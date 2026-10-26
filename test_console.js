@@ -84,6 +84,10 @@ const {
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
   makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
+  // v3.374 信任设备：签发/校验纯函数 + 落盘读写
+  DEVICE_FILE, DEVICE_COOKIE, DEVICE_TTL_MS, DEVICE_MAX,
+  makeDeviceRecord, parseDeviceCookie, trustedDeviceOf, appendDeviceRecord,
+  readDeviceStore, writeDeviceStore, hashDeviceSecret,
   // v3.370 线报全站搜索：解析/归一纯函数 + 关注词文件常量
   decodeLineHtml, parseLineStamp, clampLineQuery, normalizeWatchWord, parseLineSearchHtml,
   readLineWatchWords, readWatchState, saveWatchState, formatWatchPush,
@@ -8834,6 +8838,186 @@ async function main () {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // ── v3.374 信任设备（「记住这台设备」）──────────────────────────────────────
+  await aok('信任设备: 签发→验证、篡改/过期/revoke 后失败、21 台淘汰最旧、2FA 关闭不认', () => {
+    const dir = tmpDir()
+    const now = 1700000000000
+    try {
+      const issued = makeDeviceRecord('Mozilla/5.0 (iPhone)\nX-Evil: 1', now)
+      const cookie = `${issued.record.id}.${issued.secret}`
+      assert.strictEqual(parseDeviceCookie(cookie).id, issued.record.id, 'cookie 值形如 <id>.<secret>')
+      assert.strictEqual(parseDeviceCookie('garbage'), null, '畸形 cookie 直接判无效')
+      assert.strictEqual(parseDeviceCookie(`${issued.record.id}.zzzz`), null, '非 hex secret 判无效')
+      assert.strictEqual(JSON.stringify(issued.record).includes(issued.secret), false, '记录里不得出现 secret 明文')
+      assert.strictEqual(issued.record.ua.includes('\n'), false, 'UA 控制字符被抹掉')
+
+      assert.strictEqual(writeDeviceStore(dir, [issued.record]), true, '设备列表落盘成功')
+      const deviceFile = path.join(dir, DEVICE_FILE)
+      const fd = fs.openSync(deviceFile, 'r')
+      try {
+        assert.strictEqual(fs.fstatSync(fd).mode & 0o777, 0o600, '设备文件 0600')
+        const text = fs.readFileSync(fd, 'utf8')
+        assert.strictEqual(text.includes(issued.secret), false, '磁盘上只有哈希，没有 secret')
+        assert.strictEqual(JSON.parse(text).version, 1, '落盘结构带 version')
+      } finally {
+        fs.closeSync(fd)
+      }
+
+      let store = readDeviceStore(dir, now)
+      assert.strictEqual(store.devices.length, 1, '读回一条设备')
+      assert.strictEqual(store.devices[0].hash, hashDeviceSecret(issued.secret), '存的是 sha256(secret)')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + 1000).id, issued.record.id, '签发后可验证通过')
+      assert.strictEqual(trustedDeviceOf(store.devices, `${issued.record.id}.${'0'.repeat(64)}`, now + 1000), null, '篡改 secret 失败')
+      assert.strictEqual(trustedDeviceOf(store.devices, `${'a'.repeat(24)}.${issued.secret}`, now + 1000), null, '换 id 失败')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + DEVICE_TTL_MS - 1).id, issued.record.id, '过期前一毫秒仍有效')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + DEVICE_TTL_MS), null, '过期后失败')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + 1000, false), null, '2FA 关闭时设备 cookie 不授予访问')
+
+      // 21 台：淘汰「最久未用」的那台（lastUsedAt 最小），数量永远是 20。
+      let list = []
+      let oldest = null
+      for (let i = 0; i < DEVICE_MAX; i++) {
+        const made = makeDeviceRecord('ua-' + i, now + i * 1000)
+        if (i === 0) oldest = made.record.id
+        list = appendDeviceRecord(list, made.record, now + i * 1000)
+      }
+      assert.strictEqual(list.length, DEVICE_MAX, '满 20 台')
+      const newcomer = makeDeviceRecord('ua-new', now + 60 * 1000)
+      list = appendDeviceRecord(list, newcomer.record, now + 60 * 1000)
+      assert.strictEqual(list.length, DEVICE_MAX, '第 21 台后仍是 20 台')
+      assert.strictEqual(list.some((item) => item.id === oldest), false, '最久未用的那台被淘汰')
+      assert.strictEqual(list.some((item) => item.id === newcomer.record.id), true, '新设备在列表里')
+
+      // revoke：清空后同一 cookie 立刻失效。
+      assert.strictEqual(writeDeviceStore(dir, []), true, '清空设备列表')
+      store = readDeviceStore(dir, now)
+      assert.strictEqual(store.devices.length, 0, '列表已空')
+      assert.strictEqual(trustedDeviceOf(store.devices, cookie, now + 1000), null, 'revoke 后验证失败')
+
+      // 损坏文件：按空列表处理，写前留 .bak，不静默覆盖。
+      fs.writeFileSync(deviceFile, '{broken json')
+      const broken = readDeviceStore(dir, now)
+      assert.strictEqual(broken.devices.length, 0, '损坏文件按空列表处理')
+      assert.strictEqual(broken.corruptText, '{broken json', '损坏内容原样带回，供写前备份')
+      assert.strictEqual(trustedDeviceOf(broken.devices, cookie, now), null, '损坏文件不得放行')
+      assert.strictEqual(writeDeviceStore(dir, [issued.record], { corruptText: broken.corruptText }), true, '损坏后仍可重写')
+      const backup = readSafeTextResult(deviceFile + '.bak', 4096, { openNonBlocking: true })
+      assert.strictEqual(backup.status, 'ok', '覆盖前留了一份 .bak')
+      assert.strictEqual(backup.text, '{broken json', '.bak 保存的是原始损坏内容')
+      assert.strictEqual(readDeviceStore(dir, now).devices.length, 1, '重写后列表恢复')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('信任设备: 记住这台设备免二次验证（HTTP）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    const json = { 'content-type': 'application/json' }
+    const cookiePairs = (res) => res.headers['set-cookie'] || []
+    const cookieOf = (res, name) => cookiePairs(res)
+      .map((c) => c.split(';')[0])
+      .find((c) => c.startsWith(name + '='))
+    try {
+      let res = await request(port, 'POST', '/api/2fa/setup', { token: TOKEN, headers: json, body: '{}' })
+      const setup = JSON.parse(res.text)
+      const code = totpCodeAt(setup.secret, Date.now())
+      res = await request(port, 'POST', '/api/2fa/enable', { token: TOKEN, headers: json, body: JSON.stringify({ code, setupId: setup.setupId }) })
+      assert.strictEqual(res.status, 200, res.text)
+      const enabled = JSON.parse(res.text)
+
+      // 挑战页上「记住这台设备」默认勾选。
+      res = await request(port, 'GET', '/', { token: TOKEN })
+      assert.strictEqual(res.status, 401, '开启 2FA 后先要第二因子')
+      assert.ok(res.text.includes('name="remember" value="1" checked'), '登录页默认勾选「记住这台设备」')
+
+      const fresh = totpCodeAt(setup.secret, Date.now() + 30 * 1000)
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN, code: fresh, remember: '1' }).toString(),
+        headers: form
+      })
+      assert.strictEqual(res.status, 303, '验证码正确即登录')
+      const deviceCookie = cookieOf(res, DEVICE_COOKIE)
+      assert.ok(deviceCookie && deviceCookie.split('=')[1].includes('.'), '勾选后下发设备 Cookie')
+      const rawDevice = cookiePairs(res).find((c) => c.startsWith(DEVICE_COOKIE + '='))
+      for (const attr of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', 'Max-Age=7776000']) {
+        assert.ok(rawDevice.includes(attr), `设备 Cookie 必须带 ${attr}`)
+      }
+
+      // 只带设备 cookie（没有 xbk_session / xbk_2fa）也能进页面——这正是「免二次验证」。
+      const seeded = readDeviceStore(dir)
+      assert.strictEqual(seeded.devices.length, 1, '设备记录已落盘')
+      // 把 lastUsedAt 拨到 2 分钟前：超过 60s 节流窗，下一次命中必须重新写盘。
+      writeDeviceStore(dir, seeded.devices.map((d) => ({ ...d, lastUsedAt: d.createdAt - 120 * 1000 })))
+      res = await request(port, 'GET', '/', { headers: { cookie: deviceCookie } })
+      assert.strictEqual(res.status, 200, '仅凭设备 cookie 直接进页面')
+      assert.ok(res.text.includes('xbk-boot'), '返回的是控制台页面')
+      const touched = readDeviceStore(dir)
+      assert.ok(touched.devices[0].lastUsedAt > seeded.devices[0].createdAt - 120 * 1000, '命中后更新 lastUsedAt')
+      res = await request(port, 'GET', '/', { headers: { cookie: deviceCookie } })
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(readDeviceStore(dir).devices[0].lastUsedAt, touched.devices[0].lastUsedAt,
+        '同一分钟内的重复请求不再写盘（lastUsedAt 不变）')
+
+      res = await request(port, 'GET', '/api/2fa/status', { token: TOKEN })
+      assert.strictEqual(JSON.parse(res.text).trustedDevices, 1, '状态接口报当前设备数')
+
+      // 写面（revoke）只认 Bearer：会话 Cookie 走不通。
+      res = await request(port, 'POST', '/api/devices/revoke', {
+        headers: { ...json, cookie: `xbk_session=${encodeURIComponent(TOKEN)}` },
+        body: '{}'
+      })
+      assert.strictEqual(res.status, 401, 'Cookie-only 不能退出信任设备')
+
+      res = await request(port, 'POST', '/api/devices/revoke', { token: TOKEN, headers: json, body: '{}' })
+      assert.strictEqual(res.status, 200, res.text)
+      assert.strictEqual(JSON.parse(res.text).devices, 0)
+      assert.strictEqual(readDeviceStore(dir).devices.length, 0, '服务端设备列表已清空')
+      assert.strictEqual(cookieOf(res, DEVICE_COOKIE), `${DEVICE_COOKIE}=`, '同时让当前浏览器的设备 Cookie 失效')
+
+      res = await request(port, 'GET', '/', { headers: { cookie: deviceCookie } })
+      assert.strictEqual(res.status, 401, 'revoke 后旧设备 cookie 失效')
+      assert.ok(res.text.includes('需要访问令牌'), '回到登录页')
+
+      // 关闭 2FA 也必须清空设备列表：旧信任不能绕过「下次开启的新密钥」。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN, code: enabled.recoveryCodes[0], remember: '1' }).toString(),
+        headers: form
+      })
+      assert.strictEqual(res.status, 303, '恢复码也能记住设备')
+      assert.strictEqual(readDeviceStore(dir).devices.length, 1, '设备重新入库')
+      res = await request(port, 'POST', '/api/2fa/disable', { token: TOKEN, headers: json, body: JSON.stringify({ code: enabled.recoveryCodes[1] }) })
+      assert.strictEqual(res.status, 200, res.text)
+      assert.strictEqual(readDeviceStore(dir).devices.length, 0, '关闭 2FA 时清空信任设备')
+      assert.ok(String(res.headers['set-cookie']).includes(`${DEVICE_COOKIE}=;`), '同时清掉浏览器的设备 Cookie')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('信任设备: 2FA 关闭时设备 cookie 不授予访问（HTTP）', async () => {
+    const dir = tmpDir()
+    const issued = makeDeviceRecord('Mozilla/5.0', Date.now())
+    assert.strictEqual(writeDeviceStore(dir, [issued.record]), true, '预置一条合法设备记录')
+    // 没有 console-2fa.json ⇒ 2FA 未开启；设备 cookie 此时不得当会话用。
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    try {
+      const res = await request(port, 'GET', '/', { headers: { cookie: `${DEVICE_COOKIE}=${issued.record.id}.${issued.secret}` } })
+      assert.strictEqual(res.status, 401, '2FA 关闭时设备 cookie 什么都不授予')
+      assert.ok(res.text.includes('需要访问令牌'), '按未登录处理')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
     const src = readConsoleSource()
     assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')

@@ -1843,7 +1843,7 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
   }
 
   const CONSOLE_SEGS = ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5',
-    'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11']
+    'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11', 'console-part12']
   const RUN_LINE_RE = /--timeoutMS \$\{\{ matrix\.timeout_ms \|\| 300000 \}\}[ \t]*$/
 
   const assertTimeoutWiring = (ymlText) => {
@@ -1852,12 +1852,12 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
     assert.strictEqual(active.length, 1, 'mutation.yml 必须有且仅有一行活动 `run: npx stryker run …`')
     assert.match(active[0], RUN_LINE_RE,
       '变异测试 step 的 run 行必须以 `--timeoutMS $' + '{' + '{ matrix.timeout_ms || 300000 }}` 结尾：' +
-      'timeoutMS 只允许经 CLI 覆盖（配置文件的 hashFiles 在缓存 key 里，改配置会让 30 段全部失效）')
-    // (2) 矩阵：**恰** console-part1..11 带 timeout_ms: 60000，其余条目一个都不许有（含 4 段 command 档）。
+      'timeoutMS 只允许经 CLI 覆盖（配置文件的 hashFiles 在缓存 key 里，改配置会让 32 段全部失效）')
+    // (2) 矩阵：**恰** console-part1..12 带 timeout_ms: 60000，其余条目一个都不许有（含 4 段 command 档）。
     const entries = parseMatrixTimeouts(ymlText)
     const withTimeout = entries.filter(e => e.timeoutMs !== null)
     assert.deepStrictEqual(withTimeout.map(e => e.name), CONSOLE_SEGS,
-      '必须**恰有** console-part1..11（按矩阵顺序）声明 timeout_ms：console 段每个变异体的等待上限从 300s 降到 60s' +
+      '必须**恰有** console-part1..12（按矩阵顺序）声明 timeout_ms：console 段每个变异体的等待上限从 300s 降到 60s' +
       '（test_console.js 全量 ≈21s ⇒ 上限 ≈91s）；别的段加了这个字段就等于在没人评估的情况下改它的判据')
     assert.deepStrictEqual([...new Set(withTimeout.map(e => e.timeoutMs))], ['60000'],
       'console 段的 timeout_ms 必须是 60000（裸整数）；写成 "60" / 0 / 300000 都会让上限与评估依据脱节')

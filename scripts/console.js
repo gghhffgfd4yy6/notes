@@ -1082,6 +1082,11 @@ function renderUnauthorizedPage (options = {}) {
     <input id="code" name="code" type="text" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="24" inputmode="text" required${token ? ' autofocus' : ''}>
     <p class="hint">验证码 30 秒变一次；恢复码在开启两步验证时只显示一次。</p>`
     : ''
+  // 「记住这台设备」（v3.374）：默认勾选——自用工具 + 纯 IP 部署用不了 Passkey，
+  // 90 天免验证码是这套方案唯一的使用体验来源；不勾就还是每次都要输码。
+  const rememberField = requireCode
+    ? '<label class="remember"><input type="checkbox" name="remember" value="1" checked> 记住这台设备（90 天内在这台浏览器上不用再输验证码）</label>'
+    : ''
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} · xbk-push 控制台</title>
@@ -1094,6 +1099,8 @@ function renderUnauthorizedPage (options = {}) {
   label { display: block; font-size: 13px; color: #9aa8c0; margin-bottom: 6px; }
   input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #33405f; background: #0f1420; color: #e6edf7; font: inherit; }
   button { margin-top: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 8px; background: #356fd6; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  .remember { display: flex; align-items: center; gap: 8px; margin: 12px 0 0; font-size: 13px; color: #9aa8c0; }
+  .remember input { width: auto; margin: 0; }
   .hint { font-size: 12px; margin: 14px 0 0; }
   .error { font-size: 13px; color: #ffb4b4; margin: 0 0 12px; }
 </style></head>
@@ -1104,6 +1111,7 @@ function renderUnauthorizedPage (options = {}) {
   <form method="post" action="/login">
     ${tokenField}
     ${codeField}
+    ${rememberField}
     <button type="submit">${requireCode ? '验证并打开' : '打开控制台'}</button>
   </form>
   <p class="hint">${requireCode
@@ -1424,6 +1432,180 @@ function persistTwoFactorState (file, secret, recovery) {
     recovery,
     createdAt: Date.now()
   }), '控制台两步验证')
+}
+
+// ── 信任设备（「记住这台设备」，v3.374）─────────────────────────────────────
+// 为什么不直接上 Passkey：WebAuthn 的 RP ID 不允许是 IP 地址，而控制台当前部署在
+// https://43.143.246.62（纯 IP、无域名）⇒ 在这个部署上 Passkey 根本注册不了。等价目标是
+// 「同一台已经验过 token + 6 位码的浏览器，90 天内不用再输验证码」，用设备 Cookie 达成：
+//   · cookie 值 = <id>.<32 字节随机 hex>，HttpOnly + Secure + SameSite=Lax + Path=/；
+//   · 服务端只存 secret 的 sha256 —— console-devices.json 被读走也换不出可用 cookie；
+//   · 比较走 timingSafeEqual（定长 hex 转 Buffer，长度不等直接判不匹配）；
+//   · 文件损坏/字段非法一律按空列表处理（fail-safe：退回 2FA），覆盖前先留一份 .bak，
+//     不静默把损坏证据冲掉；
+//   · 关闭或重配 2FA 时清空列表：旧信任不得绕过新密钥。
+const DEVICE_FILE = 'console-devices.json'
+const DEVICE_SCHEMA = 1
+const DEVICE_COOKIE = 'xbk_device'
+// 90 天：cookie Max-Age 与记录 TTL 用同一个数，避免「cookie 还在、服务端已判过期」的错位。
+const DEVICE_COOKIE_MAX_AGE_S = 90 * 24 * 60 * 60 // 7776000 秒
+const DEVICE_TTL_MS = DEVICE_COOKIE_MAX_AGE_S * 1000
+const DEVICE_MAX = 20
+const DEVICE_UA_MAX = 120
+const DEVICE_FILE_MAX_BYTES = 64 * 1024
+// 同一台设备每分钟最多写一次 lastUsedAt：GET / 是高频动作，逐次落盘只会白磨磁盘。
+const DEVICE_TOUCH_MIN_MS = 60 * 1000
+const DEVICE_ID_HEX = 24 // 12 字节随机
+const DEVICE_HASH_HEX = 64 // sha256
+const DEVICE_SECRET_HEX = 64 // 32 字节随机
+
+// 定长小写 hex 判定（字符串比较，不构建正则——用户可控输入不进正则）。
+function isLowerHex (text, length) {
+  if (typeof text !== 'string' || text.length !== length) return false
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code >= 48 && code <= 57) continue // 0-9
+    if (code >= 97 && code <= 102) continue // a-f
+    return false
+  }
+  return true
+}
+
+function hashDeviceSecret (secret) {
+  return crypto.createHash('sha256').update(String(secret)).digest('hex')
+}
+
+// UA 只作「哪台设备」的辨识线索，不参与安全判定；截 120 字并抹掉控制字符，
+// 避免把换行/终端转义序列塞进状态文件后被别的读取方当成多行内容。
+function trimDeviceUa (ua) {
+  if (typeof ua !== 'string' || ua.length === 0) return ''
+  let out = ''
+  for (const ch of ua) {
+    const code = ch.charCodeAt(0)
+    out += (code < 32 || code === 127) ? ' ' : ch
+  }
+  return out.replace(/\s+/g, ' ').trim().slice(0, DEVICE_UA_MAX)
+}
+
+function parseDeviceCookie (value) {
+  if (typeof value !== 'string') return null
+  const dot = value.indexOf('.')
+  if (dot <= 0 || dot === value.length - 1) return null
+  const id = value.slice(0, dot)
+  const secret = value.slice(dot + 1)
+  if (!isLowerHex(id, DEVICE_ID_HEX) || !isLowerHex(secret, DEVICE_SECRET_HEX)) return null
+  return { id, secret }
+}
+
+// 签发：返回 { record, secret }。secret 只在本次响应的 Set-Cookie 里出现一次，
+// 服务端只留 hash——与恢复码同一口径（明文不落盘、不进日志）。
+function makeDeviceRecord (ua, now = Date.now()) {
+  const secret = crypto.randomBytes(32).toString('hex')
+  const record = {
+    id: crypto.randomBytes(12).toString('hex'),
+    hash: hashDeviceSecret(secret),
+    createdAt: now,
+    lastUsedAt: now,
+    ua: trimDeviceUa(ua)
+  }
+  return { record, secret }
+}
+
+function isValidDeviceRecord (record) {
+  return !!record && typeof record === 'object' && !Array.isArray(record) &&
+    isLowerHex(record.id, DEVICE_ID_HEX) &&
+    isLowerHex(record.hash, DEVICE_HASH_HEX) &&
+    Number.isFinite(record.createdAt) && record.createdAt > 0 &&
+    Number.isFinite(record.lastUsedAt) && record.lastUsedAt > 0 &&
+    typeof record.ua === 'string' && record.ua.length <= DEVICE_UA_MAX
+}
+
+// 过期清理 + 同 id 去重（留 lastUsedAt 更新的那条）。只放行字段完整的记录：
+// 手改出来的 {id} 这种残记录不能因为「id 对上了」就免除第二因子。
+function pruneDeviceRecords (records, now = Date.now()) {
+  const byId = new Map()
+  const at = Number.isFinite(now) ? now : Date.now()
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!isValidDeviceRecord(record)) continue
+    if (at - record.createdAt >= DEVICE_TTL_MS) continue
+    const prev = byId.get(record.id)
+    if (!prev || record.lastUsedAt > prev.lastUsedAt) {
+      byId.set(record.id, { ...record, ua: trimDeviceUa(record.ua) })
+    }
+  }
+  return [...byId.values()]
+}
+
+// 追加一台设备：最多 20 台，超限淘汰「最久未用」（lastUsedAt 最小）的那台——
+// 用户换手机/换浏览器时不需要先去旧设备上「退出」，列表自己会滚。
+function appendDeviceRecord (records, record, now = Date.now()) {
+  const kept = pruneDeviceRecords(records, now).filter((item) => item.id !== record.id)
+  kept.push(record)
+  if (kept.length <= DEVICE_MAX) return kept
+  kept.sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+  return kept.slice(kept.length - DEVICE_MAX)
+}
+
+// 设备 cookie → 命中的记录。2FA 未开启时一律不认：否则「关掉 2FA 再开」或
+// 「重配密钥」之后，旧设备 cookie 就成了绕过新密钥的后门。
+function trustedDeviceOf (records, cookieValue, now = Date.now(), enabled = true) {
+  if (enabled !== true) return null
+  const parsed = parseDeviceCookie(cookieValue)
+  if (!parsed) return null
+  const candidate = Buffer.from(hashDeviceSecret(parsed.secret), 'hex')
+  for (const record of pruneDeviceRecords(records, now)) {
+    if (record.id !== parsed.id) continue
+    const saved = Buffer.from(record.hash, 'hex')
+    if (saved.length === candidate.length && crypto.timingSafeEqual(saved, candidate)) return record
+  }
+  return null
+}
+
+function deviceCookieValue (cookieHeader) {
+  return cookieValue(cookieHeader, DEVICE_COOKIE)
+}
+
+function deviceCookieHeader (id, secret, maxAge = DEVICE_COOKIE_MAX_AGE_S) {
+  // Secure 无条件加：本功能只在 HTTPS 部署（纯 IP + TLS 终结）上有意义，
+  // 明文 HTTP 上浏览器会直接拒存——那正是我们想要的降级（退回 2FA，而不是悄悄削弱）。
+  return `${DEVICE_COOKIE}=${id}.${secret}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}; Secure`
+}
+
+function clearDeviceCookieHeader () {
+  return `${DEVICE_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure`
+}
+
+function deviceStorePath (stateDir) {
+  return path.join(stateDir, DEVICE_FILE)
+}
+
+// 读设备列表。文件缺失 = 空列表（正常）；JSON 坏了/字段非法 = 空列表 + 原始文本
+// （corruptText 交给写路径先备份 .bak，不在这里写盘：GET / 只读，不该产生副作用）。
+function readDeviceStore (stateDir, now = Date.now()) {
+  const file = deviceStorePath(stateDir)
+  const read = readSafeTextResult(file, DEVICE_FILE_MAX_BYTES, { openNonBlocking: true })
+  if (read.status === 'missing') return { file, devices: [], corruptText: null }
+  const text = typeof read.text === 'string' ? read.text : ''
+  if (read.status !== 'ok' || text.trim() === '') return { file, devices: [], corruptText: null }
+  let raw
+  try { raw = JSON.parse(text) } catch (e) { return { file, devices: [], corruptText: text } }
+  if (!raw || raw.version !== DEVICE_SCHEMA || !Array.isArray(raw.devices)) {
+    return { file, devices: [], corruptText: text }
+  }
+  return { file, devices: pruneDeviceRecords(raw.devices, now), corruptText: null }
+}
+
+// 只留一份 .bak：反复损坏时保留最早那份原始证据，不被后续覆盖。
+function backupDeviceStore (file, text) {
+  const backup = file + '.bak'
+  if (readSafeTextResult(backup, 1, { openNonBlocking: true }).status !== 'missing') return true
+  return writeAtomic(backup, String(text), '控制台信任设备备份') === true
+}
+
+function writeDeviceStore (stateDir, devices, { corruptText = null } = {}) {
+  const file = deviceStorePath(stateDir)
+  if (typeof corruptText === 'string') backupDeviceStore(file, corruptText)
+  return writeAtomic(file, JSON.stringify({ version: DEVICE_SCHEMA, devices }), '控制台信任设备') === true
 }
 
 function authorize (req, token, urlQuery) {
@@ -2907,6 +3089,33 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // （CodeQL js/user-controlled-bypass：用户可控的值不能直接决定放行）。
     return verifyTwoFactorCookie(twoFactorCookieValue(req.headers && req.headers.cookie), twoFactor.secret)
   }
+  // 信任设备（v3.374）：判定直接读盘——文件只有几百字节，换来「手改/换进程后立刻生效」；
+  // lastUsedAt 的写盘按设备 60s 节流，节流基准就是盘上的 lastUsedAt（进程重启后照样有效，
+  // 不需要额外的内存表）。
+  const trustedDeviceForRequest = (req, now = Date.now()) => {
+    const cookie = deviceCookieValue(req.headers && req.headers.cookie)
+    if (cookie === null) return null
+    const store = readDeviceStore(stateDir, now)
+    const record = trustedDeviceOf(store.devices, cookie, now, twoFactor.enabled)
+    if (!record) return null
+    if (now - record.lastUsedAt >= DEVICE_TOUCH_MIN_MS) {
+      const devices = store.devices.map((item) => (item.id === record.id ? { ...item, lastUsedAt: now } : item))
+      writeDeviceStore(stateDir, devices, { corruptText: store.corruptText })
+    }
+    return record
+  }
+  const rememberDevice = (req, now = Date.now()) => {
+    const store = readDeviceStore(stateDir, now)
+    const issued = makeDeviceRecord(req.headers && req.headers['user-agent'], now)
+    const devices = appendDeviceRecord(store.devices, issued.record, now)
+    if (!writeDeviceStore(stateDir, devices, { corruptText: store.corruptText })) return null
+    return issued
+  }
+  const revokeTrustedDevices = () => {
+    const store = readDeviceStore(stateDir)
+    return writeDeviceStore(stateDir, [], { corruptText: store.corruptText })
+  }
+  const trustedDeviceCount = () => readDeviceStore(stateDir).devices.length
   const verifySecondFactor = (code, { persistRecovery = true } = {}) => {
     const totp = consumeTotpStep(code)
     if (totp && totp.replay) return { ok: false, recovery: false, error: 'replay' }
@@ -5096,6 +5305,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         const cookies = [sessionCookieHeaderFor(req, token)]
         if (twoFactor.enabled) cookies.push(twoFactorCookieHeader(req, twoFactor.secret))
+        // 「记住这台设备」（默认勾选）：签 90 天设备 cookie。只有真正过了第二因子才会走到这里，
+        // 写盘失败就静默降级成「这次登录有效、下次还要输码」——不能因为记不住设备就拒绝登录。
+        const remember = params.get('remember')
+        if (twoFactor.enabled && typeof remember === 'string' && remember !== '') {
+          const issued = rememberDevice(req)
+          if (issued) cookies.push(deviceCookieHeader(issued.record.id, issued.secret))
+        }
         res.setHeader('Set-Cookie', cookies)
         res.setHeader('Cache-Control', 'no-store')
         res.writeHead(303, { Location: '/' })
@@ -5105,15 +5321,25 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     // 两步验证闸（v3.357）：只拦浏览器页面，不拦 API/静态资产。访问令牌正确但还没过
     // 6 位码时，给登录页的第二步；令牌本身仍留在 hidden 字段随 POST 回传，不新增 URL 暴露。
+    // v3.374：先看「信任设备」——命中即视为第二因子已过，并补发 2FA 会话 Cookie；
+    // 会话 Cookie 过期时也一并续期（设备信任本身就是这台浏览器 90 天的登录凭证）。
+    let deviceTrusted = false
+    const pageCookies = []
     if (req.method === 'GET' && url.pathname === '/' && twoFactor.enabled && !twoFactorVerified(req)) {
-      if (!authorize(req, token, url.searchParams)) {
-        sendHtml(res, 401, renderUnauthorizedPage())
+      const device = trustedDeviceForRequest(req)
+      if (device) {
+        deviceTrusted = true
+        pageCookies.push(twoFactorCookieHeader(req, twoFactor.secret), sessionCookieHeaderFor(req, token))
+      } else {
+        if (!authorize(req, token, url.searchParams)) {
+          sendHtml(res, 401, renderUnauthorizedPage())
+          return
+        }
+        const queryToken = url.searchParams.get('token')
+        const formToken = typeof queryToken === 'string' && timingSafeEqualStr(queryToken, token) ? queryToken : token
+        sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: formToken }))
         return
       }
-      const queryToken = url.searchParams.get('token')
-      const formToken = typeof queryToken === 'string' && timingSafeEqualStr(queryToken, token) ? queryToken : token
-      sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: formToken }))
-      return
     }
     // 过滤规则写端点：必须在全局 authorize 之前分流。全局闸对 POST 接受 ?token= 且
     // 对 Cookie 统一回 unauthorized——只有专属入口才能给出 query_token_not_allowed /
@@ -5129,7 +5355,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       handleFilterDraftDelete(req, res)
       return
     }
-    if (!authorize(req, token, url.searchParams)) {
+    if (!deviceTrusted && !authorize(req, token, url.searchParams)) {
       // 审查 #224：GET / 未授权时给可自助恢复的登录页，而不是裸 JSON；API/静态资源仍回 JSON。
       if (req.method === 'GET' && url.pathname === '/') {
         sendHtml(res, 401, renderUnauthorizedPage())
@@ -5162,7 +5388,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 这是部署形态的固有权衡，不是代码缺陷可修；上 HTTPS（反代/自签）后应第一时间
       // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Lax（跨站顶层
       // 导航可带，但 POST 不收 Cookie）+ Max-Age 从 30 天收窄到 1 天 + Referrer-Policy（见下）。
-      res.setHeader('Set-Cookie', sessionCookieHeaderFor(req, token))
+      // 走「信任设备」进来时上面已经排好两条 Cookie（2FA 会话 + 会话 token），别在这里覆盖掉。
+      res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
@@ -5603,8 +5830,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 200, {
         enabled: twoFactor.enabled,
         pending: hasPendingTwoFactor(),
-        recoveryRemaining: twoFactor.recovery ? twoFactor.recovery.hashes.length : 0
+        recoveryRemaining: twoFactor.recovery ? twoFactor.recovery.hashes.length : 0,
+        // 信任设备数（v3.374）：系统页的「退出所有信任设备」按钮靠它显示「现在记住了几台」。
+        trustedDevices: twoFactor.enabled ? trustedDeviceCount() : 0
       })
+      return
+    }
+    // 退出所有信任设备（v3.374）：写面只认 Bearer（与其它写端点同口径，Cookie-only 401）。
+    // 同时清掉当前浏览器的设备 Cookie——否则页面上「已退出」，这台机器下次仍能免验证进来。
+    if (req.method === 'POST' && url.pathname === '/api/devices/revoke') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
+      const verdict = writeAuthVerdict(req, url.searchParams, token)
+      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
+      req.resume() // 不需要 body；显式排空，避免 keep-alive 连接里残留字节污染下一个请求
+      if (!revokeTrustedDevices()) {
+        sendJson(res, 500, { error: 'write_failed', message: '设备列表清空失败，请稍后再试' })
+        return
+      }
+      res.setHeader('Set-Cookie', clearDeviceCookieHeader())
+      res.setHeader('Cache-Control', 'no-store')
+      sendJson(res, 200, { revoked: true, devices: 0 })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/2fa/setup') {
@@ -5679,6 +5924,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (setupStep !== null) usedTotpSteps.set(setupStep, (setupStep + 2) * TOTP_PERIOD_S * 1000)
         lastEnableResult = { setupId: pending.id, secret: pending.secret, recoveryCodes, createdAt: Date.now() }
         clearLoginFailures(req)
+        // 重配 2FA = 换了一把新钥匙：旧设备信任必须一起作废，否则旧 cookie 仍能绕过新密钥。
+        revokeTrustedDevices()
         res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
         res.setHeader('Cache-Control', 'no-store')
         sendJson(res, 200, { enabled: true, recoveryCodes, recoveryRemaining: recoveryCodes.length })
@@ -5729,7 +5976,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         lastEnableResult = null
         usedTotpSteps.clear()
         clearLoginFailures(req)
-        res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
+        // 关闭 2FA 后设备列表没有意义；下次开启是新密钥，不能继承旧信任。
+        revokeTrustedDevices()
+        res.setHeader('Set-Cookie', [clearTwoFactorCookieHeader(req), clearDeviceCookieHeader()])
         sendJson(res, 200, { enabled: false })
       }).catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
       return
@@ -6330,6 +6579,24 @@ module.exports = {
   TWO_FACTOR_PENDING_TTL_MS,
   TWO_FACTOR_RECOVERY_COUNT,
   TWO_FACTOR_LOGIN_MAX_FAILS,
+  // v3.374 信任设备：签发/校验纯函数 + 落盘读写（非 HTTP 单测直接可达）
+  DEVICE_FILE,
+  DEVICE_COOKIE,
+  DEVICE_COOKIE_MAX_AGE_S,
+  DEVICE_MAX,
+  DEVICE_TTL_MS,
+  DEVICE_TOUCH_MIN_MS,
+  hashDeviceSecret,
+  makeDeviceRecord,
+  parseDeviceCookie,
+  pruneDeviceRecords,
+  appendDeviceRecord,
+  trustedDeviceOf,
+  readDeviceStore,
+  writeDeviceStore,
+  deviceCookieValue,
+  deviceCookieHeader,
+  clearDeviceCookieHeader,
   TOTP_PERIOD_S,
   TOTP_DIGITS,
   acquireLock,

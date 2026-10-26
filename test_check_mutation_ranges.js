@@ -25,7 +25,7 @@ const SPECIAL_SEGMENTS = {
   'qinglong/xbk_push.js': ['qinglong-push'],
   'scripts/check-deps.js': ['check-deps'],
   'scripts/status.js': ['status'],
-  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11'],
+  'scripts/console.js': ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11', 'console-part12'],
   'xbk_filter_store.js': ['filter-store']
 }
 // 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随。
@@ -407,6 +407,7 @@ function run (ymlText) {
     const part9 = ranges.find(r => r.name === 'console-part9')
     const part10 = ranges.find(r => r.name === 'console-part10')
     const part11 = ranges.find(r => r.name === 'console-part11')
+    const part12 = ranges.find(r => r.name === 'console-part12')
     assert.ok(part6 && part6.start === 3251 && part6.end === 3675,
       `真实 console-part6 必须是 3251-3675，实际 ${part6 && part6.start}-${part6 && part6.end}`)
     assert.ok(part7 && part7.start === 3676 && part7.end === 4370,
@@ -417,8 +418,10 @@ function run (ymlText) {
       `真实 console-part9 必须是 4801-5200，实际 ${part9 && part9.start}-${part9 && part9.end}`)
     assert.ok(part10 && part10.start === 5201 && part10.end === 5800,
       `真实 console-part10 必须是 5201-5800，实际 ${part10 && part10.start}-${part10 && part10.end}`)
-    assert.ok(part11 && part11.start === 5801 && part11.end === lines,
-      `真实 console-part11 必须是 5801-${lines}，实际 ${part11 && part11.start}-${part11 && part11.end}`)
+    assert.ok(part11 && part11.start === 5801 && part11.end === 6500,
+      `真实 console-part11 必须是 5801-6500，实际 ${part11 && part11.start}-${part11 && part11.end}`)
+    assert.ok(part12 && part12.start === 6501 && part12.end === lines,
+      `真实 console-part12 必须是 6501-${lines}，实际 ${part12 && part12.start}-${part12 && part12.end}`)
   }
 
   console.log('test_check_mutation_ranges OK')

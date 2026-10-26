@@ -559,6 +559,17 @@ function apiPostTwoFactorDisable (code) {
   return consumeJsonResult(fetch('/api/2fa/disable', merged), done)
 }
 
+// 信任设备（v3.374）：「退出所有信任设备」——清空服务端设备列表 + 让当前浏览器的设备 Cookie 失效。
+// 写面与其它写端点同款 Bearer + JSON（Cookie-only 服务端回 401）。
+function apiPostDevicesRevoke () {
+  const { merged, done } = timedRequest({
+    method: 'POST',
+    headers: filterWriteHeaders(),
+    body: JSON.stringify({})
+  })
+  return consumeJsonResult(fetch('/api/devices/revoke', merged), done)
+}
+
 // 触发类请求公共体（SonarCloud new_duplicated_lines_density：trigger 与 triggerNotifyTest
 // 两段同构模板抽公共，消除新增代码重复率超标）。fetch 字面量由调用侧闭包注入——
 // 第一参数仍是纯字面量（§0 静态红线形态保持），公共体只管 timedRequest/重放拦截语义。
@@ -681,5 +692,6 @@ export {
   apiPostFilterSave, apiPostFilterValidate, apiPostFilterPreview, apiPostBackupExport,
   apiPostBackupImport, apiPostFilterRestore, apiGetConsoleSettings, apiPostConsoleSettings,
   apiGetTwoFactorStatus, apiPostTwoFactorSetup, apiPostTwoFactorEnable, apiPostTwoFactorDisable,
+  apiPostDevicesRevoke,
   apiSearchLines, apiGetLineWatch, apiPostLineWatch
 }
