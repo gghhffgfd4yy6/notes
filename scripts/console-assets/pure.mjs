@@ -55,7 +55,10 @@ function finePointer (doc) {
   try {
     const view = doc && doc.defaultView
     if (!view || typeof view.matchMedia !== 'function') return false
-    return view.matchMedia('(pointer: fine)').matches === true
+    // 主指针是精确指针、且设备上**没有任何**触摸指针：触屏笔记本（pointer: fine + any-pointer: coarse）
+    // 一样会用手点，快照白帧照样出现，所以必须两个条件同时成立。
+    return view.matchMedia('(pointer: fine)').matches === true &&
+      view.matchMedia('(any-pointer: coarse)').matches === false
   } catch (e) {
     return false
   }
