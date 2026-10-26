@@ -120,7 +120,7 @@ async function consumeJson (p, condKey, retry, sentTag) {
 // 重试也在这里（见 consumeJson 的 retry 参数）。fetch 的 URL 仍留在各端点里保持字面量
 // （Codacy SSRF 口径）——这里收的是「怎么发」，不是 URL。
 function conditionalRequest (condKey, build) {
-  const once = (conditional) => {
+  const attempt = (conditional) => {
     const merged = timedRequest({
       headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
     })
@@ -128,10 +128,10 @@ function conditionalRequest (condKey, build) {
     const sentTag = conditional ? addConditional(merged, condKey) : null
     return { p: build(merged), sentTag }
   }
-  const first = once(true)
+  const first = attempt(true)
   return consumeJson(first.p, condKey, () => {
     // 只重试一次：重试不带条件头，再拿到 304 就是服务端异常，按「无本地副本」抛错。
-    const again = once(false)
+    const again = attempt(false)
     return consumeJson(again.p, condKey)
   }, first.sentTag)
 }
@@ -252,18 +252,26 @@ function apiGetCacheHealth () {
   return conditionalRequest('cache-health', (merged) => fetch('/api/cache-health', merged))
 }
 
-let filesInFlight = null
+// 在飞去重（v3.385）：同一 key 的并发调用共享同一个 Promise，settle 即清。
+// 语义是「请求结束就重发」，**不是 TTL 缓存**——文件清单/过滤规则都是写后可变的，
+// 缓存化会让刷新拿到旧快照（这两处各自抄过一份同样的模板，合成这一个函数）。
+const IN_FLIGHT = new Map()
+function once (key, fn) {
+  const hit = IN_FLIGHT.get(key)
+  if (hit) return hit
+  const p = fn()
+  IN_FLIGHT.set(key, p)
+  const clear = () => { if (IN_FLIGHT.get(key) === p) IN_FLIGHT.delete(key) }
+  p.then(clear, clear)
+  return p
+}
+
 function apiGetFiles () {
   // 启动预加载会同时命中缓存健康右列、系统页文件清单、过滤规则备份下拉；
   // 共享同一个在飞 Promise，避免对大目录做三次同步扫描（Sourcery #272）。
-  if (filesInFlight) return filesInFlight
-  const merged = timedRequest({
+  return once('files', () => consumeJson(fetch('/api/files', timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  filesInFlight = consumeJson(fetch('/api/files', merged))
-  const clear = () => { filesInFlight = null }
-  filesInFlight.then(clear, clear)
-  return filesInFlight
+  }))))
 }
 
 function apiGetConfig () {
@@ -355,17 +363,11 @@ function filterWriteHeaders () {
   }
 }
 
-let filterInFlight = null
 function apiGetFilter () {
   // 配置页和过滤规则页启动预加载时都会要同一份过滤规则快照，共享在飞 Promise。
-  if (filterInFlight) return filterInFlight
-  const merged = timedRequest({
+  return once('filter', () => consumeJson(fetch('/api/config/filter', timedRequest({
     headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  filterInFlight = consumeJson(fetch('/api/config/filter', merged))
-  const clear = () => { filterInFlight = null }
-  filterInFlight.then(clear, clear)
-  return filterInFlight
+  }))))
 }
 
 // 服务器草稿：读面沿用 Cookie/?token= 均可的全局鉴权；写/删只认 Bearer。

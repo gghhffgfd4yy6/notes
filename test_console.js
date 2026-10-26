@@ -3233,6 +3233,77 @@ async function main () {
       fs.rmSync(modDir, { recursive: true, force: true })
     }
   })
+  await aok('前端数据层: 在飞去重 once(key) 只合并并发请求，settle 即清（不是缓存）', async () => {
+    // filesInFlight / filterInFlight 曾各抄一份「在飞 Promise 共享 + settle 清空」，
+    // 合成 once(key, fn) 后必须仍是「请求结束即清」而不是 TTL 缓存（否则刷新拿旧快照）。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-once-'))
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const calls = []
+    const res200 = (data) => ({
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      json: async () => data
+    })
+    globalThis.document = { getElementById: () => null }
+    globalThis.window = { dispatchEvent: () => {} }
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      let release = null
+      const gate = new Promise((resolve) => { release = resolve })
+      let n = 0
+      globalThis.fetch = async (url) => {
+        calls.push(String(url))
+        n += 1
+        if (n === 1) { await gate; return res200({ marker: 'files-1' }) }
+        return res200({ marker: `files-${n}` })
+      }
+      const a = mod.apiGetFiles()
+      const b = mod.apiGetFiles()
+      assert.strictEqual(calls.length, 1, '并发两个调用者必须共享同一个在飞请求（只发一次）')
+      release()
+      const [ra, rb] = await Promise.all([a, b])
+      assert.strictEqual(ra.marker, 'files-1')
+      assert.strictEqual(rb, ra, '两个调用者必须拿到同一份结果')
+      const again = await mod.apiGetFiles()
+      assert.strictEqual(calls.length, 2, '结算后必须重发：语义是「请求结束即清」，不是 TTL 缓存')
+      assert.strictEqual(again.marker, 'files-2')
+      // 失败路径同样要清：否则一次网络错会把这个 key 永久钉在同一个 rejection 上。
+      calls.length = 0
+      globalThis.fetch = async (url) => { calls.push(String(url)); throw new Error('Failed to fetch') }
+      await assert.rejects(() => mod.apiGetFiles(), /Failed to fetch/)
+      await assert.rejects(() => mod.apiGetFiles(), /Failed to fetch/)
+      assert.strictEqual(calls.length, 2, '失败也必须清键（否则后续调用永远拿到同一个 rejection）')
+      // 不同 key 互不影响：files 在飞时过滤规则仍必须自己发一次请求。
+      calls.length = 0
+      let releaseFiles = null
+      const filesGate = new Promise((resolve) => { releaseFiles = resolve })
+      globalThis.fetch = async (url) => {
+        calls.push(String(url))
+        if (String(url) === '/api/files') { await filesGate; return res200({ marker: 'files' }) }
+        return res200({ marker: 'filter' })
+      }
+      const pFiles = mod.apiGetFiles()
+      const pFilter = mod.apiGetFilter()
+      assert.deepStrictEqual(calls, ['/api/files', '/api/config/filter'],
+        '不同 key 必须各自发请求（不能互相顶掉）')
+      releaseFiles()
+      assert.strictEqual((await pFilter).marker, 'filter')
+      assert.strictEqual((await pFiles).marker, 'files')
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -7115,8 +7186,12 @@ async function main () {
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
       '缓存健康切回必须连右列文件清单一起补拉')
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('if (wasPaused) {'), '缓存健康从暂停/隐藏恢复时必须立即补拉一次')
-    assert.ok(src.includes('let filesInFlight = null') && src.includes('if (filesInFlight) return filesInFlight'),
-      '三个面板同时要 /api/files 时必须共享同一个在飞请求')
+    assert.ok(src.includes("return once('files', () =>") && src.includes("return once('filter', () =>"),
+      '三个面板同时要 /api/files（配置页/过滤规则页同时要过滤规则）时必须共享同一个在飞请求')
+    const onceFn = src.slice(src.indexOf('function once (key, fn)'), src.indexOf('function apiGetFiles'))
+    assert.ok(onceFn.includes('IN_FLIGHT.delete(key)') && onceFn.includes('p.then(clear, clear)'),
+      'once 必须在 settle 后清键（「请求结束即清」，不是 TTL 缓存）')
+    assert.ok(!onceFn.includes('setTimeout'), 'once 不得加 TTL/定时清理（那就变成缓存了）')
     assert.ok(seg('FilesPanel', 'function FilterRules').includes('loadTick'),
       '文件清单重拉完成也必须重报 ready，头部时间才会更新')
     // 保活带来的两个交互坑：分类弹层要主动关（否则 body overflow:hidden 卡住新页面）；
@@ -9382,7 +9457,7 @@ async function main () {
     }
     // 304 但本地无副本必须自动重试一次，不能把 304 当错误（配置页会显示「加载失败」）。
     assert.ok(src.includes('typeof retry === \'function\''), 'consumeJson 的 304 分支必须有重试通道')
-    assert.ok(src.includes('const again = once(false)'), '重试必须去掉 If-None-Match（once(false) 不再注入条件头）')
+    assert.ok(src.includes('const again = attempt(false)'), '重试必须去掉 If-None-Match（attempt(false) 不再注入条件头）')
     // fetch 在调用时快照 headers：messages 的 addConditional 必须排在 fetch 之前。
     const msgFn = src.slice(src.indexOf('function apiGetMessages'), src.indexOf('function apiGetTrends'))
     assert.ok(msgFn.indexOf('addConditional(merged, condKey)') < msgFn.indexOf('fetch('), 'messages 必须先注入 If-None-Match 再 fetch')
