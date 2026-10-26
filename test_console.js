@@ -7282,6 +7282,31 @@ async function main () {
     assert.strictEqual(canViewTransition(null, true), false, '拿不到 document 时返回 false，不能抛')
   })
 
+  await aok('行为: runViewTransition 在触摸设备上直接降级（Android 快照会偶发整屏白帧）', async () => {
+    const { runViewTransition } = await import('./scripts/console-assets/pure.mjs')
+    let started = 0
+    let applied = null
+    const coarse = {
+      documentElement: {},
+      defaultView: { matchMedia: () => ({ matches: false }) },
+      startViewTransition () { started++; return { finished: Promise.resolve() } }
+    }
+    const t = runViewTransition(coarse, true, (via) => { applied = via })
+    assert.strictEqual(t, null, '触摸设备必须返回 null（不假装起过过渡）')
+    assert.strictEqual(started, 0, '触摸设备上连 startViewTransition 都不许调（调了就可能白屏一帧）')
+    assert.strictEqual(applied, false, '降级路径同步渲染，页面级入场照常播')
+    // 拿不到 defaultView / matchMedia 时按「不支持」保守处理（宁可不做过渡）。
+    for (const doc of [
+      { documentElement: {}, startViewTransition () { started++ } },
+      { documentElement: {}, defaultView: {}, startViewTransition () { started++ } }
+    ]) {
+      applied = null
+      assert.strictEqual(runViewTransition(doc, true, (via) => { applied = via }), null)
+      assert.strictEqual(applied, false)
+    }
+    assert.strictEqual(started, 0, '任何降级路径都不得调用 startViewTransition')
+  })
+
   await aok('行为: runViewTransition（先起过渡、再渲染、再等微任务；拿不到能力就同步渲染且只渲染一次）', async () => {
     const { runViewTransition } = await import('./scripts/console-assets/pure.mjs')
     // 假 document：只记顺序，不碰真 DOM（纯函数模块不该要求 DOM 存在）。
@@ -7290,6 +7315,8 @@ async function main () {
     let renders = 0
     const doc = {
       documentElement: {},
+      // v3.377：只有精确指针（桌面）才走原生过渡；假 document 默认按桌面给。
+      defaultView: { matchMedia: () => ({ matches: true }) },
       startViewTransition (cb) {
         order.push('startViewTransition')
         pending = cb
@@ -7310,7 +7337,7 @@ async function main () {
     // 回调被重复触发（浏览器 abort 后重放）也不得补渲染。
     let pending2 = null
     let renders2 = 0
-    runViewTransition({ documentElement: {}, startViewTransition (cb) { pending2 = cb; return { finished: Promise.resolve() } } },
+    runViewTransition({ documentElement: {}, defaultView: { matchMedia: () => ({ matches: true }) }, startViewTransition (cb) { pending2 = cb; return { finished: Promise.resolve() } } },
       true, () => { renders2++ })
     await pending2()
     await pending2()
@@ -7351,6 +7378,7 @@ async function main () {
     })
     const returned = runViewTransition({
       documentElement: {},
+      defaultView: { matchMedia: () => ({ matches: true }) },
       startViewTransition () {
         return { ready: promiseLike(), finished: promiseLike(), get updateCallbackDone () { throw new Error('不得给 updateCallbackDone 挂 catch：更新回调里的异常必须露出来') } }
       }
