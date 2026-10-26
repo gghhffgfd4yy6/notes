@@ -131,7 +131,7 @@ function TapTip ({ tip, hint, children, showDate = true }) {
       if (!popRef.current) return
       placeAt(popRef.current, x, y)
       setReady(true)
-    })
+    }).catch(() => {}) // 定位失败就保持原位，不打断交互（computePosition 不会 reject，兜底而已）
     return undefined
   }, [open])
   if (!tip) return html`${children}`
@@ -264,7 +264,7 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
       if (!popRef.current) return
       placeAt(popRef.current, x, y)
       setReady(true)
-    })
+    }).catch(() => {}) // 定位失败就保持原位，不打断交互（computePosition 不会 reject，兜底而已）
   }, [])
 
   // 先量再显示：首帧 visibility:hidden，避免先按「向下」铺一帧再翻到上方。

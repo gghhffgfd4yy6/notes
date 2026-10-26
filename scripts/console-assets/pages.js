@@ -1257,7 +1257,7 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
       if (!popRef.current) return
       placeAt(popRef.current, x, y)
       setReady(true)
-    })
+    }).catch(() => {}) // 定位失败就保持原位，不打断交互（computePosition 不会 reject，兜底而已）
   }, [])
   // 打开/断点切换/滚动/缩放都重新定位（库不自带 autoUpdate，监听留在组件里；rAF 合并同帧）。
   // 必须 useLayoutEffect：坐标要赶在首帧绘制前写进 DOM，否则会先看到未定位的弹层。

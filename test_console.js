@@ -7262,7 +7262,10 @@ async function main () {
     assert.ok(/setReady\(false\)\s*\n\s*setOpen\(true\)/.test(cate),
       '每次打开都要先把 ready 归零再开（否则先按上一轮坐标可见一帧）')
     // 窄屏：CSS 贴底模态，不量测；并把桌面写下的内联定位清掉（内联会压过媒体查询）。
-    assert.ok(/if \(narrow\) \{[\s\S]{0,320}?setReady\(true\)[\s\S]{0,60}?return undefined/.test(cate),
+    const narrowAt = cate.indexOf('if (narrow) {')
+    assert.ok(narrowAt > 0, '窄屏分支必须存在')
+    const narrowSeg = cate.slice(narrowAt, narrowAt + 400)
+    assert.ok(narrowSeg.includes('setReady(true)') && narrowSeg.includes('return undefined'),
       '窄屏不得跑 computePosition（坐标交给 CSS 贴底模态）')
     assert.ok(cate.includes("pop.style.left = ''") && cate.includes("pop.style.top = ''") && cate.includes("pop.style.maxHeight = ''"),
       '切到窄屏必须清掉上一轮的内联 left/top/max-height')
@@ -7288,9 +7291,9 @@ async function main () {
     const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
     const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
     // ── stickyPad：一份实现，五处调用（列表落点 / 两个落点门 / 错误行定位 / 日志行定位）──
-    assert.strictEqual((components + pages + ui).match(/function stickyPad \(\)/g || []).length, 1,
+    assert.strictEqual(((components + pages + ui).match(/function stickyPad \(\)/g) || []).length, 1,
       'stickyPad 只能有一份实现')
-    assert.strictEqual((pages + ui).match(/stickyPad\(\)/g || []).length, 5, '五处吸顶留白必须全部改调 stickyPad()')
+    assert.strictEqual(((pages + ui).match(/stickyPad\(\)/g) || []).length, 5, '五处吸顶留白必须全部改调 stickyPad()')
     assert.ok(!/document\.querySelector\('\.tabs'\)/.test(pages + ui), '调用方不得再各写一遍 .tabs 实测高度')
     const padAt = components.indexOf('function stickyPad ()')
     const padSeg = components.slice(padAt, components.indexOf('\n}', padAt))
