@@ -7205,12 +7205,20 @@ async function main () {
     const end = src.indexOf('// 指标卡', start)
     assert.ok(start > -1 && end > start, '必须能定位 MiniSelect')
     const seg = src.slice(start, end)
-    // Sourcery #270：打开期间滚动/缩放不重量，弹层会按旧方向/高度被裁掉。
+    // 定位算给 computePosition（floating-ui）：strategy 固定 + offset/flip/shift/size 四件套。
+    assert.ok(seg.includes('computePosition(btn, pop, {') && seg.includes("strategy: 'fixed'"),
+      'MiniSelect 弹层必须走 computePosition（strategy: fixed）')
+    assert.ok(/middleware: \[\s*offset\(6\),\s*flip\(\),\s*shift\(\{ padding: 8 \}\),\s*size\(/.test(seg),
+      '中间件必须依次是 offset(6) → flip → shift(8) → size（顺序即语义：先翻再夹再压高）')
+    assert.ok(seg.includes('availableHeight') && seg.includes('style.maxHeight') && seg.includes('SELECT_MAX_H'),
+      '高度必须由 size() 按可用高度压 max-height（上限 320）')
+    assert.ok(seg.includes('minWidth') && seg.includes('rects.reference.width'),
+      '弹层最小宽度须跟随按钮宽度（fixed 下 min-width:100% 会变成整屏宽）')
+    assert.ok(!/place\.(up|dx|max)/.test(seg), '不得再自己算 up/dx/max（方向与夹取已收给库）')
+    // Sourcery #270：打开期间滚动/缩放不重量，弹层会停在旧位置的空白处。库不自带监听
+    // （autoUpdate 没进 bundle），这一对监听必须留在组件里。
     assert.ok(seg.includes("window.addEventListener('scroll', schedule"), '打开期间页面滚动须重新量测')
     assert.ok(seg.includes("window.addEventListener('resize', schedule"), '打开期间视口缩放须重新量测')
-    // 靠左的按钮 + 更宽选项：right:0 会把弹层推出左边界。
-    assert.ok(seg.includes('const left = Math.min(Math.max(pad, b.right - w)'), '弹层须做水平视口夹取')
-    assert.ok(/left:\$\{place\.dx\}px;right:auto/.test(seg), '弹层水平位置须由量测结果决定')
     // Tab 不能落回即将卸载的选项，否则焦点掉 body。
     assert.ok(seg.includes('focusOutside') && seg.includes('DOCUMENT_POSITION_FOLLOWING'), 'Tab 须显式把焦点送出组件')
     // aria-label 覆盖可见文字时必须带回当前值。
@@ -7218,6 +7226,8 @@ async function main () {
     assert.ok(seg.includes('disabled = false') && /disabled=\$\{disabled\}/.test(seg), 'MiniSelect 须支持 disabled')
     // 过滤规则页的回滚目标也不能漏（Sourcery #270）。
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(src.includes("from './floating-ui.module.js'"), '定位库必须按白名单路由名导入（漏登记 = 404 整页白屏）')
+    assert.ok(/\.mini-pop\s*\{[^}]*position:\s*fixed/.test(css), '.mini-pop 必须 fixed 定位（与 strategy:fixed 对应）')
     assert.ok(src.includes('ariaLabel="回滚目标"'), '回滚目标必须改用 MiniSelect')
     assert.ok(!src.includes('fr-select'), '原生 fr-select 样式与用法必须移除')
     assert.ok(!/<select\s+(?:id|class)=/.test(src), '控制台不得再有原生 select')
@@ -8409,8 +8419,12 @@ async function main () {
     assert.ok(tipSrc.includes("document.addEventListener('pointerdown', onDown, true)"),
       '点页面任意其它地方必须收回（document 捕获 pointerdown）')
     assert.ok(/e\.key === 'Escape'/.test(tipSrc), 'Esc 必须能收回')
-    assert.ok(tipSrc.includes('getBoundingClientRect()') && tipSrc.includes('window.innerWidth - 24'),
-      '必须按触发区位置算弹层坐标，并夹在视口内')
+    assert.ok(tipSrc.includes('computePosition(box, pop, {') && tipSrc.includes("strategy: 'fixed'"),
+      '弹层坐标必须交给 computePosition（strategy: fixed）')
+    assert.ok(tipSrc.includes('middleware: [offset(8), flip(), shift({ padding: 8 })]'),
+      '弹层方向/夹取必须走 offset(8) + flip + shift(padding 8)')
+    assert.ok(tipSrc.includes('window.innerWidth - 24'), '宽度仍须按视口收窄（200～360，不超视口 24px）')
+    assert.ok(!tipSrc.includes('getBoundingClientRect()'), '不得再自己量触发区算 top/left（定位已收给库）')
 
     // ② 弹层必须 fixed：.sync 是 overflow:hidden，绝对定位会被裁掉（等于没弹）。
     const popCss = css.slice(css.indexOf('.tap-tip-pop {'), css.indexOf('}', css.indexOf('.tap-tip-pop {')))

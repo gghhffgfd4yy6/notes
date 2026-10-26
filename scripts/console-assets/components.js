@@ -1,10 +1,12 @@
 // scripts/console-assets/components.js —— 控制台公用零件（v3.368 从 ui.js 拆出）。
 // 状态徽章 / 提示 / 折叠 / 面板头 / 骨架 / 按钮 / 下拉 / 日期区间 / 卡片 / 状态卡 / 触发条 / 二次确认弹窗。
-// 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js 与 flatpickr；不认识任何页面，也没有顶层副作用。
+// 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js、flatpickr 与 floating-ui；不认识任何页面，也没有顶层副作用。
 // 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
 import { ageFromStamp, dateRangeLabel, relDay } from './pure.mjs'
 import flatpickr from './flatpickr.js'
+// 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
+import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
 import { MOTION, useMorphDialog, useMountReveal, useRevealWhen } from './motion.js'
 import { TZ_LABEL } from './constants.js'
 import { fmtClock, fmtDuration, fmtLocalTime, fmtNum } from './format.js'
@@ -59,12 +61,19 @@ function fmtWeekday (ts) {
   return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
 }
 
+// 两个弹层共用：computePosition 的结果直写 DOM。不走 vdom 的 style 属性——控制台每 500ms
+// 重渲染一次，字符串 style 会把这里刚写好的定位值整条覆盖（旧实现为此每次滚动 setState）。
+function placeAt (pop, x, y) {
+  pop.style.left = `${Math.round(x)}px`
+  pop.style.top = `${Math.round(y)}px`
+}
+
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
 // 其它任意地方/按 Esc 收回。弹层用 position: fixed：祖先 .sync 是 overflow:hidden，绝对定位
-// 会被裁掉；fixed 也不受滚动容器影响（滚动时直接收回，避免跟着飘）。
+// 会被裁掉；fixed 也不受滚动容器影响（滚动时直接收回，避免跟着飘）。定位算给 @floating-ui/dom。
 function TapTip ({ tip, hint, children, showDate = true }) {
   const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState(null)
+  const [ready, setReady] = useState(false)
   const boxRef = useRef(null)
   const popRef = useRef(null)
   useEffect(() => {
@@ -85,16 +94,30 @@ function TapTip ({ tip, hint, children, showDate = true }) {
       window.removeEventListener('scroll', onScroll, true)
     }
   }, [open])
+  // 定位：宽度口径不变（200～360，且不超视口 24px），方向/夹取交给 computePosition。
+  // 直接写 left/top 而不是走 style 属性——顶栏每秒重渲染，字符串 style 会把这里刚写好的
+  // 定位值整条覆盖（首帧先由 CSS 的 visibility:hidden 兜住，量完再显形）。
+  useLayoutEffect(() => {
+    if (!open) return undefined
+    const box = boxRef.current
+    const pop = popRef.current
+    if (!box || !pop) return undefined
+    pop.style.width = `${Math.min(360, Math.max(200, window.innerWidth - 24))}px`
+    computePosition(box, pop, {
+      strategy: 'fixed',
+      placement: 'bottom-start',
+      middleware: [offset(8), flip(), shift({ padding: 8 })]
+    }).then(({ x, y }) => {
+      if (!popRef.current) return
+      placeAt(popRef.current, x, y)
+      setReady(true)
+    })
+    return undefined
+  }, [open])
   if (!tip) return html`${children}`
   const toggle = () => {
     if (open) { setOpen(false); return }
-    const box = boxRef.current
-    if (box) {
-      const r = box.getBoundingClientRect()
-      const width = Math.min(360, Math.max(200, window.innerWidth - 24))
-      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8))
-      setPos({ top: Math.round(r.bottom + 6), left: Math.round(left), width: Math.round(width) })
-    }
+    setReady(false)
     setOpen(true)
   }
   return html`<span class=${showDate ? 'tap-tip tap-tip-date' : 'tap-tip'} ref=${boxRef} role="button" tabindex="0"
@@ -103,8 +126,7 @@ function TapTip ({ tip, hint, children, showDate = true }) {
       onKeyDown=${(e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); toggle() }
       }}><span class="tap-tip-text">${children}</span>${hint && html`<span class="tap-tip-hint">${hint}</span>`}</span>
-    ${open && html`<span class="tap-tip-pop" ref=${popRef} role="tooltip"
-      style=${pos ? `top:${pos.top}px;left:${pos.left}px;width:${pos.width}px` : ''}>${tip}</span>`}`
+    ${open && html`<span class=${ready ? 'tap-tip-pop' : 'tap-tip-pop tap-tip-pop-wait'} ref=${popRef} role="tooltip">${tip}</span>`}`
 }
 
 // 提示行：tone='error' 红色、tone='warn' 琥珀色。页面不再拼 'hint hint-err' 字符串。
@@ -168,11 +190,15 @@ function Button ({ variant = 'secondary', disabled, onClick, title, buttonRef, a
 // 不用原生 <select>：Android Chrome 会弹全屏白底系统列表，和暗色控制台完全割裂
 // （分类筛选已因此改 CategoryPicker）。这里保留锚定弹层：选项少时不铺满屏幕，
 // 空间不足向上翻，键盘/触屏同一套交互。
+// 定位交给 @floating-ui/dom（floating-ui.module.js）：strategy 固定 + offset/flip/shift/size，
+// 自家只留「什么时候重量」与键盘/焦点。SELECT_MAX_H 是弹层上限（旧实现写死 320）。
+const SELECT_MAX_H = 320
+
 function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) {
   const list = Array.isArray(options) ? options : []
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(0)
-  const [place, setPlace] = useState({ up: false, max: 240, dx: 0, ready: false })
+  const [ready, setReady] = useState(false)
   const rootRef = useRef(null)
   const btnRef = useRef(null)
   const popRef = useRef(null)
@@ -194,37 +220,46 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
     else if (r.bottom > pr.bottom) pop.scrollTop += (r.bottom - pr.bottom)
   }
 
-  // 先量再显示：首帧用 visibility:hidden，避免先按「向下」铺一帧再跳到上方。
-  // 打开期间滚动/缩放也要重量：否则页面滚走后方向与高度还是旧值，选项会被裁掉。
+  // 位置只由 computePosition 算：left/top 直写 DOM，size 阶段写 max-height/min-width。
+  // 不走 vdom 的 style 属性——预加载轮询每 500ms 重渲染一次，字符串 style 会把这里刚写好的
+  // 定位值整条覆盖；直写也就不需要为「滚一下」而 setState。
+  const position = useCallback(() => {
+    const btn = btnRef.current
+    const pop = popRef.current
+    if (!btn || !pop) return
+    computePosition(btn, pop, {
+      strategy: 'fixed',
+      // 右缘对齐按钮（旧实现 right:0 的等价形）；flip 翻上去时仍是右缘对齐。
+      placement: 'bottom-end',
+      middleware: [
+        offset(6),
+        flip(),
+        shift({ padding: 8 }),
+        size({
+          apply ({ availableHeight, rects, elements }) {
+            const max = Math.max(48, Math.min(SELECT_MAX_H, Math.round(availableHeight)))
+            elements.floating.style.maxHeight = `${max}px`
+            elements.floating.style.minWidth = `${Math.round(rects.reference.width)}px`
+          }
+        })
+      ]
+    }).then(({ x, y }) => {
+      if (!popRef.current) return
+      placeAt(popRef.current, x, y)
+      setReady(true)
+    })
+  }, [])
+
+  // 先量再显示：首帧 visibility:hidden，避免先按「向下」铺一帧再翻到上方。
+  // 打开期间滚动/缩放要重量（否则页面滚走后弹层停在旧位置的空白处）：rAF 合并同帧事件。
   useLayoutEffect(() => {
     if (!open) return undefined
     let raf = 0
-    const measure = () => {
-      const btn = btnRef.current
-      const pop = popRef.current
-      if (!btn || !pop) return
-      const b = btn.getBoundingClientRect()
-      const vw = window.innerWidth
-      const vh = window.innerHeight
-      const below = vh - b.bottom - 10
-      const above = b.top - 10
-      const natural = Math.min(pop.scrollHeight + 2, 320)
-      const up = below < Math.min(natural, 200) && above > below
-      const max = Math.max(48, Math.min(natural, up ? above : below))
-      // 水平也做视口夹取：默认右对齐，靠左的按钮 + 更长选项时不能越出左边界。
-      const w = pop.getBoundingClientRect().width
-      const pad = 8
-      const left = Math.min(Math.max(pad, b.right - w), Math.max(pad, vw - w - pad))
-      const dx = Math.round(left - b.left)
-      setPlace((prev) => (prev.ready && prev.up === up && prev.max === max && prev.dx === dx
-        ? prev
-        : { up, max, dx, ready: true }))
-    }
     const schedule = () => {
       if (raf) return
-      raf = window.requestAnimationFrame(() => { raf = 0; measure() })
+      raf = window.requestAnimationFrame(() => { raf = 0; position() })
     }
-    measure()
+    position()
     window.addEventListener('resize', schedule)
     window.addEventListener('scroll', schedule, { passive: true })
     return () => {
@@ -232,16 +267,16 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
       window.removeEventListener('resize', schedule)
       window.removeEventListener('scroll', schedule)
     }
-  }, [open])
+  }, [open, position])
 
   useEffect(() => {
     if (!open) { focusedRef.current = false; return undefined }
-    if (!place.ready || focusedRef.current) return undefined
+    if (!ready || focusedRef.current) return undefined
     focusedRef.current = true
     setActive(selIdx)
     focusOpt(selIdx)
     return undefined
-  }, [open, place.ready, selIdx])
+  }, [open, ready, selIdx])
 
   useEffect(() => {
     if (!open) return undefined
@@ -257,7 +292,7 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
 
   const openMenu = () => {
     if (disabled) return
-    setPlace({ up: false, max: 240, dx: 0, ready: false })
+    setReady(false)
     setActive(Math.max(0, list.findIndex((o) => o.value === value)))
     setOpen(true)
   }
@@ -331,8 +366,7 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
       <span class="mini-label">${buttonLabel}</span>
       <span class="mini-caret" aria-hidden="true">▾</span>
     </button>
-    ${open && html`<div class="mini-pop" ref=${popRef} role="listbox" aria-label=${ariaLabel}
-      style=${`left:${place.dx}px;right:auto;max-height:${place.max}px;visibility:${place.ready ? 'visible' : 'hidden'};${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
+    ${open && html`<div class=${ready ? 'mini-pop' : 'mini-pop mini-pop-wait'} ref=${popRef} role="listbox" aria-label=${ariaLabel}>
       ${list.map((o, i) => html`<button type="button" key=${o.value} data-idx=${i}
         class=${'mini-opt' + (o.value === value ? ' on' : '')}
         role="option" aria-selected=${o.value === value ? 'true' : 'false'}

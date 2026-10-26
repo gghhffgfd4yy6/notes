@@ -690,7 +690,9 @@ const STATIC_ASSETS = Object.freeze({
   // v3.360 动效层：motion.js 是自家适配层，另一个是 esbuild 打成单文件的
   // motion/mini 14.6.0（MIT，无 CDN 依赖）。列表 FLIP 自己实现，不引第二个库。
   '/assets/motion.js': { file: 'motion.js', type: 'text/javascript; charset=utf-8' },
-  '/assets/motion-lib.module.js': { file: 'motion-lib.module.js', type: 'text/javascript; charset=utf-8' }
+  '/assets/motion-lib.module.js': { file: 'motion-lib.module.js', type: 'text/javascript; charset=utf-8' },
+  // 定位引擎：@floating-ui/dom 1.8.0（MIT）单文件 bundle，只含 computePosition/offset/flip/shift/size。
+  '/assets/floating-ui.module.js': { file: 'floating-ui.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
 // 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
@@ -1019,7 +1021,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
     .replace(/>/g, '\\u003e')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029')
-  // 首屏模块预加载（v3.373）：app.js 是唯一入口，浏览器必须先拿到并解析它才知道有 11 个
+  // 首屏模块预加载（v3.373）：app.js 是唯一入口，浏览器必须先拿到并解析它才知道有 12 个
   // 依赖模块——「取 app.js → 解析 → 再并发取模块」是一段可见的瀑布。这里按体积从大到小
   // 预声明整张静态 import 闭包（test_console.js 用 acorn 算闭包逐字对账，漏一个/多一个都红）。
   // 预加载与入口共用同一个**版本路径**（v3.375）：模块说明符是 './xxx.js'，从
@@ -1042,6 +1044,7 @@ function renderPage (state, runsList, query, sessionToken, theme, instanceId = '
 <link rel="modulepreload" href="${assetBaseUrl}/pure.mjs">
 <link rel="modulepreload" href="${assetBaseUrl}/motion.js">
 <link rel="modulepreload" href="${assetBaseUrl}/motion-lib.module.js">
+<link rel="modulepreload" href="${assetBaseUrl}/floating-ui.module.js">
 <link rel="modulepreload" href="${assetBaseUrl}/api.js">
 <link rel="modulepreload" href="${assetBaseUrl}/constants.js">
 <link rel="modulepreload" href="${assetBaseUrl}/format.js">
