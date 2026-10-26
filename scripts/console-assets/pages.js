@@ -4,10 +4,12 @@
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
-import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, useHoldRepeat } from './components.js'
+import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
+// 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
+import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 
 function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
@@ -342,8 +344,7 @@ function listLandTarget (el) {
   if (!el) return null
   const rect = el.getBoundingClientRect()
   if (!(rect.height > 0)) return null
-  const tabs = document.querySelector('.tabs')
-  const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+  const pad = stickyPad()
   const top = rect.top + window.scrollY - pad
   const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
   return Math.max(0, Math.min(top, max))
@@ -415,9 +416,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
     if (!el) return
     const rect = el.getBoundingClientRect()
     if (!(rect.height > 0)) return
-    const tabs = document.querySelector('.tabs')
-    const tabsH = tabs ? tabs.getBoundingClientRect().height : 0
-    const listTop = rect.top + window.scrollY - tabsH - 8
+    const listTop = rect.top + window.scrollY - stickyPad()
     if (!(window.scrollY > listTop)) return
     landRef.current = true
     armedDataRef.current = data
@@ -1215,32 +1214,81 @@ function flatCateLeaves (node, out = []) {
 // 分类筛选：自定义弹层而不是原生 <select>。
 // Android 上原生 select 会弹出全屏白底系统列表（80+ 分类、无搜索、与暗色控制台割裂），
 // 这里改为暗色下拉 + 搜索，手机端贴底弹出，选中项打勾。
+// 弹层高度上限：搜索框 + 面包屑 + .cate-list(300) + 脚注，旧实现写死 380。
+const CATE_MAX_H = 380
 function CategoryPicker ({ value, categories, total, onChange, pageActive = true }) {
   const [open, setOpen] = useState(false)
   const [q, setQ] = useState('')
   const [path, setPath] = useState([])
   const [active, setActive] = useState(0)
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 640px)').matches)
-  // ready=false 时弹层先 visibility:hidden：桌面首帧的 up/max 还没量过，不能拿默认值上屏。
-  const [place, setPlace] = useState({ up: false, max: 380, ready: false })
+  // ready=false 时弹层先 visibility:hidden（.cate-pop-wait）：桌面首帧坐标还没算出来，
+  // 不能先按「向下」铺一帧再翻上去。窄屏是 CSS 贴底模态，不用量测，直接可见。
+  const [ready, setReady] = useState(false)
   const rootRef = useRef(null)
   const btnRef = useRef(null)
   const popRef = useRef(null)
   const searchRef = useRef(null)
   const listRef = useRef(null)
-  // 键盘导航时焦点既要避免带动整页滚动，又必须把选项滚进 .cate-list 的可视区。
-  // 只调 focus({preventScroll:true}) 会让长列表里获得焦点的项停在视口外（Sourcery #254）。
-  const focusInList = (el) => {
-    if (!el) return
-    el.focus({ preventScroll: true })
-    const list = listRef.current
-    if (!list) return
-    if (!list.contains(el)) return
-    const r = el.getBoundingClientRect()
-    const lr = list.getBoundingClientRect()
-    if (r.top < lr.top) list.scrollTop -= (lr.top - r.top)
-    else if (r.bottom > lr.bottom) list.scrollTop += (r.bottom - lr.bottom)
-  }
+  // 位置只由 computePosition 算（同 MiniSelect）：left/top 直写 DOM，不走 vdom 的 style
+  // 属性——轮询每 500ms 重渲染一次，字符串 style 会把刚算好的坐标整条覆盖。方向（翻上/
+  // 翻下）、视口夹取与高度上限都交给中间件，组件里不再自己量 below/above（也就没有迟滞）。
+  const position = useCallback(() => {
+    const btn = btnRef.current
+    const pop = popRef.current
+    if (!btn || !pop) return
+    computePosition(btn, pop, {
+      strategy: 'fixed',
+      // 左缘对齐按钮（旧实现 left:0 的等价形）；flip() 翻上去时仍左缘对齐。
+      placement: 'bottom-start',
+      middleware: [
+        offset(8),
+        flip(),
+        shift({ padding: 8 }),
+        size({
+          apply ({ availableHeight, elements }) {
+            // 下限只保 1px：可用空间不足时写死更大的下限会把弹层顶出视口。
+            const max = Math.max(1, Math.min(CATE_MAX_H, Math.round(availableHeight)))
+            elements.floating.style.maxHeight = `${max}px`
+          }
+        })
+      ]
+    }).then(({ x, y }) => {
+      if (!popRef.current) return
+      placeAt(popRef.current, x, y)
+      setReady(true)
+    })
+  }, [])
+  // 打开/断点切换/滚动/缩放都重新定位（库不自带 autoUpdate，监听留在组件里；rAF 合并同帧）。
+  // 必须 useLayoutEffect：坐标要赶在首帧绘制前写进 DOM，否则会先看到未定位的弹层。
+  // 窄屏走 CSS 贴底模态（app.css 的 ≤640 媒体查询覆写 .cate-pop）：不量测，并把上一轮
+  // 桌面写下的内联 left/top/max-height 清掉——内联值会压过媒体查询，模态会被拽到别处。
+  useLayoutEffect(() => {
+    if (!open) return undefined
+    const pop = popRef.current
+    if (narrow) {
+      if (pop) {
+        pop.style.left = ''
+        pop.style.top = ''
+        pop.style.maxHeight = ''
+      }
+      setReady(true)
+      return undefined
+    }
+    let raf = 0
+    const schedule = () => {
+      if (raf) return
+      raf = window.requestAnimationFrame(() => { raf = 0; position() })
+    }
+    position()
+    window.addEventListener('resize', schedule)
+    window.addEventListener('scroll', schedule, { passive: true })
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf)
+      window.removeEventListener('resize', schedule)
+      window.removeEventListener('scroll', schedule)
+    }
+  }, [open, narrow, position])
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 640px)')
     const on = () => setNarrow(mq.matches)
@@ -1269,7 +1317,7 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
     if (!pageActive && open) setOpen(false)
   }, [pageActive, open])
   // 打开时：桌面把焦点放进搜索框；手机聚焦当前选项（不弹软键盘）。
-  // 依赖 place.ready：桌面首帧弹层是 visibility:hidden（等量测），此时 focus 会被忽略；
+  // 依赖 ready：桌面首帧弹层是 visibility:hidden（等坐标），此时 focus 会被忽略；
   // ready 翻真、弹层可见后再跑一次，否则首次打开焦点进不了搜索框。
   useEffect(() => {
     if (!open) return undefined
@@ -1278,66 +1326,15 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
       // 重置渲染后焦点就丢了。延后一拍，等新一级列表渲染完再聚焦（与 focusFirst 同口径）。
       const t = setTimeout(() => {
         const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-        if (el) focusInList(el)
+        if (el) scrollIntoBox(el, listRef.current)
       }, 0)
       return () => clearTimeout(t)
     }
     if (searchRef.current) searchRef.current.focus({ preventScroll: true })
     return undefined
-  }, [open, narrow, place.ready])
+  }, [open, narrow, ready])
   // 搜索词/层级变化后回到第一项，避免 active 指向已被过滤掉的项。
   useEffect(() => { setActive(0) }, [q, path])
-  // 桌面端空间不足时向上翻，并按可用高度限制弹层，避免被视口底边裁掉。
-  // 必须 useLayoutEffect：量测要赶在首帧绘制前完成。用 useEffect 时弹层会先按默认的
-  // 「向下」铺一帧，量到下方不够再跳到上方，肉眼就是先下坠再弹起。ready 未就绪时隐身兜底。
-  useLayoutEffect(() => {
-    if (!open || narrow) return undefined
-    let raf = 0
-    const measure = () => {
-      const btn = btnRef.current
-      if (!btn) {
-        // 量不到按钮就退回默认值，绝不能让弹层一直停在 visibility:hidden。
-        setPlace((prev) => (prev.ready ? prev : { up: false, max: 380, ready: true }))
-        return
-      }
-      const r = btn.getBoundingClientRect()
-      const below = window.innerHeight - r.bottom - 12
-      const above = r.top - 12
-      const want = 380
-      const cutoff = Math.min(300, want)
-      const H = 8
-      // 首次量测按硬阈值定方向；之后方向也走 8px 迟滞：页面在临界线附近小幅滚动时保持
-      // 当前朝向。否则 up 一翻转，下面的 prev.up === up 就必然不成立，弹层会跟着上下跳。
-      const baseUp = below < cutoff && above > below
-      setPlace((prev) => {
-        const up = !prev.ready
-          ? baseUp
-          : (prev.up
-              ? !(below > cutoff + H && below > above + H) // 已在上方：明显更该在下方才翻
-              : (below < cutoff - H && above > below + H)) // 已在下方：明显更该在上方才翻
-        // 下限只保 1px：写死 180px 这类下限，在可用空间不足时会把弹层撑出视口。
-        const max = Math.max(1, Math.min(want, up ? above : below))
-        // 方向与高度都没跨过阈值时返回同一对象，preact 的 useState 会直接跳过重渲染。
-        return prev.ready && prev.up === up && Math.abs(prev.max - max) < H ? prev : { up, max, ready: true }
-      })
-    }
-    // open/断点变化：先回到未就绪，再同步量测，避免沿用上一轮的 up/max。
-    setPlace({ up: false, max: 380, ready: false })
-    measure()
-    // 只监听 window 的 scroll（不 capture）：capture 会把 .cate-list 内部滚动也收进来，
-    // 列表每滚一下都重算定位，阈值附近就上下反复。rAF 合并同帧的多次 scroll/resize。
-    const schedule = () => {
-      if (raf) return
-      raf = window.requestAnimationFrame(() => { raf = 0; measure() })
-    }
-    window.addEventListener('resize', schedule)
-    window.addEventListener('scroll', schedule, { passive: true })
-    return () => {
-      if (raf) window.cancelAnimationFrame(raf)
-      window.removeEventListener('resize', schedule)
-      window.removeEventListener('scroll', schedule, { passive: true })
-    }
-  }, [open, narrow])
   useEffect(() => {
     if (!open) return
     const onDown = (e) => {
@@ -1355,7 +1352,7 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
         if (f.length === 0) return
         const first = f[0]
         const last = f[f.length - 1]
-        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); focusInList(last) } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); focusInList(first) }
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); scrollIntoBox(last, popRef.current) } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); scrollIntoBox(first, popRef.current) }
       }
     }
     document.addEventListener('mousedown', onDown)
@@ -1397,7 +1394,7 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
   const focusFirst = () => {
     setTimeout(() => {
       const el = listRef.current && listRef.current.querySelector('.cate-opt[tabindex="0"]')
-      if (el) focusInList(el)
+      if (el) scrollIntoBox(el, listRef.current)
     }, 0)
   }
   const choose = (name) => {
@@ -1453,17 +1450,24 @@ function CategoryPicker ({ value, categories, total, onChange, pageActive = true
     if (next >= 0) {
       e.preventDefault()
       setActive(next)
-      focusInList(opts[next])
+      scrollIntoBox(opts[next], listRef.current)
     }
+  }
+  // 重开时必须把 ready 归零：上次打开残留 true 会让弹层先按未定位的坐标可见一帧
+  // （关闭时坐标还是上一轮的，页签保活/滚动后早就过期）。
+  const toggle = () => {
+    if (open) { setOpen(false); return }
+    setReady(false)
+    setOpen(true)
   }
   return html`<div class="cate-picker" ref=${rootRef}>
     <button type="button" class="cate-btn" ref=${btnRef} aria-haspopup="dialog"
-      aria-expanded=${open ? 'true' : 'false'} onClick=${() => setOpen(!open)}>
+      aria-expanded=${open ? 'true' : 'false'} onClick=${toggle}>
       <span class="cate-btn-label">${label}</span><span class="cate-caret" aria-hidden="true">▾</span>
     </button>
     ${open && html`<div class="cate-backdrop" aria-hidden="true" onClick=${dismiss}></div>
-      <div class="cate-pop" ref=${popRef} role="dialog" aria-modal=${narrow ? 'true' : 'false'} aria-label="分类筛选"
-        style=${narrow ? '' : `max-height:${place.max}px;visibility:${place.ready ? 'visible' : 'hidden'};${place.up ? 'top:auto;bottom:calc(100% + 6px);' : ''}`}>
+      <div class=${'cate-pop' + (ready ? '' : ' cate-pop-wait')} ref=${popRef} role="dialog"
+        aria-modal=${narrow ? 'true' : 'false'} aria-label="分类筛选">
         <input class="cate-search" ref=${searchRef} type="search" placeholder="搜索全部分类…"
           value=${q} onInput=${(e) => setQ(e.target.value)} onKeyDown=${onListKey} />
         ${kw === ''
@@ -1658,9 +1662,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     if (!el) return
     const rect = el.getBoundingClientRect()
     if (!(rect.height > 0)) return
-    const tabs = document.querySelector('.tabs')
-    const tabsH = tabs ? tabs.getBoundingClientRect().height : 0
-    const listTop = rect.top + window.scrollY - tabsH - 8
+    const listTop = rect.top + window.scrollY - stickyPad()
     if (!(window.scrollY > listTop)) return
     landRef.current = true
     armedDataRef.current = dataRef.current
@@ -4425,8 +4427,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     el.focus({ preventScroll: true })
     // 视口里「哪一行错了」要一眼看见：聚焦后补一次抖动 + 红圈脉冲。
     flash(el, 'bad')
-    const tabs = document.querySelector('.tabs')
-    const pad = (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+    const pad = stickyPad()
     const top = el.getBoundingClientRect().top + window.scrollY - pad
     const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
     window.scrollTo(0, Math.max(0, Math.min(top, max)))
@@ -4956,6 +4957,7 @@ const LOG_SCROLLER = '.logpre-main'
 
 export {
   CacheHealthPanel,
+  CategoryPicker,
   ConfigPanel,
   FilesPanel,
   FilterRulesPanel,

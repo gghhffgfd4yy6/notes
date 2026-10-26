@@ -933,13 +933,18 @@
   .cate-caret { color: var(--text-dim); flex: 0 0 auto; }
   .cate-backdrop { display: none; }
   .cate-pop {
-    position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
+    /* 定位由 floating-ui 直写 left/top（strategy: fixed）：视口坐标系，不受 .cate-picker
+       祖先的 overflow/定位影响；max-height 由 size() 按可用高度覆写（上限 380）。
+       手机端由下面 ≤640 的媒体查询整条改成贴底模态，坐标交给 CSS。 */
+    position: fixed; z-index: 40; top: 0; left: 0;
     width: min(360px, calc(100vw - 48px)); padding: var(--sp-2);
     padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom));
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
     box-shadow: 0 12px 32px rgba(0, 0, 0, .45); display: flex; flex-direction: column;
     overscroll-behavior: contain;
   }
+  /* 首帧：computePosition 还没回值，先隐身（占位仍在，量得到宽高），避免先按「向下」铺一帧。 */
+  .cate-pop-wait { visibility: hidden; }
   .cate-search {
     width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--r-sm); padding: 8px 10px; font-size: var(--fs-sm);

@@ -18,6 +18,16 @@ export function backToTopBehavior (reduceMotion, supportsSmooth) {
   return reduceMotion || !supportsSmooth ? null : 'smooth'
 }
 
+// 键盘导航把列表项滚进内层滚动框：返回要加到 box.scrollTop 上的增量（负 = 向上）。
+// 只做矩形比较与差值、不碰 DOM ⇒ Node 侧可直接行为断言；组件里的 scrollIntoBox()
+// 负责 focus({preventScroll:true}) 再把这个增量写回 scrollTop。
+// 项比框还高时（elTop < boxTop 且 elBottom > boxBottom）以顶边为准：滚动后至少看得到首行。
+export function scrollDeltaInto (elRect, boxRect) {
+  if (elRect.top < boxRect.top) return elRect.top - boxRect.top
+  if (elRect.bottom > boxRect.bottom) return elRect.bottom - boxRect.bottom
+  return 0
+}
+
 // 切页用浏览器原生 View Transitions 的能力判定（淡入淡出，零依赖）。
 // 三个条件缺一不可：宿主真的实现了 startViewTransition、动效开关为真、根元素在
 // （root 快照要挂到 documentElement 上，没有它调用会直接抛）。同名的非函数值也算没有：

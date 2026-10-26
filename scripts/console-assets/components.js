@@ -3,7 +3,7 @@
 // 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js、flatpickr 与 floating-ui；不认识任何页面，也没有顶层副作用。
 // 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
-import { ageFromStamp, dateRangeLabel, relDay } from './pure.mjs'
+import { ageFromStamp, dateRangeLabel, relDay, scrollDeltaInto } from './pure.mjs'
 import flatpickr from './flatpickr.js'
 // 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -66,6 +66,26 @@ function fmtWeekday (ts) {
 function placeAt (pop, x, y) {
   pop.style.left = `${Math.round(x)}px`
   pop.style.top = `${Math.round(y)}px`
+}
+
+// 键盘导航把列表项滚进内层滚动框（MiniSelect 与 CategoryPicker 共用，原来两处各写一遍）。
+// 只调 focus({preventScroll:true}) 会把获得焦点的项停在框外（Sourcery #254）；让浏览器默认
+// focus 滚动又会把整页猛地带下去。矩形比较与差值收在 pure.mjs 的 scrollDeltaInto（Node 可测），
+// 这里只负责 focus 与把增量写回 scrollTop。
+function scrollIntoBox (el, box) {
+  if (!el) return
+  el.focus({ preventScroll: true })
+  if (!box || !box.contains(el)) return
+  const d = scrollDeltaInto(el.getBoundingClientRect(), box.getBoundingClientRect())
+  if (d !== 0) box.scrollTop += d
+}
+
+// 吸顶页签下方的落点留白 = .tabs 实测高度 + 8。列表落点、落点门（推送记录/逐轮历史）、
+// 过滤规则首个错误行、日志行定位五处同口径；散着写时漏一处 +8 就整体偏 8px。
+// 用 height 而不是 bottom：页签还没吸顶时 bottom 会多算它自己的页面偏移。
+function stickyPad () {
+  const tabs = document.querySelector('.tabs')
+  return (tabs ? tabs.getBoundingClientRect().height : 0) + 8
 }
 
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
@@ -212,12 +232,9 @@ function MiniSelect ({ value, options, onChange, ariaLabel, disabled = false }) 
     if (!pop) return
     const el = pop.querySelector(`[data-idx="${i}"]`)
     if (!el) return
-    // preventScroll：弹层在页面下部时，浏览器默认 focus 会把整页猛地滚下去。
-    el.focus({ preventScroll: true })
-    const r = el.getBoundingClientRect()
-    const pr = pop.getBoundingClientRect()
-    if (r.top < pr.top) pop.scrollTop -= (pr.top - r.top)
-    else if (r.bottom > pr.bottom) pop.scrollTop += (r.bottom - pr.bottom)
+    // preventScroll + 手工把项滚进弹层可视区（共用 scrollIntoBox）：弹层在页面下部时，
+    // 浏览器默认 focus 会把整页猛地滚下去。
+    scrollIntoBox(el, pop)
   }
 
   // 位置只由 computePosition 算：left/top 直写 DOM，size 阶段写 max-height/min-width。
@@ -1376,5 +1393,8 @@ export {
   clampAutoSeconds,
   fmtWeekday,
   inDayRange,
+  placeAt,
+  scrollIntoBox,
+  stickyPad,
   useHoldRepeat
 }
