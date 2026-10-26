@@ -6709,6 +6709,10 @@ async function main () {
     // 行内展开的旧实现整体退场：展开态 state、caret、行内正文块全删（不留死代码）。
     assert.ok(!msg.includes('msg-content'), '不得再渲染行内展开的 .msg-content 块')
     assert.ok(!msg.includes('msg-caret'), '行内展开的 caret 必须删掉')
+    // 样式也得跟着走：DOM 删了、规则留着，下一个人会以为还有别处在用这两条。
+    const cssSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(!cssSrc.includes('.msg-content'), '行内正文的 .msg-content 样式必须一起删掉')
+    assert.ok(!cssSrc.includes('.msg-caret'), '行内展开的 .msg-caret 样式必须一起删掉')
     assert.ok(!msg.includes('aria-expanded=$' + '{expanded'), '行内展开的 aria-expanded 必须退场（弹出的是对话框，不是展开行）')
     assert.ok(msg.includes('aria-haspopup="dialog"'), '行标题按钮必须声明弹出的是对话框')
     assert.ok(msg.includes('title="查看详情"'), '行标题的 title 必须是「查看详情」语义')
