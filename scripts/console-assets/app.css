@@ -236,6 +236,11 @@
   /* v3.330：下拉刷新由页面内接管（Chrome 原生下拉会整页重载，文档重建后首帧必然重画，
      数据回得越快越像「闪一下」）。contain 关掉内核手势，页面滚动本身不受影响。 */
   html, body { overscroll-behavior-y: contain; }
+  /* 根元素必须自己带底色（v3.376）。只给 body 上色时，普通绘制没问题（画布颜色会从
+     body 传播），但 View Transitions 抓的是**根元素快照**：html 没有背景就按透明处理，
+     Android Chrome 在交叉淡入淡出的某些帧会漏出默认白画布——表现就是切页「闪一下白」，
+     而且只在快照与合成器时序凑上时才出现（所以是概率性的）。 */
+  html { background: var(--bg); }
   body {
     background: var(--bg);
     color: var(--text);
@@ -1641,6 +1646,9 @@ span.flatpickr-weekday { color: color-mix(in srgb, var(--text) 80%, transparent)
    红线：只动 opacity，绝不给 .page / :root 加 transform。页面里有 position:fixed 的弹层
    （分类选择器、提示气泡、回顶按钮），祖先一旦有 transform 就会改成按它定位，弹层会跳位；
    快照也不做缩放/位移，避免整页文字发虚。 */
+/* 过渡覆盖层本身也要有底色：快照淡出到一半时若浏览器提前把覆盖层合成掉，露出的
+   是这层背景而不是 UA 默认画布（白）。 */
+::view-transition { background-color: var(--bg); }
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation-duration: 220ms;

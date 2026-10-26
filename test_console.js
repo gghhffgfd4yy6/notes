@@ -7365,6 +7365,11 @@ async function main () {
     const pair = (css.match(/::view-transition-old\(root\),\s*::view-transition-new\(root\)\s*\{[^}]*\}/) || [''])[0]
     assert.ok(/animation-duration:\s*220ms/.test(pair), '淡出淡入必须 220ms（与 motion.js 的 MOTION.fast 同档）')
     assert.ok(/animation-timing-function:\s*ease-out/.test(pair), '曲线必须是 ease-out')
+    // v3.376：根元素与过渡覆盖层都要有底色——缺一个就会在 Android 的合成器时序里漏白。
+    assert.ok(/html\s*\{[^}]*background:\s*var\(--bg\)/.test(css),
+      'html 必须自己带底色（只给 body 上色时根快照是透明的，切页会漏出白画布）')
+    assert.ok(/::view-transition\s*\{[^}]*background-color:\s*var\(--bg\)/.test(css),
+      '过渡覆盖层必须有底色（快照淡出到一半时不得漏出 UA 默认白底）')
     assert.ok(!/::view-transition[^{]*\{[^}]*\btransform\s*:/.test(css),
       '快照过渡里不得出现 transform —— 页面里有 position:fixed 的弹层，祖先一有 transform 就按它定位')
     const page = (css.match(/\.page\s*\{[^}]*\}/) || [''])[0]
