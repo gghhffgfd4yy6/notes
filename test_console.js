@@ -67,6 +67,8 @@ const {
   clampQueryBytes, csvCell, exportRowOf, buildMessagesCsv,
   EXPORT_MAX_ROWS, EXPORT_EXCERPT_MAX, EXPORT_FORMATS,
   RUN_ID_RE, ssePlanChunk, SSE_TICK_MS, SSE_HEARTBEAT_MS, SSE_MAX_PENDING, SSE_MAX_CONNECTIONS,
+  // v3.374 全站 SSE 通知（/api/stream）：常量走导出，用例不自己写死 2s/20s/20
+  SSE_STREAM_TICK_MS, SSE_STREAM_HEARTBEAT_MS, SSE_STREAM_MAX_CONNECTIONS,
   REPLAY_WINDOW_NOTIFY_TEST_MS, ENTRY_SINGLE,
   // v3.340 控制台设置（通知自检拦截窗）：常量走导出，测试不自己写死 0/3600
   CONSOLE_SETTINGS_FILE, CONSOLE_SETTINGS_DEFAULT_S, NOTIFY_REPLAY_MIN_S, NOTIFY_REPLAY_MAX_S,
@@ -672,6 +674,9 @@ ok('shouldLogAccess: 降噪白名单表（仅 2xx 且命中才免记；/api/acce
     [['GET', '/api/status', 200], false],
     [['GET', '/api/status', 500], true],
     [['GET', '/api/runs', 200], false],
+    // v3.374：全站通知流是长连接，finish 时 ms=整段连接时长——照记会污染「慢请求」读数
+    [['GET', '/api/stream', 200], false],
+    [['GET', '/api/stream', 401], true],
     [['GET', '/api/runs/1750000000000.9', 200], false],
     [['GET', '/api/runs/1750000000000.9', 404], true],
     [['POST', '/api/runs/detail', 200], false],
@@ -757,6 +762,10 @@ ok('T-P2 SSE 常量与 RUN_ID_RE 形态', () => {
   assert.strictEqual(SSE_MAX_PENDING, 1048576)
   assert.strictEqual(SSE_TICK_MS, 500)
   assert.strictEqual(SSE_HEARTBEAT_MS, 15000)
+  // v3.374 全站通知流：2s 采样 / 20s 心跳 / 20 条上限（字面量锁死文档承诺，不引用常量自证）
+  assert.strictEqual(SSE_STREAM_TICK_MS, 2000)
+  assert.strictEqual(SSE_STREAM_HEARTBEAT_MS, 20000)
+  assert.strictEqual(SSE_STREAM_MAX_CONNECTIONS, 20)
   assert.strictEqual(RUN_ID_RE.test('1750000000000.1'), true)
   assert.strictEqual(RUN_ID_RE.test('abc'), false)
   assert.strictEqual(RUN_ID_RE.test('1750.1'), false)
@@ -954,8 +963,10 @@ function sseCollect (port, urlPath, { headers } = {}) {
   let raw = ''
   let ended = false
   let resRef = null
+  let resHeaders = null
   const req = http.request({ host: '127.0.0.1', port, path: urlPath, headers: headers || {} }, (res) => {
     resRef = res
+    resHeaders = res.headers
     res.setEncoding('utf8')
     res.on('data', (c) => {
       raw += c
@@ -1004,7 +1015,7 @@ function sseCollect (port, urlPath, { headers } = {}) {
     }
     return resRef !== null
   }
-  return { events, waitFor, close, pause, resume, ready, isEnded: () => ended }
+  return { events, waitFor, close, pause, resume, ready, isEnded: () => ended, headers: () => resHeaders }
 }
 // 注入式 fake record（cancel 用例同先例）+ 与生产 append 同语义的测试追加器
 // （output 与 outputTotalLength 必须同步——镜像生产约束）。
@@ -5062,6 +5073,245 @@ async function main () {
     assert.strictEqual(get.outputTotalLength, detail.outputTotalLength, 'GET 详情响应体等价')
     server.close()
   })
+  // ── v3.374 全站 SSE 通知（/api/stream）：变化才推、连接上限、收尾不挂 ──
+  // 只读响应头就返回的建连器：这条流永不 end（靠心跳与 tick），request() 会一直等下去。
+  const openLiveStream = (port) => new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: '/api/stream',
+      headers: { authorization: 'Bearer ' + TOKEN }
+    }, (res) => {
+      res.on('data', () => {}) // 保持流动，别让内核缓冲把服务端 write 卡成 false
+      resolve({ status: res.statusCode, headers: res.headers, destroy: () => { try { req.destroy() } catch (e) { /* 已断 */ } } })
+    })
+    req.on('error', reject)
+    req.end()
+  })
+  const until = async (fn, ms = 3000) => {
+    const to = Date.now() + ms
+    while (Date.now() < to) {
+      if (fn()) return true
+      await new Promise((_resolve) => setTimeout(_resolve, 20))
+    }
+    return fn()
+  }
+  await aok('全站 SSE S1 鉴权与响应头：无/错凭证 401；会话 Cookie 放行；event-stream + no-store + x-accel-buffering', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const noAuth = await request(port, 'GET', '/api/stream')
+    assert.strictEqual(noAuth.status, 401, '无凭证必须 401（不升级连接）')
+    const badAuth = await request(port, 'GET', '/api/stream?token=' + 'y'.repeat(32))
+    assert.strictEqual(badAuth.status, 401, '错凭证必须 401')
+    const sse = sseCollect(port, '/api/stream', { headers: { cookie: `xbk_session=${TOKEN}` } })
+    assert.strictEqual(await sse.ready(), true, '会话 Cookie 必须放行（原生 EventSource 带不了 Bearer）')
+    const h = sse.headers()
+    assert.ok(String(h['content-type']).startsWith('text/event-stream'), 'content-type 前缀 event-stream')
+    assert.strictEqual(h['cache-control'], 'no-store', '带鉴权的流不得允许缓存存储（no-store 而非 no-cache）')
+    assert.strictEqual(h['x-accel-buffering'], 'no', '必须禁反向代理缓冲，否则 tick 要等代理攒满')
+    sse.close()
+    server.close()
+  })
+  await aok('全站 SSE S2 变化才推：写 run.log ≤3s 收到 tick（具名事件 + 毫秒时间戳）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const sse = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await sse.ready(), true, '建连成功')
+    fs.appendFileSync(path.join(dir, 'run.log'), '2026-10-26 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1.0s cachesaved=1\n')
+    assert.strictEqual(await sse.waitFor((e) => e.event === 'tick', 3000), true, '写 run.log 后 ≤3s 必须收到 tick')
+    const frame = sse.events.find((e) => e.event === 'tick')
+    const payload = JSON.parse(frame.data)
+    assert.strictEqual(typeof payload.at, 'number', 'tick 载荷必须带毫秒时间戳')
+    assert.ok(Math.abs(Date.now() - payload.at) < 60000, '时间戳必须是当前时刻（不是恒定的假值）')
+    sse.close()
+    server.close()
+  })
+  await aok('全站 SSE S3 无变化不刷帧；三类指纹各自触发 tick（注入 60ms 采样）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir, sseStreamTickMs: 60 })
+    const port = await listen(server)
+    const sse = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await sse.ready(), true, '建连成功')
+    const tickCount = () => sse.events.filter((e) => e.event === 'tick').length
+    // 空转：注入 60ms 采样，500ms 里已跑了十几轮，但四项指纹都没变 ⇒ 一帧 tick 都不该发
+    // （心跳注释帧不算事件）。反例：把判据写成「每拍都发」这条会立刻红。
+    await new Promise((_resolve) => setTimeout(_resolve, 500))
+    assert.strictEqual(tickCount(), 0, '无变化不得刷 tick（否则只是把 15s 轮询换成 2s 轮询）')
+    // 逐个指纹源都得能独立触发：漏一项就等于「那类变化永远要等 60s 安全轮询」。
+    for (const [label, mutate] of [
+      ['push.json', () => fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: '新推送' }]))],
+      // runs 是模块级 Map（跨实例共享，历史用例也往里塞同 id 记录）——这里必须用独占 id，
+      // 否则「运行中 id 集合」本来就有它，加了等于没加，指纹不变。
+      ['运行中 id', () => runs.set('1750000999999.7', makeStreamRecord('1750000999999.7'))],
+      ['auto 状态文件', () => fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: true, interval: 5, updatedAt: Date.now() }))]
+    ]) {
+      const before = tickCount()
+      mutate()
+      assert.strictEqual(await sse.waitFor(() => tickCount() > before, 2000), true, `${label} 变化必须推 tick`)
+    }
+    sse.close()
+    server.close()
+  })
+  await aok('全站 SSE S4 共享采样 + 连接上限：一条写两个连接各收一帧；第 21 条 503；全关后采样器停', async () => {
+    const dir = tmpDir()
+    // 注入 60ms 采样：两个连接必须收到「同一拍」的一帧，共享的意思是只读一次盘而不是各推一份。
+    const { server, streamClients, streamSamplerActive } = createConsole({ token: TOKEN, stateDir: dir, sseStreamTickMs: 60 })
+    const port = await listen(server)
+    const a = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    const b = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await a.ready(), true)
+    assert.strictEqual(await b.ready(), true)
+    assert.strictEqual(streamSamplerActive(), true, '有连接时必须起共享采样器')
+    fs.appendFileSync(path.join(dir, 'run.log'), 'x=1\n')
+    assert.strictEqual(await a.waitFor((e) => e.event === 'tick', 3000), true, '连接 A 收到 tick')
+    assert.strictEqual(await b.waitFor((e) => e.event === 'tick', 3000), true, '连接 B 收到同一帧（共享采样）')
+    assert.strictEqual(a.events.filter((e) => e.event === 'tick').length, 1, '一次变化只推一帧（A）')
+    assert.strictEqual(b.events.filter((e) => e.event === 'tick').length, 1, '一次变化只推一帧（B）')
+    // 补到 20 条再试第 21 条：上限值取实现常量，改小/改大都得同步这里的语义。
+    const extra = []
+    while (streamClients.size < SSE_STREAM_MAX_CONNECTIONS) {
+      const c = await openLiveStream(port)
+      assert.strictEqual(c.status, 200, '上限内必须 200')
+      extra.push(c)
+    }
+    assert.strictEqual(streamClients.size, 20, '满员 20 条')
+    // 超限探测必须只读响应头：万一把闸写错成放行，request() 会一直等这条永不完结的流，
+    // 用例只能等满 25s 超时才报错（红线退化时会变成「超时」而不是清晰的 503 断言）。
+    const over = await openLiveStream(port)
+    assert.strictEqual(over.status, 503, '第 21 条必须立刻 503')
+    over.destroy() // 200 也照断：断言已失败，别把连接留到用例超时
+    // 关 1 条腾出位置：仍可再开（上限是动态计数，不是「一辈子 20 条」）
+    extra[0].destroy()
+    assert.strictEqual(await until(() => streamClients.size < SSE_STREAM_MAX_CONNECTIONS), true, '关连接后 Set 摘除')
+    const reopen = await openLiveStream(port)
+    assert.strictEqual(reopen.status, 200, '腾出位置后可再开')
+    reopen.destroy()
+    for (const c of extra) c.destroy()
+    a.close()
+    b.close()
+    assert.strictEqual(await until(() => streamClients.size === 0), true, '全部断开后 Set 归零')
+    assert.strictEqual(await until(() => streamSamplerActive() === false), true, '最后一个连接走掉必须停采样定时器')
+    server.close()
+  })
+  await aok('全站 SSE S5 收尾：server.close() 主动断开在途流（客户端收到 end，不留悬挂句柄）', async () => {
+    const dir = tmpDir()
+    const { server, streamClients, streamSamplerActive } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const sse = sseCollect(port, '/api/stream', { headers: { authorization: 'Bearer ' + TOKEN } })
+    assert.strictEqual(await sse.ready(), true, '建连成功')
+    assert.strictEqual(streamClients.size, 1)
+    server.close()
+    assert.strictEqual(streamClients.size, 0, 'close() 必须同步摘掉所有通知流连接')
+    assert.strictEqual(streamSamplerActive(), false, 'close() 必须停采样器（否则测试进程挂住）')
+    assert.strictEqual(await until(() => sse.isEnded()), true, '客户端必须收到流结束（res.end）')
+  })
+  await aok('全站 SSE 前端: pollIntervalFor 降频 + createLiveChannel 连流/重连/降级/可见性（假 EventSource 运行时断言）', async () => {
+    const { createLiveChannel, pollIntervalFor } = await import('./scripts/console-assets/pure.mjs')
+    // 间隔口径用字面量锁死：SSE 在线 60s 安全轮询、断线 15s、任务在跑 2s。
+    const base = { pollMs: 15000, busyMs: 2000, safetyMs: 60000 }
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: false, busy: false }), 15000, '断线走 15s 轮询')
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: true, busy: false }), 60000, 'SSE 在线降为 60s 安全轮询')
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: true, busy: true }), 2000, '任务在跑仍用快轮询（SSE 是补充不是替代）')
+    assert.strictEqual(pollIntervalFor({ ...base, sseUp: false, busy: true }), 2000)
+    // 假 EventSource：记录 url / close / 事件分发；假 document：可控可见性 + 事件派发。
+    const made = []
+    class FakeEventSource {
+      constructor (url) {
+        this.url = url
+        this.readyState = 0 // CONNECTING
+        this.closed = false
+        this.listeners = {}
+        made.push(this)
+      }
+
+      addEventListener (name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn) }
+      close () { this.closed = true; this.readyState = 2 }
+      emit (name) { for (const fn of [...(this.listeners[name] || [])]) fn({}) }
+    }
+    FakeEventSource.CONNECTING = 0
+    FakeEventSource.OPEN = 1
+    const doc = {
+      visibilityState: 'visible',
+      listeners: [],
+      addEventListener (name, fn) { if (name === 'visibilitychange') this.listeners.push(fn) },
+      removeEventListener (name, fn) { this.listeners = this.listeners.filter((x) => x !== fn) },
+      flip (state) { this.visibilityState = state; for (const fn of [...this.listeners]) fn() }
+    }
+    const ticks = []
+    const states = []
+    const ch = createLiveChannel({
+      EventSourceCtor: FakeEventSource,
+      doc,
+      onTick: () => ticks.push(Date.now()),
+      onChange: (up) => states.push(up)
+    })
+    assert.strictEqual(ch.open(), true, '可见时建流')
+    assert.strictEqual(made.length, 1, '只建一条 EventSource')
+    assert.strictEqual(made[0].url, '/api/stream', 'URL 是相对字面量且不带 token（凭证走会话 Cookie）')
+    assert.ok(!made[0].url.includes('token'), 'URL 不得携带凭证（会进浏览器历史/代理日志）')
+    assert.strictEqual(ch.open(), false, 'open 幂等：重复调用不得叠第二条流')
+    assert.strictEqual(made.length, 1)
+    // onopen → 在线态（60s 降频的依据）；tick 帧是具名事件，必须真的触发一次拉取。
+    const es = made[0]
+    es.readyState = FakeEventSource.OPEN
+    es.onopen()
+    assert.deepStrictEqual(states, [true], 'open 后进入在线态')
+    es.emit('tick')
+    assert.strictEqual(ticks.length, 1, 'tick 帧触发一次 refresh')
+    // 断线：仍在 CONNECTING 且未超 3 次 → 交给浏览器自带重连（立刻 close 会丢掉退避/续传）。
+    es.readyState = FakeEventSource.CONNECTING
+    es.onerror(); es.onerror(); es.onerror()
+    assert.strictEqual(es.closed, false, '重连窗口内不得 close')
+    assert.strictEqual(ch.isUp(), true, '仍按在线处理（轮询保持降频）')
+    es.onerror() // 第 4 次
+    assert.strictEqual(es.closed, true, '超过 3 次才降级关闭')
+    assert.deepStrictEqual(states, [true, false], '降级 → 通知调用方恢复 15s 轮询')
+    assert.strictEqual(ch.isOpen(), false)
+    // 可见性：隐藏断开（不发请求）、可见立刻重连并补拉一次。
+    doc.flip('hidden')
+    assert.strictEqual(made.length, 1, '隐藏时只是断开，不新建流')
+    doc.flip('visible')
+    assert.strictEqual(made.length, 2, '回到可见立刻重连')
+    assert.strictEqual(ticks.length, 2, '重连后补拉一次（隐藏期间漏的帧不补发）')
+    assert.strictEqual(ch.isOpen(), true)
+    // 新连接 open 之后才算「在线」——降频的前提是通道真的通了，不是「我刚发起了连接」。
+    made[1].readyState = FakeEventSource.OPEN
+    made[1].onopen()
+    doc.flip('hidden')
+    assert.strictEqual(made[1].closed, true, '隐藏必须断开（后台标签页不留长连接）')
+    assert.deepStrictEqual(states, [true, false, true, false], '状态序列：在线→降级→重连在线→隐藏离线')
+    // 卸载：摘掉可见性监听 + 关闭连接；之后任何可见性事件都不得再建流。
+    ch.dispose()
+    assert.strictEqual(doc.listeners.length, 0, 'dispose 必须摘掉 visibilitychange 监听')
+    doc.flip('visible')
+    assert.strictEqual(made.length, 2, 'dispose 之后不得再建流')
+    // 迟到事件（旧连接）不得影响当前状态
+    const before = made.length
+    made[0].onerror()
+    assert.strictEqual(made.length, before, '旧连接的迟到 error 不得触发新连接')
+  })
+  await aok('全站 SSE 前端接线: ui.js 单一 effect 管流 + 清理断开 + 间隔走 pollIntervalFor', async () => {
+    const uiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const sseSeg = uiSrc.slice(uiSrc.indexOf('  // 全站 SSE 通知（v3.374）'), uiSrc.indexOf('  // 轮询节奏（Sourcery vvJ）'))
+    assert.ok(sseSeg.length > 0, '必须存在全站 SSE 的独立 effect 段')
+    assert.ok(sseSeg.includes('createLiveChannel({'), '必须复用纯函数里的状态机（不在 App 里手写 EventSource）')
+    assert.ok(sseSeg.includes('onTick: () => { runTickRef.current() }'), 'tick 必须走共享的一拍（条件请求拉取）')
+    assert.ok(sseSeg.includes('return () => channel.dispose()'), 'effect 清理必须断开并摘监听（切页/暂停/卸载都不漏）')
+    assert.ok(sseSeg.includes('if (authExpired || !autoRefresh)'), '暂停与凭证失效都必须停止长连接')
+    assert.ok(sseSeg.includes("document.visibilityState !== 'hidden'"), '隐藏的标签页不建流')
+    const pollSeg = uiSrc.slice(uiSrc.indexOf('  // 轮询节奏（Sourcery vvJ）'), uiSrc.indexOf('  // hash 路由'))
+    assert.ok(pollSeg.includes('pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })'),
+      '轮询间隔必须由 pollIntervalFor 判定（SSE 在线 → 安全轮询）')
+    assert.ok(pollSeg.includes('timerRef.current = setInterval(() => { runTick() }, interval)'),
+      '全页只有一个定时器，且复用同一拍')
+    assert.ok(!pollSeg.includes('new window.EventSource'), '轮询 effect 内不得再建第二条流')
+    // 安全轮询间隔 60s：字面量锁死（不引用常量自证），且必须与「断线 15s」区分开。
+    const consts = await import('./scripts/console-assets/constants.js')
+    assert.strictEqual(consts.SSE_HEARTBEAT_MS, 60000, 'SSE 在线时的安全轮询间隔必须是 60s')
+    assert.strictEqual(consts.POLL_MS, 15000, '断线退回的轮询间隔仍是 15s')
+  })
   await aok('HTTP: GET /api/run-history（轮界模型 / 行号游标 / limit 钳制 / 鉴权）', async () => {
     const dir = tmpDir()
     // 轮界模型（v3.299 评审 #3/#12）：失败行在**同轮**摘要行之前紧邻出现（生产写序
@@ -6186,7 +6436,7 @@ async function main () {
       '非概览/日志页必须每拍推进共享 tick')
     assert.ok(src.includes('if (!active || justActivated || !(pollTick > 0) || busyRef.current) return'),
       '轮询重拉必须单飞：上一拍还没回来时跳过，否则慢接口会互相作废响应')
-    assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效状态变化重跑')
+    assert.ok(/\[refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick\]/.test(src), '轮询 effect 必须随 tab / 暂停开关 / 凭证失效 / SSE 在线态变化重跑')
     // 四个页面的面板都要消费这个 tick，否则只是数字在动、数据不动。
     // v3.349：重拉统一走 usePollReload（单飞：上一拍没回来就跳过，慢接口不会互相作废）。
     for (const [fn, call] of [
@@ -6548,9 +6798,15 @@ async function main () {
     const runs = src.slice(src.indexOf('function RunsPanel'), src.indexOf('// ── 组件：逐轮运行历史'))
     assert.ok(runs.includes("if (document.visibilityState === 'hidden') return"), '触发详情在后台必须跳过请求')
     assert.ok(runs.includes("document.addEventListener('visibilitychange', onVisibility)"), '切回前台必须补一拍')
-    const pollBlock = src.slice(src.indexOf('const interval = locking ? POLL_BUSY_MS : POLL_MS'),
-      src.indexOf('}, [refreshSplit, locking, tab, autoRefresh, authExpired])'))
-    assert.ok(pollBlock.includes('if (document.hidden) return'), '概览主轮询在后台必须跳过（tick 整拍不发）')
+    // v3.374：后台跳过判断随「共享一拍」搬到 runTick（SSE tick 与定时器走同一份逻辑），
+    // 定时器只剩一个，且必须复用 runTick——两套节流各自为政就是「后台还在发请求」。
+    const tickBlock = src.slice(src.indexOf('const runTick = useCallback('),
+      src.indexOf('const runTickRef = useRef(runTick)'))
+    assert.ok(tickBlock.includes('if (document.hidden) return'), '概览主轮询在后台必须跳过（tick 整拍不发）')
+    const pollBlock = src.slice(src.indexOf('const interval = pollIntervalFor({ sseUp'),
+      src.indexOf('}, [refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick])'))
+    assert.ok(pollBlock.includes('setInterval(() => { runTick() }, interval)'),
+      '全页只此一个定时器：SSE tick 复用 runTick，不得另建 interval')
   })
 
   await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {

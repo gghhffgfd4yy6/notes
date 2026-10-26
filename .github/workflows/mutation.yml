@@ -287,10 +287,10 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 6179 行（v3.372 起；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 6820 体，变异评估
+          # console.js 6452 行（v3.374 起；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 6820 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
           # ⇒ 整段 ≈ 1510min、远超 step 330min 上限。按上限倒推取 11 片（末片 849 行实测 >330min 被杀，再对半：
-          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6179，末三片约 400 / 600 / 307 行 ≈100-170min，仍在 330min 内）。
+          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6452，末三片约 400 / 600 / 307 行 ≈100-170min，仍在 330min 内）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           # `timeout_ms: 60000`（仅这 11 段）：单次变异体运行的等待上限从配置文件的 300000ms 降到 60000ms。
           #   60s 的依据：test_console.js 全量 ≈21s ⇒ 上限 ≈1.5×21+60 = 91s（原 ≈331s），而 313 个 Timeout
@@ -348,7 +348,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part11
             src: "scripts/console.js"
-            mutate: "scripts/console.js:5801-6326"
+            mutate: "scripts/console.js:5801-6452"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

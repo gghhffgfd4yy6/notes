@@ -6,6 +6,11 @@
 // 切回前台都不受这个间隔约束（走一次性补拉）；任务在跑时仍用 POLL_BUSY_MS 快轮询。
 const POLL_MS = 15000
 const POLL_BUSY_MS = 2000
+// 全站 SSE 通知（v3.374）：服务端每 2s 采一次数据指纹，变了就推一个 tick；前端收到 tick
+// 走下面的 refreshSplit（条件请求，命中 304 时零正文）。SSE 在线期间把 15s 轮询降成这个
+// 「安全轮询」——它不承担实时性，只兜「漏了一帧 / 半天没变化」两种情况；断线（onerror
+// 超过重连次数）就退回 POLL_MS，两条通道互不依赖。
+const SSE_HEARTBEAT_MS = 60000
 // 部署后旧标签页仍跑旧脚本（数据照常轮询，看起来「在线」却看不到新 UI）。每 60s 对一次
 // /api/sys 的版本，不一致就挂一条「刷新后生效」的提示——不自动 reload，避免打断正在填的表单。
 // 边界（Sourcery #294）：只覆盖本版之后打开的页面。部署那一刻已经开着的旧页拿不到这段代码，
@@ -37,4 +42,4 @@ const TZ_LABEL = '北京时间'
 const BACKUP_BROWSER_MAX_BYTES = 32 * 1024 * 1024
 const BACKUP_FILE_MAX_BYTES = 48 * 1024 * 1024
 
-export { POLL_MS, POLL_BUSY_MS, VERSION_CHECK_MS, BUSY_FALLBACK_MS, FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, BACKUP_BROWSER_MAX_BYTES, BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MIN_S, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_DEFAULT_S, TZ_LABEL }
+export { POLL_MS, POLL_BUSY_MS, SSE_HEARTBEAT_MS, VERSION_CHECK_MS, BUSY_FALLBACK_MS, FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, BACKUP_BROWSER_MAX_BYTES, BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MIN_S, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_DEFAULT_S, TZ_LABEL }

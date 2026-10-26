@@ -186,6 +186,19 @@ const SSE_MAX_PENDING = 1024 * 1024
 // 每进程并发 SSE 连接上限：第 9 个 503（防 token 泄露后被刷连接拖垮控制台）。
 const SSE_MAX_CONNECTIONS = 8
 
+// ── v3.374 全站 SSE 通知（/api/stream）──────────────────────────────────────
+// 列表页不再靠 15s 轮询发现变化：服务端每 2s 采一次「轻量指纹」，变了就广播 tick，
+// 前端收到 tick 走既有条件请求（ETag/304 命中，不重传正文）。断线时前端自动退回 15s
+// 轮询——两条通道互不依赖，谁断了都不影响数据新鲜度。
+// 采样是**单实例**的（闭包内一个定时器）：所有连接共享同一份结果，不为每个连接各读一次盘。
+const SSE_STREAM_TICK_MS = 2000
+// 心跳注释帧：防代理/防火墙按 idle 断链。这里平时可能长时间没有 tick（数据没变），
+// 全靠心跳证明连接活着；20s 比 /api/runs/stream 的 15s 更宽，因为它只承载「变了」信号。
+const SSE_STREAM_HEARTBEAT_MS = 20000
+// 每进程并发上限：第 21 个立刻 503。与 /api/runs/stream 的 8 分开计：那条是逐帧增量流
+// （一个人只看一个运行的日志），这条是每个打开的标签页一条，上限要按「标签页数」留余量。
+const SSE_STREAM_MAX_CONNECTIONS = 20
+
 // /api/trends 的 days 白名单：URL 是未验证输入，只放行这三个值（非法/越界一律回默认 14，
 // 向后兼容）。用固定数组 includes 而非正则（用户输入不进正则是本仓红线）。
 const TREND_DAYS_ALLOWED = Object.freeze([14, 30, 60])
@@ -957,6 +970,7 @@ function shouldLogAccess (method, pathname, statusCode) {
   const m = method === 'GET'
   const p = String(pathname || '')
   if (m && (p === '/' || p === '/api/status' || p === '/api/runs' || p === '/api/runs/stream' ||
+    p === '/api/stream' ||
     Object.prototype.hasOwnProperty.call(STATIC_ASSETS, p))) return false
   if (m && RUN_DETAIL_PATH_RE.test(p)) return false // D4：GET 详情轮询
   if (method === 'POST' && p === '/api/runs/detail') return false // D4：POST 详情轮询（前端实际形态）
@@ -2791,7 +2805,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, lineSearchFetch, watchNotifier } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, watchNotifier } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -3157,6 +3171,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 未注入/非法值回退默认。命名用 ssePendingLimit 避免与解构参数同名（同名 const 会
   // SyntaxError: Identifier has already been declared）。
   const ssePendingLimit = typeof sseMaxPending === 'number' && sseMaxPending > 0 ? sseMaxPending : SSE_MAX_PENDING
+  // 通知流采样间隔：createConsole 可注入（测试用小值把「变化才推」的用例压到毫秒级，
+  // 不必每条都等满 2s），未注入/非法值回退生产默认。与 sseMaxPending 同一注入先例。
+  const streamTickMs = typeof sseStreamTickMs === 'number' && sseStreamTickMs > 0 ? sseStreamTickMs : SSE_STREAM_TICK_MS
 
   // 幂等清理：clearInterval + 摘除登记 + res.end()。res 'close'/'error'/积压超限/关停
   // 广播/完结收尾全走这里（蓝图防线 5：close 必清理，防 Set 泄漏）。
@@ -3248,6 +3265,76 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sseWriteFrame(conn, ': ping\n\n')
       conn.lastPingAt = Date.now()
     }
+  }
+
+  // ── v3.374 全站 SSE 通知（/api/stream）───────────────────────────────────
+  // 与上面 /api/runs/stream 的逐帧增量流是两件事：那条推正文，这条只推「变了」这一个
+  // 信号。正文仍由前端走既有条件请求拉（ETag/304 命中，响应体为 0 字节），所以这条流
+  // 不需要游标、不需要 Last-Event-ID 续传——漏一帧最多让数据晚 60s（安全轮询兜底）。
+  // 按实例隔离（createConsole 闭包内，非模块级）：测试会建多个实例，模块级 Set 会跨实例
+  // 泄漏连接数（第 21 个 503 误伤）。
+  const streamClients = new Set()
+  // 共享采样器状态：一个定时器 + 一份上次指纹（不为每个连接各读一次盘）。
+  let streamSampler = null
+  let streamFingerprintValue = ''
+  // 指纹只取四项「便宜且能代表变化」的东西，全程不解析文件内容：
+  //   · run.log 的 size+mtimeMs（毫秒级 mtime 覆盖「同长度原地覆盖写」）；
+  //   · push.json（判重缓存主存，新推送落盘就是这里变）；
+  //   · auto 状态文件（开了/停了自动运行）；
+  //   · 运行中 id 集合（子进程起停，runs 是进程内存，不落盘）。
+  // 用 statSafeMeta（O_NOFOLLOW + fstat）与其它读面同口径：符号链接/读失败不回落到
+  // 「看起来没变」，而是带上 status，状态切换本身也算一次变化。
+  const streamFileStamp = (p) => {
+    const meta = statSafeMeta(p)
+    return `${meta.status}:${meta.size === null ? '' : meta.size}:${meta.mtimeMs === null ? '' : meta.mtimeMs}`
+  }
+  const streamFingerprint = () => {
+    const runningIds = [...runs.values()].filter((r) => !r.finishedAt).map((r) => r.id).sort()
+    return [
+      streamFileStamp(path.join(historyDir(), 'run.log')),
+      streamFileStamp(path.join(stateDir, messagesFile)),
+      streamFileStamp(autoPath),
+      runningIds.join(',')
+    ].join('|')
+  }
+  // 单帧写出：tick 帧与心跳都只有几十字节，不需要 /api/runs/stream 那套应用层积压队列
+  // （慢客户端最多让 Node 缓冲这点小帧，真要堵死也是内核缓冲区的问题，不是本流的问题）。
+  const streamTeardown = (client) => {
+    if (client.closed) return
+    client.closed = true
+    clearInterval(client.timer)
+    streamClients.delete(client)
+    try { client.res.end() } catch (e) { /* 已断开 */ }
+    // 最后一个连接走掉就停采样：没人听的时候不该继续每 2s 读一次盘。
+    if (streamClients.size === 0) stopStreamSampler()
+  }
+  const streamWrite = (client, frame) => {
+    if (client.closed) return false
+    try { client.res.write(frame); return true } catch (e) { streamTeardown(client); return false }
+  }
+  function streamSamplerTick () {
+    const next = streamFingerprint()
+    if (next === streamFingerprintValue) return // 没变化不刷帧（代理空闲期只留心跳注释）
+    streamFingerprintValue = next
+    const frame = `event: tick\ndata: ${JSON.stringify({ at: Date.now() })}\n\n`
+    for (const client of [...streamClients]) streamWrite(client, frame)
+  }
+  function startStreamSampler () {
+    if (streamSampler !== null) return
+    // 建连那一刻的当前值作基线：把「已有状态」当变化会让每次打开页面都白刷一帧。
+    streamFingerprintValue = streamFingerprint()
+    streamSampler = setInterval(streamSamplerTick, streamTickMs)
+    if (typeof streamSampler.unref === 'function') streamSampler.unref() // 不钉事件循环（测试可退出）
+  }
+  function stopStreamSampler () {
+    if (streamSampler === null) return
+    clearInterval(streamSampler)
+    streamSampler = null
+    streamFingerprintValue = ''
+  }
+  const closeAllStreamClients = () => {
+    for (const client of [...streamClients]) streamTeardown(client)
+    stopStreamSampler()
   }
 
   // ── 批次④ 4.1：触发受理序列共享（/trigger 与 POST /api/notify-test）─────────
@@ -5833,6 +5920,32 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJsonConditional(req, res, { runs: list })
       return
     }
+    // GET /api/stream（v3.374）：全站数据变化通知流。只发「变了」这一个信号
+    // （event: tick + {"at":<ms>}），正文由前端用既有条件请求拉（ETag/304）——一条长连接
+    // 不承载数据，重连也就不需要补帧。鉴权零代码：继承上方全局闸（原生 EventSource 带不了
+    // 自定义头 → Bearer 不可用；GET 收会话 Cookie，?token= 供 API/测试用，与 runs/stream 同口径）。
+    if (req.method === 'GET' && url.pathname === '/api/stream') {
+      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭' }); return }
+      // 连接数闸：第 21 个立刻 503（不排队、不先建流再断）。
+      if (streamClients.size >= SSE_STREAM_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        // no-store 而不是 no-cache：这条流带鉴权语义，浏览器不得把任何一帧存下来复用。
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理按块缓冲（否则 tick 要等代理攒满）
+        Connection: 'keep-alive'
+      })
+      res.flushHeaders()
+      const client = { res, closed: false, timer: null }
+      // 每连接只挂一个心跳定时器（20s 注释帧）；指纹采样是共享的，连接再多也只读一次盘。
+      client.timer = setInterval(() => { streamWrite(client, ': ping\n\n') }, SSE_STREAM_HEARTBEAT_MS)
+      if (typeof client.timer.unref === 'function') client.timer.unref()
+      streamClients.add(client)
+      res.on('close', () => streamTeardown(client))
+      res.on('error', () => streamTeardown(client))
+      startStreamSampler()
+      return
+    }
     // GET /api/runs/stream（v3.300 批次③ 3.1）：运行中任务输出的 SSE 实时流。
     // ?id=<epoch.seq>&since=<offset>。鉴权零代码（继承上方全局闸）：原生 EventSource
     // 不能带自定义头 → Bearer 不可用；GET 收会话 Cookie（authorize 内 GET 分支），前端走
@@ -6033,9 +6146,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const origClose = server.close.bind(server)
   server.close = (cb) => {
     killAll()
+    // 全站 SSE 连接不随 close 自动结束（server.close 只挡新连接，在途请求照旧），
+    // 不主动 end 的话 close 回调会一直等这些长连接——测试里就是「跑完了不退出」。
+    closeAllStreamClients()
     return origClose(cb)
   }
   server.on('close', () => { disposeAuto(); killAll() })
+  // 全站 SSE 连接要单独收：server.close() 只挡新连接，在途的 /api/stream 不会自己结束；
+  // 不显式清理的话采样定时器与 socket 会留到进程退出（测试里表现为「跑完了不退出」）。
+  server.on('close', () => closeAllStreamClients())
   // ── 优雅关闭装配（v3.297 自 main 抽出，Sourcery #225 M6：原实现不可测——测试无法
   // 确认「关停真的 SIGKILL 了子进程、并等 close 后才退出」）。依赖注入 onExit/registerSignal：
   // 测试传假子进程 + 假 exit 即可确定性断言序列；生产 main 无参调用即等价旧行为。
@@ -6058,6 +6177,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sseWriteFrame(conn, 'event: done\ndata: {}\n\n')
         sseTeardown(conn)
       }
+      // 全站通知流没有「done」语义（它只发变化信号），直接 end + 清采样器：
+      // 客户端 onerror 后按纪律退回 15s 轮询，页面照旧可用。
+      closeAllStreamClients()
       console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
       for (const child of activeChildren) {
         try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
@@ -6130,7 +6252,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   if (typeof watchTimer.unref === 'function') watchTimer.unref()
   server.on('close', () => clearInterval(watchTimer))
 
-  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, runWatchOnce }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, streamClients, streamSamplerActive: () => streamSampler !== null, runWatchOnce }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -6281,6 +6403,10 @@ module.exports = {
   SSE_HEARTBEAT_MS,
   SSE_MAX_PENDING,
   SSE_MAX_CONNECTIONS,
+  // v3.374 全站 SSE 通知：常量导出（非 HTTP 单测 + 前端安全轮询间隔对账）
+  SSE_STREAM_TICK_MS,
+  SSE_STREAM_HEARTBEAT_MS,
+  SSE_STREAM_MAX_CONNECTIONS,
   // v3.301 批次④ 4.1 通知自检：常量/入口导出（spawn entry 映射断言 + 重放窗断言）
   REPLAY_WINDOW_NOTIFY_TEST_MS,
   ENTRY_SINGLE,

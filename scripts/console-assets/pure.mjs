@@ -482,3 +482,85 @@ export function morphFrom (src, box) {
     s
   }
 }
+
+// ── 全站 SSE 通知（v3.374）───────────────────────────────────────────────────
+// 轮询间隔的纯判定：SSE 连上（sseUp）时 15s 轮询没有意义，降成 60s 安全轮询——它只兜
+// 「漏帧 / 长时间无变化」，实时性由 tick 承担；任务在跑仍按 POLL_BUSY_MS 快轮询（日志要跟手）。
+export function pollIntervalFor ({ sseUp, busy, pollMs, busyMs, safetyMs }) {
+  if (busy) return busyMs
+  return sseUp ? safetyMs : pollMs
+}
+
+// 通知流的状态机：连流 / 收 tick / 断线降级 / 隐藏断开 / 可见重连。DOM 与构造器全部注入，
+// 所以本模块仍然是「无 DOM、无 fetch」——Node 测试塞假 EventSource + 假 document 就能
+// 跑真实行为断言（不必 eval 源码，S1523）。
+// 纪律（与 /api/runs/stream 的详情流同口径）：
+//   · 同一时刻只有一个 EventSource——open() 幂等，重复调用不会再建一条；
+//   · onerror 不立刻 close：原生 EventSource 正在自动重连（readyState=CONNECTING）且未超
+//     次数时先交给浏览器（它有退避与续传），超过 maxRetry 才降级；
+//   · 降级/隐藏/卸载都必经 close()：清引用 + 关闭连接 + 通知调用方（轮询回到 15s）。
+export function createLiveChannel (options = {}) {
+  const {
+    EventSourceCtor,
+    doc,
+    url = '/api/stream',
+    maxRetry = 3,
+    onTick = () => {},
+    onChange = () => {}
+  } = options
+  let es = null
+  let retries = 0
+  let up = false
+  let disposed = false
+  const set = (next) => {
+    if (next === up) return
+    up = next
+    onChange(up)
+  }
+  const visible = () => !doc || doc.visibilityState !== 'hidden'
+  // EventSource.CONNECTING === 0（规范常量）。宿主没给构造器常量时按 0 兜底——它与
+  // 「正在自动重连」同义，宁可多给浏览器一次机会，也不在重连窗口里提前降级。
+  const connectingState = () => {
+    const c = EventSourceCtor && EventSourceCtor.CONNECTING
+    return typeof c === 'number' ? c : 0
+  }
+  const close = () => {
+    const cur = es
+    es = null
+    retries = 0
+    if (cur !== null) {
+      try { cur.close() } catch (e) { /* 已断开 */ }
+    }
+    set(false)
+  }
+  const open = () => {
+    if (disposed || es !== null) return false
+    if (typeof EventSourceCtor !== 'function' || !visible()) return false
+    let src
+    try { src = new EventSourceCtor(url) } catch (e) { return false }
+    es = src
+    src.onopen = () => { retries = 0; set(true) }
+    // 服务端 tick 是具名事件（event: tick），onmessage 收不到——与详情流 reset/done 同一条纪律。
+    src.addEventListener('tick', () => { retries = 0; set(true); onTick() })
+    src.onerror = () => {
+      if (src !== es) return // 已被关闭/替换的旧连接：迟到的 error 不得影响当前状态
+      retries += 1
+      if (retries <= maxRetry && src.readyState === connectingState()) return
+      close()
+    }
+    return true
+  }
+  const onVisibility = () => {
+    if (disposed) return
+    if (!visible()) { close(); return }
+    // 回到前台立刻重连并补拉一次：隐藏期间漏的帧不会补发（这条流不带游标）。
+    if (open()) onTick()
+  }
+  if (doc && typeof doc.addEventListener === 'function') doc.addEventListener('visibilitychange', onVisibility)
+  const dispose = () => {
+    disposed = true
+    if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility)
+    close()
+  }
+  return { open, close, dispose, isOpen: () => es !== null, isUp: () => up }
+}
