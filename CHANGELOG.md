@@ -1066,3 +1066,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 测试：brotli 往返解压字节相等、q 值择优、`br;q=0` 回落、两种表示都不可接受时 406、HTML br/明文两条路径；控制台套件 286 通过。
 - 版本 3.382.0。
 
+## v3.383 — 控制台：压缩归属收到边缘，删掉 Node 侧死代码
+
+- 现象：线上 443 的响应由 Caddy 的 `encode @compressible`（br 6 / zstd / gzip 6）压缩；配置里 `header_up -Accept-Encoding` 把协商头摘掉，Node 侧读到的是 `undefined` ⇒ v3.373 的 gzip 与 v3.382 的 brotli 在现网一次都没执行过。
+- 改法：确认「压缩在边缘」这一归属，删除 Node 侧的协商/压缩实现（`negotiateEncodings`、`compressBody`、`encodeContent`、变体 ETag、406 判定及 `res.xbkEnc/xbkIdentity`），`sendJson`/`sendJsonConditional`/页面出口回到纯 identity；条件请求仍是 identity tag + `no-store`，304 语义不变。
+- 说明：静态资产的 gzip 变体与 `acceptsGzip` 保留（那是仓库自己产出的预压缩文件，和反代压缩是两回事）；SSE 仍由 Caddy 片段排除。
+- 文档：`SYSTEM_CONTRACT.md` 增加「压缩归属」段，写明边缘 br→zstd→gzip、Node 只发 identity；`README.md` 资产段同步，并纠正「HTML 是首屏最大一块」的错误前提（实测 HTML 2.4KB，首屏大头是 11 个预加载模块）。
+- 测试：删除 6 组针对 Node 侧压缩的用例（含 `xbkGzip` 死入口），保留静态资产 gzip 与条件请求用例；控制台套件 280 通过。
+- 版本 3.383.0。
+
