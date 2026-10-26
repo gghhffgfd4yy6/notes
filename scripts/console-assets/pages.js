@@ -3031,6 +3031,18 @@ function newBackupImportKey () {
   return `xbk-import-${Date.now().toString(36)}-${backupImportSeq}`
 }
 
+// 数据备份 / 恢复整块流程收在右侧抽屉里：系统页只留一个入口按钮 + 一行摘要（上次导出/导入）。
+// 导出类别、密码、导入选文件与解密都在抽屉内完成；导入的最终确认仍是短弹窗（ConfirmDialog）。
+// 安全边界不变：导出必须在 HTTPS 下、在浏览器内加密（window.isSecureContext 检查排在调用导出接口之前），
+// 密码只留在页面内存；导入沿用同一次「选文件 → 确认」的幂等键，重复提交由服务端按 key 返回原结果。
+function backupEntrySummary (last) {
+  if (!last || !Number.isFinite(last.at)) return '加密导出（需 HTTPS）· 导入前自动备份当前数据'
+  const d = new Date(last.at)
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return `${last.kind === 'import' ? '上次导入' : '上次导出'} ${stamp}${last.detail ? ` · ${last.detail}` : ''}`
+}
+
 function BackupBlock ({ onImported }) {
   const [selected, setSelected] = useState(() => {
     const out = {}
@@ -3041,7 +3053,8 @@ function BackupBlock ({ onImported }) {
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
   const [pending, setPending] = useState(null)
-  const [exportOpen, setExportOpen] = useState(false)
+  const [open, setOpen] = useState(false)
+  const [last, setLast] = useState(null)
   const [locked, setLocked] = useState(null)
   const [exportPassword, setExportPassword] = useState('')
   const [exportPassword2, setExportPassword2] = useState('')
@@ -3049,7 +3062,10 @@ function BackupBlock ({ onImported }) {
   const fileRef = useRef(null)
   const unlockRef = useRef(null)
   const allSelected = BACKUP_CATEGORY_OPTIONS.every((item) => selected[item.key])
+  const hasSelected = BACKUP_CATEGORY_OPTIONS.some((item) => selected[item.key])
   const passwordProblem = backupPasswordProblem(exportPassword, exportPassword2)
+  // 只用于提示；真正的硬校验仍在 doExport 里、且在调用导出接口之前。
+  const canEncrypt = !!(window.isSecureContext && window.crypto && window.crypto.subtle)
   const toggleAll = () => {
     const next = {}
     for (const item of BACKUP_CATEGORY_OPTIONS) next[item.key] = !allSelected
@@ -3058,6 +3074,10 @@ function BackupBlock ({ onImported }) {
   const toggleOne = (key) => {
     setSelected((prev) => ({ ...prev, [key]: !prev[key] }))
   }
+  // 加密备份需要用户输入口令：抽屉里出现密码框时把焦点放进去（只依赖 open/locked，busy 变化不抢焦点）。
+  useEffect(() => {
+    if (open && locked && unlockRef.current) unlockRef.current.focus({ preventScroll: true })
+  }, [open, locked])
   const doExport = async () => {
     if (busy !== '') return
     const categories = BACKUP_CATEGORY_OPTIONS.filter((item) => selected[item.key]).map((item) => item.key)
@@ -3093,8 +3113,8 @@ function BackupBlock ({ onImported }) {
       a.click()
       a.remove()
       const skipped = res && res.skipped ? res.skipped : []
-      setExportOpen(false)
       setExportPassword(''); setExportPassword2('')
+      setLast({ kind: 'export', at: Date.now(), detail: fmtBytes(blob.size) })
       setNote(`已导出${categories.length}类加密备份${skipped.length > 0 ? `；另有 ${skipped.length} 类当前没有可导出的内容` : ''}`)
     } catch (e) {
       setErr(`导出失败：${e && e.message ? e.message : e}`)
@@ -3103,8 +3123,20 @@ function BackupBlock ({ onImported }) {
       setBusy('')
     }
   }
-  const openExport = () => {
-    setErr(''); setNote(''); setExportPassword(''); setExportPassword2(''); setExportOpen(true)
+  const openDrawer = () => {
+    setErr(''); setOpen(true)
+  }
+  // 抽屉关闭统一走这里：导入/导出/解密进行中（busy）一律不关；关掉时清掉只属于本次的密码与提示。
+  const closeDrawer = () => {
+    if (busy !== '') return
+    setOpen(false)
+    setPending(null)
+    setLocked(null)
+    setUnlockPassword('')
+    setExportPassword('')
+    setExportPassword2('')
+    setErr('')
+    setNote('')
   }
   const chooseFile = () => {
     if (busy === '') fileRef.current && fileRef.current.click()
@@ -3174,6 +3206,7 @@ function BackupBlock ({ onImported }) {
       if (imported.settings) bits.push('控制台设置')
       if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
       if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
+      setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
       setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
       if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
     } catch (e) {
@@ -3183,18 +3216,15 @@ function BackupBlock ({ onImported }) {
     }
   }
   return html`<div class="cfg-block backup-block">
-    <div class="cfg-block-head">
-      <span class="cfg-block-title">数据备份</span>
-      <span class="cfg-block-sub">点导出再选内容；导入自动识别文件</span>
-    </div>
     <div class="backup-actions backup-actions-main">
-      <${Button} variant="secondary" disabled=${busy !== ''} onClick=${openExport}>导出<//>
-      <${Button} variant="ghost" disabled=${busy !== ''} onClick=${chooseFile}>导入<//>
-      <input class="backup-file" ref=${fileRef} type="file" accept=".xbk,.json,application/json" onChange=${onFile} />
+      <${Button} variant="secondary" onClick=${openDrawer}>数据备份与恢复<//>
+      <span class="cfg-block-sub">${backupEntrySummary(last)}</span>
     </div>
-    ${!exportOpen && !pending && !locked && err && html`<${Hint} tone="error">${err}<//>`}
-    ${note && html`<${Hint}>${note}<//>`}
-    <${ConfirmDialog} open=${exportOpen} title="选择要导出的数据" confirmLabel=${busy === 'export' ? '加密中…' : '导出'} busy=${busy === 'export'} confirmDisabled=${BACKUP_CATEGORY_OPTIONS.every((item) => !selected[item.key]) || passwordProblem !== ''} onCancel=${() => { if (busy !== 'export') setExportOpen(false) }} onConfirm=${doExport}>
+    <${Drawer} open=${open} title="数据备份与恢复" sub="加密导出 · 导入前自动备份当前数据" width=${520} busy=${busy !== '' || !!pending} onClose=${closeDrawer}>
+      <div class="cfg-block-head">
+        <span class="cfg-block-title">导出</span>
+        <span class="cfg-block-sub">勾选类别，在本机加密后下载</span>
+      </div>
       <div class="backup-pick-head">
         <label class="backup-check"><input type="checkbox" checked=${allSelected} onChange=${toggleAll} /> 全选</label>
         <span class="cfg-block-sub">只导出勾选的类别</span>
@@ -3216,23 +3246,41 @@ function BackupBlock ({ onImported }) {
         <div class="cfg-block-sub">至少 12 位；建议用一句长口令或密码管理器生成的随机密码。密码忘了，这份备份就打不开；密码只在浏览器里使用，不会发给服务器。</div>
         ${exportPassword !== '' && passwordProblem !== '' && html`<${Hint} tone="error">${passwordProblem}<//>`}
       </div>
-      ${err && html`<${Hint} tone="error">${err}<//>`}
+      <div class="backup-actions">
+        <${Button} variant="primary" disabled=${busy !== '' || !hasSelected} onClick=${doExport}>${busy === 'export' ? '加密中…' : '加密并下载'}<//>
+      </div>
+      ${canEncrypt ? null : html`<${Hint} tone="warn">当前页面不是 HTTPS，浏览器无法加密备份；请用 https:// 打开控制台。<//>`}
       <div class="modal-note">自动运行只备份间隔，不记录开关状态；导入时不会把自动运行打开。浏览器加密导出最多 32MB；更大的备份请减少勾选类别。</div>
-    <//>
-    <${ConfirmDialog} open=${!!locked} title="输入备份密码" confirmLabel=${busy === 'unlock' ? '解密中…' : '解密'} busy=${busy === 'unlock'} confirmDisabled=${unlockPassword === ''} initialFocusRef=${unlockRef} onCancel=${closeUnlock} onConfirm=${doUnlock}>
-      <div>这是加密备份：${locked ? locked.name : ''}</div>
-      <label class="backup-pass-row">备份密码
-        <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock().catch(() => {}) }} />
-      </label>
-      ${err && html`<${Hint} tone="error">${err}<//>`}
-      <div class="modal-note">密码只在这个浏览器里使用，不会发给服务器。解密后再确认导入。</div>
-    <//>
-    <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
-      <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
-      ${pending && pending.encrypted && html`<${Hint}>已在本机解密；密码没有发给服务器。<//>`}
-      ${pending && !pending.encrypted && html`<${Hint} tone="warn">这是未加密的旧备份，文件里是明文；可以用，但建议以后导出加密备份。<//>`}
-      ${err && html`<${Hint} tone="error">${err}<//>`}
+      ${!pending && err && html`<${Hint} tone="error">${err}<//>`}
+      ${note && html`<${Hint}>${note}<//>`}
+      <div class="cfg-block-head set-head">
+        <span class="cfg-block-title">导入</span>
+        <span class="cfg-block-sub">选择 .xbk 加密备份或旧的明文 .json；导入前自动备份当前数据</span>
+      </div>
+      <div class="backup-actions backup-actions-main">
+        <${Button} variant="secondary" disabled=${busy !== ''} onClick=${chooseFile}>选择备份文件<//>
+        <input class="backup-file" ref=${fileRef} type="file" accept=".xbk,.json,application/json" onChange=${onFile} />
+      </div>
+      ${locked && html`<div class="backup-pass-box">
+        <div>这是加密备份：${locked.name}</div>
+        <label class="backup-pass-row">备份密码
+          <input class="fr-input" ref=${unlockRef} type="password" value=${unlockPassword} autocomplete="current-password" onInput=${(e) => setUnlockPassword(e.target.value)} onKeyDown=${(e) => { if (e.key === 'Enter' && unlockPassword !== '' && busy === '') doUnlock().catch(() => {}) }} />
+        </label>
+        ${err && html`<${Hint} tone="error">${err}<//>`}
+        <div class="backup-actions">
+          <${Button} variant="primary" disabled=${busy !== '' || unlockPassword === ''} onClick=${doUnlock}>${busy === 'unlock' ? '解密中…' : '解密'}<//>
+          <${Button} variant="ghost" disabled=${busy !== ''} onClick=${closeUnlock}>取消<//>
+        </div>
+        <div class="modal-note">密码只在这个浏览器里使用，不会发给服务器。解密后再确认导入。</div>
+      </div>`}
       <div class="modal-note">导入会覆盖当前对应的数据；导入前会先把当前数据另存一份。自动运行开关不会被打开，仍保持导入前的状态。导入期间请先停掉外部定时任务，避免它用旧缓存覆盖刚恢复的记录。</div>
+      <${ConfirmDialog} open=${!!pending} title="确认导入备份" confirmLabel=${busy === 'import' ? '导入中…' : '确认导入'} busy=${busy === 'import'} onCancel=${() => { if (busy !== 'import') setPending(null) }} onConfirm=${doImport}>
+        <div>文件里检测到：${pending ? pending.summary.join('、') : ''}</div>
+        ${pending && pending.encrypted && html`<${Hint}>已在本机解密；密码没有发给服务器。<//>`}
+        ${pending && !pending.encrypted && html`<${Hint} tone="warn">这是未加密的旧备份，文件里是明文；可以用，但建议以后导出加密备份。<//>`}
+        <div class="modal-note">导入会覆盖当前对应的数据；自动运行开关保持导入前的状态。导入期间请先停掉外部定时任务。</div>
+        ${pending && err && html`<${Hint} tone="error">${err}<//>`}
+      <//>
     <//>
   </div>`
 }

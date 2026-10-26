@@ -2107,37 +2107,40 @@ async function backupApiTests () {
 }
 
 async function backupUiStructureTests () {
-  await aok('结构红线: 数据备份只留导入/导出，导出类别在弹窗里选', () => {
+  await aok('结构红线: 数据备份整块收进右侧抽屉，页面只留入口与摘要', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
-    const end = src.indexOf('function SysPanel', at)
+    const end = src.indexOf('function TwoFactorBlock', at)
     const seg = src.slice(at, end)
     const ph = (name) => '$' + '{' + name + '}'
     assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
-    assert.ok(seg.includes('onClick=' + ph('openExport')), '系统页入口只能打开导出弹窗')
-    assert.ok(seg.includes('onClick=' + ph('chooseFile')), '导入入口应直接选文件')
-    assert.ok(seg.includes('open=' + ph('exportOpen')) && seg.includes('title="选择要导出的数据"'),
-      '导出类别必须在弹窗里选')
-    const modalAt = seg.indexOf('open=' + ph('exportOpen'))
-    assert.ok(seg.indexOf('backup-list') > modalAt, '类别列表不得回到系统页内联显示')
-    assert.ok(seg.includes('confirmDisabled='), '一个都没选时导出确认按钮必须禁用')
+    assert.ok(seg.includes('backupEntrySummary('), '入口旁要有一行摘要（上次导出/导入）')
+    assert.ok(seg.includes('onClick=' + ph('openDrawer')) && seg.includes('数据备份与恢复'), '系统页只留一个入口按钮')
+    const drawerAt = seg.indexOf('<' + ph('Drawer') + ' open=' + ph('open'))
+    assert.ok(drawerAt > -1, '备份块必须用 Drawer 承载')
+    assert.ok(seg.includes('title="数据备份与恢复"'), '抽屉标题必须是「数据备份与恢复」')
+    assert.ok(seg.includes('width=' + ph('520')), '抽屉宽必须钉在 520')
+    assert.ok(seg.includes('busy=' + ph('busy !== \'\' || !!pending')) && seg.includes('onClose=' + ph('closeDrawer')),
+      '导入/导出进行中必须 busy（含等待最终确认时，禁止关闭抽屉）')
+    assert.ok(seg.indexOf('backup-list') > drawerAt, '类别列表必须在抽屉内，不得回到系统页')
+    assert.ok(!seg.includes('title="选择要导出的数据"'), '导出类别不再走弹窗（抽屉本身就是选择面）')
+    assert.ok(seg.includes('title="确认导入备份"'), '导入的最终确认仍是短弹窗')
   })
 
   await aok('结构红线: 备份在浏览器加密，密码不进请求', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
-    const end = src.indexOf('function SysPanel', at)
+    const end = src.indexOf('function TwoFactorBlock', at)
     const seg = src.slice(at, end)
     assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
     assert.match(src, /import \{[^}]*encryptBackup[^}]*decryptBackup[^}]*isEncryptedBackup[^}]*\} from '\.\/pure\.mjs'/, 'app.js 必须引用纯函数加密模块')
-    const exportAt = seg.indexOf('title="选择要导出的数据"')
-    const unlockAt = seg.indexOf('title="输入备份密码"')
-    const importAt = seg.indexOf('title="确认导入备份"')
-    assert.ok(exportAt > -1 && unlockAt > exportAt && importAt > unlockAt, '三个弹窗必须可分别定位')
-    const exportDialog = seg.slice(exportAt, unlockAt)
-    const unlockDialog = seg.slice(unlockAt, importAt)
-    assert.strictEqual((exportDialog.match(/type="password"/g) || []).length, 2, '导出弹窗必须有两个密码框（设置 + 确认）')
-    assert.strictEqual((unlockDialog.match(/type="password"/g) || []).length, 1, '导入弹窗必须有自己的密码框')
+    const passAt = seg.indexOf('backup-pass-box')
+    const unlockAt = seg.indexOf('backup-pass-box', passAt + 1)
+    assert.ok(passAt > -1 && unlockAt > passAt, '导出密码区与导入解密区必须可分别定位')
+    const exportBox = seg.slice(passAt, unlockAt)
+    const unlockBox = seg.slice(unlockAt, seg.indexOf('modal-note', unlockAt))
+    assert.strictEqual((exportBox.match(/type="password"/g) || []).length, 2, '导出区必须有两个密码框（设置 + 确认）')
+    assert.strictEqual((unlockBox.match(/type="password"/g) || []).length, 1, '解密区必须有自己的密码框')
     assert.ok(seg.includes('.xbk`'), '下载扩展名必须是加密备份标识')
     assert.ok(seg.includes('isEncryptedBackup(data)') && seg.includes('decryptBackup(locked.data'),
       '导入必须先识别加密头，再在浏览器解密')
@@ -2149,7 +2152,7 @@ async function backupUiStructureTests () {
     assert.ok(src.includes('const text = await res.text()'), '导出响应必须先读 JSON 文本再加密，不能直接下载 blob')
     assert.ok(src.includes('BACKUP_BROWSER_MAX_BYTES = 32 * 1024 * 1024'), '浏览器加密导出上限必须钉在 32MiB')
     assert.ok(src.includes('BACKUP_FILE_MAX_BYTES = 48 * 1024 * 1024'), '密文选文件上限必须钉在 48MiB')
-    assert.ok(seg.includes('密码只在这个浏览器里使用，不会发给服务器'), '导入弹窗必须明示密码不上传')
+    assert.ok(seg.includes('密码只在这个浏览器里使用，不会发给服务器'), '解密区必须明示密码不上传')
     const exportApi = src.slice(src.indexOf('function apiPostBackupExport'), src.indexOf('function apiPostBackupImport'))
     assert.ok(/JSON\.stringify\(\{ categories \}\)/.test(exportApi), '导出请求体只能有 categories')
     assert.ok(!/password/i.test(exportApi), '导出请求不得带密码')
@@ -8002,6 +8005,30 @@ async function main () {
     assert.ok(bar.includes('lastTrigger.settled') && bar.includes('live.final ||'), 'run 消失时必须回落到快照而不是「已提交」')
     assert.ok(src.includes('setLastTrigger({ id: String(e.replayRunId)'), '重放命中必须登记 run id（否则结果行停在旧文案）')
     assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
+  })
+
+  await aok('结构红线: 备份块用 Drawer 承载 + HTTPS 校验 + 导入幂等键', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function BackupBlock')
+    const end = src.indexOf('function TwoFactorBlock', at)
+    const seg = src.slice(at, end)
+    const ph = (name) => '$' + '{' + name + '}'
+    assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
+    const drawerAt = seg.indexOf('<' + ph('Drawer') + ' open=' + ph('open'))
+    assert.ok(drawerAt > -1, '备份块必须用 Drawer 承载（不再自绘 modal 层）')
+    assert.ok(seg.includes('width=' + ph('520')), '抽屉宽必须是 520')
+    assert.ok(seg.includes('busy=' + ph("busy !== '' || !!pending")) && seg.includes('onClose=' + ph('closeDrawer')),
+      '导入进行中必须 busy（抽屉关不掉）')
+    // HTTPS 校验仍在，且排在请求导出接口之前：HTTP 下不得先向服务器要明文。
+    const doExportAt = seg.indexOf('const doExport =')
+    const secureAt = seg.indexOf('window.isSecureContext', doExportAt)
+    const apiAt = seg.indexOf('apiPostBackupExport(categories)', doExportAt)
+    assert.ok(doExportAt > -1 && secureAt > doExportAt && apiAt > secureAt,
+      '导出必须先检查 isSecureContext/WebCrypto，再请求明文')
+    // 导入幂等键：明文与加密两条路径各生成一次，确认时把同一个 key 原样传给服务端。
+    assert.strictEqual((seg.match(/key: newBackupImportKey\(\)/g) || []).length, 2,
+      '明文与加密两条路径都要为这次导入生成幂等键')
+    assert.ok(seg.includes('apiPostBackupImport(pending.bundle, pending.key)'), '导入必须带上同一个幂等键')
   })
 
   await aok('结构红线: v3.317 小项（msg-link 44px / 手机输入 16px）', () => {
