@@ -182,6 +182,18 @@ function removeDirInRoot (targetPath, root) {
   return p
 }
 
+// 隔离目录的统一清理入口：删除失败**必须留痕**。
+// 本套件曾因「清理失败被静默吞掉」在仓库根堆了 58 个 _report_*_isolated 目录而测试全程全绿
+// （旧实现只 unlink state 文件、rmdirSync 撞 ENOTEMPTY 后被空 catch 吃掉），所以这里不用空 catch。
+// 只 warn 不抛：抛错会盖掉用例自身的失败原因（finally 里抛会替换原始异常）。
+function cleanupIsolatedDir (targetPath) {
+  try {
+    removeDirInRoot(targetPath, __dirname)
+  } catch (e) {
+    console.warn(`⚠️ 隔离缓存目录清理失败，需手工删除（否则将滞留仓库根）：${targetPath} — ${e.message}`)
+  }
+}
+
 // ---------- 工具 ----------
 let passed = 0; let failed = 0
 // v3.276（EXEC-D T10）：跳过数与实跑数单独计数——只靠 passed 无法区分「真跑了」与「被过滤跳过」
@@ -2408,7 +2420,10 @@ console.log('========================================\n');
     } finally {
       Config.report.enabled = orig
       Config.cache.dir = originalCacheDir
-      try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      // 只删 report.state 会把隔离目录本体（run.log / 缓存分片）留在仓库根：本地每跑一次就多一个
+      // xianbaoku_cache_p*_report_nodup_isolated，实测已堆数十个且部分属主是 root（曾 sudo 跑测试）。
+      // 走 cleanupIsolatedDir → removeDirInRoot 整目录删除（根内校验 fail-closed，删除失败会 warn 留痕）。
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2442,7 +2457,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       xbk.App._reportToday = originalToday
       xbk.App._reportMemoryStateByPath.clear()
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   }
 
@@ -2604,7 +2619,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2647,7 +2662,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2688,7 +2703,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2716,7 +2731,7 @@ console.log('========================================\n');
       assert(!fs.existsSync(lockPath), '持有进程已退出应回收并释放 run.log 锁')
     } finally {
       Config.cache.dir = originalCacheDir
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2752,7 +2767,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2808,7 +2823,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2855,7 +2870,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2902,7 +2917,7 @@ console.log('========================================\n');
       Config.cache.dir = originalCacheDir
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2937,7 +2952,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalFailures
       Config.channelHealth.intervalMs = originalInterval
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -2971,7 +2986,7 @@ console.log('========================================\n');
       Config.channelHealth.enabled = originalEnabled
       Config.channelHealth.consecutiveFailures = originalThreshold
       Config.channelHealth.intervalMs = originalInterval
-      try { removeDirInRoot(stateDir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupIsolatedDir(stateDir)
     }
   })
 
@@ -3098,8 +3113,9 @@ console.log('========================================\n');
     } finally {
       Config.report.enabled = orig
       Config.cache.dir = originalCacheDir
-      try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
-      try { fs.rmdirSync(stateDir) } catch (e) { /* 忽略 */ }
+      // 原实现只 unlink report.state + rmdirSync(stateDir)：run 写下的缓存/日志让 rmdir 撞 ENOTEMPTY
+      // 被静默吞掉，目录本体长期滞留仓库根。改走 cleanupIsolatedDir 整目录递归删除（根内校验 fail-closed）。
+      cleanupIsolatedDir(stateDir)
     }
   })
 
