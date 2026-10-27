@@ -246,6 +246,19 @@ function removeDirInRoot (targetPath, root) {
   return p
 }
 
+// 清理入口（与 test_app.js 的 cleanupIsolatedDir 同口径）：删除失败**必须留痕**。
+// 本仓曾因「清理失败被静默吞掉」在仓库根堆出几十个 xianbaoku_cache*_report_*_isolated 目录
+// 而测试全程全绿——空 catch 会让同一个事故再演一遍（`.gitignore` 还替它打了掩护）。
+// 只 warn 不抛：这两处分别在用例 finally 与套件收尾，抛错会盖掉用例自身失败原因，或把
+// 「全绿」在收尾阶段判成红。
+function cleanupDirInRoot (targetPath) {
+  try {
+    removeDirInRoot(targetPath, __dirname)
+  } catch (e) {
+    console.warn(`⚠️ 缓存目录清理失败，需手工删除（否则将滞留仓库根）：${targetPath} — ${e.message}`)
+  }
+}
+
 // 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
 // CodeRabbit 审查：只查首个标记会漏掉「前畸形后有效」的组合——扫描全部标记，任一成链即 true
 // CodeAnt 复审：label 可含转义 `\]`——配对须跳过转义右括号，避免漏检
@@ -10572,7 +10585,7 @@ console.log('========================================\n');
     } catch (e) {
       threw = true
     } finally {
-      try { removeDirInRoot(dir, __dirname) } catch (e) { /* 忽略 */ }
+      cleanupDirInRoot(dir)
     }
     assertEqual(threw, false, '写目录路径不得抛出')
     assertEqual(ret, false, '写目录路径应返回 false')
@@ -11221,7 +11234,8 @@ console.log('========================================\n');
   // 并发隔离目录是本进程私有产物：退出前整体删除，避免 Stryker 沙箱内逐变异体累积
   // （沙箱全生命周期只建一个，百级变异体会留下百级目录）。不碰共享的 xianbaoku_cache。
   if (OWNS_CACHE_DIR) {
-    try { removeDirInRoot(CACHE, __dirname) } catch (e) { /* 清理失败不影响退出码 */ }
+    // 删不掉就留痕（不再静默）：分片目录滞留仓库根正是本仓修过的事故，只 warn 不改退出码
+    cleanupDirInRoot(CACHE)
   }
 
   process.exit(failed > 0 ? 1 : 0)
