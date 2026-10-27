@@ -161,10 +161,13 @@ function run (ymlText) {
   assert.ok(pt.stderr.includes('路径越出仓库根目录'), '应报路径越界（stderr）')
 
   // ===== 引用以 .js 结尾的目录 → 读取失败 exit 1（EISDIR，正则要求 .js 后缀）=====
-  const readFailDir = path.join(ROOT, 'tmp-readfail-dir.js')
+  // 夹具目录名必须按进程唯一：本套件在 Stryker / 并发入口下会被 8 份同时拉起，
+  // 固定名会让先结束的进程删掉后一份正在读的目录 ⇒ 误报「引用的文件不存在」而不是「读取失败」。
+  const readFailName = `tmp-readfail-dir-${process.pid}.js`
+  const readFailDir = path.join(ROOT, readFailName)
   fs.mkdirSync(readFailDir, { recursive: true })
   try {
-    const readFailYml = buildYml() + '          - name: readfail\n            mutate: "tmp-readfail-dir.js:1-10"\n'
+    const readFailYml = buildYml() + `          - name: readfail\n            mutate: "${readFailName}:1-10"\n`
     const rf = run(readFailYml)
     assert.strictEqual(rf.status, 1, '引用以 .js 结尾的目录应读取失败 exit 1')
     assert.ok(rf.stderr.includes('读取失败'), '应报读取失败（stderr）')

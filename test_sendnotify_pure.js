@@ -62,6 +62,42 @@ function bestMs (fn, runs = 3) {
   return best
 }
 
+// 亚毫秒基准的计时器：best-of-5 在 0.9ms 量级上仍有 ±20% 抖动（GC/调度/CPU 迁移），
+// 而比值型断言的分母就是它 ⇒ 并发负载下会被噪声顶成假红（CI 已实测偶发）。
+// 这里按「实测批量时长」自适应放大迭代数，再取多次采样的**中位数**：
+// 语义仍是「一次调用的毫秒数」，但每样本足够长（几十毫秒），调度抖动被摊薄到个位数百分比。
+// 注意：不能用预热那一次调用来估迭代数——负载下预热被抢占/GC 打断会把 once 估大，
+// 批量退化成 1 次调用、又回到噪声敏感的老问题（评审 358）。所以按**每次实测的批量时长**收敛。
+function sampleMs (fn, targetMs = 30) {
+  fn() // 预热：只负责 JIT，不参与计时，也不用来估迭代数
+  let iters = 1
+  let perCall = Infinity
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const s = process.hrtime.bigint()
+    for (let i = 0; i < iters; i++) fn()
+    const totalMs = Number(process.hrtime.bigint() - s) / 1e6
+    perCall = totalMs / iters
+    if (totalMs >= targetMs * 0.75 || iters >= 5000) return perCall
+    // 样本太短：按实测放大批量（至少翻倍、上限 5000），直到这一次真的跑够时长
+    iters = Math.min(5000, Math.max(iters * 2, Math.ceil(iters * (targetMs * 1.5) / Math.max(totalMs, 0.05))))
+  }
+  return perCall
+}
+
+// A/B 交错采样 + 中位数：交错能抵消「负载慢漂移」（某一侧恰好撞上 CPU 抢占），
+// 实测 8 路并发下比值区间从 1.4–7.6×（best-of-5）收敛到 0.9–2.2×（本参数 5 采样 × 30ms；
+// 真实退化 17×，阈值 10× ⇒ 两侧余量都在 4 倍以上）。
+function ratioOf (fnA, fnB, samples = 5) {
+  const A = []
+  const B = []
+  for (let k = 0; k < samples; k++) {
+    A.push(sampleMs(fnA))
+    B.push(sampleMs(fnB))
+  }
+  const med = xs => { const a = [...xs].sort((x, y) => x - y); return a[a.length >> 1] }
+  return { a: med(A), b: med(B) }
+}
+
 // ============================================================
 // 比值型墙钟判据的沙箱缩放（PERF_MS）—— 与 CI「并发假杀」同一条判定链
 // 判定链：Stryker 的 command runner 只看**退出码**（command-test-runner.js：exitCode===0 → Survived，
@@ -329,10 +365,9 @@ check('mdLinksToPlain: 预算耗尽后角括号分支必须短路 + 畸形输入
   const malformed = '[a](<x) '.repeat(20000)
   assert.ok(!malformed.includes('>'), '用例前提：整串不得含 ">"')
   const benign = '[a](https://e.com/p) '.repeat(8000) // 与畸形输入同为 160KB 量级
-  bestMs(() => mdLinksToPlain(malformed.slice(0, 2000))) // 预热，排除首次 JIT 编译
-  bestMs(() => mdLinksToPlain(benign.slice(0, 2000)))
-  const tMal = bestMs(() => mdLinksToPlain(malformed), 5)
-  const tBenign = bestMs(() => mdLinksToPlain(benign), 5)
+  // 分母在 0.9ms 量级：用 ratioOf（长样本 + A/B 交错 + 中位数）而不是 best-of-5，
+  // 否则并发负载下的计时噪声会把 2.6× 的真实比值顶过 10× 阈值（CI 的 quality job 已实测偶发假红）
+  const { a: tMal, b: tBenign } = ratioOf(() => mdLinksToPlain(malformed), () => mdLinksToPlain(benign))
   // 绝对上界：故意不随 PERF_MS 缩放（沙箱里拦灾难性回溯的硬牙，理由见顶部 PERF_MS 段）
   assert.ok(tMal < 500, `160KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
   // 比值型上界：随 PERF_MS 缩放 —— CI 假 Killed 的正是这一条（默认 10× 在沙箱里被噪声放大）
@@ -430,10 +465,8 @@ check('mdImagesToPlain: 预算耗尽后角括号分支必须短路 + 畸形输�
   const malformed = '![a](<x) '.repeat(20000) // 每段都以 '<' 开头、整串无 '>'
   assert.ok(!malformed.includes('>'), '用例前提：整串不得含 ">"')
   const benign = '![a](https://e.com/p.png) '.repeat(7000) // 与畸形输入同为 180KB 量级
-  bestMs(() => mdImagesToPlain(malformed.slice(0, 2000)))
-  bestMs(() => mdImagesToPlain(benign.slice(0, 2000)))
-  const tMal = bestMs(() => mdImagesToPlain(malformed), 5)
-  const tBenign = bestMs(() => mdImagesToPlain(benign), 5)
+  // 同 mdLinksToPlain 版：分母亚毫秒，必须用长样本 + 交错中位数压噪声（否则并发下假红）
+  const { a: tMal, b: tBenign } = ratioOf(() => mdImagesToPlain(malformed), () => mdImagesToPlain(benign))
   // 绝对上界：故意不随 PERF_MS 缩放（沙箱里拦灾难性回溯的硬牙，理由见顶部 PERF_MS 段）
   assert.ok(tMal < 500, `180KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
   // 比值型上界：随 PERF_MS 缩放 —— 与链接版同源的 CI 假 Killed 类
