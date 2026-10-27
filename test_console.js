@@ -272,11 +272,28 @@ function mkTmp (prefix) {
 }
 function tmpDir () { return mkTmp('xbk-console-test-') }
 
-process.on('exit', () => {
+// 收割：删不掉就**不静默**——把路径与原因写 stderr，否则 30 分钟后 check-host-clean 只会说
+// 「有过期沙箱」，没人知道是哪一轮没删掉（退出码不变：清理失败是环境问题，不该冒充测试结果）。
+function cleanupTmpDirs () {
   for (const dir of tmpDirs) {
-    try { fs.rmSync(dir, { recursive: true, force: true }) } catch (e) {}
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+    } catch (e) {
+      try { process.stderr.write(`[console-suite] 沙箱清理失败 ${dir}：${(e && e.message) || e}\n`) } catch (e2) {}
+    }
   }
-})
+}
+process.on('exit', cleanupTmpDirs)
+// SIGKILL 拦不住（进程直接消失，任何钩子都不跑），它不是这里能覆盖的情形——那种残留由
+// `scripts/check-host-clean.js` 在下次 `npm test` 入口响亮拦下并打印清理命令。
+// SIGINT/SIGTERM 才是「超时被 kill / CI 取消」的常态信号：捕获后先收割再按 128+n 退出，
+// 免得多留一批目录给主机闸。
+for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  process.on(sig, () => {
+    cleanupTmpDirs()
+    process.exit(code)
+  })
+}
 
 // v3.340：每组设置用例自带 stateDir + server，退出时关服务并删沙箱——一段失败不影响其它段，
 // 也不会因为漏关监听句柄把整套件挂到超时（旧版 60+ 断言挤在一个 aok 里，首错就吞掉余下全部）。
