@@ -144,7 +144,7 @@ const productionFiles = [
 
 // 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /
 // `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js 复用
-// globToRegExp / listRepoJsFiles）改为 throw —— require 者同样必须拿到失败信号。此前 require 路径
+// globMatcher / listRepoJsFiles）改为 throw —— require 者同样必须拿到失败信号。此前 require 路径
 // 只置失败标记并降级返回，使「依赖模块加载失败 / mutation.yml 无任何行段」退化成 stderr 噪音，
 // require 者拿到「校验通过」的假象（R2 审查发现；虽被同文件的 spawn 夹具兜住，但属脆弱点）。
 function exitIfDirectRun (code) {
@@ -278,35 +278,30 @@ if (nameExtra.length) {
 // （实际漏过 scripts/check-deps.js）。
 // stryker 的 mutate 原生支持 glob 写法（如 'xbk_*.js'）：含通配符的条目无法字符串精确比对，
 // 硬比会把「被 glob 覆盖的矩阵目标」误报成「缺矩阵目标」。处理：glob 条目输出提示并跳过精确
-// 比对，改用最小 glob→RegExp 判定矩阵目标是否可能被覆盖；非 glob 条目仍严格比对，通过/失败
+// 比对，改用 glob 谓词判定矩阵目标是否可能被覆盖；非 glob 条目仍严格比对，通过/失败
 // 语义与历史一致（当前 config 无 glob 时行为完全不变）。
 const configMutateRaw = requireOrDie('../stryker.config.js', 'stryker.config.js').mutate || []
 const globChars = /[*?[\]{}]/
 const configGlob = configMutateRaw.filter(item => globChars.test(item))
 const configMutate = new Set(configMutateRaw.filter(item => !globChars.test(item)))
 
-// 最小 glob→RegExp（仅为「矩阵目标是否可能被 glob 覆盖」的判定服务）：
-// `*`/`?` 不跨 `/`，`{a,b}` 为交替，`[...]` 为字符类（`!`/`^` 开头取反，内部保留 `-` 范围）；
-// 无法安全解析的结构（空类、含 `\`/`^` 的类、含通配符的交替项）一律按字面处理——宁可继续报
-// 「缺矩阵目标」，也不能把不存在的覆盖说成存在。
-// `**`（globstar）在「路径开头或紧跟 / 后」实现真实递归匹配——`**/` 匹配零个或多个目录段
-// （`(?:[^/]*/)*`，可跨 `/`），末尾 `**`（如 `scripts/**`）递归匹配其后所有层
-// （`[^/]*(?:/[^/]*)*`）。两者均在每次迭代中带显式分隔符 `/`，无嵌套/相邻量词，线性安全
-// （Sonar S8786 把 `(?:.*.*)` 这类判为可回溯超线性，此处避免）。此前把 `**` 折叠成单个 `*`
-// （[^/]*）无法跨目录，导致 `**/xbk_*.js` 这类覆盖文件被误报成 configMissing（#131 缺陷C）。
-// 字符类内 `-` 范围合法性：`x-y` 要求 x <= y（乱序范围如 `0--`/`z-a` 直接拼进字符类会让
-// new RegExp 抛「Range out of order in character class」）。首/尾位置的 `-` 是字面量不算范围；
-// `-` 相邻 `-`（如 `a--z`）无法确定语义，同样判为不安全。不安全 → 整个类按字面 `[` 处理。
-function rangesOrdered (cls) {
-  for (let k = 0; k < cls.length; k++) {
-    if (cls[k] !== '-') continue
-    if (k === 0 || k === cls.length - 1) continue // 首/尾 `-` 为字面量
-    const prev = cls[k - 1]
-    const next = cls[k + 1]
-    if (prev === '-' || next === '-') return false // 连续 `-`：无法确定语义，按字面处理
-    if (prev.charCodeAt(0) > next.charCodeAt(0)) return false // 乱序范围 → new RegExp 会抛错
-  }
-  return true
+// glob → 谓词（仅为「矩阵目标是否可能被 glob 覆盖」的判定服务）：匹配语义交给 Node 内置
+// `path.matchesGlob`（minimatch 口径，Node 22.5+；本仓 engines >=22.22.2），不再手写 62 行状态机。
+// 返回 `{ test }` 只为保持调用点与测试的 `.test(path)` 形状。
+// 旧状态机在**实际调用面**上逐条等价：`*`/`?` 不跨 `/`、`{a,b}` 交替、`[...]` 字符类与 `[!...]`
+// 取反、`**/` 与末尾 `**` 的递归、6 个 malformed 模式（`[[`/`[z-a]`/`[a-`/`{a,`/`a**b`/`*.`）不抛
+// ——均由 test_check_mutation_ranges.js 锁定。实测差异仅 3 类，见下（都不可达或更贴近 stryker 口径）：
+//   1. 点开头的路径段：内置 glob 默认不匹配隐藏文件 ⇒ `**/*.js` 不再命中 `.github/analyze-artifacts.js`
+//      （旧实现命中）。这是**收紧且与 stryker 一致**：stryker 解析 mutate glob 时同样传 dot:false
+//      （core 的 project-reader.resolveFileDescriptions → FileMatcher(…, allowHiddenFiles=false)），
+//      故 `**/*.js` 本来就不会改到它；旧行为反而会把「实际没跑」判成「已覆盖」。当前
+//      stryker.config.js 无 glob 条目，暂不可达。
+//   2. 歧义字符类（`[a--b]`）：旧实现整体降级为字面文本，内置按 minimatch 解析该类的语义。
+//      本仓 config 无此类 pattern；测试只锁「不抛异常」，不锁 upstream 的解析细节。
+//   3. `*` 对以 `/` 结尾的**输入**：旧实现判 false、内置判 true；`listRepoJsFiles` 只产出文件路径
+//      （绝无尾随 `/`），故该差异在本调用面不可达。
+function globMatcher (pattern) {
+  return { test: (file) => path.matchesGlob(file, pattern) }
 }
 
 // 递归列举仓库根下的 .js/.mjs/.cjs 生产文件（供 glob 展开匹配），忽略 test_*.js、node_modules、.git。
@@ -330,71 +325,12 @@ function listRepoJsFiles () {
   return out
 }
 
-function globToRegExp (pattern) {
-  let out = '^'
-  let cursor = 0
-  while (cursor < pattern.length) {
-    const c = pattern[cursor]
-    if (c === '*') {
-      // 收起连续的 `*`，先判 globstar（`**` 且位于路径开头或紧跟 / 后）：
-      //   - `**/`：匹配零个或多个「目录/」段（可跨 /），消费掉紧随的 `/`（0 层时无前导 /）
-      //   - 末尾 `**`：递归匹配其后所有层（如 `scripts/**`）
-      //   - 其余位置的 `**`（段中间，如 `a/**b`）：保守按单 `*` 处理，避免跨分隔符误报覆盖
-      let j = cursor
-      while (pattern[j + 1] === '*') j++
-      const isGlobstar = j - cursor + 1 >= 2 && (cursor === 0 || pattern[cursor - 1] === '/')
-      if (isGlobstar && pattern[j + 1] === '/') {
-        out += '(?:[^/]*/)*'
-        cursor = j + 1 // 消费 `**` 及紧随的 `/`；循环尾 cursor++ 跳到 `/` 之后
-      } else if (isGlobstar && j === pattern.length - 1) {
-        out += '[^/]*(?:/[^/]*)*' // 末尾 globstar：递归匹配其余所有层
-        cursor = j // 循环尾 cursor++ 跳到末尾之后，循环结束
-      } else {
-        out += '[^/]*'
-        cursor = j // 普通 `*`/段中间 `**`：仅消费 `*` 本身
-      }
-    } else if (c === '?') {
-      out += '[^/]'
-    } else if (c === '{') {
-      const close = pattern.indexOf('}', cursor + 1)
-      const alts = close === -1 ? null : pattern.slice(cursor + 1, close).split(',')
-      if (alts && alts.length >= 2 && alts.every(a => a && !globChars.test(a))) {
-        out += '(?:' + alts.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')'
-        cursor = close // 跳过 `}`；循环尾 cursor++ 到 `}` 之后
-      } else {
-        out += '\\{'
-      }
-    } else if (c === '[') {
-      const close = pattern.indexOf(']', cursor + 1)
-      if (close !== -1) {
-        let cls = pattern.slice(cursor + 1, close)
-        let negate = ''
-        if (cls[0] === '!' || cls[0] === '^') { negate = '^'; cls = cls.slice(1) }
-        // 类内仅接受字面与 `-` 范围；含 `\`/`]`/`[`/`^`、空类或乱序范围（`0--` 等会让 new RegExp
-        // 抛 Range out of order）一律按字面 `[` 处理——生成的 RegExp 必须永远合法（绝不崩溃，也绝不虚报覆盖）
-        if (cls && !/[\]^[\\]/.test(cls) && rangesOrdered(cls)) {
-          out += '[' + negate + cls + ']'
-          cursor = close // 跳过 `]`；循环尾 cursor++ 到 `]` 之后
-        } else {
-          out += '\\['
-        }
-      } else {
-        out += '\\['
-      }
-    } else {
-      out += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    }
-    cursor++
-  }
-  return new RegExp(out + '$')
-}
-
-// 暴露给测试：glob→RegExp 与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
+// 暴露给测试：glob 谓词与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
 // 注：本文件被 require 时不会用 process.exit 结束测试进程——全部失败收场（两处提前退出：未解析到
 // 任何行段、依赖模块加载失败；以及文件末尾的最终判定）都收敛到 exitIfDirectRun / require.main：
 // 直接运行 process.exit(code)，被 require 则 throw。故健康仓库下 require 不抛，可安全复用
-// globToRegExp / listRepoJsFiles；仓库真有问题时抛错让测试失败，正是期望行为。
-module.exports = { globToRegExp, listRepoJsFiles }
+// globMatcher / listRepoJsFiles；仓库真有问题时抛错让测试失败，正是期望行为。
+module.exports = { globMatcher, listRepoJsFiles }
 
 if (configGlob.length) {
   console.log(`ℹ️ stryker.config.js 的 mutate 含 glob 写法（${configGlob.join(', ')}），相对仓库根展开匹配实际文件后再与矩阵双向比对`)
@@ -408,8 +344,8 @@ const repoJsFiles = listRepoJsFiles()
 const allConfiguredMutate = new Set([
   ...configMutate,
   ...configGlob.flatMap(pattern => {
-    const re = globToRegExp(pattern)
-    return repoJsFiles.filter(file => re.test(file))
+    const matcher = globMatcher(pattern)
+    return repoJsFiles.filter(file => matcher.test(file))
   })
 ])
 const configMissing = [...mutateTargets].filter(file => !allConfiguredMutate.has(file))
@@ -500,7 +436,7 @@ for (const [file, ranges] of fileRanges) {
 }
 
 // 主入口执行：作为脚本直接运行（node scripts/check-mutation-ranges.js）时按结果 process.exit；
-// 被 require（test_check_mutation_ranges.js 复用 globToRegExp / listRepoJsFiles）时改为 throw，
+// 被 require（test_check_mutation_ranges.js 复用 globMatcher / listRepoJsFiles）时改为 throw，
 // 让 require 者也拿到失败（不再静默返回「无结论」）。
 if (require.main === module) process.exit(failed ? 1 : 0)
 if (failed) exitIfDirectRun(1) // 直接运行：上一行已 exit，此处不可达；被 require：throw

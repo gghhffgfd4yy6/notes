@@ -1091,3 +1091,8 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 未采纳：`globToRegExp → path.matchesGlob`（`[a--b]` 这类歧义字符类语义不同，会把未覆盖文件误判为已覆盖，等于闸门假绿）；`sleep → timers/promises`（鸭子 signal 缺 `removeEventListener` 时 Node 直接抛错，现有守卫正是防这个）。
 - 测试：`test_utils_pure` 291 项（新增三组共用实现单测）；控制台 282 项、应用 168 项、消息存储 135 项、日报 96 项全绿。
 - 版本 3.385.0。
+
+## v3.386 — 控制台启动失败给可读原因
+
+- 启动期监听失败（端口被占用 / 无权限 / 地址不属于本机）不再以未捕获的 server `error` 事件抛出整段栈：改为一行可读原因（含 `ss -ltnp | grep :<port>` 这类排查命令），仍以非 0 退出交给 systemd。此前 systemd 每 5s 重启一次、日志里几十行栈看不出根因（2026-10-22 实测 7777 被旧实例占用）。
+- 回归：`listenErrorHint` 的三种 code 与未知 code 兜底；并 spawn 两个实例抢同一端口，断言第二个非 0 退出、输出「端口已被占用」且不再出现 `Unhandled 'error' event`。

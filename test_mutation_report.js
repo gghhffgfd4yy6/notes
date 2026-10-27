@@ -17,7 +17,9 @@ const {
   coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER,
   parseMatrixRunnerConfigs, readMatrixRunnerConfigs, formatSegmentLabel, scoreOf, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK,
   parseMatrixTimeouts, readMatrixTimeouts, readTimeoutStats, formatTimeoutLimit, timeoutKindCell, formatTimeoutCell,
-  DEFAULT_SEGMENT_TIMEOUT_MS, TIMEOUT_STATS_FILENAME, EXPECTED_SEGMENTS
+  DEFAULT_SEGMENT_TIMEOUT_MS, TIMEOUT_STATS_FILENAME, EXPECTED_SEGMENTS,
+  // 历史日报清理（卫生项）：谓词 + 关闭循环
+  findClosableDailyIssues, isRealDayKey, closeDailyIssues, MAX_CLOSE_PER_RUN
 } = require('./scripts/mutation-report.js')
 
 // CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
@@ -1802,12 +1804,15 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const today = shanghaiDate()
     const existingIssue = { number: 42, html_url: 'https://github.com/owner/repo/issues/42', title: `🧬 变异测试日报 ${today}` }
     const listRes = makeRes(true, 200, [existingIssue])
-    mockFetch([listRes])
+    // 历史日报清理会单独拉一次 open 列表（见 postIssue 的调用点）；本轮没有更早的日报 ⇒ 空列表。
+    const cleanupRes = makeRes(true, 200, [])
+    mockFetch([listRes, cleanupRes])
     const result = await postIssue('test body')
     assert.strictEqual(result.skipped, true)
     assert.strictEqual(result.number, 42)
     assert.strictEqual(result.html_url, existingIssue.html_url)
     assert.ok(listRes.capturedUrl.includes('/issues?state=all'), '应调用列表查询 API')
+    assert.ok(cleanupRes.capturedUrl.includes('state=open'), '清理候选必须单独查 open 列表（不复用 state=all 的 100 条窗口）')
   })
 
   await acheck('postIssue 当天无日报时创建新 Issue', async () => {
@@ -1816,7 +1821,8 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const listRes = makeRes(true, 200, [])
     const createdIssue = { number: 99, html_url: 'https://github.com/owner/repo/issues/99' }
     const createRes = makeRes(true, 201, createdIssue)
-    mockFetch([listRes, createRes])
+    const cleanupRes = makeRes(true, 200, [])
+    mockFetch([listRes, createRes, cleanupRes])
     const result = await postIssue('test body content')
     assert.strictEqual(result.number, 99)
     assert.strictEqual(result.html_url, createdIssue.html_url)
@@ -1842,7 +1848,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const listRes = makeRes(false, 500, { message: 'server error' })
     const createdIssue = { number: 100, html_url: 'https://github.com/owner/repo/issues/100' }
     const createRes = makeRes(true, 201, createdIssue)
-    mockFetch([listRes, createRes])
+    mockFetch([listRes, createRes, makeRes(true, 200, [])])
     const result = await postIssue('body')
     assert.strictEqual(result.number, 100, '列表失败时应直接创建')
   })
@@ -1854,7 +1860,8 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const listRes = makeRes(false, 503, { message: 'unavailable' })
     const createdIssue = { number: 101, html_url: 'https://github.com/owner/repo/issues/101' }
     const createRes = makeRes(true, 201, createdIssue)
-    mockFetch([listRes, createRes])
+    // 清理查询给空列表：本条只数「去重降级」那一条 warn，历史清理不得额外添噪声
+    mockFetch([listRes, createRes, makeRes(true, 200, [])])
     const warns = []
     const origWarn = console.warn
     console.warn = (...args) => { warns.push(args.join(' ')) }
@@ -1891,7 +1898,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     }
     const createdIssue = { number: 102, html_url: 'https://github.com/owner/repo/issues/102' }
     const createRes = makeRes(true, 201, createdIssue)
-    mockFetch([listRes, createRes])
+    mockFetch([listRes, createRes, makeRes(true, 200, [])])
     const warns = []
     const origWarn = console.warn
     console.warn = (...args) => { warns.push(args.join(' ')) }
@@ -1914,7 +1921,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     timeoutErr.name = 'TimeoutError'
     const createdIssue = { number: 103, html_url: 'https://github.com/owner/repo/issues/103' }
     const createRes = makeRes(true, 201, createdIssue)
-    mockFetch([timeoutErr, createRes])
+    mockFetch([timeoutErr, createRes, makeRes(true, 200, [])])
     const warns = []
     const origWarn = console.warn
     console.warn = (...args) => { warns.push(args.join(' ')) }
@@ -1934,11 +1941,14 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     process.env.GITHUB_REPOSITORY = 'owner/repo'
     const listRes = makeRes(true, 200, [])
     const createRes = makeRes(true, 201, { number: 104, html_url: 'https://github.com/owner/repo/issues/104' })
-    mockFetch([listRes, createRes])
+    const cleanupRes = makeRes(true, 200, [])
+    mockFetch([listRes, createRes, cleanupRes])
     await postIssue('body')
     assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
       '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
     assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
+    assert.ok(cleanupRes.capturedOpts.signal instanceof AbortSignal,
+      '历史日报清理的查询同样必须带超时（卫生项不得拖死 report job）')
   })
 
   // ===== 本段生效 timeoutMS + Timeout 两类（console 段 60s）====================================
@@ -2216,6 +2226,268 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  // ===== 历史日报清理（卫生项）：关闭更早的 open 日报 =============================================
+  // 背景：日报每天新建一条 Issue 且从不关闭，#206…#343 积压 20 条 open。清理口径写在
+  // scripts/mutation-report.js 的 DAILY_REPORT_TITLE_RE 处：标题严格匹配 + open + bot 创建 + 日期严格
+  // 小于今天。四类必测口径：① 关闭成功 ② 单条 500 仍继续且不改退出码 ③ 当天已存在（去重命中）也关
+  // ④ 标题不匹配的用户 issue 绝不被关闭。
+  const BOT_USER = { login: 'github-actions[bot]' }
+  // 不能写死日期：套件会长期跑，今天变了「更早的日报」就变成未来日期。按上海自然日往前推。
+  function dayBefore (n) {
+    return shanghaiDate(new Date(Date.now() - n * 86400000))
+  }
+  function dailyFixture (number, day, over = {}) {
+    return {
+      number,
+      state: 'open',
+      title: `🧬 变异测试日报 ${day}`,
+      user: BOT_USER,
+      html_url: `https://github.com/owner/repo/issues/${number}`,
+      ...over
+    }
+  }
+  const closesOf = (res) => JSON.parse(res.capturedOpts.body)
+
+  await acheck('历史日报清理：3 条更早的 open 日报全部 PATCH 成 closed', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 201, html_url: 'https://github.com/owner/repo/issues/201' })
+    const cleanupRes = makeRes(true, 200, [
+      dailyFixture(11, dayBefore(3)), dailyFixture(12, dayBefore(2)), dailyFixture(13, dayBefore(1))
+    ])
+    const patches = [makeRes(true, 200, {}), makeRes(true, 200, {}), makeRes(true, 200, {})]
+    mockFetch([listRes, createRes, cleanupRes, ...patches])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    let result
+    try {
+      result = await postIssue('body')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(result.number, 201, '当天日报仍应正常创建')
+    assert.ok(cleanupRes.capturedUrl.includes('state=open'), '清理候选必须查 open 列表')
+    assert.ok(cleanupRes.capturedUrl.includes('creator=github-actions'), '清理候选必须限定 bot 创建')
+    for (const [i, num] of [11, 12, 13].entries()) {
+      assert.strictEqual(patches[i].capturedOpts.method, 'PATCH', `第 ${i + 1} 条历史日报应 PATCH`)
+      assert.ok(patches[i].capturedUrl.endsWith(`/repos/owner/repo/issues/${num}`), `PATCH 目标应是 issue #${num}，实际：${patches[i].capturedUrl}`)
+      assert.deepStrictEqual(closesOf(patches[i]), { state: 'closed', state_reason: 'not_planned' }, '请求体只关 state（not_planned：卫生关闭，不是修完了）')
+      assert.ok(patches[i].capturedOpts.signal instanceof AbortSignal, '每条 PATCH 都必须带超时')
+    }
+    assert.strictEqual(warns.length, 0, `全部成功时不应 warn，实际：${JSON.stringify(warns)}`)
+  })
+
+  await acheck('历史日报清理：单条 PATCH 500 只 warn，其余照做且不改退出码', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 202, html_url: 'https://github.com/owner/repo/issues/202' })
+    const cleanupRes = makeRes(true, 200, [
+      dailyFixture(21, dayBefore(3)), dailyFixture(22, dayBefore(2)), dailyFixture(23, dayBefore(1))
+    ])
+    // 第二条失败：既证明「失败不抛」，也证明「失败之后仍然继续」
+    const patches = [makeRes(true, 200, {}), makeRes(false, 500, { message: 'boom-remote-body' }), makeRes(true, 200, {})]
+    mockFetch([listRes, createRes, cleanupRes, ...patches])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    const beforeExit = process.exitCode
+    let result
+    try {
+      result = await postIssue('body')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(result.number, 202, '清理失败不得影响当天日报的返回值')
+    assert.strictEqual(process.exitCode, beforeExit, '清理失败不得改退出码（不是门禁）')
+    assert.strictEqual(warns.length, 1, `一条失败应恰好 warn 一次，实际 ${warns.length}：${JSON.stringify(warns)}`)
+    assert.ok(warns[0].includes('HTTP 500'), `warn 应带状态码，实际：${warns[0]}`)
+    assert.ok(warns[0].includes('第 2/3 条'), `warn 应指出是第几条失败，实际：${warns[0]}`)
+    assert.ok(!warns[0].includes('boom-remote-body'), 'S5145：远端响应体不得进日志')
+    assert.ok(!/[\r\n]/.test(warns[0]), `warn 不得含换行（防伪造日志行），实际：${JSON.stringify(warns[0])}`)
+    assert.strictEqual(patches[1].capturedOpts.method, 'PATCH', '失败的那条确实尝试过')
+    assert.strictEqual(patches[2].capturedOpts.method, 'PATCH', '一条失败后必须继续处理其余')
+    assert.ok(patches[2].capturedUrl.endsWith('/issues/23'), '按原顺序继续到最后一条')
+  })
+
+  await acheck('历史日报清理：当天日报已存在（去重命中）时同样关闭更早的', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const today = shanghaiDate()
+    const listRes = makeRes(true, 200, [dailyFixture(31, today, { html_url: 'https://github.com/owner/repo/issues/31' })])
+    const cleanupRes = makeRes(true, 200, [dailyFixture(32, dayBefore(2)), dailyFixture(33, dayBefore(1))])
+    const patches = [makeRes(true, 200, {}), makeRes(true, 200, {})]
+    mockFetch([listRes, cleanupRes, ...patches])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    let result
+    try {
+      result = await postIssue('body')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(result.skipped, true, '当天已存在 ⇒ 走跳过分支')
+    assert.strictEqual(result.number, 31, '跳过分支仍返回当天 Issue')
+    for (const [i, num] of [32, 33].entries()) {
+      assert.strictEqual(patches[i].capturedOpts.method, 'PATCH', `跳过分支也必须关闭历史日报（第 ${i + 1} 条）`)
+      assert.ok(patches[i].capturedUrl.endsWith(`/issues/${num}`), `PATCH 目标应是 #${num}`)
+    }
+    assert.strictEqual(warns.length, 0, `正常关闭不应 warn，实际：${JSON.stringify(warns)}`)
+  })
+
+  await acheck('历史日报清理：标题不匹配 / 非 bot / 非 open / PR / 当天 的 issue 一条都不碰', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const today = shanghaiDate()
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 203, html_url: 'https://github.com/owner/repo/issues/203' })
+    const cleanupRes = makeRes(true, 200, [
+      { number: 1, state: 'open', title: `🧬 变异测试日报 ${dayBefore(1)} 手改`, user: BOT_USER }, // 标题多后缀
+      { number: 2, state: 'open', title: `【补发】🧬 变异测试日报 ${dayBefore(1)}`, user: BOT_USER }, // 前缀
+      { number: 3, state: 'open', title: `🧬 变异测试日报 ${dayBefore(1).replace(/-/g, '/')}`, user: BOT_USER }, // 分隔符不同
+      { number: 4, state: 'open', title: `🧬 变异测试日报 ${dayBefore(1)}`, user: { login: 'some-user' } }, // 非 bot 创建
+      { number: 5, state: 'closed', title: `🧬 变异测试日报 ${dayBefore(1)}`, user: BOT_USER }, // 已关闭
+      { number: 6, state: 'open', title: `🧬 变异测试日报 ${dayBefore(1)}`, user: BOT_USER, pull_request: { url: 'https://api.github.com/x' } }, // PR
+      { number: 7, state: 'open', title: '🧬 变异测试日报 2026-13-45', user: BOT_USER }, // 日期不存在
+      { number: 8, state: 'open', title: '推送偶发重复消息，怎么排查？', user: { login: 'some-user' } }, // 用户手开的普通 issue
+      dailyFixture(9, today), // 当天日报（严格小于今天才关）
+      dailyFixture(10, dayBefore(1)) // 唯一应被关闭的
+    ])
+    const patch = makeRes(true, 200, {})
+    mockFetch([listRes, createRes, cleanupRes, patch])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    try {
+      await postIssue('body')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(patch.capturedUrl.endsWith('/issues/10'), true,
+      `只有严格匹配的旧日报应被 PATCH，实际打到了：${patch.capturedUrl}`)
+    assert.deepStrictEqual(closesOf(patch), { state: 'closed', state_reason: 'not_planned' })
+    assert.strictEqual(warns.length, 0, `不应有 warn，实际：${JSON.stringify(warns)}`)
+  })
+
+  await acheck('历史日报清理：候选查询失败 / 200 非 JSON 时只 warn 并跳过本轮清理', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const scenarios = [
+      makeRes(false, 502, { message: 'bad gateway body' }),
+      { ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <') }, text: async () => '<html>' }
+    ]
+    for (const cleanupRes of scenarios) {
+      const listRes = makeRes(true, 200, [])
+      const createRes = makeRes(true, 201, { number: 204, html_url: 'https://github.com/owner/repo/issues/204' })
+      mockFetch([listRes, createRes, cleanupRes])
+      const warns = []
+      const origWarn = console.warn
+      console.warn = (...args) => { warns.push(args.join(' ')) }
+      let result
+      try {
+        result = await postIssue('body')
+      } finally {
+        console.warn = origWarn
+      }
+      assert.strictEqual(result.number, 204, '候选查询失败不得影响当天日报')
+      assert.strictEqual(warns.length, 1, `应恰好 warn 一次，实际 ${warns.length}：${JSON.stringify(warns)}`)
+      assert.ok(warns[0].includes('跳过本轮历史日报清理'), `warn 必须说明清理被跳过，实际：${warns[0]}`)
+      assert.ok(!warns[0].includes('bad gateway body'), 'S5145：远端响应体不得进日志')
+      assert.ok(!/[\r\n]/.test(warns[0]), 'warn 不得含换行')
+    }
+  })
+
+  await acheck('历史日报清理：PATCH 网络异常只 warn 并继续其余', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 205, html_url: 'https://github.com/owner/repo/issues/205' })
+    const cleanupRes = makeRes(true, 200, [dailyFixture(41, dayBefore(2)), dailyFixture(42, dayBefore(1))])
+    const netErr = new Error('socket hang up')
+    const patch = makeRes(true, 200, {})
+    mockFetch([listRes, createRes, cleanupRes, netErr, patch])
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...args) => { warns.push(args.join(' ')) }
+    let result
+    try {
+      result = await postIssue('body')
+    } finally {
+      console.warn = origWarn
+    }
+    assert.strictEqual(result.number, 205)
+    assert.strictEqual(warns.length, 1, `网络异常应 warn 一次，实际：${JSON.stringify(warns)}`)
+    assert.ok(warns[0].includes('socket hang up') && warns[0].includes('第 1/2 条'), `warn 应带根因与序号：${warns[0]}`)
+    assert.strictEqual(patch.capturedOpts.method, 'PATCH', '异常后必须继续处理剩余条目')
+  })
+
+  // 纯谓词：口径本身（不经过 fetch，改动实现时这里是第一道红）
+  check('findClosableDailyIssues：只认「严格标题 + open + bot + 真实日期 + 早于今天」', () => {
+    const today = shanghaiDate()
+    const older = dayBefore(1)
+    const cases = [
+      [dailyFixture(1, older), true, '标准历史日报'],
+      [dailyFixture(2, today), false, '当天不关（它就是当日日报）'],
+      [dailyFixture(3, older, { state: 'closed' }), false, '已关闭'],
+      [dailyFixture(4, older, { user: { login: 'someone' } }), false, '非 bot 创建'],
+      [dailyFixture(5, older, { user: undefined }), false, '缺 user 字段'],
+      [dailyFixture(6, older, { pull_request: { url: 'u' } }), false, 'PR'],
+      [dailyFixture(7, older, { number: 0 }), false, '非法 number'],
+      [{ number: 8, state: 'open', title: '🧬 变异测试日报 2026-13-45', user: BOT_USER }, false, '日期不存在'],
+      [{ number: 9, state: 'open', title: `🧬 变异测试日报 ${older} 手改`, user: BOT_USER }, false, '标题带后缀'],
+      [{ number: 10, state: 'open', title: `🧬变异测试日报 ${older}`, user: BOT_USER }, false, '缺空格']
+    ]
+    for (const [issue, expected, why] of cases) {
+      assert.strictEqual(findClosableDailyIssues([issue], today).length === 1, expected, why)
+    }
+    assert.deepStrictEqual(findClosableDailyIssues(null, today), [], '非数组入参返回空数组（不抛）')
+    assert.deepStrictEqual(findClosableDailyIssues([], today), [], '空列表')
+    assert.deepStrictEqual(findClosableDailyIssues([dailyFixture(1, older)], undefined), [], 'today 缺失时不做判断')
+    // 顺序保持（PATCH 顺序可预期，便于定位第几条失败）
+    const many = [dailyFixture(51, older), dailyFixture(52, dayBefore(5))]
+    assert.deepStrictEqual(findClosableDailyIssues(many, today).map(i => i.number), [51, 52])
+  })
+
+  check('isRealDayKey：拒绝不存在的日期，接受真实日期', () => {
+    assert.strictEqual(isRealDayKey('2026-10-20'), true)
+    assert.strictEqual(isRealDayKey('2024-02-29'), true, '闰日')
+    assert.strictEqual(isRealDayKey('2026-02-29'), false, '非闰年')
+    assert.strictEqual(isRealDayKey('2026-13-01'), false)
+    assert.strictEqual(isRealDayKey('2026-00-10'), false)
+    assert.strictEqual(isRealDayKey('2026-1-01'), false)
+    assert.strictEqual(isRealDayKey('abc'), false)
+  })
+
+  await acheck('closeDailyIssues：单轮上限 30 条，其余计入 skipped', async () => {
+    const cands = Array.from({ length: 35 }, (_, i) => ({ number: 1000 + i }))
+    let calls = 0
+    const stats = await closeDailyIssues(cands, {
+      token: 't',
+      repo: 'o/r',
+      fetchImpl: async () => { calls++; return { ok: true, status: 200, text: async () => '' } }
+    })
+    assert.strictEqual(calls, MAX_CLOSE_PER_RUN, `单轮最多关 ${MAX_CLOSE_PER_RUN} 条`)
+    assert.deepStrictEqual(stats, { closed: MAX_CLOSE_PER_RUN, failed: 0, skipped: 5 })
+  })
+
+  await acheck('closeDailyIssues：总预算用尽后停止发请求，剩余计入 skipped', async () => {
+    // 时间只在「请求期间」推进（不是每次读钟都推进）：deadline 在第 0ms 定下，第一条请求吃掉 70s，
+    // 于是第二条开始前 remaining < 0 ⇒ 停止发请求。
+    let clock = 0
+    let calls = 0
+    const stats = await closeDailyIssues([{ number: 1 }, { number: 2 }, { number: 3 }], {
+      token: 't',
+      repo: 'o/r',
+      now: () => clock,
+      fetchImpl: async () => { calls++; clock += 70000; return { ok: true, status: 200, text: async () => '' } }
+    })
+    assert.strictEqual(calls, 1, '预算在第一条之后耗尽 ⇒ 只应发一次请求')
+    assert.deepStrictEqual(stats, { closed: 1, failed: 0, skipped: 2 })
   })
 
   // 恢复原始环境变量和 fetch
