@@ -584,6 +584,9 @@ jobs:
 
       # 诊断（仅失败时）：tap 档 dry run 的测试输出只写进 stryker.log，job 日志里只有
       # 「test_console.js # exit code 1」——没有这段就无法定位是哪条断言红了（2026-10-17 实测）。
+      # 2026-10-27 补：只 tail 日志尾部不够——控制台套件 287 条用例的日志远超 120 行，真正的 ❌ 行
+      # 在中间（2026-10-27 实测：dry run 报「失败 1」，job 日志里只有计数，看不到用例名）。
+      # 故先显式摘 ❌ 行，再打尾部（尾部留崩溃/超时与汇总，套件自身也会在汇总后重列失败用例名）。
       - name: 失败时打印 stryker.log 尾部
         if: failure()
         run: |
@@ -592,7 +595,10 @@ jobs:
           for f in "${TMPDIR:-/tmp}"/xbk-test-console-*/log; do
             [ -f "$f" ] || continue
             echo "--- $f ---"
-            tail -n 120 "$f" || true
+            echo '--- 失败用例（❌ 行，最多 40 行）---'
+            grep -a '❌' "$f" | head -n 40 || true
+            echo '--- 尾部 40 行 ---'
+            tail -n 40 "$f" || true
           done
 
       # fail-closed 守卫（本轮新增）：分数门禁已撤回（break = null），但「报告本身不可信」必须仍然响亮失败。
