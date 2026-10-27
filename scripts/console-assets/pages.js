@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from 
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
+import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -2289,7 +2289,7 @@ function SearchPanel ({ onSync, active = true }) {
       watchEpoch.current += 1
       if (Array.isArray(d.words)) setWatch(d.words)
       setNewCounts((prev) => {
-        if (!Object.prototype.hasOwnProperty.call(prev, req.q)) return prev
+        if (!Object.hasOwn(prev, req.q)) return prev
         const next = { ...prev }
         delete next[req.q]
         return next
@@ -3743,7 +3743,7 @@ function ChannelList ({ pc }) {
   const map = raw && !Array.isArray(raw) ? raw : {}
   const legacy = Array.isArray(raw) ? raw.filter((x) => typeof x === 'string') : []
   const names = Object.keys(map).length > 0 ? Object.keys(map) : (Array.isArray(pc.names) ? pc.names : legacy)
-  const isOn = (k) => Object.prototype.hasOwnProperty.call(map, k)
+  const isOn = (k) => Object.hasOwn(map, k)
     ? !!map[k]
     : (Array.isArray(pc.names) && pc.names.includes(k)) || legacy.includes(k)
   const on = names.filter(isOn)
@@ -3956,15 +3956,6 @@ function clearFilterDraft () {
   try { window.localStorage.removeItem(FILTER_DRAFT_KEY) } catch (e) { /* 忽略 */ }
 }
 
-function filterDraftAgeText (savedAt) {
-  const minutes = Math.max(0, Math.floor((Date.now() - Number(savedAt)) / 60000))
-  if (minutes < 1) return '刚刚'
-  if (minutes < 60) return `${minutes} 分钟前`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
-  return `${Math.floor(hours / 24)} 天前`
-}
-
 // 全命中判定与服务端 wideMatchFields 同口径：trim 后等于 .* 或 ^.*$。
 const FILTER_WIDE_PATTERNS = ['.*', '^.*$']
 
@@ -4154,7 +4145,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         const sourceText = saved.source === 'server' ? '服务器' : '本机'
         restoreNotice = {
           tone: 'warn',
-          text: `已恢复上次未保存的草稿（${sourceText}，${filterDraftAgeText(saved.savedAt)}，${changed.length} 个字段）${baseRev !== null && baseRev !== revision ? `；草稿基于 r${baseRev}，当前 r${revision}` : ''}。保存后才会生效。`
+          text: `已恢复上次未保存的草稿（${sourceText}，${fmtAge(Date.now() - Number(saved.savedAt))}，${changed.length} 个字段）${baseRev !== null && baseRev !== revision ? `；草稿基于 r${baseRev}，当前 r${revision}` : ''}。保存后才会生效。`
         }
         setDraftSavedAt(saved.savedAt)
         setDraftSyncedAt(saved.source === 'server' ? saved.savedAt : 0)

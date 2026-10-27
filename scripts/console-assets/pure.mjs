@@ -145,7 +145,7 @@ export function effectiveFilterRows (configFilter, activeFilter) {
   const base = isPlain(configFilter) ? configFilter : {}
   const active = isPlain(activeFilter) ? activeFilter : null
   const norm = (v) => (v === undefined || v === null ? '' : String(v))
-  const has = (k) => Boolean(active) && Object.prototype.hasOwnProperty.call(active, k)
+  const has = (k) => Boolean(active) && Object.hasOwn(active, k)
   const keys = Object.keys(base)
   if (active) for (const k of Object.keys(active)) if (!keys.includes(k)) keys.push(k)
   return keys.map((key) => ({

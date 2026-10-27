@@ -8257,6 +8257,16 @@ async function main () {
     assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
   })
 
+  await aok('结构红线: v3.385 用 Object.hasOwn + 草稿时间复用 fmtAge（不留重复实现）', () => {
+    const src = readConsoleSource()
+    const pure = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pure.mjs'), 'utf8')
+    // Object.hasOwn 是 ES2022：Safari 15.4+ / Chrome 93+，与 <dialog> 的底线一致（比手写 .call 短且不碰原型）。
+    assert.ok(!src.includes('Object.prototype.hasOwnProperty.call'), '资产源码一律用 Object.hasOwn，不再手写 .call')
+    assert.ok(!pure.includes('Object.prototype.hasOwnProperty.call'), 'pure.mjs 同样用 Object.hasOwn')
+    // 「多久以前」只留 pure.mjs 的 fmtAge 一份（pages.js 曾抄过一份，文案相同、口径易漂）。
+    assert.ok(!src.includes('function filterDraftAgeText'), '「多久以前」不得再有第二份实现')
+    assert.ok(src.includes('fmtAge(Date.now() - Number(saved.savedAt))'), '草稿恢复提示必须复用 fmtAge（与缓存写入同口径）')
+  })
   await aok('结构红线: v3.385 复制兜底（非安全上下文 / 剪贴板被拒时仍能复制）', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function copyViaTextarea')
