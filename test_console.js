@@ -61,7 +61,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 }
 
 const {
-  createConsole, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
+  createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -8673,11 +8673,17 @@ async function main () {
     assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
     assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
 
-    // 版本已 bump 到 3.360：注释里不得提前写下一版 v3.361。
+    // 版本已 bump 到 3.386：注释里不得提前写下一版 v3.387。
+    // 旧写法把版本号写死成 v3.361，之后 24 个版本没人跟着改 ⇒ 这条红线早已失效（注释里真写
+    // v3.387 也不会被拦）。改为按 package.json 的当前版本推导「下一版」，bump 后自动跟上。
     // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
     // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    assert.ok(!/v3\.361/.test(src), 'app.js 注释不得写 v3.361（版本未 bump）')
-    assert.ok(!/v3\.361/.test(css), 'app.css 注释不得写 v3.361（版本未 bump）')
+    // 版本号形如 3.386.0：本仓每次发版 +1 的是中段（3.386 → 3.387.0），且注释里习惯只写到中段
+    // （旧红线写的就是 v3.361）。故按「vMAJOR.下一中段」匹配，v3.387 与 v3.387.0 两种写法都能拦。
+    const cur = String(require('./package.json').version).split('.').map(Number)
+    const nextVer = `v${cur[0]}.${cur[1] + 1}`
+    assert.ok(!src.includes(nextVer), `app.js 注释不得写 ${nextVer}（版本未 bump）`)
+    assert.ok(!css.includes(nextVer), `app.css 注释不得写 ${nextVer}（版本未 bump）`)
   })
 
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
@@ -9542,6 +9548,52 @@ async function main () {
       assert.ok(res.text.includes('需要访问令牌'), '按未登录处理')
     } finally {
       await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // v3.386：启动期监听失败要给一行可读原因（2026-10-22 实测 7777 被旧实例占用时，
+  // 日志里只有未捕获 'error' 的整段栈，systemd 每 5s 重启一次、看不出根因）。
+  await aok('启动: 监听失败给一行可读原因（端口占用不再冒未捕获栈）', async () => {
+    assert.match(listenErrorHint('EADDRINUSE', '127.0.0.1', 7777), /端口已被占用[\s\S]*ss -ltnp/, 'EADDRINUSE 应给出占用与排查命令')
+    assert.match(listenErrorHint('EACCES', '0.0.0.0', 80), /没有权限/, 'EACCES 应说明权限')
+    assert.match(listenErrorHint('EADDRNOTAVAIL', '10.0.0.9', 7777), /不属于本机/, 'EADDRNOTAVAIL 应指向 XBK_CONSOLE_HOST')
+    assert.match(listenErrorHint(undefined, '127.0.0.1', 7777), /失败（UNKNOWN）/, '未知 code 也要有可读兜底')
+
+    const dir = tmpDir()
+    const base = { ...process.env, XBK_CONSOLE_TOKEN: TOKEN, XBK_CACHE_DIR: dir }
+    const first = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
+      env: { ...base, XBK_CONSOLE_PORT: '0' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let outA = ''
+    first.stdout.on('data', (c) => { outA += c })
+    first.stderr.on('data', (c) => { outA += c })
+    try {
+      const deadline = Date.now() + 10000
+      while (!outA.includes('已启动')) {
+        if (Date.now() > deadline) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      const m = /已启动：http:\/\/[^:]+:(\d+)/.exec(outA)
+      assert.ok(m, `第一个实例未就绪：${outA.slice(0, 300)}`)
+      const busyPort = m[1]
+      const second = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
+        env: { ...base, XBK_CONSOLE_PORT: busyPort },
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+      let outB = ''
+      second.stdout.on('data', (c) => { outB += c })
+      second.stderr.on('data', (c) => { outB += c })
+      const code = await new Promise((resolve) => {
+        const timer = setTimeout(() => { second.kill('SIGKILL'); resolve('timeout') }, 10000)
+        second.on('exit', (c) => { clearTimeout(timer); resolve(c) })
+      })
+      assert.notStrictEqual(code, 0, `端口被占用时必须非 0 退出（实际 ${code}）：${outB.slice(0, 300)}`)
+      assert.match(outB, /端口已被占用/, `应给出一行可读原因：${outB.slice(0, 300)}`)
+      assert.ok(!/Unhandled 'error' event/.test(outB), `不得再冒未捕获 error 栈：${outB.slice(0, 300)}`)
+    } finally {
+      first.kill('SIGKILL')
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
