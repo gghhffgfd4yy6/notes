@@ -34,10 +34,16 @@ function readConsoleSource () {
 // 「写路径 → 按路径 open」的 check-then-use 判红。
 const { readSafeTextResult } = require('./xbk_storage')
 
-// 变异 dry-run 取证（仅变异子进程生效）：tap 档失败时只回传 `test_console.js # exit code 1`，
+// 变异 dry-run 取证（仅变异子进程 + 仅 CI 生效）：tap 档失败时只回传 `test_console.js # exit code 1`，
 // stryker.log 不含测试 stdout；把 stdout/stderr 与未捕获异常落盘，mutation.yml 的
 // `if: failure()` 步骤再 tail 出来。正常 npm test 下完全无副作用。
-if (process.env.XBK_MUTATION_CHILD === '1') {
+//
+// 为什么还要 `GITHUB_ACTIONS=true` 这一层：**只有 CI 会读这份取证**（mutation.yml 的 failure 步骤
+// glob `${TMPDIR:-/tmp}/xbk-test-console-*/log`），本机没有任何消费方；而目录名以 `xbk-` 开头，
+// 留下来就会被 scripts/check-host-clean.js 判成「>30min 的过期沙箱」⇒ 下一次 npm test 直接
+// fail-closed 拒绝启动（本机实测：npm run check 的 evaluate 场景以 XBK_MUTATION_CHILD=1 跑整套件，
+// 于是每跑一次 check 就在 os.tmpdir() 里埋一个）。本机要复现取证的语义，可显式设 GITHUB_ACTIONS=true。
+if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'true') {
   const chunks = []
   const outWrite = process.stdout.write.bind(process.stdout)
   const errWrite = process.stderr.write.bind(process.stderr)
