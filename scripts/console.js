@@ -6456,6 +6456,24 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
+// 启动期监听失败的可读原因：server 的 'error' 事件不接就是未捕获异常，日志里只有整段栈，
+// systemd 每 5s 重启一次、几十行栈看不出根因（2026-10-22 实测 7777 被旧实例占着）。
+// 这里给「哪个地址、为什么、下一步查什么」，仍以非 0 退出（fail-closed，交 systemd 退避）。
+function listenErrorHint (code, host, port) {
+  if (code === 'EADDRINUSE') {
+    return `❌ 控制台无法监听 ${host}:${port}：端口已被占用（EADDRINUSE），通常是有旧实例还没退出。` +
+      `先查占用进程：ss -ltnp | grep :${port}；停掉它再重启（本次拒绝启动，fail-closed）`
+  }
+  if (code === 'EACCES') {
+    return `❌ 控制台无法监听 ${host}:${port}：没有权限（EACCES）。1024 以下端口需要 root；` +
+      '或改用高端口（XBK_CONSOLE_PORT）'
+  }
+  if (code === 'EADDRNOTAVAIL') {
+    return `❌ 控制台无法监听 ${host}:${port}：该地址不属于本机（EADDRNOTAVAIL）。检查 XBK_CONSOLE_HOST`
+  }
+  return `❌ 控制台监听 ${host}:${port} 失败（${code || 'UNKNOWN'}）`
+}
+
 function main () {
   const token = process.env.XBK_CONSOLE_TOKEN
   // Sourcery #225 M5：XBK_CONSOLE_PORT 非空但非法（非数字/超范围）时 Number() 得 NaN，
@@ -6488,6 +6506,12 @@ function main () {
   // 优雅关闭：装配逻辑在 createConsole.wireGracefulShutdown（v3.297 抽出以便依赖注入
   // 测试，Sourcery #225 M6）。生产路径无注入 = process.exit + 全局信号监听，与抽取前等价。
   wireGracefulShutdown()
+  // 监听失败（端口占用/无权限/地址不可用）必须给一行原因，别让它变成未捕获的 'error' 事件。
+  // 其余运行期 server 错误同样收敛到这里：非 0 退出，由 systemd 决定是否重试。
+  server.on('error', (err) => {
+    console.error(listenErrorHint(err && err.code, host, port))
+    process.exit(1)
+  })
   server.listen(port, host, () => {
     console.log(`xbk-push 控制台已启动：http://${host}:${server.address().port}（缓存目录：${stateDir}）`)
     console.log(`鉴权：请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>，或浏览器打开 http://${host}:${server.address().port}/?token=<XBK_CONSOLE_TOKEN>；token 未设置或过短则拒绝启动`)
@@ -6504,6 +6528,7 @@ if (require.main === module) main()
 
 module.exports = {
   createConsole,
+  listenErrorHint,
   consoleStateDir,
   STATIC_ASSETS,
   finishRun,
