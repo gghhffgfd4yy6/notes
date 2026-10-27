@@ -234,8 +234,10 @@ function run (ymlText) {
     assert.strictEqual(globMatcher('**/xbk_*.js').test('.github/xbk_hidden.js'), false,
       '**/xbk_*.js 不得匹配隐藏目录（dot:false 口径；基线据此排除 dot 段）')
     const visibleFiles = files.filter(f => !f.split('/').some(seg => seg.startsWith('.')))
-    const byGlob = visibleFiles.filter(f => globMatcher('**/xbk_*.js').test(f)).sort()
-    const byBaseline = visibleFiles.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).sort()
+    // 显式比较器：默认 sort() 按 UTF-16 码元排，Sonar S2871 要求显式口径（此处与默认一致，只为可读）
+    const byPath = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+    const byGlob = visibleFiles.filter(f => globMatcher('**/xbk_*.js').test(f)).sort(byPath)
+    const byBaseline = visibleFiles.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).sort(byPath)
     assert.deepStrictEqual(byGlob, byBaseline,
       `glob 展开结果必须与正则基线逐条一致（集合比较，防「数量相同但选错文件」）；glob 侧 ${byGlob.length} 条、基线 ${byBaseline.length} 条`)
     console.log('✅ globMatcher / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
