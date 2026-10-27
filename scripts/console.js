@@ -131,6 +131,12 @@ const MESSAGE_DAYS_ALLOWED = Object.freeze([0, 1, 3, 7, 30])
 // ── v3.370 线报全站搜索（只读代理线报酷 /search.php）───────────────────────
 // 上游单页固定 100 条、最多约 5 页；页码与查询词都钳制后再拼 URL（上游是外部输入）。
 const LINE_SEARCH_QUERY_MAX_BYTES = 120
+// 详情页正文（关注词推送用）：搜索列表的 data-content 是纯文本——上游已经把 <a> 剥掉，
+// 只剩「领 拍」这种空壳；真实领券/下单链接与海报图只在详情页的 article-content 里。
+// 抓它复用与搜索页同一套硬约束（固定 host、不跟 3xx、8s、4 MiB），只多一条「每条推送一次」。
+const LINE_DETAIL_PATH_RE = /^\/[A-Za-z0-9_-]{1,32}\/\d{1,12}\.html$/
+const LINE_DETAIL_MAX_BYTES = 4 * 1024 * 1024
+const LINE_DETAIL_TIMEOUT_MS = 8000
 // 搜索页按「每页 N 条」切片，N 与监控共用（v3.371）。
 const LINE_SEARCH_PAGE_SIZE = 100
 const LINE_SEARCH_UPSTREAM_PAGE_MAX = 5
@@ -2486,6 +2492,74 @@ function formatWatchPush (item) {
   return lines.join('\n')
 }
 
+// 详情页正文抽取：从 `<div class="article-content ...">` 起，按 <div> 配对取内层 HTML。
+// 线性扫一遍（不用正则配嵌套）：正文里的 <br>/<a>/<img> 都是要交给 htmlToMarkdown 的素材。
+function extractArticleHtml (html) {
+  if (typeof html !== 'string' || html === '') return ''
+  const marker = 'class="article-content'
+  const at = html.indexOf(marker)
+  if (at < 0) return ''
+  const open = html.lastIndexOf('<div', at)
+  const bodyStart = html.indexOf('>', at)
+  if (open < 0 || bodyStart < 0) return ''
+  let depth = 1
+  let i = bodyStart + 1
+  while (i < html.length) {
+    const lt = html.indexOf('<', i)
+    if (lt < 0) return ''
+    if (html.startsWith('</div>', lt)) {
+      depth -= 1
+      if (depth === 0) return html.slice(bodyStart + 1, lt).trim()
+      i = lt + 6
+      continue
+    }
+    if (html.startsWith('<div', lt)) {
+      const next = html[lt + 4]
+      if (next === ' ' || next === '>' || next === '\n' || next === '\t') depth += 1
+      i = lt + 4
+      continue
+    }
+    i = lt + 1
+  }
+  return ''
+}
+
+// 正文渲染**不另写一套**：直接复用生产出口的 htmlToMarkdown（与主推送同源——<a> 转 Markdown
+// 链接、<img> 转 ![]()、末尾补「原文链接」）。于是 WxPusher 的 clickUrl=deal 取到的第一条外链
+// 就是正文里的领券链接，而不是原文链接（旧实现正文只有纯文本 + 原文链接，点开必落线报酷详情页）。
+let watchMarkdownFn = null
+function watchMarkdown (contentHtml, url) {
+  if (watchMarkdownFn === null) {
+    try {
+      const app = require('../xbk_function_v3')
+      watchMarkdownFn = typeof app.htmlToMarkdown === 'function' ? app.htmlToMarkdown : false
+    } catch (e) {
+      watchMarkdownFn = false
+    }
+  }
+  if (watchMarkdownFn === false) return ''
+  try {
+    const md = watchMarkdownFn({ content_html: String(contentHtml || ''), url: String(url || '') })
+    return typeof md === 'string' ? md.trim() : ''
+  } catch (e) {
+    return ''
+  }
+}
+
+// 富文本正文：标题 + 时间 + 生产同源 Markdown。渲染不出东西时返回 ''，调用方退回 formatWatchPush。
+// 注意 content_html 为空时必须直接返回 ''——htmlToMarkdown 对空正文仍会产出「原文链接：…」一行，
+// 那不是正文，不能拿它顶替纯文本兜底。
+function formatWatchPushRich (item, contentHtml) {
+  if (typeof contentHtml !== 'string' || contentHtml.trim() === '') return ''
+  const md = watchMarkdown(contentHtml, item && item.url)
+  if (md === '') return ''
+  const head = []
+  const title = item && typeof item.title === 'string' ? item.title.trim() : ''
+  if (title !== '') head.push(title)
+  if (item && typeof item.datetime === 'string' && item.datetime !== '') head.push(item.datetime)
+  return head.length > 0 ? `${head.join('\n')}\n\n${md}` : md
+}
+
 // 消息过滤谓词（v3.300 3.2 从 /api/messages 抽出，两处复用——变异测试只打一处）。
 // cate 精确等值（'(未分类)' 归一，与列表端点两处口径一致）；needle 为已 trim+toLowerCase 的
 // 子串（title/content 双字段）。q/cate 全程不进正则（ReDoS 红线）：只用 includes 与 String 等值。
@@ -2928,7 +3002,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, watchNotifier } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, lineDetailFetch, watchNotifier } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -4722,6 +4796,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 解析失败不抛错（返回 0 条），网络失败按 upstream_error 如实下发（不伪装成「没有结果」）。
   const lineSearchCache = new Map()
   const searchFetch = typeof lineSearchFetch === 'function' ? lineSearchFetch : globalThis.fetch
+  // 详情页抓取独立出口：不复用 searchFetch（否则测试里注入了搜索桩就会把详情页也喂给那个桩，
+  // 真实网络路径永远跑不到）。测试要显式注入 lineDetailFetch。
+  const detailFetch = typeof lineDetailFetch === 'function' ? lineDetailFetch : globalThis.fetch
 
   // 取上游某一页（1..5），解析成 { status, items, pages, ... }；同词同页 60s 缓存。
   // 失败返回 { ok:false, error }，由调用方决定怎么下发——不在这里写 res（定时监控也要复用）。
@@ -4826,6 +4903,69 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return await task
     } finally {
       lineSearchInflight.delete(key)
+    }
+  }
+
+  // 取某条线报的详情页正文（关注词推送用）。与搜索页同一套上游约束：固定 host（sourceDomain）、
+  // 路径白名单（/<段>/<数字>.html）、不跟 3xx、8s、4 MiB。失败一律返回 { ok:false }，由调用方退回纯文本。
+  const fetchLineDetail = async (rawUrl) => {
+    if (typeof detailFetch !== 'function') return { ok: false, error: '当前 Node 不支持 fetch' }
+    let target
+    try {
+      target = new URL(String(rawUrl || ''))
+    } catch (e) {
+      return { ok: false, error: '详情页地址非法' }
+    }
+    let base
+    try {
+      base = new URL(sourceDomain())
+    } catch (e) {
+      return { ok: false, error: '线报酷域名配置非法' }
+    }
+    // 只认本域 + 白名单路径：地址来自上游列表，不能让它在控制台进程里随手打内网/其它站点。
+    if (target.origin !== base.origin) return { ok: false, error: '详情页不在线报酷域名内' }
+    if (target.username !== '' || target.password !== '' || target.search !== '' || target.hash !== '') {
+      return { ok: false, error: '详情页地址带多余成分' }
+    }
+    if (!LINE_DETAIL_PATH_RE.test(target.pathname)) return { ok: false, error: '详情页路径不在白名单' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), LINE_DETAIL_TIMEOUT_MS)
+    try {
+      const upstream = await detailFetch(target.href, {
+        signal: controller.signal,
+        redirect: 'manual', // 固定 host：上游 3xx 一律中止
+        headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': 'xbk-console/1' }
+      })
+      if (upstream && upstream.status >= 300 && upstream.status < 400) return { ok: false, error: '线报酷返回重定向，已中止' }
+      if (!upstream || !upstream.ok) return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
+      let text = ''
+      const stream = upstream.body
+      if (stream && typeof stream.getReader === 'function') {
+        const reader = stream.getReader()
+        const chunks = []
+        let total = 0
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          total += value.length
+          if (total > LINE_DETAIL_MAX_BYTES) {
+            try { await reader.cancel() } catch (e) {}
+            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
+          }
+          chunks.push(value)
+        }
+        text = Buffer.concat(chunks).toString('utf8')
+      } else {
+        text = await upstream.text()
+        if (Buffer.byteLength(text, 'utf8') > LINE_DETAIL_MAX_BYTES) return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
+      }
+      const contentHtml = extractArticleHtml(text)
+      if (contentHtml === '') return { ok: false, error: '线报酷详情页结构变了（找不到正文）' }
+      return { ok: true, value: { contentHtml } }
+    } catch (e) {
+      return { ok: false, error: controller.signal.aborted ? '线报酷响应超时（8s）' : '线报酷连接失败' }
+    } finally {
+      clearTimeout(timer)
     }
   }
 
@@ -5101,7 +5241,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (!stillNew) continue
           try {
             const title = `新线报 · ${word.q}`.slice(0, 32)
-            await notifyWatch(title, formatWatchPush(item))
+            // 正文优先用详情页富文本（真实领券/下单链接 + 海报图，渲染走生产同源的 htmlToMarkdown）；
+            // 抓不到就退回纯文本——绝不因为详情页失败而不推这一条。
+            let body = formatWatchPush(item)
+            const detail = await fetchLineDetail(item.url)
+            if (detail.ok) {
+              const rich = formatWatchPushRich(item, detail.value.contentHtml)
+              if (rich !== '') body = rich
+            }
+            await notifyWatch(title, body)
           } catch (e) {
             results.push({ q: word.q, pushed: count, error: 'push_failed' })
             break
@@ -6676,6 +6824,8 @@ module.exports = {
   readWatchState,
   saveWatchState,
   formatWatchPush,
+  extractArticleHtml,
+  formatWatchPushRich,
   clampWatchInt,
   LINE_WATCH_FILE,
   LINE_WATCH_MAX_WORDS,

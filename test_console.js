@@ -97,6 +97,7 @@ const {
   // v3.370 线报全站搜索：解析/归一纯函数 + 关注词文件常量
   decodeLineHtml, parseLineStamp, clampLineQuery, normalizeWatchWord, parseLineSearchHtml,
   readLineWatchWords, readWatchState, saveWatchState, formatWatchPush,
+  extractArticleHtml, formatWatchPushRich,
   LINE_WATCH_FILE, LINE_WATCH_MAX_WORDS, LINE_SEARCH_QUERY_MAX_BYTES
 } = require('./scripts/console')
 const { readMessages } = require('./scripts/status')
@@ -2482,6 +2483,7 @@ async function watchMonitorTests () {
       token: TOKEN,
       stateDir: dir,
       lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => pageOne }),
+      lineDetailFetch: async () => ({ ok: false, error: 'stub' }),
       watchNotifier: notifier
     })
 
@@ -2567,6 +2569,7 @@ async function watchMonitorTests () {
       token: TOKEN,
       stateDir: dir,
       lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }),
+      lineDetailFetch: async () => ({ ok: false, error: 'stub' }),
       watchNotifier: async (title, body) => { pushes.push({ title, body }) }
     })
     try {
@@ -2586,6 +2589,7 @@ async function watchMonitorTests () {
       token: TOKEN,
       stateDir: dir2,
       lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => LINE_SEARCH_FIXTURE }),
+      lineDetailFetch: async () => ({ ok: false, error: 'stub' }),
       watchNotifier: async () => {
         sent.push(1)
         // 第一条发出后用户关掉监控：内存里的 state 仍是 enabled，必须靠每条重读文件才发现。
@@ -2624,6 +2628,7 @@ async function watchMonitorTests () {
       token: TOKEN,
       stateDir: dir,
       lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => html }),
+      lineDetailFetch: async () => ({ ok: false, error: 'stub' }),
       watchNotifier: async (title, body) => { pushes.push(body) }
     })
     try {
@@ -2639,6 +2644,119 @@ async function watchMonitorTests () {
       c.server.close()
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  // 关注词推送正文：搜索列表的 data-content 是纯文本（上游剥掉了 <a>），只剩「领 拍」空壳，
+  // 于是正文里唯一外链是原文链接 ⇒ WxPusher clickUrl=deal 点开必落线报酷详情页。
+  // 现在改为取详情页正文走生产 htmlToMarkdown：链接与海报图都回来，点开落在领券链接上。
+  const RICH_LIST_HTML = `<html><body><ul class="new-post">
+<li class="article-list"><p class="title"><time class="badge red" datetime="2026-10-27" title="2026-10-27 16:38">16:38</time><a href="/haodan/9000010.html" title="十月稻田东北五常大米5kg*2袋 65元" data-price="">十月稻田东北五常大米5kg*2袋 65元</a></p></li>
+</ul><div class="pagebar"><a href="/search.php?q=x&amp;page=1">1</a></div></body></html>`
+  const RICH_DETAIL_HTML = `<html><body><div class="art-content"><div class="article-content xb-linked">
+<p>十月稻田 东北五常大米5kg*2袋<br>折3.2/斤 ！！拍下【65元】<br>领 <a href="http://t.yuebuy.xin/kqRNzWx">http://t.yuebuy.xin/kqRNzWx</a><br>拍 <a href="https://u.jd.com/5GowgUb">https://u.jd.com/5GowgUb</a><br><img src="https://img14.360buyimg.com/pop/x.jpg"></p>
+</div></div><div class="art-fujia-content">收藏文章</div></body></html>`
+
+  await aok('关注词推送: 详情页正文走生产 htmlToMarkdown（真实领券链接 + 海报图）', async () => {
+    const dir = mkTmp('xbk-console-watch-rich-')
+    saveWatchState(dir, {
+      limit: 20,
+      intervalMin: 10,
+      enabled: true,
+      lastCheckAt: 0,
+      words: [{ q: '十月稻田', lastReadAt: Date.UTC(2026, 9, 27, 0, 0), lastReadId: '', sentIds: [] }]
+    })
+    const pushes = []
+    const seen = []
+    const c = createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => RICH_LIST_HTML }),
+      lineDetailFetch: async (u) => { seen.push(u); return { ok: true, status: 200, text: async () => RICH_DETAIL_HTML } },
+      watchNotifier: async (title, body) => { pushes.push({ title, body }) }
+    })
+    try {
+      const r = await c.runWatchOnce()
+      assert.strictEqual(r.pushed, 1)
+      const body = pushes[0].body
+      assert.ok(body.includes('http://t.yuebuy.xin/kqRNzWx'), `正文必须带真实领券链接: ${body.slice(0, 200)}`)
+      assert.ok(body.includes('https://u.jd.com/5GowgUb'), '正文必须带真实下单链接')
+      assert.ok(body.includes('![](https://img14.360buyimg.com/pop/x.jpg)'), '海报图必须随正文发出（生产同源 Markdown）')
+      assert.ok(body.includes('原文链接：'), '仍保留原文链接段')
+      const firstLink = (body.match(/https?:\/\/[^\s)\]]+/) || [])[0]
+      assert.strictEqual(firstLink, 'http://t.yuebuy.xin/kqRNzWx', 'WxPusher clickUrl=deal 取第一条链接，必须是领券链接')
+      assert.ok(!body.includes('收藏文章'), '只取正文容器，不得混入页尾推荐')
+      assert.strictEqual(seen.length, 1, '每条推送抓一次详情页')
+      assert.ok(seen[0].endsWith('/haodan/9000010.html'))
+    } finally {
+      c.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('关注词推送: 详情页抓不到就退回纯文本，且不外站抓取', async () => {
+    const dir = mkTmp('xbk-console-watch-fallback-')
+    const mkState = () => saveWatchState(dir, {
+      limit: 20,
+      intervalMin: 10,
+      enabled: true,
+      lastCheckAt: 0,
+      words: [{ q: '十月稻田', lastReadAt: Date.UTC(2026, 9, 27, 0, 0), lastReadId: '', sentIds: [] }]
+    })
+    // ① 详情页请求失败 → 纯文本兜底，仍然要推
+    mkState()
+    const plain = []
+    const c1 = createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => RICH_LIST_HTML }),
+      lineDetailFetch: async () => ({ ok: false, status: 500 }),
+      watchNotifier: async (t, body) => { plain.push(body) }
+    })
+    try {
+      const r = await c1.runWatchOnce()
+      assert.strictEqual(r.pushed, 1, '详情页失败不得导致不推')
+      assert.ok(plain[0].includes('/haodan/9000010.html'), '退回纯文本正文（含原文链接）')
+      assert.ok(!plain[0].includes('!['), '兜底正文不含图片 Markdown')
+    } finally {
+      c1.server.close()
+    }
+    // ② 上游给的外站地址一律不抓（SSRF 面）：detail fetch 必须一次都不被调用
+    fs.rmSync(dir, { recursive: true, force: true })
+    mkState()
+    const evilHtml = RICH_LIST_HTML.replace('/haodan/9000010.html', 'https://evil.example/haodan/9000010.html')
+    let calls = 0
+    const c2 = createConsole({
+      token: TOKEN,
+      stateDir: dir,
+      lineSearchFetch: async () => ({ ok: true, status: 200, text: async () => evilHtml }),
+      lineDetailFetch: async () => { calls += 1; return { ok: true, status: 200, text: async () => RICH_DETAIL_HTML } },
+      watchNotifier: async () => {}
+    })
+    try {
+      const r = await c2.runWatchOnce()
+      assert.strictEqual(r.pushed, 1)
+      assert.strictEqual(calls, 0, '外站详情页地址必须被拦在抓取之前')
+    } finally {
+      c2.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('关注词推送: extractArticleHtml 取正文容器（配对 div / 无标记 / 未闭合）', async () => {
+    assert.strictEqual(
+      extractArticleHtml('<div class="article-content xb">A<div class="inner">B</div>C</div><div>tail</div>'),
+      'A<div class="inner">B</div>C',
+      '按 <div> 配对取内层，遇外层闭合即止'
+    )
+    assert.strictEqual(extractArticleHtml('<div class="other">x</div>'), '', '没有正文容器时返回空串')
+    assert.strictEqual(extractArticleHtml('<div class="article-content">A<div>B</div>'), '', '未闭合时返回空串')
+    assert.strictEqual(extractArticleHtml(''), '')
+    assert.strictEqual(extractArticleHtml(null), '')
+  })
+
+  await aok('关注词推送: formatWatchPushRich 空正文必须返回空串（由调用方兜底）', async () => {
+    assert.strictEqual(formatWatchPushRich({ title: 't', url: 'https://new.ixbk.net/haodan/1.html' }, ''), '',
+      '渲染不出正文时返回空串，调用方退回 formatWatchPush')
   })
 }
 
