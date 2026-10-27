@@ -6,6 +6,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
+const { stripVTControlCharacters } = require('node:util')
 const { readReportJson, writeStrippedReport, resolveMaxReportBytes } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
@@ -193,35 +194,12 @@ const HIGH_REUSE_RATIO = 0.5
 // 实测 16 变异体 × 4 次运行 = 38 行 / 3593 字节。8MiB 留了三个数量级余量；超限一律按「未记录」处理
 // 并给出原因——绝不为了拿到一个数字而整份读入病态文件（例如有人改成 --fileLogLevel debug）。
 const REUSE_LOG_MAX_BYTES = 8 * 1024 * 1024
-// ANSI CSI 序列（含 SGR 颜色），形态为 ESC '[' [0-?]* [ -/]* [@-~]（ECMA-48 的 CSI 子集）。
-// 刻意**不用正则**实现——两种正则写法都得靠抑制注释才能过静态检查，而这里根本不需要正则：
-//   · 正则字面量要把 ESC 写成 \u001B/\x1b，命中 eslint 的 no-control-regex（standard 启用）；
-//   · new RegExp(拼接字符串) 又踩 Codacy 的「RegExp 构造函数传非字面量」告警（本文件此前正是这种写法）。
-// 手写扫描没有回溯面，剥离规则本身就是逐字符的定长状态机；行为与旧的 ANSI_ESCAPE_RE 逐字节等价
-// （由 test_mutation_report.js 的 stripAnsi 用例锁定：转义序列全部剥掉、且剥后可正常解析复用计数）。
-const ESC_CHAR = String.fromCharCode(27)
+// ANSI 转义序列（含 SGR 颜色）剥离：交给 Node 内置的 util.stripVTControlCharacters（v16.11+）。
+// 此前是 27 行手写 CSI 状态机，动机只是绕开 lint 的 no-control-regex / Codacy 的非字面量 RegExp 告警；
+// 内置实现覆盖 CSI 之外的 OSC/DCS 等序列（只会多剥、不会少剥），对本用途（解析 stryker.log 的复用计数）
+// 等价且更宽。行为由 test_mutation_report.js 的 stripAnsi 用例锁定。
 function stripAnsi (text) {
-  const s = String(text)
-  if (s.indexOf(ESC_CHAR) === -1) return s // 常见形态（写进文件的那份 stryker.log）0 个 ESC 字节：原样返回
-  let out = ''
-  let i = 0
-  while (i < s.length) {
-    let matched = false
-    if (s.charCodeAt(i) === 27 && s[i + 1] === '[') {
-      let j = i + 2
-      while (j < s.length && s[j] >= '0' && s[j] <= '?') j++ // 参数字节 [0-?]
-      while (j < s.length && s[j] >= ' ' && s[j] <= '/') j++ // 中间字节 [ -/]
-      if (j < s.length && s[j] >= '@' && s[j] <= '~') { // 终止字节 [@-~]（缺终止字节则不是 CSI）
-        i = j + 1 // 整段剥掉（S2310：for 计数器不得在体内改写，改用 while）
-        matched = true
-      }
-    }
-    if (!matched) {
-      out += s[i]
-      i++
-    }
-  }
-  return out
+  return stripVTControlCharacters(String(text))
 }
 
 const FULL_RUN_LOG_RE = /No incremental result file found at .*?, a full mutation testing run will be performed\./g
