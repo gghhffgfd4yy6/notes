@@ -2678,12 +2678,14 @@ async function watchMonitorTests () {
       const r = await c.runWatchOnce()
       assert.strictEqual(r.pushed, 1)
       const body = pushes[0].body
-      assert.ok(body.includes('http://t.yuebuy.xin/kqRNzWx'), `正文必须带真实领券链接: ${body.slice(0, 200)}`)
-      assert.ok(body.includes('https://u.jd.com/5GowgUb'), '正文必须带真实下单链接')
-      assert.ok(body.includes('![](https://img14.360buyimg.com/pop/x.jpg)'), '海报图必须随正文发出（生产同源 Markdown）')
+      // 解析正文里的 Markdown 链接再逐条精确比对——不用 body.includes(URL) 判存在性：
+      // 子串校验等于没校验（任意 host 前后缀都能混过去），CodeQL 会按 js/incomplete-url-substring-sanitization 报高优。
+      const mdLinks = Array.from(body.matchAll(/\]\((https?:\/\/[^)]+)\)/g), (m) => m[1])
+      const COUPON = 'http://t.yuebuy.xin/kqRNzWx' // NOSONAR 夹具照抄上游详情页真实 http 领券链接，不是生产在发 http
+      assert.strictEqual(mdLinks[0], COUPON, `正文第一条链接必须是领券链接（clickUrl=deal 取它）: ${body.slice(0, 200)}`)
+      assert.ok(mdLinks.some((u) => u === 'https://u.jd.com/5GowgUb'), '正文必须带真实下单链接')
+      assert.ok(mdLinks.some((u) => u === 'https://img14.360buyimg.com/pop/x.jpg'), '海报图必须随正文发出（生产同源 Markdown）')
       assert.ok(body.includes('原文链接：'), '仍保留原文链接段')
-      const firstLink = (body.match(/https?:\/\/[^\s)\]]+/) || [])[0]
-      assert.strictEqual(firstLink, 'http://t.yuebuy.xin/kqRNzWx', 'WxPusher clickUrl=deal 取第一条链接，必须是领券链接')
       assert.ok(!body.includes('收藏文章'), '只取正文容器，不得混入页尾推荐')
       assert.strictEqual(seen.length, 1, '每条推送抓一次详情页')
       assert.ok(seen[0].endsWith('/haodan/9000010.html'))
