@@ -29,6 +29,23 @@ const MUTANT_STATUSES = new Set([
 // F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
 const LIST_QUERY_TIMEOUT_MS = 15000
 
+// 历史日报清理（卫生项，不是门禁）：日报每天新建一条 Issue 且从不关闭 ⇒ 会无限堆积（就是 #206…#343
+// 那批 open 日报）。下面这套口径刻意比「看着像日报就关」窄得多：
+//   * 标题必须**严格**等于 `🧬 变异测试日报 YYYY-MM-DD`——右侧带后缀（「… 2026-10-20 手改」）、
+//     前后加字的标题一律不匹配，用户的普通 issue 一条都不碰；
+//   * state 必须是 open（已经关掉的再 PATCH 只是白费配额）；
+//   * 创建者必须是 bot（列表查询已按 creator 过滤，这里再自查一次：查询参数哪天被改坏 / 被删时，
+//     这一层仍然挡得住「把用户 issue 批量关掉」）；
+//   * 日期必须**严格小于**今天——今天那条就是当日日报，关掉等于把当天日报作废成「已关闭」。
+// 失败口径 best-effort（硬约束）：这是卫生，不是契约。非 2xx / 网络异常 / 超时 / 200 非 JSON 一律只
+// warn，绝不 throw、不改退出码，也不影响当天日报的创建与返回值（调用点都走 *BestEffort 包装）。
+const DAILY_REPORT_TITLE_RE = /^🧬 变异测试日报 (\d{4}-\d{2}-\d{2})$/
+const BOT_ISSUE_LOGIN = 'github-actions[bot]'
+// 单轮最多关 30 条 + 整段预算 60s：一起兜住「积压上百 × 每条 15s 超时」的尾部时长。积压超过上限时
+// 剩下的留给下一次运行（日报每天一轮，追平很快）——清理慢一点没关系，把 report job 拖住不行。
+const MAX_CLOSE_PER_RUN = 30
+const CLOSE_BUDGET_MS = 60000
+
 // F1：新鲜度闸门阈值（缓存回填检测）。修复前的参考基准只有「本批报告文件里最新的 mtime」：
 //   * 同一次 CI 运行内各段 matrix job 并行执行，单 job 默认上限 6h，正常产出的 mtime 跨度不可能超过 6h；
 //   * 段 job 崩溃/被 6h 取消时，actions/cache 恢复出来的上一次运行的 reports/mutation/mutation.json
@@ -1394,6 +1411,134 @@ function render (results) {
   return lines.join('\n')
 }
 
+// S5145 日志纪律：warn 里只允许出现「本机异常文本」（折叠换行后截断），远端响应体一律不进日志。
+function sanitizeLogText (e) {
+  return String((e && e.message) || e || 'unknown').replace(/[\r\n]+/g, ' ').slice(0, 200)
+}
+
+// 纯函数：`YYYY-MM-DD` 是否是真实存在的日期。必要性：`2026-13-45` 这类字符串的字典序也可能小于今天，
+// 只靠字符串比较会把「格式像日报、日期不存在」的 issue 也关掉。
+function isRealDayKey (s) {
+  const parts = String(s).split('-')
+  if (parts.length !== 3) return false
+  if (!/^\d{4}$/.test(parts[0]) || !/^\d{2}$/.test(parts[1]) || !/^\d{2}$/.test(parts[2])) return false
+  const y = Number(parts[0])
+  const mo = Number(parts[1])
+  const d = Number(parts[2])
+  const dt = new Date(Date.UTC(y, mo - 1, d))
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d
+}
+
+/**
+ * 纯函数：从 Issue 列表里挑出「可以关闭的历史日报」（口径见 DAILY_REPORT_TITLE_RE 处的注释）。
+ * @param {Array<object>} list Issue 列表（调用方按 state=open + creator=bot 查询）
+ * @param {string} today 上海自然日 `YYYY-MM-DD`
+ * @returns {Array<object>} 命中的 issue（保持原顺序）；入参形态不对时返回空数组，绝不抛错
+ */
+function findClosableDailyIssues (list, today) {
+  if (!Array.isArray(list) || typeof today !== 'string') return []
+  return list.filter((issue) => {
+    if (!issue || typeof issue !== 'object') return false
+    if (issue.state !== 'open') return false
+    // issues 列表接口会把 PR 一起返回；PR 标题即使撞上日报格式，也不该被这里 PATCH
+    if (issue.pull_request) return false
+    if (!Number.isInteger(issue.number) || issue.number <= 0) return false
+    if (!issue.user || issue.user.login !== BOT_ISSUE_LOGIN) return false
+    const m = DAILY_REPORT_TITLE_RE.exec(typeof issue.title === 'string' ? issue.title : '')
+    if (!m) return false
+    if (!isRealDayKey(m[1])) return false
+    // 两者都是 `YYYY-MM-DD` ⇒ 字典序等同于日期序；严格小于保证「今天的不关」
+    return m[1] < today
+  })
+}
+
+/**
+ * 逐条 PATCH `state=closed`（best-effort）。单条失败只 warn 并继续——一条 500 不能让其余日报留在 open。
+ * S5145：不读、不返回、不打印远端响应体，日志只有固定文案 + 第几条 + 计数 + 状态码。
+ * @param {Array<object>} candidates findClosableDailyIssues 的结果
+ * @param {{token: string, repo: string, fetchImpl?: Function, now?: Function}} opts
+ * @returns {Promise<{closed: number, failed: number, skipped: number}>}
+ */
+async function closeDailyIssues (candidates, opts) {
+  const doFetch = opts.fetchImpl || fetch
+  const now = opts.now || Date.now
+  const batch = candidates.slice(0, MAX_CLOSE_PER_RUN)
+  const deadline = now() + CLOSE_BUDGET_MS
+  const stats = { closed: 0, failed: 0, skipped: candidates.length - batch.length }
+  for (let i = 0; i < batch.length; i++) {
+    const remaining = deadline - now()
+    if (remaining <= 0) {
+      stats.skipped += batch.length - i
+      break
+    }
+    const issue = batch[i]
+    try {
+      const res = await doFetch(`https://api.github.com/repos/${opts.repo}/issues/${issue.number}`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${opts.token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
+        body: JSON.stringify({ state: 'closed', state_reason: 'not_planned' }),
+        signal: AbortSignal.timeout(Math.min(LIST_QUERY_TIMEOUT_MS, Math.max(1000, remaining)))
+      })
+      if (res.ok) {
+        stats.closed++
+      } else {
+        await res.text().catch(() => {}) // 排空响应体即可，内容不进日志（S5145）
+        stats.failed++
+        console.warn(`⚠️  关闭历史日报失败（第 ${i + 1}/${batch.length} 条，HTTP ${res.status}），继续处理其余`)
+      }
+    } catch (e) {
+      stats.failed++
+      console.warn(`⚠️  关闭历史日报失败（第 ${i + 1}/${batch.length} 条，${sanitizeLogText(e)}），继续处理其余`)
+    }
+  }
+  return stats
+}
+
+/**
+ * 查询 open 的 bot issue 并清理更早的日报（best-effort：查询失败只 warn 并跳过本轮清理）。
+ * 查询刻意用 `state=open&creator=bot` 单独拉一次，而不复用去重查询的 `state=all` 结果：后者按创建
+ * 时间倒序只给最近 100 条，积压跨过 100 条之后，老的那批会永远落在这个窗口外 —— 那正是要消灭的
+ * 「看不见的堆积」。open 列表天然自我限制（清完就只剩当天那条），`per_page=100` 足够。
+ * @param {{token: string, repo: string, today: string, fetchImpl?: Function, now?: Function}} opts
+ * @returns {Promise<{closed: number, failed: number, skipped: number}>}
+ */
+async function pruneOldDailyIssues (opts) {
+  const doFetch = opts.fetchImpl || fetch
+  const none = { closed: 0, failed: 0, skipped: 0 }
+  let list
+  try {
+    const res = await doFetch(`https://api.github.com/repos/${opts.repo}/issues?state=open&per_page=100&creator=${encodeURIComponent(BOT_ISSUE_LOGIN)}`, {
+      headers: { Authorization: `Bearer ${opts.token}`, 'User-Agent': 'mutation-report' },
+      signal: AbortSignal.timeout(LIST_QUERY_TIMEOUT_MS)
+    })
+    if (!res.ok) {
+      await res.text().catch(() => {}) // S5145：响应体不打印，只记状态码
+      console.warn(`⚠️  历史日报列表查询失败（HTTP ${res.status}），跳过本轮历史日报清理`)
+      return none
+    }
+    list = await res.json()
+  } catch (e) {
+    console.warn(`⚠️  历史日报列表查询失败（${sanitizeLogText(e)}），跳过本轮历史日报清理`)
+    return none
+  }
+  const candidates = findClosableDailyIssues(list, opts.today)
+  if (candidates.length === 0) return none
+  const stats = await closeDailyIssues(candidates, opts)
+  console.log(`🧹 历史日报清理：关闭 ${stats.closed} 条，失败 ${stats.failed} 条，未处理 ${stats.skipped} 条`)
+  return stats
+}
+
+// 双保险包装：pruneOldDailyIssues 内部已逐条兜住，这里只防它自己出意外（同步抛错 / 未来改动引入的
+// 未捕获拒绝）。**任何**失败都不得让调用方（postIssue → main）变红或改退出码。
+async function pruneOldDailyIssuesBestEffort (opts) {
+  try {
+    return await pruneOldDailyIssues(opts)
+  } catch (e) {
+    console.warn(`⚠️  历史日报清理异常（${sanitizeLogText(e)}），已忽略`)
+    return { closed: 0, failed: 0, skipped: 0 }
+  }
+}
+
 /**
  * 汇总日报并按上海自然日创建或复用 GitHub Issue。
  * @param {string} body 已渲染的日报 Markdown
@@ -1425,11 +1570,13 @@ async function postIssue (body) {
       existing = (list || []).find(i => i.title === title)
     }
   } catch (e) {
-    const reason = String((e && e.message) || e || 'unknown').replace(/[\r\n]+/g, ' ').slice(0, 200)
-    console.warn(`⚠️  日报列表查询失败（${reason}），跳过去重直接创建`)
+    console.warn(`⚠️  日报列表查询失败（${sanitizeLogText(e)}），跳过去重直接创建`)
   }
+  // 卫生（不是门禁）：当天日报已就位后，关掉更早的 open 日报。当天是「新建」还是「复用」都做同一件事
+  // ——清理的前提是「今天的日报存在」，不是「今天新建了日报」；否则同日重跑时旧日报会一直留在 open。
   if (existing) {
     console.log('⏭️  当日日报已存在，跳过重复发布')
+    await pruneOldDailyIssuesBestEffort({ token, repo, today })
     return { number: existing.number, html_url: existing.html_url, skipped: true }
   }
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
@@ -1442,7 +1589,10 @@ async function postIssue (body) {
     await res.text().catch(() => {})
     throw new Error(`发 Issue 失败，HTTP 状态码：${res.status}`)
   }
-  return res.json()
+  const issue = await res.json()
+  // 同一条口径：新建成功后同样清理更早的 open 日报（失败只 warn，返回值与退出码不受影响）
+  await pruneOldDailyIssuesBestEffort({ token, repo, today })
+  return issue
 }
 
 /**
@@ -1627,6 +1777,14 @@ module.exports = {
   render,
   shanghaiDate,
   postIssue,
+  // 历史日报清理（卫生项）：纯谓词 + 查询/关闭两段，均导出以便 mock fetch 测「关闭成功 / 关闭失败 /
+  // 当天已存在 / 标题不匹配」四类口径，不必起真网络。
+  sanitizeLogText,
+  isRealDayKey,
+  findClosableDailyIssues,
+  closeDailyIssues,
+  pruneOldDailyIssues,
+  MAX_CLOSE_PER_RUN,
   EXPECTED_SEGMENTS,
   // 复用状态（PR #158 Qodo Medium / Correctness）
   parseReuseFromLog,
