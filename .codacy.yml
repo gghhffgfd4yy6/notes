@@ -199,6 +199,9 @@ exclude_paths:
   # @floating-ui/dom 1.8.0 的 esbuild 单文件 bundle（vendored，无 CDN）：压缩产物里的
   # DOM 量测/属性访问是库实现，页面只把元素引用交给它，同 .sourcery.yaml 的 ignore 口径。
   - "scripts/console-assets/floating-ui.module.js"
+  # @tanstack/virtual-core 3.13.12 的 esbuild 单文件 bundle（vendored，无 CDN）：压缩产物里的
+  # 数值字面量/动态属性访问是库实现，页面只把元素引用与索引交给它，同 .sourcery.yaml 的 ignore 口径。
+  - "scripts/console-assets/virtual-core.module.js"
   - "scripts/check-doc-lines.js"
   - "scripts/check-host-clean.js"
   - "test_doc_line_gates.js"

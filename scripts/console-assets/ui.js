@@ -1,13 +1,13 @@
 // scripts/console-assets/ui.js —— 控制台外壳层（v3.367 从 app.js 拆出，v3.369 再拆出 pages.js）。
 // 这里只剩：App 组件、主题切换、首屏快照、回到顶部；各页面面板在 pages.js（顺序在前）。
 // 入口 app.js 只 import App。依赖方向单向，无循环引用。
-import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday, stickyPad } from './components.js'
+import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, Button, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday, stickyPad } from './components.js'
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
 import { backToTopBehavior, createLiveChannel, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
-import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
+import { Component, html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
 import { CacheHealthPanel, ConfigPanel, FilesPanel, FilterRulesPanel, LOG_SCROLLER, LogsPanel, MessagesPanel, PULL_EVENT, PullRefreshStatus, RunHistoryPanel, RunsPanel, SearchPanel, SysPanel, TOP_SHOW_INNER, TOP_SHOW_Y, TrendsPanel, VISIBLE_REFRESH_GAP_MS, usePullToRefresh } from './pages.js'
 
@@ -119,6 +119,30 @@ function applyThemeKey (key) {
   } catch (e) {
     // 沙箱/禁用 Cookie 的上下文（opaque origin）会在这里抛：本页照样能切，
     // 只是刷新后回到服务端默认。绝不能让它挡住下面的 setTheme。
+  }
+}
+
+// v3.385 渲染错误边界：任一面板 render 抛错时，旧版整棵树直接卸载成白屏（服务端字段类型
+// 变化、弱网下 detail 结构异常都踩得到）。这里保住外壳：渲染「页面出错了 + 重新加载」面板，
+// 并把错误摘要打到 console（手机上打不开 devtools 时，这是唯一能捞到的原因）。
+// 只兜渲染期异常——事件回调/异步里的错走各自面板的 catch（那本来就有可见反馈）。
+class ErrorBoundary extends Component {
+  state = { failed: false, detail: '' }
+
+  componentDidCatch (e) {
+    const detail = e && typeof e.message === 'string' && e.message !== '' ? e.message : String(e)
+    console.error('[xbk-console] 页面渲染失败：', e)
+    this.setState({ failed: true, detail })
+  }
+
+  render () {
+    if (!this.state.failed) return this.props.children
+    return html`<div class="err-boundary" role="alert">
+      <p class="boot-fail-title">页面出错了</p>
+      <p class="err-boundary-detail">${this.state.detail}</p>
+      <p class="boot-fail-hint">渲染这一屏时出错（多半是数据形状异常或临时故障）。点下面重新加载；仍打不开就重新打开带 token 的链接。</p>
+      <${Button} variant="primary" onClick=${() => window.location.reload()}>重新加载<//>
+    </div>`
   }
 }
 
@@ -1212,4 +1236,4 @@ function App () {
   </div>`
 }
 
-export { App }
+export { App, ErrorBoundary }

@@ -6,10 +6,12 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from 
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, isEncryptedBackup, logLineCounts, logLineTone, splitHits } from './pure.mjs'
+import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
+// 虚拟滚动（vendored 单文件 ESM，MIT）：只导出 Virtualizer —— 日志页只挂可视窗口的行。
+import { Virtualizer, elementScroll, observeElementOffset, observeElementRect } from './virtual-core.module.js'
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 
 function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
@@ -695,7 +697,8 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
 
 // 加载失败文案：fetch 抛的是英文（Failed to fetch / AbortError），直接甩给用户等于没说。
 // 这里只做形态映射，不改错误语义（401 仍由全局事件让 App 停轮询）：
-//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；abort → 超时。
+//   5xx → 服务器错误；4xx → 请求被拒绝；网络断/服务没起 → 网络请求失败；超时 → 超时。
+// 超时判定在 pure.mjs 的 isTimeoutError（Chrome 的 TimeoutError 文案不含 abort，只认 /abort/ 会漏）。
 // 认不出的原样返回——后端自定义错误本来就是中文，不要二次包装。
 function loadErrorText (e) {
   const raw = e && typeof e.message === 'string' ? e.message : String(e === undefined || e === null ? '' : e)
@@ -709,7 +712,7 @@ function loadErrorText (e) {
   if (/Failed to fetch|NetworkError|Load failed|ERR_NETWORK|ERR_INTERNET_DISCONNECTED/i.test(raw)) {
     return '网络请求失败（检查网络，或控制台服务是否在运行）'
   }
-  if (/abort|响应体读取超时/i.test(raw)) return '请求超时（服务器 8 秒内没有响应）'
+  if (isTimeoutError(e)) return '请求超时（服务器 8 秒内没有响应）'
   return raw === '' ? '未知错误' : raw
 }
 
@@ -1823,7 +1826,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     if (Number.isSafeInteger(days) && days > 0) body.set('days', String(days))
     if (rangeActive) { body.set('from', range.from); body.set('to', range.to) }
     // page/size 不发送：导出=筛选结果全量（服务端亦不读取）。
-    const { merged, done } = timedRequest({
+    const merged = timedRequest({
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -1867,7 +1870,6 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     } catch (e) {
       setExportErr(`导出失败：${e && e.message ? e.message : e}`)
     } finally {
-      done() // body（blob/text）消费完才清 8s 期限（Sourcery Stalled-bodies 同口径）
       // revoke 延迟到 click 之后一拍（评审 231-M5）：浏览器解析下载是异步的，同步
       // revoke 会让 deferred download 拿不到 blob。1 分钟后回收（URL 规范建议的
       // 「延迟 revoke」口径，内存占用一次性、不累积）。
@@ -2287,7 +2289,7 @@ function SearchPanel ({ onSync, active = true }) {
       watchEpoch.current += 1
       if (Array.isArray(d.words)) setWatch(d.words)
       setNewCounts((prev) => {
-        if (!Object.prototype.hasOwnProperty.call(prev, req.q)) return prev
+        if (!Object.hasOwn(prev, req.q)) return prev
         const next = { ...prev }
         delete next[req.q]
         return next
@@ -2428,6 +2430,14 @@ function SearchPanel ({ onSync, active = true }) {
 // 高亮上限：超过 3000 行退回纯文本（每行一个节点 + mark 在手机上明显掉帧），
 // 计数行必须明说「已关闭高亮」，不能让用户以为搜不到。
 const LOG_HIGHLIGHT_MAX = 3000
+// 虚拟滚动（v3.385）：只挂可视窗口 ± overscan 的行，整段日志的总高度由 virtual-core 算。
+// 行高先按 12px × 1.6（--fs-xs × --lh-code）估；真实高度由库量到后覆盖——长行在手机上会
+// 折行，估不准，只能以量到的为准（否则滚到底部会差出一大截）。
+const LOG_ROW_ESTIMATE_PX = 19
+const LOG_ROW_OVERSCAN = 8
+// virtual-core 的 DOM 适配四件套：库只带算法，滚动/尺寸观察由适配层注入（React/Vue 适配器
+// 内部就是这三个函数）。少给任何一个，scrollToIndex 就会抛 scrollToFn is not a function。
+const VIRT_ADAPTER = { observeElementRect, observeElementOffset, scrollToFn: elementScroll }
 
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialData = null, focusAt = '', focusDate = '', onSync, active = true }) {
   const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync, initialData)
@@ -2435,10 +2445,21 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const seededRef = useRef(initialData !== null)
   const preRef = useRef(null)
   // v3.319：行级跳转把「点中的那一轮」滚到框中部、加底色；只做一次，之后轮询不抢滚动。
-  const focusRef = useRef(null)
   const focusDoneRef = useRef('')
   const stickRef = useRef(true)
   const prevTextRef = useRef('')
+  // 虚拟器（v3.385）：virtual-core 不带 preact 绑定，实例自己持有；onChange 只在
+  // 「可视区间真的变了」时触发（库内部 memo 过），setState 让窗口跟着滚动走。
+  const [, bumpVirt] = useState(0)
+  const [virt] = useState(() => new Virtualizer({
+    ...VIRT_ADAPTER,
+    count: 0,
+    enabled: false,
+    overscan: LOG_ROW_OVERSCAN,
+    estimateSize: () => LOG_ROW_ESTIMATE_PX,
+    getScrollElement: () => preRef.current,
+    onChange: () => bumpVirt((n) => n + 1)
+  }))
   // v3.351：日志框右侧「快滚条」——一长条轨道，按住拖动可快速掠过整段日志。
   // 手机浏览器不显示原生滚动条，长日志只能一屏屏甩；这里补一条可拖的条，点轨道直接跳。
   const railRef = useRef(null)
@@ -2626,6 +2647,19 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const shownText = useMemo(() => ranged.join('\n'), [ranged])
   // 高亮节点上限（v3.319）：超过 3000 行退回纯文本，定位也不再假装有高亮。
   const heavy = ranged.length > LOG_HIGHLIGHT_MAX
+  // 虚拟窗口（v3.385）：setOptions 是**整份替换**（库内 defaults + 传入项），所以每次都
+  // 给全量；heavy 时 count 归零并 disabled，纯文本分支不挂滚动监听、也不维护窗口。
+  virt.setOptions({
+    ...VIRT_ADAPTER,
+    count: heavy ? 0 : ranged.length,
+    enabled: !heavy,
+    overscan: LOG_ROW_OVERSCAN,
+    estimateSize: () => LOG_ROW_ESTIMATE_PX,
+    getScrollElement: () => preRef.current,
+    onChange: () => bumpVirt((n) => n + 1)
+  })
+  const virtItems = virt.getVirtualItems()
+  const virtTotal = virt.getTotalSize()
   // v3.319：行级跳转的定位状态。day = 当天列表 + 高亮该轮；only = 只看该轮。
   // 用户切了分类/自己改了搜索词就收起定位条，避免和当前筛选打架。
   const focusHits = useMemo(() => (focusAt ? lines.filter((l) => l.startsWith(focusAt)).length : 0), [lines, focusAt])
@@ -2642,6 +2676,10 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     ['summary', '摘要', counts.summary],
     ['console', '控制台', counts.console]
   ]
+  // virtual-core 的两步（官方 adapter 同款）：挂载时 _didMount（返回清理函数），
+  // 之后每次 render 后 _willUpdate（重算区间 + 重挂 scroll/尺寸观察者）。
+  useLayoutEffect(() => virt._didMount(), [])
+  useLayoutEffect(() => { virt._willUpdate() })
   // 首屏与「原本就在底部」时跟随最新日志；用户上翻查看历史时不抢滚动位置。
   // 手动「刷新」与日志从不可读恢复时强制回到底部，避免「刷新后仍停在旧位置」。
   // v3.318：改用 layout effect——跳转时快照已在首帧，若等 paint 后再贴底，
@@ -2653,7 +2691,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     if (stickRef.current || prevTextRef.current === '') el.scrollTop = el.scrollHeight
     prevTextRef.current = shownText
     syncRail()
-  }, [data, mode, q, shownText, syncRail])
+    // virtTotal 变化（新行进来、折行高度被量出来）也要重贴一次底：容器高度先变，
+    // 不重贴就会停在「距底部正好差新增那几行」的位置。
+  }, [data, mode, q, shownText, syncRail, virtTotal])
   // 日志/筛选变化后等一帧再量轨道（<pre> 高度落定后再算）；窗口尺寸变化同理。
   useEffect(() => {
     const id = window.requestAnimationFrame(syncRail)
@@ -2683,16 +2723,15 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // 用 useLayoutEffect：与贴底同一帧完成，首帧就是定位后的位置，不会先闪顶部/底部。
   useLayoutEffect(() => {
     if (!focusAt || focusDoneRef.current === focusAt) return
-    const pre = preRef.current
-    const el = focusRef.current
-    if (!pre || !el) return
-    const box = pre.getBoundingClientRect()
-    const row = el.getBoundingClientRect()
-    const top = row.top - box.top + pre.scrollTop
-    pre.scrollTop = Math.max(0, top - (pre.clientHeight - row.height) / 2)
+    if (heavy) return // 纯文本分支没有窗口，定位条此时已明说「高亮已关闭」
+    // 行可能不在当前窗口里（虚拟滚动只挂可视区那几十行），所以按**索引**让虚拟器居中，
+    // 不再量 focusRef 的矩形——那条路只在「这一行已经渲染出来」时才成立。
+    const idx = ranged.findIndex((l) => l.startsWith(focusAt))
+    if (idx < 0) return
     stickRef.current = false
     focusDoneRef.current = focusAt
-  }, [data, focusAt, q])
+    virt.scrollToIndex(idx, { align: 'center' })
+  }, [data, focusAt, q, ranged, heavy, virt])
   const onLogScroll = () => {
     const el = preRef.current
     if (!el) return
@@ -2730,24 +2769,25 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     stickRef.current = true
     setMode('all')
   }
-  // 一行一个 <span>，换行仍用真实 "\n"（行内节点 + pre-wrap）：复制日志保留原换行、
-  // 空行不会塌成 0 高；命中片段只作为 <mark> 的文本子节点，不拼 innerHTML。
-  // 超阈值先在 useMemo 里返回 null：旧实现「先 map 出一整页 span、再在渲染时二选一」，
-  // 护栏只省了挂载没省构造，3000+ 行搜索在手机上照样卡（Sourcery：Large log searches still lag）。
-  const lineNodes = useMemo(() => {
-    if (ranged.length > LOG_HIGHLIGHT_MAX) return null
-    const kwNow = q.trim().toLowerCase()
-    const last = ranged.length - 1
-    return ranged.map((line, i) => {
-      const tone = logLineTone(line)
-      // v3.319：点中的那一轮加底色并把 ref 交给居中 effect（只会在行首时间戳匹配）。
-      const isFocus = focusAt !== '' && line.startsWith(focusAt)
-      return html`<span class=${'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')}
-        key=${i} ref=${isFocus ? focusRef : null}>${
-        splitHits(line, kwNow).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
-      }${i === last ? '' : '\n'}</span>`
-    })
-  }, [ranged, q, focusAt])
+  // 只渲染可视窗口（v3.385）：一行一个**块级** <span>，纵向位置由虚拟器给（transform，
+  // 不触发布局），外层容器高度 = 全部行的总高（滚动条长度与真实行数一致）。块级行复制出来
+  // 天然一行一条，不再靠 "\n" 文本节点；命中片段仍只作为 <mark> 的文本子节点，不拼 innerHTML。
+  // heavy（>3000 行）时返回 null，走纯文本分支——护栏行为与 v3.320 一致。
+  let lineNodes = null
+  if (!heavy) {
+    lineNodes = html`<span class="log-virt" style=${{ height: virtTotal + 'px' }}>${
+      virtItems.map((it) => {
+        const line = ranged[it.index]
+        const tone = logLineTone(line)
+        // v3.319：点中的那一轮加底色（只会在行首时间戳匹配）。
+        const isFocus = focusAt !== '' && line.startsWith(focusAt)
+        return html`<span class=${'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')}
+          key=${it.index} data-index=${it.index} style=${{ transform: 'translateY(' + it.start + 'px)' }}
+          ref=${virt.measureElement}>${
+          splitHits(line, kw).map(([text, hit], j) => hit ? html`<mark key=${j}>${text}</mark>` : text)
+        }</span>`
+      })}</span>`
+  }
   // v3.320：工具条与计数行不再等数据。旧版整块挂在 ok 分支里：首帧只有「读取中」占位
   // （panel 583），数据到达后筛选栏凭空插进来（+134）再加计数行（+19），日志框连下半页
   // 一起被推走 153px。现在 chips 用同一组标签、计数先显示 —，计数行显示「读取中…」。
@@ -3294,6 +3334,31 @@ function BackupBlock ({ onImported }) {
   </div>`
 }
 
+// 复制兜底（v3.385）：navigator.clipboard 只在安全上下文（https / localhost）存在——手机用
+// http://192.168.x.x 打开控制台时它是 undefined，两步验证的「复制」会 100% 失败。
+// execCommand('copy') 虽已废弃，但正是这种场景下唯一还能用的接口（Chrome/Safari/Firefox 都保留），
+// 用完即删 textarea，不往页面留节点、也不改选中态。
+function copyViaTextarea (text) {
+  const el = document.createElement('textarea')
+  el.value = text
+  el.setAttribute('readonly', '') // 只读：iOS 不弹键盘
+  el.style.position = 'fixed'
+  el.style.top = '-1000px'
+  document.body.appendChild(el)
+  let ok = false
+  try {
+    el.select()
+    // iOS Safari 只认 setSelectionRange（单靠 select() 复制出来是空串）。
+    if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, String(text).length)
+    ok = typeof document.execCommand === 'function' && document.execCommand('copy')
+  } catch (e) {
+    ok = false
+  } finally {
+    if (el.parentNode) el.parentNode.removeChild(el)
+  }
+  return ok
+}
+
 // 两步验证（v3.357）：系统页里的可选开关。二维码由服务端 qrcode-generator 生成
 // （SVG data URI，不引 CDN/不增加前端构建），同时保留手动密钥兜底；确认后服务端只回一次
 // 恢复码，页面如实提示「只显示一次」。
@@ -3392,13 +3457,24 @@ function TwoFactorBlock ({ active = true }) {
     }
   }
   const copyText = async (text) => {
+    let err = null
     try {
-      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('浏览器不支持复制')
-      await navigator.clipboard.writeText(text)
-      setNote('已复制到剪贴板。')
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text)
+      } else {
+        err = new Error('浏览器不支持剪贴板接口')
+      }
     } catch (e) {
-      setErr(`复制失败：${e && e.message ? e.message : e}；请手动选中密钥复制。`)
+      err = e
     }
+    // 异步剪贴板不可用 / 被拒（非安全上下文、没拿到用户激活、权限策略）→ 退回 execCommand。
+    // 两条都失败才报错：http://局域网 IP 打开时这是唯一能用的那条路。
+    if (err === null || copyViaTextarea(text)) {
+      setNote('已复制到剪贴板。')
+      setErr('') // 上一次失败的红条要一起撤掉，否则「复制失败」和「已复制」同屏
+      return
+    }
+    setErr(`复制失败：${err && err.message ? err.message : err}；请手动选中密钥复制。`)
   }
   const secretGroups = setup && typeof setup.secret === 'string'
     ? setup.secret.replace(/(.{4})/g, '$1 ').trim()
@@ -3667,7 +3743,7 @@ function ChannelList ({ pc }) {
   const map = raw && !Array.isArray(raw) ? raw : {}
   const legacy = Array.isArray(raw) ? raw.filter((x) => typeof x === 'string') : []
   const names = Object.keys(map).length > 0 ? Object.keys(map) : (Array.isArray(pc.names) ? pc.names : legacy)
-  const isOn = (k) => Object.prototype.hasOwnProperty.call(map, k)
+  const isOn = (k) => Object.hasOwn(map, k)
     ? !!map[k]
     : (Array.isArray(pc.names) && pc.names.includes(k)) || legacy.includes(k)
   const on = names.filter(isOn)
@@ -3880,15 +3956,6 @@ function clearFilterDraft () {
   try { window.localStorage.removeItem(FILTER_DRAFT_KEY) } catch (e) { /* 忽略 */ }
 }
 
-function filterDraftAgeText (savedAt) {
-  const minutes = Math.max(0, Math.floor((Date.now() - Number(savedAt)) / 60000))
-  if (minutes < 1) return '刚刚'
-  if (minutes < 60) return `${minutes} 分钟前`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
-  return `${Math.floor(hours / 24)} 天前`
-}
-
 // 全命中判定与服务端 wideMatchFields 同口径：trim 后等于 .* 或 ^.*$。
 const FILTER_WIDE_PATTERNS = ['.*', '^.*$']
 
@@ -4078,7 +4145,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         const sourceText = saved.source === 'server' ? '服务器' : '本机'
         restoreNotice = {
           tone: 'warn',
-          text: `已恢复上次未保存的草稿（${sourceText}，${filterDraftAgeText(saved.savedAt)}，${changed.length} 个字段）${baseRev !== null && baseRev !== revision ? `；草稿基于 r${baseRev}，当前 r${revision}` : ''}。保存后才会生效。`
+          text: `已恢复上次未保存的草稿（${sourceText}，${fmtAge(Date.now() - Number(saved.savedAt))}，${changed.length} 个字段）${baseRev !== null && baseRev !== revision ? `；草稿基于 r${baseRev}，当前 r${revision}` : ''}。保存后才会生效。`
         }
         setDraftSavedAt(saved.savedAt)
         setDraftSyncedAt(saved.source === 'server' ? saved.savedAt : 0)

@@ -3168,6 +3168,142 @@ async function main () {
       fs.rmSync(modDir, { recursive: true, force: true })
     }
   })
+  await aok('前端数据层: AbortSignal.timeout 覆盖「头到了、body 挂起」，无该 API 时 fallback 同样中止', async () => {
+    // 旧实现用 Promise.race 手写第二层期限（readBodyJson）兜「头已到、体挂起」；
+    // v3.385 改成一个 AbortSignal.timeout 同时管 fetch 与 body 读取。这里用真 HTTP
+    // + 真 fetch 复现那个窗口：头 200 立刻回、body 永不结束。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-timeout-'))
+    const stalled = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.write('{"partial":')
+    })
+    const port = await listen(stalled)
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const realTimeoutApi = AbortSignal.timeout
+    globalThis.document = { getElementById: () => null }
+    globalThis.window = { dispatchEvent: () => {} }
+    let mod = null
+    // 取头 + 读体一整趟；timeoutMs 由调用方给（走被测模块的 timedRequest 构造 signal）
+    const readStalledBody = async (timeoutMs) => {
+      const t0 = Date.now()
+      const res = await realFetch(`http://127.0.0.1:${port}/stall`,
+        mod.timedRequest({ headers: { Accept: 'application/json' } }, timeoutMs))
+      assert.strictEqual(res.status, 200, '响应头必须先到（否则测的不是「体挂起」窗口）')
+      let err = null
+      try { await res.json() } catch (e) { err = e }
+      return { elapsed: Date.now() - t0, err }
+    }
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      assert.ok(mod.timedRequest({}, 50).signal instanceof AbortSignal,
+        'timedRequest 必须交出真 AbortSignal（fetch 与 body 读取共用同一个期限）')
+      const native = await readStalledBody(120)
+      assert.ok(native.err, 'body 挂起时必须在期限内 reject，不能永久等待')
+      assert.strictEqual(native.err.name, 'TimeoutError', `原生路径必须抛 TimeoutError（实际 ${native.err && native.err.name}）`)
+      assert.ok(native.elapsed < 5000, `必须在期限内中止（实测 ${native.elapsed}ms）`)
+      // 回退路径（Safari < 16 / Android WebView < 103）：删掉该 API 后同一路径仍要中止。
+      delete AbortSignal.timeout
+      assert.strictEqual(typeof AbortSignal.timeout, 'undefined', '删除后必须真的走 fallback 分支')
+      const fallback = await readStalledBody(120)
+      assert.ok(fallback.err, 'fallback（AbortController + setTimeout）同样必须中止挂起的 body')
+      assert.ok(fallback.elapsed < 5000, `fallback 也必须在期限内中止（实测 ${fallback.elapsed}ms）`)
+      // 文案映射：两种引擎文案与旧竞速文案都要落到同一句「请求超时」。
+      const { isTimeoutError } = await import('./scripts/console-assets/pure.mjs')
+      assert.strictEqual(isTimeoutError(native.err), true, 'TimeoutError 必须判为超时')
+      assert.strictEqual(isTimeoutError(fallback.err), true, 'AbortError 必须判为超时')
+      assert.strictEqual(isTimeoutError({ name: 'Error', message: 'signal timed out' }), true,
+        'Chrome 的「signal timed out」不含 abort 字样，只认 /abort/ 会漏')
+      assert.strictEqual(isTimeoutError(new Error('响应体读取超时')), true, '旧竞速文案保持可识别')
+      assert.strictEqual(isTimeoutError(new Error('HTTP 500')), false, '普通 HTTP 错误不得被当成超时')
+      assert.strictEqual(isTimeoutError(null), false, '空错误不得判超时')
+    } finally {
+      AbortSignal.timeout = realTimeoutApi
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      if (typeof stalled.closeAllConnections === 'function') stalled.closeAllConnections()
+      await new Promise((resolve) => stalled.close(resolve))
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
+  await aok('前端数据层: 在飞去重 once(key) 只合并并发请求，settle 即清（不是缓存）', async () => {
+    // filesInFlight / filterInFlight 曾各抄一份「在飞 Promise 共享 + settle 清空」，
+    // 合成 once(key, fn) 后必须仍是「请求结束即清」而不是 TTL 缓存（否则刷新拿旧快照）。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-once-'))
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const calls = []
+    const res200 = (data) => ({
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      json: async () => data
+    })
+    globalThis.document = { getElementById: () => null }
+    globalThis.window = { dispatchEvent: () => {} }
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      let release = null
+      const gate = new Promise((resolve) => { release = resolve })
+      let n = 0
+      globalThis.fetch = async (url) => {
+        calls.push(String(url))
+        n += 1
+        if (n === 1) { await gate; return res200({ marker: 'files-1' }) }
+        return res200({ marker: `files-${n}` })
+      }
+      const a = mod.apiGetFiles()
+      const b = mod.apiGetFiles()
+      assert.strictEqual(calls.length, 1, '并发两个调用者必须共享同一个在飞请求（只发一次）')
+      release()
+      const [ra, rb] = await Promise.all([a, b])
+      assert.strictEqual(ra.marker, 'files-1')
+      assert.strictEqual(rb, ra, '两个调用者必须拿到同一份结果')
+      const again = await mod.apiGetFiles()
+      assert.strictEqual(calls.length, 2, '结算后必须重发：语义是「请求结束即清」，不是 TTL 缓存')
+      assert.strictEqual(again.marker, 'files-2')
+      // 失败路径同样要清：否则一次网络错会把这个 key 永久钉在同一个 rejection 上。
+      calls.length = 0
+      globalThis.fetch = async (url) => { calls.push(String(url)); throw new Error('Failed to fetch') }
+      await assert.rejects(() => mod.apiGetFiles(), /Failed to fetch/)
+      await assert.rejects(() => mod.apiGetFiles(), /Failed to fetch/)
+      assert.strictEqual(calls.length, 2, '失败也必须清键（否则后续调用永远拿到同一个 rejection）')
+      // 不同 key 互不影响：files 在飞时过滤规则仍必须自己发一次请求。
+      calls.length = 0
+      let releaseFiles = null
+      const filesGate = new Promise((resolve) => { releaseFiles = resolve })
+      globalThis.fetch = async (url) => {
+        calls.push(String(url))
+        if (String(url) === '/api/files') { await filesGate; return res200({ marker: 'files' }) }
+        return res200({ marker: 'filter' })
+      }
+      const pFiles = mod.apiGetFiles()
+      const pFilter = mod.apiGetFilter()
+      assert.deepStrictEqual(calls, ['/api/files', '/api/config/filter'],
+        '不同 key 必须各自发请求（不能互相顶掉）')
+      releaseFiles()
+      assert.strictEqual((await pFilter).marker, 'filter')
+      assert.strictEqual((await pFiles).marker, 'files')
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
   await aok('HTTP: POST /trigger 非法 action → 400', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -7050,8 +7186,12 @@ async function main () {
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
       '缓存健康切回必须连右列文件清单一起补拉')
     assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('if (wasPaused) {'), '缓存健康从暂停/隐藏恢复时必须立即补拉一次')
-    assert.ok(src.includes('let filesInFlight = null') && src.includes('if (filesInFlight) return filesInFlight'),
-      '三个面板同时要 /api/files 时必须共享同一个在飞请求')
+    assert.ok(src.includes("return once('files', () =>") && src.includes("return once('filter', () =>"),
+      '三个面板同时要 /api/files（配置页/过滤规则页同时要过滤规则）时必须共享同一个在飞请求')
+    const onceFn = src.slice(src.indexOf('function once (key, fn)'), src.indexOf('function apiGetFiles'))
+    assert.ok(onceFn.includes('IN_FLIGHT.delete(key)') && onceFn.includes('p.then(clear, clear)'),
+      'once 必须在 settle 后清键（「请求结束即清」，不是 TTL 缓存）')
+    assert.ok(!onceFn.includes('setTimeout'), 'once 不得加 TTL/定时清理（那就变成缓存了）')
     assert.ok(seg('FilesPanel', 'function FilterRules').includes('loadTick'),
       '文件清单重拉完成也必须重报 ready，头部时间才会更新')
     // 保活带来的两个交互坑：分类弹层要主动关（否则 body overflow:hidden 卡住新页面）；
@@ -7797,10 +7937,14 @@ async function main () {
     assert.ok(/\.logpre-main\s*\{[^}]*max-height:\s*520px/.test(css), '桌面日志框 520px')
     const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
     assert.ok(/\.logpre-main\s*\{[^}]*min\(62dvh, 520px\)/.test(phone), '手机日志框必须 min(62dvh, 520px)')
-    // B. 行级渲染 + 高亮：一行一个节点、换行仍是真实 "\n"（复制/空行都不变）。
+    // B. 行级渲染 + 高亮：一行一个节点（只挂可视窗口内的），块级行不靠 "\n" 文本节点断行。
     assert.ok(src.includes('class=' + ph("'logline' + (tone ? ' logline-' + tone : '') + (isFocus ? ' logline-focus' : '')")), '日志必须逐行渲染并按级别着色')
-    assert.ok(src.includes('}' + ph("i === last ? '' : '\\n'") + '</span>'), '行间必须仍是真实换行（只加 display:block 会丢换行）')
-    assert.ok(src.includes('splitHits(line, kwNow)') &&
+    assert.ok(src.includes('class="log-virt"') && src.includes('style=' + ph("{ height: virtTotal + 'px' }")),
+      '日志行必须挂在虚拟容器里（外层高度 = 全部行总高，滚动条长度仍是真实行数）')
+    assert.ok(/\.log-virt\s+\.logline\s*\{[^}]*display:\s*block/.test(css) &&
+      /\.log-virt\s+\.logline\s*\{[^}]*position:\s*absolute/.test(css),
+    '虚拟行必须块级 + 绝对定位（复制时每行一条，不靠换行文本节点；折行高度由库量）')
+    assert.ok(src.includes('splitHits(line, kw)') &&
       src.includes('html`<mark key=' + ph('j') + '>' + ph('text') + '</mark>`'), '命中片段必须用 <mark> 包起来')
     assert.ok(!/innerHTML\s*=/.test(src), '高亮不得拼 innerHTML（用户输入只能是文本节点）')
     assert.ok(/\.logline-bad\s*\{[^}]*var\(--bad-fg\)/.test(css) && /\.logline-warn\s*\{[^}]*var\(--warn-fg\)/.test(css),
@@ -7809,18 +7953,29 @@ async function main () {
     // 性能护栏：>3000 行退回纯文本，且计数行明说。
     assert.ok(src.includes('const LOG_HIGHLIGHT_MAX = 3000'), '高亮护栏阈值必须是 3000 行')
     assert.ok(src.includes('const heavy = ranged.length > LOG_HIGHLIGHT_MAX'), '超过阈值必须走纯文本分支（v3.326 起按区间过滤后的行数算）')
-    const guardAt = src.indexOf('if (ranged.length > LOG_HIGHLIGHT_MAX) return null')
-    assert.ok(guardAt > 0, '超阈值必须在 useMemo 里短路（不能先 map 一遍再二选一）')
-    assert.ok(src.indexOf('return ranged.map((line, i) =>', guardAt - 200) > guardAt, '护栏必须早于 map（顺序反了等于没省）')
+    // 虚拟滚动只省「挂多少个节点」，不省 filterLogLines 的整串扫描：阈值与降级行为保持不变。
+    assert.ok(src.includes('count: heavy ? 0 : ranged.length'), '超阈值必须把虚拟器关掉（count 归零）')
+    assert.ok(src.includes('enabled: !heavy'), '纯文本分支不得继续挂滚动监听 / 算窗口')
+    assert.ok(src.includes('if (!heavy) {') && src.includes('virtItems.map((it) =>'),
+      '虚拟模式只遍历可视窗口（vItems），不再整表 map')
+    assert.ok(!src.includes('ranged.map((line, i) =>'), '不得再整表 map 出节点（那正是要省的部分）')
     assert.ok(src.includes('已关闭高亮'), '关掉高亮必须在计数行写明（不能让人以为搜不到）')
     assert.ok(/heavy \? shownText : lineNodes/.test(src), '超阈值必须退回纯文本渲染')
+    // 窗口驱动：滚动/量高/区间都交给 vendor 的 virtual-core，preact 只负责重渲染。
+    assert.ok(src.includes('useLayoutEffect(() => virt._didMount(), [])') && src.includes('virt._willUpdate()'),
+      'virtual-core 必须按官方 adapter 两步驱动（_didMount 挂载 / _willUpdate 每帧）')
+    assert.ok(src.includes('ref=' + ph('virt.measureElement')), '行高必须交给库量（长行折行后估算值不准）')
+    assert.ok(src.includes("import { Virtualizer, elementScroll, observeElementOffset, observeElementRect } from './virtual-core.module.js'"),
+      'Virtualizer 必须是本地 vendored 资产（不引 CDN）')
+    assert.ok(src.includes('const VIRT_ADAPTER = { observeElementRect, observeElementOffset, scrollToFn: elementScroll }'),
+      'DOM 适配四件套必须显式给（库不自带；缺 scrollToFn 会让 scrollToIndex 抛错）')
     // 计数行点名筛选 + 空态出口（0 命中先点名筛选，再给「在全部日志中搜索」）。
     assert.ok(src.includes('筛选下 · 显示 ' + ph('ranged.length') + ' / ' + ph('lines.length') + ' 行'),
       '筛选非 all 时计数行必须点名筛选（v3.326 起按含日期区间的 ranged 计数）')
     assert.ok(src.includes('在全部日志中搜索') && src.includes('onClick=' + ph('searchAllLogs')),
       '空态必须给「在全部日志中搜索」按钮')
     assert.ok(src.includes('在「' + ph('modeLabel') + '」筛选下没有匹配的日志行'), '空态文案必须点名当前筛选')
-    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('// 一行一个 <span>'))
+    const searchAll = src.slice(src.indexOf('const searchAllLogs = () => {'), src.indexOf('// 只渲染可视窗口'))
     assert.ok(searchAll.includes("setMode('all')") && !searchAll.includes('setQ('), '出口只放开筛选、必须保留关键词')
     assert.ok(src.includes('分类可重叠'), '计数行必须注明分类可重叠（269 ≠ 100+165 的自洽提示）')
   })
@@ -7890,7 +8045,8 @@ async function main () {
     assert.ok(logs.includes("const isFocus = focusAt !== '' && line.startsWith(focusAt)") &&
       logs.includes("(isFocus ? ' logline-focus' : '')"), '高亮类必须由 isFocus 条件真实驱动')
     assert.ok(logs.includes('focusDoneRef.current = focusAt'), '滚动完成后必须记下 focusAt（否则轮询会反复拽回）')
-    assert.ok(logs.includes('pre.scrollTop = Math.max(0'), '定位滚动必须落在日志框内')
+    assert.ok(logs.includes("virt.scrollToIndex(idx, { align: 'center' })"),
+      '定位必须按索引交给虚拟器居中（那一行未必在当前窗口里，量不到矩形）')
     assert.ok(src.includes('const bottomAfter = line.getBoundingClientRect().bottom - (y - startY)') &&
       src.includes('y += bottomAfter - (vh - 12)'), '小屏必须把页面多滚一点，保证高亮行完整可见')
     assert.ok(logs.includes('focusOnly ? base.filter((l) => l.startsWith(focusAt)) : base'),
@@ -8101,6 +8257,38 @@ async function main () {
     assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
   })
 
+  await aok('结构红线: v3.385 用 Object.hasOwn + 草稿时间复用 fmtAge（不留重复实现）', () => {
+    const src = readConsoleSource()
+    const pure = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pure.mjs'), 'utf8')
+    // Object.hasOwn 是 ES2022：Safari 15.4+ / Chrome 93+，与 <dialog> 的底线一致（比手写 .call 短且不碰原型）。
+    assert.ok(!src.includes('Object.prototype.hasOwnProperty.call'), '资产源码一律用 Object.hasOwn，不再手写 .call')
+    assert.ok(!pure.includes('Object.prototype.hasOwnProperty.call'), 'pure.mjs 同样用 Object.hasOwn')
+    // 「多久以前」只留 pure.mjs 的 fmtAge 一份（pages.js 曾抄过一份，文案相同、口径易漂）。
+    assert.ok(!src.includes('function filterDraftAgeText'), '「多久以前」不得再有第二份实现')
+    assert.ok(src.includes('fmtAge(Date.now() - Number(saved.savedAt))'), '草稿恢复提示必须复用 fmtAge（与缓存写入同口径）')
+  })
+  await aok('结构红线: v3.385 复制兜底（非安全上下文 / 剪贴板被拒时仍能复制）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function copyViaTextarea')
+    const end = src.indexOf('function TwoFactorBlock', at)
+    assert.ok(at > -1 && end > at, '应能定位 copyViaTextarea')
+    const seg = src.slice(at, end)
+    // 触发条件：navigator.clipboard 只在安全上下文存在，http://局域网 IP 下必须是 undefined。
+    assert.ok(seg.includes("document.createElement('textarea')") && seg.includes("document.execCommand('copy')"),
+      '必须用 textarea + execCommand 兜底（非安全上下文唯一可用路径）')
+    assert.ok(seg.includes("el.setAttribute('readonly', '')"), 'textarea 必须只读（否则 iOS 弹键盘）')
+    assert.ok(seg.includes('el.setSelectionRange(0, String(text).length)'),
+      'iOS Safari 只认 setSelectionRange（单靠 select() 复制出来是空串）')
+    assert.ok(/finally\s*\{[\s\S]{0,80}parentNode\.removeChild\(el\)/.test(seg), 'textarea 必须在 finally 里摘掉（不留节点）')
+    assert.ok(seg.includes("typeof document.execCommand === 'function'"), 'execCommand 必须能力探测（旧 WebView 可能没有）')
+    // 调用侧：先异步剪贴板，失败/不可用再降级；两条都失败才报错并给手动提示。
+    const copyAt = src.indexOf('const copyText = async (text) => {')
+    const copySeg = src.slice(copyAt, src.indexOf('const secretGroups =', copyAt))
+    assert.ok(copyAt > -1 && copySeg.includes("navigator.clipboard && typeof navigator.clipboard.writeText === 'function'"),
+      '优先走 navigator.clipboard（安全上下文下的正常路径）')
+    assert.ok(copySeg.includes('if (err === null || copyViaTextarea(text))'), '异步接口被拒时必须降级到 execCommand（不是直接报错）')
+    assert.ok(copySeg.includes('请手动选中密钥复制'), '两条都失败时必须保留手动复制提示')
+  })
   await aok('结构红线: 备份块用 Drawer 承载 + HTTPS 校验 + 导入幂等键', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')
@@ -9302,6 +9490,33 @@ async function main () {
     }
   })
 
+  await aok('结构红线: v3.385 渲染错误边界（class + componentDidCatch / 入口包裹 / 错误面板）', () => {
+    const uiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const appSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const ph = (name) => '$' + '{' + name + '}'
+    // 边界只能是 class 组件（hooks 兜不住渲染期异常），且 preact 10 的边界走 componentDidCatch。
+    const at = uiSrc.indexOf('class ErrorBoundary extends Component')
+    assert.ok(at > 0, 'ui.js 必须有 class ErrorBoundary extends Component')
+    const seg = uiSrc.slice(at, uiSrc.indexOf('function App ()', at))
+    assert.ok(seg.includes('componentDidCatch (e)'), '必须实现 componentDidCatch')
+    assert.ok(seg.includes('this.setState({ failed: true, detail })'),
+      '捕获后必须把 failed 置真（只打 console 不 setState，preact 会继续渲染抛错子树）')
+    assert.ok(seg.includes("console.error('[xbk-console] 页面渲染失败：', e)"),
+      '错误摘要必须打到 console（手机上打不开 devtools）')
+    assert.ok(seg.includes('页面出错了') && seg.includes('重新加载'), '失败面板必须有「页面出错了 + 重新加载」')
+    assert.ok(seg.includes('window.location.reload()'), '「重新加载」必须真的 reload')
+    assert.ok(uiSrc.includes('export { App, ErrorBoundary }'), 'ErrorBoundary 必须导出（入口要用）')
+    // 包裹点必须在入口：挂在 App 内部就只能兜子面板，App 自己抛错仍整页白屏。
+    assert.ok(appSrc.includes("import { App, ErrorBoundary } from './ui.js'"), '入口必须同时引入 App 与 ErrorBoundary')
+    assert.ok(appSrc.includes('render(html`<' + ph('ErrorBoundary') + '><' + ph('App') + ' /><//>'),
+      'ErrorBoundary 必须包在 App 外层（render 的第一层就是边界）')
+    assert.ok(!uiSrc.includes('getDerivedStateFromError'), '不混用 getDerivedStateFromError（preact 10 边界走 componentDidCatch）')
+    // 未失败时必须是透明包装：返回 children 而不是自造容器（否则整页结构被多包一层）。
+    assert.ok(seg.includes('if (!this.state.failed) return this.props.children'), '未失败时必须原样返回 children')
+    assert.ok(/\.err-boundary\s*\{[^}]*max-width/.test(css) && css.includes('.err-boundary-detail'),
+      '错误面板必须有样式（裸文本会顶在左上角）')
+  })
   await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
     const src = readConsoleSource()
     assert.ok(src.includes('res.status === 304'), 'consumeJson 必须处理 304（复用条件缓存）')
@@ -9317,7 +9532,7 @@ async function main () {
     }
     // 304 但本地无副本必须自动重试一次，不能把 304 当错误（配置页会显示「加载失败」）。
     assert.ok(src.includes('typeof retry === \'function\''), 'consumeJson 的 304 分支必须有重试通道')
-    assert.ok(src.includes('const again = once(false)'), '重试必须去掉 If-None-Match（once(false) 不再注入条件头）')
+    assert.ok(src.includes('const again = attempt(false)'), '重试必须去掉 If-None-Match（attempt(false) 不再注入条件头）')
     // fetch 在调用时快照 headers：messages 的 addConditional 必须排在 fetch 之前。
     const msgFn = src.slice(src.indexOf('function apiGetMessages'), src.indexOf('function apiGetTrends'))
     assert.ok(msgFn.indexOf('addConditional(merged, condKey)') < msgFn.indexOf('fetch('), 'messages 必须先注入 If-None-Match 再 fetch')

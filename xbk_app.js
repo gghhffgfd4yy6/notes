@@ -1,3 +1,5 @@
+const { setTimeout: delay } = require('node:timers/promises')
+
 function createApp ({
   Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, FilterStore, Network, Pusher,
   fs, path, crypto, readSafeTextResult, writeAtomic, isRegularOrMissing,
@@ -1596,7 +1598,7 @@ function createApp ({
               // 保留可配置的补位间隔（per-worker 语义：每个 worker 完成一条后等 pushInterval 再补下一条，
               // 并行全局速率 = parallelLimit × interval；已知取舍，量小+重试兜底不改），pushInterval=0 即完成即补。
               if (pushInterval > 0 && nextIndex < items.length) {
-                await new Promise(resolve => setTimeout(resolve, pushInterval))
+                await delay(pushInterval)
               }
             }
           }
@@ -1614,7 +1616,7 @@ function createApp ({
             const r = await pushOne(item, notifyModule)
             pushResults.push(r)
             if (r.ok) { successCount++; console.log(`发现到新数据：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${urlOf(item)}`) }
-            if (pushInterval > 0) await new Promise(resolve => setTimeout(resolve, pushInterval))
+            if (pushInterval > 0) await delay(pushInterval)
           }
         }
         checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`)
@@ -1713,7 +1715,7 @@ function createApp ({
         }
         dumpCheckpoints()
         console.log('══════════════════════════════')
-        await new Promise(resolve => setTimeout(resolve, Utils.num(Config.timing.finalWait, 0)))
+        await delay(Utils.num(Config.timing.finalWait, 0))
 
         // v3.163：#9 推送全部失败无告警（v3.123 声称覆盖密钥失效但只实现接口挂）——
         // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
