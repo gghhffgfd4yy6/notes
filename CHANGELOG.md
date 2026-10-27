@@ -1085,7 +1085,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 
 ## v3.385 — 重构：标准库替换 3 处 + 仓内重复收敛 3 组
 
-- 标准库：`sanitizeSurrogates` 改用 `String.prototype.toWellFormed`（孤立代理 → U+FFFD，逐字节等价）；`stripAnsi` 改用 `util.stripVTControlCharacters`（额外覆盖 OSC/DCS，只会多剥）；4 处内联 `new Promise(resolve => setTimeout(...))` 改用 `node:timers/promises.setTimeout`。
+- 标准库：`sanitizeSurrogates` 改用 `String.prototype.toWellFormed`（孤立代理 → U+FFFD，逐字节等价）；`stripAnsi` 改用 `util.stripVTControlCharacters`（额外覆盖 OSC/DCS，只会多剥）；`xbk_app` 的 3 处内联 `new Promise(resolve => setTimeout(...))` 改用 `node:timers/promises.setTimeout`（`xbk_network` 的退避保留内联 Promise：Retry-After 上限用例靠替换 `global.setTimeout` 提速，换成 timers/promises 会真等 30s）。
 - 去重：`timingSafeEqualStr`（编排器/消息存储/控制台 3 份）、上海时间戳与日历日（run.log 戳/RE2 cutoff/访问日志/趋势窗口/日报 5 处）、Cookie 头解析（会话/主题/2FA/设备 4 份）各收敛为一份实现；共用实现放在 `xbk_utils` 顶层（顶层零 require 不变），crypto 仍由调用方注入，DI 与测试替身口径不变。
 - 未采纳：`globToRegExp → path.matchesGlob`（`[a--b]` 这类歧义字符类语义不同，会把未覆盖文件误判为已覆盖，等于闸门假绿）；`sleep → timers/promises`（鸭子 signal 缺 `removeEventListener` 时 Node 直接抛错，现有守卫正是防这个）。
 - 测试：`test_utils_pure` 291 项（新增三组共用实现单测）；控制台 282 项、应用 168 项、消息存储 135 项、日报 96 项全绿。

@@ -99,16 +99,18 @@ function normalize (o, depth = 0) {
 
 // ---------- 跨模块共用的小工具（顶层零 require 不变式） ----------
 // 恒定时间字符串比较：token / Cookie / 墓碑锁的归属校验共用一份实现。
-// crypto 由调用方注入（xbk_app / xbk_message_store 的组合根注入 crypto 以便测试替身），
-// 省略时惰性 require——模块顶层仍然零 require，控制台只取常量时不会加载 crypto。
+// crypto 由调用方注入（xbk_app / xbk_message_store 的组合根注入 crypto 以便测试替身）；
+// **省略第三个实参**才惰性 require——顶层仍然零 require，控制台只取常量时不会加载 crypto。
+// 显式传 null/undefined 视为「该调用方的 crypto 不可用」直接返回 false：组合根漏注入必须暴露，
+// 不能被内置实现静默补上（否则测试替身和缺依赖场景都失去意义）。
 function timingSafeEqualStr (a, b, cryptoImpl) {
   if (typeof a !== 'string' || typeof b !== 'string') return false
   let c = cryptoImpl
-  if (!c) { try { c = require('node:crypto') } catch (e) { return false } }
+  if (arguments.length < 3) { try { c = require('node:crypto') } catch (e) { return false } }
   const ba = Buffer.from(a, 'utf8')
   const bb = Buffer.from(b, 'utf8')
   if (ba.length !== bb.length) return false
-  try { return typeof c.timingSafeEqual === 'function' && c.timingSafeEqual(ba, bb) } catch (e) { return false }
+  try { return typeof c?.timingSafeEqual === 'function' && c.timingSafeEqual(ba, bb) } catch (e) { return false }
 }
 
 // 上海时间戳（YYYY-MM-DD HH:mm:ss）：run.log 行首、访问日志共用同一口径。

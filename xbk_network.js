@@ -6,7 +6,6 @@
 // net-1：PERMANENT_CODES 目前组合根尚未接线（xbk_function_v3.js 只注入 RETRYABLE_CODES），缺省回落到
 // xbk_failure_policy 的同名导出——该模块是无状态常量/纯函数模块，直接 require 不产生反向依赖或重复
 // 单例；若日后组合根改为显式注入，注入值优先，语义不变。
-const { setTimeout: delay } = require('node:timers/promises')
 const { PERMANENT_CODES: POLICY_PERMANENT_CODES } = require('./xbk_failure_policy')
 
 // net-1：请求层本地「确定性失败」码——重试同一个请求不会改变结果（响应体超过 maxBody 是确定性的），
@@ -204,7 +203,9 @@ function createNetwork ({
               ? Math.min(retryAfterMs, RETRY_BACKOFF_CAP_MS)
               : Math.min(1000 * 2 ** attempt, RETRY_BACKOFF_CAP_MS) + crypto.randomInt(500)
             logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）${byServer ? '（按 Retry-After）' : ''}...`)
-            await delay(wait)
+            // 保留内联 Promise：test_network 的 Retry-After 上限用例替换 global.setTimeout 提速，
+            // timers/promises 不经过 global.setTimeout，会把 30s 钳制用例变成真等 30s。
+            await new Promise(resolve => setTimeout(resolve, wait))
           }
         }
       }

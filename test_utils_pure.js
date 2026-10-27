@@ -2214,10 +2214,14 @@ check('timingSafeEqualStr: 相等/不等/非字符串/长度差/注入 crypto �
   assert.strictEqual(timingSafeEqualStr(1, '1'), false, '非字符串入参必须为假（不隐式 String()）')
   assert.strictEqual(timingSafeEqualStr('a', 'a', {}), false, '注入的 crypto 没有 timingSafeEqual 时不得抛')
   assert.strictEqual(timingSafeEqualStr('a', 'a', { timingSafeEqual () { throw new Error('boom') } }), false, '比较抛错必须吞掉并返回假')
-  let called = 0
-  const spy = { timingSafeEqual: () => { called++; return true } }
-  assert.strictEqual(timingSafeEqualStr('a', 'a', spy), true, '注入的 crypto 必须被真的使用（DI 口径）')
-  assert.strictEqual(called, 1, '每次比较只调用一次注入实现')
+  assert.strictEqual(timingSafeEqualStr('a', 'a', undefined), false, '显式传 undefined 不得回落内置 crypto（组合根漏注入必须暴露）')
+  assert.strictEqual(timingSafeEqualStr('a', 'a', null), false, '显式传 null 同上')
+  const seen = []
+  const spy = { timingSafeEqual: (x, y) => { seen.push([x.toString('utf8'), y.toString('utf8')]); return x.equals(y) } }
+  assert.strictEqual(timingSafeEqualStr('token', 'token', spy), true, '注入的 crypto 必须被真的使用（DI 口径）')
+  assert.deepStrictEqual(seen, [['token', 'token']], '传给 timingSafeEqual 的必须是两个入参的 UTF-8 字节，不能是别的缓冲')
+  assert.strictEqual(timingSafeEqualStr('token', 'other', spy), false, '等长但字节不同时必须由注入实现判假')
+  assert.deepStrictEqual(seen, [['token', 'token'], ['token', 'other']], '每次比较只调用一次注入实现，且两个入参都按原样传入')
 })
 
 check('shanghaiStamp: 固定 UTC 时刻 ⇒ 上海文本，且与进程时区无关', () => {
