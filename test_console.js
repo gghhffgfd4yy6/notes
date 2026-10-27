@@ -3189,10 +3189,20 @@ async function main () {
     globalThis.window = { dispatchEvent: () => {} }
     let mod = null
     // 取头 + 读体一整趟；timeoutMs 由调用方给（走被测模块的 timedRequest 构造 signal）
+    // ⚠️ 期限不能贴着「本机一次本回环往返」的量级定：120ms 时在并发负载下（变异 dry run
+    // 一次起 8 个测试进程）响应头会晚于期限到达，fetch 先中止 ⇒ 用例以原始 TimeoutError
+    // 冒红且测的根本不是「体挂起」窗口（本机 6 路并发实测 6/6 命中）。这里留两个数量级余量，
+    // 「是否在期限内中止」仍由下面 <5000ms 的断言守。
+    const STALL_TIMEOUT_MS = 1500
     const readStalledBody = async (timeoutMs) => {
       const t0 = Date.now()
-      const res = await realFetch(`http://127.0.0.1:${port}/stall`,
-        mod.timedRequest({ headers: { Accept: 'application/json' } }, timeoutMs))
+      let res
+      try {
+        res = await realFetch(`http://127.0.0.1:${port}/stall`,
+          mod.timedRequest({ headers: { Accept: 'application/json' } }, timeoutMs))
+      } catch (e) {
+        throw new Error(`响应头未在期限（${timeoutMs}ms）内到达，测不到「体挂起」窗口：${e && e.message}`)
+      }
       assert.strictEqual(res.status, 200, '响应头必须先到（否则测的不是「体挂起」窗口）')
       let err = null
       try { await res.json() } catch (e) { err = e }
@@ -3204,14 +3214,14 @@ async function main () {
       mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
       assert.ok(mod.timedRequest({}, 50).signal instanceof AbortSignal,
         'timedRequest 必须交出真 AbortSignal（fetch 与 body 读取共用同一个期限）')
-      const native = await readStalledBody(120)
+      const native = await readStalledBody(STALL_TIMEOUT_MS)
       assert.ok(native.err, 'body 挂起时必须在期限内 reject，不能永久等待')
       assert.strictEqual(native.err.name, 'TimeoutError', `原生路径必须抛 TimeoutError（实际 ${native.err && native.err.name}）`)
       assert.ok(native.elapsed < 5000, `必须在期限内中止（实测 ${native.elapsed}ms）`)
       // 回退路径（Safari < 16 / Android WebView < 103）：删掉该 API 后同一路径仍要中止。
       delete AbortSignal.timeout
       assert.strictEqual(typeof AbortSignal.timeout, 'undefined', '删除后必须真的走 fallback 分支')
-      const fallback = await readStalledBody(120)
+      const fallback = await readStalledBody(STALL_TIMEOUT_MS)
       assert.ok(fallback.err, 'fallback（AbortController + setTimeout）同样必须中止挂起的 body')
       assert.ok(fallback.elapsed < 5000, `fallback 也必须在期限内中止（实测 ${fallback.elapsed}ms）`)
       // 文案映射：两种引擎文案与旧竞速文案都要落到同一句「请求超时」。
@@ -5735,8 +5745,11 @@ async function main () {
     const { readRunHistory } = require('./scripts/status')
     const dir = tmpDir()
     const filler = '2026-10-15 00:00:00 DEBUG 填充行 ' + 'x'.repeat(120)
-    const lines = []
-    while (Buffer.byteLength(lines.join('\n'), 'utf8') < 1024 * 1024 + 2048) lines.push(filler)
+    // 按行累加字节数构造 >1MiB 的 run.log：**别每轮 join 整表再量**——那是 O(n²)，
+    // 本机 6 路并发时这个 fixture 的构造成本从 ~3s 涨到 >25s，直接把这条用例顶到 25s
+    // 看门狗上（变异 dry run 一次起 8 个测试进程，同理）。语义不变：总量 >1MiB+2048。
+    const fillerBytes = Buffer.byteLength(filler, 'utf8') + 1 // +1 = 行尾 '\n'
+    const lines = new Array(Math.ceil((1024 * 1024 + 2048) / fillerBytes)).fill(filler)
     for (let i = 0; i < 6; i++) {
       lines.push(`2026-10-15 1${i}:00:00 total=${i} dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1`)
     }
