@@ -902,30 +902,13 @@ function createUtils (options = {}) {
   // 清洗孤立代理（v3.110 fuzz 发现）：encodeURIComponent 对孤立代理抛 URIError → 推送失败。
   // 孤立高/低代理替换为 U+FFFD（完整代理对保留）；脏数据/截断 emoji 的真实防御。
   //
-  // P1-04（同族）：原实现把 `[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]`
-  // 交给 safeRe——含 lookahead `(?!` 与 lookbehind `(?<!`，两者都是 Google RE2 不支持的构造，
-  // 真 RE2 会编译失败并被 safeRe 静默 catch 回落 V8 RegExp（清洗链失去线性时间防护）。而本方法在
-  // 生产热路径上（safeText / xbk_app 每条推送标题与正文都过），回落窗口最大。
-  // 改为一次线性扫描：语义与旧正则逐字节等价（完整代理对整体保留，孤立高/低代理各替换为 U+FFFD）。
+  // P1-04（同族）→ 标准库替换：原先的线性扫描（更早是含 lookaround 的 safeRe 正则，RE2 不支持、
+  // 静默回落 V8）由 ES2024 的 String.prototype.toWellFormed() 等价覆盖——规范定义就是「孤立代理
+  // 替换为 U+FFFD、完整代理对保留」，与旧实现逐字节等价（test_utils_pure 的 P1-04 用例锁定）。
+  // Node 20+ 提供；本仓 engines 最低 22.22.2，无需兜底。
   sanitizeSurrogates (s) {
     try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
-    const HI_LO = 0xD800 // 高代理区起点（SURROGATE_LO）
-    const HI_HI = 0xDBFF // 高代理区终点
-    const LO_LO = 0xDC00 // 低代理区起点
-    const LO_HI = 0xDFFF // 低代理区终点（SURROGATE_HI）
-    let out = ''
-    let changed = false
-    for (let i = 0; i < s.length; i++) {
-      const c = s.charCodeAt(i)
-      if (c >= HI_LO && c <= HI_HI) {
-        const next = s.charCodeAt(i + 1)
-        if (next >= LO_LO && next <= LO_HI) { out += s[i] + s[i + 1]; i++; continue } // 完整代理对保留
-        out += '\uFFFD'; changed = true; continue // 孤立高代理
-      }
-      if (c >= LO_LO && c <= LO_HI) { out += '\uFFFD'; changed = true; continue } // 孤立低代理
-      out += s[i]
-    }
-    return changed ? out : s
+    return s.toWellFormed()
   },
 
   /** 数字实体解码统一：NUL 过滤 / 代理区与超范围保留原文 */
