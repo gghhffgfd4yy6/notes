@@ -8257,6 +8257,28 @@ async function main () {
     assert.ok(/\.trigger-result\s*\{[^}]*min-height:\s*18px/.test(css), '结果行必须预留行高（出现时按钮不位移）')
   })
 
+  await aok('结构红线: v3.385 复制兜底（非安全上下文 / 剪贴板被拒时仍能复制）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function copyViaTextarea')
+    const end = src.indexOf('function TwoFactorBlock', at)
+    assert.ok(at > -1 && end > at, '应能定位 copyViaTextarea')
+    const seg = src.slice(at, end)
+    // 触发条件：navigator.clipboard 只在安全上下文存在，http://局域网 IP 下必须是 undefined。
+    assert.ok(seg.includes("document.createElement('textarea')") && seg.includes("document.execCommand('copy')"),
+      '必须用 textarea + execCommand 兜底（非安全上下文唯一可用路径）')
+    assert.ok(seg.includes("el.setAttribute('readonly', '')"), 'textarea 必须只读（否则 iOS 弹键盘）')
+    assert.ok(seg.includes('el.setSelectionRange(0, String(text).length)'),
+      'iOS Safari 只认 setSelectionRange（单靠 select() 复制出来是空串）')
+    assert.ok(/finally\s*\{[\s\S]{0,80}parentNode\.removeChild\(el\)/.test(seg), 'textarea 必须在 finally 里摘掉（不留节点）')
+    assert.ok(seg.includes("typeof document.execCommand === 'function'"), 'execCommand 必须能力探测（旧 WebView 可能没有）')
+    // 调用侧：先异步剪贴板，失败/不可用再降级；两条都失败才报错并给手动提示。
+    const copyAt = src.indexOf('const copyText = async (text) => {')
+    const copySeg = src.slice(copyAt, src.indexOf('const secretGroups =', copyAt))
+    assert.ok(copyAt > -1 && copySeg.includes("navigator.clipboard && typeof navigator.clipboard.writeText === 'function'"),
+      '优先走 navigator.clipboard（安全上下文下的正常路径）')
+    assert.ok(copySeg.includes('if (err === null || copyViaTextarea(text))'), '异步接口被拒时必须降级到 execCommand（不是直接报错）')
+    assert.ok(copySeg.includes('请手动选中密钥复制'), '两条都失败时必须保留手动复制提示')
+  })
   await aok('结构红线: 备份块用 Drawer 承载 + HTTPS 校验 + 导入幂等键', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function BackupBlock')

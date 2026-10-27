@@ -3334,6 +3334,31 @@ function BackupBlock ({ onImported }) {
   </div>`
 }
 
+// 复制兜底（v3.385）：navigator.clipboard 只在安全上下文（https / localhost）存在——手机用
+// http://192.168.x.x 打开控制台时它是 undefined，两步验证的「复制」会 100% 失败。
+// execCommand('copy') 虽已废弃，但正是这种场景下唯一还能用的接口（Chrome/Safari/Firefox 都保留），
+// 用完即删 textarea，不往页面留节点、也不改选中态。
+function copyViaTextarea (text) {
+  const el = document.createElement('textarea')
+  el.value = text
+  el.setAttribute('readonly', '') // 只读：iOS 不弹键盘
+  el.style.position = 'fixed'
+  el.style.top = '-1000px'
+  document.body.appendChild(el)
+  let ok = false
+  try {
+    el.select()
+    // iOS Safari 只认 setSelectionRange（单靠 select() 复制出来是空串）。
+    if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, String(text).length)
+    ok = typeof document.execCommand === 'function' && document.execCommand('copy')
+  } catch (e) {
+    ok = false
+  } finally {
+    if (el.parentNode) el.parentNode.removeChild(el)
+  }
+  return ok
+}
+
 // 两步验证（v3.357）：系统页里的可选开关。二维码由服务端 qrcode-generator 生成
 // （SVG data URI，不引 CDN/不增加前端构建），同时保留手动密钥兜底；确认后服务端只回一次
 // 恢复码，页面如实提示「只显示一次」。
@@ -3432,13 +3457,24 @@ function TwoFactorBlock ({ active = true }) {
     }
   }
   const copyText = async (text) => {
+    let err = null
     try {
-      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('浏览器不支持复制')
-      await navigator.clipboard.writeText(text)
-      setNote('已复制到剪贴板。')
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text)
+      } else {
+        err = new Error('浏览器不支持剪贴板接口')
+      }
     } catch (e) {
-      setErr(`复制失败：${e && e.message ? e.message : e}；请手动选中密钥复制。`)
+      err = e
     }
+    // 异步剪贴板不可用 / 被拒（非安全上下文、没拿到用户激活、权限策略）→ 退回 execCommand。
+    // 两条都失败才报错：http://局域网 IP 打开时这是唯一能用的那条路。
+    if (err === null || copyViaTextarea(text)) {
+      setNote('已复制到剪贴板。')
+      setErr('') // 上一次失败的红条要一起撤掉，否则「复制失败」和「已复制」同屏
+      return
+    }
+    setErr(`复制失败：${err && err.message ? err.message : err}；请手动选中密钥复制。`)
   }
   const secretGroups = setup && typeof setup.secret === 'string'
     ? setup.secret.replace(/(.{4})/g, '$1 ').trim()
