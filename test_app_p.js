@@ -87,6 +87,27 @@ function runChunk (chunk, idx, quick) {
   })
 }
 
+// 收尾：worker 名单临时文件 + 独立缓存目录（本进程自己创建的临时产物）。
+// 旧实现只在「子进程 exit」与「happy path 末尾」两处清理：被 Ctrl-C / 外部 kill、或 setup
+// 中途抛错时，`.tmp_parallel_<workerId>.json` 与 `xianbaoku_cache_p<workerId>` 会留在仓库根。
+// 两者都被 .gitignore 覆盖（目录 `xianbaoku_cache*`、名单 `.tmp_parallel_*.json`）⇒ git status
+// 看不出来，只能靠数文件发现——实测已滞留 2 个名单文件。收敛成幂等入口，三条退出路径都调。
+function cleanupArtifacts () {
+  for (const workerId of workerIds) {
+    try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_${workerId}.json`)) } catch (e) {} // 已删 / 未建
+    try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${workerId}`), { recursive: true, force: true }) } catch (e) {}
+  }
+}
+
+// 被 Ctrl-C / 外部 kill 时同样收尾（SIGKILL 抓不到，不属本机制的覆盖范围）
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.once(sig, () => {
+    for (const child of activeChildren) { try { child.kill() } catch (e) {} }
+    cleanupArtifacts()
+    process.exit(sig === 'SIGINT' ? 130 : 143)
+  })
+}
+
 console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks.length} 片（并发 ${CONCURRENCY}，独立缓存目录）\n`);
 
 // ---------- 4. 首轮并发 + 失败片串行重跑（flaky 容错） ----------
@@ -101,10 +122,7 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     }
   }
 
-  // 清理：worker 独立缓存目录（自己创建的临时产物）
-  for (const workerId of workerIds) {
-    try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${workerId}`), { recursive: true, force: true }) } catch (e) {}
-  }
+  cleanupArtifacts()
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   const failedWorkers = codes.map((c, i) => ({ c, i })).filter(w => w.c !== 0)
   console.log('\n════════ 并行汇总 ════════')
@@ -120,5 +138,6 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
 })().catch(e => {
   console.error(e)
   for (const child of activeChildren) { try { child.kill() } catch (err) {} }
+  cleanupArtifacts()
   process.exitCode = 1
 })
