@@ -2204,4 +2204,31 @@ check('addIndex: 空 key 忽略、同 key 累积成集合（索引化判重的�
   assert.ok(set.has('v1') && set.has('v2'), '同 key 的多个值必须都进集合')
 })
 
+// ===== 跨模块共用实现（timingSafeEqualStr / shanghaiStamp / shanghaiDayKey）=====
+const { timingSafeEqualStr, shanghaiStamp, shanghaiDayKey } = require('./xbk_utils')
+
+check('timingSafeEqualStr: 相等/不等/非字符串/长度差/注入 crypto 无能力或抛错', () => {
+  assert.strictEqual(timingSafeEqualStr('abc', 'abc'), true, '相同字符串必须为真')
+  assert.strictEqual(timingSafeEqualStr('abc', 'abd'), false, '不同字符串必须为假')
+  assert.strictEqual(timingSafeEqualStr('abc', 'abcd'), false, '长度不同必须先短路为假')
+  assert.strictEqual(timingSafeEqualStr(1, '1'), false, '非字符串入参必须为假（不隐式 String()）')
+  assert.strictEqual(timingSafeEqualStr('a', 'a', {}), false, '注入的 crypto 没有 timingSafeEqual 时不得抛')
+  assert.strictEqual(timingSafeEqualStr('a', 'a', { timingSafeEqual () { throw new Error('boom') } }), false, '比较抛错必须吞掉并返回假')
+  let called = 0
+  const spy = { timingSafeEqual: () => { called++; return true } }
+  assert.strictEqual(timingSafeEqualStr('a', 'a', spy), true, '注入的 crypto 必须被真的使用（DI 口径）')
+  assert.strictEqual(called, 1, '每次比较只调用一次注入实现')
+})
+
+check('shanghaiStamp: 固定 UTC 时刻 ⇒ 上海文本，且与进程时区无关', () => {
+  assert.strictEqual(shanghaiStamp(new Date(Date.UTC(2024, 2, 15, 20, 0, 0))), '2024-03-16 04:00:00')
+  assert.strictEqual(shanghaiStamp(new Date(Date.UTC(2024, 2, 15, 15, 59, 59))), '2024-03-15 23:59:59')
+})
+
+check('shanghaiDayKey: +8 日界，接受 ms 与 Date', () => {
+  assert.strictEqual(shanghaiDayKey(Date.UTC(2024, 2, 15, 15, 59, 59)), '2024-03-15', '上海 23:59:59 仍是当日')
+  assert.strictEqual(shanghaiDayKey(Date.UTC(2024, 2, 15, 16, 0, 0)), '2024-03-16', '上海 00:00:00 进位到次日')
+  assert.strictEqual(shanghaiDayKey(new Date(Date.UTC(2024, 2, 15, 16, 0, 0))), '2024-03-16', 'Date 入参与 ms 等价')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_utils_pure.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

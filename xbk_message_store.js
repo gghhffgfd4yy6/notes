@@ -5,8 +5,9 @@
 // 缓存目录解析：项目根内校验 + 多级兜底。**生产 getter 与青龙 `--status` 命令共用本实现**（QX-08）：
 // `--status` 此前把默认目录硬编码成 path.join(ROOT, 'xianbaoku_cache')，于是生产会拒绝并回退的目录
 // （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
-// `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块因此
-// 不 require 任何模块，`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
+// `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块只 require
+// 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
+const { timingSafeEqualStr } = require('./xbk_utils')
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   const candidate = path.resolve(root, raw)
   const realInsideRoot = (p) => {
@@ -71,14 +72,6 @@ function createMessageStore ({
   storage,
   constants
 }) {
-  const tokenMatches = (actual, expected) => {
-    if (typeof actual !== 'string' || typeof expected !== 'string') return false
-    const actualBytes = Buffer.from(actual, 'utf8')
-    const expectedBytes = Buffer.from(expected, 'utf8')
-    if (actualBytes.length !== expectedBytes.length) return false
-    try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
-  }
-
   const { readSafeTextResult, writeAtomic, writeAtomicIfAbsent } = storage
   const {
     DEFAULT_MAX_SIZE,
@@ -1165,7 +1158,7 @@ function createMessageStore ({
     /** 释放墓碑锁：仅当锁内容仍是自己写入的 token 时才删除；ENOENT 视为正常。 */
     _releaseTombstoneLock (lockPath, token) {
       try {
-        if (tokenMatches(fs.readFileSync(lockPath, 'utf8'), token)) fs.unlinkSync(lockPath)
+        if (timingSafeEqualStr(fs.readFileSync(lockPath, 'utf8'), token, crypto)) fs.unlinkSync(lockPath)
       } catch (e) {
         if (e && e.code !== 'ENOENT') { /* 其余错误同样忽略，锁清理非关键 */ }
       }
@@ -1174,7 +1167,7 @@ function createMessageStore ({
     /** 写盘前校验锁仍归当前进程持有；锁被替换或删除时放弃本次写入。 */
     _isTombstoneLockOwner (lockPath, token) {
       try {
-        return tokenMatches(fs.readFileSync(lockPath, 'utf8'), token)
+        return timingSafeEqualStr(fs.readFileSync(lockPath, 'utf8'), token, crypto)
       } catch {
         return false
       }
