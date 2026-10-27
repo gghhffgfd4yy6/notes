@@ -61,7 +61,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 }
 
 const {
-  createConsole, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
+  createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
   acquireLock, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -9542,6 +9542,52 @@ async function main () {
       assert.ok(res.text.includes('需要访问令牌'), '按未登录处理')
     } finally {
       await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // v3.386：启动期监听失败要给一行可读原因（2026-10-22 实测 7777 被旧实例占用时，
+  // 日志里只有未捕获 'error' 的整段栈，systemd 每 5s 重启一次、看不出根因）。
+  await aok('启动: 监听失败给一行可读原因（端口占用不再冒未捕获栈）', async () => {
+    assert.match(listenErrorHint('EADDRINUSE', '127.0.0.1', 7777), /端口已被占用[\s\S]*ss -ltnp/, 'EADDRINUSE 应给出占用与排查命令')
+    assert.match(listenErrorHint('EACCES', '0.0.0.0', 80), /没有权限/, 'EACCES 应说明权限')
+    assert.match(listenErrorHint('EADDRNOTAVAIL', '10.0.0.9', 7777), /不属于本机/, 'EADDRNOTAVAIL 应指向 XBK_CONSOLE_HOST')
+    assert.match(listenErrorHint(undefined, '127.0.0.1', 7777), /失败（UNKNOWN）/, '未知 code 也要有可读兜底')
+
+    const dir = tmpDir()
+    const base = { ...process.env, XBK_CONSOLE_TOKEN: TOKEN, XBK_CACHE_DIR: dir }
+    const first = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
+      env: { ...base, XBK_CONSOLE_PORT: '0' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let outA = ''
+    first.stdout.on('data', (c) => { outA += c })
+    first.stderr.on('data', (c) => { outA += c })
+    try {
+      const deadline = Date.now() + 10000
+      while (!outA.includes('已启动')) {
+        if (Date.now() > deadline) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      const m = /已启动：http:\/\/[^:]+:(\d+)/.exec(outA)
+      assert.ok(m, `第一个实例未就绪：${outA.slice(0, 300)}`)
+      const busyPort = m[1]
+      const second = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
+        env: { ...base, XBK_CONSOLE_PORT: busyPort },
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+      let outB = ''
+      second.stdout.on('data', (c) => { outB += c })
+      second.stderr.on('data', (c) => { outB += c })
+      const code = await new Promise((resolve) => {
+        const timer = setTimeout(() => { second.kill('SIGKILL'); resolve('timeout') }, 10000)
+        second.on('exit', (c) => { clearTimeout(timer); resolve(c) })
+      })
+      assert.notStrictEqual(code, 0, `端口被占用时必须非 0 退出（实际 ${code}）：${outB.slice(0, 300)}`)
+      assert.match(outB, /端口已被占用/, `应给出一行可读原因：${outB.slice(0, 300)}`)
+      assert.ok(!/Unhandled 'error' event/.test(outB), `不得再冒未捕获 error 栈：${outB.slice(0, 300)}`)
+    } finally {
+      first.kill('SIGKILL')
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
