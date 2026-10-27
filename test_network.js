@@ -6,7 +6,7 @@ const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
 function makeNetwork (opts = {}) {
-  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders, sleep } = opts
+  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders, sleep, noResponse = false } = opts
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
@@ -17,7 +17,10 @@ function makeNetwork (opts = {}) {
     if (calls <= failTimes) {
       const e = new Error('fail ' + calls)
       if (errorCode !== undefined) e.code = errorCode // net-1：无 response 的永久性错误码
-      if (statusCode !== undefined) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
+      // noResponse：真实链路里 DNS 失败/ECONNREFUSED/超时/EBODYLIMIT 都不挂 e.response
+      // （xbk_http 只在 statusCode >= 300 时才挂）——夹具必须能复刻这条形状，否则
+      // 「无 response」分支永远测不到（statusCode: undefined 会被上面的解构默认值 500 兜回）。
+      if (statusCode !== undefined && !noResponse) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
       throw e
     }
     return { ok: true, calls }
@@ -499,6 +502,53 @@ function makeNetwork (opts = {}) {
     } finally {
       if (origTZ === undefined) delete process.env.TZ; else process.env.TZ = origTZ
     }
+  }
+
+  // 22. 关闭 got 内置重试：必须显式下发 retry.limit=0。
+  //     反例（实测）：删掉该字段后 got 默认 limit=2 复活，与外层手写重试叠加（3 次尝试 × got 3 次 = 9 次请求），
+  //     限流窗口内把请求量放大 3 倍；xbk_http 走 got.stream，options 是原样透传的。
+  {
+    const { net, getRequestOptions } = makeNetwork({ retry: 1, statusCode: 503, failTimes: 1, sleep: async () => {} })
+    await net.fetchData()
+    const first = getRequestOptions()[0]
+    assert.ok(first && first.retry, `必须显式传 retry 选项，实际：${JSON.stringify(first)}`)
+    assert.strictEqual(first.retry.limit, 0, '必须用 retry.limit=0 关闭 got 内置重试（0 次内置重试）')
+  }
+
+  // 23. api.retry=0 的语义是「不重试」：失败即止，不得被当成非法值回落默认 2。
+  //     反例：`r >= 0` → `r > 0` 后 0 被判非法 → 回落 2 → 调用次数 1 变 3。
+  {
+    const { net, getCalls } = makeNetwork({ retry: 0, statusCode: 503, failTimes: 5, sleep: async () => {} })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.ok(rejected, 'retry=0 时失败仍须抛出')
+    assert.strictEqual(getCalls(), 1, `retry=0 表示不重试，实际调用了 ${getCalls()} 次`)
+  }
+
+  // 24. 指数退避必须递增（1s → 2s）：专杀 `1000 * 2 ** attempt` → `1000 / 2 ** attempt`（方向反转）
+  //     与 `+ crypto.randomInt(500)` → `- ...`（抖动变负）。夹具已把 randomInt 固定为 0，
+  //     故第 a 次重试的等待恰为 1000·2^a。
+  {
+    const { net, getLogs } = makeNetwork({ retry: 2, statusCode: 503, failTimes: 3, sleep: async () => {} })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.ok(rejected, '三次尝试全失败后必须抛出')
+    const waits = getLogs()
+      .filter(l => l.includes('后重试'))
+      .map(l => (l.match(/，([\d.]+)s 后重试/) || [])[1])
+    assert.deepStrictEqual(waits, ['1', '2'], `指数退避必须 1s→2s 递增，实际 ${JSON.stringify(waits)}`)
+  }
+
+  // 25. 无 e.response 的错误（DNS 失败 / ECONNREFUSED / 超时 / EBODYLIMIT 的真实形状）：
+  //     必须照常重试并抛出原始错误码。反例：`if (e.response)` → `if (true)` 后读
+  //     `e.response.statusCode` 抛 TypeError —— 原始 code 被掩盖且整轮退避被打断（零重试）。
+  {
+    const { net, getCalls } = makeNetwork({ retry: 2, noResponse: true, errorCode: 'ERR_UNKNOWN_XYZ', failTimes: 5, sleep: async () => {} })
+    let rejected = null
+    try { await net.fetchData() } catch (e) { rejected = e }
+    assert.strictEqual(rejected && rejected.code, 'ERR_UNKNOWN_XYZ',
+      `无 response 的错误必须抛出原始 code，实际 ${rejected && rejected.code}（${rejected && rejected.message}）`)
+    assert.strictEqual(getCalls(), 3, '无 response 的未知错误码仍按 maxRetry 重试（首次 + 2 次）')
   }
 
   console.log('test_network OK')

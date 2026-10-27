@@ -1672,7 +1672,10 @@ console.log('========================================\n');
     const past = new Date(Date.now() - 20000)
     fsmod.utimesSync(fp + '.seen.lock', past, past)
     MessageStore._tombstoneLocksCleaned.delete(path.dirname(fp))
-    MessageStore._cleanupResidualTombstoneLocks(path.dirname(fp))
+    // 走 init()（真实启动路径）而不是直接调 _cleanupResidualTombstoneLocks：清理必须真的接在 init 上。
+    // 反例：删掉 init 里那一行，直接调用式的用例照样绿，而陈旧锁永不清 → 墓碑写入永久失败
+    // （_acquireTombstoneLock 遇 EEXIST 直接返回 null，无 staleness 复检）→ 重放重复推送。
+    MessageStore.init()
     MessageStore._tombstoneDropped(fp, [{ id: 1 }])
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 1 }), true, '启动清理残留锁后应正常写入墓碑')
     assertEqual(fsmod.existsSync(fp + '.seen.lock'), false, '启动清理后锁文件应被删除')
@@ -2677,6 +2680,13 @@ console.log('========================================\n');
 
   await test('whitelistFilter 标题不匹配', () => {
     assertEqual(whitelistFilter({ title: '淘宝特价' }, 'title', '京东'), false)
+  })
+
+  // 专杀 `hasNestedQuantifier(kwStr) → false`：风险关键词必须整条放行，不得退化成真匹配。
+  // 取值故意不带 'a'，一旦闸门被去掉，RE2 编译成功但 test 为 false → 会被判「不匹配」而拦截。
+  await test('whitelistFilter 嵌套量词关键词 → 一律放行（闸门不得退化成真匹配）', () => {
+    assertEqual(whitelistFilter({ title: 'zzz' }, 'title', '(a+)+'), true)
+    assertEqual(whitelistFilter({ title: 'zzz' }, 'title', '(a|a)+$'), true)
   })
 
   await test('whitelistFilter 内容字段匹配', () => {
@@ -10466,6 +10476,27 @@ console.log('========================================\n');
     assertEqual(big.id.has('id0'), false, '最旧键应被淘汰')
     assertEqual(big.id.has('id5000'), true, '最新键应保留')
     assertEqual(big.anon.size, 1, '未超限 map 不应裁剪')
+  })
+
+  await test('P4 _recordTombstoneDrops 落盘前必须裁剪墓碑（唯一调用点，缺则无界增长）', () => {
+    const name = 'test_tomb_trim_on_write.json'
+    const fp = getFilePath(name)
+    MessageStore._tombstoneLoaded.delete(fp)
+    const fsmod = require('node:fs')
+    const lockPath = fp + '.seen.lock'
+    try { fsmod.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
+    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    const token = MessageStore._acquireTombstoneLock(lockPath)
+    assertEqual(typeof token === 'string' && token.length > 0, true, '前置：应拿到墓碑锁')
+    const dropped = []
+    for (let i = 0; i < 5001; i++) dropped.push({ id: i })
+    MessageStore._recordTombstoneDrops(fp, dropped, lockPath, token)
+    MessageStore._releaseTombstoneLock(lockPath, token)
+    const data = MessageStore._readTombstoneData(fp)
+    assertEqual(Array.isArray(data && data.id), true, '前置：墓碑应已落盘')
+    assertEqual(data.id.length, 5000, `落盘前必须裁剪到 TOMBSTONE_MAX_KEYS，实际 ${data.id.length}`)
+    assertEqual(data.id.includes('0'), false, '最旧身份应被淘汰')
+    assertEqual(data.id.includes('5000'), true, '最新身份应保留')
   })
 
   await test('P4 _cloneTombstones 深拷贝：改副本不影响原', () => {

@@ -144,6 +144,22 @@ const {
   assert.strictEqual(writeAtomicIfAbsent(partial, '[]'), true, '残骸清理后下一次初始化应成功')
   assert.strictEqual(fs.readFileSync(partial, 'utf8'), '[]', '下一次初始化必须写入有效内容（残骸存在时 EEXIST 早退，坏内容永久残留）')
 
+  // ===== 变异 replay 补强：fd 初值必须是负数哨兵（-1）=====
+  // 反例：`let fd = -1` → `+1` 后，openSync 失败（EACCES/EEXIST）走 catch 里的
+  // `if (fd >= 0) closeSync(fd)` 会关掉 fd 1 = **标准输出**：此后进程内 console.* 全部 EBADF，
+  // 日志静默丢失且故障现场无法定位。哨兵必须 < 0，清理只关自己打开的 fd。
+  {
+    const origOpenFd = fs.openSync
+    const origCloseFd = fs.closeSync
+    const closedFds = []
+    fs.openSync = () => { const e = new Error('open-boom-fd'); e.code = 'EACCES'; throw e }
+    fs.closeSync = (f) => { closedFds.push(f) }
+    let fdRet
+    try { fdRet = writeAtomic(make('fd-sentinel.txt'), 'x') } finally { fs.openSync = origOpenFd; fs.closeSync = origCloseFd }
+    assert.strictEqual(fdRet, false, 'openSync 失败时 writeAtomic 必须返回 false')
+    assert.deepStrictEqual(closedFds, [], `openSync 尚未成功，清理路径不得 close 任何 fd（实际 ${JSON.stringify(closedFds)}；fd 初值为 1 时会关掉 stdout）`)
+  }
+
   // ===== WIN-01（qodo #154 发现 1）：写失败清理必须先 close 再 unlink =====
   // Windows 上「本进程仍持有句柄」的文件 unlink 会抛 EPERM/EBUSY，半写残骸于是留在缓存路径；
   // 而消费侧 _ensureFileExists 以 existsSync 早退 → 坏文件被当成「已初始化」。旧实现在 catch 里

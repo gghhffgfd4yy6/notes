@@ -338,6 +338,17 @@ test('合法覆盖文件：source=override 且缺字段回默认', () => {
   assert.strictEqual(loaded.filter.pingbineirong, '默认内容')
 })
 
+test('覆盖文件 revision=0 合法：不得判成损坏（revision 0 是写侧默认值）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 0, filter: { pingbibiaoti: '零号覆盖' } })
+  const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loaded.source, 'override', `revision=0 的覆盖文件必须生效，实际 source=${loaded.source}`)
+  assert.strictEqual(loaded.revision, 0)
+  assert.strictEqual(loaded.degraded, false)
+  assert.strictEqual(loaded.filter.pingbibiaoti, '零号覆盖')
+})
+
 test('每次 load 重新读盘（不缓存 activeFilter，只缓存 last-known-good）', () => {
   resetStoreStateForTests()
   const dir = makeDir()
