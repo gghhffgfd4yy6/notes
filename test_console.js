@@ -103,6 +103,9 @@ const { readMessages } = require('./scripts/status')
 
 let passed = 0
 let failed = 0
+// 失败用例名单独留存：287 条用例的日志远长于 CI 里 `tail -n 120` 的窗口，只靠行内 ❌ 定位不到
+// （2026-10-27 实测：变异 dry run 报「失败 1」，job 日志里看不到是哪条）。汇总时再列一次。
+const failedNames = []
 
 // ── 用例级收尾保障（变异测试 Timeout 的根因修复）──
 // 旧写法把 server.close() 放在用例最后一行：变异体让断言提前抛错 → 最后一行不执行 →
@@ -207,7 +210,7 @@ function refdHandleNames (ignore) {
 
 function ok (name, fn) {
   reapStaleTimeout(name)
-  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; console.log(`  ❌ ${name}: ${e.message}`) } finally { reapTestScope(name) }
+  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(name); console.log(`  ❌ ${name}: ${e.message}`) } finally { reapTestScope(name) }
 }
 // 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
 // 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
@@ -245,6 +248,7 @@ async function aok (name, fn) {
     console.log(`  ✅ ${name}`)
   } catch (e) {
     failed++
+    failedNames.push(name)
     // 超时是真超时（不是用例自己抛的错）才记僵尸标记：后续用例开始前会因此补收割一次。
     if (timedOut) timedOutStale = name
     // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
@@ -9605,7 +9609,11 @@ async function main () {
 main()
   .then(() => {
     console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
-    if (failed > 0) process.exitCode = 1
+    if (failed > 0) {
+      process.exitCode = 1
+      // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
+      console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+    }
     const lastReap = reapTestScope('套件末')
     // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
     // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
