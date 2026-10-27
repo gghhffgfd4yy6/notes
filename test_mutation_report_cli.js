@@ -1109,4 +1109,67 @@ function schemaReport (seg, mutants) {
   }
 }
 
+// 场景 20（历史日报清理 · best-effort 退出码，2026-10-27）：`--issue` 的真实 CLI 路径下，若某条历史
+// 日报的 PATCH 返回 500，进程仍必须 **exit 0**——清理是卫生项、不是门禁；stderr 只允许出现固定文案 +
+// 序号 + 状态码。为什么必须在子进程里测：纯函数套件的 `process.exitCode` 断言只能证明 postIssue 不改它，
+// 而「main() 不因清理失败变红」这条只有真跑一遍 CLI 才算验过。fetch 用 `-r` 预加载的桩顶掉（生产脚本
+// 硬编码 api.github.com，无法重定向到本地端口）。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-prune-'))
+  try {
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, [mutantOf()])))
+    }
+    const { shanghaiDate } = require('./scripts/mutation-report.js')
+    const today = shanghaiDate()
+    const yesterday = shanghaiDate(new Date(Date.now() - 86400000))
+    const stubPath = path.join(tmp, 'stub-fetch.js')
+    const callsPath = path.join(tmp, 'calls.jsonl')
+    fs.writeFileSync(stubPath, `'use strict'
+const fs = require('node:fs')
+const res = (ok, status, body) => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) })
+globalThis.fetch = async function (url, opts) {
+  const method = (opts && opts.method) || 'GET'
+  fs.appendFileSync(process.env.STUB_CALLS_FILE, JSON.stringify({ method, url, body: opts && opts.body ? JSON.parse(opts.body) : null }) + '\\n')
+  if (method === 'GET' && url.includes('state=all')) return res(true, 200, [])
+  if (method === 'POST') return res(true, 201, { number: 900, html_url: 'https://github.com/owner/repo/issues/900' })
+  if (method === 'GET' && url.includes('state=open')) {
+    return res(true, 200, [
+      { number: 901, state: 'open', title: '🧬 变异测试日报 ' + process.env.STUB_YESTERDAY, user: { login: 'github-actions[bot]' } },
+      { number: 902, state: 'open', title: '🧬 变异测试日报 ' + process.env.STUB_YESTERDAY, user: { login: 'github-actions[bot]' } }
+    ])
+  }
+  if (method === 'PATCH' && url.endsWith('/issues/901')) return res(false, 500, { message: 'REMOTE-BODY-SHOULD-NOT-BE-LOGGED' })
+  if (method === 'PATCH' && url.endsWith('/issues/902')) return res(true, 200, {})
+  throw new Error('unexpected fetch: ' + method + ' ' + url)
+}
+`)
+    const env = { ...process.env, GITHUB_TOKEN: 'stub-token', GITHUB_REPOSITORY: 'owner/repo', STUB_CALLS_FILE: callsPath, STUB_TODAY: today, STUB_YESTERDAY: yesterday }
+    delete env.MUTATION_RUN_STARTED_AT // 夹具刚写盘 ⇒ 新鲜度闸门用默认 12h 即可，别让外部注入的起点判定干扰
+    // 用 spawnSync 而不是 runCli（execFileSync）：成功路径也要拿到 stderr（warn 就在那里），
+    // execFileSync 正常返回时只给 stdout，会把「warn 有没有打出来」这条断言变成恒真。
+    const r = spawnSync(process.execPath, ['-r', stubPath, SCRIPT, tmp, '--issue'], { encoding: 'utf8', env })
+    assert.strictEqual(r.status, 0, `一条历史日报 PATCH 500 不得让日报 job 变红，实际 exit ${r.status}；stderr：${r.stderr}`)
+    assert.ok(r.stdout.includes('✅ 日报已发布'), `当天日报必须照发，实际 stdout 缺该行：\n${r.stdout}`)
+    assert.ok(r.stderr.includes('HTTP 500'), `清理失败必须留 warn（含状态码），实际 stderr：${r.stderr}`)
+    assert.ok(r.stderr.includes('第 1/2 条'), `warn 应指出第几条失败，实际 stderr：${r.stderr}`)
+    assert.ok(!r.stderr.includes('REMOTE-BODY-SHOULD-NOT-BE-LOGGED'), `S5145：远端响应体不得进日志，实际 stderr：${r.stderr}`)
+    const calls = fs.readFileSync(callsPath, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    const by = (m, frag) => calls.filter(c => c.method === m && (!frag || c.url.includes(frag)))
+    assert.strictEqual(by('GET', 'state=all').length, 1, '去重查询一次')
+    assert.strictEqual(by('POST').length, 1, '当天日报创建一次')
+    assert.strictEqual(by('GET', 'state=open').length, 1, '清理候选查询一次')
+    const patches = by('PATCH')
+    assert.deepStrictEqual(patches.map(p => p.url.replace(/^.*\/issues\//, '')), ['901', '902'],
+      '两条历史日报都要尝试关闭（第一条失败后不得中断）')
+    for (const p of patches) {
+      assert.deepStrictEqual(p.body, { state: 'closed', state_reason: 'not_planned' }, 'PATCH 请求体口径')
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 console.log('test_mutation_report_cli OK')
