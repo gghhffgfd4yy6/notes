@@ -225,10 +225,19 @@ function run (ymlText) {
     assert.ok(files.every(f => !/^test_/.test(path.basename(f))), '展开清单不应含 test_*.js')
     assert.ok(files.every(f => !f.includes('node_modules')), '展开清单不应含 node_modules')
 
-    // 缺陷B回归：glob 展开应与 globMatcher 口径一致——被 glob 覆盖的仓库文件都在展开结果里
-    const expanded = files.filter(f => globMatcher('**/xbk_*.js').test(f))
-    assert.strictEqual(expanded.length, files.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).length,
-      '展开结果应与 globMatcher 覆盖口径一致')
+    // 缺陷B回归：glob 展开应与 globMatcher 口径一致——被 glob 覆盖的仓库文件都在展开结果里。
+    // 两个口径差异在此钉死，避免把「口径不同」误判成缺陷、也避免把「选错文件」放过去：
+    //   ① path.matchesGlob 的 `*`/`**` **不跨以 `.` 开头的路径段**（与 minimatch dot:false 同口径），
+    //      故 `.github/xbk_*.js` 这类隐藏目录文件不在 glob 覆盖范围内——基线必须同样排除 dot 段，
+    //      否则仓库里真出现隐藏目录下的 xbk_*.js 时，本断言会变成假红。
+    //   ② 断言比较**集合**而不是数量：数量相同但选错文件（多选一个、少选一个）同样必须红。
+    assert.strictEqual(globMatcher('**/xbk_*.js').test('.github/xbk_hidden.js'), false,
+      '**/xbk_*.js 不得匹配隐藏目录（dot:false 口径；基线据此排除 dot 段）')
+    const visibleFiles = files.filter(f => !f.split('/').some(seg => seg.startsWith('.')))
+    const byGlob = visibleFiles.filter(f => globMatcher('**/xbk_*.js').test(f)).sort()
+    const byBaseline = visibleFiles.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).sort()
+    assert.deepStrictEqual(byGlob, byBaseline,
+      `glob 展开结果必须与正则基线逐条一致（集合比较，防「数量相同但选错文件」）；glob 侧 ${byGlob.length} 条、基线 ${byBaseline.length} 条`)
     console.log('✅ globMatcher / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
   }
 
