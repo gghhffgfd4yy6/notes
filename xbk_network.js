@@ -102,7 +102,10 @@ function createNetwork ({
   PERMANENT_CODES = POLICY_PERMANENT_CODES,
   PKG_VERSION = '3.x',
   PROFILE3 = false,
-  logger = console
+  logger = console,
+  // 退避等待可注入：默认走 timers/promises（不经过 global.setTimeout）；测试要跳过 30s 钳制
+  // 用例时注入替身，而不是替换 global.setTimeout（后者对 timers/promises 无效）。
+  sleep = delay
 }) {
   // net-3：解析 api.timeout（口径见文件头 MIN_TIMEOUT_MS 说明）。被判非法的值不静默——告警留痕，便于把
   // 「请求超时」定位回「配置有问题」（非数值输入经 Utils.num 已回落到默认，与合法填写的默认值不可区分，
@@ -204,7 +207,8 @@ function createNetwork ({
               ? Math.min(retryAfterMs, RETRY_BACKOFF_CAP_MS)
               : Math.min(1000 * 2 ** attempt, RETRY_BACKOFF_CAP_MS) + crypto.randomInt(500)
             logger.log(`请求失败（${Utils.safeErrorText(e, 'unknown')}），${wait / 1000}s 后重试（第 ${attempt + 1}/${maxRetry} 次）${byServer ? '（按 Retry-After）' : ''}...`)
-            await delay(wait)
+            // 走注入的 sleep（默认 timers/promises）：测试注入替身即可跳过 30s 钳制用例的真等待。
+            await sleep(wait)
           }
         }
       }

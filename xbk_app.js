@@ -1,4 +1,5 @@
 const { setTimeout: delay } = require('node:timers/promises')
+const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 
 function createApp ({
   Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, FilterStore, Network, Pusher,
@@ -7,13 +8,6 @@ function createApp ({
   summarizeError, PROFILE3, PROFILE3_BOOT_MARKS, prewarmDns, prewarmTls,
   getNotify, PKG_VERSION, trimTrailingSlashes, compileUserRegex
 }) {
-  const tokenMatches = (actual, expected) => {
-    if (typeof actual !== 'string' || typeof expected !== 'string') return false
-    const actualBytes = Buffer.from(actual, 'utf8')
-    const expectedBytes = Buffer.from(expected, 'utf8')
-    if (actualBytes.length !== expectedBytes.length) return false
-    try { return typeof crypto?.timingSafeEqual === 'function' && crypto.timingSafeEqual(actualBytes, expectedBytes) } catch (e) { return false }
-  }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
   // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
@@ -22,19 +16,8 @@ function createApp ({
   // APP-05：所有「按天/按时刻」的呈现口径统一到硬编码 Asia/Shanghai——日志与台账时间戳
   // （_localStamp）、日报日界（_reportToday）、运行异常告警正文的时间、RE2 标记保留期的 cutoff。
   // 进程本地时区（如 CI runner 的 UTC）不参与其中：混用会让同一时刻的 run.log 行、日报日界与
-  // 告警时间互相错位一天/八小时。sv-SE + 24 小时制恰好输出 YYYY-MM-DD HH:mm:ss，与历史格式
-  // 逐字符一致（不破坏日志解析），其 YYYY-MM-DD 前缀同时是 RE2 标记名与 cutoff 的比较键。
-  // 中国无夏令时，日界稳定。
-  const shanghaiStampFormatter = new Intl.DateTimeFormat('sv-SE', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  })
+  // 告警时间互相错位一天/八小时。实现收敛到 xbk_utils 顶层的 shanghaiStamp（sv-SE + 24 小时制，
+  // 输出 YYYY-MM-DD HH:mm:ss 与历史格式逐字符一致），控制台访问日志共用同一份。
 
   const App = {
   // v3.176：运行日志时间戳本地化——曾 toISOString（UTC），UTC+8 用户凌晨 cron 排查时
@@ -42,7 +25,7 @@ function createApp ({
   // APP-05：修正口径不一致——原先用 getHours 等进程本地时区，注释却称与日报/告警「本地口径
   // 一致」（_reportToday 硬编码 Asia/Shanghai）；现统一为同一 Asia/Shanghai 口径，格式不变。
     _localStamp () {
-      return shanghaiStampFormatter.format(new Date())
+      return shanghaiStamp(new Date())
     },
 
     // 文件级安全检查：缓存目录安全并不等于目录内的单个文件安全。
@@ -359,7 +342,7 @@ function createApp ({
       if (!acquired) return
       try {
         try {
-          if (tokenMatches(fs.readFileSync(statePath, 'utf8'), token)) {
+          if (timingSafeEqualStr(fs.readFileSync(statePath, 'utf8'), token, crypto)) {
             const completed = JSON.parse(token)
             completed.status = 'completed'
             this._writeRe2WarnMarkerAtomic(statePath, JSON.stringify(completed))
@@ -376,7 +359,7 @@ function createApp ({
       if (!acquired) return
       try {
         try {
-          if (tokenMatches(fs.readFileSync(statePath, 'utf8'), token)) fs.unlinkSync(statePath)
+          if (timingSafeEqualStr(fs.readFileSync(statePath, 'utf8'), token, crypto)) fs.unlinkSync(statePath)
         } catch (ignore) { /* 删除失败不影响主流程 */ }
       } finally {
         this._releaseRe2WarnLock(statePath, acquired)
@@ -488,8 +471,8 @@ function createApp ({
         // 而这里原先用进程本地的 getFullYear/getMonth/getDate——修复只统一了标记名，
         // 日界基准被拆成两个：TZ=UTC 时标记名按 09-16 命名、cutoff 按 09-15 计算，保留期判定
         // 随之偏移一天（该删的留着、不该删的先删）。sv-SE 的 YYYY-MM-DD 前缀与标记名同格式，
-        // 故直接复用 shanghaiStampFormatter，字符串比较口径不变。
-        const cutoffStamp = shanghaiStampFormatter.format(cutoff).slice(0, 10)
+        // 故直接复用 shanghaiStamp，字符串比较口径不变。
+        const cutoffStamp = shanghaiStamp(cutoff).slice(0, 10)
         for (const name of fs.readdirSync(cacheDir)) {
           if (!name.startsWith(prefix)) continue
           const markerStamp = name.slice(prefix.length).split('.')[0] // 取日期段，忽略 .pid.time.reclaim 后缀

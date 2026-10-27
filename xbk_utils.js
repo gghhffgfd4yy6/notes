@@ -96,6 +96,50 @@ function normalize (o, depth = 0) {
   }
   return o
 }
+
+// ---------- 跨模块共用的小工具（顶层零 require 不变式） ----------
+// 恒定时间字符串比较：token / Cookie / 墓碑锁的归属校验共用一份实现。
+// crypto 由调用方注入（xbk_app / xbk_message_store 的组合根注入 crypto 以便测试替身）；
+// **省略第三个实参**才惰性 require——顶层仍然零 require，控制台只取常量时不会加载 crypto。
+// 显式传 null/undefined 视为「该调用方的 crypto 不可用」直接返回 false：组合根漏注入必须暴露，
+// 不能被内置实现静默补上（否则测试替身和缺依赖场景都失去意义）。
+function timingSafeEqualStr (a, b, cryptoImpl) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  let c = cryptoImpl
+  if (arguments.length < 3) { try { c = require('node:crypto') } catch (e) { return false } }
+  const ba = Buffer.from(a, 'utf8')
+  const bb = Buffer.from(b, 'utf8')
+  if (ba.length !== bb.length) return false
+  try { return typeof c?.timingSafeEqual === 'function' && c.timingSafeEqual(ba, bb) } catch (e) { return false }
+}
+
+// 上海时间戳（YYYY-MM-DD HH:mm:ss）：run.log 行首、访问日志共用同一口径。
+// Intl 惰性构造 + 兜底 ISO：ICU 异常不在模块加载期炸 import（控制台 accessStamp 的历史约束）。
+let SHANGHAI_STAMP_FMT = null
+function shanghaiStamp (now = new Date()) {
+  if (!SHANGHAI_STAMP_FMT) {
+    try {
+      SHANGHAI_STAMP_FMT = new Intl.DateTimeFormat('sv-SE', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+      })
+    } catch (e) { return now.toISOString() }
+  }
+  try { return SHANGHAI_STAMP_FMT.format(now) } catch (e) { return now.toISOString() }
+}
+
+// 上海日历日（YYYY-MM-DD）：日志/趋势窗口/日报日界共用。+8 固定偏移——上海无夏令时，
+// 与 Intl('en-CA', Asia/Shanghai) 恒等（本机实测），但省掉每行日志一次 Intl 构造。
+function shanghaiDayKey (value = Date.now()) {
+  const ms = value instanceof Date ? value.getTime() : value
+  return new Date(ms + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
 function createUtils (options = {}) {
   const fs = options.fs || require('node:fs')
   const safeRe = options.safeRe
@@ -1299,6 +1343,9 @@ module.exports = {
   FILTER_FIELDS,
   trimTrailingSlashes,
   normalize,
+  timingSafeEqualStr,
+  shanghaiStamp,
+  shanghaiDayKey,
   DAY_MS,
   TS_BOUND,
   MAX_CODE_POINT,

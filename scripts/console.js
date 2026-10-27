@@ -28,7 +28,7 @@ const etag = require('etag')
 const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
-const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES } = require('../xbk_utils')
+const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
 const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
 // 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
@@ -304,14 +304,9 @@ const ACTIONS = Object.freeze({
 const ENTRY_QINGLONG = path.join(ROOT, 'qinglong', 'xbk_push.js')
 const ENTRY_SINGLE = path.join(ROOT, 'xbk_function_v3.js')
 
+// 单一实现已收敛到 xbk_utils 顶层（控制台/编排器/消息存储共用）；此处保留同名包装供既有测试与导出引用。
 function timingSafeEqualStr (a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false
-  const ba = Buffer.from(a, 'utf8')
-  const bb = Buffer.from(b, 'utf8')
-  if (ba.length !== bb.length) return false
-  try {
-    return crypto.timingSafeEqual(ba, bb)
-  } catch (e) { return false }
+  return sharedTimingSafeEqualStr(a, b, crypto)
 }
 
 // token 可用性口径（Sourcery Medium G_ot）：isValidToken 此前只看长度，但 token 要同时
@@ -883,18 +878,9 @@ function formatMs (ms) {
 }
 
 // ── 访问日志（v3.300）──────────────────────────────────────────────────────
-let accessStampFmt = null
-function accessStamp (now = new Date()) {
-  // 惰性单例 + 兜底（D7）：sv-SE + Asia/Shanghai 与 run.log 留痕戳同参同输出；
-  // 顶层惰性而非 require 期构造——防 ICU 异常炸 import。at 是展示字段
-  // （数组下标即权威时序），格式 YYYY-MM-DD HH:mm:ss。
-  if (!accessStampFmt) {
-    try {
-      accessStampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
-    } catch (e) { return now.toISOString() }
-  }
-  try { return accessStampFmt.format(now) } catch (e) { return now.toISOString() }
-}
+// 时间戳口径与 run.log 留痕戳同源（xbk_utils.shanghaiStamp：sv-SE + Asia/Shanghai，惰性 Intl +
+// ICU 异常兜底）；at 是展示字段（数组下标即权威时序），格式 YYYY-MM-DD HH:mm:ss。
+const accessStamp = (now = new Date()) => shanghaiStamp(now)
 
 // 导出文件名的时间戳：YYYYMMDD-HHmmss（Asia/Shanghai，与 run.log 同口径，用户看到的就是北京时间）。
 // 纯 ASCII：Content-Disposition 的 filename= 放非 ASCII 时各浏览器落盘名不一致，
@@ -1150,18 +1136,7 @@ const SESSION_COOKIE = 'xbk_session'
 // Sourcery Critical G_4Ki：decodeURIComponent 对畸形序列（如 %）会抛 URIError——
 // 任何畸形 Cookie 都不能炸请求处理器：解析异常一律按「无有效 Cookie」处理。
 function sessionCookieValue (cookieHeader) {
-  if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return null
-  for (const part of cookieHeader.split(';')) {
-    const eq = part.indexOf('=')
-    if (eq <= 0) continue
-    const name = part.slice(0, eq).trim()
-    if (name === SESSION_COOKIE) {
-      const value = part.slice(eq + 1).trim()
-      if (value.length === 0) return null
-      try { return decodeURIComponent(value) } catch (e) { return null }
-    }
-  }
-  return null
+  return cookieValue(cookieHeader, SESSION_COOKIE)
 }
 // 主题记忆（v3.323）：只影响配色。CSP 是 script-src 'self'（禁内联脚本），前端无法在
 // 首帧前读 localStorage，所以选择放 Cookie，由服务端写进 <html data-theme>；前端切换时
@@ -1173,15 +1148,8 @@ const THEMES = ['deep', 'material', 'nord', 'light']
 // 顶部会先闪一下白——和根快照透明是同一类「漏白」，只是漏在浏览器 UI 上。
 const THEME_BG = Object.freeze({ deep: '#0b0f17', material: '#100e14', nord: '#1a1f27', light: '#f3f5f9' })
 function themeCookieValue (cookieHeader) {
-  if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return THEMES[0]
-  for (const part of cookieHeader.split(';')) {
-    const eq = part.indexOf('=')
-    if (eq <= 0) continue
-    if (part.slice(0, eq).trim() !== THEME_COOKIE) continue
-    const value = part.slice(eq + 1).trim()
-    return THEMES.includes(value) ? value : THEMES[0]
-  }
-  return THEMES[0]
+  const value = rawCookieValue(cookieHeader, THEME_COOKIE)
+  return THEMES.includes(value) ? value : THEMES[0]
 }
 // ── 两步验证（Google Authenticator / TOTP）──────────────────────────────────
 // 设计边界（v3.357）：只保护「浏览器打开控制台」这一步，接口仍沿用访问令牌。
@@ -1338,17 +1306,24 @@ function consumeRecoveryCode (record, code) {
   return null
 }
 
-function cookieValue (cookieHeader, name) {
+// Cookie 头解析的单一实现：rawCookieValue 只做分段/trim（主题这类自产 ASCII 值直接用，不 decode），
+// cookieValue 在其上叠加 decodeURIComponent + 畸形序列兜底。线性扫描，不用正则（CodeQL ReDoS 口径）。
+function rawCookieValue (cookieHeader, name) {
   if (typeof cookieHeader !== 'string' || cookieHeader.length === 0) return null
   for (const part of cookieHeader.split(';')) {
     const eq = part.indexOf('=')
     if (eq <= 0) continue
     if (part.slice(0, eq).trim() !== name) continue
     const value = part.slice(eq + 1).trim()
-    if (value.length === 0) return null
-    try { return decodeURIComponent(value) } catch (e) { return null }
+    return value.length === 0 ? null : value
   }
   return null
+}
+
+function cookieValue (cookieHeader, name) {
+  const raw = rawCookieValue(cookieHeader, name)
+  if (raw === null) return null
+  try { return decodeURIComponent(raw) } catch (e) { return null }
 }
 
 function twoFactorCookieValue (cookieHeader) {

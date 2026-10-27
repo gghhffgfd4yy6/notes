@@ -6,7 +6,7 @@ const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
 function makeNetwork (opts = {}) {
-  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders } = opts
+  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders, sleep } = opts
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
@@ -34,6 +34,7 @@ function makeNetwork (opts = {}) {
     crypto: { randomInt: () => 0 }, // 抖动固定为 0，退避仅由 1000*2^attempt 决定
     RETRYABLE_CODES,
     ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes }),
+    ...(sleep === undefined ? {} : { sleep }),
     logger: { log: (...args) => logs.push(args.join(' ')), warn: (msg) => warnings.push(String(msg)) }
   })
   return {
@@ -351,18 +352,18 @@ function makeNetwork (opts = {}) {
   }
 
   // 13e. 上限保护：Retry-After 给出超大等待（3600s）时钳到 30s（不得把单轮请求挂死）。
-  // 只把全局 setTimeout 替换成立即结算，断言落在日志里的等待值上（否则本用例要真等 30 秒）。
+  // 注入 sleep 替身立即结算，断言落在日志里的等待值上（否则本用例要真等 30 秒）。
   {
-    const realSetTimeout = global.setTimeout
-    global.setTimeout = (fn) => { fn(); return 0 }
-    try {
-      const { net, getLogs } = makeNetwork({ retry: 1, statusCode: 429, failTimes: 1, responseHeaders: { 'retry-after': '3600' } })
-      await net.fetchData()
-      assert.ok(getLogs().some(l => l.includes('30s 后重试') && l.includes('（按 Retry-After）')),
-        `超大 Retry-After 必须钳到 30s，实际：${JSON.stringify(getLogs())}`)
-    } finally {
-      global.setTimeout = realSetTimeout
-    }
+    const { net, getLogs } = makeNetwork({
+      retry: 1,
+      statusCode: 429,
+      failTimes: 1,
+      responseHeaders: { 'retry-after': '3600' },
+      sleep: async () => {}
+    })
+    await net.fetchData()
+    assert.ok(getLogs().some(l => l.includes('30s 后重试') && l.includes('（按 Retry-After）')),
+      `超大 Retry-After 必须钳到 30s，实际：${JSON.stringify(getLogs())}`)
   }
 
   // 13f. net-7 返工（V5 打回）：HTTP-date 分支改为严格 RFC 9110 白名单（IMF-fixdate / rfc850 / asctime）

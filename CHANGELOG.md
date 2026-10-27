@@ -1083,3 +1083,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - 代价（如实）：源码净增约 145 行、首屏 +6.4KB gzip；换来的是弹窗焦点不再跑出遮罩、下拉/气泡在贴边与滚动时位置正确。
 - 副作用：`scripts/console.js` 的静态资产白名单与 `modulepreload` 各加 1 条（新 vendor 文件必须登记，否则整页白屏）；`.codacy.yml`/`.sourcery.yaml` 对 vendor 产物加排除；版本 3.384.0。
 
+## v3.385 — 重构：三组仓内重复收敛为单一实现
+
+- 去重：`timingSafeEqualStr`（编排器/消息存储/控制台 3 份）、上海时间戳与日历日（run.log 戳/RE2 cutoff/访问日志/趋势窗口/日报 5 处）、Cookie 头解析（会话/主题/2FA/设备 4 份）各收敛为一份实现；共用实现放在 `xbk_utils` 顶层（顶层零 require 不变，crypto 惰性加载/可注入），控制台 Cookie 走 `rawCookieValue` + `cookieValue`，仍是线性扫描不用正则。
+- 可测性：`xbk_network` 的退避等待改为可注入 `sleep`（默认 `timers/promises`），Retry-After 上限用例注入替身跳过 30s 真等待——替换 `global.setTimeout` 对 `timers/promises` 无效。
+- 语义收口：`timingSafeEqualStr` 显式传 `null`/`undefined` 视为「调用方 crypto 不可用」返回 false，只有省略第三参才回落内置实现——组合根漏注入必须暴露。
+- 未采纳：`globToRegExp → path.matchesGlob`（`[a--b]` 这类歧义字符类语义不同，会把未覆盖文件误判为已覆盖，等于闸门假绿）；`sleep → timers/promises`（鸭子 signal 缺 `removeEventListener` 时 Node 直接抛错，现有守卫正是防这个）。
+- 测试：`test_utils_pure` 291 项（新增三组共用实现单测）；控制台 282 项、应用 168 项、消息存储 135 项、日报 96 项全绿。
+- 版本 3.385.0。

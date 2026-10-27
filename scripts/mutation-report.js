@@ -7,6 +7,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { stripVTControlCharacters } = require('node:util')
+const { shanghaiDayKey } = require('../xbk_utils')
 const { readReportJson, writeStrippedReport, resolveMaxReportBytes } = require('./mutation-json.js')
 
 // 必须与 mutation.yml 的矩阵名称保持一致；缺段时禁止把部分结果伪装成完整日报。
@@ -1450,9 +1451,7 @@ async function postIssue (body) {
  * @returns {string} 上海自然日
  */
 function shanghaiDate (now = new Date()) {
-  return new Intl.DateTimeFormat('sv-SE', {
-    timeZone: 'Asia/Shanghai'
-  }).format(now)
+  return shanghaiDayKey(now)
 }
 
 /**

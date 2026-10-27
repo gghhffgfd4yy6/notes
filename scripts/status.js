@@ -3,6 +3,10 @@
 const path = require('node:path')
 const { readSafeTextResult } = require('../xbk_storage')
 const { defaultMessageSignature } = require('./message-signature')
+// 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧固定按 Asia/Shanghai 写，趋势窗口/输出键
+// 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
+// （审查 Sourcery PR#227）。实现与 run.log 戳/日报日界同源（xbk_utils.shanghaiDayKey）。
+const { shanghaiDayKey } = require('../xbk_utils')
 
 const FILES = {
   run: 'run.log',
@@ -16,13 +20,9 @@ function result (status, value) {
   return { status, ...(value === undefined ? {} : { value }) }
 }
 
-// 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧 _localStamp 固定按 Asia/Shanghai 写，
-// 趋势窗口/输出键必须用同一日历日，否则宿主为 UTC（本机就是）时每天 00:00–08:00 的轮次
-// 会被算进前一天/后一天（审查 Sourcery PR#227）。fixed offset +8：上海无夏令时，恒定偏移安全。
-const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000
-function shanghaiDayKey (ms) {
-  return new Date(ms + SHANGHAI_OFFSET_MS).toISOString().slice(0, 10)
-}
+// 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧固定按 Asia/Shanghai 写，趋势窗口/输出键
+// 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
+// （审查 Sourcery PR#227）。实现与 run.log 戳/日报日界同源（xbk_utils.shanghaiDayKey）。
 
 // 日志类部件（run.log / filter-diagnostics.ndjson）的读取上限与取尾部选项（审查 SS-03）。
 // 上限与写入侧 xbk_app 的截尾阈值同为 1 MiB，但写入侧在拿不到日志锁时是 fail-open（只追加、
