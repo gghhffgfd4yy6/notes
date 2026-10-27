@@ -254,7 +254,23 @@ async function aok (name, fn) {
   }
 }
 
-function tmpDir () { return fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-test-')) }
+// 本进程建的沙箱登记表 + 退出统一收割。**必须删干净**：这些目录名都以 `xbk-` 开头，
+// 而 `scripts/check-host-clean.js` 的判据正是「os.tmpdir()/xbk-* 且活跃时间 >30min」——
+// 漏删一次就等于给 30 分钟后的 `npm test` 埋一颗 fail-closed 地雷（本机实测：单跑一遍
+// 控制台套件留下 ~130 个目录，连跑几次就是几百个）。用例自己删过的走 force 静默，重复删除无害。
+const tmpDirs = new Set()
+function mkTmp (prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+  tmpDirs.add(dir)
+  return dir
+}
+function tmpDir () { return mkTmp('xbk-console-test-') }
+
+process.on('exit', () => {
+  for (const dir of tmpDirs) {
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch (e) {}
+  }
+})
 
 // v3.340：每组设置用例自带 stateDir + server，退出时关服务并删沙箱——一段失败不影响其它段，
 // 也不会因为漏关监听句柄把整套件挂到超时（旧版 60+ 断言挤在一个 aok 里，首错就吞掉余下全部）。
@@ -1054,7 +1070,7 @@ async function filterServer (dir) {
 
 async function filterRuleApiTests () {
   await aok('过滤规则 GET: 代码默认/覆盖/损坏三态 + Cookie 读面与 applied/auditChain', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     try {
       const defRes = await request(port, 'GET', '/api/config/filter', { headers: { cookie: `xbk_session=${TOKEN}` } })
@@ -1088,7 +1104,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则写鉴权: 无 Bearer 401 / 仅 Cookie 401 cookie_not_allowed / ?token= 400（即使带 Bearer）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const payload = { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '鉴权词' } }
     try {
@@ -1118,7 +1134,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则草稿: 服务器读/写/删 + 0600 + 正式保存清草稿 + revision 冲突', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1183,7 +1199,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则写端点: 415（text/plain、Content-Encoding:gzip）与 413（>64KiB）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     try {
       const plain = await request(port, 'POST', '/api/config/filter', {
@@ -1210,7 +1226,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 POST: 非法规则 400 且不落盘；合法保存 0600 + revision+1 + changedFields', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1257,7 +1273,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 POST: 409 revision_mismatch 带当前 revision；409 锁占用带 Retry-After 且不覆盖文件', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1283,7 +1299,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 POST: 损坏文件 409 store_corrupt；confirmReplaceCorrupt 后可按 revision 0 覆盖', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1306,7 +1322,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 restore: 备份（保留 3 代 0600）+ 回滚 revision+1 + baseRevision 闸 + 恢复默认写空覆盖（不删文件）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1369,7 +1385,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 备份只留最近 3 代；>10s 陈旧锁可接管', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1392,7 +1408,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤锁: 持有者进程还活着 → 绝不接管（即使 mtime 已过期）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1411,7 +1427,7 @@ async function filterRuleApiTests () {
     let re2Ok = false
     try { require('re2'); re2Ok = true } catch (e) { re2Ok = false }
     if (!re2Ok) { console.log('  ⏭ 跳过：本机无 re2（深度校验按设计跳过）'); return }
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1428,7 +1444,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 审计文件接近 4 MiB（差 512B）→ 507 audit_full（预留行宽）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1492,7 +1508,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: GET 的 override 只含文件中实际字段；用真实前端候选保存不会删掉其他覆盖项', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1550,7 +1566,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则审计: 0600 / 不含规则正文与路径 / prevHash 链可复算 / 手改一行后 GET 报断链', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1596,7 +1612,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 preview: _f 补推统计（不用 readMessages）+ limit 钳制 + capped(>5000)', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const pushPath = path.join(dir, 'push.json')
     const nowS = Math.floor(Date.now() / 1000)
@@ -1640,7 +1656,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 POST: re2 不可用 → 503 engine_unavailable 且不落盘', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const { setFilterDepsForTests } = require('./scripts/console')
     try {
@@ -1660,7 +1676,7 @@ async function filterRuleApiTests () {
     }
   })
   await aok('过滤规则 POST: 写盘失败（目标是目录）→ 500 write_failed 且锁释放', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1682,7 +1698,7 @@ async function filterRuleApiTests () {
 
   // ── 评审修复靶向用例（Sourcery 12 项）────────────────────────────────────
   await aok('过滤锁: 两个写者同判同一把旧锁过期 → 只有先到者完成接管（rename + inode 核验）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-lock-'))
+    const dir = mkTmp('xbk-console-filter-lock-')
     const paths = filterPaths(dir)
     try {
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 1 }), { mode: 0o600 })
@@ -1707,7 +1723,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 审计写失败 → 500 audit_failed 且回滚覆盖文件；失败保存不剪最老备份', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1730,7 +1746,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 预置 symlink 的审计文件 → 500 audit_failed 且不写目标文件', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     const target = path.join(dir, 'audit-target.txt')
@@ -1747,7 +1763,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 审计超 4 MiB → 507 audit_full 且不写规则文件', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1763,7 +1779,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 备份失败 → 500 backup_failed 且不替换当前覆盖文件', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
@@ -1782,7 +1798,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 preview: 推送历史不可读 → available:false / 计数为 null（不显示 0 影响）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const pushPath = path.join(dir, 'push.json')
     try {
@@ -1814,7 +1830,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 preview: zkt_gjc 白名单排除标题不匹配的记录（与运行期同源）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const pushPath = path.join(dir, 'push.json')
     const nowS = Math.floor(Date.now() / 1000)
@@ -1846,7 +1862,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则 preview: capped 按 _f 条数判定（6000 条普通 + 3 条 _f → capped:false）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-filter-'))
+    const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const pushPath = path.join(dir, 'push.json')
     const nowS = Math.floor(Date.now() / 1000)
@@ -1890,7 +1906,7 @@ async function filterRuleApiTests () {
 
 async function backupApiTests () {
   await aok('数据备份: 导出只含勾选类别，自动运行只写间隔不写开关', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const dir = mkTmp('xbk-console-backup-')
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }, { id: 2, title: 'b' }]))
     fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
     fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
@@ -1935,7 +1951,7 @@ async function backupApiTests () {
   })
 
   await aok('数据备份: 导出校验过滤规则，坏规则跳过不拖累整包', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const dir = mkTmp('xbk-console-backup-')
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'a' }]))
     fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: '(' } }))
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
@@ -1958,7 +1974,7 @@ async function backupApiTests () {
   })
 
   await aok('数据备份: 坏消息条目拒绝导入；中途写失败整体回滚', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const dir = mkTmp('xbk-console-backup-')
     const pushPath = path.join(dir, 'push.json')
     fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
@@ -2002,7 +2018,7 @@ async function backupApiTests () {
   })
 
   await aok('数据备份: 判重历史随消息恢复，重复导入按幂等键返回原结果', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const dir = mkTmp('xbk-console-backup-')
     const pushPath = path.join(dir, 'push.json')
     const seenPath = path.join(dir, 'push.json.seen.json')
     fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
@@ -2038,7 +2054,7 @@ async function backupApiTests () {
   })
 
   await aok('数据备份: 导入自动识别并恢复，未含类别不动，自动运行开关保持停止', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-backup-'))
+    const dir = mkTmp('xbk-console-backup-')
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 1, title: 'old' }]))
     fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
     fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
@@ -2274,7 +2290,7 @@ async function lineSearchTests () {
   })
 
   await aok('线报搜索 HTTP: 代理参数/60s 缓存/上游失败三态 + 关注词增删读', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-line-'))
+    const dir = mkTmp('xbk-console-line-')
     const fetched = []
     let mode = 'ok'
     // 第 2 页夹具：用于验证「每页 N 条」跨 100 条边界时会去取上游第 2 页。
@@ -2428,7 +2444,7 @@ async function lineSearchTests () {
 
 async function watchMonitorTests () {
   await aok('关注词监控: 有新的逐条推/没新的不推/推过的落盘重启不重推/失败重试', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch-'))
+    const dir = mkTmp('xbk-console-watch-')
     const pageOne = LINE_SEARCH_FIXTURE
     const anchorSecond = {
       q: '十月稻田', lastReadAt: Date.UTC(2026, 9, 24, 8, 55), lastReadId: 'haodan-7303544', sentIds: []
@@ -2508,7 +2524,7 @@ async function watchMonitorTests () {
 
   await aok('关注词监控: 两条新线报逐条推送（不汇总），中途停用立即停止', async () => {
     const mk = () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch2-'))
+      const dir = mkTmp('xbk-console-watch2-')
       saveWatchState(dir, {
         limit: 1, // 故意设 1：监控必须翻到上次位置，不能只推最新 limit 条
         intervalMin: 10,
@@ -2562,7 +2578,7 @@ async function watchMonitorTests () {
   })
 
   await aok('关注词监控: 同一分钟多条按顺序推进锚点，下一轮不重复', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-watch3-'))
+    const dir = mkTmp('xbk-console-watch3-')
     const ts = Date.UTC(2026, 9, 25, 10, 0)
     const html = `<html><body><ul class="new-post">
 <li class="article-list"><p class="title"><time title="2026-10-25 18:00">18:00</time><a href="/haodan/9000001.html" title="同分钟 A" data-price="">同分钟 A</a></p></li>
@@ -3097,7 +3113,7 @@ async function main () {
     const { pathToFileURL } = require('node:url')
     const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
     const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
-    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-mod-'))
+    const modDir = mkTmp('xbk-api-mod-')
     const realFetch = globalThis.fetch
     const realDocument = globalThis.document
     const realWindow = globalThis.window
@@ -3175,7 +3191,7 @@ async function main () {
     const { pathToFileURL } = require('node:url')
     const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
     const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
-    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-timeout-'))
+    const modDir = mkTmp('xbk-api-timeout-')
     const stalled = http.createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.write('{"partial":')
@@ -3249,7 +3265,7 @@ async function main () {
     const { pathToFileURL } = require('node:url')
     const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
     const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
-    const modDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-api-once-'))
+    const modDir = mkTmp('xbk-api-once-')
     const realFetch = globalThis.fetch
     const realDocument = globalThis.document
     const realWindow = globalThis.window
@@ -4446,7 +4462,7 @@ async function main () {
     server.close()
   })
   await aok('HTTP: SIGTERM 优雅关闭——锁帧 released + 子进程被杀 + 退出码 0（端到端）', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-console-e2e-'))
+    const dir = mkTmp('xbk-console-e2e-')
     const lockFile = path.join(dir, 'console-trigger.lock')
     const child = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
       env: {
@@ -5524,7 +5540,7 @@ async function main () {
     assert.strictEqual(norm(rel.stdout.trim()), defaultDir, '相对路径 XBK_CACHE_DIR 必须被运行侧忽略')
     assert.match(String(rel.stderr), /XBK_CACHE_DIR 不是绝对路径（rel\/cache）/, '忽略相对路径必须告警')
     // 绝对路径（含项目根外）：两侧都原样采纳，控制台读的就是运行侧写的
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-abs-'))
+    const outside = mkTmp('xbk-cache-abs-')
     const prev = process.env.XBK_CACHE_DIR
     try {
       const abs = run(outside)
@@ -5609,7 +5625,7 @@ async function main () {
       ['2026-10-15 11:00:00', '2026-10-15 09:00:00'], '「仅运行」在服务端排除取消留痕')
   })
   await aok('createConsole: 注入 stateDir 优先于全局缓存；显式 runHistoryDir 可覆盖（Sourcery 注入目录被绕过）', async () => {
-    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-dir-'))
+    const runtime = mkTmp('xbk-runtime-dir-')
     const state = tmpDir()
     fs.writeFileSync(path.join(runtime, 'run.log'),
       '2026-10-15 09:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1s cachesaved=1\n')
@@ -8195,7 +8211,7 @@ async function main () {
     assert.strictEqual((src.match(/flatpickr\(/g) || []).length, 1, 'flatpickr 只允许在 DateRange 里初始化一次（必须真的调了一次）')
     // 趋势服务端：区间优先于 days（与推送记录同口径）
     // 同样不能读源码文本（status.js 也在变异矩阵里）：直接调 readTrends 验行为。
-    const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'xbk-trends-'))
+    const tmpDir = mkTmp('xbk-trends-')
     try {
       fs.writeFileSync(path.join(tmpDir, 'run.log'), '')
       const { readTrends } = require('./scripts/status.js')
