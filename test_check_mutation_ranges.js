@@ -1,6 +1,6 @@
 'use strict'
 
-// check-mutation-ranges.js 导出 globToRegExp / listRepoJsFiles 供直接 require 复用，失败收场收敛到
+// check-mutation-ranges.js 导出 globMatcher / listRepoJsFiles 供直接 require 复用，失败收场收敛到
 // exitIfDirectRun（直跑 process.exit、被 require 则 throw）；夹具 yml 通过 MUTATION_WORKFLOW_TEXT 注入。
 const assert = require('assert')
 const fs = require('fs')
@@ -173,45 +173,49 @@ function run (ymlText) {
   }
 
   // ===== glob 相关断言（缺陷C/缺陷B 的回归，qodo #4/#5）=====
-  // globToRegExp / listRepoJsFiles 现已被 check-mutation-ranges.js 导出；本文件被 require 时
+  // globMatcher / listRepoJsFiles 现已被 check-mutation-ranges.js 导出；本文件被 require 时
   // 该脚本不会用 process.exit 结束本测试进程——失败收场收敛到 exitIfDirectRun：直接运行 exit、
-  // 被 require 则 throw（健康仓库下不抛）。直接驱动纯函数断言：
+  // 被 require 则 throw（健康仓库下不抛）。直接驱动谓词断言：
   //   - 合法 glob（含 *、?、{a,b} 交替、[字符类]、[!取反]、双星 **）覆盖判定不误报
   //   - `**`（globstar）必须能跨目录分隔符（根级 0 层 / 单层 / 多层嵌套均判为覆盖），不误报 configMissing
   //   - malformed（含 [[、乱序范围 [z-a]、未闭合 [）按字面处理、不抛异常
-  const { globToRegExp, listRepoJsFiles } = require('./scripts/check-mutation-ranges.js')
+  // 实现是 `path.matchesGlob` 的薄壳（匹配语义交给 Node 内置的 minimatch 口径）：下列全部是**行为**
+  // 断言，不依赖「生成的正则源码」，将来再换实现也锁得住语义。表里的行与 B-class-diffs.md B3 的实测
+  // 对照一一对应，已有的等价断言直接复用、不另写一份。
+  const { globMatcher, listRepoJsFiles } = require('./scripts/check-mutation-ranges.js')
   {
-    // globstar 跨目录：'**/xbk_*.js' 必须匹配根级与任意层嵌套
-    const xbkRe = globToRegExp('**/xbk_*.js')
-    for (const f of ['xbk_a.js', 'src/xbk_b.js', 'src/deep/nested/xbk_c.js']) {
-      assert.ok(xbkRe.test(f), `'**/xbk_*.js' 应匹配 ${f}（根级 0 层/单层/多层嵌套），不误报 configMissing`)
+    const globCases = [
+      // [pattern, 输入路径, 期望] —— 前 9 条即 B3 实测对照（B3 第 10-12 行是 malformed，见下面的循环）
+      ['**/xbk_*.js', 'xbk_utils.js', true], // B3-1 根级 0 层：`**/` 匹配零个目录段
+      ['**/xbk_*.js', 'scripts/xbk_x.js', true], // B3-2 单层
+      ['**/xbk_*.js', 'src/deep/nested/xbk_c.js', true], // 多层嵌套
+      ['**/xbk_*.js', 'xbk_app/bin.js', false], // 只跨目录：末段必须真是 xbk_*.js
+      ['**/xbk_*.js', 'other.js', false],
+      ['xbk_*', 'xbk_utils.js', true], // B3-3
+      ['xbk_*', 'scripts/xbk_utils.js', false], // 单星不跨 /
+      ['xbk_*.js', 'scripts/a.js', false], // B3-4
+      ['src/**', 'src/a.js', true],
+      ['src/**', 'src/a/b.js', true], // B3-5 末尾 `**` 递归
+      ['src/**', 'src.js', false],
+      ['{a,b}.js', 'a.js', true], // B3-6 交替
+      ['{a,b}.js', 'b.js', true],
+      ['{a,b}.js', 'c.js', false],
+      ['[a-c]x.js', 'bx.js', true], // B3-7 字符类
+      ['[a-c]x.js', 'dx.js', false],
+      ['[!a-z]x.js', '1x.js', true], // B3-8 取反类
+      ['[!a-z]x.js', 'ax.js', false], // B3-9
+      ['?bk.js', 'xbk.js', true] // `?` 只吃一个字符
+    ]
+    for (const [pattern, file, expected] of globCases) {
+      assert.strictEqual(globMatcher(pattern).test(file), expected,
+        `glob '${pattern}' 对 ${file} 应判 ${expected}（判错会让 configMissing/configExtra 误报）`)
     }
-    assert.ok(!xbkRe.test('xbk_app/bin.js'), "'**/xbk_*.js' 不应匹配 xbk_app/bin.js")
-    assert.ok(!xbkRe.test('other.js'), "'**/xbk_*.js' 不应匹配 other.js")
 
-    // 普通 `*` 不跨目录分隔符
-    const starRe = globToRegExp('xbk_*')
-    assert.ok(starRe.test('xbk_utils.js'), "'xbk_*' 应匹配根级文件")
-    assert.ok(!starRe.test('src/xbk_utils.js'), "'xbk_*' 不应跨 / 匹配子目录（单星语义）")
-
-    // 末尾 `**` 递归匹配其后所有层（scripts/**）
-    const dirRe = globToRegExp('src/**')
-    assert.ok(dirRe.test('src/a.js'), "'src/**' 应匹配 src/a.js")
-    assert.ok(dirRe.test('src/d/b.js'), "'src/**' 应递归匹配深层文件")
-    assert.ok(!dirRe.test('src.js'), "'src/**' 不应匹配 src.js")
-
-    // 交替 / 字符类 / 取反类
-    assert.ok(globToRegExp('{a,b}.js').test('a.js'), "'{a,b}.js' 应匹配 a.js")
-    assert.ok(globToRegExp('{a,b}.js').test('b.js'), "'{a,b}.js' 应匹配 b.js")
-    assert.ok(!globToRegExp('{a,b}.js').test('c.js'), "'{a,b}.js' 不应匹配 c.js")
-    assert.ok(globToRegExp('[a-c]x.js').test('bx.js'), "字符类 '[a-c]x.js' 应匹配 bx.js")
-    assert.ok(!globToRegExp('[a-c]x.js').test('dx.js'), "字符类 '[a-c]x.js' 不应匹配 dx.js")
-    assert.ok(globToRegExp('[!a-z]x.js').test('1x.js'), "取反类 '[!a-z]x.js' 应匹配 1x.js")
-    assert.ok(!globToRegExp('[!a-z]x.js').test('ax.js'), "取反类 '[!a-z]x.js' 不应匹配 ax.js")
-
-    // malformed：非法/不安全 glob 按字面处理且不抛异常
+    // malformed：非法/不安全的 glob 既不抛异常、也不因参与匹配而抛（B3 第 10-12 行给的就是这组：
+    // [[ / [z-a] / [a- / {a, / a**b / *.）
     for (const bad of ['[[', '[z-a]', '[a-', '{a,', 'a**b', '*.']) {
-      assert.doesNotThrow(() => globToRegExp(bad), `malformed glob '${bad}' 不抛异常`)
+      assert.doesNotThrow(() => globMatcher(bad), `malformed glob '${bad}' 不抛异常`)
+      assert.doesNotThrow(() => globMatcher(bad).test('xbk_utils.js'), `malformed glob '${bad}' 参与匹配也不抛异常`)
     }
 
     // 展开出的仓库文件（listRepoJsFiles）：忽略 test_*.js / node_modules / .git
@@ -221,11 +225,22 @@ function run (ymlText) {
     assert.ok(files.every(f => !/^test_/.test(path.basename(f))), '展开清单不应含 test_*.js')
     assert.ok(files.every(f => !f.includes('node_modules')), '展开清单不应含 node_modules')
 
-    // 缺陷B回归：glob 展开应与 globToRegExp 口径一致——被 glob 覆盖的仓库文件都在展开结果里
-    const expanded = files.filter(f => globToRegExp('**/xbk_*.js').test(f))
-    assert.ok(expanded.length === files.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).length,
-      '展开结果应与 globToRegExp 覆盖口径一致')
-    console.log('✅ globToRegExp / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
+    // 缺陷B回归：glob 展开应与 globMatcher 口径一致——被 glob 覆盖的仓库文件都在展开结果里。
+    // 两个口径差异在此钉死，避免把「口径不同」误判成缺陷、也避免把「选错文件」放过去：
+    //   ① path.matchesGlob 的 `*`/`**` **不跨以 `.` 开头的路径段**（与 minimatch dot:false 同口径），
+    //      故 `.github/xbk_*.js` 这类隐藏目录文件不在 glob 覆盖范围内——基线必须同样排除 dot 段，
+    //      否则仓库里真出现隐藏目录下的 xbk_*.js 时，本断言会变成假红。
+    //   ② 断言比较**集合**而不是数量：数量相同但选错文件（多选一个、少选一个）同样必须红。
+    assert.strictEqual(globMatcher('**/xbk_*.js').test('.github/xbk_hidden.js'), false,
+      '**/xbk_*.js 不得匹配隐藏目录（dot:false 口径；基线据此排除 dot 段）')
+    const visibleFiles = files.filter(f => !f.split('/').some(seg => seg.startsWith('.')))
+    // 显式比较器：默认 sort() 按 UTF-16 码元排，Sonar S2871 要求显式口径（此处与默认一致，只为可读）
+    const byPath = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+    const byGlob = visibleFiles.filter(f => globMatcher('**/xbk_*.js').test(f)).sort(byPath)
+    const byBaseline = visibleFiles.filter(f => /(?:^|\/)xbk_.*\.js$/.test(f)).sort(byPath)
+    assert.deepStrictEqual(byGlob, byBaseline,
+      `glob 展开结果必须与正则基线逐条一致（集合比较，防「数量相同但选错文件」）；glob 侧 ${byGlob.length} 条、基线 ${byBaseline.length} 条`)
+    console.log('✅ globMatcher / listRepoJsFiles 断言通过（* ? {a,b} [类] [!取反] ** 与 malformed）')
   }
 
   // ===== 非法 mutate 行段必须 fail-loud（#136 review F1）：旧实现静默跳过该文件的整段校验 =====
@@ -354,30 +369,28 @@ function run (ymlText) {
       assert.strictEqual(r.status, 1, '矩阵含不认识的段名必须非 0')
       assert.ok((r.stderr + r.stdout).includes('zzz-not-a-real-segment'), `必须点名陌生的段名：${r.stderr.slice(0, 220)}`)
     }
-    // CMR-09 globToRegExp 字符类里连字符的两种边界（语义以实测为准，不凭猜写断言）：
-    //   · 类首/类尾的 `-` 是字面量成员（L302 的 k===0 / k===cls.length-1 分支）：`[-a]`、`[a-]`
-    //     都匹配 `-` 与 `a`；字符类只吃**一个**字符，所以 `[-a]x.js` 这类写法永远匹配不到。
-    //   · 连续 `--` 无法确定范围语义（L305）⇒ 实现把整个方括号**降级为字面文本**，而不是
-    //     “退化成含 - 的字符类”。若有人改成后者，`[a--b].js` 会开始匹配 a.js/b.js（误杀文件）。
+    // CMR-09 字符类里连字符的边界（语义以实测为准，不凭猜写断言）：
+    //   · 类首/类尾的 `-` 是字面量成员：`[-a]`、`[a-]` 都匹配 `-` 与 `a`；字符类只吃**一个**字符，
+    //     所以 `[-a]x.js` 这类写法永远匹配不到具名文件。
+    //   · `[a--b]` 这类连续 `-` 的歧义类：薄壳前的实现把整个方括号降级为字面文本，`path.matchesGlob`
+    //     按 minimatch 解析（具体解析细节属 upstream，未在本仓锁定）。这里只锁「不抛异常」——本仓
+    //     stryker.config.js 没有任何 glob 条目，歧义类在调用面不可达；锁 upstream 细节只会在 Node
+    //     升级时误报。
+    //   · 断言一律走行为（`.test()`），不再断言生成的正则源码：薄壳没有正则可断言。
     {
-      const { globToRegExp } = require('./scripts/check-mutation-ranges.js')
-      const lead = globToRegExp('[-a].js')
-      const tail = globToRegExp('[a-].js')
-      assert.strictEqual(String(lead), '/^[-a]\\.js$/', '类首的 - 必须原样保留为字面量成员')
-      assert.strictEqual(String(tail), '/^[a-]\\.js$/', '类尾的 - 必须原样保留为字面量成员')
+      const { globMatcher } = require('./scripts/check-mutation-ranges.js')
+      const lead = globMatcher('[-a].js')
+      const tail = globMatcher('[a-].js')
       assert.ok(lead.test('-.js') && lead.test('a.js'), '[-a] 必须同时匹配 -.js 与 a.js')
       assert.ok(tail.test('-.js') && tail.test('a.js'), '[a-] 必须同时匹配 -.js 与 a.js')
       assert.ok(!lead.test('x.js') && !tail.test('x.js'), '类内未列出的字符不得被匹配')
       assert.ok(!lead.test('-x.js'), '字符类只吃一个字符：[-a]x.js 不得被匹配（写成长名即失配）')
 
-      const deg = globToRegExp('[a--b].js')
-      assert.ok(String(deg).includes('\\['), `连续 - 时方括号必须整体降级为字面文本，实际 ${String(deg)}`)
-      assert.ok(deg.test('[a--b].js'), '降级后必须只匹配该字面文件名')
-      for (const other of ['a.js', 'b.js', '-.js', 'c.js']) {
-        assert.ok(!deg.test(other), `降级为字面后不得匹配 ${other}（若被当成字符类处理就会误杀这些文件）`)
-      }
-      assert.ok(globToRegExp('[a-c].js').test('b.js') && !globToRegExp('[a-c].js').test('d.js'),
-        '对照：合法的 a-c 范围必须仍然生效（不得把降级分支写成默认行为）')
+      assert.doesNotThrow(() => globMatcher('[a--b].js').test('[a--b].js'),
+        '歧义字符类（连续 -）不得抛异常')
+
+      assert.ok(globMatcher('[a-c].js').test('b.js') && !globMatcher('[a-c].js').test('d.js'),
+        '对照：合法的 a-c 范围必须仍然生效（不得因为歧义类的处理把范围分支写成默认行为）')
     }
   }
 
