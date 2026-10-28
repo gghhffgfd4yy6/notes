@@ -163,6 +163,12 @@ function runSuite (s) {
     try {
       child = spawn(process.execPath, [file], {
         cwd: __dirname,
+        // 套件自成进程组组长（setsid，C10-003 / 与 run_tests.js 的 detached:true 同口径）：
+        // 套件会派生后代（test_console.js spawn console.js、test_app_p.js fork 并行调度最典型），后代继承
+        // fd1/fd2。只杀直接子进程时，孤儿后代仍持有管道 ⇒ CI（pipe）形态下 close 被拖到后代退出才来
+        // （实测 1500ms 上限下入口 12125ms 才返回），本地（inherit）形态下入口退出后后代还在跑。
+        // detached 让 child.pid 即进程组 id，超时/输出超限时 kill(-pid) 整组收口（见下面的 kill）。
+        detached: true,
         // stderr 直通（inherit）：CI 下随组收集并在组内回放；本地保持 inherit（与旧 execFileSync 同口径）
         stdio: ['ignore', collect ? 'pipe' : 'inherit', collect ? 'pipe' : 'inherit']
       })
@@ -171,7 +177,18 @@ function runSuite (s) {
       settle({ ok: false, ms: Date.now() - t0, error: e })
       return
     }
-    const kill = () => { try { child.kill('SIGKILL') } catch (e) { /* 进程已退出 */ } }
+    // 超时（UNIT_TIMEOUT）与输出超限（ENOBUFS）后的**整组**杀伤：先 kill(-pid) 连同套件 fork 的后代，
+    // 再退回只杀直接子进程。容错口径同 run_tests.js 的 killSuiteTree：组不存在（ESRCH：子进程未及 setsid
+    // 或已被回收）或无权限（EPERM）时静默退回修复前行为；都不抛错、都不改结算口径——close 里仍按
+    // overflowed/timedOut 判失败，退出码与汇总三数字不变（fail-closed 语义）。
+    const kill = () => {
+      if (!Number.isInteger(child.pid) || child.pid <= 0) return
+      try {
+        process.kill(-child.pid, 'SIGKILL')
+      } catch (e) {
+        try { child.kill('SIGKILL') } catch (e2) { /* 进程已退出 */ }
+      }
+    }
     const timer = setTimeout(() => { timedOut = true; kill() }, UNIT_TIMEOUT)
     if (collect) {
       child.stdout.on('data', (chunk) => {

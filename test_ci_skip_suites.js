@@ -1258,6 +1258,75 @@ try {
   fs.rmSync(summaryDir, { recursive: true, force: true })
 }
 
+// 3g6 run_unit_tests.js 每套件超时的「整组杀伤」（C10-003）：姊妹入口 run_tests.js 已有同款回归（3g4），
+//     CI 门禁/变异 runner 用的 run_unit_tests.js 此前只 child.kill('SIGKILL') 直接子进程、无 detached。
+//     桩套件 fork 一个继承 fd1 的孙进程（与 test_app_p.js 的并行调度、test_console.js spawn console.js
+//     同形）后自身挂死，触发每套件超时。修复前只杀直接子进程 ⇒ 孙进程继续持有继承的 stdout 管道：
+//     ① CI 形态（GITHUB_STEP_SUMMARY 存在 ⇒ collect=true，stdout 是管道）下入口的 close 被拖到孙进程
+//        退出才来——实测 1500ms 上限下入口 12125ms 才返回（CI 只能等作业级超时，无红测定位）；
+//     ② 本地形态下入口虽已退出，孤儿仍在跑（占 CPU/端口/临时目录，污染后续套件）。
+//     故本用例强制 CI 形态，断言：入口在超时上限附近收敛（远早于孙进程的 8s 自退）、汇总三数字与
+//     修复前一致（0/1/1，fail-closed 不变）、入口退出后孙进程心跳不再增长。
+const unitTreeDir = makeUnitTestsSandbox(
+  [{ name: '挂死套件（带孙进程）', file: 'test_stub_tree.js', desc: 'fork 继承 fd1 的孙进程后自身挂死' }],
+  {
+    'test_stub_tree.js': [
+      "const { fork } = require('child_process')",
+      "const path = require('path')",
+      "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
+      'setInterval(() => {}, 1000)',
+      // 有界自杀（8s）：修复前入口的 close 要等这个孙进程退出才来 ⇒ 入口耗时约 8s（断言 <5s 即红）；
+      // 修复后整组 SIGKILL 立即收口，这个上限只用于「修复被回退时不把整个套件拖死」。
+      'setTimeout(() => process.exit(0), 8000)',
+      ''
+    ].join('\n'),
+    'stub_heartbeat.js': [
+      "const fs = require('fs')",
+      "const path = require('path')",
+      "const out = path.join(__dirname, 'heartbeat.txt')",
+      "fs.writeFileSync(out, String(process.pid) + '\\n')",
+      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      'setTimeout(() => process.exit(0), 8000)',
+      ''
+    ].join('\n')
+  }
+)
+let unitTreePid = 0
+try {
+  const unitTreeEnv = { ...baseEnv }
+  // collect=true 是**生产形态**（GitHub Actions 必设 GITHUB_STEP_SUMMARY ⇒ 每套件 stdout 走管道），
+  // 也正是修复前被孙进程拖住 close 的那条路径。
+  unitTreeEnv.GITHUB_STEP_SUMMARY = path.join(unitTreeDir, 'summary.md')
+  unitTreeEnv.XBK_UNIT_TIMEOUT = '1500'
+  const t0 = Date.now()
+  const unitTree = spawnSync(process.execPath, [path.join(unitTreeDir, 'run_unit_tests.js')],
+    { encoding: 'utf8', cwd: unitTreeDir, env: unitTreeEnv, timeout: 60000 })
+  const elapsed = Date.now() - t0
+  assert.strictEqual(unitTree.signal, null,
+    `入口必须自行结束（被测试侧 60s 兜底杀掉说明入口未收敛，实测 ${elapsed}ms）`)
+  assert.notStrictEqual(unitTree.status, 0, '超时的套件必须让入口以非 0 退出（fail-closed 语义不变）')
+  assert.deepStrictEqual(extractTestSummary(unitTree.stdout), ['0', '1', '1'],
+    '超时仍按失败结算：汇总三数字应与修复前一致（0 通过, 1 失败, 共 1）')
+  assert.match(unitTree.stdout, /超过每套件上限 1500ms 已强杀/, '失败输出必须仍点名每套件超时（UT-03 口径不变）')
+  assert.ok(elapsed < 5000,
+    `入口应在每套件上限附近收敛，而不是等孙进程退出：实测 ${elapsed}ms（旧实现要等孙进程 8s 自退 ⇒ 约 8000ms）`)
+  const unitHb = path.join(unitTreeDir, 'heartbeat.txt')
+  unitTreePid = Number(fs.readFileSync(unitHb, 'utf8').split('\n')[0])
+  assert.ok(Number.isInteger(unitTreePid) && unitTreePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  const unitSizeAfterExit = fs.statSync(unitHb).size
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  const unitSizeLater = fs.statSync(unitHb).size
+  assert.strictEqual(unitSizeLater, unitSizeAfterExit,
+    `入口退出后孙进程仍在写心跳（${unitSizeAfterExit} → ${unitSizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（C10-003）`)
+  console.log(`✅ 每套件超时的整组杀伤（run_unit_tests）：入口 ${elapsed}ms 收敛，退出后孙进程（pid ${unitTreePid}）心跳停在 ${unitSizeAfterExit} 字节`)
+} finally {
+  // 孙进程若仍存活（修复被回退时）必须由本用例清掉，否则会污染后续套件与整轮测试
+  if (unitTreePid > 0) {
+    try { process.kill(unitTreePid, 'SIGKILL') } catch (e) { /* 已随进程组退出（ESRCH）：正常路径 */ }
+  }
+  fs.rmSync(unitTreeDir, { recursive: true, force: true })
+}
+
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
 const strykerIdx = mutationYml.indexOf('npx stryker run')
 assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
