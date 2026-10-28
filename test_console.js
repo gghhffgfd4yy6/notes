@@ -9109,7 +9109,11 @@ async function main () {
     assert.ok(refreshActiveBody.includes('lastRefreshRef.current = Date.now()'), '刷新成功必须推进时间戳（写在 refreshActive 内，别处的不算）')
     assert.ok(refreshActiveBody.includes('if (ok) lastRefreshRef.current'), '失败的刷新不得推进时间戳，否则 30s 内不会再补')
     assert.ok(refreshActiveBody.includes('formPauseUntilRef.current'), '回前台补拉必须在表单交互期间直接放弃')
-    assert.ok(src.includes('if (seq === autoSeqRef.current'), '自动运行状态响应要带序号守卫，旧响应不得覆盖新状态')
+    // C7-006：判据从「最后发出」（seq === autoSeqRef.current）改成「最后收到」——慢网（RTT
+    // 超过 2s 一拍）下前者会把每一发都判废，autoState 一次也落不下来。旧响应仍不得覆盖新
+    // 状态：守卫语义不变，只是换成「没有更大号的响应已落地才允许写」。
+    assert.ok(src.includes('if (seq > autoLandedRef.current'),
+      '自动运行状态响应要带序号守卫（按「最后收到」判序），旧响应不得覆盖新状态')
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
     const logsPanel = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function ConfigPanel'))
     assert.ok(!/addEventListener\('visibilitychange'/.test(logsPanel), '日志页不得再自己挂 visibilitychange（会与回前台补拉重复请求）')
@@ -9812,6 +9816,31 @@ async function main () {
     assert.ok(guard.includes('setPending(null)'), '切页必须清 pending（只 dialog.close() 会留下卡死的 pending）')
     assert.ok(guard.includes('confirmSeqRef.current++'),
       '切页必须作废还在路上的 askConfirm（配置晚回来不得把弹窗重新弹出来）')
+  })
+
+  await aok('结构红线: C7-006 自动运行状态轮询在飞复用 + 判据改「最后收到」（慢网不得每拍自杀）', () => {
+    const uiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const at = uiSrc.indexOf('const refreshAuto = useCallback')
+    const end = uiSrc.indexOf('// 下拉刷新', at)
+    assert.ok(at > -1 && end > at, '应能定位 refreshAuto')
+    const seg = uiSrc.slice(at, end)
+    // 旧实现每拍都把 autoSeqRef 加一领新号，判定却是 seq === autoSeqRef.current
+    // （「这一发还是不是最后发出的」）。接口 RTT > 2s（= 一拍 2s 的轮询间隔）时，每一发都会
+    // 在下一拍被自己判废 ⇒ 实测 12s 内 6 发 0 落地，autoState 停在 null，自动运行中面板
+    // 连「停止」按钮都不渲染。
+    const guardAt = seg.indexOf('if (autoFlightRef.current) return autoFlightRef.current')
+    assert.ok(guardAt > -1, '在飞时必须复用同一发（不能每拍再领一个新号把上一发判废）')
+    assert.ok(guardAt < seg.indexOf('++autoSeqRef.current'),
+      '在飞保护必须早于领新号：晚一步号照样每拍自增，上一发还是被判废')
+    assert.ok(!seg.includes('seq === autoSeqRef.current'),
+      '判据不得再是「最后发出」的 seq（慢网下每一发都被判废，一次状态也落不下来）')
+    assert.ok(seg.includes('seq > autoLandedRef.current'),
+      '判据必须是「最后收到」：没有更新的响应落地过，就允许这一发写状态')
+    assert.ok(seg.includes('autoLandedRef.current = seq'), '落地后必须记住已收到的号（旧响应仍不得覆盖新状态）')
+    assert.ok(seg.includes('autoFlightRef.current = null'),
+      '落定必须放开在飞标记（否则一次失败后自动运行状态永久冻住）')
+    assert.ok(!/inFlightRef\.current/.test(seg),
+      '自动运行的互斥必须与主轮询分开：借用 inFlightRef 会让两条轮询互相拖住')
   })
 }
 
