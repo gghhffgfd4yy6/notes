@@ -96,7 +96,8 @@ function scanBracket (text, start, closers) {
   // 再没有 `]`」的输入会退化成 O(键数 × 长度)。
   const lastCloser = closers[close]
   if (lastCloser <= start) return -1
-  for (let i = start + 1; i < text.length; i++) {
+  let i = start + 1
+  while (i < text.length) {
     const ch = text[i]
     if (ch === close) return i + 1
     if (ch === '"' || ch === "'") {
@@ -106,8 +107,10 @@ function scanBracket (text, start, closers) {
         // 一个括号都没有才吞到串尾——只会多抹，不会少抹。
         return lastCloser > i ? lastCloser + 1 : text.length
       }
-      i = end - 1
+      i = end
+      continue
     }
+    i += 1
   }
   // 走完仍没有可配平的收尾括号：取最后一个同类括号兜底（它只可能落在引号串里，旧实现会拿它当收尾）。
   return lastCloser + 1

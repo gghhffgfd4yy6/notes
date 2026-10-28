@@ -1539,7 +1539,10 @@ function unitSignalProbe () {
     }
     console.log(JSON.stringify({ started, suitePid, grandPid, sizeAfterExit, sizeLater, suiteAlive, grandAlive, exit }))
     process.exit(0)
-  })()
+  })().catch((err) => {
+    console.error(err && err.stack ? err.stack : String(err))
+    process.exit(1)
+  })
 }
 for (const [signal, expectedCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
   const sigDir = makeUnitTestsSandbox(

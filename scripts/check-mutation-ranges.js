@@ -212,7 +212,7 @@ function deriveRuntimeChain (entries = RUNTIME_ENTRIES) {
       }
     }
   }
-  return { chain: [...chain].sort(), unresolved }
+  return { chain: [...chain].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), unresolved }
 }
 
 // 显式豁免：运行链上但**有意不列 mutate 目标**的模块，理由必须写清楚（空理由判红）。

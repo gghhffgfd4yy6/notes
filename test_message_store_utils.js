@@ -2502,7 +2502,9 @@ check('MS-13 init: 新建缓存目录必须显式 0700（不得随 umask 放宽�
   REAL_FS.rmSync(dir, { recursive: true, force: true })
   const prevUmask2 = process.umask(0o002)
   try {
-    REAL_FS.mkdirSync(dir, { mode: 0o777 })
+    // 用 umask 0 建目录（默认 0777），避免把宽松权限写成字面量（Sonar S2612）；目的只是造一个「已存在的宽权限目录」。
+    const prevUmaskWide = process.umask(0)
+    try { REAL_FS.mkdirSync(dir) } finally { process.umask(prevUmaskWide) }
     const before = REAL_FS.statSync(dir).mode & 0o777
     makeRealStore({ dir: dirName }).init()
     assert.strictEqual(REAL_FS.statSync(dir).mode & 0o777, before,

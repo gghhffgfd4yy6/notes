@@ -221,4 +221,7 @@ async function main () {
   process.exit(allOk ? 0 : 1)
 }
 
-main()
+main().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err))
+  process.exit(1)
+})
