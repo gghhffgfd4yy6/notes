@@ -2513,6 +2513,71 @@ check('MS-13 init: 新建缓存目录必须显式 0700（不得随 umask 放宽�
   }
 })
 
+// ===== C3-012：哨兵认领后复核发现持有者存活，必须把哨兵搬回原名 =====
+// 竞态：:381 读到「持有者已死」 → 第三方重建了一个活哨兵 → :384 rename 抢到的正是**别人新建的
+// 活哨兵**。复核分支存在的唯一目的就是挡这一手，但旧实现只 `return null`、不还原——哨兵被永久
+// 搬到 .reclaim，目录级互斥当场失效（另一个清理者立刻能建出新哨兵，两人同时在临界区）。
+// 复现方式：patch fs.renameSync，在「guard → .reclaim」那一次 rename 之前把活 token 写回原路径，
+// 精确落在 :381 判死与 :384 抢占之间。活 token 必须带**正确的进程启动时钟**（_isTombstoneLockProcessAlive
+// 在 Linux 上比对 /proc/PID/stat 的 starttime，时钟不匹配会被判成「PID 被复用 ⇒ 已死」，走进的是另一条
+// 分支）——故内存 fs 里预置一份同口径的 /proc/<pid>/stat：state=fields[0] 之后第 19 个字段即 starttime。
+function findDeadPid () {
+  let pid = 999999
+  for (let i = 0; i < 1000; i++, pid++) {
+    try { process.kill(pid, 0) } catch (e) { if (e && e.code === 'ESRCH') return pid }
+  }
+  return pid
+}
+
+check('MS-14 哨兵认领: 复核发现持有者存活必须把哨兵搬回原名（否则目录级互斥当场失效）', () => {
+  const dir = path.join(FAKE_ROOT, 'xianbaoku_cache')
+  const guardPath = path.join(dir, '.seen.cleanup.lock')
+  const deadToken = String(findDeadPid())
+  const START = '8994013'
+  const liveToken = `${process.pid}:${START}:live-holder`
+  const procStat = `${process.pid} (node) ` + ['S'].concat(Array(18).fill('0'), START).join(' ')
+  const liveFiles = { [guardPath]: deadToken, [`/proc/${process.pid}/stat`]: procStat }
+  // ① 认领成功但复核发现持有者存活 ⇒ 必须还原；不得留 .reclaim 残留；第二个清理者不得进入
+  const fsMock = makeMemFs(liveFiles)
+  const origRename = fsMock.renameSync
+  fsMock.renameSync = (a, b) => {
+    if (a === guardPath && String(b).endsWith('.reclaim')) {
+      // 第三方在 :381 判死之后、:384 rename 之前重建了活哨兵
+      fsMock.files.set(guardPath, liveToken)
+    }
+    return origRename(a, b)
+  }
+  const s = makeBatchStore({ fsMock, name: 'ms14.json' }).store
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(s._acquireTombstoneCleanupGuard(dir), null, '复核发现持有者存活时必须让路')
+  })
+  const entries = [...fsMock.files.keys()].filter(p => p.startsWith(dir + path.sep))
+  assert.deepStrictEqual(entries, [guardPath],
+    `抢到的活哨兵必须被搬回原名且不得留 .reclaim 残留，实际目录内容: ${JSON.stringify(entries.map(p => path.basename(p)))}`)
+  assert.strictEqual(fsMock.files.get(guardPath), liveToken,
+    '活哨兵的 token 必须原样保留（否则原持有者释放时读不到自己的 token，锁变成永久残留）')
+  assert.strictEqual(warns.length, 0, `「让路」是正常竞争，不得输出告警：${JSON.stringify(warns)}`)
+  const second = s._acquireTombstoneCleanupGuard(dir)
+  assert.strictEqual(second, null,
+    '活哨兵仍在原路径时第二个清理者不得进入临界区（旧实现里两人可同时清理 .seen.lock 并互删对方刚建的锁）')
+  // ② 还原本身失败（EACCES 等）⇒ 必须 WARN 且显式说明哨兵已丢，不得静默
+  const fsB = makeMemFs(liveFiles)
+  const origRenameB = fsB.renameSync
+  fsB.renameSync = (a, b) => {
+    if (a === guardPath && String(b).endsWith('.reclaim')) {
+      fsB.files.set(guardPath, liveToken)
+      return origRenameB(a, b)
+    }
+    throw Object.assign(new Error('EACCES: restore denied'), { code: 'EACCES' })
+  }
+  const sB = makeBatchStore({ fsMock: fsB, name: 'ms14b.json' }).store
+  let got
+  const warnsB = captureConsole('warn', () => { got = sB._acquireTombstoneCleanupGuard(dir) })
+  assert.strictEqual(got, null, '还原失败同样必须放弃本轮清理')
+  assert.ok(warnsB.some(l => l.includes('哨兵还原失败') && l.includes('已丢失')),
+    `还原失败必须 WARN 并显式说明哨兵已丢（不得静默）：${JSON.stringify(warnsB)}`)
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 // ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
 // seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的

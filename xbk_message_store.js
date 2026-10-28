@@ -387,7 +387,19 @@ function createMessageStore ({
         const reclaimPath = `${guardPath}.${process.pid}.${Date.now()}.reclaim`
         try { fs.renameSync(guardPath, reclaimPath) } catch (renameError) { return null }
         try {
-          if (this._isTombstoneLockProcessAlive(reclaimPath)) return null
+          if (this._isTombstoneLockProcessAlive(reclaimPath)) {
+            // C3-012：复核判定持有者仍存活 ⇒ 刚才 rename 抢到的是**别人新建的活哨兵**，必须原样搬回。
+            // 旧实现只 return null：哨兵被永久搬到 .reclaim，原持有者释放时读不到自己的 token（按 ENOENT
+            // 静默），另一个清理者立刻能在 guardPath 建出新哨兵 ⇒ 目录级互斥当场失效，两个清理者可同时
+            // 清理 .seen.lock 并互删对方刚建的锁（整份判重记录可丢）。
+            // 还原失败时保留 reclaim 文件（里面是别人的活 token，删掉即永久丢失）并显式 WARN。
+            try {
+              fs.renameSync(reclaimPath, guardPath)
+            } catch (restoreError) {
+              console.warn(`墓碑清理哨兵还原失败（活哨兵已丢失，目录级互斥失效，本轮放弃清理/墓碑写入）${guardPath}:`, restoreError?.message || restoreError)
+            }
+            return null
+          }
           fs.unlinkSync(reclaimPath)
         } catch (reclaimError) {
           try { fs.unlinkSync(reclaimPath) } catch (ignored) {}
