@@ -2204,6 +2204,44 @@ async function backupUiStructureTests () {
     assert.ok(!/apiPostBackupImport\([^)]*password/i.test(seg), '导入请求不得带密码')
   })
 
+  await aok('结构红线: 导入 409/400/507 不得提示「导入完成」（consumeJsonResult 不抛错）', async () => {
+    // apiPostBackupImport 走 consumeJsonResult：非 2xx 只回 { ok:false, status, data } 而不抛错。
+    // doImport 旧实现直接把它当成功 ⇒ 409 busy / 400 校验失败 / 507 审计满都提示「导入完成」。
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    // 接线：先判失败，再关弹窗；失败分支不得走到「导入完成」。
+    const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const at = pages.indexOf('const doImport = async () =>')
+    const end = pages.indexOf('return html`<div class="cfg-block backup-block">', at)
+    assert.ok(at > -1 && end > at, '应能定位 doImport')
+    const body = pages.slice(at, end)
+    assert.ok(body.includes('res.ok') || body.includes('backupImportProblem(res)'),
+      'doImport 必须检查 res.ok：consumeJsonResult 对 409/400/507 只回 {ok:false}，不检查就当成功')
+    const guardAt = body.indexOf('backupImportProblem(res)')
+    assert.ok(guardAt > -1, 'doImport 必须先过统一的失败判定')
+    assert.ok(guardAt < body.indexOf('setPending(null)'), '判失败必须早于关确认弹窗（否则出错时弹窗已消失）')
+    assert.ok(guardAt < body.lastIndexOf('导入完成'), '失败分支不得走到「导入完成」提示（那行 setNote 必须在判失败之后）')
+    assert.strictEqual(typeof pure.backupImportProblem, 'function',
+      '必须有统一的导入失败判定（旧 doImport 全程不检查 res.ok）')
+    // 响应体形状取自 scripts/console.js 的 handleBackupImport（三类失败的真实载荷）。
+    assert.strictEqual(pure.backupImportProblem({ ok: true, status: 200, data: { imported: { messages: 3 } } }), '',
+      '2xx 不得判失败')
+    assert.strictEqual(
+      pure.backupImportProblem({ ok: false, status: 409, data: { error: 'busy', code: 'busy', message: '有任务正在运行，等结束再导入' } }),
+      '有任务正在运行，等结束再导入', '409 busy 必须透出服务端人话（error 字段是 busy 这种 code）')
+    assert.strictEqual(
+      pure.backupImportProblem({
+        ok: false,
+        status: 507,
+        data: { error: 'audit_full', code: 'audit_full', errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则' }] }
+      }),
+      '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则', '507 审计满顶层只有 code，人话在 errors[].message')
+    assert.match(
+      pure.backupImportProblem({ ok: false, status: 400, data: { error: '备份文件不是合法 JSON', code: 'invalid_json' } }),
+      /备份文件不是合法 JSON/, '400 顶层 error 本身是人话时必须用它')
+    assert.match(pure.backupImportProblem({ ok: false, status: 400, data: null }), /^HTTP 400$/,
+      '读不出响应体时必须兜底带状态码，不能只说「导入失败」')
+  })
+
   await aok('结构红线: 弹窗 busy 变化不得把焦点抢回密码框', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function ConfirmDialog')

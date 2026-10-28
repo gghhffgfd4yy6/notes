@@ -507,6 +507,22 @@ export function backupPasswordProblem (password, confirmation) {
   return ''
 }
 
+// 备份导入的失败判定（v3.386）：apiPostBackupImport 走 consumeJsonResult，非 2xx 只回
+// { ok:false, status, data } 而**不抛错**——调用方漏检就会把 409 busy / 400 校验失败 /
+// 507 审计满全部当成功提示「导入完成」。返回 '' 表示成功，否则是给用户看的那句话。
+// 优先级：message（409 的 error 只是 'busy' 这种 code）→ errors[].message（400 逐字段校验
+// 与 507 审计满把人话放这里）→ error（400 顶层本身就是人话）→ HTTP 状态码兜底。
+export function backupImportProblem (res) {
+  if (res && res.ok === true) return ''
+  const body = res && res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : null
+  const field = body && Array.isArray(body.errors) && body.errors[0] && typeof body.errors[0].message === 'string'
+    ? body.errors[0].message
+    : ''
+  const text = [body && body.message, field, body && body.error]
+    .find((v) => typeof v === 'string' && v !== '')
+  return text || `HTTP ${res && Number.isInteger(res.status) ? res.status : '未知状态'}`
+}
+
 export async function encryptBackup (bundle, password) {
   if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) throw new Error('没有可加密的备份内容')
   const pass = backupPasswordText(password)
