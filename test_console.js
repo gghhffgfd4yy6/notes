@@ -1773,6 +1773,60 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则保存: 既有断链审计 → 500 audit_broken 且回滚（不得按断点前 lastHash 硬接）', async () => {
+    // C2-001：readFilterAuditChain 返回 ok:false 时旧实现仍拿断点前的 lastHash 续写——新行
+    // 永远接不上（链永久停在坏行）却照样 return true、保存 200。审计是保存的提交点，断链
+    // 必须响亮拒绝并回滚规则文件，等人工归档/修复。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      // 半行（短写/掉电残留）：最后一行 JSON 不完整
+      const raw = fs.readFileSync(paths.audit, 'utf8')
+      fs.writeFileSync(paths.audit, raw.slice(0, raw.length - 12))
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+      assert.strictEqual(res.status, 500, `断链时必须拒绝保存（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_broken')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计不落地 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计 writeSync 短写 → 500 audit_failed + 回滚 + 清掉半行（链仍可读）', async () => {
+    // C2-001：旧实现丢弃 writeSync 返回值且不 fsync。半行落盘后函数仍返回 true，保存 200、
+    // 不回滚，链永久停在坏行。修后：短写 ⇒ 判失败 ⇒ 保存回滚，并把半行截掉让链保持完整。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      const auditBefore = fs.readFileSync(paths.audit, 'utf8')
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      // 模拟内核短写（ENOSPC/信号中断）：writeSync 只落一半字节并如实返回计数，不抛。
+      const realWriteSync = fs.writeSync
+      fs.writeSync = function (fd, data, ...rest) {
+        if (rest.length === 0 && typeof data === 'string' && data.includes('"action":"save"')) {
+          return realWriteSync.call(fs, fd, data.slice(0, Math.floor(data.length / 2)))
+        }
+        return realWriteSync.call(fs, fd, data, ...rest)
+      }
+      try {
+        const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+        assert.strictEqual(res.status, 500, `短写必须判失败（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+        assert.strictEqual(JSON.parse(res.text).code, 'audit_failed')
+      } finally {
+        fs.writeSync = realWriteSync
+      }
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计不完整 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.readFileSync(paths.audit, 'utf8'), auditBefore, '半行必须清掉（否则链永久停在坏行）')
+      const chain = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).auditChain
+      assert.deepStrictEqual([chain.ok, chain.entries], [true, 1], '审计链必须仍完整可读')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
   await aok('过滤规则保存: 预置 symlink 的审计文件 → 500 audit_failed 且不写目标文件', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)

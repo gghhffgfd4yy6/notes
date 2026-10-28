@@ -1983,15 +1983,27 @@ function filterAuditAtLimit (auditPath) {
 
 // append-only + 0600：每次从头复算链尾（文件上限 4MiB，控制台写频率极低）。
 // 打开时带 O_NOFOLLOW 且 fstat 必须是普通文件：预置的 symlink/FIFO/目录一律拒绝，否则
-// 「fchmod + append」会顺着链接改写别的可写文件。失败返回 false，由调用方回滚规则文件并报
-// 500 audit_failed——审计不落地就不能让调用方看到成功。
+// 「fchmod + append」会顺着链接改写别的可写文件。失败返回 `{ ok:false, code }`，由调用方
+// 回滚规则文件并报错——审计不落地就不能让调用方看到成功。
+// 返回值（C2-001）：ok:true = 整行落盘且 fsync 完成；ok:false + code:
+//   · audit_broken：既有审计链已断（brokenAt ≥ 1）。链尾不可信，接着写只会把新行接在坏行
+//     之后、链永远不可复算（旧实现在这里拿断点前的 lastHash 硬接，还返回 true）——拒绝续写，
+//     等人工归档/修复。
+//   · audit_failed：其它写入失败（不可读/非普通文件/短写/fsync 失败）。
 function appendFilterAudit ({ auditPath, actor, action, revision, changedFields }) {
   try {
     if (filterAuditAtLimit(auditPath)) {
       console.error('⚠️ 过滤规则审计已到 4 MiB 上限，拒绝续写（需人工归档后重试）')
-      return false
+      return { ok: false, code: 'audit_failed' }
     }
     const chain = readFilterAuditChain(auditPath)
+    // brokenAt ≥ 1 = 真的读到了坏行（JSON 损坏 / prevHash 断裂 / entryHash 不符）。
+    // brokenAt === 0 是「读不出来」（symlink/FIFO/超限/ioError），交给下面的 open+write
+    // 如实失败（保持既有 audit_failed 语义，不把不可读误报成断链）。
+    if (chain.ok !== true && chain.brokenAt >= 1) {
+      console.error(`⚠️ 过滤规则审计链已断裂（brokenAt=${chain.brokenAt}），拒绝续写：请人工归档/修复后重试`)
+      return { ok: false, code: 'audit_broken' }
+    }
     const prevHash = chain.lastHash || FILTER_AUDIT_GENESIS
     const entry = {
       ts: new Date().toISOString(),
@@ -2003,22 +2015,37 @@ function appendFilterAudit ({ auditPath, actor, action, revision, changedFields 
     entry.prevHash = prevHash
     entry.entryHash = filterAuditEntryHash(prevHash, entry)
     const line = `${JSON.stringify(entry)}\n`
+    const lineBytes = Buffer.byteLength(line, 'utf8')
     // O_NOFOLLOW 在非 POSIX 平台可能缺省（undefined），按位或会把它当 0 从而丢掉整组 flag。
     // O_NONBLOCK：审计路径被预置成 FIFO 时 open 立即返回（ENXIO），而不是阻塞整个事件循环。
     const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
       (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0)
     const fd = fs.openSync(auditPath, flags, 0o600)
     try {
-      if (!fs.fstatSync(fd).isFile()) throw new Error('审计路径不是普通文件')
+      const st = fs.fstatSync(fd)
+      if (!st.isFile()) throw new Error('审计路径不是普通文件')
       fs.fchmodSync(fd, 0o600)
-      fs.writeSync(fd, line)
+      try {
+        // 短写收口（C2-001，同 :647-653 锁帧写路径的先例）：writeSync 可能少写（磁盘紧张/
+        // 信号中断）且**不抛**——只返回实际写入字节数。丢弃返回值 = 半行被当成成功，链永久
+        // 停在坏行，后续 append 仍旧返回成功、保存照 200。
+        const written = fs.writeSync(fd, line)
+        if (written !== lineBytes) throw new Error(`审计写入不完整（${written}/${lineBytes} 字节）`)
+        // 审计是保存的提交点：fsync 之后才允许回 200，掉电也不许「规则生效但审计丢失」。
+        fs.fsyncSync(fd)
+      } catch (e) {
+        // 半行必须当场清掉（截回写前长度）：否则链停在坏行，之后每次保存都会被判 audit_broken。
+        // 尽力而为——截不掉时下一轮的断链闸仍会拒绝续写，不会“悄悄接上去”。
+        try { fs.ftruncateSync(fd, st.size) } catch (e2) { /* 尽力清理，靠断链闸兜底 */ }
+        throw e
+      }
     } finally {
       fs.closeSync(fd)
     }
-    return true
+    return { ok: true }
   } catch (e) {
     console.error(`⚠️ 过滤规则审计写入失败：${e && e.message ? e.message : e}`)
-    return false
+    return { ok: false, code: 'audit_failed' }
   }
 }
 
@@ -4337,14 +4364,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             override: plans.filter.result.value
           })
           const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-          if (!appendFilterAudit({
+          const audit = appendFilterAudit({
             auditPath: filterPaths.audit,
             actor: actorOf(token),
             action: 'import',
             revision: nextFile.revision,
             changedFields
-          })) {
-            abortImport('filter', 500, { error: 'audit_failed', code: 'audit_failed' })
+          })
+          if (!audit.ok) {
+            abortImport('filter', 500, { error: audit.code, code: audit.code })
             return
           }
           pruneFilterBackups(filterPaths)
@@ -4490,18 +4518,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         })
         const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
         const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        if (!appendFilterAudit({
+        const audit = appendFilterAudit({
           auditPath: paths.audit,
           actor: actorOf(actorToken),
           action: 'save',
           revision: nextRevision,
           changedFields
-        })) {
+        })
+        if (!audit.ok) {
           // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
           const rolled = rollbackFilterOverride(paths, previousText)
           sendJson(res, 500, {
-            error: 'audit_failed',
-            code: 'audit_failed',
+            error: audit.code,
+            code: audit.code,
             rolledBack: rolled.ok,
             rollbackMode: rolled.mode
           })
@@ -4741,17 +4770,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             override: restoredFilter
           })
         const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        if (!appendFilterAudit({
+        const audit = appendFilterAudit({
           auditPath: paths.audit,
           actor: actorOf(actorToken),
           action: toDefault ? 'reset_default' : 'restore',
           revision: nextRevision,
           changedFields
-        })) {
+        })
+        if (!audit.ok) {
           const rolled = rollbackFilterOverride(paths, previousText)
           sendJson(res, 500, {
-            error: 'audit_failed',
-            code: 'audit_failed',
+            error: audit.code,
+            code: audit.code,
             rolledBack: rolled.ok,
             rollbackMode: rolled.mode
           })
