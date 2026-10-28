@@ -941,5 +941,71 @@ function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
   }
 }
 
+// ── C10-043（audit38 · P3）：git merge --no-ff 的默认合并消息必须放行（只对 `^Merge ` 开白名单）────
+// 为什么测它：commit-msg 只认类型前缀，而 `git merge --no-ff` 的默认消息是 git 生成的
+// `Merge branch 'feature'`（没人会也不该给它加 fix:/chore: 前缀）⇒ 旧钩子把合并拦死、只留下一次
+// 未完成的合并，收尾只能 `git commit --no-verify`——连带跳过整道消息门禁。
+// 白名单**只免「类型前缀」这一条**：首行 ≤100 字符与「标题后必须空行」仍照旧校验（默认合并消息的
+// 单行形态 / 标题+空行形态都满足，故不会误伤）。`git revert` 实测**不触发** commit-msg
+// （githooks(5)：只有 commit 与 merge 调用它），所以这里不给 revert 开任何白名单，也不写相关文案。
+{
+  assert.strictEqual(runCommitMsg(["Merge branch 'feature'"]).status, 0,
+    '合并默认消息（单行，git merge --no-edit 的形态）必须放行')
+  assert.strictEqual(runCommitMsg(["Merge branch 'feature'", '', '正文']).status, 0,
+    '合并消息带空行 + 正文（编辑器形态）必须放行')
+  assert.strictEqual(runCommitMsg(["Merge remote-tracking branch 'origin/main'", '']).status, 0,
+    '合并远端分支的默认消息同样必须放行')
+  const mergeNoBlank = runCommitMsg(["Merge branch 'feature'", '正文没有空行'])
+  assert.strictEqual(mergeNoBlank.status, 1, '合并消息同样受「标题后必须空行」约束（白名单只免前缀）')
+  assert.match(mergeNoBlank.stdout, /空行/, '合并消息漏空行也要点名空行')
+  const mergeTooLong = runCommitMsg(['Merge ' + 'x'.repeat(200), '', '正文'])
+  assert.strictEqual(mergeTooLong.status, 1, '合并消息同样受「首行 ≤100 字符」约束（白名单只免前缀）')
+  assert.strictEqual(runCommitMsg(['Merged hotfix without space', '', '正文']).status, 1,
+    '只放行 `Merge `（带空格）：`Merged ...` 不是 git 的合并消息形态，不得借道通过')
+}
+// 真 git 仓库回归：合并必须能提交成功；同一份钩子对普通提交的判据一条都不能松
+{
+  const { dir, home } = makeCase()
+  const env = sandboxEnv(home)
+  delete env.GIT_EDITOR
+  try {
+    initRepo(dir, home, env)
+    const hooks = path.join(dir, 'hooks')
+    fs.mkdirSync(hooks)
+    const hook = path.join(hooks, 'commit-msg')
+    fs.copyFileSync(COMMIT_MSG_HOOK, hook)
+    fs.chmodSync(hook, 0o700)
+    const git = (args) => spawnSync(GIT, args, { cwd: dir, encoding: 'utf8', env })
+    for (const [key, value] of [
+      ['user.name', 'Merge Hook Regression'],
+      ['user.email', 'merge-hook@example.invalid'],
+      ['core.hooksPath', hooks],
+      ['commit.gpgsign', 'false']
+    ]) {
+      const r = git(['config', key, value])
+      assert.strictEqual(r.status, 0, `配置 ${key} 失败：${r.stderr}`)
+    }
+    assert.strictEqual(git(['commit', '--allow-empty', '-m', 'chore: 初始']).status, 0, '初始提交应通过')
+    const base = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim()
+    assert.ok(base && base !== 'HEAD', `应取到主分支名，实际 ${JSON.stringify(base)}`)
+    assert.strictEqual(git(['checkout', '-q', '-b', 'feature']).status, 0, '建分支失败')
+    assert.strictEqual(git(['commit', '--allow-empty', '-m', 'chore: 分支提交']).status, 0, '分支提交应通过')
+    assert.strictEqual(git(['checkout', '-q', base]).status, 0, '切回主分支失败')
+    const merge = git(['merge', '--no-ff', '--no-edit', 'feature'])
+    assert.strictEqual(merge.status, 0,
+      'git merge --no-ff 的默认消息必须被接受（旧钩子 exit 1，留下未完成的合并）：' +
+      (merge.stdout + merge.stderr).slice(0, 300))
+    const subject = git(['log', '-1', '--format=%s']).stdout.trim()
+    assert.strictEqual(subject, "Merge branch 'feature'",
+      `合并提交的 subject 应是 git 默认消息，实际 ${JSON.stringify(subject)}`)
+    // 白名单没有放宽整条判据：普通提交缺前缀、漏空行仍照旧被拦
+    const badPrefix = git(['commit', '--allow-empty', '-m', '随便写点什么'])
+    assert.notStrictEqual(badPrefix.status, 0, '非合并提交缺类型前缀仍必须被拦')
+    assert.match(badPrefix.stdout + badPrefix.stderr, /类型前缀/, '拦下时仍要点名类型前缀')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
 console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）/ 未跟踪文件算脏：扫描式门禁下「提交 fail、工作树的未跟踪文件补绿」仍必须真红且门禁在隔离目录里跑（旧口径假绿，G 必红）+ 有未跟踪文件改走隔离路径（旧口径只警告仍走快路径，H 必红）')
