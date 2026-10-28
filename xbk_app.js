@@ -70,7 +70,11 @@ function createApp ({
     // A 的整文件覆盖冲掉（丢日志）。修复：用 run.log.lock（O_EXCL）把「追加 + 超限截尾」包成互斥
     // 临界区；拿不到锁（竞争/陈旧锁/异常）时 fail-open 只追加不截尾，日志绝不因锁而丢。
     // 日志记录名仅接受文件基名，防未来调用传入 ../ 或绝对路径写出缓存目录。
-    _writeRunLog (line, filename = 'run.log') {
+    // C1-006：opts.truncateError=false 关闭「单行 ERROR 截断」启发式——_writeFilterDiagnostics 传的是
+    // 整批 NDJSON（lines.join('\n')），按整串首个 " ERROR " 截到 512 字符会把后面的记录连同其 JSON
+    // 结构一起切掉，末行留下半条非法 JSON（13 条只落 4~7 行）。批量写入必须逐条整行落盘，截断只在
+    // 单条日志自己身上发生。
+    _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
         const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
         const logPath = path.join(MessageStore.cacheDir, safeFilename)
@@ -111,8 +115,9 @@ function createApp ({
             }
           }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
+          // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
-          const errSep = line.indexOf(' ERROR ')
+          const errSep = opts.truncateError === false ? -1 : line.indexOf(' ERROR ')
           if (errSep >= 0 && line.length > 512) {
             const prefix = line.slice(0, errSep + 7)
             let rest = line.slice(errSep + 7)
@@ -165,7 +170,7 @@ function createApp ({
       for (const record of records) {
         try { lines.push(JSON.stringify(record)) } catch (e) { /* 单条异常不阻断整轮 */ }
       }
-      if (lines.length > 0) this._writeRunLog(lines.join('\n') + '\n', 'filter-diagnostics.ndjson')
+      if (lines.length > 0) this._writeRunLog(lines.join('\n') + '\n', 'filter-diagnostics.ndjson', { truncateError: false })
     },
 
     _diskWarningAt: 0,

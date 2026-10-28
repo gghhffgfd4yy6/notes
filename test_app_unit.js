@@ -685,6 +685,42 @@ check('_writeRunLog 非 ERROR 长行 ⇒ 完全不截断', () => {
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, line, 'utf8']])
 })
 
+// ----- C1-006 回归：整批 NDJSON 必须逐条整行写入，不得被「ERROR 行截断」启发式截出半行 -----
+check('_writeFilterDiagnostics 一批 13 条（含含 " ERROR " 的记录）⇒ 13 行完整 JSON，末行不得截断成非法 JSON', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec, Config: { diagnostics: { filterLog: { enabled: true } } } })
+  const records = [{
+    type: 'run',
+    at: '2026-10-28 10:00:00',
+    total: 13,
+    dedup: 0,
+    filtered: 3,
+    passed: 10,
+    byReason: { 'keyword.pingbibiaoti': 3 },
+    detailCount: 12
+  }]
+  for (let i = 1; i <= 12; i++) {
+    records.push({
+      type: 'item',
+      id: `diag-${i}`,
+      title: i === 3 ? `第3条线报 ERROR ${'E'.repeat(80)}` : `第${i}条线报标题${'标'.repeat(20)}`,
+      decision: 'filtered',
+      reason: { stage: 'keyword', kind: 'block', configKey: 'pingbibiaoti' }
+    })
+  }
+  app._writeFilterDiagnostics(records)
+  assert.strictEqual(rec.rec.append.length, 1, '整批诊断应一次追加')
+  const text = rec.rec.append[0][1]
+  assert.ok(text.endsWith('\n'), '整批必须以换行结尾（NDJSON 逐行）')
+  const lines = text.split('\n').slice(0, -1)
+  assert.strictEqual(lines.length, records.length,
+    `${records.length} 条记录必须写出 ${records.length} 行（实际 ${lines.length} 行，末行长度 ${(lines[lines.length - 1] || '').length}）`)
+  lines.forEach((line, index) => {
+    assert.doesNotThrow(() => JSON.parse(line), `第 ${index + 1} 行必须是完整合法 JSON，实际尾部：${line.slice(-40)}`)
+  })
+  assert.deepStrictEqual(JSON.parse(lines[2]), records[2], '含 " ERROR " 的记录必须原样整条写入（不得截掉 errMsg 之后的 JSON 结构）')
+})
+
 // ----- _writeRunLog：超 1MiB 截尾到 512KiB 且按换行对齐 -----
 check('_writeRunLog size === 1MiB ⇒ 不截尾（严格大于）', () => {
   const rec = makeLogFs({ size: LIMIT, tail: 'IGNORED' })
