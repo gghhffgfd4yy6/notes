@@ -3325,6 +3325,20 @@ console.log('========================================\n');
     assertEqual(r.includes('原文链接'), true)
   })
 
+  // C10-070（audit38）：100k 硬上限必须按 UTF-16 安全截断（SYSTEM_CONTRACT.md:31）。
+  // `{Html内容}` 分支曾用 raw.slice(0, 100000)：截断点落在 emoji 的代理对中间 ⇒ 末字符 U+FFFD。
+  await test('{Html内容}/{Markdown内容} 100k 截断不切断代理对（emoji 跨边界整体丢弃）', () => {
+    const contentHtml = 'a'.repeat(99999) + '😀' + 'TAIL'
+    assertEqual(contentHtml.length, 100005, '夹具长度应为 100005（99999 + 代理对 2 + TAIL 4）')
+    const html = tuisong_replace('{Html内容}', { content_html: contentHtml })
+    assertEqual(html.length, 99999, `{Html内容} 输出应为 99999（干净丢弃整个 emoji），实际 ${html.length}`)
+    assertEqual(html.includes('\uFFFD'), false, '{Html内容} 输出不得含替换字符 U+FFFD（半个 emoji）')
+    assertEqual(html.endsWith('a'), true, '{Html内容} 末字符应为干净的 a')
+    const md = tuisong_replace('{Markdown内容}', { content_html: contentHtml })
+    assertEqual(md.length, 99999, `{Markdown内容} 输出应为 99999，实际 ${md.length}`)
+    assertEqual(md.includes('\uFFFD'), false, '{Markdown内容} 输出不得含替换字符 U+FFFD')
+  })
+
   // ==================== 40. 补充缺口覆盖 ====================
   console.log('\n📂 40. 补充缺口覆盖')
 
