@@ -142,6 +142,140 @@ const productionFiles = [
   'scripts/console.js'
 ]
 
+// ── 运行链候选集（C10-009）──────────────────────────────────────────────────────────────
+// 为什么需要它：productionFiles 是**手写清单**，与 mutate 清单只做单向比对（「清单里的都列了吗」）。
+// 运行链上被顶层无条件 require 的模块只要没被写进清单，就既不在比对范围内、也不在 mutate 目标里
+// ⇒ 门禁永久绿灯 + 零变异覆盖，而「清单漏了一行」这件事本身无法自证（实测：过滤器规则路径 /
+// 文件权限收紧 / 判重缓存签名三个模块就是这样躺了很久）。故这里从**运行入口**出发派生候选集，
+// 再与 mutate 清单**双向**核对；两张显式表（豁免 / 非运行时）都必须带理由，且做过期校验——
+// 改名或删除后不清表，门禁自己变红。
+const RUNTIME_ENTRIES = ['qinglong/xbk_push.js']
+const JS_MODULE_RE = /\.(?:js|cjs|mjs)$/
+// require(...) 的参数可能含嵌套括号（`require(path.join(ROOT, 'x'))`），故只取到第一个右括号为止：
+// 参数里的引号字符串仍能被完整捕获，足够解析仓库内模块；拿不到引号时按「非字面量 require」记录。
+const REQUIRE_CALL_RE = /require\s*\(([^)]*)\)/g
+const QUOTED_LITERAL_RE = /(['"])((?:[^'"\\]|\\.)*)\1/g
+
+// 把 require 的字符串实参解析成仓库内文件的相对路径（'/' 分隔）；解析不到返回 null。
+// 口径：相对路径按**所在文件目录**解析；其它（裸名 / scripts/ 前缀 / path.join(ROOT, 'x') 里的
+// 目录名）一律按**仓库根**解析——本仓的动态 require 只有这两种形态，实测逐个核对过。
+function resolveRuntimeSpec (fromRel, spec) {
+  if (!spec || spec.startsWith('/')) return null
+  const base = spec.startsWith('.')
+    ? path.resolve(path.dirname(path.join(root, fromRel)), spec)
+    : path.join(root, spec)
+  for (const suffix of ['', '.js', '.cjs', '.mjs', path.join('index.js')]) {
+    const candidate = base + suffix
+    if (!candidate.startsWith(root + path.sep)) continue
+    try {
+      if (fs.statSync(candidate).isFile() && JS_MODULE_RE.test(candidate)) {
+        return path.relative(root, candidate).split(path.sep).join('/')
+      }
+    } catch (e) { /* 不存在：试下一个后缀 */ }
+  }
+  return null
+}
+
+// 从运行入口派生 require 闭包。只读源码文本、不执行任何运行时代码（入口有副作用，绝不能 require 它）。
+// 注释行（`//` / `*` / `/*` 开头）跳过：注释掉的 require 不该把模块拖进候选集（也不该让门禁假红）。
+// 非字面量 require（`require(localPath)`）无法静态解析 ⇒ 收进 unresolved 如实列出，由人工复核。
+function deriveRuntimeChain (entries = RUNTIME_ENTRIES) {
+  const chain = new Set()
+  const unresolved = []
+  const queue = entries.slice()
+  while (queue.length) {
+    const rel = queue.shift()
+    if (chain.has(rel)) continue
+    let source
+    try {
+      source = fs.readFileSync(path.join(root, rel), 'utf8') // nosemgrep（仓库内相对路径，非用户输入）
+    } catch (err) {
+      unresolved.push(`${rel}: 读取失败 —— ${err.message}`)
+      continue
+    }
+    chain.add(rel)
+    for (const line of source.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue
+      REQUIRE_CALL_RE.lastIndex = 0
+      let call
+      while ((call = REQUIRE_CALL_RE.exec(line)) !== null) {
+        const specs = [...call[1].matchAll(QUOTED_LITERAL_RE)].map(m => m[2])
+        if (!specs.length) {
+          unresolved.push(`${rel}: require(${call[1].trim().slice(0, 60)})（非字面量实参，静态闭包看不到）`)
+          continue
+        }
+        for (const spec of specs) {
+          const resolved = resolveRuntimeSpec(rel, spec)
+          if (resolved) queue.push(resolved)
+        }
+      }
+    }
+  }
+  return { chain: [...chain].sort(), unresolved }
+}
+
+// 显式豁免：运行链上但**有意不列 mutate 目标**的模块，理由必须写清楚（空理由判红）。
+// ⚠️ 这是「已登记的零变异覆盖缺口」，不是「没问题」：豁免表要逐条评审，新增条目必须说明为什么
+// 不该变异、以及它的行为由哪些套件经调用方覆盖。
+const MUTATION_EXEMPT = new Map([
+  ['scripts/filter-rules-paths.js',
+    '为消除 Codacy/Semgrep 的路径注入误报，从 xbk_filter_store 抽出的**纯路径构造**助手（51 行、无 fs 调用、不读内容）；行为由 filter-store 套件经 FilterStore 调用方覆盖。矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
+  ['scripts/owner-only-mode.js',
+    '同源抽出的**仅 stat+chmod** 权限收紧助手（52 行，入参只来自 FilterStore 的字面量文件名路径）；行为由 filter-store 套件的 0600 收紧用例经调用方覆盖，矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
+  ['scripts/message-signature.js',
+    '只做一次 statSync + mtime 签名的只读助手（21 行，给默认 push.json 判重缓存用），返回 null 的每条降级分支由 status 套件经 readStatus 覆盖；矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口']
+])
+
+// 反向标注：是 mutate 目标、但**不在**运行入口的 require 闭包里的模块，必须写明原因。
+// 否则「mutate 了一个早已不上运行链的死文件」也会被当成覆盖（是另一种假绿）。
+const NON_RUNTIME_MUTATE_TARGETS = new Map([
+  ['scripts/check-deps.js',
+    '只被测试入口 run_tests.js 顶层 require（依赖预检），运行时不加载；按历史口径仍列为 mutate 目标（测试入口的预检逻辑也要有覆盖）'],
+  ['scripts/console.js',
+    '独立 CLI（网页控制台）：由用户/调度器以 `node scripts/console.js` 启动，不经运行入口 require 或 spawn，静态闭包看不到；它仍是生产模块，故保留 mutate 目标']
+])
+
+// 纯判定函数（导出给 test_check_mutation_ranges.js 直接驱动靶向反例）：两个方向 + 过期条目 + 空理由。
+function auditRuntimeChain ({ chain, mutateTargets, exempt, nonRuntime }) {
+  const errors = []
+  const chainSet = new Set(chain)
+  const targetSet = mutateTargets instanceof Set ? mutateTargets : new Set(mutateTargets)
+  const exemptMap = exempt instanceof Map ? exempt : new Map(Object.entries(exempt || {}))
+  const nonRuntimeMap = nonRuntime instanceof Map ? nonRuntime : new Map(Object.entries(nonRuntime || {}))
+  // ① 正向：运行链上的每个模块必须「是 mutate 目标」或「显式豁免（且有理由）」
+  for (const file of chainSet) {
+    if (targetSet.has(file)) continue
+    if (exemptMap.has(file)) {
+      if (!String(exemptMap.get(file) || '').trim()) {
+        errors.push(`运行链模块 ${file} 的豁免理由为空：豁免必须写明「为什么不该变异」，空理由等于静默豁免`)
+      }
+      continue
+    }
+    errors.push(`运行链模块 ${file} 既不是 mutation.yml 的 mutate 目标、也没有显式豁免（新增/改名运行链模块时必须二选一：列入 mutate 目标，或在 MUTATION_EXEMPT 里写明豁免理由与调用方覆盖）`)
+  }
+  // ② 反向：mutate 目标必须在运行链上，或显式标注「非运行时（且有理由）」
+  for (const file of targetSet) {
+    if (chainSet.has(file)) continue
+    if (nonRuntimeMap.has(file)) {
+      if (!String(nonRuntimeMap.get(file) || '').trim()) {
+        errors.push(`mutate 目标 ${file} 的「非运行时」标注理由为空：必须写明它为何不在运行链上`)
+      }
+      continue
+    }
+    errors.push(`mutate 目标 ${file} 既不在运行链上、也没有显式标注为非运行时模块（NON_RUNTIME_MUTATE_TARGETS）：变异一个不上运行链的文件等于零收益覆盖`)
+  }
+  // ③ 过期条目：两张表都必须随代码演进自动失效，否则清单本身会成为新的盲区
+  for (const file of exemptMap.keys()) {
+    if (!chainSet.has(file)) errors.push(`MUTATION_EXEMPT 的 ${file} 不在运行链上：豁免已过期（模块已删除/改名或不再被运行入口加载），请删除该条`)
+    if (nonRuntimeMap.has(file)) errors.push(`${file} 同时出现在 MUTATION_EXEMPT 与 NON_RUNTIME_MUTATE_TARGETS：两个口径互斥`)
+  }
+  for (const file of nonRuntimeMap.keys()) {
+    if (!targetSet.has(file)) errors.push(`NON_RUNTIME_MUTATE_TARGETS 的 ${file} 不是任何 mutate 目标：标注已过期（该文件已不在矩阵里），请删除该条`)
+  }
+  return { errors }
+}
+
 // 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /
 // `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js 复用
 // globMatcher / listRepoJsFiles）改为 throw —— require 者同样必须拿到失败信号。此前 require 路径
@@ -214,6 +348,30 @@ for (const file of productionFiles) {
     console.error(`❌ ${file}: 未列入 mutation.yml 的 mutate 目标`)
     failed = true
   }
+}
+
+// 校验 0.7：运行链候选集 ↔ mutate 清单**双向**核对（C10-009）。
+// 上面那道 productionFiles 校验是单向的（「手写清单里的都列了吗」）：运行链上被顶层 require 的模块
+// 只要没被写进清单就完全在判据之外 ⇒ 永久绿灯、零变异覆盖。这里补上派生集：运行链模块必须二选一
+// （mutate 目标 / 带理由的显式豁免），mutate 目标必须二选一（在运行链上 / 带理由的非运行时标注），
+// 两张表都做过期校验。判据只增不减——上面的 productionFiles、行段、config 对账一条没动。
+const runtimeChainInfo = deriveRuntimeChain()
+const chainAudit = auditRuntimeChain({
+  chain: runtimeChainInfo.chain,
+  mutateTargets,
+  exempt: MUTATION_EXEMPT,
+  nonRuntime: NON_RUNTIME_MUTATE_TARGETS
+})
+for (const message of chainAudit.errors) {
+  console.error(`❌ ${message}`)
+  failed = true
+}
+if (runtimeChainInfo.unresolved.length) {
+  console.log(`ℹ️ 运行链派生：${runtimeChainInfo.chain.length} 个仓库内模块；${runtimeChainInfo.unresolved.length} 处非字面量 require（静态闭包看不到，逐条列出以便复核）：`)
+  for (const site of runtimeChainInfo.unresolved) console.log(`   · ${site}`)
+}
+if (MUTATION_EXEMPT.size) {
+  console.log(`ℹ️ 运行链显式豁免（零变异覆盖、需逐条评审）：${[...MUTATION_EXEMPT.keys()].join(', ')}`)
 }
 
 // 校验 0：matrix include 每项必须有 name、src 与其 mutate 目标同文件（解析见文件顶部）。
@@ -325,12 +483,20 @@ function listRepoJsFiles () {
   return out
 }
 
-// 暴露给测试：glob 谓词与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言）。
+// 暴露给测试：glob 谓词与目录文件枚举（test_check_mutation_ranges.js 直接驱动断言），
+// 以及运行链派生 / 双向核对（C10-009 的靶向反例依赖它们：直接喂合成输入，不需要改仓库文件）。
 // 注：本文件被 require 时不会用 process.exit 结束测试进程——全部失败收场（两处提前退出：未解析到
 // 任何行段、依赖模块加载失败；以及文件末尾的最终判定）都收敛到 exitIfDirectRun / require.main：
 // 直接运行 process.exit(code)，被 require 则 throw。故健康仓库下 require 不抛，可安全复用
 // globMatcher / listRepoJsFiles；仓库真有问题时抛错让测试失败，正是期望行为。
-module.exports = { globMatcher, listRepoJsFiles }
+module.exports = {
+  globMatcher,
+  listRepoJsFiles,
+  deriveRuntimeChain,
+  auditRuntimeChain,
+  MUTATION_EXEMPT,
+  NON_RUNTIME_MUTATE_TARGETS
+}
 
 if (configGlob.length) {
   console.log(`ℹ️ stryker.config.js 的 mutate 含 glob 写法（${configGlob.join(', ')}），相对仓库根展开匹配实际文件后再与矩阵双向比对`)
