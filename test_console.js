@@ -62,7 +62,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 
 const {
   createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
-  acquireLock, releaseLockFor, lockPath,
+  acquireLock, acquireLockResult, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
@@ -441,6 +441,20 @@ ok('acquireLock: 锁内容带归属 token；releaseLockFor 按 pid+token 双匹�
   assert.strictEqual(after.released, true, 'pid+token 双匹配覆写为 released')
   assert.strictEqual(acquireLock(dir, 1001, 'tok-def'), true, 'released 锁立即可接管')
 })
+ok('acquireLock: 非 EEXIST 的写失败不折叠成 busy（ENOTDIR 必须归类为真实错误）', () => {
+  // C2-006：旧实现把所有写失败都 return false，调用方一律当「锁被占」——手动触发被误报
+  // 成 409「已有任务在运行」，自动运行静默重排且不计 fails。这里用「stateDir 是普通文件」
+  // 造真实 ENOTDIR（openSync 必然失败，不是打桩），断言错误被如实分类而不是折叠成 busy。
+  const dir = tmpDir()
+  const stateAsFile = path.join(dir, 'state-as-file')
+  fs.writeFileSync(stateAsFile, 'not a dir')
+  assert.strictEqual(acquireLock(stateAsFile, 1000, 'tok-x'), false, '获取失败仍返回 false（布尔契约不变）')
+  const verdict = acquireLockResult(stateAsFile, 1000, 'tok-x')
+  assert.strictEqual(verdict.ok, false)
+  assert.strictEqual(verdict.busy, false, 'ENOTDIR 不是「锁被占」，不得让调用方回 409')
+  assert.strictEqual(verdict.error && verdict.error.code, 'ENOTDIR', '必须保留原始 errno 供调用方报真错')
+})
+
 ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的旧帧使「补空格防半旧半新」成死代码）', () => {
   const dir = tmpDir()
   assert.strictEqual(acquireLock(dir, 1000, 'tok-abc'), true)
@@ -1435,6 +1449,51 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则备份: corrupt 换代（revision 从 1 重来）后按写入顺序剪枝，新代备份不得被旧代大 revision 剪掉', async () => {
+    // C2-005 返工：剪枝按裸 revision 数值降序取前 3。corrupt 覆盖后 revision 回到 1，旧代的
+    // 4/3/2 恒大于新代的 1 ⇒ 刚写入的新代备份当场被当成「最老」删掉，恢复页只剩 corrupt
+    // 之前那一代（新代回滚点全丢）。只测「换代后第一次保存」抓不到：那一刻盘上还是 4 个文件、
+    // 旧代码恰好还没动手；要一直存到新代的最后一个备份把旧代文件挤出名额才会暴露。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      for (let rev = 1; rev <= 5; rev++) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `g1-${rev}` } })
+        assert.strictEqual(saved.status, 200, `第 ${rev} 次保存应成功`)
+      }
+      assert.deepStrictEqual(
+        fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort(),
+        ['filter-rules.bak.2.json', 'filter-rules.bak.3.json', 'filter-rules.bak.4.json'],
+        '前置：旧代按代际剪枝后剩 2/3/4'
+      )
+      // 覆盖文件损坏 → 确认覆盖：新代 revision 从 1 重新开始，旧代备份 4/3/2 仍在盘上。
+      fs.writeFileSync(paths.file, 'not-json{{')
+      const replaced = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, confirmReplaceCorrupt: true, filter: { pingbibiaoti: 'g2-1' } })
+      assert.strictEqual(replaced.status, 200)
+      assert.strictEqual(JSON.parse(replaced.text).revision, 1, '新代 revision 从 1 重来')
+      // 新代连存 3 次（r2/r3/r4）：加上 corrupt 覆盖那一次，新代共 4 次落盘 ⇒ 盘上应有
+      // 新代 bak.1/2/3 三个回滚点，旧代残留 bak.4 被名额挤出。
+      for (const rev of [2, 3, 4]) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `g2-${rev}` } })
+        assert.strictEqual(saved.status, 200, `新代第 ${rev} 次保存应成功`)
+        assert.strictEqual(JSON.parse(saved.text).revision, rev)
+      }
+      // 旧代 bak.4 的 revision 数值最大、写入最早 ⇒ 必须被剪；新代 bak.1 数值最小，但它是
+      // 新代最新 3 个写入之一，按数值取「最大的 3 个」会把它当场删掉（本条 bug）。
+      assert.deepStrictEqual(
+        fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort(),
+        ['filter-rules.bak.1.json', 'filter-rules.bak.2.json', 'filter-rules.bak.3.json'],
+        '新代 4 次落盘后只留最新 3 个备份（旧代 bak.4 必须被剪）'
+      )
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.backupFor(1), 64 * 1024).text).filter.pingbibiaoti, 'g2-1', 'bak.1 必须是新代 r1 内容')
+      // 端到端判据：恢复页能回到新代 r1（旧实现 bak.1 已被删 → 404 backup_not_found）。
+      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 4 })
+      assert.strictEqual(restored.status, 200, `恢复新代 r1 必须成功（实际 ${restored.status}）`)
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'g2-1')
+    } finally { server.close() }
+  })
+
   await aok('过滤锁: 持有者进程还活着 → 绝不接管（即使 mtime 已过期）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
@@ -1770,6 +1829,89 @@ async function filterRuleApiTests () {
       assert.strictEqual(fs.existsSync(paths.backupFor(4)), true, '第 5 次保存前仍应写备份 r4')
       assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '失败的保存不得剪掉最老备份（剪枝只在提交成功后）')
       assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 既有断链审计 → 500 audit_broken 且回滚（不得按断点前 lastHash 硬接）', async () => {
+    // C2-001：readFilterAuditChain 返回 ok:false 时旧实现仍拿断点前的 lastHash 续写——新行
+    // 永远接不上（链永久停在坏行）却照样 return true、保存 200。审计是保存的提交点，断链
+    // 必须响亮拒绝并回滚规则文件，等人工归档/修复。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      // 半行（短写/掉电残留）：最后一行 JSON 不完整
+      const raw = fs.readFileSync(paths.audit, 'utf8')
+      fs.writeFileSync(paths.audit, raw.slice(0, raw.length - 12))
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+      assert.strictEqual(res.status, 500, `断链时必须拒绝保存（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_broken')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计不落地 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计末行缺 \\n（旧版短写残留）→ 500 audit_broken，不把新行粘到末行尾', async () => {
+    // C2-001 残留（P3）：旧版 1 字节短写会留下「末行 JSON 完整、只缺最后的换行」的审计文件。
+    // 逐行重算看不出问题（末行合法、链也接得上），但下一次 append 直接粘在这一行尾部 ⇒
+    // 整行 JSON 报废、brokenAt=1，链一次性不可读；而这次保存仍返回 200。非空审计文件必须以
+    // \n 收尾，否则按「末行不完整」判链，append 拒绝续写（人工补一个换行即可）。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })).status, 200)
+      const raw = fs.readFileSync(paths.audit, 'utf8')
+      assert.ok(raw.endsWith('\n'), '前置：正常 append 的行必须以换行结尾')
+      // 只丢末行的 \n（其余字节一个不少）：末行内容仍完整、仍可 JSON.parse。
+      const truncated = raw.slice(0, -1)
+      fs.writeFileSync(paths.audit, truncated)
+      const chain = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).auditChain
+      assert.strictEqual(chain.ok, false, '末行缺换行 = 不可续写，必须判链不完整')
+      assert.strictEqual(chain.brokenAt, 2, '断链行号 = 缺换行的那一行（第 2 行）')
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 2, filter: { pingbibiaoti: 'v3' } })
+      assert.strictEqual(res.status, 500, `末行缺换行时必须拒绝保存（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_broken')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '拒绝续写 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.readFileSync(paths.audit, 'utf8'), truncated, '拒绝续写时审计文件一个字节都不动')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计 writeSync 短写 → 500 audit_failed + 回滚 + 清掉半行（链仍可读）', async () => {
+    // C2-001：旧实现丢弃 writeSync 返回值且不 fsync。半行落盘后函数仍返回 true，保存 200、
+    // 不回滚，链永久停在坏行。修后：短写 ⇒ 判失败 ⇒ 保存回滚，并把半行截掉让链保持完整。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      const auditBefore = fs.readFileSync(paths.audit, 'utf8')
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      // 模拟内核短写（ENOSPC/信号中断）：writeSync 只落一半字节并如实返回计数，不抛。
+      const realWriteSync = fs.writeSync
+      fs.writeSync = function (fd, data, ...rest) {
+        if (rest.length === 0 && typeof data === 'string' && data.includes('"action":"save"')) {
+          return realWriteSync.call(fs, fd, data.slice(0, Math.floor(data.length / 2)))
+        }
+        return realWriteSync.call(fs, fd, data, ...rest)
+      }
+      try {
+        const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+        assert.strictEqual(res.status, 500, `短写必须判失败（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+        assert.strictEqual(JSON.parse(res.text).code, 'audit_failed')
+      } finally {
+        fs.writeSync = realWriteSync
+      }
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计不完整 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.readFileSync(paths.audit, 'utf8'), auditBefore, '半行必须清掉（否则链永久停在坏行）')
+      const chain = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).auditChain
+      assert.deepStrictEqual([chain.ok, chain.entries], [true, 1], '审计链必须仍完整可读')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
     } finally { server.close() }
   })
 
@@ -4347,6 +4489,28 @@ async function main () {
     assert.strictEqual(j[0].id, '9', 'id 为字符串形态')
     server.close()
   })
+  await aok('T7 导出: 240 字节边界落在代理对中间 → 不得留孤立代理项（X-Export-Query-Used 必须可编码）', async () => {
+    // C2-017：clampQueryBytes 用 `query.slice(0,-1)` 按 UTF-16 码元退格。237 个 ASCII +
+    // 一个 4 字节 emoji = 241 字节 → 退一格留下孤立高代理项，随后
+    // encodeURIComponent(query) 抛 URIError，整条导出 500「读取请求体失败」（文案完全指错方向）。
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const q = `${'a'.repeat(237)}😀`
+    try {
+      assert.strictEqual(Buffer.byteLength(q, 'utf8'), 241, '前置：241 字节（跨 240 边界）')
+      const res = await request(port, 'POST', '/api/messages/export', {
+        token: TOKEN,
+        body: new URLSearchParams({ format: 'json', q }).toString()
+      })
+      assert.strictEqual(res.status, 200, `代理对中间截断不得让导出 500（实际 ${res.status}：${res.text.slice(0, 120)}）`)
+      assert.strictEqual(res.headers['x-export-query-used'], 'a'.repeat(237), '必须按码点边界退让（整对丢弃，不留孤立代理项）')
+      assert.ok(Array.isArray(JSON.parse(res.text)), '仍是成功导出的裸数组形态')
+    } finally { server.close() }
+  })
   await aok('T6 中文 q 跨 chunk 多字节（readBody StringDecoder 回归）+ GET 对照一致', async () => {
     const dir = tmpDir()
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
@@ -4684,6 +4848,24 @@ async function main () {
     const retry = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
     assert.strictEqual(retry.status, 202, '失败动作在窗口内必须可立即重试（pending 条目已回滚），不得 409')
     server.close()
+  })
+  await aok('HTTP: /trigger 锁写失败（ENOTDIR）→ 500 lock_failed，不得伪装成 409「已有任务在运行」', async () => {
+    // C2-006：stateDir 被换成普通文件后锁路径 open 必然 ENOTDIR（非 EEXIST）。旧实现把它
+    // 折叠成 busy ⇒ 手动触发收到 409「已有触发任务在运行」，运维完全看不出去错了地方。
+    const dir = mkTmp('xbk-console-lockfail-')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      fs.writeFileSync(dir, 'state dir replaced by a file')
+      const res = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+      assert.strictEqual(res.status, 500, `锁写失败必须是 500（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'lock_failed')
+      assert.strictEqual(fs.existsSync(lockPath(dir)), false, '没拿到锁就不该留下锁文件')
+    } finally {
+      try { fs.unlinkSync(dir) } catch (e) { /* 已清理 */ }
+      server.close()
+    }
   })
   await aok('main: XBK_CONSOLE_PORT 非法值拒绝启动（回归 Sourcery #225 M5：NaN 不得回退 7777）', async () => {
     const c = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
@@ -7405,9 +7587,31 @@ async function main () {
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
-        consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLock(stateDir'),
-      '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
+      // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
+      // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
+      // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
+      // 这条红线，删除/替换 tickAuto 的锁必红。
+      const functionBodyOf = (text, signature) => {
+        const at = text.indexOf(signature)
+        if (at < 0) return ''
+        const open = text.indexOf('{', at + signature.length)
+        if (open < 0) return ''
+        let depth = 0
+        for (let i = open; i < text.length; i++) {
+          if (text[i] === '{') depth++
+          else if (text[i] === '}') {
+            depth--
+            if (depth === 0) return text.slice(open + 1, i)
+          }
+        }
+        return ''
+      }
+      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
+        consoleSrc.includes("startAction('run-auto'") &&
+        tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
+        tickAutoBody.includes('if (!lockVerdict.ok)'),
+      '自动调度必须在服务器进程内跑 run-auto，并在 tickAuto 体内先取单飞锁（锚点落在函数体内）')
       assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
         '上一轮未结束不得叠跑')
       assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
