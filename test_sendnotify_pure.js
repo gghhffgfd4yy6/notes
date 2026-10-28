@@ -9,6 +9,7 @@ const fs = require('node:fs')
 const { maskKey, maskUrl, safeSlice, safeErr, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, push_config, configuredChannelCount, configuredChannelNames, hasWxPusherConfigured, getWxPusherProfileSummary, printWxPusherProfileSummary, sendNotify, pickWxPusherClickUrl } = require('./xbk_sendNotify_slim')
 // 判定器同源（S1/F1/P1）与截断单一实现（S6/F7）回归的对拍对象
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
+const { classifySummary, summarizeError } = require('./xbk_failure_policy')
 const { createUtils } = require('./xbk_utils')
 const Utils = createUtils({ safeRe: (source, flags) => new RegExp(source, flags) })
 
@@ -2535,3 +2536,71 @@ checkS('SN-25 企业微信: QYWX_KEY 含 query 特殊字符时必须逐字符百
 // 所有通道都以 `return new Promise(executor)` 开头、executor 抛错被 Promise 构造器转成 rejection
 // ⇒ 该支不可达，考点并入 SN-18（改测异步 rejection 下的在飞清单摘除）。SNB-07 缺号——与 SNB-08
 // 同属「成功/异常/失败三条日志模板」考点，合并进 SNB-08 的三个场景，不重复列号。
+
+// ===== C8-007：真实 got HTTPError 的 HTTP 状态码必须落到 failure.statusCode =====
+// 六个通道在 err 分支直接 `reject(err)`（Server酱 / 企业微信 / wxpusher / 息知 / PushDeer / Telegram），
+// 不经 channelError；sendNotify 的 normalizeFailure 只读 `reason.statusCode`，而真实 got 的 HTTPError
+// 把状态码挂在**非枚举**的 `error.response.statusCode` 上（错误对象自身没有 statusCode 字段）⇒
+// failure.statusCode 恒缺 → 分类器落 UNKNOWN → 413 判 retryable，与 pushplus（走 channelError，读的是
+// response.statusCode）判 permanent 的口径相反。fixture 按真实形态构造：HTTPError 实例 + defineProperty
+// 出来的非枚举 response，**不**给 error 自身补 statusCode——补了就等于把被测缺陷提前修好。
+function httpErrorFixture (statusCode, statusMessage) {
+  const err = new gotModule.HTTPError({ statusCode, statusMessage, request: { options: {} } })
+  Object.defineProperty(err, 'response', {
+    value: { statusCode, statusMessage },
+    enumerable: false,
+    configurable: true
+  })
+  return err
+}
+
+const SIX_RAW_REJECT_CHANNELS = [
+  ['server酱', { PUSH_KEY: 'SCTfakekey' }],
+  ['企业微信', { QYWX_KEY: 'qykey' }],
+  ['wxpusher', { WX_pusher_appToken: 'AT_fake' }],
+  ['息知', { WX_XIZHI_KEY: 'https://xizhi.fake/key' }],
+  ['pushdeer', { DEER_KEY: 'PDK_fake' }],
+  ['telegram', { TG_BOT_TOKEN: '1:x', TG_USER_ID: '2' }]
+]
+
+checkS('C8-007 六个原样 reject 的通道: got HTTPError 413 必须带出 statusCode 并判 permanent', async () => {
+  for (const [channel, want] of SIX_RAW_REJECT_CHANNELS) {
+    const restore = isolateChannel(want)
+    const got1 = mockTransport(() => ({ error: httpErrorFixture(413, 'Payload Too Large') }))
+    try {
+      let threw = null
+      try { await sendNotify('413 探针', '正文') } catch (e) { threw = e }
+      assert.ok(threw, `${channel}: 413 必须抛错`)
+      const failure = (threw.failures || []).find(f => f.channel === channel)
+      assert.ok(failure, `${channel}: failures 应含该通道，实际 ${JSON.stringify(threw.failures)}`)
+      assert.strictEqual(failure.statusCode, 413,
+        `${channel}: statusCode 必须从 error.response.statusCode 提取（error 自身没有 statusCode）`)
+      const decision = classifySummary({ pushed: 0, failed: 1, failures: [summarizeError(threw)] })
+      assert.strictEqual(decision && decision.kind, 'permanent',
+        `${channel}: 413 应判 permanent（与 pushplus 同口径），实际 ${JSON.stringify(decision && decision.kind)}`)
+    } finally { got1.restore(); restore() }
+  }
+})
+
+checkS('C8-007 受害集合 415/422/451 判 permanent，5xx 仍判 retryable（不得一律判永久）', async () => {
+  for (const code of [415, 422, 451]) {
+    const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
+    const got1 = mockTransport(() => ({ error: httpErrorFixture(code, 'Rejected') }))
+    try {
+      let threw = null
+      try { await sendNotify(`${code} 探针`, '正文') } catch (e) { threw = e }
+      const failure = threw && (threw.failures || []).find(f => f.channel === 'server酱')
+      assert.strictEqual(failure && failure.statusCode, code, `HTTP ${code} 的 statusCode 必须透出`)
+      assert.strictEqual(classifySummary({ pushed: 0, failed: 1, failures: [summarizeError(threw)] }).kind, 'permanent',
+        `HTTP ${code} 应判 permanent`)
+    } finally { got1.restore(); restore() }
+  }
+  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
+  const got1 = mockTransport(() => ({ error: httpErrorFixture(503, 'Service Unavailable') }))
+  try {
+    let threw = null
+    try { await sendNotify('503 探针', '正文') } catch (e) { threw = e }
+    const decision = classifySummary({ pushed: 0, failed: 1, failures: [summarizeError(threw)] })
+    assert.strictEqual(decision.kind, 'retryable', '5xx 是瞬时故障，必须仍判 retryable')
+  } finally { got1.restore(); restore() }
+})

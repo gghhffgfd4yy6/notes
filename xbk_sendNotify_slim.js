@@ -183,6 +183,22 @@ function aggregateChannelError (channel, message, failures = []) {
   return result
 }
 
+// C8-007：HTTP 状态码可能只挂在 `error.response.statusCode` 上——got 的 HTTPError 把 response 作为
+// 非枚举属性挂出，错误对象**自身没有** statusCode 字段。六个通道在 err 分支直接 `reject(err)`
+// （Server酱/企业微信/wxpusher/息知/PushDeer/Telegram），不经 channelError，汇总时若只读
+// `reason.statusCode` 就会丢掉状态码 ⇒ 分类器落 UNKNOWN → 真实 413/415/422/451 判 retryable，
+// 而同一状态码在 pushplus（走 channelError，读 response.statusCode）判 permanent。
+function failureStatusCode (reason) {
+  const pick = (value) => {
+    const n = Number(value)
+    return Number.isInteger(n) && n >= 100 && n <= 599 ? n : null
+  }
+  const direct = pick(reason && reason.statusCode)
+  if (direct !== null) return direct
+  const response = reason && reason.response
+  return pick(response && response.statusCode)
+}
+
 // 部分通道/API 代理会把数字业务码序列化成字符串；成功语义允许两种 JSON 类型。
 function isCode (value, expected) {
   return value === expected || value === String(expected)
@@ -1801,7 +1817,8 @@ async function sendNotify (text, desp, params = {}) {
     if (reason && typeof reason === 'object') {
       try {
         if (reason.code !== undefined) failure.code = reason.code
-        if (reason.statusCode !== undefined) failure.statusCode = reason.statusCode
+        const statusCode = failureStatusCode(reason)
+        if (statusCode !== null) failure.statusCode = statusCode
         if (reason.providerCode !== undefined) failure.providerCode = reason.providerCode
       } catch (e) { /* 异常字段只保留安全消息 */ }
     }
