@@ -9842,6 +9842,31 @@ async function main () {
     assert.ok(!/inFlightRef\.current/.test(seg),
       '自动运行的互斥必须与主轮询分开：借用 inFlightRef 会让两条轮询互相拖住')
   })
+
+  await aok('结构红线: C7-007 Hint 是活区域（错误 role=alert / 提示 role=status + aria-live）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function Hint (')
+    const end = src.indexOf('function Reveal (', at)
+    assert.ok(at > -1 && end > at, '应能定位 Hint')
+    const seg = src.slice(at, end)
+    // 全站的错误/提示都走 Hint，而它此前只是一个无 role 的 div，目录里也没有兜底 live
+    // region ⇒ 保存失败/触发失败/自动运行出错对读屏完全静默。现在每个 Hint 都是活区域：
+    //   错误 → role=alert（断言式，与类名 hint-err 同一分支）
+    //   其余 → role=status + aria-live=polite（不打断用户正在读的内容）
+    assert.ok(/role=\$\{err \? 'alert' : 'status'\}/.test(seg),
+      '错误必须是 role=alert、提示必须是 role=status（否则读屏听不到）')
+    assert.ok(/aria-live=\$\{err \? 'assertive' : 'polite'\}/.test(seg),
+      'aria-live 必须与 role 同步显式声明（别只挂 role 让 UA 自己猜）')
+    assert.ok(seg.includes('aria-atomic="true"'),
+      'aria-atomic：整句一起播，不逐节点拼读、也不因局部重渲染重复播')
+    assert.ok(seg.includes("const err = tone === 'error'"), '角色必须由 tone 判定（不另造一套入参）')
+    // 旧实现（无 role/aria-live 的裸 div）不得回潮：只有一个渲染出口，且 role 必须在开启标签上。
+    assert.strictEqual((seg.match(/return html`<div/g) || []).length, 1, 'Hint 只能有一个渲染出口')
+    const only = seg.slice(seg.indexOf('return html`<div'))
+    const roleAt = only.indexOf('role=')
+    assert.ok(roleAt > -1 && roleAt < only.indexOf('>'), 'role 必须落在 <div ...> 的开启标签里')
+    assert.ok(!/role="(alert|status)"/.test(only), 'role 必须按 tone 切换，不能写死一种')
+  })
 }
 
 main()

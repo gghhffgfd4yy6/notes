@@ -150,11 +150,20 @@ function TapTip ({ tip, hint, children, showDate = true }) {
 }
 
 // 提示行：tone='error' 红色、tone='warn' 琥珀色。页面不再拼 'hint hint-err' 字符串。
+// 读屏（C7-007）：全站的错误/提示只有这一个出口，而它此前是个无 role 的 div、目录里也没有
+// 任何兜底 live region ⇒ 保存失败/触发失败/自动运行出错对读屏完全静默。现在每个 Hint 都是
+// 活区域：错误 role=alert（断言式，立刻播报），其余 role=status + aria-live=polite（不打断
+// 用户正在读的内容）。aria-atomic 让整句一起播、不逐节点拼读；同一段文本在原位重渲染不会
+// 产生 DOM 变更，因此不会反复播报（先消失再出现本就是新的一次提示，该再播一次）。
 function Hint ({ tone, style, children }) {
   // 提示行随错误/成功信息出现：轻量入场，扫一眼就知道「下面多了一行」。
   const ref = useRef(null)
   useMountReveal(ref, { y: 8, duration: MOTION.fast })
-  return html`<div ref=${ref} class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')} style=${style}>${children}</div>`
+  const err = tone === 'error'
+  return html`<div ref=${ref}
+    class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')}
+    style=${style} role=${err ? 'alert' : 'status'} aria-live=${err ? 'assertive' : 'polite'}
+    aria-atomic="true">${children}</div>`
 }
 
 // 入场包装：给「条件渲染的整块内容」补一次性淡入（预览块、提示横幅）。
