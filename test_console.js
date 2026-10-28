@@ -3369,6 +3369,73 @@ async function main () {
       fs.rmSync(modDir, { recursive: true, force: true })
     }
   })
+  await aok('前端数据层: 手写条件端点（runs/auto/messages）304 且本地无副本时同样重取（不把 304 当错误）', async () => {
+    // C7-025：这三个端点手写 addConditional + consumeJson，但没给 consumeJson 传 retry。
+    // 304 到达时若同一 key 的 tag 已被并发响应换掉（或条目被 16 条容量淘汰），旧实现直接
+    // reject「HTTP 304（无本地副本）」，界面显示「加载失败：HTTP 304（无本地副本）」。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = mkTmp('xbk-api-cond-retry-')
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const res200 = (tag, data) => ({
+      status: 200,
+      ok: true,
+      headers: { get: (n) => (String(n).toLowerCase() === 'etag' ? tag : null) },
+      json: async () => data
+    })
+    const res304 = () => ({ status: 304, ok: false, headers: { get: () => null }, json: async () => { throw new Error('304 不得读 body') } })
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      globalThis.document = { getElementById: () => null }
+      globalThis.window = { dispatchEvent: () => {} }
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      // 剧本（逐端点重放）：① 基线 200 写 t-1 ② A 带 t-1 挂起 ③ B 并发 200 换 t-2
+      // ④ A 的 304 后到 → 必须去掉条件头重取（旧实现在这里抛 304）。
+      const runRace = async (label, call) => {
+        const calls = []
+        let releaseLast = null
+        const gate = new Promise((resolve) => { releaseLast = resolve })
+        let step = 0
+        globalThis.fetch = async (url, opts) => {
+          const headers = { ...((opts && opts.headers) || {}) }
+          const condKeyName = Object.keys(headers).find((k) => k.toLowerCase() === 'if-none-match')
+          calls.push({ url: String(url), cond: condKeyName !== undefined, tag: condKeyName ? headers[condKeyName] : null })
+          step += 1
+          if (step === 1) return res200('"t-1"', { v: 1 })
+          if (step === 2) { await gate; return res304() }
+          if (step === 3) return res200('"t-2"', { v: 2 })
+          if (step === 4) return res200('"t-3"', { v: 3 })
+          throw new Error(`${label}: fetch 调用次数超出剧本（304 分支可能重复重试）`)
+        }
+        assert.deepStrictEqual(await call(), { v: 1 }, `${label} 基线 200 必须写入 t-1`)
+        const pA = call()
+        const pB = call()
+        assert.deepStrictEqual(await pB, { v: 2 }, `${label} 并发 B 必须换掉同一 key 的 tag`)
+        releaseLast()
+        let got = null
+        let err = null
+        try { got = await pA } catch (e) { err = e }
+        assert.strictEqual(err, null, `${label} 304 到达时本地 tag 已不是发出去的那个：必须重取，不得把 304 当错误（实际 ${err && err.message}）`)
+        assert.deepStrictEqual(got, { v: 3 }, `${label} 必须返回重取到的真实数据`)
+        assert.strictEqual(calls.length, 4, `${label} 重试恰好一次（总共 4 次 fetch）`)
+        assert.strictEqual(calls[1].cond, true, `${label} A 必须带 If-None-Match（否则没测到 304 分支）`)
+        assert.strictEqual(calls[3].cond, false, `${label} 重取必须去掉 If-None-Match（否则还是 304）`)
+      }
+      await runRace('apiGetRuns', () => mod.apiGetRuns())
+      await runRace('apiGetAuto', () => mod.apiGetAuto())
+      await runRace('apiGetMessages', () => mod.apiGetMessages({}))
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
+
   await aok('前端数据层: AbortSignal.timeout 覆盖「头到了、body 挂起」，无该 API 时 fallback 同样中止', async () => {
     // 旧实现用 Promise.race 手写第二层期限（readBodyJson）兜「头已到、体挂起」；
     // v3.385 改成一个 AbortSignal.timeout 同时管 fetch 与 body 读取。这里用真 HTTP
