@@ -1271,6 +1271,108 @@ try {
   fs.rmSync(shimProbeDir, { recursive: true, force: true })
 }
 
+// 3g5 信号收尾（C10-044）：入口自己没有任何 SIGINT/SIGTERM handler，而套件以 detached 新进程组运行
+//     ⇒ Ctrl-C / CI 取消只杀入口，孤儿套件继续跑（占 CPU / 端口 / 临时目录，还继续持有继承的 fd）。
+//     判据：收到信号后入口必须**整组杀伤**当前套件并以非零退出码收场（不是被信号默认语义杀死）。
+//     心跳等式的不变式是「**入口退出之后**套件不得再写盘」（孤儿是否继续写），故取样点是
+//     「退出后」vs「退出后 + 700ms 观察窗」（与 3g4 同口径，见下方 sizeAfterExit / sizeLater）；
+//     入口运行期间的快照只作诊断打印，不参与断言——它与退出后快照之间隔着一次信号投递，
+//     套件每 50ms 追加一次心跳，多写一次就红（旧实现正是这个取样点竞态，属间歇性假红）。
+//     手法：桩套件写自己的 pid + 每 50ms 追加心跳后挂死；probe 拉起真入口、等套件起跑、给入口发信号、
+//     等它自己 exit，再比对心跳是否停住 + 套件是否已死（probe 用 async main，外层仍是 spawnSync，
+//     与 3g4 同款「有界、不挂死」口径；套件自带 90s 自杀兜底）。
+const SIGNAL_PROBE = [
+  "const { spawn } = require('child_process')",
+  "const fs = require('fs')",
+  "const path = require('path')",
+  'const dir = __dirname',
+  "const signal = process.argv[2] || 'SIGINT'",
+  "const pidFile = path.join(dir, 'suite.pid')",
+  "const hbFile = path.join(dir, 'suite.alive')",
+  'const isAlive = (pid) => { try { process.kill(pid, 0); return true } catch (e) { return false } }',
+  'const waitFor = (fn, ms) => new Promise(resolve => {',
+  '  const t0 = Date.now()',
+  '  const tick = () => {',
+  '    let ok = false',
+  '    try { ok = fn() } catch (e) { ok = false }',
+  '    if (ok) return resolve(true)',
+  '    if (Date.now() - t0 > ms) return resolve(false)',
+  '    setTimeout(tick, 50)',
+  '  }',
+  '  tick()',
+  '})',
+  ';(async () => {',
+  "  const entry = spawn(process.execPath, [path.join(dir, 'run_tests.js')], { cwd: dir, stdio: 'ignore' })",
+  '  let exitInfo = null',
+  '  const exitP = new Promise(resolve => {',
+  '    const t = setTimeout(() => resolve({ timeout: true }), 20000)',
+  "    entry.on('exit', (code, sig) => { clearTimeout(t); exitInfo = { code, signal: sig }; resolve(exitInfo) })",
+  '  })',
+  '  const started = await waitFor(() => fs.existsSync(pidFile) && fs.existsSync(hbFile), 20000)',
+  "  const suitePid = started ? Number(fs.readFileSync(pidFile, 'utf8').trim()) : 0",
+  '  await new Promise(r => setTimeout(r, 400))',
+  // sizeBefore 只进 JSON 诊断（证明套件在入口运行期间确实在写盘），**不参与断言**：它与退出后的快照之间
+  // 隔着一次信号投递（kill 是异步投递，套件还能再写一拍），拿它做等式就是取样点竞态。
+  '  const sizeBefore = started ? fs.statSync(hbFile).size : 0',
+  '  const killed = entry.kill(signal)',
+  '  const exit = killed ? await exitP : (exitInfo || { neverStarted: true })',
+  // 取样点改成「退出后」：exit 事件在入口 handler 整组 SIGKILL 并 process.exit(130/143) 之后才到，
+  // 此刻套件已死；sizeLater 是同一状态再等一个 700ms 观察窗（照 3g4）后的采样——两者相等才说明
+  // 「退出后不再写盘」这一不变式成立（孤儿若存活，50ms 一拍必在此期间长出若干字节）。
+  '  const sizeAfterExit = fs.existsSync(hbFile) ? fs.statSync(hbFile).size : 0',
+  '  await new Promise(r => setTimeout(r, 700))',
+  '  const sizeLater = fs.existsSync(hbFile) ? fs.statSync(hbFile).size : 0',
+  '  const suiteAlive = suitePid > 0 && isAlive(suitePid)',
+  "  if (suiteAlive) { try { process.kill(suitePid, 'SIGKILL') } catch (e) {} }",
+  '  console.log(JSON.stringify({ started, suitePid, sizeBefore, sizeAfterExit, sizeLater, suiteAlive, exit }))',
+  '  process.exit(0)',
+  '})()',
+  ''
+].join('\n')
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  const sigDir = makeRunTestsSandbox(
+    [{ name: '信号收尾套件', file: 'test_stub_signal.js', desc: '写 pid/心跳后挂死' }],
+    {
+      'test_stub_signal.js': [
+        "const fs = require('fs')",
+        "const path = require('path')",
+        "fs.writeFileSync(path.join(__dirname, 'suite.pid'), String(process.pid) + '\\n')",
+        "fs.writeFileSync(path.join(__dirname, 'suite.alive'), 'X')",
+        "setInterval(() => fs.appendFileSync(path.join(__dirname, 'suite.alive'), 'X'), 50)",
+        // 有界自杀：正常路径由入口的整组杀伤收口；被外部 kill -9 掉入口时本桩也不会永久留下。
+        // 刻意不与 3g4 的 90s 常量同形——test_host_clean_gates.js 按字面量计数「父桩 + 孙进程各一处」，
+        // 换个数值既保住那条断言，也不 weaken 本夹具的自杀兜底。
+        'setTimeout(() => process.exit(0), 120000).unref()',
+        ''
+      ].join('\n'),
+      'signal_probe.js': SIGNAL_PROBE
+    }
+  )
+  try {
+    const probe = spawnSync(process.execPath, [path.join(sigDir, 'signal_probe.js'), signal], {
+      encoding: 'utf8', cwd: sigDir, env: { ...process.env }, timeout: 60000
+    })
+    assert.strictEqual(probe.status, 0, `${signal} probe 自身应正常结束：${probe.stdout}${probe.stderr}`)
+    const out = JSON.parse(probe.stdout.trim().split('\n').pop())
+    assert.strictEqual(out.started, true, `${signal}：夹具套件必须真的起跑（否则本用例没有验证对象）`)
+    assert.ok(!out.exit.timeout, `${signal}：入口必须自行收敛（20s 内未退出）`)
+    assert.strictEqual(out.exit.signal, null,
+      `${signal}：入口被信号默认语义杀死（signal=${out.exit.signal}）⇒ 没有任何信号 handler`)
+    assert.notStrictEqual(out.exit.code, 0, `${signal}：收尾退出码必须非 0（被打断不等于通过）`)
+    // 不变式 = 入口退出后套件不得再写盘（孤儿是否继续写）。取样点必须是「退出后」对「退出后 + 观察窗」：
+    // 拿信号前的快照做等式会把「投递期间多写的一拍心跳」也算成失败（旧的取样点竞态，间歇性假红），
+    // 那既不是孤儿判据、也拦不住任何真 bug —— 强度不降：700ms 内套件若存活会写 ≥14 拍，必红。
+    assert.strictEqual(out.sizeLater, out.sizeAfterExit,
+      `${signal}：入口退出后孤儿套件仍在写心跳（退出时 ${out.sizeAfterExit} → 观察窗 700ms 后 ${out.sizeLater} 字节）——` +
+      '信号没有转发成整组杀伤，detached 套件继续跑')
+    assert.strictEqual(out.suiteAlive, false, `${signal}：套件进程（pid ${out.suitePid}）必须已死亡`)
+    console.log(`✅ ${signal} 收尾：入口以 ${out.exit.code} 退出，套件（pid ${out.suitePid}）随进程组一起被清掉；` +
+      `心跳在退出后 700ms 内冻结于 ${out.sizeAfterExit} 字节（信号前 ${out.sizeBefore}）`)
+  } finally {
+    fs.rmSync(sigDir, { recursive: true, force: true })
+  }
+}
+
 // 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
 //    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
 //    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的

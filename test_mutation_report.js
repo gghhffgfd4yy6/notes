@@ -14,7 +14,7 @@ const {
   formatReuseCell, stripAnsi, reuseUnaccountedCount, reuseOriginSuffix,
   REUSE_MODE_FULL, REUSE_MODE_PARTIAL, REUSE_MODE_UNKNOWN, HIGH_REUSE_RATIO,
   CACHE_HIT_PRIMARY, CACHE_HIT_FALLBACK, CACHE_HIT_NONE, mapCacheHitArg, normalizeCacheHitField,
-  coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER,
+  coveredScore, coveredDenominator, formatCovered, NO_COVERAGE_PLACEHOLDER, validMutantCount, formatTotalCell,
   parseMatrixRunnerConfigs, readMatrixRunnerConfigs, formatSegmentLabel, scoreOf, COMMAND_RUNNER_CONFIG, COMMAND_SEGMENT_MARK,
   parseMatrixTimeouts, readMatrixTimeouts, readTimeoutStats, formatTimeoutLimit, timeoutKindCell, formatTimeoutCell,
   DEFAULT_SEGMENT_TIMEOUT_MS, TIMEOUT_STATS_FILENAME, EXPECTED_SEGMENTS,
@@ -448,6 +448,96 @@ check('render：全部全量 ⇒ 明确写出「对应本 commit 的测试状态
   ])
   assert.ok(out.includes('本轮 2 段全部全量重算（无复用）⇒ 分数与存活清单对应本 commit 的测试状态。'), `应给出全量结论：\n${out}`)
   assert.ok(!out.includes('含未重算的结果'), '无复用段时不得出现复用警示')
+})
+
+// C10-022（audit38 · P2）：判据缺 `unknown.length === usable.length`。
+// 旧实现在「2 段全量 + 1 段未记录」时也走「本次日报没有任何段的复用状态记录」分支——而 2 段明明有记录，
+// 且它只列未记录的那 1 段，与同函数末行「其余 2 段本轮为全量重算（共 3 段：0 段含复用、1 段未记录）」
+// 自相矛盾（对外日报里的事实错误）。「没有任何段」只允许在**所有**可用段都未记录时出现。
+check('render：全量 + 未记录混合时不得宣称「没有任何段的复用状态记录」（C10-022）', () => {
+  const full = (seg) => ({ seg, total: 2, killed: 2, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } })
+  const unknown = { seg: 'rules', total: 2, killed: 1, survived: 1, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } }
+  const out = render([full('a'), full('b'), unknown])
+  assert.ok(!out.includes('没有任何段的复用状态记录'),
+    `2 段有复用记录时不得说「没有任何段」：\n${out}`)
+  assert.ok(out.includes('另有 1 段没有复用状态记录'), `未记录的 1 段必须走增量分支点名：\n${out}`)
+  // 文案里的段数必须与真正列出的段数一致（旧实现写「没有任何段」却只列 1 段）
+  const unknownLine = out.split('\n').find(l => l.includes('另有 1 段没有复用状态记录'))
+  assert.strictEqual((unknownLine.match(/`[^`]+`/g) || []).length, 1,
+    `「另有 1 段」必须恰好点名 1 段，实际：${unknownLine}`)
+  assert.ok(out.includes('其余 2 段本轮为全量重算（共 3 段：0 段含复用、1 段未记录）。'),
+    `末行必须如实给出「其余 2 段全量重算」（旧实现只在这句里出现，却与上面互斥）：\n${out}`)
+})
+
+check('render：全部段都未记录时仍须说「没有任何段的复用状态记录」并逐段点名（C10-022 边界）', () => {
+  const unknown = (seg) => ({ seg, total: 1, killed: 1, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } })
+  const out = render([unknown('a'), unknown('b')])
+  assert.ok(out.includes('没有任何段的复用状态记录'), `全部未记录时该结论才成立：\n${out}`)
+  const listed = out.split('\n').find(l => l.startsWith('未记录复用状态的段（2）：'))
+  assert.ok(listed, `必须给出未记录段清单（2 段）：\n${out}`)
+  assert.strictEqual((listed.match(/`[^`]+`/g) || []).length, 2, `清单段数必须与「2 段」一致，实际：${listed}`)
+})
+
+check('render：全量 + 未记录 + 复用混合时三类计数互斥且段数自洽（C10-022 边界）', () => {
+  const out = render([
+    { seg: 'a', total: 2, killed: 2, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } },
+    { seg: 'b', total: 4, killed: 2, survived: 2, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_PARTIAL, reused: 2, total: 4, ratio: 0.5, high: true } },
+    { seg: 'c', total: 2, killed: 1, survived: 1, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } }
+  ])
+  assert.ok(!out.includes('没有任何段的复用状态记录'), `有复用段时不得说「没有任何段」：\n${out}`)
+  assert.ok(out.includes('- `b`：复用 2/4（50.00%）'), `含复用段必须逐段标注：\n${out}`)
+  assert.ok(out.includes('另有 1 段没有复用状态记录'), `未记录段必须单列：\n${out}`)
+  assert.ok(out.includes('其余 1 段本轮为全量重算（共 3 段：1 段含复用、1 段未记录）。'),
+    `三类计数必须互斥且合计为 3 段：\n${out}`)
+})
+
+// C10-023（audit38 · P2）：全段 RuntimeError/CompileError 时 countMutant 只抬 total、四个桶全 0，
+// analyzeSegment 不报错（只拦 total===0），render 因 allSurvived 为空输出「🎉 无存活变异体！」——
+// 而 report job 是 `if: always()`，守卫变红也照发日报 ⇒ 读到的是「全绿」。这里锁死：没有有效变异体
+// （killed+timeout+survived+noCoverage === 0）的段必须被点名，且**不得**出现任何绿话术。
+check('render：全 RuntimeError 段不得输出「无存活变异体」绿话术（C10-023）', () => {
+  const out = render([
+    { seg: 'app', total: 5, killed: 0, survived: 0, noCoverage: 0, timeout: 0, score: 0, runtimeError: 5, compileError: 0, survivedMutants: [] }
+  ])
+  assert.ok(!out.includes('🎉'), `全 RuntimeError 时不得出现 🎉：\n${out}`)
+  assert.ok(!out.includes('无存活变异体！'), `不得把「没有结果」说成「没有存活变异体」：\n${out}`)
+  assert.ok(out.includes('无有效变异体'), `必须点名「无有效变异体」：\n${out}`)
+  assert.ok(out.includes('本段不构成判据'), `必须明说不构成判据：\n${out}`)
+  assert.match(out, /RuntimeError 5/, `必须给出 RuntimeError 计数：\n${out}`)
+  // 变异体列的括号披露：读者在表里就能看到 5 个变异体里有 5 个是 RuntimeError
+  assert.ok(out.includes('| app | 5（RE 5） |'), `变异体列必须披露不可计入状态：\n${out}`)
+  // 结构断言：说明文字不得插在表格中间——合计行必须**紧接**段行（放错位置会把表格截断，
+  // 合计行变成游离行；本组实现的第一版正是踩了这个坑，靠这条断言锁住）
+  assert.ok(/\| app \|[^\n]*\n\| \*\*合计\*\* \|/.test(out), `合计行必须紧跟段行（表格不得被说明文字截断）：\n${out}`)
+  assert.ok(out.includes('`变异体` 列括号 = 不可计入状态'), '括号口径必须在表后解释')
+  assert.ok(out.indexOf('`变异体` 列括号 = 不可计入状态') > out.indexOf('| **合计** |'), '说明文字必须在合计行之后')
+})
+
+check('render：部分段全 RuntimeError + 部分段全被杀时仍不得说「无存活变异体」（C10-023 混合边界）', () => {
+  const out = render([
+    { seg: 'utils', total: 3, killed: 3, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [] },
+    { seg: 'app', total: 4, killed: 0, survived: 0, noCoverage: 0, timeout: 0, score: 0, runtimeError: 3, compileError: 1, survivedMutants: [] }
+  ])
+  assert.ok(!out.includes('🎉'), `有段无有效变异体时不得给绿话术：\n${out}`)
+  assert.ok(!out.includes('无存活变异体！'), `不得让读者以为全部变异体都被检出：\n${out}`)
+  assert.ok(out.includes('无有效变异体的段'), `必须给出专门小节：\n${out}`)
+  assert.ok(out.includes('- `app`：变异体 4 个（RuntimeError 3 / CompileError 1），有效变异体 0'), `必须逐段给出计数：\n${out}`)
+  assert.ok(out.includes('不得读作「全部变异体被检出」'), `必须堵死「全绿」误读：\n${out}`)
+})
+
+check('render：有效变异体 > 0 且无存活时仍保留原有 🎉 分支（C10-023 非回归）', () => {
+  const out = render([
+    { seg: 'utils', total: 3, killed: 3, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [] }
+  ])
+  assert.ok(out.includes('## 🎉 无存活变异体！'), `真正的全被杀仍走原分支：\n${out}`)
+  assert.ok(!out.includes('无有效变异体'), `不得在正常段上误加警示：\n${out}`)
+})
+
+check('validMutantCount：只数四个可计入桶（RuntimeError/CompileError 不算有效）', () => {
+  assert.strictEqual(validMutantCount({ killed: 1, timeout: 2, survived: 3, noCoverage: 4 }), 10)
+  assert.strictEqual(validMutantCount({ total: 5, runtimeError: 5 }), 0, '全 RuntimeError ⇒ 0 个有效变异体')
+  assert.strictEqual(validMutantCount({}), 0)
+  assert.strictEqual(validMutantCount(null), 0)
 })
 
 // ===== sticky 分支 / 计数口径不符（本代理补：前任漏掉的「N/M 只是下界」这一层）=================
@@ -1422,6 +1512,33 @@ try {
     const missing = analyzeSegment(tmp, { name: 'mutation-report-nonexist' })
     assert.strictEqual(missing.error, '缺 mutation-report.json')
     assert.strictEqual(missing.reportMtimeMs, undefined, '缺报告的段不带时间（不参与新鲜度比较）')
+  })
+
+  // C10-023：不可计入状态必须被计数出来，否则 render 无从判断「这段其实没有有效变异体」。
+  check('analyzeSegment 统计 RuntimeError / CompileError（C10-023 的输入）', () => {
+    const d = path.join(tmp, 'mutation-report-all-re'); fs.mkdirSync(d, { recursive: true })
+    fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
+      files: {
+        'r.js': {
+          mutants: [
+            { status: 'RuntimeError', statusReason: 'boom' },
+            { status: 'RuntimeError' },
+            { status: 'RuntimeError' },
+            { status: 'CompileError' },
+            { status: 'Killed' }
+          ]
+        }
+      }
+    }))
+    const r = analyzeSegment(tmp, { name: 'mutation-report-all-re' })
+    assert.strictEqual(r.error, undefined, `合法报告不得被判错：${r.error}`)
+    assert.strictEqual(r.total, 5, '不可计入状态同样计入 total（口径不变）')
+    assert.strictEqual(r.runtimeError, 3, 'RuntimeError 必须单独计数')
+    assert.strictEqual(r.compileError, 1, 'CompileError 必须单独计数')
+    assert.strictEqual(validMutantCount(r), 1, '有效变异体只数 killed/timeout/survived/noCoverage')
+    // 变异体列披露（C10-023 建议项）：只有存在不可计入状态时才加括号，正常段输出一字不变
+    assert.strictEqual(formatTotalCell(r), '5（RE 3/CE 1）')
+    assert.strictEqual(formatTotalCell({ total: 7, killed: 7 }), '7', '正常段不得出现括号（快照零漂移）')
   })
 
   // F1（mutation-json 返工）：预读大小上限必须由**生产调用方**注入——本用例把生产入口
