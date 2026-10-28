@@ -1965,20 +1965,44 @@ check('RE2 警告: 清理只删标记自身形状（标记/.lock/.reclaim/.tmp�
   const mfs = makeMemFs()
   const oldStamp = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date(Date.now() - 9 * 86400000))
   const base = dir + '/re2warn.state.' + oldStamp
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
+  // .tmp 残留必须按**生产真实命名**造：直接调 _writeRe2WarnMarkerAtomic，让它停在
+  // writeFileSync 之后、rename 之前（rename 抛错 + 兜底 unlink 也失败，等价于进程在此处崩溃）。
+  // 该函数命名是 `${statePath}.${process.pid}.${Date.now()}.tmp`——纯数字段、**无 hex 段**；
+  // 旧白名单写死 12 位 hex（那是 xbk_storage.writeAtomic 的形态，re2 标记从不走它），会漏清真实残留。
+  const origRename = mfs.renameSync
+  const origUnlink = mfs.unlinkSync
+  mfs.renameSync = () => { const e = new Error('EIO: rename failed'); e.code = 'EIO'; throw e }
+  mfs.unlinkSync = (p) => {
+    if (String(p).endsWith('.tmp')) { const e = new Error('EPERM: unlink failed'); e.code = 'EPERM'; throw e }
+    return origUnlink(p)
+  }
+  const wrote = app._writeRe2WarnMarkerAtomic(base, '{"status":"pending"}')
+  mfs.renameSync = origRename
+  mfs.unlinkSync = origUnlink
+  const tmpResidues = [...mfs._files.keys()].filter(p => p.startsWith(base + '.') && p.endsWith('.tmp'))
+  assert.strictEqual(wrote, false, '模拟写入中途崩溃：_writeRe2WarnMarkerAtomic 必须返回 false')
+  assert.strictEqual(tmpResidues.length, 1, `崩溃必须留下一个 .tmp 残留（实际 ${JSON.stringify(tmpResidues)}）`)
+  const tmpResidue = tmpResidues[0]
+  assert.match(tmpResidue.slice(base.length), /^\.\d+\.\d+\.tmp$/,
+    `re2 标记 tmp 的真实形状是 <statePath>.<pid>.<ts>.tmp（无 hex 段），实际 ${tmpResidue}`)
   mfs.writeFileSync(base, '{"status":"completed"}')
   mfs.writeFileSync(base + '.lock', '999999:x')
   mfs.writeFileSync(base + '.1234.1700000000000.reclaim', '')
-  mfs.writeFileSync(base + '.1234.1700000000000.abcdef123456.tmp', '')
   // 自定义 pushUrl 末段恰为 re2warn.state.<date> 时，getFileName 得到的合法判重缓存及其墓碑
+  // （含其 writeAtomic 临时文件：`<名字>.json.<pid>.<ts>.<hex12>.tmp`——带 .json 段，不属于本模块命名，不得删）
   mfs.writeFileSync(base + '.json', '{"items":[]}')
   mfs.writeFileSync(base + '.json.seen.json', '{"tombstones":[]}')
-  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
+  mfs.writeFileSync(base + '.json.1234.1700000000000.abcdef123456.tmp', '')
   app._cleanupStaleRe2WarnMarkers()
-  for (const suffix of ['', '.lock', '.1234.1700000000000.reclaim', '.1234.1700000000000.abcdef123456.tmp']) {
+  for (const suffix of ['', '.lock', '.1234.1700000000000.reclaim']) {
     assert.strictEqual(mfs._files.has(base + suffix), false, `过期残留「${suffix || '(标记)'}」必须清理`)
   }
+  assert.strictEqual(mfs._files.has(tmpResidue), false, '崩溃残留的 re2 标记 .tmp 必须按真实形状清理（否则永久累积）')
   assert.strictEqual(mfs._files.has(base + '.json'), true, '同形合法判重缓存不得被启动清理删除（删了下轮全量重推）')
   assert.strictEqual(mfs._files.has(base + '.json.seen.json'), true, '判重缓存的 .seen.json 墓碑不得被删除（删了裁剪墓碑失效）')
+  assert.strictEqual(mfs._files.has(base + '.json.1234.1700000000000.abcdef123456.tmp'), true,
+    '判重缓存自己的 writeAtomic 临时文件（带 .json 段）不得被当成标记残留删除')
 })
 
 check('RE2 警告锁: 独占创建（wx），锁被占用且持锁进程存活时不抢占、超时放弃', () => {

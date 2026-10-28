@@ -468,7 +468,10 @@ function createApp ({
     // - re2warn.state.YYYY-MM-DD.lock（_acquireRe2WarnLock 的 per-date 锁）
     // - re2warn.state.YYYY-MM-DD.<pid>.<time>.reclaim（F3：崩溃残留的认领临时文件，
     //   进程在 rename 后、删除前退出会遗留；同样按日期兜底清理，避免永久累积）
-    // - re2warn.state.YYYY-MM-DD.<pid>.<time>.<hex>.tmp（writeAtomic 崩溃残留的临时文件）
+    // - re2warn.state.YYYY-MM-DD.<pid>.<time>.tmp（_writeRe2WarnMarkerAtomic 崩溃残留：临时文件
+    //   已写、rename 前进程退出。命名是 `<statePath>.<pid>.<ts>.tmp`——纯数字段，**没有 hex 段**；
+    //   xbk_storage.writeAtomic 的 `<path>.<pid>.<ts>.<hex12>.tmp` 形态在本前缀下只可能属于判重缓存
+    //   （`<名字>.json.<pid>.<ts>.<hex12>.tmp`），多出 `.json` 段，不得当作标记残留删除）
     // C1-002：旧判据是「前缀 + 首段是日期」，凡同形名字一律 unlink——自定义 pushUrl 末段恰为
     // re2warn.state.<date> 时，getFileName 得到的合法判重缓存 re2warn.state.<date>.json 与其
     // .json.seen.json 墓碑都落在这个前缀下，会被启动清理静默删除（下轮全量重推、裁剪墓碑失效）。
@@ -480,7 +483,7 @@ function createApp ({
       if (/^\d{4}-\d{2}-\d{2}$/.test(rest)) return true
       if (/^\d{4}-\d{2}-\d{2}\.lock$/.test(rest)) return true
       if (/^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.reclaim$/.test(rest)) return true
-      return /^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.[0-9a-f]{12}\.tmp$/.test(rest)
+      return /^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.tmp$/.test(rest)
     },
 
     _cleanupStaleRe2WarnMarkers () {
