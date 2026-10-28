@@ -9455,19 +9455,6 @@ console.log('========================================\n');
     assertEqual(hasDangerLink('[x](data:text/html,x)'), true, 'data: 应检出')
   })
 
-  if (failed === 0) {
-    console.log(`  🎉 全部通过！${passed}/${passed}  100%`)
-  } else {
-    console.log(`  ⚠️   ${passed} 通过, ${failed} 失败, 共 ${passed + failed} 个`)
-    errors.forEach((e, i) => {
-      console.log(`    ${i + 1}. ${e.name}\n       ${e.message}`)
-    })
-  }
-  console.log('========================================\n')
-
-  // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
-  cleanupTestCache()
-
   // v3.236：缓存文件缺失且恢复写入抛错（磁盘满/权限）时，readMessages 降级返回内存快照，不向外抛
   await test('readMessages 文件缺失且恢复写入抛错时降级返回内存快照（v3.236）', () => {
     const p = path.join(CACHE, 'test_restore_throw.json')
@@ -11231,12 +11218,31 @@ console.log('========================================\n');
     assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
   })
 
+  // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
+  // C4-001：本行与下方汇总横幅原先停在文件**中段**（原 :9458-9469），其后又追加了 91 个顶层用例，
+  // 于是横幅/三数字只覆盖前 819 例（910 例里恒少算 10%）、尾部用例的 ❌ 出现在绿色横幅之后且不进
+  // errors 编号列表。整块移到最后一个用例之后、process.exit 之前；顺序为「清 test_* 残留 → 私有
+  // 分片目录整体删除 → 汇总横幅 → 退出」，保证横幅与三数字是退出前最后一段输出（清理告警不会盖在
+  // 结果之后）。退出码一直用最终 failed，语义不变（本条只修「输出即证据」）。
+  cleanupTestCache()
+
   // 并发隔离目录是本进程私有产物：退出前整体删除，避免 Stryker 沙箱内逐变异体累积
   // （沙箱全生命周期只建一个，百级变异体会留下百级目录）。不碰共享的 xianbaoku_cache。
   if (OWNS_CACHE_DIR) {
     // 删不掉就留痕（不再静默）：分片目录滞留仓库根正是本仓修过的事故，只 warn 不改退出码
     cleanupDirInRoot(CACHE)
   }
+
+  // 汇总横幅：必须覆盖**全部**顶层用例（原因见上方 cleanupTestCache 前的 C4-001 说明）
+  if (failed === 0) {
+    console.log(`  🎉 全部通过！${passed}/${passed}  100%`)
+  } else {
+    console.log(`  ⚠️   ${passed} 通过, ${failed} 失败, 共 ${passed + failed} 个`)
+    errors.forEach((e, i) => {
+      console.log(`    ${i + 1}. ${e.name}\n       ${e.message}`)
+    })
+  }
+  console.log('========================================\n')
 
   process.exit(failed > 0 ? 1 : 0)
 })()
