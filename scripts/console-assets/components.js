@@ -1189,6 +1189,17 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
   // 一起 set：首帧就是最终文案；拿不到（失败/超时）才用兜底文案，绝不在显示后改。
   const [pendingNames, setPendingNames] = useState(null)
   const confirmSeqRef = useRef(0)
+  // C7-001：这个确认弹窗渲染在概览那一段 <section hidden> 内部。弹窗打开时按浏览器后退
+  // （hashchange → 切页）或点别的页签，section 会被置 display:none，而 dialog 仍是 open/:modal
+  // ⇒ 弹窗塌成 0×0、整页继续 inert：桌面还能按 Esc，手机上只能刷新页面。
+  // 修法＝切页即按「取消」收口（与 onCancel 同一条 setPending(null)，不是只 dialog.close()），
+  // 并作废还在路上的 askConfirm——配置 600ms 后才回来的话，不得把弹窗重新弹到隐藏页里。
+  // open 另用 active 门控（见下面的 ConfirmDialog）：关闭与切页落在同一次提交，不留坏帧。
+  useEffect(() => {
+    if (active) return
+    confirmSeqRef.current++
+    setPending(null)
+  }, [active])
   const askConfirm = useCallback((action) => {
     const seq = ++confirmSeqRef.current
     let timer = 0
@@ -1350,7 +1361,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
       ${auto.err && html`<${Hint} tone="error">${auto.err}<//>`}
     </div>
-    <${ConfirmDialog} open=${pending !== null}
+    <${ConfirmDialog} open=${pending !== null && active}
       title=${pending === 'run' ? '确认正式运行一轮？' : pending === 'auto' ? '确认开启自动正式运行？' : '确认发送通知自检？'}
       confirmLabel=${pending === 'run' ? '确认真实推送' : pending === 'auto' ? '开始自动运行' : '确认发送'}
       busy=${locking} onConfirm=${confirmPending} onCancel=${() => setPending(null)}>

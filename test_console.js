@@ -9784,6 +9784,35 @@ async function main () {
     assert.ok(snapBlock.includes('prev.at > startedAt'), '多标签页：旧响应不得覆盖更新快照')
     assert.ok(!snapBlock.includes('BOOT.token'), '快照不得包含 token')
   })
+
+  // ── W2 audit38 组 g4（C7-001 / C7-006 / C7-007 / C7-008）────────────────────
+  // htm 属性值里的「$ + {表达式}」按仓内既有写法拆开拼，避免 standard 的
+  // no-template-curly-in-string（本意不是模板字符串）。
+  const attrOpen = (expr) => 'open=' + '$' + '{' + expr + '}'
+  await aok('结构红线: C7-001 确认弹窗随切页关闭（后退到别的页不得留 open 弹窗在 hidden section 里）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function TriggerBar')
+    const end = src.indexOf('// ── 组件：运行历史', at)
+    assert.ok(at > -1 && end > at, '应能定位 TriggerBar')
+    const seg = src.slice(at, end)
+    // 弹窗就渲染在概览那一段 <section hidden> 里面。切页（含浏览器后退）时若只把 section
+    // 置 display:none，dialog 仍是 open/:modal ⇒ 塌成 0×0、背景继续 inert（手机只能刷新）。
+    // 所以 open 必须与「当前页」绑在同一个条件里：切页与关闭是同一次提交，不留坏帧。
+    assert.ok(seg.includes(attrOpen('pending !== null && active')),
+      '确认弹窗的 open 必须同时受当前页门控（否则后退切页会把它留在被 display:none 的祖先里）')
+    assert.ok(!/open=\$\{pending !== null\}\s/.test(seg),
+      '不得只按 pending 渲染弹窗（切页后 dialog 仍 open/:modal，整页保持 inert）')
+    assert.ok(/<\$\{TriggerBar\}[\s\S]{0,260}active=\$\{tab === 'overview'\}/.test(src),
+      'TriggerBar 必须真的拿到「当前页」标记（否则上面的门控恒真，等于没修）')
+    // 关掉还不够：pending 必须真清掉（走 onCancel 同一条 setPending(null)）。只调
+    // dialog.close() 会留下卡死的 pending：回到概览又弹一次、确认按钮还绑着旧动作。
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1, '离开当前页时必须主动收口确认弹窗（effect 兜底）')
+    const guard = seg.slice(guardAt, guardAt + 260)
+    assert.ok(guard.includes('setPending(null)'), '切页必须清 pending（只 dialog.close() 会留下卡死的 pending）')
+    assert.ok(guard.includes('confirmSeqRef.current++'),
+      '切页必须作废还在路上的 askConfirm（配置晚回来不得把弹窗重新弹出来）')
+  })
 }
 
 main()
