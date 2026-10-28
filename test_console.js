@@ -9867,6 +9867,43 @@ async function main () {
     assert.ok(roleAt > -1 && roleAt < only.indexOf('>'), 'role 必须落在 <div ...> 的开启标签里')
     assert.ok(!/role="(alert|status)"/.test(only), 'role 必须按 tone 切换，不能写死一种')
   })
+
+  await aok('结构红线: C7-008 日历可键盘进入（open() 后聚焦 calendarContainer / 选完还焦点）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function DateRange (')
+    const end = src.indexOf('// 按区间过滤', at)
+    assert.ok(at > -1 && end > at, '应能定位 DateRange')
+    const seg = src.slice(at, end)
+    // flatpickr 的 keydown 只挂在 _input 与 calendarContainer 上，而从 .date-btn 打开时焦点
+    // 留在按钮上 ⇒ 方向键/Enter 根本到不了实例，键盘只能开/关（Tab 一离开按钮还会被 document
+    // 的 focus 捕获把日历关掉）。容器自带 tabIndex=-1（flatpickr 建的），open() 之后把焦点送
+    // 进去，Le 才能接管：←/→ 逐日、↑/↓ 逐周、Enter 选中。
+    const openAt = seg.indexOf('inst.open()')
+    assert.ok(openAt > -1, '按钮必须调 inst.open() 打开日历')
+    const focusAt = seg.indexOf('inst.calendarContainer.focus(')
+    assert.ok(focusAt > -1, 'open() 后必须把焦点送进日历容器（否则焦点永远进不了日历）')
+    assert.ok(openAt < focusAt, '必须先 open() 再 focus：未打开时容器还是 display:none，focus 会被直接丢弃')
+    // 选完两格日历会自己 close()：焦点必须回到触发按钮，否则落在已经 display:none 的容器里
+    // —— 等于键盘焦点丢失（修好「进得去」却把「出得来」弄丢）。
+    const onChangeAt = seg.indexOf('onChange (dates)')
+    assert.ok(onChangeAt > -1, '应能定位 onChange')
+    const onChangeSeg = seg.slice(onChangeAt)
+    assert.ok(onChangeSeg.includes('btnRef.current.focus('),
+      '选完必须把焦点还给触发按钮（日历随即 close()，焦点不能留在隐藏容器里）')
+    // 前提：容器确实可 programmatic focus（属性名不随压缩改名，升级 flatpickr 时这条会替我们复核）。
+    const fp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'flatpickr.module.js'), 'utf8')
+    assert.ok(fp.includes('calendarContainer.tabIndex=-1'),
+      'calendarContainer 必须仍是 tabIndex=-1（否则 focus() 无效，本修复的前提变了）')
+    // Esc：焦点进日历后 flatpickr 自己也处理 Esc（_input.focus() 再 close），会把焦点丢到
+    // aria-hidden 的 .fp-anchor 上。捕获阶段必须截住这次按键，只走「关闭 + 还给按钮」。
+    const escAt = src.indexOf('function bindEscClose')
+    assert.ok(escAt > -1, '应能定位 bindEscClose')
+    const escSeg = src.slice(escAt, src.indexOf('\n}\n', escAt))
+    assert.ok(escSeg.includes('e.stopPropagation()'),
+      'Esc 必须在捕获阶段截住（否则 flatpickr 的 ke() 会把焦点抢到隐藏锚点 .fp-anchor）')
+    assert.ok(escSeg.includes('inst.close()') && escSeg.includes('restoreFocus()'),
+      'Esc 仍必须关闭日历并把焦点还给触发按钮')
+  })
 }
 
 main()

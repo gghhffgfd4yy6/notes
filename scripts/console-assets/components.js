@@ -482,6 +482,10 @@ function bindEscClose (inst, restoreFocus) {
     if (e.key !== 'Escape' && e.key !== 'Esc') return
     if (!inst.isOpen) return
     e.preventDefault()
+    // C7-008：焦点进日历之后，flatpickr 自己在 calendarContainer 上的 keydown 也会处理 Esc
+    // （case 27 → ke()：先 _input.focus() 再 close），它会把焦点丢到 aria-hidden 的
+    // .fp-anchor 上。捕获阶段就截住这一次 Esc，只走「关闭 + 焦点还给触发按钮」一条路。
+    e.stopPropagation()
     inst.close()
     if (restoreFocus) restoreFocus()
   }
@@ -532,6 +536,9 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
         const t = fmtDayKey(dates[1])
         if (!DAY_KEY_RE.test(f) || !DAY_KEY_RE.test(t) || f > t) return
         if (cbRef.current) cbRef.current({ from: f, to: t })
+        // 选完两格日历会自己关（closeOnSelect）：焦点必须回到触发按钮，否则会留在已经
+        // display:none 的容器里——等于键盘焦点丢失。
+        if (btnRef.current) btnRef.current.focus({ preventScroll: true })
         inst.close()
       }
     })
@@ -553,7 +560,18 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
   return html`<span class="date-range">
     <button type="button" ref=${btnRef} class=${active ? 'date-btn on' : 'date-btn'} disabled=${disabled}
       aria-label=${active ? `${label} ${from} 至 ${to}` : label}
-      onClick=${() => { const inst = instRef.current; if (inst) inst.open() }}>
+      onClick=${() => {
+        const inst = instRef.current
+        if (!inst) return
+        inst.open()
+        // 键盘可用性（C7-008）：flatpickr 的 keydown 只挂在 _input 与 calendarContainer 上，
+        // 而从 .date-btn 打开时焦点留在按钮上 ⇒ 方向键/Enter 根本到不了实例，键盘只能开/关
+        // （Tab 一离开按钮还会被 document 的 focus 捕获把日历关掉）。容器自带 tabIndex=-1
+        // （flatpickr 建的），把焦点送进去 Le 才接管：←/→ 逐日、↑/↓ 逐周、Enter 选中；
+        // 而「焦点跑到日历外就关闭」把容器内部判为内部（calendarContainer.contains），
+        // 所以不会刚聚焦就被关掉。
+        if (inst.calendarContainer) inst.calendarContainer.focus({ preventScroll: true })
+      }}>
       ${active ? dateRangeLabel(from, to, todayKeyShanghai()) : label}
     </button>
     ${active && html`<button type="button" class="date-clear" aria-label=${`清除${label}`} onClick=${clear}>×</button>`}
