@@ -240,7 +240,10 @@ function error (message, code) {
     failures: [{ code: 'HTTP_401', message: 'invalid token' }, { code: 'ETIMEDOUT', message: 'timeout' }]
   }).kind, 'retryable', '顶层 permanent 标签不能覆盖嵌套 retryable 失败')
 
-  assert.strictEqual(classifySummary({
+  // C9-002：pushed/failed 都是**消息**级计数——pushed>0 只说明「不是全灭」，不说明「没有失败」。
+  // 旧实现只要 pushed>0 就返回 null：1 条成功 + 99 条失败也判成功（退出码 0、告警不触发）。
+  // 现在部分失败一律给出 degraded 判定（kind 保持 retryable：未送达的消息下轮必须重试）。
+  const partialMixed = classifySummary({
     total: 2,
     pushed: 1,
     failed: 1,
@@ -248,19 +251,29 @@ function error (message, code) {
       { code: 'HTTP_401', message: 'permanent failure' },
       { code: 'ETIMEDOUT', message: 'transient failure' }
     ]
-  }), null, '部分成功且剩余失败含临时因素时不应熔断')
-  assert.strictEqual(classifySummary({
+  })
+  assert.ok(partialMixed, '部分消息失败不得返回 null（旧实现 pushed>0 无条件判成功）')
+  assert.strictEqual(partialMixed.kind, 'retryable', '部分消息失败必须进入分类（含临时因素时仍可重试）')
+  assert.strictEqual(partialMixed.reason, 'PARTIAL_MESSAGE_FAILURE')
+  assert.ok(String(partialMixed.info.message).includes('成功 1 条') &&
+    String(partialMixed.info.message).includes('失败 1 条'),
+  `部分失败的摘要必须点明成功/失败条数（消息级），实际 ${JSON.stringify(partialMixed.info)}`)
+  const partialPermanent = classifySummary({
     total: 2,
     pushed: 1,
     failed: 1,
-    failures: [{ code: 'HTTP_401', message: 'one channel permanent failure' }]
-  }), null, '部分成功即保持成功，不应因失败通道的永久错误熔断')
-  assert.strictEqual(classifySummary({
+    failures: [{ code: 'HTTP_401', message: 'one message permanently failed' }]
+  })
+  assert.strictEqual(partialPermanent.kind, 'retryable',
+    '单条消息的永久错误不得让常驻入口整轮停止（还有新消息要推），故部分失败统一 retryable')
+  assert.strictEqual(partialPermanent.reason, 'PARTIAL_MESSAGE_FAILURE')
+  const partialTransient = classifySummary({
     total: 2,
     pushed: 1,
     failed: 1,
-    failures: [{ code: 'ETIMEDOUT', message: 'one channel transient failure' }]
-  }), null, '部分成功且仅临时失败时保持继续')
+    failures: [{ code: 'ETIMEDOUT', message: 'one message transient failure' }]
+  })
+  assert.strictEqual(partialTransient.reason, 'PARTIAL_MESSAGE_FAILURE')
 
   const oldInterval = process.env.XBK_INTERVAL_MS
   const oldBackoffCap = process.env.XBK_RETRY_BACKOFF_CAP_MS
@@ -345,8 +358,10 @@ function error (message, code) {
   assert.strictEqual(unknownAll.kind, 'retryable')
   assert.strictEqual(unknownAll.reason, 'ALL_PUSH_FAILED_UNKNOWN')
 
-  // classifySummary：部分成功 + failures 空数组 → 保持成功，不熔断
-  assert.strictEqual(classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] }), null)
+  // classifySummary：部分消息失败 + failures 空数组 → 同样必须降级（不能因为原因未结构化就当成功）
+  const partialUnknown = classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] })
+  assert.ok(partialUnknown, '有消息没送达时不得返回 null')
+  assert.strictEqual(partialUnknown.reason, 'PARTIAL_MESSAGE_FAILURE')
 
   // [XFP-03] 「有没有失败」只由 failed 决定，不得被 total 的缺失/非数字带偏。
   // 反例（改动前）：`Number(total)||0` 使 total<=0 成立 → 直接返回 null，一个有失败的摘要
@@ -362,6 +377,29 @@ function error (message, code) {
   assert.strictEqual(classifySummary({ total: 5 }), null, 'failed 缺失仍为成功')
   assert.strictEqual(classifySummary({ total: 5, failed: 'abc' }), null, 'failed 非数字仍为成功')
   assert.strictEqual(classifySummary({ total: 5, failed: -1 }), null, 'failed 负数仍为成功')
+
+  // C9-002：cacheSaved 从来没被分类器读取——推送成功但成功记录没落盘时摘要仍判绿
+  // （下次运行会重复推送，运维看不到）。入口必须先判 cacheSaved===false → retryable/CACHE_SAVE_FAILED。
+  const cacheFail = classifySummary({ total: 1, pushed: 1, failed: 0, cacheSaved: false })
+  assert.ok(cacheFail, 'cacheSaved=false 必须给出判定（不得返回 null 判绿）')
+  assert.strictEqual(cacheFail.kind, 'retryable')
+  assert.strictEqual(cacheFail.reason, 'CACHE_SAVE_FAILED')
+  // 优先于其它判定：原因是「成功记录没落盘」，不能被通道失败计数掩盖
+  assert.strictEqual(classifySummary({
+    total: 2, pushed: 1, failed: 1, cacheSaved: false, failures: [{ code: 'ETIMEDOUT' }]
+  }).reason, 'CACHE_SAVE_FAILED')
+  // 反向断言：cacheSaved=true / 缺省 仍按原口径（无失败 → null），不得把正常路径判成失败
+  assert.strictEqual(classifySummary({ total: 1, pushed: 1, failed: 0, cacheSaved: true }), null)
+  assert.strictEqual(classifySummary({ total: 1, pushed: 1, failed: 0 }), null)
+
+  // C9-002 实测形态：100 条里 1 条成功、99 条失败——旧实现 pushed>0 无条件返回 null
+  // ⇒ 退出码 0、告警不触发，99 条消息被静默吞掉。
+  const mostlyFailed = classifySummary({
+    total: 100, pushed: 1, failed: 99, cacheSaved: true, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }]
+  })
+  assert.ok(mostlyFailed, '1 条成功 + 99 条失败不得判成功')
+  assert.strictEqual(mostlyFailed.kind, 'retryable')
+  assert.strictEqual(mostlyFailed.reason, 'PARTIAL_MESSAGE_FAILURE')
 
   // code 数值 400-499（未命中 message/错误码集合）→ PROVIDER_xxx 永久
   assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).kind, 'permanent')
@@ -982,7 +1020,7 @@ function error (message, code) {
   check(cyclicSummary.failures.length, 1, '自引用结构的子项仍应产出摘要')
   check(cyclicSummary.failures[0].failures, undefined, '自引用子项必须在祖先环处截断，不得继续展开')
 
-  console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
+  console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分消息失败降级、成功后恢复')
 })().catch(error => {
   console.error(error)
   process.exit(1)

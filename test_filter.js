@@ -5841,24 +5841,63 @@ console.log('========================================\n');
     assertEqual(mod.Config.domain, 'https://new.ixbk.net')
   })
 
-  await test('契约: 单次入口全失败设置非零语义，部分成功保持成功', async () => {
+  await test('契约: 单次入口全失败/部分失败均非零退出（部分消息失败附告警）', async () => {
+    // C9-002 新契约：pushed>0 不再无条件判成功。pushed/failed 都是**消息**级计数，
+    // 「1 条成功 + 99 条失败」也是失败——旧语义（部分成功即 exitCode undefined）会让调度器
+    // 看到绿色退出码，99 条被静默吞掉。新语义：全失败 → 非零；部分消息失败 → 非零 + 告警
+    // （classifySummary 在 failed>0 且 pushed>0 时固定产出 reason=PARTIAL_MESSAGE_FAILURE / kind=retryable）。
     const oldExitCode = process.exitCode
+    // 收集 runSingleEntry 打到 stderr 的失败原因。console.error 只在本次调用期间替换，
+    // finally 必还原——否则会污染其他用例/套件对 stderr 的断言。
+    const captureStderr = async (fn) => {
+      const lines = []
+      const originalError = console.error
+      try {
+        console.error = (...args) => lines.push(args.map(a => String(a)).join(' '))
+        await fn()
+      } finally {
+        console.error = originalError
+      }
+      return lines.join('\n')
+    }
+    // 每条用例都先把 exitCode 清成 undefined：上一条遗留的 1 会让下一条的「非零」断言假通过。
+    const runCase = async (summary) => {
+      process.exitCode = undefined
+      const stderr = await captureStderr(() => runSingleEntry({ run: async () => summary }))
+      return { exitCode: process.exitCode, stderr }
+    }
     try {
-      process.exitCode = undefined
-      await runSingleEntry({
-        run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] })
+      // 1) 全失败：非零退出，且不得冒用「部分失败」原因（两种失败口径必须可区分）
+      const allFailed = await runCase({
+        total: 1, pushed: 0, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }]
       })
-      assertEqual(process.exitCode, 1, '全推送失败时单次入口应设置非零退出码')
-      process.exitCode = undefined
-      await runSingleEntry({
-        run: async () => ({ total: 2, pushed: 1, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] })
+      assertEqual(allFailed.exitCode, 1, '全推送失败时单次入口应设置非零退出码')
+      assertEqual(allFailed.stderr.includes('程序运行失败'), true,
+        `全失败必须留下失败诊断（不能只置码不出声）: ${JSON.stringify(allFailed.stderr)}`)
+      assertEqual(allFailed.stderr.includes('PARTIAL_MESSAGE_FAILURE'), false,
+        `全失败不得报成部分失败: ${JSON.stringify(allFailed.stderr)}`)
+
+      // 2) 部分成功 + ETIMEDOUT：仍有消息没送达 → 非零 + 告警
+      const partialRetryable = await runCase({
+        total: 2, pushed: 1, failed: 1, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }]
       })
-      assertEqual(process.exitCode, undefined, '部分成功时不应设置失败退出码')
-      process.exitCode = undefined
-      await runSingleEntry({
-        run: async () => ({ total: 2, pushed: 1, failed: 1, failures: [{ code: 'HTTP_401', message: 'invalid token' }] })
+      assertEqual(partialRetryable.exitCode, 1, '部分消息失败也必须设置非零退出码（pushed>0 即成功已废）')
+      // 关键加强：exitCode 与 PARTIAL_MESSAGE_FAILURE 告警同时出现，才证明「非零」源自部分消息失败。
+      // 该 reason 只在 failed>0 且 pushed>0 时产出，故不可能是全失败/cacheSaved/分类异常兜底的分支。
+      assertEqual(partialRetryable.stderr.includes('PARTIAL_MESSAGE_FAILURE'), true,
+        `部分消息失败必须告警（PARTIAL_MESSAGE_FAILURE）: ${JSON.stringify(partialRetryable.stderr)}`)
+      assertEqual(partialRetryable.stderr.includes('可重试'), true,
+        `部分失败应判可重试（判 permanent 会让常驻入口整轮停止，后续新消息一起漏推）: ${JSON.stringify(partialRetryable.stderr)}`)
+
+      // 3) 部分成功 + HTTP_401（失败通道是永久错误）：仍按「部分失败」降级，不升级成不可恢复
+      const partialPermanent = await runCase({
+        total: 2, pushed: 1, failed: 1, failures: [{ code: 'HTTP_401', message: 'invalid token' }]
       })
-      assertEqual(process.exitCode, undefined, '部分成功即使失败通道为永久错误，也不应熔断单次入口')
+      assertEqual(partialPermanent.exitCode, 1, '部分失败即使失败通道为永久错误，也必须非零退出')
+      assertEqual(partialPermanent.stderr.includes('PARTIAL_MESSAGE_FAILURE'), true,
+        `HTTP_401 部分失败同样要告警: ${JSON.stringify(partialPermanent.stderr)}`)
+      assertEqual(partialPermanent.stderr.includes('不可恢复'), false,
+        `部分失败不得判永久（否则常驻入口整轮停止）: ${JSON.stringify(partialPermanent.stderr)}`)
     } finally {
       process.exitCode = oldExitCode
     }

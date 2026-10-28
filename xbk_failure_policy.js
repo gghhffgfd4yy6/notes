@@ -447,21 +447,40 @@ function classifySummary (summary) {
   if (!summary || typeof summary !== 'object') return null
   const pushed = Number(summary.pushed) || 0
   const failed = Number(summary.failed) || 0
+  // C9-002：cacheSaved 此前从未被分类器读取——消息确实推出去了、但成功记录没落盘，下次运行会重复
+  // 推送（另一半是「推送成功但缓存丢了」），运维却只能看到绿色退出码。落盘失败优先判定：它不是
+  // 通道问题，重试即可恢复，故归 retryable/CACHE_SAVE_FAILED。
+  if (readProp(summary, 'cacheSaved') === false) {
+    return {
+      kind: 'retryable',
+      reason: 'CACHE_SAVE_FAILED',
+      info: { message: '缓存落盘失败：本轮推送成功记录未写入，下次运行会重复推送' }
+    }
+  }
   // XFP-03：「有没有失败」只由 failed 决定。旧条件写作 `total <= 0 || failed <= 0`，而
   // total 来自 `Number(summary.total) || 0`——total 缺失、非数字（或恰好为 0）时即为 0，
   // 于是一个「报了失败但没报 total / total 非数字」的摘要被判成「无失败」返回 null，
   // 调度器据此读成成功（绿色），失败被静默吞掉。total 只描述本轮规模，不参与该判定。
   if (failed <= 0) return null
   const failures = safeArray(readProp(summary, 'failures')) || []
-  if (failures.length === 0) {
-    return pushed > 0
-      ? null
-      : { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } }
+  // C9-002：pushed/failed 都是**消息**级计数——pushed>0 只说明「本轮不是全灭」，不说明「没有失败」。
+  // 旧实现只要 pushed>0 就返回 null（1 条成功 + 99 条失败 → 退出码 0、告警不触发、99 条被静默吞掉）。
+  // 部分失败同样是失败：给出 degraded 判定让入口置非零退出码并告警。kind 固定 retryable——还有消息
+  // 没送达就必须下轮重试；若判 permanent，常驻入口会整轮停止，把后续新消息一起停掉（漏推）。
+  if (pushed > 0) {
+    const nested = failures.map(classifyOne)
+    return {
+      kind: 'retryable',
+      reason: 'PARTIAL_MESSAGE_FAILURE',
+      info: {
+        message: `部分消息推送失败：成功 ${pushed} 条，失败 ${failed} 条`,
+        failures: nested.map(x => x.info)
+      }
+    }
   }
-  // 主流程契约：一条消息至少有一个通道成功即视为该消息处理成功。
-  // 因此只要本轮已有成功推送，就不能因另一个通道的永久错误让单次/常驻入口熔断；
-  // 失败通道不对该条消息立即重试，避免重复轰炸。只有全失败才进入退出/重试分类。
-  if (pushed > 0) return null
+  if (failures.length === 0) {
+    return { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } }
+  }
   const nested = failures.map(classifyOne)
   const hasRetryable = nested.some(x => x.kind === 'retryable')
   const hasPermanent = nested.some(x => x.kind === 'permanent')

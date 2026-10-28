@@ -329,6 +329,11 @@ function validateFilterRules (input, deps) {
     }
   }
   for (const rule of simpleRules) {
+    // C9-010：pingbitime 运行期用 Number 解析天数、不需要正则引擎——闸门 3 的 hasRegexTarget
+    // 已为「仅时间规则」放行，这里的编译循环必须同一口径（上方 ruleLines 的循环已有该守卫）。
+    // 否则缺 re2 的环境（compileUserRegex 恒 null）会把用户唯一还能用的时间规则判成
+    // invalid_value_regex 直接拒掉。
+    if (rule.field === 'pingbitime') continue
     if (!compileOk(deps, rule.val)) {
       addError(errors, rule.field, 'invalid_value_regex', `正则无法编译：「${rule.val}」`)
     }
