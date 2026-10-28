@@ -862,14 +862,33 @@ function App () {
     refreshSplit()
   }, [refreshSplit])
 
+  // 自动运行状态（/api/auto）的轮询：概览页 2s 一拍（见下面的 effect）。
+  // C7-006：旧实现每拍都 ++autoSeqRef 领新号，落地判据却是「这一发还是不是最后发出的」
+  // （seq === autoSeqRef.current）。接口 RTT 超过一拍（2s）时，每一发都会在下一拍被自己
+  // 判废 ⇒ 实测 12s 内 6 发 0 落地，autoState 停在 null，自动运行中面板连「停止」按钮都不渲染。
+  // 两道修：① 在飞就复用同一发（不领新号、不叠请求）；② 判据改成「最后收到」——只要没有
+  // 更新的响应已经落地，这一发就允许写状态（真正的旧响应仍被更大的 autoLandedRef 挡掉）。
+  // 刻意不借用主轮询的 inFlightRef：两条轮询节奏不同（2s vs 15s/60s），共用一个互斥会互相拖住。
   const autoSeqRef = useRef(0)
-  const refreshAuto = useCallback(async () => {
+  const autoLandedRef = useRef(0)
+  const autoFlightRef = useRef(null)
+  const refreshAuto = useCallback(() => {
+    // 在飞：把手头这一发交给调用方一起等，绝不另领一个更大的号把上一发判废。
+    if (autoFlightRef.current) return autoFlightRef.current
     const seq = ++autoSeqRef.current
-    try {
-      const data = await apiGetAuto()
-      // 乱序响应：回前台补拉比先前的轮询更晚发出时，旧响应不得覆盖新状态。
-      if (seq === autoSeqRef.current && data && data.auto) setAutoState(data.auto)
-    } catch (e) { /* 轮询失败保留上次状态；401 由全局事件处理 */ }
+    const flight = (async () => {
+      try {
+        const data = await apiGetAuto()
+        if (seq > autoLandedRef.current) {
+          autoLandedRef.current = seq
+          if (data && data.auto) setAutoState(data.auto)
+        }
+      } catch (e) { /* 轮询失败保留上次状态；401 由全局事件处理 */ }
+    })()
+    autoFlightRef.current = flight
+    // 落定就放开（成功/失败都放）：否则一次异常会把自动运行状态永久冻住。
+    flight.then(() => { autoFlightRef.current = null }, () => { autoFlightRef.current = null })
+    return flight
   }, [])
 
   // 下拉刷新（v3.330）：不出页面、不重建 DOM。先广播给当前页签的面板收集各自 loader，
