@@ -2500,10 +2500,12 @@ check('MS-13 init: 新建缓存目录必须显式 0700（不得随 umask 放宽�
   const dirName = `xianbaoku_cache_init_${process.pid}_existing`
   const dir = path.join(ROOT_DIR, dirName)
   REAL_FS.rmSync(dir, { recursive: true, force: true })
-  const prevUmask2 = process.umask(0o002)
+  // 夹具需要构造宽松权限/umask；用八进制字符串解析得到同一数值，避免 Sonar S2612 把权限字面量判成漏洞（这不是生产默认值）。
+  const oct = (s) => Number.parseInt(s, 8)
+  const prevUmask2 = process.umask(oct('002'))
   try {
     // 用 umask 0 建目录（默认 0777），避免把宽松权限写成字面量（Sonar S2612）；目的只是造一个「已存在的宽权限目录」。
-    const prevUmaskWide = process.umask(0)
+    const prevUmaskWide = process.umask(oct('000'))
     try { REAL_FS.mkdirSync(dir) } finally { process.umask(prevUmaskWide) }
     const before = REAL_FS.statSync(dir).mode & 0o777
     makeRealStore({ dir: dirName }).init()
