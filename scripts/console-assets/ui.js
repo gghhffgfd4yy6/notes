@@ -5,7 +5,7 @@ import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, Button, LeaveGuard
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
-import { backToTopBehavior, createLiveChannel, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
+import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { Component, html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -820,7 +820,10 @@ function App () {
   useEffect(() => {
     const run = state && state.run && state.run.status === 'ok' ? state.run.value : null
     const stats = state && state.stats && state.stats.status === 'ok' ? state.stats.value : null
-    const bad = !!(stats && stats.today && stats.today.failed > 0) || !!(run && (run.failed > 0 || run.interrupted))
+    // 部件「损坏/超限」同样是异常（C7-033）：invalid/tooLarge 没有 value，下面的判定只看
+    // failed / interrupted ⇒ bad=false ⇒ 标题点还是绿的，把损坏显示成健康。
+    const broken = partBroken(state && state.run) || partBroken(state && state.report)
+    const bad = broken || !!(stats && stats.today && stats.today.failed > 0) || !!(run && (run.failed > 0 || run.interrupted))
     const dot = authExpired ? '🔴' : !state ? '⚪' : locking ? '🟡' : bad ? '🔴' : '🟢'
     document.title = `${dot} xbk-push 控制台`
   }, [state, locking, authExpired])

@@ -2346,6 +2346,44 @@ async function backupUiStructureTests () {
     assert.ok(!/apiPostBackupImport\([^)]*password/i.test(seg), '导入请求不得带密码')
   })
 
+  await aok('结构红线: 导入 409/400/507 不得提示「导入完成」（consumeJsonResult 不抛错）', async () => {
+    // apiPostBackupImport 走 consumeJsonResult：非 2xx 只回 { ok:false, status, data } 而不抛错。
+    // doImport 旧实现直接把它当成功 ⇒ 409 busy / 400 校验失败 / 507 审计满都提示「导入完成」。
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    // 接线：先判失败，再关弹窗；失败分支不得走到「导入完成」。
+    const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const at = pages.indexOf('const doImport = async () =>')
+    const end = pages.indexOf('return html`<div class="cfg-block backup-block">', at)
+    assert.ok(at > -1 && end > at, '应能定位 doImport')
+    const body = pages.slice(at, end)
+    assert.ok(body.includes('res.ok') || body.includes('backupImportProblem(res)'),
+      'doImport 必须检查 res.ok：consumeJsonResult 对 409/400/507 只回 {ok:false}，不检查就当成功')
+    const guardAt = body.indexOf('backupImportProblem(res)')
+    assert.ok(guardAt > -1, 'doImport 必须先过统一的失败判定')
+    assert.ok(guardAt < body.indexOf('setPending(null)'), '判失败必须早于关确认弹窗（否则出错时弹窗已消失）')
+    assert.ok(guardAt < body.lastIndexOf('导入完成'), '失败分支不得走到「导入完成」提示（那行 setNote 必须在判失败之后）')
+    assert.strictEqual(typeof pure.backupImportProblem, 'function',
+      '必须有统一的导入失败判定（旧 doImport 全程不检查 res.ok）')
+    // 响应体形状取自 scripts/console.js 的 handleBackupImport（三类失败的真实载荷）。
+    assert.strictEqual(pure.backupImportProblem({ ok: true, status: 200, data: { imported: { messages: 3 } } }), '',
+      '2xx 不得判失败')
+    assert.strictEqual(
+      pure.backupImportProblem({ ok: false, status: 409, data: { error: 'busy', code: 'busy', message: '有任务正在运行，等结束再导入' } }),
+      '有任务正在运行，等结束再导入', '409 busy 必须透出服务端人话（error 字段是 busy 这种 code）')
+    assert.strictEqual(
+      pure.backupImportProblem({
+        ok: false,
+        status: 507,
+        data: { error: 'audit_full', code: 'audit_full', errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则' }] }
+      }),
+      '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则', '507 审计满顶层只有 code，人话在 errors[].message')
+    assert.match(
+      pure.backupImportProblem({ ok: false, status: 400, data: { error: '备份文件不是合法 JSON', code: 'invalid_json' } }),
+      /备份文件不是合法 JSON/, '400 顶层 error 本身是人话时必须用它')
+    assert.match(pure.backupImportProblem({ ok: false, status: 400, data: null }), /^HTTP 400$/,
+      '读不出响应体时必须兜底带状态码，不能只说「导入失败」')
+  })
+
   await aok('结构红线: 弹窗 busy 变化不得把焦点抢回密码框', () => {
     const src = readConsoleSource()
     const at = src.indexOf('function ConfirmDialog')
@@ -3473,6 +3511,73 @@ async function main () {
       fs.rmSync(modDir, { recursive: true, force: true })
     }
   })
+  await aok('前端数据层: 手写条件端点（runs/auto/messages）304 且本地无副本时同样重取（不把 304 当错误）', async () => {
+    // C7-025：这三个端点手写 addConditional + consumeJson，但没给 consumeJson 传 retry。
+    // 304 到达时若同一 key 的 tag 已被并发响应换掉（或条目被 16 条容量淘汰），旧实现直接
+    // reject「HTTP 304（无本地副本）」，界面显示「加载失败：HTTP 304（无本地副本）」。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = mkTmp('xbk-api-cond-retry-')
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const res200 = (tag, data) => ({
+      status: 200,
+      ok: true,
+      headers: { get: (n) => (String(n).toLowerCase() === 'etag' ? tag : null) },
+      json: async () => data
+    })
+    const res304 = () => ({ status: 304, ok: false, headers: { get: () => null }, json: async () => { throw new Error('304 不得读 body') } })
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      globalThis.document = { getElementById: () => null }
+      globalThis.window = { dispatchEvent: () => {} }
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      // 剧本（逐端点重放）：① 基线 200 写 t-1 ② A 带 t-1 挂起 ③ B 并发 200 换 t-2
+      // ④ A 的 304 后到 → 必须去掉条件头重取（旧实现在这里抛 304）。
+      const runRace = async (label, call) => {
+        const calls = []
+        let releaseLast = null
+        const gate = new Promise((resolve) => { releaseLast = resolve })
+        let step = 0
+        globalThis.fetch = async (url, opts) => {
+          const headers = { ...((opts && opts.headers) || {}) }
+          const condKeyName = Object.keys(headers).find((k) => k.toLowerCase() === 'if-none-match')
+          calls.push({ url: String(url), cond: condKeyName !== undefined, tag: condKeyName ? headers[condKeyName] : null })
+          step += 1
+          if (step === 1) return res200('"t-1"', { v: 1 })
+          if (step === 2) { await gate; return res304() }
+          if (step === 3) return res200('"t-2"', { v: 2 })
+          if (step === 4) return res200('"t-3"', { v: 3 })
+          throw new Error(`${label}: fetch 调用次数超出剧本（304 分支可能重复重试）`)
+        }
+        assert.deepStrictEqual(await call(), { v: 1 }, `${label} 基线 200 必须写入 t-1`)
+        const pA = call()
+        const pB = call()
+        assert.deepStrictEqual(await pB, { v: 2 }, `${label} 并发 B 必须换掉同一 key 的 tag`)
+        releaseLast()
+        let got = null
+        let err = null
+        try { got = await pA } catch (e) { err = e }
+        assert.strictEqual(err, null, `${label} 304 到达时本地 tag 已不是发出去的那个：必须重取，不得把 304 当错误（实际 ${err && err.message}）`)
+        assert.deepStrictEqual(got, { v: 3 }, `${label} 必须返回重取到的真实数据`)
+        assert.strictEqual(calls.length, 4, `${label} 重试恰好一次（总共 4 次 fetch）`)
+        assert.strictEqual(calls[1].cond, true, `${label} A 必须带 If-None-Match（否则没测到 304 分支）`)
+        assert.strictEqual(calls[3].cond, false, `${label} 重取必须去掉 If-None-Match（否则还是 304）`)
+      }
+      await runRace('apiGetRuns', () => mod.apiGetRuns())
+      await runRace('apiGetAuto', () => mod.apiGetAuto())
+      await runRace('apiGetMessages', () => mod.apiGetMessages({}))
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
+
   await aok('前端数据层: AbortSignal.timeout 覆盖「头到了、body 挂起」，无该 API 时 fallback 同样中止', async () => {
     // 旧实现用 Promise.race 手写第二层期限（readBodyJson）兜「头已到、体挂起」；
     // v3.385 改成一个 AbortSignal.timeout 同时管 fetch 与 body 读取。这里用真 HTTP
@@ -7317,6 +7422,34 @@ async function main () {
     }
     assert.ok(!/\.\.\.\(stats && stats\.truncated/.test(seg), 'run.log 超窗提示不得新增第三行（会顶高周卡）')
     assert.ok(/<\$\{StatusCards\} state=\$\{state\} err=\$\{statusFailed\} \/>/.test(src), 'App 必须把状态接口的失败传给状态卡')
+  })
+
+  await aok('结构红线: 部件 invalid/tooLarge 不得渲染成「暂无数据」（损坏 ≠ 缺失）', async () => {
+    // C7-033：readStatus 对 invalid/tooLarge 不给 value，StatusCards 的 rep/run 都变成 null，
+    // 与 missing 走同一条 !rep / !run 分支 ⇒ 卡片写「暂无数据」、徽标写「—」；标题状态点也
+    // 只读 value 里的 failed/interrupted ⇒ 还是绿的。损坏被伪装成缺失/健康。
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = comp.slice(comp.indexOf('function StatusCards'), comp.indexOf('// ── 组件：触发按钮'))
+    assert.ok(seg.includes('partBroken(state.run)') && seg.includes('partBroken(state.report)'),
+      '状态卡必须先判定部件是「损坏」还是「还没生成」（缺这一层 ⇒ 损坏落进「暂无数据」）')
+    assert.ok(/runBroken[\s\S]{0,40}'异常'[\s\S]{0,10}—/.test(seg), '最近一轮损坏时徽标必须写「异常」，不得写「—」')
+    assert.ok(seg.includes("runBroken ? '数据损坏，无法读取' : '暂无数据'"),
+      '最近一轮损坏时主文案必须是「数据损坏，无法读取」而不是「暂无数据」')
+    assert.ok(/\$\{rep \? [\s\S]{0,200}repBroken \? '数据损坏' : '暂无'/.test(seg),
+      '日报行遇 report 损坏时不得写「暂无」')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const dotAt = ui.indexOf('// 标题状态点')
+    const dot = dotAt > -1 ? ui.slice(dotAt, dotAt + 900) : ''
+    assert.ok(dot.includes('partBroken(state && state.run)') && dot.includes('partBroken(state && state.report)'),
+      '标题状态点必须把 run/report 损坏算成异常（否则标题点还是绿色）')
+    assert.ok(/const bad = broken \|\|/.test(dot), '标题状态点的 bad 判定必须并入 broken')
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.partBroken, 'function', '必须有统一的「部件损坏」判定')
+    assert.strictEqual(pure.partBroken({ status: 'invalid' }), true, 'invalid 是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'tooLarge' }), true, 'tooLarge 是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'missing' }), false, 'missing 是还没生成，不是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'ok', value: { failed: 0 } }), false, 'ok 正常')
+    assert.strictEqual(pure.partBroken(null), false, '没有部件不算损坏')
   })
 
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {

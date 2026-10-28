@@ -115,6 +115,17 @@ async function consumeJson (p, condKey, retry, sentTag) {
   return data
 }
 
+// 「304 但本地没有副本 → 去掉条件头重取一次」的公共骨架（C7-025）：conditionalRequest 与
+// 三个手写端点（runs / auto / messages）共用。只重试一次：重试不带条件头，再拿到 304 就是
+// 服务端异常，按「无本地副本」抛错。attempt(conditional) 负责「怎么发」并交回发出的 tag。
+function consumeConditional (condKey, attempt) {
+  const first = attempt(true)
+  return consumeJson(first.p, condKey, () => {
+    const again = attempt(false)
+    return consumeJson(again.p, condKey)
+  }, first.sentTag)
+}
+
 // 条件请求端点的统一骨架（v3.373）：注入 If-None-Match → fetch → consumeJson。
 // config / cache-health / trends / run-history 四个端点共用它；「304 但本地无副本」的
 // 重试也在这里（见 consumeJson 的 retry 参数）。fetch 的 URL 仍留在各端点里保持字面量
@@ -128,12 +139,7 @@ function conditionalRequest (condKey, build) {
     const sentTag = conditional ? addConditional(merged, condKey) : null
     return { p: build(merged), sentTag }
   }
-  const first = attempt(true)
-  return consumeJson(first.p, condKey, () => {
-    // 只重试一次：重试不带条件头，再拿到 304 就是服务端异常，按「无本地副本」抛错。
-    const again = attempt(false)
-    return consumeJson(again.p, condKey)
-  }, first.sentTag)
+  return consumeConditional(condKey, attempt)
 }
 
 function apiGetStatus () {
@@ -146,11 +152,17 @@ function apiGetStatus () {
 }
 
 function apiGetRuns () {
-  const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const sentTag = addConditional(merged, 'runs')
-  return consumeJson(fetch('/api/runs', merged), 'runs', undefined, sentTag)
+  // 条件请求 + 「304 无本地副本就重取」（C7-025，与 conditionalRequest 同一骨架）。
+  // fetch 第一参数保持字面量（Codacy SSRF 口径）；条件头必须在 fetch 之前注入
+  // （fetch 调用时就快照 headers）。
+  const attempt = (conditional) => {
+    const merged = timedRequest({
+      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    })
+    const sentTag = conditional ? addConditional(merged, 'runs') : null
+    return { p: fetch('/api/runs', merged), sentTag }
+  }
+  return consumeConditional('runs', attempt)
 }
 
 async function apiGetRunDetail (id) {
@@ -220,15 +232,20 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   if (typeof from === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(from)) params.set('from', from)
   if (typeof to === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(to)) params.set('to', to)
   const qs = params.toString()
-  const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
   // 分页/筛选不同的请求各算一份缓存（同一 URL 语义才可复用 304 结果）。
   // 必须在 fetch 之前注入 If-None-Match（Sourcery PR #321）：fetch 在调用时就快照
   // headers，先 fetch 后 addConditional 等于永远不发条件头。
+  // 304 但本地无副本（tag 被并发换掉 / 条目被 16 条容量淘汰）→ 去掉条件头重取一次
+  // （C7-025；旧实现直接 reject「HTTP 304（无本地副本）」，推送记录页显示加载失败）。
   const condKey = `messages?${qs}`
-  const sentTag = addConditional(merged, condKey)
-  return consumeJson(fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), condKey, undefined, sentTag)
+  const attempt = (conditional) => {
+    const merged = timedRequest({
+      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    })
+    const sentTag = conditional ? addConditional(merged, condKey) : null
+    return { p: fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), sentTag }
+  }
+  return consumeConditional(condKey, attempt)
 }
 
 function apiGetTrends ({ days, from, to } = {}) {
@@ -298,11 +315,15 @@ function apiGetSys ({ probeVersion = false } = {}) {
 
 // 服务器端自动运行：GET 读状态；POST 开关/改间隔（写面只认 Bearer）。
 function apiGetAuto () {
-  const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
-  })
-  const sentTag = addConditional(merged, 'auto')
-  return consumeJson(fetch('/api/auto', merged), 'auto', undefined, sentTag)
+  // 条件请求 + 「304 无本地副本就重取」（C7-025）。条件头在 fetch 之前注入。
+  const attempt = (conditional) => {
+    const merged = timedRequest({
+      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    })
+    const sentTag = conditional ? addConditional(merged, 'auto') : null
+    return { p: fetch('/api/auto', merged), sentTag }
+  }
+  return consumeConditional('auto', attempt)
 }
 
 function apiSetAuto (payload) {
