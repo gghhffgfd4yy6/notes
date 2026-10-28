@@ -721,9 +721,21 @@ function createApp ({
     },
 
     /** 通道健康状态锁：O_EXCL 独占创建，陈旧判定与 run.log / RE2 锁同口径——mtime 超龄且持有
-     *  进程已确认退出（含损坏/无主锁）才回收，进程仍存活（如被暂停 >10s）绝不抢占（APP-02；
-     *  锁内写入 pid:starttime 令牌供存活复核与 PID 复用判别）。返回 lockFd，-1 表示本轮未取得。 */
+     *  进程已确认退出（含损坏/无主锁）才回收，进程仍存活（如被暂停 >10s）绝不抢占（APP-02；锁内
+     *  写入 pid:starttime 令牌供存活复核与 PID 复用判别）。返回 lockFd，-1 表示本轮未取得；失败原因
+     *  写进 this._lastChannelHealthLockFailure = { reason, code, message }，供调用点按 errno 分流日志
+     *  （C1-008：只有 EEXIST 且持有进程存活才是「另一轮在更新」；EACCES/ENOSPC/EROFS/EMFILE 等
+     *  open 失败、unlink 失败、二次 open 失败都是真实故障，此前全折叠成 -1 被谎报成并发）。 */
     _tryAcquireChannelHealthLock (lockPath) {
+      const fail = (reason, err) => {
+        this._lastChannelHealthLockFailure = {
+          reason,
+          code: (err && err.code) || '',
+          message: (err && err.message) || ''
+        }
+        return -1
+      }
+      this._lastChannelHealthLockFailure = null
       const writeToken = (fd) => {
         try {
           fs.writeSync(fd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
@@ -734,16 +746,16 @@ function createApp ({
         writeToken(fd)
         return fd
       } catch (e) {
-        if (!e || e.code !== 'EEXIST') return -1
+        if (!e || e.code !== 'EEXIST') return fail('open', e)
         let stale = false
         try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
-        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return -1
-        try { fs.unlinkSync(lockPath) } catch (e2) { return -1 } // 竞争者已接管/无权限，按跳过处理
+        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return fail('busy', e)
+        try { fs.unlinkSync(lockPath) } catch (e2) { return fail('unlink', e2) } // 竞争者已接管/无权限，按跳过处理
         try {
           const fd = fs.openSync(lockPath, 'wx')
           writeToken(fd)
           return fd
-        } catch (e2) { return -1 }
+        } catch (e2) { return fail('reopen', e2) }
       }
     },
 
@@ -840,8 +852,16 @@ function createApp ({
         lockPath = statePath + '.lock'
         lockFd = this._tryAcquireChannelHealthLock(lockPath)
         if (lockFd < 0) {
-        // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
-          console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          const lockFailure = this._lastChannelHealthLockFailure || { reason: 'open', code: '', message: '' }
+          if (lockFailure.reason === 'busy') {
+          // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
+            console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          } else {
+          // C1-008：非 EEXIST、unlink 失败、二次 open 失败此前全折叠成 -1 并被一律说成「另一轮更新」，
+          // 排障会被引向完全错误的方向（0555 目录下 open 直接 EACCES，根本没有锁文件）。按 errno 透出。
+            const code = lockFailure.code || '未知错误'
+            console.error(`通道健康状态锁获取失败（${lockFailure.reason}/${code}${lockFailure.message ? ': ' + lockFailure.message : ''}），跳过本轮健康更新 ${statePath}`)
+          }
           return
         }
         const stateResult = this._readSafeState(statePath)
