@@ -1449,6 +1449,40 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则备份: corrupt 换代（revision 从 1 重来）后按代际剪枝，新代备份不得被旧代大 revision 剪掉', async () => {
+    // C2-005：剪枝按裸 revision 数值降序取前 3。corrupt 覆盖后 revision 回到 1，旧代的
+    // 4/3/2 恒大于新代的 1 ⇒ 刚写入的新代备份当场被当成「最老」删掉，恢复页只剩 corrupt
+    // 之前那一代（新代回滚点全丢）。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      for (let rev = 1; rev <= 5; rev++) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `g1-${rev}` } })
+        assert.strictEqual(saved.status, 200, `第 ${rev} 次保存应成功`)
+      }
+      assert.deepStrictEqual(
+        fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort(),
+        ['filter-rules.bak.2.json', 'filter-rules.bak.3.json', 'filter-rules.bak.4.json'],
+        '前置：旧代按代际剪枝后剩 2/3/4'
+      )
+      // 覆盖文件损坏 → 确认覆盖：新代 revision 从 1 重新开始，旧代备份 4/3/2 仍在盘上。
+      fs.writeFileSync(paths.file, 'not-json{{')
+      const replaced = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, confirmReplaceCorrupt: true, filter: { pingbibiaoti: 'g2-1' } })
+      assert.strictEqual(replaced.status, 200)
+      assert.strictEqual(JSON.parse(replaced.text).revision, 1, '新代 revision 从 1 重来')
+      // 新代第一次「保存前备份」：bak.1 = g2-1。旧代 bak.4/3/2 的 revision 数值更大。
+      const second = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'g2-2' } })
+      assert.strictEqual(second.status, 200)
+      assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '新代备份 bak.1 不得被剪掉')
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.backupFor(1), 64 * 1024).text).filter.pingbibiaoti, 'g2-1', 'bak.1 必须是新代 r1 内容')
+      // 端到端判据：恢复页能回到新代 r1（旧实现 bak.1 已被删 → 404 backup_not_found）。
+      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 2 })
+      assert.strictEqual(restored.status, 200, `恢复新代 r1 必须成功（实际 ${restored.status}）`)
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'g2-1')
+    } finally { server.close() }
+  })
+
   await aok('过滤锁: 持有者进程还活着 → 绝不接管（即使 mtime 已过期）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)

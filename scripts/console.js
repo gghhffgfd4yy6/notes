@@ -2282,8 +2282,25 @@ function releaseFilterLock (lock) {
   } catch (e) { /* 锁已释放/被接管：幂等 */ }
 }
 
-// 备份只保留最近 FILTER_BACKUP_KEEP 代（按 revision 数值降序）。
+// 备份只保留最近 FILTER_BACKUP_KEEP 代。
 // 注意调用时机：必须在新的覆盖文件提交成功**之后**才剪枝——失败的保存不该剪掉最老备份。
+// 剪枝判据必须是「代际 + revision」，不能只看裸 revision 数值（C2-005）：覆盖文件损坏后
+// 用户确认覆盖，revision 从 1 重新开始，而上一代留下的是 4/3/2…——按数值降序取前 3 会把
+// 刚写入的新代备份（bak.1）当场当成「最老」删掉，恢复页只剩 corrupt 之前那一代。
+// 代际判据：同一代内 revision 单调递增（每次写入 +1，回滚/恢复默认也是 +1），因此
+// 「revision ≤ 当前文件 revision」的备份必属当代；大于当前 revision 的只能来自更早的代。
+// 保留策略：先保当代最新的 FILTER_BACKUP_KEEP 个，再用更早代的最新备份补满名额。
+function currentFilterRevisionForPrune (paths) {
+  const read = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+  if (read.status !== 'ok') return null
+  try {
+    const data = JSON.parse(read.text)
+    return Number.isSafeInteger(data && data.revision) && data.revision >= 0 ? data.revision : null
+  } catch (e) {
+    return null
+  }
+}
+
 function pruneFilterBackups (paths) {
   let names
   try { names = fs.readdirSync(path.dirname(paths.file)) } catch (e) { return }
@@ -2296,8 +2313,23 @@ function pruneFilterBackups (paths) {
     const rev = Number(raw)
     if (Number.isSafeInteger(rev) && rev >= 0) revisions.push(rev)
   }
+  if (revisions.length <= FILTER_BACKUP_KEEP) return
   revisions.sort((a, b) => b - a)
-  for (const rev of revisions.slice(FILTER_BACKUP_KEEP)) {
+  // 当前 revision 读不到（文件缺失/损坏）⇒ 代际不可判定，退化为纯数值保留最新——只在
+  // 「剪枝前文件不可读」这种异常态发生（剪枝只在写入成功后调用）。
+  const curRevision = currentFilterRevisionForPrune(paths)
+  let keep = revisions
+  if (curRevision !== null) {
+    keep = revisions.filter((rev) => rev <= curRevision).slice(0, FILTER_BACKUP_KEEP)
+    for (const rev of revisions) {
+      if (keep.length >= FILTER_BACKUP_KEEP) break
+      if (rev <= curRevision) continue
+      keep.push(rev)
+    }
+  }
+  const kept = new Set(keep)
+  for (const rev of revisions) {
+    if (kept.has(rev)) continue
     try { fs.unlinkSync(paths.backupFor(rev)) } catch (e) { /* 已被清理 */ }
   }
 }
