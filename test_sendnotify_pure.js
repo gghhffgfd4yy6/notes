@@ -307,6 +307,26 @@ check('mdLinksToPlain: URL 内含 ")" 且 <...> 包裹 + text===url 去重后完
     '角括号形态同样要走配平扫描，不能把 URL 内的 ")" 当闭合点'
   )
 })
+// C8-011：formatter 的 _mdDestination 对含括号/空格的 URL 一律产出 `[url](<url>)` 形态
+// （见 xbk_formatter.js 的 _mdDestination），findDestEnd 返回的目标段因此是 `<url>`；
+// 旧实现用裸串 `t === u` 比较，`https://x.com/a` !== `<https://x.com/a>` ⇒ 去重恒失效，
+// 降纯文本后链接出现两遍（`https://x.com/a (https://x.com/a)`）。
+check('mdLinksToPlain: <url> 目标段与纯 url 文本视为同一链接，只输出一次（C8-011）', () => {
+  assert.strictEqual(
+    mdLinksToPlain('[https://x.com/a](<https://x.com/a>)'),
+    'https://x.com/a',
+    '尖括号目标段未归一化时输出会重复成「https://x.com/a (https://x.com/a)」'
+  )
+  assert.strictEqual(
+    mdLinksToPlain('[https://example.com/a(b)c](<https://example.com/a(b)c>)'),
+    'https://example.com/a(b)c',
+    '真实 formatter 产物（URL 含括号）同样只应出现一次'
+  )
+  // 两侧都带尖括号：语义仍是同一链接（既有用例 303 的形态），去重后保留原文形态
+  assert.strictEqual(mdLinksToPlain('[<https://x/a(b)c.jpg>](<https://x/a(b)c.jpg>)'), '<https://x/a(b)c.jpg>')
+  // 反向断言：不同链接不得被误去重
+  assert.strictEqual(mdLinksToPlain('[https://x.com/a](<https://x.com/b>)'), 'https://x.com/a (<https://x.com/b>)')
+})
 check('mdLinksToPlain: 简单形态不回归（配平扫描不改变基本输出）', () => {
   assert.strictEqual(mdLinksToPlain('[Google](https://google.com)'), 'Google (https://google.com)')
   assert.strictEqual(mdLinksToPlain('[t](https://x/a(b)c.jpg)'), 't (https://x/a(b)c.jpg)')

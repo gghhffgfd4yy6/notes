@@ -1607,6 +1607,14 @@ function findDestEnd (s, from, budget) {
   return -1
 }
 
+// C8-011：destination 可能是 `<url>` 形态（formatter 的 _mdDestination 对含空格/括号的 URL 一律加尖括号），
+// 而 text 侧是裸 url。裸串比较会让「text 就是 url」的原文链接去重恒失效（`https://x` !== `<https://x>`）
+// ⇒ 纯文本通道把同一条链接输出两遍（`https://x (https://x)`）。比较前两侧统一剥掉外层尖括号。
+function unwrapDest (dest) {
+  const s = String(dest === undefined || dest === null ? '' : dest)
+  return s.length >= 2 && s[0] === '<' && s[s.length - 1] === '>' ? s.slice(1, -1) : s
+}
+
 function mdLinksToPlain (s) {
   let out = ''
   let i = 0
@@ -1625,7 +1633,7 @@ function mdLinksToPlain (s) {
     if (end === -1) { out += s.slice(i); break } // 连 ")" 都没有：剩余串不可能再有完整链接，原样保留并终止
     const u = s.slice(close + 2, end)
     if (u === '') { out += s.slice(i, end + 1); i = end + 1; continue } // url 空：原样保留
-    out += s.slice(i, open) + (t === u ? t : `${t} (${u})`)
+    out += s.slice(i, open) + (unwrapDest(t) === unwrapDest(u) ? t : `${t} (${u})`)
     i = end + 1
   }
   return out
