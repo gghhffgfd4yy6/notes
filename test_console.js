@@ -1449,10 +1449,11 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则备份: corrupt 换代（revision 从 1 重来）后按代际剪枝，新代备份不得被旧代大 revision 剪掉', async () => {
-    // C2-005：剪枝按裸 revision 数值降序取前 3。corrupt 覆盖后 revision 回到 1，旧代的
+  await aok('过滤规则备份: corrupt 换代（revision 从 1 重来）后按写入顺序剪枝，新代备份不得被旧代大 revision 剪掉', async () => {
+    // C2-005 返工：剪枝按裸 revision 数值降序取前 3。corrupt 覆盖后 revision 回到 1，旧代的
     // 4/3/2 恒大于新代的 1 ⇒ 刚写入的新代备份当场被当成「最老」删掉，恢复页只剩 corrupt
-    // 之前那一代（新代回滚点全丢）。
+    // 之前那一代（新代回滚点全丢）。只测「换代后第一次保存」抓不到：那一刻盘上还是 4 个文件、
+    // 旧代码恰好还没动手；要一直存到新代的最后一个备份把旧代文件挤出名额才会暴露。
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
@@ -1471,13 +1472,23 @@ async function filterRuleApiTests () {
       const replaced = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, confirmReplaceCorrupt: true, filter: { pingbibiaoti: 'g2-1' } })
       assert.strictEqual(replaced.status, 200)
       assert.strictEqual(JSON.parse(replaced.text).revision, 1, '新代 revision 从 1 重来')
-      // 新代第一次「保存前备份」：bak.1 = g2-1。旧代 bak.4/3/2 的 revision 数值更大。
-      const second = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'g2-2' } })
-      assert.strictEqual(second.status, 200)
-      assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '新代备份 bak.1 不得被剪掉')
+      // 新代连存 3 次（r2/r3/r4）：加上 corrupt 覆盖那一次，新代共 4 次落盘 ⇒ 盘上应有
+      // 新代 bak.1/2/3 三个回滚点，旧代残留 bak.4 被名额挤出。
+      for (const rev of [2, 3, 4]) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `g2-${rev}` } })
+        assert.strictEqual(saved.status, 200, `新代第 ${rev} 次保存应成功`)
+        assert.strictEqual(JSON.parse(saved.text).revision, rev)
+      }
+      // 旧代 bak.4 的 revision 数值最大、写入最早 ⇒ 必须被剪；新代 bak.1 数值最小，但它是
+      // 新代最新 3 个写入之一，按数值取「最大的 3 个」会把它当场删掉（本条 bug）。
+      assert.deepStrictEqual(
+        fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort(),
+        ['filter-rules.bak.1.json', 'filter-rules.bak.2.json', 'filter-rules.bak.3.json'],
+        '新代 4 次落盘后只留最新 3 个备份（旧代 bak.4 必须被剪）'
+      )
       assert.strictEqual(JSON.parse(readSafeTextResult(paths.backupFor(1), 64 * 1024).text).filter.pingbibiaoti, 'g2-1', 'bak.1 必须是新代 r1 内容')
       // 端到端判据：恢复页能回到新代 r1（旧实现 bak.1 已被删 → 404 backup_not_found）。
-      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 2 })
+      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 4 })
       assert.strictEqual(restored.status, 200, `恢复新代 r1 必须成功（实际 ${restored.status}）`)
       assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'g2-1')
     } finally { server.close() }
