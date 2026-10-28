@@ -1273,7 +1273,11 @@ function _renderReuseNotice (results) {
     lines.push('')
     return lines
   }
-  if (partial.length === 0 && unaccounted.length === 0) {
+  // 「没有任何段的复用状态记录」只允许在**所有**可用段都未记录时成立（C10-022）。
+  // 缺 `unknown.length === usable.length` 时，2 段全量 + 1 段未记录也会落到这里：既宣称「没有任何段」
+  // （而 2 段明明有记录），又只列未记录的 1 段，与末行「其余 2 段全量重算（共 3 段…）」自相矛盾。
+  // 其余情形一律落到下面的增量分支（逐类点名 + 互斥末行计数）。
+  if (partial.length === 0 && unaccounted.length === 0 && unknown.length === usable.length) {
     lines.push('⚠️ 本次日报**没有任何段的复用状态记录**（reuse.json 缺失或无法解析）⇒ 无法判定哪些段复用了旧结果；' +
       '**不要把这些段的分数/存活清单当作「本 commit 测试状态」下的结果**。')
     lines.push('')

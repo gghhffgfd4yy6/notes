@@ -450,6 +450,47 @@ check('render：全部全量 ⇒ 明确写出「对应本 commit 的测试状态
   assert.ok(!out.includes('含未重算的结果'), '无复用段时不得出现复用警示')
 })
 
+// C10-022（audit38 · P2）：判据缺 `unknown.length === usable.length`。
+// 旧实现在「2 段全量 + 1 段未记录」时也走「本次日报没有任何段的复用状态记录」分支——而 2 段明明有记录，
+// 且它只列未记录的那 1 段，与同函数末行「其余 2 段本轮为全量重算（共 3 段：0 段含复用、1 段未记录）」
+// 自相矛盾（对外日报里的事实错误）。「没有任何段」只允许在**所有**可用段都未记录时出现。
+check('render：全量 + 未记录混合时不得宣称「没有任何段的复用状态记录」（C10-022）', () => {
+  const full = (seg) => ({ seg, total: 2, killed: 2, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } })
+  const unknown = { seg: 'rules', total: 2, killed: 1, survived: 1, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } }
+  const out = render([full('a'), full('b'), unknown])
+  assert.ok(!out.includes('没有任何段的复用状态记录'),
+    `2 段有复用记录时不得说「没有任何段」：\n${out}`)
+  assert.ok(out.includes('另有 1 段没有复用状态记录'), `未记录的 1 段必须走增量分支点名：\n${out}`)
+  // 文案里的段数必须与真正列出的段数一致（旧实现写「没有任何段」却只列 1 段）
+  const unknownLine = out.split('\n').find(l => l.includes('另有 1 段没有复用状态记录'))
+  assert.strictEqual((unknownLine.match(/`[^`]+`/g) || []).length, 1,
+    `「另有 1 段」必须恰好点名 1 段，实际：${unknownLine}`)
+  assert.ok(out.includes('其余 2 段本轮为全量重算（共 3 段：0 段含复用、1 段未记录）。'),
+    `末行必须如实给出「其余 2 段全量重算」（旧实现只在这句里出现，却与上面互斥）：\n${out}`)
+})
+
+check('render：全部段都未记录时仍须说「没有任何段的复用状态记录」并逐段点名（C10-022 边界）', () => {
+  const unknown = (seg) => ({ seg, total: 1, killed: 1, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } })
+  const out = render([unknown('a'), unknown('b')])
+  assert.ok(out.includes('没有任何段的复用状态记录'), `全部未记录时该结论才成立：\n${out}`)
+  const listed = out.split('\n').find(l => l.startsWith('未记录复用状态的段（2）：'))
+  assert.ok(listed, `必须给出未记录段清单（2 段）：\n${out}`)
+  assert.strictEqual((listed.match(/`[^`]+`/g) || []).length, 2, `清单段数必须与「2 段」一致，实际：${listed}`)
+})
+
+check('render：全量 + 未记录 + 复用混合时三类计数互斥且段数自洽（C10-022 边界）', () => {
+  const out = render([
+    { seg: 'a', total: 2, killed: 2, survived: 0, noCoverage: 0, timeout: 0, score: 100, survivedMutants: [], reuse: { mode: REUSE_MODE_FULL } },
+    { seg: 'b', total: 4, killed: 2, survived: 2, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_PARTIAL, reused: 2, total: 4, ratio: 0.5, high: true } },
+    { seg: 'c', total: 2, killed: 1, survived: 1, noCoverage: 0, timeout: 0, score: 50, survivedMutants: [], reuse: { mode: REUSE_MODE_UNKNOWN, reason: '缺 reuse.json' } }
+  ])
+  assert.ok(!out.includes('没有任何段的复用状态记录'), `有复用段时不得说「没有任何段」：\n${out}`)
+  assert.ok(out.includes('- `b`：复用 2/4（50.00%）'), `含复用段必须逐段标注：\n${out}`)
+  assert.ok(out.includes('另有 1 段没有复用状态记录'), `未记录段必须单列：\n${out}`)
+  assert.ok(out.includes('其余 1 段本轮为全量重算（共 3 段：1 段含复用、1 段未记录）。'),
+    `三类计数必须互斥且合计为 3 段：\n${out}`)
+})
+
 // ===== sticky 分支 / 计数口径不符（本代理补：前任漏掉的「N/M 只是下界」这一层）=================
 // 实测依据（本机最小 stryker 工程 + @stryker-mutator/core@10.0.0，src.js 内容不变）：
 //   `--mutate "src.js:1-4"` 跑一次 ⇒ 再用 `--mutate "src.js:1-3"`（范围收窄，缓存 key 不含范围 ⇒ 旧 inc 命中）
