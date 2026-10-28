@@ -1347,7 +1347,7 @@ const F1_MAX_BYTES = 4096
 
 function makeRealStore (opts = {}) {
   return createMessageStore({
-    Config: { cache: { dir: F1_DIR_NAME, maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
+    Config: { cache: { dir: opts.dir === undefined ? F1_DIR_NAME : opts.dir, maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
     Utils: createUtils({ fs: REAL_FS, safeRe: (p, f) => new RegExp(p, f) }),
     fs: REAL_FS,
     path,
@@ -2467,6 +2467,49 @@ check('MS-12 FIFO: readMessages 与墓碑读取必须在秒级返回 unsafe（�
       `墓碑 FIFO 必须有含状态的告警：${JSON.stringify(r.warns)}`)
   } finally {
     clean()
+  }
+})
+
+// ===== C3-004：init() 建缓存目录不传 mode，实际权限随 umask =====
+// 主启动路径（xbk_app.js 的 MessageStore.init() 早于首次读）建出的目录由无 mode 的 mkdirSync 决定，
+// 本机 umask=0002 ⇒ 0775；xbk_storage.ensureParent 的 0o700 在这一路径上永远轮不到。
+// 同一容器内同组账号对 0775 目录可 unlink/替换缓存文件，故显式 0700 必须写在建目录这一处。
+check('MS-13 init: 新建缓存目录必须显式 0700（不得随 umask 放宽到 0775/0755）', () => {
+  const mkTrial = (umask) => {
+    const dirName = `xianbaoku_cache_init_${process.pid}_${umask.toString(8)}`
+    const dir = path.join(ROOT_DIR, dirName)
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+    const prevUmask = process.umask(umask)
+    try {
+      makeRealStore({ dir: dirName }).init()
+      return { dir, mode: REAL_FS.statSync(dir).mode & 0o777 }
+    } finally {
+      process.umask(prevUmask)
+      REAL_FS.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+  // umask 0002：旧实现得 0775（组可写）；修复后必须是 0700
+  const g = mkTrial(0o002)
+  assert.strictEqual(g.mode, 0o700,
+    `umask 0002 下 init() 建出的缓存目录必须是 0700，实际 0o${g.mode.toString(8)}（0775 = 同组账号可 unlink/替换判重缓存）`)
+  // umask 0022：旧实现得 0755（其他用户可遍历）
+  const o = mkTrial(0o022)
+  assert.strictEqual(o.mode, 0o700,
+    `umask 0022 下 init() 建出的缓存目录必须是 0700，实际 0o${o.mode.toString(8)}（0755 = 其他用户可遍历目录）`)
+  // 已存在的目录不做 chmod：修复只在全新部署生效（登记为取舍，避免启动时改动运维手工设定的权限）
+  const dirName = `xianbaoku_cache_init_${process.pid}_existing`
+  const dir = path.join(ROOT_DIR, dirName)
+  REAL_FS.rmSync(dir, { recursive: true, force: true })
+  const prevUmask2 = process.umask(0o002)
+  try {
+    REAL_FS.mkdirSync(dir, { mode: 0o777 })
+    const before = REAL_FS.statSync(dir).mode & 0o777
+    makeRealStore({ dir: dirName }).init()
+    assert.strictEqual(REAL_FS.statSync(dir).mode & 0o777, before,
+      `已存在目录不得被 init() chmod（本次只修「新建时随 umask」，不给启动路径加改权限的副作用），实际 0o${(REAL_FS.statSync(dir).mode & 0o777).toString(8)} ≠ 0o${before.toString(8)}`)
+  } finally {
+    process.umask(prevUmask2)
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
   }
 })
 

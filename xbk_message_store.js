@@ -287,7 +287,11 @@ function createMessageStore ({
       // 避免目录已存在时调用 mkdirSync（故障注入测试依赖该守卫）。
         const dir = this.cacheDir
         if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true })
+          // mode: 0o700（C3-004）：不传 mode 时目录权限全由 umask 决定（本机 0002 ⇒ 0775），
+          // 同组账号即可在该目录里 unlink/替换判重缓存；ensureParent 的 0o700 只在「首次写盘
+          // 由 xbk_storage 建父目录」时生效，而主启动路径（xbk_app.js 的 MessageStore.init()）
+          // 总是先跑到这里 ⇒ 加固必须写在这一处。已存在的目录不 chmod（只在全新部署生效）。
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
         }
         this._cleanupResidualTombstoneLocks(dir)
       } catch (e) {
