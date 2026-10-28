@@ -7558,9 +7558,31 @@ async function main () {
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
-        consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLockResult(stateDir'),
-      '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
+      // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
+      // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
+      // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
+      // 这条红线，删除/替换 tickAuto 的锁必红。
+      const functionBodyOf = (text, signature) => {
+        const at = text.indexOf(signature)
+        if (at < 0) return ''
+        const open = text.indexOf('{', at + signature.length)
+        if (open < 0) return ''
+        let depth = 0
+        for (let i = open; i < text.length; i++) {
+          if (text[i] === '{') depth++
+          else if (text[i] === '}') {
+            depth--
+            if (depth === 0) return text.slice(open + 1, i)
+          }
+        }
+        return ''
+      }
+      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
+        consoleSrc.includes("startAction('run-auto'") &&
+        tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
+        tickAutoBody.includes('if (!lockVerdict.ok)'),
+      '自动调度必须在服务器进程内跑 run-auto，并在 tickAuto 体内先取单飞锁（锚点落在函数体内）')
       assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
         '上一轮未结束不得叠跑')
       assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
