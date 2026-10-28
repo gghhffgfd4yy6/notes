@@ -1719,6 +1719,26 @@ function mdToPlain (s, stripAngle = true) {
     .replace(/&amp;/g, '&') // & 最后解码：防 &amp;lt; 二次解码成 <（CodeQL js/double-escaping）
 }
 
+// C8-002：{Html内容} 模板产物是 HTML 片段（<p>/<br>/<img>），而纯文本/Markdown 通道都渲染不了它。
+// 直接下发时：mdToPlain 只能逐字符剥标签 ⇒ <p>/<br> 的段落边界全丢、<img> 连 alt 一起消失；
+// 不剥标签的通道（Server酱/企微/息知/PushDeer/PushMe/TG）则把 HTML 源码当正文显示。
+// 故先 htmlToMarkdown（p/br→段落、img→![alt](src)、a→[text](url)）再降纯文本。
+// 门槛只认「块级/结构标签」：这些正是逐标签剥离会破坏结构的形态；纯行内标签（<b>/<i> 等）保持
+// 原路径——整段 HTML→Markdown 会把混在 Markdown 里的行内标签改写掉（TG 的 HTML 转义契约靠它）。
+// 组合根不可用（测试替身/加载序）时退回 mdToPlain 逐标签剥——无论哪条路径，都不把裸 HTML 下发。
+const BLOCK_HTML_RE = /<(?:p|div|br|img|h[1-6]|li|ul|ol|table|thead|tbody|tr|td|th|blockquote|pre|hr|section|article|figure|figcaption)(?=[\s/>])/i
+
+function htmlToPlainText (s) {
+  const str = String(s === undefined || s === null ? '' : s)
+  if (!BLOCK_HTML_RE.test(str) || !looksHtml(str)) return str
+  let md = null
+  try {
+    const utils = shared()
+    if (utils && typeof utils.htmlToMarkdown === 'function') md = utils.htmlToMarkdown({ content_html: str })
+  } catch (e) { md = null }
+  return mdToPlain(typeof md === 'string' && md !== '' ? md : str)
+}
+
 // 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理
 function cleanSurrogates (s) {
   try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
@@ -1774,16 +1794,19 @@ async function sendNotify (text, desp, params = {}) {
   }
   // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
   // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
+  // C8-002：HTML 形态的 desp 只有 wxpusher 能真渲染（contentType=2），其余 8 个通道统一改用降级后的
+  // textDesp（HTML→Markdown→纯文本），避免段落换行丢失 / <img> 连 alt 消失 / 源码外露。
+  const textDesp = htmlToPlainText(desp)
   const channelTasks = [
-    [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, desp, params)],
-    [configuredFlags[1], 'server酱', () => serverNotify(text, desp, params)],
-    [configuredFlags[2], 'bark', () => barkNotify(text, desp, params)],
-    [configuredFlags[3], '企业微信', () => qywxBotNotify(text, desp, params)],
+    [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, textDesp, params)],
+    [configuredFlags[1], 'server酱', () => serverNotify(text, textDesp, params)],
+    [configuredFlags[2], 'bark', () => barkNotify(text, textDesp, params)],
+    [configuredFlags[3], '企业微信', () => qywxBotNotify(text, textDesp, params)],
     [configuredFlags[4], 'wxpusher', () => wxPusherNotify(text, desp, params)],
-    [configuredFlags[5], '息知', () => wxXiZhiNotify(text, desp, params)],
-    [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, desp, params)],
-    [configuredFlags[7], 'pushme', () => pushMeNotify(text, desp, params)],
-    [configuredFlags[8], 'telegram', () => tgNotify(text, desp, params)]
+    [configuredFlags[5], '息知', () => wxXiZhiNotify(text, textDesp, params)],
+    [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, textDesp, params)],
+    [configuredFlags[7], 'pushme', () => pushMeNotify(text, textDesp, params)],
+    [configuredFlags[8], 'telegram', () => tgNotify(text, textDesp, params)]
   ]
   const enabledTasks = channelTasks.filter(([enabled]) => enabled)
   // P3（跨批协同，low）：向调用方（Pusher）透出本次 sendNotify 的「在飞/已结算通道」状态。

@@ -2604,3 +2604,122 @@ checkS('C8-007 受害集合 415/422/451 判 permanent，5xx 仍判 retryable（�
     assert.strictEqual(decision.kind, 'retryable', '5xx 是瞬时故障，必须仍判 retryable')
   } finally { got1.restore(); restore() }
 })
+
+// ===== C8-002：{Html内容} 产物进纯文本/Markdown 通道必须降级，不得下发裸 HTML =====
+// formatter 的 {Html内容} 占位符直接塞 content_html（<p>/<br>/<img> 等），而除 wxpusher（contentType=2
+// 真渲染 HTML）外，其余通道只能渲染纯文本/Markdown：
+//   · Bark / Push+ 走 mdToPlain 逐字符剥标签 ⇒ <p>/<br> 的段落换行全丢，<img> 连 alt 一起消失；
+//   · Server酱 / 企微 / 息知 / PushDeer / PushMe / TG 直接把 <p>…</p> 当正文下发，用户看到 HTML 源码。
+// 修法：分发前对「HTML 形态」的 desp 先 htmlToMarkdown（p/br 转段落、img 取 alt、a 转链接）再 mdToPlain。
+const HTML_DESP = '<p>段落一第一行<br>段落一第二行</p><p>段落二 <b>加粗</b></p><p><img src="https://x/a.jpg" alt="图片说明"></p>'
+const PLAIN_FIRST = '段落一第一行\n\n段落一第二行'
+const PLAIN_TAIL = '段落二 加粗\n\n图片说明'
+
+// allowBr：Push+ 的正文本身就以 <br> 分行（它是 HTML 通道），只对文本通道禁 <br>
+function assertNoRawHtml (payload, channel, allowBr = false) {
+  assert.ok(!/<p[\s>]/i.test(payload), `${channel}: 不得残留 <p> 源码，实际 ${JSON.stringify(payload)}`)
+  assert.ok(!/<img[\s>]/i.test(payload), `${channel}: 不得残留 <img> 源码，实际 ${JSON.stringify(payload)}`)
+  if (!allowBr) assert.ok(!/<br\s*\/?>/i.test(payload), `${channel}: 不得残留 <br> 源码，实际 ${JSON.stringify(payload)}`)
+}
+
+checkS('C8-002 Bark: HTML desp 的段落换行保留 + <img> 取 alt（不得整段退化）', async () => {
+  const restore = isolateChannel({ BARK_PUSH: 'https://bark.fake/dev' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+  try {
+    await sendNotify('标题', HTML_DESP)
+    const body = got1.capture[0].opts.json.body
+    assert.ok(body.includes(PLAIN_FIRST), `Bark 必须保留 <p>/<br> 的段落边界，实际 ${JSON.stringify(body)}`)
+    assert.ok(body.includes(PLAIN_TAIL), `Bark 必须保留第二段并把 <img> 降成 alt，实际 ${JSON.stringify(body)}`)
+    assertNoRawHtml(body, 'Bark')
+  } finally { got1.restore(); restore() }
+})
+
+checkS('C8-002 Push+: HTML desp 的段落换行保留 + <img> 取 alt', async () => {
+  const restore = isolateChannel({ PUSH_PLUS_TOKEN: 'pptoken' })
+  const got1 = mockTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+  try {
+    await sendNotify('标题', HTML_DESP)
+    const content = JSON.parse(got1.capture[0].opts.body).content
+    assert.ok(content.includes('段落一第一行<br><br>段落一第二行'),
+      `Push+ 的段落换行必须变成 <br>，实际 ${JSON.stringify(content)}`)
+    assert.ok(content.includes('图片说明'), `Push+ 必须取到 <img> 的 alt，实际 ${JSON.stringify(content)}`)
+    assertNoRawHtml(content, 'Push+', true) // <br> 是 Push+ 的分行形态，允许
+  } finally { got1.restore(); restore() }
+})
+
+checkS('C8-002 企微 / 息知 / PushMe: Markdown 通道不得把 HTML 源码当正文下发', async () => {
+  const cases = [
+    ['企业微信', { QYWX_KEY: 'qykey' }, (opts) => opts.json.markdown.content],
+    ['息知', { WX_XIZHI_KEY: 'https://xizhi.fake/key' }, (opts) => opts.json.content],
+    ['pushme', { PUSHME_KEY: 'pmkey' }, (opts) => opts.json.content]
+  ]
+  for (const [channel, want, pick] of cases) {
+    const restore = isolateChannel(want)
+    const body = (url) => {
+      const u = String(url)
+      if (u.includes('qyapi')) return { errcode: 0 }
+      if (u.includes('push.i-i.me')) return 'success' // PushMe 的成功判定是响应体恰为 'success'
+      return { code: 200 }
+    }
+    const got1 = mockTransport((url) => ({ body: typeof body(url) === 'string' ? body(url) : JSON.stringify(body(url)) }))
+    try {
+      await sendNotify('标题', HTML_DESP)
+      const payload = pick(got1.capture[0].opts)
+      assertNoRawHtml(payload, channel)
+      assert.ok(payload.includes('段落一第一行\n\n段落一第二行'), `${channel}: 段落换行必须保留，实际 ${JSON.stringify(payload)}`)
+      assert.ok(payload.includes('图片说明'), `${channel}: <img> 必须降成 alt，实际 ${JSON.stringify(payload)}`)
+    } finally { got1.restore(); restore() }
+  }
+})
+
+checkS('C8-002 Server酱 / PushDeer / TG: 纯文本通道不得露出 HTML 源码', async () => {
+  const restoreServer = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
+  const gotServer = mockTransport(() => ({ body: JSON.stringify({ errno: 0 }) }))
+  try {
+    await sendNotify('标题', HTML_DESP)
+    const form = new URLSearchParams(String(gotServer.capture[0].opts.body))
+    const desp = form.get('desp')
+    assertNoRawHtml(desp, 'Server酱')
+    assert.ok(desp.includes('图片说明'), `Server酱: <img> 必须降成 alt，实际 ${JSON.stringify(desp)}`)
+    assert.ok(desp.includes('段落一第一行'), 'Server酱: 段落内容必须保留')
+  } finally { gotServer.restore(); restoreServer() }
+
+  const restoreDeer = isolateChannel({ DEER_KEY: 'PDK_fake' })
+  const gotDeer = mockTransport(() => ({ body: JSON.stringify({ content: { result: [{ message: 'ok' }] } }) }))
+  try {
+    await sendNotify('标题', HTML_DESP)
+    const desp = new URLSearchParams(String(gotDeer.capture[0].opts.body)).get('desp')
+    assertNoRawHtml(desp, 'PushDeer')
+    assert.ok(desp.includes('图片说明'), `PushDeer: <img> 必须降成 alt，实际 ${JSON.stringify(desp)}`)
+  } finally { gotDeer.restore(); restoreDeer() }
+
+  const restoreTg = isolateChannel({ TG_BOT_TOKEN: '1:x', TG_USER_ID: '2' })
+  const gotTg = mockTransport(() => ({ body: JSON.stringify({ ok: true }) }))
+  try {
+    await sendNotify('标题', HTML_DESP)
+    const text = gotTg.capture[0].opts.json.text
+    assertNoRawHtml(text, 'Telegram')
+    assert.ok(!text.includes('&lt;p&gt;'), `TG: HTML 源码被转义后当正文下发了，实际 ${JSON.stringify(text)}`)
+    assert.ok(text.includes('图片说明'), `TG: <img> 必须降成 alt，实际 ${JSON.stringify(text)}`)
+  } finally { gotTg.restore(); restoreTg() }
+})
+
+checkS('C8-002 wxpusher 仍按 HTML 渲染（不得被降级成纯文本）+ 非 HTML 的 Markdown desp 不受影响', async () => {
+  const restoreWx = isolateChannel({ WX_pusher_appToken: 'AT_fake' })
+  const gotWx = mockTransport(() => ({ body: JSON.stringify({ code: 1000 }) }))
+  try {
+    await sendNotify('标题', HTML_DESP)
+    const opts = gotWx.capture[0].opts.json
+    assert.strictEqual(opts.contentType, 2, 'wxpusher 对 HTML desp 必须仍走 contentType=2（HTML 渲染）')
+    assert.ok(opts.content.includes('<p>'), `wxpusher 必须收到原 HTML（它按 HTML 渲染），实际 ${JSON.stringify(opts.content)}`)
+  } finally { gotWx.restore(); restoreWx() }
+
+  // 反向断言：不含 HTML 形态的 Markdown desp 不进入降级分支（企微的 markdown 渲染不能被吃掉）
+  const restoreQy = isolateChannel({ QYWX_KEY: 'qykey' })
+  const gotQy = mockTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
+  try {
+    await sendNotify('标题', '**粗体**正文')
+    const content = gotQy.capture[0].opts.json.markdown.content
+    assert.ok(content.includes('**粗体**'), `非 HTML 的 Markdown desp 必须原样保留，实际 ${JSON.stringify(content)}`)
+  } finally { gotQy.restore(); restoreQy() }
+})
