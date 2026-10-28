@@ -389,10 +389,29 @@ function createFormatter ({ Utils, safeRe }) {
           }
           return lo < positions.length ? positions[lo] : -1
         }
+        // C10-002：`_findTagEnd(str, i)` 的结果只取决于 i，且可一次线性填表（引号感知语义逐位等价）：
+        //   tagEnd[i] = i                                  （str[i] 是 `>`）
+        //             = tagEnd[配对引号的下一位]            （str[i] 是引号且存在同种闭合引号）
+        //             = tagEnd[i + 1]                       （其余，含未闭合引号）
+        // 旧实现对每个「按正文保留」的 `<`（`价格<100 元`、`a<100 ` 这类合法正文）都扫到远端 `>`，
+        // 却只前进 1 个字符 ⇒ 二次方（96k 字符实测 2.81s，同长度不带远端 `>` 仅 32ms）。
+        // 换成 O(1) 查表后语义不变，扫描量与输入长度线性相关。
+        const n = str.length
+        const tagEnd = new Int32Array(n + 1).fill(-1)
+        const quoteClose = new Int32Array(n + 1).fill(-1)
+        let lastDq = -1
+        let lastSq = -1
+        for (let i = n - 1; i >= 0; i--) {
+          const c = str.charCodeAt(i)
+          if (c === 0x22) { quoteClose[i] = lastDq; lastDq = i } else if (c === 0x27) { quoteClose[i] = lastSq; lastSq = i }
+          if (c === 0x3e) tagEnd[i] = i
+          else if (c === 0x22 || c === 0x27) tagEnd[i] = tagEnd[quoteClose[i] === -1 ? i + 1 : quoteClose[i] + 1]
+          else tagEnd[i] = tagEnd[i + 1]
+        }
         while (pos < str.length) {
           const lt = str.indexOf('<', pos)
           if (lt === -1) { out += str.slice(pos); break }
-          const gt = this._findTagEnd(str, lt + 1)
+          const gt = tagEnd[lt + 1]
           if (gt === -1) { out += str.slice(pos); break }
           // 只有看起来像 HTML 标签的片段才剥离；`2 < 3 > 1`、`<world>` 等普通文本保留。
           const tagStart = str[lt + 1] === '/' ? lt + 2 : lt + 1
