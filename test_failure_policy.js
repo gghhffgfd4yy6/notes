@@ -615,7 +615,7 @@ function error (message, code) {
   assert.strictEqual(pathological.length, 199, '前置条件：对抗样本必须正好 199 字节（落在上游 200 字符截断内）')
   const pathologicalStart = process.hrtime.bigint()
   const pathologicalOut = summarizeError({ message: pathological }).message
-  const pathologicalMs = Number(process.hrtime.bigint() - pathologicalStart) / 1e6
+  const pathologicalMs = Number(process.hrtime.bigint() - pathologicalStart) / 1000000
   assert.ok(pathologicalMs < 1000,
     `199B 对抗样本必须在 1000ms 内返回（修复前 30s 未返回），实测 ${pathologicalMs.toFixed(1)}ms`)
   // 语义等价：数组未闭合 ⇒ 落回裸值分支，只抹到第一个分隔符为止（与修复前同形）
@@ -629,7 +629,7 @@ function error (message, code) {
   // 否则换个能绕过截断的调用点（failureInfo 字符串不截断）同样会挂。
   const doubledStart = process.hrtime.bigint()
   summarizeError({ message: 'token=[' + '"a",'.repeat(96) })
-  const doubledMs = Number(process.hrtime.bigint() - doubledStart) / 1e6
+  const doubledMs = Number(process.hrtime.bigint() - doubledStart) / 1000000
   assert.ok(doubledMs < 1000, `394B（96 个引号元素）同样必须在 1000ms 内返回，实测 ${doubledMs.toFixed(1)}ms`)
   // 反向守卫：同一形状但括号闭合时仍是「整体抹掉」，不许为了性能把结构化值分支整个丢掉
   assert.strictEqual(summarizeError({ message: 'token=["SECRET123","b"]' }).message, 'token=***',
