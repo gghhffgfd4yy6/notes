@@ -3737,6 +3737,39 @@ console.log('========================================\n');
     }
   })
 
+  await test('C9-002 推送部分失败（1 成功 + 1 失败）→ 告警 + run.log ERROR 行（消息级计数）', async () => {
+    // 反例（改动前）：告警判据是 `successCount === 0`，1 条成功 + N 条失败既不告警也不写 ERROR 行；
+    // 再叠加分类器「pushed>0 即成功」，失败的消息被整轮静默吞掉（退出码 0）。
+    reset()
+    setPushUrl('t70b_partialfail')
+    const orig = Config.alert.enabled
+    const origInterval = Config.alert.intervalMs
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { require('fs').unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.alert.enabled = true
+      Config.alert.intervalMs = 0
+      notifyFailAt = 1 // 第 1 条消息失败、第 2 条成功，第 3 次调用是告警
+      fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })]
+      const summary = await xbk.run()
+      assertEqualNum(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
+      assertEqualNum(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
+      const log = require('fs').readFileSync(logPath, 'utf8')
+      assert(log.includes('推送部分失败'), `部分失败应写 ERROR 行: ${log.slice(-200)}`)
+      assert(pushCalls.some(c => String(c.desp || '').includes('推送部分失败')),
+        `部分失败必须触发告警（成功/失败条数可读）: ${JSON.stringify(pushCalls.map(c => c.desp))}`)
+      // 分类器同口径：degraded 判定（非 null）——单次入口据此置非零退出码
+      const decision = require('./xbk_failure_policy').classifySummary(summary)
+      assert(decision && decision.reason === 'PARTIAL_MESSAGE_FAILURE',
+        `部分失败必须被判 degraded，实际 ${JSON.stringify(decision)}`)
+    } finally {
+      Config.alert.enabled = orig
+      Config.alert.intervalMs = origInterval
+      notifyFailAt = -1
+      try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('接口异常告警在 run 返回前完成（#10 v3.164，防 exit 杀死）', async () => {
     reset()
     setPushUrl('t71_alert_await')

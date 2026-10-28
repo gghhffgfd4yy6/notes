@@ -1704,9 +1704,21 @@ function createApp ({
         // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
         // v3.170：await 告警完成（与 catch 路径 v3.164 同口径）——曾 fire-and-forget，
         // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
-        if (!dryRun && items.length > 0 && successCount === 0) {
-          try { await this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
-          this._writeRunLog(`${this._localStamp()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`)
+        // C9-002：失败计数是**消息**级（successCount 来自 pushOne 结果）。旧判据 `successCount === 0`
+        // 只覆盖全灭：1 条成功 + 99 条失败时既不告警也不写 ERROR 行，配上分类器「pushed>0 即成功」
+        // 就是「99 条被静默吞掉」。现在只要还有消息没送达就告警；全失败的文案保持不变
+        // （console/status 的 run.log 解析以「推送全部失败」为锚点），部分失败另写带条数的行。
+        const failedMessages = items.length - successCount
+        if (!dryRun && items.length > 0 && failedMessages > 0) {
+          const allFailed = successCount === 0
+          try {
+            await this._sendAlert(allFailed
+              ? `推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`
+              : `推送部分失败（成功 ${successCount} 条 / 失败 ${failedMessages} 条）：未送达的消息下轮重试，通道可能部分失效`)
+          } catch (e) { /* 告警失败不阻塞主流程 */ }
+          this._writeRunLog(`${this._localStamp()} ERROR ${allFailed
+            ? `推送全部失败 ${items.length} 条（通道可能失效）`
+            : `推送部分失败 ${failedMessages}/${items.length} 条（未送达消息下轮重试）`}\n`)
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
