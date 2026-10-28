@@ -764,6 +764,72 @@ function assertNoResidue (fx, label) {
   }
 }
 
+// I) 【靶向 C10-005 之一：status.showUntrackedFiles=no 不得让未跟踪文件隐形】
+//    `git status --porcelain` 的未跟踪口径受 status.showUntrackedFiles 影响：设成 no 时它**静默不列**
+//    未跟踪文件（实测：同仓 `git status --porcelain` 输出为空、加 `-uall` 仍输出 `?? stray.js`）。旧实现
+//    拿这份空输出判定「整棵工作树干净」并打印「工作树内容 === 被推提交内容」→ 快路径假绿。命令加 `-uall`
+//    后命令行覆盖该配置 ⇒ 未跟踪文件照旧算脏、必须走隔离路径。旧实现下本用例的
+//    「不得打印快路径结论」必红（靶向回退已实测）。
+{
+  const fx = makePushFixture({ commitGate: 'pass' })
+  try {
+    mustGit(['config', 'status.showUntrackedFiles', 'no'], { cwd: fx.work, env: fx.env }, 'git config status.showUntrackedFiles no')
+    fs.writeFileSync(path.join(fx.work, 'untracked-hidden-by-config.txt'), '未跟踪（且被 status 配置隐藏）\n')
+    // 夹具前提必须显式断言：配置真的生效，否则本用例测不到那条路径
+    const plain = mustGit(['status', '--porcelain'], { cwd: fx.work, env: fx.env })
+    const all = mustGit(['status', '--porcelain', '-uall'], { cwd: fx.work, env: fx.env })
+    assert.strictEqual(plain.trim(), '',
+      'I 夹具前提：status.showUntrackedFiles=no 时 git status --porcelain 必须为空（否则本用例测不到该配置）')
+    assert.match(all, /\?\? .*untracked-hidden-by-config\.txt/,
+      'I 夹具前提：同一仓库下 -uall 仍必须列出该未跟踪文件（-uall 覆盖配置）')
+    const head = headOf(fx)
+    const r = driveHook(fx, refLine('refs/heads/main', head, 'refs/heads/main'))
+    assert.strictEqual(r.status, 0, `I：被推提交内容通过时应 exit 0（隔离路径不改变门禁结论）：${hookOut(r)}`)
+    assert.doesNotMatch(hookOut(r), /在当前工作树跑门禁（快路径）/,
+      'I（靶向）：未跟踪文件仍算脏，绝不能走快路径——旧实现正是在这里把脏树当干净（showUntrackedFiles=no）')
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 1, `I：门禁应只跑一次，实际 ${runs.length} 次`)
+    assert.match(runs[0].cwd, /xbk-prepush-/, 'I：有未跟踪文件时必须走隔离路径（不得拿当前工作树冒充）')
+    assertInFixtureTmp(fx, runs[0].cwd, 'I')
+    assert.ok(!fs.existsSync(runs[0].cwd), 'I：临时 worktree 必须被清理')
+    assertNoResidue(fx, 'I')
+    console.log('✅ C10-005-①：status.showUntrackedFiles=no + 未跟踪文件仍走隔离校验（同一仓库 git status --porcelain 为空、-uall 列出该文件）')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+// J) 【靶向 C10-005 之二：git status 失败（索引损坏 rc=128）必须 fail-closed】
+//    旧实现 `worktree_status=$(git status --porcelain 2>/dev/null || true)`：rc=128 被 `|| true` 吞掉、
+//    stderr 被丢弃 ⇒ 变量为空 ⇒ 判定「整棵工作树干净」并打印快路径结论（红测被放行）。现在 status 失败
+//    即视为「不能证明干净」：打印具体原因并走隔离校验（隔离 worktree 有自己的一份索引，不读这份损坏的
+//    索引——实测 `git status` rc=128 与 `git worktree add --detach` 可以共存）。旧实现下本用例必红。
+{
+  const fx = makePushFixture({ commitGate: 'pass' })
+  try {
+    const head = headOf(fx)
+    fs.writeFileSync(path.join(fx.work, '.git', 'index'), 'GARBAGE-INDEX')
+    const probe = spawnSync(GIT, ['status', '--porcelain', '-uall'], { cwd: fx.work, encoding: 'utf8', env: fx.env })
+    assert.strictEqual(probe.status, 128,
+      `J 夹具前提：索引损坏后 git status 必须以 rc=128 失败（实际 ${probe.status}：${probe.stderr}）`)
+    const r = driveHook(fx, refLine('refs/heads/main', head, 'refs/heads/main'))
+    assert.strictEqual(r.status, 0, `J：索引损坏不影响「被推提交内容」的校验，应 exit 0：${hookOut(r)}`)
+    assert.doesNotMatch(hookOut(r), /在当前工作树跑门禁（快路径）/,
+      'J（靶向）：git status 失败时不得走快路径——rc=128 必须 fail-closed（旧实现把它吞成「工作树干净」）')
+    assert.match(hookOut(r), /无法判定工作树是否干净：git status --porcelain -uall 失败（退出码 128）/,
+      'J：必须打印 status 失败的具体原因（不得 `2>/dev/null || true` 静默吞掉）')
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 1, `J：门禁应只跑一次，实际 ${runs.length} 次`)
+    assert.match(runs[0].cwd, /xbk-prepush-/, 'J：status 判不了时必须走隔离路径（不能证明干净 = 不干净）')
+    assertInFixtureTmp(fx, runs[0].cwd, 'J')
+    assert.ok(!fs.existsSync(runs[0].cwd), 'J：临时 worktree 必须被清理')
+    assertNoResidue(fx, 'J')
+    console.log('✅ C10-005-②：索引损坏（git status rc=128）fail-closed——打印原因并走隔离校验，不走快路径')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
 // 12) 安装路径（无 --verify）：.githooks 目录整体缺失 ⇒ exit 1 且给出两条可照抄的诊断
 {
   const { dir, home } = makeCase()
