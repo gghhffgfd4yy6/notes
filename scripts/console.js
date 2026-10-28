@@ -1981,6 +1981,12 @@ function readFilterAuditChain (auditPath) {
     }
     lastHash = entry.entryHash
   }
+  // 末行必须以 \n 收尾（C2-001 残留）：旧版 1 字节短写会留下「末行 JSON 完整、只缺换行」的
+  // 审计文件——逐行重算查不出问题（末行合法、链也接得上），但下一次 append 会直接粘在这一行尾部，
+  // 整行 JSON 当场报废、brokenAt=1，链一次性不可读，而那次保存仍返回 200（读链说 ok）。非空文件
+  // 缺收尾换行即判「末行不完整」（brokenAt = 末行行号），由 append 的断链闸拒绝续写；人工补一个
+  // 换行即可恢复，不必归档整份审计。
+  if (brokenAt === null && read.text.length > 0 && !read.text.endsWith('\n')) brokenAt = lines.length
   return { ok: brokenAt === null, entries, brokenAt, lastHash }
 }
 

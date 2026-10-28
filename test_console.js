@@ -1853,6 +1853,35 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则保存: 审计末行缺 \\n（旧版短写残留）→ 500 audit_broken，不把新行粘到末行尾', async () => {
+    // C2-001 残留（P3）：旧版 1 字节短写会留下「末行 JSON 完整、只缺最后的换行」的审计文件。
+    // 逐行重算看不出问题（末行合法、链也接得上），但下一次 append 直接粘在这一行尾部 ⇒
+    // 整行 JSON 报废、brokenAt=1，链一次性不可读；而这次保存仍返回 200。非空审计文件必须以
+    // \n 收尾，否则按「末行不完整」判链，append 拒绝续写（人工补一个换行即可）。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })).status, 200)
+      const raw = fs.readFileSync(paths.audit, 'utf8')
+      assert.ok(raw.endsWith('\n'), '前置：正常 append 的行必须以换行结尾')
+      // 只丢末行的 \n（其余字节一个不少）：末行内容仍完整、仍可 JSON.parse。
+      const truncated = raw.slice(0, -1)
+      fs.writeFileSync(paths.audit, truncated)
+      const chain = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).auditChain
+      assert.strictEqual(chain.ok, false, '末行缺换行 = 不可续写，必须判链不完整')
+      assert.strictEqual(chain.brokenAt, 2, '断链行号 = 缺换行的那一行（第 2 行）')
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 2, filter: { pingbibiaoti: 'v3' } })
+      assert.strictEqual(res.status, 500, `末行缺换行时必须拒绝保存（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_broken')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '拒绝续写 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.readFileSync(paths.audit, 'utf8'), truncated, '拒绝续写时审计文件一个字节都不动')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
   await aok('过滤规则保存: 审计 writeSync 短写 → 500 audit_failed + 回滚 + 清掉半行（链仍可读）', async () => {
     // C2-001：旧实现丢弃 writeSync 返回值且不 fsync。半行落盘后函数仍返回 true，保存 200、
     // 不回滚，链永久停在坏行。修后：短写 ⇒ 判失败 ⇒ 保存回滚，并把半行截掉让链保持完整。
