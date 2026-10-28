@@ -4527,12 +4527,20 @@ async function main () {
     assert.strictEqual(r.value.filteredCount, 3)
   })
   await aok('HTTP: /api/trends 按日聚合（与 parseLastRun 同一正则口径）', async () => {
+    // 夹具日期必须按当日派生：/api/trends 是「今天-13 … 今天」的滚动窗（status.js:466），
+    // 写死日期会随日历滑出窗口 ⇒ 到点必红；而 Stryker 的 dry run 跑全量测试集，
+    // 一条红即全部变异段挂掉（CI run head 40580583641 实测：32 段全失败）。
+    const { shanghaiDayKey } = require('./xbk_utils')
+    const dayKey = (offset) => shanghaiDayKey(Date.now() - offset * 86400000)
+    const D_IN1 = dayKey(13) // 窗口第一天
+    const D_IN2 = dayKey(12) // 窗口第二天
+    const D_OUT = dayKey(20) // 窗口外
     const dir = tmpDir()
     fs.writeFileSync(path.join(dir, 'run.log'), [
-      '2026-10-14 18:02:34 total=20 dedup=5 filtered=1 truncated=0 pushed=18 failed=2 elapsed=10.1s cachesaved=1',
-      '2026-10-14 19:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=10 failed=0 elapsed=1.0s cachesaved=1',
-      '2026-10-15 11:01:40 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1',
-      '2026-10-01 08:00:00 total=99 dedup=0 filtered=0 truncated=0 pushed=99 failed=0 elapsed=1.0s cachesaved=1',
+      `${D_IN1} 18:02:34 total=20 dedup=5 filtered=1 truncated=0 pushed=18 failed=2 elapsed=10.1s cachesaved=1`,
+      `${D_IN1} 19:00:00 total=10 dedup=0 filtered=0 truncated=0 pushed=10 failed=0 elapsed=1.0s cachesaved=1`,
+      `${D_IN2} 11:01:40 total=20 dedup=0 filtered=0 truncated=0 pushed=20 failed=0 elapsed=10.1s cachesaved=1`,
+      `${D_OUT} 08:00:00 total=99 dedup=0 filtered=0 truncated=0 pushed=99 failed=0 elapsed=1.0s cachesaved=1`,
       'ERROR something broke'
     ].join('\n') + '\n')
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
@@ -4540,15 +4548,15 @@ async function main () {
     const t = JSON.parse((await request(port, 'GET', '/api/trends', { token: TOKEN })).text)
     assert.strictEqual(t.status, 'ok')
     assert.strictEqual(t.byDay.length, 14)
-    const d14 = t.byDay.find(d => d.date === '2026-10-14')
-    assert.ok(d14, '14 窗口含 10-14')
-    assert.strictEqual(d14.rounds, 2)
-    assert.strictEqual(d14.pushed, 28)
-    assert.strictEqual(d14.failed, 2)
-    const d15 = t.byDay.find(d => d.date === '2026-10-15')
-    assert.strictEqual(d15.pushed, 20)
-    // 窗口外的 10-01 不进任何桶（14 天窗口）
-    assert.ok(!t.byDay.some(d => d.date === '2026-10-01'))
+    const dIn1 = t.byDay.find(d => d.date === D_IN1)
+    assert.ok(dIn1, `14 窗口含 ${D_IN1}（今天-13）`)
+    assert.strictEqual(dIn1.rounds, 2)
+    assert.strictEqual(dIn1.pushed, 28)
+    assert.strictEqual(dIn1.failed, 2)
+    const dIn2 = t.byDay.find(d => d.date === D_IN2)
+    assert.strictEqual(dIn2.pushed, 20)
+    // 窗口外的日期（今天-20）不进任何桶（14 天窗口）
+    assert.ok(!t.byDay.some(d => d.date === D_OUT), `${D_OUT} 不得进 14 天窗口`)
     server.close()
   })
   await aok('HTTP: /api/logs 尾读（>1MiB 截断保留尾部）+ missing；/api/sys 版本与缓存目录、无环境变量泄漏', async () => {
