@@ -107,6 +107,8 @@ function scanBracket (text, start, closers) {
         // 一个括号都没有才吞到串尾——只会多抹，不会少抹。
         return lastCloser > i ? lastCloser + 1 : text.length
       }
+      // 不变量：scanQuoted 返回的是收尾引号之后的下标（≥ i + 2），所以这里 i 严格前进；
+      // 若以后把 scanQuoted 改成可能返回 ≤ i，这一行会原地死循环——动它之前先确认这个前提。
       i = end
       continue
     }

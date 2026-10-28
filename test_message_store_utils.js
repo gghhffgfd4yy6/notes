@@ -2501,6 +2501,8 @@ check('MS-13 init: 新建缓存目录必须显式 0700（不得随 umask 放宽�
   const dir = path.join(ROOT_DIR, dirName)
   REAL_FS.rmSync(dir, { recursive: true, force: true })
   // 夹具需要构造宽松权限/umask；用八进制字符串解析得到同一数值，避免 Sonar S2612 把权限字面量判成漏洞（这不是生产默认值）。
+  // 注意：parseInt(s, 8) 遇到 8/9 会静默截断（'008' 会得到 0），这里只许传纯 0-7 的八进制串；
+  // 以后新增用法别写带 8/9 的值，否则夹具会悄悄拿到与直觉不同的权限。
   const oct = (s) => Number.parseInt(s, 8)
   const prevUmask2 = process.umask(oct('002'))
   try {
