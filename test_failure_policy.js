@@ -567,6 +567,36 @@ function error (message, code) {
   assert.strictEqual(summarizeError({ message: 'token=***' }).message, 'token=***', '脱敏必须幂等')
   assert.strictEqual(summarizeError({ message: 'Basic ***' }).message, 'Basic ***', '裸 scheme 脱敏同样幂等')
 
+  // ============ C9-001（P0）：畸形结构化值不得把脱敏拖进指数回溯 ============
+  // 反例（修复前实测，单进程 summarizeError）：`token=[` + `"a",`×n 的耗时 n=9/43B→101ms、10→610ms、
+  // 11→3.33s、12→19.28s（每多一个元素约 ×5.5）；199B（48 个引号元素）30s 未返回。
+  // 可达性：厂商响应 data.msg → safeErr 截到 200 字符（截断点正好能落在 `[` 与 `]` 之间）→
+  // new Error(msg) → classifyFailure → summarizeError → redact，跑在推送主线程上，没有任何超时兜底。
+  // 本块同时钉住两件事：① 耗时上界（不许再有指数/超长回溯路径）；② 脱敏语义不变（该抹的还得抹）。
+  const pathological = ('token=[' + '"a",'.repeat(48)).slice(0, 200)
+  assert.strictEqual(pathological.length, 199, '前置条件：对抗样本必须正好 199 字节（落在上游 200 字符截断内）')
+  const pathologicalStart = process.hrtime.bigint()
+  const pathologicalOut = summarizeError({ message: pathological }).message
+  const pathologicalMs = Number(process.hrtime.bigint() - pathologicalStart) / 1e6
+  assert.ok(pathologicalMs < 1000,
+    `199B 对抗样本必须在 1000ms 内返回（修复前 30s 未返回），实测 ${pathologicalMs.toFixed(1)}ms`)
+  // 语义等价：数组未闭合 ⇒ 落回裸值分支，只抹到第一个分隔符为止（与修复前同形）
+  assert.strictEqual(pathologicalOut, 'token=***' + pathological.slice('token=["a"'.length),
+    '未闭合数组的脱敏形态必须与修复前一致（裸值分支抹到第一个 , 为止）')
+  // 同一形状带真凭据时不得漏抹：凭据必须整体消失（不允许「只抹前几个字符」的降级实现）
+  const secretInPathological = 'token=["SECRET1234","a",' + '"a",'.repeat(40)
+  const secretOut = summarizeError({ message: secretInPathological }).message
+  assert.ok(!secretOut.includes('SECRET1234'), '畸形结构化值里的凭据同样必须整体脱敏')
+  // 长度翻倍（394B，两倍于上游截断上限）仍须在预算内：证明修复不是靠「先截断到 N 字符」躲过去的，
+  // 否则换个能绕过截断的调用点（failureInfo 字符串不截断）同样会挂。
+  const doubledStart = process.hrtime.bigint()
+  summarizeError({ message: 'token=[' + '"a",'.repeat(96) })
+  const doubledMs = Number(process.hrtime.bigint() - doubledStart) / 1e6
+  assert.ok(doubledMs < 1000, `394B（96 个引号元素）同样必须在 1000ms 内返回，实测 ${doubledMs.toFixed(1)}ms`)
+  // 反向守卫：同一形状但括号闭合时仍是「整体抹掉」，不许为了性能把结构化值分支整个丢掉
+  assert.strictEqual(summarizeError({ message: 'token=["SECRET123","b"]' }).message, 'token=***',
+    '闭合数组仍必须整体脱敏（性能修复不得砍掉结构化值分支）')
+
   // 反向断言：无凭据文本不得被脱敏误改（防止把规则写成吞掉正常内容）
   assert.strictEqual(summarizeError({ message: 'request timed out after 5000ms' }).message,
     'request timed out after 5000ms', '无凭据文本不应被脱敏改动')
