@@ -7242,6 +7242,34 @@ async function main () {
     assert.ok(/<\$\{StatusCards\} state=\$\{state\} err=\$\{statusFailed\} \/>/.test(src), 'App 必须把状态接口的失败传给状态卡')
   })
 
+  await aok('结构红线: 部件 invalid/tooLarge 不得渲染成「暂无数据」（损坏 ≠ 缺失）', async () => {
+    // C7-033：readStatus 对 invalid/tooLarge 不给 value，StatusCards 的 rep/run 都变成 null，
+    // 与 missing 走同一条 !rep / !run 分支 ⇒ 卡片写「暂无数据」、徽标写「—」；标题状态点也
+    // 只读 value 里的 failed/interrupted ⇒ 还是绿的。损坏被伪装成缺失/健康。
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = comp.slice(comp.indexOf('function StatusCards'), comp.indexOf('// ── 组件：触发按钮'))
+    assert.ok(seg.includes('partBroken(state.run)') && seg.includes('partBroken(state.report)'),
+      '状态卡必须先判定部件是「损坏」还是「还没生成」（缺这一层 ⇒ 损坏落进「暂无数据」）')
+    assert.ok(/runBroken[\s\S]{0,40}'异常'[\s\S]{0,10}—/.test(seg), '最近一轮损坏时徽标必须写「异常」，不得写「—」')
+    assert.ok(seg.includes("runBroken ? '数据损坏，无法读取' : '暂无数据'"),
+      '最近一轮损坏时主文案必须是「数据损坏，无法读取」而不是「暂无数据」')
+    assert.ok(/\$\{rep \? [\s\S]{0,200}repBroken \? '数据损坏' : '暂无'/.test(seg),
+      '日报行遇 report 损坏时不得写「暂无」')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const dotAt = ui.indexOf('// 标题状态点')
+    const dot = dotAt > -1 ? ui.slice(dotAt, dotAt + 900) : ''
+    assert.ok(dot.includes('partBroken(state && state.run)') && dot.includes('partBroken(state && state.report)'),
+      '标题状态点必须把 run/report 损坏算成异常（否则标题点还是绿色）')
+    assert.ok(/const bad = broken \|\|/.test(dot), '标题状态点的 bad 判定必须并入 broken')
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.partBroken, 'function', '必须有统一的「部件损坏」判定')
+    assert.strictEqual(pure.partBroken({ status: 'invalid' }), true, 'invalid 是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'tooLarge' }), true, 'tooLarge 是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'missing' }), false, 'missing 是还没生成，不是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'ok', value: { failed: 0 } }), false, 'ok 正常')
+    assert.strictEqual(pure.partBroken(null), false, '没有部件不算损坏')
+  })
+
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
     const src = readConsoleSource()
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))

@@ -523,6 +523,14 @@ export function backupImportProblem (res) {
   return text || `HTTP ${res && Number.isInteger(res.status) ? res.status : '未知状态'}`
 }
 
+// 部件「损坏」判定（C7-033）：readStatus 的部件三态里，missing = 文件还没生成（中性，卡片写
+// 「暂无数据」是对的），invalid / tooLarge / 其它显式 status = 文件在但读不出来，属异常。
+// 两者都没有 value，所以组件里只判 !part 会把损坏渲染成缺失（卡片「暂无数据」、标题点绿色）。
+export function partBroken (part) {
+  if (!part || typeof part !== 'object') return false
+  return part.status !== undefined && part.status !== 'ok' && part.status !== 'missing'
+}
+
 export async function encryptBackup (bundle, password) {
   if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) throw new Error('没有可加密的备份内容')
   const pass = backupPasswordText(password)

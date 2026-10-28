@@ -3,7 +3,7 @@
 // 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js、flatpickr 与 floating-ui；不认识任何页面，也没有顶层副作用。
 // 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
-import { ageFromStamp, dateRangeLabel, relDay, scrollDeltaInto } from './pure.mjs'
+import { ageFromStamp, dateRangeLabel, partBroken, relDay, scrollDeltaInto } from './pure.mjs'
 import flatpickr from './flatpickr.js'
 // 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -793,6 +793,11 @@ function StatusCards ({ state, err }) {
   const repTone = partTone(state.report, repIsOk(state))
   const run = state.run && state.run.value ? state.run.value : null
   const runTone = partTone(state.run, runIsOk(state))
+  // 「文件在但读不出来」≠「还没生成」（C7-033）：invalid/tooLarge 都没有 value，旧实现与
+  // missing 一起落进 !rep / !run 分支 ⇒ 卡片写「暂无数据」、徽标写「—」，tone 明明是红的、
+  // 文案却说「没有数据」。损坏必须自己说出来。
+  const repBroken = partBroken(state.report)
+  const runBroken = partBroken(state.run)
   const runDry = run && run.dryRun != null
   const runBad = run && (run.interrupted === true || run.failed > 0)
   const chan = channelInfo(state)
@@ -831,7 +836,7 @@ function StatusCards ({ state, err }) {
         ? [
             `失败 ${fmtNum(today.failed)}${today.failed > 0 ? ' ⚠️' : ''}`,
             // 「正常」不再重复写在日报行：右上角状态点已经表达，重复反而每次都要读两遍。
-            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''}${repTone === 'ok' ? '' : repTone === 'bad' ? ' · 异常' : ' · 暂无'}` : '暂无'}`
+            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''}${repTone === 'ok' ? '' : repTone === 'bad' ? ' · 异常' : ' · 暂无'}` : (repBroken ? '数据损坏' : '暂无')}`
           ]
         // 没有 run.log 数据时也要占满两行：行数随数据增减会让卡片块在加载完成的瞬间长高/变矮，
         // 把下面的面板整体推走（Sourcery PR #292：首帧占位必须与加载完成态同高）。
@@ -855,7 +860,7 @@ function StatusCards ({ state, err }) {
       title: '最近一轮',
       tone: runDry ? (runBad ? 'bad' : 'warn') : runTone,
       badge: !run
-        ? '—'
+        ? (runBroken ? '异常' : '—')
         : (run.cancelled === true
             ? '已取消'
             : (runDry ? (runBad ? '试跑异常' : '试跑') : (runBad ? '异常' : '正常'))),
@@ -865,7 +870,7 @@ function StatusCards ({ state, err }) {
             unit: runDry ? '条未推送' : '条推送',
             hint: `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`
           }
-        : { num: '—', unit: '', hint: '暂无数据' },
+        : { num: '—', unit: '', hint: runBroken ? '数据损坏，无法读取' : '暂无数据' },
       lines: run
         ? [
             `获取 ${fmtNum(run.total)} · 失败 ${fmtNum(run.failed)} · 耗时 ${fmtNum(run.elapsed)}${run.cancelled === true ? ' · ⏹ 已取消' : run.interrupted ? ' · ⚠️ 中断' : ''}`
