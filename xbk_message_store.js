@@ -559,7 +559,11 @@ function createMessageStore ({
         return this._memoryCache[filePath]
       }
       const initialized = this._ensureFileExists(filePath)
-      const result = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES)
+      // openNonBlocking（C3-003）：裸 O_RDONLY 打开 FIFO 会永久阻塞等写者——同步 open 挂死的是
+      // 整个事件循环，进程内没有任何超时能打断，表现为整轮同步流程无声停住（无日志、无退出码）。
+      // 上游 _ensureFileExists 挡不住：它对已存在路径直接 return true（FIFO 的 existsSync 就是 true）。
+      // 加 O_NONBLOCK 后普通文件语义不变，FIFO 的 open 立即 ENXIO ⇒ readSafeTextResult 归 unsafe。
+      const result = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { openNonBlocking: true })
       if (result.status !== 'ok') {
         const detail = result.error && result.error.message ? result.error.message : result.status
         if (result.status === 'unsafe') console.error(`拒绝读取非普通缓存文件 ${filePath}`)
@@ -746,7 +750,7 @@ function createMessageStore ({
      *  说明：这是缩小竞态窗口的纵深防御，不构成对 TOCTOU 的证明（隔离本身仍可能被更晚的替换抢先）。 */
     _stillUnparseable (filePath) {
       let again
-      try { again = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES) } catch (e) { return false }
+      try { again = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { openNonBlocking: true }) } catch (e) { return false }
       if (!again || again.status !== 'ok') return false
       try { return !Array.isArray(JSON.parse(again.text || '[]')) } catch (e) { return true }
     },
@@ -773,7 +777,7 @@ function createMessageStore ({
         console.error(`缓存超限恢复：文件在读取期间已被替换/截断，按瞬时读失败处理（不隔离、保持写闸门）${filePath}`)
         return null
       }
-      const tail = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { tail: true })
+      const tail = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { tail: true, openNonBlocking: true })
       if (!tail || tail.status !== 'ok' || typeof tail.text !== 'string') {
         console.error(`缓存超限尾部读取失败，无法自动恢复（保持写闸门）${filePath}: ${tail && tail.status}`)
         return null
@@ -1026,7 +1030,7 @@ function createMessageStore ({
    *  ioError/unsafe/tooLarge 保留下次重试窗口）。 */
     _readTombstoneData (filePath) {
       try {
-        const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES)
+        const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
         this._tombstoneLoadStatus[filePath] = result.status
         if (result.status !== 'ok') {
           if (result.status !== 'missing') {

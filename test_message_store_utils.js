@@ -2332,6 +2332,144 @@ check('MS-10 隔离备份名不可用时绝不改名、绝不覆写：保持写�
   assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '不得在原路径写入任何内容')
 })
 
+// ===== C3-003：FIFO 上裸 O_RDONLY 的同步 open 会永久阻塞整轮同步流程（无日志、无退出码）=====
+// 两段互补证据：
+//   ① 参数层——本文件 4 个读入口（主缓存 readMessages / 隔离前复核 _stillUnparseable /
+//      尾部恢复 _recoverOverlargeCache / 墓碑 _readTombstoneData）都必须显式传
+//      openNonBlocking:true。它覆盖行为层抓不到的 rare 路径（复核读、尾部读）。
+//   ② 行为层——真实 mkfifo 建出的 FIFO 上，主缓存读与墓碑读必须在秒级返回 unsafe，
+//      而不是挂死。它覆盖参数层抓不到的「flag 传了却没接到 open flags 上」。
+// 为什么必须借子进程：同步 open 阻塞的是整个事件循环，同进程内没有任何超时能打断它；
+// 只有 execFileSync 的 timeout 能在外部杀掉挂死的子进程。
+const FIFO_CHILD_PREAMBLE = `
+const path = require('node:path')
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+const { createMessageStore } = require('./xbk_message_store')
+const { createUtils } = require('./xbk_utils')
+const conf = JSON.parse(process.env.XBK_FIFO_PROBE)
+const dir = path.join(__dirname, conf.dir)
+const store = createMessageStore({
+  Config: { cache: { dir: conf.dir, maxSize: 1000 } },
+  Utils: createUtils({ fs, safeRe: (p, f) => new RegExp(p, f) }),
+  fs,
+  path,
+  crypto,
+  normalize: (o) => o,
+  storage: require('./xbk_storage'),
+  constants: { DEFAULT_MAX_SIZE: 1000, MESSAGE_CACHE_MAX_BYTES: 8388608, TOMBSTONE_MAX_KEYS: 5000, TOMBSTONE_MAX_BYTES: 262144, TOMBSTONE_LOCK_STALE_MS: 10000 }
+})
+const warns = []
+const errs = []
+const ow = console.warn
+const oe = console.error
+console.warn = (...a) => warns.push(a.map(String).join(' '))
+console.error = (...a) => errs.push(a.map(String).join(' '))
+const fp = path.join(dir, conf.cacheFile)
+const t0 = Date.now()
+const got = store.readMessages(fp)
+const readMs = Date.now() - t0
+const t1 = Date.now()
+const tomb = store._readTombstoneData(fp)
+const tombMs = Date.now() - t1
+console.warn = ow
+console.error = oe
+process.stdout.write(JSON.stringify({ got, readMs, tombMs, tombIsNull: tomb === null, tombStatus: store._tombstoneLoadStatus[fp], errs, warns }))
+`
+
+const MKFIFO = '/usr/bin/mkfifo'
+const FIFO_SKIP = (() => {
+  try { return REAL_FS.existsSync(MKFIFO) ? null : `${MKFIFO} 不存在（非 Linux 或 coreutils 缺失）` } catch (e) { return `mkfifo 可用性探测失败: ${e.message}` }
+})()
+
+check('MS-11 读入口: 主缓存/复核/尾部恢复/墓碑四处 readSafeTextResult 必须一律传 openNonBlocking', () => {
+  const calls = []
+  const at = (label) => (p, fsMock, options) => { calls.push({ at: label, p, options }); return null }
+  // ① 主缓存读取：readMessages 正常路径
+  const h1 = makeBatchStore({ name: 'ms11_main.json', files: { [cachePath('ms11_main.json')]: '[]' }, readStatus: at('main') })
+  assert.deepStrictEqual(h1.store.readMessages(h1.filePath), [])
+  // ② 解析失败后的隔离前复核：主读 + _stillUnparseable 的二次读（第二次即复核入口）
+  let n2 = 0
+  const h2 = makeBatchStore({
+    name: 'ms11_bad.json',
+    files: { [cachePath('ms11_bad.json')]: '[{' },
+    readStatus: (p, fsMock, options) => { calls.push({ at: n2++ === 0 ? 'main' : 'recheck', p, options }); return null }
+  })
+  captureConsole('error', () => { h2.store.readMessages(h2.filePath) })
+  // ③ tooLarge 的有界尾部恢复：主读 + {tail:true} 尾部读
+  const h3 = makeBatchStore({
+    name: 'ms11_big.json',
+    files: { [cachePath('ms11_big.json')]: 'y'.repeat(100) },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 20 },
+    readStatus: (p, fsMock, options) => {
+      const label = options && options.tail === true ? 'tail' : (p.endsWith('.seen.json') ? 'tomb' : 'main')
+      calls.push({ at: label, p, options })
+      return options && options.tail === true
+        ? { status: 'ok', text: '[{"id":"a"},{"id":"b"}]', truncated: true }
+        : { status: 'tooLarge' }
+    }
+  })
+  captureConsole('error', () => { h3.store.readMessages(h3.filePath) })
+  // ④ 墓碑读取：_readTombstoneData
+  const h4 = makeBatchStore({ name: 'ms11_tomb.json', files: { [cachePath('ms11_tomb.json.seen.json')]: '{"v":1}' }, readStatus: at('tomb') })
+  assert.deepStrictEqual(h4.store._readTombstoneData(h4.filePath), { v: 1 })
+  // 夹具自证：4 个调用点必须真的走到（否则断言只剩「没走到的那个是绿的」）
+  const count = (label) => calls.filter(c => c.at === label).length
+  assert.strictEqual(count('main'), 3, `主缓存读入口必须被走到 3 次（三个夹具各一次），实际 ${count('main')}：${JSON.stringify(calls.map(c => c.at))}`)
+  assert.strictEqual(count('recheck'), 1, `隔离前复核入口必须被走到 1 次，实际 ${count('recheck')}：${JSON.stringify(calls.map(c => c.at))}`)
+  assert.strictEqual(count('tail'), 1, `尾部恢复入口必须被走到 1 次，实际 ${count('tail')}：${JSON.stringify(calls.map(c => c.at))}`)
+  assert.ok(count('tomb') >= 1, `墓碑入口必须被走到，实际 ${count('tomb')}：${JSON.stringify(calls.map(c => c.at))}`)
+  for (const c of calls) {
+    assert.strictEqual(c.options && c.options.openNonBlocking, true,
+      `readSafeTextResult 必须传 openNonBlocking:true（裸 O_RDONLY 在 FIFO 上永久阻塞）[${c.at}] ${c.p}: ${JSON.stringify(c.options)}`)
+  }
+  assert.strictEqual(calls.filter(c => c.options && c.options.tail === true).length, 1,
+    '尾部恢复调用必须同时保留 tail:true（不得为了加 flag 丢掉尾部语义）')
+})
+
+check('MS-12 FIFO: readMessages 与墓碑读取必须在秒级返回 unsafe（不得挂死整轮同步流程）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 行为探针：${FIFO_SKIP}——Linux 宿主必须真跑，不得静默当作已验证`)
+    return
+  }
+  const dirName = `xianbaoku_cache_fifo_${process.pid}`
+  const dir = path.join(ROOT_DIR, dirName)
+  const clean = () => { try { REAL_FS.rmSync(dir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } }
+  clean()
+  process.once('exit', clean)
+  try {
+    REAL_FS.mkdirSync(dir, { recursive: true })
+    const cacheFile = 'fifo_probe.json'
+    const pushFifo = path.join(dir, cacheFile)
+    const tombFifo = pushFifo + '.seen.json'
+    execFileSync(MKFIFO, [pushFifo])
+    execFileSync(MKFIFO, [tombFifo])
+    let out
+    try {
+      out = execFileSync(process.execPath, ['-e', FIFO_CHILD_PREAMBLE], {
+        encoding: 'utf8',
+        timeout: 6000,
+        cwd: __dirname,
+        env: Object.assign({}, process.env, { XBK_FIFO_PROBE: JSON.stringify({ dir: dirName, cacheFile }) })
+      })
+    } catch (e) {
+      assert.fail(`子进程未在 6s 内返回（FIFO 上裸 open 永久阻塞 ⇒ 整轮同步流程挂死、无日志无退出码）：killed=${e.killed} signal=${e.signal} code=${e.code} ${e.message}`)
+    }
+    const r = JSON.parse(out)
+    assert.ok(r.readMs < 2000, `主缓存 FIFO 读必须秒级返回（实耗 ${r.readMs}ms）`)
+    assert.deepStrictEqual(r.got, [], 'FIFO 缓存不得被当作数据源（返回空数组）')
+    assert.ok(r.errs.some(l => l.includes('拒绝读取非普通缓存文件')),
+      `FIFO 主缓存必须按 unsafe 记录显形诊断：${JSON.stringify(r.errs)}`)
+    assert.ok(r.tombMs < 2000, `墓碑 FIFO 读必须秒级返回（实耗 ${r.tombMs}ms）`)
+    assert.strictEqual(r.tombIsNull, true, '墓碑 FIFO 必须按空集处理（返回 null）')
+    assert.strictEqual(r.tombStatus, 'unsafe', `墓碑读状态必须是 unsafe，实际 ${r.tombStatus}`)
+    assert.ok(r.warns.some(l => l.includes('墓碑读取失败') && l.includes('unsafe')),
+      `墓碑 FIFO 必须有含状态的告警：${JSON.stringify(r.warns)}`)
+  } finally {
+    clean()
+  }
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 // ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
 // seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
