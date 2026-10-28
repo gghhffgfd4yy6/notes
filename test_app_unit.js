@@ -1924,6 +1924,27 @@ checkAsync('RE2 警告: 7 天前的标记被清理，当天的保留', async () 
   assert.strictEqual(mfs._files.has(dir + '/re2warn.state.2099-01-01'), true, '未来日期标记不得误删')
 })
 
+// ----- C1-002 回归：清理只删自身精确形状，同形的合法判重缓存/墓碑必须保留 -----
+check('RE2 警告: 清理只删标记自身形状（标记/.lock/.reclaim/.tmp），同形的 .json 判重缓存与其墓碑必须保留', () => {
+  const mfs = makeMemFs()
+  const oldStamp = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date(Date.now() - 9 * 86400000))
+  const base = dir + '/re2warn.state.' + oldStamp
+  mfs.writeFileSync(base, '{"status":"completed"}')
+  mfs.writeFileSync(base + '.lock', '999999:x')
+  mfs.writeFileSync(base + '.1234.1700000000000.reclaim', '')
+  mfs.writeFileSync(base + '.1234.1700000000000.abcdef123456.tmp', '')
+  // 自定义 pushUrl 末段恰为 re2warn.state.<date> 时，getFileName 得到的合法判重缓存及其墓碑
+  mfs.writeFileSync(base + '.json', '{"items":[]}')
+  mfs.writeFileSync(base + '.json.seen.json', '{"tombstones":[]}')
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
+  app._cleanupStaleRe2WarnMarkers()
+  for (const suffix of ['', '.lock', '.1234.1700000000000.reclaim', '.1234.1700000000000.abcdef123456.tmp']) {
+    assert.strictEqual(mfs._files.has(base + suffix), false, `过期残留「${suffix || '(标记)'}」必须清理`)
+  }
+  assert.strictEqual(mfs._files.has(base + '.json'), true, '同形合法判重缓存不得被启动清理删除（删了下轮全量重推）')
+  assert.strictEqual(mfs._files.has(base + '.json.seen.json'), true, '判重缓存的 .seen.json 墓碑不得被删除（删了裁剪墓碑失效）')
+})
+
 check('RE2 警告锁: 独占创建（wx），锁被占用且持锁进程存活时不抢占、超时放弃', () => {
   const mfs = makeMemFs()
   const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })

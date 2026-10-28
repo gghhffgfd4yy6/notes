@@ -460,8 +460,24 @@ function createApp ({
 
     // 清理超过保留期的 re2 标记文件（best-effort；仅删除严格早于 cutoff 的日期）：
     // - re2warn.state.YYYY-MM-DD（正常按天标记）
+    // - re2warn.state.YYYY-MM-DD.lock（_acquireRe2WarnLock 的 per-date 锁）
     // - re2warn.state.YYYY-MM-DD.<pid>.<time>.reclaim（F3：崩溃残留的认领临时文件，
     //   进程在 rename 后、删除前退出会遗留；同样按日期兜底清理，避免永久累积）
+    // - re2warn.state.YYYY-MM-DD.<pid>.<time>.<hex>.tmp（writeAtomic 崩溃残留的临时文件）
+    // C1-002：旧判据是「前缀 + 首段是日期」，凡同形名字一律 unlink——自定义 pushUrl 末段恰为
+    // re2warn.state.<date> 时，getFileName 得到的合法判重缓存 re2warn.state.<date>.json 与其
+    // .json.seen.json 墓碑都落在这个前缀下，会被启动清理静默删除（下轮全量重推、裁剪墓碑失效）。
+    // 改为**精确形状白名单**（与 xbk_message_store._isResidualTombstoneLockName 同口径）：只删
+    // 本模块自己写出的四种名字，任何含额外点段（`.json`/`.json.seen.json` 等）的名字一律跳过。
+    _isRe2WarnCleanupCandidateName (name) {
+      if (typeof name !== 'string' || !name.startsWith(RE2_WARN_STATE_FILE + '.')) return false
+      const rest = name.slice(RE2_WARN_STATE_FILE.length + 1)
+      if (/^\d{4}-\d{2}-\d{2}$/.test(rest)) return true
+      if (/^\d{4}-\d{2}-\d{2}\.lock$/.test(rest)) return true
+      if (/^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.reclaim$/.test(rest)) return true
+      return /^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.[0-9a-f]{12}\.tmp$/.test(rest)
+    },
+
     _cleanupStaleRe2WarnMarkers () {
       try {
         const cacheDir = MessageStore.cacheDir
@@ -474,10 +490,10 @@ function createApp ({
         // 故直接复用 shanghaiStamp，字符串比较口径不变。
         const cutoffStamp = shanghaiStamp(cutoff).slice(0, 10)
         for (const name of fs.readdirSync(cacheDir)) {
-          if (!name.startsWith(prefix)) continue
-          const markerStamp = name.slice(prefix.length).split('.')[0] // 取日期段，忽略 .pid.time.reclaim 后缀
+          if (!this._isRe2WarnCleanupCandidateName(name)) continue
+          const markerStamp = name.slice(prefix.length, prefix.length + 10) // 白名单已保证这 10 字符是日期段
           try {
-            if (/^\d{4}-\d{2}-\d{2}$/.test(markerStamp) && markerStamp < cutoffStamp) {
+            if (markerStamp < cutoffStamp) {
               fs.unlinkSync(path.join(cacheDir, name))
             }
           } catch (ignore) { /* best effort */ }
