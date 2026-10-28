@@ -2358,9 +2358,11 @@ function parseFilterFile (text) {
 
 // 超长 query 按 UTF-8 字节从尾截断（中文按字符截到字节边界）——/api/messages 与
 // /api/messages/export 共用同一钳制口径，防两端「截断后搜的词不一样」。
+// 必须按码点边界退让（C2-017）：`query.slice(0, -1)` 只退一个 UTF-16 码元——240 字节边界
+// 落在代理对中间时会留下孤立高代理项，下游 encodeURIComponent(query) 直接抛 URIError，
+// 整条导出变成 500。sliceUtf8Bytes 逐码点累加字节，超限就整对丢弃。
 function clampQueryBytes (query) {
-  while (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = query.slice(0, -1)
-  return query
+  return sliceUtf8Bytes(query, MESSAGES_QUERY_MAX_BYTES)
 }
 
 // ── v3.370 线报全站搜索：上游 HTML 解析与关注词归一（纯函数，非 HTTP 单测可达）──

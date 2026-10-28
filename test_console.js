@@ -4449,6 +4449,28 @@ async function main () {
     assert.strictEqual(j[0].id, '9', 'id 为字符串形态')
     server.close()
   })
+  await aok('T7 导出: 240 字节边界落在代理对中间 → 不得留孤立代理项（X-Export-Query-Used 必须可编码）', async () => {
+    // C2-017：clampQueryBytes 用 `query.slice(0,-1)` 按 UTF-16 码元退格。237 个 ASCII +
+    // 一个 4 字节 emoji = 241 字节 → 退一格留下孤立高代理项，随后
+    // encodeURIComponent(query) 抛 URIError，整条导出 500「读取请求体失败」（文案完全指错方向）。
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const q = `${'a'.repeat(237)}😀`
+    try {
+      assert.strictEqual(Buffer.byteLength(q, 'utf8'), 241, '前置：241 字节（跨 240 边界）')
+      const res = await request(port, 'POST', '/api/messages/export', {
+        token: TOKEN,
+        body: new URLSearchParams({ format: 'json', q }).toString()
+      })
+      assert.strictEqual(res.status, 200, `代理对中间截断不得让导出 500（实际 ${res.status}：${res.text.slice(0, 120)}）`)
+      assert.strictEqual(res.headers['x-export-query-used'], 'a'.repeat(237), '必须按码点边界退让（整对丢弃，不留孤立代理项）')
+      assert.ok(Array.isArray(JSON.parse(res.text)), '仍是成功导出的裸数组形态')
+    } finally { server.close() }
+  })
   await aok('T6 中文 q 跨 chunk 多字节（readBody StringDecoder 回归）+ GET 对照一致', async () => {
     const dir = tmpDir()
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
