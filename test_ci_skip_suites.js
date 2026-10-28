@@ -1229,6 +1229,48 @@ try {
   fs.rmSync(treeDir, { recursive: true, force: true })
 }
 
+// 3g5 TAP 适配层的投递契约（C10-007）：`say()` 曾以「任一 fd 写成功」为投递成功——被测文件
+//     closeSync(1) 后 TAP 点静默改投 stderr，于是 **stdout 为空、退出码仍为 0**，tap-parser 对空流判
+//     {ok:true, skipReason:'no tests found'} ⇒ 变异体静默 Survived（假绿，正是 AGENTS.md「TAP 档已知限制」
+//     ② 那条通道）。现在只有 fd 1 投递成功才算成功，失败则 stderr 留证 + 非零退出（tap-runner 会记
+//     RuntimeError ⇒ 响亮）。探针必须用 stdio:'pipe' 拉起子进程：Unix 下那是 socketpair（与 tap-runner
+//     同形），`/proc/self/fd/1` 打不开 ⇒ TAP_FD 恒为 1；若改用 shell 重定向到普通文件，dup 会真的成功、
+//     关掉 fd 1 后仍能写，探针就失效了（实测：普通文件下旧 shim 也 exit 0 且 stdout 有 TAP 点）。
+const shimProbeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-tap-shim-'))
+try {
+  fs.mkdirSync(path.join(shimProbeDir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'tap-shim.js'), path.join(shimProbeDir, 'scripts', 'tap-shim.js'))
+  fs.writeFileSync(path.join(shimProbeDir, 'test_suites.js'),
+    "module.exports = { SUITES: [{ name: 'TAP 探针', file: 'test_stub_tap_probe.js', desc: '只用于 shim 契约' }] }\n")
+  const shimProbeFile = path.join(shimProbeDir, 'test_stub_tap_probe.js')
+  const runShimProbe = (body) => {
+    fs.writeFileSync(shimProbeFile, body)
+    const env = { ...baseEnv }
+    delete env.SKIP_SUITES // 跳过集合会改写 TAP 点（# SKIP），本探针要的是正常路径
+    return spawnSync(process.execPath, ['-r', path.join(shimProbeDir, 'scripts', 'tap-shim.js'), shimProbeFile],
+      { cwd: shimProbeDir, encoding: 'utf8', env })
+  }
+  // 对照 1：被测文件正常退出 ⇒ TAP 点必须落在 stdout、退出码 0（证明探针夹具本身是有效的）
+  const shimOk = runShimProbe('process.exit(0)\n')
+  assert.strictEqual(shimOk.status, 0, `对照：正常退出应 exit 0：${shimOk.stderr}`)
+  assert.match(shimOk.stdout, /^ok 1 - test_stub_tap_probe\.js$/m, '对照：TAP 点必须投递到 stdout')
+  assert.match(shimOk.stdout, /^1\.\.1$/m, '对照：plan 行必须投递到 stdout')
+  // 对照 2：被测文件非 0 退出 ⇒ not ok 点（README 契约：非 0 退出必须伴随失败测试点）
+  const shimFail = runShimProbe('process.exit(3)\n')
+  assert.strictEqual(shimFail.status, 3, '对照：被测文件退出码应被原样带出')
+  assert.match(shimFail.stdout, /^not ok 1 - test_stub_tap_probe\.js # exit code 3$/m, '对照：非 0 退出必须投 not ok')
+  // 靶向反例：fd 1 被关掉（＝storage 段 closeSync(1) 变异体的形态）⇒ 投递必然失败
+  const shimClosed = runShimProbe("require('node:fs').closeSync(1)\nprocess.exit(0)\n")
+  assert.strictEqual(shimClosed.stdout, '',
+    '前提：fd 1 关掉后 stdout 一个字节都写不出去（本用例的靶向落差就建立在这上面）')
+  assert.notStrictEqual(shimClosed.status, 0,
+    'TAP 点投递失败时必须以非 0 退出：退出码 0 + 空 stdout 会被 tap-parser 判 ok:true ⇒ 变异体静默 Survived（C10-007）')
+  assert.match(shimClosed.stderr, /tap-shim: TAP 点无法投递到 stdout/,
+    `投递失败必须在 stderr 留证（可诊断），实际 stderr：${JSON.stringify(shimClosed.stderr)}`)
+} finally {
+  fs.rmSync(shimProbeDir, { recursive: true, force: true })
+}
+
 // 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
 //    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
 //    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
@@ -1256,6 +1298,201 @@ try {
     '本入口汇总行必须被 extractTestSummary 识别为本入口的数字（1 套件全通过），不得被内层套件的「全部通过！7/7」抢答')
 } finally {
   fs.rmSync(summaryDir, { recursive: true, force: true })
+}
+
+// 3g6 run_unit_tests.js 每套件超时的「整组杀伤」（C10-003）：姊妹入口 run_tests.js 已有同款回归（3g4），
+//     CI 门禁/变异 runner 用的 run_unit_tests.js 此前只 child.kill('SIGKILL') 直接子进程、无 detached。
+//     桩套件 fork 一个继承 fd1 的孙进程（与 test_app_p.js 的并行调度、test_console.js spawn console.js
+//     同形）后自身挂死，触发每套件超时。修复前只杀直接子进程 ⇒ 孙进程继续持有继承的 stdout 管道：
+//     ① CI 形态（GITHUB_STEP_SUMMARY 存在 ⇒ collect=true，stdout 是管道）下入口的 close 被拖到孙进程
+//        退出才来——实测 1500ms 上限下入口 12125ms 才返回（CI 只能等作业级超时，无红测定位）；
+//     ② 本地形态下入口虽已退出，孤儿仍在跑（占 CPU/端口/临时目录，污染后续套件）。
+//     故本用例强制 CI 形态，断言：入口在超时上限附近收敛（远早于孙进程的 8s 自退）、汇总三数字与
+//     修复前一致（0/1/1，fail-closed 不变）、入口退出后孙进程心跳不再增长。
+const unitTreeDir = makeUnitTestsSandbox(
+  [{ name: '挂死套件（带孙进程）', file: 'test_stub_tree.js', desc: 'fork 继承 fd1 的孙进程后自身挂死' }],
+  {
+    'test_stub_tree.js': [
+      "const { fork } = require('child_process')",
+      "const path = require('path')",
+      "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
+      'setInterval(() => {}, 1000)',
+      // 有界自杀（8s）：修复前入口的 close 要等这个孙进程退出才来 ⇒ 入口耗时约 8s（断言 <5s 即红）；
+      // 修复后整组 SIGKILL 立即收口，这个上限只用于「修复被回退时不把整个套件拖死」。
+      'setTimeout(() => process.exit(0), 8000)',
+      ''
+    ].join('\n'),
+    'stub_heartbeat.js': [
+      "const fs = require('fs')",
+      "const path = require('path')",
+      "const out = path.join(__dirname, 'heartbeat.txt')",
+      "fs.writeFileSync(out, String(process.pid) + '\\n')",
+      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      'setTimeout(() => process.exit(0), 8000)',
+      ''
+    ].join('\n')
+  }
+)
+let unitTreePid = 0
+try {
+  const unitTreeEnv = { ...baseEnv }
+  // collect=true 是**生产形态**（GitHub Actions 必设 GITHUB_STEP_SUMMARY ⇒ 每套件 stdout 走管道），
+  // 也正是修复前被孙进程拖住 close 的那条路径。
+  unitTreeEnv.GITHUB_STEP_SUMMARY = path.join(unitTreeDir, 'summary.md')
+  unitTreeEnv.XBK_UNIT_TIMEOUT = '1500'
+  const t0 = Date.now()
+  const unitTree = spawnSync(process.execPath, [path.join(unitTreeDir, 'run_unit_tests.js')],
+    { encoding: 'utf8', cwd: unitTreeDir, env: unitTreeEnv, timeout: 60000 })
+  const elapsed = Date.now() - t0
+  assert.strictEqual(unitTree.signal, null,
+    `入口必须自行结束（被测试侧 60s 兜底杀掉说明入口未收敛，实测 ${elapsed}ms）`)
+  assert.notStrictEqual(unitTree.status, 0, '超时的套件必须让入口以非 0 退出（fail-closed 语义不变）')
+  assert.deepStrictEqual(extractTestSummary(unitTree.stdout), ['0', '1', '1'],
+    '超时仍按失败结算：汇总三数字应与修复前一致（0 通过, 1 失败, 共 1）')
+  assert.match(unitTree.stdout, /超过每套件上限 1500ms 已强杀/, '失败输出必须仍点名每套件超时（UT-03 口径不变）')
+  assert.ok(elapsed < 5000,
+    `入口应在每套件上限附近收敛，而不是等孙进程退出：实测 ${elapsed}ms（旧实现要等孙进程 8s 自退 ⇒ 约 8000ms）`)
+  const unitHb = path.join(unitTreeDir, 'heartbeat.txt')
+  unitTreePid = Number(fs.readFileSync(unitHb, 'utf8').split('\n')[0])
+  assert.ok(Number.isInteger(unitTreePid) && unitTreePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  const unitSizeAfterExit = fs.statSync(unitHb).size
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  const unitSizeLater = fs.statSync(unitHb).size
+  assert.strictEqual(unitSizeLater, unitSizeAfterExit,
+    `入口退出后孙进程仍在写心跳（${unitSizeAfterExit} → ${unitSizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（C10-003）`)
+  console.log(`✅ 每套件超时的整组杀伤（run_unit_tests）：入口 ${elapsed}ms 收敛，退出后孙进程（pid ${unitTreePid}）心跳停在 ${unitSizeAfterExit} 字节`)
+} finally {
+  // 孙进程若仍存活（修复被回退时）必须由本用例清掉，否则会污染后续套件与整轮测试
+  if (unitTreePid > 0) {
+    try { process.kill(unitTreePid, 'SIGKILL') } catch (e) { /* 已随进程组退出（ESRCH）：正常路径 */ }
+  }
+  fs.rmSync(unitTreeDir, { recursive: true, force: true })
+}
+
+// 3g7 入口信号收尾（C10-003 跨组交互）：detached 让套件自成进程组，但入口自身没有任何 SIGINT/SIGTERM
+//     handler 时，Ctrl-C / CI 取消 / run_mutation.js 超时强杀只打到入口 ⇒ 套件与其后代被 reparent 成孤儿
+//     继续跑（占 CPU / 端口 / 临时目录，还继续写盘），run_mutation.js「killTree 能连后代一起清」的前提
+//     也因此被破坏。姊妹入口 run_tests.js 已由 C10-044 补齐同一口径（3g5），本用例把它固定在本入口上。
+//     手法与 3g4/3g6 同源：桩套件 fork 一个继承 fd1 的孙进程、两者都写盘后挂死；probe 拉起**真入口**、
+//     等套件起跑、给入口发 SIGINT/SIGTERM，断言 ① 入口自行收敛（不是被信号默认语义杀死）② 退出码 130/143
+//     ③ 套件与孙进程均已死亡 ④ 入口退出后心跳不再增长。
+//     取样点与 3g4/3g6 同口径：退出后取 sizeAfterExit，再等一个 700ms 观察窗取 sizeLater —— 比较
+//     「退出后 vs 退出后+窗口」才是「孤儿是否继续写」的不变式；拿信号**前**的采样去比，套件正常写盘的
+//     那一次心跳就会把绿判成红（间歇性假红）。
+// probe 用真函数再落盘，而不是拼一长串字符串：探针逻辑同样过 lint / 语法检查，且与断言共用同一份代码。
+function unitSignalProbe () {
+  const { spawn } = require('node:child_process')
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const dir = __dirname
+  const signal = process.argv[2] || 'SIGINT'
+  const pidFile = path.join(dir, 'suite.pid')
+  const grandPidFile = path.join(dir, 'grand.pid')
+  const hbFile = path.join(dir, 'heartbeat.txt')
+  // 僵尸（Z）算已死：入口被信号打断时不会 wait 子进程，被 SIGKILL 的套件在 /proc 里会短暂停在 Z 状态
+  // ——那不是「套件还在跑」。/proc 不可读（非 Linux）时退回 kill(pid,0) 的结论。
+  const isAlive = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    try { process.kill(pid, 0) } catch (e) { return false }
+    try {
+      const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8')
+      const close = stat.lastIndexOf(')')
+      return stat.slice(close + 2, close + 3) !== 'Z'
+    } catch (e) { return true }
+  }
+  const waitFor = (fn, ms) => new Promise(resolve => {
+    const t0 = Date.now()
+    const tick = () => {
+      let ok = false
+      try { ok = fn() } catch (e) { ok = false }
+      if (ok) return resolve(true)
+      if (Date.now() - t0 > ms) return resolve(false)
+      setTimeout(tick, 50)
+    }
+    tick()
+  })
+  ;(async () => {
+    const entry = spawn(process.execPath, [path.join(dir, 'run_unit_tests.js')], { cwd: dir, stdio: 'ignore' })
+    let exitInfo = null
+    const exitP = new Promise(resolve => {
+      const t = setTimeout(() => resolve({ timeout: true }), 20000)
+      entry.on('exit', (code, sig) => { clearTimeout(t); exitInfo = { code, signal: sig }; resolve(exitInfo) })
+    })
+    const started = await waitFor(() => fs.existsSync(pidFile) && fs.existsSync(grandPidFile) && fs.existsSync(hbFile), 20000)
+    const suitePid = started ? Number(fs.readFileSync(pidFile, 'utf8').trim()) : 0
+    const grandPid = started ? Number(fs.readFileSync(grandPidFile, 'utf8').trim()) : 0
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const sent = entry.kill(signal)
+    const exit = sent ? await exitP : (exitInfo || { neverSent: true })
+    const sizeAfterExit = fs.existsSync(hbFile) ? fs.statSync(hbFile).size : 0
+    await new Promise(resolve => setTimeout(resolve, 700))
+    const sizeLater = fs.existsSync(hbFile) ? fs.statSync(hbFile).size : 0
+    const suiteAlive = isAlive(suitePid)
+    const grandAlive = isAlive(grandPid)
+    // 清理（红态下必须彻底）：套件是进程组组长 ⇒ 先整组 SIGKILL，再对两个 pid 各补一刀。
+    // pid 为 0 时不得调 kill(-pid)：那等于 kill(0) = 打自己的进程组。
+    if (suitePid > 0) { try { process.kill(-suitePid, 'SIGKILL') } catch (e) { /* ESRCH：已死 */ } }
+    for (const pid of [grandPid, suitePid]) {
+      if (pid > 0) { try { process.kill(pid, 'SIGKILL') } catch (e) { /* ESRCH：已死 */ } }
+    }
+    console.log(JSON.stringify({ started, suitePid, grandPid, sizeAfterExit, sizeLater, suiteAlive, grandAlive, exit }))
+    process.exit(0)
+  })()
+}
+for (const [signal, expectedCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  const sigDir = makeUnitTestsSandbox(
+    [{ name: '信号收尾套件', file: 'test_stub_signal.js', desc: 'fork 孙进程、写心跳后挂死' }],
+    {
+      'test_stub_signal.js': [
+        "const fs = require('fs')",
+        "const path = require('path')",
+        "const { fork } = require('child_process')",
+        "fs.writeFileSync(path.join(__dirname, 'suite.pid'), String(process.pid) + '\\n')",
+        "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
+        'setInterval(() => {}, 1000)',
+        // 有界自杀（120s）：正常路径由入口的信号 handler 整组收口；被外部 kill -9 掉入口时本桩也不会
+        // 永久留下。刻意不用 3g4 那两处 90s 常量——test_host_clean_gates.js 按该字面量计数。
+        'setTimeout(() => process.exit(0), 120000).unref()',
+        ''
+      ].join('\n'),
+      'stub_heartbeat.js': [
+        "const fs = require('fs')",
+        "const path = require('path')",
+        "const out = path.join(__dirname, 'heartbeat.txt')",
+        "fs.writeFileSync(path.join(__dirname, 'grand.pid'), String(process.pid) + '\\n')",
+        "fs.writeFileSync(out, 'X')",
+        "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+        'setTimeout(() => process.exit(0), 130000).unref()',
+        ''
+      ].join('\n'),
+      'unit_signal_probe.js': '(' + unitSignalProbe.toString() + ')()\n'
+    }
+  )
+  try {
+    const sigEnv = { ...baseEnv }
+    // 本用例只锁信号收尾；CI(pipe) 形态的整组杀伤由 3g6 覆盖 ⇒ 固定成本地形态，跨环境行为一致。
+    delete sigEnv.GITHUB_STEP_SUMMARY
+    const probe = spawnSync(process.execPath, [path.join(sigDir, 'unit_signal_probe.js'), signal],
+      { encoding: 'utf8', cwd: sigDir, env: sigEnv, timeout: 60000 })
+    assert.strictEqual(probe.status, 0, `${signal} probe 自身应正常结束：${probe.stdout}${probe.stderr}`)
+    const out = JSON.parse(probe.stdout.trim().split('\n').pop())
+    assert.strictEqual(out.started, true, `${signal}：夹具套件必须真的起跑（否则本用例没有验证对象）`)
+    assert.ok(!out.exit.timeout, `${signal}：入口必须自行收敛（20s 内未退出）`)
+    assert.strictEqual(out.exit.signal, null,
+      `${signal}：入口被信号默认语义杀死（signal=${out.exit.signal}）⇒ 没有任何信号 handler，detached 套件成孤儿`)
+    assert.strictEqual(out.exit.code, expectedCode,
+      `${signal}：收尾退出码必须是 ${expectedCode}（被打断不等于通过；实测 ${out.exit.code}）`)
+    assert.strictEqual(out.suiteAlive, false,
+      `${signal}：套件进程（pid ${out.suitePid}）必须已死亡——detached 套件在自己进程组里，信号不转发就成孤儿`)
+    assert.strictEqual(out.grandAlive, false,
+      `${signal}：套件派生的孙进程（pid ${out.grandPid}）也必须已死亡——整组 SIGKILL 才能连后代一起收口`)
+    assert.strictEqual(out.sizeLater, out.sizeAfterExit,
+      `${signal}：入口退出后心跳仍在增长（${out.sizeAfterExit} → ${out.sizeLater} 字节）——` +
+      '孤儿套件还在跑、还在写盘（C10-003 跨组交互）')
+    console.log(`✅ ${signal} 收尾（run_unit_tests）：入口以 ${out.exit.code} 退出，套件（pid ${out.suitePid}）与孙进程（pid ${out.grandPid}）随进程组一起被清掉`)
+  } finally {
+    fs.rmSync(sigDir, { recursive: true, force: true })
+  }
 }
 
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
