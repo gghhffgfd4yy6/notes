@@ -1229,6 +1229,48 @@ try {
   fs.rmSync(treeDir, { recursive: true, force: true })
 }
 
+// 3g5 TAP 适配层的投递契约（C10-007）：`say()` 曾以「任一 fd 写成功」为投递成功——被测文件
+//     closeSync(1) 后 TAP 点静默改投 stderr，于是 **stdout 为空、退出码仍为 0**，tap-parser 对空流判
+//     {ok:true, skipReason:'no tests found'} ⇒ 变异体静默 Survived（假绿，正是 AGENTS.md「TAP 档已知限制」
+//     ② 那条通道）。现在只有 fd 1 投递成功才算成功，失败则 stderr 留证 + 非零退出（tap-runner 会记
+//     RuntimeError ⇒ 响亮）。探针必须用 stdio:'pipe' 拉起子进程：Unix 下那是 socketpair（与 tap-runner
+//     同形），`/proc/self/fd/1` 打不开 ⇒ TAP_FD 恒为 1；若改用 shell 重定向到普通文件，dup 会真的成功、
+//     关掉 fd 1 后仍能写，探针就失效了（实测：普通文件下旧 shim 也 exit 0 且 stdout 有 TAP 点）。
+const shimProbeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-tap-shim-'))
+try {
+  fs.mkdirSync(path.join(shimProbeDir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'tap-shim.js'), path.join(shimProbeDir, 'scripts', 'tap-shim.js'))
+  fs.writeFileSync(path.join(shimProbeDir, 'test_suites.js'),
+    "module.exports = { SUITES: [{ name: 'TAP 探针', file: 'test_stub_tap_probe.js', desc: '只用于 shim 契约' }] }\n")
+  const shimProbeFile = path.join(shimProbeDir, 'test_stub_tap_probe.js')
+  const runShimProbe = (body) => {
+    fs.writeFileSync(shimProbeFile, body)
+    const env = { ...baseEnv }
+    delete env.SKIP_SUITES // 跳过集合会改写 TAP 点（# SKIP），本探针要的是正常路径
+    return spawnSync(process.execPath, ['-r', path.join(shimProbeDir, 'scripts', 'tap-shim.js'), shimProbeFile],
+      { cwd: shimProbeDir, encoding: 'utf8', env })
+  }
+  // 对照 1：被测文件正常退出 ⇒ TAP 点必须落在 stdout、退出码 0（证明探针夹具本身是有效的）
+  const shimOk = runShimProbe('process.exit(0)\n')
+  assert.strictEqual(shimOk.status, 0, `对照：正常退出应 exit 0：${shimOk.stderr}`)
+  assert.match(shimOk.stdout, /^ok 1 - test_stub_tap_probe\.js$/m, '对照：TAP 点必须投递到 stdout')
+  assert.match(shimOk.stdout, /^1\.\.1$/m, '对照：plan 行必须投递到 stdout')
+  // 对照 2：被测文件非 0 退出 ⇒ not ok 点（README 契约：非 0 退出必须伴随失败测试点）
+  const shimFail = runShimProbe('process.exit(3)\n')
+  assert.strictEqual(shimFail.status, 3, '对照：被测文件退出码应被原样带出')
+  assert.match(shimFail.stdout, /^not ok 1 - test_stub_tap_probe\.js # exit code 3$/m, '对照：非 0 退出必须投 not ok')
+  // 靶向反例：fd 1 被关掉（＝storage 段 closeSync(1) 变异体的形态）⇒ 投递必然失败
+  const shimClosed = runShimProbe("require('node:fs').closeSync(1)\nprocess.exit(0)\n")
+  assert.strictEqual(shimClosed.stdout, '',
+    '前提：fd 1 关掉后 stdout 一个字节都写不出去（本用例的靶向落差就建立在这上面）')
+  assert.notStrictEqual(shimClosed.status, 0,
+    'TAP 点投递失败时必须以非 0 退出：退出码 0 + 空 stdout 会被 tap-parser 判 ok:true ⇒ 变异体静默 Survived（C10-007）')
+  assert.match(shimClosed.stderr, /tap-shim: TAP 点无法投递到 stdout/,
+    `投递失败必须在 stderr 留证（可诊断），实际 stderr：${JSON.stringify(shimClosed.stderr)}`)
+} finally {
+  fs.rmSync(shimProbeDir, { recursive: true, force: true })
+}
+
 // 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
 //    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
 //    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
