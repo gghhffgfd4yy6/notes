@@ -62,7 +62,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 
 const {
   createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
-  acquireLock, releaseLockFor, lockPath,
+  acquireLock, acquireLockResult, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
@@ -441,6 +441,20 @@ ok('acquireLock: 锁内容带归属 token；releaseLockFor 按 pid+token 双匹�
   assert.strictEqual(after.released, true, 'pid+token 双匹配覆写为 released')
   assert.strictEqual(acquireLock(dir, 1001, 'tok-def'), true, 'released 锁立即可接管')
 })
+ok('acquireLock: 非 EEXIST 的写失败不折叠成 busy（ENOTDIR 必须归类为真实错误）', () => {
+  // C2-006：旧实现把所有写失败都 return false，调用方一律当「锁被占」——手动触发被误报
+  // 成 409「已有任务在运行」，自动运行静默重排且不计 fails。这里用「stateDir 是普通文件」
+  // 造真实 ENOTDIR（openSync 必然失败，不是打桩），断言错误被如实分类而不是折叠成 busy。
+  const dir = tmpDir()
+  const stateAsFile = path.join(dir, 'state-as-file')
+  fs.writeFileSync(stateAsFile, 'not a dir')
+  assert.strictEqual(acquireLock(stateAsFile, 1000, 'tok-x'), false, '获取失败仍返回 false（布尔契约不变）')
+  const verdict = acquireLockResult(stateAsFile, 1000, 'tok-x')
+  assert.strictEqual(verdict.ok, false)
+  assert.strictEqual(verdict.busy, false, 'ENOTDIR 不是「锁被占」，不得让调用方回 409')
+  assert.strictEqual(verdict.error && verdict.error.code, 'ENOTDIR', '必须保留原始 errno 供调用方报真错')
+})
+
 ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的旧帧使「补空格防半旧半新」成死代码）', () => {
   const dir = tmpDir()
   assert.strictEqual(acquireLock(dir, 1000, 'tok-abc'), true)
@@ -4739,6 +4753,24 @@ async function main () {
     assert.strictEqual(retry.status, 202, '失败动作在窗口内必须可立即重试（pending 条目已回滚），不得 409')
     server.close()
   })
+  await aok('HTTP: /trigger 锁写失败（ENOTDIR）→ 500 lock_failed，不得伪装成 409「已有任务在运行」', async () => {
+    // C2-006：stateDir 被换成普通文件后锁路径 open 必然 ENOTDIR（非 EEXIST）。旧实现把它
+    // 折叠成 busy ⇒ 手动触发收到 409「已有触发任务在运行」，运维完全看不出去错了地方。
+    const dir = mkTmp('xbk-console-lockfail-')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      fs.writeFileSync(dir, 'state dir replaced by a file')
+      const res = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+      assert.strictEqual(res.status, 500, `锁写失败必须是 500（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'lock_failed')
+      assert.strictEqual(fs.existsSync(lockPath(dir)), false, '没拿到锁就不该留下锁文件')
+    } finally {
+      try { fs.unlinkSync(dir) } catch (e) { /* 已清理 */ }
+      server.close()
+    }
+  })
   await aok('main: XBK_CONSOLE_PORT 非法值拒绝启动（回归 Sourcery #225 M5：NaN 不得回退 7777）', async () => {
     const c = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
       env: { ...process.env, XBK_CONSOLE_TOKEN: TOKEN, XBK_CONSOLE_PORT: 'abc' },
@@ -7460,7 +7492,7 @@ async function main () {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
       assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
-        consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLock(stateDir'),
+        consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLockResult(stateDir'),
       '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
       assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
         '上一轮未结束不得叠跑')

@@ -375,14 +375,23 @@ function writeLockAtomic (p, now, token) {
   }
 }
 
-function acquireLock (stateDir, now, token) {
+// 锁获取结论（C2-006）：只有「锁已存在且未陈旧」才是 busy（调用方回 409 / 自动运行下一轮再试）。
+// 其余写失败（EACCES/ENOSPC/EROFS/ENOTDIR…）是真实文件系统错误——旧实现一律 return false，
+// 手动触发被误报成 409「已有任务在运行」、自动运行静默重排且不计 fails，故障完全不可见。
+// busy 用共享常量：调用方只读，不需要每次分配。
+const LOCK_BUSY = Object.freeze({ ok: false, busy: true })
+function lockFailure (e) {
+  return { ok: false, busy: false, error: e || new Error('锁写入失败') }
+}
+
+function acquireLockResult (stateDir, now, token) {
   const p = lockPath(stateDir)
   try {
     // 第一层：直接独占创建（无锁时最常见路径）。
     writeLockAtomic(p, now, token)
-    return true
+    return { ok: true }
   } catch (e) {
-    if (e.code !== 'EEXIST') return false
+    if (!e || e.code !== 'EEXIST') return lockFailure(e)
   }
   // 第二层：锁已存在——读内容判定死活。陈旧接管仍以「独占 rename 覆盖」收口：
   // rename 覆盖是原子替换，两个并发接管进程各自 prepared tmp 后同时 rename，
@@ -408,21 +417,24 @@ function acquireLock (stateDir, now, token) {
     if (corrupted && !released) {
       let mtimeAge = null
       try { mtimeAge = now - fs.statSync(p).mtimeMs } catch (e) { mtimeAge = null }
-      if (!(typeof mtimeAge === 'number' && mtimeAge > PROC_TIMEOUT_MS)) return false
+      if (!(typeof mtimeAge === 'number' && mtimeAge > PROC_TIMEOUT_MS)) return LOCK_BUSY
       corruptedStale = true
     }
     const stale = released || (corrupted ? corruptedStale : (now - startedAt > PROC_TIMEOUT_MS))
-    if (!stale) return false
+    if (!stale) return LOCK_BUSY
     // 陈旧/损坏锁接管：哨兵独占，防并发接管双跑（Sourcery High）。
     const sentinel = p + '.takeover'
     let claimed = false
+    // 哨兵建不起来且不是「已存在」= 真实写失败（EACCES/EROFS/ENOSPC…），必须如实上报而不是
+    // 伪装成「有人正在接管」（C2-006 同一类折叠）。
+    let sentinelError = null
     for (let attempt = 0; attempt < 2 && !claimed; attempt++) {
       try {
         const fd = fs.openSync(sentinel, 'wx')
         fs.closeSync(fd)
         claimed = true
       } catch (err) {
-        if (!err || err.code !== 'EEXIST') break
+        if (!err || err.code !== 'EEXIST') { sentinelError = err; break }
         // 哨兵已存在：可能是上一次接管者崩溃后留下的残留（它会让后续触发连续 10 分钟 409，
         // D2-S5）。陈旧 ⇒ 先 unlink 再重抢；重抢必须走 open(wx) —— 旧实现的
         // stat→writeFileSync 是 check-then-write，两个实例可同时 claimed。
@@ -435,7 +447,7 @@ function acquireLock (stateDir, now, token) {
         try { fs.unlinkSync(sentinel) } catch (e2) { /* 已被并发接管者清掉 */ }
       }
     }
-    if (!claimed) return false
+    if (!claimed) return sentinelError ? lockFailure(sentinelError) : LOCK_BUSY
     // takeover 路径不能再用 open(wx) 写锁（目标存在必 EEXIST）：走「临时文件 + rename
     // 原子换代」。rename 原子替换且**换 inode**——仍握着旧 inode fd 的旧持有者，其
     // releaseLockFor 的原地覆写只会落进孤儿 inode，绝不可能盖掉新持有者的锁帧
@@ -448,13 +460,21 @@ function acquireLock (stateDir, now, token) {
     } catch (err) {
       try { fs.unlinkSync(tmp) } catch (e2) { /* tmp 未建成 */ }
       try { fs.unlinkSync(sentinel) } catch (e2) { /* 并发接管者会各自清自己的 */ }
-      return false
+      return lockFailure(err)
     }
     try { fs.unlinkSync(sentinel) } catch (err) { /* 并发接管者会各自清自己的 */ }
-    return true
+    return { ok: true }
   } catch (err) {
-    return false
+    // 走到这里的是「读不到锁内容」（EACCES/EISDIR/ioError 等）：无法判定持有方死活，
+    // 按既有的 fail-closed 语义算 busy（409），不冒充文件系统错误——获取侧的写失败才是
+    // 上面已经分类上报的那几处。
+    return LOCK_BUSY
   }
+}
+
+// 布尔包装：只回答「拿到了没有」。需要区分 busy / 真实错误时用 acquireLockResult（C2-006）。
+function acquireLock (stateDir, now, token) {
+  return acquireLockResult(stateDir, now, token).ok === true
 }
 
 // releaseLock（按路径 unlinkSync 删锁）已删除（v3.296）：本仓 CodeQL 铁律——锁类代码
@@ -3338,7 +3358,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     const now = Date.now()
     const runToken = crypto.randomBytes(12).toString('hex')
-    if (!acquireLock(stateDir, now, runToken)) {
+    const lockVerdict = acquireLockResult(stateDir, now, runToken)
+    if (!lockVerdict.ok) {
+      if (!lockVerdict.busy) {
+        // 真实文件系统错误（EACCES/ENOSPC/EROFS/ENOTDIR…）：旧实现与「青龙持锁」混为一谈，
+        // 静默重排到下一轮、既不计 fails 也不留痕——自动运行看起来在跑，实际从未启动（C2-006）。
+        auto.fails += 1
+        auto.lastError = `锁获取失败：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`
+        console.error(`⚠️ 自动运行锁获取失败（stateDir=${stateDir}）：${auto.lastError}`)
+        if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次锁获取失败，已停止`)
+        else scheduleAuto(auto.interval * 1000)
+        return
+      }
       // 青龙/另一控制台实例持锁：不抢跑，也不计失败。
       scheduleAuto(auto.interval * 1000)
       return
@@ -3641,7 +3672,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 必须从 windowMs 派生（而不是再读一次设置）：否则窗长算错时 409 仍会回带一个
         // 「看起来对」的秒数，把矛盾藏起来（retryAfterS 与 replayWindowS 会自相矛盾）。
         const replayWindowS = Math.round(windowMs / 1000)
-        if (!acquireLock(stateDir, now, runToken)) {
+        const lockVerdict = acquireLockResult(stateDir, now, runToken)
+        if (!lockVerdict.ok && !lockVerdict.busy) {
+          // 锁写失败不是「已有任务在运行」：如实报 500，别让运维去等一个永远不存在的任务（C2-006）。
+          console.error(`⚠️ 触发锁获取失败（stateDir=${stateDir}）：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`)
+          sendJson(res, 500, {
+            error: '锁文件写入失败，动作未执行（检查 stateDir 权限与磁盘空间）',
+            code: 'lock_failed'
+          })
+          return
+        }
+        if (!lockVerdict.ok) {
           // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
           const prevPrePair = persistedPre.find(([k]) => k === action)
@@ -4202,7 +4243,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
       }
       const lockToken = crypto.randomBytes(12).toString('hex')
-      if (!acquireLock(stateDir, Date.now(), lockToken)) {
+      const lockVerdict = acquireLockResult(stateDir, Date.now(), lockToken)
+      if (!lockVerdict.ok) {
+        if (!lockVerdict.busy) {
+          // 锁写失败不是「有任务在跑」：导入路径同样必须报真错（C2-006）。
+          console.error(`⚠️ 导入锁获取失败（stateDir=${stateDir}）：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`)
+          sendJson(res, 500, { error: '锁文件写入失败，导入未执行（检查 stateDir 权限与磁盘空间）', code: 'lock_failed' })
+          return
+        }
         res.setHeader('Retry-After', '1')
         sendJson(res, 409, { error: 'busy', code: 'busy', message: '有任务正在运行，等结束再导入' })
         return
@@ -6754,6 +6802,7 @@ module.exports = {
   TOTP_PERIOD_S,
   TOTP_DIGITS,
   acquireLock,
+  acquireLockResult,
   releaseLockFor,
   lockPath,
   parseAction,
