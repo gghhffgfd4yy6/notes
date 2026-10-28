@@ -122,6 +122,57 @@ const CONCURRENCY = (() => {
   return positiveIntEnv('XBK_UNIT_CONCURRENCY', 8)
 })()
 
+// ---------- 信号收尾（C10-003 跨组交互；口径与姊妹入口 run_tests.js 的 C10-044 一致） ----------
+// detached:true 让每个套件自成进程组（pid 即 pgid），超时/输出超限时才能 kill(-pid) 整组收口；
+// 代价是入口**自己**被 Ctrl-C / CI 取消 / run_mutation.js 强杀时，信号只打到入口：套件与它的后代
+// 被 reparent 成孤儿继续跑（占 CPU / 端口 / 临时目录，还继续写盘）——实测入口退出后心跳仍在增长。
+// 姊妹入口 run_tests.js 已按整组杀伤 + 130/143 收尾补齐；本入口此前没有任何 handler，两个入口
+// 语义不一致（合并后「Ctrl-C 在 run_tests 下清得干净、在 run_unit_tests 下留孤儿」）。
+// 收敛口径：整组 SIGKILL 当前在跑的套件（并发池下可能同时有多个）→ 以 130（SIGINT）/143（SIGTERM）
+// 非零退出。为什么必须显式 exit：① 「被打断」不等于「通过」，退出码要让 CI / 调度方看得见中断；
+// ② 只置 exitCode 的话事件循环会继续排下一个套件、最终以 1 收尾，Ctrl-C 变成「越杀越慢」；
+// ③ 装了 JS listener 就接管了默认语义，若 handler 什么都不做，Ctrl-C 会「毫无反应」（比孤儿更糟）。
+const activeSuitePids = new Set()
+let shuttingDown = false
+
+// 整组杀伤一个套件进程组。组不存在（子进程未及 setsid 或已被回收 → ESRCH）或无权限（EPERM）时
+// 静默返回 false：不抛错、不改结算口径（超时仍按失败处理、汇总三数字不变，fail-closed 语义）。
+function killSuiteGroup (pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(-pid, 'SIGKILL')
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+// 先清记录再杀：避免 process.exit 触发的 exit handler 对可能已被复用的 pgid 再补一刀。
+function abortActiveSuites () {
+  const pids = [...activeSuitePids]
+  activeSuitePids.clear()
+  let killed = 0
+  for (const pid of pids) if (killSuiteGroup(pid)) killed++
+  return { total: pids.length, killed }
+}
+
+function handleTerminationSignal (signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  const { total, killed } = abortActiveSuites()
+  // 同步写 stderr：下一行就要 process.exit，pipe 上的异步写可能被截断；诊断信息丢不起
+  // （fd 2 不可写时静默跳过——退出码仍然非零）。
+  try {
+    require('fs').writeSync(2, `\n⚠️  收到 ${signal}：${total ? `已整组 SIGKILL ${killed}/${total} 个在跑的套件进程组` : '当前没有在跑的套件'}，入口以非零退出（不把中断当通过）\n`)
+  } catch (e) { /* fd 2 不可写：只能保证退出码 */ }
+  process.exit(signal === 'SIGINT' ? 130 : 143)
+}
+process.on('SIGINT', () => handleTerminationSignal('SIGINT'))
+process.on('SIGTERM', () => handleTerminationSignal('SIGTERM'))
+// 兜底：任何路径的 process.exit（未捕获异常、下游显式 exit）也必须先收掉在跑的套件进程组，
+// 否则同样的孤儿会留下。exit handler 里只能做同步操作——进程组杀伤恰好是同步的。
+process.on('exit', () => abortActiveSuites())
+
 // 失败回显裁剪（UT-06）：失败时回显的是子进程 stdout，其唯一约束来自 maxBuffer，而 ENOBUFS 恰恰是
 // 「已超出该上限」——故超限路径的回显量并不受 MAX_BUFFER 约束（约 MAX_BUFFER + 单块）。此处按同一上限
 // 裁剪并显式标注省略量（不静默丢弃）；输出未超限的正常失败逐字保留，行为不变。
@@ -177,6 +228,9 @@ function runSuite (s) {
       settle({ ok: false, ms: Date.now() - t0, error: e })
       return
     }
+    // 记录在跑的套件进程组（pid 即 pgid，见上面的 detached 注释）：SIGINT/SIGTERM handler 与
+    // process.on('exit') 据此整组杀伤，避免入口被打断后留下孤儿套件（C10-003 跨组交互）。
+    if (Number.isInteger(child.pid) && child.pid > 0) activeSuitePids.add(child.pid)
     // 超时（UNIT_TIMEOUT）与输出超限（ENOBUFS）后的**整组**杀伤：先 kill(-pid) 连同套件 fork 的后代，
     // 再退回只杀直接子进程。容错口径同 run_tests.js 的 killSuiteTree：组不存在（ESRCH：子进程未及 setsid
     // 或已被回收）或无权限（EPERM）时静默退回修复前行为；都不抛错、都不改结算口径——close 里仍按
@@ -222,6 +276,8 @@ function runSuite (s) {
       })
     })
     function settle ({ ok, ms, error, code, overflowed: ovf, timedOut: tout, out: childOut, err: childErr }) {
+      // 套件已收敛：从「在跑集合」里摘掉（信号 handler 只该打到还活着的进程组）
+      if (child && Number.isInteger(child.pid)) activeSuitePids.delete(child.pid)
       try {
         if (IN_CI) {
           // 🔒 组生命周期只在单次输出内完成（start + 内容 + end 连续打出）：

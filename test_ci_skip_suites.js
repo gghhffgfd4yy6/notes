@@ -1369,6 +1369,132 @@ try {
   fs.rmSync(unitTreeDir, { recursive: true, force: true })
 }
 
+// 3g7 入口信号收尾（C10-003 跨组交互）：detached 让套件自成进程组，但入口自身没有任何 SIGINT/SIGTERM
+//     handler 时，Ctrl-C / CI 取消 / run_mutation.js 超时强杀只打到入口 ⇒ 套件与其后代被 reparent 成孤儿
+//     继续跑（占 CPU / 端口 / 临时目录，还继续写盘），run_mutation.js「killTree 能连后代一起清」的前提
+//     也因此被破坏。姊妹入口 run_tests.js 已由 C10-044 补齐同一口径（3g5），本用例把它固定在本入口上。
+//     手法与 3g4/3g6 同源：桩套件 fork 一个继承 fd1 的孙进程、两者都写盘后挂死；probe 拉起**真入口**、
+//     等套件起跑、给入口发 SIGINT/SIGTERM，断言 ① 入口自行收敛（不是被信号默认语义杀死）② 退出码 130/143
+//     ③ 套件与孙进程均已死亡 ④ 入口退出后心跳不再增长。
+//     取样点与 3g4/3g6 同口径：退出后取 sizeAfterExit，再等一个 700ms 观察窗取 sizeLater —— 比较
+//     「退出后 vs 退出后+窗口」才是「孤儿是否继续写」的不变式；拿信号**前**的采样去比，套件正常写盘的
+//     那一次心跳就会把绿判成红（间歇性假红）。
+// probe 用真函数再落盘，而不是拼一长串字符串：探针逻辑同样过 lint / 语法检查，且与断言共用同一份代码。
+function unitSignalProbe () {
+  const { spawn } = require('node:child_process')
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const dir = __dirname
+  const signal = process.argv[2] || 'SIGINT'
+  const pidFile = path.join(dir, 'suite.pid')
+  const grandPidFile = path.join(dir, 'grand.pid')
+  const hbFile = path.join(dir, 'heartbeat.txt')
+  // 僵尸（Z）算已死：入口被信号打断时不会 wait 子进程，被 SIGKILL 的套件在 /proc 里会短暂停在 Z 状态
+  // ——那不是「套件还在跑」。/proc 不可读（非 Linux）时退回 kill(pid,0) 的结论。
+  const isAlive = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    try { process.kill(pid, 0) } catch (e) { return false }
+    try {
+      const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8')
+      const close = stat.lastIndexOf(')')
+      return stat.slice(close + 2, close + 3) !== 'Z'
+    } catch (e) { return true }
+  }
+  const waitFor = (fn, ms) => new Promise(resolve => {
+    const t0 = Date.now()
+    const tick = () => {
+      let ok = false
+      try { ok = fn() } catch (e) { ok = false }
+      if (ok) return resolve(true)
+      if (Date.now() - t0 > ms) return resolve(false)
+      setTimeout(tick, 50)
+    }
+    tick()
+  })
+  ;(async () => {
+    const entry = spawn(process.execPath, [path.join(dir, 'run_unit_tests.js')], { cwd: dir, stdio: 'ignore' })
+    let exitInfo = null
+    const exitP = new Promise(resolve => {
+      const t = setTimeout(() => resolve({ timeout: true }), 20000)
+      entry.on('exit', (code, sig) => { clearTimeout(t); exitInfo = { code, signal: sig }; resolve(exitInfo) })
+    })
+    const started = await waitFor(() => fs.existsSync(pidFile) && fs.existsSync(grandPidFile) && fs.existsSync(hbFile), 20000)
+    const suitePid = started ? Number(fs.readFileSync(pidFile, 'utf8').trim()) : 0
+    const grandPid = started ? Number(fs.readFileSync(grandPidFile, 'utf8').trim()) : 0
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const sent = entry.kill(signal)
+    const exit = sent ? await exitP : (exitInfo || { neverSent: true })
+    const sizeAfterExit = fs.existsSync(hbFile) ? fs.statSync(hbFile).size : 0
+    await new Promise(resolve => setTimeout(resolve, 700))
+    const sizeLater = fs.existsSync(hbFile) ? fs.statSync(hbFile).size : 0
+    const suiteAlive = isAlive(suitePid)
+    const grandAlive = isAlive(grandPid)
+    // 清理（红态下必须彻底）：套件是进程组组长 ⇒ 先整组 SIGKILL，再对两个 pid 各补一刀。
+    // pid 为 0 时不得调 kill(-pid)：那等于 kill(0) = 打自己的进程组。
+    if (suitePid > 0) { try { process.kill(-suitePid, 'SIGKILL') } catch (e) { /* ESRCH：已死 */ } }
+    for (const pid of [grandPid, suitePid]) {
+      if (pid > 0) { try { process.kill(pid, 'SIGKILL') } catch (e) { /* ESRCH：已死 */ } }
+    }
+    console.log(JSON.stringify({ started, suitePid, grandPid, sizeAfterExit, sizeLater, suiteAlive, grandAlive, exit }))
+    process.exit(0)
+  })()
+}
+for (const [signal, expectedCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  const sigDir = makeUnitTestsSandbox(
+    [{ name: '信号收尾套件', file: 'test_stub_signal.js', desc: 'fork 孙进程、写心跳后挂死' }],
+    {
+      'test_stub_signal.js': [
+        "const fs = require('fs')",
+        "const path = require('path')",
+        "const { fork } = require('child_process')",
+        "fs.writeFileSync(path.join(__dirname, 'suite.pid'), String(process.pid) + '\\n')",
+        "fork(path.join(__dirname, 'stub_heartbeat.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] })",
+        'setInterval(() => {}, 1000)',
+        // 有界自杀（120s）：正常路径由入口的信号 handler 整组收口；被外部 kill -9 掉入口时本桩也不会
+        // 永久留下。刻意不用 3g4 那两处 90s 常量——test_host_clean_gates.js 按该字面量计数。
+        'setTimeout(() => process.exit(0), 120000).unref()',
+        ''
+      ].join('\n'),
+      'stub_heartbeat.js': [
+        "const fs = require('fs')",
+        "const path = require('path')",
+        "const out = path.join(__dirname, 'heartbeat.txt')",
+        "fs.writeFileSync(path.join(__dirname, 'grand.pid'), String(process.pid) + '\\n')",
+        "fs.writeFileSync(out, 'X')",
+        "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+        'setTimeout(() => process.exit(0), 130000).unref()',
+        ''
+      ].join('\n'),
+      'unit_signal_probe.js': '(' + unitSignalProbe.toString() + ')()\n'
+    }
+  )
+  try {
+    const sigEnv = { ...baseEnv }
+    // 本用例只锁信号收尾；CI(pipe) 形态的整组杀伤由 3g6 覆盖 ⇒ 固定成本地形态，跨环境行为一致。
+    delete sigEnv.GITHUB_STEP_SUMMARY
+    const probe = spawnSync(process.execPath, [path.join(sigDir, 'unit_signal_probe.js'), signal],
+      { encoding: 'utf8', cwd: sigDir, env: sigEnv, timeout: 60000 })
+    assert.strictEqual(probe.status, 0, `${signal} probe 自身应正常结束：${probe.stdout}${probe.stderr}`)
+    const out = JSON.parse(probe.stdout.trim().split('\n').pop())
+    assert.strictEqual(out.started, true, `${signal}：夹具套件必须真的起跑（否则本用例没有验证对象）`)
+    assert.ok(!out.exit.timeout, `${signal}：入口必须自行收敛（20s 内未退出）`)
+    assert.strictEqual(out.exit.signal, null,
+      `${signal}：入口被信号默认语义杀死（signal=${out.exit.signal}）⇒ 没有任何信号 handler，detached 套件成孤儿`)
+    assert.strictEqual(out.exit.code, expectedCode,
+      `${signal}：收尾退出码必须是 ${expectedCode}（被打断不等于通过；实测 ${out.exit.code}）`)
+    assert.strictEqual(out.suiteAlive, false,
+      `${signal}：套件进程（pid ${out.suitePid}）必须已死亡——detached 套件在自己进程组里，信号不转发就成孤儿`)
+    assert.strictEqual(out.grandAlive, false,
+      `${signal}：套件派生的孙进程（pid ${out.grandPid}）也必须已死亡——整组 SIGKILL 才能连后代一起收口`)
+    assert.strictEqual(out.sizeLater, out.sizeAfterExit,
+      `${signal}：入口退出后心跳仍在增长（${out.sizeAfterExit} → ${out.sizeLater} 字节）——` +
+      '孤儿套件还在跑、还在写盘（C10-003 跨组交互）')
+    console.log(`✅ ${signal} 收尾（run_unit_tests）：入口以 ${out.exit.code} 退出，套件（pid ${out.suitePid}）与孙进程（pid ${out.grandPid}）随进程组一起被清掉`)
+  } finally {
+    fs.rmSync(sigDir, { recursive: true, force: true })
+  }
+}
+
 // 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
 const strykerIdx = mutationYml.indexOf('npx stryker run')
 assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
