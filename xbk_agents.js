@@ -30,6 +30,39 @@ const DNS_INVALIDATION_CODES = new Set([
 const dnsCache = new Map()
 const dnsPending = new Map()
 
+// C10-074（audit38）：同 key 等待项的上限与单次等待上限（毫秒）。
+// 为什么必须有：`dns.lookup` 无法取消（got 的 signal 传不到这里，见 prewarmDns 的注释），坏解析器 /
+// 网络黑洞下底层回调永远不来 ⇒ 「同 key 复用一次底层 lookup」会把所有等待项无限堆在 dnsPending 里
+// （实测：500 次调用 = 1 次底层 lookup + 500 个回调全部存活，再压 1000 次变 1500 个），而普通调用方
+// （含 got 超时/取消后仍存在的 net lookup 回调）没有任何摘除路径 ⇒ 长驻进程无界增长、调用方永远收不到回调。
+// 两个上限的分工：cap 让表**有界**（超限立即以可重试错误失败，不静默丢），deadline 让等待项**有终点**
+// （到点按失败回调并摘除）。默认 10s 远大于正常解析耗时（CI 实测 <1s），只为坏解析器兜底。
+const DNS_PENDING_MAX_WAITERS = 64
+const DNS_PENDING_TIMEOUT_DEFAULT_MS = 10000
+
+// 正整数环境变量（与 run_tests.js 的 positiveIntEnv 同口径）：非法值告警并回退默认，绝不按非法值运行。
+// 只给测试注入用；生产不设即走默认 10s。
+function positiveIntEnv (name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1) {
+    console.warn(`⚠️  环境变量 ${name}=${raw} 非法（应为正整数），已回退默认值 ${fallback}`)
+    return fallback
+  }
+  return value
+}
+
+const DNS_PENDING_TIMEOUT_MS = positiveIntEnv('XBK_DNS_PENDING_TIMEOUT_MS', DNS_PENDING_TIMEOUT_DEFAULT_MS)
+
+// 等待项失败用的错误：码必须落在 xbk_failure_policy 的可重试集合里（ETIMEDOUT / EAI_AGAIN 都是），
+// 否则一次本地排队失败会被判成 PERMANENT、连重试都不许。
+function dnsPendingError (code, message) {
+  const err = new Error(message)
+  err.code = code
+  return err
+}
+
 function profileMs (value) {
   return Number.isFinite(value) ? Math.round(value) : 'n/a'
 }
@@ -127,6 +160,44 @@ function dispatchLookupResult (callback, wantAll, error, address, family) {
   callback(null, first ? first.address : undefined, first ? first.family : family)
 }
 
+// 等待项计时器（C10-074）：deadline 逐条目登记，但一个 key 只保留**一个** timer（合并到最早 deadline），
+// 到点只摘除真正过期的项，其余重算下一个最早 deadline。timer 一律 unref——正常路径会 clearTimeout，
+// 这里兜底：坏解析器场景不得因为一个计时器把进程钉住。
+function clearPendingTimer (record) {
+  if (record && record.timer) {
+    clearTimeout(record.timer)
+    record.timer = null
+  }
+}
+
+function armPendingTimer (key, record) {
+  if (!record || record.entries.length === 0) return
+  clearPendingTimer(record)
+  let next = Infinity
+  for (const entry of record.entries) if (entry.deadline < next) next = entry.deadline
+  record.timer = setTimeout(() => sweepExpiredWaiters(key, record), Math.max(0, next - Date.now()))
+  if (typeof record.timer.unref === 'function') record.timer.unref()
+}
+
+// 到点的等待项：先按 key 摘除记账，再逐个以 ETIMEDOUT 失败回调（**不静默丢**）。
+// 为什么先摘除再回调：回调里若同步重试（很常见），不得让它看到这批已过期的等待项，也不得把新 lookup
+// 绑到一条已经判定超时的底层调用上。底层 lookup 若晚到，dnsLookup 里的身份检查会把它整条丢弃。
+function sweepExpiredWaiters (key, record) {
+  record.timer = null
+  if (dnsPending.get(key) !== record) return
+  const now = Date.now()
+  const expired = record.entries.filter(entry => entry.deadline <= now)
+  if (expired.length === 0) {
+    armPendingTimer(key, record)
+    return
+  }
+  record.entries = record.entries.filter(entry => entry.deadline > now)
+  if (record.entries.length === 0) dnsPending.delete(key)
+  else armPendingTimer(key, record)
+  const err = dnsPendingError('ETIMEDOUT', `DNS 解析等待超时（>${DNS_PENDING_TIMEOUT_MS}ms，底层 lookup 未回调）`)
+  for (const entry of expired) dispatchLookupResult(entry.callback, entry.all, err)
+}
+
 function dnsLookup (hostname, options, callback) {
   const opts = options || {}
   const wantAll = Boolean(opts.all)
@@ -145,25 +216,36 @@ function dnsLookup (hostname, options, callback) {
     return
   }
 
-  // AGENTS-04（已知限制，改行为需先定状态机口径）：普通调用方（含 got 超时/取消后仍存在的 net
-  // lookup 回调）没有摘除路径；唯一摘除是 prewarmDns 的 abort 分支，底层 dns.lookup 完成时才统一
-  // delete。坏解析器下同 key 列表会随重试只增不减——本注释只记录现状，未改任何行为。
+  // C10-074：普通调用方（含 got 超时/取消后仍存在的 net lookup 回调）没有摘除路径，故这里用
+  // 「同 key 上限 + 逐条目 deadline」兜住：超限立即以 EAI_AGAIN 失败（不静默丢），超时由
+  // sweepExpiredWaiters 以 ETIMEDOUT 失败并摘除。底层回调正常到达时仍是「一次 lookup 派发给全部等待项」。
   const pending = dnsPending.get(key)
   if (pending) {
-    pending.push({ callback, all: wantAll })
+    if (pending.entries.length >= DNS_PENDING_MAX_WAITERS) {
+      const err = dnsPendingError('EAI_AGAIN',
+        `DNS 等待队列已满（同 key ${pending.entries.length} 项 ≥ 上限 ${DNS_PENDING_MAX_WAITERS}），本次调用按失败返回，可重试`)
+      // 与缓存命中路径同口径：回调一律异步派发，绝不在 dnsLookup 里同步回调调用方
+      queueMicrotask(() => dispatchLookupResult(callback, wantAll, err))
+      return
+    }
+    pending.entries.push({ callback, all: wantAll, deadline: Date.now() + DNS_PENDING_TIMEOUT_MS })
+    armPendingTimer(key, pending)
     return
   }
-  const pendingList = [{ callback, all: wantAll }]
-  dnsPending.set(key, pendingList)
+  const record = { entries: [{ callback, all: wantAll, deadline: Date.now() + DNS_PENDING_TIMEOUT_MS }], timer: null }
+  dnsPending.set(key, record)
+  armPendingTimer(key, record)
   dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
     // v3.263（CodeAnt）：只派发并缓存本次记账列表——abort 摘除回调后若同一 key 已有新 lookup
     // 接管，旧 lookup 完成时不得清空/派发到新列表，也不得写缓存（接管等待期间新调用方会读到
-    // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）
-    if (dnsPending.get(key) !== pendingList) return
+    // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）。
+    // C10-074：超时也走同一条身份检查——sweep 已把 key 摘掉/换新，晚到的旧回调整条丢弃。
+    if (dnsPending.get(key) !== record) return
     dnsPending.delete(key)
+    clearPendingTimer(record)
     const ttl = error ? DNS_ERROR_TTL_MS : DNS_TTL_MS
     dnsCache.set(key, { error, address, family, expiresAt: Date.now() + ttl })
-    for (const entry of pendingList) dispatchLookupResult(entry.callback, entry.all, error, address, family)
+    for (const entry of record.entries) dispatchLookupResult(entry.callback, entry.all, error, address, family)
   })
 }
 
@@ -199,12 +281,18 @@ function prewarmDns (hostname, signal = null) {
       done(error, address, family)
     }
     const onAbort = () => {
-      const pending = key === null ? null : dnsPending.get(key)
-      if (pending) {
-        // dnsPending 条目是 { callback, all }：按回调身份定位本记账项
-        const i = pending.findIndex(entry => entry.callback === callback)
-        if (i !== -1) pending.splice(i, 1)
-        if (pending.length === 0) dnsPending.delete(key)
+      const record = key === null ? null : dnsPending.get(key)
+      if (record) {
+        // 等待项条目是 { callback, all, deadline }：按回调身份定位本记账项
+        const i = record.entries.findIndex(entry => entry.callback === callback)
+        if (i !== -1) record.entries.splice(i, 1)
+        if (record.entries.length === 0) {
+          // 本 key 已无等待项：连同 deadline 计时器一起摘除，别留一个空壳 timer
+          clearPendingTimer(record)
+          dnsPending.delete(key)
+        } else {
+          armPendingTimer(key, record) // 摘掉最早 deadline 的那项后要重排 timer
+        }
       }
       done(new Error('aborted'))
     }
@@ -315,4 +403,4 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   }
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls }
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS }
