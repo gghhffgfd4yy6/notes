@@ -3,14 +3,17 @@
 // v3.280 静态扫描闸门（scripts/check-ci-static.js）的「三处接线」内容断言。
 //
 // 为什么由一个套件来锁：闸门本体若从 check 链 / pre-commit / test.yml 任一处被摘除，扫描器
-// 就静默失效——而「摘步骤」本身不会让任何东西变红。本套件未标记 integration/mutationSkip、也
-// 不在 SKIP_SUITES（它不是 test.yml 显式步骤），因此由「全量单元测试（run_unit_tests.js）」
-// 兜底步骤直接执行：**CI 上删掉静态扫描步骤，下一次 CI 必红在这里**。
+// 就静默失效——而「摘步骤」本身不会让任何东西变红。
 //
-// 纯字符串/fs 断言，不 spawn 子进程：刻意绕开 AGENTS「本机验证盲区」登记的限制
-// （本机 process.execPath 指向 linker64，execFileSync/spawnSync 必炸），本机与变异沙箱均可跑。
+// 接线事实（与 test_suites.js 的注册项一致）：本套件标了 `mutationSkip: true`（变异沙箱不复制
+// `.githooks/`，沙箱内必 ENOENT 假红）⇒ run_unit_tests.js 的 `!s.mutationSkip` 过滤会把它排除在
+// 「全量单元测试」兜底之外，CI 覆盖**只**来自 test.yml policy job 的显式步骤
+// `npm run test:ci-static-gates`（这层对账由 test_ci_skip_suites.js 的「SKIP_SUITES ↔ 显式步骤」
+// 守着）；**摘掉那个显式步骤，下一次 CI 必红在这里**。
+//
+// 纯字符串/fs 断言，不 spawn 子进程：本机与变异沙箱都能跑，也不受宿主 process.execPath 形态影响。
 // C5-013 起额外 require 判据模块（scripts/check-ci-static.js）本身：只读、无副作用、不 spawn，
-// 因此不破坏上面这条限制——但把「判据函数零自动化断言」这个缺口补上（详见下方同名用例）。
+// 但把「判据函数零自动化断言」这个缺口补上（详见下方同名用例）。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -41,7 +44,8 @@ check('package.json：check 链含静态扫描，且排在 npm test 之前（先
 
 check('pre-commit：第 4 道 run_gate 接线存在，道数计数不漂移', () => {
   const hook = read('.githooks/pre-commit')
-  // 行首锚定「命令行形态」（CodeRabbit #207 · Minor :36）：注释里提到命令不算接线——
+  // 行首锚定「命令行形态」（CodeRabbit #207 · Minor，原意见的 :36 行号早已随改动漂移，改按语义锚定）：
+  // 注释里提到命令不算接线——
   // 不锚定的匹配会被自家注释文本满足。
   assert.ok(linesThat(hook, /^run_gate "静态扫描闸门/).some((l) => l.includes('npm run check:ci-static')),
     'pre-commit 缺静态扫描 run_gate 行 = 提交时刻不再拦截钩子/YAML 的新问题')
@@ -59,7 +63,8 @@ check('pre-commit：第 4 道 run_gate 接线存在，道数计数不漂移', ()
 
 check('test.yml：CI 步骤存在、shellcheck 有兜底安装、zizmor 钉版本、走同一条 npm 链', () => {
   const yml = read('.github/workflows/test.yml')
-  // 全部行首锚定命令/声明形态（CodeRabbit #207 · Minor :36）：步骤上方的注释同样含
+  // 全部行首锚定命令/声明形态（CodeRabbit #207 · Minor，同上：按语义而非漂移的行号）：
+  // 步骤上方的注释同样含
   // 「npm run check:ci-static」字样——不锚定的 includes 在「run 行被删、注释还在」时会假绿。
   assert.ok(lineThat(yml, /^- name: 静态扫描闸门（shellcheck \+ zizmor）$/),
     'test.yml 静态扫描步骤被删 = CI 上没人跑扫描器（本套件将在兜底步骤里变红）')
@@ -103,12 +108,16 @@ check('首轮扫描修复不回退（release.yml 显式关缓存 + pre-push SC20
 // C5-013：判据函数与扫描面必须被**自动化**断言接住
 // 本套件此前只断言 package.json / .githooks / YAML 里的接线字符串，一个判据函数都不 require：
 // 把 main() 改成 `return 0`（或删掉扫描循环）、或让模块加载即 throw，本套件与 CI 全绿。
-// scripts/check-ci-static.js 里的 15 条 --selftest 断言又全仓无人调用（package.json / test.yml /
-// .githooks / run_* 全无引用）⇒ 判据函数实际上零自动化断言，是死代码。下面四条把它接进套件。
+// scripts/check-ci-static.js 里当时的 15 条 --selftest 断言又全仓无人调用（package.json / test.yml /
+// .githooks / run_* 全无引用）⇒ 判据函数实际上零自动化断言，是死代码。下面的用例把它接进套件
+// （条数随后续修复增至 28，具体数字由「--selftest 已接线」那条守卫核对，不在这里写死）。
 // ============================================================
 
-check('C5-013 判据模块可加载，5 个判定函数都是可调用函数', () => {
-  for (const name of ['summarizeZizmor', 'decideToolMissing', 'toolAvailable', 'resolveTool', 'decideZizmorProc']) {
+check('C5-013 判据模块可加载，全部判定函数都是可调用函数', () => {
+  // 名单要与 scripts/check-ci-static.js 的 module.exports 里**每一个判据**对齐：漏一个就等于那个判据
+  // 没有自动化断言（decideEmptyScan / decideCiEnv 就是后续修复补进来的，此前被 5 个的硬计数漏掉）。
+  const judges = ['summarizeZizmor', 'decideToolMissing', 'decideEmptyScan', 'decideCiEnv', 'toolAvailable', 'resolveTool', 'decideZizmorProc']
+  for (const name of judges) {
     assert.strictEqual(typeof gate[name], 'function',
       `${name} 必须从 scripts/check-ci-static.js 导出——判据零自动化断言 = 门禁可被静默改坏`)
   }
