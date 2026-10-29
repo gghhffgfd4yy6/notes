@@ -106,8 +106,13 @@ if (process.env.XBK_HOST_CLEAN_THROW_PROBE !== '1') {
     assert.match(probe.stdout, /❌ 💥 探针：故意抛错/, '抛错的检查必须打印 ❌ + label，而不是抛栈退出：' + both.slice(-600))
     assert.ok(probe.stdout.includes('✅ 清理建议必须对空格和 shell 元字符进行 POSIX 引用'),
       '抛错之后的检查必须照跑（末条检查的 ✅ 缺失说明整份文件中止了）：' + both.slice(-600))
-    // 计数按「真实数量」核对（不写死通过数：宿主机不干净时其它检查可能连带失败，那与本用例无关）
-    const summary = probe.stdout.match(/(\d+) 通过 \/ (\d+) 失败（共 (\d+) 检查）/)
+    // 计数按「真实数量」核对（不写死通过数：宿主机不干净时其它检查可能连带失败，那与本用例无关）。
+    // 数字收敛成 1..9 位（S5852）：无界 `\d+` 的回退步数随数字串长度增长，有界后每个起点最多 9 次。
+    // V8 实测本形态没有可测退化（4e6 字符 2.45ms），所以这条是「把上界写死」而不是修性能；
+    // 计数不可能到十位，真到了也不会静默截断——total = passed + failed，任一项 ≥10 位时第三组
+    // 没法在 ` 检查）` 前收口 ⇒ summary 为 null ⇒ 下一行 assert.ok 当场判红。
+    // 三个数字的口径断言（失败≥1 / passed+failed=total / passed≥13）一字未动。
+    const summary = probe.stdout.match(/(\d{1,9}) 通过 \/ (\d{1,9}) 失败（共 (\d{1,9}) 检查）/)
     assert.ok(summary, '有失败时必须有汇总行（旧实现连结论都没有）：' + both.slice(-600))
     const [, passed, failed, total] = summary.map(Number)
     assert.ok(failed >= 1, `汇总必须记下失败条数（实得 ${failed}）：` + both.slice(-600))
