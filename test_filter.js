@@ -238,6 +238,19 @@ function assertEqual (actual, expected, msg) {
   }
 }
 
+// C4-011：确定性 LCG 伪随机。此前同一行实现被**逐字复制** 26 份（19 份单行 + 7 份三行），
+// 改算法/模数要改 26 处、漏一处就让「固定 seed ⇒ 跨运行结果一致」的 fuzz 用例静默分叉。
+// 语义与旧副本逐字等价：seed_n = (seed_{n-1} * 1103515245 + 12345) % 2147483648，返回 [0,1)。
+// 注意 `<x>_prnd` 一类的 `& 0x7fffffff` 变体是**另一个**生成器（序列不同），不并入本工厂：
+// 换算法会改变这些 fuzz 用例实际喂进去的输入。
+function makeRand (initialSeed) {
+  let seed = initialSeed
+  return () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed / 2147483648
+  }
+}
+
 function assertPathInRoot (targetPath, root, msg) {
   const rootAbs = path.resolve(root)
   const t = path.resolve(targetPath)
@@ -1368,6 +1381,8 @@ console.log('========================================\n');
   await test('content_html 为 undefined → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
     assertEqual(typeof r, 'string')
+    // C4-008：typeof 只排掉「返回非字符串」，空串 / 丢尾巴都能过——钉住精确输出
+    assertEqual(r, '原文链接：[http://x](http://x)', '无 content_html 时应只剩原文链接尾巴')
   })
 
   // ==================== 20. 缓存管理 更多场景 ====================
@@ -1389,6 +1404,13 @@ console.log('========================================\n');
       // isMessageInFile 仍应判重命中（防上游重放重复推送）
       assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
       assertEqual(r2, true)
+      // C4-010：用例名与注释都说「最多保留 100 条」，但上面两条只证明墓碑判重——**完全不裁剪**时
+      // 它们同样成立，对「是否裁剪」零鉴别力。这里直接读盘核对条数与保留区间（删最旧、留最新）。
+      const kept = readMessages(getFilePath(name))
+      assertEqual(kept.length, 100, `超出上限应裁到 100 条，实际 ${kept.length} 条`)
+      assertEqual(kept[0] && kept[0].id, 1, `裁剪应删掉最旧的第0条，实际首条 id=${kept[0] && kept[0].id}`)
+      assertEqual(kept[kept.length - 1] && kept[kept.length - 1].id, 100,
+        `最新一条必须保留，实际末条 id=${kept[kept.length - 1] && kept[kept.length - 1].id}`)
     } finally {
       Config.cache.maxSize = orig
     }
@@ -2474,6 +2496,7 @@ console.log('========================================\n');
   await test('htmlToMarkdown 空 content_html → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
     assertEqual(typeof r, 'string')
+    assertEqual(r, '原文链接：[http://x](http://x)', 'content_html 缺失时应只剩原文链接尾巴')
   })
 
   await test('天数过滤 pingbitime=0 → 不拦截任何人', () => {
@@ -2896,6 +2919,13 @@ console.log('========================================\n');
     assertEqual(typeof Config.filter.zhanxianlouzhu, 'string')
     assertEqual(typeof Config.filter.pingbilouzhuplus, 'string')
     assertEqual(typeof Config.filter.pingbitime, 'string')
+    // C4-008：11 条 typeof 只证明「都是字符串」，缺字段 / 多字段 / 默认配置编译不了都照样绿
+    assert.deepStrictEqual(Object.keys(Config.filter).sort(),
+      ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus',
+        'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu',
+        'zhanxianneirong'],
+      '默认过滤配置的字段集合必须与 compileRules 口径一致（缺/多都算回归）')
+    assertEqual(compileRules(Config.filter).__compiled, true, '默认过滤配置必须能编译出 __compiled')
   })
 
   await test('修改 domain 后 pushUrl 联动变化', () => {
@@ -3243,6 +3273,7 @@ console.log('========================================\n');
     _ensureFileExists(path.join(CACHE, 'test_read.json'))
     const msgs = readMessages(path.join(CACHE, 'test_read.json'))
     assertEqual(Array.isArray(msgs), true)
+    assertEqual(msgs.length, 0, '空文件应返回空数组（返回占位元素/脏数据都算回归）')
   })
 
   await test('saveMessages 写入后 readMessages 可读', () => {
@@ -4040,21 +4071,27 @@ console.log('========================================\n');
   await test('tuisong_replace shuju为null → 不崩溃', () => {
     const r = tuisong_replace('{标题}', null)
     assertEqual(typeof r, 'string')
+    assertEqual(r, '', '数据为 null 时应渲染成空串（不能把占位符原样吐出）')
   })
 
   await test('htmlToMarkdown shuju为null → 不崩溃', () => {
     const r = htmlToMarkdown(null)
     assertEqual(typeof r, 'string')
+    assertEqual(r, '', '入参为 null 时应返回空串')
   })
 
   await test('compileRules rawCfg为null → 不崩溃', () => {
     const r = compileRules(null)
     assertEqual(typeof r, 'object')
+    // C4-008：`typeof null === 'object'` ⇒ 原断言对「返回 null」也成立，这里钉住真实形态
+    assertEqual(r.__compiled, true, 'null 配置应编译成空规则集（__compiled 标记必须为 true）')
+    assertEqual(r.pingbibiaoti, null, 'null 配置下每条规则都应为 null（不放行任何规则）')
   })
 
   await test('validateConfig cfg为null → 不崩溃', () => {
     const warns = validateConfig(null)
     assertEqual(Array.isArray(warns), true)
+    assertEqual(warns.length, 0, 'null 配置没有可校验字段，不该凭空告警')
   })
 
   await test('MessageStore has message为null → 不崩溃', () => {
@@ -4065,16 +4102,22 @@ console.log('========================================\n');
   await test('getFileName url为undefined → 不崩溃', () => {
     const r = getFileName(undefined)
     assertEqual(typeof r, 'string')
+    assertEqual(r, 'default.json', '无 URL 时应回落到 default.json（返回空串会让所有写入撞同一空名）')
   })
 
   await test('daysComputed time为0 → 不崩溃', () => {
     const r = daysComputed(0)
     assertEqual(typeof r, 'number')
+    // 独立 oracle：time=0 是 epoch，天数 = UTC 今天与 1970-01-01 的自然日差
+    const nowD = new Date()
+    const utcToday = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate())
+    assertEqual(r, Math.floor((utcToday - 0) / 86400000), 'time=0 应按 epoch 起算的天数（0/NaN 都算回归）')
   })
 
   await test('decodeHtmlEntities 输入数字 → 不崩溃', () => {
     const r = decodeHtmlEntities(123)
     assertEqual(typeof r, 'string')
+    assertEqual(r, '123', '数字入参应转成其字符串形态（返回空串/undefined 文案都算回归）')
   })
 
   await test('tuisong_replace posttime=0 → 正常处理', () => {
@@ -4089,11 +4132,16 @@ console.log('========================================\n');
   await test('htmlToMarkdown content_html为数字 → 不崩溃', () => {
     const r = htmlToMarkdown({ content_html: 12345, url: 'http://x' })
     assertEqual(typeof r, 'string')
+    assertEqual(r, '原文链接：[http://x](http://x)', '非字符串 content_html 应被忽略（不得把 12345 漏进正文）')
   })
 
   await test('daysComputed time为数字 → 不崩溃', () => {
     const r = daysComputed(20260728)
     assertEqual(typeof r, 'number')
+    // 20260728 是 YYYYMMDD 形态，应解析成 2026-07-28 而不是当毫秒数
+    const nowD = new Date()
+    const utcToday = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate())
+    assertEqual(r, Math.floor((utcToday - Date.UTC(2026, 6, 28)) / 86400000), 'YYYYMMDD 应按日期解析')
   })
 
   await test('decodeHtmlEntities 连续实体 → 全部解码', () => {
@@ -4104,11 +4152,15 @@ console.log('========================================\n');
   await test('validateConfig 字段值为数字 → 不崩溃', () => {
     const warns = validateConfig({ pingbibiaoti: 12345 })
     assertEqual(Array.isArray(warns), true)
+    assertEqual(warns.length, 1, '单个非法字段应恰好告警一次')
+    assertEqual(warns[0].includes('pingbibiaoti') && warns[0].includes('应为字符串'), true,
+      `告警必须点名字段与原因（实际: ${warns[0]}）`)
   })
 
   await test('compileRules 字段值为数字 → 不崩溃', () => {
     const r = compileRules({ pingbibiaoti: 12345 })
     assertEqual(typeof r, 'object')
+    assertEqual(r.pingbibiaoti, null, '数字值的规则必须被跳过（null），不能编译成恒真/恒假正则')
   })
 
   // ==================== 51. 第10-20轮边界覆盖 ====================
@@ -4129,6 +4181,8 @@ console.log('========================================\n');
   await test('compileRules 负天数', () => {
     const r = compileRules({ pingbitime: '-5' })
     assertEqual(typeof r.pingbitime, 'object')
+    // C4-008：`typeof null === 'object'` ⇒ 原断言连「负天数被静默接受」都测不出来
+    assertEqual(r.pingbitime, null, '负天数必须判为非法（null），不得编译出时间规则')
   })
 
   await test('tuisong_replace posttime为字符串', () => {
@@ -4147,6 +4201,7 @@ console.log('========================================\n');
   await test('htmlToMarkdown 纯空格内容', () => {
     const r = htmlToMarkdown({ content_html: '   ', url: 'http://x' })
     assertEqual(typeof r, 'string')
+    assertEqual(r, '原文链接：[http://x](http://x)', '纯空白正文不应留下空行块（只保留原文链接）')
   })
 
   await test('compileRules 多行含空行', () => {
@@ -4357,6 +4412,9 @@ console.log('========================================\n');
     // 大小写不同的配置不报错（i flag 正常）
     const warns = validateConfig({ pingbibiaoti: 'JINGDONG' })
     assertEqual(Array.isArray(warns), true)
+    assertEqual(warns.length, 0, '合法的大写规则不应产生任何告警')
+    assertEqual(matchesCompiled(compileRules({ pingbibiaoti: 'JINGDONG' }).pingbibiaoti, 'jingdong', 'x'),
+      true, '大写规则必须按大小写不敏感命中')
   })
 
   // ==================== 58. 盲区误判修复（实证发现） ====================
@@ -5666,6 +5724,8 @@ console.log('========================================\n');
     const mod = require('./xbk_function_v3.js')
     assertEqual(typeof mod.Pusher, 'object')
     assertEqual(typeof mod.Pusher.send, 'function')
+    // C4-008：`typeof null === 'object'` 且任何函数都满足 typeof 'function'——钉住导出形状与身份
+    assert.deepStrictEqual(Object.keys(mod.Pusher), ['send'], 'Pusher 只应导出 send（改名/漏导都算回归）')
   })
 
   await test('缓存裁剪给出提示（#243）', () => {
@@ -6011,6 +6071,41 @@ console.log('========================================\n');
     assertEqual(r, '纯文本 内容')
   })
 
+  // ==================== 84b. C4-009：转换类 includes 断言改精确串 ====================
+  // 审计：全文件 100+ 处 `assertEqual(r.includes(X), true)`。X 只要出现在输入里，函数「把输入原样
+  // 吐回」或只做 stripTags 也能过（实测：stripTags 输出「项目一项目二」同样过 :1928/:1929 的断言）。
+  // 转换类用例的正确判据是**精确串**：下表每行期望值都带输入里不存在的 markdown 记号，
+  // identity / stripTags 实现逐行必红，includes 只保留给「危险内容不得出现」的否定断言。
+  await test('C4-009: htmlToMarkdown 转换类精确串（identity/stripTags 实现必红）', () => {
+    const cases = [
+      ['<a href="http://url">链接</a>', 'http://x', '[链接](http://url)\n\n原文链接：[http://x](http://x)'],
+      ['<img src="http://pic.jpg">', 'http://x', '![](http://pic.jpg)\n\n原文链接：[http://x](http://x)'],
+      ['<img src="p.jpg" alt="图">正文', '', '![图](p.jpg)\n\n正文'],
+      ['<h2>二级标题</h2>', '', '## 二级标题'],
+      ['<p>段落一</p><p>段落二</p>', '', '段落一\n\n段落二'],
+      ['<ul><li>苹果</li><li>香蕉</li></ul>', '', '- 苹果\n\n- 香蕉'],
+      ['<ol><li>第一步</li><li>第二步</li></ol>', '', '- 第一步\n\n- 第二步'],
+      ['<b>加粗</b>和<strong>重点</strong>与<i>斜体</i>', '', '**加粗**和**重点**与*斜体*'],
+      ['<div>商品一</div><div>商品二</div>', '', '商品一\n\n商品二'],
+      ['<table><tr><td>甲</td><td>乙</td></tr></table>', '', '| 甲 | 乙'],
+      ['<table><tr><th>名称</th><th>价格</th></tr></table>', '', '| 名称 | 价格'],
+      ['a&amp;b&lt;c&gt;d', '', 'a&b<c>d'],
+      ['<script>alert(1)</script>正文', '', '正文'],
+      ['<h2>标题</h2><p>段</p>', 'http://x/1.html', '## 标题\n\n段\n\n原文链接：[http://x/1.html](http://x/1.html)'],
+      ['纯文本', '', '纯文本'],
+      ['<div><p>段落<b>加粗</b></p></div>', 'http://x', '段落**加粗**\n\n原文链接：[http://x](http://x)'],
+      ['<a href="https://x">内<b>层</b></a>尾', '', '[内**层**](https://x)尾'],
+      ['<br>', '', ''],
+      ['行1<br><br><br>行2', '', '行1\n\n行2']
+    ]
+    for (const [html, url, expected] of cases) {
+      const out = htmlToMarkdown({ content_html: html, url })
+      assertEqual(out, expected, `精确输出不符（includes 判据下 identity 实现也能过）：${html}`)
+      // 输入含真实标签 ⇒ 输出必须与输入不同（identity 实现的机器判据）
+      if (html.includes('<')) assertEqual(out === html, false, `输出等于输入原样，标签未被转换：${html}`)
+    }
+  })
+
   await test('快照: tuisong_replace 标题+日期时间', () => {
     // v3.115：{日期} UTC 解析稳定（2026-07-29）；{时间} 本地时区——断言格式而非具体值
     const r = tuisong_replace('【{分类名}】{标题}\n{日期} {时间}', { title: '测试标题', category_name: '分类', posttime: 1785346200, url: '/a.html' })
@@ -6073,6 +6168,113 @@ console.log('========================================\n');
       const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '大促', louzhuregtime: '2026-01-01' }
       for (let i = 0; i < 5000; i++) listfilter(group, cfg)
     }, 500, '5000次listfilter')
+  })
+
+  // C4-012：上面三条预算的输入都是玩具形态（68 字符 HTML ×1000、单模板 ×1000、3 字段 ×5000），
+  // 而真实推送是「单条 100k 字符的 content_html」——此前这条形态零预算，O(n²) 退化（见 v3.251 长
+  // href 事故）只能在 CI 事后靠肉眼发现。这里按**真实可达形态**补预算：
+  //   · 真实形态是「11 个过滤字段（FILTER_FIELDS 10 个 + pingbitime）全部配满 + 多行 ### 规则」，
+  //     多行规则是分类不敏感的分支遍历。
+  // 阈值 1500/1500/1200ms 沿用（本次不放宽也不收紧）：本机 2 核逐条复刻下述输入的实测值
+  // （单跑脚本，多次采样的 min–max）：
+  //   100k htmlToMarkdown 36–77ms（2 个 CPU hog 争用 69–153ms）→ 余量 19×/9.8×；
+  //   100k tuisong 256–328ms（争用 624–920ms）→ 余量 4.6×/1.6×；
+  //   20000 次全字段 listfilter 56–111ms（争用 194–223ms）→ 余量 10.8×/5.4×。
+  //   tuisong 这条在争用下余量偏薄（预检实测最差用掉 89%），按「本组只加预算、不放宽既有阈值」
+  //   留作 follow-up，不在本组改动。
+  // 「100k 内容 × 数百条规则」的形态不在上面三条覆盖范围内（### 只限行内段数、不限行数），
+  // 由下面单独一条预算承担。
+  await test('基准: htmlToMarkdown 单文档 100k content_html < 1500ms（真实形态）', () => {
+    const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p><ul><li>项一</li><li>项二</li></ul><div>块</div>'
+    const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
+    assertEqual(html.length, 100000, '预算输入必须是真实的 100k 字符单文档')
+    benchRetry(() => { htmlToMarkdown({ content_html: html, url: 'http://x/1.html' }) }, 1500, '100k htmlToMarkdown')
+  })
+
+  await test('基准: tuisong_replace 单文档 100k content_html < 1500ms（真实推送形态）', () => {
+    const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p>'
+    const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
+    const data = { title: 'T', content: 'C', content_html: html, category_name: '分类', url: '/a', posttime: 1785346200 }
+    benchRetry(() => { tuisong_replace('【{分类名}】{标题}\n{Markdown内容}', data) }, 1500, '100k tuisong_replace')
+  })
+
+  await test('基准: listfilter 全字段规则集 20000 次 < 1200ms（真实形态：11 字段 + ### 多行）', () => {
+    const cfg = compileRules({
+      pingbifenlei: '赚客吧###什么值得买',
+      pingbibiaoti: '京东###淘宝',
+      zhanxianbiaoti: '拼多多',
+      pingbibiaotiplus: '神券###优惠',
+      pingbineirong: '返利',
+      zhanxianneirong: '红包',
+      pingbineirongplus: '线报###羊毛',
+      pingbilouzhu: '小明',
+      zhanxianlouzhu: '小红###小李',
+      pingbilouzhuplus: '楼主',
+      pingbitime: '5'
+    })
+    assertEqual(cfg.__compiled, true, '预算必须是编译后的真实规则集')
+    // 全字段都配满 ⇒ 每条消息都会走多行分支，不是「3 个字段短路」的玩具路径
+    // 口径（C4-012 返工）：本用例的规则总数只有 ~17 条（11 字段 × 行内 1–2 段，见
+    // cfg.pingbineirong.rules 等），group 也是 30 字符级短文——它量的是「多字段分支 + 分类判断」
+    // 的固定开销，**打不到**审计指的「100k 内容 × 数百条规则」形态（那条由下一条预算覆盖）。
+    const group = {
+      catename: '微博线报',
+      louzhu: '小明',
+      title: '京东神券大促',
+      content: '大促内容 123',
+      content_html: '<div>大促内容</div>',
+      url: 'http://example.com/p/1.html',
+      posttime: 1785346200,
+      louzhuregtime: '2026-10-20'
+    }
+    benchRetry(() => { for (let i = 0; i < 20000; i++) listfilter(group, cfg) }, 1200, '20000次全字段listfilter')
+  })
+
+  // C4-012 返工：审计指的「100k 内容 × 数百条规则」是**本仓可达形态**——上一版注释把 `###` 的
+  // 「只取前两段」当成了整份配置的上限，实际它只限制**行内**段数、不限行数：300 行「###关键字N」
+  // 经 compileRules 实测就是 rules.length === 300（真实配置，不是合成对象）。而上一版「20000 次
+  // 全字段」预算只有 ~17 条规则 × 30 字符 group，打不到这条热路径。
+  // 最坏路径：300 条规则全部不命中 ⇒ 每条规则都要对 100k 正文各跑一次 _normalizeReInput + test
+  // （matchesCompiled 的 multi 分支是 O(内容 × 规则)，任一条命中才短路）。
+  // 阈值标定（本机 2 核实测，整份 test_filter.js 内的实测值）：
+  //   · 空闲 481–526ms（单独跑同一负载另测 428–489ms）；
+  //   · 起 2 个 CPU hog 制造争用（本仓 check 会并发跑套件）1404–1880ms；
+  //   取 3000ms：空闲 5.7–6.2 倍余量、争用最差仍有 1.6 倍余量（不假红）；而审计形态的退化
+  //   （单条 ~113ms ⇒ 200 条 ≈22s；12–16s 级事故）在本口径下会把 3 次推到秒级 ⇒ 必红。
+  //   为什么不取「5 次一组 + 1500ms」：5 次实测空闲 733–777ms、2 hog 争用 1934–2553ms，1500ms
+  //   在争用下会假红；要让它绿得取 ≥3200ms，那会超过既有最大内部阈值 3000ms（C4-007 的
+  //   TIMEOUT_MS=4000 不变量按 perfLimit(3000) 推导），故取 3 次一组 + 3000ms
+  //   （3000ms 与既有「10000 条 listfilter」预算并列最大，仍严格小于 harness TIMEOUT_MS=4000）。
+  //   反向标定（实测，验证完已 checkout 还原）：把 _anyRule 的规则遍历放大 10 倍（实现退化）⇒
+  //   本断言实测 5184ms > 3000ms 真红，说明这条预算真的在量这条热路径，不是装饰。
+  await test('基准: listfilter 100k 内容 × 300 条 ### 规则 < 3000ms（审计形态）', () => {
+    // 300 行 ### 真配置：无分类前缀 ⇒ 规则对任意 catename 都参与匹配（分类不敏感的分支遍历）
+    const ruleLines = []
+    for (let i = 0; i < 300; i++) ruleLines.push('###zzz_nomatch_' + String(i).padStart(3, '0'))
+    const cfg300 = compileRules({ pingbineirong: ruleLines.join('\n') })
+    assertEqual(cfg300.__compiled, true, '预算必须是编译后的真实规则集')
+    assertEqual(cfg300.pingbineirong && cfg300.pingbineirong._type, 'multi', '300 行 ### 必须编译成多行规则，不是简单正则')
+    assertEqual(cfg300.pingbineirong.rules.length, 300, '300 行 ### 必须真的产出 300 条规则（### 只限行内段数）')
+    // 真实形态的 100k 正文（HTML 抽文后的纯文本），正文不含任何规则关键字 ⇒ 300 条全遍历
+    const para = '大促线报：京东自营满减叠加优惠券，名额有限先到先得。参考价 199 元，券后 129 元，库存 300 件。<br>'
+    let content = ''
+    while (content.length < 100000) content += para
+    content = content.slice(0, 100000)
+    assertEqual(content.length, 100000, '预算输入必须是真实的 100k 字符正文')
+    const g100k = {
+      catename: '微博线报',
+      louzhu: '小明',
+      title: '京东神券大促',
+      content,
+      content_html: content,
+      url: 'http://example.com/p/1.html',
+      posttime: 1785346200,
+      louzhuregtime: '2026-10-20'
+    }
+    // 预热 + 语义闸门：规则全不命中 ⇒ listfilter 放行（true）。若哪天规则意外命中，这里先红，
+    // 不让「测得快」其实是「首条规则短路早退」的假绿溜过去。
+    assertEqual(listfilter(g100k, cfg300), true, '300 条规则不得命中该正文（否则测的是短路早退，不是最坏路径）')
+    benchRetry(() => { for (let i = 0; i < 3; i++) listfilter(g100k, cfg300) }, 3000, '3×100k×300rules listfilter')
   })
 
   // v3.278（PR #156 复审续）PERF_MS 缩放回归：**撤销缩放即真红**。
@@ -6386,7 +6588,14 @@ console.log('========================================\n');
     const c = compileRules(all)
     const g = { catename: '', louzhu: null, title: '', content: undefined }
     assertEqual(typeof listfilter(g, c), 'boolean')
-    assertEqual(Array.isArray(validateConfig(all)), true)
+    assertEqual(listfilter(g, c), true, '全部规则都非法 ⇒ 一条都不生效 ⇒ 必须放行')
+    const warns = validateConfig(all)
+    assertEqual(Array.isArray(warns), true)
+    // C4-008：非法值必须被**逐字段点名**——静默吞掉 = 用户配错规则却无人告知
+    const named = [...new Set(warns.map(w => (w.match(/「([^」]+)」/) || [])[1]).filter(Boolean))].sort()
+    assert.deepStrictEqual(named, ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu',
+      'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti',
+      'zhanxianneirong', 'zkt_gjc'], '每个非法字段都应被点名（漏报字段=该字段静默失效）')
   })
 
   // v3.311：覆盖文件读面（console GET / qinglong --check）与 App.run 共用同一套正则引擎，
@@ -6546,6 +6755,7 @@ console.log('========================================\n');
     try {
       const r = readMessages(getFilePath('test_fault_read.json'))
       assertEqual(Array.isArray(r), true)
+      assertEqual(r.length, 0, '读失败应降级为空数组（返回半读内容会让上层误判缓存全量）')
     } finally {
       fs.openSync = orig
     }
@@ -6560,6 +6770,7 @@ console.log('========================================\n');
     try {
       const r = readMessages(getFilePath('test_dual_fault.json'))
       assertEqual(Array.isArray(r), true, '双故障应仍返回数组')
+      assertEqual(r.length, 0, '双故障必须降级为空数组（不是「返回了数组」就算过）')
     } finally {
       fs.openSync = origR
       fs.writeFileSync = origW
@@ -7401,14 +7612,20 @@ console.log('========================================\n');
   })
 
   console.log('\n📂 103. 随机输入冒烟（Fuzz，固定 seed 确定性）')
+  // C4-011：LCG 伪随机此前被逐字复制 26 份（19 份单行 + 7 份三行），改算法/模数要改 26 处、
+  // 漏一处就让「固定 seed ⇒ 跨运行一致」的 fuzz 用例静默分叉。收敛到 makeRand 之后，
+  // 本断言把「只剩一处实现」变成门禁：谁再复制一份即红（prnd 是 `& 0x7fffffff` 的另一序列，另算）。
+  await test('C4-011: LCG 伪随机只有 makeRand 一处实现（+ prnd 变体共 2 处）', () => {
+    const NEEDLE = '1103515' + '245' // 拆开写，免得本断言自己成为第 3 处
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const codeOnly = src.split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+    const hits = codeOnly.split(NEEDLE).length - 1
+    assertEqual(hits, 2, `LCG 常数只应出现在 makeRand 与 prnd 各一次（用例内复制即红），实际 ${hits} 处`)
+  })
 
   await test('Fuzz: 纯函数随机脏数据 500 轮不崩（v3.107）', () => {
     // 确定性伪随机（固定 seed 42——跨运行结果一致，88 章确定性精神）
-    let seed = 42
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(42)
     // 随机脏数据源：null/undefined/空串/大数/NaN/Infinity/对象/数组/含实体与标签的随机串
     const randomValue = () => {
       const r = rand()
@@ -7623,11 +7840,7 @@ console.log('========================================\n');
 
   await test('Fuzz-深度: 扩展随机值生成器（Symbol/函数/BigInt/Date/RegExp/循环/Proxy）', () => {
     // 固定 seed，确定性
-    let seed = 20260801
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(20260801)
     const deep = (depth) => {
       if (depth <= 0) return randomScalar()
       const r = rand()
@@ -7706,11 +7919,7 @@ console.log('========================================\n');
   })
 
   await test('Property: normUrl 幂等（随机输入 normUrl(normUrl(x))===normUrl(x)）', () => {
-    let seed = 7
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(7)
     const urls = ['http://A.com/x', 'https://x.com/a/', '//host/path', '/rel/path', 'http://x.com', 'a?b=1', '///', 'http://x.com//d//', 'ftp://f.com/', 'HTTP://Mixed.COM/U']
     for (let i = 0; i < 1000; i++) {
       const base = urls[Math.floor(rand() * urls.length)]
@@ -7722,11 +7931,7 @@ console.log('========================================\n');
   })
 
   await test('Property: decodeHtmlEntities 的 & 计数只减不增（随机输入）', () => {
-    let seed = 99
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(99)
     for (let i = 0; i < 1000; i++) {
       let s = ''
       const len = Math.floor(rand() * 100)
@@ -7742,11 +7947,7 @@ console.log('========================================\n');
   })
 
   await test('Property: daysComputed 非负（随机时间输入）', () => {
-    let seed = 1234
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(1234)
     for (let i = 0; i < 2000; i++) {
       const t = Math.floor(rand() * 1e14)
       const d = daysComputed(t)
@@ -7756,11 +7957,7 @@ console.log('========================================\n');
   })
 
   await test('Property: anonKey 确定性（同输入同输出）+ 不抛', () => {
-    let seed = 55
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(55)
     for (let i = 0; i < 500; i++) {
       const a = Math.floor(rand() * 1e6)
       const b = rand() < 0.5 ? null : 'x' + Math.floor(rand() * 1e6)
@@ -7773,11 +7970,7 @@ console.log('========================================\n');
   })
 
   await test('Property: truncateUtf16 长度不超限（随机字符串+emoji）', () => {
-    let seed = 777
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(777)
     for (let i = 0; i < 1000; i++) {
       let s = ''
       const len = Math.floor(rand() * 200)
@@ -7843,8 +8036,7 @@ console.log('========================================\n');
   console.log('\n📂 106. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）')
 
   await test('Property-2: truncateUtf16 单调性（max 更大 → 输出不更短）', () => {
-    let seed = 314159
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(314159)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 300)
@@ -7858,8 +8050,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: {分类名} 与 {类目} 同源一致（随机数据）', () => {
-    let seed = 2718
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(2718)
     for (let i = 0; i < 500; i++) {
       const catename = rand() < 0.2 ? null : '分类' + Math.floor(rand() * 100)
       const item = { catename, title: 't', content: 'c', url: '/x' }
@@ -7871,8 +8062,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: whitelistFilter 与 filterByKeyword 一致（随机数据）', () => {
-    let seed = 1618
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(1618)
     for (let i = 0; i < 500; i++) {
       const title = '标题' + Math.floor(rand() * 1000) + (rand() < 0.5 ? '京东' : '') + '神券'
       const kw = rand() < 0.3 ? '' : (rand() < 0.5 ? '京东' : (rand() < 0.8 ? '[' : '神券'))
@@ -7884,8 +8074,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: daysComputed 与 parseTime 一致性（无效/未来 → 0）', () => {
-    let seed = 4242
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(4242)
     for (let i = 0; i < 1000; i++) {
       const x = rand() < 0.3 ? (rand() < 0.5 ? 'abc' : null) : Math.floor(rand() * 1e13)
       const d = daysComputed(x)
@@ -7897,8 +8086,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: decodeHtmlEntities 幂等（递归解码收敛后稳定）', () => {
-    let seed = 8888
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(8888)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 40)
@@ -7913,8 +8101,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-正则: 100 个随机正则模式 hasNestedQuantifier 不崩且判定一致', () => {
-    let seed = 999
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(999)
     const atoms = ['a', 'b', '\\d', '.', '[ab]', '(ab)', '(?:cd)', 'a+', 'b*', 'a?', 'x{1,3}', 'y{2,}', '(a+)+', '(b*)*', '\\', '|', '^', '$']
     for (let i = 0; i < 100; i++) {
       let pat = ''
@@ -7943,8 +8130,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件自动清理）', () => {
-    let seed = 12321
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(12321)
     const randName = () => {
       const chars = 'abcXYZ0123 ../\\\\?*:"<>|&.;\u4e2d\ud83d\ude00'
       let s = 'test_106_'
@@ -7993,8 +8179,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-深度: 8 层嵌套 + 1MB 字符串 + 1000 轮大扫描', () => {
-    let seed = 55555
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(55555)
     const deep = (d) => {
       if (d <= 0) return rand() < 0.5 ? Math.floor(rand() * 1e9) : (rand() < 0.7 ? 'str' + Math.floor(rand() * 100) : null)
       return rand() < 0.5 ? { k: deep(d - 1) } : [deep(d - 1)]
@@ -8023,8 +8208,7 @@ console.log('========================================\n');
   console.log('\n📂 107. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）')
 
   await test('Property-3: daysComputed 单调性（更早日期 → 天数不更小）', () => {
-    let seed = 112358
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(112358)
     const mkDate = () => {
       const y = 2020 + Math.floor(rand() * 10)
       const mo = 1 + Math.floor(rand() * 12)
@@ -8044,8 +8228,7 @@ console.log('========================================\n');
   })
 
   await test('Property-3: truncateUtf16 前缀性（输出是输入前缀，允许代理对回退）', () => {
-    let seed = 131071
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(131071)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 100)
@@ -8058,8 +8241,7 @@ console.log('========================================\n');
   })
 
   await test('Property-3: decode+htmlToMarkdown 组合无实体残留（随机实体 HTML）', () => {
-    let seed = 161803
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(161803)
     for (let i = 0; i < 500; i++) {
       let html = ''
       const len = Math.floor(rand() * 20)
@@ -8109,8 +8291,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-模板: 随机模板（占位符组合）tuisong_replace 不崩且已知占位符被替换', () => {
-    let seed = 271828
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(271828)
     const placeholders = ['{分类名}', '{分类ID}', '{标题}', '{链接}', '{日期}', '{时间}', '{楼主}', '{类目}', '{价格}', '{商城}', '{品牌}', '{图片}', '{Html内容}', '{Markdown内容}', '{不存在}', '{{标题}}', '{标题', '标题}']
     const data = {
       catename: '测试分类',
@@ -8150,8 +8331,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-存储: MessageStore 跨操作一致性（save→read→has 闭环）', () => {
-    let seed = 3141592
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(3141592)
     const file = 'test_107_store.json'
     const fp = getFilePath(file)
     try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
@@ -8210,8 +8390,7 @@ console.log('========================================\n');
   console.log('\n📂 109. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）')
 
   await test('Fuzz-过滤: 随机 filter 配置 × 随机数据 → listfilter 不崩且返回 boolean', () => {
-    let seed = 20261201
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(20261201)
     const randRe = () => {
       const r = rand()
       if (r < 0.2) return ''
@@ -8253,8 +8432,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-HTML: 随机畸形标签 htmlToMarkdown 不崩且标签剥离干净', () => {
-    let seed = 2718282
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(2718282)
     const atoms = ['<b>', '</b>', '<a href="x">', '</a>', '<img src="i">', '<br>', '<br/>', '<p>', '</p>',
       '<h1>', '<h2>', '</h1>', '<li>', '</li>', '<table>', '<td>', '<tr>', '<div>', '<span>',
       '<', '>', '</', '<>', '</>', '<a>', '文本', 'x', '&amp;', '&lt;', '😀', '<script>', '</script>', '<style>', '</style>']
@@ -8331,8 +8509,7 @@ console.log('========================================\n');
     const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok') })
     await new Promise(r => server.listen(0, r))
     const port = server.address().port
-    let seed = 111111
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(111111)
     const randUrl = () => {
       const r = rand()
       if (r < 0.3) return `http://127.0.0.1:${port}/ok`
@@ -8369,8 +8546,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不崩', () => {
-    let seed = 99999
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(99999)
     const mkCompiled = () => {
       const r = rand()
       if (r < 0.25) return null
@@ -8582,8 +8758,7 @@ console.log('========================================\n');
   })
 
   await test('一致性: saveBatch 索引判重 vs 逐条 upsert 结果一致（随机数据）', () => {
-    let seed = 20261202
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(20261202)
     // 生成含重复 id/url/无 id 的随机消息流（覆盖 id 命中/url 命中/更新/追加）
     const mkMsgs = () => {
       const msgs = []
@@ -8735,8 +8910,7 @@ console.log('========================================\n');
       return (isId(qid) && (String(mid) === String(qid) || (!isId(mid) && mm.url && message.url && normUrl(mm.url) === normUrl(message.url)))) ||
                (!isId(qid) && message.url && normUrl(mm.url) === normUrl(message.url))
     })
-    let seed = 424242
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(424242)
     const randMsg = () => {
       const r = rand()
       const msg = { title: 'T' + Math.floor(rand() * 1000) }
