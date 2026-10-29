@@ -334,21 +334,27 @@ async function runResident (app, controller) {
     const decision = classifyFailure(error)
     const info = decision.info || summarizeError(error)
     const detail = describeFailure(info, error)
-    if (decision.kind === 'permanent') {
-      residentExitCode = 1
-      console.error(`本轮遇到不可恢复错误（${decision.reason}），停止常驻：${detail}`)
-      controller.abort()
-      return
-    }
-
     // PR #362（CodeRabbit Major · Stability & Availability）：部分消息失败不得占用常驻循环的指数退避。
     // 旧实现把它当整轮可重试失败叠加退避（默认封顶 30 分钟）：等待期间连**新消息**都拉不下来，
     // 一条长期送不出去的消息会把无关投递一起拖住最多 30 分钟/轮。这里与轮询解耦——照旧告警
     // （保留 PARTIAL_MESSAGE_FAILURE 可 grep），但不动循环级连续失败计数、不叠加退避：下一轮按
     // 正常轮询间隔拉取，未送达的消息随该轮重试（本轮有消息送达 ⇒ 循环已恢复，计数同步清零）。
+    //
+    // 必须**先于** permanent 判定：classifyFailure 见到嵌套子错误（failureInfo.failures 非空）就丢掉
+    // 父级预填标签转 classifyOne，子项全永久时得到 permanent/ALL_CHANNELS_PERMANENT——于是「成功 1 条
+    // + 唯一失败是 token 无效(401)」这种部分失败会被判成整轮永久。若按 decision.kind 先判 permanent，
+    // 一条 token 失效的消息就 abort 掉常驻循环、停掉全部后续新消息，比 30 分钟退避更糟。本轮已有成功
+    // 投递（pushed>0）说明循环本身健康，故以重抛时预填的 failureReason 为准，先行分流、永不 abort。
     if (isPartialMessageFailure(error)) {
       consecutiveRetryableFailures = 0
       console.error(`本轮部分消息未送达（PARTIAL_MESSAGE_FAILURE），随后续轮询重试（不叠加循环退避）：${detail}`)
+      return
+    }
+
+    if (decision.kind === 'permanent') {
+      residentExitCode = 1
+      console.error(`本轮遇到不可恢复错误（${decision.reason}），停止常驻：${detail}`)
+      controller.abort()
       return
     }
 

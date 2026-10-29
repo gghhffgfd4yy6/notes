@@ -363,6 +363,37 @@ function error (message, code) {
     }, allFailedController)
     assert.ok(allFailedGapMs >= 800,
       `整轮失败仍必须叠加退避：第 1→2 轮间隔 ${allFailedGapMs}ms（应≈1000ms）`)
+
+    // PR #362 返工（主代理复现的真因）：部分失败里若**唯一**失败消息是永久错误（如 token 无效 401），
+    // classifyFailure 见到嵌套子错误就转 classifyOne，子项全永久 ⇒ permanent/ALL_CHANNELS_PERMANENT。
+    // 若先判 permanent 再判 partial，一条 token 失效的消息会让整轮 abort——比 30 分钟退避更糟：
+    // 后续全部新消息一起停掉。本用例锁定「pushed>0 的部分失败永不 abort、不叠加退避」。
+    let partialPermRuns = 0
+    let partialPermGapMs = -1
+    let partialPermFirstAt = 0
+    let partialPermAborts = 0
+    const partialPermInner = new AbortController()
+    // 只统计 runResident 自己发起的 abort()：停循环用 inner.abort()，不走这个包装。
+    const partialPermController = {
+      signal: partialPermInner.signal,
+      abort: () => { partialPermAborts += 1; partialPermInner.abort() }
+    }
+    await runResident({
+      num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
+      run: async () => {
+        partialPermRuns += 1
+        if (partialPermRuns === 1) partialPermFirstAt = Date.now()
+        else if (partialPermRuns === 2) partialPermGapMs = Date.now() - partialPermFirstAt
+        if (partialPermRuns >= 3) partialPermInner.abort()
+        return { total: 2, pushed: 1, failed: 1, failures: [{ statusCode: 401, message: 'token 无效' }] }
+      }
+    }, partialPermController)
+    assert.strictEqual(partialPermAborts, 0,
+      `本轮有成功投递的部分失败不得 abort 常驻循环（一条 token 无效的消息不得停掉后续全部推送），实际 abort ${partialPermAborts} 次`)
+    assert.ok(partialPermRuns >= 3,
+      `部分消息失败必须继续按轮询间隔跑下一轮（不得整轮停止），实际只跑了 ${partialPermRuns} 轮`)
+    assert.ok(partialPermGapMs >= 0 && partialPermGapMs < 500,
+      `部分消息失败不得叠加常驻循环退避：第 1→2 轮间隔 ${partialPermGapMs}ms（旧实现至少 1000ms）`)
   } finally {
     if (oldInterval === undefined) delete process.env.XBK_INTERVAL_MS
     else process.env.XBK_INTERVAL_MS = oldInterval
