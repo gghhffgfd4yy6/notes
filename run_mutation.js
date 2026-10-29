@@ -659,7 +659,7 @@ async function main (deps) {
   // （600s > 180s），但环境变量可以把它配死——这里响亮告警，不静默按死配置跑。
   if (idleMs >= timeoutMs) {
     console.warn(`⚠️  MUTATION_TIMEOUT=${timeoutMs}ms 不大于 MUTATION_IDLE_MS=${idleMs}ms：静默线永远不会先触发` +
-      `（挂死只能等总上限）。请把总上限调到静默线之上。`)
+      '（挂死只能等总上限）。请把总上限调到静默线之上。')
   }
   const checkpointFile = process.env.MUTATION_CHECKPOINT || defaultCheckpointFile()
   // D3：不再 existsSync 预过滤（会把缺失的 DEFAULT_FILES 静默剔除，使 copyProject 的必选校验不可达，
