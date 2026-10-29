@@ -145,6 +145,78 @@ check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
     '直接执行 test_filter.js（CI/pre-push）也必须先经过主机干净度检查')
 })
 
+// C10-028：run_tests.js / run_unit_tests.js 的 require 容错曾经只判 `e.code === 'MODULE_NOT_FOUND'`——于是
+// 「scripts/check-host-clean.js 存在、但它内部某个依赖缺失（树损坏，或将来给它加相对依赖）」也被读成
+// 「未找到 check-host-clean.js，跳过」，主机干净度门禁被静默关掉（且随后可能因别的 require 失败而看不出
+// 真正原因）。判据：只有「本模块自身解析不到」才算最小工作树；模块内部的缺失必须原样抛出。
+// 两个生产入口各用「坏门禁 / 无门禁」两个夹具实跑核对（两个入口的真实分支不同，必须各测一次）。
+check('require 容错只吞「本模块不存在」，模块内部依赖缺失必须响亮失败（C10-028）', () => {
+  const CASES = [
+    {
+      entry: 'run_tests.js',
+      // 跑过 hostClean 之后的第一个可观察检查点（与 RT-01 夹具同口径）
+      afterSkip: /SUITES 为空/,
+      extra: { 'scripts/check-deps.js': "'use strict'\nmodule.exports = { checkDependencies: () => true }\n" }
+    },
+    {
+      entry: 'run_unit_tests.js',
+      afterSkip: /过滤后没有可执行的单元套件/,
+      extra: {}
+    }
+  ]
+  const makeFixture = (c, withBrokenGate) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-host-clean-require-'))
+    fs.mkdirSync(path.join(dir, 'scripts'))
+    // 补齐入口自身的最小依赖，让它能跑到可观察的节点（脚本本体只复制入口文件）
+    fs.writeFileSync(path.join(dir, c.entry), read(c.entry))
+    fs.writeFileSync(path.join(dir, 'test_suites.js'), "'use strict'\nmodule.exports = { SUITES: [] }\n")
+    for (const [rel, body] of Object.entries(c.extra)) fs.writeFileSync(path.join(dir, rel), body)
+    if (withBrokenGate) {
+      // 门禁脚本本身存在，但它 require 的同级依赖不存在（树损坏 / 未来新增相对依赖的形态）
+      fs.writeFileSync(path.join(dir, 'scripts', 'check-host-clean.js'),
+        "'use strict'\nrequire('./missing-dep')\nmodule.exports = { shouldAbortForDirtyHost: () => false }\n")
+    }
+    return dir
+  }
+  for (const c of CASES) {
+    // ① 坏输入：门禁脚本存在但内部依赖缺失 → 不得打印「未找到 check-host-clean.js」，必须以真实错误退出
+    {
+      const dir = makeFixture(c, true)
+      try {
+        const run = spawnSync(process.execPath, [path.join(dir, c.entry)], { cwd: dir, encoding: 'utf8', env: probeEnv() })
+        const both = (run.stdout || '') + (run.stderr || '')
+        assert.notStrictEqual(run.status, 0, `${c.entry}：内部依赖缺失必须非 0 退出：` + both.slice(-600))
+        assert.ok(!/未找到 scripts\/check-host-clean\.js/.test(both),
+          `${c.entry}：「模块内部依赖缺失」被读成「未找到 check-host-clean.js」= 门禁被静默关掉（C10-028）：` + both.slice(-600))
+        assert.ok(/missing-dep/.test(both),
+          `${c.entry}：必须把真正的缺失模块报出来，而不是谎报主机干净度脚本不存在：` + both.slice(-600))
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+    // ② 好输入（最小工作树）：脚本真的不存在 → 仍要响亮跳过并继续跑到下一个检查点
+    {
+      const dir = makeFixture(c, false)
+      try {
+        const run = spawnSync(process.execPath, [path.join(dir, c.entry)], { cwd: dir, encoding: 'utf8', env: probeEnv() })
+        const both = (run.stdout || '') + (run.stderr || '')
+        assert.match(both, /⚠️ 未找到 scripts\/check-host-clean\.js/,
+          `${c.entry}：最小工作树（无 scripts/check-host-clean.js）必须响亮跳过、不得崩：` + both.slice(-600))
+        assert.match(both, c.afterSkip,
+          `${c.entry}：跳过之后入口必须继续执行（跑到下一个检查点），不得在此中断：` + both.slice(-600))
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+    // ③ 生产路径不得回退：先 require.resolve 预判，resolve 成功后的 require 异常照常抛
+    const src = read(c.entry)
+    assert.match(src, /try \{\s*\n\s*require\.resolve\(HOST_CLEAN_MODULE\)/,
+      `${c.entry} 必须先 require.resolve 本模块、再 require 它（否则任何 MODULE_NOT_FOUND 又会被当成「脚本不存在」）`)
+    assert.ok(!/hostClean = require\('\.\/scripts\/check-host-clean\.js'\)\s*\n\}\s*catch/.test(src),
+      `${c.entry} 不得把 require 直接放在只判 e.code 的 catch 里（C10-028 的原形）`)
+  }
+})
+
 check('跳过必须响亮打印：guardOrExit 与 CLI 走同一条 ⏭ 分支（C10-013）', () => {
   // 背景：`guardOrExit` 在 r.skipped 时曾直接 `return false`（零输出），三个生产入口拿到的
   // 结果与「已检查且干净」逐字相同；而 main() 调 inspect() 时不传 env，:483 的 ⏭ 分支是死代码
