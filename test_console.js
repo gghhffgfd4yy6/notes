@@ -3146,6 +3146,41 @@ async function main () {
     assert.ok(/server 1 个/.test(leakedResourceReport({ closed: 1, cleared: 0 })), '报告必须点出被收割的 server 数')
   })
 
+  // ── C5-030：main() reject 的收尾 ──
+  // 旧实现 .catch 只打 e.message 并置 exitCode=1：没有分项汇总（通过/失败 + 失败用例名），
+  // 也没装强退闸。这条用例直接跑真实收尾接线（runSuite + rejected promise），取证三件事都做到。
+  await aok('C5-030 main() reject 也必须走「分项汇总 + 强退闸」，不是只打 e.message', async () => {
+    const lines = []
+    const origLog = console.log
+    const origErr = console.error
+    const snapshot = { passed, failed, names: failedNames.slice(), leaked: leakedScopes.slice(), exitCode: process.exitCode }
+    let guard = null
+    try {
+      console.log = (...args) => lines.push(args.join(' '))
+      console.error = (...args) => lines.push(args.join(' '))
+      guard = await runSuite(Promise.reject(new Error('probe main 崩了')))
+    } finally {
+      console.log = origLog
+      console.error = origErr
+      // 强退闸是给真实收尾用的：探针必须撤掉，否则 3s 后它会把整个套件杀掉。
+      if (guard) realClearTimeout(guard)
+      passed = snapshot.passed
+      failed = snapshot.failed
+      failedNames.length = 0
+      failedNames.push(...snapshot.names)
+      leakedScopes.length = 0
+      leakedScopes.push(...snapshot.leaked)
+      process.exitCode = snapshot.exitCode
+    }
+    const out = lines.join('\n')
+    const summary = /控制台套件：通过 (\d+) \/ 失败 (\d+)/.exec(out)
+    assert.ok(summary, `异常路径也必须打分项汇总（实际：${JSON.stringify(out)}）`)
+    assert.ok(Number(summary[2]) >= 1, `异常必须计入失败数（实际汇总：${summary[0]}）`)
+    assert.ok(out.includes('失败用例：'), '异常路径必须列失败用例名（CI 只看得到日志尾部）')
+    assert.ok(out.includes('probe main 崩了'), '异常本身必须被打印（不得吞掉）')
+    assert.ok(guard && typeof guard.hasRef === 'function', '异常路径必须装上强退闸：否则 ref 句柄会把 CI 拖到 timeoutMS')
+  })
+
   await lineSearchTests()
   await watchMonitorTests()
   await filterRuleApiTests()
@@ -10620,36 +10655,55 @@ async function main () {
   })
 }
 
-main()
-  .then(() => {
-    console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
-    if (failed > 0) {
+// ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
+// 旧实现只在 .then 里做这三件事；main() reject 时只打一行 e.message 并置 exitCode=1：
+// 既没有「通过 N / 失败 M + 失败用例清单」（分项汇总），也没有强退闸——只要还有 ref 句柄
+// 攥着事件循环（迟到回调、孙进程），CI 照样白等满 timeoutMS，而日志里看不出是哪条用例烂了。
+function finishSuite () {
+  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
+  if (failed > 0) {
+    process.exitCode = 1
+    // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
+    console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+  }
+  // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
+  // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
+  // unref interval 只 clear 不计（见 reapTestScope），不参与本判定，所以不会误伤基线。
+  const leakReport = leakedResourceReport(reapTestScope('套件末'))
+  if (leakReport) {
+    process.exitCode = 1
+    console.error(leakReport)
+  }
+  // 最后一道闸：万一还有用例之外的东西攥着事件循环（孙进程 / 未走 listen 的句柄 / 超时
+  // 用例的迟到回调刚造出来的资源），也不让 CI 白等满 timeoutMS。unref() 保证没有泄漏时它
+  // 根本不触发。强退前必须再判一次：真发现 ref 句柄就把退出码置 1 并说明原因（评审 1）。
+  const guard = realSetTimeout(() => {
+    const handles = refdHandleNames(guard)
+    if (handles.length > 0) {
       process.exitCode = 1
-      // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
-      console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+      console.error(`[console-suite] 汇总后仍有活跃句柄（${handles.join(',')}），判定泄漏：退出码置 1 后强制退出`)
+    } else {
+      console.error('[console-suite] 汇总后事件循环仍未排空，但未发现 ref 句柄（unref 句柄不钉循环），强制退出')
     }
-    const lastReap = reapTestScope('套件末')
-    // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
-    // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
-    // unref interval 只 clear 不计（见 reapTestScope），不参与本判定，所以不会误伤基线。
-    const leakReport = leakedResourceReport(lastReap)
-    if (leakReport) {
-      process.exitCode = 1
-      console.error(leakReport)
-    }
-    // 最后一道闸：万一还有用例之外的东西攥着事件循环（孙进程 / 未走 listen 的句柄 / 超时
-    // 用例的迟到回调刚造出来的资源），也不让 CI 白等满 timeoutMS。unref() 保证没有泄漏时它
-    // 根本不触发。强退前必须再判一次：真发现 ref 句柄就把退出码置 1 并说明原因（评审 1）。
-    const guard = realSetTimeout(() => {
-      const handles = refdHandleNames(guard)
-      if (handles.length > 0) {
-        process.exitCode = 1
-        console.error(`[console-suite] 汇总后仍有活跃句柄（${handles.join(',')}），判定泄漏：退出码置 1 后强制退出`)
-      } else {
-        console.error('[console-suite] 汇总后事件循环仍未排空，但未发现 ref 句柄（unref 句柄不钉循环），强制退出')
-      }
-      process.exit(process.exitCode || 0)
-    }, 3000)
-    guard.unref()
-  })
-  .catch(e => { console.error('套件执行异常:', e.message); process.exitCode = 1; reapTestScope('套件异常') })
+    process.exit(process.exitCode || 0)
+  }, 3000)
+  guard.unref()
+  return guard
+}
+
+// 两条路径共用同一个收尾：正常跑完 / main() 中途 reject。后者必须也打汇总并装强退闸，
+// 否则「套件炸在半路」与「跑完了但泄漏」在 CI 上是同一种表现：等满 timeoutMS、无判据。
+async function runSuite (mainPromise) {
+  try {
+    await mainPromise
+  } catch (e) {
+    process.exitCode = 1
+    // 中止也是失败：计数与失败清单里必须留下痕迹，否则汇总会打出「通过 N / 失败 0」的假绿。
+    failed++
+    failedNames.push('main() 异常中止（未跑到套件末）')
+    console.error('套件执行异常:', failureText(e))
+  }
+  return finishSuite()
+}
+
+runSuite(main())
