@@ -29,7 +29,13 @@ const SUITES = [
   { name: '状态面板', file: 'test_status.js', desc: '--status 只读聚合运行状态', integration: true },
   { name: '状态报告解析', file: 'test_status_report.js', desc: 'scripts/status.js parseLastRun 多行取最后匹配 + parseDiagnostics 跳过损坏行 + formatStatus 降级' },
   { name: '规则引擎校验', file: 'test_rules.js', desc: 'xbk_rules.js 嵌套量词检测/pingbitime 首尾空白/缺少分隔符' },
-  { name: '工具函数', file: 'test_utils.js', desc: 'xbk_utils.js 日期解析/CSS转义/safeErrorText/filterHash 9个纯函数分支' },
+  // C5-073（口径登记，**不合并套件**）：套件边界按**文件**切而非按职责切 —— 本文件与 test_utils_pure.js
+  // 同测 xbk_utils.js。「每条门禁起进程」只在**套件**粒度成立（run_tests.js / run_unit_tests.js 每个套件
+  // 一个子进程；本文件自身 0 次 spawn、131 行）。实测 37 条断言，其中约 11 条为本套件独有（8 条无引号
+  // srcset 多候选 + 3 条 CSS 转义上下文），其余与 test_utils_pure.js 重叠。合并两套件必须同步
+  // stryker.tap.config.js 的 testFiles 显式清单（逐元素含顺序），而收益只是每轮少一个子进程
+  // ⇒ 保留现状并在此登记口径（desc 不再写「9 个纯函数分支」这种与实际断言数无关的说法）。
+  { name: '工具函数', file: 'test_utils.js', desc: 'xbk_utils.js 37 条断言（parseTime 11/CSS 转义 6/无引号 srcset 多候选 8/safeErrorText 3/filterHash 9）；与 test_utils_pure.js 重叠约 26 条，独有约 11 条' },
   { name: '工具函数纯函数扩展', file: 'test_utils_pure.js', desc: 'xbk_utils.js add0/daysFrom/num/safeText/safeGet/truncateUtf16/isDangerousUrl/validUrl/normUrl/anonKey 等纯函数边界（提升变异分数）' },
   { name: '格式化器', file: 'test_formatter.js', desc: 'xbk_formatter.js HTML→Markdown转换+模板替换+内部方法边界（提升变异分数）' },
   { name: '规则引擎扩展', file: 'test_rules_extended.js', desc: 'xbk_rules.js compileRules/matchesCompiled/checkTimeCompiled/validateConfig 边界（提升变异分数）' },
