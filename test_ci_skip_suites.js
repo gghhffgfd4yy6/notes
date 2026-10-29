@@ -1490,73 +1490,109 @@ function signalZombieHarness () {
   })
 }
 
-const zombieDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-signal-zombie-'))
-try {
-  fs.writeFileSync(path.join(zombieDir, 'zombie_helper.js'), [
-    "const { spawn } = require('node:child_process')",
-    "const fs = require('node:fs')",
-    "const path = require('node:path')",
-    // 自报 pid：harness 被兜底杀掉时由外层 finally 据此补刀（见下方清理注释）
-    "fs.writeFileSync(path.join(__dirname, 'helper.pid'), String(process.pid) + '\\n')",
-    // 孙进程先活 100ms 再退出：helper 的 SIGSTOP 在同一 tick 内就该落地，这个延迟把「孙进程先退出、
-    // libuv 的 SIGCHLD 回收抢在 SIGSTOP 之前」的竞态窗口彻底关掉（停住的父进程不可能 wait）。
-    "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 100)'], { stdio: 'ignore' })",
-    "fs.writeFileSync(path.join(__dirname, 'zombie.pid'), String(child.pid) + '\\n')",
-    // 不 wait、也不挂 exit 监听：SIGSTOP 之后本进程不再执行任何 JS，孙进程退出后就停在 Z 直到被回收。
-    "process.kill(process.pid, 'SIGSTOP')",
-    ''
-  ].join('\n'))
-  fs.writeFileSync(path.join(zombieDir, 'zombie_probe.js'),
-    "const fs = require('fs')\n" +
-    zombieIsAliveSrc + '\n' + // ← 生产实现，原样注入（不复制、不改写）
-    'const pids = process.argv.slice(2).map(Number)\n' +
-    'console.log(JSON.stringify({ pids, alive: pids.map(pid => isAlive(pid)) }))\n')
-  fs.writeFileSync(path.join(zombieDir, 'zombie_harness.js'), '(' + signalZombieHarness.toString() + ')()\n')
-  const zombie = spawnSync(process.execPath, [path.join(zombieDir, 'zombie_harness.js')],
-    { encoding: 'utf8', cwd: zombieDir, timeout: 60000 })
-  assert.strictEqual(zombie.status, 0,
-    `僵尸夹具自身应正常结束（status=${zombie.status}, signal=${zombie.signal}）：${zombie.stdout}${zombie.stderr}`)
-  const zout = JSON.parse(zombie.stdout.trim().split('\n').pop())
-  assert.ok(zout.zombiePid > 0 && zout.zombieState === 'Z',
-    `夹具必须造出真僵尸：孙进程 pid=${zout.zombiePid} 的 State 在 5s 内实测为 ` +
-    `${JSON.stringify(zout.zombieState)}（应为 'Z'）——没有僵尸，本用例就没有验证对象，不能算通过`)
-  assert.strictEqual(zout.helperState, 'T',
-    `前提：helper（pid ${zout.helperPid}）必须真的停在 SIGSTOP 里（实测 State=${JSON.stringify(zout.helperState)}）` +
-    '——它是孙进程的父进程，只有停住（不 wait）孙进程才会留在 Z')
-  assert.strictEqual(zout.kill0, true,
-    '前提：僵尸在 kill(pid,0) 口径下必须仍「存在」（成功），否则探针返回 false 可能只是 ESRCH，' +
-    '根本没走到 Z 分支，本回归就没有靶向性')
-  assert.strictEqual(zout.probe && zout.probe.status, 0,
-    `探针脚本必须正常结束：${zout.probe && zout.probe.stderr}`)
-  const probed = JSON.parse(zout.probe.stdout.trim())
-  assert.deepStrictEqual(probed.pids, [zout.zombiePid, zout.helperPid],
-    '探针必须按顺序收到「僵尸 pid + 停住的 helper pid」两个参数')
-  assert.strictEqual(probed.alive[1], true,
-    `对照：被 SIGSTOP 停住的 helper（pid ${zout.helperPid}，State=T）必须仍判活（实测 ` +
-    `alive=${JSON.stringify(probed.alive[1])}）——否则「僵尸判死」可以靠 return false 通过，回归退化成恒假`)
-  assert.strictEqual(probed.alive[0], false,
-    `SIGNAL_PROBE 的 isAlive 必须把僵尸（pid ${zout.zombiePid}，State=Z）判死：僵尸仍占进程表项、` +
-    'kill(pid,0) 对它成功，旧实现据此返回 true ⇒ suiteAlive 假阳，入口被信号打断后「已收口」会被误判成' +
-    `孤儿还在跑（RUNBOOK §3-g3）；实测 alive=${JSON.stringify(probed.alive)}`)
-  assert.deepStrictEqual(zout.helperExit, { code: null, signal: 'SIGKILL' },
-    '清理：helper 必须被本用例 SIGKILL 并 wait 掉（exit 事件已到达 ⇒ 没留下僵尸 helper）')
-  assert.strictEqual(zout.zombieStateAfter, null,
-    `清理：helper 被回收后孙进程的 /proc 条目必须消失（实测 State=${JSON.stringify(zout.zombieStateAfter)}）` +
-    '——留在 Z 说明这台机器无进程回收僵尸，会污染后续套件')
-  console.log(`✅ SIGNAL_PROBE 判活口径：真僵尸（pid ${zout.zombiePid}, State=Z）判死、停住的 helper` +
-    `（pid ${zout.helperPid}, State=T）仍判活；helper 已 SIGKILL+wait，僵尸已回收`)
-} finally {
-  // 兜底：harness 若被 60s 兜底杀掉，SIGSTOP 的 helper 就成了孤儿 ⇒ 按它自报的 pid 补一刀。
-  // 只杀 cmdline 确实是本夹具 helper 的进程，防 pid 复用误杀。
-  try {
-    const hp = Number(fs.readFileSync(path.join(zombieDir, 'helper.pid'), 'utf8').trim())
-    if (hp > 0 && fs.readFileSync('/proc/' + hp + '/cmdline', 'utf8').includes('zombie_helper.js')) {
-      try { process.kill(hp, 'SIGCONT') } catch (e) { /* 已退出 */ }
-      try { process.kill(hp, 'SIGKILL') } catch (e) { /* 已退出 */ }
-    }
-  } catch (e) { /* 无 pid 文件（helper 未起跑）或已被回收 */ }
-  fs.rmSync(zombieDir, { recursive: true, force: true })
+// 平台判据（纯函数，便于直接断言）：3g5b 的唯一平台依赖是 Linux 的 /proc/<pid>/stat——造僵尸要读它的
+//     State 字符（证明孙进程确实停在 Z），收尾要读它的消失（证明已被 init 回收）。判据必须落在
+//     /proc/self/stat 本身：不能用「/proc 目录存在」代替（非 Linux 上可能有同名/别名目录，容器里也可能
+//     挂载了 /proc 却缺 stat），也不能只按 process.platform 判（Linux 上也有没挂 procfs 的极简 rootfs）。
+//     三组入参在下面逐条断言：写死 true 会让 macOS 的 CI 必红，写死 false 会让这组回归在 Linux 上静默消失。
+function zombieFixtureSupported (platform = process.platform, hasProcStat = fs.existsSync('/proc/self/stat')) {
+  return platform === 'linux' && hasProcStat
 }
+
+assert.strictEqual(zombieFixtureSupported('linux', true), true,
+  '平台判据：linux + /proc/self/stat 可用 ⇒ 必须判支持（否则 Linux 上这组回归永远不会真跑）')
+assert.strictEqual(zombieFixtureSupported('darwin', true), false,
+  '平台判据：darwin 即使 /proc 目录存在（同名/别名目录）也必须判不支持——非 Linux 上僵尸语义不成立')
+assert.strictEqual(zombieFixtureSupported('linux', false), false,
+  '平台判据：linux 但 /proc/self/stat 不可用 ⇒ 必须判不支持——不能只按 process.platform 判')
+
+// 守卫状态：支持平台上「不得走跳过分支、必须真跑」由 if/else 之后的断言钉住——守卫写宽会把 Linux 一起
+//     跳过，整组回归静默退化成零覆盖而套件仍全绿；写窄（非 Linux 也真跑）则 macOS 的 CI 必红。
+//     状态校验必须留在分支外：ran/skipped 各自只在一个分支里被写，断言放进同一分支就恒真（形同注释），
+//     守则被改成「Linux 也跳过」时套件照样全绿——这正是本组回归要防的失效。
+const zombieFixtureState = { skipped: false, ran: false }
+if (!zombieFixtureSupported()) {
+  zombieFixtureState.skipped = true
+  console.log('⏭️ 3g5b 跳过（需要 Linux /proc/<pid>/stat）')
+} else {
+  console.log('▶ 3g5b 执行：Linux /proc 可用，真跑僵尸夹具')
+  const zombieDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-signal-zombie-'))
+  try {
+    fs.writeFileSync(path.join(zombieDir, 'zombie_helper.js'), [
+      "const { spawn } = require('node:child_process')",
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      // 自报 pid：harness 被兜底杀掉时由外层 finally 据此补刀（见下方清理注释）
+      "fs.writeFileSync(path.join(__dirname, 'helper.pid'), String(process.pid) + '\\n')",
+      // 孙进程先活 100ms 再退出：helper 的 SIGSTOP 在同一 tick 内就该落地，这个延迟把「孙进程先退出、
+      // libuv 的 SIGCHLD 回收抢在 SIGSTOP 之前」的竞态窗口彻底关掉（停住的父进程不可能 wait）。
+      "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 100)'], { stdio: 'ignore' })",
+      "fs.writeFileSync(path.join(__dirname, 'zombie.pid'), String(child.pid) + '\\n')",
+      // 不 wait、也不挂 exit 监听：SIGSTOP 之后本进程不再执行任何 JS，孙进程退出后就停在 Z 直到被回收。
+      "process.kill(process.pid, 'SIGSTOP')",
+      ''
+    ].join('\n'))
+    fs.writeFileSync(path.join(zombieDir, 'zombie_probe.js'),
+      "const fs = require('fs')\n" +
+      zombieIsAliveSrc + '\n' + // ← 生产实现，原样注入（不复制、不改写）
+      'const pids = process.argv.slice(2).map(Number)\n' +
+      'console.log(JSON.stringify({ pids, alive: pids.map(pid => isAlive(pid)) }))\n')
+    fs.writeFileSync(path.join(zombieDir, 'zombie_harness.js'), '(' + signalZombieHarness.toString() + ')()\n')
+    const zombie = spawnSync(process.execPath, [path.join(zombieDir, 'zombie_harness.js')],
+      { encoding: 'utf8', cwd: zombieDir, timeout: 60000 })
+    assert.strictEqual(zombie.status, 0,
+      `僵尸夹具自身应正常结束（status=${zombie.status}, signal=${zombie.signal}）：${zombie.stdout}${zombie.stderr}`)
+    const zout = JSON.parse(zombie.stdout.trim().split('\n').pop())
+    assert.ok(zout.zombiePid > 0 && zout.zombieState === 'Z',
+      `夹具必须造出真僵尸：孙进程 pid=${zout.zombiePid} 的 State 在 5s 内实测为 ` +
+      `${JSON.stringify(zout.zombieState)}（应为 'Z'）——没有僵尸，本用例就没有验证对象，不能算通过`)
+    assert.strictEqual(zout.helperState, 'T',
+      `前提：helper（pid ${zout.helperPid}）必须真的停在 SIGSTOP 里（实测 State=${JSON.stringify(zout.helperState)}）` +
+      '——它是孙进程的父进程，只有停住（不 wait）孙进程才会留在 Z')
+    assert.strictEqual(zout.kill0, true,
+      '前提：僵尸在 kill(pid,0) 口径下必须仍「存在」（成功），否则探针返回 false 可能只是 ESRCH，' +
+      '根本没走到 Z 分支，本回归就没有靶向性')
+    assert.strictEqual(zout.probe && zout.probe.status, 0,
+      `探针脚本必须正常结束：${zout.probe && zout.probe.stderr}`)
+    const probed = JSON.parse(zout.probe.stdout.trim())
+    assert.deepStrictEqual(probed.pids, [zout.zombiePid, zout.helperPid],
+      '探针必须按顺序收到「僵尸 pid + 停住的 helper pid」两个参数')
+    assert.strictEqual(probed.alive[1], true,
+      `对照：被 SIGSTOP 停住的 helper（pid ${zout.helperPid}，State=T）必须仍判活（实测 ` +
+      `alive=${JSON.stringify(probed.alive[1])}）——否则「僵尸判死」可以靠 return false 通过，回归退化成恒假`)
+    assert.strictEqual(probed.alive[0], false,
+      `SIGNAL_PROBE 的 isAlive 必须把僵尸（pid ${zout.zombiePid}，State=Z）判死：僵尸仍占进程表项、` +
+      'kill(pid,0) 对它成功，旧实现据此返回 true ⇒ suiteAlive 假阳，入口被信号打断后「已收口」会被误判成' +
+      `孤儿还在跑（RUNBOOK §3-g3）；实测 alive=${JSON.stringify(probed.alive)}`)
+    assert.deepStrictEqual(zout.helperExit, { code: null, signal: 'SIGKILL' },
+      '清理：helper 必须被本用例 SIGKILL 并 wait 掉（exit 事件已到达 ⇒ 没留下僵尸 helper）')
+    assert.strictEqual(zout.zombieStateAfter, null,
+      `清理：helper 被回收后孙进程的 /proc 条目必须消失（实测 State=${JSON.stringify(zout.zombieStateAfter)}）` +
+      '——留在 Z 说明这台机器无进程回收僵尸，会污染后续套件')
+    console.log(`✅ SIGNAL_PROBE 判活口径：真僵尸（pid ${zout.zombiePid}, State=Z）判死、停住的 helper` +
+      `（pid ${zout.helperPid}, State=T）仍判活；helper 已 SIGKILL+wait，僵尸已回收`)
+  } finally {
+    // 兜底：harness 若被 60s 兜底杀掉，SIGSTOP 的 helper 就成了孤儿 ⇒ 按它自报的 pid 补一刀。
+    // 只杀 cmdline 确实是本夹具 helper 的进程，防 pid 复用误杀。
+    try {
+      const hp = Number(fs.readFileSync(path.join(zombieDir, 'helper.pid'), 'utf8').trim())
+      if (hp > 0 && fs.readFileSync('/proc/' + hp + '/cmdline', 'utf8').includes('zombie_helper.js')) {
+        try { process.kill(hp, 'SIGCONT') } catch (e) { /* 已退出 */ }
+        try { process.kill(hp, 'SIGKILL') } catch (e) { /* 已退出 */ }
+      }
+    } catch (e) { /* 无 pid 文件（helper 未起跑）或已被回收 */ }
+    fs.rmSync(zombieDir, { recursive: true, force: true })
+  }
+  // 全部真实断言与通过日志都过了才置位：任何一条先红都会在分支内抛出，ran 保持 false，下面的
+  //     分支外校验据此变红——把 ran 提到分支开头就等于把它变成常量，校验再也证伪不了守卫。
+  zombieFixtureState.ran = true
+}
+
+assert.strictEqual(zombieFixtureState.ran, zombieFixtureSupported(),
+  '在支持的平台（Linux + /proc/self/stat）上 3g5b 必须真跑过；不支持时不得真跑——守卫不得把 Linux 一起跳过')
+assert.strictEqual(zombieFixtureState.skipped, !zombieFixtureSupported(),
+  'skipped 必须与平台判据互补：支持平台上不得置位（置位说明守卫把 Linux 一起跳过了），' +
+  '不支持时必须在跳过分支置位（否则守卫写窄、非 Linux 上会硬跑僵尸夹具）')
 
 // 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
 //    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
