@@ -3200,7 +3200,9 @@ checkAsync('ALERT-3 告警状态向后兼容：顶层 lastAt=最近一次（旧�
   assert.strictEqual(last.lastAt, now + 300000, '顶层 lastAt 必须是最近一次告警时间（status/旧版本读取口径不变）')
   assert.deepStrictEqual(last.classes, { truncate: now, 'push-fail': now + 300000 },
     'classes 必须逐类记录最后发送时间（异类分流的数据基础）')
-  assert.deepStrictEqual(Object.keys(last).sort(), ['classes', 'lastAt'], '状态字段只增不改（不得丢 lastAt）')
+  // 显式码元序比较器：默认 sort() 也是 UTF-16 码元序，但依赖隐式行为在跨 locale/实现时不可确定
+  // （且读代码的人得自己推断），localeCompare 反过来会随 ICU/locale 变序 ⇒ 这里写死码元序。
+  assert.deepStrictEqual(Object.keys(last).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), ['classes', 'lastAt'], '状态字段只增不改（不得丢 lastAt）')
 })
 
 checkAsync('ALERT-4 同一轮「截断 + 推送全部失败」两类告警都必须送达（调用点必须各带类别）', async () => {
