@@ -2162,6 +2162,31 @@ check('通道健康锁: 释放时拒绝 close stdio fd（0/1/2）', () => {
   assert.deepStrictEqual(closed, [], `不得关闭 stdio fd，实际关闭：${closed.join(',')}`)
 })
 
+// N2 回归：>2 守卫只管 close，不能把 unlink 一起跳过——fd 落在 stdio 区时锁文件仍必须删除。
+// 旧实现把 close 与 unlink 放在同一个 `lockFd > 2` 分支里，0/1/2 时锁文件残留，后续轮次
+// 一直被陈旧锁挡在门外（要等 mtime 超龄 + 存活复核才回收，健康状态整段漏更新）。
+check('通道健康锁: 释放时 fd 落在 stdio（0/1/2）仍清理锁文件，不得漏 unlink', () => {
+  for (const fd of [0, 1, 2]) {
+    const closed = []
+    const unlinked = []
+    const app = makeHealthApp({
+      fs: {
+        closeSync: (x) => closed.push(x),
+        unlinkSync: (p) => unlinked.push(p)
+      }
+    })
+    app._releaseChannelHealthLock(healthPath + '.lock', fd)
+    assert.deepStrictEqual(closed, [], `fd=${fd}: 不得关闭 stdio`)
+    assert.deepStrictEqual(unlinked, [healthPath + '.lock'], `fd=${fd}: 锁文件必须删除，否则后续轮次一直被挡`)
+  }
+  // 未取到锁（null / -1）时不得删别人的锁文件
+  const unlinked = []
+  const app = makeHealthApp({ fs: { closeSync: () => {}, unlinkSync: (p) => unlinked.push(p) } })
+  app._releaseChannelHealthLock(healthPath + '.lock', null)
+  app._releaseChannelHealthLock(healthPath + '.lock', -1)
+  assert.deepStrictEqual(unlinked, [], '未取到锁（null/-1）不得 unlink 他人的锁文件')
+})
+
 check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })

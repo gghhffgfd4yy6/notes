@@ -806,10 +806,13 @@ function createApp ({
       // 锁 fd 只可能是 openSync 返回的 >=3；0/1/2 是 stdio。哨兵被误改成 +1 时
       // 旧判据会 close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError（app 变异守卫红）。
       // 这里拒绝 stdio fd：宁可漏关一个不该出现的锁 fd，也不能关闭进程输出。
-      if (typeof lockFd === 'number' && lockFd > 2) {
+      // 但 close 与 unlink 是两件事：unlink 必须在「本轮确实取到了锁」时执行（fd 落在
+      // stdio 区也一样），否则锁文件残留、后续轮次一直被陈旧锁挡住；只有 null/-1 才整段跳过。
+      if (typeof lockFd !== 'number' || lockFd < 0) return
+      if (lockFd > 2) {
         try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
-        try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
       }
+      try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
     },
 
     /** FX3：生成一次恢复告警发送尝试的唯一认领令牌（pid+时刻+序号+随机，跨进程/跨轮次不撞）。
