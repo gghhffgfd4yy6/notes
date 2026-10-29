@@ -36,6 +36,15 @@ function isSkippedDir (name) {
   return SKIP_PREFIXES.some((p) => name.startsWith(p))
 }
 
+// 显式码元序比较器（Sonar S2879）：默认 `sort()` 对字符串的比较口径正是 UTF-16 码元字典序，
+// 写出来是为了让「为什么是这个顺序」可见，并把口径钉在**与宿主无关**的那一维上（不用 locale）。
+// **不得**换成 localeCompare：它按宿主语言环境做大小写/重音不敏感的排序，'Linked.md' 与 'a.md'
+// 的相对位置会与码元序相反 ⇒ 扫描面顺序随机器 locale 漂移。`--selftest` 里有靶向断言钉这一点。
+function byCodeUnit (a, b) {
+  if (a === b) return 0
+  return a < b ? -1 : 1
+}
+
 // 收集扫描面：返回排序后的相对路径（POSIX 分隔）。确定性排序是断言可复现的前提。
 // fail-closed：非跳过目录读不下去 ⇒ **抛出**而非静默 omit——扫描面不完整时 main 必须判红，
 // 否则「少扫了一个目录」与「全绿」在输出里长得一样（与 v3.280「新增钩子/workflow 不得假定没被
@@ -65,9 +74,8 @@ function findMarkdownFiles (rootDir, opts) {
     }
   }
   walk(rootDir, '')
-  // 显式比较器：默认 sort 会把元素 toString 后按 UTF-16 码元字典序排（此处正是想要的稳定顺序），
-  // 但把口径写出来才能让「为什么是这个顺序」可见（Sonar S2879）。
-  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  // 显式比较器（Sonar S2879）：口径是 UTF-16 码元字典序，见 byCodeUnit 的注释与 --selftest 的靶向断言。
+  return out.sort(byCodeUnit)
 }
 
 // 换行符不是正文：统一剥掉 CRLF 的行尾 `\r`，保留 String.length 的 UTF-16 码元口径。
@@ -185,7 +193,17 @@ function selftest () {
     })
     assert.ok(withLink.includes('linked.md'),
       '符号链接的 .md 不得掉出扫描面（旧实现按 isFile() 判定 ⇒ 链接被静默略过）')
-    assert.deepStrictEqual([...withLink].sort(), withLink, '含符号链接时扫描面仍必须确定性排序')
+    assert.deepStrictEqual([...withLink].sort(byCodeUnit), withLink, '含符号链接时扫描面仍必须确定性排序')
+    // 比较器口径必须是**码元序**：注入大小写混排的链接名，'Linked.md'（'L' = 0x4C）必须排在
+    // 'a.md'（'a' = 0x61）之前。localeCompare 按语言环境做大小写不敏感比较，会把这个顺序反过来
+    // ⇒ 换成 localeCompare 时这条必红（本仓不许扫描面顺序随宿主 locale 漂移）。
+    assert.deepStrictEqual(findMarkdownFiles(tmp, {
+      readdir: (d) => {
+        const entries = fs.readdirSync(d, { withFileTypes: true })
+        return d === tmp ? [...entries, linkDirent('Linked.md')] : entries
+      }
+    }), ['Linked.md', 'a.md', 'docs/b.md'],
+    '扫描面必须按 UTF-16 码元序（localeCompare 会把 a.md 排到 Linked.md 之前）')
     // —— 超长文件不得靠 spread 求最长行（150k 行会让 Math.max(...args) 当场 RangeError）
     const hugeRel = 'huge.md'
     fs.writeFileSync(path.join(tmp, hugeRel), Array.from({ length: 200000 }, () => 'x').join('\n'))
@@ -199,7 +217,7 @@ function selftest () {
   const real = findMarkdownFiles(path.join(__dirname, '..'))
   assert.ok(real.length >= 7, '本仓至少应有 7 个 md 在册，实得 ' + real.length)
   assert.ok(real.includes('README.md') && real.includes('AGENTS.md') && real.includes('.github/pull_request_template.md'))
-  console.log('✅ check-doc-lines --selftest 全部通过（30 断言）')
+  console.log('✅ check-doc-lines --selftest 全部通过（31 断言）')
 }
 
 // C5-058：main 接受 (argv, opts)，以便被套件直接断言——argv 默认取 process.argv.slice(2)，
