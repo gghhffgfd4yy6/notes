@@ -58,17 +58,24 @@ const DNS_PENDING_TIMEOUT_MS = positiveIntEnv('XBK_DNS_PENDING_TIMEOUT_MS', DNS_
 // PR #362 评审（CodeRabbit Major · Stability & Availability）：deadline 只给**等待项**一个终点，不回收
 // 底层查询——`dns.lookup` 无法取消，等待项超时后那条 getaddrinfo 仍占着 libuv 线程池里的一个线程；
 // 同 key 每轮重试都会另起一条（实测：8 轮重试 = 8 条在飞），坏解析器下无界累积，可占满线程池并拖慢
-// 同池的文件操作。故对「已交给底层、回调还没到」的查询记账并设两道上限：
+// 同池的文件操作。故对「已交给底层、回调还没到」的查询记账并设两道上限 + 一道最大存活时间：
 //   · 同 key ≤ DNS_INFLIGHT_MAX_PER_KEY（当前 2）：正常慢解析（第一条在飞时超时、重试接班第二条）够用；
 //     第三条起立即失败，不再新建任务。
 //   · 全局 ≤ DNS_INFLIGHT_MAX（默认 32，XBK_DNS_MAX_INFLIGHT 可注入）：兜住多主机同时打洞的进程级占用。
+//   · 单条最长存活 DNS_INFLIGHT_MAX_AGE_MS（默认 60s，XBK_DNS_MAX_INFLIGHT_AGE_MS 可注入）：上限必须
+//     有退役路径，否则「坏解析器永不回调」会把名额永久占住——同 key 两条填满后，这个主机连解析器恢复
+//     也永远拿到 EAI_AGAIN（直到进程重启），等于把「无界泄漏」换成「单主机 DNS 永久瘫痪」。
+//     过龄条目在过闸时逐条退役、当场归还名额；退役只动记账，不动那条底层查询的回调语义。
 // 超限一律以 EAI_AGAIN 立即失败（与等待队列上限同码、可重试，且不静默丢回调）。
 // 为什么不走「超时后继续复用那条在飞查询」：仓内契约要求超时后重试必须重新发起解析
 // （test_dns_cache.js「超时摘除后重试必须重新发起底层 lookup」），且坏解析器若永不回调，复用等于让
-// 该 key 永久卡死。上限只压**并发在飞条数**，不改变「超时 ⇒ 本次失败、下次可重试」的语义。
+// 该 key 永久卡死。上限与存活时间只压**并发在飞条数**，不改变「超时 ⇒ 本次失败、下次可重试」的语义。
 const DNS_INFLIGHT_MAX_DEFAULT = 32
 const DNS_INFLIGHT_MAX_PER_KEY = 2
 const DNS_INFLIGHT_MAX = positiveIntEnv('XBK_DNS_MAX_INFLIGHT', DNS_INFLIGHT_MAX_DEFAULT)
+const DNS_INFLIGHT_MAX_AGE_MS = positiveIntEnv('XBK_DNS_MAX_INFLIGHT_AGE_MS', 60000)
+// key → 在飞条目数组（key 为 null 表示该调用不进缓存，借同一个 Map 只计全局数，否则它没有退役路径）。
+// 每条带 startedAt 供逐条退役；条目对象本身就是回调的身份凭据（见 endInflightLookup）。
 const dnsInflight = new Map()
 let dnsInflightTotal = 0
 
@@ -81,42 +88,73 @@ function dnsPendingError (code, message) {
 }
 
 // 在飞记账只覆盖真正交给解析器的调用；回调**第一件事**就释放（身份检查之前——线程已还回池子，
-// 与这条 lookup 的结果还要不要无关）。key 为 null 表示该调用不进缓存（选项未建模），只计全局数。
+// 与这条 lookup 的结果还要不要无关）。key 为 null 表示该调用不进缓存，只计全局数。
 function inflightLookupsFor (key) {
-  return dnsInflight.get(key) || 0
+  const entries = dnsInflight.get(key)
+  return entries ? entries.length : 0
 }
 
 function beginInflightLookup (key) {
+  const entry = { key, startedAt: Date.now(), retired: false }
+  const entries = dnsInflight.get(key)
+  if (entries) entries.push(entry)
+  else dnsInflight.set(key, [entry])
   dnsInflightTotal += 1
-  if (key !== null) dnsInflight.set(key, inflightLookupsFor(key) + 1)
+  return entry
 }
 
-function endInflightLookup (key) {
+// 释放名额。身份校验：条目一旦按龄退役（名额当时已归还），它自己晚到的回调只能清自己的账、不得再减
+// 一次——否则会把全局计数减成负数（上限失效），或把后来那条同名 key 的新条目名额一起吃掉。
+function endInflightLookup (entry) {
+  if (entry.retired) return
+  entry.retired = true
   dnsInflightTotal -= 1
-  if (key === null) return
-  const left = inflightLookupsFor(key) - 1
-  if (left > 0) dnsInflight.set(key, left)
-  else dnsInflight.delete(key)
+  const entries = dnsInflight.get(entry.key)
+  if (!entries) return
+  const left = entries.filter(other => other !== entry)
+  if (left.length > 0) dnsInflight.set(entry.key, left)
+  else dnsInflight.delete(entry.key)
+}
+
+// 按龄逐条退役：只归还名额，不碰底层查询本身（取消不了），也不碰它的回调派发语义——结果还要不要由
+// dnsLookup 里既有的 pending record 身份检查决定。
+function retireAgedInflight (now) {
+  for (const [key, entries] of [...dnsInflight]) {
+    const alive = []
+    for (const entry of entries) {
+      if (now - entry.startedAt < DNS_INFLIGHT_MAX_AGE_MS) {
+        alive.push(entry)
+        continue
+      }
+      entry.retired = true
+      dnsInflightTotal -= 1
+    }
+    if (alive.length > 0) dnsInflight.set(key, alive)
+    else dnsInflight.delete(key)
+  }
 }
 
 // 发起一条底层查询并记账。同步抛错（非法参数等）时必须当场释放——否则这条永远收不到回调的记账
 // 会白占一个名额，攒满全局上限后整个进程的解析都会被判成超限。
 function startInflightLookup (key, hostname, opts, onDone) {
-  beginInflightLookup(key)
+  const entry = beginInflightLookup(key)
   try {
     dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
-      endInflightLookup(key)
+      endInflightLookup(entry)
       onDone(error, address, family)
     })
   } catch (e) {
-    endInflightLookup(key)
+    endInflightLookup(entry)
     throw e
   }
 }
 
 // 超限错误：立即失败，绝不新建 getaddrinfo 任务。检查点放在「建等待项之前」——超限的调用方既不占
 // 等待队列，也不会留下一条永远等不到回调的记账。
+// 先按龄退役再判上限：同 key 超过最大存活时间后必须允许另起一条底层 lookup，否则坏解析器下这个主机
+// 永久 EAI_AGAIN（名额被永不回调的老查询占死）。
 function inflightLimitError (key) {
+  retireAgedInflight(Date.now())
   if (dnsInflightTotal >= DNS_INFLIGHT_MAX) {
     return dnsPendingError('EAI_AGAIN',
       `DNS 在飞查询已达全局上限（在飞 ${dnsInflightTotal} 条 ≥ ${DNS_INFLIGHT_MAX}），本次调用按失败返回，可重试`)
@@ -481,4 +519,4 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   }
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY }
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS }

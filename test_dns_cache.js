@@ -9,6 +9,16 @@ process.env.XBK_DNS_MAX_INFLIGHT = '6'
 const assert = require('assert')
 const dns = require('dns')
 const originalLookup = dns.lookup
+// 等待项 timer 一律 unref（坏解析器不得把进程钉住），所以「某个回调永远不来」会让事件循环空掉、Node
+// **静默退出 0**——回归会被当成通过。用退出钩子把「没跑完」判成失败（本轮返工实测：去掉在飞条目的
+// 身份校验后，晚到回调把全局计数减成负数，第 7 个 key 也被放行，`await` 永远不落定 ⇒ 旧写法静默退出 0）。
+let suiteDone = false
+process.on('exit', (code) => {
+  if (code === 0 && !suiteDone) {
+    console.error('❌ test_dns_cache 没跑完就退出了：有回调始终没到（或在飞记账让调用被永久吞掉）')
+    process.exitCode = 1
+  }
+})
 let calls = 0
 dns.lookup = (hostname, options, callback) => {
   calls += 1
@@ -18,7 +28,7 @@ dns.lookup = (hostname, options, callback) => {
 (async () => {
   try {
     delete require.cache[require.resolve('./xbk_agents')]
-    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY } = require('./xbk_agents')
+    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS } = require('./xbk_agents')
     await prewarmDns('cache-probe.invalid')
     await prewarmDns('cache-probe.invalid')
     assert.strictEqual(calls, 1, 'TTL 内应命中 DNS 缓存')
@@ -222,6 +232,113 @@ dns.lookup = (hostname, options, callback) => {
     const afterThrow = await new Promise(resolve => dnsLookup('inflight-throw-ok.invalid', { all: true }, (error) => resolve(error ? error.code : 'none')))
     assert.strictEqual(afterThrow, 'none', `同步抛错不得泄漏在飞名额（${DNS_INFLIGHT_MAX * 2} 次抛错后仍须能正常解析）`)
     console.log(`✅ PR #362 同步抛错不泄漏在飞名额：${thrownSync} 次抛错后仍能正常解析`)
+    // ── 本轮返工（d5a1e0a 被波级闸门拒绝的根因）：在飞记账必须带最大存活时间 + 回调身份校验 ──────────
+    // d5a1e0a 只有「底层回调到达」一条释放路径：同 key 两条 lookup 若永不回调，该 key 之后每次调用都
+    // 立刻 EAI_AGAIN，解析器恢复也不解除（直到进程重启）——把「无界泄漏」换成了「单主机 DNS 永久瘫痪」。
+    // 等待项 timer 一律 unref（坏解析器不得把进程钉住），故每次等 deadline 都用 ref 的 setTimeout 托住循环。
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+    // a) 默认存活时间（60s）下老语义不变：坏解析器 ⇒ 前 2 次 ETIMEDOUT ⇒ 第 3 次 EAI_AGAIN。
+    const capStuck = []
+    dns.lookup = (hostname, options, callback) => { capStuck.push(callback) } // 坏解析器：永不回调
+    const capCodes = []
+    const capCall = () => new Promise(resolve => dnsLookup('inflight-age-cap.invalid', { all: true }, (error) => {
+      capCodes.push(error ? error.code : 'none')
+      resolve()
+    }))
+    const capFirst = capCall()
+    await sleep(DNS_PENDING_TIMEOUT_MS + 40)
+    await capFirst
+    const capSecond = capCall()
+    await sleep(DNS_PENDING_TIMEOUT_MS + 40)
+    await capSecond
+    assert.strictEqual(capStuck.length, DNS_INFLIGHT_MAX_PER_KEY,
+      `坏解析器下前 ${DNS_INFLIGHT_MAX_PER_KEY} 次重试应各占 1 条在飞 lookup，实际 ${capStuck.length}`)
+    await capCall() // 第三次：两条在飞都还年轻（默认存活时间 60s）⇒ 必须立即 EAI_AGAIN
+    assert.deepStrictEqual(capCodes, ['ETIMEDOUT', 'ETIMEDOUT', 'EAI_AGAIN'],
+      `同 key 上限仍须成立：前 ${DNS_INFLIGHT_MAX_PER_KEY} 次按 deadline 超时（ETIMEDOUT）、第 ${DNS_INFLIGHT_MAX_PER_KEY + 1} 次立即 EAI_AGAIN，实际 ${capCodes.join(',')}`)
+    assert.strictEqual(capStuck.length, DNS_INFLIGHT_MAX_PER_KEY,
+      `超限调用不得新建底层 lookup，实际 ${capStuck.length}`)
+    for (const cb of capStuck) cb(null, '192.0.2.1', 4) // 释放，清零在飞记账（record 已被 sweep 摘除 ⇒ 不写缓存）
+    console.log(`✅ PR #362 在飞上限语义不变：坏解析器下前 ${DNS_INFLIGHT_MAX_PER_KEY} 次 ETIMEDOUT、第 ${DNS_INFLIGHT_MAX_PER_KEY + 1} 次 EAI_AGAIN，未新建底层 lookup`)
+    // b) 注入 XBK_DNS_MAX_INFLIGHT_AGE_MS=80：同 key 那 2 条在飞都过龄后必须退役并放行新的一条。
+    //    该 env 只在 require 时读取，故另起一个模块实例（同时拿到一份全新记账，全局上限仍是文件头注入的 6）。
+    process.env.XBK_DNS_MAX_INFLIGHT_AGE_MS = '80'
+    delete require.cache[require.resolve('./xbk_agents')]
+    const aged = require('./xbk_agents')
+    const ageHost = 'inflight-age.invalid'
+    const ageStuck = []
+    dns.lookup = (hostname, options, callback) => { ageStuck.push(callback) } // 坏解析器：永不回调
+    const ageCodes = []
+    const ageCall = (host = ageHost) => new Promise(resolve => aged.dnsLookup(host, { all: true }, (error, address) => {
+      ageCodes.push(error ? error.code : 'none')
+      resolve({ error, address })
+    }))
+    const ageFirst = ageCall()
+    await sleep(aged.DNS_PENDING_TIMEOUT_MS + 40)
+    await ageFirst
+    const ageSecond = ageCall()
+    await sleep(aged.DNS_PENDING_TIMEOUT_MS + 40)
+    await ageSecond
+    assert.strictEqual(ageStuck.length, aged.DNS_INFLIGHT_MAX_PER_KEY,
+      `坏解析器下前 ${aged.DNS_INFLIGHT_MAX_PER_KEY} 次重试应各占 1 条在飞 lookup，实际 ${ageStuck.length}`)
+    const ageThird = ageCall() // 第三次：两条在飞都超过 80ms ⇒ 过龄退役后必须另起一条
+    await sleep(aged.DNS_PENDING_TIMEOUT_MS + 40)
+    await ageThird
+    assert.strictEqual(ageStuck.length, aged.DNS_INFLIGHT_MAX_PER_KEY + 1,
+      `同 key 在飞超过最大存活时间（${aged.DNS_INFLIGHT_MAX_AGE_MS}ms）后必须退役老条目并另起一条底层 lookup（d5a1e0a 上此处拿到 EAI_AGAIN 且仍是 ${aged.DNS_INFLIGHT_MAX_PER_KEY} 条），实际 ${ageStuck.length} 条、本轮结果 ${ageCodes.join(',')}`)
+    assert.deepStrictEqual(ageCodes, ['ETIMEDOUT', 'ETIMEDOUT', 'ETIMEDOUT'],
+      `过龄退役只放行新查询、不改回调语义：三次都应各自按 deadline 收场为 ETIMEDOUT，实际 ${ageCodes.join(',')}`)
+    assert.strictEqual(aged.DNS_INFLIGHT_MAX_AGE_MS, 80,
+      `环境变量应把在飞最大存活时间压到 80ms（测试注入生效的前提），实际 ${aged.DNS_INFLIGHT_MAX_AGE_MS}`)
+    // 解析器恢复：过龄退役让名额回来，同 key 能重新解析，结果照常写回缓存
+    let ageRecoveredCalls = 0
+    dns.lookup = (hostname, options, callback) => {
+      ageRecoveredCalls += 1
+      callback(null, [{ address: '192.0.2.77', family: 4 }], 4)
+    }
+    const agedOk = await ageCall()
+    assert.strictEqual(agedOk.error, null, `过龄退役后同 key 必须能重新解析（不得永久卡死），实际 ${agedOk.error && agedOk.error.code}`)
+    assert.deepStrictEqual(agedOk.address, [{ address: '192.0.2.77', family: 4 }], 'all:true 的地址形状不得丢')
+    assert.strictEqual(ageRecoveredCalls, 1, '恢复后的解析必须真正发起，且只发起一次')
+    await ageCall() // 同 key 再问一次：应命中刚写回的缓存
+    assert.strictEqual(ageRecoveredCalls, 1, '恢复后的解析结果应写回缓存并被下一次请求命中')
+    // c) 被退役的老条目回调晚到（解析器已恢复、新结果已写缓存）：身份校验必须让它只清自己的账——
+    //    若再减一次，全局在飞数会变成负数，后面就能多放 2 个主机进 libuv 线程池。
+    ageStuck[0](null, '192.0.2.2', 4)
+    ageStuck[1](null, '192.0.2.3', 4)
+    const agedAfterLate = await ageCall()
+    assert.strictEqual(agedAfterLate.error, null)
+    assert.deepStrictEqual(agedAfterLate.address, [{ address: '192.0.2.77', family: 4 }],
+      '晚到的旧回调不得写缓存：同 key 仍应命中恢复后的结果')
+    assert.strictEqual(ageRecoveredCalls, 1, '晚到的旧回调不得触发新的底层 lookup')
+    const lateStuck = []
+    dns.lookup = (hostname, options, callback) => { lateStuck.push(callback) } // 坏解析器
+    const lateHeld = []
+    for (let i = 0; i < aged.DNS_INFLIGHT_MAX; i++) {
+      lateHeld.push(new Promise(resolve => aged.dnsLookup(`inflight-age-global-${i}.invalid`, { all: true }, (error) => resolve(error ? error.code : 'none'))))
+    }
+    const lateBlocked = { code: 'no-answer' }
+    aged.dnsLookup('inflight-age-global-over.invalid', { all: true }, (error) => { lateBlocked.code = error ? error.code : 'none' })
+    // 先同步判「有没有多放」：超限调用一旦被放行就会立刻多一条底层 lookup（不必等回调，避免 Unsettled await
+    // 让进程静默退出 0 而把回归当成通过）。
+    assert.strictEqual(lateStuck.length, aged.DNS_INFLIGHT_MAX,
+      `晚到回调不得把全局在飞数减成负数：应恰好放行 ${aged.DNS_INFLIGHT_MAX} 个新 key（多放 ⇒ 记账被二次扣减），实际 ${lateStuck.length}`)
+    await sleep(aged.DNS_PENDING_TIMEOUT_MS + 40) // 让 EAI_AGAIN 的 queueMicrotask 落定，并等 6 条在飞过 deadline
+    assert.strictEqual(lateBlocked.code, 'EAI_AGAIN', `全局在飞上限仍须立即 EAI_AGAIN、不新建底层 lookup，实际 ${lateBlocked.code}`)
+    const lateCodes = await Promise.all(lateHeld)
+    assert.ok(lateCodes.every(code => code === 'ETIMEDOUT'),
+      `上限内那 ${aged.DNS_INFLIGHT_MAX} 个 key 仍按 deadline 收场为 ETIMEDOUT，实际 ${lateCodes.join(',')}`)
+    for (const cb of lateStuck) cb(null, '192.0.2.1', 4) // 释放，清零在飞记账
+    dns.lookup = (hostname, options, callback) => { callback(null, [{ address: '192.0.2.78', family: 4 }], 4) }
+    const agedFresh = await ageCall('inflight-age-fresh.invalid')
+    assert.strictEqual(agedFresh.error, null, '记账清理后仍能正常解析新主机')
+    assert.deepStrictEqual(agedFresh.address, [{ address: '192.0.2.78', family: 4 }], 'all:true 的地址形状不得丢')
+    console.log(`✅ PR #362 在飞条目最大存活时间：过龄退役后同 key 可重新解析并写缓存；晚到回调不破坏记账（${aged.DNS_INFLIGHT_MAX} 个新 key 恰好放行）`)
+    // 生产默认（不注入）：存活时间必须是远大于等待超时的有限正整数，否则同 key 上限在超时前就被退役架空
+    // （太小）或永远等不到退役（非整数/0）。
+    assert.ok(Number.isInteger(DNS_INFLIGHT_MAX_AGE_MS) && DNS_INFLIGHT_MAX_AGE_MS > DNS_PENDING_TIMEOUT_MS,
+      `未注入时在飞最大存活时间应为远大于等待超时的有限正整数（默认 60s），实际 ${DNS_INFLIGHT_MAX_AGE_MS}`)
+    suiteDone = true
   } finally {
     dns.lookup = originalLookup
   }
