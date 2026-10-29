@@ -11,13 +11,22 @@ const { spawn } = require('child_process')
 // v3.283 主机干净度前置检查：孤儿测试桩 / 被 reparent 到 1 的孤儿套件 / 过期 /tmp/xbk-* 沙箱会把墙钟
 // 基准拖红（实测 300ms 跑出 878ms），脏机器不启动。缺脚本时**响亮跳过**——最小工作树（如
 // test_ci_skip_suites.js 的 RT-08 夹具只复制 run_tests.js）不得因此崩；其它异常照常抛出，不吞。
+// C10-028：容错只覆盖「**本模块自身**不存在」。旧实现直接 require 并只判 e.code === 'MODULE_NOT_FOUND'，
+// 于是 scripts/check-host-clean.js 存在、但它内部的某个依赖缺失（树损坏 / 将来给它加相对依赖）也被读成
+// 「未找到 scripts/check-host-clean.js，跳过」→ 主机干净度门禁被静默关掉。现在先用 require.resolve
+// 预判本模块能否解析：解析不到才算最小工作树（响亮跳过）；解析成功后的 require 异常（含其内部
+// MODULE_NOT_FOUND）一律照常抛出，绝不再伪装成「脚本不存在」。
+const HOST_CLEAN_MODULE = './scripts/check-host-clean.js'
 let hostClean = null
+let hostCleanMissing = false
 try {
-  hostClean = require('./scripts/check-host-clean.js')
+  require.resolve(HOST_CLEAN_MODULE)
 } catch (e) {
   if (e.code !== 'MODULE_NOT_FOUND') throw e
+  hostCleanMissing = true
   console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
 }
+if (!hostCleanMissing) hostClean = require(HOST_CLEAN_MODULE)
 if (hostClean && hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 const path = require('path')
 const { checkDependencies } = require('./scripts/check-deps')
