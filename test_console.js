@@ -11066,4 +11066,13 @@ async function runSuite (mainPromise) {
   return finishSuite()
 }
 
-runSuite(main())
+// 收尾自身抛出（finishSuite 里的清点 / 强退闸）也必须让进程非 0：这就是 Sonar S9383 指的
+// dangling promise。不接的话拒约只落到 unhandledRejection 上，而它的默认行为随 node 版本与
+// `--unhandled-rejections` 取值而变（warn 档退出码仍是 0）⇒ CI 上会退化成「跑完了但没判据」。
+runSuite(main()).catch((e) => {
+  process.exitCode = 1
+  // 与 runSuite 内部同口径留痕：收尾都炸了，汇总行打不出来，失败清单是唯一线索。
+  failed++
+  failedNames.push('套件收尾异常（finishSuite 抛出，未打出汇总）')
+  console.error('套件收尾异常:', failureText(e))
+})
