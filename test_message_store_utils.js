@@ -129,80 +129,8 @@ function runChildProbe (body) {
 
 console.log('=== xbk_message_store.js 纯函数方法测试 ===')
 
-// ===== getFilePath =====
-check('getFilePath: 正常文件名返回缓存目录下路径', () => {
-  const r = store.getFilePath('test.json')
-  assert.ok(r.endsWith(path.sep + 'test.json'), '应返回缓存目录下的 test.json')
-})
-
-check('getFilePath: 路径穿越被阻止（只取 basename）', () => {
-  const r = store.getFilePath('../../etc/passwd')
-  assert.ok(!r.includes('..'), '路径穿越应被阻止')
-  assert.ok(r.endsWith(path.sep + 'passwd'), '应只取 basename')
-})
-
-check('getFilePath: 绝对路径被阻止（只取 basename）', () => {
-  const r = store.getFilePath('/etc/passwd')
-  assert.ok(r.endsWith(path.sep + 'passwd'), '绝对路径应只取 basename')
-})
-
-check('getFilePath: 非法文件名字符被清洗', () => {
-  const r = store.getFilePath('a:b*c?d"e<f>g|h.json')
-  assert.ok(!/[:*?"<>|]/.test(path.basename(r)), '非法字符应被清洗')
-})
-
-check('getFilePath: NUL 字符被清洗', () => {
-  const r = store.getFilePath('test\u0000.json')
-  assert.ok(!r.includes('\u0000'), 'NUL 字符应被清洗')
-})
-
-check('getFilePath: 空文件名回退 default.json', () => {
-  const r = store.getFilePath('')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '空文件名应回退 default.json')
-})
-
-check('getFilePath: undefined 回退 default.json', () => {
-  const r = store.getFilePath(undefined)
-  assert.ok(r.endsWith(path.sep + 'default.json'), 'undefined 应回退 default.json')
-})
-
-check('getFilePath: null 回退 default.json', () => {
-  const r = store.getFilePath(null)
-  assert.ok(r.endsWith(path.sep + 'default.json'), 'null 应回退 default.json')
-})
-
-check('getFilePath: [object Object] 回退 default.json', () => {
-  const r = store.getFilePath('[object Object]')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '[object Object] 应回退 default.json')
-})
-
-check('getFilePath: . 回退 default.json', () => {
-  const r = store.getFilePath('.')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '. 应回退 default.json')
-})
-
-check('getFilePath: .. 回退 default.json', () => {
-  const r = store.getFilePath('..')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '.. 应回退 default.json')
-})
-
-check('getFilePath: 超长文件名截断到 200 字节', () => {
-  const longName = 'a'.repeat(300) + '.json'
-  const r = store.getFilePath(longName)
-  const basename = path.basename(r)
-  assert.ok(Buffer.byteLength(basename, 'utf8') <= 200, '文件名应截断到 200 字节以内')
-})
-
-check('getFilePath: 超长文件名保留扩展名', () => {
-  const longName = 'a'.repeat(300) + '.json'
-  const r = store.getFilePath(longName)
-  assert.ok(r.endsWith('.json'), '超长文件名应保留 .json 扩展名')
-})
-
-check('getFilePath: 数字文件名正常处理', () => {
-  const r = store.getFilePath(123)
-  assert.ok(r.endsWith(path.sep + '123'), '数字文件名应 String 化')
-})
+// getFilePath 的专项覆盖已收拢为单一参数表（C5-046：首版 14 条 + 持久化契约 4 条 + PlanP 4 条 + MS-05 1 条），
+// 见下方「===== getFilePath：入参 → 产物 参数表 =====」；MS-05（超长扩展名分支）仍在原处单独成 check。
 
 // ===== getFileName =====
 check('getFileName: 正常 URL 提取文件名', () => {
@@ -1131,48 +1059,118 @@ check('_isTombstoneLockOwner: 只有长度与内容都相同的字符串 token �
   // 空 token 分支不可达（生产 _newTombstoneLockToken 恒返回非空 token），不再断言空串同长同内容。
 })
 
-// ===== getFilePath：截断单射的持久化格式契约 =====
-// 说明：下方 `187 字节前缀 + -anon305.json` **不是内部细节**，而是**持久化格式**——缓存文件名
-// 直接来自 getFilePath，摘要口径一变，既有长 pushUrl 用户的缓存文件即被孤立（判重记录丢失 →
-// 重复推送）。故此字面量与 anonKey/filterHash 的精确值同属「跨版本兼容」契约（非任意快照）。
-check('getFilePath: 超长名截断用足 200 字节、保留最长前缀并附全名摘要（持久化格式兼容）', () => {
-  const r = store.getFilePath('a'.repeat(300) + '.json')
-  const base = path.basename(r)
-  assert.strictEqual(base, 'a'.repeat(187) + '-anon305.json', '截断产物必须逐字节精确（187 字节前缀 + -anon305.json）')
-  assert.strictEqual(Buffer.byteLength(base, 'utf8'), 200, '必须用足 200 字节上限')
-  // 契约本体（单射）：仅第 200 字节之后不同的两条长名不得映射到同一路径，产物一律 <= 200 字节。
-  // 用 longNameStore（**真实** Utils.anonKey）：本文件的 store 用固定 anonKey 桩（故上方字面量为
-  // '-anon305.json'），桩体现不出摘要的单射性，碰撞性质必须由真实摘要验证（与 F7 用例同口径）。
-  const x = longNameStore.getFilePath('a'.repeat(300) + 'x.json')
-  const y = longNameStore.getFilePath('a'.repeat(300) + 'y.json')
-  assert.notStrictEqual(x, y, '仅第 200 字节之后不同的长名不得碰撞（否则判重缓存互相覆盖）')
-  for (const p of [r, x, y]) {
-    assert.ok(Buffer.byteLength(path.basename(p), 'utf8') <= 200, `截断产物必须 <= 200 字节：${path.basename(p)}`)
+// ===== getFilePath：入参 → 产物 参数表（C5-046：四波重复覆盖收拢为单表）=====
+// 背景：同一函数曾被四个波次逐条重复覆盖（首版 14 个 check / 持久化契约 4 个 / PlanP 4 个 / MS-05 1 个），
+// 同一入参的同一期望最多出现三份（'../../etc/passwd'、''/'undefined'/'null' 等回退名、200 字节截断各 2~3 份）。
+// 现收拢为「一行 = 一种独有入参维度 × 期望产物」，由 runGfCases 统一执行；MS-05（超长**扩展名**分支）留在
+// 原处独立成 check——它测的是「扩展名本身超预算 ⇒ 放弃扩展名保摘要」这条不同分支，与通用截断表不重叠。
+// 期望口径：产物 = 缓存目录 + 消毒后的 basename，故每行都断言「逐字 basename」与「整串以该 basename 结尾」；
+// 后者即路径安全不变量（任何 ../ 或绝对路径都逃不出缓存目录），比首版只查 endsWith('/passwd') 更严。
+const GF_ILLEGAL = /[\\/:*?"<>|]/
+const GF_CTRL = /[\u0000-\u001F]/
+const GF_LONE_HIGH = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/
+const GF_LONE_LOW = /(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/
+// 'stub' = 固定 anonKey 桩（store：长名摘要恒为 anon305，用于钉住持久化格式字面量）；
+// 'real' = 真实 anonKey（longNameStore：摘要的单射性只能用真摘要验证，桩会让「不同长名不同路径」变恒真）。
+const GF_STORES = { stub: store, real: longNameStore }
+const GF_REPR = (v) => (typeof v === 'string' ? JSON.stringify(v) : String(v))
+// 无信息文件名（空串 / 纯点串 / 对象与布尔的 String 化产物）：一律回退 default.json。
+const GF_FALLBACK_ARGS = ['', '.', '..', '[object Object]', 'undefined', 'null', 'true', 'false', undefined, null]
+
+const GF_CASES = {
+  base: [
+    { name: '普通文件名', arg: 'test.json', basename: 'test.json' },
+    { name: '短名不得被截断/加摘要（反向对照）', arg: 'ok.json', basename: 'ok.json' },
+    { name: '正常名不得被回退掉', arg: 'normal-name.json', basename: 'normal-name.json' },
+    { name: '数字入参必须 String 化', arg: 123, basename: '123' },
+    { name: '相对路径穿越必须被 basename 消除', arg: '../../etc/passwd', basename: 'passwd', noDotDot: true },
+    { name: '绝对路径必须只取末段', arg: '/etc/passwd', basename: 'passwd' },
+    { name: '多级相对路径只取末段', arg: 'a/b', basename: 'b' }
+  ],
+  sanitize: [
+    // Windows 保留字符 + 多段路径：POSIX 下 '\' 不是分隔符，故末段里的 '\' 也要按保留字符删除。
+    { name: 'Windows 保留字符与多段路径全清', arg: 'a/b\\c:d*e?f"g<h>i|j.json', basename: 'bcdefghij.json', noIllegal: true },
+    { name: '非法字符被删除（精确产物，不是只查"不含"）', arg: 'a:b*c?d"e<f>g|h.json', basename: 'abcdefgh.json', noIllegal: true },
+    { name: 'NUL 被删除（原样进路径会让 fs 抛 ERR_INVALID_ARG_VALUE）', arg: 'test\u0000.json', basename: 'test.json', noCtl: true },
+    { name: 'NUL 夹在名字中间同样被删除', arg: 'bad\u0000name.json', basename: 'badname.json', noCtl: true },
+    { name: 'C0 控制字符同样被删除', arg: 'ctrl\u0001\u001F.json', basename: 'ctrl.json', noCtl: true }
+  ],
+  fallback: GF_FALLBACK_ARGS.map((arg) => ({ name: `无信息名 ${GF_REPR(arg)} 回退 default.json`, arg, basename: 'default.json' })),
+  truncate: [
+    // 字面量不是内部细节：缓存文件名直接来自此处，摘要口径一变，既有长 pushUrl 用户的缓存文件即被孤立
+    // （判重记录丢失 → 重复推送），故与 anonKey/filterHash 的精确值同属「跨版本兼容」契约。
+    // 一行同时覆盖首版的「≤200 字节」与「保留 .json 扩展名」两条弱断言（bytes=200 蕴含 ≤200）。
+    { name: '超长 ASCII 名：逐字 200 字节产物（187 字节前缀 + -anon305.json）', arg: 'a'.repeat(300) + '.json', basename: 'a'.repeat(187) + '-anon305.json', bytes: 200, endsWith: '.json' },
+    // 单射：仅第 200 字节之后不同的两条长名不得映射到同一缓存文件，且单射不得以突破长度上限为代价。
+    { name: '真实摘要：仅第 200 字节之后不同的长名不得碰撞', store: 'real', arg: 'a'.repeat(300) + 'x.json', distinctFrom: 'a'.repeat(300) + 'y.json', maxBytes: 200 }
+  ],
+  multibyte: [
+    { name: '多字节长名（3 字节/字）截断后仍须是合法 UTF-8', arg: '中'.repeat(80) + '.json', maxBytes: 200, utf8: true },
+    { name: '代理对长名（4 字节/个）不得留孤立代理', arg: '😀'.repeat(60) + '.json', maxBytes: 200, surrogate: true },
+    { name: '代理对更长名：末位不得落在半个码点上', arg: '😀'.repeat(80) + '.json', maxBytes: 200, surrogate: true }
+  ],
+  realDigest: [
+    // 真实 anonKey 含 ':'，摘要必须只留 [0-9a-zA-Z._-]（否则又引入路径保留字符），且要用足 200 字节。
+    { name: '真实 anonKey 摘要不得引入路径保留字符或空白', store: 'real', arg: 'u'.repeat(260) + 'aaaa.json', charset: /^[0-9a-zA-Z._-]+$/, bytes: 200 }
+  ],
+  coerce: [
+    { name: '带自定义 toString 的对象必须可 String 化', arg: { toString () { return 'obj-name.json' } }, repr: "{ toString: () => 'obj-name.json' }", basename: 'obj-name.json', noThrow: true },
+    // Symbol：String(Symbol) 本身不抛（会得到 'Symbol(s)'），但若被当数组/模板拼接则抛；此处只钉「不得抛」
+    // 与产物可用（落在缓存目录、无保留字符），不钉具体名字——名字内容是 JS 内建 String 化的细节，不是本函数契约。
+    { name: 'Symbol 必须被兜住且产物可用（不得抛）', arg: Symbol('s'), noThrow: true, noIllegal: true }
+  ]
+}
+
+function runGfCases (cases) {
+  for (const c of cases) {
+    const s = GF_STORES[c.store || 'stub']
+    const label = `${c.name}｜getFilePath(${c.repr || GF_REPR(c.arg)})`
+    let full
+    if (c.noThrow) {
+      let threw = false
+      try { full = s.getFilePath(c.arg) } catch (e) { threw = true }
+      assert.strictEqual(threw, false, `${label}：String 化失败必须被兜住（不得抛）`)
+    } else {
+      full = s.getFilePath(c.arg)
+    }
+    const base = path.basename(full)
+    const bytes = Buffer.byteLength(base, 'utf8')
+    // ① 产物逐字（一行 = 一种入参维度；real 摘要分支不钉摘要字面量，改钉下面 ③ 的性质）
+    if (c.basename !== undefined) {
+      assert.strictEqual(base, c.basename, `${label}：产物必须逐字为 ${c.basename}，实际 ${base}`)
+    }
+    // ② 路径安全不变量：产物 = 缓存目录 + basename
+    assert.ok(full.endsWith(path.sep + base), `${label}：产物必须是「缓存目录 + basename」，实际 ${full}`)
+    if (c.noDotDot) assert.strictEqual(full.includes('..'), false, `${label}：产物不得含 .. 片段`)
+    // ③ 按维度的附加性质
+    if (c.noIllegal) assert.strictEqual(GF_ILLEGAL.test(base), false, `${label}：路径保留字符必须全部清洗`)
+    if (c.noCtl) assert.strictEqual(GF_CTRL.test(base), false, `${label}：C0 控制字符必须清洗`)
+    if (c.bytes !== undefined) assert.strictEqual(bytes, c.bytes, `${label}：产物必须恰好 ${c.bytes} 字节，实际 ${bytes}`)
+    if (c.maxBytes !== undefined) assert.ok(bytes <= c.maxBytes, `${label}：产物不得超 ${c.maxBytes} 字节，实际 ${bytes}`)
+    if (c.endsWith) assert.ok(full.endsWith(c.endsWith), `${label}：产物必须保留 ${c.endsWith} 扩展名，实际 ${base}`)
+    if (c.charset) assert.ok(c.charset.test(base), `${label}：摘要产物只允许 ${c.charset}，实际 ${base}`)
+    if (c.utf8) {
+      assert.strictEqual(base, Buffer.from(base, 'utf8').toString('utf8'), `${label}：截断结果必须是合法 UTF-8`)
+      assert.strictEqual(base.includes('\uFFFD'), false, `${label}：不得出现替换字符（切在多字节中间会留 U+FFFD）`)
+    }
+    if (c.surrogate) {
+      assert.strictEqual(GF_LONE_HIGH.test(base), false, `${label}：不得残留孤立高位代理`)
+      assert.strictEqual(GF_LONE_LOW.test(base), false, `${label}：不得残留孤立低位代理`)
+    }
+    if (c.distinctFrom !== undefined) {
+      assert.notStrictEqual(full, s.getFilePath(c.distinctFrom), `${label}：仅第 ${c.maxBytes} 字节之后不同的长名不得碰撞（否则判重缓存互相覆盖 = 漏推/重推）`)
+    }
   }
-})
+}
 
-check('getFilePath: 多字节长名截断不得切出孤立代理对', () => {
-  const r = store.getFilePath('😀'.repeat(60) + '.json')
-  const base = path.basename(r)
-  assert.ok(Buffer.byteLength(base, 'utf8') <= 200, `截断产物不得超过 200 字节：${Buffer.byteLength(base, 'utf8')}`)
-  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(base), '不得残留孤立高位代理')
-  assert.ok(!/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(base), '不得残留孤立低位代理')
-})
-
-check('getFilePath: 非法字符必须被删除（精确产物），无信息名一律回退 default.json', () => {
-  assert.strictEqual(path.basename(store.getFilePath('a:b*c?d"e<f>g|h.json')), 'abcdefgh.json')
-  assert.strictEqual(path.basename(store.getFilePath('test\u0000.json')), 'test.json', 'NUL 与控制字符必须被清洗')
-  for (const bad of ['undefined', 'null', 'true', 'false', '[object Object]', '.', '..', '']) {
-    assert.strictEqual(path.basename(store.getFilePath(bad)), 'default.json', `${JSON.stringify(bad)} 应回退 default.json`)
-  }
-})
-
-check('getFilePath: 摘要不得引入路径保留字符或空白（真实 anonKey 含 ":"）', () => {
-  const a = 'u'.repeat(260) + 'aaaa.json'
-  const base = path.basename(longNameStore.getFilePath(a))
-  assert.ok(/^[0-9a-zA-Z._-]+$/.test(base), `摘要产物只允许 [0-9a-zA-Z._-]，实际 ${base}`)
-  assert.strictEqual(Buffer.byteLength(base, 'utf8'), 200)
-})
+// 每条 check = 一族维度（表驱动执行）；失败信息里带行名与入参，定位粒度不亚于原来一条 check 一个用例。
+check('getFilePath 参数表：basename 与路径安全（正常名 / 数字 / 穿越 / 绝对路径 / 多段路径）', () => runGfCases(GF_CASES.base))
+check('getFilePath 参数表：非法字符与控制字符必须被删除（精确产物）', () => runGfCases(GF_CASES.sanitize))
+check('getFilePath 参数表：无信息文件名一律回退 default.json', () => runGfCases(GF_CASES.fallback))
+check('getFilePath 参数表：超长名截断（逐字 200 字节产物 + 真实摘要单射）', () => runGfCases(GF_CASES.truncate))
+check('getFilePath 参数表：多字节与代理对截断不得切破码点', () => runGfCases(GF_CASES.multibyte))
+check('getFilePath 参数表：真实 anonKey 摘要只允许安全字符', () => runGfCases(GF_CASES.realDigest))
+check('getFilePath 参数表：String 化必须被兜住（toString 对象 / Symbol）', () => runGfCases(GF_CASES.coerce))
 
 // ===== readMessages：内存命中/恢复窗口/读失败标记 =====
 check('readMessages: 内存命中且磁盘存在时不得写盘，并标记已验证（后续命中不再重查磁盘）', () => {
@@ -2011,67 +2009,15 @@ check('identity 隔离：每个 seed 用例拿到全新实例（_memoCount/_veri
   assert.strictEqual(identityStore._verified.size, 1, '_verified 不得累积')
 })
 
-// ===== 补测 PlanP：getFilePath / _getTombstoneProcessStart（message-store 未直测的方法）=====
-// 反例（改动前）：两者在既有 104 项里只经高层路径间接覆盖，其**消毒/回退/截断**与
-// **/proc 解析**的精确口径从未被直接断言 —— 本段用 createProbeStore 直接调用。
+// ===== 补测 PlanP：_getTombstoneProcessStart（message-store 未直测的方法）=====
+// 反例（改动前）：它在既有 104 项里只经高层路径间接覆盖，**/proc 解析**的精确口径从未被直接断言
+// —— 本段用 createProbeStore 直接调用。（同一段里原有的 getFilePath 补测已并入参数表，见上。）
 {
   const S = createProbeStore()
-  // —— getFilePath：路径安全（只取 basename + 清洗非法字符）——
-  check('PlanP getFilePath: 路径穿越必须被 basename 消除、非法字符被清洗', () => {
-    const p1 = S.getFilePath('../../etc/passwd')
-    // 注意：返回值是**完整缓存路径**（含目录分隔符），安全性体现在「basename 被消毒」上，
-    // 故断言必须落在 basename 而非整串（首版写成「整串不含 /」是错的）。
-    assert.strictEqual(path.basename(p1), 'passwd', '路径穿越必须被 basename 消除为末段')
-    assert.strictEqual(p1.includes('..'), false, '产物不得含 .. 片段')
-    assert.strictEqual(path.basename(S.getFilePath('a/b')), 'b', '多级路径同样只取末段')
-    const p2 = path.basename(S.getFilePath('a/b\\c:d*e?f"g<h>i|j.json'))
-    assert.strictEqual(/[\\/:*?"<>|]/.test(p2), false, '非法字符必须全部清洗（含 Windows 保留字符）——断言落在 basename')
-    const p3 = S.getFilePath('bad\u0000name.json')
-    assert.strictEqual(p3.includes('\u0000'), false, 'NUL 必须清洗（否则 fs 抛 ERR_INVALID_ARG_VALUE）')
-    const p4 = S.getFilePath('ctrl\u0001\u001F.json')
-    assert.strictEqual(/[\u0000-\u001F]/.test(p4), false, 'C0 控制字符同样清洗')
-  })
-
-  check('PlanP getFilePath: 非信息文件名必须回退 default.json', () => {
-    for (const bad of ['', '.', '..', '[object Object]', 'undefined', 'null', 'true', 'false']) {
-      const got = S.getFilePath(bad)
-      assert.strictEqual(got.includes('default.json'), true, `${JSON.stringify(bad)} 必须回退 default.json（曾产生 [object Object] 垃圾文件）`)
-    }
-    const ok = S.getFilePath('normal-name.json')
-    assert.strictEqual(ok.includes('normal-name.json'), true, '正常名不得被回退掉')
-  })
-
-  check('PlanP getFilePath: 带自定义 toString 的对象与非字符串必须可 String 化且不抛', () => {
-    let threw = false
-    try {
-      S.getFilePath({ toString () { return 'obj-name.json' } })
-      S.getFilePath(123)
-      S.getFilePath(Symbol('s'))
-    } catch (e) { threw = true }
-    assert.strictEqual(threw, false, 'String 化失败必须被兜住（Symbol 会抛 TypeError）')
-  })
-
+  // —— getFilePath：四波重复覆盖已收拢为单表（C5-046），见「===== getFilePath：入参 → 产物 参数表 =====」——
+  // 原 PlanP 的 4 条 getFilePath 用例（穿越/清洗、回退 default.json、String 化不抛、200 字节截断）逐条落在
+  // 该表的 base / sanitize / fallback / truncate / multibyte / coerce 六族里，入参与维度均未减少。
   // —— _getTombstoneProcessStart：/proc 解析的边界 ——
-  check('PlanP getFilePath: 超长名必须按 UTF-8 字节截到 200 且不切半代理对', () => {
-    // 驱动 getFilePath 的**字节截断分支**（L427-437）——首版用例只测了短名，故该分支 30 个靶子全存活。
-    const base = (nm) => path.basename(S.getFilePath(nm))
-    // 纯 ASCII 超长：截到 200 字节（含 .json 后缀与摘要段）
-    const ascii = base('x'.repeat(300) + '.json')
-    assert.strictEqual(Buffer.byteLength(ascii, 'utf8'), 200, '超长 ASCII 名必须恰好截到 200 字节')
-    // 多字节（中文 3 字节/字）：仍须 ≤200 且为合法 UTF-8（不得截出半个字符）
-    const cn = base('中'.repeat(80) + '.json')
-    assert.ok(Buffer.byteLength(cn, 'utf8') <= 200, '多字节名不得超 200 字节')
-    assert.strictEqual(cn, Buffer.from(cn, 'utf8').toString('utf8'), '截断结果必须是合法 UTF-8')
-    assert.strictEqual(cn.includes('\uFFFD'), false, '不得出现替换字符（切在多字节中间会留 U+FFFD）')
-    // 代理对（emoji 4 字节/个）：末位不得是孤立高代理 ⇒ 字节数会退到 198
-    const em = base('😀'.repeat(80) + '.json')
-    const last = em.charCodeAt(em.length - 1)
-    assert.strictEqual(last >= 0xd800 && last <= 0xdbff, false, '末位不得是孤立高代理（必须回退一格丢弃半个码点）')
-    assert.ok(Buffer.byteLength(em, 'utf8') <= 200, '代理对场景同样不得超 200 字节')
-    // 短名不受截断影响（反向对照）
-    assert.strictEqual(base('ok.json').startsWith('ok.json'), true, '短名不得被截断/加摘要')
-  })
-
   check('PlanP _getTombstoneProcessStart: 非 Linux 返回 null、读取失败返回 null', () => {
     const orig = process.platform
     try {
