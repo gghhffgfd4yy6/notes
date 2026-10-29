@@ -1300,7 +1300,9 @@ const treeDir = makeRunTestsSandbox(
       "const path = require('path')",
       "const out = path.join(__dirname, 'heartbeat.txt')",
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
-      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
+      // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
+      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
       // 同上：孙进程自己也得有上限，否则父进程被外部杀掉后它无人可杀（ppid===1 后 killTree 到不了它）
       'setTimeout(() => process.exit(0), 90000).unref()',
       ''
@@ -1352,8 +1354,16 @@ try {
     '超时仍按失败结算：汇总三数字应与修复前一致（0 通过, 1 失败, 共 1）')
   assert.match(treeOut, /超过每套件上限 1500ms 已强杀/, '失败输出必须仍点名每套件超时（RT-03 口径不变）')
   const hb = path.join(treeDir, 'heartbeat.txt')
-  treePid = Number(fs.readFileSync(hb, 'utf8').split('\n')[0])
+  const hbLines = fs.readFileSync(hb, 'utf8').split('\n')
+  treePid = Number(hbLines[0])
   assert.ok(Number.isInteger(treePid) && treePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  // 正向对照（C4-019）：先证明孙进程在入口退出**前**确实在持续写盘（首拍 → 末拍跨 ≥300ms），再断言退出后停住。
+  // 只有后半句时，「孙进程 fork 后立刻死」或「setInterval 从未生效」同样会绿——那不是「整组杀伤生效」的证据。
+  const hbTicks = hbLines.slice(1).filter(line => /^X\d+$/.test(line)).map(line => Number(line.slice(1)))
+  assert.ok(hbTicks.length >= 2, `夹具前提：孙进程必须真的在写心跳（实得 ${hbTicks.length} 拍时间戳）`)
+  assert.ok(hbTicks[hbTicks.length - 1] - hbTicks[0] >= 300,
+    `孙进程心跳必须在入口退出前持续增长（首拍 ${hbTicks[0]} → 末拍 ${hbTicks[hbTicks.length - 1]}，跨 ` +
+    `${hbTicks[hbTicks.length - 1] - hbTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const sizeAfterExit = fs.statSync(hb).size
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
   const sizeLater = fs.statSync(hb).size
@@ -1789,7 +1799,9 @@ const unitTreeDir = makeUnitTestsSandbox(
       "const path = require('path')",
       "const out = path.join(__dirname, 'heartbeat.txt')",
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
-      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
+      // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
+      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
       'setTimeout(() => process.exit(0), 8000)',
       ''
     ].join('\n')
@@ -1815,8 +1827,15 @@ try {
   assert.ok(elapsed < 5000,
     `入口应在每套件上限附近收敛，而不是等孙进程退出：实测 ${elapsed}ms（旧实现要等孙进程 8s 自退 ⇒ 约 8000ms）`)
   const unitHb = path.join(unitTreeDir, 'heartbeat.txt')
-  unitTreePid = Number(fs.readFileSync(unitHb, 'utf8').split('\n')[0])
+  const unitHbLines = fs.readFileSync(unitHb, 'utf8').split('\n')
+  unitTreePid = Number(unitHbLines[0])
   assert.ok(Number.isInteger(unitTreePid) && unitTreePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  // 正向对照（C4-019，与 3g4 同口径）：先证明退出**前**确实在持续写盘，再断言退出后停住。
+  const unitTicks = unitHbLines.slice(1).filter(line => /^X\d+$/.test(line)).map(line => Number(line.slice(1)))
+  assert.ok(unitTicks.length >= 2, `夹具前提：孙进程必须真的在写心跳（实得 ${unitTicks.length} 拍时间戳）`)
+  assert.ok(unitTicks[unitTicks.length - 1] - unitTicks[0] >= 300,
+    `孙进程心跳必须在入口退出前持续增长（首拍 ${unitTicks[0]} → 末拍 ${unitTicks[unitTicks.length - 1]}，跨 ` +
+    `${unitTicks[unitTicks.length - 1] - unitTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const unitSizeAfterExit = fs.statSync(unitHb).size
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
   const unitSizeLater = fs.statSync(unitHb).size
