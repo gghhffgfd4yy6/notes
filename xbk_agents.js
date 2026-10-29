@@ -81,8 +81,9 @@ const DNS_INFLIGHT_MAX_DEFAULT = 32
 const DNS_INFLIGHT_MAX_PER_KEY = 2
 const DNS_INFLIGHT_MAX = positiveIntEnv('XBK_DNS_MAX_INFLIGHT', DNS_INFLIGHT_MAX_DEFAULT)
 const DNS_INFLIGHT_MAX_AGE_MS = positiveIntEnv('XBK_DNS_MAX_INFLIGHT_AGE_MS', 60000)
-// 真实在飞硬顶：默认 64，必须远高于软全局上限 32——它兜的是 libuv 线程池占用，不是恢复探测的节流阀
-// （那是软名额的活）；压到软上限之下只会让软名额永远用不满，且同 key 的两条接班查询也无处安放。
+// 真实在飞硬顶：默认 64，必须远高于软全局上限 32——它兜的是未完成的 getaddrinfo 队列（超了就是真实查询
+// 无界堆积），不是恢复探测的节流阀（那是软名额的活）；压到软上限之下只会让软名额永远用不满，且同 key
+// 的两条接班查询也无处安放。
 const DNS_REAL_INFLIGHT_MAX_DEFAULT = 64
 const DNS_REAL_INFLIGHT_MAX = positiveIntEnv('XBK_DNS_MAX_REAL_INFLIGHT', DNS_REAL_INFLIGHT_MAX_DEFAULT)
 // key → 在飞条目数组（key 为 null 表示该调用不进缓存，借同一个 Map 只计全局数，否则它没有退役路径）。
@@ -148,20 +149,32 @@ function retireAgedInflight (now) {
   }
 }
 
-// 发起一条底层查询并记两份账。真实名额在 dns.lookup 之前 +1、回调第一件事 -1（先于软名额与 onDone：
+// 释放真实名额。与 endInflightLookup 的 retired 同口径：一条底层查询只有一份真实名额，故它只能被释放
+// 一次，否则计数会被减成负数、硬顶随之失效（实测硬顶 3 却放行 6 条）。两条违反 dns.lookup 契约的路径
+// 都会重复释放：底层同步回调 + 调用方回调抛错（异常冒进 startInflightLookup 的 catch 再释放一次）、
+// 底层回调被调两次。标记只挡「第二次释放」，不新增释放路径——真实名额仍只由「回调到达」与「同步抛错」
+// 两条路径归还，过龄退役依旧绝不碰它。
+function releaseRealInflight (entry) {
+  if (entry.realReleased) return
+  entry.realReleased = true
+  dnsRealInflightTotal -= 1
+}
+
+// 发起一条底层查询并记两份账。真实名额在 dns.lookup 之前 +1、回调第一件事归还（先于软名额与 onDone：
 // 线程已还回池子，与这条 lookup 的结果还要不要无关）。同步抛错（非法参数等）时必须当场释放两份名额——
 // 否则这条永远收不到回调的记账会白占名额，攒满上限后整个进程的解析都会被判成超限。
 function startInflightLookup (key, hostname, opts, onDone) {
   const entry = beginInflightLookup(key)
+  entry.realReleased = false // 名额身份凭据：先于 +1 建立，回调与 catch 共用同一次释放
   dnsRealInflightTotal += 1
   try {
     dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
-      dnsRealInflightTotal -= 1
+      releaseRealInflight(entry)
       endInflightLookup(entry)
       onDone(error, address, family)
     })
   } catch (e) {
-    dnsRealInflightTotal -= 1
+    releaseRealInflight(entry)
     endInflightLookup(entry)
     throw e
   }
