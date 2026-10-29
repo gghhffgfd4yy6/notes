@@ -2743,10 +2743,28 @@ check('C5-040 got 传输替身只准有一份实现（扫描本文件源码）',
 // `got1.restore(); restore()` 两种**相反**次序同时存在。漏写一句就会让 push_config / got 替身漏到
 // 后续用例，报错却指向被害者。判据取「序言形状」与「收尾形状」而不是 channelFixture 的调用次数：
 // 把序言换个写法抄回来，或者手写两条 restore，照样红。
+//
+// 「序言形状」判定用逐行定位 + 定长窗口切片，而不是一条跨行正则：旧写法
+// `^\s*(?:const|let|var)\s+\w+\s*=\s*isolateChannel\([\s\S]{0,600}?installTransport\(` 在
+// multiline 下 `^\s*` 能跨行吞换行 ⇒ 每个行首都把其后的空白重扫一遍，空白密集输入上实测随行数
+// 二次增长（Sonar S5852「超线性回溯」），而它要判的事本质只有一句：同一个赋值行之后 600 字符内
+// 是否出现 installTransport(。语义等价（探针逐例对齐过）：锚点仍是行首（缩进只认 `[ \t]`——跨行
+// 那部分由下一行自己的 `^` 接管，匹配不会漏），窗口仍是 600 字符，取最近一次出现判越界。
+const countHandWrittenPreamble = (source) => {
+  const assignHead = /^[ \t]*(?:const|let|var)\s+\w+\s*=\s*isolateChannel\(/gm
+  let hits = 0
+  for (const m of source.matchAll(assignHead)) {
+    const after = m.index + m[0].length
+    const at = source.indexOf('installTransport(', after)
+    if (at !== -1 && at - after <= 600) hits++
+  }
+  return hits
+}
+
 check('C5-041 通道夹具序言 / 收尾顺序只准有一份实现（扫描本文件源码）', () => {
   const src = fs.readFileSync(__filename, 'utf8')
   const count = (re) => (src.match(re) || []).length
-  assert.strictEqual(count(/^\s*(?:const|let|var)\s+\w+\s*=\s*isolateChannel\([\s\S]{0,600}?installTransport\(/gm), 0,
+  assert.strictEqual(countHandWrittenPreamble(src), 0,
     '不得再手写「isolateChannel + installTransport」序言（用 channelFixture(want, respond)）')
   assert.strictEqual(count(/\} finally \{[^}\n]*\.restore\(\)[^}\n]*\.restore\(\)/g), 0,
     'finally 里不得再手写两条 restore 的收尾顺序（用 fx.restore() 的 LIFO 收尾）')
