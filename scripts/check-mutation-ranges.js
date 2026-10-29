@@ -159,19 +159,21 @@ const QUOTED_LITERAL_RE = /(['"])((?:[^'"\\]|\\.)*)\1/g
 // 把 require 的字符串实参解析成仓库内文件的相对路径（'/' 分隔）；解析不到返回 null。
 // 口径：相对路径按**所在文件目录**解析；其它（裸名 / scripts/ 前缀 / path.join(ROOT, 'x') 里的
 // 目录名）一律按**仓库根**解析——本仓的动态 require 只有这两种形态，实测逐个核对过。
-function resolveRuntimeSpec (fromRel, spec) {
+function resolveRuntimeSpec (fromRel, spec, baseRoot = root) {
   if (!spec || spec.startsWith('/')) return null
   const base = spec.startsWith('.')
-    ? path.resolve(path.dirname(path.join(root, fromRel)), spec)
-    : path.join(root, spec)
-  for (const suffix of ['', '.js', '.cjs', '.mjs', path.join('index.js')]) {
-    const candidate = base + suffix
-    if (!candidate.startsWith(root + path.sep)) continue
+    ? path.resolve(path.dirname(path.join(baseRoot, fromRel)), spec)
+    : path.join(baseRoot, spec)
+  // 候选必须是**完整路径**：目录形式 `require('./dir')` 要拼成 `<base>/index.js`。此前用
+  // `base + path.join('index.js')`（等价于 `base + 'index.js'`）得到的是 `<base>index.js`，
+  // 目录 require 永远解析不到 ⇒ 该分支是死代码、运行链会漏掉 `dir/index.js`（门禁假绿）。
+  for (const candidate of [base, base + '.js', base + '.cjs', base + '.mjs', path.join(base, 'index.js')]) {
+    if (!candidate.startsWith(baseRoot + path.sep)) continue
     try {
       if (fs.statSync(candidate).isFile() && JS_MODULE_RE.test(candidate)) {
-        return path.relative(root, candidate).split(path.sep).join('/')
+        return path.relative(baseRoot, candidate).split(path.sep).join('/')
       }
-    } catch (e) { /* 不存在：试下一个后缀 */ }
+    } catch (e) { /* 不存在：试下一个候选 */ }
   }
   return null
 }
@@ -179,7 +181,7 @@ function resolveRuntimeSpec (fromRel, spec) {
 // 从运行入口派生 require 闭包。只读源码文本、不执行任何运行时代码（入口有副作用，绝不能 require 它）。
 // 注释行（`//` / `*` / `/*` 开头）跳过：注释掉的 require 不该把模块拖进候选集（也不该让门禁假红）。
 // 非字面量 require（`require(localPath)`）无法静态解析 ⇒ 收进 unresolved 如实列出，由人工复核。
-function deriveRuntimeChain (entries = RUNTIME_ENTRIES) {
+function deriveRuntimeChain (entries = RUNTIME_ENTRIES, chainRoot = root) {
   const chain = new Set()
   const unresolved = []
   const queue = entries.slice()
@@ -188,7 +190,7 @@ function deriveRuntimeChain (entries = RUNTIME_ENTRIES) {
     if (chain.has(rel)) continue
     let source
     try {
-      source = fs.readFileSync(path.join(root, rel), 'utf8') // nosemgrep（仓库内相对路径，非用户输入）
+      source = fs.readFileSync(path.join(chainRoot, rel), 'utf8') // nosemgrep（仓库内相对路径，非用户输入）
     } catch (err) {
       unresolved.push(`${rel}: 读取失败 —— ${err.message}`)
       continue
@@ -206,7 +208,7 @@ function deriveRuntimeChain (entries = RUNTIME_ENTRIES) {
           continue
         }
         for (const spec of specs) {
-          const resolved = resolveRuntimeSpec(rel, spec)
+          const resolved = resolveRuntimeSpec(rel, spec, chainRoot)
           if (resolved) queue.push(resolved)
         }
       }

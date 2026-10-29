@@ -4,6 +4,7 @@
 // exitIfDirectRun（直跑 process.exit、被 require 则 throw）；夹具 yml 通过 MUTATION_WORKFLOW_TEXT 注入。
 const assert = require('assert')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const { spawnSync } = require('child_process')
 
@@ -546,6 +547,56 @@ function run (ymlText) {
     assert.ok(NON_RUNTIME_MUTATE_TARGETS.has('scripts/console.js') && NON_RUNTIME_MUTATE_TARGETS.has('scripts/check-deps.js'),
       '「非运行时」标注必须覆盖矩阵里那两个不在 require 闭包内的脚本（否则真实门禁必红）')
     console.log(`✅ 运行链双向核对断言通过（派生 ${real.chain.length} 个模块；豁免 ${MUTATION_EXEMPT.size} 条、非运行时标注 ${NON_RUNTIME_MUTATE_TARGETS.size} 条）`)
+  }
+
+  // ===== 运行链解析：目录形式 `require('./dir')` 必须解析到 dir/index.js（CodeRabbit #362-g2）=====
+  // 旧实现把候选拼成 `base + path.join('index.js')`（等价 `base + 'index.js'`），对 `require('./lib')`
+  // 得到的是 <root>/libindex.js ⇒ 目录 require 永远解析不到，该分支是死代码：运行链少一个模块，
+  // 门禁照绿、模块零变异覆盖。这里用**仓库外临时夹具**（跑完即删，不进 git）把四条解析规则一起钉死：
+  // 目录 index.js、裸名按仓库根、无扩展名补 .js、以及 .js > .cjs > .mjs 的优先级。
+  {
+    const { deriveRuntimeChain } = require('./scripts/check-mutation-ranges.js')
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-chain-'))
+    const write = (rel, body) => {
+      fs.mkdirSync(path.dirname(path.join(fixtureRoot, rel)), { recursive: true })
+      fs.writeFileSync(path.join(fixtureRoot, rel), body)
+    }
+    try {
+      write('entry.js', [
+        "require('./lib')", // 目录 ⇒ lib/index.js（旧实现漏掉的正样本）
+        "require('./plain')", // 无扩展名 ⇒ plain.js
+        "require('./cjs-mod')", // 无扩展名 ⇒ cjs-mod.cjs
+        "require('./mjs-mod')", // 无扩展名 ⇒ mjs-mod.mjs
+        "require('./dup')", // 同名多后缀 ⇒ .js 优先
+        "require('shared')" // 裸名 ⇒ 按仓库根解析
+      ].join('\n'))
+      write('lib/index.js', 'module.exports = {}\n')
+      write('plain.js', 'module.exports = {}\n')
+      write('cjs-mod.cjs', 'module.exports = {}\n')
+      write('mjs-mod.mjs', 'module.exports = {}\n')
+      write('dup.js', 'module.exports = {}\n')
+      write('dup.cjs', 'module.exports = {}\n')
+      write('shared.js', 'module.exports = {}\n')
+
+      const { chain } = deriveRuntimeChain(['entry.js'], fixtureRoot)
+      const expect = ['entry.js', 'lib/index.js', 'plain.js', 'cjs-mod.cjs', 'mjs-mod.mjs', 'dup.js', 'shared.js']
+      for (const file of expect) {
+        assert.ok(chain.includes(file),
+          `运行链必须包含 ${file}，实际 ${JSON.stringify(chain)}`)
+      }
+      assert.deepStrictEqual([...chain].sort(), [...expect].sort(),
+        `运行链不得多解析出仓库里不存在的候选，实际 ${JSON.stringify(chain)}`)
+      assert.ok(!chain.some(f => f.includes('index.jsindex.js') || /libindex\.js$/.test(f)),
+        `不得把目录 require 拼成 <dir>index.js 这种畸形候选，实际 ${JSON.stringify(chain)}`)
+
+      // 反向：解析不到的相对路径不得凭猜测进链（否则上面「包含 index.js」会退化成万能通过）
+      const miss = deriveRuntimeChain(['missing-entry.js'], fixtureRoot)
+      assert.deepStrictEqual(miss.chain, [],
+        `不存在的入口不得进链，实际 ${JSON.stringify(miss.chain)}`)
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+    console.log('✅ 运行链解析断言通过（目录 index.js / 裸名 / .js·.cjs·.mjs 优先级）')
   }
 
   console.log('test_check_mutation_ranges OK')
