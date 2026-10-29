@@ -10068,14 +10068,22 @@ console.log('========================================\n');
 
   // C4-004：fast-check 不给 seed 时默认随机（实测两次首值不同），与全文件 26 处 LCG 固定 seed
   // 的确定性口径相反 —— 一次红过的属性失败下次可能不再复现。本门禁扫描全文 fc.assert 站点，
-  // 任一处缺 seed 即红（needle 用字符串拼接，避免门禁自身源码被计为站点）。
+  // 任一处缺固定 seed 即红。
+  // 两个假绿口子都要堵：① needle 用字符串拼接，否则门禁自身源码里的字面量会被最后一段吞进去，
+  // 在门禁用例之前新插一个无 seed 站点照样绿；② 逐段先剔注释（行/块）再判，否则删掉 seed 后
+  // 补一句含 needle 的 TODO 注释也能绿。
   await test('属性测试: 全部 fc.assert 固定 seed（跨运行可复现）', () => {
     const src = require('fs').readFileSync(__filename, 'utf8')
-    const sites = src.split('fc.' + 'assert(').slice(1)
+    const SITE = 'fc.' + 'assert('
+    const NEEDLE = 'seed' + ': 20260801'
+    const stripComments = (s) => s
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+    const sites = src.split(SITE).slice(1)
     assert.ok(sites.length >= 8, `fc.assert 站点数不应减少：${sites.length}`)
     sites.forEach((seg, i) => {
-      assertEqual(/seed:\s*20260801/.test(seg), true,
-        `第 ${i + 1} 处 fc.assert 未固定 seed: 20260801（默认随机 seed，失败不可复现）`)
+      assertEqual(stripComments(seg).includes(NEEDLE), true,
+        `第 ${i + 1} 处 fc.assert 未固定 ${NEEDLE}（默认随机 seed，失败不可复现；注释里的字样不算）`)
     })
   })
 
