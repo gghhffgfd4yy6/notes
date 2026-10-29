@@ -59,12 +59,12 @@ async function withProfileLog (profile, fn) {
   {
     const restore = installMockStream({ response: { statusCode: 500, headers: {} }, chunks: ['oops'] })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.ok(rejected, 'HTTP 500 应 reject')
-      assert.strictEqual(rejected.code, 'HTTP_500')
-      assert.strictEqual(rejected.response.statusCode, 500, '应附 statusCode')
-      assert.strictEqual(rejected.response.body, 'oops', '应附响应体')
+      await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+        assert.strictEqual(e.code, 'HTTP_500')
+        assert.strictEqual(e.response.statusCode, 500, '应附 statusCode')
+        assert.strictEqual(e.response.body, 'oops', '应附响应体')
+        return true
+      }, 'HTTP 500 应 reject')
     } finally { restore() }
   }
 
@@ -72,10 +72,10 @@ async function withProfileLog (profile, fn) {
   {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['0123456789', 'abcdef'] })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x', {}, 10) } catch (e) { rejected = e }
-      assert.ok(rejected, '超限应 reject')
-      assert.strictEqual(rejected.code, 'EBODYLIMIT')
+      await assert.rejects(fetchJson('https://api.example.com/x', {}, 10), (e) => {
+        assert.strictEqual(e.code, 'EBODYLIMIT')
+        return true
+      }, '超限应 reject')
     } finally { restore() }
   }
 
@@ -83,10 +83,10 @@ async function withProfileLog (profile, fn) {
   {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['not json'] })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.ok(rejected, '非 JSON 应 reject')
-      assert.strictEqual(rejected.code, 'ERR_BODY_NOT_JSON')
+      await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+        assert.strictEqual(e.code, 'ERR_BODY_NOT_JSON')
+        return true
+      }, '非 JSON 应 reject')
     } finally { restore() }
   }
 
@@ -96,10 +96,10 @@ async function withProfileLog (profile, fn) {
     netErr.code = 'ECONNRESET'
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, error: netErr })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.ok(rejected, '流错误应 reject')
-      assert.strictEqual(rejected.code, 'ECONNRESET')
+      await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+        assert.strictEqual(e.code, 'ECONNRESET')
+        return true
+      }, '流错误应 reject')
     } finally { restore() }
   }
 
@@ -136,13 +136,13 @@ async function withProfileLog (profile, fn) {
     const payload = `{"token":"${secret}"`
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: [payload] })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.ok(rejected, '非 JSON 应 reject')
-      assert.strictEqual(rejected.code, 'ERR_BODY_NOT_JSON')
-      assert.ok(rejected.message.includes(`body ${payload.length} chars`), '错误消息应只报响应体长度')
-      assert.ok(!rejected.message.includes(secret), '错误消息不得回显响应体内容')
-      assert.ok(!rejected.message.includes('sk-live'), '错误消息不得回显响应体片段')
+      await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+        assert.strictEqual(e.code, 'ERR_BODY_NOT_JSON')
+        assert.ok(e.message.includes(`body ${payload.length} chars`), '错误消息应只报响应体长度')
+        assert.ok(!e.message.includes(secret), '错误消息不得回显响应体内容')
+        assert.ok(!e.message.includes('sk-live'), '错误消息不得回显响应体片段')
+        return true
+      }, '非 JSON 应 reject')
     } finally { restore() }
   }
 
@@ -153,13 +153,13 @@ async function withProfileLog (profile, fn) {
     for (const [chunks, label] of cases) {
       const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks })
       try {
-        let rejected = null
-        try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-        assert.ok(rejected, `${label} 应 reject`)
-        assert.strictEqual(rejected.code, 'ERR_EMPTY_BODY', `${label} 应归成空体码（旧实现 ERR_BODY_NOT_JSON=永久停推）`)
-        assert.ok(rejected.message.includes('empty body'), `${label} 应报 empty body`)
-        assert.ok(!rejected.message.includes('body 0 chars'), `${label} 不应报 body 0 chars（两种语义分开）`)
-        assert.strictEqual(classifyFailure(rejected).kind, 'retryable', `${label} 的失败归类必须是可重试`)
+        await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+          assert.strictEqual(e.code, 'ERR_EMPTY_BODY', `${label} 应归成空体码（旧实现 ERR_BODY_NOT_JSON=永久停推）`)
+          assert.ok(e.message.includes('empty body'), `${label} 应报 empty body`)
+          assert.ok(!e.message.includes('body 0 chars'), `${label} 不应报 body 0 chars（两种语义分开）`)
+          assert.strictEqual(classifyFailure(e).kind, 'retryable', `${label} 的失败归类必须是可重试`)
+          return true
+        }, `${label} 应 reject`)
       } finally { restore() }
     }
   }
@@ -168,10 +168,11 @@ async function withProfileLog (profile, fn) {
   {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['\uFEFFnope'] })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.ok(rejected.message.includes('body 4 chars'), '应报剥离 BOM 后的长度 4')
-      assert.ok(!rejected.message.includes('nope'), '错误消息不得回显响应体内容')
+      await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+        assert.ok(e.message.includes('body 4 chars'), '应报剥离 BOM 后的长度 4')
+        assert.ok(!e.message.includes('nope'), '错误消息不得回显响应体内容')
+        return true
+      }, 'BOM + 非 JSON 应 reject（旧写法没有 assert.ok(rejected)：不 reject 时抛 TypeError 而不是断言失败）')
     } finally { restore() }
   }
 
@@ -330,12 +331,12 @@ async function withProfileLog (profile, fn) {
     for (const [chunks, kind, reason, label] of cases) {
       const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks })
       try {
-        let rejected = null
-        try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-        assert.ok(rejected, `${label} 应 reject`)
-        const verdict = classifyFailure(rejected)
-        assert.strictEqual(verdict.kind, kind, `${label} 应归类为 ${kind}，实际 ${verdict.kind}（reason=${verdict.reason}）`)
-        assert.strictEqual(verdict.reason, reason, `${label} 的归类理由应为 ${reason}，实际 ${verdict.reason}`)
+        await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+          const verdict = classifyFailure(e)
+          assert.strictEqual(verdict.kind, kind, `${label} 应归类为 ${kind}，实际 ${verdict.kind}（reason=${verdict.reason}）`)
+          assert.strictEqual(verdict.reason, reason, `${label} 的归类理由应为 ${reason}，实际 ${verdict.reason}`)
+          return true
+        }, `${label} 应 reject`)
       } finally { restore() }
     }
     const timeoutErr = new Error("Timeout awaiting 'request' for 30000ms")
@@ -343,12 +344,12 @@ async function withProfileLog (profile, fn) {
     timeoutErr.code = 'ETIMEDOUT'
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, error: timeoutErr })
     try {
-      let rejected = null
-      try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-      assert.ok(rejected, '半开（请求超时）应 reject')
-      const verdict = classifyFailure(rejected)
-      assert.strictEqual(verdict.kind, 'retryable', `半开超时必须可重试，实际 ${verdict.kind}（reason=${verdict.reason}）`)
-      assert.strictEqual(verdict.reason, 'ETIMEDOUT', `半开超时应按 ETIMEDOUT 归类，实际 ${verdict.reason}`)
+      await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+        const verdict = classifyFailure(e)
+        assert.strictEqual(verdict.kind, 'retryable', `半开超时必须可重试，实际 ${verdict.kind}（reason=${verdict.reason}）`)
+        assert.strictEqual(verdict.reason, 'ETIMEDOUT', `半开超时应按 ETIMEDOUT 归类，实际 ${verdict.reason}`)
+        return true
+      }, '半开（请求超时）应 reject')
     } finally { restore() }
   }
 
@@ -360,15 +361,15 @@ async function withProfileLog (profile, fn) {
     for (const [status, chunks, label] of cases) {
       const restore = installMockStream({ response: { statusCode: status, headers: {} }, chunks })
       try {
-        let rejected = null
-        try { await fetchJson('https://api.example.com/x') } catch (e) { rejected = e }
-        assert.ok(rejected, `${label} 应 reject（不得因响应体是合法 JSON 就当成成功）`)
-        assert.strictEqual(rejected.code, `HTTP_${status}`, `${label} 必须带真实状态码（旧实现报体相关码）`)
-        assert.strictEqual(rejected.response.statusCode, status, `${label} 应附 statusCode`)
-        assert.strictEqual(rejected.response.body, chunks.join(''), `${label} 应附响应体`)
-        const verdict = classifyFailure(rejected)
-        assert.strictEqual(verdict.kind, 'permanent', `${label} 应判永久（确定性重定向），实际 ${verdict.kind}（reason=${verdict.reason}）`)
-        assert.strictEqual(verdict.reason, `HTTP_${status}`, `${label} 的归类理由应为 HTTP_${status}，实际 ${verdict.reason}`)
+        await assert.rejects(fetchJson('https://api.example.com/x'), (e) => {
+          assert.strictEqual(e.code, `HTTP_${status}`, `${label} 必须带真实状态码（旧实现报体相关码）`)
+          assert.strictEqual(e.response.statusCode, status, `${label} 应附 statusCode`)
+          assert.strictEqual(e.response.body, chunks.join(''), `${label} 应附响应体`)
+          const verdict = classifyFailure(e)
+          assert.strictEqual(verdict.kind, 'permanent', `${label} 应判永久（确定性重定向），实际 ${verdict.kind}（reason=${verdict.reason}）`)
+          assert.strictEqual(verdict.reason, `HTTP_${status}`, `${label} 的归类理由应为 HTTP_${status}，实际 ${verdict.reason}`)
+          return true
+        }, `${label} 应 reject（不得因响应体是合法 JSON 就当成成功）`)
       } finally { restore() }
     }
   }
@@ -403,9 +404,12 @@ async function withProfileLog (profile, fn) {
         const restore = installMockStream({ error: boom })
         let rejected = null
         try {
-          await withinSettle(fetchJson('https://api.example.com/x'))
-        } catch (e) { rejected = e } finally { restore() }
-        assert.strictEqual(rejected, boom, '底层 error 必须原样 reject')
+          await assert.rejects(withinSettle(fetchJson('https://api.example.com/x')), (e) => {
+            rejected = e
+            return true
+          }, '底层 error 必须原样 reject')
+        } finally { restore() }
+        assert.strictEqual(rejected, boom, '底层 error 必须原样透传（不得被包装/替换）')
         assert.strictEqual(logs.filter(l => l.includes('[profile api] error')).length, profileOn ? 1 : 0, `XBK_PROFILE=${profileOn ? "'3'" : '未设'} 时 error 日志条数不符：${JSON.stringify(logs)}`)
       })
     }
@@ -450,12 +454,13 @@ async function withProfileLog (profile, fn) {
       assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x', {}, limit)), { n: 123 }, '恰好等于上限（未超过）必须正常返回')
     } finally { a.restore() }
     const b = installExact()
-    let rejected = null
     try {
-      await withinSettle(fetchJson('https://api.example.com/x', {}, limit - 1))
-    } catch (e) { rejected = e } finally { b.restore() }
-    assert.strictEqual(rejected && rejected.code, 'EBODYLIMIT', '超上限必须报 EBODYLIMIT')
-    assert.strictEqual(rejected && rejected.message, `响应体过大(超过 ${limit - 1} 字节)`, '错误文案必须报实际上限（StringLiteral 变异体）')
+      await assert.rejects(withinSettle(fetchJson('https://api.example.com/x', {}, limit - 1)), (e) => {
+        assert.strictEqual(e.code, 'EBODYLIMIT', '超上限必须报 EBODYLIMIT')
+        assert.strictEqual(e.message, `响应体过大(超过 ${limit - 1} 字节)`, '错误文案必须报实际上限（StringLiteral 变异体）')
+        return true
+      })
+    } finally { b.restore() }
     assert.strictEqual(b.destroyed() && b.destroyed().code, 'EBODYLIMIT', '超限必须把错误交给 stream.destroy（CallExpression 变异体）')
   }
 
@@ -463,12 +468,13 @@ async function withProfileLog (profile, fn) {
   //     `finishReject(err)` / `if (settled) return` 被改成永不 settle 的变异体。
   {
     const restore = installMockStream({ response: { statusCode: 302, headers: {} }, chunks: ['<html>moved</html>'] })
-    let rejected = null
     try {
-      await withinSettle(fetchJson('https://api.example.com/x'))
-    } catch (e) { rejected = e } finally { restore() }
-    assert.strictEqual(rejected && rejected.message, 'HTTP 302', '3xx 错误文案必须是 HTTP_<status>')
-    assert.strictEqual(rejected && rejected.code, 'HTTP_302')
+      await assert.rejects(withinSettle(fetchJson('https://api.example.com/x')), (e) => {
+        assert.strictEqual(e.message, 'HTTP 302', '3xx 错误文案必须是 HTTP_<status>')
+        assert.strictEqual(e.code, 'HTTP_302')
+        return true
+      })
+    } finally { restore() }
   }
 
   // H6. profile timing 日志里的时间字段必须是**耗时差**（不得把绝对时间戳相加），firstDataAt 不得恒为
@@ -504,6 +510,19 @@ async function withProfileLog (profile, fn) {
       `env 还原分支只允许实现一次，实际 ${countOf(/if \(origProfile === undefined\)/g)} 处`)
     assert.ok(countOf(/await withProfileLog\(/g) >= 7,
       `7 个 profile 场景必须全部走统一夹具，实际 ${countOf(/await withProfileLog\(/g)} 处`)
+  }
+
+  // C5-050 反例锁：异步拒绝一律用 assert.rejects（断言失败信息里带 promise 的拒绝原因），
+  // 不再手写 `let rejected = null; try { … } catch (e) { rejected = e }`——那种写法漏掉
+  // assert.ok(rejected) 时，「没 reject」会变成 TypeError 或静默通过（8c 就是这样）。
+  {
+    const selfSource = require('node:fs').readFileSync(__filename, 'utf8')
+    const oneLiner = (selfSource.match(/try \{ await fetchJson[^\n]*\} catch \(e\) \{ rejected = e \}/g) || []).length
+    const finallyForm = (selfSource.match(/\} catch \(e\) \{ rejected = e \} finally/g) || []).length
+    const rejects = (selfSource.match(/assert\.rejects\(/g) || []).length
+    assert.strictEqual(oneLiner, 0, `不得再手写 try/catch 捕获拒绝（单行形态），实际 ${oneLiner} 处`)
+    assert.strictEqual(finallyForm, 0, `不得再手写 catch (e) { rejected = e } finally（多行形态），实际 ${finallyForm} 处`)
+    assert.ok(rejects >= 13, `13 处异步拒绝断言必须走 assert.rejects，实际 ${rejects} 处`)
   }
 
   console.log('test_http OK')
