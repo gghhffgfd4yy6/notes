@@ -10,6 +10,7 @@
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
+const { spawnSync } = require('node:child_process')
 const path = require('node:path')
 
 const { createRuleEngine } = require('./xbk_rules')
@@ -72,15 +73,27 @@ const DEFAULTS = {
 let pass = 0
 let fail = 0
 function test (name, fn) {
+  let result
   try {
-    fn()
-    pass++
-    console.log(`  ✅ ${name}`)
+    result = fn()
   } catch (e) {
     fail++
     process.exitCode = 1
     console.error(`  ❌ ${name}: ${e.message}`)
+    return
   }
+  // C5-023：本 harness 是同步的。返回 Promise 的用例此前会被直接记成通过——pass++ 与 ✅ 先执行，
+  // 断言失败/异常在微任务里才抛（可能发生在「结果：N 通过 / 0 失败」打印之后），于是出现「先记绿、
+  // 随后在微任务里炸」的假绿。异步用例的结果本 harness 无法判定，故当场判红而不是乐观记过。
+  if (result && typeof result.then === 'function') {
+    fail++
+    process.exitCode = 1
+    if (typeof result.catch === 'function') result.catch(() => {}) // 挂个 handler，避免 unhandledRejection 打崩进程掩盖这条结论
+    console.error(`  ❌ ${name}: 用例返回 Promise——同步 harness 无法判定异步结果（请改成同步用例）`)
+    return
+  }
+  pass++
+  console.log(`  ✅ ${name}`)
 }
 function expectError (result, field, code, label) {
   assert.strictEqual(result.ok, false, `${label}：应校验失败`)
@@ -710,6 +723,38 @@ test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径�
     assert.strictEqual(path.dirname(backup), base, '备份路径不得逃出 cacheDir')
   }
 })
+
+// C5-023 自测接缝：harness 的「异步用例必须判红」只能在子进程里证明（本进程里注入一条失败用例会
+// 直接把整套变红）。探针子进程用 XBK_FILTER_STORE_ASYNC_PROBE=1 注入两条用例，见下方注入块。
+if (process.env.XBK_FILTER_STORE_ASYNC_PROBE !== '1') {
+  test('harness：返回 Promise 的用例必须当场判红，不得先记通过再在微任务里抛（C5-023，子进程实跑）', () => {
+    const probe = spawnSync(process.execPath, [__filename], {
+      encoding: 'utf8',
+      cwd: __dirname,
+      env: { ...process.env, XBK_FILTER_STORE_ASYNC_PROBE: '1' }
+    })
+    const both = (probe.stdout || '') + (probe.stderr || '')
+    assert.strictEqual(probe.status, 1,
+      `异步用例必须让探针以 1 退出（实际 ${probe.status}）：` + both.slice(-600))
+    assert.match(both, /❌ 💥 探针：异步用例（返回 rejected Promise）/,
+      '异步用例必须被 harness 当场记失败并打印 ❌：' + both.slice(-600))
+    assert.ok(!both.includes('✅ 💥 探针：异步用例'),
+      '异步用例不得被记成通过（旧 harness 先 pass++ 再让 Promise 在微任务里抛）：' + both.slice(-600))
+    assert.ok(probe.stdout.includes('PROBE-AFTER-RAN'),
+      '异步用例之后的同步用例必须照跑（判红不得靠把进程打崩来吞掉后续用例）：' + both.slice(-600))
+    assert.ok(!/ERR_UNHANDLED_REJECTION|UnhandledPromiseRejection/.test(both),
+      'harness 必须自己接管这个 Promise（否则 unhandledRejection 会先打崩进程、掩盖真实结论）：' + both.slice(-600))
+    const summary = probe.stdout.match(/(\d+) 通过 \/ (\d+) 失败/)
+    assert.ok(summary, '探针必须有汇总行：' + both.slice(-600))
+    const [, passed, failed] = summary.map(Number)
+    assert.ok(failed >= 1, `汇总必须记下这条失败（实得 ${failed}）`)
+    assert.ok(passed >= 49, `其余同步用例必须照常通过（实得 ${passed}）`)
+  })
+}
+if (process.env.XBK_FILTER_STORE_ASYNC_PROBE === '1') {
+  test('💥 探针：异步用例（返回 rejected Promise）', () => Promise.reject(new Error('probe-async')))
+  test('探针：异步用例之后的同步用例', () => { console.log('PROBE-AFTER-RAN') })
+}
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
 if (fail === 0) fs.rmSync(tmp, { recursive: true, force: true })
