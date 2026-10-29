@@ -701,4 +701,39 @@ try {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 }
+// C1 回归（闸门 B）：readKilledBaseline 改成单 fd 读后，FIFO 不阻塞 / 两次上限 / 失败路径不漏 fd
+// 都没有 committed 断言。三者都直接打在 fd 路径上，任一退化都会在这里红。
+{
+  const { readKilledBaseline } = require('./scripts/mutation-guard.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'killed-baseline-c1-'))
+  try {
+    // a) FIFO：单开只读会阻塞到出现写端；O_NONBLOCK 让 open 立即返回，随后按非普通文件拒绝
+    const mkfifo = ['/usr/bin/mkfifo', '/bin/mkfifo'].find(p => fs.existsSync(p))
+    if (mkfifo) {
+      const fifo = path.join(dir, 'baseline.fifo')
+      spawnSync(mkfifo, [fifo], { timeout: 5000 })
+      const t0 = Date.now()
+      assert.throws(() => readKilledBaseline(fifo, { maxFileBytes: 1024 }), /不是普通文件/, 'FIFO 必须按非普通文件拒绝')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 读取不得阻塞（必须带 O_NONBLOCK）')
+    } else {
+      console.log('  ⏭️ 本机没有 mkfifo，跳过 FIFO 子用例')
+    }
+    // b) 上限：文件本身超限（fstat 分支）
+    const big = path.join(dir, 'big.json')
+    fs.writeFileSync(big, 'x'.repeat(4096))
+    assert.throws(() => readKilledBaseline(big, { maxFileBytes: 1024 }), /基线文件过大/, '超限文件必须拒绝')
+    // c) fd 不泄漏：连续 50 次「open 后失败」的路径，打开的 fd 数不得增长
+    const noMode = path.join(dir, 'no-mode.json')
+    fs.writeFileSync(noMode, JSON.stringify({ commit: 'x', segments: {} }))
+    const before = fs.readdirSync('/proc/self/fd').length
+    for (let i = 0; i < 50; i++) {
+      assert.throws(() => readKilledBaseline(noMode, { maxFileBytes: 1024 }), /mode/, '缺 mode 必须拒绝')
+    }
+    const after = fs.readdirSync('/proc/self/fd').length
+    assert.ok(after - before <= 2, `连续失败路径不得漏 fd：${before} → ${after}`)
+    console.log('✅ C1 回归：FIFO 不阻塞 / 超限拒绝 / 失败路径不漏 fd')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
 console.log(`\n🎉 test_mutation_json.js 全部通过（${pass} 项）`)
