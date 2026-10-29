@@ -31,6 +31,9 @@ run_gate () {
   t0=$(date +%s)
   out=$("$@" 2>&1) && rc=0 || rc=$?
   t1=$(date +%s)
+  # C10-064：本函数与 .githooks/pre-push 的 run_gate 是**同一份实现的两处副本**（不抽到共享 lib：
+  # 静态扫描面只覆盖 .githooks 顶层文件，放进子目录就逃出 shellcheck 了）。改一处必须同步另一处——
+  # 两处曾漂移：pre-push 缺下面的 ⚠ 透传，把 test_filter.js 的「缓存目录清理失败」告警静默吞掉。
   if [ "$rc" -ne 0 ]; then
     echo "❌ ${label} 未通过（耗时 $((t1 - t0))s，退出码 ${rc}）${hint}"
     if [ -n "$out" ]; then

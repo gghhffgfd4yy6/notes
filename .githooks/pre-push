@@ -126,6 +126,12 @@ run_gate () {
     echo "   ↑ 以上为「$*」的完整输出（stderr 已合并）"
     exit 1
   fi
+  # C10-064：与 pre-commit 的 run_gate 是**同一份实现的两处副本**（没有共享 lib，理由见 pre-commit
+  # 注释）。成功路径同样必须透传 ⚠ 行：本钩子跑的 test_filter.js 在「缓存目录清理失败」时只 warn
+  # 不抛（test_filter.js:264），旧实现把这类告警连同行一起吞掉——门禁绿，仓库根却在堆残骸。
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | grep '⚠' || true
+  fi
   echo "✅ ${label} 通过（$((t1 - t0))s）"
 }
 
