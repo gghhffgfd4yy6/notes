@@ -98,6 +98,9 @@ function writeJson (file, value) {
 function writeRaw (file, text) {
   fs.writeFileSync(file, text)
 }
+// 排序比较器一律走显式 code-unit（与 run_mutation.js:247 / test_mutation_ranges.js 的 byCodeUnit 同口径）：
+// 不依赖 locale，也不触发 Array#sort 默认的「字符串化后比较」。
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-store-'))
 process.once('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
@@ -292,7 +295,13 @@ test('多行规则与真实 compileRules 对账通过（2 行 → rules=2）', (
 test('宽匹配 .* / ^.*$（trim 后）记入 wideMatch', () => {
   const result = validateFilterRules({ revision: 0, filter: { pingbibiaoti: ' .* ', pingbineirong: '^.*$', zhanxianbiaoti: 'a###.*' } }, deps)
   assert.strictEqual(result.ok, true, JSON.stringify(result.errors))
-  assert.deepStrictEqual(result.wideMatch.sort(), ['pingbibiaoti', 'pingbineirong', 'zhanxianbiaoti'])
+  // C5-072：比较必须用副本 + 显式 code-unit 比较器。原实现 `result.wideMatch.sort()` 有两个问题：
+  // ① 就地排序改写 SUT 返回的数组（下次有人在这条用例后面断言真实顺序就会看到被排过的值）；
+  // ② Array#sort 默认把元素字符串化比较，对非字符串元素是隐式的 toString 契约。
+  // 顺序断言仍按真实值做：wideMatch 的插入序（[biaoti, zhanxianbiaoti, neirong]）不得被测试改写。
+  assert.deepStrictEqual([...result.wideMatch].sort(byCodeUnit), ['pingbibiaoti', 'pingbineirong', 'zhanxianbiaoti'])
+  assert.deepStrictEqual(result.wideMatch, ['pingbibiaoti', 'zhanxianbiaoti', 'pingbineirong'],
+    'SUT 返回的 wideMatch 不得被测试就地排序改写')
 })
 
 // ===== mergeActiveFilter：合并优先级 =====
