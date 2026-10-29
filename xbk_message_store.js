@@ -595,9 +595,37 @@ function createMessageStore ({
         }
         return []
       }
+      // C3-001（backlog）：`status === 'ok'` 不等于「读到了一份可用的完整内容」。两种退化必须在
+      // 这里分开处理，且都不能再被 `|| '[]'` 静默洗成「合法空缓存」：
+      //   · shortRead：fstat 观测到的字节数没读满（文件在读窗口内被就地截短）。拿到的是任意前缀，
+      //     甚至可能恰好是合法 JSON 前缀；一旦当成完整缓存，下一轮 save 就会把读不到的身份静默
+      //     丢掉（判重数据丢失，与「宁可多推」反向）⇒ 按瞬时读失败 fail-closed：保持写闸门、
+      //     返回 []、绝不 rename（文件本身可能没问题，下一轮重读即恢复）。
+      //   · 0 字节：没有任何字节可隔离/可恢复，语义上等价于「缓存缺失」，方向（全量重推）本身是
+      //     契约允许的（SYSTEM_CONTRACT 核心原则 1），缺的只是可观测性 ⇒ 响亮点名（修前零告警，
+      //     运维无法区分「缓存被截断成 0 字节」与「首次运行没有缓存」），行为不变：仍按空缓存重建、
+      //     仍解除写闸门（不引入 F1 的永久零推送自锁）。
+      if (result.shortRead === true) {
+        console.error(`缓存读取不完整（读到的字节少于文件大小，可能在被读期间截短），按瞬时读失败处理并保持写闸门 ${filePath}`)
+        try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
+        return []
+      }
+      if (typeof result.text !== 'string' || result.text === '') {
+        if (typeof result.text !== 'string') {
+          console.error(`缓存读取结果缺少文本（存储层契约异常），按瞬时读失败处理并保持写闸门 ${filePath}`)
+          try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
+          return []
+        }
+        // 注意不能 trim：纯空白文件仍是「有内容但不可解析」，走下面的解析失败 → 隔离重建路径。
+        console.error(`缓存文件为 0 字节（文件存在但无任何内容；空缓存等价于缺失，本轮按空缓存处理并将全量重推）${filePath}`)
+        try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
+        this._memoSet(filePath, [])
+        try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
+        return []
+      }
       let data
       try {
-        data = JSON.parse(result.text || '[]')
+        data = JSON.parse(result.text)
       } catch (e) {
       // F1（P1）：不再只是「保留坏文件 + 拒绝覆写」——那条路会让整轮推送永久为零。改为
       // 「重命名隔离（原件按字节保留，绝不删除）+ 重建空缓存 + 解除写闸门」：本轮恢复推送能力，

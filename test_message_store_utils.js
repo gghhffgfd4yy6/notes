@@ -2332,6 +2332,62 @@ check('MS-10 隔离备份名不可用时绝不改名、绝不覆写：保持写�
   assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '不得在原路径写入任何内容')
 })
 
+// ===== C3-001：0 字节缓存 / 短读必须与「缓存缺失」区分开 =====
+// 缺陷：`JSON.parse(result.text || '[]')` 把 0 字节文件洗成「合法空缓存」，随后清除 _readFailed、
+// 写内存快照并固化「已验证」——方向（全量重推）本身是契约允许的（SYSTEM_CONTRACT 核心原则 1），
+// 缺口是**零告警**：运维无法把「缓存被外部截断成 0 字节」与「首次运行没有缓存」区分开。
+// 修复口径：方向不变（仍按空缓存重建、仍解除写闸门 = 不引入 F1 的永久零推送自锁），只补「响亮」；
+// 短读（读到的字节少于 fstat 观测值）另按瞬时读失败 fail-closed —— 部分内容不得被当成完整判重
+// 记录，否则下一轮 save 会把读不到的身份静默丢掉（判重数据丢失）。
+check('C3-001: 0 字节 push.json 必须点名告警（不得静默当合法空缓存），方向仍是按空缓存重建', () => {
+  cleanF1Dir()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const store = makeRealStore()
+  const name = 'c3001_empty.json'
+  const fp = store.getFilePath(name)
+  REAL_FS.writeFileSync(fp, '')
+  store._readFailed[fp] = true // 前置：写闸门本已占位（旧实现会静默清掉且不留任何痕迹）
+  let msgs
+  const errs = captureConsole('error', () => { msgs = store.readMessages(fp) })
+  assert.deepStrictEqual(msgs, [], '0 字节按空缓存返回（全量重推方向不变）')
+  const hits = errs.filter(l => l.includes(fp))
+  assert.strictEqual(hits.length, 1, `0 字节必须且只能产出一条点名该文件的诊断（修前为 0 条）：${JSON.stringify(errs)}`)
+  assert.ok(hits[0].includes('0 字节') && hits[0].includes('重推'),
+    `诊断必须说明「0 字节」及其后果（全量重推）：${hits[0]}`)
+  assert.strictEqual(store._readFailed[fp], undefined, '写闸门必须解除（否则永久零推送：F1 自锁）')
+  assert.deepStrictEqual(store._memoryCache[fp], [], '内存快照按空缓存')
+  assert.strictEqual(store._verified.has(fp), true, '读取成功后固化「已验证」')
+  assert.deepStrictEqual(corruptBackups(name), [], '0 字节没有任何字节可隔离 ⇒ 不得产生 .bak（与「解析失败」区分）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '', '读取本身不得改写文件')
+  assert.strictEqual(store.saveMessages(fp, [{ id: 'x' }]), true, '门解除后必须能正常落盘（不得引入永久零推送）')
+})
+
+check('C3-001: 缓存缺失（初始化写 []）不得触发 0 字节告警（两类必须区分开）', () => {
+  cleanF1Dir()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const store = makeRealStore()
+  const fp = store.getFilePath('c3001_missing.json')
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(store.readMessages(fp), []) })
+  assert.deepStrictEqual(errs, [], '首次初始化是正常路径，不得有任何错误诊断（否则每次新 pushUrl 都刷告警）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '[]', '缺失缓存初始化内容仍是 []（行为不变）')
+})
+
+check('C3-001: 短读（读到的字节少于 fstat 观测值）必须 fail-closed：绝不把部分内容当完整判重记录', () => {
+  const name = 'c3001_short.json'
+  const h = makeBatchStore({
+    name,
+    files: { [cachePath(name)]: '[{"id":"a"}]' },
+    readStatus: () => ({ status: 'ok', text: '[{"id":"a"}]', shortRead: true })
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(h.store.readMessages(h.filePath), []) })
+  assert.strictEqual(h.store._readFailed[h.filePath], true, '短读与 ioError/replaced 同口径：保持写闸门')
+  assert.ok(errs.some(l => l.includes('不完整') && l.includes(h.filePath)),
+    `必须点名「读取不完整」并指向该文件：${JSON.stringify(errs)}`)
+  assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '短读后绝不得覆写磁盘')
+  assert.strictEqual(h.store._memoryCache[h.filePath], undefined, '短读结果不得进内存快照（否则下一轮 save 用它覆写）')
+  assert.deepStrictEqual(h.store._drainRecoveryEvents(), [], '短读是瞬时故障，绝不进入隔离开口（不得 rename）')
+})
+
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 // ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
 // seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
