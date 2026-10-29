@@ -1,5 +1,12 @@
 'use strict'
+const fs = require('node:fs') // 仅供下方「注册表自身不得含用例」的加载期扫描（读自身源码）
 // 测试套件清单：run_tests.js 和 run_unit_tests.js 共用
+//
+// C5-074（命名口径）：本文件名形如 test_*.js，但它**不是测试套件** —— 0 断言、只导出 SUITES，故在
+// test_suite_registry.js 的 REGISTRY_EXEMPTIONS 里以「注册表自身」显式豁免。改名要同步 7 处 require
+// （run_tests / run_unit_tests / run_mutation / test_ci_skip_suites / test_suite_registry /
+// stryker.tap.config / scripts/tap-shim）+ run_mutation.js 的两处字面文件名清单，代价与收益不成比例
+// ⇒ 保留名字，改用下方「注册表不得含用例」的加载期门禁让豁免前提自证（0 断言这件事由代码而非注释保证）。
 // integration: true 表示集成测试（慢/可能有网络），单元测试入口（run_unit_tests.js）会跳过
 // mutationSkip: true 表示在 Stryker 沙箱内无法运行（被 --mutate 目标插桩后行数膨胀，
 //   导致 test_mutation_ranges/check-mutation-ranges 的行段元校验误报），同样由单元入口跳过
@@ -127,6 +134,26 @@ const SUITES = [
   const names = SUITES.map(s => s.name)
   const dupNames = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))]
   if (dupNames.length) throw new Error(`test_suites.js 存在重复的套件名（汇总/日报无法区分）：${dupNames.join(', ')}`)
+}
+
+// C5-074：注册表自身**不得**含用例（fail-closed）。这条门禁让 test_suite_registry.js 白名单里
+// 「注册表自身，不是测试套件（0 断言）」这个豁免前提由代码保证，而不是靠注释自觉：
+//   * run_tests.js / run_unit_tests.js 只跑 SUITES 里 file 指向的文件；stryker.tap.config.js 的
+//     tap.testFiles 是同一份推导 ⇒ 本文件里的任何用例**永远不会被执行**；
+//   * 而 test_suite_registry.js 又把它列进 REGISTRY_EXEMPTIONS（不注册自己）⇒ 没人会红。
+// 也就是说「往注册表里加个用例」= 静默零运行。扫描用的是**行首**判定（trim 后以用例注册器开头），
+// 不会命中本块自身或注释：真实的用例文件里调用也都在行首/缩进首位。
+{
+  const CASE_LINE_RE = /^\s*(?:await\s+)?(?:check|checkAsync|test|describe|it)\s*\(/
+  const caseLines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/) // nosemgrep（读的是本文件自身，非外部输入）
+    .map((text, i) => ({ text: text.trim(), no: i + 1 }))
+    .filter(x => CASE_LINE_RE.test(x.text))
+  if (caseLines.length) {
+    throw new Error('test_suites.js 是**注册表**不是测试套件（它被 test_suite_registry.js 白名单豁免，' +
+      '也不在任何 runner 的执行清单里）⇒ 把用例写在这里永远不会被执行，等于静默零运行。' +
+      '请把用例挪到独立的 test_*.js 并注册进 SUITES。命中的用例行：' +
+      caseLines.map(x => `:${x.no} ${x.text.slice(0, 60)}`).join(' / '))
+  }
 }
 
 module.exports = { SUITES }
