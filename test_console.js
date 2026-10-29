@@ -314,6 +314,14 @@ const SSE_END_WAIT_MS = 10000 // 随后等「客户端读到 close」（与上�
 const SSE_SERIAL_WAIT_MS = SSE_TEARDOWN_WAIT_MS + SSE_END_WAIT_MS
 const WATCHDOG_MARGIN_MS = 5000 // 看门狗在内层上界之外留的余量
 const TEST_TIMEOUT_MS = Math.max(RUN_DEADLINE_MS, SSE_SERIAL_WAIT_MS) + WATCHDOG_MARGIN_MS
+// ── C5-067：阈值只能引用常量，不能在用例里复制成裸数 ──
+// 陈旧锁判定阈值由 scripts/console.js 定义但**未导出**（`const FILTER_LOCK_STALE_MS = 10 * 1000`），
+// 测试侧只能持有一份具名常量（下方注释钉住来源），样本则由它派生——旧写法是 3 处裸 11000，
+// 生产把阈值调到 15s 后这里仍在「11s 前」造锁，用例名说陈旧、实际测的是活锁。
+const FILTER_LOCK_STALE_MS = 10 * 1000 // = scripts/console.js 的 FILTER_LOCK_STALE_MS（未导出）
+const FILTER_LOCK_STALE_SAMPLE_MS = FILTER_LOCK_STALE_MS + 1000 // 刚过期 1s，边界之上
+// lastaccept 重放窗直接用生产导出的常量（旧写法散着 30000/61000 两个裸数）。
+const REPLAY_WINDOW_MS = REPLAY_WINDOW_NOTIFY_TEST_MS
 async function aok (name, fn) {
   reapStaleTimeout(name)
   let watchdog = null
@@ -1620,7 +1628,7 @@ async function filterRuleApiTests () {
 
       // 陈旧锁（mtime 11s 前）：保存应接管并成功（不是 409）。
       fs.writeFileSync(paths.lock, '{}')
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       const takeover = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 4, filter: { pingbibiaoti: 'v5' } })
       assert.strictEqual(takeover.status, 200, '陈旧锁应被接管')
@@ -1681,7 +1689,7 @@ async function filterRuleApiTests () {
     try {
       // 活锁：pid 是当前测试进程（活），mtime 已过期——旧实现会按 mtime 抢走，导致原持有者失去互斥。
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 60000, token: 'live-holder' }), { mode: 0o600 })
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       const blocked = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
       assert.strictEqual(blocked.status, 409, '活锁必须 409 write_busy')
@@ -2022,7 +2030,7 @@ async function filterRuleApiTests () {
     const paths = filterPaths(dir)
     try {
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 1 }), { mode: 0o600 })
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       // 竞态起点：两个写者在「判过期」这一刻拿到同一份快照。
       const judgedA = filterLockIdentity(paths.lock)
@@ -4334,7 +4342,7 @@ async function main () {
       assert.strictEqual(JSON.parse(triggerBadAction.text).error, '未知 action')
       const cancelMissing = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1700000000000.1' })
       assert.strictEqual(cancelMissing.status, 404, 'Bearer 应已过鉴权（不存在的 id 404）')
-      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1700000000000.7' } }))
+      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1700000000000.7' } }))
       const notifyReplay = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(notifyReplay.status, 409, 'Bearer 应已过鉴权（60s 窗内重放 409）')
       assert.strictEqual(JSON.parse(notifyReplay.text).replayBlocked, true)
@@ -4354,7 +4362,7 @@ async function main () {
       const dir = tmpDir()
       const { server } = createConsole({ token: TOKEN, stateDir: dir })
       const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.7' } }))
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.7' } }))
       const blocked = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(blocked.status, 409, '60s 窗内重放必须 409')
       const blockedBody = JSON.parse(blocked.text)
@@ -4372,7 +4380,7 @@ async function main () {
       const dir = tmpDir()
       const { server } = createConsole({ token: TOKEN, stateDir: dir })
       const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 61000, runId: '1750000000000.7' } }))
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - (REPLAY_WINDOW_MS + 1000), runId: '1750000000000.7' } }))
       assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
       const lockConflict = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(lockConflict.status, 409, '越窗后撞锁仍 409')
@@ -4721,7 +4729,7 @@ async function main () {
 
   await aok('HTTP: 全局重放窗 60s（D2-S16：窗内 409 带剩余秒数，文案不谎称有任务在运行）', async () => {
     const dir = tmpDir()
-    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 30000, runId: '1750000000000.3' } }))
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.3' } }))
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
@@ -4735,7 +4743,7 @@ async function main () {
   })
   await aok('HTTP: 全局重放窗越窗放行（61s 前受理 → 202；旧 12min 窗会拦）', async () => {
     const dir = tmpDir()
-    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 61000, runId: '1750000000000.3' } }))
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - (REPLAY_WINDOW_MS + 1000), runId: '1750000000000.3' } }))
     const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     const okRes = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
@@ -4755,7 +4763,7 @@ async function main () {
     const port = await listen(server)
     const laPath = path.join(dir, 'console-lastaccept.json')
     // 独立端点 60s 窗内 → /trigger 侧同键同窗同样拦截（共享 lastAccept 键）
-    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.8' } }))
+    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.8' } }))
     const viaTrigger = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=notify-test' })
     assert.strictEqual(viaTrigger.status, 409, '/trigger 侧通道同键同窗拦截（D6 有意行为）')
     assert.strictEqual(JSON.parse(viaTrigger.text).runId, '1750000000000.8', '回带同一首轮 runId')
