@@ -301,6 +301,29 @@ function cleanupDirInRoot (targetPath) {
   }
 }
 
+// C4-028：删除「可能不存在的夹具文件」。ENOENT 是预期（文件本来就不存在，属正常收尾），
+// 其它错误必须留痕——本文件在 cleanupDirInRoot 上已经立过「空 catch 会让同一个事故再演一遍」的
+// 规矩（清理失败被静默吞掉 → 仓库根堆出几十个残留目录而测试全程全绿），夹具清理不该是例外：
+// EACCES/EBUSY/EISDIR（只读挂载、目录未清空、句柄未释放）被吞掉后，残留文件会被下一次读盘
+// 当成有效缓存，症状与「缓存莫名多一条」一模一样。原来 89 处 `try { unlinkSync } catch (e) {}`。
+function unlinkQuiet (targetPath) {
+  try {
+    require('node:fs').unlinkSync(targetPath)
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn(`⚠️ 夹具清理失败，需手工删除：${targetPath} — ${e.message}`)
+  }
+}
+
+// 同上，用于临时目录：rmdir 只对空目录有效，ENOENT/ENOTDIR（本来就没有/不是目录）属正常收尾，
+// 其它错误（ENOTEMPTY/EACCES）必须留痕。
+function rmdirQuiet (targetPath) {
+  try {
+    require('node:fs').rmdirSync(targetPath)
+  } catch (e) {
+    if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') console.warn(`⚠️ 临时目录清理失败，需手工删除：${targetPath} — ${e.message}`)
+  }
+}
+
 // 输出中是否存在成链的 Markdown 危险链接 `[label](javascript:/vbscript:/data:)`。
 // CodeRabbit 审查：只查首个标记会漏掉「前畸形后有效」的组合——扫描全部标记，任一成链即 true
 // CodeAnt 复审：label 可含转义 `\]`——配对须跳过转义右括号，避免漏检
@@ -1741,7 +1764,7 @@ console.log('========================================\n');
       assertEqual(fsmod.existsSync(lockPath), false, '同 PID 但启动时钟不同的陈旧锁应被回收')
     } finally {
       MessageStore._getTombstoneProcessStart = origStart
-      try { fsmod.unlinkSync(lockPath) } catch (e) {}
+      unlinkQuiet(lockPath)
     }
   })
 
@@ -3386,10 +3409,10 @@ console.log('========================================\n');
     const p = path.join(CACHE, name)
     const raw = '这不是合法JSON{{{'
     const cleanBaks = () => {
-      try { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n)) } catch (e) { /* 忽略 */ }
+      for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(CACHE, n))
     }
     cleanBaks()
-    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p)
     delete MessageStore._memoryCache[p]
     MessageStore._verified.delete(p)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
@@ -3409,7 +3432,7 @@ console.log('========================================\n');
     // saveBatch 同样解除（此前首次调用也会拒绝覆写损坏文件）
     const name2 = 'test_corrupt_batch.json'
     const p2 = path.join(CACHE, name2)
-    try { fs.unlinkSync(p2) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p2)
     delete MessageStore._memoryCache[p2]
     MessageStore._verified.delete(p2)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
@@ -3417,8 +3440,8 @@ console.log('========================================\n');
     assertEqual(saveBatch([{ id: 9, title: 'x' }], name2), true, '隔离重建后 saveBatch 必须可写')
     assertEqual(JSON.parse(fs.readFileSync(p2, 'utf8')).some((m) => m.id === 9), true, 'saveBatch 新条目必须真正落盘')
     for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name2 + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n))
-    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-    try { fs.unlinkSync(p2) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p)
+    unlinkQuiet(p2)
   })
 
   // decodeHtmlEntities 未知实体 fallback
@@ -3494,7 +3517,7 @@ console.log('========================================\n');
     } finally {
       Config.cache.dir = orig
       if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-      try { fs.unlinkSync(peerFile) } catch (e) {}
+      unlinkQuiet(peerFile)
     }
   })
 
@@ -3517,7 +3540,7 @@ console.log('========================================\n');
     } finally {
       Config.cache.dir = orig
       if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-      try { fs.unlinkSync(peerFile) } catch (e) {}
+      unlinkQuiet(peerFile)
     }
   })
 
@@ -3638,7 +3661,11 @@ console.log('========================================\n');
       removeDirInRoot(escapeShard.cacheDir, __dirname)
       assert.equal(fsMod.existsSync(victimFile), true, '穿越输入的清理不得删掉仓库外哨兵')
     } finally {
-      try { fsMod.rmSync(victimDir, { recursive: true, force: true }) } catch (e) { /* 清理哨兵 */ }
+      try {
+        fsMod.rmSync(victimDir, { recursive: true, force: true })
+      } catch (e) {
+        if (e.code !== 'ENOENT') console.warn(`⚠️ 哨兵目录清理失败，需手工删除：${victimDir} — ${e.message}`)
+      }
     }
   })
 
@@ -3840,9 +3867,9 @@ console.log('========================================\n');
       assertEqual(fs.existsSync(p), true)
       assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1)
     } finally {
-      try { if (fs.existsSync(p)) fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-      try { if (fs.statSync(parent).isDirectory()) fs.rmdirSync(parent) } catch (e) { /* 忽略 */ }
-      try { if (fs.existsSync(parent) && !fs.statSync(parent).isDirectory()) fs.unlinkSync(parent) } catch (e) { /* 忽略 */ }
+      if (fs.existsSync(p)) unlinkQuiet(p)
+      if (fs.existsSync(parent) && fs.statSync(parent).isDirectory()) rmdirQuiet(parent)
+      if (fs.existsSync(parent) && !fs.statSync(parent).isDirectory()) unlinkQuiet(parent)
     }
   })
 
@@ -3851,11 +3878,11 @@ console.log('========================================\n');
     const name = 'test_cache_symlink.json'
     const p = path.join(CACHE, name)
     const outside = path.join(process.env.TMPDIR || '/tmp', `xbk-cache-symlink-${process.pid}.json`)
-    const wipeBaks = () => { try { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n)) } catch (e) { /* 忽略 */ } }
+    const wipeBaks = () => { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(CACHE, n)) }
     wipeBaks()
     try {
       fs.writeFileSync(outside, JSON.stringify([{ id: 9001 }]), 'utf8')
-      try { fs.unlinkSync(p) } catch (e) { /* 不存在 */ }
+      unlinkQuiet(p)
       fs.symlinkSync(outside, p)
       const msgs = readMessages(p)
       assertEqual(msgs.length, 0)
@@ -3870,8 +3897,8 @@ console.log('========================================\n');
       assertEqual(fs.lstatSync(p).isSymbolicLink(), false, '原路径必须被重建为普通缓存文件')
       assertEqual(MessageStore._readFailed[p], undefined, '隔离重建成功后写闸门必须解除')
     } finally {
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-      try { fs.unlinkSync(outside) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
+      unlinkQuiet(outside)
       wipeBaks()
     }
   })
@@ -4955,28 +4982,26 @@ console.log('========================================\n');
   await test('真实 anon:... 前缀 id 保持 id 权威，跨 url 判重（v3.247 修复）', async () => {
     // 曾：无 url 的 id='anon:abc1' 被 /^anon:[0-9a-f]+$/i 误降级为匿名身份，与同 id 带 url 的
     // 记录（kind 'id'）判重路径分裂 → 同一条消息被重复推送。修复后保持 id 权威，按 idKey 合并。
-    const fs = require('fs')
     const name = 'test_identity_real_anon_id.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ id: 'anon:abc1', title: '真实A', url: '/u/x.html' }], name)
     saveBatch([{ id: 'anon:abc1', title: '真实A' }], name) // 同 id 无 url → 不应降级
     assertEqual(readMessages(p).length, 1, `真实 anon:... id 应保持 id 权威跨 url 合并，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('历史 anon:hash 自身内容键仍降级匿名并跨运行去重（兼容保留）', async () => {
     // 旧版 App 曾把 anonKey(自身字段) 写入 id 字段落缓存；该 id 与自身内容哈希一致 → 仍降级
     // 为匿名，与同内容的无 id 消息判同一身份（兼容路径不受影响）。
-    const fs = require('fs')
     const name = 'test_identity_legacy_anon_id.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const legacyId = anonKey('历史标题', '历史内容')
     saveBatch([{ id: legacyId, title: '历史标题', content: '历史内容' }], name)
     saveBatch([{ title: '历史标题', content: '历史内容' }], name) // 无 id → anonKey 相同
     assertEqual(readMessages(p).length, 1, `历史 anon:hash id 应降级匿名并与同内容无 id 消息去重，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('id为null的记录不与正常记录误合并（v3.20审查2）', () => {
@@ -4992,35 +5017,32 @@ console.log('========================================\n');
   console.log('\n📂 C006 继承属性 id 判重 vs 落盘丢 id')
 
   await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', async () => {
-    const fs = require('fs')
     const name = 'test_c006_inherited_noown.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([Object.create({ id: 'X' })], name)
     assertEqual(readMessages(p).length, 0, `仅继承 id 且无自有字段的消息不应落盘，实际${readMessages(p).length}`)
     assertEqual(isMessageInFile(Object.create({ id: 'X' }), name), false, '仅继承 id 且无自有字段的消息不应命中')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('C006 继承 id 不参与判重（同构造含自有字段消息 saveBatch 后 has 命中）', async () => {
-    const fs = require('fs')
     const name = 'test_c006_inherited_ownfields.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const mk = () => { const m = Object.create({ id: 'X' }); m.title = '继承ID消息'; return m }
     saveBatch([mk()], name)
     assertEqual(isMessageInFile(mk(), name), true, '继承 id 不应参与判重，同构造消息应命中')
     const stored = readMessages(p)
     assertEqual(stored.length, 1, `同构造消息应合并为1条，实际${stored.length}`)
     assertEqual(Object.prototype.hasOwnProperty.call(stored[0], 'id'), false, '落盘副本不应携带继承 id')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('C006 自有 id 正常判重', async () => {
-    const fs = require('fs')
     const name = 'test_c006_own_id.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const mk = () => {
       const m = Object.create({ id: 'X' })
       m.id = 'own-X'
@@ -5030,18 +5052,17 @@ console.log('========================================\n');
     saveBatch([mk()], name)
     assertEqual(isMessageInFile(mk(), name), true, '自有 id 应正常判重命中')
     assertEqual(readMessages(p).length, 1, `自有 id 同构造消息应合并为1条，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('C006 原身份用例不回归（普通自有 id/url 判重）', async () => {
-    const fs = require('fs')
     const name = 'test_c006_regress.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ id: 'c006-a', url: '/c006.html', title: 'old' }], name)
     saveBatch([{ id: 'c006-a', url: '/c006-other.html', title: 'new' }], name)
     assertEqual(readMessages(p).length, 1, `同自有 id 跨 url 仍应合并为1条，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('decodeHtmlEntities 超BMP emoji 实体（v3.20审查7：fromCodePoint）', () => {
@@ -5138,9 +5159,9 @@ console.log('========================================\n');
     const fs = require('fs')
     const dir = path.dirname(p)
     const raw = JSON.stringify({ foo: 'bar' })
-    const wipeBaks = () => { try { for (const n of fs.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(dir, n)) } catch (e) { /* 忽略 */ } }
+    const wipeBaks = () => { for (const n of fs.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(dir, n)) }
     wipeBaks()
-    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p)
     delete MessageStore._memoryCache[p]
     MessageStore._verified.delete(p)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
@@ -5189,7 +5210,7 @@ console.log('========================================\n');
       const r = readMessages(fp)
       assertEqual(r.length, 2, '有效 ID 不应被旧垃圾 URL 判重拦截')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -5307,7 +5328,6 @@ console.log('========================================\n');
   })
 
   await test('cache.dir 指向普通文件 → 回退安全缓存目录而不崩溃', () => {
-    const fs = require('fs')
     const name = 'test_cache_regular_file_dir.json'
     const original = Config.cache.dir
     let p = ''
@@ -5318,7 +5338,7 @@ console.log('========================================\n');
       saveBatch([{ id: 'regular-dir-safe' }], name)
       assertEqual(readMessages(p).length, 1, '回退目录应能正常落盘缓存')
     } finally {
-      try { fs.unlinkSync(p) } catch (e) {}
+      unlinkQuiet(p)
       Config.cache.dir = original
     }
   })
@@ -5350,7 +5370,7 @@ console.log('========================================\n');
     assertEqual(normUrl('  / '), '', '纯斜杠空白归空')
     assertEqual(normUrl('/\t/  /x/ '), 'x', '交替空白/斜杠线性剥离')
     // 清理可能残留的旧缓存文件
-    try { require('fs').unlinkSync(getFilePath('test_urlnorm.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_urlnorm.json'))
     // 同一 url 不同形态（尾斜杠）→ 应判重为 1 条
     saveBatch([{ url: '/dup2.html' }], 'test_urlnorm.json')
     saveBatch([{ url: 'dup2.html/' }], 'test_urlnorm.json')
@@ -5669,7 +5689,7 @@ console.log('========================================\n');
       assertEqual(fs.existsSync(p + '.tmp'), false, '不应有 tmp 残留')
     } finally {
       // 自清理：避免超长文件残留污染缓存目录（与其余测试的 unlinkSync 清理一致）
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
     }
   })
 
@@ -5948,10 +5968,9 @@ console.log('========================================\n');
   })
 
   await test('契约: 核心判重链路导出互相一致(has/save/saveBatch 同口径)', () => {
-    const fs = require('fs')
     const mod = require('./xbk_function_v3.js')
     const f = 'test_contract_dedup.json'
-    try { fs.unlinkSync(mod.getFilePath(f)) } catch (e) {}
+    unlinkQuiet(mod.getFilePath(f))
     mod.appendMessageToFile({ id: 1, title: 'A' }, f)
     mod.appendMessageToFile({ id: 1, title: 'B' }, f)
     mod.saveBatch([{ id: 2, title: 'C' }], f)
@@ -6487,19 +6506,18 @@ console.log('========================================\n');
   })
 
   await test('内存: _memoryCache 上限防御（防无限增长泄漏）', async () => {
-    const fs = require('fs')
     // 写入 105 个不同文件名 → 内存缓存 key 超 100 应触发重置（磁盘权威不受影响）
     for (let i = 0; i < 105; i++) saveBatch([{ id: i }], 'test_memo_' + i + '.json')
     // 重置后重新读取仍正常（从磁盘恢复）
     const r = readMessages(getFilePath('test_memo_50.json'))
     assertEqual(Array.isArray(r) && r.length === 1, true, '超限重置后读取应正常')
     // 清理
-    for (let i = 0; i < 105; i++) { try { fs.unlinkSync(getFilePath('test_memo_' + i + '.json')) } catch (e) {} }
+    for (let i = 0; i < 105; i++) unlinkQuiet(getFilePath('test_memo_' + i + '.json'))
   })
 
   await test('竞态: 并发 saveBatch 到同一文件不损坏', async () => {
     const fs = require('fs')
-    try { fs.unlinkSync(getFilePath('test_race.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_race.json'))
     const batches = []
     for (let i = 0; i < 10; i++) batches.push([{ id: i, title: 't' + i }])
     await Promise.all(batches.map(b => Promise.resolve().then(() => saveBatch(b, 'test_race.json'))))
@@ -6691,9 +6709,8 @@ console.log('========================================\n');
   })
 
   await test('判重: 布尔/对象/Symbol id 不误合并（v3.20 id:null 修复的同类漏网）', () => {
-    const fs = require('fs')
     // 布尔 id：false/true 曾被 String('false') 判为有效 → 不同数据误合并
-    try { fs.unlinkSync(getFilePath('test_boolid.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_boolid.json'))
     saveBatch([
       { id: false, url: '/a', title: '甲' },
       { id: false, url: '/b', title: '乙' },
@@ -6703,7 +6720,7 @@ console.log('========================================\n');
     assertEqual(r.length, 3, `布尔 id 应走 url 判重各存 1 条，实际 ${r.length}`)
     // 对象/Symbol id 同样无效
     const symId = Symbol('s')
-    try { fs.unlinkSync(getFilePath('test_objid.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_objid.json'))
     saveBatch([
       { id: {}, url: '/x', title: '对象甲' },
       { id: {}, url: '/y', title: '对象乙' },
@@ -6746,7 +6763,7 @@ console.log('========================================\n');
   await test('故障注入: fs.writeFileSync 抛错 → saveMessages 不崩溃', () => {
     const fs = require('fs')
     const p = getFilePath('test_fault.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const orig = fs.writeFileSync
     fs.writeFileSync = () => { throw new Error('磁盘满') }
     try {
@@ -6756,7 +6773,7 @@ console.log('========================================\n');
       assertEqual(fs.existsSync(p), false, '写失败后不得留下目标文件（半成品）')
     } finally {
       fs.writeFileSync = orig
-      try { fs.unlinkSync(p) } catch (e) {}
+      unlinkQuiet(p)
     }
   })
 
@@ -6802,7 +6819,7 @@ console.log('========================================\n');
       assertEqual(fs.existsSync(p + '.tmp'), false, 'tmp 应被清理')
     } finally {
       fs.renameSync = orig
-      try { fs.unlinkSync(p) } catch (e) {}
+      unlinkQuiet(p)
     }
   })
 
@@ -6810,7 +6827,7 @@ console.log('========================================\n');
     const fs = require('fs')
     const name = 'test_save_batch_persist_fail.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     // 先建立空的内存缓存快照，再模拟 rename 失败。
     readMessages(p)
     const orig = fs.renameSync
@@ -6821,14 +6838,14 @@ console.log('========================================\n');
       fs.renameSync = orig
     }
     assertEqual(isMessageInFile({ id: 991 }, name), false, '落盘失败的消息不能被内存缓存判定为已处理')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('故障注入: 缓存损坏且重置 rename 失败 → 不污染内存，恢复后可重新读取', () => {
     const fs = require('fs')
     const name = 'test_reset_failure_memory.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, '{bad json', 'utf8')
     const origRename = fs.renameSync
     fs.renameSync = () => { throw new Error('reset rename 失败') }
@@ -6841,14 +6858,14 @@ console.log('========================================\n');
     fs.writeFileSync(p, JSON.stringify([{ id: 992 }]), 'utf8')
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 992), true, '重置失败时不能缓存空数组，恢复后应重新读到磁盘内容')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('故障注入: 缓存读取 ioError → 不缓存空结果，恢复后重新读取', () => {
     const fs = require('fs')
     const name = 'test_read_failure_memory.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, JSON.stringify([{ id: 993 }]), 'utf8')
     const origRead = fs.openSync
     // STG-01：缓存内容改由 fd 有界读取（openSync + readSync），注入 readFileSync 不再影响内容读取；
@@ -6864,7 +6881,7 @@ console.log('========================================\n');
     }
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 993), true, '读取恢复后必须重新读取文件')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   // C5-019：原用例在「CACHE 已存在」时 mkdirSync 根本不会被调用（注入点不可达），收尾再写
@@ -6900,8 +6917,8 @@ console.log('========================================\n');
     // ① 正例——真删 test_ 前缀残留，且不碰同目录的非 test_ 文件（真实 push.json 就在同目录）；
     const probe = getFilePath('test_c4005_probe.json')
     const keep = path.join(CACHE, 'c4005_keep.json')
-    try { fs.unlinkSync(probe) } catch (e) {}
-    try { fs.unlinkSync(keep) } catch (e) {}
+    unlinkQuiet(probe)
+    unlinkQuiet(keep)
     fs.writeFileSync(probe, '[]')
     fs.writeFileSync(keep, '[]')
     assertEqual(fs.existsSync(probe), true, '前置：test_ 探针文件应已创建')
@@ -6916,7 +6933,7 @@ console.log('========================================\n');
       assert.doesNotThrow(() => cleanupTestCache(), 'readdirSync 抛错时 cleanupTestCache 不得抛出')
     } finally {
       fs.readdirSync = orig
-      try { fs.unlinkSync(keep) } catch (e) {}
+      unlinkQuiet(keep)
     }
   })
 
@@ -6925,7 +6942,7 @@ console.log('========================================\n');
     const circular = { id: 1, title: '循环' }
     circular.self = circular // 循环引用
     const p = getFilePath('test_circular.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     // C5-019：契约是「序列化失败不抛」（旧 assertEqual(true,true) 永远不会红）；saveMessages
     // 还必须做到「内存保留、磁盘无半成品」——半个 JSON 会被下一次读盘当成有效缓存。
     assert.doesNotThrow(() => saveMessages(p, [circular]), 'saveMessages 循环引用应容错，不得抛')
@@ -6994,7 +7011,7 @@ console.log('========================================\n');
 
   await test('一致性: save 后内存缓存与磁盘文件一致', () => {
     const fs = require('fs')
-    try { fs.unlinkSync(getFilePath('test_mem_disk.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_mem_disk.json'))
     appendMessageToFile({ id: 1, title: 'A' }, 'test_mem_disk.json')
     appendMessageToFile({ id: 2, title: 'B' }, 'test_mem_disk.json')
     const mem = readMessages(getFilePath('test_mem_disk.json')) // 走内存缓存
@@ -7004,7 +7021,7 @@ console.log('========================================\n');
 
   await test('一致性: 多轮 saveBatch 后内存与磁盘同步', () => {
     const fs = require('fs')
-    try { fs.unlinkSync(getFilePath('test_mem_disk2.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_mem_disk2.json'))
     for (let i = 0; i < 5; i++) saveBatch([{ id: i }], 'test_mem_disk2.json')
     const mem = readMessages(getFilePath('test_mem_disk2.json'))
     const disk = JSON.parse(fs.readFileSync(getFilePath('test_mem_disk2.json'), 'utf8'))
@@ -7551,7 +7568,7 @@ console.log('========================================\n');
       const p = getFilePath('test_102_cache.json')
       assertEqual(typeof p, 'string', '应返回字符串路径（回退默认目录）')
       assertEqual(p.includes('xianbaoku_cache'), true, `应回退默认缓存目录: ${p}`)
-      try { require('fs').unlinkSync(p) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
     } finally {
       Config.cache.dir = orig
     }
@@ -7564,8 +7581,8 @@ console.log('========================================\n');
     const link = path.join(__dirname, 'test_cache_symlink_probe')
     const target = path.join(os.tmpdir(), 'xbk-cache-symlink-target')
     try {
-      try { fs.unlinkSync(link) } catch (e) { /* 不存在 */ }
-      try { fs.rmdirSync(target) } catch (e) { /* 不存在 */ }
+      unlinkQuiet(link)
+      rmdirQuiet(target)
       fs.mkdirSync(target, { recursive: true })
       fs.symlinkSync(target, link, 'dir')
       Config.cache.dir = 'test_cache_symlink_probe'
@@ -7573,8 +7590,8 @@ console.log('========================================\n');
       assertEqual(fs.realpathSync(path.dirname(p)).startsWith(path.resolve(__dirname) + path.sep), true, `符号链接缓存目录不应逃逸: ${p}`)
     } finally {
       Config.cache.dir = orig
-      try { fs.unlinkSync(link) } catch (e) { /* 忽略 */ }
-      try { fs.rmdirSync(target) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(link)
+      rmdirQuiet(target)
     }
   })
 
@@ -7793,13 +7810,12 @@ console.log('========================================\n');
         assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认 10000 不裁剪')
       })
     } finally {
-      try { require('fs').unlinkSync(p) } catch (e) { /* 文件不存在即视为无残留 */ }
-      try { require('fs').unlinkSync(p + '.tmp') } catch (e) { /* 文件不存在即视为无残留 */ }
+      unlinkQuiet(p)
+      unlinkQuiet(p + '.tmp')
     }
   })
 
   await test('安全: readMessages 原型键 __proto__ 防御（R5-2）', () => {
-    const fs = require('fs')
     const p = getFilePath('__proto__')
     try {
       // 首次读：原型键不走内存直读（hasOwnProperty false）→ 磁盘初始化空数组
@@ -7812,9 +7828,9 @@ console.log('========================================\n');
       assertEqual(Object.prototype.constructor, Object, 'Object.prototype 不被污染')
       assertEqual(Object.prototype.polluted, undefined, '无 polluted 残留')
     } finally {
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
       // readMessages 直接传 '__proto__'（触发原型键分支）时 _ensureFileExists 会在 cwd 创建文件——测试后清理
-      try { fs.unlinkSync(require('path').join(__dirname, '__proto__')) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(require('path').join(__dirname, '__proto__'))
     }
   })
 
@@ -8200,10 +8216,7 @@ console.log('========================================\n');
       throw new Error(`IO fuzz 失败 name="${String(lastName).slice(0, 40)}" content=${JSON.stringify(lastContent).slice(0, 40)}: ${e.message}`)
     } finally {
       // v3.155：清理本测试实际写过的文件（曾声称"自动清理"但未实现，跑完留乱码名垃圾如 01Zc;Z.json）
-      try {
-        const fs = require('fs')
-        for (const fp of written) { try { fs.unlinkSync(fp) } catch (e) { /* 忽略 */ } }
-      } catch (e) { /* 清理失败忽略 */ }
+      for (const fp of written) { unlinkQuiet(fp) }
     }
   })
 
@@ -8363,7 +8376,7 @@ console.log('========================================\n');
     const rand = makeRand(3141592)
     const file = 'test_107_store.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // 随机写入 50 条（含重复 id）
       const msgs = []
@@ -8389,7 +8402,7 @@ console.log('========================================\n');
       // 查询不存在的 id → false（has(message, filename) 参数顺序）
       assertEqual(isMessageInFile({ id: 99999, title: 'n' }, file), false, '不存在的 id 查不到')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -8725,11 +8738,11 @@ console.log('========================================\n');
     assertEqual(validUrl('java\nscript:alert(1)'), '', '危险协议不应参与判重')
     const name = 'test_identity_url_contract.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, JSON.stringify([{ url: '[object Object]', title: '旧伪URL' }]), 'utf8')
     saveBatch([{ url: {}, title: '新匿名消息' }], name)
     assertEqual(readMessages(p).length, 2, '旧伪 URL 与新脏 URL 不应互相吞掉')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('异常 getter 字段在模板/HTML/缓存路径均安全降级（v3.231）', () => {
@@ -8783,7 +8796,7 @@ console.log('========================================\n');
     benchRetry(() => {
       saveBatch(msgs, 'test_112_perf.json')
     }, 500, '5000 条 saveBatch')
-    try { require('fs').unlinkSync(getFilePath('test_112_perf.json')) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(getFilePath('test_112_perf.json'))
   })
 
   await test('一致性: saveBatch 索引判重 vs 逐条 upsert 结果一致（随机数据）', () => {
@@ -8806,27 +8819,27 @@ console.log('========================================\n');
       const msgs = mkMsgs()
       // A: saveBatch（索引版）
       const fa = getFilePath('test_112_cmp_a.json')
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
       saveBatch(msgs, 'test_112_cmp_a.json')
       const ra = readMessages(fa).map(x => ({ id: x.id, title: x.title, url: x.url }))
       // B: 逐条 appendMessageToFile（原 _upsert 逻辑，每批同序）
       const fb = getFilePath('test_112_cmp_b.json')
-      try { require('fs').unlinkSync(fb) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fb)
       for (const msg of msgs) {
         if (msg && typeof msg === 'object' && !Array.isArray(msg)) appendMessageToFile(msg, 'test_112_cmp_b.json')
       }
       const rb = readMessages(fb).map(x => ({ id: x.id, title: x.title, url: x.url }))
       // 结果数组必须一致（顺序 + 内容）
       assertEqual(JSON.stringify(ra), JSON.stringify(rb), `第${round}轮 saveBatch 与逐条 upsert 结果应一致`)
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
-      try { require('fs').unlinkSync(fb) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
+      unlinkQuiet(fb)
     }
   })
 
   await test('一致性: 更新后索引维护（id 变化/url 失效）', () => {
     const file = 'test_112_reindex.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       saveBatch([{ id: 1, title: 'old', url: '/a' }], file)
       saveBatch([{ id: 1, title: 'new', url: '/b' }], file) // 同 id 更新，url 变化
@@ -8842,7 +8855,7 @@ console.log('========================================\n');
       assertEqual(readMessages(fp).length, 2, '混合后 2 条')
       assertEqual(isMessageInFile({ id: 1, title: 'final' }, file), true, 'id1 更新')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -8855,7 +8868,7 @@ console.log('========================================\n');
   await test('一致性: 同批内「先更新位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_update.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // msg2 就地把位置 0 的 url 由 /x.html 换成 /y.html；msg3 再按「更新后的 url」做 url-only 匹配，
       // 必须命中位置 0。若更新路径未同步 identOf[0]，msg3 会读到旧身份（/x.html）→ 匹配失败 → 误追加。
@@ -8874,14 +8887,14 @@ console.log('========================================\n');
       assertEqual(disk.length, 1, `落盘应同为 1 条，实际 ${disk.length} 条`)
       assertEqual(disk[0].title, 'urlonly', '落盘记录应为就地更新后的 url-only 消息')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   await test('一致性: 同批内「先新增位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_push.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // msg1 新增位置 0（id 身份、带 url /z.html）；msg2 按该 url 做 url-only 匹配必须命中位置 0。
       // 若新增路径未登记 identOf[0]，候选回调会读到 undefined 身份而抛错（或漏匹配成 2 条）。
@@ -8898,14 +8911,14 @@ console.log('========================================\n');
       assertEqual(disk.length, 1, `落盘应同为 1 条，实际 ${disk.length} 条`)
       assertEqual(disk[0].title, 'B', '落盘记录应为就地更新后的 url-only 消息')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   await test('一致性: 同批内 urlOnlyMap 候选（c2 分支）身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_c2.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // c2 分支（xbk_message_store.js 的 firstIndex(urlOnlyMap, identity.url, …)）只在
       // 「缓存位置上挂着纯 url 身份」时才有候选。构造：脏缓存位置 0 是 id 身份（id c1 + url /c2.html），
@@ -8925,7 +8938,7 @@ console.log('========================================\n');
       assertEqual(r[0].title, 'idagain', '位置 0 标题应为末条消息（就地更新）')
       assertEqual(r[0].url, '/c2.html', '位置 0 url 应保持 /c2.html')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -8965,11 +8978,11 @@ console.log('========================================\n');
       }
       // A：saveBatch（索引版）
       const fa = getFilePath(fname)
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
       require('fs').writeFileSync(fa, JSON.stringify(dirty))
       for (const batch of batches) saveBatch(batch, fname)
       const ra = readMessages(fa).map(x => ({ id: x.id === undefined ? undefined : String(x.id), title: x.title, url: x.url }))
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
       // B：旧 findIndex 逻辑（同数据）
       const arr = dirty.map(x => ({ ...x }))
       for (const batch of batches) {
@@ -8987,7 +9000,7 @@ console.log('========================================\n');
     // 场景：同 url 多条无 id 脏缓存，首条被 id 消息覆盖，再有无 id 同 url 消息
     const fname = 'test_113_dirty.json'
     const fp = getFilePath(fname)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       require('fs').writeFileSync(fp, JSON.stringify([{ title: 'x1', url: '/u/1' }, { title: 'x2', url: '/u/1' }]))
       saveBatch([{ id: 5, title: 'id5', url: '/u/1' }], fname)
@@ -8997,7 +9010,7 @@ console.log('========================================\n');
       assertEqual(r[0].title, 'noId', '无 id 消息更新了 index 0（id5 那条，url 匹配首个）')
       assertEqual(r[1].title, 'x2', 'x2 保留')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -9027,21 +9040,19 @@ console.log('========================================\n');
     assertEqual(normUrl('/a?x=1&utm_source=x'), 'a?x=1')
     assertEqual(normUrl('/a#sec'), 'a')
     assertEqual(normUrl('https://A.com/p?u=1&t=2#top'), 'https://a.com/p?u=1&t=2')
-    const fs = require('fs')
     const p = getFilePath('test_q156.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ url: '/a?x=1', title: '同' }], 'test_q156.json')
     saveBatch([{ url: '/a?x=2', title: '同' }], 'test_q156.json')
     assertEqual(readMessages(p).length, 2, '不同业务 query 不应判重')
     saveBatch([{ url: '/a?x=1&utm_source=x', title: '同' }], 'test_q156.json')
     assertEqual(readMessages(p).length, 2, '仅追踪参数差异应判重')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('saveBatch 同内容更新不误报"更新缓存记录"（#5）', () => {
-    const fs = require('fs')
     const p = getFilePath('test_ts156.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ id: 1, title: 'A' }], 'test_ts156.json')
     const logs = []
     const orig = console.log
@@ -9052,7 +9063,7 @@ console.log('========================================\n');
       console.log = orig
     }
     assertEqual(logs.some(l => l.includes('更新缓存记录')), false, '内容相同不应报更新（曾因 timestamp 差异误报）')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   // ==================== 101. v3.157 修复 ====================
@@ -9077,11 +9088,11 @@ console.log('========================================\n');
   await test('readMessages 数组元素被排除（#21）', () => {
     const fs = require('node:fs')
     const p = getFilePath('test_arr157.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, JSON.stringify([{ id: 1, title: 'A' }, [1, 2], 'str', null]), 'utf8')
     const r = readMessages(p)
     assertEqual(r.length, 1, '数组/字符串/null 应被排除，仅保留对象')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('getFileName 坏源命名（#10/49）', () => {
@@ -9767,7 +9778,7 @@ console.log('========================================\n');
     // 组/其他用户无需访问该测试缓存目录，且 0o755 会被 SonarCloud S2612 判为过宽权限
     // （本行一旦被某个 PR 改动就会变成「新代码」告警，正是 #140 门禁变红的同款触发方式）。
     require('fs').chmodSync(CACHE, 0o700)
-    try { require('fs').unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
+    unlinkQuiet(p)
     assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）')
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
   })
@@ -9777,7 +9788,6 @@ console.log('========================================\n');
   // ============================================================
 
   await test('B8-F3: 墓碑瞬时读失败不永久记忆——下次调用重试并恢复防重放身份', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f3_retry.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
@@ -9812,16 +9822,15 @@ console.log('========================================\n');
       MessageStore._readTombstoneData = realRead
       MessageStore._tombstoneLoaded.delete(fp)
       MessageStore._tombstones.delete(fp)
-      try { fsmod.unlinkSync(seenPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(seenPath)
     }
   })
 
   await test('B8-F3: 墓碑文件确认缺失仍置位（不做每次判重的同步磁盘 IO）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f3_missing.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp + '.seen.json')
     const realRead = MessageStore._readTombstoneData
     let calls = 0
     MessageStore._readTombstoneData = function (p) { calls++; return realRead.call(this, p) }
@@ -9855,7 +9864,7 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(guardPath), false, '陈旧且持有进程已退出的目录级哨兵应被启动清理回收')
     } finally {
-      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(guardPath)
     }
   })
 
@@ -9882,7 +9891,7 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(guardPath), true, '活跃进程持有的哨兵即使 mtime 陈旧也不得被删')
     } finally {
-      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(guardPath)
     }
   })
 
@@ -9911,7 +9920,7 @@ console.log('========================================\n');
       assertEqual(fsmod.existsSync(guardPath), false, 'starttime 与真实值不符（PID 复用）的陈旧哨兵应视为持有者已退出并回收')
     } finally {
       MessageStore._getTombstoneProcessStart = realStart
-      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(guardPath)
     }
   })
 
@@ -9945,7 +9954,7 @@ console.log('========================================\n');
       assertEqual(fsmod.existsSync(fp), true, '合法缓存文件必须保留——被启动清理删除即整份判重记录丢失（下一轮全量重推）')
       assertEqual(fsmod.readFileSync(fp, 'utf8'), body, '合法缓存文件内容不得被改动')
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -9963,7 +9972,7 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(reclaimPath), false, '陈旧且持有进程已退出的 .reclaim 残留应被回收（回退该判据即红）')
     } finally {
-      try { fsmod.unlinkSync(reclaimPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(reclaimPath)
     }
   })
 
@@ -9973,9 +9982,9 @@ console.log('========================================\n');
     const fp = getFilePath(name)
     const dir = path.dirname(fp)
     const raw = '{ 这不是合法 JSON'
-    const wipeBaks = () => { try { for (const n of fsmod.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) fsmod.unlinkSync(path.join(dir, n)) } catch (e) { /* 忽略 */ } }
+    const wipeBaks = () => { for (const n of fsmod.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(dir, n)) }
     wipeBaks()
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     // 造一个「文件存在但内容不可解析」的损坏缓存：readMessages 走 F1 隔离重建分支
     fsmod.writeFileSync(fp, raw)
     delete MessageStore._memoryCache[fp]
@@ -9992,7 +10001,7 @@ console.log('========================================\n');
     assertEqual(accepted, true, '隔离重建后 saveBatch 必须放行（旧行为 = 永久拒绝 → 整轮零推送）')
     assertEqual(JSON.parse(fsmod.readFileSync(fp, 'utf8')).some((m) => m.id === 'f5-unblocked'), true, '解除保护后新条目必须真正落盘')
     wipeBaks()
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
   })
 
   await test('B8-F5: 成功读回磁盘后写闸门自动解除（既有解除路径不退化）', () => {
@@ -10016,8 +10025,8 @@ console.log('========================================\n');
   await test('B8-F-05: saveBatch 返回布尔——成功/空入参/无效身份/落盘失败口径一致', () => {
     const name = 'test_b8_f05_ret.json'
     const fp = getFilePath(name)
-    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
-    try { require('node:fs').unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
+    unlinkQuiet(fp + '.seen.json')
     MessageStore._memoryCache = {}
     MessageStore._memoCount = 0
     MessageStore._verified.clear()
@@ -10042,8 +10051,8 @@ console.log('========================================\n');
     assertEqual(MessageStore._readFailed[fp], undefined, '隔离重建后写闸门必须解除')
     const f05Baks = require('node:fs').readdirSync(path.dirname(fp)).filter((n) => n.startsWith(name + '.corrupt.'))
     assertEqual(f05Baks.length, 1, '解析失败必须留下隔离备份（只隔离不删除）')
-    for (const n of f05Baks) { try { require('node:fs').unlinkSync(path.join(path.dirname(fp), n)) } catch (e) { /* 忽略 */ } }
-    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    for (const n of f05Baks) { unlinkQuiet(path.join(path.dirname(fp), n)) }
+    unlinkQuiet(fp)
     delete MessageStore._readFailed[fp]
     delete MessageStore._memoryCache[fp]
     MessageStore._verified.delete(fp)
@@ -10054,10 +10063,9 @@ console.log('========================================\n');
   })
 
   await test('B8-F-02: 索引被原地改写后 has 不得误判为已存在（陈旧索引）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_stale.json'
     const fp = getFilePath(name)
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     saveMessages(fp, [{ id: 'f02-a', title: 'A' }, { id: 'f02-b', title: 'B' }, { id: 'f02-c', title: 'C' }])
     const arr = readMessages(fp)
     // 先让 _identityIndex 建立并缓存该数组的索引
@@ -10080,7 +10088,6 @@ console.log('========================================\n');
   // R4：B8 原「等价性对照」全程不改写数组 → 任何实现都通过（零区分力），替换为**逐形态**的
   // 原地改写 + 线性扫描 oracle 对拍。oracle = _indexHasIdentityDirect（零索引、独立实现）。
   await test('B8-F-02: 原地改写各形态下索引判重必须与线性扫描 oracle 逐值一致', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_oracle.json'
     const fp = getFilePath(name)
     const seed = () => [
@@ -10124,7 +10131,7 @@ console.log('========================================\n');
     ]
     try {
       for (const form of forms) {
-        try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+        unlinkQuiet(fp)
         saveMessages(fp, seed())
         const arr = readMessages(fp)
         assertEqual(isMessageInFile({ id: 'f02-a' }, name), true, `前置：${form.label} 前索引必须已建立`)
@@ -10137,19 +10144,18 @@ console.log('========================================\n');
         }
       }
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   // R4 性能守位（B8 的取舍理由：逐位复检每次 ~20ms 会打死热路径）：修复只为「每个数组版本」
   // 付一次未命中复检，之后稳态 O(1)。断言重建次数上界——把复检改成「每次未命中都重建」时必红。
   await test('B8-F-02: 批量未命中不得每次重建索引（每数组版本至多一次 O(n) 复检）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_perf.json'
     const fp = getFilePath(name)
     const msgs = []
     for (let i = 0; i < 2000; i++) msgs.push({ id: 'f02p-' + i })
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     saveMessages(fp, msgs)
     const arr = readMessages(fp)
     assertEqual(isMessageInFile({ id: 'f02p-0' }, name), true, '前置：索引已建立且命中')
@@ -10163,7 +10169,7 @@ console.log('========================================\n');
       }
     } finally {
       MessageStore._buildIdentityIndex = realBuild
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
     assertEqual(builds >= 1, true, '首次未命中必须做一次全量复检（否则原地写入的新身份查不到——F-02 修复机制被删即红）')
     assertEqual(builds <= 2, true, `1000 次未命中最多重建 1~2 次索引，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
@@ -10175,10 +10181,9 @@ console.log('========================================\n');
   // 但同样与线性扫描 oracle 不一致）。修法：未命中路径补两条旋转抽查窗（引用层 32 位置 / 身份层
   // 2 位置；n <= 8 时覆盖全表 ⇒ 首次未命中即精确）。两条窗都停掉时本条真红。
   await test('B8-F-02: 未命中重建后再原位替换非首元素，has 必须自愈（W2 粘滞反例）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_sticky.json'
     const fp = getFilePath(name)
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     saveMessages(fp, [{ id: 'st-a' }, { id: 'st-b' }, { id: 'st-c' }])
     const arr = readMessages(fp)
     const oracle = (m) => MessageStore._indexHasIdentityDirect(arr, m)
@@ -10200,7 +10205,7 @@ console.log('========================================\n');
         assertEqual(got, oracle(p), `probe=${JSON.stringify(p)}：has()=${got} 必须等于 oracle=${oracle(p)}`)
       }
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -10824,10 +10829,9 @@ console.log('========================================\n');
     const name = 'test_tomb_trim_on_write.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    const fsmod = require('node:fs')
     const lockPath = fp + '.seen.lock'
-    try { fsmod.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
-    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(lockPath)
+    unlinkQuiet(fp + '.seen.json')
     const token = MessageStore._acquireTombstoneLock(lockPath)
     assertEqual(typeof token === 'string' && token.length > 0, true, '前置：应拿到墓碑锁')
     const dropped = []
@@ -10855,7 +10859,7 @@ console.log('========================================\n');
     const fp = getFilePath('test_tomb_readdata.json')
     const fsmod = require('node:fs')
     const seen = fp + '.seen.json'
-    try { fsmod.unlinkSync(seen) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(seen)
     try {
       assertEqual(MessageStore._readTombstoneData(fp), null, '缺失应返回 null')
       fsmod.writeFileSync(seen, '{not json')
@@ -10872,7 +10876,7 @@ console.log('========================================\n');
       const d = MessageStore._readTombstoneData(fp)
       assertEqual(!!d && Array.isArray(d.id) && d.id.length === 2, true, '合法文件应解析')
     } finally {
-      try { fsmod.unlinkSync(seen) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(seen)
     }
   })
 
@@ -10886,7 +10890,7 @@ console.log('========================================\n');
   await test('P4 _writeState 类型守卫：非对象/数组拒绝，合法对象原子落盘', () => {
     const fp = getFilePath('test_state_write.json')
     const fsmod = require('node:fs')
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     const oldWarn = console.warn
     console.warn = () => {}
     try {
@@ -10899,7 +10903,7 @@ console.log('========================================\n');
       assertEqual(JSON.parse(fsmod.readFileSync(fp, 'utf8')).lastAt, 123, '内容应正确')
     } finally {
       console.warn = oldWarn
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -10923,7 +10927,7 @@ console.log('========================================\n');
   await test('P4 _readSafeState 缺失/损坏/超限/合法四态', () => {
     const fp = getFilePath('test_state_read.json')
     const fsmod = require('node:fs')
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       assertEqual(V3App._readSafeState(fp).status, 'missing', '缺失应 missing')
       fsmod.writeFileSync(fp, '{bad')
@@ -10939,7 +10943,7 @@ console.log('========================================\n');
       fsmod.writeFileSync(fp, JSON.stringify({ lastAt: 123 }))
       assertEqual(V3App._readSafeState(fp).status, 'ok', '合法小文件应 ok')
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -10971,7 +10975,6 @@ console.log('========================================\n');
   await test('P4 _sendAlert 未启用/限频内不发，lastAt=NaN 绕过限频（v3.251）', async () => {
     const saved = { alert: JSON.stringify(Config.alert), map: new Map(V3App._alertLastAtByPath) }
     const statePath = path.join(MessageStore.cacheDir, 'alert.state')
-    const fsmod = require('node:fs')
     const pusherMod = require('./xbk_function_v3.js').Pusher
     const origSend = pusherMod.send
     try {
@@ -10995,7 +10998,7 @@ console.log('========================================\n');
       pusherMod.send = origSend
       Config.alert = JSON.parse(saved.alert)
       V3App._alertLastAtByPath = saved.map
-      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(statePath)
     }
   })
 
@@ -11003,14 +11006,14 @@ console.log('========================================\n');
     const saved = { report: JSON.stringify(Config.report) }
     const statePath = path.join(MessageStore.cacheDir, 'report.state')
     const fsmod = require('node:fs')
-    try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(statePath)
     try {
       Config.report = { enabled: false }
       await V3App._updateReport({ total: 1, pushed: 1 })
       assertEqual(fsmod.existsSync(statePath), false, '关闭时不得写 report.state')
     } finally {
       Config.report = JSON.parse(saved.report)
-      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(statePath)
     }
   })
 
@@ -11040,7 +11043,7 @@ console.log('========================================\n');
       pusherMod.send = origSend
       Config.report = JSON.parse(saved.report)
       V3App._reportMemoryStateByPath = saved.map
-      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(statePath)
     }
   })
 
@@ -11071,11 +11074,10 @@ console.log('========================================\n');
   })
 
   await test('P4 _upsert 防御分支：非数组/无效消息/无效身份不写', () => {
-    const fsmod = require('node:fs')
     // 清理可能残留的墓碑（f.json/f2.json 非 test_ 前缀，启动清理不会覆盖）
     for (const fn of ['f.json', 'f2.json']) {
       const fp = getFilePath(fn)
-      try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp + '.seen.json')
     }
     const arr = []
     assertEqual(MessageStore._upsert(null, { id: 1 }, 'f.json'), false, '非数组应 false')
@@ -11105,10 +11107,9 @@ console.log('========================================\n');
   })
 
   await test('P4 _upsert 撞墓碑：曾被裁剪的身份拒绝重入（防重推）', () => {
-    const fsmod = require('node:fs')
     const fp = getFilePath('test_upsert_tomb.json')
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
-    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
+    unlinkQuiet(fp + '.seen.json')
     try {
       MessageStore._tombstoneLoaded.delete(fp)
       MessageStore._saveTombstones(fp, { id: new Map([['777', true]]), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() })
@@ -11118,8 +11119,8 @@ console.log('========================================\n');
       assertEqual(arr.length, 1, '撞墓碑不得追加')
     } finally {
       MessageStore._tombstoneLoaded.delete(fp)
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
-      try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
+      unlinkQuiet(fp + '.seen.json')
     }
   })
 
@@ -11608,6 +11609,24 @@ console.log('========================================\n');
     const t = ln.trim()
     return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')
   }
+  // AST 遍历（门禁要看「代码结构」而不是行文本：字符串/注释里出现关键字不应误判）
+  const walkAst = (node, fn) => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) { node.forEach(n => walkAst(n, fn)); return }
+    if (typeof node.type === 'string') fn(node)
+    for (const k of Object.keys(node)) {
+      if (k === 'loc' || k === 'start' || k === 'end') continue
+      const v = node[k]
+      if (v && typeof v === 'object') walkAst(v, fn)
+    }
+  }
+  const parseHygiene = () => require('acorn').parse(require('fs').readFileSync(__filename, 'utf8'),
+    { ecmaVersion: 'latest', locations: true })
+  const countEmptyCatch = (ast) => {
+    const hits = []
+    walkAst(ast, n => { if (n.type === 'CatchClause' && n.body.body.length === 0) hits.push(n.loc.start.line) })
+    return hits
+  }
 
   await test('C4-024: Config.cache.maxSize 只允许经 withCacheMaxSize 修改', () => {
     // needle 拼接：门禁源码里不出现字面量，避免自己命中自己
@@ -11645,6 +11664,37 @@ console.log('========================================\n');
     } catch (e) { caught = e.message }
     assertEqual(caught, 'boom', '回调异常必须原样抛出（不得被 helper 吞掉）')
     assertEqual(Config.cache.maxSize, before, '抛错后也必须还原')
+  })
+
+  await test('C4-028: 空 catch 零容忍（清理失败必须留痕，统一走 unlinkQuiet）', () => {
+    // 判据自检：AST 门禁必须能认出空 catch（含只写注释的"空"块），否则形同虚设
+    const sample = 'try { x() } catch (e) { /* 注释不算处理 */ }'
+    const sampleAst = require('acorn').parse(sample, { ecmaVersion: 'latest', locations: true })
+    assertEqual(countEmptyCatch(sampleAst).length, 1, '判据必须能认出「只有注释」的空 catch（自检）')
+    const hits = countEmptyCatch(parseHygiene())
+    assertEqual(hits.length, 0,
+      `空 catch 会把清理失败静默吞掉（本文件 cleanupDirInRoot 已立过此规矩），改用 unlinkQuiet：第 ${hits.join(', ')} 行`)
+  })
+
+  await test('C4-028: unlinkQuiet 只吞 ENOENT，其它清理失败必须告警', () => {
+    const fsx = require('node:fs')
+    const missing = path.join(CACHE, 'test_c4028_missing.json')
+    fsx.rmSync(missing, { force: true })
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (msg) => warns.push(String(msg))
+    const dir = path.join(CACHE, 'test_c4028_dir')
+    try {
+      assertEqual(unlinkQuiet(missing), undefined, '缺失文件应静默返回（ENOENT 是正常收尾）')
+      assertEqual(warns.length, 0, 'ENOENT 不得告警（否则每次收尾都刷日志）')
+      fsx.mkdirSync(dir, { recursive: true })
+      unlinkQuiet(dir) // unlinkSync 打目录：Linux=EISDIR / macOS=EPERM，都属非 ENOENT
+      assertEqual(warns.length, 1, '非 ENOENT 的清理失败必须留痕，不得静默吞掉')
+      assertEqual(warns[0].includes(dir), true, '告警必须带上目标路径，否则无法定位残留')
+    } finally {
+      console.warn = origWarn
+      fsx.rmdirSync(dir) // 空目录：非递归删除，避免与「递归删除只允许 3 处」的既有门禁冲突
+    }
   })
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
