@@ -1477,7 +1477,7 @@ try {
       "const fs = require('node:fs')\n" +
       "fs.writeFileSync('child.pid', String(process.pid))\n" +
       "fs.writeFileSync('stryker-output-' + process.pid + '.json', JSON.stringify({ mutantCoverage: {} }))\n" +
-      "fs.closeSync(1)\nprocess.exit(0)\n")
+      'fs.closeSync(1)\nprocess.exit(0)\n')
     assert.notStrictEqual(shimClosedCoverage.status, 0, '前提：fd 1 关掉后 shim 必须以非 0 退出')
     const closedPid = fs.readFileSync(path.join(shimProbeDir, 'child.pid'), 'utf8').trim()
     const closedCoveragePath = path.join(shimProbeDir, 'stryker-output-' + closedPid + '.json')
