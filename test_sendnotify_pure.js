@@ -2442,7 +2442,7 @@ checkS('SNB-04 Bark: 传输错误（无 response）必须逐设备点名且不�
 })
 
 checkS('SNB-05 Bark: catch 分支必须留下逐设备根因（比 SN-04 下钻一层）', async () => {
-  const fx = channelFixture({ BARK_PUSH: 'dev_snb05' }, () => ({ body: brokenBody() }), { promiseOnly: true }, { logs: true })
+  const fx = channelFixture({ BARK_PUSH: 'dev_snb05' }, () => ({ body: brokenBody() }), { promiseOnly: true, logs: true })
   try {
     let threw = null
     try { await sendNotify('catch 根因', '正文') } catch (e) { threw = e }
