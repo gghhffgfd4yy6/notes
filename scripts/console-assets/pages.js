@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from 
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, searchBodyView, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -2320,12 +2320,22 @@ function SearchPanel ({ onSync, active = true }) {
   // 只认「本次请求」的结果：切关注词时 usePanelLoader 会暂留上一份 data，
   // 不校验 q 就会把 A 的条目挂在 B 下面，甚至用 A 的结果把 B 标成已读。
   const live = data && (data.status !== 'ok' || data.q === req.q) ? data : null
-  const kw = live && typeof live.q === 'string' ? live.q.trim().toLowerCase() : ''
+  // C7-002：换词/翻页时结果区不再整块卸载。`live` 的 q 校验一个字没动（它守的是数据归属：
+  // A 的条目不得挂到 B 下面，也不能用 A 的结果把 B 标成已读）；这里另存一份「上次真正画出来的
+  // 成功结果」，只在本轮响应落地前占位（stale-while-revalidate），不参与已读标记/越界回页。
+  // 旧实现只有一个数据源：req 一变 live 立刻为 null，五个渲染分支一个都不命中 → 结果区整块
+  // 消失（先一帧空白、再 3 行骨架），长列表塌成三行，移动端滚动位置被夹回去。
+  const lastShownRef = useRef(null)
+  if (live && live.status === 'ok') lastShownRef.current = live
+  const view = searchBodyView({ q: req.q, live, prev: lastShownRef.current, loading, err })
+  const stale = view === 'stale'
+  const shown = view === 'results' ? live : (stale ? lastShownRef.current : null)
+  const kw = shown && typeof shown.q === 'string' ? shown.q.trim().toLowerCase() : ''
   const hit = (text) => (typeof text === 'string' && kw.length > 0
     ? splitHits(text, kw, 8).map(([part, on], i) => on ? html`<mark key=${i}>${part}</mark>` : part)
     : text)
-  const items = live && Array.isArray(live.items) ? live.items : []
-  const pages = live && Number.isSafeInteger(live.pages) && live.pages >= 1 ? Math.min(live.pages, LS_PAGE_MAX) : 1
+  const items = shown && Array.isArray(shown.items) ? shown.items : []
+  const pages = shown && Number.isSafeInteger(shown.pages) && shown.pages >= 1 ? Math.min(shown.pages, LS_PAGE_MAX) : 1
   // 页码超出总数（比如改了每页条数后旧链接 page=19）：自动回最后一页。
   useEffect(() => {
     if (!live || live.status !== 'ok') return
@@ -2334,17 +2344,19 @@ function SearchPanel ({ onSync, active = true }) {
     }
   }, [live, pages])
   let body
-  if (req.q === '') {
+  if (view === 'prompt') {
     body = html`<div class="empty">输入关键词搜线报酷全站（含没推给你的线报）。试试「十月稻田」。</div>`
-  } else if (loading && !live) {
-    body = html`<${PanelSkeleton} label="正在搜索线报" />`
-  } else if (err) {
+  } else if (view === 'skeleton') {
+    // 只有「一份结果都没有」（首次搜索）才出骨架；换词/翻页期间由 .ls-results 的 min-height 占位。
+    body = html`<div class="ls-results"><${PanelSkeleton} label="正在搜索线报" /></div>`
+  } else if (view === 'error') {
     body = html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`
-  } else if (live && live.status === 'upstream_error') {
+  } else if (view === 'upstream') {
     body = html`<${Hint} tone="error">${live.error || '线报酷搜索暂不可用，稍后再试'}<//>`
-  } else if (live && live.status === 'ok') {
-    body = html`<div>
-      <div class="msg-count" aria-live="polite">本页 ${live.count} 条 · 第 ${live.page} / ${pages} 页${live.pagesEstimated ? ' · 页数为估算' : ''}${live.cached ? ' · 60s 内缓存' : ''}${!watched ? html` <button type="button" class="ls-follow" onClick=${addWatch}>关注「${req.q}」</button>` : ''}</div>
+  } else {
+    body = html`<div class="ls-results">
+      ${stale && html`<div class="msg-count msg-loading">正在搜索「${req.q}」… 下面还是「${shown.q}」的结果</div>`}
+      <div class="msg-count" aria-live="polite">本页 ${shown.count} 条 · 第 ${shown.page} / ${pages} 页${shown.pagesEstimated ? ' · 页数为估算' : ''}${shown.cached ? ' · 60s 内缓存' : ''}${!stale && !watched ? html` <button type="button" class="ls-follow" onClick=${addWatch}>关注「${req.q}」</button>` : ''}</div>
       ${items.length === 0
         ? html`<div class="empty">没有匹配的线报</div>`
         : html`<div class="msg-list" role="list">
@@ -2352,7 +2364,7 @@ function SearchPanel ({ onSync, active = true }) {
             <div class="msg-item-head">
               <a class="msg-title ls-title" href=${it.url} target="_blank" rel="noopener noreferrer" title=${`打开线报酷原文：${it.title}`}>${hit(it.title)}</a>
               ${typeof it.price === 'number' ? html`<span class="msg-price">¥${it.price}</span>` : ''}
-              ${req.since !== null && typeof it.ts === 'number' && it.ts > req.since ? html`<span class="ls-new">新</span>` : ''}
+              ${!stale && req.since !== null && typeof it.ts === 'number' && it.ts > req.since ? html`<span class="ls-new">新</span>` : ''}
             </div>
             <div class="msg-meta">
               ${it.catename ? html`<span class="msg-cate" aria-label=${it.catename}>${cateParts(it.catename).map((part, j) => html`<span class="msg-cate-part" key=${j}>${part}</span>`)}</span>` : ''}
@@ -2364,11 +2376,11 @@ function SearchPanel ({ onSync, active = true }) {
           </div>`)}
         </div>`}
       <div class="pager">
-        <${Button} disabled=${req.page <= 1 || loading} onClick=${() => submit(req.q, 1, req.since)}>« 首页<//>
-        <${Button} disabled=${req.page <= 1 || loading} onClick=${() => submit(req.q, req.page - 1, req.since)}>上一页<//>
-        <span class="pager-info">第 ${live.page} / ${pages} 页</span>
-        <${Button} disabled=${req.page >= pages || loading} onClick=${() => submit(req.q, req.page + 1, req.since)}>下一页<//>
-        <${Button} disabled=${req.page >= pages || loading} onClick=${() => submit(req.q, pages, req.since)}>末页 »<//>
+        <${Button} disabled=${stale || req.page <= 1 || loading} onClick=${() => submit(req.q, 1, req.since)}>« 首页<//>
+        <${Button} disabled=${stale || req.page <= 1 || loading} onClick=${() => submit(req.q, req.page - 1, req.since)}>上一页<//>
+        <span class="pager-info">第 ${shown.page} / ${pages} 页</span>
+        <${Button} disabled=${stale || req.page >= pages || loading} onClick=${() => submit(req.q, req.page + 1, req.since)}>下一页<//>
+        <${Button} disabled=${stale || req.page >= pages || loading} onClick=${() => submit(req.q, pages, req.since)}>末页 »<//>
       </div>
     </div>`
   }

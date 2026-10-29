@@ -297,6 +297,26 @@ export function splitHits (line, kw, maxHits = Infinity) {
   return out
 }
 
+// 线报搜索面板的结果区渲染决策（C7-002）。
+// 调用方的 `live` 必须已经过 q 校验（A 的结果不得挂到 B 下面），这里只管「这一帧画什么」：
+//   prompt   还没输关键词
+//   results  本次 req 的成功结果已到
+//   upstream 本次 req 得到上游错误
+//   stale    本次结果还没到，但手上有上一份成功结果 → 继续画它（stale-while-revalidate）
+//   skeleton 一份结果都没有（首次搜索）
+//   error    这次加载失败（loader 给了 err）
+// `prev` 只用于占位：换词/翻页时 req 一变 live 立刻为 null，旧实现五个体渲染分支一个都不命中，
+// 结果区整块卸载（先一帧空白再 3 行骨架）⇒ 页面高度塌陷、移动端滚动位置被夹。
+// `loading` 还没置真的那一帧（setReq 已落地、effect 未跑）也要画上一份，不能留空。
+export function searchBodyView ({ q, live, prev, loading, err }) {
+  if (q === '') return 'prompt'
+  if (live) return live.status === 'ok' ? 'results' : (live.status === 'upstream_error' ? 'upstream' : 'skeleton')
+  const reusable = prev && prev.status === 'ok' ? 'stale' : null
+  if (loading) return reusable || 'skeleton'
+  if (err) return 'error'
+  return reusable || 'skeleton'
+}
+
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
 // issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
 // 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。

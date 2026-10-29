@@ -10241,6 +10241,47 @@ async function main () {
     assert.ok(escSeg.includes('inst.close()') && escSeg.includes('restoreFocus()'),
       'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
+
+  await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
+    const src = readConsoleSource()
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.searchBodyView, 'function',
+      '结果区渲染判定必须是 pure.mjs 的纯函数（htm/React 不能在 Node 里跑，行为只能在这测）')
+    const a = { status: 'ok', q: 'a', page: 1, pages: 3, count: 20, items: [] }
+    const b = { status: 'ok', q: 'b', page: 1, pages: 1, count: 5, items: [] }
+    assert.strictEqual(pure.searchBodyView({ q: '', live: null, prev: a, loading: false, err: '' }), 'prompt',
+      '空关键词只提示输入')
+    assert.strictEqual(pure.searchBodyView({ q: 'a', live: null, prev: null, loading: true, err: '' }), 'skeleton',
+      '首次搜索（一份结果都没有）才出骨架')
+    // 关键回归：setReq 已落地、loading 还没置真的那一帧——旧实现五个分支一个都不命中，body 是
+    // undefined，结果区整块空白（长列表塌成 0 行）后才补骨架。
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: a, loading: false, err: '' }), 'stale',
+      '换词那一帧必须继续画上一份结果（旧实现这里 body 为 undefined，整块空白）')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: a, loading: true, err: '' }), 'stale',
+      '本轮响应未到时继续画上一份结果，不得换回 3 行骨架')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: b, prev: a, loading: false, err: '' }), 'results',
+      '本次结果到了立刻画本次的')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: { status: 'upstream_error' }, prev: a, loading: false, err: '' }), 'upstream',
+      '上游错误走错误提示，不得把上一份结果当成本次的')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: null, loading: false, err: '加载失败' }), 'error',
+      '加载失败必须走 LoadError（带重试按钮）')
+    // 接线：q 守卫不能为了「保留上一份结果」被放宽；body 不得再有 undefined 分支。
+    const panel = src.slice(src.indexOf('function SearchPanel'), src.indexOf('function LogsPanel'))
+    assert.ok(panel.length > 1000, '应能定位 SearchPanel')
+    assert.ok(panel.includes("const live = data && (data.status !== 'ok' || data.q === req.q) ? data : null"),
+      'q 校验必须原样保留：A 的条目不得挂到 B 下面（也不能用 A 的结果把 B 标成已读）')
+    assert.ok(panel.includes('searchBodyView({'), '结果区必须走 pure.mjs 的判定，不得在组件里另拼一套分支')
+    assert.ok(!panel.includes('} else if (loading && !live) {'),
+      '不得再无条件把结果区换成骨架（换词/翻页会整块卸载）')
+    assert.ok(panel.includes('const lastShownRef = useRef(null)'),
+      '必须另存一份「上次画出来的结果」用于占位（live 的归属语义不变）')
+    assert.ok(panel.includes('disabled=$' + '{stale || req.page <= 1 || loading}'),
+      '占位态必须禁用翻页：上一份结果的页码不得被当成本次页码提交')
+    assert.ok(panel.includes('class="ls-results"'), '结果区必须挂 .ls-results（min-height 占位）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.ls-results\s*\{[^}]*min-height:\s*\d+px/.test(css),
+      '结果区必须有 min-height 占位：长列表 ↔ 骨架之间页面高度不得塌陷')
+  })
 }
 
 main()
