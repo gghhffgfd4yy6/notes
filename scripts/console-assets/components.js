@@ -3,7 +3,7 @@
 // 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js、flatpickr 与 floating-ui；不认识任何页面，也没有顶层副作用。
 // 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
-import { ageFromStamp, dateRangeLabel, partBroken, relDay, scrollDeltaInto } from './pure.mjs'
+import { ageFromStamp, dateRangeLabel, partBroken, relDay, statsTailNote, todayCardView, scrollDeltaInto } from './pure.mjs'
 import flatpickr from './flatpickr.js'
 // 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -846,7 +846,15 @@ function StatusCards ({ state, err }) {
   const chanMax = chan.entries.length > 0 ? Math.max(...chan.entries.map((e) => e.failures)) : 0
   const repRel = rep ? relDay(rep.date) : ''
   const rateText = (r) => (r && typeof r.successRate === 'number' ? `${(r.successRate * 100).toFixed(1)}%` : '—')
-  const todayTone = !today ? 'run' : (today.failed > 0 ? 'bad' : (today.rounds > 0 ? 'ok' : 'run'))
+  // C7-005：今日卡与近 7 天卡同一口径——stats.truncated（run.log 超 1 MiB 只读尾部）必须标注，
+  // 且被窗口切过的「0 失败」不再判绿（今日自身的日志超窗时数字会少算）。判定收在 pure.mjs，
+  // 与「周卡只标 hint」共用同一个尾部标注，避免两卡各写一套。
+  const todayCard = todayCardView({
+    hasData: !!today,
+    failed: today ? today.failed : 0,
+    rounds: today ? today.rounds : 0,
+    truncated: !!(stats && stats.truncated)
+  })
   // 周失败用琥珀色而非红色：它仍是「过去 7 天」的事实，但不应让三天前的故障长期染红首屏。
   const weekTone = !week ? 'run' : (week.failed > 0 ? 'warn' : (week.rounds > 0 ? 'ok' : 'run'))
   const chanTone = (chan.tone === 'bad' || diagTone === 'bad') ? 'bad' : (chan.tone === 'ok' ? 'ok' : 'run')
@@ -854,10 +862,10 @@ function StatusCards ({ state, err }) {
   const cards = [
     {
       title: '今日',
-      tone: todayTone,
-      badge: !today ? '—' : (today.failed > 0 ? '异常' : (today.rounds > 0 ? '正常' : '—')),
+      tone: todayCard.tone,
+      badge: todayCard.badge,
       main: today
-        ? { num: fmtNum(today.pushed), unit: '条推送', hint: `轮次 ${today.rounds} · 成功率 ${rateText(today)}` }
+        ? { num: fmtNum(today.pushed), unit: '条推送', hint: `轮次 ${today.rounds} · 成功率 ${rateText(today)}${todayCard.note}` }
         : { num: '—', unit: '', hint: '暂无 run.log 数据' },
       lines: today
         ? [
@@ -874,7 +882,7 @@ function StatusCards ({ state, err }) {
       tone: weekTone,
       badge: !week ? '—' : (week.failed > 0 ? '有失败' : (week.rounds > 0 ? '正常' : '—')),
       main: week
-        ? { num: fmtNum(week.pushed), unit: '条推送', hint: `轮次 ${week.rounds}${stats && stats.truncated ? ' · 仅统计尾部' : ''}` }
+        ? { num: fmtNum(week.pushed), unit: '条推送', hint: `轮次 ${week.rounds}${statsTailNote(stats)}` }
         : { num: '—', unit: '', hint: '暂无数据' },
       lines: week
         ? [

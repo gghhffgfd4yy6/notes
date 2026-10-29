@@ -10304,6 +10304,34 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(css.includes('.hint-warn'), 'app.css 必须有 .hint-warn 规则（否则传了 tone 也看不出差别）')
   })
+
+  await aok('C7-005 今日卡标注 stats.truncated（与周卡同口径，不再把少算的总数判绿）', async () => {
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.todayCardView, 'function', '今日卡的 tone/badge 判定必须是 pure.mjs 的纯函数')
+    assert.strictEqual(typeof pure.statsTailNote, 'function', '两卡共用的尾部标注必须是纯函数')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: false, failed: 0, rounds: 0, truncated: false }),
+      { tone: 'run', badge: '—', note: '' }, '没有 run.log 数据时保持「—」/中性（占位不谎报）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 2, rounds: 3, truncated: false }),
+      { tone: 'bad', badge: '异常', note: '' }, '有失败必须判红（与旧版一致）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 0, rounds: 3, truncated: false }),
+      { tone: 'ok', badge: '正常', note: '' }, '未截断时判绿不变')
+    // 关键回归：run.log 超 1 MiB（后端只读尾部）——少算的「0 失败」不得再画成绿色「正常」。
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 0, rounds: 3, truncated: true }),
+      { tone: 'warn', badge: '仅尾部', note: ' · 仅统计尾部' },
+      '截断时今日卡必须标注「仅统计尾部」并降成琥珀（旧实现只看 failed/rounds ⇒ 绿「正常」且无标注）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 1, rounds: 3, truncated: true }),
+      { tone: 'bad', badge: '异常', note: ' · 仅统计尾部' }, '真失败仍判红，但同样要标注只统计了尾部')
+    assert.strictEqual(pure.statsTailNote({ truncated: true }), ' · 仅统计尾部', '周卡/今日卡共用一个标注文案')
+    assert.strictEqual(pure.statsTailNote({ truncated: false }), '', '未截断不标注')
+    assert.strictEqual(pure.statsTailNote(null), '', '没有 stats 时不得报截断')
+    // 接线：今日卡必须走这个判定（不能只给周卡加标注），hint 里必须带上 note。
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = comp.slice(comp.indexOf('function StatusCards'), comp.indexOf('// ── 组件：触发按钮'))
+    assert.ok(seg.includes('todayCardView({'), '今日卡必须用 todayCardView 判定 tone/badge/标注')
+    assert.ok(/\$\{todayCard\.note\}/.test(seg), '今日卡的 hint 必须带上尾部标注')
+    assert.ok(/\$\{statsTailNote\(stats\)\}/.test(seg), '周卡必须复用同一个尾部标注（两卡口径不得再分叉）')
+    assert.ok(!/\(\s*stats\.truncated/.test(seg), '不得再在卡片里就地读 stats.truncated（判定只留在 pure.mjs）')
+  })
 }
 
 main()

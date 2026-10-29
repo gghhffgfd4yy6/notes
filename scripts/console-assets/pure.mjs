@@ -317,6 +317,25 @@ export function searchBodyView ({ q, live, prev, loading, err }) {
   return reusable || 'skeleton'
 }
 
+// 运行统计卡的尾部窗口口径（C7-005）：stats.truncated 是后端「run.log 超 1 MiB、只读了尾部
+// 1 MiB」的契约位（scripts/status.js 明确要求前端标注「仅统计日志尾部」，不得把少算的总数
+// 当完整数据展示）。今日卡与近 7 天卡必须同口径标注——此前只有周卡标了，今日卡没有。
+const TAIL_NOTE = ' · 仅统计尾部'
+
+export function statsTailNote (stats) {
+  return stats && stats.truncated === true ? TAIL_NOTE : ''
+}
+
+// 今日卡的 tone/badge/标注：真失败仍判红（异常不变）；被尾部窗口切过的「0 失败」不再判绿——
+// 降成琥珀、徽标写「仅尾部」，不给「少算的数字也是完整数据」的假象。
+export function todayCardView ({ hasData, failed, rounds, truncated }) {
+  const note = truncated === true ? TAIL_NOTE : ''
+  if (hasData !== true) return { tone: 'run', badge: '—', note: '' }
+  if (failed > 0) return { tone: 'bad', badge: '异常', note }
+  if (rounds > 0) return truncated === true ? { tone: 'warn', badge: '仅尾部', note } : { tone: 'ok', badge: '正常', note: '' }
+  return { tone: 'run', badge: '—', note }
+}
+
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
 // issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
 // 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。
