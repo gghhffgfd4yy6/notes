@@ -1437,8 +1437,14 @@ function signalZombieHarness () {
       helper.on('exit', (code, signal) => { clearTimeout(t); resolve({ code, signal }) })
     })
     const out = {
-      helperPid: helper.pid, helperState: null, zombiePid: 0, zombieState: null,
-      kill0: null, probe: null, helperExit: null, zombieStateAfter: 'not-checked'
+      helperPid: helper.pid,
+      helperState: null,
+      zombiePid: 0,
+      zombieState: null,
+      kill0: null,
+      probe: null,
+      helperExit: null,
+      zombieStateAfter: 'not-checked'
     }
     try {
       const pidFile = path.join(dir, 'zombie.pid')
@@ -1503,7 +1509,7 @@ try {
   fs.writeFileSync(path.join(zombieDir, 'zombie_probe.js'),
     "const fs = require('fs')\n" +
     zombieIsAliveSrc + '\n' + // ← 生产实现，原样注入（不复制、不改写）
-    "const pids = process.argv.slice(2).map(Number)\n" +
+    'const pids = process.argv.slice(2).map(Number)\n' +
     'console.log(JSON.stringify({ pids, alive: pids.map(pid => isAlive(pid)) }))\n')
   fs.writeFileSync(path.join(zombieDir, 'zombie_harness.js'), '(' + signalZombieHarness.toString() + ')()\n')
   const zombie = spawnSync(process.execPath, [path.join(zombieDir, 'zombie_harness.js')],
