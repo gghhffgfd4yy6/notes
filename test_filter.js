@@ -10043,6 +10043,19 @@ console.log('========================================\n');
   const { App: V3App, truncateUtf16: v3Truncate } = require('./xbk_function_v3.js')
   const fc = require('fast-check')
 
+  // C4-004：fast-check 不给 seed 时默认随机（实测两次首值不同），与全文件 26 处 LCG 固定 seed
+  // 的确定性口径相反 —— 一次红过的属性失败下次可能不再复现。本门禁扫描全文 fc.assert 站点，
+  // 任一处缺 seed 即红（needle 用字符串拼接，避免门禁自身源码被计为站点）。
+  await test('属性测试: 全部 fc.assert 固定 seed（跨运行可复现）', () => {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const sites = src.split('fc.' + 'assert(').slice(1)
+    assert.ok(sites.length >= 8, `fc.assert 站点数不应减少：${sites.length}`)
+    sites.forEach((seg, i) => {
+      assertEqual(/seed:\s*20260801/.test(seg), true,
+        `第 ${i + 1} 处 fc.assert 未固定 seed: 20260801（默认随机 seed，失败不可复现）`)
+    })
+  })
+
   // C4-003：这里原先放的是 xbk_app.js `_enabledFlag` 的逐字复制（仅函数名/尾逗号不同），
   // 属性断言实际退化成 f(x) === f(x)：抄错或照抄同一处误解都照样绿。改为两个不同源判据：
   // ① 规范词表 oracle —— 关闭值集合是**数据**（来自配置注释与上方表格用例），
@@ -10094,7 +10107,7 @@ console.log('========================================\n');
         assertEqual(typeof got, 'boolean', `必须返回布尔（cfg=${JSON.stringify(cfg)}）`)
         assertEqual(got, specEnabledFlag(cfg && cfg.enabled), `cfg=${JSON.stringify(cfg)}：判定必须等于规范词表口径`)
       }
-    ), { numRuns: 400 })
+    ), { numRuns: 400, seed: 20260801 })
     // ② 变形不变式：判定只依赖 trim+小写规范化 —— 大小写/首尾空白不得改变结果
     fc.assert(fc.property(fc.string({ maxLength: 12 }), (s) => {
       const base = V3App._enabledFlag({ enabled: s })
@@ -10102,7 +10115,7 @@ console.log('========================================\n');
         `大小写/首尾空白不得改变判定：${JSON.stringify(s)}`)
       assertEqual(V3App._enabledFlag({ enabled: ' ' + s + ' ' }), base,
         `首尾空白不得改变判定：${JSON.stringify(s)}`)
-    }), { numRuns: 400 })
+    }), { numRuns: 400, seed: 20260801 })
     // ③ 字符串化不变式：同一标量按数值/布尔传入与按字符串传入判定一致
     fc.assert(fc.property(
       fc.oneof(fc.boolean(), fc.integer(), fc.double({ noNaN: true }), fc.string({ maxLength: 6 })),
@@ -10110,7 +10123,7 @@ console.log('========================================\n');
         assertEqual(V3App._enabledFlag({ enabled: v }), V3App._enabledFlag({ enabled: String(v) }),
           `字符串化不得改变判定：${String(v)}`)
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
   await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', async () => {
@@ -10132,7 +10145,7 @@ console.log('========================================\n');
           }
         }
       }
-    ), { numRuns: 400 })
+    ), { numRuns: 400, seed: 20260801 })
   })
 
   await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', async () => {
@@ -10172,7 +10185,7 @@ console.log('========================================\n');
           assert.ok(Number.isFinite(r) && r > 0, `应返回正数有限，实际 ${r}（cfg=${JSON.stringify(cfg)}）`)
         }
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
   await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', async () => {
@@ -10214,7 +10227,7 @@ console.log('========================================\n');
             assert.ok(!warns.some(w => w.includes('含占位符')), `不应有占位符警告: ${JSON.stringify(warns)}`)
           }
         }
-      ), { numRuns: 200 })
+      ), { numRuns: 200, seed: 20260801 })
     } finally {
       Config.template = saved === undefined ? undefined : JSON.parse(saved)
     }
@@ -10238,7 +10251,7 @@ console.log('========================================\n');
         const r = V3App._safeCounter(v)
         assert.ok(Number.isInteger(r) && r >= 0 && r <= Number.MAX_SAFE_INTEGER, `应返回非负整数，实际 ${r}（输入 ${JSON.stringify(v)}）`)
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
   await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', async () => {
@@ -10308,7 +10321,7 @@ console.log('========================================\n');
           console.warn = oldWarn
         }
       }
-    ), { numRuns: 200 })
+    ), { numRuns: 200, seed: 20260801 })
   })
 
   await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', async () => {
