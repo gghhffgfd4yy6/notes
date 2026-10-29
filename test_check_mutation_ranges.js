@@ -295,6 +295,75 @@ function run (ymlText) {
     `健康仓库下 require 不应抛错（否则复用该模块的测试会被误杀），实际 stdout: ${noThrow.stdout} stderr: ${noThrow.stderr}`)
   console.log('✅ require 路径契约断言通过（失败抛错 / 健康不抛）')
 
+  // ===== C10-025：matrix 解析器一致性对账（auditMatrixParsers）=====
+  // 本门禁把「本文件自己的 include 解析结果」与日报侧两个**独立实现**（mutation-report 的
+  // parseMatrixRunnerConfigs / parseMatrixTimeouts）逐段对账：任一侧少看/多看一眼段，日报的 runner
+  // 档位与「超时上限」列就会静默回落缺省值，而 CI 只看退出码、看不出来。此前本文件对该函数零用例
+  // ——把 errors.push 全改成空操作（恒返回零错误）本套件照样全绿。故先锁「健康夹具零错误」
+  // （否则下面四条坏输入可以靠「恒报错」蒙过），再逐条喂坏输入。
+  {
+    const { auditMatrixParsers } = require('./scripts/check-mutation-ranges.js')
+    const { parseMatrixRunnerConfigs, parseMatrixTimeouts } = require('./scripts/mutation-report.js')
+    const reporters = { parseMatrixRunnerConfigs, parseMatrixTimeouts }
+    // 只造 include 块：对账输入是 (yml 文本, 本文件解析出的条目, 两个外部解析器)
+    const includeYml = (rows) => 'jobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n' +
+      rows.map(r => `          - name: ${r.name}\n` +
+        (r.config === undefined ? '' : `            config: "${r.config}"\n`) +
+        (r.timeout === undefined ? '' : `            timeout_ms: ${r.timeout}\n`) +
+        `            src: "${r.name}.js"\n            mutate: "${r.name}.js:1-10"\n`).join('')
+    const entriesOf = (rows) => rows.map(r => ({ name: r.name, config: r.config, timeout_ms: r.timeout }))
+    const healthy = [
+      { name: 'seg-a', config: 'stryker.config.js', timeout: 60000 },
+      { name: 'seg-b', config: 'stryker.tap.config.js', timeout: 300000 },
+      { name: 'seg-c', config: 'stryker.config.js' }
+    ]
+    // 正向对照：三段两侧完全一致 ⇒ 零错误（下面的坏输入断言才有意义）
+    {
+      const ok = auditMatrixParsers(includeYml(healthy), entriesOf(healthy), reporters)
+      assert.deepStrictEqual(ok.errors, [], `健康夹具不得报错：${JSON.stringify(ok.errors)}`)
+      assert.deepStrictEqual(ok.stats, { entries: 3, configs: 3, timeouts: 3 },
+        `对账统计必须覆盖三段（缺一段等于没对上）：${JSON.stringify(ok.stats)}`)
+    }
+    // ① 半套 config：yml 只给一段写了 config，另一段本文件看得见、parseMatrixRunnerConfigs 看不见
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.config.js' }, { name: 'seg-b' }]
+      const entries = [{ name: 'seg-a', config: 'stryker.config.js' }, { name: 'seg-b', config: 'stryker.config.js' }]
+      const r = auditMatrixParsers(includeYml(rows), entries, reporters)
+      assert.ok(r.errors.some(e => e.includes('parseMatrixRunnerConfigs 没看到')),
+        `半套 config 必须报「② 没看到该段」（否则该段的 runner 档位在日报里静默缺失）：${JSON.stringify(r.errors)}`)
+      assert.strictEqual(r.stats.configs, 1, `② 只应看到 1 段 config，实际 ${r.stats.configs}`)
+    }
+    // ② 取值分叉：两侧都看到该段，但 config 取值不同（② 读到的不是本文件写的那一档）
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.tap.config.js' }]
+      const entries = [{ name: 'seg-a', config: 'stryker.config.js' }]
+      const r = auditMatrixParsers(includeYml(rows), entries, reporters)
+      assert.ok(r.errors.some(e => e.includes('取值分叉') && e.includes('seg-a')),
+        `两侧 config 取值不一致必须报取值分叉：${JSON.stringify(r.errors)}`)
+    }
+    // ③ 多出段：yml（进而 ②/③ 两个解析器）多出一段，本文件的条目里没有它
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.config.js' }, { name: 'seg-extra', config: 'stryker.config.js' }]
+      const entries = [{ name: 'seg-a', config: 'stryker.config.js' }]
+      const r = auditMatrixParsers(includeYml(rows), entries, reporters)
+      assert.ok(r.errors.some(e => e.includes('多出段') && e.includes('seg-extra')),
+        `解析器多出的段必须点名（日报会为不存在的段标注档位）：${JSON.stringify(r.errors)}`)
+      assert.strictEqual(r.stats.configs, 2, `② 读到 2 段 config，实际 ${r.stats.configs}`)
+    }
+    // ④ 缺注入：没有对照解析器时必须 fail-closed——「没对照就没有判据」不等于「一致」
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.config.js' }]
+      const none = auditMatrixParsers(includeYml(rows), entriesOf(rows))
+      assert.strictEqual(none.errors.length, 1, `未注入解析器必须报 1 条错误，实际 ${JSON.stringify(none.errors)}`)
+      assert.ok(none.errors[0].includes('缺少注入的'), `必须点名缺注入：${none.errors[0]}`)
+      assert.deepStrictEqual(none.stats, { entries: 0, configs: 0, timeouts: 0 }, '缺注入时不得假装对过账')
+      const half = auditMatrixParsers(includeYml(rows), entriesOf(rows), { parseMatrixRunnerConfigs })
+      assert.ok(half.errors[0] && half.errors[0].includes('缺少注入的'),
+        `只注入一个解析器同样必须 fail-closed：${JSON.stringify(half.errors)}`)
+    }
+    console.log('✅ C10-025 matrix 解析器一致性对账断言通过（健康零错误 / 半套 config / 取值分叉 / 多出段 / 缺注入 均报错）')
+  }
+
   // ===== G11-CMR：环境变量入口与 matrix 形状守卫（c8 实测本文件 26 条分支未达）=====
   // 这些分支是「行段门禁自己的 fail-closed 出口」：注入方式写错、matrix 条目缺字段、段名打错、
   // 段名重复——旧实现里任何一条被改成静默跳过，本套件的既有用例（都走「完整合法夹具 + 只改行段」）
