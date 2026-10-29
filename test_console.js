@@ -290,9 +290,35 @@ function failureText (e) {
   return stack.length > 0 ? `${message}\n${stack.map((l) => `    ${l.trim()}`).join('\n')}` : message
 }
 
+// ── C5-068：失败清单必须能唯一定位 ──
+// 旧实现失败时只 push(name)：本文件 60 条共用「结构红线:」前缀，跨文件还出现过真重号
+// （test_pusher 的 P3/P7、test_status_report 的 S11–S17 各两处）。汇总里两行一模一样，
+// 只能重跑整份套件自己数第几条。现在注册时抓调用行（栈里第一条不属于 harness 的帧），
+// 失败行打成 `<name> @L<行>`；同名用例再带 `#<第几次>` ⇒ 重号与泛化前缀都能落到源码行。
+const caseNameSeen = new Map()
+const duplicateCaseNames = new Set()
+function caseCallSite () {
+  const frames = String((new Error()).stack || '').split('\n').slice(1)
+  for (const frame of frames) {
+    if (!/test_console\.js:\d+:\d+/.test(frame)) continue
+    if (/\bat (ok|aok|caseLabel|caseCallSite) \(/.test(frame)) continue
+    const m = frame.match(/test_console\.js:(\d+):\d+/)
+    if (m) return Number(m[1])
+  }
+  return 0
+}
+function caseLabel (name) {
+  const line = caseCallSite()
+  const seq = (caseNameSeen.get(name) || 0) + 1
+  caseNameSeen.set(name, seq)
+  if (seq > 1) duplicateCaseNames.add(name)
+  return `${name}${seq > 1 ? ` #${seq}` : ''} @L${line}`
+}
+
 function ok (name, fn) {
+  const label = caseLabel(name)
   reapStaleTimeout(name)
-  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(name); console.log(`  ❌ ${name}: ${failureText(e)}`) } finally { closeCaseServers(); reapTestScope(name) }
+  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(label); console.log(`  ❌ ${name}: ${failureText(e)}`) } finally { closeCaseServers(); reapTestScope(name) }
 }
 // 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
 // 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
@@ -323,6 +349,7 @@ const FILTER_LOCK_STALE_SAMPLE_MS = FILTER_LOCK_STALE_MS + 1000 // 刚过期 1s�
 // lastaccept 重放窗直接用生产导出的常量（旧写法散着 30000/61000 两个裸数）。
 const REPLAY_WINDOW_MS = REPLAY_WINDOW_NOTIFY_TEST_MS
 async function aok (name, fn) {
+  const label = caseLabel(name)
   reapStaleTimeout(name)
   let watchdog = null
   let timedOut = false
@@ -348,7 +375,7 @@ async function aok (name, fn) {
     console.log(`  ✅ ${name}`)
   } catch (e) {
     failed++
-    failedNames.push(name)
+    failedNames.push(label)
     // 超时是真超时（不是用例自己抛的错）才记僵尸标记：后续用例开始前会因此补收割一次。
     if (timedOut) timedOutStale = name
     console.log(`  ❌ ${name}: ${failureText(e)}`)
@@ -495,6 +522,44 @@ ok('harness 失败输出必须带栈（C5-021：走真实 ok() 打印路径）',
   assert.ok(failureText(assertion).includes('actual=2') && failureText(assertion).includes('expected=1'),
     'AssertionError 的 actual/expected 摘要不得丢')
   assert.ok(/^ {4}at /m.test(failureText(assertion)), 'AssertionError 的栈同样不得丢')
+})
+
+// ── C5-068：失败清单必须能唯一定位（重号 / 60 条泛化前缀）──
+// 走真实 ok() 注册路径取证：两条完全同名、且都在不同行抛错的用例，失败清单必须给出不同的行；
+// 第二条还要带 `#2`。全部还原计数器与注册表，不污染通过/失败数和后续重号统计。
+ok('harness 失败清单必须能唯一定位（C5-068：同名用例带 #n 与 @L 行号）', () => {
+  const origLog = console.log
+  const snapshot = {
+    passed,
+    failed,
+    names: failedNames.slice(),
+    seen: new Map(caseNameSeen),
+    dups: new Set(duplicateCaseNames)
+  }
+  let got = []
+  try {
+    console.log = () => {}
+    ok('探针：重名用例', () => { throw new Error('first') })
+    ok('探针：重名用例', () => { throw new Error('second') })
+    got = failedNames.slice(snapshot.names.length)
+  } finally {
+    console.log = origLog
+    passed = snapshot.passed
+    failed = snapshot.failed
+    failedNames.length = 0
+    failedNames.push(...snapshot.names)
+    caseNameSeen.clear()
+    for (const [k, v] of snapshot.seen) caseNameSeen.set(k, v)
+    duplicateCaseNames.clear()
+    for (const n of snapshot.dups) duplicateCaseNames.add(n)
+  }
+  assert.strictEqual(got.length, 2, `两条探针都必须进失败清单（实际 ${JSON.stringify(got)}）`)
+  assert.notStrictEqual(got[0], got[1], '同名用例的失败行不得一模一样（旧实现只打名字）')
+  const l0 = got[0].match(/@L(\d+)$/)
+  const l1 = got[1].match(/@L(\d+)$/)
+  assert.ok(l0 && l1 && Number(l0[1]) > 0 && Number(l1[1]) > 0, `每条失败行必须带源码行号（实际 ${JSON.stringify(got)}）`)
+  assert.notStrictEqual(l0[1], l1[1], '两条用例的调用行必须不同')
+  assert.ok(got[1].includes('#2'), `第二条同名用例必须带 #2（实际 ${got[1]}）`)
 })
 
 // C5-070 自查：FIFO 夹具的 mkfifo 探测必须是「找不到就返回空串、不抛异常」——旧写法把
@@ -10768,6 +10833,10 @@ function finishSuite () {
     process.exitCode = 1
     // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
     console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+    // 同名用例：`@L` 行号已能区分，这里再点名，免得有人把「两条同名」读成重复打印（C5-068）。
+    if (duplicateCaseNames.size > 0) {
+      console.log(`同名（重号）用例 ${duplicateCaseNames.size} 个，按 #n 区分：${[...duplicateCaseNames].join(' / ')}`)
+    }
   }
   // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
   // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
