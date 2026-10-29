@@ -193,19 +193,22 @@ function cleanupTestCache () {
 let passed = 0
 let failed = 0
 const errors = []
-// 每用例硬超时。沙箱内必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
+// 每用例硬超时。必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
 // → perfLimit 后 36000ms），否则「内部阈值还没到期、harness 先判超时」⇒ 上面的缩放等于白做
-// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。默认保持 3000ms 逐字节不变。
-const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 3000
+// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。
+// C4-007：默认模式同样受此约束 —— 原 3000ms 与 perfLimit(3000)=3000 相等（不满足严格大于），
+// 而旧守卫 `PERF_SCALE === 1 || ...` 恰好把它短路成恒真。默认提到 4000ms，守卫去掉短路。
+const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 4000
 
 async function test (name, fn) {
   const start = Date.now()
+  let timer = null
   try {
     await Promise.race([
       fn(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`⏰ 超时 (${TIMEOUT_MS}ms)`)), TIMEOUT_MS)
-      )
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`⏰ 超时 (${TIMEOUT_MS}ms)`)), TIMEOUT_MS)
+      })
     ])
     passed++
     console.log(`  ✅ ${name}  (${Date.now() - start}ms)`)
@@ -219,6 +222,10 @@ async function test (name, fn) {
     } else {
       console.log(`      └─ 💥 ${e.message}`)
     }
+  } finally {
+    // C4-002：收尾改 process.exitCode 后，滞留在事件循环里的 harness 定时器会把进程退出
+    // 拖到最后一个定时器到期（默认 3s）。用例已 settle，定时器无意义，显式清掉。
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -6095,9 +6102,11 @@ console.log('========================================\n');
     assertEqual(perfLimitWith(300, 3000) > 1903, true, `沙箱 tuisong 预算须覆盖实测上界 1903ms，实际 ${perfLimitWith(300, 3000)}ms`)
     assertEqual(perfLimitWith(500, 3000) > 1210, true, `沙箱 htmlToMarkdown 预算须覆盖 CI 实测上界 1210ms，实际 ${perfLimitWith(500, 3000)}ms`)
     assertEqual(perfLimitWith(500, 3000) > 966, true, `沙箱 saveBatch 预算须覆盖实测上界 966ms，实际 ${perfLimitWith(500, 3000)}ms`)
-    // ⑥ 沙箱内 harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死
-    assertEqual(PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000), true, '沙箱内 harness 超时须严格大于最大内部阈值')
-    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 3000, '默认 harness 超时必须仍是 3000ms')
+    // ⑥ harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死。
+    //    C4-007：原判据写成 `PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000)` —— 唯一违规的
+    //    默认模式（3000 > 3000 为假）被短路恒真屏蔽。去掉短路，默认超时提到 4000ms 以满足严格大于。
+    assertEqual(TIMEOUT_MS > perfLimit(3000), true, 'harness 超时必须严格大于最大内部阈值（默认 4000 > 3000）')
+    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 4000, '默认 harness 超时必须为 4000ms（严格大于内部阈值 3000）')
   })
 
   // ==================== 86. 分支覆盖显式验证(关键if两方向) ====================
@@ -6398,11 +6407,21 @@ console.log('========================================\n');
     const ta = require('fs').readFileSync(path.join(__dirname, '/test_app.js'), 'utf8')
     const tn = require('fs').readFileSync(path.join(__dirname, 'test_notify_selfcheck.js'), 'utf8')
     const all = tf + ta + tn
+    // C4-006：判据原为裸子串 includes(k)，`num` 靠 `number` 的子串恒过闸（把 Utils.num 调用删光
+    // 门禁仍绿）。改为标识符边界：名字前后不得紧邻 [A-Za-z0-9_$]，必须作为独立标识符出现
+    // （成员访问 Utils.num / 调用 num(...) / 解构 { num } 都算；number / numeral 不算）。
+    const isReferenced = (name, text) => new RegExp(
+      `(?:^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_$])`
+    ).test(text)
+    // 判据自检：反例必须只作为更长的标识符子串出现，否则门禁会再次退化成恒真
+    assertEqual(isReferenced('num', 'const number = 1; number.toFixed(2)'), false,
+      'num 仅作为 number 的子串出现时不得算引用（裸子串判据的恒真反例）')
+    assertEqual(isReferenced('num', 'Utils.num(x)'), true, 'Utils.num 成员访问必须算引用')
+    assertEqual(isReferenced('num', 'num(x)'), true, '裸调用必须算引用')
     const unused = []
     for (const k of Object.keys(mod)) {
       if (k === 'Config' || k === 'Pusher') continue
-      // 测试中是否出现该导出名
-      if (!all.includes(k) && !all.includes('.' + k)) unused.push(k)
+      if (!isReferenced(k, all)) unused.push(k)
     }
     assertEqual(unused.length, 0, `未使用的导出: ${unused.join(', ')}`)
   })
@@ -6635,21 +6654,30 @@ console.log('========================================\n');
     }
   })
 
-  await test('故障注入: fs.readdirSync 抛错 → 测试清理不崩溃', () => {
+  await test('故障注入: cleanupTestCache 真实清理 test_ 残留，readdirSync 抛错不崩溃', () => {
     const fs = require('fs')
+    // C4-005：原用例把清理逻辑手抄了 7 行、最后 assertEqual(true, true)，生产 cleanupTestCache
+    // 从未被任何断言观察（只在 :319 起跑前 / 收尾各调一次）。改为直调生产函数：
+    // ① 正例——真删 test_ 前缀残留，且不碰同目录的非 test_ 文件（真实 push.json 就在同目录）；
+    const probe = getFilePath('test_c4005_probe.json')
+    const keep = path.join(CACHE, 'c4005_keep.json')
+    try { fs.unlinkSync(probe) } catch (e) {}
+    try { fs.unlinkSync(keep) } catch (e) {}
+    fs.writeFileSync(probe, '[]')
+    fs.writeFileSync(keep, '[]')
+    assertEqual(fs.existsSync(probe), true, '前置：test_ 探针文件应已创建')
+    cleanupTestCache()
+    assertEqual(fs.existsSync(probe), false, 'cleanupTestCache 必须删除 test_ 前缀残留')
+    assertEqual(fs.existsSync(keep), true, 'cleanupTestCache 不得删除非 test_ 文件（真实 push.json 同目录）')
+    // ② 故障注入——readdirSync 对所有路径抛错时，生产函数必须自行吞掉（外层 try-catch），
+    //    不得把异常抛给调用方（起跑前/收尾各调一次，抛错会把全绿判成红）
     const orig = fs.readdirSync
     fs.readdirSync = () => { throw new Error('readdir失败') }
     try {
-      // 模拟测试结尾清理逻辑（readdirSync 抛 → catch 吞）
-      try {
-        const dir = CACHE // 与 cleanupTestCache 同口径（本进程私有分片，不再碰共享目录）
-        if (fs.existsSync(dir)) {
-          fs.readdirSync(dir).forEach(() => { /* 清理 */ })
-        }
-      } catch (e) { /* 预期吞掉 */ }
-      assertEqual(true, true, 'readdir 失败应被容错')
+      assert.doesNotThrow(() => cleanupTestCache(), 'readdirSync 抛错时 cleanupTestCache 不得抛出')
     } finally {
       fs.readdirSync = orig
+      try { fs.unlinkSync(keep) } catch (e) {}
     }
   })
 
@@ -10038,13 +10066,37 @@ console.log('========================================\n');
   const { App: V3App, truncateUtf16: v3Truncate } = require('./xbk_function_v3.js')
   const fc = require('fast-check')
 
-  // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
-  // v3.267：同步空串/纯空白串关闭口径 + 移除 truthiness/规范化重叠
-  function refEnabledFlag (cfg) {
-    if (!cfg) return false
-    const en = cfg.enabled
-    const s = en == null ? '' : String(en).trim().toLowerCase()
-    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
+  // C4-004：fast-check 不给 seed 时默认随机（实测两次首值不同），与全文件 26 处 LCG 固定 seed
+  // 的确定性口径相反 —— 一次红过的属性失败下次可能不再复现。本门禁扫描全文 fc.assert 站点，
+  // 任一处缺固定 seed 即红。
+  // 两个假绿口子都要堵：① needle 用字符串拼接，否则门禁自身源码里的字面量会被最后一段吞进去，
+  // 在门禁用例之前新插一个无 seed 站点照样绿；② 逐段先剔注释（行/块）再判，否则删掉 seed 后
+  // 补一句含 needle 的 TODO 注释也能绿。
+  await test('属性测试: 全部 fc.assert 固定 seed（跨运行可复现）', () => {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const SITE = 'fc.' + 'assert('
+    const NEEDLE = 'seed' + ': 20260801'
+    const stripComments = (s) => s
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+    const sites = src.split(SITE).slice(1)
+    assert.ok(sites.length >= 8, `fc.assert 站点数不应减少：${sites.length}`)
+    sites.forEach((seg, i) => {
+      assertEqual(stripComments(seg).includes(NEEDLE), true,
+        `第 ${i + 1} 处 fc.assert 未固定 ${NEEDLE}（默认随机 seed，失败不可复现；注释里的字样不算）`)
+    })
+  })
+
+  // C4-003：这里原先放的是 xbk_app.js `_enabledFlag` 的逐字复制（仅函数名/尾逗号不同），
+  // 属性断言实际退化成 f(x) === f(x)：抄错或照抄同一处误解都照样绿。改为两个不同源判据：
+  // ① 规范词表 oracle —— 关闭值集合是**数据**（来自配置注释与上方表格用例），
+  //    不复制实现的 Boolean(en) 短路/三分支控制流；
+  // ② 变形不变式 —— 判定只依赖「trim + 小写」规范化与字符串化，独立于具体分支写法。
+  const OFF_ENABLED_WORDS = new Set(['', 'false', '0'])
+  function specEnabledFlag (rawEnabled) {
+    if (rawEnabled === undefined || rawEnabled === null || Number.isNaN(rawEnabled)) return false
+    const norm = String(rawEnabled).trim().toLowerCase()
+    return !OFF_ENABLED_WORDS.has(norm)
   }
 
   await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
@@ -10066,19 +10118,43 @@ console.log('========================================\n');
     }
   })
 
-  await test('_enabledFlag：属性测试——任意输入与参考实现一致（不变量）', async () => {
+  await test('_enabledFlag：属性测试——规范词表 oracle + 变形不变式（不复制生产实现）', async () => {
+    // ① 规范词表 oracle：关闭 = 缺省/null/NaN + 规范化后命中 {''/'false'/'0'}；其余开启。
+    //    生成器显式覆盖空白串/大小写变体，避免只靠随机串撞不到边界。
+    const closedWords = fc.constantFrom('', ' ', '  ', '\t', '\n', '\r\n', 'false', 'FALSE', 'False', ' false ', '0', ' 0 ', 'true', '1', 'yes', 'x')
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(undefined),
         fc.constant(null),
         fc.constant({}),
+        fc.constant({ enabled: undefined }),
+        fc.constant({ enabled: null }),
+        fc.constant({ enabled: NaN }),
         fc.record({ enabled: fc.oneof(fc.boolean(), fc.integer(), fc.string({ maxLength: 10 })) }),
-        fc.record({ enabled: fc.oneof(fc.constant(''), fc.constant(0), fc.constant('0'), fc.constant('false'), fc.constant(' true ')) })
+        fc.record({ enabled: closedWords })
       ),
       (cfg) => {
-        assertEqual(V3App._enabledFlag(cfg), refEnabledFlag(cfg), `cfg=${JSON.stringify(cfg)}`)
+        const got = V3App._enabledFlag(cfg)
+        assertEqual(typeof got, 'boolean', `必须返回布尔（cfg=${JSON.stringify(cfg)}）`)
+        assertEqual(got, specEnabledFlag(cfg && cfg.enabled), `cfg=${JSON.stringify(cfg)}：判定必须等于规范词表口径`)
       }
-    ), { numRuns: 400 })
+    ), { numRuns: 400, seed: 20260801 })
+    // ② 变形不变式：判定只依赖 trim+小写规范化 —— 大小写/首尾空白不得改变结果
+    fc.assert(fc.property(fc.string({ maxLength: 12 }), (s) => {
+      const base = V3App._enabledFlag({ enabled: s })
+      assertEqual(V3App._enabledFlag({ enabled: '  ' + s.toUpperCase() + '\t' }), base,
+        `大小写/首尾空白不得改变判定：${JSON.stringify(s)}`)
+      assertEqual(V3App._enabledFlag({ enabled: ' ' + s + ' ' }), base,
+        `首尾空白不得改变判定：${JSON.stringify(s)}`)
+    }), { numRuns: 400, seed: 20260801 })
+    // ③ 字符串化不变式：同一标量按数值/布尔传入与按字符串传入判定一致
+    fc.assert(fc.property(
+      fc.oneof(fc.boolean(), fc.integer(), fc.double({ noNaN: true }), fc.string({ maxLength: 6 })),
+      (v) => {
+        assertEqual(V3App._enabledFlag({ enabled: v }), V3App._enabledFlag({ enabled: String(v) }),
+          `字符串化不得改变判定：${String(v)}`)
+      }
+    ), { numRuns: 300, seed: 20260801 })
   })
 
   await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', async () => {
@@ -10100,7 +10176,7 @@ console.log('========================================\n');
           }
         }
       }
-    ), { numRuns: 400 })
+    ), { numRuns: 400, seed: 20260801 })
   })
 
   await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', async () => {
@@ -10140,7 +10216,7 @@ console.log('========================================\n');
           assert.ok(Number.isFinite(r) && r > 0, `应返回正数有限，实际 ${r}（cfg=${JSON.stringify(cfg)}）`)
         }
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
   await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', async () => {
@@ -10182,7 +10258,7 @@ console.log('========================================\n');
             assert.ok(!warns.some(w => w.includes('含占位符')), `不应有占位符警告: ${JSON.stringify(warns)}`)
           }
         }
-      ), { numRuns: 200 })
+      ), { numRuns: 200, seed: 20260801 })
     } finally {
       Config.template = saved === undefined ? undefined : JSON.parse(saved)
     }
@@ -10206,7 +10282,7 @@ console.log('========================================\n');
         const r = V3App._safeCounter(v)
         assert.ok(Number.isInteger(r) && r >= 0 && r <= Number.MAX_SAFE_INTEGER, `应返回非负整数，实际 ${r}（输入 ${JSON.stringify(v)}）`)
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
   await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', async () => {
@@ -10276,7 +10352,7 @@ console.log('========================================\n');
           console.warn = oldWarn
         }
       }
-    ), { numRuns: 200 })
+    ), { numRuns: 200, seed: 20260801 })
   })
 
   await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', async () => {
@@ -11277,6 +11353,34 @@ console.log('========================================\n');
     assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
   })
 
+  // C4-002：与 run_unit_tests.js 的 UT-04 同口径——立即终止进程不等待 stdout flush，
+  // CI（pipe）下尾部失败明细/汇总横幅的突发写入会被截断（391KB 突发实测只收到 111KB）。
+  // 判据用「全文调用点数」而不是行首正则：只钉行首写法时，`if (failed > 0) ...` 一行式
+  // 回退（同为立即退出、同样截断明细）会整句溜过。全文只允许 1 处调用点，且必须是开头的
+  // hostClean 预检守卫行；收尾区一处都不许有。needle 与错误消息均拼接构造，否则门禁自身
+  // 源码里的字样会把调用点数算成 3。
+  await test('收尾口径: 用 process.exitCode 而非立即退出（UT-04 管道 flush 对齐）', () => {
+    const self = require('fs').readFileSync(__filename, 'utf8')
+    const EXIT_CALL = 'process' + '.exit('
+    // 去注释（先行后块），块注释按换行数等长填充，行号仍与原文件对齐
+    const stripComments = (s) => s
+      .replace(/\/\/[^\n]*/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''))
+    const code = stripComments(self)
+    const lines = code.split('\n')
+    const hitLines = []
+    lines.forEach((ln, i) => { if (ln.includes(EXIT_CALL)) hitLines.push(i + 1) })
+    assertEqual(hitLines.length, 1,
+      `全文只允许 1 处 ${EXIT_CALL} 调用点（hostClean 预检守卫），实际 ${hitLines.length} 处：${JSON.stringify(hitLines)}`)
+    assertEqual(hitLines[0] <= 20, true, `唯一调用点必须落在文件开头（:20 以内），实际第 ${hitLines[0]} 行`)
+    assertEqual(/hostClean\.guardOrExit\(/.test(lines[hitLines[0] - 1]), true,
+      `第 ${hitLines[0]} 行不是 hostClean 预检守卫：${lines[hitLines[0] - 1].trim()}`)
+    // 收尾区显式再钉一次：最后一个用例之后不得出现任何调用点；退出码仍走 process.exitCode
+    const tail = code.slice(-800)
+    assertEqual(tail.includes(EXIT_CALL), false, `收尾区不得出现 ${EXIT_CALL}（不等待管道 flush，会截断尾部输出）`)
+    assertEqual(/process\.exitCode\s*=\s*failed > 0 \? 1 : 0/.test(tail), true, '收尾必须设置 process.exitCode = failed > 0 ? 1 : 0')
+  })
+
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
   // C4-001：本行与下方汇总横幅原先停在文件**中段**（原 :9458-9469），其后又追加了 91 个顶层用例，
   // 于是横幅/三数字只覆盖前 819 例（910 例里恒少算 10%）、尾部用例的 ❌ 出现在绿色横幅之后且不进
@@ -11303,5 +11407,8 @@ console.log('========================================\n');
   }
   console.log('========================================\n')
 
-  process.exit(failed > 0 ? 1 : 0)
+  // C4-002（UT-04 同口径）：CI 下 stdout 是 pipe，process.exit() 不等待 flush —— 失败明细
+  // 与汇总横幅正是尾部突发写入，会被截断（实测 391KB 只到 111KB）。故用 process.exitCode
+  // 收尾，让事件循环自然排空 stdin/stdout 后再退出；退出码语义不变。
+  process.exitCode = failed > 0 ? 1 : 0
 })()
