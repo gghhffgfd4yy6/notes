@@ -569,7 +569,24 @@ const Module = require('node:module')
 const { strictEqual, deepStrictEqual } = require('node:assert/strict')
 
 const NATIVE_NAME = 're2'
-const INTERNAL_EXPORTS = '\nmodule.exports.__internals = { parseVersion, compareVersion, satisfiesComparator, dependencyFailureReason, nodeVersionProblems, readNativeEngineRange, declaredRuntimeDependencies, declaredDevDependencies, readPackageManifest }\n'
+
+// 白盒注入的**唯一契约**：这 9 个顶层函数名。C5-056：旧实现把 `{ parseVersion, … }` 直接拼进
+// 追加行，任何一次内部改名都会在**加载期**抛 `ReferenceError: xxx is not defined`——报错指出的是
+// 「某个标识符没定义」，既不说这是符号表漂移，也不说哪条测试因此没跑（其余 40+ 用例一条都不执行）。
+// 现在按名单逐个 `typeof` 探测：未声明的标识符在 `typeof` 下不抛错，缺失项能被**收集全**后一次报出。
+const INTERNAL_SYMBOLS = [
+  'parseVersion',
+  'compareVersion',
+  'satisfiesComparator',
+  'dependencyFailureReason',
+  'nodeVersionProblems',
+  'readNativeEngineRange',
+  'declaredRuntimeDependencies',
+  'declaredDevDependencies',
+  'readPackageManifest'
+]
+const INTERNAL_EXPORTS = '\nmodule.exports.__internals = {}\n' +
+  INTERNAL_SYMBOLS.map((name) => `if (typeof ${name} === 'function') module.exports.__internals.${name} = ${name}\n`).join('')
 
 // 在独立 Module 中编译 check-deps.js 的**当前磁盘内容**（含变异体）+ 内部导出。
 // require.main 不等于该 Module ⇒ CLI 分支不触发（无副作用、不走 exitCode）。
@@ -578,8 +595,18 @@ function internalsOf (rootDir) {
   const m = new Module(filename, null)
   m.filename = filename
   m.paths = Module._nodeModulePaths(path.dirname(filename))
-  m._compile(fs.readFileSync(filename, 'utf8') + INTERNAL_EXPORTS, filename)
-  return m.exports.__internals
+  try {
+    m._compile(fs.readFileSync(filename, 'utf8') + INTERNAL_EXPORTS, filename)
+  } catch (e) {
+    // 编译期错误与被注入符号无关（语法错误等），不要伪装成符号表漂移
+    throw new Error(`check-deps 白盒加载失败：scripts/check-deps.js 无法编译（${e.message}）`)
+  }
+  const internals = m.exports.__internals || {}
+  const missing = INTERNAL_SYMBOLS.filter((name) => typeof internals[name] !== 'function')
+  if (missing.length > 0) {
+    throw new Error(`check-deps 内部符号表漂移：${missing.join('、')}（scripts/check-deps.js 的顶层函数被改名/删除，白盒用例已不再对准契约；恢复函数名或同步 test_check_deps.js 的 INTERNAL_SYMBOLS）`)
+  }
+  return internals
 }
 
 // 内部函数沙箱：真实实现副本（ROOT = 临时目录）+ 可控 package.json + 可选 re2 清单/engines
