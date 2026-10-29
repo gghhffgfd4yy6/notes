@@ -9683,12 +9683,16 @@ console.log('========================================\n');
       for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
         assertEqual(daysComputed(v), baseline, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
       }
+      // C4-022：原收尾断言 `new Date(Date.UTC(2026,7,1)).getTime() === Date.UTC(2026,7,1)` 验的是
+      // Date 的定义（连本模块都不 require 也恒真），与本用例契约无关。换成同一「UTC 零点」契约的
+      // 两条真实输入：显式 ISO-Z 形态与纯日期同值；16:00Z 仍属前一天（宿主本地时区不得参与）。
+      assertEqual(daysComputed('2026-08-01T00:00:00Z'), baseline, '显式 ISO-Z 形态应与纯日期同值')
+      assertEqual(daysComputed('2026-07-31T16:00:00Z'), 3, 'UTC 口径：16:00Z 仍属 7/31（宿主本地时区不得参与）')
     } finally {
       Date.now = origNow
     }
     // 数字类型不受 trim 影响（String(number) 本无空白）
     assertEqual(daysComputed(1755300000), daysComputed('1755300000'), '数字与字符串时间戳口径一致')
-    assertEqual(new Date(Date.UTC(2026, 7, 1)).getTime(), Date.UTC(2026, 7, 1), 'UTC 零点常量自检')
   })
 
   await test('parseTime 全空白字符串 → 无效（P1-02：trim 后空串返回 null）', () => {
