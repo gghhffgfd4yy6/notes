@@ -401,19 +401,21 @@ const deps = async (spec) => {
     okOf([{ message: 'MA' }, { code: 'CODEONLY' }, { providerCode: 'PONLY' }]),
     okOf([{ message: '', code: '' }])
   ]
-  const out = { root: ROOT, nodeModules: NODE_MODULES, dry: [], deps: [], cache: [], backoff: [], version: [] }
+  const out = { root: ROOT, nodeModules: NODE_MODULES, dry: [], deps: {}, cache: [], backoff: [], version: [] }
   for (let i = 0; i < dryCases.length; i += 1) out.dry.push(await cap(() => mod.runDryRunOnce({ run: async () => dryCases[i] })))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'ok' } }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'nf' }, fixed: { got: 'ok', re2: 'ok' } }))
-  out.deps.push(await deps({ bare: { got: { code: 'ERR_DLOPEN_FAILED', message: 'dlopen failed' }, re2: 'ok' } }))
-  out.deps.push(await deps({ nullThrow: true }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' } }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' } }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: { code: 'EACCES', message: 'permission denied' } } }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] }))
+  // 场景一律具名（C5-062）：下标只是 push 顺序，不是契约。新增场景插在中间时，
+  // 父进程的断言按名字取用，不会静默换人。
+  out.deps.okBoth = await deps({ bare: { got: 'ok', re2: 'ok' } })
+  out.deps.fixedFallback = await deps({ bare: { got: 'nf', re2: 'nf' }, fixed: { got: 'ok', re2: 'ok' } })
+  out.deps.dlopenGot = await deps({ bare: { got: { code: 'ERR_DLOPEN_FAILED', message: 'dlopen failed' }, re2: 'ok' } })
+  out.deps.nullThrow = await deps({ nullThrow: true })
+  out.deps.missingGotWithLock = await deps({ bare: { got: 'nf', re2: 'ok' } })
+  out.deps.missingGotNoLock = await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false })
+  out.deps.dlopenRe2 = await deps({ bare: { got: 'ok', re2: 'dlopen' } })
+  out.deps.unrecoverableRe2 = await deps({ bare: { got: 'ok', re2: { code: 'EACCES', message: 'permission denied' } } })
+  out.deps.rebuildSpawnError = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] })
+  out.deps.rebuildExit7 = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] })
+  out.deps.gotEaccesAfterInstall = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] })
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: path.join(ROOT, 'abs-cache') } })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: {} })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' } })))
@@ -441,6 +443,12 @@ const deps = async (spec) => {
   const NODE_MODULES = d.nodeModules
   const ROOT = d.root
 
+  // 用例表必须以**具名 key** 暴露（C5-062）：旧写法是 `d.deps[N]`，下标即契约——在中间插一条新场景，
+  // 后面 30 多条断言会静默指向别的场景，且报错文案（`d.deps[7].thrown.code`）照样通顺，最难查。
+  // 这条断言先于所有 deps 断言执行：本套件任何一次「按下标取场景」的回潮都会在这里红。
+  assert.ok(d.deps && !Array.isArray(d.deps) && typeof d.deps === 'object',
+    `ensureDependencies 用例表必须是以场景名称为 key 的对象（不得再用 d.deps[N] 的 push 顺序），实际类型：${Array.isArray(d.deps) ? 'Array' : typeof d.deps}`)
+
   // --- runDryRunOnce：退出码与一次性语义（--dry-run 单轮成功 0 / 失败 1，不做退避重试）---
   assert.strictEqual(d.dry[0].value, 0, '--dry-run 单轮成功必须返回退出码 0')
   assert.deepStrictEqual(d.dry[0].logs, ['dry-run 单轮完成：共 5 条，过滤 2 条，未推送、未写成功缓存'], '成功文案必须精确（杀 success 文案变异体）')
@@ -465,38 +473,38 @@ const deps = async (spec) => {
   }
 
   // --- ensureDependencies：Node 解析口径优先，解析不到才回退固定 node_modules 子路径 ---
-  assert.strictEqual(d.deps[0].thrown, null, '依赖齐备不得抛错')
-  assert.deepStrictEqual(d.deps[0].calls, ['got', 're2'], '两模块均可解析时只做裸解析（与 --check 同口径）')
-  assert.deepStrictEqual(d.deps[0].spawns, [], '已完整安装时不得触发安装')
-  assert.strictEqual(d.deps[1].thrown, null, '固定路径解析成功即视为已恢复')
-  assert.deepStrictEqual(d.deps[1].calls, ['got', path.join(NODE_MODULES, 'got'), 're2', path.join(NODE_MODULES, 're2')], '裸解析失败后必须回退到固定 node_modules 直接子路径')
-  assert.deepStrictEqual(d.deps[1].spawns, [], '固定路径命中时不得安装')
-  assert.deepStrictEqual(d.deps[2].calls, ['got', 're2', 're2', 'got', 're2'], '非 MODULE_NOT_FOUND 说明模块已定位，不得回退固定路径')
-  assert.strictEqual(d.deps[2].spawns.length, 1, 'ERR_DLOPEN_FAILED 属可恢复，必须触发一次恢复安装')
-  assert.deepStrictEqual(d.deps[2].warns, [OK_MSG], '恢复前必须打印与 --check 同源的恢复告警')
-  assert.strictEqual(d.deps[3].thrown, null, 'load 的非模块错误判定必须先看 error 本身，不得解引用 null.code')
-  assert.strictEqual(d.deps[3].spawns.length, 0, '抛非对象错误时不得进入安装')
+  assert.strictEqual(d.deps.okBoth.thrown, null, '依赖齐备不得抛错')
+  assert.deepStrictEqual(d.deps.okBoth.calls, ['got', 're2'], '两模块均可解析时只做裸解析（与 --check 同口径）')
+  assert.deepStrictEqual(d.deps.okBoth.spawns, [], '已完整安装时不得触发安装')
+  assert.strictEqual(d.deps.fixedFallback.thrown, null, '固定路径解析成功即视为已恢复')
+  assert.deepStrictEqual(d.deps.fixedFallback.calls, ['got', path.join(NODE_MODULES, 'got'), 're2', path.join(NODE_MODULES, 're2')], '裸解析失败后必须回退到固定 node_modules 直接子路径')
+  assert.deepStrictEqual(d.deps.fixedFallback.spawns, [], '固定路径命中时不得安装')
+  assert.deepStrictEqual(d.deps.dlopenGot.calls, ['got', 're2', 're2', 'got', 're2'], '非 MODULE_NOT_FOUND 说明模块已定位，不得回退固定路径')
+  assert.strictEqual(d.deps.dlopenGot.spawns.length, 1, 'ERR_DLOPEN_FAILED 属可恢复，必须触发一次恢复安装')
+  assert.deepStrictEqual(d.deps.dlopenGot.warns, [OK_MSG], '恢复前必须打印与 --check 同源的恢复告警')
+  assert.strictEqual(d.deps.nullThrow.thrown, null, 'load 的非模块错误判定必须先看 error 本身，不得解引用 null.code')
+  assert.strictEqual(d.deps.nullThrow.spawns.length, 0, '抛非对象错误时不得进入安装')
 
   // --- 恢复命令：有锁文件用冻结 npm ci，缺锁文件退化为 install --no-package-lock，恢复后仍失败则忠实报错 ---
-  assert.strictEqual(d.deps[4].thrown && d.deps[4].thrown.message, `依赖恢复后 got 仍不可用：Cannot find module '${path.join(NODE_MODULES, 'got')}'`, '恢复后仍不可用必须抛出带失败模块名的错误')
-  assert.strictEqual(d.deps[4].spawns.length, 1, '缺 got 只安装一次，不得多余重建')
-  assert.strictEqual(d.deps[4].spawns[0].cmd, 'npm', '恢复命令必须是 npm（非 win32 平台）')
-  assert.deepStrictEqual(d.deps[4].spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有 package-lock.json 时必须用冻结的 npm ci 且参数完整')
-  assert.strictEqual(d.deps[4].spawns[0].cwd, ROOT, '安装必须在项目根执行')
-  assert.strictEqual(d.deps[4].spawns[0].timeout, 120000, '安装必须有超时')
-  assert.deepStrictEqual(d.deps[4].warns, [OK_MSG], '有锁文件时不得输出退化 install 告警')
-  assert.deepStrictEqual(d.deps[5].warns, [OK_MSG, '未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）'], '缺锁文件必须显式告警退化')
-  assert.deepStrictEqual(d.deps[5].spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '缺锁文件时必须 install 且不得生成新锁文件')
-  assert.strictEqual(d.deps[6].spawns.length, 2, '先冻结安装，再只对仍不可用的 re2 执行一次 install-script 恢复')
-  assert.strictEqual(d.deps[6].spawns[1].cmd, 'npm', 're2 恢复必须调用 npm')
-  assert.deepStrictEqual(d.deps[6].spawns[1].args, ['rebuild', 're2'], 're2 恢复必须执行官方 install 生命周期以优先获取预编译包')
-  assert.strictEqual(d.deps[6].thrown && d.deps[6].thrown.message, '依赖恢复后 re2 仍不可用：dlopen failed', 're2 仍不可用必须以 re2 忠实命名')
-  assert.strictEqual(d.deps[7].spawns.length, 0, '不可恢复错误不得进入恢复流程')
-  assert.deepStrictEqual(d.deps[7].warns, [], '未进入恢复流程不得打印恢复告警')
-  assert.strictEqual(d.deps[7].thrown && d.deps[7].thrown.code, 'EACCES', '不可恢复错误必须原样抛出（只认 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）')
-  assert.strictEqual(d.deps[8].thrown && d.deps[8].thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
-  assert.strictEqual(d.deps[9].thrown && d.deps[9].thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
-  assert.strictEqual(d.deps[10].thrown && d.deps[10].thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
+  assert.strictEqual(d.deps.missingGotWithLock.thrown && d.deps.missingGotWithLock.thrown.message, `依赖恢复后 got 仍不可用：Cannot find module '${path.join(NODE_MODULES, 'got')}'`, '恢复后仍不可用必须抛出带失败模块名的错误')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns.length, 1, '缺 got 只安装一次，不得多余重建')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns[0].cmd, 'npm', '恢复命令必须是 npm（非 win32 平台）')
+  assert.deepStrictEqual(d.deps.missingGotWithLock.spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有 package-lock.json 时必须用冻结的 npm ci 且参数完整')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns[0].cwd, ROOT, '安装必须在项目根执行')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns[0].timeout, 120000, '安装必须有超时')
+  assert.deepStrictEqual(d.deps.missingGotWithLock.warns, [OK_MSG], '有锁文件时不得输出退化 install 告警')
+  assert.deepStrictEqual(d.deps.missingGotNoLock.warns, [OK_MSG, '未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）'], '缺锁文件必须显式告警退化')
+  assert.deepStrictEqual(d.deps.missingGotNoLock.spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '缺锁文件时必须 install 且不得生成新锁文件')
+  assert.strictEqual(d.deps.dlopenRe2.spawns.length, 2, '先冻结安装，再只对仍不可用的 re2 执行一次 install-script 恢复')
+  assert.strictEqual(d.deps.dlopenRe2.spawns[1].cmd, 'npm', 're2 恢复必须调用 npm')
+  assert.deepStrictEqual(d.deps.dlopenRe2.spawns[1].args, ['rebuild', 're2'], 're2 恢复必须执行官方 install 生命周期以优先获取预编译包')
+  assert.strictEqual(d.deps.dlopenRe2.thrown && d.deps.dlopenRe2.thrown.message, '依赖恢复后 re2 仍不可用：dlopen failed', 're2 仍不可用必须以 re2 忠实命名')
+  assert.strictEqual(d.deps.unrecoverableRe2.spawns.length, 0, '不可恢复错误不得进入恢复流程')
+  assert.deepStrictEqual(d.deps.unrecoverableRe2.warns, [], '未进入恢复流程不得打印恢复告警')
+  assert.strictEqual(d.deps.unrecoverableRe2.thrown && d.deps.unrecoverableRe2.thrown.code, 'EACCES', '不可恢复错误必须原样抛出（只认 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）')
+  assert.strictEqual(d.deps.rebuildSpawnError.thrown && d.deps.rebuildSpawnError.thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
+  assert.strictEqual(d.deps.rebuildExit7.thrown && d.deps.rebuildExit7.thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
+  assert.strictEqual(d.deps.gotEaccesAfterInstall.thrown && d.deps.gotEaccesAfterInstall.thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
 
   // --- retryBackoffMs / statusCacheDir / nodeVersionWarning ---
   assert.deepStrictEqual(d.backoff, [1, 1, 1000, 1000], 'cap=1 是合法下界必须生效，非法 cap 回退默认 30 分钟封顶（1000 起步）')
