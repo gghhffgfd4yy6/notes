@@ -1365,37 +1365,59 @@ console.log('========================================\n');
     }
   }))
 
+  // C5-034：桩开关必须在 finally 里复位——断言失败时若把 failPost 留在 true，后续用例会莫名全红。
   await test('全通道失败 → sendNotify reject / 部分成功 → resolve（v3.133）', () => withChannels(async () => {
     cfg.PUSH_KEY = 'SCT_TEST'
-    // 全失败 → reject（v3.133：防网络故障时消息丢失，主流程不写缓存下次重试）
     failPost = true
-    let threw = false
     try {
-      await notify.sendNotify('标题', '内容')
-    } catch (e) {
-      threw = true
-      assert(e.message.includes('所有推送通道失败'), `错误应含全失败: ${e.message.slice(0, 40)}`)
-      assert(e.code === 'ALL_CHANNELS_FAILED', `全失败错误应保留聚合 code: ${e.code}`)
-      assert(Array.isArray(e.failures) && e.failures.length > 0, '全失败错误应保留子通道失败原因')
+      // 全失败 → reject（v3.133：防网络故障时消息丢失，主流程不写缓存下次重试）
+      let threw = false
+      try {
+        await notify.sendNotify('标题', '内容')
+      } catch (e) {
+        threw = true
+        assert(e.message.includes('所有推送通道失败'), `错误应含全失败: ${e.message.slice(0, 40)}`)
+        assert(e.code === 'ALL_CHANNELS_FAILED', `全失败错误应保留聚合 code: ${e.code}`)
+        assert(Array.isArray(e.failures) && e.failures.length > 0, '全失败错误应保留子通道失败原因')
+      }
+      assert(threw, '全通道失败应 reject')
+      // 原始 string reject 也必须和所属通道绑定，否则健康监测无法累计失败。
+      failPost = 'primitive'
+      let primitiveError
+      try { await notify.sendNotify('标题', '内容') } catch (e) { primitiveError = e }
+      assert(primitiveError && Array.isArray(primitiveError.failures), '原始异常应保留结构化失败列表')
+      assert(primitiveError.failures[0] && primitiveError.failures[0].channel === 'server酱', `原始异常应带通道名: ${JSON.stringify(primitiveError.failures[0])}`)
+      assert(primitiveError.failures[0].message.includes('primitive transport failure'), '原始异常应保留诊断消息')
+      // 单通道成功 → resolve（原断言保留：既有覆盖不回退，只在其后补真正的「一成一败」分支）
+      cfg.BARK_PUSH = ''
+      failPost = false
+      let ok = false
+      try { await notify.sendNotify('标题', '内容'); ok = true } catch (e) { ok = false }
+      assert(ok, '单通道成功应 resolve')
+      // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
+      // C5-036：failPost 是全局开关，没法只让一个通道失败——旧的「部分成功」半段其实只测了单通道成功
+      // （名字与执行分支不符），这里按 URL 局部覆写 got.post，构造真正的「一成一败」。
+      failPost = false
+      cfg.BARK_PUSH = 'https://api.day.app/dev1'
+      const originalPost = require.cache[gotPath].exports.post
+      require.cache[gotPath].exports.post = (url, options) => {
+        gotCalls.push({ url, options })
+        if (String(url).includes('ftqq.com')) return Promise.reject(new Error('server酱 通道失败'))
+        return { then: (res) => res({ body: { code: 200, message: 'success' }, statusCode: 200, headers: {} }) }
+      }
+      try {
+        const r = await notify.sendNotify('标题', '内容').then(v => ({ ok: true, v }), e => ({ ok: false, e }))
+        assert(r.ok, `部分成功应 resolve，实际 reject: ${r.e && r.e.message}`)
+        assert(Array.isArray(r.v.failures) && r.v.failures.some(f => f.channel === 'server酱'),
+          `部分成功时必须回报失败通道（供健康统计/下次重试）：${JSON.stringify(r.v.failures)}`)
+        assert(r.v.successfulChannels.includes('bark'), `成功通道应含 bark: ${JSON.stringify(r.v.successfulChannels)}`)
+        assert(gotCalls.some(c => String(c.url).includes('api.day.app')), 'Bark 必须真的被调用（否则不是部分成功，是全跳过）')
+      } finally {
+        require.cache[gotPath].exports.post = originalPost
+      }
+    } finally {
+      failPost = false
     }
-    assert(threw, '全通道失败应 reject')
-    // 原始 string reject 也必须和所属通道绑定，否则健康监测无法累计失败。
-    failPost = 'primitive'
-    let primitiveError
-    try { await notify.sendNotify('标题', '内容') } catch (e) { primitiveError = e }
-    assert(primitiveError && Array.isArray(primitiveError.failures), '原始异常应保留结构化失败列表')
-    assert(primitiveError.failures[0] && primitiveError.failures[0].channel === 'server酱', `原始异常应带通道名: ${JSON.stringify(primitiveError.failures[0])}`)
-    assert(primitiveError.failures[0].message.includes('primitive transport failure'), '原始异常应保留诊断消息')
-    // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
-    failPost = false
-    cfg.BARK_PUSH = 'https://api.day.app/dev1'
-    // Server酱失败（SCT URL）→ 用 failPost 只影响 Server酱？——mock 是全局的……
-    // 简化：直接验证"至少一个成功即 resolve"（Server酱单独成功）
-    cfg.BARK_PUSH = ''
-    failPost = false
-    let ok = false
-    try { await notify.sendNotify('标题', '内容'); ok = true } catch (e) { ok = false }
-    assert(ok, '单通道成功应 resolve')
   }))
 
   await test('企微/TG 超长内容截断（v3.139：通道长度限制）', () => withChannels(async () => {
@@ -1447,10 +1469,13 @@ console.log('========================================\n');
   await test('息知 API 失败(code≠200) → reject（v3.160）', () => withChannels(async () => {
     cfg.WX_XIZHI_KEY = 'https://xizhi.qqoq.net/abc.send'
     failBiz = true
-    let rejected = false
-    try { await notify.sendNotify('标题', '内容') } catch (e) { rejected = true }
-    assert(rejected, '息知 API 失败应 reject（主流程不写缓存，下次重试）')
-    failBiz = false
+    try {
+      let rejected = false
+      try { await notify.sendNotify('标题', '内容') } catch (e) { rejected = true }
+      assert(rejected, '息知 API 失败应 reject（主流程不写缓存，下次重试）')
+    } finally {
+      failBiz = false
+    }
   }))
 
   await test('全部 8 通道 API 业务失败 → 至少失败时 reject（v3.160：防假成功掩盖真失败）', () => withChannels(async () => {
@@ -1464,10 +1489,13 @@ console.log('========================================\n');
     cfg.PUSHME_KEY = 'k'
     cfg.TG_BOT_TOKEN = 't'; cfg.TG_USER_ID = 'u'
     failBiz = true
-    let rejected = false
-    try { await notify.sendNotify('标题', '内容') } catch (e) { rejected = true }
-    assert(rejected, '全部通道 API 业务失败应 reject（防消息丢失）')
-    failBiz = false
+    try {
+      let rejected = false
+      try { await notify.sendNotify('标题', '内容') } catch (e) { rejected = true }
+      assert(rejected, '全部通道 API 业务失败应 reject（防消息丢失）')
+    } finally {
+      failBiz = false
+    }
   }))
 
   await test('Server酱字符串 errno 成功/重复码应按数字语义处理', () => withChannels(async () => {
@@ -1609,6 +1637,135 @@ console.log('========================================\n');
       await xbk.Pusher.send('标题', c.input, { sendNotify: async (t, d) => { sentDesp = d } })
       assert(c.check(sentDesp), `${c.name} 出口清洗不符合预期: ${sentDesp.slice(0, 120)}`)
     }
+  })
+
+  // C5-034：模块级桩开关是「一次性开关」——必须在 finally 里复位。原先 3 处不是（failPost / failBiz×2）：
+  // 断言一失败就把开关留在 true，后面的用例莫名全红，而报错指向的是下一个用例，排查方向直接被带偏。
+  await test('C5-034: 模块级桩开关置 true 后必须有 finally 复位', () => {
+    const acorn = require('acorn')
+    const fsx = require('fs')
+    // 判据：在「最近的函数作用域」内，存在任何 try 的 finalizer 把同一开关置 false，才算受保护。
+    const audit = (ast) => {
+      const parents = new Map()
+      const attach = (node, parent) => {
+        if (!node || typeof node !== 'object') return
+        if (Array.isArray(node)) return node.forEach(n => attach(n, parent))
+        if (typeof node.type === 'string') parents.set(node, parent)
+        for (const k of Object.keys(node)) {
+          if (k === 'loc' || k === 'start' || k === 'end') continue
+          const v = node[k]
+          if (v && typeof v === 'object') attach(v, node)
+        }
+      }
+      attach(ast, null)
+      const flags = new Set()
+      for (const st of ast.body) {
+        if (st.type === 'VariableDeclaration' && st.kind === 'let') {
+          for (const d of st.declarations) if (d.id.type === 'Identifier') flags.add(d.id.name)
+        }
+      }
+      const resets = (tryStmt, name) => {
+        let ok = false
+        const w = (n) => {
+          if (!n || typeof n !== 'object' || ok) return
+          if (Array.isArray(n)) return n.forEach(w)
+          if (n.type === 'AssignmentExpression' && n.left.type === 'Identifier' && n.left.name === name &&
+              n.right.type === 'Literal' && n.right.value === false) ok = true
+          for (const k of Object.keys(n)) {
+            if (k === 'loc' || k === 'start' || k === 'end') continue
+            const v = n[k]
+            if (v && typeof v === 'object') w(v)
+          }
+        }
+        if (tryStmt.finalizer) w(tryStmt.finalizer)
+        return ok
+      }
+      const bad = []
+      const walk = (n) => {
+        if (!n || typeof n !== 'object') return
+        if (Array.isArray(n)) return n.forEach(walk)
+        if (n.type === 'AssignmentExpression' && n.left.type === 'Identifier' && flags.has(n.left.name) &&
+            n.right.type === 'Literal' && n.right.value === true) {
+          let cur = parents.get(n)
+          while (cur && !/Function/.test(cur.type)) cur = parents.get(cur)
+          let guarded = false
+          if (cur) {
+            const scan = (x) => {
+              if (!x || typeof x !== 'object' || guarded) return
+              if (Array.isArray(x)) return x.forEach(scan)
+              if (x.type === 'TryStatement' && resets(x, n.left.name)) { guarded = true; return }
+              for (const k of Object.keys(x)) {
+                if (k === 'loc' || k === 'start' || k === 'end') continue
+                const v = x[k]
+                if (v && typeof v === 'object' && v !== cur) scan(v)
+              }
+            }
+            scan(cur.body)
+          }
+          if (!guarded) bad.push({ name: n.left.name, line: n.loc.start.line })
+        }
+        for (const k of Object.keys(n)) {
+          if (k === 'loc' || k === 'start' || k === 'end') continue
+          const v = n[k]
+          if (v && typeof v === 'object') walk(v)
+        }
+      }
+      walk(ast)
+      return bad
+    }
+    const SAMPLE = 'let flag = false\nconst a = () => { flag = true }\nconst b = () => { flag = true; try { x() } finally { flag = false } }\n'
+    assert(audit(acorn.parse(SAMPLE, { ecmaVersion: 'latest', locations: true })).length === 1,
+      '判据自检：无 finally 复位的那条应被认出，有复位的不应')
+    const bad = audit(acorn.parse(fsx.readFileSync(__filename, 'utf8'), { ecmaVersion: 'latest', locations: true }))
+    assert(bad.length === 0,
+      `桩开关置 true 后缺 finally 复位（断言失败会污染后续用例）：${bad.map(b => `${b.name}@${b.line}`).join(', ')}`)
+  })
+
+  // C5-036：用例体内的死赋值（赋值后只隔注释就被同名覆盖 ⇒ 那一行从没被读过）与「名字承诺的
+  // 分支没被执行」。典型：旧「部分成功」半段先设 cfg.BARK_PUSH 再立刻清空，实际只测了单通道成功。
+  await test('C5-036: 无死赋值；用例名承诺的分支必须真的被执行', () => {
+    const fsx = require('fs')
+    const acorn = require('acorn')
+    const src = fsx.readFileSync(__filename, 'utf8')
+    const lines = src.split('\n')
+    const deadStore = (rows) => {
+      const out = []
+      rows.forEach((ln, i) => {
+        const m = ln.match(/^\s*(cfg\.[A-Za-z_]+) = (.+)$/)
+        if (!m) return
+        let j = i + 1
+        while (j < rows.length) {
+          const t = rows[j].trim()
+          if (t === '' || t.startsWith('//')) { j++; continue }
+          if (new RegExp('^\\s*' + m[1].replace('.', '\\.') + ' = ').test(rows[j])) out.push(i + 1)
+          break
+        }
+      })
+      return out
+    }
+    // 判据自检：示例里只有第 1 条是死赋值（第 2 条中间隔着一次调用，可能已被读取）
+    const sample = ['cfg.A = 1', '// 注释', '', 'cfg.A = 2', 'await go()', 'cfg.A = 3']
+    assert(deadStore(sample).join(',') === '1', `判据自检：死赋值应只认出第 1 条，实际 ${JSON.stringify(deadStore(sample))}`)
+    const dead = deadStore(lines)
+    assert(dead.length === 0, `死赋值（赋完只隔注释/空行就被同名覆盖，值从未被读取）：第 ${dead.join(', ')} 行`)
+    // 名字与被执行的分支必须一致：声称「部分成功」就必须真有一个通道失败、另一个成功。
+    // 用 AST 取回调源码范围（行窗口会被体内嵌套的 `})` 截断）。
+    const bad = []
+    ;(function walk (n) {
+      if (!n || typeof n !== 'object') return
+      if (Array.isArray(n)) return n.forEach(walk)
+      if (n.type === 'CallExpression' && n.callee && n.callee.name === 'test' &&
+          n.arguments[0] && n.arguments[0].type === 'Literal' && String(n.arguments[0].value).includes('部分成功')) {
+        const body = src.slice(n.arguments[1].start, n.arguments[1].end)
+        if (!body.includes('exports.post =')) bad.push(`第 ${n.loc.start.line} 行「${n.arguments[0].value}」`)
+      }
+      for (const k of Object.keys(n)) {
+        if (['loc', 'start', 'end'].includes(k)) continue
+        const v = n[k]
+        if (v && typeof v === 'object') walk(v)
+      }
+    })(acorn.parse(src, { ecmaVersion: 'latest', locations: true }))
+    assert(bad.length === 0, `用例名承诺「部分成功」，但体内没有按通道构造「一成一败」：${bad.join('；')}`)
   })
 
   if (failed === 0) {
