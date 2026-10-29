@@ -342,6 +342,14 @@ function assertStrictEqual (actual, expected, msg) {
   if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
 }
 
+// 命名约定（C5-084）——同一语义只允许一种名字，否则 grep 一种模式找不全：
+//   · 布尔断言 ok(cond, msg)、严格相等 assertStrictEqual(...)、根内路径 assertPathInRoot(...)；
+//   · 保存/还原点一律 orig* 前缀（origWarn / origLog / origCacheDir / origDryRun …）。本文件此前
+//     同一语义混用 orig* / original* / previous* 三套（originalLog、originalCacheDir、previousDryRun…），
+//     改一处保存点得先猜它这一份用的是哪个前缀；现统一到 orig*，快照是对象/整段内容时用具体名
+//     （origConfig / origStateJson），但仍以 orig 开头；
+//   · 布尔断言不再叫 assert（见上），Node 的 assert 因此不会被同名覆写。
+
 function setPushUrl (suffix) {
   // 覆盖 getter，让每个测试用独立缓存文件，避免 _memoryCache 状态污染
   Object.defineProperty(Config.api, 'pushUrl', {
@@ -512,7 +520,7 @@ console.log('========================================\n');
   await test('dry-run：接口失败时不发送告警通知', async () => {
     reset()
     setPushUrl('t03a_dry_run_fetch_error')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const alertState = path.join(CACHE_DIR, 'alert.state')
     try {
       process.env.XBK_DRY_RUN = '1'
@@ -525,8 +533,8 @@ console.log('========================================\n');
     } finally {
       fail4xx = false
       Config.alert.enabled = false
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(alertState) } catch (e) { /* 忽略 */ }
     }
   })
@@ -534,11 +542,11 @@ console.log('========================================\n');
   await test('dry-run：预览不发送、不写成功缓存或日报', async () => {
     reset()
     setPushUrl('t03b_dry_run_preview')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const reportState = path.join(CACHE_DIR, 'report.state')
     const cachePath = path.join(CACHE_DIR, 't03b_dry_run_preview.json')
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       process.env.XBK_DRY_RUN = '1'
       Config.alert.enabled = true
@@ -552,11 +560,11 @@ console.log('========================================\n');
       ok(!fs.existsSync(reportState), 'dry-run 不得写入日报状态')
       ok(logs.some(line => line.includes('🧪 预览：')), 'dry-run 应输出预览内容')
     } finally {
-      console.log = originalLog
+      console.log = origLog
       Config.alert.enabled = false
       Config.report.enabled = false
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(cachePath) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(reportState) } catch (e) { /* 忽略 */ }
     }
@@ -570,11 +578,11 @@ console.log('========================================\n');
   await test('dry-run：终端「未推送」文案与 run.log 台账口径一致（APP2-04）', async () => {
     reset()
     setPushUrl('t03c_dry_run_account')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const logPath = path.join(CACHE_DIR, 'run.log')
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       process.env.XBK_DRY_RUN = '1'
       fakeData = [makeItem({ id: 'dry-run-account-1' }), makeItem({ id: 'dry-run-account-2', title: '第二条' })]
@@ -589,9 +597,9 @@ console.log('========================================\n');
       ok(/\sfailed=0\s/.test(` ${lastLine} `), `dry-run run.log 的 failed 应为 0: ${lastLine}`)
       ok(lastLine.includes('dry-run未推送=2'), `run.log 应另记未推送条数: ${lastLine}`)
     } finally {
-      console.log = originalLog
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      console.log = origLog
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
   })
@@ -599,11 +607,11 @@ console.log('========================================\n');
   await test('APP-06：单条渲染异常不再中止整轮（按单条失败处理并继续其余条目）', async () => {
     reset()
     setPushUrl('t03e_render_fail')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const logPath = path.join(CACHE_DIR, 'run.log')
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     let previewCalls = 0
     try {
       // dry-run 的 preview() 位于渲染段末端：把它做成可注入故障，等价于「渲染期抛错」
@@ -623,9 +631,9 @@ console.log('========================================\n');
       ok(summary.pushed === 0 && summary.failed === 0, `dry-run 摘要口径不变: ${JSON.stringify(summary)}`)
       ok(logs.some(l => l.includes('内容渲染异常')), '渲染异常应有明确的失败日志')
     } finally {
-      console.log = originalLog
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      console.log = origLog
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(path.join(CACHE_DIR, 't03e_render_fail.json')) } catch (e) { /* 忽略 */ }
     }
@@ -637,7 +645,7 @@ console.log('========================================\n');
     const logPath = path.join(CACHE_DIR, 'run.log')
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       // 通过 isValidItem（对象）但 getMessageIdentity 判无效：无 id/有效 url 且身份来源字段全空
       // （anonKey 退化成固定键 → 显式判无效，避免所有无标识消息互相吞掉）
@@ -651,7 +659,7 @@ console.log('========================================\n');
       const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
       ok(lastLine.includes('noidentity=1'), `run.log 应记录 noidentity=1: ${lastLine}`)
     } finally {
-      console.log = originalLog
+      console.log = origLog
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
   })
@@ -689,7 +697,7 @@ console.log('========================================\n');
     reset()
     setPushUrl('t03f_log_control_chars')
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       // 接口脏数据：标题含换行/TAB/ANSI ESC——按行解析日志的青龙侧会被伪造出额外日志行
       fakeData = [makeItem({ id: 'ctl-1', title: '前段\n伪造行\t尾段\u001b[31m红' })]
@@ -701,7 +709,7 @@ console.log('========================================\n');
         `回显行不得含控制字符: ${JSON.stringify(itemLine)}`)
       ok(itemLine.includes('前段 伪造行 尾段'), '控制字符应被替换为空格而非删除内容')
     } finally {
-      console.log = originalLog
+      console.log = origLog
     }
   })
 
@@ -1843,7 +1851,7 @@ console.log('========================================\n');
   await test('截断补回原文链接不得重新引入危险 URL（v3.228）', async () => {
     reset()
     setPushUrl('t61d_danger_linkkeep')
-    const originalContentMax = Config.push.contentMax
+    const origContentMax = Config.push.contentMax
     try {
       Config.push.contentMax = 100
       fakeData = [makeItem({
@@ -1856,7 +1864,7 @@ console.log('========================================\n');
       ok(!/javascript:|vbscript:|data:/i.test(pushCalls[0].desp),
             `截断补链不得包含危险协议: ${pushCalls[0].desp}`)
     } finally {
-      Config.push.contentMax = originalContentMax
+      Config.push.contentMax = origContentMax
     }
   })
 
@@ -2093,9 +2101,9 @@ console.log('========================================\n');
 
   await test('Pusher.send 超时为全部尝试通道保留结构化失败', async () => {
     reset()
-    const originalSetTimeout = global.setTimeout
+    const origSetTimeout = global.setTimeout
     const names = ['pushplus', 'telegram']
-    global.setTimeout = (fn) => originalSetTimeout(fn, 0)
+    global.setTimeout = (fn) => origSetTimeout(fn, 0)
     try {
       let timeoutError
       try {
@@ -2108,7 +2116,7 @@ console.log('========================================\n');
       ok(timeoutError.failures.length === names.length, `超时失败数应为 ${names.length}: ${JSON.stringify(timeoutError && timeoutError.failures)}`)
       ok(timeoutError.failures.every((failure, index) => failure.channel === names[index] && failure.code === 'PUSH_TIMEOUT'), `超时失败应按通道结构化: ${JSON.stringify(timeoutError.failures)}`)
     } finally {
-      global.setTimeout = originalSetTimeout
+      global.setTimeout = origSetTimeout
     }
   })
 
@@ -2522,7 +2530,7 @@ console.log('========================================\n');
 
   await test('日报发送成功 → 今日累计不重复计数（v3.257 修复 089）', async () => {
     reset()
-    const originalCacheDir = Config.cache.dir
+    const origCacheDir = Config.cache.dir
     Config.cache.dir = DEFAULT_CACHE_DIR + '_report_nodup_isolated'
     setPushUrl('t62_report_nodup')
     fakeData = [makeItem({ id: 1 })]
@@ -2548,7 +2556,7 @@ console.log('========================================\n');
       ok(st.total === 1, `今日 total 应只计一次，实际: ${st.total}`)
     } finally {
       Config.report.enabled = orig
-      Config.cache.dir = originalCacheDir
+      Config.cache.dir = origCacheDir
       // 只删 report.state 会把隔离目录本体（run.log / 缓存分片）留在仓库根：本地每跑一次就多一个
       // xianbaoku_cache_p*_report_nodup_isolated，实测已堆数十个且部分属主是 root（曾 sudo 跑测试）。
       // 走 cleanupIsolatedDir → removeDirInRoot 整目录删除（根内校验 fail-closed，删除失败会 warn 留痕）。
@@ -2558,8 +2566,8 @@ console.log('========================================\n');
 
   let isolatedReportSeq = 0
   const withIsolatedReportEnv = async (name, testFn) => {
-    const originalCacheDir = Config.cache.dir
-    const originalToday = xbk.App._reportToday
+    const origCacheDir = Config.cache.dir
+    const origToday = xbk.App._reportToday
     const origReportEnabled = Config.report.enabled
     const uniqueSuffix = `_report_iso_${Date.now()}_${++isolatedReportSeq}`
     const cacheDir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
@@ -2583,8 +2591,8 @@ console.log('========================================\n');
       await testFn({ statePath, setupRound })
     } finally {
       Config.report.enabled = origReportEnabled
-      Config.cache.dir = originalCacheDir
-      xbk.App._reportToday = originalToday
+      Config.cache.dir = origCacheDir
+      xbk.App._reportToday = origToday
       xbk.App._reportMemoryStateByPath.clear()
       cleanupIsolatedDir(stateDir)
     }
@@ -2928,7 +2936,7 @@ console.log('========================================\n');
   })
 
   await test('APP-02：run.log 锁陈旧判定须复核持有进程存活', async () => {
-    const originalCacheDir = Config.cache.dir
+    const origCacheDir = Config.cache.dir
     const isolatedDir = `${DEFAULT_CACHE_DIR}_runlog_lock_${Date.now()}`
     const stateDir = path.join(__dirname, isolatedDir)
     const logPath = path.join(stateDir, 'run.log')
@@ -2950,7 +2958,7 @@ console.log('========================================\n');
       xbk.App._writeRunLog('已退出持有者\n')
       ok(!fs.existsSync(lockPath), '持有进程已退出应回收并释放 run.log 锁')
     } finally {
-      Config.cache.dir = originalCacheDir
+      Config.cache.dir = origCacheDir
       cleanupIsolatedDir(stateDir)
     }
   })
@@ -3215,7 +3223,7 @@ console.log('========================================\n');
 
   await test('日报发送失败 → report.state date 不重置（v3.156 #3）', async () => {
     reset()
-    const originalCacheDir = Config.cache.dir
+    const origCacheDir = Config.cache.dir
     Config.cache.dir = DEFAULT_CACHE_DIR + '_report_state_isolated'
     setPushUrl('t63_report_state')
     fakeData = [makeItem({ id: 1 })]
@@ -3234,7 +3242,7 @@ console.log('========================================\n');
       ok(st.total >= 5, '本次数据应累计进旧 state(不丢)')
     } finally {
       Config.report.enabled = orig
-      Config.cache.dir = originalCacheDir
+      Config.cache.dir = origCacheDir
       // 原实现只 unlink report.state + rmdirSync(stateDir)：run 写下的缓存/日志让 rmdir 撞 ENOTEMPTY
       // 被静默吞掉，目录本体长期滞留仓库根。改走 cleanupIsolatedDir 整目录递归删除（根内校验 fail-closed）。
       cleanupIsolatedDir(stateDir)
@@ -3465,10 +3473,10 @@ console.log('========================================\n');
     try {
       Config.report.enabled = true
       for (const date of ['garbage', '2026-99-99', '2026-02-29']) {
-        const original = JSON.stringify({ date, total: 9, pushed: 9 })
-        xbk.App._reportMemoryStateByPath.delete(statePath); fs.writeFileSync(statePath, original)
+        const origStateJson = JSON.stringify({ date, total: 9, pushed: 9 })
+        xbk.App._reportMemoryStateByPath.delete(statePath); fs.writeFileSync(statePath, origStateJson)
         fakeData = [makeItem({ id: Date.now() + date.length })]; await xbk.run()
-        ok(fs.readFileSync(statePath, 'utf8') === original, `非法日期应保留原文件: ${date}`)
+        ok(fs.readFileSync(statePath, 'utf8') === origStateJson, `非法日期应保留原文件: ${date}`)
       }
     } finally { Config.report.enabled = orig; xbk.App._reportMemoryStateByPath.delete(statePath); try { fs.unlinkSync(statePath) } catch (e) {} }
   })
@@ -3478,14 +3486,14 @@ console.log('========================================\n');
     setPushUrl('t270_report_date_invalid')
     const statePath = path.join(CACHE_DIR, 'report.state')
     const orig = Config.report.enabled
-    const original = JSON.stringify({ date: 123, total: 9, pushed: 9 })
+    const origStateJson = JSON.stringify({ date: 123, total: 9, pushed: 9 })
     try {
       Config.report.enabled = true
       xbk.App._reportMemoryStateByPath.delete(statePath)
-      fs.writeFileSync(statePath, original)
+      fs.writeFileSync(statePath, origStateJson)
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      ok(fs.readFileSync(statePath, 'utf8') === original, '非法 date 状态应保留原文件')
+      ok(fs.readFileSync(statePath, 'utf8') === origStateJson, '非法 date 状态应保留原文件')
     } finally {
       Config.report.enabled = orig
       xbk.App._reportMemoryStateByPath.delete(statePath)
@@ -3806,7 +3814,8 @@ console.log('========================================\n');
   await test('配置告警脏值 Symbol → cache/domain/mode 链路不崩（#16）', async () => {
     reset()
     setPushUrl('t75_config_warning_symbol')
-    const original = {
+    // 保存点（原值快照）：统一 orig* 前缀，见上方约定
+    const origConfig = {
       maxSize: Config.cache.maxSize,
       domain: Config.domain,
       mode: Config.push.mode
@@ -3819,9 +3828,9 @@ console.log('========================================\n');
       await xbk.run()
       ok(pushCalls.length === 1, `脏配置告警不应阻断主流程，实际${pushCalls.length}`)
     } finally {
-      Config.cache.maxSize = original.maxSize
-      Config.domain = original.domain
-      Config.push.mode = original.mode
+      Config.cache.maxSize = origConfig.maxSize
+      Config.domain = origConfig.domain
+      Config.push.mode = origConfig.mode
     }
   })
 
