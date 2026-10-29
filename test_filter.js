@@ -6157,6 +6157,56 @@ console.log('========================================\n');
     }, 500, '5000次listfilter')
   })
 
+  // C4-012：上面三条预算的输入都是玩具形态（68 字符 HTML ×1000、单模板 ×1000、3 字段 ×5000），
+  // 而真实推送是「单条 100k 字符的 content_html」——此前这条形态零预算，O(n²) 退化（见 v3.251 长
+  // href 事故）只能在 CI 事后靠肉眼发现。这里按**真实可达形态**补预算：
+  //   · 配置模型只支持 ~12 个字段、### 只取前两段 ⇒「数百规则」不是本仓可达形态，不编造该口径；
+  //     真实形态是「12 字段全部配满 + 多行 ### 规则」，且多行规则是分类不敏感的分支遍历。
+  // 阈值取自本机（2 核）实测的 3~4 倍：100k htmlToMarkdown 183–632ms、100k tuisong 631–770ms、
+  // 20000 次全字段 listfilter ≈660ms。三条都远低于 harness 4000ms 硬超时（含 benchRetry 重试一次）。
+  await test('基准: htmlToMarkdown 单文档 100k content_html < 1500ms（真实形态）', () => {
+    const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p><ul><li>项一</li><li>项二</li></ul><div>块</div>'
+    const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
+    assertEqual(html.length, 100000, '预算输入必须是真实的 100k 字符单文档')
+    benchRetry(() => { htmlToMarkdown({ content_html: html, url: 'http://x/1.html' }) }, 1500, '100k htmlToMarkdown')
+  })
+
+  await test('基准: tuisong_replace 单文档 100k content_html < 1500ms（真实推送形态）', () => {
+    const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p>'
+    const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
+    const data = { title: 'T', content: 'C', content_html: html, category_name: '分类', url: '/a', posttime: 1785346200 }
+    benchRetry(() => { tuisong_replace('【{分类名}】{标题}\n{Markdown内容}', data) }, 1500, '100k tuisong_replace')
+  })
+
+  await test('基准: listfilter 全字段规则集 20000 次 < 1200ms（真实形态：12 字段 + ### 多行）', () => {
+    const cfg = compileRules({
+      pingbifenlei: '赚客吧###什么值得买',
+      pingbibiaoti: '京东###淘宝',
+      zhanxianbiaoti: '拼多多',
+      pingbibiaotiplus: '神券###优惠',
+      pingbineirong: '返利',
+      zhanxianneirong: '红包',
+      pingbineirongplus: '线报###羊毛',
+      pingbilouzhu: '小明',
+      zhanxianlouzhu: '小红###小李',
+      pingbilouzhuplus: '楼主',
+      pingbitime: '5'
+    })
+    assertEqual(cfg.__compiled, true, '预算必须是编译后的真实规则集')
+    // 全字段都配满 ⇒ 每条消息都会走多行分支，不是「3 个字段短路」的玩具路径
+    const group = {
+      catename: '微博线报',
+      louzhu: '小明',
+      title: '京东神券大促',
+      content: '大促内容 123',
+      content_html: '<div>大促内容</div>',
+      url: 'http://example.com/p/1.html',
+      posttime: 1785346200,
+      louzhuregtime: '2026-10-20'
+    }
+    benchRetry(() => { for (let i = 0; i < 20000; i++) listfilter(group, cfg) }, 1200, '20000次全字段listfilter')
+  })
+
   // v3.278（PR #156 复审续）PERF_MS 缩放回归：**撤销缩放即真红**。
   // 人造耗时 800ms：> 默认口径 300ms（必须判不合格 ⇒ 断言没被改死），
   // < 沙箱口径 300×12=3600ms（必须放行 ⇒ 缩放真的生效）。两方向都在同一进程内断言，
