@@ -323,6 +323,36 @@ check('_saveTombstones: 可达标时正常序列化并交给 writeAtomic（对�
   assert.strictEqual(Buffer.byteLength(writes[0].text, 'utf8'), 53, '写入内容应为 53 字节空墓碑文本')
 })
 
+// ===== C5-031：放弃持久化/淘汰无法达标分支必须在**进程内**执行（TAP 覆盖可归因）=====
+// 同一行为已由上面两条带超时的子进程探针验过，但 TAP 档 perTest 覆盖只归因到测试进程：变异目标
+// 只在子进程里被执行 ⇒ 判 NoCoverage 且不跑任何测试（message-store 段 3 个击杀静默丢失）。
+// 这里把同一分支搬进进程内；子进程探针保留——死循环守卫的「有限时间」证明必须靠外部 timeout。
+check('_evictTombstonesToSize: 无法达标返回 null 的分支在进程内被执行（覆盖可归因）', () => {
+  const r = store._evictTombstonesToSize(emptyTombstoneMaps(), 1)
+  assert.strictEqual(r, null, '四类 Map 全空且 maxBytes 小于空序列化长度时应返回 null')
+})
+
+check('_saveTombstones: 放弃持久化分支在进程内被执行（告警 + 不写盘 + 返回 false）', () => {
+  const writes = []
+  const probe = createProbeStore({ writeAtomic: (p) => { writes.push(p); return true } })
+  const warns = []
+  const origWarn = console.warn
+  const realEvict = probe._evictTombstonesToSize
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  try {
+    // 钉住「淘汰无法达标」这一前置（真实入参要进自旋，挂死风险的有限时间证明由子进程探针负责）
+    probe._evictTombstonesToSize = () => null
+    const ret = probe._saveTombstones(path.join(__dirname, 'dsh_probe_inproc'), emptyTombstoneMaps(), 1)
+    assert.strictEqual(ret, false, '无法通过淘汰达标时应放弃持久化并返回 false')
+    assert.strictEqual(writes.length, 0, '放弃持久化时不得调用 writeAtomic 写盘')
+    assert.ok(warns.some((w) => w.includes('放弃持久化') && w.includes('dsh_probe_inproc.seen.json')),
+      `应告警「超限且无法通过淘汰达标，放弃持久化」并带上路径，实际告警: ${JSON.stringify(warns)}`)
+  } finally {
+    console.warn = origWarn
+    probe._evictTombstonesToSize = realEvict
+  }
+})
+
 // ===== C5-075：子进程夹具必须与父进程同源 =====
 // 旧实现把父进程的 mockUtils + createMessageStore 装配逐字抄进 CHILD_PREAMBLE；工厂签名/Config 口径一变
 // 子进程侧就静默停在旧副本上，探针变成「在测一份过期的夹具」而套件仍绿。下面两条把同源关系钉死。
