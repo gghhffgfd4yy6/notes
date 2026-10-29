@@ -29,6 +29,12 @@ const MUTANT_STATUSES = new Set([
 // F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
 const LIST_QUERY_TIMEOUT_MS = 15000
 
+// C10-024：创建 Issue 的 POST 也必须自带超时。修前它是整条链上唯一没有 `signal` 的 fetch：列表查询
+// 有 F7 的 15s、逐条 PATCH 有 CLOSE_BUDGET_MS 的剩余预算，只有 POST /issues 裸奔 ⇒ API 偶发长时间
+// 无响应时 report job 会一直挂到 job 级超时（6h），日报既发不出去也不响亮失败。15s 与列表查询同量级：
+// 单条 Issue 的创建写请求远快于它，挂满 15s 只可能是对端不响应。
+const ISSUE_POST_TIMEOUT_MS = 15000
+
 // 历史日报清理（卫生项，不是门禁）：日报每天新建一条 Issue 且从不关闭 ⇒ 会无限堆积（就是 #206…#343
 // 那批 open 日报）。下面这套口径刻意比「看着像日报就关」窄得多：
 //   * 标题必须**严格**等于 `🧬 变异测试日报 YYYY-MM-DD`——右侧带后缀（「… 2026-10-20 手改」）、
@@ -1713,7 +1719,9 @@ async function postIssue (body) {
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
-    body: JSON.stringify({ title, body })
+    body: JSON.stringify({ title, body }),
+    // C10-024：本请求自己的超时信号（不复用列表查询那一个：两者各自计时）
+    signal: AbortSignal.timeout(ISSUE_POST_TIMEOUT_MS)
   })
   if (!res.ok) {
     // S5145：远端响应体不可信（可能含换行/控制字符/伪日志前缀），只记录固定状态码

@@ -2055,9 +2055,30 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     await postIssue('body')
     assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
       '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
-    assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
+    // C10-024：POST 也要有自己的超时（见下一条专测）；这里只锁「不被列表查询那一个绑住」——
+    // 两者各自独立计时，否则一次 15s 的列表超时会连带把创建请求掐掉。
+    assert.notStrictEqual(createRes.capturedOpts.signal, listRes.capturedOpts.signal,
+      '发 Issue 请求不应被列表查询的超时信号绑住')
     assert.ok(cleanupRes.capturedOpts.signal instanceof AbortSignal,
       '历史日报清理的查询同样必须带超时（卫生项不得拖死 report job）')
+  })
+
+  // C10-024：创建 Issue 的 POST 曾是整条链上**唯一**没有超时的 fetch——列表查询（F7）与逐条 PATCH
+  // （CLOSE_BUDGET_MS）都带了 AbortSignal，只有 POST /issues 裸奔。GitHub API 偶发长时间无响应时，
+  // report job 会一直挂到 job 级超时（6h）：日报既发不出去、也不会响亮失败，正是本仓反复消灭的
+  // 「静默挂住」形态。判据用 in-process 的 opts.signal 类型 + 对象身份（不是耗时墙钟）。
+  await acheck('C10-024 postIssue 创建 Issue 的 POST 自带 AbortSignal 超时（不得裸奔）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 105, html_url: 'https://github.com/owner/repo/issues/105' })
+    const cleanupRes = makeRes(true, 200, [])
+    mockFetch([listRes, createRes, cleanupRes])
+    await postIssue('body')
+    assert.ok(createRes.capturedOpts && createRes.capturedOpts.signal instanceof AbortSignal,
+      '创建 Issue 的 POST 必须带 AbortSignal 超时（否则接口挂住会把 report job 一起拖死）')
+    assert.notStrictEqual(createRes.capturedOpts.signal, listRes.capturedOpts.signal,
+      'POST 必须用自己的超时信号，不能复用列表查询那一个')
   })
 
   // ===== 本段生效 timeoutMS + Timeout 两类（console 段 60s）====================================
