@@ -19,7 +19,19 @@ const V3 = path.join(ROOT, 'xbk_function_v3.js')
 
 function run (dir, env) {
   // process.execPath 由运行环境决定（CI 为 node 本体；本机经 execpath-shim 覆写为真实 node 二进制）
-  const r = spawnSync(process.execPath, [SCRIPT, dir], { cwd: ROOT, encoding: 'utf8', env: env ? { ...process.env, ...env } : process.env })
+  // C5-009：必须带 timeout + SIGKILL —— 脚本若回归成死循环（读报告卡住/无限重试），无上限的
+  // spawnSync 会让整个套件挂到外层超时才失败，且归因只剩「套件超时」。
+  const r = spawnSync(process.execPath, [SCRIPT, dir], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: env ? { ...process.env, ...env } : process.env,
+    timeout: 20000,
+    killSignal: 'SIGKILL'
+  })
+  if (r.error || r.signal) {
+    assert.fail(`analyze-artifacts 子进程未正常收场（error=${r.error && r.error.code} signal=${r.signal} killed=${r.killed}）：` +
+      '脚本挂死/被强杀必须明确失败，不得等外层超时')
+  }
   return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' }
 }
 
@@ -82,6 +94,11 @@ try {
     // 独立复算：末行有换行时不额外计一个空行（与脚本 countLines 同口径）
     const text = fs.readFileSync(V3, 'utf8')
     const realLines = text.split('\n').length - (text.endsWith('\n') ? 1 : 0)
+    // C5-009：上面这条与脚本 countLines 逐字符同式 —— 两侧共享同一错定义时（例如都漏掉尾部换行
+    // 修正）对拍照样绿，只是不是独立 oracle。加一条已知答案夹具把「口径本身」钉住：
+    // 'a\nb\n' 是 2 行（不是 3 行），漏掉尾部换行修正就会得 3。
+    assert.strictEqual('a\nb\n'.split('\n').length - ('a\nb\n'.endsWith('\n') ? 1 : 0), 2,
+      '行数口径：末行换行不得多算一个空行（现有对拍与脚本同式，本夹具提供独立已知答案）')
     const r = run(dir)
     // 用字符串包含替代 new RegExp(`…`)：插值只有十进制行数，转义括号在 includes 里写回字面
     // 「(全文件 N 行)」，语义等价；动态构造 RegExp 会被判为「非字面量 RegExp」（Codacy）。

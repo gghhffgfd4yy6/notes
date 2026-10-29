@@ -411,6 +411,19 @@ check('P1-04 同族: sanitizeSurrogates/safeText 内部正则不含 lookaround�
 //   ④ 回落行为不变：危险协议仍被清空、合法值仍保留。
 // 撤掉告警实现（catch 恢复为空）→ ② 立即变红。
 const execFileSync = require('node:child_process').execFileSync
+// C5-009：探针子进程一律带 timeout + SIGKILL。没有上限的 execFileSync 在探针里的用户代码回归成
+// 死循环/挂住时会一直等，套件只能挂到 run_unit_tests 的 600s 套件级兜底（CI 是 job 级 45min），
+// 归因退化成「套件超时」。失败时把 e.code / e.signal / e.killed 一并抛出：ETIMEDOUT+SIGKILL
+// （被本上限强杀）与「探针自己 exit 1」可区分。
+const PROBE_TIMEOUT_MS = 20000
+function execProbeSync (args, opts) {
+  try {
+    return execFileSync(process.execPath, args, { timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts })
+  } catch (e) {
+    assert.fail(`探针子进程未正常收场（code=${e.code} signal=${e.signal} killed=${e.killed}）：` +
+      `${String((e.stderr || e.message || '')).slice(0, 300)}`)
+  }
+}
 const fallbackProbe = String.raw`
 'use strict'
 const re2Path = require.resolve('re2')
@@ -447,7 +460,7 @@ process.stdout.write(JSON.stringify({
 `
 
 check('P1-04 收尾: RE2 编译失败回落 V8 只告警一次（含模式与原因，凭据已脱敏）', () => {
-  const raw = execFileSync(process.execPath, ['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
+  const raw = execProbeSync(['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
   const out = JSON.parse(raw.trim().split(/\r?\n/).pop())
   assert.strictEqual(out.warnsAfterLoad, 0, '模块加载期的内部模式不得触发回落告警')
   assert.ok(out.rejectedCount >= 3, `前置条件：本轮清洗必须让 ≥3 条内部模式编译失败（实际 ${out.rejectedCount}）——否则「只告警一次」只是被 _reCache 挡住，测不到一次性标记`)
@@ -1493,7 +1506,7 @@ const probeBaseEnv = Object.assign({}, process.env)
 delete probeBaseEnv.XBK_PROFILE
 const probeProfile3Env = Object.assign({}, probeBaseEnv, { XBK_PROFILE: '3' })
 function runProbe (src, env) {
-  const raw = execFileSync(process.execPath, ['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
+  const raw = execProbeSync(['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
   const lines = raw.trim().split(/\r?\n/)
   const last = lines[lines.length - 1]
   const at = last.indexOf('PROBE_JSON:')

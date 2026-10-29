@@ -9,10 +9,18 @@ const checker = 'scripts/check-mutation-ranges.js'
 const yml = fs.readFileSync(workflow, 'utf8')
 
 function runChecker (workflowText) {
-  return spawnSync(process.execPath, [checker], {
+  // C5-009：带 timeout + SIGKILL。checker 若回归成死循环，无上限的 spawnSync 会挂到套件级超时，
+  // 且 status=null 会让下面「必须非零退出」类断言把挂死读成「正确失败」（假绿）。
+  const r = spawnSync(process.execPath, [checker], {
     encoding: 'utf8',
-    env: { ...process.env, MUTATION_WORKFLOW_TEXT: workflowText }
+    env: { ...process.env, MUTATION_WORKFLOW_TEXT: workflowText },
+    timeout: 20000,
+    killSignal: 'SIGKILL'
   })
+  if (r.error || r.signal) {
+    assert.fail(`check-mutation-ranges 子进程未正常收场（error=${r.error && r.error.code} signal=${r.signal} killed=${r.killed}）`)
+  }
+  return r
 }
 
 // 按行删除指定内容：不用多行正则（`\s*…\s*` 相邻量词会被静态分析判为可回溯超线性，Sonar S8786）

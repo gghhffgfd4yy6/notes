@@ -68,20 +68,34 @@ function sandboxEnv (home, sourceEnv = process.env) {
   return env
 }
 
+// C5-009：子进程一律带上限 + SIGKILL。没有 timeout 的 spawnSync 在钩子/脚本挂住时会无界等待，
+// 套件只能挂到 run_unit_tests 的 600s（CI 是 job 级 45min）才失败，归因只剩「套件超时」；
+// r.error 存在即明确失败，消息带 error.code / signal / killed —— 能区分「被本上限强杀」与
+// 「子进程自己非零退出」。（调用方仍可用 opts.timeout 覆盖，如 pre-push 端到端保持 180s。）
+const CHILD_TIMEOUT_MS = 20000
+const CHILD_KILL_SIGNAL = 'SIGKILL'
+function boundedSpawn (bin, args, opts) {
+  const r = spawnSync(bin, args, { timeout: CHILD_TIMEOUT_MS, killSignal: CHILD_KILL_SIGNAL, ...opts })
+  if (r.error) {
+    assert.fail(`子进程未正常收场（${bin} ${args.join(' ')}）：error=${r.error.code} signal=${r.signal} killed=${r.killed}`)
+  }
+  return r
+}
+
 function runVerify (cwd, home) {
-  return spawnSync(NODE_EXEC, [INSTALL_HOOKS, '--verify'], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(NODE_EXEC, [INSTALL_HOOKS, '--verify'], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function runPlugin (cwd, home, args) {
-  return spawnSync(NODE_EXEC, [INSTALL_HOOKS, ...args], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(NODE_EXEC, [INSTALL_HOOKS, ...args], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function gitConfig (cwd, home, key) {
-  return spawnSync(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function initRepo (dir, home, env = sandboxEnv(home)) {
-  const init = spawnSync(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
+  const init = boundedSpawn(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
   assert.strictEqual(init.status, 0, `git init 失败：${init.stderr}`)
 }
 
@@ -371,7 +385,7 @@ const FIXTURE_SCAN_GATE_JS = [
 
 // 绝对路径调用真实 git；失败即断言失败（夹具建不起来不能静默跳过）。
 function mustGit (args, opts, what) {
-  const r = spawnSync(GIT, args, { encoding: 'utf8', ...opts })
+  const r = boundedSpawn(GIT, args, { encoding: 'utf8', ...opts })
   assert.strictEqual(r.status, 0, `${what || ('git ' + args.join(' '))} 失败（退出码 ${r.status}）：${r.stderr || r.stdout}`)
   return r.stdout
 }
