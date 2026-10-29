@@ -1566,72 +1566,101 @@ function isolateChannel (want) {
   }
 }
 
+/**
+ * 通道夹具（C5-041）：把「隔离配置 + 装传输替身 + 可选捕获日志」这 6 行序言和**收尾顺序**收到一处。
+ *
+ * 修前每条用例都手写这段序言（30+ 处逐字重复），finally 里的收尾顺序也各写各的——同一文件里
+ * `restore(); restoreGot()` 与 `got1.restore(); restore()` 两种**相反**的次序同时存在，还有
+ * `log1.restore(); got1.restore(); restore()` 这种三件套。顺序本身不产生断言，但它决定「恢复过程中
+ * 抛错时剩下的状态由谁承担」，靠每个用例作者记性维持迟早出事。
+ *
+ * 现在的语义：按**安装顺序的逆序**拆除（logs → transport → config），与 finally 的直觉一致；
+ * 用例只需要 `const fx = channelFixture(want, respond)` + `try { ... } finally { fx.restore() }`。
+ *
+ * @param {object} want 通道配置（直接传给 isolateChannel：只留这些键，其余使能/端点覆盖键一律清掉）
+ * @param {Function} [respond] 传输替身的应答函数（传给 installTransport；省略则只隔离配置）
+ * @param {{promiseOnly?: boolean, logs?: boolean}} [opts] promiseOnly 走 :407 回退分支；logs 同时捕获 console
+ * @returns {{capture: Array, logs: string[], warns: string[], restore: Function}}
+ */
+function channelFixture (want, respond, opts = {}) {
+  const restores = [isolateChannel(want)]
+  let transport = null
+  if (respond) {
+    transport = installTransport(respond, { promiseOnly: !!opts.promiseOnly })
+    restores.push(transport.restore)
+  }
+  let logs = null
+  if (opts.logs) {
+    logs = captureLogs()
+    restores.push(logs.restore)
+  }
+  return {
+    capture: transport ? transport.capture : [],
+    logs: logs ? logs.logs : [],
+    warns: logs ? logs.warns : [],
+    restore: () => { while (restores.length > 0) restores.pop()() }
+  }
+}
+
 checkS('息知通道: code===200 判成功，successfulChannels 含「息知」', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/key' })
-  const restoreGot = installTransport(() => JSON.stringify({ code: 200 }))
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/key' }, () => JSON.stringify({ code: 200 }))
   try {
     const res = await sendNotify('息知成功探针', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['息知'], '成功通道应为息知')
     assert.strictEqual(res.failures.length, 0, '不得有失败记录')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('息知通道: HTTP 200 但 code≠200 必须 reject（API 级失败不得静默成功）', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/key' })
-  const restoreGot = installTransport(() => JSON.stringify({ code: 500, msg: '内部错误' }))
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/key' }, () => JSON.stringify({ code: 500, msg: '内部错误' }))
   try {
     let threw = null
     try { await sendNotify('息知失败探针', '正文') } catch (e) { threw = e }
     assert.ok(threw, 'code≠200 必须抛错（v3.160 契约）')
     assert.ok(Array.isArray(threw.failures) && threw.failures.some(f => f.channel === '息知'), `failures 应含息知失败，实际: ${JSON.stringify(threw.failures)}`)
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('息知通道: HTTP 200 + JSON null 响应必须按失败处理（v3.180 判空防御）', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/key' })
-  const restoreGot = installTransport(() => 'null')
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/key' }, () => 'null')
   try {
     let threw = null
     try { await sendNotify('息知空响应', '正文') } catch (e) { threw = e }
     assert.ok(threw, 'data 为 null 必须拒绝（曾虚假成功）')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('息知通道: 请求体形态——url 用 WX_XIZHI_KEY，json 含 title/content', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/realpath' })
   let captured = null
-  const restoreGot = installTransport((url, opts) => { captured = { url, opts }; return JSON.stringify({ code: 200 }) })
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/realpath' }, (url, opts) => { captured = { url, opts }; return JSON.stringify({ code: 200 }) })
   try {
     await sendNotify('标题甲', '内容乙')
     assert.ok(captured, '必须发出请求')
     assert.ok(String(captured.url).startsWith('https://xizhi.fake/realpath'), `url 应取 WX_XIZHI_KEY，实际 ${captured.url}`)
     assert.strictEqual(captured.opts.json.title, '标题甲', 'title 应为 text')
     assert.strictEqual(captured.opts.json.content, '内容乙', 'content 应为 desp')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('PushDeer: content.result.length>0 判成功', async () => {
-  const restore = isolateChannel({ DEER_KEY: 'PDK_fake' })
-  const restoreGot = installTransport(() => JSON.stringify({ content: { result: [{ message: 'ok' }] } }))
+  const fx = channelFixture({ DEER_KEY: 'PDK_fake' }, () => JSON.stringify({ content: { result: [{ message: 'ok' }] } }))
   try {
     const res = await sendNotify('PD成功', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['pushdeer'], '成功通道应为 pushdeer')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('PushDeer: result 空数组必须 reject（API 级失败）', async () => {
-  const restore = isolateChannel({ DEER_KEY: 'PDK_fake' })
-  const restoreGot = installTransport(() => JSON.stringify({ content: { result: [] } }))
+  const fx = channelFixture({ DEER_KEY: 'PDK_fake' }, () => JSON.stringify({ content: { result: [] } }))
   try {
     let threw = null
     try { await sendNotify('PD失败', '正文') } catch (e) { threw = e }
     assert.ok(threw, 'result 空必须拒绝')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('PushDeer: 请求体为 urlencode 表单，pushkey/text/desp 齐全且 & = # 已编码', async () => {
-  const restore = isolateChannel({ DEER_KEY: 'PDK&weird=key#x' })
-  const restoreGot = installTransport(() => JSON.stringify({ content: { result: [1] } }))
+  const fx = channelFixture({ DEER_KEY: 'PDK&weird=key#x' }, () => JSON.stringify({ content: { result: [1] } }))
   try {
     let bodyCaptured = null
     const origStreamPost = gotModule.stream.post
@@ -1642,7 +1671,7 @@ checkS('PushDeer: 请求体为 urlencode 表单，pushkey/text/desp 齐全且 & 
     assert.ok(body.includes(`pushkey=${encodeURIComponent('PDK&weird=key#x')}`), 'pushkey 必须 encodeURIComponent（&=# 不得裸传）')
     assert.ok(body.includes(`text=${encodeURIComponent('标题&特=殊#字')}`), 'text 必须编码')
     assert.ok(body.includes('type=markdown'), 'type=markdown 是既有契约')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('PushDeer: 默认 url 为 api2.pushdeer.com，DEER_URL 可覆盖', async () => {
@@ -1664,8 +1693,7 @@ checkS('PushDeer: 默认 url 为 api2.pushdeer.com，DEER_URL 可覆盖', async 
 })
 
 checkS('Telegram: data.ok===true 判成功；text 经 HTML 转义；url 含 bot token', async () => {
-  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
-  const restoreGot = installTransport(() => JSON.stringify({ ok: true }))
+  const fx = channelFixture({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' }, () => JSON.stringify({ ok: true }))
   try {
     let captured = null
     const origStreamPost = gotModule.stream.post
@@ -1679,35 +1707,33 @@ checkS('Telegram: data.ok===true 判成功；text 经 HTML 转义；url 含 bot 
     assert.strictEqual(captured.opts.json.disable_web_page_preview, true, '禁预览契约')
     assert.ok(captured.opts.json.text.includes('&lt;b&gt;'), 'HTML 敏感字符必须转义')
     assert.ok(captured.opts.json.text.includes('&amp;'), '& 必须转义')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('Telegram: ok≠true 必须 reject（API 级失败）', async () => {
-  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
-  const restoreGot = installTransport(() => JSON.stringify({ ok: false, error_code: 400, description: 'chat not found' }))
+  const fx = channelFixture({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' }, () => JSON.stringify({ ok: false, error_code: 400, description: 'chat not found' }))
   try {
     let threw = null
     try { await sendNotify('TG失败', '正文') } catch (e) { threw = e }
     assert.ok(threw, 'ok≠true 必须拒绝')
     assert.ok(/chat not found|Telegram/.test(threw.message), `错误信息应含 description 或通道名，实际: ${threw.message}`)
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('Telegram: TG_PROXY 配置给出一次性不生效警告（v3.76 防误配静默失效）', async () => {
-  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42', TG_PROXY_HOST: 'proxy.example', TG_PROXY_PORT: '1080' })
-  const restoreGot = installTransport(() => JSON.stringify({ ok: true }))
-  const origWarn = console.warn
-  const warns = []
-  console.warn = (m) => warns.push(String(m))
+  const fx = channelFixture(
+    { TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42', TG_PROXY_HOST: 'proxy.example', TG_PROXY_PORT: '1080' },
+    () => JSON.stringify({ ok: true }),
+    { logs: true })
   try {
     await sendNotify('a', 'b')
-    assert.ok(warns.some(w => w.includes('TG_PROXY') && w.includes('不生效')), `必须警告代理未接入，实际: ${JSON.stringify(warns)}`)
-  } finally { console.warn = origWarn; restore(); restoreGot.restore() }
+    // C5-041：warn 捕获与收尾都交给夹具（原先是本用例自己劫持 console.warn 再手写恢复）
+    assert.ok(fx.warns.some(w => w.includes('TG_PROXY') && w.includes('不生效')), `必须警告代理未接入，实际: ${JSON.stringify(fx.warns)}`)
+  } finally { fx.restore() }
 })
 
 checkS('TG 超长文本: safeSlice 4000 字符截断且末尾不得是孤立高代理', async () => {
-  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
-  const restoreGot = installTransport(() => JSON.stringify({ ok: true }))
+  const fx = channelFixture({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' }, () => JSON.stringify({ ok: true }))
   try {
     let captured = null
     const origStreamPost = gotModule.stream.post
@@ -1718,23 +1744,22 @@ checkS('TG 超长文本: safeSlice 4000 字符截断且末尾不得是孤立高�
     assert.ok(sent.length <= 4000, `TG 文本必须按字符受限（safeSlice 4000），实际 ${sent.length} 字符`)
     const last = sent.charCodeAt(sent.length - 1)
     assert.ok(!(last >= 0xD800 && last <= 0xDBFF), '末尾不得是孤立高代理（会乱码/URIError）')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('sendNotify: 未配置任何通道时抛 NO_CHANNEL_CONFIG', async () => {
-  const restore = isolateChannel({})
+  const fx = channelFixture({})
   try {
     let threw = null
     try { await sendNotify('a', 'b') } catch (e) { threw = e }
     assert.ok(threw, '无通道必须抛错')
     assert.strictEqual(threw.code, 'NO_CHANNEL_CONFIG', `错误码应为 NO_CHANNEL_CONFIG，实际 ${threw.code}`)
     assert.ok(threw.message.includes('未配置任何推送通道'), '错误信息应列出全部通道名')
-  } finally { restore() }
+  } finally { fx.restore() }
 })
 
 checkS('sendNotify: 双通道一败一成=部分成功不抛错；双成功 failures 为空', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' })
-  const restoreGot = installTransport((url) => {
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' }, (url) => {
     if (String(url).includes('xizhi.fake')) return JSON.stringify({ code: 200 })
     return JSON.stringify({ content: { result: [] } })
   })
@@ -1746,9 +1771,8 @@ checkS('sendNotify: 双通道一败一成=部分成功不抛错；双成功 fail
     assert.deepStrictEqual(res.successfulChannels, ['息知'], '成功通道应为息知')
     assert.strictEqual(res.failures.length, 1, 'pushdeer 失败应计入 failures')
     assert.strictEqual(res.failures[0].channel, 'pushdeer', '失败记录必须带 channel 标识')
-  } finally { restore(); restoreGot.restore() }
-  const restore2 = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' })
-  const restoreGot2 = installTransport((url) => {
+  } finally { fx.restore() }
+  const fx2 = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' }, (url) => {
     if (String(url).includes('xizhi.fake')) return JSON.stringify({ code: 200 })
     return JSON.stringify({ content: { result: [1] } })
   })
@@ -1756,12 +1780,11 @@ checkS('sendNotify: 双通道一败一成=部分成功不抛错；双成功 fail
     const res2 = await sendNotify('双成功', '正文')
     assert.strictEqual(res2.successfulChannels.length, 2, '两通道都应成功')
     assert.deepStrictEqual(res2.failures, [], 'failures 应为空数组')
-  } finally { restore2(); restoreGot2.restore() }
+  } finally { fx2.restore() }
 })
 
 checkS('sendNotify: 全通道业务失败抛 ALL_CHANNELS_FAILED 且带 failures 数组', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' })
-  const restoreGot = installTransport(() => JSON.stringify({ code: 1 }))
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', DEER_KEY: 'PDK' }, () => JSON.stringify({ code: 1 }))
   try {
     let threw = null
     try { await sendNotify('全败', '正文') } catch (e) { threw = e }
@@ -1769,64 +1792,60 @@ checkS('sendNotify: 全通道业务失败抛 ALL_CHANNELS_FAILED 且带 failures
     assert.strictEqual(threw.code, 'ALL_CHANNELS_FAILED', `错误码应为 ALL_CHANNELS_FAILED，实际 ${threw.code}`)
     assert.ok(Array.isArray(threw.failures) && threw.failures.length === 2, '必须带两个通道的失败详情')
     assert.ok(/息知|pushdeer/.test(threw.message), `错误信息应含通道名，实际: ${threw.message}`)
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 // --- 一言开关与拼接簇（HITOKOTO 开关口径、3s 短超时、响应防御）---
 checkS('一言: HITOKOTO 显式 true 时请求一言并拼接 desp（含 from 缺省不输出 undefined）', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: true })
-  const restoreGot = installTransport((url) => {
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: true }, (url) => {
     if (String(url).includes('hitokoto')) return JSON.stringify({ hitokoto: '一句', from: '出处' })
     return JSON.stringify({ code: 200 })
   })
   try {
     await sendNotify('t', '正文')
     // C5-040：不再自己改 got.get 做 spy——installTransport 的 capture 记录每次调用（含一言的 got.get）
-    const hitokotoCall = restoreGot.capture.find(c => String(c.url).includes('hitokoto'))
+    const hitokotoCall = fx.capture.find(c => String(c.url).includes('hitokoto'))
     assert.ok(hitokotoCall, 'HITOKOTO=true 必须请求一言')
     assert.strictEqual(hitokotoCall.opts.timeout, 3000, '一言必须 3s 短超时（v3.151）')
     assert.deepStrictEqual(hitokotoCall.opts.retry, { limit: 0 }, '必须显式关闭 got 重试（v3.273 S4）')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('一言: 字符串 \'true\' 与 \'TRUE\' 也开启（兼容环境变量字符串形态）', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: 'true' })
-  const restoreGot = installTransport((url) => {
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: 'true' }, (url) => {
     if (String(url).includes('hitokoto')) return JSON.stringify({ hitokoto: 'x', from: '' })
     return JSON.stringify({ code: 200 })
   })
   try {
     await sendNotify('t', '正文')
-    assert.ok(restoreGot.capture.some(c => String(c.url).includes('hitokoto')),
+    assert.ok(fx.capture.some(c => String(c.url).includes('hitokoto')),
       "HITOKOTO='true' 字符串必须开启")
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 checkS('一言: 0 / \'false\' / undefined 均关闭（旧逻辑仅排 \'false\'，\'0\' 曾误开）', async () => {
   for (const v of [0, 'false', '0', undefined, '']) {
-    const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: v })
-    const restoreGot = installTransport((url) => {
+    const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: v }, (url) => {
       if (String(url).includes('hitokoto')) return JSON.stringify({ hitokoto: 'x', from: '' })
       return JSON.stringify({ code: 200 })
     })
     try {
       await sendNotify('t', '正文')
-      assert.ok(!restoreGot.capture.some(c => String(c.url).includes('hitokoto')),
+      assert.ok(!fx.capture.some(c => String(c.url).includes('hitokoto')),
         `HITOKOTO=${JSON.stringify(v)} 必须关闭`)
-    } finally { restore(); restoreGot.restore() }
+    } finally { fx.restore() }
   }
 })
 
 checkS('一言: 一言失败不阻塞推送（catch 跳过，主通道照发）', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: true })
-  const restoreGot = installTransport((url) => {
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k', HITOKOTO: true }, (url) => {
     if (String(url).includes('hitokoto')) return 'not-json{{' // 解析失败
     return JSON.stringify({ code: 200 })
   })
   try {
     const res = await sendNotify('t', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['息知'], '一言挂掉不得影响主推送')
-  } finally { restore(); restoreGot.restore() }
+  } finally { fx.restore() }
 })
 
 // ============================================================
@@ -1876,44 +1895,39 @@ function brokenBody () {
 // 变异对照：删掉 `if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)` ⇒ 截断留下孤立高代理
 // ⇒ encodeURIComponent 抛 URIError ⇒ 本用例（断言通道成功）当场红。
 checkS('SN-01 Server酱: 标题>32 且第 32 位落在代理对中间时必须退位（不得留孤立高代理）', async () => {
-  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ errno: 0 }) }))
+  const fx = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ body: JSON.stringify({ errno: 0 }) }))
   try {
     const res = await sendNotify('a'.repeat(31) + '🌟', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['server酱'], 'Server酱 应成功送达')
-    assert.strictEqual(got1.capture.length, 1, '必须发出 1 次请求')
-    const form = new URLSearchParams(String(got1.capture[0].opts.body))
+    assert.strictEqual(fx.capture.length, 1, '必须发出 1 次请求')
+    const form = new URLSearchParams(String(fx.capture[0].opts.body))
     const sent = form.get('text') || ''
     assert.strictEqual(sent.length, 31, `标题必须截到完整代理对之前（31 字符），实际 ${sent.length}`)
     const last = sent.charCodeAt(sent.length - 1)
     assert.ok(!(last >= 0xD800 && last <= 0xDBFF), '末尾不得是孤立高代理')
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 // --- SN-02：Server酱·Turbo 版把 errno 嵌在 data 里（:544 嵌套回退）---
 checkS('SN-02 Server酱: errno 只在 data.data 内层时也必须按成功判（Turbo 响应形状）', async () => {
-  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ data: { errno: 0 }, errmsg: 'ok' }) }))
-  const log1 = captureLogs()
+  const fx = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ body: JSON.stringify({ data: { errno: 0 }, errmsg: 'ok' }) }), { logs: true })
   try {
     const res = await sendNotify('嵌套成功', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['server酱'], '内层 errno=0 必须判成功（不得回退外层 undefined 而 reject）')
     assert.strictEqual(res.failures.length, 0, '不得记失败')
-  } finally { log1.restore(); got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 // --- SN-03：1024=一分钟内重复内容，消息已送达 ⇒ 视为成功不 reject（:547 数字/字符串两侧 + :550 分支）---
 // 判错的后果不对称：把 1024 当失败 ⇒ 不写缓存 ⇒ 每轮重推、有效设备被反复轰炸。
 checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为已送达，不得 reject', async () => {
   for (const raw of [1024, '1024']) {
-    const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-    const got1 = installTransport(() => ({ body: JSON.stringify({ errno: raw, errmsg: '此内容一分钟内已发送过' }) }))
-    const log1 = captureLogs()
+    const fx = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ body: JSON.stringify({ errno: raw, errmsg: '此内容一分钟内已发送过' }) }), { logs: true })
     try {
       const res = await sendNotify('重复内容', '正文')
       assert.deepStrictEqual(res.successfulChannels, ['server酱'], `errno=${JSON.stringify(raw)} 必须视为送达（不 reject）`)
-      assert.ok(log1.logs.some(l => l.includes('异常')), '仍要打出异常日志（内容重复不是成功推送新内容）')
-    } finally { log1.restore(); got1.restore(); restore() }
+      assert.ok(fx.logs.some(l => l.includes('异常')), '仍要打出异常日志（内容重复不是成功推送新内容）')
+    } finally { fx.restore() }
   }
 })
 
@@ -1922,8 +1936,7 @@ checkS('SN-03 Server酱: errno 1024（数字与字符串两种序列化）视为
 // 判错的后果是虚假成功：主流程写缓存 ⇒ 消息永久丢失（v3.180 那起 P1 的同族）。
 for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], ['SN-06 PushMe', { PUSHME_KEY: 'pmkey1' }, 'pushme']]) {
   checkS(`${label}: 响应业务体字段抛异常时不得被记成成功（catch 必须按通道失败）`, async () => {
-    const restore = isolateChannel(cfg)
-    const got1 = installTransport(() => ({ body: brokenBody() }), { promiseOnly: true })
+    const fx2 = channelFixture(cfg, () => ({ body: brokenBody() }), { promiseOnly: true })
     try {
       let threw = null
       try { await sendNotify('结构异常探针', '正文') } catch (e) { threw = e }
@@ -1940,7 +1953,7 @@ for (const [label, cfg, key] of [['SN-04 Bark', { BARK_PUSH: 'dev1' }, 'bark'], 
         `${key} 根因必须点名并保留原始异常文案，实际 ${JSON.stringify(agg.failures[0])}`)
       assert.ok(!threw.successfulChannels || !threw.successfulChannels.includes(key),
         `${key} 不得出现在成功通道里`)
-    } finally { got1.restore(); restore() }
+    } finally { fx2.restore() }
   })
 }
 
@@ -1956,61 +1969,55 @@ function unwrapChannelFailures (threw, channel) {
 }
 
 checkS('SN-05 PushMe: 响应无 code 时 providerCode 取 error_code（再退 errno），不得丢业务码', async () => {
-  const restore = isolateChannel({ PUSHME_KEY: 'pmkey1' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ error_code: 4001, message: 'invalid key' }) }))
+  const fx = channelFixture({ PUSHME_KEY: 'pmkey1' }, () => ({ body: JSON.stringify({ error_code: 4001, message: 'invalid key' }) }))
   try {
     let threw = null
     try { await sendNotify('业务码探针', '正文') } catch (e) { threw = e }
     assert.ok(threw, 'PushMe 非 success 响应必须失败')
     const inner = unwrapChannelFailures(threw, 'pushme')
     assert.strictEqual(inner.providerCode, 4001, `providerCode 必须回退到 error_code，实际 ${JSON.stringify(inner.providerCode)}`)
-  } finally { got1.restore(); restore() }
-  const restore2 = isolateChannel({ PUSHME_KEY: 'pmkey2' })
-  const got2 = installTransport(() => ({ body: JSON.stringify({ errno: 5, message: 'rate' }) }))
+  } finally { fx.restore() }
+  const fx2 = channelFixture({ PUSHME_KEY: 'pmkey2' }, () => ({ body: JSON.stringify({ errno: 5, message: 'rate' }) }))
   try {
     let threw = null
     try { await sendNotify('业务码探针2', '正文') } catch (e) { threw = e }
     const inner = unwrapChannelFailures(threw, 'pushme')
     assert.strictEqual(inner.providerCode, 5, 'error_code 也缺时必须退到 errno')
-  } finally { got2.restore(); restore2() }
+  } finally { fx2.restore() }
 })
 
 // --- SN-07 / SN-08：企业微信端点可覆盖 + desp 为空时正文只取标题（:760 / :767）---
 checkS('SN-07 企业微信: QYWX_ORIGIN 自定义端点必须去尾斜杠拼接（不得出现 //cgi-bin）', async () => {
-  const restore = isolateChannel({ QYWX_KEY: 'qykey', QYWX_ORIGIN: 'https://qy.example.com///' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ errcode: 0, errmsg: 'ok' }) }))
+  const fx = channelFixture({ QYWX_KEY: 'qykey', QYWX_ORIGIN: 'https://qy.example.com///' }, () => ({ body: JSON.stringify({ errcode: 0, errmsg: 'ok' }) }))
   try {
     const res = await sendNotify('企微端点', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['企业微信'], 'errcode=0 判成功')
-    const url = got1.capture[0].url
+    const url = fx.capture[0].url
     assert.ok(url.startsWith('https://qy.example.com/cgi-bin/webhook/send'), `端点必须去尾斜杠，实际 ${url}`)
     assert.ok(url.includes('key=qykey'), 'key 必须进 query')
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('SN-08 企业微信: desp 为空时 content 只取标题（不拼出「标题\\n\\nundefined」残尾）', async () => {
-  const restore = isolateChannel({ QYWX_KEY: 'qykey' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
+  const fx = channelFixture({ QYWX_KEY: 'qykey' }, () => ({ body: JSON.stringify({ errcode: 0 }) }))
   try {
     await sendNotify('只有标题', '')
-    const content = got1.capture[0].opts.json.markdown.content
+    const content = fx.capture[0].opts.json.markdown.content
     assert.strictEqual(content, '只有标题', `正文必须只等于标题，实际 ${JSON.stringify(content)}`)
     assert.ok(!content.includes('\n\n'), '不得出现拼接分隔符')
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 // --- SN-09：WX_pusher_channels 是不可序列化形状（循环引用）⇒ 缓存键退位、解析继续（:846）---
 checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退旧字段并显形告警', async () => {
   const circular = { self: null }
   circular.self = circular // 对象形状（不是数组）⇒ 既撞 :846 的不可序列化 catch，也撞「不是数组」告警
-  const restore = isolateChannel({ WX_pusher_appToken: 'APT_fake', WX_pusher_topicIds: 'T1', WX_pusher_channels: circular })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ code: 1000 }) }))
-  const log1 = captureLogs()
+  const fx = channelFixture({ WX_pusher_appToken: 'APT_fake', WX_pusher_topicIds: 'T1', WX_pusher_channels: circular }, () => ({ body: JSON.stringify({ code: 1000 }) }), { logs: true })
   try {
     const res = await sendNotify('循环配置探针', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '必须回退 WX_pusher_appToken 完成发送，不得因配置形状崩掉')
-    assert.ok(log1.warns.some(w => w.includes('不是数组')), `必须显形「多应用配置被忽略」，实际: ${JSON.stringify(log1.warns)}`)
-  } finally { log1.restore(); got1.restore(); restore() }
+    assert.ok(fx.warns.some(w => w.includes('不是数组')), `必须显形「多应用配置被忽略」，实际: ${JSON.stringify(fx.warns)}`)
+  } finally { fx.restore() }
 })
 
 // --- SN-10：配置值「已配置」谓词的 String() 抛错兜底（:911 / :915）---
@@ -2018,33 +2025,31 @@ checkS('SN-09 WxPusher: 多应用配置循环引用不得抛穿，必须回退�
 // 导出的 configuredChannelCount / configuredChannelNames 与 sendNotify 共用同一对谓词 ⇒ 可直调、进程内。
 checkS('SN-10 通道自检: 配置值 String() 抛异常必须判「未配置」且不抛穿（自检与主流程同口径）', () => {
   const throwing = { toString () { throw new Error('脏配置不可字符串化') } }
-  const restore = isolateChannel({ QYWX_KEY: throwing, PUSHME_KEY: throwing, WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  const fx = channelFixture({ QYWX_KEY: throwing, PUSHME_KEY: throwing, WX_XIZHI_KEY: 'https://xizhi.fake/k' })
   try {
     assert.strictEqual(configuredChannelCount(), 1, '抛错的脏值不得计入已配置通道（只剩息知）')
     assert.deepStrictEqual(configuredChannelNames(), ['息知'], '自检清单不得包含脏值通道')
-  } finally { restore() }
+  } finally { fx.restore() }
 })
 
 // --- SN-22：息知 providerCode 回退 errcode（:1201）---
 checkS('SN-22 息知: 响应无 code 时 providerCode 取 errcode（业务码不得丢）', async () => {
-  const restore = isolateChannel({ WX_XIZHI_KEY: 'https://xizhi.fake/k' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ errcode: 500, msg: '内部错误' }) }))
+  const fx = channelFixture({ WX_XIZHI_KEY: 'https://xizhi.fake/k' }, () => ({ body: JSON.stringify({ errcode: 500, msg: '内部错误' }) }))
   try {
     let threw = null
     try { await sendNotify('息知业务码', '正文') } catch (e) { threw = e }
     assert.ok(threw, 'errcode≠200 必须 reject')
     assert.strictEqual(threw.failures[0].providerCode, 500, `providerCode 必须回退 errcode，实际 ${JSON.stringify(threw.failures[0].providerCode)}`)
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 // --- SN-23：Telegram 正文为空时只发标题（:1297 三元另一侧）---
 checkS('SN-23 Telegram: desp 为空时 text 不含分隔符残尾', async () => {
-  const restore = isolateChannel({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ ok: true }) }))
+  const fx = channelFixture({ TG_BOT_TOKEN: 'TOK', TG_USER_ID: '42' }, () => ({ body: JSON.stringify({ ok: true }) }))
   try {
     await sendNotify('TG只有标题', '')
-    assert.strictEqual(got1.capture[0].opts.json.text, 'TG只有标题', '正文空时只发标题')
-  } finally { got1.restore(); restore() }
+    assert.strictEqual(fx.capture[0].opts.json.text, 'TG只有标题', '正文空时只发标题')
+  } finally { fx.restore() }
 })
 
 // --- SN-24：Push+「一对一/一对多」文案随 PUSH_PLUS_USER 变化（:463/:473/:478 三处日志三元）---
@@ -2056,22 +2061,20 @@ checkS('SN-24 Push+: PUSH_PLUS_USER 存在时三处日志都必须是「一对�
   ]
   for (const [label, spec, re] of cases) {
     for (const who of ['一对多', '一对一']) {
-      const restore = isolateChannel(who === '一对多'
+      const fx = channelFixture(who === '一对多'
         ? { PUSH_PLUS_TOKEN: 'PPT_fake', PUSH_PLUS_USER: 'U1' }
-        : { PUSH_PLUS_TOKEN: 'PPT_fake' })
-      const got1 = installTransport(spec)
-      const log1 = captureLogs()
+        : { PUSH_PLUS_TOKEN: 'PPT_fake' }, spec, { logs: true })
       try {
         let swallowed = null
         try { await sendNotify('文案探针', '正文') } catch (e) { swallowed = e }
         // 上抛的聚合消息只作**排障线索**，不进被匹配的语料：它自带「所有推送通道失败」，
         // 混进 logs 后 /失败/ 那条断言会被自己注入的行满足（半自证，实测削弱判红面）。
         const threwHint = swallowed ? ` | 上抛: ${swallowed.message || String(swallowed)}` : ''
-        const hit = log1.logs.filter(l => re.test(l))
-        assert.ok(hit.length > 0, `Push+ ${label}路径（who=${who}）必须打日志，实际: ${JSON.stringify(log1.logs)}${threwHint}`)
+        const hit = fx.logs.filter(l => re.test(l))
+        assert.ok(hit.length > 0, `Push+ ${label}路径（who=${who}）必须打日志，实际: ${JSON.stringify(fx.logs)}${threwHint}`)
         assert.ok(hit.some(l => l.includes(who)), `Push+ ${label}日志应含「${who}」，实际: ${JSON.stringify(hit)}${threwHint}`)
         assert.ok(!hit.some(l => l.includes(who === '一对多' ? '一对一' : '一对多')), '不得同时出现相反文案')
-      } finally { log1.restore(); got1.restore(); restore() }
+      } finally { fx.restore() }
     }
   }
 })
@@ -2086,62 +2089,57 @@ checkS('SN-11 WxPusher: 取消（code=ABORT_ERR / name=AbortError）不得被文
     ['code=ABORT_ERR', () => Object.assign(new Error('WxPusher 限频等待已取消'), { code: 'ABORT_ERR' }), (f) => assert.strictEqual(f.code, 'ABORT_ERR', '取消错误码必须原样透出')],
     ['name=AbortError', () => Object.assign(new Error('WxPusher 限频等待已取消'), { name: 'AbortError' }), (f) => assert.ok(/已取消/.test(f.message), '取消文案必须保留（不得换成 1001 限频摘要）')]
   ]) {
-    const restore = isolateChannel({
+    const fx = channelFixture({
       WX_pusher_channels: [{ appToken: 'APT_SNC11A_' + label, topicIds: ['T1'] }, { appToken: 'APT_SNC11B_' + label, topicIds: ['T2'] }]
-    })
-    const got1 = installTransport(() => ({ error: mkErr() }))
+    }, () => ({ error: mkErr() }))
     try {
       let threw = null
       try { await sendNotify('取消探针', '正文') } catch (e) { threw = e }
       assert.ok(threw, '取消必须上抛')
-      assert.strictEqual(got1.capture.length, 1, `${label} 必须短路只发 1 次（判成限频会逐个换应用重发），实际 ${got1.capture.length} 次`)
+      assert.strictEqual(fx.capture.length, 1, `${label} 必须短路只发 1 次（判成限频会逐个换应用重发），实际 ${fx.capture.length} 次`)
       assert.strictEqual(threw.code, 'ALL_CHANNELS_FAILED', '唯一通道失败要走汇总上抛')
       checkCancel(threw.failures[0])
-    } finally { got1.restore(); restore() }
+    } finally { fx.restore() }
   }
 })
 
 checkS('SN-12 WxPusher: 错误无 message 时仍须按 err 本身的文本判定 1001（换备用应用，不得一次都不重试）', async () => {
-  const restore = isolateChannel({
-    WX_pusher_channels: [{ appToken: 'APT_SNC12A', topicIds: ['T1'] }, { appToken: 'APT_SNC12B', topicIds: ['T2'] }]
-  })
   const rateErr = Object.assign(new Error(''), { toString: () => 'upstream 1001 速度太快' })
   let n = 0
-  const got1 = installTransport(() => (++n === 1 ? { error: rateErr } : WX_OK()))
+  const fx = channelFixture({
+    WX_pusher_channels: [{ appToken: 'APT_SNC12A', topicIds: ['T1'] }, { appToken: 'APT_SNC12B', topicIds: ['T2'] }]
+  }, () => (++n === 1 ? { error: rateErr } : WX_OK()))
   try {
     const res = await sendNotify('无 message 限频', '正文')
     assert.strictEqual(n, 2, '首个应用被判限频后必须换下一个应用（判不出来就直接一次不重试）')
     assert.deepStrictEqual(res.successfulChannels, ['wxpusher'], '第二个应用应成功')
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('SN-13 WxPusher: XBK_PROFILE=2 时打逐次日志但不写聚合统计（统计只在 3 档记录）', async () => {
   // 关键：统计 Map 是模块级、跨档位持续存在 ⇒ 必须切回 3 档再读，才能证明 2 档那次运行真的没写进去。
   // （先前我直接在 2 档读 getWxPusherProfileSummary()——它自己第一行就是同一道 !== '3' 的门，
   //  永远返回 [] ⇒ 这条断言在「门被删掉」时照样绿 ⇒ 是废题，已按可观测方式重写。）
-  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC13', WX_pusher_topicIds: 'T1' })
-  const got1 = installTransport(WX_OK)
-  const log1 = captureLogs()
+  const fx = channelFixture({ WX_pusher_appToken: 'APT_SNC13', WX_pusher_topicIds: 'T1' }, WX_OK, { logs: true })
   const origProfile = process.env.XBK_PROFILE
   process.env.XBK_PROFILE = '2'
   try {
     await sendNotify('profile2', '正文')
-    assert.ok(log1.logs.some(l => l.includes('[profile wxpusher]') && l.includes('outcome=success')), '2 档必须打逐次日志')
+    assert.ok(fx.logs.some(l => l.includes('[profile wxpusher]') && l.includes('outcome=success')), '2 档必须打逐次日志')
     process.env.XBK_PROFILE = '3'
     assert.ok(!getWxPusherProfileSummary().some(s => s.app === maskKey('APT_SNC13')), '2 档的运行不得在 3 档统计里留下条目')
   } finally {
     if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    log1.restore(); got1.restore(); restore()
+    fx.restore()
   }
 })
 
 checkS('SN-14 WxPusher: XBK_PROFILE=3 的四种 outcome 分类计数必须各归各位', async () => {
-  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC14', WX_pusher_topicIds: 'T1' })
-  const log1 = captureLogs()
   const origProfile = process.env.XBK_PROFILE
   process.env.XBK_PROFILE = '3'
   const scripted = [WX_OK, () => ({ body: JSON.stringify({ code: 1001 }) }), () => ({ error: new Error('连接中断') }), () => ({ body: JSON.stringify({ code: 500 }) })]
-  const got1 = installTransport(() => scripted[Math.min(got1.capture.length - 1, scripted.length - 1)]())
+  const fx = channelFixture({ WX_pusher_appToken: 'APT_SNC14', WX_pusher_topicIds: 'T1' },
+    () => scripted[Math.min(fx.capture.length - 1, scripted.length - 1)](), { logs: true })
   try {
     for (let i = 0; i < scripted.length; i++) {
       try { await sendNotify('profile3-' + i, '正文') } catch (e) { /* 失败轮次预期上抛 */ }
@@ -2155,7 +2153,7 @@ checkS('SN-14 WxPusher: XBK_PROFILE=3 的四种 outcome 分类计数必须各归
     )
   } finally {
     if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    log1.restore(); got1.restore(); restore()
+    fx.restore()
   }
 })
 
@@ -2165,35 +2163,31 @@ checkS('SN-15 WxPusher: 非 3 档调用 printWxPusherProfileSummary 必须一字
   // 实测（本 PR 评审）：全新进程里把 `!== '3'` 那道门删掉，size===0 仍先兜住 ⇒ 本条照样绿。
   // 所以这里先自己在 3 档跑一轮，确保「Map 非空」是本用例造成的，档位门一坏就必然显形。
   const origProfile = process.env.XBK_PROFILE
-  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC15', WX_pusher_topicIds: 'T1' })
-  const got1 = installTransport(WX_OK)
-  const log1 = captureLogs()
+  const fx = channelFixture({ WX_pusher_appToken: 'APT_SNC15', WX_pusher_topicIds: 'T1' }, WX_OK, { logs: true })
   try {
     process.env.XBK_PROFILE = '3'
     await sendNotify('播种-3档', '正文')
     const seeded = getWxPusherProfileSummary().filter(s => s.app === maskKey('APT_SNC15'))
     assert.strictEqual(seeded.length, 1, `前置播种必须真的写进 3 档统计（否则下面的断言是空转），实际 ${JSON.stringify(seeded)}`)
-    assert.strictEqual(got1.capture.length, 1, '播种轮应发出 1 次请求')
+    assert.strictEqual(fx.capture.length, 1, '播种轮应发出 1 次请求')
     // 切到非 3 档再调 print：统计已非空，此时**只可能**是档位门让它闭嘴。
     delete process.env.XBK_PROFILE
-    log1.logs.length = 0
+    fx.logs.length = 0
     printWxPusherProfileSummary()
-    assert.strictEqual(log1.logs.length, 0, `未开 3 档时不得输出任何 summary 行，实际: ${JSON.stringify(log1.logs)}`)
+    assert.strictEqual(fx.logs.length, 0, `未开 3 档时不得输出任何 summary 行，实际: ${JSON.stringify(fx.logs)}`)
     // 同一非空统计在 3 档下必须打出来——反向对照，证明上一条不是「反正都不打」的废题
     process.env.XBK_PROFILE = '3'
     printWxPusherProfileSummary()
-    assert.ok(log1.logs.some(l => l.includes('[profile wxpusher summary]')),
-      `3 档且统计非空时必须输出，实际: ${JSON.stringify(log1.logs)}`)
+    assert.ok(fx.logs.some(l => l.includes('[profile wxpusher summary]')),
+      `3 档且统计非空时必须输出，实际: ${JSON.stringify(fx.logs)}`)
   } finally {
     if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    log1.restore(); got1.restore(); restore()
+    fx.restore()
   }
 })
 
 checkS('SN-16 WxPusher: 10 秒窗口过期后必须腾出名额（不得因未清理的时间戳把自己锁死）', async () => {
-  const restore = isolateChannel({ WX_pusher_appToken: 'APT_SNC16', WX_pusher_topicIds: 'T1' })
-  const log1 = captureLogs()
-  const got1 = installTransport(WX_OK)
+  const fx = channelFixture({ WX_pusher_appToken: 'APT_SNC16', WX_pusher_topicIds: 'T1' }, WX_OK, { logs: true })
   const realNow = Date.now
   let offset = 0
   Date.now = () => realNow() + offset
@@ -2205,35 +2199,33 @@ checkS('SN-16 WxPusher: 10 秒窗口过期后必须腾出名额（不得因未�
   const ac = new AbortController()
   try {
     for (let i = 0; i < 19; i++) await sendNotify('填窗口-' + i, '正文')
-    assert.strictEqual(got1.capture.length, 19, '窗口内应发出 19 次')
+    assert.strictEqual(fx.capture.length, 19, '窗口内应发出 19 次')
     offset = 15000 // 跨过 WXPUSHER_WINDOW_MS(10s)：旧时间戳必须被清理，否则本轮永远排不到名额
     // 用有界 race：清理被删掉时这一轮不是「慢」而是永远排不到 ⇒ 让它 1.5s 就判红，而不是拖到套件看门狗。
     const done = sendNotify('窗口过期后', '正文', { signal: ac.signal }).then(() => 'done', (e) => 'failed: ' + (e && e.message))
     const settled = await Promise.race([done, new Promise((resolve) => setTimeout(() => resolve('stuck'), 1500))])
     assert.strictEqual(settled, 'done', `过期后第 20 次必须立刻排到名额，实际 ${settled}`)
-    assert.strictEqual(got1.capture.length, 20, '窗口过期清理后必须真的发出第 20 次请求')
+    assert.strictEqual(fx.capture.length, 20, '窗口过期清理后必须真的发出第 20 次请求')
   } finally {
     ac.abort() // 收尾泄漏的在飞等待（判红时它已不可能自己结算）
     Date.now = realNow
-    log1.restore(); got1.restore(); restore()
+    fx.restore()
   }
 })
 
 checkS('SN-17 WxPusher: 重复应用配置在限频后必须停止空转并保留最后一次真实错误', async () => {
   const dup = { appToken: 'APT_SNC17', topicIds: ['T1'] }
-  const restore = isolateChannel({ WX_pusher_channels: [dup, { ...dup }] })
-  const log1 = captureLogs()
-  const got1 = installTransport(() => ({ body: JSON.stringify({ code: 1001, msg: '速度太快' }) }))
+  const fx = channelFixture({ WX_pusher_channels: [dup, { ...dup }] }, () => ({ body: JSON.stringify({ code: 1001, msg: '速度太快' }) }), { logs: true })
   try {
     let threw = null
     try { await sendNotify('重复应用限频', '正文') } catch (e) { threw = e }
     assert.ok(threw, '全部应用都试过仍限频必须上抛')
-    assert.strictEqual(got1.capture.length, 1, '同一 appToken+topicIds 的重复项不得被当成「另一个备用应用」反复发（重复轰炸）')
+    assert.strictEqual(fx.capture.length, 1, '同一 appToken+topicIds 的重复项不得被当成「另一个备用应用」反复发（重复轰炸）')
     const inner = threw.failures[0]
     assert.strictEqual(inner.channel, 'wxpusher', '失败记录必须点名 wxpusher')
     assert.strictEqual(String(inner.providerCode), '1001', `必须保留最后一次限频业务码，实际 ${JSON.stringify(inner.providerCode)}`)
     assert.ok(inner.message.includes('速度太快'), `不得退化成无信息量的兜底文案，实际 ${inner.message}`)
-  } finally { log1.restore(); got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 // SN-18：通道内部抛异常时的「部分成功 + 在飞清单摘除」契约。
@@ -2244,13 +2236,13 @@ checkS('SN-17 WxPusher: 重复应用配置在限频后必须停止空转并保�
 // （留着会让 Pusher 的 10s 超时归因把已结算通道也算成 PUSH_TIMEOUT）。
 checkS('SN-18 sendNotify: 通道自身抛异常只算该通道失败，不得影响其他通道，且必须从在飞清单摘掉', async () => {
   let reads = 0
-  const restore = isolateChannel({ PUSH_PLUS_TOKEN: 'PPT_once', WX_XIZHI_KEY: 'https://xizhi.fake/k' })
+  const fx = channelFixture({ PUSH_PLUS_TOKEN: 'PPT_once', WX_XIZHI_KEY: 'https://xizhi.fake/k' },
+    () => ({ body: JSON.stringify({ code: 200 }) }))
+  // 脏配置 getter 必须在 isolateChannel 之后装上（它会抹掉全部通道键）
   Object.defineProperty(push_config, 'PUSH_PLUS_TOKEN', {
     configurable: true,
     get () { if (reads++ > 0) throw new Error('脏配置读取失败'); return 'PPT_once' }
   })
-  const log1 = captureLogs()
-  const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
   const tracker = {}
   try {
     let threw = null
@@ -2261,18 +2253,16 @@ checkS('SN-18 sendNotify: 通道自身抛异常只算该通道失败，不得影
     assert.strictEqual(res.failures[0].channel, 'pushplus', '异常通道必须记为失败并点名')
     assert.ok(/脏配置读取失败/.test(res.failures[0].message), `失败原因必须保留根因，实际 ${res.failures[0].message}`)
     assert.deepStrictEqual(tracker.pending, [], `已结算通道必须全部从在飞清单摘掉，实际 ${JSON.stringify(tracker.pending)}`)
-    assert.strictEqual(got1.capture.length, 1, '异常通道不得发出请求（只有息知发一次）')
+    assert.strictEqual(fx.capture.length, 1, '异常通道不得发出请求（只有息知发一次）')
   } finally {
     delete push_config.PUSH_PLUS_TOKEN
-    log1.restore(); got1.restore(); restore()
+    fx.restore()
   }
 })
 
 checkS('SN-20 失败归因: reason 的结构化字段读取抛异常时只保留安全消息，不得抛穿汇总', async () => {
   const hostile = { message: '上游返回异常', code: 'ECONNRESET', get providerCode () { throw new Error('字段不可读') } }
-  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-  const log1 = captureLogs()
-  const got1 = installTransport(() => ({ error: hostile }))
+  const fx = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ error: hostile }), { logs: true })
   try {
     let threw = null
     try { await sendNotify('异常字段探针', '正文') } catch (e) { threw = e }
@@ -2280,19 +2270,17 @@ checkS('SN-20 失败归因: reason 的结构化字段读取抛异常时只保留
     assert.strictEqual(threw.code, 'ALL_CHANNELS_FAILED', `必须走正常汇总而不是被字段异常炸穿，实际 code=${threw && threw.code} msg=${threw && threw.message}`)
     assert.strictEqual(threw.failures[0].message, '上游返回异常', '失败记录必须保留安全消息')
     assert.strictEqual(threw.failures[0].channel, 'server酱', '失败记录必须带通道名')
-  } finally { log1.restore(); got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('SN-21 入口清洗: text/desp 为 undefined/null 或 String() 抛异常时都必须按空串继续，不得抛穿', async () => {
   for (const [label, bad] of [['undefined', undefined], ['null', null], ['String() 抛', { toString () { throw new Error('不可字符串化') } }]]) {
-    const restore = isolateChannel({ BARK_PUSH: 'dev_snc21' })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    const fx = channelFixture({ BARK_PUSH: 'dev_snc21' }, () => ({ body: JSON.stringify({ code: 200 }) }), { logs: true })
     try {
       const res = await sendNotify(bad, bad)
       assert.deepStrictEqual(res.successfulChannels, ['bark'], `${label} 必须清洗成空串后照常发送`)
-      assert.strictEqual(got1.capture[0].opts.json.title, '', `${label} 时 title 必须是空串，实际 ${JSON.stringify(got1.capture[0].opts.json.title)}`)
-    } finally { log1.restore(); got1.restore(); restore() }
+      assert.strictEqual(fx.capture[0].opts.json.title, '', `${label} 时 title 必须是空串，实际 ${JSON.stringify(fx.capture[0].opts.json.title)}`)
+    } finally { fx.restore() }
   }
 })
 
@@ -2310,14 +2298,12 @@ checkS('SNB-01 Bark: 设备码切分——空段丢弃、每段 trim，请求条
     ['d1#  #d2', ['https://api.day.app/d1', 'https://api.day.app/d2']]
   ]
   for (const [raw, urls] of cases) {
-    const restore = isolateChannel({ BARK_PUSH: raw })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    const fx = channelFixture({ BARK_PUSH: raw }, () => ({ body: JSON.stringify({ code: 200 }) }), { logs: true })
     try {
       const res = await sendNotify('切分探针', '正文')
-      assert.deepStrictEqual(got1.capture.map(c => c.url), urls, `配置 ${JSON.stringify(raw)} 的请求 URL 集合不符（filter/trim 被掏空就会多请求或带空格）`)
+      assert.deepStrictEqual(fx.capture.map(c => c.url), urls, `配置 ${JSON.stringify(raw)} 的请求 URL 集合不符（filter/trim 被掏空就会多请求或带空格）`)
       assert.deepStrictEqual(res.successfulChannels, ['bark'], `配置 ${JSON.stringify(raw)} 应判通道成功`)
-    } finally { log1.restore(); got1.restore(); restore() }
+    } finally { fx.restore() }
   }
 })
 
@@ -2331,15 +2317,13 @@ checkS('SNB-02 Bark: 端点协议判定——自建 http 与大写 HTTPS 原样�
     'dev1'
   ]
   for (const raw of cases) {
-    const restore = isolateChannel({ BARK_PUSH: raw })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    const fx = channelFixture({ BARK_PUSH: raw }, () => ({ body: JSON.stringify({ code: 200 }) }), { logs: true })
     try {
       await sendNotify('协议判定探针', '正文')
-      assert.strictEqual(got1.capture.length, 1, `配置 ${raw} 必须恰好发一次`)
+      assert.strictEqual(fx.capture.length, 1, `配置 ${raw} 必须恰好发一次`)
       const expect = /^https?:\/\//i.test(raw) ? raw : `https://api.day.app/${raw}`
-      assert.strictEqual(got1.capture[0].url, expect, `配置 ${raw} 的端点判定错（锚点 ^ 或 s? 改动、取反都会在此变红）`)
-    } finally { log1.restore(); got1.restore(); restore() }
+      assert.strictEqual(fx.capture[0].url, expect, `配置 ${raw} 的端点判定错（锚点 ^ 或 s? 改动、取反都会在此变红）`)
+    } finally { fx.restore() }
   }
 })
 
@@ -2347,47 +2331,40 @@ checkS('SNB-06 Bark: 调用方 AbortSignal 必须原样交给传输层；未传�
   // 轮1：带 signal —— 必须是同一个引用（取消能否生效的唯一通路）
   const ac = new AbortController()
   {
-    const restore = isolateChannel({ BARK_PUSH: 'dev_snb06' })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    const fx = channelFixture({ BARK_PUSH: 'dev_snb06' }, () => ({ body: JSON.stringify({ code: 200 }) }), { logs: true })
     try {
       await sendNotify('signal 透传', '正文', { signal: ac.signal, inFlightTracker: {} })
-      const opts = got1.capture[0].opts
+      const opts = fx.capture[0].opts
       assert.strictEqual(opts.signal, ac.signal, 'signal 必须原样（同引用）交给传输层；删掉透传这一路无人变红')
       assert.strictEqual(opts.headers['Content-Type'], 'application/json', 'Bark 必须显式 application/json（headers 对象被清空在此变红）')
       assert.strictEqual(opts.timeout, 15000, '超时形态契约')
       assert.strictEqual('signal' in opts.json, false, 'signal 不得进第三方 JSON body')
       assert.strictEqual('inFlightTracker' in opts, false, '内部选项不得漏进传输选项')
-    } finally { log1.restore(); got1.restore(); restore() }
+    } finally { fx.restore() }
   }
   // 轮2：脏 params（读 signal 就抛）⇒ requestExtras 的 try/catch 必须兜住，照常发送
   {
-    const restore = isolateChannel({ BARK_PUSH: 'dev_snb06' })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    const fx2 = channelFixture({ BARK_PUSH: 'dev_snb06' }, () => ({ body: JSON.stringify({ code: 200 }) }), { logs: true })
     try {
       const res = await sendNotify('脏 params', '正文', { get signal () { throw new Error('脏 params') } })
       assert.deepStrictEqual(res.successfulChannels, ['bark'], '脏 params 不得影响发送（try/catch 被掏空则整条通道抛穿）')
-      assert.strictEqual(got1.capture.length, 1, '仍恰好发一次')
-    } finally { log1.restore(); got1.restore(); restore() }
+      assert.strictEqual(fx2.capture.length, 1, '仍恰好发一次')
+    } finally { fx2.restore() }
   }
   // 轮3：只传内部选项 ⇒ 传输选项里不得凭空出现 signal 键
   {
-    const restore = isolateChannel({ BARK_PUSH: 'dev_snb06' })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+    const fx3 = channelFixture({ BARK_PUSH: 'dev_snb06' }, () => ({ body: JSON.stringify({ code: 200 }) }), { logs: true })
     try {
       await sendNotify('无 signal', '正文', { inFlightTracker: {} })
-      assert.strictEqual('signal' in got1.capture[0].opts, false, '未传 signal 时不得注入该键（写成 {signal: undefined} 会让取消语义变成永不取消）')
-    } finally { log1.restore(); got1.restore(); restore() }
+      assert.strictEqual('signal' in fx3.capture[0].opts, false, '未传 signal 时不得注入该键（写成 {signal: undefined} 会让取消语义变成永不取消）')
+    } finally { fx3.restore() }
   }
 })
 
 checkS('SNB-03 Bark: 响应不是 JSON（代理回 HTML）时按业务失败，兜底文案逐字且不得把响应体塞进 message', async () => {
-  const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DevKey12345' })
-  const log1 = captureLogs()
   // 流式路径 JSON.parse 失败时保留原始字符串（:390-393 的刻意行为）⇒ data 是个 HTML 字符串
-  const got1 = installTransport(() => ({ body: '<html>Bad Gateway DevKey12345</html>' }))
+  const fx = channelFixture({ BARK_PUSH: 'https://api.day.app/DevKey12345' },
+    () => ({ body: '<html>Bad Gateway DevKey12345</html>' }))
   try {
     let threw = null
     try { await sendNotify('HTML 响应', '正文') } catch (e) { threw = e }
@@ -2399,13 +2376,11 @@ checkS('SNB-03 Bark: 响应不是 JSON（代理回 HTML）时按业务失败，�
     assert.strictEqual('providerCode' in inner, false, '响应体没有 code 字段时不得造 providerCode')
     assert.strictEqual(inner.statusCode, 200, 'statusCode 取自 response 形参')
     assert.ok(!inner.message.includes('Bad Gateway') && !inner.message.includes('DevKey12345'), '异常响应体不得进 message（可能回显密钥）')
-  } finally { log1.restore(); got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('SNB-04 Bark: 传输错误（无 response）必须逐设备点名且不得重发', async () => {
-  const restore = isolateChannel({ BARK_PUSH: 'dev_snb04' })
-  const log1 = captureLogs()
-  const got1 = installTransport(() => ({ error: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }))
+  const fx = channelFixture({ BARK_PUSH: 'dev_snb04' }, () => ({ error: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }), { logs: true })
   try {
     let threw = null
     try { await sendNotify('传输失败', '正文') } catch (e) { threw = e }
@@ -2415,14 +2390,12 @@ checkS('SNB-04 Bark: 传输错误（无 response）必须逐设备点名且不�
     assert.strictEqual(inner.channel, 'bark', '逐设备失败必须点名 bark（通道名写错在这一层才看得见）')
     assert.strictEqual(inner.code, 'ECONNREFUSED', '传输错误码原样透传')
     assert.strictEqual('statusCode' in inner, false, '错误没有 response 时不得造 statusCode 键')
-    assert.strictEqual(got1.capture.length, 1, 'Bark 没有重试语义，不得重发')
-  } finally { log1.restore(); got1.restore(); restore() }
+    assert.strictEqual(fx.capture.length, 1, 'Bark 没有重试语义，不得重发')
+  } finally { fx.restore() }
 })
 
 checkS('SNB-05 Bark: catch 分支必须留下逐设备根因（比 SN-04 下钻一层）', async () => {
-  const restore = isolateChannel({ BARK_PUSH: 'dev_snb05' })
-  const log1 = captureLogs()
-  const got1 = installTransport(() => ({ body: brokenBody() }), { promiseOnly: true })
+  const fx = channelFixture({ BARK_PUSH: 'dev_snb05' }, () => ({ body: brokenBody() }), { promiseOnly: true }, { logs: true })
   try {
     let threw = null
     try { await sendNotify('catch 根因', '正文') } catch (e) { threw = e }
@@ -2432,7 +2405,7 @@ checkS('SNB-05 Bark: catch 分支必须留下逐设备根因（比 SN-04 下钻�
     assert.strictEqual(agg.failures[0].channel, 'bark', '根因必须点名 bark')
     assert.ok(/不可读/.test(agg.failures[0].message), `根因必须保留原始异常文案，实际 ${agg.failures[0].message}`)
     assert.strictEqual('providerCode' in agg.failures[0], false, '读不出业务码时不得造键')
-  } finally { log1.restore(); got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不落日志）', async () => {
@@ -2444,29 +2417,25 @@ checkS('SNB-08 Bark: 三行日志逐字 + 端点一律脱敏（query/hash 绝不
     ['传输失败', () => ({ error: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) })]
   ]
   for (const [label, spec] of scenarios) {
-    const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DEVI9999' })
-    const log1 = captureLogs()
-    const got1 = installTransport(spec)
+    const fx = channelFixture({ BARK_PUSH: 'https://api.day.app/DEVI9999' }, spec, { logs: true })
     try {
       try { await sendNotify('日志面探针', '正文') } catch (e) { /* 失败场景预期上抛 */ }
-      const hit = log1.logs.filter(l => l.includes('Bark APP 发送通知到'))
+      const hit = fx.logs.filter(l => l.includes('Bark APP 发送通知到'))
       assert.ok(hit.length >= 1, `${label} 场景必须打「Bark APP 发送通知到 …」这条日志（模板被掏空在此暴露）`)
       assert.ok(hit.some(l => l.includes('https://api.day.app/DEVI***99')), `${label} 场景端点必须走 maskUrl，实际: ${JSON.stringify(hit)}`)
       assert.ok(!hit.some(l => l.includes('DEVI99')), `${label} 场景不得把完整设备码写进日志`)
-    } finally { log1.restore(); got1.restore(); restore() }
+    } finally { fx.restore() }
   }
   // query/hash 形态：maskUrl 只保留协议+host+脱敏路径，query 与 hash 整段丢弃（防密钥随日志外泄）
   {
-    const restore = isolateChannel({ BARK_PUSH: 'https://api.day.app/DevKey1234?auth=SECRETQUERY#frag' })
-    const log1 = captureLogs()
-    const got1 = installTransport(() => ({ body: JSON.stringify({ code: 500, message: 'bad' }) }))
+    const fx2 = channelFixture({ BARK_PUSH: 'https://api.day.app/DevKey1234?auth=SECRETQUERY#frag' }, () => ({ body: JSON.stringify({ code: 500, message: 'bad' }) }), { logs: true })
     try {
       try { await sendNotify('query 脱敏', '正文') } catch (e) { /* 预期失败 */ }
-      const joined = log1.logs.join('\n')
+      const joined = fx2.logs.join('\n')
       assert.ok(joined.includes('https://api.day.app/DevK***34'), `路径必须脱敏为 DevK***34，实际日志: ${joined.slice(0, 200)}`)
       assert.ok(!joined.includes('SECRETQUERY'), 'query 一律不得进日志')
       assert.ok(!joined.includes('#frag'), 'hash 一律不得进日志')
-    } finally { log1.restore(); got1.restore(); restore() }
+    } finally { fx2.restore() }
   }
 })
 
@@ -2482,15 +2451,13 @@ checkS('SNB-09 Bark/企业微信: 业务码序列化成字符串时必须照样�
     ['企业微信', { QYWX_KEY: 'qykey09' }, () => ({ body: JSON.stringify({ errcode: '0', errmsg: 'ok' }) }), '企业微信']
   ]
   for (const [label, cfg, respond, channel] of forms) {
-    const restore = isolateChannel(cfg)
-    const log1 = captureLogs()
-    const got1 = installTransport(respond)
+    const fx = channelFixture(cfg, respond, { logs: true })
     try {
       const res = await sendNotify('字符串业务码-' + label, '正文')
       assert.deepStrictEqual(res.successfulChannels, [channel],
         `${label} 的业务码是字符串时必须照样判成功（只认数字侧就会把已送达的消息当失败重推）`)
       assert.strictEqual(res.failures.length, 0, `${label} 字符串业务码不得记失败`)
-    } finally { log1.restore(); got1.restore(); restore() }
+    } finally { fx.restore() }
   }
 })
 
@@ -2500,19 +2467,17 @@ checkS('SNB-09 Bark/企业微信: 业务码序列化成字符串时必须照样�
 // 轻则 webhook 截断成「发给了另一个 key」，重则用户配的脏 key 直接把 query 拼坏而无人报警。
 checkS('SN-25 企业微信: QYWX_KEY 含 query 特殊字符时必须逐字符百分号编码（不得拼出可截断的 key）', async () => {
   const dirty = 'qy&key=x#1'
-  const restore = isolateChannel({ QYWX_KEY: dirty })
-  const log1 = captureLogs()
-  const got1 = installTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
+  const fx = channelFixture({ QYWX_KEY: dirty }, () => ({ body: JSON.stringify({ errcode: 0 }) }), { logs: true })
   try {
     const res = await sendNotify('脏 key 编码', '正文')
     assert.deepStrictEqual(res.successfulChannels, ['企业微信'], '脏 key 不得影响发送判定')
-    const url = got1.capture[0].url
+    const url = fx.capture[0].url
     assert.ok(url.endsWith('key=' + encodeURIComponent(dirty)),
       `key 必须整体百分号编码，实际 URL: ${url}`)
     assert.ok(!url.includes('qy&key=x'), '原始 & 不得留在 query 里（会被当参数分隔符）')
     assert.ok(!url.slice(url.indexOf('?')).includes('#'), '原始 # 不得留在 query 里（会被当 fragment 起点截断）')
     assert.strictEqual(url.split('?').length, 2, `URL 只能有一个 query 段，实际: ${url}`)
-  } finally { log1.restore(); got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 // 登记（本簇**不写**考题的等价/不可达变异体，实测所有候选都杀不掉）：
@@ -2562,8 +2527,7 @@ const SIX_RAW_REJECT_CHANNELS = [
 
 checkS('C8-007 六个原样 reject 的通道: got HTTPError 413 必须带出 statusCode 并判 permanent', async () => {
   for (const [channel, want] of SIX_RAW_REJECT_CHANNELS) {
-    const restore = isolateChannel(want)
-    const got1 = installTransport(() => ({ error: httpErrorFixture(413, 'Payload Too Large') }))
+    const fx = channelFixture(want, () => ({ error: httpErrorFixture(413, 'Payload Too Large') }))
     try {
       let threw = null
       try { await sendNotify('413 探针', '正文') } catch (e) { threw = e }
@@ -2575,14 +2539,13 @@ checkS('C8-007 六个原样 reject 的通道: got HTTPError 413 必须带出 sta
       const decision = classifySummary({ pushed: 0, failed: 1, failures: [summarizeError(threw)] })
       assert.strictEqual(decision && decision.kind, 'permanent',
         `${channel}: 413 应判 permanent（与 pushplus 同口径），实际 ${JSON.stringify(decision && decision.kind)}`)
-    } finally { got1.restore(); restore() }
+    } finally { fx.restore() }
   }
 })
 
 checkS('C8-007 受害集合 415/422/451 判 permanent，5xx 仍判 retryable（不得一律判永久）', async () => {
   for (const code of [415, 422, 451]) {
-    const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-    const got1 = installTransport(() => ({ error: httpErrorFixture(code, 'Rejected') }))
+    const fx = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ error: httpErrorFixture(code, 'Rejected') }))
     try {
       let threw = null
       try { await sendNotify(`${code} 探针`, '正文') } catch (e) { threw = e }
@@ -2590,16 +2553,15 @@ checkS('C8-007 受害集合 415/422/451 判 permanent，5xx 仍判 retryable（�
       assert.strictEqual(failure && failure.statusCode, code, `HTTP ${code} 的 statusCode 必须透出`)
       assert.strictEqual(classifySummary({ pushed: 0, failed: 1, failures: [summarizeError(threw)] }).kind, 'permanent',
         `HTTP ${code} 应判 permanent`)
-    } finally { got1.restore(); restore() }
+    } finally { fx.restore() }
   }
-  const restore = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-  const got1 = installTransport(() => ({ error: httpErrorFixture(503, 'Service Unavailable') }))
+  const fx2 = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ error: httpErrorFixture(503, 'Service Unavailable') }))
   try {
     let threw = null
     try { await sendNotify('503 探针', '正文') } catch (e) { threw = e }
     const decision = classifySummary({ pushed: 0, failed: 1, failures: [summarizeError(threw)] })
     assert.strictEqual(decision.kind, 'retryable', '5xx 是瞬时故障，必须仍判 retryable')
-  } finally { got1.restore(); restore() }
+  } finally { fx2.restore() }
 })
 
 // ===== C8-002：{Html内容} 产物进纯文本/Markdown 通道必须降级，不得下发裸 HTML =====
@@ -2620,28 +2582,26 @@ function assertNoRawHtml (payload, channel, allowBr = false) {
 }
 
 checkS('C8-002 Bark: HTML desp 的段落换行保留 + <img> 取 alt（不得整段退化）', async () => {
-  const restore = isolateChannel({ BARK_PUSH: 'https://bark.fake/dev' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+  const fx = channelFixture({ BARK_PUSH: 'https://bark.fake/dev' }, () => ({ body: JSON.stringify({ code: 200 }) }))
   try {
     await sendNotify('标题', HTML_DESP)
-    const body = got1.capture[0].opts.json.body
+    const body = fx.capture[0].opts.json.body
     assert.ok(body.includes(PLAIN_FIRST), `Bark 必须保留 <p>/<br> 的段落边界，实际 ${JSON.stringify(body)}`)
     assert.ok(body.includes(PLAIN_TAIL), `Bark 必须保留第二段并把 <img> 降成 alt，实际 ${JSON.stringify(body)}`)
     assertNoRawHtml(body, 'Bark')
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('C8-002 Push+: HTML desp 的段落换行保留 + <img> 取 alt', async () => {
-  const restore = isolateChannel({ PUSH_PLUS_TOKEN: 'pptoken' })
-  const got1 = installTransport(() => ({ body: JSON.stringify({ code: 200 }) }))
+  const fx = channelFixture({ PUSH_PLUS_TOKEN: 'pptoken' }, () => ({ body: JSON.stringify({ code: 200 }) }))
   try {
     await sendNotify('标题', HTML_DESP)
-    const content = JSON.parse(got1.capture[0].opts.body).content
+    const content = JSON.parse(fx.capture[0].opts.body).content
     assert.ok(content.includes('段落一第一行<br><br>段落一第二行'),
       `Push+ 的段落换行必须变成 <br>，实际 ${JSON.stringify(content)}`)
     assert.ok(content.includes('图片说明'), `Push+ 必须取到 <img> 的 alt，实际 ${JSON.stringify(content)}`)
     assertNoRawHtml(content, 'Push+', true) // <br> 是 Push+ 的分行形态，允许
-  } finally { got1.restore(); restore() }
+  } finally { fx.restore() }
 })
 
 checkS('C8-002 企微 / 息知 / PushMe: Markdown 通道不得把 HTML 源码当正文下发', async () => {
@@ -2651,74 +2611,68 @@ checkS('C8-002 企微 / 息知 / PushMe: Markdown 通道不得把 HTML 源码当
     ['pushme', { PUSHME_KEY: 'pmkey' }, (opts) => opts.json.content]
   ]
   for (const [channel, want, pick] of cases) {
-    const restore = isolateChannel(want)
     const body = (url) => {
       const u = String(url)
       if (u.includes('qyapi')) return { errcode: 0 }
       if (u.includes('push.i-i.me')) return 'success' // PushMe 的成功判定是响应体恰为 'success'
       return { code: 200 }
     }
-    const got1 = installTransport((url) => ({ body: typeof body(url) === 'string' ? body(url) : JSON.stringify(body(url)) }))
+    const fx = channelFixture(want, (url) => ({ body: typeof body(url) === 'string' ? body(url) : JSON.stringify(body(url)) }))
     try {
       await sendNotify('标题', HTML_DESP)
-      const payload = pick(got1.capture[0].opts)
+      const payload = pick(fx.capture[0].opts)
       assertNoRawHtml(payload, channel)
       assert.ok(payload.includes('段落一第一行\n\n段落一第二行'), `${channel}: 段落换行必须保留，实际 ${JSON.stringify(payload)}`)
       assert.ok(payload.includes('图片说明'), `${channel}: <img> 必须降成 alt，实际 ${JSON.stringify(payload)}`)
-    } finally { got1.restore(); restore() }
+    } finally { fx.restore() }
   }
 })
 
 checkS('C8-002 Server酱 / PushDeer / TG: 纯文本通道不得露出 HTML 源码', async () => {
-  const restoreServer = isolateChannel({ PUSH_KEY: 'SCTfakekey' })
-  const gotServer = installTransport(() => ({ body: JSON.stringify({ errno: 0 }) }))
+  const fx = channelFixture({ PUSH_KEY: 'SCTfakekey' }, () => ({ body: JSON.stringify({ errno: 0 }) }))
   try {
     await sendNotify('标题', HTML_DESP)
-    const form = new URLSearchParams(String(gotServer.capture[0].opts.body))
+    const form = new URLSearchParams(String(fx.capture[0].opts.body))
     const desp = form.get('desp')
     assertNoRawHtml(desp, 'Server酱')
     assert.ok(desp.includes('图片说明'), `Server酱: <img> 必须降成 alt，实际 ${JSON.stringify(desp)}`)
     assert.ok(desp.includes('段落一第一行'), 'Server酱: 段落内容必须保留')
-  } finally { gotServer.restore(); restoreServer() }
+  } finally { fx.restore() }
 
-  const restoreDeer = isolateChannel({ DEER_KEY: 'PDK_fake' })
-  const gotDeer = installTransport(() => ({ body: JSON.stringify({ content: { result: [{ message: 'ok' }] } }) }))
+  const fx2 = channelFixture({ DEER_KEY: 'PDK_fake' }, () => ({ body: JSON.stringify({ content: { result: [{ message: 'ok' }] } }) }))
   try {
     await sendNotify('标题', HTML_DESP)
-    const desp = new URLSearchParams(String(gotDeer.capture[0].opts.body)).get('desp')
+    const desp = new URLSearchParams(String(fx2.capture[0].opts.body)).get('desp')
     assertNoRawHtml(desp, 'PushDeer')
     assert.ok(desp.includes('图片说明'), `PushDeer: <img> 必须降成 alt，实际 ${JSON.stringify(desp)}`)
-  } finally { gotDeer.restore(); restoreDeer() }
+  } finally { fx2.restore() }
 
-  const restoreTg = isolateChannel({ TG_BOT_TOKEN: '1:x', TG_USER_ID: '2' })
-  const gotTg = installTransport(() => ({ body: JSON.stringify({ ok: true }) }))
+  const fx3 = channelFixture({ TG_BOT_TOKEN: '1:x', TG_USER_ID: '2' }, () => ({ body: JSON.stringify({ ok: true }) }))
   try {
     await sendNotify('标题', HTML_DESP)
-    const text = gotTg.capture[0].opts.json.text
+    const text = fx3.capture[0].opts.json.text
     assertNoRawHtml(text, 'Telegram')
     assert.ok(!text.includes('&lt;p&gt;'), `TG: HTML 源码被转义后当正文下发了，实际 ${JSON.stringify(text)}`)
     assert.ok(text.includes('图片说明'), `TG: <img> 必须降成 alt，实际 ${JSON.stringify(text)}`)
-  } finally { gotTg.restore(); restoreTg() }
+  } finally { fx3.restore() }
 })
 
 checkS('C8-002 wxpusher 仍按 HTML 渲染（不得被降级成纯文本）+ 非 HTML 的 Markdown desp 不受影响', async () => {
-  const restoreWx = isolateChannel({ WX_pusher_appToken: 'AT_fake' })
-  const gotWx = installTransport(() => ({ body: JSON.stringify({ code: 1000 }) }))
+  const fx = channelFixture({ WX_pusher_appToken: 'AT_fake' }, () => ({ body: JSON.stringify({ code: 1000 }) }))
   try {
     await sendNotify('标题', HTML_DESP)
-    const opts = gotWx.capture[0].opts.json
+    const opts = fx.capture[0].opts.json
     assert.strictEqual(opts.contentType, 2, 'wxpusher 对 HTML desp 必须仍走 contentType=2（HTML 渲染）')
     assert.ok(opts.content.includes('<p>'), `wxpusher 必须收到原 HTML（它按 HTML 渲染），实际 ${JSON.stringify(opts.content)}`)
-  } finally { gotWx.restore(); restoreWx() }
+  } finally { fx.restore() }
 
   // 反向断言：不含 HTML 形态的 Markdown desp 不进入降级分支（企微的 markdown 渲染不能被吃掉）
-  const restoreQy = isolateChannel({ QYWX_KEY: 'qykey' })
-  const gotQy = installTransport(() => ({ body: JSON.stringify({ errcode: 0 }) }))
+  const fx2 = channelFixture({ QYWX_KEY: 'qykey' }, () => ({ body: JSON.stringify({ errcode: 0 }) }))
   try {
     await sendNotify('标题', '**粗体**正文')
-    const content = gotQy.capture[0].opts.json.markdown.content
+    const content = fx2.capture[0].opts.json.markdown.content
     assert.ok(content.includes('**粗体**'), `非 HTML 的 Markdown desp 必须原样保留，实际 ${JSON.stringify(content)}`)
-  } finally { gotQy.restore(); restoreQy() }
+  } finally { fx2.restore() }
 })
 
 // ===== C5-040 门禁：got 传输替身只准有一份实现（扫描本文件源码）=====
@@ -2734,4 +2688,23 @@ check('C5-040 got 传输替身只准有一份实现（扫描本文件源码）',
   assert.strictEqual(count(/const orig = \{ post: got(Module)?\./g), 1, '整个套件只准一处保存 got 原值')
   assert.strictEqual(count(/Object\.assign\(got(Module)?, orig\)/g), 1, '整个套件只准一处恢复 got（写在 installTransport.restore 里）')
   assert.strictEqual(count(/^function installTransport/gm), 1, '传输替身只准 installTransport 一份实现')
+})
+
+// ===== C5-041 门禁：通道夹具序言 / 收尾顺序只准有一份（扫描本文件源码）=====
+// 修前 30+ 条用例把「isolateChannel(...) + installTransport(...) + 可选的日志捕获 + try/finally 手工
+// 收尾」这段序言逐字抄一遍，收尾顺序还各写各的——同一文件里 `restore(); restoreGot()` 与
+// `got1.restore(); restore()` 两种**相反**次序同时存在。漏写一句就会让 push_config / got 替身漏到
+// 后续用例，报错却指向被害者。判据取「序言形状」与「收尾形状」而不是 channelFixture 的调用次数：
+// 把序言换个写法抄回来，或者手写两条 restore，照样红。
+check('C5-041 通道夹具序言 / 收尾顺序只准有一份实现（扫描本文件源码）', () => {
+  const src = fs.readFileSync(__filename, 'utf8')
+  const count = (re) => (src.match(re) || []).length
+  assert.strictEqual(count(/^\s*(?:const|let|var)\s+\w+\s*=\s*isolateChannel\([\s\S]{0,600}?installTransport\(/gm), 0,
+    '不得再手写「isolateChannel + installTransport」序言（用 channelFixture(want, respond)）')
+  assert.strictEqual(count(/\} finally \{[^}\n]*\.restore\(\)[^}\n]*\.restore\(\)/g), 0,
+    'finally 里不得再手写两条 restore 的收尾顺序（用 fx.restore() 的 LIFO 收尾）')
+  assert.strictEqual(count(/^function channelFixture/gm), 1, '通道夹具只准 channelFixture 一份实现')
+  assert.strictEqual(count(/captureLogs\(\)/g), 1, 'captureLogs 只准被夹具内部调用一次（外部要日志就传 { logs: true }）')
+  assert.ok(count(/channelFixture\(/g) >= 60,
+    `至少 60 条用例必须走同一夹具（当前 ${count(/channelFixture\(/g)} 处），否则序言又会各写各的`)
 })
