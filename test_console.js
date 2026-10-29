@@ -211,9 +211,25 @@ function refdHandleNames (ignore) {
   return names
 }
 
+// C5-021：失败只打 e.message 会把栈一起丢掉——TypeError 只剩「x is not a function」，
+// 这类套件上万行，排障只能在本地重跑一遍才知道断在哪。统一打「message（含 actual/expected）
+// + 栈首几帧」：AssertionError 也给栈，它指向的那一行就是断言现场。
+const FAILURE_STACK_FRAMES = 6
+function failureText (e) {
+  let detail = ''
+  // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
+  // 排障时看不出差在哪。这里补上短摘要，超长截断。
+  if (e && e.actual !== undefined) {
+    try { detail = ` (actual=${JSON.stringify(e.actual)} expected=${JSON.stringify(e.expected)})`.slice(0, 200) } catch (err) { detail = '' }
+  }
+  const message = `${(e && e.message) || String(e)}${detail}`
+  const stack = e && e.stack ? String(e.stack).split('\n').slice(1, 1 + FAILURE_STACK_FRAMES).filter((l) => l.trim()) : []
+  return stack.length > 0 ? `${message}\n${stack.map((l) => `    ${l.trim()}`).join('\n')}` : message
+}
+
 function ok (name, fn) {
   reapStaleTimeout(name)
-  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(name); console.log(`  ❌ ${name}: ${e.message}`) } finally { reapTestScope(name) }
+  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(name); console.log(`  ❌ ${name}: ${failureText(e)}`) } finally { reapTestScope(name) }
 }
 // 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
 // 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
@@ -264,13 +280,7 @@ async function aok (name, fn) {
     failedNames.push(name)
     // 超时是真超时（不是用例自己抛的错）才记僵尸标记：后续用例开始前会因此补收割一次。
     if (timedOut) timedOutStale = name
-    // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
-    // 排障时看不出差在哪。这里补上短摘要，超长截断。
-    let detail = ''
-    if (e && e.actual !== undefined) {
-      try { detail = ` (actual=${JSON.stringify(e.actual)} expected=${JSON.stringify(e.expected)})`.slice(0, 200) } catch (err) { detail = '' }
-    }
-    console.log(`  ❌ ${name}: ${e.message}${detail}`)
+    console.log(`  ❌ ${name}: ${failureText(e)}`)
   } finally {
     if (watchdog) realClearTimeout(watchdog)
     reapTestScope(name)
@@ -353,6 +363,37 @@ ok('看门狗不死不变式：TEST_TIMEOUT_MS 必须大于每一处内层等待
     'SSE 拆除等待必须走 SSE_TEARDOWN_WAIT_MS 常量')
   assert.strictEqual((src.match(/untilEnded\(SSE_END_WAIT_MS\)/g) || []).length, 1,
     'SSE 终结等待必须走 SSE_END_WAIT_MS 常量')
+})
+
+// ── C5-021：harness 自己的失败输出必须有栈 ──
+// 旧实现两个 catch 都只打 `e.message`：TypeError 在 CI 日志里就是一行「x is not a function」，
+// 上万行的套件里没有栈帧就只能本地重跑定位。这条用例走真实 ok() 打印路径取证（不是读源码），
+// 打印前后把计数器与失败名还原，避免自证式污染通过/失败数。
+ok('harness 失败输出必须带栈（C5-021：走真实 ok() 打印路径）', () => {
+  const lines = []
+  const origLog = console.log
+  const snapshot = { passed, failed, names: failedNames.slice(), leaked: leakedScopes.slice() }
+  try {
+    console.log = (...args) => lines.push(args.join(' '))
+    ok('探针：故意抛 TypeError', () => { throw new TypeError('probe is not a function') })
+  } finally {
+    console.log = origLog
+    passed = snapshot.passed
+    failed = snapshot.failed
+    failedNames.length = 0
+    failedNames.push(...snapshot.names)
+    leakedScopes.length = 0
+    leakedScopes.push(...snapshot.leaked)
+  }
+  const out = lines.join('\n')
+  assert.ok(out.includes('probe is not a function'), `失败输出必须保留 message（实际：${JSON.stringify(out)}）`)
+  assert.ok(out.includes('❌ 探针：故意抛 TypeError'), '失败输出必须保留用例名')
+  assert.ok(/^ {4}at /m.test(out), `失败输出必须带栈帧（旧实现只打 e.message，实际：${JSON.stringify(out)}）`)
+  // AssertionError 同样要给栈（message 里那句自定义文案之外，actual/expected 也要留）
+  const assertion = new assert.AssertionError({ message: '期望 A', actual: 2, expected: 1 })
+  assert.ok(failureText(assertion).includes('actual=2') && failureText(assertion).includes('expected=1'),
+    'AssertionError 的 actual/expected 摘要不得丢')
+  assert.ok(/^ {4}at /m.test(failureText(assertion)), 'AssertionError 的栈同样不得丢')
 })
 
 // ── token 校验 ──
