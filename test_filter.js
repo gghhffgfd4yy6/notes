@@ -1623,7 +1623,8 @@ console.log('========================================\n');
       assertEqual(Buffer.byteLength(r, 'utf8') <= maxBytes, true, '返回的裁剪结果不得超过 maxBytes（防读端自锁）')
       assertEqual(droppedOut.length > 0, true, '超限时应发生裁剪')
     } else {
-      assertEqual(true, true, '单条仍超限返回 null 也是合法兜底')
+      // C5-019：null 分支的契约是「没有实际裁掉任何记录 ⇒ 不产生丢弃」（旧 assertEqual(true,true) 恒真）
+      assertEqual(droppedOut.length, 0, '返回 null（单条仍超限）时不得记为丢弃：没有实际裁掉任何记录')
     }
   })
 
@@ -2786,8 +2787,9 @@ console.log('========================================\n');
   })
 
   await test('saveBatch 空数组 → 不报错', () => {
-    saveBatch([], 'test_batch_empty.json')
-    assertEqual(true, true)
+    // C5-019：契约是「不抛」（旧 assertEqual(true,true) 永远不会红），并断言确实没写入任何消息
+    assert.doesNotThrow(() => saveBatch([], 'test_batch_empty.json'), '空数组不得抛错')
+    assertEqual(readMessages(getFilePath('test_batch_empty.json')).length, 0, '空数组不得写入任何消息')
   })
 
   await test('saveBatch 含重复 id → 更新不重复', () => {
@@ -2817,9 +2819,9 @@ console.log('========================================\n');
   console.log('\n📂 30. init & decodeHtmlEntities')
 
   await test('init 重复调用 → 不报错', () => {
-    init()
-    init()
-    assertEqual(true, true)
+    // C5-019：契约是「重复调用不抛」（旧 assertEqual(true,true) 永远不会红）
+    assert.doesNotThrow(() => { init(); init() }, '重复 init 不得抛错')
+    assertEqual(require('fs').existsSync(CACHE), true, '重复 init 后缓存目录仍存在')
   })
 
   await test('decodeHtmlEntities 全部常见实体', () => {
@@ -4223,10 +4225,11 @@ console.log('========================================\n');
   })
 
   await test('saveBatch 非数组输入 → 不崩溃', () => {
+    // C5-019：契约是「每个脏输入都不抛」（旧 assertEqual(true,true) 永远不会红）
     for (const value of [undefined, null, {}, 123, true, Symbol('x'), 'abc']) {
-      saveBatch(value, 'test_sb_non_array.json')
+      assert.doesNotThrow(() => saveBatch(value, 'test_sb_non_array.json'), `非数组输入 ${String(value)} 不得抛错`)
     }
-    assertEqual(true, true)
+    assertEqual(readMessages(getFilePath('test_sb_non_array.json')).length, 0, '非数组输入不得写入消息')
   })
 
   await test('htmlToMarkdown 纯空格内容', () => {
@@ -6701,6 +6704,38 @@ console.log('========================================\n');
     }
   })
 
+  // ==================== 90b. 断言鉴别力 ====================
+  console.log('\n📂 90b. 断言鉴别力')
+
+  // C5-019：字面恒真断言（assertEqual(true,true) / assert.ok(true) / assert(true)）永远不会失败——
+  // 把「不会红」当断言，只给报告凑断言数。这里做源码级零容忍：新增一处即红。
+  // needle 一律由常量拼接：字面量直接写进门禁源码会自己命中自己（同 C4-004 的 seed 门禁手法）。
+  await test('C5-019: 恒真断言零容忍（字面 true 断言一律不许）', () => {
+    const fsx = require('fs')
+    const TRUE_LIT = 'true'
+    const patterns = [
+      new RegExp(`assertEqual\\(\\s*${TRUE_LIT}\\s*,\\s*${TRUE_LIT}\\s*[,)]`),
+      new RegExp(`assert\\.(?:ok|strictEqual)\\(\\s*${TRUE_LIT}\\s*[,)]`),
+      new RegExp(`assert\\(\\s*${TRUE_LIT}\\s*\\)`)
+    ]
+    // 判据自检：三种形态都必须被认出，否则门禁本身退化成「恒绿」
+    for (const sample of [`assertEqual(${TRUE_LIT}, ${TRUE_LIT})`, `assert.ok(${TRUE_LIT})`, `assert(${TRUE_LIT})`]) {
+      assertEqual(patterns.some(re => re.test(sample)), true, `判据必须认出恒真断言形态：${sample}`)
+    }
+    const hits = []
+    for (const f of ['test_filter.js', 'test_doc_line_gates.js']) {
+      const lines = fsx.readFileSync(path.join(__dirname, f), 'utf8').split('\n')
+      lines.forEach((line, i) => {
+        const code = line.trim()
+        // 注释里提到该形态不算（说明文字要能解释为什么禁止它）
+        if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return
+        for (const re of patterns) if (re.test(line)) hits.push(`${f}:${i + 1}`)
+      })
+    }
+    assert.deepStrictEqual(hits, [],
+      '字面恒真断言零鉴别力（永远不会红），改成 assert.doesNotThrow / 真值断言：' + hits.join(', '))
+  })
+
   // ==================== 91. Unicode 深度测试 ====================
   console.log('\n📂 91. Unicode 深度测试')
 
@@ -6787,15 +6822,19 @@ console.log('========================================\n');
 
   await test('故障注入: fs.writeFileSync 抛错 → saveMessages 不崩溃', () => {
     const fs = require('fs')
+    const p = getFilePath('test_fault.json')
+    try { fs.unlinkSync(p) } catch (e) {}
     const orig = fs.writeFileSync
     fs.writeFileSync = () => { throw new Error('磁盘满') }
     try {
-      saveMessages(getFilePath('test_fault.json'), [{ id: 1 }])
-      // 不应抛到调用方(内部已 try-catch)
+      // C5-019：契约是「写失败不抛到调用方」（旧 assertEqual(true,true) 永远不会红），
+      // 且失败后不得留下半成品文件（会被下一次读盘当成有效缓存）
+      assert.doesNotThrow(() => saveMessages(p, [{ id: 1 }]), 'fs 写失败应被容错，不得抛到调用方')
+      assertEqual(fs.existsSync(p), false, '写失败后不得留下目标文件（半成品）')
     } finally {
       fs.writeFileSync = orig
+      try { fs.unlinkSync(p) } catch (e) {}
     }
-    assertEqual(true, true, 'fs 写失败应被容错')
   })
 
   await test('故障注入: fs.readFileSync 抛错 → readMessages 返回空数组', () => {
@@ -6835,13 +6874,13 @@ console.log('========================================\n');
     fs.renameSync = () => { throw new Error('rename失败') }
     const p = getFilePath('test_rename_fault.json')
     try {
-      saveMessages(p, [{ id: 1 }]) // 内部 try-catch，不应抛
+      // C5-019：契约是「rename 失败不抛到调用方」（旧 assertEqual(true,true) 永远不会红）
+      assert.doesNotThrow(() => saveMessages(p, [{ id: 1 }]), 'rename 失败应被容错，不得抛')
       assertEqual(fs.existsSync(p + '.tmp'), false, 'tmp 应被清理')
     } finally {
       fs.renameSync = orig
       try { fs.unlinkSync(p) } catch (e) {}
     }
-    assertEqual(true, true, 'rename 失败应被容错')
   })
 
   await test('故障注入: saveBatch 落盘失败 → 内存缓存不得提前判重', () => {
@@ -6905,15 +6944,29 @@ console.log('========================================\n');
     try { fs.unlinkSync(p) } catch (e) {}
   })
 
-  await test('故障注入: fs.mkdirSync 抛错 → init 不崩溃', () => {
+  // C5-019：原用例在「CACHE 已存在」时 mkdirSync 根本不会被调用（注入点不可达），收尾再写
+  // assertEqual(true,true) —— 断言恒真且注入无效。真实契约（v3.245 P1）是「目录创建失败必须响亮
+  // 暴露」：既打 console.error 也把异常抛给调用方。改为在**缺失**的专属子目录上注入，两条都断言。
+  await test('故障注入: fs.mkdirSync 抛错 → init 必须暴露（日志 + 抛出）', () => {
     const fs = require('fs')
-    const orig = fs.mkdirSync
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_mkdir_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+    const origMkdir = fs.mkdirSync
+    const origErr = console.error
+    const origDir = Config.cache.dir
+    const logs = []
     fs.mkdirSync = () => { throw new Error('权限不足') }
+    console.error = (...a) => { logs.push(a.join(' ')) }
     try {
-      init() // init 内部 try-catch(console.error)，不应抛
-      assertEqual(true, true)
+      Config.cache.dir = sub
+      assert.throws(() => init(), /权限不足/, '目录创建失败必须把异常抛给调用方（不得静默吞掉）')
+      assertEqual(logs.some(l => l.includes('缓存目录创建失败')), true, '目录创建失败必须打 console.error 留痕')
     } finally {
-      fs.mkdirSync = orig
+      fs.mkdirSync = origMkdir
+      console.error = origErr
+      Config.cache.dir = origDir
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
     }
   })
 
@@ -6950,10 +7003,11 @@ console.log('========================================\n');
     circular.self = circular // 循环引用
     const p = getFilePath('test_circular.json')
     try { fs.unlinkSync(p) } catch (e) {}
-    saveMessages(p, [circular]) // 序列化失败应容错（内存保留不落盘）
-    assertEqual(true, true, 'saveMessages 循环引用应容错')
-    saveBatch([circular], 'test_circular.json') // _upsert 比较失败按更新处理
-    assertEqual(true, true, 'saveBatch 循环引用应容错')
+    // C5-019：契约是「序列化失败不抛」（旧 assertEqual(true,true) 永远不会红）；saveMessages
+    // 还必须做到「内存保留、磁盘无半成品」——半个 JSON 会被下一次读盘当成有效缓存。
+    assert.doesNotThrow(() => saveMessages(p, [circular]), 'saveMessages 循环引用应容错，不得抛')
+    assertEqual(fs.existsSync(p), false, '序列化失败不得落盘（不得留下半成品文件）')
+    assert.doesNotThrow(() => saveBatch([circular], 'test_circular.json'), 'saveBatch 循环引用应容错，不得抛')
   })
 
   // ==================== 93. 深度嵌套压力 ====================
