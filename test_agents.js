@@ -503,7 +503,6 @@ dns.lookup = DEFAULT_LOOKUP
     }
 
     // AGENTS-20：未知选项键 ⇒ 签名 null ⇒ 既不读也不写缓存，且不得污染同主机的已建模条目
-    await withResolver(makeCounter().fn, async () => {})
     {
       const st = makeCounter()
       await withResolver(st.fn, async () => {
@@ -662,6 +661,15 @@ dns.lookup = DEFAULT_LOOKUP
         assert.strictEqual(st.calls, 1, '生产选项必须命中预热条目；不同 key 则预热写进了一个永不被读的条目（预热完全无效）')
       })
     }
+  }
+
+  // ===== [夹具自检] 不许留「装了替身却什么都不做」的空动作（C5-065）=====
+  // 反例：把 makeCounter().fn 塞进 withResolver、body 留空（`async () => {}`）—— 装一次替身、零断言。
+  // 它让读者以为紧随其后的分支已被覆盖，实际什么都没验证；真正的 AGENTS-20 用例在下一个块里。
+  {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const emptyBodies = src.match(/withResolver\([^\n]*,\s*async\s*\(\)\s*=>\s*\{\s*\}\s*\)/g) || []
+    assert.strictEqual(emptyBodies.length, 0, `withResolver 不得留空 body（装了替身却零断言），实际 ${emptyBodies.length} 处`)
   }
 
   console.log('test_agents OK')
