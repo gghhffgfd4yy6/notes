@@ -1025,6 +1025,8 @@ const CI_SUMMARY_PATH_TEMPLATE = 'reports/<stem>.p<pid>.md'
 const ciSummaryPath = (pid, stem) => CI_SUMMARY_PATH_TEMPLATE.replace('<stem>', stem).replace('<pid>', String(pid))
 const ciSummaryCheck = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
 const ciSummaryOverflow = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
+// 3c+ 的「可写可观测」落点（C4-018）：同一份按 pid 唯一的模板，保证并发 worker 互不可见。
+const ciSummaryChild = ciSummaryPath(process.pid, '.ci-summary-child')
 // 3c 的反面夹具要指到一个**不存在**的目录（真去写就 ENOENT）：同样带 pid 后缀——否则并发 worker 遗留的
 // 同名目录会让「没写」这条断言静默失去意义（夹具自身失效 ⇒ 断言恒真）。
 const ciMissingFile = `reports/.ci-missing-dir.p${process.pid}/.ci-summary-child.md`
@@ -1056,6 +1058,22 @@ try {
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
   assert.ok(!/ENOENT/.test(child.stderr || ''), 'XBK_MUTATION_CHILD=1 时不得尝试写 job summary')
 
+  // 3c+ 直接证「没有发生写入」（C4-018）：上面的 ENOENT 旁证只说明「没有异常痕迹」，不说明「没有写」——
+  //   生产代码一旦把 appendFileSync 包进 try/catch（或改写到另一个可写落点），ENOENT 不再出现，
+  //   而 summary 其实已经被追加，那句断言照样绿。这里把落点换成**可写且可观测**的路径（同一条按 pid
+  //   唯一的模板）：跑完文件不存在 = 确实没写；被创建 = 写了（此时 1MiB 摘要上限迟早被撞穿）。
+  assert.ok(!fs.existsSync(ciSummaryChild),
+    `夹具前提：${ciSummaryChild} 不应预先存在（它存在就让「没有写入」这条断言恒真）`)
+  const childNoSummary = runEntry({
+    SKIP_SUITES: skipAllButOne,
+    GITHUB_STEP_SUMMARY: ciSummaryChild,
+    XBK_MUTATION_CHILD: '1'
+  })
+  assert.strictEqual(childNoSummary.status, 0, childNoSummary.stderr || childNoSummary.stdout)
+  assert.ok(!fs.existsSync(ciSummaryChild),
+    `XBK_MUTATION_CHILD=1 时必须**没有发生写入**（不是「没报错」而是「文件不存在」）：${ciSummaryChild} 被创建 ⇒ ` +
+    '变异评估的每个子进程都会重复 append 整张表，几百次即撞 1MiB 的 job summary 上限')
+
   // 3e 输出超限（ENOBUFS）必须标注为「输出超限」而不是普通测试失败：
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const overflow = runEntry({
@@ -1077,6 +1095,7 @@ try {
   // 只删**本进程自己的**落点（并发 worker 的落点文件名不同，互不可见）——清理不漏、也不误删别人
   fs.rmSync(ciSummaryCheck, { force: true })
   fs.rmSync(ciSummaryOverflow, { force: true })
+  fs.rmSync(ciSummaryChild, { force: true }) // 回归时（写入发生）也不留残渣
 }
 
 // ── 3b-并发回归：共享落点的并发争抢必须被结构性排除（PR #158 的靶向锁）──────────────
