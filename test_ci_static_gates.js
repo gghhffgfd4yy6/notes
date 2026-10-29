@@ -98,10 +98,11 @@ check('C5-013 判据模块可加载，5 个判定函数都是可调用函数', (
   assert.strictEqual(gate.decideToolMissing(true, false), 'fail', 'CI 缺工具必须 fail-closed')
 })
 
-check('C5-013 --selftest 已接线：15 条判据断言在套件内执行', () => {
-  // 此前 --selftest 全仓无人调用，是死代码；现在由本套件执行（run_unit_tests 与 test.yml 都跑本套件）。
+check('C5-013 --selftest 已接线：20 条判据断言在套件内执行', () => {
+  // 此前 --selftest 全仓无人调用，是死代码；现在由本套件执行（run_tests 与 test.yml 都跑本套件）。
+  // b7 的 C10-004 追加 5 条 decideEmptyScan 断言（15 → 20），条数漂移仍须同步本守卫。
   const n = gate.selftest()
-  assert.strictEqual(n, 15, `--selftest 必须执行 15 条断言（实际 ${n}）；增减须同步本守卫`)
+  assert.strictEqual(n, 20, `--selftest 必须执行 20 条断言（实际 ${n}）；增减须同步本守卫`)
 })
 
 check('C5-013 扫描面守卫：门禁真的会扫到 N 个 .githooks 文件（N>=2 且与磁盘一致）', () => {
@@ -124,6 +125,28 @@ check('C5-013 main() 必须真的调用两台扫描器（防 main 空转后门�
   assert.ok(src.includes("if (toolAvailable('zizmor')) {"), 'main 必须按 zizmor 可用性分支扫描')
   assert.ok(src.includes('const z = runZizmor()'), 'main 必须真的调用 runZizmor')
   assert.ok(src.includes('return red ? 1 : 0'), 'main 必须把 red 汇成退出码（恒 0 = 门禁永远绿）')
+})
+
+check('shellcheck 扫描面为 0 必须判红（0 个文件 ≠ 0 发现，C10-004）', () => {
+  const gate = require('./scripts/check-ci-static.js')
+  assert.strictEqual(typeof gate.decideEmptyScan, 'function', '必须有「扫描面是否为空」的判定纯函数')
+  assert.strictEqual(gate.decideEmptyScan(3), 'pass', '有文件才是 pass')
+  assert.strictEqual(gate.decideEmptyScan(1), 'pass')
+  assert.strictEqual(gate.decideEmptyScan(0), 'fail', '扫描面为 0 必须判红——旧实现打印「0 个钩子文件，0 发现」并 exit 0')
+  assert.strictEqual(gate.decideEmptyScan(-1), 'fail', '负数不可能来自真实扫描，按不可判定判红')
+  assert.strictEqual(gate.decideEmptyScan(undefined), 'fail', '拿不到扫描面时按不可判定判红（宁红勿绿）')
+  // 接线：main 必须在「failures 为空 → ✅」之前拦下空扫描面，并点名「扫描面为空」。
+  const src = read('scripts/check-ci-static.js')
+  const emptyAt = src.indexOf("decideEmptyScan(sc.scanned) === 'fail'")
+  const okAt = src.indexOf("'✅ shellcheck：' + sc.scanned + ' 个钩子文件，0 发现'")
+  assert.ok(emptyAt > -1, 'main 必须用 decideEmptyScan 拦空扫描面（否则这条判定只是死代码）')
+  assert.ok(okAt > -1, '成功模板必须保留（有文件、无发现时照常打印计数）')
+  assert.ok(emptyAt < okAt, '空扫描面判定必须排在成功模板之前，否则空扫描面先被 ✅ 吃掉')
+  assert.ok(src.includes('\'❌ shellcheck：扫描面为空'),
+    '判红时必须点名「扫描面为空」，不能复用「0 个文件，0 发现」那套成功文案')
+  // zizmor 的 fail-closed 语义（缺工具/非 0 退出/输出不可解析）不得被这条改动带偏。
+  assert.ok(src.includes('if (why) return { ok: false, reason: why, findings: [] }'),
+    'zizmor 不可判定仍必须判红（本修复只补 shellcheck 的空扫描面，不动 zizmor）')
 })
 
 console.log(`✅ test_ci_static_gates 全部通过（${checks} 检查）`)

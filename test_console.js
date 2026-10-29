@@ -10397,6 +10397,113 @@ async function main () {
     assert.ok(escSeg.includes('inst.close()') && escSeg.includes('restoreFocus()'),
       'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
+
+  await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
+    const src = readConsoleSource()
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.searchBodyView, 'function',
+      '结果区渲染判定必须是 pure.mjs 的纯函数（htm/React 不能在 Node 里跑，行为只能在这测）')
+    const a = { status: 'ok', q: 'a', page: 1, pages: 3, count: 20, items: [] }
+    const b = { status: 'ok', q: 'b', page: 1, pages: 1, count: 5, items: [] }
+    assert.strictEqual(pure.searchBodyView({ q: '', live: null, prev: a, loading: false, err: '' }), 'prompt',
+      '空关键词只提示输入')
+    assert.strictEqual(pure.searchBodyView({ q: 'a', live: null, prev: null, loading: true, err: '' }), 'skeleton',
+      '首次搜索（一份结果都没有）才出骨架')
+    // 关键回归：setReq 已落地、loading 还没置真的那一帧——旧实现五个分支一个都不命中，body 是
+    // undefined，结果区整块空白（长列表塌成 0 行）后才补骨架。
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: a, loading: false, err: '' }), 'stale',
+      '换词那一帧必须继续画上一份结果（旧实现这里 body 为 undefined，整块空白）')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: a, loading: true, err: '' }), 'stale',
+      '本轮响应未到时继续画上一份结果，不得换回 3 行骨架')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: b, prev: a, loading: false, err: '' }), 'results',
+      '本次结果到了立刻画本次的')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: { status: 'upstream_error' }, prev: a, loading: false, err: '' }), 'upstream',
+      '上游错误走错误提示，不得把上一份结果当成本次的')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: null, loading: false, err: '加载失败' }), 'error',
+      '加载失败必须走 LoadError（带重试按钮）')
+    // 关键回归（B2 返工 a1）：同一 q 的刷新/翻页失败时 loader 保留旧 data ⇒ live 仍是上一份 ok 结果。
+    // 旧实现只有 `if (err) return 'error'` 这一个错误出口，live 非空就把它整个跳过：失败无提示、
+    // 无重试，且 req.page 已前进而按钮重新启用 → 再点下一页从第 1 页跳到第 3 页。
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: b, prev: b, loading: false, err: '加载失败：网络请求失败' }), 'results',
+      '同 q 刷新失败仍画旧结果（不得整块卸载），但错误必须另有出口')
+    assert.strictEqual(pure.searchRefreshError({ live: b, err: '加载失败：网络请求失败' }), true,
+      '同 q 刷新失败必须给出错误提示 + 重试：err 不得被非空 live 静默吞掉（旧实现此处失败完全不可见）')
+    assert.strictEqual(pure.searchRefreshError({ live: b, err: '' }), false,
+      '没有错误时不得凭空多出一条错误提示')
+    // 接线：q 守卫不能为了「保留上一份结果」被放宽；body 不得再有 undefined 分支。
+    const panel = src.slice(src.indexOf('function SearchPanel'), src.indexOf('function LogsPanel'))
+    assert.ok(panel.length > 1000, '应能定位 SearchPanel')
+    assert.ok(panel.includes("const live = data && (data.status !== 'ok' || data.q === req.q) ? data : null"),
+      'q 校验必须原样保留：A 的条目不得挂到 B 下面（也不能用 A 的结果把 B 标成已读）')
+    assert.ok(panel.includes('searchBodyView({'), '结果区必须走 pure.mjs 的判定，不得在组件里另拼一套分支')
+    assert.ok(!panel.includes('} else if (loading && !live) {'),
+      '不得再无条件把结果区换成骨架（换词/翻页会整块卸载）')
+    assert.ok(panel.includes('const lastShownRef = useRef(null)'),
+      '必须另存一份「上次画出来的结果」用于占位（live 的归属语义不变）')
+    assert.ok(panel.includes('const refreshErr = searchRefreshError({ live, err })'),
+      '失败提示必须由纯函数判定（searchRefreshError）：err 与非空 live 同时存在时不得静默')
+    const D = '$' // no-template-curly-in-string：含 `${` 的字符串要拼出来
+    assert.ok(panel.includes(D + '{refreshErr && html`<' + D + '{Hint} tone="error">' + D + '{err}'),
+      'results 分支顶部必须渲染 err（Hint tone="error"）：否则同 q 刷新失败无提示、无重试')
+    assert.ok(panel.includes('disabled=$' + '{stale || !!err || req.page <= 1 || loading}'),
+      '占位态/失败期间必须禁用翻页：上一份结果的页码不得被当成本次页码提交，失败后也不得继续翻页（否则从第 1 页跳到第 3 页）')
+    assert.ok(panel.includes('disabled=$' + '{stale || !!err || req.page >= pages || loading}'),
+      '下一页/末页同样要在失败期间禁用')
+    assert.ok(panel.includes('class="ls-results"'), '结果区必须挂 .ls-results（min-height 占位）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.ls-results\s*\{[^}]*min-height:\s*\d+px/.test(css),
+      '结果区必须有 min-height 占位：长列表 ↔ 骨架之间页面高度不得塌陷')
+  })
+
+  await aok('C7-003 过滤规则 notice.tone 不再被吞（warn 必须真的渲染成琥珀提示）', () => {
+    const src = readConsoleSource()
+    const panel = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('export {', src.indexOf('function FilterRulesPanel')))
+    assert.ok(panel.length > 5000, '应能定位 FilterRulesPanel')
+    // 唯一渲染点必须把 tone 传给 Hint。旧实现只渲染 notice.text ⇒ 7 处 setNotice 的
+    // warn/ok 全是同一个中性 .hint，「服务器草稿清理失败」和「已保存 rN」长得一模一样。
+    assert.ok(/<\$\{Hint\} tone=\$\{notice\.tone\}>\$\{notice\.text\}<\/\/>/.test(panel),
+      'notice 渲染必须透传 tone（<Hint> 的 warn 分支与 .hint-warn 样式都已就绪，只差调用点）')
+    const sets = []
+    for (let i = panel.indexOf('setNotice({'); i !== -1; i = panel.indexOf('setNotice({', i + 1)) sets.push(i)
+    assert.ok(sets.length >= 6, `setNotice 的对象字面量写入点至少 6 处，实际 ${sets.length}`)
+    sets.forEach((pos, i) => {
+      const body = panel.slice(pos, pos + 300)
+      assert.ok(body.includes('tone:'), `第 ${i + 1} 处 setNotice 必须带 tone，否则新提示又会退化成中性：${body.slice(0, 80)}`)
+    })
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const hint = comp.slice(comp.indexOf('function Hint ('), comp.indexOf('// 入场包装'))
+    assert.ok(hint.includes("tone === 'warn' ? 'hint hint-warn'"), 'Hint 必须把 warn 渲染成 hint-warn（本修复的前提）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(css.includes('.hint-warn'), 'app.css 必须有 .hint-warn 规则（否则传了 tone 也看不出差别）')
+  })
+
+  await aok('C7-005 今日卡标注 stats.truncated（与周卡同口径，不再把少算的总数判绿）', async () => {
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.todayCardView, 'function', '今日卡的 tone/badge 判定必须是 pure.mjs 的纯函数')
+    assert.strictEqual(typeof pure.statsTailNote, 'function', '两卡共用的尾部标注必须是纯函数')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: false, failed: 0, rounds: 0, truncated: false }),
+      { tone: 'run', badge: '—', note: '' }, '没有 run.log 数据时保持「—」/中性（占位不谎报）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 2, rounds: 3, truncated: false }),
+      { tone: 'bad', badge: '异常', note: '' }, '有失败必须判红（与旧版一致）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 0, rounds: 3, truncated: false }),
+      { tone: 'ok', badge: '正常', note: '' }, '未截断时判绿不变')
+    // 关键回归：run.log 超 1 MiB（后端只读尾部）——少算的「0 失败」不得再画成绿色「正常」。
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 0, rounds: 3, truncated: true }),
+      { tone: 'warn', badge: '仅尾部', note: ' · 仅统计尾部' },
+      '截断时今日卡必须标注「仅统计尾部」并降成琥珀（旧实现只看 failed/rounds ⇒ 绿「正常」且无标注）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 1, rounds: 3, truncated: true }),
+      { tone: 'bad', badge: '异常', note: ' · 仅统计尾部' }, '真失败仍判红，但同样要标注只统计了尾部')
+    assert.strictEqual(pure.statsTailNote({ truncated: true }), ' · 仅统计尾部', '周卡/今日卡共用一个标注文案')
+    assert.strictEqual(pure.statsTailNote({ truncated: false }), '', '未截断不标注')
+    assert.strictEqual(pure.statsTailNote(null), '', '没有 stats 时不得报截断')
+    // 接线：今日卡必须走这个判定（不能只给周卡加标注），hint 里必须带上 note。
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = comp.slice(comp.indexOf('function StatusCards'), comp.indexOf('// ── 组件：触发按钮'))
+    assert.ok(seg.includes('todayCardView({'), '今日卡必须用 todayCardView 判定 tone/badge/标注')
+    assert.ok(/\$\{todayCard\.note\}/.test(seg), '今日卡的 hint 必须带上尾部标注')
+    assert.ok(/\$\{statsTailNote\(stats\)\}/.test(seg), '周卡必须复用同一个尾部标注（两卡口径不得再分叉）')
+    assert.ok(!/\(\s*stats\.truncated/.test(seg), '不得再在卡片里就地读 stats.truncated（判定只留在 pure.mjs）')
+  })
 }
 
 main()

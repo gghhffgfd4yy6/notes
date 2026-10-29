@@ -9,7 +9,22 @@ const got = require('got')
 const { baseRequestOptions, invalidateDnsForError, profileMs } = require('./xbk_agents')
 const { trimTrailingSlashes } = require('./xbk_utils')
 const { looksLikeHtmlEnvelope } = require('./xbk_pusher')
+// 单通道 HTTP timeout：默认 15s（console 关注词监控直接调 sendNotify，没有外层预算）。
+// 投递层（xbk_pusher.js 的 send）会用 params.channelTimeoutMs 显式收窄——Pusher 的整体 race
+// 只有 10s（SYSTEM_CONTRACT.md「推送整体超时 10s」，不得上调），15s 的单通道预算在那条路径上
+// 永远等不到：10s 一到外层先 abort 全部在飞通道 ⇒ 已送达的通道也被判 PUSH_TIMEOUT、本轮不写
+// 缓存、下轮全通道重推。收窄后慢通道只让自己失败（各通道 Promise.allSettled 各结算各的），
+// 其它通道的成功得以保留。
+// 两套预算靠显式参数区分（不靠 signal 有没有：signal 是取消通路，不是预算声明）。数值口径与
+// SYSTEM_CONTRACT 一致：只接受 ≥100ms 的整数且不超过默认值——0/负数/小数/字符串/更大的值
+// 一律回落 15s，绝不借这个参数把预算抬到契约之外。
 const timeout = 15000
+const channelTimeout = (params) => {
+  let raw
+  try { raw = params ? params.channelTimeoutMs : undefined } catch (e) { return timeout }
+  if (!Number.isInteger(raw) || raw < 100 || raw > timeout) return timeout
+  return raw
+}
 const REQUEST_OPTIONS = baseRequestOptions()
 
 // 复用主代码的 sanitizeDecodedHtml / truncateUtf16（审查 S2/F2、S6/F7：不再保留第二份实现）。
@@ -472,7 +487,7 @@ function pushPlusNotify (text, desp, params = {}) {
         headers: {
           'Content-Type': 'application/json'
         },
-        timeout
+        timeout: channelTimeout(params)
       }
       $.post(options, (err, resp, data) => {
         try {
@@ -551,7 +566,7 @@ function serverNotify (text, desp, params = {}) {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded'
         },
-        timeout
+        timeout: channelTimeout(params)
       }
       $.post(options, (err, resp, data) => {
         try {
@@ -645,7 +660,7 @@ function barkNotify (text, desp, params = {}) {
         headers: {
           'Content-Type': 'application/json'
         },
-        timeout
+        timeout: channelTimeout(params)
       }
 
       return new Promise((innerResolve) => {
@@ -724,7 +739,7 @@ function pushMeNotify (text, desp, params = {}) {
         headers: {
           'Content-Type': 'application/json'
         },
-        timeout
+        timeout: channelTimeout(params)
       }
 
       return new Promise((innerResolve) => {
@@ -790,7 +805,7 @@ function qywxBotNotify (text, desp, params = {}) {
       headers: {
         'Content-Type': 'application/json'
       },
-      timeout
+      timeout: channelTimeout(params)
     }
     if (QYWX_KEY) {
       $.post(options, (err, resp, data) => {
@@ -1337,7 +1352,7 @@ function wxPusherPost (channel, text, desp, params = {}) {
         ...(clickUrl ? { url: clickUrl } : {})
       },
       headers: { 'Content-Type': 'application/json' },
-      timeout
+      timeout: channelTimeout(params)
     }
     $.post(options, (err, resp, data, timings) => {
       try {
@@ -1408,7 +1423,7 @@ function wxXiZhiNotify (text, desp, params = {}) {
       headers: {
         'Content-Type': 'application/json'
       },
-      timeout
+      timeout: channelTimeout(params)
     }
 
     if (WX_XIZHI_KEY) {
@@ -1463,7 +1478,7 @@ function pushDeerNotify (text, desp, params = {}) {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded'
         },
-        timeout
+        timeout: channelTimeout(params)
       }
       $.post(options, (err, resp, data) => {
         try {
@@ -1541,7 +1556,7 @@ function tgNotify (text, desp, params = {}) {
         headers: {
           'Content-Type': 'application/json'
         },
-        timeout
+        timeout: channelTimeout(params)
       }
       $.post(options, (err, resp, data) => {
         try {
