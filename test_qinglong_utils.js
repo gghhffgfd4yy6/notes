@@ -339,6 +339,10 @@ const deps = async (spec) => {
   // 只留探针的版本仍然全绿）。
   out.deps.autoInstallOff = await deps({ bare: { got: 'nf', re2: 'ok' }, autoInstall: false })
   out.deps.installFails = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ result: { status: 4 } }] })
+  // C5-060：安装子进程**自身**失败（spawn ENOENT，连退出码都没有）是 install.status 之外的另一条出口，
+  // 生产用 if (install.error) throw install.error 单独兜住这条出口，与下面的非零退出分支是两条独立断言。旧直调副本用 installResult:{error} 锁的就是这条；
+  // 只覆盖「非零退出」时，删掉那句 throw 后套件仍绿（实测变异体存活）。
+  out.deps.installSpawnError = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ result: { error: { message: 'spawn ENOENT' } } }] })
   // 恢复**成功**的出口（QX-04 的正常路径）：装完依赖可加载 ⇒ 必须静默返回 undefined，既不 rebuild 也不报错。
   // 旧直调副本用 installed 翻转锁的就是这条出口；只留「装完仍不可用」的场景时，「装完一律报错」的变异体无一能杀。
   out.deps.installRecovers = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'installed' }] })
@@ -441,6 +445,8 @@ const deps = async (spec) => {
   assert.deepStrictEqual(d.deps.autoInstallOff.warns, [], '未设置自动安装时不得打印「已执行恢复」告警')
   assert.strictEqual(d.deps.installFails.thrown && d.deps.installFails.thrown.message, 'npm ci 失败，退出码 4', '安装非零退出必须报 npm ci 失败并带真实退出码')
   assert.strictEqual(d.deps.installFails.spawns.length, 1, '安装失败必须立刻中止，不得继续 rebuild')
+  assert.strictEqual(d.deps.installSpawnError.thrown && d.deps.installSpawnError.thrown.message, 'spawn ENOENT', '安装子进程自身失败（error 而非退出码）必须原样抛出，不得退化成「退出码 undefined」')
+  assert.strictEqual(d.deps.installSpawnError.spawns.length, 1, '安装子进程失败必须立刻中止，不得继续 rebuild')
   assert.strictEqual(d.deps.installRecovers.thrown, null, '安装后依赖可加载时必须静默返回（恢复成功不得报错）')
   assert.strictEqual(d.deps.installRecovers.spawns.length, 1, '恢复成功只应触发一次安装（re2 已可加载 ⇒ 不 rebuild）')
   assert.deepStrictEqual(d.deps.installRecovers.spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有锁文件时恢复成功走的仍是冻结 npm ci')
