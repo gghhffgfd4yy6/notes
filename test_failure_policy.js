@@ -1,6 +1,8 @@
 'use strict'
 
 const assert = require('assert')
+const path = require('path')
+const { spawnSync } = require('child_process')
 const {
   classifyFailure,
   classifySummary,
@@ -13,6 +15,34 @@ function error (message, code) {
   const e = new Error(message)
   if (code) e.code = code
   return e
+}
+
+// C5-002：脱敏的墙钟上界必须在**子进程**里量。正则回溯是同步 CPU 死循环，同线程的
+// setTimeout / Promise.race 永远不会被调度（事件循环被占住），唯一能给硬上界的是
+// 「子进程 + SIGKILL」。返回 { timedOut, timings }；子进程异常退出按断言失败处理。
+function timeRedactInChild (samples, timeoutMs) {
+  const script = [
+    'const { summarizeError } = require(process.argv[1])',
+    'const samples = JSON.parse(process.argv[2])',
+    'const timings = samples.map(({ message, via }) => {',
+    '  const started = process.hrtime.bigint()',
+    '  const out = via === "failureInfo"',
+    '    ? summarizeError({ failureInfo: { message } }).message',
+    '    : summarizeError({ message }).message',
+    '  return { ms: Number(process.hrtime.bigint() - started) / 1e6, out }',
+    '})',
+    'process.stdout.write(JSON.stringify(timings))'
+  ].join('\n')
+  const result = spawnSync(process.execPath, ['-e', script, path.join(__dirname, 'xbk_failure_policy.js'), JSON.stringify(samples)], {
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024
+  })
+  if (result.error && result.error.code === 'ETIMEDOUT') return { timedOut: true, timings: null }
+  assert.strictEqual(result.status, 0,
+    `脱敏计时探针子进程异常退出（status=${result.status}, signal=${result.signal}）：${(result.stderr || '').slice(0, 400)}`)
+  return { timedOut: false, timings: JSON.parse(result.stdout) }
 }
 
 (async () => {
@@ -951,6 +981,65 @@ function error (message, code) {
   check(cyclicSummary.message, 'root', '自引用结构的根摘要仍应可读')
   check(cyclicSummary.failures.length, 1, '自引用结构的子项仍应产出摘要')
   check(cyclicSummary.failures[0].failures, undefined, '自引用子项必须在祖先环处截断，不得继续展开')
+
+  // ============ C5-002：对抗样本 + 墙钟上界（畸形结构化值不得把脱敏拖进指数回溯） ============
+  // 既有脱敏用例只喂短、闭合、单形态样本（token=[0,"SECRET"] / token={"a":"SECRET"} / token=[1,2,3]），
+  // 且此前全文没有任何计时断言 ⇒ 生产正则在「重复引号元素 × 未闭合括号」上的指数回溯在测试里完全
+  // 不可见：C9-001 实测 `token=[` + `"a",`×n 的耗时 n=9/43B→93ms、10→745ms、11→3194ms、12→19714ms
+  // （每多一个元素约 ×5.5），199B（48 个元素）30s 未返回；而厂商响应 data.msg 截到 200 字符正好能
+  // 截出这个形态。本块钉住两件事：① 墙钟上界（退化时真的红，不看计数）；② 脱敏语义不变
+  // （该抹的必须抹、输出长度不得缩水）。
+  //
+  // 阈值口径：500ms 上界 / 5s 子进程外壳。线性实现实测 <1ms（3 个数量级余量），只有指数或超长
+  // 回溯才会撞线，故不是对机器速度敏感的判据。
+  const sample199 = 'token=[' + '"a",'.repeat(48)
+  assert.strictEqual(sample199.length, 199, '前置条件：对抗样本必须正好 199 字节（落在上游 200 字符截断内）')
+
+  // 多倍规模采样：48（199B）/ 96（391B）/ 192（775B）/ 384（1543B）。
+  // 期望输出按既有口径精确给出：数组未闭合 ⇒ 落回裸值分支，抹到第一个分隔符（`,`）为止；
+  // summarizeError 的 message 截断 500 在脱敏**之后**，故大样本按 500 截断。
+  const probeSamples = []
+  for (const n of [48, 96, 192, 384]) {
+    const message = 'token=[' + '"a",'.repeat(n)
+    probeSamples.push({
+      name: `${n} 个重复引号元素（${message.length}B，数组未闭合）`,
+      message,
+      expected: ('token=***' + message.slice('token=["a"'.length)).slice(0, 500)
+    })
+  }
+  // failureInfo 里的字符串不走「上游 200 字符截断」这条路，换个调用点同样不能退化/漏抹。
+  probeSamples.push({
+    name: '未闭合数组内嵌真凭据（failureInfo 路径）',
+    message: 'token=["SECRET1234","a",' + '"a",'.repeat(40),
+    via: 'failureInfo',
+    forbid: 'SECRET1234'
+  })
+
+  const probe = timeRedactInChild(probeSamples, 5000)
+  assert.strictEqual(probe.timedOut, false,
+    '脱敏对抗样本 5s 内必须返回：子进程被 SIGKILL 说明结构化值扫描已退化成指数/超长回溯' +
+    '（C9-001 形态：199B/48 元素修复前 30s 不返回）')
+  assert.strictEqual(probe.timings.length, probeSamples.length, '每个对抗样本都必须有计时结果')
+  for (let i = 0; i < probeSamples.length; i++) {
+    const sample = probeSamples[i]
+    const timing = probe.timings[i]
+    assert.ok(timing.ms < 500,
+      `「${sample.name}」耗时 ${timing.ms.toFixed(1)}ms 超过 500ms 上界（线性实现 <1ms；撞线即退化）`)
+    if (sample.expected !== undefined) {
+      assert.strictEqual(timing.out, sample.expected,
+        `「${sample.name}」脱敏结果必须与既有口径一致（长度不得缩水、该抹的必须抹掉）`)
+    }
+    if (sample.forbid) {
+      assert.ok(!timing.out.includes(sample.forbid), '「' + sample.name + '」凭据不得残留')
+      assert.ok(timing.out.startsWith('token=***'), '「' + sample.name + '」凭据值必须整体抹掉')
+    }
+  }
+  const probeTotalMs = probe.timings.reduce((sum, t) => sum + t.ms, 0)
+  assert.ok(probeTotalMs < 500,
+    `多倍规模（48/96/192/384 元素）合计 ${probeTotalMs.toFixed(1)}ms 超过 500ms 上界`)
+  // 反向守卫：性能修复不得把结构化值分支整个砍掉——闭合数组仍必须整体抹成 token=***
+  assert.strictEqual(summarizeError({ message: 'token=["SECRET123","b"]' }).message, 'token=***',
+    '闭合数组仍必须整体脱敏（性能修复不得砍掉结构化值分支）')
 
   console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分成功不熔断、成功后恢复')
 })().catch(error => {
