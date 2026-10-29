@@ -77,4 +77,26 @@ check('首轮扫描修复不回退（release.yml 显式关缓存 + pre-push SC20
     'pre-push 的 remote_sha 协议占位行必须带 disable 指令，否则闸门常驻一条噪音红')
 })
 
+check('shellcheck 扫描面为 0 必须判红（0 个文件 ≠ 0 发现，C10-004）', () => {
+  const gate = require('./scripts/check-ci-static.js')
+  assert.strictEqual(typeof gate.decideEmptyScan, 'function', '必须有「扫描面是否为空」的判定纯函数')
+  assert.strictEqual(gate.decideEmptyScan(3), 'pass', '有文件才是 pass')
+  assert.strictEqual(gate.decideEmptyScan(1), 'pass')
+  assert.strictEqual(gate.decideEmptyScan(0), 'fail', '扫描面为 0 必须判红——旧实现打印「0 个钩子文件，0 发现」并 exit 0')
+  assert.strictEqual(gate.decideEmptyScan(-1), 'fail', '负数不可能来自真实扫描，按不可判定判红')
+  assert.strictEqual(gate.decideEmptyScan(undefined), 'fail', '拿不到扫描面时按不可判定判红（宁红勿绿）')
+  // 接线：main 必须在「failures 为空 → ✅」之前拦下空扫描面，并点名「扫描面为空」。
+  const src = read('scripts/check-ci-static.js')
+  const emptyAt = src.indexOf("decideEmptyScan(sc.scanned) === 'fail'")
+  const okAt = src.indexOf("'✅ shellcheck：' + sc.scanned + ' 个钩子文件，0 发现'")
+  assert.ok(emptyAt > -1, 'main 必须用 decideEmptyScan 拦空扫描面（否则这条判定只是死代码）')
+  assert.ok(okAt > -1, '成功模板必须保留（有文件、无发现时照常打印计数）')
+  assert.ok(emptyAt < okAt, '空扫描面判定必须排在成功模板之前，否则空扫描面先被 ✅ 吃掉')
+  assert.ok(src.includes('\'❌ shellcheck：扫描面为空'),
+    '判红时必须点名「扫描面为空」，不能复用「0 个文件，0 发现」那套成功文案')
+  // zizmor 的 fail-closed 语义（缺工具/非 0 退出/输出不可解析）不得被这条改动带偏。
+  assert.ok(src.includes('if (why) return { ok: false, reason: why, findings: [] }'),
+    'zizmor 不可判定仍必须判红（本修复只补 shellcheck 的空扫描面，不动 zizmor）')
+})
+
 console.log(`✅ test_ci_static_gates 全部通过（${checks} 检查）`)

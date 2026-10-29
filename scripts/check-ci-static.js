@@ -57,6 +57,16 @@ function decideToolMissing (isCi, requireTools) {
   return 'skip'
 }
 
+// shellcheck 扫描面判定纯函数（C10-004）：**0 个文件 ≠ 0 发现**。
+// `.githooks` 缺失、裁剪检出、钩子被删时 files=[]，旧实现照样打印「✅ shellcheck：0 个钩子文件，
+// 0 发现」并整脚本 exit 0 —— 门禁在「什么都没扫」时静默通过（fail-open）。与 run_unit_tests 的
+// 「零套件不等于通过」、check-doc-lines 的 decideEmptyScan(0)==='fail' 同口径：扫描面为空一律判红，
+// 并点名「扫描面为空」，免得被读成「扫过、没问题」。zizmor 一侧的 fail-closed 语义（缺工具/
+// 非 0 退出/输出不可解析）不受影响。
+function decideEmptyScan (scanned) {
+  return Number.isSafeInteger(scanned) && scanned > 0 ? 'pass' : 'fail'
+}
+
 // zizmor --format json 的解析纯函数：数组即 findings 清单；形状不符 = 不可判定 = 红（宁红勿绿，
 // 与 test_ci_skip_suites.js 的「提取不出命令名 ⇒ 对账保持红」同一口径）。
 function summarizeZizmor (stdout) {
@@ -135,6 +145,12 @@ function selftest () {
   assert.strictEqual(decideToolMissing(true, false), 'fail')
   assert.strictEqual(decideToolMissing(false, true), 'fail')
   assert.strictEqual(decideToolMissing(false, false), 'skip')
+  // —— decideEmptyScan：扫描面为 0 必须判红（0 个文件 ≠ 0 发现，与「零套件不等于通过」同口径）
+  assert.strictEqual(decideEmptyScan(3), 'pass')
+  assert.strictEqual(decideEmptyScan(1), 'pass')
+  assert.strictEqual(decideEmptyScan(0), 'fail', '扫描面为 0 不得静默通过（旧实现打印 ✅ 并 exit 0）')
+  assert.strictEqual(decideEmptyScan(-1), 'fail')
+  assert.strictEqual(decideEmptyScan(undefined), 'fail', '拿不到扫描面 = 不可判定 = 红')
   // —— resolveTool / toolAvailable 边界：假工具名解析不到；真在场工具解析为绝对路径
   assert.strictEqual(resolveTool('definitely-not-a-real-tool-xyz-98'), null)
   assert.strictEqual(toolAvailable('definitely-not-a-real-tool-xyz-98'), false)
@@ -145,7 +161,7 @@ function selftest () {
   assert.match(decideZizmorProc(3, null), /exit=3/)
   assert.match(decideZizmorProc(1, null), /exit=1/)
   assert.match(decideZizmorProc(null, 'SIGABRT'), /信号/)
-  console.log('✅ check-ci-static --selftest 全部通过（15 断言）')
+  console.log('✅ check-ci-static --selftest 全部通过（20 断言）')
 }
 
 function main () {
@@ -174,7 +190,11 @@ function main () {
 
   if (toolAvailable('shellcheck')) {
     const sc = runShellcheck()
-    if (sc.failures.length === 0) {
+    if (decideEmptyScan(sc.scanned) === 'fail') {
+      // 扫描面为 0：目录缺失/裁剪检出/钩子被删。旧实现走到下面那个 ✅ 模板并 exit 0（fail-open）。
+      red = true
+      console.log('❌ shellcheck：扫描面为空（.githooks 下 ' + sc.scanned + ' 个钩子文件）——0 个文件不等于 0 发现，判红')
+    } else if (sc.failures.length === 0) {
       console.log('✅ shellcheck：' + sc.scanned + ' 个钩子文件，0 发现')
     } else {
       red = true
@@ -213,4 +233,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool, decideZizmorProc }
+module.exports = { summarizeZizmor, decideToolMissing, decideEmptyScan, toolAvailable, resolveTool, decideZizmorProc }
