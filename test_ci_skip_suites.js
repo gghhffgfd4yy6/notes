@@ -1385,6 +1385,173 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   }
 }
 
+// 3g5b SIGNAL_PROBE 的 isAlive 必须把僵尸（Z）判成死（RUNBOOK §3-g3 的回归）：上面 3g5 只跑真入口的收口
+//     路径，套件被整组 SIGKILL 后停在 Z 的那一瞬在正常 PID 1 上短到抓不住 ⇒ Z 分支一旦被回退，没有任何
+//     断言会红（本组上一轮只用临时脚本证明了红/绿，缺口就在这里）。
+//     为什么要判死：僵尸仍占着进程表项，kill(pid,0) 对它照样成功；入口被信号打断时不会 wait 子进程，
+//     宿主 PID 1 不及时回收的容器里更会长时间停在 Z ⇒ 旧实现的 suiteAlive 假阳，把「已收口」误判成
+//     「孤儿还在跑」，3g5 的整套断言随之失真。
+//     手法：helper 进程 spawn 孙进程后**立刻 SIGSTOP 自己**（停住的进程不可能 wait）⇒ 孙进程退出即成 Z；
+//     先轮询 /proc/<孙 pid>/stat 到 State=Z（5s 上限，超时把实测 State 打出来并红），再**用从生产
+//     SIGNAL_PROBE 字符串里原样取出的 isAlive** 拼临时探针脚本、以子进程真跑一遍。手抄一份 isAlive 等于
+//     把回归钉在副本上——生产实现回退时它不跟随，那就是假回归。
+//     对照：同一次探针运行里，被 SIGSTOP 停住的 helper（State=T，非 Z）必须仍判活——否则「僵尸判死」可以
+//     靠 `return false` 通过，回归退化成恒假。
+//     旧实现（kill(pid,0) 即判活）在同一夹具上返回 true，故本用例可证伪。
+const zombieIsAliveSrc = (() => {
+  const at = SIGNAL_PROBE.indexOf('const isAlive = (pid) => {')
+  assert.ok(at >= 0, 'SIGNAL_PROBE 里应有 isAlive 定义（提取不到则本回归没有验证对象，也不能退化成手抄副本）')
+  let depth = 0
+  for (let i = SIGNAL_PROBE.indexOf('{', at); i < SIGNAL_PROBE.length; i++) {
+    if (SIGNAL_PROBE[i] === '{') depth++
+    else if (SIGNAL_PROBE[i] === '}' && --depth === 0) return SIGNAL_PROBE.slice(at, i + 1)
+  }
+  throw new Error('SIGNAL_PROBE 的 isAlive 花括号不平衡——提取失败')
+})()
+// 只校验「取到的是一个完整的、会 kill(pid,0) 的函数体」，不校验 Z 分支本身：那条判据属于被测代码，
+// 由下面的探针断言负责（否则把实现改回基线时本行先红，就看不出真正的落差在哪）。
+assert.match(zombieIsAliveSrc, /process\.kill\(pid, 0\)/,
+  `从 SIGNAL_PROBE 取出的 isAlive 必须包含 kill(pid,0)（提取结果：${JSON.stringify(zombieIsAliveSrc.slice(0, 120))}）`)
+
+// 夹具与探针都是落盘脚本（真子进程、真信号），故用真函数再 toString 落盘，而不是拼一长串字符串：
+// 探针逻辑同样过 lint / 语法检查（与 3g7 的 unitSignalProbe 同口径）。isAlive 由上面注入，不在此复制。
+function signalZombieHarness () {
+  const { spawn, spawnSync } = require('node:child_process')
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const dir = __dirname
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+  // 只读 State 字符，不判活：判活必须由**生产代码**（注入的 isAlive）来做，本夹具只负责证明「确实是 Z」。
+  const stateOf = (pid) => {
+    try {
+      const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8')
+      const close = stat.lastIndexOf(')')
+      return stat.slice(close + 2, close + 3)
+    } catch (e) { return null }
+  }
+  ;(async () => {
+    const helper = spawn(process.execPath, [path.join(dir, 'zombie_helper.js')], { cwd: dir, stdio: 'ignore' })
+    // exit 监听必须在 kill 之前挂好：SIGKILL 之后再注册会漏掉已经发生的 exit，那样「已 waitpid 回收」无从证明。
+    const helperExit = new Promise(resolve => {
+      const t = setTimeout(() => resolve({ timeout: true }), 8000)
+      helper.on('exit', (code, signal) => { clearTimeout(t); resolve({ code, signal }) })
+    })
+    const out = {
+      helperPid: helper.pid, helperState: null, zombiePid: 0, zombieState: null,
+      kill0: null, probe: null, helperExit: null, zombieStateAfter: 'not-checked'
+    }
+    try {
+      const pidFile = path.join(dir, 'zombie.pid')
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline) {
+        if (!out.zombiePid && fs.existsSync(pidFile)) out.zombiePid = Number(fs.readFileSync(pidFile, 'utf8').trim()) || 0
+        if (out.zombiePid > 0) {
+          out.zombieState = stateOf(out.zombiePid)
+          if (out.zombieState === 'Z') break
+        }
+        await sleep(50)
+      }
+      if (out.zombieState === 'Z') {
+        out.helperState = stateOf(helper.pid)
+        // 僵尸对 kill(pid,0) 仍然成功 ⇒ 探针若判死，只可能来自 Z 分支，而不是「进程已不存在」（ESRCH）。
+        try { process.kill(out.zombiePid, 0); out.kill0 = true } catch (e) { out.kill0 = false }
+        // 一次运行给两个 pid：僵尸 + 停住的 helper（对照，见外层断言），走的是同一份生产 isAlive。
+        const probe = spawnSync(process.execPath,
+          [path.join(dir, 'zombie_probe.js'), String(out.zombiePid), String(helper.pid)],
+          { encoding: 'utf8', cwd: dir, timeout: 20000 })
+        out.probe = { status: probe.status, stdout: probe.stdout, stderr: probe.stderr }
+      }
+    } finally {
+      // 无条件清理：helper 停在 SIGSTOP 里，SIGKILL 对已停止进程同样生效（先 CONT 只为让退出路径可读）；
+      // 但**不 wait 就会把 helper 自己留成僵尸**，故必须等 exit 事件（＝ waitpid 完成）才能宣称已回收。
+      try { process.kill(helper.pid, 'SIGCONT') } catch (e) { /* 已退出 */ }
+      try { process.kill(helper.pid, 'SIGKILL') } catch (e) { /* 已退出 */ }
+      out.helperExit = await helperExit
+      // helper 被回收后孙进程由 init 收养并 wait ⇒ /proc 条目必须消失。仍停在 Z 说明这台机器的 PID 1
+      // 不回收孤儿（真问题，不是本用例的噪声），必须暴露出来。
+      if (out.zombiePid > 0) {
+        const deadline = Date.now() + 5000
+        let st = stateOf(out.zombiePid)
+        while (st !== null && Date.now() < deadline) { await sleep(50); st = stateOf(out.zombiePid) }
+        out.zombieStateAfter = st
+      }
+    }
+    console.log(JSON.stringify(out))
+    process.exit(0)
+  })().catch((err) => {
+    console.error(err && err.stack ? err.stack : String(err))
+    process.exit(1)
+  })
+}
+
+const zombieDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-signal-zombie-'))
+try {
+  fs.writeFileSync(path.join(zombieDir, 'zombie_helper.js'), [
+    "const { spawn } = require('node:child_process')",
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    // 自报 pid：harness 被兜底杀掉时由外层 finally 据此补刀（见下方清理注释）
+    "fs.writeFileSync(path.join(__dirname, 'helper.pid'), String(process.pid) + '\\n')",
+    // 孙进程先活 100ms 再退出：helper 的 SIGSTOP 在同一 tick 内就该落地，这个延迟把「孙进程先退出、
+    // libuv 的 SIGCHLD 回收抢在 SIGSTOP 之前」的竞态窗口彻底关掉（停住的父进程不可能 wait）。
+    "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 100)'], { stdio: 'ignore' })",
+    "fs.writeFileSync(path.join(__dirname, 'zombie.pid'), String(child.pid) + '\\n')",
+    // 不 wait、也不挂 exit 监听：SIGSTOP 之后本进程不再执行任何 JS，孙进程退出后就停在 Z 直到被回收。
+    "process.kill(process.pid, 'SIGSTOP')",
+    ''
+  ].join('\n'))
+  fs.writeFileSync(path.join(zombieDir, 'zombie_probe.js'),
+    "const fs = require('fs')\n" +
+    zombieIsAliveSrc + '\n' + // ← 生产实现，原样注入（不复制、不改写）
+    "const pids = process.argv.slice(2).map(Number)\n" +
+    'console.log(JSON.stringify({ pids, alive: pids.map(pid => isAlive(pid)) }))\n')
+  fs.writeFileSync(path.join(zombieDir, 'zombie_harness.js'), '(' + signalZombieHarness.toString() + ')()\n')
+  const zombie = spawnSync(process.execPath, [path.join(zombieDir, 'zombie_harness.js')],
+    { encoding: 'utf8', cwd: zombieDir, timeout: 60000 })
+  assert.strictEqual(zombie.status, 0,
+    `僵尸夹具自身应正常结束（status=${zombie.status}, signal=${zombie.signal}）：${zombie.stdout}${zombie.stderr}`)
+  const zout = JSON.parse(zombie.stdout.trim().split('\n').pop())
+  assert.ok(zout.zombiePid > 0 && zout.zombieState === 'Z',
+    `夹具必须造出真僵尸：孙进程 pid=${zout.zombiePid} 的 State 在 5s 内实测为 ` +
+    `${JSON.stringify(zout.zombieState)}（应为 'Z'）——没有僵尸，本用例就没有验证对象，不能算通过`)
+  assert.strictEqual(zout.helperState, 'T',
+    `前提：helper（pid ${zout.helperPid}）必须真的停在 SIGSTOP 里（实测 State=${JSON.stringify(zout.helperState)}）` +
+    '——它是孙进程的父进程，只有停住（不 wait）孙进程才会留在 Z')
+  assert.strictEqual(zout.kill0, true,
+    '前提：僵尸在 kill(pid,0) 口径下必须仍「存在」（成功），否则探针返回 false 可能只是 ESRCH，' +
+    '根本没走到 Z 分支，本回归就没有靶向性')
+  assert.strictEqual(zout.probe && zout.probe.status, 0,
+    `探针脚本必须正常结束：${zout.probe && zout.probe.stderr}`)
+  const probed = JSON.parse(zout.probe.stdout.trim())
+  assert.deepStrictEqual(probed.pids, [zout.zombiePid, zout.helperPid],
+    '探针必须按顺序收到「僵尸 pid + 停住的 helper pid」两个参数')
+  assert.strictEqual(probed.alive[1], true,
+    `对照：被 SIGSTOP 停住的 helper（pid ${zout.helperPid}，State=T）必须仍判活（实测 ` +
+    `alive=${JSON.stringify(probed.alive[1])}）——否则「僵尸判死」可以靠 return false 通过，回归退化成恒假`)
+  assert.strictEqual(probed.alive[0], false,
+    `SIGNAL_PROBE 的 isAlive 必须把僵尸（pid ${zout.zombiePid}，State=Z）判死：僵尸仍占进程表项、` +
+    'kill(pid,0) 对它成功，旧实现据此返回 true ⇒ suiteAlive 假阳，入口被信号打断后「已收口」会被误判成' +
+    `孤儿还在跑（RUNBOOK §3-g3）；实测 alive=${JSON.stringify(probed.alive)}`)
+  assert.deepStrictEqual(zout.helperExit, { code: null, signal: 'SIGKILL' },
+    '清理：helper 必须被本用例 SIGKILL 并 wait 掉（exit 事件已到达 ⇒ 没留下僵尸 helper）')
+  assert.strictEqual(zout.zombieStateAfter, null,
+    `清理：helper 被回收后孙进程的 /proc 条目必须消失（实测 State=${JSON.stringify(zout.zombieStateAfter)}）` +
+    '——留在 Z 说明这台机器无进程回收僵尸，会污染后续套件')
+  console.log(`✅ SIGNAL_PROBE 判活口径：真僵尸（pid ${zout.zombiePid}, State=Z）判死、停住的 helper` +
+    `（pid ${zout.helperPid}, State=T）仍判活；helper 已 SIGKILL+wait，僵尸已回收`)
+} finally {
+  // 兜底：harness 若被 60s 兜底杀掉，SIGSTOP 的 helper 就成了孤儿 ⇒ 按它自报的 pid 补一刀。
+  // 只杀 cmdline 确实是本夹具 helper 的进程，防 pid 复用误杀。
+  try {
+    const hp = Number(fs.readFileSync(path.join(zombieDir, 'helper.pid'), 'utf8').trim())
+    if (hp > 0 && fs.readFileSync('/proc/' + hp + '/cmdline', 'utf8').includes('zombie_helper.js')) {
+      try { process.kill(hp, 'SIGCONT') } catch (e) { /* 已退出 */ }
+      try { process.kill(hp, 'SIGKILL') } catch (e) { /* 已退出 */ }
+    }
+  } catch (e) { /* 无 pid 文件（helper 未起跑）或已被回收 */ }
+  fs.rmSync(zombieDir, { recursive: true, force: true })
+}
+
 // 3h run_unit_tests.js 的汇总行必须能被 run_mutation.js 的 extractTestSummary 识别（UT-07）：
 //    变异评估下内层套件 stdout 与本入口共用同一捕获管道，若本入口汇总行不含「K 通过, M 失败, 共 N」
 //    三数字，extractTestSummary 会继续向上扫描并命中内层套件的同名行（如 test_filter.js:8746 的
