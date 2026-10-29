@@ -1267,6 +1267,10 @@ testCase('C5-002 脱敏对抗样本墙钟上界', async () => {
 // 逐用例执行：失败不中止其余用例；退出码仍按「有没有失败」置 1。
 // XBK_TEST_ONLY 仅供本地单节诊断（子串匹配），CI 不设置 ⇒ 默认跑全部用例；
 // 匹配不到任何用例时直接判红，避免「开关写错 = 静默零覆盖」。
+//
+// 顶层 IIFE 的 rejection 必须自己兜住并置退出码：裸 `;(async () => {...})()` 在
+// `--unhandled-rejections=warn` 的宿主上只打一行警告、进程仍以 0 退出 ⇒ 套件「全绿」实为
+// 异常被吞（Sonar S18）。这里接上 `.catch` 落红（不加 `void`：standard 的 no-void 不允许）。
 ;(async () => {
   const only = process.env.XBK_TEST_ONLY
   const selected = only ? CASES.filter(item => item.name.includes(only)) : CASES
@@ -1313,4 +1317,8 @@ testCase('C5-002 脱敏对抗样本墙钟上界', async () => {
     console.error(`  - ${item.name}: ${item.error && item.error.message ? item.error.message : String(item.error)}`)
   }
   process.exitCode = 1
-})()
+})().catch((e) => {
+  console.error('❌ 常驻失败策略套件异常退出（顶层 IIFE 的 rejection 未被用例循环兜住）：')
+  console.error(e && e.stack ? e.stack : String(e))
+  process.exitCode = 1
+})
