@@ -61,9 +61,11 @@ const assertCacheStep = (ymlText) => {
   // dependabot 把 fast-check 4.10.0→4.10.1 后 package-lock.json 变了、主 key 因含依赖指纹而未命中，但
   // 旧形态把依赖只放在主 key 里、兜底前缀不含 deps ⇒ 兜底把旧 inc 原样复原，而 stryker 的
   // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
-  const open = '${'
+  // GitHub 表达式开头 `${` 的常量写法：拼字面量时用不到模板字面量，也不会被 standard 的
+  // no-template-curly-in-string 判红。名字取 EXPR_OPEN——它是一段语法，不是开关/句柄（C4-031）。
+  const EXPR_OPEN = '${'
   assert.strictEqual(keyLine.trim(),
-    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + open + '{ hashFiles(\'package-lock.json\') }}-rng-' + open + '{ matrix.mutate }}-src-' + open + '{ hashFiles(matrix.src) }}',
+    'key: stryker-' + EXPR_OPEN + '{ matrix.name }}-cfg-' + EXPR_OPEN + '{ matrix.config }}-' + EXPR_OPEN + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + EXPR_OPEN + '{ hashFiles(\'package-lock.json\') }}-rng-' + EXPR_OPEN + '{ matrix.mutate }}-src-' + EXPR_OPEN + '{ hashFiles(matrix.src) }}',
     '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
     '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = matrix.src>（不含 -tests- 或本地 run_mutation.js 指纹）' +
     '：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
@@ -1031,8 +1033,8 @@ const SUMMARY_RACE_JITTER_MS = 2 // 3b-并发回归：轮次内抖动上限（�
 // no-template-curly-in-string 判红（不是靠 eslint-disable 压规则）。
 const CI_SUMMARY_PATH_TEMPLATE = 'reports/<stem>.p<pid>.md'
 const ciSummaryPath = (pid, stem) => CI_SUMMARY_PATH_TEMPLATE.replace('<stem>', stem).replace('<pid>', String(pid))
-const ciSummaryCheck = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
-const ciSummaryOverflow = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
+const ciSummaryCheckPath = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
+const ciSummaryOverflowPath = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
 // 3c+ 的「可写可观测」落点（C4-018）：同一份按 pid 唯一的模板，保证并发 worker 互不可见。
 const ciSummaryChild = ciSummaryPath(process.pid, '.ci-summary-child')
 // 3c 的反面夹具要指到一个**不存在**的目录（真去写就 ENOENT）：同样带 pid 后缀——否则并发 worker 遗留的
@@ -1047,10 +1049,10 @@ try {
   assert.match(unknown.stderr, /test_not_exist\.js/, '错误应点名未知套件')
 
   // 3b CI 下写 summary（验证过滤生效：跳过其余套件 → 只剩 test_check_deps.js 一个）
-  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: ciSummaryCheck })
+  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: ciSummaryCheckPath })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
   assert.match(filtered.stdout, /共 1 个套件/, '只剩一个套件时应报告 1 个')
-  const summary = fs.readFileSync(ciSummaryCheck, 'utf8')
+  const summary = fs.readFileSync(ciSummaryCheckPath, 'utf8')
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
   assert.match(summary, /共 1 套件/, 'summary 套件数应与实际执行数一致')
 
@@ -1086,7 +1088,7 @@ try {
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const overflow = runEntry({
     SKIP_SUITES: skipAllButOne,
-    GITHUB_STEP_SUMMARY: ciSummaryOverflow,
+    GITHUB_STEP_SUMMARY: ciSummaryOverflowPath,
     XBK_UNIT_MAX_BUFFER: '1'
   })
   assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
@@ -1101,8 +1103,8 @@ try {
   assert.ok(!/全部通过/.test(zero.stdout), '零套件时不得输出「全部通过」')
 } finally {
   // 只删**本进程自己的**落点（并发 worker 的落点文件名不同，互不可见）——清理不漏、也不误删别人
-  fs.rmSync(ciSummaryCheck, { force: true })
-  fs.rmSync(ciSummaryOverflow, { force: true })
+  fs.rmSync(ciSummaryCheckPath, { force: true })
+  fs.rmSync(ciSummaryOverflowPath, { force: true })
   fs.rmSync(ciSummaryChild, { force: true }) // 回归时（写入发生）也不留残渣
 }
 
@@ -1178,10 +1180,10 @@ try {
     fs.rmSync(probeDir, { recursive: true, force: true })
   }
   // 唯一性 + 静态双保险：真实落点必须带本进程 pid；固定共享字面量不得再出现（回退即红）。
-  assert.ok(ciSummaryCheck.includes(`.p${process.pid}.md`) && ciSummaryOverflow.includes(`.p${process.pid}.md`),
+  assert.ok(ciSummaryCheckPath.includes(`.p${process.pid}.md`) && ciSummaryOverflowPath.includes(`.p${process.pid}.md`),
     'summary 落点必须带 `.p<pid>.md` 唯一后缀（不带 = 退回共享路径 = 并发 worker 互相删读 ⇒ ENOENT 假 Killed）')
-  assert.notStrictEqual(ciSummaryCheck, ciSummaryOverflow, '同进程内两个落点也必须互不相同')
-  assert.ok(ciSummaryCheck !== ciSummaryPath(process.pid + 1, '.ci-summary-check'),
+  assert.notStrictEqual(ciSummaryCheckPath, ciSummaryOverflowPath, '同进程内两个落点也必须互不相同')
+  assert.ok(ciSummaryCheckPath !== ciSummaryPath(process.pid + 1, '.ci-summary-check'),
     '落点必须随 pid 变化（把 pid 从模板里去掉会让这条断言与并发探针同时红）')
   {
     const selfSrc = fs.readFileSync(__filename, 'utf8')
@@ -2167,13 +2169,13 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   //     ⇒ 那条反例只证明了 key 被锁、**没有**证明兜底被锁（兜底实际由正向 deepStrictEqual 兜住，
   //     但「反例覆盖两个方向」这件事此前是假的）。拆开后每个变体都带「夹具真的改到了目标行」的前置断言。
   {
-    const open = '${'
+    const EXPR_OPEN = '${'
     // 变体 A：**只**把 key 改回 PR #156 的含测试指纹形态 ⇒ key 断言必须红（兜底保持原样，保证正交）
     {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-key-'))
       try {
         const fixture = path.join(dir, 'mutation.yml')
-        const fingerprintKey = 'key: stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
+        const fingerprintKey = 'key: stryker-' + EXPR_OPEN + '{ matrix.name }}-tests-' + EXPR_OPEN + "{ hashFiles('test_*.js') }}-src-" + EXPR_OPEN + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
         const keyRegressed = mutationYml.replace(/^([ \t]*)key: stryker-\$\{\{ matrix\.name \}\}-.*$/m, (m, ind) => ind + fingerprintKey)
         assert.notStrictEqual(keyRegressed, mutationYml,
           '变体 A 夹具必须真的把 key 改成了含测试指纹的形态（没改成本回归形同虚设）')
@@ -2197,7 +2199,7 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-restore-'))
       try {
         const fixture = path.join(dir, 'mutation.yml')
-        const bareRestore = 'stryker-' + open + '{ matrix.name }}-'
+        const bareRestore = 'stryker-' + EXPR_OPEN + '{ matrix.name }}-'
         const restoreRegressed = mutationYml.replace(/^([ \t]*)stryker-\$\{\{ matrix\.name \}\}-cfg-.*$/m, (m, ind) => ind + bareRestore)
         assert.notStrictEqual(restoreRegressed, mutationYml,
           '变体 B 夹具必须真的把兜底前缀退回了裸前缀形态（没改成本回归形同虚设）')
