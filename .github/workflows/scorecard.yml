@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30   # REV-CI：本工作流此前无 timeout-minutes；Scorecard 分析通常 2-5min，30min 余量充足
     permissions:
+      contents: read        # job 级 permissions 会整体覆盖 workflow 级：漏掉这条 checkout 就是 contents:none，拿不到仓库
       security-events: write
       id-token: write
     steps:

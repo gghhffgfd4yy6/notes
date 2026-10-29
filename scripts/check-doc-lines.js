@@ -56,7 +56,10 @@ function findMarkdownFiles (rootDir, opts) {
       if (e.isDirectory()) {
         if (isSkippedDir(e.name)) continue
         walk(path.join(dir, e.name), childRel)
-      } else if (e.isFile() && e.name.toLowerCase().endsWith('.md')) {
+      } else if (e.name.toLowerCase().endsWith('.md') && (e.isFile() || e.isSymbolicLink())) {
+        // 符号链接的 .md 同样在扫描面内（C10-065）：readdir 的 Dirent 对链接 `isFile()` 为 false，
+        // 旧实现因此静默把它排除——「链接指向的长文档」与「全绿」在输出里长得一样。链接目标不是
+        // 常规文件（断链 / 指向目录）时，checkOne 的读盘失败照旧判红（fail-closed），不会静默略过。
         out.push(childRel)
       }
     }
@@ -168,6 +171,21 @@ function selftest () {
         return fs.readdirSync(d, { withFileTypes: true })
       }
     }), ['a.md', 'docs/b.md'], '跳过名单的目录不得参与遍历，也不得因注入的读取失败而报错')
+    // —— 符号链接的 .md 必须在扫描面内（C10-065）：Dirent 对链接 `isFile()` 为 false，旧实现静默略过。
+    // 用注入的 Dirent 而不是真建符号链接：本仓已登记 FUSE/Termux 宿主建链接会失败，门禁行为不该
+    // 取决于宿主能否 symlink。
+    const linkDirent = (name) => ({
+      name, isDirectory: () => false, isFile: () => false, isSymbolicLink: () => true
+    })
+    const withLink = findMarkdownFiles(tmp, {
+      readdir: (d) => {
+        const entries = fs.readdirSync(d, { withFileTypes: true })
+        return d === tmp ? [...entries, linkDirent('linked.md')] : entries
+      }
+    })
+    assert.ok(withLink.includes('linked.md'),
+      '符号链接的 .md 不得掉出扫描面（旧实现按 isFile() 判定 ⇒ 链接被静默略过）')
+    assert.deepStrictEqual([...withLink].sort(), withLink, '含符号链接时扫描面仍必须确定性排序')
     // —— 超长文件不得靠 spread 求最长行（150k 行会让 Math.max(...args) 当场 RangeError）
     const hugeRel = 'huge.md'
     fs.writeFileSync(path.join(tmp, hugeRel), Array.from({ length: 200000 }, () => 'x').join('\n'))
@@ -181,7 +199,7 @@ function selftest () {
   const real = findMarkdownFiles(path.join(__dirname, '..'))
   assert.ok(real.length >= 7, '本仓至少应有 7 个 md 在册，实得 ' + real.length)
   assert.ok(real.includes('README.md') && real.includes('AGENTS.md') && real.includes('.github/pull_request_template.md'))
-  console.log('✅ check-doc-lines --selftest 全部通过（28 断言）')
+  console.log('✅ check-doc-lines --selftest 全部通过（30 断言）')
 }
 
 function main () {

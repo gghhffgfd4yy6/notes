@@ -146,14 +146,20 @@ function stripStatusReason (buf, keepChars = 0) {
 // 路径到对象的绑定只发生一次，类型/大小判定与整份读取作用于同一个 inode，不存在「检查后被换」的窗口。
 // O_NONBLOCK：FIFO 单独以 O_RDONLY 打开会阻塞到出现写端（旧实现用 statSync 先拒绝，不会阻塞）；
 // 加 O_NONBLOCK 让 open 立即返回，随后 fstat 判为非常规文件而拒绝。对常规文件无副作用。
-function readGuardedBytes (abs, maxFileBytes) {
-  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK
+// O_NOFOLLOW（options.noFollow，仅写侧用，C10-062）：符号链接在 open 阶段直接 ELOOP——写侧要的
+// 「拒写符号链接」判定因此与读取同源，不再有「先 lstat 判类型、再按路径二次 open」的替换窗口。
+function readGuardedBytes (abs, maxFileBytes, options = {}) {
+  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK |
+    (options && options.noFollow ? (fs.constants.O_NOFOLLOW || 0) : 0)
   let fd
   try {
     fd = fs.openSync(abs, openFlags)
   } catch (err) {
-    // open 阶段失败（ENOENT/EACCES/ENOTDIR 等）原生异常消息不含被读路径，这里补上上下文
-    throw new Error(`无法读取 ${abs}：${err.message}`)
+    // open 阶段失败（ENOENT/EACCES/ENOTDIR/ELOOP 等）原生异常消息不含被读路径，这里补上上下文；
+    // 同时保留 err.code —— 写侧要据此把 ELOOP 归到「符号链接一律拒写」那句文案。
+    const wrapped = new Error(`无法读取 ${abs}：${err.message}`)
+    wrapped.code = err.code
+    throw wrapped
   }
   let buf
   let stat
@@ -259,18 +265,22 @@ function writeStrippedReport (reportPath, options = {}) {
   const maxStringLength = Number.isFinite(options && options.maxStringLength) ? options.maxStringLength : MAX_STRING_LENGTH
   const maxFileBytes = Number.isFinite(options && options.maxFileBytes) ? options.maxFileBytes : DEFAULT_MAX_FILE_BYTES
   const abs = path.resolve(reportPath)
-  // 符号链接防御：先 lstat（不跟随）确认目标是常规文件本身。写回走 rename，跟随符号链接的写法会把链接
-  // 换成普通文件而真实目标不变——这里明确拒绝，fail-closed（与「不是普通文件一律拒绝」同一口径）。
-  let lst
+  // 符号链接防御（C10-062）：写回走「同目录临时文件 + rename」，rename 替换的是路径本身，跟随符号链接
+  // 会改写错对象，故链接一律拒写。**判定必须与读取绑定在同一次 open 上**：旧实现先 lstat(路径) 判类型、
+  // 再让 readGuardedBytes 按同一路径二次 open —— 中间把路径换成符号链接，就能让「检查看到的」与
+  // 「实际读到的」不是同一个文件（check-then-use / CodeQL js/file-system-race，实测可让写回落盘的
+  // 是另一个文件的内容）。现在用 O_NOFOLLOW 单次 open + 只对 fd fstat：链接在 open 阶段即 ELOOP。
+  let buf
+  let stat
   try {
-    lst = fs.lstatSync(abs)
+    ({ buf, stat } = readGuardedBytes(abs, maxFileBytes, { noFollow: true }))
   } catch (err) {
-    throw new Error(`无法写入 ${abs}：${err.message}`)
+    // ELOOP = O_NOFOLLOW 撞上符号链接：与「目录/FIFO/socket」同一句拒写文案（fail-closed）
+    if (err && err.code === 'ELOOP') {
+      throw new Error(`无法写入 ${abs}：不是普通文件（符号链接/目录/FIFO/socket 一律拒写）`)
+    }
+    throw err
   }
-  if (!lst.isFile()) {
-    throw new Error(`无法写入 ${abs}：不是普通文件（符号链接/目录/FIFO/socket 一律拒写）`)
-  }
-  const { buf, stat } = readGuardedBytes(abs, maxFileBytes)
   const { chunks, strippedLength } = stripStatusReason(buf)
   if (strippedLength > maxStringLength) {
     throw new Error(`JSON 剥离 statusReason 后仍为 ${strippedLength} 字节，超过 V8 字符串上限 ${maxStringLength}：${abs}`)
