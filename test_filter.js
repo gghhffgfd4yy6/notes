@@ -238,6 +238,19 @@ function assertEqual (actual, expected, msg) {
   }
 }
 
+// C4-011：确定性 LCG 伪随机。此前同一行实现被**逐字复制** 26 份（19 份单行 + 7 份三行），
+// 改算法/模数要改 26 处、漏一处就让「固定 seed ⇒ 跨运行结果一致」的 fuzz 用例静默分叉。
+// 语义与旧副本逐字等价：seed_n = (seed_{n-1} * 1103515245 + 12345) % 2147483648，返回 [0,1)。
+// 注意 `<x>_prnd` 一类的 `& 0x7fffffff` 变体是**另一个**生成器（序列不同），不并入本工厂：
+// 换算法会改变这些 fuzz 用例实际喂进去的输入。
+function makeRand (initialSeed) {
+  let seed = initialSeed
+  return () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed / 2147483648
+  }
+}
+
 function assertPathInRoot (targetPath, root, msg) {
   const rootAbs = path.resolve(root)
   const t = path.resolve(targetPath)
@@ -7542,14 +7555,20 @@ console.log('========================================\n');
   })
 
   console.log('\n📂 103. 随机输入冒烟（Fuzz，固定 seed 确定性）')
+  // C4-011：LCG 伪随机此前被逐字复制 26 份（19 份单行 + 7 份三行），改算法/模数要改 26 处、
+  // 漏一处就让「固定 seed ⇒ 跨运行一致」的 fuzz 用例静默分叉。收敛到 makeRand 之后，
+  // 本断言把「只剩一处实现」变成门禁：谁再复制一份即红（prnd 是 `& 0x7fffffff` 的另一序列，另算）。
+  await test('C4-011: LCG 伪随机只有 makeRand 一处实现（+ prnd 变体共 2 处）', () => {
+    const NEEDLE = '1103515' + '245' // 拆开写，免得本断言自己成为第 3 处
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const codeOnly = src.split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+    const hits = codeOnly.split(NEEDLE).length - 1
+    assertEqual(hits, 2, `LCG 常数只应出现在 makeRand 与 prnd 各一次（用例内复制即红），实际 ${hits} 处`)
+  })
 
   await test('Fuzz: 纯函数随机脏数据 500 轮不崩（v3.107）', () => {
     // 确定性伪随机（固定 seed 42——跨运行结果一致，88 章确定性精神）
-    let seed = 42
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(42)
     // 随机脏数据源：null/undefined/空串/大数/NaN/Infinity/对象/数组/含实体与标签的随机串
     const randomValue = () => {
       const r = rand()
@@ -7764,11 +7783,7 @@ console.log('========================================\n');
 
   await test('Fuzz-深度: 扩展随机值生成器（Symbol/函数/BigInt/Date/RegExp/循环/Proxy）', () => {
     // 固定 seed，确定性
-    let seed = 20260801
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(20260801)
     const deep = (depth) => {
       if (depth <= 0) return randomScalar()
       const r = rand()
@@ -7847,11 +7862,7 @@ console.log('========================================\n');
   })
 
   await test('Property: normUrl 幂等（随机输入 normUrl(normUrl(x))===normUrl(x)）', () => {
-    let seed = 7
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(7)
     const urls = ['http://A.com/x', 'https://x.com/a/', '//host/path', '/rel/path', 'http://x.com', 'a?b=1', '///', 'http://x.com//d//', 'ftp://f.com/', 'HTTP://Mixed.COM/U']
     for (let i = 0; i < 1000; i++) {
       const base = urls[Math.floor(rand() * urls.length)]
@@ -7863,11 +7874,7 @@ console.log('========================================\n');
   })
 
   await test('Property: decodeHtmlEntities 的 & 计数只减不增（随机输入）', () => {
-    let seed = 99
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(99)
     for (let i = 0; i < 1000; i++) {
       let s = ''
       const len = Math.floor(rand() * 100)
@@ -7883,11 +7890,7 @@ console.log('========================================\n');
   })
 
   await test('Property: daysComputed 非负（随机时间输入）', () => {
-    let seed = 1234
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(1234)
     for (let i = 0; i < 2000; i++) {
       const t = Math.floor(rand() * 1e14)
       const d = daysComputed(t)
@@ -7897,11 +7900,7 @@ console.log('========================================\n');
   })
 
   await test('Property: anonKey 确定性（同输入同输出）+ 不抛', () => {
-    let seed = 55
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(55)
     for (let i = 0; i < 500; i++) {
       const a = Math.floor(rand() * 1e6)
       const b = rand() < 0.5 ? null : 'x' + Math.floor(rand() * 1e6)
@@ -7914,11 +7913,7 @@ console.log('========================================\n');
   })
 
   await test('Property: truncateUtf16 长度不超限（随机字符串+emoji）', () => {
-    let seed = 777
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(777)
     for (let i = 0; i < 1000; i++) {
       let s = ''
       const len = Math.floor(rand() * 200)
@@ -7984,8 +7979,7 @@ console.log('========================================\n');
   console.log('\n📂 106. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）')
 
   await test('Property-2: truncateUtf16 单调性（max 更大 → 输出不更短）', () => {
-    let seed = 314159
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(314159)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 300)
@@ -7999,8 +7993,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: {分类名} 与 {类目} 同源一致（随机数据）', () => {
-    let seed = 2718
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(2718)
     for (let i = 0; i < 500; i++) {
       const catename = rand() < 0.2 ? null : '分类' + Math.floor(rand() * 100)
       const item = { catename, title: 't', content: 'c', url: '/x' }
@@ -8012,8 +8005,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: whitelistFilter 与 filterByKeyword 一致（随机数据）', () => {
-    let seed = 1618
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(1618)
     for (let i = 0; i < 500; i++) {
       const title = '标题' + Math.floor(rand() * 1000) + (rand() < 0.5 ? '京东' : '') + '神券'
       const kw = rand() < 0.3 ? '' : (rand() < 0.5 ? '京东' : (rand() < 0.8 ? '[' : '神券'))
@@ -8025,8 +8017,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: daysComputed 与 parseTime 一致性（无效/未来 → 0）', () => {
-    let seed = 4242
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(4242)
     for (let i = 0; i < 1000; i++) {
       const x = rand() < 0.3 ? (rand() < 0.5 ? 'abc' : null) : Math.floor(rand() * 1e13)
       const d = daysComputed(x)
@@ -8038,8 +8029,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: decodeHtmlEntities 幂等（递归解码收敛后稳定）', () => {
-    let seed = 8888
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(8888)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 40)
@@ -8054,8 +8044,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-正则: 100 个随机正则模式 hasNestedQuantifier 不崩且判定一致', () => {
-    let seed = 999
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(999)
     const atoms = ['a', 'b', '\\d', '.', '[ab]', '(ab)', '(?:cd)', 'a+', 'b*', 'a?', 'x{1,3}', 'y{2,}', '(a+)+', '(b*)*', '\\', '|', '^', '$']
     for (let i = 0; i < 100; i++) {
       let pat = ''
@@ -8084,8 +8073,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件自动清理）', () => {
-    let seed = 12321
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(12321)
     const randName = () => {
       const chars = 'abcXYZ0123 ../\\\\?*:"<>|&.;\u4e2d\ud83d\ude00'
       let s = 'test_106_'
@@ -8134,8 +8122,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-深度: 8 层嵌套 + 1MB 字符串 + 1000 轮大扫描', () => {
-    let seed = 55555
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(55555)
     const deep = (d) => {
       if (d <= 0) return rand() < 0.5 ? Math.floor(rand() * 1e9) : (rand() < 0.7 ? 'str' + Math.floor(rand() * 100) : null)
       return rand() < 0.5 ? { k: deep(d - 1) } : [deep(d - 1)]
@@ -8164,8 +8151,7 @@ console.log('========================================\n');
   console.log('\n📂 107. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）')
 
   await test('Property-3: daysComputed 单调性（更早日期 → 天数不更小）', () => {
-    let seed = 112358
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(112358)
     const mkDate = () => {
       const y = 2020 + Math.floor(rand() * 10)
       const mo = 1 + Math.floor(rand() * 12)
@@ -8185,8 +8171,7 @@ console.log('========================================\n');
   })
 
   await test('Property-3: truncateUtf16 前缀性（输出是输入前缀，允许代理对回退）', () => {
-    let seed = 131071
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(131071)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 100)
@@ -8199,8 +8184,7 @@ console.log('========================================\n');
   })
 
   await test('Property-3: decode+htmlToMarkdown 组合无实体残留（随机实体 HTML）', () => {
-    let seed = 161803
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(161803)
     for (let i = 0; i < 500; i++) {
       let html = ''
       const len = Math.floor(rand() * 20)
@@ -8250,8 +8234,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-模板: 随机模板（占位符组合）tuisong_replace 不崩且已知占位符被替换', () => {
-    let seed = 271828
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(271828)
     const placeholders = ['{分类名}', '{分类ID}', '{标题}', '{链接}', '{日期}', '{时间}', '{楼主}', '{类目}', '{价格}', '{商城}', '{品牌}', '{图片}', '{Html内容}', '{Markdown内容}', '{不存在}', '{{标题}}', '{标题', '标题}']
     const data = {
       catename: '测试分类',
@@ -8291,8 +8274,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-存储: MessageStore 跨操作一致性（save→read→has 闭环）', () => {
-    let seed = 3141592
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(3141592)
     const file = 'test_107_store.json'
     const fp = getFilePath(file)
     try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
@@ -8351,8 +8333,7 @@ console.log('========================================\n');
   console.log('\n📂 109. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）')
 
   await test('Fuzz-过滤: 随机 filter 配置 × 随机数据 → listfilter 不崩且返回 boolean', () => {
-    let seed = 20261201
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(20261201)
     const randRe = () => {
       const r = rand()
       if (r < 0.2) return ''
@@ -8394,8 +8375,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-HTML: 随机畸形标签 htmlToMarkdown 不崩且标签剥离干净', () => {
-    let seed = 2718282
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(2718282)
     const atoms = ['<b>', '</b>', '<a href="x">', '</a>', '<img src="i">', '<br>', '<br/>', '<p>', '</p>',
       '<h1>', '<h2>', '</h1>', '<li>', '</li>', '<table>', '<td>', '<tr>', '<div>', '<span>',
       '<', '>', '</', '<>', '</>', '<a>', '文本', 'x', '&amp;', '&lt;', '😀', '<script>', '</script>', '<style>', '</style>']
@@ -8472,8 +8452,7 @@ console.log('========================================\n');
     const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok') })
     await new Promise(r => server.listen(0, r))
     const port = server.address().port
-    let seed = 111111
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(111111)
     const randUrl = () => {
       const r = rand()
       if (r < 0.3) return `http://127.0.0.1:${port}/ok`
@@ -8510,8 +8489,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不崩', () => {
-    let seed = 99999
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(99999)
     const mkCompiled = () => {
       const r = rand()
       if (r < 0.25) return null
@@ -8723,8 +8701,7 @@ console.log('========================================\n');
   })
 
   await test('一致性: saveBatch 索引判重 vs 逐条 upsert 结果一致（随机数据）', () => {
-    let seed = 20261202
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(20261202)
     // 生成含重复 id/url/无 id 的随机消息流（覆盖 id 命中/url 命中/更新/追加）
     const mkMsgs = () => {
       const msgs = []
@@ -8876,8 +8853,7 @@ console.log('========================================\n');
       return (isId(qid) && (String(mid) === String(qid) || (!isId(mid) && mm.url && message.url && normUrl(mm.url) === normUrl(message.url)))) ||
                (!isId(qid) && message.url && normUrl(mm.url) === normUrl(message.url))
     })
-    let seed = 424242
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(424242)
     const randMsg = () => {
       const r = rand()
       const msg = { title: 'T' + Math.floor(rand() * 1000) }
