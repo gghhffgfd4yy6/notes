@@ -233,9 +233,19 @@ const {
   // 旧实现直接 writeFileSync(tmp)+renameSync：rename 的原子性只对进程崩溃成立，掉电时目录项与
   // 内容都可能丢失。修后顺序固定为 fsync(内容) → rename → fsync(父目录)。
   const order = []
+  const fsyncedFileInos = []
   const origFsync = fs.fsyncSync
   const origRename2 = fs.renameSync
-  fs.fsyncSync = (target) => { order.push(order.length === 0 ? 'fsync-file' : 'fsync'); return origFsync.call(fs, target) }
+  // 标签必须由 **fd 指向什么** 决定，不能按「第几次调用」贴（C5-076）：按次数贴标签时，把实现换成
+  // 「fsync 一个无关普通文件 → rename → 再 fsync 目标文件」或「先 fsync 父目录 → rename → fsync 文件」，
+  // 下面三条断言照样全绿——它们只证明「有两次 fsync，一次在前一次在后」，不证明 fsync 的是 tmp 的 fd。
+  fs.fsyncSync = (target) => {
+    const st = fs.fstatSync(target)
+    // 标签字面量沿用既有断言（'fsync-file' / 'fsync'），来源改为 fstat(fd)：目录 fd 不再被当成文件 fd
+    order.push(st.isDirectory() ? 'fsync' : 'fsync-file')
+    if (!st.isDirectory()) fsyncedFileInos.push(st.ino)
+    return origFsync.call(fs, target)
+  }
   fs.renameSync = (a, b) => { order.push('rename'); return origRename2.call(fs, a, b) }
   let durableOk
   try { durableOk = writeAtomic(make('durable.txt'), 'durable') } finally { fs.fsyncSync = origFsync; fs.renameSync = origRename2 }
@@ -243,6 +253,12 @@ const {
   assert.ok(order.includes('fsync-file'), 'writeAtomic 必须在 rename 前 fsync 临时文件（否则掉电可丢内容）')
   assert.ok(order.indexOf('fsync-file') < order.indexOf('rename'), '文件 fsync 必须发生在 rename 之前（提交点唯一）')
   assert.ok(order.lastIndexOf('fsync') > order.indexOf('rename'), 'rename 之后必须 fsync 父目录（否则掉电可丢目录项）')
+  // 否定式（C5-076）：被 fsync 的**文件** fd 必须正好是 tmp 那一个——rename 之后 tmp 就是目标文件本身，
+  // 故其 ino 必须等于最终目标的 ino，且只允许出现一次。fsync 了别的普通文件、fsync 了旧目标文件、
+  // 或干脆只 fsync 了目录，三种形态在这里都是红。
+  const durableIno = fs.statSync(make('durable.txt')).ino
+  assert.deepStrictEqual(fsyncedFileInos, [durableIno],
+    `rename 前必须 fsync 临时文件本身（其 ino 应等于最终目标文件的 ino）；实测被 fsync 的普通文件 ino=${JSON.stringify(fsyncedFileInos)}，目标 ino=${durableIno}`)
   assert.strictEqual(fs.readFileSync(make('durable.txt'), 'utf8'), 'durable', 'fsync 之后内容仍应是本次写入的')
 
   // writeAtomicIfAbsent 走同一口径（无 rename 提交点，但内容同样要先落盘）
