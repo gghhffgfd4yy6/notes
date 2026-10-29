@@ -1382,8 +1382,9 @@ checkAsync('_sendAlert 成功路径：标题/正文分段/run.log 留痕/alert.s
   assert.strictEqual(parts[1].slice(0, 3), '时间：')
   assert.strictEqual(parts[2], '原因：boom')
   assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：boom\n'])
-  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000}']])
-  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: true })
+  // C1-004：状态文件有意扩展为 {lastAt, classes.<key>}（仍精确 deepEqual，未放宽）；lastAt 语义不变
+  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000,"classes":{"alert":1700000000000}}']])
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, classes: { alert: now }, persisted: true })
   // 杀 Math.ceil 与 /60000 口径：90000ms ⇒ 2 分钟
   assert.deepStrictEqual(msgs, ['已发送运行异常告警（限频 2 分钟）'])
 })
@@ -1472,7 +1473,7 @@ checkAsync('_sendAlert 已持久化内存状态但文件被删 ⇒ 丢弃内存�
   // 杀 `persisted && !fs.existsSync` 的条件取反：文件没了仍按内存限频 = 静默丢告警
   assert.strictEqual(r, true)
   assert.strictEqual(sent.length, 1)
-  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: true })
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, classes: { alert: now }, persisted: true })
 })
 
 checkAsync('_sendAlert 未持久化的内存状态不因文件存在与否重置（persisted 合取项）', async () => {
@@ -1543,8 +1544,8 @@ checkAsync('_sendAlert 持久化失败 ⇒ 仍返回 true 并告警，内存限�
   // 杀 if (!persisted) 取反与 persisted 标记写错
   assert.strictEqual(value, true)
   assert.deepStrictEqual(msgs, ['⚠️ 运行异常告警已发送，但 alert.state 持久化失败；本进程将继续使用内存限频'])
-  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000}']])
-  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: false })
+  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000,"classes":{"alert":1700000000000}}']])
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, classes: { alert: now }, persisted: false })
 })
 
 checkAsync('_sendAlert 同步异常（Pusher.send 抛出）⇒ 返回 false 且不冒泡', async () => {
@@ -2396,7 +2397,7 @@ checkAsync('AP-5 通道健康：更新过程整体抛错 ⇒ 补一行 WARN 留�
 //     的 getter 只接受根内 cache.dir，临时目录必须走部署开关才真正生效），断言后递归删除；
 //   · 覆盖文件按轮改写，证明「保存后下一轮生效」，且代码默认层 Config.filter 全程不被污染。
 // ============================================================
-function buildFilterRunHarness (cacheDir) {
+function buildFilterRunHarness (cacheDir, over = {}) {
   const realFs = require('fs')
   const nodeCrypto = require('crypto')
   const {
@@ -2465,7 +2466,7 @@ function buildFilterRunHarness (cacheDir) {
   let items = []
   const sends = []
   const Network = { fetchData: async () => items }
-  const Pusher = {
+  const Pusher = over.Pusher || {
     send: async (text, desp) => {
       sends.push({ text, desp })
       return { successfulChannels: ['stub'], failures: [] }
@@ -2842,4 +2843,127 @@ checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严�
     if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
     else process.env.XBK_DRY_RUN = prevDryRun
   }
+})
+
+// 共享夹具：临时 cacheDir + 真装配 harness + 环境变量还原（异常路径也还原，避免污染后续用例）
+async function withRunHarness (over, fn) {
+  const os = require('os')
+  const realFs = require('fs')
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runh-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir, over)
+  try {
+    return await fn(h, cacheDir, realFs)
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+}
+
+checkAsync('ALERT-1 异类告警不得互相压制：截断告警限频窗口内的「推送全部失败」必须送达，同类仍限频', async () => {
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({ Config: { alert: { enabled: true, intervalMs: 3600000 } } })
+  const r1 = await withFixedNowAsync(now, () => app._sendAlert('截断 3 条', 'truncate'))
+  assert.strictEqual(r1, true, '首条截断告警应发送成功')
+  assert.strictEqual(sent.length, 1)
+  // 5 分钟后换一类：共用单一 lastAt 时这里会被整段压掉（返回 undefined、实发数仍为 1）
+  const r2 = await withFixedNowAsync(now + 300000, () => app._sendAlert('推送全部失败（2 条）', 'push-fail'))
+  assert.strictEqual(r2, true, '异类告警必须送达（曾被 alert.state 的单一 lastAt 压制）')
+  assert.strictEqual(sent.length, 2, `异类告警实发数应为 2，实际 ${sent.length}`)
+  // 同类仍在窗口内 ⇒ 必须继续压制（防轰炸是既定设计，不得为了「不压制」把它拆掉）
+  const r3 = await withFixedNowAsync(now + 600000, () => app._sendAlert('又一次全失败', 'push-fail'))
+  assert.strictEqual(r3, undefined, '同类告警在限频窗口内必须继续压制（防轰炸）')
+  assert.strictEqual(sent.length, 2, '同类压制生效，不得多发')
+  // 第三类同样不被前两类压制
+  const r4 = await withFixedNowAsync(now + 700000, () => app._sendAlert('接口 404', 'run-error'))
+  assert.strictEqual(r4, true, '第三类告警同样不得被其他类别压制')
+  assert.strictEqual(sent.length, 3)
+})
+
+checkAsync('ALERT-2 旧版 alert.state（只有 lastAt、无 classes）升级后仍限频：不得因格式变更放过轰炸', async () => {
+  const now = 1700000000000
+  const legacy = JSON.stringify({ lastAt: now - 60000 }) // 1 分钟前写过，无 classes 字段
+  const { app, sent } = makeNotifyApp({
+    Config: { alert: { enabled: true, intervalMs: 3600000 } },
+    readSafeTextResult: () => ({ status: 'ok', text: legacy })
+  })
+  await withFixedNowAsync(now, async () => {
+    for (const cls of ['truncate', 'push-fail', 'run-error']) {
+      const r = await app._sendAlert('boom', cls)
+      assert.strictEqual(r, undefined, `旧状态文件的 lastAt 必须继续压制 ${cls}（升级后第一个窗口不得放宽）`)
+    }
+  })
+  assert.strictEqual(sent.length, 0, '旧状态在窗口内不得触发任何告警')
+})
+
+checkAsync('ALERT-3 告警状态向后兼容：顶层 lastAt=最近一次（旧读者口径不变），并逐类记 classes', async () => {
+  const now = 1700000000000
+  const { app, stateWrites } = makeNotifyApp({ Config: { alert: { enabled: true, intervalMs: 3600000 } } })
+  await withFixedNowAsync(now, () => app._sendAlert('截断', 'truncate'))
+  await withFixedNowAsync(now + 300000, () => app._sendAlert('全失败', 'push-fail'))
+  assert.ok(stateWrites.length >= 2, `两次告警都应持久化状态：${JSON.stringify(stateWrites)}`)
+  const last = JSON.parse(stateWrites[stateWrites.length - 1][1])
+  assert.strictEqual(last.lastAt, now + 300000, '顶层 lastAt 必须是最近一次告警时间（status/旧版本读取口径不变）')
+  assert.deepStrictEqual(last.classes, { truncate: now, 'push-fail': now + 300000 },
+    'classes 必须逐类记录最后发送时间（异类分流的数据基础）')
+  assert.deepStrictEqual(Object.keys(last).sort(), ['classes', 'lastAt'], '状态字段只增不改（不得丢 lastAt）')
+})
+
+checkAsync('ALERT-4 同一轮「截断 + 推送全部失败」两类告警都必须送达（调用点必须各带类别）', async () => {
+  const alertSends = []
+  const Pusher = {
+    send: async (text, desp) => {
+      if (text.includes('运行异常')) {
+        alertSends.push({ text, desp })
+        return { successfulChannels: ['stub'], failures: [] }
+      }
+      throw new Error('模拟推送通道全失败')
+    }
+  }
+  await withRunHarness({ Pusher }, async (h) => {
+    h.Config.alert = { enabled: true, intervalMs: 3600000 }
+    h.Config.push.maxPerRun = 2
+    h.setItems([1, 2, 3, 4, 5].map(i => makeRunItem('al-' + i, '告警' + i)))
+    const r = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: r.summary.pushed, failed: r.summary.failed, truncated: r.summary.truncated },
+      { pushed: 0, failed: 2, truncated: 3 }, `夹具前提异常：${JSON.stringify(r.summary)}`)
+    assert.strictEqual(alertSends.length, 2,
+      `截断（truncate）与全失败（push-fail）是两类告警，都必须送达；共用单一 lastAt 时第二条被压掉（实际 ${alertSends.length}）`)
+    assert.ok(alertSends[0].desp.includes('截断'), `第一条应是截断告警：${alertSends[0].desp}`)
+    assert.ok(alertSends[1].desp.includes('推送全部失败'), `第二条应是全失败告警：${alertSends[1].desp}`)
+  })
+})
+
+checkAsync('ALERT-5 同类告警被限频压制时仍必须留痕：run.log 有 truncated= 与 ERROR 推送全部失败', async () => {
+  const alertSends = []
+  const Pusher = {
+    send: async (text) => {
+      if (text.includes('运行异常')) {
+        alertSends.push(text)
+        return { successfulChannels: ['stub'], failures: [] }
+      }
+      throw new Error('模拟推送通道全失败')
+    }
+  }
+  await withRunHarness({ Pusher }, async (h, cacheDir, realFs) => {
+    h.Config.alert = { enabled: true, intervalMs: 3600000 }
+    h.Config.push.maxPerRun = 2
+    const now = Date.now()
+    // 预置「两类都刚发过」的状态 ⇒ 本轮两条告警都被限频吞掉（压制是设计，但不得零留痕）
+    realFs.writeFileSync(path.join(cacheDir, 'alert.state'),
+      JSON.stringify({ lastAt: now, classes: { truncate: now, 'push-fail': now } }))
+    h.setItems([1, 2, 3, 4, 5].map(i => makeRunItem('qs-' + i, '压制' + i)))
+    const r = await runWithWarnings(h.App)
+    assert.strictEqual(r.summary.truncated, 3, '夹具前提：本轮确实截断 3 条')
+    assert.strictEqual(alertSends.length, 0, '限频窗口内同类告警必须被压制（本用例的前提）')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/truncated=3/.test(log), `截断必须在 run.log 摘要行留痕（“被压制=零留痕”不成立）：${log.slice(-400)}`)
+    assert.ok(/ERROR 推送全部失败 2 条/.test(log), `全失败必须有 ERROR 行（cron 翻日志可见）：${log.slice(-400)}`)
+  })
 })
