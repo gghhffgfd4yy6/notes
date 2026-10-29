@@ -2555,8 +2555,8 @@ console.log('========================================\n');
     }), true, 'listfilter(makeItem({ catename: \'A\', louzhu: \'B\', title: \'C\', content… 应等于 true')
   })
 
-  // ==================== 27. compileRules 预编译 ====================
-  console.log('\n📂 27. compileRules 预编译')
+  // ==================== 28. compileRules 预编译 ====================
+  console.log('\n📂 28. compileRules 预编译')
 
   await test('compileRules 简单正则字段', () => {
     const r = compileRules({ pingbifenlei: '微博|赚客吧' })
@@ -2673,7 +2673,7 @@ console.log('========================================\n');
   })
 
   // ==================== C007 _legacyCompileKey 字符串/对象同缓存键 ====================
-  console.log('\n📂 C007 _legacyCompileKey 字符串/对象同缓存键')
+  console.log('\n📂 29. C007 _legacyCompileKey 字符串/对象同缓存键')
 
   await test('C007 先字符串后对象：对象按 compileRules null 放行', () => {
     assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: \'x\' }) 应等于 false')
@@ -2693,7 +2693,7 @@ console.log('========================================\n');
   })
 
   // ==================== C015 filterHash 类型归一 ====================
-  console.log('\n📂 C015 filterHash 类型归一')
+  console.log('\n📂 30. C015 filterHash 类型归一')
 
   await test('C015 filterHash number 0 与 string "0" 哈希不同', () => {
     assertEqual(filterHash({ pingbibiaoti: 0 }) === filterHash({ pingbibiaoti: '0' }), false, '0 与 "0" 应不同哈希')
@@ -2717,8 +2717,8 @@ console.log('========================================\n');
     assertEqual(warns[0].includes('应为字符串'), true, 'warns[0].includes(\'应为字符串\') 应等于 true')
   })
 
-  // ==================== 28. whitelistFilter ====================
-  console.log('\n📂 28. whitelistFilter')
+  // ==================== 31. whitelistFilter ====================
+  console.log('\n📂 31. whitelistFilter')
 
   await test('whitelistFilter 空关键词 → 全部通过', () => {
     assertEqual(whitelistFilter({ title: '随便' }, 'title', ''), true, 'whitelistFilter({ title: \'随便\' }, \'title\', \'\') 应等于 true')
@@ -2780,8 +2780,8 @@ console.log('========================================\n');
     assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \'京东\') 应等于 true')
   })
 
-  // ==================== 29. saveBatch 批量写入 ====================
-  console.log('\n📂 29. saveBatch 批量写入')
+  // ==================== 32. saveBatch 批量写入 ====================
+  console.log('\n📂 32. saveBatch 批量写入')
 
   await test('saveBatch 批量写入多条', () => {
     saveBatch([{ id: 1 }, { id: 2 }, { id: 3 }], 'test_batch.json')
@@ -2819,8 +2819,8 @@ console.log('========================================\n');
     assertEqual(msgs.length, 2, '共享 addIndex 后总条数不应因索引失效而膨胀')
   })
 
-  // ==================== 30. init & decodeHtmlEntities ====================
-  console.log('\n📂 30. init & decodeHtmlEntities')
+  // ==================== 33. init & decodeHtmlEntities ====================
+  console.log('\n📂 33. init & decodeHtmlEntities')
 
   await test('init 重复调用 → 不报错', () => {
     // C5-019：契约是「重复调用不抛」（旧 assertEqual(true,true) 永远不会红）
@@ -2844,8 +2844,8 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('a&amp;b&lt;c'), 'a&b<c', 'decodeHtmlEntities(\'a&amp;b&lt;c\') 应等于 \'a&b<c\'')
   })
 
-  // ==================== 31. Formatter 惰性计算 ====================
-  console.log('\n📂 31. Formatter 惰性计算')
+  // ==================== 34. Formatter 惰性计算 ====================
+  console.log('\n📂 34. Formatter 惰性计算')
 
   await test('模板不用Markdown → 不触发htmlToMarkdown', () => {
     // 模板不含 {Markdown内容} → 结果里没有Markdown相关内容，正常输出标题
@@ -2880,8 +2880,8 @@ console.log('========================================\n');
     assertEqual(r.includes('hello'), true, 'r.includes(\'hello\') 应等于 true')
   })
 
-  // ==================== 32. has() url fallback 判重 ====================
-  console.log('\n📂 32. has() url fallback 判重')
+  // ==================== 35. has() url fallback 判重 ====================
+  console.log('\n📂 35. has() url fallback 判重')
 
   await test('无id+相同url → 判重', () => {
     appendMessageToFile({ url: '/x/1.html', title: 'a' }, 'test_urlfb.json')
@@ -2905,8 +2905,8 @@ console.log('========================================\n');
     assertEqual(isMessageInFile({ title: '另一个无标识' }, 'test_urlfb3.json'), false, 'isMessageInFile({ title: \'另一个无标识\' }, \'test_urlfb3.json\') 应等于 false')
   })
 
-  // ==================== 33. Config getter ====================
-  console.log('\n📂 33. Config getter')
+  // ==================== 36. Config getter ====================
+  console.log('\n📂 36. Config getter')
 
   await test('Config.api.pushUrl 正确拼接', () => {
     assertEqual(Config.api.pushUrl, Config.domain + '/plus/json/push.json', 'Config.api.pushUrl 应等于 Config.domain + \'/plus/json/push.json\'')
@@ -2940,11 +2940,11 @@ console.log('========================================\n');
     Config.domain = original // 恢复
   })
 
-  // ==================== 34. fetchData ====================
-  console.log('\n📂 34. fetchData')
+  // ==================== 37. fetchData ====================
+  console.log('\n📂 37. fetchData')
 
-  // ==================== 35. daysComputed 边界 ====================
-  console.log('\n📂 35. daysComputed 边界')
+  // ==================== 38. daysComputed 边界 ====================
+  console.log('\n📂 38. daysComputed 边界')
 
   await test('daysComputed 正常日期', () => {
     assertEqual(typeof daysComputed('2026-07-28'), 'number', 'typeof daysComputed(\'2026-07-28\') 应等于 \'number\'')
@@ -3161,8 +3161,8 @@ console.log('========================================\n');
     assertEqual(tuisong_replace('{链接}', { url: '/haodan/123.html', title: 't' }), '/haodan/123.html', '相对路径保留')
   })
 
-  // ==================== 36. _splitLines 解析 ====================
-  console.log('\n📂 36. _splitLines 解析')
+  // ==================== 39. _splitLines 解析 ====================
+  console.log('\n📂 39. _splitLines 解析')
 
   await test('_splitLines 有### → 返回行数组（v3.22审查12：支持单\n）', () => {
     const lines = _splitLines('a###1\n\nb###2')
@@ -3183,8 +3183,8 @@ console.log('========================================\n');
     assertEqual(_splitLines('').length, 0, '_splitLines(\'\').length 应等于 0')
   })
 
-  // ==================== 37. 过滤子方法直接测 ====================
-  console.log('\n📂 37. 过滤子方法直接测')
+  // ==================== 40. 过滤子方法直接测 ====================
+  console.log('\n📂 40. 过滤子方法直接测')
 
   await test('checkRegisterTime 无配置 → 通过', () => {
     assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(4) }, null), true, 'checkRegisterTime({ louzhuregtime: daysAgo(4) }, null) 应等于 true')
@@ -3248,8 +3248,8 @@ console.log('========================================\n');
     assertEqual(checkFields({ louzhu: 'x', title: 'y', content: 'z' }, compiled), true, 'checkFields({ louzhu: \'x\', title: \'y\', content: \'z\' }, compiled) 应等于 true')
   })
 
-  // ==================== 38. 缓存内部方法 ====================
-  console.log('\n📂 38. 缓存内部方法')
+  // ==================== 41. 缓存内部方法 ====================
+  console.log('\n📂 41. 缓存内部方法')
 
   await test('getFilePath 拼接路径', () => {
     const p = getFilePath('test.json')
@@ -3341,8 +3341,8 @@ console.log('========================================\n');
     assertEqual(msgs.length, 5000, `字符串 maxSize '5000' 应生效（曾回退默认 10000），实际 ${msgs.length}`)
   }))
 
-  // ==================== 39. {Html内容} 惰性计算分支 ====================
-  console.log('\n📂 39. {Html内容} 惰性计算分支')
+  // ==================== 42. {Html内容} 惰性计算分支 ====================
+  console.log('\n📂 42. {Html内容} 惰性计算分支')
 
   await test('模板用{Html内容} → 正常输出HTML', () => {
     const r = tuisong_replace('{Html内容}', {
@@ -3374,8 +3374,8 @@ console.log('========================================\n');
     assertEqual(md.includes('\uFFFD'), false, '{Markdown内容} 输出不得含替换字符 U+FFFD')
   })
 
-  // ==================== 40. 补充缺口覆盖 ====================
-  console.log('\n📂 40. 补充缺口覆盖')
+  // ==================== 43. 补充缺口覆盖 ====================
+  console.log('\n📂 43. 补充缺口覆盖')
 
   // validateConfig ### 多行正则校验
   await test('validateConfig ### 多行：分类正则无效 → 有警告', () => {
@@ -3482,8 +3482,8 @@ console.log('========================================\n');
     assertEqual(msgs.some(m => m.id === 149), true, 'msgs.some(m => m.id === 149) 应等于 true') // 最新的保留
   }))
 
-  // ==================== 41. 错误分支覆盖 ====================
-  console.log('\n📂 41. 错误分支覆盖')
+  // ==================== 44. 错误分支覆盖 ====================
+  console.log('\n📂 44. 错误分支覆盖')
 
   await test('compileRules pingbitime 非数字 → null 不编译（v3.157）', () => {
     const r = compileRules({ pingbitime: 'abc' })
@@ -3736,8 +3736,8 @@ console.log('========================================\n');
       `递归删除只能收敛到 removeDirInRoot + 本用例哨兵清理（实得 ${rawRecursiveRm.length} 处）`)
   })
 
-  // ==================== 42. 剩余缺口覆盖 ====================
-  console.log('\n📂 42. 剩余缺口覆盖')
+  // ==================== 45. 剩余缺口覆盖 ====================
+  console.log('\n📂 45. 剩余缺口覆盖')
 
   await test('compileRules ### 值正则无效 → 跳过该行', () => {
     const r = compileRules({ pingbilouzhu: '线报###[未闭合' })
@@ -3787,8 +3787,8 @@ console.log('========================================\n');
     assertEqual(warns[0].includes('不支持 ###'), true, 'warns[0].includes(\'不支持 ###\') 应等于 true')
   })
 
-  // ==================== 43. save upsert 更新分支 ====================
-  console.log('\n📂 43. save upsert 更新分支')
+  // ==================== 46. save upsert 更新分支 ====================
+  console.log('\n📂 46. save upsert 更新分支')
 
   await test('save 已存在消息 → 内容被更新', () => {
     const fs = require('fs')
@@ -3813,8 +3813,8 @@ console.log('========================================\n');
     assertEqual(msgs.some(m => m.id === 2), true, 'msgs.some(m => m.id === 2) 应等于 true')
   })
 
-  // ==================== 44. 变异测试盲区修复 ====================
-  console.log('\n📂 44. 变异测试盲区修复')
+  // ==================== 47. 变异测试盲区修复 ====================
+  console.log('\n📂 47. 变异测试盲区修复')
 
   await test('whitelistFilter 空关键词+字段为空 → 返回true', () => {
     // 空关键词应放行，即使字段为空（不误拦截）
@@ -3949,8 +3949,8 @@ console.log('========================================\n');
     assertEqual(listfilter({ title: '', content: '', catename: '' }, c), true, '主流程空值放行（调用方保护）')
   })
 
-  // ==================== 45. htmlToMarkdown 输出细节断言 ====================
-  console.log('\n📂 45. htmlToMarkdown 输出细节断言')
+  // ==================== 48. htmlToMarkdown 输出细节断言 ====================
+  console.log('\n📂 48. htmlToMarkdown 输出细节断言')
 
   await test('htmlToMarkdown <br> → 换行', () => {
     const r = htmlToMarkdown({ content_html: '行一<br>行二', url: 'http://x' })
@@ -3972,8 +3972,8 @@ console.log('========================================\n');
     assertEqual(r.includes('&amp;'), false, 'r.includes(\'&amp;\') 应等于 false')
   })
 
-  // ==================== 46. 第4轮变异盲区修复 ====================
-  console.log('\n📂 46. 第4轮变异盲区修复')
+  // ==================== 49. tuisong_replace 占位符与 save 时间戳 ====================
+  console.log('\n📂 49. tuisong_replace 占位符与 save 时间戳')
 
   await test('tuisong_replace {分类ID} 占位符', () => {
     const r = tuisong_replace('{分类ID}', { cateid: '30', url: 'x' })
@@ -3999,8 +3999,8 @@ console.log('========================================\n');
     assertEqual(second.length, 1, 'second.length 应等于 1')
   })
 
-  // ==================== 47. 第5轮变异盲区修复 ====================
-  console.log('\n📂 47. 第5轮变异盲区修复')
+  // ==================== 50. tuisong_replace 占位符覆盖 ====================
+  console.log('\n📂 50. tuisong_replace 占位符覆盖')
 
   await test('tuisong_replace {类目} 占位符', () => {
     const r = tuisong_replace('{类目}', { category_name: '美妆', url: 'x' })
@@ -4068,8 +4068,8 @@ console.log('========================================\n');
     assertEqual(Config.domain, 'https://new.ixbk.net', 'Config.domain 应等于 \'https://new.ixbk.net\'')
   })
 
-  // ==================== 48. 第7轮变异盲区修复 ====================
-  console.log('\n📂 48. 第7轮变异盲区修复')
+  // ==================== 51. tuisong_replace 纯函数与原文链接 ====================
+  console.log('\n📂 51. tuisong_replace 纯函数与原文链接')
 
   await test('tuisong_replace 不修改原对象（纯函数）', () => {
     const original = { category_name: '分类', catename: '原分类', title: 'T', url: 'x' }
@@ -4086,8 +4086,8 @@ console.log('========================================\n');
     assertEqual(r.includes('http://example.com/a.html'), true, 'r.includes(\'http://example.com/a.html\') 应等于 true')
   })
 
-  // ==================== 49. 第8轮变异盲区修复（异常输入健壮性） ====================
-  console.log('\n📂 49. 第8轮变异盲区修复')
+  // ==================== 52. 第8轮变异盲区修复（异常输入健壮性） ====================
+  console.log('\n📂 52. 脏输入兜底（null / 数字）')
 
   await test('tuisong_replace shuju为null → 不崩溃', () => {
     const r = tuisong_replace('{标题}', null)
@@ -4147,8 +4147,8 @@ console.log('========================================\n');
     assertEqual(r, 'T', 'r 应等于 \'T\'')
   })
 
-  // ==================== 50. 第9轮变异盲区修复（数字输入健壮性） ====================
-  console.log('\n📂 50. 第9轮变异盲区修复')
+  // ==================== 53. 第9轮变异盲区修复（数字输入健壮性） ====================
+  console.log('\n📂 53. 脏输入边界（数字 / 连续实体）')
 
   await test('htmlToMarkdown content_html为数字 → 不崩溃', () => {
     const r = htmlToMarkdown({ content_html: 12345, url: 'http://x' })
@@ -4184,8 +4184,8 @@ console.log('========================================\n');
     assertEqual(r.pingbibiaoti, null, '数字值的规则必须被跳过（null），不能编译成恒真/恒假正则')
   })
 
-  // ==================== 51. 第10-20轮边界覆盖 ====================
-  console.log('\n📂 51. 第10-20轮边界覆盖')
+  // ==================== 54. 边界值收集（大写实体 / ISO 时间 / 负天数） ====================
+  console.log('\n📂 54. 边界值收集（大写实体 / ISO 时间 / 负天数）')
 
   await test('decodeHtmlEntities 大写实体', () => {
     // HTML 实体一般小写，大写应原样保留（不误转换）
@@ -4245,8 +4245,8 @@ console.log('========================================\n');
     assertEqual(msgs[0].title, '新', 'msgs[0].title 应等于 \'新\'')
   })
 
-  // ==================== 52. 大规模变异盲区修复 ====================
-  console.log('\n📂 52. 大规模变异盲区修复')
+  // ==================== 55. 原文链接与配置默认值精确断言 ====================
+  console.log('\n📂 55. 原文链接与配置默认值精确断言')
 
   await test('htmlToMarkdown 原文链接格式精确断言', () => {
     const r = htmlToMarkdown({ content_html: '内容', url: 'http://x.com/1' })
@@ -4295,8 +4295,8 @@ console.log('========================================\n');
     assertEqual(r.includes('a\n\n\n\nb'), false, 'r.includes(\'a\\n\\n\\n\\nb\') 应等于 false') // 不应有3个以上换行
   })
 
-  // ==================== 53. 第21-30轮盲区修复 ====================
-  console.log('\n📂 53. 第21-30轮盲区修复')
+  // ==================== 56. htmlToMarkdown 大小写与空白 ====================
+  console.log('\n📂 56. htmlToMarkdown 大小写与空白')
 
   await test('htmlToMarkdown 大写标签也转换（i flag）', () => {
     const r = htmlToMarkdown({ content_html: '<P>大写段落</P><BR>换行', url: 'http://x' })
@@ -4316,8 +4316,8 @@ console.log('========================================\n');
     assertEqual(r.includes('http://x/a.jpg'), true, 'r.includes(\'http://x/a.jpg\') 应等于 true')
   })
 
-  // ==================== 54. 第1-10批×10变异盲区修复 ====================
-  console.log('\n📂 54. 第1-10批×10变异盲区修复')
+  // ==================== 57. 实体解码与时间戳更新 ====================
+  console.log('\n📂 57. 实体解码与时间戳更新')
 
   await test('htmlToMarkdown 多种实体都被解码', () => {
     const r = htmlToMarkdown({ content_html: 'a&amp;b&lt;c&gt;d&nbsp;e', url: 'http://x' })
@@ -4347,8 +4347,8 @@ console.log('========================================\n');
     assertEqual(t2.length >= t1.length, true, 't2.length >= t1.length 应等于 true')
   })
 
-  // ==================== 55. 第11-20批×10盲区修复 ====================
-  console.log('\n📂 55. 第11-20批×10盲区修复')
+  // ==================== 58. h 标签层级与引号边界 ====================
+  console.log('\n📂 58. h 标签层级与引号边界')
 
   await test('htmlToMarkdown h标签#数量精确断言', () => {
     // ### 不能匹配为 ##，必须精确数量
@@ -4386,8 +4386,8 @@ console.log('========================================\n');
     assertEqual(r.includes('**['), false, 'r.includes(\'**[\') 应等于 false')
   })
 
-  // ==================== 56. 第21-30批盲区修复 ====================
-  console.log('\n📂 56. 第21-30批盲区修复')
+  // ==================== 59. Html 内容链接与过滤默认值 ====================
+  console.log('\n📂 59. Html 内容链接与过滤默认值')
 
   await test('tuisong {Html内容} 原文链接含实际URL', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/p.html' })
@@ -4408,8 +4408,8 @@ console.log('========================================\n');
     assertEqual(Config.filter.pingbineirong, '', 'Config.filter.pingbineirong 应等于 \'\'')
   })
 
-  // ==================== 57. 第31-40批盲区修复 ====================
-  console.log('\n📂 57. 第31-40批盲区修复')
+  // ==================== 60. 日期格式与正则大小写 ====================
+  console.log('\n📂 60. 日期格式与正则大小写')
 
   await test('tuisong 日期格式带-分隔', () => {
     const r = tuisong_replace('{日期}', { posttime: 1785346200, datetime: undefined, url: 'x' })
@@ -4432,8 +4432,8 @@ console.log('========================================\n');
       true, '大写规则必须按大小写不敏感命中')
   })
 
-  // ==================== 58. 盲区误判修复（实证发现） ====================
-  console.log('\n📂 58. 盲区误判修复')
+  // ==================== 61. 盲区误判修复（实证发现） ====================
+  console.log('\n📂 61. match/test 等价性与大小写口径')
 
   await test('whitelistFilter 用match测试也应匹配（test/exec等价性）', () => {
     // exec 和 test 对相同输入应返回一致结果
@@ -4463,8 +4463,8 @@ console.log('========================================\n');
     assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true, '/^\\d{4}-\\d{2}-\\d{2}T/.test(msgs[0].timestamp) 应等于 true')
   })
 
-  // ==================== 59. 边缘误判修复（实证发现） ====================
-  console.log('\n📂 59. 边缘误判修复')
+  // ==================== 62. 边缘误判修复（实证发现） ====================
+  console.log('\n📂 62. 日期本地时间与空 url 回退')
 
   await test('daysComputed 日期解析为本地时间（非UTC）', () => {
     // 2026-07-28 解析后应是本地日期的天数
@@ -4490,8 +4490,8 @@ console.log('========================================\n');
     assertEqual(getFileName('http://x.com/push.json'), 'push.json', 'getFileName(\'http://x.com/push.json\') 应等于 \'push.json\'')
   })
 
-  // ==================== 60. 误判实证修复（第二批） ====================
-  console.log('\n📂 60. 误判实证修复')
+  // ==================== 63. 误判实证修复（第二批） ====================
+  console.log('\n📂 63. 天数与年份精确值')
 
   await test('daysComputed 天数精确计算', () => {
     // 用精确日期验证天数（v3.115：expected 用 Date.UTC 与 parseTime UTC 解析口径一致）
@@ -4519,8 +4519,8 @@ console.log('========================================\n');
     assertEqual(r2.pingbitime.rules[0].value, 3, 'r2.pingbitime.rules[0].value 应等于 3')
   })
 
-  // ==================== 61. 精确断言修复（实证盲区） ====================
-  console.log('\n📂 61. 精确断言修复')
+  // ==================== 64. 精确断言修复（实证盲区） ====================
+  console.log('\n📂 64. 天数 / 年份 / 正则边界精确断言')
 
   await test('daysComputed 天数精确（不因时区偏移变化）', () => {
     // 精确日期 → 精确天数
@@ -4570,8 +4570,8 @@ console.log('========================================\n');
     assertEqual(r.some(m => m.id === 149), true, 'r.some(m => m.id === 149) 应等于 true')
   }))
 
-  // ==================== 62. 变异实证盲区修复（第41-50批） ====================
-  console.log('\n📂 62. 变异实证盲区修复')
+  // ==================== 65. 变异实证盲区修复（第41-50批） ====================
+  console.log('\n📂 65. 边界值与退化输入实证')
 
   await test('add0 边界：9分钟补0 → 09', () => {
     // v3.115：{时间} 用 getUTC*——测试用 Date.UTC 构造（跨时区稳定）
@@ -4712,8 +4712,8 @@ console.log('========================================\n');
     assertEqual(checkTimeCompiled(weird, group), false, 'checkTimeCompiled(weird, group) 应等于 false')
   })
 
-  // ==================== 63. 第51批变异盲区修复（v2算子） ====================
-  console.log('\n📂 63. 第51批变异盲区修复')
+  // ==================== 66. 第51批变异盲区修复（v2算子） ====================
+  console.log('\n📂 66. 追加顺序与空标签转换')
 
   await test('saveBatch 新消息按顺序追加到末尾（变异 push->unshift 会倒序）', () => {
     // 变异 unshift 后新消息会插到数组开头，顺序颠倒
@@ -4801,8 +4801,8 @@ console.log('========================================\n');
     assertEqual(r2.includes('![](http://p.jpg)\n\nx'), false, 'r2.includes(\'![](http://p.jpg)\\n\\nx\') 应等于 false')
   })
 
-  // ==================== 64. fuzz 属性测试发现修复 ====================
-  console.log('\n📂 64. fuzz 属性测试发现修复')
+  // ==================== 67. fuzz 发现的换行与模板退化 ====================
+  console.log('\n📂 67. fuzz 发现的换行与模板退化')
 
   await test('htmlToMarkdown 内容尾部换行 + 模板拼接处 → 无3连换行（fuzz发现）', () => {
     // 内容以 <p> 结尾产生尾部 \n\n，拼接模板的 \n\n 原文链接 会拼出 4 连换行
@@ -4847,8 +4847,8 @@ console.log('========================================\n');
     assertEqual(checkCategory({ catename: '微博' }, c.pingbifenlei), false, 'checkCategory({ catename: \'微博\' }, c.pingbifenlei) 应等于 false')
   })
 
-  // ==================== 65. 代码审查修复（v3.14 审查请求） ====================
-  console.log('\n📂 65. 代码审查修复')
+  // ==================== 68. 代码审查修复（v3.14 审查请求） ====================
+  console.log('\n📂 68. saveBatch 无 id 判重口径')
 
   await test('saveBatch 无id不同url → 互不覆盖（修复前 undefined===undefined 误判覆盖）', () => {
     // 修复前 m.id === message.id 在两者都是 undefined 时为 true，
@@ -4890,8 +4890,8 @@ console.log('========================================\n');
     assertEqual(r.length, 2, `应2条，实际${r.length}`)
   })
 
-  // ==================== 66. v3.15 审查报告修复 ====================
-  console.log('\n📂 66. v3.15 审查报告修复')
+  // ==================== 69. save 判重对齐与数字实体解码 ====================
+  console.log('\n📂 69. save 判重对齐与数字实体解码')
 
   await test('save 无id不同url → 互不覆盖（v3.15审查3.1：save与saveBatch对齐）', () => {
     appendMessageToFile({ url: '/x1.html', title: 'A' }, 'test_save_noid.json')
@@ -4937,8 +4937,8 @@ console.log('========================================\n');
     assertEqual(fs.existsSync(p + '.tmp'), false, 'tmp 文件应被清理')
   })
 
-  // ==================== 67. v3.18 审查报告修复 ====================
-  console.log('\n📂 67. v3.18 审查报告修复')
+  // ==================== 70. anonKey 稳定性与类目同源 ====================
+  console.log('\n📂 70. anonKey 稳定性与类目同源')
 
   await test('anonKey 稳定合成id：相同输入相同key（v3.18审查Bug2）', () => {
     assertEqual(anonKey('京东', '内容A'), anonKey('京东', '内容A'), 'anonKey(\'京东\', \'内容A\') 应等于 anonKey(\'京东\', \'内容A\')')
@@ -4967,8 +4967,8 @@ console.log('========================================\n');
     assertEqual(r2, '数码|数码', 'r2 应等于 \'数码|数码\'')
   })
 
-  // ==================== 68. v3.20 审查报告修复 ====================
-  console.log('\n📂 68. v3.20 审查报告修复')
+  // ==================== 71. id 判重边界与 anon 前缀口径 ====================
+  console.log('\n📂 71. id 判重边界与 anon 前缀口径')
 
   await test('hasValidId 排除 null/空串（v3.20审查2：id判重过宽）', () => {
     assertEqual(hasValidId({ id: undefined }), false, 'hasValidId({ id: undefined }) 应等于 false')
@@ -5014,7 +5014,7 @@ console.log('========================================\n');
   })
 
   // ==================== C006 继承属性 id 判重 vs 落盘丢 id ====================
-  console.log('\n📂 C006 继承属性 id 判重 vs 落盘丢 id')
+  console.log('\n📂 72. C006 继承属性 id 判重 vs 落盘丢 id')
 
   await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', () => {
     const name = 'test_c006_inherited_noown.json'
@@ -5085,8 +5085,8 @@ console.log('========================================\n');
     assertEqual(r3.includes('[链接3](http://u3)'), true, 'r3.includes(\'[链接3](http://u3)\') 应等于 true')
   })
 
-  // ==================== 69. v3.21 审查报告修复 ====================
-  console.log('\n📂 69. v3.21 审查报告修复')
+  // ==================== 73. 非法日期与脏后缀解析 ====================
+  console.log('\n📂 73. 非法日期与脏后缀解析')
 
   await test('daysComputed 非法日期 2026-02-31 → 0（v3.21审查1）', () => {
     assertEqual(daysComputed('2026-02-31'), 0, 'daysComputed(\'2026-02-31\') 应等于 0')
@@ -5230,8 +5230,8 @@ console.log('========================================\n');
     assertEqual(r.length, 100, 'r.length 应等于 100')
   }))
 
-  // ==================== 70. v3.22 审查报告修复 ====================
-  console.log('\n📂 70. v3.22 审查报告修复')
+  // ==================== 74. ISO / 毫秒时间戳解析口径 ====================
+  console.log('\n📂 74. ISO / 毫秒时间戳解析口径')
 
   await test('daysComputed ISO 时间串 → 正常解析（v3.22审查1）', () => {
     const d = daysComputed('2026-08-01T00:00:00Z')
@@ -5443,8 +5443,8 @@ console.log('========================================\n');
     assert(Date.now() - t0 < PERF_REDOS_LIMIT, `![ 对抗输入应 <${PERF_REDOS_LIMIT}ms，实际 ${Date.now() - t0}ms`)
   })
 
-  // ==================== 71. 通读复查修复 ====================
-  console.log('\n📂 71. 通读复查修复')
+  // ==================== 75. 单换行配置与 0 时间戳口径 ====================
+  console.log('\n📂 75. 单换行配置与 0 时间戳口径')
 
   await test('validateConfig 单换行 pingbitime → 无误报警告（复查1）', () => {
     // 修复前分隔符不含单\n，单换行配置被粘成一行 → 误报"天数值不是有效数字"
@@ -5462,16 +5462,16 @@ console.log('========================================\n');
     assertEqual(checkRegisterTime({}, r.pingbitime), true, 'checkRegisterTime({}, r.pingbitime) 应等于 true')
   })
 
-  // ==================== 72. 审查3轮修复 ====================
-  console.log('\n📂 72. 审查3轮修复')
+  // ==================== 76. h 标签跨行标题 ====================
+  console.log('\n📂 76. h 标签跨行标题')
 
   await test('htmlToMarkdown h标签跨行标题 → 转换（审查3 B）', () => {
     const r = htmlToMarkdown({ content_html: '<h2>第一行\n第二行</h2>', url: 'http://x' })
     assertEqual(r.includes('## 第一行\n第二行'), true, 'r.includes(\'## 第一行\\n第二行\') 应等于 true')
   })
 
-  // ==================== 73. 审查4轮修复 ====================
-  console.log('\n📂 73. 审查4轮修复')
+  // ==================== 77. 纯点串 URL 与无空格 ahref ====================
+  console.log('\n📂 77. 纯点串 URL 与无空格 ahref')
 
   await test('getFileName 纯点串URL → default.json（审查4-2）', () => {
     assertEqual(getFileName('http://x.com/a/..'), 'default.json', 'getFileName(\'http://x.com/a/..\') 应等于 \'default.json\'')
@@ -5489,8 +5489,8 @@ console.log('========================================\n');
     assertEqual(warns.some(w => w.includes('pingbitime')), false, `不应有pingbitime警告: ${JSON.stringify(warns)}`)
   })
 
-  // ==================== 74. 审查5轮修复 ====================
-  console.log('\n📂 74. 审查5轮修复')
+  // ==================== 78. 非法 / 负 posttime 与 zkt_gjc 校验 ====================
+  console.log('\n📂 78. 非法 / 负 posttime 与 zkt_gjc 校验')
 
   await test('非法posttime → 日期留空不回退当前时间（审查5-1）', () => {
     const r = tuisong_replace('{日期}|{时间}', { posttime: 'abc', url: 'x' })
@@ -5517,8 +5517,8 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('&#0;'), '', 'decodeHtmlEntities(\'&#0;\') 应等于 \'\'')
   })
 
-  // ==================== 75. 审查6轮修复(推送模块/got/代理区) ====================
-  console.log('\n📂 75. 审查6轮修复')
+  // ==================== 79. 审查6轮修复(推送模块/got/代理区) ====================
+  console.log('\n📂 79. 代理区字符与空通道拒绝')
 
   await test('decodeHtmlEntities 代理区字符保留原文（审查6-8）', () => {
     assertEqual(decodeHtmlEntities('&#xD800;'), '&#xD800;', 'decodeHtmlEntities(\'&#xD800;\') 应等于 \'&#xD800;\'')
@@ -5541,8 +5541,8 @@ console.log('========================================\n');
     assertEqual(rejected, true, '未配置通道应 reject（避免主流程误判推送成功并写缓存）')
   })
 
-  // ==================== 76. 审查7轮修复(主代码) ====================
-  console.log('\n📂 76. 审查7轮修复')
+  // ==================== 80. 审查7轮修复(主代码) ====================
+  console.log('\n📂 80. 关键词空白与空 href 链接')
 
   await test('whitelistFilter 空格关键词 → 全通过（审查7-1）', () => {
     assertEqual(whitelistFilter({ title: 'a b' }, 'title', ' '), true, 'whitelistFilter({ title: \'a b\' }, \'title\', \' \') 应等于 true')
@@ -5565,8 +5565,8 @@ console.log('========================================\n');
     assertEqual(htmlToMarkdown({ content_html: 'x', url: 'http://u/a.html' }).includes('(http://u/a.html)'), true, 'htmlToMarkdown({ content_html: \'x\', url: \'http://u/a.html\' }).include… 应等于 true')
   })
 
-  // ==================== 77. 审查8轮(文档项升级修复) ====================
-  console.log('\n📂 77. 审查8轮(文档项升级修复)')
+  // ==================== 81. 对象字段 JSON 与 8 位日期 ====================
+  console.log('\n📂 81. 对象字段 JSON 与 8 位日期')
 
   await test('tuisong 对象字段 → JSON 显示（审查8-2）', () => {
     const r = tuisong_replace('{价格}', { price: { value: 5.9, unit: '元' }, url: 'x' })
@@ -5583,8 +5583,8 @@ console.log('========================================\n');
     assertEqual(daysComputed('20260231'), 0, 'daysComputed(\'20260231\') 应等于 0')
   })
 
-  // ==================== 78. 审查9轮(文档项升级) ====================
-  console.log('\n📂 78. 审查9轮(文档项升级)')
+  // ==================== 82. maxSize 0/负回退默认 ====================
+  console.log('\n📂 82. maxSize 0/负回退默认')
 
   await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.120）', () => withCacheMaxSize(0, () => {
     const arr = []
@@ -5594,8 +5594,8 @@ console.log('========================================\n');
     assertEqual(r.length, 150, 'maxSize=0 时回退默认 10000，150 条不裁剪')
   }))
 
-  // ==================== 79. 审查10轮高价值修复 ====================
-  console.log('\n📂 79. 审查10轮高价值修复')
+  // ==================== 83. saveBatch 非对象元素跳过 ====================
+  console.log('\n📂 83. saveBatch 非对象元素跳过')
 
   await test('saveBatch 含非对象元素 → 跳过不崩（审查10 #158）', () => {
     saveBatch([{ id: 1 }, null, 'x', { id: 2 }], 'test_r10_elem.json')
@@ -5604,8 +5604,8 @@ console.log('========================================\n');
     assertEqual(r.map(m => m.id).join(','), '1,2', 'r.map(m => m.id).join(\',\') 应等于 \'1,2\'')
   })
 
-  // ==================== 80. 审查10轮批量修复(20项) ====================
-  console.log('\n📂 80. 审查10轮批量修复')
+  // ==================== 84. 审查10轮批量修复(20项) ====================
+  console.log('\n📂 84. script/style 移除与 safeText 防御')
 
   await test('htmlToMarkdown script/style 内容移除（#62）', () => {
     const r = htmlToMarkdown({ content_html: '<script>var x=1;</script>正文<style>.a{}</style>', url: 'http://x' })
@@ -5650,8 +5650,8 @@ console.log('========================================\n');
     assertEqual(warns.some(w => w.includes('多个 ###')), true, 'warns.some(w => w.includes(\'多个 ###\')) 应等于 true')
   })
 
-  // ==================== 81. 审查10轮批量修复(补齐测试) ====================
-  console.log('\n📂 81. 审查10轮批量修复(补齐测试)')
+  // ==================== 85. htmlToMarkdown 标签细节补齐 ====================
+  console.log('\n📂 85. htmlToMarkdown 标签细节补齐')
 
   await test('htmlToMarkdown </br> → 换行（#58）', () => {
     const r = htmlToMarkdown({ content_html: 'a</br>b', url: 'http://x' })
@@ -5735,8 +5735,8 @@ console.log('========================================\n');
     assertEqual(logs.some(w => w.includes('更新缓存记录')), true, '覆盖应提示')
   })
 
-  // ==================== 82. 性质测试(Property-based) ====================
-  console.log('\n📂 82. 性质测试(Property-based)')
+  // ==================== 86. 性质测试(Property-based) ====================
+  console.log('\n📂 86. 性质测试(Property-based)')
 
   // 固定种子生成器(可复现)
   let propSeed = 20260801
@@ -5844,8 +5844,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 83. 契约测试(锁定导出 API) ====================
-  console.log('\n📂 83. 契约测试(锁定导出 API)')
+  // ==================== 87. 契约测试(锁定导出 API) ====================
+  console.log('\n📂 87. 契约测试(锁定导出 API)')
 
   await test('契约: 全部导出键存在且类型正确', () => {
     const mod = require('./xbk_function_v3.js')
@@ -5980,8 +5980,8 @@ console.log('========================================\n');
     assertEqual(mod.isMessageInFile({ id: 3 }, f), false, 'mod.isMessageInFile({ id: 3 }, f) 应等于 false')
   })
 
-  // ==================== 84. 快照测试(锁定输出格式) ====================
-  console.log('\n📂 84. 快照测试(锁定输出格式)')
+  // ==================== 88. 快照测试(锁定输出格式) ====================
+  console.log('\n📂 88. 快照测试(锁定输出格式)')
 
   await test('快照: htmlToMarkdown 组合标签', () => {
     const r = htmlToMarkdown({ content_html: '<h2>标题</h2><p>段落</p><a href="http://u">链接</a><br>换行', url: 'http://x/1.html' })
@@ -6102,8 +6102,8 @@ console.log('========================================\n');
     assertEqual(r, '9.9|京东|某牌|http://p.jpg', 'r 应等于 \'9.9|京东|某牌|http://p.jpg\'')
   })
 
-  // ==================== 85. 性能基准(防性能回归) ====================
-  console.log('\n📂 85. 性能基准(防性能回归)')
+  // ==================== 89. 性能基准(防性能回归) ====================
+  console.log('\n📂 89. 性能基准(防性能回归)')
 
   // v3.175：基准测试负载容错——瞬时系统负载（CI 2核/并行残留进程）可能偶发超时误报，
   // 首次超时重跑一次（排除瞬时负载）；真实性能回归两次都超时仍会红（保留检测力）
@@ -6287,8 +6287,8 @@ console.log('========================================\n');
     if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 4000, '默认 harness 超时必须为 4000ms（严格大于内部阈值 3000）')
   })
 
-  // ==================== 86. 分支覆盖显式验证(关键if两方向) ====================
-  console.log('\n📂 86. 分支覆盖显式验证')
+  // ==================== 90. 分支覆盖显式验证(关键if两方向) ====================
+  console.log('\n📂 90. 分支覆盖显式验证')
 
   await test('分支: checkCategory 命中/未命中/字段缺失', () => {
     const c = compileRules({ pingbifenlei: '微博' })
@@ -6344,8 +6344,8 @@ console.log('========================================\n');
     assertEqual(daysComputed(null), 0, 'daysComputed(null) 应等于 0') // 空→0
   })
 
-  // ==================== 87. 安全测试(原型污染+输出注入) ====================
-  console.log('\n📂 87. 安全测试')
+  // ==================== 91. 安全测试(原型污染+输出注入) ====================
+  console.log('\n📂 91. 安全测试')
 
   await test('安全: listfilter 不受 __proto__ 污染', () => {
     delete Object.prototype.polluted
@@ -6474,8 +6474,8 @@ console.log('========================================\n');
     assertEqual(/<\/?[a-z][a-z0-9]*\s*>/i.test(r), false, '不应残留任何 HTML 标签')
   })
 
-  // ==================== 88. 稳定性/时间旅行/竞态 ====================
-  console.log('\n📂 88. 稳定性/时间旅行/竞态')
+  // ==================== 92. 稳定性/时间旅行/竞态 ====================
+  console.log('\n📂 92. 稳定性/时间旅行/竞态')
 
   await test('稳定性: 连续500轮调用内存不显著增长', () => {
     global.gc && global.gc()
@@ -6527,8 +6527,8 @@ console.log('========================================\n');
     assertEqual(data.length >= 1, true, 'data.length >= 1 应等于 true')
   })
 
-  // ==================== 89. 配置矩阵(组合爆炸) ====================
-  console.log('\n📂 89. 配置矩阵')
+  // ==================== 93. 配置矩阵(组合爆炸) ====================
+  console.log('\n📂 93. 配置矩阵')
 
   await test('矩阵: 过滤字段全组合（2^10）逐组断言拦截/放行（独立 oracle）', () => {
     const fields = ['pingbifenlei', 'pingbibiaoti', 'zhanxianbiaoti', 'pingbibiaotiplus', 'pingbineirong', 'zhanxianneirong', 'pingbineirongplus', 'pingbilouzhu', 'zhanxianlouzhu', 'pingbilouzhuplus']
@@ -6603,8 +6603,8 @@ console.log('========================================\n');
     assertEqual(_normalizeReInput('a\u200Bb\uFEFFc'), 'abc', '_normalizeReInput(\'a\\u200Bb\\uFEFFc\') 应等于 \'abc\'')
   })
 
-  // ==================== 90. 死代码检测(可达性) ====================
-  console.log('\n📂 90. 死代码检测')
+  // ==================== 94. 死代码检测(可达性) ====================
+  console.log('\n📂 94. 死代码检测')
 
   await test('可达性: 全部导出被测试引用', () => {
     const mod = require('./xbk_function_v3.js')
@@ -6645,8 +6645,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 90b. 断言鉴别力 ====================
-  console.log('\n📂 90b. 断言鉴别力')
+  // ==================== 95. 断言鉴别力 ====================
+  console.log('\n📂 95. 断言鉴别力')
 
   // C5-019：字面恒真断言（assertEqual(true,true) / assert.ok(true) / assert(true)）永远不会失败——
   // 把「不会红」当断言，只给报告凑断言数。这里做源码级零容忍：新增一处即红。
@@ -6677,8 +6677,8 @@ console.log('========================================\n');
       '字面恒真断言零鉴别力（永远不会红），改成 assert.doesNotThrow / 真值断言：' + hits.join(', '))
   })
 
-  // ==================== 91. Unicode 深度测试 ====================
-  console.log('\n📂 91. Unicode 深度测试')
+  // ==================== 96. Unicode 深度测试 ====================
+  console.log('\n📂 96. Unicode 深度测试')
 
   await test('Unicode: emoji 代理对在解码/格式化/判重中正常', () => {
     assertEqual(decodeHtmlEntities('&#128512;'), '😀', 'decodeHtmlEntities(\'&#128512;\') 应等于 \'😀\'') // emoji 解码
@@ -6757,8 +6757,8 @@ console.log('========================================\n');
     assertEqual(truncateUtf16('😀😀中文', 4), '😀😀', 'truncateUtf16(\'😀😀中文\', 4) 应等于 \'😀😀\'')
   })
 
-  // ==================== 92. 故障注入(fs错误) ====================
-  console.log('\n📂 92. 故障注入')
+  // ==================== 97. 故障注入(fs错误) ====================
+  console.log('\n📂 97. 故障注入')
 
   await test('故障注入: fs.writeFileSync 抛错 → saveMessages 不崩溃', () => {
     const fs = require('fs')
@@ -6950,8 +6950,8 @@ console.log('========================================\n');
     assert.doesNotThrow(() => saveBatch([circular], 'test_circular.json'), 'saveBatch 循环引用应容错，不得抛')
   })
 
-  // ==================== 93. 深度嵌套压力 ====================
-  console.log('\n📂 93. 深度嵌套压力')
+  // ==================== 98. 深度嵌套压力 ====================
+  console.log('\n📂 98. 深度嵌套压力')
 
   await test('压力: 100层嵌套HTML不崩不卡', () => {
     const deep = '<div>'.repeat(100) + '最深层' + '</div>'.repeat(100)
@@ -6969,8 +6969,8 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(c.pingbilouzhu, '关键词50', '其他'), false, 'matchesCompiled(c.pingbilouzhu, \'关键词50\', \'其他\') 应等于 false')
   })
 
-  // ==================== 94. 兼容性/契约/一致性 ====================
-  console.log('\n📂 94. 兼容性/契约/一致性')
+  // ==================== 99. 兼容性/契约/一致性 ====================
+  console.log('\n📂 99. 兼容性/契约/一致性')
 
   await test('兼容: 旧格式缓存(无timestamp/缺字段)读入不崩', () => {
     const fs = require('fs')
@@ -7029,8 +7029,8 @@ console.log('========================================\n');
     assertEqual(JSON.stringify(mem), JSON.stringify(disk), '多轮后仍一致')
   })
 
-  // ==================== 95. ReDoS 防护(灾难性回溯) ====================
-  console.log('\n📂 95. ReDoS 防护(灾难性回溯)')
+  // ==================== 100. ReDoS 防护(灾难性回溯) ====================
+  console.log('\n📂 100. ReDoS 防护(灾难性回溯)')
 
   // 95-1. hasNestedQuantifier 检测正确性
   await test('ReDoS: hasNestedQuantifier 命中嵌套量词模式', () => {
@@ -7090,8 +7090,8 @@ console.log('========================================\n');
     assertEqual(Date.now() - t0 < PERF_REDOS_LIMIT, true, '嵌套量词配置不应卡死')
   })
 
-  // ==================== 96. 一致性修复(配置解析口径) ====================
-  console.log('\n📂 96. 一致性修复(配置解析口径)')
+  // ==================== 101. 一致性修复(配置解析口径) ====================
+  console.log('\n📂 101. 一致性修复(配置解析口径)')
 
   await test('一致性: validateConfig \\r 分隔与 _splitLines 口径一致', () => {
     // \r 单独分隔多行：compileRules 拆 2 行，validateConfig 不应误报"多个 ###"
@@ -7135,8 +7135,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 97. 官方 got 客户端直测(本地 server) ====================
-  console.log('\n📂 97. 官方 got 客户端直测')
+  // ==================== 102. 官方 got 客户端直测(本地 server) ====================
+  console.log('\n📂 102. 官方 got 客户端直测')
 
   await test('got: 302 重定向跟随 + JSON 解析', async () => {
     const http = require('http')
@@ -7339,8 +7339,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 98. 异常路径批量(类型/网络边界) ====================
-  console.log('\n📂 98. 异常路径批量')
+  // ==================== 103. 异常路径批量(类型/网络边界) ====================
+  console.log('\n📂 103. 异常路径批量')
 
   await test('异常: 未知占位符 {不存在} 保留原文', () => {
     assertEqual(tuisong_replace('x{不存在}y', { title: 'T' }), 'x{不存在}y', '未知占位符应保留')
@@ -7435,8 +7435,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 99. 边界精确值(锁定行为) ====================
-  console.log('\n📂 99. 边界精确值')
+  // ==================== 104. 边界精确值(锁定行为) ====================
+  console.log('\n📂 104. 边界精确值')
 
   await test('边界: TS_BOUND(1e11) 精确分界行为锁定', () => {
     // 10 位秒(2001年)→正常天数
@@ -7480,7 +7480,7 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('&#0;'), '', 'NUL过滤')
   })
 
-  console.log('\n📂 100. 审查项 #56/#65/#7')
+  console.log('\n📂 105. img 空 src / 换行 url / maxSize 校验归属')
 
   await test('#56: img 空 src / 纯空白 src → 不生成 ![]() 空图片', () => {
     const r1 = htmlToMarkdown({ content_html: '<img src="">', url: 'http://x' })
@@ -7524,7 +7524,7 @@ console.log('========================================\n');
     assertEqual(tuisong_replace('{链接}', { title: 't' }), '', 'tuisong_replace(\'{链接}\', { title: \'t\' }) 应等于 \'\'')
   })
 
-  console.log('\n📂 101. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）')
+  console.log('\n📂 106. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）')
 
   await test('版本一致性：文件头版本号与 CHANGELOG 最新一致', () => {
     const fs = require('fs')
@@ -7559,7 +7559,7 @@ console.log('========================================\n');
   // v3.169：README 不再维护版本号（避免每次发布手动同步的过时源）——版本一致性收敛为
   // 文件头 ↔ CHANGELOG 最新 ↔ package.json ↔ package-lock 根元数据 四方自动校验；README 的版本信息指向 package.json/CHANGELOG
 
-  console.log('\n📂 102. 配置防御（v3.80）')
+  console.log('\n📂 107. 配置防御（v3.80）')
 
   await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', () => {
     const orig = Config.cache.dir
@@ -7657,7 +7657,7 @@ console.log('========================================\n');
     assertEqual(Config.push.parallelLimit, 10, 'push.parallelLimit 默认')
   })
 
-  console.log('\n📂 103. 随机输入冒烟（Fuzz，固定 seed 确定性）')
+  console.log('\n📂 108. 随机输入冒烟（Fuzz，固定 seed 确定性）')
   // C4-011：LCG 伪随机此前被逐字复制 26 份（19 份单行 + 7 份三行），改算法/模数要改 26 处、
   // 漏一处就让「固定 seed ⇒ 跨运行一致」的 fuzz 用例静默分叉。收敛到 makeRand 之后，
   // 本断言把「只剩一处实现」变成门禁：谁再复制一份即红（prnd 是 `& 0x7fffffff` 的另一序列，另算）。
@@ -7758,8 +7758,8 @@ console.log('========================================\n');
     assertEqual(r2.includes('http://x.com/ok'), true, '正常 url 不受影响')
   })
 
-  // ==================== 103. R1 低风险修复锁定（v3.105 不推版本） ====================
-  console.log('\n📂 103. 低风险修复批次锁定（R1-R6/R9：truncate/getFileName/splitLines/domain/maxSize/retry/原型键/url/title）')
+  // ==================== 109. R1 低风险修复锁定（v3.105 不推版本） ====================
+  console.log('\n📂 109. 低风险项锁定（truncate/getFileName/splitLines/domain/maxSize/retry/原型键/url/title）')
 
   await test('truncateUtf16: 非法 max(undefined/NaN/0/负数) 不截断（R1）', () => {
     assertEqual(truncateUtf16('abc', undefined), 'abc', 'undefined 不截断')
@@ -7881,7 +7881,7 @@ console.log('========================================\n');
 
   // ================================================
 
-  console.log('\n📂 104. 深度 Fuzz（全导出扫描 + 不变量 Property Tests）')
+  console.log('\n📂 110. 深度 Fuzz（全导出扫描 + 不变量 Property Tests）')
 
   await test('Fuzz-深度: 扩展随机值生成器（Symbol/函数/BigInt/Date/RegExp/循环/Proxy）', () => {
     // 固定 seed，确定性
@@ -8044,7 +8044,7 @@ console.log('========================================\n');
     assertEqual(truncateUtf16(emojiHuge, 300).length <= 300, true, '超长 emoji 截断不崩')
   })
 
-  console.log('\n📂 105. Fuzz 回归锁定（嵌套 Symbol 数组全 API 防御）')
+  console.log('\n📂 111. Fuzz 回归锁定（嵌套 Symbol 数组全 API 防御）')
 
   await test('Fuzz 回归: 嵌套 Symbol 数组输入 16 个 API 不崩（v3.108）', () => {
     const symArr = [Symbol('x')]
@@ -8078,7 +8078,7 @@ console.log('========================================\n');
   })
 
   console.log('\n========================================')
-  console.log('\n📂 106. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）')
+  console.log('\n📂 112. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）')
 
   await test('Property-2: truncateUtf16 单调性（max 更大 → 输出不更短）', () => {
     const rand = makeRand(314159)
@@ -8247,7 +8247,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 107. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）')
+  console.log('\n📂 113. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）')
 
   await test('Property-3: daysComputed 单调性（更早日期 → 天数不更小）', () => {
     const rand = makeRand(112358)
@@ -8406,7 +8406,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 108. Fuzz 回归二（孤立代理清洗）')
+  console.log('\n📂 114. Fuzz 回归二（孤立代理清洗）')
 
   await test('Fuzz 回归: 孤立代理 → tuisong_replace 输出 U+FFFD 且 encode 不崩（v3.110）', () => {
     const cases = ['a\ud800b', 'a\udfff b', '😀\ud800', '\udfff😀', '正常文本😀🎉', '&amp;\ud800&lt;']
@@ -8429,7 +8429,7 @@ console.log('========================================\n');
     assertEqual(out.includes('😀'), true, '完整代理对保留')
   })
 
-  console.log('\n📂 109. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）')
+  console.log('\n📂 115. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）')
 
   await test('Fuzz-过滤: 随机 filter 配置 × 随机数据 → listfilter 不崩且返回 boolean', () => {
     const rand = makeRand(20261201)
@@ -8608,7 +8608,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 110. 边界精确值二（官方 got 响应体/getFilePath 200 字节/跨日边界）')
+  console.log('\n📂 116. 边界精确值二（官方 got 响应体/getFilePath 200 字节/跨日边界）')
 
   await test('边界: 官方 got 响应体精确读取', async () => {
     const http = require('http')
@@ -8674,7 +8674,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 111. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）')
+  console.log('\n📂 117. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）')
 
   await test('时区回归: 数字形态字符串无效(v3.142: 字符串-1曾宿主解析成2001)', () => {
     // 数字形态字符串（负号/小数）应无效——与数字 -1/2026.5 一致（审查5-2 精神）
@@ -8729,7 +8729,7 @@ console.log('========================================\n');
     assertEqual(normUrl('http://x.com/'), 'http://x.com', '尾斜杠去除')
   })
 
-  console.log('\n📂 112. saveBatch 索引化：判重一致性 + 性能基准')
+  console.log('\n📂 118. saveBatch 索引化：判重一致性 + 性能基准')
 
   await test('统一 URL 身份：伪 URL/危险 URL 不参与判重，脏 URL 走匿名身份', () => {
     const fs = require('fs')
@@ -8942,7 +8942,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 113. saveBatch 索引化强化验证（脏缓存/多批/同键多条 vs 旧逻辑）')
+  console.log('\n📂 119. saveBatch 索引化强化验证（脏缓存/多批/同键多条 vs 旧逻辑）')
 
   await test('一致性-强化: 30 轮随机（脏缓存+多批+同键多条）索引版 vs 旧 findIndex 逻辑', () => {
     // 旧逻辑精确复刻 _findDedupIndex（findIndex 顺序语义）——作为对照基准
@@ -9014,8 +9014,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 100. v3.156 配置空白/normUrl/更新日志修复 ====================
-  console.log('\n📂 100. v3.156 修复')
+  // ==================== 120. v3.156 配置空白/normUrl/更新日志修复 ====================
+  console.log('\n📂 120. v3.156 修复')
 
   await test('空白 pingbibiaoti → 编译为 null + validateConfig 警告（#1/#6）', () => {
     const c = compileRules({ pingbibiaoti: '   ' })
@@ -9066,8 +9066,8 @@ console.log('========================================\n');
     unlinkQuiet(p)
   })
 
-  // ==================== 101. v3.157 修复 ====================
-  console.log('\n📂 101. v3.157 修复')
+  // ==================== 121. v3.157 修复 ====================
+  console.log('\n📂 121. v3.157 修复')
 
   await test('anonKey 字段差异不合并（#2/41）', () => {
     const k1 = anonKey('同标题', '同内容', null, null, 'pic1', '京东', '9.9', 'A牌', '分类')
@@ -9146,7 +9146,7 @@ console.log('========================================\n');
   })
 
   // ==================== C002：sanitizeDecodedHtml ReDoS/性能 ====================
-  console.log('\n📂 C002 sanitizeDecodedHtml ReDoS/性能')
+  console.log('\n📂 122. C002 sanitizeDecodedHtml ReDoS/性能')
 
   await test('sanitizeDecodedHtml 正常 <script>...</script> 被移除', () => {
     assertEqual(sanitizeDecodedHtml('a<script>alert(1)</script>b'), 'ab', 'sanitizeDecodedHtml(\'a<script>alert(1)</script>b\') 应等于 \'ab\'')
@@ -10590,7 +10590,7 @@ console.log('========================================\n');
   // 目标：_now 单调时钟(v3.251/253)、_memoSet LRU(v3.260)、
   //       _contentChangedIgnoringTs(v3.156)、墓碑身份应用/索引、_localStamp
   // ============================================================
-  console.log('\n📂 补测：单调时钟 / 内存缓存 LRU / 判重深排 / 墓碑身份')
+  console.log('\n📂 123. 补测：单调时钟 / 内存缓存 LRU / 判重深排 / 墓碑身份')
 
   await test('P4 _now 同毫秒连续调用严格单调递增（v3.251/253 时钟回拨修复）', () => {
     MessageStore._nowLastTs = undefined
@@ -10758,7 +10758,7 @@ console.log('========================================\n');
   // 目标：_findDedupIndex、_indexHasIdentity、_evictOldestKeys、
   //       _evictTombstonesToSize、_trimTombstoneMaps、_cloneTombstones、_readTombstoneData
   // ============================================================
-  console.log('\n📂 补测 2：判重索引 / 墓碑淘汰 / 墓碑读取')
+  console.log('\n📂 124. 补测 2：判重索引 / 墓碑淘汰 / 墓碑读取')
 
   await test('P4 _findDedupIndex 统一判重：四类身份命中/未命中与防御', () => {
     assertEqual(MessageStore._findDedupIndex(null, { id: 1 }), -1, '非数组应返回 -1')
@@ -10885,7 +10885,7 @@ console.log('========================================\n');
   // 目标：_writeState、_writeTextAtomic、_readSafeState、
   //       _sendAlert(v3.251 lastAt 校验)、_warnLowDisk、_updateReport
   // ============================================================
-  console.log('\n📂 补测 3：状态读写 / 告警限频 / 日报更新')
+  console.log('\n📂 125. 补测 3：状态读写 / 告警限频 / 日报更新')
 
   await test('P4 _writeState 类型守卫：非对象/数组拒绝，合法对象原子落盘', () => {
     const fp = getFilePath('test_state_write.json')
@@ -11051,7 +11051,7 @@ console.log('========================================\n');
   // 补测 4：num 数值配置解析 + _upsert 统一更新/追加
   // 目标：num（导出零直接测试）、_upsert 防御分支/判重/墓碑拦截（v3.245 P1）
   // ============================================================
-  console.log('\n📂 补测 4：num 数值配置解析 / _upsert 统一更新')
+  console.log('\n📂 126. 补测 4：num 数值配置解析 / _upsert 统一更新')
 
   await test('P4 num 数值配置解析：脏类型回退默认、有效数字/数字串保留', () => {
     assertEqual(num(undefined), undefined, 'undefined 应回退默认')
@@ -11189,7 +11189,7 @@ console.log('========================================\n');
   //   ④ whitelistFilter 非字符串字段值统一 String() 口径（与 matchesCompiled 同源）
   // 本区块为文末追加，不改动上方任何既有断言。
   // ============================================================
-  console.log('\n📂 补测：xbk_filter 形状守卫 / 编译失败告警 / 非字符串值口径')
+  console.log('\n📂 127. 补测：xbk_filter 形状守卫 / 编译失败告警 / 非字符串值口径')
 
   const { createFilterEngine: _createFilterEngine } = require('./xbk_filter')
   // 直测 xbk_filter 内部 _passIfMissing（主入口未导出 FilterEngine，故就地构造最小引擎）
@@ -11602,7 +11602,7 @@ console.log('========================================\n');
   // ==================== 测试代码卫生（源码级门禁） ====================
   // 这一节的门禁读本文件源码：被测对象是「测试代码本身」的卫生，运行期行为看不出来。
   // 判据一律先自检（证明 detector 能认出坏样本）再扫源码，否则门禁会退化成恒绿。
-  console.log('\n📂 测试代码卫生')
+  console.log('\n📂 128. 测试代码卫生')
 
   const hygieneLines = () => require('fs').readFileSync(__filename, 'utf8').split('\n')
   const isCommentLine = (ln) => {
@@ -11738,6 +11738,21 @@ console.log('========================================\n');
     const hits = countAssertWithoutMsg(parseHygiene())
     assertEqual(hits.length, 0,
       `assertEqual 缺失败说明（失败报告只剩 期望=x/实际=y，多断言用例无法定位）：第 ${hits.slice(0, 20).join(', ')} 行${hits.length > 20 ? ` 等 ${hits.length} 处` : ''}`)
+  })
+
+  await test('C4-025: 分节编号按文件顺序 1..N 连续，标题按内容命名', () => {
+    const secs = []
+    hygieneLines().forEach((ln, i) => {
+      const m = ln.match(/^\s*console\.log\('(?:\\n)?📂 (\d+)\. (.+)'\)\s*$/)
+      if (m) secs.push({ line: i + 1, num: Number(m[1]), title: m[2] })
+    })
+    // 下限自检：扫不到标题说明判据坏了（门禁会恒绿），不是「文件里没问题」
+    assertEqual(secs.length > 100, true, `应能扫到全部分节标题，实际 ${secs.length} 个（<100 说明扫描规则失效）`)
+    const bad = []
+    secs.forEach((s, i) => { if (s.num !== i + 1) bad.push(`第 ${s.line} 行编号 ${s.num} 应为 ${i + 1}`) })
+    const ROUND = /审查|复审|轮次|批次|第\s*\d+\s*[-–~]?\s*\d*\s*(轮|批)/
+    secs.forEach(s => { if (ROUND.test(s.title)) bad.push(`第 ${s.line} 行标题仍按轮次/批次/审查命名：${s.title}`) })
+    assertEqual(bad.length, 0, '分节编号必须按文件顺序 1..N 连续、标题按内容命名：' + bad.slice(0, 8).join('；'))
   })
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
