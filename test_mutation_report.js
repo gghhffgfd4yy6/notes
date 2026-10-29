@@ -2184,7 +2184,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     // 反向对账：矩阵里的 console 段必须与常量里的 console 段一一对应——段数不写死，但「矩阵少一段」
     // 与「常量少一段」都得红（只靠上面的正向循环，漏掉的段永远不会被点名）。
     assert.deepStrictEqual([...map.keys()].filter((seg) => /^console-part\d+$/.test(seg)).sort(byCodeUnit),
-      [...CONSOLE_SEGMENTS].sort(),
+      [...CONSOLE_SEGMENTS].sort(byCodeUnit),
       '矩阵里的 console 段必须与 EXPECTED_SEGMENTS 的 console 段一一对应（段数由常量推导，不写死数字）')
     assert.strictEqual(map.get('v3-entry'), DEFAULT_SEGMENT_TIMEOUT_MS,
       '未声明 timeout_ms 的段必须回落 300000（与 GitHub 表达式 matrix.timeout_ms || 300000 同口径）')
