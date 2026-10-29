@@ -5223,18 +5223,22 @@ async function main () {
       assert.strictEqual(trig.status, 202, '触发必须受理')
       assert.strictEqual(fs.existsSync(lockFile), true, '触发后锁文件必须存在')
       await new Promise(resolve => setTimeout(resolve, 150))
-      // Sourcery #225 M6：SIGTERM 前无法直接观测孙进程（--check 在控制台进程内 spawn），
-      // 用退出延迟区分「杀掉子进程走 close 收尾」（毫秒级）与「子进程没死、3s 看门狗
-      // 强退」（≥3s）——若关停逻辑不再杀子进程，此断言必红。
-      const killAt = Date.now()
+      // C5-018：这里原先还有一条 `shutdownMs < 2800`，用退出延迟当「没走 3s 关停看门狗」的
+      // 代理。两个问题：① 余量只有 200ms，小于 quality job 8 路并发的抖动，机器慢时无代码改动
+      // 也红；② 它测不到真契约——`--check` 子进程 0.2s 就退场了（实测），SIGTERM 时手上常常
+      // 根本没有在跑的子进程，杀不杀子进程都很快退出。墙钟判据在这里整体删掉，只留下面
+      // 「8s 内必须退出且退出码 0」（这条上界只是防挂死，不表达性能契约，失败文案也这么写）；
+      // 「关停必须真的杀在跑的子进程」改由事件序用例
+      // 「C5-018 关停必须真的杀掉在跑子进程」守——不读毫秒，读子进程的 exit signal。
       child.kill('SIGTERM')
       const code = await new Promise(resolve => {
+        // 8s 只是「不许挂死」的上界：关停自身有 3s 看门狗 + 1s 强退兜底，正常路径毫秒级。
         const to = setTimeout(() => resolve('timeout'), 8000)
         child.on('exit', (c) => { clearTimeout(to); resolve(c) })
       })
-      const shutdownMs = Date.now() - killAt
-      assert.ok(shutdownMs < 2800, `关停耗时 ${shutdownMs}ms ≥ 2800ms：疑似走了 3s 看门狗（子进程未被杀）\n${out.slice(-400)}`)
-      assert.strictEqual(code, 0, `SIGTERM 后必须 0 退出（实际 ${code}）\n${out.slice(-400)}`)
+      assert.strictEqual(code, 0, `SIGTERM 后必须 8s 内以 0 退出（实际 ${code}，timeout = 关停挂死）\n${out.slice(-400)}`)
+      // 结构性判据：关停横幅必须出现（走的是 SIGTERM 的 shutdown 序列，不是异常退出）。
+      assert.ok(out.includes('收到 SIGTERM，关闭控制台'), `必须走 SIGTERM 关停序列：${out.slice(-400)}`)
       const frame = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
       assert.strictEqual(frame.released, true, '退出后锁帧必须为 released（原地产出，不靠外部清理）')
     } catch (e) {
@@ -5244,6 +5248,35 @@ async function main () {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+  // C5-018：「关停必须杀掉在跑子进程」的判据不能是毫秒——e2e 里的 --check 子进程 0.2s
+  // 就退场了，SIGTERM 时手上常常没有活着的子进程，于是「杀 / 不杀」都很快退出（旧判据
+  // shutdownMs < 2800 实测对「摘掉 kill 循环」仍然全绿）。这里直接调关停序列，注入一个
+  // 长命子进程（activeChildren 是 createConsole 显式暴露给测试的注册表），只读事件：
+  // 子进程必须收到 SIGKILL、onExit 必须在它退出之后才被调用。
+  await aok('C5-018 关停必须真的杀掉在跑子进程（事件序判据，不读墙钟毫秒）', async () => {
+    const { server, activeChildren, wireGracefulShutdown } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    await listen(server)
+    const longChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    // 先等它真的起来：否则「exit signal」可能来自 spawn 失败，而不是关停的 SIGKILL。
+    await new Promise((resolve, reject) => {
+      longChild.once('spawn', resolve)
+      longChild.once('error', reject)
+    })
+    activeChildren.add(longChild)
+    const order = []
+    const exited = new Promise((resolve) => longChild.once('exit', (code, signal) => { order.push('child-exit'); resolve(signal) }))
+    // registerSignal 注入空函数：不要给测试进程装真的 SIGTERM handler。
+    const { shutdown } = wireGracefulShutdown({ onExit: (code) => order.push(`onExit:${code}`), registerSignal: () => {} })
+    shutdown('SIGTERM')
+    assert.strictEqual(await exited, 'SIGKILL', '关停必须对在跑子进程发 SIGKILL（不是等它自然结束）')
+    // 事件序是「不是 3s 看门狗强退」的结构判据：看门狗那条路会在子进程还活着时就退出进程
+    // （onExit 先于 child-exit 出现），而正常路径必须等子进程收齐才收尾（锁释放挂在 close 上）。
+    const deadline = Date.now() + 2000
+    while (order.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.deepStrictEqual(order, ['child-exit', 'onExit:0'],
+      `子进程死后才允许收尾，且只收尾一次（实际 ${JSON.stringify(order)}）`)
+  })
+
   await aok('HTTP: /trigger 落盘失败 → 500 且可立即重试（回归 Sourcery #225 M2：pending 条目必须回滚）', async () => {
     const dir = tmpDir()
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
