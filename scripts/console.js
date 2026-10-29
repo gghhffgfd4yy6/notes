@@ -1659,6 +1659,14 @@ function conditionalVariant (req) {
   return raw.slice(0, qAt) + (params.length > 0 ? '?' + params.join('&') : '')
 }
 
+// 异常兜底的最小可诊断日志（C2-004）：`.catch(() => …)` 会把未预期异常（TypeError 等）压成一个
+// 500，既无栈也无线索。这里只记「站点标签 + e.message」——不打印整个 e（展开可能带请求上下文），
+// 也不含请求体/查询串/凭证，所以可以安全落到 journald。label 由各调用点写死，便于 grep 定位。
+function logCaught (label, e) {
+  const message = e && typeof e.message === 'string' ? e.message : String(e)
+  console.error(`⚠️ 控制台端点异常（${label}）：${message.slice(0, 300)}`)
+}
+
 function sendJson (res, code, obj) {
   // 压缩统一在边缘（Caddy 的 encode 片段）完成：本进程只发 identity，不再自带协商/压缩。
   // 反代已经把 Accept-Encoding 摘掉（header_up -Accept-Encoding），Node 侧压缩在现网
@@ -3704,7 +3712,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
         sendJson(res, 202, { id: record.id, action, label: record.label })
       })
-      .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      .catch((e) => { logCaught('trigger/readBody', e); sendJson(res, 500, { error: '读取请求体失败' }) })
   }
 
   // ── 过滤规则控制面（规格 §3/§4；计划 §3.3）──────────────────────────────
@@ -3922,7 +3930,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return
       }
       sendJson(res, 200, { ok: true, revision: baseRevision, savedAt: payload.savedAt })
-    }).catch(() => sendJson(res, 500, { ok: false, error: 'write_failed', code: 'write_failed' }))
+    }).catch((e) => {
+      logCaught('filter/draft-save', e)
+      sendJson(res, 500, { ok: false, error: 'write_failed', code: 'write_failed' })
+    })
   }
   const handleFilterDraftDelete = (req, res) => {
     if (!clearFilterDraftFile()) {
@@ -4074,7 +4085,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         'Cache-Control': 'no-store'
       })
       res.end(bodyText)
-    }).catch(() => sendJson(res, 500, { error: '导出失败' }))
+    }).catch((e) => { logCaught('backup/export', e); sendJson(res, 500, { error: '导出失败' }) })
   }
   const handleBackupImport = (req, res) => {
     readBody(req, BACKUP_MAX_BYTES).then(({ body, over, aborted }) => {
@@ -4375,7 +4386,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (filterLock) releaseFilterLock(filterLock)
         releaseLockFor({ _stateDir: stateDir, _lockToken: lockToken })
       }
-    }).catch(() => sendJson(res, 500, { error: '导入失败' }))
+    }).catch((e) => { logCaught('backup/import', e); sendJson(res, 500, { error: '导入失败' }) })
   }
 
   // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer / ?token= 均可）。
@@ -4530,7 +4541,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       } finally {
         releaseFilterLock(lock)
       }
-    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+    }).catch((e) => {
+      logCaught('filter/save', e)
+      sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
+    })
   }
 
   // POST /api/config/filter/validate：只预检，不取锁、不落盘。
@@ -4546,7 +4560,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       if (!result.ok) { respondValidationFailure(res, result); return }
       sendJson(res, 200, { ok: true, warnings: [], wideMatch: result.wideMatch })
-    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+    }).catch((e) => {
+      logCaught('filter/validate', e)
+      sendJson(res, 500, { error: 'validate_failed', code: 'validate_failed' })
+    })
   }
 
   // POST /api/config/filter/preview：候选规则对 push.json 中 _f===true 记录试算补推数。
@@ -4647,7 +4664,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         cacheStatus: read.status,
         zktApplied
       })
-    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+    }).catch((e) => {
+      logCaught('filter/preview', e)
+      sendJson(res, 500, { error: 'preview_failed', code: 'preview_failed' })
+    })
   }
 
   // POST /api/config/filter/restore：备份回滚或恢复代码默认——两者都写 revision+1 的覆盖文件。
@@ -4781,7 +4801,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       } finally {
         releaseFilterLock(lock)
       }
-    }).catch(() => sendJson(res, 500, { error: 'write_failed', code: 'write_failed' }))
+    }).catch((e) => {
+      logCaught('filter/restore', e)
+      sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
+    })
   }
 
   // 写端点入口：Bearer-only 闸 → 媒体类型 → 按固定路径分派。
@@ -5163,7 +5186,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           max: LINE_WATCH_MAX_WORDS
         })
       })
-      .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      .catch((e) => { logCaught('line-watch/write', e); sendJson(res, 500, { error: '读取请求体失败' }) })
   }
 
   // ── v3.371 关注词定时监控 ────────────────────────────────────────────────
@@ -5415,7 +5438,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         res.setHeader('Cache-Control', 'no-store')
         res.writeHead(303, { Location: '/' })
         res.end()
-      }).catch(() => sendJson(res, 400, { error: '登录请求读取失败' }))
+      }).catch((e) => { logCaught('login', e); sendJson(res, 400, { error: '登录请求读取失败' }) })
       return
     }
     // 两步验证闸（v3.357）：只拦浏览器页面，不拦 API/静态资产。访问令牌正确但还没过
@@ -5688,7 +5711,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     // ── v3.370 线报全站搜索 / 关注词（只读代理 + 本机关注词文件）─────────────
     if (req.method === 'GET' && url.pathname === '/api/line-search') {
-      handleLineSearch(req, res, url).catch(() => {
+      handleLineSearch(req, res, url).catch((e) => {
+        logCaught('line-search', e)
         if (!res.headersSent) sendJson(res, 200, { status: 'upstream_error', error: '线报酷搜索暂不可用，稍后再试' })
       })
       return
@@ -5785,7 +5809,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           res.writeHead(200, head)
           res.end(Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(buildMessagesCsv(rows), 'utf8')]))
         })
-        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+        .catch((e) => { logCaught('messages/export', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/trends') {
@@ -6042,7 +6066,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
         res.setHeader('Cache-Control', 'no-store')
         sendJson(res, 200, { enabled: true, recoveryCodes, recoveryRemaining: recoveryCodes.length })
-      }).catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      }).catch((e) => { logCaught('2fa/enable', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/2fa/disable') {
@@ -6096,7 +6120,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         clearLoginFailures(req)
         res.setHeader('Set-Cookie', [clearTwoFactorCookieHeader(req), clearDeviceCookieHeader()])
         sendJson(res, 200, { enabled: false })
-      }).catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+      }).catch((e) => { logCaught('2fa/disable', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     // 服务器端自动正式运行：状态/开关/间隔。GET 走全局鉴权；POST 只认 Bearer（写面防 CSRF）。
@@ -6151,7 +6175,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           }
           sendJson(res, 200, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
         })
-        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+        .catch((e) => { logCaught('auto/config', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     // ── v3.340 控制台设置：通知自检的重复提交拦截窗（配置页可读写）──────────────
@@ -6257,7 +6281,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             settings: { notifyTestReplayWindowS: next.notifyTestReplayWindowS, syncShowDate: next.syncShowDate }
           })
         })
-        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+        .catch((e) => { logCaught('console/settings', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     if (req.method === 'POST' && url.pathname === '/trigger') {
@@ -6401,7 +6425,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             outputTotalLength: record.outputTotalLength
           })
         })
-        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+        .catch((e) => { logCaught('runs/detail', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     // POST /api/runs/cancel（v3.299 批次②）：停止运行中的触发任务。body: id=...，
@@ -6478,7 +6502,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (typeof record._cancelTimer.unref === 'function') record._cancelTimer.unref()
           sendJson(res, 202, { id: record.id, action: record.action, cancelled: true })
         })
-        .catch(() => sendJson(res, 500, { error: '读取请求体失败' }))
+        .catch((e) => { logCaught('runs/cancel', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
     }
     const runMatch = /^\/api\/runs\/(\d{13,}\.\d{1,10})$/.exec(url.pathname)

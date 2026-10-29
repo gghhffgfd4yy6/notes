@@ -86,6 +86,8 @@ const {
   filterLockIdentity,
   claimStaleFilterLock,
   runtimeFilterDeps,
+  // C2-004：注入「校验期抛错」的引擎，钉住异常兜底 catch 的错误码与日志
+  setFilterDepsForTests,
   // v3.357 两步验证：TOTP/恢复码/Cookie/配置读取
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
@@ -1721,6 +1723,59 @@ async function filterRuleApiTests () {
     } finally {
       try { fs.rmdirSync(paths.file) } catch (e) { /* 已清理 */ }
       server.close()
+    }
+  })
+
+  // backlog b3 / C2-004：异常兜底 catch 此前对只读端点也回 write_failed（把「预检/试算失败」说成
+  // 「写盘失败」），且 `.catch(() => …)` 不接错误对象、不打日志 ⇒ TypeError 一类未预期异常只剩一个
+  // 500，排障无线索。这里钉两件事：错误码按端点语义区分（只读端点不得回 write_failed），且 catch
+  // 必须留一行带 e.message 的诊断日志（不含凭证）；真正的写端点仍回 write_failed。
+  await aok('过滤规则异常兜底: validate/preview 错误码分语义 + 留诊断日志（C2-004）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const caught = []
+    const realConsoleError = console.error
+    console.error = (...args) => { caught.push(args.map((a) => String(a)).join(' ')) }
+    // 注入「校验期就抛错」的引擎：validateCandidate 里的 hasNestedQuantifier 未包 try，异常会一路
+    // 冒到 handler 的 .catch——正是条目说的「未预期异常被压成 500」形态。
+    setFilterDepsForTests({
+      RuleEngine: {
+        hasNestedQuantifier: () => { throw new Error('boom-validate-engine') },
+        compileRules: () => ({})
+      },
+      compileUserRegex: () => null,
+      re2Available: true,
+      isRe2Available: () => true
+    })
+    try {
+      const payload = { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } }
+      const validateRes = await postFilterJson(port, '/api/config/filter/validate', payload)
+      assert.strictEqual(validateRes.status, 500)
+      const validateBody = JSON.parse(validateRes.text)
+      assert.strictEqual(validateBody.code, 'validate_failed', '只预检端点不得回 write_failed')
+      assert.strictEqual(validateBody.error, 'validate_failed')
+
+      const previewRes = await postFilterJson(port, '/api/config/filter/preview', payload)
+      assert.strictEqual(previewRes.status, 500)
+      const previewBody = JSON.parse(previewRes.text)
+      assert.strictEqual(previewBody.code, 'preview_failed', '只读试算端点不得回 write_failed')
+      assert.strictEqual(previewBody.error, 'preview_failed')
+
+      // 真正的写端点仍回 write_failed：改的是只读端点的语义，不是把写失败改名。
+      const saveRes = await postFilterJson(port, '/api/config/filter', payload)
+      assert.strictEqual(saveRes.status, 500)
+      assert.strictEqual(JSON.parse(saveRes.text).code, 'write_failed')
+
+      // 三个 catch 各留一行日志，且能定位到异常 message；日志不得夹带访问 token。
+      const joined = caught.join('\n')
+      assert.ok(joined.includes('boom-validate-engine'), `catch 必须记录 e.message：${joined.slice(0, 300)}`)
+      assert.ok(!joined.includes(TOKEN), '诊断日志不得包含访问 token')
+      assert.ok(caught.length >= 3, `三个失败请求各留一行日志（实际 ${caught.length}）`)
+    } finally {
+      setFilterDepsForTests(null)
+      console.error = realConsoleError
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
