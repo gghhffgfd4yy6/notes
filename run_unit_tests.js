@@ -62,7 +62,7 @@ try {
   if (e.code !== 'MODULE_NOT_FOUND') throw e
   console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
 }
-if (hostClean && hostClean.guardOrExit(process.env)) process.exit(1)
+if (hostClean && hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 
 const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
 // 拼错的条目会「静默不生效」（等于没跳过，重复跑且无人知道），因此必须在入口处炸出来。

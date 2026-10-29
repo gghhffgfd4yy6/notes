@@ -4,7 +4,7 @@
 
 // 直接执行（CI/pre-push）也必须先拦截残留进程和过期沙箱；变异评估子进程由 guard 自己按环境跳过。
 const hostClean = require('./scripts/check-host-clean.js')
-if (hostClean.guardOrExit(process.env)) process.exit(1)
+if (hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 
 // ============================================================
 // 直接测试 xbk_function_v3.js 里的 listfilter
@@ -11547,7 +11547,7 @@ console.log('========================================\n');
     assertEqual(hitLines.length, 1,
       `全文只允许 1 处 ${EXIT_CALL} 调用点（hostClean 预检守卫），实际 ${hitLines.length} 处：${JSON.stringify(hitLines)}`)
     assertEqual(hitLines[0] <= 20, true, `唯一调用点必须落在文件开头（:20 以内），实际第 ${hitLines[0]} 行`)
-    assertEqual(/hostClean\.guardOrExit\(/.test(lines[hitLines[0] - 1]), true,
+    assertEqual(/hostClean\.shouldAbortForDirtyHost\(/.test(lines[hitLines[0] - 1]), true,
       `第 ${hitLines[0]} 行不是 hostClean 预检守卫：${lines[hitLines[0] - 1].trim()}`)
     // 收尾区显式再钉一次：最后一个用例之后不得出现任何调用点；退出码仍走 process.exitCode
     const tail = code.slice(-800)

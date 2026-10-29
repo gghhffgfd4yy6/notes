@@ -27,10 +27,16 @@ check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
   const pkg = JSON.parse(read('package.json'))
   assert.strictEqual(pkg.scripts['check:host-clean'], 'node scripts/check-host-clean.js',
     'check:host-clean 必须指向 scripts/check-host-clean.js')
+  // C10-068：`guardOrExit` 名不符实（函数只返回布尔、从不 exit），调用方读起来语义相反 ⇒ 改名
+  // shouldAbortForDirtyHost（语义不变：返回 true = 调用方应中止本次运行）。
+  assert.strictEqual(typeof host.shouldAbortForDirtyHost, 'function',
+    '入口守卫必须叫 shouldAbortForDirtyHost：名字要说明它返回布尔而不是替调用方退出')
+  assert.strictEqual(host.guardOrExit, undefined,
+    '旧名 guardOrExit 必须删除：它承诺 exit、实际只返回布尔（C10-068）')
   for (const entry of ['run_tests.js', 'run_unit_tests.js']) {
     // 行首锚定真实调用行：只在注释里提一句不算接线
     const src = read(entry)
-    assert.match(src, /^if \(hostClean && hostClean\.guardOrExit\(process\.env\)\) process\.exit\(1\)$/m,
+    assert.match(src, /^if \(hostClean && hostClean\.shouldAbortForDirtyHost\(process\.env\)\) process\.exit\(1\)$/m,
       entry + ' 缺入口 guard：脏机器上跑出的红会被当成契约失败（v3.282 那轮 48/49 正是如此）')
     // 容错必须是「只放过 MODULE_NOT_FOUND」：最小工作树（RT-08 夹具只复制 run_tests.js）不得崩，
     // 但吞掉一切异常会让真故障伪装成「已检查且干净」。
@@ -40,7 +46,7 @@ check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
       entry + ' 跳过时必须响亮打印，不得静默通过')
   }
   const direct = read('test_filter.js')
-  assert.match(direct, /^if \(hostClean\.guardOrExit\(process\.env\)\) process\.exit\(1\)$/m,
+  assert.match(direct, /^if \(hostClean\.shouldAbortForDirtyHost\(process\.env\)\) process\.exit\(1\)$/m,
     '直接执行 test_filter.js（CI/pre-push）也必须先经过主机干净度检查')
 })
 
@@ -50,7 +56,7 @@ check('跳过必须响亮打印：guardOrExit 与 CLI 走同一条 ⏭ 分支（
   // ⇒ 在变异评估子进程里直接跑 CLI 反而打印「✅ 主机干净」。这两处都让「门禁没跑」不可见。
   const entry = path.join(__dirname, 'scripts/check-host-clean.js')
   const guardProbe = 'const h=require(' + JSON.stringify(entry) + ');' +
-    'const r=h.guardOrExit({XBK_MUTATION_CHILD:"1"});process.stdout.write("\\nRET="+String(r))'
+    'const r=h.shouldAbortForDirtyHost({XBK_MUTATION_CHILD:"1"});process.stdout.write("\\nRET="+String(r))'
   const guardRun = spawnSync(process.execPath, ['-e', guardProbe], {
     encoding: 'utf8',
     env: { ...process.env, XBK_MUTATION_CHILD: '1' }

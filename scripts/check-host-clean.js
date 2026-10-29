@@ -555,8 +555,10 @@ function main () {
   return 1
 }
 
-// 供 run_tests.js / run_unit_tests.js 入口调用：返回 true 表示应当中止本次运行
-function guardOrExit (env) {
+// 供 run_tests.js / run_unit_tests.js / test_filter.js 入口调用：返回 true 表示应当中止本次运行。
+// 名字即契约（C10-068）：它只**判断**并返回布尔，退出码由调用方决定（入口保留自己的处置权）；
+// 旧名 guardOrExit 承诺 exit 却从不 exit，读调用点时会得出相反语义，故改名。
+function shouldAbortForDirtyHost (env) {
   const r = inspect({ env: env || process.env })
   if (r.skipped) {
     // 跳过必须响亮打印（与 main 的 ⏭ 同一行，含 skip 原因）：三个生产入口只从这里拿到输出，
@@ -588,4 +590,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, activityMtimeMs, liveSandboxCwds, isActiveSandbox, shellQuote, rmSuggestion, inspect, guardOrExit }
+module.exports = { STALE_MS, TMP_ROOT, shouldSkipCheck, findStaleSandboxes, findOrphanStubs, findOrphanSuites, ancestorPids, activityMtimeMs, liveSandboxCwds, isActiveSandbox, shellQuote, rmSuggestion, inspect, shouldAbortForDirtyHost }
