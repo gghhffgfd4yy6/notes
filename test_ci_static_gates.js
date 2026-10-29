@@ -117,11 +117,12 @@ check('C5-013 判据模块可加载，5 个判定函数都是可调用函数', (
   assert.strictEqual(gate.decideToolMissing(true, false), 'fail', 'CI 缺工具必须 fail-closed')
 })
 
-check('C5-013 --selftest 已接线：20 条判据断言在套件内执行', () => {
+check('C5-013 --selftest 已接线：28 条判据断言在套件内执行', () => {
   // 此前 --selftest 全仓无人调用，是死代码；现在由本套件执行（run_tests 与 test.yml 都跑本套件）。
-  // b7 的 C10-004 追加 5 条 decideEmptyScan 断言（15 → 20），条数漂移仍须同步本守卫。
+  // b7 的 C10-004 追加 5 条 decideEmptyScan 断言（15 → 20）；C10-067 追加 8 条 decideCiEnv 断言
+  // （20 → 28）。条数漂移仍须同步本守卫。
   const n = gate.selftest()
-  assert.strictEqual(n, 20, `--selftest 必须执行 20 条断言（实际 ${n}）；增减须同步本守卫`)
+  assert.strictEqual(n, 28, `--selftest 必须执行 28 条断言（实际 ${n}）；增减须同步本守卫`)
 })
 
 check('C5-013 扫描面守卫：门禁真的会扫到 N 个 .githooks 文件（N>=2 且与磁盘一致）', () => {
