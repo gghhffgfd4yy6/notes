@@ -202,30 +202,35 @@ function selftest () {
   console.log('✅ check-doc-lines --selftest 全部通过（30 断言）')
 }
 
-function main () {
-  const argv = process.argv.slice(2)
-  if (argv.includes('--selftest')) {
+// C5-058：main 接受 (argv, opts)，以便被套件直接断言——argv 默认取 process.argv.slice(2)，
+// opts.root / opts.log 只供测试注入临时根与输出收集。CLI 形态（process.exit(main())）与判定
+// 行为一字未改：以前 main 与退出码零覆盖，把「有超限」分支改成永假，真实 CLI 打印着 75 行超限
+// 仍然输出「✅ 全部通过」并 exit 0，而套件全绿（判据恒返回 0 也抓不到）。
+function main (argv, opts) {
+  const args = argv || process.argv.slice(2)
+  const log = (opts && opts.log) || ((s) => console.log(s))
+  if (args.includes('--selftest')) {
     selftest()
     return 0
   }
-  const maxIdx = argv.indexOf('--max')
-  const max = maxIdx >= 0 ? Number(argv[maxIdx + 1]) : MAX_DOC_LINE
+  const maxIdx = args.indexOf('--max')
+  const max = maxIdx >= 0 ? Number(args[maxIdx + 1]) : MAX_DOC_LINE
   if (!Number.isInteger(max) || max <= 0) {
-    console.log('❌ --max 必须是正整数，实得 ' + JSON.stringify(argv[maxIdx + 1]))
+    log('❌ --max 必须是正整数，实得 ' + JSON.stringify(args[maxIdx + 1]))
     return 1
   }
-  const root = path.join(__dirname, '..')
+  const root = (opts && opts.root) || path.join(__dirname, '..')
   let files
   try {
     files = findMarkdownFiles(root)
   } catch (e) {
-    console.log('❌ ' + ((e && e.message) || String(e)))
-    console.log('   「扫描面不完整」不等于「全部通过」：与「空扫描面=红」「单文件读盘失败=红」同一条 fail-closed 口径')
+    log('❌ ' + ((e && e.message) || String(e)))
+    log('   「扫描面不完整」不等于「全部通过」：与「空扫描面=红」「单文件读盘失败=红」同一条 fail-closed 口径')
     return 1
   }
-  console.log('🔍 文档行长闸门：阈值 ' + max + ' 字符/行，扫描面 ' + files.length + ' 个 markdown')
+  log('🔍 文档行长闸门：阈值 ' + max + ' 字符/行，扫描面 ' + files.length + ' 个 markdown')
   if (decideEmptyScan(files.length) === 'fail') {
-    console.log('❌ 扫描面为空（一个 markdown 都没收集到）＝不可判定＝红；绝不把「没扫到」当「全绿」')
+    log('❌ 扫描面为空（一个 markdown 都没收集到）＝不可判定＝红；绝不把「没扫到」当「全绿」')
     return 1
   }
   let red = false
@@ -236,21 +241,21 @@ function main () {
     if (!r.ok) {
       red = true
       if (r.offenders.length === 0) {
-        console.log('❌ ' + rel + '：' + r.reason)
+        log('❌ ' + rel + '：' + r.reason)
       } else {
-        console.log('❌ ' + rel + '：' + r.offenders.length + ' 行超限（阈值 ' + max + '）')
+        log('❌ ' + rel + '：' + r.offenders.length + ' 行超限（阈值 ' + max + '）')
         for (const o of r.offenders.slice(0, 5)) {
-          console.log('   L' + o.line + ' = ' + o.len + ' 字符 → 按语义拆成子弹/表格（拆完跑逐字守恒核对）')
+          log('   L' + o.line + ' = ' + o.len + ' 字符 → 按语义拆成子弹/表格（拆完跑逐字守恒核对）')
         }
-        if (r.offenders.length > 5) console.log('   …另有 ' + (r.offenders.length - 5) + ' 行')
+        if (r.offenders.length > 5) log('   …另有 ' + (r.offenders.length - 5) + ' 行')
       }
     }
   }
   if (red) {
-    console.log('❌ 文档行长未通过：把超限的行拆开，不要调大阈值——阈值放宽=闸门形同虚设')
+    log('❌ 文档行长未通过：把超限的行拆开，不要调大阈值——阈值放宽=闸门形同虚设')
     return 1
   }
-  console.log('✅ 文档行长全部通过（' + files.length + ' 个文件，最长 ' + longest + ' 字符）')
+  log('✅ 文档行长全部通过（' + files.length + ' 个文件，最长 ' + longest + ' 字符）')
   return 0
 }
 
@@ -258,4 +263,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { MAX_DOC_LINE, isSkippedDir, findMarkdownFiles, scanOffenders, decideEmptyScan, checkOne }
+module.exports = { MAX_DOC_LINE, isSkippedDir, findMarkdownFiles, scanOffenders, decideEmptyScan, checkOne, main }

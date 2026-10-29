@@ -10,6 +10,9 @@
 //
 // 纯字符串/fs/进程内函数断言，不 spawn 子进程：与 test_ci_static_gates.js 同口径，本机与变异沙箱
 // 都能跑（AGENTS「本机验证盲区」登记的 execPath 子进程限制在此不适用，但保持同一纪律更稳）。
+// 唯一例外是 C5-058 的 CLI 退出码用例：`process.exit(main())` 的接线只能从进程外观察，故用
+// spawnSync(process.execPath, …) 各跑一次（--max 1 / 默认阈值，合计约 0.2s）。本套件在
+// test_suites.js 标 mutationSkip，不进变异沙箱，沙箱的 copyProject 缺 .githooks/ 限制与它无关。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -194,6 +197,64 @@ check('最长行不得用 spread 求（review #211：150k 行会让 Math.max(...
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
+})
+
+// C5-058：main() 与退出码此前零覆盖——把「有超限」分支改成永假，真实 CLI 明明打印了 75 行超限，
+// 结论仍是「✅ 文档行长全部通过」并 exit 0，而当时本套件全绿。下面用注入的临时根直接断言 main 的
+// 返回码与点名输出，再用一次真实 CLI 调用锁住 process.exit(main()) 的接线。
+check('main()：超长 md ⇒ 1 且点名文件；正常树 ⇒ 0；空扫描面 ⇒ 1；--max 非法 ⇒ 1', () => {
+  const os = require('node:os')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-docmain-'))
+  const logs = []
+  const run = (argv, root) => { logs.length = 0; return gate.main(argv, { root, log: (s) => logs.push(s) }) }
+  try {
+    // ① 正常树（短行）⇒ 0
+    fs.writeFileSync(path.join(tmp, 'ok.md'), 'ok\n')
+    assert.strictEqual(run([], tmp), 0, '短行必须绿：' + JSON.stringify(logs))
+    // ② 超长 md ⇒ 1，且点名文件、行号与长度（否则修复者无从下手）
+    fs.writeFileSync(path.join(tmp, 'long.md'), 'x\n' + 'y'.repeat(gate.MAX_DOC_LINE + 1) + '\n')
+    assert.strictEqual(run([], tmp), 1, '超限必须红：' + JSON.stringify(logs))
+    assert.ok(logs.some((l) => l.includes('long.md') && l.includes('1 行超限')),
+      '红输出必须点名文件与超限行数：' + JSON.stringify(logs))
+    assert.ok(logs.some((l) => l.includes('L2 = ' + (gate.MAX_DOC_LINE + 1))),
+      '必须报出行号与长度：' + JSON.stringify(logs))
+    // ③ 空扫描面（一个 md 都没有）⇒ 1：与「没扫到 ≠ 全绿」同口径
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-docmain-empty-'))
+    try {
+      assert.strictEqual(run([], empty), 1, '空扫描面必须红：' + JSON.stringify(logs))
+      assert.ok(logs.some((l) => l.includes('扫描面为空')), '必须点名「扫描面为空」：' + JSON.stringify(logs))
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true })
+    }
+    // ④ --max 非法 ⇒ 1（0/负数/非数字都不能退化成「阈值 0 全绿」）
+    for (const bad of [['--max', '0'], ['--max', '-1'], ['--max', 'abc']]) {
+      assert.strictEqual(run(bad, tmp), 1, `--max ${bad[1]} 必须红：` + JSON.stringify(logs))
+      assert.ok(logs.some((l) => l.includes('--max 必须是正整数')), '必须点名参数错误：' + JSON.stringify(logs))
+    }
+    // ⑤ 阈值必须真的被 main 使用（不是恒定用 MAX_DOC_LINE）
+    fs.writeFileSync(path.join(tmp, 'long.md'), 'z'.repeat(gate.MAX_DOC_LINE) + '\n')
+    assert.strictEqual(run([], tmp), 0, '恰好等于阈值必须绿')
+    fs.writeFileSync(path.join(tmp, 'long.md'), 'z'.repeat(gate.MAX_DOC_LINE + 1) + '\n')
+    assert.strictEqual(run(['--max', String(gate.MAX_DOC_LINE + 1)], tmp), 0,
+      '--max 提高阈值后同一文件必须绿（main 必须真用传入阈值）')
+    assert.strictEqual(run(['--max', String(gate.MAX_DOC_LINE)], tmp), 1, '回到默认阈值必须红')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+check('CLI 退出码：process.exit(main()) 真接线（--max 1 ⇒ 1，默认阈值 ⇒ 0）', () => {
+  const { spawnSync } = require('node:child_process')
+  const cli = path.join(__dirname, 'scripts', 'check-doc-lines.js')
+  const runCli = (args) => spawnSync(process.execPath, [cli, ...args], { cwd: __dirname, encoding: 'utf8' })
+  const red = runCli(['--max', '1'])
+  assert.strictEqual(red.status, 1,
+    `--max 1 必须 exit 1（实际 ${red.status}）：` + (red.stdout || '') + (red.stderr || ''))
+  assert.ok((red.stdout || '').includes('文档行长未通过'), '红路径必须打出结论行：' + (red.stdout || '').slice(-400))
+  const green = runCli([])
+  assert.strictEqual(green.status, 0,
+    `默认阈值必须 exit 0（实际 ${green.status}）：` + (green.stdout || '') + (green.stderr || ''))
+  assert.ok((green.stdout || '').includes('文档行长全部通过'), '绿路径必须打出结论行：' + (green.stdout || '').slice(-400))
 })
 
 // C5-022 门禁：harness 自身的控制流必须有断言，否则「一条检查抛错就整份文件中断」这种改动零覆盖
