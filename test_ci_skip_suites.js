@@ -188,7 +188,8 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 //   ② run: 支持多行形式（块指示符 `|` / `>` 及其 chomp/显式缩进变体 `|-` `>-` `|+` `>-2` `|2` `|2-` `>1+` 等，
 //      或 run: 后跟缩进更深的续行），命令文本合并后只提取
 //      `npm run <script>` 命令名——解析不出命令名仍会红（那才是真正的门禁缺口），排版变化不再误红；
-//   ③ 步骤内其它字段（uses/with/env/id/continue-on-error 等）不参与命令提取，也不破坏步骤归属；
+//   ③ 步骤内其它字段（uses/with/env/id 等）不参与命令提取，也不破坏步骤归属；`continue-on-error`
+//      额外记进 step.continueOnError（供「阻断性」对账用，见 2 补），不影响命令提取本身；
 //   ④ if: 仅在缩进比当前 step 起点更深时视为步骤级条件——job 级 if:（缩进更浅）不属任何 step，
 //      避免把已覆盖的步骤误标为条件步骤而被对账忽略。
 // 从命令文本中提取 `npm run <script>` 命令名（脚本名取首个 token，排除 shell 元字符，避免跨行吞并）；
@@ -213,6 +214,17 @@ function stripQuotesAndComment (line) {
   }
   return out
 }
+// step 级 `continue-on-error:` 的三种合法键写法（裸键 / 单引号 / 双引号）都要认：值只在**显式 false**
+// 时才算「阻断」；空值、表达式（`${{ matrix.experimental }}`）、`true` 一律按「可能不阻断」处理（宁红勿绿）。
+const CONTINUE_ON_ERROR_KEY_RE = /^(?:continue-on-error|'continue-on-error'|"continue-on-error")\s*:(.*)$/
+const isBlockingContinueOnError = (rawValue) => {
+  const value = stripQuotesAndComment(rawValue).trim().toLowerCase()
+  return value === 'false'
+}
+// shell 兜底把失败吞掉：`npm run x || true` / `|| :` / `|| exit 0`（前两者永远成功，后者把退出码改成 0）。
+// 这类命令的退出码取决于兜底命令，不能作为「该步骤会阻断 CI」的证据（C4-016）。
+// 用线性扫描的字面量集合而不是宽泛的 `||.*`：`|| exit 1` 这类兜底仍是阻断的，不该误判（宁红勿绿有边界）。
+const SWALLOWED_FALLBACK_RE = /\|\|\s*(?:true|:)(?=[\s;)&|]|$)|\|\|\s*exit\s+0(?=[\s;)&|]|$)|\|\|\s*(?:\/usr)?\/bin\/true\b/
 function collectNpmScripts (step, commandText) {
   // 只认真实命令：注释行（`# npm run x`）与行内注释（`npm run foo # 说明` 的 # 后部分）不是命令，
   // 引号内的文本（echo "参考: npm run x" 这类诊断输出）也不是命令——提取前剔除，避免对账被虚假满足。
@@ -220,7 +232,11 @@ function collectNpmScripts (step, commandText) {
     const line = raw.trim()
     if (!line || line.startsWith('#')) continue
     const cmd = stripQuotesAndComment(line)
-    for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) step.scripts.push(m[1])
+    const swallowed = SWALLOWED_FALLBACK_RE.test(cmd) // 该行的失败是否被兜底吞掉（见 C4-016）
+    for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) {
+      step.scripts.push(m[1])
+      if (swallowed) step.swallowed.push(m[1])
+    }
   }
 }
 
@@ -254,7 +270,7 @@ function parseWorkflowSteps (text) {
       runLines = null
     }
     if (/^- +(?:name|uses|run|if):/.test(trimmed)) {
-      curStep = { indent, conditional: /^- +if:/.test(trimmed), scripts: [] }
+      curStep = { indent, conditional: /^- +if:/.test(trimmed), continueOnError: false, scripts: [], swallowed: [] }
       steps.push(curStep)
       const inlineRun = trimmed.match(/^- +run: ?(.+)$/)
       if (inlineRun) {
@@ -275,6 +291,10 @@ function parseWorkflowSteps (text) {
     }
     if (!curStep) continue
     if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
+    // step 级 continue-on-error（缩进深于当前 step 起点；job 级的缩进更浅，不属任何 step）：
+    // 显式 false 之外一律记为「可能不阻断」——对账据此判断该步骤能否作为豁免套件的门禁（C4-016）。
+    const coeMatch = trimmed.match(CONTINUE_ON_ERROR_KEY_RE)
+    if (coeMatch && indent > curStep.indent && !isBlockingContinueOnError(coeMatch[1])) curStep.continueOnError = true
     if (trimmed.startsWith('run:')) {
       // rest 先剔除行内注释再 trim：`run: | # 注释` 旧码拿到 `| # 注释` → 判定不是块指示符 →
       // 后续命令行丢失（对账误报）。空值判定仍用剔除前的 rawRest：`run: # 注释`（无指示符、仅注释）
@@ -296,15 +316,21 @@ function parseWorkflowSteps (text) {
   return steps
 }
 
+// `npm run <script>` → 它实际执行到的 test_*.js 文件名（不是套件命令则 null）。
+// 主对账与「阻断性」对账共用这一份映射口径，避免两处各写一遍 pkg.scripts 解析。
+function suiteFileOfScript (script) {
+  const cmd = pkg.scripts[script]
+  const file = cmd && cmd.match(/node (\S+\.js)/)
+  const basename = file && path.basename(file[1])
+  return basename && /^test_.*\.js$/.test(basename) ? basename : null
+}
 function collectExplicitFiles (workflowText) {
   const files = new Set()
   for (const step of parseWorkflowSteps(workflowText)) {
     if (step.conditional) continue
     for (const script of step.scripts) {
-      const cmd = pkg.scripts[script]
-      const file = cmd && cmd.match(/node (\S+\.js)/)
-      const basename = file && path.basename(file[1])
-      if (basename && /^test_.*\.js$/.test(basename)) files.add(basename)
+      const basename = suiteFileOfScript(script)
+      if (basename) files.add(basename)
     }
   }
   return files
@@ -318,6 +344,79 @@ function assertSkipSuitesMatchExplicitSteps (workflowText) {
   return explicitFiles
 }
 const explicitFiles = assertSkipSuitesMatchExplicitSteps(testYml)
+
+// ── 2 补. SKIP_SUITES 的「阻断性」对账（C4-016）────────────────────────────────
+// 上面的主对账只回答「显式步骤里出现过 npm run <script>」，不回答「这一步会不会阻断 CI」：
+//   · `npm run test:x || true` / `|| :` / `|| exit 0` —— 命令失败时退出码取自兜底命令（0），step 永远成功；
+//   · step 级 `continue-on-error: true`（含表达式值）—— step 失败被吞，job 继续跑绿。
+// 而 SKIP_SUITES 恰恰把这批套件从 run_unit_tests.js 的全量兜底里摘掉（见 test.yml 该步 env 注释），
+// 于是那个唯一覆盖它们的显式步骤一旦不阻断，该套件就彻底没有门禁：漏跑不会红，只是「看起来跑过了」。
+// 主解析器已把两种形态记进 step（continueOnError / swallowed），这里据此要求：
+// **SKIP_SUITES 的每个套件都必须至少有一个阻断性显式步骤覆盖**。
+function assertSkipSuitesBlocking (workflowText) {
+  const blocking = new Set()
+  const nonBlocking = new Map() // file → 首次观察到的「不阻断」原因（只为报错可读，不参与判定）
+  for (const step of parseWorkflowSteps(workflowText)) {
+    for (const script of step.scripts) {
+      const file = suiteFileOfScript(script)
+      if (!file) continue
+      const reason = step.conditional
+        ? 'step-level if 条件'
+        : step.continueOnError
+          ? 'step 级 continue-on-error'
+          : step.swallowed.includes(script)
+            ? '`|| true` / `|| :` / `|| exit 0` 兜底吞掉退出码'
+            : ''
+      if (reason) {
+        if (!nonBlocking.has(file)) nonBlocking.set(file, reason)
+        continue
+      }
+      blocking.add(file)
+    }
+  }
+  const exposed = skips.filter(f => !blocking.has(f))
+  assert.deepStrictEqual(exposed, [],
+    'SKIP_SUITES 的每个套件都必须由**阻断性**显式步骤覆盖（它们已被 run_unit_tests.js 跳过，显式步骤是' +
+    '唯一的门禁）：' + exposed.map(f => `${f} ← ${nonBlocking.get(f) || '没有可解析的显式步骤'}`).join(' | ') +
+    '。`npm run test:x || true` / `|| :` / `|| exit 0` 与 step 级 continue-on-error（含表达式值）都会让' +
+    '该步骤永不阻断 ⇒ 等于没跑：要么去掉兜底/continue-on-error，要么把套件从 SKIP_SUITES 移除')
+  return blocking
+}
+assertSkipSuitesBlocking(testYml)
+
+// 2 补 反例·靶向（C4-016）：证明上面这条门禁真的会红 —— 每种「不阻断」形态单点注入到**真实 test.yml 的
+// 一个被豁免套件步骤**上。同时保留 `assertSkipSuitesMatchExplicitSteps(v.text)` 这一行：主对账对四种坏
+// 形态**一律放行**（它只看命令是否出现），这正是条目描述的缺口本身，也是本门禁存在的理由。
+{
+  const targetSuite = 'test_filter.js'
+  const targetStepName = '单元测试（test_filter.js，含 101 章版本校验）'
+  const targetStepLine = '      - name: ' + targetStepName
+  const targetRunLine = '        run: npm run test:filter'
+  assert.ok(skips.includes(targetSuite),
+    `反例前提：${targetSuite} 必须在 SKIP_SUITES 里（否则它不受「豁免套件必须阻断」这条约束）`)
+  const variants = [
+    { name: 'step 级 continue-on-error: true', text: testYml.replace(targetStepLine, targetStepLine + '\n        continue-on-error: true') },
+    { name: 'step 级 continue-on-error: 表达式值', text: testYml.replace(targetStepLine, targetStepLine + '\n        continue-on-error: $' + '{{ matrix.experimental }}') },
+    { name: 'run 行末尾 || true', text: testYml.replace(targetStepLine + '\n' + targetRunLine, targetStepLine + '\n' + targetRunLine + ' || true') },
+    { name: 'run 行末尾 || :', text: testYml.replace(targetStepLine + '\n' + targetRunLine, targetStepLine + '\n' + targetRunLine + ' || :') }
+  ]
+  for (const v of variants) {
+    assert.notStrictEqual(v.text, testYml, `反例夹具（${v.name}）必须真的改到了目标步骤（没改成本回归形同虚设）`)
+    // 前置：坏形态确实被记进目标 step —— 否则反例证明的不是「不阻断被拒」，而是别的东西
+    const parsed = parseWorkflowSteps(v.text).find(step => step.scripts.includes('test:filter'))
+    assert.ok(parsed && (parsed.continueOnError || parsed.swallowed.includes('test:filter')),
+      `反例夹具（${v.name}）必须让目标步骤被记为不阻断（否则本反例没有验证对象）`)
+    assertSkipSuitesMatchExplicitSteps(v.text) // 主对账放行 = 缺口本身（C4-016）
+    assert.throws(() => assertSkipSuitesBlocking(v.text), /阻断性/,
+      `${v.name} 后必须红：否则被豁免套件的唯一门禁可以被改成永不阻断，而整套门禁全绿（C4-016）`)
+  }
+  // 正向对照：`continue-on-error: false` 仍是阻断的，不得误伤（否则「宁红勿绿」变成「一律红」）
+  const withFalse = testYml.replace(targetStepLine, targetStepLine + '\n        continue-on-error: false')
+  assert.notStrictEqual(withFalse, testYml, '正向对照夹具必须真的注入 continue-on-error: false')
+  assertSkipSuitesBlocking(withFalse)
+  console.log(`✅ SKIP_SUITES 阻断性对账：${skips.length} 个被豁免套件均由阻断性显式步骤覆盖；` +
+    '`|| true` / `|| :` / step 级 continue-on-error（true 与表达式值）4 条靶向反例各自被拦，continue-on-error: false 不误伤')
+}
 
 // ── 2a. 静态/文档策略门禁只跑一次，稳定 Required Check 汇总两类结果 ──
 function jobBlock (workflowText, name) {
