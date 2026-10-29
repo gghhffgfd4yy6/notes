@@ -28,7 +28,7 @@ dns.lookup = (hostname, options, callback) => {
 (async () => {
   try {
     delete require.cache[require.resolve('./xbk_agents')]
-    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS } = require('./xbk_agents')
+    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS, DNS_REAL_INFLIGHT_MAX } = require('./xbk_agents')
     await prewarmDns('cache-probe.invalid')
     await prewarmDns('cache-probe.invalid')
     assert.strictEqual(calls, 1, 'TTL 内应命中 DNS 缓存')
@@ -338,6 +338,84 @@ dns.lookup = (hostname, options, callback) => {
     // （太小）或永远等不到退役（非整数/0）。
     assert.ok(Number.isInteger(DNS_INFLIGHT_MAX_AGE_MS) && DNS_INFLIGHT_MAX_AGE_MS > DNS_PENDING_TIMEOUT_MS,
       `未注入时在飞最大存活时间应为远大于等待超时的有限正整数（默认 60s），实际 ${DNS_INFLIGHT_MAX_AGE_MS}`)
+    // 生产默认（不注入 XBK_DNS_MAX_REAL_INFLIGHT）：真实硬顶必须是远大于软全局上限（生产默认 32）的有限正
+    // 整数。太小会让软名额永远用不满（同 key 的接班查询先撞硬顶），非整数/0 则等于没有硬顶。用首实例的
+    // 未注入值断言——下面那个注入 REAL=3 的实例只证明注入生效，不证明默认值合理；这条放在新用例之后，
+    // 好让旧实现先红在「每周期又新增 2 条真实查询」的计数上（缺这个导出只是症状，真实无界才是病灶）。
+    // ── 本轮返工（CodeRabbit #362 第 4 条）：真实名额只由底层回调释放，跨多个过龄周期仍有硬顶 ──────────
+    // 漏洞（只有软名额 + 过龄退役时）：退役把名额还给软上限，但那条 getaddrinfo 仍在 libuv 线程池里跑；
+    // 每过一个存活周期重试又能新增查询 ⇒ 真实未完成查询数无界（旧实现实测 3 个周期 = 6 条，且继续涨）。
+    // 故另起一个模块实例注入真实硬顶 3 / 存活 80ms / 等待 150ms。三个 env 都不能放文件头：AGE=80 会架空
+    // 既有「两条在飞都还年轻（默认存活 60s）」与「AGE > PENDING」断言；REAL=3 会把既有 lateHeld 的 6 条
+    // 放行压到 2 条（那一刻真实在飞还有 1 条没释放）。
+    process.env.XBK_DNS_MAX_REAL_INFLIGHT = '3'
+    process.env.XBK_DNS_MAX_INFLIGHT_AGE_MS = '80'
+    process.env.XBK_DNS_PENDING_TIMEOUT_MS = '150'
+    delete require.cache[require.resolve('./xbk_agents')]
+    const capped = require('./xbk_agents')
+    assert.strictEqual(capped.DNS_INFLIGHT_MAX_AGE_MS, 80,
+      `环境变量应把在飞最大存活时间压到 80ms（测试注入生效的前提），实际 ${capped.DNS_INFLIGHT_MAX_AGE_MS}`)
+    assert.strictEqual(capped.DNS_INFLIGHT_MAX_PER_KEY, 2,
+      `同 key 软名额仍是 ${capped.DNS_INFLIGHT_MAX_PER_KEY}（本用例要证明硬顶低于「3 个周期 × 软上限」之和）`)
+    const realHost = 'inflight-real-cap.invalid'
+    const realCap = 3
+    const realPerCycle = 25
+    const realStuck = [] // 永不回调的底层 lookup：跨 3 个周期累积
+    const realCycleCodes = [[], [], []]
+    dns.lookup = (hostname, options, callback) => { realStuck.push(callback) } // 坏解析器：永不回调
+    const realCall = (cycle) => new Promise(resolve => capped.dnsLookup(realHost, { all: true }, (error) => {
+      realCycleCodes[cycle].push(error ? error.code : 'none')
+      resolve()
+    }))
+    for (let cycle = 0; cycle < 3; cycle++) {
+      // 每周期两波（模拟 got 超时后的两轮重试）：第一波 1 次必然放行；第二波 24 次——软名额只剩 1 条，
+      // 但旧实现靠过龄退役在同一周期里又腾出空位，故每周期都能再放行 2 条（= 每周期都新增 2 条真实查询）。
+      const waveFirst = realCall(cycle)
+      await sleep(capped.DNS_PENDING_TIMEOUT_MS + 40)
+      await waveFirst
+      const waveRest = []
+      for (let i = 1; i < realPerCycle; i++) waveRest.push(realCall(cycle))
+      await sleep(capped.DNS_PENDING_TIMEOUT_MS + 40)
+      await Promise.all(waveRest)
+      await sleep(capped.DNS_INFLIGHT_MAX_AGE_MS + 40) // 周期之间：上一批真实在飞条目全部过龄
+    }
+    const realTotal = 3 * realPerCycle
+    const realFlat = realCycleCodes.flat()
+    assert.strictEqual(realFlat.length, realTotal, `${realTotal} 次调用必须一个回调不少，实际 ${realFlat.length}`)
+    assert.ok(realFlat.every(code => code === 'ETIMEDOUT' || code === 'EAI_AGAIN'),
+      `受限的给 EAI_AGAIN、上限内的给 ETIMEDOUT，不得出现别的结果，实际 ${realFlat.join(',')}`)
+    // 先测行为再验注入：旧实现没有 DNS_REAL_INFLIGHT_MAX 这个导出，先断言计数才能拿到「真实发起 6 条」的证据。
+    assert.strictEqual(realStuck.length, realCap,
+      `跨 3 个过龄周期真实发起的底层 lookup 必须收敛到真实硬顶 ${realCap} 条（旧实现 = 3 周期 × 同 key 软上限 ${capped.DNS_INFLIGHT_MAX_PER_KEY} 条 = 6 条），实际 ${realStuck.length}`)
+    assert.strictEqual(capped.DNS_REAL_INFLIGHT_MAX, realCap,
+      `环境变量应把真实在飞硬顶压到 ${realCap}（测试注入生效的前提），实际 ${capped.DNS_REAL_INFLIGHT_MAX}`)
+    assert.ok(realCycleCodes[0].every(code => code === 'ETIMEDOUT'),
+      `第 1 个周期硬顶内的 ${realPerCycle} 项都还在等待，必须按 deadline 收场为 ETIMEDOUT，实际 ${realCycleCodes[0].join(',')}`)
+    assert.ok(realCycleCodes[2].every(code => code === 'EAI_AGAIN'),
+      `第 3 个周期真实在飞已满 ${realCap} 条：全部 ${realPerCycle} 次调用必须立即 EAI_AGAIN（可重试），实际 ${realCycleCodes[2].join(',')}`)
+    const realTimeouts = realFlat.filter(code => code === 'ETIMEDOUT').length
+    const realRefused = realFlat.filter(code => code === 'EAI_AGAIN').length
+    assert.strictEqual(realTimeouts, realPerCycle + 1,
+      `硬顶内的查询仍按 deadline 收场（第 1 周期 ${realPerCycle} 项 + 第 2 周期首波 1 项），期望 ${realPerCycle + 1}，实际 ${realTimeouts}`)
+    assert.strictEqual(realRefused, realTotal - (realPerCycle + 1),
+      `其余调用必须立即以 EAI_AGAIN 失败（不得静默丢、也不新建底层查询），期望 ${realTotal - (realPerCycle + 1)}，实际 ${realRefused}`)
+    // 恢复：真实名额只由底层回调释放——放掉这 3 条挂起回调后同 key 必须能重新解析并写回缓存
+    for (const cb of realStuck) cb(null, '192.0.2.91', 4)
+    let realRecoveredCalls = 0
+    dns.lookup = (hostname, options, callback) => {
+      realRecoveredCalls += 1
+      callback(null, [{ address: '192.0.2.91', family: 4 }], 4)
+    }
+    const realOk = await new Promise(resolve => capped.dnsLookup(realHost, { all: true }, (error, address) => resolve({ error, address })))
+    assert.strictEqual(realOk.error, null,
+      `真实在飞回调释放后同 key 必须能重新解析（硬顶不得把主机永久钉死），实际 ${realOk.error && realOk.error.code}`)
+    assert.deepStrictEqual(realOk.address, [{ address: '192.0.2.91', family: 4 }], 'all:true 的地址形状不得丢')
+    assert.strictEqual(realRecoveredCalls, 1, '真实名额释放后必须真正发起底层 lookup，且只发起一次')
+    await new Promise(resolve => capped.dnsLookup(realHost, { all: true }, (error) => resolve(error)))
+    assert.strictEqual(realRecoveredCalls, 1, '恢复后的解析结果应写回缓存并被下一次请求命中')
+    console.log(`✅ PR #362 真实在飞硬顶：跨 3 个过龄周期共 ${realTotal} 次同 key 调用只发起 ${realStuck.length} 条底层 lookup（旧实现 6 条），${realTimeouts} 条 ETIMEDOUT / ${realRefused} 条 EAI_AGAIN，回调释放后可重新解析`)
+    assert.ok(Number.isInteger(DNS_REAL_INFLIGHT_MAX) && DNS_REAL_INFLIGHT_MAX > DNS_INFLIGHT_MAX,
+      `未注入时真实在飞硬顶应为远大于软全局上限（默认 64 > 32）的有限正整数，实际 ${DNS_REAL_INFLIGHT_MAX}`)
     suiteDone = true
   } finally {
     dns.lookup = originalLookup
