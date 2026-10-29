@@ -5,42 +5,14 @@
 const assert = require('node:assert')
 const { createFormatter } = require('./xbk_formatter')
 
-// Mock Utils：只实现 formatter 用到的方法，为简化桩（非真实 Utils 完整行为）
-// 注意：truncateUtf16/sanitizeDecodedHtml/sanitizeSurrogates 等为恒等/简化实现，
-// 与 xbk_utils.js 真实行为存在差异，仅用于隔离 formatter 自身逻辑。
-const mockUtils = {
-  safeObjectCopy: (obj) => JSON.parse(JSON.stringify(obj)),
-  truncateUtf16: (str, len) => str.slice(0, len),
-  safeUrl: (url) => {
-    if (typeof url !== 'string' || url.length === 0) return ''
-    if (/^(javascript:|data:|vbscript:)/i.test(url)) return ''
-    return url.replace(/[\r\n]+/g, '').trim()
-  },
-  sanitizeDecodedHtml: (str) => str,
-  decodeHtmlEntities: (str) => str.replace(/&(lt|gt|amp|quot|#39);/g, (m, name) => ({
-    lt: '<', gt: '>', amp: '&', quot: '"', '#39': "'"
-  }[name] || m)),
-  safeText: (val) => {
-    if (val === undefined || val === null) return ''
-    return String(val)
-  },
-  safeGet: (obj, key) => {
-    if (!obj || typeof obj !== 'object') return undefined
-    return obj[key]
-  },
-  sanitizeSurrogates: (str) => str,
-  // 与生产 Utils.add0 同语义（xbk_utils.js:255 `m < 10 ? '0' + m : '' + m`）：
-  // 时间分支此前完全没有被覆盖（桩缺 add0 会直接抛错），补桩后 {日期}/{时间} 才可断言。
-  add0: (m) => (m < 10 ? '0' + m : '' + m),
-  parseTime: (t) => {
-    if (typeof t === 'number' && t > 0) return t
-    const d = new Date(t)
-    return Number.isNaN(d.getTime()) ? null : d.getTime()
-  }
-}
-
+// C5-024：夹具直接使用**生产** Utils（xbk_utils.createUtils），不再手写一份「更弱」的替身。
+// 旧替身把 truncateUtf16 换成 slice（会切断代理对）、decodeHtmlEntities 只认 5 个命名实体、
+// safeUrl 不看控制字符、sanitizeDecodedHtml 恒等——十余条断言验的其实是桩而不是产品；换回削弱版
+// 替身时文件末的四条「产品语义」断言全红。
+const { createUtils } = require('./xbk_utils')
 const safeRe = (src, flags) => new RegExp(src, flags)
-const formatter = createFormatter({ Utils: mockUtils, safeRe })
+const Utils = createUtils({ fs: require('node:fs'), safeRe })
+const formatter = createFormatter({ Utils, safeRe })
 
 let pass = 0
 let fail = 0
@@ -444,21 +416,21 @@ check('createFormatter: 缺 Utils → 抛 TypeError', () => {
 })
 
 check('createFormatter: 缺 safeRe → 抛 TypeError', () => {
-  assert.throws(() => createFormatter({ Utils: mockUtils }), TypeError)
+  assert.throws(() => createFormatter({ Utils }), TypeError)
 })
 
 check('createFormatter: safeRe 非函数 → 抛 TypeError', () => {
-  assert.throws(() => createFormatter({ Utils: mockUtils, safeRe: 'notafunction' }), TypeError)
+  assert.throws(() => createFormatter({ Utils, safeRe: 'notafunction' }), TypeError)
 })
 
-// 夹具契约：mockUtils.parseTime 必须与生产 Utils.parseTime 同语义。
+// 生产 Utils.parseTime 契约（C5-024 后夹具即生产实现，不再只是桩的自我一致性）。
 // 这条非法日期分支此前没有被任何断言覆盖——注毒实验（把 return 改成 d.getTime()）后套件仍绿，故补上。
-check('mockUtils.parseTime：非法日期返回 null', () => {
-  assert.strictEqual(mockUtils.parseTime('不是日期'), null)
+check('Utils.parseTime：非法日期返回 null', () => {
+  assert.strictEqual(Utils.parseTime('不是日期'), null)
 })
 
-check('mockUtils.parseTime：合法日期返回毫秒时间戳', () => {
-  assert.strictEqual(mockUtils.parseTime('2026-01-01T00:00:00Z'), Date.parse('2026-01-01T00:00:00Z'))
+check('Utils.parseTime：合法日期返回毫秒时间戳', () => {
+  assert.strictEqual(Utils.parseTime('2026-01-01T00:00:00Z'), Date.parse('2026-01-01T00:00:00Z'))
 })
 
 // ===== anchorText：锚点文本（标签段原样保留、其余段解码并转义、嵌套 <a...>/</a> 整段剥除）=====
@@ -922,6 +894,29 @@ check('_mdDestination：假值原样返回，不调用 .replace', () => {
 check('_mdDestination：含空白用 <> 包裹，角括号编码', () => {
   assert.strictEqual(formatter._mdDestination('https://x/a b'), '<https://x/a b>')
   assert.strictEqual(formatter._mdDestination('https://x/a>b'), 'https://x/a%3Eb')
+})
+
+// ===== C5-024：断言必须验生产 Utils 的真实语义，不得靠削弱版替身 =====
+// 旧夹具（手写 mockUtils）把 truncateUtf16 换成 slice（会切断代理对）、decodeHtmlEntities 只认 5 个
+// 命名实体、safeUrl 不看控制字符、sanitizeDecodedHtml 恒等——十余条断言验的其实是桩而不是产品。
+// 下面四条直接锚定生产语义，夹具换回削弱版替身时四条全红。
+check('产品语义：十六进制/十进制数字实体必须解码（削弱版替身只认 5 个命名实体）', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: 'a&#x27;b' }), "a'b")
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: 'x&#128512;y' }), 'x😀y')
+})
+
+check('产品语义：&nbsp; 按生产 ENTITY_MAP 解码（削弱版替身原样保留）', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: 'a&nbsp;b' }), 'a b')
+})
+
+check('产品语义：href 含控制字符时 safeUrl 必须拒绝出链（削弱版替身仍生成链接）', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<a href="https://x/a\u0000b">t</a>' }), 't')
+})
+
+check('产品语义：10 万上限截断不得切断代理对（削弱版替身用 slice 切出孤立高代理）', () => {
+  const out = formatter.htmlToMarkdown({ content_html: '<p>' + 'a'.repeat(99996) + '😀' + '</p>' })
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out), '截断后不得残留孤立高代理')
+  assert.ok(!out.includes('\uFFFD'), '不得出现替换字符')
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_formatter.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
