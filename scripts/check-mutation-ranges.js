@@ -63,7 +63,7 @@ if (includeIdx !== -1) {
       // （如 `- # 纯注释`、`-#注释`）的不算新条目，避免生成全空条目触发「缺 name 字段」误报。
       const rest = trimmed.slice(1).trim()
       if (rest === '' || rest.startsWith('#')) continue
-      currentEntry = { name: null, src: null, mutate: null }
+      currentEntry = { name: null, src: null, mutate: null, config: null, timeout_ms: null }
       matrixEntries.push(currentEntry)
       body = rest
     }
@@ -72,7 +72,9 @@ if (includeIdx !== -1) {
     const colon = body.indexOf(':')
     if (colon <= 0) continue
     const key = body.slice(0, colon)
-    if (key !== 'name' && key !== 'src' && key !== 'mutate') continue
+    // config / timeout_ms 不参与行段校验，只用于与 mutation-report 的两份解析器对账（C10-025）：
+    // 本文件的解析器因此**同时看得到**另两份解析器关心的字段，分叉门禁才有同一份输入可比。
+    if (key !== 'name' && key !== 'src' && key !== 'mutate' && key !== 'config' && key !== 'timeout_ms') continue
     let value = body.slice(colon + 1).trim()
     const quote = value[0]
     if (quote === '"' || quote === "'") {
@@ -278,6 +280,76 @@ function auditRuntimeChain ({ chain, mutateTargets, exempt, nonRuntime }) {
   return { errors }
 }
 
+// ── matrix include 解析器一致性（C10-025）───────────────────────────────────────────────────
+// 同一份 mutation.yml 的 include 块有**三份独立**解析器：
+//   ① 本文件（name/src/mutate）—— 行段与 mutate 目标的权威来源；
+//   ② scripts/mutation-report.js 的 parseMatrixRunnerConfigs（name/config）—— 日报标注 command 档；
+//   ③ scripts/mutation-report.js 的 parseMatrixTimeouts（name/timeout_ms）—— 日报的「超时上限」列。
+// 三份键集合各不相同、实现各自演进（近似解析器）。当前对真实 yml 输出一致，但此前**没有任何门禁**
+// 在它们分叉时报警，真实事故形态就是「某条目少了 config 字段」：本文件的 name/src/mutate 校验全绿，
+// 而 ② 会静默丢掉该段 ⇒ 日报不再标注它的 runner 档位（读者会把 command 档的分数与 TAP 档混比）。
+// 这里把**同一份 yml 文本**分别喂三份解析器，段名集合不一致即响亮失败（判据只增不减：行段/连续性/
+// 尾部/config 对账/运行链核对一条没动）。
+function auditMatrixParsers (ymlText, entries, reporters = {}) {
+  const parseConfigs = reporters.parseMatrixRunnerConfigs
+  const parseTimeouts = reporters.parseMatrixTimeouts
+  if (typeof parseConfigs !== 'function' || typeof parseTimeouts !== 'function') {
+    return {
+      errors: ['matrix 解析器一致性校验缺少注入的 parseMatrixRunnerConfigs / parseMatrixTimeouts（fail-closed：没有对照就没有判据）'],
+      stats: { entries: 0, configs: 0, timeouts: 0 }
+    }
+  }
+  const list = (entries || []).filter(e => e && e.name)
+  const names = [...new Set(list.map(e => e.name))]
+  const configs = parseConfigs(ymlText)
+  const timeouts = parseTimeouts(ymlText)
+  const errors = []
+  // ① name-only 解析器（timeout）：对缺字段不敏感，看不见某个段就是解析器本身分叉 —— 无条件对账。
+  for (const name of names) {
+    if (!timeouts.has(name)) {
+      errors.push(`matrix 解析器分叉：本文件看到段「${name}」，而 mutation-report.parseMatrixTimeouts 没看到` +
+        '⇒ 日报的「超时上限」列会静默回落缺省 300s')
+    }
+  }
+  for (const name of timeouts.keys()) {
+    if (!names.includes(name)) {
+      errors.push(`matrix 解析器分叉：mutation-report.parseMatrixTimeouts 多出段「${name}」，本文件的 include 解析器没看到`)
+    }
+  }
+  // ② config 解析器：**仅当这份 yml 声明了 config 字段**时对账。
+  //    理由：本脚本的夹具/补丁片段按契约只需 name/src/mutate（test_check_mutation_ranges.js 的
+  //    合成矩阵就是这样写的），而真实矩阵每段都有 config（由 test_ci_skip_suites 的 assertMatrixConfigs
+  //    另行锁死）。只要 yml 里出现 config，就必须每段都被 ② 看见 —— 半套 config 才是真分叉（某条目
+  //    被 ② 静默丢掉 ⇒ 日报不标注它的 runner 档位）。
+  if (list.some(e => e.config)) {
+    for (const entry of list) {
+      if (!configs.has(entry.name)) {
+        errors.push(`matrix 解析器分叉：本文件看到段「${entry.name}」，而 mutation-report.parseMatrixRunnerConfigs 没看到` +
+          '（该条目缺 config 字段，或写法它不认）⇒ 日报会静默不标注该段的 runner 档位')
+      } else if (entry.config && configs.get(entry.name) !== entry.config) {
+        errors.push(`matrix 解析器取值分叉：段「${entry.name}」的 config，本文件读到 ${JSON.stringify(entry.config)}，` +
+          `parseMatrixRunnerConfigs 读到 ${JSON.stringify(configs.get(entry.name))}`)
+      }
+    }
+    for (const name of configs.keys()) {
+      if (!names.includes(name)) {
+        errors.push(`matrix 解析器分叉：mutation-report.parseMatrixRunnerConfigs 多出段「${name}」，本文件的 include 解析器没看到`)
+      }
+    }
+  }
+  // ③ timeout_ms 取值对账：只有 yml 明确写了 timeout_ms 的段才比（缺省 300000 由 ③ 侧自行回落）
+  for (const entry of list) {
+    if (!entry.timeout_ms) continue
+    const parsed = timeouts.get(entry.name)
+    const expected = Number(entry.timeout_ms)
+    if (parsed !== undefined && parsed !== expected) {
+      errors.push(`matrix 解析器取值分叉：段「${entry.name}」的 timeout_ms，本文件读到 ${JSON.stringify(entry.timeout_ms)}，` +
+        `parseMatrixTimeouts 读到 ${JSON.stringify(parsed)}（非正整数会被它静默回落 300000）`)
+    }
+  }
+  return { errors, stats: { entries: names.length, configs: configs.size, timeouts: timeouts.size } }
+}
+
 // 失败收敛点：直接运行（node scripts/check-mutation-ranges.js）时按 code process.exit，保证 CI /
 // `npm run check` 照旧 fail-loud（非零退出）；被 require 时（test_check_mutation_ranges.js 复用
 // globMatcher / listRepoJsFiles）改为 throw —— require 者同样必须拿到失败信号。此前 require 路径
@@ -415,7 +487,8 @@ function requireOrDie (modulePath, displayName) {
 
 // 校验 0.5：矩阵 name 必须与 mutation-report 的 EXPECTED_SEGMENTS 一致（含重复检测）。
 // 背景：name 写错/漏改要等 report 阶段 validateSegments() 才 throw —— 那时整轮矩阵（小时级）已经白跑。
-const expectedSegments = requireOrDie('../scripts/mutation-report.js', 'mutation-report.js').EXPECTED_SEGMENTS || []
+const mutationReport = requireOrDie('../scripts/mutation-report.js', 'mutation-report.js')
+const expectedSegments = mutationReport.EXPECTED_SEGMENTS || []
 const matrixNames = matrixEntries.map(entry => entry.name).filter(Boolean)
 const dupNames = [...new Set(matrixNames.filter((name, i) => matrixNames.indexOf(name) !== i))]
 const nameMissing = expectedSegments.filter(name => !matrixNames.includes(name))
@@ -431,6 +504,22 @@ if (nameMissing.length) {
 if (nameExtra.length) {
   console.error(`❌ 矩阵含 mutation-report 不认识的段名：${nameExtra.join(', ')}`)
   failed = true
+}
+
+// 校验 0.55：三份 matrix include 解析器对**同一份 yml** 必须得出相同的段名集合（C10-025）。
+// 与上面 0/0.5 的区别：0 只校验本文件自己的解析结果，0.5 只比 name 与 EXPECTED_SEGMENTS；
+// 这里把 mutation-report 的两份解析器也拉进来对账，专治「同一条目被某个解析器静默丢掉」。
+const parserAudit = auditMatrixParsers(yml, matrixEntries, {
+  parseMatrixRunnerConfigs: mutationReport.parseMatrixRunnerConfigs,
+  parseMatrixTimeouts: mutationReport.parseMatrixTimeouts
+})
+for (const message of parserAudit.errors) {
+  console.error(`❌ ${message}`)
+  failed = true
+}
+if (parserAudit.errors.length === 0) {
+  console.log(`ℹ️ matrix 解析器一致性：段名 ${parserAudit.stats.entries}，config ${parserAudit.stats.configs}，` +
+    `timeout ${parserAudit.stats.timeouts}（本文件 / parseMatrixRunnerConfigs / parseMatrixTimeouts 一致）`)
 }
 
 // 校验 0.6：stryker.config.js 的 mutate 必须与矩阵文件集完全一致。
@@ -496,6 +585,7 @@ module.exports = {
   listRepoJsFiles,
   deriveRuntimeChain,
   auditRuntimeChain,
+  auditMatrixParsers,
   MUTATION_EXEMPT,
   NON_RUNTIME_MUTATE_TARGETS
 }

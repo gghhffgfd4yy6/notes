@@ -25,7 +25,23 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/mutation.yml'
+  # 手动触发的两个可选输入：只服务 killed 下降门禁（C10-021 判据 ⑤），留空即保持该门禁**默认关闭**。
+  # 为什么用「同一 commit 的既有 run id」而不是「基线文件路径」：守卫只接受**同一 commit 的全量重算**结果
+  #   （基线里的 commit 必须与 GITHUB_SHA 逐字相同，见 scripts/mutation-guard.js 的 readKilledBaseline），
+  #   而同一个 commit 不可能把自己产出的基线先提交进仓库（文件里要写该 commit 的 sha，sha 又取决于该文件）
+  #   ⇒ 唯一合法来源就是「同一 sha 的另一次运行」，它只以 artifact 形式存在。
   workflow_dispatch:
+    inputs:
+      killed_baseline_run:
+        description: '可选：同一 commit 的既有 run id；用它的 mutation-report-<段> artifact 作 killed 下降基线（留空 = 门禁保持默认关闭）'
+        required: false
+        default: ''
+        type: string
+      killed_baseline_tolerance:
+        description: '可选：killed 下降容忍值（非负整数，留空 = 0）；仅在给了 killed_baseline_run 时才有意义'
+        required: false
+        default: ''
+        type: string
   schedule:
     - cron: '17 16 * * *'
     - cron: '17 4 * * *'
@@ -149,6 +165,10 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
+      # 读「基线 run」的 artifact（gh api 取 head_sha / gh run download 拉 mutation-report-<段>）需要
+      # actions: read；缺失即 403 ⇒ 一旦显式给出 killed_baseline_run，守卫会因为拿不到基线而红。
+      # 只在 killed_baseline_run 非空时才有实际用途，常规 schedule/push 运行不会调用任何 actions 读接口。
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -601,6 +621,73 @@ jobs:
             tail -n 40 "$f" || true
           done
 
+      # killed 下降门禁（判据 ⑤）在 CI 的接线（C10-021）：**默认关闭**——只有 workflow_dispatch 显式给出
+      # killed_baseline_run 时本 step 才运行；不给 ⇒ 整段跳过、XBK_MUTATION_KILLED_BASELINE 从未写入
+      # $GITHUB_ENV ⇒ 守卫行为与「未接线」时逐字节相同（不新增任何常规运行路径）。
+      # 为什么要从「既有 run 的 artifact」取基线：守卫只接受**同一 commit 的全量重算**结果（基线 commit 必须
+      #   与 GITHUB_SHA 逐字相同；带 reuse/增量痕迹一律拒）⇒ 唯一合法来源是「同一 sha 的另一次运行」，
+      #   它只以 artifact 形式存在（同一 commit 无法把自己产出的基线先提交进仓库，见 workflow_dispatch 注释）。
+      # 三条校验，任一不过即 exit 1（绝不把「基线来路不明」降级成「没设基线」静默关掉门禁）：
+      #   ① 基线 run 的 head_sha 必须等于本轮 GITHUB_SHA（跨 commit 的 killed 不可比；守卫侧还会再拒一次）；
+      #   ② 基线 run 该段的 reuse.json 必须 mode=full —— 增量/复用跑出来的 killed 只是上一轮结果的搬运，
+      #      与「本轮测试变弱」不可区分（这正是判据 ⑤ 默认关闭的原因）；
+      #   ③ artifact 里必须有 mutation.json（缺报告就没有 killed 可数）。
+      # 只拉**本段**的 artifact（--pattern mutation-report-<段>）：32 段全拉约 2GB，而每条腿只需要自己那一段；
+      #   基线因此只含本段，守卫「本段不在 killed 基线 ⇒ 红」的判据（test_mutation_json.js 判据 f）不受影响。
+      # 落盘位置选 $RUNNER_TEMP 而不是 reports/：reports/ 是本 job 的缓存 path，写进去会让这条腿把几十 MB
+      #   基线 artifact 存进 stryker-* 缓存（纯浪费配额），且它不属于任何报告产物。
+      # 为什么不把变量写进守卫 step 的 env：守卫里「未设置」≠「显式置空」——XBK_MUTATION_KILLED_BASELINE
+      #   为空串是**故意 fail-closed**（test_mutation_json.js 判据 g），而 step 级 env 在输入留空时会写出空串
+      #   ⇒ 每次常规运行都会红。故基线路径只在真拿到基线后经 $GITHUB_ENV 注入。
+      # 失败语义：gh / jq 任一失败由 set -euo pipefail 直接置非零 ⇒ 本 step 响亮红，不静默关掉门禁。
+      - name: 准备 killed 下降基线（可选，${{ matrix.name }}）
+        # 三个条件缺一不可：非 dispatch 触发时 `inputs` 上下文是空对象（不靠 null 与空串的类型转换语义，
+        # 显式锚定 event_name，避免 schedule/push 上万一求值成 true 时 32 条腿全部红在这种接线上）。
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.killed_baseline_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BASELINE_RUN: ${{ inputs.killed_baseline_run }}
+          SEGMENT: ${{ matrix.name }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$BASELINE_RUN" in
+            ''|*[!0-9]*) echo "❌ killed_baseline_run 必须是 run id（纯数字），收到 ${BASELINE_RUN}" >&2; exit 1 ;;
+          esac
+          base_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BASELINE_RUN" --jq .head_sha)
+          if [ "$base_sha" != "$CURRENT_SHA" ]; then
+            echo "❌ 基线 run 的 head_sha（${base_sha:-<空>}）与本轮 commit（$CURRENT_SHA）不一致：跨 commit 的 killed 不可比" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/killed-baseline"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          if ! gh run download "$BASELINE_RUN" --repo "$GITHUB_REPOSITORY" --pattern "mutation-report-$SEGMENT" --dir "$dir"; then
+            echo "❌ 基线 run $BASELINE_RUN 里没有 mutation-report-$SEGMENT artifact" >&2
+            exit 1
+          fi
+          report="$dir/mutation-report-$SEGMENT/mutation.json"
+          reuse="$dir/mutation-report-$SEGMENT/reuse.json"
+          if [ ! -f "$report" ] || [ ! -f "$reuse" ]; then
+            echo "❌ 基线 artifact 缺 mutation.json 或 reuse.json（无法证明该段是全量重算）" >&2
+            exit 1
+          fi
+          reuse_mode=$(jq -r '.mode // "unknown"' "$reuse")
+          if [ "$reuse_mode" != "full" ]; then
+            echo "❌ 基线 run 的该段不是全量重算（reuse.json mode=$reuse_mode）：增量/复用结果不能当 killed 基线" >&2
+            exit 1
+          fi
+          killed=$(jq '[.files[].mutants[] | select(.status == "Killed")] | length' "$report")
+          case "$killed" in
+            ''|*[!0-9]*) echo "❌ 基线 killed 计数非法：${killed}" >&2; exit 1 ;;
+          esac
+          out="$dir/killed-baseline-$SEGMENT.json"
+          jq -n --arg commit "$CURRENT_SHA" --arg seg "$SEGMENT" --argjson killed "$killed" \
+            '{commit: $commit, mode: "full", segments: {($seg): {killed: $killed}}}' > "$out"
+          echo "ℹ️ killed 下降基线已就绪（段 $SEGMENT，run $BASELINE_RUN，killed=$killed，commit=$CURRENT_SHA）"
+          echo "XBK_MUTATION_KILLED_BASELINE=$out" >> "$GITHUB_ENV"
+
       # fail-closed 守卫（本轮新增）：分数门禁已撤回（break = null），但「报告本身不可信」必须仍然响亮失败。
       # 它兜住 stryker 不会置退出码的假绿通道（NaN 通道的源码依据见 stryker.config.js 的 thresholds 注释）：
       #   ① 任一变异体 status = RuntimeError —— 测试自身崩溃导致的「没能判定」，既不算已检出也不算存活，
@@ -621,6 +708,12 @@ jobs:
       #   两类再也分不开）。该文件随 artifact 到汇总 job，日报的 `真挂死` / `上限触发` 两列据此渲染。
       - name: 变异报告 fail-closed 守卫（${{ matrix.name }}）
         if: always()
+        env:
+          # 容忍值经 inputs 显式传（留空 = 0；守卫的 resolveKilledTolerance：未设置/空串都不放大容忍）。
+          # XBK_MUTATION_KILLED_BASELINE **不在此处**：未设置 ≠ 显式置空（守卫对空串 fail-closed），
+          # 故基线路径只在上面「准备 killed 下降基线」真的拿到基线后经 $GITHUB_ENV 注入；不给输入时该
+          # 变量根本不存在 ⇒ 判据 ⑤ 保持默认关闭。
+          XBK_MUTATION_KILLED_TOLERANCE: ${{ inputs.killed_baseline_tolerance }}
         run: node scripts/mutation-guard.js --segment "${{ matrix.name }}" reports/mutation/mutation.json
 
       # 复用状态落盘（PR #158 Qodo Medium / Correctness）：本段本轮到底是「全量重算」还是「复用了 N/M 个

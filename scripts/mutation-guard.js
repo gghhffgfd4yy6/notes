@@ -21,6 +21,18 @@
 //      判据不是同一回事**：缺段由汇总 job 的 scripts/mutation-report.js validateSegments 负责，本守卫只管
 //      「守卫自己判不了」。两者文案分开，避免排障时把「守卫读不到文件」误读成「上游没产出」。
 //   ④ 报告存在但结构非法 —— 无法按 stryker 口径计数时同样 fail-closed（不许「算不出来就当通过」）。
+//   ⑤（**默认关闭，需显式提供基线**）某段 killed 数低于「同 commit 全量重算基线」减去容忍值 —— 见下。
+//
+// 判据 ⑤ 为什么默认关闭（C10-021，诚实登记：没有基线时**这个门禁不存在**）：
+//   stryker 侧的分数门禁已撤回（stryker.config.js 的 thresholds.break = null，:83-101 用三条实测证据
+//   记录了这个取舍：同配置同 commit 同段三轮 79.08% / 82.92% / 71.02%，极差 11.90pp）；而「读上一轮
+//   artifact 当基线」正是被否定的做法 —— 增量复用会把上一轮的 killed 原样搬过来，与「本轮测试变弱」
+//   不可区分（:92 的污染基线）。故判据 ⑤ 只在调用方**显式**提供基线时生效，且基线必须是:
+//     * **同一 commit** 的全量重算结果（基线文件带 commit，与 GITHUB_SHA 逐字相同；缺一即 fail-closed），
+//     * `mode: "full"`（partial / incremental / 未知一律拒），不得带 reuse / incremental 字段，
+//     * 逐段 killed 计数（非负整数）。
+//   只有这三条同时成立，「killed 下降」才是可归因的测试变弱信号，而不是抖动或复用残留。
+//   容忍值由 XBK_MUTATION_KILLED_TOLERANCE 给出（默认 0，非负整数）。
 //
 // 附带产出（**不属于判据、不影响退出码**）：每份成功解析的报告会在同目录落盘 timeout-stats.json，把 Timeout
 //   按 statusReason 分成 hang（无 reason，真挂死）/ hitLimit（`Hit limit reached` 前缀，tap-runner 的命中
@@ -34,6 +46,17 @@
 //     files.*.mutants.items.status（enum）
 //   * node_modules/mutation-testing-report-schema/dist/src-generated/schema.d.ts 的 `export type MutantStatus = ...`
 // 与 scripts/mutation-report.js 的 MUTANT_STATUSES 同源同集合——收窄成 countMutant 计数的 4 个会把正常报告整段拒掉。
+//
+// ── argv 解析策略（C10-054）────────────────────────────────────────────────────────────────
+// 本仓有 ≥8 个 CLI 入口各自手写 argv 解析（本文件、xbk_function_v3.js、qinglong/xbk_push.js、
+// scripts/mutation-report.js、scripts/check-doc-lines.js、scripts/check-host-clean.js、
+// scripts/check-ci-static.js、scripts/validate-release-tag.js）。未知参数历史上分三类互斥策略：
+//   ① throw 后收敛成非零退出（本文件）；② console.error + process.exitCode=1（xbk_function_v3/qinglong 入口）；
+//   ③ 静默忽略（其余用 includes/indexOf 取已知项，剩下的当位置参数）。
+// 统一口径 = **未知或非法参数一律 fail-closed**（本文件即该口径的实现，见 parseArgs）：拼错 `--segmnt`
+// 曾能让守卫静默空转（无路径 ⇒ 无判据）。空取值、取值看起来像另一个参数、同一参数重复指定都算非法。
+// 其余入口的收敛**不在本次改动范围**（动它们会改变既有 CLI 行为）；换 node:util parseArgs 也应排在
+// 统一策略之后，而不是先换实现再谈语义。
 const path = require('node:path')
 const fs = require('node:fs')
 const { readReportJson, resolveMaxReportBytes } = require('./mutation-json.js')
@@ -192,18 +215,108 @@ function writeTimeoutStats (reportPath, stats) {
   return target
 }
 
+// ── killed 下降基线的读取与校验（判据 ⑤，**默认关闭**）─────────────────────────────────────────
+// 「不得读上一轮 artifact」这条硬约束的可执行落地：基线必须自带 commit + mode:'full'，且不得带
+// reuse / incremental 字段；与本轮 commit（GITHUB_SHA）不一致一律拒。三条缺一即 fail-closed。
+const KILLED_BASELINE_ENV = 'XBK_MUTATION_KILLED_BASELINE'
+const KILLED_TOLERANCE_ENV = 'XBK_MUTATION_KILLED_TOLERANCE'
+const KILLED_BASELINE_MODE = 'full'
+
+function resolveKilledTolerance (raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 0
+  const text = String(raw).trim()
+  // 只认非负整数：'-1' / '1.5' / '1e3' 都会让「下降」判据变形（负容忍等于反向放宽），一律拒
+  if (!/^\d+$/.test(text)) throw new Error(`${KILLED_TOLERANCE_ENV} 必须是非负整数（收到 ${JSON.stringify(raw)}）`)
+  return Number(text)
+}
+
+/**
+ * 读取并校验 killed 基线（判据 ⑤ 的输入）。任何一条不满足都 throw（调用侧按 fail-closed 处理）。
+ * @param {string} filePath 基线 JSON 路径（XBK_MUTATION_KILLED_BASELINE）
+ * @param {{commit?: string, maxFileBytes?: number}} [options] commit = 本轮 commit（CI 的 GITHUB_SHA）
+ * @returns {{commit: string, segments: Map<string, number>}}
+ */
+function readKilledBaseline (filePath, options = {}) {
+  const maxFileBytes = Number.isFinite(options.maxFileBytes)
+    ? options.maxFileBytes
+    : resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES)
+  let stat
+  try {
+    stat = fs.statSync(filePath)
+  } catch (err) {
+    throw new Error(`基线文件不可读（${filePath}）：${err.message}`)
+  }
+  if (!stat.isFile()) throw new Error(`基线不是普通文件（${filePath}）`)
+  if (stat.size > maxFileBytes) throw new Error(`基线文件过大（${stat.size} > ${maxFileBytes} 字节）`)
+  let baseline
+  try {
+    baseline = JSON.parse(fs.readFileSync(filePath, 'utf8')) // nosemgrep（路径来自显式配置的基线变量）
+  } catch (err) {
+    throw new Error(`基线不是合法 JSON（${filePath}）：${err.message}`)
+  }
+  if (!baseline || typeof baseline !== 'object' || Array.isArray(baseline)) {
+    throw new Error(`基线顶层结构非法（${describe(baseline)}）`)
+  }
+  // 增量/复用痕迹一律拒：增量复用会把上一轮的 killed 原样搬过来，与「本轮测试变弱」不可区分
+  for (const key of ['reuse', 'incremental', 'incrementalFile']) {
+    if (Object.prototype.hasOwnProperty.call(baseline, key)) {
+      throw new Error(`基线带 ${key} 字段 ⇒ 疑似上一轮 artifact / 增量结果，不能当基线（这就是本判据默认关闭的原因）`)
+    }
+  }
+  if (baseline.mode !== KILLED_BASELINE_MODE) {
+    throw new Error(`基线的 mode 必须是 ${JSON.stringify(KILLED_BASELINE_MODE)}（全量重算），实际 ${JSON.stringify(baseline.mode)}`)
+  }
+  if (typeof baseline.commit !== 'string' || baseline.commit.trim() === '') {
+    throw new Error('基线缺 commit 字段（必须是产出该基线的那个 commit）')
+  }
+  const expectedCommit = typeof options.commit === 'string' ? options.commit.trim() : ''
+  if (expectedCommit === '') {
+    throw new Error('无法确认基线与本轮同 commit：本轮 commit 需由 GITHUB_SHA 提供（跨 commit 的 killed 不可比）')
+  }
+  if (baseline.commit !== expectedCommit) {
+    throw new Error(`基线的 commit(${baseline.commit}) 与本轮 commit(${expectedCommit}) 不一致：跨 commit 的 killed 不可比`)
+  }
+  const segments = baseline.segments
+  if (!segments || typeof segments !== 'object' || Array.isArray(segments)) {
+    throw new Error(`基线缺 segments 映射（实际 ${describe(segments)}）`)
+  }
+  const map = new Map()
+  for (const [name, value] of Object.entries(segments)) {
+    const killed = value && typeof value === 'object' && !Array.isArray(value) ? value.killed : undefined
+    if (!Number.isInteger(killed) || killed < 0) {
+      throw new Error(`基线 segments["${name}"].killed 必须是非负整数（实际 ${JSON.stringify(killed)}）`)
+    }
+    map.set(name, killed)
+  }
+  if (map.size === 0) throw new Error('基线的 segments 为空 ⇒ 无判据可比')
+  return { commit: baseline.commit, segments: map }
+}
+
 function parseArgs (argv) {
   const paths = []
   let segment = null
+  let segmentSource = null
+  // 口径（C10-054）：未知或**非法**参数一律 fail-closed。此前的三处静默接受都并进来：
+  //   * `--segment=`（空取值）→ 旧实现 trim 后置 null，守卫在**没有标签**的情况下继续跑；
+  //   * `--segment --label x` → 旧实现把 `--label` 当段名、`x` 当报告路径（真错时只报「文件不可读」，误导）；
+  //   * 重复 `--segment a --segment b`（或 `--segment` 与 `--label` 同时给）→ 旧实现后者静默覆盖前者。
+  const takeSegment = (source, raw) => {
+    const value = String(raw)
+    if (value.trim() === '') throw new Error(`${source} 取值为空（fail-closed：空取值会让守卫在没有段标签的情况下继续跑）`)
+    if (value.startsWith('-')) throw new Error(`${source} 的取值 ${value} 看起来是另一个参数（fail-closed：参数不明时拒绝静默放行）`)
+    if (segmentSource !== null) throw new Error(`${source} 重复指定段名（已由 ${segmentSource} 给出「${segment}」）—— fail-closed：取哪个都不该靠猜`)
+    segment = value
+    segmentSource = source
+  }
   for (let i = 0; i < argv.length; i++) {
     const a = String(argv[i])
     if (a === '--segment' || a === '--label') {
       const v = argv[i + 1]
       if (v === undefined) throw new Error(`${a} 缺少取值`)
-      segment = String(v)
+      takeSegment(a, v)
       i++
     } else if (a.startsWith('--segment=')) {
-      segment = a.slice('--segment='.length)
+      takeSegment('--segment=', a.slice('--segment='.length))
     } else if (a === '--') {
       for (let j = i + 1; j < argv.length; j++) paths.push(String(argv[j]))
       break
@@ -214,7 +327,6 @@ function parseArgs (argv) {
       paths.push(a)
     }
   }
-  if (segment !== null && segment.trim() === '') segment = null
   return { paths, segment }
 }
 
@@ -232,6 +344,10 @@ function evaluateReports (reportPaths, options = {}) {
   const maxFileBytes = Number.isFinite(options.maxFileBytes)
     ? options.maxFileBytes
     : resolveMaxReportBytes(env.XBK_MUTATION_REPORT_MAX_BYTES) // 复用同一份上限解析，不另写
+  // 判据 ⑤（可选）：仅当调用方显式传入 { commit, segments: Map } 基线时比较 killed；未传 = 无该判据
+  const baseline = options.baseline && options.baseline.segments instanceof Map ? options.baseline : null
+  const killedTolerance = Number.isFinite(options.killedTolerance) ? options.killedTolerance : 0
+  let comparedSegments = 0
   const reports = []
   const failures = []
   for (const reportPath of reportPaths) {
@@ -258,6 +374,22 @@ function evaluateReports (reportPaths, options = {}) {
     reports.push({ label, reportPath, counts, timeoutStats: collectTimeoutStats(report, label) })
     if (counts.runtimeErrors > 0) failures.push({ kind: 'runtimeErrors', label, reportPath, counts })
     if (counts.totalValid === 0) failures.push({ kind: 'noValidMutants', label, reportPath, counts })
+    // 判据 ⑤：killed 不得低于同 commit 全量重算基线（容忍值内视为抖动）。本段不在基线里 ⇒ 无法比较 ⇒ 判红。
+    if (baseline) {
+      const baselineKilled = baseline.segments.get(label)
+      if (baselineKilled === undefined) {
+        failures.push({ kind: 'baselineMissingSegment', label, reportPath, counts })
+      } else {
+        comparedSegments++
+        if (counts.killed < baselineKilled - killedTolerance) {
+          failures.push({ kind: 'killedDrop', label, reportPath, counts, baselineKilled, killedTolerance })
+        }
+      }
+    }
+  }
+  // 基线与本次报告零交集（段名全对不上）⇒ 判据 ⑤ 实际上没判任何东西，必须响亮失败而不是假绿。
+  if (baseline && comparedSegments === 0 && reports.length > 0) {
+    failures.push({ kind: 'baselineNoOverlap', label: baseline.commit, reportPath: reportPaths.join(', '), counts: null })
   }
   return { ok: failures.length === 0, reports, failures }
 }
@@ -298,6 +430,26 @@ function describeFailure (f) {
         `   计数：${formatCounts(f.counts)}`,
         `   路径：${f.reportPath}`
       ].join('\n')
+    case 'killedDrop':
+      return [
+        head + `killed 数下降：本轮 ${f.counts.killed} < 基线 ${f.baselineKilled}（容忍 ${f.killedTolerance}）。`,
+        '   判据 ⑤（需显式提供「同 commit 全量重算」基线）：killed 下降意味着测试变弱或变异目标被静默缩水，',
+        '   不能用「分数抖动」解释。若确认为抖动，请在基线侧提高 XBK_MUTATION_KILLED_TOLERANCE，不要改本守卫。',
+        `   计数：${formatCounts(f.counts)}`,
+        `   路径：${f.reportPath}`
+      ].join('\n')
+    case 'baselineMissingSegment':
+      return [
+        head + '本段不在 killed 基线的 segments 里 ⇒ 无法比较（fail-closed：基线必须覆盖被比较的段）。',
+        `   段：${f.label}`,
+        `   路径：${f.reportPath}`
+      ].join('\n')
+    case 'baselineNoOverlap':
+      return [
+        head + '基线里的段与本次报告零交集 ⇒ 判据 ⑤ 没有判到任何东西（fail-closed，不接受「没比到就算通过」）。',
+        `   基线 commit：${f.label}`,
+        `   报告：${f.reportPath}`
+      ].join('\n')
     default:
       return head + `未知失败类型 ${f.kind}（fail-closed）`
   }
@@ -325,7 +477,30 @@ function run (argv, io = {}) {
     err.write('   用法：node scripts/mutation-guard.js [--segment <段名>] <mutation.json> [更多报告...]\n')
     return 1
   }
-  const { ok, reports, failures } = evaluateReports(parsed.paths, { segment: parsed.segment, env })
+  // 判据 ⑤ 的输入（默认关闭）：只有显式设置 XBK_MUTATION_KILLED_BASELINE 才比较 killed。
+  // 基线不可用（读不到/结构非法/跨 commit/带增量痕迹）⇒ 立刻 fail-closed，不进入「没有判据」的假绿。
+  let baseline = null
+  let killedTolerance = 0
+  try {
+    killedTolerance = resolveKilledTolerance(env[KILLED_TOLERANCE_ENV])
+    const baselineRaw = env[KILLED_BASELINE_ENV]
+    if (baselineRaw !== undefined) {
+      const baselinePath = String(baselineRaw).trim()
+      if (baselinePath === '') throw new Error(`${KILLED_BASELINE_ENV} 不能为空串（不启用请删除该变量，不要置空）`)
+      baseline = readKilledBaseline(baselinePath, {
+        commit: env.GITHUB_SHA,
+        maxFileBytes: resolveMaxReportBytes(env.XBK_MUTATION_REPORT_MAX_BYTES)
+      })
+    }
+  } catch (e) {
+    err.write(`❌ 守卫参数非法：killed 基线不可用 —— ${String((e && e.message) || e)}\n`)
+    err.write('   基线必须是**同一 commit 的全量重算**结果（mode:"full" + commit + segments），不得用上一轮 artifact/增量结果。\n')
+    return 1
+  }
+  if (baseline) {
+    out.write(`ℹ️ killed 下降门禁已启用（判据 ⑤）：基线 commit=${baseline.commit}，${baseline.segments.size} 段，容忍 ${killedTolerance}\n`)
+  }
+  const { ok, reports, failures } = evaluateReports(parsed.paths, { segment: parsed.segment, env, baseline, killedTolerance })
   // Timeout 取证落盘（可观测性）：写在报告同目录（CI = reports/mutation/timeout-stats.json，随 artifact 上传）。
   // **绝不**影响退出码：写失败只告警——取证文件缺失不该把一段本该绿的 job 判红（日报会把缺取证显示成 `—`，
   // 不静默当 0）。放在判失败之前：即使本段红（如 RuntimeError），Timeout 的成因同样值得留档。
@@ -371,6 +546,10 @@ module.exports = {
   classifyTimeoutReason,
   collectTimeoutStats,
   writeTimeoutStats,
+  readKilledBaseline,
+  resolveKilledTolerance,
+  KILLED_BASELINE_ENV,
+  KILLED_TOLERANCE_ENV,
   TIMEOUT_STATS_FILENAME,
   HIT_LIMIT_PREFIX
 }
