@@ -235,8 +235,20 @@ jobs:
       # 升级须同时改本机与此处（防口径漂移）。CI 下缺工具由脚本 fail-closed——扫描器失踪=红，
       # 「静默绿」等价于门禁不存在。
       - name: 静态扫描闸门（shellcheck + zizmor）
+        env:
+          # C10-046：shellcheck 与 zizmor 都**钉版本**——扫描口径必须由本仓决定，不能随 runner 镜像
+          # 漂移。SHELLCHECK_VERSION = 本机基线（`shellcheck --version`）；升级时本机 apt/pipx 与
+          # 此处两处同步，并对 .githooks 重跑 npm run check:ci-static 复核发现集合。
+          SHELLCHECK_VERSION: '0.9.0'
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
+          found="$(shellcheck --version | sed -n 's/^version: //p')"
+          if [ "$found" != "$SHELLCHECK_VERSION" ]; then
+            echo "❌ shellcheck 版本漂移：期望 $SHELLCHECK_VERSION，实际 ${found:-未知}"
+            echo "   runner 镜像换了 shellcheck ⇒ 扫描口径随之变化，不许静默放行。"
+            echo "   先在本机同版本跑 npm run check:ci-static 复核发现集合，再改 SHELLCHECK_VERSION。"
+            exit 1
+          fi
           pipx install zizmor==1.30.1
           npm run check:ci-static
 
