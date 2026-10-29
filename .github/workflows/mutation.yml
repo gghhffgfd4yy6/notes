@@ -158,10 +158,13 @@ jobs:
     # validateSegments 会因缺段硬失败（把一次超时放大成整份日报发不出来）。
     # 正确做法是把时限压在**变异测试那一步**上：step 级超时只杀那一步、job 继续跑，
     # 下方 if: always() 的步骤仍有窗口（见该 step 的 timeout-minutes: 330）。
-    # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间）：
-    #   （C=2 时代）check-deps 215.2min、utils 205.1min、message-store 194.6min、sendnotify-part2 91.7min，
-    #   其余 15 段 1.3-81.3min。step 级 330 高于任何实测段耗时 ⇒ 不会新增误杀；
+    # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间；**现矩阵 32 段**，run 40515518642）：
+    #   全矩阵最慢是 command 档 qinglong-push 的「变异测试」单步 **150.9min**，次高 check-deps 102.9min、
+    #   v3-entry 82.6min、storage 78.1min ⇒ step 级 330 对最慢段仍有 2.2x 余量，不会新增误杀；
     #   而某步真挂死时，job 级 360（平台硬上限）仍是唯一的上界。
+    # ⚠️ 别把「某次实测数字」当预算的唯一依据：同一段 qinglong-push 在 **1.7–150.9min** 间摆动（增量复用
+    #   几乎全命中时同日 run 40504645205 只跑 1.7min）⇒ 预算按**最坏一次**定，单点实测只能证「不会误杀」，
+    #   不能证「一定够快」。拆分前的 19 段 / C=2 口径（215.2min / 205.1min 等）已作废，不再引用。
     timeout-minutes: 360
     permissions:
       contents: read
@@ -565,8 +568,12 @@ jobs:
       #   成立（未重测最优值）。storage 段仍走 command 档，沿用同一取值。
       # 为什么时限加在**这一步**而不是靠 job 级的「留 10 分钟」（PR #156 返工）：job 级超时会把同一 job
       # 后续所有步骤一起杀掉（详见 job 级 timeout-minutes 注释），step 级超时只杀这一步、job 继续跑 ⇒
-      # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于实测最大段耗时
-      # （C=2 时代 command 档 check-deps 215.2min；C=8 实测最长段 command 档 qinglong-push **90.1min**（run 35827096127，head 01c0ef89；PR-1 那轮同段 85.3min，run 35646992130）、TAP 档 utils **70.4min**（**job 口径**；run 35646992130 的 16 TAP + 3 command 那轮；全 TAP 基线的 utils 见文件头；本矩阵本轮 41.0min））⇒ 正常段落不会被误杀。
+      # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于**现矩阵**实测最大段耗时
+      # （command 档 qinglong-push 的「变异测试」单步 **150.9min**，run 40515518642，2026-10-27；次高
+      # check-deps 102.9min、v3-entry 82.6min、storage 78.1min）⇒ 余量 2.2x，正常段落不会被误杀；
+      # 该段耗时随增量复用命中率在 **1.7–150.9min** 间摆动（同日 run 40504645205 仅 1.7min），故 330 按
+      # 最坏一次留余量、不随单点实测定。旧注释引用的 90.1min（19 段口径 run 35827096127）与 215.2min
+      # （C=2 口径）都不代表现矩阵，已不再作依据。
       # --fileLogLevel info：把 stryker 的 INFO 日志同时写进 cwd 的 stryker.log（LoggingBackend 把
       #   priority ≥ activeFileLevel 的事件写进该文件；默认 fileLogLevel 是 off ⇒ 不写文件）。
       #   这是「复用状态可见」（PR #158 Qodo Medium / Correctness）的**唯一判定源**：报告本身没有复用标记
