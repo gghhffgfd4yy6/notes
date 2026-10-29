@@ -15,29 +15,40 @@ const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDEN
 const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
 isolateProcessCacheDirEnv()
 
-const mockUtils = {
-  anonKey: (s) => 'anon' + String(s).length,
-  safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
-  getMessageIdentity: () => ({ valid: false }),
-  isValidItem: () => true,
-  num: () => 10000,
-  addIndex: () => {}
+// 夹具装配只允许一处真相（C5-075）：父进程 store / 探针 store / 子进程 preamble 全部由下面两个工厂生成。
+// 子进程侧用 Function.prototype.toString() 把同一份源码注入 `node -e`——工厂签名或 Config 口径一变自动同步；
+// 旧实现把这段装配逐字抄进 CHILD_PREAMBLE，签名一变子进程就静默停在旧副本上（探针在测过期夹具，套件仍绿）。
+function buildMockUtils () {
+  return {
+    anonKey: (s) => 'anon' + String(s).length,
+    safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
+    getMessageIdentity: () => ({ valid: false }),
+    isValidItem: () => true,
+    num: () => 10000,
+    addIndex: () => {}
+  }
 }
 
-const store = createMessageStore({
-  Config: { cache: { maxSize: 10000 } },
-  Utils: mockUtils,
-  fs: {
-    existsSync: () => true,
-    lstatSync: () => ({ isDirectory: () => true }),
-    realpathSync: (p) => p
-  },
-  path,
-  crypto: { randomUUID: () => 'uuid' },
-  normalize: () => {},
-  storage: {},
-  constants: {}
-})
+const mockUtils = buildMockUtils()
+
+function buildFixtureStore ({ createMessageStore, path, storage, Utils }) {
+  return createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils,
+    fs: {
+      existsSync: () => true,
+      lstatSync: () => ({ isDirectory: () => true }),
+      realpathSync: (p) => p
+    },
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: storage || {},
+    constants: {}
+  })
+}
+
+const store = buildFixtureStore({ createMessageStore, path, Utils: mockUtils })
 
 let pass = 0
 let fail = 0
@@ -63,48 +74,20 @@ function tombstoneBytes (ts) {
 
 // 注入 writeAtomic 探针，用于证明「放弃持久化」时确实没有写盘。
 function createProbeStore (storage) {
-  return createMessageStore({
-    Config: { cache: { maxSize: 10000 } },
-    Utils: mockUtils,
-    fs: {
-      existsSync: () => true,
-      lstatSync: () => ({ isDirectory: () => true }),
-      realpathSync: (p) => p
-    },
-    path,
-    crypto: { randomUUID: () => 'uuid' },
-    normalize: () => {},
-    storage: storage || {},
-    constants: {}
-  })
+  return buildFixtureStore({ createMessageStore, path, storage, Utils: mockUtils })
 }
 
 // 死循环守卫的「有限时间」证明必须借子进程设界：同进程内的 setTimeout 无法中断同步
 // 自旋，只有 execFileSync 的 timeout 能杀掉挂死调用。子进程共用一段 store 装配前导，
 // 后接各自探针体；NODE_OPTIONS 的 execpath-shim 已把 process.execPath 指向真实 node，
-// 与 test_cli.js 同一手法。
+// 与 test_cli.js 同一手法。装配由父进程工厂源码生成（C5-075），不再手抄一份。
 const CHILD_PREAMBLE = `
 const path = require('node:path')
 const { createMessageStore } = require('./xbk_message_store')
-const mockUtils = {
-  anonKey: (s) => 'anon' + String(s).length,
-  safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
-  getMessageIdentity: () => ({ valid: false }),
-  isValidItem: () => true,
-  num: () => 10000,
-  addIndex: () => {}
-}
+const mockUtils = (${buildMockUtils.toString()})()
+const buildFixtureStore = ${buildFixtureStore.toString()}
 function makeStore (storage) {
-  return createMessageStore({
-    Config: { cache: { maxSize: 10000 } },
-    Utils: mockUtils,
-    fs: { existsSync: () => true, lstatSync: () => ({ isDirectory: () => true }), realpathSync: (p) => p },
-    path,
-    crypto: { randomUUID: () => 'uuid' },
-    normalize: () => {},
-    storage: storage || {},
-    constants: {}
-  })
+  return buildFixtureStore({ createMessageStore, path, storage, Utils: mockUtils })
 }
 `
 
@@ -338,6 +321,42 @@ check('_saveTombstones: 可达标时正常序列化并交给 writeAtomic（对�
   assert.strictEqual(writes.length, 1, '应恰好调用一次 writeAtomic')
   assert.ok(writes[0].p.endsWith('dsh_probe_ok.seen.json'), '写入目标应为 <filePath>.seen.json')
   assert.strictEqual(Buffer.byteLength(writes[0].text, 'utf8'), 53, '写入内容应为 53 字节空墓碑文本')
+})
+
+// ===== C5-031：放弃持久化分支必须在**进程内**执行（TAP 覆盖可归因）=====
+// 同一行为已由上面带超时的子进程探针验过，但 TAP 档 perTest 覆盖只归因到测试进程：变异目标只在
+// 子进程里被执行 ⇒ 判 NoCoverage 且不跑任何测试（message-store 段 3 个击杀静默丢失）。
+// 这里用**真实入参**（空墓碑 + maxBytes=1）在进程内走完「淘汰无法达标 ⇒ 放弃持久化」整条链；
+// 子进程探针保留——死循环守卫的「有限时间」证明必须靠外部 timeout。
+check('_saveTombstones: 无法达标时放弃持久化（告警 + 不写盘 + 返回 false）在进程内被执行（覆盖可归因）', () => {
+  const writes = []
+  const probe = createProbeStore({ writeAtomic: (p) => { writes.push(p); return true } })
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  try {
+    const ret = probe._saveTombstones(path.join(__dirname, 'dsh_probe_inproc'), emptyTombstoneMaps(), 1)
+    assert.strictEqual(ret, false, '无法通过淘汰达标时应放弃持久化并返回 false')
+    assert.strictEqual(writes.length, 0, '放弃持久化时不得调用 writeAtomic 写盘')
+    assert.ok(warns.some((w) => w.includes('放弃持久化') && w.includes('dsh_probe_inproc.seen.json')),
+      `应告警「超限且无法通过淘汰达标，放弃持久化」并带上路径，实际告警: ${JSON.stringify(warns)}`)
+  } finally {
+    console.warn = origWarn
+  }
+})
+
+// ===== C5-075：子进程夹具必须与父进程同源 =====
+// 旧实现把父进程的 mockUtils + createMessageStore 装配逐字抄进 CHILD_PREAMBLE；工厂签名/Config 口径一变
+// 子进程侧就静默停在旧副本上，探针变成「在测一份过期的夹具」而套件仍绿。下面两条把同源关系钉死。
+check('CHILD_PREAMBLE: 不得内联一份 createMessageStore 装配（必须由父进程夹具工厂生成）', () => {
+  assert.ok(!/const mockUtils = \{/.test(CHILD_PREAMBLE), 'preamble 不得再手抄 mockUtils 字面量：工厂签名/Config 一变就静默漂移')
+  assert.ok(CHILD_PREAMBLE.includes(String(buildFixtureStore)) && CHILD_PREAMBLE.includes(String(buildMockUtils)),
+    'preamble 必须由 buildFixtureStore/buildMockUtils 源码生成（父进程/探针/子进程同源）')
+})
+
+check('CHILD_PREAMBLE: 子进程夹具与父进程夹具对拍（_resolveMaxSize 同值）', () => {
+  const child = runChildProbe('process.stdout.write(String(makeStore()._resolveMaxSize()))').trim()
+  assert.strictEqual(child, String(store._resolveMaxSize()), '子进程夹具必须与父进程同源（不得是抄过去的旧副本）')
 })
 
 // ===== QX-08：缓存目录解析由生产与青龙 --status 共用同一实现 =====
@@ -648,42 +667,40 @@ check('F7 残留: getFileName 性质测试——同名缓存文件必来自等�
 // （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
 // → 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。这里用真实 Utils + 假 fs +
 // 内存权威数组做单元级 oracle 对拍（oracle = _indexHasIdentityDirect 零索引线性扫描）。
-const identityStore = createMessageStore({
-  Config: { cache: { maxSize: 10000 } },
-  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
-  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
-  path,
-  crypto: { randomUUID: () => 'uuid' },
-  normalize: () => {},
-  storage: {
-    readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
-    writeAtomic: () => true,
-    writeAtomicIfAbsent: () => true
-  },
-  constants: {
-    DEFAULT_MAX_SIZE: 10000,
-    MESSAGE_CACHE_MAX_BYTES: 8388608,
-    TOMBSTONE_MAX_KEYS: 5000,
-    TOMBSTONE_MAX_BYTES: 262144,
-    TOMBSTONE_LOCK_STALE_MS: 10000
-  }
-})
+// C5-077：每次 seed 都 new 一个实例——隔离由构造保证，不再靠「文件名不撞」的命名约定，
+// 也不需要手工回退 _memoryCache / _memoCount / _verified（旧写法一旦漏写或换名，陈旧条目
+// 就被下一个用例当作「已推送」判重，曾实锤漏推假绿）。
+function makeIdentityStore () {
+  return createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+    fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: {
+      readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
+      writeAtomic: () => true,
+      writeAtomicIfAbsent: () => true
+    },
+    constants: {
+      DEFAULT_MAX_SIZE: 10000,
+      MESSAGE_CACHE_MAX_BYTES: 8388608,
+      TOMBSTONE_MAX_KEYS: 5000,
+      TOMBSTONE_MAX_BYTES: 262144,
+      TOMBSTONE_LOCK_STALE_MS: 10000
+    }
+  })
+}
+
+let identityStore = makeIdentityStore()
 
 function seedIdentityProbe (messages, name) {
+  // 全新实例 ⇒ 同一用例内不存在前序用例的 _memoryCache/_verified/_memoCount 残留
+  identityStore = makeIdentityStore()
   // 必须经 getFilePath 求路径：has(message, filename) 内部同样先 getFilePath(filename)，
   // 直接塞绝对路径会让两次路径不一致、内存权威数组命不中。
   const fp = identityStore.getFilePath(name)
-  // ⚠️ 状态泄漏防御（用例间状态猎杀 #198 后续）：identityStore 是模块级共享实例，
-  // _memoryCache/_verified/_memoCount 跨用例累积且 _verified 恒真永不重读磁盘——
-  // 前一用例 mutate 后的陈旧快照会被后续用例当作「已推送」判重（曾实锤复现：
-  // f02_form_2_22.json 派生名碰撞 + f02_stale.json 原地改写后 has 误真）。
-  // 同名 fp 的旧条目在重新 seed 前先清掉：陈旧快照/verified 标志/计数一起回退，
-  // 使每个 seed 用例看到的是「干净的同名缓存文件」而非前序用例的遗留态。
-  if (Object.prototype.hasOwnProperty.call(identityStore._memoryCache, fp)) {
-    delete identityStore._memoryCache[fp]
-    identityStore._memoCount -= 1
-    identityStore._verified.delete(fp)
-  }
   identityStore._memoryCache[fp] = messages
   identityStore._memoCount += 1
   identityStore._verified.add(fp) // 跳过「内存命中未验证」的真实磁盘检查
@@ -1982,6 +1999,18 @@ check('_probeIndexMiss: 小数组（n<=8）必须整表抽查（首次未命中�
   assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true }, 'n=8 必须整表抽查，第 5 位字段改写必须被看见')
 })
 
+// ===== C5-077：identityStore 隔离必须由「每用例新实例」保证，不能靠命名约定 + 手工回退计数 =====
+// 旧实现是模块级共享实例，seedIdentityProbe 靠删 _memoryCache[fp] / _memoCount -= 1 / _verified.delete
+// 手工回退；一旦新用例换了文件名或忘写清理，陈旧条目与 _memoCount 就跨用例累积（曾实锤漏推假绿）。
+check('identity 隔离：每个 seed 用例拿到全新实例（_memoCount/_verified 不得跨用例累积）', () => {
+  seedIdentityProbe([{ id: 'iso-1' }], 'iso_probe_1.json')
+  assert.strictEqual(identityStore._memoCount, 1, `seed 之后 _memoCount 必须只反映本次 seed，实际 ${identityStore._memoCount}（模块级实例跨用例累积）`)
+  seedIdentityProbe([{ id: 'iso-2' }], 'iso_probe_2.json')
+  assert.strictEqual(identityStore._memoCount, 1, '再次 seed 必须仍是 1 条（不得把上一个用例的条目带过来）')
+  assert.deepStrictEqual(Object.keys(identityStore._memoryCache), [identityStore.getFilePath('iso_probe_2.json')], '不得残留前一用例的缓存条目')
+  assert.strictEqual(identityStore._verified.size, 1, '_verified 不得累积')
+})
+
 // ===== 补测 PlanP：getFilePath / _getTombstoneProcessStart（message-store 未直测的方法）=====
 // 反例（改动前）：两者在既有 104 项里只经高层路径间接覆盖，其**消毒/回退/截断**与
 // **/proc 解析**的精确口径从未被直接断言 —— 本段用 createProbeStore 直接调用。
@@ -2751,10 +2780,9 @@ check('C3-002: 带 XBK_CACHE_DIR 启动子进程——raw 仍写 env 目录（�
   }
 })
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
-// ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
-// seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
-// _memoryCache/_verified/_memoCount 仍会在套件结束后残留——同进程聚合执行（变异测试/
-// 合并 runner）时污染后续套件。退场统一清空，保证套件边界零残留。
+// ===== 套件退场：清掉最后一个 identityStore 实例的残留（用例间状态猎杀 #198 后续）=====
+// 隔离已由 makeIdentityStore 每用例新实例保证；这里兜底清一次，保证套件边界零残留——
+// 同进程聚合执行（变异测试 / 合并 runner）时不会把最后一条 seed 的条目带进后续套件。
 for (const fp of Object.keys(identityStore._memoryCache)) {
   delete identityStore._memoryCache[fp]
   identityStore._verified.delete(fp)
