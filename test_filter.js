@@ -1368,6 +1368,8 @@ console.log('========================================\n');
   await test('content_html 为 undefined → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
     assertEqual(typeof r, 'string')
+    // C4-008：typeof 只排掉「返回非字符串」，空串 / 丢尾巴都能过——钉住精确输出
+    assertEqual(r, '原文链接：[http://x](http://x)', '无 content_html 时应只剩原文链接尾巴')
   })
 
   // ==================== 20. 缓存管理 更多场景 ====================
@@ -2481,6 +2483,7 @@ console.log('========================================\n');
   await test('htmlToMarkdown 空 content_html → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
     assertEqual(typeof r, 'string')
+    assertEqual(r, '原文链接：[http://x](http://x)', 'content_html 缺失时应只剩原文链接尾巴')
   })
 
   await test('天数过滤 pingbitime=0 → 不拦截任何人', () => {
@@ -2903,6 +2906,13 @@ console.log('========================================\n');
     assertEqual(typeof Config.filter.zhanxianlouzhu, 'string')
     assertEqual(typeof Config.filter.pingbilouzhuplus, 'string')
     assertEqual(typeof Config.filter.pingbitime, 'string')
+    // C4-008：11 条 typeof 只证明「都是字符串」，缺字段 / 多字段 / 默认配置编译不了都照样绿
+    assert.deepStrictEqual(Object.keys(Config.filter).sort(),
+      ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus',
+        'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu',
+        'zhanxianneirong'],
+      '默认过滤配置的字段集合必须与 compileRules 口径一致（缺/多都算回归）')
+    assertEqual(compileRules(Config.filter).__compiled, true, '默认过滤配置必须能编译出 __compiled')
   })
 
   await test('修改 domain 后 pushUrl 联动变化', () => {
@@ -3250,6 +3260,7 @@ console.log('========================================\n');
     _ensureFileExists(path.join(CACHE, 'test_read.json'))
     const msgs = readMessages(path.join(CACHE, 'test_read.json'))
     assertEqual(Array.isArray(msgs), true)
+    assertEqual(msgs.length, 0, '空文件应返回空数组（返回占位元素/脏数据都算回归）')
   })
 
   await test('saveMessages 写入后 readMessages 可读', () => {
@@ -4047,21 +4058,27 @@ console.log('========================================\n');
   await test('tuisong_replace shuju为null → 不崩溃', () => {
     const r = tuisong_replace('{标题}', null)
     assertEqual(typeof r, 'string')
+    assertEqual(r, '', '数据为 null 时应渲染成空串（不能把占位符原样吐出）')
   })
 
   await test('htmlToMarkdown shuju为null → 不崩溃', () => {
     const r = htmlToMarkdown(null)
     assertEqual(typeof r, 'string')
+    assertEqual(r, '', '入参为 null 时应返回空串')
   })
 
   await test('compileRules rawCfg为null → 不崩溃', () => {
     const r = compileRules(null)
     assertEqual(typeof r, 'object')
+    // C4-008：`typeof null === 'object'` ⇒ 原断言对「返回 null」也成立，这里钉住真实形态
+    assertEqual(r.__compiled, true, 'null 配置应编译成空规则集（__compiled 标记必须为 true）')
+    assertEqual(r.pingbibiaoti, null, 'null 配置下每条规则都应为 null（不放行任何规则）')
   })
 
   await test('validateConfig cfg为null → 不崩溃', () => {
     const warns = validateConfig(null)
     assertEqual(Array.isArray(warns), true)
+    assertEqual(warns.length, 0, 'null 配置没有可校验字段，不该凭空告警')
   })
 
   await test('MessageStore has message为null → 不崩溃', () => {
@@ -4072,16 +4089,22 @@ console.log('========================================\n');
   await test('getFileName url为undefined → 不崩溃', () => {
     const r = getFileName(undefined)
     assertEqual(typeof r, 'string')
+    assertEqual(r, 'default.json', '无 URL 时应回落到 default.json（返回空串会让所有写入撞同一空名）')
   })
 
   await test('daysComputed time为0 → 不崩溃', () => {
     const r = daysComputed(0)
     assertEqual(typeof r, 'number')
+    // 独立 oracle：time=0 是 epoch，天数 = UTC 今天与 1970-01-01 的自然日差
+    const nowD = new Date()
+    const utcToday = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate())
+    assertEqual(r, Math.floor((utcToday - 0) / 86400000), 'time=0 应按 epoch 起算的天数（0/NaN 都算回归）')
   })
 
   await test('decodeHtmlEntities 输入数字 → 不崩溃', () => {
     const r = decodeHtmlEntities(123)
     assertEqual(typeof r, 'string')
+    assertEqual(r, '123', '数字入参应转成其字符串形态（返回空串/undefined 文案都算回归）')
   })
 
   await test('tuisong_replace posttime=0 → 正常处理', () => {
@@ -4096,11 +4119,16 @@ console.log('========================================\n');
   await test('htmlToMarkdown content_html为数字 → 不崩溃', () => {
     const r = htmlToMarkdown({ content_html: 12345, url: 'http://x' })
     assertEqual(typeof r, 'string')
+    assertEqual(r, '原文链接：[http://x](http://x)', '非字符串 content_html 应被忽略（不得把 12345 漏进正文）')
   })
 
   await test('daysComputed time为数字 → 不崩溃', () => {
     const r = daysComputed(20260728)
     assertEqual(typeof r, 'number')
+    // 20260728 是 YYYYMMDD 形态，应解析成 2026-07-28 而不是当毫秒数
+    const nowD = new Date()
+    const utcToday = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate())
+    assertEqual(r, Math.floor((utcToday - Date.UTC(2026, 6, 28)) / 86400000), 'YYYYMMDD 应按日期解析')
   })
 
   await test('decodeHtmlEntities 连续实体 → 全部解码', () => {
@@ -4111,11 +4139,15 @@ console.log('========================================\n');
   await test('validateConfig 字段值为数字 → 不崩溃', () => {
     const warns = validateConfig({ pingbibiaoti: 12345 })
     assertEqual(Array.isArray(warns), true)
+    assertEqual(warns.length, 1, '单个非法字段应恰好告警一次')
+    assertEqual(warns[0].includes('pingbibiaoti') && warns[0].includes('应为字符串'), true,
+      `告警必须点名字段与原因（实际: ${warns[0]}）`)
   })
 
   await test('compileRules 字段值为数字 → 不崩溃', () => {
     const r = compileRules({ pingbibiaoti: 12345 })
     assertEqual(typeof r, 'object')
+    assertEqual(r.pingbibiaoti, null, '数字值的规则必须被跳过（null），不能编译成恒真/恒假正则')
   })
 
   // ==================== 51. 第10-20轮边界覆盖 ====================
@@ -4136,6 +4168,8 @@ console.log('========================================\n');
   await test('compileRules 负天数', () => {
     const r = compileRules({ pingbitime: '-5' })
     assertEqual(typeof r.pingbitime, 'object')
+    // C4-008：`typeof null === 'object'` ⇒ 原断言连「负天数被静默接受」都测不出来
+    assertEqual(r.pingbitime, null, '负天数必须判为非法（null），不得编译出时间规则')
   })
 
   await test('tuisong_replace posttime为字符串', () => {
@@ -4154,6 +4188,7 @@ console.log('========================================\n');
   await test('htmlToMarkdown 纯空格内容', () => {
     const r = htmlToMarkdown({ content_html: '   ', url: 'http://x' })
     assertEqual(typeof r, 'string')
+    assertEqual(r, '原文链接：[http://x](http://x)', '纯空白正文不应留下空行块（只保留原文链接）')
   })
 
   await test('compileRules 多行含空行', () => {
@@ -4364,6 +4399,9 @@ console.log('========================================\n');
     // 大小写不同的配置不报错（i flag 正常）
     const warns = validateConfig({ pingbibiaoti: 'JINGDONG' })
     assertEqual(Array.isArray(warns), true)
+    assertEqual(warns.length, 0, '合法的大写规则不应产生任何告警')
+    assertEqual(matchesCompiled(compileRules({ pingbibiaoti: 'JINGDONG' }).pingbibiaoti, 'jingdong', 'x'),
+      true, '大写规则必须按大小写不敏感命中')
   })
 
   // ==================== 58. 盲区误判修复（实证发现） ====================
@@ -5673,6 +5711,8 @@ console.log('========================================\n');
     const mod = require('./xbk_function_v3.js')
     assertEqual(typeof mod.Pusher, 'object')
     assertEqual(typeof mod.Pusher.send, 'function')
+    // C4-008：`typeof null === 'object'` 且任何函数都满足 typeof 'function'——钉住导出形状与身份
+    assert.deepStrictEqual(Object.keys(mod.Pusher), ['send'], 'Pusher 只应导出 send（改名/漏导都算回归）')
   })
 
   await test('缓存裁剪给出提示（#243）', () => {
@@ -6393,7 +6433,14 @@ console.log('========================================\n');
     const c = compileRules(all)
     const g = { catename: '', louzhu: null, title: '', content: undefined }
     assertEqual(typeof listfilter(g, c), 'boolean')
-    assertEqual(Array.isArray(validateConfig(all)), true)
+    assertEqual(listfilter(g, c), true, '全部规则都非法 ⇒ 一条都不生效 ⇒ 必须放行')
+    const warns = validateConfig(all)
+    assertEqual(Array.isArray(warns), true)
+    // C4-008：非法值必须被**逐字段点名**——静默吞掉 = 用户配错规则却无人告知
+    const named = [...new Set(warns.map(w => (w.match(/「([^」]+)」/) || [])[1]).filter(Boolean))].sort()
+    assert.deepStrictEqual(named, ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu',
+      'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti',
+      'zhanxianneirong', 'zkt_gjc'], '每个非法字段都应被点名（漏报字段=该字段静默失效）')
   })
 
   // v3.311：覆盖文件读面（console GET / qinglong --check）与 App.run 共用同一套正则引擎，
@@ -6553,6 +6600,7 @@ console.log('========================================\n');
     try {
       const r = readMessages(getFilePath('test_fault_read.json'))
       assertEqual(Array.isArray(r), true)
+      assertEqual(r.length, 0, '读失败应降级为空数组（返回半读内容会让上层误判缓存全量）')
     } finally {
       fs.openSync = orig
     }
@@ -6567,6 +6615,7 @@ console.log('========================================\n');
     try {
       const r = readMessages(getFilePath('test_dual_fault.json'))
       assertEqual(Array.isArray(r), true, '双故障应仍返回数组')
+      assertEqual(r.length, 0, '双故障必须降级为空数组（不是「返回了数组」就算过）')
     } finally {
       fs.openSync = origR
       fs.writeFileSync = origW
