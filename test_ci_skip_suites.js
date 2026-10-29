@@ -1402,10 +1402,20 @@ try {
   fs.writeFileSync(path.join(shimProbeDir, 'test_suites.js'),
     "module.exports = { SUITES: [{ name: 'TAP 探针', file: 'test_stub_tap_probe.js', desc: '只用于 shim 契约' }] }\n")
   const shimProbeFile = path.join(shimProbeDir, 'test_stub_tap_probe.js')
+  // C10-008：TAP 点记录通道的探针路径（工作流里由 XBK_TAP_POINTS_LOG 注入；探针按同一口径注入）
+  const shimPointsLog = path.join(shimProbeDir, 'tap-points.jsonl')
+  const readShimRecords = () => (fs.existsSync(shimPointsLog)
+    ? fs.readFileSync(shimPointsLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    : [])
   const runShimProbe = (body) => {
     fs.writeFileSync(shimProbeFile, body)
     const env = { ...baseEnv }
     delete env.SKIP_SUITES // 跳过集合会改写 TAP 点（# SKIP），本探针要的是正常路径
+    // dry run 标志 + 记录路径都按 tap-runner / mutation.yml 的真实注入方式给（STRYKER_DRY_RUN 见
+    // tap-runner 的 dist/src/setup/env.cjs：hook.cjs 就是按它区分 dry run 与变异体跑的）
+    env.STRYKER_DRY_RUN = 'true'
+    env.XBK_TAP_POINTS_LOG = shimPointsLog
+    fs.rmSync(shimPointsLog, { force: true })
     return spawnSync(process.execPath, ['-r', path.join(shimProbeDir, 'scripts', 'tap-shim.js'), shimProbeFile],
       { cwd: shimProbeDir, encoding: 'utf8', env })
   }
@@ -1414,10 +1424,39 @@ try {
   assert.strictEqual(shimOk.status, 0, `对照：正常退出应 exit 0：${shimOk.stderr}`)
   assert.match(shimOk.stdout, /^ok 1 - test_stub_tap_probe\.js$/m, '对照：TAP 点必须投递到 stdout')
   assert.match(shimOk.stdout, /^1\.\.1$/m, '对照：plan 行必须投递到 stdout')
+  // C10-008：成功投递的点数必须落成记录（mutation.yml 的空流判据只有这一条数据来源）
+  {
+    const recs = readShimRecords()
+    assert.deepStrictEqual(recs, [{ file: 'test_stub_tap_probe.js', points: 1, exit: 0 }],
+      `成功投递 1 个 TAP 点时必须记 1 条 points=1 的记录（实得 ${JSON.stringify(recs)}）：没有记录 ⇒ 摘要按 0 点判、整段假红`)
+  }
   // 对照 2：被测文件非 0 退出 ⇒ not ok 点（README 契约：非 0 退出必须伴随失败测试点）
   const shimFail = runShimProbe('process.exit(3)\n')
   assert.strictEqual(shimFail.status, 3, '对照：被测文件退出码应被原样带出')
   assert.match(shimFail.stdout, /^not ok 1 - test_stub_tap_probe\.js # exit code 3$/m, '对照：非 0 退出必须投 not ok')
+  {
+    const recs = readShimRecords()
+    assert.deepStrictEqual(recs, [{ file: 'test_stub_tap_probe.js', points: 1, exit: 3 }],
+      `not ok 也是**已投递**的点（不能算空流），且记录必须带真实退出码：${JSON.stringify(recs)}`)
+  }
+  // 对照 3（C10-008 的落盘通道）：coverage JSON 已由 stryker 的 hook 产出时，shim 必须把 tapPoints
+  //     写进去，且**不得动** tap-runner 真正读取的 hitCount/mutantCoverage（只加一个键）。
+  {
+    const shimAnnotate = runShimProbe(
+      "const fs = require('node:fs')\n" +
+      "fs.writeFileSync('child.pid', String(process.pid))\n" +
+      "fs.writeFileSync('stryker-output-' + process.pid + '.json', JSON.stringify({ hitCount: 7, mutantCoverage: { static: { 'xbk_utils.js': { 0: 1 } } } }))\n")
+    assert.strictEqual(shimAnnotate.status, 0, `对照：注解路径不得影响退出码：${shimAnnotate.stderr}`)
+    const pid = fs.readFileSync(path.join(shimProbeDir, 'child.pid'), 'utf8').trim()
+    const coveragePath = path.join(shimProbeDir, 'stryker-output-' + pid + '.json')
+    const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'))
+    assert.strictEqual(coverage.tapPoints, 1, 'coverage JSON 必须带上本进程成功投递的 TAP 点数（tapPoints=1）')
+    assert.strictEqual(coverage.hitCount, 7, '注解不得改动 hitCount（tap-runner 的判据字段之一）')
+    assert.deepStrictEqual(coverage.mutantCoverage, { static: { 'xbk_utils.js': { 0: 1 } } },
+      '注解不得改动 mutantCoverage（tap-runner 的另一个判据字段）')
+    fs.rmSync(coveragePath, { force: true })
+    fs.rmSync(path.join(shimProbeDir, 'child.pid'), { force: true })
+  }
   // 靶向反例：fd 1 被关掉（＝storage 段 closeSync(1) 变异体的形态）⇒ 投递必然失败
   const shimClosed = runShimProbe("require('node:fs').closeSync(1)\nprocess.exit(0)\n")
   assert.strictEqual(shimClosed.stdout, '',
@@ -1426,6 +1465,27 @@ try {
     'TAP 点投递失败时必须以非 0 退出：退出码 0 + 空 stdout 会被 tap-parser 判 ok:true ⇒ 变异体静默 Survived（C10-007）')
   assert.match(shimClosed.stderr, /tap-shim: TAP 点无法投递到 stdout/,
     `投递失败必须在 stderr 留证（可诊断），实际 stderr：${JSON.stringify(shimClosed.stderr)}`)
+  // C10-008 的落盘侧反例：投递失败时记录必须是 points=0（真实退出码非 0），
+  // 这样「本段有几个 TAP 点」这件事在 shim 侧就不会自欺——旧判据（报告 tests 条数）在这里完全看不见。
+  {
+    const recs = readShimRecords()
+    assert.strictEqual(recs.length, 1, `投递失败也必须留 1 条记录（否则摘要无法区分「没跑」与「跑空」）：${JSON.stringify(recs)}`)
+    assert.strictEqual(recs[0].points, 0, `fd 1 关掉 ⇒ 成功投递 0 个点，记录必须是 0：${JSON.stringify(recs)}`)
+    assert.notStrictEqual(recs[0].exit, 0, `记录必须带真实非 0 退出码（不是 process.exit(0) 的入参 0）：${JSON.stringify(recs)}`)
+    // coverage JSON 注解也必须写 0（同一进程里两处口径一致）
+    const shimClosedCoverage = runShimProbe(
+      "const fs = require('node:fs')\n" +
+      "fs.writeFileSync('child.pid', String(process.pid))\n" +
+      "fs.writeFileSync('stryker-output-' + process.pid + '.json', JSON.stringify({ mutantCoverage: {} }))\n" +
+      "fs.closeSync(1)\nprocess.exit(0)\n")
+    assert.notStrictEqual(shimClosedCoverage.status, 0, '前提：fd 1 关掉后 shim 必须以非 0 退出')
+    const closedPid = fs.readFileSync(path.join(shimProbeDir, 'child.pid'), 'utf8').trim()
+    const closedCoveragePath = path.join(shimProbeDir, 'stryker-output-' + closedPid + '.json')
+    assert.strictEqual(JSON.parse(fs.readFileSync(closedCoveragePath, 'utf8')).tapPoints, 0,
+      '投递失败时 coverage JSON 的 tapPoints 必须是 0（摘要据此判红）')
+    fs.rmSync(closedCoveragePath, { force: true })
+    fs.rmSync(path.join(shimProbeDir, 'child.pid'), { force: true })
+  }
 } finally {
   fs.rmSync(shimProbeDir, { recursive: true, force: true })
 }
@@ -2299,8 +2359,173 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     assert.ok(guardAt > strykerIdx && guardAt < uploadAt,
       '守卫必须位于 stryker step 之后、上传 artifact 之前（stryker 之前无报告可判；上传之后失败已无意义）')
   }
+  // (5) statusReason 在上传前被剥离 ⇒ artifact 里的机器报告再也解释不了「这个变异体为什么存活/报错」；
+  //     而 tap-runner 对空 TAP 流只返回 ok（tap-parser 对空 stdout 判 ok:true / skipReason:"no tests found"）
+  //     ⇒ 该段测试一个都没跑、全部变异体记 Survived/NoCoverage，报告与「测试跑过但没杀掉」完全同形。
+  //     C10-008 要求上传前落一份**未剥离**的摘要（随 artifact 到汇总 job），并把「TAP 档 + 零测试 + 有变异体」
+  //     单独判红。抽成函数以便对真实 workflow 的变异副本跑反例。
+  //     C10-008 **返工**：判据必须是「shim 成功投递的 TAP 点数 = 0」，不是报告里的 tests 条数——
+  //     tap-runner 对每个测试文件无条件合成 1 条 TestResult（id/name 都是文件名）⇒ 真·空流时 tests
+  //     = 文件数（本仓 66），旧判据只在「一个文件都没跑」时才成立（等于没判）。tapPoints 由 tap-shim
+  //     逐文件写进 XBK_TAP_POINTS_LOG（dry run），本步聚合。
+  //     返回 shell 正文，供紧随其后的**可执行**用例（喂真实形态夹具跑这一步）复用同一份提取结果。
+  const assertStatusReasonEvidence = (ymlText) => {
+    const srName = '- name: 记录 statusReason 摘要与 TAP 空流表征（' + '${' + '{ matrix.name }}）'
+    const srAt = ymlText.indexOf(srName)
+    assert.ok(srAt >= 0,
+      'mutation.yml 必须存在「记录 statusReason 摘要与 TAP 空流表征」step：剥离后 artifact 里无法回溯原因、也无空流表征')
+    const srText = ymlText.slice(srAt, stepEndIn(ymlText, srAt, srName.length))
+    const srLines = yamlOnly(srText)
+    assert.ok(srLines.some(l => /^\s*if:\s*always\(\)/.test(l)),
+      '摘要 step 必须带 if: always()：stryker 失败/超时时同样要落证据（那时最需要它）')
+    const srScript = shellBodyOf(srText)
+    assert.ok(srScript !== null, '摘要 step 必须以 `run: |` 执行 shell')
+    assert.ok(srScript.includes('reports/mutation/status-reason-summary.json'),
+      '摘要必须落 reports/mutation/status-reason-summary.json（只有落在上传目录里才能随 artifact 留档）')
+    assert.ok(/statusReason/.test(srScript),
+      '摘要必须真的读取 statusReason：剥离步之后该字段全是空串，事后再算就是自欺')
+    assert.match(srScript, /if \[ ! -f reports\/mutation\/mutation\.json \]/,
+      '无报告时必须显式跳过且不新建文件：多出一个文件会让上传步的 if-no-files-found: error 失效')
+    assert.ok(/emptyTapStream/.test(srScript), '摘要必须计算 emptyTapStream（TAP 档 TAP 点数为 0）')
+    // 判据必须是 tapPoints（shim 成功投递的点数），不得退回报告里的 tests 条数
+    assert.ok(/\$tap\.points == 0/.test(srScript),
+      'emptyTapStream 必须按 $tap.points == 0 判（C10-008：报告里的 tests 条数在真·空流时等于文件数，判不出来）')
+    assert.ok(!/tests\[\]\?\] \| length\) == 0/.test(srScript),
+      '空流判据不得退回 `[.testFiles[]?.tests[]?] | length == 0`：tap-runner 每文件无条件合成 1 条 TestResult，真·空流时该值 = 66')
+    assert.match(srScript, /--argjson tap "\$TAP_AGG"/,
+      '摘要必须把 TAP 点聚合结果以 --argjson tap 传进 jq（否则 tapPoints 无从取值）')
+    // 记录通道：两处必须指向同一条 runner.temp 路径（stryker step 注入给 shim，本步读回来）
+    const tapLogLine = 'XBK_TAP_POINTS_LOG: $' + '{{ runner.temp }}/tap-points.jsonl'
+    assert.ok(srLines.some(l => l.trim() === tapLogLine),
+      '摘要 step 必须声明 ' + tapLogLine + '（与 shim 写的同一条路径，否则永远读到 0 条记录）')
+    const strykerAt = ymlText.indexOf('- name: 变异测试（')
+    assert.ok(strykerAt >= 0, '找不到「变异测试」step')
+    const strykerText = ymlText.slice(strykerAt, stepEndIn(ymlText, strykerAt, '- name: 变异测试（'.length))
+    assert.ok(yamlOnly(strykerText).some(l => l.trim() === tapLogLine),
+      '「变异测试」step 必须把同一条 XBK_TAP_POINTS_LOG 注入给 shim（被 spawn 的测试进程继承 step env）——' +
+      '缺了它 ⇒ 一条记录都不写 ⇒ 每个 TAP 段按 fail-closed 判红')
+    assert.ok(!/XBK_TAP_POINTS_LOG:\s*reports\//.test(ymlText),
+      'TAP 点记录不得落在 reports/ 下：path: reports 会把它缓存跨运行，reports/mutation/ 则会让崩溃段多出一个文件、' +
+      '把上传步的 if-no-files-found: error 降级')
+    assert.match(srScript, /if \[ "\$EMPTY_TAP" = "true" \][\s\S]*?exit 1/,
+      '空 TAP 流必须响亮判红（exit 1）：否则整段「零测试」会被当成「测试跑过、没杀掉」的假绿')
+    // 顺序：复用状态 → 摘要（剥离前取 reason）→ 剥离 → 上传
+    const reuseAt = ymlText.indexOf('- name: 记录本段增量复用状态')
+    const stripAt2 = ymlText.indexOf('- name: 剥离报告中的 statusReason')
+    const uploadAt2 = ymlText.indexOf('- name: 上传变异报告')
+    assert.ok(reuseAt >= 0 && stripAt2 >= 0 && uploadAt2 >= 0, '找不到复用/剥离/上传 step，顺序无从核对')
+    assert.ok(srAt > reuseAt && srAt < stripAt2,
+      '摘要必须在剥离 step 之前（剥离会重写 mutation.json 的 statusReason）：先剥离再取 reason 等于拿到一片空串')
+    assert.ok(stripAt2 < uploadAt2, '剥离必须在上传之前：artifact 取的是上传时刻的磁盘状态')
+    return srScript
+  }
+  const statusReasonScript = assertStatusReasonEvidence(mutationYml)
+
+  // (5 反例·靶向) 把「无报告不新建」的守卫改成 if false（等价于去掉守卫）⇒ 必须红：崩溃段会因多出
+  //     摘要文件而让上传步的 fail-loud 失效（stryker 没产出报告不再由上传自身响亮变红）。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-sr-guard-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const unguarded = mutationYml.replace('if [ ! -f reports/mutation/mutation.json ]; then', 'if false; then')
+      assert.notStrictEqual(unguarded, mutationYml, '反例夹具必须真的改掉了「无报告即跳过」的守卫')
+      fs.writeFileSync(fixture, unguarded)
+      assert.throws(() => assertStatusReasonEvidence(fs.readFileSync(fixture, 'utf8')),
+        /无报告时必须显式跳过/, '去掉「无报告不新建」守卫后必须红（否则崩溃段的 fail-loud 被降级）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // (5·可执行判据) C10-008：直接执行 mutation.yml 里这一步的 shell 正文（不是复述它的正则），喂
+  //     **tap-runner 真实形态**的夹具。真·空流长什么样（tap-runner@10.0.0 tap-test-runner.js 已核对）：
+  //     tapResultToTestResult 对每个测试文件**无条件**合成 1 条 TestResult（id/name 都是文件名），
+  //     空 stdout 被 tap-parser 判 {ok:true, skipReason:"no tests found"} ⇒ 报告里 tests=66、全绿、
+  //     变异体全 Survived。旧判据（tests == 0）在这份输入上**放行**——下面第一条断言先把这一点钉死，
+  //     否则这份夹具证明不了任何东西（夹具又退回自造 tests:0 时它会立刻红）。
+  {
+    const jqProbe = spawnSync('jq', ['--version'], { encoding: 'utf8' })
+    assert.strictEqual(jqProbe.status, 0,
+      '本用例用 jq 执行 workflow 的真实判据（CI 的 ubuntu-latest 预装 jq）；jq 不可用时无从核对，按失败计')
+    // 夹具构造：只允许「每文件 1 条 TestResult」这一种真实形态（刻意不提供 tests:0 的入口）
+    const tapRunnerReport = (fileCount, runner) => {
+      const testFiles = {}
+      for (let i = 0; i < fileCount; i++) {
+        testFiles['test_case_' + i + '.js'] = { tests: [{ id: String(i), name: 'test_case_' + i + '.js' }] }
+      }
+      return {
+        schemaVersion: '1.0',
+        config: { testRunner: runner },
+        files: {
+          'xbk_utils.js': {
+            mutants: [
+              { id: '0', status: 'Survived', statusReason: '' },
+              { id: '1', status: 'Survived', statusReason: '' },
+              { id: '2', status: 'NoCoverage', statusReason: '' }
+            ]
+          }
+        },
+        testFiles
+      }
+    }
+    // 跑真实 step 正文：cwd 里造 reports/mutation/mutation.json（报告已产出），记录文件按参数造
+    const runStatusReasonStep = (report, records) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-sr-step-'))
+      try {
+        fs.mkdirSync(path.join(dir, 'reports', 'mutation'), { recursive: true })
+        fs.writeFileSync(path.join(dir, 'reports', 'mutation', 'mutation.json'), JSON.stringify(report))
+        const logPath = path.join(dir, 'tap-points.jsonl')
+        if (records) fs.writeFileSync(logPath, records.map(r => JSON.stringify(r) + '\n').join(''))
+        const r = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', statusReasonScript],
+          { cwd: dir, encoding: 'utf8', env: { ...baseEnv, SEGMENT: 'probe', GITHUB_SHA: 'deadbeef', XBK_TAP_POINTS_LOG: logPath } })
+        const summaryPath = path.join(dir, 'reports', 'mutation', 'status-reason-summary.json')
+        const summary = fs.existsSync(summaryPath) ? JSON.parse(fs.readFileSync(summaryPath, 'utf8')) : null
+        return { status: r.status, stderr: r.stderr || '', stdout: r.stdout || '', summary }
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+    const recordsFor = (n, points) => Array.from({ length: n }, (_, i) => ({ file: 'test_case_' + i + '.js', points, exit: 0 }))
+
+    const emptyReport = tapRunnerReport(66, 'tap')
+    const testsInReport = Object.values(emptyReport.testFiles).reduce((n, f) => n + f.tests.length, 0)
+    assert.strictEqual(testsInReport, 66, '夹具必须按 tap-runner 语义给出 66 条 TestResult（每文件一条）')
+    assert.ok(!/"tests":0/.test(JSON.stringify(emptyReport)), '夹具不得自造 tests:0 形态（真实报告不出现该形态）')
+    const legacyFlags = emptyReport.config.testRunner === 'tap' && testsInReport === 0 &&
+      emptyReport.files['xbk_utils.js'].mutants.length > 0
+    assert.strictEqual(legacyFlags, false,
+      '前提：旧判据（tests==0）在这份真·空流夹具上必须**放行**——放行正是 C10-008 的缺陷；若这里为 true，' +
+      '说明夹具又退回「自造 tests:0」的形态，下面的用例就变成了同义反复')
+
+    // ① 真·空流（66 条 TestResult、零记录）⇒ 必须红
+    const empty = runStatusReasonStep(emptyReport, null)
+    assert.notStrictEqual(empty.status, 0,
+      '真·空流必须判红（旧判据在这里放行）：' + empty.stdout + empty.stderr)
+    assert.strictEqual(empty.summary.emptyTapStream, true, '摘要必须把真·空流标成 emptyTapStream=true')
+    assert.strictEqual(empty.summary.tests, 66,
+      '同一份摘要里 tests 必须仍是 66——判红的原因只能是 tapPoints，不可能是「零文件」')
+    assert.strictEqual(empty.summary.tapPoints, 0, '无记录时 tapPoints 必须是 0（fail-closed）')
+    assert.match(empty.stderr, /成功投递的 TAP 点数为 0/, '判红输出必须点名是 TAP 点数，不是别的口径：' + empty.stderr)
+
+    // ② 有记录但每个文件都 0 点（shim 投递失败）⇒ 仍必须红：判据是点数，不是记录条数
+    const allZero = runStatusReasonStep(emptyReport, recordsFor(66, 0))
+    assert.notStrictEqual(allZero.status, 0, '66 条记录、全部 0 点必须判红：' + allZero.stdout + allZero.stderr)
+    assert.strictEqual(allZero.summary.tapPointZeroFiles, 66, '零点点数必须被点名（tapPointZeroFiles=66）')
+
+    // ③ 正常跑（66 个文件各投递 1 个点）⇒ 必须绿，且 tapPoints 就是 66
+    const healthy = runStatusReasonStep(tapRunnerReport(66, 'tap'), recordsFor(66, 1))
+    assert.strictEqual(healthy.status, 0, '健康段必须绿：' + healthy.stdout + healthy.stderr)
+    assert.strictEqual(healthy.summary.emptyTapStream, false, '健康段不得被判成空流')
+    assert.strictEqual(healthy.summary.tapPoints, 66, 'tapPoints 必须等于成功投递的点数（66 个文件各 1 点）')
+
+    // ④ command 档（无 TAP 记录是常态）⇒ 语义不变：不得判红
+    const command = runStatusReasonStep(tapRunnerReport(66, 'command'), null)
+    assert.strictEqual(command.status, 0, 'command 档不适用空流判据，必须保持绿：' + command.stdout + command.stderr)
+    assert.strictEqual(command.summary.emptyTapStream, false, 'command 档的 emptyTapStream 必须为 false')
+  }
 }
-console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
+
+console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud；statusReason 摘要 + TAP 空流表征在剥离前落盘并判红（靶向反例已锁）')
 
 // ── 矩阵 include 的行式解析：**单点实现**（C4-020）────────────────────────────
 // 3i 的「逐段 runner 档位」与 3j 的「逐段 timeout_ms」原先各有一份 34/35 行、逐行同构的拷贝

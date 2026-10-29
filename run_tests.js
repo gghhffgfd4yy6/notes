@@ -18,7 +18,7 @@ try {
   if (e.code !== 'MODULE_NOT_FOUND') throw e
   console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
 }
-if (hostClean && hostClean.guardOrExit(process.env)) process.exit(1)
+if (hostClean && hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 const path = require('path')
 const { checkDependencies } = require('./scripts/check-deps')
 
