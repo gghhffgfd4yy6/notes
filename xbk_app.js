@@ -83,7 +83,10 @@ function createApp ({
           return
         }
         const lockPath = logPath + '.lock'
-        let lockFd = -1
+        // null 哨兵（与 _updateChannelHealth 同口径）：-1 这类数值哨兵在变异测试里会被 UnaryOperator
+        // 改成 +1，release 分支把 1 当锁 fd 去 close，直接关掉 stdout、进程崩成 RuntimeError。
+        // close 另加 >2 守卫：stdio 已被外部关闭时 openSync 本就会返回 0/1/2 这样的真 fd。
+        let lockFd = null
         try {
         // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
         // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）
@@ -130,7 +133,7 @@ function createApp ({
           const LIMIT = 1024 * 1024
           // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
           // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
-          if (lockFd >= 0 && st.size > LIMIT) {
+          if (lockFd !== null && st.size > LIMIT) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
             const KEEP = 512 * 1024
@@ -154,8 +157,12 @@ function createApp ({
             }
           }
         } finally {
-          if (lockFd >= 0) {
-            try { fs.closeSync(lockFd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
+          if (lockFd !== null) {
+            // 只关真锁 fd：0/1/2 是 stdio，宁可漏关一个不该出现的锁 fd，也不能关掉进程输出。
+            // 锁文件仍要删（不管 fd 落在哪个区）——漏 unlink 会让后续轮次一直被陈旧锁挡住。
+            if (lockFd > 2) {
+              try { fs.closeSync(lockFd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
+            }
             try { fs.unlinkSync(lockPath) } catch (e) { /* 锁文件已被抢删等，忽略 */ }
           }
         }

@@ -645,6 +645,23 @@ check('_writeRunLog 追加后 statSync 失败 ⇒ 静默，锁清理不跳过', 
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
 })
 
+// N1 回归（与 _updateChannelHealth 的 mutRuntimeError 同源）：锁 fd 落在 stdio 区（0/1/2）时绝不 close。
+// 旧实现把「未取得锁」编码成 -1，哨兵被 UnaryOperator 改成 +1 后 finally 的 closeSync(1) 会直接关掉
+// stdout，测试进程崩成 RuntimeError；且 stdio 已被外部关闭时 openSync 本就会返回 0/1/2 这样的真 fd。
+// 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，正常追加与追加抛错（异常路径）两条都要守住。
+check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍清理（含异常路径）', () => {
+  for (const fd of [0, 1, 2]) {
+    for (const appendThrows of [false, true]) {
+      const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? fd : 8), appendThrows })
+      const { app } = makeLogApp({ rec })
+      app._writeRunLog('x\n')
+      const tag = `fd=${fd} appendThrows=${appendThrows}`
+      assert.deepStrictEqual(rec.rec.close, [], `${tag}: 不得 close stdio，实际 close：${rec.rec.close.join(',')}`)
+      assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], `${tag}: 锁文件必须清理（漏删会让后续轮次一直被旧锁挡住）`)
+    }
+  }
+})
+
 // ----- _writeRunLog：ERROR 行只截 errMsg 段 -----
 check('_writeRunLog ERROR 行超 512 ⇒ 仅 errMsg 段截到 512，前缀与尾换行保留', () => {
   const rec = makeLogFs()
@@ -782,13 +799,15 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
-check('_writeRunLog 锁 fd 为 0 时 finally 仍释放（close/unlink），不得漏清理', () => {
+// fd 为 0 是 falsy：旧实现用 `if (lockFd)` 判定「是否取到锁」时会把 fd 0 当成「没取到」而整段跳过
+// 释放（锁文件残留）。这里守住「0 是有效 fd、必须走释放」；但 0 也是 stdin，close 必须被 >2 守卫拒绝。
+check('_writeRunLog 锁 fd 为 0（falsy）时 finally 仍释放：unlink 照做、不得 close stdio', () => {
   const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9) })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.write, [[0, `${process.pid}:42`]])
-  assert.deepStrictEqual(rec.rec.close, [0])
-  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], 'fd 0 不得被当成「未取锁」而跳过释放（锁文件会残留）')
+  assert.deepStrictEqual(rec.rec.close, [], 'fd 0 是 stdin，>2 守卫必须拒绝 close')
 })
 
 // ----- _warnLowDisk：阈值 / 只告警不阻断 / 限频 -----
