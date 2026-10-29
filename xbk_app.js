@@ -796,7 +796,10 @@ function createApp ({
     },
 
     _releaseChannelHealthLock (lockPath, lockFd) {
-      if (typeof lockFd === 'number' && lockFd >= 0) {
+      // 锁 fd 只可能是 openSync 返回的 >=3；0/1/2 是 stdio。哨兵被误改成 +1 时
+      // 旧判据会 close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError（app 变异守卫红）。
+      // 这里拒绝 stdio fd：宁可漏关一个不该出现的锁 fd，也不能关闭进程输出。
+      if (typeof lockFd === 'number' && lockFd > 2) {
         try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
         try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
       }
@@ -878,7 +881,8 @@ function createApp ({
     },
 
     async _updateChannelHealth (outcome) {
-      let lockFd = -1
+      // null 哨兵：避免 UnaryOperator 把 -1 改成 +1 后，早退路径在 finally 里 close(1)。
+      let lockFd = null
       let lockPath = ''
       let statePath = ''
       const pendingAlerts = []

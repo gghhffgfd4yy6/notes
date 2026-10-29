@@ -2107,6 +2107,42 @@ async function runHealthWithCapturedConsole (app) {
   return { warns, errs }
 }
 
+// 变异回归（app mutation RuntimeError）：xbk_app.js:_updateChannelHealth 的哨兵
+// `let lockFd = -1` 被 UnaryOperator 改成 `+1` 后，channelHealth 关闭的早退路径会
+// 在 finally 里把 1 当锁 fd 去 close，直接关掉 stdout，测试进程崩成 RuntimeError。
+// 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，而不是让进程崩掉。
+checkAsync('通道健康锁: 关闭健康观测时不得关闭 stdio fd（-1 哨兵变异回归）', async () => {
+  const realFs = require('fs')
+  const closed = []
+  const spyFs = new Proxy(realFs, {
+    get (target, prop) {
+      if (prop === 'closeSync') {
+        return (fd) => {
+          closed.push(fd)
+          if (fd > 2) target.closeSync(fd)
+        }
+      }
+      return target[prop]
+    }
+  })
+  const app = makeHealthApp2({ fs: spyFs, enabled: false })
+  await app._updateChannelHealth({ successfulChannels: [], failures: [] })
+  assert.deepStrictEqual(closed.filter(fd => fd >= 0 && fd <= 2), [],
+    `关闭健康观测时清理不得 close stdio fd，实际关闭：${closed.join(',')}`)
+})
+
+check('通道健康锁: 释放时拒绝 close stdio fd（0/1/2）', () => {
+  const closed = []
+  const app = makeHealthApp({
+    fs: {
+      closeSync: (fd) => closed.push(fd),
+      unlinkSync: () => {}
+    }
+  })
+  for (const fd of [0, 1, 2]) app._releaseChannelHealthLock('', fd)
+  assert.deepStrictEqual(closed, [], `不得关闭 stdio fd，实际关闭：${closed.join(',')}`)
+})
+
 check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })
@@ -2250,9 +2286,9 @@ checkAsync('恢复认领清零: 通道恢复成功后计数清零、lastRecovere
 
 // --- _updateChannelHealth 主流程用例（失败计数 / 告警入队 / 恢复认领 / 状态损坏防御）---
 // _sendAlert 经 makeHealthApp 无注入——检查其实现依赖 getNotify/Pusher。用 sendAlert 注入参数版本。
-function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true }) {
+function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true, enabled = true }) {
   return createApp({
-    Config: { channelHealth: { enabled: true, consecutiveFailures: threshold, intervalMs } },
+    Config: { channelHealth: { enabled, consecutiveFailures: threshold, intervalMs } },
     Utils: {
       safeErrorText: (e, d) => String((e && e.message) || d),
       num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
