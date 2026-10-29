@@ -526,39 +526,42 @@ function run (ymlText) {
       .map(m => ({ name: m[1], start: Number(m[2]), end: Number(m[3]) }))
     assert.strictEqual(ranges.length, 12, `真实矩阵必须拆 12 段 console，实际 ${ranges.length}`)
     const lines = fs.readFileSync(path.join(ROOT, 'scripts', 'console.js'), 'utf8').split('\n').length - 1
-    assert.strictEqual(ranges[0].start, 1, '真实矩阵首段必须从第 1 行开始')
-    assert.strictEqual(ranges[ranges.length - 1].end, lines, '真实矩阵末段必须止于文件最后一行')
-    for (let i = 1; i < ranges.length; i++) {
-      assert.strictEqual(ranges[i].start, ranges[i - 1].end + 1,
-        `真实矩阵 ${ranges[i].name} 必须紧接上一段（不得留缝/重叠），实际 ${ranges[i].start} vs ${ranges[i - 1].end + 1}`)
-    }
-    // 单片预算：849 行（旧 part6）实测撞穿 step 330min 被杀；末两段各 ~425 行是为此对半拆的。
+    // 单片预算：849 行（旧 part6）实测撞穿 step 330min 被杀。
     const MAX_PART_LINES = 700
-    for (const r of ranges) {
-      assert.ok(r.end - r.start + 1 <= MAX_PART_LINES,
-        `真实矩阵 ${r.name} 覆盖 ${r.end - r.start + 1} 行，超过单片预算 ${MAX_PART_LINES} 行（会撞 step 上限）`)
+    // C5-061：原先在这里把 part6..part12 的绝对起止行（3251-3675 / 3676-4370 …）逐段写死，
+    // 与同仓「不硬编码行数」的口径相反——console.js 增长后按语义重平衡分段是合法维护动作，
+    // 却被这 7 条绝对值判红。改为只从矩阵与文件实际行数推导语义：首段=1、末段=lines、
+    // 逐段连续、单片 ≤ MAX_PART_LINES；下面两条反例证明推导确实会红（不是恒真）。
+    const auditSplit = (rs) => {
+      const errs = []
+      if (rs[0].start !== 1) errs.push(`首段必须从第 1 行开始，实际 ${rs[0].start}`)
+      if (rs[rs.length - 1].end !== lines) {
+        errs.push(`末段必须止于文件最后一行 ${lines}，实际 ${rs[rs.length - 1].end}`)
+      }
+      for (let i = 1; i < rs.length; i++) {
+        if (rs[i].start !== rs[i - 1].end + 1) {
+          errs.push(`${rs[i].name} 必须紧接上一段（不得留缝/重叠），实际 ${rs[i].start} vs ${rs[i - 1].end + 1}`)
+        }
+      }
+      for (const r of rs) {
+        if (r.end - r.start + 1 > MAX_PART_LINES) {
+          errs.push(`${r.name} 覆盖 ${r.end - r.start + 1} 行，超过单片预算 ${MAX_PART_LINES} 行（会撞 step 上限）`)
+        }
+      }
+      return errs
     }
-    const part6 = ranges.find(r => r.name === 'console-part6')
-    const part7 = ranges.find(r => r.name === 'console-part7')
-    const part8 = ranges.find(r => r.name === 'console-part8')
-    const part9 = ranges.find(r => r.name === 'console-part9')
-    const part10 = ranges.find(r => r.name === 'console-part10')
-    const part11 = ranges.find(r => r.name === 'console-part11')
-    const part12 = ranges.find(r => r.name === 'console-part12')
-    assert.ok(part6 && part6.start === 3251 && part6.end === 3675,
-      `真实 console-part6 必须是 3251-3675，实际 ${part6 && part6.start}-${part6 && part6.end}`)
-    assert.ok(part7 && part7.start === 3676 && part7.end === 4370,
-      `真实 console-part7 必须是 3676-4370，实际 ${part7 && part7.start}-${part7 && part7.end}`)
-    assert.ok(part8 && part8.start === 4371 && part8.end === 4800,
-      `真实 console-part8 必须是 4371-4800，实际 ${part8 && part8.start}-${part8 && part8.end}`)
-    assert.ok(part9 && part9.start === 4801 && part9.end === 5200,
-      `真实 console-part9 必须是 4801-5200，实际 ${part9 && part9.start}-${part9 && part9.end}`)
-    assert.ok(part10 && part10.start === 5201 && part10.end === 5800,
-      `真实 console-part10 必须是 5201-5800，实际 ${part10 && part10.start}-${part10 && part10.end}`)
-    assert.ok(part11 && part11.start === 5801 && part11.end === 6500,
-      `真实 console-part11 必须是 5801-6500，实际 ${part11 && part11.start}-${part11 && part11.end}`)
-    assert.ok(part12 && part12.start === 6501 && part12.end === lines,
-      `真实 console-part12 必须是 6501-${lines}，实际 ${part12 && part12.start}-${part12 && part12.end}`)
+    const realErrors = auditSplit(ranges)
+    assert.deepStrictEqual(realErrors, [], `真实矩阵 console 拆段必须合规：${realErrors.join('；')}`)
+    // 反例①：把 part7 起点 +1（与 part6 留缝 1 行）⇒ 推导必须点名该段
+    const gapped = ranges.map(r => r.name === 'console-part7' ? { ...r, start: r.start + 1 } : r)
+    assert.ok(auditSplit(gapped).some(e => e.includes('console-part7')),
+      `留缝/重叠必须被推导抓到，实际 ${JSON.stringify(auditSplit(gapped))}`)
+    // 反例②：把 part6 拉长到 part7 末尾（单片 1121 行，超 700 预算）⇒ 推导必须判红
+    const part7End = ranges.find(r => r.name === 'console-part7').end
+    const merged = ranges.filter(r => r.name !== 'console-part7')
+      .map(r => r.name === 'console-part6' ? { ...r, end: part7End } : r)
+    assert.ok(auditSplit(merged).some(e => e.includes('console-part6') && e.includes('单片预算')),
+      `单片超预算必须被推导抓到，实际 ${JSON.stringify(auditSplit(merged))}`)
   }
 
   // ===== C10-009 运行链候选集 ↔ mutate 清单双向核对（靶向反例）=====
