@@ -22,27 +22,12 @@ const {
   findClosableDailyIssues, isRealDayKey, closeDailyIssues, MAX_CLOSE_PER_RUN
 } = require('./scripts/mutation-report.js')
 
-// CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
-// check-then-use —— 检查与使用之间该路径可被换成另一个对象。与本仓 scripts/mutation-json.js 的
-// readGuardedBytes（STG-01 修法）同口径：这条路径只按路径「访问一次」（openSync('r')），之后只对 fd
-// 做 fstatSync/readSync —— 读到、量到的必然是同一个对象，路径二次查找（check-then-use）不再存在。
-// 返回 { bytes, size, mtimeMs }：分别等价于原先的 readFileSync(p) / statSync(p).size / statSync(p).mtimeMs。
-function readAllViaFd (p) {
-  const fd = fs.openSync(p, 'r')
-  try {
-    const st = fs.fstatSync(fd)
-    const buf = Buffer.allocUnsafe(st.size)
-    let off = 0
-    while (off < st.size) {
-      const n = fs.readSync(fd, buf, off, st.size - off, off)
-      if (n <= 0) break
-      off += n
-    }
-    return { bytes: buf.subarray(0, off), size: st.size, mtimeMs: st.mtimeMs }
-  } finally {
-    fs.closeSync(fd)
-  }
-}
+// 报告文本/文件读取的唯一实现（C5-044）：`run: |` 正文、表格行归一化、fd 读循环原先各有 2–4 份副本
+// （规则已分叉），现统一放到 test/_yaml.js。readViaFd = 同一路径只按 fd 访问一次，与
+// scripts/mutation-json.js 的 readGuardedBytes（STG-01 修法）同口径，不再「statSync 检查 → readFileSync 使用」。
+const { tableRowOf, readViaFd: readAllViaFd } = require('./test/_yaml')
+// 段汇总表的行提取（同一实现三处共用）：`复用` 单元格按内容锚定剥掉，其余列逐字比较。
+const rowOf = tableRowOf
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
@@ -610,7 +595,6 @@ check('render：口径不符**不改变**任何分数/统计口径（与只加�
   const withMismatch = base.map((r, i) => ({ ...r, reuse: i === 0 ? { mode: REUSE_MODE_PARTIAL, reused: 6, total: 6, ratio: 1, high: true } : { mode: REUSE_MODE_FULL } }))
   // 只摘掉 `复用` 单元格（按内容锚定），不摘后面的新增列：`$` 行尾锚点已去掉——
   // `真挂死/上限触发/超时上限` 三列追加在 `复用` 之后，行尾不再是复用列。
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withMismatch)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '分数行不得因口径不符而变化')
@@ -627,7 +611,6 @@ check('render：复用元信息**不改变**任何分数/统计口径（只多�
   // 分数行与合计行必须逐字相同（本 PR 明确不改 (killed+timeout)/total 口径）
   // 只摘掉 `复用` 单元格（按内容锚定），不摘后面的新增列：`$` 行尾锚点已去掉——
   // `真挂死/上限触发/超时上限` 三列追加在 `复用` 之后，行尾不再是复用列。
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withReuse)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '同一统计下分数行必须一致（复用只增加标注）')
@@ -831,7 +814,6 @@ check('render 溯源三态 · cacheHit 不改变任何分数/统计口径（只�
   })
   const base = [seg('app'), seg('utils', CACHE_HIT_PRIMARY)]
   const withFallback = [seg('app', CACHE_HIT_FALLBACK), seg('utils', CACHE_HIT_PRIMARY)]
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withFallback)
   // 方向一：数字列/合计行逐字相同（cacheHit **泄漏进统计** ⇒ 这里红）

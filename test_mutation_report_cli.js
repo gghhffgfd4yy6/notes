@@ -6,6 +6,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { execFileSync, spawnSync } = require('node:child_process')
+// YAML `run: |` 正文提取的唯一实现（C5-044：原先两份副本的规则已经分叉，见 test/_yaml.js 头注释）。
+const { runBodyOf } = require('./test/_yaml')
 
 const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 
@@ -542,16 +544,10 @@ function schemaReport (seg, mutants) {
   // ① 执行级验证：桩 gh 实跑 run 段，覆盖成功 / 空值 / 不可解析 / API 失败四条分支。
   //    纯文本断言会被「删掉空值守卫但留下 API 失败文案」骗过（Sourcery 指出），必须看真实退出码与落盘值。
   //    逐行解析 run: | 块（不用 /^(\s*)run: \|/ + [\s\S]*$/ 这类嵌套量词，Sonar S8786 会判超线性回溯）。
-  const resolveLines2 = resolve.text.split('\n')
-  const runLineIdx = resolveLines2.findIndex(l => l.trim() === 'run: |')
-  assert.ok(runLineIdx >= 0, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
-  const runIndent = resolveLines2[runLineIdx].search(/\S/)
-  const body = []
-  for (let i = runLineIdx + 1; i < resolveLines2.length; i++) {
-    if (resolveLines2[i].trim() === '') { body.push(''); continue }
-    if (resolveLines2[i].search(/\S/) <= runIndent) break
-    body.push(resolveLines2[i].slice(runIndent + 2))
-  }
+  // 正文提取走 test/_yaml.js 的唯一实现（C5-044）：本处需要「保留注释与空行 + 相对缩进」，故显式给
+  // dedent；另一处（剥离步骤）需要「注释不算证据 + 遇空行即停」，差异只体现在选项上，不再各写一份循环。
+  const body = runBodyOf(resolve.text, { dedent: true })
+  assert.ok(body !== null, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
   const script = body.join('\n').trimEnd()
   assert.ok(script.includes('gh api'), `run 段必须实际调用 gh api，实际：${script}`)
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-resolver-'))
@@ -796,16 +792,8 @@ function schemaReport (seg, mutants) {
     // 取 `run: |` 之后的 shell 正文（缩进深于 run: 的行）作为唯一判据：注释不算证据——
     // 注释行必须在这里剔除，否则把活动命令整行改成 `# node scripts/…` 后正文里仍带着命令原文，
     // `includes('node scripts/mutation-report.js --strip')` 会被注释满足（CI 不再剥离而套件全绿）。
-    const stepLines = text.split('\n')
-    const runAt = stepLines.findIndex(l => l.trim() === 'run: |')
-    assert.ok(runAt >= 0, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
-    const runIndent = stepLines[runAt].length - stepLines[runAt].trimStart().length
-    const shellBody = []
-    for (let i = runAt + 1; i < stepLines.length; i++) {
-      if (stepLines[i].trim() === '' || (stepLines[i].length - stepLines[i].trimStart().length) <= runIndent) break
-      if (stepLines[i].trim().startsWith('#')) continue // shell 注释不是证据
-      shellBody.push(stepLines[i])
-    }
+    const shellBody = runBodyOf(text, { skipComments: true, stopAtBlank: true })
+    assert.ok(shellBody !== null, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
     const shell = shellBody.join('\n')
     assert.ok(shell.includes('reports/mutation/mutation.json'), '剥离必须覆盖 stryker 的 mutation.json')
     assert.ok(!shell.includes('reports/inc-'),
