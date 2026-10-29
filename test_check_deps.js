@@ -1122,7 +1122,10 @@ test('C10-018 反向扫描：代码 require 未声明的包 → exit 1 并点名
     if (r.status === 0) throw new Error('未声明包必须非 0 退出（旧实现只查声明→实例，这里恒 0），实际 status=0')
     if (!out.includes('❌ 代码 require 了未声明的包：ghost-pkg')) throw new Error(`必须点名未声明的包\n--- 实际输出 ---\n${out}`)
     if (!out.includes('ghost-pkg（xbk_ghost.js）')) throw new Error(`必须点名出问题的文件\n--- 实际输出 ---\n${out}`)
-    if (/^\s+- got（/m.test(out)) throw new Error(`已声明的包不得被误报\n--- 实际输出 ---\n${out}`)
+    // 清单行模板一律是 `  - <包>（<文件>）`（scripts/check-deps.js 三处），缩进只会是空格/Tab。
+    // 旧写法 `\s+` 含换行：配 /m 时每个行首都能起扫并跨过后续空行，匹配可以跨行
+    // （`- got（` 自己不带缩进、只要前面有空行也算命中）。限定 [ \t] 后匹配被关在同一行内。
+    if (/^[ \t]+- got（/m.test(out)) throw new Error(`已声明的包不得被误报\n--- 实际输出 ---\n${out}`)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
