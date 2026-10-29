@@ -2776,3 +2776,70 @@ checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过�
     else process.env.XBK_DRY_RUN = prevDryRun
   }
 })
+
+checkAsync('TR-1 maxPerRun 截断：被截断条目不得写入缓存（下轮补推不丢不重），摘要 truncated 如实计数', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-trunc-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const fiveItems = () => [1, 2, 3, 4, 5].map(i => makeRunItem('tr-' + i, '截断' + i))
+  try {
+    // 第一轮：上限 2、来 5 条 ⇒ 只推前 2 条，后 3 条既不推也不缓存
+    h.Config.push.maxPerRun = 2
+    h.setItems(fiveItems())
+    const r1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r1.summary.total, pushed: r1.summary.pushed, truncated: r1.summary.truncated },
+      { total: 5, pushed: 2, truncated: 3 }, `第一轮摘要异常：${JSON.stringify(r1.summary)}`)
+    assert.ok(r1.warns.some(l => l.includes('超过上限')), `截断必须有 console.warn 提示：${JSON.stringify(r1.warns)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id).sort(), ['tr-1', 'tr-2'],
+      '只有真正推送成功的 2 条可入缓存；被截断的 3 条写入缓存 = 下轮判重跳过 = 永久漏推')
+    // run.log 摘要必须如实计数（cron/status 的可观测入口）
+    const runLog1 = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/truncated=3 pushed=2 failed=0/.test(runLog1), `run.log 摘要应记 truncated=3 pushed=2：${runLog1.slice(-400)}`)
+
+    // 第二轮：上限放宽，接口重放同样 5 条 ⇒ 缓存去重 2、补推 3（不丢不重）
+    h.Config.push.maxPerRun = 100
+    h.setItems(fiveItems())
+    const r2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: r2.summary.pushed, dedup: r2.summary.dedup, truncated: r2.summary.truncated },
+      { pushed: 3, dedup: 2, truncated: 0 }, `第二轮必须补推被截断的 3 条：${JSON.stringify(r2.summary)}`)
+    assert.strictEqual(h.cacheMessages().length, 5, '两轮结束后 5 条应全部入缓存（无重复、无遗漏）')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严格大于），不得多推也不得写截断告警', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-trunc-eq-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  try {
+    h.Config.push.maxPerRun = 2
+    h.setItems([makeRunItem('eq-1', '边界甲'), makeRunItem('eq-2', '边界乙')])
+    const r = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: r.summary.pushed, truncated: r.summary.truncated },
+      { pushed: 2, truncated: 0 }, `恰好等于上限时不得截断：${JSON.stringify(r.summary)}`)
+    assert.ok(!r.warns.some(l => l.includes('超过上限')),
+      `恰好等于上限不得输出截断告警（>= 会多发一条 0 条截断的告警）：${JSON.stringify(r.warns)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id).sort(), ['eq-1', 'eq-2'], '两条都必须入缓存')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
