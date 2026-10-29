@@ -11,8 +11,16 @@ const envSkips = []
 const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境性）：' + why) }
 
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
+// C5-052：注入面全部收在这里。此前工厂表达不了 PROFILE3 / 自定义 pushUrl / 无 warn 的 logger，
+// 三个用例只好整段手抄 createNetwork 调用（连 nextTick 之外的注入项都手写），抄写点各自漂移。
 function makeNetwork (opts = {}) {
-  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders, sleep, noResponse = false } = opts
+  const {
+    retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes,
+    responseHeaders, sleep, noResponse = false,
+    pushUrl = 'https://api.example.com/push', profile3 = false,
+    prewarmDns = async () => ({ ok: true, elapsedMs: 1, family: 'ipv4' }),
+    loggerWarn = true
+  } = opts
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
@@ -32,19 +40,23 @@ function makeNetwork (opts = {}) {
     return { ok: true, calls }
   }
   const net = createNetwork({
-    Config: { api: { pushUrl: 'https://api.example.com/push', retry, timeout } },
+    Config: { api: { pushUrl, retry, timeout } },
     Utils: {
       num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
       safeErrorText: (e, d) => (e && e.message) || d
     },
     fetchJson,
-    prewarmDns: async () => ({ ok: true, elapsedMs: 1, family: 'ipv4' }),
+    prewarmDns,
     getNotify: async () => 'notify-module',
     crypto: { randomInt: () => 0 }, // 抖动固定为 0，退避仅由 1000*2^attempt 决定
     RETRYABLE_CODES,
     ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes }),
     ...(sleep === undefined ? {} : { sleep }),
-    logger: { log: (...args) => logs.push(args.join(' ')), warn: (msg) => warnings.push(String(msg)) }
+    // loggerWarn:false 复刻「旧调用方只传 log」的形状（缺 warn 时告警路径不得抛 TypeError）
+    logger: loggerWarn
+      ? { log: (...args) => logs.push(args.join(' ')), warn: (msg) => warnings.push(String(msg)) }
+      : { log: (...args) => logs.push(args.join(' ')) },
+    ...(profile3 ? { PROFILE3: true } : {})
   })
   return {
     net,
@@ -114,46 +126,26 @@ function makeNetwork (opts = {}) {
 
   // 8. PROFILE3 + prewarmDns reject → 走 .catch 日志分支（行38-39），不影响主流程
   {
-    const logs = []
-    const net = createNetwork({
-      Config: { api: { pushUrl: 'https://api.example.com/push', retry: 0, timeout: 5000 } },
-      Utils: {
-        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
-        safeErrorText: (e, d) => (e && e.message) || d
-      },
-      fetchJson: async () => ({ ok: true }),
-      prewarmDns: async () => { throw new Error('dns-fail') },
-      getNotify: async () => 'notify',
-      crypto: { randomInt: () => 0 },
-      RETRYABLE_CODES,
-      PROFILE3: true,
-      logger: { log: (...args) => logs.push(args.join(' ')) }
+    const { net, getLogs } = makeNetwork({
+      retry: 0,
+      profile3: true,
+      prewarmDns: async () => { throw new Error('dns-fail') }
     })
     const r = await net.fetchData()
     assert.strictEqual(r.ok, true, 'prewarmDns 失败不应影响主流程')
-    assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('ok=false')), 'PROFILE3 应输出 prewarm 失败日志')
+    assert.ok(getLogs().some(l => l.includes('dns-prewarm') && l.includes('ok=false')), 'PROFILE3 应输出 prewarm 失败日志')
   }
 
   // 9. PROFILE3 + 无效 pushUrl → new URL 抛错走 catch 日志分支（行43-44），不影响主流程
   {
-    const logs = []
-    const net = createNetwork({
-      Config: { api: { pushUrl: 'not-a-valid-url', retry: 0, timeout: 5000 } },
-      Utils: {
-        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
-        safeErrorText: (e, d) => (e && e.message) || d
-      },
-      fetchJson: async () => ({ ok: true }),
-      prewarmDns: async () => ({ ok: true }),
-      getNotify: async () => 'notify',
-      crypto: { randomInt: () => 0 },
-      RETRYABLE_CODES,
-      PROFILE3: true,
-      logger: { log: (...args) => logs.push(args.join(' ')) }
+    const { net, getLogs } = makeNetwork({
+      retry: 0,
+      profile3: true,
+      pushUrl: 'not-a-valid-url'
     })
     const r = await net.fetchData()
     assert.strictEqual(r.ok, true, 'URL 解析失败不应影响主流程')
-    assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
+    assert.ok(getLogs().some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
   }
 
   // 10. net-3（xbk_network.js resolveTimeoutMs）：只有「≥100ms 的整数」被采用，其余回落默认并告警
@@ -224,22 +216,9 @@ function makeNetwork (opts = {}) {
 
   // 11b. net-3：注入的 logger 没有 warn（旧调用方形状）时不得抛错，回落语义不变
   {
-    const requestOptions = []
-    const net = createNetwork({
-      Config: { api: { pushUrl: 'https://api.example.com/push', retry: 0, timeout: 5 } },
-      Utils: {
-        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
-        safeErrorText: (e, d) => (e && e.message) || d
-      },
-      fetchJson: async (_url, requestOpts) => { requestOptions.push(requestOpts); return { ok: true } },
-      prewarmDns: async () => ({ ok: true }),
-      getNotify: async () => 'notify',
-      crypto: { randomInt: () => 0 },
-      RETRYABLE_CODES,
-      logger: { log: () => {} } // 无 warn：不得因告警而抛 TypeError
-    })
+    const { net, getRequestOptions } = makeNetwork({ retry: 0, timeout: 5, loggerWarn: false })
     await net.fetchData()
-    assert.strictEqual(requestOptions[0].timeout, 5000, '无 warn 的 logger 仍应回落默认')
+    assert.strictEqual(getRequestOptions()[0].timeout, 5000, '无 warn 的 logger 仍应回落默认')
   }
 
   // 12. net-1（xbk_network.js:83-87）：不可重试判定不再只看 HTTP 状态码——无 response 的永久性错误码
@@ -562,5 +541,17 @@ function makeNetwork (opts = {}) {
   if (envSkips.length > 0) {
     console.log(`⏭ test_network 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，改为在非 UTC 宿主上生效）`)
   }
+
+  // 26. [夹具自检] createNetwork 只允许在 makeNetwork 工厂内出现一次（C5-052）。
+  // 反例：工厂表达不了 PROFILE3 / 自定义 pushUrl / 无 warn 的 logger 时，用例只好整段手抄注入对象；
+  // 手抄点没有任何结构约束，注入项与工厂漂移（少一个 warn、多一个字段）不会被任何断言发现。
+  // 本守卫直接读本文件源码，把「再抄一份」变成红。
+  {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const calls = src.match(/createNetwork\s*\(/g) || []
+    assert.strictEqual(calls.length, 1,
+      `createNetwork 只应出现在 makeNetwork 工厂里，实际 ${calls.length} 处：手抄调用点会与工厂漂移（C5-052）`)
+  }
+
   console.log('test_network OK')
 })().catch((e) => { console.error(e); process.exit(1) })
