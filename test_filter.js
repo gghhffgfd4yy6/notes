@@ -3512,20 +3512,51 @@ console.log('========================================\n');
 
   await test('init 在目录不存在时自动创建', () => {
     const fs = require('fs')
-    const dir = CACHE
-    // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
-    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-    init()
-    assertEqual(fs.existsSync(dir), true)
+    // C4-013：CACHE 由外部 XBK_PARALLEL_ID 决定——调度器给两个进程同一个 ID 时它是**共用**目录
+    // （此时 OWNS_CACHE_DIR=false，退出清理已经不删它）。整目录删除会把对方正在用的判重缓存清掉，
+    // 故只删 CACHE 之下本进程专属的子目录：用例要证的仍是「目录不存在 → init 自动创建」。
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_init_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    // 同分片里另一进程的活跃缓存：本用例跑完它必须还在（旧写法整目录删除时必丢）
+    const peerFile = path.join(CACHE, `peer_live_cache_${process.pid}.json`)
+    fs.mkdirSync(CACHE, { recursive: true })
+    fs.writeFileSync(peerFile, '{"peer":true}')
+    const orig = Config.cache.dir
+    try {
+      // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      Config.cache.dir = sub
+      init()
+      assertEqual(fs.existsSync(dir), true)
+      assertEqual(fs.existsSync(peerFile), true, '不得删除共用分片里其它进程的缓存（C4-013：整目录删除不受 OWNS_CACHE_DIR 保护）')
+    } finally {
+      Config.cache.dir = orig
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      try { fs.unlinkSync(peerFile) } catch (e) {}
+    }
   })
 
   await test('save 在目录不存在时自动创建（_ensureFileExists）', () => {
     const fs = require('fs')
-    const dir = CACHE
-    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-    appendMessageToFile({ id: 555 }, 'test_recreate.json')
-    assertEqual(fs.existsSync(dir), true)
-    assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
+    // C4-013：同上——只删本进程专属子目录，不删可能被同 ID 的另一进程共用的 CACHE。
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_save_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    const peerFile = path.join(CACHE, `peer_live_cache_save_${process.pid}.json`)
+    fs.mkdirSync(CACHE, { recursive: true })
+    fs.writeFileSync(peerFile, '{"peer":true}')
+    const orig = Config.cache.dir
+    try {
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      Config.cache.dir = sub
+      appendMessageToFile({ id: 555 }, 'test_recreate.json')
+      assertEqual(fs.existsSync(dir), true)
+      assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
+      assertEqual(fs.existsSync(peerFile), true, '不得删除共用分片里其它进程的缓存（C4-013：整目录删除不受 OWNS_CACHE_DIR 保护）')
+    } finally {
+      Config.cache.dir = orig
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      try { fs.unlinkSync(peerFile) } catch (e) {}
+    }
   })
 
   // v3.277（PR #156 复审）并发隔离回归：**撤销隔离即真红**——锁的是「假 Killed 真根因」，
