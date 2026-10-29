@@ -290,9 +290,35 @@ function failureText (e) {
   return stack.length > 0 ? `${message}\n${stack.map((l) => `    ${l.trim()}`).join('\n')}` : message
 }
 
+// ── C5-068：失败清单必须能唯一定位 ──
+// 旧实现失败时只 push(name)：本文件 60 条共用「结构红线:」前缀，跨文件还出现过真重号
+// （test_pusher 的 P3/P7、test_status_report 的 S11–S17 各两处）。汇总里两行一模一样，
+// 只能重跑整份套件自己数第几条。现在注册时抓调用行（栈里第一条不属于 harness 的帧），
+// 失败行打成 `<name> @L<行>`；同名用例再带 `#<第几次>` ⇒ 重号与泛化前缀都能落到源码行。
+const caseNameSeen = new Map()
+const duplicateCaseNames = new Set()
+function caseCallSite () {
+  const frames = String((new Error()).stack || '').split('\n').slice(1)
+  for (const frame of frames) {
+    if (!/test_console\.js:\d+:\d+/.test(frame)) continue
+    if (/\bat (ok|aok|caseLabel|caseCallSite) \(/.test(frame)) continue
+    const m = frame.match(/test_console\.js:(\d+):\d+/)
+    if (m) return Number(m[1])
+  }
+  return 0
+}
+function caseLabel (name) {
+  const line = caseCallSite()
+  const seq = (caseNameSeen.get(name) || 0) + 1
+  caseNameSeen.set(name, seq)
+  if (seq > 1) duplicateCaseNames.add(name)
+  return `${name}${seq > 1 ? ` #${seq}` : ''} @L${line}`
+}
+
 function ok (name, fn) {
+  const label = caseLabel(name)
   reapStaleTimeout(name)
-  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(name); console.log(`  ❌ ${name}: ${failureText(e)}`) } finally { closeCaseServers(); reapTestScope(name) }
+  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(label); console.log(`  ❌ ${name}: ${failureText(e)}`) } finally { closeCaseServers(); reapTestScope(name) }
 }
 // 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
 // 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
@@ -314,7 +340,36 @@ const SSE_END_WAIT_MS = 10000 // 随后等「客户端读到 close」（与上�
 const SSE_SERIAL_WAIT_MS = SSE_TEARDOWN_WAIT_MS + SSE_END_WAIT_MS
 const WATCHDOG_MARGIN_MS = 5000 // 看门狗在内层上界之外留的余量
 const TEST_TIMEOUT_MS = Math.max(RUN_DEADLINE_MS, SSE_SERIAL_WAIT_MS) + WATCHDOG_MARGIN_MS
+// ── C5-067：阈值只能引用常量，不能在用例里复制成裸数 ──
+// 陈旧锁判定阈值由 scripts/console.js 定义但**未导出**（`const FILTER_LOCK_STALE_MS = 10 * 1000`），
+// 测试侧只能持有一份具名常量（下方注释钉住来源），样本则由它派生——旧写法是 3 处裸 11000，
+// 生产把阈值调到 15s 后这里仍在「11s 前」造锁，用例名说陈旧、实际测的是活锁。
+const FILTER_LOCK_STALE_MS = 10 * 1000 // = scripts/console.js 的 FILTER_LOCK_STALE_MS（未导出）
+const FILTER_LOCK_STALE_SAMPLE_MS = FILTER_LOCK_STALE_MS + 1000 // 刚过期 1s，边界之上
+// lastaccept 重放窗直接用生产导出的常量（旧写法散着 30000/61000 两个裸数）。
+const REPLAY_WINDOW_MS = REPLAY_WINDOW_NOTIFY_TEST_MS
+// ── C5-033：按函数名取函数体（花括号配对）──
+// 必须容错：变异档里 scripts/console.js 会被 @stryker-mutator/instrumenter 实插桩，
+// 插桩器重排签名空白（`function tickAuto (` → `function tickAuto(`）。定点串匹配在插桩后
+// 源码上取到 0 字节，把「函数体长度 > 500」的守卫变成恒抛，整套变异报告恒红失真——
+// 容错定位 + 自测（见「C5-033 函数体定位器」用例）一起兜住这个回归。
+function functionBodyOf (text, fnName) {
+  const m = new RegExp('function\\s+' + fnName + '\\s*\\(').exec(text)
+  if (!m) return ''
+  const open = text.indexOf('{', m.index + m[0].length)
+  if (open < 0) return ''
+  let depth = 0
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}') {
+      depth--
+      if (depth === 0) return text.slice(open + 1, i)
+    }
+  }
+  return ''
+}
 async function aok (name, fn) {
+  const label = caseLabel(name)
   reapStaleTimeout(name)
   let watchdog = null
   let timedOut = false
@@ -340,7 +395,7 @@ async function aok (name, fn) {
     console.log(`  ✅ ${name}`)
   } catch (e) {
     failed++
-    failedNames.push(name)
+    failedNames.push(label)
     // 超时是真超时（不是用例自己抛的错）才记僵尸标记：后续用例开始前会因此补收割一次。
     if (timedOut) timedOutStale = name
     console.log(`  ❌ ${name}: ${failureText(e)}`)
@@ -362,6 +417,35 @@ function mkTmp (prefix) {
   return dir
 }
 function tmpDir () { return mkTmp('xbk-console-test-') }
+
+// ── FIFO 夹具（C5-070）──
+// mkfifo 只有 coreutils 提供（Node 22 没有 mkfifoSync），而旧写法把 /usr/bin/mkfifo 写死：
+// macOS / 精简容器 / 某些 Android 上该路径不存在 ⇒ execFileSync 抛 ENOENT，用例变红而不是
+// 显式跳过，把「本机没有这个工具」误报成契约失败。改为固定落点探测（仍不做 PATH 查找——
+// Sonar S4036：可写目录里的同名程序不该被执行），缺失时记一笔 SKIPPED 并打印出来。
+// 只跳过依赖 FIFO 的那一小段，同一用例里其它断言照跑（不整条用例静默消失）。
+const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
+let skipped = 0
+function findMkfifo (candidates = MKFIFO_CANDIDATES) {
+  for (const p of candidates) {
+    try {
+      // 存在还不够：目录/不可执行的同名文件同样会 Enoent/EACCES；只认「普通文件」。
+      if (fs.statSync(p).isFile()) return p
+    } catch (e) { /* 不存在/读不到 ⇒ 试下一个候选 */ }
+  }
+  return ''
+}
+function makeFifo (target, label) {
+  const bin = findMkfifo()
+  if (!bin) {
+    skipped++
+    console.log(`  ⏭️ ${label}：本机没有 mkfifo（已探测 ${MKFIFO_CANDIDATES.join(' / ')}），只跳过 FIFO 夹具`)
+    return false
+  }
+  fs.rmSync(target, { force: true })
+  require('node:child_process').execFileSync(bin, [target])
+  return true
+}
 
 // 收割：删不掉就**不静默**——把路径与原因写 stderr，否则 30 分钟后 check-host-clean 只会说
 // 「有过期沙箱」，没人知道是哪一轮没删掉（退出码不变：清理失败是环境问题，不该冒充测试结果）。
@@ -458,6 +542,54 @@ ok('harness 失败输出必须带栈（C5-021：走真实 ok() 打印路径）',
   assert.ok(failureText(assertion).includes('actual=2') && failureText(assertion).includes('expected=1'),
     'AssertionError 的 actual/expected 摘要不得丢')
   assert.ok(/^ {4}at /m.test(failureText(assertion)), 'AssertionError 的栈同样不得丢')
+})
+
+// ── C5-068：失败清单必须能唯一定位（重号 / 60 条泛化前缀）──
+// 走真实 ok() 注册路径取证：两条完全同名、且都在不同行抛错的用例，失败清单必须给出不同的行；
+// 第二条还要带 `#2`。全部还原计数器与注册表，不污染通过/失败数和后续重号统计。
+ok('harness 失败清单必须能唯一定位（C5-068：同名用例带 #n 与 @L 行号）', () => {
+  const origLog = console.log
+  const snapshot = {
+    passed,
+    failed,
+    names: failedNames.slice(),
+    seen: new Map(caseNameSeen),
+    dups: new Set(duplicateCaseNames)
+  }
+  let got = []
+  try {
+    console.log = () => {}
+    ok('探针：重名用例', () => { throw new Error('first') })
+    ok('探针：重名用例', () => { throw new Error('second') })
+    got = failedNames.slice(snapshot.names.length)
+  } finally {
+    console.log = origLog
+    passed = snapshot.passed
+    failed = snapshot.failed
+    failedNames.length = 0
+    failedNames.push(...snapshot.names)
+    caseNameSeen.clear()
+    for (const [k, v] of snapshot.seen) caseNameSeen.set(k, v)
+    duplicateCaseNames.clear()
+    for (const n of snapshot.dups) duplicateCaseNames.add(n)
+  }
+  assert.strictEqual(got.length, 2, `两条探针都必须进失败清单（实际 ${JSON.stringify(got)}）`)
+  assert.notStrictEqual(got[0], got[1], '同名用例的失败行不得一模一样（旧实现只打名字）')
+  const l0 = got[0].match(/@L(\d+)$/)
+  const l1 = got[1].match(/@L(\d+)$/)
+  assert.ok(l0 && l1 && Number(l0[1]) > 0 && Number(l1[1]) > 0, `每条失败行必须带源码行号（实际 ${JSON.stringify(got)}）`)
+  assert.notStrictEqual(l0[1], l1[1], '两条用例的调用行必须不同')
+  assert.ok(got[1].includes('#2'), `第二条同名用例必须带 #2（实际 ${got[1]}）`)
+})
+
+// C5-070 自查：FIFO 夹具的 mkfifo 探测必须是「找不到就返回空串、不抛异常」——旧写法把
+// /usr/bin/mkfifo 写死，非该路径的平台直接在 execFileSync 里抛 ENOENT（用例红成契约失败）。
+ok('FIFO 夹具: mkfifo 探测只认固定落点（缺失不抛、不做 PATH 查找）', () => {
+  assert.strictEqual(findMkfifo(['/nonexistent/mkfifo-u05']), '', '全部候选都不存在时必须返回空串（不得抛 ENOENT）')
+  assert.strictEqual(findMkfifo([process.execPath]), process.execPath, '存在的候选必须原样返回')
+  assert.strictEqual(findMkfifo([]), '', '空候选表返回空串')
+  assert.ok(MKFIFO_CANDIDATES.every((p) => path.isAbsolute(p)),
+    '候选必须是绝对路径：PATH 查找会执行可写目录里的同名程序（Sonar S4036）')
 })
 
 // ── token 校验 ──
@@ -1581,7 +1713,7 @@ async function filterRuleApiTests () {
 
       // 陈旧锁（mtime 11s 前）：保存应接管并成功（不是 409）。
       fs.writeFileSync(paths.lock, '{}')
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       const takeover = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 4, filter: { pingbibiaoti: 'v5' } })
       assert.strictEqual(takeover.status, 200, '陈旧锁应被接管')
@@ -1642,7 +1774,7 @@ async function filterRuleApiTests () {
     try {
       // 活锁：pid 是当前测试进程（活），mtime 已过期——旧实现会按 mtime 抢走，导致原持有者失去互斥。
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 60000, token: 'live-holder' }), { mode: 0o600 })
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       const blocked = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
       assert.strictEqual(blocked.status, 409, '活锁必须 409 write_busy')
@@ -1983,7 +2115,7 @@ async function filterRuleApiTests () {
     const paths = filterPaths(dir)
     try {
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 1 }), { mode: 0o600 })
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       // 竞态起点：两个写者在「判过期」这一刻拿到同一份快照。
       const judgedA = filterLockIdentity(paths.lock)
@@ -4295,7 +4427,7 @@ async function main () {
       assert.strictEqual(JSON.parse(triggerBadAction.text).error, '未知 action')
       const cancelMissing = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1700000000000.1' })
       assert.strictEqual(cancelMissing.status, 404, 'Bearer 应已过鉴权（不存在的 id 404）')
-      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1700000000000.7' } }))
+      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1700000000000.7' } }))
       const notifyReplay = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(notifyReplay.status, 409, 'Bearer 应已过鉴权（60s 窗内重放 409）')
       assert.strictEqual(JSON.parse(notifyReplay.text).replayBlocked, true)
@@ -4315,7 +4447,7 @@ async function main () {
       const dir = tmpDir()
       const { server } = createConsole({ token: TOKEN, stateDir: dir })
       const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.7' } }))
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.7' } }))
       const blocked = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(blocked.status, 409, '60s 窗内重放必须 409')
       const blockedBody = JSON.parse(blocked.text)
@@ -4333,7 +4465,7 @@ async function main () {
       const dir = tmpDir()
       const { server } = createConsole({ token: TOKEN, stateDir: dir })
       const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 61000, runId: '1750000000000.7' } }))
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - (REPLAY_WINDOW_MS + 1000), runId: '1750000000000.7' } }))
       assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
       const lockConflict = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(lockConflict.status, 409, '越窗后撞锁仍 409')
@@ -4590,22 +4722,23 @@ async function main () {
     // 之前）。用子进程 + 看门狗：真挂死也只杀子进程，不会把整套件拖成 10 分钟超时。
     const fifoDir = tmpDir()
     const fifoSettings = path.join(fifoDir, CONSOLE_SETTINGS_FILE)
-    fs.rmSync(fifoSettings, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoSettings])
-    const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
-      'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
-      'console.log("SETTINGS_READ_NONBLOCKING")\n' +
-      'process.exit(0)\n'
-    const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
-    let probeOut = ''
-    probe.stdout.on('data', (c) => { probeOut += c })
-    probe.stderr.resume()
-    const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
-    const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
-    await probeDone
-    clearTimeout(probeTimer)
-    assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
-      'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    if (makeFifo(fifoSettings, '设置文件 FIFO（非阻塞启动）')) {
+      const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
+        'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
+        'console.log("SETTINGS_READ_NONBLOCKING")\n' +
+        'process.exit(0)\n'
+      const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let probeOut = ''
+      probe.stdout.on('data', (c) => { probeOut += c })
+      probe.stderr.resume()
+      const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
+      const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
+      await probeDone
+      clearTimeout(probeTimer)
+      assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
+        'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    }
+    // 清理放在 if 外：没有 mkfifo 时这份沙箱同样要删（否则只能等退出时的全局收割）。
     fs.rmSync(fifoDir, { recursive: true, force: true })
   })
 
@@ -4681,7 +4814,7 @@ async function main () {
 
   await aok('HTTP: 全局重放窗 60s（D2-S16：窗内 409 带剩余秒数，文案不谎称有任务在运行）', async () => {
     const dir = tmpDir()
-    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 30000, runId: '1750000000000.3' } }))
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.3' } }))
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
@@ -4695,7 +4828,7 @@ async function main () {
   })
   await aok('HTTP: 全局重放窗越窗放行（61s 前受理 → 202；旧 12min 窗会拦）', async () => {
     const dir = tmpDir()
-    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 61000, runId: '1750000000000.3' } }))
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - (REPLAY_WINDOW_MS + 1000), runId: '1750000000000.3' } }))
     const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     const okRes = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
@@ -4715,7 +4848,7 @@ async function main () {
     const port = await listen(server)
     const laPath = path.join(dir, 'console-lastaccept.json')
     // 独立端点 60s 窗内 → /trigger 侧同键同窗同样拦截（共享 lastAccept 键）
-    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.8' } }))
+    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.8' } }))
     const viaTrigger = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=notify-test' })
     assert.strictEqual(viaTrigger.status, 409, '/trigger 侧通道同键同窗拦截（D6 有意行为）')
     assert.strictEqual(JSON.parse(viaTrigger.text).runId, '1750000000000.8', '回带同一首轮 runId')
@@ -6669,11 +6802,11 @@ async function main () {
     // mkfifo 需要专用系统调用（Node 22 无 mkfifoSync）——用 coreutils 绝对路径
     // （Sonar S4036：不做可写目录 PATH 查找），普通文件先删除再建 FIFO。
     const fifo = path.join(dir, 'pipe')
-    fs.rmSync(fifo, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
-    const t0 = Date.now()
-    assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    if (makeFifo(fifo, 'statSafeMeta FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    }
   })
   await aok('只读纯函数: classifyStateFile 分类与 F4 反例（.seen.cleanup.lock.json 是缓存不是锁）', () => {
     assert.strictEqual(classifyStateFile('push.json', 'push.json'), 'cache')
@@ -6752,11 +6885,11 @@ async function main () {
     assert.strictEqual(tombstoneCounts(dir2, 'push.json').bytes, null)
     // FIFO 也走 unsafe 闸（statSafeMeta 的 O_NONBLOCK 立即返回）——若闸失效此用例挂死
     const fifoTomb = path.join(dir2, 'push.json.seen.json')
-    fs.rmSync(fifoTomb, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoTomb])
-    const t0 = Date.now()
-    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+    if (makeFifo(fifoTomb, 'tombstone FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+    }
   })
   await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
     const { readSafeTextResult } = require('./xbk_storage')
@@ -6770,11 +6903,11 @@ async function main () {
     assert.strictEqual(noOpt.status, 'ok', '不传 options 的既有调用方语义不变')
     // FIFO（无写者）：O_NONBLOCK open 立即 ENXIO → unsafe；若回归为裸 open 此用例挂死
     const fifo = path.join(dir, 'pipe')
-    fs.rmSync(fifo, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
-    const t0 = Date.now()
-    assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    if (makeFifo(fifo, 'readSafeTextResult FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    }
   })
   await aok('只读纯函数: defaultHealthLimits entryMax 与 _resolveMaxSize 同口径（数字/字符串/脏值回退）', () => {
     const { defaultHealthLimits } = require('./scripts/console')
@@ -8065,6 +8198,29 @@ async function main () {
     assert.ok(!/\.page\s*\{[^}]*min-height:/.test(css), '不得再用固定减值的 min-height（短页会多出滚动）')
   })
 
+  // ── C5-033 返工：函数体定位器自测 ──
+  // 变异档里 console.js 被插桩器重写，签名空白会被压掉。定位器必须对「带空格 / 无空格」
+  // 两种形态都取到同一条非空函数体；否则下面 length>500 的守卫每轮恒抛，变异报告失真。
+  await aok('C5-033 函数体定位器: 带空格/无空格（插桩后）两种签名都能取到 tickAuto 函数体', () => {
+    const body = '  if (!lockVerdict.ok) return\n  auto.fails += 1\n'.repeat(20)
+    const spaced = `function tickAuto () {\n${body}}\n`
+    const tight = `function tickAuto() {\n${body}}\n`
+    assert.ok(spaced.includes('function tickAuto ('), 'fixture 必须覆盖「带空格」形态')
+    assert.ok(tight.includes('function tickAuto(') && !tight.includes('function tickAuto ('),
+      'fixture 必须覆盖插桩器产出的「无空格」形态')
+    const fromSpaced = functionBodyOf(spaced, 'tickAuto')
+    const fromTight = functionBodyOf(tight, 'tickAuto')
+    assert.ok(fromSpaced.length > 500, '带空格形态必须取到 >500 字节的函数体')
+    assert.ok(fromTight.length > 500, `无空格形态（插桩后）必须取到 >500 字节，实取 ${fromTight.length}`)
+    assert.strictEqual(fromTight, fromSpaced, '两种形态必须取到同一条函数体')
+    assert.ok(fromTight.includes('lockVerdict'), '取到的必须是函数体内容，不是签名')
+    // 旧写法（定点串）在无空格形态上必然 miss：这就是「取 0 字节 → 恒抛」的根因。
+    assert.strictEqual(tight.indexOf('function tickAuto ('), -1, '旧定点串在插桩后源码上必然 miss')
+    // 真文件也过一遍：变异沙箱里读到的就是插桩后的 console.js。
+    const realSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    assert.ok(functionBodyOf(realSrc, 'tickAuto').length > 500, '真实 console.js 上的 tickAuto 函数体必须取得非空')
+  })
+
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -8073,31 +8229,18 @@ async function main () {
     assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
       '保存/启动前必须统一 clamp 到 3–20')
     const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
+    // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
+    // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
+    // 这条红线，删除/替换 tickAuto 的锁必红。
+    // 定位器已提到模块作用域（functionBodyOf），签名按函数名 + 正则容错匹配，
+    // 见下方 C5-033 定位器自测。
     // 变异沙箱里 console.js 是机器生成代码（语句被 stryMutAct_* 条件包裹 + 覆盖率计数），
     // 所有源码串断言只对原始源文件有意义——与「测试隔离」红线同一口径，交 Test workflow 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
-      // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
-      // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
-      // 这条红线，删除/替换 tickAuto 的锁必红。
-      const functionBodyOf = (text, signature) => {
-        const at = text.indexOf(signature)
-        if (at < 0) return ''
-        const open = text.indexOf('{', at + signature.length)
-        if (open < 0) return ''
-        let depth = 0
-        for (let i = open; i < text.length; i++) {
-          if (text[i] === '{') depth++
-          else if (text[i] === '}') {
-            depth--
-            if (depth === 0) return text.slice(open + 1, i)
-          }
-        }
-        return ''
-      }
-      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
       assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
         consoleSrc.includes("startAction('run-auto'") &&
         tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
@@ -8137,6 +8280,31 @@ async function main () {
         "server.on('close', () => { disposeAuto(); killAll() })",
         "server.on('close', () => { killAll() }); disposeAuto()")),
       '清理调用移出关闭回调不得算数')
+    } else {
+      // C5-033：变异档不再整段跳过（旧写法让这 8 条红线在变异评估里零防护）。
+      // 插桩只改写语句/表达式文本（字面量被 stryMutAct_* 包住），标识符、字符串字面量与
+      // 函数体结构都还在 ⇒ 用「函数体 + 标识符」这一族断言兜同一批红线：删掉 tickAuto 的锁、
+      // 单飞判定或连续失败计数，或把 run-auto 挪到别处，都会在这里变红。
+      const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
+      assert.ok(tickAutoBody.length > 500, '变异档必须仍能取到 tickAuto 函数体（否则下面几条恒真）')
+      assert.ok(consoleSrc.includes('AUTO_MIN_S') && consoleSrc.includes('AUTO_MAX_S') &&
+        consoleSrc.includes('clampAutoSeconds'),
+      '服务器端 3–20 秒夹紧常量与夹紧函数必须还在（文本被插桩改写，只认标识符）')
+      assert.ok(consoleSrc.includes('AUTO_MAX_FAILS') && tickAutoBody.includes('startAction') &&
+        tickAutoBody.includes("'run-auto'"),
+      '自动调度必须在服务器进程内跑 run-auto')
+      assert.ok(tickAutoBody.includes('acquireLockResult') && /lockVerdict\s*\.\s*ok/.test(tickAutoBody),
+        'tickAuto 体内必须先取单飞锁（换成 {ok:true} 即变红）')
+      assert.ok(tickAutoBody.includes('autoInFlightId') && /activeChildren\s*\.\s*size/.test(tickAutoBody),
+        '上一轮未结束不得叠跑')
+      assert.ok(tickAutoBody.includes('auto.fails') && tickAutoBody.includes('AUTO_MAX_FAILS') &&
+        tickAutoBody.includes('stopAuto'),
+      '连续失败计数必须仍参与自动停机判定')
+      assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
+        '自动开关/间隔必须由服务器持久化，重启可恢复')
+      assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
+      assert.ok(consoleSrc.includes('disposeAuto') && consoleSrc.includes('killAll'),
+        '控制台关闭时必须清理自动定时器')
     }
 
     const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
@@ -10706,6 +10874,128 @@ async function main () {
     assert.ok(/\$\{statsTailNote\(stats\)\}/.test(seg), '周卡必须复用同一个尾部标注（两卡口径不得再分叉）')
     assert.ok(!/\(\s*stats\.truncated/.test(seg), '不得再在卡片里就地读 stats.truncated（判定只留在 pure.mjs）')
   })
+
+  // ── C5-064：服务端 renderPage 输出断言（组件级渲染：DEFER，见下）──
+  // 病根：本文件几千条断言里没有一条调用过渲染入口，全是 readConsoleSource() 的正则。
+  // 「文本里有这行代码」与「页面真的这么渲染」是两件事：把 renderPage 改成返回固定串、
+  // 或把 boot 岛里的 token/instance 丢掉，旧断言全绿。这里直接调导出的 renderPage /
+  // renderUnauthorizedPage 渲染真实 state，对返回的 HTML 做断言。
+  //
+  // 口径（C5-064 正式 DEFER）：下面 5 条只覆盖**服务端字符串渲染**（state → HTML 文本），
+  // 不是组件级行为测试。scripts/console-assets/pages.js(5067 行)/components.js(1451 行)
+  // 里的组件（弹窗打开后焦点、Esc 关闭回调、空列表空态文案）仍无一条用例真渲染过，
+  // 预检原文「没有一条渲染过组件」成立，不得把这批用例记作组件行为测试。
+  // 已尝试但本轮落不了地（证据留档）：
+  //   1) 资产是浏览器 ESM（import './htm-preact.module.js'），package.json 无 "type":"module"
+  //      ⇒ CJS 测试进程直 import .js 会按 CJS 解析报错；要跑需先拷贝改名 .mjs 并改写说明符。
+  //   2) 组件渲染需要 DOM：htm-preact.module.js 本身能在 Node 里 import（已实测），但本机没有
+  //      任何 DOM 实现——jsdom / happy-dom / linkedom 在 worktree 与共享 node_modules 里全 absent。
+  //   3) `npm i -D happy-dom` 两次实测（180s、420s）均卡在 reify 阶段超时；registry 镜像
+  //      (mirrors.tencentyun.com) 对大 reify 不可用，中途还把关掉的 node_modules 删成半残（已还原）。
+  // 结论：补真组件测试的前置条件是先解依赖（离线 happy-dom tarball，或给资产加测试专用 ESM 入口）。
+  // 在这之前，"C5-064 已覆盖组件行为" 的说法不成立。
+  // state 骨架按 formatStatus 的读取面构造（generatedAt + report/run/channels/diagnostics 四部件）。
+  function uiState (over = {}) {
+    return {
+      generatedAt: Date.UTC(2026, 9, 27, 3, 4, 5),
+      report: { status: 'ok', value: { date: '2026-10-27', runs: 3, pushed: 12, failed: 1, truncated: 0 } },
+      run: { status: 'ok', value: { at: '2026-10-27 11:03:00', total: 20, dedup: 3, filtered: 2, pushed: 14, failed: 1, truncated: 0, elapsed: '4s' } },
+      channels: { status: 'ok', value: { xianbao: { consecutiveFailures: 1, lastFailureAt: 0, lastAlertAt: 0 } } },
+      diagnostics: { status: 'ok', value: { at: '2026-10-27 10:00:00', byReason: { dedup: 3 } } },
+      ...over
+    }
+  }
+  // boot JSON 岛是前端拿 token/version/instance 的唯一通道：抽出来按 JSON 解析，顺便证明
+  // 「转义之后仍是合法 JSON」——旧断言只看源码里有没有 bootJson 这个标识符。
+  function bootIsland (html) {
+    const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(html)
+    assert.ok(m, '必须渲染出 id="xbk-boot" 的 JSON 岛，否则前端拿不到凭证/实例名')
+    return JSON.parse(m[1])
+  }
+
+  await aok('C5-064 renderPage: 用户可控状态字段必须转义（服务端渲染输出，尖括号不得原样落地）', () => {
+    const { renderPage } = require('./scripts/console')
+    const payload = '<script>alert(1)</script>'
+    const attr = 'x" onmouseover="alert(1)'
+    const html = renderPage(uiState({
+      report: { status: 'ok', value: { date: payload, runs: 1 } },
+      run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
+      channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
+    }), [], new URLSearchParams(), 'tok', 'deep')
+    assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
+    assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
+    assert.ok(html.includes('&quot; onmouseover=&quot;alert(1)'), '双引号必须转成 &quot;（转义完整性）')
+  })
+
+  await aok('C5-064 renderPage: 空 state/无 run/空 runsList 不抛，且输出完整合法骨架', () => {
+    const { renderPage } = require('./scripts/console')
+    const bare = {
+      generatedAt: 0,
+      report: { status: 'missing', value: null },
+      run: { status: 'missing', value: null },
+      channels: { status: 'missing', value: null },
+      diagnostics: { status: 'missing', value: null }
+    }
+    // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
+    const html = renderPage(bare, [], undefined, '', 'deep')
+    assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
+    assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
+    assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
+    assert.ok(html.includes('<noscript>') && html.includes('缺失'), '无脚本降级必须保留，且缺失部件如实写「缺失」')
+    assert.strictEqual((html.match(/<\/html>/g) || []).length, 1)
+    const boot = bootIsland(html)
+    assert.strictEqual(boot.token, '', '没传凭证时 boot token 必须是空串')
+    assert.strictEqual(boot.instance, '', '没传 instanceId 时必须回退空串（不能是 undefined）')
+    assert.strictEqual(typeof boot.version, 'string')
+    assert.ok(boot.version.length > 0, 'version 必须非空，否则资产 URL 带不上版本号、缓存永远不失效')
+  })
+
+  await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
+    const { renderPage } = require('./scripts/console')
+    const dark = renderPage(uiState(), [], new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), [], new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
+    assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
+    assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
+    assert.strictEqual(bootIsland(dark).token, 'tok-AAA', 'boot token 必须是本请求验过的凭证')
+    assert.strictEqual(bootIsland(dark).instance, 'inst-1', 'instanceId 必须进 boot（前端快照的命名空间）')
+    assert.strictEqual(bootIsland(light).token, 'tok-BBB')
+    assert.strictEqual(bootIsland(light).instance, 'inst-2')
+    // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
+    const evil = renderPage(uiState(), [], new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
+    assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
+  })
+
+  await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
+    const { renderPage } = require('./scripts/console')
+    const fromQuery = renderPage(uiState(), [], new URLSearchParams('token=from-query'), '', 'deep')
+    assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
+    const fromSession = renderPage(uiState(), [], new URLSearchParams('token=from-query'), 'from-session', 'deep')
+    assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
+    // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
+    const breakout = renderPage(uiState(), [], new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
+    assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
+    assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')
+  })
+
+  await aok('C5-064 renderUnauthorizedPage: 令牌/错误文案转义，条件字段按参数出现', () => {
+    const { renderUnauthorizedPage } = require('./scripts/console')
+    const plain = renderUnauthorizedPage()
+    assert.ok(plain.includes('<input id="token"'), '未带码时必须有可见令牌输入框')
+    assert.ok(plain.includes('autofocus'), '未带码时令牌框自动聚焦（否则用户对着空表单先按一次 Tab）')
+    assert.ok(!plain.includes('name="code"'), '未要求第二因子时不得渲染验证码框')
+    assert.ok(!plain.includes('type="hidden" name="token"'), '未要求第二因子时不得把令牌塞进 hidden')
+    assert.ok(!plain.includes('记住这台设备'), '未要求第二因子时不得出现信任设备勾选')
+    const twofa = renderUnauthorizedPage({ requireCode: true, token: 'tok</script>', error: '<img src=x onerror=alert(1)>' })
+    assert.ok(twofa.includes('type="hidden" name="token" value="tok&lt;/script&gt;"'), '令牌必须经 hidden 回填且转义')
+    assert.ok(twofa.includes('name="code"'), '要求第二因子时必须渲染验证码/恢复码框')
+    assert.ok(twofa.includes('&lt;img src=x onerror=alert(1)&gt;'), '错误文案必须转义后输出')
+    assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
+    assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
@@ -10713,11 +11003,17 @@ async function main () {
 // 既没有「通过 N / 失败 M + 失败用例清单」（分项汇总），也没有强退闸——只要还有 ref 句柄
 // 攥着事件循环（迟到回调、孙进程），CI 照样白等满 timeoutMS，而日志里看不出是哪条用例烂了。
 function finishSuite () {
-  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
+  // 跳过必须可见（C5-070）：FIFO 夹具缺 mkfifo 时只跳过那一小段，不能让它静默消失。
+  const skippedNote = skipped > 0 ? ` / 跳过 ${skipped}（本机缺工具，已逐条打印原因）` : ''
+  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}${skippedNote}`)
   if (failed > 0) {
     process.exitCode = 1
     // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
     console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+    // 同名用例：`@L` 行号已能区分，这里再点名，免得有人把「两条同名」读成重复打印（C5-068）。
+    if (duplicateCaseNames.size > 0) {
+      console.log(`同名（重号）用例 ${duplicateCaseNames.size} 个，按 #n 区分：${[...duplicateCaseNames].join(' / ')}`)
+    }
   }
   // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
   // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
