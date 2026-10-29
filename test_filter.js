@@ -193,10 +193,12 @@ function cleanupTestCache () {
 let passed = 0
 let failed = 0
 const errors = []
-// 每用例硬超时。沙箱内必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
+// 每用例硬超时。必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
 // → perfLimit 后 36000ms），否则「内部阈值还没到期、harness 先判超时」⇒ 上面的缩放等于白做
-// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。默认保持 3000ms 逐字节不变。
-const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 3000
+// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。
+// C4-007：默认模式同样受此约束 —— 原 3000ms 与 perfLimit(3000)=3000 相等（不满足严格大于），
+// 而旧守卫 `PERF_SCALE === 1 || ...` 恰好把它短路成恒真。默认提到 4000ms，守卫去掉短路。
+const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 4000
 
 async function test (name, fn) {
   const start = Date.now()
@@ -6100,9 +6102,11 @@ console.log('========================================\n');
     assertEqual(perfLimitWith(300, 3000) > 1903, true, `沙箱 tuisong 预算须覆盖实测上界 1903ms，实际 ${perfLimitWith(300, 3000)}ms`)
     assertEqual(perfLimitWith(500, 3000) > 1210, true, `沙箱 htmlToMarkdown 预算须覆盖 CI 实测上界 1210ms，实际 ${perfLimitWith(500, 3000)}ms`)
     assertEqual(perfLimitWith(500, 3000) > 966, true, `沙箱 saveBatch 预算须覆盖实测上界 966ms，实际 ${perfLimitWith(500, 3000)}ms`)
-    // ⑥ 沙箱内 harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死
-    assertEqual(PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000), true, '沙箱内 harness 超时须严格大于最大内部阈值')
-    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 3000, '默认 harness 超时必须仍是 3000ms')
+    // ⑥ harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死。
+    //    C4-007：原判据写成 `PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000)` —— 唯一违规的
+    //    默认模式（3000 > 3000 为假）被短路恒真屏蔽。去掉短路，默认超时提到 4000ms 以满足严格大于。
+    assertEqual(TIMEOUT_MS > perfLimit(3000), true, 'harness 超时必须严格大于最大内部阈值（默认 4000 > 3000）')
+    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 4000, '默认 harness 超时必须为 4000ms（严格大于内部阈值 3000）')
   })
 
   // ==================== 86. 分支覆盖显式验证(关键if两方向) ====================
