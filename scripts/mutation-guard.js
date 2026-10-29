@@ -46,6 +46,17 @@
 //     files.*.mutants.items.status（enum）
 //   * node_modules/mutation-testing-report-schema/dist/src-generated/schema.d.ts 的 `export type MutantStatus = ...`
 // 与 scripts/mutation-report.js 的 MUTANT_STATUSES 同源同集合——收窄成 countMutant 计数的 4 个会把正常报告整段拒掉。
+//
+// ── argv 解析策略（C10-054）────────────────────────────────────────────────────────────────
+// 本仓有 ≥8 个 CLI 入口各自手写 argv 解析（本文件、xbk_function_v3.js、qinglong/xbk_push.js、
+// scripts/mutation-report.js、scripts/check-doc-lines.js、scripts/check-host-clean.js、
+// scripts/check-ci-static.js、scripts/validate-release-tag.js）。未知参数历史上分三类互斥策略：
+//   ① throw 后收敛成非零退出（本文件）；② console.error + process.exitCode=1（xbk_function_v3/qinglong 入口）；
+//   ③ 静默忽略（其余用 includes/indexOf 取已知项，剩下的当位置参数）。
+// 统一口径 = **未知或非法参数一律 fail-closed**（本文件即该口径的实现，见 parseArgs）：拼错 `--segmnt`
+// 曾能让守卫静默空转（无路径 ⇒ 无判据）。空取值、取值看起来像另一个参数、同一参数重复指定都算非法。
+// 其余入口的收敛**不在本次改动范围**（动它们会改变既有 CLI 行为）；换 node:util parseArgs 也应排在
+// 统一策略之后，而不是先换实现再谈语义。
 const path = require('node:path')
 const fs = require('node:fs')
 const { readReportJson, resolveMaxReportBytes } = require('./mutation-json.js')
@@ -284,15 +295,28 @@ function readKilledBaseline (filePath, options = {}) {
 function parseArgs (argv) {
   const paths = []
   let segment = null
+  let segmentSource = null
+  // 口径（C10-054）：未知或**非法**参数一律 fail-closed。此前的三处静默接受都并进来：
+  //   * `--segment=`（空取值）→ 旧实现 trim 后置 null，守卫在**没有标签**的情况下继续跑；
+  //   * `--segment --label x` → 旧实现把 `--label` 当段名、`x` 当报告路径（真错时只报「文件不可读」，误导）；
+  //   * 重复 `--segment a --segment b`（或 `--segment` 与 `--label` 同时给）→ 旧实现后者静默覆盖前者。
+  const takeSegment = (source, raw) => {
+    const value = String(raw)
+    if (value.trim() === '') throw new Error(`${source} 取值为空（fail-closed：空取值会让守卫在没有段标签的情况下继续跑）`)
+    if (value.startsWith('-')) throw new Error(`${source} 的取值 ${value} 看起来是另一个参数（fail-closed：参数不明时拒绝静默放行）`)
+    if (segmentSource !== null) throw new Error(`${source} 重复指定段名（已由 ${segmentSource} 给出「${segment}」）—— fail-closed：取哪个都不该靠猜`)
+    segment = value
+    segmentSource = source
+  }
   for (let i = 0; i < argv.length; i++) {
     const a = String(argv[i])
     if (a === '--segment' || a === '--label') {
       const v = argv[i + 1]
       if (v === undefined) throw new Error(`${a} 缺少取值`)
-      segment = String(v)
+      takeSegment(a, v)
       i++
     } else if (a.startsWith('--segment=')) {
-      segment = a.slice('--segment='.length)
+      takeSegment('--segment=', a.slice('--segment='.length))
     } else if (a === '--') {
       for (let j = i + 1; j < argv.length; j++) paths.push(String(argv[j]))
       break
@@ -303,7 +327,6 @@ function parseArgs (argv) {
       paths.push(a)
     }
   }
-  if (segment !== null && segment.trim() === '') segment = null
   return { paths, segment }
 }
 
