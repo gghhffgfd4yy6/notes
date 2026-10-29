@@ -479,7 +479,7 @@ function main () {
     console.log('❌ --stale-min 必须是正数分钟，实得 ' + JSON.stringify(argv[i + 1]))
     return 1
   }
-  const r = inspect({ staleMs: Number.isFinite(staleMin) ? Math.round(staleMin * 60000) : undefined })
+  const r = inspect({ env: process.env, staleMs: Number.isFinite(staleMin) ? Math.round(staleMin * 60000) : undefined })
   if (r.skipped) {
     console.log('⏭ 主机干净度检查跳过：' + r.reason)
     return 0
@@ -524,7 +524,12 @@ function main () {
 // 供 run_tests.js / run_unit_tests.js 入口调用：返回 true 表示应当中止本次运行
 function guardOrExit (env) {
   const r = inspect({ env: env || process.env })
-  if (r.skipped) return false
+  if (r.skipped) {
+    // 跳过必须响亮打印（与 main 的 ⏭ 同一行，含 skip 原因）：三个生产入口只从这里拿到输出，
+    // 静默 `return false` 让「门禁没跑」与「已检查且干净」在输出上完全同形（C10-013）。
+    console.log('⏭ 主机干净度检查跳过：' + r.reason)
+    return false
+  }
   if (r.unsupported) {
     console.log('⚠️ 主机干净度检查：读不到 /proc，无法判定孤儿桩；若有过期沙箱候选，则 cwd 豁免不可判定并按 fail-closed 拒绝继续')
   }

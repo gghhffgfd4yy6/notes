@@ -8,6 +8,7 @@
 // 复制 scripts/，故沙箱内也能跑；由「全量单元测试（run_unit_tests.js）」兜底步骤覆盖，SKIP_SUITES 不动。
 // 判据本身的边界用例（NUL cmdline、ppid 排除、过期阈值覆盖等）在 --selftest 的 34 条里，不在此重复。
 const assert = require('node:assert')
+const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -41,6 +42,33 @@ check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
   const direct = read('test_filter.js')
   assert.match(direct, /^if \(hostClean\.guardOrExit\(process\.env\)\) process\.exit\(1\)$/m,
     '直接执行 test_filter.js（CI/pre-push）也必须先经过主机干净度检查')
+})
+
+check('跳过必须响亮打印：guardOrExit 与 CLI 走同一条 ⏭ 分支（C10-013）', () => {
+  // 背景：`guardOrExit` 在 r.skipped 时曾直接 `return false`（零输出），三个生产入口拿到的
+  // 结果与「已检查且干净」逐字相同；而 main() 调 inspect() 时不传 env，:483 的 ⏭ 分支是死代码
+  // ⇒ 在变异评估子进程里直接跑 CLI 反而打印「✅ 主机干净」。这两处都让「门禁没跑」不可见。
+  const entry = path.join(__dirname, 'scripts/check-host-clean.js')
+  const guardProbe = 'const h=require(' + JSON.stringify(entry) + ');' +
+    'const r=h.guardOrExit({XBK_MUTATION_CHILD:"1"});process.stdout.write("\\nRET="+String(r))'
+  const guardRun = spawnSync(process.execPath, ['-e', guardProbe], {
+    encoding: 'utf8',
+    env: { ...process.env, XBK_MUTATION_CHILD: '1' }
+  })
+  assert.ok(!guardRun.error, 'guardOrExit 探针未能启动: ' + (guardRun.error && guardRun.error.message))
+  assert.strictEqual(guardRun.status, 0, '跳过路径不得改变退出码：' + guardRun.stderr)
+  assert.match(guardRun.stdout, /⏭ 主机干净度检查跳过：XBK_MUTATION_CHILD=1（变异评估沙箱内）/,
+    'guardOrExit 跳过时零输出 ⇒ 三个生产入口都不知道门禁没跑（跳过必须与 main 打同一行 ⏭）')
+  assert.match(guardRun.stdout, /RET=false/, '跳过语义不变：仍返回 false（不阻断本次运行）')
+  const cliRun = spawnSync(process.execPath, [entry], {
+    encoding: 'utf8',
+    env: { ...process.env, XBK_MUTATION_CHILD: '1' }
+  })
+  assert.strictEqual(cliRun.status, 0, 'CLI 在跳过场景必须 exit 0: ' + cliRun.stderr)
+  assert.match(cliRun.stdout, /⏭ 主机干净度检查跳过：XBK_MUTATION_CHILD=1/,
+    'main() 必须把 env 传给 inspect()：否则 ⏭ 分支是死代码，变异子进程里 CLI 会谎报「✅ 主机干净」')
+  assert.ok(!/✅ 主机干净/.test(cliRun.stdout),
+    '跳过时不得打印「✅ 主机干净」：那是把「没检查」说成「检查过且干净」')
 })
 
 check('不回退：变异子进程必跳过；沙箱只认过期；阈值必须是 30 分钟', () => {
