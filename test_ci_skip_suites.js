@@ -1424,6 +1424,15 @@ try {
   assert.strictEqual(shimOk.status, 0, `对照：正常退出应 exit 0：${shimOk.stderr}`)
   assert.match(shimOk.stdout, /^ok 1 - test_stub_tap_probe\.js$/m, '对照：TAP 点必须投递到 stdout')
   assert.match(shimOk.stdout, /^1\.\.1$/m, '对照：plan 行必须投递到 stdout')
+  // C2 回归：这一跑**没有** stryker coverage JSON（hook 未预加载）⇒ 注解必须静默跳过。
+  //   去掉 existsSync 之后，存在性只能由**这次读自己的 ENOENT** 判定；漏掉那条分支就会落进外层
+  //   catch，在 stderr 打出「tapPoints 未能写进 coverage JSON」——把「hook 没产出」误报成注解失败
+  //   （C2 修复前的形态不是误报，而是 check-then-use；这条回归锁的是修完之后的语义不变）。
+  //   两条断言各守一半：a) 不得有那条误报；b) 不得凭空创建 stryker-output-*.json（注解只改**已产出**的文件）。
+  assert.doesNotMatch(shimOk.stderr, /tapPoints 未能写进 coverage JSON/,
+    `无 coverage JSON 时必须静默跳过注解（ENOENT 是正常路径），实际 stderr：${JSON.stringify(shimOk.stderr)}`)
+  assert.deepStrictEqual(fs.readdirSync(shimProbeDir).filter(f => f.startsWith('stryker-output-')), [],
+    '无 coverage JSON 时不得凭空创建 stryker-output-*.json（注解只改 hook 已产出的那份）')
   // C10-008：成功投递的点数必须落成记录（mutation.yml 的空流判据只有这一条数据来源）
   {
     const recs = readShimRecords()
