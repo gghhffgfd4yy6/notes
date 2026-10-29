@@ -265,9 +265,11 @@ if (process.env.QUICK === '1') {
   Config.timing.finalWait = 0
 }
 
+let currentTestName = '' // 当前用例名（expectRunThrows 的诊断定位用）
 async function test (name, fn) {
   if (onlyFilter && !name.includes(onlyFilter)) { skipped++; passed++; return } // 跳过（并行调度用）
   if (nameSet && !nameSet.has(name)) { skipped++; passed++; return } // v3.172：名单外跳过（并行分片）
+  currentTestName = name
   executed++ // v3.276（EXEC-D T10）：真正进入 fn() 的用例数（passed 含跳过，无法反映过滤是否生效）
   const t0 = Date.now() // v3.122：耗时统计（识别慢测试供并行调度）
   try {
@@ -284,6 +286,20 @@ async function test (name, fn) {
 
 function assert (cond, msg) {
   if (!cond) throw new Error(msg || '断言失败')
+}
+
+// 负向用例的共同前提：run() 必须真的抛错（C5-005）。
+// 旧写法是对 xbk.run() 套一个空 catch：它对「抛了」与「根本没抛」两种形态都全绿——后面的负向断言
+// （不写状态 / 不发告警 / 不写缓存）在失败分支从未走到时恒真，等于空转。15 处吞错点统一走这里；
+// 诊断自动带上当前用例名（currentTestName）。
+async function expectRunThrows () {
+  let threw = false
+  try {
+    await xbk.run()
+  } catch (e) {
+    threw = true
+  }
+  assert(threw, `${currentTestName}：run() 必须抛错（否则后续负向断言恒真，被测失败分支根本没走到）`)
 }
 
 // Qodo PR #158 回归用：与 test_filter.js 的 assertEqual / assert.strictEqual 同口径的严格相等断言。
@@ -457,7 +473,7 @@ console.log('========================================\n');
       Config.alert.enabled = true
       Config.alert.intervalMs = 0
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 接口失败仍应向调用方暴露 */ }
+      await expectRunThrows()
       assert(pushCalls.length === 0, `dry-run 接口失败不得发送告警，实际 ${pushCalls.length} 次`)
       assert(!fs.existsSync(alertState), 'dry-run 接口失败不得写入告警状态')
     } finally {
@@ -2225,7 +2241,7 @@ console.log('========================================\n');
       reset()
       setPushUrl('t56_alert_2')
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       const alert2 = pushCalls.find(c => c.text.includes('运行异常'))
       assert(!alert2, '限频内不应重复发送告警')
     } finally {
@@ -2318,13 +2334,13 @@ console.log('========================================\n');
       Config.alert.enabled = true
       Config.alert.intervalMs = ''
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期失败 */ }
+      await expectRunThrows()
       assert(pushCalls.some(c => c.text.includes('运行异常')), '首次异常应发告警')
       reset()
       setPushUrl('t72_alert_interval_empty_2')
       Config.alert.enabled = true
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期失败 */ }
+      await expectRunThrows()
       assert(!pushCalls.some(c => c.text.includes('运行异常')), '空字符串应回退默认限频，不应第二次轰炸')
     } finally {
       Config.alert.intervalMs = origInterval
@@ -2342,17 +2358,17 @@ console.log('========================================\n');
       Config.alert.intervalMs = 0 // 不限频，确保只受 enabled 控制
       fakeData = []
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       assert(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=0 不应发送告警')
       // 字符串 '0' 同样关闭
       pushCalls = []
       Config.alert.enabled = '0'
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       assert(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled="0" 不应发送告警')
       // 对照：true 时发送（确保测试本身有效）
       pushCalls = []
       Config.alert.enabled = true
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       assert(!!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=true 应发送告警（对照）')
     } finally {
       Config.alert.enabled = origEnabled
@@ -2373,7 +2389,7 @@ console.log('========================================\n');
       Config.alert.intervalMs = 'abc' // 非法字符串（环境变量拼错）——曾 'abc' > 0 比较 false → 0 不限频轰炸
       // 第一次：接口异常 → 发告警（lastAt 空，'abc' 回退默认 3600000 仍发首次）
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       const alert1 = pushCalls.find(c => c.text.includes('运行异常'))
       assert(!!alert1, '第一次应发告警')
       // 第二次：限频应生效（'abc' → 默认 3600000，曾 0 不限频每次轰炸）
@@ -2381,7 +2397,7 @@ console.log('========================================\n');
       setPushUrl('t72_alert_interval_abc_2')
       Config.alert.enabled = true // reset() 默认关闭告警（曾漏开 → 第二次不发是 disabled 而非限频，变异抓不住）
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       const alert2 = pushCalls.find(c => c.text.includes('运行异常'))
       assert(!alert2, `非法 intervalMs 应回退默认限频（曾不限频轰炸）: ${pushCalls.map(c => c.text).join('|')}`)
     } finally {
@@ -3030,19 +3046,28 @@ console.log('========================================\n');
     const origEnabled = Config.alert.enabled
     const origLog = console.log
     const logs = []
+    const alertStatePath = path.join(CACHE_DIR, 'alert.state')
     console.log = (...a) => logs.push(a.join(' '))
     try {
       Config.alert.enabled = true
       Config.alert.intervalMs = 0
       fail4xx = true // 接口失败触发告警
       notifyFail = true // 告警通道也挂（sendNotify reject）
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       assert(!logs.some(l => l.includes('已发送运行异常告警')), `通道挂不应误报已发送: ${logs.join(' | ')}`)
+      // 正向对照（C5-005）：同一段日志断言在「告警根本没走到发送」时也恒真。把通道恢复再跑一轮，
+      // 必须真的出现「已发送运行异常告警」——否则上面的负向断言挡不住「_sendAlert 未被调用」。
+      notifyFail = false
+      try { fs.unlinkSync(alertStatePath) } catch (e) { /* 无状态文件 */ }
+      logs.length = 0
+      await expectRunThrows()
+      assert(logs.some(l => l.includes('已发送运行异常告警')),
+        `对照：通道恢复后必须打印「已发送运行异常告警」（实际 ${logs.join(' | ')}）`)
     } finally {
       console.log = origLog
       Config.alert.intervalMs = origInterval
       Config.alert.enabled = origEnabled
-      try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+      try { require('fs').unlinkSync(alertStatePath) } catch (e) { /* 忽略 */ }
     }
   })
 
@@ -3080,7 +3105,7 @@ console.log('========================================\n');
       Config.alert.intervalMs = 60000
       fail4xx = true // 接口失败触发告警
       notifyFail = true // 告警通道也挂（sendNotify reject）
-      try { await xbk.run() } catch (e) { /* 预期抛错 */ }
+      await expectRunThrows()
       await new Promise(r => setTimeout(r, 50)) // 等 sendNotify 微任务（fire-and-forget）
       const statePath = path.join(CACHE_DIR, 'alert.state')
       assert(!fs.existsSync(statePath), `发送失败不应写状态(曾写 lastAt 限频挡重试): ${fs.existsSync(statePath)}`)
@@ -3107,13 +3132,17 @@ console.log('========================================\n');
         return origRename(from, to)
       }
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 接口失败预期抛错 */ }
+      await expectRunThrows()
       const st = JSON.parse(fs.readFileSync(statePath, 'utf8'))
       assert(st.lastAt === oldState.lastAt, `rename 失败不应破坏旧状态: ${JSON.stringify(st)}`)
       assert(!fs.existsSync(statePath + '.tmp'), '状态临时文件应清理')
+      // 正向对照（C5-005）：先证明「首次确实发过告警」。否则下面的「第二次不重复发」在
+      // 「一次都没发」时也成立——两条断言一起空转，rename 分支从未走到也全绿。
+      assert(notifyCalls === 1,
+        `首次异常必须真的发过一次告警（实际 ${notifyCalls} 次）——否则下面的「不重复发送」恒真`)
       // 同一进程第二次异常不应因状态落盘失败而再次轰炸告警。
       const callsAfterFirst = notifyCalls
-      try { await xbk.run() } catch (e) { /* 接口失败预期抛错 */ }
+      await expectRunThrows()
       assert(notifyCalls === callsAfterFirst, '状态落盘失败后应使用内存限频，不重复发送告警')
     } finally {
       fs.renameSync = origRename
@@ -3177,7 +3206,7 @@ console.log('========================================\n');
       Config.alert.enabled = 'false' // 环境变量字符串
       Config.alert.intervalMs = 0
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期 */ }
+      await expectRunThrows()
       assert(!pushCalls.some(c => c.text.includes('运行异常')), `字符串 false 应关闭告警: ${pushCalls.length}`)
     } finally {
       Config.alert.enabled = orig
@@ -3194,7 +3223,7 @@ console.log('========================================\n');
       Config.alert.enabled = ' FALSE ' // 环境变量字符串带空格/大写，应关闭
       Config.alert.intervalMs = 0
       fail4xx = true
-      try { await xbk.run() } catch (e) { /* 预期 */ }
+      await expectRunThrows()
       assert(!pushCalls.some(c => c.text.includes('运行异常')), `" FALSE " 应关闭告警: ${pushCalls.length}`)
     } finally {
       Config.alert.enabled = orig
@@ -4379,14 +4408,40 @@ console.log('========================================\n');
       'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
   })
 
+  // ---------- 计数对账（C5-004）----------
+  // 过滤跳过被计成「通过」（test() 里 skipped++ 紧跟 passed++），executed 原先只进打印；于是
+  // `--only=<写错的子串>` 或 `--list-file` 名单对不上时，0 例真的执行也打印「🎉 全部通过 N/N」
+  // 并 exit 0 —— 门禁看着全绿，实际一条用例都没跑。这里把几类计数互相钉住，任一不成立即判失败。
+  const reconcile = []
+  try {
+    assertEqualNum(executed, passed + failed - skipped,
+      `执行计数不自洽：executed=${executed}，passed+failed-skipped=${passed + failed - skipped}（跳过的用例不得计入通过数）`)
+    assert(executed > 0,
+      `本轮 0 例真的执行（过滤跳过 ${skipped} 例；${onlyFilter ? `--only=${onlyFilter}` : nameSet ? '--list-file 名单未命中任何用例' : '无过滤'}）——` +
+      '过滤条件/名单写错不得当成「全部通过」，必须判失败')
+    if (!onlyFilter && !nameSet) {
+      assertEqualNum(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
+      // 独立分母：源码里声明的用例数（与 test_app_p.js 同名提取口径）。只对账 passed 说明不了
+      // 「有没有漏跑」——passed 含跳过，恒等于用例总数。
+      const declared = [...fs.readFileSync(__filename, 'utf8').matchAll(/await test\((['"])(.*?)\1,/g)].length
+      assertEqualNum(executed, declared, `无过滤时必须跑满声明用例：声明 ${declared} 例，实际执行 ${executed} 例`)
+    }
+  } catch (e) {
+    reconcile.push(e.message)
+  }
+
   const filterNote = (onlyFilter || nameSet)
     ? `（实际执行 ${executed} 例，过滤跳过 ${skipped} 例${onlyFilter ? `，--only=${onlyFilter}` : ''}）`
     : ''
-  if (failed === 0) {
+  if (failed === 0 && reconcile.length === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}${filterNote}`)
   } else {
     console.log(`  ⚠️   ${passed} 通过, ${failed} 失败${filterNote}`)
     errors.forEach(e => console.log(`    ${e}`))
+    if (reconcile.length > 0) {
+      console.log('  ⚠️   用例计数对账失败（本次结果不可信，按失败处理）：')
+      reconcile.forEach(e => console.log(`    ${e}`))
+    }
   }
   console.log('========================================\n')
 
@@ -4406,5 +4461,16 @@ console.log('========================================\n');
     } catch (e) { /* 忽略 */ }
   }
 
-  process.exit(failed > 0 ? 1 : 0)
+  // worker 执行计数回报（C5-004）：test_app_p.js 的 stdio 是 inherit，父进程读不到子进程 stdout，
+  // 只能落一份报告文件供其断言「Σexecuted === 名单总数」（否则名单写错时 0 例执行也算全绿）。
+  const reportPath = process.env.XBK_TEST_APP_REPORT
+  if (reportPath) {
+    try {
+      fs.writeFileSync(reportPath, JSON.stringify({ executed, skipped, passed, failed }))
+    } catch (e) {
+      console.log(`  ⚠️   执行计数报告写入失败（并行调度器将无法对账）：${e.message}`)
+    }
+  }
+
+  process.exit(failed > 0 || reconcile.length > 0 ? 1 : 0)
 })().catch(e => { console.error(e); process.exitCode = 1 })

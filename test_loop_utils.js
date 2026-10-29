@@ -103,16 +103,52 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
     assert.ok(String(r.stdout || '').includes('RUNS=3'),
       `非信号真值 {aborted:true} 不得让 runLoop 跳过整轮 run（stdout=${JSON.stringify(r.stdout)} signal=${r.signal} status=${r.status}）`)
   }
+  // ===== 本地超时护栏（全文件唯一一份，C5-017）=====
+  // 计时器必须在 race settle 后清掉：p 先 settle 时，旧写法把 `setTimeout` 定时器留在事件循环里，
+  // 进程要等它到期才能退出——每个 3000ms 护栏会把进程多留约 3s（实测套件尾部空等 2.6s /
+  // 净增约 1.6s 每次），反复的变异运行逐次累积这段空等。见 PR #173 评审。
+  // 三个包装共用一份实现：把「该 settle 却永不 settle」的变异体转成快速失败（而不是只等 900s 外部超时）。
+  // ⚠️ 定义必须早于所有使用点：旧版 withinSettle 定义在文件后半段，直接把它上移给 withTimeout 用会
+  // 命中 TDZ（Cannot access 'withinSettle' before initialization），所以共享 helper 放在这里。
+  const withDeadline = (p, ms, makeError) => {
+    let timer
+    const deadline = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(makeError()), ms) })
+    return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
+  }
+  // 带自定义文案（runLoop 守卫用例靠它点名「挂死超时」）
+  const withTimeout = (p, ms, label) => withDeadline(p, ms, () => new Error(`${label} 挂死超时（${ms}ms）`))
+  // 默认 2s：给「该 settle 却永不 settle」的变异体一个快速失败
+  const withinSettle = (p, ms = 2000) => withDeadline(p, ms, () => new Error('未在期限内 settle'))
+
+  // 护栏自身必须有断言（C5-017）：race 先 settle 时定时器必须被清掉——否则进程被多留 ms 毫秒，
+  // 而「套件整体耗时」这种观测无法在断言里回归（它只在人看日志时可见）。
+  // 用「创建即登记、清除即销账」的探针观测：只追踪本条探针的标记时长（4321ms），不影响真实等待。
+  {
+    const realSetTimeoutProbe = global.setTimeout
+    const realClearTimeoutProbe = global.clearTimeout
+    const liveTimers = new Set()
+    global.setTimeout = function (fn, ms, ...rest) {
+      const t = realSetTimeoutProbe(fn, ms, ...rest)
+      if (ms === 4321) liveTimers.add(t)
+      return t
+    }
+    global.clearTimeout = function (t) { liveTimers.delete(t); return realClearTimeoutProbe(t) }
+    try {
+      assert.strictEqual(await withTimeout(Promise.resolve('ok'), 4321, '护栏探针'), 'ok')
+      assert.strictEqual(liveTimers.size, 0,
+        `race 先 settle 后必须 clearTimeout（仍存活 ${liveTimers.size} 个定时器 ⇒ 进程被多留 4321ms）`)
+    } finally {
+      global.setTimeout = realSetTimeoutProbe
+      global.clearTimeout = realClearTimeoutProbe
+    }
+  }
+
   // 反向断言：真正可监听的 signal（含鸭子类型）必须仍被接受——aborted 翻转后当轮结束即退出。
   // 若 isAbortable 被写成恒 false，上面的子进程会通过，但这里会因循环不退出而被 withTimeout 判挂死。
   {
     const duck = { aborted: false, addEventListener: () => {}, removeEventListener: () => {} }
     let duckRuns = 0
-    const withTimeoutDuck = (p, ms) => Promise.race([
-      p,
-      new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`runLoop(duck) 挂死超时（${ms}ms）`)), ms))
-    ])
-    await withTimeoutDuck(runLoop(async () => { duckRuns += 1; duck.aborted = true }, { signal: duck, intervalMs: 0 }), 2000)
+    await withTimeout(runLoop(async () => { duckRuns += 1; duck.aborted = true }, { signal: duck, intervalMs: 0 }), 2000, 'runLoop(duck)')
     assert.strictEqual(duckRuns, 1, '可监听 signal 的 aborted 翻转后应只跑一轮即退出')
   }
 
@@ -169,10 +205,6 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
   // ===== runLoop：run 非函数返回 rejected Promise（async 函数）=====
   // timeout 保护：若守卫失效（如被变异删掉），runLoop 会进入无限循环挂死；
   // 用 Promise.race 确保 2s 内必须 reject，否则判定为挂死失败。
-  const withTimeout = (p, ms, label) => Promise.race([
-    p,
-    new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`${label} 挂死超时（${ms}ms）`)), ms))
-  ])
   await assert.rejects(() => withTimeout(runLoop('not-a-function'), 2000, 'runLoop(string)'), /runLoop 需要函数|挂死超时/, '非函数 run 应 reject')
   await assert.rejects(() => withTimeout(runLoop(123), 2000, 'runLoop(number)'), /runLoop 需要函数|挂死超时/, '数字 run 应 reject')
   await assert.rejects(() => withTimeout(runLoop(null), 2000, 'runLoop(null)'), /runLoop 需要函数|挂死超时/, 'null run 应 reject')
@@ -407,15 +439,6 @@ const { runLoop, sleep, refreshTimeoutError, isAbortable } = require('./xbk_loop
     }
     console.log('✅ 常驻循环：停止信号不截断在飞轮次（三种时点），轮末缓存照写、不产生重复轮次（XL-06 探针结论锁定）')
     await delay(0)
-  }
-
-  // 本地小工具：把「该 settle 却永不 settle」的变异体转成快速失败，而不是只靠 900s 外部超时判负。
-  // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
-  // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
-  const withinSettle = (p, ms = 2000) => {
-    let timer
-    const deadline = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('未在期限内 settle')), ms) })
-    return Promise.race([p, deadline]).finally(() => clearTimeout(timer))
   }
 
   // L1. clampTimerMs/refreshTimeoutError 的文案分支与上下界：专杀 EqualityOperator

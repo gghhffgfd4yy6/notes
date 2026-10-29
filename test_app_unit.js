@@ -14,9 +14,14 @@ const { createApp } = require('./xbk_app.js')
 
 let passed = 0
 let failed = 0
+// 声明数（C5-004）：每注册一条用例（同步 check / 异步 checkAsync）就 +1，与「结算数 passed+failed」
+// 对账。asyncChecks 曾靠「for…of 读活数组」顺带跑到 drain 之后注册的用例，一旦 drain 前移或
+// 注册前出现真正的异步等待，那些用例会静默不跑且没有任何计数能看出来。
+let declared = 0
 const failures = []
 
 function check (name, fn) {
+  declared += 1
   try {
     fn()
     passed++
@@ -897,7 +902,7 @@ check('_persistReportState 落盘前先 normalize（字符串计数转数字、�
 // ============================================================================
 
 const asyncChecks = []
-function checkAsync (name, fn) { asyncChecks.push([name, fn]) }
+function checkAsync (name, fn) { declared += 1; asyncChecks.push([name, fn]) }
 
 async function withCaptureAsync (level, fn) {
   const orig = console[level]
@@ -1716,25 +1721,6 @@ checkAsync('_sendAlert 留痕把连续换行折叠成一个空格（+ 量词与�
   await withFixedNowAsync(now, () => silentAlert(app, new Error('前段\n\n后段')))
   assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：前段 后段\n'])
 })
-
-// ===== 异步用例执行（同步用例已在上方跑完）=====
-;(async () => {
-  for (const [name, fn] of asyncChecks) {
-    try {
-      await fn()
-      passed++
-    } catch (e) {
-      failed++
-      failures.push(`${name} :: ${e.message}`)
-    }
-  }
-  console.log(`通过 ${passed} / 失败 ${failed}`)
-  if (failed > 0) {
-    for (const f of failures) console.log(`  ❌ ${f}`)
-    process.exit(1)
-  }
-  process.exit(0)
-})().catch(e => { console.error(e); process.exitCode = 1 })
 
 // ===== RE2 缺失警告簇（RE2 警告标记生命周期：pending→completed/回收/7天清理）=====
 // 全部经 makeApp 注入的内存 fs 桩运行，不触碰真实缓存目录。
@@ -2660,6 +2646,7 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     Config,
     MessageStore,
     FilterStore,
+    Pusher,
     sends,
     baseConfig,
     setItems (next) { items = next },
@@ -3216,3 +3203,82 @@ checkAsync('DAT-1 100% 脏数据必须可观测：run.log WARN + bad= 字段 + �
     assert.strictEqual(alertSends.length, 2, '全量去重不得告警')
   })
 })
+
+// ===== C5-016：「推送失败不写缓存」契约（变异集内唯一覆盖点）=====
+// run() 的失败路径此前在 test_app_unit.js 里零覆盖：三处 App.run 全用恒成功桩（Pusher.send
+// 永不抛）。该契约只有不进变异集的 test_app.js 守着，于是「推送失败仍写缓存」的变异体
+// （xbk_app.js 的 `ok: false` → `ok: true`、toCache 的 `|| pushedKeys.has(keyOf(m))` → `|| true`）
+// 在变异矩阵里可存活——后果是失败消息被写进缓存，下轮当「已推送」去重 ⇒ 永久漏推。
+// 断言必须落到**缓存文件内容**：只看 summary.failed 杀不掉 toCache 那个变异体。
+checkAsync('RUN-1 推送失败不写缓存：失败条目不得进缓存（含文件字节），下一轮必须重推', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const FAIL_TITLE = '通道失败乙'
+  const origSend = h.Pusher.send
+  let failTitle = FAIL_TITLE // null = 通道恢复
+  h.Pusher.send = async (text, desp) => {
+    if (failTitle && text.includes(failTitle)) throw new Error('push boom（模拟通道失败）')
+    return origSend(text, desp)
+  }
+  const cachePath = h.MessageStore.getFilePath(h.cacheName())
+  try {
+    h.setItems([makeRunItem('run1-a', '正常甲'), makeRunItem('run1-b', FAIL_TITLE)])
+    const round1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: round1.summary.pushed, failed: round1.summary.failed }, { pushed: 1, failed: 1 },
+      `第一轮应是「1 推成功 + 1 推失败」：${JSON.stringify(round1.summary)}`)
+    const idsAfterFail = h.cacheMessages().map(m => m && m.id)
+    assert.deepStrictEqual(idsAfterFail, ['run1-a'],
+      `推送失败的条目绝不能被写进缓存（写进去 ⇒ 下轮被当已推送去重 ⇒ 永久漏推）：实际 ${JSON.stringify(idsAfterFail)}`)
+    // 字节级复核：读取层可能因形状/键名差异掩盖问题，缓存文件里也不得出现失败条目。
+    assert.ok(!realFs.readFileSync(cachePath, 'utf8').includes('run1-b'),
+      '缓存文件字节里不得出现失败条目 id（推送失败不写缓存）')
+
+    // 第二轮：通道恢复。失败条目必须被重推（若上轮被误写进缓存，这里会因去重而 pushed=0）。
+    failTitle = null
+    const round2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: round2.summary.pushed, failed: round2.summary.failed }, { pushed: 1, failed: 0 },
+      `第二轮必须重推上轮失败的那条：${JSON.stringify(round2.summary)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m && m.id).sort(), ['run1-a', 'run1-b'],
+      '重推成功后两条都应进缓存')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+// ===== 异步用例执行（必须留在文件末尾）=====
+// C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
+// 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
+// 现在：① 移到文件末尾；② 先快照 asyncChecks 再跑；③ 对账「声明数 === 结算数」。
+;(async () => {
+  const pending = asyncChecks.slice()
+  for (const [name, fn] of pending) {
+    try {
+      await fn()
+      passed++
+    } catch (e) {
+      failed++
+      failures.push(`${name} :: ${e.message}`)
+    }
+  }
+  console.log(`通过 ${passed} / 失败 ${failed}（声明 ${declared} 例）`)
+  if (failed > 0) {
+    for (const f of failures) console.log(`  ❌ ${f}`)
+  }
+  if (passed + failed !== declared) {
+    console.log(`  ❌ 用例计数对账失败：声明 ${declared} 例，实际结算 ${passed + failed} 例（${declared - passed - failed} 例永远不会被执行）`)
+    process.exit(1)
+  }
+  process.exit(failed > 0 ? 1 : 0)
+})().catch(e => { console.error(e); process.exitCode = 1 })

@@ -61,13 +61,18 @@ const t0 = Date.now()
 const activeChildren = new Set()
 
 // 跑一个分片：返回退出码。quick=true 时用 QUICK 快测；重跑时用非 QUICK 完整验证
+// executedReports：worker 落盘的执行计数（idx → {executed, skipped, passed, failed}）。
+// 用文件而不是 stdout：stdio 是 inherit（进度照常打到终端），父进程读不到子进程输出。
+const executedReports = new Map()
 function runChunk (chunk, idx, quick) {
   return new Promise((resolve) => {
     const workerId = workerIds[idx]
     const listFile = path.join(__dirname, `.tmp_parallel_${workerId}.json`)
+    const reportFile = path.join(__dirname, `.tmp_parallel_report_${workerId}.json`)
     fs.writeFileSync(listFile, JSON.stringify(chunk))
+    try { fs.unlinkSync(reportFile) } catch (e) { /* 上一轮残留（重跑路径） */ }
     const child = fork(SRC, ['--list-file', listFile], {
-      env: { ...process.env, XBK_PARALLEL_ID: workerId, QUICK: quick ? '1' : '' },
+      env: { ...process.env, XBK_PARALLEL_ID: workerId, QUICK: quick ? '1' : '', XBK_TEST_APP_REPORT: reportFile },
       stdio: 'inherit'
     })
     activeChildren.add(child)
@@ -82,6 +87,14 @@ function runChunk (chunk, idx, quick) {
     child.on('exit', (code) => {
       activeChildren.delete(child)
       try { fs.unlinkSync(listFile) } catch (e) {}
+      // 报告缺失/损坏时不要抛：让对账段统一判定（缺报告本身就是「无法证明执行过」）。
+      try {
+        const rep = JSON.parse(fs.readFileSync(reportFile, 'utf8'))
+        if (rep && typeof rep.executed === 'number') executedReports.set(idx, rep)
+        else executedReports.delete(idx)
+      } catch (e) {
+        executedReports.delete(idx)
+      }
       resolve(code)
     })
   })
@@ -95,6 +108,7 @@ function runChunk (chunk, idx, quick) {
 function cleanupArtifacts () {
   for (const workerId of workerIds) {
     try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_${workerId}.json`)) } catch (e) {} // 已删 / 未建
+    try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_report_${workerId}.json`)) } catch (e) {} // 执行计数报告
     try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${workerId}`), { recursive: true, force: true }) } catch (e) {}
   }
 }
@@ -125,13 +139,31 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
   cleanupArtifacts()
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   const failedWorkers = codes.map((c, i) => ({ c, i })).filter(w => w.c !== 0)
+  // 计数对账（C5-004）：只看退出码挡不住「名单里的名字一个都没命中」——那时每个 worker
+  // 0 例执行也 exit 0，汇总照报「全部通过」。这里要求每片都回报执行数，且 Σexecuted === 名单总数。
+  let reconProblem = null
+  let sumExecuted = 0
+  for (let i = 0; i < chunks.length; i++) {
+    const rep = executedReports.get(i)
+    if (!rep) { reconProblem = `worker#${i} 未回报执行计数（报告缺失，无法证明该片跑过）`; break }
+    sumExecuted += rep.executed
+    if (rep.executed !== chunks[i].length) {
+      reconProblem = `worker#${i} 名单 ${chunks[i].length} 例但实际执行 ${rep.executed} 例（过滤跳过 ${rep.skipped} 例）` +
+        `${rep.skipped > 0 ? '——名单与 test_app.js 的用例名对不上' : ''}`
+      break
+    }
+  }
+  if (!reconProblem && sumExecuted !== names.length) reconProblem = `Σexecuted=${sumExecuted} ≠ 名单总数 ${names.length}`
   console.log('\n════════ 并行汇总 ════════')
-  console.log(`  测试: ${names.length} 个 | 并发: ${CONCURRENCY} | 耗时: ${secs}s`)
-  if (failedWorkers.length === 0) {
+  console.log(`  测试: ${names.length} 个 | 并发: ${CONCURRENCY} | 耗时: ${secs}s | 实际执行: ${sumExecuted} 例`)
+  if (failedWorkers.length === 0 && !reconProblem) {
     console.log('  结果: 全部通过 ✅')
     process.exit(0)
   } else {
     for (const w of failedWorkers) console.log(`  ✗ worker#${w.i} 重跑后仍失败（涉及 ${chunks[w.i].length} 个测试）`)
+    if (reconProblem) {
+      console.log(`  ✗ 执行计数对账失败（本次结果不可信）：${reconProblem}`)
+    }
     console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑（等号/空格两种写法均生效）')
     process.exit(1)
   }
