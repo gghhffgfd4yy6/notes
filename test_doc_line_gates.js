@@ -22,12 +22,44 @@ const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
 const lineThat = (text, re) => text.split('\n').map((l) => l.trim()).find((l) => re.test(l))
 const linesThat = (text, re) => text.split('\n').map((l) => l.trim()).filter((l) => re.test(l))
 
-let checks = 0
-function check (label, fn) {
-  fn()
-  checks++
-  console.log('✅ ' + label)
+// C5-022：harness 不能在一条检查抛错时就中断整个文件。旧实现 `fn()` 直接穿出顶层：不打印 label、
+// 不计数、无汇总，后面的检查一条都不跑（同批 test_audit_gate.js / test_check_version.js 早已是带
+// catch 的版本）。这里收成可实例化的工厂：每条检查独立捕获，passed/failed 双计数，末尾统一汇总并
+// 置非零退出码——工厂形态同时让 harness 自身可被断言（下面「harness 自身」那条用例），否则这段
+// 控制流改动同样零覆盖。
+function createChecker (out) {
+  const log = (out && out.log) || ((s) => console.log(s))
+  let passed = 0
+  const failures = []
+  function check (label, fn) {
+    try {
+      fn()
+      passed++
+      log('✅ ' + label)
+    } catch (e) {
+      const message = (e && e.message) || String(e)
+      failures.push({ label, message })
+      log('❌ ' + label + '：' + message)
+    }
+  }
+  return {
+    check,
+    get passed () { return passed },
+    get failures () { return failures.slice() },
+    summary () {
+      if (failures.length === 0) {
+        log(`✅ test_doc_line_gates 全部通过（${passed} 检查）`)
+        return 0
+      }
+      log(`❌ test_doc_line_gates：${passed} 通过 / ${failures.length} 失败（共 ${passed + failures.length} 检查）`)
+      for (const f of failures) log('   ❌ ' + f.label + '：' + f.message)
+      return 1
+    }
+  }
 }
+
+const harness = createChecker()
+const check = harness.check
 
 check('package.json：check 链含文档行长闸门，且排在 npm test 之前；两条 npm 脚本在册', () => {
   const pkg = JSON.parse(read('package.json'))
@@ -164,4 +196,22 @@ check('最长行不得用 spread 求（review #211：150k 行会让 Math.max(...
   }
 })
 
-console.log(`✅ test_doc_line_gates 全部通过（${checks} 检查）`)
+// C5-022 门禁：harness 自身的控制流必须有断言，否则「一条检查抛错就整份文件中断」这种改动零覆盖
+// （改动前实测：插入一条 throw，输出停在 ✅ 之后直接 Node 堆栈退出，后续检查与汇总一条都不出现）。
+check('harness 自身：一条检查抛错只记失败，后续检查照跑并汇总为红（C5-022）', () => {
+  const lines = []
+  const probe = createChecker({ log: (s) => lines.push(s) })
+  probe.check('通过的检查', () => {})
+  probe.check('抛错的检查', () => { throw new Error('boom') })
+  probe.check('抛错之后的检查', () => { lines.push('AFTER-RAN') })
+  assert.deepStrictEqual(probe.failures.map((f) => f.label), ['抛错的检查'],
+    '抛错的检查必须被记为失败（带 label），而不是把异常穿出 harness')
+  assert.strictEqual(probe.failures[0].message, 'boom', '失败明细必须带原始错误信息，否则定位不到根因')
+  assert.ok(lines.includes('AFTER-RAN'), '抛错之后的检查必须照跑——旧实现在这里整份文件中止')
+  assert.ok(lines.some((l) => l.startsWith('❌ 抛错的检查')), '失败检查必须打印 ❌ 与 label（旧实现连 label 都不打）')
+  assert.strictEqual(probe.passed, 2, 'passed 只算真正跑完的检查')
+  assert.strictEqual(probe.summary(), 1, '有失败时汇总必须返回 1，不得把「跑了一半」当全绿')
+  assert.ok(lines.some((l) => l.includes('2 通过 / 1 失败')), '汇总必须同时报通过与失败数：' + JSON.stringify(lines))
+})
+
+process.exitCode = harness.summary()
