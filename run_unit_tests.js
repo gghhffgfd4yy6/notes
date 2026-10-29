@@ -7,6 +7,18 @@
 const { spawn } = require('child_process')
 const path = require('path')
 const { SUITES } = require('./test_suites')
+const { stripCacheDirEnv } = require('./scripts/test-env-isolation')
+
+// C3-002（backlog）：套件子进程一律用**剥离了 XBK_CACHE_DIR 的 env**。
+// 为什么必须显式传 env：spawn 不传 env 时子进程继承 shell 环境，而生产 cacheDir getter 让
+// XBK_CACHE_DIR 无条件压过 Config.cache.dir（SYSTEM_CONTRACT 契约，语义正确），于是「在 export 过
+// 该变量的机器上跑测试」会把夹具写进**部署缓存目录**、覆盖真实 push.json 判重主存。
+// 只改测试侧：生产 getter 一字不动，环境变量在你自己的 shell 里照旧生效。
+const SUITE_ENV_INFO = stripCacheDirEnv(process.env)
+const SUITE_ENV = SUITE_ENV_INFO.env
+if (SUITE_ENV_INFO.cleared) {
+  console.warn(`⚠️ 已从本入口派生的测试子进程环境中清除 XBK_CACHE_DIR（${SUITE_ENV_INFO.cleared}）：测试只用 Config.cache.dir 的私有目录，避免写入部署缓存（backlog C3-002）`)
+}
 
 // 中文名按显示宽度对齐：String.prototype.padEnd 按 UTF-16 码元计数，中文每字占 2 列，
 // 直接 padEnd 会导致汇总行错位；此处按终端显示宽度补齐。
@@ -163,6 +175,9 @@ function runSuite (s) {
     try {
       child = spawn(process.execPath, [file], {
         cwd: __dirname,
+        // C3-002：显式传剥离了 XBK_CACHE_DIR 的 env（见文件顶部 SUITE_ENV 的说明）——
+        // 不传 env 会让子进程继承 shell 里的部署开关，把夹具写进真实缓存目录。
+        env: SUITE_ENV,
         // stderr 直通（inherit）：CI 下随组收集并在组内回放；本地保持 inherit（与旧 execFileSync 同口径）
         stdio: ['ignore', collect ? 'pipe' : 'inherit', collect ? 'pipe' : 'inherit']
       })

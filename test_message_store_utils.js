@@ -8,6 +8,13 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW } = require('./xbk_message_store')
 
+// C3-002（backlog）：夹具加载期先清掉外部部署开关 XBK_CACHE_DIR。
+// 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
+// 而本套件下方用 Config.cache.dir 把 F1 夹具隔离到私有目录——在 export 过该变量的 shell 里直跑
+// 本套件，隔离会被 env 顶掉、夹具写进部署缓存目录（实测：17 条用例假红 + 12 个夹具文件落进哨兵目录）。
+const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
+isolateProcessCacheDirEnv()
+
 const mockUtils = {
   anonKey: (s) => 'anon' + String(s).length,
   safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
@@ -2386,6 +2393,110 @@ check('C3-001: 短读（读到的字节少于 fstat 观测值）必须 fail-clos
   assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '短读后绝不得覆写磁盘')
   assert.strictEqual(h.store._memoryCache[h.filePath], undefined, '短读结果不得进内存快照（否则下一轮 save 用它覆写）')
   assert.deepStrictEqual(h.store._drainRecoveryEvents(), [], '短读是瞬时故障，绝不进入隔离开口（不得 rename）')
+})
+
+// ===== C3-002：测试入口/夹具必须隔离 XBK_CACHE_DIR =====
+// 缺陷：XBK_CACHE_DIR 无条件压过 Config.cache.dir 并跳过根内校验——这是 SYSTEM_CONTRACT:19 的
+// 三方同源契约（生产行为正确，**不得改动**）；真实缺陷在测试侧：两个测试入口 spawn/exec 子进程时
+// 不传 env（继承 shell），全仓也没有任何一处删除它 ⇒ 在 export 过该变量的 shell 里跑测试，夹具会
+// 写进部署缓存目录（实测：本套件带该变量启动时 17 条用例假红、12 个夹具文件落进哨兵目录）。
+// 修复口径：只改测试侧——入口把剥离后的 env 传给子进程，高风险夹具在加载期自清；生产 getter 的
+// 「env 压过配置」语义一字不改（下方 raw 对照分支就是在锁这条，防止有人「顺手」改生产语义）。
+const ENV_ISOLATION = './scripts/test-env-isolation'
+
+check('C3-002: stripCacheDirEnv 必须剥离 XBK_CACHE_DIR 且不改动入参（入口唯一实现）', () => {
+  const { stripCacheDirEnv } = require(ENV_ISOLATION)
+  const base = { XBK_CACHE_DIR: '/deploy/cache', KEEP: '1' }
+  const { env, cleared } = stripCacheDirEnv(base)
+  assert.strictEqual(env.XBK_CACHE_DIR, undefined, '剥离后不得残留 XBK_CACHE_DIR')
+  assert.strictEqual(env.KEEP, '1', '其它环境变量必须原样保留')
+  assert.strictEqual(cleared, '/deploy/cache', '必须回传被清除的原值（入口据此告警）')
+  assert.strictEqual(base.XBK_CACHE_DIR, '/deploy/cache', '不得原地修改入参（process.env 只由显式 API 改）')
+  assert.strictEqual(stripCacheDirEnv({ XBK_CACHE_DIR: '' }).cleared, '', '空值按「未设置」处理（不算泄漏）')
+  assert.strictEqual(stripCacheDirEnv({}).env.XBK_CACHE_DIR, undefined, '未设置时不得凭空造键')
+})
+
+check('C3-002: 两个测试入口都必须把剥离后的 env 传给子进程（接线内容断言）', () => {
+  for (const entry of ['run_tests.js', 'run_unit_tests.js']) {
+    const src = REAL_FS.readFileSync(path.join(__dirname, entry), 'utf8')
+    assert.ok(src.includes(`require('${ENV_ISOLATION}')`), `${entry} 必须 require ${ENV_ISOLATION}`)
+    assert.ok(/env:\s*SUITE_ENV/.test(src),
+      `${entry} 必须把 SUITE_ENV 传给子进程（否则 shell 里的 XBK_CACHE_DIR 照旧泄漏进每个套件）`)
+  }
+})
+
+check('C3-002: 高风险夹具（test_filter / 本套件）加载期必须自清 XBK_CACHE_DIR', () => {
+  for (const file of ['test_filter.js', 'test_message_store_utils.js']) {
+    const src = REAL_FS.readFileSync(path.join(__dirname, file), 'utf8')
+    assert.ok(/isolateProcessCacheDirEnv\(\)/.test(src), `${file} 必须在加载期调用 isolateProcessCacheDirEnv()`)
+  }
+  assert.strictEqual(process.env.XBK_CACHE_DIR, undefined, '本套件加载后进程内不得残留 XBK_CACHE_DIR')
+})
+
+// 行为验证：子进程以 XBK_CACHE_DIR=<哨兵目录> 启动，raw = 不隔离（生产契约：env 压过配置，必须
+// 照旧成立），isolate = 走测试侧的显式清除。两条分支合起来同时锁住「缺陷机制真实存在」与
+// 「隔离后不再写进部署目录」。
+const C3002_OWN = `xianbaoku_cache_c3002_own_${process.pid}`
+const C3002_SENTINEL = `xianbaoku_cache_c3002_sentinel_${process.pid}`
+const C3002_PREAMBLE = `
+const path = require('node:path')
+const fs = require('node:fs')
+const { createMessageStore } = require('./xbk_message_store')
+`
+function c3002Body (mode) {
+  return C3002_PREAMBLE + `
+if (${JSON.stringify(mode)} === 'isolate') require('${ENV_ISOLATION}').isolateProcessCacheDirEnv({ log: () => {} })
+const store = createMessageStore({
+  Config: { cache: { dir: ${JSON.stringify(C3002_OWN)}, maxSize: 10000 } },
+  Utils: { anonKey: (s) => 'anon' + String(s).length, safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)), getMessageIdentity: () => ({ valid: false }), isValidItem: () => true, num: () => 10000, addIndex: () => {} },
+  fs,
+  path,
+  crypto: require('node:crypto'),
+  normalize: (o) => o,
+  storage: require('./xbk_storage'),
+  constants: { DEFAULT_MAX_SIZE: 10000, MESSAGE_CACHE_MAX_BYTES: 8388608, TOMBSTONE_MAX_KEYS: 5000, TOMBSTONE_MAX_BYTES: 262144, TOMBSTONE_LOCK_STALE_MS: 10000 }
+})
+const fp = store.getFilePath('c3002_probe.json')
+const ok = store.saveMessages(fp, [{ id: 'x' }])
+process.stdout.write(JSON.stringify({ cacheDir: store.cacheDir, filePath: fp, ok }))
+`
+}
+
+check('C3-002: 带 XBK_CACHE_DIR 启动子进程——raw 仍写 env 目录（生产契约），isolate 后只写私有目录', () => {
+  const ownDir = path.join(__dirname, C3002_OWN)
+  const sentinelDir = path.join(__dirname, C3002_SENTINEL)
+  const cleanup = () => {
+    for (const d of [ownDir, sentinelDir]) {
+      try { REAL_FS.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  }
+  const run = (mode) => {
+    let out
+    try {
+      out = execFileSync(process.execPath, ['-e', c3002Body(mode)], {
+        encoding: 'utf8', timeout: 8000, cwd: __dirname, env: { ...process.env, XBK_CACHE_DIR: sentinelDir }
+      })
+    } catch (e) {
+      assert.fail(`C3-002 子进程（${mode}）未能正常返回（code=${e.code}）：${e.message}`)
+    }
+    return JSON.parse(out)
+  }
+  cleanup()
+  try {
+    const raw = run('raw')
+    assert.strictEqual(raw.ok, true, 'raw 分支写入必须成功（缺陷复现的前置）')
+    assert.strictEqual(raw.cacheDir, sentinelDir, '生产契约：XBK_CACHE_DIR 必须压过 Config.cache.dir（本修复不得改动）')
+    assert.ok(raw.filePath.startsWith(sentinelDir + path.sep),
+      `raw 分支必须写进 env 指向的目录（这就是「测试写进部署缓存」的机制）：${raw.filePath}`)
+    cleanup()
+    const isolated = run('isolate')
+    assert.strictEqual(isolated.ok, true, 'isolate 分支写入必须成功')
+    assert.strictEqual(isolated.cacheDir, ownDir, '隔离后必须回到 Config.cache.dir 解析出的私有目录')
+    assert.ok(isolated.filePath.startsWith(ownDir + path.sep), `隔离后必须写私有目录：${isolated.filePath}`)
+    assert.strictEqual(REAL_FS.existsSync(sentinelDir), false, '隔离后绝不得再创建/写入部署目录（哨兵必须不存在）')
+  } finally {
+    cleanup()
+  }
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

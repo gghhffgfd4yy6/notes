@@ -23,6 +23,18 @@ const path = require('path')
 const { checkDependencies } = require('./scripts/check-deps')
 
 const { SUITES } = require('./test_suites')
+const { stripCacheDirEnv } = require('./scripts/test-env-isolation')
+
+// C3-002（backlog）：套件子进程一律用**剥离了 XBK_CACHE_DIR 的 env**。
+// 为什么必须显式传 env：execFileSync 不传 env 时子进程继承 shell 环境，而生产 cacheDir getter 让
+// XBK_CACHE_DIR 无条件压过 Config.cache.dir（SYSTEM_CONTRACT 契约，语义正确），于是「在 export 过
+// 该变量的机器上跑测试」会把夹具写进**部署缓存目录**、覆盖真实 push.json 判重主存。
+// 只改测试侧：生产 getter 一字不动，环境变量在你自己的 shell 里照旧生效。
+const SUITE_ENV_INFO = stripCacheDirEnv(process.env)
+const SUITE_ENV = SUITE_ENV_INFO.env
+if (SUITE_ENV_INFO.cleared) {
+  console.warn(`⚠️ 已从本入口派生的测试子进程环境中清除 XBK_CACHE_DIR（${SUITE_ENV_INFO.cleared}）：测试只用 Config.cache.dir 的私有目录，避免写入部署缓存（backlog C3-002）`)
+}
 
 // 汇总表按终端显示宽度对齐（与 run_unit_tests.js 同口径）：String.prototype.padEnd 按 UTF-16 码元计数，
 // 中文每字占 2 列、文件名长度不一，直接 padEnd 会让列错位；此处按实测最大显示宽度补齐。
@@ -108,7 +120,7 @@ for (const s of SUITES) {
     // package.json / CHANGELOG.md，前者更是直接断言「请在仓库根目录运行本套件」——不固定 cwd 时
     // 从子目录调用本入口会假红；cwd 落在同构副本目录时则会「对账到别的仓库」而假绿。
     // 以仓库根为 cwd 的调用（npm test / CI）行为不变。
-    execFileSync(process.execPath, [file], { cwd: __dirname, stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL', detached: true })
+    execFileSync(process.execPath, [file], { cwd: __dirname, env: SUITE_ENV, stdio: 'inherit', timeout: TEST_TIMEOUT, killSignal: 'SIGKILL', detached: true })
     const ms = Date.now() - t0
     results.push({ ...s, ok: true, ms })
     console.log(`\n  ✅ ${s.name} 通过（${(ms / 1000).toFixed(1)}s）\n`)

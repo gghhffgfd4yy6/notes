@@ -113,6 +113,12 @@ const OWNS_CACHE_DIR = !process.env.XBK_PARALLEL_ID
 // 注意这里写回的是**归一后**的 ID（可能与环境变量原值不同）：生产 fallback 分支出的是
 // xianbaoku_cache_p<该值>，必须与本文件用的 CACHE_DIR_NAME 完全同源，断言才指向同一目录。
 process.env.XBK_PARALLEL_ID = TEST_ISOLATION_ID
+// C3-002（backlog）：先清掉外部部署开关 XBK_CACHE_DIR 再设 Config.cache.dir。
+// 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
+// 本套件的隔离全靠 Config.cache.dir ⇒ 在 export 过该变量的 shell 里直跑本套件，夹具会写进部署缓存
+// 目录（真实 push.json 判重主存被覆盖），下方「cacheDir 必须落在私有分片目录」的断言也会当场假红。
+const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
+isolateProcessCacheDirEnv()
 Config.cache.dir = CACHE_DIR_NAME
 
 // ============================================================
