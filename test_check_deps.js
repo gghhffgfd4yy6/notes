@@ -14,7 +14,7 @@ const { checkDependencies, satisfiesNodeRange } = require('./scripts/check-deps'
 // marker（F5 返工）：给每个依赖的 index.js 注入「被加载即记账」——在隔离树上取证「检查真的跑了、
 // 且经 ROOT 基准解析并加载了声明清单里的包」。只断言「status 0 且零输出」时，基线源码（无
 // require.main 守卫、直接执行只加载模块）的空跑也恰好满足该条件（不可证伪）。
-function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [], marker = null }) {
+function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [], marker = null, sources = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-deps-sandbox-'))
   fs.mkdirSync(path.join(dir, 'scripts'))
   fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
@@ -34,6 +34,12 @@ function makeCheckDepsSandbox ({ manifest, deps = [], brokenDeps = [], marker = 
     fs.mkdirSync(pkgDir, { recursive: true })
     fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.js' }))
     fs.writeFileSync(path.join(pkgDir, 'index.js'), 'throw new Error("BROKEN_IN_SCRIPTS_TREE")\n')
+  }
+  // C10-018：反向扫描的目标文件（相对沙箱根）。null 表示这个沙箱没有待扫源码。
+  for (const [rel, content] of Object.entries(sources || {})) {
+    const target = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, content)
   }
   return dir
 }
@@ -1099,6 +1105,53 @@ test('F3 checkDependencies：missing 与 broken 同时存在 → 两段文案都
   if (!out.split('\n').includes('❌ 缺少依赖：got')) throw new Error(`missing 与 broken 同时存在：必须报「❌ 缺少依赖：got」\n--- 实际输出 ---\n${out}`)
   if (!out.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(`missing 与 broken 同时存在：必须报「❌ 依赖已安装但不可用：re2」\n--- 实际输出 ---\n${out}`)
   if (!out.split('\n').includes('  - re2: binding gone')) throw new Error(`missing 与 broken 同时存在：必须列出 re2 的根因行\n--- 实际输出 ---\n${out}`)
+})
+
+// C10-018：反向扫描（代码 require → 声明）。此前只做正方向（声明 → 实例）：下面这个沙箱
+// 里 `require('ghost-pkg')` 从未被声明，旧实现照旧 exit 0（本机碰巧有传递依赖时装得上），
+// 换一台精简安装的机器才炸，且报错点离改动很远。
+test('C10-018 反向扫描：代码 require 未声明的包 → exit 1 并点名包与文件', () => {
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { got: '1.0.0' } },
+    deps: ['got'],
+    sources: { 'xbk_ghost.js': "require('got')\nrequire('ghost-pkg')\nmodule.exports = {}\n" }
+  })
+  try {
+    const r = runCheckDepsSandbox(dir)
+    const out = `${r.stdout}\n${r.stderr}`
+    if (r.status === 0) throw new Error('未声明包必须非 0 退出（旧实现只查声明→实例，这里恒 0），实际 status=0')
+    if (!out.includes('❌ 代码 require 了未声明的包：ghost-pkg')) throw new Error(`必须点名未声明的包\n--- 实际输出 ---\n${out}`)
+    if (!out.includes('ghost-pkg（xbk_ghost.js）')) throw new Error(`必须点名出问题的文件\n--- 实际输出 ---\n${out}`)
+    if (/^\s+- got（/m.test(out)) throw new Error(`已声明的包不得被误报\n--- 实际输出 ---\n${out}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('C10-018 反向扫描：注释里的 require 不算，相对/内置/子路径也不算（不得假红）', () => {
+  const dir = makeCheckDepsSandbox({
+    manifest: { name: 'sandbox', version: '1.0.0', dependencies: { got: '1.0.0' } },
+    deps: ['got'],
+    sources: {
+      // 注释里的 require 字样不是判据（否则删掉真 require 也能绿）；行内注释同样不算。
+      'xbk_clean.js': [
+        '// require(\'comment-only-pkg\') 只是注释，不是真的依赖',
+        '/* require(\'block-comment-pkg\') */',
+        'require(\'node:fs\'); require(\'./local\'); require(\'got/dist/util\')',
+        'module.exports = {}',
+        ''
+      ].join('\n'),
+      'scripts/tool.js': 'const fs = require(\'fs\')\nmodule.exports = { fs }\n'
+    }
+  })
+  try {
+    const r = runCheckDepsSandbox(dir)
+    const out = `${r.stdout}\n${r.stderr}`
+    if (r.status !== 0) throw new Error(`注释/内置/相对/子路径都不得触发反向扫描\n--- 实际输出 ---\n${out}`)
+    if (out.includes('未声明')) throw new Error(`不得出现未声明告警\n--- 实际输出 ---\n${out}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 console.log('  🧪 依赖预检测试（checkDependencies）')
