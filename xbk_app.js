@@ -70,7 +70,11 @@ function createApp ({
     // A 的整文件覆盖冲掉（丢日志）。修复：用 run.log.lock（O_EXCL）把「追加 + 超限截尾」包成互斥
     // 临界区；拿不到锁（竞争/陈旧锁/异常）时 fail-open 只追加不截尾，日志绝不因锁而丢。
     // 日志记录名仅接受文件基名，防未来调用传入 ../ 或绝对路径写出缓存目录。
-    _writeRunLog (line, filename = 'run.log') {
+    // C1-006：opts.truncateError=false 关闭「单行 ERROR 截断」启发式——_writeFilterDiagnostics 传的是
+    // 整批 NDJSON（lines.join('\n')），按整串首个 " ERROR " 截到 512 字符会把后面的记录连同其 JSON
+    // 结构一起切掉，末行留下半条非法 JSON（13 条只落 4~7 行）。批量写入必须逐条整行落盘，截断只在
+    // 单条日志自己身上发生。
+    _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
         const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
         const logPath = path.join(MessageStore.cacheDir, safeFilename)
@@ -111,8 +115,9 @@ function createApp ({
             }
           }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
+          // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
-          const errSep = line.indexOf(' ERROR ')
+          const errSep = opts.truncateError === false ? -1 : line.indexOf(' ERROR ')
           if (errSep >= 0 && line.length > 512) {
             const prefix = line.slice(0, errSep + 7)
             let rest = line.slice(errSep + 7)
@@ -165,7 +170,7 @@ function createApp ({
       for (const record of records) {
         try { lines.push(JSON.stringify(record)) } catch (e) { /* 单条异常不阻断整轮 */ }
       }
-      if (lines.length > 0) this._writeRunLog(lines.join('\n') + '\n', 'filter-diagnostics.ndjson')
+      if (lines.length > 0) this._writeRunLog(lines.join('\n') + '\n', 'filter-diagnostics.ndjson', { truncateError: false })
     },
 
     _diskWarningAt: 0,
@@ -460,8 +465,27 @@ function createApp ({
 
     // 清理超过保留期的 re2 标记文件（best-effort；仅删除严格早于 cutoff 的日期）：
     // - re2warn.state.YYYY-MM-DD（正常按天标记）
+    // - re2warn.state.YYYY-MM-DD.lock（_acquireRe2WarnLock 的 per-date 锁）
     // - re2warn.state.YYYY-MM-DD.<pid>.<time>.reclaim（F3：崩溃残留的认领临时文件，
     //   进程在 rename 后、删除前退出会遗留；同样按日期兜底清理，避免永久累积）
+    // - re2warn.state.YYYY-MM-DD.<pid>.<time>.tmp（_writeRe2WarnMarkerAtomic 崩溃残留：临时文件
+    //   已写、rename 前进程退出。命名是 `<statePath>.<pid>.<ts>.tmp`——纯数字段，**没有 hex 段**；
+    //   xbk_storage.writeAtomic 的 `<path>.<pid>.<ts>.<hex12>.tmp` 形态在本前缀下只可能属于判重缓存
+    //   （`<名字>.json.<pid>.<ts>.<hex12>.tmp`），多出 `.json` 段，不得当作标记残留删除）
+    // C1-002：旧判据是「前缀 + 首段是日期」，凡同形名字一律 unlink——自定义 pushUrl 末段恰为
+    // re2warn.state.<date> 时，getFileName 得到的合法判重缓存 re2warn.state.<date>.json 与其
+    // .json.seen.json 墓碑都落在这个前缀下，会被启动清理静默删除（下轮全量重推、裁剪墓碑失效）。
+    // 改为**精确形状白名单**（与 xbk_message_store._isResidualTombstoneLockName 同口径）：只删
+    // 本模块自己写出的四种名字，任何含额外点段（`.json`/`.json.seen.json` 等）的名字一律跳过。
+    _isRe2WarnCleanupCandidateName (name) {
+      if (typeof name !== 'string' || !name.startsWith(RE2_WARN_STATE_FILE + '.')) return false
+      const rest = name.slice(RE2_WARN_STATE_FILE.length + 1)
+      if (/^\d{4}-\d{2}-\d{2}$/.test(rest)) return true
+      if (/^\d{4}-\d{2}-\d{2}\.lock$/.test(rest)) return true
+      if (/^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.reclaim$/.test(rest)) return true
+      return /^\d{4}-\d{2}-\d{2}\.\d+\.\d+\.tmp$/.test(rest)
+    },
+
     _cleanupStaleRe2WarnMarkers () {
       try {
         const cacheDir = MessageStore.cacheDir
@@ -474,10 +498,10 @@ function createApp ({
         // 故直接复用 shanghaiStamp，字符串比较口径不变。
         const cutoffStamp = shanghaiStamp(cutoff).slice(0, 10)
         for (const name of fs.readdirSync(cacheDir)) {
-          if (!name.startsWith(prefix)) continue
-          const markerStamp = name.slice(prefix.length).split('.')[0] // 取日期段，忽略 .pid.time.reclaim 后缀
+          if (!this._isRe2WarnCleanupCandidateName(name)) continue
+          const markerStamp = name.slice(prefix.length, prefix.length + 10) // 白名单已保证这 10 字符是日期段
           try {
-            if (/^\d{4}-\d{2}-\d{2}$/.test(markerStamp) && markerStamp < cutoffStamp) {
+            if (markerStamp < cutoffStamp) {
               fs.unlinkSync(path.join(cacheDir, name))
             }
           } catch (ignore) { /* best effort */ }
@@ -700,9 +724,21 @@ function createApp ({
     },
 
     /** 通道健康状态锁：O_EXCL 独占创建，陈旧判定与 run.log / RE2 锁同口径——mtime 超龄且持有
-     *  进程已确认退出（含损坏/无主锁）才回收，进程仍存活（如被暂停 >10s）绝不抢占（APP-02；
-     *  锁内写入 pid:starttime 令牌供存活复核与 PID 复用判别）。返回 lockFd，-1 表示本轮未取得。 */
+     *  进程已确认退出（含损坏/无主锁）才回收，进程仍存活（如被暂停 >10s）绝不抢占（APP-02；锁内
+     *  写入 pid:starttime 令牌供存活复核与 PID 复用判别）。返回 lockFd，-1 表示本轮未取得；失败原因
+     *  写进 this._lastChannelHealthLockFailure = { reason, code, message }，供调用点按 errno 分流日志
+     *  （C1-008：只有 EEXIST 且持有进程存活才是「另一轮在更新」；EACCES/ENOSPC/EROFS/EMFILE 等
+     *  open 失败、unlink 失败、二次 open 失败都是真实故障，此前全折叠成 -1 被谎报成并发）。 */
     _tryAcquireChannelHealthLock (lockPath) {
+      const fail = (reason, err) => {
+        this._lastChannelHealthLockFailure = {
+          reason,
+          code: (err && err.code) || '',
+          message: (err && err.message) || ''
+        }
+        return -1
+      }
+      this._lastChannelHealthLockFailure = null
       const writeToken = (fd) => {
         try {
           fs.writeSync(fd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
@@ -713,16 +749,16 @@ function createApp ({
         writeToken(fd)
         return fd
       } catch (e) {
-        if (!e || e.code !== 'EEXIST') return -1
+        if (!e || e.code !== 'EEXIST') return fail('open', e)
         let stale = false
         try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
-        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return -1
-        try { fs.unlinkSync(lockPath) } catch (e2) { return -1 } // 竞争者已接管/无权限，按跳过处理
+        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return fail('busy', e)
+        try { fs.unlinkSync(lockPath) } catch (e2) { return fail('unlink', e2) } // 竞争者已接管/无权限，按跳过处理
         try {
           const fd = fs.openSync(lockPath, 'wx')
           writeToken(fd)
           return fd
-        } catch (e2) { return -1 }
+        } catch (e2) { return fail('reopen', e2) }
       }
     },
 
@@ -819,8 +855,16 @@ function createApp ({
         lockPath = statePath + '.lock'
         lockFd = this._tryAcquireChannelHealthLock(lockPath)
         if (lockFd < 0) {
-        // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
-          console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          const lockFailure = this._lastChannelHealthLockFailure || { reason: 'open', code: '', message: '' }
+          if (lockFailure.reason === 'busy') {
+          // 单实例仍可能因手工重复启动/重叠 cron 短暂重入；宁可本轮跳过健康观测，也不能覆盖另一轮状态。
+            console.warn(`通道健康状态正由另一轮更新，跳过本轮健康更新 ${statePath}`)
+          } else {
+          // C1-008：非 EEXIST、unlink 失败、二次 open 失败此前全折叠成 -1 并被一律说成「另一轮更新」，
+          // 排障会被引向完全错误的方向（0555 目录下 open 直接 EACCES，根本没有锁文件）。按 errno 透出。
+            const code = lockFailure.code || '未知错误'
+            console.error(`通道健康状态锁获取失败（${lockFailure.reason}/${code}${lockFailure.message ? ': ' + lockFailure.message : ''}），跳过本轮健康更新 ${statePath}`)
+          }
           return
         }
         const stateResult = this._readSafeState(statePath)
@@ -1704,9 +1748,21 @@ function createApp ({
         // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
         // v3.170：await 告警完成（与 catch 路径 v3.164 同口径）——曾 fire-and-forget，
         // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
-        if (!dryRun && items.length > 0 && successCount === 0) {
-          try { await this._sendAlert(`推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
-          this._writeRunLog(`${this._localStamp()} ERROR 推送全部失败 ${items.length} 条（通道可能失效）\n`)
+        // C9-002：失败计数是**消息**级（successCount 来自 pushOne 结果）。旧判据 `successCount === 0`
+        // 只覆盖全灭：1 条成功 + 99 条失败时既不告警也不写 ERROR 行，配上分类器「pushed>0 即成功」
+        // 就是「99 条被静默吞掉」。现在只要还有消息没送达就告警；全失败的文案保持不变
+        // （console/status 的 run.log 解析以「推送全部失败」为锚点），部分失败另写带条数的行。
+        const failedMessages = items.length - successCount
+        if (!dryRun && items.length > 0 && failedMessages > 0) {
+          const allFailed = successCount === 0
+          try {
+            await this._sendAlert(allFailed
+              ? `推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`
+              : `推送部分失败（成功 ${successCount} 条 / 失败 ${failedMessages} 条）：未送达的消息下轮重试，通道可能部分失效`)
+          } catch (e) { /* 告警失败不阻塞主流程 */ }
+          this._writeRunLog(`${this._localStamp()} ERROR ${allFailed
+            ? `推送全部失败 ${items.length} 条（通道可能失效）`
+            : `推送部分失败 ${failedMessages}/${items.length} 条（未送达消息下轮重试）`}\n`)
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。

@@ -287,7 +287,11 @@ function createMessageStore ({
       // 避免目录已存在时调用 mkdirSync（故障注入测试依赖该守卫）。
         const dir = this.cacheDir
         if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true })
+          // mode: 0o700（C3-004）：不传 mode 时目录权限全由 umask 决定（本机 0002 ⇒ 0775），
+          // 同组账号即可在该目录里 unlink/替换判重缓存；ensureParent 的 0o700 只在「首次写盘
+          // 由 xbk_storage 建父目录」时生效，而主启动路径（xbk_app.js 的 MessageStore.init()）
+          // 总是先跑到这里 ⇒ 加固必须写在这一处。已存在的目录不 chmod（只在全新部署生效）。
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
         }
         this._cleanupResidualTombstoneLocks(dir)
       } catch (e) {
@@ -383,7 +387,19 @@ function createMessageStore ({
         const reclaimPath = `${guardPath}.${process.pid}.${Date.now()}.reclaim`
         try { fs.renameSync(guardPath, reclaimPath) } catch (renameError) { return null }
         try {
-          if (this._isTombstoneLockProcessAlive(reclaimPath)) return null
+          if (this._isTombstoneLockProcessAlive(reclaimPath)) {
+            // C3-012：复核判定持有者仍存活 ⇒ 刚才 rename 抢到的是**别人新建的活哨兵**，必须原样搬回。
+            // 旧实现只 return null：哨兵被永久搬到 .reclaim，原持有者释放时读不到自己的 token（按 ENOENT
+            // 静默），另一个清理者立刻能在 guardPath 建出新哨兵 ⇒ 目录级互斥当场失效，两个清理者可同时
+            // 清理 .seen.lock 并互删对方刚建的锁（整份判重记录可丢）。
+            // 还原失败时保留 reclaim 文件（里面是别人的活 token，删掉即永久丢失）并显式 WARN。
+            try {
+              fs.renameSync(reclaimPath, guardPath)
+            } catch (restoreError) {
+              console.warn(`墓碑清理哨兵还原失败（活哨兵已丢失，目录级互斥失效，本轮放弃清理/墓碑写入）${guardPath}:`, restoreError?.message || restoreError)
+            }
+            return null
+          }
           fs.unlinkSync(reclaimPath)
         } catch (reclaimError) {
           try { fs.unlinkSync(reclaimPath) } catch (ignored) {}
@@ -559,7 +575,11 @@ function createMessageStore ({
         return this._memoryCache[filePath]
       }
       const initialized = this._ensureFileExists(filePath)
-      const result = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES)
+      // openNonBlocking（C3-003）：裸 O_RDONLY 打开 FIFO 会永久阻塞等写者——同步 open 挂死的是
+      // 整个事件循环，进程内没有任何超时能打断，表现为整轮同步流程无声停住（无日志、无退出码）。
+      // 上游 _ensureFileExists 挡不住：它对已存在路径直接 return true（FIFO 的 existsSync 就是 true）。
+      // 加 O_NONBLOCK 后普通文件语义不变，FIFO 的 open 立即 ENXIO ⇒ readSafeTextResult 归 unsafe。
+      const result = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { openNonBlocking: true })
       if (result.status !== 'ok') {
         const detail = result.error && result.error.message ? result.error.message : result.status
         if (result.status === 'unsafe') console.error(`拒绝读取非普通缓存文件 ${filePath}`)
@@ -746,7 +766,7 @@ function createMessageStore ({
      *  说明：这是缩小竞态窗口的纵深防御，不构成对 TOCTOU 的证明（隔离本身仍可能被更晚的替换抢先）。 */
     _stillUnparseable (filePath) {
       let again
-      try { again = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES) } catch (e) { return false }
+      try { again = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { openNonBlocking: true }) } catch (e) { return false }
       if (!again || again.status !== 'ok') return false
       try { return !Array.isArray(JSON.parse(again.text || '[]')) } catch (e) { return true }
     },
@@ -773,7 +793,7 @@ function createMessageStore ({
         console.error(`缓存超限恢复：文件在读取期间已被替换/截断，按瞬时读失败处理（不隔离、保持写闸门）${filePath}`)
         return null
       }
-      const tail = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { tail: true })
+      const tail = readSafeTextResult(filePath, MESSAGE_CACHE_MAX_BYTES, { tail: true, openNonBlocking: true })
       if (!tail || tail.status !== 'ok' || typeof tail.text !== 'string') {
         console.error(`缓存超限尾部读取失败，无法自动恢复（保持写闸门）${filePath}: ${tail && tail.status}`)
         return null
@@ -1026,7 +1046,7 @@ function createMessageStore ({
    *  ioError/unsafe/tooLarge 保留下次重试窗口）。 */
     _readTombstoneData (filePath) {
       try {
-        const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES)
+        const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
         this._tombstoneLoadStatus[filePath] = result.status
         if (result.status !== 'ok') {
           if (result.status !== 'missing') {

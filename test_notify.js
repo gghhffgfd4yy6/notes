@@ -139,6 +139,24 @@ async function test (name, fn) {
 function assert (c, msg) { if (!c) throw new Error(msg || '断言失败') }
 function reset () { gotCalls = [] }
 
+// C5-007（audit38）：负向断言 helper 提到模块级，便于用一条自测锁住「promise 正常 resolve 时
+// 必须判失败」这半边（原先是写在用例体内的局部函数，无法自测，且判定被自己的 catch 吞掉）。
+async function expectRejected (promise, label) {
+  let timer
+  try {
+    await Promise.race([promise, new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} pending`)), 200)
+    })])
+  } catch (e) {
+    // 真 reject 走这里并静默通过；唯一不合法的失败形态是「超时仍 pending」。
+    assert(!String(e.message).includes('pending'), `${label} 不应永久 pending`)
+    return
+  } finally { clearTimeout(timer) }
+  // C5-007：「未 reject」的判定必须写在 try 之外——写在 try 内会被上面的 catch 接住，而那个
+  // catch 只断言「不含 pending」⇒ promise 正常 resolve 时用例照样 PASS（判据恒真）。
+  assert(false, `${label} 未 reject`)
+}
+
 // 所有通道相关配置 key：每个测试前清空 → 只配被测通道（防本地密钥/跨测试污染）
 const CHANNEL_KEYS = ['PUSH_PLUS_TOKEN', 'PUSH_PLUS_USER', 'PUSH_KEY',
   'BARK_PUSH', 'BARK_ARCHIVE', 'BARK_GROUP', 'BARK_SOUND', 'BARK_ICON', 'BARK_LEVEL', 'BARK_URL',
@@ -267,24 +285,28 @@ console.log('========================================\n');
     syncPostThrow = true
     try {
       cfg.BARK_PUSH = 'sync-bark'
-      const expectRejected = async (promise, label) => {
-        let timer
-        try {
-          await Promise.race([promise, new Promise((_resolve, reject) => {
-            timer = setTimeout(() => reject(new Error(`${label} pending`)), 200)
-          })])
-          throw new Error(`${label} 未 reject`)
-        } catch (e) {
-          assert(!String(e.message).includes('pending'), `${label} 不应永久 pending`)
-        } finally { clearTimeout(timer) }
-      }
-      cfg.BARK_PUSH = 'sync-bark'
       await expectRejected(notify.sendNotify('标题', '内容'), 'Bark')
       cfg.BARK_PUSH = ''
       cfg.PUSHME_KEY = 'sync-pushme'
       await expectRejected(notify.sendNotify('标题', '内容'), 'PushMe')
     } finally { syncPostThrow = false }
   }))
+
+  // C5-007（audit38）防退化自测：promise 正常 resolve 时 expectRejected 必须失败。
+  // 旧实现把「未 reject」的 throw 写在 try 内、被自己的 catch 接住，而 catch 只断言「不含 pending」
+  // ⇒ resolve 的 promise 照样 PASS，用例名承诺的「必须 reject」这半边永远不可能失败。
+  await test('expectRejected 自测：promise resolve 必须判失败、reject 通过、pending 判红（C5-007）', async () => {
+    const run = async (p) => {
+      try { await expectRejected(p, '自测'); return null } catch (e) { return e }
+    }
+    const e1 = await run(Promise.resolve('ok'))
+    assert(e1 !== null, 'promise 正常 resolve 时 helper 必须抛错（旧实现被自己的 catch 吞掉 ⇒ 恒绿）')
+    assert(/未 reject/.test(e1.message), `失败原因应为「未 reject」，实际: ${e1.message}`)
+    const e2 = await run(Promise.reject(new Error('boom')))
+    assert(e2 === null, `真 reject 的 promise 不应判失败，实际: ${e2 && e2.message}`)
+    const e3 = await run(new Promise(() => {}))
+    assert(e3 !== null && /pending/.test(e3.message), `永不 settle 必须报 pending，实际: ${e3 && e3.message}`)
+  })
 
   // 4. PushDeer: URL 编码
   await test('PushDeer: body 全字段 URL 编码(& # 转义)', () => withChannels(async () => {

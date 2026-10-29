@@ -332,7 +332,10 @@ testCase('classifySummary 熔断口径', async () => {
     failures: [{ code: 'HTTP_401', message: 'invalid token' }, { code: 'ETIMEDOUT', message: 'timeout' }]
   }).kind, 'retryable', '顶层 permanent 标签不能覆盖嵌套 retryable 失败')
 
-  assert.strictEqual(classifySummary({
+  // C9-002：pushed/failed 都是**消息**级计数——pushed>0 只说明「不是全灭」，不说明「没有失败」。
+  // 旧实现只要 pushed>0 就返回 null：1 条成功 + 99 条失败也判成功（退出码 0、告警不触发）。
+  // 现在部分失败一律给出 degraded 判定（kind 保持 retryable：未送达的消息下轮必须重试）。
+  const partialMixed = classifySummary({
     total: 2,
     pushed: 1,
     failed: 1,
@@ -340,19 +343,29 @@ testCase('classifySummary 熔断口径', async () => {
       { code: 'HTTP_401', message: 'permanent failure' },
       { code: 'ETIMEDOUT', message: 'transient failure' }
     ]
-  }), null, '部分成功且剩余失败含临时因素时不应熔断')
-  assert.strictEqual(classifySummary({
+  })
+  assert.ok(partialMixed, '部分消息失败不得返回 null（旧实现 pushed>0 无条件判成功）')
+  assert.strictEqual(partialMixed.kind, 'retryable', '部分消息失败必须进入分类（含临时因素时仍可重试）')
+  assert.strictEqual(partialMixed.reason, 'PARTIAL_MESSAGE_FAILURE')
+  assert.ok(String(partialMixed.info.message).includes('成功 1 条') &&
+    String(partialMixed.info.message).includes('失败 1 条'),
+  `部分失败的摘要必须点明成功/失败条数（消息级），实际 ${JSON.stringify(partialMixed.info)}`)
+  const partialPermanent = classifySummary({
     total: 2,
     pushed: 1,
     failed: 1,
-    failures: [{ code: 'HTTP_401', message: 'one channel permanent failure' }]
-  }), null, '部分成功即保持成功，不应因失败通道的永久错误熔断')
-  assert.strictEqual(classifySummary({
+    failures: [{ code: 'HTTP_401', message: 'one message permanently failed' }]
+  })
+  assert.strictEqual(partialPermanent.kind, 'retryable',
+    '单条消息的永久错误不得让常驻入口整轮停止（还有新消息要推），故部分失败统一 retryable')
+  assert.strictEqual(partialPermanent.reason, 'PARTIAL_MESSAGE_FAILURE')
+  const partialTransient = classifySummary({
     total: 2,
     pushed: 1,
     failed: 1,
-    failures: [{ code: 'ETIMEDOUT', message: 'one channel transient failure' }]
-  }), null, '部分成功且仅临时失败时保持继续')
+    failures: [{ code: 'ETIMEDOUT', message: 'one message transient failure' }]
+  })
+  assert.strictEqual(partialTransient.reason, 'PARTIAL_MESSAGE_FAILURE')
 })
 
 testCase('runResident 常驻重试/恢复与环境变量还原', async () => {
@@ -402,6 +415,79 @@ testCase('runResident 常驻重试/恢复与环境变量还原', async () => {
     }, recoveryController)
     assert.strictEqual(recoveryRuns, 2, '恢复成功后应清零失败状态并正常停止')
     assert.strictEqual(recoveryController.signal.aborted, true)
+
+    // PR #362（CodeRabbit Major · Stability & Availability）：部分消息失败必须与常驻轮询解耦。
+    // 反例（旧行为）：只要一条消息长期送不出去，runResident 就把它当整轮可重试失败叠加指数退避
+    // （默认封顶 30 分钟）——等待期间连**新消息**都拉不下来，无关投递被同一条失败消息拖住最多
+    // 30 分钟/轮。封顶留在大值（首次退避 1000ms）：解耦后第 1→2 轮只应等正常轮询间隔
+    // （XBK_INTERVAL_MS=0），而不是 1000ms。
+    process.env.XBK_RETRY_BACKOFF_CAP_MS = '5000'
+    let partialRuns = 0
+    let partialGapMs = -1
+    let partialFirstAt = 0
+    const partialController = new AbortController()
+    await runResident({
+      num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
+      run: async () => {
+        partialRuns += 1
+        if (partialRuns === 1) partialFirstAt = Date.now()
+        else if (partialRuns === 2) partialGapMs = Date.now() - partialFirstAt
+        if (partialRuns >= 3) partialController.abort()
+        return { total: 2, pushed: 1, failed: 1, failures: [{ code: 'ETIMEDOUT', message: '一条消息送不出去' }] }
+      }
+    }, partialController)
+    assert.ok(partialRuns >= 3, `部分消息失败必须继续轮询（不得整轮停止），实际只跑了 ${partialRuns} 轮`)
+    assert.ok(partialGapMs >= 0 && partialGapMs < 500,
+      `部分消息失败不得叠加常驻循环退避：第 1→2 轮间隔 ${partialGapMs}ms（旧实现至少 1000ms，新消息被同一条失败消息拖住）`)
+
+    // 对照组：整轮失败（pushed=0）仍必须叠加退避——防「把退避整个删掉」式假修复。
+    let allFailedRuns = 0
+    let allFailedGapMs = -1
+    let allFailedFirstAt = 0
+    const allFailedController = new AbortController()
+    await runResident({
+      num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
+      run: async () => {
+        allFailedRuns += 1
+        if (allFailedRuns === 1) allFailedFirstAt = Date.now()
+        else if (allFailedRuns === 2) allFailedGapMs = Date.now() - allFailedFirstAt
+        if (allFailedRuns >= 2) allFailedController.abort()
+        return { total: 2, pushed: 0, failed: 2, failures: [{ code: 'ETIMEDOUT', message: '两条都送不出去' }] }
+      }
+    }, allFailedController)
+    assert.ok(allFailedGapMs >= 800,
+      `整轮失败仍必须叠加退避：第 1→2 轮间隔 ${allFailedGapMs}ms（应≈1000ms）`)
+
+    // PR #362 返工（主代理复现的真因）：部分失败里若**唯一**失败消息是永久错误（如 token 无效 401），
+    // classifyFailure 见到嵌套子错误就转 classifyOne，子项全永久 ⇒ permanent/ALL_CHANNELS_PERMANENT。
+    // 若先判 permanent 再判 partial，一条 token 失效的消息会让整轮 abort——比 30 分钟退避更糟：
+    // 后续全部新消息一起停掉。本用例锁定「pushed>0 的部分失败永不 abort、不叠加退避」。
+    let partialPermRuns = 0
+    let partialPermGapMs = -1
+    let partialPermFirstAt = 0
+    let partialPermAborts = 0
+    const partialPermInner = new AbortController()
+    // 只统计 runResident 自己发起的 abort()：停循环用 inner.abort()，不走这个包装。
+    const partialPermController = {
+      signal: partialPermInner.signal,
+      abort: () => { partialPermAborts += 1; partialPermInner.abort() }
+    }
+    await runResident({
+      num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
+      run: async () => {
+        partialPermRuns += 1
+        if (partialPermRuns === 1) partialPermFirstAt = Date.now()
+        else if (partialPermRuns === 2) partialPermGapMs = Date.now() - partialPermFirstAt
+        if (partialPermRuns >= 3) partialPermInner.abort()
+        return { total: 2, pushed: 1, failed: 1, failures: [{ statusCode: 401, message: 'token 无效' }] }
+      }
+    }, partialPermController)
+    assert.strictEqual(partialPermAborts, 0,
+      `本轮有成功投递的部分失败不得 abort 常驻循环（一条 token 无效的消息不得停掉后续全部推送），实际 abort ${partialPermAborts} 次`)
+    assert.ok(partialPermRuns >= 3,
+      `部分消息失败必须继续按轮询间隔跑下一轮（不得整轮停止），实际只跑了 ${partialPermRuns} 轮`)
+    assert.ok(partialPermGapMs >= 0 && partialPermGapMs < 500,
+      `部分消息失败不得叠加常驻循环退避：第 1→2 轮间隔 ${partialPermGapMs}ms（旧实现至少 1000ms）`)
   } finally {
     if (oldInterval === undefined) delete process.env.XBK_INTERVAL_MS
     else process.env.XBK_INTERVAL_MS = oldInterval
@@ -441,8 +527,10 @@ testCase('补测 classifyFailure 聚合与 classifySummary 边界', async () => 
   assert.strictEqual(unknownAll.kind, 'retryable')
   assert.strictEqual(unknownAll.reason, 'ALL_PUSH_FAILED_UNKNOWN')
 
-  // classifySummary：部分成功 + failures 空数组 → 保持成功，不熔断
-  assert.strictEqual(classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] }), null)
+  // classifySummary：部分消息失败 + failures 空数组 → 同样必须降级（不能因为原因未结构化就当成功）
+  const partialUnknown = classifySummary({ total: 2, pushed: 1, failed: 1, failures: [] })
+  assert.ok(partialUnknown, '有消息没送达时不得返回 null')
+  assert.strictEqual(partialUnknown.reason, 'PARTIAL_MESSAGE_FAILURE')
 
   // [XFP-03] 「有没有失败」只由 failed 决定，不得被 total 的缺失/非数字带偏。
   // 反例（改动前）：`Number(total)||0` 使 total<=0 成立 → 直接返回 null，一个有失败的摘要
@@ -458,6 +546,29 @@ testCase('补测 classifyFailure 聚合与 classifySummary 边界', async () => 
   assert.strictEqual(classifySummary({ total: 5 }), null, 'failed 缺失仍为成功')
   assert.strictEqual(classifySummary({ total: 5, failed: 'abc' }), null, 'failed 非数字仍为成功')
   assert.strictEqual(classifySummary({ total: 5, failed: -1 }), null, 'failed 负数仍为成功')
+
+  // C9-002：cacheSaved 从来没被分类器读取——推送成功但成功记录没落盘时摘要仍判绿
+  // （下次运行会重复推送，运维看不到）。入口必须先判 cacheSaved===false → retryable/CACHE_SAVE_FAILED。
+  const cacheFail = classifySummary({ total: 1, pushed: 1, failed: 0, cacheSaved: false })
+  assert.ok(cacheFail, 'cacheSaved=false 必须给出判定（不得返回 null 判绿）')
+  assert.strictEqual(cacheFail.kind, 'retryable')
+  assert.strictEqual(cacheFail.reason, 'CACHE_SAVE_FAILED')
+  // 优先于其它判定：原因是「成功记录没落盘」，不能被通道失败计数掩盖
+  assert.strictEqual(classifySummary({
+    total: 2, pushed: 1, failed: 1, cacheSaved: false, failures: [{ code: 'ETIMEDOUT' }]
+  }).reason, 'CACHE_SAVE_FAILED')
+  // 反向断言：cacheSaved=true / 缺省 仍按原口径（无失败 → null），不得把正常路径判成失败
+  assert.strictEqual(classifySummary({ total: 1, pushed: 1, failed: 0, cacheSaved: true }), null)
+  assert.strictEqual(classifySummary({ total: 1, pushed: 1, failed: 0 }), null)
+
+  // C9-002 实测形态：100 条里 1 条成功、99 条失败——旧实现 pushed>0 无条件返回 null
+  // ⇒ 退出码 0、告警不触发，99 条消息被静默吞掉。
+  const mostlyFailed = classifySummary({
+    total: 100, pushed: 1, failed: 99, cacheSaved: true, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }]
+  })
+  assert.ok(mostlyFailed, '1 条成功 + 99 条失败不得判成功')
+  assert.strictEqual(mostlyFailed.kind, 'retryable')
+  assert.strictEqual(mostlyFailed.reason, 'PARTIAL_MESSAGE_FAILURE')
 
   // code 数值 400-499（未命中 message/错误码集合）→ PROVIDER_xxx 永久
   assert.strictEqual(classifyFailure({ code: 450, message: 'server replied' }).kind, 'permanent')
@@ -673,6 +784,36 @@ testCase('qodo PR #152 结构化值/裸 scheme/关键字边界', async () => {
   // 幂等：已脱敏输出再次经过脱敏不得继续变化（身份/日志可能重复经过多条清洗路径）
   assert.strictEqual(summarizeError({ message: 'token=***' }).message, 'token=***', '脱敏必须幂等')
   assert.strictEqual(summarizeError({ message: 'Basic ***' }).message, 'Basic ***', '裸 scheme 脱敏同样幂等')
+
+  // ============ C9-001（P0）：畸形结构化值不得把脱敏拖进指数回溯 ============
+  // 反例（修复前实测，单进程 summarizeError）：`token=[` + `"a",`×n 的耗时 n=9/43B→101ms、10→610ms、
+  // 11→3.33s、12→19.28s（每多一个元素约 ×5.5）；199B（48 个引号元素）30s 未返回。
+  // 可达性：厂商响应 data.msg → safeErr 截到 200 字符（截断点正好能落在 `[` 与 `]` 之间）→
+  // new Error(msg) → classifyFailure → summarizeError → redact，跑在推送主线程上，没有任何超时兜底。
+  // 本块同时钉住两件事：① 耗时上界（不许再有指数/超长回溯路径）；② 脱敏语义不变（该抹的还得抹）。
+  const pathological = ('token=[' + '"a",'.repeat(48)).slice(0, 200)
+  assert.strictEqual(pathological.length, 199, '前置条件：对抗样本必须正好 199 字节（落在上游 200 字符截断内）')
+  const pathologicalStart = process.hrtime.bigint()
+  const pathologicalOut = summarizeError({ message: pathological }).message
+  const pathologicalMs = Number(process.hrtime.bigint() - pathologicalStart) / 1000000
+  assert.ok(pathologicalMs < 1000,
+    `199B 对抗样本必须在 1000ms 内返回（修复前 30s 未返回），实测 ${pathologicalMs.toFixed(1)}ms`)
+  // 语义等价：数组未闭合 ⇒ 落回裸值分支，只抹到第一个分隔符为止（与修复前同形）
+  assert.strictEqual(pathologicalOut, 'token=***' + pathological.slice('token=["a"'.length),
+    '未闭合数组的脱敏形态必须与修复前一致（裸值分支抹到第一个 , 为止）')
+  // 同一形状带真凭据时不得漏抹：凭据必须整体消失（不允许「只抹前几个字符」的降级实现）
+  const secretInPathological = 'token=["SECRET1234","a",' + '"a",'.repeat(40)
+  const secretOut = summarizeError({ message: secretInPathological }).message
+  assert.ok(!secretOut.includes('SECRET1234'), '畸形结构化值里的凭据同样必须整体脱敏')
+  // 长度翻倍（394B，两倍于上游截断上限）仍须在预算内：证明修复不是靠「先截断到 N 字符」躲过去的，
+  // 否则换个能绕过截断的调用点（failureInfo 字符串不截断）同样会挂。
+  const doubledStart = process.hrtime.bigint()
+  summarizeError({ message: 'token=[' + '"a",'.repeat(96) })
+  const doubledMs = Number(process.hrtime.bigint() - doubledStart) / 1000000
+  assert.ok(doubledMs < 1000, `394B（96 个引号元素）同样必须在 1000ms 内返回，实测 ${doubledMs.toFixed(1)}ms`)
+  // 反向守卫：同一形状但括号闭合时仍是「整体抹掉」，不许为了性能把结构化值分支整个丢掉
+  assert.strictEqual(summarizeError({ message: 'token=["SECRET123","b"]' }).message, 'token=***',
+    '闭合数组仍必须整体脱敏（性能修复不得砍掉结构化值分支）')
 
   // 反向断言：无凭据文本不得被脱敏误改（防止把规则写成吞掉正常内容）
   assert.strictEqual(summarizeError({ message: 'request timed out after 5000ms' }).message,

@@ -183,6 +183,22 @@ function aggregateChannelError (channel, message, failures = []) {
   return result
 }
 
+// C8-007：HTTP 状态码可能只挂在 `error.response.statusCode` 上——got 的 HTTPError 把 response 作为
+// 非枚举属性挂出，错误对象**自身没有** statusCode 字段。六个通道在 err 分支直接 `reject(err)`
+// （Server酱/企业微信/wxpusher/息知/PushDeer/Telegram），不经 channelError，汇总时若只读
+// `reason.statusCode` 就会丢掉状态码 ⇒ 分类器落 UNKNOWN → 真实 413/415/422/451 判 retryable，
+// 而同一状态码在 pushplus（走 channelError，读 response.statusCode）判 permanent。
+function failureStatusCode (reason) {
+  const pick = (value) => {
+    const n = Number(value)
+    return Number.isInteger(n) && n >= 100 && n <= 599 ? n : null
+  }
+  const direct = pick(reason && reason.statusCode)
+  if (direct !== null) return direct
+  const response = reason && reason.response
+  return pick(response && response.statusCode)
+}
+
 // 部分通道/API 代理会把数字业务码序列化成字符串；成功语义允许两种 JSON 类型。
 function isCode (value, expected) {
   return value === expected || value === String(expected)
@@ -1607,6 +1623,14 @@ function findDestEnd (s, from, budget) {
   return -1
 }
 
+// C8-011：destination 可能是 `<url>` 形态（formatter 的 _mdDestination 对含空格/括号的 URL 一律加尖括号），
+// 而 text 侧是裸 url。裸串比较会让「text 就是 url」的原文链接去重恒失效（`https://x` !== `<https://x>`）
+// ⇒ 纯文本通道把同一条链接输出两遍（`https://x (https://x)`）。比较前两侧统一剥掉外层尖括号。
+function unwrapDest (dest) {
+  const s = String(dest === undefined || dest === null ? '' : dest)
+  return s.length >= 2 && s[0] === '<' && s[s.length - 1] === '>' ? s.slice(1, -1) : s
+}
+
 function mdLinksToPlain (s) {
   let out = ''
   let i = 0
@@ -1625,7 +1649,7 @@ function mdLinksToPlain (s) {
     if (end === -1) { out += s.slice(i); break } // 连 ")" 都没有：剩余串不可能再有完整链接，原样保留并终止
     const u = s.slice(close + 2, end)
     if (u === '') { out += s.slice(i, end + 1); i = end + 1; continue } // url 空：原样保留
-    out += s.slice(i, open) + (t === u ? t : `${t} (${u})`)
+    out += s.slice(i, open) + (unwrapDest(t) === unwrapDest(u) ? t : `${t} (${u})`)
     i = end + 1
   }
   return out
@@ -1695,6 +1719,26 @@ function mdToPlain (s, stripAngle = true) {
     .replace(/&amp;/g, '&') // & 最后解码：防 &amp;lt; 二次解码成 <（CodeQL js/double-escaping）
 }
 
+// C8-002：{Html内容} 模板产物是 HTML 片段（<p>/<br>/<img>），而纯文本/Markdown 通道都渲染不了它。
+// 直接下发时：mdToPlain 只能逐字符剥标签 ⇒ <p>/<br> 的段落边界全丢、<img> 连 alt 一起消失；
+// 不剥标签的通道（Server酱/企微/息知/PushDeer/PushMe/TG）则把 HTML 源码当正文显示。
+// 故先 htmlToMarkdown（p/br→段落、img→![alt](src)、a→[text](url)）再降纯文本。
+// 门槛只认「块级/结构标签」：这些正是逐标签剥离会破坏结构的形态；纯行内标签（<b>/<i> 等）保持
+// 原路径——整段 HTML→Markdown 会把混在 Markdown 里的行内标签改写掉（TG 的 HTML 转义契约靠它）。
+// 组合根不可用（测试替身/加载序）时退回 mdToPlain 逐标签剥——无论哪条路径，都不把裸 HTML 下发。
+const BLOCK_HTML_RE = /<(?:p|div|br|img|h[1-6]|li|ul|ol|table|thead|tbody|tr|td|th|blockquote|pre|hr|section|article|figure|figcaption)(?=[\s/>])/i
+
+function htmlToPlainText (s) {
+  const str = String(s === undefined || s === null ? '' : s)
+  if (!BLOCK_HTML_RE.test(str) || !looksHtml(str)) return str
+  let md = null
+  try {
+    const utils = shared()
+    if (utils && typeof utils.htmlToMarkdown === 'function') md = utils.htmlToMarkdown({ content_html: str })
+  } catch (e) { md = null }
+  return mdToPlain(typeof md === 'string' && md !== '' ? md : str)
+}
+
 // 孤立代理清洗（v3.110）：encodeURIComponent 对孤立代理抛 URIError——推送前统一处理
 function cleanSurrogates (s) {
   try { s = String(s === undefined || s === null ? '' : s) } catch (e) { return '' }
@@ -1750,16 +1794,19 @@ async function sendNotify (text, desp, params = {}) {
   }
   // 只启动已配置通道：未配置通道原本虽会立即 resolve，但每条消息仍会创建函数/Promise/对象。
   // 保持数组顺序与 configuredFlags 一致，便于失败统计和后续扩展。
+  // C8-002：HTML 形态的 desp 只有 wxpusher 能真渲染（contentType=2），其余 8 个通道统一改用降级后的
+  // textDesp（HTML→Markdown→纯文本），避免段落换行丢失 / <img> 连 alt 消失 / 源码外露。
+  const textDesp = htmlToPlainText(desp)
   const channelTasks = [
-    [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, desp, params)],
-    [configuredFlags[1], 'server酱', () => serverNotify(text, desp, params)],
-    [configuredFlags[2], 'bark', () => barkNotify(text, desp, params)],
-    [configuredFlags[3], '企业微信', () => qywxBotNotify(text, desp, params)],
+    [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, textDesp, params)],
+    [configuredFlags[1], 'server酱', () => serverNotify(text, textDesp, params)],
+    [configuredFlags[2], 'bark', () => barkNotify(text, textDesp, params)],
+    [configuredFlags[3], '企业微信', () => qywxBotNotify(text, textDesp, params)],
     [configuredFlags[4], 'wxpusher', () => wxPusherNotify(text, desp, params)],
-    [configuredFlags[5], '息知', () => wxXiZhiNotify(text, desp, params)],
-    [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, desp, params)],
-    [configuredFlags[7], 'pushme', () => pushMeNotify(text, desp, params)],
-    [configuredFlags[8], 'telegram', () => tgNotify(text, desp, params)]
+    [configuredFlags[5], '息知', () => wxXiZhiNotify(text, textDesp, params)],
+    [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, textDesp, params)],
+    [configuredFlags[7], 'pushme', () => pushMeNotify(text, textDesp, params)],
+    [configuredFlags[8], 'telegram', () => tgNotify(text, textDesp, params)]
   ]
   const enabledTasks = channelTasks.filter(([enabled]) => enabled)
   // P3（跨批协同，low）：向调用方（Pusher）透出本次 sendNotify 的「在飞/已结算通道」状态。
@@ -1793,7 +1840,8 @@ async function sendNotify (text, desp, params = {}) {
     if (reason && typeof reason === 'object') {
       try {
         if (reason.code !== undefined) failure.code = reason.code
-        if (reason.statusCode !== undefined) failure.statusCode = reason.statusCode
+        const statusCode = failureStatusCode(reason)
+        if (statusCode !== null) failure.statusCode = statusCode
         if (reason.providerCode !== undefined) failure.providerCode = reason.providerCode
       } catch (e) { /* 异常字段只保留安全消息 */ }
     }

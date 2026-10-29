@@ -764,6 +764,72 @@ function assertNoResidue (fx, label) {
   }
 }
 
+// I) 【靶向 C10-005 之一：status.showUntrackedFiles=no 不得让未跟踪文件隐形】
+//    `git status --porcelain` 的未跟踪口径受 status.showUntrackedFiles 影响：设成 no 时它**静默不列**
+//    未跟踪文件（实测：同仓 `git status --porcelain` 输出为空、加 `-uall` 仍输出 `?? stray.js`）。旧实现
+//    拿这份空输出判定「整棵工作树干净」并打印「工作树内容 === 被推提交内容」→ 快路径假绿。命令加 `-uall`
+//    后命令行覆盖该配置 ⇒ 未跟踪文件照旧算脏、必须走隔离路径。旧实现下本用例的
+//    「不得打印快路径结论」必红（靶向回退已实测）。
+{
+  const fx = makePushFixture({ commitGate: 'pass' })
+  try {
+    mustGit(['config', 'status.showUntrackedFiles', 'no'], { cwd: fx.work, env: fx.env }, 'git config status.showUntrackedFiles no')
+    fs.writeFileSync(path.join(fx.work, 'untracked-hidden-by-config.txt'), '未跟踪（且被 status 配置隐藏）\n')
+    // 夹具前提必须显式断言：配置真的生效，否则本用例测不到那条路径
+    const plain = mustGit(['status', '--porcelain'], { cwd: fx.work, env: fx.env })
+    const all = mustGit(['status', '--porcelain', '-uall'], { cwd: fx.work, env: fx.env })
+    assert.strictEqual(plain.trim(), '',
+      'I 夹具前提：status.showUntrackedFiles=no 时 git status --porcelain 必须为空（否则本用例测不到该配置）')
+    assert.match(all, /\?\? .*untracked-hidden-by-config\.txt/,
+      'I 夹具前提：同一仓库下 -uall 仍必须列出该未跟踪文件（-uall 覆盖配置）')
+    const head = headOf(fx)
+    const r = driveHook(fx, refLine('refs/heads/main', head, 'refs/heads/main'))
+    assert.strictEqual(r.status, 0, `I：被推提交内容通过时应 exit 0（隔离路径不改变门禁结论）：${hookOut(r)}`)
+    assert.doesNotMatch(hookOut(r), /在当前工作树跑门禁（快路径）/,
+      'I（靶向）：未跟踪文件仍算脏，绝不能走快路径——旧实现正是在这里把脏树当干净（showUntrackedFiles=no）')
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 1, `I：门禁应只跑一次，实际 ${runs.length} 次`)
+    assert.match(runs[0].cwd, /xbk-prepush-/, 'I：有未跟踪文件时必须走隔离路径（不得拿当前工作树冒充）')
+    assertInFixtureTmp(fx, runs[0].cwd, 'I')
+    assert.ok(!fs.existsSync(runs[0].cwd), 'I：临时 worktree 必须被清理')
+    assertNoResidue(fx, 'I')
+    console.log('✅ C10-005-①：status.showUntrackedFiles=no + 未跟踪文件仍走隔离校验（同一仓库 git status --porcelain 为空、-uall 列出该文件）')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+// J) 【靶向 C10-005 之二：git status 失败（索引损坏 rc=128）必须 fail-closed】
+//    旧实现 `worktree_status=$(git status --porcelain 2>/dev/null || true)`：rc=128 被 `|| true` 吞掉、
+//    stderr 被丢弃 ⇒ 变量为空 ⇒ 判定「整棵工作树干净」并打印快路径结论（红测被放行）。现在 status 失败
+//    即视为「不能证明干净」：打印具体原因并走隔离校验（隔离 worktree 有自己的一份索引，不读这份损坏的
+//    索引——实测 `git status` rc=128 与 `git worktree add --detach` 可以共存）。旧实现下本用例必红。
+{
+  const fx = makePushFixture({ commitGate: 'pass' })
+  try {
+    const head = headOf(fx)
+    fs.writeFileSync(path.join(fx.work, '.git', 'index'), 'GARBAGE-INDEX')
+    const probe = spawnSync(GIT, ['status', '--porcelain', '-uall'], { cwd: fx.work, encoding: 'utf8', env: fx.env })
+    assert.strictEqual(probe.status, 128,
+      `J 夹具前提：索引损坏后 git status 必须以 rc=128 失败（实际 ${probe.status}：${probe.stderr}）`)
+    const r = driveHook(fx, refLine('refs/heads/main', head, 'refs/heads/main'))
+    assert.strictEqual(r.status, 0, `J：索引损坏不影响「被推提交内容」的校验，应 exit 0：${hookOut(r)}`)
+    assert.doesNotMatch(hookOut(r), /在当前工作树跑门禁（快路径）/,
+      'J（靶向）：git status 失败时不得走快路径——rc=128 必须 fail-closed（旧实现把它吞成「工作树干净」）')
+    assert.match(hookOut(r), /无法判定工作树是否干净：git status --porcelain -uall 失败（退出码 128）/,
+      'J：必须打印 status 失败的具体原因（不得 `2>/dev/null || true` 静默吞掉）')
+    const runs = gateRuns(fx)
+    assert.strictEqual(runs.length, 1, `J：门禁应只跑一次，实际 ${runs.length} 次`)
+    assert.match(runs[0].cwd, /xbk-prepush-/, 'J：status 判不了时必须走隔离路径（不能证明干净 = 不干净）')
+    assertInFixtureTmp(fx, runs[0].cwd, 'J')
+    assert.ok(!fs.existsSync(runs[0].cwd), 'J：临时 worktree 必须被清理')
+    assertNoResidue(fx, 'J')
+    console.log('✅ C10-005-②：索引损坏（git status rc=128）fail-closed——打印原因并走隔离校验，不走快路径')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
 // 12) 安装路径（无 --verify）：.githooks 目录整体缺失 ⇒ exit 1 且给出两条可照抄的诊断
 {
   const { dir, home } = makeCase()
@@ -843,27 +909,37 @@ function assertNoResidue (fx, label) {
 // bash 复用上面为 pre-push 解析好的绝对路径 BASH（按名 spawn 会被静态分析判 Sonar S4036）。
 const COMMIT_MSG_HOOK = path.join(__dirname, '.githooks', 'commit-msg')
 
-function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
+function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar, mergeInProgress = false) {
   const { dir, home } = makeCase()
   const env = sandboxEnv(home, { ...process.env, ...inheritedGitEnv })
   try {
     const file = path.join(dir, 'MSG')
     fs.writeFileSync(file, lines.join('\n'))
-    if (cleanup || commentChar) {
-      initRepo(dir, home, env)
-      if (cleanup) {
-        const set = spawnSync(GIT, ['config', 'commit.cleanup', cleanup], { cwd: dir, encoding: 'utf8', env })
-        assert.strictEqual(set.status, 0, `设置 commit.cleanup=${cleanup} 失败：${set.stderr}`)
-      }
-      if (commentChar) {
-        const set = spawnSync(GIT, ['config', 'core.commentChar', commentChar], { cwd: dir, encoding: 'utf8', env })
-        assert.strictEqual(set.status, 0, `设置 core.commentChar=${commentChar} 失败：${set.stderr}`)
-      }
+    // 钩子要问 Git 的 MERGE_HEAD 才能开合并豁免，因此每个用例都建真仓库（CodeRabbit g1）。
+    initRepo(dir, home, env)
+    if (cleanup) {
+      const set = spawnSync(GIT, ['config', 'commit.cleanup', cleanup], { cwd: dir, encoding: 'utf8', env })
+      assert.strictEqual(set.status, 0, `设置 commit.cleanup=${cleanup} 失败：${set.stderr}`)
+    }
+    if (commentChar) {
+      const set = spawnSync(GIT, ['config', 'core.commentChar', commentChar], { cwd: dir, encoding: 'utf8', env })
+      assert.strictEqual(set.status, 0, `设置 core.commentChar=${commentChar} 失败：${set.stderr}`)
+    }
+    if (mergeInProgress) {
+      // 用 --git-path 解析（worktree 下不是 .git/MERGE_HEAD），与钩子同一口径；解析失败即夹具失效必须红。
+      const resolved = spawnSync(GIT, ['rev-parse', '--git-path', 'MERGE_HEAD'], { cwd: dir, encoding: 'utf8', env })
+      assert.strictEqual(resolved.status, 0, `解析 MERGE_HEAD 路径失败：${resolved.stderr}`)
+      fs.writeFileSync(path.resolve(dir, resolved.stdout.trim()), '0'.repeat(40) + '\n')
     }
     return spawnSync(BASH, [COMMIT_MSG_HOOK, file], { cwd: dir, encoding: 'utf8', env })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+}
+
+// 「合并进行中」夹具：只有 MERGE_HEAD 真实存在时，`Merge ` 才该免前缀
+function runInMergeState (lines) {
+  return runCommitMsg(lines, undefined, {}, undefined, true)
 }
 {
   const withBody = runCommitMsg(['chore: 标题（合规前缀）', '', '正文第一段。'])
@@ -937,6 +1013,142 @@ function runCommitMsg (lines, cleanup, inheritedGitEnv = {}, commentChar) {
     const log = spawnSync(GIT, ['log', '-1', '--format=%s'], { cwd: dir, encoding: 'utf8', env })
     assert.notStrictEqual(log.status, 0, '钩子拒绝后不得创建提交')
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// ── C10-043（audit38 · P3）：git merge --no-ff 的默认合并消息必须放行（只对 `^Merge ` 开白名单）────
+// 为什么测它：commit-msg 只认类型前缀，而 `git merge --no-ff` 的默认消息是 git 生成的
+// `Merge branch 'feature'`（没人会也不该给它加 fix:/chore: 前缀）⇒ 旧钩子把合并拦死、只留下一次
+// 未完成的合并，收尾只能 `git commit --no-verify`——连带跳过整道消息门禁。
+// 白名单**只免「类型前缀」这一条**：首行 ≤100 字符与「标题后必须空行」仍照旧校验（默认合并消息的
+// 单行形态 / 标题+空行形态都满足，故不会误伤）。`git revert` 实测**不触发** commit-msg
+// （githooks(5)：只有 commit 与 merge 调用它），所以这里不给 revert 开任何白名单，也不写相关文案。
+{
+  assert.strictEqual(runInMergeState(["Merge branch 'feature'"]).status, 0,
+    '合并默认消息（单行，git merge --no-edit 的形态）必须放行')
+  assert.strictEqual(runInMergeState(["Merge branch 'feature'", '', '正文']).status, 0,
+    '合并消息带空行 + 正文（编辑器形态）必须放行')
+  assert.strictEqual(runInMergeState(["Merge remote-tracking branch 'origin/main'", '']).status, 0,
+    '合并远端分支的默认消息同样必须放行')
+  const mergeNoBlank = runInMergeState(["Merge branch 'feature'", '正文没有空行'])
+  assert.strictEqual(mergeNoBlank.status, 1, '合并消息同样受「标题后必须空行」约束（白名单只免前缀）')
+  assert.match(mergeNoBlank.stdout, /空行/, '合并消息漏空行也要点名空行')
+  const mergeTooLong = runInMergeState(['Merge ' + 'x'.repeat(200), '', '正文'])
+  assert.strictEqual(mergeTooLong.status, 1, '合并消息同样受「首行 ≤100 字符」约束（白名单只免前缀）')
+  assert.strictEqual(runCommitMsg(['Merged hotfix without space', '', '正文']).status, 1,
+    '只放行 `Merge `（带空格）：`Merged ...` 不是 git 的合并消息形态，不得借道通过')
+  // 靶向反例（CodeRabbit g1）：subject 以 `Merge ` 开头、但**没有合并状态**（无 MERGE_HEAD）时必须要求前缀。
+  // 旧实现只看 subject（.githooks/commit-msg:15 `'Merge '*) is_merge=1`）⇒ 这条会假绿。
+  const fakeMerge = runCommitMsg(['Merge not a merge'])
+  assert.strictEqual(fakeMerge.status, 1,
+    '非合并提交用 `Merge ...` 当标题必须被拒（旧实现只看 subject，会放行）')
+  assert.match(fakeMerge.stdout, /类型前缀/, '拒非合并的 `Merge ...` 时仍要点名类型前缀')
+  // fail-closed：不在仓库里 ⇒ `git rev-parse --git-path MERGE_HEAD` 失败 ⇒ 按普通提交处理（不得放行）。
+  // GIT_CEILING_DIRECTORIES 防止临时目录恰好落在某个仓库里，让「解析失败」这条判据失真。
+  {
+    const { dir, home } = makeCase()
+    try {
+      const file = path.join(dir, 'MSG')
+      fs.writeFileSync(file, "Merge branch 'feature'\n")
+      const r = spawnSync(BASH, [COMMIT_MSG_HOOK, file], {
+        cwd: dir, encoding: 'utf8', env: { ...sandboxEnv(home), GIT_CEILING_DIRECTORIES: dir }
+      })
+      assert.strictEqual(r.status, 1, 'MERGE_HEAD 无法解析（不在仓库）时必须按普通提交处理，不得免前缀')
+      assert.match(r.stdout, /类型前缀/, '解析失败被拒时仍要点名类型前缀')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}
+// 真 git 仓库回归：合并必须能提交成功；同一份钩子对普通提交的判据一条都不能松
+{
+  const { dir, home } = makeCase()
+  const env = sandboxEnv(home)
+  delete env.GIT_EDITOR
+  try {
+    initRepo(dir, home, env)
+    const hooks = path.join(dir, 'hooks')
+    fs.mkdirSync(hooks)
+    const hook = path.join(hooks, 'commit-msg')
+    fs.copyFileSync(COMMIT_MSG_HOOK, hook)
+    fs.chmodSync(hook, 0o700)
+    const git = (args) => spawnSync(GIT, args, { cwd: dir, encoding: 'utf8', env })
+    for (const [key, value] of [
+      ['user.name', 'Merge Hook Regression'],
+      ['user.email', 'merge-hook@example.invalid'],
+      ['core.hooksPath', hooks],
+      ['commit.gpgsign', 'false']
+    ]) {
+      const r = git(['config', key, value])
+      assert.strictEqual(r.status, 0, `配置 ${key} 失败：${r.stderr}`)
+    }
+    assert.strictEqual(git(['commit', '--allow-empty', '-m', 'chore: 初始']).status, 0, '初始提交应通过')
+    const base = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim()
+    assert.ok(base && base !== 'HEAD', `应取到主分支名，实际 ${JSON.stringify(base)}`)
+    assert.strictEqual(git(['checkout', '-q', '-b', 'feature']).status, 0, '建分支失败')
+    assert.strictEqual(git(['commit', '--allow-empty', '-m', 'chore: 分支提交']).status, 0, '分支提交应通过')
+    assert.strictEqual(git(['checkout', '-q', base]).status, 0, '切回主分支失败')
+    const merge = git(['merge', '--no-ff', '--no-edit', 'feature'])
+    assert.strictEqual(merge.status, 0,
+      'git merge --no-ff 的默认消息必须被接受（旧钩子 exit 1，留下未完成的合并）：' +
+      (merge.stdout + merge.stderr).slice(0, 300))
+    const subject = git(['log', '-1', '--format=%s']).stdout.trim()
+    assert.strictEqual(subject, "Merge branch 'feature'",
+      `合并提交的 subject 应是 git 默认消息，实际 ${JSON.stringify(subject)}`)
+    // 靶向回归（CodeRabbit g1）：合并已收尾 ⇒ MERGE_HEAD 已删除，此刻 `Merge ...` 只是普通标题。
+    // 旧实现只看 subject 就免前缀 ⇒ 这条提交会成功，本断言在旧代码上必红。
+    const fakeMerge = git(['commit', '--allow-empty', '-m', 'Merge not a merge'])
+    assert.notStrictEqual(fakeMerge.status, 0, '非合并状态下的 `Merge ...` 标题必须被拦（旧实现会放行）')
+    assert.match(fakeMerge.stdout + fakeMerge.stderr, /类型前缀/, '拦下时要点名类型前缀')
+    const fakeSubject = git(['log', '-1', '--format=%s']).stdout.trim()
+    assert.strictEqual(fakeSubject, "Merge branch 'feature'", '被拦后不得创建提交')
+    // 普通提交不受影响：带类型前缀照旧通过
+    const normal = git(['commit', '--allow-empty', '-m', 'fix: 普通提交不受合并豁免影响'])
+    assert.strictEqual(normal.status, 0,
+      '普通 `fix: ...` 提交必须照旧通过：' + (normal.stdout + normal.stderr).slice(0, 200))
+    // 白名单没有放宽整条判据：普通提交缺前缀、漏空行仍照旧被拦
+    const badPrefix = git(['commit', '--allow-empty', '-m', '随便写点什么'])
+    assert.notStrictEqual(badPrefix.status, 0, '非合并提交缺类型前缀仍必须被拦')
+    assert.match(badPrefix.stdout + badPrefix.stderr, /类型前缀/, '拦下时仍要点名类型前缀')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+// linked worktree 的 MERGE_HEAD 解析（验收 3）：它落在 `.git/worktrees/<name>/`，硬编码
+// `.git/MERGE_HEAD` 会让 worktree 里的正常合并被误拦。这里直接按 --git-path 落文件再跑钩子。
+{
+  const { dir, home } = makeCase()
+  const env = sandboxEnv(home)
+  let wtDir
+  try {
+    initRepo(dir, home, env)
+    const git = (args, cwd = dir) => spawnSync(GIT, args, { cwd, encoding: 'utf8', env })
+    for (const [key, value] of [
+      ['user.name', 'Merge Worktree Regression'],
+      ['user.email', 'merge-worktree@example.invalid'],
+      ['commit.gpgsign', 'false']
+    ]) {
+      const r = git(['config', key, value])
+      assert.strictEqual(r.status, 0, `配置 ${key} 失败：${r.stderr}`)
+    }
+    assert.strictEqual(git(['commit', '--allow-empty', '-m', 'chore: 初始']).status, 0, '初始提交应通过')
+    wtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-wt-merge-'))
+    const add = git(['worktree', 'add', '-q', '--detach', wtDir])
+    assert.strictEqual(add.status, 0, `git worktree add 失败：${add.stderr}`)
+    const resolved = git(['rev-parse', '--git-path', 'MERGE_HEAD'], wtDir)
+    assert.strictEqual(resolved.status, 0, `worktree 里解析 MERGE_HEAD 失败：${resolved.stderr}`)
+    const mergeHead = resolved.stdout.trim()
+    assert.match(mergeHead, /[\\/]worktrees[\\/]/, `linked worktree 的 MERGE_HEAD 应指向 .git/worktrees/，实际 ${JSON.stringify(mergeHead)}`)
+    fs.writeFileSync(mergeHead, '0'.repeat(40) + '\n')
+    const file = path.join(wtDir, 'MSG')
+    fs.writeFileSync(file, "Merge branch 'feature'\n")
+    const r = spawnSync(BASH, [COMMIT_MSG_HOOK, file], { cwd: wtDir, encoding: 'utf8', env })
+    assert.strictEqual(r.status, 0,
+      'linked worktree 中处于合并状态的 `Merge ...` 必须放行（硬编码 .git/MERGE_HEAD 会误拦）：' +
+      (r.stdout + r.stderr).slice(0, 200))
+  } finally {
+    if (wtDir) fs.rmSync(wtDir, { recursive: true, force: true })
     fs.rmSync(dir, { recursive: true, force: true })
   }
 }

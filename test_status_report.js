@@ -97,6 +97,26 @@ try {
     assert.strictEqual(status.run.value.total, 7)
   })
 
+  // ===== formatStatus 必须把取消轮说出来（C10-006）：旧实现只判 interrupted =====
+  test('S5c formatStatus 取消轮 → 「⏹ 上一轮已被取消」+「本轮无计数（已取消）」，不得写「正常」或 null 计数', () => {
+    fs.writeFileSync(path.join(tmp, 'run.log'), [
+      '2026-09-08 10:00:00 total=42 dedup=5 filtered=7 truncated=2 pushed=28 failed=2 elapsed=3.4s',
+      '2026-09-08 10:05:00 CANCEL 控制台停止：任务 #1792236290484.7（run）于运行中被停止（SIGTERM）'
+    ].join('\n') + '\n')
+    const status = readStatus(tmp)
+    assert.strictEqual(status.run.value.cancelled, true, '前置：夹具确实解析成取消轮')
+    const line = formatStatus(status).split('\n').find((l) => l.startsWith('最近一轮：'))
+    assert.ok(line, '必须输出最近一轮行')
+    assert.ok(line.includes('⏹ 上一轮已被取消'), `取消轮不得渲染成「正常」（实际：${line}）`)
+    assert.ok(!line.includes('最近一轮：正常'), `取消轮不得写「正常」（实际：${line}）`)
+    assert.ok(line.includes('本轮无计数（已取消）'), `取消轮的计数段必须明说无计数（实际：${line}）`)
+    assert.ok(!/获取 null|去重 null|过滤 null|推送 null|失败 null|截断 null/.test(line),
+      `不得把 null 当计数写出来（实际：${line}）`)
+    assert.ok(line.includes('2026-09-08 10:05:00'), `取消时间必须可见（实际：${line}）`)
+    // 取消不影响其它行：日报 / 通道 / 过滤诊断照旧。
+    assert.match(formatStatus(status), /^日报：/m, '日报行照旧输出')
+  })
+
   // ===== parseLastRun 行首锚定：行中间内嵌的 total=… 不再被误命中 =====
   test('S6 run.log 仅 ERROR 行内嵌 total=… 子串（行首为其它文字）→ invalid', () => {
     fs.writeFileSync(path.join(tmp, 'run.log'), [
