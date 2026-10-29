@@ -1289,7 +1289,19 @@ const SIGNAL_PROBE = [
   "const signal = process.argv[2] || 'SIGINT'",
   "const pidFile = path.join(dir, 'suite.pid')",
   "const hbFile = path.join(dir, 'suite.alive')",
-  'const isAlive = (pid) => { try { process.kill(pid, 0); return true } catch (e) { return false } }',
+  // 僵尸（Z）算已死：入口被信号打断时不会 wait 子进程，被 SIGKILL 的套件在 /proc 里会短暂停在 Z 状态
+  // ——那不是「套件还在跑」。与 run_unit_tests 的探针（unitSignalProbe 的 isAlive）同口径：
+  // PID 非正整数 → 死；kill(pid,0) 失败 → 死；/proc/<pid>/stat 的 State 为 Z → 死；stat 读不到 → 退回 kill 的结论。
+  // 否则 PID 1 不回收孤儿（或不及时回收的容器）里，kill(pid,0) 成功会让 suiteAlive 假阳。
+  'const isAlive = (pid) => {',
+  '  if (!Number.isInteger(pid) || pid <= 0) return false',
+  '  try { process.kill(pid, 0) } catch (e) { return false }',
+  '  try {',
+  "    const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8')",
+  "    const close = stat.lastIndexOf(')')",
+  "    return stat.slice(close + 2, close + 3) !== 'Z'",
+  '  } catch (e) { return true }',
+  '}',
   'const waitFor = (fn, ms) => new Promise(resolve => {',
   '  const t0 = Date.now()',
   '  const tick = () => {',
