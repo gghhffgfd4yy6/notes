@@ -2126,11 +2126,12 @@ async function runHealthWithCapturedConsole (app) {
   return { warns, errs }
 }
 
-// 变异回归（app mutation RuntimeError）：xbk_app.js:_updateChannelHealth 的哨兵
-// `let lockFd = -1` 被 UnaryOperator 改成 `+1` 后，channelHealth 关闭的早退路径会
-// 在 finally 里把 1 当锁 fd 去 close，直接关掉 stdout，测试进程崩成 RuntimeError。
+// 变异回归（app mutation RuntimeError）：channelHealth 关闭时 _updateChannelHealth 早退，
+// finally 仍会走 _releaseChannelHealthLock。哨兵早已是 null（UnaryOperator 对 null 无从下手），
+// 真正挡住「把 stdio 当锁 fd 关掉」的是该方法的 `>2` 守卫：旧实现 -1 → +1 的变异体会在这里
+// close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError。
 // 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，而不是让进程崩掉。
-checkAsync('通道健康锁: 关闭健康观测时不得关闭 stdio fd（-1 哨兵变异回归）', async () => {
+checkAsync('通道健康锁: 关闭健康观测时不得关闭 stdio fd（>2 守卫回归）', async () => {
   const realFs = require('fs')
   const closed = []
   const spyFs = new Proxy(realFs, {
