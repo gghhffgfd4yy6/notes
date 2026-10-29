@@ -14,6 +14,10 @@ const {
 } = require('./qinglong/xbk_push')
 
 ;(async () => {
+  // 导出面守卫（C5-060 去重后仍需要这个符号：真正调用它的是文末的子进程探针，这里是「本套件确实在测它」的
+  // 显式声明，删掉导出一行即红——否则误删 import 后本套件会安静地只剩探针那一侧）。
+  assert.strictEqual(typeof ensureDependencies, 'function', 'ensureDependencies 必须由 qinglong/xbk_push 导出')
+
   // ===== shouldAutoInstallDependencies =====
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '1' }), true, '设置为 1 应返回 true')
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '0' }), false, '设置为 0 应返回 false')
@@ -51,132 +55,14 @@ const {
   assert.strictEqual(retryBackoffMs(2, { XBK_RETRY_BACKOFF_CAP_MS: '0' }), 2000, 'cap=0 应回退默认（<1）')
   assert.strictEqual(retryBackoffMs(2, null), 2000, 'null env 应回退默认')
 
-  // ===== ensureDependencies：更多边界分支 =====
-  // 统一 mock 构造器：消除 7 个用例间重复的 requireFn/spawnSyncFn 样板
-  // spawnCallCount：记录 spawnSyncFn 被调用次数，用于负向断言——依赖正常时不得触发安装/重建
-  // spawnCalls：记录每次调用的参数，用于断言实际执行的 npm 子命令（QX-04）
-  // lockExists：默认 true，令恢复命令固定为 npm ci（不依赖跑测试时仓库根是否存在锁文件）
-  const makeDepsMock = ({ gotError = null, re2Error = null, installResult = { status: 0 }, rebuildResult = { status: 0 }, autoInstall = true, lockExists = () => true } = {}) => {
-    const mock = {
-      spawnCallCount: 0,
-      spawnCalls: [],
-      requireFn: (id) => {
-        const base = path.basename(id)
-        if (base === 'got' && gotError) throw gotError
-        if (base === 're2' && re2Error) throw re2Error
-        return {}
-      },
-      spawnSyncFn: (cmd, args) => {
-        mock.spawnCallCount += 1
-        mock.spawnCalls.push({ cmd, args })
-        return args[0] === 'rebuild' && args[1] === 're2' ? rebuildResult : installResult
-      },
-      env: autoInstall ? { XBK_AUTO_INSTALL_DEPS: '1' } : {},
-      lockExists
-    }
-    return mock
-  }
-  const modNotFound = () => { const e = new Error('Cannot find module'); e.code = 'MODULE_NOT_FOUND'; return e }
-  const dlopenFailed = () => { const e = new Error('Native mismatch'); e.code = 'ERR_DLOPEN_FAILED'; return e }
-
-  // 1. got 和 re2 都可加载 → 返回 undefined（不抛错），且不得触发 spawnSync（安装/重建）
-  const normalMock = makeDepsMock()
-  assert.strictEqual(ensureDependencies(normalMock), undefined, '两个依赖都可加载时应返回 undefined')
-  assert.strictEqual(normalMock.spawnCallCount, 0, '依赖正常时不得触发 spawnSync（安装/重建）——负向断言，防未来重排漏判')
-
-  // 2. 不可恢复错误（非 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）直接 throw，不尝试安装
-  const unrecoverable = new Error('Unexpected runtime error')
-  unrecoverable.code = 'E_RANDOM'
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: unrecoverable })), /Unexpected runtime error/, '不可恢复错误应直接抛出，不尝试自动安装')
-
-  // 3. 可恢复错误但未设置自动安装 → 抛明确提示错误
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), autoInstall: false })), /got 依赖或原生模块未完整安装/, '未设置 XBK_AUTO_INSTALL_DEPS 时应抛提示错误')
-
-  // 4. npm install 失败（status != 0）→ throw
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { status: 1 } })), /npm ci 失败/, '安装退出码非 0 应抛错（有锁文件时为 npm ci）')
-
-  // 5. install 成功但 re2 rebuild 失败 → throw
-  assert.throws(() => ensureDependencies(makeDepsMock({ re2Error: dlopenFailed(), rebuildResult: { status: 1 } })), /re2 原生模块恢复失败/, 'rebuild 退出码非 0 应抛错')
-
-  // 6. 安装+rebuild 都成功但恢复后仍不可用 → throw（got 始终不可加载模拟恢复失败）
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound() })), /依赖恢复后 got 仍不可用/, '恢复后仍不可用应抛错')
-
-  // 7. spawnSync 返回 error 对象 → throw install.error
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { error: new Error('spawn ENOENT'), status: null } })), /spawn ENOENT/, 'spawnSync 返回 error 应抛出该错误')
-
-  // ===== QX-01 回归：依赖探测与 Node 常规解析同口径 =====
-  // 常规解析可用（require('got')/require('re2') 成功）、而固定路径 ROOT/node_modules/<pkg> 不可用时，
-  // 必须判为「可用」——既不抛错，也不触发 npm 安装。旧实现只探测固定路径：同一 mock 下会走
-  // 自动安装 + re2 重建后仍失败，最终抛「依赖恢复后 got 仍不可用」。
-  const resolutionOnly = {
-    spawnCallCount: 0,
-    requireFn: (id) => {
-      if (id === 'got' || id === 're2') return {}
-      const e = new Error(`Cannot find module '${id}'`)
-      e.code = 'MODULE_NOT_FOUND'
-      throw e
-    },
-    spawnSyncFn: () => { resolutionOnly.spawnCallCount += 1; return { status: 0 } },
-    env: { XBK_AUTO_INSTALL_DEPS: '1' },
-    lockExists: () => true
-  }
-  assert.strictEqual(ensureDependencies(resolutionOnly), undefined, '常规解析可用时不得判为依赖缺失（QX-01 回归）')
-  assert.strictEqual(resolutionOnly.spawnCallCount, 0, '常规解析可用时不得触发 npm 安装/重建')
-
-  // 反向兜底仍在：常规解析不可用、固定路径可用 → 同样判为可用且不安装
-  const fixedPathOnly = {
-    spawnCallCount: 0,
-    requireFn: (id) => {
-      if (path.isAbsolute(id)) return {}
-      const e = new Error(`Cannot find module '${id}'`)
-      e.code = 'MODULE_NOT_FOUND'
-      throw e
-    },
-    spawnSyncFn: () => { fixedPathOnly.spawnCallCount += 1; return { status: 0 } },
-    env: {},
-    lockExists: () => true
-  }
-  assert.strictEqual(ensureDependencies(fixedPathOnly), undefined, '固定路径兜底应仍然有效（常规解析失败时回退）')
-  assert.strictEqual(fixedPathOnly.spawnCallCount, 0, '固定路径命中时不得触发安装')
-
-  // ===== QX-04：依赖恢复命令必须冻结（有锁文件 → npm ci；无锁文件 → install --no-package-lock）=====
-  // installed 翻转模拟「安装后依赖变为可加载」，让 ensureDependencies 走完整条恢复路径。
-  const makeInstallMock = (lockExists) => {
-    const mock = {
-      installed: false,
-      calls: [],
-      requireFn: (id) => {
-        const base = path.basename(id)
-        if (base === 'got' || base === 're2') {
-          if (mock.installed) return {}
-          const e = new Error(`Cannot find module '${id}'`)
-          e.code = 'MODULE_NOT_FOUND'
-          throw e
-        }
-        return {}
-      },
-      spawnSyncFn: (cmd, args) => {
-        mock.calls.push({ cmd, args })
-        if (args[0] === 'ci' || args[0] === 'install') mock.installed = true
-        return { status: 0 }
-      },
-      env: { XBK_AUTO_INSTALL_DEPS: '1' },
-      lockExists
-    }
-    return mock
-  }
-
-  const ciMock = makeInstallMock(() => true)
-  assert.strictEqual(ensureDependencies(ciMock), undefined, '恢复成功应返回 undefined')
-  assert.strictEqual(ciMock.calls.length, 1, '恢复只应触发一次安装（re2 安装后即可加载，无需重建）')
-  assert.strictEqual(ciMock.calls[0].args[0], 'ci', '有 package-lock.json 时必须用冻结安装 npm ci（QX-04 回归）')
-  assert.ok(!ciMock.calls[0].args.includes('--no-package-lock'), 'npm ci 不应再带 --no-package-lock')
-  assert.ok(ciMock.calls[0].args.includes('--omit=dev') && ciMock.calls[0].args.includes('--ignore-scripts'), 'ci 仍须保留 --omit=dev / --ignore-scripts')
-
-  const noLockMock = makeInstallMock(() => false)
-  assert.strictEqual(ensureDependencies(noLockMock), undefined, '无锁文件时退回 install 也应能恢复')
-  assert.strictEqual(noLockMock.calls[0].args[0], 'install', '无锁文件时退回 npm install')
-  assert.ok(noLockMock.calls[0].args.includes('--no-package-lock'), '退回 install 时必须带 --no-package-lock（不再在部署目录生成/改写锁文件）')
+  // ===== ensureDependencies：唯一 harness = 子进程探针（C5-060 去重） =====
+  // 这里原先还有一份「进程内 mock 直调」的副本（~120 行），与文件末尾的子进程探针各覆盖一遍同一个
+  // ensureDependencies，两份的断言维度不同：直调能断言返回值/调用序，探针能看 spawns/console/退出码，
+  // 而它们各自漏掉的分支不会互相提醒（实测：把生产里的「未设置 XBK_AUTO_INSTALL_DEPS 即抛错」整段删掉，
+  // 只留探针的版本仍全绿）。去重口径＝**先迁维度、再删副本**：直调独有的两条（未开自动安装、npm 安装
+  // 非零退出）已并入探针的 deps.autoInstallOff / deps.installFails，其余维度由 deps.* 具名场景逐条覆盖
+  // （okBoth / fixedFallback 锁 QX-01 的「常规解析优先 + 固定路径兜底」，missingGotWithLock /
+  // missingGotNoLock 锁 QX-04 的「有锁 ci、无锁 install --no-package-lock」）。断言一条没少。
 
   // ===== QX-02：--dry-run 一次性执行 =====
   // runDryRunOnce 只跑一轮：成功 → 0，全失败 → 1（不做常驻退避重试）。
@@ -381,7 +267,8 @@ const deps = async (spec) => {
   const r = await cap(() => mod.ensureDependencies({
     requireFn: requireFn,
     spawnSyncFn: spawnSyncFn,
-    env: { XBK_AUTO_INSTALL_DEPS: '1' },
+    // autoInstall:false 模拟「未设置 XBK_AUTO_INSTALL_DEPS」的部署（C5-060 迁移自旧直调副本的唯一维度之一）
+    env: spec.autoInstall === false ? {} : { XBK_AUTO_INSTALL_DEPS: '1' },
     lockExists: () => spec.lock !== false
   }))
   r.calls = calls
@@ -416,6 +303,11 @@ const deps = async (spec) => {
   out.deps.rebuildSpawnError = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] })
   out.deps.rebuildExit7 = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] })
   out.deps.gotEaccesAfterInstall = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] })
+  // C5-060：旧直调副本里有两个维度是子进程探针原先没覆盖的（auto-install 未开、npm 安装非零退出）。
+  // 去重前先把它们迁进来，否则删掉副本就等于丢覆盖（实测：把生产里的「未设置自动安装即抛错」整段删掉，
+  // 只留探针的版本仍然全绿）。
+  out.deps.autoInstallOff = await deps({ bare: { got: 'nf', re2: 'ok' }, autoInstall: false })
+  out.deps.installFails = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ result: { status: 4 } }] })
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: path.join(ROOT, 'abs-cache') } })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: {} })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' } })))
@@ -505,6 +397,15 @@ const deps = async (spec) => {
   assert.strictEqual(d.deps.rebuildSpawnError.thrown && d.deps.rebuildSpawnError.thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
   assert.strictEqual(d.deps.rebuildExit7.thrown && d.deps.rebuildExit7.thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
   assert.strictEqual(d.deps.gotEaccesAfterInstall.thrown && d.deps.gotEaccesAfterInstall.thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
+
+  // --- 迁移自旧直调副本的两个维度（C5-060）：未开自动安装必须给部署提示且零 spawn；npm 安装非零退出必须带真实退出码 ---
+  assert.match(String(d.deps.autoInstallOff.thrown && d.deps.autoInstallOff.thrown.message),
+    /^检测到 got 依赖或原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm rebuild re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1。/,
+    '未设置 XBK_AUTO_INSTALL_DEPS 时必须抛出带部署命令（npm ci --omit=dev --ignore-scripts && npm rebuild re2）的提示错误')
+  assert.strictEqual(d.deps.autoInstallOff.spawns.length, 0, '未设置自动安装时不得触发任何 npm 子进程')
+  assert.deepStrictEqual(d.deps.autoInstallOff.warns, [], '未设置自动安装时不得打印「已执行恢复」告警')
+  assert.strictEqual(d.deps.installFails.thrown && d.deps.installFails.thrown.message, 'npm ci 失败，退出码 4', '安装非零退出必须报 npm ci 失败并带真实退出码')
+  assert.strictEqual(d.deps.installFails.spawns.length, 1, '安装失败必须立刻中止，不得继续 rebuild')
 
   // --- retryBackoffMs / statusCacheDir / nodeVersionWarning ---
   assert.deepStrictEqual(d.backoff, [1, 1, 1000, 1000], 'cap=1 是合法下界必须生效，非法 cap 回退默认 30 分钟封顶（1000 起步）')
