@@ -205,6 +205,10 @@ function collectMutants (files) {
 // 「测试代码本身」这个有界、可枚举、与判定强相关的集合。夹具改动的残余口径缺口见 fix-fx6 报告。
 function judgingTestFiles () {
   return ['run_unit_tests.js', 'test_suites.js',
+    // C5-044：test/ 下的共享 helper 也是「参与判定的测试代码」——test_mutation_report.js 与
+    // test_mutation_report_cli.js 顶层 require 它，改它同样会改变哪些变异体被杀；漏在清单外时
+    // 指纹不随它变化，断点续跑会静默继承旧判定。
+    'test/_yaml.js',
     ...SUITES.filter(s => !s.integration && !s.mutationSkip).map(s => s.file)]
 }
 
@@ -305,9 +309,11 @@ function copyProject (dir, files) {
   }
   // 目录整体复制：scripts/ 与 qinglong/ 是部分测试的依赖；.github/ 是 CI 清单
   // （test_ci_skip_suites.js 要读 test.yml 与 mutation.yml 对账，缺一个就 ENOENT 误判失败，同 #120/#122 口径）
-  // 三者同为必选（D3）：此前的 if (fs.existsSync) 是静默可选，目录一旦丢失同样留下 evaluate 恒 fail 的
+  // test/ 是测试共享 helper 目录（test/_yaml.js）：test_mutation_report.js 与 test_mutation_report_cli.js
+  // 顶层 require('./test/_yaml')，不拷则沙箱内 MODULE_NOT_FOUND → 套件整体红 → 每个变异体被误判 killed（C5-044）。
+  // 四者同为必选（D3）：此前的 if (fs.existsSync) 是静默可选，目录一旦丢失同样留下 evaluate 恒 fail 的
   // 不响亮回归，与文件清单的必选口径不一致——现改为缺失即 throw。
-  for (const sub of ['scripts', 'qinglong', '.github']) {
+  for (const sub of ['scripts', 'qinglong', '.github', 'test']) {
     const srcDir = path.join(ROOT, sub)
     if (!fs.existsSync(srcDir)) throw new Error(`copyProject 缺少必要目录: ${sub}`)
     fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })

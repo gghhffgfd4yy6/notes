@@ -13,7 +13,34 @@ const {
   nodeVersionWarning
 } = require('./qinglong/xbk_push')
 
-;(async () => {
+// console 三路的**唯二**允许改写点（C5-063）：基线在这里取一次，捕获函数必须在 finally 里还原到基线。
+// 旧写法在两个并发的顶层 IIFE 里各改一次 console，前半段的静音正好罩住后半段的同步前缀 ⇒ 后半段的
+// 完成行与失败输出被吞掉（实测：整套只打印一条 OK）。
+const NATIVE_CONSOLE = Object.freeze({ log: console.log, warn: console.warn, error: console.error })
+async function captureConsole (fn) {
+  const logs = []
+  const warns = []
+  const errs = []
+  console.log = (...a) => { logs.push(a.join(' ')) }
+  console.warn = (...a) => { warns.push(a.join(' ')) }
+  console.error = (...a) => { errs.push(a.join(' ')) }
+  let value
+  try {
+    value = await fn()
+  } finally {
+    console.log = NATIVE_CONSOLE.log
+    console.warn = NATIVE_CONSOLE.warn
+    console.error = NATIVE_CONSOLE.error
+  }
+  return { value, logs, warns, errs }
+}
+
+// 第一段：纯函数 + ensureDependencies 的进程内断言（依赖恢复的边界分支在文末的子进程探针里）。
+const runUnitChecks = async () => {
+  // 导出面守卫（C5-060 去重后仍需要这个符号：真正调用它的是文末的子进程探针，这里是「本套件确实在测它」的
+  // 显式声明，删掉导出一行即红——否则误删 import 后本套件会安静地只剩探针那一侧）。
+  assert.strictEqual(typeof ensureDependencies, 'function', 'ensureDependencies 必须由 qinglong/xbk_push 导出')
+
   // ===== shouldAutoInstallDependencies =====
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '1' }), true, '设置为 1 应返回 true')
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '0' }), false, '设置为 0 应返回 false')
@@ -51,152 +78,34 @@ const {
   assert.strictEqual(retryBackoffMs(2, { XBK_RETRY_BACKOFF_CAP_MS: '0' }), 2000, 'cap=0 应回退默认（<1）')
   assert.strictEqual(retryBackoffMs(2, null), 2000, 'null env 应回退默认')
 
-  // ===== ensureDependencies：更多边界分支 =====
-  // 统一 mock 构造器：消除 7 个用例间重复的 requireFn/spawnSyncFn 样板
-  // spawnCallCount：记录 spawnSyncFn 被调用次数，用于负向断言——依赖正常时不得触发安装/重建
-  // spawnCalls：记录每次调用的参数，用于断言实际执行的 npm 子命令（QX-04）
-  // lockExists：默认 true，令恢复命令固定为 npm ci（不依赖跑测试时仓库根是否存在锁文件）
-  const makeDepsMock = ({ gotError = null, re2Error = null, installResult = { status: 0 }, rebuildResult = { status: 0 }, autoInstall = true, lockExists = () => true } = {}) => {
-    const mock = {
-      spawnCallCount: 0,
-      spawnCalls: [],
-      requireFn: (id) => {
-        const base = path.basename(id)
-        if (base === 'got' && gotError) throw gotError
-        if (base === 're2' && re2Error) throw re2Error
-        return {}
-      },
-      spawnSyncFn: (cmd, args) => {
-        mock.spawnCallCount += 1
-        mock.spawnCalls.push({ cmd, args })
-        return args[0] === 'rebuild' && args[1] === 're2' ? rebuildResult : installResult
-      },
-      env: autoInstall ? { XBK_AUTO_INSTALL_DEPS: '1' } : {},
-      lockExists
-    }
-    return mock
-  }
-  const modNotFound = () => { const e = new Error('Cannot find module'); e.code = 'MODULE_NOT_FOUND'; return e }
-  const dlopenFailed = () => { const e = new Error('Native mismatch'); e.code = 'ERR_DLOPEN_FAILED'; return e }
-
-  // 1. got 和 re2 都可加载 → 返回 undefined（不抛错），且不得触发 spawnSync（安装/重建）
-  const normalMock = makeDepsMock()
-  assert.strictEqual(ensureDependencies(normalMock), undefined, '两个依赖都可加载时应返回 undefined')
-  assert.strictEqual(normalMock.spawnCallCount, 0, '依赖正常时不得触发 spawnSync（安装/重建）——负向断言，防未来重排漏判')
-
-  // 2. 不可恢复错误（非 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）直接 throw，不尝试安装
-  const unrecoverable = new Error('Unexpected runtime error')
-  unrecoverable.code = 'E_RANDOM'
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: unrecoverable })), /Unexpected runtime error/, '不可恢复错误应直接抛出，不尝试自动安装')
-
-  // 3. 可恢复错误但未设置自动安装 → 抛明确提示错误
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), autoInstall: false })), /got 依赖或原生模块未完整安装/, '未设置 XBK_AUTO_INSTALL_DEPS 时应抛提示错误')
-
-  // 4. npm install 失败（status != 0）→ throw
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { status: 1 } })), /npm ci 失败/, '安装退出码非 0 应抛错（有锁文件时为 npm ci）')
-
-  // 5. install 成功但 re2 rebuild 失败 → throw
-  assert.throws(() => ensureDependencies(makeDepsMock({ re2Error: dlopenFailed(), rebuildResult: { status: 1 } })), /re2 原生模块恢复失败/, 'rebuild 退出码非 0 应抛错')
-
-  // 6. 安装+rebuild 都成功但恢复后仍不可用 → throw（got 始终不可加载模拟恢复失败）
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound() })), /依赖恢复后 got 仍不可用/, '恢复后仍不可用应抛错')
-
-  // 7. spawnSync 返回 error 对象 → throw install.error
-  assert.throws(() => ensureDependencies(makeDepsMock({ gotError: modNotFound(), installResult: { error: new Error('spawn ENOENT'), status: null } })), /spawn ENOENT/, 'spawnSync 返回 error 应抛出该错误')
-
-  // ===== QX-01 回归：依赖探测与 Node 常规解析同口径 =====
-  // 常规解析可用（require('got')/require('re2') 成功）、而固定路径 ROOT/node_modules/<pkg> 不可用时，
-  // 必须判为「可用」——既不抛错，也不触发 npm 安装。旧实现只探测固定路径：同一 mock 下会走
-  // 自动安装 + re2 重建后仍失败，最终抛「依赖恢复后 got 仍不可用」。
-  const resolutionOnly = {
-    spawnCallCount: 0,
-    requireFn: (id) => {
-      if (id === 'got' || id === 're2') return {}
-      const e = new Error(`Cannot find module '${id}'`)
-      e.code = 'MODULE_NOT_FOUND'
-      throw e
-    },
-    spawnSyncFn: () => { resolutionOnly.spawnCallCount += 1; return { status: 0 } },
-    env: { XBK_AUTO_INSTALL_DEPS: '1' },
-    lockExists: () => true
-  }
-  assert.strictEqual(ensureDependencies(resolutionOnly), undefined, '常规解析可用时不得判为依赖缺失（QX-01 回归）')
-  assert.strictEqual(resolutionOnly.spawnCallCount, 0, '常规解析可用时不得触发 npm 安装/重建')
-
-  // 反向兜底仍在：常规解析不可用、固定路径可用 → 同样判为可用且不安装
-  const fixedPathOnly = {
-    spawnCallCount: 0,
-    requireFn: (id) => {
-      if (path.isAbsolute(id)) return {}
-      const e = new Error(`Cannot find module '${id}'`)
-      e.code = 'MODULE_NOT_FOUND'
-      throw e
-    },
-    spawnSyncFn: () => { fixedPathOnly.spawnCallCount += 1; return { status: 0 } },
-    env: {},
-    lockExists: () => true
-  }
-  assert.strictEqual(ensureDependencies(fixedPathOnly), undefined, '固定路径兜底应仍然有效（常规解析失败时回退）')
-  assert.strictEqual(fixedPathOnly.spawnCallCount, 0, '固定路径命中时不得触发安装')
-
-  // ===== QX-04：依赖恢复命令必须冻结（有锁文件 → npm ci；无锁文件 → install --no-package-lock）=====
-  // installed 翻转模拟「安装后依赖变为可加载」，让 ensureDependencies 走完整条恢复路径。
-  const makeInstallMock = (lockExists) => {
-    const mock = {
-      installed: false,
-      calls: [],
-      requireFn: (id) => {
-        const base = path.basename(id)
-        if (base === 'got' || base === 're2') {
-          if (mock.installed) return {}
-          const e = new Error(`Cannot find module '${id}'`)
-          e.code = 'MODULE_NOT_FOUND'
-          throw e
-        }
-        return {}
-      },
-      spawnSyncFn: (cmd, args) => {
-        mock.calls.push({ cmd, args })
-        if (args[0] === 'ci' || args[0] === 'install') mock.installed = true
-        return { status: 0 }
-      },
-      env: { XBK_AUTO_INSTALL_DEPS: '1' },
-      lockExists
-    }
-    return mock
-  }
-
-  const ciMock = makeInstallMock(() => true)
-  assert.strictEqual(ensureDependencies(ciMock), undefined, '恢复成功应返回 undefined')
-  assert.strictEqual(ciMock.calls.length, 1, '恢复只应触发一次安装（re2 安装后即可加载，无需重建）')
-  assert.strictEqual(ciMock.calls[0].args[0], 'ci', '有 package-lock.json 时必须用冻结安装 npm ci（QX-04 回归）')
-  assert.ok(!ciMock.calls[0].args.includes('--no-package-lock'), 'npm ci 不应再带 --no-package-lock')
-  assert.ok(ciMock.calls[0].args.includes('--omit=dev') && ciMock.calls[0].args.includes('--ignore-scripts'), 'ci 仍须保留 --omit=dev / --ignore-scripts')
-
-  const noLockMock = makeInstallMock(() => false)
-  assert.strictEqual(ensureDependencies(noLockMock), undefined, '无锁文件时退回 install 也应能恢复')
-  assert.strictEqual(noLockMock.calls[0].args[0], 'install', '无锁文件时退回 npm install')
-  assert.ok(noLockMock.calls[0].args.includes('--no-package-lock'), '退回 install 时必须带 --no-package-lock（不再在部署目录生成/改写锁文件）')
+  // ===== ensureDependencies：唯一 harness = 子进程探针（C5-060 去重） =====
+  // 这里原先还有一份「进程内 mock 直调」的副本（~120 行），与文件末尾的子进程探针各覆盖一遍同一个
+  // ensureDependencies，两份的断言维度不同：直调能断言返回值/调用序，探针能看 spawns/console/退出码，
+  // 而它们各自漏掉的分支不会互相提醒（实测：把生产里的「未设置 XBK_AUTO_INSTALL_DEPS 即抛错」整段删掉，
+  // 只留探针的版本仍全绿）。去重口径＝**先迁维度、再删副本**：直调独有的两条（未开自动安装、npm 安装
+  // 非零退出）已并入探针的 deps.autoInstallOff / deps.installFails，其余维度由 deps.* 具名场景逐条覆盖
+  // （okBoth / fixedFallback 锁 QX-01 的「常规解析优先 + 固定路径兜底」，missingGotWithLock /
+  // missingGotNoLock 锁 QX-04 的「有锁 ci、无锁 install --no-package-lock」）。断言一条没少。
 
   // ===== QX-02：--dry-run 一次性执行 =====
   // runDryRunOnce 只跑一轮：成功 → 0，全失败 → 1（不做常驻退避重试）。
-  const origLog = console.log
-  const origErr = console.error
-  console.log = () => {}
-  console.error = () => {}
+  // 输出用 captureConsole 局部捕获（C5-063）：旧写法直接 `console.log = () => {}` 静音整个进程，
+  // 在 `await` 窗口里连并发段的输出一起吞掉；现在只包住这两次调用，finally 还原到模块加载时的基线。
   let dryRunCalls = 0
-  let dryRunCode
-  let dryRunFailCode
-  try {
-    dryRunCode = await runDryRunOnce({ run: async () => { dryRunCalls += 1; return { total: 3, filtered: 1, pushed: 0, failed: 0 } } })
-    dryRunFailCode = await runDryRunOnce({ run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'E_NET', statusCode: 503 }] }) })
-  } finally {
-    console.log = origLog
-    console.error = origErr
-  }
+  const dryRun = await captureConsole(async () => {
+    const code = await runDryRunOnce({ run: async () => { dryRunCalls += 1; return { total: 3, filtered: 1, pushed: 0, failed: 0 } } })
+    const failCode = await runDryRunOnce({ run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'E_NET', statusCode: 503 }] }) })
+    return { code, failCode }
+  })
+  const dryRunCode = dryRun.value.code
+  const dryRunFailCode = dryRun.value.failCode
   assert.strictEqual(dryRunCalls, 1, 'dry-run 只能调用 app.run() 一次（一次性执行）')
   assert.strictEqual(dryRunCode, 0, '单轮成功应返回退出码 0')
   assert.strictEqual(dryRunFailCode, 1, '单轮全失败应返回退出码 1')
+  assert.deepStrictEqual(dryRun.logs, ['dry-run 单轮完成：共 3 条，过滤 1 条，未推送、未写成功缓存'],
+    '捕获范围内必须能看到成功轮的完成行（证明捕获确实包住了被测调用，且没漏到宿主 stdout）')
+  assert.strictEqual(dryRun.errs.length, 1, '失败轮必须经 console.error 报一条根因')
+  assert.strictEqual(console.log, NATIVE_CONSOLE.log, 'captureConsole 必须把 console.log 还原到基线（不得泄漏到后续代码）')
 
   // 接线断言（与 test_cli.js:31 同一种源码级手法）：main() 的 --dry-run 分支必须调用 runDryRunOnce
   // 并 return，绝不能继续落到 runResident(...)。回退旧行为（只设 XBK_DRY_RUN=1 即常驻）时本断言必红。
@@ -313,13 +222,19 @@ const {
   }
 
   console.log('test_qinglong_utils OK')
-})().catch((e) => { console.error(e); process.exit(1) })
+}
 
 // ===== 追加：qinglong/xbk_push.js「入口」契约回归（QX-02/QX-04/QX-05/QX-08/QX-09）=====
 // 断言对着 SYSTEM_CONTRACT.md 的「入口」条：退出码语义、失败文案、可恢复判定、恢复命令、
-// 包名白名单 fail-closed、缓存目录口径。可观测输出（console 三路/退出码）一律在独立子进程取，
-// 避免与既有套件并发共享 console/process.stdout 造成捕获串扰；不依赖时区/网络/遍历顺序。
-;(async () => {
+// 包名白名单 fail-closed、缓存目录口径。可观测输出（console 三路/退出码）一律在独立子进程取——
+// 本段确实不读宿主 console，但**上面那一段会临时改写 console**，所以两段必须串行（见文件末尾的
+// runUnitChecks().then(runEntryContractChecks)）：并发时本段的同步前缀会落在上一段的捕获窗口里，
+// 完成行与失败诊断都会被吞掉（C5-063 实测）。
+const runEntryContractChecks = async () => {
+  // 宿主 console 基线核对（C5-063）：上面那段用 captureConsole 临时换掉三路 console，必须在它 resolve
+  // 之前还原。这条断言是「两段串行 + 捕获成对」的可执行判据——两段重新并发时它会立刻红（实测于旧结构）。
+  assert.strictEqual(console.log, NATIVE_CONSOLE.log, '上一段的 console 捕获必须在 await 前后成对还原（C5-063）')
+  assert.strictEqual(console.error, NATIVE_CONSOLE.error, '上一段的 console.error 捕获必须已还原（C5-063）')
   const ENTRY = path.join(__dirname, 'qinglong', 'xbk_push.js')
   const CHILD = `'use strict'
 const path = require('path')
@@ -375,13 +290,16 @@ const deps = async (spec) => {
     spawns.push({ cmd: cmd, args: args, cwd: opts && opts.cwd, stdio: opts && opts.stdio, timeout: opts && opts.timeout })
     const step = plan[n] || {}
     n += 1
+    // after: 安装/重建之后被测代码会再 load 一次——用它模拟「装完就好了」与「装完变成另一种错误」。
     if (step.after === 'eaccesGot') bare.got = { code: 'EACCES' }
+    if (step.after === 'installed') { bare.got = 'ok'; bare.re2 = 'ok' }
     return step.result || { status: 0 }
   }
   const r = await cap(() => mod.ensureDependencies({
     requireFn: requireFn,
     spawnSyncFn: spawnSyncFn,
-    env: { XBK_AUTO_INSTALL_DEPS: '1' },
+    // autoInstall:false 模拟「未设置 XBK_AUTO_INSTALL_DEPS」的部署（C5-060 迁移自旧直调副本的唯一维度之一）
+    env: spec.autoInstall === false ? {} : { XBK_AUTO_INSTALL_DEPS: '1' },
     lockExists: () => spec.lock !== false
   }))
   r.calls = calls
@@ -401,19 +319,34 @@ const deps = async (spec) => {
     okOf([{ message: 'MA' }, { code: 'CODEONLY' }, { providerCode: 'PONLY' }]),
     okOf([{ message: '', code: '' }])
   ]
-  const out = { root: ROOT, nodeModules: NODE_MODULES, dry: [], deps: [], cache: [], backoff: [], version: [] }
+  const out = { root: ROOT, nodeModules: NODE_MODULES, dry: [], deps: {}, cache: [], backoff: [], version: [] }
   for (let i = 0; i < dryCases.length; i += 1) out.dry.push(await cap(() => mod.runDryRunOnce({ run: async () => dryCases[i] })))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'ok' } }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'nf' }, fixed: { got: 'ok', re2: 'ok' } }))
-  out.deps.push(await deps({ bare: { got: { code: 'ERR_DLOPEN_FAILED', message: 'dlopen failed' }, re2: 'ok' } }))
-  out.deps.push(await deps({ nullThrow: true }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' } }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' } }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: { code: 'EACCES', message: 'permission denied' } } }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] }))
-  out.deps.push(await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] }))
-  out.deps.push(await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] }))
+  // 场景一律具名（C5-062）：下标只是 push 顺序，不是契约。新增场景插在中间时，
+  // 父进程的断言按名字取用，不会静默换人。
+  out.deps.okBoth = await deps({ bare: { got: 'ok', re2: 'ok' } })
+  out.deps.fixedFallback = await deps({ bare: { got: 'nf', re2: 'nf' }, fixed: { got: 'ok', re2: 'ok' } })
+  out.deps.dlopenGot = await deps({ bare: { got: { code: 'ERR_DLOPEN_FAILED', message: 'dlopen failed' }, re2: 'ok' } })
+  out.deps.nullThrow = await deps({ nullThrow: true })
+  out.deps.missingGotWithLock = await deps({ bare: { got: 'nf', re2: 'ok' } })
+  out.deps.missingGotNoLock = await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false })
+  out.deps.dlopenRe2 = await deps({ bare: { got: 'ok', re2: 'dlopen' } })
+  out.deps.unrecoverableRe2 = await deps({ bare: { got: 'ok', re2: { code: 'EACCES', message: 'permission denied' } } })
+  out.deps.rebuildSpawnError = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] })
+  out.deps.rebuildExit7 = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] })
+  out.deps.gotEaccesAfterInstall = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] })
+  // C5-060：旧直调副本里有两个维度是子进程探针原先没覆盖的（auto-install 未开、npm 安装非零退出）。
+  // 去重前先把它们迁进来，否则删掉副本就等于丢覆盖（实测：把生产里的「未设置自动安装即抛错」整段删掉，
+  // 只留探针的版本仍然全绿）。
+  out.deps.autoInstallOff = await deps({ bare: { got: 'nf', re2: 'ok' }, autoInstall: false })
+  out.deps.installFails = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ result: { status: 4 } }] })
+  // C5-060：安装子进程**自身**失败（spawn ENOENT，连退出码都没有）是 install.status 之外的另一条出口，
+  // 生产用 if (install.error) throw install.error 单独兜住这条出口，与下面的非零退出分支是两条独立断言。旧直调副本用 installResult:{error} 锁的就是这条；
+  // 只覆盖「非零退出」时，删掉那句 throw 后套件仍绿（实测变异体存活）。
+  out.deps.installSpawnError = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ result: { error: { message: 'spawn ENOENT' } } }] })
+  // 恢复**成功**的出口（QX-04 的正常路径）：装完依赖可加载 ⇒ 必须静默返回 undefined，既不 rebuild 也不报错。
+  // 旧直调副本用 installed 翻转锁的就是这条出口；只留「装完仍不可用」的场景时，「装完一律报错」的变异体无一能杀。
+  out.deps.installRecovers = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'installed' }] })
+  out.deps.installRecoversNoLock = await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false, plan: [{ after: 'installed' }] })
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: path.join(ROOT, 'abs-cache') } })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: {} })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' } })))
@@ -441,6 +374,12 @@ const deps = async (spec) => {
   const NODE_MODULES = d.nodeModules
   const ROOT = d.root
 
+  // 用例表必须以**具名 key** 暴露（C5-062）：旧写法是 `d.deps[N]`，下标即契约——在中间插一条新场景，
+  // 后面 30 多条断言会静默指向别的场景，且报错文案（`d.deps[7].thrown.code`）照样通顺，最难查。
+  // 这条断言先于所有 deps 断言执行：本套件任何一次「按下标取场景」的回潮都会在这里红。
+  assert.ok(d.deps && !Array.isArray(d.deps) && typeof d.deps === 'object',
+    `ensureDependencies 用例表必须是以场景名称为 key 的对象（不得再用 d.deps[N] 的 push 顺序），实际类型：${Array.isArray(d.deps) ? 'Array' : typeof d.deps}`)
+
   // --- runDryRunOnce：退出码与一次性语义（--dry-run 单轮成功 0 / 失败 1，不做退避重试）---
   assert.strictEqual(d.dry[0].value, 0, '--dry-run 单轮成功必须返回退出码 0')
   assert.deepStrictEqual(d.dry[0].logs, ['dry-run 单轮完成：共 5 条，过滤 2 条，未推送、未写成功缓存'], '成功文案必须精确（杀 success 文案变异体）')
@@ -465,38 +404,55 @@ const deps = async (spec) => {
   }
 
   // --- ensureDependencies：Node 解析口径优先，解析不到才回退固定 node_modules 子路径 ---
-  assert.strictEqual(d.deps[0].thrown, null, '依赖齐备不得抛错')
-  assert.deepStrictEqual(d.deps[0].calls, ['got', 're2'], '两模块均可解析时只做裸解析（与 --check 同口径）')
-  assert.deepStrictEqual(d.deps[0].spawns, [], '已完整安装时不得触发安装')
-  assert.strictEqual(d.deps[1].thrown, null, '固定路径解析成功即视为已恢复')
-  assert.deepStrictEqual(d.deps[1].calls, ['got', path.join(NODE_MODULES, 'got'), 're2', path.join(NODE_MODULES, 're2')], '裸解析失败后必须回退到固定 node_modules 直接子路径')
-  assert.deepStrictEqual(d.deps[1].spawns, [], '固定路径命中时不得安装')
-  assert.deepStrictEqual(d.deps[2].calls, ['got', 're2', 're2', 'got', 're2'], '非 MODULE_NOT_FOUND 说明模块已定位，不得回退固定路径')
-  assert.strictEqual(d.deps[2].spawns.length, 1, 'ERR_DLOPEN_FAILED 属可恢复，必须触发一次恢复安装')
-  assert.deepStrictEqual(d.deps[2].warns, [OK_MSG], '恢复前必须打印与 --check 同源的恢复告警')
-  assert.strictEqual(d.deps[3].thrown, null, 'load 的非模块错误判定必须先看 error 本身，不得解引用 null.code')
-  assert.strictEqual(d.deps[3].spawns.length, 0, '抛非对象错误时不得进入安装')
+  assert.strictEqual(d.deps.okBoth.thrown, null, '依赖齐备不得抛错')
+  assert.deepStrictEqual(d.deps.okBoth.calls, ['got', 're2'], '两模块均可解析时只做裸解析（与 --check 同口径）')
+  assert.deepStrictEqual(d.deps.okBoth.spawns, [], '已完整安装时不得触发安装')
+  assert.strictEqual(d.deps.fixedFallback.thrown, null, '固定路径解析成功即视为已恢复')
+  assert.deepStrictEqual(d.deps.fixedFallback.calls, ['got', path.join(NODE_MODULES, 'got'), 're2', path.join(NODE_MODULES, 're2')], '裸解析失败后必须回退到固定 node_modules 直接子路径')
+  assert.deepStrictEqual(d.deps.fixedFallback.spawns, [], '固定路径命中时不得安装')
+  assert.deepStrictEqual(d.deps.dlopenGot.calls, ['got', 're2', 're2', 'got', 're2'], '非 MODULE_NOT_FOUND 说明模块已定位，不得回退固定路径')
+  assert.strictEqual(d.deps.dlopenGot.spawns.length, 1, 'ERR_DLOPEN_FAILED 属可恢复，必须触发一次恢复安装')
+  assert.deepStrictEqual(d.deps.dlopenGot.warns, [OK_MSG], '恢复前必须打印与 --check 同源的恢复告警')
+  assert.strictEqual(d.deps.nullThrow.thrown, null, 'load 的非模块错误判定必须先看 error 本身，不得解引用 null.code')
+  assert.strictEqual(d.deps.nullThrow.spawns.length, 0, '抛非对象错误时不得进入安装')
 
   // --- 恢复命令：有锁文件用冻结 npm ci，缺锁文件退化为 install --no-package-lock，恢复后仍失败则忠实报错 ---
-  assert.strictEqual(d.deps[4].thrown && d.deps[4].thrown.message, `依赖恢复后 got 仍不可用：Cannot find module '${path.join(NODE_MODULES, 'got')}'`, '恢复后仍不可用必须抛出带失败模块名的错误')
-  assert.strictEqual(d.deps[4].spawns.length, 1, '缺 got 只安装一次，不得多余重建')
-  assert.strictEqual(d.deps[4].spawns[0].cmd, 'npm', '恢复命令必须是 npm（非 win32 平台）')
-  assert.deepStrictEqual(d.deps[4].spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有 package-lock.json 时必须用冻结的 npm ci 且参数完整')
-  assert.strictEqual(d.deps[4].spawns[0].cwd, ROOT, '安装必须在项目根执行')
-  assert.strictEqual(d.deps[4].spawns[0].timeout, 120000, '安装必须有超时')
-  assert.deepStrictEqual(d.deps[4].warns, [OK_MSG], '有锁文件时不得输出退化 install 告警')
-  assert.deepStrictEqual(d.deps[5].warns, [OK_MSG, '未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）'], '缺锁文件必须显式告警退化')
-  assert.deepStrictEqual(d.deps[5].spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '缺锁文件时必须 install 且不得生成新锁文件')
-  assert.strictEqual(d.deps[6].spawns.length, 2, '先冻结安装，再只对仍不可用的 re2 执行一次 install-script 恢复')
-  assert.strictEqual(d.deps[6].spawns[1].cmd, 'npm', 're2 恢复必须调用 npm')
-  assert.deepStrictEqual(d.deps[6].spawns[1].args, ['rebuild', 're2'], 're2 恢复必须执行官方 install 生命周期以优先获取预编译包')
-  assert.strictEqual(d.deps[6].thrown && d.deps[6].thrown.message, '依赖恢复后 re2 仍不可用：dlopen failed', 're2 仍不可用必须以 re2 忠实命名')
-  assert.strictEqual(d.deps[7].spawns.length, 0, '不可恢复错误不得进入恢复流程')
-  assert.deepStrictEqual(d.deps[7].warns, [], '未进入恢复流程不得打印恢复告警')
-  assert.strictEqual(d.deps[7].thrown && d.deps[7].thrown.code, 'EACCES', '不可恢复错误必须原样抛出（只认 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）')
-  assert.strictEqual(d.deps[8].thrown && d.deps[8].thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
-  assert.strictEqual(d.deps[9].thrown && d.deps[9].thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
-  assert.strictEqual(d.deps[10].thrown && d.deps[10].thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
+  assert.strictEqual(d.deps.missingGotWithLock.thrown && d.deps.missingGotWithLock.thrown.message, `依赖恢复后 got 仍不可用：Cannot find module '${path.join(NODE_MODULES, 'got')}'`, '恢复后仍不可用必须抛出带失败模块名的错误')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns.length, 1, '缺 got 只安装一次，不得多余重建')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns[0].cmd, 'npm', '恢复命令必须是 npm（非 win32 平台）')
+  assert.deepStrictEqual(d.deps.missingGotWithLock.spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有 package-lock.json 时必须用冻结的 npm ci 且参数完整')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns[0].cwd, ROOT, '安装必须在项目根执行')
+  assert.strictEqual(d.deps.missingGotWithLock.spawns[0].timeout, 120000, '安装必须有超时')
+  assert.deepStrictEqual(d.deps.missingGotWithLock.warns, [OK_MSG], '有锁文件时不得输出退化 install 告警')
+  assert.deepStrictEqual(d.deps.missingGotNoLock.warns, [OK_MSG, '未找到 package-lock.json，退化为 npm install --no-package-lock（建议按 README 用 npm ci 部署以冻结依赖版本）'], '缺锁文件必须显式告警退化')
+  assert.deepStrictEqual(d.deps.missingGotNoLock.spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '缺锁文件时必须 install 且不得生成新锁文件')
+  assert.strictEqual(d.deps.dlopenRe2.spawns.length, 2, '先冻结安装，再只对仍不可用的 re2 执行一次 install-script 恢复')
+  assert.strictEqual(d.deps.dlopenRe2.spawns[1].cmd, 'npm', 're2 恢复必须调用 npm')
+  assert.deepStrictEqual(d.deps.dlopenRe2.spawns[1].args, ['rebuild', 're2'], 're2 恢复必须执行官方 install 生命周期以优先获取预编译包')
+  assert.strictEqual(d.deps.dlopenRe2.thrown && d.deps.dlopenRe2.thrown.message, '依赖恢复后 re2 仍不可用：dlopen failed', 're2 仍不可用必须以 re2 忠实命名')
+  assert.strictEqual(d.deps.unrecoverableRe2.spawns.length, 0, '不可恢复错误不得进入恢复流程')
+  assert.deepStrictEqual(d.deps.unrecoverableRe2.warns, [], '未进入恢复流程不得打印恢复告警')
+  assert.strictEqual(d.deps.unrecoverableRe2.thrown && d.deps.unrecoverableRe2.thrown.code, 'EACCES', '不可恢复错误必须原样抛出（只认 MODULE_NOT_FOUND/ERR_DLOPEN_FAILED）')
+  assert.strictEqual(d.deps.rebuildSpawnError.thrown && d.deps.rebuildSpawnError.thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
+  assert.strictEqual(d.deps.rebuildExit7.thrown && d.deps.rebuildExit7.thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
+  assert.strictEqual(d.deps.gotEaccesAfterInstall.thrown && d.deps.gotEaccesAfterInstall.thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
+
+  // --- 迁移自旧直调副本的两个维度（C5-060）：未开自动安装必须给部署提示且零 spawn；npm 安装非零退出必须带真实退出码 ---
+  assert.match(String(d.deps.autoInstallOff.thrown && d.deps.autoInstallOff.thrown.message),
+    /^检测到 got 依赖或原生模块未完整安装；请在部署阶段依次执行：npm ci --omit=dev --ignore-scripts && npm rebuild re2。如确需在本次运行时安装，请显式设置 XBK_AUTO_INSTALL_DEPS=1。/,
+    '未设置 XBK_AUTO_INSTALL_DEPS 时必须抛出带部署命令（npm ci --omit=dev --ignore-scripts && npm rebuild re2）的提示错误')
+  assert.strictEqual(d.deps.autoInstallOff.spawns.length, 0, '未设置自动安装时不得触发任何 npm 子进程')
+  assert.deepStrictEqual(d.deps.autoInstallOff.warns, [], '未设置自动安装时不得打印「已执行恢复」告警')
+  assert.strictEqual(d.deps.installFails.thrown && d.deps.installFails.thrown.message, 'npm ci 失败，退出码 4', '安装非零退出必须报 npm ci 失败并带真实退出码')
+  assert.strictEqual(d.deps.installFails.spawns.length, 1, '安装失败必须立刻中止，不得继续 rebuild')
+  assert.strictEqual(d.deps.installSpawnError.thrown && d.deps.installSpawnError.thrown.message, 'spawn ENOENT', '安装子进程自身失败（error 而非退出码）必须原样抛出，不得退化成「退出码 undefined」')
+  assert.strictEqual(d.deps.installSpawnError.spawns.length, 1, '安装子进程失败必须立刻中止，不得继续 rebuild')
+  assert.strictEqual(d.deps.installRecovers.thrown, null, '安装后依赖可加载时必须静默返回（恢复成功不得报错）')
+  assert.strictEqual(d.deps.installRecovers.spawns.length, 1, '恢复成功只应触发一次安装（re2 已可加载 ⇒ 不 rebuild）')
+  assert.deepStrictEqual(d.deps.installRecovers.spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有锁文件时恢复成功走的仍是冻结 npm ci')
+  assert.deepStrictEqual(d.deps.installRecovers.warns, [OK_MSG], '恢复成功只允许一条「已执行恢复」告警')
+  assert.strictEqual(d.deps.installRecoversNoLock.thrown, null, '无锁文件时 install 后依赖可加载同样必须静默返回')
+  assert.deepStrictEqual(d.deps.installRecoversNoLock.spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '无锁文件的恢复成功路径必须是 install --no-package-lock')
 
   // --- retryBackoffMs / statusCacheDir / nodeVersionWarning ---
   assert.deepStrictEqual(d.backoff, [1, 1, 1000, 1000], 'cap=1 是合法下界必须生效，非法 cap 回退默认 30 分钟封顶（1000 起步）')
@@ -522,4 +478,13 @@ const deps = async (spec) => {
   assert.strictEqual(unknown.stdout, '', '未知参数不得输出状态报告')
 
   console.log('test_qinglong_utils OK (entry contract)')
-})().catch((e) => { fs.writeSync(2, 'entry-contract FAIL: ' + (e && e.stack ? e.stack : String(e)) + '\n'); process.exit(1) })
+}
+
+// 两段**串行**执行（C5-063）：旧写法是两个并发的顶层 IIFE，第一段在 `await runDryRunOnce` 的窗口里
+// 把 console.log/error 换成空函数，第二段的同步前缀（构造子进程脚本 + spawnSync 探针 + 全部断言）
+// 正好整段落在那个窗口里 ⇒ 它的完成行与失败诊断被吞掉，且两段的断言顺序不可预期。
+// 串行后：第一段的捕获在 captureConsole 的 finally 里还原（第二段开工前那条 console 基线断言会核对），
+// 任一段抛错都走同一个 catch（打栈 + exit 1），不再各自抢着 process.exit。
+runUnitChecks()
+  .then(runEntryContractChecks)
+  .catch((e) => { fs.writeSync(2, 'test_qinglong_utils FAIL: ' + (e && e.stack ? e.stack : String(e)) + '\n'); process.exit(1) })
