@@ -63,7 +63,86 @@ function dependencyFailureReason (error) {
   return `${code}${message.split('\n')[0]}`
 }
 
-// ---- F4：Node 版本闸门 ----
+// ── C10-018：反向扫描（代码 require → package.json 声明）──
+// 此前只做正方向（声明 → 实例）：declared 清单每一项都探测装没装。反方向没人看：代码里
+// `require('foo')` 忘了写 dependencies 时，装过 foo 的机器（或 foo 恰好是某依赖的传递依赖）
+// 全绿，换一台精简安装的机器才炸，且报错点离改动很远。
+// 扫描面 = 随仓库分发的运行时文件（根目录 xbk_*.js / scripts/*.js / qinglong/*.js）；
+// test_*.js 与 run_*.js 不在其列：它们裸 require 的是 devDependencies（fast-check 等），
+// 口径不同，混在一起只会逼出例外名单。
+const RUNTIME_SOURCE_DIRS = Object.freeze([
+  ['.', (name) => name.startsWith('xbk_')],
+  ['scripts', () => true],
+  ['qinglong', () => true]
+])
+
+// 剥掉注释再找 require：注释里写一句 `require('x')` 不算（C5-020 的教训——判据被注释里的
+// 字样满足就是假绿）。按行处理而不是写引号状态机：本仓的注释都是行首 `//` / `*` / `/*`
+// 形态，行内 `//` 只在它前面没有引号时才算注释起点（`'http://x'` 这种字符串不被截断）。
+// 状态机版本实测会把 `require('fast-check')` 这类注释重新露出来（正则字面量里的引号会
+// 把状态带偏），判据要么过宽要么过窄，不如这条可解释的规则。
+function stripJsComments (source) {
+  return source.split('\n').map((line) => {
+    const trimmed = line.trimStart()
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return ''
+    const idx = line.indexOf('//')
+    if (idx > -1 && !/['"`]/.test(line.slice(0, idx))) return line.slice(0, idx)
+    return line
+  }).join('\n')
+}
+
+function runtimeSourceFiles (root) {
+  const files = []
+  for (const [dir, keep] of RUNTIME_SOURCE_DIRS) {
+    let entries
+    try {
+      entries = fs.readdirSync(path.join(root, dir), { withFileTypes: true }) // nosemgrep（root 是模块常量，dir 是上面的字面量表）
+    } catch (error) {
+      continue // 目录不存在（沙箱里只放了部分树）不是错误
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.js') || !keep(entry.name)) continue
+      files.push(dir === '.' ? entry.name : `${dir}/${entry.name}`)
+    }
+  }
+  return files
+}
+
+// 裸包名归一：@scope/name/sub → @scope/name；name/sub → name
+function packageNameOf (specifier) {
+  if (typeof specifier !== 'string' || !specifier) return null
+  if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('node:')) return null
+  const parts = specifier.split('/')
+  const name = specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+  if (require('module').builtinModules.includes(name)) return null
+  return name
+}
+
+// 返回 [{ name, file }]：代码 require 了、但 package.json 的运行时清单里没有的包。
+function scanUndeclaredRequires (pkg, { root = ROOT } = {}) {
+  const declared = new Set([
+    ...Object.keys((pkg && pkg.dependencies) || {}),
+    ...Object.keys((pkg && pkg.optionalDependencies) || {})
+  ])
+  const undeclared = []
+  // 清单读不到/为空时不动手：那种情况由正方向的降级分支（内置 got/re2 + 告警）负责，
+  // 这里再扫一遍只会把「清单缺失」放大成一片「所有 require 都未声明」的假红。
+  if (declared.size === 0) return undeclared
+  for (const rel of runtimeSourceFiles(root)) {
+    const source = stripJsComments(fs.readFileSync(path.join(root, rel), 'utf8')) // nosemgrep（rel 来自 readdir，不是用户输入）
+    const re = /require\s*\(\s*(['"])([^'"]+)\1\s*\)/g
+    let match
+    while ((match = re.exec(source)) !== null) {
+      const name = packageNameOf(match[2])
+      if (!name || declared.has(name)) continue
+      if (undeclared.some((u) => u.name === name && u.file === rel)) continue
+      undeclared.push({ name, file: rel })
+    }
+  }
+  return undeclared
+}
+
+// F4：Node 版本闸门 ----
 // 极简范围判定：只支持 `||` 分隔的候选区间 + 空白分隔的比较器（>= > <= < = ^ ~ 与裸版本）。
 // 本仓库 engines.node 与 re2 的 engines.node 都是这种写法（re2 为 `^22.22.2 || ^24.15.0 || >=26.0.0`），
 // 故不引入 semver 依赖；看不懂的写法一律返回 null，由调用方降级为告警（不误红）。
@@ -192,10 +271,11 @@ function loadFromRoot (name) {
   return require(require.resolve(name, { paths: [ROOT] })) // nosemgrep（name 取值域 = package.json 运行时声明清单，见文件头）
 }
 
-function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest, includeDevDependencies = false } = {}) {
+function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, manifest = readPackageManifest, includeDevDependencies = false, sourceScan } = {}) {
   const missing = []
   const broken = []
   const versionProblems = []
+  const undeclared = []
 
   let pkg = null
   try {
@@ -215,6 +295,14 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
   // F4：此前完全不校验 Node 版本（无 process.versions.node / engines 判定），而 re2 的 engines
   // 严于本仓库 engines——README 明示 Node 23.x、24.0–24.14、25.x 上装/重建 re2 必然失败。
   versionProblems.push(...nodeVersionProblems(pkg, process.versions.node))
+
+  // C10-018：反向扫描。只在用**默认清单读取器**时扫，且可用 sourceScan 注入（单测）：
+  // 注入假 manifest 的调用方验的是正方向语义，假清单与仓库真实代码必然对不上，
+  // 无条件扫会把 20 多条既有单测变成「未声明包」的假红。
+  if (pkg && (sourceScan !== undefined || manifest === readPackageManifest)) {
+    const scan = sourceScan || ((manifestPkg) => scanUndeclaredRequires(manifestPkg))
+    undeclared.push(...scan(pkg))
+  }
 
   for (const name of [...targets, ...devTargets]) {
     // F3：两段判定——resolve 失败才是「缺少」；resolve 成功而加载抛错（ERR_REQUIRE_ESM、
@@ -240,7 +328,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
     }
   }
 
-  if (missing.length === 0 && broken.length === 0 && versionProblems.length === 0) return true
+  if (missing.length === 0 && broken.length === 0 && versionProblems.length === 0 && undeclared.length === 0) return true
 
   // F4：Node 版本不满足时先把要求摆出来（含 re2 更严的那一条），再报依赖问题，
   // 避免用户在「re2 装不上」的现场先看到一堆与版本无关的指引。
@@ -257,6 +345,14 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
     if (missing.includes(NATIVE_DEP)) {
       console.error(`  npm rebuild ${NATIVE_DEP}`)
     }
+  }
+  // C10-018：反向扫描的结论（代码 require → 声明）。放在最后：它是「仓库自身的口径问题」，
+  // 与「本机装没装」无关，先让 missing/broken/版本问题这些现场原因出场。
+  if (undeclared.length > 0) {
+    console.error(`❌ 代码 require 了未声明的包：${[...new Set(undeclared.map(u => u.name))].join(', ')}`)
+    for (const u of undeclared) console.error(`  - ${u.name}（${u.file}）`)
+    console.error('请在 package.json 的 dependencies（或 optionalDependencies）里声明，或删掉这条 require：')
+    console.error('  require 到未声明包时，本机只是碰巧通过传递依赖装上了，换一台精简安装的机器才会炸')
   }
   if (broken.length > 0) {
     console.error(`❌ 依赖已安装但不可用：${broken.map(b => b.name).join(', ')}`)
@@ -276,7 +372,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
   return false
 }
 
-module.exports = { checkDependencies, satisfiesNodeRange }
+module.exports = { checkDependencies, satisfiesNodeRange, scanUndeclaredRequires }
 
 // F2：此前没有 CLI 守卫——`node scripts/check-deps.js` 只加载模块、不执行任何检查，
 // 于是「直接执行」这个入口永远 exit 0 且零输出（fail-open：把它挂进脚本链/CI 步骤时会静默放行）。
