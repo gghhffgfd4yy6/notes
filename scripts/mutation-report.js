@@ -1677,6 +1677,24 @@ async function pruneOldDailyIssuesBestEffort (opts) {
 }
 
 /**
+ * C10-026：解析日报要发往的仓库（`owner/repo`）。
+ *
+ * 修前是 `process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'`：变量缺失时静默把日报 POST 到另一个
+ * 仓库——既污染他仓，又让本仓永远看不到日报；而「配置缺失」被伪装成「一切正常」。现在与缺 token 同口径
+ * fail-closed：缺失/形态非法直接抛错，调用方（main）据此 exit 1，一个请求都不发。
+ * @param {string|undefined} raw `process.env.GITHUB_REPOSITORY` 的原始取值
+ * @returns {string} 校验过的 `owner/repo`
+ * @throws {Error} 缺失或不是 `owner/repo` 形态
+ */
+function resolveIssueRepo (raw) {
+  const repo = raw === undefined || raw === null ? '' : String(raw).trim()
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error(`缺少或非法的 GITHUB_REPOSITORY（${JSON.stringify(repo)}）：日报只发本仓，不再回落到硬编码仓库`)
+  }
+  return repo
+}
+
+/**
  * 汇总日报并按上海自然日创建或复用 GitHub Issue。
  * @param {string} body 已渲染的日报 Markdown
  * @returns {Promise<object>} 新建或已存在的 Issue 信息
@@ -1684,7 +1702,7 @@ async function pruneOldDailyIssuesBestEffort (opts) {
 async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
-  const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
+  const repo = resolveIssueRepo(process.env.GITHUB_REPOSITORY)
   const today = shanghaiDate()
   const title = `🧬 变异测试日报 ${today}`
   // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）。

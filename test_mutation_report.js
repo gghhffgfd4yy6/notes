@@ -1907,6 +1907,26 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     await assert.rejects(() => postIssue('body'), /缺少 GITHUB_TOKEN/)
   })
 
+  // C10-026：缺 GITHUB_REPOSITORY 时绝不回落到硬编码的他仓。旧实现 `process.env.GITHUB_REPOSITORY ||
+  // 'junhanw868-bot/notes'`：CI 漏传该变量（本地 `--issue` 也常见）时，日报会被静默 POST 到另一个
+  // 仓库——既污染他仓，又让本仓永远看不到日报，属于「配置缺失被伪装成正常工作」。口径与上面缺 token
+  // 一致：fail-closed 抛错，且**一个请求都不发**（不允许用空仓库名先探一次）。
+  await acheck('C10-026 postIssue 缺少 GITHUB_REPOSITORY 时抛错且不发出任何请求（不得回落硬编码他仓）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    delete process.env.GITHUB_REPOSITORY
+    const calls = []
+    global.fetch = async function (url) {
+      calls.push(String(url))
+      throw new Error(`缺仓库变量时不应发出任何请求：${url}`)
+    }
+    try {
+      await assert.rejects(() => postIssue('body'), /GITHUB_REPOSITORY/)
+    } finally {
+      process.env.GITHUB_REPOSITORY = 'owner/repo'
+    }
+    assert.deepStrictEqual(calls, [], `缺仓库变量时必须直接失败，实际发出：${calls.join(', ')}`)
+  })
+
   await acheck('postIssue 当天日报已存在时跳过发布', async () => {
     process.env.GITHUB_TOKEN = 'test-token'
     process.env.GITHUB_REPOSITORY = 'owner/repo'
