@@ -321,6 +321,48 @@ function error (message, code) {
     }, recoveryController)
     assert.strictEqual(recoveryRuns, 2, '恢复成功后应清零失败状态并正常停止')
     assert.strictEqual(recoveryController.signal.aborted, true)
+
+    // PR #362（CodeRabbit Major · Stability & Availability）：部分消息失败必须与常驻轮询解耦。
+    // 反例（旧行为）：只要一条消息长期送不出去，runResident 就把它当整轮可重试失败叠加指数退避
+    // （默认封顶 30 分钟）——等待期间连**新消息**都拉不下来，无关投递被同一条失败消息拖住最多
+    // 30 分钟/轮。封顶留在大值（首次退避 1000ms）：解耦后第 1→2 轮只应等正常轮询间隔
+    // （XBK_INTERVAL_MS=0），而不是 1000ms。
+    process.env.XBK_RETRY_BACKOFF_CAP_MS = '5000'
+    let partialRuns = 0
+    let partialGapMs = -1
+    let partialFirstAt = 0
+    const partialController = new AbortController()
+    await runResident({
+      num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
+      run: async () => {
+        partialRuns += 1
+        if (partialRuns === 1) partialFirstAt = Date.now()
+        else if (partialRuns === 2) partialGapMs = Date.now() - partialFirstAt
+        if (partialRuns >= 3) partialController.abort()
+        return { total: 2, pushed: 1, failed: 1, failures: [{ code: 'ETIMEDOUT', message: '一条消息送不出去' }] }
+      }
+    }, partialController)
+    assert.ok(partialRuns >= 3, `部分消息失败必须继续轮询（不得整轮停止），实际只跑了 ${partialRuns} 轮`)
+    assert.ok(partialGapMs >= 0 && partialGapMs < 500,
+      `部分消息失败不得叠加常驻循环退避：第 1→2 轮间隔 ${partialGapMs}ms（旧实现至少 1000ms，新消息被同一条失败消息拖住）`)
+
+    // 对照组：整轮失败（pushed=0）仍必须叠加退避——防「把退避整个删掉」式假修复。
+    let allFailedRuns = 0
+    let allFailedGapMs = -1
+    let allFailedFirstAt = 0
+    const allFailedController = new AbortController()
+    await runResident({
+      num: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
+      run: async () => {
+        allFailedRuns += 1
+        if (allFailedRuns === 1) allFailedFirstAt = Date.now()
+        else if (allFailedRuns === 2) allFailedGapMs = Date.now() - allFailedFirstAt
+        if (allFailedRuns >= 2) allFailedController.abort()
+        return { total: 2, pushed: 0, failed: 2, failures: [{ code: 'ETIMEDOUT', message: '两条都送不出去' }] }
+      }
+    }, allFailedController)
+    assert.ok(allFailedGapMs >= 800,
+      `整轮失败仍必须叠加退避：第 1→2 轮间隔 ${allFailedGapMs}ms（应≈1000ms）`)
   } finally {
     if (oldInterval === undefined) delete process.env.XBK_INTERVAL_MS
     else process.env.XBK_INTERVAL_MS = oldInterval
