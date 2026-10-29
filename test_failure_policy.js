@@ -1017,7 +1017,21 @@ testCase('靶向 carrierCases（承载字段 × 区间）', async () => {
     ['statusCode 499 是 4xx 上界 → 永久', { statusCode: 499 }, 'permanent', 'HTTP_499'],
     ['statusCode 600 超出取值域 → 保守重试', { statusCode: 600, message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
     ['providerCode 1001 是限流码 → 可重试', { providerCode: '1001' }, 'retryable', 'PROVIDER_RATE_LIMIT'],
-    ['数字 code 1001 走 provider 可重试分支', { code: '1001' }, 'retryable', 'PROVIDER_1001']
+    ['数字 code 1001 走 provider 可重试分支', { code: '1001' }, 'retryable', 'PROVIDER_1001'],
+    // ↓ C5-059：原「区间边界（数字 code / providerCode / statusCode）」表的 12 组维度并入本表，
+    //   逐条保留 why/期望（原先同一批口径分成两张表，改一处忘另一处就是两份口径）。
+    ['数字 code 299 在 3xx 下界之下 → 保守重试', { code: '299', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['数字 code 300 是 3xx 下界（无关 message 不得改写归类）→ 永久', { code: '300', message: 'upstream odd' }, 'permanent', 'PROVIDER_300'],
+    ['数字 code 400 是 4xx 下界 → 永久', { code: '400', message: 'upstream odd' }, 'permanent', 'PROVIDER_400'],
+    ['数字 code 499 是 4xx 上界 → 永久', { code: '499', message: 'upstream odd' }, 'permanent', 'PROVIDER_499'],
+    ['providerCode 299 在 3xx 下界之下 → 保守重试', { providerCode: '299', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['providerCode 300 是 3xx 下界 → 永久', { providerCode: '300', message: 'upstream odd' }, 'permanent', 'PROVIDER_300'],
+    ['providerCode 400 是 4xx 下界 → 永久', { providerCode: '400', message: 'upstream odd' }, 'permanent', 'PROVIDER_400'],
+    ['providerCode 499 是 4xx 上界 → 永久', { providerCode: '499', message: 'upstream odd' }, 'permanent', 'PROVIDER_499'],
+    ['statusCode 300 是 3xx 下界 → 永久', { statusCode: 300 }, 'permanent', 'HTTP_300'],
+    ['statusCode 400 是 4xx 下界 → 永久', { statusCode: 400 }, 'permanent', 'HTTP_400'],
+    ['HTTP_300 是 3xx 下界 → 永久', { code: 'HTTP_300' }, 'permanent', 'HTTP_300'],
+    ['非 HTTP_ 前缀的码不得按状态区间判永久', { code: 'PAD__302', message: 'upstream odd' }, 'retryable', 'UNKNOWN']
   ]
   for (const [why, e, kind, reason] of carrierCases) {
     const r = classifyFailure(e)
@@ -1176,40 +1190,6 @@ testCase('summarizeError 返回结构精确契约', async () => {
   check(withChild.failures.length, 1, '子失败必须逐个摘要')
   check(withChild.failures[0].message, 'child', '子失败的 message 必须保留')
   check(summarizeError({ failures: 'nope' }).failures, undefined, '非数组 failures 不得透出')
-})
-
-testCase('区间边界（数字 code / providerCode / statusCode）', async () => {
-  // 【簇1 · 区间边界补齐】3xx/4xx 的下界/上界必须精确：杀 >=、< 被翻成 > / <= 后仍落同 reason 的变异体。
-  for (const [c, kind, reason] of [
-    ['299', 'retryable', 'UNKNOWN'],
-    ['300', 'permanent', 'PROVIDER_300'],
-    ['400', 'permanent', 'PROVIDER_400'],
-    ['499', 'permanent', 'PROVIDER_499']
-  ]) {
-    const r = classifyFailure({ code: c, message: 'upstream odd' })
-    check(r.kind, kind, `数字 code=${c} 的 kind（区间边界）`)
-    check(r.reason, reason, `数字 code=${c} 的 reason（区间边界）`)
-  }
-  for (const [pc, kind, reason] of [
-    ['299', 'retryable', 'UNKNOWN'],
-    ['300', 'permanent', 'PROVIDER_300'],
-    ['400', 'permanent', 'PROVIDER_400'],
-    ['499', 'permanent', 'PROVIDER_499']
-  ]) {
-    const r = classifyFailure({ providerCode: pc, message: 'upstream odd' })
-    check(r.kind, kind, `providerCode=${pc} 的 kind（区间边界）`)
-    check(r.reason, reason, `providerCode=${pc} 的 reason（区间边界）`)
-  }
-  check(classifyFailure({ statusCode: 300 }).kind, 'permanent', 'statusCode 300 是 3xx 下界 → 永久')
-  check(classifyFailure({ statusCode: 300 }).reason, 'HTTP_300', 'statusCode 300 的 reason 即归一码')
-  check(classifyFailure({ statusCode: 400 }).kind, 'permanent', 'statusCode 400 是 4xx 下界 → 永久')
-  check(classifyFailure({ statusCode: 400 }).reason, 'HTTP_400', 'statusCode 400 的 reason 即归一码')
-  check(classifyFailure({ code: 'HTTP_300' }).kind, 'permanent', 'HTTP_300 是 3xx 下界 → 永久')
-  check(classifyFailure({ code: 'HTTP_300' }).reason, 'HTTP_300', 'HTTP_300 的 reason 即码本身')
-  // 前缀必须精确：非 HTTP_ 前缀的码不得被按 HTTP 状态区间判永久（杀 'HTTP_' 字面量与前缀守卫被短路）。
-  const paddedCode = classifyFailure({ code: 'PAD__302', message: 'upstream odd' })
-  check(paddedCode.kind, 'retryable', '非 HTTP_ 前缀的码不得按状态区间判永久')
-  check(paddedCode.reason, 'UNKNOWN', '非 HTTP_ 前缀的码应落 UNKNOWN 保守重试')
 })
 
 testCase('祖先环守卫', async () => {
