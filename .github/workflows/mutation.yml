@@ -887,12 +887,19 @@ jobs:
       # REV-CI（落地 stryker.config.js 自述的 F-04）：缓存（path: reports）此前会把
       # reports/mutation/{mutation.json,mutation.html} 一并保存——而这个目录正是本 job 最上方的
       # 「清理缓存回填的旧报告」每次都要 `rm -rf` 掉的东西：保存 → 恢复 → 删除，纯浪费。
-      # 量化依据（gh api …/actions/caches，2026-09-18）：
-      #   * 仓库缓存共 519 条 / 4860MiB（= 10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
-      #   * 分段条目数 24-28 条/段（sendnotify 两段合计 62 条），同一段的近重复条目在持续堆积；
-      #   * 同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app），
-      #     说明 reports/mutation/* 是 reports/ 里的绝对大头（磁盘上无法经 API 拆出 inc-*.json 的占比，
-      #     故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」这一事实）。
+      # 量化依据（**历史快照，2026-09-18**；已被 2026-10-28 实测反转，保留只为记录当时为什么动这一刀，
+      #   不得当现状引用）：
+      #   * 当时：仓库缓存共 519 条 / 4860MiB（≈10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
+      #   * 现测（2026-10-28，同一 API 全量分页聚合）：1078 条 / 6528MiB（**63.8%**——配额压力已过半），
+      #     其中 stryker-* 890 条但只占 1085MiB（**16.6%**）⇒「stryker 占 87%」的口径已反转，
+      #     stryker 缓存不再是配额主因；本步的收益来自「不再缓存 reports/mutation/」，与该占比无关。
+      #   * 条目形态（同为历史观测）：分段 24-28 条/段（sendnotify 两段合计 62 条），近重复条目持续堆积；
+      #     同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app）——磁盘上无法经 API
+      #     拆出 inc-*.json 的占比，故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」。
+      # ⚠️ 本仓**没有任何**缓存用量自动核对/告警（`grep -rn actions/caches` 全仓只命中本段注释）⇒ 上面的
+      #   现测数字同样会过期。引用或改这条注释前用同一条命令重测，并把日期一起改（快照型数字不带日期，
+      #   下一轮又会被当现状）：
+      #   gh api repos/{owner}/{repo}/actions/caches --paginate --jq '.actions_caches[] | [.key, .size_in_bytes] | @tsv'
       # 为什么放在「上传变异报告」之后：artifact 仍需要 reports/mutation/（report job 靠它汇总），
       #   而 actions/cache 的保存在**job 全部步骤结束后**的 post 步骤执行 ⇒ 此处删除只影响缓存、不影响 artifact。
       # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同一口径——stryker 失败/超时时，
