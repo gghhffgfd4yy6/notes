@@ -23,11 +23,99 @@ const probeEnv = (extra) => {
   delete env.XBK_MUTATION_CHILD
   return env
 }
-let checks = 0
-function check (label, fn) {
-  fn()
-  checks++
-  console.log('✅ ' + label)
+// C5-022：harness 必须「逐条捕获」而不是裸调用。旧实现是 `fn(); checks++; console.log('✅')`——
+// 任何一条检查抛错就直接穿出顶层：不打印该条的 label、不记失败、没有汇总，**其后的检查一条都不跑**
+// （本文件 12 条检查里前 3 条一红，后面 9 条连同最终结论全部沉默，CI 只看到一段 Node 堆栈）。
+// 现在与 test_doc_line_gates.js / test_ci_static_gates.js 的 createChecker 同形：每条独立 try/catch，
+// passed/failed 双计数，抛错时打印 ❌ + label + 原始 message，末尾 summary() 汇总并给出退出码。
+function createChecker (out) {
+  const log = (out && out.log) || ((s) => console.log(s))
+  let passed = 0
+  const failures = []
+  function check (label, fn) {
+    try {
+      fn()
+      passed++
+      log('✅ ' + label)
+    } catch (e) {
+      const message = (e && e.message) || String(e)
+      failures.push({ label, message })
+      log('❌ ' + label + '：' + message)
+    }
+  }
+  return {
+    check,
+    get passed () { return passed },
+    get failures () { return failures.slice() },
+    summary () {
+      if (failures.length === 0) {
+        log(`✅ test_host_clean_gates 全部通过（${passed} 检查）`)
+        return 0
+      }
+      log(`❌ test_host_clean_gates：${passed} 通过 / ${failures.length} 失败（共 ${passed + failures.length} 检查）`)
+      for (const f of failures) log('   ❌ ' + f.label + '：' + f.message)
+      return 1
+    }
+  }
+}
+
+const harness = createChecker()
+const check = harness.check
+
+// C5-022 自测接缝：让「一条检查抛错」这条控制流在**子进程**里可复现——本文件的 harness 自测只能证明
+// createChecker 的返回值，证明不了 `process.exitCode = harness.summary()` 真的会把退出码变成 1。
+// 只有探针子进程（见下方「harness 退出码」用例）会设这个变量；正常跑完全不走这条分支。
+if (process.env.XBK_HOST_CLEAN_THROW_PROBE === '1') {
+  check('💥 探针：故意抛错（仅 XBK_HOST_CLEAN_THROW_PROBE=1 时存在）', () => {
+    throw new Error('probe-throw')
+  })
+}
+
+// C5-022 门禁：harness 自身的控制流必须有断言，否则「一条检查抛错就整份文件中断」这种改动零覆盖。
+check('harness 自身：一条检查抛错只记失败，后续检查照跑并汇总为红（C5-022）', () => {
+  const lines = []
+  const probe = createChecker({ log: (s) => lines.push(s) })
+  probe.check('通过的检查', () => {})
+  probe.check('抛错的检查', () => { throw new Error('boom') })
+  probe.check('抛错之后的检查', () => { lines.push('AFTER-RAN') })
+  assert.deepStrictEqual(probe.failures.map((f) => f.label), ['抛错的检查'],
+    '抛错的检查必须被记为失败（带 label），而不是把异常穿出 harness')
+  assert.strictEqual(probe.failures[0].message, 'boom', '失败明细必须带原始错误信息，否则定位不到根因')
+  assert.ok(lines.includes('AFTER-RAN'), '抛错之后的检查必须照跑——旧实现在这里整份文件中止')
+  assert.ok(lines.some((l) => l.startsWith('❌ 抛错的检查')), '失败检查必须打印 ❌ 与 label（旧实现连 label 都不打）')
+  assert.strictEqual(probe.passed, 2, 'passed 只算真正跑完的检查')
+  assert.strictEqual(probe.summary(), 1, '有失败时汇总必须返回 1，不得把「跑了一半」当全绿')
+  assert.ok(lines.some((l) => l.includes('2 通过 / 1 失败')), '汇总必须同时报通过与失败数：' + JSON.stringify(lines))
+})
+
+// C5-022 退出码（子进程，真跑）：把探针异常插进**这一个套件本身**，断言 ① 它被记成 ❌ 而不是崩栈、
+// ② 其后的检查照跑（末条检查的 ✅ 必须出现）、③ 进程退出码是 1。缺了 ③，harness 就只是「打印得好
+// 看」——CI 仍会把一份带失败明细的报告当绿。
+// 探针子进程里必须跳过本用例自身：否则它会再 spawn 一个孙进程，无限递归。
+if (process.env.XBK_HOST_CLEAN_THROW_PROBE !== '1') {
+  check('harness 退出码：一条检查抛错 ⇒ 后续检查照跑且 exit 1（C5-022，子进程实跑）', () => {
+    // 子进程里必须摘掉 XBK_MUTATION_CHILD（与本文件 probeEnv 同口径）：否则它会按设计跳过主机检查，
+    // 探针测到的就不是「门禁怎么判」而是「门禁被关掉了」。
+    const childEnv = { ...process.env, XBK_HOST_CLEAN_THROW_PROBE: '1' }
+    delete childEnv.XBK_MUTATION_CHILD
+    const probe = spawnSync(process.execPath, [__filename],
+      { encoding: 'utf8', cwd: __dirname, env: childEnv })
+    const both = (probe.stdout || '') + (probe.stderr || '')
+    assert.strictEqual(probe.status, 1,
+      `注入抛错后套件必须以 1 退出（实际 ${probe.status}）：` + both.slice(-600))
+    assert.match(probe.stdout, /❌ 💥 探针：故意抛错/, '抛错的检查必须打印 ❌ + label，而不是抛栈退出：' + both.slice(-600))
+    assert.ok(probe.stdout.includes('✅ 清理建议必须对空格和 shell 元字符进行 POSIX 引用'),
+      '抛错之后的检查必须照跑（末条检查的 ✅ 缺失说明整份文件中止了）：' + both.slice(-600))
+    // 计数按「真实数量」核对（不写死通过数：宿主机不干净时其它检查可能连带失败，那与本用例无关）
+    const summary = probe.stdout.match(/(\d+) 通过 \/ (\d+) 失败（共 (\d+) 检查）/)
+    assert.ok(summary, '有失败时必须有汇总行（旧实现连结论都没有）：' + both.slice(-600))
+    const [, passed, failed, total] = summary.map(Number)
+    assert.ok(failed >= 1, `汇总必须记下失败条数（实得 ${failed}）：` + both.slice(-600))
+    assert.strictEqual(passed + failed, total, `汇总三数字必须自洽（${passed}+${failed}≠${total}）`)
+    assert.ok(passed >= 13, `探头之后仍有 13 条检查必须跑完（实得 ${passed} 通过）：` + both.slice(-600))
+    assert.ok(!/Error: probe-throw\s*\n\s*at /.test(both),
+      '不得把原始异常栈直接抛到顶层（旧实现的行为）：' + both.slice(-600))
+  })
 }
 
 check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
@@ -414,4 +502,5 @@ check('清理建议必须对空格和 shell 元字符进行 POSIX 引用', () =>
   assert.strictEqual(host.rmSuggestion([{ p: relativeDashPath }]), "rm -rf '" + path.resolve(relativeDashPath) + "'")
 })
 
-console.log('✅ test_host_clean_gates 全部通过（' + checks + ' 检查）')
+// C5-022：退出码必须由 summary() 决定——有失败即 1，全部通过才是 0。
+process.exitCode = harness.summary()
