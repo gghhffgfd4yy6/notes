@@ -1473,7 +1473,10 @@ const entryProbe = String.raw`
 const xbk = require('./xbk_function_v3')
 const errs = []
 console.error = (...a) => { errs.push(a.map(v => String(v)).join(' ')) }
-const cases = [['ok', { pushed: 1, failed: 0 }], ['retryable', { failed: 1, pushed: 0 }], ['permanent', { failed: 1, pushed: 0, failures: [{ message: '接口返回数据格式异常' }] }]]
+const cases = [['ok', { pushed: 1, failed: 0 }], ['retryable', { failed: 1, pushed: 0 }], ['permanent', { failed: 1, pushed: 0, failures: [{ message: '接口返回数据格式异常' }] }],
+  // C9-002：pushed>0 不再等于成功——1 条成功 + 99 条失败、以及缓存落盘失败，都必须置非零退出码
+  ['partial', { pushed: 1, failed: 99, cacheSaved: true, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }],
+  ['cachefail', { pushed: 1, failed: 0, cacheSaved: false }]]
 ;(async () => {
   const out = {}
   for (const c of cases) {
@@ -1659,6 +1662,14 @@ check('runSingleEntry：无失败不动退出码；全失败置 1 且 retryable/
   assert.strictEqual(out.permanent.code, 1, '永久失败必须置非零退出码')
   assert.strictEqual(out.permanent.err.startsWith('程序运行失败（') && out.permanent.err.includes('不可恢复'), true, `永久失败文案必须是「不可恢复」（实际：${out.permanent.err}）`)
   assert.strictEqual(out.permanent.err.includes('可重试'), false, '永久失败不得被写成可重试（=== 被变异成 !== 即失败）')
+  // C9-002：pushed>0 曾无条件判成功（1 条成功 + 99 条失败 → 退出码 0、告警不触发）；
+  // cacheSaved 曾从未被分类器读取（成功记录没落盘也判绿）。两者都必须置非零退出码。
+  assert.strictEqual(out.partial.code, 1, '1 条成功 + 99 条失败必须置非零退出码（旧实现返回 null）')
+  assert.strictEqual(out.partial.err.startsWith('程序运行失败（PARTIAL_MESSAGE_FAILURE）：可重试'), true,
+    `部分失败必须点名 PARTIAL_MESSAGE_FAILURE（实际：${out.partial.err}）`)
+  assert.strictEqual(out.cachefail.code, 1, '缓存落盘失败必须置非零退出码（旧实现 pushed>0 判绿）')
+  assert.strictEqual(out.cachefail.err.startsWith('程序运行失败（CACHE_SAVE_FAILED）：可重试'), true,
+    `缓存落盘失败必须点名 CACHE_SAVE_FAILED（实际：${out.cachefail.err}）`)
 })
 
 // ===== 补测 PlanH：hasValidId 的守卫与类型分支（父代理按 instrumenter 逐 id 定位后补齐）=====

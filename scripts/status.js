@@ -399,8 +399,20 @@ function formatStatus (status) {
   // 审查 SS-01：① 展示摘要行时间戳（旧实现把时间戳丢弃，输出里看不出这一轮是何时跑的、是否已陈旧）；
   // ② 「文件可读」不等于「这一轮正常」——摘要行之后还有 ERROR/运行异常行时说明该轮中断退出，
   //    不再一律渲染成「正常」（崩溃轮此前与正常轮显示完全一致）。
-  const runState = run && run.interrupted ? '⚠️ 上一轮未正常结束' : describe(status.run)
-  lines.push(`最近一轮：${runState}${run ? ` | 时间 ${run.at || '无时间戳'} | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}` : ''}`)
+  // C10-006：取消轮（parseLastRun 的占位分支 cancelled/isPlaceholder=true 且五项计数全 null）
+  // 旧实现只判 interrupted ⇒ 输出「最近一轮：正常 | … 获取 null … 失败 null」。取消必须排在最前
+  // 判定（它与 interrupted 互斥），计数段改写「本轮无计数（已取消）」，不把 null 拼进去。
+  const runState = run && run.cancelled === true
+    ? '⏹ 上一轮已被取消'
+    : (run && run.interrupted ? '⚠️ 上一轮未正常结束' : describe(status.run))
+  // 取消轮没有计数：占位分支五项计数全 null，直接拼会输出「获取 null … 失败 null」。
+  let runDetail = ''
+  if (run) {
+    runDetail = run.cancelled === true || run.isPlaceholder === true
+      ? ` | 时间 ${run.at || '无时间戳'} | 本轮无计数（已取消）`
+      : ` | 时间 ${run.at || '无时间戳'} | 获取 ${run.total} | 去重 ${run.dedup} | 过滤 ${run.filtered} | 推送 ${run.pushed} | 失败 ${run.failed} | 截断 ${run.truncated}${run.truncated > 0 ? ' ⚠️' : ''} | 耗时 ${run.elapsed}`
+  }
+  lines.push(`最近一轮：${runState}${runDetail}`)
   // 摘要之后的无主失败行（崩溃轮）：不把这轮标成中断（它确实正常写完了摘要），但也不能让
   // 崩溃信号在首屏消失——单独一行如实上报，指向运行历史里的占位条目。
   if (run && run.orphanFailures > 0) {

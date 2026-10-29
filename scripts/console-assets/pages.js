@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from 
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -3245,6 +3245,11 @@ function BackupBlock ({ onImported }) {
     setBusy('import'); setErr('')
     try {
       const res = await apiPostBackupImport(pending.bundle, pending.key)
+      // consumeJsonResult 对非 2xx 只回 { ok:false, status, data }，不抛错：409 busy /
+      // 400 校验失败 / 507 审计满原本都会走进成功分支并提示「导入完成」。先过这一道；
+      // 抛错时 pending 不清 ⇒ 确认弹窗仍开着、错误显示在弹窗里，可直接改完重试。
+      const problem = backupImportProblem(res)
+      if (problem !== '') throw new Error(problem)
       setPending(null)
       const result = res && res.data ? res.data : (res || {})
       const imported = result.imported ? result.imported : {}

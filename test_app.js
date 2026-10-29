@@ -171,7 +171,7 @@ function assertPathInRoot (targetPath, root, msg) {
 
 // 收敛后的**唯一**递归删除入口（与 test_filter.js 同源、同语义）：先校验后删除。
 // 传入路径必须已由 buildCacheShard 产出或由用例在根内字面量构造；越界即抛错（fail-closed）。
-// 唯一声明的豁免是 :3737 的局部 removePath（目标含 os.tmpdir() 下的仓库外夹具），见其处注释。
+// 唯一声明的豁免是 C022 用例内的局部 removePath（目标只是 os.tmpdir() 下的仓库外夹具），见其处注释。
 function removeDirInRoot (targetPath, root) {
   const rootAbs = path.resolve(root)
   const p = path.resolve(targetPath)
@@ -192,6 +192,38 @@ function cleanupIsolatedDir (targetPath) {
   } catch (e) {
     console.warn(`⚠️ 隔离缓存目录清理失败，需手工删除（否则将滞留仓库根）：${targetPath} — ${e.message}`)
   }
+}
+
+// C5-001（P0）：让位给夹具的固定名路径**不是**本套件的私产——仓库根的 `.xbk_cache_safe` 正是
+// xbk_message_store.js:35 的**生产兜底缓存目录**（默认目录不可用时生产自动写到这里，内含 push.json
+// 与墓碑）。旧版 C022 用裸 rmSync(recursive) 先删后建软链、finally 只删自己建的软链，于是在兜底已
+// 生效的部署目录跑一次集成测试就静默毁掉判重主存。两条 helper 的契约：
+//   · stashCachePath：符号链接 → 只摘链接（链接目标不动）；真实文件/目录 → 整体 rename 到备份位
+//     （内容零改动，随时可搬回）；不存在 → 什么都不做。返回备份路径（没挪动过则 null）。
+//   · restoreCachePath：有备份 → 摘掉夹具留下的符号链接后把备份原样搬回；无备份 → 只摘夹具留下的
+//     符号链接。**任何分支都不删除真实文件/目录**：原位被真实路径占据且无备份时返回 'refused'
+//     留给调用方告警（数据优先，fail-closed），备份因此永远不会被「清理」掉。
+function stashCachePath (targetPath, backupPath) {
+  let st = null
+  try { st = fs.lstatSync(targetPath) } catch (e) { return null } // 不存在：无需让位
+  if (st.isSymbolicLink()) { fs.unlinkSync(targetPath); return null }
+  fs.renameSync(targetPath, backupPath)
+  return backupPath
+}
+
+function restoreCachePath (targetPath, backupPath) {
+  let st = null
+  try { st = fs.lstatSync(targetPath) } catch (e) { st = null }
+  // 原位此刻只可能是夹具自建的符号链接；真实路径一律不碰（碰它就是本函数要防的那类静默删除）。
+  if (st && !st.isSymbolicLink()) return 'refused'
+  if (backupPath) {
+    if (st) fs.unlinkSync(targetPath)
+    fs.renameSync(backupPath, targetPath)
+    return 'restored'
+  }
+  if (!st) return 'skipped'
+  fs.unlinkSync(targetPath)
+  return 'cleared'
 }
 
 // ---------- 工具 ----------
@@ -3737,6 +3769,39 @@ console.log('========================================\n');
     }
   })
 
+  await test('C9-002 推送部分失败（1 成功 + 1 失败）→ 告警 + run.log ERROR 行（消息级计数）', async () => {
+    // 反例（改动前）：告警判据是 `successCount === 0`，1 条成功 + N 条失败既不告警也不写 ERROR 行；
+    // 再叠加分类器「pushed>0 即成功」，失败的消息被整轮静默吞掉（退出码 0）。
+    reset()
+    setPushUrl('t70b_partialfail')
+    const orig = Config.alert.enabled
+    const origInterval = Config.alert.intervalMs
+    const logPath = path.join(CACHE_DIR, 'run.log')
+    try { require('fs').unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    try {
+      Config.alert.enabled = true
+      Config.alert.intervalMs = 0
+      notifyFailAt = 1 // 第 1 条消息失败、第 2 条成功，第 3 次调用是告警
+      fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })]
+      const summary = await xbk.run()
+      assertEqualNum(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
+      assertEqualNum(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
+      const log = require('fs').readFileSync(logPath, 'utf8')
+      assert(log.includes('推送部分失败'), `部分失败应写 ERROR 行: ${log.slice(-200)}`)
+      assert(pushCalls.some(c => String(c.desp || '').includes('推送部分失败')),
+        `部分失败必须触发告警（成功/失败条数可读）: ${JSON.stringify(pushCalls.map(c => c.desp))}`)
+      // 分类器同口径：degraded 判定（非 null）——单次入口据此置非零退出码
+      const decision = require('./xbk_failure_policy').classifySummary(summary)
+      assert(decision && decision.reason === 'PARTIAL_MESSAGE_FAILURE',
+        `部分失败必须被判 degraded，实际 ${JSON.stringify(decision)}`)
+    } finally {
+      Config.alert.enabled = orig
+      Config.alert.intervalMs = origInterval
+      notifyFailAt = -1
+      try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('接口异常告警在 run 返回前完成（#10 v3.164，防 exit 杀死）', async () => {
     reset()
     setPushUrl('t71_alert_await')
@@ -3808,6 +3873,49 @@ console.log('========================================\n');
     }
   })
 
+  await test('兜底缓存目录清理：真目录备份还原、符号链接才摘（C5-001）', async () => {
+    const baseDir = path.join(__dirname, `${DEFAULT_CACHE_DIR}_c5_001_helper`)
+    const realDir = path.join(baseDir, '.xbk_cache_safe')
+    const linkPath = path.join(baseDir, 'cache_link')
+    const linkTarget = path.join(baseDir, 'link_target')
+    const backupReal = path.join(baseDir, 'backup_real')
+    const backupLink = path.join(baseDir, 'backup_link')
+    cleanupIsolatedDir(baseDir)
+    try {
+      fs.mkdirSync(realDir, { recursive: true })
+      fs.writeFileSync(path.join(realDir, 'push.json'), '{"keep":1}', 'utf8')
+      fs.writeFileSync(path.join(realDir, 'tombstones.json'), '["t1"]', 'utf8')
+
+      // ① 真目录：整体挪到备份位，内容一字不动（绝不能 rmSync）
+      const stashed = stashCachePath(realDir, backupReal)
+      assertEqualStr(stashed, backupReal, `真目录应被挪到备份位，实得 ${stashed}`)
+      assert(!fs.existsSync(realDir), '真目录应离开原位（而不是复制/残留）')
+      assertEqualStr(fs.readFileSync(path.join(backupReal, 'push.json'), 'utf8'), '{"keep":1}', '备份内容必须逐字节保留')
+
+      // ② 还原：先摘掉测试自建的符号链接，再把备份原样搬回
+      fs.symlinkSync(linkTarget, realDir)
+      assertEqualStr(restoreCachePath(realDir, stashed), 'restored', '有备份时必须还原')
+      assert(!fs.lstatSync(realDir).isSymbolicLink() && fs.lstatSync(realDir).isDirectory(), '还原后原位必须是真目录')
+      assertEqualStr(fs.readFileSync(path.join(realDir, 'tombstones.json'), 'utf8'), '["t1"]', '墓碑内容必须原样回来')
+      assert(!fs.existsSync(backupReal), '还原后备份位应已清空')
+
+      // ③ 符号链接：只摘链接，链接目标的内容不得被碰
+      fs.mkdirSync(linkTarget, { recursive: true })
+      fs.writeFileSync(path.join(linkTarget, 'keep.txt'), 'keep', 'utf8')
+      fs.symlinkSync(linkTarget, linkPath)
+      assertEqualStr(stashCachePath(linkPath, backupLink), null, '符号链接只摘链接、不产生备份')
+      assert(!fs.existsSync(linkPath), '符号链接应被摘掉')
+      assert(!fs.existsSync(backupLink), '符号链接不得产生备份目录')
+      assertEqualStr(fs.readFileSync(path.join(linkTarget, 'keep.txt'), 'utf8'), 'keep', '链接目标内容不得被删')
+
+      // ④ 原位无备份却是真实目录：拒绝覆盖（fail-closed），内容不得被删
+      assertEqualStr(restoreCachePath(realDir, null), 'refused', '无备份且原位是真实目录时必须拒绝')
+      assertEqualStr(fs.readFileSync(path.join(realDir, 'push.json'), 'utf8'), '{"keep":1}', '拒绝覆盖时真实内容必须完好')
+    } finally {
+      cleanupIsolatedDir(baseDir)
+    }
+  })
+
   await test('应急路径 .xbk_cache_safe 符号链接 → cacheDir 不指向外部（C022）', async () => {
     reset()
     setPushUrl('t_c022_cache_safe_symlink')
@@ -3816,23 +3924,25 @@ console.log('========================================\n');
     const safeLinkPath = path.join(__dirname, '.xbk_cache_safe')
     const defaultCachePath = path.join(__dirname, DEFAULT_CACHE_DIR)
     const externalTarget = path.join(os.tmpdir(), `xbk-cache-safe-${process.pid}`)
-    const backupDefault = path.join(__dirname, `.xbk_cache_safe_default_${process.pid}.bak`)
+    // 备份名带 pid+时间戳：与生产兜底目录撞名不可能，且崩溃残留的备份**不会**被下一次运行删掉
+    // （旧版 setup 直接 removePath(backupDefault)，等价于把上一次的兜底数据当垃圾清理）。
+    const backupSuffix = `${process.pid}_${Date.now()}`
+    const backupSafe = path.join(__dirname, `.xbk_cache_safe_bak_${backupSuffix}`)
+    const backupDefault = path.join(__dirname, `${DEFAULT_CACHE_DIR}.bak_${backupSuffix}`)
     const origCacheDir = Config.cache.dir
-    // 声明的裸删除豁免（Qodo #158 收敛的唯一例外）：本局部 helper 的目标之一是 os.tmpdir() 下的
-    // **仓库外**夹具 externalTarget——把它改走 removeDirInRoot 会直接使该用例失败。它不接收任何由
-    // 环境变量派生的路径：三个调用点分别是仓库外夹具、仓库根的固定符号链接名、以及备份路径，
-    // 全部为本文件字面量构造。:Qodo #158 的「来源」断言按此豁免逐字放行。
+    let stashedSafe = null
+    let stashedDefault = null
+    // 声明的裸删除豁免（Qodo #158 收敛的唯一例外）：本局部 helper 的**唯一**目标是不受仓库根约束的
+    // os.tmpdir() 夹具 externalTarget——把它改走 removeDirInRoot 会直接使该用例失败。仓库根上的
+    // .xbk_cache_safe 与分片缓存目录**不再**经过这里：旧注释称它们是「本文件字面量构造的固定符号链接名」，
+    // 但生产兜底生效的部署上 .xbk_cache_safe 是**真实目录**（xbk_message_store.js:35），前提不成立；
+    // 现在改走 stashCachePath/restoreCachePath（真目录整体备份还原，只有符号链接才摘）。
     const removePath = (p) => { try { fs.rmSync(p, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } }
     try {
-      removePath(backupDefault)
       removePath(externalTarget)
-      removePath(safeLinkPath)
-      let defaultStat = null
-      try { defaultStat = fs.lstatSync(defaultCachePath) } catch (e) { defaultStat = null }
-      if (defaultStat) {
-        if (defaultStat.isSymbolicLink()) fs.unlinkSync(defaultCachePath)
-        else fs.renameSync(defaultCachePath, backupDefault)
-      }
+      // C5-001：先让位（真目录 → 备份位，绝不删除），再建夹具软链
+      stashedSafe = stashCachePath(safeLinkPath, backupSafe)
+      stashedDefault = stashCachePath(defaultCachePath, backupDefault)
       fs.mkdirSync(externalTarget, { recursive: true })
       fs.symlinkSync(externalTarget, safeLinkPath)
       fs.symlinkSync(externalTarget, defaultCachePath)
@@ -3843,11 +3953,16 @@ console.log('========================================\n');
       assert(!probe.startsWith(safeLinkPath + path.sep), `cacheDir 不应使用被符号链接的应急路径: ${probe}`)
     } finally {
       Config.cache.dir = origCacheDir
-      removePath(safeLinkPath)
-      removePath(defaultCachePath)
+      // C5-001：摘掉夹具自建的软链后把备份原样搬回；只告警不抛（同 cleanupIsolatedDir 的理由：
+      // finally 里抛会盖掉用例自身的失败原因），并把备份路径写进告警以便人工归位。
+      for (const [target, backup] of [[safeLinkPath, stashedSafe], [defaultCachePath, stashedDefault]]) {
+        let status = 'skipped'
+        try { status = restoreCachePath(target, backup) } catch (e) { status = `error: ${e.message}` }
+        if (status === 'refused' || status.startsWith('error')) {
+          console.warn(`⚠️ 缓存夹具还原未完成（${status}），备份保留在 ${backup}：${target}`)
+        }
+      }
       removePath(externalTarget)
-      if (fs.existsSync(backupDefault)) fs.renameSync(backupDefault, defaultCachePath)
-      removePath(backupDefault)
     }
   })
 

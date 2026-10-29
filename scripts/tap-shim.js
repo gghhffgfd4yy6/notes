@@ -45,9 +45,12 @@ const path = require('node:path')
 //   * 旧注释「dup 修复把 4 个降到 2 个」**不是** dup 生效的证据，该归因**未被证实**：canary 是 47 个
 //     测试文件、baseline 是 32 个，L124 在两者之间由 RE 变 Survived，差异至少有一部分来自测试集收窄
 //     + tap-parser 空流语义（见下）。
-//   * 因此 `say()` 的三级兜底 `[TAP_FD, 1, 2]` **实际只有 fd 1 → fd 2 两级**：fd 1 被 closeSync(1)
-//     关掉后写它会抛 EBADF，于是 TAP 点落到 **stderr**，而 tap-runner 只解析 stdout ⇒ 仍判 RuntimeError。
-//     （这正是 storage 段在 TAP 档记 RuntimeError、在 command 档记 Killed 的机制之一；见 AGENTS.md
+//   * 因此 `say()` 的兜底通道**实际只有 fd 1**（TAP_FD 恒为 1）：fd 1 被 closeSync(1) 关掉后写它会抛 EBADF。
+//     修复前「任一 fd 写成功即算成功」会把 TAP 点**静默改投 stderr**：被测文件退出码为 0 时 stdout 为空，
+//     tap-parser 对空流判 {ok:true, skipReason:'no tests found'} ⇒ 该变异体静默 Survived（假绿）。
+//     现已改为「**只有 fd 1 投递成功才算成功**，否则 stderr 留证 + 退出码非零」（C10-007）：tap-runner
+//     的硬规则会把「非零退出且解析不到失败测试」记成 RuntimeError ⇒ 响亮，不再是空流假绿。
+//     （这也是 storage 段在 TAP 档记 RuntimeError、在 command 档记 Killed 的机制之一；见 AGENTS.md
 //     的「TAP 档已知限制」与 .local/storage-tap-RE-findings.md §3.2/§3.5。）
 //
 // 真正的修法是 shim 侧「中继子进程」（加载期 spawn 一个持有同一 stdout 管道的中继，退出时同步写其
@@ -60,17 +63,37 @@ try {
   TAP_FD = 1
 }
 
+let deliveryFailureReported = false
 function say (line) {
   const text = line + '\n'
-  // 逐个尝试：[TAP_FD, 1, 2]。注意 TAP_FD **恒为 1**（上面的 dup 是 no-op，实测见文件顶部注释）
-  // ⇒ 实际只有 fd 1 → fd 2 两级；fd 1 被 closeSync(1) 关掉后，TAP 点会落到 stderr，TAP 解析器看不到，
-  // 仍被判 RuntimeError。最后一级只是「不抛异常」的兜底：至少不会因抛异常而改变退出码/掩盖真实失败原因。
-  for (const fd of [TAP_FD, 1, 2]) {
+  // 投递契约（C10-007）：**只有 fd 1 写成功才算投递**。
+  // TAP_FD 是 fd 1 的 dup（上面的实测结论：`fs.openSync('/proc/self/fd/1','a')` 在 tap-runner 的
+  // socketpair 下恒 ENXIO ⇒ TAP_FD 恒为 1），故 [TAP_FD, 1] 都是「同一个 stdout 通道」。
+  // **stderr 不是投递通道**——tap-parser 只解析 stdout。
+  // 修复前这里是「任一 fd 写成功即算成功」：fd 1 被 closeSync(1) 关掉后 TAP 点静默改投 fd 2，于是
+  // stdout 为空、退出码仍是 0，tap-parser 对空流判 {ok:true, skipReason:'no tests found'} ⇒ 变异体
+  // 静默 Survived（假绿）。现在投递失败就**响亮**：stderr 留证（仅为可诊断，不算投递）+ 退出码非零
+  // —— tap-runner 的硬规则是「非零退出且解析不到失败测试 ⇒ RuntimeError」，比空流假绿诚实。
+  // 三个 fd 全失败（stderr 也写不进去）同样保持非零退出码：这条契约不依赖任何一次写成功。
+  let lastError = null
+  for (const fd of [TAP_FD, 1]) {
     try {
       fs.writeSync(fd, text)
-      return
-    } catch { /* 试下一个 */ }
+      return true
+    } catch (err) {
+      lastError = err
+    }
   }
+  process.exitCode = 1
+  // 一个点三行都写不进去，证据只留一条（三行重复只会把 stderr 刷成噪音）
+  if (!deliveryFailureReported) {
+    deliveryFailureReported = true
+    try {
+      fs.writeSync(2, `tap-shim: TAP 点无法投递到 stdout（fd 1 不可写：${lastError && lastError.code ? lastError.code : 'unknown'}）` +
+        '——空 stdout 会被 tap-parser 判 ok:true，故按投递失败置非零退出码\n')
+    } catch { /* stderr 也不可写：退出码已非零，不需要再留证 */ }
+  }
+  return false
 }
 
 const testFileArg = process.argv[1] || ''
@@ -113,10 +136,14 @@ function resolveSkipReason (file) {
   return null
 }
 
+// 三个 TAP 行必须**全部**投递成功才算这一个测试点被投递（部分投递 = 残缺 TAP 流，同样不可信）。
 function emitPoint (ok, note) {
-  say('TAP version 13')
-  say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${note ? ` # ${note}` : ''}`)
-  say('1..1')
+  const delivered = [
+    say('TAP version 13'),
+    say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${note ? ` # ${note}` : ''}`),
+    say('1..1')
+  ]
+  return delivered.every(Boolean)
 }
 
 const skipReason = resolveSkipReason(testFileName)
@@ -126,15 +153,19 @@ if (!testFileName) {
   emitPoint(false, 'tap-shim 无法从 argv[1] 取到被测文件')
   process.exitCode = 1
 } else if (skipReason) {
-  emitPoint(true, `SKIP ${skipReason}`)
-  process.exit(0)
+  // 跳过点也必须真的投递出去：投递失败时不能用 process.exit(0) 把 say() 置的非零退出码盖掉
+  // （C10-007：空 stdout + exit 0 会被 tap-parser 判 ok:true）。
+  const delivered = emitPoint(true, `SKIP ${skipReason}`)
+  process.exit(delivered ? 0 : 1)
 } else {
   process.on('exit', (code) => {
     const ok = code === 0
     emitPoint(ok, ok ? undefined : `exit code ${code}`)
     if (foreignTapLines > 0) {
       // 已经转发到 stderr，TAP 流里看不到；这里只是如实留证，供 canary 判断风险面。
-      fs.writeSync(2, `tap-shim: 正文里出现过 ${foreignTapLines} 行 TAP 形状输出（已转发到 stderr，未污染 TAP 流）\n`)
+      try {
+        fs.writeSync(2, `tap-shim: 正文里出现过 ${foreignTapLines} 行 TAP 形状输出（已转发到 stderr，未污染 TAP 流）\n`)
+      } catch { /* stderr 不可写：留证降级，不影响退出码 */ }
     }
   })
 }

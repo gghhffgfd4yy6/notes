@@ -1,12 +1,44 @@
 #!/bin/bash
 # commit-msg 钩子：提交信息规范校验（可 git commit --no-verify 跳过）
 # 允许前缀：fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:
+# 例外（C10-043）：`git merge` 生成的合并提交消息（`Merge branch 'x'` / `Merge tag 'v1'` /
+# `Merge remote-tracking branch '...'`）以 `^Merge ` 开头**且处于合并状态**（Git 的 MERGE_HEAD 存在）时
+# 免「类型前缀」这一条——它是 git 自己生成的，不可能也不需要带类型前缀；不放行时 `git merge --no-ff` 会被
+# 拦死并留下一次**未完成的合并**，收尾只能 `git commit --no-verify`（实测：exit 1 + `Not committing
+# merge`），等于连带跳过整道消息门禁。
+# MERGE_HEAD 这一半是必需的（CodeRabbit g1）：`git commit -m "Merge 随便写"` 的 subject 同样以
+# `Merge ` 开头，只看 subject 就等于给普通提交开了一条免前缀的后门。路径必须问
+# `git rev-parse --git-path MERGE_HEAD`：linked worktree 下 MERGE_HEAD 在 `.git/worktrees/<name>/`，
+# 硬编码 `.git/MERGE_HEAD` 会把 worktree 里的正常合并误拦。解析失败（不在仓库里 / git 不可用）或文件
+# 不存在，一律按普通提交处理（fail-closed）：证明不了在合并中就不免前缀。
+# 例外**只**免前缀：首行 ≤100 字符、标题与正文之间的空行对合并消息同样生效——git 的默认形态（单行
+# `Merge branch 'x'`，或编辑器里的「标题 + 空行 + 注释」）两者都满足，故不会误伤正常合并。
+# 注意 `^Merge ` 带空格：`Merged ...` 不是 git 的合并消息形态，不得借道通过。
 msg_file="$1"
 msg=$(head -1 "$msg_file")
-if ! echo "$msg" | grep -qE '^(fix|feat|refactor|docs|chore|style|test|perf|revert|build|ci)(\(.*\))?:'; then
-  echo "❌ 提交信息必须以类型前缀开头: fix: / feat: / refactor: / docs: / chore: / style: / test: / perf: / revert: / build: / ci:"
-  echo "   实际: $msg"
-  exit 1
+is_merge=0
+case "$msg" in
+  'Merge '*)
+    # 只有 subject 不够：`git commit -m "Merge ..."` 不是合并提交。判据是 MERGE_HEAD 存在（见文件头）。
+    merge_head=$(git rev-parse --git-path MERGE_HEAD 2>/dev/null) || merge_head=''
+    case "$merge_head" in
+      '') ;;
+      /*) [ -f "$merge_head" ] && is_merge=1 ;;
+      *)
+        # 主工作树返回相对路径（`.git/MERGE_HEAD`），钩子的 cwd 是仓库根；仍按根解析以防从子目录手跑。
+        merge_head="$(git rev-parse --show-toplevel 2>/dev/null)/$merge_head"
+        [ -f "$merge_head" ] && is_merge=1
+        ;;
+    esac
+    ;;
+esac
+if [ "$is_merge" -eq 0 ]; then
+  if ! echo "$msg" | grep -qE '^(fix|feat|refactor|docs|chore|style|test|perf|revert|build|ci)(\(.*\))?:'; then
+    echo "❌ 提交信息必须以类型前缀开头: fix: / feat: / refactor: / docs: / chore: / style: / test: / perf: / revert: / build: / ci:"
+    echo "   （仅「合并进行中」且以 'Merge ' 开头的合并提交免此前缀，但同样受首行长度与空行两条判据约束）"
+    echo "   实际: $msg"
+    exit 1
+  fi
 fi
 len=${#msg}
 if [ "$len" -gt 100 ]; then
@@ -18,6 +50,7 @@ fi
 # 本仓 v3.281 那个提交就是这么写的（标题被并成 5 行），钩子当时完全没拦。
 # Git 的 --cleanup 命令行覆盖值不会传给 commit-msg 钩子。
 # 因此固定检查原始消息第二行，确保所有清理模式下的标题长度判据一致。
+# 合并消息同样走这一段（C10-043）：默认形态第二行是空行或文件结束，不会被误拦。
 first_after_title=$(sed -n '2p' "$msg_file")
 case "$(printf '%s' "$first_after_title" | tr -d '[:space:]')" in
   '') ;;

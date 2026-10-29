@@ -815,7 +815,7 @@ function analyzeSegment (dir, entry, runnerConfigs, timeoutConfigs) {
   const timeoutMs = timeoutConfigs && typeof timeoutConfigs.get === 'function' ? timeoutConfigs.get(seg) : undefined
   const reportPath = findReportJson(path.join(dir, entry.name))
   if (!reportPath) return { seg, runnerConfig, timeoutMs, error: '缺 mutation-report.json' }
-  const stats = { total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, survivedMutants: [] }
+  const stats = { total: 0, killed: 0, survived: 0, noCoverage: 0, timeout: 0, runtimeError: 0, compileError: 0, survivedMutants: [] }
   // F4：解析与聚合同处 try 内——报告顶层为 null（JSON 字面量 null）/原始值时显式失败并走段级隔离，
   // 不抛 TypeError 逃出本函数（与上方注释「单段失败不中断整体」一致），也不把损坏报告伪装成
   // 0 变异体的正常段；错误补上报告路径便于定位。
@@ -875,6 +875,10 @@ function analyzeSegment (dir, entry, runnerConfigs, timeoutConfigs) {
     survived: stats.survived,
     noCoverage: stats.noCoverage,
     timeout: stats.timeout,
+    // C10-023：不可计入状态的计数（它们已计入 total）。render 据此判断「该段有没有有效变异体」，
+    // 不另算分数——`分数` 口径仍是 (killed+timeout)/total，一字未改。
+    runtimeError: stats.runtimeError,
+    compileError: stats.compileError,
     // `分数` 的两位小数四舍五入与合计行共用 scoreOf（防止两处各写一份而静默漂移）。
     score: scoreOf(stats),
     survivedMutants: stats.survivedMutants,
@@ -929,7 +933,69 @@ function countMutant (stats, fileKey, m) {
     stats.noCoverage++
   } else if (m.status === 'Timeout') {
     stats.timeout++
+  } else if (m.status === 'RuntimeError') {
+    // C10-023：不可计入状态也要记账。只抬 total 时「整段 RuntimeError」与「整段被杀」在日报里同形
+    // （四个桶全 0、survivedMutants 为空 ⇒ 渲染出 🎉），而 report job 是 if: always() 照发。
+    // `|| 0` 兼容直接调用 countMutant 的小夹具（stats 里没有这两个字段时按 0 起算）。
+    stats.runtimeError = (stats.runtimeError || 0) + 1
+  } else if (m.status === 'CompileError') {
+    stats.compileError = (stats.compileError || 0) + 1
   }
+}
+
+/**
+ * 有效变异体数 = killed + timeout + survived + noCoverage（C10-023）。
+ *
+ * 其余合法状态（RuntimeError / CompileError / Ignored / Pending）计入 `total`（因此进 `分数` 的分母），
+ * 但**不是**可判定的结果：它们说明变异体没跑起来（或没跑）。整段都落在这些状态时该段一个有效变异体
+ * 都没有——这时**不得**宣布「无存活变异体」，只能声明「本段不构成判据」。
+ *
+ * @param {object} r analyzeSegment 的产物（段统计）
+ * @returns {number} 有效变异体数（入参非法时为 0）
+ */
+function validMutantCount (r) {
+  if (!r || typeof r !== 'object') return 0
+  return (r.killed || 0) + (r.timeout || 0) + (r.survived || 0) + (r.noCoverage || 0)
+}
+
+/**
+ * `变异体` 单元格：总数 + （仅当存在不可计入状态时）括号披露 RE/CE/其他 的计数。
+ *
+ * 为什么要有括号（C10-023 的建议项，做成单元格后缀而非新增列）：`total` 把不可计入状态一起算了进去，
+ * 读者看到 `变异体 150` 却只对上 100 个可计入结果时无从知道差在哪。括号只在真有这类状态时出现，
+ * 因此正常段的输出逐字不变（12 列的快照/单元格下标契约零漂移）。
+ *
+ * @param {object} r analyzeSegment 的产物
+ * @returns {string} 单元格文本
+ */
+function formatTotalCell (r) {
+  const total = Number.isFinite(r && r.total) ? r.total : 0
+  const runtimeError = (r && r.runtimeError) || 0
+  const compileError = (r && r.compileError) || 0
+  const other = total - validMutantCount(r) - runtimeError - compileError
+  const parts = []
+  if (runtimeError > 0) parts.push(`RE ${runtimeError}`)
+  if (compileError > 0) parts.push(`CE ${compileError}`)
+  if (other > 0) parts.push(`其他 ${other}`)
+  return parts.length === 0 ? String(total) : `${total}（${parts.join('/')}）`
+}
+
+/**
+ * 不可计入状态的逐项明细（`RuntimeError 3 / CompileError 1 / 其他不可计入 2`）。
+ * 只给「无有效变异体的段」小节用：读者必须能看出 4 个变异体里到底哪个状态占了多少。
+ *
+ * @param {object} r analyzeSegment 的产物
+ * @returns {string} 明细文本（没有任何不可计入状态时给出占位说明）
+ */
+function invalidStatusBreakdown (r) {
+  const runtimeError = (r && r.runtimeError) || 0
+  const compileError = (r && r.compileError) || 0
+  const other = (Number.isFinite(r && r.total) ? r.total : 0) - validMutantCount(r) - runtimeError - compileError
+  const parts = []
+  if (runtimeError > 0) parts.push(`RuntimeError ${runtimeError}`)
+  if (compileError > 0) parts.push(`CompileError ${compileError}`)
+  if (other > 0) parts.push(`其他不可计入 ${other}`)
+  return parts.length > 0 ? parts.join(' / ') : '无可计入状态'
 }
 
 // Markdown 表格单元格转义：| 破坏表格、换行破坏行结构、反引号破坏代码标记（子代理审查）
@@ -1108,7 +1174,7 @@ function _renderSegmentTable (results) {
       tHitLimit += r.timeoutStats.hitLimit
       tOther += r.timeoutStats.other
     }
-    lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ${r.total} | ${r.killed} | ${formatTimeoutCell(r)} | ${r.survived} | ` +
+    lines.push(`| ${formatSegmentLabel(r.seg, r.runnerConfig)} | ${formatTotalCell(r)} | ${r.killed} | ${formatTimeoutCell(r)} | ${r.survived} | ` +
       `${r.noCoverage} | ${r.score}% | ${formatCovered(r)} | ${formatReuseCell(r.reuse, r.total)} | ` +
       `${timeoutKindCell(r, 'hang')} | ${timeoutKindCell(r, 'hitLimit')} | ${formatTimeoutLimit(r.timeoutMs)} |`)
   }
@@ -1136,6 +1202,14 @@ function _renderSegmentTable (results) {
   lines.push(`| **合计** | **${tTotal}** | **${tKilled}** | ${timeoutTotal} | **${tSurvived}** | **${tNoCoverage}** | **${overall}%** | **${formatCovered({ killed: tKilled, timeout: tTimeout, survived: tSurvived })}** | **${reusedSegs} 段复用** | ${hangTotal} | ${hitLimitTotal} | **${NO_COVERAGE_PLACEHOLDER}** |`)
   lines.push(..._renderCoveredScopeNote(results))
   lines.push(..._renderTimeoutScopeNote(results))
+  // C10-023：只有真有不可计入状态时才解释 `变异体` 列的括号——必须放在**合计行之后**（放表中间会把
+  // 表格截断，合计行变成游离行）。正常段（无 RE/CE）输出逐字不变，12 列的快照与 cells[i] 下标零漂移。
+  if (results.some(r => !r.error && formatTotalCell(r) !== String(Number.isFinite(r.total) ? r.total : 0))) {
+    lines.push('')
+    lines.push('> **`变异体` 列括号 = 不可计入状态**（RE=RuntimeError、CE=CompileError、其他=Ignored/Pending）：' +
+      '它们计入 `变异体` 与 `分数` 的分母，但**不在** `covered 口径` 的分母里。与 NoCoverage 的差别是语义：' +
+      'NoCoverage 是「跑过但没被覆盖」，这些状态是「根本没跑起来/没跑」，**不能当作已检出的证据**。')
+  }
   return lines
 }
 
@@ -1273,7 +1347,11 @@ function _renderReuseNotice (results) {
     lines.push('')
     return lines
   }
-  if (partial.length === 0 && unaccounted.length === 0) {
+  // 「没有任何段的复用状态记录」只允许在**所有**可用段都未记录时成立（C10-022）。
+  // 缺 `unknown.length === usable.length` 时，2 段全量 + 1 段未记录也会落到这里：既宣称「没有任何段」
+  // （而 2 段明明有记录），又只列未记录的 1 段，与末行「其余 2 段全量重算（共 3 段…）」自相矛盾。
+  // 其余情形一律落到下面的增量分支（逐类点名 + 互斥末行计数）。
+  if (partial.length === 0 && unaccounted.length === 0 && unknown.length === usable.length) {
     lines.push('⚠️ 本次日报**没有任何段的复用状态记录**（reuse.json 缺失或无法解析）⇒ 无法判定哪些段复用了旧结果；' +
       '**不要把这些段的分数/存活清单当作「本 commit 测试状态」下的结果**。')
     lines.push('')
@@ -1347,6 +1425,41 @@ function _renderReuseNotice (results) {
   return lines
 }
 
+/**
+ * 「无有效变异体的段」小节（C10-023）。
+ *
+ * 为什么必须有：`countMutant` 只把合法但不可计入的状态算进 `total`，`analyzeSegment` 只拦 `total === 0`，
+ * 于是**整段 RuntimeError / CompileError** 的报告能一路走到 `render`：四个桶全 0、`survivedMutants` 为空
+ * ⇒ 旧实现输出「🎉 无存活变异体！」。而 `mutation.yml` 的 report job 是 `if: always()`——守卫判红的那
+ * 一轮恰恰照发日报，读者拿到的就是一句「全绿」。这里改为逐段点名 `有效变异体 = 0` 并明说「本段不构成判据」，
+ * 且给出 RuntimeError / CompileError / 其他的计数（`有效变异体 = killed+timeout+survived+noCoverage`）。
+ *
+ * 纯显示层：不 throw、不改任何统计口径（`分数` 仍是 (killed+timeout)/total）。
+ *
+ * @param {Array<object>} results analyzeSegment 的产物
+ * @returns {string[]} markdown 行
+ */
+function _renderInvalidMutantNotice (results) {
+  const usable = (Array.isArray(results) ? results : []).filter(r => r && !r.error)
+  const invalid = usable.filter(r => validMutantCount(r) === 0)
+  if (invalid.length === 0) return []
+  const lines = []
+  lines.push('## ⚠️ 无有效变异体的段（不构成判据）')
+  lines.push('')
+  lines.push('下列段**没有产出任何可判定的变异体结果**：`被杀`/`超时`/`存活`/`无覆盖` 四个桶全为 0，' +
+    '变异体全部落在 RuntimeError / CompileError / Ignored / Pending 这类不可计入状态。')
+  lines.push('')
+  for (const r of invalid) {
+    lines.push(`- \`${r.seg}\`：变异体 ${r.total} 个（${invalidStatusBreakdown(r)}），有效变异体 0 —— 无有效变异体，本段不构成判据。`)
+  }
+  lines.push('')
+  lines.push('`分数` 为 `0%` / `covered 口径` 为 `—` **不代表「无存活」**，更**不得**读作全绿：这些段根本没有跑出可比的结果' +
+    '（典型成因是变异体运行期崩溃或编译失败）。本日报仍会照常发出（report job 为 `if: always()`），' +
+    '所以这条提示必须单独读——先修好这些段的运行环境再重跑。')
+  lines.push('')
+  return lines
+}
+
 function _renderTopFiles (byFile) {
   // 存活最多的文件 Top 10（含具体数量——定位补测重点）
   const lines = []
@@ -1375,7 +1488,7 @@ function _renderTopKinds (byKind) {
   return lines
 }
 
-function _renderSurvivors (allSurvived) {
+function _renderSurvivors (allSurvived, invalidSegments = [], usableCount = 0) {
   // 存活变异体清单（>30 时截断显示"还有 N 个"）；无存活则 🎉 分支
   const lines = []
   if (allSurvived.length > 0) {
@@ -1385,6 +1498,20 @@ function _renderSurvivors (allSurvived) {
       lines.push(`- \`${escCell(m.file)}:${m.line}\` ${escCell(m.mutator)} → \`${escCell(String(m.replacement).slice(0, 40))}\``)
     }
     if (allSurvived.length > 30) lines.push(`- …还有 ${allSurvived.length - 30} 个（见各段报告）`)
+  } else if (invalidSegments.length > 0) {
+    // C10-023：存活清单为空**不等于**「没有存活变异体」——有段根本没产出可判定的结果时，🎉 是假绿话术。
+    // 这一段只在「无有效变异体的段」小节已经存在时出现（两者同源，措辞互相引用）。
+    if (usableCount > 0 && invalidSegments.length === usableCount) {
+      lines.push('## ⚠️ 无有效变异体（不构成判据）')
+      lines.push('')
+      lines.push('本次没有任何段产出可判定的变异体结果（全部是 RuntimeError / CompileError 等不可计入状态）：' +
+        '**不得读作「无存活变异体」**，也不得读作全绿——详见上方「无有效变异体的段」小节。')
+    } else {
+      lines.push(`## ⚠️ 无存活变异体（但有 ${invalidSegments.length} 段无有效变异体，不构成判据）`)
+      lines.push('')
+      lines.push(`存活清单为空，但 ${invalidSegments.map(r => `\`${r.seg}\``).join('、')} 没有产出可判定的结果：` +
+        '**这些段不构成判据，本日报不得读作「全部变异体被检出」**（详见上方「无有效变异体的段」小节）。')
+    }
   } else {
     lines.push('## 🎉 无存活变异体！')
   }
@@ -1395,16 +1522,20 @@ function render (results) {
   // 协调器：标题 + collectStats + 4 个子段拼装 + footer
   // 单 push 多参调用避免 SonarCloud S7778 / Lizard_ccn 重复 push 告警
   const { byFile, byKind, allSurvived } = collectStats(results)
+  // C10-023：有效变异体为 0 的段（全 RuntimeError/CompileError 等）单独点名，且不给 🎉 绿话术。
+  const usable = results.filter(r => r && !r.error)
+  const invalidSegments = usable.filter(r => validMutantCount(r) === 0)
   const lines = []
   lines.push(
     '## 🧬 变异测试日报',
     '',
     ..._renderSegmentTable(results),
     '',
+    ..._renderInvalidMutantNotice(results),
     ..._renderReuseNotice(results),
     ..._renderTopFiles(byFile),
     ..._renderTopKinds(byKind),
-    ..._renderSurvivors(allSurvived),
+    ..._renderSurvivors(allSurvived, invalidSegments, usable.length),
     '',
     '> 由 mutation-report.js 自动生成'
   )
@@ -1804,6 +1935,9 @@ module.exports = {
   coveredScore,
   formatCovered,
   NO_COVERAGE_PLACEHOLDER,
+  // C10-023：有效变异体（四桶）判据 + 变异体列的不可计入状态披露
+  validMutantCount,
+  formatTotalCell,
   // runner 档位逐段披露（PR-1 · 审查 A2 的 F-2）
   parseMatrixRunnerConfigs,
   readMatrixRunnerConfigs,
