@@ -1010,7 +1010,6 @@ console.log('========================================\n');
 
   await test('空内容 → 返回空', () => {
     const result = htmlToMarkdown({ url: 'http://x' })
-    assertEqual(result.includes('原文链接'), true)
     assertEqual(result.includes('http://x'), true)
   })
 
@@ -1027,7 +1026,6 @@ console.log('========================================\n');
       url: 'http://x'
     })
     assertEqual(result.includes('[链接](http://url)'), true)
-    assertEqual(result.includes('原文链接'), true)
   })
 
   await test('图片标签被转换', () => {
@@ -1623,7 +1621,8 @@ console.log('========================================\n');
       assertEqual(Buffer.byteLength(r, 'utf8') <= maxBytes, true, '返回的裁剪结果不得超过 maxBytes（防读端自锁）')
       assertEqual(droppedOut.length > 0, true, '超限时应发生裁剪')
     } else {
-      assertEqual(true, true, '单条仍超限返回 null 也是合法兜底')
+      // C5-019：null 分支的契约是「没有实际裁掉任何记录 ⇒ 不产生丢弃」（旧 assertEqual(true,true) 恒真）
+      assertEqual(droppedOut.length, 0, '返回 null（单条仍超限）时不得记为丢弃：没有实际裁掉任何记录')
     }
   })
 
@@ -2786,8 +2785,9 @@ console.log('========================================\n');
   })
 
   await test('saveBatch 空数组 → 不报错', () => {
-    saveBatch([], 'test_batch_empty.json')
-    assertEqual(true, true)
+    // C5-019：契约是「不抛」（旧 assertEqual(true,true) 永远不会红），并断言确实没写入任何消息
+    assert.doesNotThrow(() => saveBatch([], 'test_batch_empty.json'), '空数组不得抛错')
+    assertEqual(readMessages(getFilePath('test_batch_empty.json')).length, 0, '空数组不得写入任何消息')
   })
 
   await test('saveBatch 含重复 id → 更新不重复', () => {
@@ -2817,9 +2817,9 @@ console.log('========================================\n');
   console.log('\n📂 30. init & decodeHtmlEntities')
 
   await test('init 重复调用 → 不报错', () => {
-    init()
-    init()
-    assertEqual(true, true)
+    // C5-019：契约是「重复调用不抛」（旧 assertEqual(true,true) 永远不会红）
+    assert.doesNotThrow(() => { init(); init() }, '重复 init 不得抛错')
+    assertEqual(require('fs').existsSync(CACHE), true, '重复 init 后缓存目录仍存在')
   })
 
   await test('decodeHtmlEntities 全部常见实体', () => {
@@ -2872,7 +2872,6 @@ console.log('========================================\n');
       content_html: '<p>hello</p>', url: 'http://x'
     })
     assertEqual(r.includes('hello'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   // ==================== 32. has() url fallback 判重 ====================
@@ -3357,7 +3356,6 @@ console.log('========================================\n');
     })
     assertEqual(r.includes('测试'), true)
     assertEqual(r.includes('<b>'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('模板含{Html内容}和{标题}混合', () => {
@@ -3366,7 +3364,6 @@ console.log('========================================\n');
     })
     assertEqual(r.includes('商品'), true)
     assertEqual(r.includes('内容'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   // C10-070（audit38）：100k 硬上限必须按 UTF-16 安全截断（SYSTEM_CONTRACT.md:31）。
@@ -3512,20 +3509,51 @@ console.log('========================================\n');
 
   await test('init 在目录不存在时自动创建', () => {
     const fs = require('fs')
-    const dir = CACHE
-    // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
-    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-    init()
-    assertEqual(fs.existsSync(dir), true)
+    // C4-013：CACHE 由外部 XBK_PARALLEL_ID 决定——调度器给两个进程同一个 ID 时它是**共用**目录
+    // （此时 OWNS_CACHE_DIR=false，退出清理已经不删它）。整目录删除会把对方正在用的判重缓存清掉，
+    // 故只删 CACHE 之下本进程专属的子目录：用例要证的仍是「目录不存在 → init 自动创建」。
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_init_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    // 同分片里另一进程的活跃缓存：本用例跑完它必须还在（旧写法整目录删除时必丢）
+    const peerFile = path.join(CACHE, `peer_live_cache_${process.pid}.json`)
+    fs.mkdirSync(CACHE, { recursive: true })
+    fs.writeFileSync(peerFile, '{"peer":true}')
+    const orig = Config.cache.dir
+    try {
+      // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      Config.cache.dir = sub
+      init()
+      assertEqual(fs.existsSync(dir), true)
+      assertEqual(fs.existsSync(peerFile), true, '不得删除共用分片里其它进程的缓存（C4-013：整目录删除不受 OWNS_CACHE_DIR 保护）')
+    } finally {
+      Config.cache.dir = orig
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      try { fs.unlinkSync(peerFile) } catch (e) {}
+    }
   })
 
   await test('save 在目录不存在时自动创建（_ensureFileExists）', () => {
     const fs = require('fs')
-    const dir = CACHE
-    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-    appendMessageToFile({ id: 555 }, 'test_recreate.json')
-    assertEqual(fs.existsSync(dir), true)
-    assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
+    // C4-013：同上——只删本进程专属子目录，不删可能被同 ID 的另一进程共用的 CACHE。
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_save_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    const peerFile = path.join(CACHE, `peer_live_cache_save_${process.pid}.json`)
+    fs.mkdirSync(CACHE, { recursive: true })
+    fs.writeFileSync(peerFile, '{"peer":true}')
+    const orig = Config.cache.dir
+    try {
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      Config.cache.dir = sub
+      appendMessageToFile({ id: 555 }, 'test_recreate.json')
+      assertEqual(fs.existsSync(dir), true)
+      assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
+      assertEqual(fs.existsSync(peerFile), true, '不得删除共用分片里其它进程的缓存（C4-013：整目录删除不受 OWNS_CACHE_DIR 保护）')
+    } finally {
+      Config.cache.dir = orig
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      try { fs.unlinkSync(peerFile) } catch (e) {}
+    }
   })
 
   // v3.277（PR #156 复审）并发隔离回归：**撤销隔离即真红**——锁的是「假 Killed 真根因」，
@@ -4030,7 +4058,9 @@ console.log('========================================\n');
 
   await test('tuisong_replace {Html内容} content_html为空', () => {
     const r = tuisong_replace('{Html内容}', { url: 'http://x', content_html: undefined })
-    assertEqual(r.includes('原文链接'), true)
+    // 空 content_html ⇒ 正文段整段为空，只保留原文链接段（不得残留 undefined/null/花括号）
+    assertEqual(r, '<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="http://x" target="_blank">http://x</a><br>&nbsp;<br>&nbsp;<br>',
+      '空 content_html 必须只输出原文链接段，正文段为空')
     // 空内容不应显示 "undefined" 文本
     assertEqual(r.includes('undefined'), false)
   })
@@ -4062,7 +4092,6 @@ console.log('========================================\n');
   await test('tuisong_replace {Html内容} 原文链接URL正确', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/a.html' })
     assertEqual(r.includes('http://example.com/a.html'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   // ==================== 49. 第8轮变异盲区修复（异常输入健壮性） ====================
@@ -4192,10 +4221,11 @@ console.log('========================================\n');
   })
 
   await test('saveBatch 非数组输入 → 不崩溃', () => {
+    // C5-019：契约是「每个脏输入都不抛」（旧 assertEqual(true,true) 永远不会红）
     for (const value of [undefined, null, {}, 123, true, Symbol('x'), 'abc']) {
-      saveBatch(value, 'test_sb_non_array.json')
+      assert.doesNotThrow(() => saveBatch(value, 'test_sb_non_array.json'), `非数组输入 ${String(value)} 不得抛错`)
     }
-    assertEqual(true, true)
+    assertEqual(readMessages(getFilePath('test_sb_non_array.json')).length, 0, '非数组输入不得写入消息')
   })
 
   await test('htmlToMarkdown 纯空格内容', () => {
@@ -4376,7 +4406,6 @@ console.log('========================================\n');
   await test('tuisong {Html内容} 原文链接含实际URL', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/p.html' })
     assertEqual(r.includes('http://example.com/p.html'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('tuisong {Html内容} 链接文本是URL本身', () => {
@@ -4753,13 +4782,11 @@ console.log('========================================\n');
     // 变异 '{Html内容' 作为 key 时仍前缀匹配，替换结果末尾会残留 '}'
     const r = tuisong_replace('{Html内容}', { content_html: '测试', url: 'http://x' })
     assertEqual(r.includes('}'), false)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('tuisong {Markdown内容} 替换后无花括号残留', () => {
     const r = tuisong_replace('{Markdown内容}', { content_html: '测试', url: 'http://x' })
     assertEqual(r.includes('}'), false)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('validateConfig 逐字段验证无效正则（变异字段名数组会漏验）', () => {
@@ -5692,7 +5719,6 @@ console.log('========================================\n');
     // 无标签内容走短路路径，输出应与正常路径一致
     const r = htmlToMarkdown({ content_html: '纯文本&nbsp;内容', url: 'http://x' })
     assertEqual(r.includes('纯文本 内容'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('getFilePath 超长文件名截断（#146）', () => {
@@ -6555,18 +6581,39 @@ console.log('========================================\n');
   // ==================== 89. 配置矩阵(组合爆炸) ====================
   console.log('\n📂 89. 配置矩阵')
 
-  await test('矩阵: 过滤字段全组合 listfilter 不崩', () => {
+  await test('矩阵: 过滤字段全组合（2^10）逐组断言拦截/放行（独立 oracle）', () => {
     const fields = ['pingbifenlei', 'pingbibiaoti', 'zhanxianbiaoti', 'pingbibiaotiplus', 'pingbineirong', 'zhanxianneirong', 'pingbineirongplus', 'pingbilouzhu', 'zhanxianlouzhu', 'pingbilouzhuplus']
     const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '限时大促内容', louzhuregtime: '2026-01-01' }
-    // 2^10 全组合(每个字段 开/关)
-    for (let mask = 0; mask < 1024; mask++) {
-      const cfg = {}
-      for (let i = 0; i < fields.length; i++) {
-        if (mask & (1 << i)) cfg[fields[i]] = '京东'
+    // C4-014：原先 1024 组只断言 `typeof r === 'boolean'`——listfilter 恒 true（或恒 false）也全绿，
+    // 零鉴别力却贡献了「全组合」的覆盖面。这里由**独立 oracle** 按 mask 推导期望值，只依据字段语义
+    // 与夹具文本，不复用 listfilter / compileRules 的实现：
+    //   · 配置值一律 '京东'；夹具里只有标题 '京东神券' 含它（正文/楼主/分类都不含）
+    //   · pingbibiaotiplus 命中即拦（生产里 plus 优先于 show，展示不抵消 plus）
+    //   · pingbibiaoti 命中即拦，但同字段的 zhanxianbiaoti 同时开启时被「展示」抵消
+    //   · 其余 7 个字段在夹具文本里不命中 ⇒ 恒不拦截
+    //   · pingbitime=5 且注册日 2026-01-01 距固定今天 212 天 ⇒ 不拦截
+    // 「今天」必须固定：注册天数是距今自然日差，不固定则期望值随真实日期逐日漂移（同「时间旅行」用例）。
+    const origNow = Date.now
+    Date.now = () => Date.UTC(2026, 7, 1) // 固定"今天"= 2026-08-01 00:00 UTC
+    try {
+      const on = (mask, i) => (mask & (1 << i)) !== 0
+      const expected = (mask) => !(on(mask, 3) || (on(mask, 1) && !on(mask, 2)))
+      let blocked = 0
+      for (let mask = 0; mask < 1024; mask++) {
+        const cfg = {}
+        for (let i = 0; i < fields.length; i++) {
+          if (mask & (1 << i)) cfg[fields[i]] = '京东'
+        }
+        cfg.pingbitime = mask % 3 === 0 ? '5' : ''
+        const r = listfilter(group, cfg)
+        const exp = expected(mask)
+        if (r === false) blocked++
+        assertEqual(r, exp, `组合 ${mask}（${fields.filter((f, i) => mask & (1 << i)).join('+') || '全关'}）期望 ${exp}，实得 ${r}`)
       }
-      cfg.pingbitime = mask % 3 === 0 ? '5' : ''
-      const r = listfilter(group, cfg)
-      assertEqual(typeof r === 'boolean', true, `组合 ${mask} 应返回布尔`)
+      // 矩阵必须双向覆盖：恒放行 / 恒拦截两种退化实现都会让这个计数对不上
+      assertEqual(blocked, 640, `1024 组里应有 640 组被拦截（实得 ${blocked}）`)
+    } finally {
+      Date.now = origNow
     }
   })
 
@@ -6647,6 +6694,38 @@ console.log('========================================\n');
       const cnt = (src.match(new RegExp(h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
       assertEqual(cnt >= 2, true, `${h} 应被调用(出现${cnt}次)`)
     }
+  })
+
+  // ==================== 90b. 断言鉴别力 ====================
+  console.log('\n📂 90b. 断言鉴别力')
+
+  // C5-019：字面恒真断言（assertEqual(true,true) / assert.ok(true) / assert(true)）永远不会失败——
+  // 把「不会红」当断言，只给报告凑断言数。这里做源码级零容忍：新增一处即红。
+  // needle 一律由常量拼接：字面量直接写进门禁源码会自己命中自己（同 C4-004 的 seed 门禁手法）。
+  await test('C5-019: 恒真断言零容忍（字面 true 断言一律不许）', () => {
+    const fsx = require('fs')
+    const TRUE_LIT = 'true'
+    const patterns = [
+      new RegExp(`assertEqual\\(\\s*${TRUE_LIT}\\s*,\\s*${TRUE_LIT}\\s*[,)]`),
+      new RegExp(`assert\\.(?:ok|strictEqual)\\(\\s*${TRUE_LIT}\\s*[,)]`),
+      new RegExp(`assert\\(\\s*${TRUE_LIT}\\s*\\)`)
+    ]
+    // 判据自检：三种形态都必须被认出，否则门禁本身退化成「恒绿」
+    for (const sample of [`assertEqual(${TRUE_LIT}, ${TRUE_LIT})`, `assert.ok(${TRUE_LIT})`, `assert(${TRUE_LIT})`]) {
+      assertEqual(patterns.some(re => re.test(sample)), true, `判据必须认出恒真断言形态：${sample}`)
+    }
+    const hits = []
+    for (const f of ['test_filter.js', 'test_doc_line_gates.js']) {
+      const lines = fsx.readFileSync(path.join(__dirname, f), 'utf8').split('\n')
+      lines.forEach((line, i) => {
+        const code = line.trim()
+        // 注释里提到该形态不算（说明文字要能解释为什么禁止它）
+        if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return
+        for (const re of patterns) if (re.test(line)) hits.push(`${f}:${i + 1}`)
+      })
+    }
+    assert.deepStrictEqual(hits, [],
+      '字面恒真断言零鉴别力（永远不会红），改成 assert.doesNotThrow / 真值断言：' + hits.join(', '))
   })
 
   // ==================== 91. Unicode 深度测试 ====================
@@ -6735,15 +6814,19 @@ console.log('========================================\n');
 
   await test('故障注入: fs.writeFileSync 抛错 → saveMessages 不崩溃', () => {
     const fs = require('fs')
+    const p = getFilePath('test_fault.json')
+    try { fs.unlinkSync(p) } catch (e) {}
     const orig = fs.writeFileSync
     fs.writeFileSync = () => { throw new Error('磁盘满') }
     try {
-      saveMessages(getFilePath('test_fault.json'), [{ id: 1 }])
-      // 不应抛到调用方(内部已 try-catch)
+      // C5-019：契约是「写失败不抛到调用方」（旧 assertEqual(true,true) 永远不会红），
+      // 且失败后不得留下半成品文件（会被下一次读盘当成有效缓存）
+      assert.doesNotThrow(() => saveMessages(p, [{ id: 1 }]), 'fs 写失败应被容错，不得抛到调用方')
+      assertEqual(fs.existsSync(p), false, '写失败后不得留下目标文件（半成品）')
     } finally {
       fs.writeFileSync = orig
+      try { fs.unlinkSync(p) } catch (e) {}
     }
-    assertEqual(true, true, 'fs 写失败应被容错')
   })
 
   await test('故障注入: fs.readFileSync 抛错 → readMessages 返回空数组', () => {
@@ -6783,13 +6866,13 @@ console.log('========================================\n');
     fs.renameSync = () => { throw new Error('rename失败') }
     const p = getFilePath('test_rename_fault.json')
     try {
-      saveMessages(p, [{ id: 1 }]) // 内部 try-catch，不应抛
+      // C5-019：契约是「rename 失败不抛到调用方」（旧 assertEqual(true,true) 永远不会红）
+      assert.doesNotThrow(() => saveMessages(p, [{ id: 1 }]), 'rename 失败应被容错，不得抛')
       assertEqual(fs.existsSync(p + '.tmp'), false, 'tmp 应被清理')
     } finally {
       fs.renameSync = orig
       try { fs.unlinkSync(p) } catch (e) {}
     }
-    assertEqual(true, true, 'rename 失败应被容错')
   })
 
   await test('故障注入: saveBatch 落盘失败 → 内存缓存不得提前判重', () => {
@@ -6853,15 +6936,29 @@ console.log('========================================\n');
     try { fs.unlinkSync(p) } catch (e) {}
   })
 
-  await test('故障注入: fs.mkdirSync 抛错 → init 不崩溃', () => {
+  // C5-019：原用例在「CACHE 已存在」时 mkdirSync 根本不会被调用（注入点不可达），收尾再写
+  // assertEqual(true,true) —— 断言恒真且注入无效。真实契约（v3.245 P1）是「目录创建失败必须响亮
+  // 暴露」：既打 console.error 也把异常抛给调用方。改为在**缺失**的专属子目录上注入，两条都断言。
+  await test('故障注入: fs.mkdirSync 抛错 → init 必须暴露（日志 + 抛出）', () => {
     const fs = require('fs')
-    const orig = fs.mkdirSync
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_mkdir_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+    const origMkdir = fs.mkdirSync
+    const origErr = console.error
+    const origDir = Config.cache.dir
+    const logs = []
     fs.mkdirSync = () => { throw new Error('权限不足') }
+    console.error = (...a) => { logs.push(a.join(' ')) }
     try {
-      init() // init 内部 try-catch(console.error)，不应抛
-      assertEqual(true, true)
+      Config.cache.dir = sub
+      assert.throws(() => init(), /权限不足/, '目录创建失败必须把异常抛给调用方（不得静默吞掉）')
+      assertEqual(logs.some(l => l.includes('缓存目录创建失败')), true, '目录创建失败必须打 console.error 留痕')
     } finally {
-      fs.mkdirSync = orig
+      fs.mkdirSync = origMkdir
+      console.error = origErr
+      Config.cache.dir = origDir
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
     }
   })
 
@@ -6898,10 +6995,11 @@ console.log('========================================\n');
     circular.self = circular // 循环引用
     const p = getFilePath('test_circular.json')
     try { fs.unlinkSync(p) } catch (e) {}
-    saveMessages(p, [circular]) // 序列化失败应容错（内存保留不落盘）
-    assertEqual(true, true, 'saveMessages 循环引用应容错')
-    saveBatch([circular], 'test_circular.json') // _upsert 比较失败按更新处理
-    assertEqual(true, true, 'saveBatch 循环引用应容错')
+    // C5-019：契约是「序列化失败不抛」（旧 assertEqual(true,true) 永远不会红）；saveMessages
+    // 还必须做到「内存保留、磁盘无半成品」——半个 JSON 会被下一次读盘当成有效缓存。
+    assert.doesNotThrow(() => saveMessages(p, [circular]), 'saveMessages 循环引用应容错，不得抛')
+    assertEqual(fs.existsSync(p), false, '序列化失败不得落盘（不得留下半成品文件）')
+    assert.doesNotThrow(() => saveBatch([circular], 'test_circular.json'), 'saveBatch 循环引用应容错，不得抛')
   })
 
   // ==================== 93. 深度嵌套压力 ====================
@@ -9577,12 +9675,16 @@ console.log('========================================\n');
       for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
         assertEqual(daysComputed(v), baseline, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
       }
+      // C4-022：原收尾断言 `new Date(Date.UTC(2026,7,1)).getTime() === Date.UTC(2026,7,1)` 验的是
+      // Date 的定义（连本模块都不 require 也恒真），与本用例契约无关。换成同一「UTC 零点」契约的
+      // 两条真实输入：显式 ISO-Z 形态与纯日期同值；16:00Z 仍属前一天（宿主本地时区不得参与）。
+      assertEqual(daysComputed('2026-08-01T00:00:00Z'), baseline, '显式 ISO-Z 形态应与纯日期同值')
+      assertEqual(daysComputed('2026-07-31T16:00:00Z'), 3, 'UTC 口径：16:00Z 仍属 7/31（宿主本地时区不得参与）')
     } finally {
       Date.now = origNow
     }
     // 数字类型不受 trim 影响（String(number) 本无空白）
     assertEqual(daysComputed(1755300000), daysComputed('1755300000'), '数字与字符串时间戳口径一致')
-    assertEqual(new Date(Date.UTC(2026, 7, 1)).getTime(), Date.UTC(2026, 7, 1), 'UTC 零点常量自检')
   })
 
   await test('parseTime 全空白字符串 → 无效（P1-02：trim 后空串返回 null）', () => {
@@ -11553,6 +11655,16 @@ console.log('========================================\n');
     const tail = code.slice(-800)
     assertEqual(tail.includes(EXIT_CALL), false, `收尾区不得出现 ${EXIT_CALL}（不等待管道 flush，会截断尾部输出）`)
     assertEqual(/process\.exitCode\s*=\s*failed > 0 \? 1 : 0/.test(tail), true, '收尾必须设置 process.exitCode = failed > 0 ? 1 : 0')
+  })
+
+  // C4-023：13 个互不相关的用例共用同一句 `assertEqual(r.includes('原文链接'), true)`，是照着上一个用例
+  // 补的样板尾巴，不是各自想清楚要锁什么：原文链接的格式由「htmlToMarkdown 原文链接格式精确断言」
+  // 专门覆盖，模板路径留 1–2 处即可。这条门禁防止样板再被复制回去（数量一涨即红，逼着写各自要锁的契约）。
+  await test('原文链接样板断言不得成片复制（C4-023：只留模板类 1–2 处 + 格式专门用例）', () => {
+    const self = require('fs').readFileSync(__filename, 'utf8')
+    const boiler = self.split('\n').filter((l) => /^\s*assertEqual\((?:r|result)\.includes\('原文链接'\), true\)$/.test(l))
+    assertEqual(boiler.length <= 2, true,
+      `同一句样板应只留 1–2 处（模板类 + 格式专门用例），实际 ${boiler.length} 处：${JSON.stringify(boiler.map((l) => l.trim()))}`)
   })
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
