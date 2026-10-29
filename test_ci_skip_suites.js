@@ -999,6 +999,23 @@ const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 零套件守
 // 用它秒级收尾——过滤后为零套件已被 3f 固定为非 0，不能再拿它当「快速跑完」的挡箭牌。
 const skipAllButOne = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
 
+// ── 墙钟/轮次常量的单点定义（C4-030）────────────────────────────────────────────────
+// 这些数字原先内联在各用例里（每套件上限、子进程兜底、收敛预算、心跳观测窗、并发回归的
+// 轮次/抖动），而它们与「每套件上限 / 子进程兜底 / 心跳一拍」的耦合只写在散文注释里 ⇒ 改动时
+// 分不清哪个数是**判据**、哪个是**余量**。集中具名后倍数关系直接落在表达式上：
+//   · ENTRY_CONVERGE_BUDGET_MS = 66 × HANG_SUITE_TIMEOUT_MS（余量，不是判据）；
+//   · SPAWN_BAILOUT_MS        = 100 × HANG_SUITE_TIMEOUT_MS（兜底：撞它就是入口没收敛）；
+//   · HEARTBEAT_OBSERVE_MS    = 14 × HEARTBEAT_INTERVAL_MS（14 拍，足以区分「停了」与「还在写」）。
+// 值一律不改（语义与断言强度不变），只把数字搬到有名字的地方。
+const HANG_SUITE_TIMEOUT_MS = 300 // 3g3：喂给入口的每套件上限（判据本体）
+const SPAWN_BAILOUT_MS = 30000 // 测试侧 spawnSync 兜底：撞到它说明入口永久阻塞
+const ENTRY_CONVERGE_BUDGET_MS = 20000 // 3g3：入口收敛预算 = 66 × 每套件上限（余量）
+const TREE_SUITE_TIMEOUT_MS = 1500 // 3g4：带孙进程的每套件上限，必须长过心跳观测窗
+const HEARTBEAT_INTERVAL_MS = 50 // 夹具孙进程的心跳写盘间隔
+const HEARTBEAT_OBSERVE_MS = 14 * HEARTBEAT_INTERVAL_MS // 700ms = 14 拍观测窗
+const SUMMARY_RACE_ROUNDS = 10 // 3b-并发回归：每个 hammer 进程的「写→读回→删」轮次
+const SUMMARY_RACE_JITTER_MS = 2 // 3b-并发回归：轮次内抖动上限（相位按 pid 错开）
+
 // ── 并发假杀隔离：summary 落点必须按进程唯一（PR #158）──────────────────────────
 // Stryker 一次 run 只建**一个**沙箱目录：`--concurrency 8` 时 8 个测试 worker 共用同一份 cwd，于是任何
 // **仓库相对**的共享可写路径都会被并发 worker 写→读→删互相踩。本段原先用固定的「reports/ + 固定名」做
@@ -1143,7 +1160,7 @@ try {
     ].join('\n')
     // rounds/jitter 取「回退必红、在位必绿」的最小成本档：本机实测共享路径下 5/5 真红（内容被覆盖或 ENOENT），
     // 唯一路径下恒绿；成本主要是 4 个子进程的 node 启动，与轮次基本无关，故不放大轮次（stryker 逐变异体都跑本套件）。
-    const spec = JSON.stringify({ template: CI_SUMMARY_PATH_TEMPLATE, stem: '.ci-summary-check', rounds: 10, jitterMs: 2 })
+    const spec = JSON.stringify({ template: CI_SUMMARY_PATH_TEMPLATE, stem: '.ci-summary-check', rounds: SUMMARY_RACE_ROUNDS, jitterMs: SUMMARY_RACE_JITTER_MS })
     const probeRun = spawnSync(process.execPath, ['-e', runner, path.join(probeDir, 'hammer.js')], {
       encoding: 'utf8',
       cwd: __dirname,
@@ -1251,13 +1268,13 @@ const hangDir = makeRunTestsSandbox(
 )
 try {
   const t0 = Date.now()
-  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: '300' }, { timeout: 30000 })
+  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: String(HANG_SUITE_TIMEOUT_MS) }, { timeout: SPAWN_BAILOUT_MS })
   const elapsed = Date.now() - t0
   assert.strictEqual(hang.signal, null,
     '入口必须自行结束：被测试侧 30s 兜底杀掉（signal 非 null）说明每套件超时失效，入口仍在永久阻塞')
   assert.notStrictEqual(hang.status, 0, '挂死套件必须让入口以非 0 退出（零假绿）')
   assert.match(hang.stdout, /超过每套件上限 300ms 已强杀/, '失败输出必须点名每套件超时（与断言红区分）')
-  assert.ok(elapsed < 20000, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
+  assert.ok(elapsed < ENTRY_CONVERGE_BUDGET_MS, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
 } finally {
   fs.rmSync(hangDir, { recursive: true, force: true })
 }
@@ -1293,7 +1310,7 @@ const treeDir = makeRunTestsSandbox(
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
       // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
       // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
-      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
+      `setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), ${HEARTBEAT_INTERVAL_MS})`,
       // 同上：孙进程自己也得有上限，否则父进程被外部杀掉后它无人可杀（ppid===1 后 killTree 到不了它）
       'setTimeout(() => process.exit(0), 90000).unref()',
       ''
@@ -1316,7 +1333,7 @@ try {
   let treeOut
   const t0 = Date.now()
   try {
-    tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: '1500' }, { timeout: 30000, stdio: ['ignore', treeOutFd, treeErrFd] })
+    tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: String(TREE_SUITE_TIMEOUT_MS) }, { timeout: SPAWN_BAILOUT_MS, stdio: ['ignore', treeOutFd, treeErrFd] })
   } finally {
     // 子进程已退出且不再写：先按 fd 取真实大小，再从**位置 0** 显式读回。位置必须显式给 0——子进程继承的是
     // 同一个打开文件描述（dup），写完共享偏移停在 EOF，readFileSync(fd) 会从当前位置读回空串（本机实测）。
@@ -1356,7 +1373,7 @@ try {
     `孙进程心跳必须在入口退出前持续增长（首拍 ${hbTicks[0]} → 末拍 ${hbTicks[hbTicks.length - 1]}，跨 ` +
     `${hbTicks[hbTicks.length - 1] - hbTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const sizeAfterExit = fs.statSync(hb).size
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, HEARTBEAT_OBSERVE_MS)
   const sizeLater = fs.statSync(hb).size
   assert.strictEqual(sizeLater, sizeAfterExit,
     `入口退出后孙进程仍在写心跳（${sizeAfterExit} → ${sizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（F6）`)
@@ -1792,7 +1809,7 @@ const unitTreeDir = makeUnitTestsSandbox(
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
       // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
       // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
-      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
+      `setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), ${HEARTBEAT_INTERVAL_MS})`,
       'setTimeout(() => process.exit(0), 8000)',
       ''
     ].join('\n')
@@ -1828,7 +1845,7 @@ try {
     `孙进程心跳必须在入口退出前持续增长（首拍 ${unitTicks[0]} → 末拍 ${unitTicks[unitTicks.length - 1]}，跨 ` +
     `${unitTicks[unitTicks.length - 1] - unitTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const unitSizeAfterExit = fs.statSync(unitHb).size
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, HEARTBEAT_OBSERVE_MS)
   const unitSizeLater = fs.statSync(unitHb).size
   assert.strictEqual(unitSizeLater, unitSizeAfterExit,
     `入口退出后孙进程仍在写心跳（${unitSizeAfterExit} → ${unitSizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（C10-003）`)
