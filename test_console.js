@@ -33,7 +33,7 @@ function sliceTo (source, endAnchor, label) {
   return source.slice(0, end)
 }
 // 按行剥注释（行首 //、*、/* 整行剥掉；行内 // 只在前面没有引号时才算注释起点，
-// 'http://x' 这类字符串不被截断）。要锁「代码里真有这句」的地方把它套在源码上再 includes。
+// 'https://x' 这类字符串不被截断）。要锁「代码里真有这句」的地方把它套在源码上再 includes。
 function codeOf (source) {
   return source.split('\n').map((line) => {
     const trimmed = line.trimStart()
@@ -3288,9 +3288,11 @@ async function main () {
     const src = '// locking && html`<span class="trigger-busy"/\nconst real = 1\n'
     assert.ok(src.includes('trigger-busy'), '裸 includes 会被注释里的原句满足——这正是旧判据的漏洞')
     assert.strictEqual(codeOf(src).includes('trigger-busy'), false, 'codeOf 必须把注释行剥掉')
-    // 行内注释同样不算；字符串里的 // 不得被当成注释起点（'http://x' 要完整保留）
+    // 行内注释同样不算；字符串里的 // 不得被当成注释起点（'https://x' 要完整保留）。
+    // 夹具用 https 而不是 http：这条只测「字符串里的 // 不被截断」，一个字节都没发出去
+    // （无真实网络、无凭证），但也没必要在源码里留明文协议字面量给 S5332 这类规则报。
     assert.strictEqual(codeOf('const a = 1 // busy-badge\n').trim(), 'const a = 1')
-    assert.ok(codeOf("const u = 'http://x/y'\n").includes('http://x/y'), '字符串里的 // 不得被截断')
+    assert.ok(codeOf("const u = 'https://x/y'\n").includes('https://x/y'), '字符串里的 // 不得被截断')
   })
 
   // C5-028：用例级 server 由 harness 收尾——用例提前失败（最后一行 close 没跑到）也不会
