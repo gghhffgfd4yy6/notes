@@ -4,6 +4,12 @@ const assert = require('assert')
 const { createNetwork, parseRetryAfterMs } = require('./xbk_network')
 const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
+// C5-010：环境性跳过必须可见且计数（此前只有 if 没有 else：断言整块消失、末尾照打 OK）。
+// 本套件的跳过面是「运行期切时区能否被 Date.parse 反映」——UTC 宿主上 asctime 的补 GMT 语义
+// 与本地解析同值，无法观测。skip 只打印原因并计数，断言一条不删。
+const envSkips = []
+const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境性）：' + why) }
+
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
 function makeNetwork (opts = {}) {
   const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders, sleep, noResponse = false } = opts
@@ -498,6 +504,8 @@ function makeNetwork (opts = {}) {
       process.env.TZ = 'Asia/Shanghai'
       if (Date.parse(asctime) !== Date.UTC(2033, 10, 6, 8, 49, 37)) {
         assert.strictEqual(parseRetryAfterMs(asctime, now), Date.UTC(2033, 10, 6, 8, 49, 37) - now, 'asctime 必须按 GMT 解析，不得按本地时区')
+      } else {
+        skipEnv('asctime 无时区标记的「补 GMT」语义：本进程时区为 UTC，Date.parse 对补 GMT 与本地解析同值，该断言不可观测')
       }
     } finally {
       if (origTZ === undefined) delete process.env.TZ; else process.env.TZ = origTZ
@@ -551,5 +559,8 @@ function makeNetwork (opts = {}) {
     assert.strictEqual(getCalls(), 3, '无 response 的未知错误码仍按 maxRetry 重试（首次 + 2 次）')
   }
 
+  if (envSkips.length > 0) {
+    console.log(`⏭ test_network 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，改为在非 UTC 宿主上生效）`)
+  }
   console.log('test_network OK')
 })().catch((e) => { console.error(e); process.exit(1) })
