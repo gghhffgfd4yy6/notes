@@ -2967,3 +2967,65 @@ checkAsync('ALERT-5 同类告警被限频压制时仍必须留痕：run.log 有 
     assert.ok(/ERROR 推送全部失败 2 条/.test(log), `全失败必须有 ERROR 行（cron 翻日志可见）：${log.slice(-400)}`)
   })
 })
+
+checkAsync('DAT-1 100% 脏数据必须可观测：run.log WARN + bad= 字段 + 告警，而空数组/全量去重不告警', async () => {
+  const alertSends = []
+  const Pusher = {
+    send: async (text, desp) => {
+      if (text.includes('运行异常')) {
+        alertSends.push({ text, desp })
+        return { successfulChannels: ['stub'], failures: [] }
+      }
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  await withRunHarness({ Pusher }, async (h, cacheDir, realFs) => {
+    h.Config.alert = { enabled: true, intervalMs: 0 } // 不限频：关注「有没有告警」而不是限频
+    const logPath = path.join(cacheDir, 'run.log')
+    const readLog = () => (realFs.existsSync(logPath) ? realFs.readFileSync(logPath, 'utf8') : '')
+    // 只数 WARN 行：ALERT 行的原因文本里也会出现「全部为脏数据」，按整句计数会把告警自身算进来
+    const dirtyLines = () => readLog().split('\n').filter(l => /WARN 本轮抓取 \d+ 条全部为脏数据/.test(l)).length
+
+    // ① 全部非法元素：契约不变（failed 只统计已进入推送的条目 ⇒ 0、退出码 0），但必须留痕 + 告警
+    h.setItems([null, 'oops', 123, [], true])
+    const r1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r1.summary.total, pushed: r1.summary.pushed, failed: r1.summary.failed },
+      { total: 5, pushed: 0, failed: 0 },
+      `既定契约：failed 只统计已进入推送的条目（100% 脏数据时恒为 0），不得改动：${JSON.stringify(r1.summary)}`)
+    assert.strictEqual(dirtyLines(), 1, `run.log 必须留一行「全部为脏数据」WARN：${readLog().slice(-500)}`)
+    assert.ok(/bad=5/.test(readLog()), `run.log 摘要行必须带 bad=5（非对象元素数）：${readLog().slice(-300)}`)
+    assert.strictEqual(alertSends.length, 1,
+      `100% 脏数据必须告警（旧实现零告警零留痕，脚本整天「绿色成功」却一条没推）：${JSON.stringify(alertSends)}`)
+    assert.ok(alertSends[0].desp.includes('脏数据'), `告警原因必须点名脏数据：${alertSends[0].desp}`)
+
+    // ② 全部无有效身份：同样可观测，并带 noidentity 明细
+    h.Config.api.pushUrl = 'https://example.invalid/dirty-noidentity.json'
+    h.setItems([{}, {}, { title: '' }])
+    const r2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r2.summary.total, pushed: r2.summary.pushed, failed: r2.summary.failed },
+      { total: 3, pushed: 0, failed: 0 }, `全无身份同样不得改 failed 口径：${JSON.stringify(r2.summary)}`)
+    assert.strictEqual(dirtyLines(), 2, '全无身份也必须留「全部为脏数据」WARN')
+    assert.ok(/noidentity=3/.test(readLog()), `摘要行必须带 noidentity=3：${readLog().slice(-300)}`)
+    assert.strictEqual(alertSends.length, 2, '全无身份同样必须告警')
+
+    // ③ 空数组：既定契约「空数据不告警」——不得因本修复被打破
+    h.Config.api.pushUrl = 'https://example.invalid/dirty-empty.json'
+    h.setItems([])
+    const r3 = await runWithWarnings(h.App)
+    assert.strictEqual(r3.summary.total, 0, `空数组 total 应为 0：${JSON.stringify(r3.summary)}`)
+    assert.strictEqual(dirtyLines(), 2, '空数组不得新增「全部为脏数据」WARN')
+    assert.strictEqual(alertSends.length, 2, '空数组不得告警（既定契约，test_app.js「空数据 → 不推送不崩溃」钉住）')
+
+    // ④ 全量去重（items 为空但一条不脏）：不得误报脏数据
+    h.Config.api.pushUrl = 'https://example.invalid/dirty-dedup.json'
+    h.setItems([makeRunItem('dd-1', '去重甲'), makeRunItem('dd-2', '去重乙')])
+    const warm = await runWithWarnings(h.App)
+    assert.strictEqual(warm.summary.pushed, 2, `预热轮应推 2 条：${JSON.stringify(warm.summary)}`)
+    h.setItems([makeRunItem('dd-1', '去重甲'), makeRunItem('dd-2', '去重乙')])
+    const r4 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ dedup: r4.summary.dedup, pushed: r4.summary.pushed },
+      { dedup: 2, pushed: 0 }, `预热轮后应全量去重：${JSON.stringify(r4.summary)}`)
+    assert.strictEqual(dirtyLines(), 2, '全量去重（非脏数据）不得误报「全部为脏数据」')
+    assert.strictEqual(alertSends.length, 2, '全量去重不得告警')
+  })
+})

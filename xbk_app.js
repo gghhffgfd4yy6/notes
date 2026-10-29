@@ -1743,7 +1743,22 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
+        // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
+        // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
+        // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。
+        // 只在「确实抓到了数据、且全部在摄入阶段被丢弃」时告警；空数组、全量去重、全量规则过滤
+        // 都不满足 bad+noidentity === total，因此不会被误报。
+        const droppedAsDirty = xbkdata.length > 0 && items.length === 0 &&
+          (badElementCount + skippedNoIdentity) === xbkdata.length
+        if (droppedAsDirty) {
+          const dirtyDetail = `非法元素 ${badElementCount} 条 / 无有效身份 ${skippedNoIdentity} 条`
+          this._writeRunLog(`${this._localStamp()} WARN 本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目\n`)
+          console.warn(`⚠️ 本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目（接口字段可能已变更）`)
+          if (!dryRun) {
+            try { await this._sendAlert(`本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目——接口字段可能已变更`, 'dirty-data') } catch (e) { /* 告警失败不阻塞主流程 */ }
+          }
+        }
 
         // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
         const summary = {
