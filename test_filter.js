@@ -6403,11 +6403,21 @@ console.log('========================================\n');
     const ta = require('fs').readFileSync(path.join(__dirname, '/test_app.js'), 'utf8')
     const tn = require('fs').readFileSync(path.join(__dirname, 'test_notify_selfcheck.js'), 'utf8')
     const all = tf + ta + tn
+    // C4-006：判据原为裸子串 includes(k)，`num` 靠 `number` 的子串恒过闸（把 Utils.num 调用删光
+    // 门禁仍绿）。改为标识符边界：名字前后不得紧邻 [A-Za-z0-9_$]，必须作为独立标识符出现
+    // （成员访问 Utils.num / 调用 num(...) / 解构 { num } 都算；number / numeral 不算）。
+    const isReferenced = (name, text) => new RegExp(
+      `(?:^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_$])`
+    ).test(text)
+    // 判据自检：反例必须只作为更长的标识符子串出现，否则门禁会再次退化成恒真
+    assertEqual(isReferenced('num', 'const number = 1; number.toFixed(2)'), false,
+      'num 仅作为 number 的子串出现时不得算引用（裸子串判据的恒真反例）')
+    assertEqual(isReferenced('num', 'Utils.num(x)'), true, 'Utils.num 成员访问必须算引用')
+    assertEqual(isReferenced('num', 'num(x)'), true, '裸调用必须算引用')
     const unused = []
     for (const k of Object.keys(mod)) {
       if (k === 'Config' || k === 'Pusher') continue
-      // 测试中是否出现该导出名
-      if (!all.includes(k) && !all.includes('.' + k)) unused.push(k)
+      if (!isReferenced(k, all)) unused.push(k)
     }
     assertEqual(unused.length, 0, `未使用的导出: ${unused.join(', ')}`)
   })
