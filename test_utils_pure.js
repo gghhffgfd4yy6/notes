@@ -1780,9 +1780,30 @@ check('PlanI _parseFallback: 小写 z 也算时区标记（[Zz] 字符类）', (
 check('PlanI _parseFallback: 单数字月日的 T 格式与空格格式必须同口径（v3.171 回退）', () => {
   const P = (s) => Utils._parseFallback(s)
   // '2026-8-1T10:30' 曾 Invalid 返回 null，而空格格式有效 —— v3.171 用第二个回退统一
-  assert.strictEqual(P('2026-8-1T10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '单数字月日 + T 必须与空格格式同值（第二次回退把 T 转空格）')
-  assert.strictEqual(P('2026-8-1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '空格格式同值')
-  assert.strictEqual(P('2026/8/1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '斜杠格式同样要有兜底')
+  // C5-011：这里**不锁具体时刻**。这三条输入在 parseTime 上先被 _parseDateTimeNoTz（日期段 [-/]、
+  // 秒可选）命中并直接返回 Date.UTC ⇒ 本函数在产品路径上不可达；而它对「非补零 ISO / 斜杠」的
+  // 宽松解析落到 new Date(s)（宿主本地时区）⇒ 锁 Date.UTC 的写法在 UTC 宿主恒绿、CST 宿主必红
+  // （假契约 + 本地假红）。只锁跨时区恒真的口径：可解析 + 三种写法同值（v3.171 要的就是这个）。
+  // UTC 契约改在下一条用例里经产品入口 parseTime 断言。
+  const values = ['2026-8-1T10:30', '2026-8-1 10:30', '2026/8/1 10:30'].map((s) => {
+    const v = P(s)
+    assert.strictEqual(typeof v, 'number', `_parseFallback(${s}) 必须宽松解析出毫秒数，不得返回 null`)
+    assert.ok(Number.isFinite(v), `_parseFallback(${s}) 必须是有限毫秒数`)
+    return v
+  })
+  assert.strictEqual(values[1], values[0], '空格分隔必须与 T 分隔同值（第二次回退把 T 转空格）')
+  assert.strictEqual(values[2], values[0], '斜杠格式必须与 T/空格格式同值（同一兜底解析）')
+})
+
+check('PlanI parseTime: 单数字月日与斜杠格式必须按 UTC 解析（宿主时区无关）', () => {
+  // C5-011：这是产品真正走的路径（_parseDateTimeNoTz 的日期段是 [-/]、秒可选，先于 _parseFallback
+  // 命中并返回 Date.UTC）。断言必须两档 TZ 都为真 —— 否则「只在 UTC 宿主成立」的用例既给本地
+  // 开发机假红、又在 CI 上假绿（锁的契约根本不是产品行为）。
+  for (const s of ['2026-8-1T10:30', '2026-8-1 10:30', '2026/8/1 10:30', '2026/08/01 10:30', '2026/8/1 10:30:00']) {
+    assert.strictEqual(Utils.parseTime(s), Date.UTC(2026, 7, 1, 10, 30, 0), `${s} 必须按 UTC 解析（与宿主时区无关）`)
+  }
+  assert.strictEqual(Utils.parseTime('2026/8/1 10:30'), Utils.parseTime('2026-08-01 10:30:00'),
+    '斜杠与连字符、单双数字月日、有无秒 必须得到同一时刻')
 })
 
 check('PlanI _parseFallback: 完全无法解析时返回 null（不得返回 NaN/Invalid Date）', () => {
