@@ -15,12 +15,19 @@ const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境�
 // 三个用例只好整段手抄 createNetwork 调用（连 nextTick 之外的注入项都手写），抄写点各自漂移。
 function makeNetwork (opts = {}) {
   const {
-    retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes,
-    responseHeaders, sleep, noResponse = false,
+    retry = 2, timeout = 5000, failTimes = 0, errorCode, permanentCodes,
+    responseHeaders, sleep,
     pushUrl = 'https://api.example.com/push', profile3 = false,
     prewarmDns = async () => ({ ok: true, elapsedMs: 1, family: 'ipv4' }),
     loggerWarn = true
   } = opts
+  // C5-053：是否挂 e.response 由「opts 里有没有写 statusCode」决定，不再由解构默认值决定：
+  //   · 不写 statusCode          → 500（既有夹具口径，绝大多数用例）
+  //   · 显式写 statusCode: undefined → 无 response（DNS 失败/ECONNREFUSED/超时/EBODYLIMIT 的真实形状）
+  // 旧写法 `statusCode = 500` 把显式 undefined 兜回 500，于是「无 response」只能靠额外的 noResponse
+  // 布尔表达；而 4 个调用点（写 undefined 却没传 noResponse）实际一直挂着伪造的 500。
+  const hasStatus = Object.prototype.hasOwnProperty.call(opts, 'statusCode')
+  const statusCode = hasStatus ? opts.statusCode : 500
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
@@ -31,10 +38,7 @@ function makeNetwork (opts = {}) {
     if (calls <= failTimes) {
       const e = new Error('fail ' + calls)
       if (errorCode !== undefined) e.code = errorCode // net-1：无 response 的永久性错误码
-      // noResponse：真实链路里 DNS 失败/ECONNREFUSED/超时/EBODYLIMIT 都不挂 e.response
-      // （xbk_http 只在 statusCode >= 300 时才挂）——夹具必须能复刻这条形状，否则
-      // 「无 response」分支永远测不到（statusCode: undefined 会被上面的解构默认值 500 兜回）。
-      if (statusCode !== undefined && !noResponse) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
+      if (statusCode !== undefined) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
       throw e
     }
     return { ok: true, calls }
@@ -530,7 +534,7 @@ function makeNetwork (opts = {}) {
   //     必须照常重试并抛出原始错误码。反例：`if (e.response)` → `if (true)` 后读
   //     `e.response.statusCode` 抛 TypeError —— 原始 code 被掩盖且整轮退避被打断（零重试）。
   {
-    const { net, getCalls } = makeNetwork({ retry: 2, noResponse: true, errorCode: 'ERR_UNKNOWN_XYZ', failTimes: 5, sleep: async () => {} })
+    const { net, getCalls } = makeNetwork({ retry: 2, statusCode: undefined, errorCode: 'ERR_UNKNOWN_XYZ', failTimes: 5, sleep: async () => {} })
     let rejected = null
     try { await net.fetchData() } catch (e) { rejected = e }
     assert.strictEqual(rejected && rejected.code, 'ERR_UNKNOWN_XYZ',
@@ -542,7 +546,25 @@ function makeNetwork (opts = {}) {
     console.log(`⏭ test_network 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，改为在非 UTC 宿主上生效）`)
   }
 
-  // 26. [夹具自检] createNetwork 只允许在 makeNetwork 工厂内出现一次（C5-052）。
+  // 26. [夹具自检] makeNetwork 的「无 response」形状（C5-053）。
+  // 真实链路里 DNS 失败 / ECONNREFUSED / 超时 / EBODYLIMIT 都不挂 e.response（xbk_http 只在
+  // statusCode >= 300 时才挂）。夹具必须能表达这两种形状，否则「无 response」分支永远是假的：
+  // 解构默认值 `statusCode = 500` 会把显式传入的 undefined 兜回 500，用例以为在测无 response，
+  // 实际拿到的错误带一个伪造的 500 response。
+  {
+    const withResp = makeNetwork({ retry: 0, statusCode: 418, failTimes: 1 })
+    let e1 = null
+    try { await withResp.net.fetchData() } catch (e) { e1 = e }
+    assert.strictEqual(e1 && e1.response && e1.response.statusCode, 418, '显式 statusCode 必须挂 e.response')
+
+    const noResp = makeNetwork({ retry: 0, statusCode: undefined, failTimes: 1 })
+    let e2 = null
+    try { await noResp.net.fetchData() } catch (e) { e2 = e }
+    assert.ok(e2 && !('response' in e2),
+      `statusCode: undefined 必须表示「无 response」，实际挂了 ${JSON.stringify(e2 && e2.response)}（解构默认值 500 把 undefined 兜回）`)
+  }
+
+  // 27. [夹具自检] createNetwork 只允许在 makeNetwork 工厂内出现一次（C5-052）。
   // 反例：工厂表达不了 PROFILE3 / 自定义 pushUrl / 无 warn 的 logger 时，用例只好整段手抄注入对象；
   // 手抄点没有任何结构约束，注入项与工厂漂移（少一个 warn、多一个字段）不会被任何断言发现。
   // 本守卫直接读本文件源码，把「再抄一份」变成红。
