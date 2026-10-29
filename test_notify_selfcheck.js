@@ -236,19 +236,34 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
     }
   })
 
-  // S6b 退出码口径：无渠道 → NO_CHANNEL_CONFIG reject → guard 出 1（进程内复刻 guard 形态）
-  await test('无渠道: NO_CHANNEL_CONFIG → 脱敏失败出口（含渠道清单文案）', () => withChannels(async () => {
-    const { out } = await withCapture(async () => {
-      await m.runNotifyTest(['--notify-test']).catch((e) => {
-        const { summarizeError } = require('./xbk_failure_policy')
-        const info = summarizeError(e)
-        console.error(`通知自检失败：${info.message || '未知错误'}`)
-      })
+  // S6b 退出码口径（C5-037）：旧形态在测试自己的 catch 里复刻 guard 的出口、再断言自己
+  // 拼出来的「通知自检失败：」——既没读 process.exitCode，也从没经过真 guard。于是
+  // 「无渠道不算失败，exit 0」这类改动（真实事故形态：自检假绿）在本套件里完全不可见。
+  // 现在走真 main-guard：真子进程 + 清空全部通道 env ⇒ sendNotify 抛 NO_CHANNEL_CONFIG，
+  // 退出码与文案都由 guard 的 catch 决定；文案断言锚在 summarizeError 的 message 上
+  // （同一条脱敏出口），不是测试自己拼的字符串。
+  await test('无渠道: 真 main-guard spawn → exitCode 1 + NO_CHANNEL_CONFIG 脱敏原因', () => {
+    const { spawnSync } = require('child_process')
+    const { summarizeError } = require('./xbk_failure_policy')
+    // 清空全部通道 key：子进程的 slim 从 env 装配 push_config，任何残留 key 都会让自检真的
+    // 发一条出去（本用例必须零真实网络）。HITOKOTO 同样关掉。
+    const env = { ...process.env, TZ: 'UTC', HITOKOTO: 'false' }
+    for (const k of CHANNEL_KEYS) env[k] = ''
+    const run = spawnSync(process.execPath, [path.join(__dirname, 'xbk_function_v3.js'), '--notify-test'], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      timeout: 30000,
+      env
     })
-    const text = outText(out)
-    assertRc(text.includes('通知自检失败'), '应输出失败结论')
-    assertRc(text.includes('未配置任何推送通道'), '应含 NO_CHANNEL_CONFIG 文案')
-  }))
+    const text = `${run.stdout || ''}${run.stderr || ''}`
+    assertRc(run.status === 1, `真 guard 退出码必须为 1（无渠道 = 失败），实际 ${run.status}（signal=${run.signal || '无'}）`)
+    const summarized = summarizeError(Object.assign(new Error('未配置任何推送通道'), { code: 'NO_CHANNEL_CONFIG' }))
+    assertRc(summarized.code === 'NO_CHANNEL_CONFIG', '夹具必须走 NO_CHANNEL_CONFIG 口径')
+    assertRc(text.includes(`通知自检失败：${summarized.message}`),
+      `失败结论必须由 guard 经 summarizeError 出口（期望含 ${JSON.stringify('通知自检失败：' + summarized.message)}，实际 ${JSON.stringify(text.slice(0, 400))}）`)
+    assertRc(text.includes('未配置任何推送通道'), '应含 NO_CHANNEL_CONFIG 文案（渠道清单）')
+    assertRc(!text.includes('[object Object]'), '不得有对象 stringify 痕迹')
+  })
 
   // S8 脱敏红线：guard catch 块源码级断言（summarizeError 在、裸 stringify 不在——
   // 剥行注释后断言：注释里的「禁止 JSON.stringify(e)」守则文案本身含该字样）。
