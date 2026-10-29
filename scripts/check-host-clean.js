@@ -171,23 +171,33 @@ function findOrphanStubs (procs, selfPid, ancestors) {
 }
 
 // 读 /proc：非 Linux（macOS 等）抛 ENOENT → 返回 null，由上层响亮标注「该平台不检测」。
+// 单个 pid 读不到时**必须计数**：给 { cmdline: '', ppid: -1 } 的默认值恰好等于「这个进程不存在」，
+// 而孤儿判据先按 cmdline 匹配桩标记 ⇒ hidepid / 跨用户 / 权限收紧时，不可读进程里的孤儿桩与孤儿套件
+// 整批消失，inspect 仍报 ok（C10-029）。只有「进程在读的过程中退出」（ENOENT/ESRCH）不算不可读——
+// 那是竞态而不是失明，计入会让每次扫描都误报。
 function readProcs (procRoot) {
+  let pids
   try {
-    const pids = fs.readdirSync(procRoot).filter((s) => /^\d+$/.test(s))
-    return pids.map((pid) => {
-      try {
-        return {
-          pid: Number(pid),
-          cmdline: fs.readFileSync(path.join(procRoot, pid, 'cmdline'), 'utf8'),
-          ppid: ppidOf(path.join(procRoot, pid, 'stat'))
-        }
-      } catch {
-        return { pid: Number(pid), cmdline: '', ppid: -1 } // 进程刚退出/无权限：不参与判定
-      }
-    })
+    pids = fs.readdirSync(procRoot).filter((s) => /^\d+$/.test(s))
   } catch {
     return null
   }
+  const procs = []
+  const unreadable = []
+  for (const pid of pids) {
+    try {
+      procs.push({
+        pid: Number(pid),
+        cmdline: fs.readFileSync(path.join(procRoot, pid, 'cmdline'), 'utf8'),
+        ppid: ppidOf(path.join(procRoot, pid, 'stat'))
+      })
+    } catch (e) {
+      const code = e && e.code ? e.code : 'UNKNOWN'
+      if (code !== 'ENOENT' && code !== 'ESRCH') unreadable.push({ pid: Number(pid), errorCode: code })
+      procs.push({ pid: Number(pid), cmdline: '', ppid: -1 }) // 进程刚退出/无权限：不参与判定
+    }
+  }
+  return { procs, unreadable }
 }
 
 // comm 字段可能含空格与括号：切到最后一个 ')' 之后再取 ppid（第 2 个字段）
@@ -311,14 +321,19 @@ function listStaleSandboxDirs (tmpRoot, nowMs, staleMs, cwds) {
 // 汇总判定：{ skipped, unsupported, cwdScanError, tmpScanError, stubs, dirs, ok }
 function inspect (opts) {
   const env = opts.env || {}
-  if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, cwdScanError: false, tmpScanError: false, stubs: [], suites: [], dirs: [] }
+  if (shouldSkipCheck(env)) return { skipped: true, reason: 'XBK_MUTATION_CHILD=1（变异评估沙箱内）', ok: true, cwdScanError: false, tmpScanError: false, stubs: [], suites: [], dirs: [], unreadableProcs: [], incomplete: false }
   const procRoot = opts.procRoot || '/proc'
   const tmpRoot = opts.tmpRoot || TMP_ROOT
   const nowMs = opts.nowMs || Date.now()
   const staleMs = opts.staleMs
-  const procs = readProcs(procRoot)
+  const read = readProcs(procRoot)
+  const unsupported = read === null
+  const procs = unsupported ? [] : read.procs
+  // 不可读进程不是「不存在」：计数并标 incomplete，让「没扫到」与「扫过且干净」在输出上不再同形。
+  // 不并入 ok——hidepid / 跨用户主机上全部进程都不可读，判红等于让门禁在那种环境下永久误拦。
+  const unreadableProcs = unsupported ? [] : read.unreadable
+  const incomplete = unreadableProcs.length > 0
   const selfPid = opts.selfPid || process.pid
-  const unsupported = procs === null
   const anc = unsupported ? [] : ancestorPids(procRoot, selfPid)
   const stubs = unsupported ? [] : findOrphanStubs(procs, selfPid, anc)
   const suites = unsupported ? [] : findOrphanSuites(procs, selfPid, anc)
@@ -343,6 +358,8 @@ function inspect (opts) {
     stubs,
     suites,
     dirs,
+    unreadableProcs,
+    incomplete,
     ok: !unsupported && !cwdScanError && !tmpScanError && stubs.length === 0 && suites.length === 0 && dirs.length === 0
   }
 }
@@ -457,6 +474,14 @@ function selftest () {
   console.log('✅ check-host-clean --selftest 全部通过（34 断言）')
 }
 
+// 不可读进程的取证文案（PID + errno）：这批进程对孤儿检测失明，必须点名而不是静默通过。
+function unreadableProcsText (r) {
+  const list = Array.isArray(r && r.unreadableProcs) ? r.unreadableProcs : []
+  const shown = list.slice(0, 6).map((x) => x.pid + '（' + x.errorCode + '）').join(' ')
+  return '⚠️ 孤儿检测不完整：' + list.length + ' 个进程的 cmdline 不可读（' + shown +
+    (list.length > 6 ? ' …' : '') + '）——hidepid / 跨用户 / 权限收紧时，这些进程里的孤儿桩与孤儿套件不会被发现'
+}
+
 function cwdScanFailureText (details) {
   if (!details) return ''
   const procDir = details.procDirExists === true ? 'present' : 'unknown'
@@ -493,7 +518,12 @@ function main () {
   if (r.tmpScanError) {
     console.log('❌ 临时根目录扫描失败，无法判定过期沙箱（按 fail-closed 拒绝继续）')
   }
+  if (r.incomplete) console.log(unreadableProcsText(r))
   if (r.ok && !r.unsupported) {
+    if (r.incomplete) {
+      console.log('⚠️ 主机干净度检查通过（仅就已扫描到的进程）：孤儿检测对上述进程失明，结论不得读作「全量已检查」')
+      return 0
+    }
     console.log('✅ 主机干净：无孤儿测试桩 / 孤儿套件进程、无过期 ' + SANDBOX_PREFIX + '* 沙箱')
     return 0
   }
@@ -535,7 +565,11 @@ function guardOrExit (env) {
   }
   if (r.cwdScanError) console.log('   活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（fail-closed）' + cwdScanFailureText(r.cwdScanErrorDetails))
   if (r.tmpScanError) console.log('   临时根目录扫描失败，无法判定过期沙箱（fail-closed）')
-  if (r.ok) return false
+  if (r.incomplete) console.log('   ' + unreadableProcsText(r))
+  if (r.ok) {
+    if (r.incomplete) console.log('⚠️ 主机干净度检查通过（仅就已扫描到的进程）：孤儿检测对上述进程失明，结论不得读作「全量已检查」')
+    return false
+  }
   console.log('❌ 主机不干净，本次运行不启动（避免把环境残留报成契约失败）：')
   for (const x of r.stubs) console.log('   孤儿桩 pid ' + x.pid + '  ' + x.cmdline.slice(0, 120))
   for (const x of r.suites) console.log('   孤儿套件 pid ' + x.pid + '  ' + x.cmdline.slice(0, 120))

@@ -84,6 +84,83 @@ check('不回退：变异子进程必跳过；沙箱只认过期；阈值必须�
     '阈值被悄悄调小 = 并发场景假红；调大 = 门禁形同虚设')
 })
 
+check('cmdline 不可读必须计数并标不完整（C10-029：hidepid/跨用户不得静默假绿）', () => {
+  // 背景：readProcs 对读不到的 pid 返回 { cmdline: '', ppid: -1 }，而孤儿判据先按 cmdline 匹配桩标记
+  // ⇒ 不可读进程里的孤儿桩/孤儿套件整批消失，inspect 仍 ok=true（假绿）。修复 = 计数 + 标 incomplete，
+  // 但**不**改变 ok（hidepid 主机上全部进程都不可读，判红等于让门禁在那种环境下永久误拦）。
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-gate-unreadable-'))
+  const procRoot = path.join(root, 'proc')
+  const tmpRoot = path.join(root, 'tmp')
+  fs.mkdirSync(tmpRoot)
+  const writeProc = (pid, ppid, marker) => {
+    const dir = path.join(procRoot, pid)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'cmdline'), 'node\0' + marker + '\0')
+    fs.writeFileSync(path.join(dir, 'stat'),
+      `${pid} (node) S ${ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0`)
+  }
+  writeProc('100', 1, 'worker.js')
+  writeProc('200', 1, 'stub_heartbeat.js')
+  const originalRead = fs.readFileSync
+  const deny = (target, code) => {
+    const e = new Error('read failed: ' + code)
+    e.code = code
+    throw e
+  }
+  let r
+  fs.readFileSync = function (target, ...args) {
+    if (String(target) === path.join(procRoot, '200', 'cmdline')) deny(target, 'EACCES')
+    return originalRead.call(this, target, ...args)
+  }
+  try {
+    r = host.inspect({ env: {}, procRoot, tmpRoot, selfPid: 1 })
+  } finally {
+    fs.readFileSync = originalRead
+  }
+  assert.deepStrictEqual(r.unreadableProcs, [{ pid: 200, errorCode: 'EACCES' }],
+    'cmdline 读不到（EACCES）的进程必须被计数：静默给空 cmdline 会让它里面的孤儿桩永远扫不到')
+  assert.strictEqual(r.incomplete, true, '有进程不可读时必须标 incomplete（「没扫到」≠「扫过且干净」）')
+  assert.strictEqual(r.ok, true, '不可读只标不完整、不改 ok：hidepid 主机上判红等于门禁永久误拦')
+  // 进程在读的过程中退出（ENOENT/ESRCH）是竞态，不是失明：不得计入不可读，否则每次扫描都会误报
+  fs.readFileSync = function (target, ...args) {
+    if (String(target) === path.join(procRoot, '200', 'cmdline')) deny(target, 'ENOENT')
+    return originalRead.call(this, target, ...args)
+  }
+  let raced
+  try {
+    raced = host.inspect({ env: {}, procRoot, tmpRoot, selfPid: 1 })
+  } finally {
+    fs.readFileSync = originalRead
+  }
+  assert.deepStrictEqual(raced.unreadableProcs, [], 'ENOENT（进程刚退出）不得计为「不可读」')
+  assert.strictEqual(raced.incomplete, false, '退出竞态不得把检测标成不完整')
+  fs.rmSync(root, { recursive: true, force: true })
+
+  // 端到端：CLI 在「全部 /proc cmdline 读不到」时不得再打「✅ 主机干净」，必须响亮标不完整
+  const preload = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-preload-')), 'deny-cmdline.js')
+  fs.writeFileSync(preload,
+    "'use strict'\n" +
+    "const fs = require('fs')\n" +
+    'const orig = fs.readFileSync\n' +
+    'fs.readFileSync = function (target, ...args) {\n' +
+    "  if (String(target).startsWith('/proc/') && String(target).endsWith('/cmdline')) {\n" +
+    "    const e = new Error('denied'); e.code = 'EACCES'; throw e\n" +
+    '  }\n' +
+    '  return orig.call(this, target, ...args)\n' +
+    '}\n')
+  try {
+    const run = spawnSync(process.execPath, ['-r', preload, path.join(__dirname, 'scripts/check-host-clean.js')],
+      { encoding: 'utf8', env: { ...process.env } })
+    assert.strictEqual(run.status, 0, '不可读只标不完整、不改退出码：' + run.stderr)
+    assert.match(run.stdout, /孤儿检测不完整/,
+      'CLI 必须把「有进程不可读」说出来：否则输出与「全量扫过且干净」同形')
+    assert.ok(!/✅ 主机干净/.test(run.stdout),
+      '不可读时不得打印「✅ 主机干净」：孤儿检测对这批进程失明，结论不能读作全量已检查')
+  } finally {
+    fs.rmSync(path.dirname(preload), { recursive: true, force: true })
+  }
+})
+
 check('孤儿判据：父进程已消失的测试进程也要拦，活动子进程不误伤', () => {
   const nul = String.fromCharCode(0)
   const ps = [
