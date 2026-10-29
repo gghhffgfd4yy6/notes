@@ -4928,7 +4928,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   return html`<div class="panel">
     <${PanelHead} title="过滤规则" level=${1} sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
     ${err && html`<${Hint} tone="error">${err}<//>`}
-    ${notice && html`<${Hint}>${notice.text}<//>`}
+    ${notice && html`<${Hint} tone=${notice.tone}>${notice.text}<//>`}
     ${loading && !data && html`<div class="empty">加载中…</div>`}
     ${!loading && !data && html`<div class="empty">暂无可显示的规则（上方为错误详情）</div>`}
     ${data && html`<div>

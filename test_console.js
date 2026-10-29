@@ -10282,6 +10282,28 @@ async function main () {
     assert.ok(/\.ls-results\s*\{[^}]*min-height:\s*\d+px/.test(css),
       '结果区必须有 min-height 占位：长列表 ↔ 骨架之间页面高度不得塌陷')
   })
+
+  await aok('C7-003 过滤规则 notice.tone 不再被吞（warn 必须真的渲染成琥珀提示）', () => {
+    const src = readConsoleSource()
+    const panel = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('export {', src.indexOf('function FilterRulesPanel')))
+    assert.ok(panel.length > 5000, '应能定位 FilterRulesPanel')
+    // 唯一渲染点必须把 tone 传给 Hint。旧实现只渲染 notice.text ⇒ 7 处 setNotice 的
+    // warn/ok 全是同一个中性 .hint，「服务器草稿清理失败」和「已保存 rN」长得一模一样。
+    assert.ok(/<\$\{Hint\} tone=\$\{notice\.tone\}>\$\{notice\.text\}<\/\/>/.test(panel),
+      'notice 渲染必须透传 tone（<Hint> 的 warn 分支与 .hint-warn 样式都已就绪，只差调用点）')
+    const sets = []
+    for (let i = panel.indexOf('setNotice({'); i !== -1; i = panel.indexOf('setNotice({', i + 1)) sets.push(i)
+    assert.ok(sets.length >= 6, `setNotice 的对象字面量写入点至少 6 处，实际 ${sets.length}`)
+    sets.forEach((pos, i) => {
+      const body = panel.slice(pos, pos + 300)
+      assert.ok(body.includes('tone:'), `第 ${i + 1} 处 setNotice 必须带 tone，否则新提示又会退化成中性：${body.slice(0, 80)}`)
+    })
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const hint = comp.slice(comp.indexOf('function Hint ('), comp.indexOf('// 入场包装'))
+    assert.ok(hint.includes("tone === 'warn' ? 'hint hint-warn'"), 'Hint 必须把 warn 渲染成 hint-warn（本修复的前提）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(css.includes('.hint-warn'), 'app.css 必须有 .hint-warn 规则（否则传了 tone 也看不出差别）')
+  })
 }
 
 main()
