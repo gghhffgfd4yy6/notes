@@ -86,6 +86,8 @@ const {
   filterLockIdentity,
   claimStaleFilterLock,
   runtimeFilterDeps,
+  // C2-004：注入「校验期抛错」的引擎，钉住异常兜底 catch 的错误码与日志
+  setFilterDepsForTests,
   // v3.357 两步验证：TOTP/恢复码/Cookie/配置读取
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
@@ -1780,6 +1782,59 @@ async function filterRuleApiTests () {
     } finally {
       try { fs.rmdirSync(paths.file) } catch (e) { /* 已清理 */ }
       server.close()
+    }
+  })
+
+  // backlog b3 / C2-004：异常兜底 catch 此前对只读端点也回 write_failed（把「预检/试算失败」说成
+  // 「写盘失败」），且 `.catch(() => …)` 不接错误对象、不打日志 ⇒ TypeError 一类未预期异常只剩一个
+  // 500，排障无线索。这里钉两件事：错误码按端点语义区分（只读端点不得回 write_failed），且 catch
+  // 必须留一行带 e.message 的诊断日志（不含凭证）；真正的写端点仍回 write_failed。
+  await aok('过滤规则异常兜底: validate/preview 错误码分语义 + 留诊断日志（C2-004）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const caught = []
+    const realConsoleError = console.error
+    console.error = (...args) => { caught.push(args.map((a) => String(a)).join(' ')) }
+    // 注入「校验期就抛错」的引擎：validateCandidate 里的 hasNestedQuantifier 未包 try，异常会一路
+    // 冒到 handler 的 .catch——正是条目说的「未预期异常被压成 500」形态。
+    setFilterDepsForTests({
+      RuleEngine: {
+        hasNestedQuantifier: () => { throw new Error('boom-validate-engine') },
+        compileRules: () => ({})
+      },
+      compileUserRegex: () => null,
+      re2Available: true,
+      isRe2Available: () => true
+    })
+    try {
+      const payload = { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } }
+      const validateRes = await postFilterJson(port, '/api/config/filter/validate', payload)
+      assert.strictEqual(validateRes.status, 500)
+      const validateBody = JSON.parse(validateRes.text)
+      assert.strictEqual(validateBody.code, 'validate_failed', '只预检端点不得回 write_failed')
+      assert.strictEqual(validateBody.error, 'validate_failed')
+
+      const previewRes = await postFilterJson(port, '/api/config/filter/preview', payload)
+      assert.strictEqual(previewRes.status, 500)
+      const previewBody = JSON.parse(previewRes.text)
+      assert.strictEqual(previewBody.code, 'preview_failed', '只读试算端点不得回 write_failed')
+      assert.strictEqual(previewBody.error, 'preview_failed')
+
+      // 真正的写端点仍回 write_failed：改的是只读端点的语义，不是把写失败改名。
+      const saveRes = await postFilterJson(port, '/api/config/filter', payload)
+      assert.strictEqual(saveRes.status, 500)
+      assert.strictEqual(JSON.parse(saveRes.text).code, 'write_failed')
+
+      // 三个 catch 各留一行日志，且能定位到异常 message；日志不得夹带访问 token。
+      const joined = caught.join('\n')
+      assert.ok(joined.includes('boom-validate-engine'), `catch 必须记录 e.message：${joined.slice(0, 300)}`)
+      assert.ok(!joined.includes(TOKEN), '诊断日志不得包含访问 token')
+      assert.ok(caught.length >= 3, `三个失败请求各留一行日志（实际 ${caught.length}）`)
+    } finally {
+      setFilterDepsForTests(null)
+      console.error = realConsoleError
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
@@ -3919,6 +3974,73 @@ async function main () {
     const csrf = await request(port, 'POST', '/api/notify-test', { headers: { cookie: `xbk_session=${TOKEN}` }, body: '' })
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 401（CSRF 面）')
     server.close()
+  })
+  // backlog b3 / C2-002：四个改状态端点（备份导入 / 手动触发 / 通知自检 / 停止任务）此前只靠全局
+  // authorize()，而它对任意方法都放行 `?token=`（URL 查询串凭证），与过滤写端点的「写面仅 Bearer」
+  // 不一致。这里把「URL 凭证不得用于写」钉在行为上：400 query_token_not_allowed，且拒绝必须发生在
+  // readBody / 取锁 / spawn 之前（无任何副作用）；同一端点用 Bearer 仍照常进业务层。
+  await aok('HTTP: 改状态端点拒绝 URL query token（C2-002）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // runs 是模块级 Map（跨实例共享），只能比增量——断言「本次没有新记录」。
+    const runsBefore = runs.size
+    const lockFile = path.join(dir, 'console-trigger.lock')
+    const lastAcceptFile = path.join(dir, 'console-lastaccept.json')
+    const viaQueryUrl = '?token=' + encodeURIComponent(TOKEN)
+    // 四条端点各配一个「鉴权之后必然确定的」分支：导入=坏 JSON、触发=非法动作、取消=不存在的 id、
+    // 自检=重放窗（预置 30s 帧），都不 spawn 真实子进程、不落盘。
+    const endpoints = [
+      ['/api/backup/import', '{}'],
+      ['/trigger', 'action=check'],
+      ['/api/notify-test', ''],
+      ['/api/runs/cancel', 'id=1700000000000.1']
+    ]
+    try {
+      for (const [endpoint, body] of endpoints) {
+        const viaQuery = await request(port, 'POST', endpoint + viaQueryUrl, { body })
+        assert.strictEqual(viaQuery.status, 400, `${endpoint} 带 ?token= 必须 400`)
+        assert.strictEqual(JSON.parse(viaQuery.text).code, 'query_token_not_allowed', `${endpoint} 错误码`)
+        // 即使同时带合法 Bearer 也拒绝：URL 里的凭证不得被当成可用写法（与过滤写端点同口径）。
+        const both = await request(port, 'POST', endpoint + viaQueryUrl, { token: TOKEN, body })
+        assert.strictEqual(both.status, 400, `${endpoint} ?token= + Bearer 仍必须 400`)
+        assert.strictEqual(JSON.parse(both.text).code, 'query_token_not_allowed')
+        // 仅 Cookie：写面不收 Cookie（CSRF 面），错误码要具体到 cookie_not_allowed。
+        const cookieOnly = await request(port, 'POST', endpoint, {
+          body,
+          headers: { cookie: `xbk_session=${TOKEN}` }
+        })
+        assert.strictEqual(cookieOnly.status, 401, `${endpoint} 仅 Cookie 必须 401`)
+        assert.strictEqual(JSON.parse(cookieOnly.text).code, 'cookie_not_allowed')
+      }
+      // 拒绝发生在副作用之前：没有运行记录（不 spawn）、没有触发锁、没有重放帧。
+      assert.strictEqual(runs.size, runsBefore, '被拒请求不得创建运行记录')
+      assert.strictEqual(fs.existsSync(lockFile), false, '被拒请求不得取触发锁')
+      assert.strictEqual(fs.existsSync(lastAcceptFile), false, '被拒请求不得写重放帧')
+      // 反向：Bearer 照常通过鉴权（各自走到鉴权之后的确定性分支，不 spawn）。
+      const importBadJson = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: '{not-json'
+      })
+      assert.strictEqual(importBadJson.status, 400, 'Bearer 应已过鉴权（导入坏 JSON 400）')
+      assert.strictEqual(JSON.parse(importBadJson.text).code, 'invalid_json')
+      const triggerBadAction = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=hack' })
+      assert.strictEqual(triggerBadAction.status, 400, 'Bearer 应已过鉴权（非法动作 400）')
+      assert.strictEqual(JSON.parse(triggerBadAction.text).error, '未知 action')
+      const cancelMissing = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1700000000000.1' })
+      assert.strictEqual(cancelMissing.status, 404, 'Bearer 应已过鉴权（不存在的 id 404）')
+      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1700000000000.7' } }))
+      const notifyReplay = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+      assert.strictEqual(notifyReplay.status, 409, 'Bearer 应已过鉴权（60s 窗内重放 409）')
+      assert.strictEqual(JSON.parse(notifyReplay.text).replayBlocked, true)
+      // 只读端点不能跟着被砍：GET 仍接受 ?token=（浏览器开页/EventSource 用法）。
+      const readViaQuery = await request(port, 'GET', '/api/runs' + viaQueryUrl)
+      assert.strictEqual(readViaQuery.status, 200, '只读端点仍接受 ?token=')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
   await aok('HTTP: notify-test 60s 独立重放窗行为区分（K3）', async () => {
     // 两个独立实例（独立 stateDir）：lastAccept 是「内存 Map + 实时读盘合并（at 更大者胜）」，
