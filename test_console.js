@@ -1899,16 +1899,22 @@ async function filterRuleApiTests () {
       const candidate = buildSaveCandidate(first.override, ['pingbitime'], draft, ['pingbilouzhu', 'zhanxianlouzhu', 'pingbitime'])
       assert.deepStrictEqual(candidate, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
         '候选必须是「覆盖文件已有字段 + 本次改动字段」，且不得把未改动的代码默认带出去')
-      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+      const saved = await postFilterJson(port, '/api/config/filter', {
         schema: 1, baseRevision: first.revision, filter: candidate
-      })).status, 200)
+      })
+      assert.strictEqual(saved.status, 200)
       const kept = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
       assert.deepStrictEqual(kept.filter, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
         'A 与改动后的 B 必须同时留在覆盖文件里（这正是本次修复的不变式）')
+      // 下一步的乐观锁基线取自**服务端响应**，不取落盘的覆盖文件：文件内容是这一段的断言对象，
+      // 让它回流进下一个请求体既是 js/file-access-to-http（CodeQL 102）的形状，也把「校验落盘」
+      // 与「驱动下一次写入」耦成一条链。落盘值仍被这句钉住，断言强度不变。
+      const savedRevision = JSON.parse(saved.text).revision
+      assert.strictEqual(kept.revision, savedRevision, '落盘 revision 必须等于响应 revision')
 
       // 第三步：旧行为反例——只提交 B，A 会被整份替换静默删掉（说明本用例确实覆盖此 bug）。
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
-        schema: 1, baseRevision: kept.revision, filter: { pingbitime: '7' }
+        schema: 1, baseRevision: savedRevision, filter: { pingbitime: '7' }
       })).status, 200)
       const dropped = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
       assert.deepStrictEqual(Object.keys(dropped.filter), ['pingbitime'], '服务端仍是整份替换：只提交 B 会丢掉 A')
