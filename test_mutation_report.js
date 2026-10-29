@@ -29,6 +29,10 @@ const { tableRowOf, readViaFd: readAllViaFd } = require('./test/_yaml')
 // 段汇总表的行提取（同一实现三处共用）：`复用` 单元格按内容锚定剥掉，其余列逐字比较。
 const rowOf = tableRowOf
 
+// 键序比较器：显式码元序（与 `Array#sort` 默认序等价），与 run_mutation.js / test_mutation_ranges.js 的
+// byCodeUnit 同口径——不用 localeCompare（collation 随宿主 ICU/locale 变），也不留隐式默认序（Sonar S2871）。
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
 //   2) 段汇总表（error 行：含 ❌ 前缀）
@@ -2179,7 +2183,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     }
     // 反向对账：矩阵里的 console 段必须与常量里的 console 段一一对应——段数不写死，但「矩阵少一段」
     // 与「常量少一段」都得红（只靠上面的正向循环，漏掉的段永远不会被点名）。
-    assert.deepStrictEqual([...map.keys()].filter((seg) => /^console-part\d+$/.test(seg)).sort(),
+    assert.deepStrictEqual([...map.keys()].filter((seg) => /^console-part\d+$/.test(seg)).sort(byCodeUnit),
       [...CONSOLE_SEGMENTS].sort(),
       '矩阵里的 console 段必须与 EXPECTED_SEGMENTS 的 console 段一一对应（段数由常量推导，不写死数字）')
     assert.strictEqual(map.get('v3-entry'), DEFAULT_SEGMENT_TIMEOUT_MS,
