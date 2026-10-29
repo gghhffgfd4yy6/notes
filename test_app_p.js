@@ -14,9 +14,14 @@
 // 失败时用串行定位：node test_app.js --only=<测试名子串>
 //   （v3.276/EXEC-D T10 起 `--only=<子串>` 与空格形式 `--only <子串>` 均生效；
 //     此前只有空格形式生效，照本行提示抄等号形式会静默跑全量用例）
+// 自测（C5-081 回归）：node test_app_p.js --selfcheck
+//   —— 在夹具目录上跑同一份 cleanupArtifacts/scanResidualArtifacts，断言「清理失败 ⇒ 有残留 ⇒ exit 1」
+// 复现故障注入（只跳过报告文件的删除，用来验证残留回扫真能拦住报告类产物）：
+//   XBK_CLEANUP_FAULT=report node test_app_p.js   ⇒ 正常跑完但 exit 1 并点名残留的 .tmp_parallel_report_*.json
 // ============================================================
 const { fork } = require('child_process')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 
 const CONCURRENCY = (() => {
@@ -114,16 +119,28 @@ function runChunk (chunk, idx, quick, attempt = 0) {
   })
 }
 
-// 收尾：worker 名单临时文件 + 独立缓存目录（本进程自己创建的临时产物）。
+// 收尾：worker 名单临时文件 + 执行报告 + 独立缓存目录（本进程自己创建的临时产物）。
 // 旧实现只在「子进程 exit」与「happy path 末尾」两处清理：被 Ctrl-C / 外部 kill、或 setup
 // 中途抛错时，`.tmp_parallel_<workerId>.json` 与 `xianbaoku_cache_p<workerId>` 会留在仓库根。
 // 两者都被 .gitignore 覆盖（目录 `xianbaoku_cache*`、名单 `.tmp_parallel_*.json`）⇒ git status
 // 看不出来，只能靠数文件发现——实测已滞留 2 个名单文件。收敛成幂等入口，三条退出路径都调。
-function cleanupArtifacts () {
-  for (const workerId of usedWorkerIds) {
-    try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_${workerId}.json`)) } catch (e) {} // 已删 / 未建
-    try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_report_${workerId}.json`)) } catch (e) {} // 执行计数报告
-    try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${workerId}`), { recursive: true, force: true }) } catch (e) {}
+// 故障注入（只服务本文件的回归自测/复现，默认不生效）：XBK_CLEANUP_FAULT=report 让「报告文件」的
+// 删除空转，其余产物照删；这样跑完必留 N 份报告，用来验证回扫能接住并判 exit 1（见 --selfcheck）。
+const CLEANUP_FAULT = process.env.XBK_CLEANUP_FAULT || ''
+
+// opts 仅供 --selfcheck 使用（默认值即线上口径）：换成夹具目录/假 workerId/必抛的删除桩，
+// 就能在不改产品代码的前提下复现「删不掉」。
+function cleanupArtifacts (opts = {}) {
+  const root = opts.root || __dirname
+  const ids = opts.ids || usedWorkerIds
+  const unlink = opts.unlink || fs.unlinkSync
+  const rm = opts.rm || ((p) => fs.rmSync(p, { recursive: true, force: true }))
+  for (const workerId of ids) {
+    try { unlink(path.join(root, `.tmp_parallel_${workerId}.json`)) } catch (e) {} // 已删 / 未建
+    if (CLEANUP_FAULT !== 'report') {
+      try { unlink(path.join(root, `.tmp_parallel_report_${workerId}.json`)) } catch (e) {} // 执行计数报告
+    }
+    try { rm(path.join(root, `xianbaoku_cache_p${workerId}`)) } catch (e) {}
   }
 }
 
@@ -177,38 +194,127 @@ async function reapChildren (budgetMs) {
 }
 
 // 本次运行的残留扫描：只看自己的 RUN_ID 命名空间（并发调度器的 RUN_ID 不同，互不误伤）。
-// 前缀 `.tmp_parallel_${RUN_ID}` 覆盖名单+报告，`xianbaoku_cache_p${RUN_ID}` 覆盖缓存分片。
-function scanResidualArtifacts () {
+// 覆盖三类产物，注意**报告名不以名单前缀开头**：报告是 `.tmp_parallel_report_<RUN_ID>_<idx>.json`，
+// 而名单前缀是 `.tmp_parallel_<RUN_ID>`（RUN_ID 以 pid 数字开头，报告名该位置是 `report_`），
+// 只按名单前缀扫会把报告类残留整类漏掉——.gitignore 盖着、git status 看不见、也没有别的门禁扫它。
+//   - 名单：`.tmp_parallel_<RUN_ID>_<idx>.json`（失败重跑为 `..._<idx>_r<n>.json`，C5-085）
+//   - 报告：`.tmp_parallel_report_<RUN_ID>_<idx>.json`（同上，重跑多 `_r<n>`）
+//   - 缓存：`xianbaoku_cache_p<RUN_ID>_<idx>`（同上，重跑多 `_r<n>`）
+// 边界：只认本次 RUN_ID 前缀——扫不到上一个 RUN_ID 的历史遗留，也扫不到被 SIGKILL 杀死、
+// 三条退出路径都没走成的进程。够不到的这两类只能靠人工清理。
+function artifactPrefixes (runId) {
+  return {
+    list: `.tmp_parallel_${runId}`,
+    report: `.tmp_parallel_report_${runId}`,
+    cache: `xianbaoku_cache_p${runId}`
+  }
+}
+
+function scanResidualArtifacts (opts = {}) {
+  const root = opts.root || __dirname
+  const prefixes = artifactPrefixes(opts.runId || RUN_ID)
   let names
   try {
-    names = fs.readdirSync(__dirname)
+    names = fs.readdirSync(root)
   } catch (e) {
     return { scanned: false, paths: [] } // 读不到仓库根：判不了，不能当成「干净」
   }
-  const listPrefix = `.tmp_parallel_${RUN_ID}`
-  const cachePrefix = `xianbaoku_cache_p${RUN_ID}`
+  const isOwn = (n) => n.startsWith(prefixes.list) || n.startsWith(prefixes.report) || n.startsWith(prefixes.cache)
   return {
     scanned: true,
-    paths: names
-      .filter((n) => n.startsWith(listPrefix) || n.startsWith(cachePrefix))
-      .map((n) => path.join(__dirname, n))
+    paths: names.filter(isOwn).map((n) => path.join(root, n))
   }
 }
 
 // 返回 true = 有残留（调用方据此把退出码判成失败）。
-function reportResidualArtifacts (phase) {
-  const r = scanResidualArtifacts()
+function reportResidualArtifacts (phase, opts = {}) {
+  const r = scanResidualArtifacts(opts)
+  const runId = opts.runId || RUN_ID
   if (!r.scanned) {
-    console.error(`⚠️ ${phase}：无法扫描仓库根，残留判定不可用（RUN_ID=${RUN_ID}）`)
+    console.error(`⚠️ ${phase}：无法扫描仓库根，残留判定不可用（RUN_ID=${runId}）`)
     return false
   }
   if (r.paths.length > 0) {
-    console.error(`❌ ${phase}：本次运行（RUN_ID=${RUN_ID}）残留 ${r.paths.length} 个分片产物——被 .gitignore 盖住，git status 看不见：`)
+    console.error(`❌ ${phase}：本次运行（RUN_ID=${runId}）残留 ${r.paths.length} 个分片产物——被 .gitignore 盖住，git status 看不见：`)
     for (const p of r.paths) console.error(`   - ${path.basename(p)}`)
     console.error('   清理：rm -rf ' + r.paths.map((p) => `'${p}'`).join(' '))
     return true
   }
   return false
+}
+
+// 出口判定的唯一口径：失败片 / 执行计数对账 / 收尾残留，任一不满足即 1（fail-closed）。
+// 三者在汇总里各占一行说明，这里只做布尔合成，避免「新增一类失败却忘了接进 exit code」。
+function finalExitCode ({ failedWorkers, reconProblem, residualArtifacts }) {
+  return failedWorkers.length === 0 && !reconProblem && !residualArtifacts ? 0 : 1
+}
+
+// ---------- 自测（C5-081 回归）：node test_app_p.js --selfcheck ----------
+// 为什么落在本文件：残留判据/报告前缀就是这里的产品逻辑；放进 test_app.js 会改用例总数（173→174），
+// 而单独 fork 全量套件只为验一条断言又太重。这里直接在夹具目录上跑**同一份**
+// cleanupArtifacts/scanResidualArtifacts/finalExitCode，断言「清理失败 ⇒ 有残留 ⇒ exit 1」，
+// 并用旧单前缀做负向自证（确认夹具真的复现了那个盲区，而不是碰巧命中）。
+function runSelfCheck () {
+  const assertSelf = (cond, msg) => { if (!cond) throw new Error(`自测失败：${msg}`) }
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-u14-residual-'))
+  try {
+    const runId = '99999_1700000000000'
+    const ids = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => `${runId}_${i}`)
+    for (const id of ids) {
+      fs.writeFileSync(path.join(base, `.tmp_parallel_${id}.json`), '[]')
+      fs.writeFileSync(path.join(base, `.tmp_parallel_report_${id}.json`), '{"executed":1,"skipped":0}')
+      fs.mkdirSync(path.join(base, `xianbaoku_cache_p${id}`))
+    }
+    // 重跑形态（C5-085）：workerId 末尾多一个 _r<n>
+    const rerunId = `${ids[0]}_r1`
+    fs.writeFileSync(path.join(base, `.tmp_parallel_${rerunId}.json`), '[]')
+    fs.writeFileSync(path.join(base, `.tmp_parallel_report_${rerunId}.json`), '{"executed":1,"skipped":0}')
+    fs.mkdirSync(path.join(base, `xianbaoku_cache_p${rerunId}`))
+    // 诱饵：别的 RUN_ID 的同类产物，不得算到本次头上
+    fs.writeFileSync(path.join(base, '.tmp_parallel_report_99999_1699999999999_0.json'), '{}')
+
+    // 负向自证：旧口径（只按 `.tmp_parallel_<RUN_ID>` 单前缀）本来就匹配不到报告名
+    const legacyHit = (n) => n.startsWith(`.tmp_parallel_${runId}`)
+    assertSelf(!legacyHit(`.tmp_parallel_report_${runId}_0.json`), '旧单前缀竟能匹配报告名，夹具失去证明力')
+
+    // ① 清理失败（unlink/rm 全抛）⇒ 残留必须被扫到，且点名 9 份报告（8 首轮 + 1 重跑）
+    const boom = () => { throw new Error('EACCES: 注入的删除失败') }
+    cleanupArtifacts({ root: base, ids, unlink: boom, rm: boom })
+    const residual = scanResidualArtifacts({ root: base, runId })
+    const names = residual.paths.map((p) => path.basename(p))
+    assertSelf(residual.scanned, '夹具目录读不到')
+    assertSelf(names.length === 27, `清理失败后应残留 27 个产物（8 名单+8 报告+8 缓存+重跑 3），实得 ${names.length}`)
+    const reports = names.filter((n) => n.startsWith('.tmp_parallel_report_'))
+    assertSelf(reports.length === 9, `报告类残留应为 9 份（8 首轮 + 1 重跑），实得 ${reports.length}`)
+    assertSelf(reports.includes(`.tmp_parallel_report_${runId}_0.json`), '首轮报告未被扫到')
+    assertSelf(reports.includes(`.tmp_parallel_report_${rerunId}.json`), '重跑报告（_r1）未被扫到')
+    assertSelf(!names.some((n) => n.includes('1699999999999')), '别的 RUN_ID 的产物被误算成本次残留')
+    assertSelf(reportResidualArtifacts('自测-清理失败', { root: base, runId }) === true, '残留回扫未返回 true')
+
+    // ② 判定口径：同一批失败片/对账结果下，残留与否决定 exit 1 / 0
+    assertSelf(finalExitCode({ failedWorkers: [], reconProblem: null, residualArtifacts: true }) === 1,
+      '有残留必须 exit 1')
+    assertSelf(finalExitCode({ failedWorkers: [], reconProblem: null, residualArtifacts: false }) === 0,
+      '无残留且无失败必须 exit 0')
+
+    // ③ 清理真成功 ⇒ 回扫干净 ⇒ exit 0（顺带证明夹具被清空，不留垃圾）
+    // 这里必须把重跑 ID 一起交给清理，与线上 usedWorkerIds 覆盖「首轮 + 所有重跑」同口径。
+    cleanupArtifacts({ root: base, ids: [...ids, rerunId] })
+    assertSelf(scanResidualArtifacts({ root: base, runId }).paths.length === 0, '正常清理后仍有残留')
+    console.log('✅ 自测通过：清理失败 ⇒ 27 个残留（含 9 份 .tmp_parallel_report_*.json）⇒ exit 1；清理成功 ⇒ 无残留 ⇒ exit 0')
+  } finally {
+    try { fs.rmSync(base, { recursive: true, force: true }) } catch (e) { /* 夹具已随断言清空 */ }
+  }
+}
+
+if (process.argv.includes('--selfcheck')) {
+  try {
+    runSelfCheck()
+    process.exit(0)
+  } catch (e) {
+    console.error(e && e.message ? e.message : e)
+    process.exit(1)
+  }
 }
 
 // 被 Ctrl-C / 外部 kill 时同样收尾（SIGKILL 抓不到，不属本机制的覆盖范围）。
@@ -271,9 +377,10 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
   if (!reconProblem && sumExecuted !== names.length) reconProblem = `Σexecuted=${sumExecuted} ≠ 名单总数 ${names.length}`
   console.log('\n════════ 并行汇总 ════════')
   console.log(`  测试: ${names.length} 个 | 并发: ${CONCURRENCY} | 耗时: ${secs}s | 实际执行: ${sumExecuted} 例`)
-  if (failedWorkers.length === 0 && !reconProblem && !residualArtifacts) {
+  // C5-081：出口只由 finalExitCode 决定——残留与失败片/对账同权，不会被「全部通过」盖掉。
+  const exitCode = finalExitCode({ failedWorkers, reconProblem, residualArtifacts })
+  if (exitCode === 0) {
     console.log('  结果: 全部通过 ✅')
-    process.exit(0)
   } else {
     for (const w of failedWorkers) console.log(`  ✗ worker#${w.i} 重跑后仍失败（涉及 ${chunks[w.i].length} 个测试）`)
     if (reconProblem) {
@@ -283,8 +390,8 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
       console.log('  ✗ 收尾残留：清单见上方 stderr（残留物被 .gitignore 盖住，git status 看不出来）')
     }
     console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑（等号/空格两种写法均生效）')
-    process.exit(1)
   }
+  process.exit(exitCode)
 })().catch(async (e) => {
   console.error(e)
   // C5-081：异常退出同样先回收子进程，再删产物、再扫残留（顺序理由见 reapChildren 上方）。
