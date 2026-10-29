@@ -71,6 +71,25 @@ check('test.yml：CI 步骤存在、shellcheck 有兜底安装、zizmor 钉版�
     'CI 步骤必须走与本地同一条 npm 链，禁止 CI 侧自拼扫描命令造成口径分叉')
 })
 
+check('scorecard.yml：analysis job 的 job 级 permissions 必须显式保留 contents: read（C10-047）', () => {
+  // job 级 `permissions:` 会**整体覆盖** workflow 级：未列出的作用域一律置 none。scorecard.yml 的
+  // workflow 级那句 contents: read 对 analysis job 不起作用——job 级只写了 security-events / id-token，
+  // 于是 contents=none，actions/checkout 拿不到仓库、Scorecard 分析跑在空目录上（绿色假象）。
+  // 断言因此必须落在 job 块内的 permissions 段，而不是只看文件里出现过 contents: read。
+  const lines = read('.github/workflows/scorecard.yml').split('\n')
+  const at = lines.indexOf('    permissions:')
+  assert.ok(at > -1, 'analysis job 必须保留 job 级 permissions 块（缩进 4 空格的 permissions:）')
+  const scopes = []
+  for (let i = at + 1; i < lines.length; i++) {
+    // job 级作用域行的缩进固定 6 空格；遇到别的行（steps / 下一个键）即本段结束。
+    // 行内注释不算作用域内容（`contents: read  # …` 仍是 contents: read）。
+    if (!/^ {6}\S/.test(lines[i])) break
+    scopes.push(lines[i].trim().split('#')[0].trim())
+  }
+  assert.ok(scopes.includes('contents: read'),
+    `job 级 permissions 覆盖 workflow 级 ⇒ 缺 contents: read 时 checkout 无权读仓库（实得作用域：${scopes.join(' / ')}）`)
+})
+
 check('首轮扫描修复不回退（release.yml 显式关缓存 + pre-push SC2034 指令）', () => {
   const rel = read('.github/workflows/release.yml')
   assert.ok(lineThat(rel, /^package-manager-cache: false$/),
