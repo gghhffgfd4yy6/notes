@@ -29,6 +29,12 @@ const MUTANT_STATUSES = new Set([
 // F7：去重列表查询的整体超时（毫秒）——列表 API 只回答「当天是否已发过」，挂住不能拖死整个日报 job。
 const LIST_QUERY_TIMEOUT_MS = 15000
 
+// C10-024：创建 Issue 的 POST 也必须自带超时。修前它是整条链上唯一没有 `signal` 的 fetch：列表查询
+// 有 F7 的 15s、逐条 PATCH 有 CLOSE_BUDGET_MS 的剩余预算，只有 POST /issues 裸奔 ⇒ API 偶发长时间
+// 无响应时 report job 会一直挂到 job 级超时（6h），日报既发不出去也不响亮失败。15s 与列表查询同量级：
+// 单条 Issue 的创建写请求远快于它，挂满 15s 只可能是对端不响应。
+const ISSUE_POST_TIMEOUT_MS = 15000
+
 // 历史日报清理（卫生项，不是门禁）：日报每天新建一条 Issue 且从不关闭 ⇒ 会无限堆积（就是 #206…#343
 // 那批 open 日报）。下面这套口径刻意比「看着像日报就关」窄得多：
 //   * 标题必须**严格**等于 `🧬 变异测试日报 YYYY-MM-DD`——右侧带后缀（「… 2026-10-20 手改」）、
@@ -341,8 +347,12 @@ function readLogText (logPath, maxBytes = REUSE_LOG_MAX_BYTES) {
   }
 }
 
-// 递归查找 reuse.json（与 findReportJson 同口径：artifact 里是 mutation-reports/mutation-report-<段>/reports/mutation/）
-function findReuseJson (dir) {
+// 递归按文件名查找（C10-052：`findReuseJson` 与 `findReportJson` 原是逐字复制的两份实现，只差文件名）。
+// artifact 里是 mutation-reports/mutation-report-<段>/reports/mutation/，报告与 reuse.json 同层不同名，
+// 故「怎么走目录树」必须是同一份实现：目录不可读/不存在 → null（单段失败不中断整体，与 analyzeSegment
+// 的错误隔离设计一致）。
+function findFileInTree (dir, names) {
+  const wanted = Array.isArray(names) ? names : [names]
   let entries
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录树内递归（根目录已校验）
@@ -352,13 +362,17 @@ function findReuseJson (dir) {
   for (const e of entries) {
     const p = path.join(dir, e.name)
     if (e.isDirectory()) {
-      const found = findReuseJson(p)
+      const found = findFileInTree(p, wanted)
       if (found) return found
-    } else if (e.name === 'reuse.json') {
+    } else if (wanted.includes(e.name)) {
       return p
     }
   }
   return null
+}
+
+function findReuseJson (dir) {
+  return findFileInTree(dir, 'reuse.json')
 }
 
 // 把 reuse.json 的原始对象归一成渲染用形状；任何形状异常 → unknown + reason（不猜、不抛）
@@ -488,17 +502,23 @@ const COMMAND_RUNNER_CONFIG = 'stryker.config.js'
 const COMMAND_SEGMENT_MARK = '（command 档）'
 
 // yml 标量取值（与 check-mutation-ranges.js 同口径）：引号内的 `#` 属于值、裸标量的 `#` 起行内注释。
+// C10-060：引号**未闭合**一律按「无取值」处理（返回 ''），绝不把后半行原样当成值——旧实现「去掉开引号
+// 取全部」会让 `config: "stryker.tap.config.js` 与正常闭合逐字同值、`timeout_ms: "60000` 照样得到
+// 60000，矩阵写坏时日报仍给出确定结论（TAP 档 / 60s），谁也不会去查。空值在调用侧就是「不吃这条」：
+// runner 档位不登记该段、timeout 回落缺省 300000（两者都是已文档化的降级口径，不是猜）。
 function ymlScalar (raw) {
   let value = raw
   const quote = value[0]
   if (quote === '"' || quote === "'") {
-    // 连续两个相同引号折叠为一个（yml 转义）；未闭合时回退为去掉开引号取全部（防御性）
+    // 连续两个相同引号折叠为一个（yml 转义）；遇到单个闭合引号即结束。
     let out = ''
+    let closed = false
     for (let i = 1; i < value.length; i++) {
       const ch = value[i]
       if (ch !== quote) { out += ch; continue }
-      if (value[i + 1] === quote) { out += quote; i++ } else break
+      if (value[i + 1] === quote) { out += quote; i++ } else { closed = true; break }
     }
+    if (!closed) return ''
     value = out
   } else {
     const hash = value.indexOf('#')
@@ -548,11 +568,16 @@ function parseMatrixRunnerConfigs (ymlText) {
 }
 
 /**
- * 读取仓库内的 mutation.yml 并解析 runner 档位；**任何失败都降级为空 Map**（不抛、不退出）。
+ * 读取仓库内的 mutation.yml 并交给给定解析器；**任何失败都降级为空 Map**（不抛、不退出）。
+ *
+ * C10-052：`readMatrixRunnerConfigs` / `readMatrixTimeouts` 原是把这 14 行（路径缺省 → 读文件 →
+ * try 解析 → 两处 catch 返回空 Map）逐字抄了两份，只有最后调用的解析器不同。副本分叉的后果是
+ * 同一份矩阵在「runner 档位」与「超时上限」两列上给出互相矛盾的可信度。故收敛为一份。
  * @param {string} [matrixPath] 显式矩阵路径（测试注入用）；缺省为 `<repo>/.github/workflows/mutation.yml`
- * @returns {Map<string, string>} 段名 → config 文件名（读不到时为空的 Map ⇒ 调用侧不标注）
+ * @param {(text: string) => Map} parse 解析器（parseMatrixRunnerConfigs / parseMatrixTimeouts）
+ * @returns {Map} 解析结果；读不到或解析抛错时为空 Map
  */
-function readMatrixRunnerConfigs (matrixPath) {
+function readMatrixYml (matrixPath, parse) {
   const resolved = matrixPath || path.join(__dirname, '..', '.github', 'workflows', 'mutation.yml')
   let text
   try {
@@ -561,10 +586,19 @@ function readMatrixRunnerConfigs (matrixPath) {
     return new Map()
   }
   try {
-    return parseMatrixRunnerConfigs(text)
+    return parse(text)
   } catch (e) {
     return new Map()
   }
+}
+
+/**
+ * 读取仓库内的 mutation.yml 并解析 runner 档位；**任何失败都降级为空 Map**（不抛、不退出）。
+ * @param {string} [matrixPath] 显式矩阵路径（测试注入用）；缺省为 `<repo>/.github/workflows/mutation.yml`
+ * @returns {Map<string, string>} 段名 → config 文件名（读不到时为空的 Map ⇒ 调用侧不标注）
+ */
+function readMatrixRunnerConfigs (matrixPath) {
+  return readMatrixYml(matrixPath, parseMatrixRunnerConfigs)
 }
 
 /**
@@ -644,18 +678,7 @@ function parseMatrixTimeouts (ymlText) {
  * @returns {Map<string, number>} 段名 → timeoutMS（读不到时为空 Map ⇒ 调用侧显示 `—`）
  */
 function readMatrixTimeouts (matrixPath) {
-  const resolved = matrixPath || path.join(__dirname, '..', '.github', 'workflows', 'mutation.yml')
-  let text
-  try {
-    text = fs.readFileSync(resolved, 'utf8') // nosemgrep（路径来自 __dirname 常量或测试注入，非不可信输入）
-  } catch (e) {
-    return new Map()
-  }
-  try {
-    return parseMatrixTimeouts(text)
-  } catch (e) {
-    return new Map()
-  }
+  return readMatrixYml(matrixPath, parseMatrixTimeouts)
 }
 
 /**
@@ -717,16 +740,17 @@ function scoreOf (r) {
 
 function analyze (dir, options = {}) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
+  // C10-058：**库函数不得 process.exit**——坏目录一律抛 Error（文案与 CLI 一致），退出码交给 main 的
+  // catch 统一决定。否则任何直接调用 analyze 的宿主（测试、将来的包装脚本）都会被静默带走，调用方
+  // 既没法兜住、也没法区分「参数写错」与「报告有问题」。
   let st
   try {
     st = fs.statSync(dir) // NOSONAR:S8707 校验调用本身（防错误 CLI 参数）
   } catch (e) {
-    console.error(`❌ 报告目录不存在或不可访问：${dir}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
-    process.exit(1)
+    throw new Error(`报告目录不存在或不可访问：${dir}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
   }
   if (!st.isDirectory()) {
-    console.error(`❌ ${dir} 不是目录（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
-    process.exit(1)
+    throw new Error(`${dir} 不是目录（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
   }
   const results = []
   // runner 档位只读一次（每段共用一个解析结果）；读不到 ⇒ 空 Map ⇒ 全表不标注（见上方 F-2 说明）。
@@ -738,8 +762,7 @@ function analyze (dir, options = {}) {
     entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录处理（根目录已校验，工具合法用途）
   } catch (e) {
     // 入口目录不可读 = 调用错误：友好报错 + 干净退出（与单段错误隔离不同——入口失败全部失败）
-    console.error(`❌ 无法读取报告目录 ${dir}：${e.message}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
-    process.exit(1)
+    throw new Error(`无法读取报告目录 ${dir}：${e.message}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
   }
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith('mutation-report-')) continue
@@ -784,25 +807,9 @@ function validateSegments (results, expected = EXPECTED_SEGMENTS) {
 }
 
 // 递归查找 stryker 报告文件（文件名 mutation.json——json reporter 输出 reports/mutation/mutation.json；
-// 兼容旧名 mutation-report.json；目录可能嵌套 reports/ 等层）
+// 兼容旧名 mutation-report.json；目录可能嵌套 reports/ 等层）。走 findFileInTree（C10-052：与 findReuseJson 共用）。
 function findReportJson (dir) {
-  let entries
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录树内递归（根目录已校验）
-  } catch (e) {
-    // 目录不可读/不存在 → 跳过（与 analyzeSegment 的错误隔离设计一致，单段失败不中断整体）
-    return null
-  }
-  for (const e of entries) {
-    const p = path.join(dir, e.name)
-    if (e.isDirectory()) {
-      const found = findReportJson(p)
-      if (found) return found
-    } else if (e.name === 'mutation.json' || e.name === 'mutation-report.json') {
-      return p
-    }
-  }
-  return null
+  return findFileInTree(dir, ['mutation.json', 'mutation-report.json'])
 }
 
 // 解析单个段的 mutation-report.json（复杂度拆分：analyze 保持线性遍历）
@@ -1671,6 +1678,24 @@ async function pruneOldDailyIssuesBestEffort (opts) {
 }
 
 /**
+ * C10-026：解析日报要发往的仓库（`owner/repo`）。
+ *
+ * 修前是 `process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'`：变量缺失时静默把日报 POST 到另一个
+ * 仓库——既污染他仓，又让本仓永远看不到日报；而「配置缺失」被伪装成「一切正常」。现在与缺 token 同口径
+ * fail-closed：缺失/形态非法直接抛错，调用方（main）据此 exit 1，一个请求都不发。
+ * @param {string|undefined} raw `process.env.GITHUB_REPOSITORY` 的原始取值
+ * @returns {string} 校验过的 `owner/repo`
+ * @throws {Error} 缺失或不是 `owner/repo` 形态
+ */
+function resolveIssueRepo (raw) {
+  const repo = raw === undefined || raw === null ? '' : String(raw).trim()
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error(`缺少或非法的 GITHUB_REPOSITORY（${JSON.stringify(repo)}）：日报只发本仓，不再回落到硬编码仓库`)
+  }
+  return repo
+}
+
+/**
  * 汇总日报并按上海自然日创建或复用 GitHub Issue。
  * @param {string} body 已渲染的日报 Markdown
  * @returns {Promise<object>} 新建或已存在的 Issue 信息
@@ -1678,7 +1703,7 @@ async function pruneOldDailyIssuesBestEffort (opts) {
 async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
-  const repo = process.env.GITHUB_REPOSITORY || 'junhanw868-bot/notes'
+  const repo = resolveIssueRepo(process.env.GITHUB_REPOSITORY)
   const today = shanghaiDate()
   const title = `🧬 变异测试日报 ${today}`
   // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）。
@@ -1713,7 +1738,9 @@ async function postIssue (body) {
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
-    body: JSON.stringify({ title, body })
+    body: JSON.stringify({ title, body }),
+    // C10-024：本请求自己的超时信号（不复用列表查询那一个：两者各自计时）
+    signal: AbortSignal.timeout(ISSUE_POST_TIMEOUT_MS)
   })
   if (!res.ok) {
     // S5145：远端响应体不可信（可能含换行/控制字符/伪日志前缀），只记录固定状态码

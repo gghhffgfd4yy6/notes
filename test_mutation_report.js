@@ -1183,6 +1183,33 @@ check('parseMatrixRunnerConfigs：从 matrix include 解析逐段 config（含 s
   assert.strictEqual(quoted.get('s1'), COMMAND_RUNNER_CONFIG)
 })
 
+// C10-060：引号**未闭合**曾「静默回退」成「去掉开引号、后半行全算值」——对两个解析器来说，结果都是
+// **看起来完全合法**的取值：`config: "stryker.tap.config.js` 与正常闭合逐字相同，`timeout_ms: "60000`
+// 也照样得到 60000。矩阵被改坏时日报仍给出「这一段走 TAP 档 / 上限 60s」的确定结论，没有任何信号提示
+// 「这行 yml 本身是坏的」。契约：未闭合 ⇒ 该标量视为**无取值**（条目不计入；timeout 回落缺省），绝不猜。
+check('C10-060 引号未闭合不得回退成看似合法的值（runner 档位 + timeout 同口径）', () => {
+  const yml = [
+    'include:',
+    '  - name: bad-double',
+    '    config: "stryker.tap.config.js',
+    '    timeout_ms: "60000',
+    '  - name: bad-single',
+    "    config: 'stryker.config.js",
+    '  - name: ok-quoted',
+    '    config: "stryker.tap.config.js"  # 正常闭合',
+    '    timeout_ms: "45000"'
+  ].join('\n')
+  const configs = parseMatrixRunnerConfigs(yml)
+  assert.strictEqual(configs.has('bad-double'), false,
+    '双引号未闭合的 config 必须视为无值（修前会被读成 stryker.tap.config.js，与正常值无法区分）')
+  assert.strictEqual(configs.has('bad-single'), false, '单引号未闭合同理')
+  assert.strictEqual(configs.get('ok-quoted'), 'stryker.tap.config.js', '正常闭合的引号（带行内注释）必须照旧解析')
+  const timeouts = parseMatrixTimeouts(yml)
+  assert.strictEqual(timeouts.get('bad-double'), DEFAULT_SEGMENT_TIMEOUT_MS,
+    '未闭合的 timeout_ms 必须回落缺省 300000（修前会被读成 60000）')
+  assert.strictEqual(timeouts.get('ok-quoted'), 45000, '正常闭合的 timeout_ms 必须照旧解析')
+})
+
 check('render/analyze：command 档段被标注、TAP 档段不被标注（F-2 靶向用例）', () => {
   // 纯函数层
   assert.strictEqual(formatSegmentLabel('storage', COMMAND_RUNNER_CONFIG), `storage${COMMAND_SEGMENT_MARK}`)
@@ -1477,6 +1504,23 @@ try {
     assert.strictEqual(findReportJson(path.join(tmp, 'not-exist')), null)
   })
 
+  // C10-052：`findReportJson` / `findReuseJson` 原是逐字复制的两份递归查找（只差文件名），
+  // `readMatrixRunnerConfigs` / `readMatrixTimeouts` 是逐字复制的两份「读 mutation.yml + 解析 +
+  // 任何失败降级空 Map」。副本一旦分叉，日报的「有报告/无报告」与「矩阵读不到」判据就会各说各话。
+  // 门禁：树查找实现只准 1 处、矩阵读取实现只准 1 处（分析器的目录枚举是另一回事，故 withFileTypes 计 2）。
+  check('C10-052 目录树查找 / 矩阵读取各自只有一处实现（禁止再出现逐字副本）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'mutation-report.js'), 'utf8')
+    const countOf = (needle) => src.split(needle).length - 1
+    assert.strictEqual(countOf('fs.readFileSync(resolved, \'utf8\')'), 1,
+      '「读 mutation.yml」只准一处实现（readMatrixYml）；矩阵读取副本会各自漂移')
+    assert.strictEqual(countOf('fs.readdirSync(dir, { withFileTypes: true })'), 2,
+      '递归目录遍历只准共享实现 1 处 + analyze 的入口枚举 1 处；多出来的那份就是 findReportJson/findReuseJson 的副本')
+    // 两对 helper 必须都还导出且仍走共享实现（删名字会让上面的计数假绿）
+    for (const name of ['findReportJson', 'findReuseJson', 'readMatrixRunnerConfigs', 'readMatrixTimeouts']) {
+      assert.strictEqual(typeof require('./scripts/mutation-report.js')[name], 'function', `${name} 必须仍然导出`)
+    }
+  })
+
   check('analyzeSegment 正确解析统计 / 缺报告返回 error', () => {
     const d = path.join(tmp, 'mutation-report-utils'); fs.mkdirSync(d, { recursive: true })
     fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
@@ -1620,6 +1664,24 @@ try {
     } finally {
       fs.rmSync(emptyDir, { recursive: true, force: true })
     }
+  })
+
+  // C10-058：analyze() 是导出的**库函数**（测试与将来的调用方都直接用它），里面 process.exit(1) 会让
+  // 调用方无法兜住：既不能降级、也不能把「参数写错」与「报告有问题」分开处理，整个宿主进程直接消失。
+  // 契约改为抛 Error（消息与 CLI 文案一致），退出码由 main 的 catch 统一决定（仍 exit 1、文案不变）。
+  check('C10-058 analyze 遇到坏目录抛错而不是 process.exit（调用方可兜住）', () => {
+    const missing = path.join(tmp, 'c10058-not-exist')
+    let err = null
+    try { analyze(missing) } catch (e) { err = e }
+    assert.ok(err instanceof Error, '不存在的目录必须抛错（process.exit 会让调用方拿不到控制权）')
+    assert.ok(/报告目录不存在或不可访问/.test(err.message), `错误文案须与 CLI 一致，实际：${err.message}`)
+
+    const filePath = path.join(tmp, 'c10058-a-file')
+    fs.writeFileSync(filePath, 'x')
+    let err2 = null
+    try { analyze(filePath) } catch (e) { err2 = e }
+    assert.ok(err2 instanceof Error, '传普通文件也必须抛错')
+    assert.ok(/不是目录/.test(err2.message), `错误文案须点名「不是目录」，实际：${err2.message}`)
   })
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
@@ -1907,6 +1969,26 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     await assert.rejects(() => postIssue('body'), /缺少 GITHUB_TOKEN/)
   })
 
+  // C10-026：缺 GITHUB_REPOSITORY 时绝不回落到硬编码的他仓。旧实现 `process.env.GITHUB_REPOSITORY ||
+  // 'junhanw868-bot/notes'`：CI 漏传该变量（本地 `--issue` 也常见）时，日报会被静默 POST 到另一个
+  // 仓库——既污染他仓，又让本仓永远看不到日报，属于「配置缺失被伪装成正常工作」。口径与上面缺 token
+  // 一致：fail-closed 抛错，且**一个请求都不发**（不允许用空仓库名先探一次）。
+  await acheck('C10-026 postIssue 缺少 GITHUB_REPOSITORY 时抛错且不发出任何请求（不得回落硬编码他仓）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    delete process.env.GITHUB_REPOSITORY
+    const calls = []
+    global.fetch = async function (url) {
+      calls.push(String(url))
+      throw new Error(`缺仓库变量时不应发出任何请求：${url}`)
+    }
+    try {
+      await assert.rejects(() => postIssue('body'), /GITHUB_REPOSITORY/)
+    } finally {
+      process.env.GITHUB_REPOSITORY = 'owner/repo'
+    }
+    assert.deepStrictEqual(calls, [], `缺仓库变量时必须直接失败，实际发出：${calls.join(', ')}`)
+  })
+
   await acheck('postIssue 当天日报已存在时跳过发布', async () => {
     process.env.GITHUB_TOKEN = 'test-token'
     process.env.GITHUB_REPOSITORY = 'owner/repo'
@@ -2055,9 +2137,30 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     await postIssue('body')
     assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
       '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
-    assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
+    // C10-024：POST 也要有自己的超时（见下一条专测）；这里只锁「不被列表查询那一个绑住」——
+    // 两者各自独立计时，否则一次 15s 的列表超时会连带把创建请求掐掉。
+    assert.notStrictEqual(createRes.capturedOpts.signal, listRes.capturedOpts.signal,
+      '发 Issue 请求不应被列表查询的超时信号绑住')
     assert.ok(cleanupRes.capturedOpts.signal instanceof AbortSignal,
       '历史日报清理的查询同样必须带超时（卫生项不得拖死 report job）')
+  })
+
+  // C10-024：创建 Issue 的 POST 曾是整条链上**唯一**没有超时的 fetch——列表查询（F7）与逐条 PATCH
+  // （CLOSE_BUDGET_MS）都带了 AbortSignal，只有 POST /issues 裸奔。GitHub API 偶发长时间无响应时，
+  // report job 会一直挂到 job 级超时（6h）：日报既发不出去、也不会响亮失败，正是本仓反复消灭的
+  // 「静默挂住」形态。判据用 in-process 的 opts.signal 类型 + 对象身份（不是耗时墙钟）。
+  await acheck('C10-024 postIssue 创建 Issue 的 POST 自带 AbortSignal 超时（不得裸奔）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 105, html_url: 'https://github.com/owner/repo/issues/105' })
+    const cleanupRes = makeRes(true, 200, [])
+    mockFetch([listRes, createRes, cleanupRes])
+    await postIssue('body')
+    assert.ok(createRes.capturedOpts && createRes.capturedOpts.signal instanceof AbortSignal,
+      '创建 Issue 的 POST 必须带 AbortSignal 超时（否则接口挂住会把 report job 一起拖死）')
+    assert.notStrictEqual(createRes.capturedOpts.signal, listRes.capturedOpts.signal,
+      'POST 必须用自己的超时信号，不能复用列表查询那一个')
   })
 
   // ===== 本段生效 timeoutMS + Timeout 两类（console 段 60s）====================================

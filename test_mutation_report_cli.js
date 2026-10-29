@@ -120,6 +120,22 @@ function schemaReport (seg, mutants) {
   assert.ok(r.stderr.includes('不存在') || r.stderr.includes('不可访问'), '应输出目录不存在错误')
 }
 
+// 场景 2b（C10-058）：参数是普通文件（存在但不是目录）→ exit 1 + 「不是目录」。
+// 这条分支只在 analyze() 里判定（main 的 existsSync 前置检查放行普通文件），改前改后都必须由
+// 「抛错 → main 的 catch → exit 1」这条路收尾：库函数不再自己 process.exit，CLI 行为逐字不变。
+{
+  const tmpFile = path.join(os.tmpdir(), `xbk-mut-report-notdir-${process.pid}`)
+  fs.writeFileSync(tmpFile, 'x')
+  try {
+    const r = runCli([tmpFile])
+    assert.strictEqual(r.code, 1, '普通文件应 exit 1')
+    assert.ok(r.stderr.includes('不是目录'), `stderr 应点名「不是目录」，实际：${r.stderr}`)
+    assert.ok(r.stderr.includes('用法'), '仍应带用法提示')
+  } finally {
+    fs.rmSync(tmpFile, { force: true })
+  }
+}
+
 // 场景 3：有效目录 + 全部分段的 mutation.json → exit 0 + 输出 markdown
 {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-'))
