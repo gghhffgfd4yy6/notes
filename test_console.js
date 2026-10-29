@@ -10875,12 +10875,25 @@ async function main () {
     assert.ok(!/\(\s*stats\.truncated/.test(seg), '不得再在卡片里就地读 stats.truncated（判定只留在 pure.mjs）')
   })
 
-  // ── C5-064：UI 行为断言（真渲染，不再只锁源码文本）──
+  // ── C5-064：服务端 renderPage 输出断言（组件级渲染：DEFER，见下）──
   // 病根：本文件几千条断言里没有一条调用过渲染入口，全是 readConsoleSource() 的正则。
   // 「文本里有这行代码」与「页面真的这么渲染」是两件事：把 renderPage 改成返回固定串、
   // 或把 boot 岛里的 token/instance 丢掉，旧断言全绿。这里直接调导出的 renderPage /
-  // renderUnauthorizedPage 渲染真实 state，对返回的 HTML 做行为断言——不引 jsdom，
-  // 因为这两个入口本来就是服务端字符串渲染，浏览器里那一侧不在本套件的判据范围。
+  // renderUnauthorizedPage 渲染真实 state，对返回的 HTML 做断言。
+  //
+  // 口径（C5-064 正式 DEFER）：下面 5 条只覆盖**服务端字符串渲染**（state → HTML 文本），
+  // 不是组件级行为测试。scripts/console-assets/pages.js(5067 行)/components.js(1451 行)
+  // 里的组件（弹窗打开后焦点、Esc 关闭回调、空列表空态文案）仍无一条用例真渲染过，
+  // 预检原文「没有一条渲染过组件」成立，不得把这批用例记作组件行为测试。
+  // 已尝试但本轮落不了地（证据留档）：
+  //   1) 资产是浏览器 ESM（import './htm-preact.module.js'），package.json 无 "type":"module"
+  //      ⇒ CJS 测试进程直 import .js 会按 CJS 解析报错；要跑需先拷贝改名 .mjs 并改写说明符。
+  //   2) 组件渲染需要 DOM：htm-preact.module.js 本身能在 Node 里 import（已实测），但本机没有
+  //      任何 DOM 实现——jsdom / happy-dom / linkedom 在 worktree 与共享 node_modules 里全 absent。
+  //   3) `npm i -D happy-dom` 两次实测（180s、420s）均卡在 reify 阶段超时；registry 镜像
+  //      (mirrors.tencentyun.com) 对大 reify 不可用，中途还把关掉的 node_modules 删成半残（已还原）。
+  // 结论：补真组件测试的前置条件是先解依赖（离线 happy-dom tarball，或给资产加测试专用 ESM 入口）。
+  // 在这之前，"C5-064 已覆盖组件行为" 的说法不成立。
   // state 骨架按 formatStatus 的读取面构造（generatedAt + report/run/channels/diagnostics 四部件）。
   function uiState (over = {}) {
     return {
@@ -10900,7 +10913,7 @@ async function main () {
     return JSON.parse(m[1])
   }
 
-  await aok('C5-064 renderPage: 用户可控状态字段必须转义（真渲染，尖括号不得原样落地）', () => {
+  await aok('C5-064 renderPage: 用户可控状态字段必须转义（服务端渲染输出，尖括号不得原样落地）', () => {
     const { renderPage } = require('./scripts/console')
     const payload = '<script>alert(1)</script>'
     const attr = 'x" onmouseover="alert(1)'
@@ -10910,7 +10923,7 @@ async function main () {
       channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
     }), [], new URLSearchParams(), 'tok', 'deep')
     assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
-    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（真渲染链路，不是源码正则）')
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
     assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
     assert.ok(html.includes('&quot; onmouseover=&quot;alert(1)'), '双引号必须转成 &quot;（转义完整性）')
   })
