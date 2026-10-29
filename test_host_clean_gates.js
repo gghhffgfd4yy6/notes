@@ -210,7 +210,12 @@ check('require 容错只吞「本模块不存在」，模块内部依赖缺失�
     }
     // ③ 生产路径不得回退：先 require.resolve 预判，resolve 成功后的 require 异常照常抛
     const src = read(c.entry)
-    assert.match(src, /try \{\s*\n\s*require\.resolve\(HOST_CLEAN_MODULE\)/,
+    // 可匹配形态：`try {` 换行后紧跟 `require.resolve(HOST_CLEAN_MODULE)`（中间允许空行）。
+    // 旧写法 `\s*\n\s*` 里 `\s` 也能吃换行，两侧抢同一段空白 ⇒ 超线性回切（S5852）。
+    // 把「行尾空白」限定成 [ \t]（不含换行）后，`\n` 只能由字面量吃掉，判定退化为一次线性扫描；
+    // 「先 require.resolve、再 require」这条判据本身一字未变——坏形态反例（直接 require 进 catch）
+    // 由紧随其后的负断言继续兜住。
+    assert.match(src, /try \{[ \t]*\n\s*require\.resolve\(HOST_CLEAN_MODULE\)/,
       `${c.entry} 必须先 require.resolve 本模块、再 require 它（否则任何 MODULE_NOT_FOUND 又会被当成「脚本不存在」）`)
     assert.ok(!/hostClean = require\('\.\/scripts\/check-host-clean\.js'\)\s*\n\}\s*catch/.test(src),
       `${c.entry} 不得把 require 直接放在只判 e.code 的 catch 里（C10-028 的原形）`)
