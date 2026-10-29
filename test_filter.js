@@ -10043,13 +10043,16 @@ console.log('========================================\n');
   const { App: V3App, truncateUtf16: v3Truncate } = require('./xbk_function_v3.js')
   const fc = require('fast-check')
 
-  // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
-  // v3.267：同步空串/纯空白串关闭口径 + 移除 truthiness/规范化重叠
-  function refEnabledFlag (cfg) {
-    if (!cfg) return false
-    const en = cfg.enabled
-    const s = en == null ? '' : String(en).trim().toLowerCase()
-    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
+  // C4-003：这里原先放的是 xbk_app.js `_enabledFlag` 的逐字复制（仅函数名/尾逗号不同），
+  // 属性断言实际退化成 f(x) === f(x)：抄错或照抄同一处误解都照样绿。改为两个不同源判据：
+  // ① 规范词表 oracle —— 关闭值集合是**数据**（来自配置注释与上方表格用例），
+  //    不复制实现的 Boolean(en) 短路/三分支控制流；
+  // ② 变形不变式 —— 判定只依赖「trim + 小写」规范化与字符串化，独立于具体分支写法。
+  const OFF_ENABLED_WORDS = new Set(['', 'false', '0'])
+  function specEnabledFlag (rawEnabled) {
+    if (rawEnabled === undefined || rawEnabled === null || Number.isNaN(rawEnabled)) return false
+    const norm = String(rawEnabled).trim().toLowerCase()
+    return !OFF_ENABLED_WORDS.has(norm)
   }
 
   await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
@@ -10071,19 +10074,43 @@ console.log('========================================\n');
     }
   })
 
-  await test('_enabledFlag：属性测试——任意输入与参考实现一致（不变量）', async () => {
+  await test('_enabledFlag：属性测试——规范词表 oracle + 变形不变式（不复制生产实现）', async () => {
+    // ① 规范词表 oracle：关闭 = 缺省/null/NaN + 规范化后命中 {''/'false'/'0'}；其余开启。
+    //    生成器显式覆盖空白串/大小写变体，避免只靠随机串撞不到边界。
+    const closedWords = fc.constantFrom('', ' ', '  ', '\t', '\n', '\r\n', 'false', 'FALSE', 'False', ' false ', '0', ' 0 ', 'true', '1', 'yes', 'x')
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(undefined),
         fc.constant(null),
         fc.constant({}),
+        fc.constant({ enabled: undefined }),
+        fc.constant({ enabled: null }),
+        fc.constant({ enabled: NaN }),
         fc.record({ enabled: fc.oneof(fc.boolean(), fc.integer(), fc.string({ maxLength: 10 })) }),
-        fc.record({ enabled: fc.oneof(fc.constant(''), fc.constant(0), fc.constant('0'), fc.constant('false'), fc.constant(' true ')) })
+        fc.record({ enabled: closedWords })
       ),
       (cfg) => {
-        assertEqual(V3App._enabledFlag(cfg), refEnabledFlag(cfg), `cfg=${JSON.stringify(cfg)}`)
+        const got = V3App._enabledFlag(cfg)
+        assertEqual(typeof got, 'boolean', `必须返回布尔（cfg=${JSON.stringify(cfg)}）`)
+        assertEqual(got, specEnabledFlag(cfg && cfg.enabled), `cfg=${JSON.stringify(cfg)}：判定必须等于规范词表口径`)
       }
     ), { numRuns: 400 })
+    // ② 变形不变式：判定只依赖 trim+小写规范化 —— 大小写/首尾空白不得改变结果
+    fc.assert(fc.property(fc.string({ maxLength: 12 }), (s) => {
+      const base = V3App._enabledFlag({ enabled: s })
+      assertEqual(V3App._enabledFlag({ enabled: '  ' + s.toUpperCase() + '\t' }), base,
+        `大小写/首尾空白不得改变判定：${JSON.stringify(s)}`)
+      assertEqual(V3App._enabledFlag({ enabled: ' ' + s + ' ' }), base,
+        `首尾空白不得改变判定：${JSON.stringify(s)}`)
+    }), { numRuns: 400 })
+    // ③ 字符串化不变式：同一标量按数值/布尔传入与按字符串传入判定一致
+    fc.assert(fc.property(
+      fc.oneof(fc.boolean(), fc.integer(), fc.double({ noNaN: true }), fc.string({ maxLength: 6 })),
+      (v) => {
+        assertEqual(V3App._enabledFlag({ enabled: v }), V3App._enabledFlag({ enabled: String(v) }),
+          `字符串化不得改变判定：${String(v)}`)
+      }
+    ), { numRuns: 300 })
   })
 
   await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', async () => {
