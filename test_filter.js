@@ -1010,7 +1010,6 @@ console.log('========================================\n');
 
   await test('空内容 → 返回空', () => {
     const result = htmlToMarkdown({ url: 'http://x' })
-    assertEqual(result.includes('原文链接'), true)
     assertEqual(result.includes('http://x'), true)
   })
 
@@ -1027,7 +1026,6 @@ console.log('========================================\n');
       url: 'http://x'
     })
     assertEqual(result.includes('[链接](http://url)'), true)
-    assertEqual(result.includes('原文链接'), true)
   })
 
   await test('图片标签被转换', () => {
@@ -2874,7 +2872,6 @@ console.log('========================================\n');
       content_html: '<p>hello</p>', url: 'http://x'
     })
     assertEqual(r.includes('hello'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   // ==================== 32. has() url fallback 判重 ====================
@@ -3359,7 +3356,6 @@ console.log('========================================\n');
     })
     assertEqual(r.includes('测试'), true)
     assertEqual(r.includes('<b>'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('模板含{Html内容}和{标题}混合', () => {
@@ -3368,7 +3364,6 @@ console.log('========================================\n');
     })
     assertEqual(r.includes('商品'), true)
     assertEqual(r.includes('内容'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   // C10-070（audit38）：100k 硬上限必须按 UTF-16 安全截断（SYSTEM_CONTRACT.md:31）。
@@ -4063,7 +4058,9 @@ console.log('========================================\n');
 
   await test('tuisong_replace {Html内容} content_html为空', () => {
     const r = tuisong_replace('{Html内容}', { url: 'http://x', content_html: undefined })
-    assertEqual(r.includes('原文链接'), true)
+    // 空 content_html ⇒ 正文段整段为空，只保留原文链接段（不得残留 undefined/null/花括号）
+    assertEqual(r, '<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="http://x" target="_blank">http://x</a><br>&nbsp;<br>&nbsp;<br>',
+      '空 content_html 必须只输出原文链接段，正文段为空')
     // 空内容不应显示 "undefined" 文本
     assertEqual(r.includes('undefined'), false)
   })
@@ -4095,7 +4092,6 @@ console.log('========================================\n');
   await test('tuisong_replace {Html内容} 原文链接URL正确', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/a.html' })
     assertEqual(r.includes('http://example.com/a.html'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   // ==================== 49. 第8轮变异盲区修复（异常输入健壮性） ====================
@@ -4410,7 +4406,6 @@ console.log('========================================\n');
   await test('tuisong {Html内容} 原文链接含实际URL', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/p.html' })
     assertEqual(r.includes('http://example.com/p.html'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('tuisong {Html内容} 链接文本是URL本身', () => {
@@ -4787,13 +4782,11 @@ console.log('========================================\n');
     // 变异 '{Html内容' 作为 key 时仍前缀匹配，替换结果末尾会残留 '}'
     const r = tuisong_replace('{Html内容}', { content_html: '测试', url: 'http://x' })
     assertEqual(r.includes('}'), false)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('tuisong {Markdown内容} 替换后无花括号残留', () => {
     const r = tuisong_replace('{Markdown内容}', { content_html: '测试', url: 'http://x' })
     assertEqual(r.includes('}'), false)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('validateConfig 逐字段验证无效正则（变异字段名数组会漏验）', () => {
@@ -5726,7 +5719,6 @@ console.log('========================================\n');
     // 无标签内容走短路路径，输出应与正常路径一致
     const r = htmlToMarkdown({ content_html: '纯文本&nbsp;内容', url: 'http://x' })
     assertEqual(r.includes('纯文本 内容'), true)
-    assertEqual(r.includes('原文链接'), true)
   })
 
   await test('getFilePath 超长文件名截断（#146）', () => {
@@ -11663,6 +11655,16 @@ console.log('========================================\n');
     const tail = code.slice(-800)
     assertEqual(tail.includes(EXIT_CALL), false, `收尾区不得出现 ${EXIT_CALL}（不等待管道 flush，会截断尾部输出）`)
     assertEqual(/process\.exitCode\s*=\s*failed > 0 \? 1 : 0/.test(tail), true, '收尾必须设置 process.exitCode = failed > 0 ? 1 : 0')
+  })
+
+  // C4-023：13 个互不相关的用例共用同一句 `assertEqual(r.includes('原文链接'), true)`，是照着上一个用例
+  // 补的样板尾巴，不是各自想清楚要锁什么：原文链接的格式由「htmlToMarkdown 原文链接格式精确断言」
+  // 专门覆盖，模板路径留 1–2 处即可。这条门禁防止样板再被复制回去（数量一涨即红，逼着写各自要锁的契约）。
+  await test('原文链接样板断言不得成片复制（C4-023：只留模板类 1–2 处 + 格式专门用例）', () => {
+    const self = require('fs').readFileSync(__filename, 'utf8')
+    const boiler = self.split('\n').filter((l) => /^\s*assertEqual\((?:r|result)\.includes\('原文链接'\), true\)$/.test(l))
+    assertEqual(boiler.length <= 2, true,
+      `同一句样板应只留 1–2 处（模板类 + 格式专门用例），实际 ${boiler.length} 处：${JSON.stringify(boiler.map((l) => l.trim()))}`)
   })
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
