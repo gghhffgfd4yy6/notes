@@ -674,17 +674,15 @@ try {
       assert.ok(r.err.includes('GITHUB_SHA'), 'stderr 必须点名 GITHUB_SHA：' + r.err)
     }
     //   e) 容忍值非法：只认非负整数（负数等于反向放宽、1.5/1e3 会让判据变形）
-    {
-      for (const bad of ['-1', '1.5', '1e3', 'x', ' 9.0']) {
-        assert.throws(() => resolveKilledTolerance(bad), /必须是非负整数/, `容忍值 ${JSON.stringify(bad)} 必须抛`)
-        const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: baseline, [KILLED_TOLERANCE_ENV]: bad })
-        assert.strictEqual(r.code, 1, `容忍值 ${JSON.stringify(bad)} 必须 exit 1，实际 ${r.code}：${r.text}`)
-      }
-      // 未设置 / 空串 ⇒ 0（缺省不放大容忍）
-      assert.strictEqual(resolveKilledTolerance(undefined), 0, '未设置容忍值 ⇒ 0')
-      assert.strictEqual(resolveKilledTolerance('  '), 0, '空白容忍值 ⇒ 0')
-      assert.strictEqual(resolveKilledTolerance('10'), 10, '合法容忍值必须原样解析')
+    for (const bad of ['-1', '1.5', '1e3', 'x', ' 9.0']) {
+      assert.throws(() => resolveKilledTolerance(bad), /必须是非负整数/, `容忍值 ${JSON.stringify(bad)} 必须抛`)
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: baseline, [KILLED_TOLERANCE_ENV]: bad })
+      assert.strictEqual(r.code, 1, `容忍值 ${JSON.stringify(bad)} 必须 exit 1，实际 ${r.code}：${r.text}`)
     }
+    // 未设置 / 空串 ⇒ 0（缺省不放大容忍）
+    assert.strictEqual(resolveKilledTolerance(undefined), 0, '未设置容忍值 ⇒ 0')
+    assert.strictEqual(resolveKilledTolerance('  '), 0, '空白容忍值 ⇒ 0')
+    assert.strictEqual(resolveKilledTolerance('10'), 10, '合法容忍值必须原样解析')
     //   f) 本段不在基线的 segments 里 ⇒ 无法比较 ⇒ 红（不接受「没比到就算通过」）
     {
       const noSeg = writeJson('baseline-no-seg.json', { commit: SHA, mode: 'full', segments: { 'other-seg': { killed: 100 } } })
