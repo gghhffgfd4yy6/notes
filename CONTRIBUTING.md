@@ -4,7 +4,10 @@
 
 - 从 `main` 新建 `fix/*`、`feat/*`、`docs/*`、`chore/*`、`refactor/*`、`test/*` 分支（CI/工具链改动用 `ci/*` 或 `chore/*`）；不要直接修改 `main`。
 - 一次提交只做一件事。CI 全绿后使用 Squash Merge。
-- 提交信息首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且标题与正文之间**必须留一个空行**（三条都由 `commit-msg` 钩子硬拦；漏空行会让 git 把整段当标题，首行限制随之失效）。`#`（或 Git 配置的 `core.commentChar`）行不自动算那个空行：注释行不算空行。Git 的 `--cleanup` 可被命令行覆盖且不会把有效值传给钩子，因此该检查不依赖 cleanup 配置。
+- 提交信息首行须以 `fix: feat: refactor: docs: chore: style: test: perf: revert: build: ci:` 之一开头、不超过 100 字符，且标题与正文之间**必须留一个空行**（三条都由 `commit-msg` 钩子硬拦；漏空行会让 git 把整段当标题，首行限制随之失效）。`#`（或 Git 配置的 `core.commentChar`）行不自动算那个空行：注释行不算空行。Git 的 `--cleanup` 可被命令行覆盖且不会把有效值传给钩子，因此该检查不依赖 cleanup 配置。**唯一例外是「合并进行中」的合并提交**——它免「类型前缀」这一条，判据与免责范围见下面三条（与 `.githooks/commit-msg` 的 `is_merge` 判定逐条对齐）：
+  - **判据是「`Merge ` 开头 + MERGE_HEAD 存在」两条同时成立**：首行以 `Merge `（带空格，`Merged ...` 不算）开头，**且** `git rev-parse --git-path MERGE_HEAD` 指向的文件确实存在（即真的处于合并进行中）→ 免「类型前缀」这一条。只看 subject 不够：`git commit -m "Merge 随便写"` 首行同样以 `Merge ` 开头，但 MERGE_HEAD 不存在，按普通提交处理，**不免前缀**。解析失败（不在仓库里 / git 不可用）同样 fail-closed 按普通提交处理。
+  - **其余提交照旧**：除上述合并提交外，所有提交仍须以 `fix:` / `feat:` / `refactor:` / `docs:` / `chore:` / `style:` / `test:` / `perf:` / `revert:` / `build:` / `ci:` 之一（可带 `(scope)`）开头。例外**只**免前缀一条，不代表合并提交可以不守格式。
+  - **另两条对合并提交照旧生效**：首行 ≤100 字符、标题（首行）与正文之间必须留空行，两条判据在合并消息上同样硬拦——git 的默认形态（单行 `Merge branch 'x'`，或编辑器里的「标题 + 空行 + 注释」）两者都满足，不会误伤正常合并。为什么不能只看 subject：那等于给普通提交开一条免前缀的后门；为什么必须问 `--git-path`：linked worktree 下 MERGE_HEAD 在 `.git/worktrees/<name>/`，硬编码 `.git/MERGE_HEAD` 会把正常合并误拦。
 
 ## 改完要跑什么
 
