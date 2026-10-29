@@ -10844,6 +10844,115 @@ async function main () {
     assert.ok(/\$\{statsTailNote\(stats\)\}/.test(seg), '周卡必须复用同一个尾部标注（两卡口径不得再分叉）')
     assert.ok(!/\(\s*stats\.truncated/.test(seg), '不得再在卡片里就地读 stats.truncated（判定只留在 pure.mjs）')
   })
+
+  // ── C5-064：UI 行为断言（真渲染，不再只锁源码文本）──
+  // 病根：本文件几千条断言里没有一条调用过渲染入口，全是 readConsoleSource() 的正则。
+  // 「文本里有这行代码」与「页面真的这么渲染」是两件事：把 renderPage 改成返回固定串、
+  // 或把 boot 岛里的 token/instance 丢掉，旧断言全绿。这里直接调导出的 renderPage /
+  // renderUnauthorizedPage 渲染真实 state，对返回的 HTML 做行为断言——不引 jsdom，
+  // 因为这两个入口本来就是服务端字符串渲染，浏览器里那一侧不在本套件的判据范围。
+  // state 骨架按 formatStatus 的读取面构造（generatedAt + report/run/channels/diagnostics 四部件）。
+  function uiState (over = {}) {
+    return {
+      generatedAt: Date.UTC(2026, 9, 27, 3, 4, 5),
+      report: { status: 'ok', value: { date: '2026-10-27', runs: 3, pushed: 12, failed: 1, truncated: 0 } },
+      run: { status: 'ok', value: { at: '2026-10-27 11:03:00', total: 20, dedup: 3, filtered: 2, pushed: 14, failed: 1, truncated: 0, elapsed: '4s' } },
+      channels: { status: 'ok', value: { xianbao: { consecutiveFailures: 1, lastFailureAt: 0, lastAlertAt: 0 } } },
+      diagnostics: { status: 'ok', value: { at: '2026-10-27 10:00:00', byReason: { dedup: 3 } } },
+      ...over
+    }
+  }
+  // boot JSON 岛是前端拿 token/version/instance 的唯一通道：抽出来按 JSON 解析，顺便证明
+  // 「转义之后仍是合法 JSON」——旧断言只看源码里有没有 bootJson 这个标识符。
+  function bootIsland (html) {
+    const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(html)
+    assert.ok(m, '必须渲染出 id="xbk-boot" 的 JSON 岛，否则前端拿不到凭证/实例名')
+    return JSON.parse(m[1])
+  }
+
+  await aok('C5-064 renderPage: 用户可控状态字段必须转义（真渲染，尖括号不得原样落地）', () => {
+    const { renderPage } = require('./scripts/console')
+    const payload = '<script>alert(1)</script>'
+    const attr = 'x" onmouseover="alert(1)'
+    const html = renderPage(uiState({
+      report: { status: 'ok', value: { date: payload, runs: 1 } },
+      run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
+      channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
+    }), [], new URLSearchParams(), 'tok', 'deep')
+    assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（真渲染链路，不是源码正则）')
+    assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
+    assert.ok(html.includes('&quot; onmouseover=&quot;alert(1)'), '双引号必须转成 &quot;（转义完整性）')
+  })
+
+  await aok('C5-064 renderPage: 空 state/无 run/空 runsList 不抛，且输出完整合法骨架', () => {
+    const { renderPage } = require('./scripts/console')
+    const bare = {
+      generatedAt: 0,
+      report: { status: 'missing', value: null },
+      run: { status: 'missing', value: null },
+      channels: { status: 'missing', value: null },
+      diagnostics: { status: 'missing', value: null }
+    }
+    // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
+    const html = renderPage(bare, [], undefined, '', 'deep')
+    assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
+    assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
+    assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
+    assert.ok(html.includes('<noscript>') && html.includes('缺失'), '无脚本降级必须保留，且缺失部件如实写「缺失」')
+    assert.strictEqual((html.match(/<\/html>/g) || []).length, 1)
+    const boot = bootIsland(html)
+    assert.strictEqual(boot.token, '', '没传凭证时 boot token 必须是空串')
+    assert.strictEqual(boot.instance, '', '没传 instanceId 时必须回退空串（不能是 undefined）')
+    assert.strictEqual(typeof boot.version, 'string')
+    assert.ok(boot.version.length > 0, 'version 必须非空，否则资产 URL 带不上版本号、缓存永远不失效')
+  })
+
+  await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
+    const { renderPage } = require('./scripts/console')
+    const dark = renderPage(uiState(), [], new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), [], new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
+    assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
+    assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
+    assert.strictEqual(bootIsland(dark).token, 'tok-AAA', 'boot token 必须是本请求验过的凭证')
+    assert.strictEqual(bootIsland(dark).instance, 'inst-1', 'instanceId 必须进 boot（前端快照的命名空间）')
+    assert.strictEqual(bootIsland(light).token, 'tok-BBB')
+    assert.strictEqual(bootIsland(light).instance, 'inst-2')
+    // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
+    const evil = renderPage(uiState(), [], new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
+    assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
+  })
+
+  await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
+    const { renderPage } = require('./scripts/console')
+    const fromQuery = renderPage(uiState(), [], new URLSearchParams('token=from-query'), '', 'deep')
+    assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
+    const fromSession = renderPage(uiState(), [], new URLSearchParams('token=from-query'), 'from-session', 'deep')
+    assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
+    // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
+    const breakout = renderPage(uiState(), [], new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
+    assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
+    assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')
+  })
+
+  await aok('C5-064 renderUnauthorizedPage: 令牌/错误文案转义，条件字段按参数出现', () => {
+    const { renderUnauthorizedPage } = require('./scripts/console')
+    const plain = renderUnauthorizedPage()
+    assert.ok(plain.includes('<input id="token"'), '未带码时必须有可见令牌输入框')
+    assert.ok(plain.includes('autofocus'), '未带码时令牌框自动聚焦（否则用户对着空表单先按一次 Tab）')
+    assert.ok(!plain.includes('name="code"'), '未要求第二因子时不得渲染验证码框')
+    assert.ok(!plain.includes('type="hidden" name="token"'), '未要求第二因子时不得把令牌塞进 hidden')
+    assert.ok(!plain.includes('记住这台设备'), '未要求第二因子时不得出现信任设备勾选')
+    const twofa = renderUnauthorizedPage({ requireCode: true, token: 'tok</script>', error: '<img src=x onerror=alert(1)>' })
+    assert.ok(twofa.includes('type="hidden" name="token" value="tok&lt;/script&gt;"'), '令牌必须经 hidden 回填且转义')
+    assert.ok(twofa.includes('name="code"'), '要求第二因子时必须渲染验证码/恢复码框')
+    assert.ok(twofa.includes('&lt;img src=x onerror=alert(1)&gt;'), '错误文案必须转义后输出')
+    assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
+    assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
