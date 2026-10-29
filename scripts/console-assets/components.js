@@ -3,7 +3,7 @@
 // 只依赖 htm-preact、pure.mjs、format.js、constants.js、api.js、flatpickr 与 floating-ui；不认识任何页面，也没有顶层副作用。
 // 页面面板在 pages.js、外壳在 ui.js（顺序：本文件 → pages.js → ui.js），文本断言按 CONSOLE_MODULE_FILES 聚合读源码。
 import { html, useCallback, useEffect, useLayoutEffect, useRef, useState } from './htm-preact.module.js'
-import { ageFromStamp, dateRangeLabel, relDay, scrollDeltaInto } from './pure.mjs'
+import { ageFromStamp, dateRangeLabel, partBroken, relDay, scrollDeltaInto } from './pure.mjs'
 import flatpickr from './flatpickr.js'
 // 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -150,11 +150,20 @@ function TapTip ({ tip, hint, children, showDate = true }) {
 }
 
 // 提示行：tone='error' 红色、tone='warn' 琥珀色。页面不再拼 'hint hint-err' 字符串。
+// 读屏（C7-007）：全站的错误/提示只有这一个出口，而它此前是个无 role 的 div、目录里也没有
+// 任何兜底 live region ⇒ 保存失败/触发失败/自动运行出错对读屏完全静默。现在每个 Hint 都是
+// 活区域：错误 role=alert（断言式，立刻播报），其余 role=status + aria-live=polite（不打断
+// 用户正在读的内容）。aria-atomic 让整句一起播、不逐节点拼读；同一段文本在原位重渲染不会
+// 产生 DOM 变更，因此不会反复播报（先消失再出现本就是新的一次提示，该再播一次）。
 function Hint ({ tone, style, children }) {
   // 提示行随错误/成功信息出现：轻量入场，扫一眼就知道「下面多了一行」。
   const ref = useRef(null)
   useMountReveal(ref, { y: 8, duration: MOTION.fast })
-  return html`<div ref=${ref} class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')} style=${style}>${children}</div>`
+  const err = tone === 'error'
+  return html`<div ref=${ref}
+    class=${tone === 'error' ? 'hint hint-err' : (tone === 'warn' ? 'hint hint-warn' : 'hint')}
+    style=${style} role=${err ? 'alert' : 'status'} aria-live=${err ? 'assertive' : 'polite'}
+    aria-atomic="true">${children}</div>`
 }
 
 // 入场包装：给「条件渲染的整块内容」补一次性淡入（预览块、提示横幅）。
@@ -473,6 +482,10 @@ function bindEscClose (inst, restoreFocus) {
     if (e.key !== 'Escape' && e.key !== 'Esc') return
     if (!inst.isOpen) return
     e.preventDefault()
+    // C7-008：焦点进日历之后，flatpickr 自己在 calendarContainer 上的 keydown 也会处理 Esc
+    // （case 27 → ke()：先 _input.focus() 再 close），它会把焦点丢到 aria-hidden 的
+    // .fp-anchor 上。捕获阶段就截住这一次 Esc，只走「关闭 + 焦点还给触发按钮」一条路。
+    e.stopPropagation()
     inst.close()
     if (restoreFocus) restoreFocus()
   }
@@ -523,6 +536,9 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
         const t = fmtDayKey(dates[1])
         if (!DAY_KEY_RE.test(f) || !DAY_KEY_RE.test(t) || f > t) return
         if (cbRef.current) cbRef.current({ from: f, to: t })
+        // 选完两格日历会自己关（closeOnSelect）：焦点必须回到触发按钮，否则会留在已经
+        // display:none 的容器里——等于键盘焦点丢失。
+        if (btnRef.current) btnRef.current.focus({ preventScroll: true })
         inst.close()
       }
     })
@@ -544,7 +560,18 @@ function DateRange ({ value, onChange, label = '日期区间', disabled = false 
   return html`<span class="date-range">
     <button type="button" ref=${btnRef} class=${active ? 'date-btn on' : 'date-btn'} disabled=${disabled}
       aria-label=${active ? `${label} ${from} 至 ${to}` : label}
-      onClick=${() => { const inst = instRef.current; if (inst) inst.open() }}>
+      onClick=${() => {
+        const inst = instRef.current
+        if (!inst) return
+        inst.open()
+        // 键盘可用性（C7-008）：flatpickr 的 keydown 只挂在 _input 与 calendarContainer 上，
+        // 而从 .date-btn 打开时焦点留在按钮上 ⇒ 方向键/Enter 根本到不了实例，键盘只能开/关
+        // （Tab 一离开按钮还会被 document 的 focus 捕获把日历关掉）。容器自带 tabIndex=-1
+        // （flatpickr 建的），把焦点送进去 Le 才接管：←/→ 逐日、↑/↓ 逐周、Enter 选中；
+        // 而「焦点跑到日历外就关闭」把容器内部判为内部（calendarContainer.contains），
+        // 所以不会刚聚焦就被关掉。
+        if (inst.calendarContainer) inst.calendarContainer.focus({ preventScroll: true })
+      }}>
       ${active ? dateRangeLabel(from, to, todayKeyShanghai()) : label}
     </button>
     ${active && html`<button type="button" class="date-clear" aria-label=${`清除${label}`} onClick=${clear}>×</button>`}
@@ -793,6 +820,11 @@ function StatusCards ({ state, err }) {
   const repTone = partTone(state.report, repIsOk(state))
   const run = state.run && state.run.value ? state.run.value : null
   const runTone = partTone(state.run, runIsOk(state))
+  // 「文件在但读不出来」≠「还没生成」（C7-033）：invalid/tooLarge 都没有 value，旧实现与
+  // missing 一起落进 !rep / !run 分支 ⇒ 卡片写「暂无数据」、徽标写「—」，tone 明明是红的、
+  // 文案却说「没有数据」。损坏必须自己说出来。
+  const repBroken = partBroken(state.report)
+  const runBroken = partBroken(state.run)
   const runDry = run && run.dryRun != null
   const runBad = run && (run.interrupted === true || run.failed > 0)
   const chan = channelInfo(state)
@@ -831,7 +863,7 @@ function StatusCards ({ state, err }) {
         ? [
             `失败 ${fmtNum(today.failed)}${today.failed > 0 ? ' ⚠️' : ''}`,
             // 「正常」不再重复写在日报行：右上角状态点已经表达，重复反而每次都要读两遍。
-            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''}${repTone === 'ok' ? '' : repTone === 'bad' ? ' · 异常' : ' · 暂无'}` : '暂无'}`
+            `日报 ${rep ? `${rep.date || '—'}${repRel ? `（${repRel}）` : ''}${repTone === 'ok' ? '' : repTone === 'bad' ? ' · 异常' : ' · 暂无'}` : (repBroken ? '数据损坏' : '暂无')}`
           ]
         // 没有 run.log 数据时也要占满两行：行数随数据增减会让卡片块在加载完成的瞬间长高/变矮，
         // 把下面的面板整体推走（Sourcery PR #292：首帧占位必须与加载完成态同高）。
@@ -855,7 +887,7 @@ function StatusCards ({ state, err }) {
       title: '最近一轮',
       tone: runDry ? (runBad ? 'bad' : 'warn') : runTone,
       badge: !run
-        ? '—'
+        ? (runBroken ? '异常' : '—')
         : (run.cancelled === true
             ? '已取消'
             : (runDry ? (runBad ? '试跑异常' : '试跑') : (runBad ? '异常' : '正常'))),
@@ -865,7 +897,7 @@ function StatusCards ({ state, err }) {
             unit: runDry ? '条未推送' : '条推送',
             hint: `${runAge || '时间未知'}${run.at ? ` · ${run.at.slice(5, 16)}` : ''}`
           }
-        : { num: '—', unit: '', hint: '暂无数据' },
+        : { num: '—', unit: '', hint: runBroken ? '数据损坏，无法读取' : '暂无数据' },
       lines: run
         ? [
             `获取 ${fmtNum(run.total)} · 失败 ${fmtNum(run.failed)} · 耗时 ${fmtNum(run.elapsed)}${run.cancelled === true ? ' · ⏹ 已取消' : run.interrupted ? ' · ⚠️ 中断' : ''}`
@@ -1189,6 +1221,17 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
   // 一起 set：首帧就是最终文案；拿不到（失败/超时）才用兜底文案，绝不在显示后改。
   const [pendingNames, setPendingNames] = useState(null)
   const confirmSeqRef = useRef(0)
+  // C7-001：这个确认弹窗渲染在概览那一段 <section hidden> 内部。弹窗打开时按浏览器后退
+  // （hashchange → 切页）或点别的页签，section 会被置 display:none，而 dialog 仍是 open/:modal
+  // ⇒ 弹窗塌成 0×0、整页继续 inert：桌面还能按 Esc，手机上只能刷新页面。
+  // 修法＝切页即按「取消」收口（与 onCancel 同一条 setPending(null)，不是只 dialog.close()），
+  // 并作废还在路上的 askConfirm——配置 600ms 后才回来的话，不得把弹窗重新弹到隐藏页里。
+  // open 另用 active 门控（见下面的 ConfirmDialog）：关闭与切页落在同一次提交，不留坏帧。
+  useEffect(() => {
+    if (active) return
+    confirmSeqRef.current++
+    setPending(null)
+  }, [active])
   const askConfirm = useCallback((action) => {
     const seq = ++confirmSeqRef.current
     let timer = 0
@@ -1350,7 +1393,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
       ${auto.err && html`<${Hint} tone="error">${auto.err}<//>`}
     </div>
-    <${ConfirmDialog} open=${pending !== null}
+    <${ConfirmDialog} open=${pending !== null && active}
       title=${pending === 'run' ? '确认正式运行一轮？' : pending === 'auto' ? '确认开启自动正式运行？' : '确认发送通知自检？'}
       confirmLabel=${pending === 'run' ? '确认真实推送' : pending === 'auto' ? '开始自动运行' : '确认发送'}
       busy=${locking} onConfirm=${confirmPending} onCancel=${() => setPending(null)}>

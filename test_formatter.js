@@ -663,6 +663,60 @@ check('scanStrip：<< 只丢弃首个尖括号（< 后非字母的畸形输入�
   assert.strictEqual(formatter.htmlToMarkdown({ content_html: 'x<<>>y' }), 'x<>>y')
 })
 
+// ===== C10-002（audit38）：scanStrip 对「`<` 后接非字母 + 远端 `>`」的二次方扫描 =====
+// 反例形态：`a<100 ` 重复 N 次 + 末尾一个 `>`。旧实现对每个 `<` 调一次 _findTagEnd 扫到远端 `>`，
+// 却只前进 1 个字符 ⇒ 扫描量 = N×len/2（96k 字符实测 2.81s、累计扫描 768M 字符）。
+// 断言口径**与机器速度无关**：_findTagEnd 的累计扫描字符数必须随输入长度线性（修复后为 0）。
+const withFindTagEndCounter = (fn) => {
+  const orig = formatter._findTagEnd
+  const stat = { calls: 0, scanned: 0 }
+  formatter._findTagEnd = function (str, from) {
+    stat.calls++
+    const r = orig.call(this, str, from)
+    stat.scanned += (r === -1 ? str.length : r) - from
+    return r
+  }
+  try { return fn(stat) } finally { formatter._findTagEnd = orig }
+}
+
+check('scanStrip：`<` 后接非字母 + 远端 `>` 的扫描量随输入线性（C10-002）', () => {
+  for (const n of [500, 2000]) {
+    const input = 'a<100 '.repeat(n) + '>'
+    const out = withFindTagEndCounter((stat) => {
+      const r = formatter.htmlToMarkdown({ content_html: input })
+      assert.ok(stat.scanned <= 4 * input.length,
+        `扫描量 ${stat.scanned} 必须与输入长度 ${input.length} 线性（旧实现 N×len/2 = ${Math.round(n * input.length / 2)}）`)
+      return r
+    })
+    // 语义不得变：`价格<100 元` 这类正文里的 `<` 全部原样保留，输出与输入等长
+    assert.strictEqual(out, input, '正文中的 `<` 必须原样保留（不得因提速改变输出）')
+  }
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '价格<100 元' }), '价格<100 元')
+})
+
+// 同类形态（未知标签名 + 远端 `>`）：不得按每个 `<` 全量回扫
+check('scanStrip：`<x ` 重复 + 远端 `>` 的扫描量同样随输入线性（C10-002 同类）', () => {
+  const input = '<x '.repeat(2000) + '>'
+  const out = withFindTagEndCounter((stat) => {
+    const r = formatter.htmlToMarkdown({ content_html: input })
+    assert.ok(stat.scanned <= 4 * input.length,
+      `扫描量 ${stat.scanned} 必须与输入长度 ${input.length} 线性`)
+    return r
+  })
+  assert.strictEqual(out, input, '无配对的未知标签片段仍按正文原样保留')
+})
+
+// 查表必须与 _findTagEnd 的「引号感知」口径逐位一致：引号内的 `>` 不结束标签
+// （回归：曾用「后方是否还有 >」的近似判据，`<<'>'` 会误丢首个尖括号）
+check('scanStrip：引号内的 `>` 不当作标签结束（C10-002 查表口径）', () => {
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: "<<'>'" }), "<<'>'")
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<<">>"' }), '<<">>"')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<x a=">">b</x>' }), 'b')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: "<x a='>'>b</x>" }), 'b')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: '<x>"a>b"</x>' }), '"a>b"')
+  assert.strictEqual(formatter.htmlToMarkdown({ content_html: 'a<1"2>3"4>5' }), 'a<1"2>3"4>5')
+})
+
 // ===== 补充：img 的「空/危险 src 不生成图片」分支（引号与无引号两形态）=====
 // 杀 ConditionalExpression（if (!srcValue) 恒 false）/ EqualityOperator（op !== tagOps.img）/
 // Regex（src 属性剥离正则）与 StringLiteral（替换串）：危险 src 必须整段不产出图片语法，
