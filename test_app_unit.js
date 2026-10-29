@@ -2692,3 +2692,87 @@ checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默�
     else process.env.XBK_DRY_RUN = prevDryRun
   }
 })
+
+// ============================================================
+// 运行级回归（App.run 主链）：dry-run / 截断 / 告警分流 / 全脏数据可观测
+//
+// 为什么放在本文件（C1-001 / C1-003 的根因）：xbk_app.js 的 run() 主链此前只有
+// test_app.js（集成套件）覆盖，而 test_app.js 不进变异集（test_suite_registry.js 白名单 +
+// integration 过滤 ⇒ run_unit_tests.js / TAP 都不跑它）⇒ dry-run 判据、truncatedKeys 合取项
+// 这些「只在 run() 里生效」的分支在变异集内零执行、零断言，改坏也无人红。
+// 本段复用 buildFilterRunHarness 的真实装配（真 createApp + 真 MessageStore + 临时 cacheDir），
+// 只桩 Network.fetchData / Pusher.send ⇒ 落在单元入口 ⇒ 进 TAP 变异集。
+// ============================================================
+
+checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过日报（前后两个对照轮证明断言有判别力）', async () => {
+  const os = require('os')
+  const realFs = require('fs')
+  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-dryrun-'))
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  // 日报必须真的「可写」——report 关着时「dry-run 不写日报」恒真、无判别力
+  h.Config.report = { enabled: true }
+  const reportPath = path.join(cacheDir, 'report.state')
+  const urlControl = 'https://example.invalid/dry-run-control.json'
+  const urlDry = 'https://example.invalid/dry-run-preview.json'
+  const cacheFileOf = (url) => path.join(cacheDir, h.MessageStore.getFileName(url))
+  try {
+    // ① 对照轮（非 dry-run）：必须真推送 + 写缓存 + 写日报
+    h.Config.api.pushUrl = urlControl
+    h.setItems([makeRunItem('dr-ctl-1', '对照甲')])
+    const ctl = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: ctl.summary.pushed, failed: ctl.summary.failed }, { pushed: 1, failed: 0 },
+      `对照轮摘要异常：${JSON.stringify(ctl.summary)}`)
+    assert.strictEqual(h.sends.length, 1, '对照轮必须真调用 Pusher.send（否则「dry-run 不推送」恒真）')
+    assert.strictEqual(h.cacheMessages().length, 1, '对照轮必须把成功条目写入缓存')
+    assert.ok(realFs.existsSync(reportPath), '对照轮必须写日报状态（否则「dry-run 不写日报」恒真）')
+
+    // ② dry-run：同一夹具、只多一个 XBK_DRY_RUN=1，换 URL 隔离缓存
+    realFs.rmSync(reportPath, { force: true })
+    const sentBefore = h.sends.length
+    h.Config.api.pushUrl = urlDry
+    h.setItems([makeRunItem('dr-1', '预览甲'), makeRunItem('dr-2', '预览乙')])
+    process.env.XBK_DRY_RUN = '1'
+    const logs = []
+    const origLog = console.log
+    const origWarn = console.warn
+    let dry
+    try {
+      console.log = (...a) => { logs.push(a.map(String).join(' ')) }
+      console.warn = () => {}
+      dry = await h.App.run()
+    } finally {
+      console.log = origLog
+      console.warn = origWarn
+    }
+    assert.deepStrictEqual({ total: dry.total, pushed: dry.pushed, failed: dry.failed },
+      { total: 2, pushed: 0, failed: 0 }, `dry-run 摘要不得伪造推送/失败：${JSON.stringify(dry)}`)
+    assert.strictEqual(h.sends.length, sentBefore,
+      'dry-run 不得调用 Pusher.send（preview() 必须在 Pusher.send 之前返回 true）')
+    // saveBatch([]) 允许创建空缓存文件（契约未禁止）；断言的是「没有任何条目被写进缓存」
+    const cachedInDryRun = realFs.existsSync(cacheFileOf(urlDry)) ? h.cacheMessages().length : 0
+    assert.strictEqual(cachedInDryRun, 0,
+      'dry-run 的 toCache 必须是空数组（写进缓存 = 下轮判重跳过，等于静默丢消息）')
+    assert.ok(!realFs.existsSync(reportPath), 'dry-run 必须整段跳过 _updateReport（不得写日报状态）')
+    assert.ok(logs.some(l => l.includes('🧪 预览：')), `dry-run 必须逐条打印预览内容：${JSON.stringify(logs.slice(-8))}`)
+    assert.ok(logs.some(l => l.includes('预览甲')), '预览内容必须含待推送条目的正文/标题')
+
+    // ③ 再对照：同一 URL 去掉 dry-run ⇒ 必须推送 2 条、写缓存 2 条、写日报
+    delete process.env.XBK_DRY_RUN
+    h.setItems([makeRunItem('dr-1', '预览甲'), makeRunItem('dr-2', '预览乙')])
+    const after = await runWithWarnings(h.App)
+    assert.strictEqual(after.summary.pushed, 2, `去掉 dry-run 后必须真推 2 条：${JSON.stringify(after.summary)}`)
+    assert.strictEqual(h.cacheMessages().length, 2,
+      '同一 URL 去掉 dry-run 后必须写缓存（证明 ② 的零来自 dryRun 判据，不是夹具不工作）')
+    assert.ok(realFs.existsSync(reportPath), '同一 URL 去掉 dry-run 后必须写日报（同上）')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
