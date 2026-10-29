@@ -2371,16 +2371,56 @@ checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、
 // （Sonar「Make sure publicly writable directories are used safely here」/ CWE-377：公共可写目录里的
 // 固定名可被他人抢占/预建；本仓 6369482 已把记账文件统一改成 mkdtemp 私有目录，此处照同一口径）。
 // 注意：下面 AP-1…AP-3 用的是**注入的假 fs**，这些路径只是字符串、不落真磁盘，但命名口径仍按真实环境执行。
+//
+// C5-025：本文件的临时夹具一律走 `xbkunit-` 前缀 + 进程退出兜底清理，不再用 `xbk-`。
+// 为什么：scripts/check-host-clean.js 把 <tmp>/xbk-* 当作「套件/变异沙箱」，残留超过 30min 就判
+// 主机脏并给出 rm -rf 建议（实测 inspect()：61min 的 xbk-app-unit-* → ok=false、dirs 点名）。本文件
+// 的夹具不是那种沙箱，被 SIGKILL 后残留会被下一轮 `npm run check` 误拦。改名后该门禁不再替我们清场，
+// 所以用 exit 钩子自己清（与 AP_ROOT 原有兜底同口径）——两条都不丢。
+const TMP_FIXTURES = []
+function mkTmpFixture (tag) {
+  const realFs = require('fs')
+  const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-' + tag))
+  TMP_FIXTURES.push(d)
+  return d
+}
+process.once('exit', () => {
+  const realFs = require('fs')
+  for (const d of TMP_FIXTURES) {
+    try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 退出路径忽略清理失败 */ }
+  }
+})
 const AP_ROOT = (() => {
   const realFs = require('fs')
-  const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-app-unit-'))
+  const d = mkTmpFixture('app-unit-')
   try { realFs.chmodSync(d, 0o700) } catch (e) { /* 某些 FUSE 挂载不允许 chmod：目录名仍不可预测 */ } // nosemgrep（d 是 mkdtempSync 独占产物，无外部输入）
-  process.once('exit', () => { try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
   return d
 })()
 // 唯一的动态来源是 mkdtemp 私有目录 + 本文件内硬编码的文件名常量，不接受任何外部输入
 // ⇒ Codacy 的 pathtraversal-non-literal-fs-filename 在此是结构性误报（口径同 xbk_storage.js:17 与 .codacy.yml 里 test_storage.js 的说明）
 const apPath = (name) => path.join(AP_ROOT, name) // nosemgrep
+
+// C5-025 守卫：本文件的临时夹具（哪怕 61 分钟没动）不得被 check-host-clean 当成过期沙箱。
+// 反例：夹具用 xbk- 前缀时，findStaleSandboxes 会把 61min 的目录点名成「过期沙箱」并判主机脏——
+// 一次 SIGKILL 残留就能让下一轮 `npm run check` 以「主机脏」拒跑（本机已端到端复现）。
+check('C5-025 夹具命名：本文件的临时目录不落进 check-host-clean 的沙箱命名空间', () => {
+  const realFs = require('fs')
+  const { findStaleSandboxes, activityMtimeMs } = require('./scripts/check-host-clean')
+  // ① 行为侧：真建一个夹具、把 mtime 拨到 61 分钟前，门禁的判据不得把它当残留
+  const d = mkTmpFixture('namespace-probe-')
+  try {
+    const past = new Date(Date.now() - 61 * 60000)
+    realFs.utimesSync(d, past, past)
+    assert.deepStrictEqual(
+      findStaleSandboxes([{ p: d, mtimeMs: activityMtimeMs(d) }], Date.now(), 30 * 60000), [],
+      `夹具目录 ${d} 落进了 check-host-clean 的沙箱命名空间：残留 >30min 会被判主机脏并误拦 check`)
+  } finally {
+    realFs.rmSync(d, { recursive: true, force: true })
+  }
+  // ② 源码侧：不允许再有绕过 mkTmpFixture 的裸 xbk- mkdtemp（注释里的示例不会命中，需带 mkdtempSync(）
+  const raw = realFs.readFileSync(__filename, 'utf8').match(/mkdtempSync\(path\.join\(os\.tmpdir\(\), 'xbk-/g) || []
+  assert.strictEqual(raw.length, 0, `本文件不得再有裸 xbk- 前缀的 mkdtempSync（应走 mkTmpFixture）：实际 ${raw.length} 处`)
+})
 
 // ===== G11-AP：RE2 标记原子写 / PID 复用识别 / 通道健康降级（c8 实测 xbk_app.js 分支 86.06%，
 // L341-350 与 L524-530 与 L843-845 与 L917-918 均未达）=====
@@ -2672,11 +2712,10 @@ async function runWithWarnings (app) {
 }
 
 checkAsync('FR-1 覆盖文件按轮生效：同一进程两次 App.run 读到不同规则，applied 快照与第二轮一致，Config.filter 不被污染', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests()
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2732,11 +2771,10 @@ checkAsync('FR-1 覆盖文件按轮生效：同一进程两次 App.run 读到不
 })
 
 checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _f 与 filter.hash，告警含 source/lastGoodUsed', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests()
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2781,11 +2819,10 @@ checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _
 })
 
 checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默认、告警 lastGoodUsed=false，仍不清 _f/不推进 hash', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests() // 关键：清掉进程内 last-known-good，模拟「本进程从未读到合法文件」
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2845,9 +2882,8 @@ checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默�
 // ============================================================
 
 checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过日报（前后两个对照轮证明断言有判别力）', async () => {
-  const os = require('os')
   const realFs = require('fs')
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-dryrun-'))
+  const cacheDir = mkTmpFixture('dryrun-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2953,9 +2989,8 @@ checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过�
 })
 
 checkAsync('TR-1 maxPerRun 截断：被截断条目不得写入缓存（下轮补推不丢不重），摘要 truncated 如实计数', async () => {
-  const os = require('os')
   const realFs = require('fs')
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-trunc-'))
+  const cacheDir = mkTmpFixture('trunc-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2993,9 +3028,8 @@ checkAsync('TR-1 maxPerRun 截断：被截断条目不得写入缓存（下轮�
 })
 
 checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严格大于），不得多推也不得写截断告警', async () => {
-  const os = require('os')
   const realFs = require('fs')
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-trunc-eq-'))
+  const cacheDir = mkTmpFixture('trunc-eq-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -3021,9 +3055,8 @@ checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严�
 
 // 共享夹具：临时 cacheDir + 真装配 harness + 环境变量还原（异常路径也还原，避免污染后续用例）
 async function withRunHarness (over, fn) {
-  const os = require('os')
   const realFs = require('fs')
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runh-'))
+  const cacheDir = mkTmpFixture('runh-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -3211,11 +3244,10 @@ checkAsync('DAT-1 100% 脏数据必须可观测：run.log WARN + bad= 字段 + �
 // 在变异矩阵里可存活——后果是失败消息被写进缓存，下轮当「已推送」去重 ⇒ 永久漏推。
 // 断言必须落到**缓存文件内容**：只看 summary.failed 杀不掉 toCache 那个变异体。
 checkAsync('RUN-1 推送失败不写缓存：失败条目不得进缓存（含文件字节），下一轮必须重推', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests()
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
