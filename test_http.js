@@ -14,7 +14,7 @@ function installMockStream (behavior) {
     if (behavior.onOptions) behavior.onOptions(url, opts)
     const s = new EventEmitter()
     s.timings = { phases: {} }
-    s.destroy = (err) => { s.__destroyed = err || true }
+    s.destroy = (err) => { s.__destroyed = err || true; if (behavior.onDestroy) behavior.onDestroy(err) }
     setTimeout(() => {
       if (behavior.response) s.emit('response', behavior.response)
       if (behavior.chunks) for (const c of behavior.chunks) s.emit('data', Buffer.from(c))
@@ -433,21 +433,15 @@ async function withProfileLog (profile, fn) {
   {
     const body = '{"n":123}'
     const limit = Buffer.byteLength(body)
+    // 与 installMockStream 同一实现，只挂 onDestroy 观测 stream.destroy 的错误（不再整体复制一份 mock）。
     const installExact = () => {
-      const orig = got.stream
       let destroyed = null
-      got.stream = () => {
-        const s = new EventEmitter()
-        s.timings = { phases: {} }
-        s.destroy = (err) => { destroyed = err === undefined ? true : err }
-        setTimeout(() => {
-          s.emit('response', { statusCode: 200, headers: {} })
-          s.emit('data', Buffer.from(body))
-          s.emit('end')
-        }, 0)
-        return s
-      }
-      return { restore: () => { got.stream = orig }, destroyed: () => destroyed }
+      const restore = installMockStream({
+        response: { statusCode: 200, headers: {} },
+        chunks: [body],
+        onDestroy: (err) => { destroyed = err === undefined ? true : err }
+      })
+      return { restore, destroyed: () => destroyed }
     }
     const a = installExact()
     try {
@@ -523,6 +517,17 @@ async function withProfileLog (profile, fn) {
     assert.strictEqual(oneLiner, 0, `不得再手写 try/catch 捕获拒绝（单行形态），实际 ${oneLiner} 处`)
     assert.strictEqual(finallyForm, 0, `不得再手写 catch (e) { rejected = e } finally（多行形态），实际 ${finallyForm} 处`)
     assert.ok(rejects >= 13, `13 处异步拒绝断言必须走 assert.rejects，实际 ${rejects} 处`)
+  }
+
+  // C5-051 反例锁：mock stream 安装器只允许有一处实现（installMockStream + onDestroy 钩子）。
+  // installExact 曾整体复制 installMockStream、只多一个 onDestroy；复制件漂移后两处 mock 语义会分叉。
+  {
+    const selfSource = require('node:fs').readFileSync(__filename, 'utf8')
+    const installers = (selfSource.match(/got\.stream = (?:\(url, opts\)|\(\)) =>/g) || []).length
+    const eventEmitters = (selfSource.match(/new EventEmitter\(\)/g) || []).length
+    assert.strictEqual(installers, 1, `mock stream 安装器只允许一处，实际 ${installers} 处`)
+    assert.strictEqual(eventEmitters, 1, `mock stream 构造只允许一处，实际 ${eventEmitters} 处`)
+    assert.ok(/onDestroy/.test(selfSource), 'installMockStream 必须保留 onDestroy 钩子（H4 依赖它观测 stream.destroy）')
   }
 
   console.log('test_http OK')
