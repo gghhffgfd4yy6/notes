@@ -767,6 +767,57 @@ jobs:
           CACHE_HIT: ${{ steps.inc-cache.outputs.cache-hit || 'none' }}
         run: node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}" --log stryker.log --out reports/mutation/reuse.json --cache-hit "$CACHE_HIT"
 
+      # statusReason 摘要 + 「TAP 流为空」表征（C10-008，**必须在剥离之前**）：剥离步把每个变异体的
+      # statusReason 置空串，artifact 里的机器报告从此解释不了「它为什么存活/报错」；而 tap-runner 对
+      # 空 TAP 流只返回 ok（tap-parser 对空 stdout 判 {ok:true, skipReason:"no tests found"}）⇒ 该段
+      # 一个测试都没跑，全部变异体记 Survived/NoCoverage，报告与「测试跑过但没杀掉」完全同形。
+      # 本步在上传前落一份未剥离的摘要（reports/mutation/status-reason-summary.json，随 artifact 到
+      # 汇总 job），并把「TAP 档 + 测试数 0 + 有变异体」单列判红——那不是分数低，而是这一段根本没测。
+      # 与 if-no-files-found: error 的关系（同 reuse.json，**不得放宽**）：只在报**告已存在时**才写文件，
+      # 否则崩溃段会因多出一个文件让上传步的 fail-loud 失效（「stryker 没产出报告 ⇒ 段 job 响亮变红」）。
+      # 为什么用 jq 而不是新增脚本：jq 已在「准备 killed 下降基线」step 用过，这里只做一次性归约；
+      # 守卫（scripts/mutation-guard.js）的判据一字未动，本步只加可观测性 + 空流这一条新判据。
+      - name: 记录 statusReason 摘要与 TAP 空流表征（${{ matrix.name }}）
+        if: always()
+        env:
+          SEGMENT: ${{ matrix.name }}
+        run: |
+          if [ ! -f reports/mutation/mutation.json ]; then
+            echo "ℹ️  无报告产物（stryker 未产出报告），不落 statusReason 摘要（保持 if-no-files-found: error 的 fail-loud）"
+            exit 0
+          fi
+          jq --arg seg "$SEGMENT" --arg commit "$GITHUB_SHA" '
+            def mutants: [.files[]?.mutants[]?];
+            { schema: 1,
+              segment: $seg,
+              commit: $commit,
+              testRunner: (.config.testRunner // "unknown"),
+              mutants: (mutants | length),
+              testFiles: ((.testFiles // {}) | length),
+              tests: ([.testFiles[]?.tests[]?] | length),
+              statuses: (mutants
+                | group_by(.status)
+                | map({ key: (.[0].status // "unknown"),
+                        value: { count: length,
+                                 nonEmptyReason: (map(select((.statusReason // "") != "")) | length) } })
+                | from_entries),
+              reasonSamples: (mutants
+                | map(select((.statusReason // "") != ""))
+                | group_by(.status)
+                | map({ key: (.[0].status // "unknown"),
+                        value: (map(.statusReason[0:120]) | unique | .[0:3]) })
+                | from_entries),
+              emptyTapStream: (((.config.testRunner // "") == "tap")
+                and (([.testFiles[]?.tests[]?] | length) == 0)
+                and ((mutants | length) > 0)) }' \
+            reports/mutation/mutation.json > reports/mutation/status-reason-summary.json
+          echo "ℹ️  statusReason 摘要：$(jq -c '{mutants, tests, testRunner, emptyTapStream}' reports/mutation/status-reason-summary.json)"
+          EMPTY_TAP=$(jq -r '.emptyTapStream' reports/mutation/status-reason-summary.json)
+          if [ "$EMPTY_TAP" = "true" ]; then
+            echo "❌ 本段是 TAP 档但测试数为 0（TAP 流为空）：该段变异体全部记 Survived/NoCoverage，不能当作「测试跑过」的结论（摘要已落到 status-reason-summary.json）" >&2
+            exit 1
+          fi
+
       # F-04（落盘侧，REV-CI）：修掉 statusReason 的「纯废重」膨胀。stryker 的 command runner 把每个
       # 变异体的整段测试输出写进 statusReason（TAP 档只含覆盖该变异体的测试文件输出，体积小得多，但剥离
       # 步照旧保留——消费方语义零变化），实测占 mutation-report.json 的 99.89%

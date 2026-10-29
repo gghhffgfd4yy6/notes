@@ -2299,8 +2299,74 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
     assert.ok(guardAt > strykerIdx && guardAt < uploadAt,
       '守卫必须位于 stryker step 之后、上传 artifact 之前（stryker 之前无报告可判；上传之后失败已无意义）')
   }
+  // (5) statusReason 在上传前被剥离 ⇒ artifact 里的机器报告再也解释不了「这个变异体为什么存活/报错」；
+  //     而 tap-runner 对空 TAP 流只返回 ok（tap-parser 对空 stdout 判 ok:true / skipReason:"no tests found"）
+  //     ⇒ 该段测试一个都没跑、全部变异体记 Survived/NoCoverage，报告与「测试跑过但没杀掉」完全同形。
+  //     C10-008 要求上传前落一份**未剥离**的摘要（随 artifact 到汇总 job），并把「TAP 档 + 零测试 + 有变异体」
+  //     单独判红。抽成函数以便对真实 workflow 的变异副本跑反例。
+  const assertStatusReasonEvidence = (ymlText) => {
+    const srName = '- name: 记录 statusReason 摘要与 TAP 空流表征（' + '${' + '{ matrix.name }}）'
+    const srAt = ymlText.indexOf(srName)
+    assert.ok(srAt >= 0,
+      'mutation.yml 必须存在「记录 statusReason 摘要与 TAP 空流表征」step：剥离后 artifact 里无法回溯原因、也无空流表征')
+    const srText = ymlText.slice(srAt, stepEndIn(ymlText, srAt, srName.length))
+    const srLines = yamlOnly(srText)
+    assert.ok(srLines.some(l => /^\s*if:\s*always\(\)/.test(l)),
+      '摘要 step 必须带 if: always()：stryker 失败/超时时同样要落证据（那时最需要它）')
+    const srScript = shellBodyOf(srText)
+    assert.ok(srScript !== null, '摘要 step 必须以 `run: |` 执行 shell')
+    assert.ok(srScript.includes('reports/mutation/status-reason-summary.json'),
+      '摘要必须落 reports/mutation/status-reason-summary.json（只有落在上传目录里才能随 artifact 留档）')
+    assert.ok(/statusReason/.test(srScript),
+      '摘要必须真的读取 statusReason：剥离步之后该字段全是空串，事后再算就是自欺')
+    assert.match(srScript, /if \[ ! -f reports\/mutation\/mutation\.json \]/,
+      '无报告时必须显式跳过且不新建文件：多出一个文件会让上传步的 if-no-files-found: error 失效')
+    assert.ok(/emptyTapStream/.test(srScript), '摘要必须计算 emptyTapStream（TAP 档测试数为 0）')
+    assert.match(srScript, /if \[ "\$EMPTY_TAP" = "true" \][\s\S]*?exit 1/,
+      '空 TAP 流必须响亮判红（exit 1）：否则整段「零测试」会被当成「测试跑过、没杀掉」的假绿')
+    // 顺序：复用状态 → 摘要（剥离前取 reason）→ 剥离 → 上传
+    const reuseAt = ymlText.indexOf('- name: 记录本段增量复用状态')
+    const stripAt2 = ymlText.indexOf('- name: 剥离报告中的 statusReason')
+    const uploadAt2 = ymlText.indexOf('- name: 上传变异报告')
+    assert.ok(reuseAt >= 0 && stripAt2 >= 0 && uploadAt2 >= 0, '找不到复用/剥离/上传 step，顺序无从核对')
+    assert.ok(srAt > reuseAt && srAt < stripAt2,
+      '摘要必须在剥离 step 之前（剥离会重写 mutation.json 的 statusReason）：先剥离再取 reason 等于拿到一片空串')
+    assert.ok(stripAt2 < uploadAt2, '剥离必须在上传之前：artifact 取的是上传时刻的磁盘状态')
+  }
+  assertStatusReasonEvidence(mutationYml)
+
+  // (5 反例·靶向) 把「无报告不新建」的守卫改成 if false（等价于去掉守卫）⇒ 必须红：崩溃段会因多出
+  //     摘要文件而让上传步的 fail-loud 失效（stryker 没产出报告不再由上传自身响亮变红）。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-sr-guard-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const unguarded = mutationYml.replace('if [ ! -f reports/mutation/mutation.json ]; then', 'if false; then')
+      assert.notStrictEqual(unguarded, mutationYml, '反例夹具必须真的改掉了「无报告即跳过」的守卫')
+      fs.writeFileSync(fixture, unguarded)
+      assert.throws(() => assertStatusReasonEvidence(fs.readFileSync(fixture, 'utf8')),
+        /无报告时必须显式跳过/, '去掉「无报告不新建」守卫后必须红（否则崩溃段的 fail-loud 被降级）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // (5 反例·靶向) 把空流判红的 exit 1 删掉 ⇒ 必须红：整段零测试将重新变成静默假绿。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-sr-empty-'))
+    try {
+      const fixture = path.join(dir, 'mutation.yml')
+      const noRed = mutationYml.replace(/(if \[ "\$EMPTY_TAP" = "true" \][\s\S]*?)exit 1/, '$1true')
+      assert.notStrictEqual(noRed, mutationYml, '反例夹具必须真的删掉了空流判红的 exit 1')
+      fs.writeFileSync(fixture, noRed)
+      assert.throws(() => assertStatusReasonEvidence(fs.readFileSync(fixture, 'utf8')),
+        /空 TAP 流必须响亮判红/, '删掉空流 exit 1 后必须红（否则零测试段落仍静默通过）')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
 }
-console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
+console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud；statusReason 摘要 + TAP 空流表征在剥离前落盘并判红（靶向反例已锁）')
 
 // ── 矩阵 include 的行式解析：**单点实现**（C4-020）────────────────────────────
 // 3i 的「逐段 runner 档位」与 3j 的「逐段 timeout_ms」原先各有一份 34/35 行、逐行同构的拷贝
