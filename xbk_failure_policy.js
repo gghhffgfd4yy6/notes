@@ -472,6 +472,8 @@ function classifySummary (summary) {
   // 旧实现只要 pushed>0 就返回 null（1 条成功 + 99 条失败 → 退出码 0、告警不触发、99 条被静默吞掉）。
   // 部分失败同样是失败：给出 degraded 判定让入口置非零退出码并告警。kind 固定 retryable——还有消息
   // 没送达就必须下轮重试；若判 permanent，常驻入口会整轮停止，把后续新消息一起停掉（漏推）。
+  // PR #362：常驻入口不得把本判定当成整轮失败叠加指数退避——那会让一条长期送不出去的消息连新消息
+  // 的拉取一起拖到 30 分钟；qinglong/xbk_push.js 的 handleFailure 对 PARTIAL_MESSAGE_FAILURE 单独分流。
   if (pushed > 0) {
     const nested = failures.map(classifyOne)
     return {
