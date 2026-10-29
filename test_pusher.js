@@ -507,6 +507,21 @@ function test (name, fn) {
     assert.strictEqual(Math.max(...c2), 1, '成功路径同一 controller 的 abort 次数必须恰好 1（仅 finally 兜底）')
   })
 
+  // C8-001：Pusher 必须把「单通道预算」显式交给投递层（params.channelTimeoutMs），且严格小于
+  // 10s 整体 race——否则 slim 的 15s 单通道 timeout 在这条路径上永远等不到：慢通道被外层 abort 时
+  // 已送达的通道也一起判 PUSH_TIMEOUT，本轮不写缓存、下轮全通道重推。
+  await test('P27 单通道预算经 params.channelTimeoutMs 下发，且严格小于 10s 整体 race', async () => {
+    const mod = { sendNotify: async () => 'ok', configuredChannelNames: () => [] }
+    const r = await runSend(mod)
+    const ms = r.captured.params && r.captured.params.channelTimeoutMs
+    assert.ok(Number.isInteger(ms), `params.channelTimeoutMs 必须是整数（实际：${ms}）`)
+    assert.ok(ms > 0 && ms < 10000, `单通道预算必须 >0 且严格小于 10s 整体 race，实际：${ms}`)
+    assert.ok(ms <= 9000, `单通道预算必须给外层留结算余量（≤9000ms），实际：${ms}`)
+    // 预算与「有没有 AbortController」无关：两条分支必须下发同一个值。
+    const r2 = await runSend(mod, { noAbortController: true })
+    assert.strictEqual(r2.captured.params.channelTimeoutMs, ms, '两种分支必须下发同一个单通道预算')
+  })
+
   // 杀 L10/L11 条件恒真/恒假、等号方向（归一化被吞 → 推送文本 "undefined" 或吞掉正常内容）
   await test('P18 入参归一：undefined/null→空串、数字 String() 化、普通串原样', async () => {
     const mod = { sendNotify: async () => 'ok', configuredChannelNames: () => [] }

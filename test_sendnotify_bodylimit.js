@@ -137,6 +137,33 @@ function installPromiseMocks (bodyFactory) {
     assert.ok(realResult && realResult.successfulChannels.includes('企业微信'),
       '官方 got 的真实流式路径应端到端成功（请求选项/响应解析与 promise 路径等价）')
 
+    // ⑤ C8-001：Pusher 主路径用 params.channelTimeoutMs 显式收窄单通道预算。整体 race 只有
+    // 10s（SYSTEM_CONTRACT，不得上调），15s 的单通道预算在那条路径上永远等不到——外层先 abort
+    // 全部在飞通道 ⇒ 已送达的通道也被判 PUSH_TIMEOUT、本轮不写缓存、下轮全通道重推。
+    const withOpts = async (params) => {
+      const restorePromise = installPromiseMocks(() => '{"errcode":0}')
+      const mock = installMockStream({
+        response: { statusCode: 200, headers: { 'content-type': 'application/json' } },
+        chunks: ['{"errcode":0}']
+      })
+      try {
+        const r = await slim.sendNotify('标题', '正文', params)
+        return { r, timeout: mock.created[0].__options.timeout }
+      } finally { mock.restore(); restorePromise() }
+    }
+    const ac = new AbortController()
+    const pusherPath = await withOpts({ signal: ac.signal, channelTimeoutMs: 9000 })
+    assert.ok(pusherPath.r && pusherPath.r.successfulChannels.includes('企业微信'),
+      'Pusher 路径（signal + channelTimeoutMs）仍应正常成功')
+    assert.strictEqual(pusherPath.timeout, 9000,
+      `Pusher 下发的单通道预算必须原样生效（旧实现恒用 15s ⇒ 慢通道永远等不到，实测 ${pusherPath.timeout}）`)
+    assert.ok(pusherPath.timeout < 10000, '单通道预算必须严格小于 10s 整体 race，否则慢通道会拖垮全部通道')
+    // 只收不放：非法值/超过默认值一律回落 15s，不得借这个参数把预算抬到契约之外。
+    for (const bad of [0, -1, 999.5, 60000, '9000']) {
+      const got = await withOpts({ channelTimeoutMs: bad })
+      assert.strictEqual(got.timeout, 15000, `非法 channelTimeoutMs=${JSON.stringify(bad)} 必须回落 15s（不得抬高预算）`)
+    }
+
     console.log('✅ F5/S3：推送层响应体上限（流式解析/选项透传、超限 EBODYLIMIT 并销毁流、无 stream 回退、官方 got 回环端到端）')
   } finally {
     for (const k of Object.keys(cfg)) delete cfg[k]
