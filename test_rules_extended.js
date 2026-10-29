@@ -63,7 +63,11 @@ console.log('=== xbk_rules.js 扩展测试 ===')
 check('compileRules: 空配置返回空编译结果', () => {
   const r = engine.compileRules({})
   // 契约：空配置下字段一律未编译（null），仅保留 __compiled 旗标
-  assert.deepStrictEqual(Object.keys(r).sort((a, b) => a.localeCompare(b)), ['__compiled', 'keyword', 'pingbitime', 'title'])
+  // C5-071：键序断言必须用码元序（`Array#sort` 默认比较），不用 localeCompare。
+  // localeCompare 的默认 collation 随宿主 ICU/locale 变化（实测 sv-SE 把 ['z','å','a'] 排成 a,z,å，
+  // en-US 排成 a,å,z）——用它对固定期望数组排序，等于把断言押在 runner 的 LANG/ICU 数据上。
+  // 这 4 个 ASCII 键在 33 个 locale 下当前恰好同序（零行为差），但顺序契约来自码元序，不是来自词法排序。
+  assert.deepStrictEqual(Object.keys(r).sort(), ['__compiled', 'keyword', 'pingbitime', 'title'])
   assert.strictEqual(r.keyword, null, '未配置的字段必须为 null（不得落成字符串语义）')
   assert.strictEqual(r.__compiled, true, '必须打上 __compiled 旗标')
 })
