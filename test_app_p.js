@@ -8,6 +8,7 @@
 //   2. --list-file 精确名单分片（--only 子串可能重叠/漏跑）
 //   3. QUICK=1 快测（pushInterval/finalWait=0；重试类测试的真实退避等待保留）
 //   4. 每次运行使用唯一 worker ID，允许多个调度器同时执行而不撞临时文件/缓存目录
+//   5. 失败片重跑换**新的** worker 分片（新 workerId ⇒ 新缓存目录），不复用首轮那份脏目录（C5-085）
 // 用法：node test_app_p.js        （沙箱默认并发 8 稳定）
 //       CONCURRENCY=32 node test_app_p.js   （真机可调大）
 // 失败时用串行定位：node test_app.js --only=<测试名子串>
@@ -32,7 +33,9 @@ const SRC = path.join(__dirname, 'test_app.js')
 // （test_filter.js 曾因此被报 Qodo PR #158 High/Security）。
 // ⇒ 不要改成 `process.env.XBK_PARALLEL_ID || workerId`，也不要把 spread 挪到后面。
 const RUN_ID = `${process.pid}_${Date.now()}`
-const workerIds = []
+// 本进程用过的**全部**分片 ID（含失败重跑那几轮）：cleanupArtifacts 必须按它逐个清，否则重跑
+// 分片目录会漏在仓库根。C5-085 起重跑不再复用首轮 ID（见 workerIdFor）。
+const usedWorkerIds = new Set()
 
 // ---------- 1. 提取测试名（与 test_app.js 的 await test('name' 一一对应） ----------
 const src = fs.readFileSync(SRC, 'utf8')
@@ -52,21 +55,32 @@ const chunkSize = Math.ceil(sorted.length / CONCURRENCY)
 const chunks = []
 for (let i = 0; i < sorted.length; i += chunkSize) {
   chunks.push(sorted.slice(i, i + chunkSize))
-  workerIds.push(`${RUN_ID}_${chunks.length - 1}`)
 }
+
+// 分片 ID 按「第几次跑这一片」现算（C5-085）：首轮 `${RUN_ID}_<idx>` 保持不变
+// （test_app.js:4426 的「与 test_app_p.js 分片口径逐字符一致」断言就锚在这个形态上），
+// 重跑则用 `${RUN_ID}_<idx>_r<n>`。
+// 为什么要换：重跑复用同一个 workerId ⇒ 同一个 `xianbaoku_cache_p<ID>`。而首轮失败恰恰常是
+// overlayfs 的 IO 竞态，用「上一轮刚写过、进程可能还没退干净」的目录去重验，等于把同一竞态再演一遍，
+// 把 flaky 判成真失败——「每 worker 独立缓存目录」的隔离设计在重跑路径上被自己抵消了。
+// 形态约束：只含 [A-Za-z0-9_-]（test_app.js 的 sanitizeIsolationId 白名单 + 64 字符上限），
+// 且仍**由本文件自造**（理由见上方 XBK_PARALLEL_ID 段）。
+const workerIdFor = (idx, attempt) => (attempt > 0 ? `${RUN_ID}_${idx}_r${attempt}` : `${RUN_ID}_${idx}`)
 
 // ---------- 3. 并发 fork（独立缓存目录 + 精确名单 + QUICK 快测） ----------
 const t0 = Date.now()
 // 活跃子进程登记：setup 中途抛错（writeFileSync/fork）时顶层 catch 能终止已启动的 worker
 const activeChildren = new Set()
 
-// 跑一个分片：返回退出码。quick=true 时用 QUICK 快测；重跑时用非 QUICK 完整验证
+// 跑一个分片：返回退出码。quick=true 时用 QUICK 快测；重跑时用非 QUICK 完整验证。
+// attempt 决定分片 ID（C5-085）：0 = 首轮，n>0 = 第 n 次重跑，各自独立的名单文件/报告/缓存目录。
 // executedReports：worker 落盘的执行计数（idx → {executed, skipped, passed, failed}）。
 // 用文件而不是 stdout：stdio 是 inherit（进度照常打到终端），父进程读不到子进程输出。
 const executedReports = new Map()
-function runChunk (chunk, idx, quick) {
+function runChunk (chunk, idx, quick, attempt = 0) {
   return new Promise((resolve) => {
-    const workerId = workerIds[idx]
+    const workerId = workerIdFor(idx, attempt)
+    usedWorkerIds.add(workerId)
     const listFile = path.join(__dirname, `.tmp_parallel_${workerId}.json`)
     const reportFile = path.join(__dirname, `.tmp_parallel_report_${workerId}.json`)
     fs.writeFileSync(listFile, JSON.stringify(chunk))
@@ -106,7 +120,7 @@ function runChunk (chunk, idx, quick) {
 // 两者都被 .gitignore 覆盖（目录 `xianbaoku_cache*`、名单 `.tmp_parallel_*.json`）⇒ git status
 // 看不出来，只能靠数文件发现——实测已滞留 2 个名单文件。收敛成幂等入口，三条退出路径都调。
 function cleanupArtifacts () {
-  for (const workerId of workerIds) {
+  for (const workerId of usedWorkerIds) {
     try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_${workerId}.json`)) } catch (e) {} // 已删 / 未建
     try { fs.unlinkSync(path.join(__dirname, `.tmp_parallel_report_${workerId}.json`)) } catch (e) {} // 执行计数报告
     try { fs.rmSync(path.join(__dirname, `xianbaoku_cache_p${workerId}`), { recursive: true, force: true }) } catch (e) {}
@@ -228,7 +242,9 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     if (shuttingDown) return
     if (codes[i] !== 0) {
       console.log(`\n⚠️ worker#${i} 首轮失败，串行重跑完整验证（flaky 容错）...`)
-      codes[i] = await runChunk(chunks[i], i, false)
+      // attempt=1 ⇒ 全新的 workerId/缓存目录（C5-085）：不复用首轮那份可能还被上一轮进程占用、
+      // 且已被写脏的目录。
+      codes[i] = await runChunk(chunks[i], i, false, 1)
     }
   }
 
