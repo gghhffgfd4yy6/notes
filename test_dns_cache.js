@@ -28,7 +28,7 @@ dns.lookup = (hostname, options, callback) => {
 (async () => {
   try {
     delete require.cache[require.resolve('./xbk_agents')]
-    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS } = require('./xbk_agents')
+    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS, DNS_REAL_INFLIGHT_MAX } = require('./xbk_agents')
     await prewarmDns('cache-probe.invalid')
     await prewarmDns('cache-probe.invalid')
     assert.strictEqual(calls, 1, 'TTL 内应命中 DNS 缓存')
@@ -338,6 +338,154 @@ dns.lookup = (hostname, options, callback) => {
     // （太小）或永远等不到退役（非整数/0）。
     assert.ok(Number.isInteger(DNS_INFLIGHT_MAX_AGE_MS) && DNS_INFLIGHT_MAX_AGE_MS > DNS_PENDING_TIMEOUT_MS,
       `未注入时在飞最大存活时间应为远大于等待超时的有限正整数（默认 60s），实际 ${DNS_INFLIGHT_MAX_AGE_MS}`)
+    // 生产默认（不注入 XBK_DNS_MAX_REAL_INFLIGHT）：真实硬顶必须是远大于软全局上限（生产默认 32）的有限正
+    // 整数。太小会让软名额永远用不满（同 key 的接班查询先撞硬顶），非整数/0 则等于没有硬顶。用首实例的
+    // 未注入值断言——下面那个注入 REAL=3 的实例只证明注入生效，不证明默认值合理；这条放在新用例之后，
+    // 好让旧实现先红在「每周期又新增 2 条真实查询」的计数上（缺这个导出只是症状，真实无界才是病灶）。
+    // ── 本轮返工（CodeRabbit #362 第 4 条）：真实名额只由底层回调释放，跨多个过龄周期仍有硬顶 ──────────
+    // 漏洞（只有软名额 + 过龄退役时）：退役把名额还给软上限，但那条 getaddrinfo 仍在 libuv 线程池里跑；
+    // 每过一个存活周期重试又能新增查询 ⇒ 真实未完成查询数无界（旧实现实测 3 个周期 = 6 条，且继续涨）。
+    // 故另起一个模块实例注入真实硬顶 3 / 存活 80ms / 等待 150ms。三个 env 都不能放文件头：AGE=80 会架空
+    // 既有「两条在飞都还年轻（默认存活 60s）」与「AGE > PENDING」断言；REAL=3 会把既有 lateHeld 的 6 条
+    // 放行压到 2 条（那一刻真实在飞还有 1 条没释放）。
+    process.env.XBK_DNS_MAX_REAL_INFLIGHT = '3'
+    process.env.XBK_DNS_MAX_INFLIGHT_AGE_MS = '80'
+    process.env.XBK_DNS_PENDING_TIMEOUT_MS = '150'
+    delete require.cache[require.resolve('./xbk_agents')]
+    const capped = require('./xbk_agents')
+    assert.strictEqual(capped.DNS_INFLIGHT_MAX_AGE_MS, 80,
+      `环境变量应把在飞最大存活时间压到 80ms（测试注入生效的前提），实际 ${capped.DNS_INFLIGHT_MAX_AGE_MS}`)
+    assert.strictEqual(capped.DNS_INFLIGHT_MAX_PER_KEY, 2,
+      `同 key 软名额仍是 ${capped.DNS_INFLIGHT_MAX_PER_KEY}（本用例要证明硬顶低于「3 个周期 × 软上限」之和）`)
+    const realHost = 'inflight-real-cap.invalid'
+    const realCap = 3
+    const realPerCycle = 25
+    const realStuck = [] // 永不回调的底层 lookup：跨 3 个周期累积
+    const realCycleCodes = [[], [], []]
+    dns.lookup = (hostname, options, callback) => { realStuck.push(callback) } // 坏解析器：永不回调
+    const realCall = (cycle) => new Promise(resolve => capped.dnsLookup(realHost, { all: true }, (error) => {
+      realCycleCodes[cycle].push(error ? error.code : 'none')
+      resolve()
+    }))
+    for (let cycle = 0; cycle < 3; cycle++) {
+      // 每周期两波（模拟 got 超时后的两轮重试）：第一波 1 次必然放行并建起 pending record；第二波 24 次在
+      // **同一 tick** 里先命中那条 pending record（在飞闸门在 pending 之后）而全部加入等待，故每波只新增 1 条
+      // 底层查询。每周期能起 2 条是这么来的：波与波之间 deadline(150ms) 先到，把 pending record 整条摘掉，
+      // 下一波必须重新过闸；而 80ms 的过龄退役此时已把软名额腾出来，于是旧实现每周期都再放行 1 条
+      // （3 周期 × 同 key 软上限 2 条 = 6 条，且继续涨）。
+      // 26/49 的分布由结构决定、不是巧合：deadline(150ms) 恒早于 sleep(190ms) ⇒ 每波都在下一波开始前被扫成
+      // ETIMEDOUT；同 tick 内无 await ⇒ 那 24 次只等在那条 pending record 上，谁都不会另起底层查询。
+      // 于是第 1 周期 25 条全 ETIMEDOUT、第 2 周期首波那 1 条（第 3 条真实查询）ETIMEDOUT 而其余 24 条撞顶，
+      // 第 3 周期 25 条全 EAI_AGAIN ⇒ 26 条 ETIMEDOUT / 49 条 EAI_AGAIN。
+      const waveFirst = realCall(cycle)
+      await sleep(capped.DNS_PENDING_TIMEOUT_MS + 40)
+      await waveFirst
+      const waveRest = []
+      for (let i = 1; i < realPerCycle; i++) waveRest.push(realCall(cycle))
+      await sleep(capped.DNS_PENDING_TIMEOUT_MS + 40)
+      await Promise.all(waveRest)
+      await sleep(capped.DNS_INFLIGHT_MAX_AGE_MS + 40) // 周期之间：上一批真实在飞条目全部过龄
+    }
+    const realTotal = 3 * realPerCycle
+    const realFlat = realCycleCodes.flat()
+    assert.strictEqual(realFlat.length, realTotal, `${realTotal} 次调用必须一个回调不少，实际 ${realFlat.length}`)
+    assert.ok(realFlat.every(code => code === 'ETIMEDOUT' || code === 'EAI_AGAIN'),
+      `受限的给 EAI_AGAIN、上限内的给 ETIMEDOUT，不得出现别的结果，实际 ${realFlat.join(',')}`)
+    // 先测行为再验注入：旧实现没有 DNS_REAL_INFLIGHT_MAX 这个导出，先断言计数才能拿到「真实发起 6 条」的证据。
+    assert.strictEqual(realStuck.length, realCap,
+      `跨 3 个过龄周期真实发起的底层 lookup 必须收敛到真实硬顶 ${realCap} 条（旧实现 = 3 周期 × 同 key 软上限 ${capped.DNS_INFLIGHT_MAX_PER_KEY} 条 = 6 条），实际 ${realStuck.length}`)
+    assert.strictEqual(capped.DNS_REAL_INFLIGHT_MAX, realCap,
+      `环境变量应把真实在飞硬顶压到 ${realCap}（测试注入生效的前提），实际 ${capped.DNS_REAL_INFLIGHT_MAX}`)
+    assert.ok(realCycleCodes[0].every(code => code === 'ETIMEDOUT'),
+      `第 1 个周期硬顶内的 ${realPerCycle} 项都还在等待，必须按 deadline 收场为 ETIMEDOUT，实际 ${realCycleCodes[0].join(',')}`)
+    assert.ok(realCycleCodes[2].every(code => code === 'EAI_AGAIN'),
+      `第 3 个周期真实在飞已满 ${realCap} 条：全部 ${realPerCycle} 次调用必须立即 EAI_AGAIN（可重试），实际 ${realCycleCodes[2].join(',')}`)
+    const realTimeouts = realFlat.filter(code => code === 'ETIMEDOUT').length
+    const realRefused = realFlat.filter(code => code === 'EAI_AGAIN').length
+    assert.strictEqual(realTimeouts, realPerCycle + 1,
+      `硬顶内的查询仍按 deadline 收场（第 1 周期 ${realPerCycle} 项 + 第 2 周期首波 1 项），期望 ${realPerCycle + 1}，实际 ${realTimeouts}`)
+    assert.strictEqual(realRefused, realTotal - (realPerCycle + 1),
+      `其余调用必须立即以 EAI_AGAIN 失败（不得静默丢、也不新建底层查询），期望 ${realTotal - (realPerCycle + 1)}，实际 ${realRefused}`)
+    // 硬顶是进程级：3 个过龄周期跑完、真实在飞仍满 3 条（第 1 周期两波各 1 条 + 第 2 周期首波 1 条，回调一条
+    // 都没释放），此刻另一个主机的解析也必须快速失败、不得新增底层 lookup。按 key 记账（per-key）的实现会
+    // 放过它——只压单 key 的回归骗不过这条断言（per-key 版跑旧回归仍绿，实测）。
+    const otherHost = 'inflight-real-cap-other.invalid'
+    const stuckBeforeOther = realStuck.length
+    let otherCode = 'pending'
+    const otherWait = new Promise(resolve => capped.dnsLookup(otherHost, { all: true }, (error) => {
+      otherCode = error ? error.code : 'none'
+      resolve()
+    }))
+    // 先同步判「有没有多放」：per-key 硬顶会立刻为这个新主机多起一条底层 lookup，不必等回调（否则会被
+    // unref 的等待项 timer 架空成「进程静默退出 0」而不是一条能读的断言）。
+    assert.strictEqual(realStuck.length, stuckBeforeOther,
+      `硬顶是进程级：饱和期其它主机也不得新增底层 lookup（per-key 硬顶会在这里多起一条），实际 ${realStuck.length} 条`)
+    await sleep(capped.DNS_PENDING_TIMEOUT_MS + 40) // 该回调由 queueMicrotask 异步派发，断言前必须等它落定
+    await otherWait
+    assert.strictEqual(otherCode, 'EAI_AGAIN',
+      `硬顶是进程级：饱和期其它主机（${otherHost}）的解析也必须快速失败为 EAI_AGAIN，实际 ${otherCode}`)
+    // 恢复：真实名额只由底层回调释放——放掉这 3 条挂起回调后同 key 必须能重新解析并写回缓存
+    for (const cb of realStuck) cb(null, '192.0.2.91', 4)
+    let realRecoveredCalls = 0
+    dns.lookup = (hostname, options, callback) => {
+      realRecoveredCalls += 1
+      callback(null, [{ address: '192.0.2.91', family: 4 }], 4)
+    }
+    const realOk = await new Promise(resolve => capped.dnsLookup(realHost, { all: true }, (error, address) => resolve({ error, address })))
+    assert.strictEqual(realOk.error, null,
+      `真实在飞回调释放后同 key 必须能重新解析（硬顶不得把主机永久钉死），实际 ${realOk.error && realOk.error.code}`)
+    assert.deepStrictEqual(realOk.address, [{ address: '192.0.2.91', family: 4 }], 'all:true 的地址形状不得丢')
+    assert.strictEqual(realRecoveredCalls, 1, '真实名额释放后必须真正发起底层 lookup，且只发起一次')
+    await new Promise(resolve => capped.dnsLookup(realHost, { all: true }, (error) => resolve(error)))
+    assert.strictEqual(realRecoveredCalls, 1, '恢复后的解析结果应写回缓存并被下一次请求命中')
+    console.log(`✅ PR #362 真实在飞硬顶：跨 3 个过龄周期共 ${realTotal} 次同 key 调用只发起 ${realStuck.length} 条底层 lookup（旧实现 6 条），${realTimeouts} 条 ETIMEDOUT / ${realRefused} 条 EAI_AGAIN，回调释放后可重新解析`)
+    // ── 真实名额的释放必须幂等（reviewer 实测：硬顶 3 却能放行 6 条）─────────────────────────────
+    // 两条违反 dns.lookup 契约的路径会让同一份名额被释放两次：底层同步回调（测试替身本来就这么写）之后
+    // 调用方回调抛错，异常冒进 startInflightLookup 的 catch 再减一次；底层回调被调两次则 +1/-2。
+    // 计数一旦被减负，硬顶就形同虚设。这里用同步回调 + 会抛错的调用方回调跑 6 次，随后真实名额必须仍只够 3 条。
+    let syncedLookups = 0
+    dns.lookup = (hostname, options, callback) => {
+      syncedLookups += 1
+      callback(null, '192.0.2.92', 4) // 底层同步回调：违反契约，正是要把回调路径和异常路径叠在一次调用上
+    }
+    for (let i = 0; i < 6; i++) {
+      assert.throws(() => capped.dnsLookup(`inflight-real-idem-throw-${i}.invalid`, { all: true }, () => {
+        throw new Error('caller boom')
+      }), /caller boom/, `调用方回调抛错必须原样冒到调用方（第 ${i + 1} 次）`)
+    }
+    assert.strictEqual(syncedLookups, 6, `6 次同步回调调用都该真正发起底层 lookup，实际 ${syncedLookups}`)
+    const idemStuck = []
+    dns.lookup = (hostname, options, callback) => { idemStuck.push(callback) } // 坏解析器：永不回调
+    const idemCodes = []
+    const idemWaits = []
+    for (let i = 0; i < 6; i++) {
+      idemWaits.push(new Promise(resolve => capped.dnsLookup(`inflight-real-idem-hold-${i}.invalid`, { all: true }, (error) => {
+        idemCodes.push(error ? error.code : 'none')
+        resolve()
+      })))
+    }
+    // 先同步判「有没有多放」：计数被减负就会 6 次全放行（每次都会立刻多一条底层 lookup），不必等回调。
+    assert.strictEqual(idemStuck.length, realCap,
+      `真实名额释放必须幂等：同步回调 + 调用方抛错不得把计数减成负数（减负后 6 次调用会全部放行），应恰好放行 ${realCap} 条底层 lookup，实际 ${idemStuck.length}`)
+    await sleep(capped.DNS_PENDING_TIMEOUT_MS + 40) // 等待项的 timer 是 unref 的：必须先挂一个**不 unref** 的 sleep，否则事件循环空转、进程静默退出 0
+    await Promise.all(idemWaits) // 让撞顶的 3 条 EAI_AGAIN 与在飞 3 条的 deadline 都落定
+    assert.strictEqual(idemCodes.filter(code => code === 'ETIMEDOUT').length, realCap,
+      `硬顶内的 ${realCap} 条仍按 deadline 收场为 ETIMEDOUT，实际 ${idemCodes.join(',')}`)
+    assert.strictEqual(idemCodes.filter(code => code === 'EAI_AGAIN').length, 6 - realCap,
+      `其余 ${6 - realCap} 条必须立即 EAI_AGAIN（不得静默丢），实际 ${idemCodes.join(',')}`)
+    for (const cb of idemStuck) cb(null, '192.0.2.93', 4) // 释放这 3 份名额，计数归零
+    let idemRecovered = 0
+    dns.lookup = (hostname, options, callback) => {
+      idemRecovered += 1
+      callback(null, [{ address: '192.0.2.93', family: 4 }], 4)
+    }
+    const idemOk = await new Promise(resolve => capped.dnsLookup('inflight-real-idem-recovered.invalid', { all: true }, (error, address) => resolve({ error, address })))
+    assert.strictEqual(idemOk.error, null,
+      `幂等释放后名额必须正好归零：新主机应能正常解析，实际 ${idemOk.error && idemOk.error.code}`)
+    assert.strictEqual(idemRecovered, 1, '名额归零后必须真正发起底层 lookup，且只发起一次')
+    console.log(`✅ PR #362 真实名额释放幂等：同步回调 + 调用方抛错 6 次后仍只放行 ${idemStuck.length} 条底层 lookup（未减负），撞顶的 ${6 - realCap} 条 EAI_AGAIN、硬顶内 ${realCap} 条 ETIMEDOUT`)
+    assert.ok(Number.isInteger(DNS_REAL_INFLIGHT_MAX) && DNS_REAL_INFLIGHT_MAX > DNS_INFLIGHT_MAX,
+      `未注入时真实在飞硬顶应为远大于软全局上限（默认 64 > 32）的有限正整数，实际 ${DNS_REAL_INFLIGHT_MAX}`)
     suiteDone = true
   } finally {
     dns.lookup = originalLookup
