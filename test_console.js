@@ -8186,30 +8186,30 @@ async function main () {
     assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
       '保存/启动前必须统一 clamp 到 3–20')
     const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
+    // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
+    // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
+    // 这条红线，删除/替换 tickAuto 的锁必红。
+    const functionBodyOf = (text, signature) => {
+      const at = text.indexOf(signature)
+      if (at < 0) return ''
+      const open = text.indexOf('{', at + signature.length)
+      if (open < 0) return ''
+      let depth = 0
+      for (let i = open; i < text.length; i++) {
+        if (text[i] === '{') depth++
+        else if (text[i] === '}') {
+          depth--
+          if (depth === 0) return text.slice(open + 1, i)
+        }
+      }
+      return ''
+    }
     // 变异沙箱里 console.js 是机器生成代码（语句被 stryMutAct_* 条件包裹 + 覆盖率计数），
     // 所有源码串断言只对原始源文件有意义——与「测试隔离」红线同一口径，交 Test workflow 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
-      // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
-      // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
-      // 这条红线，删除/替换 tickAuto 的锁必红。
-      const functionBodyOf = (text, signature) => {
-        const at = text.indexOf(signature)
-        if (at < 0) return ''
-        const open = text.indexOf('{', at + signature.length)
-        if (open < 0) return ''
-        let depth = 0
-        for (let i = open; i < text.length; i++) {
-          if (text[i] === '{') depth++
-          else if (text[i] === '}') {
-            depth--
-            if (depth === 0) return text.slice(open + 1, i)
-          }
-        }
-        return ''
-      }
       const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
       assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
         consoleSrc.includes("startAction('run-auto'") &&
@@ -8250,6 +8250,31 @@ async function main () {
         "server.on('close', () => { disposeAuto(); killAll() })",
         "server.on('close', () => { killAll() }); disposeAuto()")),
       '清理调用移出关闭回调不得算数')
+    } else {
+      // C5-033：变异档不再整段跳过（旧写法让这 8 条红线在变异评估里零防护）。
+      // 插桩只改写语句/表达式文本（字面量被 stryMutAct_* 包住），标识符、字符串字面量与
+      // 函数体结构都还在 ⇒ 用「函数体 + 标识符」这一族断言兜同一批红线：删掉 tickAuto 的锁、
+      // 单飞判定或连续失败计数，或把 run-auto 挪到别处，都会在这里变红。
+      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      assert.ok(tickAutoBody.length > 500, '变异档必须仍能取到 tickAuto 函数体（否则下面几条恒真）')
+      assert.ok(consoleSrc.includes('AUTO_MIN_S') && consoleSrc.includes('AUTO_MAX_S') &&
+        consoleSrc.includes('clampAutoSeconds'),
+      '服务器端 3–20 秒夹紧常量与夹紧函数必须还在（文本被插桩改写，只认标识符）')
+      assert.ok(consoleSrc.includes('AUTO_MAX_FAILS') && tickAutoBody.includes('startAction') &&
+        tickAutoBody.includes("'run-auto'"),
+      '自动调度必须在服务器进程内跑 run-auto')
+      assert.ok(tickAutoBody.includes('acquireLockResult') && /lockVerdict\s*\.\s*ok/.test(tickAutoBody),
+        'tickAuto 体内必须先取单飞锁（换成 {ok:true} 即变红）')
+      assert.ok(tickAutoBody.includes('autoInFlightId') && /activeChildren\s*\.\s*size/.test(tickAutoBody),
+        '上一轮未结束不得叠跑')
+      assert.ok(tickAutoBody.includes('auto.fails') && tickAutoBody.includes('AUTO_MAX_FAILS') &&
+        tickAutoBody.includes('stopAuto'),
+      '连续失败计数必须仍参与自动停机判定')
+      assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
+        '自动开关/间隔必须由服务器持久化，重启可恢复')
+      assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
+      assert.ok(consoleSrc.includes('disposeAuto') && consoleSrc.includes('killAll'),
+        '控制台关闭时必须清理自动定时器')
     }
 
     const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
