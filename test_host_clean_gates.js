@@ -118,7 +118,11 @@ if (process.env.XBK_HOST_CLEAN_THROW_PROBE !== '1') {
     assert.ok(failed >= 1, `汇总必须记下失败条数（实得 ${failed}）：` + both.slice(-600))
     assert.strictEqual(passed + failed, total, `汇总三数字必须自洽（${passed}+${failed}≠${total}）`)
     assert.ok(passed >= 13, `探头之后仍有 13 条检查必须跑完（实得 ${passed} 通过）：` + both.slice(-600))
-    assert.ok(!/Error: probe-throw\s*\n\s*at /.test(both),
+    // 直观形态是 `Error: probe-throw` 换行后跟若干层 `    at …`。旧写法 `\s*\n\s*` 里 `\s` 也能吃换行，
+    // 中间的 `\n` 与两侧量词抢同一段空白 ⇒ 超线性回切（S5852）。去掉中间的换行字面量后只剩一个量词，
+    // 后面紧跟的 `at` 又不可能属于空白 ⇒ 判定唯一。顺带更严：旧写法要求消息与帧之间有换行，
+    // 内联吐出来的栈（`Error: probe-throw       at …`）它漏判，新写法照样抓住。
+    assert.ok(!/Error: probe-throw\s*at /.test(both),
       '不得把原始异常栈直接抛到顶层（旧实现的行为）：' + both.slice(-600))
   })
 }
