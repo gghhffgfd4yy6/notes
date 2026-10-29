@@ -2509,6 +2509,61 @@ console.log('========================================\n');
     }
   }
 
+  // ---------- C5-026：私有方法级用例的**有意重复**登记 ----------
+  // 下面 12 条用例直调 xbk.App._updateReport / _updateChannelHealth / _writeRunLog（不走 run()），
+  // 与 test_app_unit.js 的部分用例同域。**有意保留，不收敛删除**，理由三条：
+  //   ① 只有集成侧能观测到的差异不能由 unit 口径替代：真实 fs 落盘字节（report.state / channel-health.state
+  //      / 锁文件）、真实跨进程锁与恢复认领租约、真实 sendNotify 边界上的 pushCalls、真实 CACHE_DIR 分片目录；
+  //      删掉它们等于把这批语义从「进程内真实文件」降级成「内存桩」，覆盖面是降低而不是收敛。
+  //   ② 本文件不在变异集里（SUITES 无 test_app.js；stryker.tap.config.js 的 explicitTestFiles 由 SUITES 派生），
+  //      所以这些用例不贡献变异分——这是有意的测试集边界（同 test_app_p.js / test_notify.js），不是接线漏项；
+  //      它们买的是「真实文件布局与跨进程锁」的回归保护，归因口径要按「不进变异集」读，不得当成变异覆盖率。
+  //   ③ 同域语义的 unit 侧覆盖在 test_app_unit.js（在变异集内），所以「这条重复到底有没有价值」的判据是：
+  //      unit 侧改坏能不能红。能红的（unit 锚点已登记）⇒ 本文件这条只保集成差异；不能红的（integrationOnly）
+  //      ⇒ 这里就是**唯一**观测点，删除即零覆盖。改动 _updateReport/_updateChannelHealth 语义时两侧都要看。
+  // 登记必须与文件同步：下面这条用例逐条核对「点名的用例仍存在」「unit 锚点仍存在」「归属前提未变」。
+  const PRIVATE_CALL_REGISTRY = [
+    { name: '跨天旧主全0 + pending缺失或全零 → 不发送日报且精确保存今日summary六项', unit: '_updateReport 跨天但计数全 0 ⇒ 不发明报，结转后累计（value[k] > 0 而非 >= 0）' },
+    { name: '跨天旧主全0 + 非零pending → 发送昨日日报、结转成功/保留失败且覆盖failed/truncated', unit: '_updateReport 跨天有 pending 时把它当结转基数（Object.assign 七字段）' },
+    { name: '日报累计运行轮数并在日报正文展示', unit: '_updateReport 跨天且有计数 ⇒ 调 _sendCrossDayReport(路径,state,summary,today) 后 return' },
+    { name: '通道连续失败告警、恢复告警均限频且不影响主推送语义', unit: '健康更新: 连续失败达阈值入告警 + lastAlertAt 即时落盘（APP2-01 限频按尝试计时）' },
+    { name: 'APP2-02：恢复告警发送失败不丢通知（保留 pending 并在下一轮重发）', unit: '健康更新: 恢复告警送达确认后清零（APP2-02 闭环：pending/claim/计数全清）' },
+    { name: 'APP-02：通道健康锁陈旧判定须复核持有进程存活', unit: '通道健康锁: 陈旧锁+持有进程退出时抢占重获' },
+    { name: 'APP-02：run.log 锁陈旧判定须复核持有进程存活', unit: '_writeRunLog 陈旧锁但持有进程仍存活 ⇒ 不抢占，退避重试成功' },
+    { name: 'FX3：恢复告警发送失败即释放认领 → 下一轮立即重发（不丢）', unit: '健康更新: 恢复告警发送失败释放认领、保留 pending 与计数（FX3 重发语义）' },
+    { name: 'APP2-01：告警通道不可用时失败告警仍按 intervalMs 限频（按告警尝试计时）', unit: '健康更新: 连续失败达阈值入告警 + lastAlertAt 即时落盘（APP2-01 限频按尝试计时）' },
+    // integrationOnly：unit 侧没有等价场景（不是漏登记），删掉即零覆盖。
+    { name: 'APP-02：通道健康告警发送期间不持有跨进程锁（并发的健康更新不被挡住）', why: '时序契约：告警发送的 300ms 窗口内锁必须已释放；unit 侧桩做不到真实跨进程锁 + 真实发送窗口' },
+    { name: 'FX3：重叠运行的恢复告警只发送一条（锁内原子认领 + 租约）', why: '真实重叠运行（可控闸门钉住第一次发送）才能观测「锁内原子认领」；unit 侧是单次调用序列' },
+    { name: 'FX3：租约内的活认领挡住重复重发；超租约陈旧认领可接管（有界可恢复）', why: '认领租约的过期接管需要真实时间跳变（lastRecoveredAt 回拨 1h）与真实状态文件，unit 侧无租约场景' }
+  ]
+
+  await test('C5-026：私有方法级用例登记不得漂移（有意重复 + 不进变异集）', async () => {
+    const selfSrc = fs.readFileSync(__filename, 'utf8')
+    const unitSrc = fs.readFileSync(path.join(__dirname, 'test_app_unit.js'), 'utf8')
+    // 口径与 test_app_p.js 的分片提取一致（它按同一正则给本文件分片，改名后两者必须同步）
+    const declared = [...selfSrc.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
+    assertEqualNum(PRIVATE_CALL_REGISTRY.length, 12,
+      `私有方法级用例登记表应覆盖 12 条（新增/删除私有方法级用例时必须同步登记与理由）`)
+    for (const entry of PRIVATE_CALL_REGISTRY) {
+      assert(declared.includes(entry.name), `登记表点名的用例已不存在（改名/删除后未同步登记）：${entry.name}`)
+      assert(!!(entry.unit || entry.why), `每条登记必须给出 unit 侧等价锚点或「只有集成侧能观测」的理由：${entry.name}`)
+      if (entry.unit) {
+        assert(unitSrc.includes(entry.unit),
+          `unit 侧等价覆盖已消失（${entry.name} 的锚点 ${JSON.stringify(entry.unit)} 在 test_app_unit.js 找不到）` +
+          '——这条重复已没有对侧承接，必须把它收回 test_app_unit.js 或在这里补回集成差异')
+      }
+    }
+    // 归属前提：本文件不进单元/变异集（SUITES 是 run_unit_tests.js 与 TAP 档 explicitTestFiles 的唯一来源），
+    // 而 unit 侧必须在集内——否则这批私有方法的语义在变异口径里既无分也无人认领。
+    const suites = require('./test_suites.js').SUITES
+    assert(!suites.some(s => s.file === 'test_app.js'),
+      'test_app.js 不得注册进 SUITES：它是由 test.yml 显式步骤跑的集成套件，进单元集会被 run_unit_tests.js 当单元套件重复执行')
+    const unitSuite = suites.find(s => s.file === 'test_app_unit.js')
+    assert(unitSuite && !unitSuite.integration && !unitSuite.mutationSkip,
+      'test_app_unit.js 必须在单元/变异集内（integration/mutationSkip 都不得置位），否则这些私有方法的语义无人认领')
+  })
+
   await test('跨天旧主全0 + pending缺失或全零 → 不发送日报且精确保存今日summary六项', async () => {
     await withIsolatedReportEnv('zero_empty', async ({ statePath, setupRound }) => {
       const cases = [
