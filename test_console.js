@@ -348,6 +348,26 @@ const FILTER_LOCK_STALE_MS = 10 * 1000 // = scripts/console.js 的 FILTER_LOCK_S
 const FILTER_LOCK_STALE_SAMPLE_MS = FILTER_LOCK_STALE_MS + 1000 // 刚过期 1s，边界之上
 // lastaccept 重放窗直接用生产导出的常量（旧写法散着 30000/61000 两个裸数）。
 const REPLAY_WINDOW_MS = REPLAY_WINDOW_NOTIFY_TEST_MS
+// ── C5-033：按函数名取函数体（花括号配对）──
+// 必须容错：变异档里 scripts/console.js 会被 @stryker-mutator/instrumenter 实插桩，
+// 插桩器重排签名空白（`function tickAuto (` → `function tickAuto(`）。定点串匹配在插桩后
+// 源码上取到 0 字节，把「函数体长度 > 500」的守卫变成恒抛，整套变异报告恒红失真——
+// 容错定位 + 自测（见「C5-033 函数体定位器」用例）一起兜住这个回归。
+function functionBodyOf (text, fnName) {
+  const m = new RegExp('function\\s+' + fnName + '\\s*\\(').exec(text)
+  if (!m) return ''
+  const open = text.indexOf('{', m.index + m[0].length)
+  if (open < 0) return ''
+  let depth = 0
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}') {
+      depth--
+      if (depth === 0) return text.slice(open + 1, i)
+    }
+  }
+  return ''
+}
 async function aok (name, fn) {
   const label = caseLabel(name)
   reapStaleTimeout(name)
@@ -8178,6 +8198,29 @@ async function main () {
     assert.ok(!/\.page\s*\{[^}]*min-height:/.test(css), '不得再用固定减值的 min-height（短页会多出滚动）')
   })
 
+  // ── C5-033 返工：函数体定位器自测 ──
+  // 变异档里 console.js 被插桩器重写，签名空白会被压掉。定位器必须对「带空格 / 无空格」
+  // 两种形态都取到同一条非空函数体；否则下面 length>500 的守卫每轮恒抛，变异报告失真。
+  await aok('C5-033 函数体定位器: 带空格/无空格（插桩后）两种签名都能取到 tickAuto 函数体', () => {
+    const body = '  if (!lockVerdict.ok) return\n  auto.fails += 1\n'.repeat(20)
+    const spaced = `function tickAuto () {\n${body}}\n`
+    const tight = `function tickAuto() {\n${body}}\n`
+    assert.ok(spaced.includes('function tickAuto ('), 'fixture 必须覆盖「带空格」形态')
+    assert.ok(tight.includes('function tickAuto(') && !tight.includes('function tickAuto ('),
+      'fixture 必须覆盖插桩器产出的「无空格」形态')
+    const fromSpaced = functionBodyOf(spaced, 'tickAuto')
+    const fromTight = functionBodyOf(tight, 'tickAuto')
+    assert.ok(fromSpaced.length > 500, '带空格形态必须取到 >500 字节的函数体')
+    assert.ok(fromTight.length > 500, `无空格形态（插桩后）必须取到 >500 字节，实取 ${fromTight.length}`)
+    assert.strictEqual(fromTight, fromSpaced, '两种形态必须取到同一条函数体')
+    assert.ok(fromTight.includes('lockVerdict'), '取到的必须是函数体内容，不是签名')
+    // 旧写法（定点串）在无空格形态上必然 miss：这就是「取 0 字节 → 恒抛」的根因。
+    assert.strictEqual(tight.indexOf('function tickAuto ('), -1, '旧定点串在插桩后源码上必然 miss')
+    // 真文件也过一遍：变异沙箱里读到的就是插桩后的 console.js。
+    const realSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    assert.ok(functionBodyOf(realSrc, 'tickAuto').length > 500, '真实 console.js 上的 tickAuto 函数体必须取得非空')
+  })
+
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -8190,27 +8233,14 @@ async function main () {
     // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
     // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
     // 这条红线，删除/替换 tickAuto 的锁必红。
-    const functionBodyOf = (text, signature) => {
-      const at = text.indexOf(signature)
-      if (at < 0) return ''
-      const open = text.indexOf('{', at + signature.length)
-      if (open < 0) return ''
-      let depth = 0
-      for (let i = open; i < text.length; i++) {
-        if (text[i] === '{') depth++
-        else if (text[i] === '}') {
-          depth--
-          if (depth === 0) return text.slice(open + 1, i)
-        }
-      }
-      return ''
-    }
+    // 定位器已提到模块作用域（functionBodyOf），签名按函数名 + 正则容错匹配，
+    // 见下方 C5-033 定位器自测。
     // 变异沙箱里 console.js 是机器生成代码（语句被 stryMutAct_* 条件包裹 + 覆盖率计数），
     // 所有源码串断言只对原始源文件有意义——与「测试隔离」红线同一口径，交 Test workflow 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
       assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
         consoleSrc.includes("startAction('run-auto'") &&
         tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
@@ -8255,7 +8285,7 @@ async function main () {
       // 插桩只改写语句/表达式文本（字面量被 stryMutAct_* 包住），标识符、字符串字面量与
       // 函数体结构都还在 ⇒ 用「函数体 + 标识符」这一族断言兜同一批红线：删掉 tickAuto 的锁、
       // 单飞判定或连续失败计数，或把 run-auto 挪到别处，都会在这里变红。
-      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
       assert.ok(tickAutoBody.length > 500, '变异档必须仍能取到 tickAuto 函数体（否则下面几条恒真）')
       assert.ok(consoleSrc.includes('AUTO_MIN_S') && consoleSrc.includes('AUTO_MAX_S') &&
         consoleSrc.includes('clampAutoSeconds'),
