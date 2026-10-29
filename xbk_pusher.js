@@ -60,8 +60,9 @@ function createPusher ({ Utils, getNotify }) {
       }
       // 抛异常由主流程处理：推送失败的消息不写缓存，下次运行重试（避免永久丢失）
       // 加整体超时：整体 race 上限 10s（SYSTEM_CONTRACT「推送整体超时 10s」，不得上调）。
-      // slim 在带 signal 的 Pusher 路径上把单通道 HTTP timeout 收到 9s（console 直调无 signal
-      // 仍是 15s）——慢通道只让自己失败，给这里的整体预算留 1s 结算与归因。
+      // slim 的单通道 HTTP timeout 默认 15s，那只留给完全绕过 Pusher 的直调（scripts/console.js 的
+      // 关注词监控直接调 sendNotify）；本路径不论有没有 signal 都用 params.channelTimeoutMs 显式收到
+      // 9s——慢通道只让自己失败，给整体预算留 1s 结算与归因。
       // 避免慢通道把整批推送拖到数分钟
       // v3.121：clearTimeout 清除超时定时器——Promise.race 完成后定时器仍挂着会导致
       // 进程退出延迟（事件循环被 keep-alive）+ 多次推送定时器堆积（资源泄漏）

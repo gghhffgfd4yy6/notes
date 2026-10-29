@@ -10265,6 +10265,15 @@ async function main () {
       '上游错误走错误提示，不得把上一份结果当成本次的')
     assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: null, loading: false, err: '加载失败' }), 'error',
       '加载失败必须走 LoadError（带重试按钮）')
+    // 关键回归（B2 返工 a1）：同一 q 的刷新/翻页失败时 loader 保留旧 data ⇒ live 仍是上一份 ok 结果。
+    // 旧实现只有 `if (err) return 'error'` 这一个错误出口，live 非空就把它整个跳过：失败无提示、
+    // 无重试，且 req.page 已前进而按钮重新启用 → 再点下一页从第 1 页跳到第 3 页。
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: b, prev: b, loading: false, err: '加载失败：网络请求失败' }), 'results',
+      '同 q 刷新失败仍画旧结果（不得整块卸载），但错误必须另有出口')
+    assert.strictEqual(pure.searchRefreshError({ live: b, err: '加载失败：网络请求失败' }), true,
+      '同 q 刷新失败必须给出错误提示 + 重试：err 不得被非空 live 静默吞掉（旧实现此处失败完全不可见）')
+    assert.strictEqual(pure.searchRefreshError({ live: b, err: '' }), false,
+      '没有错误时不得凭空多出一条错误提示')
     // 接线：q 守卫不能为了「保留上一份结果」被放宽；body 不得再有 undefined 分支。
     const panel = src.slice(src.indexOf('function SearchPanel'), src.indexOf('function LogsPanel'))
     assert.ok(panel.length > 1000, '应能定位 SearchPanel')
@@ -10275,8 +10284,15 @@ async function main () {
       '不得再无条件把结果区换成骨架（换词/翻页会整块卸载）')
     assert.ok(panel.includes('const lastShownRef = useRef(null)'),
       '必须另存一份「上次画出来的结果」用于占位（live 的归属语义不变）')
-    assert.ok(panel.includes('disabled=$' + '{stale || req.page <= 1 || loading}'),
-      '占位态必须禁用翻页：上一份结果的页码不得被当成本次页码提交')
+    assert.ok(panel.includes('const refreshErr = searchRefreshError({ live, err })'),
+      '失败提示必须由纯函数判定（searchRefreshError）：err 与非空 live 同时存在时不得静默')
+    const D = '$' // no-template-curly-in-string：含 `${` 的字符串要拼出来
+    assert.ok(panel.includes(D + '{refreshErr && html`<' + D + '{Hint} tone="error">' + D + '{err}'),
+      'results 分支顶部必须渲染 err（Hint tone="error"）：否则同 q 刷新失败无提示、无重试')
+    assert.ok(panel.includes('disabled=$' + '{stale || !!err || req.page <= 1 || loading}'),
+      '占位态/失败期间必须禁用翻页：上一份结果的页码不得被当成本次页码提交，失败后也不得继续翻页（否则从第 1 页跳到第 3 页）')
+    assert.ok(panel.includes('disabled=$' + '{stale || !!err || req.page >= pages || loading}'),
+      '下一页/末页同样要在失败期间禁用')
     assert.ok(panel.includes('class="ls-results"'), '结果区必须挂 .ls-results（min-height 占位）')
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(/\.ls-results\s*\{[^}]*min-height:\s*\d+px/.test(css),

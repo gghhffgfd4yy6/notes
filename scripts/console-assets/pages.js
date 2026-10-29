@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from 
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, searchBodyView, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -2328,6 +2328,10 @@ function SearchPanel ({ onSync, active = true }) {
   const lastShownRef = useRef(null)
   if (live && live.status === 'ok') lastShownRef.current = live
   const view = searchBodyView({ q: req.q, live, prev: lastShownRef.current, loading, err })
+  // C7-002（B2 返工 a1）：同 q 的刷新/翻页失败时 loader 保留旧 data ⇒ live 仍是上一份 ok 结果，
+  // 于是 view 仍是 'results'、`view === 'error'` 的 LoadError（含重试）永远走不到。失败必须另有
+  // 出口：在 results 上方补 err 提示 + 重试，否则翻页失败既无提示也无重试入口。
+  const refreshErr = searchRefreshError({ live, err })
   const stale = view === 'stale'
   const shown = view === 'results' ? live : (stale ? lastShownRef.current : null)
   const kw = shown && typeof shown.q === 'string' ? shown.q.trim().toLowerCase() : ''
@@ -2355,6 +2359,7 @@ function SearchPanel ({ onSync, active = true }) {
     body = html`<${Hint} tone="error">${live.error || '线报酷搜索暂不可用，稍后再试'}<//>`
   } else {
     body = html`<div class="ls-results">
+      ${refreshErr && html`<${Hint} tone="error">${err}${' '}<button type="button" class="ls-follow" onClick=${() => { load().catch(() => {}) }}>重试<//><//>`}
       ${stale && html`<div class="msg-count msg-loading">正在搜索「${req.q}」… 下面还是「${shown.q}」的结果</div>`}
       <div class="msg-count" aria-live="polite">本页 ${shown.count} 条 · 第 ${shown.page} / ${pages} 页${shown.pagesEstimated ? ' · 页数为估算' : ''}${shown.cached ? ' · 60s 内缓存' : ''}${!stale && !watched ? html` <button type="button" class="ls-follow" onClick=${addWatch}>关注「${req.q}」</button>` : ''}</div>
       ${items.length === 0
@@ -2376,11 +2381,11 @@ function SearchPanel ({ onSync, active = true }) {
           </div>`)}
         </div>`}
       <div class="pager">
-        <${Button} disabled=${stale || req.page <= 1 || loading} onClick=${() => submit(req.q, 1, req.since)}>« 首页<//>
-        <${Button} disabled=${stale || req.page <= 1 || loading} onClick=${() => submit(req.q, req.page - 1, req.since)}>上一页<//>
+        <${Button} disabled=${stale || !!err || req.page <= 1 || loading} onClick=${() => submit(req.q, 1, req.since)}>« 首页<//>
+        <${Button} disabled=${stale || !!err || req.page <= 1 || loading} onClick=${() => submit(req.q, req.page - 1, req.since)}>上一页<//>
         <span class="pager-info">第 ${shown.page} / ${pages} 页</span>
-        <${Button} disabled=${stale || req.page >= pages || loading} onClick=${() => submit(req.q, req.page + 1, req.since)}>下一页<//>
-        <${Button} disabled=${stale || req.page >= pages || loading} onClick=${() => submit(req.q, pages, req.since)}>末页 »<//>
+        <${Button} disabled=${stale || !!err || req.page >= pages || loading} onClick=${() => submit(req.q, req.page + 1, req.since)}>下一页<//>
+        <${Button} disabled=${stale || !!err || req.page >= pages || loading} onClick=${() => submit(req.q, pages, req.since)}>末页 »<//>
       </div>
     </div>`
   }
