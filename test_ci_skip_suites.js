@@ -12,6 +12,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
+const { resolveTool } = require('./scripts/check-ci-static')
 
 // 仓库根固定路径：本套件以仓库根为 cwd 运行（CI 的 npm run test:unit、copyProject 沙箱、stryker 沙箱
 // 都在仓库/沙箱根启动），故统一用字面量相对路径——不动态拼路径，静态分析也就没有误报空间。
@@ -2453,12 +2454,13 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   //     变异体全 Survived。旧判据（tests == 0）在这份输入上**放行**——下面第一条断言先把这一点钉死，
   //     否则这份夹具证明不了任何东西（夹具又退回自造 tests:0 时它会立刻红）。
   {
-    // S08：按名 spawn 会被 Sonar S4036 判「PATH 变量只应包含固定的不可写目录」。这里**不改写死绝对路径**：
-    // jq 的固定位置随宿主而异（Linux /usr/bin、macOS Homebrew /opt/homebrew/bin、Termux $PREFIX/bin），
-    // 写死任一处都会让本仓在另一些宿主上假红（探针判「没装 jq」而其实装了）。夹具侧只探测工具是否存在，
-    // 命令与参数全是字面量、不拼接任何外部输入；真正被执行的 workflow 正文由写死的 /bin/bash 拉起。
-    // 故按 brief 选择带理由的压制，而不是把宿主差异搬进门禁。
-    const jqProbe = spawnSync('jq', ['--version'], { encoding: 'utf8' }) // NOSONAR（S4036 测试夹具，不执行外部不可信命令：只按名探测本机是否装有 jq）
+    // S08（闸门 B 返工）：同一条 Sonar S4036 在本仓的既定口径是「纯 JS 扫 PATH → 绝对路径 spawn、
+    // 不挂 NOSONAR 压制」——见 scripts/check-ci-static.js 头注（PR #207）与 test_install_hooks.js
+    // 对 git 的同款解析。此处复用 resolveTool：既不按名 spawn（命令解析依赖 PATH），也不写死某个
+    // 宿主的固定路径（Linux /usr/bin、macOS /opt/homebrew/bin、Termux $PREFIX/bin 各不相同）。
+    const jq = resolveTool('jq')
+    assert.ok(jq, '未能在 PATH 中找到 jq（CI 的 ubuntu-latest 预装 jq）；jq 不可用时无从核对 workflow 判据，按失败计')
+    const jqProbe = spawnSync(jq, ['--version'], { encoding: 'utf8' })
     assert.strictEqual(jqProbe.status, 0,
       '本用例用 jq 执行 workflow 的真实判据（CI 的 ubuntu-latest 预装 jq）；jq 不可用时无从核对，按失败计')
     // 夹具构造：只允许「每文件 1 条 TestResult」这一种真实形态（刻意不提供 tests:0 的入口）
