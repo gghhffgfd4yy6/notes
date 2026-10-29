@@ -2292,6 +2292,93 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
 }
 console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
 
+// ── 矩阵 include 的行式解析：**单点实现**（C4-020）────────────────────────────
+// 3i 的「逐段 runner 档位」与 3j 的「逐段 timeout_ms」原先各有一份 34/35 行、逐行同构的拷贝
+// （归一化后 34 行里 24–28 行只差标识符/注释）。两份并存的实际风险：矩阵新增字段时要同时改两处，
+// 漏一处就出现「一段有一段的判据」——而这种半绿没有任何门禁能发现。现在两个调用者只提供字段映射
+// （YAML 键 → 条目字段名），解析口径只剩一份。语义与两份拷贝的并集保持一致（原口径，未放宽）：
+//   · 只认活动行：`#` 注释行不是证据，缩进不深于 include: 的同级键即视为 include 块结束；
+//   · `- ` 起新条目，其余条目字段逐行累积；fieldMap 之外的键一律忽略（各调用者只取自己那几个字段）；
+//   · 值剥成对引号、剥裸标量的行内 `#` 注释；
+//   · 未出现的字段保持 null（调用方据此区分「没声明」与「声明了空值」）。
+// 边界：这是**测试侧**独立实现，不得改调生产 readMatrixRunnerConfigs（那会让断言退化成同义反复）。
+const MATRIX_FIELDS_RUNNER = { name: 'name', config: 'config' }
+const MATRIX_FIELDS_TIMEOUT = { name: 'name', timeout_ms: 'timeoutMs' }
+function parseMatrixInclude (ymlText, fieldMap, label) {
+  const lines = ymlText.split('\n')
+  const includeAt = lines.findIndex(l => /^\s*include:\s*$/.test(l))
+  assert.ok(includeAt >= 0, `mutation.yml 的 matrix 必须有 include 块（${label}无从核对即视为回归）`)
+  const includeIndent = lines[includeAt].match(/^\s*/)[0].length
+  const entries = []
+  let cur = null
+  for (let i = includeAt + 1; i < lines.length; i++) {
+    const raw = lines[i]
+    if (raw.trim() === '') continue
+    const indent = raw.match(/^\s*/)[0].length
+    // include 块结束：回到 steps: 等同级键（缩进不深于 include:）
+    if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
+    if (raw.trim().startsWith('#')) continue // 注释不是证据
+    let body = raw.trim()
+    if (body.startsWith('-')) {
+      const rest = body.slice(1).trim()
+      if (rest === '' || rest.startsWith('#')) continue
+      cur = {}
+      for (const field of Object.values(fieldMap)) cur[field] = null
+      entries.push(cur)
+      body = rest
+    }
+    if (!cur) continue
+    const colon = body.indexOf(':')
+    if (colon <= 0) continue
+    const key = body.slice(0, colon).trim()
+    const field = fieldMap[key]
+    if (!field) continue
+    let value = body.slice(colon + 1).trim()
+    if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
+    const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
+    if (hash !== -1) value = value.slice(0, hash).trim()
+    cur[field] = value
+  }
+  return entries
+}
+const parseMatrixConfigs = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIELDS_RUNNER, '逐段 runner 档位')
+const parseMatrixTimeouts = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIELDS_TIMEOUT, '逐段 timeout ')
+// 单一实现的靶向锁：① 两个解析器都必须**委托**给同一实现（复制一份独立实现回来即红）；
+// ② 同一份夹具（双键同条 + 引号 + 行内注释 + 块末回到同级键）必须被两条路径按同一口径归一，
+//    且各自只取自己的字段——任一实现漂移（漏剥引号/漏剥注释/漏判块结束）都会被这里抓住。
+{
+  for (const [name, fn] of [['parseMatrixConfigs', parseMatrixConfigs], ['parseMatrixTimeouts', parseMatrixTimeouts]]) {
+    assert.ok(fn.toString().includes('parseMatrixInclude'),
+      `${name} 必须委托给单一实现 parseMatrixInclude：两份逐行同构的拷贝并存时，矩阵新增字段漏改一处就会出现` +
+      '「一段有一段的判据」，而这种半绿没有任何门禁能发现（C4-020）')
+  }
+  const fixture = [
+    'strategy:',
+    '  matrix:',
+    '    include:',
+    '      - name: a  # 行内注释',
+    '        config: "stryker.tap.config.js"',
+    '        timeout_ms: 60000',
+    '      - name: b',
+    "        config: 'stryker.config.js'",
+    '      - name: c',
+    '        timeout_ms: 300000 # 行内注释',
+    'steps:',
+    '      - name: 块结束后的同名键不得被收进来'
+  ].join('\n')
+  assert.deepStrictEqual(parseMatrixConfigs(fixture), [
+    { name: 'a', config: 'stryker.tap.config.js' },
+    { name: 'b', config: 'stryker.config.js' },
+    { name: 'c', config: null }
+  ], '档位解析：剥引号/剥行内注释/缺字段留 null/include 块结束即停 的口径漂移（与 timeout 解析共用同一实现）')
+  assert.deepStrictEqual(parseMatrixTimeouts(fixture), [
+    { name: 'a', timeoutMs: '60000' },
+    { name: 'b', timeoutMs: null },
+    { name: 'c', timeoutMs: '300000' }
+  ], 'timeout 解析：同一份夹具必须按同一口径归一（只取 name + timeout_ms，其余键忽略）')
+  console.log('✅ 矩阵解析单点实现 parseMatrixInclude：档位/超时两条路径同一口径（委托 + 夹具对照），无第二份拷贝')
+}
+
 // 3i PR-1（CI 切 TAP 档）接线契约：报告路径 + 矩阵逐段 runner 档位。
 // 为什么必须锁死（不是形式主义）：tap 配置把报告路径**显式**写成 stryker 默认值（stryker.tap.config.js 的
 // jsonReporter/htmlReporter），而「报告 = reports/mutation/mutation.json|.html」是**五处**的共同前提——
@@ -2378,43 +2465,9 @@ console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（
     }
   }
 
-  // (2)(3) 矩阵逐段 runner 档位：从**真实 YAML 行**解析（注释一律不算证据），
-  //     抽成函数是为了让紧随其后的两条反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本。
-  const parseMatrixConfigs = (ymlText) => {
-    const lines = ymlText.split('\n')
-    const includeAt = lines.findIndex(l => /^\s*include:\s*$/.test(l))
-    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 runner 档位无从核对即视为回归）')
-    const includeIndent = lines[includeAt].match(/^\s*/)[0].length
-    const entries = []
-    let cur = null
-    for (let i = includeAt + 1; i < lines.length; i++) {
-      const raw = lines[i]
-      if (raw.trim() === '') continue
-      const indent = raw.match(/^\s*/)[0].length
-      // include 块结束：回到 steps: 等同级键（缩进不深于 include:）
-      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
-      if (raw.trim().startsWith('#')) continue // 注释不是证据
-      let body = raw.trim()
-      if (body.startsWith('-')) {
-        const rest = body.slice(1).trim()
-        if (rest === '' || rest.startsWith('#')) continue
-        cur = { name: null, config: null }
-        entries.push(cur)
-        body = rest
-      }
-      if (!cur) continue
-      const colon = body.indexOf(':')
-      if (colon <= 0) continue
-      const key = body.slice(0, colon).trim()
-      if (key !== 'name' && key !== 'config') continue
-      let value = body.slice(colon + 1).trim()
-      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
-      const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
-      if (hash !== -1) value = value.slice(0, hash).trim()
-      cur[key] = value
-    }
-    return entries
-  }
+  // (2)(3) 矩阵逐段 runner 档位：从**真实 YAML 行**解析（注释一律不算证据）。解析器本体已收敛到
+  //     模块级的 parseMatrixInclude（单点实现，见上方 C4-020 段）；这里只保留字段映射，
+  //     紧随其后的两条反例仍在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本。
 
   const assertMatrixConfigs = (ymlText) => {
     const entries = parseMatrixConfigs(ymlText)
@@ -2527,41 +2580,8 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
 //   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 29 段再全量一次（或让日报失去
 //   「本段生效上限」的判据）。这里把三条接线一起锁死，并各配一条靶向反例（改回旧形态立刻红）。
 {
-  // 矩阵条目解析（与本文件 parseMatrixConfigs 同口径：只认活动行、剥注释/引号）
-  const parseMatrixTimeouts = (ymlText) => {
-    const ls = ymlText.split('\n')
-    const includeAt = ls.findIndex(l => /^\s*include:\s*$/.test(l))
-    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 timeout 无从核对即视为回归）')
-    const includeIndent = ls[includeAt].match(/^\s*/)[0].length
-    const entries = []
-    let cur = null
-    for (let j = includeAt + 1; j < ls.length; j++) {
-      const raw = ls[j]
-      if (raw.trim() === '') continue
-      const indent = raw.match(/^\s*/)[0].length
-      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
-      if (raw.trim().startsWith('#')) continue
-      let body = raw.trim()
-      if (body.startsWith('-')) {
-        const rest = body.slice(1).trim()
-        if (rest === '' || rest.startsWith('#')) continue
-        cur = { name: null, timeoutMs: null }
-        entries.push(cur)
-        body = rest
-      }
-      if (!cur) continue
-      const colon = body.indexOf(':')
-      if (colon <= 0) continue
-      const key = body.slice(0, colon).trim()
-      if (key !== 'name' && key !== 'timeout_ms') continue
-      let value = body.slice(colon + 1).trim()
-      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
-      const hash = value.indexOf('#')
-      if (hash !== -1) value = value.slice(0, hash).trim()
-      cur[key === 'name' ? 'name' : 'timeoutMs'] = value
-    }
-    return entries
-  }
+  // 矩阵条目解析：与档位解析共用模块级的 parseMatrixInclude（单点实现，C4-020），
+  // 这里只传 name + timeout_ms 的字段映射——原来的 34 行副本已删除。
 
   const CONSOLE_SEGS = ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5',
     'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11', 'console-part12']
