@@ -112,9 +112,17 @@ process.stdout.write = function (chunk, encoding, callback) {
   return process.stderr.write(chunk, encoding, callback)
 }
 
-// 2) 跳过判定：与 run_unit_tests.js 的 UNIT_SUITES 过滤严格同源
-function resolveSkipReason (file) {
-  if (!file) return null
+// 2) 跳过判定：与 run_unit_tests.js 的 UNIT_SUITES 过滤严格同源。
+//    返回 { skip, fatal } 两个**互斥**结果，语义不能混用：
+//      skip  = 「本文件不该在本入口运行」（与 command 档同源的正常语义）⇒ ok # SKIP + exit 0
+//      fatal = 适配层自身失效（读不到注册表）⇒ not ok + exit 1
+//    C10-038：旧实现把 fatal 也当 skip 返回，于是「读不到注册表」变成 `ok # SKIP` + exit 0，
+//    与这里的注释（fail-closed）正相反——tap-parser 会把那条记成**通过**，适配层失效在 TAP 档里
+//    与全绿无法区分。
+function resolveSkip (file) {
+  const SKIP = (reason) => ({ skip: reason, fatal: null })
+  const FATAL = (reason) => ({ skip: null, fatal: reason })
+  if (!file) return { skip: null, fatal: null }
   let suites
   try {
     // 沙箱里本文件位于 <sandbox>/scripts/tap-shim.js，注册表在 <sandbox>/test_suites.js。
@@ -123,39 +131,48 @@ function resolveSkipReason (file) {
     // （Codacy「dynamically import a module by calling require using a non-literal string」）。
     suites = require('../test_suites.js').SUITES
   } catch (err) {
-    // 读不到注册表就无法保证「跳过集合与 command 档一致」——fail-closed，不允许静默放行。
-    return `无法读取 test_suites.js（${err.message}）；跳过集合无法与 command 档对齐`
+    // 读不到注册表就无法保证「跳过集合与 command 档一致」——fail-closed：判红（not ok + 非 0 退出），
+    // 绝不静默放行成「跳过」。
+    return FATAL(`无法读取 test_suites.js（${err.message}）；跳过集合无法与 command 档对齐`)
   }
-  if (!Array.isArray(suites)) return 'test_suites.js 未导出 SUITES 数组（跳过集合无法与 command 档对齐）'
+  if (!Array.isArray(suites)) return FATAL('test_suites.js 未导出 SUITES 数组（跳过集合无法与 command 档对齐）')
   const suite = suites.find(s => s.file === file)
-  if (!suite) return '未注册进 test_suites.js（run_unit_tests.js 同口径：不在 SUITES 即不运行）'
+  if (!suite) return SKIP('未注册进 test_suites.js（run_unit_tests.js 同口径：不在 SUITES 即不运行）')
   const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
-  if (skipSuites.has(file)) return `SKIP_SUITES 显式跳过（SKIP_SUITES=${process.env.SKIP_SUITES}）`
-  if (suite.integration) return 'integration（run_unit_tests.js 同口径排除）'
-  if (suite.mutationSkip) return 'mutationSkip（Stryker 沙箱内不可运行：行数元校验误报）'
-  return null
+  if (skipSuites.has(file)) return SKIP(`SKIP_SUITES 显式跳过（SKIP_SUITES=${process.env.SKIP_SUITES}）`)
+  if (suite.integration) return SKIP('integration（run_unit_tests.js 同口径排除）')
+  if (suite.mutationSkip) return SKIP('mutationSkip（Stryker 沙箱内不可运行：行数元校验误报）')
+  return { skip: null, fatal: null }
 }
 
 // 三个 TAP 行必须**全部**投递成功才算这一个测试点被投递（部分投递 = 残缺 TAP 流，同样不可信）。
 function emitPoint (ok, note) {
+  // note 必须压成**单行**：它可能来自 err.message（带 "Require stack:" 与多行栈），直接拼进 TAP 点
+  // 会把一个测试点撕成多行、plan(1..1) 与 extra 行错位（C10-038 实测：旧实现在该沙箱里正是如此）。
+  const suffix = note === undefined || note === null ? '' : ` # ${String(note).replace(/\s+/g, ' ').trim()}`
   const delivered = [
     say('TAP version 13'),
-    say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${note ? ` # ${note}` : ''}`),
+    say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${suffix}`),
     say('1..1')
   ]
   return delivered.every(Boolean)
 }
 
-const skipReason = resolveSkipReason(testFileName)
+const decision = resolveSkip(testFileName)
 
 if (!testFileName) {
   // argv[1] 缺失，适配层没被 tap-runner 正确调用，必须响亮失败（否则静默变成「全绿」）。
   emitPoint(false, 'tap-shim 无法从 argv[1] 取到被测文件')
   process.exitCode = 1
-} else if (skipReason) {
+} else if (decision.fatal) {
+  // 适配层失效：not ok + 非 0 退出（tap-runner 记 RuntimeError ⇒ 响亮），且**不执行**被测文件——
+  // 跳过集合无法与 command 档对齐时照跑，等于让 TAP 档的测试集与 command 档悄悄分叉。
+  emitPoint(false, decision.fatal)
+  process.exit(1)
+} else if (decision.skip) {
   // 跳过点也必须真的投递出去：投递失败时不能用 process.exit(0) 把 say() 置的非零退出码盖掉
   // （C10-007：空 stdout + exit 0 会被 tap-parser 判 ok:true）。
-  const delivered = emitPoint(true, `SKIP ${skipReason}`)
+  const delivered = emitPoint(true, `SKIP ${decision.skip}`)
   process.exit(delivered ? 0 : 1)
 } else {
   process.on('exit', (code) => {

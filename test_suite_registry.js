@@ -254,7 +254,34 @@ assert.deepStrictEqual(staleExemptions, [],
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
-  console.log('✅ tap-shim 运行期契约：stdout 只留 TAP / 四类跳过判定（含正文不得执行）/ argv 缺失响亮失败')
+
+  // ④ C10-038：注册表读不到是**适配层自身失效**，不是「本文件该跳过」。
+  //    旧实现把它当成 skipReason ⇒ `ok 1 - … # SKIP` + exit 0，与注释声称的 fail-closed 相反：
+  //    tap-parser 会把这一条记成**通过**，于是「跳过集合无法与 command 档对齐」这件事在 TAP 档里
+  //    长得跟全绿一样（perTest 下零测试文件的段也不会有任何失败信号）。
+  //    正确语义：not ok + 非 0 退出（tap-runner 记 RuntimeError ⇒ 响亮），且不得执行被测文件。
+  //    附带契约：note 必须压成**单行** —— err.message 带 "Require stack:" 多行栈，直接拼进 TAP 点会把
+  //    一个测试点撕成多行，plan(1..1) 与 extra 行错位（旧实现在本用例的沙箱里就是这么坏的）。
+  const noRegDir = makeShimSandbox(false)
+  try {
+    const sentinel = path.join(noRegDir, 'body-ran')
+    const p = path.join(noRegDir, 'test_stub_plain.js')
+    fs.writeFileSync(p, bodyFor(sentinel))
+    const r = runShimIn(noRegDir, [p])
+    assert.strictEqual(r.status, 1, '注册表读不到必须非 0 退出（fail-closed：不能像「该跳过」那样 exit 0）')
+    const lines = r.stdout.split('\n')
+    assert.strictEqual(lines.length, 4, `TAP 点必须是单行 note（实际 stdout：${JSON.stringify(r.stdout)}）`)
+    assert.strictEqual(lines[0], 'TAP version 13', 'TAP 首行固定')
+    assert.ok(lines[1].startsWith('not ok 1 - test_stub_plain.js # 无法读取 test_suites.js'),
+      `注册表不可读必须投 not ok 点（实际：${lines[1]}）`)
+    assert.strictEqual(lines[2], '1..1', 'plan 行必须紧随测试点（note 含换行会把它挤到 extra 之后）')
+    assert.ok(!/^Require stack:/m.test(r.stdout), 'note 里的多行栈必须被压平在同一行，不得自己占一行（那会把 TAP 点撕开）')
+    assert.ok(r.stdout.includes('跳过集合无法与 command 档对齐'), '失败原因必须可读（点明跳过集合无法对齐）')
+    assert.strictEqual(fs.existsSync(sentinel), false, '适配层失效时不得执行被测文件（此时无法保证跳过集合与 command 档一致）')
+  } finally {
+    fs.rmSync(noRegDir, { recursive: true, force: true })
+  }
+  console.log('✅ tap-shim 运行期契约：stdout 只留 TAP / 四类跳过判定（含正文不得执行）/ argv 缺失响亮失败 / 注册表不可读 fail-closed')
 }
 
 console.log(`✅ 根目录 ${diskTestFiles.length} 个 test_*.js 与 SUITES ${registeredFiles.length} 条注册双向一致（白名单 ${REGISTRY_EXEMPTIONS.length} 个：${REGISTRY_EXEMPTIONS.join(', ')}）`)
