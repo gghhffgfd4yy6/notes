@@ -18,6 +18,12 @@ const ROOT = __dirname
 // 变异评估子进程是串行跑（XBK_MUTATION_CHILD=1），期间 test_network 一类会静默 ~45s，
 // 180s 留了 4× 余量；真挂死（死循环 / 等一个不会来的输入）本来就一直静默，照样被杀。
 const DEFAULT_IDLE_MS = 180000
+// 「整批跑多久算兜底超时」的默认线（C10-033）。两条定时器同时 arm、先到者 trip，所以总上限**必须
+// 严格大于**静默线：旧默认 90s < 180s 时静默线永远不会先到 ⇒ 静默语义在生产默认配置下从未生效，
+// 挂死只能等墙钟；而 90s 墙钟本身又会把慢机器上 170–205s 的正常运行（v3.282 的实测区间）误判成
+// 挂死——这正是静默线要解决的那类假红。现取 600s（与 test_run_mutation_cli.js 给 evaluate 的预算、
+// run_tests.js 的每套件默认上限同量级）：它只是「跑到天荒地老」的兜底，真正的挂死判据是静默线。
+const DEFAULT_TIMEOUT_MS = 600000
 const DEFAULT_FILES = [
   'xbk_function_v3.js', 'xbk_app.js', 'xbk_filter.js', 'xbk_formatter.js',
   'xbk_message_store.js', 'xbk_network.js', 'xbk_pusher.js', 'xbk_rules.js',
@@ -435,7 +441,7 @@ function runTests (dir, timeoutMs, idleMs) {
     // 于是 180s 的总上限会把「慢」误报成「挂死」（timeout 形态），CI 上同一套却只要 115–120s。
     // 静默线才是挂死的真实症状：子进程持续写 stdout/stderr 就说明它在推进，不该被杀。
     // 结算契约一字未改（D1）：两条线都只置 timedOut + killTree，最终结论仍由 close 的真实 code 决定；
-    // 总上限继续存在（生产 MUTATION_TIMEOUT=90s 不变），只是多了一条「静默够久也算挂死」。
+    // 总上限继续存在（默认 DEFAULT_TIMEOUT_MS=600s，见文件头 C10-033 的说明），只是多了一条「静默够久也算挂死」。
     const idleEff = Number.isInteger(idleMs) && idleMs > 0 ? idleMs : DEFAULT_IDLE_MS
     const trip = () => {
       if (settled || falloutTimer) return
@@ -635,10 +641,16 @@ async function main (deps) {
   const runEvaluation = (deps && deps.evaluate) || evaluate
   const batchSize = positiveIntEnv('MUTATION_BATCH', 50)
   const concurrency = positiveIntEnv('MUTATION_CONCURRENCY', Math.max(1, Math.min(os.cpus().length, 8)))
-  const timeoutMs = positiveIntEnv('MUTATION_TIMEOUT', 90000)
+  const timeoutMs = positiveIntEnv('MUTATION_TIMEOUT', DEFAULT_TIMEOUT_MS)
   // 静默线可独立调（v3.282）：总上限管「跑太久」，静默线管「不再前进」。慢机器只该抬总上限，
   // 静默线保持在最慢单套件静默时长之上即可——把它调得比总上限还大等于退回纯墙钟语义。
   const idleMs = positiveIntEnv('MUTATION_IDLE_MS', DEFAULT_IDLE_MS)
+  // 不变量（C10-033）：两条定时器同时 arm，idle >= total 时静默线永远后到、等于没配。默认值已满足
+  // （600s > 180s），但环境变量可以把它配死——这里响亮告警，不静默按死配置跑。
+  if (idleMs >= timeoutMs) {
+    console.warn(`⚠️  MUTATION_TIMEOUT=${timeoutMs}ms 不大于 MUTATION_IDLE_MS=${idleMs}ms：静默线永远不会先触发` +
+      `（挂死只能等总上限）。请把总上限调到静默线之上。`)
+  }
   const checkpointFile = process.env.MUTATION_CHECKPOINT || path.join(ROOT, 'mutation-progress.json')
   // D3：不再 existsSync 预过滤（会把缺失的 DEFAULT_FILES 静默剔除，使 copyProject 的必选校验不可达，
   // 且 collectMutants 会先抛出裸 ENOENT）。缺文件属工作区损坏，按 main() 既有风格响亮报错 + 退出码 1，
@@ -776,4 +788,4 @@ if (require.main === module) {
   }
   main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
 }
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, mutantFingerprint, judgingTestFiles }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_MS, mutantFingerprint, judgingTestFiles }

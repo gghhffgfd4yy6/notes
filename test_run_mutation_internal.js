@@ -10,7 +10,8 @@ const {
   lineTriple, numberBefore, numberAfter,
   mapLimit, saveCheckpoint, loadCheckpoint,
   copyProject, linkNodeModules, applyMutants,
-  generateMutants, positiveIntEnv
+  generateMutants, positiveIntEnv, main,
+  DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_MS
 } = require('./run_mutation')
 
 let pass = 0
@@ -122,6 +123,78 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       assert.strictEqual(positiveIntEnv('XBK_TEST_POSITIVE_INT', 50), 50, `${bad} 应回落默认值`)
     }
     delete process.env.XBK_TEST_POSITIVE_INT
+  })
+
+  // ===== 默认挂死判据：总上限必须大于静默线（C10-033）=====
+  // 两条定时器同时 arm、先到者 trip。默认 idle(180s) > 默认 total(90s) 时静默线永远后到 ⇒ 死配置：
+  // 生产默认跑法下「连续静默」这条语义从没生效过，挂死只能等墙钟总上限；而 90s 墙钟本身还会把
+  // 慢机器上 170–205s 的正常运行误判成挂死（v3.282 的语义只在调大 total 之后才成立）。
+  console.log('\n--- 默认总上限 vs 静默线（C10-033）---')
+  await check('默认 total 严格大于默认 idle（否则静默线永不触发）', () => {
+    assert.strictEqual(typeof DEFAULT_TIMEOUT_MS, 'number',
+      '必须导出默认总上限常量：默认值本身要能被断言锁住，不能只写在 main() 的调用参数里')
+    assert.strictEqual(typeof DEFAULT_IDLE_MS, 'number', '必须导出默认静默线常量（供不变量断言与文档对齐）')
+    assert.strictEqual(DEFAULT_IDLE_MS, 180000,
+      '静默线默认值不得为了让不变量成立而下调：180s = 最慢单套件静默 ~45s 的 4× 余量')
+    assert.ok(DEFAULT_TIMEOUT_MS > DEFAULT_IDLE_MS,
+      `默认总上限 ${DEFAULT_TIMEOUT_MS}ms 必须大于静默线 ${DEFAULT_IDLE_MS}ms，否则静默线永不先到`)
+    assert.ok(DEFAULT_TIMEOUT_MS >= 2 * DEFAULT_IDLE_MS,
+      '总上限至少要留两个静默窗口：否则一次慢批次（连续输出但很慢）会先撞总上限，静默线仍无意义')
+  })
+  await check('main() 未设环境变量时用上述默认值，且实际生效的 idle < total（行为断言）', async () => {
+    const savedTimeout = process.env.MUTATION_TIMEOUT
+    const savedIdle = process.env.MUTATION_IDLE_MS
+    let captured = null
+    try {
+      delete process.env.MUTATION_TIMEOUT
+      delete process.env.MUTATION_IDLE_MS
+      // 基线 evaluate 抛错即中止 main()：此时还没写断点、没进批次循环，只留下「实际生效的超时参数」。
+      await assert.rejects(
+        () => main({
+          allowLocal: true,
+          evaluate: async (mutants, files, timeoutMs, idleMs) => {
+            captured = { mutants: mutants.length, timeoutMs, idleMs }
+            throw new Error('probe-stop')
+          }
+        }),
+        /probe-stop/,
+        '基线 evaluate 的异常必须原样穿出 main()（否则捕获不到实际生效的超时参数）'
+      )
+    } finally {
+      if (savedTimeout === undefined) delete process.env.MUTATION_TIMEOUT
+      else process.env.MUTATION_TIMEOUT = savedTimeout
+      if (savedIdle === undefined) delete process.env.MUTATION_IDLE_MS
+      else process.env.MUTATION_IDLE_MS = savedIdle
+    }
+    assert.ok(captured, 'main() 必须先跑一次未套变异的基线，才能观测到实际生效的超时参数')
+    assert.strictEqual(captured.mutants, 0, '基线运行不应携带任何变异体')
+    assert.strictEqual(captured.timeoutMs, DEFAULT_TIMEOUT_MS, '默认总上限必须来自 DEFAULT_TIMEOUT_MS')
+    assert.strictEqual(captured.idleMs, DEFAULT_IDLE_MS, '默认静默线必须来自 DEFAULT_IDLE_MS')
+    assert.ok(captured.idleMs < captured.timeoutMs,
+      `实际生效的 idle(${captured.idleMs}ms) 必须小于 total(${captured.timeoutMs}ms)`)
+  })
+  await check('显式配成 idle >= total 时必须响亮告警（配置层不变量）', async () => {
+    const savedTimeout = process.env.MUTATION_TIMEOUT
+    const savedIdle = process.env.MUTATION_IDLE_MS
+    const warnings = []
+    const originalWarn = console.warn
+    console.warn = (...args) => { warnings.push(args.map(String).join(' ')) }
+    try {
+      process.env.MUTATION_TIMEOUT = '90000'
+      process.env.MUTATION_IDLE_MS = '180000'
+      await assert.rejects(
+        () => main({ allowLocal: true, evaluate: async () => { throw new Error('probe-stop') } }),
+        /probe-stop/
+      )
+    } finally {
+      console.warn = originalWarn
+      if (savedTimeout === undefined) delete process.env.MUTATION_TIMEOUT
+      else process.env.MUTATION_TIMEOUT = savedTimeout
+      if (savedIdle === undefined) delete process.env.MUTATION_IDLE_MS
+      else process.env.MUTATION_IDLE_MS = savedIdle
+    }
+    assert.ok(warnings.some(w => /静默线永远不会先触发/.test(w)),
+      'idle >= total 时静默线永远后到，必须在入口响亮告警（不得静默按死配置跑）：' + JSON.stringify(warnings))
   })
 
   // ===== mapLimit =====
