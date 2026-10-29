@@ -6058,6 +6058,41 @@ console.log('========================================\n');
     assertEqual(r, '纯文本 内容')
   })
 
+  // ==================== 84b. C4-009：转换类 includes 断言改精确串 ====================
+  // 审计：全文件 100+ 处 `assertEqual(r.includes(X), true)`。X 只要出现在输入里，函数「把输入原样
+  // 吐回」或只做 stripTags 也能过（实测：stripTags 输出「项目一项目二」同样过 :1928/:1929 的断言）。
+  // 转换类用例的正确判据是**精确串**：下表每行期望值都带输入里不存在的 markdown 记号，
+  // identity / stripTags 实现逐行必红，includes 只保留给「危险内容不得出现」的否定断言。
+  await test('C4-009: htmlToMarkdown 转换类精确串（identity/stripTags 实现必红）', () => {
+    const cases = [
+      ['<a href="http://url">链接</a>', 'http://x', '[链接](http://url)\n\n原文链接：[http://x](http://x)'],
+      ['<img src="http://pic.jpg">', 'http://x', '![](http://pic.jpg)\n\n原文链接：[http://x](http://x)'],
+      ['<img src="p.jpg" alt="图">正文', '', '![图](p.jpg)\n\n正文'],
+      ['<h2>二级标题</h2>', '', '## 二级标题'],
+      ['<p>段落一</p><p>段落二</p>', '', '段落一\n\n段落二'],
+      ['<ul><li>苹果</li><li>香蕉</li></ul>', '', '- 苹果\n\n- 香蕉'],
+      ['<ol><li>第一步</li><li>第二步</li></ol>', '', '- 第一步\n\n- 第二步'],
+      ['<b>加粗</b>和<strong>重点</strong>与<i>斜体</i>', '', '**加粗**和**重点**与*斜体*'],
+      ['<div>商品一</div><div>商品二</div>', '', '商品一\n\n商品二'],
+      ['<table><tr><td>甲</td><td>乙</td></tr></table>', '', '| 甲 | 乙'],
+      ['<table><tr><th>名称</th><th>价格</th></tr></table>', '', '| 名称 | 价格'],
+      ['a&amp;b&lt;c&gt;d', '', 'a&b<c>d'],
+      ['<script>alert(1)</script>正文', '', '正文'],
+      ['<h2>标题</h2><p>段</p>', 'http://x/1.html', '## 标题\n\n段\n\n原文链接：[http://x/1.html](http://x/1.html)'],
+      ['纯文本', '', '纯文本'],
+      ['<div><p>段落<b>加粗</b></p></div>', 'http://x', '段落**加粗**\n\n原文链接：[http://x](http://x)'],
+      ['<a href="https://x">内<b>层</b></a>尾', '', '[内**层**](https://x)尾'],
+      ['<br>', '', ''],
+      ['行1<br><br><br>行2', '', '行1\n\n行2']
+    ]
+    for (const [html, url, expected] of cases) {
+      const out = htmlToMarkdown({ content_html: html, url })
+      assertEqual(out, expected, `精确输出不符（includes 判据下 identity 实现也能过）：${html}`)
+      // 输入含真实标签 ⇒ 输出必须与输入不同（identity 实现的机器判据）
+      if (html.includes('<')) assertEqual(out === html, false, `输出等于输入原样，标签未被转换：${html}`)
+    }
+  })
+
   await test('快照: tuisong_replace 标题+日期时间', () => {
     // v3.115：{日期} UTC 解析稳定（2026-07-29）；{时间} 本地时区——断言格式而非具体值
     const r = tuisong_replace('【{分类名}】{标题}\n{日期} {时间}', { title: '测试标题', category_name: '分类', posttime: 1785346200, url: '/a.html' })
