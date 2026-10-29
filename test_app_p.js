@@ -113,12 +113,104 @@ function cleanupArtifacts () {
   }
 }
 
-// 被 Ctrl-C / 外部 kill 时同样收尾（SIGKILL 抓不到，不属本机制的覆盖范围）
+// ---------- 收尾的正确顺序（C5-081）----------
+// `child.kill()` 只**投递**信号，不保证子进程已经停手。旧收尾是「kill() → 立刻递归删目录 → process.exit()」：
+// 子进程此刻可能还在跑（收尾写 XBK_TEST_APP_REPORT、刷缓存/run.log），父进程把目录删掉就退出，子进程随后
+// 落盘即**没有人会清**的残留。三种产物又都被 .gitignore 覆盖（目录 `xianbaoku_cache*`、名单 `.tmp_parallel_*.json`）
+// ⇒ git status 一片干净，这种残留既不会自己暴露，也没有门禁扫它（实测滞流过 2 个名单文件）。
+// 收尾改成有序四步：① 投递 SIGTERM；② 等子进程**真的退出**（有界，超时升级 SIGKILL）；
+// ③ 再删产物；④ 扫本次 RUN_ID 命名空间，扫到残留就判失败——残留从此是「看得见的失败」，不是运气。
+const REAP_TIMEOUT_MS = (() => {
+  const v = Number.parseInt(process.env.XBK_REAP_TIMEOUT_MS || '5000', 10)
+  return Number.isInteger(v) && v > 0 ? v : 5000
+})()
+
+// 等一个子进程退出：已退出立即 true；超时 false（调用方据此升级 SIGKILL）。
+function waitChildExit (child, ms) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (ok) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      resolve(ok)
+    }
+    const onExit = () => finish(true)
+    const timer = setTimeout(() => finish(false), ms)
+    child.once('exit', onExit)
+  })
+}
+
+// 依次（而非同时）等：一个卡住的 worker 不该把其它 worker 的回收预算吃光。
+async function reapChildren (budgetMs) {
+  const children = [...activeChildren]
+  for (const child of children) { try { child.kill('SIGTERM') } catch (e) {} }
+  const stragglers = []
+  const deadline = Date.now() + budgetMs
+  for (const child of children) {
+    const left = deadline - Date.now()
+    if (left <= 0 || !(await waitChildExit(child, left))) stragglers.push(child)
+  }
+  if (stragglers.length > 0) {
+    console.error(`⚠️ ${stragglers.length} 个 worker 未在 ${budgetMs}ms 内退出，升级 SIGKILL 后继续收尾`)
+    for (const child of stragglers) { try { child.kill('SIGKILL') } catch (e) {} }
+    for (const child of stragglers) await waitChildExit(child, 2000)
+  }
+  activeChildren.clear()
+  return stragglers.length
+}
+
+// 本次运行的残留扫描：只看自己的 RUN_ID 命名空间（并发调度器的 RUN_ID 不同，互不误伤）。
+// 前缀 `.tmp_parallel_${RUN_ID}` 覆盖名单+报告，`xianbaoku_cache_p${RUN_ID}` 覆盖缓存分片。
+function scanResidualArtifacts () {
+  let names
+  try {
+    names = fs.readdirSync(__dirname)
+  } catch (e) {
+    return { scanned: false, paths: [] } // 读不到仓库根：判不了，不能当成「干净」
+  }
+  const listPrefix = `.tmp_parallel_${RUN_ID}`
+  const cachePrefix = `xianbaoku_cache_p${RUN_ID}`
+  return {
+    scanned: true,
+    paths: names
+      .filter((n) => n.startsWith(listPrefix) || n.startsWith(cachePrefix))
+      .map((n) => path.join(__dirname, n))
+  }
+}
+
+// 返回 true = 有残留（调用方据此把退出码判成失败）。
+function reportResidualArtifacts (phase) {
+  const r = scanResidualArtifacts()
+  if (!r.scanned) {
+    console.error(`⚠️ ${phase}：无法扫描仓库根，残留判定不可用（RUN_ID=${RUN_ID}）`)
+    return false
+  }
+  if (r.paths.length > 0) {
+    console.error(`❌ ${phase}：本次运行（RUN_ID=${RUN_ID}）残留 ${r.paths.length} 个分片产物——被 .gitignore 盖住，git status 看不见：`)
+    for (const p of r.paths) console.error(`   - ${path.basename(p)}`)
+    console.error('   清理：rm -rf ' + r.paths.map((p) => `'${p}'`).join(' '))
+    return true
+  }
+  return false
+}
+
+// 被 Ctrl-C / 外部 kill 时同样收尾（SIGKILL 抓不到，不属本机制的覆盖范围）。
+// 顺序：先等子进程回收，再删产物、再扫残留（理由见上）。
+let shuttingDown = false
+async function shutdownFromSignal (sig) {
+  await reapChildren(REAP_TIMEOUT_MS)
+  cleanupArtifacts()
+  const residual = reportResidualArtifacts(`${sig} 收尾`)
+  process.exit(residual ? 1 : (sig === 'SIGINT' ? 130 : 143))
+}
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.once(sig, () => {
-    for (const child of activeChildren) { try { child.kill() } catch (e) {} }
-    cleanupArtifacts()
-    process.exit(sig === 'SIGINT' ? 130 : 143)
+    if (shuttingDown) return // 二次信号不重入收尾（可能仍在等子进程退出）
+    shuttingDown = true
+    shutdownFromSignal(sig).catch(() => process.exit(1))
   })
 }
 
@@ -129,7 +221,11 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
 // 该片串行完整重跑一次（无 QUICK）——偶发失败应转绿，真实失败仍红可定位
 (async () => {
   const codes = await Promise.all(chunks.map((chunk, idx) => runChunk(chunk, idx, true)))
+  // C5-081：信号收尾已接管时，这里不许再重跑/汇总/exit(0)——否则 Ctrl-C 之后仍会打印
+  // 「全部通过 ✅」并以 0 退出，把收尾（等子进程回收 + 扫残留）盖掉。
+  if (shuttingDown) return
   for (let i = 0; i < chunks.length; i++) {
+    if (shuttingDown) return
     if (codes[i] !== 0) {
       console.log(`\n⚠️ worker#${i} 首轮失败，串行重跑完整验证（flaky 容错）...`)
       codes[i] = await runChunk(chunks[i], i, false)
@@ -137,6 +233,9 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
   }
 
   cleanupArtifacts()
+  // C5-081：删完立刻回扫——清理没成功（目录被占用/权限/子进程又落了盘）必须当场判失败，
+  // 而不是留到下次有人手工数文件才发现。
+  const residualArtifacts = reportResidualArtifacts('正常收尾')
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   const failedWorkers = codes.map((c, i) => ({ c, i })).filter(w => w.c !== 0)
   // 计数对账（C5-004）：只看退出码挡不住「名单里的名字一个都没命中」——那时每个 worker
@@ -156,7 +255,7 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
   if (!reconProblem && sumExecuted !== names.length) reconProblem = `Σexecuted=${sumExecuted} ≠ 名单总数 ${names.length}`
   console.log('\n════════ 并行汇总 ════════')
   console.log(`  测试: ${names.length} 个 | 并发: ${CONCURRENCY} | 耗时: ${secs}s | 实际执行: ${sumExecuted} 例`)
-  if (failedWorkers.length === 0 && !reconProblem) {
+  if (failedWorkers.length === 0 && !reconProblem && !residualArtifacts) {
     console.log('  结果: 全部通过 ✅')
     process.exit(0)
   } else {
@@ -164,12 +263,17 @@ console.log(`🧪 test_app 并行调度：${names.length} 个测试 → ${chunks
     if (reconProblem) {
       console.log(`  ✗ 执行计数对账失败（本次结果不可信）：${reconProblem}`)
     }
+    if (residualArtifacts) {
+      console.log('  ✗ 收尾残留：清单见上方 stderr（残留物被 .gitignore 盖住，git status 看不出来）')
+    }
     console.log('  定位: node test_app.js --only=<测试名子串> 串行重跑（等号/空格两种写法均生效）')
     process.exit(1)
   }
-})().catch(e => {
+})().catch(async (e) => {
   console.error(e)
-  for (const child of activeChildren) { try { child.kill() } catch (err) {} }
+  // C5-081：异常退出同样先回收子进程，再删产物、再扫残留（顺序理由见 reapChildren 上方）。
+  await reapChildren(REAP_TIMEOUT_MS)
   cleanupArtifacts()
+  reportResidualArtifacts('异常收尾')
   process.exitCode = 1
 })
