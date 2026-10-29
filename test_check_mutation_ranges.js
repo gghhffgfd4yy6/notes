@@ -584,7 +584,7 @@ function run (ymlText) {
         assert.ok(chain.includes(file),
           `运行链必须包含 ${file}，实际 ${JSON.stringify(chain)}`)
       }
-      assert.deepStrictEqual([...chain].sort(), [...expect].sort(),
+      assert.deepStrictEqual([...chain].sort((a, b) => a.localeCompare(b)), [...expect].sort((a, b) => a.localeCompare(b)),
         `运行链不得多解析出仓库里不存在的候选，实际 ${JSON.stringify(chain)}`)
       assert.ok(!chain.some(f => f.includes('index.jsindex.js') || /libindex\.js$/.test(f)),
         `不得把目录 require 拼成 <dir>index.js 这种畸形候选，实际 ${JSON.stringify(chain)}`)
