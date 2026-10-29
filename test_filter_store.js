@@ -756,7 +756,11 @@ if (process.env.XBK_FILTER_STORE_ASYNC_PROBE !== '1') {
       '异步用例之后的同步用例必须照跑（判红不得靠把进程打崩来吞掉后续用例）：' + both.slice(-600))
     assert.ok(!/ERR_UNHANDLED_REJECTION|UnhandledPromiseRejection/.test(both),
       'harness 必须自己接管这个 Promise（否则 unhandledRejection 会先打崩进程、掩盖真实结论）：' + both.slice(-600))
-    const summary = probe.stdout.match(/(\d+) 通过 \/ (\d+) 失败/)
+    // 汇总行形如 `=== 结果：50 通过 / 1 失败 ===`。数字收敛成 1..9 位并锚在「数字串起点」
+    // （`(?:^|\D)`）：无界 `\d+` 的回退步数随数字串长度增长（S5852），有界后每个起点最多 9 次；
+    // 加了起点锚，十位计数不会从第 2 位起被切出 9 位（那会静默读成小数字），而是整条不命中 ⇒
+    // 下一行 assert.ok(summary) 当场判红。两条口径断言（失败≥1 / 通过≥49）一字未动。
+    const summary = probe.stdout.match(/(?:^|\D)(\d{1,9}) 通过 \/ (\d{1,9}) 失败/)
     assert.ok(summary, '探针必须有汇总行：' + both.slice(-600))
     const [, passed, failed] = summary.map(Number)
     assert.ok(failed >= 1, `汇总必须记下这条失败（实得 ${failed}）`)
