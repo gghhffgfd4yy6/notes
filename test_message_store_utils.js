@@ -15,29 +15,40 @@ const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDEN
 const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
 isolateProcessCacheDirEnv()
 
-const mockUtils = {
-  anonKey: (s) => 'anon' + String(s).length,
-  safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
-  getMessageIdentity: () => ({ valid: false }),
-  isValidItem: () => true,
-  num: () => 10000,
-  addIndex: () => {}
+// 夹具装配只允许一处真相（C5-075）：父进程 store / 探针 store / 子进程 preamble 全部由下面两个工厂生成。
+// 子进程侧用 Function.prototype.toString() 把同一份源码注入 `node -e`——工厂签名或 Config 口径一变自动同步；
+// 旧实现把这段装配逐字抄进 CHILD_PREAMBLE，签名一变子进程就静默停在旧副本上（探针在测过期夹具，套件仍绿）。
+function buildMockUtils () {
+  return {
+    anonKey: (s) => 'anon' + String(s).length,
+    safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
+    getMessageIdentity: () => ({ valid: false }),
+    isValidItem: () => true,
+    num: () => 10000,
+    addIndex: () => {}
+  }
 }
 
-const store = createMessageStore({
-  Config: { cache: { maxSize: 10000 } },
-  Utils: mockUtils,
-  fs: {
-    existsSync: () => true,
-    lstatSync: () => ({ isDirectory: () => true }),
-    realpathSync: (p) => p
-  },
-  path,
-  crypto: { randomUUID: () => 'uuid' },
-  normalize: () => {},
-  storage: {},
-  constants: {}
-})
+const mockUtils = buildMockUtils()
+
+function buildFixtureStore ({ createMessageStore, path, storage, Utils }) {
+  return createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils,
+    fs: {
+      existsSync: () => true,
+      lstatSync: () => ({ isDirectory: () => true }),
+      realpathSync: (p) => p
+    },
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: storage || {},
+    constants: {}
+  })
+}
+
+const store = buildFixtureStore({ createMessageStore, path, Utils: mockUtils })
 
 let pass = 0
 let fail = 0
@@ -63,48 +74,20 @@ function tombstoneBytes (ts) {
 
 // 注入 writeAtomic 探针，用于证明「放弃持久化」时确实没有写盘。
 function createProbeStore (storage) {
-  return createMessageStore({
-    Config: { cache: { maxSize: 10000 } },
-    Utils: mockUtils,
-    fs: {
-      existsSync: () => true,
-      lstatSync: () => ({ isDirectory: () => true }),
-      realpathSync: (p) => p
-    },
-    path,
-    crypto: { randomUUID: () => 'uuid' },
-    normalize: () => {},
-    storage: storage || {},
-    constants: {}
-  })
+  return buildFixtureStore({ createMessageStore, path, storage, Utils: mockUtils })
 }
 
 // 死循环守卫的「有限时间」证明必须借子进程设界：同进程内的 setTimeout 无法中断同步
 // 自旋，只有 execFileSync 的 timeout 能杀掉挂死调用。子进程共用一段 store 装配前导，
 // 后接各自探针体；NODE_OPTIONS 的 execpath-shim 已把 process.execPath 指向真实 node，
-// 与 test_cli.js 同一手法。
+// 与 test_cli.js 同一手法。装配由父进程工厂源码生成（C5-075），不再手抄一份。
 const CHILD_PREAMBLE = `
 const path = require('node:path')
 const { createMessageStore } = require('./xbk_message_store')
-const mockUtils = {
-  anonKey: (s) => 'anon' + String(s).length,
-  safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
-  getMessageIdentity: () => ({ valid: false }),
-  isValidItem: () => true,
-  num: () => 10000,
-  addIndex: () => {}
-}
+const mockUtils = (${buildMockUtils.toString()})()
+const buildFixtureStore = ${buildFixtureStore.toString()}
 function makeStore (storage) {
-  return createMessageStore({
-    Config: { cache: { maxSize: 10000 } },
-    Utils: mockUtils,
-    fs: { existsSync: () => true, lstatSync: () => ({ isDirectory: () => true }), realpathSync: (p) => p },
-    path,
-    crypto: { randomUUID: () => 'uuid' },
-    normalize: () => {},
-    storage: storage || {},
-    constants: {}
-  })
+  return buildFixtureStore({ createMessageStore, path, storage, Utils: mockUtils })
 }
 `
 
@@ -338,6 +321,20 @@ check('_saveTombstones: 可达标时正常序列化并交给 writeAtomic（对�
   assert.strictEqual(writes.length, 1, '应恰好调用一次 writeAtomic')
   assert.ok(writes[0].p.endsWith('dsh_probe_ok.seen.json'), '写入目标应为 <filePath>.seen.json')
   assert.strictEqual(Buffer.byteLength(writes[0].text, 'utf8'), 53, '写入内容应为 53 字节空墓碑文本')
+})
+
+// ===== C5-075：子进程夹具必须与父进程同源 =====
+// 旧实现把父进程的 mockUtils + createMessageStore 装配逐字抄进 CHILD_PREAMBLE；工厂签名/Config 口径一变
+// 子进程侧就静默停在旧副本上，探针变成「在测一份过期的夹具」而套件仍绿。下面两条把同源关系钉死。
+check('CHILD_PREAMBLE: 不得内联一份 createMessageStore 装配（必须由父进程夹具工厂生成）', () => {
+  assert.ok(!/const mockUtils = \{/.test(CHILD_PREAMBLE), 'preamble 不得再手抄 mockUtils 字面量：工厂签名/Config 一变就静默漂移')
+  assert.ok(CHILD_PREAMBLE.includes(String(buildFixtureStore)) && CHILD_PREAMBLE.includes(String(buildMockUtils)),
+    'preamble 必须由 buildFixtureStore/buildMockUtils 源码生成（父进程/探针/子进程同源）')
+})
+
+check('CHILD_PREAMBLE: 子进程夹具与父进程夹具对拍（_resolveMaxSize 同值）', () => {
+  const child = runChildProbe('process.stdout.write(String(makeStore()._resolveMaxSize()))').trim()
+  assert.strictEqual(child, String(store._resolveMaxSize()), '子进程夹具必须与父进程同源（不得是抄过去的旧副本）')
 })
 
 // ===== QX-08：缓存目录解析由生产与青龙 --status 共用同一实现 =====
