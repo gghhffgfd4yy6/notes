@@ -55,12 +55,77 @@ function positiveIntEnv (name, fallback) {
 
 const DNS_PENDING_TIMEOUT_MS = positiveIntEnv('XBK_DNS_PENDING_TIMEOUT_MS', DNS_PENDING_TIMEOUT_DEFAULT_MS)
 
+// PR #362 评审（CodeRabbit Major · Stability & Availability）：deadline 只给**等待项**一个终点，不回收
+// 底层查询——`dns.lookup` 无法取消，等待项超时后那条 getaddrinfo 仍占着 libuv 线程池里的一个线程；
+// 同 key 每轮重试都会另起一条（实测：8 轮重试 = 8 条在飞），坏解析器下无界累积，可占满线程池并拖慢
+// 同池的文件操作。故对「已交给底层、回调还没到」的查询记账并设两道上限：
+//   · 同 key ≤ DNS_INFLIGHT_MAX_PER_KEY（当前 2）：正常慢解析（第一条在飞时超时、重试接班第二条）够用；
+//     第三条起立即失败，不再新建任务。
+//   · 全局 ≤ DNS_INFLIGHT_MAX（默认 32，XBK_DNS_MAX_INFLIGHT 可注入）：兜住多主机同时打洞的进程级占用。
+// 超限一律以 EAI_AGAIN 立即失败（与等待队列上限同码、可重试，且不静默丢回调）。
+// 为什么不走「超时后继续复用那条在飞查询」：仓内契约要求超时后重试必须重新发起解析
+// （test_dns_cache.js「超时摘除后重试必须重新发起底层 lookup」），且坏解析器若永不回调，复用等于让
+// 该 key 永久卡死。上限只压**并发在飞条数**，不改变「超时 ⇒ 本次失败、下次可重试」的语义。
+const DNS_INFLIGHT_MAX_DEFAULT = 32
+const DNS_INFLIGHT_MAX_PER_KEY = 2
+const DNS_INFLIGHT_MAX = positiveIntEnv('XBK_DNS_MAX_INFLIGHT', DNS_INFLIGHT_MAX_DEFAULT)
+const dnsInflight = new Map()
+let dnsInflightTotal = 0
+
 // 等待项失败用的错误：码必须落在 xbk_failure_policy 的可重试集合里（ETIMEDOUT / EAI_AGAIN 都是），
 // 否则一次本地排队失败会被判成 PERMANENT、连重试都不许。
 function dnsPendingError (code, message) {
   const err = new Error(message)
   err.code = code
   return err
+}
+
+// 在飞记账只覆盖真正交给解析器的调用；回调**第一件事**就释放（身份检查之前——线程已还回池子，
+// 与这条 lookup 的结果还要不要无关）。key 为 null 表示该调用不进缓存（选项未建模），只计全局数。
+function inflightLookupsFor (key) {
+  return dnsInflight.get(key) || 0
+}
+
+function beginInflightLookup (key) {
+  dnsInflightTotal += 1
+  if (key !== null) dnsInflight.set(key, inflightLookupsFor(key) + 1)
+}
+
+function endInflightLookup (key) {
+  dnsInflightTotal -= 1
+  if (key === null) return
+  const left = inflightLookupsFor(key) - 1
+  if (left > 0) dnsInflight.set(key, left)
+  else dnsInflight.delete(key)
+}
+
+// 发起一条底层查询并记账。同步抛错（非法参数等）时必须当场释放——否则这条永远收不到回调的记账
+// 会白占一个名额，攒满全局上限后整个进程的解析都会被判成超限。
+function startInflightLookup (key, hostname, opts, onDone) {
+  beginInflightLookup(key)
+  try {
+    dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
+      endInflightLookup(key)
+      onDone(error, address, family)
+    })
+  } catch (e) {
+    endInflightLookup(key)
+    throw e
+  }
+}
+
+// 超限错误：立即失败，绝不新建 getaddrinfo 任务。检查点放在「建等待项之前」——超限的调用方既不占
+// 等待队列，也不会留下一条永远等不到回调的记账。
+function inflightLimitError (key) {
+  if (dnsInflightTotal >= DNS_INFLIGHT_MAX) {
+    return dnsPendingError('EAI_AGAIN',
+      `DNS 在飞查询已达全局上限（在飞 ${dnsInflightTotal} 条 ≥ ${DNS_INFLIGHT_MAX}），本次调用按失败返回，可重试`)
+  }
+  if (key !== null && inflightLookupsFor(key) >= DNS_INFLIGHT_MAX_PER_KEY) {
+    return dnsPendingError('EAI_AGAIN',
+      `DNS 在飞查询已达同 key 上限（同 key 在飞 ${inflightLookupsFor(key)} 条 ≥ ${DNS_INFLIGHT_MAX_PER_KEY}），本次调用按失败返回，可重试`)
+  }
+  return null
 }
 
 function profileMs (value) {
@@ -206,7 +271,12 @@ function dnsLookup (hostname, options, callback) {
   // 这类调用方（目前只有测试/未来扩展）失去缓存收益，换来的是「拿到的地址一定按自己的选项
   // 筛选/排序过」，也不会污染同主机其它选项的缓存条目。
   if (key === null) {
-    dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => dispatchLookupResult(callback, wantAll, error, address, family))
+    const overLimit = inflightLimitError(null)
+    if (overLimit) {
+      queueMicrotask(() => dispatchLookupResult(callback, wantAll, overLimit))
+      return
+    }
+    startInflightLookup(null, hostname, opts, (error, address, family) => dispatchLookupResult(callback, wantAll, error, address, family))
     return
   }
   const now = Date.now()
@@ -232,10 +302,18 @@ function dnsLookup (hostname, options, callback) {
     armPendingTimer(key, pending)
     return
   }
+  // PR #362 评审：新建底层查询之前先过在飞上限——等待项超时只摘记账、不回收在飞查询，若不设上限，
+  // 坏解析器下同 key 每轮重试都再起一条 getaddrinfo，最终占满 libuv 线程池并拖慢同池文件操作。
+  // 与等待队列上限同口径：超限立即以 EAI_AGAIN 失败（可重试），回调一律异步派发。
+  const overLimit = inflightLimitError(key)
+  if (overLimit) {
+    queueMicrotask(() => dispatchLookupResult(callback, wantAll, overLimit))
+    return
+  }
   const record = { entries: [{ callback, all: wantAll, deadline: Date.now() + DNS_PENDING_TIMEOUT_MS }], timer: null }
   dnsPending.set(key, record)
   armPendingTimer(key, record)
-  dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
+  startInflightLookup(key, hostname, opts, (error, address, family) => {
     // v3.263（CodeAnt）：只派发并缓存本次记账列表——abort 摘除回调后若同一 key 已有新 lookup
     // 接管，旧 lookup 完成时不得清空/派发到新列表，也不得写缓存（接管等待期间新调用方会读到
     // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）。
@@ -403,4 +481,4 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   }
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS }
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY }

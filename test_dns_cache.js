@@ -3,6 +3,8 @@
 // C10-074：坏解析器场景要在测试里快速验证——把等待上限压到 150ms（生产默认 10s）。
 // 必须在 require('./xbk_agents') 之前设置（模块加载时读取）。
 process.env.XBK_DNS_PENDING_TIMEOUT_MS = '150'
+// PR #362：全局在飞 lookup 上限同口径压小（生产默认 32）——否则要造 32 个「堆死」的主机才能验证上限。
+process.env.XBK_DNS_MAX_INFLIGHT = '6'
 
 const assert = require('assert')
 const dns = require('dns')
@@ -16,7 +18,7 @@ dns.lookup = (hostname, options, callback) => {
 (async () => {
   try {
     delete require.cache[require.resolve('./xbk_agents')]
-    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS } = require('./xbk_agents')
+    const { prewarmDns, invalidateDns, dnsLookup, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY } = require('./xbk_agents')
     await prewarmDns('cache-probe.invalid')
     await prewarmDns('cache-probe.invalid')
     assert.strictEqual(calls, 1, 'TTL 内应命中 DNS 缓存')
@@ -137,6 +139,89 @@ dns.lookup = (hostname, options, callback) => {
     await prewarmDns('pending-cap.invalid')
     dns.lookup = (hostname, options, callback) => { calls += 1; callback(null, '192.0.2.1', 4) }
     console.log('✅ C10-074 dnsPending 有界：超限/超时都按失败回调并摘除，重试可重新解析，wantAll 形状不变')
+    // ── PR #362 评审（CodeRabbit Major · Stability & Availability）：超时后仍在飞的底层查询必须有界 ──────
+    // 复现（修复前）：deadline 只摘等待项，底层 dns.lookup 仍在飞；同 key 每轮重试都再起一条，坏解析器
+    // 永不回调时无界累积（实测 8 轮重试 = 8 条在飞 getaddrinfo，占满 libuv 线程池并拖慢同池文件操作）。
+    // 修复后同 key 最多 DNS_INFLIGHT_MAX_PER_KEY 条在飞，其后立即 EAI_AGAIN（可重试、不静默丢）。
+    const cycles = 20
+    const perCycle = 25
+    const multiStuck = []
+    dns.lookup = (hostname, options, callback) => { multiStuck.push(callback) } // 坏解析器：永不回调
+    const multiCodes = []
+    for (let c = 0; c < cycles; c++) {
+      const batch = []
+      for (let i = 0; i < perCycle; i++) {
+        batch.push(new Promise(resolve => dnsLookup('pending-inflight.invalid', { all: true }, (error) => {
+          multiCodes.push(error ? error.code : 'none')
+          resolve()
+        })))
+      }
+      // 等到本轮所有等待项都过 deadline（= 生产上 got 超时后的下一次重试），再打下一轮
+      await new Promise(resolve => setTimeout(resolve, DNS_PENDING_TIMEOUT_MS + 40))
+      await Promise.all(batch)
+    }
+    assert.ok(multiStuck.length < cycles,
+      `坏解析器下同 key 连重试 ${cycles} 轮不得每轮都另起一条底层 lookup（旧实现 = 每轮 1 条），实际 ${multiStuck.length}`)
+    assert.ok(Number.isInteger(DNS_INFLIGHT_MAX_PER_KEY) && DNS_INFLIGHT_MAX_PER_KEY >= 2 && DNS_INFLIGHT_MAX_PER_KEY <= 8,
+      `同 key 在飞上限必须是 ≥2 的有限小整数（取 1 会让超时后连一次接班解析都发不出去），实际 ${DNS_INFLIGHT_MAX_PER_KEY}`)
+    assert.strictEqual(multiStuck.length, DNS_INFLIGHT_MAX_PER_KEY,
+      `同 key 在飞的底层 lookup 必须收敛到上限 ${DNS_INFLIGHT_MAX_PER_KEY} 条，实际 ${multiStuck.length}`)
+    assert.strictEqual(multiCodes.length, cycles * perCycle, `${cycles * perCycle} 个调用方都必须收到回调（一个都不能少）`)
+    const multiTimeouts = multiCodes.filter(code => code === 'ETIMEDOUT').length
+    const multiRefused = multiCodes.filter(code => code === 'EAI_AGAIN').length
+    assert.strictEqual(multiTimeouts, DNS_INFLIGHT_MAX_PER_KEY * perCycle,
+      `上限内那 ${DNS_INFLIGHT_MAX_PER_KEY} 轮仍按 deadline 超时（ETIMEDOUT）：期望 ${DNS_INFLIGHT_MAX_PER_KEY * perCycle}，实际 ${multiTimeouts}`)
+    assert.strictEqual(multiRefused, (cycles - DNS_INFLIGHT_MAX_PER_KEY) * perCycle,
+      `超限轮次必须立即以 EAI_AGAIN 失败（不静默丢、也不新建底层查询）：期望 ${(cycles - DNS_INFLIGHT_MAX_PER_KEY) * perCycle}，实际 ${multiRefused}`)
+    console.log(`✅ PR #362 在飞 dns.lookup 有界：同 key 连重试 ${cycles} 轮共 ${cycles * perCycle} 次调用，只发起 ${multiStuck.length} 条底层 lookup，回调一个不少`)
+    // 坏解析器恢复：在飞记账随底层回调释放，同 key 能重新解析，结果照常写回缓存
+    for (const cb of multiStuck) cb(null, '192.0.2.1', 4) // 释放挂起的在飞回调（记账随之清零）
+    let afterRecoverCalls = 0
+    dns.lookup = (hostname, options, callback) => {
+      afterRecoverCalls += 1
+      callback(null, [{ address: '192.0.2.9', family: 4 }], 4)
+    }
+    const afterRecover = await new Promise(resolve => dnsLookup('pending-inflight.invalid', { all: true }, (error, address) => resolve({ error, address })))
+    assert.strictEqual(afterRecover.error, null, '在飞上限解除后同 key 必须能重新解析（不得永久卡死）')
+    await new Promise(resolve => dnsLookup('pending-inflight.invalid', { all: true }, (error) => resolve(error)))
+    assert.strictEqual(afterRecoverCalls, 1, '恢复后的解析结果应写回缓存并被下一次请求命中')
+    console.log('✅ PR #362 恢复路径：在飞回调释放后同 key 可重解析，结果写回缓存')
+    // ── 全局在飞上限（XBK_DNS_MAX_INFLIGHT = 文件头注入值）：超限立即 EAI_AGAIN，绝不新建 getaddrinfo ──
+    assert.ok(Number.isInteger(DNS_INFLIGHT_MAX) && DNS_INFLIGHT_MAX === 6,
+      `环境变量应把全局在飞上限压到 6（测试注入生效的前提），实际 ${DNS_INFLIGHT_MAX}`)
+    for (const cb of stuck) cb(null, '192.0.2.1', 4) // 释放前面遗留的挂起回调，把进程内在飞记账清零
+    const globalStuck = []
+    dns.lookup = (hostname, options, callback) => { globalStuck.push(callback) }
+    const heldCodes = []
+    const held = []
+    for (let i = 0; i < DNS_INFLIGHT_MAX; i++) {
+      held.push(new Promise(resolve => dnsLookup(`inflight-global-${i}.invalid`, { all: true }, (error) => {
+        heldCodes.push(error ? error.code : 'none')
+        resolve()
+      })))
+    }
+    const blockedCode = await new Promise(resolve => dnsLookup('inflight-global-over.invalid', { all: true }, (error) => resolve(error ? error.code : 'none')))
+    assert.strictEqual(globalStuck.length, DNS_INFLIGHT_MAX,
+      `上限内的 ${DNS_INFLIGHT_MAX} 个不同 key 都应真正发起底层 lookup，实际 ${globalStuck.length}`)
+    assert.strictEqual(blockedCode, 'EAI_AGAIN', '超出全局在飞上限必须立即以 EAI_AGAIN 失败（可重试），且不新建底层 lookup')
+    await new Promise(resolve => setTimeout(resolve, DNS_PENDING_TIMEOUT_MS + 40))
+    await Promise.all(held)
+    assert.ok(heldCodes.every(code => code === 'ETIMEDOUT'),
+      `上限内的等待项仍按 deadline 收场为 ETIMEDOUT（错误码不得被上限逻辑改写），实际 ${heldCodes.join(',')}`)
+    for (const cb of globalStuck) cb(null, '192.0.2.1', 4) // 释放，清零在飞记账
+    dns.lookup = (hostname, options, callback) => { calls += 1; callback(null, '192.0.2.1', 4) }
+    console.log(`✅ PR #362 全局在飞上限：${DNS_INFLIGHT_MAX} 条在飞后新调用立即 EAI_AGAIN，未新建底层 lookup`)
+    // 同步抛错（非法参数等极端路径）不得泄漏在飞名额：否则 2×上限次抛错就把整个进程的解析钉死
+    dns.lookup = () => { throw new Error('sync-boom') }
+    let thrownSync = 0
+    for (let i = 0; i < DNS_INFLIGHT_MAX * 2; i++) {
+      try { dnsLookup(`inflight-throw-${i}.invalid`, { all: true }, () => {}) } catch (e) { thrownSync += 1 }
+    }
+    assert.strictEqual(thrownSync, DNS_INFLIGHT_MAX * 2, '底层同步抛错必须原样上抛（不得被吞掉或改写成回调）')
+    dns.lookup = (hostname, options, callback) => { callback(null, [{ address: '192.0.2.33', family: 4 }], 4) }
+    const afterThrow = await new Promise(resolve => dnsLookup('inflight-throw-ok.invalid', { all: true }, (error) => resolve(error ? error.code : 'none')))
+    assert.strictEqual(afterThrow, 'none', `同步抛错不得泄漏在飞名额（${DNS_INFLIGHT_MAX * 2} 次抛错后仍须能正常解析）`)
+    console.log(`✅ PR #362 同步抛错不泄漏在飞名额：${thrownSync} 次抛错后仍能正常解析`)
   } finally {
     dns.lookup = originalLookup
   }
