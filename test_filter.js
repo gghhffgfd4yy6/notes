@@ -6640,21 +6640,30 @@ console.log('========================================\n');
     }
   })
 
-  await test('故障注入: fs.readdirSync 抛错 → 测试清理不崩溃', () => {
+  await test('故障注入: cleanupTestCache 真实清理 test_ 残留，readdirSync 抛错不崩溃', () => {
     const fs = require('fs')
+    // C4-005：原用例把清理逻辑手抄了 7 行、最后 assertEqual(true, true)，生产 cleanupTestCache
+    // 从未被任何断言观察（只在 :319 起跑前 / 收尾各调一次）。改为直调生产函数：
+    // ① 正例——真删 test_ 前缀残留，且不碰同目录的非 test_ 文件（真实 push.json 就在同目录）；
+    const probe = getFilePath('test_c4005_probe.json')
+    const keep = path.join(CACHE, 'c4005_keep.json')
+    try { fs.unlinkSync(probe) } catch (e) {}
+    try { fs.unlinkSync(keep) } catch (e) {}
+    fs.writeFileSync(probe, '[]')
+    fs.writeFileSync(keep, '[]')
+    assertEqual(fs.existsSync(probe), true, '前置：test_ 探针文件应已创建')
+    cleanupTestCache()
+    assertEqual(fs.existsSync(probe), false, 'cleanupTestCache 必须删除 test_ 前缀残留')
+    assertEqual(fs.existsSync(keep), true, 'cleanupTestCache 不得删除非 test_ 文件（真实 push.json 同目录）')
+    // ② 故障注入——readdirSync 对所有路径抛错时，生产函数必须自行吞掉（外层 try-catch），
+    //    不得把异常抛给调用方（起跑前/收尾各调一次，抛错会把全绿判成红）
     const orig = fs.readdirSync
     fs.readdirSync = () => { throw new Error('readdir失败') }
     try {
-      // 模拟测试结尾清理逻辑（readdirSync 抛 → catch 吞）
-      try {
-        const dir = CACHE // 与 cleanupTestCache 同口径（本进程私有分片，不再碰共享目录）
-        if (fs.existsSync(dir)) {
-          fs.readdirSync(dir).forEach(() => { /* 清理 */ })
-        }
-      } catch (e) { /* 预期吞掉 */ }
-      assertEqual(true, true, 'readdir 失败应被容错')
+      assert.doesNotThrow(() => cleanupTestCache(), 'readdirSync 抛错时 cleanupTestCache 不得抛出')
     } finally {
       fs.readdirSync = orig
+      try { fs.unlinkSync(keep) } catch (e) {}
     }
   })
 
