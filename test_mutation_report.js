@@ -99,6 +99,12 @@ const EMPTY_CASE = [
   }
 ]
 
+// console 段清单**从生产常量推导**（C5-042）：旧写法把段数写死成 9（测试名、注释、循环三处），矩阵扩到
+// 12 段后三处一起过期；而 `map.size === EXPECTED_SEGMENTS.length` 抓不住这种漏——`parseMatrixTimeouts`
+// 对缺 `timeout_ms` 的段会回落缺省 300000，段数照样对得上（实测：摘掉 console-part10..12 的 timeout_ms，
+// 旧套件仍 114/114 全绿）。段名与顺序一律沿 EXPECTED_SEGMENTS，不另立第二份清单。
+const CONSOLE_SEGMENTS = EXPECTED_SEGMENTS.filter((seg) => /^console-part\d+$/.test(seg))
+
 let pass = 0
 let fail = 0
 /**
@@ -2069,17 +2075,24 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
   })
 
   // ===== 本段生效 timeoutMS + Timeout 两类（console 段 60s）====================================
-  // 背景：console 9 段在 mutation.yml 矩阵里带 `timeout_ms: 60000`，由「变异测试」step 经 CLI
+  // 背景：console 段（当前 12 段，段数由 EXPECTED_SEGMENTS 推导）在 mutation.yml 矩阵里带
+  // `timeout_ms: 60000`，由「变异测试」step 经 CLI
   // `--timeoutMS` 覆盖配置（缓存 key 不含该值 ⇒ 不需要一次性全量重跑）。日报必须同时展示：
   //   ① 该段**生效**的等待上限（缺省 300000）；② Timeout 的成因两类（真挂死 / 上限触发）——
   //   后者来自段 job 守卫在剥离 statusReason 之前落盘的 timeout-stats.json。
   // 判据不变：分数仍是 (killed+timeout)/total（Timeout 计入 detected）⇒ 下列用例锁死「只加可见性、不改数值」。
-  check('parseMatrixTimeouts：真实矩阵 ⇒ console 9 段 60000、其余缺省 300000（不新增第二份硬编码清单）', () => {
+  check(`parseMatrixTimeouts：真实矩阵 ⇒ console ${CONSOLE_SEGMENTS.length} 段 60000、其余缺省 300000（不新增第二份硬编码清单）`, () => {
     const text = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
     const map = parseMatrixTimeouts(text)
-    for (let i = 1; i <= 9; i++) {
-      assert.strictEqual(map.get(`console-part${i}`), 60000, `console-part${i} 必须显式 60000（否则又等满 300s 偏移）`)
+    assert.ok(CONSOLE_SEGMENTS.length > 0, 'console 段必须能从 EXPECTED_SEGMENTS 推导出来（否则下面的循环恒真）')
+    for (const seg of CONSOLE_SEGMENTS) {
+      assert.strictEqual(map.get(seg), 60000, `${seg} 必须显式 60000（否则又等满 300s 偏移）`)
     }
+    // 反向对账：矩阵里的 console 段必须与常量里的 console 段一一对应——段数不写死，但「矩阵少一段」
+    // 与「常量少一段」都得红（只靠上面的正向循环，漏掉的段永远不会被点名）。
+    assert.deepStrictEqual([...map.keys()].filter((seg) => /^console-part\d+$/.test(seg)).sort(),
+      [...CONSOLE_SEGMENTS].sort(),
+      '矩阵里的 console 段必须与 EXPECTED_SEGMENTS 的 console 段一一对应（段数由常量推导，不写死数字）')
     assert.strictEqual(map.get('v3-entry'), DEFAULT_SEGMENT_TIMEOUT_MS,
       '未声明 timeout_ms 的段必须回落 300000（与 GitHub 表达式 matrix.timeout_ms || 300000 同口径）')
     assert.strictEqual(map.get('sendnotify-part2'), DEFAULT_SEGMENT_TIMEOUT_MS, '其余段一律缺省 300000')
