@@ -413,7 +413,7 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
       'if (require.main === module) {',
       '  runNotifyTest(cliArgs).catch(e => {',
       '    const info = summarizeError(e)',
-      '    console.error(`通知自检失败：${info.message}`)',
+      '    console.error(`通知自检失败：$' + '{info.message}`)',
       '    process.exitCode = 1',
       '  })',
       '}'
