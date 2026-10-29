@@ -6173,10 +6173,17 @@ console.log('========================================\n');
   // C4-012：上面三条预算的输入都是玩具形态（68 字符 HTML ×1000、单模板 ×1000、3 字段 ×5000），
   // 而真实推送是「单条 100k 字符的 content_html」——此前这条形态零预算，O(n²) 退化（见 v3.251 长
   // href 事故）只能在 CI 事后靠肉眼发现。这里按**真实可达形态**补预算：
-  //   · 配置模型只支持 ~12 个字段、### 只取前两段 ⇒「数百规则」不是本仓可达形态，不编造该口径；
-  //     真实形态是「12 字段全部配满 + 多行 ### 规则」，且多行规则是分类不敏感的分支遍历。
-  // 阈值取自本机（2 核）实测的 3~4 倍：100k htmlToMarkdown 183–632ms、100k tuisong 631–770ms、
-  // 20000 次全字段 listfilter ≈660ms。三条都远低于 harness 4000ms 硬超时（含 benchRetry 重试一次）。
+  //   · 真实形态是「11 个过滤字段（FILTER_FIELDS 10 个 + pingbitime）全部配满 + 多行 ### 规则」，
+  //     多行规则是分类不敏感的分支遍历。
+  // 阈值 1500/1500/1200ms 沿用（本次不放宽也不收紧）：本机 2 核逐条复刻下述输入的实测值
+  // （单跑脚本，多次采样的 min–max）：
+  //   100k htmlToMarkdown 36–77ms（2 个 CPU hog 争用 69–153ms）→ 余量 19×/9.8×；
+  //   100k tuisong 256–328ms（争用 624–920ms）→ 余量 4.6×/1.6×；
+  //   20000 次全字段 listfilter 56–111ms（争用 194–223ms）→ 余量 10.8×/5.4×。
+  //   tuisong 这条在争用下余量偏薄（预检实测最差用掉 89%），按「本组只加预算、不放宽既有阈值」
+  //   留作 follow-up，不在本组改动。
+  // 「100k 内容 × 数百条规则」的形态不在上面三条覆盖范围内（### 只限行内段数、不限行数），
+  // 由下面单独一条预算承担。
   await test('基准: htmlToMarkdown 单文档 100k content_html < 1500ms（真实形态）', () => {
     const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p><ul><li>项一</li><li>项二</li></ul><div>块</div>'
     const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
@@ -6191,7 +6198,7 @@ console.log('========================================\n');
     benchRetry(() => { tuisong_replace('【{分类名}】{标题}\n{Markdown内容}', data) }, 1500, '100k tuisong_replace')
   })
 
-  await test('基准: listfilter 全字段规则集 20000 次 < 1200ms（真实形态：12 字段 + ### 多行）', () => {
+  await test('基准: listfilter 全字段规则集 20000 次 < 1200ms（真实形态：11 字段 + ### 多行）', () => {
     const cfg = compileRules({
       pingbifenlei: '赚客吧###什么值得买',
       pingbibiaoti: '京东###淘宝',
@@ -6207,6 +6214,9 @@ console.log('========================================\n');
     })
     assertEqual(cfg.__compiled, true, '预算必须是编译后的真实规则集')
     // 全字段都配满 ⇒ 每条消息都会走多行分支，不是「3 个字段短路」的玩具路径
+    // 口径（C4-012 返工）：本用例的规则总数只有 ~17 条（11 字段 × 行内 1–2 段，见
+    // cfg.pingbineirong.rules 等），group 也是 30 字符级短文——它量的是「多字段分支 + 分类判断」
+    // 的固定开销，**打不到**审计指的「100k 内容 × 数百条规则」形态（那条由下一条预算覆盖）。
     const group = {
       catename: '微博线报',
       louzhu: '小明',
@@ -6218,6 +6228,53 @@ console.log('========================================\n');
       louzhuregtime: '2026-10-20'
     }
     benchRetry(() => { for (let i = 0; i < 20000; i++) listfilter(group, cfg) }, 1200, '20000次全字段listfilter')
+  })
+
+  // C4-012 返工：审计指的「100k 内容 × 数百条规则」是**本仓可达形态**——上一版注释把 `###` 的
+  // 「只取前两段」当成了整份配置的上限，实际它只限制**行内**段数、不限行数：300 行「###关键字N」
+  // 经 compileRules 实测就是 rules.length === 300（真实配置，不是合成对象）。而上一版「20000 次
+  // 全字段」预算只有 ~17 条规则 × 30 字符 group，打不到这条热路径。
+  // 最坏路径：300 条规则全部不命中 ⇒ 每条规则都要对 100k 正文各跑一次 _normalizeReInput + test
+  // （matchesCompiled 的 multi 分支是 O(内容 × 规则)，任一条命中才短路）。
+  // 阈值标定（本机 2 核实测，整份 test_filter.js 内的实测值）：
+  //   · 空闲 481–526ms（单独跑同一负载另测 428–489ms）；
+  //   · 起 2 个 CPU hog 制造争用（本仓 check 会并发跑套件）1404–1880ms；
+  //   取 3000ms：空闲 5.7–6.2 倍余量、争用最差仍有 1.6 倍余量（不假红）；而审计形态的退化
+  //   （单条 ~113ms ⇒ 200 条 ≈22s；12–16s 级事故）在本口径下会把 3 次推到秒级 ⇒ 必红。
+  //   为什么不取「5 次一组 + 1500ms」：5 次实测空闲 733–777ms、2 hog 争用 1934–2553ms，1500ms
+  //   在争用下会假红；要让它绿得取 ≥3200ms，那会超过既有最大内部阈值 3000ms（C4-007 的
+  //   TIMEOUT_MS=4000 不变量按 perfLimit(3000) 推导），故取 3 次一组 + 3000ms
+  //   （3000ms 与既有「10000 条 listfilter」预算并列最大，仍严格小于 harness TIMEOUT_MS=4000）。
+  //   反向标定（实测，验证完已 checkout 还原）：把 _anyRule 的规则遍历放大 10 倍（实现退化）⇒
+  //   本断言实测 5184ms > 3000ms 真红，说明这条预算真的在量这条热路径，不是装饰。
+  await test('基准: listfilter 100k 内容 × 300 条 ### 规则 < 3000ms（审计形态）', () => {
+    // 300 行 ### 真配置：无分类前缀 ⇒ 规则对任意 catename 都参与匹配（分类不敏感的分支遍历）
+    const ruleLines = []
+    for (let i = 0; i < 300; i++) ruleLines.push('###zzz_nomatch_' + String(i).padStart(3, '0'))
+    const cfg300 = compileRules({ pingbineirong: ruleLines.join('\n') })
+    assertEqual(cfg300.__compiled, true, '预算必须是编译后的真实规则集')
+    assertEqual(cfg300.pingbineirong && cfg300.pingbineirong._type, 'multi', '300 行 ### 必须编译成多行规则，不是简单正则')
+    assertEqual(cfg300.pingbineirong.rules.length, 300, '300 行 ### 必须真的产出 300 条规则（### 只限行内段数）')
+    // 真实形态的 100k 正文（HTML 抽文后的纯文本），正文不含任何规则关键字 ⇒ 300 条全遍历
+    const para = '大促线报：京东自营满减叠加优惠券，名额有限先到先得。参考价 199 元，券后 129 元，库存 300 件。<br>'
+    let content = ''
+    while (content.length < 100000) content += para
+    content = content.slice(0, 100000)
+    assertEqual(content.length, 100000, '预算输入必须是真实的 100k 字符正文')
+    const g100k = {
+      catename: '微博线报',
+      louzhu: '小明',
+      title: '京东神券大促',
+      content,
+      content_html: content,
+      url: 'http://example.com/p/1.html',
+      posttime: 1785346200,
+      louzhuregtime: '2026-10-20'
+    }
+    // 预热 + 语义闸门：规则全不命中 ⇒ listfilter 放行（true）。若哪天规则意外命中，这里先红，
+    // 不让「测得快」其实是「首条规则短路早退」的假绿溜过去。
+    assertEqual(listfilter(g100k, cfg300), true, '300 条规则不得命中该正文（否则测的是短路早退，不是最坏路径）')
+    benchRetry(() => { for (let i = 0; i < 3; i++) listfilter(g100k, cfg300) }, 3000, '3×100k×300rules listfilter')
   })
 
   // v3.278（PR #156 复审续）PERF_MS 缩放回归：**撤销缩放即真红**。
