@@ -1389,6 +1389,13 @@ console.log('========================================\n');
       // isMessageInFile 仍应判重命中（防上游重放重复推送）
       assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
       assertEqual(r2, true)
+      // C4-010：用例名与注释都说「最多保留 100 条」，但上面两条只证明墓碑判重——**完全不裁剪**时
+      // 它们同样成立，对「是否裁剪」零鉴别力。这里直接读盘核对条数与保留区间（删最旧、留最新）。
+      const kept = readMessages(getFilePath(name))
+      assertEqual(kept.length, 100, `超出上限应裁到 100 条，实际 ${kept.length} 条`)
+      assertEqual(kept[0] && kept[0].id, 1, `裁剪应删掉最旧的第0条，实际首条 id=${kept[0] && kept[0].id}`)
+      assertEqual(kept[kept.length - 1] && kept[kept.length - 1].id, 100,
+        `最新一条必须保留，实际末条 id=${kept[kept.length - 1] && kept[kept.length - 1].id}`)
     } finally {
       Config.cache.maxSize = orig
     }
