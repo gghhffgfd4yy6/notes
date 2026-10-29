@@ -300,30 +300,91 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
   // S6b 退出码口径（C5-037）：旧形态在测试自己的 catch 里复刻 guard 的出口、再断言自己
   // 拼出来的「通知自检失败：」——既没读 process.exitCode，也从没经过真 guard。于是
   // 「无渠道不算失败，exit 0」这类改动（真实事故形态：自检假绿）在本套件里完全不可见。
-  // 现在走真 main-guard：真子进程 + 清空全部通道 env ⇒ sendNotify 抛 NO_CHANNEL_CONFIG，
+  // 现在走真 main-guard：真子进程 + slim 换成「抛 NO_CHANNEL_CONFIG」的桩，
   // 退出码与文案都由 guard 的 catch 决定；文案断言锚在 summarizeError 的 message 上
   // （同一条脱敏出口），不是测试自己拼的字符串。
+  //
+  // C5-037 返工（审查 A）：旧夹具只把环境变量里的渠道 key 置空，清不掉配置文件——
+  // slim 在 xbk_sendNotify_slim.js:303 按 __dirname 加载 push_config.local.js，且 :348-356
+  // 明确「存在但为空的 env 不覆盖本地配置」。凡克隆里存在该文件（本机 ~/notes、~/notes-live
+  // 都带真凭证），子进程会进入真实推送路径：既真发一条自检消息，又因推送成功 exit 0 而与
+  // 「无渠道必须 exit 1」的断言冲突变红——违背「绝不裸跑真推」。改法照 S6：NODE_OPTIONS=
+  // --require=<stub> 在装载期用 require.cache 替掉 slim，假模块直接抛 NO_CHANNEL_CONFIG。
+  // 真 main-guard / 真 runNotifyTest / 真 Pusher 链一律不动，但 slim 永不加载 ⇒
+  // push_config.local.js 永不被读、任何渠道都发不出去。
   await test('无渠道: 真 main-guard spawn → exitCode 1 + NO_CHANNEL_CONFIG 脱敏原因', () => {
+    const os = require('os')
     const { spawnSync } = require('child_process')
     const { summarizeError } = require('./xbk_failure_policy')
-    // 清空全部通道 key：子进程的 slim 从 env 装配 push_config，任何残留 key 都会让自检真的
-    // 发一条出去（本用例必须零真实网络）。HITOKOTO 同样关掉。
-    const env = { ...process.env, TZ: 'UTC', HITOKOTO: 'false' }
-    for (const k of CHANNEL_KEYS) env[k] = ''
-    const run = spawnSync(process.execPath, [path.join(__dirname, 'xbk_function_v3.js'), '--notify-test'], {
-      cwd: __dirname,
-      encoding: 'utf8',
-      timeout: 30000,
-      env
-    })
-    const text = `${run.stdout || ''}${run.stderr || ''}`
-    assertRc(run.status === 1, `真 guard 退出码必须为 1（无渠道 = 失败），实际 ${run.status}（signal=${run.signal || '无'}）`)
-    const summarized = summarizeError(Object.assign(new Error('未配置任何推送通道'), { code: 'NO_CHANNEL_CONFIG' }))
-    assertRc(summarized.code === 'NO_CHANNEL_CONFIG', '夹具必须走 NO_CHANNEL_CONFIG 口径')
-    assertRc(text.includes(`通知自检失败：${summarized.message}`),
-      `失败结论必须由 guard 经 summarizeError 出口（期望含 ${JSON.stringify('通知自检失败：' + summarized.message)}，实际 ${JSON.stringify(text.slice(0, 400))}）`)
-    assertRc(text.includes('未配置任何推送通道'), '应含 NO_CHANNEL_CONFIG 文案（渠道清单）')
-    assertRc(!text.includes('[object Object]'), '不得有对象 stringify 痕迹')
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-selfcheck-nochan-'))
+    const stubPath = path.join(stubDir, 'stub.js')
+    const probePath = path.join(stubDir, 'probe.json')
+    // 桩：替身 slim 的 sendNotify 抛 NO_CHANNEL_CONFIG；同时在装载期把全部出网入口计数
+    // （http/https request|get、net.connect、tls.connect、dns.lookup）并直接抛错阻断。
+    // 计数经 exit 钩子落到 probe.json —— 父进程断言「装载了桩 / sendNotify 恰一次 / 出网 0 次」，
+    // 「零网络」由桩自证，而不是靠父进程猜子进程发了没发。
+    fs.writeFileSync(stubPath, `'use strict'
+const probe = { stubLoaded: true, sendNotifyCalls: 0, netAttempts: 0, blocked: [] }
+const block = (name) => function () { probe.netAttempts++; probe.blocked.push(name); throw new Error('BLOCKED_NET:' + name) }
+const http = require('http')
+const https = require('https')
+const net = require('net')
+const tls = require('tls')
+const dns = require('dns')
+for (const [mod, keys] of [[http, ['request', 'get']], [https, ['request', 'get']], [net, ['connect', 'createConnection']], [tls, ['connect']], [dns, ['lookup']]]) {
+  for (const key of keys) if (typeof mod[key] === 'function') mod[key] = block(key)
+}
+process.on('exit', () => {
+  try { require('fs').writeFileSync(process.env.XBK_NOCHAN_PROBE, JSON.stringify(probe)) } catch (e) {}
+})
+const slimPath = require('path').join(process.cwd(), 'xbk_sendNotify_slim.js')
+// 注意：桩内绝不 require 入口文件——--require 阶段 require 它会让 Node 22 把入口标记为
+// 已加载，真 main 不再执行（require.main !== module）→ guard 不触发、进程零输出退出 0。
+require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, exports: {
+  push_config: { HITOKOTO: 'false' },
+  configuredChannelNames: () => [],
+  configuredChannelCount: () => 0,
+  sendNotify: async () => {
+    probe.sendNotifyCalls++
+    const err = new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）')
+    err.code = 'NO_CHANNEL_CONFIG'
+    throw err
+  }
+} }
+`)
+    try {
+      // env 清空只是二道防线（对 push_config.local.js 无效，见上），真正的保证是 slim 被替掉。
+      const nodeOptions = [process.env.NODE_OPTIONS, `--require=${stubPath}`].filter(Boolean).join(' ')
+      const env = { ...process.env, TZ: 'UTC', HITOKOTO: 'false', NODE_OPTIONS: nodeOptions, XBK_NOCHAN_PROBE: probePath }
+      for (const k of CHANNEL_KEYS) env[k] = ''
+      const run = spawnSync(process.execPath, [path.join(__dirname, 'xbk_function_v3.js'), '--notify-test'], {
+        cwd: __dirname,
+        encoding: 'utf8',
+        timeout: 30000,
+        env
+      })
+      const text = `${run.stdout || ''}${run.stderr || ''}`
+      assertRc(run.status === 1, `真 guard 退出码必须为 1（无渠道 = 失败），实际 ${run.status}（signal=${run.signal || '无'}）`)
+      const summarized = summarizeError(Object.assign(new Error('未配置任何推送通道'), { code: 'NO_CHANNEL_CONFIG' }))
+      assertRc(summarized.code === 'NO_CHANNEL_CONFIG', '夹具必须走 NO_CHANNEL_CONFIG 口径')
+      assertRc(text.includes(`通知自检失败：${summarized.message}`),
+        `失败结论必须由 guard 经 summarizeError 出口（期望含 ${JSON.stringify('通知自检失败：' + summarized.message)}，实际 ${JSON.stringify(text.slice(0, 400))}）`)
+      assertRc(text.includes('未配置任何推送通道'), '应含 NO_CHANNEL_CONFIG 文案（渠道清单）')
+      assertRc(!text.includes('[object Object]'), '不得有对象 stringify 痕迹')
+      // C5-037：桩自证 —— 桩真的装进了子进程、真 guard 真的经 Pusher 调了一次 sendNotify、
+      // 且全程零出网调用（否则说明 slim/真实通道被加载，本用例会真推送）。
+      let probe
+      try {
+        probe = JSON.parse(fs.readFileSync(probePath, 'utf8'))
+      } catch (e) {
+        throw new Error(`桩未在子进程装载（probe 缺失：${e.code || e.message}）——拒绝在未替身状态下用真 slim 跑自检`)
+      }
+      assertRc(probe.stubLoaded === true, '桩必须在子进程装载（否则 slim 仍是真模块，本用例会真推送）')
+      assertRc(probe.sendNotifyCalls === 1, `真 guard 必须恰好调一次 sendNotify（单次广播），实际 ${probe.sendNotifyCalls}`)
+      assertRc(probe.netAttempts === 0, `零网络红线：子进程不得发起任何出网调用，实际 ${probe.netAttempts} 次（${(probe.blocked || []).join(',')}）`)
+    } finally {
+      fs.rmSync(stubDir, { recursive: true, force: true })
+    }
   })
 
   // S8 脱敏红线：guard catch 块结构断言（summarizeError 在、原始 error 不得进打印/序列化）。
