@@ -76,15 +76,20 @@ function summarizeZizmor (stdout) {
 }
 
 // .githooks/ 下逐个常规文件跑 shellcheck；符号链接不跟随（存储层符号链接防御的同族纪律）。
+// 扫描面抽成独立函数：让「门禁到底会扫几个文件」可被 test_ci_static_gates.js 直接断言
+// （守卫「扫描循环被删 / 扫描面塌成 0 个文件」这类空转，C5-013）。
+function shellcheckTargets () {
+  const dir = path.join(ROOT, '.githooks')
+  if (!fs.existsSync(dir)) return []
+  return fs.readdirSync(dir).filter((f) => {
+    const st = fs.lstatSync(path.join(dir, f))
+    return st.isFile() && !st.isSymbolicLink()
+  })
+}
+
 function runShellcheck () {
   const dir = path.join(ROOT, '.githooks')
-  let files = []
-  if (fs.existsSync(dir)) {
-    files = fs.readdirSync(dir).filter((f) => {
-      const st = fs.lstatSync(path.join(dir, f))
-      return st.isFile() && !st.isSymbolicLink()
-    })
-  }
+  const files = shellcheckTargets()
   const failures = []
   const bin = resolveTool('shellcheck')
   if (!bin) throw new Error('shellcheck 解析失败（resolveTool 返回 null）')
@@ -146,6 +151,9 @@ function selftest () {
   assert.match(decideZizmorProc(1, null), /exit=1/)
   assert.match(decideZizmorProc(null, 'SIGABRT'), /信号/)
   console.log('✅ check-ci-static --selftest 全部通过（15 断言）')
+  // 返回值供测试守卫核对条数（C5-013：--selftest 此前全仓无人调用，是死代码；现在由
+  // test_ci_static_gates.js 在套件内执行，条数漂移即红）。
+  return 15
 }
 
 function main () {
@@ -213,4 +221,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool, decideZizmorProc }
+module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool, decideZizmorProc, shellcheckTargets, selftest }

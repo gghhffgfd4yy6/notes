@@ -68,20 +68,37 @@ function sandboxEnv (home, sourceEnv = process.env) {
   return env
 }
 
+// C5-009：子进程一律带上限 + SIGKILL。没有 timeout 的 spawnSync 在钩子/脚本挂住时会无界等待，
+// 套件只能挂到 run_unit_tests 的 600s（CI 是 job 级 45min）才失败，归因只剩「套件超时」；
+// r.error 存在即明确失败，消息带 error.code / signal / killed —— 能区分「被本上限强杀」与
+// 「子进程自己非零退出」。（调用方仍可用 opts.timeout 覆盖，如 pre-push 端到端保持 180s。）
+const CHILD_TIMEOUT_MS = 20000
+const CHILD_KILL_SIGNAL = 'SIGKILL'
+// C5-010：环境性跳过必须可见且计数（此前只有 console.log，末尾汇总里看不到少跑了什么）。
+const envSkips = []
+const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境性）：' + why) }
+function boundedSpawn (bin, args, opts) {
+  const r = spawnSync(bin, args, { timeout: CHILD_TIMEOUT_MS, killSignal: CHILD_KILL_SIGNAL, ...opts })
+  if (r.error) {
+    assert.fail(`子进程未正常收场（${bin} ${args.join(' ')}）：error=${r.error.code} signal=${r.signal} killed=${r.killed}`)
+  }
+  return r
+}
+
 function runVerify (cwd, home) {
-  return spawnSync(NODE_EXEC, [INSTALL_HOOKS, '--verify'], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(NODE_EXEC, [INSTALL_HOOKS, '--verify'], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function runPlugin (cwd, home, args) {
-  return spawnSync(NODE_EXEC, [INSTALL_HOOKS, ...args], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(NODE_EXEC, [INSTALL_HOOKS, ...args], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function gitConfig (cwd, home, key) {
-  return spawnSync(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function initRepo (dir, home, env = sandboxEnv(home)) {
-  const init = spawnSync(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
+  const init = boundedSpawn(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
   assert.strictEqual(init.status, 0, `git init 失败：${init.stderr}`)
 }
 
@@ -371,7 +388,7 @@ const FIXTURE_SCAN_GATE_JS = [
 
 // 绝对路径调用真实 git；失败即断言失败（夹具建不起来不能静默跳过）。
 function mustGit (args, opts, what) {
-  const r = spawnSync(GIT, args, { encoding: 'utf8', ...opts })
+  const r = boundedSpawn(GIT, args, { encoding: 'utf8', ...opts })
   assert.strictEqual(r.status, 0, `${what || ('git ' + args.join(' '))} 失败（退出码 ${r.status}）：${r.stderr || r.stdout}`)
   return r.stdout
 }
@@ -877,6 +894,8 @@ function assertNoResidue (fx, label) {
     let honoring = false
     try { fs.chmodSync(probe, 0o700); fs.accessSync(probe, fs.constants.X_OK); honoring = true } catch (e) { honoring = false }
     if (!honoring) {
+      // 不删断言：只在 noexec 挂载/不尊重 chmod 的宿主上登记跳过，并由用例 6/9 继续锁「失败必须显形」。
+      skipEnv('安装必须修好执行位（chmod honoring 探测为假）：本机文件系统不尊重执行位，正结果不可观测')
       console.log('  （本机不支持 chmod 执行位：本条按环境性跳过，改由用例 6/9 锁“失败必须显形”）')
     } else {
       const { dir, home } = makeCase()
@@ -1153,5 +1172,8 @@ function runInMergeState (lines) {
   }
 }
 
+if (envSkips.length > 0) {
+  console.log(`⏭ install-hooks 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，只是本机缺少观测面）`)
+}
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
 console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）/ 未跟踪文件算脏：扫描式门禁下「提交 fail、工作树的未跟踪文件补绿」仍必须真红且门禁在隔离目录里跑（旧口径假绿，G 必红）+ 有未跟踪文件改走隔离路径（旧口径只警告仍走快路径，H 必红）')

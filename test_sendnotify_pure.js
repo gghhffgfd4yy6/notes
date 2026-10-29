@@ -142,6 +142,13 @@ function ratioBudgetWith (maxRatio, tBenign, floorMs, perfMs) {
 function ratioBudget (maxRatio, tBenign, floorMs) {
   return ratioBudgetWith(maxRatio, tBenign, floorMs, process.env.PERF_MS)
 }
+// 10× 两条比值判据的毫秒地板（C5-006）：分母在 0.9–2ms 量级时，「10 × tBenign」只有 9–20ms，
+// 已经落在宿主机调度噪声里——CI quality 步（4 vCPU、job 内 8 路并发）实测 1.85/24.66、1.72/24.84、
+// 1.53/17.60ms（10.4–13.3×）就是被这类噪声顶过裸 10× 的（同期 25× 那两条带 +50ms 地板，39.6× 都未红）。
+// 地板只对**小分母**生效：tBenign ≥ 2ms 时 10× 仍大于 20ms，真实退化（回退角括号预算守卫实测 37–44×）
+// 在 1.0–2.0ms 分母上得 37–88ms，仍远越「10 × tBenign + 20ms」⇒ 灵敏度只在噪声区让步，退化区不受影响。
+// 绝对值不写成魔法数重复：两条 10× 断言行都以本常量作第三参（回归用例⑤ 扫源码锁定）。
+const MALFORMED_RATIO_FLOOR_MS = 20
 
 console.log('=== xbk_sendNotify_slim.js 纯函数方法测试 ===')
 
@@ -393,8 +400,8 @@ check('mdLinksToPlain: 预算耗尽后角括号分支必须短路 + 畸形输入
   assert.ok(tMal < 500, `160KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
   // 比值型上界：随 PERF_MS 缩放 —— CI 假 Killed 的正是这一条（默认 10× 在沙箱里被噪声放大）
   assert.ok(
-    tMal <= ratioBudget(10, tBenign, 0),
-    `畸形输入不得相对同规模良性输入爆炸（默认 10 倍，本进程生效上界 ${ratioBudget(10, tBenign, 0).toFixed(1)}ms）：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 37-44 倍）`
+    tMal <= ratioBudget(10, tBenign, MALFORMED_RATIO_FLOOR_MS),
+    `畸形输入不得相对同规模良性输入爆炸（默认 10 倍 + ${MALFORMED_RATIO_FLOOR_MS}ms 噪声地板，本进程生效上界 ${ratioBudget(10, tBenign, MALFORMED_RATIO_FLOOR_MS).toFixed(1)}ms）：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 37-44 倍）`
   )
 })
 
@@ -492,8 +499,8 @@ check('mdImagesToPlain: 预算耗尽后角括号分支必须短路 + 畸形输�
   assert.ok(tMal < 500, `180KB 畸形输入应在 500ms 内完成，实测 ${tMal.toFixed(1)}ms`)
   // 比值型上界：随 PERF_MS 缩放 —— 与链接版同源的 CI 假 Killed 类
   assert.ok(
-    tMal <= ratioBudget(10, tBenign, 0),
-    `畸形输入不得相对同规模良性输入爆炸（默认 10 倍，本进程生效上界 ${ratioBudget(10, tBenign, 0).toFixed(1)}ms）：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 40-44 倍）`
+    tMal <= ratioBudget(10, tBenign, MALFORMED_RATIO_FLOOR_MS),
+    `畸形输入不得相对同规模良性输入爆炸（默认 10 倍 + ${MALFORMED_RATIO_FLOOR_MS}ms 噪声地板，本进程生效上界 ${ratioBudget(10, tBenign, MALFORMED_RATIO_FLOOR_MS).toFixed(1)}ms）：实测良性=${tBenign.toFixed(2)}ms 畸形=${tMal.toFixed(2)}ms（回退角括号预算守卫约 40-44 倍）`
   )
 })
 
@@ -620,6 +627,9 @@ check('PERF_MS 缩放 ①: 沙箱口径（PERF_MS=3000 ⇒ 12 倍）放行 CI �
   // 倍率必须真是 (3000/500) × 2 = 12，而不是随手写死的常量
   assert.strictEqual(ratioBudgetWith(10, 2, 0, 3000), 240, 'PERF_MS=3000 ⇒ 10 × 2ms 的生效上界应为 240ms（12 倍）')
 })
+// 注：② 锁的是**裸比值原语**（floorMs=0）。生产断言点在 10× 上另加 MALFORMED_RATIO_FLOOR_MS（见 ⑤），
+// 两者差值就是噪声地板；25× 的两个点位一直用 +50ms。②的「默认口径必须拦下 CI 实测」是对 floorMs=0
+// 这一原语本身的灵敏性证据，不是对断言点生效阈值的描述。
 check('PERF_MS 缩放 ②: 默认口径（未设 / =500）仍拦下同一人造输入，且逐字节不变', () => {
   for (const perfMs of [undefined, 500, '500']) {
     assert.ok(!(ratioBudgetWith(10, 1.5, 0, perfMs) >= 25), `默认口径（PERF_MS=${perfMs}）必须拦下 1.5ms/25ms`)
@@ -674,6 +684,35 @@ check('PERF_MS 缩放 ④: 生效上界必须来自本进程 PERF_MS，断言点
   const bareRatioRes = [/tMal<=[0-9.]+\*tBenign/, /tMal<=tBenign\*[0-9.]+/]
   const bareRatio = bareRatioRes.map(re => bareSrc.match(re)).filter(Boolean).map(m => m[0])
   assert.deepStrictEqual(bareRatio, [], `比值断言不得退回不含 PERF_SCALE 因子的裸形式，已发现：${bareRatio.join(' / ')}`)
+})
+// C5-006：10× 比值判据的毫秒地板。缺地板的只有 10× 这两条（25× 那两条带 +50ms）——分母 0.9–2ms 时
+// 裸 10× 的预算只有 9–20ms，与宿主机调度噪声同量级，quality 步一旦命中 CI 实测区间（10.4–13.3×）就是红。
+// 本用例把「噪声区放行、退化区照拦」两头都钉住，并扫源码确认断言点真的接了地板（防「算了但没接上」）。
+check('C5-006 10× 比值判据必须带毫秒地板（噪声区放行、37–44× 退化仍红）', () => {
+  // 与 ① 同源：CI quality 步 r5/r6/r7 三点的良性/畸形实测（ms）
+  for (const [tB, tM] of [[1.85, 24.66], [1.72, 24.84], [1.53, 17.60]]) {
+    assert.ok(tM > ratioBudgetWith(10, tB, 0, undefined), `前置：CI 实测 ${tB}/${tM}ms 确实越过裸 10× 比值`)
+    assert.ok(tM <= ratioBudgetWith(10, tB, MALFORMED_RATIO_FLOOR_MS, undefined),
+      `带 ${MALFORMED_RATIO_FLOOR_MS}ms 地板后必须放行 CI 实测噪声：良性=${tB}ms 畸形=${tM}ms`)
+  }
+  // 地板不得把真实退化一起放行：回退角括号预算守卫实测 37–44×（同文件 :391 注释的实测值）
+  for (const tB of [1.0, 1.5, 2.0]) {
+    for (const r of [37, 44]) {
+      assert.ok(!(r * tB <= ratioBudgetWith(10, tB, MALFORMED_RATIO_FLOOR_MS, undefined)),
+        `${r}× 退化（分母 ${tB}ms ⇒ 畸形 ${(r * tB).toFixed(1)}ms）必须仍被 10× + ${MALFORMED_RATIO_FLOOR_MS}ms 地板拦下`)
+    }
+  }
+  // 断言点必须真的接到地板上：两条 10× 断言行都以 MALFORMED_RATIO_FLOOR_MS 作第三参（源码扫描，
+  // 同 ④ 的「防算了但没接上」口径）。改回 0 或其它字面量 ⇒ 本行红。
+  const flatLines = fs.readFileSync(__filename, 'utf8').split('\n').map(l => l.replace(/\s+/g, ''))
+  const tenX = flatLines.filter(l => l.startsWith('tMal<=ratioBudget(10,'))
+  assert.strictEqual(tenX.length, 2, `应有 2 条 10× 比值断言行，实际 ${tenX.length} 条`)
+  for (const l of tenX) {
+    assert.ok(l.includes('MALFORMED_RATIO_FLOOR_MS'),
+      `10× 比值断言行必须以 MALFORMED_RATIO_FLOOR_MS 作地板（否则 quality 步偶发假红），实际：${l}`)
+    assert.match(l, /^tMal<=ratioBudget\(10,tBenign,MALFORMED_RATIO_FLOOR_MS\)[,)]/,
+      `10× 比值断言行形如 ratioBudget(10, tBenign, MALFORMED_RATIO_FLOOR_MS)，实际：${l}`)
+  }
 })
 
 // ============================================================

@@ -51,7 +51,12 @@ try {
   fs.rmSync(statusDir, { recursive: true, force: true })
 }
 
-const dryRun = spawnSync(process.execPath, ['-e', `process.env.XBK_DRY_RUN = '1'; const app = require(${JSON.stringify(path.join(__dirname, 'xbk_function_v3.js'))}); const result = app.App; if (!result || typeof result.run !== 'function') process.exit(2)`], { cwd: __dirname, encoding: 'utf8' })
+// C5-009：带 timeout + SIGKILL（主模块若在 dry-run 加载期回归成死循环，无上限的 spawnSync 会挂到
+// 套件级超时）；error/signal 必须显形，而不是等 status 为 null 让后续 strictEqual 报「status 不符」。
+const dryRun = spawnSync(process.execPath, ['-e', `process.env.XBK_DRY_RUN = '1'; const app = require(${JSON.stringify(path.join(__dirname, 'xbk_function_v3.js'))}); const result = app.App; if (!result || typeof result.run !== 'function') process.exit(2)`], { cwd: __dirname, encoding: 'utf8', timeout: 20000, killSignal: 'SIGKILL' })
+if (dryRun.error || dryRun.signal) {
+  assert.fail(`dry-run 子进程未正常收场（error=${dryRun.error && dryRun.error.code} signal=${dryRun.signal} killed=${dryRun.killed}）`)
+}
 assert.strictEqual(dryRun.status, 0, 'dry-run 环境变量应能加载主模块')
 
 // ── 批次④ 4.1：--notify-test spawn 型用例（全部带桩，绝不裸跑真推——D10）──
@@ -106,6 +111,9 @@ process.on('exit', () => {
 })
 `
   const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-notify-stub-'))
+  // C5-009：清理兜底 —— 末尾那条 rmSync 在任一断言失败/异常中断时不会执行，桩目录会残留在 os.tmpdir()。
+  // exit 钩子在 process.exit（含未捕获断言失败）时同步执行，rmSync 幂等（与末尾显式清理重复无害）。
+  process.once('exit', () => { try { fs.rmSync(stubDir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
   const p = path.join(stubDir, 'stub.js')
   fs.writeFileSync(p, stub)
   return p

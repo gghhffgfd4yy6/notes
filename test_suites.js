@@ -71,6 +71,12 @@ const SUITES = [
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)', integration: true },
+  // C5-008 登记（有此条即口径，勿再当「漏接线」重开）：本套件是 1600 行 integration 套件，被
+  // run_unit_tests.js（UNIT_SUITES 过滤 integration/mutationSkip）与 TAP 档的显式清单（同口径过滤）
+  // 两档排除 ⇒ **对变异门禁零贡献**，只在 test.yml 的显式步骤「通道测试（test_notify.js）」里跑。
+  // 这是有意的测试集边界（同 test_app.js / test_app_p.js 不进变异集，已知边界见 AGENTS.md），不是接线漏项。
+  // 代价：本套件独有的通道分支零变异覆盖 —— 新增/改动通道判定时，请在 test_sendnotify_pure.js 补等价
+  // 单元断言（先例：isCode 的 String 侧由 SNB-09 在单元档击杀，不依赖本套件）。
   { name: '通道测试', file: 'test_notify.js', desc: '推送通道请求构造+脱敏', integration: true },
   // v3.276 补：xbk_app.js 此前无任何单元套件（test_app.js 是集成套件、不进变异测试集），
   // 其报告/状态簇的存活变异体无人认领。本套件在**进程内**用最小桩构造 createApp(...) 后直接

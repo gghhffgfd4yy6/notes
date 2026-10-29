@@ -411,6 +411,19 @@ check('P1-04 同族: sanitizeSurrogates/safeText 内部正则不含 lookaround�
 //   ④ 回落行为不变：危险协议仍被清空、合法值仍保留。
 // 撤掉告警实现（catch 恢复为空）→ ② 立即变红。
 const execFileSync = require('node:child_process').execFileSync
+// C5-009：探针子进程一律带 timeout + SIGKILL。没有上限的 execFileSync 在探针里的用户代码回归成
+// 死循环/挂住时会一直等，套件只能挂到 run_unit_tests 的 600s 套件级兜底（CI 是 job 级 45min），
+// 归因退化成「套件超时」。失败时把 e.code / e.signal / e.killed 一并抛出：ETIMEDOUT+SIGKILL
+// （被本上限强杀）与「探针自己 exit 1」可区分。
+const PROBE_TIMEOUT_MS = 20000
+function execProbeSync (args, opts) {
+  try {
+    return execFileSync(process.execPath, args, { timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts })
+  } catch (e) {
+    assert.fail(`探针子进程未正常收场（code=${e.code} signal=${e.signal} killed=${e.killed}）：` +
+      `${String((e.stderr || e.message || '')).slice(0, 300)}`)
+  }
+}
 const fallbackProbe = String.raw`
 'use strict'
 const re2Path = require.resolve('re2')
@@ -447,7 +460,7 @@ process.stdout.write(JSON.stringify({
 `
 
 check('P1-04 收尾: RE2 编译失败回落 V8 只告警一次（含模式与原因，凭据已脱敏）', () => {
-  const raw = execFileSync(process.execPath, ['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
+  const raw = execProbeSync(['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
   const out = JSON.parse(raw.trim().split(/\r?\n/).pop())
   assert.strictEqual(out.warnsAfterLoad, 0, '模块加载期的内部模式不得触发回落告警')
   assert.ok(out.rejectedCount >= 3, `前置条件：本轮清洗必须让 ≥3 条内部模式编译失败（实际 ${out.rejectedCount}）——否则「只告警一次」只是被 _reCache 挡住，测不到一次性标记`)
@@ -1493,7 +1506,7 @@ const probeBaseEnv = Object.assign({}, process.env)
 delete probeBaseEnv.XBK_PROFILE
 const probeProfile3Env = Object.assign({}, probeBaseEnv, { XBK_PROFILE: '3' })
 function runProbe (src, env) {
-  const raw = execFileSync(process.execPath, ['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
+  const raw = execProbeSync(['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
   const lines = raw.trim().split(/\r?\n/)
   const last = lines[lines.length - 1]
   const at = last.indexOf('PROBE_JSON:')
@@ -1767,9 +1780,30 @@ check('PlanI _parseFallback: 小写 z 也算时区标记（[Zz] 字符类）', (
 check('PlanI _parseFallback: 单数字月日的 T 格式与空格格式必须同口径（v3.171 回退）', () => {
   const P = (s) => Utils._parseFallback(s)
   // '2026-8-1T10:30' 曾 Invalid 返回 null，而空格格式有效 —— v3.171 用第二个回退统一
-  assert.strictEqual(P('2026-8-1T10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '单数字月日 + T 必须与空格格式同值（第二次回退把 T 转空格）')
-  assert.strictEqual(P('2026-8-1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '空格格式同值')
-  assert.strictEqual(P('2026/8/1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '斜杠格式同样要有兜底')
+  // C5-011：这里**不锁具体时刻**。这三条输入在 parseTime 上先被 _parseDateTimeNoTz（日期段 [-/]、
+  // 秒可选）命中并直接返回 Date.UTC ⇒ 本函数在产品路径上不可达；而它对「非补零 ISO / 斜杠」的
+  // 宽松解析落到 new Date(s)（宿主本地时区）⇒ 锁 Date.UTC 的写法在 UTC 宿主恒绿、CST 宿主必红
+  // （假契约 + 本地假红）。只锁跨时区恒真的口径：可解析 + 三种写法同值（v3.171 要的就是这个）。
+  // UTC 契约改在下一条用例里经产品入口 parseTime 断言。
+  const values = ['2026-8-1T10:30', '2026-8-1 10:30', '2026/8/1 10:30'].map((s) => {
+    const v = P(s)
+    assert.strictEqual(typeof v, 'number', `_parseFallback(${s}) 必须宽松解析出毫秒数，不得返回 null`)
+    assert.ok(Number.isFinite(v), `_parseFallback(${s}) 必须是有限毫秒数`)
+    return v
+  })
+  assert.strictEqual(values[1], values[0], '空格分隔必须与 T 分隔同值（第二次回退把 T 转空格）')
+  assert.strictEqual(values[2], values[0], '斜杠格式必须与 T/空格格式同值（同一兜底解析）')
+})
+
+check('PlanI parseTime: 单数字月日与斜杠格式必须按 UTC 解析（宿主时区无关）', () => {
+  // C5-011：这是产品真正走的路径（_parseDateTimeNoTz 的日期段是 [-/]、秒可选，先于 _parseFallback
+  // 命中并返回 Date.UTC）。断言必须两档 TZ 都为真 —— 否则「只在 UTC 宿主成立」的用例既给本地
+  // 开发机假红、又在 CI 上假绿（锁的契约根本不是产品行为）。
+  for (const s of ['2026-8-1T10:30', '2026-8-1 10:30', '2026/8/1 10:30', '2026/08/01 10:30', '2026/8/1 10:30:00']) {
+    assert.strictEqual(Utils.parseTime(s), Date.UTC(2026, 7, 1, 10, 30, 0), `${s} 必须按 UTC 解析（与宿主时区无关）`)
+  }
+  assert.strictEqual(Utils.parseTime('2026/8/1 10:30'), Utils.parseTime('2026-08-01 10:30:00'),
+    '斜杠与连字符、单双数字月日、有无秒 必须得到同一时刻')
 })
 
 check('PlanI _parseFallback: 完全无法解析时返回 null（不得返回 NaN/Invalid Date）', () => {

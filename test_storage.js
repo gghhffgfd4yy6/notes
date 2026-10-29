@@ -14,6 +14,11 @@ const {
 
 ;(async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-storage-'))
+  // C5-010：环境性跳过必须**可见且计数**。没有 /proc/self/fd 的宿主（macOS / Windows）上，下面
+  // 4 组 fd 泄漏断言无法观测；此前是 `if (mrHasProc) { assert }` 的静默降级 —— 断言整块消失、
+  // 末尾照打 OK，跑数的人无从知道少了 4 项。skip 分支只打印原因并计数，断言本身一条不删。
+  const envSkips = []
+  const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境性）：' + why) }
   // 清理兜底（用例间状态猎杀 #198 后续）：任何断言失败走 catch → process.exit(1) 时，
   // 末尾的 rmSync 会被跳过，私有临时目录（含 perm/、mr/ 等全部夹具）泄漏到 os.tmpdir()。
   // exit 钩子在 process.exit 时同步执行，rmSync 幂等（与末尾显式清理重复也无害）。
@@ -444,6 +449,8 @@ const {
       for (let i = 0; i < 40; i++) assert.strictEqual(writeAtomic(mrLeakFile, 'x' + i), true, '写入必须成功')
       assert.ok(mrFds() - mrBase <= 2,
         `writeAtomic 成功路径每次都必须关闭临时文件 fd 与父目录 fd（40 次后实际净增 ${mrFds() - mrBase}）`)
+    } else {
+      skipEnv('writeAtomic 成功路径的 fd 泄漏（40 次写入后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
     }
     // 失败路径（fsync 抛错）：必须关闭已打开的 fd，且告警带默认 label 与完整文案
     const mrFsync = fs.fsyncSync
@@ -458,7 +465,10 @@ const {
         const mrBase2 = mrFds()
         for (let i = 0; i < 40; i++) assert.strictEqual(writeAtomic(mrErrFile, 'z'), false, 'fsync 失败必须 fail-closed 返回 false')
         assert.ok(mrFds() - mrBase2 <= 2, `writeAtomic 失败路径必须关闭已打开的 fd（40 次后实际净增 ${mrFds() - mrBase2}）`)
-      } else { writeAtomic(mrErrFile, 'z') }
+      } else {
+        writeAtomic(mrErrFile, 'z') // 仍执行一次，保证下面「失败文案」断言有输入
+        skipEnv('writeAtomic 失败路径的 fd 泄漏（fsync 抛错后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
+      }
     } finally { fs.fsyncSync = mrFsync; console.error = mrErr }
     assert.deepStrictEqual(mrErrs.slice(-1), [`缓存文件写入失败 ${mrErrFile}: fsync-boom`],
       '默认 label「缓存文件」与失败文案必须完整（不得置空）')
@@ -472,6 +482,8 @@ const {
       for (let i = 0; i < 40; i++) assert.strictEqual(readSafeTextResult(mrReadFile).status, 'ok', '读取必须成功')
       assert.ok(mrFds() - mrBase3 <= 2,
         `readSafeTextResult 每次调用都必须关闭内容 fd 与复检 fd（40 次后实际净增 ${mrFds() - mrBase3}）`)
+    } else {
+      skipEnv('readSafeTextResult 的 fd 泄漏（40 次读取后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
     }
 
     // ===== 读后复检（契约）：dev/ino 或文件类型变化 ⇒ **replaced**（瞬时，不是 unsafe）且丢弃内容 =====
@@ -553,6 +565,8 @@ const {
       }
       assert.ok(mrFds() - mrBase4 <= 2,
         `writeAtomicIfAbsent 成功路径必须由 finally 关闭 fd（40 次后实际净增 ${mrFds() - mrBase4}）`)
+    } else {
+      skipEnv('writeAtomicIfAbsent 成功路径的 fd 泄漏（40 次独占创建后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
     }
     const mrForeign = path.join(mrDir, 'foreign.txt')
     fs.writeFileSync(mrForeign, 'other-process-data')
@@ -775,5 +789,8 @@ const {
   // 清理：临时目录递归删除即可覆盖所有测试文件
   try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) {}
 
+  if (envSkips.length > 0) {
+    console.log(`⏭ test_storage 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，只是本机缺少 /proc/self/fd 观测面）`)
+  }
   console.log('test_storage OK')
 })().catch((e) => { console.error(e); process.exit(1) })
