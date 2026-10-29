@@ -25,6 +25,14 @@
 //   3) 退出时打一个与退出码一致的 TAP 点。tap-runner 有一条硬规则（tap-helper.ts）：
 //      进程退出码非 0 且没有解析到任何失败测试，会抛错并记 RuntimeError。
 //      所以「非 0 退出」必须伴随 not ok，否则 tap 档会凭空多出 runtimeErrors（假红）。
+//   4) 把「本进程**成功投递**的 TAP 点数」留成可核对的证据（C10-008），两条通道：
+//      a. 写进 stryker coverage hook 已落盘的 coverage JSON（stryker-output-<pid>.json，多一个
+//         `tapPoints` 键；tap-runner 只读 hitCount/mutantCoverage，未知键被忽略）；
+//      b. 追加一行到 `XBK_TAP_POINTS_LOG`（mutation.yml 的摘要步按 `tapPoints===0` 判空流）。
+//      为什么必须另有 (b)：tap-runner 的 runFile() 读完 coverage JSON **立刻 fs.rm 掉**
+//      （dist/src/tap-test-runner.js 的 `await fs.rm(fileName)`），而 mutation.json 的
+//      testFiles[].tests[] 只有 {id,name}（无覆盖、无 TAP 点）⇒ 报告侧拿不到任何「投递了几个点」
+//      的信息，(b) 是唯一能活到 job 末尾的通道。
 // ============================================================
 const fs = require('node:fs')
 const path = require('node:path')
@@ -146,6 +154,8 @@ function resolveSkip (file) {
 }
 
 // 三个 TAP 行必须**全部**投递成功才算这一个测试点被投递（部分投递 = 残缺 TAP 流，同样不可信）。
+let deliveredPoints = 0
+let pointEmitted = false
 function emitPoint (ok, note) {
   // note 必须压成**单行**：它可能来自 err.message（带 "Require stack:" 与多行栈），直接拼进 TAP 点
   // 会把一个测试点撕成多行、plan(1..1) 与 extra 行错位（C10-038 实测：旧实现在该沙箱里正是如此）。
@@ -155,8 +165,82 @@ function emitPoint (ok, note) {
     say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${suffix}`),
     say('1..1')
   ]
-  return delivered.every(Boolean)
+  pointEmitted = true
+  const allDelivered = delivered.every(Boolean)
+  // C10-008：空 TAP 流的真实判据就是这个计数——tap-runner 对每个测试文件**无条件**合成 1 条
+  // TestResult（tapResultToTestResult，id/name 都是文件名），所以报告里的 tests 条数 = 文件数，
+  // 空流时照样是 66。「投递了几个点」只有 shim 知道。
+  if (allDelivered) deliveredPoints++
+  return allDelivered
 }
+
+// dry run 判定（C10-008）：tap-runner 的 runFile() 用 `STRYKER_DRY_RUN` 区分 dry run 与变异体跑
+// （dist/src/setup/env.cjs: strykerDryRun = 'STRYKER_DRY_RUN'，hook.cjs 按它决定是否删 mutantCoverage）。
+// 只有 dry run 写逐文件记录：变异体跑是「文件 × 变异体」重复 spawn 同一批文件，记进去只会淹没证据、
+// 也会让「点数」失去「这段测试集产出了几个点」的含义。
+// fail-closed：该标志一旦改名 ⇒ 一条记录都不写 ⇒ 摘要按 tapPoints=0 判红并点名「无记录」，
+// 宁可响亮误红，也不要静默放行成「测试跑过」（这正是 C10-008 要堵的假绿通道）。
+const isDryRun = process.env.STRYKER_DRY_RUN === 'true'
+
+// stryker coverage hook 的产出文件名：与 dist/src/setup/env.cjs 的 tempTapOutputFileName(pid) 同口径
+// （`stryker-output-${pid}.json`，写在 spawn 出来的被测进程 cwd）。
+const coverageJsonName = `stryker-output-${process.pid}.json`
+
+// (a) 把 tapPoints 写进**已产出**的 coverage JSON。hook.cjs 的 process.on('exit', finalCleanup) 比本
+//    文件先注册 ⇒ 退出时它先写、这里后读，读到的就是它刚落的文件（文件头 10-13 行记了这个顺序）。
+//    任何失败都只留 stderr 证据、**不动退出码**：tap-runner 拿这个文件当唯一输入（JSON.parse），
+//    注解只是附加键，注解本身出问题不该把整段判成 RuntimeError。
+function annotateCoverageJson (points) {
+  try {
+    if (!fs.existsSync(coverageJsonName)) return
+    const parsed = JSON.parse(fs.readFileSync(coverageJsonName, 'utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+    parsed.tapPoints = points
+    fs.writeFileSync(coverageJsonName, JSON.stringify(parsed))
+  } catch (err) {
+    try {
+      fs.writeSync(2, `tap-shim: tapPoints 未能写进 coverage JSON（${err && err.code ? err.code : 'unknown'}）——摘要将只依赖 TAP 点记录\n`)
+    } catch { /* stderr 也不可写：注解不是判据，不升级为退出码 */ }
+  }
+}
+
+// (b) 逐文件追加一行记录，供 mutation.yml 的「记录 statusReason 摘要与 TAP 空流表征」步聚合。
+//     路径由工作流注入（runner.temp：逐 job 独立、不进缓存也不进 artifact）；未注入时不写——
+//     本地直接跑 shim 不落任何文件，也不会在仓库里留下脏文件。
+function appendTapPointRecord (points, exitCode) {
+  const target = process.env.XBK_TAP_POINTS_LOG
+  if (!target || !isDryRun) return
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    // 单行小 JSON（< PIPE_BUF）：并发 append 不会互相截断
+    fs.appendFileSync(target, JSON.stringify({ file: testFileName || '', points, exit: exitCode }) + '\n')
+  } catch (err) {
+    try {
+      fs.writeSync(2, `tap-shim: TAP 点记录未能写入 ${target}（${err && err.code ? err.code : 'unknown'}）——摘要将看到 0 条记录\n`)
+    } catch { /* stderr 也不可写：摘要侧会因「0 条记录」判红，仍然响亮 */ }
+  }
+}
+
+// 单一出口（C10-008）：投点与落记录必须在**同一处**，且 handler 在模块加载期就注册——
+// skip/fatal/无参三个分支会 process.exit 硬退出（阻止被测文件继续执行），分支里注册的 handler
+// 根本不会存在；而每条路径都必须留记录，散着注册必然漏一两个分支。
+process.on('exit', (code) => {
+  if (!pointEmitted) {
+    // 正常路径：被测文件已跑完（main module），按退出码投唯一那个 TAP 点。
+    emitPoint(code === 0, code === 0 ? undefined : `exit code ${code}`)
+    if (foreignTapLines > 0) {
+      // 已经转发到 stderr，TAP 流里看不到；这里只是如实留证，供 canary 判断风险面。
+      try {
+        fs.writeSync(2, `tap-shim: 正文里出现过 ${foreignTapLines} 行 TAP 形状输出（已转发到 stderr，未污染 TAP 流）\n`)
+      } catch { /* stderr 不可写：留证降级，不影响退出码 */ }
+    }
+  }
+  annotateCoverageJson(deliveredPoints)
+  // 退出码用 process.exitCode 优先：投点失败时 say() 会在本 handler 里把它置 1，而 'exit' 事件带的
+  // code 是 process.exit() 的入参（硬退出那条路径上仍是 0）——记录里必须写**真实**退出码，
+  // 否则「投递失败」在记录里会伪装成「正常退出、只是 0 个点」。
+  appendTapPointRecord(deliveredPoints, process.exitCode == null ? code : process.exitCode)
+})
 
 const decision = resolveSkip(testFileName)
 
@@ -174,15 +258,5 @@ if (!testFileName) {
   // （C10-007：空 stdout + exit 0 会被 tap-parser 判 ok:true）。
   const delivered = emitPoint(true, `SKIP ${decision.skip}`)
   process.exit(delivered ? 0 : 1)
-} else {
-  process.on('exit', (code) => {
-    const ok = code === 0
-    emitPoint(ok, ok ? undefined : `exit code ${code}`)
-    if (foreignTapLines > 0) {
-      // 已经转发到 stderr，TAP 流里看不到；这里只是如实留证，供 canary 判断风险面。
-      try {
-        fs.writeSync(2, `tap-shim: 正文里出现过 ${foreignTapLines} 行 TAP 形状输出（已转发到 stderr，未污染 TAP 流）\n`)
-      } catch { /* stderr 不可写：留证降级，不影响退出码 */ }
-    }
-  })
 }
+// 正常路径无需注册任何东西：上方模块加载期注册的单一 exit handler 会在被测文件跑完后投点 + 落记录。

@@ -597,6 +597,13 @@ jobs:
           # 约 656 次即被截断）。该变量的语义即「已在变异运行内」，同时被 run_mutation.js 与
           # test_run_mutation_cli.js 复用。
           XBK_MUTATION_CHILD: '1'
+          # TAP 档（stryker.tap.config.js）的 tap-shim 在 dry run 里逐文件往这个文件追加一行
+          # {"file":…,"points":成功投递的 TAP 点数,"exit":…}，供下方「记录 statusReason 摘要与 TAP
+          # 空流表征」步聚合出本段真实的 TAP 点数（C10-008）。被 spawn 的测试进程继承本 step env。
+          # 路径取 runner.temp：逐 job 独立（不可能跨运行陈旧）、不进 actions/cache（path: reports）
+          # 也不进 artifact（reports/mutation/）⇒ 崩溃段不会因为多出这个文件而让上传步的
+          # if-no-files-found: error 失效。摘掉本行 = 摘要看不到任何记录 ⇒ 每个 TAP 段判红（fail-closed）。
+          XBK_TAP_POINTS_LOG: ${{ runner.temp }}/tap-points.jsonl
 
       # --timeoutMS（逐段覆盖单次等待上限）：取矩阵的 `timeout_ms`，缺省 300000（= stryker.config.js 的值）。
       #   为什么走 CLI 而不是改配置文件：stryker core 的 config-reader 是 deepMerge(options, cliOptions)
@@ -779,21 +786,38 @@ jobs:
       # 空 TAP 流只返回 ok（tap-parser 对空 stdout 判 {ok:true, skipReason:"no tests found"}）⇒ 该段
       # 一个测试都没跑，全部变异体记 Survived/NoCoverage，报告与「测试跑过但没杀掉」完全同形。
       # 本步在上传前落一份未剥离的摘要（reports/mutation/status-reason-summary.json，随 artifact 到
-      # 汇总 job），并把「TAP 档 + 测试数 0 + 有变异体」单列判红——那不是分数低，而是这一段根本没测。
+      # 汇总 job），并把「TAP 档 + 成功投递的 TAP 点数为 0 + 有变异体」单列判红——那不是分数低，
+      # 而是这一段根本没测。
+      #
+      # ⚠️ 判据是 **tapPoints（shim 成功投递的 TAP 点数）= 0**，**不是**报告里的 tests 条数（C10-008 返工）：
+      #   tap-runner 对**每个测试文件无条件**合成 1 条 TestResult（tapResultToTestResult：id/name 都是
+      #   文件名），所以真·空流时 tests = 文件数（本仓 66），旧判据 `tests == 0` 只在「一个文件都没跑」
+      #   时才成立 ⇒ 它判的不是空流，而是「零文件」。tapPoints 只有 shim 知道（它写不出 TAP 点时按
+      #   C10-007 已置非零退出 + stderr 留证），故由 tap-shim 逐文件落到 XBK_TAP_POINTS_LOG（dry run），
+      #   本步聚合。为什么不读 coverage JSON：tap-runner 的 runFile() 读完就 `fs.rm` 掉它；为什么不读
+      #   mutation.json：它的 testFiles[].tests[] 只有 {id,name}，没有任何覆盖/点位信息。
+      #   fail-closed：记录文件缺失或为空 ⇒ tapPoints=0 ⇒ 判红（「无法证明测试跑过」不得当成跑过）。
       # 与 if-no-files-found: error 的关系（同 reuse.json，**不得放宽**）：只在报**告已存在时**才写文件，
-      # 否则崩溃段会因多出一个文件让上传步的 fail-loud 失效（「stryker 没产出报告 ⇒ 段 job 响亮变红」）。
+      # 否则崩溃段会因多出一个文件让上传步的 fail-loud 失效（「stryker 没产出报告 ⇒ 段 job 响亮变红」）；
+      # 记录文件刻意放 runner.temp 而不是 reports/mutation/，就是为了不制造那个多出来的文件。
       # 为什么用 jq 而不是新增脚本：jq 已在「准备 killed 下降基线」step 用过，这里只做一次性归约；
       # 守卫（scripts/mutation-guard.js）的判据一字未动，本步只加可观测性 + 空流这一条新判据。
       - name: 记录 statusReason 摘要与 TAP 空流表征（${{ matrix.name }}）
         if: always()
         env:
           SEGMENT: ${{ matrix.name }}
+          # 与「变异测试」step 注入给 shim 的是同一个变量名、同一条路径（runner.temp 逐 job 独立）。
+          XBK_TAP_POINTS_LOG: ${{ runner.temp }}/tap-points.jsonl
         run: |
           if [ ! -f reports/mutation/mutation.json ]; then
             echo "ℹ️  无报告产物（stryker 未产出报告），不落 statusReason 摘要（保持 if-no-files-found: error 的 fail-loud）"
             exit 0
           fi
-          jq --arg seg "$SEGMENT" --arg commit "$GITHUB_SHA" '
+          TAP_AGG='{"records":0,"files":0,"points":0,"zeroFiles":0}'
+          if [ -n "$XBK_TAP_POINTS_LOG" ] && [ -s "$XBK_TAP_POINTS_LOG" ]; then
+            TAP_AGG=$(jq -s -c '{records: length, files: (map(.file) | unique | length), points: (map(.points) | add // 0), zeroFiles: (map(select(.points == 0) | .file) | unique | length)}' "$XBK_TAP_POINTS_LOG")
+          fi
+          jq --arg seg "$SEGMENT" --arg commit "$GITHUB_SHA" --argjson tap "$TAP_AGG" '
             def mutants: [.files[]?.mutants[]?];
             { schema: 1,
               segment: $seg,
@@ -802,6 +826,10 @@ jobs:
               mutants: (mutants | length),
               testFiles: ((.testFiles // {}) | length),
               tests: ([.testFiles[]?.tests[]?] | length),
+              tapPoints: $tap.points,
+              tapPointRecords: $tap.records,
+              tapPointFiles: $tap.files,
+              tapPointZeroFiles: $tap.zeroFiles,
               statuses: (mutants
                 | group_by(.status)
                 | map({ key: (.[0].status // "unknown"),
@@ -815,13 +843,18 @@ jobs:
                         value: (map(.statusReason[0:120]) | unique | .[0:3]) })
                 | from_entries),
               emptyTapStream: (((.config.testRunner // "") == "tap")
-                and (([.testFiles[]?.tests[]?] | length) == 0)
+                and ($tap.points == 0)
                 and ((mutants | length) > 0)) }' \
             reports/mutation/mutation.json > reports/mutation/status-reason-summary.json
-          echo "ℹ️  statusReason 摘要：$(jq -c '{mutants, tests, testRunner, emptyTapStream}' reports/mutation/status-reason-summary.json)"
+          echo "ℹ️  statusReason 摘要：$(jq -c '{mutants, tests, tapPoints, tapPointRecords, tapPointFiles, tapPointZeroFiles, testRunner, emptyTapStream}' reports/mutation/status-reason-summary.json)"
+          TAP_RECORDS=$(jq -r '.tapPointRecords' reports/mutation/status-reason-summary.json)
+          TAP_RUNNER=$(jq -r '.testRunner' reports/mutation/status-reason-summary.json)
+          if [ "$TAP_RUNNER" = "tap" ] && [ "$TAP_RECORDS" = "0" ]; then
+            echo "ℹ️  本段没有任何 TAP 点记录（${XBK_TAP_POINTS_LOG:-未注入 XBK_TAP_POINTS_LOG}）：shim 未被预加载或 dry run 标志失效 ⇒ 按 0 点判（fail-closed）" >&2
+          fi
           EMPTY_TAP=$(jq -r '.emptyTapStream' reports/mutation/status-reason-summary.json)
           if [ "$EMPTY_TAP" = "true" ]; then
-            echo "❌ 本段是 TAP 档但测试数为 0（TAP 流为空）：该段变异体全部记 Survived/NoCoverage，不能当作「测试跑过」的结论（摘要已落到 status-reason-summary.json）" >&2
+            echo "❌ 本段是 TAP 档但成功投递的 TAP 点数为 0（tapPoints=0，逐文件记录 ${TAP_RECORDS} 条）：该段变异体全部记 Survived/NoCoverage，不能当作「测试跑过」的结论（摘要已落到 status-reason-summary.json）" >&2
             exit 1
           fi
 
