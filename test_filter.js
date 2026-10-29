@@ -6586,18 +6586,39 @@ console.log('========================================\n');
   // ==================== 89. 配置矩阵(组合爆炸) ====================
   console.log('\n📂 89. 配置矩阵')
 
-  await test('矩阵: 过滤字段全组合 listfilter 不崩', () => {
+  await test('矩阵: 过滤字段全组合（2^10）逐组断言拦截/放行（独立 oracle）', () => {
     const fields = ['pingbifenlei', 'pingbibiaoti', 'zhanxianbiaoti', 'pingbibiaotiplus', 'pingbineirong', 'zhanxianneirong', 'pingbineirongplus', 'pingbilouzhu', 'zhanxianlouzhu', 'pingbilouzhuplus']
     const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '限时大促内容', louzhuregtime: '2026-01-01' }
-    // 2^10 全组合(每个字段 开/关)
-    for (let mask = 0; mask < 1024; mask++) {
-      const cfg = {}
-      for (let i = 0; i < fields.length; i++) {
-        if (mask & (1 << i)) cfg[fields[i]] = '京东'
+    // C4-014：原先 1024 组只断言 `typeof r === 'boolean'`——listfilter 恒 true（或恒 false）也全绿，
+    // 零鉴别力却贡献了「全组合」的覆盖面。这里由**独立 oracle** 按 mask 推导期望值，只依据字段语义
+    // 与夹具文本，不复用 listfilter / compileRules 的实现：
+    //   · 配置值一律 '京东'；夹具里只有标题 '京东神券' 含它（正文/楼主/分类都不含）
+    //   · pingbibiaotiplus 命中即拦（生产里 plus 优先于 show，展示不抵消 plus）
+    //   · pingbibiaoti 命中即拦，但同字段的 zhanxianbiaoti 同时开启时被「展示」抵消
+    //   · 其余 7 个字段在夹具文本里不命中 ⇒ 恒不拦截
+    //   · pingbitime=5 且注册日 2026-01-01 距固定今天 212 天 ⇒ 不拦截
+    // 「今天」必须固定：注册天数是距今自然日差，不固定则期望值随真实日期逐日漂移（同「时间旅行」用例）。
+    const origNow = Date.now
+    Date.now = () => Date.UTC(2026, 7, 1) // 固定"今天"= 2026-08-01 00:00 UTC
+    try {
+      const on = (mask, i) => (mask & (1 << i)) !== 0
+      const expected = (mask) => !(on(mask, 3) || (on(mask, 1) && !on(mask, 2)))
+      let blocked = 0
+      for (let mask = 0; mask < 1024; mask++) {
+        const cfg = {}
+        for (let i = 0; i < fields.length; i++) {
+          if (mask & (1 << i)) cfg[fields[i]] = '京东'
+        }
+        cfg.pingbitime = mask % 3 === 0 ? '5' : ''
+        const r = listfilter(group, cfg)
+        const exp = expected(mask)
+        if (r === false) blocked++
+        assertEqual(r, exp, `组合 ${mask}（${fields.filter((f, i) => mask & (1 << i)).join('+') || '全关'}）期望 ${exp}，实得 ${r}`)
       }
-      cfg.pingbitime = mask % 3 === 0 ? '5' : ''
-      const r = listfilter(group, cfg)
-      assertEqual(typeof r === 'boolean', true, `组合 ${mask} 应返回布尔`)
+      // 矩阵必须双向覆盖：恒放行 / 恒拦截两种退化实现都会让这个计数对不上
+      assertEqual(blocked, 640, `1024 组里应有 640 组被拦截（实得 ${blocked}）`)
+    } finally {
+      Date.now = origNow
     }
   })
 
