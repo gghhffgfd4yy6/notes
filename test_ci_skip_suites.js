@@ -61,9 +61,11 @@ const assertCacheStep = (ymlText) => {
   // dependabot 把 fast-check 4.10.0→4.10.1 后 package-lock.json 变了、主 key 因含依赖指纹而未命中，但
   // 旧形态把依赖只放在主 key 里、兜底前缀不含 deps ⇒ 兜底把旧 inc 原样复原，而 stryker 的
   // incremental-differ 只按**文件内容** diff、不认识依赖版本 ⇒ 19/19 段 100% 复用，依赖升级从未重算。
-  const open = '${'
+  // GitHub 表达式开头 `${` 的常量写法：拼字面量时用不到模板字面量，也不会被 standard 的
+  // no-template-curly-in-string 判红。名字取 EXPR_OPEN——它是一段语法，不是开关/句柄（C4-031）。
+  const EXPR_OPEN = '${'
   assert.strictEqual(keyLine.trim(),
-    'key: stryker-' + open + '{ matrix.name }}-cfg-' + open + '{ matrix.config }}-' + open + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + open + '{ hashFiles(\'package-lock.json\') }}-rng-' + open + '{ matrix.mutate }}-src-' + open + '{ hashFiles(matrix.src) }}',
+    'key: stryker-' + EXPR_OPEN + '{ matrix.name }}-cfg-' + EXPR_OPEN + '{ matrix.config }}-' + EXPR_OPEN + '{ hashFiles(\'stryker.config.js\', \'stryker.tap.config.js\', \'scripts/tap-shim.js\') }}-deps-' + EXPR_OPEN + '{ hashFiles(\'package-lock.json\') }}-rng-' + EXPR_OPEN + '{ matrix.mutate }}-src-' + EXPR_OPEN + '{ hashFiles(matrix.src) }}',
     '缓存 key 必须逐字等于 stryker-<段>-cfg-<档位 matrix.config>-<配置指纹 = 两份 stryker 配置 + scripts/tap-shim.js>' +
     '-deps-<依赖指纹 = package-lock.json>-src-<源指纹 = matrix.src>（不含 -tests- 或本地 run_mutation.js 指纹）' +
     '：PR #156 的「测试指纹强制全量」已回退——它拦不住真根因（假 Killed 来自共享缓存的并发' +
@@ -935,29 +937,20 @@ assert.deepStrictEqual(uncovered, [],
   }
   assert.ok(pathsIgnore.length > 0, 'push 触发应有非空 paths-ignore（否则本断言失去守护对象）')
 
-  // gitignore/minimatch 子集匹配器（只需支持本仓库实际会用的形态：字面路径、`**/*.ext`、`dir/**`）
-  const toRe = (p) => {
-    let re = ''
-    for (let i = 0; i < p.length; i++) {
-      const c = p[i]
-      if (c === '*') {
-        if (p[i + 1] === '*') { // `**` → 任意层级
-          if (p[i + 2] === '/') { re += '(?:[^/]+/)*'; i += 2 } else { re += '.*'; i += 1 }
-        } else re += '[^/]*'
-      } else if (c === '?') re += '[^/]'
-      else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    }
-    return new RegExp('^' + re + '$')
-  }
-  const matchers = pathsIgnore.map(p => ({ p, re: toRe(p) }))
-  const matchedBy = (rel) => matchers.filter(m => m.re.test(rel)).map(m => m.p)
+  // 匹配器：Node 内置 path.matchesGlob（minimatch 口径，与本仓 engines>=22.22.2 已满足 22.5 的要求）。
+  // 这里曾有一份手写的 glob→RegExp 转换（只支持字面路径 / `**/*.ext` / `dir/**` 子集），与
+  // path.matchesGlob 实测在「`.` 开头的路径段」上分歧（手写版把 `.local/x.md` 判给 `**/*.md`，
+  // 而 Node 与 GitHub 的 path filter 都判否）⇒ 判据必须与真实闸门同源，故收敛到同一个实现（C4-021）。
+  const matchers = pathsIgnore.map(p => ({ p }))
+  const matchedBy = (rel) => matchers.filter(m => path.matchesGlob(rel, m.p)).map(m => m.p)
 
   // 匹配器自身的正向对照（防恒假：判据必须能认出 `**/*.md` 会命中 CHANGELOG.md）
   assert.deepStrictEqual(matchedBy('CHANGELOG.md'), [],
     'paths-ignore 不得命中 CHANGELOG.md：它是 check-version.js 版本闸门与 test_filter.js 第 101 章的输入')
-  assert.ok(toRe('**/*.md').test('CHANGELOG.md') && toRe('**/*.md').test('docs/a.md'),
+  assert.ok(path.matchesGlob('CHANGELOG.md', '**/*.md') && path.matchesGlob('docs/a.md', '**/*.md'),
     '匹配器对照：`**/*.md` 必须能命中 CHANGELOG.md（否则本断言恒真、形同虚设）')
-  assert.ok(!toRe('dir/**').test('dir') && toRe('dir/**').test('dir/a/b.js'), '匹配器对照：`dir/**` 应命中目录内部文件')
+  assert.ok(!path.matchesGlob('dir', 'dir/**') && path.matchesGlob('dir/a/b.js', 'dir/**'),
+    '匹配器对照：`dir/**` 应命中目录内部文件')
 
   // 显式「允许被忽略」清单：纯文档（无任何脚本/测试读取）+ 未入库的本机目录 + 议题模板
   const PROSE_DOCS = new Set([
@@ -1008,6 +1001,23 @@ const skipAll = unitFiles.join(',') // 跳过全部单元套件 → 零套件守
 // 用它秒级收尾——过滤后为零套件已被 3f 固定为非 0，不能再拿它当「快速跑完」的挡箭牌。
 const skipAllButOne = unitFiles.filter(f => f !== 'test_check_deps.js').join(',')
 
+// ── 墙钟/轮次常量的单点定义（C4-030）────────────────────────────────────────────────
+// 这些数字原先内联在各用例里（每套件上限、子进程兜底、收敛预算、心跳观测窗、并发回归的
+// 轮次/抖动），而它们与「每套件上限 / 子进程兜底 / 心跳一拍」的耦合只写在散文注释里 ⇒ 改动时
+// 分不清哪个数是**判据**、哪个是**余量**。集中具名后倍数关系直接落在表达式上：
+//   · ENTRY_CONVERGE_BUDGET_MS = 66 × HANG_SUITE_TIMEOUT_MS（余量，不是判据）；
+//   · SPAWN_BAILOUT_MS        = 100 × HANG_SUITE_TIMEOUT_MS（兜底：撞它就是入口没收敛）；
+//   · HEARTBEAT_OBSERVE_MS    = 14 × HEARTBEAT_INTERVAL_MS（14 拍，足以区分「停了」与「还在写」）。
+// 值一律不改（语义与断言强度不变），只把数字搬到有名字的地方。
+const HANG_SUITE_TIMEOUT_MS = 300 // 3g3：喂给入口的每套件上限（判据本体）
+const SPAWN_BAILOUT_MS = 30000 // 测试侧 spawnSync 兜底：撞到它说明入口永久阻塞
+const ENTRY_CONVERGE_BUDGET_MS = 20000 // 3g3：入口收敛预算 = 66 × 每套件上限（余量）
+const TREE_SUITE_TIMEOUT_MS = 1500 // 3g4：带孙进程的每套件上限，必须长过心跳观测窗
+const HEARTBEAT_INTERVAL_MS = 50 // 夹具孙进程的心跳写盘间隔
+const HEARTBEAT_OBSERVE_MS = 14 * HEARTBEAT_INTERVAL_MS // 700ms = 14 拍观测窗
+const SUMMARY_RACE_ROUNDS = 10 // 3b-并发回归：每个 hammer 进程的「写→读回→删」轮次
+const SUMMARY_RACE_JITTER_MS = 2 // 3b-并发回归：轮次内抖动上限（相位按 pid 错开）
+
 // ── 并发假杀隔离：summary 落点必须按进程唯一（PR #158）──────────────────────────
 // Stryker 一次 run 只建**一个**沙箱目录：`--concurrency 8` 时 8 个测试 worker 共用同一份 cwd，于是任何
 // **仓库相对**的共享可写路径都会被并发 worker 写→读→删互相踩。本段原先用固定的「reports/ + 固定名」做
@@ -1023,8 +1033,8 @@ const skipAllButOne = unitFiles.filter(f => f !== 'test_check_deps.js').join(','
 // no-template-curly-in-string 判红（不是靠 eslint-disable 压规则）。
 const CI_SUMMARY_PATH_TEMPLATE = 'reports/<stem>.p<pid>.md'
 const ciSummaryPath = (pid, stem) => CI_SUMMARY_PATH_TEMPLATE.replace('<stem>', stem).replace('<pid>', String(pid))
-const ciSummaryCheck = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
-const ciSummaryOverflow = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
+const ciSummaryCheckPath = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
+const ciSummaryOverflowPath = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
 // 3c+ 的「可写可观测」落点（C4-018）：同一份按 pid 唯一的模板，保证并发 worker 互不可见。
 const ciSummaryChild = ciSummaryPath(process.pid, '.ci-summary-child')
 // 3c 的反面夹具要指到一个**不存在**的目录（真去写就 ENOENT）：同样带 pid 后缀——否则并发 worker 遗留的
@@ -1039,10 +1049,10 @@ try {
   assert.match(unknown.stderr, /test_not_exist\.js/, '错误应点名未知套件')
 
   // 3b CI 下写 summary（验证过滤生效：跳过其余套件 → 只剩 test_check_deps.js 一个）
-  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: ciSummaryCheck })
+  const filtered = runEntry({ SKIP_SUITES: skipAllButOne, GITHUB_STEP_SUMMARY: ciSummaryCheckPath })
   assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout)
   assert.match(filtered.stdout, /共 1 个套件/, '只剩一个套件时应报告 1 个')
-  const summary = fs.readFileSync(ciSummaryCheck, 'utf8')
+  const summary = fs.readFileSync(ciSummaryCheckPath, 'utf8')
   assert.match(summary, /^## 单元测试结果/m, 'CI 下应写入 job summary')
   assert.match(summary, /共 1 套件/, 'summary 套件数应与实际执行数一致')
 
@@ -1078,7 +1088,7 @@ try {
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const overflow = runEntry({
     SKIP_SUITES: skipAllButOne,
-    GITHUB_STEP_SUMMARY: ciSummaryOverflow,
+    GITHUB_STEP_SUMMARY: ciSummaryOverflowPath,
     XBK_UNIT_MAX_BUFFER: '1'
   })
   assert.notStrictEqual(overflow.status, 0, '输出超过 maxBuffer 的套件应判定失败')
@@ -1093,8 +1103,8 @@ try {
   assert.ok(!/全部通过/.test(zero.stdout), '零套件时不得输出「全部通过」')
 } finally {
   // 只删**本进程自己的**落点（并发 worker 的落点文件名不同，互不可见）——清理不漏、也不误删别人
-  fs.rmSync(ciSummaryCheck, { force: true })
-  fs.rmSync(ciSummaryOverflow, { force: true })
+  fs.rmSync(ciSummaryCheckPath, { force: true })
+  fs.rmSync(ciSummaryOverflowPath, { force: true })
   fs.rmSync(ciSummaryChild, { force: true }) // 回归时（写入发生）也不留残渣
 }
 
@@ -1152,7 +1162,7 @@ try {
     ].join('\n')
     // rounds/jitter 取「回退必红、在位必绿」的最小成本档：本机实测共享路径下 5/5 真红（内容被覆盖或 ENOENT），
     // 唯一路径下恒绿；成本主要是 4 个子进程的 node 启动，与轮次基本无关，故不放大轮次（stryker 逐变异体都跑本套件）。
-    const spec = JSON.stringify({ template: CI_SUMMARY_PATH_TEMPLATE, stem: '.ci-summary-check', rounds: 10, jitterMs: 2 })
+    const spec = JSON.stringify({ template: CI_SUMMARY_PATH_TEMPLATE, stem: '.ci-summary-check', rounds: SUMMARY_RACE_ROUNDS, jitterMs: SUMMARY_RACE_JITTER_MS })
     const probeRun = spawnSync(process.execPath, ['-e', runner, path.join(probeDir, 'hammer.js')], {
       encoding: 'utf8',
       cwd: __dirname,
@@ -1170,10 +1180,10 @@ try {
     fs.rmSync(probeDir, { recursive: true, force: true })
   }
   // 唯一性 + 静态双保险：真实落点必须带本进程 pid；固定共享字面量不得再出现（回退即红）。
-  assert.ok(ciSummaryCheck.includes(`.p${process.pid}.md`) && ciSummaryOverflow.includes(`.p${process.pid}.md`),
+  assert.ok(ciSummaryCheckPath.includes(`.p${process.pid}.md`) && ciSummaryOverflowPath.includes(`.p${process.pid}.md`),
     'summary 落点必须带 `.p<pid>.md` 唯一后缀（不带 = 退回共享路径 = 并发 worker 互相删读 ⇒ ENOENT 假 Killed）')
-  assert.notStrictEqual(ciSummaryCheck, ciSummaryOverflow, '同进程内两个落点也必须互不相同')
-  assert.ok(ciSummaryCheck !== ciSummaryPath(process.pid + 1, '.ci-summary-check'),
+  assert.notStrictEqual(ciSummaryCheckPath, ciSummaryOverflowPath, '同进程内两个落点也必须互不相同')
+  assert.ok(ciSummaryCheckPath !== ciSummaryPath(process.pid + 1, '.ci-summary-check'),
     '落点必须随 pid 变化（把 pid 从模板里去掉会让这条断言与并发探针同时红）')
   {
     const selfSrc = fs.readFileSync(__filename, 'utf8')
@@ -1260,13 +1270,13 @@ const hangDir = makeRunTestsSandbox(
 )
 try {
   const t0 = Date.now()
-  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: '300' }, { timeout: 30000 })
+  const hang = runRunTestsIn(hangDir, { XBK_TEST_TIMEOUT: String(HANG_SUITE_TIMEOUT_MS) }, { timeout: SPAWN_BAILOUT_MS })
   const elapsed = Date.now() - t0
   assert.strictEqual(hang.signal, null,
     '入口必须自行结束：被测试侧 30s 兜底杀掉（signal 非 null）说明每套件超时失效，入口仍在永久阻塞')
   assert.notStrictEqual(hang.status, 0, '挂死套件必须让入口以非 0 退出（零假绿）')
   assert.match(hang.stdout, /超过每套件上限 300ms 已强杀/, '失败输出必须点名每套件超时（与断言红区分）')
-  assert.ok(elapsed < 20000, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
+  assert.ok(elapsed < ENTRY_CONVERGE_BUDGET_MS, `入口应在每套件上限后很快结束（实测 ${elapsed}ms）`)
 } finally {
   fs.rmSync(hangDir, { recursive: true, force: true })
 }
@@ -1302,7 +1312,7 @@ const treeDir = makeRunTestsSandbox(
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
       // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
       // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
-      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
+      `setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), ${HEARTBEAT_INTERVAL_MS})`,
       // 同上：孙进程自己也得有上限，否则父进程被外部杀掉后它无人可杀（ppid===1 后 killTree 到不了它）
       'setTimeout(() => process.exit(0), 90000).unref()',
       ''
@@ -1325,7 +1335,7 @@ try {
   let treeOut
   const t0 = Date.now()
   try {
-    tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: '1500' }, { timeout: 30000, stdio: ['ignore', treeOutFd, treeErrFd] })
+    tree = runRunTestsIn(treeDir, { XBK_TEST_TIMEOUT: String(TREE_SUITE_TIMEOUT_MS) }, { timeout: SPAWN_BAILOUT_MS, stdio: ['ignore', treeOutFd, treeErrFd] })
   } finally {
     // 子进程已退出且不再写：先按 fd 取真实大小，再从**位置 0** 显式读回。位置必须显式给 0——子进程继承的是
     // 同一个打开文件描述（dup），写完共享偏移停在 EOF，readFileSync(fd) 会从当前位置读回空串（本机实测）。
@@ -1365,7 +1375,7 @@ try {
     `孙进程心跳必须在入口退出前持续增长（首拍 ${hbTicks[0]} → 末拍 ${hbTicks[hbTicks.length - 1]}，跨 ` +
     `${hbTicks[hbTicks.length - 1] - hbTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const sizeAfterExit = fs.statSync(hb).size
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, HEARTBEAT_OBSERVE_MS)
   const sizeLater = fs.statSync(hb).size
   assert.strictEqual(sizeLater, sizeAfterExit,
     `入口退出后孙进程仍在写心跳（${sizeAfterExit} → ${sizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（F6）`)
@@ -1801,7 +1811,7 @@ const unitTreeDir = makeUnitTestsSandbox(
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
       // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
       // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
-      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
+      `setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), ${HEARTBEAT_INTERVAL_MS})`,
       'setTimeout(() => process.exit(0), 8000)',
       ''
     ].join('\n')
@@ -1837,7 +1847,7 @@ try {
     `孙进程心跳必须在入口退出前持续增长（首拍 ${unitTicks[0]} → 末拍 ${unitTicks[unitTicks.length - 1]}，跨 ` +
     `${unitTicks[unitTicks.length - 1] - unitTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const unitSizeAfterExit = fs.statSync(unitHb).size
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, HEARTBEAT_OBSERVE_MS)
   const unitSizeLater = fs.statSync(unitHb).size
   assert.strictEqual(unitSizeLater, unitSizeAfterExit,
     `入口退出后孙进程仍在写心跳（${unitSizeAfterExit} → ${unitSizeLater} 字节）：每套件超时只杀了直接子进程，孤儿后代存活（C10-003）`)
@@ -2159,13 +2169,13 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   //     ⇒ 那条反例只证明了 key 被锁、**没有**证明兜底被锁（兜底实际由正向 deepStrictEqual 兜住，
   //     但「反例覆盖两个方向」这件事此前是假的）。拆开后每个变体都带「夹具真的改到了目标行」的前置断言。
   {
-    const open = '${'
+    const EXPR_OPEN = '${'
     // 变体 A：**只**把 key 改回 PR #156 的含测试指纹形态 ⇒ key 断言必须红（兜底保持原样，保证正交）
     {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-key-'))
       try {
         const fixture = path.join(dir, 'mutation.yml')
-        const fingerprintKey = 'key: stryker-' + open + '{ matrix.name }}-tests-' + open + "{ hashFiles('test_*.js') }}-src-" + open + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
+        const fingerprintKey = 'key: stryker-' + EXPR_OPEN + '{ matrix.name }}-tests-' + EXPR_OPEN + "{ hashFiles('test_*.js') }}-src-" + EXPR_OPEN + "{ hashFiles('package-lock.json', 'stryker.config.js', 'run_mutation.js', matrix.src) }}"
         const keyRegressed = mutationYml.replace(/^([ \t]*)key: stryker-\$\{\{ matrix\.name \}\}-.*$/m, (m, ind) => ind + fingerprintKey)
         assert.notStrictEqual(keyRegressed, mutationYml,
           '变体 A 夹具必须真的把 key 改成了含测试指纹的形态（没改成本回归形同虚设）')
@@ -2189,7 +2199,7 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-cache-restore-'))
       try {
         const fixture = path.join(dir, 'mutation.yml')
-        const bareRestore = 'stryker-' + open + '{ matrix.name }}-'
+        const bareRestore = 'stryker-' + EXPR_OPEN + '{ matrix.name }}-'
         const restoreRegressed = mutationYml.replace(/^([ \t]*)stryker-\$\{\{ matrix\.name \}\}-cfg-.*$/m, (m, ind) => ind + bareRestore)
         assert.notStrictEqual(restoreRegressed, mutationYml,
           '变体 B 夹具必须真的把兜底前缀退回了裸前缀形态（没改成本回归形同虚设）')
@@ -2573,11 +2583,11 @@ const parseMatrixTimeouts = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIEL
 }
 console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner 契约（testRunner=tap / coverageAnalysis=perTest / tap.testFiles 非空）均已锁（靶向反例已锁）；mutation.yml 矩阵逐段 config 齐备、文件真实存在、恰 v3-entry/storage/qinglong-push/check-deps 四段 command 档，且消费点逐字用 $' + '{' + '{ matrix.config }}（靶向反例已锁）')
 
-// ── 3j 逐段 timeoutMS（console 9 段 60s）的接线契约 ────────────────────────────────────────────
+// ── 3j 逐段 timeoutMS（console 12 段 60s）的接线契约 ────────────────────────────────────────────
 // 为什么必须锁：`timeoutMS` 只允许经 **CLI** 覆盖（`--timeoutMS ${{ matrix.timeout_ms || 300000 }}`），
 //   理由是 stryker core 的 config-reader 是 deepMerge(options, cliOptions)、而「恢复增量缓存」的 key 只
 //   hash 三份配置文件 ⇒ 走 CLI 不进缓存身份、不需要一次性全量重跑；反过来，谁把 timeout 值写进
-//   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 29 段再全量一次（或让日报失去
+//   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 32 段再全量一次（或让日报失去
 //   「本段生效上限」的判据）。这里把三条接线一起锁死，并各配一条靶向反例（改回旧形态立刻红）。
 {
   // 矩阵条目解析：与档位解析共用模块级的 parseMatrixInclude（单点实现，C4-020），
@@ -2645,7 +2655,7 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
     assert.throws(() => assertTimeoutWiring(polluted), /timeout/,
       '缓存身份里出现 timeout 维度后必须红：那会让所有段在每次改上限时全部失效（一次真全量）')
   }
-  console.log('✅ 逐段 timeoutMS：只经 CLI --timeoutMS 覆盖（非 console 段缺省 300000）、恰 console 11 段 60000、缓存身份与两份配置零改动（4 条靶向反例已锁）')
+  console.log(`✅ 逐段 timeoutMS：只经 CLI --timeoutMS 覆盖（非 console 段缺省 300000）、恰 console ${CONSOLE_SEGS.length} 段 60000、缓存身份与两份配置零改动（4 条靶向反例已锁）`)
 }
 
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────

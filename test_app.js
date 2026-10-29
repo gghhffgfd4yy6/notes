@@ -164,7 +164,7 @@ const CACHE_DIR = path.join(__dirname, DEFAULT_CACHE_DIR)
 function assertPathInRoot (targetPath, root, msg) {
   const rootAbs = path.resolve(root)
   const t = path.resolve(targetPath)
-  assert(t !== rootAbs && t.startsWith(rootAbs + path.sep),
+  ok(t !== rootAbs && t.startsWith(rootAbs + path.sep),
     msg || `路径必须位于仓库根之内：${t} 不在 ${rootAbs}${path.sep} 之下`)
   return t
 }
@@ -312,7 +312,11 @@ async function test (name, fn) {
   }
 }
 
-function assert (cond, msg) {
+// 布尔断言（truthy，无返回值）：名字取 ok 而不是 assert——本文件不引入 node:assert，但把布尔语义
+// 的函数叫 assert 会让「从别的测试文件抄来的 assert.strictEqual(...)」在这一行变成
+// `TypeError: assert.strictEqual is not a function`（报错指向调用行、看不出是抄错了文件），
+// grep `assert` 也分不清它是 Node 的模块还是本地布尔断言（C5-069 / C5-084）。test_console.js 同口径。
+function ok (cond, msg) {
   if (!cond) throw new Error(msg || '断言失败')
 }
 
@@ -327,17 +331,24 @@ async function expectRunThrows () {
   } catch (e) {
     threw = true
   }
-  assert(threw, `${currentTestName}：run() 必须抛错（否则后续负向断言恒真，被测失败分支根本没走到）`)
+  ok(threw, `${currentTestName}：run() 必须抛错（否则后续负向断言恒真，被测失败分支根本没走到）`)
 }
 
 // Qodo PR #158 回归用：与 test_filter.js 的 assertEqual / assert.strictEqual 同口径的严格相等断言。
-// 单独命名（assertEqualStr/Num）以免与上面的布尔断言 assert 混淆，也不引入 node:assert。
-function assertEqualStr (actual, expected, msg) {
+// 单独命名（assertStrictEqual）以免与上面的布尔断言 ok 混淆，也不引入 node:assert。
+// 此前它有两个逐字相同的实现（assertEqualStr / assertEqualNum，只差名字）：同一断言两个名字会让
+// 「改错误文案要同步两处」，也让调用面被拆成两半、grep 一个名字看不全（C5-082）。现合并为一个。
+function assertStrictEqual (actual, expected, msg) {
   if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
 }
-function assertEqualNum (actual, expected, msg) {
-  if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
-}
+
+// 命名约定（C5-084）——同一语义只允许一种名字，否则 grep 一种模式找不全：
+//   · 布尔断言 ok(cond, msg)、严格相等 assertStrictEqual(...)、根内路径 assertPathInRoot(...)；
+//   · 保存/还原点一律 orig* 前缀（origWarn / origLog / origCacheDir / origDryRun …）。本文件此前
+//     同一语义混用 orig* / original* / previous* 三套（originalLog、originalCacheDir、previousDryRun…），
+//     改一处保存点得先猜它这一份用的是哪个前缀；现统一到 orig*，快照是对象/整段内容时用具体名
+//     （origConfig / origStateJson），但仍以 orig 开头；
+//   · 布尔断言不再叫 assert（见上），Node 的 assert 因此不会被同名覆写。
 
 function setPushUrl (suffix) {
   // 覆盖 getter，让每个测试用独立缓存文件，避免 _memoryCache 状态污染
@@ -440,21 +451,21 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' }), makeItem({ id: 3, title: '拼多多砍价' })]
     const summary = await xbk.run()
     // run() 返回摘要契约：total/dedup/filtered/pushed/failed
-    assert(summary && summary.total === 3 && summary.dedup === 0 && summary.filtered === 0 &&
+    ok(summary && summary.total === 3 && summary.dedup === 0 && summary.filtered === 0 &&
         summary.pushed === 3 && summary.failed === 0,
         `摘要错误: ${JSON.stringify(summary)}`)
-    assert(pushCalls.length === 3, `应推3条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 3, `应推3条，实际${pushCalls.length}`)
     // text 格式：【分类名】标题
-    assert(pushCalls[0].text === '【微博线报】京东神券 100元', `text格式错误: ${pushCalls[0].text}`)
+    ok(pushCalls[0].text === '【微博线报】京东神券 100元', `text格式错误: ${pushCalls[0].text}`)
     // desp 为 Markdown 内容（来自 content_html）
-    assert(pushCalls[0].desp.includes('原文链接'), 'desp 应含原文链接')
-    assert(pushCalls[0].desp.includes('京东神券 100元'), 'desp 应含 content_html 内容')
-    assert(pushCalls[0].desp.includes('**京东神券 100元**'), 'desp 应含 Markdown 粗体转换结果（v3.90 锁定 htmlToMarkdown 真实链路）')
+    ok(pushCalls[0].desp.includes('原文链接'), 'desp 应含原文链接')
+    ok(pushCalls[0].desp.includes('京东神券 100元'), 'desp 应含 content_html 内容')
+    ok(pushCalls[0].desp.includes('**京东神券 100元**'), 'desp 应含 Markdown 粗体转换结果（v3.90 锁定 htmlToMarkdown 真实链路）')
     // 新数据写入缓存
     const cached = readCacheFile('t01_normal')
-    assert(cached.length === 3, `缓存应有3条，实际${cached.length}`)
+    ok(cached.length === 3, `缓存应有3条，实际${cached.length}`)
     // 缓存保持原始顺序（变异 newMessages.unshift 会倒序写入）
-    assert(cached[0].id === 1 && cached[1].id === 2 && cached[2].id === 3,
+    ok(cached[0].id === 1 && cached[1].id === 2 && cached[2].id === 3,
         `缓存顺序错误: ${cached.map(m => m.id).join(',')}`)
   })
 
@@ -465,8 +476,8 @@ console.log('========================================\n');
     fs.writeFileSync(path.join(CACHE_DIR, 't02_dedup.json'), JSON.stringify([makeItem({ id: 1 })]))
     fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '新数据' })]
     await xbk.run()
-    assert(pushCalls.length === 1, `应只推新数据1条，实际${pushCalls.length}`)
-    assert(pushCalls[0].text.includes('新数据'), '推送的应是新数据')
+    ok(pushCalls.length === 1, `应只推新数据1条，实际${pushCalls.length}`)
+    ok(pushCalls[0].text.includes('新数据'), '推送的应是新数据')
   })
 
   await test('空数据 → 不推送不崩溃', async () => {
@@ -474,7 +485,7 @@ console.log('========================================\n');
     setPushUrl('t03_empty')
     fakeData = []
     await xbk.run()
-    assert(pushCalls.length === 0, '空数据不应推送')
+    ok(pushCalls.length === 0, '空数据不应推送')
   })
 
   await test('过滤诊断：跨运行追加屏蔽原因与保护记录', async () => {
@@ -493,14 +504,14 @@ console.log('========================================\n');
       await xbk.run()
       await xbk.run()
       const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-      assert(records.filter(record => record.type === 'run').length === 2, '两轮运行应写入两条汇总记录')
+      ok(records.filter(record => record.type === 'run').length === 2, '两轮运行应写入两条汇总记录')
       const blocked = records.find(record => record.type === 'item' && record.id === 'diag-blocked')
-      assert(blocked && blocked.decision === 'filtered', '屏蔽条目应写入诊断文件')
-      assert(blocked.reason.configKey === 'pingbibiaoti' && blocked.reason.rule === '屏蔽词', `屏蔽原因不正确: ${JSON.stringify(blocked)}`)
+      ok(blocked && blocked.decision === 'filtered', '屏蔽条目应写入诊断文件')
+      ok(blocked.reason.configKey === 'pingbibiaoti' && blocked.reason.rule === '屏蔽词', `屏蔽原因不正确: ${JSON.stringify(blocked)}`)
       const protectedItem = records.find(record => record.type === 'item' && record.id === 'diag-protected')
-      assert(protectedItem && protectedItem.decision === 'passed', '被保护条目应写入诊断文件')
-      assert(protectedItem.protections.some(entry => entry.configKey === 'zhanxianlouzhu'), '应记录楼主强制展现')
-      assert(protectedItem.skipped.some(entry => entry.configKey === 'pingbibiaoti'), '应记录跳过的标题屏蔽')
+      ok(protectedItem && protectedItem.decision === 'passed', '被保护条目应写入诊断文件')
+      ok(protectedItem.protections.some(entry => entry.configKey === 'zhanxianlouzhu'), '应记录楼主强制展现')
+      ok(protectedItem.skipped.some(entry => entry.configKey === 'pingbibiaoti'), '应记录跳过的标题屏蔽')
     } finally {
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
@@ -509,7 +520,7 @@ console.log('========================================\n');
   await test('dry-run：接口失败时不发送告警通知', async () => {
     reset()
     setPushUrl('t03a_dry_run_fetch_error')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const alertState = path.join(CACHE_DIR, 'alert.state')
     try {
       process.env.XBK_DRY_RUN = '1'
@@ -517,13 +528,13 @@ console.log('========================================\n');
       Config.alert.intervalMs = 0
       fail4xx = true
       await expectRunThrows()
-      assert(pushCalls.length === 0, `dry-run 接口失败不得发送告警，实际 ${pushCalls.length} 次`)
-      assert(!fs.existsSync(alertState), 'dry-run 接口失败不得写入告警状态')
+      ok(pushCalls.length === 0, `dry-run 接口失败不得发送告警，实际 ${pushCalls.length} 次`)
+      ok(!fs.existsSync(alertState), 'dry-run 接口失败不得写入告警状态')
     } finally {
       fail4xx = false
       Config.alert.enabled = false
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(alertState) } catch (e) { /* 忽略 */ }
     }
   })
@@ -531,11 +542,11 @@ console.log('========================================\n');
   await test('dry-run：预览不发送、不写成功缓存或日报', async () => {
     reset()
     setPushUrl('t03b_dry_run_preview')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const reportState = path.join(CACHE_DIR, 'report.state')
     const cachePath = path.join(CACHE_DIR, 't03b_dry_run_preview.json')
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       process.env.XBK_DRY_RUN = '1'
       Config.alert.enabled = true
@@ -543,17 +554,17 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 'dry-run-preview' })]
       console.log = (...args) => logs.push(args.join(' '))
       const summary = await xbk.run()
-      assert(summary && summary.pushed === 0 && summary.failed === 0, `dry-run 摘要不应伪造推送: ${JSON.stringify(summary)}`)
-      assert(pushCalls.length === 0, `dry-run 不得调用通知通道，实际 ${pushCalls.length} 次`)
-      assert(readCacheFile('t03b_dry_run_preview').length === 0, 'dry-run 不得写入成功消息缓存')
-      assert(!fs.existsSync(reportState), 'dry-run 不得写入日报状态')
-      assert(logs.some(line => line.includes('🧪 预览：')), 'dry-run 应输出预览内容')
+      ok(summary && summary.pushed === 0 && summary.failed === 0, `dry-run 摘要不应伪造推送: ${JSON.stringify(summary)}`)
+      ok(pushCalls.length === 0, `dry-run 不得调用通知通道，实际 ${pushCalls.length} 次`)
+      ok(readCacheFile('t03b_dry_run_preview').length === 0, 'dry-run 不得写入成功消息缓存')
+      ok(!fs.existsSync(reportState), 'dry-run 不得写入日报状态')
+      ok(logs.some(line => line.includes('🧪 预览：')), 'dry-run 应输出预览内容')
     } finally {
-      console.log = originalLog
+      console.log = origLog
       Config.alert.enabled = false
       Config.report.enabled = false
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(cachePath) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(reportState) } catch (e) { /* 忽略 */ }
     }
@@ -567,28 +578,28 @@ console.log('========================================\n');
   await test('dry-run：终端「未推送」文案与 run.log 台账口径一致（APP2-04）', async () => {
     reset()
     setPushUrl('t03c_dry_run_account')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const logPath = path.join(CACHE_DIR, 'run.log')
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       process.env.XBK_DRY_RUN = '1'
       fakeData = [makeItem({ id: 'dry-run-account-1' }), makeItem({ id: 'dry-run-account-2', title: '第二条' })]
       console.log = (...args) => logs.push(args.join(' '))
       const summary = await xbk.run()
-      assert(summary && summary.pushed === 0 && summary.failed === 0,
+      ok(summary && summary.pushed === 0 && summary.failed === 0,
         `dry-run 摘要必须 pushed=0/failed=0: ${JSON.stringify(summary)}`)
-      assert(logs.some(line => line.includes('推送:') && line.includes('dry-run 未推送 2 条')),
+      ok(logs.some(line => line.includes('推送:') && line.includes('dry-run 未推送 2 条')),
         `终端应显示未推送条数: ${logs.filter(l => l.includes('推送:')).join(' | ')}`)
-      assert(!logs.some(line => line.includes('条失败，下次运行重试')), 'dry-run 不得共用真实失败文案')
+      ok(!logs.some(line => line.includes('条失败，下次运行重试')), 'dry-run 不得共用真实失败文案')
       const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-      assert(/\sfailed=0\s/.test(` ${lastLine} `), `dry-run run.log 的 failed 应为 0: ${lastLine}`)
-      assert(lastLine.includes('dry-run未推送=2'), `run.log 应另记未推送条数: ${lastLine}`)
+      ok(/\sfailed=0\s/.test(` ${lastLine} `), `dry-run run.log 的 failed 应为 0: ${lastLine}`)
+      ok(lastLine.includes('dry-run未推送=2'), `run.log 应另记未推送条数: ${lastLine}`)
     } finally {
-      console.log = originalLog
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      console.log = origLog
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
   })
@@ -596,11 +607,11 @@ console.log('========================================\n');
   await test('APP-06：单条渲染异常不再中止整轮（按单条失败处理并继续其余条目）', async () => {
     reset()
     setPushUrl('t03e_render_fail')
-    const previousDryRun = process.env.XBK_DRY_RUN
+    const origDryRun = process.env.XBK_DRY_RUN
     const logPath = path.join(CACHE_DIR, 'run.log')
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     let previewCalls = 0
     try {
       // dry-run 的 preview() 位于渲染段末端：把它做成可注入故障，等价于「渲染期抛错」
@@ -615,14 +626,14 @@ console.log('========================================\n');
         logs.push(line)
       }
       const summary = await xbk.run()
-      assert(previewCalls === 2, `渲染异常不得中止整轮：两条都应走到预览，实际 ${previewCalls} 条`)
-      assert(summary && summary.failures.length === 2, `渲染异常应按单条失败计入摘要，实际 ${JSON.stringify(summary && summary.failures)}`)
-      assert(summary.pushed === 0 && summary.failed === 0, `dry-run 摘要口径不变: ${JSON.stringify(summary)}`)
-      assert(logs.some(l => l.includes('内容渲染异常')), '渲染异常应有明确的失败日志')
+      ok(previewCalls === 2, `渲染异常不得中止整轮：两条都应走到预览，实际 ${previewCalls} 条`)
+      ok(summary && summary.failures.length === 2, `渲染异常应按单条失败计入摘要，实际 ${JSON.stringify(summary && summary.failures)}`)
+      ok(summary.pushed === 0 && summary.failed === 0, `dry-run 摘要口径不变: ${JSON.stringify(summary)}`)
+      ok(logs.some(l => l.includes('内容渲染异常')), '渲染异常应有明确的失败日志')
     } finally {
-      console.log = originalLog
-      if (previousDryRun === undefined) delete process.env.XBK_DRY_RUN
-      else process.env.XBK_DRY_RUN = previousDryRun
+      console.log = origLog
+      if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = origDryRun
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(path.join(CACHE_DIR, 't03e_render_fail.json')) } catch (e) { /* 忽略 */ }
     }
@@ -634,21 +645,21 @@ console.log('========================================\n');
     const logPath = path.join(CACHE_DIR, 'run.log')
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       // 通过 isValidItem（对象）但 getMessageIdentity 判无效：无 id/有效 url 且身份来源字段全空
       // （anonKey 退化成固定键 → 显式判无效，避免所有无标识消息互相吞掉）
       fakeData = [{ title: '' }, makeItem({ id: 'noidentity-keep' })]
       console.log = (...args) => logs.push(args.join(' '))
       const summary = await xbk.run()
-      assert(summary && summary.total === 2 && summary.pushed === 1,
+      ok(summary && summary.total === 2 && summary.pushed === 1,
         `身份无效条目仍应计入 total，正常条目应推送: ${JSON.stringify(summary)}`)
-      assert(logs.some(line => line.includes('身份无效:') && line.includes('1 条')),
+      ok(logs.some(line => line.includes('身份无效:') && line.includes('1 条')),
         `终端应单独统计身份无效条目: ${logs.filter(l => l.includes('身份无效')).join(' | ')}`)
       const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-      assert(lastLine.includes('noidentity=1'), `run.log 应记录 noidentity=1: ${lastLine}`)
+      ok(lastLine.includes('noidentity=1'), `run.log 应记录 noidentity=1: ${lastLine}`)
     } finally {
-      console.log = originalLog
+      console.log = origLog
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
   })
@@ -670,9 +681,9 @@ console.log('========================================\n');
       await xbk.run()
       const log = fs.readFileSync(logPath, 'utf8')
       const pkgVersion = require('./package.json').version
-      assert(log.includes(`ALERT [v${pkgVersion}]`),
+      ok(log.includes(`ALERT [v${pkgVersion}]`),
         `告警留痕应带注入的 PKG_VERSION(v${pkgVersion})：${log.split('\n').filter(l => l.includes('ALERT')).join(' | ')}`)
-      assert(!log.includes('[vundefined]'), '不得回落到 undefined 版本（缺 package.json 的部署场景）')
+      ok(!log.includes('[vundefined]'), '不得回落到 undefined 版本（缺 package.json 的部署场景）')
     } finally {
       Config.alert.enabled = origAlert
       Config.alert.intervalMs = origInterval
@@ -686,19 +697,19 @@ console.log('========================================\n');
     reset()
     setPushUrl('t03f_log_control_chars')
     const logs = []
-    const originalLog = console.log
+    const origLog = console.log
     try {
       // 接口脏数据：标题含换行/TAB/ANSI ESC——按行解析日志的青龙侧会被伪造出额外日志行
       fakeData = [makeItem({ id: 'ctl-1', title: '前段\n伪造行\t尾段\u001b[31m红' })]
       console.log = (...args) => logs.push(args.join(' '))
       await xbk.run()
       const itemLine = logs.find(l => l.includes('发现到新数据'))
-      assert(itemLine, `应输出「发现到新数据」回显行: ${logs.slice(0, 5).join(' | ')}`)
-      assert(!itemLine.includes('\n') && !itemLine.includes('\t') && !itemLine.includes('\u001b'),
+      ok(itemLine, `应输出「发现到新数据」回显行: ${logs.slice(0, 5).join(' | ')}`)
+      ok(!itemLine.includes('\n') && !itemLine.includes('\t') && !itemLine.includes('\u001b'),
         `回显行不得含控制字符: ${JSON.stringify(itemLine)}`)
-      assert(itemLine.includes('前段 伪造行 尾段'), '控制字符应被替换为空格而非删除内容')
+      ok(itemLine.includes('前段 伪造行 尾段'), '控制字符应被替换为空格而非删除内容')
     } finally {
-      console.log = originalLog
+      console.log = origLog
     }
   })
 
@@ -713,8 +724,8 @@ console.log('========================================\n');
       await xbk.run()
       const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
       const blocked = records.find(record => record.type === 'item' && record.id === 'diag-keyword')
-      assert(blocked && blocked.decision === 'filtered', '只看它未命中应写入屏蔽记录')
-      assert(blocked.reason.configKey === 'zkt_gjc' && blocked.reason.kind === 'whitelist', `只看它原因不正确: ${JSON.stringify(blocked)}`)
+      ok(blocked && blocked.decision === 'filtered', '只看它未命中应写入屏蔽记录')
+      ok(blocked.reason.configKey === 'zkt_gjc' && blocked.reason.kind === 'whitelist', `只看它原因不正确: ${JSON.stringify(blocked)}`)
     } finally {
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
@@ -730,8 +741,8 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 'diag-string-false', title: '普通放行条目' })]
       await xbk.run()
       const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-      assert(records.some(record => record.type === 'run'), '应写入本轮汇总')
-      assert(!records.some(record => record.type === 'item' && record.id === 'diag-string-false'), '字符串 false 不应记录普通放行条目')
+      ok(records.some(record => record.type === 'run'), '应写入本轮汇总')
+      ok(!records.some(record => record.type === 'item' && record.id === 'diag-string-false'), '字符串 false 不应记录普通放行条目')
     } finally {
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
@@ -749,8 +760,8 @@ console.log('========================================\n');
       await xbk.run()
       const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
       const run = records.find(record => record.type === 'run')
-      assert(run.detailCount === 1, `明细应按上限截断: ${JSON.stringify(run)}`)
-      assert(run.byReason['title.block.pingbibiaoti'] === 3, `汇总必须统计全部屏蔽项: ${JSON.stringify(run)}`)
+      ok(run.detailCount === 1, `明细应按上限截断: ${JSON.stringify(run)}`)
+      ok(run.byReason['title.block.pingbibiaoti'] === 3, `汇总必须统计全部屏蔽项: ${JSON.stringify(run)}`)
     } finally {
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
     }
@@ -764,8 +775,8 @@ console.log('========================================\n');
     setPushUrl('t04_norm')
     fakeData = [{ id: 1, category_name: '测试分类', category_id: '42', title: '归一化测试', content: '内容', url: '/x/1.html' }]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推1条')
-    assert(pushCalls[0].text === '【测试分类】归一化测试', `分类未归一化: ${pushCalls[0].text}`)
+    ok(pushCalls.length === 1, '应推1条')
+    ok(pushCalls[0].text === '【测试分类】归一化测试', `分类未归一化: ${pushCalls[0].text}`)
   })
 
   await test('category_id 自动映射为 cateid（{分类ID} 占位符生效）', async () => {
@@ -773,11 +784,11 @@ console.log('========================================\n');
     setPushUrl('t45_cateid')
     fakeData = [{ id: 1, category_id: '42', category_name: '测试', title: '分类ID测试', content: 'x', url: '/c/1.html' }]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推1条')
+    ok(pushCalls.length === 1, '应推1条')
     // {分类ID} 只出现在自定义模板里；通过 tuisong_replace 直接验证映射
     const { tuisong_replace } = xbk
     const r = tuisong_replace('ID:{分类ID}', { category_id: '42' })
-    assert(r === 'ID:42', `category_id 应映射为 cateid: ${r}`)
+    ok(r === 'ID:42', `category_id 应映射为 cateid: ${r}`)
   })
 
   // ==================== 3. 批内去重 ====================
@@ -788,7 +799,7 @@ console.log('========================================\n');
     setPushUrl('t05_batch_dup')
     fakeData = [makeItem({ id: 9 }), makeItem({ id: 9, title: '重复项' })]
     await xbk.run()
-    assert(pushCalls.length === 1, `同id应只推1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `同id应只推1条，实际${pushCalls.length}`)
   })
 
   await test('同一批重复 url（无id）→ 只收录1条', async () => {
@@ -799,7 +810,7 @@ console.log('========================================\n');
       { url: '/u/1.html', catename: 'a', title: 'A2', content: 'c' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `同url应只推1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `同url应只推1条，实际${pushCalls.length}`)
   })
 
   await test('批内 id-ful 与无 id 同 url → 只收录1条（v3.176 修复#2：口径对齐）', async () => {
@@ -812,9 +823,9 @@ console.log('========================================\n');
       { url: '/m/1.html', catename: 'a', title: '无id', content: 'c' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `id-ful+无id同url应只推1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `id-ful+无id同url应只推1条，实际${pushCalls.length}`)
     const cached = readCacheFile('t06b_mixed_dup')
-    assert(cached.length === 1, `缓存应只有1条，实际${cached.length}`)
+    ok(cached.length === 1, `缓存应只有1条，实际${cached.length}`)
   })
 
   await test('批内无 id 与有 id 同 url → 只收录1条（v3.176 修复#2 反向）', async () => {
@@ -825,7 +836,7 @@ console.log('========================================\n');
       { id: 2, url: '/m/2.html', catename: 'a', title: '有id', content: 'c' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `无id在前+有id同url应只推1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `无id在前+有id同url应只推1条，实际${pushCalls.length}`)
   })
 
   await test('缓存垃圾 url 不应拦截新有效 id 消息', async () => {
@@ -836,9 +847,9 @@ console.log('========================================\n');
     ]))
     fakeData = [{ id: 123, url: '#', catename: 'a', title: '新有效 ID', content: 'new' }]
     await xbk.run()
-    assert(pushCalls.length === 1, `新有效 id 消息不应被垃圾 URL 判重，实际推送${pushCalls.length}条`)
+    ok(pushCalls.length === 1, `新有效 id 消息不应被垃圾 URL 判重，实际推送${pushCalls.length}条`)
     const summary = await xbk.run()
-    assert(summary.pushed === 0 && summary.dedup === 1, `第二次应只按有效 id 去重: ${JSON.stringify(summary)}`)
+    ok(summary.pushed === 0 && summary.dedup === 1, `第二次应只按有效 id 去重: ${JSON.stringify(summary)}`)
   })
 
   await test('垃圾 url（#/?x=1）归一为空 → anonKey 化不互判重（v3.176 修复#5）', async () => {
@@ -850,7 +861,7 @@ console.log('========================================\n');
       { url: '?x=1', catename: 'a', title: '垃圾B', content: '内容B' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 2, `两条不同内容垃圾url应全推，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `两条不同内容垃圾url应全推，实际${pushCalls.length}`)
     // 跨运行：anonKey 稳定 → 下次全去重（不重复推送）
     reset()
     setPushUrl('t06d_garbage_url')
@@ -859,7 +870,7 @@ console.log('========================================\n');
       { url: '?x=1', catename: 'a', title: '垃圾B', content: '内容B' }
     ]
     const s2 = await xbk.run()
-    assert(s2.pushed === 0 && s2.dedup === 2, `二次应全去重: ${JSON.stringify(s2)}`)
+    ok(s2.pushed === 0 && s2.dedup === 2, `二次应全去重: ${JSON.stringify(s2)}`)
   })
 
   await test('批内无id非字符串 url → 不得误判重，改走匿名身份（v3.228）', async () => {
@@ -870,10 +881,10 @@ console.log('========================================\n');
       { url: {}, catename: 'a', title: '对象URL-B', content: '内容B' }
     ]
     const summary = await xbk.run()
-    assert(summary && summary.dedup === 0 && summary.pushed === 2,
+    ok(summary && summary.dedup === 0 && summary.pushed === 2,
         `非字符串 URL 不应把不同匿名消息判重: ${JSON.stringify(summary)}`)
-    assert(pushCalls.length === 2, `两条不同消息都应推送，实际${pushCalls.length}`)
-    assert(readCacheFile('t06e_invalid_url_type').length === 2, '两条消息都应进入缓存')
+    ok(pushCalls.length === 2, `两条不同消息都应推送，实际${pushCalls.length}`)
+    ok(readCacheFile('t06e_invalid_url_type').length === 2, '两条消息都应进入缓存')
   })
 
   await test('标题屏蔽规则 → 命中数据不推送', async () => {
@@ -882,8 +893,8 @@ console.log('========================================\n');
     Config.filter.pingbibiaoti = '京东'
     fakeData = [makeItem({ id: 1, title: '京东神券' }), makeItem({ id: 2, title: '淘宝特价' })]
     await xbk.run()
-    assert(pushCalls.length === 1, `应只推淘宝1条，实际${pushCalls.length}`)
-    assert(pushCalls[0].text.includes('淘宝'), '推送的应是淘宝')
+    ok(pushCalls.length === 1, `应只推淘宝1条，实际${pushCalls.length}`)
+    ok(pushCalls[0].text.includes('淘宝'), '推送的应是淘宝')
   })
 
   await test('分类屏蔽规则 → 命中分类不推送', async () => {
@@ -892,7 +903,7 @@ console.log('========================================\n');
     Config.filter.pingbifenlei = '赚客吧'
     fakeData = [makeItem({ id: 1, catename: '赚客吧' }), makeItem({ id: 2, catename: '微博线报' })]
     await xbk.run()
-    assert(pushCalls.length === 1, `应只推微博1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `应只推微博1条，实际${pushCalls.length}`)
   })
 
   // ==================== 5. 只看它过滤 ====================
@@ -904,8 +915,8 @@ console.log('========================================\n');
     Config.keyword.zkt_gjc = '京东'
     fakeData = [makeItem({ id: 1, title: '京东神券' }), makeItem({ id: 2, title: '淘宝特价' })]
     await xbk.run()
-    assert(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
-    assert(pushCalls[0].text.includes('京东'), '推送的应是京东')
+    ok(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
+    ok(pushCalls[0].text.includes('京东'), '推送的应是京东')
   })
 
   await test('zkt_gjc + frozen item → 不抛错（C041）', async () => {
@@ -918,9 +929,9 @@ console.log('========================================\n');
     ]
     let crashed = false
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(!crashed, `frozen item + zkt_gjc 不应抛错: ${crashed}`)
-    assert(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
-    assert(pushCalls[0].text.includes('京东'), '推送的应是京东')
+    ok(!crashed, `frozen item + zkt_gjc 不应抛错: ${crashed}`)
+    ok(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
+    ok(pushCalls[0].text.includes('京东'), '推送的应是京东')
   })
 
   // ==================== 6. fetchData 重试 ====================
@@ -932,8 +943,8 @@ console.log('========================================\n');
     failCount = 1 // 第一次失败，第二次成功
     fakeData = [makeItem({ id: 1 })]
     await xbk.run()
-    assert(gotCalls.length === 2, `应请求2次，实际${gotCalls.length}`)
-    assert(pushCalls.length === 1, '重试成功后应推送')
+    ok(gotCalls.length === 2, `应请求2次，实际${gotCalls.length}`)
+    ok(pushCalls.length === 1, '重试成功后应推送')
   })
 
   await test('4xx 客户端错误 → 不重试直接失败，不崩溃', async () => {
@@ -947,9 +958,9 @@ console.log('========================================\n');
       crashed = true
     }
     // 修复后 run() 重新抛出，让 cron/调度感知失败
-    assert(crashed, '4xx 应抛出异常（不再静默吞错）')
-    assert(gotCalls.length === 1, `4xx 不应重试，实际请求${gotCalls.length}次`)
-    assert(pushCalls.length === 0, '4xx 不应推送')
+    ok(crashed, '4xx 应抛出异常（不再静默吞错）')
+    ok(gotCalls.length === 1, `4xx 不应重试，实际请求${gotCalls.length}次`)
+    ok(pushCalls.length === 0, '4xx 不应推送')
   })
 
   await test('425 Too Early → 重试成功（P2：fetchData 与 failure_policy RETRYABLE_CODES 收敛）', async () => {
@@ -958,8 +969,8 @@ console.log('========================================\n');
     fail425Once = true // 第一次 425，第二次成功
     fakeData = [makeItem({ id: 1 })]
     await xbk.run()
-    assert(gotCalls.length === 2, `425 应重试，实际请求${gotCalls.length}次`)
-    assert(pushCalls.length === 1, '425 重试成功后应推送')
+    ok(gotCalls.length === 2, `425 应重试，实际请求${gotCalls.length}次`)
+    ok(pushCalls.length === 1, '425 重试成功后应推送')
   })
 
   // ==================== 7. 组合场景 ====================
@@ -977,8 +988,8 @@ console.log('========================================\n');
       makeItem({ id: 1, title: '重复京东' }) // 批内去重
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `应只推1条，实际${pushCalls.length}`)
-    assert(pushCalls[0].text.includes('京东神券'), '应推 id=1')
+    ok(pushCalls.length === 1, `应只推1条，实际${pushCalls.length}`)
+    ok(pushCalls[0].text.includes('京东神券'), '应推 id=1')
   })
 
   // ==================== 7.5 无标识数据去重 ====================
@@ -993,7 +1004,7 @@ console.log('========================================\n');
       { catename: 'a', title: '无标识3', content: 'z' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 3, `应推3条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 3, `应推3条，实际${pushCalls.length}`)
   })
 
   await test('批内无id同url重复 → 只推1条（url fallback 生效）', async () => {
@@ -1005,7 +1016,7 @@ console.log('========================================\n');
       { url: '/u/2.html', catename: 'a', title: 'B', content: 'z' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 2, `应推2条(A+B)，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `应推2条(A+B)，实际${pushCalls.length}`)
   })
 
   // ==================== 7.6 keyword 非法正则 ====================
@@ -1018,9 +1029,9 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' })]
     let crashed = false
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(!crashed, '不应崩溃')
+    ok(!crashed, '不应崩溃')
     // 非法正则时 items 不过滤，全部推送
-    assert(pushCalls.length === 2, `应推2条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `应推2条，实际${pushCalls.length}`)
   })
 
   await test('zkt_gjc 合法正则 → 正常过滤（行为不受影响）', async () => {
@@ -1029,7 +1040,7 @@ console.log('========================================\n');
     Config.keyword.zkt_gjc = '京东'
     fakeData = [makeItem({ id: 1, title: '京东神券' }), makeItem({ id: 2, title: '淘宝特价' })]
     await xbk.run()
-    assert(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `应只推京东1条，实际${pushCalls.length}`)
   })
 
   await test('推送部分失败 → 只缓存推送成功的（v3.18审查Bug1）', async () => {
@@ -1040,14 +1051,14 @@ console.log('========================================\n');
     Config.filter.pingbibiaoti = '过滤掉'
     const summary = await xbk.run()
     // 摘要应正确区分：3 获取、1 过滤、1 成功、1 失败
-    assert(summary && summary.total === 3 && summary.dedup === 0 && summary.filtered === 1 &&
+    ok(summary && summary.total === 3 && summary.dedup === 0 && summary.filtered === 1 &&
         summary.pushed === 1 && summary.failed === 1,
         `摘要错误: ${JSON.stringify(summary)}`)
-    assert(pushCalls.length === 1, `应成功推1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `应成功推1条，实际${pushCalls.length}`)
     // 缓存: 成功推送的 id=1 + 被过滤的 id=3（id=2 失败不缓存）
     const cached = readCacheFile('t20_partial')
     const ids = cached.map(m => m.id).sort()
-    assert(ids.join(',') === '1,3', `缓存应为[1,3]，实际[${ids}]`)
+    ok(ids.join(',') === '1,3', `缓存应为[1,3]，实际[${ids}]`)
   })
 
   await test('匿名数据（无id无url）跨运行去重（v3.18审查Bug2：合成id）', async () => {
@@ -1055,19 +1066,19 @@ console.log('========================================\n');
     setPushUrl('t21_anon_rerun')
     fakeData = [{ title: '匿名甲', content: '内容A', catename: 'a' }]
     await xbk.run()
-    assert(pushCalls.length === 1, '第一次运行应推送')
+    ok(pushCalls.length === 1, '第一次运行应推送')
     // 第二次运行相同数据（title+content 相同 → 合成 id 相同 → 去重）
     reset()
     setPushUrl('t21_anon_rerun')
     fakeData = [{ title: '匿名甲', content: '内容A', catename: 'a' }]
     await xbk.run()
-    assert(pushCalls.length === 0, '第二次运行相同匿名数据应去重')
+    ok(pushCalls.length === 0, '第二次运行相同匿名数据应去重')
     // 不同内容 → 不判重
     reset()
     setPushUrl('t21_anon_rerun')
     fakeData = [{ title: '匿名甲', content: '内容B', catename: 'a' }]
     await xbk.run()
-    assert(pushCalls.length === 1, '内容不同应重新推送')
+    ok(pushCalls.length === 1, '内容不同应重新推送')
   })
 
   // ==================== 7.7 v3.18 第二轮审查修复 ====================
@@ -1081,9 +1092,9 @@ console.log('========================================\n');
       let crashed = false
       let msg = ''
       try { await xbk.run() } catch (e) { crashed = true; msg = e.message || '' }
-      assert(crashed, `返回 ${JSON.stringify(bad).slice(0, 20)} 应抛出异常`)
+      ok(crashed, `返回 ${JSON.stringify(bad).slice(0, 20)} 应抛出异常`)
       // 无校验时 for...of 也会抛错但信息晦涩（如 "is not iterable"），校验应给出友好提示
-      assert(msg.includes('格式异常'), `错误信息应友好，实际: ${msg.slice(0, 60)}`)
+      ok(msg.includes('格式异常'), `错误信息应友好，实际: ${msg.slice(0, 60)}`)
     }
   })
 
@@ -1095,7 +1106,7 @@ console.log('========================================\n');
       { title: '活动', content: '详情', posttime: 1785432600, catename: 'a' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 2, `不同posttime应推2条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `不同posttime应推2条，实际${pushCalls.length}`)
   })
 
   await test('匿名数据同title+content+posttime → 合并去重', async () => {
@@ -1106,7 +1117,7 @@ console.log('========================================\n');
       { title: '活动', content: '详情', posttime: 1785346200, catename: 'a' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `完全相同应推1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `完全相同应推1条，实际${pushCalls.length}`)
   })
 
   // ==================== 7.8 v3.20 审查修复 ====================
@@ -1117,9 +1128,9 @@ console.log('========================================\n');
     setPushUrl('t25_nourl')
     fakeData = [{ id: 1, catename: 'a', title: '无链接数据', content: 'x' }] // 无 url
     await xbk.run()
-    assert(pushCalls.length === 1, '应推送')
-    assert(!pushCalls[0].text.includes('undefined'), `链接不应含undefined: ${pushCalls[0].text.slice(0, 80)}`)
-    assert(!pushCalls[0].desp.includes('undefined'), 'desp 不应含 undefined')
+    ok(pushCalls.length === 1, '应推送')
+    ok(!pushCalls[0].text.includes('undefined'), `链接不应含undefined: ${pushCalls[0].text.slice(0, 80)}`)
+    ok(!pushCalls[0].desp.includes('undefined'), 'desp 不应含 undefined')
   })
 
   await test('数组含非对象元素 → 跳过不崩溃（v3.20审查3）', async () => {
@@ -1133,8 +1144,8 @@ console.log('========================================\n');
     ]
     let crashed = false
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(!crashed, '非对象元素不应导致崩溃')
-    assert(pushCalls.length === 1, `应只推正常数据1条，实际${pushCalls.length}`)
+    ok(!crashed, '非对象元素不应导致崩溃')
+    ok(pushCalls.length === 1, `应只推正常数据1条，实际${pushCalls.length}`)
   })
 
   await test('id为null的两条不同记录 → 不误合并（v3.20审查2）', async () => {
@@ -1145,7 +1156,7 @@ console.log('========================================\n');
       { id: null, catename: 'a', title: '乙', content: 'y', url: '/u/2.html' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 2, `不同url应推2条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `不同url应推2条，实际${pushCalls.length}`)
   })
 
   // ==================== 7.9 v3.22 审查修复 ====================
@@ -1159,11 +1170,11 @@ console.log('========================================\n');
       makeItem({ id: 2, url: '/relative/2.html' })
     ]
     await xbk.run()
-    assert(pushCalls.length === 2, '应推2条')
+    ok(pushCalls.length === 2, '应推2条')
     // URL 在 desp(Markdown 原文链接)里：绝对 URL 原样，相对 URL 拼 domain
-    assert(pushCalls[0].desp.includes('https://other.com/path/1.html'), `绝对URL不应拼前缀: ${pushCalls[0].desp.slice(0, 80)}`)
-    assert(!pushCalls[0].desp.includes('new.ixbk.nethttps://'), '不应双重前缀')
-    assert(pushCalls[1].desp.includes('https://new.ixbk.net/relative/2.html'), '相对URL应拼前缀')
+    ok(pushCalls[0].desp.includes('https://other.com/path/1.html'), `绝对URL不应拼前缀: ${pushCalls[0].desp.slice(0, 80)}`)
+    ok(!pushCalls[0].desp.includes('new.ixbk.nethttps://'), '不应双重前缀')
+    ok(pushCalls[1].desp.includes('https://new.ixbk.net/relative/2.html'), '相对URL应拼前缀')
   })
 
   // ==================== 7.10 审查2轮: 空白url与url形态 ====================
@@ -1178,7 +1189,7 @@ console.log('========================================\n');
       { catename: 'a', title: '空白丙', content: 'z', url: ' ' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 3, `应推3条，实际${pushCalls.length}（修复前丢失2条）`)
+    ok(pushCalls.length === 3, `应推3条，实际${pushCalls.length}（修复前丢失2条）`)
   })
 
   await test('同资源不同url形态批内 → 判重推1条（审查2 BugB）', async () => {
@@ -1189,7 +1200,7 @@ console.log('========================================\n');
       { catename: 'a', title: '形态乙', content: 'x', url: 'dup/1.html/' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `应推1条，实际${pushCalls.length}（修复前重复推送）`)
+    ok(pushCalls.length === 1, `应推1条，实际${pushCalls.length}（修复前重复推送）`)
   })
 
   // ==================== 7.11 审查3轮: 协议与空白关键词 ====================
@@ -1200,9 +1211,9 @@ console.log('========================================\n');
     setPushUrl('t31_ftp')
     fakeData = [makeItem({ id: 1, url: 'ftp://files.x.com/a.zip' })]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推送')
-    assert(pushCalls[0].desp.includes('ftp://files.x.com/a.zip'), 'ftp URL 不应拼前缀')
-    assert(!pushCalls[0].desp.includes('new.ixbk.netftp'), '不应拼坏')
+    ok(pushCalls.length === 1, '应推送')
+    ok(pushCalls[0].desp.includes('ftp://files.x.com/a.zip'), 'ftp URL 不应拼前缀')
+    ok(!pushCalls[0].desp.includes('new.ixbk.netftp'), '不应拼坏')
   })
 
   await test('空白关键词 → 忽略过滤全推（审查3 C）', async () => {
@@ -1211,7 +1222,7 @@ console.log('========================================\n');
     Config.keyword.zkt_gjc = ' ' // 空白关键词(合法正则但误配)
     fakeData = [makeItem({ id: 1, title: '京东神券' }), makeItem({ id: 2, title: '淘宝特价' })]
     await xbk.run()
-    assert(pushCalls.length === 2, `空白关键词应忽略过滤全推，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `空白关键词应忽略过滤全推，实际${pushCalls.length}`)
   })
 
   // ==================== 7.12 审查4轮: 429与数组元素 ====================
@@ -1223,8 +1234,8 @@ console.log('========================================\n');
     fail429Once = true // 第一次抛 429，第二次成功
     fakeData = [makeItem({ id: 1 })]
     await xbk.run()
-    assert(gotCalls.length === 2, `429 应重试，实际请求${gotCalls.length}次`)
-    assert(pushCalls.length === 1, '重试成功后应推送')
+    ok(gotCalls.length === 2, `429 应重试，实际请求${gotCalls.length}次`)
+    ok(pushCalls.length === 1, '重试成功后应推送')
   })
 
   await test('非 JSON 响应 → .json() 抛错重试成功（真实 got 行为）', async () => {
@@ -1233,8 +1244,8 @@ console.log('========================================\n');
     failNonJson = true // 第一次返回非 JSON，第二次成功
     fakeData = [makeItem({ id: 1 })]
     await xbk.run()
-    assert(gotCalls.length === 2, `非 JSON 应重试，实际请求${gotCalls.length}次`)
-    assert(pushCalls.length === 1, '重试成功后应推送')
+    ok(gotCalls.length === 2, `非 JSON 应重试，实际请求${gotCalls.length}次`)
+    ok(pushCalls.length === 1, '重试成功后应推送')
   })
 
   await test('数组元素嵌套 → 跳过不推送（审查4-3）', async () => {
@@ -1245,7 +1256,7 @@ console.log('========================================\n');
       { id: 1, catename: 'a', title: '正常', content: 'x', url: '/n/1.html' }
     ]
     await xbk.run()
-    assert(pushCalls.length === 1, `数组元素应被跳过，只推正常1条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `数组元素应被跳过，只推正常1条，实际${pushCalls.length}`)
   })
 
   // ==================== 7.13 审查9轮: 空标题/非Error异常 ====================
@@ -1256,8 +1267,8 @@ console.log('========================================\n');
     setPushUrl('t35_notitle')
     fakeData = [{ id: 1, catename: 'a', title: '', content: 'x', url: '/n/1.html' }]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推送')
-    assert(pushCalls[0].text.includes('(无标题)'), '空标题应占位')
+    ok(pushCalls.length === 1, '应推送')
+    ok(pushCalls[0].text.includes('(无标题)'), '空标题应占位')
   })
 
   await test('接口抛非Error(字符串) → 不崩溃（审查9-D）', async () => {
@@ -1266,7 +1277,7 @@ console.log('========================================\n');
     failPlainString = true // 每次请求抛普通字符串(非 Error)
     let crashed = false
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(crashed, '非 Error 异常应被捕获并重抛')
+    ok(crashed, '非 Error 异常应被捕获并重抛')
   })
 
   // ==================== 7.14 审查10轮: 空标题保留/URL拼接 ====================
@@ -1282,7 +1293,7 @@ console.log('========================================\n');
       { id: 3, catename: 'a', title: '淘宝特价', content: 'z', url: '/n/3.html' } // 关键词不匹配滤掉
     ]
     await xbk.run()
-    assert(pushCalls.length === 2, `空标题+京东应推2条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `空标题+京东应推2条，实际${pushCalls.length}`)
   })
 
   await test('相对URL拼接无双斜杠（审查10 #268）', async () => {
@@ -1293,10 +1304,10 @@ console.log('========================================\n');
       makeItem({ id: 2, url: '/with/slash.html' }) // 有前导 /
     ]
     await xbk.run()
-    assert(pushCalls.length === 2)
-    assert(pushCalls[0].desp.includes('https://new.ixbk.net/rel/no-slash.html'), `相对无斜杠应补斜杠: ${pushCalls[0].desp.slice(0, 80)}`)
-    assert(!pushCalls[0].desp.includes('//rel/'), '不应双斜杠')
-    assert(pushCalls[1].desp.includes('https://new.ixbk.net/with/slash.html'), '有斜杠正常')
+    ok(pushCalls.length === 2)
+    ok(pushCalls[0].desp.includes('https://new.ixbk.net/rel/no-slash.html'), `相对无斜杠应补斜杠: ${pushCalls[0].desp.slice(0, 80)}`)
+    ok(!pushCalls[0].desp.includes('//rel/'), '不应双斜杠')
+    ok(pushCalls[1].desp.includes('https://new.ixbk.net/with/slash.html'), '有斜杠正常')
   })
 
   // ==================== 7.15 审查10轮批量: 推送截断 ====================
@@ -1307,10 +1318,10 @@ console.log('========================================\n');
     setPushUrl('t39_trunc')
     fakeData = [makeItem({ id: 1, title: '超'.repeat(500), content: '内容'.repeat(5000), url: '/n/1.html' })]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推送')
+    ok(pushCalls.length === 1, '应推送')
     // 标题截断到 100，内容截断到 3000
-    assert(pushCalls[0].text.length <= 150, `标题应截断: ${pushCalls[0].text.length}`)
-    assert(pushCalls[0].desp.length <= 3200, `内容应截断: ${pushCalls[0].desp.length}`)
+    ok(pushCalls[0].text.length <= 150, `标题应截断: ${pushCalls[0].text.length}`)
+    ok(pushCalls[0].desp.length <= 3200, `内容应截断: ${pushCalls[0].desp.length}`)
   })
 
   // ==================== 7.16 审查10轮: UA请求头 ====================
@@ -1322,12 +1333,12 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1 })]
     // 顶部 mock 已记录 gotCalls，检查 headers
     await xbk.run()
-    assert(gotCalls.length >= 1, '应发请求')
+    ok(gotCalls.length >= 1, '应发请求')
     const headers = gotCalls[0].opts && gotCalls[0].opts.headers
-    assert(headers && headers['User-Agent'], '应带 User-Agent')
-    assert(headers && /^xbk-push-script\/\d+\.\d+\.\d+$/.test(headers['User-Agent']),
+    ok(headers && headers['User-Agent'], '应带 User-Agent')
+    ok(headers && /^xbk-push-script\/\d+\.\d+\.\d+$/.test(headers['User-Agent']),
         `UA 应含 semver 版本号: ${headers['User-Agent']}`)
-    assert(headers && headers.Accept === 'application/json', '应带 Accept')
+    ok(headers && headers.Accept === 'application/json', '应带 Accept')
   })
 
   // ==================== 7.17 并行推送模式 ====================
@@ -1364,8 +1375,8 @@ console.log('========================================\n');
   await test('parallel 模式: 多条全部推送+缓存（并行模式）', async () => {
     const data = [1, 2, 3, 4, 5].map(i => ({ id: i, catename: 'a', title: '并行' + i, content: 'x', url: '/p/' + i + '.html' }))
     const r = await runWithPushMode('parallel', 0, data)
-    assert(r.pushed === 5, `应推5条，实际${r.pushed}`)
-    assert(r.cached === 5, `缓存应5条，实际${r.cached}`)
+    ok(r.pushed === 5, `应推5条，实际${r.pushed}`)
+    ok(r.cached === 5, `缓存应5条，实际${r.cached}`)
   })
 
   await test('parallelLimit=2: 滑动窗口补位且不超过并发上限', async () => {
@@ -1388,11 +1399,11 @@ console.log('========================================\n');
         ends[index] = Date.now()
         active--
       })
-      assert(r.summary && r.summary.pushed === 3, `自定义 sendFn 三条应全部完成: ${JSON.stringify(r.summary)}`)
-      assert(r.cached === 3, `缓存应3条，实际${r.cached}`)
-      assert(maxActive === 2, `并发上限应为2，实际峰值${maxActive}`)
-      assert(starts[3] < ends[1], '第3条应在第1条完成前补位，必须是滑动窗口')
-      assert(abortSignalSeen, 'Pusher.send 应向底层 notify 传递 AbortSignal')
+      ok(r.summary && r.summary.pushed === 3, `自定义 sendFn 三条应全部完成: ${JSON.stringify(r.summary)}`)
+      ok(r.cached === 3, `缓存应3条，实际${r.cached}`)
+      ok(maxActive === 2, `并发上限应为2，实际峰值${maxActive}`)
+      ok(starts[3] < ends[1], '第3条应在第1条完成前补位，必须是滑动窗口')
+      ok(abortSignalSeen, 'Pusher.send 应向底层 notify 传递 AbortSignal')
     } finally {
       Config.timing.pushInterval = origInterval
     }
@@ -1401,8 +1412,8 @@ console.log('========================================\n');
   await test('parallelLimit=2: 兼容并发推送与缓存', async () => {
     const data = [1, 2, 3, 4].map(i => ({ id: i, catename: 'a', title: '批' + i, content: 'x', url: '/q/' + i + '.html' }))
     const r = await runWithPushMode('parallel', 2, data)
-    assert(r.pushed === 4, `应推4条，实际${r.pushed}`)
-    assert(r.cached === 4, `缓存应4条，实际${r.cached}`)
+    ok(r.pushed === 4, `应推4条，实际${r.pushed}`)
+    ok(r.cached === 4, `缓存应4条，实际${r.cached}`)
   })
 
   await test('parallelLimit=1000: 硬性上限50，并发峰值不超过50', async () => {
@@ -1418,8 +1429,8 @@ console.log('========================================\n');
         await new Promise(resolve => setTimeout(resolve, 3))
         active--
       })
-      assert(r.summary && r.summary.pushed === 60, `60条应全部完成: ${JSON.stringify(r.summary)}`)
-      assert(maxActive <= 50, `并发峰值应≤50（硬性上限），实际${maxActive}`)
+      ok(r.summary && r.summary.pushed === 60, `60条应全部完成: ${JSON.stringify(r.summary)}`)
+      ok(maxActive <= 50, `并发峰值应≤50（硬性上限），实际${maxActive}`)
     } finally {
       Config.timing.pushInterval = origInterval
     }
@@ -1428,9 +1439,9 @@ console.log('========================================\n');
   await test('parallelLimit=2.5(小数) → 取整为2，正常推送无空批', async () => {
     const data = [1, 2, 3, 4, 5].map(i => ({ id: i, catename: 'a', title: '小' + i, content: 'x', url: '/m/' + i + '.html' }))
     const r = await runWithPushMode('parallel', 2.5, data)
-    assert(r.pushed === 5, `应推5条，实际${r.pushed}`)
-    assert(r.cached === 5, `缓存应5条，实际${r.cached}`)
-    assert(r.summary && r.summary.pushed === 5 && r.summary.failed === 0, `摘要正确: ${JSON.stringify(r.summary)}`)
+    ok(r.pushed === 5, `应推5条，实际${r.pushed}`)
+    ok(r.cached === 5, `缓存应5条，实际${r.cached}`)
+    ok(r.summary && r.summary.pushed === 5 && r.summary.failed === 0, `摘要正确: ${JSON.stringify(r.summary)}`)
   })
 
   await test('push.mode 非法值 → 警告并按顺序模式推送（防静默降级）', async () => {
@@ -1439,8 +1450,8 @@ console.log('========================================\n');
     Config.push.mode = 'PARALLEL' // 大写（拼写误配）
     fakeData = [1, 2].map(i => ({ id: i, catename: 'a', title: '模式' + i, content: 'x', url: '/b/' + i + '.html' }))
     await xbk.run()
-    assert(pushCalls.length === 2, `非法 mode 应按顺序推送全部，实际${pushCalls.length}`)
-    assert(Config.push.mode === 'PARALLEL', '不应修改用户配置')
+    ok(pushCalls.length === 2, `非法 mode 应按顺序推送全部，实际${pushCalls.length}`)
+    ok(Config.push.mode === 'PARALLEL', '不应修改用户配置')
     // 恢复
     Config.push.mode = 'parallel'
   })
@@ -1452,9 +1463,9 @@ console.log('========================================\n');
     notifyFailAt = 2 // 第2条推送失败
     fakeData = [1, 2, 3].map(i => ({ id: i, catename: 'a', title: '半' + i, content: 'x', url: '/r/' + i + '.html' }))
     await xbk.run()
-    assert(pushCalls.length === 2, `应成功推2条，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `应成功推2条，实际${pushCalls.length}`)
     const cached = readCacheFile('tpar_fail.json')
-    assert(cached.length === 2, `应只缓存成功2条，实际${cached.length}`)
+    ok(cached.length === 2, `应只缓存成功2条，实际${cached.length}`)
     Config.push.mode = 'parallel'
   })
 
@@ -1462,12 +1473,12 @@ console.log('========================================\n');
     const data = [1, 2, 3, 4].map(i => ({ id: i, catename: 'a', title: '对' + i, content: 'x', url: '/s/' + i + '.html' }))
     const pa = await runWithPushMode('parallel', 0, data)
     const se = await runWithPushMode('sequential', 0, data)
-    assert(pa.pushed === se.pushed, `推送数应一致: ${pa.pushed} vs ${se.pushed}`)
-    assert(pa.cached === se.cached, `缓存应一致: ${pa.cached} vs ${se.cached}`)
+    ok(pa.pushed === se.pushed, `推送数应一致: ${pa.pushed} vs ${se.pushed}`)
+    ok(pa.cached === se.cached, `缓存应一致: ${pa.cached} vs ${se.cached}`)
     // 两种模式的 run() 返回摘要应完全一致（顺序模式统计曾恒错）
-    assert(JSON.stringify(pa.summary) === JSON.stringify(se.summary),
+    ok(JSON.stringify(pa.summary) === JSON.stringify(se.summary),
         `summary 应一致: ${JSON.stringify(pa.summary)} vs ${JSON.stringify(se.summary)}`)
-    assert(pa.summary && pa.summary.total === 4 && pa.summary.pushed === 4 && pa.summary.failed === 0,
+    ok(pa.summary && pa.summary.total === 4 && pa.summary.pushed === 4 && pa.summary.failed === 0,
         `摘要应正确: ${JSON.stringify(pa.summary)}`)
   })
 
@@ -1485,10 +1496,10 @@ console.log('========================================\n');
       crashed = true
     }
     // 修复后 run() 重新抛出（不再静默吞错）
-    assert(crashed, '重试耗尽应抛出异常')
+    ok(crashed, '重试耗尽应抛出异常')
     // retry=2 → 最多请求 3 次后放弃
-    assert(gotCalls.length === 3, `应请求3次后放弃，实际${gotCalls.length}`)
-    assert(pushCalls.length === 0, '失败不应推送')
+    ok(gotCalls.length === 3, `应请求3次后放弃，实际${gotCalls.length}`)
+    ok(pushCalls.length === 0, '失败不应推送')
   })
 
   await test('推送失败 → 被捕获不崩溃，且不写缓存（v3.18审查Bug1：下次可重试）', async () => {
@@ -1502,10 +1513,10 @@ console.log('========================================\n');
     } catch (e) {
       crashed = true
     }
-    assert(!crashed, '推送失败不应导致未捕获异常')
+    ok(!crashed, '推送失败不应导致未捕获异常')
     // 推送失败的消息不应写入缓存 → 下次运行会重新推送（避免永久丢失）
     const cached = readCacheFile('t14_push_fail')
-    assert(cached.length === 0, `推送失败不应写缓存，实际${cached.length}条`)
+    ok(cached.length === 0, `推送失败不应写缓存，实际${cached.length}条`)
   })
 
   await test('ETIMEDOUT → 重试后仍失败，run 走超时分支不崩溃', async () => {
@@ -1519,9 +1530,9 @@ console.log('========================================\n');
       crashed = true
     }
     // 修复后 run() 重新抛出（不再静默吞错）
-    assert(crashed, 'ETIMEDOUT 应抛出异常')
+    ok(crashed, 'ETIMEDOUT 应抛出异常')
     // retry=2 → 3 次请求后放弃（重试耗时较长，此处只验证次数）
-    assert(gotCalls.length === 3, `应请求3次，实际${gotCalls.length}`)
+    ok(gotCalls.length === 3, `应请求3次，实际${gotCalls.length}`)
   })
 
   // ==================== 7.18 ReDoS 防护（审查10轮 #240） ====================
@@ -1535,10 +1546,10 @@ console.log('========================================\n');
     let crashed = false
     const t0 = Date.now()
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(!crashed, '不应崩溃')
-    assert(Date.now() - t0 < 3000, '不应被灾难性回溯卡死')
+    ok(!crashed, '不应崩溃')
+    ok(Date.now() - t0 < 3000, '不应被灾难性回溯卡死')
     // 风险关键词被忽略 → 不过滤，全部推送
-    assert(pushCalls.length === 2, `应推2条(忽略风险过滤)，实际${pushCalls.length}`)
+    ok(pushCalls.length === 2, `应推2条(忽略风险过滤)，实际${pushCalls.length}`)
   })
 
   await test('filter 配置嵌套量词正则 → 规则跳过不卡死（#240）', async () => {
@@ -1549,9 +1560,9 @@ console.log('========================================\n');
     let crashed = false
     const t0 = Date.now()
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(!crashed, '不应崩溃')
-    assert(Date.now() - t0 < 3000, '不应卡死')
-    assert(pushCalls.length === 2, '风险屏蔽规则被跳过 → 全部推送')
+    ok(!crashed, '不应崩溃')
+    ok(Date.now() - t0 < 3000, '不应卡死')
+    ok(pushCalls.length === 2, '风险屏蔽规则被跳过 → 全部推送')
   })
 
   // ==================== 7.19 url 类型防御 ====================
@@ -1567,11 +1578,11 @@ console.log('========================================\n');
     ]
     let crashed = false
     try { await xbk.run() } catch (e) { crashed = true }
-    assert(!crashed, '对象/空 url 不应导致崩溃')
-    assert(pushCalls.length === 3, `应推3条，实际${pushCalls.length}`)
+    ok(!crashed, '对象/空 url 不应导致崩溃')
+    ok(pushCalls.length === 3, `应推3条，实际${pushCalls.length}`)
     // 正常数据链接完整；对象/空 url 无 undefined / [object Object]
-    assert(pushCalls[0].desp.includes('https://new.ixbk.net/n/1.html'), '正常数据链接应完整')
-    assert(!pushCalls[1].desp.includes('undefined') && !pushCalls[1].desp.includes('[object Object]'),
+    ok(pushCalls[0].desp.includes('https://new.ixbk.net/n/1.html'), '正常数据链接应完整')
+    ok(!pushCalls[1].desp.includes('undefined') && !pushCalls[1].desp.includes('[object Object]'),
       '脏数据不应含垃圾文本')
   })
 
@@ -1580,9 +1591,9 @@ console.log('========================================\n');
     setPushUrl('t44_protorel')
     fakeData = [makeItem({ id: 1, url: '//cdn.x.com/a.jpg' })]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推送')
-    assert(pushCalls[0].desp.includes('//cdn.x.com/a.jpg'), '协议相对 URL 不应拼前缀')
-    assert(!pushCalls[0].desp.includes('new.ixbk.net//'), '不应拼坏')
+    ok(pushCalls.length === 1, '应推送')
+    ok(pushCalls[0].desp.includes('//cdn.x.com/a.jpg'), '协议相对 URL 不应拼前缀')
+    ok(!pushCalls[0].desp.includes('new.ixbk.net//'), '不应拼坏')
   })
 
   await test('运行时配置校验：非法数值配置警告、合法不警告（v3.64）', async () => {
@@ -1610,13 +1621,13 @@ console.log('========================================\n');
       Config.domain = '非法域名'
       Config.template.title = 123
       await xbk.run()
-      assert(warns.some(w => w.includes('api.timeout')), 'timeout 应警告')
-      assert(warns.some(w => w.includes('api.retry')), 'retry 应警告')
-      assert(warns.some(w => w.includes('pushInterval')), 'pushInterval 应警告')
-      assert(warns.some(w => w.includes('finalWait')), 'finalWait 应警告')
-      assert(warns.some(w => w.includes('parallelLimit')), 'parallelLimit 应警告')
-      assert(warns.some(w => w.includes('domain')), '非法 domain 应警告')
-      assert(warns.some(w => w.includes('template')), '非法 template 应警告')
+      ok(warns.some(w => w.includes('api.timeout')), 'timeout 应警告')
+      ok(warns.some(w => w.includes('api.retry')), 'retry 应警告')
+      ok(warns.some(w => w.includes('pushInterval')), 'pushInterval 应警告')
+      ok(warns.some(w => w.includes('finalWait')), 'finalWait 应警告')
+      ok(warns.some(w => w.includes('parallelLimit')), 'parallelLimit 应警告')
+      ok(warns.some(w => w.includes('domain')), '非法 domain 应警告')
+      ok(warns.some(w => w.includes('template')), '非法 template 应警告')
     } finally {
       Config.api.timeout = orig.timeout
       Config.api.retry = orig.retry
@@ -1632,7 +1643,7 @@ console.log('========================================\n');
     console.warn = (m) => warns.push(String(m))
     try {
       await xbk.run()
-      assert(!warns.some(w => w.includes('⚠️ 配置「')), '合法配置不应有运行时配置警告')
+      ok(!warns.some(w => w.includes('⚠️ 配置「')), '合法配置不应有运行时配置警告')
     } finally {
       console.warn = origWarn
     }
@@ -1644,12 +1655,12 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '第二条' })]
     await xbk.run()
     const logPath = path.join(CACHE_DIR, 'run.log')
-    assert(fs.existsSync(logPath), 'run.log 应已创建')
+    ok(fs.existsSync(logPath), 'run.log 应已创建')
     const content = fs.readFileSync(logPath, 'utf8')
     const lastLine = content.trim().split('\n').pop()
-    assert(/total=\d+ dedup=\d+ filtered=\d+ truncated=\d+ pushed=\d+ failed=\d+ elapsed=[\d.]+s/.test(lastLine),
+    ok(/total=\d+ dedup=\d+ filtered=\d+ truncated=\d+ pushed=\d+ failed=\d+ elapsed=[\d.]+s/.test(lastLine),
         `日志行应含完整摘要字段（含 elapsed/truncated），实际: ${lastLine}`)
-    assert(lastLine.includes('pushed=2'), `应记录推送 2 条，实际: ${lastLine}`)
+    ok(lastLine.includes('pushed=2'), `应记录推送 2 条，实际: ${lastLine}`)
     // 测试产生的日志行不污染真实运行日志（测试专用，删掉）
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
@@ -1663,11 +1674,11 @@ console.log('========================================\n');
     fail4xx = true // 404 不重试 → run 直接抛错（走 catch 分支）
     let threw = false
     try { await xbk.run() } catch (e) { threw = true }
-    assert(threw, '4xx 应使 run 抛错')
+    ok(threw, '4xx 应使 run 抛错')
     const logPath = path.join(CACHE_DIR, 'run.log')
-    assert(fs.existsSync(logPath), 'run.log 应已创建')
+    ok(fs.existsSync(logPath), 'run.log 应已创建')
     const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-    assert(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine}`)
+    ok(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine}`)
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
 
@@ -1679,12 +1690,12 @@ console.log('========================================\n');
     try { fs.unlinkSync(path.join(CACHE_DIR, 'run.log')) } catch (e) { /* 忽略 */ }
     let threw = false
     try { await xbk.run() } catch (e) { threw = true }
-    assert(threw, '超长错误应使 run 抛错')
+    ok(threw, '超长错误应使 run 抛错')
     const logPath = path.join(CACHE_DIR, 'run.log')
-    assert(fs.existsSync(logPath), 'run.log 应已创建')
+    ok(fs.existsSync(logPath), 'run.log 应已创建')
     const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-    assert(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine.slice(0, 80)}`)
-    assert(lastLine.length < 1024, `超长 error.message 日志行应 <1KB，实际 ${lastLine.length}`)
+    ok(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine.slice(0, 80)}`)
+    ok(lastLine.length < 1024, `超长 error.message 日志行应 <1KB，实际 ${lastLine.length}`)
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
 
@@ -1699,10 +1710,10 @@ console.log('========================================\n');
       await xbk.run()
       const content = fs.readFileSync(logPath, 'utf8')
       const lastLine = content.trim().split('\n').pop()
-      assert(/total=\d+/.test(lastLine), `fail-open 下日志仍应追加摘要行，实际: ${lastLine}`)
-      assert(lastLine.includes('pushed=1'), `应记录推送 1 条，实际: ${lastLine}`)
+      ok(/total=\d+/.test(lastLine), `fail-open 下日志仍应追加摘要行，实际: ${lastLine}`)
+      ok(lastLine.includes('pushed=1'), `应记录推送 1 条，实际: ${lastLine}`)
       // 外部创建的锁文件不应被误删（非本次调用创建的锁）
-      assert(fs.existsSync(logPath + '.lock'), '外部锁文件不应被删除')
+      ok(fs.existsSync(logPath + '.lock'), '外部锁文件不应被删除')
     } finally {
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
       try { fs.unlinkSync(logPath + '.lock') } catch (e) { /* 忽略 */ }
@@ -1719,12 +1730,12 @@ console.log('========================================\n');
       Config.template.title = '【{分类名}】{标题} | {日期} {时间}'
       Config.template.content = '{标题}\n{链接}\n{Markdown内容}'
       await xbk.run()
-      assert(pushCalls.length === 1, '应推送 1 条')
-      assert(pushCalls[0].text.includes(' | '), '标题模板应含自定义分隔符')
-      assert(!pushCalls[0].text.includes('{日期}') && !pushCalls[0].text.includes('{时间}'),
+      ok(pushCalls.length === 1, '应推送 1 条')
+      ok(pushCalls[0].text.includes(' | '), '标题模板应含自定义分隔符')
+      ok(!pushCalls[0].text.includes('{日期}') && !pushCalls[0].text.includes('{时间}'),
             `日期/时间占位符应被替换，实际: ${pushCalls[0].text}`)
-      assert(pushCalls[0].desp.includes('模板测试'), '内容模板应含 {标题}')
-      assert(pushCalls[0].desp.includes('原文链接'), '内容模板应含 {Markdown内容} 全文')
+      ok(pushCalls[0].desp.includes('模板测试'), '内容模板应含 {标题}')
+      ok(pushCalls[0].desp.includes('原文链接'), '内容模板应含 {Markdown内容} 全文')
     } finally {
       Config.template.title = origTitle
       Config.template.content = origContent
@@ -1737,9 +1748,9 @@ console.log('========================================\n');
       Config.template.title = undefined
       Config.template.content = 123
       await xbk.run()
-      assert(pushCalls.length === 1, '回退默认仍应推送')
-      assert(pushCalls[0].text.startsWith('【'), '非法模板应回退默认标题格式')
-      assert(pushCalls[0].desp.includes('原文链接'), '非法模板应回退默认内容格式')
+      ok(pushCalls.length === 1, '回退默认仍应推送')
+      ok(pushCalls[0].text.startsWith('【'), '非法模板应回退默认标题格式')
+      ok(pushCalls[0].desp.includes('原文链接'), '非法模板应回退默认内容格式')
     } finally {
       Config.template.title = origTitle
       Config.template.content = origContent
@@ -1758,10 +1769,10 @@ console.log('========================================\n');
         content_html: '<p>安全 HTML</p>'
       })]
       await xbk.run()
-      assert(pushCalls.length === 1, '应推送一条')
+      ok(pushCalls.length === 1, '应推送一条')
       const d = pushCalls[0].desp
-      assert(!/<script|onerror\s*=|javascript:/i.test(d), `自定义内容不应带主动 HTML: ${d}`)
-      assert(d.includes('正文'), '普通内容文本应保留')
+      ok(!/<script|onerror\s*=|javascript:/i.test(d), `自定义内容不应带主动 HTML: ${d}`)
+      ok(d.includes('正文'), '普通内容文本应保留')
     } finally {
       Config.template.content = origContent
     }
@@ -1780,20 +1791,20 @@ console.log('========================================\n');
         content_html: '<p>安全 HTML</p>'
       })]
       await xbk.run()
-      assert(pushCalls.length === 1, '应推送一条')
+      ok(pushCalls.length === 1, '应推送一条')
       const d = pushCalls[0].desp
-      assert(d.includes('onerror=alert(1)'), `纯文本讨论不应被删: ${d}`)
-      assert(d.includes('<script>') || d.includes('&lt;script&gt;'), `代码字面量应保留: ${d}`)
+      ok(d.includes('onerror=alert(1)'), `纯文本讨论不应被删: ${d}`)
+      ok(d.includes('<script>') || d.includes('&lt;script&gt;'), `代码字面量应保留: ${d}`)
       // 对照：含真实 HTML 标签的 desp 仍被清洗（出口防护不失效）
       fakeData = [makeItem({ id: 6003, content: '<script>alert(1)</script>正文', content_html: '<p>x</p>' })]
       await xbk.run()
       const d2 = pushCalls[pushCalls.length - 1].desp
-      assert(!/<script|onerror\s*=/i.test(d2), `HTML 形态内容仍应清洗: ${d2}`)
+      ok(!/<script|onerror\s*=/i.test(d2), `HTML 形态内容仍应清洗: ${d2}`)
       // 对照：非白名单 HTML 元素（input/form 等）也必须触发最终出口清洗，不能绕过 htmlLike 检测
       fakeData = [makeItem({ id: 6004, content: '<input autofocus onfocus=alert(3)>输入控件', content_html: '<p>x</p>' })]
       await xbk.run()
       const d3 = pushCalls[pushCalls.length - 1].desp
-      assert(!/onfocus\s*=/i.test(d3), `非白名单 HTML 元素的事件属性也应清洗: ${d3}`)
+      ok(!/onfocus\s*=/i.test(d3), `非白名单 HTML 元素的事件属性也应清洗: ${d3}`)
     } finally {
       Config.template.content = origContent
     }
@@ -1805,10 +1816,10 @@ console.log('========================================\n');
     // 超长 content_html → desp 超 contentMax → 截断后原文链接应保留
     fakeData = [makeItem({ id: 1, content_html: '<p>' + '很长内容'.repeat(2000) + '</p>' })]
     await xbk.run()
-    assert(pushCalls.length === 1, '应推送')
+    ok(pushCalls.length === 1, '应推送')
     const d = pushCalls[0].desp
-    assert(d.length <= Config.push.contentMax, `desp 应 ≤ contentMax: ${d.length}`)
-    assert(d.includes('原文链接'), `截断后原文链接应保留: 尾部 ${JSON.stringify(d.slice(-30))}`)
+    ok(d.length <= Config.push.contentMax, `desp 应 ≤ contentMax: ${d.length}`)
+    ok(d.includes('原文链接'), `截断后原文链接应保留: 尾部 ${JSON.stringify(d.slice(-30))}`)
   })
 
   await test('desp 链接补回极端 contentMax 不超限（v3.177 边界修正）', async () => {
@@ -1821,9 +1832,9 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1, content_html: '<p>' + '很长内容'.repeat(30) + '</p>' })]
       await xbk.run()
       const d = pushCalls[0].desp
-      assert(d.length <= 90, `极端 contentMax=90 时 desp 应 ≤90: 实际 ${d.length}`)
-      assert(d.includes('原文链接'), '链接应保留')
-      assert(d.endsWith(')'), 'desp 应以链接结尾')
+      ok(d.length <= 90, `极端 contentMax=90 时 desp 应 ≤90: 实际 ${d.length}`)
+      ok(d.includes('原文链接'), '链接应保留')
+      ok(d.endsWith(')'), 'desp 应以链接结尾')
       // contentMax 太小（链接都放不下）→ 不补链接，尊重截断配置
       reset()
       setPushUrl('t61c_linkkeep_tiny')
@@ -1831,7 +1842,7 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1, content_html: '<p>' + '很长内容'.repeat(30) + '</p>' })]
       await xbk.run()
       const d2 = pushCalls[0].desp
-      assert(d2.length <= 10, `contentMax=10 时 desp 应 ≤10: 实际 ${d2.length}`)
+      ok(d2.length <= 10, `contentMax=10 时 desp 应 ≤10: 实际 ${d2.length}`)
     } finally {
       Config.push.contentMax = origContentMax
     }
@@ -1840,7 +1851,7 @@ console.log('========================================\n');
   await test('截断补回原文链接不得重新引入危险 URL（v3.228）', async () => {
     reset()
     setPushUrl('t61d_danger_linkkeep')
-    const originalContentMax = Config.push.contentMax
+    const origContentMax = Config.push.contentMax
     try {
       Config.push.contentMax = 100
       fakeData = [makeItem({
@@ -1849,11 +1860,11 @@ console.log('========================================\n');
         content_html: '<p>' + '长'.repeat(100) + '原文链接</p>'
       })]
       await xbk.run()
-      assert(pushCalls.length === 1, '危险 URL 场景仍应完成推送')
-      assert(!/javascript:|vbscript:|data:/i.test(pushCalls[0].desp),
+      ok(pushCalls.length === 1, '危险 URL 场景仍应完成推送')
+      ok(!/javascript:|vbscript:|data:/i.test(pushCalls[0].desp),
             `截断补链不得包含危险协议: ${pushCalls[0].desp}`)
     } finally {
-      Config.push.contentMax = originalContentMax
+      Config.push.contentMax = origContentMax
     }
   })
 
@@ -1867,10 +1878,10 @@ console.log('========================================\n');
       Config.push.titleMax = 5
       Config.push.contentMax = 4
       await xbk.run()
-      assert(pushCalls.length === 1, '应推送 1 条')
-      assert(pushCalls[0].text.length <= 5, `标题最终长度应 ≤ titleMax(5)，实际: ${pushCalls[0].text}`)
-      assert(!pushCalls[0].text.includes('非常长的标题用于测试截断'), '标题不应超过 5 字符')
-      assert(pushCalls[0].desp.length <= 4, `内容应按 4 截断（含 Markdown 转换结果），实际: ${pushCalls[0].desp.length}`)
+      ok(pushCalls.length === 1, '应推送 1 条')
+      ok(pushCalls[0].text.length <= 5, `标题最终长度应 ≤ titleMax(5)，实际: ${pushCalls[0].text}`)
+      ok(!pushCalls[0].text.includes('非常长的标题用于测试截断'), '标题不应超过 5 字符')
+      ok(pushCalls[0].desp.length <= 4, `内容应按 4 截断（含 Markdown 转换结果），实际: ${pushCalls[0].desp.length}`)
     } finally {
       Config.push.titleMax = origTitleMax
       Config.push.contentMax = origContentMax
@@ -1883,10 +1894,10 @@ console.log('========================================\n');
       Config.push.titleMax = -1
       Config.push.contentMax = 0
       await xbk.run()
-      assert(pushCalls.length === 1, '回退默认仍应推送')
-      assert(pushCalls[0].text.includes('【分类】正常标题') || pushCalls[0].text.includes('正常标题'),
+      ok(pushCalls.length === 1, '回退默认仍应推送')
+      ok(pushCalls[0].text.includes('【分类】正常标题') || pushCalls[0].text.includes('正常标题'),
             `非法 titleMax 不应截断，实际: ${pushCalls[0].text}`)
-      assert(pushCalls[0].desp.includes('原文链接'), '非法 contentMax 不应截断 Markdown 全文')
+      ok(pushCalls[0].desp.includes('原文链接'), '非法 contentMax 不应截断 Markdown 全文')
     } finally {
       Config.push.titleMax = origTitleMax
       Config.push.contentMax = origContentMax
@@ -1905,11 +1916,11 @@ console.log('========================================\n');
       Config.push.titleMax = 20
       Config.template.title = '【{分类名}】{标题}|{链接}'
       await xbk.run()
-      assert(pushCalls.length === 2, `应推 2 条: ${pushCalls.length}`)
+      ok(pushCalls.length === 2, `应推 2 条: ${pushCalls.length}`)
       for (const c of pushCalls) {
-        assert(c.text.length <= 20, `并行模式标题应 ≤ titleMax(20): ${c.text}`)
-        assert(c.text.includes('|'), `模板分隔符应生效: ${c.text}`)
-        assert(!c.text.includes('{'), `占位符应全部替换: ${c.text}`)
+        ok(c.text.length <= 20, `并行模式标题应 ≤ titleMax(20): ${c.text}`)
+        ok(c.text.includes('|'), `模板分隔符应生效: ${c.text}`)
+        ok(!c.text.includes('{'), `占位符应全部替换: ${c.text}`)
       }
     } finally {
       Config.push.mode = origMode
@@ -1926,7 +1937,7 @@ console.log('========================================\n');
       Config.filter.pingbibiaoti = [Symbol('bad')]
       fakeData = []
       const s = await xbk.run()
-      assert(s && s.total === 0, `脏过滤配置不应阻断主流程: ${JSON.stringify(s)}`)
+      ok(s && s.total === 0, `脏过滤配置不应阻断主流程: ${JSON.stringify(s)}`)
     } finally {
       Config.filter.pingbibiaoti = orig
     }
@@ -1951,8 +1962,8 @@ console.log('========================================\n');
       Config.template.content = null
       Config.domain = '非法域名'
       await xbk.run()
-      assert(pushCalls.length === 1, `全部非法配置下仍应推送成功: ${pushCalls.length}`)
-      assert(pushCalls[0].desp.includes('原文链接'), '非法配置回退默认后内容应完整')
+      ok(pushCalls.length === 1, `全部非法配置下仍应推送成功: ${pushCalls.length}`)
+      ok(pushCalls[0].desp.includes('原文链接'), '非法配置回退默认后内容应完整')
     } finally {
       reset() // v3.91 reset 恢复全部默认
     }
@@ -1969,14 +1980,14 @@ console.log('========================================\n');
     console.log = (...args) => captured.push(args.join(' '))
     try {
       const r = await xbk.run()
-      assert(r.total === 1, `total=1: ${r.total}`)
-      assert(r.pushed === 0 && r.failed === 1, `失败应计数: pushed=${r.pushed} failed=${r.failed}`)
-      assert(pushCalls.length === 0, '字符串异常时 notify 不应有成功调用')
-      assert(readCacheFile('t52_notify_string').length === 0, '失败不写缓存（下次重试）')
+      ok(r.total === 1, `total=1: ${r.total}`)
+      ok(r.pushed === 0 && r.failed === 1, `失败应计数: pushed=${r.pushed} failed=${r.failed}`)
+      ok(pushCalls.length === 0, '字符串异常时 notify 不应有成功调用')
+      ok(readCacheFile('t52_notify_string').length === 0, '失败不写缓存（下次重试）')
       // 日志断言：失败原因应显示字符串本身，而非 undefined（R1 兜底核心）
       const log = captured.join('\n')
-      assert(log.includes('push boom string'), `日志应含字符串原因: ${log.slice(-120)}`)
-      assert(!log.includes('undefined'), `日志不应含 undefined: ${log.slice(-120)}`)
+      ok(log.includes('push boom string'), `日志应含字符串原因: ${log.slice(-120)}`)
+      ok(!log.includes('undefined'), `日志不应含 undefined: ${log.slice(-120)}`)
     } finally {
       console.log = origLog
       notifyFailString = false
@@ -1991,8 +2002,8 @@ console.log('========================================\n');
     Config.domain = 123 // 脏配置：数字（v3.73 校验只警告不阻止，baseUrl 需防御）
     try {
       const r = await xbk.run()
-      assert(r.total === 1 && r.pushed === 1, `domain=123 应仍能推送: pushed=${r.pushed}`)
-      assert(pushCalls[0].desp.includes('原文链接'), '推送内容正常')
+      ok(r.total === 1 && r.pushed === 1, `domain=123 应仍能推送: pushed=${r.pushed}`)
+      ok(pushCalls[0].desp.includes('原文链接'), '推送内容正常')
     } finally {
       reset()
     }
@@ -2009,10 +2020,10 @@ console.log('========================================\n');
     try {
       let rejected = false
       try { await xbk.run() } catch (e) { rejected = true }
-      assert(rejected, '重试耗尽应失败')
+      ok(rejected, '重试耗尽应失败')
       const log = captured.join('\n')
-      assert(log.includes('plain string error'), `日志应含字符串原因: ${log.slice(-120)}`)
-      assert(!log.includes('undefined'), `日志不应含 undefined: ${log.slice(-120)}`)
+      ok(log.includes('plain string error'), `日志应含字符串原因: ${log.slice(-120)}`)
+      ok(!log.includes('undefined'), `日志不应含 undefined: ${log.slice(-120)}`)
     } finally {
       console.log = origLog
       failPlainString = false
@@ -2023,8 +2034,8 @@ console.log('========================================\n');
     Config.api.timeout = 9999
     Config.api.retry = 7
     reset()
-    assert(Config.api.timeout === 5000, `timeout 恢复默认: ${Config.api.timeout}`)
-    assert(Config.api.retry === 2, `retry 恢复默认: ${Config.api.retry}`)
+    ok(Config.api.timeout === 5000, `timeout 恢复默认: ${Config.api.timeout}`)
+    ok(Config.api.retry === 2, `retry 恢复默认: ${Config.api.retry}`)
   })
 
   // C5-027：reset() 的注释自称「恢复全部默认」，实测漏 push.parallelLimit / timing.pushInterval /
@@ -2050,13 +2061,13 @@ console.log('========================================\n');
       Config.channelHealth.consecutiveFailures = 0
       Config.channelHealth.intervalMs = 1
       reset()
-      assertEqualNum(Config.push.parallelLimit, DEFAULTS.parallelLimit, 'reset 必须把 push.parallelLimit 恢复默认 10')
-      assertEqualNum(Config.timing.pushInterval, DEFAULTS.pushInterval, 'reset 必须把 timing.pushInterval 恢复默认 0')
-      assertEqualNum(Config.timing.finalWait, DEFAULTS.finalWait, 'reset 必须把 timing.finalWait 恢复默认 0')
-      assertEqualNum(Config.alert.intervalMs, DEFAULTS.alertIntervalMs, 'reset 必须把 alert.intervalMs 恢复默认 3600000')
-      assert(Config.channelHealth.enabled === DEFAULTS.chEnabled, 'reset 必须把 channelHealth.enabled 恢复默认 true')
-      assertEqualNum(Config.channelHealth.consecutiveFailures, DEFAULTS.chFailures, 'reset 必须把 channelHealth.consecutiveFailures 恢复默认 3')
-      assertEqualNum(Config.channelHealth.intervalMs, DEFAULTS.chIntervalMs, 'reset 必须把 channelHealth.intervalMs 恢复默认 3600000')
+      assertStrictEqual(Config.push.parallelLimit, DEFAULTS.parallelLimit, 'reset 必须把 push.parallelLimit 恢复默认 10')
+      assertStrictEqual(Config.timing.pushInterval, DEFAULTS.pushInterval, 'reset 必须把 timing.pushInterval 恢复默认 0')
+      assertStrictEqual(Config.timing.finalWait, DEFAULTS.finalWait, 'reset 必须把 timing.finalWait 恢复默认 0')
+      assertStrictEqual(Config.alert.intervalMs, DEFAULTS.alertIntervalMs, 'reset 必须把 alert.intervalMs 恢复默认 3600000')
+      ok(Config.channelHealth.enabled === DEFAULTS.chEnabled, 'reset 必须把 channelHealth.enabled 恢复默认 true')
+      assertStrictEqual(Config.channelHealth.consecutiveFailures, DEFAULTS.chFailures, 'reset 必须把 channelHealth.consecutiveFailures 恢复默认 3')
+      assertStrictEqual(Config.channelHealth.intervalMs, DEFAULTS.chIntervalMs, 'reset 必须把 channelHealth.intervalMs 恢复默认 3600000')
     } finally {
       reset()
     }
@@ -2075,12 +2086,12 @@ console.log('========================================\n');
     try {
       let rejected = false
       try { await xbk.run() } catch (e) { rejected = true }
-      assert(rejected, '持续失败应最终抛错')
-      assert(gotCalls.length <= 3, `retry=Infinity 应兜底为 2 次重试(共3次请求): 实际 ${gotCalls.length}`)
+      ok(rejected, '持续失败应最终抛错')
+      ok(gotCalls.length <= 3, `retry=Infinity 应兜底为 2 次重试(共3次请求): 实际 ${gotCalls.length}`)
       // R5-1：日志显示兜底后次数（1/2、2/2），非 "1/Infinity"
       const log = captured.join('\n')
-      assert(log.includes('1/2'), `日志应显示兜底次数 1/2: ${log.slice(-160)}`)
-      assert(!log.includes('Infinity'), `日志不应含 Infinity: ${log.slice(-160)}`)
+      ok(log.includes('1/2'), `日志应显示兜底次数 1/2: ${log.slice(-160)}`)
+      ok(!log.includes('Infinity'), `日志不应含 Infinity: ${log.slice(-160)}`)
     } finally {
       console.log = origLog
       failCount = 0
@@ -2090,9 +2101,9 @@ console.log('========================================\n');
 
   await test('Pusher.send 超时为全部尝试通道保留结构化失败', async () => {
     reset()
-    const originalSetTimeout = global.setTimeout
+    const origSetTimeout = global.setTimeout
     const names = ['pushplus', 'telegram']
-    global.setTimeout = (fn) => originalSetTimeout(fn, 0)
+    global.setTimeout = (fn) => origSetTimeout(fn, 0)
     try {
       let timeoutError
       try {
@@ -2101,20 +2112,20 @@ console.log('========================================\n');
           sendNotify: () => new Promise(() => {})
         })
       } catch (e) { timeoutError = e }
-      assert(timeoutError && Array.isArray(timeoutError.failures), '超时应携带 failures')
-      assert(timeoutError.failures.length === names.length, `超时失败数应为 ${names.length}: ${JSON.stringify(timeoutError && timeoutError.failures)}`)
-      assert(timeoutError.failures.every((failure, index) => failure.channel === names[index] && failure.code === 'PUSH_TIMEOUT'), `超时失败应按通道结构化: ${JSON.stringify(timeoutError.failures)}`)
+      ok(timeoutError && Array.isArray(timeoutError.failures), '超时应携带 failures')
+      ok(timeoutError.failures.length === names.length, `超时失败数应为 ${names.length}: ${JSON.stringify(timeoutError && timeoutError.failures)}`)
+      ok(timeoutError.failures.every((failure, index) => failure.channel === names[index] && failure.code === 'PUSH_TIMEOUT'), `超时失败应按通道结构化: ${JSON.stringify(timeoutError.failures)}`)
     } finally {
-      global.setTimeout = originalSetTimeout
+      global.setTimeout = origSetTimeout
     }
   })
 
   await test('Pusher.send 非字符串参数 → 归一为空串（R4-2 防御）', async () => {
     reset()
     await xbk.Pusher.send(undefined, null)
-    assert(pushCalls.length === 1, '应调用 sendNotify')
-    assert(pushCalls[0].text === '', `text 归一为空串: ${JSON.stringify(pushCalls[0].text)}`)
-    assert(pushCalls[0].desp === '', `desp 归一为空串: ${JSON.stringify(pushCalls[0].desp)}`)
+    ok(pushCalls.length === 1, '应调用 sendNotify')
+    ok(pushCalls[0].text === '', `text 归一为空串: ${JSON.stringify(pushCalls[0].text)}`)
+    ok(pushCalls[0].desp === '', `desp 归一为空串: ${JSON.stringify(pushCalls[0].desp)}`)
   })
 
   await test('对象 title 脏数据 → (无标题) 占位、无 [object Object]（R9 防御）', async () => {
@@ -2122,10 +2133,10 @@ console.log('========================================\n');
     setPushUrl('t58_obj_title')
     fakeData = [makeItem({ id: 1, title: { a: 1 } })]
     const r = await xbk.run()
-    assert(r.pushed === 1, `应推送成功: ${r.pushed}`)
+    ok(r.pushed === 1, `应推送成功: ${r.pushed}`)
     const p = pushCalls[0]
-    assert(!p.text.includes('[object Object]'), `标题无泄漏: ${p.text.slice(0, 80)}`)
-    assert(p.text.includes('(无标题)'), `标题应为 (无标题) 占位: ${p.text.slice(0, 80)}`)
+    ok(!p.text.includes('[object Object]'), `标题无泄漏: ${p.text.slice(0, 80)}`)
+    ok(p.text.includes('(无标题)'), `标题应为 (无标题) 占位: ${p.text.slice(0, 80)}`)
   })
 
   await test('Symbol/异常字段不应破坏已成功推送的缓存一致性（v3.229）', async () => {
@@ -2134,10 +2145,10 @@ console.log('========================================\n');
     const bad = { toString () { throw new Error('bad field') } }
     fakeData = [makeItem({ id: 5801, title: Symbol('bad-title'), catename: Symbol('bad-category'), content: bad })]
     const r = await xbk.run()
-    assert(r && r.pushed === 1 && r.failed === 0, `脏字段不应影响成功摘要: ${JSON.stringify(r)}`)
-    assert(pushCalls.length === 1, `底层推送应成功一次，实际${pushCalls.length}`)
-    assert(readCacheFile('t58_dirty_fields').length === 1, '成功推送后仍应写入缓存')
-    assert(!pushCalls[0].text.includes('Symbol') && !pushCalls[0].text.includes('[object Object]'), '推送标题不应泄漏脏字段')
+    ok(r && r.pushed === 1 && r.failed === 0, `脏字段不应影响成功摘要: ${JSON.stringify(r)}`)
+    ok(pushCalls.length === 1, `底层推送应成功一次，实际${pushCalls.length}`)
+    ok(readCacheFile('t58_dirty_fields').length === 1, '成功推送后仍应写入缓存')
+    ok(!pushCalls[0].text.includes('Symbol') && !pushCalls[0].text.includes('[object Object]'), '推送标题不应泄漏脏字段')
   })
 
   await test('异常 getter 字段不应破坏推送后缓存事务（v3.231）', async () => {
@@ -2151,10 +2162,10 @@ console.log('========================================\n');
     })
     fakeData = [item]
     const r = await xbk.run()
-    assert(r && r.pushed === 1 && r.failed === 0, `异常 getter 不应影响成功摘要: ${JSON.stringify(r)}`)
-    assert(pushCalls.length === 1, `异常 getter 数据仍应推送一次，实际${pushCalls.length}`)
-    assert(readCacheFile('t58_throwing_getter').length === 1, '成功推送后异常 getter 数据仍应写缓存')
-    assert(pushCalls[0].text.includes('(无标题)'), '异常 getter 标题应使用安全占位')
+    ok(r && r.pushed === 1 && r.failed === 0, `异常 getter 不应影响成功摘要: ${JSON.stringify(r)}`)
+    ok(pushCalls.length === 1, `异常 getter 数据仍应推送一次，实际${pushCalls.length}`)
+    ok(readCacheFile('t58_throwing_getter').length === 1, '成功推送后异常 getter 数据仍应写缓存')
+    ok(pushCalls[0].text.includes('(无标题)'), '异常 getter 标题应使用安全占位')
   })
 
   await test('zkt_gjc 对象配置 → 警告并全部推送（R11-1 防御）', async () => {
@@ -2167,8 +2178,8 @@ console.log('========================================\n');
     console.warn = (m) => warns.push(String(m))
     try {
       const r = await xbk.run()
-      assert(r.pushed === 2, `对象 zkt_gjc 应全部推送: ${r.pushed}`)
-      assert(warns.some(w => w.includes('zkt_gjc') && w.includes('应为字符串')), '应有非字符串警告')
+      ok(r.pushed === 2, `对象 zkt_gjc 应全部推送: ${r.pushed}`)
+      ok(warns.some(w => w.includes('zkt_gjc') && w.includes('应为字符串')), '应有非字符串警告')
     } finally {
       console.warn = origWarn
       reset()
@@ -2208,10 +2219,10 @@ console.log('========================================\n');
       Config.keyword.zkt_gjc = rand() < 0.3 ? '' : (rand() < 0.5 ? '京东' : '[')
       try {
         const summary = await xbk.run()
-        assert(typeof summary.total === 'number' && summary.total === fakeData.length,
+        ok(typeof summary.total === 'number' && summary.total === fakeData.length,
                 `第${round}轮 total 应为 ${fakeData.length}，实际 ${summary.total}`)
-        assert(typeof summary.pushed === 'number' && typeof summary.failed === 'number', '摘要字段完整')
-        assert(summary.pushed + summary.failed <= summary.total, 'pushed+failed 不应超 total')
+        ok(typeof summary.pushed === 'number' && typeof summary.failed === 'number', '摘要字段完整')
+        ok(summary.pushed + summary.failed <= summary.total, 'pushed+failed 不应超 total')
       } finally {
         reset()
       }
@@ -2223,11 +2234,11 @@ console.log('========================================\n');
     setPushUrl('t53_surrogate')
     fakeData = [makeItem({ id: 1, title: '标题\ud800', content_html: '<p>内容\udfff</p>', content: '正文\ud800' })]
     const summary = await xbk.run()
-    assert(summary.pushed === 1, `应推送成功: ${JSON.stringify(summary)}`)
+    ok(summary.pushed === 1, `应推送成功: ${JSON.stringify(summary)}`)
     const isolatedRe = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
     for (const c of pushCalls) {
-      assert(!isolatedRe.test(c.text), `text 无孤立代理: ${JSON.stringify(c.text)}`)
-      assert(!isolatedRe.test(c.desp), 'desp 无孤立代理')
+      ok(!isolatedRe.test(c.text), `text 无孤立代理: ${JSON.stringify(c.text)}`)
+      ok(!isolatedRe.test(c.desp), 'desp 无孤立代理')
       try { encodeURIComponent(c.text); encodeURIComponent(c.desp) } catch (e) { throw new Error('推送内容 encode 崩') }
     }
   })
@@ -2243,9 +2254,9 @@ console.log('========================================\n');
       Config.push.parallelLimit = 1
       Config.timing.pushInterval = 0
       const summary = await xbk.run()
-      assert(summary.pushed === 3, `parallelLimit=1 应推 3 条: ${JSON.stringify(summary)}`)
-      assert(pushCalls.length === 3, '3 条全部推送')
-      assert(summary.failed === 0, '无失败')
+      ok(summary.pushed === 3, `parallelLimit=1 应推 3 条: ${JSON.stringify(summary)}`)
+      ok(pushCalls.length === 3, '3 条全部推送')
+      ok(summary.failed === 0, '无失败')
     } finally {
       Config.push.mode = origMode; Config.push.parallelLimit = origLimit; Config.timing.pushInterval = origPI
     }
@@ -2259,7 +2270,7 @@ console.log('========================================\n');
       failCount = 1 // 首次失败，retry=0 不重试
       let threw = false
       try { await xbk.run() } catch (e) { threw = true }
-      assert(threw, 'retry=0 时首次失败应直接抛错')
+      ok(threw, 'retry=0 时首次失败应直接抛错')
     } finally {
       Config.api.retry = origRetry
     }
@@ -2271,7 +2282,7 @@ console.log('========================================\n');
       Config.api.retry = 1
       failCount = 1 // 失败 1 次 → 重试成功
       const summary = await xbk.run()
-      assert(summary.pushed === 1, 'retry=1 失败一次后应重试成功')
+      ok(summary.pushed === 1, 'retry=1 失败一次后应重试成功')
     } finally {
       Config.api.retry = origRetry
     }
@@ -2296,11 +2307,11 @@ console.log('========================================\n');
       let threw = false
       try { await xbk.run() } catch (e) { threw = true }
       const tAfter = Date.now()
-      assert(threw, '接口异常应抛错')
+      ok(threw, '接口异常应抛错')
       const alert = pushCalls.find(c => c.text.includes('运行异常'))
-      assert(!!alert, '应发送运行异常告警')
-      assert(alert.desp.includes('Not Found'), `告警内容应含原因: ${alert.desp.slice(0, 80)}`)
-      assert(alert.desp.includes('\n\n时间：'), `告警 desp 应用段落分隔 \\n\\n（v3.159，wxpusher Markdown 渲染单\\n可能挤行）: ${JSON.stringify(alert.desp.slice(0, 60))}`)
+      ok(!!alert, '应发送运行异常告警')
+      ok(alert.desp.includes('Not Found'), `告警内容应含原因: ${alert.desp.slice(0, 80)}`)
+      ok(alert.desp.includes('\n\n时间：'), `告警 desp 应用段落分隔 \\n\\n（v3.159，wxpusher Markdown 渲染单\\n可能挤行）: ${JSON.stringify(alert.desp.slice(0, 60))}`)
       // APP-05：正文里的时间必须是上海口径。反例（改动前）：toLocaleString('zh-CN') 不带 timeZone，
       // TZ=UTC 时渲染 UTC（比上海早 8 小时），与 run.log/日报的上海口径错开。
       const alertStamp = (alert.desp.match(/时间：([^\n]+)/) || [])[1]
@@ -2312,7 +2323,7 @@ console.log('========================================\n');
       // 改为允许区间内每一个可能的渲染秒。
       const allowedStamps = new Set()
       for (let t = Math.floor(tBefore / 1000) * 1000; t <= tAfter; t += 1000) allowedStamps.add(fmtZh('Asia/Shanghai', t))
-      assert(allowedStamps.has(alertStamp),
+      ok(allowedStamps.has(alertStamp),
         `告警正文时间必须是 Asia/Shanghai 口径（进程 TZ=${process.env.TZ}；同一时刻的 UTC 渲染为 ${fmtZh('UTC', tBefore)}）：实际 ${alertStamp}`)
       // ② 限频生效：intervalMs 大 → 第二次异常不发（状态文件记录上次）
       Config.alert.intervalMs = 3600000
@@ -2321,7 +2332,7 @@ console.log('========================================\n');
       fail4xx = true
       await expectRunThrows()
       const alert2 = pushCalls.find(c => c.text.includes('运行异常'))
-      assert(!alert2, '限频内不应重复发送告警')
+      ok(!alert2, '限频内不应重复发送告警')
     } finally {
       Config.alert.intervalMs = origInterval
       Config.alert.enabled = origEnabled
@@ -2355,11 +2366,11 @@ console.log('========================================\n');
       backup = preExisting.map(name => [name, fs.readFileSync(path.join(CACHE_DIR, name))])
       for (const d of markers) fs.writeFileSync(path.join(CACHE_DIR, `${prefix}${d}`), 'test')
       xbk.App._cleanupStaleRe2WarnMarkers()
-      assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-08`)) === false,
+      ok(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-08`)) === false,
         '上海 cutoff=2026-09-09，故 09-08 必须删除（旧实现按进程本地 UTC 得 cutoff=09-08，会把它留下）')
-      assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-09`)) === true,
+      ok(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-09`)) === true,
         'cutoff 当天不算“严格早于”，必须保留')
-      assert(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-10`)) === true, '保留期内的标记必须保留')
+      ok(fs.existsSync(path.join(CACHE_DIR, `${prefix}2026-09-10`)) === true, '保留期内的标记必须保留')
     } finally {
       Date.now = realDateNow
       if (savedTz === undefined) delete process.env.TZ
@@ -2393,7 +2404,7 @@ console.log('========================================\n');
       Config.storage.minFreeBytes = 20 * 1024
       fakeData = []
       await xbk.run()
-      assert(warns.some(w => w.includes('磁盘余量不足')), `低磁盘应告警: ${warns.join(' | ')}`)
+      ok(warns.some(w => w.includes('磁盘余量不足')), `低磁盘应告警: ${warns.join(' | ')}`)
     } finally {
       fs.statfsSync = origStatfs
       console.warn = origWarn
@@ -2413,13 +2424,13 @@ console.log('========================================\n');
       Config.alert.intervalMs = ''
       fail4xx = true
       await expectRunThrows()
-      assert(pushCalls.some(c => c.text.includes('运行异常')), '首次异常应发告警')
+      ok(pushCalls.some(c => c.text.includes('运行异常')), '首次异常应发告警')
       reset()
       setPushUrl('t72_alert_interval_empty_2')
       Config.alert.enabled = true
       fail4xx = true
       await expectRunThrows()
-      assert(!pushCalls.some(c => c.text.includes('运行异常')), '空字符串应回退默认限频，不应第二次轰炸')
+      ok(!pushCalls.some(c => c.text.includes('运行异常')), '空字符串应回退默认限频，不应第二次轰炸')
     } finally {
       Config.alert.intervalMs = origInterval
       Config.alert.enabled = origEnabled
@@ -2437,17 +2448,17 @@ console.log('========================================\n');
       fakeData = []
       fail4xx = true
       await expectRunThrows()
-      assert(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=0 不应发送告警')
+      ok(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=0 不应发送告警')
       // 字符串 '0' 同样关闭
       pushCalls = []
       Config.alert.enabled = '0'
       await expectRunThrows()
-      assert(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled="0" 不应发送告警')
+      ok(!pushCalls.find(c => c.text.includes('运行异常')), 'enabled="0" 不应发送告警')
       // 对照：true 时发送（确保测试本身有效）
       pushCalls = []
       Config.alert.enabled = true
       await expectRunThrows()
-      assert(!!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=true 应发送告警（对照）')
+      ok(!!pushCalls.find(c => c.text.includes('运行异常')), 'enabled=true 应发送告警（对照）')
     } finally {
       Config.alert.enabled = origEnabled
       try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
@@ -2469,7 +2480,7 @@ console.log('========================================\n');
       fail4xx = true
       await expectRunThrows()
       const alert1 = pushCalls.find(c => c.text.includes('运行异常'))
-      assert(!!alert1, '第一次应发告警')
+      ok(!!alert1, '第一次应发告警')
       // 第二次：限频应生效（'abc' → 默认 3600000，曾 0 不限频每次轰炸）
       reset()
       setPushUrl('t72_alert_interval_abc_2')
@@ -2477,7 +2488,7 @@ console.log('========================================\n');
       fail4xx = true
       await expectRunThrows()
       const alert2 = pushCalls.find(c => c.text.includes('运行异常'))
-      assert(!alert2, `非法 intervalMs 应回退默认限频（曾不限频轰炸）: ${pushCalls.map(c => c.text).join('|')}`)
+      ok(!alert2, `非法 intervalMs 应回退默认限频（曾不限频轰炸）: ${pushCalls.map(c => c.text).join('|')}`)
     } finally {
       Config.alert.intervalMs = origInterval
       Config.alert.enabled = origEnabled
@@ -2497,20 +2508,20 @@ console.log('========================================\n');
       require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }))
       await xbk.run()
       const report = pushCalls.find(c => c.text.includes('日报'))
-      assert(!!report, '跨天应发昨日日报')
-      assert(report.desp.includes('推送 3 条'), `日报应含昨日统计: ${report.desp}`)
-      assert(report.desp.includes('条\n\n获取'), `日报 desp 应用段落分隔 \\n\\n（v3.159，与主推送口径一致）: ${JSON.stringify(report.desp.slice(0, 60))}`)
+      ok(!!report, '跨天应发昨日日报')
+      ok(report.desp.includes('推送 3 条'), `日报应含昨日统计: ${report.desp}`)
+      ok(report.desp.includes('条\n\n获取'), `日报 desp 应用段落分隔 \\n\\n（v3.159，与主推送口径一致）: ${JSON.stringify(report.desp.slice(0, 60))}`)
       // 同一天再跑 → 不重复发日报（累加今天；用新 id 防缓存去重）
       pushCalls.length = 0
       fakeData = [makeItem({ id: 2 })]
       await xbk.run()
-      assert(!pushCalls.some(c => c.text.includes('日报')), '同一天不重复发日报')
+      ok(!pushCalls.some(c => c.text.includes('日报')), '同一天不重复发日报')
       const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(st.pushed >= 2, `当天应累加 pushed: ${st.pushed}`)
+      ok(st.pushed >= 2, `当天应累加 pushed: ${st.pushed}`)
       // v3.174：断言统一使用上海自然日（与 _updateReport 的 Asia/Shanghai 口径一致）。
       // 不能依赖 CI runner 的系统时区；GitHub runner 通常为 UTC，北京时间凌晨会差一天。
       const localToday = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date())
-      assert(st.date === localToday, `状态日期应为今天(上海): ${st.date} vs ${localToday}`)
+      ok(st.date === localToday, `状态日期应为今天(上海): ${st.date} vs ${localToday}`)
     } finally {
       Config.report.enabled = orig
       try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
@@ -2519,7 +2530,7 @@ console.log('========================================\n');
 
   await test('日报发送成功 → 今日累计不重复计数（v3.257 修复 089）', async () => {
     reset()
-    const originalCacheDir = Config.cache.dir
+    const origCacheDir = Config.cache.dir
     Config.cache.dir = DEFAULT_CACHE_DIR + '_report_nodup_isolated'
     setPushUrl('t62_report_nodup')
     fakeData = [makeItem({ id: 1 })]
@@ -2535,17 +2546,17 @@ console.log('========================================\n');
       try { require('node:fs').unlinkSync(path.join(stateDir, 't62_report_nodup.json')) } catch (e) { /* 不存在则忽略 */ }
       require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, dedup: 1, filtered: 1, pushed: 3, failed: 0 }))
       await xbk.run()
-      assert(pushCalls.some(c => c.text.includes('日报')), '跨天应发昨日日报')
+      ok(pushCalls.some(c => c.text.includes('日报')), '跨天应发昨日日报')
       // 等待发送成功回调持久化（Pusher.send resolve 后的 .then）
       await new Promise(r => setTimeout(r, 100))
       const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(st.date !== '2026-08-01', '发送成功应重置日期为今天')
+      ok(st.date !== '2026-08-01', '发送成功应重置日期为今天')
       // v3.257：pend2 已含本次 summary，曾 acc 一次 + pend2 一次 → 双重计数（pushed=2）
-      assert(st.pushed === 1, `今日 pushed 应只计本次 summary 一次，实际: ${st.pushed}`)
-      assert(st.total === 1, `今日 total 应只计一次，实际: ${st.total}`)
+      ok(st.pushed === 1, `今日 pushed 应只计本次 summary 一次，实际: ${st.pushed}`)
+      ok(st.total === 1, `今日 total 应只计一次，实际: ${st.total}`)
     } finally {
       Config.report.enabled = orig
-      Config.cache.dir = originalCacheDir
+      Config.cache.dir = origCacheDir
       // 只删 report.state 会把隔离目录本体（run.log / 缓存分片）留在仓库根：本地每跑一次就多一个
       // xianbaoku_cache_p*_report_nodup_isolated，实测已堆数十个且部分属主是 root（曾 sudo 跑测试）。
       // 走 cleanupIsolatedDir → removeDirInRoot 整目录删除（根内校验 fail-closed，删除失败会 warn 留痕）。
@@ -2555,8 +2566,8 @@ console.log('========================================\n');
 
   let isolatedReportSeq = 0
   const withIsolatedReportEnv = async (name, testFn) => {
-    const originalCacheDir = Config.cache.dir
-    const originalToday = xbk.App._reportToday
+    const origCacheDir = Config.cache.dir
+    const origToday = xbk.App._reportToday
     const origReportEnabled = Config.report.enabled
     const uniqueSuffix = `_report_iso_${Date.now()}_${++isolatedReportSeq}`
     const cacheDir = `${DEFAULT_CACHE_DIR}${uniqueSuffix}`
@@ -2580,8 +2591,8 @@ console.log('========================================\n');
       await testFn({ statePath, setupRound })
     } finally {
       Config.report.enabled = origReportEnabled
-      Config.cache.dir = originalCacheDir
-      xbk.App._reportToday = originalToday
+      Config.cache.dir = origCacheDir
+      xbk.App._reportToday = origToday
       xbk.App._reportMemoryStateByPath.clear()
       cleanupIsolatedDir(stateDir)
     }
@@ -2646,21 +2657,21 @@ console.log('========================================\n');
     try {
       await withChannelHealth({ tag: 'selfcheck', failures: 1, intervalMs: 1234 }, async ({ stateDir }) => {
         isolatedDirSeen = stateDir
-        assert(fs.existsSync(stateDir), '夹具必须先建好隔离目录（否则用例会写到真实缓存目录）')
-        assert(Config.cache.dir === path.basename(stateDir), `夹具必须把 cache.dir 指到隔离目录，实际 ${Config.cache.dir}`)
-        assertEqualNum(Config.channelHealth.consecutiveFailures, 1, 'opts.failures 必须生效')
-        assertEqualNum(Config.channelHealth.intervalMs, 1234, 'opts.intervalMs 必须生效')
+        ok(fs.existsSync(stateDir), '夹具必须先建好隔离目录（否则用例会写到真实缓存目录）')
+        ok(Config.cache.dir === path.basename(stateDir), `夹具必须把 cache.dir 指到隔离目录，实际 ${Config.cache.dir}`)
+        assertStrictEqual(Config.channelHealth.consecutiveFailures, 1, 'opts.failures 必须生效')
+        assertStrictEqual(Config.channelHealth.intervalMs, 1234, 'opts.intervalMs 必须生效')
         throw new Error('boom')
       })
     } catch (e) {
       threw = e.message === 'boom'
     }
-    assert(threw, 'body 抛错必须原样冒泡（夹具不得吞掉用例失败原因）')
-    assertEqualStr(Config.cache.dir, before.dir, '夹具必须还原 cache.dir')
-    assert(Config.channelHealth.enabled === before.enabled, `夹具必须还原 channelHealth.enabled，实际 ${Config.channelHealth.enabled}`)
-    assertEqualNum(Config.channelHealth.consecutiveFailures, before.failures, '夹具必须还原 channelHealth.consecutiveFailures')
-    assertEqualNum(Config.channelHealth.intervalMs, before.interval, '夹具必须还原 channelHealth.intervalMs（旧 9 份夹具里 4 份就漏了这个）')
-    assert(isolatedDirSeen && !fs.existsSync(isolatedDirSeen),
+    ok(threw, 'body 抛错必须原样冒泡（夹具不得吞掉用例失败原因）')
+    assertStrictEqual(Config.cache.dir, before.dir, '夹具必须还原 cache.dir')
+    ok(Config.channelHealth.enabled === before.enabled, `夹具必须还原 channelHealth.enabled，实际 ${Config.channelHealth.enabled}`)
+    assertStrictEqual(Config.channelHealth.consecutiveFailures, before.failures, '夹具必须还原 channelHealth.consecutiveFailures')
+    assertStrictEqual(Config.channelHealth.intervalMs, before.interval, '夹具必须还原 channelHealth.intervalMs（旧 9 份夹具里 4 份就漏了这个）')
+    ok(isolatedDirSeen && !fs.existsSync(isolatedDirSeen),
       `夹具必须删除自己的隔离目录（否则仓库根会堆 xianbaoku_cache_p*_channel_health_*）：${isolatedDirSeen}`)
   })
 
@@ -2708,15 +2719,15 @@ console.log('========================================\n');
         testBodies.set(marks[i][2], selfSrc.slice(marks[i].index, stop))
       }
     }
-    assertEqualNum(PRIVATE_CALL_REGISTRY.length, 12,
+    assertStrictEqual(PRIVATE_CALL_REGISTRY.length, 12,
       '私有方法级用例登记表应覆盖 12 条（新增/删除私有方法级用例时必须同步登记与理由）')
     for (const entry of PRIVATE_CALL_REGISTRY) {
-      assert(declared.includes(entry.name), `登记表点名的用例已不存在（改名/删除后未同步登记）：${entry.name}`)
-      assert(/xbk\.App\._/.test(testBodies.get(entry.name) || ''),
+      ok(declared.includes(entry.name), `登记表点名的用例已不存在（改名/删除后未同步登记）：${entry.name}`)
+      ok(/xbk\.App\._/.test(testBodies.get(entry.name) || ''),
         `登记表点名的用例必须真的直调 xbk.App._*（否则它不是「私有方法级用例」，不该占登记位）：${entry.name}`)
-      assert(!!(entry.unit || entry.why), `每条登记必须给出 unit 侧等价锚点或「只有集成侧能观测」的理由：${entry.name}`)
+      ok(!!(entry.unit || entry.why), `每条登记必须给出 unit 侧等价锚点或「只有集成侧能观测」的理由：${entry.name}`)
       if (entry.unit) {
-        assert(unitSrc.includes(entry.unit),
+        ok(unitSrc.includes(entry.unit),
           `unit 侧等价覆盖已消失（${entry.name} 的锚点 ${JSON.stringify(entry.unit)} 在 test_app_unit.js 找不到）` +
           '——这条重复已没有对侧承接，必须把它收回 test_app_unit.js 或在这里补回集成差异')
       }
@@ -2724,10 +2735,10 @@ console.log('========================================\n');
     // 归属前提：本文件不进单元/变异集（SUITES 是 run_unit_tests.js 与 TAP 档 explicitTestFiles 的唯一来源），
     // 而 unit 侧必须在集内——否则这批私有方法的语义在变异口径里既无分也无人认领。
     const suites = require('./test_suites.js').SUITES
-    assert(!suites.some(s => s.file === 'test_app.js'),
+    ok(!suites.some(s => s.file === 'test_app.js'),
       'test_app.js 不得注册进 SUITES：它是由 test.yml 显式步骤跑的集成套件，进单元集会被 run_unit_tests.js 当单元套件重复执行')
     const unitSuite = suites.find(s => s.file === 'test_app_unit.js')
-    assert(unitSuite && !unitSuite.integration && !unitSuite.mutationSkip,
+    ok(unitSuite && !unitSuite.integration && !unitSuite.mutationSkip,
       'test_app_unit.js 必须在单元/变异集内（integration/mutationSkip 都不得置位），否则这些私有方法的语义无人认领')
   })
 
@@ -2744,17 +2755,17 @@ console.log('========================================\n');
         const summary = { total: 11, dedup: 2, filtered: 3, pushed: 4, failed: 1, truncated: 1 }
         await xbk.App._updateReport(summary)
 
-        assert(!pushCalls.some(c => c.text.includes('日报')), `${tc.name}: 跨天旧主全0且无非零pending时不应发送日报`)
+        ok(!pushCalls.some(c => c.text.includes('日报')), `${tc.name}: 跨天旧主全0且无非零pending时不应发送日报`)
 
         const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-        assert(st.date === '2026-09-02', `${tc.name}: 跨天后日期应更新为今天`)
-        assert(st.total === 11, `${tc.name}: total 应精确保存`)
-        assert(st.dedup === 2, `${tc.name}: dedup 应精确保存`)
-        assert(st.filtered === 3, `${tc.name}: filtered 应精确保存`)
-        assert(st.pushed === 4, `${tc.name}: pushed 应精确保存`)
-        assert(st.failed === 1, `${tc.name}: failed 应精确保存`)
-        assert(st.truncated === 1, `${tc.name}: truncated 应精确保存`)
-        assert(st.pending === undefined, `${tc.name}: 切换到今日后不应保留 pending`)
+        ok(st.date === '2026-09-02', `${tc.name}: 跨天后日期应更新为今天`)
+        ok(st.total === 11, `${tc.name}: total 应精确保存`)
+        ok(st.dedup === 2, `${tc.name}: dedup 应精确保存`)
+        ok(st.filtered === 3, `${tc.name}: filtered 应精确保存`)
+        ok(st.pushed === 4, `${tc.name}: pushed 应精确保存`)
+        ok(st.failed === 1, `${tc.name}: failed 应精确保存`)
+        ok(st.truncated === 1, `${tc.name}: truncated 应精确保存`)
+        ok(st.pending === undefined, `${tc.name}: 切换到今日后不应保留 pending`)
       }
     })
   })
@@ -2777,20 +2788,20 @@ console.log('========================================\n');
       await xbk.App._updateReport(summarySuccess)
 
       const reportSuccess = pushCalls.find(c => c.text.includes('日报'))
-      assert(!!reportSuccess, '旧主全0但存在非零pending时应发送昨日日报')
-      assert(reportSuccess.text.includes('2026-09-01'), '日报标题应为昨日日期')
-      assert(reportSuccess.desp.includes('推送 0 条 | 失败 0 条'), '正文昨日主统计应保持旧主全0')
-      assert(reportSuccess.desp.includes('今日待结转：运行 1 轮 | 推送 9 条 | 失败 3 条'), '正文今日待结转应包含旧pending与当前summary合计')
+      ok(!!reportSuccess, '旧主全0但存在非零pending时应发送昨日日报')
+      ok(reportSuccess.text.includes('2026-09-01'), '日报标题应为昨日日期')
+      ok(reportSuccess.desp.includes('推送 0 条 | 失败 0 条'), '正文昨日主统计应保持旧主全0')
+      ok(reportSuccess.desp.includes('今日待结转：运行 1 轮 | 推送 9 条 | 失败 3 条'), '正文今日待结转应包含旧pending与当前summary合计')
 
       const stateSuccess = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(stateSuccess.date === '2026-09-02', '成功后日期应切到今天')
-      assert(stateSuccess.total === 17, '今日 total 应为 10 + 7')
-      assert(stateSuccess.dedup === 2, '今日 dedup 应为 1 + 1')
-      assert(stateSuccess.filtered === 3, '今日 filtered 应为 2 + 1')
-      assert(stateSuccess.pushed === 9, '今日 pushed 应为 5 + 4')
-      assert(stateSuccess.failed === 3, '今日 failed 应为 2 + 1')
-      assert(stateSuccess.truncated === 5, '今日 truncated 应为 3 + 2')
-      assert(stateSuccess.pending === undefined, '成功后 pending 应被消费移除')
+      ok(stateSuccess.date === '2026-09-02', '成功后日期应切到今天')
+      ok(stateSuccess.total === 17, '今日 total 应为 10 + 7')
+      ok(stateSuccess.dedup === 2, '今日 dedup 应为 1 + 1')
+      ok(stateSuccess.filtered === 3, '今日 filtered 应为 2 + 1')
+      ok(stateSuccess.pushed === 9, '今日 pushed 应为 5 + 4')
+      ok(stateSuccess.failed === 3, '今日 failed 应为 2 + 1')
+      ok(stateSuccess.truncated === 5, '今日 truncated 应为 3 + 2')
+      ok(stateSuccess.pending === undefined, '成功后 pending 应被消费移除')
 
       // 2) 失败路径（仅 failed / truncated 非零 pending）
       setupRound({
@@ -2809,19 +2820,19 @@ console.log('========================================\n');
       await xbk.App._updateReport(summaryFail)
 
       const stateFail = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(stateFail.date === '2026-09-01', '发送失败应保持昨日日期以便重试')
-      assert(stateFail.total === 0, '旧主 total 保持 0')
-      assert(stateFail.pushed === 0, '旧主 pushed 保持 0')
-      assert(stateFail.failed === 0, '旧主 failed 保持 0')
-      assert(stateFail.truncated === 0, '旧主 truncated 保持 0')
+      ok(stateFail.date === '2026-09-01', '发送失败应保持昨日日期以便重试')
+      ok(stateFail.total === 0, '旧主 total 保持 0')
+      ok(stateFail.pushed === 0, '旧主 pushed 保持 0')
+      ok(stateFail.failed === 0, '旧主 failed 保持 0')
+      ok(stateFail.truncated === 0, '旧主 truncated 保持 0')
       const pendingFail = stateFail.pending
-      assert(pendingFail && pendingFail.date === '', '失败时 pending date 应为空')
-      assert(pendingFail.total === 3, '失败时 pending total 应为 3')
-      assert(pendingFail.dedup === 0, '失败时 pending dedup 应为 0')
-      assert(pendingFail.filtered === 0, '失败时 pending filtered 应为 0')
-      assert(pendingFail.pushed === 2, '失败时 pending pushed 应为 2')
-      assert(pendingFail.failed === 2, '失败时 pending failed 应为 2')
-      assert(pendingFail.truncated === 3, '失败时 pending truncated 应为 3')
+      ok(pendingFail && pendingFail.date === '', '失败时 pending date 应为空')
+      ok(pendingFail.total === 3, '失败时 pending total 应为 3')
+      ok(pendingFail.dedup === 0, '失败时 pending dedup 应为 0')
+      ok(pendingFail.filtered === 0, '失败时 pending filtered 应为 0')
+      ok(pendingFail.pushed === 2, '失败时 pending pushed 应为 2')
+      ok(pendingFail.failed === 2, '失败时 pending failed 应为 2')
+      ok(pendingFail.truncated === 3, '失败时 pending truncated 应为 3')
 
       // 3) 后续重试成功（新 run + 新 summary，断言不双计数且成功结转）
       notifyFail = false
@@ -2830,16 +2841,16 @@ console.log('========================================\n');
       await xbk.App._updateReport(summaryRetry)
 
       const reportRetry = pushCalls.find(c => c.text.includes('日报'))
-      assert(!!reportRetry, '重试成功应发送昨日日报')
+      ok(!!reportRetry, '重试成功应发送昨日日报')
       const stateRetrySuccess = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(stateRetrySuccess.date === '2026-09-02', '重试成功后日期切到今天')
-      assert(stateRetrySuccess.total === 5, '最终 total 应为 3 + 2')
-      assert(stateRetrySuccess.dedup === 1, '最终 dedup 应为 0 + 1')
-      assert(stateRetrySuccess.filtered === 0, '最终 filtered 应为 0 + 0')
-      assert(stateRetrySuccess.pushed === 3, '最终 pushed 应为 2 + 1')
-      assert(stateRetrySuccess.failed === 2, '最终 failed 应为 2 + 0')
-      assert(stateRetrySuccess.truncated === 3, '最终 truncated 应为 3 + 0')
-      assert(stateRetrySuccess.pending === undefined, '重试成功后 pending 移除')
+      ok(stateRetrySuccess.date === '2026-09-02', '重试成功后日期切到今天')
+      ok(stateRetrySuccess.total === 5, '最终 total 应为 3 + 2')
+      ok(stateRetrySuccess.dedup === 1, '最终 dedup 应为 0 + 1')
+      ok(stateRetrySuccess.filtered === 0, '最终 filtered 应为 0 + 0')
+      ok(stateRetrySuccess.pushed === 3, '最终 pushed 应为 2 + 1')
+      ok(stateRetrySuccess.failed === 2, '最终 failed 应为 2 + 0')
+      ok(stateRetrySuccess.truncated === 3, '最终 truncated 应为 3 + 0')
+      ok(stateRetrySuccess.pending === undefined, '重试成功后 pending 移除')
     })
   })
 
@@ -2848,29 +2859,29 @@ console.log('========================================\n');
       setupRound({ date: '2026-09-01', total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, runs: 2 })
       await xbk.App._updateReport({ total: 3, dedup: 1, filtered: 1, pushed: 1, failed: 0, truncated: 0 })
       const report = pushCalls.find(c => c.text.includes('日报'))
-      assert(report && report.desp.includes('运行 2 轮'), `日报应展示昨日运行轮数: ${report && report.desp}`)
+      ok(report && report.desp.includes('运行 2 轮'), `日报应展示昨日运行轮数: ${report && report.desp}`)
       const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.runs === 1, `跨天后今日运行轮数应为 1，实际 ${state.runs}`)
+      ok(state.runs === 1, `跨天后今日运行轮数应为 1，实际 ${state.runs}`)
     })
   })
 
   await test('通道连续失败告警、恢复告警均限频且不影响主推送语义', async () => {
     await withChannelHealth({ tag: 'threshold', failures: 2, intervalMs: 3600000 }, async ({ stateDir }) => {
       await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [{ channel: 'telegram', message: 'token invalid' }] })
-      assert(!pushCalls.some(c => c.text.includes('通道异常')), '首次失败未达到阈值不应告警')
+      ok(!pushCalls.some(c => c.text.includes('通道异常')), '首次失败未达到阈值不应告警')
       await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [{ channel: 'telegram', message: 'token invalid' }] })
-      assert(pushCalls.some(c => c.text.includes('通道异常')), '连续失败达到阈值应告警')
+      ok(pushCalls.some(c => c.text.includes('通道异常')), '连续失败达到阈值应告警')
       pushCalls.length = 0
       await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [{ channel: 'telegram', message: 'token invalid' }] })
-      assert(!pushCalls.some(c => c.text.includes('通道异常')), '限频内不得重复告警')
+      ok(!pushCalls.some(c => c.text.includes('通道异常')), '限频内不得重复告警')
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
-      assert(pushCalls.some(c => c.text.includes('通道恢复')), '故障通道恢复应告警')
+      ok(pushCalls.some(c => c.text.includes('通道恢复')), '故障通道恢复应告警')
       const state = JSON.parse(fs.readFileSync(path.join(stateDir, 'channel-health.state'), 'utf8'))
-      assert(state.telegram.consecutiveFailures === 0, '恢复后连续失败计数应清零')
+      ok(state.telegram.consecutiveFailures === 0, '恢复后连续失败计数应清零')
       fs.writeFileSync(path.join(stateDir, 'channel-health.state.lock'), 'other process')
       await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'timeout' }] })
       const lockedState = JSON.parse(fs.readFileSync(path.join(stateDir, 'channel-health.state'), 'utf8'))
-      assert(lockedState.telegram.consecutiveFailures === 0, '健康状态被锁定时不得覆盖另一轮的状态更新')
+      ok(lockedState.telegram.consecutiveFailures === 0, '健康状态被锁定时不得覆盖另一轮的状态更新')
       fs.unlinkSync(path.join(stateDir, 'channel-health.state.lock'))
     })
   })
@@ -2886,16 +2897,16 @@ console.log('========================================\n');
       notifyFail = true
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
       let state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.telegram.consecutiveFailures === 2, `恢复通知未送达时应保留失败计数，实际 ${state.telegram.consecutiveFailures}`)
-      assert(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记')
+      ok(state.telegram.consecutiveFailures === 2, `恢复通知未送达时应保留失败计数，实际 ${state.telegram.consecutiveFailures}`)
+      ok(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记')
       // 告警通道恢复：下一轮必须重发恢复通知，送达后才清零
       notifyFail = false
       pushCalls.length = 0
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
-      assert(pushCalls.some(c => c.text.includes('通道恢复')), '恢复通知应在下一轮重发')
+      ok(pushCalls.some(c => c.text.includes('通道恢复')), '恢复通知应在下一轮重发')
       state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
-      assert(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
+      ok(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
+      ok(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
     })
   })
 
@@ -2911,21 +2922,21 @@ console.log('========================================\n');
       fs.writeFileSync(lockPath, String(process.pid))
       fs.utimesSync(lockPath, aged, aged)
       await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'timeout' }] })
-      assert(fs.existsSync(lockPath), '持有进程仍存活时不得抢占超龄健康锁')
-      assert(warnings.some(w => w.includes('正由另一轮更新')), `存活持有者应导致本轮跳过: ${warnings.join(' | ')}`)
-      assert(!fs.existsSync(statePath), '被锁跳过时不得写入健康状态')
+      ok(fs.existsSync(lockPath), '持有进程仍存活时不得抢占超龄健康锁')
+      ok(warnings.some(w => w.includes('正由另一轮更新')), `存活持有者应导致本轮跳过: ${warnings.join(' | ')}`)
+      ok(!fs.existsSync(statePath), '被锁跳过时不得写入健康状态')
       // 2) 超龄锁 + 持有进程已确认退出 → 正常回收并更新
       fs.writeFileSync(lockPath, '999999999')
       fs.utimesSync(lockPath, aged, aged)
       await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [] })
       const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.pushplus && state.pushplus.consecutiveFailures === 0, '持有进程已退出应收割超龄锁并正常更新')
-      assert(!fs.existsSync(lockPath), '更新完成后应释放锁')
+      ok(state.pushplus && state.pushplus.consecutiveFailures === 0, '持有进程已退出应收割超龄锁并正常更新')
+      ok(!fs.existsSync(lockPath), '更新完成后应释放锁')
     })
   })
 
   await test('APP-02：run.log 锁陈旧判定须复核持有进程存活', async () => {
-    const originalCacheDir = Config.cache.dir
+    const origCacheDir = Config.cache.dir
     const isolatedDir = `${DEFAULT_CACHE_DIR}_runlog_lock_${Date.now()}`
     const stateDir = path.join(__dirname, isolatedDir)
     const logPath = path.join(stateDir, 'run.log')
@@ -2939,15 +2950,15 @@ console.log('========================================\n');
       fs.writeFileSync(lockPath, String(process.pid))
       fs.utimesSync(lockPath, aged, aged)
       xbk.App._writeRunLog('存活持有者期间追加\n')
-      assert(fs.existsSync(lockPath), '持有进程仍存活时不得抢占 run.log 锁')
-      assert(fs.readFileSync(logPath, 'utf8').includes('存活持有者期间追加'), '拿不到锁也应 fail-open 追加日志')
+      ok(fs.existsSync(lockPath), '持有进程仍存活时不得抢占 run.log 锁')
+      ok(fs.readFileSync(logPath, 'utf8').includes('存活持有者期间追加'), '拿不到锁也应 fail-open 追加日志')
       // 2) 超龄锁 + 持有进程已退出 → 回收并在结束后释放
       fs.writeFileSync(lockPath, '999999999')
       fs.utimesSync(lockPath, aged, aged)
       xbk.App._writeRunLog('已退出持有者\n')
-      assert(!fs.existsSync(lockPath), '持有进程已退出应回收并释放 run.log 锁')
+      ok(!fs.existsSync(lockPath), '持有进程已退出应回收并释放 run.log 锁')
     } finally {
-      Config.cache.dir = originalCacheDir
+      Config.cache.dir = origCacheDir
       cleanupIsolatedDir(stateDir)
     }
   })
@@ -2963,11 +2974,11 @@ console.log('========================================\n');
       const first = xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'boom' }] })
       await new Promise(r => setTimeout(r, 60)) // 此时第一次调用已进入告警发送阶段
       await xbk.App._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [] })
-      assert(!warnings.some(w => w.includes('正由另一轮更新')), `告警发送期间不得持有跨进程锁: ${warnings.join(' | ')}`)
+      ok(!warnings.some(w => w.includes('正由另一轮更新')), `告警发送期间不得持有跨进程锁: ${warnings.join(' | ')}`)
       await first
       const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.pushplus, '并发的第二轮健康更新不应被告警发送挡住')
-      assert(state.telegram && state.telegram.consecutiveFailures === 1, '两轮更新应各自落盘且互不覆盖')
+      ok(state.pushplus, '并发的第二轮健康更新不应被告警发送挡住')
+      ok(state.telegram && state.telegram.consecutiveFailures === 1, '两轮更新应各自落盘且互不覆盖')
     })
   })
 
@@ -3000,10 +3011,10 @@ console.log('========================================\n');
       releaseResolve()
       await first
       const recovered = pushCalls.filter(c => c.text.includes('通道恢复'))
-      assert(recovered.length === 1, `重叠运行下同一次恢复只应发送一条恢复告警，实际 ${recovered.length} 条`)
+      ok(recovered.length === 1, `重叠运行下同一次恢复只应发送一条恢复告警，实际 ${recovered.length} 条`)
       const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
-      assert(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
+      ok(state.telegram.recoverAlertPending === undefined, '送达后应移除 pending 标记')
+      ok(state.telegram.consecutiveFailures === 0, `送达后应清零，实际 ${state.telegram.consecutiveFailures}`)
     })
   })
 
@@ -3021,15 +3032,15 @@ console.log('========================================\n');
       // 通道恢复但告警通道挂：恢复通知发送失败
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
       let state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记（不丢）')
-      assert(state.telegram.consecutiveFailures === 2, `未送达时不得清零，实际 ${state.telegram.consecutiveFailures}`)
+      ok(state.telegram.recoverAlertPending === true, '恢复通知未送达时应保留 pending 标记（不丢）')
+      ok(state.telegram.consecutiveFailures === 2, `未送达时不得清零，实际 ${state.telegram.consecutiveFailures}`)
       // 告警通道恢复：下一轮必须立即重发——若认领未在失败时释放，这里会被自己的租约挡住（0 条）
       recoverFail = false
       pushCalls.length = 0
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
-      assert(pushCalls.some(c => c.text.includes('通道恢复')), '发送失败后下一轮应立即重发恢复通知')
+      ok(pushCalls.some(c => c.text.includes('通道恢复')), '发送失败后下一轮应立即重发恢复通知')
       state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(state.telegram.recoverAlertPending === undefined && state.telegram.consecutiveFailures === 0,
+      ok(state.telegram.recoverAlertPending === undefined && state.telegram.consecutiveFailures === 0,
         `重发送达后应清零，实际 ${JSON.stringify(state.telegram)}`)
     })
   })
@@ -3050,16 +3061,16 @@ console.log('========================================\n');
       fs.writeFileSync(statePath, JSON.stringify({ telegram: { ...baseEntry(), recoverAlertClaim: 'live-token', recoverAlertClaimAt: Date.now() } }))
       pushCalls.length = 0
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
-      assert(!pushCalls.some(c => c.text.includes('通道恢复')), '租约内的活认领不得被重复认领重发')
+      ok(!pushCalls.some(c => c.text.includes('通道恢复')), '租约内的活认领不得被重复认领重发')
       const liveState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(liveState.telegram.recoverAlertPending === true, '活认领期间 pending 必须原样保留')
+      ok(liveState.telegram.recoverAlertPending === true, '活认领期间 pending 必须原样保留')
       // ② 持有方已崩溃（认领时间远超租约）→ 后续轮次必须接管重发，不得永久卡死
       fs.writeFileSync(statePath, JSON.stringify({ telegram: { ...baseEntry(), recoverAlertClaim: 'crashed-token', recoverAlertClaimAt: Date.now() - 3600000 } }))
       pushCalls.length = 0
       await xbk.App._updateChannelHealth({ successfulChannels: ['telegram'], failures: [] })
-      assert(pushCalls.some(c => c.text.includes('通道恢复')), '超租约的陈旧认领应被接管并重发（有界可恢复）')
+      ok(pushCalls.some(c => c.text.includes('通道恢复')), '超租约的陈旧认领应被接管并重发（有界可恢复）')
       const recoveredState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(recoveredState.telegram.recoverAlertClaim !== 'crashed-token' || recoveredState.telegram.recoverAlertPending === undefined,
+      ok(recoveredState.telegram.recoverAlertClaim !== 'crashed-token' || recoveredState.telegram.recoverAlertPending === undefined,
         `接管后原崩溃令牌不得继续生效，实际 ${JSON.stringify(recoveredState.telegram)}`)
     })
   })
@@ -3072,11 +3083,11 @@ console.log('========================================\n');
       await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
       await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
       const afterAlert = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(afterAlert.telegram.lastAlertAt > 0, `告警尝试后应落盘 lastAlertAt（发送成功与否无关），实际 ${afterAlert.telegram.lastAlertAt}`)
+      ok(afterAlert.telegram.lastAlertAt > 0, `告警尝试后应落盘 lastAlertAt（发送成功与否无关），实际 ${afterAlert.telegram.lastAlertAt}`)
       notifyFail = false
       pushCalls.length = 0
       await xbk.App._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'telegram', message: 'token invalid' }] })
-      assert(!pushCalls.some(c => c.text.includes('通道异常')), '限频窗口内不得重复告警（即使上一轮发送失败）')
+      ok(!pushCalls.some(c => c.text.includes('通道异常')), '限频窗口内不得重复告警（即使上一轮发送失败）')
     })
   })
 
@@ -3089,10 +3100,10 @@ console.log('========================================\n');
       setPushUrl('t_channel_health_disabled')
       notifyMock.sendNotify = async () => { throw new Error('channel down') }
       const summary = await xbk.run()
-      assert(summary && summary.failed >= 1, `本轮应有失败推送，实际 ${JSON.stringify(summary)}`)
-      assert(!fs.existsSync(path.join(stateDir, 'channel-health.state')), '关闭侧不得创建 channel-health 状态文件')
-      assert(!fs.existsSync(path.join(stateDir, 'channel-health.state.lock')), '关闭侧不得创建健康锁文件')
-      assert(!pushCalls.some(c => c.text.includes('通道异常') || c.text.includes('通道恢复')), '关闭侧不得发送健康告警')
+      ok(summary && summary.failed >= 1, `本轮应有失败推送，实际 ${JSON.stringify(summary)}`)
+      ok(!fs.existsSync(path.join(stateDir, 'channel-health.state')), '关闭侧不得创建 channel-health 状态文件')
+      ok(!fs.existsSync(path.join(stateDir, 'channel-health.state.lock')), '关闭侧不得创建健康锁文件')
+      ok(!pushCalls.some(c => c.text.includes('通道异常') || c.text.includes('通道恢复')), '关闭侧不得发送健康告警')
     })
   })
 
@@ -3112,14 +3123,14 @@ console.log('========================================\n');
       fail4xx = true // 接口失败触发告警
       notifyFail = true // 告警通道也挂（sendNotify reject）
       await expectRunThrows()
-      assert(!logs.some(l => l.includes('已发送运行异常告警')), `通道挂不应误报已发送: ${logs.join(' | ')}`)
+      ok(!logs.some(l => l.includes('已发送运行异常告警')), `通道挂不应误报已发送: ${logs.join(' | ')}`)
       // 正向对照（C5-005）：同一段日志断言在「告警根本没走到发送」时也恒真。把通道恢复再跑一轮，
       // 必须真的出现「已发送运行异常告警」——否则上面的负向断言挡不住「_sendAlert 未被调用」。
       notifyFail = false
       try { fs.unlinkSync(alertStatePath) } catch (e) { /* 无状态文件 */ }
       logs.length = 0
       await expectRunThrows()
-      assert(logs.some(l => l.includes('已发送运行异常告警')),
+      ok(logs.some(l => l.includes('已发送运行异常告警')),
         `对照：通道恢复后必须打印「已发送运行异常告警」（实际 ${logs.join(' | ')}）`)
     } finally {
       console.log = origLog
@@ -3143,7 +3154,7 @@ console.log('========================================\n');
       notifyFail = true // 日报通道挂
       require('fs').writeFileSync(statePath, JSON.stringify({ date: '2026-08-01', total: 5, pushed: 3, failed: 0 }))
       await xbk.run()
-      assert(!logs.some(l => l.includes('已发送昨日运行日报')), `通道挂不应误报已发送日报: ${logs.join(' | ')}`)
+      ok(!logs.some(l => l.includes('已发送昨日运行日报')), `通道挂不应误报已发送日报: ${logs.join(' | ')}`)
     } finally {
       console.log = origLog
       Config.report.enabled = orig
@@ -3166,7 +3177,7 @@ console.log('========================================\n');
       await expectRunThrows()
       await new Promise(r => setTimeout(r, 50)) // 等 sendNotify 微任务（fire-and-forget）
       const statePath = path.join(CACHE_DIR, 'alert.state')
-      assert(!fs.existsSync(statePath), `发送失败不应写状态(曾写 lastAt 限频挡重试): ${fs.existsSync(statePath)}`)
+      ok(!fs.existsSync(statePath), `发送失败不应写状态(曾写 lastAt 限频挡重试): ${fs.existsSync(statePath)}`)
     } finally {
       Config.alert.intervalMs = origInterval
       Config.alert.enabled = origEnabled
@@ -3192,16 +3203,16 @@ console.log('========================================\n');
       fail4xx = true
       await expectRunThrows()
       const st = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-      assert(st.lastAt === oldState.lastAt, `rename 失败不应破坏旧状态: ${JSON.stringify(st)}`)
-      assert(!fs.existsSync(statePath + '.tmp'), '状态临时文件应清理')
+      ok(st.lastAt === oldState.lastAt, `rename 失败不应破坏旧状态: ${JSON.stringify(st)}`)
+      ok(!fs.existsSync(statePath + '.tmp'), '状态临时文件应清理')
       // 正向对照（C5-005）：先证明「首次确实发过告警」。否则下面的「第二次不重复发」在
       // 「一次都没发」时也成立——两条断言一起空转，rename 分支从未走到也全绿。
-      assert(notifyCalls === 1,
+      ok(notifyCalls === 1,
         `首次异常必须真的发过一次告警（实际 ${notifyCalls} 次）——否则下面的「不重复发送」恒真`)
       // 同一进程第二次异常不应因状态落盘失败而再次轰炸告警。
       const callsAfterFirst = notifyCalls
       await expectRunThrows()
-      assert(notifyCalls === callsAfterFirst, '状态落盘失败后应使用内存限频，不重复发送告警')
+      ok(notifyCalls === callsAfterFirst, '状态落盘失败后应使用内存限频，不重复发送告警')
     } finally {
       fs.renameSync = origRename
       Config.alert.enabled = origEnabled
@@ -3212,7 +3223,7 @@ console.log('========================================\n');
 
   await test('日报发送失败 → report.state date 不重置（v3.156 #3）', async () => {
     reset()
-    const originalCacheDir = Config.cache.dir
+    const origCacheDir = Config.cache.dir
     Config.cache.dir = DEFAULT_CACHE_DIR + '_report_state_isolated'
     setPushUrl('t63_report_state')
     fakeData = [makeItem({ id: 1 })]
@@ -3227,11 +3238,11 @@ console.log('========================================\n');
       await xbk.run()
       await new Promise(r => setTimeout(r, 50)) // 等 sendNotify 微任务（fire-and-forget）
       const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(st.date === '2026-08-01', `发送失败不应重置 date(曾直接跨天丢日报): ${st.date}`)
-      assert(st.total >= 5, '本次数据应累计进旧 state(不丢)')
+      ok(st.date === '2026-08-01', `发送失败不应重置 date(曾直接跨天丢日报): ${st.date}`)
+      ok(st.total >= 5, '本次数据应累计进旧 state(不丢)')
     } finally {
       Config.report.enabled = orig
-      Config.cache.dir = originalCacheDir
+      Config.cache.dir = origCacheDir
       // 原实现只 unlink report.state + rmdirSync(stateDir)：run 写下的缓存/日志让 rmdir 撞 ENOTEMPTY
       // 被静默吞掉，目录本体长期滞留仓库根。改走 cleanupIsolatedDir 整目录递归删除（根内校验 fail-closed）。
       cleanupIsolatedDir(stateDir)
@@ -3248,8 +3259,8 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1 })]
       let crashed = false
       try { await xbk.run() } catch (e) { crashed = true }
-      assert(gotCalls.length === 4, `字符串 retry='3' 应重试3次(共4请求)，实际${gotCalls.length}`)
-      assert(crashed, '重试耗尽应抛错')
+      ok(gotCalls.length === 4, `字符串 retry='3' 应重试3次(共4请求)，实际${gotCalls.length}`)
+      ok(crashed, '重试耗尽应抛错')
     } finally {
       Config.api.retry = orig
     }
@@ -3265,7 +3276,7 @@ console.log('========================================\n');
       Config.alert.intervalMs = 0
       fail4xx = true
       await expectRunThrows()
-      assert(!pushCalls.some(c => c.text.includes('运行异常')), `字符串 false 应关闭告警: ${pushCalls.length}`)
+      ok(!pushCalls.some(c => c.text.includes('运行异常')), `字符串 false 应关闭告警: ${pushCalls.length}`)
     } finally {
       Config.alert.enabled = orig
       try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
@@ -3282,7 +3293,7 @@ console.log('========================================\n');
       Config.alert.intervalMs = 0
       fail4xx = true
       await expectRunThrows()
-      assert(!pushCalls.some(c => c.text.includes('运行异常')), `" FALSE " 应关闭告警: ${pushCalls.length}`)
+      ok(!pushCalls.some(c => c.text.includes('运行异常')), `" FALSE " 应关闭告警: ${pushCalls.length}`)
     } finally {
       Config.alert.enabled = orig
       try { require('fs').unlinkSync(path.join(CACHE_DIR, 'alert.state')) } catch (e) { /* 忽略 */ }
@@ -3298,8 +3309,8 @@ console.log('========================================\n');
       Config.push.parallelLimit = '1' // 字符串 → 每批 1 条
       fakeData = [1, 2, 3].map(i => makeItem({ id: i }))
       await xbk.run()
-      assert(pushCalls.length === 3, 'parallelLimit=\'1\' 应全推 3 条')
-      assert(Config.push.parallelLimit === '1', '不应修改用户配置')
+      ok(pushCalls.length === 3, 'parallelLimit=\'1\' 应全推 3 条')
+      ok(Config.push.parallelLimit === '1', '不应修改用户配置')
     } finally {
       Config.push.parallelLimit = orig
       Config.push.mode = 'parallel'
@@ -3320,9 +3331,9 @@ console.log('========================================\n');
       fakeData = []
       for (let i = 0; i < 150; i++) fakeData.push(makeItem({ id: i + 1000 }))
       const summary = await xbk.run()
-      assert(summary.pushed === 100, `应只推 100 条: ${JSON.stringify(summary)}`)
-      assert(summary.total === 150, 'total 仍是拉取数 150')
-      assert(summary.truncated === 50, `截断应计入统计: ${JSON.stringify(summary)}`) // v3.145
+      ok(summary.pushed === 100, `应只推 100 条: ${JSON.stringify(summary)}`)
+      ok(summary.total === 150, 'total 仍是拉取数 150')
+      ok(summary.truncated === 50, `截断应计入统计: ${JSON.stringify(summary)}`) // v3.145
       // 正常 20 条不截断
       reset()
       setPushUrl('t58b_maxperrun_ok')
@@ -3330,7 +3341,7 @@ console.log('========================================\n');
       fakeData = []
       for (let i = 0; i < 20; i++) fakeData.push(makeItem({ id: i + 2000 }))
       const s2 = await xbk.run()
-      assert(s2.pushed === 20, `正常 20 条应全推: ${JSON.stringify(s2)}`)
+      ok(s2.pushed === 20, `正常 20 条应全推: ${JSON.stringify(s2)}`)
       // v3.134：截断未推的不写缓存 → 下次运行推剩余（不丢不重复）
       reset()
       setPushUrl('t58c_trunc_retry')
@@ -3338,16 +3349,16 @@ console.log('========================================\n');
       fakeData = []
       for (let i = 0; i < 150; i++) fakeData.push(makeItem({ id: i + 3000 }))
       const s3 = await xbk.run() // 第一次：截断推 100
-      assert(s3.pushed === 100, `首次应推 100: ${JSON.stringify(s3)}`)
+      ok(s3.pushed === 100, `首次应推 100: ${JSON.stringify(s3)}`)
       const cached1 = readCacheFile('t58c_trunc_retry')
-      assert(cached1.length === 100, `首次只缓存推的 100（截断的 50 不缓存）: ${cached1.length}`)
+      ok(cached1.length === 100, `首次只缓存推的 100（截断的 50 不缓存）: ${cached1.length}`)
       reset()
       setPushUrl('t58c_trunc_retry')
       fakeData = []
       for (let i = 0; i < 150; i++) fakeData.push(makeItem({ id: i + 3000 }))
       const s4 = await xbk.run() // 第二次：缓存去重 100 → 剩 50 → 推 50（不重复）
-      assert(s4.pushed === 50, `二次应推剩余 50: ${JSON.stringify(s4)}`)
-      assert(s4.dedup === 100, `二次去重 100: ${JSON.stringify(s4)}`)
+      ok(s4.pushed === 50, `二次应推剩余 50: ${JSON.stringify(s4)}`)
+      ok(s4.dedup === 100, `二次去重 100: ${JSON.stringify(s4)}`)
     } finally {
       Config.push.maxPerRun = orig
       Config.timing.pushInterval = origInt
@@ -3370,10 +3381,10 @@ console.log('========================================\n');
       const t0 = Date.now()
       const summary = await xbk.run()
       const ms = Date.now() - t0
-      assert(summary.pushed === 100, `海量数据应只推 maxPerRun=100: ${JSON.stringify(summary)}`)
-      assert(summary.total === 20000, `total 应 20000: ${JSON.stringify(summary)}`)
-      assert(summary.truncated === 19900, `截断应 19900: ${JSON.stringify(summary)}`)
-      assert(ms < 5000, `海量判重应 <5s（修复前 ~12s）: 实际 ${ms}ms`)
+      ok(summary.pushed === 100, `海量数据应只推 maxPerRun=100: ${JSON.stringify(summary)}`)
+      ok(summary.total === 20000, `total 应 20000: ${JSON.stringify(summary)}`)
+      ok(summary.truncated === 19900, `截断应 19900: ${JSON.stringify(summary)}`)
+      ok(ms < 5000, `海量判重应 <5s（修复前 ~12s）: 实际 ${ms}ms`)
     } finally {
       Config.push.maxPerRun = orig
       Config.timing.pushInterval = origInt
@@ -3398,13 +3409,13 @@ console.log('========================================\n');
         Config.push.maxPerRun = invalid
         fakeData = [{ id: 4000, title: 'T', content: 'c', catename: 'c', url: 'https://x.com/1', content_html: '<p>c</p>' }]
         const summary = await xbk.run()
-        assert(summary.pushed === 1 && summary.truncated === 0,
+        ok(summary.pushed === 1 && summary.truncated === 0,
                 `非法 maxPerRun=${JSON.stringify(invalid)} 应回退默认并推送: ${JSON.stringify(summary)}`)
       }
       Config.push.maxPerRun = '2.5'
       fakeData = [{ id: 4001, title: 'T2', content: 'c', catename: 'c', url: 'https://x.com/2', content_html: '<p>c</p>' }]
       const s2 = await xbk.run()
-      assert(s2.pushed === 1 && s2.truncated === 0, `小数 maxPerRun 不应变成 0: ${JSON.stringify(s2)}`)
+      ok(s2.pushed === 1 && s2.truncated === 0, `小数 maxPerRun 不应变成 0: ${JSON.stringify(s2)}`)
     } finally {
       Config.push.maxPerRun = orig
       Config.timing.pushInterval = origInt
@@ -3426,9 +3437,9 @@ console.log('========================================\n');
       notifyFail = true // 告警通道 mock reject
       let threw = false
       try { await xbk.run() } catch (e) { threw = true }
-      assert(threw, '接口异常应抛错')
+      ok(threw, '接口异常应抛错')
       await new Promise(r => setTimeout(r, 100)) // 等 fire-and-forget 完成
-      assert(unhandled === 0, `告警通道失败不应 unhandledRejection: ${unhandled}`)
+      ok(unhandled === 0, `告警通道失败不应 unhandledRejection: ${unhandled}`)
     } finally {
       process.removeListener('unhandledRejection', handler)
       Config.alert.enabled = false
@@ -3449,7 +3460,7 @@ console.log('========================================\n');
       xbk.App._reportMemoryStateByPath.delete(statePath)
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      assert(fs.readFileSync(statePath, 'utf8') === JSON.stringify('corrupt-state'), '损坏状态原文应保留，不应覆盖为空状态')
+      ok(fs.readFileSync(statePath, 'utf8') === JSON.stringify('corrupt-state'), '损坏状态原文应保留，不应覆盖为空状态')
     } finally {
       Config.report.enabled = orig
       try { fs.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
@@ -3462,10 +3473,10 @@ console.log('========================================\n');
     try {
       Config.report.enabled = true
       for (const date of ['garbage', '2026-99-99', '2026-02-29']) {
-        const original = JSON.stringify({ date, total: 9, pushed: 9 })
-        xbk.App._reportMemoryStateByPath.delete(statePath); fs.writeFileSync(statePath, original)
+        const origStateJson = JSON.stringify({ date, total: 9, pushed: 9 })
+        xbk.App._reportMemoryStateByPath.delete(statePath); fs.writeFileSync(statePath, origStateJson)
         fakeData = [makeItem({ id: Date.now() + date.length })]; await xbk.run()
-        assert(fs.readFileSync(statePath, 'utf8') === original, `非法日期应保留原文件: ${date}`)
+        ok(fs.readFileSync(statePath, 'utf8') === origStateJson, `非法日期应保留原文件: ${date}`)
       }
     } finally { Config.report.enabled = orig; xbk.App._reportMemoryStateByPath.delete(statePath); try { fs.unlinkSync(statePath) } catch (e) {} }
   })
@@ -3475,14 +3486,14 @@ console.log('========================================\n');
     setPushUrl('t270_report_date_invalid')
     const statePath = path.join(CACHE_DIR, 'report.state')
     const orig = Config.report.enabled
-    const original = JSON.stringify({ date: 123, total: 9, pushed: 9 })
+    const origStateJson = JSON.stringify({ date: 123, total: 9, pushed: 9 })
     try {
       Config.report.enabled = true
       xbk.App._reportMemoryStateByPath.delete(statePath)
-      fs.writeFileSync(statePath, original)
+      fs.writeFileSync(statePath, origStateJson)
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      assert(fs.readFileSync(statePath, 'utf8') === original, '非法 date 状态应保留原文件')
+      ok(fs.readFileSync(statePath, 'utf8') === origStateJson, '非法 date 状态应保留原文件')
     } finally {
       Config.report.enabled = orig
       xbk.App._reportMemoryStateByPath.delete(statePath)
@@ -3501,18 +3512,18 @@ console.log('========================================\n');
       try { require('fs').unlinkSync(statePath) } catch (e) { /* 不存在则忽略 */ }
       // 第 1 次：推 2 条
       const s1 = await xbk.run()
-      assert(s1.pushed === 2, `第1次应推2: ${JSON.stringify(s1)}`)
+      ok(s1.pushed === 2, `第1次应推2: ${JSON.stringify(s1)}`)
       // 第 2 次：同数据 → 缓存去重 → 推 0
       const s2 = await xbk.run()
-      assert(s2.pushed === 0 && s2.dedup === 2, `第2次应全去重: ${JSON.stringify(s2)}`)
+      ok(s2.pushed === 0 && s2.dedup === 2, `第2次应全去重: ${JSON.stringify(s2)}`)
       // 第 3 次：新数据 1 条 + 旧 1 条 → 推 1 去重 1
       fakeData = [makeItem({ id: 1 }), makeItem({ id: 3 })]
       const s3 = await xbk.run()
-      assert(s3.pushed === 1 && s3.dedup === 1, `第3次应推1去重1: ${JSON.stringify(s3)}`)
+      ok(s3.pushed === 1 && s3.dedup === 1, `第3次应推1去重1: ${JSON.stringify(s3)}`)
       // report.state：3 次累加 pushed = 2+0+1 = 3
       const st = JSON.parse(require('fs').readFileSync(statePath, 'utf8'))
-      assert(st.pushed === 3, `report.state 应累加 3 条: ${JSON.stringify(st)}`)
-      assert(st.total === 6, `report.state total 应 2×3 次=6: ${JSON.stringify(st)}`)
+      ok(st.pushed === 3, `report.state 应累加 3 条: ${JSON.stringify(st)}`)
+      ok(st.total === 6, `report.state total 应 2×3 次=6: ${JSON.stringify(st)}`)
     } finally {
       Config.report.enabled = orig
       try { require('fs').unlinkSync(statePath) } catch (e) { /* 忽略 */ }
@@ -3530,22 +3541,22 @@ console.log('========================================\n');
       Config.filter.pingbibiaoti = '京东'
       fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' }), makeItem({ id: 3, title: '拼多多砍价' })]
       let s = await xbk.run()
-      assert(s.pushed === 2 && s.filtered === 1, `首次应推2过滤1: ${JSON.stringify(s)}`)
+      ok(s.pushed === 2 && s.filtered === 1, `首次应推2过滤1: ${JSON.stringify(s)}`)
       const cached1 = readCacheFile('t67_filter_change')
       const marked = cached1.filter(m => m._f === true)
-      assert(marked.length === 1 && marked[0].id === 1,
+      ok(marked.length === 1 && marked[0].id === 1,
             `缓存应有 1 条过滤标记(京东 id=1): ${cached1.map(m => `${m.id}:_f=${m._f}`).join(',')}`)
 
       // 第二次运行：改宽（不屏蔽）→ 过滤写入缓存失效 → 京东重新评估并推送
       Config.filter.pingbibiaoti = ''
       pushCalls = []
       s = await xbk.run()
-      assert(s.pushed === 1 && s.filtered === 0 && s.dedup === 2,
+      ok(s.pushed === 1 && s.filtered === 0 && s.dedup === 2,
             `改宽后应重推 1 条(京东)，其余去重: ${JSON.stringify(s)}`)
-      assert(pushCalls.length === 1 && pushCalls[0].desp.includes('京东神券'),
+      ok(pushCalls.length === 1 && pushCalls[0].desp.includes('京东神券'),
             `京东应重新推送: ${pushCalls.map(c => c.text).join('|')}`)
       const cached2 = readCacheFile('t67_filter_change')
-      assert(cached2.length === 3 && cached2.every(m => m._f !== true),
+      ok(cached2.length === 3 && cached2.every(m => m._f !== true),
             `过滤标记应已清除（重新推送的 id=1 以成功态写回）: ${cached2.map(m => `${m.id}:_f=${m._f}`).join(',')}`)
     } finally {
       try { require('fs').unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
@@ -3562,9 +3573,9 @@ console.log('========================================\n');
       Config.filter.pingbibiaoti = '京东'
       fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' })]
       let s = await xbk.run()
-      assert(s.pushed === 1 && s.filtered === 1, `首次应推1过滤1: ${JSON.stringify(s)}`)
+      ok(s.pushed === 1 && s.filtered === 1, `首次应推1过滤1: ${JSON.stringify(s)}`)
       const markedA = readCacheFile('t67_filter_switch_a').filter(m => m._f === true)
-      assert(markedA.length === 1 && markedA[0].id === 1, `A 文件应有 id=1 的 _f 条目: ${JSON.stringify(markedA)}`)
+      ok(markedA.length === 1 && markedA[0].id === 1, `A 文件应有 id=1 的 _f 条目: ${JSON.stringify(markedA)}`)
 
       // ② 规则改宽 + 切到 B 源 → hash 在 B 上推进（B 无 _f，清理空转）
       reset()
@@ -3572,15 +3583,15 @@ console.log('========================================\n');
       Config.filter.pingbibiaoti = ''
       fakeData = [makeItem({ id: 1 })]
       s = await xbk.run()
-      assert(s.pushed === 1, `B 源应正常推送: ${JSON.stringify(s)}`)
+      ok(s.pushed === 1, `B 源应正常推送: ${JSON.stringify(s)}`)
 
       // ③ 切回 A 源（规则仍改宽）→ 旧 _f 必须被重评并推送（修复前 lastHash 相同被跳过 → 静默漏推）
       reset()
       setPushUrl('t67_filter_switch_a')
       fakeData = [makeItem({ id: 1 })]
       s = await xbk.run()
-      assert(s.pushed === 1 && s.filtered === 0, `切回 A 后 id=1 应重评推送: ${JSON.stringify(s)}`)
-      assert(pushCalls.length === 1 && pushCalls[0].desp.includes('京东神券'),
+      ok(s.pushed === 1 && s.filtered === 0, `切回 A 后 id=1 应重评推送: ${JSON.stringify(s)}`)
+      ok(pushCalls.length === 1 && pushCalls[0].desp.includes('京东神券'),
             `京东应重新推送: ${pushCalls.map(c => c.text).join('|')}`)
     } finally {
       Config.filter.pingbibiaoti = ''
@@ -3599,14 +3610,14 @@ console.log('========================================\n');
         Config.filter.pingbibiaoti = '屏蔽词'
         fakeData = [makeItem({ id: 100 + i, title: '屏蔽词内容' })]
         await xbk.run()
-        assert(readCacheFile(suffix).some(m => m._f === true), '首次应留下 _f')
+        ok(readCacheFile(suffix).some(m => m._f === true), '首次应留下 _f')
         fs.writeFileSync(hashPath, text, 'utf8')
         reset()
         Config.filter.pingbibiaoti = ''
         fakeData = [makeItem({ id: 100 + i, title: '屏蔽词内容' })]
         await xbk.run()
-        assert(pushCalls.length === 1, `hash=${JSON.stringify(text)} 时应重推`)
-        assert(!readCacheFile(suffix).some(m => m._f === true), '重推后不应保留 _f')
+        ok(pushCalls.length === 1, `hash=${JSON.stringify(text)} 时应重推`)
+        ok(!readCacheFile(suffix).some(m => m._f === true), '重推后不应保留 _f')
       }
     } finally {
       Config.filter.pingbibiaoti = orig
@@ -3638,7 +3649,7 @@ console.log('========================================\n');
       }
       fakeData = [makeItem({ id: 1 }), makeItem({ id: 2, title: '淘宝特价' })]
       await xbk.run()
-      assert(fs.readFileSync(hashPath, 'utf8') === oldHash, '过滤缓存清理失败时 filter.hash 不应推进')
+      ok(fs.readFileSync(hashPath, 'utf8') === oldHash, '过滤缓存清理失败时 filter.hash 不应推进')
     } finally {
       fs.renameSync = origRename
       Config.filter.pingbibiaoti = origFilter
@@ -3656,7 +3667,7 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1, louzhuregtime: fiveDaysAgo })]
       await xbk.run()
       const cached1 = readCacheFile('t68_pb_change')
-      assert(cached1.some(m => m._f === true), '被过滤条目应写 _f 标记')
+      ok(cached1.some(m => m._f === true), '被过滤条目应写 _f 标记')
       // 放宽 pingbitime → filterHash 变化 → 清除 _f → 重推
       reset()
       setPushUrl('t68_pb_change')
@@ -3664,8 +3675,8 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1, louzhuregtime: fiveDaysAgo })]
       await xbk.run()
       const cached2 = readCacheFile('t68_pb_change')
-      assert(pushCalls.length === 1, `放宽后应重推(不再被缓存判重跳过)，实际${pushCalls.length}`)
-      assert(!cached2.some(m => m._f === true), '重推后 _f 标记应清除')
+      ok(pushCalls.length === 1, `放宽后应重推(不再被缓存判重跳过)，实际${pushCalls.length}`)
+      ok(!cached2.some(m => m._f === true), '重推后 _f 标记应清除')
     } finally {
       Config.filter.pingbitime = origPb
     }
@@ -3685,7 +3696,7 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1, title: '普通标题' })]
       await xbk.run()
       const stored1 = fs.readFileSync(hashPath, 'utf8').trim().split('\n')[1]
-      assert(stored1 !== xbk.filterHash(Config.filter, Config.keyword.zkt_gjc),
+      ok(stored1 !== xbk.filterHash(Config.filter, Config.keyword.zkt_gjc),
         'app 写入的 filter.hash 必须含配置字节之外的「编译生效」维度（两参哈希 != 落盘哈希）')
       // 同配置重复运行：维度稳定（否则每轮 _f 全清、每轮全量重评）
       reset()
@@ -3694,7 +3705,7 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1, title: '普通标题' })]
       await xbk.run()
       const stored2 = fs.readFileSync(hashPath, 'utf8').trim().split('\n')[1]
-      assert(stored2 === stored1, `编译生效维度必须随环境稳定，实际 ${stored1} → ${stored2}`)
+      ok(stored2 === stored1, `编译生效维度必须随环境稳定，实际 ${stored1} → ${stored2}`)
     } finally {
       Config.filter.pingbibiaoti = origFilter
       try { fs.unlinkSync(hashPath) } catch (e) { /* 忽略 */ }
@@ -3719,11 +3730,11 @@ console.log('========================================\n');
       try { fs.unlinkSync(runLogPath) } catch (e) { /* 首次无日志 */ }
       fakeData = [makeItem({ id: 1 })]
       const summary = await xbk.run()
-      assert(summary.cacheSaved === false, `落盘失败时 summary.cacheSaved 必须为 false，实际 ${JSON.stringify(summary.cacheSaved)}`)
-      assert(warns.some(w => w.includes('缓存落盘失败')), `落盘失败应告警，实际告警: ${warns.join(' | ')}`)
+      ok(summary.cacheSaved === false, `落盘失败时 summary.cacheSaved 必须为 false，实际 ${JSON.stringify(summary.cacheSaved)}`)
+      ok(warns.some(w => w.includes('缓存落盘失败')), `落盘失败应告警，实际告警: ${warns.join(' | ')}`)
       const log = fs.readFileSync(runLogPath, 'utf8')
-      assert(log.includes('WARN 缓存落盘失败'), `run.log 应含落盘失败 WARN 行: ${log.split('\n').slice(-3).join(' | ')}`)
-      assert(log.includes('cachesaved=0'), 'run.log 摘要行应含 cachesaved=0')
+      ok(log.includes('WARN 缓存落盘失败'), `run.log 应含落盘失败 WARN 行: ${log.split('\n').slice(-3).join(' | ')}`)
+      ok(log.includes('cachesaved=0'), 'run.log 摘要行应含 cachesaved=0')
     } finally {
       xbk.MessageStore.saveBatch = origSaveBatch
       console.warn = origWarn
@@ -3733,7 +3744,7 @@ console.log('========================================\n');
     setPushUrl('t_app03_cache_ok')
     fakeData = [makeItem({ id: 2 })]
     const okSummary = await xbk.run()
-    assert(okSummary.cacheSaved === true, `落盘成功时 summary.cacheSaved 应为 true，实际 ${JSON.stringify(okSummary.cacheSaved)}`)
+    ok(okSummary.cacheSaved === true, `落盘成功时 summary.cacheSaved 应为 true，实际 ${JSON.stringify(okSummary.cacheSaved)}`)
   })
 
   await test('api.timeout 字符串配置生效（#8 v3.162）', async () => {
@@ -3748,9 +3759,9 @@ console.log('========================================\n');
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
       const call = gotCalls.find(c => c.url.includes('t69_timeout_str'))
-      assert(call && call.opts && call.opts.timeout === 5000, `字符串 timeout 应生效为 5000: ${call && call.opts && call.opts.timeout}`)
+      ok(call && call.opts && call.opts.timeout === 5000, `字符串 timeout 应生效为 5000: ${call && call.opts && call.opts.timeout}`)
       // v3.175：字符串配置（环境变量场景）不应误报「不是有效值」（曾 Number.isFinite('5000')=false 假警告）
-      assert(!warns.some(w => w.includes('api.timeout') && w.includes('不是有效值')),
+      ok(!warns.some(w => w.includes('api.timeout') && w.includes('不是有效值')),
             `字符串 timeout 不应误报警告: ${warns.filter(w => w.includes('timeout')).join(' | ')}`)
     } finally {
       console.warn = origWarn
@@ -3767,7 +3778,7 @@ console.log('========================================\n');
       try {
         await xbk.run()
         const call = gotCalls.find(c => c.url.includes('t270_timeout_'))
-        assert(call && call.opts.timeout === 5000, `timeout=${bad} 应回退 5000: ${JSON.stringify(call && call.opts)}`)
+        ok(call && call.opts.timeout === 5000, `timeout=${bad} 应回退 5000: ${JSON.stringify(call && call.opts)}`)
       } finally { Config.api.timeout = 5000 }
     }
   })
@@ -3780,7 +3791,7 @@ console.log('========================================\n');
       Config.push.maxPerRun = Symbol('bad-maxPerRun')
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      assert(pushCalls.length === 1, `Symbol 数值配置回退默认后应正常推送，实际${pushCalls.length}`)
+      ok(pushCalls.length === 1, `Symbol 数值配置回退默认后应正常推送，实际${pushCalls.length}`)
     } finally {
       Config.push.maxPerRun = orig
     }
@@ -3794,7 +3805,7 @@ console.log('========================================\n');
       Config.filter.pingbitime = Symbol('bad-pingbitime')
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      assert(pushCalls.length === 1, `Symbol pingbitime 不应阻断主流程，实际${pushCalls.length}`)
+      ok(pushCalls.length === 1, `Symbol pingbitime 不应阻断主流程，实际${pushCalls.length}`)
     } finally {
       Config.filter.pingbitime = orig
     }
@@ -3803,7 +3814,8 @@ console.log('========================================\n');
   await test('配置告警脏值 Symbol → cache/domain/mode 链路不崩（#16）', async () => {
     reset()
     setPushUrl('t75_config_warning_symbol')
-    const original = {
+    // 保存点（原值快照）：统一 orig* 前缀，见上方约定
+    const origConfig = {
       maxSize: Config.cache.maxSize,
       domain: Config.domain,
       mode: Config.push.mode
@@ -3814,11 +3826,11 @@ console.log('========================================\n');
       Config.push.mode = Symbol('bad-mode')
       fakeData = [makeItem({ id: 1 })]
       await xbk.run()
-      assert(pushCalls.length === 1, `脏配置告警不应阻断主流程，实际${pushCalls.length}`)
+      ok(pushCalls.length === 1, `脏配置告警不应阻断主流程，实际${pushCalls.length}`)
     } finally {
-      Config.cache.maxSize = original.maxSize
-      Config.domain = original.domain
-      Config.push.mode = original.mode
+      Config.cache.maxSize = origConfig.maxSize
+      Config.domain = origConfig.domain
+      Config.push.mode = origConfig.mode
     }
   })
 
@@ -3838,15 +3850,15 @@ console.log('========================================\n');
       notifyDelayMs = 50
       fakeData = [makeItem({ id: 1 })]
       const summary = await xbk.run()
-      assert(summary && summary.failed === 1 && summary.pushed === 0, '推送全失败摘要应保留失败统计')
-      assert(Array.isArray(summary.failures) && summary.failures.length === 1 &&
+      ok(summary && summary.failed === 1 && summary.pushed === 0, '推送全失败摘要应保留失败统计')
+      ok(Array.isArray(summary.failures) && summary.failures.length === 1 &&
             summary.failures[0].message.includes('push boom'),
             `推送全失败摘要应保留结构化失败原因: ${JSON.stringify(summary)}`)
       const log = require('fs').readFileSync(logPath, 'utf8')
-      assert(log.includes('ERROR'), `推送全失败应写 ERROR 行: ${log.slice(-100)}`)
-      assert(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败')
+      ok(log.includes('ERROR'), `推送全失败应写 ERROR 行: ${log.slice(-100)}`)
+      ok(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败')
       // v3.170：成功路径 _sendAlert 也 await——告警应在 run 返回前完成
-      assert(pushCalls.some(c => c.text && String(c.text).includes('运行异常')),
+      ok(pushCalls.some(c => c.text && String(c.text).includes('运行异常')),
         '告警应在 run 返回前完成（v3.170 await；曾 fire-and-forget 时序不定）')
     } finally {
       Config.alert.enabled = orig
@@ -3871,15 +3883,15 @@ console.log('========================================\n');
       notifyFailAt = 1 // 第 1 条消息失败、第 2 条成功，第 3 次调用是告警
       fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })]
       const summary = await xbk.run()
-      assertEqualNum(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
-      assertEqualNum(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
+      assertStrictEqual(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
+      assertStrictEqual(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
       const log = require('fs').readFileSync(logPath, 'utf8')
-      assert(log.includes('推送部分失败'), `部分失败应写 ERROR 行: ${log.slice(-200)}`)
-      assert(pushCalls.some(c => String(c.desp || '').includes('推送部分失败')),
+      ok(log.includes('推送部分失败'), `部分失败应写 ERROR 行: ${log.slice(-200)}`)
+      ok(pushCalls.some(c => String(c.desp || '').includes('推送部分失败')),
         `部分失败必须触发告警（成功/失败条数可读）: ${JSON.stringify(pushCalls.map(c => c.desp))}`)
       // 分类器同口径：degraded 判定（非 null）——单次入口据此置非零退出码
       const decision = require('./xbk_failure_policy').classifySummary(summary)
-      assert(decision && decision.reason === 'PARTIAL_MESSAGE_FAILURE',
+      ok(decision && decision.reason === 'PARTIAL_MESSAGE_FAILURE',
         `部分失败必须被判 degraded，实际 ${JSON.stringify(decision)}`)
     } finally {
       Config.alert.enabled = orig
@@ -3902,10 +3914,10 @@ console.log('========================================\n');
       notifyDelayMs = 50 // 模拟真实网络往返：告警 sendNotify 延迟 50ms（fire-and-forget 会被 process.exit(1) 杀死）
       let crashed = false
       try { await xbk.run() } catch (e) { crashed = true }
-      assert(crashed, '接口失败应抛错')
+      ok(crashed, '接口失败应抛错')
       // v3.164：catch 里 await _sendAlert → run 返回时告警已完成（曾 fire-and-forget → exit 杀死告警 HTTP）
       const alertSent = pushCalls.some(c => c.text && String(c.text).includes('运行异常'))
-      assert(alertSent, '告警应在 run 返回前完成（否则被 process.exit 杀死，cron 直接运行收不到）')
+      ok(alertSent, '告警应在 run 返回前完成（否则被 process.exit 杀死，cron 直接运行收不到）')
     } finally {
       fail4xx = false
       notifyDelayMs = 0
@@ -3929,7 +3941,7 @@ console.log('========================================\n');
       console.warn = origWarn
       Config.filter.pingbitime = ''
     }
-    assert(warns.some(w => w.includes('louzhuregtime') && w.includes('pingbitime')),
+    ok(warns.some(w => w.includes('louzhuregtime') && w.includes('pingbitime')),
         `应有注册时间缺失警告: ${warns.join(' | ')}`)
   })
 
@@ -3951,10 +3963,10 @@ console.log('========================================\n');
       fs.symlinkSync(hashTarget, hashPath)
       fs.symlinkSync(logTarget, logPath)
       await xbk.run()
-      assert(fs.lstatSync(hashPath).isSymbolicLink(), 'filter.hash 符号链接应被拒绝并保留')
-      assert(fs.lstatSync(logPath).isSymbolicLink(), 'run.log 符号链接应被拒绝并保留')
-      assert(fs.readFileSync(hashTarget, 'utf8') === oldHash, 'filter.hash 不应跟随符号链接写外部文件')
-      assert(fs.readFileSync(logTarget, 'utf8') === oldLog, 'run.log 不应跟随符号链接写外部文件')
+      ok(fs.lstatSync(hashPath).isSymbolicLink(), 'filter.hash 符号链接应被拒绝并保留')
+      ok(fs.lstatSync(logPath).isSymbolicLink(), 'run.log 符号链接应被拒绝并保留')
+      ok(fs.readFileSync(hashTarget, 'utf8') === oldHash, 'filter.hash 不应跟随符号链接写外部文件')
+      ok(fs.readFileSync(logTarget, 'utf8') === oldLog, 'run.log 不应跟随符号链接写外部文件')
     } finally {
       for (const p of [hashPath, logPath, hashTarget, logTarget]) { try { fs.unlinkSync(p) } catch (e) {} }
     }
@@ -3975,29 +3987,29 @@ console.log('========================================\n');
 
       // ① 真目录：整体挪到备份位，内容一字不动（绝不能 rmSync）
       const stashed = stashCachePath(realDir, backupReal)
-      assertEqualStr(stashed, backupReal, `真目录应被挪到备份位，实得 ${stashed}`)
-      assert(!fs.existsSync(realDir), '真目录应离开原位（而不是复制/残留）')
-      assertEqualStr(fs.readFileSync(path.join(backupReal, 'push.json'), 'utf8'), '{"keep":1}', '备份内容必须逐字节保留')
+      assertStrictEqual(stashed, backupReal, `真目录应被挪到备份位，实得 ${stashed}`)
+      ok(!fs.existsSync(realDir), '真目录应离开原位（而不是复制/残留）')
+      assertStrictEqual(fs.readFileSync(path.join(backupReal, 'push.json'), 'utf8'), '{"keep":1}', '备份内容必须逐字节保留')
 
       // ② 还原：先摘掉测试自建的符号链接，再把备份原样搬回
       fs.symlinkSync(linkTarget, realDir)
-      assertEqualStr(restoreCachePath(realDir, stashed), 'restored', '有备份时必须还原')
-      assert(!fs.lstatSync(realDir).isSymbolicLink() && fs.lstatSync(realDir).isDirectory(), '还原后原位必须是真目录')
-      assertEqualStr(fs.readFileSync(path.join(realDir, 'tombstones.json'), 'utf8'), '["t1"]', '墓碑内容必须原样回来')
-      assert(!fs.existsSync(backupReal), '还原后备份位应已清空')
+      assertStrictEqual(restoreCachePath(realDir, stashed), 'restored', '有备份时必须还原')
+      ok(!fs.lstatSync(realDir).isSymbolicLink() && fs.lstatSync(realDir).isDirectory(), '还原后原位必须是真目录')
+      assertStrictEqual(fs.readFileSync(path.join(realDir, 'tombstones.json'), 'utf8'), '["t1"]', '墓碑内容必须原样回来')
+      ok(!fs.existsSync(backupReal), '还原后备份位应已清空')
 
       // ③ 符号链接：只摘链接，链接目标的内容不得被碰
       fs.mkdirSync(linkTarget, { recursive: true })
       fs.writeFileSync(path.join(linkTarget, 'keep.txt'), 'keep', 'utf8')
       fs.symlinkSync(linkTarget, linkPath)
-      assertEqualStr(stashCachePath(linkPath, backupLink), null, '符号链接只摘链接、不产生备份')
-      assert(!fs.existsSync(linkPath), '符号链接应被摘掉')
-      assert(!fs.existsSync(backupLink), '符号链接不得产生备份目录')
-      assertEqualStr(fs.readFileSync(path.join(linkTarget, 'keep.txt'), 'utf8'), 'keep', '链接目标内容不得被删')
+      assertStrictEqual(stashCachePath(linkPath, backupLink), null, '符号链接只摘链接、不产生备份')
+      ok(!fs.existsSync(linkPath), '符号链接应被摘掉')
+      ok(!fs.existsSync(backupLink), '符号链接不得产生备份目录')
+      assertStrictEqual(fs.readFileSync(path.join(linkTarget, 'keep.txt'), 'utf8'), 'keep', '链接目标内容不得被删')
 
       // ④ 原位无备份却是真实目录：拒绝覆盖（fail-closed），内容不得被删
-      assertEqualStr(restoreCachePath(realDir, null), 'refused', '无备份且原位是真实目录时必须拒绝')
-      assertEqualStr(fs.readFileSync(path.join(realDir, 'push.json'), 'utf8'), '{"keep":1}', '拒绝覆盖时真实内容必须完好')
+      assertStrictEqual(restoreCachePath(realDir, null), 'refused', '无备份且原位是真实目录时必须拒绝')
+      assertStrictEqual(fs.readFileSync(path.join(realDir, 'push.json'), 'utf8'), '{"keep":1}', '拒绝覆盖时真实内容必须完好')
     } finally {
       cleanupIsolatedDir(baseDir)
     }
@@ -4035,9 +4047,9 @@ console.log('========================================\n');
       fs.symlinkSync(externalTarget, defaultCachePath)
       Config.cache.dir = '.xbk_cache_safe'
       const probe = xbk.getFilePath('c022_probe.json')
-      assert(!probe.startsWith(externalTarget), `cacheDir 不应指向外部: ${probe}`)
-      assert(probe.startsWith(path.join(__dirname, path.sep)), `cacheDir 应留在项目根内: ${probe}`)
-      assert(!probe.startsWith(safeLinkPath + path.sep), `cacheDir 不应使用被符号链接的应急路径: ${probe}`)
+      ok(!probe.startsWith(externalTarget), `cacheDir 不应指向外部: ${probe}`)
+      ok(probe.startsWith(path.join(__dirname, path.sep)), `cacheDir 应留在项目根内: ${probe}`)
+      ok(!probe.startsWith(safeLinkPath + path.sep), `cacheDir 不应使用被符号链接的应急路径: ${probe}`)
     } finally {
       Config.cache.dir = origCacheDir
       // C5-001：摘掉夹具自建的软链后把备份原样搬回；只告警不抛（同 cleanupIsolatedDir 的理由：
@@ -4070,10 +4082,10 @@ console.log('========================================\n');
       Config.template.title = origT
       Config.template.content = origC
     }
-    assert(!warns.some(w => w.includes('{价格}') && w.includes('template.content')),
+    ok(!warns.some(w => w.includes('{价格}') && w.includes('template.content')),
         `不应有模板占位符警告: ${warns.join(' | ')}`)
     // {价格} 等占位符由 tuisong_replace 替换；{标题} 正常替换——推送不崩
-    assert(pushCalls.some(c => c.desp.includes('京东神券 100元') && !c.desp.includes('{价格}') && !c.desp.includes('{商城}')),
+    ok(pushCalls.some(c => c.desp.includes('京东神券 100元') && !c.desp.includes('{价格}') && !c.desp.includes('{商城}')),
         `占位符应替换且标题正常: ${pushCalls.map(c => JSON.stringify(c.desp.slice(0, 80))).join('|')}`)
   })
 
@@ -4101,23 +4113,23 @@ console.log('========================================\n');
     } finally {
       console.error = origErr
     }
-    assert(pushCalls.length === 1, `损坏缓存隔离后本轮必须恢复推送，实际${pushCalls.length}`)
-    assert(errs.some(e => e.includes('corrupt.')), `必须响亮报告隔离事件（点名备份路径）: ${errs.join(' | ')}`)
-    assert(!errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
+    ok(pushCalls.length === 1, `损坏缓存隔离后本轮必须恢复推送，实际${pushCalls.length}`)
+    ok(errs.some(e => e.includes('corrupt.')), `必须响亮报告隔离事件（点名备份路径）: ${errs.join(' | ')}`)
+    ok(!errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
         `不得再走「整轮零推送」闸门: ${errs.join(' | ')}`)
     const baks = fs.readdirSync(CACHE_DIR).filter(n => n.startsWith(cacheName + '.corrupt.') && n.endsWith('.bak'))
-    assert(baks.length === 1, `原件必须被改名隔离且只留一份备份: ${fs.readdirSync(CACHE_DIR).join(',')}`)
-    assert(fs.readFileSync(path.join(CACHE_DIR, baks[0]), 'utf8') === raw, '备份必须逐字节保留原件（绝不删除/清空）')
+    ok(baks.length === 1, `原件必须被改名隔离且只留一份备份: ${fs.readdirSync(CACHE_DIR).join(',')}`)
+    ok(fs.readFileSync(path.join(CACHE_DIR, baks[0]), 'utf8') === raw, '备份必须逐字节保留原件（绝不删除/清空）')
     // 隔离重建后原路径必须是**合法可读**缓存；本轮推送成功，故其中应含本轮记录（证明写入能力已恢复）
     const rebuilt = JSON.parse(fs.readFileSync(cachePath, 'utf8'))
-    assert(Array.isArray(rebuilt) && rebuilt.some(m => String(m.id) === '9001'),
+    ok(Array.isArray(rebuilt) && rebuilt.some(m => String(m.id) === '9001'),
         `原路径必须重建为合法缓存并记录本轮推送: ${fs.readFileSync(cachePath, 'utf8').slice(0, 200)}`)
-    assert(summary?.pushed === 1, `隔离后本轮推送成功语义不变，实际 ${JSON.stringify(summary)}`)
+    ok(summary?.pushed === 1, `隔离后本轮推送成功语义不变，实际 ${JSON.stringify(summary)}`)
     // 隔离事件必须进 run.log（否则「整轮零推送 + ERROR + 告警」这条旧信号消失后就成了静默降级）
     const log = fs.readFileSync(path.join(CACHE_DIR, 'run.log'), 'utf8')
-    assert(log.includes('WARN 缓存JSON 解析失败隔离重建') || log.includes('缓存JSON 解析失败隔离重建'),
+    ok(log.includes('WARN 缓存JSON 解析失败隔离重建') || log.includes('缓存JSON 解析失败隔离重建'),
         `run.log 必须留痕隔离事件: ${log.split('\n').slice(-4).join(' | ')}`)
-    assert(log.includes('.corrupt.'), `run.log 必须点名备份路径: ${log.split('\n').slice(-4).join(' | ')}`)
+    ok(log.includes('.corrupt.'), `run.log 必须点名备份路径: ${log.split('\n').slice(-4).join(' | ')}`)
     wipeBaks()
   })
 
@@ -4146,12 +4158,12 @@ console.log('========================================\n');
       console.error = origErr
       delete xbk.MessageStore._readFailed[cachePath]
     }
-    assert(pushCalls.length === 0, `缓存读失败必须跳过本轮推送，实际${pushCalls.length}`)
-    assert(errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
+    ok(pushCalls.length === 0, `缓存读失败必须跳过本轮推送，实际${pushCalls.length}`)
+    ok(errs.some(e => e.includes('缓存读取失败，跳过本轮推送以防重复轰炸')),
         `应有跳过推送告警: ${errs.join(' | ')}`)
     // P1（审查 2026-08-15）：缓存读失败早退曾返回 undefined（退出码 0 + 零告警零日志，静默漏推）；
     // 修复后应返回带失败语义的摘要，使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码
-    assert(summary?.total === 1 && summary?.failed === 1 && summary?.pushed === 0,
+    ok(summary?.total === 1 && summary?.failed === 1 && summary?.pushed === 0,
         `缓存读失败应返回失败摘要(failed=待推送条数)，实际 ${JSON.stringify(summary)}`)
   })
 
@@ -4163,11 +4175,11 @@ console.log('========================================\n');
     notifyMock.sendNotify = () => undefined
     try {
       const summary = await xbk.run()
-      assert(pushCalls.length === 0, `同步 sendNotify 不应产生推送记录，实际${pushCalls.length}`)
-      assert(summary?.pushed === 0 && summary?.failed === 1,
+      ok(pushCalls.length === 0, `同步 sendNotify 不应产生推送记录，实际${pushCalls.length}`)
+      ok(summary?.pushed === 0 && summary?.failed === 1,
           `应记录失败语义（不写缓存下次重试），实际 ${JSON.stringify(summary)}`)
       const cached = readCacheFile('t_p2_sync_notify')
-      assert(cached.length === 0, '同步 sendNotify 失败不应写缓存')
+      ok(cached.length === 0, '同步 sendNotify 失败不应写缓存')
     } finally {
       // run() 若抛错不得泄漏 mock（参照本文件 runWithPushMode 先例的恢复纪律）
       notifyMock.sendNotify = defaultNotifySend
@@ -4181,14 +4193,14 @@ console.log('========================================\n');
     Config.keyword.zkt_gjc = '0'
     fakeData = [makeItem({ id: 1, title: 0 })]
     await xbk.run()
-    assert(pushCalls.length === 1, `title=0 且 zkt_gjc='0' 应匹配推送，实际${pushCalls.length}`)
+    ok(pushCalls.length === 1, `title=0 且 zkt_gjc='0' 应匹配推送，实际${pushCalls.length}`)
     // title=0 且 zkt_gjc='abc' → 不匹配 → 滤掉（修复前 0/false 一律放行会误推）
     reset()
     setPushUrl('t_p2_kwd_miss')
     Config.keyword.zkt_gjc = 'abc'
     fakeData = [makeItem({ id: 2, title: 0 })]
     await xbk.run()
-    assert(pushCalls.length === 0, `title=0 且 zkt_gjc='abc' 应被滤掉，实际${pushCalls.length}`)
+    ok(pushCalls.length === 0, `title=0 且 zkt_gjc='abc' 应被滤掉，实际${pushCalls.length}`)
   })
 
   await test('缓存读失败时 filter.hash 不推进（P2：旧 _f 永久失效防线）', async () => {
@@ -4219,7 +4231,7 @@ console.log('========================================\n');
       xbk.MessageStore.readMessages = origReadP2
     }
     const h3 = fs.readFileSync(hashPath, 'utf8').trim()
-    assert(h3 === h1, `缓存读失败时 filter.hash 不应推进，期望 ${h1} 实际 ${h3}`)
+    ok(h3 === h1, `缓存读失败时 filter.hash 不应推进，期望 ${h1} 实际 ${h3}`)
     // ③ 修复缓存为空数组
     fs.writeFileSync(cachePath, '[]', 'utf8')
     // ④ 规则仍 B：hash(A) !== hash(B) → 检测到规则变更 → 推进 hash(B) → 正常推送
@@ -4228,8 +4240,8 @@ console.log('========================================\n');
     fakeData = [makeItem({ id: 1, title: '屏蔽词内容' })]
     await xbk.run()
     const h5 = fs.readFileSync(hashPath, 'utf8').trim()
-    assert(h5 !== h1, `修复缓存后 hash 应推进为新规则: ${h1} vs ${h5}`)
-    assert(pushCalls.length === 1, `修复缓存后应正常推送，实际${pushCalls.length}`)
+    ok(h5 !== h1, `修复缓存后 hash 应推进为新规则: ${h1} vs ${h5}`)
+    ok(pushCalls.length === 1, `修复缓存后应正常推送，实际${pushCalls.length}`)
   })
 
   await test('saveBatch 同内容两次 → 文件 mtime/timestamp 不变（C024）', async () => {
@@ -4244,8 +4256,8 @@ console.log('========================================\n');
     xbk.saveBatch([msg], fname)
     const cached2 = readCacheFile('t68b_savebatch_mtime')
     const stat2 = fs.statSync(p)
-    assert(stat2.mtimeMs === stat1.mtimeMs, '同内容 saveBatch 不应重写文件 mtime')
-    assert(cached2[0].timestamp === cached1[0].timestamp, '同内容 saveBatch 不应刷新 timestamp')
+    ok(stat2.mtimeMs === stat1.mtimeMs, '同内容 saveBatch 不应重写文件 mtime')
+    ok(cached2[0].timestamp === cached1[0].timestamp, '同内容 saveBatch 不应刷新 timestamp')
   })
 
   await test('save 与 saveBatch 交错调用 timestamp 单调（C025）', async () => {
@@ -4263,9 +4275,9 @@ console.log('========================================\n');
     ]
     for (const step of steps) step()
     const stamps = readCacheFile('t68c_save_savebatch_monotonic').map(m => m.timestamp)
-    assert(stamps.length >= 6, `应交错写入多条消息，实际 ${stamps.length}`)
+    ok(stamps.length >= 6, `应交错写入多条消息，实际 ${stamps.length}`)
     for (let i = 1; i < stamps.length; i++) {
-      assert(Date.parse(stamps[i]) > Date.parse(stamps[i - 1]),
+      ok(Date.parse(stamps[i]) > Date.parse(stamps[i - 1]),
           `save/saveBatch 交错 timestamp 应单调递增: ${stamps.join(' -> ')}`)
     }
   })
@@ -4311,8 +4323,8 @@ console.log('========================================\n');
       if (origAbort) AbortController.prototype.abort = origAbort
       try { removeDirInRoot(testDir, __dirname) } catch (e) { /* ignore */ }
     }
-    assert(threw, 'mkdirSync 抛错应使 run 抛错')
-    assert(aborted > 0, 'finally 应取消预热（warmupCancelled/abort 执行）')
+    ok(threw, 'mkdirSync 抛错应使 run 抛错')
+    ok(aborted > 0, 'finally 应取消预热（warmupCancelled/abort 执行）')
   })
 
   // v3.276（EXEC-D T10）：过滤是否生效必须可观测。跳过同样计入 passed，故 passed 恒等于用例总数——
@@ -4328,11 +4340,11 @@ console.log('========================================\n');
   await test('Qodo #158: XBK_PARALLEL_ID 含 / 绝对路径 .. 一律回退 pid 分片（路径穿越防护）', async () => {
     // 1) 模块级不变量：生效三元组必须同源、在根内、且已过白名单
     assertPathInRoot(CACHE_DIR, __dirname, '生效 CACHE_DIR 必须位于仓库根之内')
-    assertEqualStr(CACHE_DIR, path.join(__dirname, DEFAULT_CACHE_DIR), 'CACHE_DIR 必须与 DEFAULT_CACHE_DIR 同源')
-    assertEqualStr(process.env.XBK_PARALLEL_ID, PARALLEL_ID, '写回环境的 XBK_PARALLEL_ID 必须与生效分片 ID 同源')
-    assertEqualStr(PARALLEL_ID, sanitizeIsolationId(PARALLEL_ID), '生效分片 ID 自身必须已通过白名单')
-    assert(CACHE_SHARD_ID_RE.test(PARALLEL_ID), `生效分片 ID 必须只含 [A-Za-z0-9_-]（实得 ${PARALLEL_ID}）`)
-    assert(DEFAULT_CACHE_DIR === `xianbaoku_cache_p${PARALLEL_ID}`,
+    assertStrictEqual(CACHE_DIR, path.join(__dirname, DEFAULT_CACHE_DIR), 'CACHE_DIR 必须与 DEFAULT_CACHE_DIR 同源')
+    assertStrictEqual(process.env.XBK_PARALLEL_ID, PARALLEL_ID, '写回环境的 XBK_PARALLEL_ID 必须与生效分片 ID 同源')
+    assertStrictEqual(PARALLEL_ID, sanitizeIsolationId(PARALLEL_ID), '生效分片 ID 自身必须已通过白名单')
+    ok(CACHE_SHARD_ID_RE.test(PARALLEL_ID), `生效分片 ID 必须只含 [A-Za-z0-9_-]（实得 ${PARALLEL_ID}）`)
+    ok(DEFAULT_CACHE_DIR === `xianbaoku_cache_p${PARALLEL_ID}`,
       `DEFAULT_CACHE_DIR 必须恒为分片目录名（实得 ${DEFAULT_CACHE_DIR}）`)
 
     // 2) 三类恶意输入 + 等价变体：一律回退 pid 分片，构造结果必在仓库根内
@@ -4353,11 +4365,11 @@ console.log('========================================\n');
     for (const [label, raw] of malicious) {
       const shard = buildCacheShard(raw, __dirname, path)
       assertPathInRoot(shard.cacheDir, __dirname, `${label} 输入经构造后仍在仓库根内`)
-      assertEqualStr(path.resolve(shard.cacheDir), path.resolve(rootAbs, shard.dirName),
+      assertStrictEqual(path.resolve(shard.cacheDir), path.resolve(rootAbs, shard.dirName),
         `${label}：cacheDir 必须就是 root+dirName（无多余路径段）`)
-      assertEqualStr(shard.dirName, `xianbaoku_cache_p${process.pid}`,
+      assertStrictEqual(shard.dirName, `xianbaoku_cache_p${process.pid}`,
         `${label}：非法 XBK_PARALLEL_ID=${JSON.stringify(raw)} 必须回退 pid 分片（实得 ${shard.dirName}）`)
-      assertEqualStr(shard.id, String(process.pid), `${label}：非法的归一 ID 必须是 pid`)
+      assertStrictEqual(shard.id, String(process.pid), `${label}：非法的归一 ID 必须是 pid`)
     }
 
     // 3) 恶意输入不得让任何**仓库外**路径被用于递归删除。
@@ -4366,7 +4378,7 @@ console.log('========================================\n');
     //    绝不触碰任何真实敏感路径。
     const victimDir = path.resolve(__dirname, '..', `xbk-o1-app-sentinel-${process.pid}`)
     const victimFile = path.join(victimDir, 'leaf.json')
-    assert(!(victimDir === rootAbs || victimDir.startsWith(rootAbs + path.sep)),
+    ok(!(victimDir === rootAbs || victimDir.startsWith(rootAbs + path.sep)),
       `哨兵必须位于仓库根之外才有证明力（当前 ${victimDir}）`)
     const addSentinel = () => {
       fs.rmSync(victimDir, { recursive: true, force: true })
@@ -4378,26 +4390,26 @@ console.log('========================================\n');
         const shard = buildCacheShard(raw, __dirname, path)
         addSentinel()
         removeDirInRoot(shard.cacheDir, __dirname) // 只允许删自己（根内的分片名）
-        assert(fs.existsSync(victimFile), `${label}：仓库外哨兵文件不得被递归删除（${victimDir}）`)
-        assert(fs.existsSync(victimDir), `${label}：仓库外哨兵目录不得被递归删除（${victimDir}）`)
-        assert(path.resolve(shard.cacheDir) !== path.resolve(victimDir),
+        ok(fs.existsSync(victimFile), `${label}：仓库外哨兵文件不得被递归删除（${victimDir}）`)
+        ok(fs.existsSync(victimDir), `${label}：仓库外哨兵目录不得被递归删除（${victimDir}）`)
+        ok(path.resolve(shard.cacheDir) !== path.resolve(victimDir),
           `${label}：生效缓存目录不得落在仓库之外`)
       }
       // 4) 自证旧口径确实逃逸：raw='3×../<sentinel basename>' 时旧派生路径恰好等于哨兵目录
       const escapeRaw = `../../../${path.basename(victimDir)}`
       const escapeDerived = path.join(rootAbs, `xianbaoku_cache_p${escapeRaw}`)
-      assertEqualStr(path.resolve(escapeDerived), path.resolve(victimDir),
+      assertStrictEqual(path.resolve(escapeDerived), path.resolve(victimDir),
         '构造自证失败：该输入应恰好派生到哨兵目录（否则本用例的证明力不成立）')
       addSentinel()
       const escapeShard = buildCacheShard(escapeRaw, __dirname, path)
-      assert(path.resolve(escapeShard.cacheDir) !== path.resolve(victimDir),
+      ok(path.resolve(escapeShard.cacheDir) !== path.resolve(victimDir),
         '穿越输入必须被拦下，不得把仓库外目录当作缓存目录')
       let blocked = false
       try { removeDirInRoot(victimDir, __dirname) } catch (e) { blocked = true }
-      assert(blocked, 'removeDirInRoot 必须拒绝仓库外路径（fail-closed）')
-      assert(fs.existsSync(victimFile), '穿越输入派生出的清理不得删掉仓库外哨兵')
+      ok(blocked, 'removeDirInRoot 必须拒绝仓库外路径（fail-closed）')
+      ok(fs.existsSync(victimFile), '穿越输入派生出的清理不得删掉仓库外哨兵')
       removeDirInRoot(escapeShard.cacheDir, __dirname)
-      assert(fs.existsSync(victimFile), '穿越输入被回退后的清理也不得删掉仓库外哨兵')
+      ok(fs.existsSync(victimFile), '穿越输入被回退后的清理也不得删掉仓库外哨兵')
     } finally {
       try { fs.rmSync(victimDir, { recursive: true, force: true }) } catch (e) { /* 清理哨兵 */ }
     }
@@ -4407,15 +4419,15 @@ console.log('========================================\n');
   await test('Qodo #158: 合法 XBK_PARALLEL_ID 仍照常分片（白名单不误伤）', async () => {
     for (const good of ['worker1', '12345', '1234_5678901234_0', 'a-b_c-9', 'x'.repeat(CACHE_SHARD_ID_MAX)]) {
       const shard = buildCacheShard(good, __dirname, path)
-      assertEqualStr(shard.id, good, `合法 ID ${good} 不应被改写`)
-      assertEqualStr(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
+      assertStrictEqual(shard.id, good, `合法 ID ${good} 不应被改写`)
+      assertStrictEqual(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
       assertPathInRoot(shard.cacheDir, __dirname, `合法 ID ${good} 的分片目录必须在仓库根内`)
     }
     // 与 test_app_p.js 的分片口径逐字符一致（workerId = `${pid}_${Date.now()}_${idx}`）
     const workerLike = `${process.pid}_${Date.now()}_0`
-    assertEqualStr(buildCacheShard(workerLike, __dirname, path).cacheDir,
+    assertStrictEqual(buildCacheShard(workerLike, __dirname, path).cacheDir,
       path.join(__dirname, `xianbaoku_cache_p${workerLike}`), '与 test_app_p.js 分片口径一致')
-    assertEqualStr(buildCacheShard(undefined, __dirname, path).dirName,
+    assertStrictEqual(buildCacheShard(undefined, __dirname, path).dirName,
       `xianbaoku_cache_p${process.pid}`, '未设置时取进程 pid')
   })
 
@@ -4427,10 +4439,10 @@ console.log('========================================\n');
   await test('Qodo #158: 删除入口收敛 + 与 test_filter.js 同源块未漂移', async () => {
     let threw = false
     try { removeDirInRoot(path.join(__dirname, '..'), __dirname) } catch (e) { threw = true }
-    assert(threw, '对仓库根之外的路径必须抛错拒绝，而不是照删')
+    ok(threw, '对仓库根之外的路径必须抛错拒绝，而不是照删')
     threw = false
     try { removeDirInRoot(__dirname, __dirname) } catch (e) { threw = true }
-    assert(threw, '不得把仓库根自身作为递归删除目标')
+    ok(threw, '不得把仓库根自身作为递归删除目标')
 
     const stripComments = (src) => src
       .replace(/\/\*[\s\S]*?\*\//g, '') // 块注释
@@ -4440,7 +4452,7 @@ console.log('========================================\n');
     // 允许恰好 4 处：removeDirInRoot 内部 1 处 + 声明的豁免 removePath 1 处
     // + 本用例清理哨兵 2 处（addSentinel 前置清空 + finally 收尾，目标恒为仓库外自建哨兵）
     const rawRecursiveRm = selfSrc.match(/rmSync\([^)]*recursive:\s*true/g) || []
-    assertEqualNum(rawRecursiveRm.length, 4,
+    assertStrictEqual(rawRecursiveRm.length, 4,
       `递归删除只能收敛到 removeDirInRoot + 1 处声明豁免 + 本用例哨兵（实得 ${rawRecursiveRm.length} 处）`)
 
     // 两侧同源块逐字符比对（normalize：去整行注释、去空行、去行尾空白、行首空白）
@@ -4460,9 +4472,9 @@ console.log('========================================\n');
       .split('\n').map(line => line.trim()).filter(Boolean).join('\n')
     const mine = normalize(extractBlock(fs.readFileSync(__filename, 'utf8')))
     const other = normalize(extractBlock(fs.readFileSync(path.join(__dirname, 'test_filter.js'), 'utf8')))
-    assert(mine.length > 200 && other.length > 200,
+    ok(mine.length > 200 && other.length > 200,
       `同源块提取失败（自身 ${mine.length} / test_filter ${other.length} 字符）——锚点注释失效`)
-    assertEqualStr(mine, other,
+    assertStrictEqual(mine, other,
       'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
   })
 
@@ -4477,21 +4489,21 @@ console.log('========================================\n');
   cleanupOwnCacheShard(CACHE_DIR, __dirname)
   const reconcile = []
   try {
-    assertEqualNum(executed, passed + failed - skipped,
+    assertStrictEqual(executed, passed + failed - skipped,
       `执行计数不自洽：executed=${executed}，passed+failed-skipped=${passed + failed - skipped}（跳过的用例不得计入通过数）`)
-    assert(executed > 0,
+    ok(executed > 0,
       `本轮 0 例真的执行（过滤跳过 ${skipped} 例；${onlyFilter ? `--only=${onlyFilter}` : nameSet ? '--list-file 名单未命中任何用例' : '无过滤'}）——` +
       '过滤条件/名单写错不得当成「全部通过」，必须判失败')
     // C5-032 自证：收尾必须删掉本进程的分片（旧实现删的是共享目录 ⇒ 每次串行/--only 运行都留一个
     // xianbaoku_cache_p<id>）。靶向回退：把清理目标改回共享 xianbaoku_cache ⇒ 本条真红（--only 路径必现）。
-    assert(!fs.existsSync(CACHE_DIR),
+    ok(!fs.existsSync(CACHE_DIR),
       `收尾必须删除本进程的缓存分片 ${CACHE_DIR}（旧实现删的是共享 xianbaoku_cache，自己的分片恒滞留仓库根）`)
     if (!onlyFilter && !nameSet) {
-      assertEqualNum(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
+      assertStrictEqual(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
       // 独立分母：源码里声明的用例数（与 test_app_p.js 同名提取口径）。只对账 passed 说明不了
       // 「有没有漏跑」——passed 含跳过，恒等于用例总数。
       const declared = [...fs.readFileSync(__filename, 'utf8').matchAll(/await test\((['"])(.*?)\1,/g)].length
-      assertEqualNum(executed, declared, `无过滤时必须跑满声明用例：声明 ${declared} 例，实际执行 ${executed} 例`)
+      assertStrictEqual(executed, declared, `无过滤时必须跑满声明用例：声明 ${declared} 例，实际执行 ${executed} 例`)
     }
   } catch (e) {
     reconcile.push(e.message)
