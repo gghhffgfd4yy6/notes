@@ -125,8 +125,11 @@ function resolveSkip (file) {
   if (!file) return { skip: null, fatal: null }
   let suites
   try {
-    // 沙箱里本文件位于 <sandbox>/scripts/tap-shim.js，注册表在 <sandbox>/test_suites.js。
-    // 用**字面量相对路径**（相对本模块文件解析 ⇒ <root>/test_suites.js）：既避免 './test_suites'
+    // C10-039：CI 生产档里 tap-runner 的 nodeArgs 是**真实仓库**的绝对路径（stryker.tap.config.js），
+    // 所以这里解析到的也是真实仓库的 test_suites.js——不是「沙箱那份」。只有本套件的探针/夹具把
+    // shim 复制进 <sandbox>/scripts/ 时，相对路径才会落到 <sandbox>/test_suites.js（夹具注册表）；
+    // 沙箱副本与真实仓库同 commit、同内容，两条路径在 CI 下不改行为。
+    // 用**字面量相对路径**（相对本模块文件解析 ⇒ <shim 所在根>/test_suites.js）：既避免 './test_suites'
     // 误解析到 scripts/ 下（不存在）而静默失败，也避免 `require(<变量>)` 触发静态分析告警
     // （Codacy「dynamically import a module by calling require using a non-literal string」）。
     suites = require('../test_suites.js').SUITES
