@@ -2033,8 +2033,13 @@ console.log('========================================\n');
   // 的默认值。靶向回退：删掉 reset 里任一恢复行 ⇒ 本用例真红。
   await test('C5-027：reset() 必须恢复 push.parallelLimit/timing/alert.intervalMs/channelHealth 默认值', async () => {
     const DEFAULTS = {
-      parallelLimit: 10, pushInterval: 0, finalWait: 0, alertIntervalMs: 3600000,
-      chEnabled: true, chFailures: 3, chIntervalMs: 3600000
+      parallelLimit: 10,
+      pushInterval: 0,
+      finalWait: 0,
+      alertIntervalMs: 3600000,
+      chEnabled: true,
+      chFailures: 3,
+      chIntervalMs: 3600000
     }
     try {
       Config.push.parallelLimit = 'z'
@@ -2694,7 +2699,7 @@ console.log('========================================\n');
     // 口径与 test_app_p.js 的分片提取一致（它按同一正则给本文件分片，改名后两者必须同步）
     const declared = [...selfSrc.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
     assertEqualNum(PRIVATE_CALL_REGISTRY.length, 12,
-      `私有方法级用例登记表应覆盖 12 条（新增/删除私有方法级用例时必须同步登记与理由）`)
+      '私有方法级用例登记表应覆盖 12 条（新增/删除私有方法级用例时必须同步登记与理由）')
     for (const entry of PRIVATE_CALL_REGISTRY) {
       assert(declared.includes(entry.name), `登记表点名的用例已不存在（改名/删除后未同步登记）：${entry.name}`)
       assert(!!(entry.unit || entry.why), `每条登记必须给出 unit 侧等价锚点或「只有集成侧能观测」的理由：${entry.name}`)
