@@ -458,12 +458,21 @@ const {
     // ===== 句柄必须在所有分支关闭（fd 泄漏是可观测副作用）=====
     const mrHasProc = fs.existsSync('/proc/self/fd')
     const mrFds = () => fs.readdirSync('/proc/self/fd').length
+    // C5-078：fd 净增容差 2 的推导——不是「观测到几就写几」的魔数：
+    //   ① 理想值是 0：被测函数返回前必须把 tmp fd 与父目录 fd 都关掉，这正是下面几条断言要守的契约；
+    //   ② 2 是**上界余量**，留给「采样窗口内还有 fd 未关完」的抖动（同步实现下本机 40 次从未命中），
+    //      以及其它宿主上 /proc/self/fd 列表口径的细微差别；
+    //   ③ 不放成 0：本机实测为 0（writeAtomic 成功/失败、readSafeTextResult、writeAtomicIfAbsent
+    //      各 40 次，净增全为 0），但没有证据证明 0 在 macOS/Android 等宿主上同样成立。
+    //   真正的泄漏是「每次调用漏 1 个」——40 次循环会把净增推到 40，远大于 2：这个容差拦得住泄漏，
+    //   只放过采样噪声。
+    const FD_LEAK_BUDGET = 2
     const mrLeakFile = path.join(mrDir, 'leak.txt')
     if (mrHasProc) {
       writeAtomic(mrLeakFile, 'warm') // 预热：排除首次调用的一次性分配
       const mrBase = mrFds()
       for (let i = 0; i < 40; i++) assert.strictEqual(writeAtomic(mrLeakFile, 'x' + i), true, '写入必须成功')
-      assert.ok(mrFds() - mrBase <= 2,
+      assert.ok(mrFds() - mrBase <= FD_LEAK_BUDGET,
         `writeAtomic 成功路径每次都必须关闭临时文件 fd 与父目录 fd（40 次后实际净增 ${mrFds() - mrBase}）`)
     } else {
       skipEnv('writeAtomic 成功路径的 fd 泄漏（40 次写入后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
@@ -480,7 +489,7 @@ const {
       if (mrHasProc) {
         const mrBase2 = mrFds()
         for (let i = 0; i < 40; i++) assert.strictEqual(writeAtomic(mrErrFile, 'z'), false, 'fsync 失败必须 fail-closed 返回 false')
-        assert.ok(mrFds() - mrBase2 <= 2, `writeAtomic 失败路径必须关闭已打开的 fd（40 次后实际净增 ${mrFds() - mrBase2}）`)
+        assert.ok(mrFds() - mrBase2 <= FD_LEAK_BUDGET, `writeAtomic 失败路径必须关闭已打开的 fd（40 次后实际净增 ${mrFds() - mrBase2}）`)
       } else {
         writeAtomic(mrErrFile, 'z') // 仍执行一次，保证下面「失败文案」断言有输入
         skipEnv('writeAtomic 失败路径的 fd 泄漏（fsync 抛错后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
@@ -496,7 +505,7 @@ const {
     if (mrHasProc) {
       const mrBase3 = mrFds()
       for (let i = 0; i < 40; i++) assert.strictEqual(readSafeTextResult(mrReadFile).status, 'ok', '读取必须成功')
-      assert.ok(mrFds() - mrBase3 <= 2,
+      assert.ok(mrFds() - mrBase3 <= FD_LEAK_BUDGET,
         `readSafeTextResult 每次调用都必须关闭内容 fd 与复检 fd（40 次后实际净增 ${mrFds() - mrBase3}）`)
     } else {
       skipEnv('readSafeTextResult 的 fd 泄漏（40 次读取后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
@@ -579,7 +588,7 @@ const {
       for (let i = 0; i < 40; i++) {
         assert.strictEqual(writeAtomicIfAbsent(path.join(mrDir, 'wai-' + i + '.txt'), 'x'), true, '独占创建必须成功')
       }
-      assert.ok(mrFds() - mrBase4 <= 2,
+      assert.ok(mrFds() - mrBase4 <= FD_LEAK_BUDGET,
         `writeAtomicIfAbsent 成功路径必须由 finally 关闭 fd（40 次后实际净增 ${mrFds() - mrBase4}）`)
     } else {
       skipEnv('writeAtomicIfAbsent 成功路径的 fd 泄漏（40 次独占创建后净增 ≤2）：本机无 /proc/self/fd，fd 计数不可观测')
