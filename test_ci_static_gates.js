@@ -9,9 +9,12 @@
 //
 // 纯字符串/fs 断言，不 spawn 子进程：刻意绕开 AGENTS「本机验证盲区」登记的限制
 // （本机 process.execPath 指向 linker64，execFileSync/spawnSync 必炸），本机与变异沙箱均可跑。
+// C5-013 起额外 require 判据模块（scripts/check-ci-static.js）本身：只读、无副作用、不 spawn，
+// 因此不破坏上面这条限制——但把「判据函数零自动化断言」这个缺口补上（详见下方同名用例）。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
+const gate = require('./scripts/check-ci-static.js')
 
 const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
 // 行匹配一律「拆成行 + 去缩进后精确判定」，不用 /^\s*…$/m：静态分析把「\s* + 行尾锚 + 可能很长的行」
@@ -75,6 +78,52 @@ check('首轮扫描修复不回退（release.yml 显式关缓存 + pre-push SC20
   const pp = read('.githooks/pre-push')
   assert.ok(pp.includes('shellcheck disable=SC2034'),
     'pre-push 的 remote_sha 协议占位行必须带 disable 指令，否则闸门常驻一条噪音红')
+})
+
+// ============================================================
+// C5-013：判据函数与扫描面必须被**自动化**断言接住
+// 本套件此前只断言 package.json / .githooks / YAML 里的接线字符串，一个判据函数都不 require：
+// 把 main() 改成 `return 0`（或删掉扫描循环）、或让模块加载即 throw，本套件与 CI 全绿。
+// scripts/check-ci-static.js 里的 15 条 --selftest 断言又全仓无人调用（package.json / test.yml /
+// .githooks / run_* 全无引用）⇒ 判据函数实际上零自动化断言，是死代码。下面四条把它接进套件。
+// ============================================================
+
+check('C5-013 判据模块可加载，5 个判定函数都是可调用函数', () => {
+  for (const name of ['summarizeZizmor', 'decideToolMissing', 'toolAvailable', 'resolveTool', 'decideZizmorProc']) {
+    assert.strictEqual(typeof gate[name], 'function',
+      `${name} 必须从 scripts/check-ci-static.js 导出——判据零自动化断言 = 门禁可被静默改坏`)
+  }
+  // 直接打一发真实判据：require 到的不是空壳（非 JSON 必须判「不可判定」）
+  assert.strictEqual(gate.summarizeZizmor('not json').ok, false, '非 JSON 输出必须不可判定（宁红勿绿）')
+  assert.strictEqual(gate.decideToolMissing(true, false), 'fail', 'CI 缺工具必须 fail-closed')
+})
+
+check('C5-013 --selftest 已接线：15 条判据断言在套件内执行', () => {
+  // 此前 --selftest 全仓无人调用，是死代码；现在由本套件执行（run_unit_tests 与 test.yml 都跑本套件）。
+  const n = gate.selftest()
+  assert.strictEqual(n, 15, `--selftest 必须执行 15 条断言（实际 ${n}）；增减须同步本守卫`)
+})
+
+check('C5-013 扫描面守卫：门禁真的会扫到 N 个 .githooks 文件（N>=2 且与磁盘一致）', () => {
+  const targets = gate.shellcheckTargets()
+  assert.ok(Array.isArray(targets), 'shellcheckTargets 必须返回文件名数组')
+  assert.ok(targets.length >= 2, `扫描面不得塌成 0：实际 ${targets.length} 个（扫描循环被删/目录读空即红）`)
+  const onDisk = fs.readdirSync(path.join(__dirname, '.githooks'))
+    .filter((f) => fs.lstatSync(path.join(__dirname, '.githooks', f)).isFile())
+  assert.deepStrictEqual([...targets].sort(), [...onDisk].sort(),
+    '.githooks 下的常规文件必须全部在扫描面内（新增钩子漏扫 = 门禁缺一块）')
+  for (const must of ['pre-commit', 'pre-push']) {
+    assert.ok(targets.includes(must), `${must} 必须在扫描面内`)
+  }
+})
+
+check('C5-013 main() 必须真的调用两台扫描器（防 main 空转后门禁静默失效）', () => {
+  const src = read('scripts/check-ci-static.js').split('\n').map((l) => l.trim())
+  assert.ok(src.includes("if (toolAvailable('shellcheck')) {"), 'main 必须按 shellcheck 可用性分支扫描（分支被删 = 空转）')
+  assert.ok(src.includes('const sc = runShellcheck()'), 'main 必须真的调用 runShellcheck（改成 main(){ return 0 } 会在这里红）')
+  assert.ok(src.includes("if (toolAvailable('zizmor')) {"), 'main 必须按 zizmor 可用性分支扫描')
+  assert.ok(src.includes('const z = runZizmor()'), 'main 必须真的调用 runZizmor')
+  assert.ok(src.includes('return red ? 1 : 0'), 'main 必须把 red 汇成退出码（恒 0 = 门禁永远绿）')
 })
 
 console.log(`✅ test_ci_static_gates 全部通过（${checks} 检查）`)
