@@ -71,6 +71,42 @@ check('跳过必须响亮打印：guardOrExit 与 CLI 走同一条 ⏭ 分支（
     '跳过时不得打印「✅ 主机干净」：那是把「没检查」说成「检查过且干净」')
 })
 
+check('main() 的「不可判定」必须有独立结论，且不留不可达 return（C10-063）', () => {
+  // 背景：ok 的定义已含 !unsupported（:346）⇒ `if (r.ok && !r.unsupported)` 冗余、末行 return 0 不可达；
+  // 而 unsupported 时先打「❌ 主机不干净——墙钟基准会被这些残留拖红」再零条明细，读起来像扫到了残留。
+  // 这里用 preload 让 /proc readdir 抛 ENOENT（与审计复现同一手法），从 CLI 端到端核对文案与退出码。
+  const preload = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-preload-')), 'no-proc.js')
+  fs.writeFileSync(preload,
+    "'use strict'\n" +
+    "const fs = require('fs')\n" +
+    'const orig = fs.readdirSync\n' +
+    'fs.readdirSync = function (target, ...args) {\n' +
+    "  if (String(target) === '/proc') { const e = new Error('no proc'); e.code = 'ENOENT'; throw e }\n" +
+    '  return orig.call(this, target, ...args)\n' +
+    '}\n')
+  try {
+    const run = spawnSync(process.execPath, ['-r', preload, path.join(__dirname, 'scripts/check-host-clean.js')],
+      { encoding: 'utf8', env: { ...process.env } })
+    assert.strictEqual(run.status, 1, '读不到 /proc 仍必须 fail-closed（exit 1，语义不变）：' + run.stderr)
+    assert.match(run.stdout, /该平台不检测/,
+      'unsupported 必须单独一条「该平台不检测」，不得只说「主机不干净」')
+    assert.ok(!/主机不干净——墙钟基准会被这些残留拖红/.test(run.stdout),
+      'unsupported 时零条残留明细，却打「主机不干净——墙钟基准会被这些残留拖红」= 把「判不了」说成「扫到了残留」')
+    assert.match(run.stdout, /无法判定主机是否干净/,
+      '找不到明细时结论必须落在「无法判定」而不是「不干净」')
+  } finally {
+    fs.rmSync(path.dirname(preload), { recursive: true, force: true })
+  }
+  const src = read('scripts/check-host-clean.js')
+  assert.ok(!/if \(r\.ok && !r\.unsupported\)/.test(src),
+    'main() 不得保留冗余条件 `r.ok && !r.unsupported`：ok 的定义已含 !unsupported（:346）')
+  const mainStart = src.indexOf('function main () {')
+  assert.ok(mainStart > 0, '找不到 main()')
+  const mainSrc = src.slice(mainStart, src.indexOf('\n}\n', mainStart))
+  assert.ok(mainSrc.trimEnd().endsWith('return 1'),
+    'main() 的最后一条语句必须是 `return 1`：末行 `return 0` 在 !ok 分支之后不可达（C10-063）')
+})
+
 check('不回退：变异子进程必跳过；沙箱只认过期；阈值必须是 30 分钟', () => {
   assert.strictEqual(host.shouldSkipCheck({ XBK_MUTATION_CHILD: '1' }), true,
     '变异评估子进程内必须跳过——沙箱里本来就有活动 /tmp 沙箱，按「脏」判会立刻假红')

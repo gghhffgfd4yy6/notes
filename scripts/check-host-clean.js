@@ -510,7 +510,7 @@ function main () {
     return 0
   }
   if (r.unsupported) {
-    console.log('⚠️ 读不到 /proc，本机不做孤儿桩检测；若存在过期沙箱候选，则 cwd 豁免不可判定并按 fail-closed 拒绝继续')
+    console.log('⚠️ 该平台不检测：读不到 /proc，本机无法枚举进程 —— 孤儿测试桩/孤儿套件检测**未执行**（这不是「已检查干净」）')
   }
   if (r.cwdScanError) {
     console.log('❌ 活动沙箱 cwd 扫描失败，无法安全排除正在运行的沙箱（按 fail-closed 拒绝继续）' + cwdScanFailureText(r.cwdScanErrorDetails))
@@ -519,7 +519,7 @@ function main () {
     console.log('❌ 临时根目录扫描失败，无法判定过期沙箱（按 fail-closed 拒绝继续）')
   }
   if (r.incomplete) console.log(unreadableProcsText(r))
-  if (r.ok && !r.unsupported) {
+  if (r.ok) {
     if (r.incomplete) {
       console.log('⚠️ 主机干净度检查通过（仅就已扫描到的进程）：孤儿检测对上述进程失明，结论不得读作「全量已检查」')
       return 0
@@ -527,7 +527,12 @@ function main () {
     console.log('✅ 主机干净：无孤儿测试桩 / 孤儿套件进程、无过期 ' + SANDBOX_PREFIX + '* 沙箱')
     return 0
   }
-  if (!r.ok) {
+  // 明细头必须分开：unsupported / 扫描失败时确实一条残留都没有，此时打「主机不干净——墙钟基准会被
+  // 这些残留拖红」再列 0 条，读起来像扫到了残留；结论只能是「判不了」（C10-063，fail-closed 语义不变）。
+  const findings = r.stubs.length + r.suites.length + r.dirs.length
+  if (findings === 0) {
+    console.log('❌ 无法判定主机是否干净（上面的保护信号不可判定，按 fail-closed 拒绝继续；本次没有任何残留明细）')
+  } else {
     console.log('❌ 主机不干净——墙钟基准会被这些残留拖红（实测可让 300ms 基准跑到 878ms）')
     if (r.stubs.length) {
       console.log('  孤儿测试桩 ' + r.stubs.length + ' 个：')
@@ -545,10 +550,9 @@ function main () {
       console.log('    清理：' + rmSuggestion(r.dirs))
     }
     console.log('  为什么判红：v3.282 一轮 48/49 的红就是被这类残留拖出来的（详见 scripts/check-host-clean.js 头注）。')
-    console.log('  在变异评估子进程里本检查自动跳过；沙箱只认过期（默认 >30min，可用 --stale-min 调）。')
-    return 1
   }
-  return 0
+  console.log('  在变异评估子进程里本检查自动跳过；沙箱只认过期（默认 >30min，可用 --stale-min 调）。')
+  return 1
 }
 
 // 供 run_tests.js / run_unit_tests.js 入口调用：返回 true 表示应当中止本次运行
