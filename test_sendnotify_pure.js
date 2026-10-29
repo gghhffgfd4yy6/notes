@@ -608,6 +608,53 @@ check('stripAngleTags: 无标签原样返回', () => {
   assert.strictEqual(stripAngleTags('plain text', true), 'plain text')
 })
 
+// ============================================================
+// C5-039：从 test_sendnotify_utils.js 收拢过来的形态边界
+// ------------------------------------------------------------
+// 收敛前，mdToPlain / mdLinksToPlain / mdImagesToPlain / stripAngleTags / looksHtml / maskKey /
+// maskUrl / safeSlice / safeErr 这 9 个导出被两个套件各测一遍（utils 侧 52 处断言）。收敛口径：
+// 纯函数只在本文件维护（逐函数逐分支、且是变异击杀的主战场）。下面 13 条是 utils 侧**没有等价覆盖**
+// 的那部分，逐字搬过来 ⇒ 收拢不丢覆盖，也不改任何既有断言；其余 39 条与这里的用例等价，随收敛删除。
+check('mdToPlain: 实体只解一层——&amp;lt; 不得二次解码成 <（CodeQL double-escaping）', () => {
+  assert.strictEqual(mdToPlain('&amp;lt;'), '&lt;')
+})
+check('mdToPlain: null 返回空串（与 undefined 同口径）', () => {
+  assert.strictEqual(mdToPlain(null), '')
+})
+check('mdToPlain: 数字入参 String 化', () => {
+  assert.strictEqual(mdToPlain(123), '123')
+})
+check('mdLinksToPlain: 成功替换后前缀与后缀原样保留', () => {
+  assert.strictEqual(mdLinksToPlain('前置[a](https://x)后'), '前置a (https://x)后')
+})
+check('mdLinksToPlain: 有 "] " 但没有 "(" 时不得误判成链接', () => {
+  assert.strictEqual(mdLinksToPlain('[a] 未闭合'), '[a] 未闭合')
+})
+check('mdLinksToPlain: 只有 "[a](" 的未闭合尾部原样保留', () => {
+  assert.strictEqual(mdLinksToPlain('[a]('), '[a](')
+})
+check('mdLinksToPlain: text 与 url 同时为空时原样保留', () => {
+  assert.strictEqual(mdLinksToPlain('[]()'), '[]()')
+})
+check('stripAngleTags: 标签名内含空格且整串无 ">" 时原样保留', () => {
+  assert.strictEqual(stripAngleTags('<b hi', true), '<b hi')
+})
+check('maskUrl: http(s) 的路径段保留首 4 尾 2、host 原样', () => {
+  assert.strictEqual(maskUrl('https://api.day.app/deviceKey12345'), 'https://api.day.app/devi***45')
+})
+check('maskUrl: 非 http(s) 方案按 maskKey 脱敏整串', () => {
+  assert.strictEqual(maskUrl('file://host/x'), 'file***/x')
+})
+check('maskUrl: URL 解析失败（含空格串）按 maskKey 脱敏', () => {
+  assert.strictEqual(maskUrl('not a url'), 'not ***rl')
+})
+check('safeSlice: 连续代理对不得截出孤立高代理', () => {
+  assert.strictEqual(safeSlice('😀😀', 3), '😀')
+})
+check('safeSlice: ZWJ 家庭 emoji 截断点落在序列内时整体移除（不留半截序列）', () => {
+  assert.strictEqual(safeSlice('a👨‍👩‍👧‍👦b', 2), 'a')
+})
+
 // ===== 比值型墙钟判据的 PERF_MS 缩放回归 =====
 // 靶向对象：CI（4 vCPU、--concurrency 8）在 PR #158 新配置下 r5/r6/r7 三轮产生的**残余假 Killed**，
 // 原始日志三条：良性/畸形 = 1.85/24.66ms、1.72/24.84ms、1.53/17.60ms（比值 10.4–13.3×）。良性基数
@@ -981,7 +1028,7 @@ check('push_config: 默认值逐键精确（空串默认不得被占位文本替
     TG_PROXY_PORT: ''
   }
   // 部署侧存在 push_config.local.js（gitignore 的真实密钥文件）时，local 配置按设计在模块加载期
-  // Object.assign 覆盖默认值——此时默认值不可观测，与 test_sendnotify_utils.js:280 的跳过口径对齐
+  // Object.assign 覆盖默认值——此时默认值不可观测，与 test_sendnotify_utils.js 的「模块加载期配置契约」段同口径
   // （本机存在该文件时本用例曾 100% 假红：WX_pusher_topicIds 被真实主题 ID 覆盖）。
   let hasLocalCfg = true
   try { require.resolve('./push_config.local.js') } catch (e) { hasLocalCfg = false }

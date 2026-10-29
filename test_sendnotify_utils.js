@@ -1,17 +1,10 @@
 'use strict'
 
 const assert = require('assert')
+const fs = require('fs')
+const path = require('path')
 const slim = require('./xbk_sendNotify_slim')
 const {
-  mdToPlain,
-  mdLinksToPlain,
-  mdImagesToPlain,
-  stripAngleTags,
-  looksHtml,
-  maskKey,
-  maskUrl,
-  safeSlice,
-  safeErr,
   configuredChannelCount,
   configuredChannelNames
 } = slim
@@ -62,74 +55,11 @@ function assertSettled (outcome, label, why) {
 }
 
 ;(async () => {
-  // ===== mdToPlain：Markdown → 纯文本（推送正文可读性） =====
-  assert.strictEqual(mdToPlain('**粗体**'), '粗体', '粗体应剥离')
-  assert.strictEqual(mdToPlain('*斜体*'), '斜体', '斜体应剥离')
-  assert.strictEqual(mdToPlain('5*3*2cm'), '5*3*2cm', '数字前后 * 不应剥除（v3.150）')
-  assert.strictEqual(mdToPlain('# 标题'), '标题', '标题井号应剥离')
-  assert.strictEqual(mdToPlain('`code`'), 'code', '行内代码反引号应剥离')
-  assert.strictEqual(mdToPlain('![alt](https://x/y.png)'), 'alt', '图片语法应替换为 alt')
-  assert.strictEqual(mdToPlain('[text](https://x)'), 'text (https://x)', '链接应保留文本与 URL')
-  assert.strictEqual(mdToPlain('[https://x](https://x)'), 'https://x', 'text===url 原文链接只显示一次（v3.153）')
-  assert.strictEqual(mdToPlain('<b>hi</b>'), 'hi', 'HTML 标签应剥离')
-  assert.strictEqual(mdToPlain('<https://x>'), 'https://x', 'http autolink 保留内容')
-  assert.strictEqual(mdToPlain('a&nbsp;b'), 'a b', '&nbsp; 应解码为空格')
-  assert.strictEqual(mdToPlain('&amp;lt;'), '&lt;', '&amp; 不得二次解码成 <（CodeQL double-escaping）')
-  assert.strictEqual(mdToPlain('<b>hi</b>', false), '<b>hi</b>', 'stripAngle=false 整体保留标签')
-  assert.strictEqual(mdToPlain(undefined), '', 'undefined → 空串')
-  assert.strictEqual(mdToPlain(null), '', 'null → 空串')
-  assert.strictEqual(mdToPlain(123), '123', '数字应 String 化')
-
-  // ===== mdLinksToPlain：线性链接剥离 =====
-  assert.strictEqual(mdLinksToPlain('[a](https://x)'), 'a (https://x)')
-  assert.strictEqual(mdLinksToPlain('前置[a](https://x)后'), '前置a (https://x)后')
-  assert.strictEqual(mdLinksToPlain('[a] 未闭合'), '[a] 未闭合', '无 () 不应误判链接')
-  assert.strictEqual(mdLinksToPlain('[a]('), '[a](', '未闭合 ( 原样保留')
-  assert.strictEqual(mdLinksToPlain('[]()'), '[]()', '空 text 原样保留')
-  assert.strictEqual(mdLinksToPlain('[a]()'), '[a]()', '空 url 原样保留')
-
-  // ===== mdImagesToPlain：线性图片语法剥离 =====
-  assert.strictEqual(mdImagesToPlain('![alt](https://x/y.png)'), 'alt')
-  assert.strictEqual(mdImagesToPlain('![](https://x/y.png)'), '', '空 alt 默认替换为空串')
-  assert.strictEqual(mdImagesToPlain('![](https://x/y.png)', '(图片)'), '(图片)', '空 alt 用 emptyAlt 替换')
-  assert.strictEqual(mdImagesToPlain('![未闭合'), '![未闭合', '未闭合保留')
-
-  // ===== stripAngleTags：线性 HTML 标签剥离 =====
-  assert.strictEqual(stripAngleTags('<b>hi</b>', true), 'hi')
-  assert.strictEqual(stripAngleTags('<https://x>', true), 'https://x', 'autolink 保留')
-  assert.strictEqual(stripAngleTags('<b>hi', true), 'hi', '完整 <b> 标签剥离，剩余文本保留')
-  assert.strictEqual(stripAngleTags('<b hi', true), '<b hi', '无 > 的串整体保留')
-  assert.strictEqual(stripAngleTags('<b>hi</b>', false), '<b>hi</b>', 'stripAngle=false 保留')
-  assert.strictEqual(stripAngleTags('<>', true), '<>', '空 inner 保留')
-
-  // ===== looksHtml =====
-  assert.strictEqual(looksHtml('<b>x</b>'), true)
-  assert.strictEqual(looksHtml('plain text'), false)
-
-  // ===== maskKey / maskUrl：凭据与设备码脱敏 =====
-  assert.strictEqual(maskKey('abc'), '***', '≤6 位全脱敏')
-  assert.strictEqual(maskKey('abcdefgh'), 'abcd***gh', '保留首 4 尾 2')
-  assert.strictEqual(maskUrl('https://api.day.app/deviceKey12345'), 'https://api.day.app/devi***45', 'host 保留、路径脱敏')
-  assert.strictEqual(maskUrl('file://host/x'), 'file***/x', '非 http(s) 按 key 脱敏（保留首 4 尾 2）')
-  assert.strictEqual(maskUrl('not a url'), 'not ***rl', 'URL 解析失败按 key 脱敏')
-
-  // ===== safeSlice：安全截断（不拆散 emoji/代理对） =====
-  assert.strictEqual(safeSlice('hello', 3), 'hel')
-  assert.strictEqual(safeSlice('hello', 10), 'hello', '不超长原样返回')
-  assert.strictEqual(safeSlice(undefined, 5), '', 'undefined → 空串')
-  assert.strictEqual(safeSlice(null, 5), '', 'null → 空串')
-  assert.strictEqual(safeSlice('😀😀', 3), '😀', '不得拆散代理对')
-  // max=2 落在家庭 emoji 序列内：要么保留完整 grapheme，要么整体移除（不得留下半截序列）
-  assert.strictEqual(safeSlice('a👨‍👩‍👧‍👦b', 2), 'a', 'ZWJ 家庭 emoji 不得被拆散，应整体移除被截断的序列')
-
-  // ===== safeErr：错误摘要（含脱敏与截断） =====
-  assert.strictEqual(safeErr(null), '', 'null → 空串')
-  assert.strictEqual(safeErr(undefined), '', 'undefined → 空串')
-  assert.strictEqual(safeErr(new Error('boom')), 'boom', 'Error 取 message')
-  assert.strictEqual(safeErr('err str'), 'err str', '字符串原样')
-  assert.strictEqual(safeErr({ message: 'obj msg' }), 'obj msg', '对象取 message 字段')
-  assert.strictEqual(safeErr('x'.repeat(300)).length, 201, '超 200 截断并追加 …')
-  assert.strictEqual(safeErr('abc'), 'abc', '短消息不截断')
+  // ===== 纯函数段已整体移交 test_sendnotify_pure.js（C5-039）=====
+  // 原先这里逐条重测 mdToPlain / mdLinksToPlain / mdImagesToPlain / stripAngleTags / looksHtml /
+  // maskKey / maskUrl / safeSlice / safeErr（52 处断言）。收敛后那 9 个纯函数只由
+  // test_sendnotify_pure.js 断言（其中 13 处 utils 独有的形态边界已逐字搬过去），
+  // 本文件从下面这道门禁开始，只测需要与本套件夹具/配置交互的部分。
 
   // ===== configuredChannelCount / configuredChannelNames：通道配置统计 =====
   const saved = {}
@@ -178,7 +108,51 @@ function assertSettled (outcome, label, why) {
     for (const [k, v] of Object.entries(saved)) cfg[k] = v
   }
 
-  // ===== F4：WX_pusher_channels 配置被丢弃时必须告警（旧口径完全静默）=====
+  // ===== 纯函数口径的唯一归属：门禁（C5-039）=====
+  // 反例（改动前）：mdToPlain / mdLinksToPlain / mdImagesToPlain / stripAngleTags / looksHtml /
+  // maskKey / maskUrl / safeSlice / safeErr 这 9 个导出在本文件与 test_sendnotify_pure.js 里各测一遍
+  // （本文件 52 处断言，其中 39 处与 pure 侧用例等价、13 处是 pure 没有的形态边界）。
+  // 同一行为两处维护：改一处忘一处就让两个套件的口径漂移，而「哪一份才是契约」在代码里查不到；
+  // 变异门禁也只认一份的击杀，另一份只是重复跑。
+  // 收敛口径：这 9 个纯函数**只归 test_sendnotify_pure.js**（逐函数逐分支，且是变异击杀的主战场；
+  // 那 13 处形态边界已逐字搬过去，见其「C5-039」段）；本文件保留需要与自己的夹具/配置交互的部分
+  // （sendNotify 通道簇、模块加载期配置契约、导出面守卫、正常/异常路径等）。
+  // 下面这道门禁把归属钉死（不是注释）：纯函数断言回流到本文件、或 pure 侧用例整批消失，都会在这里真红。
+  {
+    const selfSrc = fs.readFileSync(__filename, 'utf8')
+    const pureSrc = fs.readFileSync(path.join(__dirname, 'test_sendnotify_pure.js'), 'utf8')
+    // 归属表：函数名 → pure 侧用例条数下限（= 收敛当时实测条数；只许增，不许悄悄删）
+    const OWNERSHIP = {
+      looksHtml: 6,
+      maskKey: 7,
+      maskUrl: 9,
+      mdImagesToPlain: 17,
+      mdLinksToPlain: 22,
+      mdToPlain: 21,
+      safeErr: 21,
+      safeSlice: 12,
+      stripAngleTags: 10
+    }
+    // ① 本文件不得再直接断言这 9 个纯函数（否则「同一行为两处维护」又回来了）
+    const offenders = []
+    for (const fn of Object.keys(OWNERSHIP)) {
+      const hits = selfSrc.match(new RegExp(`assert\\.[A-Za-z]+\\(\\s*${fn}\\(`, 'g'))
+      if (hits) offenders.push(`${fn}×${hits.length}`)
+    }
+    assert.deepStrictEqual(offenders, [],
+      `纯函数用例只归 test_sendnotify_pure.js（C5-039），本文件又出现直接断言：${offenders.join(', ')}`)
+    // ② pure 侧用例条数不得回落——否则「唯一归属」会退化成「没人测」
+    const thin = []
+    for (const [fn, floor] of Object.entries(OWNERSHIP)) {
+      const got = (pureSrc.match(new RegExp(`check\\('${fn}[: ]`, 'g')) || []).length
+      if (got < floor) thin.push(`${fn} ${got}<${floor}`)
+    }
+    assert.deepStrictEqual(thin, [], `test_sendnotify_pure.js 的纯函数用例数回落：${thin.join(', ')}`)
+    const total = Object.values(OWNERSHIP).reduce((a, b) => a + b, 0)
+    console.log(`✅ C5-039 纯函数口径唯一化：${Object.keys(OWNERSHIP).length} 个导出只由 test_sendnotify_pure.js 断言（本文件零直接断言；pure 侧这 9 个函数的用例数 ≥ ${total}）`)
+  }
+
+  // ===== F4：WxPusher_channels 配置被丢弃时必须告警（旧口径完全静默）=====
   // 多应用数组里任一项缺 appToken/topicIds、或整串不是合法 JSON 时，旧实现直接回退旧字段且零日志——
   // 用户看到「推送成功」，其余应用一条没收到。逐场景断言 console.warn 的出现/缺席。
   {

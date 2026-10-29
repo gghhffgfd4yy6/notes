@@ -4423,7 +4423,8 @@ console.log('========================================\n');
       assertStrictEqual(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
       assertPathInRoot(shard.cacheDir, __dirname, `合法 ID ${good} 的分片目录必须在仓库根内`)
     }
-    // 与 test_app_p.js 的分片口径逐字符一致（workerId = `${pid}_${Date.now()}_${idx}`）
+    // 与 test_app_p.js 的分片口径逐字符一致（首轮 workerId = `${pid}_${Date.now()}_${idx}`；
+    // 失败重跑（C5-085）在末尾多一个序号后缀 `_r<n>`，形如 `${pid}_${Date.now()}_${idx}_r1`）
     const workerLike = `${process.pid}_${Date.now()}_0`
     assertStrictEqual(buildCacheShard(workerLike, __dirname, path).cacheDir,
       path.join(__dirname, `xianbaoku_cache_p${workerLike}`), '与 test_app_p.js 分片口径一致')
