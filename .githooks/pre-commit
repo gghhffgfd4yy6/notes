@@ -50,6 +50,32 @@ run_gate () {
   echo "✅ ${label} 通过（$((t1 - t0))s）"
 }
 
+# ── C10-042：index 与工作树不一致时拒绝提交 ───────────────────────────────────────────
+# 五道门禁全部读**工作树**（standard 遍历、check-version 读 package.json/CHANGELOG、check-doc-lines
+# 读盘、check-mutation-ranges 读 mutation.yml、check:ci-static 读 .githooks/*），没有一道看 index；
+# 而 git 提交的是 index。`git add -p` 部分暂存、或 add 之后又改了盘上内容时，「被验证的内容 ≠ 被提交
+# 的内容」——五道门禁全绿只说明工作树绿，那个提交本身没被验证过（旧实现对此一声不吭）。
+# 不改成「从 index 导出临时树再跑」：五道门禁都是相对路径读盘，导出临时树要复制整条工具链
+# （node_modules、shellcheck/zizmor、mutation.yml 的相对定位），成本与误报都远高于收益。取成本最低的
+# fail-closed：不一致就**明确拒绝**，让人先把两边对齐。只加拒绝、不放宽任何既有判据——
+# `git commit -a` / `git commit <path>` 在钩子运行前已经对齐 index 与工作树，照旧放行。
+index_mismatch_rc=0
+git diff --quiet || index_mismatch_rc=$?
+case "$index_mismatch_rc" in
+  0) : ;;
+  1)
+    echo "❌ 暂存区与工作树不一致：门禁只验证工作树，此时「全绿」不代表被提交的内容通过"
+    index_diff_files=$(git diff --name-only || true)
+    printf '%s\n' "$index_diff_files" | sed 's/^/   · /'
+    echo "   处理：把改动全部 git add（两边对齐）后重试，或 git stash 未暂存部分后再提交"
+    exit 1
+    ;;
+  *)
+    echo "❌ 无法判定暂存区与工作树是否一致（git diff 退出码 ${index_mismatch_rc}）：不能确认被提交的内容已通过门禁，拒绝提交"
+    exit 1
+    ;;
+esac
+
 run_gate "lint" "，修复后再提交（若提示某个可执行文件 not found，先 npm ci 装依赖）" npm run lint
 run_gate "版本闸门" "（文件头/CHANGELOG/package.json/package-lock 四方不一致），先同步再提交" node check-version.js
 run_gate "变异行段闸门" "（mutation.yml 行段未覆盖 xbk_function_v3.js / xbk_sendNotify_slim.js 实际行数），重拆行段后再提交" node scripts/check-mutation-ranges.js
