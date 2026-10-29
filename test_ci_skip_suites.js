@@ -2564,11 +2564,11 @@ const parseMatrixTimeouts = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIEL
 }
 console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner 契约（testRunner=tap / coverageAnalysis=perTest / tap.testFiles 非空）均已锁（靶向反例已锁）；mutation.yml 矩阵逐段 config 齐备、文件真实存在、恰 v3-entry/storage/qinglong-push/check-deps 四段 command 档，且消费点逐字用 $' + '{' + '{ matrix.config }}（靶向反例已锁）')
 
-// ── 3j 逐段 timeoutMS（console 9 段 60s）的接线契约 ────────────────────────────────────────────
+// ── 3j 逐段 timeoutMS（console 12 段 60s）的接线契约 ────────────────────────────────────────────
 // 为什么必须锁：`timeoutMS` 只允许经 **CLI** 覆盖（`--timeoutMS ${{ matrix.timeout_ms || 300000 }}`），
 //   理由是 stryker core 的 config-reader 是 deepMerge(options, cliOptions)、而「恢复增量缓存」的 key 只
 //   hash 三份配置文件 ⇒ 走 CLI 不进缓存身份、不需要一次性全量重跑；反过来，谁把 timeout 值写进
-//   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 29 段再全量一次（或让日报失去
+//   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 32 段再全量一次（或让日报失去
 //   「本段生效上限」的判据）。这里把三条接线一起锁死，并各配一条靶向反例（改回旧形态立刻红）。
 {
   // 矩阵条目解析：与档位解析共用模块级的 parseMatrixInclude（单点实现，C4-020），
@@ -2636,7 +2636,7 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
     assert.throws(() => assertTimeoutWiring(polluted), /timeout/,
       '缓存身份里出现 timeout 维度后必须红：那会让所有段在每次改上限时全部失效（一次真全量）')
   }
-  console.log('✅ 逐段 timeoutMS：只经 CLI --timeoutMS 覆盖（非 console 段缺省 300000）、恰 console 11 段 60000、缓存身份与两份配置零改动（4 条靶向反例已锁）')
+  console.log(`✅ 逐段 timeoutMS：只经 CLI --timeoutMS 覆盖（非 console 段缺省 300000）、恰 console ${CONSOLE_SEGS.length} 段 60000、缓存身份与两份配置零改动（4 条靶向反例已锁）`)
 }
 
 // ── 4. test_app.js 的 `--only` 过滤契约（EXEC-D T10）──────────
