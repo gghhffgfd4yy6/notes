@@ -13,6 +13,36 @@ const zlib = require('node:zlib')
 const net = require('node:net')
 const { spawn, spawnSync } = require('node:child_process')
 
+// C5-020：源码锁的两条纪律。
+// ① 切片的锚点必须先存在：`src.slice(src.indexOf(a), src.indexOf(b))` 在锚点消失时 indexOf
+//    返回 -1 ⇒ slice(-1, x) 静默退化成「末字符/空段」，后面的 includes 断言要么假红（错位）
+//    要么假绿（判据根本没覆盖到目标段），而失败信息只会说「长度不对」。
+// ② 判据不得被注释满足：注释里留着实现原句时 includes 照样绿（实现已删也没人发现）。
+function sliceBetween (source, startAnchor, endAnchor, label) {
+  const start = source.indexOf(startAnchor)
+  assert.ok(start > -1, `${label}：起始锚点缺失（${startAnchor}）`)
+  const end = endAnchor === undefined ? source.length : source.indexOf(endAnchor, start)
+  assert.ok(end > start, `${label}：结束锚点缺失或在起点之前（${endAnchor}）`)
+  const seg = source.slice(start, end)
+  assert.ok(seg.length > 0, `${label}：切片为空（${startAnchor} → ${endAnchor}）`)
+  return seg
+}
+function sliceTo (source, endAnchor, label) {
+  const end = source.indexOf(endAnchor)
+  assert.ok(end > 0, `${label}：结束锚点缺失或在文件头（${endAnchor}）`)
+  return source.slice(0, end)
+}
+// 按行剥注释（行首 //、*、/* 整行剥掉；行内 // 只在前面没有引号时才算注释起点，
+// 'http://x' 这类字符串不被截断）。要锁「代码里真有这句」的地方把它套在源码上再 includes。
+function codeOf (source) {
+  return source.split('\n').map((line) => {
+    const trimmed = line.trimStart()
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return ''
+    const idx = line.indexOf('//')
+    if (idx > -1 && !/['"`]/.test(line.slice(0, idx))) return line.slice(0, idx)
+    return line
+  }).join('\n')
+}
 // 前端模块清单（v3.364）：拆 app.js 时，测试按固定顺序把自家模块拼回一份源码——
 // 653 条源码文本断言因此不必随搬家逐条改锚点。新增模块时把文件追加到入口之前。
 const CONSOLE_MODULE_FILES = [
@@ -26,7 +56,13 @@ const CONSOLE_MODULE_FILES = [
 ]
 function readConsoleSource () {
   return CONSOLE_MODULE_FILES
-    .map((file) => fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8'))
+    .map((file) => {
+      const text = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8')
+      // C5-020：清单里的模块被清空/搬走时，拼接结果会静默变短，653 条文本断言里有一部分
+      // 仍然能过（另一些以「找不到」红在很远的地方）。这里先按文件钉住「非空且像源码」。
+      assert.ok(text.length > 0, `前端模块 ${file} 不得为空（readConsoleSource 会静默少拼一段）`)
+      return text
+    })
     .join('\n')
 }
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
@@ -3084,6 +3120,30 @@ async function watchMonitorTests () {
 }
 
 async function main () {
+  // ── C5-020：源码锁的纪律（缺锚点响亮失败 / 注释不得满足判据）──
+  ok('C5-020 源码切片缺锚点或空切片必须响亮失败（旧写法 slice(-1) 静默假绿）', () => {
+    const src = 'function A () { return 1 }\nfunction B () { return 2 }\n'
+    assert.strictEqual(sliceBetween(src, 'function A', 'function B', '探针').trim(), 'function A () { return 1 }')
+    assert.strictEqual(sliceTo(src, 'function B', '探针').trim(), 'function A () { return 1 }')
+    assert.throws(() => sliceBetween(src, 'function Missing', 'function B', '探针'), /起始锚点缺失/, '缺起始锚点必须响')
+    assert.throws(() => sliceBetween(src, 'function A', 'function Missing', '探针'), /结束锚点缺失/, '缺结束锚点必须响')
+    assert.throws(() => sliceBetween(src, 'function B', 'function A', '探针'), /结束锚点缺失或在起点之前/, '锚点顺序反了必须响')
+    assert.throws(() => sliceTo(src, 'function Missing', '探针'), /结束锚点缺失/, 'sliceTo 缺锚点必须响')
+    // 旧写法复现：锚点消失 ⇒ indexOf = -1 ⇒ slice(-1, N) 只剩最后一个字符，后面的
+    // includes 断言既可能假红（切片错位）也可能假绿（根本没覆盖目标段）。
+    const legacy = src.slice(src.indexOf('function Missing'), src.indexOf('function B'))
+    assert.ok(legacy.length <= 1, `旧写法缺锚点时只切出 ${legacy.length} 个字符（静默）`)
+  })
+
+  ok('C5-020 注释不得满足文本判据（codeOf 先按行剥注释）', () => {
+    const src = '// locking && html`<span class="trigger-busy"/\nconst real = 1\n'
+    assert.ok(src.includes('trigger-busy'), '裸 includes 会被注释里的原句满足——这正是旧判据的漏洞')
+    assert.strictEqual(codeOf(src).includes('trigger-busy'), false, 'codeOf 必须把注释行剥掉')
+    // 行内注释同样不算；字符串里的 // 不得被当成注释起点（'http://x' 要完整保留）
+    assert.strictEqual(codeOf('const a = 1 // busy-badge\n').trim(), 'const a = 1')
+    assert.ok(codeOf("const u = 'http://x/y'\n").includes('http://x/y'), '字符串里的 // 不得被截断')
+  })
+
   // ── C5-029：收尾机制自身的用例 ──
   // 收割（reapTestScope）与泄漏兜底闸此前零用例：把收割改成 no-op、把闸的判定改成恒不成立，
   // 没有任何一条用例会红——表现是 Stryker 等满 timeoutMS（延迟 18h 才可见）。这两条自己故意
@@ -7696,15 +7756,13 @@ async function main () {
 
   await aok('手动触发: 忙碌/错误提示都不许插行顶动布局', () => {
     const js = readConsoleSource()
-    const start = js.indexOf('function TriggerBar')
-    const end = js.indexOf('// ── 组件：运行历史', start)
-    assert.ok(start > -1 && end > start, '应能定位 TriggerBar 组件')
-    const block = js.slice(start, end)
+    const block = sliceBetween(js, 'function TriggerBar', '// ── 组件：运行历史', 'TriggerBar 组件')
     // 手动触发状态区（面板头 + 按钮行 + 提示）里不许出现行内 Hint。
-    const triggerArea = block.slice(0, block.indexOf('<div class="auto-run">'))
+    const triggerArea = sliceTo(block, '<div class="auto-run">', 'TriggerBar 手动触发状态区')
     // 忙碌提示原先插在按钮行与自动运行之间，出现/消失会把下方内容整体顶下 ~28px，
     // 手机上点一下就像「弹一下」；它必须由 locking 直接条件渲染成面板头徽标（不占额外高度）。
-    assert.ok(/locking && html`<span class="trigger-busy"/.test(triggerArea),
+    // C5-020：过 codeOf 再判——注释里留着这句原话时，裸 includes 会让「实现已删」也绿。
+    assert.ok(/locking && html`<span class="trigger-busy"/.test(codeOf(triggerArea)),
       '忙碌徽标必须由 locking 直接条件渲染（只留类名字符串不算）')
     // 行内 Hint 无论装忙碌还是错误都会插行：面板头与按钮行之间一个都不许留。
     assert.ok(!/<\$\{Hint\}/.test(triggerArea), '手动触发状态区不得再渲染行内 Hint（出现/消失会顶动布局）')
@@ -7747,8 +7805,8 @@ async function main () {
       const n = arr[1].trim() === '' ? 0 : arr[1].split("', '").length
       assert.strictEqual(n, rows, `「${title}」占位卡必须固定 ${rows} 行明细`)
     })
-    const seg = src.slice(src.indexOf('function StatusCards'), src.indexOf('// ── 组件：触发按钮'))
-    const head = seg.slice(0, seg.indexOf('const rep ='))
+    const seg = sliceBetween(src, 'function StatusCards', '// ── 组件：触发按钮', 'StatusCards 组件')
+    const head = sliceTo(seg, 'const rep =', 'StatusCards 占位分支')
     assert.ok(!/return null/.test(head), '占位分支之前不得有任何 return null：首帧必须画出卡片')
     const branch = head.match(/if \(!state\) \{[\s\S]*?return html`<\$\{CardsGrid\} cards=\$\{cards\} busy=\$\{!err\} \/>`/)
     assert.ok(branch, 'StatusCards 的第一个分支必须直接返回占位网格')
@@ -10639,7 +10697,7 @@ async function main () {
 
   await aok('C7-003 过滤规则 notice.tone 不再被吞（warn 必须真的渲染成琥珀提示）', () => {
     const src = readConsoleSource()
-    const panel = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('export {', src.indexOf('function FilterRulesPanel')))
+    const panel = sliceBetween(src, 'function FilterRulesPanel', 'export {', 'FilterRulesPanel 组件')
     assert.ok(panel.length > 5000, '应能定位 FilterRulesPanel')
     // 唯一渲染点必须把 tone 传给 Hint。旧实现只渲染 notice.text ⇒ 7 处 setNotice 的
     // warn/ok 全是同一个中性 .hint，「服务器草稿清理失败」和「已保存 rN」长得一模一样。
