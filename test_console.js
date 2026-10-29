@@ -4390,7 +4390,6 @@ async function main () {
     const port = await listen(server)
     // runs 是模块级 Map（跨实例共享），只能比增量——断言「本次没有新记录」。
     const runsBefore = runs.size
-    const lockFile = path.join(dir, 'console-trigger.lock')
     const lastAcceptFile = path.join(dir, 'console-lastaccept.json')
     const viaQueryUrl = '?token=' + encodeURIComponent(TOKEN)
     // 四条端点各配一个「鉴权之后必然确定的」分支：导入=坏 JSON、触发=非法动作、取消=不存在的 id、
@@ -4420,8 +4419,12 @@ async function main () {
       }
       // 拒绝发生在副作用之前：没有运行记录（不 spawn）、没有触发锁、没有重放帧。
       assert.strictEqual(runs.size, runsBefore, '被拒请求不得创建运行记录')
-      assert.strictEqual(fs.existsSync(lockFile), false, '被拒请求不得取触发锁')
-      assert.strictEqual(fs.existsSync(lastAcceptFile), false, '被拒请求不得写重放帧')
+      // 用一次 readdir 快照断言「一个文件都没留下」，代替 `existsSync(lockFile)` /
+      // `existsSync(lastAcceptFile)`：本用例随后就要按同一路径写重放帧（下面那行 writeFileSync），
+      // 「先判存在、再按同一路径写」正是 js/file-system-race（CodeQL 121）的 check-then-use 形状，
+      // 而报告方判的其实是「检查看到的」与「实际写到的」可能不是同一个对象。快照同时更强：
+      // 触发锁、重放帧之外任何意料外的落盘都算失败。
+      assert.deepStrictEqual(fs.readdirSync(dir), [], '被拒请求不得在 stateDir 留下任何文件（触发锁 / 重放帧 / 运行记录）')
       // 反向：Bearer 照常通过鉴权（各自走到鉴权之后的确定性分支，不 spawn）。
       const importBadJson = await request(port, 'POST', '/api/backup/import', {
         token: TOKEN,
