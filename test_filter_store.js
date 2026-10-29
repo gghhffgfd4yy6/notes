@@ -679,18 +679,30 @@ test('writeAppliedSnapshot 失败分支：applied 路径被目录占位 → 返�
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ioError', '读回必须如实报告 ioError，不得假装有一份快照')
 })
 
-test('writeAppliedSnapshot 失败分支：目录不可写 → 返回 false 且不留半成品快照', () => {
+test('writeAppliedSnapshot 失败分支：建临时文件报 EACCES → 返回 false 且不留半成品快照', () => {
   const dir = makeDir()
   const paths = filterRulesPaths(dir)
-  fs.chmodSync(dir, 0o500)
-  try {
-    const wrote = writeAppliedSnapshot({ cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'override', hash: 'h' })
-    assert.strictEqual(wrote, false, 'EACCES 下必须返回 false（不得把失败报成成功）')
-    assert.strictEqual(fs.existsSync(paths.applied), false, '写入失败不得留下快照文件')
-    assert.strictEqual(readAppliedSnapshot(dir).status, 'missing', '失败后状态仍应是 missing，而不是一份可疑的快照')
-  } finally {
-    fs.chmodSync(dir, 0o700)
+  // 用注入的 EACCES 而不是 chmod 0500：以 root 跑门禁时目录权限拦不住写入，夹具会假绿（甚至断言失败）。
+  // writeAtomic 的临时文件名形如 `<applied>.<pid>.<ts>.<rand>.tmp`，只拦这一条路径，其余 fs 调用照旧。
+  const realOpen = fs.openSync
+  fs.openSync = function (target, ...args) {
+    const name = String(target)
+    if (name.startsWith(paths.applied + '.') && name.endsWith('.tmp')) {
+      const err = new Error('EACCES: permission denied, open ' + name)
+      err.code = 'EACCES'
+      throw err
+    }
+    return realOpen.call(this, target, ...args)
   }
+  let wrote
+  try {
+    wrote = writeAppliedSnapshot({ cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'override', hash: 'h' })
+  } finally {
+    fs.openSync = realOpen
+  }
+  assert.strictEqual(wrote, false, 'EACCES 下必须返回 false（不得把失败报成成功）')
+  assert.deepStrictEqual(fs.readdirSync(dir), [], '写入失败不得留下快照或临时文件')
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'missing', '失败后状态仍应是 missing，而不是一份可疑的快照')
 })
 
 test('readAppliedSnapshot：missing / invalid / ioError 三态', () => {
