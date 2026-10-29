@@ -363,6 +363,35 @@ function mkTmp (prefix) {
 }
 function tmpDir () { return mkTmp('xbk-console-test-') }
 
+// ── FIFO 夹具（C5-070）──
+// mkfifo 只有 coreutils 提供（Node 22 没有 mkfifoSync），而旧写法把 /usr/bin/mkfifo 写死：
+// macOS / 精简容器 / 某些 Android 上该路径不存在 ⇒ execFileSync 抛 ENOENT，用例变红而不是
+// 显式跳过，把「本机没有这个工具」误报成契约失败。改为固定落点探测（仍不做 PATH 查找——
+// Sonar S4036：可写目录里的同名程序不该被执行），缺失时记一笔 SKIPPED 并打印出来。
+// 只跳过依赖 FIFO 的那一小段，同一用例里其它断言照跑（不整条用例静默消失）。
+const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
+let skipped = 0
+function findMkfifo (candidates = MKFIFO_CANDIDATES) {
+  for (const p of candidates) {
+    try {
+      // 存在还不够：目录/不可执行的同名文件同样会 Enoent/EACCES；只认「普通文件」。
+      if (fs.statSync(p).isFile()) return p
+    } catch (e) { /* 不存在/读不到 ⇒ 试下一个候选 */ }
+  }
+  return ''
+}
+function makeFifo (target, label) {
+  const bin = findMkfifo()
+  if (!bin) {
+    skipped++
+    console.log(`  ⏭️ ${label}：本机没有 mkfifo（已探测 ${MKFIFO_CANDIDATES.join(' / ')}），只跳过 FIFO 夹具`)
+    return false
+  }
+  fs.rmSync(target, { force: true })
+  require('node:child_process').execFileSync(bin, [target])
+  return true
+}
+
 // 收割：删不掉就**不静默**——把路径与原因写 stderr，否则 30 分钟后 check-host-clean 只会说
 // 「有过期沙箱」，没人知道是哪一轮没删掉（退出码不变：清理失败是环境问题，不该冒充测试结果）。
 function cleanupTmpDirs () {
@@ -458,6 +487,16 @@ ok('harness 失败输出必须带栈（C5-021：走真实 ok() 打印路径）',
   assert.ok(failureText(assertion).includes('actual=2') && failureText(assertion).includes('expected=1'),
     'AssertionError 的 actual/expected 摘要不得丢')
   assert.ok(/^ {4}at /m.test(failureText(assertion)), 'AssertionError 的栈同样不得丢')
+})
+
+// C5-070 自查：FIFO 夹具的 mkfifo 探测必须是「找不到就返回空串、不抛异常」——旧写法把
+// /usr/bin/mkfifo 写死，非该路径的平台直接在 execFileSync 里抛 ENOENT（用例红成契约失败）。
+ok('FIFO 夹具: mkfifo 探测只认固定落点（缺失不抛、不做 PATH 查找）', () => {
+  assert.strictEqual(findMkfifo(['/nonexistent/mkfifo-u05']), '', '全部候选都不存在时必须返回空串（不得抛 ENOENT）')
+  assert.strictEqual(findMkfifo([process.execPath]), process.execPath, '存在的候选必须原样返回')
+  assert.strictEqual(findMkfifo([]), '', '空候选表返回空串')
+  assert.ok(MKFIFO_CANDIDATES.every((p) => path.isAbsolute(p)),
+    '候选必须是绝对路径：PATH 查找会执行可写目录里的同名程序（Sonar S4036）')
 })
 
 // ── token 校验 ──
@@ -4590,22 +4629,23 @@ async function main () {
     // 之前）。用子进程 + 看门狗：真挂死也只杀子进程，不会把整套件拖成 10 分钟超时。
     const fifoDir = tmpDir()
     const fifoSettings = path.join(fifoDir, CONSOLE_SETTINGS_FILE)
-    fs.rmSync(fifoSettings, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoSettings])
-    const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
-      'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
-      'console.log("SETTINGS_READ_NONBLOCKING")\n' +
-      'process.exit(0)\n'
-    const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
-    let probeOut = ''
-    probe.stdout.on('data', (c) => { probeOut += c })
-    probe.stderr.resume()
-    const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
-    const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
-    await probeDone
-    clearTimeout(probeTimer)
-    assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
-      'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    if (makeFifo(fifoSettings, '设置文件 FIFO（非阻塞启动）')) {
+      const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
+        'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
+        'console.log("SETTINGS_READ_NONBLOCKING")\n' +
+        'process.exit(0)\n'
+      const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let probeOut = ''
+      probe.stdout.on('data', (c) => { probeOut += c })
+      probe.stderr.resume()
+      const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
+      const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
+      await probeDone
+      clearTimeout(probeTimer)
+      assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
+        'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    }
+    // 清理放在 if 外：没有 mkfifo 时这份沙箱同样要删（否则只能等退出时的全局收割）。
     fs.rmSync(fifoDir, { recursive: true, force: true })
   })
 
@@ -6669,11 +6709,11 @@ async function main () {
     // mkfifo 需要专用系统调用（Node 22 无 mkfifoSync）——用 coreutils 绝对路径
     // （Sonar S4036：不做可写目录 PATH 查找），普通文件先删除再建 FIFO。
     const fifo = path.join(dir, 'pipe')
-    fs.rmSync(fifo, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
-    const t0 = Date.now()
-    assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    if (makeFifo(fifo, 'statSafeMeta FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    }
   })
   await aok('只读纯函数: classifyStateFile 分类与 F4 反例（.seen.cleanup.lock.json 是缓存不是锁）', () => {
     assert.strictEqual(classifyStateFile('push.json', 'push.json'), 'cache')
@@ -6752,11 +6792,11 @@ async function main () {
     assert.strictEqual(tombstoneCounts(dir2, 'push.json').bytes, null)
     // FIFO 也走 unsafe 闸（statSafeMeta 的 O_NONBLOCK 立即返回）——若闸失效此用例挂死
     const fifoTomb = path.join(dir2, 'push.json.seen.json')
-    fs.rmSync(fifoTomb, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoTomb])
-    const t0 = Date.now()
-    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+    if (makeFifo(fifoTomb, 'tombstone FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+    }
   })
   await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
     const { readSafeTextResult } = require('./xbk_storage')
@@ -6770,11 +6810,11 @@ async function main () {
     assert.strictEqual(noOpt.status, 'ok', '不传 options 的既有调用方语义不变')
     // FIFO（无写者）：O_NONBLOCK open 立即 ENXIO → unsafe；若回归为裸 open 此用例挂死
     const fifo = path.join(dir, 'pipe')
-    fs.rmSync(fifo, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
-    const t0 = Date.now()
-    assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    if (makeFifo(fifo, 'readSafeTextResult FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    }
   })
   await aok('只读纯函数: defaultHealthLimits entryMax 与 _resolveMaxSize 同口径（数字/字符串/脏值回退）', () => {
     const { defaultHealthLimits } = require('./scripts/console')
@@ -10713,7 +10753,9 @@ async function main () {
 // 既没有「通过 N / 失败 M + 失败用例清单」（分项汇总），也没有强退闸——只要还有 ref 句柄
 // 攥着事件循环（迟到回调、孙进程），CI 照样白等满 timeoutMS，而日志里看不出是哪条用例烂了。
 function finishSuite () {
-  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
+  // 跳过必须可见（C5-070）：FIFO 夹具缺 mkfifo 时只跳过那一小段，不能让它静默消失。
+  const skippedNote = skipped > 0 ? ` / 跳过 ${skipped}（本机缺工具，已逐条打印原因）` : ''
+  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}${skippedNote}`)
   if (failed > 0) {
     process.exitCode = 1
     // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
