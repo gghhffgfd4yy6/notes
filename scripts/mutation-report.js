@@ -502,17 +502,23 @@ const COMMAND_RUNNER_CONFIG = 'stryker.config.js'
 const COMMAND_SEGMENT_MARK = '（command 档）'
 
 // yml 标量取值（与 check-mutation-ranges.js 同口径）：引号内的 `#` 属于值、裸标量的 `#` 起行内注释。
+// C10-060：引号**未闭合**一律按「无取值」处理（返回 ''），绝不把后半行原样当成值——旧实现「去掉开引号
+// 取全部」会让 `config: "stryker.tap.config.js` 与正常闭合逐字同值、`timeout_ms: "60000` 照样得到
+// 60000，矩阵写坏时日报仍给出确定结论（TAP 档 / 60s），谁也不会去查。空值在调用侧就是「不吃这条」：
+// runner 档位不登记该段、timeout 回落缺省 300000（两者都是已文档化的降级口径，不是猜）。
 function ymlScalar (raw) {
   let value = raw
   const quote = value[0]
   if (quote === '"' || quote === "'") {
-    // 连续两个相同引号折叠为一个（yml 转义）；未闭合时回退为去掉开引号取全部（防御性）
+    // 连续两个相同引号折叠为一个（yml 转义）；遇到单个闭合引号即结束。
     let out = ''
+    let closed = false
     for (let i = 1; i < value.length; i++) {
       const ch = value[i]
       if (ch !== quote) { out += ch; continue }
-      if (value[i + 1] === quote) { out += quote; i++ } else break
+      if (value[i + 1] === quote) { out += quote; i++ } else { closed = true; break }
     }
+    if (!closed) return ''
     value = out
   } else {
     const hash = value.indexOf('#')

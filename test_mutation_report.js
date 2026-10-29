@@ -1183,6 +1183,33 @@ check('parseMatrixRunnerConfigs：从 matrix include 解析逐段 config（含 s
   assert.strictEqual(quoted.get('s1'), COMMAND_RUNNER_CONFIG)
 })
 
+// C10-060：引号**未闭合**曾「静默回退」成「去掉开引号、后半行全算值」——对两个解析器来说，结果都是
+// **看起来完全合法**的取值：`config: "stryker.tap.config.js` 与正常闭合逐字相同，`timeout_ms: "60000`
+// 也照样得到 60000。矩阵被改坏时日报仍给出「这一段走 TAP 档 / 上限 60s」的确定结论，没有任何信号提示
+// 「这行 yml 本身是坏的」。契约：未闭合 ⇒ 该标量视为**无取值**（条目不计入；timeout 回落缺省），绝不猜。
+check('C10-060 引号未闭合不得回退成看似合法的值（runner 档位 + timeout 同口径）', () => {
+  const yml = [
+    'include:',
+    '  - name: bad-double',
+    '    config: "stryker.tap.config.js',
+    '    timeout_ms: "60000',
+    '  - name: bad-single',
+    "    config: 'stryker.config.js",
+    '  - name: ok-quoted',
+    '    config: "stryker.tap.config.js"  # 正常闭合',
+    '    timeout_ms: "45000"'
+  ].join('\n')
+  const configs = parseMatrixRunnerConfigs(yml)
+  assert.strictEqual(configs.has('bad-double'), false,
+    '双引号未闭合的 config 必须视为无值（修前会被读成 stryker.tap.config.js，与正常值无法区分）')
+  assert.strictEqual(configs.has('bad-single'), false, '单引号未闭合同理')
+  assert.strictEqual(configs.get('ok-quoted'), 'stryker.tap.config.js', '正常闭合的引号（带行内注释）必须照旧解析')
+  const timeouts = parseMatrixTimeouts(yml)
+  assert.strictEqual(timeouts.get('bad-double'), DEFAULT_SEGMENT_TIMEOUT_MS,
+    '未闭合的 timeout_ms 必须回落缺省 300000（修前会被读成 60000）')
+  assert.strictEqual(timeouts.get('ok-quoted'), 45000, '正常闭合的 timeout_ms 必须照旧解析')
+})
+
 check('render/analyze：command 档段被标注、TAP 档段不被标注（F-2 靶向用例）', () => {
   // 纯函数层
   assert.strictEqual(formatSegmentLabel('storage', COMMAND_RUNNER_CONFIG), `storage${COMMAND_SEGMENT_MARK}`)
