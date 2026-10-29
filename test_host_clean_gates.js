@@ -16,6 +16,13 @@ const path = require('node:path')
 const host = require('./scripts/check-host-clean.js')
 
 const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
+// 子进程探针用 env：本套件也可能跑在变异评估沙箱里（XBK_MUTATION_CHILD=1）⇒ 必须先摘掉它，
+// 否则 CLI 会按设计跳过检查，探针测到的就不是「门禁怎么判」而是「门禁被关掉了」。
+const probeEnv = (extra) => {
+  const env = { ...process.env, ...(extra || {}) }
+  delete env.XBK_MUTATION_CHILD
+  return env
+}
 let checks = 0
 function check (label, fn) {
   fn()
@@ -92,7 +99,7 @@ check('main() 的「不可判定」必须有独立结论，且不留不可达 re
     '}\n')
   try {
     const run = spawnSync(process.execPath, ['-r', preload, path.join(__dirname, 'scripts/check-host-clean.js')],
-      { encoding: 'utf8', env: { ...process.env } })
+      { encoding: 'utf8', env: probeEnv() })
     assert.strictEqual(run.status, 1, '读不到 /proc 仍必须 fail-closed（exit 1，语义不变）：' + run.stderr)
     assert.match(run.stdout, /该平台不检测/,
       'unsupported 必须单独一条「该平台不检测」，不得只说「主机不干净」')
@@ -192,7 +199,7 @@ check('cmdline 不可读必须计数并标不完整（C10-029：hidepid/跨用�
     '}\n')
   try {
     const run = spawnSync(process.execPath, ['-r', preload, path.join(__dirname, 'scripts/check-host-clean.js')],
-      { encoding: 'utf8', env: { ...process.env } })
+      { encoding: 'utf8', env: probeEnv() })
     assert.strictEqual(run.status, 0, '不可读只标不完整、不改退出码：' + run.stderr)
     assert.match(run.stdout, /孤儿检测不完整/,
       'CLI 必须把「有进程不可读」说出来：否则输出与「全量扫过且干净」同形')
