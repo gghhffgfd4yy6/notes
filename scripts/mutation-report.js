@@ -734,16 +734,17 @@ function scoreOf (r) {
 
 function analyze (dir, options = {}) {
   // S8707：CLI 参数显式校验（防 LLM/错误参数访问任意路径——先验证存在且是目录）
+  // C10-058：**库函数不得 process.exit**——坏目录一律抛 Error（文案与 CLI 一致），退出码交给 main 的
+  // catch 统一决定。否则任何直接调用 analyze 的宿主（测试、将来的包装脚本）都会被静默带走，调用方
+  // 既没法兜住、也没法区分「参数写错」与「报告有问题」。
   let st
   try {
     st = fs.statSync(dir) // NOSONAR:S8707 校验调用本身（防错误 CLI 参数）
   } catch (e) {
-    console.error(`❌ 报告目录不存在或不可访问：${dir}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
-    process.exit(1)
+    throw new Error(`报告目录不存在或不可访问：${dir}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
   }
   if (!st.isDirectory()) {
-    console.error(`❌ ${dir} 不是目录（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
-    process.exit(1)
+    throw new Error(`${dir} 不是目录（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
   }
   const results = []
   // runner 档位只读一次（每段共用一个解析结果）；读不到 ⇒ 空 Map ⇒ 全表不标注（见上方 F-2 说明）。
@@ -755,8 +756,7 @@ function analyze (dir, options = {}) {
     entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录处理（根目录已校验，工具合法用途）
   } catch (e) {
     // 入口目录不可读 = 调用错误：友好报错 + 干净退出（与单段错误隔离不同——入口失败全部失败）
-    console.error(`❌ 无法读取报告目录 ${dir}：${e.message}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
-    process.exit(1)
+    throw new Error(`无法读取报告目录 ${dir}：${e.message}（用法: node scripts/mutation-report.js <reports-dir> [--issue]）`)
   }
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith('mutation-report-')) continue

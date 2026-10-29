@@ -1638,6 +1638,24 @@ try {
       fs.rmSync(emptyDir, { recursive: true, force: true })
     }
   })
+
+  // C10-058：analyze() 是导出的**库函数**（测试与将来的调用方都直接用它），里面 process.exit(1) 会让
+  // 调用方无法兜住：既不能降级、也不能把「参数写错」与「报告有问题」分开处理，整个宿主进程直接消失。
+  // 契约改为抛 Error（消息与 CLI 文案一致），退出码由 main 的 catch 统一决定（仍 exit 1、文案不变）。
+  check('C10-058 analyze 遇到坏目录抛错而不是 process.exit（调用方可兜住）', () => {
+    const missing = path.join(tmp, 'c10058-not-exist')
+    let err = null
+    try { analyze(missing) } catch (e) { err = e }
+    assert.ok(err instanceof Error, '不存在的目录必须抛错（process.exit 会让调用方拿不到控制权）')
+    assert.ok(/报告目录不存在或不可访问/.test(err.message), `错误文案须与 CLI 一致，实际：${err.message}`)
+
+    const filePath = path.join(tmp, 'c10058-a-file')
+    fs.writeFileSync(filePath, 'x')
+    let err2 = null
+    try { analyze(filePath) } catch (e) { err2 = e }
+    assert.ok(err2 instanceof Error, '传普通文件也必须抛错')
+    assert.ok(/不是目录/.test(err2.message), `错误文案须点名「不是目录」，实际：${err2.message}`)
+  })
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
 }
