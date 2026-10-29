@@ -2921,6 +2921,41 @@ checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过�
     assert.strictEqual(h.cacheMessages().length, 2,
       '同一 URL 去掉 dry-run 后必须写缓存（证明 ② 的零来自 dryRun 判据，不是夹具不工作）')
     assert.ok(realFs.existsSync(reportPath), '同一 URL 去掉 dry-run 后必须写日报（同上）')
+
+    // ④ dry-run + 1 条被规则拦下的条目：独立子段，专门钉「dry-run 一条都不写缓存」
+    //    ② 的条目全部通过过滤 ⇒ newMessages 与 items 同集、pushedKeys 恒空 ⇒ 即使去掉
+    //    xbk_app.js:1719 的 `dryRun ? [] : …` 短路，toCache 依然是空（断言无判别力）。
+    //    被规则过滤的条目不同：它进 newMessages（:1401）却不进 items/itemsKeys/truncatedKeys，
+    //    短路一旦消失就会被写进缓存 ⇒ 下轮判重跳过 ⇒ 被过滤条目永久漏推。
+    //    这里换独立 pushUrl（独立缓存文件），不动 ①②③ 的任何断言。
+    const urlDryFiltered = 'https://example.invalid/dry-run-filtered.json'
+    const rulesFile = h.FilterStore.filterRulesPaths(cacheDir).file
+    realFs.writeFileSync(rulesFile,
+      JSON.stringify({ schema: 1, revision: 1, filter: { pingbibiaoti: '预览乙', pingbitime: '' } }), { mode: 0o600 })
+    realFs.rmSync(reportPath, { force: true }) // ③ 已写过日报：先清掉，「dry-run 不写日报」才有判别力
+    h.Config.api.pushUrl = urlDryFiltered
+    h.setItems([makeRunItem('pb-1', '预览乙：被规则拦下的条目'), makeRunItem('pb-2', '预览丙：正常条目')])
+    process.env.XBK_DRY_RUN = '1'
+    const sentBeforeFiltered = h.sends.length
+    let dryFiltered
+    try {
+      console.log = (...a) => { logs.push(a.map(String).join(' ')) }
+      console.warn = () => {}
+      dryFiltered = await h.App.run()
+    } finally {
+      console.log = origLog
+      console.warn = origWarn
+    }
+    assert.deepStrictEqual(
+      { total: dryFiltered.total, filtered: dryFiltered.filtered, pushed: dryFiltered.pushed, failed: dryFiltered.failed },
+      { total: 2, filtered: 1, pushed: 0, failed: 0 },
+      `dry-run（含 1 条被过滤条目）摘要异常：${JSON.stringify(dryFiltered)}`)
+    assert.strictEqual(h.sends.length, sentBeforeFiltered,
+      'dry-run 不得调用 Pusher.send（这一轮同样含待推送条目）')
+    const cacheMsgsFiltered = realFs.existsSync(cacheFileOf(urlDryFiltered)) ? h.cacheMessages() : []
+    assert.strictEqual(cacheMsgsFiltered.length, 0,
+      `dry-run 不得把任何条目写进缓存——包括只进 newMessages、不进 items 的被过滤条目（实际写入：${JSON.stringify(cacheMsgsFiltered.map(m => m && m.id))}）`)
+    assert.ok(!realFs.existsSync(reportPath), 'dry-run 这一轮同样不得写日报状态（_updateReport 整段跳过）')
   } finally {
     realFs.rmSync(cacheDir, { recursive: true, force: true })
     if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
