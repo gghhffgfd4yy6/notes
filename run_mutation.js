@@ -601,10 +601,20 @@ function loadCheckpoint (file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) { return null }
 }
 
+// 默认断点文件（C10-041）：旧实现固定写 ROOT/mutation-progress.json。同一 clone 里两份本机评估
+// （两个终端 / 前后脚两次）会共用同一个文件：A 的 persist() 覆盖 B 的进度，A 正常收尾的 unlink()
+// 又抹掉 B 的恢复点；并发时 B 还可能把 A 的部分判定当成自己的续跑结果（指纹相同 ⇒ 不会被丢弃）。
+// 故默认路径改为「临时目录 + 仓库哈希 + 进程号」：互不干扰，也不在仓库里留未跟踪文件。
+// 跨进程续跑（唯一需要稳定路径的场景）显式用 MUTATION_CHECKPOINT 指定；该变量仍优先。
+function defaultCheckpointFile () {
+  const repoTag = crypto.createHash('sha256').update(ROOT).digest('hex').slice(0, 8)
+  return path.join(os.tmpdir(), `xbk-mutation-progress-${repoTag}-${process.pid}.json`)
+}
+
 // 正整数环境变量解析（review F9）：MUTATION_BATCH=-1 会让批次循环 i += batchSize 变成 i 递减，
 // 无限 push 空数组直到 OOM；MUTATION_CONCURRENCY=-1 会让 mapLimit 零并发空转，并且在此之前已经
-// 把未判定的断点写进仓库根。统一在此校验：缺省/空串回落默认值，非法值（非正整数）回落默认值并告警
-// ——绝不静默按非法值运行。
+// 把未判定的断点写进默认断点文件（见 defaultCheckpointFile）。统一在此校验：缺省/空串回落默认值，
+// 非法值（非正整数）回落默认值并告警——绝不静默按非法值运行。
 function positiveIntEnv (name, fallback) {
   const raw = process.env[name]
   if (raw === undefined || raw === '') return fallback
@@ -651,7 +661,7 @@ async function main (deps) {
     console.warn(`⚠️  MUTATION_TIMEOUT=${timeoutMs}ms 不大于 MUTATION_IDLE_MS=${idleMs}ms：静默线永远不会先触发` +
       `（挂死只能等总上限）。请把总上限调到静默线之上。`)
   }
-  const checkpointFile = process.env.MUTATION_CHECKPOINT || path.join(ROOT, 'mutation-progress.json')
+  const checkpointFile = process.env.MUTATION_CHECKPOINT || defaultCheckpointFile()
   // D3：不再 existsSync 预过滤（会把缺失的 DEFAULT_FILES 静默剔除，使 copyProject 的必选校验不可达，
   // 且 collectMutants 会先抛出裸 ENOENT）。缺文件属工作区损坏，按 main() 既有风格响亮报错 + 退出码 1，
   // 而不是「少变异一个文件后仍报成功」。
@@ -788,4 +798,4 @@ if (require.main === module) {
   }
   main().catch(error => { console.error(error.stack || error); process.exitCode = 1 })
 }
-module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_MS, mutantFingerprint, judgingTestFiles }
+module.exports = { generateMutants, collectMutants, extractTestSummary, lineColumn, isIdentStart, isIdentPart, isWs, regexAllowed, scanRegexLiteral, positiveIntEnv, ensureBaselinePass, main, lineTriple, numberBefore, numberAfter, mapLimit, saveCheckpoint, loadCheckpoint, defaultCheckpointFile, copyProject, linkNodeModules, applyMutants, buildBatches, runTests, evaluate, DEFAULT_FILES, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_MS, mutantFingerprint, judgingTestFiles }
