@@ -551,7 +551,12 @@ try {
   assert.strictEqual(parseArgs(['--segment', 'storage', 'a.json']).segment, 'storage', '--segment <值> 必须落到 segment')
   assert.deepStrictEqual(parseArgs(['--segment', 'storage', 'a.json']).paths, ['a.json'], '位置参数必须落到 paths')
   assert.strictEqual(parseArgs(['--segment=v3-entry', 'b.json']).segment, 'v3-entry', '--segment= 内联值必须同样生效')
-  assert.strictEqual(parseArgs(['--segment', '   ', 'c.json']).segment, null, '空白段名必须归一为 null')
+  // C10-054 返工：空白段名的旧契约「归一为 null」已取消——空取值会让守卫在没有段标签的情况下继续跑
+  // （label 落到 basename，killed 基线与段名对不上却看不出来），故改为 fail-closed。下面三条是同一契约的
+  // 三种非法形态，任一被退回「静默接受」，守卫就会在参数不明时照常出结论。
+  assert.throws(() => parseArgs(['--segment', '   ', 'c.json']), /取值为空/, '空白段名必须 fail-closed（旧契约「归一为 null」已按 C10-054 取消）')
+  assert.throws(() => parseArgs(['--segment', 'a', '--segment', 'b']), /重复指定/, '重复指定段名必须 fail-closed（旧实现后者静默覆盖前者，取哪个都靠猜）')
+  assert.throws(() => parseArgs(['--segment', '--label', 'x']), /看起来是另一个参数/, '取值看起来是另一个参数时必须 fail-closed（旧实现把 --label 当段名、x 当报告路径）')
   assert.deepStrictEqual(parseArgs(['--', '-weird.json', 'd.json']).paths, ['-weird.json', 'd.json'], '-- 之后必须全部按路径处理')
   assert.throws(() => parseArgs(['--segmnt', 'storage']), /未知参数/, '参数笔误必须 fail-closed，不得静默忽略成“无路径”空转')
   assert.throws(() => parseArgs(['--segment']), /缺少取值/, '--segment 缺取值必须抛，不能当成未提供')
@@ -561,6 +566,6 @@ try {
   assert.ok(errw.join('').includes('守卫参数非法'), 'stderr 必须说明根因：' + errw.join(''))
   assert.ok(errw.join('').includes('用法：node scripts/mutation-guard.js'), '必须给出可照抄的用法行：' + errw.join(''))
   assert.strictEqual(outw.length, 0, '参数非法时不得向 stdout 写结论（避免被当成有效判定）')
-  console.log('✅ mutation-guard 形态守卫与参数解析断言通过（9 条 throw 路径 + 7 条参数契约 + run 出口）')
+  console.log('✅ mutation-guard 形态守卫与参数解析断言通过（9 条形态 throw + 4 条参数接纳 + 5 条参数非法（含 C10-054 空白/重复/取值像参数）+ run 出口）')
 }
 console.log(`\n🎉 test_mutation_json.js 全部通过（${pass} 项）`)
