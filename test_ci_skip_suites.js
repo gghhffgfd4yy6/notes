@@ -345,6 +345,27 @@ function assertSkipSuitesMatchExplicitSteps (workflowText) {
 }
 const explicitFiles = assertSkipSuitesMatchExplicitSteps(testYml)
 
+// 2a 反例·靶向（C4-017）：主对账是本套件里唯一管全局的那条门禁，此前却没有一条反例证明它会红。
+// 手法：从**真实 test.yml** 整块删掉一个「被 SKIP_SUITES 豁免、且由该步骤唯一覆盖」的显式步骤 ⇒
+// 等式左（SKIP_SUITES）比右（显式步骤覆盖的单元套件）多一项 ⇒ 必须抛。反例挂在主对账自己的正则上，
+// 证明的正是「SKIP_SUITES 多写（= 该套件漏跑）会被抓到」这半条语义。
+{
+  const targetSuite = 'test_filter.js'
+  const targetStepName = '单元测试（test_filter.js，含 101 章版本校验）'
+  assert.ok(skips.includes(targetSuite),
+    `反例前提：${targetSuite} 必须在 SKIP_SUITES 里（否则删掉它的步骤不会改变等式任何一端）`)
+  const targetBlock = stepBlockForName(testYml, targetStepName)
+  const fixture = testYml.replace(targetBlock, '')
+  assert.notStrictEqual(fixture, testYml, '主对账反例夹具必须真的删掉了目标 step 块（没删成本回归形同虚设）')
+  assert.ok(!fixture.includes('      - name: ' + targetStepName), '夹具中不得残留目标步骤的 name 行')
+  assert.ok(!collectExplicitFiles(fixture).has(targetSuite),
+    `夹具中被删掉的步骤不得再贡献 ${targetSuite}（否则反例证明的不是「等式被破坏」）`)
+  assert.throws(() => assertSkipSuitesMatchExplicitSteps(fixture), /SKIP_SUITES 必须等于/,
+    '删掉被豁免套件的唯一显式步骤后主对账必须红：否则「SKIP_SUITES 多写一项」= 该套件永久漏跑，' +
+    '而整套门禁全绿（门禁盲区）')
+  console.log('✅ 主对账（SKIP_SUITES ↔ 显式步骤）靶向反例：删掉被豁免套件的唯一显式步骤后等式判红')
+}
+
 // ── 2 补. SKIP_SUITES 的「阻断性」对账（C4-016）────────────────────────────────
 // 上面的主对账只回答「显式步骤里出现过 npm run <script>」，不回答「这一步会不会阻断 CI」：
 //   · `npm run test:x || true` / `|| :` / `|| exit 0` —— 命令失败时退出码取自兜底命令（0），step 永远成功；
