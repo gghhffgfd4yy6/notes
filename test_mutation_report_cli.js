@@ -134,7 +134,7 @@ function schemaReport (seg, mutants) {
     fs.writeFileSync(tmpFile, 'x')
     // 前置断言：夹具必须真是普通文件。否则（路径不存在 ⇒ 走「不存在」分支）下面的 `不是目录` 断言
     // 会在错误的分支上给出无关的失败文本，或者更糟——两条分支文案都变的时候假绿。
-    assert.ok(fs.statSync(tmpFile).isFile(), '夹具必须是普通文件（不得被同名目录/符号链接顶替）')
+    assert.ok(fs.statSync(tmpFile).isFile(), '夹具必须是普通文件（不得被同名目录顶替；本断言跟随符号链接，不覆盖链接形态）')
     const r = runCli([tmpFile])
     assert.strictEqual(r.code, 1, '普通文件应 exit 1')
     assert.ok(r.stderr.includes('不是目录'), `stderr 应点名「不是目录」，实际：${r.stderr}`)
