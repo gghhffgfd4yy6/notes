@@ -34,17 +34,17 @@ function safeString (value) {
 // 一条键值规则 + 一条裸 scheme 规则，比按形态堆多条正则更好推理，也不会出现「前一条把后一条的
 // 输入改掉」的耦合。
 //
-// 键值规则：`<关键字(可带引号)> < = | : > [scheme] <值>`，值四种形态（顺序即优先级）：
-//  ① `"(?:\.|[^"\\])*"?`  双引号值，按 JSON 转义语义吃完整串——用 `[^"]*` 会把值内的转义引号当
-//     收尾引号、只抹前半段（qodo #151-1：`{"appToken":"abc\"SECRET"}` 残留 `SECRET`）；收尾引号
-//     可选，未闭合的引号值同样被抹掉（否则 `token="x` 整段漏抹）。单引号形态同构。
-//  ② `'(?:\.|[^'\\])*'?`  单引号值（A 组反例：`{'token':'SECRET'}` 旧规则整体不命中）。
-//  ③ `\[(?:[^\]"']|"…"|'…')*\]` / `\{(?:[^\}"']|"…"|'…')*\}`  **结构化值**（数组/对象），含值内的
-//     引号串与逗号。qodo #152-1：旧规则的裸值分支遇 `,`/`}`/`]` 即停，`token=[0,"SECRET"]` 只抹到
-//     `token=***,"SECRET"]`、`token={"a":"SECRET"}` 只抹到 `token=***}`，凭据仍进日志。
-//     括号内的引号串按转义语义整段吞掉，括号配平由强制收尾括号保证；未闭合的（如 `token=[1,2`）
-//     落回下面的裸值分支，不会吞掉后续文本。
-//  ④ `[^\s,;}\]&]+`       裸值，含非字符串 JSON 值（`{"token":12345}`）。分隔符 `\s,;}\]&` 是
+// 键值规则：`<关键字(可带引号)> < = | : > [scheme] <值>`，值三种形态（顺序即优先级）：
+//  ① `"…"` / `'…'`  引号值，按 JSON 转义语义吃完整串——用「遇引号即停」会把值内的转义引号当收尾
+//     引号、只抹前半段（qodo #151-1：`{"appToken":"abc\"SECRET"}` 残留 `SECRET`）；未闭合的引号值
+//     吞到串尾，同样整段抹掉（否则 `token="x` 整段漏抹）。单引号形态同构。
+//  ② `[…]` / `{…}`  **结构化值**（数组/对象），含值内的引号串与逗号。qodo #152-1：旧规则的裸值
+//     分支遇 `,`/`}`/`]` 即停，`token=[0,"SECRET"]` 只抹到 `token=***,"SECRET"]`、
+//     `token={"a":"SECRET"}` 只抹到 `token=***}`，凭据仍进日志。引号串按转义语义整段跳过，收尾
+//     括号取第一个不在引号串内的；括号未闭合的（如 `token=[1,2`）落回下面的裸值分支，不会吞掉
+//     后续文本；引号串本身未闭合时括号边界已不可判定，一律吞到串尾——只会多抹，旧实现在
+//     `token=[0,"SECRET]` 上同样是整段抹掉。
+//  ③ `[^\s,;}\]&]+`  裸值，含非字符串 JSON 值（`{"token":12345}`）。分隔符 `\s,;}\]&` 是
 //     **有意收窄**：逗号/分号/& 之后属于下一个参数（`?token=a,b` 只抹 `a`），该行为有断言锁定。
 //  值以引号开头时按原引号形态回填（`"***"` / `'***'`），保持 JSON/JS 结构可读；
 //  已脱敏值（`***`）不会被二次处理——回调按值重新生成，天然幂等。
@@ -60,15 +60,80 @@ function safeString (value) {
 const SECRET_KEY = '(?:app[_-]?token|access[_-]?token|refresh[_-]?token|api[_-]?key|pushkey|authorization|credential|password|passwd|pwd|session|cookie|token|key|secret)'
 // 关键字本身可能是引用形态（双引号 JSON / 单引号 JS 字面量），两侧加边界断言
 const SECRET_KEY_QUOTED = `(?:^|[^A-Za-z0-9_])["']?${SECRET_KEY}["']?(?![A-Za-z0-9_])`
-const DQ_VALUE = '"(?:\\\\.|[^"\\\\])*"?'
-const SQ_VALUE = "'(?:\\\\.|[^'\\\\])*'?"
-// 结构化值：数组/对象，允许值内的引号串（按转义语义吞掉）与逗号等分隔符
-const ARRAY_VALUE = `\\[(?:[^\\]"']|${DQ_VALUE}|${SQ_VALUE})*\\]`
-const OBJECT_VALUE = `\\{(?:[^}"']|${DQ_VALUE}|${SQ_VALUE})*\\}`
-const SECRET_KV_RE = new RegExp(
-  `(${SECRET_KEY_QUOTED}\\s*[=:]\\s*)(?:(?:bearer|basic)\\s+)?(${DQ_VALUE}|${SQ_VALUE}|${ARRAY_VALUE}|${OBJECT_VALUE}|[^\\s,;}\\]&]+)`,
-  'gi'
-)
+// C9-001（P0）：值的边界**不再用正则取**。旧实现把「收尾引号可选」的引号串塞进数组/对象的量词里
+//   （`\[(?:[^\]"']|"(?:[^"\\]|\\.)*"?|…)*\]`）：同一个 `"` 既可以是开引号、又可以是上一个串的收尾
+//   引号，括号配不上时回溯树按元素数指数增长。实测 `token=[` + `"a",`×n 的耗时 n=9/43B→101ms、
+//   10→610ms、11→3.33s、12→19.28s（每多一个元素约 ×5.5），199B（48 个元素）30s 未返回——一条畸形
+//   厂商错误信息就能把整轮推送挂死（厂商 `data.msg` → safeErr 截到 200 字符 → Error → classifyFailure
+//   → summarizeError → redact，正好落在主线程上）。
+//   现在只保留「关键字 + 分隔符」的前缀正则（无嵌套量词，线性），值的结束位置由下面的单趟扫描给出：
+//   每个字符只前进一次、引号串按转义语义整段跳过 ⇒ 严格 O(n)，不存在指数回溯路径。
+const SECRET_KV_PREFIX_RE = new RegExp(`(${SECRET_KEY_QUOTED}\\s*[=:]\\s*)(?:(?:bearer|basic)\\s+)?`, 'gi')
+// 裸值字符集：分隔符 `\s,;}\]&` 与旧正则完全一致（见上方 ③）
+const BARE_VALUE_CHAR_RE = /[^\s,;}\]&]/
+
+// 引号串：text[start] 是引号，返回收尾引号之后的下标；未闭合返回 -1。
+// 转义（`\"`）整段跳过，与旧正则 `\\.` 同义——不能把转义引号当收尾（qodo #151-1）。
+function scanQuoted (text, start) {
+  const quote = text[start]
+  for (let i = start + 1; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '\\') { i++; continue }
+    if (ch === quote) return i + 1
+  }
+  return -1
+}
+
+// 结构化值（数组/对象）：返回收尾括号之后的下标；括号未闭合返回 -1（调用方落回裸值）。
+// 括号内的引号串整段跳过；引号串本身未闭合时括号边界已不可判定。未配平时取**最后一个**同类括号
+// 兜底——旧实现的引号分支「收尾引号可选」，同一个 `"` 可在开/收两种角色间互换，于是引号串**里面**的
+// 收尾括号也会被当成数组收尾（实测 `token=[0,"S]"` 旧实现抹掉 `[0,"S]`）。兜底只在「一个可配平的
+// 收尾括号都没有」时生效，一个括号都没有才落回裸值：只会多抹，不会少抹。
+function scanBracket (text, start, closers) {
+  const close = text[start] === '[' ? ']' : '}'
+  // closers 缓存了全文最后一个同类收尾括号的下标（redact 每次调用只算一次）。这个值落在值起点之前
+  // ⇒ 之后不可能再有收尾括号，扫描必然扫到串尾才失败：直接落回裸值，否则「N 处 `token=[…` + 后面
+  // 再没有 `]`」的输入会退化成 O(键数 × 长度)。
+  const lastCloser = closers[close]
+  if (lastCloser <= start) return -1
+  let i = start + 1
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === close) return i + 1
+    if (ch === '"' || ch === "'") {
+      const end = scanQuoted(text, i)
+      if (end === -1) {
+        // 引号串未闭合 ⇒ 括号边界不可判定：先按「最后一个同类括号」收尾（旧实现会拿引号里的括号当收尾），
+        // 一个括号都没有才吞到串尾——只会多抹，不会少抹。
+        return lastCloser > i ? lastCloser + 1 : text.length
+      }
+      // 不变量：scanQuoted 返回的是收尾引号之后的下标（≥ i + 2），所以这里 i 严格前进；
+      // 若以后把 scanQuoted 改成可能返回 ≤ i，这一行会原地死循环——动它之前先确认这个前提。
+      i = end
+      continue
+    }
+    i += 1
+  }
+  // 走完仍没有可配平的收尾括号：取最后一个同类括号兜底（它只可能落在引号串里，旧实现会拿它当收尾）。
+  return lastCloser + 1
+}
+
+// 值：返回结束下标（不含）；-1 表示该位置没有可抹的值（整条键值不成立，调用方跳过）。
+function scanSecretValue (text, start, closers) {
+  const head = text[start]
+  if (head === '"' || head === "'") {
+    const end = scanQuoted(text, start)
+    return end === -1 ? text.length : end
+  }
+  if (head === '[' || head === '{') {
+    const end = scanBracket(text, start, closers)
+    if (end !== -1) return end
+  }
+  let end = start
+  while (end < text.length && BARE_VALUE_CHAR_RE.test(text[end])) end++
+  return end === start ? -1 : end
+}
+
 const SECRET_BARE_SCHEME_RE = /\b(bearer|basic)\s+("[A-Za-z0-9._~+/=-]{8,}"|'[A-Za-z0-9._~+/=-]{8,}'|[A-Za-z0-9._~+/=-]{8,})/gi
 
 // 保持值原有的引号形态（`"abc"` → `"***"`、`'abc'` → `'***'`、裸值 → `***`）
@@ -78,8 +143,33 @@ function maskSecretValue (value) {
 }
 
 function redact (text) {
-  return safeString(text)
-    .replace(SECRET_KV_RE, (_match, prefix, value) => prefix + maskSecretValue(value))
+  const input = safeString(text)
+  // 全文最后一个收尾括号的下标（一次 O(n)，供上方 scanBracket 剪枝 + 兜底）
+  const closers = { ']': input.lastIndexOf(']'), '}': input.lastIndexOf('}') }
+  let out = ''
+  let last = 0
+  SECRET_KV_PREFIX_RE.lastIndex = 0
+  let match
+  while ((match = SECRET_KV_PREFIX_RE.exec(input)) !== null) {
+    const prefix = match[1]
+    let valueStart = match.index + match[0].length
+    let valueEnd = scanSecretValue(input, valueStart, closers)
+    // 前缀里的 scheme（`Bearer `）是可选的：旧实现在「认了 scheme 但后面没有值」时会退回不认 scheme
+    // （`token=bearer ` 的 `bearer` 本身按裸值抹掉）。这里等价重试一次。
+    if (valueEnd === -1 && match[0].length > prefix.length) {
+      valueStart = match.index + prefix.length
+      valueEnd = scanSecretValue(input, valueStart, closers)
+    }
+    if (valueEnd === -1) {
+      SECRET_KV_PREFIX_RE.lastIndex = match.index + prefix.length
+      continue
+    }
+    out += input.slice(last, match.index) + prefix + maskSecretValue(input.slice(valueStart, valueEnd))
+    last = valueEnd
+    SECRET_KV_PREFIX_RE.lastIndex = valueEnd
+  }
+  out += input.slice(last)
+  return out
     .replace(SECRET_BARE_SCHEME_RE, '$1 ***')
     .replace(/\/bot[^/\s]+/gi, '/bot***')
 }
@@ -362,21 +452,42 @@ function classifySummary (summary) {
   if (!summary || typeof summary !== 'object') return null
   const pushed = Number(summary.pushed) || 0
   const failed = Number(summary.failed) || 0
+  // C9-002：cacheSaved 此前从未被分类器读取——消息确实推出去了、但成功记录没落盘，下次运行会重复
+  // 推送（另一半是「推送成功但缓存丢了」），运维却只能看到绿色退出码。落盘失败优先判定：它不是
+  // 通道问题，重试即可恢复，故归 retryable/CACHE_SAVE_FAILED。
+  if (readProp(summary, 'cacheSaved') === false) {
+    return {
+      kind: 'retryable',
+      reason: 'CACHE_SAVE_FAILED',
+      info: { message: '缓存落盘失败：本轮推送成功记录未写入，下次运行会重复推送' }
+    }
+  }
   // XFP-03：「有没有失败」只由 failed 决定。旧条件写作 `total <= 0 || failed <= 0`，而
   // total 来自 `Number(summary.total) || 0`——total 缺失、非数字（或恰好为 0）时即为 0，
   // 于是一个「报了失败但没报 total / total 非数字」的摘要被判成「无失败」返回 null，
   // 调度器据此读成成功（绿色），失败被静默吞掉。total 只描述本轮规模，不参与该判定。
   if (failed <= 0) return null
   const failures = safeArray(readProp(summary, 'failures')) || []
-  if (failures.length === 0) {
-    return pushed > 0
-      ? null
-      : { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } }
+  // C9-002：pushed/failed 都是**消息**级计数——pushed>0 只说明「本轮不是全灭」，不说明「没有失败」。
+  // 旧实现只要 pushed>0 就返回 null（1 条成功 + 99 条失败 → 退出码 0、告警不触发、99 条被静默吞掉）。
+  // 部分失败同样是失败：给出 degraded 判定让入口置非零退出码并告警。kind 固定 retryable——还有消息
+  // 没送达就必须下轮重试；若判 permanent，常驻入口会整轮停止，把后续新消息一起停掉（漏推）。
+  // PR #362：常驻入口不得把本判定当成整轮失败叠加指数退避——那会让一条长期送不出去的消息连新消息
+  // 的拉取一起拖到 30 分钟；qinglong/xbk_push.js 的 handleFailure 对 PARTIAL_MESSAGE_FAILURE 单独分流。
+  if (pushed > 0) {
+    const nested = failures.map(classifyOne)
+    return {
+      kind: 'retryable',
+      reason: 'PARTIAL_MESSAGE_FAILURE',
+      info: {
+        message: `部分消息推送失败：成功 ${pushed} 条，失败 ${failed} 条`,
+        failures: nested.map(x => x.info)
+      }
+    }
   }
-  // 主流程契约：一条消息至少有一个通道成功即视为该消息处理成功。
-  // 因此只要本轮已有成功推送，就不能因另一个通道的永久错误让单次/常驻入口熔断；
-  // 失败通道不对该条消息立即重试，避免重复轰炸。只有全失败才进入退出/重试分类。
-  if (pushed > 0) return null
+  if (failures.length === 0) {
+    return { kind: 'retryable', reason: 'ALL_PUSH_FAILED_UNKNOWN', info: { message: '推送全部失败（原因未结构化）' } }
+  }
   const nested = failures.map(classifyOne)
   const hasRetryable = nested.some(x => x.kind === 'retryable')
   const hasPermanent = nested.some(x => x.kind === 'permanent')

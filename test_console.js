@@ -62,7 +62,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 
 const {
   createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
-  acquireLock, releaseLockFor, lockPath,
+  acquireLock, acquireLockResult, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
@@ -443,6 +443,20 @@ ok('acquireLock: 锁内容带归属 token；releaseLockFor 按 pid+token 双匹�
   assert.strictEqual(after.released, true, 'pid+token 双匹配覆写为 released')
   assert.strictEqual(acquireLock(dir, 1001, 'tok-def'), true, 'released 锁立即可接管')
 })
+ok('acquireLock: 非 EEXIST 的写失败不折叠成 busy（ENOTDIR 必须归类为真实错误）', () => {
+  // C2-006：旧实现把所有写失败都 return false，调用方一律当「锁被占」——手动触发被误报
+  // 成 409「已有任务在运行」，自动运行静默重排且不计 fails。这里用「stateDir 是普通文件」
+  // 造真实 ENOTDIR（openSync 必然失败，不是打桩），断言错误被如实分类而不是折叠成 busy。
+  const dir = tmpDir()
+  const stateAsFile = path.join(dir, 'state-as-file')
+  fs.writeFileSync(stateAsFile, 'not a dir')
+  assert.strictEqual(acquireLock(stateAsFile, 1000, 'tok-x'), false, '获取失败仍返回 false（布尔契约不变）')
+  const verdict = acquireLockResult(stateAsFile, 1000, 'tok-x')
+  assert.strictEqual(verdict.ok, false)
+  assert.strictEqual(verdict.busy, false, 'ENOTDIR 不是「锁被占」，不得让调用方回 409')
+  assert.strictEqual(verdict.error && verdict.error.code, 'ENOTDIR', '必须保留原始 errno 供调用方报真错')
+})
+
 ok('releaseLockFor: released 短帧不大于原帧（回归：恒比原帧长的旧帧使「补空格防半旧半新」成死代码）', () => {
   const dir = tmpDir()
   assert.strictEqual(acquireLock(dir, 1000, 'tok-abc'), true)
@@ -1437,6 +1451,51 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则备份: corrupt 换代（revision 从 1 重来）后按写入顺序剪枝，新代备份不得被旧代大 revision 剪掉', async () => {
+    // C2-005 返工：剪枝按裸 revision 数值降序取前 3。corrupt 覆盖后 revision 回到 1，旧代的
+    // 4/3/2 恒大于新代的 1 ⇒ 刚写入的新代备份当场被当成「最老」删掉，恢复页只剩 corrupt
+    // 之前那一代（新代回滚点全丢）。只测「换代后第一次保存」抓不到：那一刻盘上还是 4 个文件、
+    // 旧代码恰好还没动手；要一直存到新代的最后一个备份把旧代文件挤出名额才会暴露。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      for (let rev = 1; rev <= 5; rev++) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `g1-${rev}` } })
+        assert.strictEqual(saved.status, 200, `第 ${rev} 次保存应成功`)
+      }
+      assert.deepStrictEqual(
+        fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort(),
+        ['filter-rules.bak.2.json', 'filter-rules.bak.3.json', 'filter-rules.bak.4.json'],
+        '前置：旧代按代际剪枝后剩 2/3/4'
+      )
+      // 覆盖文件损坏 → 确认覆盖：新代 revision 从 1 重新开始，旧代备份 4/3/2 仍在盘上。
+      fs.writeFileSync(paths.file, 'not-json{{')
+      const replaced = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, confirmReplaceCorrupt: true, filter: { pingbibiaoti: 'g2-1' } })
+      assert.strictEqual(replaced.status, 200)
+      assert.strictEqual(JSON.parse(replaced.text).revision, 1, '新代 revision 从 1 重来')
+      // 新代连存 3 次（r2/r3/r4）：加上 corrupt 覆盖那一次，新代共 4 次落盘 ⇒ 盘上应有
+      // 新代 bak.1/2/3 三个回滚点，旧代残留 bak.4 被名额挤出。
+      for (const rev of [2, 3, 4]) {
+        const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: rev - 1, filter: { pingbibiaoti: `g2-${rev}` } })
+        assert.strictEqual(saved.status, 200, `新代第 ${rev} 次保存应成功`)
+        assert.strictEqual(JSON.parse(saved.text).revision, rev)
+      }
+      // 旧代 bak.4 的 revision 数值最大、写入最早 ⇒ 必须被剪；新代 bak.1 数值最小，但它是
+      // 新代最新 3 个写入之一，按数值取「最大的 3 个」会把它当场删掉（本条 bug）。
+      assert.deepStrictEqual(
+        fs.readdirSync(dir).filter((n) => n.startsWith('filter-rules.bak.') && n.endsWith('.json')).sort(),
+        ['filter-rules.bak.1.json', 'filter-rules.bak.2.json', 'filter-rules.bak.3.json'],
+        '新代 4 次落盘后只留最新 3 个备份（旧代 bak.4 必须被剪）'
+      )
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.backupFor(1), 64 * 1024).text).filter.pingbibiaoti, 'g2-1', 'bak.1 必须是新代 r1 内容')
+      // 端到端判据：恢复页能回到新代 r1（旧实现 bak.1 已被删 → 404 backup_not_found）。
+      const restored = await postFilterJson(port, '/api/config/filter/restore', { to: 1, confirm: true, baseRevision: 4 })
+      assert.strictEqual(restored.status, 200, `恢复新代 r1 必须成功（实际 ${restored.status}）`)
+      assert.strictEqual(JSON.parse(readSafeTextResult(paths.file, 64 * 1024).text).filter.pingbibiaoti, 'g2-1')
+    } finally { server.close() }
+  })
+
   await aok('过滤锁: 持有者进程还活着 → 绝不接管（即使 mtime 已过期）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
@@ -1825,6 +1884,89 @@ async function filterRuleApiTests () {
       assert.strictEqual(fs.existsSync(paths.backupFor(4)), true, '第 5 次保存前仍应写备份 r4')
       assert.strictEqual(fs.existsSync(paths.backupFor(1)), true, '失败的保存不得剪掉最老备份（剪枝只在提交成功后）')
       assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 既有断链审计 → 500 audit_broken 且回滚（不得按断点前 lastHash 硬接）', async () => {
+    // C2-001：readFilterAuditChain 返回 ok:false 时旧实现仍拿断点前的 lastHash 续写——新行
+    // 永远接不上（链永久停在坏行）却照样 return true、保存 200。审计是保存的提交点，断链
+    // 必须响亮拒绝并回滚规则文件，等人工归档/修复。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      // 半行（短写/掉电残留）：最后一行 JSON 不完整
+      const raw = fs.readFileSync(paths.audit, 'utf8')
+      fs.writeFileSync(paths.audit, raw.slice(0, raw.length - 12))
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+      assert.strictEqual(res.status, 500, `断链时必须拒绝保存（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_broken')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计不落地 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计末行缺 \\n（旧版短写残留）→ 500 audit_broken，不把新行粘到末行尾', async () => {
+    // C2-001 残留（P3）：旧版 1 字节短写会留下「末行 JSON 完整、只缺最后的换行」的审计文件。
+    // 逐行重算看不出问题（末行合法、链也接得上），但下一次 append 直接粘在这一行尾部 ⇒
+    // 整行 JSON 报废、brokenAt=1，链一次性不可读；而这次保存仍返回 200。非空审计文件必须以
+    // \n 收尾，否则按「末行不完整」判链，append 拒绝续写（人工补一个换行即可）。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })).status, 200)
+      const raw = fs.readFileSync(paths.audit, 'utf8')
+      assert.ok(raw.endsWith('\n'), '前置：正常 append 的行必须以换行结尾')
+      // 只丢末行的 \n（其余字节一个不少）：末行内容仍完整、仍可 JSON.parse。
+      const truncated = raw.slice(0, -1)
+      fs.writeFileSync(paths.audit, truncated)
+      const chain = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).auditChain
+      assert.strictEqual(chain.ok, false, '末行缺换行 = 不可续写，必须判链不完整')
+      assert.strictEqual(chain.brokenAt, 2, '断链行号 = 缺换行的那一行（第 2 行）')
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 2, filter: { pingbibiaoti: 'v3' } })
+      assert.strictEqual(res.status, 500, `末行缺换行时必须拒绝保存（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'audit_broken')
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '拒绝续写 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.readFileSync(paths.audit, 'utf8'), truncated, '拒绝续写时审计文件一个字节都不动')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 审计 writeSync 短写 → 500 audit_failed + 回滚 + 清掉半行（链仍可读）', async () => {
+    // C2-001：旧实现丢弃 writeSync 返回值且不 fsync。半行落盘后函数仍返回 true，保存 200、
+    // 不回滚，链永久停在坏行。修后：短写 ⇒ 判失败 ⇒ 保存回滚，并把半行截掉让链保持完整。
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'v1' } })).status, 200)
+      const auditBefore = fs.readFileSync(paths.audit, 'utf8')
+      const before = readSafeTextResult(paths.file, 64 * 1024).text
+      // 模拟内核短写（ENOSPC/信号中断）：writeSync 只落一半字节并如实返回计数，不抛。
+      const realWriteSync = fs.writeSync
+      fs.writeSync = function (fd, data, ...rest) {
+        if (rest.length === 0 && typeof data === 'string' && data.includes('"action":"save"')) {
+          return realWriteSync.call(fs, fd, data.slice(0, Math.floor(data.length / 2)))
+        }
+        return realWriteSync.call(fs, fd, data, ...rest)
+      }
+      try {
+        const res = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: 'v2' } })
+        assert.strictEqual(res.status, 500, `短写必须判失败（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+        assert.strictEqual(JSON.parse(res.text).code, 'audit_failed')
+      } finally {
+        fs.writeSync = realWriteSync
+      }
+      assert.strictEqual(readSafeTextResult(paths.file, 64 * 1024).text, before, '审计不完整 ⇒ 规则文件必须回滚')
+      assert.strictEqual(fs.readFileSync(paths.audit, 'utf8'), auditBefore, '半行必须清掉（否则链永久停在坏行）')
+      const chain = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text).auditChain
+      assert.deepStrictEqual([chain.ok, chain.entries], [true, 1], '审计链必须仍完整可读')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径必须释放过滤锁')
     } finally { server.close() }
   })
 
@@ -2257,6 +2399,44 @@ async function backupUiStructureTests () {
     assert.ok(!/password/i.test(exportApi), '导出请求不得带密码')
     assert.ok(/apiPostBackupImport\(pending\.bundle, pending\.key\)/.test(seg), '导入请求只能带解密后的 bundle 和幂等键')
     assert.ok(!/apiPostBackupImport\([^)]*password/i.test(seg), '导入请求不得带密码')
+  })
+
+  await aok('结构红线: 导入 409/400/507 不得提示「导入完成」（consumeJsonResult 不抛错）', async () => {
+    // apiPostBackupImport 走 consumeJsonResult：非 2xx 只回 { ok:false, status, data } 而不抛错。
+    // doImport 旧实现直接把它当成功 ⇒ 409 busy / 400 校验失败 / 507 审计满都提示「导入完成」。
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    // 接线：先判失败，再关弹窗；失败分支不得走到「导入完成」。
+    const pages = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const at = pages.indexOf('const doImport = async () =>')
+    const end = pages.indexOf('return html`<div class="cfg-block backup-block">', at)
+    assert.ok(at > -1 && end > at, '应能定位 doImport')
+    const body = pages.slice(at, end)
+    assert.ok(body.includes('res.ok') || body.includes('backupImportProblem(res)'),
+      'doImport 必须检查 res.ok：consumeJsonResult 对 409/400/507 只回 {ok:false}，不检查就当成功')
+    const guardAt = body.indexOf('backupImportProblem(res)')
+    assert.ok(guardAt > -1, 'doImport 必须先过统一的失败判定')
+    assert.ok(guardAt < body.indexOf('setPending(null)'), '判失败必须早于关确认弹窗（否则出错时弹窗已消失）')
+    assert.ok(guardAt < body.lastIndexOf('导入完成'), '失败分支不得走到「导入完成」提示（那行 setNote 必须在判失败之后）')
+    assert.strictEqual(typeof pure.backupImportProblem, 'function',
+      '必须有统一的导入失败判定（旧 doImport 全程不检查 res.ok）')
+    // 响应体形状取自 scripts/console.js 的 handleBackupImport（三类失败的真实载荷）。
+    assert.strictEqual(pure.backupImportProblem({ ok: true, status: 200, data: { imported: { messages: 3 } } }), '',
+      '2xx 不得判失败')
+    assert.strictEqual(
+      pure.backupImportProblem({ ok: false, status: 409, data: { error: 'busy', code: 'busy', message: '有任务正在运行，等结束再导入' } }),
+      '有任务正在运行，等结束再导入', '409 busy 必须透出服务端人话（error 字段是 busy 这种 code）')
+    assert.strictEqual(
+      pure.backupImportProblem({
+        ok: false,
+        status: 507,
+        data: { error: 'audit_full', code: 'audit_full', errors: [{ field: 'audit', code: 'audit_full', message: '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则' }] }
+      }),
+      '审计文件已达 4 MiB 上限，需人工归档后才能导入过滤规则', '507 审计满顶层只有 code，人话在 errors[].message')
+    assert.match(
+      pure.backupImportProblem({ ok: false, status: 400, data: { error: '备份文件不是合法 JSON', code: 'invalid_json' } }),
+      /备份文件不是合法 JSON/, '400 顶层 error 本身是人话时必须用它')
+    assert.match(pure.backupImportProblem({ ok: false, status: 400, data: null }), /^HTTP 400$/,
+      '读不出响应体时必须兜底带状态码，不能只说「导入失败」')
   })
 
   await aok('结构红线: 弹窗 busy 变化不得把焦点抢回密码框', () => {
@@ -3386,6 +3566,73 @@ async function main () {
       fs.rmSync(modDir, { recursive: true, force: true })
     }
   })
+  await aok('前端数据层: 手写条件端点（runs/auto/messages）304 且本地无副本时同样重取（不把 304 当错误）', async () => {
+    // C7-025：这三个端点手写 addConditional + consumeJson，但没给 consumeJson 传 retry。
+    // 304 到达时若同一 key 的 tag 已被并发响应换掉（或条目被 16 条容量淘汰），旧实现直接
+    // reject「HTTP 304（无本地副本）」，界面显示「加载失败：HTTP 304（无本地副本）」。
+    const { pathToFileURL } = require('node:url')
+    const apiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const constSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'constants.js'), 'utf8')
+    const modDir = mkTmp('xbk-api-cond-retry-')
+    const realFetch = globalThis.fetch
+    const realDocument = globalThis.document
+    const realWindow = globalThis.window
+    const res200 = (tag, data) => ({
+      status: 200,
+      ok: true,
+      headers: { get: (n) => (String(n).toLowerCase() === 'etag' ? tag : null) },
+      json: async () => data
+    })
+    const res304 = () => ({ status: 304, ok: false, headers: { get: () => null }, json: async () => { throw new Error('304 不得读 body') } })
+    try {
+      fs.writeFileSync(path.join(modDir, 'api.mjs'), apiSrc.replace("from './constants.js'", "from './constants.mjs'"))
+      fs.writeFileSync(path.join(modDir, 'constants.mjs'), constSrc)
+      globalThis.document = { getElementById: () => null }
+      globalThis.window = { dispatchEvent: () => {} }
+      const mod = await import(pathToFileURL(path.join(modDir, 'api.mjs')).href)
+      // 剧本（逐端点重放）：① 基线 200 写 t-1 ② A 带 t-1 挂起 ③ B 并发 200 换 t-2
+      // ④ A 的 304 后到 → 必须去掉条件头重取（旧实现在这里抛 304）。
+      const runRace = async (label, call) => {
+        const calls = []
+        let releaseLast = null
+        const gate = new Promise((resolve) => { releaseLast = resolve })
+        let step = 0
+        globalThis.fetch = async (url, opts) => {
+          const headers = { ...((opts && opts.headers) || {}) }
+          const condKeyName = Object.keys(headers).find((k) => k.toLowerCase() === 'if-none-match')
+          calls.push({ url: String(url), cond: condKeyName !== undefined, tag: condKeyName ? headers[condKeyName] : null })
+          step += 1
+          if (step === 1) return res200('"t-1"', { v: 1 })
+          if (step === 2) { await gate; return res304() }
+          if (step === 3) return res200('"t-2"', { v: 2 })
+          if (step === 4) return res200('"t-3"', { v: 3 })
+          throw new Error(`${label}: fetch 调用次数超出剧本（304 分支可能重复重试）`)
+        }
+        assert.deepStrictEqual(await call(), { v: 1 }, `${label} 基线 200 必须写入 t-1`)
+        const pA = call()
+        const pB = call()
+        assert.deepStrictEqual(await pB, { v: 2 }, `${label} 并发 B 必须换掉同一 key 的 tag`)
+        releaseLast()
+        let got = null
+        let err = null
+        try { got = await pA } catch (e) { err = e }
+        assert.strictEqual(err, null, `${label} 304 到达时本地 tag 已不是发出去的那个：必须重取，不得把 304 当错误（实际 ${err && err.message}）`)
+        assert.deepStrictEqual(got, { v: 3 }, `${label} 必须返回重取到的真实数据`)
+        assert.strictEqual(calls.length, 4, `${label} 重试恰好一次（总共 4 次 fetch）`)
+        assert.strictEqual(calls[1].cond, true, `${label} A 必须带 If-None-Match（否则没测到 304 分支）`)
+        assert.strictEqual(calls[3].cond, false, `${label} 重取必须去掉 If-None-Match（否则还是 304）`)
+      }
+      await runRace('apiGetRuns', () => mod.apiGetRuns())
+      await runRace('apiGetAuto', () => mod.apiGetAuto())
+      await runRace('apiGetMessages', () => mod.apiGetMessages({}))
+    } finally {
+      globalThis.fetch = realFetch
+      globalThis.document = realDocument
+      globalThis.window = realWindow
+      fs.rmSync(modDir, { recursive: true, force: true })
+    }
+  })
+
   await aok('前端数据层: AbortSignal.timeout 覆盖「头到了、body 挂起」，无该 API 时 fallback 同样中止', async () => {
     // 旧实现用 Promise.race 手写第二层期限（readBodyJson）兜「头已到、体挂起」；
     // v3.385 改成一个 AbortSignal.timeout 同时管 fetch 与 body 读取。这里用真 HTTP
@@ -4469,6 +4716,28 @@ async function main () {
     assert.strictEqual(j[0].id, '9', 'id 为字符串形态')
     server.close()
   })
+  await aok('T7 导出: 240 字节边界落在代理对中间 → 不得留孤立代理项（X-Export-Query-Used 必须可编码）', async () => {
+    // C2-017：clampQueryBytes 用 `query.slice(0,-1)` 按 UTF-16 码元退格。237 个 ASCII +
+    // 一个 4 字节 emoji = 241 字节 → 退一格留下孤立高代理项，随后
+    // encodeURIComponent(query) 抛 URIError，整条导出 500「读取请求体失败」（文案完全指错方向）。
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
+      { id: 1, title: '牛奶特价', content: '伊利', catename: '好单-日用', shijianchuo: 1000, datetime: '2026-10-15', shorttime: '10:00' }
+    ]))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const q = `${'a'.repeat(237)}😀`
+    try {
+      assert.strictEqual(Buffer.byteLength(q, 'utf8'), 241, '前置：241 字节（跨 240 边界）')
+      const res = await request(port, 'POST', '/api/messages/export', {
+        token: TOKEN,
+        body: new URLSearchParams({ format: 'json', q }).toString()
+      })
+      assert.strictEqual(res.status, 200, `代理对中间截断不得让导出 500（实际 ${res.status}：${res.text.slice(0, 120)}）`)
+      assert.strictEqual(res.headers['x-export-query-used'], 'a'.repeat(237), '必须按码点边界退让（整对丢弃，不留孤立代理项）')
+      assert.ok(Array.isArray(JSON.parse(res.text)), '仍是成功导出的裸数组形态')
+    } finally { server.close() }
+  })
   await aok('T6 中文 q 跨 chunk 多字节（readBody StringDecoder 回归）+ GET 对照一致', async () => {
     const dir = tmpDir()
     fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([
@@ -4806,6 +5075,24 @@ async function main () {
     const retry = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
     assert.strictEqual(retry.status, 202, '失败动作在窗口内必须可立即重试（pending 条目已回滚），不得 409')
     server.close()
+  })
+  await aok('HTTP: /trigger 锁写失败（ENOTDIR）→ 500 lock_failed，不得伪装成 409「已有任务在运行」', async () => {
+    // C2-006：stateDir 被换成普通文件后锁路径 open 必然 ENOTDIR（非 EEXIST）。旧实现把它
+    // 折叠成 busy ⇒ 手动触发收到 409「已有触发任务在运行」，运维完全看不出去错了地方。
+    const dir = mkTmp('xbk-console-lockfail-')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      fs.writeFileSync(dir, 'state dir replaced by a file')
+      const res = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+      assert.strictEqual(res.status, 500, `锁写失败必须是 500（实际 ${res.status}：${res.text.slice(0, 160)}）`)
+      assert.strictEqual(JSON.parse(res.text).code, 'lock_failed')
+      assert.strictEqual(fs.existsSync(lockPath(dir)), false, '没拿到锁就不该留下锁文件')
+    } finally {
+      try { fs.unlinkSync(dir) } catch (e) { /* 已清理 */ }
+      server.close()
+    }
   })
   await aok('main: XBK_CONSOLE_PORT 非法值拒绝启动（回归 Sourcery #225 M5：NaN 不得回退 7777）', async () => {
     const c = spawn(process.execPath, [path.join(__dirname, 'scripts', 'console.js')], {
@@ -7259,6 +7546,34 @@ async function main () {
     assert.ok(/<\$\{StatusCards\} state=\$\{state\} err=\$\{statusFailed\} \/>/.test(src), 'App 必须把状态接口的失败传给状态卡')
   })
 
+  await aok('结构红线: 部件 invalid/tooLarge 不得渲染成「暂无数据」（损坏 ≠ 缺失）', async () => {
+    // C7-033：readStatus 对 invalid/tooLarge 不给 value，StatusCards 的 rep/run 都变成 null，
+    // 与 missing 走同一条 !rep / !run 分支 ⇒ 卡片写「暂无数据」、徽标写「—」；标题状态点也
+    // 只读 value 里的 failed/interrupted ⇒ 还是绿的。损坏被伪装成缺失/健康。
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = comp.slice(comp.indexOf('function StatusCards'), comp.indexOf('// ── 组件：触发按钮'))
+    assert.ok(seg.includes('partBroken(state.run)') && seg.includes('partBroken(state.report)'),
+      '状态卡必须先判定部件是「损坏」还是「还没生成」（缺这一层 ⇒ 损坏落进「暂无数据」）')
+    assert.ok(/runBroken[\s\S]{0,40}'异常'[\s\S]{0,10}—/.test(seg), '最近一轮损坏时徽标必须写「异常」，不得写「—」')
+    assert.ok(seg.includes("runBroken ? '数据损坏，无法读取' : '暂无数据'"),
+      '最近一轮损坏时主文案必须是「数据损坏，无法读取」而不是「暂无数据」')
+    assert.ok(/\$\{rep \? [\s\S]{0,200}repBroken \? '数据损坏' : '暂无'/.test(seg),
+      '日报行遇 report 损坏时不得写「暂无」')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const dotAt = ui.indexOf('// 标题状态点')
+    const dot = dotAt > -1 ? ui.slice(dotAt, dotAt + 900) : ''
+    assert.ok(dot.includes('partBroken(state && state.run)') && dot.includes('partBroken(state && state.report)'),
+      '标题状态点必须把 run/report 损坏算成异常（否则标题点还是绿色）')
+    assert.ok(/const bad = broken \|\|/.test(dot), '标题状态点的 bad 判定必须并入 broken')
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.partBroken, 'function', '必须有统一的「部件损坏」判定')
+    assert.strictEqual(pure.partBroken({ status: 'invalid' }), true, 'invalid 是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'tooLarge' }), true, 'tooLarge 是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'missing' }), false, 'missing 是还没生成，不是损坏')
+    assert.strictEqual(pure.partBroken({ status: 'ok', value: { failed: 0 } }), false, 'ok 正常')
+    assert.strictEqual(pure.partBroken(null), false, '没有部件不算损坏')
+  })
+
   await aok('结构红线: 后台标签页不轮询（概览/日志/触发详情三处）', () => {
     const src = readConsoleSource()
     const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
@@ -7527,9 +7842,31 @@ async function main () {
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && consoleSrc.includes('function tickAuto') &&
-        consoleSrc.includes("startAction('run-auto'") && consoleSrc.includes('acquireLock(stateDir'),
-      '自动调度必须在服务器进程内跑 run-auto，并经过单飞锁')
+      // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
+      // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
+      // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
+      // 这条红线，删除/替换 tickAuto 的锁必红。
+      const functionBodyOf = (text, signature) => {
+        const at = text.indexOf(signature)
+        if (at < 0) return ''
+        const open = text.indexOf('{', at + signature.length)
+        if (open < 0) return ''
+        let depth = 0
+        for (let i = open; i < text.length; i++) {
+          if (text[i] === '{') depth++
+          else if (text[i] === '}') {
+            depth--
+            if (depth === 0) return text.slice(open + 1, i)
+          }
+        }
+        return ''
+      }
+      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
+        consoleSrc.includes("startAction('run-auto'") &&
+        tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
+        tickAutoBody.includes('if (!lockVerdict.ok)'),
+      '自动调度必须在服务器进程内跑 run-auto，并在 tickAuto 体内先取单飞锁（锚点落在函数体内）')
       assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
         '上一轮未结束不得叠跑')
       assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
@@ -9231,7 +9568,11 @@ async function main () {
     assert.ok(refreshActiveBody.includes('lastRefreshRef.current = Date.now()'), '刷新成功必须推进时间戳（写在 refreshActive 内，别处的不算）')
     assert.ok(refreshActiveBody.includes('if (ok) lastRefreshRef.current'), '失败的刷新不得推进时间戳，否则 30s 内不会再补')
     assert.ok(refreshActiveBody.includes('formPauseUntilRef.current'), '回前台补拉必须在表单交互期间直接放弃')
-    assert.ok(src.includes('if (seq === autoSeqRef.current'), '自动运行状态响应要带序号守卫，旧响应不得覆盖新状态')
+    // C7-006：判据从「最后发出」（seq === autoSeqRef.current）改成「最后收到」——慢网（RTT
+    // 超过 2s 一拍）下前者会把每一发都判废，autoState 一次也落不下来。旧响应仍不得覆盖新
+    // 状态：守卫语义不变，只是换成「没有更大号的响应已落地才允许写」。
+    assert.ok(src.includes('if (seq > autoLandedRef.current'),
+      '自动运行状态响应要带序号守卫（按「最后收到」判序），旧响应不得覆盖新状态')
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
     const logsPanel = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function ConfigPanel'))
     assert.ok(!/addEventListener\('visibilitychange'/.test(logsPanel), '日志页不得再自己挂 visibilitychange（会与回前台补拉重复请求）')
@@ -9905,6 +10246,122 @@ async function main () {
     assert.ok(snapBlock.includes('runs.slice(0, 12)'), '快照最多存 12 条历史（localStorage 有 5MB 上限）')
     assert.ok(snapBlock.includes('prev.at > startedAt'), '多标签页：旧响应不得覆盖更新快照')
     assert.ok(!snapBlock.includes('BOOT.token'), '快照不得包含 token')
+  })
+
+  // ── W2 audit38 组 g4（C7-001 / C7-006 / C7-007 / C7-008）────────────────────
+  // htm 属性值里的「$ + {表达式}」按仓内既有写法拆开拼，避免 standard 的
+  // no-template-curly-in-string（本意不是模板字符串）。
+  const attrOpen = (expr) => 'open=' + '$' + '{' + expr + '}'
+  await aok('结构红线: C7-001 确认弹窗随切页关闭（后退到别的页不得留 open 弹窗在 hidden section 里）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function TriggerBar')
+    const end = src.indexOf('// ── 组件：运行历史', at)
+    assert.ok(at > -1 && end > at, '应能定位 TriggerBar')
+    const seg = src.slice(at, end)
+    // 弹窗就渲染在概览那一段 <section hidden> 里面。切页（含浏览器后退）时若只把 section
+    // 置 display:none，dialog 仍是 open/:modal ⇒ 塌成 0×0、背景继续 inert（手机只能刷新）。
+    // 所以 open 必须与「当前页」绑在同一个条件里：切页与关闭是同一次提交，不留坏帧。
+    assert.ok(seg.includes(attrOpen('pending !== null && active')),
+      '确认弹窗的 open 必须同时受当前页门控（否则后退切页会把它留在被 display:none 的祖先里）')
+    assert.ok(!/open=\$\{pending !== null\}\s/.test(seg),
+      '不得只按 pending 渲染弹窗（切页后 dialog 仍 open/:modal，整页保持 inert）')
+    assert.ok(/<\$\{TriggerBar\}[\s\S]{0,260}active=\$\{tab === 'overview'\}/.test(src),
+      'TriggerBar 必须真的拿到「当前页」标记（否则上面的门控恒真，等于没修）')
+    // 关掉还不够：pending 必须真清掉（走 onCancel 同一条 setPending(null)）。只调
+    // dialog.close() 会留下卡死的 pending：回到概览又弹一次、确认按钮还绑着旧动作。
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1, '离开当前页时必须主动收口确认弹窗（effect 兜底）')
+    const guard = seg.slice(guardAt, guardAt + 260)
+    assert.ok(guard.includes('setPending(null)'), '切页必须清 pending（只 dialog.close() 会留下卡死的 pending）')
+    assert.ok(guard.includes('confirmSeqRef.current++'),
+      '切页必须作废还在路上的 askConfirm（配置晚回来不得把弹窗重新弹出来）')
+  })
+
+  await aok('结构红线: C7-006 自动运行状态轮询在飞复用 + 判据改「最后收到」（慢网不得每拍自杀）', () => {
+    const uiSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const at = uiSrc.indexOf('const refreshAuto = useCallback')
+    const end = uiSrc.indexOf('// 下拉刷新', at)
+    assert.ok(at > -1 && end > at, '应能定位 refreshAuto')
+    const seg = uiSrc.slice(at, end)
+    // 旧实现每拍都把 autoSeqRef 加一领新号，判定却是 seq === autoSeqRef.current
+    // （「这一发还是不是最后发出的」）。接口 RTT > 2s（= 一拍 2s 的轮询间隔）时，每一发都会
+    // 在下一拍被自己判废 ⇒ 实测 12s 内 6 发 0 落地，autoState 停在 null，自动运行中面板
+    // 连「停止」按钮都不渲染。
+    const guardAt = seg.indexOf('if (autoFlightRef.current) return autoFlightRef.current')
+    assert.ok(guardAt > -1, '在飞时必须复用同一发（不能每拍再领一个新号把上一发判废）')
+    assert.ok(guardAt < seg.indexOf('++autoSeqRef.current'),
+      '在飞保护必须早于领新号：晚一步号照样每拍自增，上一发还是被判废')
+    assert.ok(!seg.includes('seq === autoSeqRef.current'),
+      '判据不得再是「最后发出」的 seq（慢网下每一发都被判废，一次状态也落不下来）')
+    assert.ok(seg.includes('seq > autoLandedRef.current'),
+      '判据必须是「最后收到」：没有更新的响应落地过，就允许这一发写状态')
+    assert.ok(seg.includes('autoLandedRef.current = seq'), '落地后必须记住已收到的号（旧响应仍不得覆盖新状态）')
+    assert.ok(seg.includes('autoFlightRef.current = null'),
+      '落定必须放开在飞标记（否则一次失败后自动运行状态永久冻住）')
+    assert.ok(!/inFlightRef\.current/.test(seg),
+      '自动运行的互斥必须与主轮询分开：借用 inFlightRef 会让两条轮询互相拖住')
+  })
+
+  await aok('结构红线: C7-007 Hint 是活区域（错误 role=alert / 提示 role=status + aria-live）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function Hint (')
+    const end = src.indexOf('function Reveal (', at)
+    assert.ok(at > -1 && end > at, '应能定位 Hint')
+    const seg = src.slice(at, end)
+    // 全站的错误/提示都走 Hint，而它此前只是一个无 role 的 div，目录里也没有兜底 live
+    // region ⇒ 保存失败/触发失败/自动运行出错对读屏完全静默。现在每个 Hint 都是活区域：
+    //   错误 → role=alert（断言式，与类名 hint-err 同一分支）
+    //   其余 → role=status + aria-live=polite（不打断用户正在读的内容）
+    assert.ok(/role=\$\{err \? 'alert' : 'status'\}/.test(seg),
+      '错误必须是 role=alert、提示必须是 role=status（否则读屏听不到）')
+    assert.ok(/aria-live=\$\{err \? 'assertive' : 'polite'\}/.test(seg),
+      'aria-live 必须与 role 同步显式声明（别只挂 role 让 UA 自己猜）')
+    assert.ok(seg.includes('aria-atomic="true"'),
+      'aria-atomic：整句一起播，不逐节点拼读、也不因局部重渲染重复播')
+    assert.ok(seg.includes("const err = tone === 'error'"), '角色必须由 tone 判定（不另造一套入参）')
+    // 旧实现（无 role/aria-live 的裸 div）不得回潮：只有一个渲染出口，且 role 必须在开启标签上。
+    assert.strictEqual((seg.match(/return html`<div/g) || []).length, 1, 'Hint 只能有一个渲染出口')
+    const only = seg.slice(seg.indexOf('return html`<div'))
+    const roleAt = only.indexOf('role=')
+    assert.ok(roleAt > -1 && roleAt < only.indexOf('>'), 'role 必须落在 <div ...> 的开启标签里')
+    assert.ok(!/role="(alert|status)"/.test(only), 'role 必须按 tone 切换，不能写死一种')
+  })
+
+  await aok('结构红线: C7-008 日历可键盘进入（open() 后聚焦 calendarContainer / 选完还焦点）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function DateRange (')
+    const end = src.indexOf('// 按区间过滤', at)
+    assert.ok(at > -1 && end > at, '应能定位 DateRange')
+    const seg = src.slice(at, end)
+    // flatpickr 的 keydown 只挂在 _input 与 calendarContainer 上，而从 .date-btn 打开时焦点
+    // 留在按钮上 ⇒ 方向键/Enter 根本到不了实例，键盘只能开/关（Tab 一离开按钮还会被 document
+    // 的 focus 捕获把日历关掉）。容器自带 tabIndex=-1（flatpickr 建的），open() 之后把焦点送
+    // 进去，Le 才能接管：←/→ 逐日、↑/↓ 逐周、Enter 选中。
+    const openAt = seg.indexOf('inst.open()')
+    assert.ok(openAt > -1, '按钮必须调 inst.open() 打开日历')
+    const focusAt = seg.indexOf('inst.calendarContainer.focus(')
+    assert.ok(focusAt > -1, 'open() 后必须把焦点送进日历容器（否则焦点永远进不了日历）')
+    assert.ok(openAt < focusAt, '必须先 open() 再 focus：未打开时容器还是 display:none，focus 会被直接丢弃')
+    // 选完两格日历会自己 close()：焦点必须回到触发按钮，否则落在已经 display:none 的容器里
+    // —— 等于键盘焦点丢失（修好「进得去」却把「出得来」弄丢）。
+    const onChangeAt = seg.indexOf('onChange (dates)')
+    assert.ok(onChangeAt > -1, '应能定位 onChange')
+    const onChangeSeg = seg.slice(onChangeAt)
+    assert.ok(onChangeSeg.includes('btnRef.current.focus('),
+      '选完必须把焦点还给触发按钮（日历随即 close()，焦点不能留在隐藏容器里）')
+    // 前提：容器确实可 programmatic focus（属性名不随压缩改名，升级 flatpickr 时这条会替我们复核）。
+    const fp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'flatpickr.module.js'), 'utf8')
+    assert.ok(fp.includes('calendarContainer.tabIndex=-1'),
+      'calendarContainer 必须仍是 tabIndex=-1（否则 focus() 无效，本修复的前提变了）')
+    // Esc：焦点进日历后 flatpickr 自己也处理 Esc（_input.focus() 再 close），会把焦点丢到
+    // aria-hidden 的 .fp-anchor 上。捕获阶段必须截住这次按键，只走「关闭 + 还给按钮」。
+    const escAt = src.indexOf('function bindEscClose')
+    assert.ok(escAt > -1, '应能定位 bindEscClose')
+    const escSeg = src.slice(escAt, src.indexOf('\n}\n', escAt))
+    assert.ok(escSeg.includes('e.stopPropagation()'),
+      'Esc 必须在捕获阶段截住（否则 flatpickr 的 ke() 会把焦点抢到隐藏锚点 .fp-anchor）')
+    assert.ok(escSeg.includes('inst.close()') && escSeg.includes('restoreFocus()'),
+      'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
 }
 

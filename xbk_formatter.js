@@ -7,6 +7,12 @@ function createFormatter ({ Utils, safeRe }) {
   // 模板占位符全集（与 xbk_app.js SUPPORTED_TPL_KEYS 及 tuisong_replace 的 map 键一致）：单趟
   // 替换用固定字面量正则，无回溯风险（同 _finalizeMd 的固定正则，无需 safeRe）。
   const TPL_PLACEHOLDER_RE = /\{标题\}|\{内容\}|\{Html内容\}|\{Markdown内容\}|\{分类名\}|\{分类ID\}|\{链接\}|\{日期\}|\{时间\}|\{楼主\}|\{类目\}|\{价格\}|\{商城\}|\{品牌\}|\{图片\}/g
+  // 推送正文 / HTML 内容的 100k 硬上限（SYSTEM_CONTRACT.md:31：超出必须按 UTF-16 安全截断，
+  // 不得按码元切断代理对）。htmlToMarkdown 入口与 tuisong_replace 的 {Html内容} 共用本常量，
+  // 避免两处各写一个字面量后漂移（C10-070：后者曾用 raw.slice，10 万边界切出半个 emoji）。
+  // 注：xbk_pusher.js 的 HTML_LIKE_MAX_LEN 同值但独立持有——那里 Utils 是注入依赖、缺
+  // truncateUtf16 时要退回本地代理对退位实现，跨文件合并常量得同时改注入契约，不在本次范围。
+  const HTML_TEXT_MAX_LEN = 100000
   const Formatter = {
   /** Markdown 收尾：合并连续换行 + 去首尾空白（短路与正常路径共用） */
   _finalizeMd (s) {
@@ -209,7 +215,7 @@ function createFormatter ({ Utils, safeRe }) {
     // 构造为 10 万+ 字符卡死主线程。v3.254 的 100k 截断只能把最坏输入压到 ~100k（实测
     // 仍 12-16s）。v3.261：h/a/script/style 全部改为 _replaceTagged 线性定位（开标签互不
     // 重叠、indexOf 找首个闭合，全程 O(n)），入口截断保留作为下游（解码/清洗）的防护。
-    if (html.length > 100000) html = Utils.truncateUtf16(html, 100000)
+    if (html.length > HTML_TEXT_MAX_LEN) html = Utils.truncateUtf16(html, HTML_TEXT_MAX_LEN)
     // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
     const urlText = Utils.safeUrl(shuju && shuju.url)
     const safeUrl = urlText
@@ -389,10 +395,29 @@ function createFormatter ({ Utils, safeRe }) {
           }
           return lo < positions.length ? positions[lo] : -1
         }
+        // C10-002：`_findTagEnd(str, i)` 的结果只取决于 i，且可一次线性填表（引号感知语义逐位等价）：
+        //   tagEnd[i] = i                                  （str[i] 是 `>`）
+        //             = tagEnd[配对引号的下一位]            （str[i] 是引号且存在同种闭合引号）
+        //             = tagEnd[i + 1]                       （其余，含未闭合引号）
+        // 旧实现对每个「按正文保留」的 `<`（`价格<100 元`、`a<100 ` 这类合法正文）都扫到远端 `>`，
+        // 却只前进 1 个字符 ⇒ 二次方（96k 字符实测 2.81s，同长度不带远端 `>` 仅 32ms）。
+        // 换成 O(1) 查表后语义不变，扫描量与输入长度线性相关。
+        const n = str.length
+        const tagEnd = new Int32Array(n + 1).fill(-1)
+        const quoteClose = new Int32Array(n + 1).fill(-1)
+        let lastDq = -1
+        let lastSq = -1
+        for (let i = n - 1; i >= 0; i--) {
+          const c = str.charCodeAt(i)
+          if (c === 0x22) { quoteClose[i] = lastDq; lastDq = i } else if (c === 0x27) { quoteClose[i] = lastSq; lastSq = i }
+          if (c === 0x3e) tagEnd[i] = i
+          else if (c === 0x22 || c === 0x27) tagEnd[i] = tagEnd[quoteClose[i] === -1 ? i + 1 : quoteClose[i] + 1]
+          else tagEnd[i] = tagEnd[i + 1]
+        }
         while (pos < str.length) {
           const lt = str.indexOf('<', pos)
           if (lt === -1) { out += str.slice(pos); break }
-          const gt = this._findTagEnd(str, lt + 1)
+          const gt = tagEnd[lt + 1]
           if (gt === -1) { out += str.slice(pos); break }
           // 只有看起来像 HTML 标签的片段才剥离；`2 < 3 > 1`、`<world>` 等普通文本保留。
           const tagStart = str[lt + 1] === '/' ? lt + 2 : lt + 1
@@ -486,7 +511,9 @@ function createFormatter ({ Utils, safeRe }) {
       let raw = data.content_html
       if (typeof raw !== 'string') raw = ''
       // 与 htmlToMarkdown 对齐：超长截断到 10 万字符，防未闭合主动标签堆叠导致回溯式 ReDoS。
-      if (raw.length > 100000) raw = raw.slice(0, 100000)
+      // C10-070：截断必须走 Utils.truncateUtf16——原先 raw.slice(0, 100000) 会在 10 万边界
+      // 切断代理对，输出末字符退化成 U+FFFD（SYSTEM_CONTRACT.md:31 明确禁止按码元切断代理对）。
+      if (raw.length > HTML_TEXT_MAX_LEN) raw = Utils.truncateUtf16(raw, HTML_TEXT_MAX_LEN)
       rawHtml = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(raw))
     }
     // {链接} 占位符 Markdown 安全化（v3.74）：与 htmlToMarkdown 的 mdUrl 同口径——

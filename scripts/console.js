@@ -375,14 +375,23 @@ function writeLockAtomic (p, now, token) {
   }
 }
 
-function acquireLock (stateDir, now, token) {
+// 锁获取结论（C2-006）：只有「锁已存在且未陈旧」才是 busy（调用方回 409 / 自动运行下一轮再试）。
+// 其余写失败（EACCES/ENOSPC/EROFS/ENOTDIR…）是真实文件系统错误——旧实现一律 return false，
+// 手动触发被误报成 409「已有任务在运行」、自动运行静默重排且不计 fails，故障完全不可见。
+// busy 用共享常量：调用方只读，不需要每次分配。
+const LOCK_BUSY = Object.freeze({ ok: false, busy: true })
+function lockFailure (e) {
+  return { ok: false, busy: false, error: e || new Error('锁写入失败') }
+}
+
+function acquireLockResult (stateDir, now, token) {
   const p = lockPath(stateDir)
   try {
     // 第一层：直接独占创建（无锁时最常见路径）。
     writeLockAtomic(p, now, token)
-    return true
+    return { ok: true }
   } catch (e) {
-    if (e.code !== 'EEXIST') return false
+    if (!e || e.code !== 'EEXIST') return lockFailure(e)
   }
   // 第二层：锁已存在——读内容判定死活。陈旧接管仍以「独占 rename 覆盖」收口：
   // rename 覆盖是原子替换，两个并发接管进程各自 prepared tmp 后同时 rename，
@@ -408,21 +417,24 @@ function acquireLock (stateDir, now, token) {
     if (corrupted && !released) {
       let mtimeAge = null
       try { mtimeAge = now - fs.statSync(p).mtimeMs } catch (e) { mtimeAge = null }
-      if (!(typeof mtimeAge === 'number' && mtimeAge > PROC_TIMEOUT_MS)) return false
+      if (!(typeof mtimeAge === 'number' && mtimeAge > PROC_TIMEOUT_MS)) return LOCK_BUSY
       corruptedStale = true
     }
     const stale = released || (corrupted ? corruptedStale : (now - startedAt > PROC_TIMEOUT_MS))
-    if (!stale) return false
+    if (!stale) return LOCK_BUSY
     // 陈旧/损坏锁接管：哨兵独占，防并发接管双跑（Sourcery High）。
     const sentinel = p + '.takeover'
     let claimed = false
+    // 哨兵建不起来且不是「已存在」= 真实写失败（EACCES/EROFS/ENOSPC…），必须如实上报而不是
+    // 伪装成「有人正在接管」（C2-006 同一类折叠）。
+    let sentinelError = null
     for (let attempt = 0; attempt < 2 && !claimed; attempt++) {
       try {
         const fd = fs.openSync(sentinel, 'wx')
         fs.closeSync(fd)
         claimed = true
       } catch (err) {
-        if (!err || err.code !== 'EEXIST') break
+        if (!err || err.code !== 'EEXIST') { sentinelError = err; break }
         // 哨兵已存在：可能是上一次接管者崩溃后留下的残留（它会让后续触发连续 10 分钟 409，
         // D2-S5）。陈旧 ⇒ 先 unlink 再重抢；重抢必须走 open(wx) —— 旧实现的
         // stat→writeFileSync 是 check-then-write，两个实例可同时 claimed。
@@ -435,7 +447,7 @@ function acquireLock (stateDir, now, token) {
         try { fs.unlinkSync(sentinel) } catch (e2) { /* 已被并发接管者清掉 */ }
       }
     }
-    if (!claimed) return false
+    if (!claimed) return sentinelError ? lockFailure(sentinelError) : LOCK_BUSY
     // takeover 路径不能再用 open(wx) 写锁（目标存在必 EEXIST）：走「临时文件 + rename
     // 原子换代」。rename 原子替换且**换 inode**——仍握着旧 inode fd 的旧持有者，其
     // releaseLockFor 的原地覆写只会落进孤儿 inode，绝不可能盖掉新持有者的锁帧
@@ -448,13 +460,21 @@ function acquireLock (stateDir, now, token) {
     } catch (err) {
       try { fs.unlinkSync(tmp) } catch (e2) { /* tmp 未建成 */ }
       try { fs.unlinkSync(sentinel) } catch (e2) { /* 并发接管者会各自清自己的 */ }
-      return false
+      return lockFailure(err)
     }
     try { fs.unlinkSync(sentinel) } catch (err) { /* 并发接管者会各自清自己的 */ }
-    return true
+    return { ok: true }
   } catch (err) {
-    return false
+    // 走到这里的是「读不到锁内容」（EACCES/EISDIR/ioError 等）：无法判定持有方死活，
+    // 按既有的 fail-closed 语义算 busy（409），不冒充文件系统错误——获取侧的写失败才是
+    // 上面已经分类上报的那几处。
+    return LOCK_BUSY
   }
+}
+
+// 布尔包装：只回答「拿到了没有」。需要区分 busy / 真实错误时用 acquireLockResult（C2-006）。
+function acquireLock (stateDir, now, token) {
+  return acquireLockResult(stateDir, now, token).ok === true
 }
 
 // releaseLock（按路径 unlinkSync 删锁）已删除（v3.296）：本仓 CodeQL 铁律——锁类代码
@@ -1978,6 +1998,12 @@ function readFilterAuditChain (auditPath) {
     }
     lastHash = entry.entryHash
   }
+  // 末行必须以 \n 收尾（C2-001 残留）：旧版 1 字节短写会留下「末行 JSON 完整、只缺换行」的
+  // 审计文件——逐行重算查不出问题（末行合法、链也接得上），但下一次 append 会直接粘在这一行尾部，
+  // 整行 JSON 当场报废、brokenAt=1，链一次性不可读，而那次保存仍返回 200（读链说 ok）。非空文件
+  // 缺收尾换行即判「末行不完整」（brokenAt = 末行行号），由 append 的断链闸拒绝续写；人工补一个
+  // 换行即可恢复，不必归档整份审计。
+  if (brokenAt === null && read.text.length > 0 && !read.text.endsWith('\n')) brokenAt = lines.length
   return { ok: brokenAt === null, entries, brokenAt, lastHash }
 }
 
@@ -2000,15 +2026,27 @@ function filterAuditAtLimit (auditPath) {
 
 // append-only + 0600：每次从头复算链尾（文件上限 4MiB，控制台写频率极低）。
 // 打开时带 O_NOFOLLOW 且 fstat 必须是普通文件：预置的 symlink/FIFO/目录一律拒绝，否则
-// 「fchmod + append」会顺着链接改写别的可写文件。失败返回 false，由调用方回滚规则文件并报
-// 500 audit_failed——审计不落地就不能让调用方看到成功。
+// 「fchmod + append」会顺着链接改写别的可写文件。失败返回 `{ ok:false, code }`，由调用方
+// 回滚规则文件并报错——审计不落地就不能让调用方看到成功。
+// 返回值（C2-001）：ok:true = 整行落盘且 fsync 完成；ok:false + code:
+//   · audit_broken：既有审计链已断（brokenAt ≥ 1）。链尾不可信，接着写只会把新行接在坏行
+//     之后、链永远不可复算（旧实现在这里拿断点前的 lastHash 硬接，还返回 true）——拒绝续写，
+//     等人工归档/修复。
+//   · audit_failed：其它写入失败（不可读/非普通文件/短写/fsync 失败）。
 function appendFilterAudit ({ auditPath, actor, action, revision, changedFields }) {
   try {
     if (filterAuditAtLimit(auditPath)) {
       console.error('⚠️ 过滤规则审计已到 4 MiB 上限，拒绝续写（需人工归档后重试）')
-      return false
+      return { ok: false, code: 'audit_failed' }
     }
     const chain = readFilterAuditChain(auditPath)
+    // brokenAt ≥ 1 = 真的读到了坏行（JSON 损坏 / prevHash 断裂 / entryHash 不符）。
+    // brokenAt === 0 是「读不出来」（symlink/FIFO/超限/ioError），交给下面的 open+write
+    // 如实失败（保持既有 audit_failed 语义，不把不可读误报成断链）。
+    if (chain.ok !== true && chain.brokenAt >= 1) {
+      console.error(`⚠️ 过滤规则审计链已断裂（brokenAt=${chain.brokenAt}），拒绝续写：请人工归档/修复后重试`)
+      return { ok: false, code: 'audit_broken' }
+    }
     const prevHash = chain.lastHash || FILTER_AUDIT_GENESIS
     const entry = {
       ts: new Date().toISOString(),
@@ -2020,22 +2058,37 @@ function appendFilterAudit ({ auditPath, actor, action, revision, changedFields 
     entry.prevHash = prevHash
     entry.entryHash = filterAuditEntryHash(prevHash, entry)
     const line = `${JSON.stringify(entry)}\n`
+    const lineBytes = Buffer.byteLength(line, 'utf8')
     // O_NOFOLLOW 在非 POSIX 平台可能缺省（undefined），按位或会把它当 0 从而丢掉整组 flag。
     // O_NONBLOCK：审计路径被预置成 FIFO 时 open 立即返回（ENXIO），而不是阻塞整个事件循环。
     const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
       (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0)
     const fd = fs.openSync(auditPath, flags, 0o600)
     try {
-      if (!fs.fstatSync(fd).isFile()) throw new Error('审计路径不是普通文件')
+      const st = fs.fstatSync(fd)
+      if (!st.isFile()) throw new Error('审计路径不是普通文件')
       fs.fchmodSync(fd, 0o600)
-      fs.writeSync(fd, line)
+      try {
+        // 短写收口（C2-001，同 :647-653 锁帧写路径的先例）：writeSync 可能少写（磁盘紧张/
+        // 信号中断）且**不抛**——只返回实际写入字节数。丢弃返回值 = 半行被当成成功，链永久
+        // 停在坏行，后续 append 仍旧返回成功、保存照 200。
+        const written = fs.writeSync(fd, line)
+        if (written !== lineBytes) throw new Error(`审计写入不完整（${written}/${lineBytes} 字节）`)
+        // 审计是保存的提交点：fsync 之后才允许回 200，掉电也不许「规则生效但审计丢失」。
+        fs.fsyncSync(fd)
+      } catch (e) {
+        // 半行必须当场清掉（截回写前长度）：否则链停在坏行，之后每次保存都会被判 audit_broken。
+        // 尽力而为——截不掉时下一轮的断链闸仍会拒绝续写，不会“悄悄接上去”。
+        try { fs.ftruncateSync(fd, st.size) } catch (e2) { /* 尽力清理，靠断链闸兜底 */ }
+        throw e
+      }
     } finally {
       fs.closeSync(fd)
     }
-    return true
+    return { ok: true }
   } catch (e) {
     console.error(`⚠️ 过滤规则审计写入失败：${e && e.message ? e.message : e}`)
-    return false
+    return { ok: false, code: 'audit_failed' }
   }
 }
 
@@ -2252,23 +2305,42 @@ function releaseFilterLock (lock) {
   } catch (e) { /* 锁已释放/被接管：幂等 */ }
 }
 
-// 备份只保留最近 FILTER_BACKUP_KEEP 代（按 revision 数值降序）。
+// 备份只保留最近 FILTER_BACKUP_KEEP 个写入点（回滚点）。
 // 注意调用时机：必须在新的覆盖文件提交成功**之后**才剪枝——失败的保存不该剪掉最老备份。
+// 判据是「备份文件的 mtime（= 写入顺序）」，绝不比较 revision 数值（C2-005 返工）：覆盖文件
+// 损坏后用户确认覆盖，revision 从 1 重新开始，旧代残留的 bak.4 数值大于新代 bak.1——按数值
+// 「保留最大的 3 个」会把刚写入的新代 bak.1 当成最老删掉，恢复页随即 404 backup_not_found。
+// 为什么不会误删（单写者证据）：save / restore / import 三条写入路径都在 acquireFilterLock 的
+// 同一临界区内先 backupFilterFile 再写覆盖文件、**成功后才** pruneFilterBackups，备份文件只会
+// 被「本次写入」创建或覆盖 ⇒ mtime 越新 ≡ 回滚点越新，与代际编号无关。同一 revision 跨代重写
+// 会刷新 mtime（内容本来就是更新的一代），旧代残留文件不再被写、mtime 保持更老，先被剪。
+// 平局兜底：同一文件系统时间粒度内落盘的多个备份按 revision 升序取——换代时 revision 从 1 重来，
+// 升序把票投给新代（正是本条要保的方向）；平局只可能出现在「同一时刻写入」的相邻回滚点之间。
 function pruneFilterBackups (paths) {
   let names
   try { names = fs.readdirSync(path.dirname(paths.file)) } catch (e) { return }
-  const revisions = []
+  const backups = []
   for (const name of names) {
     const prefix = 'filter-rules.bak.'
     if (!name.startsWith(prefix) || !name.endsWith('.json')) continue
     const raw = name.slice(prefix.length, -'.json'.length)
     if (!/^\d+$/.test(raw)) continue
     const rev = Number(raw)
-    if (Number.isSafeInteger(rev) && rev >= 0) revisions.push(rev)
+    if (!Number.isSafeInteger(rev) || rev < 0) continue
+    // lstat 不跟随符号链接：备份名被预置成链接时按链接自身的 mtime 排序，删的也是链接本身。
+    let mtimeNs
+    try { mtimeNs = fs.lstatSync(paths.backupFor(rev), { bigint: true }).mtimeNs } catch (e) { continue }
+    backups.push({ rev, mtimeNs })
   }
-  revisions.sort((a, b) => b - a)
-  for (const rev of revisions.slice(FILTER_BACKUP_KEEP)) {
-    try { fs.unlinkSync(paths.backupFor(rev)) } catch (e) { /* 已被清理 */ }
+  if (backups.length <= FILTER_BACKUP_KEEP) return
+  backups.sort((a, b) => {
+    if (a.mtimeNs !== b.mtimeNs) return a.mtimeNs > b.mtimeNs ? -1 : 1
+    return a.rev - b.rev
+  })
+  const kept = new Set(backups.slice(0, FILTER_BACKUP_KEEP).map((b) => b.rev))
+  for (const b of backups) {
+    if (kept.has(b.rev)) continue
+    try { fs.unlinkSync(paths.backupFor(b.rev)) } catch (e) { /* 已被清理 */ }
   }
 }
 
@@ -2296,9 +2368,11 @@ function parseFilterFile (text) {
 
 // 超长 query 按 UTF-8 字节从尾截断（中文按字符截到字节边界）——/api/messages 与
 // /api/messages/export 共用同一钳制口径，防两端「截断后搜的词不一样」。
+// 必须按码点边界退让（C2-017）：`query.slice(0, -1)` 只退一个 UTF-16 码元——240 字节边界
+// 落在代理对中间时会留下孤立高代理项，下游 encodeURIComponent(query) 直接抛 URIError，
+// 整条导出变成 500。sliceUtf8Bytes 逐码点累加字节，超限就整对丢弃。
 function clampQueryBytes (query) {
-  while (Buffer.byteLength(query, 'utf8') > MESSAGES_QUERY_MAX_BYTES) query = query.slice(0, -1)
-  return query
+  return sliceUtf8Bytes(query, MESSAGES_QUERY_MAX_BYTES)
 }
 
 // ── v3.370 线报全站搜索：上游 HTML 解析与关注词归一（纯函数，非 HTTP 单测可达）──
@@ -3328,7 +3402,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     const now = Date.now()
     const runToken = crypto.randomBytes(12).toString('hex')
-    if (!acquireLock(stateDir, now, runToken)) {
+    const lockVerdict = acquireLockResult(stateDir, now, runToken)
+    if (!lockVerdict.ok) {
+      if (!lockVerdict.busy) {
+        // 真实文件系统错误（EACCES/ENOSPC/EROFS/ENOTDIR…）：旧实现与「青龙持锁」混为一谈，
+        // 静默重排到下一轮、既不计 fails 也不留痕——自动运行看起来在跑，实际从未启动（C2-006）。
+        auto.fails += 1
+        auto.lastError = `锁获取失败：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`
+        console.error(`⚠️ 自动运行锁获取失败（stateDir=${stateDir}）：${auto.lastError}`)
+        if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次锁获取失败，已停止`)
+        else scheduleAuto(auto.interval * 1000)
+        return
+      }
       // 青龙/另一控制台实例持锁：不抢跑，也不计失败。
       scheduleAuto(auto.interval * 1000)
       return
@@ -3631,7 +3716,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 必须从 windowMs 派生（而不是再读一次设置）：否则窗长算错时 409 仍会回带一个
         // 「看起来对」的秒数，把矛盾藏起来（retryAfterS 与 replayWindowS 会自相矛盾）。
         const replayWindowS = Math.round(windowMs / 1000)
-        if (!acquireLock(stateDir, now, runToken)) {
+        const lockVerdict = acquireLockResult(stateDir, now, runToken)
+        if (!lockVerdict.ok && !lockVerdict.busy) {
+          // 锁写失败不是「已有任务在运行」：如实报 500，别让运维去等一个永远不存在的任务（C2-006）。
+          console.error(`⚠️ 触发锁获取失败（stateDir=${stateDir}）：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`)
+          sendJson(res, 500, {
+            error: '锁文件写入失败，动作未执行（检查 stateDir 权限与磁盘空间）',
+            code: 'lock_failed'
+          })
+          return
+        }
+        if (!lockVerdict.ok) {
           // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
           const prevPrePair = persistedPre.find(([k]) => k === action)
@@ -4195,7 +4290,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
       }
       const lockToken = crypto.randomBytes(12).toString('hex')
-      if (!acquireLock(stateDir, Date.now(), lockToken)) {
+      const lockVerdict = acquireLockResult(stateDir, Date.now(), lockToken)
+      if (!lockVerdict.ok) {
+        if (!lockVerdict.busy) {
+          // 锁写失败不是「有任务在跑」：导入路径同样必须报真错（C2-006）。
+          console.error(`⚠️ 导入锁获取失败（stateDir=${stateDir}）：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`)
+          sendJson(res, 500, { error: '锁文件写入失败，导入未执行（检查 stateDir 权限与磁盘空间）', code: 'lock_failed' })
+          return
+        }
         res.setHeader('Retry-After', '1')
         sendJson(res, 409, { error: 'busy', code: 'busy', message: '有任务正在运行，等结束再导入' })
         return
@@ -4357,14 +4459,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             override: plans.filter.result.value
           })
           const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-          if (!appendFilterAudit({
+          const audit = appendFilterAudit({
             auditPath: filterPaths.audit,
             actor: actorOf(token),
             action: 'import',
             revision: nextFile.revision,
             changedFields
-          })) {
-            abortImport('filter', 500, { error: 'audit_failed', code: 'audit_failed' })
+          })
+          if (!audit.ok) {
+            abortImport('filter', 500, { error: audit.code, code: audit.code })
             return
           }
           pruneFilterBackups(filterPaths)
@@ -4510,18 +4613,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         })
         const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
         const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        if (!appendFilterAudit({
+        const audit = appendFilterAudit({
           auditPath: paths.audit,
           actor: actorOf(actorToken),
           action: 'save',
           revision: nextRevision,
           changedFields
-        })) {
+        })
+        if (!audit.ok) {
           // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
           const rolled = rollbackFilterOverride(paths, previousText)
           sendJson(res, 500, {
-            error: 'audit_failed',
-            code: 'audit_failed',
+            error: audit.code,
+            code: audit.code,
             rolledBack: rolled.ok,
             rollbackMode: rolled.mode
           })
@@ -4770,17 +4874,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             override: restoredFilter
           })
         const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        if (!appendFilterAudit({
+        const audit = appendFilterAudit({
           auditPath: paths.audit,
           actor: actorOf(actorToken),
           action: toDefault ? 'reset_default' : 'restore',
           revision: nextRevision,
           changedFields
-        })) {
+        })
+        if (!audit.ok) {
           const rolled = rollbackFilterOverride(paths, previousText)
           sendJson(res, 500, {
-            error: 'audit_failed',
-            code: 'audit_failed',
+            error: audit.code,
+            code: audit.code,
             rolledBack: rolled.ok,
             rollbackMode: rolled.mode
           })
@@ -6765,6 +6870,7 @@ module.exports = {
   TOTP_PERIOD_S,
   TOTP_DIGITS,
   acquireLock,
+  acquireLockResult,
   releaseLockFor,
   lockPath,
   parseAction,

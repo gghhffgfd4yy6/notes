@@ -685,6 +685,42 @@ check('_writeRunLog 非 ERROR 长行 ⇒ 完全不截断', () => {
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, line, 'utf8']])
 })
 
+// ----- C1-006 回归：整批 NDJSON 必须逐条整行写入，不得被「ERROR 行截断」启发式截出半行 -----
+check('_writeFilterDiagnostics 一批 13 条（含含 " ERROR " 的记录）⇒ 13 行完整 JSON，末行不得截断成非法 JSON', () => {
+  const rec = makeLogFs()
+  const { app } = makeLogApp({ rec, Config: { diagnostics: { filterLog: { enabled: true } } } })
+  const records = [{
+    type: 'run',
+    at: '2026-10-28 10:00:00',
+    total: 13,
+    dedup: 0,
+    filtered: 3,
+    passed: 10,
+    byReason: { 'keyword.pingbibiaoti': 3 },
+    detailCount: 12
+  }]
+  for (let i = 1; i <= 12; i++) {
+    records.push({
+      type: 'item',
+      id: `diag-${i}`,
+      title: i === 3 ? `第3条线报 ERROR ${'E'.repeat(80)}` : `第${i}条线报标题${'标'.repeat(20)}`,
+      decision: 'filtered',
+      reason: { stage: 'keyword', kind: 'block', configKey: 'pingbibiaoti' }
+    })
+  }
+  app._writeFilterDiagnostics(records)
+  assert.strictEqual(rec.rec.append.length, 1, '整批诊断应一次追加')
+  const text = rec.rec.append[0][1]
+  assert.ok(text.endsWith('\n'), '整批必须以换行结尾（NDJSON 逐行）')
+  const lines = text.split('\n').slice(0, -1)
+  assert.strictEqual(lines.length, records.length,
+    `${records.length} 条记录必须写出 ${records.length} 行（实际 ${lines.length} 行，末行长度 ${(lines[lines.length - 1] || '').length}）`)
+  lines.forEach((line, index) => {
+    assert.doesNotThrow(() => JSON.parse(line), `第 ${index + 1} 行必须是完整合法 JSON，实际尾部：${line.slice(-40)}`)
+  })
+  assert.deepStrictEqual(JSON.parse(lines[2]), records[2], '含 " ERROR " 的记录必须原样整条写入（不得截掉 errMsg 之后的 JSON 结构）')
+})
+
 // ----- _writeRunLog：超 1MiB 截尾到 512KiB 且按换行对齐 -----
 check('_writeRunLog size === 1MiB ⇒ 不截尾（严格大于）', () => {
   const rec = makeLogFs({ size: LIMIT, tail: 'IGNORED' })
@@ -1924,6 +1960,51 @@ checkAsync('RE2 警告: 7 天前的标记被清理，当天的保留', async () 
   assert.strictEqual(mfs._files.has(dir + '/re2warn.state.2099-01-01'), true, '未来日期标记不得误删')
 })
 
+// ----- C1-002 回归：清理只删自身精确形状，同形的合法判重缓存/墓碑必须保留 -----
+check('RE2 警告: 清理只删标记自身形状（标记/.lock/.reclaim/.tmp），同形的 .json 判重缓存与其墓碑必须保留', () => {
+  const mfs = makeMemFs()
+  const oldStamp = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date(Date.now() - 9 * 86400000))
+  const base = dir + '/re2warn.state.' + oldStamp
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
+  // .tmp 残留必须按**生产真实命名**造：直接调 _writeRe2WarnMarkerAtomic，让它停在
+  // writeFileSync 之后、rename 之前（rename 抛错 + 兜底 unlink 也失败，等价于进程在此处崩溃）。
+  // 该函数命名是 `${statePath}.${process.pid}.${Date.now()}.tmp`——纯数字段、**无 hex 段**；
+  // 旧白名单写死 12 位 hex（那是 xbk_storage.writeAtomic 的形态，re2 标记从不走它），会漏清真实残留。
+  const origRename = mfs.renameSync
+  const origUnlink = mfs.unlinkSync
+  mfs.renameSync = () => { const e = new Error('EIO: rename failed'); e.code = 'EIO'; throw e }
+  mfs.unlinkSync = (p) => {
+    if (String(p).endsWith('.tmp')) { const e = new Error('EPERM: unlink failed'); e.code = 'EPERM'; throw e }
+    return origUnlink(p)
+  }
+  const wrote = app._writeRe2WarnMarkerAtomic(base, '{"status":"pending"}')
+  mfs.renameSync = origRename
+  mfs.unlinkSync = origUnlink
+  const tmpResidues = [...mfs._files.keys()].filter(p => p.startsWith(base + '.') && p.endsWith('.tmp'))
+  assert.strictEqual(wrote, false, '模拟写入中途崩溃：_writeRe2WarnMarkerAtomic 必须返回 false')
+  assert.strictEqual(tmpResidues.length, 1, `崩溃必须留下一个 .tmp 残留（实际 ${JSON.stringify(tmpResidues)}）`)
+  const tmpResidue = tmpResidues[0]
+  assert.match(tmpResidue.slice(base.length), /^\.\d+\.\d+\.tmp$/,
+    `re2 标记 tmp 的真实形状是 <statePath>.<pid>.<ts>.tmp（无 hex 段），实际 ${tmpResidue}`)
+  mfs.writeFileSync(base, '{"status":"completed"}')
+  mfs.writeFileSync(base + '.lock', '999999:x')
+  mfs.writeFileSync(base + '.1234.1700000000000.reclaim', '')
+  // 自定义 pushUrl 末段恰为 re2warn.state.<date> 时，getFileName 得到的合法判重缓存及其墓碑
+  // （含其 writeAtomic 临时文件：`<名字>.json.<pid>.<ts>.<hex12>.tmp`——带 .json 段，不属于本模块命名，不得删）
+  mfs.writeFileSync(base + '.json', '{"items":[]}')
+  mfs.writeFileSync(base + '.json.seen.json', '{"tombstones":[]}')
+  mfs.writeFileSync(base + '.json.1234.1700000000000.abcdef123456.tmp', '')
+  app._cleanupStaleRe2WarnMarkers()
+  for (const suffix of ['', '.lock', '.1234.1700000000000.reclaim']) {
+    assert.strictEqual(mfs._files.has(base + suffix), false, `过期残留「${suffix || '(标记)'}」必须清理`)
+  }
+  assert.strictEqual(mfs._files.has(tmpResidue), false, '崩溃残留的 re2 标记 .tmp 必须按真实形状清理（否则永久累积）')
+  assert.strictEqual(mfs._files.has(base + '.json'), true, '同形合法判重缓存不得被启动清理删除（删了下轮全量重推）')
+  assert.strictEqual(mfs._files.has(base + '.json.seen.json'), true, '判重缓存的 .seen.json 墓碑不得被删除（删了裁剪墓碑失效）')
+  assert.strictEqual(mfs._files.has(base + '.json.1234.1700000000000.abcdef123456.tmp'), true,
+    '判重缓存自己的 writeAtomic 临时文件（带 .json 段）不得被当成标记残留删除')
+})
+
 check('RE2 警告锁: 独占创建（wx），锁被占用且持锁进程存活时不抢占、超时放弃', () => {
   const mfs = makeMemFs()
   const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir, alive: () => true })
@@ -2022,6 +2103,23 @@ function makeHealthApp ({ fs, cacheDir = dir, alive = () => false, start = 'abc'
 
 const healthPath = dir + '/channel-health.state'
 
+// C1-008：同时抓 warn/error，供「errno 透出 vs 谎报另一轮」两侧断言
+async function runHealthWithCapturedConsole (app) {
+  const origWarn = console.warn
+  const origError = console.error
+  const warns = []
+  const errs = []
+  console.warn = (...a) => warns.push(a.map(String).join(' '))
+  console.error = (...a) => errs.push(a.map(String).join(' '))
+  try {
+    await app._updateChannelHealth({ successfulChannels: ['pushplus'], failures: [] })
+  } finally {
+    console.warn = origWarn
+    console.error = origError
+  }
+  return { warns, errs }
+}
+
 check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })
@@ -2055,6 +2153,60 @@ check('通道健康锁: 非 EEXIST 异常（如权限）直接返回 -1 不得�
   mfs.openSync = (p, flags) => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e }
   const app = makeHealthApp({ fs: mfs })
   assert.strictEqual(app._tryAcquireChannelHealthLock(healthPath + '.lock'), -1, 'EACCES 必须立即放弃')
+})
+
+// ----- C1-008 回归：锁失败必须按 errno 分类透出，不得一律谎报「正由另一轮更新」-----
+checkAsync('通道健康锁: 非 EEXIST（EACCES）锁失败须打印 errno，不得谎报「正由另一轮更新」', async () => {
+  const mfs = makeMemFs()
+  mfs.openSync = () => { const e = new Error('EACCES: permission denied, open ...'); e.code = 'EACCES'; throw e }
+  const app = makeHealthApp({ fs: mfs })
+  const { warns, errs } = await runHealthWithCapturedConsole(app)
+  assert.ok(errs.some(m => m.includes('EACCES')), `锁获取失败必须在错误日志里带 errno：errs=${JSON.stringify(errs)}`)
+  assert.strictEqual(warns.some(m => m.includes('正由另一轮更新')), false,
+    `非 EEXIST 失败不得谎报另一轮占用：warns=${JSON.stringify(warns)}`)
+})
+
+checkAsync('通道健康锁: 陈旧锁 unlink 失败（EROFS）须打印 errno，不得谎报「正由另一轮更新」', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath + '.lock', '999999:dead')
+  mfs._touch(healthPath + '.lock', Date.now() - 20000)
+  mfs.unlinkSync = () => { const e = new Error('EROFS: read-only file system'); e.code = 'EROFS'; throw e }
+  const app = makeHealthApp({ fs: mfs, alive: () => false })
+  const { warns, errs } = await runHealthWithCapturedConsole(app)
+  assert.ok(errs.some(m => m.includes('EROFS')), `unlink 失败必须在错误日志里带 errno：errs=${JSON.stringify(errs)}`)
+  assert.strictEqual(warns.some(m => m.includes('正由另一轮更新')), false,
+    `unlink 失败不得谎报另一轮占用：warns=${JSON.stringify(warns)}`)
+})
+
+checkAsync('通道健康锁: 抢占后二次 open 失败（EACCES）须打印 errno，不得谎报「正由另一轮更新」', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath + '.lock', '999999:dead')
+  mfs._touch(healthPath + '.lock', Date.now() - 20000)
+  const realOpen = mfs.openSync
+  let wxCalls = 0
+  mfs.openSync = (p, flags) => {
+    if (flags === 'wx') {
+      wxCalls++
+      if (wxCalls === 2) { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e }
+    }
+    return realOpen(p, flags)
+  }
+  const app = makeHealthApp({ fs: mfs, alive: () => false })
+  const { warns, errs } = await runHealthWithCapturedConsole(app)
+  assert.strictEqual(wxCalls, 2, '陈旧锁回收后必须再试一次 open')
+  assert.ok(errs.some(m => m.includes('EACCES')), `二次 open 失败必须在错误日志里带 errno：errs=${JSON.stringify(errs)}`)
+  assert.strictEqual(warns.some(m => m.includes('正由另一轮更新')), false,
+    `二次 open 失败不得谎报另一轮占用：warns=${JSON.stringify(warns)}`)
+})
+
+checkAsync('通道健康锁: EEXIST+持有者存活仍打印「正由另一轮更新」（真实并发不得被说成故障）', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath + '.lock', '999999:x')
+  mfs._touch(healthPath + '.lock', Date.now())
+  const app = makeHealthApp({ fs: mfs, alive: () => true })
+  const { warns, errs } = await runHealthWithCapturedConsole(app)
+  assert.ok(warns.some(m => m.includes('正由另一轮更新')), `持有者存活必须按并发处理：warns=${JSON.stringify(warns)}`)
+  assert.strictEqual(errs.length, 0, `真实并发不应进错误日志：errs=${JSON.stringify(errs)}`)
 })
 
 check('恢复认领: _newChannelRecoverClaim 两次生成不重复（含 pid 前缀）', () => {

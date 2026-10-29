@@ -4,6 +4,7 @@
 // exitIfDirectRun（直跑 process.exit、被 require 则 throw）；夹具 yml 通过 MUTATION_WORKFLOW_TEXT 注入。
 const assert = require('assert')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const { spawnSync } = require('child_process')
 
@@ -153,6 +154,11 @@ function run (ymlText) {
     `应报生产文件未列入 mutate 目标（stderr），实际 stderr: ${omitFile.stderr}`)
   assert.ok(!omitFile.stderr.includes('未在 mutation.yml 中解析到任何 mutate 行段'),
     '漏条目场景不应命中早退守卫（说明后续校验确实执行了）')
+  // C10-009 接线证明：同一个「摘掉一个运行链模块」的夹具必须**同时**被新的双向判据点名——只导出
+  // 一个没人调用的判定函数不算修好，这条断言锁的是「判据接进了门禁主流程」。
+  const omittedRuntimeModule = fs.readdirSync(ROOT).find(f => /^xbk_.*\.js$/.test(f))
+  assert.ok(omitFile.stderr.includes(`运行链模块 ${omittedRuntimeModule} 既不是 mutation.yml 的 mutate 目标`),
+    `摘掉一个运行链模块必须被双向判据点名（C10-009 接线），实际 stderr 前 400 字：${omitFile.stderr.slice(0, 400)}`)
 
   // ===== 路径越出仓库根目录 → exit 1（拒绝 ../ 越界）=====
   const pathTraversal = buildYml() + '          - name: outside\n            mutate: "../outside.js:1-10"\n'
@@ -438,6 +444,159 @@ function run (ymlText) {
       `真实 console-part11 必须是 5801-6500，实际 ${part11 && part11.start}-${part11 && part11.end}`)
     assert.ok(part12 && part12.start === 6501 && part12.end === lines,
       `真实 console-part12 必须是 6501-${lines}，实际 ${part12 && part12.start}-${part12 && part12.end}`)
+  }
+
+  // ===== C10-009 运行链候选集 ↔ mutate 清单双向核对（靶向反例）=====
+  // 背景：productionFiles 是手写清单、与 mutate 只做单向比对，运行链上被顶层 require 的模块（本次实测
+  // 3 个：filter-rules-paths / owner-only-mode / message-signature）既不在清单也不在 mutate 目标 ⇒
+  // 永久绿灯、零变异覆盖。下面直接驱动导出的判定函数（合成输入，不改仓库文件），并在最后用真实注入
+  // yml 证明新判据确实接进了门禁（不是「只导出了一个没人调用的函数」）。
+  {
+    const {
+      auditRuntimeChain, deriveRuntimeChain, MUTATION_EXEMPT, NON_RUNTIME_MUTATE_TARGETS
+    } = require('./scripts/check-mutation-ranges.js')
+    const relPath = 'scripts/filter-rules-paths.js'
+
+    // ① 正向：运行链模块既不是 mutate 目标、也没有豁免 ⇒ 必须报错并点名
+    const missing = auditRuntimeChain({
+      chain: ['xbk_utils.js', relPath], mutateTargets: new Set(['xbk_utils.js']), exempt: new Map(), nonRuntime: new Map()
+    })
+    assert.strictEqual(missing.errors.length, 1, `运行链模块无覆盖时必须恰好报 1 条错，实际 ${JSON.stringify(missing.errors)}`)
+    assert.ok(missing.errors[0].includes(relPath) && missing.errors[0].includes('既不是 mutation.yml 的 mutate 目标'),
+      `必须点名该模块并说明两条出路：${missing.errors[0]}`)
+
+    // ② 带理由的显式豁免 ⇒ 通过（豁免是「登记缺口」，不是「静默忽略」）
+    const exempted = auditRuntimeChain({
+      chain: ['xbk_utils.js', relPath],
+      mutateTargets: new Set(['xbk_utils.js']),
+      exempt: new Map([[relPath, '纯路径构造助手，行为由 filter-store 套件经调用方覆盖']]),
+      nonRuntime: new Map()
+    })
+    assert.deepStrictEqual(exempted.errors, [], `带理由的豁免应通过，实际 ${JSON.stringify(exempted.errors)}`)
+
+    // ③ 空理由的豁免 ⇒ 红（否则「豁免」退化成「删掉判据」）
+    const blank = auditRuntimeChain({
+      chain: [relPath], mutateTargets: new Set(), exempt: new Map([[relPath, '   ']]), nonRuntime: new Map()
+    })
+    assert.strictEqual(blank.errors.length, 1, '豁免理由为空必须判红')
+    assert.ok(blank.errors[0].includes('豁免理由为空'), `必须点名「理由为空」：${blank.errors[0]}`)
+
+    // ④ 反向：mutate 目标不在运行链上、也没有「非运行时」标注 ⇒ 必须报错
+    const reverse = auditRuntimeChain({
+      chain: ['xbk_utils.js'],
+      mutateTargets: new Set(['xbk_utils.js', 'scripts/console.js']),
+      exempt: new Map(),
+      nonRuntime: new Map()
+    })
+    assert.strictEqual(reverse.errors.length, 1, `反向漏标注必须恰好报 1 条错，实际 ${JSON.stringify(reverse.errors)}`)
+    assert.ok(reverse.errors[0].includes('scripts/console.js') && reverse.errors[0].includes('既不在运行链上'),
+      `必须点名该 mutate 目标并说明缺标注：${reverse.errors[0]}`)
+
+    // ⑤ 补上「非运行时」标注 ⇒ 通过；理由为空 ⇒ 红
+    const annotated = auditRuntimeChain({
+      chain: ['xbk_utils.js'],
+      mutateTargets: new Set(['xbk_utils.js', 'scripts/console.js']),
+      exempt: new Map(),
+      nonRuntime: new Map([['scripts/console.js', '独立 CLI，不经运行入口 require']])
+    })
+    assert.deepStrictEqual(annotated.errors, [], `带理由的非运行时标注应通过，实际 ${JSON.stringify(annotated.errors)}`)
+    const blankNonRuntime = auditRuntimeChain({
+      chain: ['xbk_utils.js'],
+      mutateTargets: new Set(['xbk_utils.js', 'scripts/console.js']),
+      exempt: new Map(),
+      nonRuntime: new Map([['scripts/console.js', '']])
+    })
+    assert.strictEqual(blankNonRuntime.errors.length, 1, '「非运行时」标注理由为空必须判红')
+    assert.ok(blankNonRuntime.errors[0].includes('标注理由为空'), `必须点名理由为空：${blankNonRuntime.errors[0]}`)
+
+    // ⑥ 过期条目：两张表都必须随代码演进自动失效（否则表本身成为新盲区）
+    const staleExempt = auditRuntimeChain({
+      chain: ['xbk_utils.js'],
+      mutateTargets: new Set(['xbk_utils.js']),
+      exempt: new Map([['scripts/gone-away.js', '早已删除的模块']]),
+      nonRuntime: new Map()
+    })
+    assert.strictEqual(staleExempt.errors.length, 1, '豁免表里的过期条目必须判红')
+    assert.ok(staleExempt.errors[0].includes('豁免已过期'), `必须点名豁免过期：${staleExempt.errors[0]}`)
+    const staleNonRuntime = auditRuntimeChain({
+      chain: ['xbk_utils.js'],
+      mutateTargets: new Set(['xbk_utils.js']),
+      exempt: new Map(),
+      nonRuntime: new Map([['scripts/console.js', '已在矩阵里删掉的目标']])
+    })
+    assert.strictEqual(staleNonRuntime.errors.length, 1, '「非运行时」表里的过期条目必须判红')
+    assert.ok(staleNonRuntime.errors[0].includes('标注已过期'), `必须点名标注过期：${staleNonRuntime.errors[0]}`)
+
+    // ⑦ 同一模块同时出现在两张表 ⇒ 口径互斥，必须红
+    const both = auditRuntimeChain({
+      chain: [relPath],
+      mutateTargets: new Set(),
+      exempt: new Map([[relPath, '理由 A']]),
+      nonRuntime: new Map([[relPath, '理由 B']])
+    })
+    assert.ok(both.errors.some(e => e.includes('两个口径互斥')), `同模块出现在两张表必须判红：${JSON.stringify(both.errors)}`)
+
+    // ⑧ 真实仓库：派生集必须真的包含这三个模块（本次修复的对象本身，缺一条说明派生逻辑退化了）
+    const real = deriveRuntimeChain()
+    for (const file of ['scripts/filter-rules-paths.js', 'scripts/owner-only-mode.js', 'scripts/message-signature.js']) {
+      assert.ok(real.chain.includes(file), `运行链派生必须包含 ${file}（它被运行入口无条件 require）`)
+      assert.ok(MUTATION_EXEMPT.has(file), `${file} 必须在 MUTATION_EXEMPT 里有显式豁免（否则真实门禁必红）`)
+    }
+    assert.ok(real.chain.includes('xbk_utils.js') && real.chain.includes('qinglong/xbk_push.js'),
+      '运行链派生必须包含运行入口与它 require 的生产模块（派生逻辑退化成空集时上面的断言才有意义）')
+    assert.ok(NON_RUNTIME_MUTATE_TARGETS.has('scripts/console.js') && NON_RUNTIME_MUTATE_TARGETS.has('scripts/check-deps.js'),
+      '「非运行时」标注必须覆盖矩阵里那两个不在 require 闭包内的脚本（否则真实门禁必红）')
+    console.log(`✅ 运行链双向核对断言通过（派生 ${real.chain.length} 个模块；豁免 ${MUTATION_EXEMPT.size} 条、非运行时标注 ${NON_RUNTIME_MUTATE_TARGETS.size} 条）`)
+  }
+
+  // ===== 运行链解析：目录形式 `require('./dir')` 必须解析到 dir/index.js（CodeRabbit #362-g2）=====
+  // 旧实现把候选拼成 `base + path.join('index.js')`（等价 `base + 'index.js'`），对 `require('./lib')`
+  // 得到的是 <root>/libindex.js ⇒ 目录 require 永远解析不到，该分支是死代码：运行链少一个模块，
+  // 门禁照绿、模块零变异覆盖。这里用**仓库外临时夹具**（跑完即删，不进 git）把四条解析规则一起钉死：
+  // 目录 index.js、裸名按仓库根、无扩展名补 .js、以及 .js > .cjs > .mjs 的优先级。
+  {
+    const { deriveRuntimeChain } = require('./scripts/check-mutation-ranges.js')
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-runtime-chain-'))
+    const write = (rel, body) => {
+      fs.mkdirSync(path.dirname(path.join(fixtureRoot, rel)), { recursive: true })
+      fs.writeFileSync(path.join(fixtureRoot, rel), body)
+    }
+    try {
+      write('entry.js', [
+        "require('./lib')", // 目录 ⇒ lib/index.js（旧实现漏掉的正样本）
+        "require('./plain')", // 无扩展名 ⇒ plain.js
+        "require('./cjs-mod')", // 无扩展名 ⇒ cjs-mod.cjs
+        "require('./mjs-mod')", // 无扩展名 ⇒ mjs-mod.mjs
+        "require('./dup')", // 同名多后缀 ⇒ .js 优先
+        "require('shared')" // 裸名 ⇒ 按仓库根解析
+      ].join('\n'))
+      write('lib/index.js', 'module.exports = {}\n')
+      write('plain.js', 'module.exports = {}\n')
+      write('cjs-mod.cjs', 'module.exports = {}\n')
+      write('mjs-mod.mjs', 'module.exports = {}\n')
+      write('dup.js', 'module.exports = {}\n')
+      write('dup.cjs', 'module.exports = {}\n')
+      write('shared.js', 'module.exports = {}\n')
+
+      const { chain } = deriveRuntimeChain(['entry.js'], fixtureRoot)
+      const expect = ['entry.js', 'lib/index.js', 'plain.js', 'cjs-mod.cjs', 'mjs-mod.mjs', 'dup.js', 'shared.js']
+      for (const file of expect) {
+        assert.ok(chain.includes(file),
+          `运行链必须包含 ${file}，实际 ${JSON.stringify(chain)}`)
+      }
+      assert.deepStrictEqual([...chain].sort((a, b) => a.localeCompare(b)), [...expect].sort((a, b) => a.localeCompare(b)),
+        `运行链不得多解析出仓库里不存在的候选，实际 ${JSON.stringify(chain)}`)
+      assert.ok(!chain.some(f => f.includes('index.jsindex.js') || /libindex\.js$/.test(f)),
+        `不得把目录 require 拼成 <dir>index.js 这种畸形候选，实际 ${JSON.stringify(chain)}`)
+
+      // 反向：解析不到的相对路径不得凭猜测进链（否则上面「包含 index.js」会退化成万能通过）
+      const miss = deriveRuntimeChain(['missing-entry.js'], fixtureRoot)
+      assert.deepStrictEqual(miss.chain, [],
+        `不存在的入口不得进链，实际 ${JSON.stringify(miss.chain)}`)
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+    console.log('✅ 运行链解析断言通过（目录 index.js / 裸名 / .js·.cjs·.mjs 优先级）')
   }
 
   console.log('test_check_mutation_ranges OK')
