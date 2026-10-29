@@ -3673,6 +3673,73 @@ async function main () {
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 401（CSRF 面）')
     server.close()
   })
+  // backlog b3 / C2-002：四个改状态端点（备份导入 / 手动触发 / 通知自检 / 停止任务）此前只靠全局
+  // authorize()，而它对任意方法都放行 `?token=`（URL 查询串凭证），与过滤写端点的「写面仅 Bearer」
+  // 不一致。这里把「URL 凭证不得用于写」钉在行为上：400 query_token_not_allowed，且拒绝必须发生在
+  // readBody / 取锁 / spawn 之前（无任何副作用）；同一端点用 Bearer 仍照常进业务层。
+  await aok('HTTP: 改状态端点拒绝 URL query token（C2-002）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // runs 是模块级 Map（跨实例共享），只能比增量——断言「本次没有新记录」。
+    const runsBefore = runs.size
+    const lockFile = path.join(dir, 'console-trigger.lock')
+    const lastAcceptFile = path.join(dir, 'console-lastaccept.json')
+    const viaQueryUrl = '?token=' + encodeURIComponent(TOKEN)
+    // 四条端点各配一个「鉴权之后必然确定的」分支：导入=坏 JSON、触发=非法动作、取消=不存在的 id、
+    // 自检=重放窗（预置 30s 帧），都不 spawn 真实子进程、不落盘。
+    const endpoints = [
+      ['/api/backup/import', '{}'],
+      ['/trigger', 'action=check'],
+      ['/api/notify-test', ''],
+      ['/api/runs/cancel', 'id=1700000000000.1']
+    ]
+    try {
+      for (const [endpoint, body] of endpoints) {
+        const viaQuery = await request(port, 'POST', endpoint + viaQueryUrl, { body })
+        assert.strictEqual(viaQuery.status, 400, `${endpoint} 带 ?token= 必须 400`)
+        assert.strictEqual(JSON.parse(viaQuery.text).code, 'query_token_not_allowed', `${endpoint} 错误码`)
+        // 即使同时带合法 Bearer 也拒绝：URL 里的凭证不得被当成可用写法（与过滤写端点同口径）。
+        const both = await request(port, 'POST', endpoint + viaQueryUrl, { token: TOKEN, body })
+        assert.strictEqual(both.status, 400, `${endpoint} ?token= + Bearer 仍必须 400`)
+        assert.strictEqual(JSON.parse(both.text).code, 'query_token_not_allowed')
+        // 仅 Cookie：写面不收 Cookie（CSRF 面），错误码要具体到 cookie_not_allowed。
+        const cookieOnly = await request(port, 'POST', endpoint, {
+          body,
+          headers: { cookie: `xbk_session=${TOKEN}` }
+        })
+        assert.strictEqual(cookieOnly.status, 401, `${endpoint} 仅 Cookie 必须 401`)
+        assert.strictEqual(JSON.parse(cookieOnly.text).code, 'cookie_not_allowed')
+      }
+      // 拒绝发生在副作用之前：没有运行记录（不 spawn）、没有触发锁、没有重放帧。
+      assert.strictEqual(runs.size, runsBefore, '被拒请求不得创建运行记录')
+      assert.strictEqual(fs.existsSync(lockFile), false, '被拒请求不得取触发锁')
+      assert.strictEqual(fs.existsSync(lastAcceptFile), false, '被拒请求不得写重放帧')
+      // 反向：Bearer 照常通过鉴权（各自走到鉴权之后的确定性分支，不 spawn）。
+      const importBadJson = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: '{not-json'
+      })
+      assert.strictEqual(importBadJson.status, 400, 'Bearer 应已过鉴权（导入坏 JSON 400）')
+      assert.strictEqual(JSON.parse(importBadJson.text).code, 'invalid_json')
+      const triggerBadAction = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=hack' })
+      assert.strictEqual(triggerBadAction.status, 400, 'Bearer 应已过鉴权（非法动作 400）')
+      assert.strictEqual(JSON.parse(triggerBadAction.text).error, '未知 action')
+      const cancelMissing = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1700000000000.1' })
+      assert.strictEqual(cancelMissing.status, 404, 'Bearer 应已过鉴权（不存在的 id 404）')
+      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1700000000000.7' } }))
+      const notifyReplay = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+      assert.strictEqual(notifyReplay.status, 409, 'Bearer 应已过鉴权（60s 窗内重放 409）')
+      assert.strictEqual(JSON.parse(notifyReplay.text).replayBlocked, true)
+      // 只读端点不能跟着被砍：GET 仍接受 ?token=（浏览器开页/EventSource 用法）。
+      const readViaQuery = await request(port, 'GET', '/api/runs' + viaQueryUrl)
+      assert.strictEqual(readViaQuery.status, 200, '只读端点仍接受 ?token=')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
   await aok('HTTP: notify-test 60s 独立重放窗行为区分（K3）', async () => {
     // 两个独立实例（独立 stateDir）：lastAccept 是「内存 Map + 实时读盘合并（at 更大者胜）」，
     // 同一实例内先写 30s 帧再改盘为 61s 帧不会生效（内存 30s 帧更权威）。

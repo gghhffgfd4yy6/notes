@@ -1825,6 +1825,15 @@ const FILTER_WRITE_PATHS = new Set([
   '/api/config/filter/restore',
   '/api/config/filter/draft'
 ])
+// 改状态端点（C2-002）：这些请求会落盘或起子进程，鉴权必须与过滤写端点同口径（Bearer-only）。
+// 全局 authorize() 对**任意方法**都放行 `?token=`（浏览器开页兼容路径），拿它当写端点的唯一闸
+// 会让「URL 查询串里的凭证」直接可用于写——token 进访问日志/历史/Referer 后就不再是只读暴露。
+const STATE_CHANGING_PATHS = new Set([
+  '/api/backup/import',
+  '/trigger',
+  '/api/notify-test',
+  '/api/runs/cancel'
+])
 
 function sha256Hex (text) {
   return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex')
@@ -5444,6 +5453,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       handleFilterDraftDelete(req, res)
       return
+    }
+    // 改状态端点（C2-002）：不再只靠下面的全局 authorize()——它对任意方法都放行 `?token=`。
+    // 这里按写面口径（Bearer-only）复判一次：URL 带 token ⇒ 400 query_token_not_allowed（即使
+    // 同时带合法 Bearer），仅 Cookie ⇒ 401 cookie_not_allowed。复判在任何 readBody / 取锁 /
+    // spawn 之前，所以「被拒 = 零副作用」；只读端点不受影响（仍走全局 authorize 的 GET 口径）。
+    if (req.method === 'POST' && STATE_CHANGING_PATHS.has(url.pathname)) {
+      const verdict = writeAuthVerdict(req, url.searchParams, token)
+      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
     }
     if (!deviceTrusted && !authorize(req, token, url.searchParams)) {
       // 审查 #224：GET / 未授权时给可自助恢复的登录页，而不是裸 JSON；API/静态资源仍回 JSON。
