@@ -1389,15 +1389,26 @@ console.log('========================================\n');
       assert(primitiveError.failures[0] && primitiveError.failures[0].channel === 'server酱', `原始异常应带通道名: ${JSON.stringify(primitiveError.failures[0])}`)
       assert(primitiveError.failures[0].message.includes('primitive transport failure'), '原始异常应保留诊断消息')
       // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
+      // C5-036：failPost 是全局开关，没法只让一个通道失败——旧的「部分成功」半段其实只测了单通道成功
+      // （名字与执行分支不符），这里按 URL 局部覆写 got.post，构造真正的「一成一败」。
       failPost = false
       cfg.BARK_PUSH = 'https://api.day.app/dev1'
-      // Server酱失败（SCT URL）→ 用 failPost 只影响 Server酱？——mock 是全局的……
-      // 简化：直接验证"至少一个成功即 resolve"（Server酱单独成功）
-      cfg.BARK_PUSH = ''
-      failPost = false
-      let ok = false
-      try { await notify.sendNotify('标题', '内容'); ok = true } catch (e) { ok = false }
-      assert(ok, '单通道成功应 resolve')
+      const originalPost = require.cache[gotPath].exports.post
+      require.cache[gotPath].exports.post = (url, options) => {
+        gotCalls.push({ url, options })
+        if (String(url).includes('ftqq.com')) return Promise.reject(new Error('server酱 通道失败'))
+        return { then: (res) => res({ body: { code: 200, message: 'success' }, statusCode: 200, headers: {} }) }
+      }
+      try {
+        const r = await notify.sendNotify('标题', '内容').then(v => ({ ok: true, v }), e => ({ ok: false, e }))
+        assert(r.ok, `部分成功应 resolve，实际 reject: ${r.e && r.e.message}`)
+        assert(Array.isArray(r.v.failures) && r.v.failures.some(f => f.channel === 'server酱'),
+          `部分成功时必须回报失败通道（供健康统计/下次重试）：${JSON.stringify(r.v.failures)}`)
+        assert(r.v.successfulChannels.includes('bark'), `成功通道应含 bark: ${JSON.stringify(r.v.successfulChannels)}`)
+        assert(gotCalls.some(c => String(c.url).includes('api.day.app')), 'Bark 必须真的被调用（否则不是部分成功，是全跳过）')
+      } finally {
+        require.cache[gotPath].exports.post = originalPost
+      }
     } finally {
       failPost = false
     }
@@ -1702,6 +1713,53 @@ console.log('========================================\n');
     const bad = audit(acorn.parse(fsx.readFileSync(__filename, 'utf8'), { ecmaVersion: 'latest', locations: true }))
     assert(bad.length === 0,
       `桩开关置 true 后缺 finally 复位（断言失败会污染后续用例）：${bad.map(b => `${b.name}@${b.line}`).join(', ')}`)
+  })
+
+  // C5-036：用例体内的死赋值（赋值后只隔注释就被同名覆盖 ⇒ 那一行从没被读过）与「名字承诺的
+  // 分支没被执行」。典型：旧「部分成功」半段先设 cfg.BARK_PUSH 再立刻清空，实际只测了单通道成功。
+  await test('C5-036: 无死赋值；用例名承诺的分支必须真的被执行', () => {
+    const fsx = require('fs')
+    const acorn = require('acorn')
+    const src = fsx.readFileSync(__filename, 'utf8')
+    const lines = src.split('\n')
+    const deadStore = (rows) => {
+      const out = []
+      rows.forEach((ln, i) => {
+        const m = ln.match(/^\s*(cfg\.[A-Za-z_]+) = (.+)$/)
+        if (!m) return
+        let j = i + 1
+        while (j < rows.length) {
+          const t = rows[j].trim()
+          if (t === '' || t.startsWith('//')) { j++; continue }
+          if (new RegExp('^\\s*' + m[1].replace('.', '\\.') + ' = ').test(rows[j])) out.push(i + 1)
+          break
+        }
+      })
+      return out
+    }
+    // 判据自检：示例里只有第 1 条是死赋值（第 2 条中间隔着一次调用，可能已被读取）
+    const sample = ['cfg.A = 1', '// 注释', '', 'cfg.A = 2', 'await go()', 'cfg.A = 3']
+    assert(deadStore(sample).join(',') === '1', `判据自检：死赋值应只认出第 1 条，实际 ${JSON.stringify(deadStore(sample))}`)
+    const dead = deadStore(lines)
+    assert(dead.length === 0, `死赋值（赋完只隔注释/空行就被同名覆盖，值从未被读取）：第 ${dead.join(', ')} 行`)
+    // 名字与被执行的分支必须一致：声称「部分成功」就必须真有一个通道失败、另一个成功。
+    // 用 AST 取回调源码范围（行窗口会被体内嵌套的 `})` 截断）。
+    const bad = []
+    ;(function walk (n) {
+      if (!n || typeof n !== 'object') return
+      if (Array.isArray(n)) return n.forEach(walk)
+      if (n.type === 'CallExpression' && n.callee && n.callee.name === 'test' &&
+          n.arguments[0] && n.arguments[0].type === 'Literal' && String(n.arguments[0].value).includes('部分成功')) {
+        const body = src.slice(n.arguments[1].start, n.arguments[1].end)
+        if (!body.includes('exports.post =')) bad.push(`第 ${n.loc.start.line} 行「${n.arguments[0].value}」`)
+      }
+      for (const k of Object.keys(n)) {
+        if (['loc', 'start', 'end'].includes(k)) continue
+        const v = n[k]
+        if (v && typeof v === 'object') walk(v)
+      }
+    })(acorn.parse(src, { ecmaVersion: 'latest', locations: true }))
+    assert(bad.length === 0, `用例名承诺「部分成功」，但体内没有按通道构造「一成一败」：${bad.join('；')}`)
   })
 
   if (failed === 0) {
