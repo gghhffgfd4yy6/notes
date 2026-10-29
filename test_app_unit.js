@@ -14,9 +14,14 @@ const { createApp } = require('./xbk_app.js')
 
 let passed = 0
 let failed = 0
+// 声明数（C5-004）：每注册一条用例（同步 check / 异步 checkAsync）就 +1，与「结算数 passed+failed」
+// 对账。asyncChecks 曾靠「for…of 读活数组」顺带跑到 drain 之后注册的用例，一旦 drain 前移或
+// 注册前出现真正的异步等待，那些用例会静默不跑且没有任何计数可看出来。
+let declared = 0
 const failures = []
 
 function check (name, fn) {
+  declared += 1
   try {
     fn()
     passed++
@@ -897,7 +902,7 @@ check('_persistReportState 落盘前先 normalize（字符串计数转数字、�
 // ============================================================================
 
 const asyncChecks = []
-function checkAsync (name, fn) { asyncChecks.push([name, fn]) }
+function checkAsync (name, fn) { declared += 1; asyncChecks.push([name, fn]) }
 
 async function withCaptureAsync (level, fn) {
   const orig = console[level]
@@ -1715,25 +1720,6 @@ checkAsync('_sendAlert 留痕把连续换行折叠成一个空格（+ 量词与�
   await withFixedNowAsync(now, () => silentAlert(app, new Error('前段\n\n后段')))
   assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：前段 后段\n'])
 })
-
-// ===== 异步用例执行（同步用例已在上方跑完）=====
-;(async () => {
-  for (const [name, fn] of asyncChecks) {
-    try {
-      await fn()
-      passed++
-    } catch (e) {
-      failed++
-      failures.push(`${name} :: ${e.message}`)
-    }
-  }
-  console.log(`通过 ${passed} / 失败 ${failed}`)
-  if (failed > 0) {
-    for (const f of failures) console.log(`  ❌ ${f}`)
-    process.exit(1)
-  }
-  process.exit(0)
-})().catch(e => { console.error(e); process.exitCode = 1 })
 
 // ===== RE2 缺失警告簇（RE2 警告标记生命周期：pending→completed/回收/7天清理）=====
 // 全部经 makeApp 注入的内存 fs 桩运行，不触碰真实缓存目录。
@@ -2844,3 +2830,29 @@ checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默�
     else process.env.XBK_DRY_RUN = prevDryRun
   }
 })
+
+// ===== 异步用例执行（必须留在文件末尾）=====
+// C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
+// 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
+// 现在：① 移到文件末尾；② 先快照 asyncChecks 再跑；③ 对账「声明数 === 结算数」。
+;(async () => {
+  const pending = asyncChecks.slice()
+  for (const [name, fn] of pending) {
+    try {
+      await fn()
+      passed++
+    } catch (e) {
+      failed++
+      failures.push(`${name} :: ${e.message}`)
+    }
+  }
+  console.log(`通过 ${passed} / 失败 ${failed}（声明 ${declared} 例）`)
+  if (failed > 0) {
+    for (const f of failures) console.log(`  ❌ ${f}`)
+  }
+  if (passed + failed !== declared) {
+    console.log(`  ❌ 用例计数对账失败：声明 ${declared} 例，实际结算 ${passed + failed} 例（${declared - passed - failed} 例永远不会被执行）`)
+    process.exit(1)
+  }
+  process.exit(failed > 0 ? 1 : 0)
+})().catch(e => { console.error(e); process.exitCode = 1 })

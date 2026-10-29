@@ -4379,14 +4379,40 @@ console.log('========================================\n');
       'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
   })
 
+  // ---------- 计数对账（C5-004）----------
+  // 过滤跳过被计成「通过」（test() 里 skipped++ 紧跟 passed++），executed 原先只进打印；于是
+  // `--only=<写错的子串>` 或 `--list-file` 名单对不上时，0 例真的执行也打印「🎉 全部通过 N/N」
+  // 并 exit 0 —— 门禁看着全绿，实际一条用例都没跑。这里把几类计数互相钉住，任一不成立即判失败。
+  const reconcile = []
+  try {
+    assertEqualNum(executed, passed + failed - skipped,
+      `执行计数不自洽：executed=${executed}，passed+failed-skipped=${passed + failed - skipped}（跳过的用例不得计入通过数）`)
+    assert(executed > 0,
+      `本轮 0 例真的执行（过滤跳过 ${skipped} 例；${onlyFilter ? `--only=${onlyFilter}` : nameSet ? '--list-file 名单未命中任何用例' : '无过滤'}）——` +
+      '过滤条件/名单写错不得当成「全部通过」，必须判失败')
+    if (!onlyFilter && !nameSet) {
+      assertEqualNum(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
+      // 独立分母：源码里声明的用例数（与 test_app_p.js 同名提取口径）。只对账 passed 说明不了
+      // 「有没有漏跑」——passed 含跳过，恒等于用例总数。
+      const declared = [...fs.readFileSync(__filename, 'utf8').matchAll(/await test\((['"])(.*?)\1,/g)].length
+      assertEqualNum(executed, declared, `无过滤时必须跑满声明用例：声明 ${declared} 例，实际执行 ${executed} 例`)
+    }
+  } catch (e) {
+    reconcile.push(e.message)
+  }
+
   const filterNote = (onlyFilter || nameSet)
     ? `（实际执行 ${executed} 例，过滤跳过 ${skipped} 例${onlyFilter ? `，--only=${onlyFilter}` : ''}）`
     : ''
-  if (failed === 0) {
+  if (failed === 0 && reconcile.length === 0) {
     console.log(`  🎉 集成测试全部通过！${passed}/${passed}${filterNote}`)
   } else {
     console.log(`  ⚠️   ${passed} 通过, ${failed} 失败${filterNote}`)
     errors.forEach(e => console.log(`    ${e}`))
+    if (reconcile.length > 0) {
+      console.log('  ⚠️   用例计数对账失败（本次结果不可信，按失败处理）：')
+      reconcile.forEach(e => console.log(`    ${e}`))
+    }
   }
   console.log('========================================\n')
 
@@ -4406,5 +4432,16 @@ console.log('========================================\n');
     } catch (e) { /* 忽略 */ }
   }
 
-  process.exit(failed > 0 ? 1 : 0)
+  // worker 执行计数回报（C5-004）：test_app_p.js 的 stdio 是 inherit，父进程读不到子进程 stdout，
+  // 只能落一份报告文件供其断言「Σexecuted === 名单总数」（否则名单写错时 0 例执行也算全绿）。
+  const reportPath = process.env.XBK_TEST_APP_REPORT
+  if (reportPath) {
+    try {
+      fs.writeFileSync(reportPath, JSON.stringify({ executed, skipped, passed, failed }))
+    } catch (e) {
+      console.log(`  ⚠️   执行计数报告写入失败（并行调度器将无法对账）：${e.message}`)
+    }
+  }
+
+  process.exit(failed > 0 || reconcile.length > 0 ? 1 : 0)
 })().catch(e => { console.error(e); process.exitCode = 1 })
