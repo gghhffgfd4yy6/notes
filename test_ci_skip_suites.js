@@ -935,29 +935,20 @@ assert.deepStrictEqual(uncovered, [],
   }
   assert.ok(pathsIgnore.length > 0, 'push 触发应有非空 paths-ignore（否则本断言失去守护对象）')
 
-  // gitignore/minimatch 子集匹配器（只需支持本仓库实际会用的形态：字面路径、`**/*.ext`、`dir/**`）
-  const toRe = (p) => {
-    let re = ''
-    for (let i = 0; i < p.length; i++) {
-      const c = p[i]
-      if (c === '*') {
-        if (p[i + 1] === '*') { // `**` → 任意层级
-          if (p[i + 2] === '/') { re += '(?:[^/]+/)*'; i += 2 } else { re += '.*'; i += 1 }
-        } else re += '[^/]*'
-      } else if (c === '?') re += '[^/]'
-      else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    }
-    return new RegExp('^' + re + '$')
-  }
-  const matchers = pathsIgnore.map(p => ({ p, re: toRe(p) }))
-  const matchedBy = (rel) => matchers.filter(m => m.re.test(rel)).map(m => m.p)
+  // 匹配器：Node 内置 path.matchesGlob（minimatch 口径，与本仓 engines>=22.22.2 已满足 22.5 的要求）。
+  // 这里曾有一份手写的 glob→RegExp 转换（只支持字面路径 / `**/*.ext` / `dir/**` 子集），与
+  // path.matchesGlob 实测在「`.` 开头的路径段」上分歧（手写版把 `.local/x.md` 判给 `**/*.md`，
+  // 而 Node 与 GitHub 的 path filter 都判否）⇒ 判据必须与真实闸门同源，故收敛到同一个实现（C4-021）。
+  const matchers = pathsIgnore.map(p => ({ p }))
+  const matchedBy = (rel) => matchers.filter(m => path.matchesGlob(rel, m.p)).map(m => m.p)
 
   // 匹配器自身的正向对照（防恒假：判据必须能认出 `**/*.md` 会命中 CHANGELOG.md）
   assert.deepStrictEqual(matchedBy('CHANGELOG.md'), [],
     'paths-ignore 不得命中 CHANGELOG.md：它是 check-version.js 版本闸门与 test_filter.js 第 101 章的输入')
-  assert.ok(toRe('**/*.md').test('CHANGELOG.md') && toRe('**/*.md').test('docs/a.md'),
+  assert.ok(path.matchesGlob('CHANGELOG.md', '**/*.md') && path.matchesGlob('docs/a.md', '**/*.md'),
     '匹配器对照：`**/*.md` 必须能命中 CHANGELOG.md（否则本断言恒真、形同虚设）')
-  assert.ok(!toRe('dir/**').test('dir') && toRe('dir/**').test('dir/a/b.js'), '匹配器对照：`dir/**` 应命中目录内部文件')
+  assert.ok(!path.matchesGlob('dir', 'dir/**') && path.matchesGlob('dir/a/b.js', 'dir/**'),
+    '匹配器对照：`dir/**` 应命中目录内部文件')
 
   // 显式「允许被忽略」清单：纯文档（无任何脚本/测试读取）+ 未入库的本机目录 + 议题模板
   const PROSE_DOCS = new Set([
