@@ -151,4 +151,137 @@ assert.deepStrictEqual(staleExemptions, [],
   console.log('✅ 注册表形状门禁：缺 name / 重复文件 / 重复套件名 三种坏条目均被 test_suites.js 加载期校验拦截')
 }
 
+// ============================================================
+// C10-027：scripts/tap-shim.js 的**运行期契约**必须有执行级用例。
+//
+// 此前该文件只在 CI 变异缓存 key 的字符串断言里出现（`hashFiles(… 'scripts/tap-shim.js')`）——
+// 改坏 shim 的判定/转发逻辑不会有任何东西变红。唯一已有的执行探针是 test_ci_skip_suites.js 的 3g5
+// （正常退出 0 / 非 0 退出 / fd 1 被 closeSync 三条**投递**路径），本段补它没覆盖的三块：
+//   ① stdout 全部让给 TAP：正文的 console.log 与 TAP 形状行必须改走 stderr，否则 tap-parser 会多解析
+//      出测试点、plan 不匹配（dry-run 假失败）；
+//   ② 跳过判定与 command 档同源：未注册 / integration / mutationSkip / SKIP_SUITES 一律 `ok # SKIP` +
+//      exit 0，**且正文不得执行**（判定必须发生在被测文件加载之前，否则「跳过」只是嘴上说说）；
+//   ③ argv[1] 缺失（tap-runner 没把被测文件传进来）必须响亮失败：not ok + 非 0 退出码。
+//
+// 为什么挂在本套件、不新建 test_tap_shim.js：shim 的第 2 项职责就是消费**注册表**（SUITES 的
+// integration/mutationSkip 与 SKIP_SUITES），本套件已经是注册表策略的对账方；而新建套件必须同步
+// test_suites.js 与 stryker.tap.config.js 的**顺序锁定**显式清单（后者在加载期按序对账两档测试集），
+// 为一个适配层扩大两处配置的改动面不划算。
+//
+// 夹具口径：**只复制 shim + 自带注册表**的临时沙箱。shim 用字面量相对路径 require
+// '../test_suites.js'（按 shim 自身解析），沙箱里换成夹具注册表，才能构造「未注册 / integration /
+// mutationSkip」三种形态而不动真注册表；被测文件正文写一个 sentinel 文件，用来证明「正文到底跑没跑」。
+// ============================================================
+{
+  const SANDBOX_REGISTRY =
+    'module.exports = { SUITES: [' +
+    "{ name: '普通', file: 'test_stub_plain.js', desc: '普通套件（应运行）' }," +
+    "{ name: '集成', file: 'test_stub_integration.js', desc: '集成套件', integration: true }," +
+    "{ name: '变异跳过', file: 'test_stub_mutationskip.js', desc: '沙箱内不可运行', mutationSkip: true }" +
+    '] }\n'
+
+  // registry: false ⇒ 沙箱里故意不放 test_suites.js（构造「注册表读不到」）
+  const makeShimSandbox = (withRegistry) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-tap-shim-'))
+    fs.mkdirSync(path.join(dir, 'scripts'))
+    fs.copyFileSync(path.join(ROOT, 'scripts', 'tap-shim.js'), path.join(dir, 'scripts', 'tap-shim.js'))
+    if (withRegistry) fs.writeFileSync(path.join(dir, 'test_suites.js'), SANDBOX_REGISTRY)
+    return dir
+  }
+
+  // 被测文件正文：写 sentinel（证明真的执行了）+ 往 stdout 打普通正文与一行 TAP 形状输出
+  const bodyFor = (sentinel) =>
+    "require('node:fs').writeFileSync(" + JSON.stringify(sentinel) + ", 'ran')\n" +
+    "console.log('ok 99 - 正文里的假测试点')\n" +
+    "console.log('普通正文行')\n" +
+    'process.exit(0)\n'
+
+  const runShimIn = (dir, args, envOverride) => {
+    const env = { ...process.env }
+    // 调用方环境（CI 的单元步骤设了 SKIP_SUITES）会改写本次探针的判定，默认清空
+    delete env.SKIP_SUITES
+    Object.assign(env, envOverride || {})
+    const r = spawnSync(process.execPath, ['-r', path.join(dir, 'scripts', 'tap-shim.js'), ...args],
+      { cwd: dir, encoding: 'utf8', env, timeout: 20000, killSignal: 'SIGKILL' })
+    assert.ok(!r.error && !r.signal,
+      `shim 探针未正常收场（error=${r.error && r.error.code} signal=${r.signal}）：挂死/被强杀必须明确失败，不得等外层超时`)
+    return r
+  }
+
+  // ① stdout 让给 TAP
+  const dir = makeShimSandbox(true)
+  try {
+    const sentinel = path.join(dir, 'body-ran')
+    const plain = path.join(dir, 'test_stub_plain.js')
+    fs.writeFileSync(plain, bodyFor(sentinel))
+    const r = runShimIn(dir, [plain])
+    assert.strictEqual(r.status, 0, `正常退出必须 exit 0（stderr: ${r.stderr.trim()}）`)
+    assert.strictEqual(fs.existsSync(sentinel), true, '前提：正常路径必须真的执行了被测文件正文（否则下面的断言都没意义）')
+    assert.strictEqual(r.stdout, 'TAP version 13\nok 1 - test_stub_plain.js\n1..1\n',
+      'stdout 必须只剩 TAP 三行：正文的 console.log 与 TAP 形状行一旦进入 TAP 流，tap-parser 会多解析出测试点、plan 不匹配')
+    assert.ok(r.stderr.includes('ok 99 - 正文里的假测试点'),
+      '正文的 TAP 形状行必须原样改走 stderr（改走可以，吞掉不行——那会改变被测文件的可观测行为）')
+    assert.ok(r.stderr.includes('普通正文行'), '正文的普通输出同样必须走 stderr')
+    assert.ok(r.stderr.includes('正文里出现过 1 行 TAP 形状输出'),
+      `shim 必须在退出时如实留证：正文里出现过几行 TAP 形状输出（实际 stderr：${JSON.stringify(r.stderr)}）`)
+
+    // ② 跳过判定与 command 档同源（四类），且必须在被测文件加载前生效
+    const skipCases = [
+      { file: 'test_stub_unregistered.js', env: {}, note: /未注册进 test_suites\.js/ },
+      { file: 'test_stub_integration.js', env: {}, note: /integration/ },
+      { file: 'test_stub_mutationskip.js', env: {}, note: /mutationSkip/ },
+      { file: 'test_stub_plain.js', env: { SKIP_SUITES: 'test_stub_plain.js' }, note: /SKIP_SUITES=/ }
+    ]
+    for (const c of skipCases) {
+      const p = path.join(dir, c.file)
+      fs.writeFileSync(p, bodyFor(sentinel))
+      fs.rmSync(sentinel, { force: true })
+      const s = runShimIn(dir, [p], c.env)
+      assert.strictEqual(s.status, 0, `${c.file}：跳过必须 exit 0（stderr: ${s.stderr.trim()}）`)
+      const skipLine = s.stdout.split('\n').find((l) => l.startsWith('ok 1 - ' + c.file + ' # SKIP '))
+      assert.ok(skipLine, `${c.file}：必须投出「ok 1 - <文件> # SKIP …」的跳过点（实际 stdout：${JSON.stringify(s.stdout)}）`)
+      assert.ok(c.note.test(skipLine), `${c.file}：跳过原因必须点明判定依据（实际：${skipLine}）`)
+      assert.ok(s.stdout.split('\n').includes('1..1'), `${c.file}：跳过点也必须带 plan 行 1..1`)
+      assert.strictEqual(fs.existsSync(sentinel), false,
+        `${c.file}：跳过必须在被测文件加载前生效（正文写了 sentinel = 仍在执行本应跳过的文件）`)
+    }
+
+    // ③ argv[1] 缺失：适配层没被 tap-runner 正确调用，必须响亮失败
+    const noArg = runShimIn(dir, ['-e', '0'])
+    assert.strictEqual(noArg.status, 1, 'argv[1] 缺失必须非 0 退出（否则适配层失效会静默变成全绿）')
+    assert.strictEqual(noArg.stdout, 'TAP version 13\nnot ok 1 - unknown # tap-shim 无法从 argv[1] 取到被测文件\n1..1\n',
+      'argv[1] 缺失必须投 not ok 点（非 0 退出无失败测试会被 tap-runner 记 RuntimeError，两种都响亮，但不能静默）')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+
+  // ④ C10-038：注册表读不到是**适配层自身失效**，不是「本文件该跳过」。
+  //    旧实现把它当成 skipReason ⇒ `ok 1 - … # SKIP` + exit 0，与注释声称的 fail-closed 相反：
+  //    tap-parser 会把这一条记成**通过**，于是「跳过集合无法与 command 档对齐」这件事在 TAP 档里
+  //    长得跟全绿一样（perTest 下零测试文件的段也不会有任何失败信号）。
+  //    正确语义：not ok + 非 0 退出（tap-runner 记 RuntimeError ⇒ 响亮），且不得执行被测文件。
+  //    附带契约：note 必须压成**单行** —— err.message 带 "Require stack:" 多行栈，直接拼进 TAP 点会把
+  //    一个测试点撕成多行，plan(1..1) 与 extra 行错位（旧实现在本用例的沙箱里就是这么坏的）。
+  const noRegDir = makeShimSandbox(false)
+  try {
+    const sentinel = path.join(noRegDir, 'body-ran')
+    const p = path.join(noRegDir, 'test_stub_plain.js')
+    fs.writeFileSync(p, bodyFor(sentinel))
+    const r = runShimIn(noRegDir, [p])
+    assert.strictEqual(r.status, 1, '注册表读不到必须非 0 退出（fail-closed：不能像「该跳过」那样 exit 0）')
+    const lines = r.stdout.split('\n')
+    assert.strictEqual(lines.length, 4, `TAP 点必须是单行 note（实际 stdout：${JSON.stringify(r.stdout)}）`)
+    assert.strictEqual(lines[0], 'TAP version 13', 'TAP 首行固定')
+    assert.ok(lines[1].startsWith('not ok 1 - test_stub_plain.js # 无法读取 test_suites.js'),
+      `注册表不可读必须投 not ok 点（实际：${lines[1]}）`)
+    assert.strictEqual(lines[2], '1..1', 'plan 行必须紧随测试点（note 含换行会把它挤到 extra 之后）')
+    assert.ok(!/^Require stack:/m.test(r.stdout), 'note 里的多行栈必须被压平在同一行，不得自己占一行（那会把 TAP 点撕开）')
+    assert.ok(r.stdout.includes('跳过集合无法与 command 档对齐'), '失败原因必须可读（点明跳过集合无法对齐）')
+    assert.strictEqual(fs.existsSync(sentinel), false, '适配层失效时不得执行被测文件（此时无法保证跳过集合与 command 档一致）')
+  } finally {
+    fs.rmSync(noRegDir, { recursive: true, force: true })
+  }
+  console.log('✅ tap-shim 运行期契约：stdout 只留 TAP / 四类跳过判定（含正文不得执行）/ argv 缺失响亮失败 / 注册表不可读 fail-closed')
+}
+
 console.log(`✅ 根目录 ${diskTestFiles.length} 个 test_*.js 与 SUITES ${registeredFiles.length} 条注册双向一致（白名单 ${REGISTRY_EXEMPTIONS.length} 个：${REGISTRY_EXEMPTIONS.join(', ')}）`)

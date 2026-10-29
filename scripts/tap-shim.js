@@ -29,13 +29,13 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-// TAP 写出口：**需要一个** fd 1 之外的私有出口——原因（实测，非推测）：xbk_storage.js 里有
+// TAP 写出口：历史上**想**要一个 fd 1 之外的私有出口——动机（实测，非推测）：xbk_storage.js 里有
 // let fd = -1 这类哨兵，UnaryOperator 变异体把它改成 +1 后，finally 里的 closeSync(fd) 就变成
 // closeSync(1) —— 直接关掉 stdout。此时 shim 若只会写 fd 1 会抛 EBADF: bad file descriptor, write
 // （在 process 'exit' 钩子里抛出，进程异常终止，TAP 点全丢），于是 tap-runner 按 tap-helper.ts 的规则
 // 判「退出码非 0 且无失败测试」，记 RuntimeError。
 //
-// ⚠️ 但**下面这段复制私有 fd 的实现是 no-op，从未生效**（2026-09-21 实测证伪，见
+// ⚠️ 但**复制私有 fd 的实现是 no-op，从未生效**（C10-040 已按实测删掉这段死代码，见
 //   .local/storage-tap-RE-findings.md §3.4 与 §2.3）：
 //   * tap-runner 用 **socketpair** spawn 被测进程（`readlink /proc/self/fd/1` = `socket:[…]`），
 //     `fs.openSync('/proc/self/fd/1', 'a')` 直接 **ENXIO**（不是「本机终端才 ENXIO」——CI 下同样如此）
@@ -56,19 +56,16 @@ const path = require('node:path')
 // 真正的修法是 shim 侧「中继子进程」（加载期 spawn 一个持有同一 stdout 管道的中继，退出时同步写其
 // stdin），**本轮不实现**（超出 PR-1 范围，且中继必须在 stdin EOF 后立即退出并带超时，否则 parseTap
 // 会挂死——比现在的 RE 更糟）。已登记为 PR-2 候选。
-let TAP_FD = 1
-try {
-  TAP_FD = fs.openSync('/proc/self/fd/1', 'a')
-} catch {
-  TAP_FD = 1
-}
+// 因此实现里不再尝试 dup：**TAP_FD 就是 fd 1**（C10-040）。保留名字是为了让「哪条通道算 TAP」
+// 这件事只有一个出处，也方便将来换中继方案时只改这一处。
+const TAP_FD = 1
 
 let deliveryFailureReported = false
 function say (line) {
   const text = line + '\n'
   // 投递契约（C10-007）：**只有 fd 1 写成功才算投递**。
-  // TAP_FD 是 fd 1 的 dup（上面的实测结论：`fs.openSync('/proc/self/fd/1','a')` 在 tap-runner 的
-  // socketpair 下恒 ENXIO ⇒ TAP_FD 恒为 1），故 [TAP_FD, 1] 都是「同一个 stdout 通道」。
+  // TAP_FD 就是 fd 1（C10-040：dup 尝试在 tap-runner 的 socketpair 下恒 ENXIO，已删），
+  // 故 [TAP_FD, 1] 是**同一个** stdout 通道。
   // **stderr 不是投递通道**——tap-parser 只解析 stdout。
   // 修复前这里是「任一 fd 写成功即算成功」：fd 1 被 closeSync(1) 关掉后 TAP 点静默改投 fd 2，于是
   // stdout 为空、退出码仍是 0，tap-parser 对空流判 {ok:true, skipReason:'no tests found'} ⇒ 变异体
@@ -112,50 +109,70 @@ process.stdout.write = function (chunk, encoding, callback) {
   return process.stderr.write(chunk, encoding, callback)
 }
 
-// 2) 跳过判定：与 run_unit_tests.js 的 UNIT_SUITES 过滤严格同源
-function resolveSkipReason (file) {
-  if (!file) return null
+// 2) 跳过判定：与 run_unit_tests.js 的 UNIT_SUITES 过滤严格同源。
+//    返回 { skip, fatal } 两个**互斥**结果，语义不能混用：
+//      skip  = 「本文件不该在本入口运行」（与 command 档同源的正常语义）⇒ ok # SKIP + exit 0
+//      fatal = 适配层自身失效（读不到注册表）⇒ not ok + exit 1
+//    C10-038：旧实现把 fatal 也当 skip 返回，于是「读不到注册表」变成 `ok # SKIP` + exit 0，
+//    与这里的注释（fail-closed）正相反——tap-parser 会把那条记成**通过**，适配层失效在 TAP 档里
+//    与全绿无法区分。
+function resolveSkip (file) {
+  const SKIP = (reason) => ({ skip: reason, fatal: null })
+  const FATAL = (reason) => ({ skip: null, fatal: reason })
+  if (!file) return { skip: null, fatal: null }
   let suites
   try {
-    // 沙箱里本文件位于 <sandbox>/scripts/tap-shim.js，注册表在 <sandbox>/test_suites.js。
-    // 用**字面量相对路径**（相对本模块文件解析 ⇒ <root>/test_suites.js）：既避免 './test_suites'
+    // C10-039：CI 生产档里 tap-runner 的 nodeArgs 是**真实仓库**的绝对路径（stryker.tap.config.js），
+    // 所以这里解析到的也是真实仓库的 test_suites.js——不是「沙箱那份」。只有本套件的探针/夹具把
+    // shim 复制进 <sandbox>/scripts/ 时，相对路径才会落到 <sandbox>/test_suites.js（夹具注册表）；
+    // 沙箱副本与真实仓库同 commit、同内容，两条路径在 CI 下不改行为。
+    // 用**字面量相对路径**（相对本模块文件解析 ⇒ <shim 所在根>/test_suites.js）：既避免 './test_suites'
     // 误解析到 scripts/ 下（不存在）而静默失败，也避免 `require(<变量>)` 触发静态分析告警
     // （Codacy「dynamically import a module by calling require using a non-literal string」）。
     suites = require('../test_suites.js').SUITES
   } catch (err) {
-    // 读不到注册表就无法保证「跳过集合与 command 档一致」——fail-closed，不允许静默放行。
-    return `无法读取 test_suites.js（${err.message}）；跳过集合无法与 command 档对齐`
+    // 读不到注册表就无法保证「跳过集合与 command 档一致」——fail-closed：判红（not ok + 非 0 退出），
+    // 绝不静默放行成「跳过」。
+    return FATAL(`无法读取 test_suites.js（${err.message}）；跳过集合无法与 command 档对齐`)
   }
-  if (!Array.isArray(suites)) return 'test_suites.js 未导出 SUITES 数组（跳过集合无法与 command 档对齐）'
+  if (!Array.isArray(suites)) return FATAL('test_suites.js 未导出 SUITES 数组（跳过集合无法与 command 档对齐）')
   const suite = suites.find(s => s.file === file)
-  if (!suite) return '未注册进 test_suites.js（run_unit_tests.js 同口径：不在 SUITES 即不运行）'
+  if (!suite) return SKIP('未注册进 test_suites.js（run_unit_tests.js 同口径：不在 SUITES 即不运行）')
   const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
-  if (skipSuites.has(file)) return `SKIP_SUITES 显式跳过（SKIP_SUITES=${process.env.SKIP_SUITES}）`
-  if (suite.integration) return 'integration（run_unit_tests.js 同口径排除）'
-  if (suite.mutationSkip) return 'mutationSkip（Stryker 沙箱内不可运行：行数元校验误报）'
-  return null
+  if (skipSuites.has(file)) return SKIP(`SKIP_SUITES 显式跳过（SKIP_SUITES=${process.env.SKIP_SUITES}）`)
+  if (suite.integration) return SKIP('integration（run_unit_tests.js 同口径排除）')
+  if (suite.mutationSkip) return SKIP('mutationSkip（Stryker 沙箱内不可运行：行数元校验误报）')
+  return { skip: null, fatal: null }
 }
 
 // 三个 TAP 行必须**全部**投递成功才算这一个测试点被投递（部分投递 = 残缺 TAP 流，同样不可信）。
 function emitPoint (ok, note) {
+  // note 必须压成**单行**：它可能来自 err.message（带 "Require stack:" 与多行栈），直接拼进 TAP 点
+  // 会把一个测试点撕成多行、plan(1..1) 与 extra 行错位（C10-038 实测：旧实现在该沙箱里正是如此）。
+  const suffix = note === undefined || note === null ? '' : ` # ${String(note).replace(/\s+/g, ' ').trim()}`
   const delivered = [
     say('TAP version 13'),
-    say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${note ? ` # ${note}` : ''}`),
+    say(`${ok ? 'ok' : 'not ok'} 1 - ${testFileName || 'unknown'}${suffix}`),
     say('1..1')
   ]
   return delivered.every(Boolean)
 }
 
-const skipReason = resolveSkipReason(testFileName)
+const decision = resolveSkip(testFileName)
 
 if (!testFileName) {
   // argv[1] 缺失，适配层没被 tap-runner 正确调用，必须响亮失败（否则静默变成「全绿」）。
   emitPoint(false, 'tap-shim 无法从 argv[1] 取到被测文件')
   process.exitCode = 1
-} else if (skipReason) {
+} else if (decision.fatal) {
+  // 适配层失效：not ok + 非 0 退出（tap-runner 记 RuntimeError ⇒ 响亮），且**不执行**被测文件——
+  // 跳过集合无法与 command 档对齐时照跑，等于让 TAP 档的测试集与 command 档悄悄分叉。
+  emitPoint(false, decision.fatal)
+  process.exit(1)
+} else if (decision.skip) {
   // 跳过点也必须真的投递出去：投递失败时不能用 process.exit(0) 把 say() 置的非零退出码盖掉
   // （C10-007：空 stdout + exit 0 会被 tap-parser 判 ok:true）。
-  const delivered = emitPoint(true, `SKIP ${skipReason}`)
+  const delivered = emitPoint(true, `SKIP ${decision.skip}`)
   process.exit(delivered ? 0 : 1)
 } else {
   process.on('exit', (code) => {

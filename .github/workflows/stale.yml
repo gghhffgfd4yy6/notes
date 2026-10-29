@@ -4,6 +4,7 @@ name: Stale
 # 供应链安全：固定 commit SHA
 on:
   push:
+    branches: [main]
     paths:
       - '.github/workflows/stale.yml'
   schedule:
