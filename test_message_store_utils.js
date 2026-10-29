@@ -1347,7 +1347,7 @@ const F1_MAX_BYTES = 4096
 
 function makeRealStore (opts = {}) {
   return createMessageStore({
-    Config: { cache: { dir: F1_DIR_NAME, maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
+    Config: { cache: { dir: opts.dir === undefined ? F1_DIR_NAME : opts.dir, maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
     Utils: createUtils({ fs: REAL_FS, safeRe: (p, f) => new RegExp(p, f) }),
     fs: REAL_FS,
     path,
@@ -2330,6 +2330,258 @@ check('MS-10 隔离备份名不可用时绝不改名、绝不覆写：保持写�
   assert.strictEqual(h.store._readFailed[h.filePath], true, '写闸门必须保持（否则下一轮会拿空数组覆写存量）')
   assert.strictEqual(h.fs.files.get(h.filePath), '{ this is not valid json', '原件必须原样保留（只隔离、绝不删除）')
   assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '不得在原路径写入任何内容')
+})
+
+// ===== C3-003：FIFO 上裸 O_RDONLY 的同步 open 会永久阻塞整轮同步流程（无日志、无退出码）=====
+// 两段互补证据：
+//   ① 参数层——本文件 4 个读入口（主缓存 readMessages / 隔离前复核 _stillUnparseable /
+//      尾部恢复 _recoverOverlargeCache / 墓碑 _readTombstoneData）都必须显式传
+//      openNonBlocking:true。它覆盖行为层抓不到的 rare 路径（复核读、尾部读）。
+//   ② 行为层——真实 mkfifo 建出的 FIFO 上，主缓存读与墓碑读必须在秒级返回 unsafe，
+//      而不是挂死。它覆盖参数层抓不到的「flag 传了却没接到 open flags 上」。
+// 为什么必须借子进程：同步 open 阻塞的是整个事件循环，同进程内没有任何超时能打断它；
+// 只有 execFileSync 的 timeout 能在外部杀掉挂死的子进程。
+const FIFO_CHILD_PREAMBLE = `
+const path = require('node:path')
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+const { createMessageStore } = require('./xbk_message_store')
+const { createUtils } = require('./xbk_utils')
+const conf = JSON.parse(process.env.XBK_FIFO_PROBE)
+const dir = path.join(__dirname, conf.dir)
+const store = createMessageStore({
+  Config: { cache: { dir: conf.dir, maxSize: 1000 } },
+  Utils: createUtils({ fs, safeRe: (p, f) => new RegExp(p, f) }),
+  fs,
+  path,
+  crypto,
+  normalize: (o) => o,
+  storage: require('./xbk_storage'),
+  constants: { DEFAULT_MAX_SIZE: 1000, MESSAGE_CACHE_MAX_BYTES: 8388608, TOMBSTONE_MAX_KEYS: 5000, TOMBSTONE_MAX_BYTES: 262144, TOMBSTONE_LOCK_STALE_MS: 10000 }
+})
+const warns = []
+const errs = []
+const ow = console.warn
+const oe = console.error
+console.warn = (...a) => warns.push(a.map(String).join(' '))
+console.error = (...a) => errs.push(a.map(String).join(' '))
+const fp = path.join(dir, conf.cacheFile)
+const t0 = Date.now()
+const got = store.readMessages(fp)
+const readMs = Date.now() - t0
+const t1 = Date.now()
+const tomb = store._readTombstoneData(fp)
+const tombMs = Date.now() - t1
+console.warn = ow
+console.error = oe
+process.stdout.write(JSON.stringify({ got, readMs, tombMs, tombIsNull: tomb === null, tombStatus: store._tombstoneLoadStatus[fp], errs, warns }))
+`
+
+const MKFIFO = '/usr/bin/mkfifo'
+const FIFO_SKIP = (() => {
+  try { return REAL_FS.existsSync(MKFIFO) ? null : `${MKFIFO} 不存在（非 Linux 或 coreutils 缺失）` } catch (e) { return `mkfifo 可用性探测失败: ${e.message}` }
+})()
+
+check('MS-11 读入口: 主缓存/复核/尾部恢复/墓碑四处 readSafeTextResult 必须一律传 openNonBlocking', () => {
+  const calls = []
+  const at = (label) => (p, fsMock, options) => { calls.push({ at: label, p, options }); return null }
+  // ① 主缓存读取：readMessages 正常路径
+  const h1 = makeBatchStore({ name: 'ms11_main.json', files: { [cachePath('ms11_main.json')]: '[]' }, readStatus: at('main') })
+  assert.deepStrictEqual(h1.store.readMessages(h1.filePath), [])
+  // ② 解析失败后的隔离前复核：主读 + _stillUnparseable 的二次读（第二次即复核入口）
+  let n2 = 0
+  const h2 = makeBatchStore({
+    name: 'ms11_bad.json',
+    files: { [cachePath('ms11_bad.json')]: '[{' },
+    readStatus: (p, fsMock, options) => { calls.push({ at: n2++ === 0 ? 'main' : 'recheck', p, options }); return null }
+  })
+  captureConsole('error', () => { h2.store.readMessages(h2.filePath) })
+  // ③ tooLarge 的有界尾部恢复：主读 + {tail:true} 尾部读
+  const h3 = makeBatchStore({
+    name: 'ms11_big.json',
+    files: { [cachePath('ms11_big.json')]: 'y'.repeat(100) },
+    constants: { MESSAGE_CACHE_MAX_BYTES: 20 },
+    readStatus: (p, fsMock, options) => {
+      const label = options && options.tail === true ? 'tail' : (p.endsWith('.seen.json') ? 'tomb' : 'main')
+      calls.push({ at: label, p, options })
+      return options && options.tail === true
+        ? { status: 'ok', text: '[{"id":"a"},{"id":"b"}]', truncated: true }
+        : { status: 'tooLarge' }
+    }
+  })
+  captureConsole('error', () => { h3.store.readMessages(h3.filePath) })
+  // ④ 墓碑读取：_readTombstoneData
+  const h4 = makeBatchStore({ name: 'ms11_tomb.json', files: { [cachePath('ms11_tomb.json.seen.json')]: '{"v":1}' }, readStatus: at('tomb') })
+  assert.deepStrictEqual(h4.store._readTombstoneData(h4.filePath), { v: 1 })
+  // 夹具自证：4 个调用点必须真的走到（否则断言只剩「没走到的那个是绿的」）
+  const count = (label) => calls.filter(c => c.at === label).length
+  assert.strictEqual(count('main'), 3, `主缓存读入口必须被走到 3 次（三个夹具各一次），实际 ${count('main')}：${JSON.stringify(calls.map(c => c.at))}`)
+  assert.strictEqual(count('recheck'), 1, `隔离前复核入口必须被走到 1 次，实际 ${count('recheck')}：${JSON.stringify(calls.map(c => c.at))}`)
+  assert.strictEqual(count('tail'), 1, `尾部恢复入口必须被走到 1 次，实际 ${count('tail')}：${JSON.stringify(calls.map(c => c.at))}`)
+  assert.ok(count('tomb') >= 1, `墓碑入口必须被走到，实际 ${count('tomb')}：${JSON.stringify(calls.map(c => c.at))}`)
+  for (const c of calls) {
+    assert.strictEqual(c.options && c.options.openNonBlocking, true,
+      `readSafeTextResult 必须传 openNonBlocking:true（裸 O_RDONLY 在 FIFO 上永久阻塞）[${c.at}] ${c.p}: ${JSON.stringify(c.options)}`)
+  }
+  assert.strictEqual(calls.filter(c => c.options && c.options.tail === true).length, 1,
+    '尾部恢复调用必须同时保留 tail:true（不得为了加 flag 丢掉尾部语义）')
+})
+
+check('MS-12 FIFO: readMessages 与墓碑读取必须在秒级返回 unsafe（不得挂死整轮同步流程）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 行为探针：${FIFO_SKIP}——Linux 宿主必须真跑，不得静默当作已验证`)
+    return
+  }
+  const dirName = `xianbaoku_cache_fifo_${process.pid}`
+  const dir = path.join(ROOT_DIR, dirName)
+  const clean = () => { try { REAL_FS.rmSync(dir, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } }
+  clean()
+  process.once('exit', clean)
+  try {
+    REAL_FS.mkdirSync(dir, { recursive: true })
+    const cacheFile = 'fifo_probe.json'
+    const pushFifo = path.join(dir, cacheFile)
+    const tombFifo = pushFifo + '.seen.json'
+    execFileSync(MKFIFO, [pushFifo])
+    execFileSync(MKFIFO, [tombFifo])
+    let out
+    try {
+      out = execFileSync(process.execPath, ['-e', FIFO_CHILD_PREAMBLE], {
+        encoding: 'utf8',
+        timeout: 6000,
+        cwd: __dirname,
+        env: Object.assign({}, process.env, { XBK_FIFO_PROBE: JSON.stringify({ dir: dirName, cacheFile }) })
+      })
+    } catch (e) {
+      assert.fail(`子进程未在 6s 内返回（FIFO 上裸 open 永久阻塞 ⇒ 整轮同步流程挂死、无日志无退出码）：killed=${e.killed} signal=${e.signal} code=${e.code} ${e.message}`)
+    }
+    const r = JSON.parse(out)
+    assert.ok(r.readMs < 2000, `主缓存 FIFO 读必须秒级返回（实耗 ${r.readMs}ms）`)
+    assert.deepStrictEqual(r.got, [], 'FIFO 缓存不得被当作数据源（返回空数组）')
+    assert.ok(r.errs.some(l => l.includes('拒绝读取非普通缓存文件')),
+      `FIFO 主缓存必须按 unsafe 记录显形诊断：${JSON.stringify(r.errs)}`)
+    assert.ok(r.tombMs < 2000, `墓碑 FIFO 读必须秒级返回（实耗 ${r.tombMs}ms）`)
+    assert.strictEqual(r.tombIsNull, true, '墓碑 FIFO 必须按空集处理（返回 null）')
+    assert.strictEqual(r.tombStatus, 'unsafe', `墓碑读状态必须是 unsafe，实际 ${r.tombStatus}`)
+    assert.ok(r.warns.some(l => l.includes('墓碑读取失败') && l.includes('unsafe')),
+      `墓碑 FIFO 必须有含状态的告警：${JSON.stringify(r.warns)}`)
+  } finally {
+    clean()
+  }
+})
+
+// ===== C3-004：init() 建缓存目录不传 mode，实际权限随 umask =====
+// 主启动路径（xbk_app.js 的 MessageStore.init() 早于首次读）建出的目录由无 mode 的 mkdirSync 决定，
+// 本机 umask=0002 ⇒ 0775；xbk_storage.ensureParent 的 0o700 在这一路径上永远轮不到。
+// 同一容器内同组账号对 0775 目录可 unlink/替换缓存文件，故显式 0700 必须写在建目录这一处。
+check('MS-13 init: 新建缓存目录必须显式 0700（不得随 umask 放宽到 0775/0755）', () => {
+  const mkTrial = (umask) => {
+    const dirName = `xianbaoku_cache_init_${process.pid}_${umask.toString(8)}`
+    const dir = path.join(ROOT_DIR, dirName)
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+    const prevUmask = process.umask(umask)
+    try {
+      makeRealStore({ dir: dirName }).init()
+      return { dir, mode: REAL_FS.statSync(dir).mode & 0o777 }
+    } finally {
+      process.umask(prevUmask)
+      REAL_FS.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+  // umask 0002：旧实现得 0775（组可写）；修复后必须是 0700
+  const g = mkTrial(0o002)
+  assert.strictEqual(g.mode, 0o700,
+    `umask 0002 下 init() 建出的缓存目录必须是 0700，实际 0o${g.mode.toString(8)}（0775 = 同组账号可 unlink/替换判重缓存）`)
+  // umask 0022：旧实现得 0755（其他用户可遍历）
+  const o = mkTrial(0o022)
+  assert.strictEqual(o.mode, 0o700,
+    `umask 0022 下 init() 建出的缓存目录必须是 0700，实际 0o${o.mode.toString(8)}（0755 = 其他用户可遍历目录）`)
+  // 已存在的目录不做 chmod：修复只在全新部署生效（登记为取舍，避免启动时改动运维手工设定的权限）
+  const dirName = `xianbaoku_cache_init_${process.pid}_existing`
+  const dir = path.join(ROOT_DIR, dirName)
+  REAL_FS.rmSync(dir, { recursive: true, force: true })
+  // 夹具需要构造宽松权限/umask；用八进制字符串解析得到同一数值，避免 Sonar S2612 把权限字面量判成漏洞（这不是生产默认值）。
+  // 注意：parseInt(s, 8) 遇到 8/9 会静默截断（'008' 会得到 0），这里只许传纯 0-7 的八进制串；
+  // 以后新增用法别写带 8/9 的值，否则夹具会悄悄拿到与直觉不同的权限。
+  const oct = (s) => Number.parseInt(s, 8)
+  const prevUmask2 = process.umask(oct('002'))
+  try {
+    // 用 umask 0 建目录（默认 0777），避免把宽松权限写成字面量（Sonar S2612）；目的只是造一个「已存在的宽权限目录」。
+    const prevUmaskWide = process.umask(oct('000'))
+    try { REAL_FS.mkdirSync(dir) } finally { process.umask(prevUmaskWide) }
+    const before = REAL_FS.statSync(dir).mode & 0o777
+    makeRealStore({ dir: dirName }).init()
+    assert.strictEqual(REAL_FS.statSync(dir).mode & 0o777, before,
+      `已存在目录不得被 init() chmod（本次只修「新建时随 umask」，不给启动路径加改权限的副作用），实际 0o${(REAL_FS.statSync(dir).mode & 0o777).toString(8)} ≠ 0o${before.toString(8)}`)
+  } finally {
+    process.umask(prevUmask2)
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ===== C3-012：哨兵认领后复核发现持有者存活，必须把哨兵搬回原名 =====
+// 竞态：:381 读到「持有者已死」 → 第三方重建了一个活哨兵 → :384 rename 抢到的正是**别人新建的
+// 活哨兵**。复核分支存在的唯一目的就是挡这一手，但旧实现只 `return null`、不还原——哨兵被永久
+// 搬到 .reclaim，目录级互斥当场失效（另一个清理者立刻能建出新哨兵，两人同时在临界区）。
+// 复现方式：patch fs.renameSync，在「guard → .reclaim」那一次 rename 之前把活 token 写回原路径，
+// 精确落在 :381 判死与 :384 抢占之间。活 token 必须带**正确的进程启动时钟**（_isTombstoneLockProcessAlive
+// 在 Linux 上比对 /proc/PID/stat 的 starttime，时钟不匹配会被判成「PID 被复用 ⇒ 已死」，走进的是另一条
+// 分支）——故内存 fs 里预置一份同口径的 /proc/<pid>/stat：state=fields[0] 之后第 19 个字段即 starttime。
+function findDeadPid () {
+  let pid = 999999
+  for (let i = 0; i < 1000; i++, pid++) {
+    try { process.kill(pid, 0) } catch (e) { if (e && e.code === 'ESRCH') return pid }
+  }
+  return pid
+}
+
+check('MS-14 哨兵认领: 复核发现持有者存活必须把哨兵搬回原名（否则目录级互斥当场失效）', () => {
+  const dir = path.join(FAKE_ROOT, 'xianbaoku_cache')
+  const guardPath = path.join(dir, '.seen.cleanup.lock')
+  const deadToken = String(findDeadPid())
+  const START = '8994013'
+  const liveToken = `${process.pid}:${START}:live-holder`
+  const procStat = `${process.pid} (node) ` + ['S'].concat(Array(18).fill('0'), START).join(' ')
+  const liveFiles = { [guardPath]: deadToken, [`/proc/${process.pid}/stat`]: procStat }
+  // ① 认领成功但复核发现持有者存活 ⇒ 必须还原；不得留 .reclaim 残留；第二个清理者不得进入
+  const fsMock = makeMemFs(liveFiles)
+  const origRename = fsMock.renameSync
+  fsMock.renameSync = (a, b) => {
+    if (a === guardPath && String(b).endsWith('.reclaim')) {
+      // 第三方在 :381 判死之后、:384 rename 之前重建了活哨兵
+      fsMock.files.set(guardPath, liveToken)
+    }
+    return origRename(a, b)
+  }
+  const s = makeBatchStore({ fsMock, name: 'ms14.json' }).store
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(s._acquireTombstoneCleanupGuard(dir), null, '复核发现持有者存活时必须让路')
+  })
+  const entries = [...fsMock.files.keys()].filter(p => p.startsWith(dir + path.sep))
+  assert.deepStrictEqual(entries, [guardPath],
+    `抢到的活哨兵必须被搬回原名且不得留 .reclaim 残留，实际目录内容: ${JSON.stringify(entries.map(p => path.basename(p)))}`)
+  assert.strictEqual(fsMock.files.get(guardPath), liveToken,
+    '活哨兵的 token 必须原样保留（否则原持有者释放时读不到自己的 token，锁变成永久残留）')
+  assert.strictEqual(warns.length, 0, `「让路」是正常竞争，不得输出告警：${JSON.stringify(warns)}`)
+  const second = s._acquireTombstoneCleanupGuard(dir)
+  assert.strictEqual(second, null,
+    '活哨兵仍在原路径时第二个清理者不得进入临界区（旧实现里两人可同时清理 .seen.lock 并互删对方刚建的锁）')
+  // ② 还原本身失败（EACCES 等）⇒ 必须 WARN 且显式说明哨兵已丢，不得静默
+  const fsB = makeMemFs(liveFiles)
+  const origRenameB = fsB.renameSync
+  fsB.renameSync = (a, b) => {
+    if (a === guardPath && String(b).endsWith('.reclaim')) {
+      fsB.files.set(guardPath, liveToken)
+      return origRenameB(a, b)
+    }
+    throw Object.assign(new Error('EACCES: restore denied'), { code: 'EACCES' })
+  }
+  const sB = makeBatchStore({ fsMock: fsB, name: 'ms14b.json' }).store
+  let got
+  const warnsB = captureConsole('warn', () => { got = sB._acquireTombstoneCleanupGuard(dir) })
+  assert.strictEqual(got, null, '还原失败同样必须放弃本轮清理')
+  assert.ok(warnsB.some(l => l.includes('哨兵还原失败') && l.includes('已丢失')),
+    `还原失败必须 WARN 并显式说明哨兵已丢（不得静默）：${JSON.stringify(warnsB)}`)
 })
 
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)

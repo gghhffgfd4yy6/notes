@@ -30,11 +30,17 @@
 #        → 门禁回到 rc=0（符号出现次数被未跟踪文件补够，断言放行）。
 #   即「提交 fail / 工作树 pass」：旧实现把它当快路径放行，只打印一条警告承认「这一条『通过』对它
 #   不严格成立」——那条警告正是这个假绿灯的遮羞布，它给出的仍是绿灯的**假证据**（红灯的提交被放行）。
-#   所以判定改用整树口径 `git status --porcelain`（默认**不列**被 .gitignore 忽略的文件，无需额外开关：
-#   `.local/`、`xianbaoku_cache*`、`push_config.local.js`、`reports` 等都在 .gitignore 里，它们本就不参与
-#   门禁扫描），这类情形一律与「已跟踪文件脏」同走隔离路径：门禁在只含**被推提交内容**的临时 worktree
-#   里跑（那里没有工作树里的杂散 `xbk_*.js`），绿灯才真的属于被推提交。**不要**用 `--untracked-files=all`：
-#   那会把被忽略的文件也算成脏，正常开发机上快路径将永远走不到（代价白付）。
+#   所以判定改用整树口径 `git status --porcelain -uall`（**未跟踪文件也算脏**），这类情形一律与「已跟踪
+#   文件脏」同走隔离路径：门禁在只含**被推提交内容**的临时 worktree 里跑（那里没有工作树里的杂散
+#   `xbk_*.js`），绿灯才真的属于被推提交。
+#   为什么必须显式 `-uall`（C10-005）：`git status` 的未跟踪口径受 `status.showUntrackedFiles` 配置影响，
+#   设成 `no` 时它**静默不列**未跟踪文件（实测同一仓库：`git status --porcelain` 输出为空、加 `-uall` 仍
+#   输出 `?? stray.js`）⇒ 快路径会把「工作树脏」误判成干净。命令行 `-uall` 覆盖该配置。
+#   `-uall` **不会**把被 .gitignore 忽略的文件算成脏（只有 `--ignored` 才会）：`.local/`、`xianbaoku_cache*`、
+#   `push_config.local.js`、`reports` 等照旧不参与判定——旧注释「改成 --untracked-files=all 会把忽略项也算成
+#   脏、快路径永远走不到」与实测不符，已订正（`-uall` 只是把未跟踪文件**逐个**列出，不是连忽略项一起列）。
+#   判定本身失败（`git status` 非 0：索引损坏 / 工作树不可读等）**必须 fail-closed**：不能证明干净就等于
+#   不干净，走隔离路径按被推提交内容校验；绝不 `2>/dev/null || true` 把 rc=128 吞成「输出为空 = 干净」。
 #
 # 隔离路径的成本与失败口径：快路径与旧实现等价（无额外成本，绝大多数推送都走这条）。只有「非当前
 #   HEAD」或「工作树脏（含未跟踪文件）」时才多付一次 `git worktree add` checkout（本仓 ~105 个文件，
@@ -308,12 +314,25 @@ fi
 # ── 3) 逐个校验被推提交的**内容** ─────────────────────────────────────────────
 for sha in $push_shas; do
   echo "── 校验被推提交 ${sha:0:8} ──"
-  # 整棵工作树是否干净：默认口径 `git status --porcelain`——**未跟踪文件也算脏**（旧口径
+  # 整棵工作树是否干净：`git status --porcelain -uall` —— **未跟踪文件也算脏**（旧口径
   # `--untracked-files=no` 正是本条修复的对象，假绿灯机制见文件头注释：门禁会扫描工作树里的
-  # `xbk_*.js`，未跟踪文件能把被推提交的红读成绿）。默认口径不列被 .gitignore 忽略的文件
-  # （`.local/`、`xianbaoku_cache*`、`push_config.local.js`、`reports` 等），不要改成
-  # `--untracked-files=all`——那会把忽略项也算成脏，快路径在正常开发机上永远走不到。
-  worktree_status=$(git status --porcelain 2>/dev/null || true)
+  # `xbk_*.js`，未跟踪文件能把被推提交的红读成绿）。
+  # ① 必须显式 `-uall`：未跟踪口径受 `status.showUntrackedFiles` 影响，`=no` 时 `git status --porcelain`
+  #    会**静默不列**未跟踪文件（实测：同仓输出为空、加 `-uall` 仍输出 `?? stray.js`）⇒ 脏树被当成干净。
+  # ② `-uall` **不列**被 .gitignore 忽略的文件（`.local/`、`xianbaoku_cache*`、`push_config.local.js`、
+  #    `reports` 等照旧不参与；只有 `--ignored` 才会列）——旧注释称「-uall 会把忽略项也算成脏」与实测不符。
+  # ③ `git status` 失败（索引损坏 rc=128、工作树不可读等）不得吞掉：不能证明干净 ⇒ 不得走快路径
+  #    （fail-closed 到隔离校验），并打印原因。
+  worktree_rc=0
+  worktree_status=$(git status --porcelain -uall 2>&1) || worktree_rc=$?
+  if [ "$worktree_rc" -ne 0 ]; then
+    echo "   ❌ 无法判定工作树是否干净：git status --porcelain -uall 失败（退出码 ${worktree_rc}）"
+    if [ -n "$worktree_status" ]; then
+      while IFS= read -r status_line; do echo "      ${status_line}"; done <<<"$worktree_status"
+    fi
+    echo "      不能证明「工作树内容 === 被推提交内容」⇒ 本次不得走快路径（fail-closed 到隔离校验）"
+    worktree_status="<git status 失败：工作树状态未知>"
+  fi
   if [ "$sha" = "$head_sha" ] && [ -z "$worktree_status" ]; then
     # 快路径：被推对象就是当前 HEAD 且整棵工作树干净（无已跟踪改动、也无未跟踪文件）→
     # 工作树内容 === 被推提交内容，可以断言。
@@ -322,7 +341,9 @@ for sha in $push_shas; do
     echo "⏳ 单元测试 test:filter（本机实测约 60s，请稍候）..."
     run_gate "单元测试" "，先修复再推送（该门禁自 pre-commit 迁来，覆盖未减少）" "${gate_cmd[@]}"
   else
-    if [ "$sha" = "$head_sha" ]; then
+    if [ "$worktree_rc" -ne 0 ]; then
+      echo "   ⚠️ 工作树干净与否**无法判定**（git status 失败，原因见上）：不能证明工作树内容 === 被推提交内容"
+    elif [ "$sha" = "$head_sha" ]; then
       echo "   ⚠️ 当前 HEAD 与被推提交相同，但工作树有未提交内容（已跟踪改动或未跟踪文件）：工作树内容 ≠ 被推提交内容"
       echo "      （未跟踪文件会参与门禁的目录扫描——它们能把这个提交里的失败读成通过；未提交的修复同理——"
       echo "       旧实现正是把这两类都当快路径放行，给出假绿灯）"

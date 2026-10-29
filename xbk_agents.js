@@ -30,6 +30,178 @@ const DNS_INVALIDATION_CODES = new Set([
 const dnsCache = new Map()
 const dnsPending = new Map()
 
+// C10-074（audit38）：同 key 等待项的上限与单次等待上限（毫秒）。
+// 为什么必须有：`dns.lookup` 无法取消（got 的 signal 传不到这里，见 prewarmDns 的注释），坏解析器 /
+// 网络黑洞下底层回调永远不来 ⇒ 「同 key 复用一次底层 lookup」会把所有等待项无限堆在 dnsPending 里
+// （实测：500 次调用 = 1 次底层 lookup + 500 个回调全部存活，再压 1000 次变 1500 个），而普通调用方
+// （含 got 超时/取消后仍存在的 net lookup 回调）没有任何摘除路径 ⇒ 长驻进程无界增长、调用方永远收不到回调。
+// 两个上限的分工：cap 让表**有界**（超限立即以可重试错误失败，不静默丢），deadline 让等待项**有终点**
+// （到点按失败回调并摘除）。默认 10s 远大于正常解析耗时（CI 实测 <1s），只为坏解析器兜底。
+const DNS_PENDING_MAX_WAITERS = 64
+const DNS_PENDING_TIMEOUT_DEFAULT_MS = 10000
+
+// 正整数环境变量（与 run_tests.js 的 positiveIntEnv 同口径）：非法值告警并回退默认，绝不按非法值运行。
+// 只给测试注入用；生产不设即走默认 10s。
+function positiveIntEnv (name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1) {
+    console.warn(`⚠️  环境变量 ${name}=${raw} 非法（应为正整数），已回退默认值 ${fallback}`)
+    return fallback
+  }
+  return value
+}
+
+const DNS_PENDING_TIMEOUT_MS = positiveIntEnv('XBK_DNS_PENDING_TIMEOUT_MS', DNS_PENDING_TIMEOUT_DEFAULT_MS)
+
+// PR #362 评审（CodeRabbit Major · Stability & Availability）：deadline 只给**等待项**一个终点，不回收
+// 底层查询——`dns.lookup` 无法取消，等待项超时后那条 getaddrinfo 仍占着 libuv 线程池里的一个线程；
+// 同 key 每轮重试都会另起一条（实测：8 轮重试 = 8 条在飞），坏解析器下无界累积，可占满线程池并拖慢
+// 同池的文件操作。故对「已交给底层、回调还没到」的查询记**两份账**，分工不同：
+//   · 软名额（同 key ≤ DNS_INFLIGHT_MAX_PER_KEY，全局 ≤ DNS_INFLIGHT_MAX）：表达「这个 key 最近试过几次」，
+//     管**允许恢复探测**。同 key 2 条：正常慢解析（第一条在飞时超时、重试接班第二条）够用，第三条起立即
+//     失败；全局 32（默认，XBK_DNS_MAX_INFLIGHT 可注入）：兜住多主机同时打洞的进程级占用。
+//   · 真实名额（DNS_REAL_INFLIGHT_MAX，默认 64，XBK_DNS_MAX_REAL_INFLIGHT 可注入）：表达「真实还有几条
+//     getaddrinfo 没跑完」，管**真实并发的硬顶**。只由两条路径释放：底层回调到达（第一时间 -1，在
+//     endInflightLookup 与 onDone 之前）与 startInflightLookup 的同步抛错。
+//   · 单条最长存活 DNS_INFLIGHT_MAX_AGE_MS（默认 60s，XBK_DNS_MAX_INFLIGHT_AGE_MS 可注入）：软名额必须
+//     有退役路径，否则「坏解析器永不回调」会把软名额永久占住——同 key 两条填满后，这个主机连解析器恢复
+//     也永远拿到 EAI_AGAIN（直到进程重启），等于把「无界泄漏」换成「单主机 DNS 永久瘫痪」。
+//     过龄条目在过闸时逐条退役、当场归还**软**名额；退役只动记账，不动那条底层查询的回调语义。
+// 为什么过龄退役绝不能释放真实名额：退役只是让 JS 侧重试（这个 key 可以再发起探测），那条 getaddrinfo
+// 仍在 libuv 线程池里跑、回调没到就还没结束。若退役也归还真实名额，重试就又能新增一条，跨每个存活周期
+// 净增一批，**真实未完成查询数仍然无界**——这正是只有软上限时的漏洞：60s 周期一到，同 key 又能起 2 条，
+// 慢速泄漏照样填满线程池。硬顶的语义就是只认「回调到了 / 当场抛错」这一个事实。
+// 超限一律以 EAI_AGAIN 立即失败（与等待队列上限同码、可重试，且不静默丢回调）。
+// 为什么不走「超时后继续复用那条在飞查询」：仓内契约要求超时后重试必须重新发起解析
+// （test_dns_cache.js「超时摘除后重试必须重新发起底层 lookup」），且坏解析器若永不回调，复用等于让
+// 该 key 永久卡死。上限与存活时间只压**并发在飞条数**，不改变「超时 ⇒ 本次失败、下次可重试」的语义。
+const DNS_INFLIGHT_MAX_DEFAULT = 32
+const DNS_INFLIGHT_MAX_PER_KEY = 2
+const DNS_INFLIGHT_MAX = positiveIntEnv('XBK_DNS_MAX_INFLIGHT', DNS_INFLIGHT_MAX_DEFAULT)
+const DNS_INFLIGHT_MAX_AGE_MS = positiveIntEnv('XBK_DNS_MAX_INFLIGHT_AGE_MS', 60000)
+// 真实在飞硬顶：默认 64，必须远高于软全局上限 32——它兜的是未完成的 getaddrinfo 队列（超了就是真实查询
+// 无界堆积），不是恢复探测的节流阀（那是软名额的活）；压到软上限之下只会让软名额永远用不满，且同 key
+// 的两条接班查询也无处安放。
+const DNS_REAL_INFLIGHT_MAX_DEFAULT = 64
+const DNS_REAL_INFLIGHT_MAX = positiveIntEnv('XBK_DNS_MAX_REAL_INFLIGHT', DNS_REAL_INFLIGHT_MAX_DEFAULT)
+// key → 在飞条目数组（key 为 null 表示该调用不进缓存，借同一个 Map 只计全局数，否则它没有退役路径）。
+// 每条带 startedAt 供逐条退役；条目对象本身就是回调的身份凭据（见 endInflightLookup）。
+const dnsInflight = new Map()
+let dnsInflightTotal = 0
+// 真实在飞条数：只由底层回调到达或同步抛错增减，**过龄退役绝不碰它**（见上）。
+let dnsRealInflightTotal = 0
+
+// 等待项失败用的错误：码必须落在 xbk_failure_policy 的可重试集合里（ETIMEDOUT / EAI_AGAIN 都是），
+// 否则一次本地排队失败会被判成 PERMANENT、连重试都不许。
+function dnsPendingError (code, message) {
+  const err = new Error(message)
+  err.code = code
+  return err
+}
+
+// 在飞记账只覆盖真正交给解析器的调用；回调**第一件事**就释放（身份检查之前——线程已还回池子，
+// 与这条 lookup 的结果还要不要无关）。key 为 null 表示该调用不进缓存，只计全局数。
+function inflightLookupsFor (key) {
+  const entries = dnsInflight.get(key)
+  return entries ? entries.length : 0
+}
+
+function beginInflightLookup (key) {
+  const entry = { key, startedAt: Date.now(), retired: false }
+  const entries = dnsInflight.get(key)
+  if (entries) entries.push(entry)
+  else dnsInflight.set(key, [entry])
+  dnsInflightTotal += 1
+  return entry
+}
+
+// 释放名额。身份校验：条目一旦按龄退役（名额当时已归还），它自己晚到的回调只能清自己的账、不得再减
+// 一次——否则会把全局计数减成负数（上限失效），或把后来那条同名 key 的新条目名额一起吃掉。
+function endInflightLookup (entry) {
+  if (entry.retired) return
+  entry.retired = true
+  dnsInflightTotal -= 1
+  const entries = dnsInflight.get(entry.key)
+  if (!entries) return
+  const left = entries.filter(other => other !== entry)
+  if (left.length > 0) dnsInflight.set(entry.key, left)
+  else dnsInflight.delete(entry.key)
+}
+
+// 按龄逐条退役：只归还**软**名额，不碰底层查询本身（取消不了），不碰真实名额（那条 getaddrinfo 还在
+// 线程池里跑，回调没到就不算结束——退役只是让 JS 侧能再试），也不碰它的回调派发语义——结果还要不要由
+// dnsLookup 里既有的 pending record 身份检查决定。
+function retireAgedInflight (now) {
+  for (const [key, entries] of [...dnsInflight]) {
+    const alive = []
+    for (const entry of entries) {
+      if (now - entry.startedAt < DNS_INFLIGHT_MAX_AGE_MS) {
+        alive.push(entry)
+        continue
+      }
+      entry.retired = true
+      dnsInflightTotal -= 1
+    }
+    if (alive.length > 0) dnsInflight.set(key, alive)
+    else dnsInflight.delete(key)
+  }
+}
+
+// 释放真实名额。与 endInflightLookup 的 retired 同口径：一条底层查询只有一份真实名额，故它只能被释放
+// 一次，否则计数会被减成负数、硬顶随之失效（实测硬顶 3 却放行 6 条）。两条违反 dns.lookup 契约的路径
+// 都会重复释放：底层同步回调 + 调用方回调抛错（异常冒进 startInflightLookup 的 catch 再释放一次）、
+// 底层回调被调两次。标记只挡「第二次释放」，不新增释放路径——真实名额仍只由「回调到达」与「同步抛错」
+// 两条路径归还，过龄退役依旧绝不碰它。
+function releaseRealInflight (entry) {
+  if (entry.realReleased) return
+  entry.realReleased = true
+  dnsRealInflightTotal -= 1
+}
+
+// 发起一条底层查询并记两份账。真实名额在 dns.lookup 之前 +1、回调第一件事归还（先于软名额与 onDone：
+// 线程已还回池子，与这条 lookup 的结果还要不要无关）。同步抛错（非法参数等）时必须当场释放两份名额——
+// 否则这条永远收不到回调的记账会白占名额，攒满上限后整个进程的解析都会被判成超限。
+function startInflightLookup (key, hostname, opts, onDone) {
+  const entry = beginInflightLookup(key)
+  entry.realReleased = false // 名额身份凭据：先于 +1 建立，回调与 catch 共用同一次释放
+  dnsRealInflightTotal += 1
+  try {
+    dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
+      releaseRealInflight(entry)
+      endInflightLookup(entry)
+      onDone(error, address, family)
+    })
+  } catch (e) {
+    releaseRealInflight(entry)
+    endInflightLookup(entry)
+    throw e
+  }
+}
+
+// 超限错误：立即失败，绝不新建 getaddrinfo 任务。检查点放在「建等待项之前」——超限的调用方既不占
+// 等待队列，也不会留下一条永远等不到回调的记账。
+// 先按龄退役再判上限：软名额过龄后必须允许另起一条底层查询，否则坏解析器下这个主机永久 EAI_AGAIN
+// （名额被永不回调的老查询占死）。真实名额则**不因退役归还**，故它是唯一能拦住「每过一个存活周期又
+// 新增一批真实查询」的那道闸——两道闸顺序：先真实硬顶，再软全局，最后同 key。
+function inflightLimitError (key) {
+  retireAgedInflight(Date.now())
+  if (dnsRealInflightTotal >= DNS_REAL_INFLIGHT_MAX) {
+    return dnsPendingError('EAI_AGAIN',
+      `DNS 真实在飞查询已达硬上限（真实在飞 ${dnsRealInflightTotal} 条 ≥ ${DNS_REAL_INFLIGHT_MAX}），本次调用按失败返回，可重试`)
+  }
+  if (dnsInflightTotal >= DNS_INFLIGHT_MAX) {
+    return dnsPendingError('EAI_AGAIN',
+      `DNS 在飞查询已达全局上限（在飞 ${dnsInflightTotal} 条 ≥ ${DNS_INFLIGHT_MAX}），本次调用按失败返回，可重试`)
+  }
+  if (key !== null && inflightLookupsFor(key) >= DNS_INFLIGHT_MAX_PER_KEY) {
+    return dnsPendingError('EAI_AGAIN',
+      `DNS 在飞查询已达同 key 上限（同 key 在飞 ${inflightLookupsFor(key)} 条 ≥ ${DNS_INFLIGHT_MAX_PER_KEY}），本次调用按失败返回，可重试`)
+  }
+  return null
+}
+
 function profileMs (value) {
   return Number.isFinite(value) ? Math.round(value) : 'n/a'
 }
@@ -127,6 +299,44 @@ function dispatchLookupResult (callback, wantAll, error, address, family) {
   callback(null, first ? first.address : undefined, first ? first.family : family)
 }
 
+// 等待项计时器（C10-074）：deadline 逐条目登记，但一个 key 只保留**一个** timer（合并到最早 deadline），
+// 到点只摘除真正过期的项，其余重算下一个最早 deadline。timer 一律 unref——正常路径会 clearTimeout，
+// 这里兜底：坏解析器场景不得因为一个计时器把进程钉住。
+function clearPendingTimer (record) {
+  if (record && record.timer) {
+    clearTimeout(record.timer)
+    record.timer = null
+  }
+}
+
+function armPendingTimer (key, record) {
+  if (!record || record.entries.length === 0) return
+  clearPendingTimer(record)
+  let next = Infinity
+  for (const entry of record.entries) if (entry.deadline < next) next = entry.deadline
+  record.timer = setTimeout(() => sweepExpiredWaiters(key, record), Math.max(0, next - Date.now()))
+  if (typeof record.timer.unref === 'function') record.timer.unref()
+}
+
+// 到点的等待项：先按 key 摘除记账，再逐个以 ETIMEDOUT 失败回调（**不静默丢**）。
+// 为什么先摘除再回调：回调里若同步重试（很常见），不得让它看到这批已过期的等待项，也不得把新 lookup
+// 绑到一条已经判定超时的底层调用上。底层 lookup 若晚到，dnsLookup 里的身份检查会把它整条丢弃。
+function sweepExpiredWaiters (key, record) {
+  record.timer = null
+  if (dnsPending.get(key) !== record) return
+  const now = Date.now()
+  const expired = record.entries.filter(entry => entry.deadline <= now)
+  if (expired.length === 0) {
+    armPendingTimer(key, record)
+    return
+  }
+  record.entries = record.entries.filter(entry => entry.deadline > now)
+  if (record.entries.length === 0) dnsPending.delete(key)
+  else armPendingTimer(key, record)
+  const err = dnsPendingError('ETIMEDOUT', `DNS 解析等待超时（>${DNS_PENDING_TIMEOUT_MS}ms，底层 lookup 未回调）`)
+  for (const entry of expired) dispatchLookupResult(entry.callback, entry.all, err)
+}
+
 function dnsLookup (hostname, options, callback) {
   const opts = options || {}
   const wantAll = Boolean(opts.all)
@@ -135,7 +345,12 @@ function dnsLookup (hostname, options, callback) {
   // 这类调用方（目前只有测试/未来扩展）失去缓存收益，换来的是「拿到的地址一定按自己的选项
   // 筛选/排序过」，也不会污染同主机其它选项的缓存条目。
   if (key === null) {
-    dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => dispatchLookupResult(callback, wantAll, error, address, family))
+    const overLimit = inflightLimitError(null)
+    if (overLimit) {
+      queueMicrotask(() => dispatchLookupResult(callback, wantAll, overLimit))
+      return
+    }
+    startInflightLookup(null, hostname, opts, (error, address, family) => dispatchLookupResult(callback, wantAll, error, address, family))
     return
   }
   const now = Date.now()
@@ -145,25 +360,44 @@ function dnsLookup (hostname, options, callback) {
     return
   }
 
-  // AGENTS-04（已知限制，改行为需先定状态机口径）：普通调用方（含 got 超时/取消后仍存在的 net
-  // lookup 回调）没有摘除路径；唯一摘除是 prewarmDns 的 abort 分支，底层 dns.lookup 完成时才统一
-  // delete。坏解析器下同 key 列表会随重试只增不减——本注释只记录现状，未改任何行为。
+  // C10-074：普通调用方（含 got 超时/取消后仍存在的 net lookup 回调）没有摘除路径，故这里用
+  // 「同 key 上限 + 逐条目 deadline」兜住：超限立即以 EAI_AGAIN 失败（不静默丢），超时由
+  // sweepExpiredWaiters 以 ETIMEDOUT 失败并摘除。底层回调正常到达时仍是「一次 lookup 派发给全部等待项」。
   const pending = dnsPending.get(key)
   if (pending) {
-    pending.push({ callback, all: wantAll })
+    if (pending.entries.length >= DNS_PENDING_MAX_WAITERS) {
+      const err = dnsPendingError('EAI_AGAIN',
+        `DNS 等待队列已满（同 key ${pending.entries.length} 项 ≥ 上限 ${DNS_PENDING_MAX_WAITERS}），本次调用按失败返回，可重试`)
+      // 与缓存命中路径同口径：回调一律异步派发，绝不在 dnsLookup 里同步回调调用方
+      queueMicrotask(() => dispatchLookupResult(callback, wantAll, err))
+      return
+    }
+    pending.entries.push({ callback, all: wantAll, deadline: Date.now() + DNS_PENDING_TIMEOUT_MS })
+    armPendingTimer(key, pending)
     return
   }
-  const pendingList = [{ callback, all: wantAll }]
-  dnsPending.set(key, pendingList)
-  dns.lookup(hostname, { ...opts, all: true }, (error, address, family) => {
+  // PR #362 评审：新建底层查询之前先过在飞上限——等待项超时只摘记账、不回收在飞查询，若不设上限，
+  // 坏解析器下同 key 每轮重试都再起一条 getaddrinfo，最终占满 libuv 线程池并拖慢同池文件操作。
+  // 与等待队列上限同口径：超限立即以 EAI_AGAIN 失败（可重试），回调一律异步派发。
+  const overLimit = inflightLimitError(key)
+  if (overLimit) {
+    queueMicrotask(() => dispatchLookupResult(callback, wantAll, overLimit))
+    return
+  }
+  const record = { entries: [{ callback, all: wantAll, deadline: Date.now() + DNS_PENDING_TIMEOUT_MS }], timer: null }
+  dnsPending.set(key, record)
+  armPendingTimer(key, record)
+  startInflightLookup(key, hostname, opts, (error, address, family) => {
     // v3.263（CodeAnt）：只派发并缓存本次记账列表——abort 摘除回调后若同一 key 已有新 lookup
     // 接管，旧 lookup 完成时不得清空/派发到新列表，也不得写缓存（接管等待期间新调用方会读到
-    // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）
-    if (dnsPending.get(key) !== pendingList) return
+    // 旧结果，且晚到的旧回调会覆盖更新的缓存条目；新 lookup 会缓存自己的结果）。
+    // C10-074：超时也走同一条身份检查——sweep 已把 key 摘掉/换新，晚到的旧回调整条丢弃。
+    if (dnsPending.get(key) !== record) return
     dnsPending.delete(key)
+    clearPendingTimer(record)
     const ttl = error ? DNS_ERROR_TTL_MS : DNS_TTL_MS
     dnsCache.set(key, { error, address, family, expiresAt: Date.now() + ttl })
-    for (const entry of pendingList) dispatchLookupResult(entry.callback, entry.all, error, address, family)
+    for (const entry of record.entries) dispatchLookupResult(entry.callback, entry.all, error, address, family)
   })
 }
 
@@ -199,12 +433,18 @@ function prewarmDns (hostname, signal = null) {
       done(error, address, family)
     }
     const onAbort = () => {
-      const pending = key === null ? null : dnsPending.get(key)
-      if (pending) {
-        // dnsPending 条目是 { callback, all }：按回调身份定位本记账项
-        const i = pending.findIndex(entry => entry.callback === callback)
-        if (i !== -1) pending.splice(i, 1)
-        if (pending.length === 0) dnsPending.delete(key)
+      const record = key === null ? null : dnsPending.get(key)
+      if (record) {
+        // 等待项条目是 { callback, all, deadline }：按回调身份定位本记账项
+        const i = record.entries.findIndex(entry => entry.callback === callback)
+        if (i !== -1) record.entries.splice(i, 1)
+        if (record.entries.length === 0) {
+          // 本 key 已无等待项：连同 deadline 计时器一起摘除，别留一个空壳 timer
+          clearPendingTimer(record)
+          dnsPending.delete(key)
+        } else {
+          armPendingTimer(key, record) // 摘掉最早 deadline 的那项后要重排 timer
+        }
       }
       done(new Error('aborted'))
     }
@@ -315,4 +555,4 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   }
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls }
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS, DNS_REAL_INFLIGHT_MAX }

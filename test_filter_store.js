@@ -48,7 +48,10 @@ const RuleEngine = createRuleEngine({
   isRe2Available: () => true
 })
 const deps = { RuleEngine, compileUserRegex, re2Available: true }
-const noRe2Deps = { ...deps, re2Available: false }
+// 缺 re2 的真实形态：compileUserRegex 恒返回 null——xbk_function_v3 在无 re2 时**不回退 V8**
+// （见其 :52 注释），用户过滤正则一律编译失败。旧夹具用的是真 `new RegExp`，于是「无 re2」路径
+// 其实从来没被走到：任何 compileOk 都成功，C9-010 那类「唯一可用规则被误拒」的缺陷在测试里不可见。
+const noRe2Deps = { ...deps, re2Available: false, compileUserRegex: () => null }
 
 // 代码默认层夹具：含非字符串值（pingbilouzhu: 123）与额外非白名单键，用于验证「只取 11 字段 + String 安全化」。
 const DEFAULTS = {
@@ -234,6 +237,24 @@ test('RE2 不可用时返回 engine_unavailable，且不因无规则而误报', 
   )
   const empty = validateFilterRules({ revision: 0, filter: { pingbibiaoti: '', pingbitime: '5' } }, noRe2Deps)
   assert.strictEqual(empty.ok, true, `无正则规则时不应要求 RE2：${JSON.stringify(empty.errors)}`)
+})
+
+test('缺 re2：仅 pingbitime 规则必须放行（闸门 3 的豁免不得被 simpleRules 编译循环推翻）', () => {
+  // 运行期 pingbitime 用 Number 解析天数、不需要正则引擎，是缺 re2 环境里唯一还能用的规则。
+  // 闸门 3 的 hasRegexTarget 已为「仅时间规则」放行，但紧随其后的 simpleRules 编译循环漏了同一
+  // 守卫（ruleLines 的循环有 `rule.field !== 'pingbitime'`）⇒ 恒 null 的 compileOk 把它误判成
+  // invalid_value_regex，用户唯一能用的规则被拒。
+  const result = validateFilterRules({ revision: 0, filter: { pingbitime: '5' } }, noRe2Deps)
+  assert.strictEqual(result.ok, true, `仅时间规则在缺 re2 环境必须放行，实际 ${JSON.stringify(result.errors)}`)
+  // 其它字段留空时同属「仅时间规则」（旧断言在真 null 编译器下变红的那条形态）
+  assert.strictEqual(validateFilterRules({ revision: 0, filter: { pingbibiaoti: '', pingbitime: '5' } }, noRe2Deps).ok, true,
+    '空字段不参与编译，仅时间规则仍必须放行')
+  // 反向断言：一旦带上任何真正要编译的字段，缺 re2 仍必须 engine_unavailable（豁免不得外溢）
+  expectError(validateFilterRules({ revision: 0, filter: { pingbitime: '5', pingbibiaoti: '屏蔽' } }, noRe2Deps),
+    'filter', 'engine_unavailable', '含正则字段时仍要求 RE2')
+  // 分类###天数 形态里的「分类」本身就是正则，缺 re2 时仍必须要求引擎（豁免只覆盖纯天数规则）
+  expectError(validateFilterRules({ revision: 0, filter: { pingbitime: '5###7' } }, noRe2Deps),
+    'filter', 'engine_unavailable', 'pingbitime 带分类正则时仍要求 RE2')
 })
 
 test('非法正则被拒绝', () => {
