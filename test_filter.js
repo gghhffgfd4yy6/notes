@@ -238,6 +238,22 @@ function assertEqual (actual, expected, msg) {
   }
 }
 
+// C4-024：Config.cache.maxSize 的「保存 → 设置 → 还原」样板曾原样重复 16 份（5 处 100、两处 2、
+// 字符串/小数/0 各一处等），每份都手写一遍 try/finally。样板的问题不是长，而是「漏一处就静默泄漏」：
+// 少写 finally 或 finally 里少还原一处，都会把临时上限留给后续用例，且失败现场看不出是谁改的。
+// 统一入口后，本文件里对 maxSize 的赋值只允许出现在本函数内（源码门禁见用例 C4-024）。
+// 用 async + await：用例体若是 async（含 await），同步版 helper 会在 Promise settle 之前就还原，
+// 等于把上限提前改回去——这里必须等回调真正结算完再还原。
+async function withCacheMaxSize (maxSize, fn) {
+  const orig = Config.cache.maxSize
+  Config.cache.maxSize = maxSize
+  try {
+    return await fn()
+  } finally {
+    Config.cache.maxSize = orig
+  }
+}
+
 // C4-011：确定性 LCG 伪随机。此前同一行实现被**逐字复制** 26 份（19 份单行 + 7 份三行），
 // 改算法/模数要改 26 处、漏一处就让「固定 seed ⇒ 跨运行结果一致」的 fuzz 用例静默分叉。
 // 语义与旧副本逐字等价：seed_n = (seed_{n-1} * 1103515245 + 12345) % 2147483648，返回 [0,1)。
@@ -1386,98 +1402,74 @@ console.log('========================================\n');
   // ==================== 20. 缓存管理 更多场景 ====================
   console.log('\n📂 20. 缓存管理 更多场景')
 
-  await test('缓存超过100条 → 自动裁剪', () => {
+  await test('缓存超过100条 → 自动裁剪', () => withCacheMaxSize(100, () => {
     const name = 'test_trim.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限（默认已 10000）
-    try {
-      // 写入101条
-      for (let i = 0; i < 101; i++) {
-        appendMessageToFile({ id: i, title: `第${i}条` }, name)
-      }
-      // 验证最多保留100条（ID 1~100，第0条被删）
-      const r = isMessageInFile({ id: 0 }, name)
-      const r2 = isMessageInFile({ id: 100 }, name)
-      // 模块内 splice(0, length-100) 会删掉前1条；P4：被裁剪记录的身份进墓碑，
-      // isMessageInFile 仍应判重命中（防上游重放重复推送）
-      assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
-      assertEqual(r2, true)
-      // C4-010：用例名与注释都说「最多保留 100 条」，但上面两条只证明墓碑判重——**完全不裁剪**时
-      // 它们同样成立，对「是否裁剪」零鉴别力。这里直接读盘核对条数与保留区间（删最旧、留最新）。
-      const kept = readMessages(getFilePath(name))
-      assertEqual(kept.length, 100, `超出上限应裁到 100 条，实际 ${kept.length} 条`)
-      assertEqual(kept[0] && kept[0].id, 1, `裁剪应删掉最旧的第0条，实际首条 id=${kept[0] && kept[0].id}`)
-      assertEqual(kept[kept.length - 1] && kept[kept.length - 1].id, 100,
-        `最新一条必须保留，实际末条 id=${kept[kept.length - 1] && kept[kept.length - 1].id}`)
-    } finally {
-      Config.cache.maxSize = orig
+    // 写入101条
+    for (let i = 0; i < 101; i++) {
+      appendMessageToFile({ id: i, title: `第${i}条` }, name)
     }
-  })
+    // 验证最多保留100条（ID 1~100，第0条被删）
+    const r = isMessageInFile({ id: 0 }, name)
+    const r2 = isMessageInFile({ id: 100 }, name)
+    // 模块内 splice(0, length-100) 会删掉前1条；P4：被裁剪记录的身份进墓碑，
+    // isMessageInFile 仍应判重命中（防上游重放重复推送）
+    assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
+    assertEqual(r2, true)
+    // C4-010：用例名与注释都说「最多保留 100 条」，但上面两条只证明墓碑判重——**完全不裁剪**时
+    // 它们同样成立，对「是否裁剪」零鉴别力。这里直接读盘核对条数与保留区间（删最旧、留最新）。
+    const kept = readMessages(getFilePath(name))
+    assertEqual(kept.length, 100, `超出上限应裁到 100 条，实际 ${kept.length} 条`)
+    assertEqual(kept[0] && kept[0].id, 1, `裁剪应删掉最旧的第0条，实际首条 id=${kept[0] && kept[0].id}`)
+    assertEqual(kept[kept.length - 1] && kept[kept.length - 1].id, 100,
+      `最新一条必须保留，实际末条 id=${kept[kept.length - 1] && kept[kept.length - 1].id}`)
+  }))
 
-  await test('P4 裁剪后判重身份保留：被裁记录重放不重复入库', () => {
+  await test('P4 裁剪后判重身份保留：被裁记录重放不重复入库', () => withCacheMaxSize(50, () => {
     const name = 'test_tomb_replay.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 50 // 显式小上限触发条数裁剪
-    try {
-      for (let i = 0; i < 60; i++) appendMessageToFile({ id: i, title: `t${i}` }, name)
-      assertEqual(isMessageInFile({ id: 0 }, name), true, '被裁 id 0 应仍判重命中（墓碑）')
-      assertEqual(isMessageInFile({ id: 59 }, name), true, '未裁记录正常命中')
-      const before = readMessages(getFilePath(name)).length
-      assertEqual(before, 50, '消息数组应裁剪到 50 条')
-      // 重放被裁记录：saveBatch/append 不应再收进缓存（身份已在墓碑）
-      saveBatch([{ id: 0, title: 't0' }], name)
-      assertEqual(readMessages(getFilePath(name)).length, before, '重放被裁记录不应重复入库')
-      const r = appendMessageToFile({ id: 1, title: 't1' }, name)
-      assertEqual(r, true, '重放被裁记录应视为已判重（不触发落盘）')
-      assertEqual(readMessages(getFilePath(name)).length, before, 'append 重放被裁记录也不应重复入库')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    for (let i = 0; i < 60; i++) appendMessageToFile({ id: i, title: `t${i}` }, name)
+    assertEqual(isMessageInFile({ id: 0 }, name), true, '被裁 id 0 应仍判重命中（墓碑）')
+    assertEqual(isMessageInFile({ id: 59 }, name), true, '未裁记录正常命中')
+    const before = readMessages(getFilePath(name)).length
+    assertEqual(before, 50, '消息数组应裁剪到 50 条')
+    // 重放被裁记录：saveBatch/append 不应再收进缓存（身份已在墓碑）
+    saveBatch([{ id: 0, title: 't0' }], name)
+    assertEqual(readMessages(getFilePath(name)).length, before, '重放被裁记录不应重复入库')
+    const r = appendMessageToFile({ id: 1, title: 't1' }, name)
+    assertEqual(r, true, '重放被裁记录应视为已判重（不触发落盘）')
+    assertEqual(readMessages(getFilePath(name)).length, before, 'append 重放被裁记录也不应重复入库')
+  }))
 
-  await test('P4 过滤未推(_f)记录不落墓碑：规则改宽后仍可重新评估', () => {
+  await test('P4 过滤未推(_f)记录不落墓碑：规则改宽后仍可重新评估', () => withCacheMaxSize(100, () => {
     const name = 'test_tomb_f.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100
-    try {
-      for (let i = 0; i < 120; i++) appendMessageToFile({ id: i, title: `t${i}`, _f: true }, name)
-      // _f 记录从未推送：被裁剪后不应进墓碑 → isMessageInFile 判不存在
-      assertEqual(isMessageInFile({ id: 0 }, name), false, '过滤未推记录被裁剪后不应被墓碑误判')
-      // 同身份重放应能重新入库（规则改宽后可重新评估/推送）——墓碑未收录，正常 append
-      appendMessageToFile({ id: 0, title: 't0', _f: true }, name)
-      assertEqual(isMessageInFile({ id: 0 }, name), true, '过滤未推记录重放应重新收录')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    for (let i = 0; i < 120; i++) appendMessageToFile({ id: i, title: `t${i}`, _f: true }, name)
+    // _f 记录从未推送：被裁剪后不应进墓碑 → isMessageInFile 判不存在
+    assertEqual(isMessageInFile({ id: 0 }, name), false, '过滤未推记录被裁剪后不应被墓碑误判')
+    // 同身份重放应能重新入库（规则改宽后可重新评估/推送）——墓碑未收录，正常 append
+    appendMessageToFile({ id: 0, title: 't0', _f: true }, name)
+    assertEqual(isMessageInFile({ id: 0 }, name), true, '过滤未推记录重放应重新收录')
+  }))
 
-  await test('P4 墓碑四类身份 × 条数裁剪后 has() 命中 + save/saveBatch 不重写', () => {
+  await test('P4 墓碑四类身份 × 条数裁剪后 has() 命中 + save/saveBatch 不重写', () => withCacheMaxSize(20, () => {
     const name = 'test_tomb_4kinds_count.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 20
-    try {
-      // 四类身份各自灌满并触发条数裁剪：id / id+url / url-only / anon
-      for (let i = 0; i < 30; i++) appendMessageToFile({ id: i, title: `c${i}` }, name)
-      for (let i = 0; i < 30; i++) appendMessageToFile({ id: 100 + i, url: `https://idurl.example/${i}`, title: `d${i}` }, name)
-      for (let i = 0; i < 30; i++) appendMessageToFile({ url: `https://url.example/${i}`, title: `e${i}` }, name)
-      for (let i = 0; i < 30; i++) appendMessageToFile({ title: `匿名内容 f${i} 足够长避免退化` }, name)
-      const before = readMessages(getFilePath(name)).length
-      assertEqual(before, 20, '缓存应裁剪到 20 条')
-      // 四类被裁身份 has() 仍命中（墓碑兜底）
-      assertEqual(isMessageInFile({ id: 0 }, name), true, 'id 被裁身份应墓碑命中')
-      assertEqual(isMessageInFile({ id: 100, url: 'https://idurl.example/0' }, name), true, 'id+url 被裁身份应墓碑命中')
-      assertEqual(isMessageInFile({ url: 'https://url.example/0' }, name), true, 'url-only 被裁身份应墓碑命中')
-      assertEqual(isMessageInFile({ title: '匿名内容 f0 足够长避免退化' }, name), true, 'anon 被裁身份应墓碑命中')
-      // save/saveBatch 重放均不重新入库
-      saveBatch([{ id: 0 }], name)
-      appendMessageToFile({ id: 100, url: 'https://idurl.example/0' }, name)
-      appendMessageToFile({ url: 'https://url.example/0' }, name)
-      appendMessageToFile({ title: '匿名内容 f0 足够长避免退化' }, name)
-      assertEqual(readMessages(getFilePath(name)).length, before, '四类重放均不应重复入库')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    // 四类身份各自灌满并触发条数裁剪：id / id+url / url-only / anon
+    for (let i = 0; i < 30; i++) appendMessageToFile({ id: i, title: `c${i}` }, name)
+    for (let i = 0; i < 30; i++) appendMessageToFile({ id: 100 + i, url: `https://idurl.example/${i}`, title: `d${i}` }, name)
+    for (let i = 0; i < 30; i++) appendMessageToFile({ url: `https://url.example/${i}`, title: `e${i}` }, name)
+    for (let i = 0; i < 30; i++) appendMessageToFile({ title: `匿名内容 f${i} 足够长避免退化` }, name)
+    const before = readMessages(getFilePath(name)).length
+    assertEqual(before, 20, '缓存应裁剪到 20 条')
+    // 四类被裁身份 has() 仍命中（墓碑兜底）
+    assertEqual(isMessageInFile({ id: 0 }, name), true, 'id 被裁身份应墓碑命中')
+    assertEqual(isMessageInFile({ id: 100, url: 'https://idurl.example/0' }, name), true, 'id+url 被裁身份应墓碑命中')
+    assertEqual(isMessageInFile({ url: 'https://url.example/0' }, name), true, 'url-only 被裁身份应墓碑命中')
+    assertEqual(isMessageInFile({ title: '匿名内容 f0 足够长避免退化' }, name), true, 'anon 被裁身份应墓碑命中')
+    // save/saveBatch 重放均不重新入库
+    saveBatch([{ id: 0 }], name)
+    appendMessageToFile({ id: 100, url: 'https://idurl.example/0' }, name)
+    appendMessageToFile({ url: 'https://url.example/0' }, name)
+    appendMessageToFile({ title: '匿名内容 f0 足够长避免退化' }, name)
+    assertEqual(readMessages(getFilePath(name)).length, before, '四类重放均不应重复入库')
+  }))
 
   await test('P4 墓碑四类身份 × 字节裁剪后 has() 命中', () => {
     const name = 'test_tomb_4kinds_bytes.json'
@@ -1503,32 +1495,24 @@ console.log('========================================\n');
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { title: '匿名字节 f9' }), false, '未裁剪记录不应有墓碑')
   })
 
-  await test('P4 墓碑时序：条数裁剪后序列化失败 → 不落墓碑（CodeAnt Round2 Major）', () => {
+  await test('P4 墓碑时序：条数裁剪后序列化失败 → 不落墓碑（CodeAnt Round2 Major）', () => withCacheMaxSize(2, () => {
     const name = 'test_tomb_serialize_fail.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 2
-    try {
-      const circular = { id: 9, title: '循环引用' }
-      circular.self = circular
-      // 条数裁剪会先收集 {id:0}，但随后 JSON.stringify 失败 → 缓存未落盘，不得落墓碑
-      const ok = MessageStore.saveMessages(fp, [{ id: 0 }, { id: 1 }, circular])
-      assertEqual(ok, false, '序列化失败应返回 false')
-      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
-      const fsmod = require('node:fs')
-      assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    const circular = { id: 9, title: '循环引用' }
+    circular.self = circular
+    // 条数裁剪会先收集 {id:0}，但随后 JSON.stringify 失败 → 缓存未落盘，不得落墓碑
+    const ok = MessageStore.saveMessages(fp, [{ id: 0 }, { id: 1 }, circular])
+    assertEqual(ok, false, '序列化失败应返回 false')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
+    const fsmod = require('node:fs')
+    assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
+  }))
 
-  await test('P4 墓碑时序：缓存原子写失败 → 不落墓碑（CodeAnt Round2 Major）', () => {
+  await test('P4 墓碑时序：缓存原子写失败 → 不落墓碑（CodeAnt Round2 Major）', () => withCacheMaxSize(2, () => {
     const name = 'test_tomb_atomic_fail.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 2
     const fsmod = require('node:fs')
     const origRename = fsmod.renameSync
     try {
@@ -1538,7 +1522,6 @@ console.log('========================================\n');
       assertEqual(ok, false, '原子写失败应返回 false')
     } finally {
       fsmod.renameSync = origRename
-      Config.cache.maxSize = orig
     }
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
     assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
@@ -1546,7 +1529,7 @@ console.log('========================================\n');
     const ok2 = MessageStore.saveMessages(fp, [{ id: 0 }])
     assertEqual(ok2, true, '写盘失败后重放应正常落盘')
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '成功落盘但未裁剪不得产生墓碑')
-  })
+  }))
 
   await test('P4 墓碑时序：字节裁剪返回 null → 不产生墓碑（CodeAnt Round2 Major）', () => {
     const name = 'test_tomb_bytenull.json'
@@ -3317,35 +3300,23 @@ console.log('========================================\n');
     assertEqual(msgs[0].id, 1)
   })
 
-  await test('saveMessages 超过maxSize自动裁剪', () => {
+  await test('saveMessages 超过maxSize自动裁剪', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_trim2.json')
     const many = []
     for (let i = 0; i < 150; i++) many.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限
-    try {
-      saveMessages(p, many)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, many)
     const msgs = readMessages(p)
     assertEqual(msgs.length <= 100, true)
-  })
+  }))
 
-  await test('saveMessages maxSize 字符串配置生效（v3.176 修复#1：层间一致）', () => {
+  await test('saveMessages maxSize 字符串配置生效（v3.176 修复#1：层间一致）', () => withCacheMaxSize('5000', () => {
     const p = path.join(CACHE, 'test_trim3.json')
     const many = []
     for (let i = 0; i < 12000; i++) many.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = '5000' // 环境变量字符串（validateConfig 认合法，函数层曾静默回退 10000）
-    try {
-      saveMessages(p, many)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, many)
     const msgs = readMessages(p)
     assertEqual(msgs.length, 5000, `字符串 maxSize '5000' 应生效（曾回退默认 10000），实际 ${msgs.length}`)
-  })
+  }))
 
   // ==================== 39. {Html内容} 惰性计算分支 ====================
   console.log('\n📂 39. {Html内容} 惰性计算分支')
@@ -3476,23 +3447,17 @@ console.log('========================================\n');
   })
 
   // saveMessages 裁剪后数据正确
-  await test('saveMessages 裁剪后保留最新数据', () => {
+  await test('saveMessages 裁剪后保留最新数据', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_trim_new.json')
     const many = []
     for (let i = 0; i < 150; i++) many.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限
-    try {
-      saveMessages(p, many)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, many)
     const msgs = readMessages(p)
     // 裁剪后保留的是后面的数据（splice 删除前面的）
     assertEqual(msgs.length, 100)
     assertEqual(msgs.some(m => m.id === 0), false) // 最旧的被删
     assertEqual(msgs.some(m => m.id === 149), true) // 最新的保留
-  })
+  }))
 
   // ==================== 41. 错误分支覆盖 ====================
   console.log('\n📂 41. 错误分支覆盖')
@@ -4288,20 +4253,14 @@ console.log('========================================\n');
     assertEqual(r.length, 100) // 恰好100条不裁剪
   })
 
-  await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 maxSize=100 验证裁剪逻辑）', () => {
+  await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 maxSize=100 验证裁剪逻辑）', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_over100.json')
     const msgs = []
     for (let i = 0; i < 101; i++) msgs.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // 显式小上限，验证裁剪（不依赖默认 10000）
-    try {
-      saveMessages(p, msgs)
-    } finally {
-      Config.cache.maxSize = orig // v3.120b：finally 保证恢复（断言失败也恢复，防污染）
-    }
+    saveMessages(p, msgs)
     const r = readMessages(p)
     assertEqual(r.length, 100)
-  })
+  }))
 
   await test('htmlToMarkdown 连续换行合并', () => {
     // 3个以上连续换行应合并为2个
@@ -4572,23 +4531,17 @@ console.log('========================================\n');
     assertEqual(r2.pingbitime.rules[0].value, 3)
   })
 
-  await test('MS 裁剪用splice保留后100条', () => {
+  await test('MS 裁剪用splice保留后100条', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_splice.json')
     const msgs = []
     for (let i = 0; i < 150; i++) msgs.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限验证裁剪（默认已 10000）
-    try {
-      saveMessages(p, msgs)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, msgs)
     const r = readMessages(p)
     assertEqual(r.length, 100)
     // 裁剪应删前面的，保留后面的
     assertEqual(r.some(m => m.id === 0), false)
     assertEqual(r.some(m => m.id === 149), true)
-  })
+  }))
 
   // ==================== 62. 变异实证盲区修复（第41-50批） ====================
   console.log('\n📂 62. 变异实证盲区修复')
@@ -5204,20 +5157,14 @@ console.log('========================================\n');
     wipeBaks()
   })
 
-  await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => {
+  await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => withCacheMaxSize(100, () => {
     const arr = []
     for (let i = 0; i < 150; i++) arr.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限（默认已 10000）
-    try {
-      saveMessages(getFilePath('test_no_mutate.json'), arr)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(getFilePath('test_no_mutate.json'), arr)
     assertEqual(arr.length, 150, '原数组不应被截断')
     const r = readMessages(getFilePath('test_no_mutate.json'))
     assertEqual(r.length, 100)
-  })
+  }))
 
   await test('getFileName 查询参数/保留字符清洗（v3.21审查14）', () => {
     assertEqual(getFileName('http://x.com/a/b/c.json?token=1'), 'c.json')
@@ -5253,20 +5200,14 @@ console.log('========================================\n');
     // 类型归一后 String(1)===String("1") → 更新不重复
   })
 
-  await test('saveMessages 内存缓存与裁剪结果一致', () => {
+  await test('saveMessages 内存缓存与裁剪结果一致', () => withCacheMaxSize(100, () => {
     const p = getFilePath('test_trim_mem.json')
     const arr = []
     for (let i = 0; i < 150; i++) arr.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限（默认已 10000）
-    try {
-      saveMessages(p, arr)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, arr)
     const r = readMessages(p) // 应读内存缓存（已裁剪的 toSave）
     assertEqual(r.length, 100)
-  })
+  }))
 
   // ==================== 70. v3.22 审查报告修复 ====================
   console.log('\n📂 70. v3.22 审查报告修复')
@@ -5625,20 +5566,13 @@ console.log('========================================\n');
   // ==================== 78. 审查9轮(文档项升级) ====================
   console.log('\n📂 78. 审查9轮(文档项升级)')
 
-  await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.120）', () => {
-    const { Config } = require('./xbk_function_v3.js')
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 0 // 恶意/误配
+  await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.120）', () => withCacheMaxSize(0, () => {
     const arr = []
     for (let i = 0; i < 150; i++) arr.push({ id: i })
-    try {
-      saveMessages(getFilePath('test_maxsize0.json'), arr)
-    } finally {
-      Config.cache.maxSize = orig // v3.120b：finally 保证恢复
-    }
+    saveMessages(getFilePath('test_maxsize0.json'), arr)
     const r = readMessages(getFilePath('test_maxsize0.json'))
     assertEqual(r.length, 150, 'maxSize=0 时回退默认 10000，150 条不裁剪')
-  })
+  }))
 
   // ==================== 79. 审查10轮高价值修复 ====================
   console.log('\n📂 79. 审查10轮高价值修复')
@@ -5754,9 +5688,7 @@ console.log('========================================\n');
     assert.deepStrictEqual(Object.keys(mod.Pusher), ['send'], 'Pusher 只应导出 send（改名/漏导都算回归）')
   })
 
-  await test('缓存裁剪给出提示（#243）', () => {
-    const orig = require('./xbk_function_v3.js').Config.cache.maxSize
-    require('./xbk_function_v3.js').Config.cache.maxSize = 5
+  await test('缓存裁剪给出提示（#243）', () => withCacheMaxSize(5, () => {
     const warns = []
     const origWarn = console.warn
     console.warn = (msg) => warns.push(String(msg))
@@ -5766,10 +5698,9 @@ console.log('========================================\n');
       saveMessages(getFilePath('test_trim_warn.json'), arr)
     } finally {
       console.warn = origWarn
-      require('./xbk_function_v3.js').Config.cache.maxSize = orig
     }
     assertEqual(warns.some(w => w.includes('裁剪')), true, '裁剪应提示')
-  })
+  }))
 
   await test('重复id覆盖给出提示（#252）', () => {
     const logs = []
@@ -7842,28 +7773,28 @@ console.log('========================================\n');
     assertEqual(_splitLines('abc'), null, '简单模式仍返回 null（无 ### 不拆分）')
   })
 
-  await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2 整数化）', () => {
-    const saved = Config.cache.maxSize
-    const fs = require('fs')
+  await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2 整数化）', async () => {
     const p = getFilePath('test_103_maxsize.json')
     const msgs = Array.from({ length: 100 }, (_, i) => ({ id: i, title: `t${i}` }))
     try {
       // 小数 maxSize → 回退默认 10000（v3.120）→ 100 条不裁剪
-      Config.cache.maxSize = 2.5
-      saveMessages(p, msgs)
-      assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 10000 不裁剪: ${readMessages(p).length}`)
+      await withCacheMaxSize(2.5, () => {
+        saveMessages(p, msgs)
+        assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 10000 不裁剪: ${readMessages(p).length}`)
+      })
       // 整数 maxSize=3 → 裁剪到 3 条（上限语义为整数条数）
-      Config.cache.maxSize = 3
-      saveMessages(p, msgs)
-      assertEqual(readMessages(p).length, 3, `整数 maxSize=3 应裁剪到 3 条: ${readMessages(p).length}`)
+      await withCacheMaxSize(3, () => {
+        saveMessages(p, msgs)
+        assertEqual(readMessages(p).length, 3, `整数 maxSize=3 应裁剪到 3 条: ${readMessages(p).length}`)
+      })
       // 0/负值仍回退默认（原行为保持）
-      Config.cache.maxSize = 0
-      saveMessages(p, msgs)
-      assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认 10000 不裁剪')
+      await withCacheMaxSize(0, () => {
+        saveMessages(p, msgs)
+        assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认 10000 不裁剪')
+      })
     } finally {
-      Config.cache.maxSize = saved
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-      try { fs.unlinkSync(p + '.tmp') } catch (e) { /* 忽略 */ }
+      try { require('fs').unlinkSync(p) } catch (e) { /* 文件不存在即视为无残留 */ }
+      try { require('fs').unlinkSync(p + '.tmp') } catch (e) { /* 文件不存在即视为无残留 */ }
     }
   })
 
@@ -11665,6 +11596,55 @@ console.log('========================================\n');
     const boiler = self.split('\n').filter((l) => /^\s*assertEqual\((?:r|result)\.includes\('原文链接'\), true\)$/.test(l))
     assertEqual(boiler.length <= 2, true,
       `同一句样板应只留 1–2 处（模板类 + 格式专门用例），实际 ${boiler.length} 处：${JSON.stringify(boiler.map((l) => l.trim()))}`)
+  })
+
+  // ==================== 测试代码卫生（源码级门禁） ====================
+  // 这一节的门禁读本文件源码：被测对象是「测试代码本身」的卫生，运行期行为看不出来。
+  // 判据一律先自检（证明 detector 能认出坏样本）再扫源码，否则门禁会退化成恒绿。
+  console.log('\n📂 测试代码卫生')
+
+  const hygieneLines = () => require('fs').readFileSync(__filename, 'utf8').split('\n')
+  const isCommentLine = (ln) => {
+    const t = ln.trim()
+    return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')
+  }
+
+  await test('C4-024: Config.cache.maxSize 只允许经 withCacheMaxSize 修改', () => {
+    // needle 拼接：门禁源码里不出现字面量，避免自己命中自己
+    const ASSIGN = 'Config.cache.maxSize' + ' ='
+    const lines = hygieneLines()
+    const hits = []
+    lines.forEach((ln, i) => {
+      if (isCommentLine(ln)) return
+      if (ln.includes(ASSIGN)) hits.push(i + 1)
+    })
+    assertEqual(hits.length, 2,
+      `maxSize 赋值点必须只落在 withCacheMaxSize 内（2 处），实际 ${hits.length} 处：${hits.join(', ')}`)
+    const start = lines.findIndex(l => l.startsWith('async function withCacheMaxSize'))
+    assertEqual(start >= 0, true, '必须存在 async function withCacheMaxSize 定义')
+    let end = start + 1
+    while (lines[end] !== '}') end++
+    for (const n of hits) {
+      assertEqual(n > start + 1 && n <= end, true,
+        `第 ${n} 行赋值落在 helper（第 ${start + 1}-${end} 行）之外：${lines[n - 1].trim()}`)
+    }
+  })
+
+  await test('C4-024: withCacheMaxSize 回调期间生效、成功与抛错都还原', async () => {
+    const before = Config.cache.maxSize
+    let seen = null
+    await withCacheMaxSize(7, () => { seen = Config.cache.maxSize })
+    assertEqual(seen, 7, '回调执行期间应看到临时上限 7')
+    assertEqual(Config.cache.maxSize, before, '成功返回后必须还原')
+    let caught = null
+    try {
+      await withCacheMaxSize(9, async () => {
+        assertEqual(Config.cache.maxSize, 9, 'async 回调期间临时上限应生效（同步版 helper 会提前还原）')
+        throw new Error('boom')
+      })
+    } catch (e) { caught = e.message }
+    assertEqual(caught, 'boom', '回调异常必须原样抛出（不得被 helper 吞掉）')
+    assertEqual(Config.cache.maxSize, before, '抛错后也必须还原')
   })
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
