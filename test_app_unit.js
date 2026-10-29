@@ -2188,6 +2188,28 @@ check('通道健康锁: 释放时 fd 落在 stdio（0/1/2）仍清理锁文件�
   assert.deepStrictEqual(unlinked, [], '未取到锁（null/-1）不得 unlink 他人的锁文件')
 })
 
+// N2 回归：>2 分支本身要有牙——此前把 `if (lockFd > 2) closeSync` 整段删掉，套件仍 242/242 全绿。
+check('通道健康锁: 释放时 fd>2 必须 close（close 分支不被静默删除）', () => {
+  const realFs = require('fs')
+  const closed = []
+  const app = makeHealthApp({
+    fs: {
+      closeSync: (fd) => { closed.push(fd); realFs.closeSync(fd) },
+      unlinkSync: () => {}
+    }
+  })
+  const probe = realFs.openSync(healthPath + '.fdprobe', 'w')
+  try {
+    assert.ok(probe > 2, `探针 fd 必须 >2，实际 ${probe}`)
+    app._releaseChannelHealthLock(healthPath + '.lock', probe)
+    assert.deepStrictEqual(closed, [probe], `fd>2 时必须 close 锁 fd，实际关闭：${closed.join(',') || '无'}`)
+    assert.throws(() => realFs.fstatSync(probe), /EBADF/, 'close 之后该 fd 必须已失效')
+  } finally {
+    try { realFs.closeSync(probe) } catch { /* 已关闭 */ }
+    try { realFs.unlinkSync(healthPath + '.fdprobe') } catch { /* 不存在 */ }
+  }
+})
+
 check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })

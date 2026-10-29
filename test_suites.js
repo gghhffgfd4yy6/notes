@@ -95,9 +95,9 @@ const SUITES = [
   // 其报告/状态簇的存活变异体无人认领。本套件在**进程内**用最小桩构造 createApp(...) 后直接
   // 调用目标方法（不走子进程 ⇒ 可被变异测试的 perTest 覆盖归因）。
   // C5-083（口径）：desc 此前只列 3 个方法（_isValidReportDate/_loadReportState/_normalizeReportState），
-  // 与套件的真实覆盖严重不符 —— 实测 242 例，覆盖报告/状态、日志写入、告警/模板三大簇 + RE2 警告标记
+  // 与套件的真实覆盖严重不符 —— 实测 243 例，覆盖报告/状态、日志写入、告警/模板三大簇 + RE2 警告标记
   // 生命周期 + 通道健康降级 + 覆盖文件按轮生效。desc 按簇列出，避免读者把它当成「只测 3 个方法」。
-  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 进程内 242 例：报告/状态簇（_isValidReportDate/_blankReportState/_safeCounter/_normalizeReportState/_loadReportState/_reportToday/_persistReportState）+ 日志写入簇（_writeRunLog/_warnLowDisk/_writeState/_writeTextAtomic/_isRegularOrMissing/_localStamp）+ 告警/模板簇（_enabledFlag/_validateTplConfig/_accumulateReport/_sendCrossDayReport/_updateReport/_sendAlert）+ RE2 警告标记生命周期/通道健康降级/PID 复用/覆盖文件按轮生效 FR-1..3/DR-1 dry-run' },
+  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 进程内 243 例：报告/状态簇（_isValidReportDate/_blankReportState/_safeCounter/_normalizeReportState/_loadReportState/_reportToday/_persistReportState）+ 日志写入簇（_writeRunLog/_warnLowDisk/_writeState/_writeTextAtomic/_isRegularOrMissing/_localStamp）+ 告警/模板簇（_enabledFlag/_validateTplConfig/_accumulateReport/_sendCrossDayReport/_updateReport/_sendAlert）+ RE2 警告标记生命周期/通道健康降级/PID 复用/覆盖文件按轮生效 FR-1..3/DR-1 dry-run' },
   // G11：scripts/audit-gate.js 是 fail-closed 安全门禁（v3.276 续 / PR #194 引入），此前**零测试**
   // ——只在 test.yml:218 被 `node scripts/audit-gate.js` 调用过，仓库里没有任何断言指向它。
   // 于是「豁免只针对 GHSA-CH52-4W7C-C8XP、其余高危一律拦」这条契约无人守护：放宽 ALLOWED_ADVISORIES、
