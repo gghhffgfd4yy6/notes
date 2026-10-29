@@ -290,7 +290,9 @@ const deps = async (spec) => {
     spawns.push({ cmd: cmd, args: args, cwd: opts && opts.cwd, stdio: opts && opts.stdio, timeout: opts && opts.timeout })
     const step = plan[n] || {}
     n += 1
+    // after: 安装/重建之后被测代码会再 load 一次——用它模拟「装完就好了」与「装完变成另一种错误」。
     if (step.after === 'eaccesGot') bare.got = { code: 'EACCES' }
+    if (step.after === 'installed') { bare.got = 'ok'; bare.re2 = 'ok' }
     return step.result || { status: 0 }
   }
   const r = await cap(() => mod.ensureDependencies({
@@ -337,6 +339,10 @@ const deps = async (spec) => {
   // 只留探针的版本仍然全绿）。
   out.deps.autoInstallOff = await deps({ bare: { got: 'nf', re2: 'ok' }, autoInstall: false })
   out.deps.installFails = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ result: { status: 4 } }] })
+  // 恢复**成功**的出口（QX-04 的正常路径）：装完依赖可加载 ⇒ 必须静默返回 undefined，既不 rebuild 也不报错。
+  // 旧直调副本用 installed 翻转锁的就是这条出口；只留「装完仍不可用」的场景时，「装完一律报错」的变异体无一能杀。
+  out.deps.installRecovers = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'installed' }] })
+  out.deps.installRecoversNoLock = await deps({ bare: { got: 'nf', re2: 'ok' }, lock: false, plan: [{ after: 'installed' }] })
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: path.join(ROOT, 'abs-cache') } })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: {} })))
   out.cache.push(await cap(() => mod.statusCacheDir({ env: { XBK_CACHE_DIR: 'rel/cache' } })))
@@ -435,6 +441,12 @@ const deps = async (spec) => {
   assert.deepStrictEqual(d.deps.autoInstallOff.warns, [], '未设置自动安装时不得打印「已执行恢复」告警')
   assert.strictEqual(d.deps.installFails.thrown && d.deps.installFails.thrown.message, 'npm ci 失败，退出码 4', '安装非零退出必须报 npm ci 失败并带真实退出码')
   assert.strictEqual(d.deps.installFails.spawns.length, 1, '安装失败必须立刻中止，不得继续 rebuild')
+  assert.strictEqual(d.deps.installRecovers.thrown, null, '安装后依赖可加载时必须静默返回（恢复成功不得报错）')
+  assert.strictEqual(d.deps.installRecovers.spawns.length, 1, '恢复成功只应触发一次安装（re2 已可加载 ⇒ 不 rebuild）')
+  assert.deepStrictEqual(d.deps.installRecovers.spawns[0].args, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT], '有锁文件时恢复成功走的仍是冻结 npm ci')
+  assert.deepStrictEqual(d.deps.installRecovers.warns, [OK_MSG], '恢复成功只允许一条「已执行恢复」告警')
+  assert.strictEqual(d.deps.installRecoversNoLock.thrown, null, '无锁文件时 install 后依赖可加载同样必须静默返回')
+  assert.deepStrictEqual(d.deps.installRecoversNoLock.spawns[0].args, ['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', ROOT, '--no-package-lock'], '无锁文件的恢复成功路径必须是 install --no-package-lock')
 
   // --- retryBackoffMs / statusCacheDir / nodeVersionWarning ---
   assert.deepStrictEqual(d.backoff, [1, 1, 1000, 1000], 'cap=1 是合法下界必须生效，非法 cap 回退默认 30 分钟封顶（1000 起步）')
