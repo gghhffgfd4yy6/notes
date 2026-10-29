@@ -13,7 +13,30 @@ const {
   nodeVersionWarning
 } = require('./qinglong/xbk_push')
 
-;(async () => {
+// console 三路的**唯二**允许改写点（C5-063）：基线在这里取一次，捕获函数必须在 finally 里还原到基线。
+// 旧写法在两个并发的顶层 IIFE 里各改一次 console，前半段的静音正好罩住后半段的同步前缀 ⇒ 后半段的
+// 完成行与失败输出被吞掉（实测：整套只打印一条 OK）。
+const NATIVE_CONSOLE = Object.freeze({ log: console.log, warn: console.warn, error: console.error })
+async function captureConsole (fn) {
+  const logs = []
+  const warns = []
+  const errs = []
+  console.log = (...a) => { logs.push(a.join(' ')) }
+  console.warn = (...a) => { warns.push(a.join(' ')) }
+  console.error = (...a) => { errs.push(a.join(' ')) }
+  let value
+  try {
+    value = await fn()
+  } finally {
+    console.log = NATIVE_CONSOLE.log
+    console.warn = NATIVE_CONSOLE.warn
+    console.error = NATIVE_CONSOLE.error
+  }
+  return { value, logs, warns, errs }
+}
+
+// 第一段：纯函数 + ensureDependencies 的进程内断言（依赖恢复的边界分支在文末的子进程探针里）。
+const runUnitChecks = async () => {
   // 导出面守卫（C5-060 去重后仍需要这个符号：真正调用它的是文末的子进程探针，这里是「本套件确实在测它」的
   // 显式声明，删掉导出一行即红——否则误删 import 后本套件会安静地只剩探针那一侧）。
   assert.strictEqual(typeof ensureDependencies, 'function', 'ensureDependencies 必须由 qinglong/xbk_push 导出')
@@ -66,23 +89,23 @@ const {
 
   // ===== QX-02：--dry-run 一次性执行 =====
   // runDryRunOnce 只跑一轮：成功 → 0，全失败 → 1（不做常驻退避重试）。
-  const origLog = console.log
-  const origErr = console.error
-  console.log = () => {}
-  console.error = () => {}
+  // 输出用 captureConsole 局部捕获（C5-063）：旧写法直接 `console.log = () => {}` 静音整个进程，
+  // 在 `await` 窗口里连并发段的输出一起吞掉；现在只包住这两次调用，finally 还原到模块加载时的基线。
   let dryRunCalls = 0
-  let dryRunCode
-  let dryRunFailCode
-  try {
-    dryRunCode = await runDryRunOnce({ run: async () => { dryRunCalls += 1; return { total: 3, filtered: 1, pushed: 0, failed: 0 } } })
-    dryRunFailCode = await runDryRunOnce({ run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'E_NET', statusCode: 503 }] }) })
-  } finally {
-    console.log = origLog
-    console.error = origErr
-  }
+  const dryRun = await captureConsole(async () => {
+    const code = await runDryRunOnce({ run: async () => { dryRunCalls += 1; return { total: 3, filtered: 1, pushed: 0, failed: 0 } } })
+    const failCode = await runDryRunOnce({ run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'E_NET', statusCode: 503 }] }) })
+    return { code, failCode }
+  })
+  const dryRunCode = dryRun.value.code
+  const dryRunFailCode = dryRun.value.failCode
   assert.strictEqual(dryRunCalls, 1, 'dry-run 只能调用 app.run() 一次（一次性执行）')
   assert.strictEqual(dryRunCode, 0, '单轮成功应返回退出码 0')
   assert.strictEqual(dryRunFailCode, 1, '单轮全失败应返回退出码 1')
+  assert.deepStrictEqual(dryRun.logs, ['dry-run 单轮完成：共 3 条，过滤 1 条，未推送、未写成功缓存'],
+    '捕获范围内必须能看到成功轮的完成行（证明捕获确实包住了被测调用，且没漏到宿主 stdout）')
+  assert.strictEqual(dryRun.errs.length, 1, '失败轮必须经 console.error 报一条根因')
+  assert.strictEqual(console.log, NATIVE_CONSOLE.log, 'captureConsole 必须把 console.log 还原到基线（不得泄漏到后续代码）')
 
   // 接线断言（与 test_cli.js:31 同一种源码级手法）：main() 的 --dry-run 分支必须调用 runDryRunOnce
   // 并 return，绝不能继续落到 runResident(...)。回退旧行为（只设 XBK_DRY_RUN=1 即常驻）时本断言必红。
@@ -199,13 +222,19 @@ const {
   }
 
   console.log('test_qinglong_utils OK')
-})().catch((e) => { console.error(e); process.exit(1) })
+}
 
 // ===== 追加：qinglong/xbk_push.js「入口」契约回归（QX-02/QX-04/QX-05/QX-08/QX-09）=====
 // 断言对着 SYSTEM_CONTRACT.md 的「入口」条：退出码语义、失败文案、可恢复判定、恢复命令、
-// 包名白名单 fail-closed、缓存目录口径。可观测输出（console 三路/退出码）一律在独立子进程取，
-// 避免与既有套件并发共享 console/process.stdout 造成捕获串扰；不依赖时区/网络/遍历顺序。
-;(async () => {
+// 包名白名单 fail-closed、缓存目录口径。可观测输出（console 三路/退出码）一律在独立子进程取——
+// 本段确实不读宿主 console，但**上面那一段会临时改写 console**，所以两段必须串行（见文件末尾的
+// runUnitChecks().then(runEntryContractChecks)）：并发时本段的同步前缀会落在上一段的捕获窗口里，
+// 完成行与失败诊断都会被吞掉（C5-063 实测）。
+const runEntryContractChecks = async () => {
+  // 宿主 console 基线核对（C5-063）：上面那段用 captureConsole 临时换掉三路 console，必须在它 resolve
+  // 之前还原。这条断言是「两段串行 + 捕获成对」的可执行判据——两段重新并发时它会立刻红（实测于旧结构）。
+  assert.strictEqual(console.log, NATIVE_CONSOLE.log, '上一段的 console 捕获必须在 await 前后成对还原（C5-063）')
+  assert.strictEqual(console.error, NATIVE_CONSOLE.error, '上一段的 console.error 捕获必须已还原（C5-063）')
   const ENTRY = path.join(__dirname, 'qinglong', 'xbk_push.js')
   const CHILD = `'use strict'
 const path = require('path')
@@ -431,4 +460,13 @@ const deps = async (spec) => {
   assert.strictEqual(unknown.stdout, '', '未知参数不得输出状态报告')
 
   console.log('test_qinglong_utils OK (entry contract)')
-})().catch((e) => { fs.writeSync(2, 'entry-contract FAIL: ' + (e && e.stack ? e.stack : String(e)) + '\n'); process.exit(1) })
+}
+
+// 两段**串行**执行（C5-063）：旧写法是两个并发的顶层 IIFE，第一段在 `await runDryRunOnce` 的窗口里
+// 把 console.log/error 换成空函数，第二段的同步前缀（构造子进程脚本 + spawnSync 探针 + 全部断言）
+// 正好整段落在那个窗口里 ⇒ 它的完成行与失败诊断被吞掉，且两段的断言顺序不可预期。
+// 串行后：第一段的捕获在 captureConsole 的 finally 里还原（第二段开工前那条 console 基线断言会核对），
+// 任一段抛错都走同一个 catch（打栈 + exit 1），不再各自抢着 process.exit。
+runUnitChecks()
+  .then(runEntryContractChecks)
+  .catch((e) => { fs.writeSync(2, 'test_qinglong_utils FAIL: ' + (e && e.stack ? e.stack : String(e)) + '\n'); process.exit(1) })
