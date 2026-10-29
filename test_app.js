@@ -2698,10 +2698,22 @@ console.log('========================================\n');
     const unitSrc = fs.readFileSync(path.join(__dirname, 'test_app_unit.js'), 'utf8')
     // 口径与 test_app_p.js 的分片提取一致（它按同一正则给本文件分片，改名后两者必须同步）
     const declared = [...selfSrc.matchAll(/await test\((['"])(.*?)\1,/g)].map(m => m[2])
+    // 按同一正则切出每个用例的**源码体**：登记表不能靠随便写 12 个名字通过——点名的用例必须真的
+    // 直调 xbk.App._*（这条把「登记对象是否名副其实」也变成可证伪的）。
+    const testBodies = new Map()
+    {
+      const marks = [...selfSrc.matchAll(/await test\((['"])(.*?)\1,/g)]
+      for (let i = 0; i < marks.length; i++) {
+        const stop = i + 1 < marks.length ? marks[i + 1].index : selfSrc.length
+        testBodies.set(marks[i][2], selfSrc.slice(marks[i].index, stop))
+      }
+    }
     assertEqualNum(PRIVATE_CALL_REGISTRY.length, 12,
       '私有方法级用例登记表应覆盖 12 条（新增/删除私有方法级用例时必须同步登记与理由）')
     for (const entry of PRIVATE_CALL_REGISTRY) {
       assert(declared.includes(entry.name), `登记表点名的用例已不存在（改名/删除后未同步登记）：${entry.name}`)
+      assert(/xbk\.App\._/.test(testBodies.get(entry.name) || ''),
+        `登记表点名的用例必须真的直调 xbk.App._*（否则它不是「私有方法级用例」，不该占登记位）：${entry.name}`)
       assert(!!(entry.unit || entry.why), `每条登记必须给出 unit 侧等价锚点或「只有集成侧能观测」的理由：${entry.name}`)
       if (entry.unit) {
         assert(unitSrc.includes(entry.unit),
