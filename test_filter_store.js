@@ -650,6 +650,36 @@ test('writeAppliedSnapshot 写入 0600 快照，readAppliedSnapshot 可读回', 
   assert.deepStrictEqual(readJson(paths.applied), read.snapshot)
 })
 
+// C5-047：writeAppliedSnapshot 的返回值是「快照到底有没有写成」的唯一信号（xbk_app 用它打 warn + run log），
+// 但此前全文件只有一条 `strictEqual(wrote, true)` 正向断言 —— 把实现改成恒 true，整套仍然全绿
+// （本条已用变异探针实测）。下面两条把失败分支钉死：返回 false、不抛、不留半成品。
+test('writeAppliedSnapshot 失败分支：applied 路径被目录占位 → 返回 false、不抛、不改占位', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  fs.mkdirSync(paths.applied) // 目标路径是目录：writeAtomic 的 isRegularOrMissing 拒绝写入
+  let wrote
+  assert.doesNotThrow(() => {
+    wrote = writeAppliedSnapshot({ cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 1, source: 'override', hash: 'h' })
+  }, '写不进去属于可预期失败，必须返回 false 而不是抛错（调用方按布尔处理）')
+  assert.strictEqual(wrote, false, '快照没写成必须返回 false（恒 true 的实现会让调用方以为已落盘）')
+  assert.strictEqual(fs.statSync(paths.applied).isDirectory(), true, '失败时不得删除/替换占位目录')
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'ioError', '读回必须如实报告 ioError，不得假装有一份快照')
+})
+
+test('writeAppliedSnapshot 失败分支：目录不可写 → 返回 false 且不留半成品快照', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  fs.chmodSync(dir, 0o500)
+  try {
+    const wrote = writeAppliedSnapshot({ cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'override', hash: 'h' })
+    assert.strictEqual(wrote, false, 'EACCES 下必须返回 false（不得把失败报成成功）')
+    assert.strictEqual(fs.existsSync(paths.applied), false, '写入失败不得留下快照文件')
+    assert.strictEqual(readAppliedSnapshot(dir).status, 'missing', '失败后状态仍应是 missing，而不是一份可疑的快照')
+  } finally {
+    fs.chmodSync(dir, 0o700)
+  }
+})
+
 test('readAppliedSnapshot：missing / invalid / ioError 三态', () => {
   const dir = makeDir()
   assert.strictEqual(readAppliedSnapshot(dir).status, 'missing')
