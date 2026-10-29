@@ -335,11 +335,10 @@ async function expectRunThrows () {
 }
 
 // Qodo PR #158 回归用：与 test_filter.js 的 assertEqual / assert.strictEqual 同口径的严格相等断言。
-// 单独命名（assertEqualStr/Num）以免与上面的布尔断言 ok 混淆，也不引入 node:assert。
-function assertEqualStr (actual, expected, msg) {
-  if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
-}
-function assertEqualNum (actual, expected, msg) {
+// 单独命名（assertStrictEqual）以免与上面的布尔断言 ok 混淆，也不引入 node:assert。
+// 此前它有两个逐字相同的实现（assertEqualStr / assertEqualNum，只差名字）：同一断言两个名字会让
+// 「改错误文案要同步两处」，也让调用面被拆成两半、grep 一个名字看不全（C5-082）。现合并为一个。
+function assertStrictEqual (actual, expected, msg) {
   if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
 }
 
@@ -2054,13 +2053,13 @@ console.log('========================================\n');
       Config.channelHealth.consecutiveFailures = 0
       Config.channelHealth.intervalMs = 1
       reset()
-      assertEqualNum(Config.push.parallelLimit, DEFAULTS.parallelLimit, 'reset 必须把 push.parallelLimit 恢复默认 10')
-      assertEqualNum(Config.timing.pushInterval, DEFAULTS.pushInterval, 'reset 必须把 timing.pushInterval 恢复默认 0')
-      assertEqualNum(Config.timing.finalWait, DEFAULTS.finalWait, 'reset 必须把 timing.finalWait 恢复默认 0')
-      assertEqualNum(Config.alert.intervalMs, DEFAULTS.alertIntervalMs, 'reset 必须把 alert.intervalMs 恢复默认 3600000')
+      assertStrictEqual(Config.push.parallelLimit, DEFAULTS.parallelLimit, 'reset 必须把 push.parallelLimit 恢复默认 10')
+      assertStrictEqual(Config.timing.pushInterval, DEFAULTS.pushInterval, 'reset 必须把 timing.pushInterval 恢复默认 0')
+      assertStrictEqual(Config.timing.finalWait, DEFAULTS.finalWait, 'reset 必须把 timing.finalWait 恢复默认 0')
+      assertStrictEqual(Config.alert.intervalMs, DEFAULTS.alertIntervalMs, 'reset 必须把 alert.intervalMs 恢复默认 3600000')
       ok(Config.channelHealth.enabled === DEFAULTS.chEnabled, 'reset 必须把 channelHealth.enabled 恢复默认 true')
-      assertEqualNum(Config.channelHealth.consecutiveFailures, DEFAULTS.chFailures, 'reset 必须把 channelHealth.consecutiveFailures 恢复默认 3')
-      assertEqualNum(Config.channelHealth.intervalMs, DEFAULTS.chIntervalMs, 'reset 必须把 channelHealth.intervalMs 恢复默认 3600000')
+      assertStrictEqual(Config.channelHealth.consecutiveFailures, DEFAULTS.chFailures, 'reset 必须把 channelHealth.consecutiveFailures 恢复默认 3')
+      assertStrictEqual(Config.channelHealth.intervalMs, DEFAULTS.chIntervalMs, 'reset 必须把 channelHealth.intervalMs 恢复默认 3600000')
     } finally {
       reset()
     }
@@ -2652,18 +2651,18 @@ console.log('========================================\n');
         isolatedDirSeen = stateDir
         ok(fs.existsSync(stateDir), '夹具必须先建好隔离目录（否则用例会写到真实缓存目录）')
         ok(Config.cache.dir === path.basename(stateDir), `夹具必须把 cache.dir 指到隔离目录，实际 ${Config.cache.dir}`)
-        assertEqualNum(Config.channelHealth.consecutiveFailures, 1, 'opts.failures 必须生效')
-        assertEqualNum(Config.channelHealth.intervalMs, 1234, 'opts.intervalMs 必须生效')
+        assertStrictEqual(Config.channelHealth.consecutiveFailures, 1, 'opts.failures 必须生效')
+        assertStrictEqual(Config.channelHealth.intervalMs, 1234, 'opts.intervalMs 必须生效')
         throw new Error('boom')
       })
     } catch (e) {
       threw = e.message === 'boom'
     }
     ok(threw, 'body 抛错必须原样冒泡（夹具不得吞掉用例失败原因）')
-    assertEqualStr(Config.cache.dir, before.dir, '夹具必须还原 cache.dir')
+    assertStrictEqual(Config.cache.dir, before.dir, '夹具必须还原 cache.dir')
     ok(Config.channelHealth.enabled === before.enabled, `夹具必须还原 channelHealth.enabled，实际 ${Config.channelHealth.enabled}`)
-    assertEqualNum(Config.channelHealth.consecutiveFailures, before.failures, '夹具必须还原 channelHealth.consecutiveFailures')
-    assertEqualNum(Config.channelHealth.intervalMs, before.interval, '夹具必须还原 channelHealth.intervalMs（旧 9 份夹具里 4 份就漏了这个）')
+    assertStrictEqual(Config.channelHealth.consecutiveFailures, before.failures, '夹具必须还原 channelHealth.consecutiveFailures')
+    assertStrictEqual(Config.channelHealth.intervalMs, before.interval, '夹具必须还原 channelHealth.intervalMs（旧 9 份夹具里 4 份就漏了这个）')
     ok(isolatedDirSeen && !fs.existsSync(isolatedDirSeen),
       `夹具必须删除自己的隔离目录（否则仓库根会堆 xianbaoku_cache_p*_channel_health_*）：${isolatedDirSeen}`)
   })
@@ -2712,7 +2711,7 @@ console.log('========================================\n');
         testBodies.set(marks[i][2], selfSrc.slice(marks[i].index, stop))
       }
     }
-    assertEqualNum(PRIVATE_CALL_REGISTRY.length, 12,
+    assertStrictEqual(PRIVATE_CALL_REGISTRY.length, 12,
       '私有方法级用例登记表应覆盖 12 条（新增/删除私有方法级用例时必须同步登记与理由）')
     for (const entry of PRIVATE_CALL_REGISTRY) {
       ok(declared.includes(entry.name), `登记表点名的用例已不存在（改名/删除后未同步登记）：${entry.name}`)
@@ -3875,8 +3874,8 @@ console.log('========================================\n');
       notifyFailAt = 1 // 第 1 条消息失败、第 2 条成功，第 3 次调用是告警
       fakeData = [makeItem({ id: 1 }), makeItem({ id: 2 })]
       const summary = await xbk.run()
-      assertEqualNum(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
-      assertEqualNum(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
+      assertStrictEqual(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
+      assertStrictEqual(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
       const log = require('fs').readFileSync(logPath, 'utf8')
       ok(log.includes('推送部分失败'), `部分失败应写 ERROR 行: ${log.slice(-200)}`)
       ok(pushCalls.some(c => String(c.desp || '').includes('推送部分失败')),
@@ -3979,29 +3978,29 @@ console.log('========================================\n');
 
       // ① 真目录：整体挪到备份位，内容一字不动（绝不能 rmSync）
       const stashed = stashCachePath(realDir, backupReal)
-      assertEqualStr(stashed, backupReal, `真目录应被挪到备份位，实得 ${stashed}`)
+      assertStrictEqual(stashed, backupReal, `真目录应被挪到备份位，实得 ${stashed}`)
       ok(!fs.existsSync(realDir), '真目录应离开原位（而不是复制/残留）')
-      assertEqualStr(fs.readFileSync(path.join(backupReal, 'push.json'), 'utf8'), '{"keep":1}', '备份内容必须逐字节保留')
+      assertStrictEqual(fs.readFileSync(path.join(backupReal, 'push.json'), 'utf8'), '{"keep":1}', '备份内容必须逐字节保留')
 
       // ② 还原：先摘掉测试自建的符号链接，再把备份原样搬回
       fs.symlinkSync(linkTarget, realDir)
-      assertEqualStr(restoreCachePath(realDir, stashed), 'restored', '有备份时必须还原')
+      assertStrictEqual(restoreCachePath(realDir, stashed), 'restored', '有备份时必须还原')
       ok(!fs.lstatSync(realDir).isSymbolicLink() && fs.lstatSync(realDir).isDirectory(), '还原后原位必须是真目录')
-      assertEqualStr(fs.readFileSync(path.join(realDir, 'tombstones.json'), 'utf8'), '["t1"]', '墓碑内容必须原样回来')
+      assertStrictEqual(fs.readFileSync(path.join(realDir, 'tombstones.json'), 'utf8'), '["t1"]', '墓碑内容必须原样回来')
       ok(!fs.existsSync(backupReal), '还原后备份位应已清空')
 
       // ③ 符号链接：只摘链接，链接目标的内容不得被碰
       fs.mkdirSync(linkTarget, { recursive: true })
       fs.writeFileSync(path.join(linkTarget, 'keep.txt'), 'keep', 'utf8')
       fs.symlinkSync(linkTarget, linkPath)
-      assertEqualStr(stashCachePath(linkPath, backupLink), null, '符号链接只摘链接、不产生备份')
+      assertStrictEqual(stashCachePath(linkPath, backupLink), null, '符号链接只摘链接、不产生备份')
       ok(!fs.existsSync(linkPath), '符号链接应被摘掉')
       ok(!fs.existsSync(backupLink), '符号链接不得产生备份目录')
-      assertEqualStr(fs.readFileSync(path.join(linkTarget, 'keep.txt'), 'utf8'), 'keep', '链接目标内容不得被删')
+      assertStrictEqual(fs.readFileSync(path.join(linkTarget, 'keep.txt'), 'utf8'), 'keep', '链接目标内容不得被删')
 
       // ④ 原位无备份却是真实目录：拒绝覆盖（fail-closed），内容不得被删
-      assertEqualStr(restoreCachePath(realDir, null), 'refused', '无备份且原位是真实目录时必须拒绝')
-      assertEqualStr(fs.readFileSync(path.join(realDir, 'push.json'), 'utf8'), '{"keep":1}', '拒绝覆盖时真实内容必须完好')
+      assertStrictEqual(restoreCachePath(realDir, null), 'refused', '无备份且原位是真实目录时必须拒绝')
+      assertStrictEqual(fs.readFileSync(path.join(realDir, 'push.json'), 'utf8'), '{"keep":1}', '拒绝覆盖时真实内容必须完好')
     } finally {
       cleanupIsolatedDir(baseDir)
     }
@@ -4332,9 +4331,9 @@ console.log('========================================\n');
   await test('Qodo #158: XBK_PARALLEL_ID 含 / 绝对路径 .. 一律回退 pid 分片（路径穿越防护）', async () => {
     // 1) 模块级不变量：生效三元组必须同源、在根内、且已过白名单
     assertPathInRoot(CACHE_DIR, __dirname, '生效 CACHE_DIR 必须位于仓库根之内')
-    assertEqualStr(CACHE_DIR, path.join(__dirname, DEFAULT_CACHE_DIR), 'CACHE_DIR 必须与 DEFAULT_CACHE_DIR 同源')
-    assertEqualStr(process.env.XBK_PARALLEL_ID, PARALLEL_ID, '写回环境的 XBK_PARALLEL_ID 必须与生效分片 ID 同源')
-    assertEqualStr(PARALLEL_ID, sanitizeIsolationId(PARALLEL_ID), '生效分片 ID 自身必须已通过白名单')
+    assertStrictEqual(CACHE_DIR, path.join(__dirname, DEFAULT_CACHE_DIR), 'CACHE_DIR 必须与 DEFAULT_CACHE_DIR 同源')
+    assertStrictEqual(process.env.XBK_PARALLEL_ID, PARALLEL_ID, '写回环境的 XBK_PARALLEL_ID 必须与生效分片 ID 同源')
+    assertStrictEqual(PARALLEL_ID, sanitizeIsolationId(PARALLEL_ID), '生效分片 ID 自身必须已通过白名单')
     ok(CACHE_SHARD_ID_RE.test(PARALLEL_ID), `生效分片 ID 必须只含 [A-Za-z0-9_-]（实得 ${PARALLEL_ID}）`)
     ok(DEFAULT_CACHE_DIR === `xianbaoku_cache_p${PARALLEL_ID}`,
       `DEFAULT_CACHE_DIR 必须恒为分片目录名（实得 ${DEFAULT_CACHE_DIR}）`)
@@ -4357,11 +4356,11 @@ console.log('========================================\n');
     for (const [label, raw] of malicious) {
       const shard = buildCacheShard(raw, __dirname, path)
       assertPathInRoot(shard.cacheDir, __dirname, `${label} 输入经构造后仍在仓库根内`)
-      assertEqualStr(path.resolve(shard.cacheDir), path.resolve(rootAbs, shard.dirName),
+      assertStrictEqual(path.resolve(shard.cacheDir), path.resolve(rootAbs, shard.dirName),
         `${label}：cacheDir 必须就是 root+dirName（无多余路径段）`)
-      assertEqualStr(shard.dirName, `xianbaoku_cache_p${process.pid}`,
+      assertStrictEqual(shard.dirName, `xianbaoku_cache_p${process.pid}`,
         `${label}：非法 XBK_PARALLEL_ID=${JSON.stringify(raw)} 必须回退 pid 分片（实得 ${shard.dirName}）`)
-      assertEqualStr(shard.id, String(process.pid), `${label}：非法的归一 ID 必须是 pid`)
+      assertStrictEqual(shard.id, String(process.pid), `${label}：非法的归一 ID 必须是 pid`)
     }
 
     // 3) 恶意输入不得让任何**仓库外**路径被用于递归删除。
@@ -4390,7 +4389,7 @@ console.log('========================================\n');
       // 4) 自证旧口径确实逃逸：raw='3×../<sentinel basename>' 时旧派生路径恰好等于哨兵目录
       const escapeRaw = `../../../${path.basename(victimDir)}`
       const escapeDerived = path.join(rootAbs, `xianbaoku_cache_p${escapeRaw}`)
-      assertEqualStr(path.resolve(escapeDerived), path.resolve(victimDir),
+      assertStrictEqual(path.resolve(escapeDerived), path.resolve(victimDir),
         '构造自证失败：该输入应恰好派生到哨兵目录（否则本用例的证明力不成立）')
       addSentinel()
       const escapeShard = buildCacheShard(escapeRaw, __dirname, path)
@@ -4411,15 +4410,15 @@ console.log('========================================\n');
   await test('Qodo #158: 合法 XBK_PARALLEL_ID 仍照常分片（白名单不误伤）', async () => {
     for (const good of ['worker1', '12345', '1234_5678901234_0', 'a-b_c-9', 'x'.repeat(CACHE_SHARD_ID_MAX)]) {
       const shard = buildCacheShard(good, __dirname, path)
-      assertEqualStr(shard.id, good, `合法 ID ${good} 不应被改写`)
-      assertEqualStr(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
+      assertStrictEqual(shard.id, good, `合法 ID ${good} 不应被改写`)
+      assertStrictEqual(shard.dirName, `xianbaoku_cache_p${good}`, `合法 ID ${good} 必须照原样分片`)
       assertPathInRoot(shard.cacheDir, __dirname, `合法 ID ${good} 的分片目录必须在仓库根内`)
     }
     // 与 test_app_p.js 的分片口径逐字符一致（workerId = `${pid}_${Date.now()}_${idx}`）
     const workerLike = `${process.pid}_${Date.now()}_0`
-    assertEqualStr(buildCacheShard(workerLike, __dirname, path).cacheDir,
+    assertStrictEqual(buildCacheShard(workerLike, __dirname, path).cacheDir,
       path.join(__dirname, `xianbaoku_cache_p${workerLike}`), '与 test_app_p.js 分片口径一致')
-    assertEqualStr(buildCacheShard(undefined, __dirname, path).dirName,
+    assertStrictEqual(buildCacheShard(undefined, __dirname, path).dirName,
       `xianbaoku_cache_p${process.pid}`, '未设置时取进程 pid')
   })
 
@@ -4444,7 +4443,7 @@ console.log('========================================\n');
     // 允许恰好 4 处：removeDirInRoot 内部 1 处 + 声明的豁免 removePath 1 处
     // + 本用例清理哨兵 2 处（addSentinel 前置清空 + finally 收尾，目标恒为仓库外自建哨兵）
     const rawRecursiveRm = selfSrc.match(/rmSync\([^)]*recursive:\s*true/g) || []
-    assertEqualNum(rawRecursiveRm.length, 4,
+    assertStrictEqual(rawRecursiveRm.length, 4,
       `递归删除只能收敛到 removeDirInRoot + 1 处声明豁免 + 本用例哨兵（实得 ${rawRecursiveRm.length} 处）`)
 
     // 两侧同源块逐字符比对（normalize：去整行注释、去空行、去行尾空白、行首空白）
@@ -4466,7 +4465,7 @@ console.log('========================================\n');
     const other = normalize(extractBlock(fs.readFileSync(path.join(__dirname, 'test_filter.js'), 'utf8')))
     ok(mine.length > 200 && other.length > 200,
       `同源块提取失败（自身 ${mine.length} / test_filter ${other.length} 字符）——锚点注释失效`)
-    assertEqualStr(mine, other,
+    assertStrictEqual(mine, other,
       'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
   })
 
@@ -4481,7 +4480,7 @@ console.log('========================================\n');
   cleanupOwnCacheShard(CACHE_DIR, __dirname)
   const reconcile = []
   try {
-    assertEqualNum(executed, passed + failed - skipped,
+    assertStrictEqual(executed, passed + failed - skipped,
       `执行计数不自洽：executed=${executed}，passed+failed-skipped=${passed + failed - skipped}（跳过的用例不得计入通过数）`)
     ok(executed > 0,
       `本轮 0 例真的执行（过滤跳过 ${skipped} 例；${onlyFilter ? `--only=${onlyFilter}` : nameSet ? '--list-file 名单未命中任何用例' : '无过滤'}）——` +
@@ -4491,11 +4490,11 @@ console.log('========================================\n');
     ok(!fs.existsSync(CACHE_DIR),
       `收尾必须删除本进程的缓存分片 ${CACHE_DIR}（旧实现删的是共享 xianbaoku_cache，自己的分片恒滞留仓库根）`)
     if (!onlyFilter && !nameSet) {
-      assertEqualNum(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
+      assertStrictEqual(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
       // 独立分母：源码里声明的用例数（与 test_app_p.js 同名提取口径）。只对账 passed 说明不了
       // 「有没有漏跑」——passed 含跳过，恒等于用例总数。
       const declared = [...fs.readFileSync(__filename, 'utf8').matchAll(/await test\((['"])(.*?)\1,/g)].length
-      assertEqualNum(executed, declared, `无过滤时必须跑满声明用例：声明 ${declared} 例，实际执行 ${executed} 例`)
+      assertStrictEqual(executed, declared, `无过滤时必须跑满声明用例：声明 ${declared} 例，实际执行 ${executed} 例`)
     }
   } catch (e) {
     reconcile.push(e.message)
