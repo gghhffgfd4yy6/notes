@@ -942,7 +942,7 @@ test('F1/F3 checkDependencies：resolve 失败 → missing；仅 re2 缺失才�
       load: () => fakeRe2Class({ ok: true })
     }), false)
   })
-  if (!gotOnly.split('\n').includes('❌ 缺少依赖：got')) throw new Error(gotOnly)
+  if (!gotOnly.split('\n').includes('❌ 缺少依赖：got')) throw new Error(`仅缺 got 时应报「❌ 缺少依赖：got」\n--- 实际输出 ---\n${gotOnly}`)
   if (gotOnly.includes('rebuild')) throw new Error(`仅缺 got 时不应提示 rebuild: ${gotOnly}`)
 })
 
@@ -957,10 +957,10 @@ test('F3 checkDependencies：可解析但加载抛错 → broken（根因入输�
       }
     }), false)
   })
-  if (!gotBroken.split('\n').includes('❌ 依赖已安装但不可用：got')) throw new Error(gotBroken)
-  if (!gotBroken.split('\n').includes('  - got: ERR_REQUIRE_ESM: require() of ES Module')) throw new Error(gotBroken)
-  if (!gotBroken.includes('请重新安装依赖')) throw new Error(gotBroken)
-  if (gotBroken.includes('请重建原生模块') || gotBroken.includes('缺少依赖')) throw new Error(gotBroken)
+  if (!gotBroken.split('\n').includes('❌ 依赖已安装但不可用：got')) throw new Error(`got 加载抛错时应报「❌ 依赖已安装但不可用：got」\n--- 实际输出 ---\n${gotBroken}`)
+  if (!gotBroken.split('\n').includes('  - got: ERR_REQUIRE_ESM: require() of ES Module')) throw new Error(`got 的根因行必须带 error.code（ERR_REQUIRE_ESM）\n--- 实际输出 ---\n${gotBroken}`)
+  if (!gotBroken.includes('请重新安装依赖')) throw new Error(`非原生依赖 broken 的指引必须是「请重新安装依赖」\n--- 实际输出 ---\n${gotBroken}`)
+  if (gotBroken.includes('请重建原生模块') || gotBroken.includes('缺少依赖')) throw new Error(`非原生依赖 broken 时不得出现「请重建原生模块」或「缺少依赖」\n--- 实际输出 ---\n${gotBroken}`)
   const re2Broken = captureAllOutput(() => {
     strictEqual(checkDependencies({
       manifest: () => ({ dependencies: { got: '1', re2: '1' } }),
@@ -968,9 +968,9 @@ test('F3 checkDependencies：可解析但加载抛错 → broken（根因入输�
       load: (name) => { if (name === NATIVE_NAME) throw new Error('binding missing'); return {} }
     }), false)
   })
-  if (!re2Broken.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(re2Broken)
-  if (!re2Broken.includes('请重建原生模块或切换 Node 版本')) throw new Error(re2Broken)
-  if (re2Broken.includes('请重新安装依赖')) throw new Error(re2Broken)
+  if (!re2Broken.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(`re2 加载抛错时应报「❌ 依赖已安装但不可用：re2」\n--- 实际输出 ---\n${re2Broken}`)
+  if (!re2Broken.includes('请重建原生模块或切换 Node 版本')) throw new Error(`re2 broken 的指引必须是「请重建原生模块或切换 Node 版本」\n--- 实际输出 ---\n${re2Broken}`)
+  if (re2Broken.includes('请重新安装依赖')) throw new Error(`re2 broken 时不得出现「请重新安装依赖」\n--- 实际输出 ---\n${re2Broken}`)
 })
 
 test('F3 checkDependencies：re2 可加载但原生绑定探针不过 → broken；探针只对 re2 生效', () => {
@@ -981,7 +981,7 @@ test('F3 checkDependencies：re2 可加载但原生绑定探针不过 → broken
       load: (name) => name === NATIVE_NAME ? fakeRe2Class({ ok: false }) : {}
     }), false)
   })
-  if (!probeFail.split('\n').includes('  - re2: re2 native binding probe failed')) throw new Error(probeFail)
+  if (!probeFail.split('\n').includes('  - re2: re2 native binding probe failed')) throw new Error(`re2 原生绑定探针失败必须列出根因行\n--- 实际输出 ---\n${probeFail}`)
   const out = captureAllOutput(() => {
     strictEqual(checkDependencies({
       manifest: () => ({ dependencies: { got: '1' } }),
@@ -1000,9 +1000,9 @@ test('F1 checkDependencies：manifest 读不到 → 告警并回落内置 got/re
       load: () => ({})
     }), false)
   })
-  if (!out.includes('无法读取 package.json（bad manifest）')) throw new Error(out)
-  if (!out.includes('退回内置清单 got/re2')) throw new Error(out)
-  if (!out.split('\n').includes('❌ 缺少依赖：got, re2')) throw new Error(out)
+  if (!out.includes('无法读取 package.json（bad manifest）')) throw new Error(`manifest 读不到时必须告警原因（bad manifest）\n--- 实际输出 ---\n${out}`)
+  if (!out.includes('退回内置清单 got/re2')) throw new Error(`manifest 读不到时必须说明「退回内置清单 got/re2」\n--- 实际输出 ---\n${out}`)
+  if (!out.split('\n').includes('❌ 缺少依赖：got, re2')) throw new Error(`回落内置清单后必须报「❌ 缺少依赖：got, re2」\n--- 实际输出 ---\n${out}`)
   const emptyDeclared = captureAllOutput(() => {
     strictEqual(checkDependencies({
       manifest: () => ({ dependencies: {} }),
@@ -1010,7 +1010,7 @@ test('F1 checkDependencies：manifest 读不到 → 告警并回落内置 got/re
       load: () => fakeRe2Class({ ok: true })
     }), false)
   })
-  if (!emptyDeclared.split('\n').includes('❌ 缺少依赖：got')) throw new Error(emptyDeclared)
+  if (!emptyDeclared.split('\n').includes('❌ 缺少依赖：got')) throw new Error(`声明清单为空时必须回落到内置清单（报 got）\n--- 实际输出 ---\n${emptyDeclared}`)
   const onlyGot = captureAllOutput(() => {
     strictEqual(checkDependencies({
       manifest: () => ({ dependencies: { got: '1' } }),
@@ -1018,7 +1018,7 @@ test('F1 checkDependencies：manifest 读不到 → 告警并回落内置 got/re
       load: () => ({})
     }), false)
   })
-  if (!onlyGot.split('\n').includes('❌ 缺少依赖：got')) throw new Error(onlyGot)
+  if (!onlyGot.split('\n').includes('❌ 缺少依赖：got')) throw new Error(`只声明 got 时只报 got\n--- 实际输出 ---\n${onlyGot}`)
   if (onlyGot.includes('re2')) throw new Error(`声明清单未含 re2 时不得探测 re2: ${onlyGot}`)
 })
 
@@ -1040,7 +1040,7 @@ test('RT-08 checkDependencies：includeDevDependencies 只做 resolve，且不�
       includeDevDependencies: true
     }), false)
   })
-  if (!missingDev.split('\n').includes('❌ 缺少依赖：fast-check')) throw new Error(missingDev)
+  if (!missingDev.split('\n').includes('❌ 缺少依赖：fast-check')) throw new Error(`includeDevDependencies 时缺 devDependency 必须报出\n--- 实际输出 ---\n${missingDev}`)
   const devOff = captureAllOutput(() => {
     strictEqual(checkDependencies({
       manifest: () => ({ dependencies: { got: '1' }, devDependencies: { 'fast-check': '1' } }),
@@ -1068,8 +1068,8 @@ test('F4 checkDependencies：Node 版本不满足 → false 并先报版本闸�
       load: () => ({})
     }), false)
   })
-  if (!bad.split('\n').includes('  - package.json 的 engines.node 要求 >=99.0.0')) throw new Error(bad)
-  if (!bad.split('\n').some(l => l.startsWith('❌ Node 版本不满足要求（当前 '))) throw new Error(bad)
+  if (!bad.split('\n').includes('  - package.json 的 engines.node 要求 >=99.0.0')) throw new Error(`engines.node 超限必须列出要求区间\n--- 实际输出 ---\n${bad}`)
+  if (!bad.split('\n').some(l => l.startsWith('❌ Node 版本不满足要求（当前 '))) throw new Error(`engines.node 超限必须报「❌ Node 版本不满足要求（当前 …）」\n--- 实际输出 ---\n${bad}`)
   const both = captureAllOutput(() => {
     strictEqual(checkDependencies({
       manifest: () => ({ engines: { node: '>=99.0.0' }, dependencies: { got: '1' } }),
@@ -1096,9 +1096,9 @@ test('F3 checkDependencies：missing 与 broken 同时存在 → 两段文案都
       load: (name) => { if (name === NATIVE_NAME) throw new Error('binding gone'); return {} }
     }), false)
   })
-  if (!out.split('\n').includes('❌ 缺少依赖：got')) throw new Error(out)
-  if (!out.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(out)
-  if (!out.split('\n').includes('  - re2: binding gone')) throw new Error(out)
+  if (!out.split('\n').includes('❌ 缺少依赖：got')) throw new Error(`missing 与 broken 同时存在：必须报「❌ 缺少依赖：got」\n--- 实际输出 ---\n${out}`)
+  if (!out.split('\n').includes('❌ 依赖已安装但不可用：re2')) throw new Error(`missing 与 broken 同时存在：必须报「❌ 依赖已安装但不可用：re2」\n--- 实际输出 ---\n${out}`)
+  if (!out.split('\n').includes('  - re2: binding gone')) throw new Error(`missing 与 broken 同时存在：必须列出 re2 的根因行\n--- 实际输出 ---\n${out}`)
 })
 
 console.log('  🧪 依赖预检测试（checkDependencies）')
