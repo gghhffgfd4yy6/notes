@@ -200,12 +200,13 @@ const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 3000
 
 async function test (name, fn) {
   const start = Date.now()
+  let timer = null
   try {
     await Promise.race([
       fn(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`⏰ 超时 (${TIMEOUT_MS}ms)`)), TIMEOUT_MS)
-      )
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`⏰ 超时 (${TIMEOUT_MS}ms)`)), TIMEOUT_MS)
+      })
     ])
     passed++
     console.log(`  ✅ ${name}  (${Date.now() - start}ms)`)
@@ -219,6 +220,10 @@ async function test (name, fn) {
     } else {
       console.log(`      └─ 💥 ${e.message}`)
     }
+  } finally {
+    // C4-002：收尾改 process.exitCode 后，滞留在事件循环里的 harness 定时器会把进程退出
+    // 拖到最后一个定时器到期（默认 3s）。用例已 settle，定时器无意义，显式清掉。
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -11277,6 +11282,16 @@ console.log('========================================\n');
     assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
   })
 
+  // C4-002：与 run_unit_tests.js 的 UT-04 同口径——CI 下 stdout 是 pipe，process.exit()
+  // 不等待 flush，尾部失败明细/汇总横幅的突发写入会被截断（391KB 突发实测只收到 111KB）。
+  // 本用例把「收尾不得用 process.exit()」钉死：源码尾部一旦回退成立即红。
+  await test('收尾口径: 用 process.exitCode 而非 process.exit() 退出（UT-04 管道 flush 对齐）', () => {
+    const self = require('fs').readFileSync(__filename, 'utf8')
+    const tail = self.slice(-600)
+    assertEqual(/^\s*process\.exit\(/m.test(tail), false, '收尾不得调用 process.exit()（不等待管道 flush，会截断尾部输出）')
+    assertEqual(/process\.exitCode\s*=\s*failed > 0 \? 1 : 0/.test(tail), true, '收尾必须设置 process.exitCode = failed > 0 ? 1 : 0')
+  })
+
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
   // C4-001：本行与下方汇总横幅原先停在文件**中段**（原 :9458-9469），其后又追加了 91 个顶层用例，
   // 于是横幅/三数字只覆盖前 819 例（910 例里恒少算 10%）、尾部用例的 ❌ 出现在绿色横幅之后且不进
@@ -11303,5 +11318,8 @@ console.log('========================================\n');
   }
   console.log('========================================\n')
 
-  process.exit(failed > 0 ? 1 : 0)
+  // C4-002（UT-04 同口径）：CI 下 stdout 是 pipe，process.exit() 不等待 flush —— 失败明细
+  // 与汇总横幅正是尾部突发写入，会被截断（实测 391KB 只到 111KB）。故用 process.exitCode
+  // 收尾，让事件循环自然排空 stdin/stdout 后再退出；退出码语义不变。
+  process.exitCode = failed > 0 ? 1 : 0
 })()
