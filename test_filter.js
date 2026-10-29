@@ -4086,7 +4086,7 @@ console.log('========================================\n');
     assertEqual(r.includes('http://example.com/a.html'), true, 'r.includes(\'http://example.com/a.html\') 应等于 true')
   })
 
-  // ==================== 52. 第8轮变异盲区修复（异常输入健壮性） ====================
+  // ==================== 52. 脏输入兜底（null / 数字） ====================
   console.log('\n📂 52. 脏输入兜底（null / 数字）')
 
   await test('tuisong_replace shuju为null → 不崩溃', () => {
@@ -4147,7 +4147,7 @@ console.log('========================================\n');
     assertEqual(r, 'T', 'r 应等于 \'T\'')
   })
 
-  // ==================== 53. 第9轮变异盲区修复（数字输入健壮性） ====================
+  // ==================== 53. 脏输入边界（数字 / 连续实体） ====================
   console.log('\n📂 53. 脏输入边界（数字 / 连续实体）')
 
   await test('htmlToMarkdown content_html为数字 → 不崩溃', () => {
@@ -4570,7 +4570,7 @@ console.log('========================================\n');
     assertEqual(r.some(m => m.id === 149), true, 'r.some(m => m.id === 149) 应等于 true')
   }))
 
-  // ==================== 65. 变异实证盲区修复（第41-50批） ====================
+  // ==================== 65. 边界值与退化输入实证 ====================
   console.log('\n📂 65. 边界值与退化输入实证')
 
   await test('add0 边界：9分钟补0 → 09', () => {
@@ -4712,7 +4712,7 @@ console.log('========================================\n');
     assertEqual(checkTimeCompiled(weird, group), false, 'checkTimeCompiled(weird, group) 应等于 false')
   })
 
-  // ==================== 66. 第51批变异盲区修复（v2算子） ====================
+  // ==================== 66. 追加顺序与空标签转换（v2 算子） ====================
   console.log('\n📂 66. 追加顺序与空标签转换')
 
   await test('saveBatch 新消息按顺序追加到末尾（变异 push->unshift 会倒序）', () => {
@@ -4847,7 +4847,7 @@ console.log('========================================\n');
     assertEqual(checkCategory({ catename: '微博' }, c.pingbifenlei), false, 'checkCategory({ catename: \'微博\' }, c.pingbifenlei) 应等于 false')
   })
 
-  // ==================== 68. 代码审查修复（v3.14 审查请求） ====================
+  // ==================== 68. saveBatch 无 id 判重口径 ====================
   console.log('\n📂 68. saveBatch 无 id 判重口径')
 
   await test('saveBatch 无id不同url → 互不覆盖（修复前 undefined===undefined 误判覆盖）', () => {
@@ -5517,7 +5517,7 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('&#0;'), '', 'decodeHtmlEntities(\'&#0;\') 应等于 \'\'')
   })
 
-  // ==================== 79. 审查6轮修复(推送模块/got/代理区) ====================
+  // ==================== 79. 代理区字符与空通道拒绝 ====================
   console.log('\n📂 79. 代理区字符与空通道拒绝')
 
   await test('decodeHtmlEntities 代理区字符保留原文（审查6-8）', () => {
@@ -5541,7 +5541,7 @@ console.log('========================================\n');
     assertEqual(rejected, true, '未配置通道应 reject（避免主流程误判推送成功并写缓存）')
   })
 
-  // ==================== 80. 审查7轮修复(主代码) ====================
+  // ==================== 80. 关键词空白与空 href 链接 ====================
   console.log('\n📂 80. 关键词空白与空 href 链接')
 
   await test('whitelistFilter 空格关键词 → 全通过（审查7-1）', () => {
@@ -5604,7 +5604,7 @@ console.log('========================================\n');
     assertEqual(r.map(m => m.id).join(','), '1,2', 'r.map(m => m.id).join(\',\') 应等于 \'1,2\'')
   })
 
-  // ==================== 84. 审查10轮批量修复(20项) ====================
+  // ==================== 84. script/style 移除与 safeText 防御 ====================
   console.log('\n📂 84. script/style 移除与 safeText 防御')
 
   await test('htmlToMarkdown script/style 内容移除（#62）', () => {
@@ -11741,8 +11741,9 @@ console.log('========================================\n');
   })
 
   await test('C4-025: 分节编号按文件顺序 1..N 连续，标题按内容命名', () => {
+    const all = hygieneLines()
     const secs = []
-    hygieneLines().forEach((ln, i) => {
+    all.forEach((ln, i) => {
       const m = ln.match(/^\s*console\.log\('(?:\\n)?📂 (\d+)\. (.+)'\)\s*$/)
       if (m) secs.push({ line: i + 1, num: Number(m[1]), title: m[2] })
     })
@@ -11752,6 +11753,15 @@ console.log('========================================\n');
     secs.forEach((s, i) => { if (s.num !== i + 1) bad.push(`第 ${s.line} 行编号 ${s.num} 应为 ${i + 1}`) })
     const ROUND = /审查|复审|轮次|批次|第\s*\d+\s*[-–~]?\s*\d*\s*(轮|批)/
     secs.forEach(s => { if (ROUND.test(s.title)) bad.push(`第 ${s.line} 行标题仍按轮次/批次/审查命名：${s.title}`) })
+    // 源码注释头也要同步：控制台改成「52. 脏输入兜底」，注释头还写「52. 第8轮变异盲区修复」，
+    // 两处说法不一致，读代码的人仍会被轮次命名带偏（本轮实测漏了 8 处）。
+    secs.forEach(s => {
+      const prev = all[s.line - 2]
+      const hm = prev && prev.match(/^\s*\/\/ =+ (\d+)[a-z]?\. (.+?) =+$/)
+      if (!hm) return
+      if (Number(hm[1]) !== s.num) bad.push(`第 ${s.line - 1} 行注释头编号 ${hm[1]} 与分节编号 ${s.num} 不一致`)
+      if (ROUND.test(hm[2])) bad.push(`第 ${s.line - 1} 行注释头仍按轮次/批次/审查命名：${hm[2]}`)
+    })
     assertEqual(bad.length, 0, '分节编号必须按文件顺序 1..N 连续、标题按内容命名：' + bad.slice(0, 8).join('；'))
   })
 
