@@ -194,6 +194,34 @@ function cleanupIsolatedDir (targetPath) {
   }
 }
 
+// C5-032：**本进程自己的**缓存分片目录清理入口（幂等）。
+// 旧收尾删的是硬编码的共享 `xianbaoku_cache`——本进程从不写那里（reset() 与 setPushUrl 都指向 CACHE_DIR
+// 分片），结果「删别人的东西」与「自己的分片永久滞留」同时发生：串行 `node test_app.js` 与任何
+// `--only` 运行都会在仓库根留下一个 xianbaoku_cache_p<id>（run.log / alert.state / filter.hash / 测试缓存）。
+// 收尾调一次，process.on('exit') 再兜一次（崩溃、提前 exit、main 的 catch 路径都覆盖）。
+let ownShardCleanupDone = false
+function cleanupOwnCacheShard (cacheDir, root) {
+  if (ownShardCleanupDone) return false
+  ownShardCleanupDone = true
+  try {
+    // 两道守卫，防「清理入口本身变成删别人」：
+    //   ① 目标必须就是本进程分片（与模块级 CACHE_DIR 同源派生），不能是调用方临时拼的路径；
+    //   ② 目录名必须严格是 xianbaoku_cache_p<白名单 ID>——若哪天 DEFAULT_CACHE_DIR 被改回共享名
+    //      `xianbaoku_cache`，这里直接拒绝，绝不把共享缓存（真实 push.json 判重主存）整目录删掉。
+    const expected = path.resolve(path.join(root, DEFAULT_CACHE_DIR))
+    if (path.resolve(cacheDir) !== expected) return false
+    if (!/^xianbaoku_cache_p[A-Za-z0-9_-]+$/.test(path.basename(cacheDir))) return false
+    if (!fs.existsSync(cacheDir)) return false
+    removeDirInRoot(cacheDir, root) // 根内校验 fail-closed（越界即抛，绝不回退到「直接删」）
+    return true
+  } catch (e) {
+    // 只 warn 不抛：收尾抛错会把用例失败原因盖掉（与 cleanupIsolatedDir 同一纪律），但必须留痕。
+    console.warn(`⚠️ 本进程缓存分片清理失败，需手工删除（否则将滞留仓库根）：${cacheDir} — ${e.message}`)
+    return false
+  }
+}
+process.on('exit', () => cleanupOwnCacheShard(CACHE_DIR, __dirname))
+
 // C5-001（P0）：让位给夹具的固定名路径**不是**本套件的私产——仓库根的 `.xbk_cache_safe` 正是
 // xbk_message_store.js:35 的**生产兜底缓存目录**（默认目录不可用时生产自动写到这里，内含 push.json
 // 与墓碑）。旧版 C022 用裸 rmSync(recursive) 先删后建软链、finally 只删自己建的软链，于是在兜底已
@@ -4425,6 +4453,11 @@ console.log('========================================\n');
   // 过滤跳过被计成「通过」（test() 里 skipped++ 紧跟 passed++），executed 原先只进打印；于是
   // `--only=<写错的子串>` 或 `--list-file` 名单对不上时，0 例真的执行也打印「🎉 全部通过 N/N」
   // 并 exit 0 —— 门禁看着全绿，实际一条用例都没跑。这里把几类计数互相钉住，任一不成立即判失败。
+  //
+  // C5-032：先删**本进程自己的**缓存分片再做对账（对账里有一条断言它真的被删了）。
+  // 旧实现把清理放在打印之后、且目标是共享 `xianbaoku_cache`：分片恒滞留，共享目录反被误删（见
+  // cleanupOwnCacheShard 的注释）。--only / --list-file 也照删——每个进程只删自己的分片，无竞态。
+  cleanupOwnCacheShard(CACHE_DIR, __dirname)
   const reconcile = []
   try {
     assertEqualNum(executed, passed + failed - skipped,
@@ -4432,6 +4465,10 @@ console.log('========================================\n');
     assert(executed > 0,
       `本轮 0 例真的执行（过滤跳过 ${skipped} 例；${onlyFilter ? `--only=${onlyFilter}` : nameSet ? '--list-file 名单未命中任何用例' : '无过滤'}）——` +
       '过滤条件/名单写错不得当成「全部通过」，必须判失败')
+    // C5-032 自证：收尾必须删掉本进程的分片（旧实现删的是共享目录 ⇒ 每次串行/--only 运行都留一个
+    // xianbaoku_cache_p<id>）。靶向回退：把清理目标改回共享 xianbaoku_cache ⇒ 本条真红（--only 路径必现）。
+    assert(!fs.existsSync(CACHE_DIR),
+      `收尾必须删除本进程的缓存分片 ${CACHE_DIR}（旧实现删的是共享 xianbaoku_cache，自己的分片恒滞留仓库根）`)
     if (!onlyFilter && !nameSet) {
       assertEqualNum(skipped, 0, `无过滤时不应有跳过用例（实际 ${skipped} 例）`)
       // 独立分母：源码里声明的用例数（与 test_app_p.js 同名提取口径）。只对账 passed 说明不了
@@ -4458,21 +4495,10 @@ console.log('========================================\n');
   }
   console.log('========================================\n')
 
-  // 清理本套件产生的缓存测试文件（t\d{2}_/t48b_/tpush_/tpar_fail，保留真实运行缓存 push.json）
-  // v3.122：--only 模式（并行调度）跳过清理——并行进程删除会删掉其他仍在跑的进程正在使用的缓存文件
-  // v3.172：--list-file 模式同样跳过（调度器统一清理 worker 独立目录）
-  if (!onlyFilter && !nameSet) {
-    try {
-      const fs = require('fs')
-      const dir = path.join(__dirname, 'xianbaoku_cache')
-      if (fs.existsSync(dir)) {
-        for (const f of fs.readdirSync(dir)) {
-          // t\d{2}[a-z]?_ 同时匹配 t48_ 与 t48b_（v3.69 修复：原 ^t\d{2}_ 漏掉带字母后缀的测试名）
-          if (/^t\d{2}[a-z]?_|^tpush_|^tpar_fail/.test(f)) { try { fs.unlinkSync(path.join(dir, f)) } catch (e) { /* 忽略 */ } }
-        }
-      }
-    } catch (e) { /* 忽略 */ }
-  }
+  // 共享 `xianbaoku_cache` 的清理段已删除（C5-032）：本进程从不往那里写（reset()/setPushUrl 都指向
+  // 本进程的 CACHE_DIR 分片），旧代码按 /^t\d{2}[a-z]?_|^tpush_|^tpar_fail/ 前缀删的是**别人的**文件
+  // （真实运行缓存 push.json 就在同一目录）。调度侧 worker 分片由 test_app_p.js 的 cleanupArtifacts
+  // 按 workerId 清，与 process.on('exit') 的兜底互相幂等。
 
   // worker 执行计数回报（C5-004）：test_app_p.js 的 stdio 是 inherit，父进程读不到子进程 stdout，
   // 只能落一份报告文件供其断言「Σexecuted === 名单总数」（否则名单写错时 0 例执行也算全绿）。
