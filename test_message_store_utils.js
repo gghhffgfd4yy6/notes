@@ -675,42 +675,40 @@ check('F7 残留: getFileName 性质测试——同名缓存文件必来自等�
 // （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
 // → 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。这里用真实 Utils + 假 fs +
 // 内存权威数组做单元级 oracle 对拍（oracle = _indexHasIdentityDirect 零索引线性扫描）。
-const identityStore = createMessageStore({
-  Config: { cache: { maxSize: 10000 } },
-  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
-  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
-  path,
-  crypto: { randomUUID: () => 'uuid' },
-  normalize: () => {},
-  storage: {
-    readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
-    writeAtomic: () => true,
-    writeAtomicIfAbsent: () => true
-  },
-  constants: {
-    DEFAULT_MAX_SIZE: 10000,
-    MESSAGE_CACHE_MAX_BYTES: 8388608,
-    TOMBSTONE_MAX_KEYS: 5000,
-    TOMBSTONE_MAX_BYTES: 262144,
-    TOMBSTONE_LOCK_STALE_MS: 10000
-  }
-})
+// C5-077：每次 seed 都 new 一个实例——隔离由构造保证，不再靠「文件名不撞」的命名约定，
+// 也不需要手工回退 _memoryCache / _memoCount / _verified（旧写法一旦漏写或换名，陈旧条目
+// 就被下一个用例当作「已推送」判重，曾实锤漏推假绿）。
+function makeIdentityStore () {
+  return createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+    fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: {
+      readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
+      writeAtomic: () => true,
+      writeAtomicIfAbsent: () => true
+    },
+    constants: {
+      DEFAULT_MAX_SIZE: 10000,
+      MESSAGE_CACHE_MAX_BYTES: 8388608,
+      TOMBSTONE_MAX_KEYS: 5000,
+      TOMBSTONE_MAX_BYTES: 262144,
+      TOMBSTONE_LOCK_STALE_MS: 10000
+    }
+  })
+}
+
+let identityStore = makeIdentityStore()
 
 function seedIdentityProbe (messages, name) {
+  // 全新实例 ⇒ 同一用例内不存在前序用例的 _memoryCache/_verified/_memoCount 残留
+  identityStore = makeIdentityStore()
   // 必须经 getFilePath 求路径：has(message, filename) 内部同样先 getFilePath(filename)，
   // 直接塞绝对路径会让两次路径不一致、内存权威数组命不中。
   const fp = identityStore.getFilePath(name)
-  // ⚠️ 状态泄漏防御（用例间状态猎杀 #198 后续）：identityStore 是模块级共享实例，
-  // _memoryCache/_verified/_memoCount 跨用例累积且 _verified 恒真永不重读磁盘——
-  // 前一用例 mutate 后的陈旧快照会被后续用例当作「已推送」判重（曾实锤复现：
-  // f02_form_2_22.json 派生名碰撞 + f02_stale.json 原地改写后 has 误真）。
-  // 同名 fp 的旧条目在重新 seed 前先清掉：陈旧快照/verified 标志/计数一起回退，
-  // 使每个 seed 用例看到的是「干净的同名缓存文件」而非前序用例的遗留态。
-  if (Object.prototype.hasOwnProperty.call(identityStore._memoryCache, fp)) {
-    delete identityStore._memoryCache[fp]
-    identityStore._memoCount -= 1
-    identityStore._verified.delete(fp)
-  }
   identityStore._memoryCache[fp] = messages
   identityStore._memoCount += 1
   identityStore._verified.add(fp) // 跳过「内存命中未验证」的真实磁盘检查
@@ -2009,6 +2007,18 @@ check('_probeIndexMiss: 小数组（n<=8）必须整表抽查（首次未命中�
   assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true }, 'n=8 必须整表抽查，第 5 位字段改写必须被看见')
 })
 
+// ===== C5-077：identityStore 隔离必须由「每用例新实例」保证，不能靠命名约定 + 手工回退计数 =====
+// 旧实现是模块级共享实例，seedIdentityProbe 靠删 _memoryCache[fp] / _memoCount -= 1 / _verified.delete
+// 手工回退；一旦新用例换了文件名或忘写清理，陈旧条目与 _memoCount 就跨用例累积（曾实锤漏推假绿）。
+check('identity 隔离：每个 seed 用例拿到全新实例（_memoCount/_verified 不得跨用例累积）', () => {
+  seedIdentityProbe([{ id: 'iso-1' }], 'iso_probe_1.json')
+  assert.strictEqual(identityStore._memoCount, 1, `seed 之后 _memoCount 必须只反映本次 seed，实际 ${identityStore._memoCount}（模块级实例跨用例累积）`)
+  seedIdentityProbe([{ id: 'iso-2' }], 'iso_probe_2.json')
+  assert.strictEqual(identityStore._memoCount, 1, '再次 seed 必须仍是 1 条（不得把上一个用例的条目带过来）')
+  assert.deepStrictEqual(Object.keys(identityStore._memoryCache), [identityStore.getFilePath('iso_probe_2.json')], '不得残留前一用例的缓存条目')
+  assert.strictEqual(identityStore._verified.size, 1, '_verified 不得累积')
+})
+
 // ===== 补测 PlanP：getFilePath / _getTombstoneProcessStart（message-store 未直测的方法）=====
 // 反例（改动前）：两者在既有 104 项里只经高层路径间接覆盖，其**消毒/回退/截断**与
 // **/proc 解析**的精确口径从未被直接断言 —— 本段用 createProbeStore 直接调用。
@@ -2778,10 +2788,9 @@ check('C3-002: 带 XBK_CACHE_DIR 启动子进程——raw 仍写 env 目录（�
   }
 })
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
-// ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
-// seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
-// _memoryCache/_verified/_memoCount 仍会在套件结束后残留——同进程聚合执行（变异测试/
-// 合并 runner）时污染后续套件。退场统一清空，保证套件边界零残留。
+// ===== 套件退场：清掉最后一个 identityStore 实例的残留（用例间状态猎杀 #198 后续）=====
+// 隔离已由 makeIdentityStore 每用例新实例保证；这里兜底清一次，保证套件边界零残留——
+// 同进程聚合执行（变异测试 / 合并 runner）时不会把最后一条 seed 的条目带进后续套件。
 for (const fp of Object.keys(identityStore._memoryCache)) {
   delete identityStore._memoryCache[fp]
   identityStore._verified.delete(fp)
