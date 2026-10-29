@@ -1388,6 +1388,12 @@ console.log('========================================\n');
       assert(primitiveError && Array.isArray(primitiveError.failures), '原始异常应保留结构化失败列表')
       assert(primitiveError.failures[0] && primitiveError.failures[0].channel === 'server酱', `原始异常应带通道名: ${JSON.stringify(primitiveError.failures[0])}`)
       assert(primitiveError.failures[0].message.includes('primitive transport failure'), '原始异常应保留诊断消息')
+      // 单通道成功 → resolve（原断言保留：既有覆盖不回退，只在其后补真正的「一成一败」分支）
+      cfg.BARK_PUSH = ''
+      failPost = false
+      let ok = false
+      try { await notify.sendNotify('标题', '内容'); ok = true } catch (e) { ok = false }
+      assert(ok, '单通道成功应 resolve')
       // 部分成功（Bark 成功 + Server酱失败）→ resolve（失败通道下次不重试防重复）
       // C5-036：failPost 是全局开关，没法只让一个通道失败——旧的「部分成功」半段其实只测了单通道成功
       // （名字与执行分支不符），这里按 URL 局部覆写 got.post，构造真正的「一成一败」。
