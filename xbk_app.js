@@ -239,29 +239,55 @@ function createApp ({
     },
 
     // 接口异常告警（v3.123）：限频 + 静默——不影响主流程；告警也走推送通道（通道挂了就静默，无解）
-    _sendAlert (errMsg) {
+    // C1-004：限频按**告警类别**各自计时（alertKey）。此前五类告警共用 alert.state 的单一 lastAt，
+    // 「截断」这类低危告警发过一次后，同一个 intervalMs 窗口内的「推送全部失败」「接口异常」会被
+    // 整段压掉（verify 实测：第二类返回 undefined、实发数仍为 1）——防轰炸保留，但异类不再互相压制。
+    // 状态文件向后兼容：顶层 lastAt 仍是「最近一次告警」的时间（status/旧版本读取口径不变），新增
+    // classes.<key> 逐类时间戳；只有 lastAt、没有 classes 的旧文件按「未知类」保守沿用（升级后第一个
+    // 窗口不放宽）。压制不等于零留痕：各调用点在 run.log 另有自己的行（截断摘要 truncated=、ERROR 推送
+    // 全部失败、WARN 缓存读取失败…），由 ALERT-5 用例钉住。
+    _sendAlert (errMsg, alertKey = 'alert') {
       try {
       // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
         if (!this._enabledFlag(Config.alert)) return
+        const classKey = typeof alertKey === 'string' && alertKey ? alertKey : 'alert'
         const statePath = path.join(MessageStore.cacheDir, 'alert.state')
         const alertMemory = this._alertLastAtByPath.get(statePath)
         let lastAt = alertMemory ? alertMemory.lastAt : 0
+        let classes = alertMemory && alertMemory.classes && typeof alertMemory.classes === 'object'
+          ? Object.assign({}, alertMemory.classes)
+          : null
         // 状态文件被外部删除时，已持久化的旧内存状态不应继续生效；写失败的内存状态仍用于本进程限频。
         if (alertMemory && alertMemory.persisted && !fs.existsSync(statePath)) {
           this._alertLastAtByPath.delete(statePath)
           lastAt = 0
+          classes = null
         }
         const stateResult = this._readSafeState(statePath)
         if (stateResult.status === 'ok') {
-          try { lastAt = Math.max(lastAt, JSON.parse(stateResult.text).lastAt || 0) } catch (e) { /* 损坏状态=忽略 */ }
+          try {
+            const parsed = JSON.parse(stateResult.text)
+            lastAt = Math.max(Number.isFinite(lastAt) ? lastAt : 0, parsed.lastAt || 0)
+            if (parsed.classes && typeof parsed.classes === 'object' && !Array.isArray(parsed.classes)) {
+              const diskClasses = {}
+              for (const k of Object.keys(parsed.classes)) {
+                const v = parsed.classes[k]
+                if (Number.isFinite(v) && v > 0) diskClasses[k] = v
+              }
+              // 磁盘值权威（别的进程可能刚写过）；本进程写失败时内存里的更晚时间仍然生效
+              classes = Object.assign(diskClasses, classes || {})
+            }
+          } catch (e) { /* 损坏状态=忽略 */ }
         } else if (stateResult.status !== 'missing') {
         // ioError/unsafe/tooLarge：无法确认真实限频状态。若按"无状态文件"处理会重置
         // lastAt 导致限频失效、重复推送；保守跳过本次告警，下次运行再重试。
           console.error(`告警限频状态读取失败(${stateResult.status})，跳过本次告警以免限频被重置导致重复推送 ${statePath}`)
           return
         }
+        // 逐类取限频时间：有 classes 时只认本类（异类互不压制）；旧文件没有 classes 时沿用单一 lastAt。
         // v3.251：校验 lastAt——NaN/Infinity 或未来时间戳会令限频失效或告警永久静默，视为 0 以恢复正常限频
-        lastAt = Number.isFinite(lastAt) && lastAt <= Date.now() ? lastAt : 0
+        const classLastAt = classes && Object.keys(classes).length > 0 ? classes[classKey] : lastAt
+        lastAt = Number.isFinite(classLastAt) && classLastAt <= Date.now() ? classLastAt : 0
         const intervalMs = Utils.num(Config.alert.intervalMs, 3600000) // v3.167: 非法字符串'abc'曾>0比较false→0不限频轰炸（其他数值配置均num回退）
         const interval = intervalMs > 0 ? intervalMs : 0 // <=0(含-1) = 不限频（每次异常都发）
         if (interval > 0 && Date.now() - lastAt < interval) return // 限频：间隔内不重复轰炸
@@ -284,8 +310,15 @@ function createApp ({
         return Pusher.send(alertText, alertDesp)
           .then(() => {
             const sentAt = Date.now()
-            const persisted = this._writeState(statePath, { lastAt: sentAt })
-            this._alertLastAtByPath.set(statePath, { lastAt: sentAt, persisted })
+            // C1-004：逐类时间戳 + 顶层 lastAt=全类最近一次（旧读者只认 lastAt，语义仍是「最近告警时间」）
+            const nextClasses = Object.assign({}, classes || {})
+            nextClasses[classKey] = sentAt
+            let latest = 0
+            for (const k of Object.keys(nextClasses)) {
+              if (Number.isFinite(nextClasses[k]) && nextClasses[k] > latest) latest = nextClasses[k]
+            }
+            const persisted = this._writeState(statePath, { lastAt: latest, classes: nextClasses })
+            this._alertLastAtByPath.set(statePath, { lastAt: latest, classes: nextClasses, persisted })
             if (!persisted) {
               this._warnLowDisk()
               console.warn('⚠️ 运行异常告警已发送，但 alert.state 持久化失败；本进程将继续使用内存限频')
@@ -419,7 +452,7 @@ function createApp ({
       // 发送结果三态：true 成功 / false 失败删标记重试 /
       // undefined 跳过（禁用/限频）——成功与跳过都视为当天已处理，标记置 completed（CodeRabbit 第八轮：
       // 防止正常进程退出后被误判为残留造成同一天重复提醒）。
-      const sent = await this._sendAlert(RE2_MISSING_WARNING)
+      const sent = await this._sendAlert(RE2_MISSING_WARNING, 're2-missing')
       if (sent === false) {
       // 发送失败：锁内删除自己的 pending 标记（完整 token 校验），下次运行可重试
         this._removeRe2WarnMarker(statePath, token)
@@ -1258,7 +1291,7 @@ function createApp ({
           // 写 run.log ERROR + 告警（测试默认关 alert 不污染推送计数）+ 返回带失败语义的摘要，
           // 使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码，调度感知失败。
           this._writeRunLog(`${this._localStamp()} ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）${cacheFilePath}\n`)
-          try { await this._sendAlert(`缓存读取失败，本轮推送已跳过（防重复轰炸）：${cacheFilePath}`) } catch (e) { /* 告警失败不阻塞 */ }
+          try { await this._sendAlert(`缓存读取失败，本轮推送已跳过（防重复轰炸）：${cacheFilePath}`, 'cache-read') } catch (e) { /* 告警失败不阻塞 */ }
           return {
             total: xbkdata.length,
             dedup: 0,
@@ -1458,7 +1491,7 @@ function createApp ({
           // P3（审查 2026-08-15）：再修正——截断条目并未暂存（不入缓存、无任何持久化），仅依赖接口下轮重放，
           // 「已暂存」仍会误导用户以为已持久化；改为如实描述「待下轮接口重放时补推」
           if (!dryRun) {
-            try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${truncatedCount} 条待下轮接口重放时补推（防推送风暴）`) } catch (e) { /* 告警失败不阻塞主流程 */ }
+            try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${truncatedCount} 条待下轮接口重放时补推（防推送风暴）`, 'truncate') } catch (e) { /* 告警失败不阻塞主流程 */ }
           }
           // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
           // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
@@ -1752,13 +1785,15 @@ function createApp ({
         // 只覆盖全灭：1 条成功 + 99 条失败时既不告警也不写 ERROR 行，配上分类器「pushed>0 即成功」
         // 就是「99 条被静默吞掉」。现在只要还有消息没送达就告警；全失败的文案保持不变
         // （console/status 的 run.log 解析以「推送全部失败」为锚点），部分失败另写带条数的行。
+        // 合并 b1：本处在两类文案上都带 'push-fail' 告警类别（C1-004），与截断/接口异常等
+        // 其他类别各计各的限频窗口。
         const failedMessages = items.length - successCount
         if (!dryRun && items.length > 0 && failedMessages > 0) {
           const allFailed = successCount === 0
           try {
             await this._sendAlert(allFailed
               ? `推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`
-              : `推送部分失败（成功 ${successCount} 条 / 失败 ${failedMessages} 条）：未送达的消息下轮重试，通道可能部分失效`)
+              : `推送部分失败（成功 ${successCount} 条 / 失败 ${failedMessages} 条）：未送达的消息下轮重试，通道可能部分失效`, 'push-fail')
           } catch (e) { /* 告警失败不阻塞主流程 */ }
           this._writeRunLog(`${this._localStamp()} ERROR ${allFailed
             ? `推送全部失败 ${items.length} 条（通道可能失效）`
@@ -1766,7 +1801,22 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
+        // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
+        // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
+        // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。
+        // 只在「确实抓到了数据、且全部在摄入阶段被丢弃」时告警；空数组、全量去重、全量规则过滤
+        // 都不满足 bad+noidentity === total，因此不会被误报。
+        const droppedAsDirty = xbkdata.length > 0 && items.length === 0 &&
+          (badElementCount + skippedNoIdentity) === xbkdata.length
+        if (droppedAsDirty) {
+          const dirtyDetail = `非法元素 ${badElementCount} 条 / 无有效身份 ${skippedNoIdentity} 条`
+          this._writeRunLog(`${this._localStamp()} WARN 本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目\n`)
+          console.warn(`⚠️ 本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目（接口字段可能已变更）`)
+          if (!dryRun) {
+            try { await this._sendAlert(`本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目——接口字段可能已变更`, 'dirty-data') } catch (e) { /* 告警失败不阻塞主流程 */ }
+          }
+        }
 
         // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
         const summary = {
@@ -1801,7 +1851,7 @@ function createApp ({
         // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
         // dry-run 不允许任何通知副作用；失败仍重抛给调用方/调度器。
         if (!dryRun) {
-          try { await this._sendAlert(errMsg) } catch (e) { /* 告警失败不阻塞重抛 */ }
+          try { await this._sendAlert(errMsg, 'run-error') } catch (e) { /* 告警失败不阻塞重抛 */ }
         }
         throw error // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
       } finally {
