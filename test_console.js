@@ -11069,10 +11069,34 @@ async function runSuite (mainPromise) {
 // 收尾自身抛出（finishSuite 里的清点 / 强退闸）也必须让进程非 0：这就是 Sonar S9383 指的
 // dangling promise。不接的话拒约只落到 unhandledRejection 上，而它的默认行为随 node 版本与
 // `--unhandled-rejections` 取值而变（warn 档退出码仍是 0）⇒ CI 上会退化成「跑完了但没判据」。
-runSuite(main()).catch((e) => {
+function handleSuiteFinishError (e) {
   process.exitCode = 1
   // 与 runSuite 内部同口径留痕：收尾都炸了，汇总行打不出来，失败清单是唯一线索。
   failed++
   failedNames.push('套件收尾异常（finishSuite 抛出，未打出汇总）')
   console.error('套件收尾异常:', failureText(e))
+}
+
+// S15 回归（闸门 A）：此前这条 .catch 只有口头探针（注入 throw 后看 exit 1），没有committed 断言。
+// 把处理器提成具名函数后在这里直接验：置退出码 1 + 失败计数 +1 + 清单留痕，三项缺一即红。
+ok('S15 回归：收尾异常处理器置退出码 1 并在失败清单留痕', () => {
+  const savedExit = process.exitCode
+  const savedFailed = failed
+  const savedLen = failedNames.length
+  const savedError = console.error
+  try {
+    process.exitCode = 0
+    console.error = () => {}
+    handleSuiteFinishError(new Error('probe-s15-handler'))
+    assert.strictEqual(process.exitCode, 1, '收尾异常必须把退出码置 1')
+    assert.strictEqual(failed, savedFailed + 1, '失败计数必须 +1')
+    assert.ok(failedNames.slice(savedLen).some(n => n.includes('套件收尾异常')), '失败清单必须留痕')
+  } finally {
+    process.exitCode = savedExit
+    failed = savedFailed
+    failedNames.length = savedLen
+    console.error = savedError
+  }
 })
+
+runSuite(main()).catch(handleSuiteFinishError)
