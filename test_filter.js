@@ -11345,13 +11345,31 @@ console.log('========================================\n');
     assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
   })
 
-  // C4-002：与 run_unit_tests.js 的 UT-04 同口径——CI 下 stdout 是 pipe，process.exit()
-  // 不等待 flush，尾部失败明细/汇总横幅的突发写入会被截断（391KB 突发实测只收到 111KB）。
-  // 本用例把「收尾不得用 process.exit()」钉死：源码尾部一旦回退成立即红。
-  await test('收尾口径: 用 process.exitCode 而非 process.exit() 退出（UT-04 管道 flush 对齐）', () => {
+  // C4-002：与 run_unit_tests.js 的 UT-04 同口径——立即终止进程不等待 stdout flush，
+  // CI（pipe）下尾部失败明细/汇总横幅的突发写入会被截断（391KB 突发实测只收到 111KB）。
+  // 判据用「全文调用点数」而不是行首正则：只钉行首写法时，`if (failed > 0) ...` 一行式
+  // 回退（同为立即退出、同样截断明细）会整句溜过。全文只允许 1 处调用点，且必须是开头的
+  // hostClean 预检守卫行；收尾区一处都不许有。needle 与错误消息均拼接构造，否则门禁自身
+  // 源码里的字样会把调用点数算成 3。
+  await test('收尾口径: 用 process.exitCode 而非立即退出（UT-04 管道 flush 对齐）', () => {
     const self = require('fs').readFileSync(__filename, 'utf8')
-    const tail = self.slice(-600)
-    assertEqual(/^\s*process\.exit\(/m.test(tail), false, '收尾不得调用 process.exit()（不等待管道 flush，会截断尾部输出）')
+    const EXIT_CALL = 'process' + '.exit('
+    // 去注释（先行后块），块注释按换行数等长填充，行号仍与原文件对齐
+    const stripComments = (s) => s
+      .replace(/\/\/[^\n]*/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''))
+    const code = stripComments(self)
+    const lines = code.split('\n')
+    const hitLines = []
+    lines.forEach((ln, i) => { if (ln.includes(EXIT_CALL)) hitLines.push(i + 1) })
+    assertEqual(hitLines.length, 1,
+      `全文只允许 1 处 ${EXIT_CALL} 调用点（hostClean 预检守卫），实际 ${hitLines.length} 处：${JSON.stringify(hitLines)}`)
+    assertEqual(hitLines[0] <= 20, true, `唯一调用点必须落在文件开头（:20 以内），实际第 ${hitLines[0]} 行`)
+    assertEqual(/hostClean\.guardOrExit\(/.test(lines[hitLines[0] - 1]), true,
+      `第 ${hitLines[0]} 行不是 hostClean 预检守卫：${lines[hitLines[0] - 1].trim()}`)
+    // 收尾区显式再钉一次：最后一个用例之后不得出现任何调用点；退出码仍走 process.exitCode
+    const tail = code.slice(-800)
+    assertEqual(tail.includes(EXIT_CALL), false, `收尾区不得出现 ${EXIT_CALL}（不等待管道 flush，会截断尾部输出）`)
     assertEqual(/process\.exitCode\s*=\s*failed > 0 \? 1 : 0/.test(tail), true, '收尾必须设置 process.exitCode = failed > 0 ? 1 : 0')
   })
 
