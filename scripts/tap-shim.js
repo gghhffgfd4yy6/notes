@@ -29,13 +29,13 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-// TAP 写出口：**需要一个** fd 1 之外的私有出口——原因（实测，非推测）：xbk_storage.js 里有
+// TAP 写出口：历史上**想**要一个 fd 1 之外的私有出口——动机（实测，非推测）：xbk_storage.js 里有
 // let fd = -1 这类哨兵，UnaryOperator 变异体把它改成 +1 后，finally 里的 closeSync(fd) 就变成
 // closeSync(1) —— 直接关掉 stdout。此时 shim 若只会写 fd 1 会抛 EBADF: bad file descriptor, write
 // （在 process 'exit' 钩子里抛出，进程异常终止，TAP 点全丢），于是 tap-runner 按 tap-helper.ts 的规则
 // 判「退出码非 0 且无失败测试」，记 RuntimeError。
 //
-// ⚠️ 但**下面这段复制私有 fd 的实现是 no-op，从未生效**（2026-09-21 实测证伪，见
+// ⚠️ 但**复制私有 fd 的实现是 no-op，从未生效**（C10-040 已按实测删掉这段死代码，见
 //   .local/storage-tap-RE-findings.md §3.4 与 §2.3）：
 //   * tap-runner 用 **socketpair** spawn 被测进程（`readlink /proc/self/fd/1` = `socket:[…]`），
 //     `fs.openSync('/proc/self/fd/1', 'a')` 直接 **ENXIO**（不是「本机终端才 ENXIO」——CI 下同样如此）
@@ -56,19 +56,16 @@ const path = require('node:path')
 // 真正的修法是 shim 侧「中继子进程」（加载期 spawn 一个持有同一 stdout 管道的中继，退出时同步写其
 // stdin），**本轮不实现**（超出 PR-1 范围，且中继必须在 stdin EOF 后立即退出并带超时，否则 parseTap
 // 会挂死——比现在的 RE 更糟）。已登记为 PR-2 候选。
-let TAP_FD = 1
-try {
-  TAP_FD = fs.openSync('/proc/self/fd/1', 'a')
-} catch {
-  TAP_FD = 1
-}
+// 因此实现里不再尝试 dup：**TAP_FD 就是 fd 1**（C10-040）。保留名字是为了让「哪条通道算 TAP」
+// 这件事只有一个出处，也方便将来换中继方案时只改这一处。
+const TAP_FD = 1
 
 let deliveryFailureReported = false
 function say (line) {
   const text = line + '\n'
   // 投递契约（C10-007）：**只有 fd 1 写成功才算投递**。
-  // TAP_FD 是 fd 1 的 dup（上面的实测结论：`fs.openSync('/proc/self/fd/1','a')` 在 tap-runner 的
-  // socketpair 下恒 ENXIO ⇒ TAP_FD 恒为 1），故 [TAP_FD, 1] 都是「同一个 stdout 通道」。
+  // TAP_FD 就是 fd 1（C10-040：dup 尝试在 tap-runner 的 socketpair 下恒 ENXIO，已删），
+  // 故 [TAP_FD, 1] 是**同一个** stdout 通道。
   // **stderr 不是投递通道**——tap-parser 只解析 stdout。
   // 修复前这里是「任一 fd 写成功即算成功」：fd 1 被 closeSync(1) 关掉后 TAP 点静默改投 fd 2，于是
   // stdout 为空、退出码仍是 0，tap-parser 对空流判 {ok:true, skipReason:'no tests found'} ⇒ 变异体
