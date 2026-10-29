@@ -8,6 +8,33 @@ const { spawn } = require('child_process')
 const path = require('path')
 const { SUITES } = require('./test_suites')
 
+// C3-002（backlog）：套件子进程一律用**剥离了 XBK_CACHE_DIR 的 env**。
+// 为什么必须显式传 env：spawn 不传 env 时子进程继承 shell 环境，而生产 cacheDir getter 让
+// XBK_CACHE_DIR 无条件压过 Config.cache.dir（SYSTEM_CONTRACT 契约，语义正确），于是「在 export 过
+// 该变量的机器上跑测试」会把夹具写进**部署缓存目录**、覆盖真实 push.json 判重主存。
+// 只改测试侧：生产 getter 一字不动，环境变量在你自己的 shell 里照旧生效。
+// ⚠️ 最小工作树夹具（test_ci_skip_suites.js 只复制 run_tests.js + 假 test_suites/check-deps）里没有
+// scripts/ 目录：与 scripts/check-host-clean.js 同口径——缺模块时**响亮**跳过并退回同一实现的内联
+// 版本（绝不静默放行，否则夹具里的隔离语义与真实入口不一致）。
+const FALLBACK_STRIP_CACHE_DIR_ENV = (env = process.env) => {
+  const next = { ...(env || {}) }
+  const raw = typeof next.XBK_CACHE_DIR === 'string' ? next.XBK_CACHE_DIR : ''
+  delete next.XBK_CACHE_DIR
+  return { env: next, cleared: raw }
+}
+let stripCacheDirEnv = FALLBACK_STRIP_CACHE_DIR_ENV
+try {
+  stripCacheDirEnv = require('./scripts/test-env-isolation').stripCacheDirEnv || FALLBACK_STRIP_CACHE_DIR_ENV
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') throw e
+  console.log('⚠️ 未找到 scripts/test-env-isolation.js，入口按同一口径内联剥离 XBK_CACHE_DIR（最小工作树夹具）')
+}
+const SUITE_ENV_INFO = stripCacheDirEnv(process.env)
+const SUITE_ENV = SUITE_ENV_INFO.env
+if (SUITE_ENV_INFO.cleared) {
+  console.warn(`⚠️ 已从本入口派生的测试子进程环境中清除 XBK_CACHE_DIR（${SUITE_ENV_INFO.cleared}）：测试只用 Config.cache.dir 的私有目录，避免写入部署缓存（backlog C3-002）`)
+}
+
 // 中文名按显示宽度对齐：String.prototype.padEnd 按 UTF-16 码元计数，中文每字占 2 列，
 // 直接 padEnd 会导致汇总行错位；此处按终端显示宽度补齐。
 const WIDE_RE = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/
@@ -214,6 +241,9 @@ function runSuite (s) {
     try {
       child = spawn(process.execPath, [file], {
         cwd: __dirname,
+        // C3-002：显式传剥离了 XBK_CACHE_DIR 的 env（见文件顶部 SUITE_ENV 的说明）——
+        // 不传 env 会让子进程继承 shell 里的部署开关，把夹具写进真实缓存目录。
+        env: SUITE_ENV,
         // 套件自成进程组组长（setsid，C10-003 / 与 run_tests.js 的 detached:true 同口径）：
         // 套件会派生后代（test_console.js spawn console.js、test_app_p.js fork 并行调度最典型），后代继承
         // fd1/fd2。只杀直接子进程时，孤儿后代仍持有管道 ⇒ CI（pipe）形态下 close 被拖到后代退出才来

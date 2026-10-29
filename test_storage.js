@@ -328,6 +328,33 @@ const {
   assert.strictEqual(tailWhole.truncated, undefined, '未发生截断时不得标记 truncated')
   assert.strictEqual(readSafeText(tailFile, 100, { tail: true }), 'B'.repeat(100), 'readSafeText 也必须透传 options')
 
+  // ===== C3-001：0 字节与「短读」必须能从结果里区分出来 =====
+  // 背景（backlog C3-001）：0 字节文件走 ok 分支返回空串，消费侧 `|| '[]'` 把它洗成「合法空缓存」，
+  // 与「缓存缺失」在结果里完全同形 ⇒ 无法告警。此处只加**附加标记**（不改 status，避免影响既有
+  // 调用方语义：readSafeText 仍返回 ''）；短读（实际读到的字节少于 fstat 观测值）同样必须可识别，
+  // 否则「文件被截短」的部分内容会被当成完整记录。
+  const emptyFile = make('empty-c3001.txt')
+  fs.writeFileSync(emptyFile, '')
+  const rEmpty = readSafeTextResult(emptyFile)
+  assert.strictEqual(rEmpty.status, 'ok', '0 字节仍判 ok（既有语义不变）')
+  assert.strictEqual(rEmpty.text, '', '0 字节返回空串')
+  assert.strictEqual(rEmpty.empty, true, 'C3-001：0 字节必须带 empty 标记（否则与「缺失」不可区分）')
+  assert.strictEqual(readSafeTextResult(okFile).empty, undefined, '非空文件不得带 empty 标记')
+
+  const shortReadFile = make('shortread-c3001.txt')
+  fs.writeFileSync(shortReadFile, 'abcdef')
+  const origFstatSR = fs.fstatSync
+  fs.fstatSync = (fd) => {
+    const s = origFstatSR.call(fs, fd)
+    return { isFile: () => s.isFile(), dev: s.dev, ino: s.ino, size: s.size + 4 } // 观测值大于实际字节
+  }
+  let rShort
+  try { rShort = readSafeTextResult(shortReadFile) } finally { fs.fstatSync = origFstatSR }
+  assert.strictEqual(rShort.status, 'ok', '短读仍判 ok（既有语义不变）')
+  assert.strictEqual(rShort.text, 'abcdef', '短读返回实际读到的内容（不得补零/串内容）')
+  assert.strictEqual(rShort.shortRead, true, 'C3-001：读到的字节少于 fstat 观测值必须带 shortRead 标记')
+  assert.strictEqual(readSafeTextResult(okFile).shortRead, undefined, '完整读取不得带 shortRead 标记')
+
   // ===== readSafeText（包装）=====
   assert.strictEqual(readSafeText(okFile), 'safe-content', 'ok 时应返回文本')
   assert.strictEqual(readSafeText(make('missing2.txt')), null, 'missing 时应返回 null')

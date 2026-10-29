@@ -8,6 +8,13 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW } = require('./xbk_message_store')
 
+// C3-002（backlog）：夹具加载期先清掉外部部署开关 XBK_CACHE_DIR。
+// 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
+// 而本套件下方用 Config.cache.dir 把 F1 夹具隔离到私有目录——在 export 过该变量的 shell 里直跑
+// 本套件，隔离会被 env 顶掉、夹具写进部署缓存目录（实测：17 条用例假红 + 12 个夹具文件落进哨兵目录）。
+const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
+isolateProcessCacheDirEnv()
+
 const mockUtils = {
   anonKey: (s) => 'anon' + String(s).length,
   safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
@@ -2584,6 +2591,165 @@ check('MS-14 哨兵认领: 复核发现持有者存活必须把哨兵搬回原�
     `还原失败必须 WARN 并显式说明哨兵已丢（不得静默）：${JSON.stringify(warnsB)}`)
 })
 
+// ===== C3-001：0 字节缓存 / 短读必须与「缓存缺失」区分开 =====
+// 缺陷：`JSON.parse(result.text || '[]')` 把 0 字节文件洗成「合法空缓存」，随后清除 _readFailed、
+// 写内存快照并固化「已验证」——方向（全量重推）本身是契约允许的（SYSTEM_CONTRACT 核心原则 1），
+// 缺口是**零告警**：运维无法把「缓存被外部截断成 0 字节」与「首次运行没有缓存」区分开。
+// 修复口径：方向不变（仍按空缓存重建、仍解除写闸门 = 不引入 F1 的永久零推送自锁），只补「响亮」；
+// 短读（读到的字节少于 fstat 观测值）另按瞬时读失败 fail-closed —— 部分内容不得被当成完整判重
+// 记录，否则下一轮 save 会把读不到的身份静默丢掉（判重数据丢失）。
+check('C3-001: 0 字节 push.json 必须点名告警（不得静默当合法空缓存），方向仍是按空缓存重建', () => {
+  cleanF1Dir()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const store = makeRealStore()
+  const name = 'c3001_empty.json'
+  const fp = store.getFilePath(name)
+  REAL_FS.writeFileSync(fp, '')
+  store._readFailed[fp] = true // 前置：写闸门本已占位（旧实现会静默清掉且不留任何痕迹）
+  let msgs
+  const errs = captureConsole('error', () => { msgs = store.readMessages(fp) })
+  assert.deepStrictEqual(msgs, [], '0 字节按空缓存返回（全量重推方向不变）')
+  const hits = errs.filter(l => l.includes(fp))
+  assert.strictEqual(hits.length, 1, `0 字节必须且只能产出一条点名该文件的诊断（修前为 0 条）：${JSON.stringify(errs)}`)
+  assert.ok(hits[0].includes('0 字节') && hits[0].includes('重推'),
+    `诊断必须说明「0 字节」及其后果（全量重推）：${hits[0]}`)
+  assert.strictEqual(store._readFailed[fp], undefined, '写闸门必须解除（否则永久零推送：F1 自锁）')
+  assert.deepStrictEqual(store._memoryCache[fp], [], '内存快照按空缓存')
+  assert.strictEqual(store._verified.has(fp), true, '读取成功后固化「已验证」')
+  assert.deepStrictEqual(corruptBackups(name), [], '0 字节没有任何字节可隔离 ⇒ 不得产生 .bak（与「解析失败」区分）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '', '读取本身不得改写文件')
+  assert.strictEqual(store.saveMessages(fp, [{ id: 'x' }]), true, '门解除后必须能正常落盘（不得引入永久零推送）')
+})
+
+check('C3-001: 缓存缺失（初始化写 []）不得触发 0 字节告警（两类必须区分开）', () => {
+  cleanF1Dir()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const store = makeRealStore()
+  const fp = store.getFilePath('c3001_missing.json')
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(store.readMessages(fp), []) })
+  assert.deepStrictEqual(errs, [], '首次初始化是正常路径，不得有任何错误诊断（否则每次新 pushUrl 都刷告警）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '[]', '缺失缓存初始化内容仍是 []（行为不变）')
+})
+
+check('C3-001: 短读（读到的字节少于 fstat 观测值）必须 fail-closed：绝不把部分内容当完整判重记录', () => {
+  const name = 'c3001_short.json'
+  const h = makeBatchStore({
+    name,
+    files: { [cachePath(name)]: '[{"id":"a"}]' },
+    readStatus: () => ({ status: 'ok', text: '[{"id":"a"}]', shortRead: true })
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(h.store.readMessages(h.filePath), []) })
+  assert.strictEqual(h.store._readFailed[h.filePath], true, '短读与 ioError/replaced 同口径：保持写闸门')
+  assert.ok(errs.some(l => l.includes('不完整') && l.includes(h.filePath)),
+    `必须点名「读取不完整」并指向该文件：${JSON.stringify(errs)}`)
+  assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '短读后绝不得覆写磁盘')
+  assert.strictEqual(h.store._memoryCache[h.filePath], undefined, '短读结果不得进内存快照（否则下一轮 save 用它覆写）')
+  assert.deepStrictEqual(h.store._drainRecoveryEvents(), [], '短读是瞬时故障，绝不进入隔离开口（不得 rename）')
+})
+
+// ===== C3-002：测试入口/夹具必须隔离 XBK_CACHE_DIR =====
+// 缺陷：XBK_CACHE_DIR 无条件压过 Config.cache.dir 并跳过根内校验——这是 SYSTEM_CONTRACT:19 的
+// 三方同源契约（生产行为正确，**不得改动**）；真实缺陷在测试侧：两个测试入口 spawn/exec 子进程时
+// 不传 env（继承 shell），全仓也没有任何一处删除它 ⇒ 在 export 过该变量的 shell 里跑测试，夹具会
+// 写进部署缓存目录（实测：本套件带该变量启动时 17 条用例假红、12 个夹具文件落进哨兵目录）。
+// 修复口径：只改测试侧——入口把剥离后的 env 传给子进程，高风险夹具在加载期自清；生产 getter 的
+// 「env 压过配置」语义一字不改（下方 raw 对照分支就是在锁这条，防止有人「顺手」改生产语义）。
+const ENV_ISOLATION = './scripts/test-env-isolation'
+
+check('C3-002: stripCacheDirEnv 必须剥离 XBK_CACHE_DIR 且不改动入参（入口唯一实现）', () => {
+  const { stripCacheDirEnv } = require(ENV_ISOLATION)
+  const base = { XBK_CACHE_DIR: '/deploy/cache', KEEP: '1' }
+  const { env, cleared } = stripCacheDirEnv(base)
+  assert.strictEqual(env.XBK_CACHE_DIR, undefined, '剥离后不得残留 XBK_CACHE_DIR')
+  assert.strictEqual(env.KEEP, '1', '其它环境变量必须原样保留')
+  assert.strictEqual(cleared, '/deploy/cache', '必须回传被清除的原值（入口据此告警）')
+  assert.strictEqual(base.XBK_CACHE_DIR, '/deploy/cache', '不得原地修改入参（process.env 只由显式 API 改）')
+  assert.strictEqual(stripCacheDirEnv({ XBK_CACHE_DIR: '' }).cleared, '', '空值按「未设置」处理（不算泄漏）')
+  assert.strictEqual(stripCacheDirEnv({}).env.XBK_CACHE_DIR, undefined, '未设置时不得凭空造键')
+})
+
+check('C3-002: 两个测试入口都必须把剥离后的 env 传给子进程（接线内容断言）', () => {
+  for (const entry of ['run_tests.js', 'run_unit_tests.js']) {
+    const src = REAL_FS.readFileSync(path.join(__dirname, entry), 'utf8')
+    assert.ok(src.includes(`require('${ENV_ISOLATION}')`), `${entry} 必须 require ${ENV_ISOLATION}`)
+    assert.ok(/env:\s*SUITE_ENV/.test(src),
+      `${entry} 必须把 SUITE_ENV 传给子进程（否则 shell 里的 XBK_CACHE_DIR 照旧泄漏进每个套件）`)
+  }
+})
+
+check('C3-002: 高风险夹具（test_filter / 本套件）加载期必须自清 XBK_CACHE_DIR', () => {
+  for (const file of ['test_filter.js', 'test_message_store_utils.js']) {
+    const src = REAL_FS.readFileSync(path.join(__dirname, file), 'utf8')
+    assert.ok(/isolateProcessCacheDirEnv\(\)/.test(src), `${file} 必须在加载期调用 isolateProcessCacheDirEnv()`)
+  }
+  assert.strictEqual(process.env.XBK_CACHE_DIR, undefined, '本套件加载后进程内不得残留 XBK_CACHE_DIR')
+})
+
+// 行为验证：子进程以 XBK_CACHE_DIR=<哨兵目录> 启动，raw = 不隔离（生产契约：env 压过配置，必须
+// 照旧成立），isolate = 走测试侧的显式清除。两条分支合起来同时锁住「缺陷机制真实存在」与
+// 「隔离后不再写进部署目录」。
+const C3002_OWN = `xianbaoku_cache_c3002_own_${process.pid}`
+const C3002_SENTINEL = `xianbaoku_cache_c3002_sentinel_${process.pid}`
+const C3002_PREAMBLE = `
+const path = require('node:path')
+const fs = require('node:fs')
+const { createMessageStore } = require('./xbk_message_store')
+`
+function c3002Body (mode) {
+  return C3002_PREAMBLE + `
+if (${JSON.stringify(mode)} === 'isolate') require('${ENV_ISOLATION}').isolateProcessCacheDirEnv({ log: () => {} })
+const store = createMessageStore({
+  Config: { cache: { dir: ${JSON.stringify(C3002_OWN)}, maxSize: 10000 } },
+  Utils: { anonKey: (s) => 'anon' + String(s).length, safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)), getMessageIdentity: () => ({ valid: false }), isValidItem: () => true, num: () => 10000, addIndex: () => {} },
+  fs,
+  path,
+  crypto: require('node:crypto'),
+  normalize: (o) => o,
+  storage: require('./xbk_storage'),
+  constants: { DEFAULT_MAX_SIZE: 10000, MESSAGE_CACHE_MAX_BYTES: 8388608, TOMBSTONE_MAX_KEYS: 5000, TOMBSTONE_MAX_BYTES: 262144, TOMBSTONE_LOCK_STALE_MS: 10000 }
+})
+const fp = store.getFilePath('c3002_probe.json')
+const ok = store.saveMessages(fp, [{ id: 'x' }])
+process.stdout.write(JSON.stringify({ cacheDir: store.cacheDir, filePath: fp, ok }))
+`
+}
+
+check('C3-002: 带 XBK_CACHE_DIR 启动子进程——raw 仍写 env 目录（生产契约），isolate 后只写私有目录', () => {
+  const ownDir = path.join(__dirname, C3002_OWN)
+  const sentinelDir = path.join(__dirname, C3002_SENTINEL)
+  const cleanup = () => {
+    for (const d of [ownDir, sentinelDir]) {
+      try { REAL_FS.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  }
+  const run = (mode) => {
+    let out
+    try {
+      out = execFileSync(process.execPath, ['-e', c3002Body(mode)], {
+        encoding: 'utf8', timeout: 8000, cwd: __dirname, env: { ...process.env, XBK_CACHE_DIR: sentinelDir }
+      })
+    } catch (e) {
+      assert.fail(`C3-002 子进程（${mode}）未能正常返回（code=${e.code}）：${e.message}`)
+    }
+    return JSON.parse(out)
+  }
+  cleanup()
+  try {
+    const raw = run('raw')
+    assert.strictEqual(raw.ok, true, 'raw 分支写入必须成功（缺陷复现的前置）')
+    assert.strictEqual(raw.cacheDir, sentinelDir, '生产契约：XBK_CACHE_DIR 必须压过 Config.cache.dir（本修复不得改动）')
+    assert.ok(raw.filePath.startsWith(sentinelDir + path.sep),
+      `raw 分支必须写进 env 指向的目录（这就是「测试写进部署缓存」的机制）：${raw.filePath}`)
+    cleanup()
+    const isolated = run('isolate')
+    assert.strictEqual(isolated.ok, true, 'isolate 分支写入必须成功')
+    assert.strictEqual(isolated.cacheDir, ownDir, '隔离后必须回到 Config.cache.dir 解析出的私有目录')
+    assert.ok(isolated.filePath.startsWith(ownDir + path.sep), `隔离后必须写私有目录：${isolated.filePath}`)
+    assert.strictEqual(REAL_FS.existsSync(sentinelDir), false, '隔离后绝不得再创建/写入部署目录（哨兵必须不存在）')
+  } finally {
+    cleanup()
+  }
+})
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 // ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
 // seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
