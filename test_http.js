@@ -26,6 +26,25 @@ function installMockStream (behavior) {
   return () => { got.stream = orig }
 }
 
+// C5-049：切 XBK_PROFILE + 劫持 console.log 收日志 + finally 还原，此前同一段在 7 个用例里逐字复制
+// （任一处漏写还原就会把 env/console.log 污染带进后续用例）。统一夹具：profile 为 undefined 表示
+// 删除该变量；fn(logs) 在劫持期内执行，无论成败都还原（含断言抛错），返回值原样透传。
+async function withProfileLog (profile, fn) {
+  const origProfile = process.env.XBK_PROFILE
+  if (profile === undefined) delete process.env.XBK_PROFILE
+  else process.env.XBK_PROFILE = profile
+  const logs = []
+  const origLog = console.log
+  console.log = (...args) => { logs.push(args.join(' ')) }
+  try {
+    return await fn(logs)
+  } finally {
+    console.log = origLog
+    if (origProfile === undefined) delete process.env.XBK_PROFILE
+    else process.env.XBK_PROFILE = origProfile
+  }
+}
+
 ;(async () => {
   // 1. 正常 JSON 解析
   {
@@ -86,12 +105,7 @@ function installMockStream (behavior) {
 
   // 6. XBK_PROFILE=3 + 正常 JSON → 走 detailedProfile timing 日志分支（行75-78）
   // 行为断言：不仅验证 JSON 解析结果，还验证 profile 日志确实被输出（start/response/timing 三条日志）。
-  {
-    const origProfile = process.env.XBK_PROFILE
-    process.env.XBK_PROFILE = '3'
-    const logs = []
-    const origLog = console.log
-    console.log = (...args) => { logs.push(args.join(' ')) }
+  await withProfileLog('3', async (logs) => {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
     try {
       const body = await fetchJson('https://api.example.com/x')
@@ -103,12 +117,8 @@ function installMockStream (behavior) {
       // 日志断言 3：timing 日志应被输出（这是行75-78的核心分支，此前唯一断言未覆盖）
       assert.ok(logs.some(l => l.includes('[profile api timing]')), '应输出 [profile api timing] 日志（覆盖 timing 分支）')
       assert.ok(logs.some(l => l.includes('total=') && l.includes('bytes=')), 'timing 日志应包含 total 和 bytes 字段')
-    } finally {
-      restore()
-      console.log = origLog
-      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    }
-  }
+    } finally { restore() }
+  })
 
   // 7. UTF-8 BOM 前缀的合法 JSON → 正常解析。旧实现直接 JSON.parse（对 BOM 抛错）→ 归成
   //    ERR_BODY_NOT_JSON，而 xbk_failure_policy 把该码放进 PERMANENT 集合 → 常驻循环永久停推。
@@ -167,12 +177,7 @@ function installMockStream (behavior) {
 
   // 9. XBK_PROFILE=3 的 start 日志：URL 只保留 origin + '/***'，路径段里的密钥不得出现
   //    （旧实现 replace(/\/[^/]+$/, '/***') 只遮蔽末段 → /SECRET/ 原样进日志）
-  {
-    const origProfile = process.env.XBK_PROFILE
-    process.env.XBK_PROFILE = '3'
-    const logs = []
-    const origLog = console.log
-    console.log = (...args) => { logs.push(args.join(' ')) }
+  await withProfileLog('3', async (logs) => {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
     try {
       const body = await fetchJson('https://api.example.com/SECRET/v1?token=abc')
@@ -182,20 +187,11 @@ function installMockStream (behavior) {
       assert.ok(startLog.includes('url=https://api.example.com/***'), 'URL 应只保留 origin + /***')
       assert.ok(!startLog.includes('SECRET'), '非末段路径密钥不得进日志')
       assert.ok(!startLog.includes('v1') && !startLog.includes('token=abc'), '路径/查询串不得进日志')
-    } finally {
-      restore()
-      console.log = origLog
-      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    }
-  }
+    } finally { restore() }
+  })
 
   // 10. 非法 URL → '<invalid-url>/***'（旧实现正则不匹配，整条 URL 原样进日志）
-  {
-    const origProfile = process.env.XBK_PROFILE
-    process.env.XBK_PROFILE = '3'
-    const logs = []
-    const origLog = console.log
-    console.log = (...args) => { logs.push(args.join(' ')) }
+  await withProfileLog('3', async (logs) => {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"ok":true}'] })
     try {
       const body = await fetchJson('not-a-valid-url')
@@ -203,12 +199,8 @@ function installMockStream (behavior) {
       const startLog = logs.find(l => l.includes('[profile api] start url='))
       assert.ok(startLog && startLog.includes('url=<invalid-url>/***'), '非法 URL 应打 <invalid-url>/***')
       assert.ok(!startLog.includes('not-a-valid-url'), '非法 URL 原串不得进日志')
-    } finally {
-      restore()
-      console.log = origLog
-      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    }
-  }
+    } finally { restore() }
+  })
 
   // 11. maxBody 非法（非数字/≤0/NaN/Infinity）→ 告警一次并钳制到 DEFAULT_MAX_BODY；合法值不告警
   {
@@ -239,32 +231,26 @@ function installMockStream (behavior) {
   //     responseAtMs，且严格小于 downloadEnd（旧实现在 end 回调里重新取 Date.now()，恒 ≥ downloadEnd）。
   //     注入单调递增假时钟使两处取值必然可区分——真实时钟下旧实现常因同一毫秒而蒙混过关。
   {
-    const origProfile = process.env.XBK_PROFILE
     const origNow = Date.now
-    process.env.XBK_PROFILE = '3'
-    const logs = []
-    const origLog = console.log
-    console.log = (...args) => { logs.push(args.join(' ')) }
     let clock = 0
     Date.now = () => { clock += 1000; return clock }
-    const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"t":1}'] })
     try {
-      const body = await fetchJson('https://api.example.com/x')
-      assert.deepStrictEqual(body, { t: 1 }, '假时钟下 JSON 解析应正常')
-      const respLog = logs.find(l => l.includes('[profile api] responseAtMs='))
-      const timingLog = logs.find(l => l.includes('[profile api timing]'))
-      assert.ok(respLog && timingLog, '应输出 response 与 timing 日志')
-      const respAt = Number(/responseAtMs=(\d+)/.exec(respLog)[1])
-      const timingAt = Number(/responseAt=(\d+)/.exec(timingLog)[1])
-      const downloadEnd = Number(/downloadEnd=(\d+)/.exec(timingLog)[1])
-      assert.strictEqual(timingAt, respAt, 'timing.responseAt 必须复用 response 事件的取值')
-      assert.ok(timingAt < downloadEnd, `responseAt(${timingAt}) 应严格小于 downloadEnd(${downloadEnd})`)
-    } finally {
-      restore()
-      console.log = origLog
-      Date.now = origNow
-      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    }
+      await withProfileLog('3', async (logs) => {
+        const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"t":1}'] })
+        try {
+          const body = await fetchJson('https://api.example.com/x')
+          assert.deepStrictEqual(body, { t: 1 }, '假时钟下 JSON 解析应正常')
+          const respLog = logs.find(l => l.includes('[profile api] responseAtMs='))
+          const timingLog = logs.find(l => l.includes('[profile api timing]'))
+          assert.ok(respLog && timingLog, '应输出 response 与 timing 日志')
+          const respAt = Number(/responseAtMs=(\d+)/.exec(respLog)[1])
+          const timingAt = Number(/responseAt=(\d+)/.exec(timingLog)[1])
+          const downloadEnd = Number(/downloadEnd=(\d+)/.exec(timingLog)[1])
+          assert.strictEqual(timingAt, respAt, 'timing.responseAt 必须复用 response 事件的取值')
+          assert.ok(timingAt < downloadEnd, `responseAt(${timingAt}) 应严格小于 downloadEnd(${downloadEnd})`)
+        } finally { restore() }
+      })
+    } finally { Date.now = origNow }
   }
 
   // 13. maxBody 是「取值即抛错」的非法对象 → 告警路径必须先做安全转换。
@@ -398,46 +384,30 @@ function installMockStream (behavior) {
 
   // H1. 默认环境（XBK_PROFILE 非 '3'）不得输出任何 [profile api] 日志——专杀
   //     `process.env.XBK_PROFILE === '3'`→true 与 `if (detailedProfile)`→if(true) 两类变异体。
-  {
-    const origProfile = process.env.XBK_PROFILE
-    delete process.env.XBK_PROFILE
-    const logs = []
-    const origLog = console.log
-    console.log = (...a) => logs.push(a.join(' '))
+  await withProfileLog(undefined, async (logs) => {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":1}'] })
     try {
       assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x')), { a: 1 }, '默认环境仍应正常返回 JSON')
-    } finally {
-      restore()
-      console.log = origLog
-      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    }
+    } finally { restore() }
     assert.strictEqual(logs.filter(l => l.startsWith('[profile api')).length, 0, `默认环境不得输出 profile 日志，实际 ${JSON.stringify(logs)}`)
-  }
+  })
 
   // H2. 详细 profile：错误路径必须打且只打一条 `[profile api] error`；默认环境一条都不打——专杀
   //     `if (detailedProfile)` 的 true/false 两侧变异体（finishReject 内的日志分支）。
   {
     const profileModes = [true, false]
     for (const profileOn of profileModes) {
-      const origProfile = process.env.XBK_PROFILE
-      if (profileOn) process.env.XBK_PROFILE = '3'; else delete process.env.XBK_PROFILE
-      const logs = []
-      const origLog = console.log
-      console.log = (...a) => logs.push(a.join(' '))
       const boom = new Error('boom')
       boom.code = 'ERR_BOOM'
-      const restore = installMockStream({ error: boom })
-      let rejected = null
-      try {
-        await withinSettle(fetchJson('https://api.example.com/x'))
-      } catch (e) { rejected = e } finally {
-        restore()
-        console.log = origLog
-        if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-      }
-      assert.strictEqual(rejected, boom, '底层 error 必须原样 reject')
-      assert.strictEqual(logs.filter(l => l.includes('[profile api] error')).length, profileOn ? 1 : 0, `XBK_PROFILE=${profileOn ? "'3'" : '未设'} 时 error 日志条数不符：${JSON.stringify(logs)}`)
+      await withProfileLog(profileOn ? '3' : undefined, async (logs) => {
+        const restore = installMockStream({ error: boom })
+        let rejected = null
+        try {
+          await withinSettle(fetchJson('https://api.example.com/x'))
+        } catch (e) { rejected = e } finally { restore() }
+        assert.strictEqual(rejected, boom, '底层 error 必须原样 reject')
+        assert.strictEqual(logs.filter(l => l.includes('[profile api] error')).length, profileOn ? 1 : 0, `XBK_PROFILE=${profileOn ? "'3'" : '未设'} 时 error 日志条数不符：${JSON.stringify(logs)}`)
+      })
     }
   }
 
@@ -504,20 +474,11 @@ function installMockStream (behavior) {
   // H6. profile timing 日志里的时间字段必须是**耗时差**（不得把绝对时间戳相加），firstDataAt 不得恒为
   //     n/a——专杀 `firstDataAt - started` / `endedAt - started` / `Date.now() - endedAt` 等
   //     ArithmeticOperator 变异体与 `if (!firstDataAt)` 的 BooleanLiteral 变异体。
-  {
-    const origProfile = process.env.XBK_PROFILE
-    process.env.XBK_PROFILE = '3'
-    const logs = []
-    const origLog = console.log
-    console.log = (...a) => logs.push(a.join(' '))
+  await withProfileLog('3', async (logs) => {
     const restore = installMockStream({ response: { statusCode: 200, headers: {} }, chunks: ['{"a":', '1}'] })
     try {
       assert.deepStrictEqual(await withinSettle(fetchJson('https://api.example.com/x')), { a: 1 })
-    } finally {
-      restore()
-      console.log = origLog
-      if (origProfile === undefined) delete process.env.XBK_PROFILE; else process.env.XBK_PROFILE = origProfile
-    }
+    } finally { restore() }
     const timing = logs.find(l => l.includes('[profile api timing]'))
     assert.ok(timing, `必须输出 timing 日志，实际 ${JSON.stringify(logs)}`)
     for (const key of ['firstDataAt', 'downloadEnd', 'parse', 'total']) {
@@ -527,6 +488,22 @@ function installMockStream (behavior) {
       assert.ok(m, `${key} 必须是数字耗时（恒为 n/a 说明首块未记录），实际日志：${timing}`)
       assert.ok(Number(m[1]) < 3600000, `${key} 必须是耗时差而不是时间戳相加，实际 ${m[1]}`)
     }
+  })
+
+  // C5-049 反例锁：env 切换与 console.log 劫持只允许有一处实现（withProfileLog）。
+  // 再抄一份即红——此前 7 处各自手写 restore，任一处漏还原就会把 XBK_PROFILE/console.log 污染
+  // 带进后续用例（顺序一变就假绿/假红）。
+  {
+    const selfSource = require('node:fs').readFileSync(__filename, 'utf8')
+    const countOf = (re) => (selfSource.match(re) || []).length
+    assert.strictEqual(countOf(/const origLog = console\.log/g), 1,
+      `console.log 劫持只允许在 withProfileLog 内实现一次，实际 ${countOf(/const origLog = console\.log/g)} 处`)
+    assert.strictEqual(countOf(/const origProfile = process\.env\.XBK_PROFILE/g), 1,
+      `XBK_PROFILE 切换/还原只允许实现一次，实际 ${countOf(/const origProfile = process\.env\.XBK_PROFILE/g)} 处`)
+    assert.strictEqual(countOf(/if \(origProfile === undefined\)/g), 1,
+      `env 还原分支只允许实现一次，实际 ${countOf(/if \(origProfile === undefined\)/g)} 处`)
+    assert.ok(countOf(/await withProfileLog\(/g) >= 7,
+      `7 个 profile 场景必须全部走统一夹具，实际 ${countOf(/await withProfileLog\(/g)} 处`)
   }
 
   console.log('test_http OK')
