@@ -183,6 +183,17 @@ function reapTestScope (label) {
   return { closed, cleared }
 }
 
+// C5-029：泄漏兜底闸的判定抽成函数——此前它只写在 main().then 的尾巴里（一段 if），
+// 把判定改成恒不成立、或把 harvested 结果换成常量，没有任何一条用例会红；唯一的信号是
+// Stryker 等满 timeoutMS（延迟 18h 才可见）。抽出来之后由用例直接钉住「有泄漏 ⇒ 非空报告」。
+function leakedResourceReport (lastReap) {
+  if (leakedScopes.length === 0 && lastReap.closed <= 0 && lastReap.cleared <= 0) return null
+  const detail = leakedScopes.length > 0
+    ? `${leakedScopes.length} 次收尾兜底（${leakedScopes.join('；')}）`
+    : `套件末收到 server ${lastReap.closed} 个 / interval ${lastReap.cleared} 个`
+  return `[console-suite] 检测到测试资源泄漏：${detail}——退出码置 1`
+}
+
 // 上一个 aok 超时未收尾的标记：aok 用 Promise.race 定局后原 work 仍在跑，Promise 没有取消
 // 语义（原理上做不到把它掐掉），它迟到的回调可能新建 server/socket/interval 或改共享状态。
 // 这里不做取消，只做最小防护：下一条 ok/aok 开始时先补一次收割，把僵尸刚造出来的句柄收掉；
@@ -3073,6 +3084,68 @@ async function watchMonitorTests () {
 }
 
 async function main () {
+  // ── C5-029：收尾机制自身的用例 ──
+  // 收割（reapTestScope）与泄漏兜底闸此前零用例：把收割改成 no-op、把闸的判定改成恒不成立，
+  // 没有任何一条用例会红——表现是 Stryker 等满 timeoutMS（延迟 18h 才可见）。这两条自己故意
+  // 漏一个 server / 一个 ref interval，直接钉住「真的关掉 + 真的记账 + 闸真的给出非空报告」。
+  // 计数可判定的前提是此刻进程里还没有别的 server/interval，所以放在套件最前面。
+  // 探针自己那一笔记账在 finally 里摘掉，不留给套件末的兜底闸（否则每次都 exit 1）。
+  await aok('C5-029 reapTestScope 必须关掉用例漏关的 server（句柄真的释放，不只记账）', async () => {
+    const probe = http.createServer((_req, res) => res.end('probe'))
+    const port = await listen(probe) // 与用例同一个入口：登记进 liveServers
+    const before = leakedScopes.length
+    try {
+      assert.strictEqual(probe.listening, true, '探针 server 必须先在监听')
+      const reaped = reapTestScope('C5-029 探针 server')
+      assert.strictEqual(reaped.closed, 1, '收割必须报告关掉 1 个 server')
+      assert.strictEqual(reaped.cleared, 0, '本探针没有 interval，不该记 interval')
+      assert.strictEqual(probe.listening, false, '收割必须真的摘掉监听句柄（不是只写一行 ♻️）')
+      assert.strictEqual(leakedScopes.length, before + 1, '真收割必须记进 leakedScopes（兜底闸的输入）')
+      assert.ok(leakedResourceReport({ closed: 0, cleared: 0 }), '有泄漏记录时兜底闸必须给出非空报告')
+      // 端口必须真的空出来：只把 server 从集合里删掉、不碰句柄的实现过不了这一步。
+      const again = http.createServer((_req, res) => res.end('again'))
+      await new Promise((resolve, reject) => {
+        again.once('error', reject)
+        again.listen(port, '127.0.0.1', resolve)
+      })
+      await new Promise((resolve) => again.close(resolve))
+    } finally {
+      leakedScopes.splice(before)
+    }
+  })
+
+  await aok('C5-029 reapTestScope 必须 clear ref interval，unref 的只清不记（不误红）', async () => {
+    // clear 的判据必须行为化：Node 22 实测 clearInterval 之后 hasRef() 仍返回 true，
+    // 拿它当「已 clear」的证据等于什么都没证明。改成「clear 之后回调不得再跑」。
+    const before = leakedScopes.length
+    let refFired = 0
+    let unrefFired = 0
+    setInterval(() => { refFired++ }, 20) // 全局包装登记进 liveIntervals
+    const unrefTimer = setInterval(() => { unrefFired++ }, 20)
+    unrefTimer.unref()
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 60)) // 先证明两个定时器本来是活的
+      assert.ok(refFired > 0, `ref interval 必须先真的跑起来（实际 ${refFired} 次）`)
+      assert.ok(unrefFired > 0, `unref interval 也必须先真的跑起来（实际 ${unrefFired} 次）`)
+      const reaped = reapTestScope('C5-029 探针 interval')
+      assert.strictEqual(reaped.cleared, 1, '只有 ref interval 记泄漏（unref 不钉事件循环）')
+      assert.strictEqual(reaped.closed, 0, '本探针没有 server')
+      assert.strictEqual(liveIntervals.size, 0, '两个 interval 都必须从登记表摘掉')
+      assert.strictEqual(leakedScopes.length, before + 1, '只有 ref interval 记一笔')
+      const frozen = { refFired, unrefFired }
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      assert.strictEqual(refFired, frozen.refFired, 'reap 之后 ref interval 不得再跑（必须真的 clearInterval）')
+      assert.strictEqual(unrefFired, frozen.unrefFired, 'reap 之后 unref interval 同样不得再跑')
+    } finally {
+      leakedScopes.splice(before)
+    }
+    // 无泄漏时闸必须沉默——否则套件每轮都以 1 退出，等于把闸变成噪声。
+    // （探针自己的记账已在 finally 摘掉，这里是「真实基线」的形态。）
+    assert.strictEqual(leakedResourceReport({ closed: 0, cleared: 0 }), null, '无泄漏时兜底闸不得误报')
+    // 报告必须带上计数（改坏判据、只打印一句空话都过不了）。
+    assert.ok(/server 1 个/.test(leakedResourceReport({ closed: 1, cleared: 0 })), '报告必须点出被收割的 server 数')
+  })
+
   await lineSearchTests()
   await watchMonitorTests()
   await filterRuleApiTests()
@@ -10559,9 +10632,10 @@ main()
     // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
     // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
     // unref interval 只 clear 不计（见 reapTestScope），不参与本判定，所以不会误伤基线。
-    if (leakedScopes.length > 0 || lastReap.closed > 0 || lastReap.cleared > 0) {
+    const leakReport = leakedResourceReport(lastReap)
+    if (leakReport) {
       process.exitCode = 1
-      console.error(`[console-suite] 检测到测试资源泄漏：${leakedScopes.length} 次收尾兜底（${leakedScopes.join('；')}）——退出码置 1`)
+      console.error(leakReport)
     }
     // 最后一道闸：万一还有用例之外的东西攥着事件循环（孙进程 / 未走 listen 的句柄 / 超时
     // 用例的迟到回调刚造出来的资源），也不让 CI 白等满 timeoutMS。unref() 保证没有泄漏时它
