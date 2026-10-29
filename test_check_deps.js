@@ -1125,7 +1125,8 @@ test('C10-018 反向扫描：代码 require 未声明的包 → exit 1 并点名
     // 清单行模板一律是 `  - <包>（<文件>）`（scripts/check-deps.js 三处），缩进只会是空格/Tab。
     // 旧写法 `\s+` 含换行：配 /m 时每个行首都能起扫并跨过后续空行，匹配可以跨行
     // （`- got（` 自己不带缩进、只要前面有空行也算命中）。限定 [ \t] 后匹配被关在同一行内。
-    if (/^[ \t]+- got（/m.test(out)) throw new Error(`已声明的包不得被误报\n--- 实际输出 ---\n${out}`)
+    // 用 `*` 而非 `+`：零缩进的 `- got（` 同样是误报形态，不该被排除在判据外（闸门 B 建议）。
+    if (/^[ \t]*- got（/m.test(out)) throw new Error(`已声明的包不得被误报\n--- 实际输出 ---\n${out}`)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
