@@ -188,7 +188,8 @@ const unitFiles = SUITES.filter(s => !s.integration && !s.mutationSkip).map(s =>
 //   ② run: 支持多行形式（块指示符 `|` / `>` 及其 chomp/显式缩进变体 `|-` `>-` `|+` `>-2` `|2` `|2-` `>1+` 等，
 //      或 run: 后跟缩进更深的续行），命令文本合并后只提取
 //      `npm run <script>` 命令名——解析不出命令名仍会红（那才是真正的门禁缺口），排版变化不再误红；
-//   ③ 步骤内其它字段（uses/with/env/id/continue-on-error 等）不参与命令提取，也不破坏步骤归属；
+//   ③ 步骤内其它字段（uses/with/env/id 等）不参与命令提取，也不破坏步骤归属；`continue-on-error`
+//      额外记进 step.continueOnError（供「阻断性」对账用，见 2 补），不影响命令提取本身；
 //   ④ if: 仅在缩进比当前 step 起点更深时视为步骤级条件——job 级 if:（缩进更浅）不属任何 step，
 //      避免把已覆盖的步骤误标为条件步骤而被对账忽略。
 // 从命令文本中提取 `npm run <script>` 命令名（脚本名取首个 token，排除 shell 元字符，避免跨行吞并）；
@@ -213,6 +214,17 @@ function stripQuotesAndComment (line) {
   }
   return out
 }
+// step 级 `continue-on-error:` 的三种合法键写法（裸键 / 单引号 / 双引号）都要认：值只在**显式 false**
+// 时才算「阻断」；空值、表达式（`${{ matrix.experimental }}`）、`true` 一律按「可能不阻断」处理（宁红勿绿）。
+const CONTINUE_ON_ERROR_KEY_RE = /^(?:continue-on-error|'continue-on-error'|"continue-on-error")\s*:(.*)$/
+const isBlockingContinueOnError = (rawValue) => {
+  const value = stripQuotesAndComment(rawValue).trim().toLowerCase()
+  return value === 'false'
+}
+// shell 兜底把失败吞掉：`npm run x || true` / `|| :` / `|| exit 0`（前两者永远成功，后者把退出码改成 0）。
+// 这类命令的退出码取决于兜底命令，不能作为「该步骤会阻断 CI」的证据（C4-016）。
+// 用线性扫描的字面量集合而不是宽泛的 `||.*`：`|| exit 1` 这类兜底仍是阻断的，不该误判（宁红勿绿有边界）。
+const SWALLOWED_FALLBACK_RE = /\|\|\s*(?:true|:)(?=[\s;)&|]|$)|\|\|\s*exit\s+0(?=[\s;)&|]|$)|\|\|\s*(?:\/usr)?\/bin\/true\b/
 function collectNpmScripts (step, commandText) {
   // 只认真实命令：注释行（`# npm run x`）与行内注释（`npm run foo # 说明` 的 # 后部分）不是命令，
   // 引号内的文本（echo "参考: npm run x" 这类诊断输出）也不是命令——提取前剔除，避免对账被虚假满足。
@@ -220,7 +232,11 @@ function collectNpmScripts (step, commandText) {
     const line = raw.trim()
     if (!line || line.startsWith('#')) continue
     const cmd = stripQuotesAndComment(line)
-    for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) step.scripts.push(m[1])
+    const swallowed = SWALLOWED_FALLBACK_RE.test(cmd) // 该行的失败是否被兜底吞掉（见 C4-016）
+    for (const m of cmd.matchAll(/\bnpm run ([A-Za-z0-9_.:@/-]+)/g)) {
+      step.scripts.push(m[1])
+      if (swallowed) step.swallowed.push(m[1])
+    }
   }
 }
 
@@ -254,7 +270,7 @@ function parseWorkflowSteps (text) {
       runLines = null
     }
     if (/^- +(?:name|uses|run|if):/.test(trimmed)) {
-      curStep = { indent, conditional: /^- +if:/.test(trimmed), scripts: [] }
+      curStep = { indent, conditional: /^- +if:/.test(trimmed), continueOnError: false, scripts: [], swallowed: [] }
       steps.push(curStep)
       const inlineRun = trimmed.match(/^- +run: ?(.+)$/)
       if (inlineRun) {
@@ -275,6 +291,10 @@ function parseWorkflowSteps (text) {
     }
     if (!curStep) continue
     if (trimmed.startsWith('if:') && indent > curStep.indent) curStep.conditional = true
+    // step 级 continue-on-error（缩进深于当前 step 起点；job 级的缩进更浅，不属任何 step）：
+    // 显式 false 之外一律记为「可能不阻断」——对账据此判断该步骤能否作为豁免套件的门禁（C4-016）。
+    const coeMatch = trimmed.match(CONTINUE_ON_ERROR_KEY_RE)
+    if (coeMatch && indent > curStep.indent && !isBlockingContinueOnError(coeMatch[1])) curStep.continueOnError = true
     if (trimmed.startsWith('run:')) {
       // rest 先剔除行内注释再 trim：`run: | # 注释` 旧码拿到 `| # 注释` → 判定不是块指示符 →
       // 后续命令行丢失（对账误报）。空值判定仍用剔除前的 rawRest：`run: # 注释`（无指示符、仅注释）
@@ -296,15 +316,21 @@ function parseWorkflowSteps (text) {
   return steps
 }
 
+// `npm run <script>` → 它实际执行到的 test_*.js 文件名（不是套件命令则 null）。
+// 主对账与「阻断性」对账共用这一份映射口径，避免两处各写一遍 pkg.scripts 解析。
+function suiteFileOfScript (script) {
+  const cmd = pkg.scripts[script]
+  const file = cmd && cmd.match(/node (\S+\.js)/)
+  const basename = file && path.basename(file[1])
+  return basename && /^test_.*\.js$/.test(basename) ? basename : null
+}
 function collectExplicitFiles (workflowText) {
   const files = new Set()
   for (const step of parseWorkflowSteps(workflowText)) {
     if (step.conditional) continue
     for (const script of step.scripts) {
-      const cmd = pkg.scripts[script]
-      const file = cmd && cmd.match(/node (\S+\.js)/)
-      const basename = file && path.basename(file[1])
-      if (basename && /^test_.*\.js$/.test(basename)) files.add(basename)
+      const basename = suiteFileOfScript(script)
+      if (basename) files.add(basename)
     }
   }
   return files
@@ -318,6 +344,100 @@ function assertSkipSuitesMatchExplicitSteps (workflowText) {
   return explicitFiles
 }
 const explicitFiles = assertSkipSuitesMatchExplicitSteps(testYml)
+
+// 2a 反例·靶向（C4-017）：主对账是本套件里唯一管全局的那条门禁，此前却没有一条反例证明它会红。
+// 手法：从**真实 test.yml** 整块删掉一个「被 SKIP_SUITES 豁免、且由该步骤唯一覆盖」的显式步骤 ⇒
+// 等式左（SKIP_SUITES）比右（显式步骤覆盖的单元套件）多一项 ⇒ 必须抛。反例挂在主对账自己的正则上，
+// 证明的正是「SKIP_SUITES 多写（= 该套件漏跑）会被抓到」这半条语义。
+{
+  const targetSuite = 'test_filter.js'
+  const targetStepName = '单元测试（test_filter.js，含 101 章版本校验）'
+  assert.ok(skips.includes(targetSuite),
+    `反例前提：${targetSuite} 必须在 SKIP_SUITES 里（否则删掉它的步骤不会改变等式任何一端）`)
+  const targetBlock = stepBlockForName(testYml, targetStepName)
+  const fixture = testYml.replace(targetBlock, '')
+  assert.notStrictEqual(fixture, testYml, '主对账反例夹具必须真的删掉了目标 step 块（没删成本回归形同虚设）')
+  assert.ok(!fixture.includes('      - name: ' + targetStepName), '夹具中不得残留目标步骤的 name 行')
+  assert.ok(!collectExplicitFiles(fixture).has(targetSuite),
+    `夹具中被删掉的步骤不得再贡献 ${targetSuite}（否则反例证明的不是「等式被破坏」）`)
+  assert.throws(() => assertSkipSuitesMatchExplicitSteps(fixture), /SKIP_SUITES 必须等于/,
+    '删掉被豁免套件的唯一显式步骤后主对账必须红：否则「SKIP_SUITES 多写一项」= 该套件永久漏跑，' +
+    '而整套门禁全绿（门禁盲区）')
+  console.log('✅ 主对账（SKIP_SUITES ↔ 显式步骤）靶向反例：删掉被豁免套件的唯一显式步骤后等式判红')
+}
+
+// ── 2 补. SKIP_SUITES 的「阻断性」对账（C4-016）────────────────────────────────
+// 上面的主对账只回答「显式步骤里出现过 npm run <script>」，不回答「这一步会不会阻断 CI」：
+//   · `npm run test:x || true` / `|| :` / `|| exit 0` —— 命令失败时退出码取自兜底命令（0），step 永远成功；
+//   · step 级 `continue-on-error: true`（含表达式值）—— step 失败被吞，job 继续跑绿。
+// 而 SKIP_SUITES 恰恰把这批套件从 run_unit_tests.js 的全量兜底里摘掉（见 test.yml 该步 env 注释），
+// 于是那个唯一覆盖它们的显式步骤一旦不阻断，该套件就彻底没有门禁：漏跑不会红，只是「看起来跑过了」。
+// 主解析器已把两种形态记进 step（continueOnError / swallowed），这里据此要求：
+// **SKIP_SUITES 的每个套件都必须至少有一个阻断性显式步骤覆盖**。
+function assertSkipSuitesBlocking (workflowText) {
+  const blocking = new Set()
+  const nonBlocking = new Map() // file → 首次观察到的「不阻断」原因（只为报错可读，不参与判定）
+  for (const step of parseWorkflowSteps(workflowText)) {
+    for (const script of step.scripts) {
+      const file = suiteFileOfScript(script)
+      if (!file) continue
+      const reason = step.conditional
+        ? 'step-level if 条件'
+        : step.continueOnError
+          ? 'step 级 continue-on-error'
+          : step.swallowed.includes(script)
+            ? '`|| true` / `|| :` / `|| exit 0` 兜底吞掉退出码'
+            : ''
+      if (reason) {
+        if (!nonBlocking.has(file)) nonBlocking.set(file, reason)
+        continue
+      }
+      blocking.add(file)
+    }
+  }
+  const exposed = skips.filter(f => !blocking.has(f))
+  assert.deepStrictEqual(exposed, [],
+    'SKIP_SUITES 的每个套件都必须由**阻断性**显式步骤覆盖（它们已被 run_unit_tests.js 跳过，显式步骤是' +
+    '唯一的门禁）：' + exposed.map(f => `${f} ← ${nonBlocking.get(f) || '没有可解析的显式步骤'}`).join(' | ') +
+    '。`npm run test:x || true` / `|| :` / `|| exit 0` 与 step 级 continue-on-error（含表达式值）都会让' +
+    '该步骤永不阻断 ⇒ 等于没跑：要么去掉兜底/continue-on-error，要么把套件从 SKIP_SUITES 移除')
+  return blocking
+}
+assertSkipSuitesBlocking(testYml)
+
+// 2 补 反例·靶向（C4-016）：证明上面这条门禁真的会红 —— 每种「不阻断」形态单点注入到**真实 test.yml 的
+// 一个被豁免套件步骤**上。同时保留 `assertSkipSuitesMatchExplicitSteps(v.text)` 这一行：主对账对四种坏
+// 形态**一律放行**（它只看命令是否出现），这正是条目描述的缺口本身，也是本门禁存在的理由。
+{
+  const targetSuite = 'test_filter.js'
+  const targetStepName = '单元测试（test_filter.js，含 101 章版本校验）'
+  const targetStepLine = '      - name: ' + targetStepName
+  const targetRunLine = '        run: npm run test:filter'
+  assert.ok(skips.includes(targetSuite),
+    `反例前提：${targetSuite} 必须在 SKIP_SUITES 里（否则它不受「豁免套件必须阻断」这条约束）`)
+  const variants = [
+    { name: 'step 级 continue-on-error: true', text: testYml.replace(targetStepLine, targetStepLine + '\n        continue-on-error: true') },
+    { name: 'step 级 continue-on-error: 表达式值', text: testYml.replace(targetStepLine, targetStepLine + '\n        continue-on-error: $' + '{{ matrix.experimental }}') },
+    { name: 'run 行末尾 || true', text: testYml.replace(targetStepLine + '\n' + targetRunLine, targetStepLine + '\n' + targetRunLine + ' || true') },
+    { name: 'run 行末尾 || :', text: testYml.replace(targetStepLine + '\n' + targetRunLine, targetStepLine + '\n' + targetRunLine + ' || :') }
+  ]
+  for (const v of variants) {
+    assert.notStrictEqual(v.text, testYml, `反例夹具（${v.name}）必须真的改到了目标步骤（没改成本回归形同虚设）`)
+    // 前置：坏形态确实被记进目标 step —— 否则反例证明的不是「不阻断被拒」，而是别的东西
+    const parsed = parseWorkflowSteps(v.text).find(step => step.scripts.includes('test:filter'))
+    assert.ok(parsed && (parsed.continueOnError || parsed.swallowed.includes('test:filter')),
+      `反例夹具（${v.name}）必须让目标步骤被记为不阻断（否则本反例没有验证对象）`)
+    assertSkipSuitesMatchExplicitSteps(v.text) // 主对账放行 = 缺口本身（C4-016）
+    assert.throws(() => assertSkipSuitesBlocking(v.text), /阻断性/,
+      `${v.name} 后必须红：否则被豁免套件的唯一门禁可以被改成永不阻断，而整套门禁全绿（C4-016）`)
+  }
+  // 正向对照：`continue-on-error: false` 仍是阻断的，不得误伤（否则「宁红勿绿」变成「一律红」）
+  const withFalse = testYml.replace(targetStepLine, targetStepLine + '\n        continue-on-error: false')
+  assert.notStrictEqual(withFalse, testYml, '正向对照夹具必须真的注入 continue-on-error: false')
+  assertSkipSuitesBlocking(withFalse)
+  console.log(`✅ SKIP_SUITES 阻断性对账：${skips.length} 个被豁免套件均由阻断性显式步骤覆盖；` +
+    '`|| true` / `|| :` / step 级 continue-on-error（true 与表达式值）4 条靶向反例各自被拦，continue-on-error: false 不误伤')
+}
 
 // ── 2a. 静态/文档策略门禁只跑一次，稳定 Required Check 汇总两类结果 ──
 function jobBlock (workflowText, name) {
@@ -905,6 +1025,8 @@ const CI_SUMMARY_PATH_TEMPLATE = 'reports/<stem>.p<pid>.md'
 const ciSummaryPath = (pid, stem) => CI_SUMMARY_PATH_TEMPLATE.replace('<stem>', stem).replace('<pid>', String(pid))
 const ciSummaryCheck = ciSummaryPath(process.pid, '.ci-summary-check') // reports/.ci-summary-check.p<pid>.md
 const ciSummaryOverflow = ciSummaryPath(process.pid, '.ci-summary-overflow') // reports/.ci-summary-overflow.p<pid>.md
+// 3c+ 的「可写可观测」落点（C4-018）：同一份按 pid 唯一的模板，保证并发 worker 互不可见。
+const ciSummaryChild = ciSummaryPath(process.pid, '.ci-summary-child')
 // 3c 的反面夹具要指到一个**不存在**的目录（真去写就 ENOENT）：同样带 pid 后缀——否则并发 worker 遗留的
 // 同名目录会让「没写」这条断言静默失去意义（夹具自身失效 ⇒ 断言恒真）。
 const ciMissingFile = `reports/.ci-missing-dir.p${process.pid}/.ci-summary-child.md`
@@ -936,6 +1058,22 @@ try {
   assert.strictEqual(child.status, 0, child.stderr || child.stdout)
   assert.ok(!/ENOENT/.test(child.stderr || ''), 'XBK_MUTATION_CHILD=1 时不得尝试写 job summary')
 
+  // 3c+ 直接证「没有发生写入」（C4-018）：上面的 ENOENT 旁证只说明「没有异常痕迹」，不说明「没有写」——
+  //   生产代码一旦把 appendFileSync 包进 try/catch（或改写到另一个可写落点），ENOENT 不再出现，
+  //   而 summary 其实已经被追加，那句断言照样绿。这里把落点换成**可写且可观测**的路径（同一条按 pid
+  //   唯一的模板）：跑完文件不存在 = 确实没写；被创建 = 写了（此时 1MiB 摘要上限迟早被撞穿）。
+  assert.ok(!fs.existsSync(ciSummaryChild),
+    `夹具前提：${ciSummaryChild} 不应预先存在（它存在就让「没有写入」这条断言恒真）`)
+  const childNoSummary = runEntry({
+    SKIP_SUITES: skipAllButOne,
+    GITHUB_STEP_SUMMARY: ciSummaryChild,
+    XBK_MUTATION_CHILD: '1'
+  })
+  assert.strictEqual(childNoSummary.status, 0, childNoSummary.stderr || childNoSummary.stdout)
+  assert.ok(!fs.existsSync(ciSummaryChild),
+    `XBK_MUTATION_CHILD=1 时必须**没有发生写入**（不是「没报错」而是「文件不存在」）：${ciSummaryChild} 被创建 ⇒ ` +
+    '变异评估的每个子进程都会重复 append 整张表，几百次即撞 1MiB 的 job summary 上限')
+
   // 3e 输出超限（ENOBUFS）必须标注为「输出超限」而不是普通测试失败：
   //    XBK_UNIT_MAX_BUFFER 仅测试注入；留一个必输出内容的套件、把上限压到 1 字节
   const overflow = runEntry({
@@ -957,6 +1095,7 @@ try {
   // 只删**本进程自己的**落点（并发 worker 的落点文件名不同，互不可见）——清理不漏、也不误删别人
   fs.rmSync(ciSummaryCheck, { force: true })
   fs.rmSync(ciSummaryOverflow, { force: true })
+  fs.rmSync(ciSummaryChild, { force: true }) // 回归时（写入发生）也不留残渣
 }
 
 // ── 3b-并发回归：共享落点的并发争抢必须被结构性排除（PR #158 的靶向锁）──────────────
@@ -1161,7 +1300,9 @@ const treeDir = makeRunTestsSandbox(
       "const path = require('path')",
       "const out = path.join(__dirname, 'heartbeat.txt')",
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
-      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
+      // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
+      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
       // 同上：孙进程自己也得有上限，否则父进程被外部杀掉后它无人可杀（ppid===1 后 killTree 到不了它）
       'setTimeout(() => process.exit(0), 90000).unref()',
       ''
@@ -1213,8 +1354,16 @@ try {
     '超时仍按失败结算：汇总三数字应与修复前一致（0 通过, 1 失败, 共 1）')
   assert.match(treeOut, /超过每套件上限 1500ms 已强杀/, '失败输出必须仍点名每套件超时（RT-03 口径不变）')
   const hb = path.join(treeDir, 'heartbeat.txt')
-  treePid = Number(fs.readFileSync(hb, 'utf8').split('\n')[0])
+  const hbLines = fs.readFileSync(hb, 'utf8').split('\n')
+  treePid = Number(hbLines[0])
   assert.ok(Number.isInteger(treePid) && treePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  // 正向对照（C4-019）：先证明孙进程在入口退出**前**确实在持续写盘（首拍 → 末拍跨 ≥300ms），再断言退出后停住。
+  // 只有后半句时，「孙进程 fork 后立刻死」或「setInterval 从未生效」同样会绿——那不是「整组杀伤生效」的证据。
+  const hbTicks = hbLines.slice(1).filter(line => /^X\d+$/.test(line)).map(line => Number(line.slice(1)))
+  assert.ok(hbTicks.length >= 2, `夹具前提：孙进程必须真的在写心跳（实得 ${hbTicks.length} 拍时间戳）`)
+  assert.ok(hbTicks[hbTicks.length - 1] - hbTicks[0] >= 300,
+    `孙进程心跳必须在入口退出前持续增长（首拍 ${hbTicks[0]} → 末拍 ${hbTicks[hbTicks.length - 1]}，跨 ` +
+    `${hbTicks[hbTicks.length - 1] - hbTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const sizeAfterExit = fs.statSync(hb).size
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
   const sizeLater = fs.statSync(hb).size
@@ -1650,7 +1799,9 @@ const unitTreeDir = makeUnitTestsSandbox(
       "const path = require('path')",
       "const out = path.join(__dirname, 'heartbeat.txt')",
       "fs.writeFileSync(out, String(process.pid) + '\\n')",
-      "setInterval(() => fs.appendFileSync(out, 'X'), 50)",
+      // 每拍带时间戳（C4-019）：心跳文件因此成为「退出前是否在增长」的**正向对照**证据来源——
+      // 只比较退出前后的大小，区分不出「被整组杀掉」与「这个孙进程从头到尾没写过一拍」。
+      "setInterval(() => fs.appendFileSync(out, 'X' + Date.now() + '\\n'), 50)",
       'setTimeout(() => process.exit(0), 8000)',
       ''
     ].join('\n')
@@ -1676,8 +1827,15 @@ try {
   assert.ok(elapsed < 5000,
     `入口应在每套件上限附近收敛，而不是等孙进程退出：实测 ${elapsed}ms（旧实现要等孙进程 8s 自退 ⇒ 约 8000ms）`)
   const unitHb = path.join(unitTreeDir, 'heartbeat.txt')
-  unitTreePid = Number(fs.readFileSync(unitHb, 'utf8').split('\n')[0])
+  const unitHbLines = fs.readFileSync(unitHb, 'utf8').split('\n')
+  unitTreePid = Number(unitHbLines[0])
   assert.ok(Number.isInteger(unitTreePid) && unitTreePid > 0, '孙进程应已写出自己的 pid（夹具自身生效的前提）')
+  // 正向对照（C4-019，与 3g4 同口径）：先证明退出**前**确实在持续写盘，再断言退出后停住。
+  const unitTicks = unitHbLines.slice(1).filter(line => /^X\d+$/.test(line)).map(line => Number(line.slice(1)))
+  assert.ok(unitTicks.length >= 2, `夹具前提：孙进程必须真的在写心跳（实得 ${unitTicks.length} 拍时间戳）`)
+  assert.ok(unitTicks[unitTicks.length - 1] - unitTicks[0] >= 300,
+    `孙进程心跳必须在入口退出前持续增长（首拍 ${unitTicks[0]} → 末拍 ${unitTicks[unitTicks.length - 1]}，跨 ` +
+    `${unitTicks[unitTicks.length - 1] - unitTicks[0]}ms < 300ms）：否则「退出后不涨」可能只是它从未写过`)
   const unitSizeAfterExit = fs.statSync(unitHb).size
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700)
   const unitSizeLater = fs.statSync(unitHb).size
@@ -2134,6 +2292,93 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
 }
 console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（不含测试指纹；靶向反例已锁），剥离不含 inc，artifact 收窄为 reports/mutation/ 且 fail-loud')
 
+// ── 矩阵 include 的行式解析：**单点实现**（C4-020）────────────────────────────
+// 3i 的「逐段 runner 档位」与 3j 的「逐段 timeout_ms」原先各有一份 34/35 行、逐行同构的拷贝
+// （归一化后 34 行里 24–28 行只差标识符/注释）。两份并存的实际风险：矩阵新增字段时要同时改两处，
+// 漏一处就出现「一段有一段的判据」——而这种半绿没有任何门禁能发现。现在两个调用者只提供字段映射
+// （YAML 键 → 条目字段名），解析口径只剩一份。语义与两份拷贝的并集保持一致（原口径，未放宽）：
+//   · 只认活动行：`#` 注释行不是证据，缩进不深于 include: 的同级键即视为 include 块结束；
+//   · `- ` 起新条目，其余条目字段逐行累积；fieldMap 之外的键一律忽略（各调用者只取自己那几个字段）；
+//   · 值剥成对引号、剥裸标量的行内 `#` 注释；
+//   · 未出现的字段保持 null（调用方据此区分「没声明」与「声明了空值」）。
+// 边界：这是**测试侧**独立实现，不得改调生产 readMatrixRunnerConfigs（那会让断言退化成同义反复）。
+const MATRIX_FIELDS_RUNNER = { name: 'name', config: 'config' }
+const MATRIX_FIELDS_TIMEOUT = { name: 'name', timeout_ms: 'timeoutMs' }
+function parseMatrixInclude (ymlText, fieldMap, label) {
+  const lines = ymlText.split('\n')
+  const includeAt = lines.findIndex(l => /^\s*include:\s*$/.test(l))
+  assert.ok(includeAt >= 0, `mutation.yml 的 matrix 必须有 include 块（${label}无从核对即视为回归）`)
+  const includeIndent = lines[includeAt].match(/^\s*/)[0].length
+  const entries = []
+  let cur = null
+  for (let i = includeAt + 1; i < lines.length; i++) {
+    const raw = lines[i]
+    if (raw.trim() === '') continue
+    const indent = raw.match(/^\s*/)[0].length
+    // include 块结束：回到 steps: 等同级键（缩进不深于 include:）
+    if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
+    if (raw.trim().startsWith('#')) continue // 注释不是证据
+    let body = raw.trim()
+    if (body.startsWith('-')) {
+      const rest = body.slice(1).trim()
+      if (rest === '' || rest.startsWith('#')) continue
+      cur = {}
+      for (const field of Object.values(fieldMap)) cur[field] = null
+      entries.push(cur)
+      body = rest
+    }
+    if (!cur) continue
+    const colon = body.indexOf(':')
+    if (colon <= 0) continue
+    const key = body.slice(0, colon).trim()
+    const field = fieldMap[key]
+    if (!field) continue
+    let value = body.slice(colon + 1).trim()
+    if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
+    const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
+    if (hash !== -1) value = value.slice(0, hash).trim()
+    cur[field] = value
+  }
+  return entries
+}
+const parseMatrixConfigs = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIELDS_RUNNER, '逐段 runner 档位')
+const parseMatrixTimeouts = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIELDS_TIMEOUT, '逐段 timeout ')
+// 单一实现的靶向锁：① 两个解析器都必须**委托**给同一实现（复制一份独立实现回来即红）；
+// ② 同一份夹具（双键同条 + 引号 + 行内注释 + 块末回到同级键）必须被两条路径按同一口径归一，
+//    且各自只取自己的字段——任一实现漂移（漏剥引号/漏剥注释/漏判块结束）都会被这里抓住。
+{
+  for (const [name, fn] of [['parseMatrixConfigs', parseMatrixConfigs], ['parseMatrixTimeouts', parseMatrixTimeouts]]) {
+    assert.ok(fn.toString().includes('parseMatrixInclude'),
+      `${name} 必须委托给单一实现 parseMatrixInclude：两份逐行同构的拷贝并存时，矩阵新增字段漏改一处就会出现` +
+      '「一段有一段的判据」，而这种半绿没有任何门禁能发现（C4-020）')
+  }
+  const fixture = [
+    'strategy:',
+    '  matrix:',
+    '    include:',
+    '      - name: a  # 行内注释',
+    '        config: "stryker.tap.config.js"',
+    '        timeout_ms: 60000',
+    '      - name: b',
+    "        config: 'stryker.config.js'",
+    '      - name: c',
+    '        timeout_ms: 300000 # 行内注释',
+    'steps:',
+    '      - name: 块结束后的同名键不得被收进来'
+  ].join('\n')
+  assert.deepStrictEqual(parseMatrixConfigs(fixture), [
+    { name: 'a', config: 'stryker.tap.config.js' },
+    { name: 'b', config: 'stryker.config.js' },
+    { name: 'c', config: null }
+  ], '档位解析：剥引号/剥行内注释/缺字段留 null/include 块结束即停 的口径漂移（与 timeout 解析共用同一实现）')
+  assert.deepStrictEqual(parseMatrixTimeouts(fixture), [
+    { name: 'a', timeoutMs: '60000' },
+    { name: 'b', timeoutMs: null },
+    { name: 'c', timeoutMs: '300000' }
+  ], 'timeout 解析：同一份夹具必须按同一口径归一（只取 name + timeout_ms，其余键忽略）')
+  console.log('✅ 矩阵解析单点实现 parseMatrixInclude：档位/超时两条路径同一口径（委托 + 夹具对照），无第二份拷贝')
+}
+
 // 3i PR-1（CI 切 TAP 档）接线契约：报告路径 + 矩阵逐段 runner 档位。
 // 为什么必须锁死（不是形式主义）：tap 配置把报告路径**显式**写成 stryker 默认值（stryker.tap.config.js 的
 // jsonReporter/htmlReporter），而「报告 = reports/mutation/mutation.json|.html」是**五处**的共同前提——
@@ -2220,43 +2465,9 @@ console.log('✅ mutation.yml：缓存 key/兜底前缀为**回退后**形态（
     }
   }
 
-  // (2)(3) 矩阵逐段 runner 档位：从**真实 YAML 行**解析（注释一律不算证据），
-  //     抽成函数是为了让紧随其后的两条反例在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本。
-  const parseMatrixConfigs = (ymlText) => {
-    const lines = ymlText.split('\n')
-    const includeAt = lines.findIndex(l => /^\s*include:\s*$/.test(l))
-    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 runner 档位无从核对即视为回归）')
-    const includeIndent = lines[includeAt].match(/^\s*/)[0].length
-    const entries = []
-    let cur = null
-    for (let i = includeAt + 1; i < lines.length; i++) {
-      const raw = lines[i]
-      if (raw.trim() === '') continue
-      const indent = raw.match(/^\s*/)[0].length
-      // include 块结束：回到 steps: 等同级键（缩进不深于 include:）
-      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
-      if (raw.trim().startsWith('#')) continue // 注释不是证据
-      let body = raw.trim()
-      if (body.startsWith('-')) {
-        const rest = body.slice(1).trim()
-        if (rest === '' || rest.startsWith('#')) continue
-        cur = { name: null, config: null }
-        entries.push(cur)
-        body = rest
-      }
-      if (!cur) continue
-      const colon = body.indexOf(':')
-      if (colon <= 0) continue
-      const key = body.slice(0, colon).trim()
-      if (key !== 'name' && key !== 'config') continue
-      let value = body.slice(colon + 1).trim()
-      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
-      const hash = value.indexOf('#') // 裸标量：行内注释从 # 开始
-      if (hash !== -1) value = value.slice(0, hash).trim()
-      cur[key] = value
-    }
-    return entries
-  }
+  // (2)(3) 矩阵逐段 runner 档位：从**真实 YAML 行**解析（注释一律不算证据）。解析器本体已收敛到
+  //     模块级的 parseMatrixInclude（单点实现，见上方 C4-020 段）；这里只保留字段映射，
+  //     紧随其后的两条反例仍在**同一套提取 + 断言代码**上跑真实 workflow 的变异副本。
 
   const assertMatrixConfigs = (ymlText) => {
     const entries = parseMatrixConfigs(ymlText)
@@ -2369,41 +2580,8 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
 //   stryker.config.js / stryker.tap.config.js 或写进缓存 key，都会让 29 段再全量一次（或让日报失去
 //   「本段生效上限」的判据）。这里把三条接线一起锁死，并各配一条靶向反例（改回旧形态立刻红）。
 {
-  // 矩阵条目解析（与本文件 parseMatrixConfigs 同口径：只认活动行、剥注释/引号）
-  const parseMatrixTimeouts = (ymlText) => {
-    const ls = ymlText.split('\n')
-    const includeAt = ls.findIndex(l => /^\s*include:\s*$/.test(l))
-    assert.ok(includeAt >= 0, 'mutation.yml 的 matrix 必须有 include 块（逐段 timeout 无从核对即视为回归）')
-    const includeIndent = ls[includeAt].match(/^\s*/)[0].length
-    const entries = []
-    let cur = null
-    for (let j = includeAt + 1; j < ls.length; j++) {
-      const raw = ls[j]
-      if (raw.trim() === '') continue
-      const indent = raw.match(/^\s*/)[0].length
-      if (/^\s*[A-Za-z_][\w-]*:/.test(raw) && indent <= includeIndent) break
-      if (raw.trim().startsWith('#')) continue
-      let body = raw.trim()
-      if (body.startsWith('-')) {
-        const rest = body.slice(1).trim()
-        if (rest === '' || rest.startsWith('#')) continue
-        cur = { name: null, timeoutMs: null }
-        entries.push(cur)
-        body = rest
-      }
-      if (!cur) continue
-      const colon = body.indexOf(':')
-      if (colon <= 0) continue
-      const key = body.slice(0, colon).trim()
-      if (key !== 'name' && key !== 'timeout_ms') continue
-      let value = body.slice(colon + 1).trim()
-      if (value.startsWith('"') || value.startsWith("'")) value = value.slice(1, -1)
-      const hash = value.indexOf('#')
-      if (hash !== -1) value = value.slice(0, hash).trim()
-      cur[key === 'name' ? 'name' : 'timeoutMs'] = value
-    }
-    return entries
-  }
+  // 矩阵条目解析：与档位解析共用模块级的 parseMatrixInclude（单点实现，C4-020），
+  // 这里只传 name + timeout_ms 的字段映射——原来的 34 行副本已删除。
 
   const CONSOLE_SEGS = ['console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5',
     'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11', 'console-part12']
