@@ -347,8 +347,12 @@ function readLogText (logPath, maxBytes = REUSE_LOG_MAX_BYTES) {
   }
 }
 
-// 递归查找 reuse.json（与 findReportJson 同口径：artifact 里是 mutation-reports/mutation-report-<段>/reports/mutation/）
-function findReuseJson (dir) {
+// 递归按文件名查找（C10-052：`findReuseJson` 与 `findReportJson` 原是逐字复制的两份实现，只差文件名）。
+// artifact 里是 mutation-reports/mutation-report-<段>/reports/mutation/，报告与 reuse.json 同层不同名，
+// 故「怎么走目录树」必须是同一份实现：目录不可读/不存在 → null（单段失败不中断整体，与 analyzeSegment
+// 的错误隔离设计一致）。
+function findFileInTree (dir, names) {
+  const wanted = Array.isArray(names) ? names : [names]
   let entries
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录树内递归（根目录已校验）
@@ -358,13 +362,17 @@ function findReuseJson (dir) {
   for (const e of entries) {
     const p = path.join(dir, e.name)
     if (e.isDirectory()) {
-      const found = findReuseJson(p)
+      const found = findFileInTree(p, wanted)
       if (found) return found
-    } else if (e.name === 'reuse.json') {
+    } else if (wanted.includes(e.name)) {
       return p
     }
   }
   return null
+}
+
+function findReuseJson (dir) {
+  return findFileInTree(dir, 'reuse.json')
 }
 
 // 把 reuse.json 的原始对象归一成渲染用形状；任何形状异常 → unknown + reason（不猜、不抛）
@@ -554,11 +562,16 @@ function parseMatrixRunnerConfigs (ymlText) {
 }
 
 /**
- * 读取仓库内的 mutation.yml 并解析 runner 档位；**任何失败都降级为空 Map**（不抛、不退出）。
+ * 读取仓库内的 mutation.yml 并交给给定解析器；**任何失败都降级为空 Map**（不抛、不退出）。
+ *
+ * C10-052：`readMatrixRunnerConfigs` / `readMatrixTimeouts` 原是把这 14 行（路径缺省 → 读文件 →
+ * try 解析 → 两处 catch 返回空 Map）逐字抄了两份，只有最后调用的解析器不同。副本分叉的后果是
+ * 同一份矩阵在「runner 档位」与「超时上限」两列上给出互相矛盾的可信度。故收敛为一份。
  * @param {string} [matrixPath] 显式矩阵路径（测试注入用）；缺省为 `<repo>/.github/workflows/mutation.yml`
- * @returns {Map<string, string>} 段名 → config 文件名（读不到时为空的 Map ⇒ 调用侧不标注）
+ * @param {(text: string) => Map} parse 解析器（parseMatrixRunnerConfigs / parseMatrixTimeouts）
+ * @returns {Map} 解析结果；读不到或解析抛错时为空 Map
  */
-function readMatrixRunnerConfigs (matrixPath) {
+function readMatrixYml (matrixPath, parse) {
   const resolved = matrixPath || path.join(__dirname, '..', '.github', 'workflows', 'mutation.yml')
   let text
   try {
@@ -567,10 +580,19 @@ function readMatrixRunnerConfigs (matrixPath) {
     return new Map()
   }
   try {
-    return parseMatrixRunnerConfigs(text)
+    return parse(text)
   } catch (e) {
     return new Map()
   }
+}
+
+/**
+ * 读取仓库内的 mutation.yml 并解析 runner 档位；**任何失败都降级为空 Map**（不抛、不退出）。
+ * @param {string} [matrixPath] 显式矩阵路径（测试注入用）；缺省为 `<repo>/.github/workflows/mutation.yml`
+ * @returns {Map<string, string>} 段名 → config 文件名（读不到时为空的 Map ⇒ 调用侧不标注）
+ */
+function readMatrixRunnerConfigs (matrixPath) {
+  return readMatrixYml(matrixPath, parseMatrixRunnerConfigs)
 }
 
 /**
@@ -650,18 +672,7 @@ function parseMatrixTimeouts (ymlText) {
  * @returns {Map<string, number>} 段名 → timeoutMS（读不到时为空 Map ⇒ 调用侧显示 `—`）
  */
 function readMatrixTimeouts (matrixPath) {
-  const resolved = matrixPath || path.join(__dirname, '..', '.github', 'workflows', 'mutation.yml')
-  let text
-  try {
-    text = fs.readFileSync(resolved, 'utf8') // nosemgrep（路径来自 __dirname 常量或测试注入，非不可信输入）
-  } catch (e) {
-    return new Map()
-  }
-  try {
-    return parseMatrixTimeouts(text)
-  } catch (e) {
-    return new Map()
-  }
+  return readMatrixYml(matrixPath, parseMatrixTimeouts)
 }
 
 /**
@@ -790,25 +801,9 @@ function validateSegments (results, expected = EXPECTED_SEGMENTS) {
 }
 
 // 递归查找 stryker 报告文件（文件名 mutation.json——json reporter 输出 reports/mutation/mutation.json；
-// 兼容旧名 mutation-report.json；目录可能嵌套 reports/ 等层）
+// 兼容旧名 mutation-report.json；目录可能嵌套 reports/ 等层）。走 findFileInTree（C10-052：与 findReuseJson 共用）。
 function findReportJson (dir) {
-  let entries
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true }) // NOSONAR:S8707 报告目录树内递归（根目录已校验）
-  } catch (e) {
-    // 目录不可读/不存在 → 跳过（与 analyzeSegment 的错误隔离设计一致，单段失败不中断整体）
-    return null
-  }
-  for (const e of entries) {
-    const p = path.join(dir, e.name)
-    if (e.isDirectory()) {
-      const found = findReportJson(p)
-      if (found) return found
-    } else if (e.name === 'mutation.json' || e.name === 'mutation-report.json') {
-      return p
-    }
-  }
-  return null
+  return findFileInTree(dir, ['mutation.json', 'mutation-report.json'])
 }
 
 // 解析单个段的 mutation-report.json（复杂度拆分：analyze 保持线性遍历）

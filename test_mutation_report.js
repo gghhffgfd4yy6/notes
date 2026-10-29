@@ -1477,6 +1477,23 @@ try {
     assert.strictEqual(findReportJson(path.join(tmp, 'not-exist')), null)
   })
 
+  // C10-052：`findReportJson` / `findReuseJson` 原是逐字复制的两份递归查找（只差文件名），
+  // `readMatrixRunnerConfigs` / `readMatrixTimeouts` 是逐字复制的两份「读 mutation.yml + 解析 +
+  // 任何失败降级空 Map」。副本一旦分叉，日报的「有报告/无报告」与「矩阵读不到」判据就会各说各话。
+  // 门禁：树查找实现只准 1 处、矩阵读取实现只准 1 处（分析器的目录枚举是另一回事，故 withFileTypes 计 2）。
+  check('C10-052 目录树查找 / 矩阵读取各自只有一处实现（禁止再出现逐字副本）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'mutation-report.js'), 'utf8')
+    const countOf = (needle) => src.split(needle).length - 1
+    assert.strictEqual(countOf('fs.readFileSync(resolved, \'utf8\')'), 1,
+      '「读 mutation.yml」只准一处实现（readMatrixYml）；矩阵读取副本会各自漂移')
+    assert.strictEqual(countOf('fs.readdirSync(dir, { withFileTypes: true })'), 2,
+      '递归目录遍历只准共享实现 1 处 + analyze 的入口枚举 1 处；多出来的那份就是 findReportJson/findReuseJson 的副本')
+    // 两对 helper 必须都还导出且仍走共享实现（删名字会让上面的计数假绿）
+    for (const name of ['findReportJson', 'findReuseJson', 'readMatrixRunnerConfigs', 'readMatrixTimeouts']) {
+      assert.strictEqual(typeof require('./scripts/mutation-report.js')[name], 'function', `${name} 必须仍然导出`)
+    }
+  })
+
   check('analyzeSegment 正确解析统计 / 缺报告返回 error', () => {
     const d = path.join(tmp, 'mutation-report-utils'); fs.mkdirSync(d, { recursive: true })
     fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
