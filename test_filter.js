@@ -4979,7 +4979,7 @@ console.log('========================================\n');
     assertEqual(hasValidId({ id: 'anon:abc' }), true)
   })
 
-  await test('真实 anon:... 前缀 id 保持 id 权威，跨 url 判重（v3.247 修复）', async () => {
+  await test('真实 anon:... 前缀 id 保持 id 权威，跨 url 判重（v3.247 修复）', () => {
     // 曾：无 url 的 id='anon:abc1' 被 /^anon:[0-9a-f]+$/i 误降级为匿名身份，与同 id 带 url 的
     // 记录（kind 'id'）判重路径分裂 → 同一条消息被重复推送。修复后保持 id 权威，按 idKey 合并。
     const name = 'test_identity_real_anon_id.json'
@@ -4991,7 +4991,7 @@ console.log('========================================\n');
     unlinkQuiet(p)
   })
 
-  await test('历史 anon:hash 自身内容键仍降级匿名并跨运行去重（兼容保留）', async () => {
+  await test('历史 anon:hash 自身内容键仍降级匿名并跨运行去重（兼容保留）', () => {
     // 旧版 App 曾把 anonKey(自身字段) 写入 id 字段落缓存；该 id 与自身内容哈希一致 → 仍降级
     // 为匿名，与同内容的无 id 消息判同一身份（兼容路径不受影响）。
     const name = 'test_identity_legacy_anon_id.json'
@@ -5016,7 +5016,7 @@ console.log('========================================\n');
   // ==================== C006 继承属性 id 判重 vs 落盘丢 id ====================
   console.log('\n📂 C006 继承属性 id 判重 vs 落盘丢 id')
 
-  await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', async () => {
+  await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', () => {
     const name = 'test_c006_inherited_noown.json'
     const p = getFilePath(name)
     unlinkQuiet(p)
@@ -5026,7 +5026,7 @@ console.log('========================================\n');
     unlinkQuiet(p)
   })
 
-  await test('C006 继承 id 不参与判重（同构造含自有字段消息 saveBatch 后 has 命中）', async () => {
+  await test('C006 继承 id 不参与判重（同构造含自有字段消息 saveBatch 后 has 命中）', () => {
     const name = 'test_c006_inherited_ownfields.json'
     const p = getFilePath(name)
     unlinkQuiet(p)
@@ -5039,7 +5039,7 @@ console.log('========================================\n');
     unlinkQuiet(p)
   })
 
-  await test('C006 自有 id 正常判重', async () => {
+  await test('C006 自有 id 正常判重', () => {
     const name = 'test_c006_own_id.json'
     const p = getFilePath(name)
     unlinkQuiet(p)
@@ -5055,7 +5055,7 @@ console.log('========================================\n');
     unlinkQuiet(p)
   })
 
-  await test('C006 原身份用例不回归（普通自有 id/url 判重）', async () => {
+  await test('C006 原身份用例不回归（普通自有 id/url 判重）', () => {
     const name = 'test_c006_regress.json'
     const p = getFilePath(name)
     unlinkQuiet(p)
@@ -6505,7 +6505,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('内存: _memoryCache 上限防御（防无限增长泄漏）', async () => {
+  await test('内存: _memoryCache 上限防御（防无限增长泄漏）', () => {
     // 写入 105 个不同文件名 → 内存缓存 key 超 100 应触发重置（磁盘权威不受影响）
     for (let i = 0; i < 105; i++) saveBatch([{ id: i }], 'test_memo_' + i + '.json')
     // 重置后重新读取仍正常（从磁盘恢复）
@@ -10311,7 +10311,7 @@ console.log('========================================\n');
     return !OFF_ENABLED_WORDS.has(norm)
   }
 
-  await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
+  await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', () => {
     const cases = [
     // [输入, 预期开启]
       [undefined, false], [null, false], [{}, false], [{ enabled: undefined }, false],
@@ -10330,7 +10330,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_enabledFlag：属性测试——规范词表 oracle + 变形不变式（不复制生产实现）', async () => {
+  await test('_enabledFlag：属性测试——规范词表 oracle + 变形不变式（不复制生产实现）', () => {
     // ① 规范词表 oracle：关闭 = 缺省/null/NaN + 规范化后命中 {''/'false'/'0'}；其余开启。
     //    生成器显式覆盖空白串/大小写变体，避免只靠随机串撞不到边界。
     const closedWords = fc.constantFrom('', ' ', '  ', '\t', '\n', '\r\n', 'false', 'FALSE', 'False', ' false ', '0', ' 0 ', 'true', '1', 'yes', 'x')
@@ -10369,7 +10369,7 @@ console.log('========================================\n');
     ), { numRuns: 300, seed: 20260801 })
   })
 
-  await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', async () => {
+  await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', () => {
     fc.assert(fc.property(
       fc.string({ maxLength: 150 }),
       fc.integer({ min: 1, max: 60 }),
@@ -10391,7 +10391,7 @@ console.log('========================================\n');
     ), { numRuns: 400, seed: 20260801 })
   })
 
-  await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', async () => {
+  await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', () => {
     const D = 50 * 1024 * 1024
     const cases = [
       [undefined, D],
@@ -10413,7 +10413,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_diskMinFree：属性测试——任意输入返回 null 或正数有限（不变量）', async () => {
+  await test('_diskMinFree：属性测试——任意输入返回 null 或正数有限（不变量）', () => {
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(undefined),
@@ -10431,7 +10431,7 @@ console.log('========================================\n');
     ), { numRuns: 300, seed: 20260801 })
   })
 
-  await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', async () => {
+  await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', () => {
     const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
     // 合法模板：全部占位符在支持列表内
@@ -10450,7 +10450,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_validateTplConfig：属性测试——任意模板不崩溃，合法占位符不产生警告', async () => {
+  await test('_validateTplConfig：属性测试——任意模板不崩溃，合法占位符不产生警告', () => {
     const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
       fc.assert(fc.property(
@@ -10476,7 +10476,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_safeCounter：表格驱动——计数归一化边界', async () => {
+  await test('_safeCounter：表格驱动——计数归一化边界', () => {
     const cases = [
       [0, 0], [1, 1], [999, 999], [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
       [-1, 0], [1.5, 0], [NaN, 0], [Infinity, 0], [-Infinity, 0],
@@ -10487,7 +10487,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_safeCounter：属性测试——任意输入返回非负整数（不变量）', async () => {
+  await test('_safeCounter：属性测试——任意输入返回非负整数（不变量）', () => {
     fc.assert(fc.property(
       fc.oneof(fc.integer(), fc.double(), fc.boolean(), fc.string(), fc.constant(null), fc.constant(undefined), fc.constant(NaN), fc.constant(Infinity)),
       (v) => {
@@ -10497,7 +10497,7 @@ console.log('========================================\n');
     ), { numRuns: 300, seed: 20260801 })
   })
 
-  await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', async () => {
+  await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', () => {
     const blank = () => V3App._blankReportState()
     // 非对象 → blank
     assertEqual(JSON.stringify(V3App._normalizeReportState(null)), JSON.stringify(blank()))
@@ -10532,7 +10532,7 @@ console.log('========================================\n');
     assert.ok(warns.length >= 1, '损坏 pending 应告警')
   })
 
-  await test('_normalizeReportState：属性测试——任意输入不崩溃且计数合法（不变量）', async () => {
+  await test('_normalizeReportState：属性测试——任意输入不崩溃且计数合法（不变量）', () => {
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(null), fc.constant(undefined), fc.constant(42), fc.constant('x'),
@@ -10567,7 +10567,7 @@ console.log('========================================\n');
     ), { numRuns: 200, seed: 20260801 })
   })
 
-  await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', async () => {
+  await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', () => {
     const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
       const keys = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', '价格', '商城', '品牌', '图片', 'Html内容', 'Markdown内容']
@@ -11627,6 +11627,20 @@ console.log('========================================\n');
     walkAst(ast, n => { if (n.type === 'CatchClause' && n.body.body.length === 0) hits.push(n.loc.start.line) })
     return hits
   }
+  const containsAwait = (node) => {
+    let found = false
+    walkAst(node, n => { if (n.type === 'AwaitExpression') found = true })
+    return found
+  }
+  const countAsyncTestWithoutAwait = (ast) => {
+    const hits = []
+    walkAst(ast, n => {
+      if (n.type !== 'CallExpression' || !n.callee || n.callee.name !== 'test') return
+      const cb = n.arguments[1]
+      if (cb && cb.async && !containsAwait(cb.body)) hits.push(n.loc.start.line)
+    })
+    return hits
+  }
 
   await test('C4-024: Config.cache.maxSize 只允许经 withCacheMaxSize 修改', () => {
     // needle 拼接：门禁源码里不出现字面量，避免自己命中自己
@@ -11695,6 +11709,15 @@ console.log('========================================\n');
       console.warn = origWarn
       fsx.rmdirSync(dir) // 空目录：非递归删除，避免与「递归删除只允许 3 处」的既有门禁冲突
     }
+  })
+
+  await test('C4-026: async 用例回调必须真的 await（多余 async 会让读者误以为用例是异步的）', () => {
+    // 判据自检：三条样本里只有「async 且体内无 await」那条该被认出
+    const sample = '(async () => { await test("a", async () => { 1 }); await test("b", async () => { await p }); await test("c", () => { 1 }) })()'
+    const sampleAst = require('acorn').parse(sample, { ecmaVersion: 'latest', locations: true })
+    assertEqual(countAsyncTestWithoutAwait(sampleAst).length, 1, '判据自检：只有 async 且无 await 的用例回调应被认出')
+    const hits = countAsyncTestWithoutAwait(parseHygiene())
+    assertEqual(hits.length, 0, `用例回调声明 async 却没有任何 await（去掉 async 即可，行为不变）：第 ${hits.join(', ')} 行`)
   })
 
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
