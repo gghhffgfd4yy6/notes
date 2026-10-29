@@ -216,13 +216,23 @@ function ok (name, fn) {
 // 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
 // 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
 // 用例一个上界：超时记失败、继续下一条。
-// 取值 25s 的依据（评审 4 校准，旧注释 15s 的口径是错的）：
-//   · 基线最慢单条 5.3–5.5s（readRunHistory 尾窗），25s ≈ 4.5x，慢机器/抖动仍有富余；
-//   · 必须严格大于 SSE 用例的最长内层等待 20s（untilTornDown(20000)：超限硬断要等满 20s
-//     才能判负），否则合法慢用例会先被看门狗判红——15s 时这条用例本来就在赌，机器一慢就假红。
+// 取值 35s 的依据（C5-003 校准，旧口径 25s/「只论证 20s」是错的）：
+//   · 基线最慢单条 5.3–5.5s（readRunHistory 尾窗），35s ≈ 6x，慢机器/抖动仍有富余；
+//   · 必须严格大于**每一处**内层等待上界，而内层上界有两类：
+//       ① 子进程/服务收尾轮询 5 处，各 RUN_DEADLINE_MS=30s（原先散落成 5 个 30000 字面量）；
+//       ② SSE 超限硬断用例是**串行两段**：untilTornDown(SSE_TEARDOWN_WAIT_MS=20s) 之后才
+//          untilEnded(SSE_END_WAIT_MS=10s)，最坏和 = 30s（旧注释只论证了前一段 20s < 25s，
+//          漏掉后一段 ⇒ 慢机上先红看门狗、用例自己的断言永远不执行）。
+//   · 因此 TEST_TIMEOUT_MS = max(两类上界) + WATCHDOG_MARGIN_MS。下面那条「看门狗不死不变式」
+//     用例把这条关系锁死：改任何一个内层上界而不同步看门狗，套件当场变红。
 // 已知边界：同步死循环（while (true) {}）用同线程定时器打断不了——看门狗自己也是这个线程上的
 // 回调，永远轮不到它执行。那种形态只能靠上层兜住（Stryker 的 timeoutMS、CI 的 step 超时）。
-const TEST_TIMEOUT_MS = 25000
+const RUN_DEADLINE_MS = 30000 // 5 处「等子进程/服务收尾」轮询上界（用例断言文案写「30s 内结束」）
+const SSE_TEARDOWN_WAIT_MS = 20000 // SSE 超限硬断：等「服务端连接被摘除」
+const SSE_END_WAIT_MS = 10000 // 随后等「客户端读到 close」（与上一步串行）
+const SSE_SERIAL_WAIT_MS = SSE_TEARDOWN_WAIT_MS + SSE_END_WAIT_MS
+const WATCHDOG_MARGIN_MS = 5000 // 看门狗在内层上界之外留的余量
+const TEST_TIMEOUT_MS = Math.max(RUN_DEADLINE_MS, SSE_SERIAL_WAIT_MS) + WATCHDOG_MARGIN_MS
 async function aok (name, fn) {
   reapStaleTimeout(name)
   let watchdog = null
@@ -318,6 +328,30 @@ async function withSettingsConsole (fn, prepare) {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 }
+
+// ── 看门狗不死不变式（C5-003）──
+// 断言对象是「常量之间的关系」而不是某条业务行为：看门狗先响时，用例自己的断言永远不执行，
+// 失败文案还会误导成「实现挂死」（假红 + 排错方向错）。这条关系以前只写在注释里，注释漏写了
+// SSE 后半段 10s，于是 25s 的看门狗其实小于 20s+10s 的串行上界——必须由测试自己守住。
+ok('看门狗不死不变式：TEST_TIMEOUT_MS 必须大于每一处内层等待上界（且留余量）', () => {
+  assert.ok(TEST_TIMEOUT_MS > RUN_DEADLINE_MS,
+    `看门狗 ${TEST_TIMEOUT_MS}ms 必须大于子进程轮询上界 ${RUN_DEADLINE_MS}ms`)
+  assert.ok(TEST_TIMEOUT_MS > SSE_SERIAL_WAIT_MS,
+    `看门狗 ${TEST_TIMEOUT_MS}ms 必须大于 SSE 串行等待 ${SSE_TEARDOWN_WAIT_MS}+${SSE_END_WAIT_MS}=${SSE_SERIAL_WAIT_MS}ms`)
+  const slack = TEST_TIMEOUT_MS - Math.max(RUN_DEADLINE_MS, SSE_SERIAL_WAIT_MS)
+  assert.ok(slack >= WATCHDOG_MARGIN_MS,
+    `看门狗相对最长内层等待必须留 ≥${WATCHDOG_MARGIN_MS}ms 余量（实际 ${slack}ms）`)
+  // 锁住 30s 这个量级：5 处断言的文案与文档都写「30s 内结束」，调大必须连带重估看门狗。
+  assert.strictEqual(RUN_DEADLINE_MS, 30000, '轮询上界必须仍是 30s（用例文案与文档口径）')
+  // 内层上界必须**全部**从常量派生：散落字面量对上面三条关系断言是隐形的（改字面量不改关系）。
+  const src = fs.readFileSync(__filename, 'utf8')
+  const derived = src.match(/Date\.now\(\) \+ RUN_DEADLINE_MS/g) || []
+  assert.strictEqual(derived.length, 5, `5 处轮询上界必须派生自 RUN_DEADLINE_MS（实际 ${derived.length} 处）`)
+  assert.strictEqual((src.match(/untilTornDown\(SSE_TEARDOWN_WAIT_MS\)/g) || []).length, 1,
+    'SSE 拆除等待必须走 SSE_TEARDOWN_WAIT_MS 常量')
+  assert.strictEqual((src.match(/untilEnded\(SSE_END_WAIT_MS\)/g) || []).length, 1,
+    'SSE 终结等待必须走 SSE_END_WAIT_MS 常量')
+})
 
 // ── token 校验 ──
 ok(`isValidToken: ≥${TOKEN_MIN_LEN} 字符合法`, () => {
@@ -3744,7 +3778,7 @@ async function main () {
     assert.strictEqual(second.status, 409, '持有期内第二个触发必须 409')
     // 模拟子进程结束：找到 run 里的 fake 记录——真实子进程已 spawn（node qinglong/xbk_push.js --check 在本机可跑），
     // 等 close 事件释放锁（--check 只做环境检查，秒级完成）。
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     while (Date.now() < deadline) {
       const rec = runs.get(firstBody.id)
       if (rec && rec.finishedAt) break
@@ -4316,7 +4350,7 @@ async function main () {
     assert.strictEqual(okRes.status, 202, '越过 60s 窗必须放行（旧 12min 窗下这里会 409，人工重跑要等 12 分钟）')
     // 收尾：等子进程结束释放锁，避免影响后续用例
     const id = JSON.parse(okRes.text).id
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     while (Date.now() < deadline) {
       const rec = runs.get(id)
       if (rec && rec.finishedAt) break
@@ -4346,7 +4380,7 @@ async function main () {
     assert.ok(Array.isArray(list.runs) && list.runs.some(r => r.id === id))
     // Sourcery #39：等子进程结束再断言 output 非空——--check 必然打印环境信息，
     // 只断言「是字符串」抓不住输出捕获链路整体失效的回归。
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     let detail = null
     while (Date.now() < deadline) {
       detail = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
@@ -5097,7 +5131,7 @@ async function main () {
     const again = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: `id=${cancelId}` })
     assert.ok(again.status === 200 || again.status === 409, `重复 cancel 幂等（实际 ${again.status}：任务可能已自然结束）`)
     // 子进程被信号终止后 close 释放锁（SIGTERM 对无 handler 子进程近即时）。
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     while (Date.now() < deadline && rec.finishedAt === 0) await new Promise((_resolve) => setTimeout(_resolve, 100))
     assert.ok(rec.finishedAt > 0, '被取消任务必须走到 close（锁释放唯一入口）')
     const lockAfter = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
@@ -5501,7 +5535,7 @@ async function main () {
       }
       return sseConnections.size === 0
     }
-    torn = await untilTornDown(20000)
+    torn = await untilTornDown(SSE_TEARDOWN_WAIT_MS)
     if (appendTimer) clearInterval(appendTimer)
     assert.strictEqual(torn, true, '超限硬断 → 服务端连接已 teardown 摘除')
     sock.on('data', (c) => { raw += c })
@@ -5517,7 +5551,7 @@ async function main () {
       }
       return ended
     }
-    assert.strictEqual(await untilEnded(10000), true, '恢复读后客户端收到连接终结（排队字节流尽 → close）')
+    assert.strictEqual(await untilEnded(SSE_END_WAIT_MS), true, '恢复读后客户端收到连接终结（排队字节流尽 → close）')
     clearInterval(kick)
     assert.strictEqual(sseConnections.size, 0, '硬断后服务端连接保持摘除')
     assert.strictEqual(raw.includes('event: done'), false, '超限硬断不发 done 帧（区别于淘汰/完结收尾路径）')
@@ -5572,7 +5606,7 @@ async function main () {
       assert.strictEqual(trig.status, 202)
     }
     const { id } = JSON.parse(trig.text)
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     let detail = null
     while (Date.now() < deadline) {
       const r = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: `id=${id}` })
