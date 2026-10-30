@@ -2935,7 +2935,7 @@ console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner
   // 靶向反例 1：把 test.yml 的 npm rebuild 换回旧的手工直调 ⇒ 必须红（证明 a) 不是空断言）
   {
     const text = wfText('test.yml')
-    const mutated = text.replace(/^(\s*)npm rebuild re2 --foreground-scripts --ignore-scripts=false$/m,
+    const mutated = text.replace(/^([ \t]*)npm rebuild re2 --foreground-scripts --ignore-scripts=false$/m,
       '$1(cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node)')
     assert.notStrictEqual(mutated, text, '反例夹具必须真的把 npm rebuild 换成了手工直调')
     assert.throws(() => assertRe2Scoped(mutated, 'fixture'), /不得直接调用/,
