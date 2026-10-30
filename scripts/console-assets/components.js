@@ -695,30 +695,28 @@ function channelInfo (state) {
 // 过滤诊断卡片（Sourcery Filter-diagnostics x3）：readStatus 返回 state.diagnostics
 // （{status, value}），此前 SPA 从未渲染——无脚本降级版有此信息，JS 版反而丢失。
 // 口径与 formatStatus 一致：missing=中性暂无；invalid=红；ok 时展示最近时间与原因分布。
-function diagCard (state) {
-  if (!state || !state.diagnostics) return []
-  const d = state.diagnostics
-  if (d.status === 'missing') {
-    return [{ title: '过滤诊断', tone: 'run', lines: ['暂无记录'] }]
-  }
-  if (d.status !== 'ok') {
-    return [{ title: '过滤诊断', tone: 'bad', lines: [`状态异常（${d.status}）`] }]
-  }
-  const v = d.value || {}
-  if (!v || typeof v !== 'object') {
-    return [{ title: '过滤诊断', tone: 'bad', lines: ['状态异常'] }]
-  }
-  const reasons = v.byReason && typeof v.byReason === 'object' && !Array.isArray(v.byReason)
-    ? Object.entries(v.byReason).map(([k, n]) => `${k}=${typeof n === 'number' ? n : '?'}`).join('，')
-    : ''
-  return [{
-    title: '过滤诊断',
+// C7-058：诊断只解析一次。旧实现返回单元素数组（调用方还得 `[0] || null`），
+// 而 StatusCards 又把 value.byReason 自己算了一遍——同一份原因分布两处格式还不一样
+// （这里 `k=n`，卡片里 `k n`），合计条数也只在一个地方算。现在返回一个对象，
+// 原因文案 / 合计条数 / 最近时间一次算好，卡片只负责拼两行文本。
+function diagInfo (state) {
+  const d = state && state.diagnostics ? state.diagnostics : null
+  // 没有诊断文件 / 还没生成 ⇒ 中性「暂无」：返回 null，卡片用自己的兜底行（`最近过滤 —` /
+  // `原因 —`），不假装「已过滤 0 条」。
+  if (!d || d.status === 'missing') return null
+  // ok 必须带对象 value（缺失/非对象即契约破坏）；status !== 'ok' 归同一支：红卡 + 无数据。
+  const v = d.status === 'ok' && d.value && typeof d.value === 'object' && !Array.isArray(d.value)
+    ? d.value
+    : null
+  if (!v) return { tone: 'bad', at: null, reasons: '', filtered: null }
+  const byReason = v.byReason && typeof v.byReason === 'object' && !Array.isArray(v.byReason) ? v.byReason : null
+  const pairs = byReason ? Object.entries(byReason) : []
+  return {
     tone: 'ok',
-    lines: [
-      `最近 ${fmtNum(v.at)}`,
-      `原因分布 ${reasons || '无'}`
-    ]
-  }]
+    at: v.at,
+    reasons: pairs.map(([k, n]) => `${k} ${typeof n === 'number' ? n : '?'}`).join('，'),
+    filtered: byReason ? pairs.reduce((sum, [, n]) => sum + (typeof n === 'number' ? n : 0), 0) : null
+  }
 }
 
 // ── 组件：首屏异常横幅（v3.307）────────────────────────────────────────────
@@ -831,18 +829,11 @@ function StatusCards ({ state, err }) {
   const stats = state.stats && state.stats.status === 'ok' ? state.stats.value : null
   const today = stats ? stats.today : null
   const week = stats ? stats.week : null
-  const diag = diagCard(state)[0] || null
+  const diag = diagInfo(state)
   const diagTone = diag ? diag.tone : 'run'
-  const diagLines = diag ? diag.lines : ['暂无记录']
   // v3.325：通道卡的「主数字」用被过滤条数（有信息量），连续失败放 hint。
-  const diagRaw = state.diagnostics && state.diagnostics.status === 'ok' ? state.diagnostics.value : null
-  const diagReasons = diagRaw && diagRaw.byReason && typeof diagRaw.byReason === 'object'
-    ? Object.entries(diagRaw.byReason).map(([k, n]) => `${k} ${typeof n === 'number' ? n : '?'}`).join('，')
-    : ''
-  const filteredCount = diagRaw && diagRaw.byReason && typeof diagRaw.byReason === 'object'
-    ? Object.values(diagRaw.byReason).reduce((a, n) => a + (typeof n === 'number' ? n : 0), 0)
-    : null
-  const diagAt = diagRaw ? diagRaw.at : null
+  // C7-058：条数与原因分布都来自 diagInfo 的同一次解析（旧实现在这里又遍历一遍 byReason，
+  // 两处格式不同，改一处就会前后矛盾）。
   const chanMax = chan.entries.length > 0 ? Math.max(...chan.entries.map((e) => e.failures)) : 0
   const repRel = rep ? relDay(rep.date) : ''
   const rateText = (r) => (r && typeof r.successRate === 'number' ? `${(r.successRate * 100).toFixed(1)}%` : '—')
@@ -918,12 +909,12 @@ function StatusCards ({ state, err }) {
       badge: chanTone === 'bad' ? '异常' : (chanTone === 'ok' ? '正常' : '—'),
       // 主数字换成「被过滤条数」：连续失败 0 当大字没意义（0 太抢且不是成绩）。
       main: {
-        num: filteredCount === null ? '—' : fmtNum(filteredCount),
+        num: diag && diag.filtered !== null ? fmtNum(diag.filtered) : '—',
         unit: '条被过滤',
         hint: `${chan.entries.length > 0 ? chan.entries.map((e) => e.name).join('、') : (chan.note || '暂无记录')}${chanMax > 0 ? ` · 连续失败 ${chanMax}` : ' · 连续失败 0'}`
       },
-      lines: diagLines.length > 0
-        ? [`最近过滤 ${fmtNum(diagAt)}`, `原因 ${diagReasons || '无'}`]
+      lines: diag
+        ? [`最近过滤 ${fmtNum(diag.at)}`, `原因 ${diag.reasons || '无'}`]
         : ['最近过滤 —', '原因 —']
     }
   ]
