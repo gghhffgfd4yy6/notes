@@ -1,17 +1,30 @@
 'use strict'
 
-// 🌐 Network — 网络请求层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
+// 🌐 Network — 网络请求层（由 xbk_function_v3.js 的组合根 createNetwork 注入，生产每轮都经它发请求）
 // 依赖全部由组合根注入，避免反向 require 主入口及重复单例。
 //
 // net-1：PERMANENT_CODES 目前组合根尚未接线（xbk_function_v3.js 只注入 RETRYABLE_CODES），缺省回落到
 // xbk_failure_policy 的同名导出——该模块是无状态常量/纯函数模块，直接 require 不产生反向依赖或重复
 // 单例；若日后组合根改为显式注入，注入值优先，语义不变。
 const { setTimeout: delay } = require('node:timers/promises')
-const { PERMANENT_CODES: POLICY_PERMANENT_CODES } = require('./xbk_failure_policy')
+const {
+  RETRYABLE_CODES: POLICY_RETRYABLE_CODES,
+  PERMANENT_CODES: POLICY_PERMANENT_CODES
+} = require('./xbk_failure_policy')
 
-// net-1：请求层本地「确定性失败」码——重试同一个请求不会改变结果（响应体超过 maxBody 是确定性的），
-// 但 xbk_failure_policy 未把该码列进 PERMANENT_CODES（该模块对未知码按「保守重试」处理，见其头部口径），
-// 故只在请求层单列，不改动失败分类模块的语义（常驻循环仍按策略归类决定下一轮）。
+// C8-016：两张表都回落策略默认值。旧实现只给 PERMANENT_CODES 默认值，RETRYABLE_CODES 漏注入时是
+// `undefined`——4xx 分支的 `RETRYABLE_CODES.has(...)` 在 catch 里抛 TypeError，把正在处理的原始错误
+// 换成「Cannot read properties of undefined」，真正原因（状态码/错误码）整条丢失。
+// 同理，注入值不是 Set（数组、误传字符串）时 `.has` 也不存在；判定恒在 catch 里执行，任何抛错都会顶掉
+// 原始错误，故统一归一化：能判断成员就用调用方注入的，否则回落策略表。
+function membershipSet (injected, fallback) {
+  return injected && typeof injected.has === 'function' ? injected : fallback
+}
+
+// net-1：请求层本地「确定性失败」码——重试同一个请求不会改变结果（响应体超过 maxBody 是确定性的）。
+// C8-004 起该码已同时列进 xbk_failure_policy.PERMANENT_CODES（常驻层不再每轮重下同一个超限响应体）；
+// 本地集合保留：调用方注入自定义 PERMANENT_CODES 会**整体替换**默认表，那一路径下该码仍需在请求层
+// 立即抛出而不重试。
 const DETERMINISTIC_LOCAL_CODES = new Set(['EBODYLIMIT'])
 
 // net-3：请求超时的合法性口径——只有「≥100ms 的整数」才采用，其余一律回落默认 5000ms 并告警：
@@ -98,7 +111,9 @@ function createNetwork ({
   prewarmDns,
   getNotify,
   crypto,
-  RETRYABLE_CODES,
+  // C8-016：缺省回落到策略表（与 PERMANENT_CODES 对称），且注入值若不是可用集合也走回落——
+  // 见文件顶 membershipSet 的说明。
+  RETRYABLE_CODES = POLICY_RETRYABLE_CODES,
   PERMANENT_CODES = POLICY_PERMANENT_CODES,
   PKG_VERSION = '3.x',
   PROFILE3 = false,
@@ -107,6 +122,8 @@ function createNetwork ({
   // 用例时注入替身，而不是替换 global.setTimeout（后者对 timers/promises 无效）。
   sleep = delay
 }) {
+  const retryableCodes = membershipSet(RETRYABLE_CODES, POLICY_RETRYABLE_CODES)
+  const permanentCodes = membershipSet(PERMANENT_CODES, POLICY_PERMANENT_CODES)
   // net-3：解析 api.timeout（口径见文件头 MIN_TIMEOUT_MS 说明）。被判非法的值不静默——告警留痕，便于把
   // 「请求超时」定位回「配置有问题」（非数值输入经 Utils.num 已回落到默认，与合法填写的默认值不可区分，
   // 保持原语义不告警）；注入的 logger 未提供 warn 时退化为不告警（不得因此抛错）。
@@ -187,13 +204,13 @@ function createNetwork ({
           // 证书类 CERT_HAS_EXPIRED、URL/参数类 ERR_INVALID_URL 等）在 PERMANENT_CODES 里是明确的永久性
           // 错误，旧实现会退避重试满 maxRetry 次（白白空转 1s+2s+4s…）；EBODYLIMIT 同理（确定性失败）。
           // 未知错误码一律保持旧口径（继续重试），不因本改动扩大「不重试」的范围。
-          if (e.code && (PERMANENT_CODES.has(e.code) || DETERMINISTIC_LOCAL_CODES.has(e.code))) throw e
+          if (e.code && (permanentCodes.has(e.code) || DETERMINISTIC_LOCAL_CODES.has(e.code))) throw e
           // 4xx 客户端错误：重试也没用，直接抛出（限流/临时性状态码除外——408/409/425/429 可能瞬时，值得重试）
           // P2（审查 2026-08-15）：可重试状态码收敛到 xbk_failure_policy.RETRYABLE_CODES 单一来源，
           // 曾内联硬编码 429/408/409 漏掉 425（failure_policy 判 retryable 而 fetchData 立即抛，两份清单漂移）。
           if (e.response) {
             const sc = e.response.statusCode
-            if (sc !== undefined && sc < 500 && !RETRYABLE_CODES.has('HTTP_' + sc)) throw e
+            if (sc !== undefined && sc < 500 && !retryableCodes.has('HTTP_' + sc)) throw e
           }
           if (attempt < maxRetry) { // v3.157：用兜底后的 maxRetry（曾用原始 Config.api.retry，非法类型时与实际重试不一致）
             // net-7：服务端显式给了 Retry-After（429/408/425/503 常见）就按它等——外层手写退避曾完全不读它，

@@ -148,6 +148,19 @@ check('AG-05 severity 大小写变体仍判高危（HIGH/Critical 不得被静�
   }
 })
 
+check('AG-12 条目级 severity 缺失/非法 → exit 1（不得压成空串后判“无高危”）', () => {
+  // 缺陷本体（C10-030）：旧实现 `String(v.severity || '').toLowerCase()` 把缺失值压成空串，
+  // 空串既不等于 'high' 也不等于 'critical' ⇒ high 为空 ⇒ 打印「安全审计通过：无高危及以上漏洞」并 exit 0。
+  // schema 漂移（字段改名/裁剪）因此能把真高危静默放行。三类输入都必须 fail-closed 且点名条目。
+  for (const [label, sev] of [['缺 severity 字段', undefined], ['severity 为 null', null], ['severity 为未知枚举值', 'severe']]) {
+    const r = run({ vulnerabilities: direct('drift-pkg', sev, [OTHER_URL]) })
+    ok1(r, `${label}：判不出 severity 时必须拒绝放行（旧实现会判 0）`)
+    assert.match(r.stderr, /severity 缺失或非法/, `${label} 必须给出可归因的诊断（实际：${r.stderr.trim().slice(0, 200)}）`)
+    assert.match(r.stderr, /drift-pkg/, `${label} 必须点名条目（否则无法定位是哪条记录漂移）`)
+    assert.doesNotMatch(r.stdout, /安全审计通过/, `${label} 绝不输出“通过”字样`)
+  }
+})
+
 check('AG-06 未豁免的高危 → exit 1 且点名具体包名（不得只给汇总）', () => {
   const r = run({ vulnerabilities: Object.assign({}, direct('evil-a', 'high', [OTHER_URL]), direct('evil-b', 'critical', [OTHER_URL])) })
   ok1(r, '未豁免高危必须拦')

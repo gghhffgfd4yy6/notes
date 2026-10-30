@@ -772,7 +772,33 @@ check('C5-006 10× 比值判据必须带毫秒地板（噪声区放行、37–44
 // local 注入的键在测试口径下必须视为「未配置」：否则 withConfig 的保存/恢复会把真实 token 原样带回，
 // 「未配置」断言假红（本机曾 100% 红：WX_pusher_appToken/topicIds 泄入 isolateChannel/withConfig 状态）。
 let LOCAL_ONLY_KEYS = []
-try { LOCAL_ONLY_KEYS = Object.keys(require('./push_config.local.js')) } catch (e) { /* 无 local 配置文件 */ }
+// 区分两种情形：文件**不存在**（正常：本机/CI 没有部署侧配置）与文件**存在但加载失败**（local 配置坏了）。
+// 后者必须响亮失败并打印根因：旧实现的 `catch { /* 无 local 配置文件 */ }` 把「文件在但 require 抛错」
+// 也当成「没有 local 配置」⇒ LOCAL_ONLY_KEYS 为空 ⇒ local 注入的真实密钥被当成基线配置留在 push_config 里，
+// 「未配置」用例按「已配置」跑（假绿或互相串扰），而真正的原因（语法错误 / 缺依赖 / 导出成非对象）一个字不打印。
+const localConfigPath = require('node:path').join(__dirname, 'push_config.local.js')
+// CR-11：只暴露「错误类别」。Node 的 require 堆栈会带出配置源码整行（Token 就写在其中），把原始堆栈
+// 打进本地日志/终端回滚记录等于泄露密钥；而 SyntaxError / 模块缺失 / 其它加载失败已足够定位问题。
+function localConfigErrorCategory (e) {
+  const code = e && typeof e.code === 'string' ? e.code : ''
+  if (code === 'MODULE_NOT_FOUND' || code === 'ERR_MODULE_NOT_FOUND') return 'module_not_found'
+  if (e && e.name === 'SyntaxError') return 'syntax_error'
+  return 'load_failed'
+}
+if (fs.existsSync(localConfigPath)) {
+  try {
+    const localConfig = require(localConfigPath)
+    if (!localConfig || typeof localConfig !== 'object' || Array.isArray(localConfig)) {
+      throw new Error(`push_config.local.js 必须导出对象（实际 ${Array.isArray(localConfig) ? 'array' : typeof localConfig}）`)
+    }
+    LOCAL_ONLY_KEYS = Object.keys(localConfig)
+  } catch (e) {
+    // 不吞：local 配置坏掉时本套件所有「未配置」判据都不可信，必须当场红在根因上（不是继续跑下去）。
+    // 非零退出保持不变；只记安全类别，不回显原始堆栈（见 localConfigErrorCategory 的注释）。
+    console.error(`❌ 读取 push_config.local.js 失败（文件存在但无法加载，local 配置已损坏）：category=${localConfigErrorCategory(e)}，按类别自查后修复（不回显原始堆栈，以免带出配置里的密钥）`)
+    process.exit(1)
+  }
+}
 // env 覆盖不经过 withConfig（见 ENV_ALIASES 用例自管），此清单只含 local 文件注入的键。
 const BASELINE_CONFIG = {}
 for (const k of Object.keys(push_config)) BASELINE_CONFIG[k] = push_config[k]

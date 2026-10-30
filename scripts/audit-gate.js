@@ -26,6 +26,18 @@ const ALLOWED_ADVISORIES = new Map([
   ['GHSA-CH52-4W7C-C8XP', '4.3.0 已落在受影响范围 <=4.2.0 之外（实测 npm audit 命中归零），但 GitHub 侧 first_patched_version 仍为 null、告警引用的 max-stale 表达式一字未改 ⇒ 属「范围消解 + 上游 Vary 匹配加固」而非确认修复；got@11 传递依赖已停更；项目用法为直连推送 API，cacheable-request 缓存路径不生效，实际暴露面趋近于零（PR #194 豁免，PR #203 更新理由）']
 ])
 
+// severity 的合法取值集合（npm audit 的 vulnerabilities[].severity 枚举）。
+// 归一化只做「去空白 + 小写」；**不认识的取值返回 null**，由调用方按 schema 漂移处理：
+// 把未知值当成「不是 high」就是在缺字段时判「无高危」，这正是 C10-030 的缺陷本体。
+const SEVERITY_LEVELS = new Set(['info', 'low', 'moderate', 'high', 'critical'])
+
+function normalizeSeverity (vuln) {
+  const raw = vuln && vuln.severity
+  if (typeof raw !== 'string') return null
+  const sev = raw.trim().toLowerCase()
+  return SEVERITY_LEVELS.has(sev) ? sev : null
+}
+
 function main () {
   let raw
   try {
@@ -48,8 +60,22 @@ function main () {
   }
   const vulns = data.vulnerabilities
   const entries = Object.values(vulns)
+  // 条目级 severity 必须显式且可归一（C10-030）：npm audit 的 vulnerabilities[<pkg>].severity 是**必填**
+  // 枚举（info/low/moderate/high/critical）。修复前 `String(v.severity || '')` 把缺失值压成空串，空串既不
+  // 等于 'high' 也不等于 'critical' ⇒ 整份报告被判「无高危」并 exit 0：字段改名/裁剪这类 schema 漂移会
+  // 静默放行真高危。缺失或未知取值一律按基础设施异常 fail-closed（与上方 vulnerabilities 漂移同一口径），
+  // 并点名条目——「判不出来」不得当成「没有高危」。
+  const unknownSeverity = entries.filter(v => normalizeSeverity(v) === null)
+  if (unknownSeverity.length > 0) {
+    const named = unknownSeverity.map(v => `${v && v.name ? v.name : '<无 name 字段>'}=${JSON.stringify(v && v.severity)}`)
+    console.error(`❌ audit-result.json 有 ${unknownSeverity.length} 个条目的 severity 缺失或非法（npm audit schema 漂移？），fail-closed 拒绝放行：${named.join(', ')}`)
+    process.exit(1)
+  }
   // severity 归一化：防御大小写变体被静默放行（任务2 审查 finding）
-  const high = entries.filter(v => String(v.severity || '').toLowerCase() === 'high' || String(v.severity || '').toLowerCase() === 'critical')
+  const high = entries.filter(v => {
+    const sev = normalizeSeverity(v)
+    return sev === 'high' || sev === 'critical'
+  })
   if (high.length === 0) {
     console.log('✅ 安全审计通过：无高危及以上漏洞')
     return

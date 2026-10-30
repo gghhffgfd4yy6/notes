@@ -142,7 +142,7 @@ function makeCase () {
     writeHooks(dir)
     const r = runVerify(dir, home)
     assert.strictEqual(r.status, 1, 'core.hooksPath 未配置时门禁不生效，--verify 必须非 0')
-    assert.match(r.stderr, /core\.hooksPath=\(未设置或空串\)/, '应回显当前配置值')
+    assert.match(r.stderr, /core\.hooksPath=\(未设置：键不存在\)/, '应回显当前配置值（未设置，不是「空串」）')
     const cfg = gitConfig(dir, home, 'core.hooksPath')
     assert.notStrictEqual(cfg.status, 0, '--verify 是只读的：不得顺手写入 core.hooksPath')
   } finally {
@@ -223,6 +223,26 @@ function makeCase () {
     const r = runPlugin(dir, home, [])
     assert.strictEqual(r.status, 0, `默认路径在非工作树内仍应 exit 0：${r.stderr || r.stdout}`)
     assert.match(r.stderr, /跳过/, '应显式声明是「跳过」而非「已生效」')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 7b) 【C10-031 靶向】拼错的参数（--verfiy）必须拒绝执行：旧实现只看 includes('--verify')，
+//     未知参数被静默忽略 ⇒ 直接落到安装路径并**真的写入 core.hooksPath**——一次笔误就改了仓库配置，
+//     调用方还以为自己在做只读自检。现在必须非 0 退出、点名参数本身，且绝不写配置。
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    writeHooks(dir, EXPECTED_HOOKS)
+    const r = runPlugin(dir, home, ['--verfiy'])
+    assert.strictEqual(r.status, 2, `未知参数必须 fail-closed（参数错误用 2，与「门禁未生效」的 1 区分）：${r.stderr}`)
+    assert.match(r.stderr, /未识别参数/, '必须点名「未识别参数」')
+    assert.match(r.stderr, /--verfiy/, '必须回显拼错的参数，否则用户看不出是笔误（--verfiy vs --verify）')
+    assert.notStrictEqual(gitConfig(dir, home, 'core.hooksPath').status, 0,
+      '未知参数不得写入 core.hooksPath（旧实现把笔误 --verfiy 当成安装执行）')
+    assert.doesNotMatch(r.stdout, /已注册|已就绪/, '拒绝执行时不得打印任何「已注册/已就绪」的成功结论')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

@@ -3406,6 +3406,105 @@ checkAsync('RUN-1 推送失败不写缓存：失败条目不得进缓存（含�
   }
 })
 
+// ============================================================
+// CD-1（CR-03）：cacheDir 必须「每次访问都校验」
+//
+// 背景：本 PR 的 C1-027 曾把 MessageStore.cacheDir 的 getter 求值优化成 run() 里解析一次并钉到
+// _cacheDirForRun，其后同一轮的 run.log / 状态文件写入全部复用这条未经校验的路径。若运行期间
+// 缓存目录的父目录被换成指向项目外的符号链接，写入会跟着链接走（符号链接防御从「每次写入」降级
+// 成「只看启动那一刻」）。本用例在**运行中**（Pusher.send 时刻，init 之后、本轮日志/状态写入之前）
+// 把目录替换成外部符号链接，断言：① 每次访问都真的重新求值 getter；② 替换后当次访问即失败；
+// ③ 同一时刻的日志写入不跟随链接、外部目标文件一个字节都不变。
+// ============================================================
+checkAsync('CD-1 cacheDir 每次访问都重新校验：运行中目录被换成外部符号链接 ⇒ 当次访问失败、写入不跟随链接', async () => {
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = mkTmpFixture('cachedir-swap-')
+  const outsideDir = mkTmpFixture('cachedir-outside-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+
+  // getter 换成「每次求值都 lstat + 计数」的校验版：生产 getter 本身是 existsSync 逐级回溯 + lstat +
+  // realpathSync，这里只补上「求值次数」与「目标被换成符号链接即抛错」两个可观测点（XBK_CACHE_DIR
+  // 的显式覆盖在真实 getter 里只做 resolve，不参与根内 realpath 校验，故这一维必须由用例自己钉）。
+  const realGet = Object.getOwnPropertyDescriptor(h.MessageStore, 'cacheDir').get
+  let cacheDirReads = 0
+  Object.defineProperty(h.MessageStore, 'cacheDir', {
+    configurable: true,
+    get () {
+      cacheDirReads += 1
+      const dir = realGet.call(this)
+      if (realFs.lstatSync(dir).isSymbolicLink()) throw new Error('缓存目录安全检查失败：目录已被替换为符号链接')
+      return dir
+    }
+  })
+
+  const outsideLog = path.join(outsideDir, 'run.log')
+  realFs.writeFileSync(outsideLog, 'ORIGINAL\n', { mode: 0o600 })
+  const outsideListing = realFs.readdirSync(outsideDir).sort()
+  const stash = cacheDir + '.stash'
+  const observed = { threw: null, outsideLogDuringSwap: null, listingDuringSwap: null }
+  const origSend = h.Pusher.send
+  let swapped = false
+  h.Pusher.send = async (text, desp) => {
+    if (!swapped) {
+      swapped = true
+      // ① 每次访问都必须重新走 getter：run() 已执行过 init，此处若复用「开头解析的路径」则计数不变。
+      const before = cacheDirReads
+      assert.strictEqual(h.App._cacheDir(), cacheDir, '未替换前应返回缓存目录')
+      assert.strictEqual(cacheDirReads, before + 1,
+        '运行期每次访问都必须重新求值 MessageStore.cacheDir（不得复用 run() 开头解析的路径）')
+
+      // ② 运行中把缓存目录换成指向项目外的符号链接（父目录有写权限的进程即可做到）。
+      realFs.renameSync(cacheDir, stash)
+      realFs.symlinkSync(outsideDir, cacheDir, 'dir')
+      try {
+        try {
+          h.App._cacheDir()
+        } catch (e) {
+          observed.threw = e
+        }
+        // ③ 同一时刻的日志写入：目录已被替换 ⇒ 必须当场失败，绝不跟随链接写到 outsideDir。
+        h.App._writeRunLog('cd1-probe\n')
+        observed.outsideLogDuringSwap = realFs.readFileSync(outsideLog, 'utf8')
+        observed.listingDuringSwap = realFs.readdirSync(outsideDir).sort()
+      } finally {
+        realFs.unlinkSync(cacheDir)
+        realFs.renameSync(stash, cacheDir)
+      }
+    }
+    return origSend(text, desp)
+  }
+
+  try {
+    h.setItems([makeRunItem('cd1-a', '正常甲')])
+    const round = await runWithWarnings(h.App)
+    assert.ok(observed.threw, '目录被替换成符号链接后，当次 cacheDir 访问必须失败（返回旧路径 = 校验被缓存掉了）')
+    assert.match(String(observed.threw && observed.threw.message), /安全检查失败/,
+      `替换后的访问必须报「安全检查失败」，实际：${observed.threw && observed.threw.message}`)
+    assert.strictEqual(observed.outsideLogDuringSwap, 'ORIGINAL\n',
+      '目录被替换后，run.log 写入不得跟随符号链接改写项目外文件')
+    assert.deepStrictEqual(observed.listingDuringSwap, outsideListing,
+      '目录被替换后，不得在项目外目录里留下任何新文件（run.log.lock / 截尾临时文件）')
+    assert.strictEqual(realFs.readFileSync(outsideLog, 'utf8'), 'ORIGINAL\n',
+      '本轮结束后项目外目标文件仍必须逐字节不变')
+    assert.deepStrictEqual({ pushed: round.summary.pushed, failed: round.summary.failed }, { pushed: 1, failed: 0 },
+      `目录归位后本轮应正常推送：${JSON.stringify(round.summary)}`)
+  } finally {
+    if (realFs.existsSync(stash)) realFs.rmSync(stash, { recursive: true, force: true })
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    realFs.rmSync(outsideDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

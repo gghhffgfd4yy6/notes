@@ -153,15 +153,6 @@ export function useRevealWhen (ref, ready, selector, opts = {}) {
   }, [ready])
 }
 
-// 打开时入场（弹窗：组件常驻、open 翻转；关闭仍是立即卸载，不做退场排队）。
-export function useEnterOnOpen (ref, open, opts = {}) {
-  const was = useRef(false)
-  useLayoutEffect(() => {
-    if (open && !was.current) enter(ref.current, opts)
-    was.current = !!open
-  }, [open])
-}
-
 // 列表增删/重排的 FLIP：上一次布局的矩形存在 WeakMap 里，新布局量一次，位移差
 // 用 transform 补回去（新增条目淡入 + 轻推）。只碰 transform/opacity；条目自身
 // 变高变矮不参与动画——不会把页面高度带着一起跳。

@@ -8,6 +8,17 @@ function createApp ({
   summarizeError, PROFILE3, PROFILE3_BOOT_MARKS, prewarmDns, prewarmTls,
   getNotify, PKG_VERSION, trimTrailingSlashes, compileUserRegex
 }) {
+  // C1-026：parallelLimit 的**唯一**夹取口径。此前三处各自夹取（预热窗口按 10、并行 worker 按 50、
+  // 0/负数按 items.length），于是「预热连接数与并发窗口对齐」的注释不成立：窗口 >10 时预热恒定只开
+  // 10 条连接。规则收敛为：正数向下取整；0/负数/非法回退「按消息总数」（调用方拿不到条目数时传
+  // 单轮上限，语义仍是同一上限）；统一受 MAX_PARALLEL_WORKERS 约束，空批次兜底 1。
+  const MAX_PARALLEL_WORKERS = 50
+  const resolveParallelWindow = (configured, totalItems) => {
+    const pl = Utils.num(configured, 0)
+    const items = Number.isFinite(totalItems) && totalItems > 0 ? Math.floor(totalItems) : 0
+    const base = pl > 0 ? Math.floor(pl) : items
+    return Math.max(1, Math.min(base, MAX_PARALLEL_WORKERS))
+  }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
   // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
@@ -34,6 +45,15 @@ function createApp ({
       return isRegularOrMissing(filePath)
     },
 
+    // C1-027/CR-03：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
+    // **每次访问都要重新求值**——「运行期间父目录被换成指向项目外的符号链接」只在求值那一刻可见。
+    // 本 PR 曾把重复求值优化成 run() 里解析一次并钉到 _cacheDirForRun（单轮内 cache.dir 是静态配置），
+    // 代价是轮次内的日志/状态写入不再过 lstat/realpath 校验：写路径会跟着被替换的链接走，符号链接
+    // 防御从「每次写入」降级成「只看启动那一刻」。现撤回该缓存：配置在单轮内静态，目录本身不是。
+    _cacheDir () {
+      return MessageStore.cacheDir
+    },
+
     // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
     // unsafe/replaced/tooLarge），并强制大小上限，杜绝异常膨胀文件被整读入内存。
     _readSafeState (filePath) {
@@ -41,9 +61,20 @@ function createApp ({
     },
 
     _writeTextAtomic (filePath, text) {
-    // v3.245 P1：writeAtomic 内部有 try/catch 正常不抛；此处再加一层防御（如 text 含
-    // Symbol 等 String 化异常），任何意外不向调用链冒泡。
-      try { return writeAtomic(filePath, text, '缓存文件') } catch (e) { return false }
+    // v3.245 P1：writeAtomic 内部有 try/catch（失败会 console.error 后返回 false），正常不抛；
+    // 这一层只兜「String 化异常」等意外，任何异常都不向调用链冒泡。
+    // C1-016：旧实现 `catch (e) { return false }` 把原因整条丢掉——调用方与运维只看到 false，
+    // 分不清「磁盘/权限失败」与「text 无法字符串化」。不冒泡的契约不变，原因必须留痕。
+      try {
+        return writeAtomic(filePath, text, '缓存文件')
+      } catch (e) {
+      // 原因自己安全字符串化（不依赖 Utils：本方法的既有单测用最小 Utils 替身，且这里正好是
+      // 「text 不可字符串化」的兜底路径，取原因本身也不能再抛一次）。
+        let reason = ''
+        try { reason = String((e && e.message) || e) } catch (e2) { reason = '<不可字符串化的异常>' }
+        console.warn(`⚠️ 缓存文件写入异常（已拦截，不冒泡）：${filePath}: ${reason}`)
+        return false
+      }
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
@@ -77,7 +108,7 @@ function createApp ({
     _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
         const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
-        const logPath = path.join(MessageStore.cacheDir, safeFilename)
+        const logPath = path.join(this._cacheDir(), safeFilename)
         if (!this._isRegularOrMissing(logPath)) {
           console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
           return
@@ -236,7 +267,7 @@ function createApp ({
       const now = Date.now()
       // 同一进程最多每小时提示一次，避免磁盘低时刷屏；限流前置，避免高频写入时每次都无谓同步 statfs 阻塞事件循环。
       if (now - this._diskWarningAt < 3600000) return
-      const info = Utils.diskSpace(MessageStore.cacheDir)
+      const info = Utils.diskSpace(this._cacheDir())
       // freeBytes 需有限性校验：NaN 时 >=minFree 为 false 会误入告警并在 toFixed 抛 RangeError。
       if (!info || !Number.isFinite(info.freeBytes) || info.freeBytes >= minFree) return
       this._diskWarningAt = now
@@ -258,7 +289,7 @@ function createApp ({
       // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
         if (!this._enabledFlag(Config.alert)) return
         const classKey = typeof alertKey === 'string' && alertKey ? alertKey : 'alert'
-        const statePath = path.join(MessageStore.cacheDir, 'alert.state')
+        const statePath = path.join(this._cacheDir(), 'alert.state')
         const alertMemory = this._alertLastAtByPath.get(statePath)
         let lastAt = alertMemory ? alertMemory.lastAt : 0
         let classes = alertMemory && alertMemory.classes && typeof alertMemory.classes === 'object'
@@ -422,7 +453,7 @@ function createApp ({
       // 标记记录 pid + 进程启动时钟（incarnation）+ 状态（pending/completed）：
       // 已完成的标记永不回收，只有 pending（崩溃未完成）才允许回收（CodeRabbit 第八轮）。
       const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
-      const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
+      const statePath = path.join(this._cacheDir(), `${RE2_WARN_STATE_FILE}.${stamp}`)
       const token = JSON.stringify({
         warnedAt: Date.now(),
         pid: process.pid,
@@ -528,7 +559,7 @@ function createApp ({
 
     _cleanupStaleRe2WarnMarkers () {
       try {
-        const cacheDir = MessageStore.cacheDir
+        const cacheDir = this._cacheDir()
         const prefix = RE2_WARN_STATE_FILE + '.'
         const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // 保留 7 天
         // APP-05：cutoff 与标记名必须同用上海日界。标记名来自 _localStamp()（已是上海），
@@ -726,7 +757,7 @@ function createApp ({
     async _updateReport (summary) {
       try {
         if (!this._enabledFlag(Config.report)) return
-        const statePath = path.join(MessageStore.cacheDir, 'report.state')
+        const statePath = path.join(this._cacheDir(), 'report.state')
         const state = this._loadReportState(statePath)
         if (!state) return
         const today = this._reportToday()
@@ -898,7 +929,7 @@ function createApp ({
       const pendingAlerts = []
       try {
         if (!this._enabledFlag(Config.channelHealth)) return
-        statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
+        statePath = path.join(this._cacheDir(), 'channel-health.state')
         lockPath = statePath + '.lock'
         lockFd = this._tryAcquireChannelHealthLock(lockPath)
         if (lockFd < 0) {
@@ -1010,6 +1041,13 @@ function createApp ({
           if (alert.type === 'recovered') this._clearChannelRecoverPending(statePath, alert.channel, alert.claim)
         } catch (e) {
           // 健康告警失败不得影响主推送、缓存或下一次重试。
+          // C1-022：发送失败此前完全无痕——既不写 run.log 也不打印，于是「通道连续失败」与「连告警都发不出去」
+          // 在日志上长得一样，排障只能靠猜。两处都留（stdout 供青龙任务日志，run.log 供事后回溯）。
+          const reason = Utils.safeErrorText(e, '未知错误').replace(/[\r\n]+/g, ' ').slice(0, 200)
+          const alertLabel = alert.type === 'recovered' ? '恢复' : '异常'
+          const failureText = `通道健康${alertLabel}告警发送失败（${alert.channel}）：${reason}`
+          console.warn(`⚠️ ${failureText}`)
+          try { this._writeRunLog(`${this._localStamp()} WARN ${failureText}\n`) } catch (logError) { /* 留痕失败静默 */ }
           // FX3：恢复通知发送失败须释放本次认领（保留 pending），否则下一轮会被自己的租约挡到
           // 租约到期才重发——APP2-02「不丢」的即时重试语义会被破坏。
           if (alert.type === 'recovered') this._releaseChannelRecoverClaim(statePath, alert.channel, alert.claim)
@@ -1096,11 +1134,11 @@ function createApp ({
           .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result })
           .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup })
         const prewarmCount = (() => {
-          const pl = Utils.num(Config.push.parallelLimit, 10)
+          // C1-026：预热发生在拿到数据之前，条目数未知——把单轮上限 maxPerRun 作为「消息总数」输入，
+          // 走与并行 worker 同一个 resolveParallelWindow（不再单独夹到 10，连接数才真的与并发窗口一致）。
           const maxPerRun = Utils.num(Config.push.maxPerRun, 100)
-          const window = pl > 0 ? Math.min(Math.floor(pl), 10) : 10
           const batch = Number.isInteger(maxPerRun) && maxPerRun > 0 ? maxPerRun : 100
-          return Math.max(1, Math.min(window, batch))
+          return resolveParallelWindow(Config.push.parallelLimit, batch)
         })()
         // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
         const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
@@ -1119,6 +1157,8 @@ function createApp ({
       warmupPromise.catch(() => {})
       try {
         MessageStore.init()
+        // CR-03：不在此处缓存 cacheDir——init 只保证「此刻」目录可用，后续每行日志/状态文件都要
+        // 重新过 getter 的 lstat+realpath 校验（运行期目录被替换成外部符号链接时必须当场失败）。
         checkpoint('cache-init')
         if (!dryRun) await this._warnMissingRe2()
         this._warnLowDisk()
@@ -1130,7 +1170,7 @@ function createApp ({
         // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
         // 优先沿用进程内 last-known-good，本进程从未读到合法文件才回代码默认。
         const active = FilterStore.loadFilterRules({
-          cacheDir: MessageStore.cacheDir,
+          cacheDir: this._cacheDir(),
           defaults: Config.filter,
           keyword: Config.keyword,
           // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
@@ -1203,7 +1243,7 @@ function createApp ({
         const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
         // 生效快照：证明「本轮实际用的是哪一版规则」，供控制台显示「已生效 rN」。写失败只告警，绝不抛穿本轮推送。
         if (!FilterStore.writeAppliedSnapshot({
-          cacheDir: MessageStore.cacheDir,
+          cacheDir: this._cacheDir(),
           filter: active.filter,
           keyword: active.keyword,
           revision: active.revision,
@@ -1239,7 +1279,7 @@ function createApp ({
         // 覆盖文件损坏（active.degraded）时**整段跳过**：不清 _f、不推进 filter.hash——
         // 降级不能放宽规则，也就不能触发「之前被过滤的条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
         if (!active.degraded) {
-          const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
+          const hashPath = path.join(this._cacheDir(), 'filter.hash')
           let lastFile = ''
           let lastHash = ''
           let filterStateReady = true
@@ -1278,7 +1318,13 @@ function createApp ({
           // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
           // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
           if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
-            this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)
+          // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
+          // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
+          // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
+            if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
+              console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
+              this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
+            }
           }
         }
         const newMessages = []
@@ -1438,13 +1484,21 @@ function createApp ({
           } else {
             let kwRe = null
             if (RuleEngine.hasNestedQuantifier(kw)) {
-              console.warn('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
+              console.warn('⚠️ 配置「zkt_gjc」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），已忽略只看它过滤')
             } else {
+            // C1-023：编译闸门本身不抛错（内部 catch 后返回 null），失败原因经 onError 回传；旧实现用一个
+            // 空 catch 包住调用，既拿不到唯一失败原因，告警又只剩「无效或环境不支持」——
+            // 「正则写错」与「没装 re2」这两种完全不同的处置在日志里无法区分。
+              let kwReError = null
               try {
-                kwRe = compileUserRegex(kw, 'i')
+                kwRe = compileUserRegex(kw, 'i', (e) => { kwReError = e })
               } catch (e) {
+                kwReError = e // 闸门自身异常（契约外）：同样作为告警原因，不静默吞掉
               }
-              if (!kwRe) console.warn('⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式，已忽略只看它过滤')
+              if (!kwRe) {
+                const reason = Utils.safeErrorText(kwReError, '原因未知').replace(/[\r\n]+/g, ' ').slice(0, 200)
+                console.warn(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式（${reason}），已忽略只看它过滤`)
+              }
             }
             if (kwRe) {
             // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
@@ -1653,14 +1707,8 @@ function createApp ({
         }
         if (Config.push && Config.push.mode === 'parallel') {
         // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
-        // parallelLimit 防御：小数取整（0.5 取 0 后回退 1）、0/负数回退全量、空 items 兜底 1。
-          const MAX_PARALLEL_WORKERS = 50 // 并行推送硬性上限：防超大 parallelLimit/大批量瞬时拉起海量 worker
-          const limit = (() => {
-            const pl = Utils.num(Config.push.parallelLimit, 0)
-            // 有效正数取整；0/负数/非法回退全量 items；二者均受硬性上限约束，空 items 兜底 1
-            const base = pl > 0 ? Math.floor(pl) : items.length
-            return Math.min(base, MAX_PARALLEL_WORKERS)
-          })() || 1
+        // parallelLimit 防御：夹取口径只在 resolveParallelWindow（取整（0.5 取 0 后回退 1）、0/负数按消息总数、硬性上限 50）。
+          const limit = resolveParallelWindow(Config.push.parallelLimit, items.length)
           const pushInterval = Utils.num(Config.timing.pushInterval, 0)
           const results = new Array(items.length)
           let nextIndex = 0
@@ -1682,7 +1730,9 @@ function createApp ({
           for (const r of results) {
             if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
           }
-          successCount = results.filter(r => r && r.ok && !r.preview).length
+          // C1-024：preview 分支返回 { ok:false, preview:true }，故 `r.ok && !r.preview` 里的 !r.preview
+          // 恒真——成功只认 r.ok（与顺序分支 `if (r.ok)` 同口径），预览不伪造成功也不计失败。
+          successCount = results.filter(r => r && r.ok).length
         } else {
         // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
           const pushInterval = Utils.num(Config.timing.pushInterval, 0)
@@ -1710,20 +1760,24 @@ function createApp ({
           }
           if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
           if (result.failure) {
-            // APP2-03：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。投递层
-            // 只在「全部通道失败」时抛错（xbk_sendNotify_slim.js:1573 `okCount === 0`），此时
-            // successfulChannels 恒为空数组——该分支不可达。
-            // 返工结论（R1a）：① 删除该分支写不出可证伪断言（删死代码无行为差异）；
-            // ② 唯一可证伪的出路是让 summarizeError 透出 successfulChannels，但那要改
-            //    xbk_failure_policy.js（不在本代理白名单）；③ 更要紧的是它**不该**透出：
-            //    channelSuccessful/成功缓存已由上方 `sent.successfulChannels` 覆盖，而在
-            //    `okCount === 0` 的抛错路径上该数组恒空，透出只会把「全部失败」记录成
-            //    「部分成功」并污染 _updateChannelHealth 的通道健康统计。
-            // 故保留死分支 + 契约注释，不按清单建议①改（理由见 .local/reports/fix-r1a-REPORT.md）。
-            if (Array.isArray(result.failure.successfulChannels)) {
-              for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
+            // APP2-03 / C1-015：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。
+            // 「全部通道失败」在投递层是**抛错**（xbk_sendNotify_slim.js 的 `okCount === 0` ⇒
+            // ALL_CHANNELS_FAILED，错误对象挂 failures=[逐通道失败]），所以这时 sent 恒不存在，
+            // 下面这段 failure.failures 是这类失败**唯一**能进 _updateChannelHealth 通道健康统计的
+            // 入口（sent.failures 那条路走不到）。旧注释称整段「分支不可达」并据此保留了一段
+            // 死分支——按那个论证删代码会把这条在跑的路一起删掉，健康统计从此静默漏记整轮全通道失败。
+            // 真正不可达的只有 successfulChannels 半边：summarizeError 只透出 code/name/statusCode/
+            // providerCode/channel/message/failureKind/failures（不拷贝 successfulChannels），且
+            // okCount===0 路径上该数组恒为空；即便日后透出也**不该**记成功（会把「全部失败」记成
+            // 「部分成功」并污染健康统计）⇒ 该半边已删除，不再保留会被误读为可删死代码的形态。
+            const failedChannels = result.failure.failures
+            if (Array.isArray(failedChannels)) {
+              channelFailures.push(...failedChannels)
+            } else if (result.failure.code === 'ALL_CHANNELS_FAILED') {
+            // 聚合失败的载荷就是 error.failures，摘要里缺失说明摘要链路被改坏：此时健康统计会静默
+            // 漏掉整轮失败（不报警、不累计），必须响亮而不是当作「没有失败通道」吞掉。
+              console.warn('⚠️ 全通道失败的摘要缺少 failures 明细（摘要链路异常），本轮通道健康统计将漏记这些通道')
             }
-            if (Array.isArray(result.failure.failures)) channelFailures.push(...result.failure.failures)
           }
         }
         for (const result of pushResults) recordChannelOutcome(result)

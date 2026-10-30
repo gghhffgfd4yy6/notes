@@ -296,18 +296,18 @@ function validateFilterRules (input, deps) {
   }
   if (errors.length) return { ok: false, errors }
 
-  // ---------- 闸门 3：嵌套量词（ReDoS）+ RE2 可用性 + 正则语法 ----------
+  // ---------- 闸门 3：灾难性回溯结构（ReDoS；错误码仍为 nested_quantifier，勿改）+ RE2 可用性 + 正则语法 ----------
   for (const rule of ruleLines) {
     if (rule.cat && engine.hasNestedQuantifier(rule.cat)) {
-      addError(errors, rule.field, 'nested_quantifier', `分类正则含嵌套量词：「${rule.cat}」`)
+      addError(errors, rule.field, 'nested_quantifier', `分类正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+）：「${rule.cat}」`)
     }
     if (engine.hasNestedQuantifier(rule.val)) {
-      addError(errors, rule.field, 'nested_quantifier', `正则含嵌套量词：「${rule.val}」`)
+      addError(errors, rule.field, 'nested_quantifier', `正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+）：「${rule.val}」`)
     }
   }
   for (const rule of simpleRules) {
     if (engine.hasNestedQuantifier(rule.val)) {
-      addError(errors, rule.field, 'nested_quantifier', `正则含嵌套量词：「${rule.val}」`)
+      addError(errors, rule.field, 'nested_quantifier', `正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+）：「${rule.val}」`)
     }
   }
   if (errors.length) return { ok: false, errors }
@@ -501,6 +501,10 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
+  // 两道「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
+  // + 读后复检 inode，末级是链接直接判 unsafe），收紧走 enforceOwnerOnlyMode（O_NOFOLLOW 打开、
+  // 对比 lstat 的 dev/ino、只在已校验的 fd 上 fchmod 并按同一 fd 复检）——任一处被换成链接都不会读到、
+  // 更不会 chmod 到链接目标。
   const read = readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES)
   if (read.status === 'missing') {
     // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废。

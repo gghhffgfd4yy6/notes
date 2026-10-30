@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.386.0",
+  "version": "3.387.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -55,7 +55,7 @@
     "qrcode-generator": "2.0.4"
   },
   "engines": {
-    "node": ">=22.22.2"
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
   "keywords": [
     "推送",

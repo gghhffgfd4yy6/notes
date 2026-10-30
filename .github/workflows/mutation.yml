@@ -129,13 +129,16 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: 安装依赖
+      # C10-048：--ignore-scripts 只跳过**所有依赖**的安装脚本；re2 自己的 install 脚本由下一步用
+      # `npm rebuild re2` 限定到这一个包恢复（手工调 install-from-cache.js 会丢掉脚本里的 node-gyp 回退）。
+      - name: 安装依赖（跳过全部依赖的安装脚本）
         run: npm ci --ignore-scripts
 
-      # Node 24/Linux x64 的 re2 二进制供全部 mutation 矩阵任务复用；下载失败时自动回退源码构建。
-      - name: 安装并验证 re2 原生模块
+      # Node 24/Linux x64 的 re2 二进制供全部 mutation 矩阵任务复用；下载失败时由 re2 自己的 install 脚本
+      # 回退源码构建（这正是必须走 npm rebuild 而不是直调 bin 的原因，见 test.yml quality job 的注释）。
+      - name: 安装并验证 re2 原生模块（只重建 re2）
         run: |
-          (cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node --host-var RE2_DOWNLOAD_MIRROR --skip-path-var RE2_DOWNLOAD_SKIP_PATH --skip-ver-var RE2_DOWNLOAD_SKIP_VER --force-build-var RE2_DOWNLOAD_FORCE_BUILD)
+          npm rebuild re2 --foreground-scripts --ignore-scripts=false
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
       - name: 上传 re2 原生模块
@@ -310,10 +313,10 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 6986 行（b3 C2-002/C2-004 +41 行后同步；定位重构 +3 行起；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7778 体，变异评估
+          # console.js 6995 行（CR-05 导入回滚 +13 行后同步；历史上 W1-C2-023 删死代码 formatMs 净 -4 行、b3 C2-002/C2-004 +41 行、定位重构 +3 行都需同步；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7778 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
           # ⇒ 整段 ≈ 1660min、远超 step 330min 上限。按上限倒推取 12 片（末片 849 行实测 >330min 被杀，再对半：
-          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-6986，末四片约 400 / 600 / 700 / 486 行
+          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-6982，末四片约 400 / 600 / 700 / 482 行
           # ≈100-200min（700 行 × 1.12 体/行 × 13.3s 估 ≈174min，仍低于 330min；v3.374 合 SSE + 信任设备后按 700 行硬上限新开 part12）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           # `timeout_ms: 60000`（仅这 12 段）：单次变异体运行的等待上限从配置文件的 300000ms 降到 60000ms。
@@ -377,7 +380,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part12
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6501-6986"
+            mutate: "scripts/console.js:6501-6995"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:
@@ -590,6 +593,11 @@ jobs:
         run: npx stryker run ${{ matrix.config }} --mutate "${{ matrix.mutate }}" --incremental --incrementalFile reports/inc-${{ matrix.name }}.json --concurrency 8 --fileLogLevel info --timeoutMS ${{ matrix.timeout_ms || 300000 }}
         env:
           PERF_MS: 3000   # 宽松性能阈值（插桩开销）
+          # C10-010：显式声明「本 step 不跳过任何套件」。真正的强制在 stryker.tap.config.js 加载期
+          # （清空 process.env.SKIP_SUITES，tap-runner 逐文件 spawn 时按 {...process.env} 继承）；
+          # 这里再置空是**声明层**的纵深防御：step 级 env 覆盖 job/workflow 级继承值，读者不必翻配置
+          # 文件就知道本 step 不允许跳过（test_ci_skip_suites.js 锁定本行的存在与取值）。
+          SKIP_SUITES: ''
           # TAP 档下由 tap-runner 逐文件 spawn 测试进程、**不再**由 commandRunner 反复 spawn
           # run_unit_tests.js（storage 段仍走 command 档，行为与旧一致）；两种档位 spawn 出的进程都继承本
           # step 环境。不设此变量时，被 spawn 的 run_unit_tests.js（如 test_run_mutation_cli.js 间接触发）

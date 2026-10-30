@@ -7,7 +7,25 @@
 // （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
 // `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块只 require
 // 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
-const { timingSafeEqualStr } = require('./xbk_utils')
+const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
+
+// 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
+//   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
+// TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
+// 的条数（默认 10000 > 旧固定上限 5000：接口不能继续上报一个生产根本不执行的值）；
+// droppedCount 是本次**实际**落墓碑的身份数上界——saveBatch 没有入参上限（maxSize=10000 时一批
+// 20001 条会丢 10001 条，字节上限还会再补刀），只按 maxSize sizing 会让 _trimTombstoneMaps 把
+// 刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
+// 控制台 /api/cache-health 的上报值（limits.tombstoneKeyMax）也调本函数推导，保证「报出的上限」
+// 与「生产真正强制的上限」是同一份规则，不出现两处各写一份常量。
+// floorKeys 仅供实例注入的 constants 覆盖（测试用小常量），生产缺省即 xbk_utils 的常量本尊。
+function tombstoneKeyCap (maxSize, droppedCount = 0, floorKeys = TOMBSTONE_MAX_KEYS) {
+  let cap = Number.isInteger(floorKeys) && floorKeys > 0 ? floorKeys : TOMBSTONE_MAX_KEYS
+  if (Number.isInteger(maxSize) && maxSize > cap) cap = maxSize
+  if (Number.isInteger(droppedCount) && droppedCount > cap) cap = droppedCount
+  return cap
+}
+
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   const candidate = path.resolve(root, raw)
   const realInsideRoot = (p) => {
@@ -32,6 +50,10 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   const safeFallback = path.resolve(root, fallback)
   if (realInsideRoot(safeFallback)) return safeFallback
   // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
+  // C3-014：下面两个兜底目录名与 .gitignore 的 `.xbk_cache_safe*` 一一对应——它们是**生产**兜底
+  // 写入目标（默认目录被占位/被换成根外符号链接时 cacheDir 就落在这里），改名必须同步改 .gitignore，
+  // 否则兜底目录里的 push.json / run.log / filter.hash 会以未跟踪文件出现在 git status 里（有被误提交
+  // 的风险，也会让 pre-push 的「工作树干净」快路径失效）。
   const emergencyFallback = path.join(root, '.xbk_cache_safe')
   // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
   if (realInsideRoot(emergencyFallback)) return emergencyFallback
@@ -43,6 +65,36 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
   // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
   throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
+}
+
+// C3-016：getFilePath 的两个纯工具。它们原先**定义在 getFilePath 函数体内**，而 has/save/saveBatch
+// 每个判重入口都要经过 getFilePath ⇒ 每次调用都重建两个闭包（纯分配开销，且与 this 无关）。
+// 上提到模块级后每次调用零闭包分配；截断语义（二分 + 末位高代理退一格）与「≤200 字节」不变量
+// 逐字未变，由 test_message_store_utils / test_filter 的 getFilePath 用例继续锁定。
+// 按 UTF-8 字节截断且不切半代理对：返回不超过 maxBytes 的最长前缀，且末尾不会残留孤代理。
+// 多字节字符不能按字符索引截断，故二分。
+function truncateUtf8ByBytes (s, maxBytes) {
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s
+  let lo = 0
+  let hi = s.length
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (Buffer.byteLength(s.slice(0, mid), 'utf8') <= maxBytes) lo = mid
+    else hi = mid - 1
+  }
+  // 末位若是高位代理，说明切在代理对中间，回退一格丢弃半个码点（不留孤代理）
+  if (lo > 0) {
+    const cu = s.charCodeAt(lo - 1)
+    if (cu >= 0xd800 && cu <= 0xdbff) lo -= 1
+  }
+  return s.slice(0, lo)
+}
+
+// 取首个完整码点：截断结果为空时兜底，避免产出空文件名与孤代理（原 keepOne 的 `s || 全名首码点`）。
+// 空串返回空串（与 `codePointAt(0) === undefined` 的原判据同结果）。
+function firstCodePoint (s) {
+  const f = s.codePointAt(0)
+  return f === undefined ? '' : s.slice(0, f > 0xffff ? 2 : 1)
 }
 
 // F-02 残留闭合（R6）：稳态未命中路径的**有界**自愈抽查（实现见 MessageStore._probeIndexMiss）。
@@ -60,7 +112,7 @@ const IDENTITY_INDEX_IDENTITY_PROBE_WINDOW = 2
 // 数组都落在这里），代价上界 8 个位置；更大的数组才退回固定窗口（代价与 n 无关，有界自愈）。
 const IDENTITY_INDEX_PROBE_FULL_MAX = 8
 
-// 💾 MessageStore — 缓存管理层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
+// 💾 MessageStore — 缓存管理层（由 xbk_function_v3.js 的组合根 createMessageStore 注入，生产每轮读写缓存都走它）
 // 依赖全部由组合根注入；不反向 require 主入口，不复制共享单例。
 function createMessageStore ({
   Config,
@@ -136,8 +188,9 @@ function createMessageStore ({
     // 数组被 GC 回收时索引随之自动释放，无需手动失效。
     _identityIndex: new WeakMap(),
     // 判重身份墓碑（按缓存文件路径）：字节/条数裁剪丢弃记录的紧凑身份键（Map 保插入序，
-    // 超 TOMBSTONE_MAX_KEYS 丢最旧）。主判重闸门与 has/save/saveBatch 统一并入查询，
-    // 防上游重放被裁记录时重复推送；过滤未推（_f）记录不落墓碑，规则改宽后仍可重新评估。
+    // 超当次上限——max(TOMBSTONE_MAX_KEYS, maxSize)，C6-006——丢最旧）。主判重闸门与
+    // has/save/saveBatch 统一并入查询，防上游重放被裁记录时重复推送；过滤未推（_f）记录不落墓碑，
+    // 规则改宽后仍可重新评估。
     // P3（审查 2026-09-15）键上限口径：下方 _tombstones/_tombstoneLoaded/_readFailed/_verified
     // 均以「缓存文件路径」为键，条目数由 pushUrl 集合规模决定（单实例部署下规模稳定，磁盘缓存
     // 为权威且可重建），与 _MEMO_MAX 覆盖的内存快照数组不是同一维度，故当前不加 LRU/键上限；
@@ -147,6 +200,8 @@ function createMessageStore ({
     // 墓碑最近一次读盘结果（按缓存文件路径）：仅用于区分「确认缺失」与「读取失败」，
     // 决定 _tombstoneLoaded 是否置位（missing/ok 置位，其余保留重试窗口）。
     _tombstoneLoadStatus: {},
+    // C3-013：已就「判重主存重建为空但墓碑仍在」告警过的文件（每进程每文件一次，防刷屏）。
+    _residualTombstoneWarned: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
     _MEMO_MAX: 100,
     // 磁盘读取失败标记（按缓存文件路径记录）：ioError/unsafe/replaced 读取失败时置位，
@@ -472,29 +527,10 @@ function createMessageStore ({
       // v3.176：非信息文件名（对象/布尔 String 化产物）回退 default.json——与 getFileName 口径一致
       // （曾产生 xianbaoku_cache/[object Object] 垃圾文件：test_filter 参数颠倒 + 此处无防御）
       if (!safe || safe === '.' || safe === '..' || safe === '[object Object]' || safe === 'undefined' || safe === 'null' || safe === 'true' || safe === 'false') safe = 'default.json'
-      // 按 UTF-8 字节截断且不切半代理对：返回不超过 maxBytes 的最长前缀，且末尾
-      // 不会残留孤代理（避免输出乱码）。多字节字符不能按字符索引截断，故二分。
-      const truncateByBytes = (s, maxBytes) => {
-        if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s
-        let lo = 0
-        let hi = s.length
-        while (lo < hi) {
-          const mid = (lo + hi + 1) >> 1
-          if (Buffer.byteLength(s.slice(0, mid), 'utf8') <= maxBytes) lo = mid
-          else hi = mid - 1
-        }
-        // 末位若是高位代理，说明切在代理对中间，回退一格丢弃半个码点（不留孤代理）
-        if (lo > 0) {
-          const cu = s.charCodeAt(lo - 1)
-          if (cu >= 0xd800 && cu <= 0xdbff) lo -= 1
-        }
-        return s.slice(0, lo)
-      }
-      // 截断结果为空时保留首个完整码点（避免空名与孤代理）
-      const keepOne = (s) => s || (() => {
-        const f = safe.codePointAt(0)
-        return safe.slice(0, f > 0xffff ? 2 : 1)
-      })()
+      // C3-016：字节截断与「保留首个完整码点」两个工具此前**定义在 getFilePath 函数体内**——
+      // has/save/saveBatch 每个判重入口都要经过 getFilePath，长名场景下每次调用都重建两个闭包
+      // （纯分配开销、无状态）。二者与 this 无关，已上提到模块级 truncateUtf8ByBytes /
+      // firstCodePoint；截断语义逐字未变（二分 + 末位高代理退一格）。
       // 文件名超长截断：先尝试保留扩展名，保证总字节 <= 200。
       // F7 回归（R4/V6）：单纯截断会让「仅第 200 字节之后不同」的两个长名映射到同一路径——
       // 生产 cacheName 直接来自 getFileName(pushUrl)，两个不同 pushUrl 的判重缓存会互相覆盖。
@@ -508,13 +544,14 @@ function createMessageStore ({
         let maxBase = 200 - Buffer.byteLength(suffix, 'utf8')
         if (maxBase < 1) { suffix = `-${digest}`; maxBase = 200 - Buffer.byteLength(suffix, 'utf8') } // 扩展名本身超长：放弃保留
         if (maxBase < 1) { suffix = ''; maxBase = 200 } // 摘要超长（不可能发生）：退回纯截断
-        const base = truncateByBytes(dot > 0 ? safe.slice(0, dot) : safe, maxBase)
-        safe = keepOne(base) + suffix
+        const base = truncateUtf8ByBytes(dot > 0 ? safe.slice(0, dot) : safe, maxBase)
+        // 截断结果为空时保留首个完整码点（避免空名与孤代理）——取的是**全名**首码点（原 keepOne 口径）
+        safe = (base || firstCodePoint(safe)) + suffix
       }
       // 兜底校验：截断后仍可能超 200 字节（如扩展名超长且首字符为多字节、Math.max(1) 强保
       // 字符时），放弃扩展名整体再按字节截断，保证不变量成立。
       if (Buffer.byteLength(safe, 'utf8') > 200) {
-        safe = keepOne(truncateByBytes(safe, 200))
+        safe = truncateUtf8ByBytes(safe, 200) || firstCodePoint(safe)
       }
       return path.join(this.cacheDir, safe)
     },
@@ -529,12 +566,43 @@ function createMessageStore ({
       try {
       // v3.263（CodeAnt）：初始化用独占创建替代 writeAtomic——tmp+rename 会无条件替换目标文件，
       // 检查与写入之间另一进程若已创建有效缓存会被覆盖成 [] 丢失判重记录；wx 语义并发创建不覆盖。
-        if (!fs.existsSync(filePath)) return writeAtomicIfAbsent(filePath, '[]', '缓存初始化')
+        if (!fs.existsSync(filePath)) {
+          const created = writeAtomicIfAbsent(filePath, '[]', '缓存初始化')
+          // C3-013：判重主存刚被重建为空，但同目录的 <file>.seen.json（墓碑）可能还在——
+          // 墓碑里的身份会继续把上游重放判成「已推送」，旧行为对此**全程无提示**。
+          if (created) this._warnResidualTombstones(filePath)
+          return created
+        }
         return true
       } catch (e) {
         console.error(`缓存初始化失败 ${filePath}:`, e.message)
         return false
       }
+    },
+
+    /** C3-013：判重主存被重建为 [] 时的「残留墓碑」显形（每进程每文件一次）。
+   *  判重由两个文件共同构成：`<cache>`（已推送记录）+ `<cache>.seen.json`（裁剪/淘汰掉的身份墓碑）。
+   *  只删主存不清墓碑时，墓碑身份会继续拦下上游重放且没有任何日志——用户以为「清空判重后全量重推」，
+   *  实际静静少推一批。这里点名残留身份数、影响与彻底清理办法；**不改变判重语义**（仍按墓碑拦重放，
+   *  方向是「少推」而不是重复推送），也不代删文件（判重数据绝不自动销毁）。
+   *  读不到/坏文件直接返回：_readTombstoneData 对 ioError/unsafe/tooLarge 已有各自告警，不重复刷屏。 */
+    _warnResidualTombstones (filePath) {
+      if (this._residualTombstoneWarned.has(filePath)) return
+      this._residualTombstoneWarned.add(filePath)
+      let count = 0
+      try {
+        const read = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
+        if (read.status !== 'ok' || !read.text) return
+        const data = JSON.parse(read.text)
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return
+        for (const k of ['id', 'urlOnly', 'idWithUrl', 'anon']) {
+          if (Array.isArray(data[k])) count += data[k].length
+        }
+      } catch (e) {
+        return
+      }
+      if (count <= 0) return
+      console.warn(`⚠️ 判重主存已按空缓存重建（原文件缺失）：${filePath}——同目录的 ${filePath}.seen.json 仍有 ${count} 个墓碑身份，这些身份会继续拦下上游重放且不再提示；如需彻底清空判重，请停实例后同时删除该缓存文件与同名 .seen.json 两个文件（先备份目录）`)
     },
 
     readMessages (filePath) {
@@ -689,6 +757,14 @@ function createMessageStore ({
     _resolveMaxSize () {
       const v = Utils.num(Config.cache.maxSize, -1)
       return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE
+    },
+
+    /** 墓碑每类键数上限（C6-006）：必须 ≥ 同一次裁剪可能丢弃的身份数，否则「满缓存裁剪」后
+     *  最旧的一半身份当场失去防重放保护（缓存上限默认 10000 条 > 旧固定上限 5000 键）。
+     *  规则只有一份实现：模块级 tombstoneKeyCap（控制台 /api/cache-health 也用它上报），
+     *  这里只把实例注入的 constants.TOMBSTONE_MAX_KEYS 当下限传进去。 */
+    _tombstoneKeyCap (maxSize, droppedCount = 0) {
+      return tombstoneKeyCap(maxSize, droppedCount, TOMBSTONE_MAX_KEYS)
     },
 
     // ===== F1（P1）：坏/超限缓存的「隔离 + 重建」自愈 =====
@@ -850,14 +926,16 @@ function createMessageStore ({
         console.error(`缓存尾部恢复：单条即超过读端上限，无法自动恢复（保持写闸门）${filePath}`)
         return null
       }
-      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped)
+      // CR-02：容量按**本次实际丢弃的全量** sizing——尾部恢复的 dropped 同时含条数裁剪与字节
+      // 上限淘汰的条目，总数可超过 maxSize（条数无入参上限，字节裁剪还会再补刀）。
+      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped, this._tombstoneKeyCap(maxSize, dropped.length))
     },
 
     /** 把不可读缓存改名隔离（绝不 unlink）后，在原路径原子重建（解析失败/非普通文件为空缓存，
      *  超限为尾部恢复集）并解除写闸门。返回重建后的消息数组（已同步内存快照与「已验证」标记，
      *  后续 save/saveBatch 因此放行）；隔离改名或重建写盘失败时返回 null —— 保持写闸门
      *  （fail-closed），此时人工作业仍是最后手段。 */
-    _isolateAndRebuild (filePath, messages, text, label, dropped = []) {
+    _isolateAndRebuild (filePath, messages, text, label, dropped = [], maxKeys = TOMBSTONE_MAX_KEYS) {
     // 已知残余竞态（返工 R1 登记，不修）：三条判据的「复核 → rename」之间、以及「rename 成功 →
     // 重建 writeAtomic」之间仍有微秒级窗口。前一窗口若被并发写入抢先，会把对方刚写的有效缓存搬进
     // .bak（复核已把它从「读窗口内的必然命中」缩到「复核与 rename 之间的极小概率」）；后一窗口若被
@@ -886,8 +964,9 @@ function createMessageStore ({
       this._memoSet(filePath, messages)
       try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       // 落墓碑放在写盘成功之后：与 saveMessages 同口径——未真正落盘就登记会把仍在磁盘上的身份
-      // 误判成「已推送」而漏推。
-      if (dropped.length > 0) this._tombstoneDropped(filePath, dropped)
+      // 误判成「已推送」而漏推。maxKeys 由调用方按「本次实际丢弃条数」给出（C6-006 / CR-02：
+      // 容量须覆盖本次裁剪量，不能只按 maxSize）。
+      if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, maxKeys)
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
       console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除）${filePath} → ${backupPath}；` +
@@ -982,7 +1061,10 @@ function createMessageStore ({
       // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
       try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
       // 缓存写盘成功：被裁剪记录才真正退出磁盘缓存，此时落墓碑防重放（防重复推送）
-      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll)
+      // C6-006 / CR-02：墓碑键数上限按**本次实际丢弃的全量** sizing（条数裁剪 + 字节上限裁剪）——
+      // saveBatch 没有入参上限，maxSize=10000 时一批 20001 条会丢 10001 条，只按 maxSize 给容量
+      // 就会让 _trimTombstoneMaps 把刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
+      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
       return true
     },
 
@@ -1225,14 +1307,14 @@ function createMessageStore ({
    *  规则变更失效后须能重新评估/推送。与 _buildIdentityIndex 四集合同构：
    *  id 记录记 idKey（+url 入 idWithUrl）、url 记录记 urlOnly、anon 记 anonKey。
    *  写前强制重读磁盘合并其他进程已写入的身份（配合跨进程锁，消除覆盖竞态）。 */
-    _tombstoneDropped (filePath, dropped) {
+    _tombstoneDropped (filePath, dropped, maxKeys = TOMBSTONE_MAX_KEYS) {
     // 拿锁成功：串行读-改-写；拿锁失败（IO 错误/锁忙）：放弃本次墓碑写入——
     // 无锁读-改-写仍可能覆盖并发进程已写入的身份（CodeAnt Round3 Major），
     // 放弃的代价仅是本次裁剪身份在重放时可能重复推送（与墓碑机制引入前行为一致）。
     // P3（审查 2026-09-15）：_withTombstoneLock 仅在「清理哨兵/墓碑锁未拿到」时返回 false
     // （成功路径返回 _recordTombstoneDrops 的 undefined），补一条诊断让失败可观测；
     // 失败语义不变（仍放弃本次墓碑写入，不重试、不阻塞主流程）。
-      const locked = this._withTombstoneLock(filePath, (lockPath, token) => this._recordTombstoneDrops(filePath, dropped, lockPath, token))
+      const locked = this._withTombstoneLock(filePath, (lockPath, token) => this._recordTombstoneDrops(filePath, dropped, lockPath, token, maxKeys))
       if (locked === false) console.warn(`墓碑写入未获锁，本次裁剪身份未落墓碑（重放时可能重复推送）：${filePath}`)
     },
 
@@ -1241,7 +1323,7 @@ function createMessageStore ({
    *  在临时副本上完成合并/淘汰，仅当 owner 校验通过且 .seen.json 原子写成功后才
    *  提交到内存缓存——锁被抢占或写盘失败时当前内存状态保持与磁盘一致（CodeAnt Round6）。
    *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后须能重新评估/推送。 */
-    _recordTombstoneDrops (filePath, dropped, lockPath, token) {
+    _recordTombstoneDrops (filePath, dropped, lockPath, token, maxKeys = TOMBSTONE_MAX_KEYS) {
     // 写盘前（进入读-改-写前）先确认锁仍归当前进程：被抢占/替换后立即放弃，
     // 不重读不合并不修改内存墓碑（CodeAnt Round5 Major：避免覆盖抢占者已写入的身份）
       if (!this._isTombstoneLockOwner(lockPath, token)) return
@@ -1253,7 +1335,7 @@ function createMessageStore ({
         changed = this._applyTombstoneIdentity(next, Utils.getMessageIdentity(m)) || changed
       }
       if (!changed) return
-      this._trimTombstoneMaps(next)
+      this._trimTombstoneMaps(next, maxKeys)
       // 写盘瞬间再次确认锁仍归当前进程：读-改-写期间若被误判 stale 抢占/替换，
       // 静默放弃本次写入，避免基于旧快照的原子替换覆盖抢占者已合并的身份
       if (!this._isTombstoneLockOwner(lockPath, token)) return
@@ -1290,10 +1372,11 @@ function createMessageStore ({
       return false
     },
 
-    /** 四类墓碑 Map 超 TOMBSTONE_MAX_KEYS 时丢最旧键 */
-    _trimTombstoneMaps (ts) {
+    /** 四类墓碑 Map 超 maxKeys（默认 TOMBSTONE_MAX_KEYS 下限；生产按「本次实际丢弃条数」取
+     *  _tombstoneKeyCap，见 C6-006 / CR-02）时丢最旧键 */
+    _trimTombstoneMaps (ts, maxKeys = TOMBSTONE_MAX_KEYS) {
       for (const map of [ts.id, ts.urlOnly, ts.idWithUrl, ts.anon]) {
-        while (map.size > TOMBSTONE_MAX_KEYS) {
+        while (map.size > maxKeys) {
           const oldest = map.keys().next().value
           if (oldest === undefined) break
           map.delete(oldest)
@@ -1800,9 +1883,44 @@ function createMessageStore ({
   return MessageStore
 }
 
+// C3-013：判重历史由 `push.json` + `push.json.seen.json`（墓碑）两个文件共同构成。控制台「数据备份」
+// 导入时若备份不含判重历史，机器上残留的 .seen.json 描述的是**另一段历史**——它会把已被淘汰的身份继续
+// 判成「已推送」，使恢复后的主存「少了记录却不重推」且全程无提示。导入侧因此需要一个「清残留」动作：
+// 只删普通文件（符号链接/目录不是墓碑形态，绝不顺着链接删到别处）。fs 由调用方注入（与
+// resolveCacheDirInRoot 同口径，测试无需真实删盘即可驱动）。
+// 判重数据本身**绝不自动销毁**：是否调用、以及回滚备份，全部由调用方（控制台导入流程）决定。
+//
+// 返回三态（评审 CR-05：旧实现把「本来就不存在」与「删除失败」都折叠成 false，导入照旧报成功）：
+//   { status: 'removed' }                → 真的删掉了残留墓碑；
+//   { status: 'absent' }                 → 本来就没有残留（ENOENT；或路径不是普通文件——符号链接/目录
+//                                          不是墓碑形态，不能顺着删，语义上也没有可清的残留）；
+//   { status: 'failed', message }        → 是普通文件却删不掉（EACCES/EROFS/EBUSY…）。调用方**必须**
+//                                          中止并回滚导入：旧墓碑仍在，会把导入历史里缺失的身份继续判成
+//                                          「已推送」，此时报成功等于静默留下另一段判重历史。
+function removeStaleTombstoneFile (fs, seenPath) {
+  const describe = (e) => (e && (e.code || e.message)) || String(e)
+  let st = null
+  try {
+    st = fs.lstatSync(seenPath)
+  } catch (e) {
+    // 没有这个路径 = 本来就没有残留；其它（父目录读不了等）无法确认 ⇒ 按失败处理，不谎报清理成功
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'failed', message: describe(e) }
+  }
+  if (!st || !st.isFile()) return { status: 'absent' }
+  try {
+    fs.unlinkSync(seenPath)
+    return { status: 'removed' }
+  } catch (e) {
+    // 检查后被别的进程删掉：确实没有残留，不是失败
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'failed', message: describe(e) }
+  }
+}
+
 module.exports = {
   createMessageStore,
   resolveCacheDirInRoot,
+  removeStaleTombstoneFile,
+  tombstoneKeyCap,
   IDENTITY_INDEX_REF_PROBE_WINDOW,
   IDENTITY_INDEX_IDENTITY_PROBE_WINDOW
 }

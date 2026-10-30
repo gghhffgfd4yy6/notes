@@ -187,11 +187,18 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       const { matchedRule, ...rest } = detail
       return { stage, kind, configKey, rule: sourceOf(configKey, matchedRule), ...rest }
     }
-    const matchedRule = (compiled, value, catename) => {
-      if (!compiled || compiled._type !== 'multi') return null
-      let text
-      try { text = typeof value === 'string' ? value : String(value) } catch (e) { return null }
-      return RuleEngine._firstMatchingRule(compiled.rules, catename, rule => rule.val && rule.val.test(RuleEngine._normalizeReInput(text)))
+    /** 单遍「是否命中 + 首个命中规则」（C9-014）
+     *  此前 show 阶段先**无条件**用 matchedRule() 全量预跑一遍（命中与否都跑），命中后再用
+     *  matchesCompiled() 跑第二遍 → 每个字段白扫一次。这里合成一次扫描：multi 用
+     *  _firstMatchingRule 同时得出「是否命中」与「首个命中规则」；re 没有子规则，rule 恒为
+     *  null（sourceOf 会回落到配置原文，与重构前逐字一致）。
+     *  字段缺失（undefined/null/空串）与 matchesCompiled 同口径：不参与匹配、直接不命中
+     *  （空串即使规则是 .* 也不命中）。 */
+    const matchOnce = (compiled, value, catename) => {
+      if (!compiled || value === undefined || value === null || value === '') return { hit: false, rule: null }
+      if (compiled._type !== 'multi') return { hit: RuleEngine.matchesCompiled(compiled, value, catename), rule: null }
+      const rule = RuleEngine._firstMatchingRule(compiled.rules, catename, r => RuleEngine._safeTest(r.val, value))
+      return { hit: rule !== null, rule }
     }
     const timeMatchedRule = (compiled, group) => {
       if (!compiled || compiled._type !== 'timeMulti') return null
@@ -208,9 +215,9 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     }
 
     const category = Utils.safeGet(group, 'catename')
-    if (cfg.pingbifenlei && category !== undefined && category !== null && category !== '' &&
-      RuleEngine.matchesCompiled(cfg.pingbifenlei, category, category)) {
-      return blocked(reason('category', 'block', 'pingbifenlei', { matchedRule: matchedRule(cfg.pingbifenlei, category, category) }))
+    const categoryMatch = matchOnce(cfg.pingbifenlei, category, category)
+    if (categoryMatch.hit) {
+      return blocked(reason('category', 'block', 'pingbifenlei', { matchedRule: categoryMatch.rule }))
     }
 
     const stages = [
@@ -220,12 +227,11 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     ]
     const showFlags = {}
     for (const stage of stages) {
-      const value = stage.getVal(group)
-      const rule = matchedRule(cfg[stage.showKey], value, category)
-      if (cfg[stage.showKey] && value !== undefined && value !== null && value !== '' &&
-        RuleEngine.matchesCompiled(cfg[stage.showKey], value, category)) {
+      // C9-014：一次扫描同时得出「是否命中」与「首个命中规则」，不再预跑 + 复跑各一遍。
+      const show = matchOnce(cfg[stage.showKey], stage.getVal(group), category)
+      if (show.hit) {
         showFlags[stage.key] = true
-        passed.protections.push(reason(stage.label, 'show', stage.showKey, { matchedRule: rule }))
+        passed.protections.push(reason(stage.label, 'show', stage.showKey, { matchedRule: show.rule }))
       }
     }
 
@@ -239,14 +245,18 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
         }
         continue
       }
-      if (cfg[stage.blockKey] && !showFlags[stage.key] && RuleEngine.matchesCompiled(cfg[stage.blockKey], value, category)) {
-        return blocked(reason(stage.label, 'block', stage.blockKey, { matchedRule: matchedRule(cfg[stage.blockKey], value, category) }))
+      if (cfg[stage.blockKey] && !showFlags[stage.key]) {
+        const block = matchOnce(cfg[stage.blockKey], value, category)
+        if (block.hit) return blocked(reason(stage.label, 'block', stage.blockKey, { matchedRule: block.rule }))
       }
-      if (cfg[stage.plusKey] && RuleEngine.matchesCompiled(cfg[stage.plusKey], value, category)) {
-        // FILTER-05：不再改写 passed.protections/showFlags——blocked() 会把 protections/skipped
-        // 整表清空，紧随其后的 return 丢弃所有改写（原为不可达死代码）；「保护被 plus 抵消」
-        // 由 reason.kind === 'plus' 承载（测试锁定同字段抵消后 protections 为空）。
-        return blocked(reason(stage.label, 'plus', stage.plusKey, { matchedRule: matchedRule(cfg[stage.plusKey], value, category) }))
+      if (cfg[stage.plusKey]) {
+        const plus = matchOnce(cfg[stage.plusKey], value, category)
+        if (plus.hit) {
+          // FILTER-05：不再改写 passed.protections/showFlags——blocked() 会把 protections/skipped
+          // 整表清空，紧随其后的 return 丢弃所有改写（原为不可达死代码）；「保护被 plus 抵消」
+          // 由 reason.kind === 'plus' 承载（测试锁定同字段抵消后 protections 为空）。
+          return blocked(reason(stage.label, 'plus', stage.plusKey, { matchedRule: plus.rule }))
+        }
       }
       if (showFlags[stage.key] && cfg[stage.blockKey]) {
         passed.skipped.push(reason(stage.label, 'skipped', stage.blockKey, { because: `${stage.key}.show` }))
@@ -339,11 +349,10 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     // Utils.safeText 的「对象 JSON 化 / 函数置空」口径），输入仅由 _normalizeReInput 剥离零宽
     // 字符、不做任何长度截断（v3.270 起长文本完整匹配；安全性由 RE2 线性时间 + 上方关键词
     // hasNestedQuantifier 闸门保证，而非截断）。
-    // v3.249：超长 keyword 的 V8 会把正则编译推迟到首次 .test()，此时抛 "Regular expression too
-    // large"（new RegExp 不抛）——test 也需 try/catch，失败按放行处理（宁可多推不可少推）。
-    try {
-      return re.test(RuleEngine._normalizeReInput(typeof value === 'string' ? value : String(value)))
-    } catch (e) { return true }
+    // C9-008：与 matchesCompiled / _catMatches 共用 RuleEngine._safeTest 这一个出口——
+    // 超长正则的 .test 延迟编译异常、String(Symbol) 的隐式转换异常都由它兜住，不再各有各的
+    // try/catch。白名单方向传 onFail=true：异常 → 保留（宁可多推不可少推）。
+    return RuleEngine._safeTest(re, value, true)
   }
   }
   return FilterEngine

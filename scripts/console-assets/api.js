@@ -6,28 +6,86 @@ import { FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, BACKUP_BROWSER_MAX_BYTES, NO
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
 // 实体会让 JSON.parse 得到含 &amp; 的错误 token，Sourcery vwK）。
-// 解析后立即移除该节点（用后即焚，token 不常驻 DOM）。
+// 解析后立即移除该节点（用后即焚，token 不常驻 DOM）——解析失败同样要移除：节点里带着明文 token。
+// bootError 把「没有 token」的两种情形分开（C7-034）：'missing' = 页面没注入岛（Cookie 会话 /
+// 老页面，凭证本来就不走这里，不算错误）；'invalid-json' = 注入了但解析不了（页面数据坏了）。
+// 只回空 token 会把后者伪装成「凭证失效」——随后必然出现的 401 让控制台提示「用带 ?token= 的
+// 链接重开」，而真正的原因（注入内容损坏）被埋掉，也没有任何日志可查。
 function readBoot () {
+  const el = document.getElementById('xbk-boot')
+  if (!el) return { token: '', version: '', instance: '', bootError: 'missing' }
+  let data = null
+  let fault = null
   try {
-    const el = document.getElementById('xbk-boot')
-    if (!el) return { token: '' }
-    const data = JSON.parse(el.textContent || '{}')
+    data = JSON.parse(el.textContent || '{}')
+  } catch (e) {
+    fault = e
+  } finally {
     el.remove()
-    // version：页面启动时的构建版本（服务端注入），用来发现「部署后还开着旧标签页」。
-    return {
-      token: typeof data.token === 'string' ? data.token : '',
-      version: typeof data.version === 'string' ? data.version : '',
-      // instance：本实例的短 id（服务端按 stateDir 派生）。只用于给 localStorage 里的
-      // 首屏快照做命名空间，防止同一 origin 换实例后渲染上一个实例的数据。
-      instance: typeof data.instance === 'string' ? data.instance : ''
+  }
+  // JSON 合法但不是对象（"1" / null）与解析失败同一口径：岛里的内容不可用。
+  let bootError = ''
+  if (fault !== null || data === null || typeof data !== 'object') {
+    bootError = 'invalid-json'
+    if (typeof console !== 'undefined' && typeof console.error === 'function') {
+      console.error('xbk-boot 启动数据不可用（不是凭证失效）：JSON 岛解析失败或不是对象', fault)
     }
-  } catch (e) { return { token: '', version: '', instance: '' } }
+    data = {}
+  }
+  // version：页面启动时的构建版本（服务端注入），用来发现「部署后还开着旧标签页」。
+  return {
+    token: typeof data.token === 'string' ? data.token : '',
+    version: typeof data.version === 'string' ? data.version : '',
+    // instance：本实例的短 id（服务端按 stateDir 派生）。只用于给 localStorage 里的
+    // 首屏快照做命名空间，防止同一 origin 换实例后渲染上一个实例的数据。
+    instance: typeof data.instance === 'string' ? data.instance : '',
+    bootError
+  }
 }
 const BOOT = readBoot()
 
 // 日期键（YYYY-MM-DD）：数据层的 from/to 查询参数只接受这个形状——形状不对的值不发给
 // 服务端（形状对但不是日期由服务端判）；日期区间组件（app.js）复用同一个判定。
 const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+
+// 搜索词长度上限（UTF-8 字节，与服务端 console.js 的钳制同口径）：推送记录
+// MESSAGES_QUERY_MAX_BYTES=240（80 个汉字）、线报全站搜索 LINE_SEARCH_QUERY_MAX_BYTES=120。
+// 日期参数形状不对就不发；搜索词同样不能无上限（C7-057）——超长 q 会把 URL 顶到服务端/代理的
+// 长度上限（414，或服务端按字节截断后回包的 queryUsed 与发出去的不是同一个词）。数据层先按同一
+// 上限截断，URL 长度有界，且发出去的就是服务端真正会用的那个词（前端不必再靠 queryUsed 兜）。
+const MESSAGES_QUERY_MAX_BYTES = 240
+const LINE_SEARCH_QUERY_MAX_BYTES = 120
+const UTF8_ENCODER = typeof TextEncoder === 'function' ? new TextEncoder() : null
+// 没有 TextEncoder 时的 UTF-8 字节数（评审 CR-08）：按**码点**判宽——1/2/3/4 字节。
+// 旧实现用 `ch.length`（UTF-16 码元数）：240 个汉字算成 240 字节、实际 720 字节，服务端于是按
+// 一个被截到更短的词搜索，超长 URL 还可能被中间代理拒收。这里逐码点累加，与服务端 sliceUtf8Bytes 同口径。
+function utf8BytesOfCodePoint (ch) {
+  const cp = ch.codePointAt(0)
+  if (cp === undefined) return 0
+  if (cp < 0x80) return 1
+  if (cp < 0x800) return 2
+  if (cp < 0x10000) return 3
+  return 4
+}
+function clampQueryBytes (raw, maxBytes) {
+  if (typeof raw !== 'string') return ''
+  // 服务端两个端点都是「先 trim 再按字节截断」（console.js /api/messages 与 clampLineQuery），
+  // 这里同口径：否则首尾空格会把真正生效的词挤出上限，queryUsed 与请求又不一致。
+  const s = raw.trim()
+  if (s.length === 0) return ''
+  // 绝大多数词远未到上限：先整体编码一次走快路径。
+  if (UTF8_ENCODER && UTF8_ENCODER.encode(s).length <= maxBytes) return s
+  // 截断按码点走（for...of），不切断代理对/emoji；字节口径与服务端 sliceUtf8Bytes 一致。
+  let out = ''
+  let used = 0
+  for (const ch of s) {
+    const n = UTF8_ENCODER ? UTF8_ENCODER.encode(ch).length : utf8BytesOfCodePoint(ch)
+    if (used + n > maxBytes) break
+    out += ch
+    used += n
+  }
+  return out
+}
 
 // ── API ─────────────────────────────────────────────────────────────────────
 // token 只走 Authorization: Bearer 头（URL 不带任何凭证；console.js 服务端不打访问日志，
@@ -225,7 +283,9 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
   if (typeof cate === 'string' && cate.length > 0) params.set('cate', cate)
-  if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  // 搜索词按服务端同一上限（240 字节）截断后再发：URL 有界，且发出去的就是生效的那个词。
+  const qText = clampQueryBytes(q, MESSAGES_QUERY_MAX_BYTES)
+  if (qText.length > 0) params.set('q', qText)
   // 时间窗（v3.307）：0/未传=全部；1/3/7/30=近 N 个上海日历日（服务端白名单兜底）
   if (Number.isSafeInteger(days) && days > 0) params.set('days', String(days))
   // 自定义区间（v3.326）：YYYY-MM-DD 闭区间，服务端优先于 days（非法/颠倒时静默回落）
@@ -638,7 +698,10 @@ async function triggerNotifyTest () {
 // URLSearchParams，authority 恒为字面量；期限比普通端点长（服务端上游超时 8s）。
 function apiSearchLines ({ q, page, limit } = {}) {
   const params = new URLSearchParams()
-  if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  // 搜索词上限 120 字节（服务端 LINE_SEARCH_QUERY_MAX_BYTES 同口径）：面板已在输入侧钳制，
+  // 数据层再兜一道——直接调 apiSearchLines 的路径（关注词/深链）也不能发出超长 q。
+  const qText = clampQueryBytes(q, LINE_SEARCH_QUERY_MAX_BYTES)
+  if (qText.length > 0) params.set('q', qText)
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   const qs = params.toString()

@@ -146,6 +146,11 @@ function resolveSkip (file) {
   if (!Array.isArray(suites)) return FATAL('test_suites.js 未导出 SUITES 数组（跳过集合无法与 command 档对齐）')
   const suite = suites.find(s => s.file === file)
   if (!suite) return SKIP('未注册进 test_suites.js（run_unit_tests.js 同口径：不在 SUITES 即不运行）')
+  // C10-010：SKIP_SUITES 的强制清空发生在**进入 TAP 档**那一刻——stryker.tap.config.js 在配置加载期写死
+  //   `process.env.SKIP_SUITES = ''`（tap-runner 逐文件 spawn 时按 {...process.env} 继承），与 command 档
+  //   scripts/mutation-child.js 同源。所以本文件**不再**需要「CI 的 step env 没设它」这条假设：档内
+  //   process.env.SKIP_SUITES 恒为空串，下面这条判据只有在「不经 stryker.tap.config.js、直接调用本 shim」
+  //   时才可能命中（test_suite_registry.js 把它作为「与 command 档同源的跳过语义」锁定，故保留）。
   const skipSuites = new Set((process.env.SKIP_SUITES || '').split(',').map(s => s.trim()).filter(Boolean))
   if (skipSuites.has(file)) return SKIP(`SKIP_SUITES 显式跳过（SKIP_SUITES=${process.env.SKIP_SUITES}）`)
   if (suite.integration) return SKIP('integration（run_unit_tests.js 同口径排除）')

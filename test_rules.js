@@ -260,7 +260,7 @@ const r2Warn = (fn) => {
   const w2 = r2Warn(() => {
     assert.strictEqual(r2e.compileRules({ keyword: 'BAD' }).keyword, null)
   })
-  assert.deepStrictEqual(w2, ['⚠️ 规则「keyword」无法使用安全正则引擎，已跳过'])
+  assert.deepStrictEqual(w2, ['⚠️ 规则「keyword」包含非法正则「BAD」，已跳过（RE2 可用但编译失败；validateConfig 已告警）'])
   r2Re2.on = false
   const w3 = r2Warn(() => {
     assert.deepStrictEqual(r2e.compileRules({ keyword: 'cat###BAD' }).keyword.rules, [])
@@ -330,7 +330,7 @@ const r2Warn = (fn) => {
   assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###' }),
     ['⚠️ 配置「keyword」值正则为空，该行将被忽略（避免永真规则）：「a###」'])
   assert.deepStrictEqual(r2e.validateConfig({ keyword: 'a###(b+)+' }),
-    ['⚠️ 配置「keyword」值正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(b+)+」'])
+    ['⚠️ 配置「keyword」值正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），该行将被忽略：「(b+)+」'])
   r2Re2.on = true
   assert.deepStrictEqual(r2e.validateConfig({ keyword: 'cat###BAD' }),
     ['⚠️ 配置「keyword」值正则无效或当前环境不支持：「BAD」'])
@@ -342,7 +342,7 @@ const r2Warn = (fn) => {
   assert.deepStrictEqual(r2e.validateConfig({ keyword: '   ' }),
     ['⚠️ 配置「keyword」为空白字符，将被忽略'])
   assert.deepStrictEqual(r2e.validateConfig({ keyword: '  (a+)+  ' }),
-    ['⚠️ 配置「keyword」的正则含嵌套量词，可能导致灾难性回溯，该规则将被忽略：「(a+)+」'])
+    ['⚠️ 配置「keyword」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），该规则将被忽略：「(a+)+」'])
 }
 
 // 杀各处固定 'i' 标志（StringLiteral→""）与 String() 化口径：所有用户正则编译必须带 'i'，且模式集合精确
