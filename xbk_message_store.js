@@ -170,8 +170,9 @@ function createMessageStore ({
     // 数组被 GC 回收时索引随之自动释放，无需手动失效。
     _identityIndex: new WeakMap(),
     // 判重身份墓碑（按缓存文件路径）：字节/条数裁剪丢弃记录的紧凑身份键（Map 保插入序，
-    // 超 TOMBSTONE_MAX_KEYS 丢最旧）。主判重闸门与 has/save/saveBatch 统一并入查询，
-    // 防上游重放被裁记录时重复推送；过滤未推（_f）记录不落墓碑，规则改宽后仍可重新评估。
+    // 超当次上限——max(TOMBSTONE_MAX_KEYS, maxSize)，C6-006——丢最旧）。主判重闸门与
+    // has/save/saveBatch 统一并入查询，防上游重放被裁记录时重复推送；过滤未推（_f）记录不落墓碑，
+    // 规则改宽后仍可重新评估。
     // P3（审查 2026-09-15）键上限口径：下方 _tombstones/_tombstoneLoaded/_readFailed/_verified
     // 均以「缓存文件路径」为键，条目数由 pushUrl 集合规模决定（单实例部署下规模稳定，磁盘缓存
     // 为权威且可重建），与 _MEMO_MAX 覆盖的内存快照数组不是同一维度，故当前不加 LRU/键上限；
@@ -740,6 +741,14 @@ function createMessageStore ({
       return Number.isInteger(v) && v > 0 ? v : DEFAULT_MAX_SIZE
     },
 
+    /** 墓碑每类键数上限（C6-006）：必须 ≥ 同一次裁剪可能丢弃的身份数，否则「满缓存裁剪」后
+     *  最旧的一半身份当场失去防重放保护（缓存上限默认 10000 条 > 旧固定上限 5000 键）。
+     *  调用方按当次 maxSize 传口径，取 max(TOMBSTONE_MAX_KEYS, maxSize)：TOMBSTONE_MAX_KEYS 是
+     *  下限（不带 maxSize 的路径仍用它），maxSize 是真正能一次被裁掉的条数上界。 */
+    _tombstoneKeyCap (maxSize) {
+      return Number.isInteger(maxSize) && maxSize > TOMBSTONE_MAX_KEYS ? maxSize : TOMBSTONE_MAX_KEYS
+    },
+
     // ===== F1（P1）：坏/超限缓存的「隔离 + 重建」自愈 =====
     // 背景（AUDIT-2026-09-26 / F1，已确证）：缓存文件超限 / JSON 解析失败 / 非普通文件时，
     // readMessages 置 _readFailed ⇒ save/saveBatch 拒绝覆写 ⇒ xbk_app 跳过整轮推送 ⇒ 每轮重复、
@@ -899,14 +908,14 @@ function createMessageStore ({
         console.error(`缓存尾部恢复：单条即超过读端上限，无法自动恢复（保持写闸门）${filePath}`)
         return null
       }
-      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped)
+      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped, this._tombstoneKeyCap(maxSize))
     },
 
     /** 把不可读缓存改名隔离（绝不 unlink）后，在原路径原子重建（解析失败/非普通文件为空缓存，
      *  超限为尾部恢复集）并解除写闸门。返回重建后的消息数组（已同步内存快照与「已验证」标记，
      *  后续 save/saveBatch 因此放行）；隔离改名或重建写盘失败时返回 null —— 保持写闸门
      *  （fail-closed），此时人工作业仍是最后手段。 */
-    _isolateAndRebuild (filePath, messages, text, label, dropped = []) {
+    _isolateAndRebuild (filePath, messages, text, label, dropped = [], maxKeys = TOMBSTONE_MAX_KEYS) {
     // 已知残余竞态（返工 R1 登记，不修）：三条判据的「复核 → rename」之间、以及「rename 成功 →
     // 重建 writeAtomic」之间仍有微秒级窗口。前一窗口若被并发写入抢先，会把对方刚写的有效缓存搬进
     // .bak（复核已把它从「读窗口内的必然命中」缩到「复核与 rename 之间的极小概率」）；后一窗口若被
@@ -935,8 +944,8 @@ function createMessageStore ({
       this._memoSet(filePath, messages)
       try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       // 落墓碑放在写盘成功之后：与 saveMessages 同口径——未真正落盘就登记会把仍在磁盘上的身份
-      // 误判成「已推送」而漏推。
-      if (dropped.length > 0) this._tombstoneDropped(filePath, dropped)
+      // 误判成「已推送」而漏推。maxKeys 由调用方按当次 maxSize 给出（C6-006：容量须覆盖本次裁剪量）。
+      if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, maxKeys)
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
       console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除）${filePath} → ${backupPath}；` +
@@ -1031,7 +1040,9 @@ function createMessageStore ({
       // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
       try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
       // 缓存写盘成功：被裁剪记录才真正退出磁盘缓存，此时落墓碑防重放（防重复推送）
-      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll)
+      // C6-006：墓碑键数上限取 max(TOMBSTONE_MAX_KEYS, maxSize)——本次最多裁掉
+      // toSave.length - maxSize 条，容量不低于 maxSize 才能让这批身份全部留在墓碑里。
+      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize))
       return true
     },
 
@@ -1274,14 +1285,14 @@ function createMessageStore ({
    *  规则变更失效后须能重新评估/推送。与 _buildIdentityIndex 四集合同构：
    *  id 记录记 idKey（+url 入 idWithUrl）、url 记录记 urlOnly、anon 记 anonKey。
    *  写前强制重读磁盘合并其他进程已写入的身份（配合跨进程锁，消除覆盖竞态）。 */
-    _tombstoneDropped (filePath, dropped) {
+    _tombstoneDropped (filePath, dropped, maxKeys = TOMBSTONE_MAX_KEYS) {
     // 拿锁成功：串行读-改-写；拿锁失败（IO 错误/锁忙）：放弃本次墓碑写入——
     // 无锁读-改-写仍可能覆盖并发进程已写入的身份（CodeAnt Round3 Major），
     // 放弃的代价仅是本次裁剪身份在重放时可能重复推送（与墓碑机制引入前行为一致）。
     // P3（审查 2026-09-15）：_withTombstoneLock 仅在「清理哨兵/墓碑锁未拿到」时返回 false
     // （成功路径返回 _recordTombstoneDrops 的 undefined），补一条诊断让失败可观测；
     // 失败语义不变（仍放弃本次墓碑写入，不重试、不阻塞主流程）。
-      const locked = this._withTombstoneLock(filePath, (lockPath, token) => this._recordTombstoneDrops(filePath, dropped, lockPath, token))
+      const locked = this._withTombstoneLock(filePath, (lockPath, token) => this._recordTombstoneDrops(filePath, dropped, lockPath, token, maxKeys))
       if (locked === false) console.warn(`墓碑写入未获锁，本次裁剪身份未落墓碑（重放时可能重复推送）：${filePath}`)
     },
 
@@ -1290,7 +1301,7 @@ function createMessageStore ({
    *  在临时副本上完成合并/淘汰，仅当 owner 校验通过且 .seen.json 原子写成功后才
    *  提交到内存缓存——锁被抢占或写盘失败时当前内存状态保持与磁盘一致（CodeAnt Round6）。
    *  过滤未推（_f）记录不记录——它们从未推送，规则变更失效后须能重新评估/推送。 */
-    _recordTombstoneDrops (filePath, dropped, lockPath, token) {
+    _recordTombstoneDrops (filePath, dropped, lockPath, token, maxKeys = TOMBSTONE_MAX_KEYS) {
     // 写盘前（进入读-改-写前）先确认锁仍归当前进程：被抢占/替换后立即放弃，
     // 不重读不合并不修改内存墓碑（CodeAnt Round5 Major：避免覆盖抢占者已写入的身份）
       if (!this._isTombstoneLockOwner(lockPath, token)) return
@@ -1302,7 +1313,7 @@ function createMessageStore ({
         changed = this._applyTombstoneIdentity(next, Utils.getMessageIdentity(m)) || changed
       }
       if (!changed) return
-      this._trimTombstoneMaps(next)
+      this._trimTombstoneMaps(next, maxKeys)
       // 写盘瞬间再次确认锁仍归当前进程：读-改-写期间若被误判 stale 抢占/替换，
       // 静默放弃本次写入，避免基于旧快照的原子替换覆盖抢占者已合并的身份
       if (!this._isTombstoneLockOwner(lockPath, token)) return
@@ -1339,10 +1350,11 @@ function createMessageStore ({
       return false
     },
 
-    /** 四类墓碑 Map 超 TOMBSTONE_MAX_KEYS 时丢最旧键 */
-    _trimTombstoneMaps (ts) {
+    /** 四类墓碑 Map 超 maxKeys（默认 TOMBSTONE_MAX_KEYS 下限；生产按当次 maxSize 取
+     *  _tombstoneKeyCap，见 C6-006）时丢最旧键 */
+    _trimTombstoneMaps (ts, maxKeys = TOMBSTONE_MAX_KEYS) {
       for (const map of [ts.id, ts.urlOnly, ts.idWithUrl, ts.anon]) {
-        while (map.size > TOMBSTONE_MAX_KEYS) {
+        while (map.size > maxKeys) {
           const oldest = map.keys().next().value
           if (oldest === undefined) break
           map.delete(oldest)
