@@ -30,6 +30,12 @@ const OWNER_ONLY_MODE = 0o600
 const GROUP_OTHER_BITS = 0o077
 // O_NOFOLLOW 在 Windows 上不存在：此时退化为 0（由下方 lstat 的符号链接判断兜底）。
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0
+// O_NONBLOCK（评审 CR-09）：末级若被换成 FIFO，裸 O_RDONLY open 会**阻塞到有写者打开**——
+// O_NOFOLLOW 只挡符号链接，挡不住 FIFO；而 fstatSync().isFile() 要等 open 返回才跑，永远没机会
+// 拒绝。加 O_NONBLOCK 后 FIFO 的 open 立刻返回（无写者时读端也照样返回，随后被 isFile() 判掉），
+// 整轮运行不再挂死；对普通文件没有任何影响（它只影响 FIFO/设备节点的打开语义）。Windows 上没有
+// 这个常量，同样退化为 0。
+const O_NONBLOCK = fs.constants.O_NONBLOCK || 0
 
 function safeErrorMessage (err) {
   if (!err) return '未知错误'
@@ -45,7 +51,8 @@ function enforceOwnerOnlyMode (file) {
   let fd
   try {
     // O_NOFOLLOW：末级是符号链接时 open 直接 ELOOP，从源头上不跟随。
-    fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW)
+    // O_NONBLOCK：末级是 FIFO 时让 open 立刻返回（读端无写者也照样返回），随后被 isFile() 判掉。
+    fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
   } catch (e) {
     if (e && e.code === 'ELOOP') {
       return { ok: false, message: '覆盖文件是符号链接，拒绝按路径收紧权限（这会改到链接目标）' }

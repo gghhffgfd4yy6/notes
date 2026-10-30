@@ -28,9 +28,9 @@ const etag = require('etag')
 const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
-const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
+const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
 const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
-const { removeStaleTombstoneFile } = require('../xbk_message_store') // C3-013：清残留墓碑（实现与注释见 store）
+const { removeStaleTombstoneFile, tombstoneKeyCap } = require('../xbk_message_store') // C3-013：清残留墓碑 / CR-01：墓碑上限同一规则
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
 // 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
 const FilterStore = require('../xbk_filter_store')
@@ -287,7 +287,10 @@ function defaultHealthLimits () {
     writeMaxBytes: MESSAGE_CACHE_MAX_BYTES,
     consoleReadMaxBytes: MESSAGES_MAX_BYTES,
     entryMax,
-    tombstoneKeyMax: TOMBSTONE_MAX_KEYS,
+    // 墓碑键数上限不再写死 TOMBSTONE_MAX_KEYS（评审 CR-01）：生产真正的上限是
+    // max(TOMBSTONE_MAX_KEYS, maxSize)，由 xbk_message_store 的 tombstoneKeyCap 唯一推导——
+    // 上报值必须与运行侧强制的是同一条规则，否则接口报的 5000 生产根本不执行。
+    tombstoneKeyMax: tombstoneKeyCap(entryMax),
     tombstoneMaxBytes: TOMBSTONE_MAX_BYTES
   }
 }
@@ -4389,7 +4392,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (plans.messages.seenText !== undefined) {
             if (!writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) { abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' }); return }
             imported.dedup = true
-          } else if (removeStaleTombstoneFile(fs, seenPath)) imported.dedupCleared = true
+          } else {
+            // 评审 CR-05：删除残留墓碑失败时必须中止并回滚，不能只按「删掉了吗」一个布尔值判断成功——
+            // 旧墓碑仍在会把导入历史里缺失的身份继续判成「已推送」，响应却报导入成功。
+            const cleared = removeStaleTombstoneFile(fs, seenPath)
+            if (cleared.status === 'failed') {
+              console.error(`⚠️ 导入中止：残留判重历史无法删除（${cleared.message}），旧墓碑会继续压制导入历史里缺失的消息：${seenPath}`)
+              abortImport('messages', 500, { error: 'dedup_clear_failed', code: 'dedup_clear_failed' })
+              return
+            }
+            if (cleared.status === 'removed') imported.dedupCleared = true
+          }
           imported.messages = plans.messages.count
         }
         if (plans.settings) {

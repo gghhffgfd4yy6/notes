@@ -56,6 +56,17 @@ const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 const MESSAGES_QUERY_MAX_BYTES = 240
 const LINE_SEARCH_QUERY_MAX_BYTES = 120
 const UTF8_ENCODER = typeof TextEncoder === 'function' ? new TextEncoder() : null
+// 没有 TextEncoder 时的 UTF-8 字节数（评审 CR-08）：按**码点**判宽——1/2/3/4 字节。
+// 旧实现用 `ch.length`（UTF-16 码元数）：240 个汉字算成 240 字节、实际 720 字节，服务端于是按
+// 一个被截到更短的词搜索，超长 URL 还可能被中间代理拒收。这里逐码点累加，与服务端 sliceUtf8Bytes 同口径。
+function utf8BytesOfCodePoint (ch) {
+  const cp = ch.codePointAt(0)
+  if (cp === undefined) return 0
+  if (cp < 0x80) return 1
+  if (cp < 0x800) return 2
+  if (cp < 0x10000) return 3
+  return 4
+}
 function clampQueryBytes (raw, maxBytes) {
   if (typeof raw !== 'string') return ''
   // 服务端两个端点都是「先 trim 再按字节截断」（console.js /api/messages 与 clampLineQuery），
@@ -68,7 +79,7 @@ function clampQueryBytes (raw, maxBytes) {
   let out = ''
   let used = 0
   for (const ch of s) {
-    const n = UTF8_ENCODER ? UTF8_ENCODER.encode(ch).length : ch.length
+    const n = UTF8_ENCODER ? UTF8_ENCODER.encode(ch).length : utf8BytesOfCodePoint(ch)
     if (used + n > maxBytes) break
     out += ch
     used += n

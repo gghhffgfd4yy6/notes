@@ -7,7 +7,25 @@
 // （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
 // `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块只 require
 // 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
-const { timingSafeEqualStr } = require('./xbk_utils')
+const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
+
+// 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
+//   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
+// TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
+// 的条数（默认 10000 > 旧固定上限 5000：接口不能继续上报一个生产根本不执行的值）；
+// droppedCount 是本次**实际**落墓碑的身份数上界——saveBatch 没有入参上限（maxSize=10000 时一批
+// 20001 条会丢 10001 条，字节上限还会再补刀），只按 maxSize sizing 会让 _trimTombstoneMaps 把
+// 刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
+// 控制台 /api/cache-health 的上报值（limits.tombstoneKeyMax）也调本函数推导，保证「报出的上限」
+// 与「生产真正强制的上限」是同一份规则，不出现两处各写一份常量。
+// floorKeys 仅供实例注入的 constants 覆盖（测试用小常量），生产缺省即 xbk_utils 的常量本尊。
+function tombstoneKeyCap (maxSize, droppedCount = 0, floorKeys = TOMBSTONE_MAX_KEYS) {
+  let cap = Number.isInteger(floorKeys) && floorKeys > 0 ? floorKeys : TOMBSTONE_MAX_KEYS
+  if (Number.isInteger(maxSize) && maxSize > cap) cap = maxSize
+  if (Number.isInteger(droppedCount) && droppedCount > cap) cap = droppedCount
+  return cap
+}
+
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   const candidate = path.resolve(root, raw)
   const realInsideRoot = (p) => {
@@ -743,10 +761,10 @@ function createMessageStore ({
 
     /** 墓碑每类键数上限（C6-006）：必须 ≥ 同一次裁剪可能丢弃的身份数，否则「满缓存裁剪」后
      *  最旧的一半身份当场失去防重放保护（缓存上限默认 10000 条 > 旧固定上限 5000 键）。
-     *  调用方按当次 maxSize 传口径，取 max(TOMBSTONE_MAX_KEYS, maxSize)：TOMBSTONE_MAX_KEYS 是
-     *  下限（不带 maxSize 的路径仍用它），maxSize 是真正能一次被裁掉的条数上界。 */
-    _tombstoneKeyCap (maxSize) {
-      return Number.isInteger(maxSize) && maxSize > TOMBSTONE_MAX_KEYS ? maxSize : TOMBSTONE_MAX_KEYS
+     *  规则只有一份实现：模块级 tombstoneKeyCap（控制台 /api/cache-health 也用它上报），
+     *  这里只把实例注入的 constants.TOMBSTONE_MAX_KEYS 当下限传进去。 */
+    _tombstoneKeyCap (maxSize, droppedCount = 0) {
+      return tombstoneKeyCap(maxSize, droppedCount, TOMBSTONE_MAX_KEYS)
     },
 
     // ===== F1（P1）：坏/超限缓存的「隔离 + 重建」自愈 =====
@@ -908,7 +926,9 @@ function createMessageStore ({
         console.error(`缓存尾部恢复：单条即超过读端上限，无法自动恢复（保持写闸门）${filePath}`)
         return null
       }
-      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped, this._tombstoneKeyCap(maxSize))
+      // CR-02：容量按**本次实际丢弃的全量** sizing——尾部恢复的 dropped 同时含条数裁剪与字节
+      // 上限淘汰的条目，总数可超过 maxSize（条数无入参上限，字节裁剪还会再补刀）。
+      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped, this._tombstoneKeyCap(maxSize, dropped.length))
     },
 
     /** 把不可读缓存改名隔离（绝不 unlink）后，在原路径原子重建（解析失败/非普通文件为空缓存，
@@ -944,7 +964,8 @@ function createMessageStore ({
       this._memoSet(filePath, messages)
       try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       // 落墓碑放在写盘成功之后：与 saveMessages 同口径——未真正落盘就登记会把仍在磁盘上的身份
-      // 误判成「已推送」而漏推。maxKeys 由调用方按当次 maxSize 给出（C6-006：容量须覆盖本次裁剪量）。
+      // 误判成「已推送」而漏推。maxKeys 由调用方按「本次实际丢弃条数」给出（C6-006 / CR-02：
+      // 容量须覆盖本次裁剪量，不能只按 maxSize）。
       if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, maxKeys)
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
@@ -1040,9 +1061,10 @@ function createMessageStore ({
       // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
       try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
       // 缓存写盘成功：被裁剪记录才真正退出磁盘缓存，此时落墓碑防重放（防重复推送）
-      // C6-006：墓碑键数上限取 max(TOMBSTONE_MAX_KEYS, maxSize)——本次最多裁掉
-      // toSave.length - maxSize 条，容量不低于 maxSize 才能让这批身份全部留在墓碑里。
-      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize))
+      // C6-006 / CR-02：墓碑键数上限按**本次实际丢弃的全量** sizing（条数裁剪 + 字节上限裁剪）——
+      // saveBatch 没有入参上限，maxSize=10000 时一批 20001 条会丢 10001 条，只按 maxSize 给容量
+      // 就会让 _trimTombstoneMaps 把刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
+      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
       return true
     },
 
@@ -1350,8 +1372,8 @@ function createMessageStore ({
       return false
     },
 
-    /** 四类墓碑 Map 超 maxKeys（默认 TOMBSTONE_MAX_KEYS 下限；生产按当次 maxSize 取
-     *  _tombstoneKeyCap，见 C6-006）时丢最旧键 */
+    /** 四类墓碑 Map 超 maxKeys（默认 TOMBSTONE_MAX_KEYS 下限；生产按「本次实际丢弃条数」取
+     *  _tombstoneKeyCap，见 C6-006 / CR-02）时丢最旧键 */
     _trimTombstoneMaps (ts, maxKeys = TOMBSTONE_MAX_KEYS) {
       for (const map of [ts.id, ts.urlOnly, ts.idWithUrl, ts.anon]) {
         while (map.size > maxKeys) {
@@ -1864,20 +1886,33 @@ function createMessageStore ({
 // C3-013：判重历史由 `push.json` + `push.json.seen.json`（墓碑）两个文件共同构成。控制台「数据备份」
 // 导入时若备份不含判重历史，机器上残留的 .seen.json 描述的是**另一段历史**——它会把已被淘汰的身份继续
 // 判成「已推送」，使恢复后的主存「少了记录却不重推」且全程无提示。导入侧因此需要一个「清残留」动作：
-// 只删普通文件（符号链接/目录不是墓碑形态，绝不顺着链接删到别处）；ENOENT 视为没有残留；其它错误
-// 告警但不改判定。fs 由调用方注入（与 resolveCacheDirInRoot 同口径，测试无需真实删盘即可驱动）。
+// 只删普通文件（符号链接/目录不是墓碑形态，绝不顺着链接删到别处）。fs 由调用方注入（与
+// resolveCacheDirInRoot 同口径，测试无需真实删盘即可驱动）。
 // 判重数据本身**绝不自动销毁**：是否调用、以及回滚备份，全部由调用方（控制台导入流程）决定。
+//
+// 返回三态（评审 CR-05：旧实现把「本来就不存在」与「删除失败」都折叠成 false，导入照旧报成功）：
+//   { status: 'removed' }                → 真的删掉了残留墓碑；
+//   { status: 'absent' }                 → 本来就没有残留（ENOENT；或路径不是普通文件——符号链接/目录
+//                                          不是墓碑形态，不能顺着删，语义上也没有可清的残留）；
+//   { status: 'failed', message }        → 是普通文件却删不掉（EACCES/EROFS/EBUSY…）。调用方**必须**
+//                                          中止并回滚导入：旧墓碑仍在，会把导入历史里缺失的身份继续判成
+//                                          「已推送」，此时报成功等于静默留下另一段判重历史。
 function removeStaleTombstoneFile (fs, seenPath) {
+  const describe = (e) => (e && (e.code || e.message)) || String(e)
+  let st = null
   try {
-    const st = fs.lstatSync(seenPath)
-    if (!st || !st.isFile()) return false
-    fs.unlinkSync(seenPath)
-    return true
+    st = fs.lstatSync(seenPath)
   } catch (e) {
-    if (!e || e.code !== 'ENOENT') {
-      console.warn(`⚠️ 导入时清理残留判重历史失败 ${seenPath}: ${e && e.message ? e.message : e}`)
-    }
-    return false
+    // 没有这个路径 = 本来就没有残留；其它（父目录读不了等）无法确认 ⇒ 按失败处理，不谎报清理成功
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'failed', message: describe(e) }
+  }
+  if (!st || !st.isFile()) return { status: 'absent' }
+  try {
+    fs.unlinkSync(seenPath)
+    return { status: 'removed' }
+  } catch (e) {
+    // 检查后被别的进程删掉：确实没有残留，不是失败
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'failed', message: describe(e) }
   }
 }
 
@@ -1885,6 +1920,7 @@ module.exports = {
   createMessageStore,
   resolveCacheDirInRoot,
   removeStaleTombstoneFile,
+  tombstoneKeyCap,
   IDENTITY_INDEX_REF_PROBE_WINDOW,
   IDENTITY_INDEX_IDENTITY_PROBE_WINDOW
 }
