@@ -2880,15 +2880,13 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
 // v3.342：控制台设置块（v3.340 在配置页，v3.342 搬到系统页「设置」）。
 // 一条读面 + 两个写面：通知自检拦截窗、顶栏时间是否显示年月日。读面失败只影响本块。
 function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, active = true }) {
-  // 拦截窗草稿：数字框默认锁定（手机端交互约定：滚动/误触点一下就弹键盘，整行被挡住；
-  // 日常调整靠「−/+」长按连续加减），点「手动输入」切到键入态后可自由键入任意字符，
-  // 保存前统一校验（整数 0–3600，非法值不发请求）——C7-046：此前输入框是永久 disabled，
-  // 注释说的「可自由键入」与这套校验都不可达。用户正在改（dirty）时刷新回来的生效值
-  // 不覆盖输入框，避免「改到一半被定时重拉吃掉」。
+  // 拦截窗草稿：数字框是锁定只读的（手机端滚动/误触点一下就弹键盘，整行被挡住），
+  // 调整只有「−/+」这一条路径：单击步进、长按连续加减，两端在 adjustWin 里夹到常量范围。
+  // 不支持直接键入，所以这里也没有「非法输入」要拦——C7-046：旧注释声称可自由键入、
+  // 保存前统一校验，而框是永久 disabled，那层校验永远进不去（已删）。
+  // 用户正在改（dirty）时刷新回来的生效值不覆盖草稿，避免「改到一半被定时重拉吃掉」。
   const [winDraft, setWinDraft] = useState('')
   const [winDirty, setWinDirty] = useState(false)
-  const [winTyping, setWinTyping] = useState(false)
-  const winTypingRef = useRef(null)
   const [winErr, setWinErr] = useState('')
   const [winSaved, setWinSaved] = useState(false)
   const [winSaving, setWinSaving] = useState(false)
@@ -2934,19 +2932,12 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
     winSyncedRef.current = winCurrent
     setWinDraft(String(winCurrent))
   }, [winCurrent, winDirty])
-  // 切进键入态时把焦点给输入框并全选（点「手动输入」后手不用再点一次，直接输入即替换）；
-  // preventScroll 与分类弹层同口径：手机上聚焦不得把整页滚走。
-  useEffect(() => {
-    const el = winTypingRef.current
-    if (!winTyping || !el) return
-    el.focus({ preventScroll: true })
-    if (typeof el.select === 'function') el.select()
-  }, [winTyping])
+  // 草稿只可能来自下面同步 effect 的回填，或本函数上一次的夹取结果，必是 0–3600 的整数；
+  // 首帧 effect 还没跑（草稿为空串）时以生效值为基准。夹取在写入时完成，保存端不再校验。
   const adjustWin = (delta) => {
     if (winCurrent === null || winSavingRef.current) return
     setWinDraft((prev) => {
-      const typed = prev.trim() === '' ? Number.NaN : Number(prev)
-      const base = Number.isInteger(typed) ? typed : winCurrent
+      const base = prev === '' ? winCurrent : Number(prev)
       const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
       return String(next)
     })
@@ -2955,53 +2946,27 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
     setWinErr('')
   }
   const holdWin = useHoldRepeat(adjustWin, winCurrent === null || winSaving)
-  // 键入态（C7-046）三个入口：切进去、逐键写草稿、取消还原。草稿是字符串，不在输入时夹紧——
-  // 让「打了 9999 / 空串 / 字母」都能落到保存那一步被明确拒绝，而不是被静默改成一个看起来
-  // 合法的数字。adjustWin 仍按旧口径解析草稿（非整数就落在生效值上加减）。
-  const startWinEdit = () => {
-    if (winCurrent === null || winSavingRef.current) return
-    setWinErr('')
-    setWinTyping(true)
-  }
-  const onWinInput = (e) => {
-    setWinDraft(e.target.value)
-    setWinDirty(true)
-    setWinSaved(false)
-    setWinErr('')
-  }
-  const cancelWinEdit = () => {
-    setWinTyping(false)
-    setWinDirty(false)
-    setWinErr('')
-    setWinDraft(winCurrent === null ? '' : String(winCurrent))
-  }
-  // 保存：客户端只做「整数 0–3600」这一层拦截（非法值不发请求）；带 baseRevision 做乐观锁，
-  // 别处改过就 409，这里重读让用户看清当前值再决定。
+  // 保存：草稿只会由 ± / 长按产生，写入时已经夹在 NOTIFY_WINDOW_MIN_S–NOTIFY_WINDOW_MAX_S，
+  // 客户端没有「非法值」要拦（旧的那层校验对着永远 disabled 的框，永远进不去——C7-046 已删）。
+  // 带 baseRevision 做乐观锁，别处改过就 409，这里重读让用户看清当前值再决定。
   const saveWin = async () => {
     setWinErr('')
     // 连点两次会各带同一个 baseRevision 发两次 POST，第二次必然 409——那是自己造的冲突，
     // 页面却会同时出现「已保存」和「设置已被别处改过」。入口与按钮双守卫。
     if (winSavingRef.current) return
     if (!settingsLive || winCurrent === null) { setWinErr('当前生效值未读到，先刷新再改'); return }
-    // 空串必须按非法处理：Number('') === 0，若直接转数字会把「清空输入框再点保存」
-    // 静默解释成 0（关闭拦截）——那是最不该靠猜的语义。
-    const typed = winDraft.trim() === '' ? Number.NaN : Number(winDraft)
-    if (!Number.isInteger(typed) || typed < NOTIFY_WINDOW_MIN_S || typed > NOTIFY_WINDOW_MAX_S) {
-      setWinErr(`拦截窗必须是 ${NOTIFY_WINDOW_MIN_S}–${NOTIFY_WINDOW_MAX_S} 的整数（秒）`)
-      return
-    }
+    // 首帧同步 effect 还没跑时草稿仍为空串：保存的就是生效值本身（不是 Number('') 的 0）。
+    const next = winDraft === '' ? winCurrent : Number(winDraft)
     winSavingRef.current = true
     setWinSaving(true)
     try {
-      const res = await apiPostConsoleSettings({ notifyTestReplayWindowS: typed, baseRevision: winBaseRevRef.current === null ? settingsLive.revision : winBaseRevRef.current })
+      const res = await apiPostConsoleSettings({ notifyTestReplayWindowS: next, baseRevision: winBaseRevRef.current === null ? settingsLive.revision : winBaseRevRef.current })
       const payload = res.data && typeof res.data === 'object' ? res.data : {}
       if (!res.ok) {
         if (payload.error === 'revision_mismatch') {
           setWinErr('设置已被别处改过（revision 不一致），已重新读取，请确认后再保存')
           // 必须复位 dirty：否则本页草稿再也不会跟随刷新，只能整页重载才能回到可保存状态。
-          // 键入态一起退出：重读后的值由同步 effect 回填，别再让旧草稿盖住它。
           setWinDirty(false)
-          setWinTyping(false)
           await loadSettings()
           return
         }
@@ -3010,10 +2975,9 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       }
       const saved = payload.settings && Number.isInteger(payload.settings.notifyTestReplayWindowS)
         ? payload.settings.notifyTestReplayWindowS
-        : typed
+        : next
       setWinDraft(String(saved))
       setWinDirty(false)
-      setWinTyping(false)
       setWinSaved(true)
       clearTimeout(winSavedTimerRef.current)
       winSavedTimerRef.current = setTimeout(() => setWinSaved(false), 1500)
@@ -3025,11 +2989,6 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       winSavingRef.current = false
       setWinSaving(false)
     }
-  }
-  // 键入态键盘：回车 = 保存（与点保存同一条校验路径，非法值同样只报错不发请求），
-  // Esc = 取消并还原生效值。手机数字键盘没有回车键，按钮仍是主路径。
-  const onWinKey = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); saveWin() } else if (e.key === 'Escape') { e.preventDefault(); cancelWinEdit() }
   }
   // 显示开关：勾一下就保存（不再要一次「保存」）；失败重读并报错，勾选状态跟随服务端。
   const toggleShowDate = async (next) => {
@@ -3074,23 +3033,14 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
         onPointerDown=${holdWin.start(-1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
         onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
         onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(-1)}>−</button>
-      ${winTyping
-        ? html`<input class="auto-input auto-input-typing" type="text" inputmode="numeric" autocomplete="off"
-            spellcheck="false" maxlength="4" ref=${winTypingRef} aria-label="通知自检拦截窗（秒）"
-            title="输入 0–3600 的整数：回车保存，Esc 取消" value=${winDraft}
-            onInput=${onWinInput} onKeyDown=${onWinKey} />`
-        : html`<input class="auto-input" type="number" inputmode="numeric"
-            min=${NOTIFY_WINDOW_MIN_S} max=${NOTIFY_WINDOW_MAX_S} step="1"
-            aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${true} />`}
+      <input class="auto-input" type="number" inputmode="numeric"
+        min=${NOTIFY_WINDOW_MIN_S} max=${NOTIFY_WINDOW_MAX_S} step="1"
+        aria-label="通知自检拦截窗（秒）" value=${winCurrent === null ? '' : winDraft} disabled=${true} />
       <span class="auto-unit">秒</span>
       <button type="button" class="auto-step" aria-label="增加" disabled=${winCurrent === null || winSaving}
         onPointerDown=${holdWin.start(1)} onPointerUp=${holdWin.stop} onPointerLeave=${holdWin.stop}
         onPointerCancel=${holdWin.stop} onLostPointerCapture=${holdWin.stop}
         onContextMenu=${holdWin.contextMenu} onClick=${holdWin.click(1)}>+</button>
-      ${winTyping
-        ? html`<${Button} variant="ghost" onClick=${cancelWinEdit}>取消<//>`
-        : html`<${Button} variant="ghost" disabled=${winCurrent === null || winSaving}
-            onClick=${startWinEdit} title="键盘输入任意值，保存时校验 0–3600">手动输入<//>`}
       <${Button} variant="secondary" disabled=${winCurrent === null || winSaving} onClick=${saveWin}>保存<//>
       ${winSaved && html`<span class="cfg-block-sub" role="status" aria-live="polite">已保存 · 立即生效</span>`}
     </div>`}
@@ -3098,7 +3048,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       ? '正在读取当前生效值…'
       : winCurrent === null
         ? `当前生效值读取失败，暂不可修改（点右上「刷新」重试）：${settingsErr || '未知错误'}`
-        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 长按加减可快速调整，点「手动输入」可直接键入（保存时校验 0–3600）· 保存后下一次触发立即生效`}</div>
+        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 点 ± 调整、长按连续加减（输入框锁定，不支持直接键入）· 保存后下一次触发立即生效`}</div>
     ${winErr && html`<${Hint} tone="error">${winErr}<//>`}
     <div class="cfg-block-head set-head">
       <span class="cfg-block-title">顶栏时间</span>
