@@ -2198,15 +2198,27 @@ check('通道健康锁: 释放时 fd>2 必须 close（close 分支不被静默�
       unlinkSync: () => {}
     }
   })
-  const probe = realFs.openSync(healthPath + '.fdprobe', 'w')
+  // 探针必须落在**不可预测**的私有目录里：旧写法 `os.tmpdir() + '/channel-health.state.fdprobe'`
+  // 名字可预测、写盘也不带 O_EXCL，同机任何进程都能抢先占位——先建同名目录 ⇒ 这里 `openSync` EISDIR
+  // 直接炸（用例在断言前崩），先建同名符号链接 ⇒ `'w'` 打开会把别人的目标文件截成 0 字节而套件照旧
+  // 全绿（实测 243/243、受害文件 31 → 0 字节）。CodeQL 视作「Insecure creation of file in the os temp dir」。
+  // 前缀按本文件 C5-025 口径用 `xbkunit-`（不是 `xbk-`：后者落进 check-host-clean 的「过期沙箱」命名
+  // 空间，被 SIGKILL 后的残留会误拦下一轮 check）；本用例是早期注册的，mkTmpFixture 的 const 尚未初始化，
+  // 故就地建目录并在 finally 里整目录删除。
+  const tmpDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-fdprobe-'))
+  const probePath = path.join(tmpDir, 'probe')
+  const probe = realFs.openSync(probePath, 'w')
   try {
+    // 前置断言：探针必须真是本用例独占的普通文件（私有目录被同名目录/符号链接顶替时当场点名，
+    // 而不是让下面的 EBADF 断言在无关失败形态上给出误导文本）
+    assert.ok(realFs.statSync(probePath).isFile(), '探针必须落在 mkdtemp 私有目录里的普通文件上')
     assert.ok(probe > 2, `探针 fd 必须 >2，实际 ${probe}`)
     app._releaseChannelHealthLock(healthPath + '.lock', probe)
     assert.deepStrictEqual(closed, [probe], `fd>2 时必须 close 锁 fd，实际关闭：${closed.join(',') || '无'}`)
     assert.throws(() => realFs.fstatSync(probe), /EBADF/, 'close 之后该 fd 必须已失效')
   } finally {
     try { realFs.closeSync(probe) } catch { /* 已关闭 */ }
-    try { realFs.unlinkSync(healthPath + '.fdprobe') } catch { /* 不存在 */ }
+    realFs.rmSync(tmpDir, { recursive: true, force: true })
   }
 })
 
