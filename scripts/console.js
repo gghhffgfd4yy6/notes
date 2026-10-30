@@ -852,7 +852,7 @@ function serveStatic (req, res, route, spec, assetVersion = null) {
   }
   const entry = store.table.get(route)
   const useGzip = acceptsGzip(req.headers['accept-encoding'])
-  const etag = useGzip ? entry.gzipEtag : entry.etag
+  const assetEtag = useGzip ? entry.gzipEtag : entry.etag
   // 内容寻址有两种写法：旧页面的 ?v=<version>，和新页面把版本写进路径（/assets/<version>/file）。
   // 路径写法只在**版本等于当前资产哈希**时发 immutable；部署前打开的旧页面仍能取到文件
   // （宁可给它当前字节，也不要 404 白屏），但只能 no-store——否则会把新字节写进旧版本的
@@ -876,10 +876,10 @@ function serveStatic (req, res, route, spec, assetVersion = null) {
     // 数据面不在此列——HTML 由 applyPageHeaders 明确 no-store，API 出口按各分支自设 Cache-Control。
     // 裸 URL（app.js 内部 `import './pure.mjs'`）不走内容寻址，仍 no-cache + ETag 协商。
     'Cache-Control': cacheControl,
-    ETag: etag,
+    ETag: assetEtag,
     Vary: 'Accept-Encoding'
   }
-  if (etagMatches(req.headers['if-none-match'], etag)) {
+  if (etagMatches(req.headers['if-none-match'], assetEtag)) {
     res.writeHead(304, headers)
     res.end()
     return
@@ -894,13 +894,6 @@ function escapeHtml (s) {
   return String(s === undefined || s === null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
-}
-
-function formatMs (ms) {
-  if (!Number.isFinite(ms) || ms < 0) return '—'
-  if (ms < 1000) return `${ms}ms`
-  const s = Math.round(ms / 100) / 10
-  return `${s}s`
 }
 
 // ── 访问日志（v3.300）──────────────────────────────────────────────────────
@@ -2542,7 +2535,10 @@ function readWatchState (stateDir) {
   }
 }
 
-// 兼容旧调用点：只关心关注词的地方仍拿 { status, words }。
+// 兼容投影：关注词字段的**唯一真源**是 readWatchState（解析/归一/上限都在那里），
+// 这里只把结果裁成 { status, words } 给「只关心关注词」的调用方。生产代码零调用点
+// （本仓 grep 只剩本定义与导出表），实际消费者是 test_console.js 对坏文件 status
+// 的口径断言——删除会连带改该断言，故保留；不要在这里加解析逻辑，否则两处语义会漂。
 function readLineWatchWords (stateDir) {
   const s = readWatchState(stateDir)
   return { status: s.status, words: s.words }
@@ -5617,12 +5613,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // SameSite=Lax（审查 #224：Strict 会让「从聊天点链接」的跨站顶层导航不带 Cookie，
       // 首屏必 401；Lax 对同源子请求照常携带，而写动作 POST /trigger 本就不收 Cookie，
       // 因此不扩大 CSRF 面）、Path=/；token 本身就是会话凭证，无需另发随机值。
-      // Max-Age 30 天：自用工具，过期后重新打开 ?token= 链接即续期。
+      // Max-Age 1 天（86400 秒，真源是 sessionCookieHeaderFor 的默认值）：自用工具，过期后重新打开
+      // ?token= 链接即续期。
       // Sourcery 3x High（Cookie 无 Secure）：本服务部署在明文 HTTP 上（无 TLS 终结点），
       // Secure 属性会让浏览器拒绝在 http:// 上发送/存储 Cookie，控制台直接不可用——
       // 这是部署形态的固有权衡，不是代码缺陷可修；上 HTTPS（反代/自签）后应第一时间
       // 补 Secure + __Host- 前缀。缓解：HttpOnly（XSS 拿不走）+ SameSite=Lax（跨站顶层
-      // 导航可带，但 POST 不收 Cookie）+ Max-Age 从 30 天收窄到 1 天 + Referrer-Policy（见下）。
+      // 导航可带，但 POST 不收 Cookie）+ Max-Age 曾为 30 天、现已收窄到 1 天（86400 秒）+ Referrer-Policy（见下）。
       res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       // HTML 只发 identity：压缩统一由边缘 Caddy 完成（见 sendJson 注释）。
       // no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入。
@@ -6879,7 +6876,6 @@ module.exports = {
   SESSION_COOKIE,
   THEMES,
   escapeHtml,
-  formatMs,
   renderPage,
   authorize,
   ACTIONS,
