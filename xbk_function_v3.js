@@ -44,17 +44,17 @@ const safeRe = (src, flags) => {
   return r
 }
 
-// 用户配置正则不允许在缺少 RE2 时回退到 V8 原生 RegExp：复杂模式可能阻塞单线程事件循环。
-// 内部固定正则仍由 safeRe() 处理；这里仅作为用户配置正则的编译闸门。
-// ⚠️ RE2 兼容性（取舍说明）：RE2 为线性时间、无回溯，因此不支持 V8 的部分语法——
-// 反向引用（/(a)\1/）、lookbehind（/(?<=x)/）、命名捕获组的部分写法等。
-// 装了 re2 后，原本在 V8 下可用的这类用户正则可能编译失败被跳过（有告警），
-// 表现为规则静默不生效；这是「防 ReDoS 卡死事件循环」的刻意取舍。
-// 注意：未安装 re2 时用户配置正则同样会被跳过（不会回退 V8），不存在“不装就能用
-// 反向引用/lookbehind”的选项——使用这些特性只能改写为 RE2 兼容语法。
-function compileUserRegex (source, flags = 'i') {
-  if (typeof source !== 'string' || !RE2C) return null
-  try { return new RE2C(source, flags) } catch (e) { return null }
+// 用户配置正则不允许在缺少 RE2 时回退到 V8 原生 RegExp：复杂模式可能阻塞单线程事件循环；内部固定正则仍由 safeRe() 处理。
+// ⚠️ RE2 兼容性（取舍说明）：RE2 为线性时间、无回溯，因此不支持 V8 的部分语法——反向引用 /(a)\1/、lookbehind、
+// 命名捕获组的部分写法等。装了 re2 后，原本在 V8 下可用的这类用户正则可能编译失败被跳过（有告警），表现为规则
+// 静默不生效；未安装 re2 时同样跳过（不回退 V8），不存在「不装就能用反向引用/lookbehind」的选项——只能改写为 RE2 兼容语法，这是「防 ReDoS 卡死事件循环」的刻意取舍。
+// C1-023：编译失败原因曾被内部 catch 吞掉，调用方只剩「无效或环境不支持」的泛化告警——三种失败（源码非字符串 /
+// 未安装 re2 / RE2 语法不支持）的处置完全不同，故经 onError 回传，供调用方写进告警与 run.log，不再有无原因的失败。
+function compileUserRegex (source, flags = 'i', onError) {
+  const fail = (reason) => { if (typeof onError === 'function') onError(reason); return null }
+  if (typeof source !== 'string') return fail(new Error('正则源码不是字符串'))
+  if (!RE2C) return fail(new Error('当前环境未安装可用的 re2，用户配置正则被跳过'))
+  try { return new RE2C(source, flags) } catch (e) { return fail(e) }
 }
 
 function isRe2Available () {
@@ -176,7 +176,7 @@ const Config = {
   },
 
   // 推送模式：sequential=顺序逐条 | parallel=并行滑动窗口(默认)
-  // parallelLimit：并发上限；并行模式下完成一条立即补下一条，0=按消息总数作为窗口
+  // parallelLimit：并发上限；并行模式下完成一条立即补下一条，0=按消息总数作为窗口（夹取口径唯一实现在 xbk_app.resolveParallelWindow：取整 / 0→消息总数 / 上限 50 / 兜底 1）
   // titleMax/contentMax：推送截断长度（v3.69 可配置；各通道 API 限制不一，如 Server酱 title 限 32 字符）
   push: {
     mode: 'parallel',
