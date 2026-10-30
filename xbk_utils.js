@@ -11,6 +11,17 @@ const FILTER_FIELDS = [
 ]
 const TRACKING_QUERY_NAMES = new Set(['fbclid', 'gclid', 'dclid', 'msclkid', 'yclid', 'mc_cid', 'mc_eid', 'igshid', '_ga', '_gl'])
 
+// getMessageIdentity 的匿名合成键字段清单：顺序即 anonKey 的实参顺序，且是唯一来源。
+// 「历史匿名 id 降级判据」与「无 id/url 的匿名身份」两处必须共用本清单与同一个调用点——
+// 曾把 10 参数调用逐字写两遍，加字段/改顺序只改一半时降级判据静默失效（kind 由 anon 变 id），
+// 同一批消息的缓存身份整体漂移。
+const IDENTITY_ANON_FIELDS = Object.freeze(['title', 'content', 'posttime', 'shijianchuo', 'pic', 'mall_name', 'price', 'brand', 'catename', 'louzhu'])
+
+/** 按 IDENTITY_ANON_FIELDS 的固定顺序计算「消息自身」的匿名合成键；getMessageIdentity 的两条分支共用。 */
+function messageAnonKey (utils, message) {
+  return utils.anonKey(...IDENTITY_ANON_FIELDS.map((field) => utils.safeGet(message, field)))
+}
+
 // ---------- 魔法数字常量 ----------
 const DAY_MS = 24 * 60 * 60 * 1000 // 一天的毫秒数
 const TS_BOUND = Number('100000000000') // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
@@ -406,12 +417,14 @@ function createUtils (options = {}) {
     let s
     try { s = String(url) } catch (e) { return false }
     // v3.245 P0(XSS)：浏览器解析 href/src 时会解码命名实体——&colon;→':'、&Tab;→'\t'、
-    // &NewLine;/&Newline;/&NewLine → '\n'、&nbsp;→'\u00A0'。decodeHtmlEntities 的 ENTITY_MAP
-    // 不含这些，故在安全校验链路上单独解码，防止 javascript&colon;alert(1) 绕过黑名单。
-    // 注意：只在此链路解码，不污染 ENTITY_MAP（消息正文渲染口径不变）。
+    // &NewLine;（含 &Newline;/&NEWLINE; 等大小写变体，下方 /gi 一并命中）→'\n'、&nbsp;→'\u00A0'。
+    // decodeHtmlEntities 的 ENTITY_MAP 不含这些，故在安全校验链路上单独解码，防止
+    // javascript&colon;alert(1) 绕过黑名单。注意：只在此链路解码，不污染 ENTITY_MAP
+    // （消息正文渲染口径不变）。
     // v3.258 C009：named 实体替换改为大小写不敏感查表（&Colon;/&COLON; 等变体统一收敛）。
     // 双编码防护：decodeHtmlEntities 后再跑一次 named 替换，确保 &amp;colon; → &colon; → ':' 被识别。
-    const decodeNamed = (str) => str.replace(/&(?:colon|Tab|NewLine|Newline|nbsp);/gi, m => ({ '&colon;': ':', '&tab;': '\t', '&newline;': '\n', '&nbsp;': '\u00A0' })[m.toLowerCase()] || '')
+    // 交替里只留 NewLine 一支：/gi 下 Newline 与 NewLine 完全等价，单独成支不可能命中（C6-007）。
+    const decodeNamed = (str) => str.replace(/&(?:colon|Tab|NewLine|nbsp);/gi, m => ({ '&colon;': ':', '&tab;': '\t', '&newline;': '\n', '&nbsp;': '\u00A0' })[m.toLowerCase()] || '')
     s = decodeNamed(s)
     s = this.decodeHtmlEntities(s)
     s = decodeNamed(s)
@@ -988,18 +1001,7 @@ function createUtils (options = {}) {
       // 'anon:abc123'（全十六进制），也与自身内容哈希不同 → 保持 id/url 权威判重，
       // 不再被误降级而丢失 id/url 判重（v3.247 修复）。
       if (/^anon:[0-9a-f]+$/i.test(idKey) && !url) {
-        const selfAnon = this.anonKey(
-          this.safeGet(message, 'title'),
-          this.safeGet(message, 'content'),
-          this.safeGet(message, 'posttime'),
-          this.safeGet(message, 'shijianchuo'),
-          this.safeGet(message, 'pic'),
-          this.safeGet(message, 'mall_name'),
-          this.safeGet(message, 'price'),
-          this.safeGet(message, 'brand'),
-          this.safeGet(message, 'catename'),
-          this.safeGet(message, 'louzhu')
-        )
+        const selfAnon = messageAnonKey(this, message)
         // 自内容哈希须与 id 一致，且非「全空字段退化键」(anon:1505cde7) 才视为历史匿名合成键
         if (selfAnon !== this.anonKey() && selfAnon === idKey) {
           return { valid: true, kind: 'anon', key: idKey, idKey: '', url: '', anonKey: idKey }
@@ -1009,18 +1011,7 @@ function createUtils (options = {}) {
     }
     const url = this.validUrl(ownUrl ? this.safeGet(message, 'url') : undefined)
     if (url) return { valid: true, kind: 'url', key: `url:${url}`, idKey: '', url }
-    const anon = this.anonKey(
-      this.safeGet(message, 'title'),
-      this.safeGet(message, 'content'),
-      this.safeGet(message, 'posttime'),
-      this.safeGet(message, 'shijianchuo'),
-      this.safeGet(message, 'pic'),
-      this.safeGet(message, 'mall_name'),
-      this.safeGet(message, 'price'),
-      this.safeGet(message, 'brand'),
-      this.safeGet(message, 'catename'),
-      this.safeGet(message, 'louzhu')
-    )
+    const anon = messageAnonKey(this, message)
     // 全字段为空时 anonKey 哈希空串退化为固定键(anon:1505cde7)，会使所有此类消息判为同一身份而互相吞掉。
     // 退化为无效身份，让每条无标识消息各自独立、不再参与匿名判重。
     if (anon === this.anonKey()) return { valid: false, kind: 'invalid', key: '', idKey: '', url: '' }
