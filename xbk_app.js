@@ -1438,7 +1438,7 @@ function createApp ({
           } else {
             let kwRe = null
             if (RuleEngine.hasNestedQuantifier(kw)) {
-              console.warn('⚠️ 配置「zkt_gjc」的正则含嵌套量词，可能导致灾难性回溯，已忽略只看它过滤')
+              console.warn('⚠️ 配置「zkt_gjc」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），已忽略只看它过滤')
             } else {
               try {
                 kwRe = compileUserRegex(kw, 'i')
