@@ -595,6 +595,44 @@ testCase('补测 classifyFailure 聚合与 classifySummary 边界', async () => 
   }).kind, 'permanent')
 })
 
+// C9-003（返工）：上一版只堵住 missing / NaN / 非数字串 / 负数 / 普通对象 / Symbol，`Number()` 的强制
+// 转换仍把 null / '' / '   ' / [] / false 洗成 0。同一票面（failures 非空）只把 failed 换个类型就
+// 重新落进 failed<=0 分支返回 null → 退出码 0、告警不触发。计数缺失/非法时以 failures 条数为证据。
+testCase('C9-003 failed 非法类型不得被 Number() 洗成 0', async () => {
+  const ILLEGAL_FAILED = [
+    ['null', null],
+    ['空串', ''],
+    ['纯空白串', '   '],
+    ['空数组', []],
+    ['布尔 false', false],
+    ['普通对象', {}],
+    ['Symbol', Symbol('failed')]
+  ]
+  for (const [label, value] of ILLEGAL_FAILED) {
+    const decision = classifySummary({ total: 3, pushed: 0, failed: value, failures: [{ code: 'ETIMEDOUT' }] })
+    assert.ok(decision, `failed=${label} + 非空 failures 不得判成功（返回 null）`)
+    assert.strictEqual(decision.kind, 'retryable', `failed=${label} 的失败摘要必须判可重试`)
+  }
+  // 根因口径：同一票面（total/failures 不变）换 failed 的类型，判定必须一致而非从 retryable 掉成 null
+  assert.strictEqual(
+    classifySummary({ total: 3, pushed: 0, failed: null, failures: [{ code: 'ETIMEDOUT' }] }).reason,
+    'PUSH_HAS_RETRYABLE_FAILURE')
+  // 合法计数仍然优先：number 与非空数字串都按上报值采信（'0' 是显式 0，dry-run 口径不翻案）
+  assert.strictEqual(classifySummary({ total: 3, pushed: 0, failed: 1, failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable')
+  assert.strictEqual(classifySummary({ total: 3, pushed: 0, failed: '1', failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable')
+  assert.strictEqual(classifySummary({ total: 3, pushed: 0, failed: ' 2 ', failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable')
+  assert.strictEqual(classifySummary({ total: 3, pushed: 0, failed: '0', failures: [{ code: 'ETIMEDOUT' }] }), null,
+    'failed="0" 是显式 0，仍按成功口径')
+  // 反向断言：非法计数 + 无 failures 时没有失败证据，仍返回 null（不得放宽成「一律失败」）
+  for (const [label, value] of ILLEGAL_FAILED) {
+    assert.strictEqual(classifySummary({ total: 3, pushed: 0, failed: value }), null,
+      `failed=${label} 且无 failures 时不构成失败证据，仍为成功`)
+  }
+  // 敌意/不可转换的字符串同样回落 failures 条数，且不抛
+  assert.doesNotThrow(() => classifySummary({ total: 3, failed: 'abc', failures: [{ code: 'ETIMEDOUT' }] }))
+  assert.strictEqual(classifySummary({ total: 3, failed: '       1.0e3  ', failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable')
+})
+
 testCase('summarizeError 递归防护（自引用/深度/兄弟重复）', async () => {
   // ============ 补测：失败摘要递归防护（自引用 / 深度上限 / 兄弟重复）+ failureInfo 脱敏 ============
 

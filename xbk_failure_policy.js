@@ -17,6 +17,10 @@ const RETRYABLE_CODES = new Set([
 
 const PERMANENT_CODES = new Set([
   'ERR_INVALID_URL', 'ERR_BODY_NOT_JSON', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_INVALID_ARG_TYPE',
+  // C8-004：响应体超过本地上限（xbk_http.fetchJson 与推送出口 xbk_sendNotify_slim.$.post 用的同一个码）。
+  // 此前它不在任何集合里 → 落 UNKNOWN 判可重试，常驻每轮重新下载同一个 20MB+ 响应体、在同一处再失败。
+  // 重试同一请求的结果必然相同（与 ERR_BODY_NOT_JSON 同属「响应内容不合契约」的确定性错误），故归永久。
+  'EBODYLIMIT',
   'MODULE_NOT_FOUND', 'NO_CHANNEL_CONFIG',
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
   'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'CERT_SIGNATURE_FAILURE', 'CERT_REVOKED',
@@ -448,10 +452,36 @@ function classifyFailure (error) {
   return classifyOne(error)
 }
 
+// C9-003：`Number(summary.failed) || 0` 把「缺失 / NaN / 非数字」一律洗成 0——「报了 failures 但没报计数」
+// 的摘要因此落进 failed<=0 分支被判成功（退出码 0，失败被静默吞掉）。计数只描述规模，不该是「有没有失败」
+// 的唯一证据：缺失/非法时用结构化 failures 的条数兜底（有多少条失败原因就至少有多少条没送达）。
+// 显式合法计数（含 0）仍然优先——`failed: 0` 是上报方的明确断言（dry-run 就是这种口径），不在这里翻案。
+// **先校验类型再转换**：Number() 是强制转换而非解析，null / '' / 纯空白 / [] / false 都不抛错，而是被
+// 转成 0——「没上报计数」与「明确 0 条失败」被混为一谈，同一票面只把 failed 换个类型就能重新落进
+// failed<=0 判成功。故只接受 number（有限、非负）或「非空、可整体转成非负有限数字」的字符串，
+// null / '' / 纯空白串 / 数组 / 布尔 / 对象 / Symbol 一律按非法处理 → 回落 failures 条数。
+// try 保留：Symbol 等类型会让 Number() 抛 TypeError，本模块「绝不抛」契约不能破（取值也可能来自
+// 敌意 getter，readProp 已兜住，这里仍按非法计数收口）。
+function failureCountOf (summary, failures) {
+  const fallback = failures.length
+  try {
+    const raw = readProp(summary, 'failed')
+    if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+    if (typeof raw === 'string') {
+      const text = raw.trim()
+      if (text === '') return fallback
+      const n = Number(text)
+      return Number.isFinite(n) && n >= 0 ? n : fallback
+    }
+  } catch (e) { /* 非法计数：落到 failures 条数 */ }
+  return fallback
+}
+
 function classifySummary (summary) {
   if (!summary || typeof summary !== 'object') return null
   const pushed = Number(summary.pushed) || 0
-  const failed = Number(summary.failed) || 0
+  const failures = safeArray(readProp(summary, 'failures')) || []
+  const failed = failureCountOf(summary, failures)
   // C9-002：cacheSaved 此前从未被分类器读取——消息确实推出去了、但成功记录没落盘，下次运行会重复
   // 推送（另一半是「推送成功但缓存丢了」），运维却只能看到绿色退出码。落盘失败优先判定：它不是
   // 通道问题，重试即可恢复，故归 retryable/CACHE_SAVE_FAILED。
@@ -466,8 +496,8 @@ function classifySummary (summary) {
   // total 来自 `Number(summary.total) || 0`——total 缺失、非数字（或恰好为 0）时即为 0，
   // 于是一个「报了失败但没报 total / total 非数字」的摘要被判成「无失败」返回 null，
   // 调度器据此读成成功（绿色），失败被静默吞掉。total 只描述本轮规模，不参与该判定。
+  // C9-003：failed 的口径见 failureCountOf——缺失/非法的计数不再被洗成 0，非空 failures 即为失败证据。
   if (failed <= 0) return null
-  const failures = safeArray(readProp(summary, 'failures')) || []
   // C9-002：pushed/failed 都是**消息**级计数——pushed>0 只说明「本轮不是全灭」，不说明「没有失败」。
   // 旧实现只要 pushed>0 就返回 null（1 条成功 + 99 条失败 → 退出码 0、告警不触发、99 条被静默吞掉）。
   // 部分失败同样是失败：给出 degraded 判定让入口置非零退出码并告警。kind 固定 retryable——还有消息
