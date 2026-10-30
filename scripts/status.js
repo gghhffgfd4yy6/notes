@@ -453,7 +453,7 @@ const TREND_DAYS_LIMIT = 92
 const TREND_DAYS_FALLBACK = 14
 function clampTrendDays (v) {
   let n
-  try { n = Number(v) } catch (e) { n = NaN } // Number(Symbol) 抛 TypeError，钳制函数本身不许抛
+  try { n = Number(v) } catch (e) { n = Number.NaN } // Number(Symbol) 抛 TypeError，钳制函数本身不许抛
   if (!Number.isFinite(n)) return TREND_DAYS_FALLBACK
   return Math.min(TREND_DAYS_LIMIT, Math.max(1, Math.trunc(n)))
 }
