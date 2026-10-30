@@ -26,7 +26,11 @@ const STATE_TEXT_MAX_BYTES = 64 * 1024
 const MESSAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 // 判重身份墓碑：缓存裁剪丢弃的记录身份独立保留（见 MessageStore._tombstone*），
 // 上限按每类键数约束，防止墓碑文件随裁剪无限膨胀。
-const TOMBSTONE_MAX_KEYS = 5000 // 每类墓碑键上限（id/urlOnly/idWithUrl/anon 各 5000）
+// C6-006：TOMBSTONE_MAX_KEYS 是每类键数的**下限**，不是死上限——墓碑容量必须 ≥ 同一次裁剪
+// 可能丢弃的身份数，否则一次满缓存裁剪（缓存条数上限默认 DEFAULT_MAX_SIZE=10000）会让最旧的
+// 一半身份当场失去防重放保护。实际生效上限由 MessageStore 按当次 maxSize 取
+// max(TOMBSTONE_MAX_KEYS, maxSize)（见 _tombstoneKeyCap），本常量只兜住不带 maxSize 的路径。
+const TOMBSTONE_MAX_KEYS = 5000 // 每类墓碑键数下限（生效上限跟随缓存条数上限，见上）
 const TOMBSTONE_MAX_BYTES = 8 * 1024 * 1024 // 墓碑文件读取/写入体积上限
 const TOMBSTONE_LOCK_STALE_MS = 10000 // 锁文件超过该年龄视为崩溃残留，可抢占
 
