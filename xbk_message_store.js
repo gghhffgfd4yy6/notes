@@ -7,7 +7,20 @@
 // （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
 // `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块只 require
 // 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
-const { timingSafeEqualStr } = require('./xbk_utils')
+const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
+
+// 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01）：
+//   max(TOMBSTONE_MAX_KEYS, maxSize)
+// TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 才是生产同一次裁剪
+// 最多能丢的条数（默认 10000 > 旧固定上限 5000：接口不能继续上报一个生产根本不执行的值）。
+// 控制台 /api/cache-health 的上报值（limits.tombstoneKeyMax）也调本函数推导，保证「报出的上限」
+// 与「生产真正强制的上限」是同一份规则，不出现两处各写一份常量。
+// floorKeys 仅供实例注入的 constants 覆盖（测试用小常量），生产缺省即 xbk_utils 的常量本尊。
+function tombstoneKeyCap (maxSize, floorKeys = TOMBSTONE_MAX_KEYS) {
+  const floor = Number.isInteger(floorKeys) && floorKeys > 0 ? floorKeys : TOMBSTONE_MAX_KEYS
+  return Number.isInteger(maxSize) && maxSize > floor ? maxSize : floor
+}
+
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   const candidate = path.resolve(root, raw)
   const realInsideRoot = (p) => {
@@ -743,10 +756,10 @@ function createMessageStore ({
 
     /** 墓碑每类键数上限（C6-006）：必须 ≥ 同一次裁剪可能丢弃的身份数，否则「满缓存裁剪」后
      *  最旧的一半身份当场失去防重放保护（缓存上限默认 10000 条 > 旧固定上限 5000 键）。
-     *  调用方按当次 maxSize 传口径，取 max(TOMBSTONE_MAX_KEYS, maxSize)：TOMBSTONE_MAX_KEYS 是
-     *  下限（不带 maxSize 的路径仍用它），maxSize 是真正能一次被裁掉的条数上界。 */
+     *  规则只有一份实现：模块级 tombstoneKeyCap（控制台 /api/cache-health 也用它上报），
+     *  这里只把实例注入的 constants.TOMBSTONE_MAX_KEYS 当下限传进去。 */
     _tombstoneKeyCap (maxSize) {
-      return Number.isInteger(maxSize) && maxSize > TOMBSTONE_MAX_KEYS ? maxSize : TOMBSTONE_MAX_KEYS
+      return tombstoneKeyCap(maxSize, TOMBSTONE_MAX_KEYS)
     },
 
     // ===== F1（P1）：坏/超限缓存的「隔离 + 重建」自愈 =====
@@ -1885,6 +1898,7 @@ module.exports = {
   createMessageStore,
   resolveCacheDirInRoot,
   removeStaleTombstoneFile,
+  tombstoneKeyCap,
   IDENTITY_INDEX_REF_PROBE_WINDOW,
   IDENTITY_INDEX_IDENTITY_PROBE_WINDOW
 }

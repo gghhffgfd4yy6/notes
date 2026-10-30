@@ -28,9 +28,9 @@ const etag = require('etag')
 const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
-const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
+const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
 const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
-const { removeStaleTombstoneFile } = require('../xbk_message_store') // C3-013：清残留墓碑（实现与注释见 store）
+const { removeStaleTombstoneFile, tombstoneKeyCap } = require('../xbk_message_store') // C3-013：清残留墓碑 / CR-01：墓碑上限同一规则
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
 // 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
 const FilterStore = require('../xbk_filter_store')
@@ -287,7 +287,10 @@ function defaultHealthLimits () {
     writeMaxBytes: MESSAGE_CACHE_MAX_BYTES,
     consoleReadMaxBytes: MESSAGES_MAX_BYTES,
     entryMax,
-    tombstoneKeyMax: TOMBSTONE_MAX_KEYS,
+    // 墓碑键数上限不再写死 TOMBSTONE_MAX_KEYS（评审 CR-01）：生产真正的上限是
+    // max(TOMBSTONE_MAX_KEYS, maxSize)，由 xbk_message_store 的 tombstoneKeyCap 唯一推导——
+    // 上报值必须与运行侧强制的是同一条规则，否则接口报的 5000 生产根本不执行。
+    tombstoneKeyMax: tombstoneKeyCap(entryMax),
     tombstoneMaxBytes: TOMBSTONE_MAX_BYTES
   }
 }
