@@ -968,6 +968,12 @@ function TrendsPanel ({ active = true }) {
   const [selDay, setSelDay] = useState(null)
   const toggleDay = (date) => setSelDay((cur) => (cur === date ? null : date))
   // 横向滚动：默认停在最右侧（最近一天），用户可直接左滑看更早日期
+  // 对齐重算的触发指纹（C7-051）：旧依赖只有 byDay.length，等长窗口切换（14 天区间 → 另一段
+  // 14 天区间、或 30→60→30 来回切回同样天数）时列集合全换了但 key 没变，内联 paddingRight
+  // 停在上一组列算出的值 ⇒ 右端空白累积/最右几列跑出容器。列宽是固定的 34px（.trend-col），
+  // 几何只由「列数 + 各自日期」决定，故指纹只取日期序列：条数变化（同一窗口的下一拍轮询）
+  // 不该重跑——那会把用户左滑查看的位置强行拽回最右端。
+  const alignKey = byDay.map((d) => d.date).join('|')
   const scrollRef = useRef(null)
   // 对齐必须在绘制前完成：切窗口时一组新列在同一个 commit 里换进来，
   // 若放到 useEffect（绘制后）再对齐，会先画出一帧「沿用旧 scrollLeft、指向窗口最早几天」的
@@ -1007,7 +1013,7 @@ function TrendsPanel ({ active = true }) {
     }
     const schedule = () => { if (raf === 0) raf = window.requestAnimationFrame(align) }
     align()
-    // 容器宽度变化（横竖屏、窗口缩放）时 byDay.length 不变，也必须重新对齐；
+    // 容器宽度变化（横竖屏、窗口缩放）时列集合固定，也必须重新对齐；
     // 否则会保留旧 padding/滚动位置，最右几列又跑出容器（Sourcery #254）。
     let ro = null
     if (typeof window.ResizeObserver === 'function') {
@@ -1021,7 +1027,7 @@ function TrendsPanel ({ active = true }) {
       if (ro !== null) ro.disconnect()
       else window.removeEventListener('resize', schedule)
     }
-  }, [byDay.length])
+  }, [alignKey])
   return html`<div class="panel">
     <${PanelHead} title=${shownRange ? `运行趋势（${shownRange}）` : (shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势')}
       afterTitle=${html`<div class="toolbar">
@@ -1098,7 +1104,14 @@ function CacheHealthPanel ({ paused = false, active = true }) {
         filesLoader.load().catch(() => {})
       }
     }
-    const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
+    const t = setInterval(() => {
+      if (document.visibilityState === 'hidden') return
+      // C7-043：右列文件清单必须跟左列同一拍刷新。旧实现只调 load()，两列从此各自新鲜度
+      // 不同步——页面开着过夜时左列 mtime 在走、右列还停在首次快照（files 数组与大小都过期）。
+      // /api/files 与文件清单页共用 once('files') 的在飞去重，不会和那边的请求叠发。
+      load().catch(() => {})
+      filesLoader.load().catch(() => {})
+    }, 60000)
     // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
     // 通知当前页签的面板，这里再挂一个就会被拉两次（Sourcery PR #300）。
     return () => clearInterval(t)
@@ -2876,8 +2889,11 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
 // v3.342：控制台设置块（v3.340 在配置页，v3.342 搬到系统页「设置」）。
 // 一条读面 + 两个写面：通知自检拦截窗、顶栏时间是否显示年月日。读面失败只影响本块。
 function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, active = true }) {
-  // 拦截窗草稿：输入框可自由键入，保存前统一校验（整数 0–3600）；用户正在改（dirty）时
-  // 刷新回来的生效值不覆盖输入框，避免「改到一半被定时重拉吃掉」。
+  // 拦截窗草稿：数字框是锁定只读的（手机端滚动/误触点一下就弹键盘，整行被挡住），
+  // 调整只有「−/+」这一条路径：单击步进、长按连续加减，两端在 adjustWin 里夹到常量范围。
+  // 不支持直接键入，所以这里也没有「非法输入」要拦——C7-046：旧注释声称可自由键入、
+  // 保存前统一校验，而框是永久 disabled，那层校验永远进不去（已删）。
+  // 用户正在改（dirty）时刷新回来的生效值不覆盖草稿，避免「改到一半被定时重拉吃掉」。
   const [winDraft, setWinDraft] = useState('')
   const [winDirty, setWinDirty] = useState(false)
   const [winErr, setWinErr] = useState('')
@@ -2925,11 +2941,12 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
     winSyncedRef.current = winCurrent
     setWinDraft(String(winCurrent))
   }, [winCurrent, winDirty])
+  // 草稿只可能来自下面同步 effect 的回填，或本函数上一次的夹取结果，必是 0–3600 的整数；
+  // 首帧 effect 还没跑（草稿为空串）时以生效值为基准。夹取在写入时完成，保存端不再校验。
   const adjustWin = (delta) => {
     if (winCurrent === null || winSavingRef.current) return
     setWinDraft((prev) => {
-      const typed = prev.trim() === '' ? Number.NaN : Number(prev)
-      const base = Number.isInteger(typed) ? typed : winCurrent
+      const base = prev === '' ? winCurrent : Number(prev)
       const next = Math.min(NOTIFY_WINDOW_MAX_S, Math.max(NOTIFY_WINDOW_MIN_S, base + delta))
       return String(next)
     })
@@ -2938,25 +2955,21 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
     setWinErr('')
   }
   const holdWin = useHoldRepeat(adjustWin, winCurrent === null || winSaving)
-  // 保存：客户端只做「整数 0–3600」这一层拦截（非法值不发请求）；带 baseRevision 做乐观锁，
-  // 别处改过就 409，这里重读让用户看清当前值再决定。
+  // 保存：草稿只会由 ± / 长按产生，写入时已经夹在 NOTIFY_WINDOW_MIN_S–NOTIFY_WINDOW_MAX_S，
+  // 客户端没有「非法值」要拦（旧的那层校验对着永远 disabled 的框，永远进不去——C7-046 已删）。
+  // 带 baseRevision 做乐观锁，别处改过就 409，这里重读让用户看清当前值再决定。
   const saveWin = async () => {
     setWinErr('')
     // 连点两次会各带同一个 baseRevision 发两次 POST，第二次必然 409——那是自己造的冲突，
     // 页面却会同时出现「已保存」和「设置已被别处改过」。入口与按钮双守卫。
     if (winSavingRef.current) return
     if (!settingsLive || winCurrent === null) { setWinErr('当前生效值未读到，先刷新再改'); return }
-    // 空串必须按非法处理：Number('') === 0，若直接转数字会把「清空输入框再点保存」
-    // 静默解释成 0（关闭拦截）——那是最不该靠猜的语义。
-    const typed = winDraft.trim() === '' ? Number.NaN : Number(winDraft)
-    if (!Number.isInteger(typed) || typed < NOTIFY_WINDOW_MIN_S || typed > NOTIFY_WINDOW_MAX_S) {
-      setWinErr(`拦截窗必须是 ${NOTIFY_WINDOW_MIN_S}–${NOTIFY_WINDOW_MAX_S} 的整数（秒）`)
-      return
-    }
+    // 首帧同步 effect 还没跑时草稿仍为空串：保存的就是生效值本身（不是 Number('') 的 0）。
+    const next = winDraft === '' ? winCurrent : Number(winDraft)
     winSavingRef.current = true
     setWinSaving(true)
     try {
-      const res = await apiPostConsoleSettings({ notifyTestReplayWindowS: typed, baseRevision: winBaseRevRef.current === null ? settingsLive.revision : winBaseRevRef.current })
+      const res = await apiPostConsoleSettings({ notifyTestReplayWindowS: next, baseRevision: winBaseRevRef.current === null ? settingsLive.revision : winBaseRevRef.current })
       const payload = res.data && typeof res.data === 'object' ? res.data : {}
       if (!res.ok) {
         if (payload.error === 'revision_mismatch') {
@@ -2971,7 +2984,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       }
       const saved = payload.settings && Number.isInteger(payload.settings.notifyTestReplayWindowS)
         ? payload.settings.notifyTestReplayWindowS
-        : typed
+        : next
       setWinDraft(String(saved))
       setWinDirty(false)
       setWinSaved(true)
@@ -3044,7 +3057,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       ? '正在读取当前生效值…'
       : winCurrent === null
         ? `当前生效值读取失败，暂不可修改（点右上「刷新」重试）：${settingsErr || '未知错误'}`
-        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 长按加减可快速调整 · 保存后下一次触发立即生效`}</div>
+        : `当前生效 ${winCurrent} 秒 · 0 = 关闭拦截（连点会重复真实发送）· 点 ± 调整、长按连续加减（输入框锁定，不支持直接键入）· 保存后下一次触发立即生效`}</div>
     ${winErr && html`<${Hint} tone="error">${winErr}<//>`}
     <div class="cfg-block-head set-head">
       <span class="cfg-block-title">顶栏时间</span>
