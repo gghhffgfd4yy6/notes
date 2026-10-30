@@ -947,6 +947,11 @@ function makePreCommitFixture () {
   }
   const env = sandboxEnv(home, { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` })
   initRepo(repo, home, env)
+  // 夹具仓库必须自带身份：sandboxEnv 关掉了 global/system 配置，CI 上没有可自动探测的
+  // user.name/email，`git commit` 会以 128「Author identity unknown」失败（本机靠 git 的
+  // 自动探测才没暴露）。身份写在仓库本地，夹具仍是 hermetic 的。
+  mustGit(['config', 'user.name', 'fixture'], { cwd: repo, env }, '配置夹具 user.name')
+  mustGit(['config', 'user.email', 'fixture@example.invalid'], { cwd: repo, env }, '配置夹具 user.email')
   const hooks = path.join(dir, 'hooks')
   fs.mkdirSync(hooks)
   const copied = path.join(hooks, 'pre-commit')
