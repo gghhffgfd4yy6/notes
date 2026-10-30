@@ -321,6 +321,9 @@ function App () {
   const busyRunIdRef = useRef(null)
   // 首次刷新完成前不判「无活跃任务」（启动时 runs 尚空，会把丢失响应的 busy 立刻清掉）。
   const refreshedOnceRef = useRef(false)
+  // 首屏那一发不受暂停开关影响（暂停也要先把页面填上）；之后暂停期间的 effect 重跑
+  // （切页签 / locking 翻转）不再补发请求（C7-040）。
+  const bootFetchedRef = useRef(false)
 
   // 每个页签记住自己的「数据截至」：切回已来过的页签时先显示上次时间，
   // 不再先闪一下「手动刷新」再跳成时间。第一次进入才显示占位符。
@@ -710,6 +713,10 @@ function App () {
   // 并允许触发（会被服务端 409 拒绝）。status.lock.held（共享 stateDir 的锁文件）参与判定。
   const active = runs.some((r) => !r.finishedAt) || !!(state && state.lock && state.lock.held === true)
   const locking = busy || active
+  // 轮询间隔只在这一处算（C7-059）：定时器、顶栏倒计时、面板自轮询全部用这同一个值。
+  // 同一个表达式写两遍就会漂移——改了一处忘了另一处，就是「倒计时说 4 秒、定时器按 60 秒走」。
+  // 判定在 pure.mjs 里（pollIntervalFor），Node 侧可直接断言。
+  const interval = pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })
 
   useEffect(() => {
     const onAuth = () => setAuthExpired(true)
@@ -744,7 +751,13 @@ function App () {
 
   useEffect(() => {
     if (authExpired) return undefined
-    refreshSplit()
+    // 只有「首屏」与「真的在自动刷新」才补这一发：暂停时切页签 / locking 翻转同样会让本
+    // effect 重跑，无条件 refreshSplit() 等于按了暂停还在打接口（C7-040）。首屏例外——
+    // 否则暂停着重开页面就是一片空白。
+    if (autoRefresh || !bootFetchedRef.current) {
+      bootFetchedRef.current = true
+      refreshSplit()
+    }
     clearInterval(timerRef.current)
     // v3.348：所有页都轮询（用户要求：推送记录/配置/过滤规则/系统 的「自动刷新」必须真的在跑）。
     // 概览/日志拉状态与历史；其余页由统一 tick 让当前面板重拉自己的数据。
@@ -752,8 +765,7 @@ function App () {
     // 暂停（autoRefresh=false）同样不建定时器；恢复时本 effect 重跑并立即补一次。
     if (!autoRefresh) return () => clearInterval(timerRef.current)
     // v3.374：SSE 在线 → 60s 安全轮询（tick 才是主通道）；断线自动回到 15s；任务在跑仍按
-    // POLL_BUSY_MS 快轮询。判定在 pure.mjs 里（pollIntervalFor），Node 侧可直接断言。
-    const interval = pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })
+    // POLL_BUSY_MS 快轮询。间隔取上面唯一那次 pollIntervalFor 的结果（见「轮询节奏」块）。
     const mark = () => setNextAt(Date.now() + interval)
     // 只在这一个地方持定时器：SSE tick 不另建 interval，它复用 runTick（顺带复位倒计时）。
     markRef.current = mark
@@ -1144,15 +1156,19 @@ function App () {
   const themeLabel = (THEMES.find((t) => t.key === theme) || THEMES[0]).label
   const nextThemeLabel = (THEMES[(THEMES.findIndex((t) => t.key === theme) + 1) % THEMES.length] || THEMES[0]).label
   // 顶栏倒计时与面板自轮询都用这个值，必须与真实定时器同源（v3.374）：SSE 在线时是 60s，
-  // 写死 15s 就会出现「4 秒后刷新」却 60 秒才动一次的假信息。
-  const pollMs = pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })
+  // 写死 15s 就会出现「4 秒后刷新」却 60 秒才动一次的假信息。值来自上面唯一那次
+  // pollIntervalFor（C7-059：同一文件算两遍容易漂移），这里只起个与用途同名的别名。
+  const pollMs = interval
   // 顶栏徽章只在「概览/日志 + 自动刷新开」时是活状态；其它情况（暂停、推送记录/配置/系统）
   // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
   // 顶栏徽章只在「自动刷新开 + 未失效」时是活状态；所有页都轮询（v3.348），
   // 不再有「（快照）」后缀——数据新旧看后面的时间。
+  // 启动数据损坏 ≠ 凭证失效（C7-034）：readBoot 把「注入内容解析失败」单独标成 bootError，
+  // 提示要指向真正能做的动作（刷新重注入），不能把用户引去「重新取 token」这条错路。
+  const bootBroken = BOOT.bootError === 'invalid-json'
   const livePolling = !authExpired && autoRefresh
   const badgeText = authExpired
-    ? '凭证失效'
+    ? (bootBroken ? '启动数据损坏' : '凭证失效')
     : locking ? '任务运行中' : '空闲'
   // 顶栏状态行：所有页同一套词，只有时间来源不同（概览看最近刷新，其它页看本页拉到数据的时间）。
   const syncAt = tab === 'overview' ? lastSync : panelSync
@@ -1184,8 +1200,10 @@ function App () {
 
     ${authExpired && html`<div class="alert-banner bad" role="alert">
       <div class="alert-main">
-        <strong>凭证已失效，控制台已停止自动刷新</strong>
-        <span class="alert-sub">请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。</span>
+        <strong>${bootBroken ? '页面启动数据损坏，控制台已停止自动刷新' : '凭证已失效，控制台已停止自动刷新'}</strong>
+        <span class="alert-sub">${bootBroken
+          ? html`页面注入的 xbk-boot JSON 岛解析失败（<strong>不是凭证问题</strong>）：刷新页面重新注入；仍失败请检查服务端 renderPage 的注入内容。`
+          : html`请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。`}</span>
       </div>
       <a class="alert-action" href="/">重新登录</a>
     </div>`}
