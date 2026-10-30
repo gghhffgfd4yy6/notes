@@ -11099,4 +11099,11 @@ ok('S15 回归：收尾异常处理器置退出码 1 并在失败清单留痕', 
   }
 })
 
+// S15 接线：handler 有了，接线也必须锁住——退回 .catch(() => {}) 时上面的用例照样绿。
+ok('S15 接线：runSuite(main()) 必须接到 handleSuiteFinishError', () => {
+  const src = fs.readFileSync(__filename, 'utf8')
+  assert.match(src, /runSuite\(main\(\)\)\.catch\(handleSuiteFinishError\)/,
+    '收尾必须接到具名 handler；换成空 catch 等于把兜底丢掉')
+})
+
 runSuite(main()).catch(handleSuiteFinishError)
