@@ -123,16 +123,24 @@ function schemaReport (seg, mutants) {
 // 场景 2b（C10-058）：参数是普通文件（存在但不是目录）→ exit 1 + 「不是目录」。
 // 这条分支只在 analyze() 里判定（main 的 existsSync 前置检查放行普通文件），改前改后都必须由
 // 「抛错 → main 的 catch → exit 1」这条路收尾：库函数不再自己 process.exit，CLI 行为逐字不变。
+// C4：夹具落点必须是**不可预测**的临时路径。旧写法 `path.join(os.tmpdir(), 'xbk-mut-report-notdir-<pid>')`
+// 名字可预测、写盘也不带 O_EXCL，同机任何进程都能抢先占位：先建同名目录 ⇒ 这里 `writeFileSync` EISDIR
+// 直接炸（用例还没跑到断言就崩），先建同名符号链接 ⇒ 写入被引到别人的目标文件上。CodeQL 据此判
+// 「Insecure creation of file in the os temp dir」。改为 mkdtempSync 先拿唯一目录（0700），普通文件落在里面。
 {
-  const tmpFile = path.join(os.tmpdir(), `xbk-mut-report-notdir-${process.pid}`)
-  fs.writeFileSync(tmpFile, 'x')
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-notdir-'))
+  const tmpFile = path.join(tmpDir, 'plain-file')
   try {
+    fs.writeFileSync(tmpFile, 'x')
+    // 前置断言：夹具必须真是普通文件。否则（路径不存在 ⇒ 走「不存在」分支）下面的 `不是目录` 断言
+    // 会在错误的分支上给出无关的失败文本，或者更糟——两条分支文案都变的时候假绿。
+    assert.ok(fs.statSync(tmpFile).isFile(), '夹具必须是普通文件（不得被同名目录顶替；本断言跟随符号链接，不覆盖链接形态）')
     const r = runCli([tmpFile])
     assert.strictEqual(r.code, 1, '普通文件应 exit 1')
     assert.ok(r.stderr.includes('不是目录'), `stderr 应点名「不是目录」，实际：${r.stderr}`)
     assert.ok(r.stderr.includes('用法'), '仍应带用法提示')
   } finally {
-    fs.rmSync(tmpFile, { force: true })
+    fs.rmSync(tmpDir, { recursive: true, force: true })
   }
 }
 

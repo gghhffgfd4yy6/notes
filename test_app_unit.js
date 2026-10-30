@@ -645,6 +645,23 @@ check('_writeRunLog 追加后 statSync 失败 ⇒ 静默，锁清理不跳过', 
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
 })
 
+// N1 回归（与 _updateChannelHealth 的 mutRuntimeError 同源）：锁 fd 落在 stdio 区（0/1/2）时绝不 close。
+// 旧实现把「未取得锁」编码成 -1，哨兵被 UnaryOperator 改成 +1 后 finally 的 closeSync(1) 会直接关掉
+// stdout，测试进程崩成 RuntimeError；且 stdio 已被外部关闭时 openSync 本就会返回 0/1/2 这样的真 fd。
+// 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，正常追加与追加抛错（异常路径）两条都要守住。
+check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍清理（含异常路径）', () => {
+  for (const fd of [0, 1, 2]) {
+    for (const appendThrows of [false, true]) {
+      const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? fd : 8), appendThrows })
+      const { app } = makeLogApp({ rec })
+      app._writeRunLog('x\n')
+      const tag = `fd=${fd} appendThrows=${appendThrows}`
+      assert.deepStrictEqual(rec.rec.close, [], `${tag}: 不得 close stdio，实际 close：${rec.rec.close.join(',')}`)
+      assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], `${tag}: 锁文件必须清理（漏删会让后续轮次一直被旧锁挡住）`)
+    }
+  }
+})
+
 // ----- _writeRunLog：ERROR 行只截 errMsg 段 -----
 check('_writeRunLog ERROR 行超 512 ⇒ 仅 errMsg 段截到 512，前缀与尾换行保留', () => {
   const rec = makeLogFs()
@@ -782,13 +799,15 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
-check('_writeRunLog 锁 fd 为 0 时 finally 仍释放（close/unlink），不得漏清理', () => {
+// fd 为 0 是 falsy：旧实现用 `if (lockFd)` 判定「是否取到锁」时会把 fd 0 当成「没取到」而整段跳过
+// 释放（锁文件残留）。这里守住「0 是有效 fd、必须走释放」；但 0 也是 stdin，close 必须被 >2 守卫拒绝。
+check('_writeRunLog 锁 fd 为 0（falsy）时 finally 仍释放：unlink 照做、不得 close stdio', () => {
   const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9) })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.write, [[0, `${process.pid}:42`]])
-  assert.deepStrictEqual(rec.rec.close, [0])
-  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], 'fd 0 不得被当成「未取锁」而跳过释放（锁文件会残留）')
+  assert.deepStrictEqual(rec.rec.close, [], 'fd 0 是 stdin，>2 守卫必须拒绝 close')
 })
 
 // ----- _warnLowDisk：阈值 / 只告警不阻断 / 限频 -----
@@ -2107,11 +2126,12 @@ async function runHealthWithCapturedConsole (app) {
   return { warns, errs }
 }
 
-// 变异回归（app mutation RuntimeError）：xbk_app.js:_updateChannelHealth 的哨兵
-// `let lockFd = -1` 被 UnaryOperator 改成 `+1` 后，channelHealth 关闭的早退路径会
-// 在 finally 里把 1 当锁 fd 去 close，直接关掉 stdout，测试进程崩成 RuntimeError。
+// 变异回归（app mutation RuntimeError）：channelHealth 关闭时 _updateChannelHealth 早退，
+// finally 仍会走 _releaseChannelHealthLock。哨兵早已是 null（UnaryOperator 对 null 无从下手），
+// 真正挡住「把 stdio 当锁 fd 关掉」的是该方法的 `>2` 守卫：旧实现 -1 → +1 的变异体会在这里
+// close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError。
 // 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，而不是让进程崩掉。
-checkAsync('通道健康锁: 关闭健康观测时不得关闭 stdio fd（-1 哨兵变异回归）', async () => {
+checkAsync('通道健康锁: 关闭健康观测时不得关闭 stdio fd（>2 守卫回归）', async () => {
   const realFs = require('fs')
   const closed = []
   const spyFs = new Proxy(realFs, {
@@ -2141,6 +2161,65 @@ check('通道健康锁: 释放时拒绝 close stdio fd（0/1/2）', () => {
   })
   for (const fd of [0, 1, 2]) app._releaseChannelHealthLock('', fd)
   assert.deepStrictEqual(closed, [], `不得关闭 stdio fd，实际关闭：${closed.join(',')}`)
+})
+
+// N2 回归：>2 守卫只管 close，不能把 unlink 一起跳过——fd 落在 stdio 区时锁文件仍必须删除。
+// 旧实现把 close 与 unlink 放在同一个 `lockFd > 2` 分支里，0/1/2 时锁文件残留，后续轮次
+// 一直被陈旧锁挡在门外（要等 mtime 超龄 + 存活复核才回收，健康状态整段漏更新）。
+check('通道健康锁: 释放时 fd 落在 stdio（0/1/2）仍清理锁文件，不得漏 unlink', () => {
+  for (const fd of [0, 1, 2]) {
+    const closed = []
+    const unlinked = []
+    const app = makeHealthApp({
+      fs: {
+        closeSync: (x) => closed.push(x),
+        unlinkSync: (p) => unlinked.push(p)
+      }
+    })
+    app._releaseChannelHealthLock(healthPath + '.lock', fd)
+    assert.deepStrictEqual(closed, [], `fd=${fd}: 不得关闭 stdio`)
+    assert.deepStrictEqual(unlinked, [healthPath + '.lock'], `fd=${fd}: 锁文件必须删除，否则后续轮次一直被挡`)
+  }
+  // 未取到锁（null / -1）时不得删别人的锁文件
+  const unlinked = []
+  const app = makeHealthApp({ fs: { closeSync: () => {}, unlinkSync: (p) => unlinked.push(p) } })
+  app._releaseChannelHealthLock(healthPath + '.lock', null)
+  app._releaseChannelHealthLock(healthPath + '.lock', -1)
+  assert.deepStrictEqual(unlinked, [], '未取到锁（null/-1）不得 unlink 他人的锁文件')
+})
+
+// N2 回归：>2 分支本身要有牙——此前把 `if (lockFd > 2) closeSync` 整段删掉，套件仍 242/242 全绿。
+check('通道健康锁: 释放时 fd>2 必须 close（close 分支不被静默删除）', () => {
+  const realFs = require('fs')
+  const closed = []
+  const app = makeHealthApp({
+    fs: {
+      closeSync: (fd) => { closed.push(fd); realFs.closeSync(fd) },
+      unlinkSync: () => {}
+    }
+  })
+  // 探针必须落在**不可预测**的私有目录里：旧写法 `os.tmpdir() + '/channel-health.state.fdprobe'`
+  // 名字可预测、写盘也不带 O_EXCL，同机任何进程都能抢先占位——先建同名目录 ⇒ 这里 `openSync` EISDIR
+  // 直接炸（用例在断言前崩），先建同名符号链接 ⇒ `'w'` 打开会把别人的目标文件截成 0 字节而套件照旧
+  // 全绿（实测 243/243、受害文件 31 → 0 字节）。CodeQL 视作「Insecure creation of file in the os temp dir」。
+  // 前缀按本文件 C5-025 口径用 `xbkunit-`（不是 `xbk-`：后者落进 check-host-clean 的「过期沙箱」命名
+  // 空间，被 SIGKILL 后的残留会误拦下一轮 check）；本用例是早期注册的，mkTmpFixture 的 const 尚未初始化，
+  // 故就地建目录并在 finally 里整目录删除。
+  const tmpDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-fdprobe-'))
+  const probePath = path.join(tmpDir, 'probe')
+  const probe = realFs.openSync(probePath, 'w')
+  try {
+    // 前置断言：探针必须真是本用例独占的普通文件（私有目录被同名目录/符号链接顶替时当场点名，
+    // 而不是让下面的 EBADF 断言在无关失败形态上给出误导文本）
+    assert.ok(realFs.statSync(probePath).isFile(), '探针必须落在 mkdtemp 私有目录里的普通文件上')
+    assert.ok(probe > 2, `探针 fd 必须 >2，实际 ${probe}`)
+    app._releaseChannelHealthLock(healthPath + '.lock', probe)
+    assert.deepStrictEqual(closed, [probe], `fd>2 时必须 close 锁 fd，实际关闭：${closed.join(',') || '无'}`)
+    assert.throws(() => realFs.fstatSync(probe), /EBADF/, 'close 之后该 fd 必须已失效')
+  } finally {
+    try { realFs.closeSync(probe) } catch { /* 已关闭 */ }
+    realFs.rmSync(tmpDir, { recursive: true, force: true })
+  }
 })
 
 check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
@@ -3155,7 +3234,9 @@ checkAsync('ALERT-3 告警状态向后兼容：顶层 lastAt=最近一次（旧�
   assert.strictEqual(last.lastAt, now + 300000, '顶层 lastAt 必须是最近一次告警时间（status/旧版本读取口径不变）')
   assert.deepStrictEqual(last.classes, { truncate: now, 'push-fail': now + 300000 },
     'classes 必须逐类记录最后发送时间（异类分流的数据基础）')
-  assert.deepStrictEqual(Object.keys(last).sort(), ['classes', 'lastAt'], '状态字段只增不改（不得丢 lastAt）')
+  // 显式码元序比较器：默认 sort() 也是 UTF-16 码元序，但依赖隐式行为在跨 locale/实现时不可确定
+  // （且读代码的人得自己推断），localeCompare 反过来会随 ICU/locale 变序 ⇒ 这里写死码元序。
+  assert.deepStrictEqual(Object.keys(last).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), ['classes', 'lastAt'], '状态字段只增不改（不得丢 lastAt）')
 })
 
 checkAsync('ALERT-4 同一轮「截断 + 推送全部失败」两类告警都必须送达（调用点必须各带类别）', async () => {
