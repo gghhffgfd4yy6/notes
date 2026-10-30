@@ -1742,6 +1742,11 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     [page, size, cate, query, days, rangeActive, range.from, range.to])
   const { data, err, load, loading, settleTick } = usePanelLoader(fetchMessages, onSync)
   const slowLoading = useSlowFlag(loading)
+  // 分页器禁用态的「在飞」部分延迟 120ms 才置位（C7-041，见下面 renderPager）：一次翻页的
+  // loading 常常只存在十几毫秒（条件请求命中 304 / 本地缓存快），整排按钮立刻压到 .7 透明度
+  // 再弹回来，就是一闪（与 v3.334 刷新按钮同一教训）。双击/连点的间隔约 200ms，120ms 后才
+  // 禁用仍挡得住；只有「快到看不见」的请求不再让分页器闪一帧。
+  const pagerSlow = useSlowFlag(loading, 120)
   // armLand 需要「点击那一刻的 data」做前后对比；渲染期同步，避免闭包拿到旧值。
   dataRef.current = data
   // 保活后每次切回本页都静默拉一次新数据：旧列表留在原地（loading 不会清 data），
@@ -1939,6 +1944,25 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   // Enter/空格 ⇒ 合成 click，再手写 onKeyDown 会双触发（keydown 展开 + click 收起 = 看起来没反应），
   // 故删掉手写键盘处理。v3.379 起它打开的是右侧抽屉：aria-haspopup 声明弹出的是对话框，
   // 行内展开的 aria-expanded / caret 一起退场（展开态不再是行内状态）。
+  // 分页器视图（C7-041）：形参 loading 是「延迟后的在飞态」——一次翻页的请求常常十几毫秒就
+  // 回来，4 个按钮同时压到 .7 透明度再弹回就是一帧闪。边界（page / 页数）实时算，与延迟门
+  // 无关；超过 120ms 的请求仍然禁用，连点跳页照旧被挡。
+  const renderPager = (loading) => html`<div class="pager">
+        <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
+        <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(page - 1)}>上一页<//>
+        <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
+        <span class="pager-jump">
+          <span class="pager-jump-label" aria-hidden="true">跳至</span>
+          <input class="pager-jump-input" type="number" inputmode="numeric" min="1" max=${data.pages}
+            value=${jump} aria-label="跳到第几页"
+            onInput=${(e) => setJump(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); jumpTo(jump) } }}
+            onBlur=${() => jumpTo(jump)} />
+          <span class="pager-jump-label" aria-hidden="true">页</span>
+        </span>
+        <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(page + 1)}>下一页<//>
+        <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
+      </div>`
   return html`<div class="panel">
     <${PanelHead} title="推送记录" level=${1} sub="判重缓存 push.json（已抓取并推送的消息）" />
     <div class="msg-toolbar">
@@ -2010,22 +2034,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
             </div>
           </div>`)}
         </div>`}
-      <div class="pager">
-        <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(1)}>« 首页<//>
-        <${Button} disabled=${page <= 1 || loading} onClick=${() => goPage(page - 1)}>上一页<//>
-        <span class="pager-info">第 ${data.page} / ${data.pages} 页</span>
-        <span class="pager-jump">
-          <span class="pager-jump-label" aria-hidden="true">跳至</span>
-          <input class="pager-jump-input" type="number" inputmode="numeric" min="1" max=${data.pages}
-            value=${jump} aria-label="跳到第几页"
-            onInput=${(e) => setJump(e.target.value)}
-            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); jumpTo(jump) } }}
-            onBlur=${() => jumpTo(jump)} />
-          <span class="pager-jump-label" aria-hidden="true">页</span>
-        </span>
-        <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(page + 1)}>下一页<//>
-        <${Button} disabled=${page >= data.pages || loading} onClick=${() => goPage(data.pages)}>末页 »<//>
-      </div>
+      ${renderPager(loading && pagerSlow)}
     </div>`}
     ${/* v3.379：条目详情抽屉。列表留在背后做对照（滚动位置不动），宽度 520 与抽屉默认值一致，
          手机上由 Drawer 自己铺满整屏。detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
