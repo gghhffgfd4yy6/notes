@@ -17,6 +17,10 @@ const RETRYABLE_CODES = new Set([
 
 const PERMANENT_CODES = new Set([
   'ERR_INVALID_URL', 'ERR_BODY_NOT_JSON', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_INVALID_ARG_TYPE',
+  // C8-004：响应体超过本地上限（xbk_http.fetchJson 与推送出口 xbk_sendNotify_slim.$.post 用的同一个码）。
+  // 此前它不在任何集合里 → 落 UNKNOWN 判可重试，常驻每轮重新下载同一个 20MB+ 响应体、在同一处再失败。
+  // 重试同一请求的结果必然相同（与 ERR_BODY_NOT_JSON 同属「响应内容不合契约」的确定性错误），故归永久。
+  'EBODYLIMIT',
   'MODULE_NOT_FOUND', 'NO_CHANNEL_CONFIG',
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
   'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'CERT_SIGNATURE_FAILURE', 'CERT_REVOKED',
