@@ -444,6 +444,20 @@ function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 // 与 readStatus 部件三态（missing/ok/invalid）一致，前端沿用 partTone 归类。
 // v3.326：支持自定义日期区间（from/to，上海日历日）。区间优先于 days；跨度上限 92 天
 // （一年四分之一的图表已是横向滚动的极限，再长既画不出也没数据）。
+// C10-061：窗口天数在入口**自身**钳制到 1..92。此前只有 console 的 TREND_DAYS_ALLOWED
+// 白名单兜底（注释还写着「readTrends 对 days 无内部钳制」）：任何别的调用方（CLI/测试/
+// 未来的 API）传 NaN/Infinity 都会算出 `now - (days-1)*86400000 = NaN`，然后
+// `new Date(NaN).toISOString()` 抛 RangeError，把整个趋势读取打穿。非数回默认 14，
+// 小数向下取整，越界钳到边界（与下方 spanDays 的 92 天上限同值）。
+const TREND_DAYS_LIMIT = 92
+const TREND_DAYS_FALLBACK = 14
+function clampTrendDays (v) {
+  let n
+  try { n = Number(v) } catch (e) { n = NaN } // Number(Symbol) 抛 TypeError，钳制函数本身不许抛
+  if (!Number.isFinite(n)) return TREND_DAYS_FALLBACK
+  return Math.min(TREND_DAYS_LIMIT, Math.max(1, Math.trunc(n)))
+}
+
 function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = {}) {
   // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读不报截断，这里以「文件实际大于
   // 读取上限」判定。窗口内的更早摘要若被截掉，趋势只反映尾部日志——前端副标题会注明。
@@ -474,7 +488,8 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   // 显式给了 from/to 但格式非法/颠倒：按「没有窗口」处理（取日志里能覆盖的最大跨度），
   // 不回落到 days——否则调用方以为看的是区间、实际拿到「最近 N 天」子集（Sourcery #288 M2）。
   const wantRange = (typeof from === 'string' && from !== '') || (typeof to === 'string' && to !== '')
-  const effDays = rangeMode ? days : (wantRange ? 92 : days)
+  const dayCount = clampTrendDays(days)
+  const effDays = rangeMode ? dayCount : (wantRange ? 92 : dayCount)
   const rawStart = rangeMode ? from : shanghaiDayKey(now - (effDays - 1) * 86400000)
   const endMs = Date.parse(endKey + 'T00:00:00Z')
   const startMs = Date.parse(rawStart + 'T00:00:00Z')
