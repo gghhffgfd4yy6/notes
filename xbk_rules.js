@@ -4,6 +4,9 @@
 // 📐 RuleEngine — 规则引擎层
 // ============================================================
 function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available }) {
+  // C9-008：正则 .test 异常只在进程内首次告警一次——热路径（每条消息 × 每个字段 × 每条规则）
+  // 重复告警会淹没 run.log，静默又会让「规则全废」不可见。
+  let testFailWarned = false
   const RuleEngine = {
     // RULES-06：此处原有 _compileUserRegex 包装方法，全仓库（含测试）无任何调用者，
     // 实际编译统一走依赖注入的 compileUserRegex 与 _compileCatRe，已删除（死方法清理）。
@@ -330,25 +333,44 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       return s.replace(/[\u200B-\u200D\uFEFF]+/g, '')
     },
 
+    /** 规则正则 .test 的唯一出口（C9-008）
+     *  .test 会在**运行时**抛（new RegExp 不抛）：V8 对超长正则延迟到首次 test 才编译并抛
+     *  "Regular expression too large"；re2 包装对象、被污染/伪造的规则对象同理。
+     *  此前三个调用面各自处理、口径不一：whitelistFilter 有 try/catch（异常→放行）、
+     *  _catMatches 有 try/catch（异常→不命中），而 matchesCompiled 与 explainFilter 的
+     *  首个规则查找**没有** try/catch——一条坏规则就抛穿整轮 run（该轮一条都不推）。
+     *  统一契约：**异常永不冒泡，一律按 onFail 处理**（默认 false = 不命中）——
+     *  拦截规则（matchesCompiled / checkTimeCompiled / _catMatches）不命中 ⇒ 放行；
+     *  白名单（whitelistFilter）传 onFail=true ⇒ 保留（宁可多推不可少推）。re 形状不对
+     *  （null/没有 test）与异常同处理：都无法判定是否命中，口径必须一致。
+     *  告警每进程只发一次：这里是每条消息 × 每个字段 × 每条规则的热路径，逐次告警会淹没 run.log。 */
+    _safeTest (re, input, onFail = false) {
+      try {
+        if (!re || typeof re.test !== 'function') return onFail
+        const text = this._normalizeReInput(typeof input === 'string' ? input : String(input))
+        return !!re.test(text)
+      } catch (e) {
+        if (!testFailWarned) {
+          testFailWarned = true
+          console.warn('⚠️ 过滤规则正则执行异常，已按「不命中/不拦截」处理（本进程不再重复告警）')
+        }
+        return onFail
+      }
+    },
+
     /** 多行规则分类匹配：无 cat 限制(匹配所有)或有 cat 且 catename 匹配 */
     _catMatches (rule, catename) {
       if (!rule.cat) return true
       if (catename === undefined || catename === null || catename === '') return false
-      try {
-        const value = typeof catename === 'string' ? catename : String(catename)
-        return rule.cat.test(this._normalizeReInput(value))
-      } catch (e) {
-        return false
-      }
+      return this._safeTest(rule.cat, catename)
     },
 
-    /** 多行规则任意匹配：分类匹配 + 断言成立即返回 true（matchesCompiled/checkTimeCompiled 共用） */
+    /** 多行规则任意匹配：分类匹配 + 断言成立即短路（与 _firstMatchingRule 共用同一遍扫描） */
     _anyRule (rules, catename, predicate) {
-      if (!Array.isArray(rules)) return false
-      for (const rule of rules) {
-        if (this._catMatches(rule, catename) && predicate(rule)) return true
-      }
-      return false
+      // C9-016：与 _firstMatchingRule 是同一段「按序遍历、首个命中即返回」的循环，
+      // 只有返回值不同（true/false vs rule/null）——统一由 _firstMatchingRule 实现，
+      // 本方法只做布尔化，返回契约（严格 true/false）不变。
+      return this._firstMatchingRule(rules, catename, predicate) !== null
     },
 
     /** 返回首个命中的多行规则（供可解释过滤复用；无命中返回 null） */
@@ -367,15 +389,14 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       try { value = typeof fieldValue === 'string' ? fieldValue : String(fieldValue) } catch (e) { return false } // 脏字段 toString/Symbol 失败时保守放行，不让整批 run 崩溃
 
       if (compiled._type === 're') {
-      // 简单正则
-        if (!compiled.re || typeof compiled.re.test !== 'function') return false
-        return compiled.re.test(this._normalizeReInput(value))
+      // 简单正则（形状守卫与 .test 异常处理都在 _safeTest 内：不命中即放行）
+        return this._safeTest(compiled.re, value)
       }
 
       if (compiled._type === 'multi') {
       // 多行多分类：任意一行匹配即匹配
         if (!Array.isArray(compiled.rules) || compiled.rules.length === 0) return false
-        return this._anyRule(compiled.rules, catename, r => r.val.test(this._normalizeReInput(value)))
+        return this._anyRule(compiled.rules, catename, r => this._safeTest(r.val, value))
       }
 
       return false
