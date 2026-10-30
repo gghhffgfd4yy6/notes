@@ -351,6 +351,24 @@ const deps = async (spec) => {
     bare: { got: 'ok', re2: 'dlopen' },
     plan: [{}, { result: { status: null, signal: 'SIGTERM' } }]
   })
+  // CR-07：两个超时变量都只接受「正的安全整数」。0.5 会让 spawnSync 的 validateTimeout 在启动 npm
+  // 之前抛 ERR_OUT_OF_RANGE（旧实现照收 ⇒ 依赖恢复直接失败，而不是回退默认上限）；超出 uint32 的
+  // 「安全整数」同样抛 ERR_OUT_OF_RANGE。三例都必须回退默认值并走完恢复流程。
+  out.deps.installTimeoutFractional = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    env: { XBK_NPM_TIMEOUT_MS: '0.5' },
+    plan: [{ result: { status: 0 }, after: 'installed' }]
+  })
+  out.deps.installTimeoutOverflow = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    env: { XBK_NPM_TIMEOUT_MS: '4294967296' },
+    plan: [{ result: { status: 0 }, after: 'installed' }]
+  })
+  out.deps.rebuildTimeoutFractional = await deps({
+    bare: { got: 'ok', re2: 'dlopen' },
+    env: { XBK_NPM_REBUILD_TIMEOUT_MS: '0.5' },
+    plan: [{ result: { status: 0 } }, { result: { status: 0 }, after: 'installed' }]
+  })
   // C5-060：旧直调副本里有两个维度是子进程探针原先没覆盖的（auto-install 未开、npm 安装非零退出）。
   // 去重前先把它们迁进来，否则删掉副本就等于丢覆盖（实测：把生产里的「未设置自动安装即抛错」整段删掉，
   // 只留探针的版本仍然全绿）。
@@ -469,6 +487,18 @@ const deps = async (spec) => {
     /npm rebuild re2 超过 600000ms 未完成/, '重建超时必须点名 npm rebuild re2 与被超时的上限值')
   assert.match(String(d.deps.rebuildTimeout.thrown && d.deps.rebuildTimeout.thrown.message),
     /XBK_NPM_REBUILD_TIMEOUT_MS/, '重建超时文案必须给出可调的上限环境变量')
+
+  // --- CR-07：超时变量只接受正的安全整数（小数/超界值回退默认，否则 spawnSync 启动 npm 前就抛 ERR_OUT_OF_RANGE）---
+  assert.strictEqual(d.deps.installTimeoutFractional.spawns[0].timeout, 120000,
+    'XBK_NPM_TIMEOUT_MS=0.5 必须回退默认 120000（spawnSync 只接受整数，不能把小数照收）')
+  assert.strictEqual(d.deps.installTimeoutFractional.thrown, null,
+    '小数超时不得让依赖恢复失败：回退默认后应正常走完安装与恢复')
+  assert.strictEqual(d.deps.installTimeoutOverflow.spawns[0].timeout, 120000,
+    '超出 spawnSync uint32 上限的超时（4294967296）同样必须回退默认 120000')
+  assert.strictEqual(d.deps.rebuildTimeoutFractional.spawns[1].timeout, 600000,
+    'XBK_NPM_REBUILD_TIMEOUT_MS=0.5 必须回退默认 600000（重建同样只接受整数）')
+  assert.strictEqual(d.deps.rebuildTimeoutFractional.thrown, null,
+    '重建超时的小数同样不得让依赖恢复失败')
 
   // --- C10-037：package.json 的 engines.node 必须与入口的受支持范围同口径 ---
   // 旧值 `>=22.22.2` 放行 23.x / 25.x / 24.0–24.14，而 re2 在这些版本上构建必然失败：

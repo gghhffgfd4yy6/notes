@@ -165,12 +165,17 @@ function sanitizeModuleName (name) {
 const NPM_INSTALL_TIMEOUT_MS = 120000
 const NPM_REBUILD_TIMEOUT_MS = 600000
 
-// 只接受正数；未设置/空串/非数字/非正数一律回退默认值（配置写错不得让子进程无超时）。
+// 只接受「正的安全整数」；未设置/空串/非数字/非正数/小数/超界值一律回退默认值（配置写错不得让子进程无超时）。
+// CR-07：spawnSync 的 timeout 只接受整数（Node 的 validateTimeout 按 uint32 校验），0.5 这类小数会在
+// **启动 npm 之前**抛 ERR_OUT_OF_RANGE —— 于是「配置写错」变成「依赖恢复直接失败」，而不是按注释回退默认值。
+// 上界同样按 spawnSync 的 uint32 取 0xFFFFFFFF：更大的「安全整数」照样抛 ERR_OUT_OF_RANGE。
+const SPAWN_TIMEOUT_MAX_MS = 0xFFFFFFFF
 function positiveTimeout (env, name, fallback) {
   const raw = env && env[name]
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
   const value = Number(raw)
-  return Number.isFinite(value) && value > 0 ? value : fallback
+  if (!Number.isSafeInteger(value) || value <= 0 || value > SPAWN_TIMEOUT_MAX_MS) return fallback
+  return value
 }
 
 // spawnSync 超时的形状是 status=null + signal（Node 另给 error.code='ETIMEDOUT'）。必须与
