@@ -102,7 +102,28 @@ function makeResidentApp (runFn) {
     throw err
   })
   const ctrl2 = new AbortController()
-  await runResident(appPerm, ctrl2)
+  // C5-015：看门狗。permanent 分支一旦回归（判定被破坏 ⇒ 循环永不退出、runLoop 无轮次上限），
+  // 这里的 await 永不 settle，套件只能挂到 CI 的 job 级 45min（node 矩阵两档各挂一次）；
+  // run_tests.js 的 TEST_TIMEOUT 也就不到这条 CI 路径（test.yml 直接跑 npm run test:qinglong-resident）。
+  // 超时即 abort（让回归的循环有机会停下，而不是留一个空转的重试循环）并判红。
+  // clearTimeout 必须成对放在 finally：否则超时用例留下一个活定时器，同进程聚合执行会被拖住
+  // （C5-017 那类定时器泄漏）。
+  const PERM_WATCHDOG_MS = 5000
+  let permTimer
+  try {
+    await Promise.race([
+      runResident(appPerm, ctrl2),
+      new Promise((resolve, reject) => {
+        permTimer = setTimeout(() => {
+          ctrl2.abort()
+          reject(new Error(`runResident 未在 ${PERM_WATCHDOG_MS}ms 内因 permanent 错误退出（已尝试 ${runCalls} 次）：` +
+            'permanent 判定疑似回归，循环永不结束（旧实现会挂满 CI job 的 45min）'))
+        }, PERM_WATCHDOG_MS)
+      })
+    ])
+  } finally {
+    clearTimeout(permTimer)
+  }
   assert.strictEqual(ctrl2.signal.aborted, true, 'permanent 错误应触发 controller.abort()')
   assert.strictEqual(runCalls, 1, 'permanent 错误后应停止，只调用 1 次')
 

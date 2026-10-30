@@ -25,7 +25,23 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/mutation.yml'
+  # 手动触发的两个可选输入：只服务 killed 下降门禁（C10-021 判据 ⑤），留空即保持该门禁**默认关闭**。
+  # 为什么用「同一 commit 的既有 run id」而不是「基线文件路径」：守卫只接受**同一 commit 的全量重算**结果
+  #   （基线里的 commit 必须与 GITHUB_SHA 逐字相同，见 scripts/mutation-guard.js 的 readKilledBaseline），
+  #   而同一个 commit 不可能把自己产出的基线先提交进仓库（文件里要写该 commit 的 sha，sha 又取决于该文件）
+  #   ⇒ 唯一合法来源就是「同一 sha 的另一次运行」，它只以 artifact 形式存在。
   workflow_dispatch:
+    inputs:
+      killed_baseline_run:
+        description: '可选：同一 commit 的既有 run id；用它的 mutation-report-<段> artifact 作 killed 下降基线（留空 = 门禁保持默认关闭）'
+        required: false
+        default: ''
+        type: string
+      killed_baseline_tolerance:
+        description: '可选：killed 下降容忍值（非负整数，留空 = 0）；仅在给了 killed_baseline_run 时才有意义'
+        required: false
+        default: ''
+        type: string
   schedule:
     - cron: '17 16 * * *'
     - cron: '17 4 * * *'
@@ -142,13 +158,20 @@ jobs:
     # validateSegments 会因缺段硬失败（把一次超时放大成整份日报发不出来）。
     # 正确做法是把时限压在**变异测试那一步**上：step 级超时只杀那一步、job 继续跑，
     # 下方 if: always() 的步骤仍有窗口（见该 step 的 timeout-minutes: 330）。
-    # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间）：
-    #   （C=2 时代）check-deps 215.2min、utils 205.1min、message-store 194.6min、sendnotify-part2 91.7min，
-    #   其余 15 段 1.3-81.3min。step 级 330 高于任何实测段耗时 ⇒ 不会新增误杀；
+    # 依据（gh api …/jobs 实测单段 started→completed 的最大值，非排队时间；**现矩阵 32 段**，run 40515518642）：
+    #   全矩阵最慢是 command 档 qinglong-push 的「变异测试」单步 **150.9min**，次高 check-deps 102.9min、
+    #   v3-entry 82.6min、storage 78.1min ⇒ step 级 330 对最慢段仍有 2.2x 余量，不会新增误杀；
     #   而某步真挂死时，job 级 360（平台硬上限）仍是唯一的上界。
+    # ⚠️ 别把「某次实测数字」当预算的唯一依据：同一段 qinglong-push 在 **1.7–150.9min** 间摆动（增量复用
+    #   几乎全命中时同日 run 40504645205 只跑 1.7min）⇒ 预算按**最坏一次**定，单点实测只能证「不会误杀」，
+    #   不能证「一定够快」。拆分前的 19 段 / C=2 口径（215.2min / 205.1min 等）已作废，不再引用。
     timeout-minutes: 360
     permissions:
       contents: read
+      # 读「基线 run」的 artifact（gh api 取 head_sha / gh run download 拉 mutation-report-<段>）需要
+      # actions: read；缺失即 403 ⇒ 一旦显式给出 killed_baseline_run，守卫会因为拿不到基线而红。
+      # 只在 killed_baseline_run 非空时才有实际用途，常规 schedule/push 运行不会调用任何 actions 读接口。
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -245,14 +268,14 @@ jobs:
             src: "xbk_utils.js"
             mutate: "xbk_utils.js"
             config: "stryker.tap.config.js"
-          # sendnotify（1876 行）拆 2 段（v3.313 通知点击直达后重算；原 v3.279 基线 1612 行）
+          # sendnotify（1891 行，C8-001 单通道预算后重算）拆 2 段（v3.313 通知点击直达后重算；原 v3.279 基线 1612 行）
           - name: sendnotify-part1
             src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
             config: "stryker.tap.config.js"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1876"
+            mutate: "xbk_sendNotify_slim.js:751-1891"
             config: "stryker.tap.config.js"
           # 小文件各一任务
           - name: failure-policy
@@ -287,10 +310,10 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 6945 行（定位重构 +3 行起；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7778 体，变异评估
+          # console.js 6986 行（b3 C2-002/C2-004 +41 行后同步；定位重构 +3 行起；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7778 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
           # ⇒ 整段 ≈ 1660min、远超 step 330min 上限。按上限倒推取 12 片（末片 849 行实测 >330min 被杀，再对半：
-          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-6945，末四片约 400 / 600 / 700 / 445 行
+          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-6986，末四片约 400 / 600 / 700 / 486 行
           # ≈100-200min（700 行 × 1.12 体/行 × 13.3s 估 ≈174min，仍低于 330min；v3.374 合 SSE + 信任设备后按 700 行硬上限新开 part12）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           # `timeout_ms: 60000`（仅这 12 段）：单次变异体运行的等待上限从配置文件的 300000ms 降到 60000ms。
@@ -354,7 +377,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part12
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6501-6945"
+            mutate: "scripts/console.js:6501-6986"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:
@@ -545,8 +568,12 @@ jobs:
       #   成立（未重测最优值）。storage 段仍走 command 档，沿用同一取值。
       # 为什么时限加在**这一步**而不是靠 job 级的「留 10 分钟」（PR #156 返工）：job 级超时会把同一 job
       # 后续所有步骤一起杀掉（详见 job 级 timeout-minutes 注释），step 级超时只杀这一步、job 继续跑 ⇒
-      # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于实测最大段耗时
-      # （C=2 时代 command 档 check-deps 215.2min；C=8 实测最长段 command 档 qinglong-push **90.1min**（run 35827096127，head 01c0ef89；PR-1 那轮同段 85.3min，run 35646992130）、TAP 档 utils **70.4min**（**job 口径**；run 35646992130 的 16 TAP + 3 command 那轮；全 TAP 基线的 utils 见文件头；本矩阵本轮 41.0min））⇒ 正常段落不会被误杀。
+      # 下方 if: always() 的「守卫 / 剥离 / 上传 / 清理」仍有窗口。330 高于**现矩阵**实测最大段耗时
+      # （command 档 qinglong-push 的「变异测试」单步 **150.9min**，run 40515518642，2026-10-27；次高
+      # check-deps 102.9min、v3-entry 82.6min、storage 78.1min）⇒ 余量 2.2x，正常段落不会被误杀；
+      # 该段耗时随增量复用命中率在 **1.7–150.9min** 间摆动（同日 run 40504645205 仅 1.7min），故 330 按
+      # 最坏一次留余量、不随单点实测定。旧注释引用的 90.1min（19 段口径 run 35827096127）与 215.2min
+      # （C=2 口径）都不代表现矩阵，已不再作依据。
       # --fileLogLevel info：把 stryker 的 INFO 日志同时写进 cwd 的 stryker.log（LoggingBackend 把
       #   priority ≥ activeFileLevel 的事件写进该文件；默认 fileLogLevel 是 off ⇒ 不写文件）。
       #   这是「复用状态可见」（PR #158 Qodo Medium / Correctness）的**唯一判定源**：报告本身没有复用标记
@@ -570,6 +597,13 @@ jobs:
           # 约 656 次即被截断）。该变量的语义即「已在变异运行内」，同时被 run_mutation.js 与
           # test_run_mutation_cli.js 复用。
           XBK_MUTATION_CHILD: '1'
+          # TAP 档（stryker.tap.config.js）的 tap-shim 在 dry run 里逐文件往这个文件追加一行
+          # {"file":…,"points":成功投递的 TAP 点数,"exit":…}，供下方「记录 statusReason 摘要与 TAP
+          # 空流表征」步聚合出本段真实的 TAP 点数（C10-008）。被 spawn 的测试进程继承本 step env。
+          # 路径取 runner.temp：逐 job 独立（不可能跨运行陈旧）、不进 actions/cache（path: reports）
+          # 也不进 artifact（reports/mutation/）⇒ 崩溃段不会因为多出这个文件而让上传步的
+          # if-no-files-found: error 失效。摘掉本行 = 摘要看不到任何记录 ⇒ 每个 TAP 段判红（fail-closed）。
+          XBK_TAP_POINTS_LOG: ${{ runner.temp }}/tap-points.jsonl
 
       # --timeoutMS（逐段覆盖单次等待上限）：取矩阵的 `timeout_ms`，缺省 300000（= stryker.config.js 的值）。
       #   为什么走 CLI 而不是改配置文件：stryker core 的 config-reader 是 deepMerge(options, cliOptions)
@@ -601,6 +635,73 @@ jobs:
             tail -n 40 "$f" || true
           done
 
+      # killed 下降门禁（判据 ⑤）在 CI 的接线（C10-021）：**默认关闭**——只有 workflow_dispatch 显式给出
+      # killed_baseline_run 时本 step 才运行；不给 ⇒ 整段跳过、XBK_MUTATION_KILLED_BASELINE 从未写入
+      # $GITHUB_ENV ⇒ 守卫行为与「未接线」时逐字节相同（不新增任何常规运行路径）。
+      # 为什么要从「既有 run 的 artifact」取基线：守卫只接受**同一 commit 的全量重算**结果（基线 commit 必须
+      #   与 GITHUB_SHA 逐字相同；带 reuse/增量痕迹一律拒）⇒ 唯一合法来源是「同一 sha 的另一次运行」，
+      #   它只以 artifact 形式存在（同一 commit 无法把自己产出的基线先提交进仓库，见 workflow_dispatch 注释）。
+      # 三条校验，任一不过即 exit 1（绝不把「基线来路不明」降级成「没设基线」静默关掉门禁）：
+      #   ① 基线 run 的 head_sha 必须等于本轮 GITHUB_SHA（跨 commit 的 killed 不可比；守卫侧还会再拒一次）；
+      #   ② 基线 run 该段的 reuse.json 必须 mode=full —— 增量/复用跑出来的 killed 只是上一轮结果的搬运，
+      #      与「本轮测试变弱」不可区分（这正是判据 ⑤ 默认关闭的原因）；
+      #   ③ artifact 里必须有 mutation.json（缺报告就没有 killed 可数）。
+      # 只拉**本段**的 artifact（--pattern mutation-report-<段>）：32 段全拉约 2GB，而每条腿只需要自己那一段；
+      #   基线因此只含本段，守卫「本段不在 killed 基线 ⇒ 红」的判据（test_mutation_json.js 判据 f）不受影响。
+      # 落盘位置选 $RUNNER_TEMP 而不是 reports/：reports/ 是本 job 的缓存 path，写进去会让这条腿把几十 MB
+      #   基线 artifact 存进 stryker-* 缓存（纯浪费配额），且它不属于任何报告产物。
+      # 为什么不把变量写进守卫 step 的 env：守卫里「未设置」≠「显式置空」——XBK_MUTATION_KILLED_BASELINE
+      #   为空串是**故意 fail-closed**（test_mutation_json.js 判据 g），而 step 级 env 在输入留空时会写出空串
+      #   ⇒ 每次常规运行都会红。故基线路径只在真拿到基线后经 $GITHUB_ENV 注入。
+      # 失败语义：gh / jq 任一失败由 set -euo pipefail 直接置非零 ⇒ 本 step 响亮红，不静默关掉门禁。
+      - name: 准备 killed 下降基线（可选，${{ matrix.name }}）
+        # 三个条件缺一不可：非 dispatch 触发时 `inputs` 上下文是空对象（不靠 null 与空串的类型转换语义，
+        # 显式锚定 event_name，避免 schedule/push 上万一求值成 true 时 32 条腿全部红在这种接线上）。
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.killed_baseline_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BASELINE_RUN: ${{ inputs.killed_baseline_run }}
+          SEGMENT: ${{ matrix.name }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$BASELINE_RUN" in
+            ''|*[!0-9]*) echo "❌ killed_baseline_run 必须是 run id（纯数字），收到 ${BASELINE_RUN}" >&2; exit 1 ;;
+          esac
+          base_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BASELINE_RUN" --jq .head_sha)
+          if [ "$base_sha" != "$CURRENT_SHA" ]; then
+            echo "❌ 基线 run 的 head_sha（${base_sha:-<空>}）与本轮 commit（$CURRENT_SHA）不一致：跨 commit 的 killed 不可比" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/killed-baseline"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          if ! gh run download "$BASELINE_RUN" --repo "$GITHUB_REPOSITORY" --pattern "mutation-report-$SEGMENT" --dir "$dir"; then
+            echo "❌ 基线 run $BASELINE_RUN 里没有 mutation-report-$SEGMENT artifact" >&2
+            exit 1
+          fi
+          report="$dir/mutation-report-$SEGMENT/mutation.json"
+          reuse="$dir/mutation-report-$SEGMENT/reuse.json"
+          if [ ! -f "$report" ] || [ ! -f "$reuse" ]; then
+            echo "❌ 基线 artifact 缺 mutation.json 或 reuse.json（无法证明该段是全量重算）" >&2
+            exit 1
+          fi
+          reuse_mode=$(jq -r '.mode // "unknown"' "$reuse")
+          if [ "$reuse_mode" != "full" ]; then
+            echo "❌ 基线 run 的该段不是全量重算（reuse.json mode=$reuse_mode）：增量/复用结果不能当 killed 基线" >&2
+            exit 1
+          fi
+          killed=$(jq '[.files[].mutants[] | select(.status == "Killed")] | length' "$report")
+          case "$killed" in
+            ''|*[!0-9]*) echo "❌ 基线 killed 计数非法：${killed}" >&2; exit 1 ;;
+          esac
+          out="$dir/killed-baseline-$SEGMENT.json"
+          jq -n --arg commit "$CURRENT_SHA" --arg seg "$SEGMENT" --argjson killed "$killed" \
+            '{commit: $commit, mode: "full", segments: {($seg): {killed: $killed}}}' > "$out"
+          echo "ℹ️ killed 下降基线已就绪（段 $SEGMENT，run $BASELINE_RUN，killed=$killed，commit=$CURRENT_SHA）"
+          echo "XBK_MUTATION_KILLED_BASELINE=$out" >> "$GITHUB_ENV"
+
       # fail-closed 守卫（本轮新增）：分数门禁已撤回（break = null），但「报告本身不可信」必须仍然响亮失败。
       # 它兜住 stryker 不会置退出码的假绿通道（NaN 通道的源码依据见 stryker.config.js 的 thresholds 注释）：
       #   ① 任一变异体 status = RuntimeError —— 测试自身崩溃导致的「没能判定」，既不算已检出也不算存活，
@@ -621,6 +722,12 @@ jobs:
       #   两类再也分不开）。该文件随 artifact 到汇总 job，日报的 `真挂死` / `上限触发` 两列据此渲染。
       - name: 变异报告 fail-closed 守卫（${{ matrix.name }}）
         if: always()
+        env:
+          # 容忍值经 inputs 显式传（留空 = 0；守卫的 resolveKilledTolerance：未设置/空串都不放大容忍）。
+          # XBK_MUTATION_KILLED_BASELINE **不在此处**：未设置 ≠ 显式置空（守卫对空串 fail-closed），
+          # 故基线路径只在上面「准备 killed 下降基线」真的拿到基线后经 $GITHUB_ENV 注入；不给输入时该
+          # 变量根本不存在 ⇒ 判据 ⑤ 保持默认关闭。
+          XBK_MUTATION_KILLED_TOLERANCE: ${{ inputs.killed_baseline_tolerance }}
         run: node scripts/mutation-guard.js --segment "${{ matrix.name }}" reports/mutation/mutation.json
 
       # 复用状态落盘（PR #158 Qodo Medium / Correctness）：本段本轮到底是「全量重算」还是「复用了 N/M 个
@@ -673,6 +780,83 @@ jobs:
           # 由 `|| 'none'` 归一成三态之一，取值空间再由 CLI 的 fail-closed 校验限定。
           CACHE_HIT: ${{ steps.inc-cache.outputs.cache-hit || 'none' }}
         run: node scripts/mutation-report.js --reuse --segment "${{ matrix.name }}" --log stryker.log --out reports/mutation/reuse.json --cache-hit "$CACHE_HIT"
+
+      # statusReason 摘要 + 「TAP 流为空」表征（C10-008，**必须在剥离之前**）：剥离步把每个变异体的
+      # statusReason 置空串，artifact 里的机器报告从此解释不了「它为什么存活/报错」；而 tap-runner 对
+      # 空 TAP 流只返回 ok（tap-parser 对空 stdout 判 {ok:true, skipReason:"no tests found"}）⇒ 该段
+      # 一个测试都没跑，全部变异体记 Survived/NoCoverage，报告与「测试跑过但没杀掉」完全同形。
+      # 本步在上传前落一份未剥离的摘要（reports/mutation/status-reason-summary.json，随 artifact 到
+      # 汇总 job），并把「TAP 档 + 成功投递的 TAP 点数为 0 + 有变异体」单列判红——那不是分数低，
+      # 而是这一段根本没测。
+      #
+      # ⚠️ 判据是 **tapPoints（shim 成功投递的 TAP 点数）= 0**，**不是**报告里的 tests 条数（C10-008 返工）：
+      #   tap-runner 对**每个测试文件无条件**合成 1 条 TestResult（tapResultToTestResult：id/name 都是
+      #   文件名），所以真·空流时 tests = 文件数（本仓 66），旧判据 `tests == 0` 只在「一个文件都没跑」
+      #   时才成立 ⇒ 它判的不是空流，而是「零文件」。tapPoints 只有 shim 知道（它写不出 TAP 点时按
+      #   C10-007 已置非零退出 + stderr 留证），故由 tap-shim 逐文件落到 XBK_TAP_POINTS_LOG（dry run），
+      #   本步聚合。为什么不读 coverage JSON：tap-runner 的 runFile() 读完就 `fs.rm` 掉它；为什么不读
+      #   mutation.json：它的 testFiles[].tests[] 只有 {id,name}，没有任何覆盖/点位信息。
+      #   fail-closed：记录文件缺失或为空 ⇒ tapPoints=0 ⇒ 判红（「无法证明测试跑过」不得当成跑过）。
+      # 与 if-no-files-found: error 的关系（同 reuse.json，**不得放宽**）：只在报**告已存在时**才写文件，
+      # 否则崩溃段会因多出一个文件让上传步的 fail-loud 失效（「stryker 没产出报告 ⇒ 段 job 响亮变红」）；
+      # 记录文件刻意放 runner.temp 而不是 reports/mutation/，就是为了不制造那个多出来的文件。
+      # 为什么用 jq 而不是新增脚本：jq 已在「准备 killed 下降基线」step 用过，这里只做一次性归约；
+      # 守卫（scripts/mutation-guard.js）的判据一字未动，本步只加可观测性 + 空流这一条新判据。
+      - name: 记录 statusReason 摘要与 TAP 空流表征（${{ matrix.name }}）
+        if: always()
+        env:
+          SEGMENT: ${{ matrix.name }}
+          # 与「变异测试」step 注入给 shim 的是同一个变量名、同一条路径（runner.temp 逐 job 独立）。
+          XBK_TAP_POINTS_LOG: ${{ runner.temp }}/tap-points.jsonl
+        run: |
+          if [ ! -f reports/mutation/mutation.json ]; then
+            echo "ℹ️  无报告产物（stryker 未产出报告），不落 statusReason 摘要（保持 if-no-files-found: error 的 fail-loud）"
+            exit 0
+          fi
+          TAP_AGG='{"records":0,"files":0,"points":0,"zeroFiles":0}'
+          if [ -n "$XBK_TAP_POINTS_LOG" ] && [ -s "$XBK_TAP_POINTS_LOG" ]; then
+            TAP_AGG=$(jq -s -c '{records: length, files: (map(.file) | unique | length), points: (map(.points) | add // 0), zeroFiles: (map(select(.points == 0) | .file) | unique | length)}' "$XBK_TAP_POINTS_LOG")
+          fi
+          jq --arg seg "$SEGMENT" --arg commit "$GITHUB_SHA" --argjson tap "$TAP_AGG" '
+            def mutants: [.files[]?.mutants[]?];
+            { schema: 1,
+              segment: $seg,
+              commit: $commit,
+              testRunner: (.config.testRunner // "unknown"),
+              mutants: (mutants | length),
+              testFiles: ((.testFiles // {}) | length),
+              tests: ([.testFiles[]?.tests[]?] | length),
+              tapPoints: $tap.points,
+              tapPointRecords: $tap.records,
+              tapPointFiles: $tap.files,
+              tapPointZeroFiles: $tap.zeroFiles,
+              statuses: (mutants
+                | group_by(.status)
+                | map({ key: (.[0].status // "unknown"),
+                        value: { count: length,
+                                 nonEmptyReason: (map(select((.statusReason // "") != "")) | length) } })
+                | from_entries),
+              reasonSamples: (mutants
+                | map(select((.statusReason // "") != ""))
+                | group_by(.status)
+                | map({ key: (.[0].status // "unknown"),
+                        value: (map(.statusReason[0:120]) | unique | .[0:3]) })
+                | from_entries),
+              emptyTapStream: (((.config.testRunner // "") == "tap")
+                and ($tap.points == 0)
+                and ((mutants | length) > 0)) }' \
+            reports/mutation/mutation.json > reports/mutation/status-reason-summary.json
+          echo "ℹ️  statusReason 摘要：$(jq -c '{mutants, tests, tapPoints, tapPointRecords, tapPointFiles, tapPointZeroFiles, testRunner, emptyTapStream}' reports/mutation/status-reason-summary.json)"
+          TAP_RECORDS=$(jq -r '.tapPointRecords' reports/mutation/status-reason-summary.json)
+          TAP_RUNNER=$(jq -r '.testRunner' reports/mutation/status-reason-summary.json)
+          if [ "$TAP_RUNNER" = "tap" ] && [ "$TAP_RECORDS" = "0" ]; then
+            echo "ℹ️  本段没有任何 TAP 点记录（${XBK_TAP_POINTS_LOG:-未注入 XBK_TAP_POINTS_LOG}）：shim 未被预加载或 dry run 标志失效 ⇒ 按 0 点判（fail-closed）" >&2
+          fi
+          EMPTY_TAP=$(jq -r '.emptyTapStream' reports/mutation/status-reason-summary.json)
+          if [ "$EMPTY_TAP" = "true" ]; then
+            echo "❌ 本段是 TAP 档但成功投递的 TAP 点数为 0（tapPoints=0，逐文件记录 ${TAP_RECORDS} 条）：该段变异体全部记 Survived/NoCoverage，不能当作「测试跑过」的结论（摘要已落到 status-reason-summary.json）" >&2
+            exit 1
+          fi
 
       # F-04（落盘侧，REV-CI）：修掉 statusReason 的「纯废重」膨胀。stryker 的 command runner 把每个
       # 变异体的整段测试输出写进 statusReason（TAP 档只含覆盖该变异体的测试文件输出，体积小得多，但剥离
@@ -736,12 +920,19 @@ jobs:
       # REV-CI（落地 stryker.config.js 自述的 F-04）：缓存（path: reports）此前会把
       # reports/mutation/{mutation.json,mutation.html} 一并保存——而这个目录正是本 job 最上方的
       # 「清理缓存回填的旧报告」每次都要 `rm -rf` 掉的东西：保存 → 恢复 → 删除，纯浪费。
-      # 量化依据（gh api …/actions/caches，2026-09-18）：
-      #   * 仓库缓存共 519 条 / 4860MiB（= 10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
-      #   * 分段条目数 24-28 条/段（sendnotify 两段合计 62 条），同一段的近重复条目在持续堆积；
-      #   * 同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app），
-      #     说明 reports/mutation/* 是 reports/ 里的绝对大头（磁盘上无法经 API 拆出 inc-*.json 的占比，
-      #     故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」这一事实）。
+      # 量化依据（**历史快照，2026-09-18**；已被 2026-10-28 实测反转，保留只为记录当时为什么动这一刀，
+      #   不得当现状引用）：
+      #   * 当时：仓库缓存共 519 条 / 4860MiB（≈10GiB 配额的 47.5%），其中 stryker-* 481 条占 4234MiB（87%）；
+      #   * 现测（2026-10-28，同一 API 全量分页聚合）：1078 条 / 6528MiB（**63.8%**——配额压力已过半），
+      #     其中 stryker-* 890 条但只占 1085MiB（**16.6%**）⇒「stryker 占 87%」的口径已反转，
+      #     stryker 缓存不再是配额主因；本步的收益来自「不再缓存 reports/mutation/」，与该占比无关。
+      #   * 条目形态（同为历史观测）：分段 24-28 条/段（sendnotify 两段合计 62 条），近重复条目持续堆积；
+      #     同目录 artifact 体积实测 avg 64MiB/段、最大 179MiB（mutation-report-app）——磁盘上无法经 API
+      #     拆出 inc-*.json 的占比，故此处不宣称具体节省量，只断言「本工作流明确删除的目录不再被缓存」。
+      # ⚠️ 本仓**没有任何**缓存用量自动核对/告警（`grep -rn actions/caches` 全仓只命中本段注释）⇒ 上面的
+      #   现测数字同样会过期。引用或改这条注释前用同一条命令重测，并把日期一起改（快照型数字不带日期，
+      #   下一轮又会被当现状）：
+      #   gh api repos/{owner}/{repo}/actions/caches --paginate --jq '.actions_caches[] | [.key, .size_in_bytes] | @tsv'
       # 为什么放在「上传变异报告」之后：artifact 仍需要 reports/mutation/（report job 靠它汇总），
       #   而 actions/cache 的保存在**job 全部步骤结束后**的 post 步骤执行 ⇒ 此处删除只影响缓存、不影响 artifact。
       # 为什么 if: always()：与「清理缓存回填的旧报告」「上传变异报告」同一口径——stryker 失败/超时时，

@@ -4,9 +4,30 @@ const assert = require('assert')
 const { createNetwork, parseRetryAfterMs } = require('./xbk_network')
 const { RETRYABLE_CODES } = require('./xbk_failure_policy')
 
+// C5-010：环境性跳过必须可见且计数（此前只有 if 没有 else：断言整块消失、末尾照打 OK）。
+// 本套件的跳过面是「运行期切时区能否被 Date.parse 反映」——UTC 宿主上 asctime 的补 GMT 语义
+// 与本地解析同值，无法观测。skip 只打印原因并计数，断言一条不删。
+const envSkips = []
+const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境性）：' + why) }
+
 // fetchData 依赖全部注入：Config / Utils / fetchJson / prewarmDns / getNotify / crypto / RETRYABLE_CODES
+// C5-052：注入面全部收在这里。此前工厂表达不了 PROFILE3 / 自定义 pushUrl / 无 warn 的 logger，
+// 三个用例只好整段手抄 createNetwork 调用（连 nextTick 之外的注入项都手写），抄写点各自漂移。
 function makeNetwork (opts = {}) {
-  const { retry = 2, timeout = 5000, statusCode = 500, failTimes = 0, errorCode, permanentCodes, responseHeaders, sleep, noResponse = false } = opts
+  const {
+    retry = 2, timeout = 5000, failTimes = 0, errorCode, permanentCodes,
+    responseHeaders, sleep,
+    pushUrl = 'https://api.example.com/push', profile3 = false,
+    prewarmDns = async () => ({ ok: true, elapsedMs: 1, family: 'ipv4' }),
+    loggerWarn = true
+  } = opts
+  // C5-053：是否挂 e.response 由「opts 里有没有写 statusCode」决定，不再由解构默认值决定：
+  //   · 不写 statusCode          → 500（既有夹具口径，绝大多数用例）
+  //   · 显式写 statusCode: undefined → 无 response（DNS 失败/ECONNREFUSED/超时/EBODYLIMIT 的真实形状）
+  // 旧写法 `statusCode = 500` 把显式 undefined 兜回 500，于是「无 response」只能靠额外的 noResponse
+  // 布尔表达；而 4 个调用点（写 undefined 却没传 noResponse）实际一直挂着伪造的 500。
+  const hasStatus = Object.prototype.hasOwnProperty.call(opts, 'statusCode')
+  const statusCode = hasStatus ? opts.statusCode : 500
   let calls = 0
   const requestOptions = [] // net-3：捕获传给 HTTP 层的 option，供 timeout 钳制断言使用
   const warnings = [] // net-3：捕获 logger.warn（配置非法时必须告警留痕）
@@ -17,28 +38,29 @@ function makeNetwork (opts = {}) {
     if (calls <= failTimes) {
       const e = new Error('fail ' + calls)
       if (errorCode !== undefined) e.code = errorCode // net-1：无 response 的永久性错误码
-      // noResponse：真实链路里 DNS 失败/ECONNREFUSED/超时/EBODYLIMIT 都不挂 e.response
-      // （xbk_http 只在 statusCode >= 300 时才挂）——夹具必须能复刻这条形状，否则
-      // 「无 response」分支永远测不到（statusCode: undefined 会被上面的解构默认值 500 兜回）。
-      if (statusCode !== undefined && !noResponse) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
+      if (statusCode !== undefined) e.response = { statusCode, headers: responseHeaders } // net-7：Retry-After 载体
       throw e
     }
     return { ok: true, calls }
   }
   const net = createNetwork({
-    Config: { api: { pushUrl: 'https://api.example.com/push', retry, timeout } },
+    Config: { api: { pushUrl, retry, timeout } },
     Utils: {
       num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
       safeErrorText: (e, d) => (e && e.message) || d
     },
     fetchJson,
-    prewarmDns: async () => ({ ok: true, elapsedMs: 1, family: 'ipv4' }),
+    prewarmDns,
     getNotify: async () => 'notify-module',
     crypto: { randomInt: () => 0 }, // 抖动固定为 0，退避仅由 1000*2^attempt 决定
     RETRYABLE_CODES,
     ...(permanentCodes === undefined ? {} : { PERMANENT_CODES: permanentCodes }),
     ...(sleep === undefined ? {} : { sleep }),
-    logger: { log: (...args) => logs.push(args.join(' ')), warn: (msg) => warnings.push(String(msg)) }
+    // loggerWarn:false 复刻「旧调用方只传 log」的形状（缺 warn 时告警路径不得抛 TypeError）
+    logger: loggerWarn
+      ? { log: (...args) => logs.push(args.join(' ')), warn: (msg) => warnings.push(String(msg)) }
+      : { log: (...args) => logs.push(args.join(' ')) },
+    ...(profile3 ? { PROFILE3: true } : {})
   })
   return {
     net,
@@ -108,46 +130,26 @@ function makeNetwork (opts = {}) {
 
   // 8. PROFILE3 + prewarmDns reject → 走 .catch 日志分支（行38-39），不影响主流程
   {
-    const logs = []
-    const net = createNetwork({
-      Config: { api: { pushUrl: 'https://api.example.com/push', retry: 0, timeout: 5000 } },
-      Utils: {
-        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
-        safeErrorText: (e, d) => (e && e.message) || d
-      },
-      fetchJson: async () => ({ ok: true }),
-      prewarmDns: async () => { throw new Error('dns-fail') },
-      getNotify: async () => 'notify',
-      crypto: { randomInt: () => 0 },
-      RETRYABLE_CODES,
-      PROFILE3: true,
-      logger: { log: (...args) => logs.push(args.join(' ')) }
+    const { net, getLogs } = makeNetwork({
+      retry: 0,
+      profile3: true,
+      prewarmDns: async () => { throw new Error('dns-fail') }
     })
     const r = await net.fetchData()
     assert.strictEqual(r.ok, true, 'prewarmDns 失败不应影响主流程')
-    assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('ok=false')), 'PROFILE3 应输出 prewarm 失败日志')
+    assert.ok(getLogs().some(l => l.includes('dns-prewarm') && l.includes('ok=false')), 'PROFILE3 应输出 prewarm 失败日志')
   }
 
   // 9. PROFILE3 + 无效 pushUrl → new URL 抛错走 catch 日志分支（行43-44），不影响主流程
   {
-    const logs = []
-    const net = createNetwork({
-      Config: { api: { pushUrl: 'not-a-valid-url', retry: 0, timeout: 5000 } },
-      Utils: {
-        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
-        safeErrorText: (e, d) => (e && e.message) || d
-      },
-      fetchJson: async () => ({ ok: true }),
-      prewarmDns: async () => ({ ok: true }),
-      getNotify: async () => 'notify',
-      crypto: { randomInt: () => 0 },
-      RETRYABLE_CODES,
-      PROFILE3: true,
-      logger: { log: (...args) => logs.push(args.join(' ')) }
+    const { net, getLogs } = makeNetwork({
+      retry: 0,
+      profile3: true,
+      pushUrl: 'not-a-valid-url'
     })
     const r = await net.fetchData()
     assert.strictEqual(r.ok, true, 'URL 解析失败不应影响主流程')
-    assert.ok(logs.some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
+    assert.ok(getLogs().some(l => l.includes('dns-prewarm') && l.includes('skipped')), 'PROFILE3 应输出 skipped 日志')
   }
 
   // 10. net-3（xbk_network.js resolveTimeoutMs）：只有「≥100ms 的整数」被采用，其余回落默认并告警
@@ -218,22 +220,9 @@ function makeNetwork (opts = {}) {
 
   // 11b. net-3：注入的 logger 没有 warn（旧调用方形状）时不得抛错，回落语义不变
   {
-    const requestOptions = []
-    const net = createNetwork({
-      Config: { api: { pushUrl: 'https://api.example.com/push', retry: 0, timeout: 5 } },
-      Utils: {
-        num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d },
-        safeErrorText: (e, d) => (e && e.message) || d
-      },
-      fetchJson: async (_url, requestOpts) => { requestOptions.push(requestOpts); return { ok: true } },
-      prewarmDns: async () => ({ ok: true }),
-      getNotify: async () => 'notify',
-      crypto: { randomInt: () => 0 },
-      RETRYABLE_CODES,
-      logger: { log: () => {} } // 无 warn：不得因告警而抛 TypeError
-    })
+    const { net, getRequestOptions } = makeNetwork({ retry: 0, timeout: 5, loggerWarn: false })
     await net.fetchData()
-    assert.strictEqual(requestOptions[0].timeout, 5000, '无 warn 的 logger 仍应回落默认')
+    assert.strictEqual(getRequestOptions()[0].timeout, 5000, '无 warn 的 logger 仍应回落默认')
   }
 
   // 12. net-1（xbk_network.js:83-87）：不可重试判定不再只看 HTTP 状态码——无 response 的永久性错误码
@@ -498,6 +487,8 @@ function makeNetwork (opts = {}) {
       process.env.TZ = 'Asia/Shanghai'
       if (Date.parse(asctime) !== Date.UTC(2033, 10, 6, 8, 49, 37)) {
         assert.strictEqual(parseRetryAfterMs(asctime, now), Date.UTC(2033, 10, 6, 8, 49, 37) - now, 'asctime 必须按 GMT 解析，不得按本地时区')
+      } else {
+        skipEnv('asctime 无时区标记的「补 GMT」语义：本进程时区为 UTC，Date.parse 对补 GMT 与本地解析同值，该断言不可观测')
       }
     } finally {
       if (origTZ === undefined) delete process.env.TZ; else process.env.TZ = origTZ
@@ -543,12 +534,45 @@ function makeNetwork (opts = {}) {
   //     必须照常重试并抛出原始错误码。反例：`if (e.response)` → `if (true)` 后读
   //     `e.response.statusCode` 抛 TypeError —— 原始 code 被掩盖且整轮退避被打断（零重试）。
   {
-    const { net, getCalls } = makeNetwork({ retry: 2, noResponse: true, errorCode: 'ERR_UNKNOWN_XYZ', failTimes: 5, sleep: async () => {} })
+    const { net, getCalls } = makeNetwork({ retry: 2, statusCode: undefined, errorCode: 'ERR_UNKNOWN_XYZ', failTimes: 5, sleep: async () => {} })
     let rejected = null
     try { await net.fetchData() } catch (e) { rejected = e }
     assert.strictEqual(rejected && rejected.code, 'ERR_UNKNOWN_XYZ',
       `无 response 的错误必须抛出原始 code，实际 ${rejected && rejected.code}（${rejected && rejected.message}）`)
     assert.strictEqual(getCalls(), 3, '无 response 的未知错误码仍按 maxRetry 重试（首次 + 2 次）')
+  }
+
+  if (envSkips.length > 0) {
+    console.log(`⏭ test_network 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，改为在非 UTC 宿主上生效）`)
+  }
+
+  // 26. [夹具自检] makeNetwork 的「无 response」形状（C5-053）。
+  // 真实链路里 DNS 失败 / ECONNREFUSED / 超时 / EBODYLIMIT 都不挂 e.response（xbk_http 只在
+  // statusCode >= 300 时才挂）。夹具必须能表达这两种形状，否则「无 response」分支永远是假的：
+  // 解构默认值 `statusCode = 500` 会把显式传入的 undefined 兜回 500，用例以为在测无 response，
+  // 实际拿到的错误带一个伪造的 500 response。
+  {
+    const withResp = makeNetwork({ retry: 0, statusCode: 418, failTimes: 1 })
+    let e1 = null
+    try { await withResp.net.fetchData() } catch (e) { e1 = e }
+    assert.strictEqual(e1 && e1.response && e1.response.statusCode, 418, '显式 statusCode 必须挂 e.response')
+
+    const noResp = makeNetwork({ retry: 0, statusCode: undefined, failTimes: 1 })
+    let e2 = null
+    try { await noResp.net.fetchData() } catch (e) { e2 = e }
+    assert.ok(e2 && !('response' in e2),
+      `statusCode: undefined 必须表示「无 response」，实际挂了 ${JSON.stringify(e2 && e2.response)}（解构默认值 500 把 undefined 兜回）`)
+  }
+
+  // 27. [夹具自检] createNetwork 只允许在 makeNetwork 工厂内出现一次（C5-052）。
+  // 反例：工厂表达不了 PROFILE3 / 自定义 pushUrl / 无 warn 的 logger 时，用例只好整段手抄注入对象；
+  // 手抄点没有任何结构约束，注入项与工厂漂移（少一个 warn、多一个字段）不会被任何断言发现。
+  // 本守卫直接读本文件源码，把「再抄一份」变成红。
+  {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const calls = src.match(/createNetwork\s*\(/g) || []
+    assert.strictEqual(calls.length, 1,
+      `createNetwork 只应出现在 makeNetwork 工厂里，实际 ${calls.length} 处：手抄调用点会与工厂漂移（C5-052）`)
   }
 
   console.log('test_network OK')

@@ -295,6 +295,121 @@ function run (ymlText) {
     `健康仓库下 require 不应抛错（否则复用该模块的测试会被误杀），实际 stdout: ${noThrow.stdout} stderr: ${noThrow.stderr}`)
   console.log('✅ require 路径契约断言通过（失败抛错 / 健康不抛）')
 
+  // ===== C10-025：matrix 解析器一致性对账（auditMatrixParsers）=====
+  // 本门禁把「本文件自己的 include 解析结果」与日报侧两个**独立实现**（mutation-report 的
+  // parseMatrixRunnerConfigs / parseMatrixTimeouts）逐段对账：任一侧少看/多看一眼段，日报的 runner
+  // 档位与「超时上限」列就会静默回落缺省值，而 CI 只看退出码、看不出来。此前本文件对该函数零用例
+  // ——把 errors.push 全改成空操作（恒返回零错误）本套件照样全绿。故先锁「健康夹具零错误」
+  // （否则下面四条坏输入可以靠「恒报错」蒙过），再逐条喂坏输入。
+  {
+    const { auditMatrixParsers } = require('./scripts/check-mutation-ranges.js')
+    const { parseMatrixRunnerConfigs, parseMatrixTimeouts } = require('./scripts/mutation-report.js')
+    const reporters = { parseMatrixRunnerConfigs, parseMatrixTimeouts }
+    // 只造 include 块：对账输入是 (yml 文本, 本文件解析出的条目, 两个外部解析器)
+    const includeYml = (rows) => 'jobs:\n  mutation:\n    strategy:\n      matrix:\n        include:\n' +
+      rows.map(r => `          - name: ${r.name}\n` +
+        (r.config === undefined ? '' : `            config: "${r.config}"\n`) +
+        (r.timeout === undefined ? '' : `            timeout_ms: ${r.timeout}\n`) +
+        `            src: "${r.name}.js"\n            mutate: "${r.name}.js:1-10"\n`).join('')
+    const entriesOf = (rows) => rows.map(r => ({ name: r.name, config: r.config, timeout_ms: r.timeout }))
+    const healthy = [
+      { name: 'seg-a', config: 'stryker.config.js', timeout: 60000 },
+      { name: 'seg-b', config: 'stryker.tap.config.js', timeout: 300000 },
+      { name: 'seg-c', config: 'stryker.config.js' }
+    ]
+    // 正向对照：三段两侧完全一致 ⇒ 零错误（下面的坏输入断言才有意义）
+    {
+      const ok = auditMatrixParsers(includeYml(healthy), entriesOf(healthy), reporters)
+      assert.deepStrictEqual(ok.errors, [], `健康夹具不得报错：${JSON.stringify(ok.errors)}`)
+      assert.deepStrictEqual(ok.stats, { entries: 3, configs: 3, timeouts: 3 },
+        `对账统计必须覆盖三段（缺一段等于没对上）：${JSON.stringify(ok.stats)}`)
+    }
+    // ① 半套 config：yml 只给一段写了 config，另一段本文件看得见、parseMatrixRunnerConfigs 看不见
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.config.js' }, { name: 'seg-b' }]
+      const entries = [{ name: 'seg-a', config: 'stryker.config.js' }, { name: 'seg-b', config: 'stryker.config.js' }]
+      const r = auditMatrixParsers(includeYml(rows), entries, reporters)
+      assert.ok(r.errors.some(e => e.includes('parseMatrixRunnerConfigs 没看到')),
+        `半套 config 必须报「② 没看到该段」（否则该段的 runner 档位在日报里静默缺失）：${JSON.stringify(r.errors)}`)
+      assert.strictEqual(r.stats.configs, 1, `② 只应看到 1 段 config，实际 ${r.stats.configs}`)
+    }
+    // ② 取值分叉：两侧都看到该段，但 config 取值不同（② 读到的不是本文件写的那一档）
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.tap.config.js' }]
+      const entries = [{ name: 'seg-a', config: 'stryker.config.js' }]
+      const r = auditMatrixParsers(includeYml(rows), entries, reporters)
+      assert.ok(r.errors.some(e => e.includes('取值分叉') && e.includes('seg-a')),
+        `两侧 config 取值不一致必须报取值分叉：${JSON.stringify(r.errors)}`)
+    }
+    // ③ 多出段：yml（进而 ②/③ 两个解析器）多出一段，本文件的条目里没有它
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.config.js' }, { name: 'seg-extra', config: 'stryker.config.js' }]
+      const entries = [{ name: 'seg-a', config: 'stryker.config.js' }]
+      const r = auditMatrixParsers(includeYml(rows), entries, reporters)
+      assert.ok(r.errors.some(e => e.includes('多出段') && e.includes('seg-extra')),
+        `解析器多出的段必须点名（日报会为不存在的段标注档位）：${JSON.stringify(r.errors)}`)
+      assert.strictEqual(r.stats.configs, 2, `② 读到 2 段 config，实际 ${r.stats.configs}`)
+    }
+    // ④ timeout 取值对账：段名对得上只说明「两条解析器都看见了这个段」，不说明「读到的秒数一样」。
+    //    此前本块只锁了 config 侧取值分叉，timeout 侧取值比较（if (parsed !== undefined && parsed !==
+    //    expected)）改成恒假、甚至整段删掉，本套件照样全绿：日报的「超时上限」列会按错的值渲染，
+    //    而 CI 只看退出码。故这里既喂真实解析器能一眼看出分叉的写法（timeout_ms: 60_000：本文件读到
+    //    字符串 "60_000"（Number ⇒ NaN），parseMatrixTimeouts 判非正整数后回落 300000），也用 stub
+    //    直接喂不等值的 Map（不依赖任一侧对怪写法的容忍度）。
+    {
+      const diagRows = [{ name: 'seg-a', config: 'stryker.config.js', timeout: '60_000' }]
+      const diag = auditMatrixParsers(includeYml(diagRows), entriesOf(diagRows), reporters)
+      const diagMsg = diag.errors.find(e => e.includes('取值分叉') && e.includes('seg-a'))
+      assert.ok(diagMsg,
+        `timeout_ms 两侧取值不一致必须报取值分叉并点名该段：${JSON.stringify(diag.errors)}`)
+      assert.ok(diagMsg.includes('timeout_ms'), `取值分叉必须点名字段 timeout_ms：${diagMsg}`)
+      assert.ok(diagMsg.includes('60_000') && diagMsg.includes('300000'),
+        `取值分叉必须同时报出两侧读到的值（本文件 60_000 / parseMatrixTimeouts 300000）：${diagMsg}`)
+      assert.strictEqual(diag.errors.length, 1,
+        `该夹具只应报这一条（其余错误会掩盖取值分叉）：${JSON.stringify(diag.errors)}`)
+      // 同一判据的 stub 版：段名两侧都在、取值不等（300000 vs 60000），且不经过任何奇异写法
+      const stubRows = [{ name: 'seg-a', config: 'stryker.config.js', timeout: 60000 }]
+      const stubTimeouts = () => new Map([['seg-a', 300000]])
+      const stub = auditMatrixParsers(includeYml(stubRows), entriesOf(stubRows),
+        { parseMatrixRunnerConfigs, parseMatrixTimeouts: stubTimeouts })
+      assert.ok(stub.errors.some(e => e.includes('取值分叉') && e.includes('seg-a') &&
+        e.includes('60000') && e.includes('300000')),
+        `两侧 timeout_ms 数值不等必须报取值分叉（不依赖 yml 写法）：${JSON.stringify(stub.errors)}`)
+      assert.strictEqual(stub.stats.timeouts, 1, `stub 只看到 1 段 timeout，实际 ${stub.stats.timeouts}`)
+    }
+    // ⑤ timeout 段名对账：stub 返回少一段的 Map（真实解析器对某些写法会静默丢段，这里直接构造该形态）。
+    //    此前若把「没看到该段」的判定改成恒假，本套件全绿：日报会为被丢掉的段回落缺省 300s，读者
+    //    却以为那就是矩阵声明的上限。必须点名 parseMatrixTimeouts 与被丢掉的段名。
+    {
+      const rows = [
+        { name: 'seg-a', config: 'stryker.config.js', timeout: 60000 },
+        { name: 'seg-b', config: 'stryker.config.js', timeout: 60000 }
+      ]
+      const shortTimeouts = () => new Map([['seg-a', 60000]])
+      const r = auditMatrixParsers(includeYml(rows), entriesOf(rows),
+        { parseMatrixRunnerConfigs, parseMatrixTimeouts: shortTimeouts })
+      assert.ok(r.errors.some(e => e.includes('parseMatrixTimeouts 没看到') && e.includes('seg-b')),
+        `parseMatrixTimeouts 少看一段必须点名解析器与该段：${JSON.stringify(r.errors)}`)
+      assert.ok(r.errors.some(e => e.includes('parseMatrixTimeouts 没看到') && e.includes('超时上限')),
+        `少看段的错误必须说明后果（超时上限列回落缺省）：${JSON.stringify(r.errors)}`)
+      assert.strictEqual(r.errors.length, 1,
+        `该夹具只应报「没看到该段」这一条：${JSON.stringify(r.errors)}`)
+      assert.strictEqual(r.stats.timeouts, 1, `stub 只看到 1 段 timeout，实际 ${r.stats.timeouts}`)
+    }
+    // ⑥ 缺注入：没有对照解析器时必须 fail-closed——「没对照就没有判据」不等于「一致」
+    {
+      const rows = [{ name: 'seg-a', config: 'stryker.config.js' }]
+      const none = auditMatrixParsers(includeYml(rows), entriesOf(rows))
+      assert.strictEqual(none.errors.length, 1, `未注入解析器必须报 1 条错误，实际 ${JSON.stringify(none.errors)}`)
+      assert.ok(none.errors[0].includes('缺少注入的'), `必须点名缺注入：${none.errors[0]}`)
+      assert.deepStrictEqual(none.stats, { entries: 0, configs: 0, timeouts: 0 }, '缺注入时不得假装对过账')
+      const half = auditMatrixParsers(includeYml(rows), entriesOf(rows), { parseMatrixRunnerConfigs })
+      assert.ok(half.errors[0] && half.errors[0].includes('缺少注入的'),
+        `只注入一个解析器同样必须 fail-closed：${JSON.stringify(half.errors)}`)
+    }
+    console.log('✅ C10-025 matrix 解析器一致性对账断言通过（健康零错误 / 半套 config / config 取值分叉 / 多出段 / timeout 取值分叉 / timeout 少看段 / 缺注入 均报错）')
+  }
+
   // ===== G11-CMR：环境变量入口与 matrix 形状守卫（c8 实测本文件 26 条分支未达）=====
   // 这些分支是「行段门禁自己的 fail-closed 出口」：注入方式写错、matrix 条目缺字段、段名打错、
   // 段名重复——旧实现里任何一条被改成静默跳过，本套件的既有用例（都走「完整合法夹具 + 只改行段」）
@@ -411,39 +526,42 @@ function run (ymlText) {
       .map(m => ({ name: m[1], start: Number(m[2]), end: Number(m[3]) }))
     assert.strictEqual(ranges.length, 12, `真实矩阵必须拆 12 段 console，实际 ${ranges.length}`)
     const lines = fs.readFileSync(path.join(ROOT, 'scripts', 'console.js'), 'utf8').split('\n').length - 1
-    assert.strictEqual(ranges[0].start, 1, '真实矩阵首段必须从第 1 行开始')
-    assert.strictEqual(ranges[ranges.length - 1].end, lines, '真实矩阵末段必须止于文件最后一行')
-    for (let i = 1; i < ranges.length; i++) {
-      assert.strictEqual(ranges[i].start, ranges[i - 1].end + 1,
-        `真实矩阵 ${ranges[i].name} 必须紧接上一段（不得留缝/重叠），实际 ${ranges[i].start} vs ${ranges[i - 1].end + 1}`)
-    }
-    // 单片预算：849 行（旧 part6）实测撞穿 step 330min 被杀；末两段各 ~425 行是为此对半拆的。
+    // 单片预算：849 行（旧 part6）实测撞穿 step 330min 被杀。
     const MAX_PART_LINES = 700
-    for (const r of ranges) {
-      assert.ok(r.end - r.start + 1 <= MAX_PART_LINES,
-        `真实矩阵 ${r.name} 覆盖 ${r.end - r.start + 1} 行，超过单片预算 ${MAX_PART_LINES} 行（会撞 step 上限）`)
+    // C5-061：原先在这里把 part6..part12 的绝对起止行（3251-3675 / 3676-4370 …）逐段写死，
+    // 与同仓「不硬编码行数」的口径相反——console.js 增长后按语义重平衡分段是合法维护动作，
+    // 却被这 7 条绝对值判红。改为只从矩阵与文件实际行数推导语义：首段=1、末段=lines、
+    // 逐段连续、单片 ≤ MAX_PART_LINES；下面两条反例证明推导确实会红（不是恒真）。
+    const auditSplit = (rs) => {
+      const errs = []
+      if (rs[0].start !== 1) errs.push(`首段必须从第 1 行开始，实际 ${rs[0].start}`)
+      if (rs[rs.length - 1].end !== lines) {
+        errs.push(`末段必须止于文件最后一行 ${lines}，实际 ${rs[rs.length - 1].end}`)
+      }
+      for (let i = 1; i < rs.length; i++) {
+        if (rs[i].start !== rs[i - 1].end + 1) {
+          errs.push(`${rs[i].name} 必须紧接上一段（不得留缝/重叠），实际 ${rs[i].start} vs ${rs[i - 1].end + 1}`)
+        }
+      }
+      for (const r of rs) {
+        if (r.end - r.start + 1 > MAX_PART_LINES) {
+          errs.push(`${r.name} 覆盖 ${r.end - r.start + 1} 行，超过单片预算 ${MAX_PART_LINES} 行（会撞 step 上限）`)
+        }
+      }
+      return errs
     }
-    const part6 = ranges.find(r => r.name === 'console-part6')
-    const part7 = ranges.find(r => r.name === 'console-part7')
-    const part8 = ranges.find(r => r.name === 'console-part8')
-    const part9 = ranges.find(r => r.name === 'console-part9')
-    const part10 = ranges.find(r => r.name === 'console-part10')
-    const part11 = ranges.find(r => r.name === 'console-part11')
-    const part12 = ranges.find(r => r.name === 'console-part12')
-    assert.ok(part6 && part6.start === 3251 && part6.end === 3675,
-      `真实 console-part6 必须是 3251-3675，实际 ${part6 && part6.start}-${part6 && part6.end}`)
-    assert.ok(part7 && part7.start === 3676 && part7.end === 4370,
-      `真实 console-part7 必须是 3676-4370，实际 ${part7 && part7.start}-${part7 && part7.end}`)
-    assert.ok(part8 && part8.start === 4371 && part8.end === 4800,
-      `真实 console-part8 必须是 4371-4800，实际 ${part8 && part8.start}-${part8 && part8.end}`)
-    assert.ok(part9 && part9.start === 4801 && part9.end === 5200,
-      `真实 console-part9 必须是 4801-5200，实际 ${part9 && part9.start}-${part9 && part9.end}`)
-    assert.ok(part10 && part10.start === 5201 && part10.end === 5800,
-      `真实 console-part10 必须是 5201-5800，实际 ${part10 && part10.start}-${part10 && part10.end}`)
-    assert.ok(part11 && part11.start === 5801 && part11.end === 6500,
-      `真实 console-part11 必须是 5801-6500，实际 ${part11 && part11.start}-${part11 && part11.end}`)
-    assert.ok(part12 && part12.start === 6501 && part12.end === lines,
-      `真实 console-part12 必须是 6501-${lines}，实际 ${part12 && part12.start}-${part12 && part12.end}`)
+    const realErrors = auditSplit(ranges)
+    assert.deepStrictEqual(realErrors, [], `真实矩阵 console 拆段必须合规：${realErrors.join('；')}`)
+    // 反例①：把 part7 起点 +1（与 part6 留缝 1 行）⇒ 推导必须点名该段
+    const gapped = ranges.map(r => r.name === 'console-part7' ? { ...r, start: r.start + 1 } : r)
+    assert.ok(auditSplit(gapped).some(e => e.includes('console-part7')),
+      `留缝/重叠必须被推导抓到，实际 ${JSON.stringify(auditSplit(gapped))}`)
+    // 反例②：把 part6 拉长到 part7 末尾（单片 1121 行，超 700 预算）⇒ 推导必须判红
+    const part7End = ranges.find(r => r.name === 'console-part7').end
+    const merged = ranges.filter(r => r.name !== 'console-part7')
+      .map(r => r.name === 'console-part6' ? { ...r, end: part7End } : r)
+    assert.ok(auditSplit(merged).some(e => e.includes('console-part6') && e.includes('单片预算')),
+      `单片超预算必须被推导抓到，实际 ${JSON.stringify(auditSplit(merged))}`)
   }
 
   // ===== C10-009 运行链候选集 ↔ mutate 清单双向核对（靶向反例）=====

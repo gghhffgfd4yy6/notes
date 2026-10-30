@@ -10,7 +10,8 @@
 // ——与本仓 test_install_hooks.js 对 git 的处理同款，改代码消除、不挂 NOSONAR 压制。
 //
 // 工具缺失语义（CI vs 本地）：
-//   - CI（env CI=true）或显式 --require-tools：缺工具 = 红（fail-closed）。
+//   - CI（env CI 为真：'true' / '1' / 其他非空值，见 decideCiEnv）或显式 --require-tools：
+//     缺工具 = 红（fail-closed）。
 //     否则「CI 里扫描器没装 ⇒ 静默绿」等价于门禁不存在。
 //   - 本地：缺工具时打印显眼提示并跳过该扫描器——与「npm 不会自动注册仓库钩子」同一先例，
 //     本地缺失不阻塞开发，由 CI 兜底，绝不假装扫描过。
@@ -57,6 +58,27 @@ function decideToolMissing (isCi, requireTools) {
   return 'skip'
 }
 
+// CI 环境判定纯函数（C10-067）：旧实现只认 `CI === 'true'`，而 CI=1 / CI=True 这类同样表示「在 CI 里」
+// 的取值会被判成本机 ⇒ 缺 shellcheck/zizmor 时打印 ⚠️ 并 exit 0，门禁在 CI 上静默失效。
+// 口径：未设置 / 空串 = 本机；显式假值（false、0）= 本机；其余任何非空值一律按 CI
+// ——判不准时 fail-closed：多要求一个扫描器只是显眼地红，把 CI 当本机放行的代价是门禁不存在。
+function decideCiEnv (value) {
+  if (typeof value !== 'string') return false
+  const v = value.trim().toLowerCase()
+  if (v === '' || v === 'false' || v === '0') return false
+  return true
+}
+
+// shellcheck 扫描面判定纯函数（C10-004）：**0 个文件 ≠ 0 发现**。
+// `.githooks` 缺失、裁剪检出、钩子被删时 files=[]，旧实现照样打印「✅ shellcheck：0 个钩子文件，
+// 0 发现」并整脚本 exit 0 —— 门禁在「什么都没扫」时静默通过（fail-open）。与 run_unit_tests 的
+// 「零套件不等于通过」、check-doc-lines 的 decideEmptyScan(0)==='fail' 同口径：扫描面为空一律判红，
+// 并点名「扫描面为空」，免得被读成「扫过、没问题」。zizmor 一侧的 fail-closed 语义（缺工具/
+// 非 0 退出/输出不可解析）不受影响。
+function decideEmptyScan (scanned) {
+  return Number.isSafeInteger(scanned) && scanned > 0 ? 'pass' : 'fail'
+}
+
 // zizmor --format json 的解析纯函数：数组即 findings 清单；形状不符 = 不可判定 = 红（宁红勿绿，
 // 与 test_ci_skip_suites.js 的「提取不出命令名 ⇒ 对账保持红」同一口径）。
 function summarizeZizmor (stdout) {
@@ -76,15 +98,20 @@ function summarizeZizmor (stdout) {
 }
 
 // .githooks/ 下逐个常规文件跑 shellcheck；符号链接不跟随（存储层符号链接防御的同族纪律）。
+// 扫描面抽成独立函数：让「门禁到底会扫几个文件」可被 test_ci_static_gates.js 直接断言
+// （守卫「扫描循环被删 / 扫描面塌成 0 个文件」这类空转，C5-013）。
+function shellcheckTargets () {
+  const dir = path.join(ROOT, '.githooks')
+  if (!fs.existsSync(dir)) return []
+  return fs.readdirSync(dir).filter((f) => {
+    const st = fs.lstatSync(path.join(dir, f))
+    return st.isFile() && !st.isSymbolicLink()
+  })
+}
+
 function runShellcheck () {
   const dir = path.join(ROOT, '.githooks')
-  let files = []
-  if (fs.existsSync(dir)) {
-    files = fs.readdirSync(dir).filter((f) => {
-      const st = fs.lstatSync(path.join(dir, f))
-      return st.isFile() && !st.isSymbolicLink()
-    })
-  }
+  const files = shellcheckTargets()
   const failures = []
   const bin = resolveTool('shellcheck')
   if (!bin) throw new Error('shellcheck 解析失败（resolveTool 返回 null）')
@@ -135,17 +162,36 @@ function selftest () {
   assert.strictEqual(decideToolMissing(true, false), 'fail')
   assert.strictEqual(decideToolMissing(false, true), 'fail')
   assert.strictEqual(decideToolMissing(false, false), 'skip')
+  // —— decideEmptyScan：扫描面为 0 必须判红（0 个文件 ≠ 0 发现，与「零套件不等于通过」同口径）
+  assert.strictEqual(decideEmptyScan(3), 'pass')
+  assert.strictEqual(decideEmptyScan(1), 'pass')
+  assert.strictEqual(decideEmptyScan(0), 'fail', '扫描面为 0 不得静默通过（旧实现打印 ✅ 并 exit 0）')
+  assert.strictEqual(decideEmptyScan(-1), 'fail')
+  assert.strictEqual(decideEmptyScan(undefined), 'fail', '拿不到扫描面 = 不可判定 = 红')
   // —— resolveTool / toolAvailable 边界：假工具名解析不到；真在场工具解析为绝对路径
   assert.strictEqual(resolveTool('definitely-not-a-real-tool-xyz-98'), null)
   assert.strictEqual(toolAvailable('definitely-not-a-real-tool-xyz-98'), false)
   const nodeAbs = resolveTool('node')
   assert.ok(nodeAbs && path.isAbsolute(nodeAbs), 'node 必然在场且解析为绝对路径（本脚本正由它执行）')
+  // —— decideCiEnv：CI 的取值不只 'true'（C10-067）——CI=1 曾被判成本机，缺工具时软跳过 ⇒ CI 上门禁静默失效
+  assert.strictEqual(decideCiEnv('true'), true)
+  assert.strictEqual(decideCiEnv('1'), true, 'CI=1 同样是 CI（旧口径落到软跳过 = CI 上门禁失效）')
+  assert.strictEqual(decideCiEnv('TRUE'), true, '大小写不敏感（CI=True 也是 CI）')
+  assert.strictEqual(decideCiEnv(undefined), false, '未设置 = 本机（本地开发不因缺工具阻塞）')
+  assert.strictEqual(decideCiEnv(''), false, '空串 = 未声明')
+  assert.strictEqual(decideCiEnv('false'), false, '显式 CI=false 仍按本机')
+  assert.strictEqual(decideCiEnv('0'), false, '显式 CI=0 仍按本机')
+  assert.strictEqual(decideCiEnv('yes'), true, '其余非空值一律按 CI（判不准时 fail-closed）')
   // —— decideZizmorProc：非 0 一律「输出不采信」，0 且无信号放行
   assert.strictEqual(decideZizmorProc(0, null), null)
   assert.match(decideZizmorProc(3, null), /exit=3/)
   assert.match(decideZizmorProc(1, null), /exit=1/)
   assert.match(decideZizmorProc(null, 'SIGABRT'), /信号/)
-  console.log('✅ check-ci-static --selftest 全部通过（15 断言）')
+  console.log('✅ check-ci-static --selftest 全部通过（28 断言）')
+  // 返回值供测试守卫核对条数（C5-013：--selftest 此前全仓无人调用，是死代码；现在由
+  // test_ci_static_gates.js 在套件内执行，条数漂移即红）。b7 的 C10-004 加了 5 条
+  // decideEmptyScan 断言（15 → 20）；C10-067 加了 8 条 decideCiEnv 断言（20 → 28）。
+  return 28
 }
 
 function main () {
@@ -154,7 +200,7 @@ function main () {
     selftest()
     return 0
   }
-  const isCi = process.env.CI === 'true'
+  const isCi = decideCiEnv(process.env.CI)
   const requireTools = argv.includes('--require-tools')
   let red = false
   console.log('🔍 静态扫描闸门：shellcheck(.githooks) + zizmor(.github/workflows)')
@@ -174,7 +220,11 @@ function main () {
 
   if (toolAvailable('shellcheck')) {
     const sc = runShellcheck()
-    if (sc.failures.length === 0) {
+    if (decideEmptyScan(sc.scanned) === 'fail') {
+      // 扫描面为 0：目录缺失/裁剪检出/钩子被删。旧实现走到下面那个 ✅ 模板并 exit 0（fail-open）。
+      red = true
+      console.log('❌ shellcheck：扫描面为空（.githooks 下 ' + sc.scanned + ' 个钩子文件）——0 个文件不等于 0 发现，判红')
+    } else if (sc.failures.length === 0) {
       console.log('✅ shellcheck：' + sc.scanned + ' 个钩子文件，0 发现')
     } else {
       red = true
@@ -213,4 +263,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { summarizeZizmor, decideToolMissing, toolAvailable, resolveTool, decideZizmorProc }
+module.exports = { summarizeZizmor, decideToolMissing, decideEmptyScan, decideCiEnv, toolAvailable, resolveTool, decideZizmorProc, shellcheckTargets, selftest }

@@ -239,6 +239,24 @@ function waitKillCount (expected, timeoutMs = 1500) {
       console.log('✅ 场景G：持续输出跨过静默线 → 不被杀、判 pass（慢机器不再假红）')
     }
 
+    // ── 场景 G2（C10-034）：只写 stderr 也必须重置静默线 ──
+    // 场景 G 只往 stdout 写：删掉 run_mutation.js 里 stderr 分支的 armIdle() 不会有任何用例变红，
+    // 于是「stderr 持续输出仍被判挂死」这条回归无覆盖（SYSTEM_CONTRACT.md:77 要求两路都算推进）。
+    {
+      killedSignals.length = 0
+      const pending = runTests(dir, 60000, 150)
+      const iv = setInterval(() => { if (lastChild && lastChild.stderr.writable) lastChild.stderr.write('stderr 推进\n') }, 40)
+      await new Promise(resolve => setTimeout(resolve, 520)) // 远超 150ms 静默线：只有 stderr 在推进
+      clearInterval(iv)
+      lastChild.emit('close', 0, null)
+      const result = await pending
+      assert.deepStrictEqual(killedSignals, [],
+        '只有 stderr 输出时同样不该被杀：stdout 与 stderr 都必须重置静默计时器（删掉 stderr 的 armIdle 会在本用例变红）')
+      assert.strictEqual(result.status, 'pass', '只写 stderr 的慢子进程应按真实 code=0 判 pass')
+      assert.ok(result.output.includes('stderr 推进'), 'stderr 内容必须与 stdout 同样被收集进 output')
+      console.log('✅ 场景G2：只写 stderr 跨过静默线 → 不被杀、判 pass')
+    }
+
     // ── 场景 H（v3.282）：总上限仍是兜底——持续输出也要在 timeoutMs 收敛 ──
     {
       killedSignals.length = 0

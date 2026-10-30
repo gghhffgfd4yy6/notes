@@ -297,6 +297,56 @@ export function splitHits (line, kw, maxHits = Infinity) {
   return out
 }
 
+// 线报搜索面板的结果区渲染决策（C7-002）。
+// 调用方的 `live` 必须已经过 q 校验（A 的结果不得挂到 B 下面），这里只管「这一帧画什么」：
+//   prompt   还没输关键词
+//   results  本次 req 的成功结果已到
+//   upstream 本次 req 得到上游错误
+//   stale    本次结果还没到，但手上有上一份成功结果 → 继续画它（stale-while-revalidate）
+//   skeleton 一份结果都没有（首次搜索）
+//   error    这次加载失败（loader 给了 err）
+// 注意：`live` 非空时 `err` 也可能同时存在——同 q 的刷新/翻页失败时 loader 保留旧 data，这里仍返回
+// 'results'；那次失败是否可见由 searchRefreshError 决定。别再把它「优化」成 err 优先：那会整块卸载
+// 旧结果（C7-002 的原始 bug），而漏掉 searchRefreshError 则是这次返工修的静默吞错。
+// `prev` 只用于占位：换词/翻页时 req 一变 live 立刻为 null，旧实现五个体渲染分支一个都不命中，
+// 结果区整块卸载（先一帧空白再 3 行骨架）⇒ 页面高度塌陷、移动端滚动位置被夹。
+// `loading` 还没置真的那一帧（setReq 已落地、effect 未跑）也要画上一份，不能留空。
+export function searchBodyView ({ q, live, prev, loading, err }) {
+  if (q === '') return 'prompt'
+  if (live) return live.status === 'ok' ? 'results' : (live.status === 'upstream_error' ? 'upstream' : 'skeleton')
+  const reusable = prev && prev.status === 'ok' ? 'stale' : null
+  if (loading) return reusable || 'skeleton'
+  if (err) return 'error'
+  return reusable || 'skeleton'
+}
+
+// 同 q 的刷新/翻页失败（C7-002，B2 返工 a1）：`usePanelLoader` 失败时保留旧 data，所以 `live` 仍是
+// 上一份成功结果 → `searchBodyView` 仍返回 'results'，而它的 'error' 分支只有在 live 为空时才可达。
+// 这个判定单独把「results 之上必须再画一条 err」的场景挑出来：没有它，失败既无提示也无重试入口，
+// 且 req.page 已前进、按钮重新启用 → 再点下一页会从第 1 页直接跳到第 3 页。
+export function searchRefreshError ({ live, err }) {
+  return Boolean(err) && Boolean(live && live.status === 'ok')
+}
+
+// 运行统计卡的尾部窗口口径（C7-005）：stats.truncated 是后端「run.log 超 1 MiB、只读了尾部
+// 1 MiB」的契约位（scripts/status.js 明确要求前端标注「仅统计日志尾部」，不得把少算的总数
+// 当完整数据展示）。今日卡与近 7 天卡必须同口径标注——此前只有周卡标了，今日卡没有。
+const TAIL_NOTE = ' · 仅统计尾部'
+
+export function statsTailNote (stats) {
+  return stats && stats.truncated === true ? TAIL_NOTE : ''
+}
+
+// 今日卡的 tone/badge/标注：真失败仍判红（异常不变）；被尾部窗口切过的「0 失败」不再判绿——
+// 降成琥珀、徽标写「仅尾部」，不给「少算的数字也是完整数据」的假象。
+export function todayCardView ({ hasData, failed, rounds, truncated }) {
+  const note = truncated === true ? TAIL_NOTE : ''
+  if (hasData !== true) return { tone: 'run', badge: '—', note: '' }
+  if (failed > 0) return { tone: 'bad', badge: '异常', note }
+  if (rounds > 0) return truncated === true ? { tone: 'warn', badge: '仅尾部', note } : { tone: 'ok', badge: '正常', note: '' }
+  return { tone: 'run', badge: '—', note }
+}
+
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
 // issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
 // 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。

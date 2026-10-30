@@ -167,7 +167,10 @@ function readFdRange (fd, start, length) {
     if (read <= 0) break // 文件在读取期间被截短
     filled += read
   }
-  return buf.subarray(0, filled).toString('utf8')
+  // 返回实际读到的字节数（C3-001）：调用方必须能把「读满」与「读窗口内被就地截短（短读）」区分开——
+  // 短读拿到的是任意前缀，可能恰好是一段合法 JSON（如 `[]`、或截在元素边界上），若被当成完整内容，
+  // 判重记录会被静默截断，下一轮 save 即覆写丢失（与 SYSTEM_CONTRACT「宁可多推」反向）。
+  return { text: buf.subarray(0, filled).toString('utf8'), bytes: filled }
 }
 
 // maxBytes 入口校验（审查 STG-05）：合法输入只有两种——undefined（保持旧行为「不设限」）与
@@ -187,6 +190,9 @@ function resolveMaxBytes (maxBytes, filePath) {
 // 日志类消费方（scripts/status.js 的 run.log / filter-diagnostics.ndjson）只关心最近记录，
 // 而写入侧 fail-open 时日志可无上限增长，旧行为会让整个部件显示「不可读（tooLarge）」。
 // 尾部读取的结果附 truncated:true：首行可能是被切开的半行，调用方须按「逐行解析、坏行跳过」处理。
+// ok 结果附两个**退化标记**（C3-001，status 不变，旧调用方行为不变）：
+//   · empty:true —— 文件存在但 0 字节（与 missing 不同：文件在、内容没了）；
+//   · shortRead:true —— 实际读到的字节少于 fstat 观测值（读窗口内被就地截短，内容只是前缀）。
 function readSafeTextResult (filePath, maxBytes, options = {}) {
   // 修复 TOCTOU：先以 O_NOFOLLOW 打开并 fstat 确认为普通文件，读取内容后复检路径仍指向
   // 同一 inode（dev+ino）的普通文件。内容读取走同一 fd（readFdRange），读取期间路径被替换
@@ -218,7 +224,16 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
       }
       start = stat.size - limit // 只读尾部 limit 字节（bound 仍由 fstat 观测值决定）
     }
-    const text = readFdRange(fd, start, stat.size - start)
+    const readResult = readFdRange(fd, start, stat.size - start)
+    const text = readResult.text
+    // C3-001：`ok` 不足以描述「一份可用的完整内容」，两个退化维度必须能从结果里读出来
+    // （status 一律保持 ok —— 既有调用方语义与 readSafeText 的返回值不变，只有消费侧按需看标记）：
+    //   · empty：文件存在但 0 字节。与 missing 是两件事（文件在、内容没了），消费侧据此告警，
+    //     否则会被 `|| '[]'` 静默洗成「合法空缓存」；
+    //   · shortRead：实际读到的字节少于 fstat 观测值（读窗口内被就地截短）。拿到的是任意前缀，
+    //     可能恰好是合法 JSON 前缀，绝不能当成完整内容（缓存场景须 fail-closed）。
+    const empty = start === 0 && stat.size === 0
+    const shortRead = readResult.bytes < stat.size - start
     let reFd
     try {
       reFd = fs.openSync(filePath, flags)
@@ -236,7 +251,14 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
     } finally {
       if (reFd !== undefined) { try { fs.closeSync(reFd) } catch (e) { /* 忽略 */ } }
     }
-    return { status: 'ok', text, error: null, ...(start > 0 ? { truncated: true } : {}) }
+    return {
+      status: 'ok',
+      text,
+      error: null,
+      ...(start > 0 ? { truncated: true } : {}),
+      ...(empty ? { empty: true } : {}),
+      ...(shortRead ? { shortRead: true } : {})
+    }
   } catch (e) {
     return { status: 'ioError', text: null, error: e }
   } finally {

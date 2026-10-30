@@ -11,18 +11,54 @@ const { spawn } = require('child_process')
 // v3.283 主机干净度前置检查：孤儿测试桩 / 被 reparent 到 1 的孤儿套件 / 过期 /tmp/xbk-* 沙箱会把墙钟
 // 基准拖红（实测 300ms 跑出 878ms），脏机器不启动。缺脚本时**响亮跳过**——最小工作树（如
 // test_ci_skip_suites.js 的 RT-08 夹具只复制 run_tests.js）不得因此崩；其它异常照常抛出，不吞。
+// C10-028：容错只覆盖「**本模块自身**不存在」。旧实现直接 require 并只判 e.code === 'MODULE_NOT_FOUND'，
+// 于是 scripts/check-host-clean.js 存在、但它内部的某个依赖缺失（树损坏 / 将来给它加相对依赖）也被读成
+// 「未找到 scripts/check-host-clean.js，跳过」→ 主机干净度门禁被静默关掉。现在先用 require.resolve
+// 预判本模块能否解析：解析不到才算最小工作树（响亮跳过）；解析成功后的 require 异常（含其内部
+// MODULE_NOT_FOUND）一律照常抛出，绝不再伪装成「脚本不存在」。
+const HOST_CLEAN_MODULE = './scripts/check-host-clean.js'
 let hostClean = null
+let hostCleanMissing = false
 try {
-  hostClean = require('./scripts/check-host-clean.js')
+  require.resolve(HOST_CLEAN_MODULE)
 } catch (e) {
   if (e.code !== 'MODULE_NOT_FOUND') throw e
+  hostCleanMissing = true
   console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
 }
-if (hostClean && hostClean.guardOrExit(process.env)) process.exit(1)
+if (!hostCleanMissing) hostClean = require(HOST_CLEAN_MODULE)
+if (hostClean && hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 const path = require('path')
 const { checkDependencies } = require('./scripts/check-deps')
 
 const { SUITES } = require('./test_suites')
+
+// C3-002（backlog）：套件子进程一律用**剥离了 XBK_CACHE_DIR 的 env**。
+// 为什么必须显式传 env：spawn 不传 env 时子进程继承 shell 环境，而生产 cacheDir getter 让
+// XBK_CACHE_DIR 无条件压过 Config.cache.dir（SYSTEM_CONTRACT 契约，语义正确），于是「在 export 过
+// 该变量的机器上跑测试」会把夹具写进**部署缓存目录**、覆盖真实 push.json 判重主存。
+// 只改测试侧：生产 getter 一字不动，环境变量在你自己的 shell 里照旧生效。
+// ⚠️ 最小工作树夹具（test_ci_skip_suites.js 的 RT-08 只复制 run_tests.js + 假 test_suites/check-deps）
+// 里没有 scripts/ 目录：与 scripts/check-host-clean.js 同口径——缺模块时**响亮**跳过并退回同一实现的
+// 内联版本（绝不静默放行，否则夹具里的隔离语义与真实入口不一致）。
+const FALLBACK_STRIP_CACHE_DIR_ENV = (env = process.env) => {
+  const next = { ...(env || {}) }
+  const raw = typeof next.XBK_CACHE_DIR === 'string' ? next.XBK_CACHE_DIR : ''
+  delete next.XBK_CACHE_DIR
+  return { env: next, cleared: raw }
+}
+let stripCacheDirEnv = FALLBACK_STRIP_CACHE_DIR_ENV
+try {
+  stripCacheDirEnv = require('./scripts/test-env-isolation').stripCacheDirEnv || FALLBACK_STRIP_CACHE_DIR_ENV
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') throw e
+  console.log('⚠️ 未找到 scripts/test-env-isolation.js，入口按同一口径内联剥离 XBK_CACHE_DIR（最小工作树夹具）')
+}
+const SUITE_ENV_INFO = stripCacheDirEnv(process.env)
+const SUITE_ENV = SUITE_ENV_INFO.env
+if (SUITE_ENV_INFO.cleared) {
+  console.warn(`⚠️ 已从本入口派生的测试子进程环境中清除 XBK_CACHE_DIR（${SUITE_ENV_INFO.cleared}）：测试只用 Config.cache.dir 的私有目录，避免写入部署缓存（backlog C3-002）`)
+}
 
 // 汇总表按终端显示宽度对齐（与 run_unit_tests.js 同口径）：String.prototype.padEnd 按 UTF-16 码元计数，
 // 中文每字占 2 列、文件名长度不一，直接 padEnd 会让列错位；此处按实测最大显示宽度补齐。
@@ -120,7 +156,9 @@ function runSuite (file) {
     let settled = false
     let timedOut = false
     let timer = null
-    const child = spawn(process.execPath, [file], { cwd: __dirname, stdio: 'inherit', detached: true })
+    // C3-002：显式传剥离了 XBK_CACHE_DIR 的 env（见文件顶部 SUITE_ENV 的说明）——
+    // 不传 env 会让子进程继承 shell 里的部署开关，把夹具写进真实缓存目录。
+    const child = spawn(process.execPath, [file], { cwd: __dirname, env: SUITE_ENV, stdio: 'inherit', detached: true })
     const pid = child.pid
     // 记录当前套件进程组：信号 handler 与 process.on('exit') 据此整组杀伤
     activeSuitePid = Number.isInteger(pid) ? pid : null

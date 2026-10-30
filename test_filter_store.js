@@ -10,6 +10,7 @@
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
+const { spawnSync } = require('node:child_process')
 const path = require('node:path')
 
 const { createRuleEngine } = require('./xbk_rules')
@@ -72,15 +73,27 @@ const DEFAULTS = {
 let pass = 0
 let fail = 0
 function test (name, fn) {
+  let result
   try {
-    fn()
-    pass++
-    console.log(`  ✅ ${name}`)
+    result = fn()
   } catch (e) {
     fail++
     process.exitCode = 1
     console.error(`  ❌ ${name}: ${e.message}`)
+    return
   }
+  // C5-023：本 harness 是同步的。返回 Promise 的用例此前会被直接记成通过——pass++ 与 ✅ 先执行，
+  // 断言失败/异常在微任务里才抛（可能发生在「结果：N 通过 / 0 失败」打印之后），于是出现「先记绿、
+  // 随后在微任务里炸」的假绿。异步用例的结果本 harness 无法判定，故当场判红而不是乐观记过。
+  if (result && typeof result.then === 'function') {
+    fail++
+    process.exitCode = 1
+    if (typeof result.catch === 'function') result.catch(() => {}) // 挂个 handler，避免 unhandledRejection 打崩进程掩盖这条结论
+    console.error(`  ❌ ${name}: 用例返回 Promise——同步 harness 无法判定异步结果（请改成同步用例）`)
+    return
+  }
+  pass++
+  console.log(`  ✅ ${name}`)
 }
 function expectError (result, field, code, label) {
   assert.strictEqual(result.ok, false, `${label}：应校验失败`)
@@ -98,6 +111,9 @@ function writeJson (file, value) {
 function writeRaw (file, text) {
   fs.writeFileSync(file, text)
 }
+// 排序比较器一律走显式 code-unit（与 run_mutation.js:247 / test_mutation_ranges.js 的 byCodeUnit 同口径）：
+// 不依赖 locale，也不触发 Array#sort 默认的「字符串化后比较」。
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-store-'))
 process.once('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
@@ -292,7 +308,13 @@ test('多行规则与真实 compileRules 对账通过（2 行 → rules=2）', (
 test('宽匹配 .* / ^.*$（trim 后）记入 wideMatch', () => {
   const result = validateFilterRules({ revision: 0, filter: { pingbibiaoti: ' .* ', pingbineirong: '^.*$', zhanxianbiaoti: 'a###.*' } }, deps)
   assert.strictEqual(result.ok, true, JSON.stringify(result.errors))
-  assert.deepStrictEqual(result.wideMatch.sort(), ['pingbibiaoti', 'pingbineirong', 'zhanxianbiaoti'])
+  // C5-072：比较必须用副本 + 显式 code-unit 比较器。原实现 `result.wideMatch.sort()` 有两个问题：
+  // ① 就地排序改写 SUT 返回的数组（下次有人在这条用例后面断言真实顺序就会看到被排过的值）；
+  // ② Array#sort 默认把元素字符串化比较，对非字符串元素是隐式的 toString 契约。
+  // 顺序断言仍按真实值做：wideMatch 的插入序（[biaoti, zhanxianbiaoti, neirong]）不得被测试改写。
+  assert.deepStrictEqual([...result.wideMatch].sort(byCodeUnit), ['pingbibiaoti', 'pingbineirong', 'zhanxianbiaoti'])
+  assert.deepStrictEqual(result.wideMatch, ['pingbibiaoti', 'zhanxianbiaoti', 'pingbineirong'],
+    'SUT 返回的 wideMatch 不得被测试就地排序改写')
 })
 
 // ===== mergeActiveFilter：合并优先级 =====
@@ -641,6 +663,48 @@ test('writeAppliedSnapshot 写入 0600 快照，readAppliedSnapshot 可读回', 
   assert.deepStrictEqual(readJson(paths.applied), read.snapshot)
 })
 
+// C5-047：writeAppliedSnapshot 的返回值是「快照到底有没有写成」的唯一信号（xbk_app 用它打 warn + run log），
+// 但此前全文件只有一条 `strictEqual(wrote, true)` 正向断言 —— 把实现改成恒 true，整套仍然全绿
+// （本条已用变异探针实测）。下面两条把失败分支钉死：返回 false、不抛、不留半成品。
+test('writeAppliedSnapshot 失败分支：applied 路径被目录占位 → 返回 false、不抛、不改占位', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  fs.mkdirSync(paths.applied) // 目标路径是目录：writeAtomic 的 isRegularOrMissing 拒绝写入
+  let wrote
+  assert.doesNotThrow(() => {
+    wrote = writeAppliedSnapshot({ cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 1, source: 'override', hash: 'h' })
+  }, '写不进去属于可预期失败，必须返回 false 而不是抛错（调用方按布尔处理）')
+  assert.strictEqual(wrote, false, '快照没写成必须返回 false（恒 true 的实现会让调用方以为已落盘）')
+  assert.strictEqual(fs.statSync(paths.applied).isDirectory(), true, '失败时不得删除/替换占位目录')
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'ioError', '读回必须如实报告 ioError，不得假装有一份快照')
+})
+
+test('writeAppliedSnapshot 失败分支：建临时文件报 EACCES → 返回 false 且不留半成品快照', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  // 用注入的 EACCES 而不是 chmod 0500：以 root 跑门禁时目录权限拦不住写入，夹具会假绿（甚至断言失败）。
+  // writeAtomic 的临时文件名形如 `<applied>.<pid>.<ts>.<rand>.tmp`，只拦这一条路径，其余 fs 调用照旧。
+  const realOpen = fs.openSync
+  fs.openSync = function (target, ...args) {
+    const name = String(target)
+    if (name.startsWith(paths.applied + '.') && name.endsWith('.tmp')) {
+      const err = new Error('EACCES: permission denied, open ' + name)
+      err.code = 'EACCES'
+      throw err
+    }
+    return realOpen.call(this, target, ...args)
+  }
+  let wrote
+  try {
+    wrote = writeAppliedSnapshot({ cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'override', hash: 'h' })
+  } finally {
+    fs.openSync = realOpen
+  }
+  assert.strictEqual(wrote, false, 'EACCES 下必须返回 false（不得把失败报成成功）')
+  assert.deepStrictEqual(fs.readdirSync(dir), [], '写入失败不得留下快照或临时文件')
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'missing', '失败后状态仍应是 missing，而不是一份可疑的快照')
+})
+
 test('readAppliedSnapshot：missing / invalid / ioError 三态', () => {
   const dir = makeDir()
   assert.strictEqual(readAppliedSnapshot(dir).status, 'missing')
@@ -671,6 +735,42 @@ test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径�
     assert.strictEqual(path.dirname(backup), base, '备份路径不得逃出 cacheDir')
   }
 })
+
+// C5-023 自测接缝：harness 的「异步用例必须判红」只能在子进程里证明（本进程里注入一条失败用例会
+// 直接把整套变红）。探针子进程用 XBK_FILTER_STORE_ASYNC_PROBE=1 注入两条用例，见下方注入块。
+if (process.env.XBK_FILTER_STORE_ASYNC_PROBE !== '1') {
+  test('harness：返回 Promise 的用例必须当场判红，不得先记通过再在微任务里抛（C5-023，子进程实跑）', () => {
+    const probe = spawnSync(process.execPath, [__filename], {
+      encoding: 'utf8',
+      cwd: __dirname,
+      env: { ...process.env, XBK_FILTER_STORE_ASYNC_PROBE: '1' }
+    })
+    const both = (probe.stdout || '') + (probe.stderr || '')
+    assert.strictEqual(probe.status, 1,
+      `异步用例必须让探针以 1 退出（实际 ${probe.status}）：` + both.slice(-600))
+    assert.match(both, /❌ 💥 探针：异步用例（返回 rejected Promise）/,
+      '异步用例必须被 harness 当场记失败并打印 ❌：' + both.slice(-600))
+    assert.ok(!both.includes('✅ 💥 探针：异步用例'),
+      '异步用例不得被记成通过（旧 harness 先 pass++ 再让 Promise 在微任务里抛）：' + both.slice(-600))
+    assert.ok(probe.stdout.includes('PROBE-AFTER-RAN'),
+      '异步用例之后的同步用例必须照跑（判红不得靠把进程打崩来吞掉后续用例）：' + both.slice(-600))
+    assert.ok(!/ERR_UNHANDLED_REJECTION|UnhandledPromiseRejection/.test(both),
+      'harness 必须自己接管这个 Promise（否则 unhandledRejection 会先打崩进程、掩盖真实结论）：' + both.slice(-600))
+    // 汇总行形如 `=== 结果：50 通过 / 1 失败 ===`。数字收敛成 1..9 位并锚在「数字串起点」
+    // （`(?:^|\D)`）：无界 `\d+` 的回退步数随数字串长度增长（S5852），有界后每个起点最多 9 次；
+    // 加了起点锚，十位计数不会从第 2 位起被切出 9 位（那会静默读成小数字），而是整条不命中 ⇒
+    // 下一行 assert.ok(summary) 当场判红。两条口径断言（失败≥1 / 通过≥49）一字未动。
+    const summary = probe.stdout.match(/(?:^|\D)(\d{1,9}) 通过 \/ (\d{1,9}) 失败/)
+    assert.ok(summary, '探针必须有汇总行：' + both.slice(-600))
+    const [, passed, failed] = summary.map(Number)
+    assert.ok(failed >= 1, `汇总必须记下这条失败（实得 ${failed}）`)
+    assert.ok(passed >= 49, `其余同步用例必须照常通过（实得 ${passed}）`)
+  })
+}
+if (process.env.XBK_FILTER_STORE_ASYNC_PROBE === '1') {
+  test('💥 探针：异步用例（返回 rejected Promise）', () => Promise.reject(new Error('probe-async')))
+  test('探针：异步用例之后的同步用例', () => { console.log('PROBE-AFTER-RAN') })
+}
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
 if (fail === 0) fs.rmSync(tmp, { recursive: true, force: true })

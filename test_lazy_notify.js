@@ -5,6 +5,18 @@ const assert = require('assert')
 const fs = require('node:fs')
 const path = require('node:path')
 const { execFileSync } = require('child_process')
+// C5-009：探针一律带 timeout + SIGKILL。探针里跑的是真实 xbk.run()，一旦回归成挂住，无上限的
+// execFileSync 会一直等（只由 run_unit_tests 的 600s / CI job 45min 兜底，归因只剩「套件超时」）。
+// 失败时把 e.code / e.signal / e.killed 抛出来：ETIMEDOUT+SIGKILL 与业务失败可区分。
+const PROBE_TIMEOUT_MS = 20000
+function execProbe (args, opts) {
+  try {
+    return execFileSync(process.execPath, args, { timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts })
+  } catch (e) {
+    assert.fail(`探针子进程未正常收场（code=${e.code} signal=${e.signal} killed=${e.killed}）：` +
+      `${String((e.stderr || e.message || '')).slice(0, 300)}`)
+  }
+}
 
 // 探针会真实跑一轮 xbk.run()：缓存/日志目录必须钉到临时目录，否则每跑一次测试就往仓库
 // 生产 run.log 追加一条 total=0 + 「Cannot find module」的假失败轮（评审现场：手机端历史
@@ -60,7 +72,7 @@ xbk.fetchData().then(() => {
 });
 `
 
-const output = execFileSync(process.execPath, ['-e', probe], {
+const output = execProbe(['-e', probe], {
   cwd: __dirname,
   encoding: 'utf8'
 })
@@ -96,7 +108,7 @@ xbk.run().then(() => process.stdout.write(JSON.stringify(events))).catch(error =
     process.exit(1);
 });
 `
-const noWarmupOutput = execFileSync(process.execPath, ['-e', noWarmupProbe], {
+const noWarmupOutput = execProbe(['-e', noWarmupProbe], {
   cwd: __dirname,
   encoding: 'utf8',
   env: { ...process.env, XBK_CACHE_DIR: probeCacheDir }
@@ -130,7 +142,7 @@ prewarmTls('example.test', 100, 1).then(() => {
     process.exit(1);
 });
 `
-  const output = execFileSync(process.execPath, ['-e', probe], {
+  const output = execProbe(['-e', probe], {
     cwd: __dirname,
     encoding: 'utf8',
     env: { ...process.env, ...(family ? { XBK_DNS_FAMILY: family } : { XBK_DNS_FAMILY: '' }) }
@@ -169,10 +181,9 @@ const missingProbe = `
     xbk.run().then(() => process.stdout.write(JSON.stringify({ fetched })))
         .catch(e => process.stdout.write(JSON.stringify({ fetched, err: (e && e.code) || String(e) })));
 `
-const missingOut = execFileSync(process.execPath, ['-e', missingProbe], {
+const missingOut = execProbe(['-e', missingProbe], {
   cwd: __dirname,
   encoding: 'utf8',
-  timeout: 20000,
   env: { ...process.env, XBK_CACHE_DIR: probeCacheDir }
 }).trim().split(/\r?\n/).pop()
 const missingParsed = JSON.parse(missingOut)

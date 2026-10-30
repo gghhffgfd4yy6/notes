@@ -61,24 +61,32 @@ check('daysComputed: 负数时间戳返回 0', () => {
   assert.strictEqual(Utils.daysComputed(-1), 0)
 })
 
-// ===== num：数字解析 =====
-check('num: 数字原样返回', () => {
-  assert.strictEqual(Utils.num(42, 0), 42)
-})
-check('num: 数字字符串解析', () => {
-  assert.strictEqual(Utils.num('42', 0), 42)
-})
-check('num: 无效值返回默认', () => {
-  assert.strictEqual(Utils.num('abc', 10), 10)
-})
-check('num: undefined 返回默认', () => {
-  assert.strictEqual(Utils.num(undefined, 10), 10)
-})
-check('num: null 返回默认', () => {
-  assert.strictEqual(Utils.num(null, 10), 10)
-})
-check('num: NaN 返回默认', () => {
-  assert.strictEqual(Utils.num(Number.NaN, 10), 10)
+// ===== num：数字解析（原先按波次分成的 3 组 9 条用例合并为一张参数表，每行仍是一条独立断言）=====
+check('num: 数字/字符串/脏输入/默认值（跨波次合并的参数表）', () => {
+  const cases = [
+    [42, 0, 42, '数字原样返回'],
+    ['42', 0, 42, '数字字符串解析'],
+    ['abc', 10, 10, '无效值返回默认'],
+    [undefined, 10, 10, 'undefined 返回默认'],
+    [null, 10, 10, 'null 返回默认'],
+    [Number.NaN, 10, 10, 'NaN 返回默认'],
+    [true, 'DEF', 'DEF', '布尔值一律回退默认（true 不是有效数值配置）'],
+    [false, 'DEF', 'DEF', '布尔值一律回退默认（false 不是有效数值配置）'],
+    [undefined, 'DEF', 'DEF', 'undefined 回退默认'],
+    [null, 'DEF', 'DEF', 'null 回退默认'],
+    [0, 'DEF', 0, '0 是有效数值'],
+    ['0', 'DEF', 0, '字符串 0 解析为 0'],
+    ['5', 2, 5, "字符串 '5' 按数值接受（num 的核心用途）"],
+    [5, 2, 5, '数字原样接受'],
+    ['x', 2, 2, '非数值串回退默认'],
+    [Number.NaN, 7, 7, 'NaN 回退默认'],
+    ['', 3, 3, '空串回退默认'],
+    [null, 4, 4, 'null 回退默认'],
+    [0, 9, 0, '0 合法，不得回退（否则会把合法配置吞掉）']
+  ]
+  for (const [value, def, want, msg] of cases) {
+    assert.strictEqual(Utils.num(value, def), want, `${msg}（num(${String(value)}, ${String(def)})）`)
+  }
 })
 
 // ===== safeText：安全文本 =====
@@ -411,6 +419,19 @@ check('P1-04 同族: sanitizeSurrogates/safeText 内部正则不含 lookaround�
 //   ④ 回落行为不变：危险协议仍被清空、合法值仍保留。
 // 撤掉告警实现（catch 恢复为空）→ ② 立即变红。
 const execFileSync = require('node:child_process').execFileSync
+// C5-009：探针子进程一律带 timeout + SIGKILL。没有上限的 execFileSync 在探针里的用户代码回归成
+// 死循环/挂住时会一直等，套件只能挂到 run_unit_tests 的 600s 套件级兜底（CI 是 job 级 45min），
+// 归因退化成「套件超时」。失败时把 e.code / e.signal / e.killed 一并抛出：ETIMEDOUT+SIGKILL
+// （被本上限强杀）与「探针自己 exit 1」可区分。
+const PROBE_TIMEOUT_MS = 20000
+function execProbeSync (args, opts) {
+  try {
+    return execFileSync(process.execPath, args, { timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL', ...opts })
+  } catch (e) {
+    assert.fail(`探针子进程未正常收场（code=${e.code} signal=${e.signal} killed=${e.killed}）：` +
+      `${String((e.stderr || e.message || '')).slice(0, 300)}`)
+  }
+}
 const fallbackProbe = String.raw`
 'use strict'
 const re2Path = require.resolve('re2')
@@ -447,7 +468,7 @@ process.stdout.write(JSON.stringify({
 `
 
 check('P1-04 收尾: RE2 编译失败回落 V8 只告警一次（含模式与原因，凭据已脱敏）', () => {
-  const raw = execFileSync(process.execPath, ['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
+  const raw = execProbeSync(['-e', fallbackProbe], { cwd: __dirname, encoding: 'utf8' })
   const out = JSON.parse(raw.trim().split(/\r?\n/).pop())
   assert.strictEqual(out.warnsAfterLoad, 0, '模块加载期的内部模式不得触发回落告警')
   assert.ok(out.rejectedCount >= 3, `前置条件：本轮清洗必须让 ≥3 条内部模式编译失败（实际 ${out.rejectedCount}）——否则「只告警一次」只是被 _reCache 挡住，测不到一次性标记`)
@@ -1059,22 +1080,8 @@ check('filterHash: ### 形式保留行内格式（不 Number 归一）', () => {
   assert.notStrictEqual(Utils.filterHash({ pingbitime: 'cat###5' }, ''), Utils.filterHash({ pingbitime: 'cat###6' }, ''))
 })
 
-// ===== parseTime：入口三态与字符串 trim 语义 =====
-// 反例（改动前）：L119/L125 的空值与 trim 守卫从未被直接断言（既有无时区用例都传合法格式），
-// 8+5 个 ConditionalExpression/LogicalOperator/StringLiteral/BlockStatement 存活。
-check('parseTime: 空值三态（undefined/null/空串）→ null', () => {
-  assert.strictEqual(Utils.parseTime(undefined), null)
-  assert.strictEqual(Utils.parseTime(null), null)
-  assert.strictEqual(Utils.parseTime(''), null)
-})
-check('parseTime: 字符串两侧空白先 trim（纯空白按空串无效）', () => {
-  assert.strictEqual(Utils.parseTime(' 2026-09-08 10:30:00 '), utcMs(2026, 9, 8, 10, 30, 0), '带空白必须 trim 后按 UTC 解析')
-  assert.strictEqual(Utils.parseTime('   '), null, '纯空白 trim 后为空串 → null')
-  assert.strictEqual(Utils.parseTime('\t\n'), null)
-})
-check('parseTime: 非字符串不受 trim 影响（数字仍走数字分支）', () => {
-  assert.strictEqual(Utils.parseTime(1788863400000), 1788863400000)
-})
+// parseTime 的入口三态 / trim 语义已与 PlanR 的守卫用例合并为一张参数表（见下方 PlanR 段）。
+// 合并前同一批入参（undefined/null/''/纯空白）在 4 个波次里各写一遍，改口径要同步多处。
 
 // ===== _parseNumericTime：8 位日期的 月/日 边界 =====
 // 反例（改动前）：8 位 YYYYMMDD 的 4 个边界比较（月 >=1 / <=12、日 >=1 / <=31）无覆盖。
@@ -1170,17 +1177,7 @@ check('hasValidId: id 为 undefined/null 都判无效', () => {
   assert.strictEqual(Utils.hasValidId({ id: false }), false, '布尔 id 无效')
 })
 
-// ===== num：布尔/空值守卫 =====
-check('num: 布尔值一律回退默认（true/false 都不是有效数值配置）', () => {
-  assert.strictEqual(Utils.num(true, 'DEF'), 'DEF')
-  assert.strictEqual(Utils.num(false, 'DEF'), 'DEF')
-})
-check('num: undefined/null 回退默认', () => {
-  assert.strictEqual(Utils.num(undefined, 'DEF'), 'DEF')
-  assert.strictEqual(Utils.num(null, 'DEF'), 'DEF')
-  assert.strictEqual(Utils.num(0, 'DEF'), 0, '0 是有效数值')
-  assert.strictEqual(Utils.num('0', 'DEF'), 0)
-})
+// num 的布尔/空值守卫已并入上方「跨波次合并的参数表」（覆盖不减少，不再单列一块）。
 
 // ===== anonKey：转义序列（% / \ / |）=====
 // 反例（改动前）：L1093 的 3 组转义字面量（'%25' / '%5C' / '%7C'）只有「不加转义」的弱断言。
@@ -1493,7 +1490,7 @@ const probeBaseEnv = Object.assign({}, process.env)
 delete probeBaseEnv.XBK_PROFILE
 const probeProfile3Env = Object.assign({}, probeBaseEnv, { XBK_PROFILE: '3' })
 function runProbe (src, env) {
-  const raw = execFileSync(process.execPath, ['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
+  const raw = execProbeSync(['-e', src], { cwd: __dirname, encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024 })
   const lines = raw.trim().split(/\r?\n/)
   const last = lines[lines.length - 1]
   const at = last.indexOf('PROBE_JSON:')
@@ -1767,9 +1764,30 @@ check('PlanI _parseFallback: 小写 z 也算时区标记（[Zz] 字符类）', (
 check('PlanI _parseFallback: 单数字月日的 T 格式与空格格式必须同口径（v3.171 回退）', () => {
   const P = (s) => Utils._parseFallback(s)
   // '2026-8-1T10:30' 曾 Invalid 返回 null，而空格格式有效 —— v3.171 用第二个回退统一
-  assert.strictEqual(P('2026-8-1T10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '单数字月日 + T 必须与空格格式同值（第二次回退把 T 转空格）')
-  assert.strictEqual(P('2026-8-1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '空格格式同值')
-  assert.strictEqual(P('2026/8/1 10:30'), Date.UTC(2026, 7, 1, 10, 30, 0), '斜杠格式同样要有兜底')
+  // C5-011：这里**不锁具体时刻**。这三条输入在 parseTime 上先被 _parseDateTimeNoTz（日期段 [-/]、
+  // 秒可选）命中并直接返回 Date.UTC ⇒ 本函数在产品路径上不可达；而它对「非补零 ISO / 斜杠」的
+  // 宽松解析落到 new Date(s)（宿主本地时区）⇒ 锁 Date.UTC 的写法在 UTC 宿主恒绿、CST 宿主必红
+  // （假契约 + 本地假红）。只锁跨时区恒真的口径：可解析 + 三种写法同值（v3.171 要的就是这个）。
+  // UTC 契约改在下一条用例里经产品入口 parseTime 断言。
+  const values = ['2026-8-1T10:30', '2026-8-1 10:30', '2026/8/1 10:30'].map((s) => {
+    const v = P(s)
+    assert.strictEqual(typeof v, 'number', `_parseFallback(${s}) 必须宽松解析出毫秒数，不得返回 null`)
+    assert.ok(Number.isFinite(v), `_parseFallback(${s}) 必须是有限毫秒数`)
+    return v
+  })
+  assert.strictEqual(values[1], values[0], '空格分隔必须与 T 分隔同值（第二次回退把 T 转空格）')
+  assert.strictEqual(values[2], values[0], '斜杠格式必须与 T/空格格式同值（同一兜底解析）')
+})
+
+check('PlanI parseTime: 单数字月日与斜杠格式必须按 UTC 解析（宿主时区无关）', () => {
+  // C5-011：这是产品真正走的路径（_parseDateTimeNoTz 的日期段是 [-/]、秒可选，先于 _parseFallback
+  // 命中并返回 Date.UTC）。断言必须两档 TZ 都为真 —— 否则「只在 UTC 宿主成立」的用例既给本地
+  // 开发机假红、又在 CI 上假绿（锁的契约根本不是产品行为）。
+  for (const s of ['2026-8-1T10:30', '2026-8-1 10:30', '2026/8/1 10:30', '2026/08/01 10:30', '2026/8/1 10:30:00']) {
+    assert.strictEqual(Utils.parseTime(s), Date.UTC(2026, 7, 1, 10, 30, 0), `${s} 必须按 UTC 解析（与宿主时区无关）`)
+  }
+  assert.strictEqual(Utils.parseTime('2026/8/1 10:30'), Utils.parseTime('2026-08-01 10:30:00'),
+    '斜杠与连字符、单双数字月日、有无秒 必须得到同一时刻')
 })
 
 check('PlanI _parseFallback: 完全无法解析时返回 null（不得返回 NaN/Invalid Date）', () => {
@@ -1953,16 +1971,7 @@ check('PlanM anonKey: 前缀与确定性，且不同输入必须给出不同键'
   assert.notStrictEqual(u.anonKey('ab'), u.anonKey('ba'), '顺序不同必须不同键（下标项参与哈希）')
 })
 
-check('PlanM num: 只做校验与回退默认，字符串数字按数值接受', () => {
-  const u = Utils
-  assert.strictEqual(u.num('5', 2), 5, "字符串 '5' 必须按数值接受（Utils.num 的核心用途）")
-  assert.strictEqual(u.num(5, 2), 5, '数字原样接受')
-  assert.strictEqual(u.num('x', 2), 2, '非数值串必须回退默认')
-  assert.strictEqual(u.num(Number.NaN, 7), 7, 'NaN 必须回退默认')
-  assert.strictEqual(u.num('', 3), 3, '空串必须回退默认')
-  assert.strictEqual(u.num(null, 4), 4, 'null 必须回退默认')
-  assert.strictEqual(u.num(0, 9), 0, '0 是合法数值，不得回退（否则会把合法配置吞掉）')
-})
+// PlanM 的 num 用例已并入文件上方「num：跨波次合并的参数表」（入参与期望逐条保留）。
 
 check('PlanM2 isDangerousUrl: 命名实体/数字实体绕过必须被识破（v3.245 P0 / v3.258 C009）', () => {
   const u = Utils
@@ -2107,31 +2116,32 @@ check('PlanQ _isTrackingQueryName: 非跟踪名必须判否（不得用子串/�
   assert.strictEqual(f(''), false, '空串必须放行（不得因空串被误判跟踪）')
 })
 
-// ===== 补测 PlanR：parseTime 的输入守卫与字符串分支 =====
+// ===== 补测 PlanR：parseTime 的输入守卫与字符串分支（与文件上方 3 组守卫用例合并为一张参数表）=====
 // 反例（改动前）：PlanO 只断言了各格式的**解析值**，L119 的 undefined/null/'' 三连守卫、
 // L125 的 typeof 分支、L126 的 trim、L127 的「trim 后为空」全部未测 ⇒ 该区 25 个靶子存活。
-check('PlanR parseTime: undefined/null/空串/纯空白一律返回 null（三连守卫逐项）', () => {
-  const u = Utils
-  assert.strictEqual(u.parseTime(undefined), null, 'undefined 必须返回 null（缺该分支会继续走 String(undefined)）')
-  assert.strictEqual(u.parseTime(null), null, 'null 必须返回 null')
-  assert.strictEqual(u.parseTime(''), null, '空串必须返回 null')
-  assert.strictEqual(u.parseTime('   '), null, '纯空白必须返回 null（trim 后为空）')
-  assert.strictEqual(u.parseTime('abc'), null, '非日期文本必须返回 null')
-})
-
-check('PlanR parseTime: 字符串数字与数字的分支差异', () => {
-  const u = Utils
-  // 数字 0 是合法时间戳（1970 纪元）；但纯数字串走的是 /^-?\d+(\.\d+)?$/ 分支
-  assert.strictEqual(uc(u.parseTime(0)), '1970-01-01T00:00:00.000Z', '数字 0 必须解析为纪元（不得被守卫短路）')
-  assert.strictEqual(u.parseTime(123), null, '三位数字既非时间戳区间也非日期 ⇒ null')
-  assert.strictEqual(uc(u.parseTime('  2026-08-01  ')), '2026-08-01T00:00:00.000Z', '首尾空白必须被 trim 后仍能解析（trim 分支）')
-})
-
-check('PlanR parseTime: 布尔/对象等脏输入必须安全返回 null 不抛', () => {
-  const u = Utils
-  assert.strictEqual(u.parseTime(true), null, '布尔必须返回 null')
-  assert.strictEqual(u.parseTime({}), null, '对象必须返回 null（不得抛）')
-  assert.strictEqual(u.parseTime([]), null, '空数组必须返回 null')
+// C5-046：这些守卫随后又被上方「入口三态/trim」两组逐字重测（同一入参分 4 波）；此处合并为一张表，
+// 每行仍是一条独立断言，入参-期望-维度一条不少（用 uc 包裹的行保持原断言口径）。
+check('PlanR parseTime: 入口守卫 / trim / 脏输入（跨波次合并的参数表）', () => {
+  const cases = [
+    [undefined, null, null, 'undefined 必须返回 null（缺该分支会继续走 String(undefined)）'],
+    [null, null, null, 'null 必须返回 null'],
+    ['', null, null, '空串必须返回 null'],
+    ['   ', null, null, '纯空白必须返回 null（trim 后为空）'],
+    ['\t\n', null, null, '纯空白（制表/换行）trim 后为空 → null'],
+    ['abc', null, null, '非日期文本必须返回 null'],
+    [true, null, null, '布尔必须返回 null'],
+    [{}, null, null, '对象必须返回 null（不得抛）'],
+    [[], null, null, '空数组必须返回 null'],
+    [123, null, null, '三位数字既非时间戳区间也非日期 ⇒ null'],
+    [0, uc, '1970-01-01T00:00:00.000Z', '数字 0 必须解析为纪元（不得被守卫短路）'],
+    [' 2026-09-08 10:30:00 ', null, utcMs(2026, 9, 8, 10, 30, 0), '带空白必须 trim 后按 UTC 解析'],
+    ['  2026-08-01  ', uc, '2026-08-01T00:00:00.000Z', '首尾空白必须被 trim 后仍能解析（trim 分支）'],
+    [1788863400000, null, 1788863400000, '数字仍走数字分支（非字符串不受 trim 影响）']
+  ]
+  for (const [value, wrap, want, msg] of cases) {
+    const got = wrap ? wrap(Utils.parseTime(value)) : Utils.parseTime(value)
+    assert.strictEqual(got, want, msg)
+  }
 })
 
 // --- 已导出常量守护（此前无任何断言；这些常量被 daysFrom/_decodeNumeric/sanitizeSurrogates 等热路径依赖）---

@@ -22,27 +22,16 @@ const {
   findClosableDailyIssues, isRealDayKey, closeDailyIssues, MAX_CLOSE_PER_RUN
 } = require('./scripts/mutation-report.js')
 
-// CodeQL js/file-system-race（本仓库必需检查）：同一路径「先 statSync 检查、再 readFileSync 使用」是
-// check-then-use —— 检查与使用之间该路径可被换成另一个对象。与本仓 scripts/mutation-json.js 的
-// readGuardedBytes（STG-01 修法）同口径：这条路径只按路径「访问一次」（openSync('r')），之后只对 fd
-// 做 fstatSync/readSync —— 读到、量到的必然是同一个对象，路径二次查找（check-then-use）不再存在。
-// 返回 { bytes, size, mtimeMs }：分别等价于原先的 readFileSync(p) / statSync(p).size / statSync(p).mtimeMs。
-function readAllViaFd (p) {
-  const fd = fs.openSync(p, 'r')
-  try {
-    const st = fs.fstatSync(fd)
-    const buf = Buffer.allocUnsafe(st.size)
-    let off = 0
-    while (off < st.size) {
-      const n = fs.readSync(fd, buf, off, st.size - off, off)
-      if (n <= 0) break
-      off += n
-    }
-    return { bytes: buf.subarray(0, off), size: st.size, mtimeMs: st.mtimeMs }
-  } finally {
-    fs.closeSync(fd)
-  }
-}
+// 报告文本/文件读取的唯一实现（C5-044）：`run: |` 正文、表格行归一化、fd 读循环原先各有 2–4 份副本
+// （规则已分叉），现统一放到 test/_yaml.js。readViaFd = 同一路径只按 fd 访问一次，与
+// scripts/mutation-json.js 的 readGuardedBytes（STG-01 修法）同口径，不再「statSync 检查 → readFileSync 使用」。
+const { tableRowOf, readViaFd: readAllViaFd } = require('./test/_yaml')
+// 段汇总表的行提取（同一实现三处共用）：`复用` 单元格按内容锚定剥掉，其余列逐字比较。
+const rowOf = tableRowOf
+
+// 键序比较器：显式码元序（与 `Array#sort` 默认序等价），与 run_mutation.js / test_mutation_ranges.js 的
+// byCodeUnit 同口径——不用 localeCompare（collation 随宿主 ICU/locale 变），也不留隐式默认序（Sonar S2871）。
+const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
 
 // Fixture：3 段（正常 + 错误 + 全被杀）→ 覆盖全部 6 条核心分支
 //   1) 段汇总表（正常行）
@@ -99,6 +88,31 @@ const EMPTY_CASE = [
   }
 ]
 
+// console 段清单**从生产常量推导**（C5-042）：旧写法把段数写死成 9（测试名、注释、循环三处），矩阵扩到
+// 12 段后三处一起过期；而 `map.size === EXPECTED_SEGMENTS.length` 抓不住这种漏——`parseMatrixTimeouts`
+// 对缺 `timeout_ms` 的段会回落缺省 300000，段数照样对得上（实测：摘掉 console-part10..12 的 timeout_ms，
+// 旧套件仍 114/114 全绿）。段名与顺序一律沿 EXPECTED_SEGMENTS，不另立第二份清单。
+const CONSOLE_SEGMENTS = EXPECTED_SEGMENTS.filter((seg) => /^console-part\d+$/.test(seg))
+
+// 表下 6 行口径说明（C5-045）：两份快照原先各逐字抄一份（同一段 markdown 在源码里出现 2 次），
+// 改一个标点要同步两处、漏一处就红在「另一个快照」上。说明本身是生产 render 的输出，两个快照都必须逐字
+// 包含它，所以抽成常量：只有一处可改，语义仍由两个快照的整串比较 + F-5 的接线断言钉住。
+// PR-1 双口径：表下必须给出「两列为何不同」的口径说明（NoCoverage > 0 ⇒ covered 剔除该段 NoCoverage）。
+const NOTE_COMMON = '> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
+// 本 PR：Timeout 计入 detected 这句必须留在分数口径说明里（改的是等待上限，不是判据）。
+'> **`Timeout` 计入 detected**（`分数` 分子含 timeout）：本改只降低 console 段的**单次等待上限**（见 `超时上限` 列），**不改判据**——上限调低后，「慢但通过」的变异体可能被记为 Timeout 而算作已检出，故 `真挂死` / `上限触发` 两列必须与 `分数` 一起读。\n' +
+// 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
+// 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
+'> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
+'\n' +
+'> **超时三类**：`真挂死` = Timeout 且 statusReason 为空（TimeoutDecorator 杀掉，变异体跑不动）；`上限触发` = Timeout 且 statusReason 以 `Hit limit reached` 开头（tap-runner 的命中上限 `(n/m)`）；其余非空 reason 归第三类 `其他超时`（不在两列里，只在 `超时` 格括号内注明）。取证 = 段 job 的 fail-closed 守卫在**剥离 statusReason 之前**落盘的 `timeout-stats.json`（随 artifact 到汇总 job）；`—` = 该段**有 Timeout 但没有可用取证**（文件缺失/非法/与报告计数不符），**不得读作 0**。\n'
+
+// 「本次矩阵取值」是本段唯一随夹具变化的一行（A 夹具 300s+60s、B 夹具只有 300s），单独参数化；
+// 其余 5 行共用 NOTE_COMMON。
+function noteTimeoutLimit (values) {
+  return '> **本段生效 timeoutMS**（`超时上限` 列）= `mutation.yml` 矩阵的 `timeout_ms`，经 CLI `--timeoutMS` 覆盖配置文件的 300000ms；它只改单次等待上限，**不进缓存身份**、**不改分数口径**。本次矩阵取值：' + values + '（缺省 `300s`）。\n'
+}
+
 let pass = 0
 let fail = 0
 /**
@@ -120,16 +134,8 @@ check('render 输出快照（含 error 段 + 正常段 + 全被杀段）', () =>
 '| part4-all-killed | 5 | 5 | 0 | 0 | 0 | 100% | 100% | 未记录 | 0 | 0 | 60s |\n' +
 '| **合计** | **25** | **13** | **6** | **4** | **2** | **76%** | **82.61%** | **0 段复用** | **2** | **4** | **—** |\n' +
 '\n' +
-// PR-1 双口径：表下必须给出「两列为何不同」的口径说明（NoCoverage > 0 ⇒ covered 剔除该段 NoCoverage）。
-'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
-// 本 PR：Timeout 计入 detected 这句必须留在分数口径说明里（改的是等待上限，不是判据）。
-'> **`Timeout` 计入 detected**（`分数` 分子含 timeout）：本改只降低 console 段的**单次等待上限**（见 `超时上限` 列），**不改判据**——上限调低后，「慢但通过」的变异体可能被记为 Timeout 而算作已检出，故 `真挂死` / `上限触发` 两列必须与 `分数` 一起读。\n' +
-// 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
-// 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
-'> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
-'\n' +
-'> **超时三类**：`真挂死` = Timeout 且 statusReason 为空（TimeoutDecorator 杀掉，变异体跑不动）；`上限触发` = Timeout 且 statusReason 以 `Hit limit reached` 开头（tap-runner 的命中上限 `(n/m)`）；其余非空 reason 归第三类 `其他超时`（不在两列里，只在 `超时` 格括号内注明）。取证 = 段 job 的 fail-closed 守卫在**剥离 statusReason 之前**落盘的 `timeout-stats.json`（随 artifact 到汇总 job）；`—` = 该段**有 Timeout 但没有可用取证**（文件缺失/非法/与报告计数不符），**不得读作 0**。\n' +
-'> **本段生效 timeoutMS**（`超时上限` 列）= `mutation.yml` 矩阵的 `timeout_ms`，经 CLI `--timeoutMS` 覆盖配置文件的 300000ms；它只改单次等待上限，**不进缓存身份**、**不改分数口径**。本次矩阵取值：`300s`、`60s`（缺省 `300s`）。\n' +
+NOTE_COMMON +
+noteTimeoutLimit('`300s`、`60s`') +
 '\n' +
 // PR #158 Qodo Medium / Correctness：夹具没带 reuse 元信息 ⇒ 必须走「没有任何段的复用状态记录」分支。
 // 这一段不能省：省掉之后「没记录」与「没复用」在日报里长得完全一样，正是 Qodo 指出的缺陷本身。
@@ -175,15 +181,8 @@ check('render 输出快照（全被杀 → 🎉 无存活变异体分支）', ()
 '| clean | 3 | 3 | 0 | 0 | 0 | 100% | 100% | 未记录 | 0 | 0 | 300s |\n' +
 '| **合计** | **3** | **3** | **0** | **0** | **0** | **100%** | **100%** | **0 段复用** | **0** | **0** | **—** |\n' +
 '\n' +
-'> **两种口径**：`分数` = (被杀 + 超时) / **全部**变异体（含 NoCoverage，保守口径）；`covered 口径` = (被杀 + 超时) / (被杀 + 超时 + 存活)（**剔除** NoCoverage，只反映已覆盖部分的检出能力）。`无覆盖` 列即 NoCoverage 计数：某段 NoCoverage > 0 时 covered ≥ 分数（分母更小），**但两列未必不同**——分子（被杀 + 超时）为 0 **且存活 > 0** 时两列都是 0%（例如 1 个存活 + 1 个无覆盖）；NoCoverage = 0 且无其它未计入状态（RuntimeError / CompileError / Ignored / Pending 同样不在 covered 分母里）时两列相等；整段 NoCoverage（分母为 0）时 `covered 口径` 显示 `—`（不显示 NaN / 0%）。\n' +
-// 本 PR：Timeout 计入 detected 这句必须留在分数口径说明里（改的是等待上限，不是判据）。
-'> **`Timeout` 计入 detected**（`分数` 分子含 timeout）：本改只降低 console 段的**单次等待上限**（见 `超时上限` 列），**不改判据**——上限调低后，「慢但通过」的变异体可能被记为 Timeout 而算作已检出，故 `真挂死` / `上限触发` 两列必须与 `分数` 一起读。\n' +
-// 审查 A2 · F-2：夹具没带 runnerConfig ⇒ 走**通用**的 command 档说明（不带段名/计数），
-// 但这句话本身不得省略——「runner 看不见覆盖」必须在表下显式声明，否则新列会被读成「不存在未覆盖」。
-'> ⚠️ **command 档段（`coverageAnalysis:\'off\'`）的 `无覆盖` 恒为 0 是 runner 语义，不代表已全部覆盖**：这类段的 `covered 口径` 必然等于 `分数`，与 TAP 档段**不同口径**，**跨段比较必须排除**。\n' +
-'\n' +
-'> **超时三类**：`真挂死` = Timeout 且 statusReason 为空（TimeoutDecorator 杀掉，变异体跑不动）；`上限触发` = Timeout 且 statusReason 以 `Hit limit reached` 开头（tap-runner 的命中上限 `(n/m)`）；其余非空 reason 归第三类 `其他超时`（不在两列里，只在 `超时` 格括号内注明）。取证 = 段 job 的 fail-closed 守卫在**剥离 statusReason 之前**落盘的 `timeout-stats.json`（随 artifact 到汇总 job）；`—` = 该段**有 Timeout 但没有可用取证**（文件缺失/非法/与报告计数不符），**不得读作 0**。\n' +
-'> **本段生效 timeoutMS**（`超时上限` 列）= `mutation.yml` 矩阵的 `timeout_ms`，经 CLI `--timeoutMS` 覆盖配置文件的 300000ms；它只改单次等待上限，**不进缓存身份**、**不改分数口径**。本次矩阵取值：`300s`（缺省 `300s`）。\n' +
+NOTE_COMMON +
+noteTimeoutLimit('`300s`') +
 '\n' +
 '## ♻️ 复用状态（结果是否对应当前测试状态）\n' +
 '\n' +
@@ -600,7 +599,6 @@ check('render：口径不符**不改变**任何分数/统计口径（与只加�
   const withMismatch = base.map((r, i) => ({ ...r, reuse: i === 0 ? { mode: REUSE_MODE_PARTIAL, reused: 6, total: 6, ratio: 1, high: true } : { mode: REUSE_MODE_FULL } }))
   // 只摘掉 `复用` 单元格（按内容锚定），不摘后面的新增列：`$` 行尾锚点已去掉——
   // `真挂死/上限触发/超时上限` 三列追加在 `复用` 之后，行尾不再是复用列。
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withMismatch)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '分数行不得因口径不符而变化')
@@ -617,7 +615,6 @@ check('render：复用元信息**不改变**任何分数/统计口径（只多�
   // 分数行与合计行必须逐字相同（本 PR 明确不改 (killed+timeout)/total 口径）
   // 只摘掉 `复用` 单元格（按内容锚定），不摘后面的新增列：`$` 行尾锚点已去掉——
   // `真挂死/上限触发/超时上限` 三列追加在 `复用` 之后，行尾不再是复用列。
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withReuse)
   assert.strictEqual(rowOf(a, 'app'), rowOf(b, 'app'), '同一统计下分数行必须一致（复用只增加标注）')
@@ -821,7 +818,6 @@ check('render 溯源三态 · cacheHit 不改变任何分数/统计口径（只�
   })
   const base = [seg('app'), seg('utils', CACHE_HIT_PRIMARY)]
   const withFallback = [seg('app', CACHE_HIT_FALLBACK), seg('utils', CACHE_HIT_PRIMARY)]
-  const rowOf = (out, seg) => out.split('\n').find(l => l.startsWith(`| ${seg} |`)).replace(/ \| (未记录|复用 [\d/]+(?:·兜底)?|全量(?:\(口径不符\))?) \|/, ' |')
   const a = render(base)
   const b = render(withFallback)
   // 方向一：数字列/合计行逐字相同（cacheHit **泄漏进统计** ⇒ 这里红）
@@ -1191,6 +1187,33 @@ check('parseMatrixRunnerConfigs：从 matrix include 解析逐段 config（含 s
   assert.strictEqual(quoted.get('s1'), COMMAND_RUNNER_CONFIG)
 })
 
+// C10-060：引号**未闭合**曾「静默回退」成「去掉开引号、后半行全算值」——对两个解析器来说，结果都是
+// **看起来完全合法**的取值：`config: "stryker.tap.config.js` 与正常闭合逐字相同，`timeout_ms: "60000`
+// 也照样得到 60000。矩阵被改坏时日报仍给出「这一段走 TAP 档 / 上限 60s」的确定结论，没有任何信号提示
+// 「这行 yml 本身是坏的」。契约：未闭合 ⇒ 该标量视为**无取值**（条目不计入；timeout 回落缺省），绝不猜。
+check('C10-060 引号未闭合不得回退成看似合法的值（runner 档位 + timeout 同口径）', () => {
+  const yml = [
+    'include:',
+    '  - name: bad-double',
+    '    config: "stryker.tap.config.js',
+    '    timeout_ms: "60000',
+    '  - name: bad-single',
+    "    config: 'stryker.config.js",
+    '  - name: ok-quoted',
+    '    config: "stryker.tap.config.js"  # 正常闭合',
+    '    timeout_ms: "45000"'
+  ].join('\n')
+  const configs = parseMatrixRunnerConfigs(yml)
+  assert.strictEqual(configs.has('bad-double'), false,
+    '双引号未闭合的 config 必须视为无值（修前会被读成 stryker.tap.config.js，与正常值无法区分）')
+  assert.strictEqual(configs.has('bad-single'), false, '单引号未闭合同理')
+  assert.strictEqual(configs.get('ok-quoted'), 'stryker.tap.config.js', '正常闭合的引号（带行内注释）必须照旧解析')
+  const timeouts = parseMatrixTimeouts(yml)
+  assert.strictEqual(timeouts.get('bad-double'), DEFAULT_SEGMENT_TIMEOUT_MS,
+    '未闭合的 timeout_ms 必须回落缺省 300000（修前会被读成 60000）')
+  assert.strictEqual(timeouts.get('ok-quoted'), 45000, '正常闭合的 timeout_ms 必须照旧解析')
+})
+
 check('render/analyze：command 档段被标注、TAP 档段不被标注（F-2 靶向用例）', () => {
   // 纯函数层
   assert.strictEqual(formatSegmentLabel('storage', COMMAND_RUNNER_CONFIG), `storage${COMMAND_SEGMENT_MARK}`)
@@ -1485,6 +1508,23 @@ try {
     assert.strictEqual(findReportJson(path.join(tmp, 'not-exist')), null)
   })
 
+  // C10-052：`findReportJson` / `findReuseJson` 原是逐字复制的两份递归查找（只差文件名），
+  // `readMatrixRunnerConfigs` / `readMatrixTimeouts` 是逐字复制的两份「读 mutation.yml + 解析 +
+  // 任何失败降级空 Map」。副本一旦分叉，日报的「有报告/无报告」与「矩阵读不到」判据就会各说各话。
+  // 门禁：树查找实现只准 1 处、矩阵读取实现只准 1 处（分析器的目录枚举是另一回事，故 withFileTypes 计 2）。
+  check('C10-052 目录树查找 / 矩阵读取各自只有一处实现（禁止再出现逐字副本）', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'mutation-report.js'), 'utf8')
+    const countOf = (needle) => src.split(needle).length - 1
+    assert.strictEqual(countOf('fs.readFileSync(resolved, \'utf8\')'), 1,
+      '「读 mutation.yml」只准一处实现（readMatrixYml）；矩阵读取副本会各自漂移')
+    assert.strictEqual(countOf('fs.readdirSync(dir, { withFileTypes: true })'), 2,
+      '递归目录遍历只准共享实现 1 处 + analyze 的入口枚举 1 处；多出来的那份就是 findReportJson/findReuseJson 的副本')
+    // 两对 helper 必须都还导出且仍走共享实现（删名字会让上面的计数假绿）
+    for (const name of ['findReportJson', 'findReuseJson', 'readMatrixRunnerConfigs', 'readMatrixTimeouts']) {
+      assert.strictEqual(typeof require('./scripts/mutation-report.js')[name], 'function', `${name} 必须仍然导出`)
+    }
+  })
+
   check('analyzeSegment 正确解析统计 / 缺报告返回 error', () => {
     const d = path.join(tmp, 'mutation-report-utils'); fs.mkdirSync(d, { recursive: true })
     fs.writeFileSync(path.join(d, 'mutation.json'), JSON.stringify({
@@ -1628,6 +1668,24 @@ try {
     } finally {
       fs.rmSync(emptyDir, { recursive: true, force: true })
     }
+  })
+
+  // C10-058：analyze() 是导出的**库函数**（测试与将来的调用方都直接用它），里面 process.exit(1) 会让
+  // 调用方无法兜住：既不能降级、也不能把「参数写错」与「报告有问题」分开处理，整个宿主进程直接消失。
+  // 契约改为抛 Error（消息与 CLI 文案一致），退出码由 main 的 catch 统一决定（仍 exit 1、文案不变）。
+  check('C10-058 analyze 遇到坏目录抛错而不是 process.exit（调用方可兜住）', () => {
+    const missing = path.join(tmp, 'c10058-not-exist')
+    let err = null
+    try { analyze(missing) } catch (e) { err = e }
+    assert.ok(err instanceof Error, '不存在的目录必须抛错（process.exit 会让调用方拿不到控制权）')
+    assert.ok(/报告目录不存在或不可访问/.test(err.message), `错误文案须与 CLI 一致，实际：${err.message}`)
+
+    const filePath = path.join(tmp, 'c10058-a-file')
+    fs.writeFileSync(filePath, 'x')
+    let err2 = null
+    try { analyze(filePath) } catch (e) { err2 = e }
+    assert.ok(err2 instanceof Error, '传普通文件也必须抛错')
+    assert.ok(/不是目录/.test(err2.message), `错误文案须点名「不是目录」，实际：${err2.message}`)
   })
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
@@ -1915,6 +1973,26 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     await assert.rejects(() => postIssue('body'), /缺少 GITHUB_TOKEN/)
   })
 
+  // C10-026：缺 GITHUB_REPOSITORY 时绝不回落到硬编码的他仓。旧实现 `process.env.GITHUB_REPOSITORY ||
+  // 'junhanw868-bot/notes'`：CI 漏传该变量（本地 `--issue` 也常见）时，日报会被静默 POST 到另一个
+  // 仓库——既污染他仓，又让本仓永远看不到日报，属于「配置缺失被伪装成正常工作」。口径与上面缺 token
+  // 一致：fail-closed 抛错，且**一个请求都不发**（不允许用空仓库名先探一次）。
+  await acheck('C10-026 postIssue 缺少 GITHUB_REPOSITORY 时抛错且不发出任何请求（不得回落硬编码他仓）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    delete process.env.GITHUB_REPOSITORY
+    const calls = []
+    global.fetch = async function (url) {
+      calls.push(String(url))
+      throw new Error(`缺仓库变量时不应发出任何请求：${url}`)
+    }
+    try {
+      await assert.rejects(() => postIssue('body'), /GITHUB_REPOSITORY/)
+    } finally {
+      process.env.GITHUB_REPOSITORY = 'owner/repo'
+    }
+    assert.deepStrictEqual(calls, [], `缺仓库变量时必须直接失败，实际发出：${calls.join(', ')}`)
+  })
+
   await acheck('postIssue 当天日报已存在时跳过发布', async () => {
     process.env.GITHUB_TOKEN = 'test-token'
     process.env.GITHUB_REPOSITORY = 'owner/repo'
@@ -2063,23 +2141,51 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     await postIssue('body')
     assert.ok(listRes.capturedOpts.signal instanceof AbortSignal,
       '列表查询必须带 AbortSignal 超时（无超时会让日报 job 无限等待）')
-    assert.strictEqual(createRes.capturedOpts.signal, undefined, '发 Issue 请求不应被列表查询的超时信号绑住')
+    // C10-024：POST 也要有自己的超时（见下一条专测）；这里只锁「不被列表查询那一个绑住」——
+    // 两者各自独立计时，否则一次 15s 的列表超时会连带把创建请求掐掉。
+    assert.notStrictEqual(createRes.capturedOpts.signal, listRes.capturedOpts.signal,
+      '发 Issue 请求不应被列表查询的超时信号绑住')
     assert.ok(cleanupRes.capturedOpts.signal instanceof AbortSignal,
       '历史日报清理的查询同样必须带超时（卫生项不得拖死 report job）')
   })
 
+  // C10-024：创建 Issue 的 POST 曾是整条链上**唯一**没有超时的 fetch——列表查询（F7）与逐条 PATCH
+  // （CLOSE_BUDGET_MS）都带了 AbortSignal，只有 POST /issues 裸奔。GitHub API 偶发长时间无响应时，
+  // report job 会一直挂到 job 级超时（6h）：日报既发不出去、也不会响亮失败，正是本仓反复消灭的
+  // 「静默挂住」形态。判据用 in-process 的 opts.signal 类型 + 对象身份（不是耗时墙钟）。
+  await acheck('C10-024 postIssue 创建 Issue 的 POST 自带 AbortSignal 超时（不得裸奔）', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const listRes = makeRes(true, 200, [])
+    const createRes = makeRes(true, 201, { number: 105, html_url: 'https://github.com/owner/repo/issues/105' })
+    const cleanupRes = makeRes(true, 200, [])
+    mockFetch([listRes, createRes, cleanupRes])
+    await postIssue('body')
+    assert.ok(createRes.capturedOpts && createRes.capturedOpts.signal instanceof AbortSignal,
+      '创建 Issue 的 POST 必须带 AbortSignal 超时（否则接口挂住会把 report job 一起拖死）')
+    assert.notStrictEqual(createRes.capturedOpts.signal, listRes.capturedOpts.signal,
+      'POST 必须用自己的超时信号，不能复用列表查询那一个')
+  })
+
   // ===== 本段生效 timeoutMS + Timeout 两类（console 段 60s）====================================
-  // 背景：console 9 段在 mutation.yml 矩阵里带 `timeout_ms: 60000`，由「变异测试」step 经 CLI
+  // 背景：console 段（当前 12 段，段数由 EXPECTED_SEGMENTS 推导）在 mutation.yml 矩阵里带
+  // `timeout_ms: 60000`，由「变异测试」step 经 CLI
   // `--timeoutMS` 覆盖配置（缓存 key 不含该值 ⇒ 不需要一次性全量重跑）。日报必须同时展示：
   //   ① 该段**生效**的等待上限（缺省 300000）；② Timeout 的成因两类（真挂死 / 上限触发）——
   //   后者来自段 job 守卫在剥离 statusReason 之前落盘的 timeout-stats.json。
   // 判据不变：分数仍是 (killed+timeout)/total（Timeout 计入 detected）⇒ 下列用例锁死「只加可见性、不改数值」。
-  check('parseMatrixTimeouts：真实矩阵 ⇒ console 9 段 60000、其余缺省 300000（不新增第二份硬编码清单）', () => {
+  check(`parseMatrixTimeouts：真实矩阵 ⇒ console ${CONSOLE_SEGMENTS.length} 段 60000、其余缺省 300000（不新增第二份硬编码清单）`, () => {
     const text = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
     const map = parseMatrixTimeouts(text)
-    for (let i = 1; i <= 9; i++) {
-      assert.strictEqual(map.get(`console-part${i}`), 60000, `console-part${i} 必须显式 60000（否则又等满 300s 偏移）`)
+    assert.ok(CONSOLE_SEGMENTS.length > 0, 'console 段必须能从 EXPECTED_SEGMENTS 推导出来（否则下面的循环恒真）')
+    for (const seg of CONSOLE_SEGMENTS) {
+      assert.strictEqual(map.get(seg), 60000, `${seg} 必须显式 60000（否则又等满 300s 偏移）`)
     }
+    // 反向对账：矩阵里的 console 段必须与常量里的 console 段一一对应——段数不写死，但「矩阵少一段」
+    // 与「常量少一段」都得红（只靠上面的正向循环，漏掉的段永远不会被点名）。
+    assert.deepStrictEqual([...map.keys()].filter((seg) => /^console-part\d+$/.test(seg)).sort(byCodeUnit),
+      [...CONSOLE_SEGMENTS].sort(byCodeUnit),
+      '矩阵里的 console 段必须与 EXPECTED_SEGMENTS 的 console 段一一对应（段数由常量推导，不写死数字）')
     assert.strictEqual(map.get('v3-entry'), DEFAULT_SEGMENT_TIMEOUT_MS,
       '未声明 timeout_ms 的段必须回落 300000（与 GitHub 表达式 matrix.timeout_ms || 300000 同口径）')
     assert.strictEqual(map.get('sendnotify-part2'), DEFAULT_SEGMENT_TIMEOUT_MS, '其余段一律缺省 300000')

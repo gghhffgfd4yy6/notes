@@ -1,5 +1,12 @@
 'use strict'
+const fs = require('node:fs') // 仅供下方「注册表自身不得含用例」的加载期扫描（读自身源码）
 // 测试套件清单：run_tests.js 和 run_unit_tests.js 共用
+//
+// C5-074（命名口径）：本文件名形如 test_*.js，但它**不是测试套件** —— 0 断言、只导出 SUITES，故在
+// test_suite_registry.js 的 REGISTRY_EXEMPTIONS 里以「注册表自身」显式豁免。改名要同步 7 处 require
+// （run_tests / run_unit_tests / run_mutation / test_ci_skip_suites / test_suite_registry /
+// stryker.tap.config / scripts/tap-shim）+ run_mutation.js 的两处字面文件名清单，代价与收益不成比例
+// ⇒ 保留名字，改用下方「注册表不得含用例」的加载期门禁让豁免前提自证（0 断言这件事由代码而非注释保证）。
 // integration: true 表示集成测试（慢/可能有网络），单元测试入口（run_unit_tests.js）会跳过
 // mutationSkip: true 表示在 Stryker 沙箱内无法运行（被 --mutate 目标插桩后行数膨胀，
 //   导致 test_mutation_ranges/check-mutation-ranges 的行段元校验误报），同样由单元入口跳过
@@ -29,7 +36,13 @@ const SUITES = [
   { name: '状态面板', file: 'test_status.js', desc: '--status 只读聚合运行状态', integration: true },
   { name: '状态报告解析', file: 'test_status_report.js', desc: 'scripts/status.js parseLastRun 多行取最后匹配 + parseDiagnostics 跳过损坏行 + formatStatus 降级' },
   { name: '规则引擎校验', file: 'test_rules.js', desc: 'xbk_rules.js 嵌套量词检测/pingbitime 首尾空白/缺少分隔符' },
-  { name: '工具函数', file: 'test_utils.js', desc: 'xbk_utils.js 日期解析/CSS转义/safeErrorText/filterHash 9个纯函数分支' },
+  // C5-073（口径登记，**不合并套件**）：套件边界按**文件**切而非按职责切 —— 本文件与 test_utils_pure.js
+  // 同测 xbk_utils.js。「每条门禁起进程」只在**套件**粒度成立（run_tests.js / run_unit_tests.js 每个套件
+  // 一个子进程；本文件自身 0 次 spawn、131 行）。实测 37 条断言，其中约 11 条为本套件独有（8 条无引号
+  // srcset 多候选 + 3 条 CSS 转义上下文），其余与 test_utils_pure.js 重叠。合并两套件必须同步
+  // stryker.tap.config.js 的 testFiles 显式清单（逐元素含顺序），而收益只是每轮少一个子进程
+  // ⇒ 保留现状并在此登记口径（desc 不再写「9 个纯函数分支」这种与实际断言数无关的说法）。
+  { name: '工具函数', file: 'test_utils.js', desc: 'xbk_utils.js 37 条断言（parseTime 11/CSS 转义 6/无引号 srcset 多候选 8/safeErrorText 3/filterHash 9）；与 test_utils_pure.js 重叠约 26 条，独有约 11 条' },
   { name: '工具函数纯函数扩展', file: 'test_utils_pure.js', desc: 'xbk_utils.js add0/daysFrom/num/safeText/safeGet/truncateUtf16/isDangerousUrl/validUrl/normUrl/anonKey 等纯函数边界（提升变异分数）' },
   { name: '格式化器', file: 'test_formatter.js', desc: 'xbk_formatter.js HTML→Markdown转换+模板替换+内部方法边界（提升变异分数）' },
   { name: '规则引擎扩展', file: 'test_rules_extended.js', desc: 'xbk_rules.js compileRules/matchesCompiled/checkTimeCompiled/validateConfig 边界（提升变异分数）' },
@@ -71,11 +84,20 @@ const SUITES = [
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)', integration: true },
+  // C5-008 登记（有此条即口径，勿再当「漏接线」重开）：本套件是 1600 行 integration 套件，被
+  // run_unit_tests.js（UNIT_SUITES 过滤 integration/mutationSkip）与 TAP 档的显式清单（同口径过滤）
+  // 两档排除 ⇒ **对变异门禁零贡献**，只在 test.yml 的显式步骤「通道测试（test_notify.js）」里跑。
+  // 这是有意的测试集边界（同 test_app.js / test_app_p.js 不进变异集，已知边界见 AGENTS.md），不是接线漏项。
+  // 代价：本套件独有的通道分支零变异覆盖 —— 新增/改动通道判定时，请在 test_sendnotify_pure.js 补等价
+  // 单元断言（先例：isCode 的 String 侧由 SNB-09 在单元档击杀，不依赖本套件）。
   { name: '通道测试', file: 'test_notify.js', desc: '推送通道请求构造+脱敏', integration: true },
   // v3.276 补：xbk_app.js 此前无任何单元套件（test_app.js 是集成套件、不进变异测试集），
   // 其报告/状态簇的存活变异体无人认领。本套件在**进程内**用最小桩构造 createApp(...) 后直接
   // 调用目标方法（不走子进程 ⇒ 可被变异测试的 perTest 覆盖归因）。
-  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 报告/状态簇：_isValidReportDate 闰年与月界、_loadReportState 缺文件/损坏/超限降级、_normalizeReportState 形状归一与 pending 占位告警' },
+  // C5-083（口径）：desc 此前只列 3 个方法（_isValidReportDate/_loadReportState/_normalizeReportState），
+  // 与套件的真实覆盖严重不符 —— 实测 243 例，覆盖报告/状态、日志写入、告警/模板三大簇 + RE2 警告标记
+  // 生命周期 + 通道健康降级 + 覆盖文件按轮生效。desc 按簇列出，避免读者把它当成「只测 3 个方法」。
+  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 进程内 243 例：报告/状态簇（_isValidReportDate/_blankReportState/_safeCounter/_normalizeReportState/_loadReportState/_reportToday/_persistReportState）+ 日志写入簇（_writeRunLog/_warnLowDisk/_writeState/_writeTextAtomic/_isRegularOrMissing/_localStamp）+ 告警/模板簇（_enabledFlag/_validateTplConfig/_accumulateReport/_sendCrossDayReport/_updateReport/_sendAlert）+ RE2 警告标记生命周期/通道健康降级/PID 复用/覆盖文件按轮生效 FR-1..3/DR-1 dry-run' },
   // G11：scripts/audit-gate.js 是 fail-closed 安全门禁（v3.276 续 / PR #194 引入），此前**零测试**
   // ——只在 test.yml:218 被 `node scripts/audit-gate.js` 调用过，仓库里没有任何断言指向它。
   // 于是「豁免只针对 GHSA-CH52-4W7C-C8XP、其余高危一律拦」这条契约无人守护：放宽 ALLOWED_ADVISORIES、
@@ -115,6 +137,26 @@ const SUITES = [
   const names = SUITES.map(s => s.name)
   const dupNames = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))]
   if (dupNames.length) throw new Error(`test_suites.js 存在重复的套件名（汇总/日报无法区分）：${dupNames.join(', ')}`)
+}
+
+// C5-074：注册表自身**不得**含用例（fail-closed）。这条门禁让 test_suite_registry.js 白名单里
+// 「注册表自身，不是测试套件（0 断言）」这个豁免前提由代码保证，而不是靠注释自觉：
+//   * run_tests.js / run_unit_tests.js 只跑 SUITES 里 file 指向的文件；stryker.tap.config.js 的
+//     tap.testFiles 是同一份推导 ⇒ 本文件里的任何用例**永远不会被执行**；
+//   * 而 test_suite_registry.js 又把它列进 REGISTRY_EXEMPTIONS（不注册自己）⇒ 没人会红。
+// 也就是说「往注册表里加个用例」= 静默零运行。扫描用的是**行首**判定（trim 后以用例注册器开头），
+// 不会命中本块自身或注释：真实的用例文件里调用也都在行首/缩进首位。
+{
+  const CASE_LINE_RE = /^\s*(?:await\s+)?(?:check|checkAsync|test|describe|it)\s*\(/
+  const caseLines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/) // nosemgrep（读的是本文件自身，非外部输入）
+    .map((text, i) => ({ text: text.trim(), no: i + 1 }))
+    .filter(x => CASE_LINE_RE.test(x.text))
+  if (caseLines.length) {
+    throw new Error('test_suites.js 是**注册表**不是测试套件（它被 test_suite_registry.js 白名单豁免，' +
+      '也不在任何 runner 的执行清单里）⇒ 把用例写在这里永远不会被执行，等于静默零运行。' +
+      '请把用例挪到独立的 test_*.js 并注册进 SUITES。命中的用例行：' +
+      caseLines.map(x => `:${x.no} ${x.text.slice(0, 60)}`).join(' / '))
+  }
 }
 
 module.exports = { SUITES }

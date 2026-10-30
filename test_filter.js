@@ -4,7 +4,7 @@
 
 // 直接执行（CI/pre-push）也必须先拦截残留进程和过期沙箱；变异评估子进程由 guard 自己按环境跳过。
 const hostClean = require('./scripts/check-host-clean.js')
-if (hostClean.guardOrExit(process.env)) process.exit(1)
+if (hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 
 // ============================================================
 // 直接测试 xbk_function_v3.js 里的 listfilter
@@ -113,6 +113,12 @@ const OWNS_CACHE_DIR = !process.env.XBK_PARALLEL_ID
 // 注意这里写回的是**归一后**的 ID（可能与环境变量原值不同）：生产 fallback 分支出的是
 // xianbaoku_cache_p<该值>，必须与本文件用的 CACHE_DIR_NAME 完全同源，断言才指向同一目录。
 process.env.XBK_PARALLEL_ID = TEST_ISOLATION_ID
+// C3-002（backlog）：先清掉外部部署开关 XBK_CACHE_DIR 再设 Config.cache.dir。
+// 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
+// 本套件的隔离全靠 Config.cache.dir ⇒ 在 export 过该变量的 shell 里直跑本套件，夹具会写进部署缓存
+// 目录（真实 push.json 判重主存被覆盖），下方「cacheDir 必须落在私有分片目录」的断言也会当场假红。
+const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
+isolateProcessCacheDirEnv()
 Config.cache.dir = CACHE_DIR_NAME
 
 // ============================================================
@@ -187,19 +193,22 @@ function cleanupTestCache () {
 let passed = 0
 let failed = 0
 const errors = []
-// 每用例硬超时。沙箱内必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
+// 每用例硬超时。必须**严格大于**最大的内部墙钟阈值（10000 条 listfilter 基准 3000ms
 // → perfLimit 后 36000ms），否则「内部阈值还没到期、harness 先判超时」⇒ 上面的缩放等于白做
-// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。默认保持 3000ms 逐字节不变。
-const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 3000
+// （3s 的 harness 会把任何 3s+ 的基准直接判红）。取 1.5× 余量。
+// C4-007：默认模式同样受此约束 —— 原 3000ms 与 perfLimit(3000)=3000 相等（不满足严格大于），
+// 而旧守卫 `PERF_SCALE === 1 || ...` 恰好把它短路成恒真。默认提到 4000ms，守卫去掉短路。
+const TIMEOUT_MS = PERF_SCALE > 1 ? Math.round(3000 * PERF_SCALE * 1.5) : 4000
 
 async function test (name, fn) {
   const start = Date.now()
+  let timer = null
   try {
     await Promise.race([
       fn(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`⏰ 超时 (${TIMEOUT_MS}ms)`)), TIMEOUT_MS)
-      )
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`⏰ 超时 (${TIMEOUT_MS}ms)`)), TIMEOUT_MS)
+      })
     ])
     passed++
     console.log(`  ✅ ${name}  (${Date.now() - start}ms)`)
@@ -213,6 +222,10 @@ async function test (name, fn) {
     } else {
       console.log(`      └─ 💥 ${e.message}`)
     }
+  } finally {
+    // C4-002：收尾改 process.exitCode 后，滞留在事件循环里的 harness 定时器会把进程退出
+    // 拖到最后一个定时器到期（默认 3s）。用例已 settle，定时器无意义，显式清掉。
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -222,6 +235,35 @@ function assertEqual (actual, expected, msg) {
   } catch (e) {
     e.message = msg || `期望=${expected}, 实际=${actual}`
     throw e
+  }
+}
+
+// C4-024：Config.cache.maxSize 的「保存 → 设置 → 还原」样板曾原样重复 16 份（5 处 100、两处 2、
+// 字符串/小数/0 各一处等），每份都手写一遍 try/finally。样板的问题不是长，而是「漏一处就静默泄漏」：
+// 少写 finally 或 finally 里少还原一处，都会把临时上限留给后续用例，且失败现场看不出是谁改的。
+// 统一入口后，本文件里对 maxSize 的赋值只允许出现在本函数内（源码门禁见用例 C4-024）。
+// 用 async + await：用例体若是 async（含 await），同步版 helper 会在 Promise settle 之前就还原，
+// 等于把上限提前改回去——这里必须等回调真正结算完再还原。
+async function withCacheMaxSize (maxSize, fn) {
+  const orig = Config.cache.maxSize
+  Config.cache.maxSize = maxSize
+  try {
+    return await fn()
+  } finally {
+    Config.cache.maxSize = orig
+  }
+}
+
+// C4-011：确定性 LCG 伪随机。此前同一行实现被**逐字复制** 26 份（19 份单行 + 7 份三行），
+// 改算法/模数要改 26 处、漏一处就让「固定 seed ⇒ 跨运行结果一致」的 fuzz 用例静默分叉。
+// 语义与旧副本逐字等价：seed_n = (seed_{n-1} * 1103515245 + 12345) % 2147483648，返回 [0,1)。
+// 注意 `<x>_prnd` 一类的 `& 0x7fffffff` 变体是**另一个**生成器（序列不同），不并入本工厂：
+// 换算法会改变这些 fuzz 用例实际喂进去的输入。
+function makeRand (initialSeed) {
+  let seed = initialSeed
+  return () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed / 2147483648
   }
 }
 
@@ -256,6 +298,29 @@ function cleanupDirInRoot (targetPath) {
     removeDirInRoot(targetPath, __dirname)
   } catch (e) {
     console.warn(`⚠️ 缓存目录清理失败，需手工删除（否则将滞留仓库根）：${targetPath} — ${e.message}`)
+  }
+}
+
+// C4-028：删除「可能不存在的夹具文件」。ENOENT 是预期（文件本来就不存在，属正常收尾），
+// 其它错误必须留痕——本文件在 cleanupDirInRoot 上已经立过「空 catch 会让同一个事故再演一遍」的
+// 规矩（清理失败被静默吞掉 → 仓库根堆出几十个残留目录而测试全程全绿），夹具清理不该是例外：
+// EACCES/EBUSY/EISDIR（只读挂载、目录未清空、句柄未释放）被吞掉后，残留文件会被下一次读盘
+// 当成有效缓存，症状与「缓存莫名多一条」一模一样。原来 89 处 `try { unlinkSync } catch (e) {}`。
+function unlinkQuiet (targetPath) {
+  try {
+    require('node:fs').unlinkSync(targetPath)
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn(`⚠️ 夹具清理失败，需手工删除：${targetPath} — ${e.message}`)
+  }
+}
+
+// 同上，用于临时目录：rmdir 只对空目录有效，ENOENT/ENOTDIR（本来就没有/不是目录）属正常收尾，
+// 其它错误（ENOTEMPTY/EACCES）必须留痕。
+function rmdirQuiet (targetPath) {
+  try {
+    require('node:fs').rmdirSync(targetPath)
+  } catch (e) {
+    if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') console.warn(`⚠️ 临时目录清理失败，需手工删除：${targetPath} — ${e.message}`)
   }
 }
 
@@ -328,48 +393,48 @@ console.log('========================================\n');
   }
 
   await test('全部配置为空 → 全部保留', () => {
-    assertEqual(listfilter(makeItem(), {}), true)
+    assertEqual(listfilter(makeItem(), {}), true, 'listfilter(makeItem(), {}) 应等于 true')
   })
 
   await test('所有配置都不匹配 → 保留', () => {
-    assertEqual(listfilter(makeItem(), { pingbifenlei: '赚客吧' }), true)
+    assertEqual(listfilter(makeItem(), { pingbifenlei: '赚客吧' }), true, 'listfilter(makeItem(), { pingbifenlei: \'赚客吧\' }) 应等于 true')
   })
 
   await test('过滤解释：分类屏蔽给出配置项与命中规则', () => {
     const result = explainFilter(makeItem({ catename: '赚客吧' }), compileRules({ pingbifenlei: '微博|赚客吧' }))
-    assertEqual(result.passed, false)
-    assertEqual(result.reason.configKey, 'pingbifenlei')
-    assertEqual(result.reason.kind, 'block')
-    assertEqual(result.reason.rule, '微博|赚客吧')
+    assertEqual(result.passed, false, 'result.passed 应等于 false')
+    assertEqual(result.reason.configKey, 'pingbifenlei', 'result.reason.configKey 应等于 \'pingbifenlei\'')
+    assertEqual(result.reason.kind, 'block', 'result.reason.kind 应等于 \'block\'')
+    assertEqual(result.reason.rule, '微博|赚客吧', 'result.reason.rule 应等于 \'微博|赚客吧\'')
   })
 
   await test('过滤解释：楼主保护记录被跳过的标题屏蔽', () => {
     const result = explainFilter(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbibiaoti: '京东' }))
-    assertEqual(result.passed, true)
-    assertEqual(result.protections[0].configKey, 'zhanxianlouzhu')
-    assertEqual(result.skipped[0].configKey, 'pingbibiaoti')
-    assertEqual(result.skipped[0].because, 'louzhu.show')
+    assertEqual(result.passed, true, 'result.passed 应等于 true')
+    assertEqual(result.protections[0].configKey, 'zhanxianlouzhu', 'result.protections[0].configKey 应等于 \'zhanxianlouzhu\'')
+    assertEqual(result.skipped[0].configKey, 'pingbibiaoti', 'result.skipped[0].configKey 应等于 \'pingbibiaoti\'')
+    assertEqual(result.skipped[0].because, 'louzhu.show', 'result.skipped[0].because 应等于 \'louzhu.show\'')
   })
 
   await test('过滤解释：同字段强化屏蔽抵消保护记录', () => {
     const result = explainFilter(makeItem(), compileRules({ zhanxianlouzhu: '小明', pingbilouzhuplus: '小明' }))
-    assertEqual(result.passed, false)
-    assertEqual(result.reason.configKey, 'pingbilouzhuplus')
-    assertEqual(result.protections.length, 0)
+    assertEqual(result.passed, false, 'result.passed 应等于 false')
+    assertEqual(result.reason.configKey, 'pingbilouzhuplus', 'result.reason.configKey 应等于 \'pingbilouzhuplus\'')
+    assertEqual(result.protections.length, 0, 'result.protections.length 应等于 0')
   })
 
   await test('过滤解释：多行分类规则记录实际命中行', () => {
     const result = explainFilter(makeItem({ catename: '数码', title: '耳机优惠' }), compileRules({ pingbibiaoti: '美妆###口红\n数码###耳机' }))
-    assertEqual(result.passed, false)
-    assertEqual(result.reason.rule, '数码###耳机')
+    assertEqual(result.passed, false, 'result.passed 应等于 false')
+    assertEqual(result.reason.rule, '数码###耳机', 'result.reason.rule 应等于 \'数码###耳机\'')
   })
 
   await test('过滤解释：后续未生效的展现规则不混入屏蔽诊断', () => {
     const result = explainFilter(makeItem({ louzhu: 'bad', title: 'vip' }), compileRules({ pingbilouzhu: 'bad', zhanxianbiaoti: 'vip' }))
-    assertEqual(result.passed, false)
-    assertEqual(result.reason.configKey, 'pingbilouzhu')
-    assertEqual(result.protections.length, 0)
-    assertEqual(result.skipped.length, 0)
+    assertEqual(result.passed, false, 'result.passed 应等于 false')
+    assertEqual(result.reason.configKey, 'pingbilouzhu', 'result.reason.configKey 应等于 \'pingbilouzhu\'')
+    assertEqual(result.protections.length, 0, 'result.protections.length 应等于 0')
+    assertEqual(result.skipped.length, 0, 'result.skipped.length 应等于 0')
   })
 
   await test('过滤解释：原始配置编译异常时告警并保守放行', () => {
@@ -379,51 +444,51 @@ console.log('========================================\n');
     const warnings = []
     try {
       console.warn = (...args) => warnings.push(args.join(' '))
-      assertEqual(explainFilter(makeItem(), cfg).passed, true)
+      assertEqual(explainFilter(makeItem(), cfg).passed, true, 'explainFilter(makeItem(), cfg).passed 应等于 true')
     } finally {
       console.warn = originalWarn
     }
-    assertEqual(warnings.some(message => message.includes('过滤规则编译失败')), true)
+    assertEqual(warnings.some(message => message.includes('过滤规则编译失败')), true, 'warnings.some(message => message.includes(\'过滤规则编译失败\')) 应等于 true')
   })
 
   // ==================== 2. 分类屏蔽 ====================
   console.log('\n📂 2. 分类屏蔽')
 
   await test('分类屏蔽命中 → 被屏蔽', () => {
-    assertEqual(listfilter(makeItem({ catename: '赚客吧' }), { pingbifenlei: '赚客吧' }), false)
+    assertEqual(listfilter(makeItem({ catename: '赚客吧' }), { pingbifenlei: '赚客吧' }), false, 'listfilter(makeItem({ catename: \'赚客吧\' }), { pingbifenlei: \'赚客吧\' }) 应等于 false')
   })
 
   await test('分类屏蔽未命中 → 保留', () => {
-    assertEqual(listfilter(makeItem(), { pingbifenlei: '赚客吧' }), true)
+    assertEqual(listfilter(makeItem(), { pingbifenlei: '赚客吧' }), true, 'listfilter(makeItem(), { pingbifenlei: \'赚客吧\' }) 应等于 true')
   })
 
   await test('分类屏蔽支持正则', () => {
-    assertEqual(listfilter(makeItem(), { pingbifenlei: '微博' }), false)
-    assertEqual(listfilter(makeItem({ catename: '赚客吧' }), { pingbifenlei: '微博' }), true)
+    assertEqual(listfilter(makeItem(), { pingbifenlei: '微博' }), false, 'listfilter(makeItem(), { pingbifenlei: \'微博\' }) 应等于 false')
+    assertEqual(listfilter(makeItem({ catename: '赚客吧' }), { pingbifenlei: '微博' }), true, 'listfilter(makeItem({ catename: \'赚客吧\' }), { pingbifenlei: \'微博\' }) 应等于 true')
   })
 
   await test('分类屏蔽 正则 OR 匹配', () => {
-    assertEqual(listfilter(makeItem({ catename: '赚客吧' }), { pingbifenlei: '微博|赚客吧' }), false)
-    assertEqual(listfilter(makeItem({ catename: '好单线报' }), { pingbifenlei: '微博|赚客吧' }), true)
+    assertEqual(listfilter(makeItem({ catename: '赚客吧' }), { pingbifenlei: '微博|赚客吧' }), false, 'listfilter(makeItem({ catename: \'赚客吧\' }), { pingbifenlei: \'微博|赚客吧\' }) 应等于 false')
+    assertEqual(listfilter(makeItem({ catename: '好单线报' }), { pingbifenlei: '微博|赚客吧' }), true, 'listfilter(makeItem({ catename: \'好单线报\' }), { pingbifenlei: \'微博|赚客吧\' }) 应等于 true')
   })
 
   // ==================== 3. 楼主过滤 ====================
   console.log('\n📂 3. 楼主过滤')
 
   await test('楼主屏蔽命中 → 被屏蔽', () => {
-    assertEqual(listfilter(makeItem({ louzhu: '小黑' }), { pingbilouzhu: '小黑' }), false)
+    assertEqual(listfilter(makeItem({ louzhu: '小黑' }), { pingbilouzhu: '小黑' }), false, 'listfilter(makeItem({ louzhu: \'小黑\' }), { pingbilouzhu: \'小黑\' }) 应等于 false')
   })
 
   await test('楼主屏蔽未命中 → 保留', () => {
-    assertEqual(listfilter(makeItem(), { pingbilouzhu: '小黑' }), true)
+    assertEqual(listfilter(makeItem(), { pingbilouzhu: '小黑' }), true, 'listfilter(makeItem(), { pingbilouzhu: \'小黑\' }) 应等于 true')
   })
 
   await test('楼主强制展现 → 即使楼主屏蔽也保留', () => {
-    assertEqual(listfilter(makeItem(), { pingbilouzhu: '小明', zhanxianlouzhu: '小明' }), true)
+    assertEqual(listfilter(makeItem(), { pingbilouzhu: '小明', zhanxianlouzhu: '小明' }), true, 'listfilter(makeItem(), { pingbilouzhu: \'小明\', zhanxianlouzhu: \'小明\' }) 应等于 true')
   })
 
   await test('楼主强化屏蔽 → 抵消强制展现', () => {
-    assertEqual(listfilter(makeItem(), { zhanxianlouzhu: '小明', pingbilouzhuplus: '小明' }), false)
+    assertEqual(listfilter(makeItem(), { zhanxianlouzhu: '小明', pingbilouzhuplus: '小明' }), false, 'listfilter(makeItem(), { zhanxianlouzhu: \'小明\', pingbilouzhuplus: \'小明\'… 应等于 false')
   })
 
   await test('楼主强化屏蔽不匹配 → 强制展现生效', () => {
@@ -431,7 +496,7 @@ console.log('========================================\n');
       pingbilouzhu: '小明', // 屏蔽命中
       zhanxianlouzhu: '小明', // 强制展现命中
       pingbilouzhuplus: '小黑' // 强化屏蔽不匹配 → 不抵消
-    }), true) // 强制展现 > 屏蔽
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\' }), { pingbilouzhu: \'小明\', // 屏蔽命中 … 应等于 true') // 强制展现 > 屏蔽
   })
 
   await test('楼主强化屏蔽未配置 → 普通屏蔽生效', () => {
@@ -439,26 +504,26 @@ console.log('========================================\n');
       pingbilouzhu: '小黑',
       zhanxianlouzhu: '' // 无强制展现
       // plus 未配置
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小黑\' }), { pingbilouzhu: \'小黑\', zhanxian… 应等于 false')
   })
 
   // ==================== 4. 标题过滤 ====================
   console.log('\n📂 4. 标题过滤')
 
   await test('标题屏蔽命中 → 被屏蔽', () => {
-    assertEqual(listfilter(makeItem(), { pingbibiaoti: '京东' }), false)
+    assertEqual(listfilter(makeItem(), { pingbibiaoti: '京东' }), false, 'listfilter(makeItem(), { pingbibiaoti: \'京东\' }) 应等于 false')
   })
 
   await test('标题强制展现 → 即使标题屏蔽也保留', () => {
-    assertEqual(listfilter(makeItem(), { pingbibiaoti: '京东', zhanxianbiaoti: '京东' }), true)
+    assertEqual(listfilter(makeItem(), { pingbibiaoti: '京东', zhanxianbiaoti: '京东' }), true, 'listfilter(makeItem(), { pingbibiaoti: \'京东\', zhanxianbiaoti: \'京东\' }) 应等于 true')
   })
 
   await test('标题强化屏蔽 → 抵消标题强制展现', () => {
-    assertEqual(listfilter(makeItem(), { zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' }), false)
+    assertEqual(listfilter(makeItem(), { zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' }), false, 'listfilter(makeItem(), { zhanxianbiaoti: \'京东\', pingbibiaotiplus: \'京东\'… 应等于 false')
   })
 
   await test('楼主强制展现时 → 标题屏蔽不生效', () => {
-    assertEqual(listfilter(makeItem(), { zhanxianlouzhu: '小明', pingbibiaoti: '京东' }), true)
+    assertEqual(listfilter(makeItem(), { zhanxianlouzhu: '小明', pingbibiaoti: '京东' }), true, 'listfilter(makeItem(), { zhanxianlouzhu: \'小明\', pingbibiaoti: \'京东\' }) 应等于 true')
   })
 
   await test('标题强化屏蔽不匹配 → 强制展现生效', () => {
@@ -466,7 +531,7 @@ console.log('========================================\n');
       pingbibiaoti: '京东',
       zhanxianbiaoti: '京东',
       pingbibiaotiplus: '淘宝' // 不匹配
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'京东神券\' }), { pingbibiaoti: \'京东\', zhanxia… 应等于 true')
   })
 
   await test('标题三种同时配置 → 强化屏蔽优先', () => {
@@ -474,33 +539,33 @@ console.log('========================================\n');
       zhanxianbiaoti: '京东', // 强制展现
       pingbibiaotiplus: '京东', // 强化屏蔽 → 抵消强制展现
       pingbibiaoti: '' // 无普通屏蔽
-    }), false)
+    }), false, 'listfilter(makeItem({ title: \'京东神券\' }), { zhanxianbiaoti: \'京东\', // 强制… 应等于 false')
   })
 
   // ==================== 5. 内容过滤 ====================
   console.log('\n📂 5. 内容过滤')
 
   await test('内容屏蔽命中 → 被屏蔽', () => {
-    assertEqual(listfilter(makeItem(), { pingbineirong: '限时抢购' }), false)
+    assertEqual(listfilter(makeItem(), { pingbineirong: '限时抢购' }), false, 'listfilter(makeItem(), { pingbineirong: \'限时抢购\' }) 应等于 false')
   })
 
   await test('内容强制展现 → 即使内容屏蔽也保留', () => {
-    assertEqual(listfilter(makeItem(), { pingbineirong: '限时抢购', zhanxianneirong: '限时抢购' }), true)
+    assertEqual(listfilter(makeItem(), { pingbineirong: '限时抢购', zhanxianneirong: '限时抢购' }), true, 'listfilter(makeItem(), { pingbineirong: \'限时抢购\', zhanxianneirong: \'限时抢… 应等于 true')
   })
 
   await test('标题强制展现时 → 内容屏蔽不生效', () => {
-    assertEqual(listfilter(makeItem(), { zhanxianbiaoti: '京东', pingbineirong: '广告内容' }), true)
+    assertEqual(listfilter(makeItem(), { zhanxianbiaoti: '京东', pingbineirong: '广告内容' }), true, 'listfilter(makeItem(), { zhanxianbiaoti: \'京东\', pingbineirong: \'广告内容\' … 应等于 true')
   })
 
   await test('楼主强制展现时 → 内容屏蔽不生效', () => {
-    assertEqual(listfilter(makeItem(), { zhanxianlouzhu: '小明', pingbineirong: '广告内容' }), true)
+    assertEqual(listfilter(makeItem(), { zhanxianlouzhu: '小明', pingbineirong: '广告内容' }), true, 'listfilter(makeItem(), { zhanxianlouzhu: \'小明\', pingbineirong: \'广告内容\' … 应等于 true')
   })
 
   await test('内容强化屏蔽 → 抵消内容强制展现', () => {
     assertEqual(listfilter(makeItem({ content: '限时抢购' }), {
       zhanxianneirong: '限时抢购',
       pingbineirongplus: '限时抢购'
-    }), false)
+    }), false, 'listfilter(makeItem({ content: \'限时抢购\' }), { zhanxianneirong: \'限时抢购\', … 应等于 false')
   })
 
   await test('楼主+标题同时强制展现 → 内容屏蔽不生效', () => {
@@ -508,7 +573,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianbiaoti: '京东',
       pingbineirong: '广告内容'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\', content: \'广告内容\' }), … 应等于 true')
   })
 
   await test('内容三级：屏蔽+展现+强化 → 强化屏蔽优先', () => {
@@ -516,37 +581,37 @@ console.log('========================================\n');
       pingbineirong: '广告内容',
       zhanxianneirong: '广告内容',
       pingbineirongplus: '广告内容'
-    }), false) // 强化屏蔽 > 强制展现 > 普通屏蔽
+    }), false, 'listfilter(makeItem({ content: \'广告内容\' }), { pingbineirong: \'广告内容\', zh… 应等于 false') // 强化屏蔽 > 强制展现 > 普通屏蔽
   })
 
   // ==================== 6. 天数过滤 ====================
   console.log('\n📂 6. 天数过滤')
 
   await test('设定值(5) > 注册天数(2) → 新号被拦截', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '5' }), false)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '5' }), false, 'listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: \'5\'… 应等于 false')
   })
 
   await test('设定值(3) < 注册天数(100) → 老号通过', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(100) }), { pingbitime: '3' }), true)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(100) }), { pingbitime: '3' }), true, 'listfilter(makeItem({ louzhuregtime: daysAgo(100) }), { pingbitime: \'… 应等于 true')
   })
 
   await test('设定值=0 → 不拦截任何人', () => {
     // pingbitime=0, 0不可能大于任何天数 → 永远不拦截
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: '0' }), true)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: '0' }), true, 'listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: \'0\'… 应等于 true')
   })
 
   await test('分类限定天数：匹配分类 → 拦截', () => {
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }),
       { pingbitime: '微博线报###5' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'微博线报\', louzhuregtime: daysAgo(4) })… 应等于 false')
   })
 
   await test('分类限定天数：不匹配分类 → 不拦截', () => {
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(4) }),
       { pingbitime: '微博线报###5' }
-    ), true)
+    ), true, 'listfilter( makeItem({ catename: \'赚客吧\', louzhuregtime: daysAgo(4) }),… 应等于 true')
   })
 
   await test('天数 + 分类屏蔽同时生效 → 任一拦截即屏蔽', () => {
@@ -554,12 +619,12 @@ console.log('========================================\n');
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }),
       { pingbifenlei: '赚客吧', pingbitime: '微博线报###5' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'微博线报\', louzhuregtime: daysAgo(4) })… 应等于 false')
     // 分类拦截
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', louzhuregtime: '2026-01-01' }),
       { pingbifenlei: '赚客吧', pingbitime: '微博线报###5' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'赚客吧\', louzhuregtime: \'2026-01-01\' }… 应等于 false')
   })
 
   await test('多行 pingbitime 空值行 → 跳过不生成 0 天规则（v3.238）', () => {
@@ -568,12 +633,12 @@ console.log('========================================\n');
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhuregtime: new Date().toISOString() }),
       { pingbitime: '微博线报###' }
-    ), true)
+    ), true, 'listfilter( makeItem({ catename: \'微博线报\', louzhuregtime: new Date().to… 应等于 true')
   })
 
   await test('多行分类 0/false 参与匹配（v3.270）', () => {
-    assertEqual(listfilter({ catename: 0, louzhu: 'u', title: 'x', content: 'x' }, compileRules({ pingbilouzhu: '0###u' })), false)
-    assertEqual(listfilter({ catename: false, louzhu: 'u', title: 'x', content: 'x' }, compileRules({ pingbilouzhu: 'false###u' })), false)
+    assertEqual(listfilter({ catename: 0, louzhu: 'u', title: 'x', content: 'x' }, compileRules({ pingbilouzhu: '0###u' })), false, 'listfilter({ catename: 0, louzhu: \'u\', title: \'x\', content: \'x\' }, co… 应等于 false')
+    assertEqual(listfilter({ catename: false, louzhu: 'u', title: 'x', content: 'x' }, compileRules({ pingbilouzhu: 'false###u' })), false, 'listfilter({ catename: false, louzhu: \'u\', title: \'x\', content: \'x\' }… 应等于 false')
   })
 
   // ==================== 7. 多分类模式（###） ====================
@@ -583,28 +648,28 @@ console.log('========================================\n');
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', louzhu: '黑名单用户' }),
       { pingbilouzhu: '赚客吧###黑名单用户' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'赚客吧\', louzhu: \'黑名单用户\' }), { pingbil… 应等于 false')
   })
 
   await test('分类不匹配 → 不屏蔽', () => {
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhu: '黑名单用户' }),
       { pingbilouzhu: '赚客吧###黑名单用户' }
-    ), true)
+    ), true, 'listfilter( makeItem({ catename: \'微博线报\', louzhu: \'黑名单用户\' }), { pingbi… 应等于 true')
   })
 
   await test('分类+关键词 标题屏蔽', () => {
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', title: '违规内容' }),
       { pingbibiaoti: '赚客吧###违规' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'赚客吧\', title: \'违规内容\' }), { pingbibia… 应等于 false')
   })
 
   await test('分类+关键词 内容屏蔽', () => {
     assertEqual(listfilter(
       makeItem({ catename: '好单线报', content: '下单联系微信' }),
       { pingbineirong: '好单线报###微信' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'好单线报\', content: \'下单联系微信\' }), { ping… 应等于 false')
   })
 
   // ==================== 8. 多行配置模式（<br> / \n\n） ====================
@@ -614,96 +679,96 @@ console.log('========================================\n');
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhu: '小黑' }),
       { pingbilouzhu: '赚客吧###黑名单<br>微博线报###小黑' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'微博线报\', louzhu: \'小黑\' }), { pingbilou… 应等于 false')
   })
 
   await test('<br> 多行楼主：都不匹配 → 保留', () => {
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhu: '小白' }),
       { pingbilouzhu: '赚客吧###黑名单<br>微博线报###小黑' }
-    ), true)
+    ), true, 'listfilter( makeItem({ catename: \'微博线报\', louzhu: \'小白\' }), { pingbilou… 应等于 true')
   })
 
   await test('\\n\\n 多行标题：某行匹配 → 被屏蔽', () => {
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', title: '违规标题' }),
       { pingbibiaoti: '违规标题' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'赚客吧\', title: \'违规标题\' }), { pingbibia… 应等于 false')
   })
 
   await test('混合 <br> + \\n\\n：任意匹配 → 被屏蔽', () => {
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', title: '特价商品' }),
       { pingbibiaoti: '特价商品' }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'赚客吧\', title: \'特价商品\' }), { pingbibia… 应等于 false')
   })
 
   await test('多行天数：匹配分类且超阈值 → 拦截', () => {
     assertEqual(listfilter(
       makeItem({ catename: '赚客吧', louzhuregtime: daysAgo(4) }),
       { pingbitime: '微博线报###3<br>赚客吧###5' }
-    ), false) // 第二行 5>2 → 拦截
+    ), false, 'listfilter( makeItem({ catename: \'赚客吧\', louzhuregtime: daysAgo(4) }),… 应等于 false') // 第二行 5>2 → 拦截
   })
 
   await test('多行天数：匹配分类但未超阈值 → 不拦截', () => {
     assertEqual(listfilter(
       makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }),
       { pingbitime: '赚客吧###5<br>微博线报###1' }
-    ), true) // 第二行 1>2? 否 → 保留
+    ), true, 'listfilter( makeItem({ catename: \'微博线报\', louzhuregtime: daysAgo(4) })… 应等于 true') // 第二行 1>2? 否 → 保留
   })
 
   // ==================== 9. 只看它模式 ====================
   console.log('\n📂 9. 只看它模式')
 
   await test('只看它空配置 → 全部展现', () => {
-    assertEqual(listfilter(makeItem(), { pingbibiaoti: '(.*)', zhanxianbiaoti: '(.*)' }), true)
+    assertEqual(listfilter(makeItem(), { pingbibiaoti: '(.*)', zhanxianbiaoti: '(.*)' }), true, 'listfilter(makeItem(), { pingbibiaoti: \'(.*)\', zhanxianbiaoti: \'(.*)\'… 应等于 true')
   })
 
   await test('只看它关键词不匹配 → 屏蔽', () => {
     assertEqual(listfilter(makeItem({ title: '淘宝特价' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: '京东'
-    }), false)
+    }), false, 'listfilter(makeItem({ title: \'淘宝特价\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 false')
   })
 
   await test('只看它关键词匹配 → 保留', () => {
     assertEqual(listfilter(makeItem({ title: '京东神券' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: '京东'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'京东神券\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 true')
   })
 
   await test('只看它 + 强化屏蔽 → 匹配强化则屏蔽', () => {
     assertEqual(listfilter(makeItem({ title: '京东神券' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: '(.*)', pingbibiaotiplus: '京东'
-    }), false)
+    }), false, 'listfilter(makeItem({ title: \'京东神券\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 false')
   })
 
   await test('只看它 + 强化屏蔽不匹配 → 保留', () => {
     assertEqual(listfilter(makeItem({ title: '淘宝特价' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: '(.*)', pingbibiaotiplus: '京东'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'淘宝特价\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 true')
   })
 
   await test('只看它 + 楼主强制展现 → 标题屏蔽不执行', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小明', title: '随便' }), {
       zhanxianlouzhu: '小明', pingbibiaoti: '(.*)'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'随便\' }), { zhanxianlouzhu:… 应等于 true')
   })
 
   await test('只看它完整流程模拟（zkt_gjc 为空）', () => {
     const zkt_gjc = ''
     assertEqual(listfilter(makeItem({ title: '京东神券' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: zkt_gjc || '(.*)'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'京东神券\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 true')
   })
 
   await test('只看它完整流程模拟（zkt_gjc=京东）', () => {
     const zkt_gjc = '京东'
     assertEqual(listfilter(makeItem({ title: '京东神券' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: zkt_gjc || '(.*)'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'京东神券\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 true')
     assertEqual(listfilter(makeItem({ title: '淘宝特价' }), {
       pingbibiaoti: '(.*)', zhanxianbiaoti: zkt_gjc || '(.*)'
-    }), false)
+    }), false, 'listfilter(makeItem({ title: \'淘宝特价\' }), { pingbibiaoti: \'(.*)\', zhanx… 应等于 false')
   })
 
   // ==================== 10. 边界与异常 ====================
@@ -713,41 +778,41 @@ console.log('========================================\n');
     assertEqual(listfilter(
       makeItem({ title: '', content: '', louzhu: '' }),
       { pingbibiaoti: '京东', pingbineirong: '活动' }
-    ), true)
+    ), true, 'listfilter( makeItem({ title: \'\', content: \'\', louzhu: \'\' }), { pingb… 应等于 true')
   })
 
   await test('正则 OR 多关键词 → 任一命中即屏蔽', () => {
-    assertEqual(listfilter(makeItem(), { pingbibiaoti: '京东|淘宝' }), false)
+    assertEqual(listfilter(makeItem(), { pingbibiaoti: '京东|淘宝' }), false, 'listfilter(makeItem(), { pingbibiaoti: \'京东|淘宝\' }) 应等于 false')
   })
 
   await test('输入数据缺失 → 不崩溃', () => {
-    assertEqual(listfilter({ catename: '测试' }, {}), true)
-    assertEqual(listfilter({}, {}), true)
+    assertEqual(listfilter({ catename: '测试' }, {}), true, 'listfilter({ catename: \'测试\' }, {}) 应等于 true')
+    assertEqual(listfilter({}, {}), true, 'listfilter({}, {}) 应等于 true')
   })
 
   await test('配置含未知字段 → 不影响', () => {
     assertEqual(listfilter(makeItem(), {
       pingbibiaoti: '京东', unknownField: '测试', foo: 'bar'
-    }), false)
+    }), false, 'listfilter(makeItem(), { pingbibiaoti: \'京东\', unknownField: \'测试\', foo:… 应等于 false')
   })
 
   await test('标题含正则特殊字符 → 可转义匹配', () => {
     assertEqual(listfilter(
       makeItem({ title: '测试[特价]商品' }),
       { pingbibiaoti: '\\[特价\\]' }
-    ), false)
+    ), false, 'listfilter( makeItem({ title: \'测试[特价]商品\' }), { pingbibiaoti: \'\\\\[特价\\\\… 应等于 false')
   })
 
   await test('配置 undefined / null → 不崩溃', () => {
-    assertEqual(listfilter(makeItem(), undefined), true)
-    assertEqual(listfilter(makeItem(), null), true)
+    assertEqual(listfilter(makeItem(), undefined), true, 'listfilter(makeItem(), undefined) 应等于 true')
+    assertEqual(listfilter(makeItem(), null), true, 'listfilter(makeItem(), null) 应等于 true')
   })
 
   await test('超大数值 → 不溢出', () => {
     assertEqual(listfilter(
       makeItem({ louzhuregtime: daysAgo(3) }),
       { pingbitime: '999999' }
-    ), false)
+    ), false, 'listfilter( makeItem({ louzhuregtime: daysAgo(3) }), { pingbitime: \'9… 应等于 false')
   })
 
   // ==================== 11. 组合场景 ====================
@@ -775,7 +840,7 @@ console.log('========================================\n');
         pingbineirongplus: '虚假|诈骗',
         pingbitime: '30'
       }
-    ), true)
+    ), true, 'listfilter( makeItem({ catename: \'好单线报\', louzhu: \'普通用户\', title: \'普通商品… 应等于 true')
   })
 
   await test('所有配置填满且分类匹配 → 屏蔽', () => {
@@ -788,7 +853,7 @@ console.log('========================================\n');
         pingbineirong: '虚假',
         pingbitime: '200'
       }
-    ), false)
+    ), false, 'listfilter( makeItem({ catename: \'微博线报\', louzhu: \'普通用户\', title: \'普通商品… 应等于 false')
   })
 
   await test('自增天数边界：当天注册 → 被拦截', () => {
@@ -796,14 +861,14 @@ console.log('========================================\n');
     assertEqual(listfilter(
       makeItem({ louzhuregtime: daysAgo(0) }),
       { pingbitime: '1' }
-    ), false) // 1 > 0 → 拦截
+    ), false, 'listfilter( makeItem({ louzhuregtime: daysAgo(0) }), { pingbitime: \'1… 应等于 false') // 1 > 0 → 拦截
   })
 
   await test('自增天数边界：很久以前注册 → 老号通过', () => {
     assertEqual(listfilter(
       makeItem({ louzhuregtime: '2020-01-01' }),
       { pingbitime: '1000' }
-    ), true) // 1000 > ~2400? 要看实际天数... 假设2020-01-01到2026-07-30约2400天
+    ), true, 'listfilter( makeItem({ louzhuregtime: \'2020-01-01\' }), { pingbitime: … 应等于 true') // 1000 > ~2400? 要看实际天数... 假设2020-01-01到2026-07-30约2400天
     // 如果 1000 > 2400? 否 → 保留
   })
 
@@ -811,15 +876,15 @@ console.log('========================================\n');
   console.log('\n📂 12. filterByKeyword（只看它封装）')
 
   await test('关键词为空 → 全部通过', () => {
-    assertEqual(filterByKeyword(makeItem({ title: '随便' }), ''), true)
+    assertEqual(filterByKeyword(makeItem({ title: '随便' }), ''), true, 'filterByKeyword(makeItem({ title: \'随便\' }), \'\') 应等于 true')
   })
 
   await test('关键词匹配 → 保留', () => {
-    assertEqual(filterByKeyword(makeItem({ title: '京东神券' }), '京东'), true)
+    assertEqual(filterByKeyword(makeItem({ title: '京东神券' }), '京东'), true, 'filterByKeyword(makeItem({ title: \'京东神券\' }), \'京东\') 应等于 true')
   })
 
   await test('关键词不匹配 → 屏蔽', () => {
-    assertEqual(filterByKeyword(makeItem({ title: '淘宝特价' }), '京东'), false)
+    assertEqual(filterByKeyword(makeItem({ title: '淘宝特价' }), '京东'), false, 'filterByKeyword(makeItem({ title: \'淘宝特价\' }), \'京东\') 应等于 false')
   })
 
   await test('只看它 + 楼主强制展现 → 标题过滤被跳过', () => {
@@ -829,7 +894,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       pingbibiaoti: '(.*)',
       zhanxianbiaoti: '京东'
-    }), true) // 楼主强制展现，只看它不生效
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'随便\' }), { zhanxianlouzhu:… 应等于 true') // 楼主强制展现，只看它不生效
   })
 
   // ==================== 13. validateConfig（配置校验） ====================
@@ -841,24 +906,24 @@ console.log('========================================\n');
       pingbibiaoti: '京东|淘宝',
       pingbitime: '5'
     })
-    assertEqual(warns.length, 0)
+    assertEqual(warns.length, 0, 'warns.length 应等于 0')
   })
 
   await test('空配置 → 无警告', () => {
     const warns = validateConfig({})
-    assertEqual(warns.length, 0)
+    assertEqual(warns.length, 0, 'warns.length 应等于 0')
   })
 
   await test('非法正则 → 有警告', () => {
     const warns = validateConfig({ pingbibiaoti: '[未闭合' })
-    assertEqual(warns.length, 1)
-    assertEqual(warns[0].includes('无效') || warns[0].includes('不支持'), true)
+    assertEqual(warns.length, 1, 'warns.length 应等于 1')
+    assertEqual(warns[0].includes('无效') || warns[0].includes('不支持'), true, 'warns[0].includes(\'无效\') || warns[0].includes(\'不支持\') 应等于 true')
   })
 
   await test('非法天数 → 有警告', () => {
     const warns = validateConfig({ pingbitime: 'abc' })
-    assertEqual(warns.length, 1)
-    assertEqual(warns[0].includes('不是有效数字'), true)
+    assertEqual(warns.length, 1, 'warns.length 应等于 1')
+    assertEqual(warns[0].includes('不是有效数字'), true, 'warns[0].includes(\'不是有效数字\') 应等于 true')
   })
 
   await test('zkt_gjc 首尾空白 → 告警（P2：白名单语义下误配空格会静默全量滤空）', () => {
@@ -867,18 +932,18 @@ console.log('========================================\n');
         `应有 zkt_gjc 首尾空白告警: ${warns.join(' | ')}`)
     // 正常关键词不告警（无首尾空白）
     const warns2 = validateConfig({ zkt_gjc: '京东' })
-    assertEqual(warns2.some(w => w.includes('zkt_gjc') && w.includes('首尾空白')), false)
+    assertEqual(warns2.some(w => w.includes('zkt_gjc') && w.includes('首尾空白')), false, 'warns2.some(w => w.includes(\'zkt_gjc\') && w.includes(\'首尾空白\')) 应等于 false')
   })
 
   await test('多分类天数：合法 → 无警告', () => {
     const warns = validateConfig({ pingbitime: '微博线报###5<br>赚客吧###3' })
-    assertEqual(warns.length, 0)
+    assertEqual(warns.length, 0, 'warns.length 应等于 0')
   })
 
   await test('多分类天数：非法 → 有警告', () => {
     const warns = validateConfig({ pingbitime: '微博线报###abc' })
-    assertEqual(warns.length, 1)
-    assertEqual(warns[0].includes('不是有效数字'), true)
+    assertEqual(warns.length, 1, 'warns.length 应等于 1')
+    assertEqual(warns[0].includes('不是有效数字'), true, 'warns[0].includes(\'不是有效数字\') 应等于 true')
   })
 
   await test('多个字段非法 → 多个警告', () => {
@@ -887,13 +952,13 @@ console.log('========================================\n');
       pingbibiaoti: '(',
       pingbitime: 'x'
     })
-    assertEqual(warns.length, 3)
+    assertEqual(warns.length, 3, 'warns.length 应等于 3')
   })
 
   await test('validateConfig ### 多行同源警告去重（v3.257）', () => {
     const warns = validateConfig({ pingbibiaoti: '###x###y\n###x###y' })
-    assertEqual(warns.length, 1)
-    assertEqual(new Set(warns).size, warns.length)
+    assertEqual(warns.length, 1, 'warns.length 应等于 1')
+    assertEqual(new Set(warns).size, warns.length, 'new Set(warns).size 应等于 warns.length')
   })
 
   // ==================== 14. tuisong_replace（模板替换） ====================
@@ -903,7 +968,7 @@ console.log('========================================\n');
     const result = tuisong_replace('{标题} - {内容}', {
       title: '京东神券', content: '限时抢购', url: 'http://xxx', catename: '线报'
     })
-    assertEqual(result, '京东神券 - 限时抢购')
+    assertEqual(result, '京东神券 - 限时抢购', 'result 应等于 \'京东神券 - 限时抢购\'')
   })
 
   await test('全部占位符都替换', () => {
@@ -914,21 +979,21 @@ console.log('========================================\n');
       datetime: '2026-07-30',
       shorttime: '01:30'
     })
-    assertEqual(result, '【微博线报】神价 2026-07-30 01:30')
+    assertEqual(result, '【微博线报】神价 2026-07-30 01:30', 'result 应等于 \'【微博线报】神价 2026-07-30 01:30\'')
   })
 
   await test('含 $ 符号的内容不被错误解释', () => {
     const result = tuisong_replace('{标题}', {
       title: '仅需$9.9 $&超值', url: 'http://x', catename: '线报'
     })
-    assertEqual(result, '仅需$9.9 $&超值')
+    assertEqual(result, '仅需$9.9 $&超值', 'result 应等于 \'仅需$9.9 $&超值\'')
   })
 
   await test('不存在的占位符保持原样', () => {
     const result = tuisong_replace('{标题} {不存在的占位符}', {
       title: '测试', url: 'http://x', catename: '线报'
     })
-    assertEqual(result, '测试 {不存在的占位符}')
+    assertEqual(result, '测试 {不存在的占位符}', 'result 应等于 \'测试 {不存在的占位符}\'')
   })
 
   await test('字段为 undefined → 替换为空', () => {
@@ -936,7 +1001,7 @@ console.log('========================================\n');
       title: '测试', url: 'http://x', catename: '线报'
       // 没有 louzhu 字段
     })
-    assertEqual(result, '【线报】')
+    assertEqual(result, '【线报】', 'result 应等于 \'【线报】\'')
   })
 
   await test('posttime 时间戳 → 正确格式化', () => {
@@ -951,7 +1016,7 @@ console.log('========================================\n');
       shorttime: undefined
     })
     // posttime 被解析，datetime/shorttime 被计算出来
-    assertEqual(result.includes('2026'), true)
+    assertEqual(result.includes('2026'), true, 'result.includes(\'2026\') 应等于 true')
   })
 
   await test('shijianchuo 时间戳 → 正确格式化', () => {
@@ -963,7 +1028,7 @@ console.log('========================================\n');
       datetime: undefined,
       shorttime: undefined
     })
-    assertEqual(result.includes('2026'), true)
+    assertEqual(result.includes('2026'), true, 'result.includes(\'2026\') 应等于 true')
   })
 
   await test('数据源已有 datetime → 保留原始值', () => {
@@ -976,7 +1041,7 @@ console.log('========================================\n');
       shorttime: '01:30'
     })
     // 即使有时间戳，也优先用数据源的 datetime
-    assertEqual(result, '2026-07-30 01:30')
+    assertEqual(result, '2026-07-30 01:30', 'result 应等于 \'2026-07-30 01:30\'')
   })
 
   // ==================== 15. htmlToMarkdown（HTML转Markdown） ====================
@@ -984,15 +1049,14 @@ console.log('========================================\n');
 
   await test('空内容 → 返回空', () => {
     const result = htmlToMarkdown({ url: 'http://x' })
-    assertEqual(result.includes('原文链接'), true)
-    assertEqual(result.includes('http://x'), true)
+    assertEqual(result.includes('http://x'), true, 'result.includes(\'http://x\') 应等于 true')
   })
 
   await test('HTML 纯文本尖括号保留（v3.270）', () => {
-    assertEqual(htmlToMarkdown({ content_html: '2 < 3 > 1', url: '' }), '2 < 3 > 1')
-    assertEqual(htmlToMarkdown({ content_html: 'hello <world>', url: '' }), 'hello <world>')
-    assertEqual(htmlToMarkdown({ content_html: '<foo>İ</foo>', url: '' }), 'İ')
-    assertEqual(htmlToMarkdown({ content_html: '<foo><bar title="</foo>">text</bar>', url: '' }), '<foo>text')
+    assertEqual(htmlToMarkdown({ content_html: '2 < 3 > 1', url: '' }), '2 < 3 > 1', 'htmlToMarkdown({ content_html: \'2 < 3 > 1\', url: \'\' }) 应等于 \'2 < 3 > 1\'')
+    assertEqual(htmlToMarkdown({ content_html: 'hello <world>', url: '' }), 'hello <world>', 'htmlToMarkdown({ content_html: \'hello <world>\', url: \'\' }) 应等于 \'hello <world>\'')
+    assertEqual(htmlToMarkdown({ content_html: '<foo>İ</foo>', url: '' }), 'İ', 'htmlToMarkdown({ content_html: \'<foo>İ</foo>\', url: \'\' }) 应等于 \'İ\'')
+    assertEqual(htmlToMarkdown({ content_html: '<foo><bar title="</foo>">text</bar>', url: '' }), '<foo>text', 'htmlToMarkdown({ content_html: \'<foo><bar title="</foo>">text</bar>\',… 应等于 \'<foo>text\'')
   })
 
   await test('HTML 标签被正确转换', () => {
@@ -1000,8 +1064,7 @@ console.log('========================================\n');
       content_html: '<a href="http://url">链接</a><br>下一行',
       url: 'http://x'
     })
-    assertEqual(result.includes('[链接](http://url)'), true)
-    assertEqual(result.includes('原文链接'), true)
+    assertEqual(result.includes('[链接](http://url)'), true, 'result.includes(\'[链接](http://url)\') 应等于 true')
   })
 
   await test('图片标签被转换', () => {
@@ -1009,7 +1072,7 @@ console.log('========================================\n');
       content_html: '<img src="http://pic.jpg" alt="图片描述">',
       url: 'http://x'
     })
-    assertEqual(result.includes('![图片描述](http://pic.jpg)'), true)
+    assertEqual(result.includes('![图片描述](http://pic.jpg)'), true, 'result.includes(\'![图片描述](http://pic.jpg)\') 应等于 true')
   })
 
   await test('标题标签被转换', () => {
@@ -1017,7 +1080,7 @@ console.log('========================================\n');
       content_html: '<h2>二级标题</h2>',
       url: 'http://x'
     })
-    assertEqual(result.includes('## 二级标题'), true)
+    assertEqual(result.includes('## 二级标题'), true, 'result.includes(\'## 二级标题\') 应等于 true')
   })
 
   await test('htmlToMarkdown 字面 &lt;a&gt; 文本保留（#098）', () => {
@@ -1114,12 +1177,12 @@ console.log('========================================\n');
   console.log('\n📂 16. 缓存管理')
 
   await test('getFileName 从 URL 提取文件名', () => {
-    assertEqual(getFileName('http://x.com/push.json'), 'push.json')
-    assertEqual(getFileName('http://x.com/a/b/123.json'), '123.json')
+    assertEqual(getFileName('http://x.com/push.json'), 'push.json', 'getFileName(\'http://x.com/push.json\') 应等于 \'push.json\'')
+    assertEqual(getFileName('http://x.com/a/b/123.json'), '123.json', 'getFileName(\'http://x.com/a/b/123.json\') 应等于 \'123.json\'')
   })
 
   await test('getFileName 补全 .json 后缀', () => {
-    assertEqual(getFileName('http://x.com/abc'), 'abc.json')
+    assertEqual(getFileName('http://x.com/abc'), 'abc.json', 'getFileName(\'http://x.com/abc\') 应等于 \'abc.json\'')
   })
 
   await test('新增消息 → 可查到', () => {
@@ -1130,8 +1193,8 @@ console.log('========================================\n');
     // 新增
     appendMessageToFile(msg, name)
     const after = isMessageInFile(msg, name)
-    assertEqual(before, false)
-    assertEqual(after, true)
+    assertEqual(before, false, 'before 应等于 false')
+    assertEqual(after, true, 'after 应等于 true')
   })
 
   await test('重复消息 → 去重', () => {
@@ -1141,7 +1204,7 @@ console.log('========================================\n');
     appendMessageToFile(msg, name)
     // 只应该存了一条
     const result = isMessageInFile(msg, name)
-    assertEqual(result, true)
+    assertEqual(result, true, 'result 应等于 true')
   })
 
   // ==================== 17. listfilter 更多级联组合 ====================
@@ -1152,7 +1215,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianbiaoti: '京东',
       pingbineirong: '广告'
-    }), true) // 楼主和标题都强制展现，内容屏蔽被跳过
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\', content: \'广告\' }), { … 应等于 true') // 楼主和标题都强制展现，内容屏蔽被跳过
   })
 
   await test('楼主强制展现 + 标题强化屏蔽 → 标题被屏蔽', () => {
@@ -1160,7 +1223,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianbiaoti: '京东',
       pingbibiaotiplus: '京东'
-    }), true) // 楼主强制展现时，标题强化屏蔽也被跳过（原版设计）
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\' }), { zhanxianlouzhu:… 应等于 true') // 楼主强制展现时，标题强化屏蔽也被跳过（原版设计）
   })
 
   await test('只看它 + 天数过滤组合', () => {
@@ -1169,7 +1232,7 @@ console.log('========================================\n');
       pingbibiaoti: '(.*)',
       zhanxianbiaoti: '京东',
       pingbitime: '5'
-    }), false) // 只看它不匹配
+    }), false, 'listfilter(makeItem({ title: \'淘宝\', louzhuregtime: daysAgo(4) }), { pi… 应等于 false') // 只看它不匹配
   })
 
   await test('只看它匹配 + 天数过滤拦截 → 被拦截', () => {
@@ -1177,14 +1240,14 @@ console.log('========================================\n');
       pingbibiaoti: '(.*)',
       zhanxianbiaoti: '京东',
       pingbitime: '5'
-    }), false) // 只看它匹配了，但天数过滤 5>1 拦截
+    }), false, 'listfilter(makeItem({ title: \'京东\', louzhuregtime: daysAgo(4) }), { pi… 应等于 false') // 只看它匹配了，但天数过滤 5>1 拦截
   })
 
   await test('天数过滤 + 分类屏蔽 同时生效', () => {
     assertEqual(listfilter(makeItem({ catename: '微博线报', louzhuregtime: daysAgo(4) }), {
       pingbifenlei: '微博',
       pingbitime: '5'
-    }), false) // 分类匹配即拦截，天数还没走到
+    }), false, 'listfilter(makeItem({ catename: \'微博线报\', louzhuregtime: daysAgo(4) }),… 应等于 false') // 分类匹配即拦截，天数还没走到
   })
 
   await test('楼主内容双屏蔽 + 标题强制展现', () => {
@@ -1192,7 +1255,7 @@ console.log('========================================\n');
       pingbilouzhu: '小黑',
       zhanxianbiaoti: '京东',
       pingbineirong: '广告'
-    }), false) // 楼主屏蔽命中，直接返回false，后面的不执行
+    }), false, 'listfilter(makeItem({ louzhu: \'小黑\', title: \'京东\', content: \'广告\' }), { … 应等于 false') // 楼主屏蔽命中，直接返回false，后面的不执行
   })
 
   // ==================== 18. tuisong_replace 更多场景 ====================
@@ -1202,28 +1265,28 @@ console.log('========================================\n');
     const r = tuisong_replace('{标题} - {标题} - {标题}', {
       title: 'A', url: 'x', catename: 'c'
     })
-    assertEqual(r, 'A - A - A')
+    assertEqual(r, 'A - A - A', 'r 应等于 \'A - A - A\'')
   })
 
   await test('占位符连续无分隔符', () => {
     const r = tuisong_replace('{标题}{分类名}{日期}', {
       title: 'T', catename: 'C', url: 'x', datetime: 'D'
     })
-    assertEqual(r, 'TCD')
+    assertEqual(r, 'TCD', 'r 应等于 \'TCD\'')
   })
 
   await test('内容含 HTML 标签 → 原样保留', () => {
     const r = tuisong_replace('{内容}', {
       content: '<b>加粗</b>', url: 'x', catename: 'c'
     })
-    assertEqual(r, '<b>加粗</b>')
+    assertEqual(r, '<b>加粗</b>', 'r 应等于 \'<b>加粗</b>\'')
   })
 
   await test('category_name 覆盖 catename', () => {
     const r = tuisong_replace('{分类名}', {
       category_name: '覆盖分类', catename: '原始分类', url: 'x'
     })
-    assertEqual(r, '覆盖分类')
+    assertEqual(r, '覆盖分类', 'r 应等于 \'覆盖分类\'')
   })
 
   await test('posttime 和 shijianchuo 同时存在 → posttime 优先', () => {
@@ -1237,7 +1300,7 @@ console.log('========================================\n');
       datetime: undefined
     })
     // posttime: 1000000000 → 2001-09-09
-    assertEqual(r.includes('2001'), true)
+    assertEqual(r.includes('2001'), true, 'r.includes(\'2001\') 应等于 true')
   })
 
   await test('所有已知占位符同时替换', () => {
@@ -1249,14 +1312,14 @@ console.log('========================================\n');
       shorttime: 'S',
       louzhu: 'L'
     })
-    assertEqual(r, 'T|C|U|D|S|L')
+    assertEqual(r, 'T|C|U|D|S|L', 'r 应等于 \'T|C|U|D|S|L\'')
   })
 
   await test('占位符大小写敏感', () => {
     const r = tuisong_replace('{标题} {标题}', {
       title: '正确', url: 'x', catename: 'c'
     })
-    assertEqual(r, '正确 正确')
+    assertEqual(r, '正确 正确', 'r 应等于 \'正确 正确\'')
   })
 
   // ==================== 19. htmlToMarkdown 更多场景 ====================
@@ -1267,7 +1330,7 @@ console.log('========================================\n');
       content_html: '<img src="http://pic.jpg">',
       url: 'http://x'
     })
-    assertEqual(r.includes('![](http://pic.jpg)'), true)
+    assertEqual(r.includes('![](http://pic.jpg)'), true, 'r.includes(\'![](http://pic.jpg)\') 应等于 true')
   })
 
   await test('多个连续 br', () => {
@@ -1276,7 +1339,7 @@ console.log('========================================\n');
       url: 'http://x'
     })
     // 多个 br 被替换为多个换行
-    assertEqual(r.includes('\n\n'), true)
+    assertEqual(r.includes('\n\n'), true, 'r.includes(\'\\n\\n\') 应等于 true')
   })
 
   await test('复杂嵌套标签', () => {
@@ -1284,8 +1347,8 @@ console.log('========================================\n');
       content_html: '<div><p>段落<b>加粗</b></p><a href="http://url">链接</a></div>',
       url: 'http://x'
     })
-    assertEqual(r.includes('加粗'), true)
-    assertEqual(r.includes('[链接](http://url)'), true)
+    assertEqual(r.includes('加粗'), true, 'r.includes(\'加粗\') 应等于 true')
+    assertEqual(r.includes('[链接](http://url)'), true, 'r.includes(\'[链接](http://url)\') 应等于 true')
   })
 
   await test('纯文本无标签', () => {
@@ -1293,7 +1356,7 @@ console.log('========================================\n');
       content_html: '纯文本内容',
       url: 'http://x'
     })
-    assertEqual(r.includes('纯文本内容'), true)
+    assertEqual(r.includes('纯文本内容'), true, 'r.includes(\'纯文本内容\') 应等于 true')
   })
 
   await test('h1-h6 全部支持', () => {
@@ -1326,7 +1389,7 @@ console.log('========================================\n');
   await test('htmlToMarkdown <area>/<abbr> 前缀不误当锚点（CodeAnt）', () => {
     const r1 = htmlToMarkdown({ content_html: '<area href="https://x">中间内容</a>尾部', url: '' })
     assertEqual(r1.includes('[中间内容](https://x)'), false, '<area> 不应吞并后续内容转链接')
-    assertEqual(r1.includes('中间内容尾部'), true)
+    assertEqual(r1.includes('中间内容尾部'), true, 'r1.includes(\'中间内容尾部\') 应等于 true')
     const r2 = htmlToMarkdown({ content_html: '<abbr>缩略</abbr>', url: '' })
     assertEqual(r2.includes('缩略'), true, '<abbr> 不应被当作锚点')
   })
@@ -1335,7 +1398,7 @@ console.log('========================================\n');
     const a = htmlToMarkdown({ content_html: '<a href="https://x">İçerik</a>', url: '' })
     assertEqual(a.includes('[İçerik](https://x)'), true, 'İ 后锚点内容不应带出 <')
     const h = htmlToMarkdown({ content_html: '<h2>İ</h2>', url: '' })
-    assertEqual(h.includes('## İ'), true)
+    assertEqual(h.includes('## İ'), true, 'h.includes(\'## İ\') 应等于 true')
     assertEqual(h.includes('## İ<'), false, 'İ 后标题内容不应带出 <')
     const s = htmlToMarkdown({ content_html: '<script>İ</script>after', url: '' })
     assertEqual(s.startsWith('after'), true, 'İ 后 script 移除不应丢首字符（曾错位丢 a 只剩 fter）')
@@ -1344,107 +1407,92 @@ console.log('========================================\n');
   await test('htmlToMarkdown 属性值内字面 <a>/<h> 不转换（CodeAnt）', () => {
     const r1 = htmlToMarkdown({ content_html: '<div data-x="<a href="https://x">text</a>', url: '' })
     assertEqual(r1.includes('[text](https://x)'), false, '属性值内 <a> 不应被伪造成链接')
-    assertEqual(r1.includes('text'), true)
+    assertEqual(r1.includes('text'), true, 'r1.includes(\'text\') 应等于 true')
     const r2 = htmlToMarkdown({ content_html: '<div data-x="<h2>标题</h2>', url: '' })
     assertEqual(r2.includes('## 标题'), false, '属性值内 <h2> 不应被转换为标题')
-    assertEqual(r2.includes('标题'), true)
+    assertEqual(r2.includes('标题'), true, 'r2.includes(\'标题\') 应等于 true')
     const r3 = htmlToMarkdown({ content_html: '<div data-x="<a href="https://x">text</a>">', url: '' })
-    assertEqual(r3.includes('[text](https://x)'), false)
+    assertEqual(r3.includes('[text](https://x)'), false, 'r3.includes(\'[text](https://x)\') 应等于 false')
   })
 
   await test('content_html 为 undefined → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    // C4-008：typeof 只排掉「返回非字符串」，空串 / 丢尾巴都能过——钉住精确输出
+    assertEqual(r, '原文链接：[http://x](http://x)', '无 content_html 时应只剩原文链接尾巴')
   })
 
   // ==================== 20. 缓存管理 更多场景 ====================
   console.log('\n📂 20. 缓存管理 更多场景')
 
-  await test('缓存超过100条 → 自动裁剪', () => {
+  await test('缓存超过100条 → 自动裁剪', () => withCacheMaxSize(100, () => {
     const name = 'test_trim.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限（默认已 10000）
-    try {
-      // 写入101条
-      for (let i = 0; i < 101; i++) {
-        appendMessageToFile({ id: i, title: `第${i}条` }, name)
-      }
-      // 验证最多保留100条（ID 1~100，第0条被删）
-      const r = isMessageInFile({ id: 0 }, name)
-      const r2 = isMessageInFile({ id: 100 }, name)
-      // 模块内 splice(0, length-100) 会删掉前1条；P4：被裁剪记录的身份进墓碑，
-      // isMessageInFile 仍应判重命中（防上游重放重复推送）
-      assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
-      assertEqual(r2, true)
-    } finally {
-      Config.cache.maxSize = orig
+    // 写入101条
+    for (let i = 0; i < 101; i++) {
+      appendMessageToFile({ id: i, title: `第${i}条` }, name)
     }
-  })
+    // 验证最多保留100条（ID 1~100，第0条被删）
+    const r = isMessageInFile({ id: 0 }, name)
+    const r2 = isMessageInFile({ id: 100 }, name)
+    // 模块内 splice(0, length-100) 会删掉前1条；P4：被裁剪记录的身份进墓碑，
+    // isMessageInFile 仍应判重命中（防上游重放重复推送）
+    assertEqual(r, true, '第0条被裁剪但身份应保留（墓碑判重）')
+    assertEqual(r2, true, 'r2 应等于 true')
+    // C4-010：用例名与注释都说「最多保留 100 条」，但上面两条只证明墓碑判重——**完全不裁剪**时
+    // 它们同样成立，对「是否裁剪」零鉴别力。这里直接读盘核对条数与保留区间（删最旧、留最新）。
+    const kept = readMessages(getFilePath(name))
+    assertEqual(kept.length, 100, `超出上限应裁到 100 条，实际 ${kept.length} 条`)
+    assertEqual(kept[0] && kept[0].id, 1, `裁剪应删掉最旧的第0条，实际首条 id=${kept[0] && kept[0].id}`)
+    assertEqual(kept[kept.length - 1] && kept[kept.length - 1].id, 100,
+      `最新一条必须保留，实际末条 id=${kept[kept.length - 1] && kept[kept.length - 1].id}`)
+  }))
 
-  await test('P4 裁剪后判重身份保留：被裁记录重放不重复入库', () => {
+  await test('P4 裁剪后判重身份保留：被裁记录重放不重复入库', () => withCacheMaxSize(50, () => {
     const name = 'test_tomb_replay.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 50 // 显式小上限触发条数裁剪
-    try {
-      for (let i = 0; i < 60; i++) appendMessageToFile({ id: i, title: `t${i}` }, name)
-      assertEqual(isMessageInFile({ id: 0 }, name), true, '被裁 id 0 应仍判重命中（墓碑）')
-      assertEqual(isMessageInFile({ id: 59 }, name), true, '未裁记录正常命中')
-      const before = readMessages(getFilePath(name)).length
-      assertEqual(before, 50, '消息数组应裁剪到 50 条')
-      // 重放被裁记录：saveBatch/append 不应再收进缓存（身份已在墓碑）
-      saveBatch([{ id: 0, title: 't0' }], name)
-      assertEqual(readMessages(getFilePath(name)).length, before, '重放被裁记录不应重复入库')
-      const r = appendMessageToFile({ id: 1, title: 't1' }, name)
-      assertEqual(r, true, '重放被裁记录应视为已判重（不触发落盘）')
-      assertEqual(readMessages(getFilePath(name)).length, before, 'append 重放被裁记录也不应重复入库')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    for (let i = 0; i < 60; i++) appendMessageToFile({ id: i, title: `t${i}` }, name)
+    assertEqual(isMessageInFile({ id: 0 }, name), true, '被裁 id 0 应仍判重命中（墓碑）')
+    assertEqual(isMessageInFile({ id: 59 }, name), true, '未裁记录正常命中')
+    const before = readMessages(getFilePath(name)).length
+    assertEqual(before, 50, '消息数组应裁剪到 50 条')
+    // 重放被裁记录：saveBatch/append 不应再收进缓存（身份已在墓碑）
+    saveBatch([{ id: 0, title: 't0' }], name)
+    assertEqual(readMessages(getFilePath(name)).length, before, '重放被裁记录不应重复入库')
+    const r = appendMessageToFile({ id: 1, title: 't1' }, name)
+    assertEqual(r, true, '重放被裁记录应视为已判重（不触发落盘）')
+    assertEqual(readMessages(getFilePath(name)).length, before, 'append 重放被裁记录也不应重复入库')
+  }))
 
-  await test('P4 过滤未推(_f)记录不落墓碑：规则改宽后仍可重新评估', () => {
+  await test('P4 过滤未推(_f)记录不落墓碑：规则改宽后仍可重新评估', () => withCacheMaxSize(100, () => {
     const name = 'test_tomb_f.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100
-    try {
-      for (let i = 0; i < 120; i++) appendMessageToFile({ id: i, title: `t${i}`, _f: true }, name)
-      // _f 记录从未推送：被裁剪后不应进墓碑 → isMessageInFile 判不存在
-      assertEqual(isMessageInFile({ id: 0 }, name), false, '过滤未推记录被裁剪后不应被墓碑误判')
-      // 同身份重放应能重新入库（规则改宽后可重新评估/推送）——墓碑未收录，正常 append
-      appendMessageToFile({ id: 0, title: 't0', _f: true }, name)
-      assertEqual(isMessageInFile({ id: 0 }, name), true, '过滤未推记录重放应重新收录')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    for (let i = 0; i < 120; i++) appendMessageToFile({ id: i, title: `t${i}`, _f: true }, name)
+    // _f 记录从未推送：被裁剪后不应进墓碑 → isMessageInFile 判不存在
+    assertEqual(isMessageInFile({ id: 0 }, name), false, '过滤未推记录被裁剪后不应被墓碑误判')
+    // 同身份重放应能重新入库（规则改宽后可重新评估/推送）——墓碑未收录，正常 append
+    appendMessageToFile({ id: 0, title: 't0', _f: true }, name)
+    assertEqual(isMessageInFile({ id: 0 }, name), true, '过滤未推记录重放应重新收录')
+  }))
 
-  await test('P4 墓碑四类身份 × 条数裁剪后 has() 命中 + save/saveBatch 不重写', () => {
+  await test('P4 墓碑四类身份 × 条数裁剪后 has() 命中 + save/saveBatch 不重写', () => withCacheMaxSize(20, () => {
     const name = 'test_tomb_4kinds_count.json'
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 20
-    try {
-      // 四类身份各自灌满并触发条数裁剪：id / id+url / url-only / anon
-      for (let i = 0; i < 30; i++) appendMessageToFile({ id: i, title: `c${i}` }, name)
-      for (let i = 0; i < 30; i++) appendMessageToFile({ id: 100 + i, url: `https://idurl.example/${i}`, title: `d${i}` }, name)
-      for (let i = 0; i < 30; i++) appendMessageToFile({ url: `https://url.example/${i}`, title: `e${i}` }, name)
-      for (let i = 0; i < 30; i++) appendMessageToFile({ title: `匿名内容 f${i} 足够长避免退化` }, name)
-      const before = readMessages(getFilePath(name)).length
-      assertEqual(before, 20, '缓存应裁剪到 20 条')
-      // 四类被裁身份 has() 仍命中（墓碑兜底）
-      assertEqual(isMessageInFile({ id: 0 }, name), true, 'id 被裁身份应墓碑命中')
-      assertEqual(isMessageInFile({ id: 100, url: 'https://idurl.example/0' }, name), true, 'id+url 被裁身份应墓碑命中')
-      assertEqual(isMessageInFile({ url: 'https://url.example/0' }, name), true, 'url-only 被裁身份应墓碑命中')
-      assertEqual(isMessageInFile({ title: '匿名内容 f0 足够长避免退化' }, name), true, 'anon 被裁身份应墓碑命中')
-      // save/saveBatch 重放均不重新入库
-      saveBatch([{ id: 0 }], name)
-      appendMessageToFile({ id: 100, url: 'https://idurl.example/0' }, name)
-      appendMessageToFile({ url: 'https://url.example/0' }, name)
-      appendMessageToFile({ title: '匿名内容 f0 足够长避免退化' }, name)
-      assertEqual(readMessages(getFilePath(name)).length, before, '四类重放均不应重复入库')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    // 四类身份各自灌满并触发条数裁剪：id / id+url / url-only / anon
+    for (let i = 0; i < 30; i++) appendMessageToFile({ id: i, title: `c${i}` }, name)
+    for (let i = 0; i < 30; i++) appendMessageToFile({ id: 100 + i, url: `https://idurl.example/${i}`, title: `d${i}` }, name)
+    for (let i = 0; i < 30; i++) appendMessageToFile({ url: `https://url.example/${i}`, title: `e${i}` }, name)
+    for (let i = 0; i < 30; i++) appendMessageToFile({ title: `匿名内容 f${i} 足够长避免退化` }, name)
+    const before = readMessages(getFilePath(name)).length
+    assertEqual(before, 20, '缓存应裁剪到 20 条')
+    // 四类被裁身份 has() 仍命中（墓碑兜底）
+    assertEqual(isMessageInFile({ id: 0 }, name), true, 'id 被裁身份应墓碑命中')
+    assertEqual(isMessageInFile({ id: 100, url: 'https://idurl.example/0' }, name), true, 'id+url 被裁身份应墓碑命中')
+    assertEqual(isMessageInFile({ url: 'https://url.example/0' }, name), true, 'url-only 被裁身份应墓碑命中')
+    assertEqual(isMessageInFile({ title: '匿名内容 f0 足够长避免退化' }, name), true, 'anon 被裁身份应墓碑命中')
+    // save/saveBatch 重放均不重新入库
+    saveBatch([{ id: 0 }], name)
+    appendMessageToFile({ id: 100, url: 'https://idurl.example/0' }, name)
+    appendMessageToFile({ url: 'https://url.example/0' }, name)
+    appendMessageToFile({ title: '匿名内容 f0 足够长避免退化' }, name)
+    assertEqual(readMessages(getFilePath(name)).length, before, '四类重放均不应重复入库')
+  }))
 
   await test('P4 墓碑四类身份 × 字节裁剪后 has() 命中', () => {
     const name = 'test_tomb_4kinds_bytes.json'
@@ -1470,32 +1518,24 @@ console.log('========================================\n');
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { title: '匿名字节 f9' }), false, '未裁剪记录不应有墓碑')
   })
 
-  await test('P4 墓碑时序：条数裁剪后序列化失败 → 不落墓碑（CodeAnt Round2 Major）', () => {
+  await test('P4 墓碑时序：条数裁剪后序列化失败 → 不落墓碑（CodeAnt Round2 Major）', () => withCacheMaxSize(2, () => {
     const name = 'test_tomb_serialize_fail.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 2
-    try {
-      const circular = { id: 9, title: '循环引用' }
-      circular.self = circular
-      // 条数裁剪会先收集 {id:0}，但随后 JSON.stringify 失败 → 缓存未落盘，不得落墓碑
-      const ok = MessageStore.saveMessages(fp, [{ id: 0 }, { id: 1 }, circular])
-      assertEqual(ok, false, '序列化失败应返回 false')
-      assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
-      const fsmod = require('node:fs')
-      assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
-    } finally {
-      Config.cache.maxSize = orig
-    }
-  })
+    const circular = { id: 9, title: '循环引用' }
+    circular.self = circular
+    // 条数裁剪会先收集 {id:0}，但随后 JSON.stringify 失败 → 缓存未落盘，不得落墓碑
+    const ok = MessageStore.saveMessages(fp, [{ id: 0 }, { id: 1 }, circular])
+    assertEqual(ok, false, '序列化失败应返回 false')
+    assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
+    const fsmod = require('node:fs')
+    assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
+  }))
 
-  await test('P4 墓碑时序：缓存原子写失败 → 不落墓碑（CodeAnt Round2 Major）', () => {
+  await test('P4 墓碑时序：缓存原子写失败 → 不落墓碑（CodeAnt Round2 Major）', () => withCacheMaxSize(2, () => {
     const name = 'test_tomb_atomic_fail.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 2
     const fsmod = require('node:fs')
     const origRename = fsmod.renameSync
     try {
@@ -1505,7 +1545,6 @@ console.log('========================================\n');
       assertEqual(ok, false, '原子写失败应返回 false')
     } finally {
       fsmod.renameSync = origRename
-      Config.cache.maxSize = orig
     }
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '写盘失败不得产生墓碑')
     assertEqual(fsmod.existsSync(fp + '.seen.json'), false, '.seen.json 不应存在')
@@ -1513,7 +1552,7 @@ console.log('========================================\n');
     const ok2 = MessageStore.saveMessages(fp, [{ id: 0 }])
     assertEqual(ok2, true, '写盘失败后重放应正常落盘')
     assertEqual(MessageStore._tombstoneHasIdentity(fp, { id: 0 }), false, '成功落盘但未裁剪不得产生墓碑')
-  })
+  }))
 
   await test('P4 墓碑时序：字节裁剪返回 null → 不产生墓碑（CodeAnt Round2 Major）', () => {
     const name = 'test_tomb_bytenull.json'
@@ -1588,7 +1627,8 @@ console.log('========================================\n');
       assertEqual(Buffer.byteLength(r, 'utf8') <= maxBytes, true, '返回的裁剪结果不得超过 maxBytes（防读端自锁）')
       assertEqual(droppedOut.length > 0, true, '超限时应发生裁剪')
     } else {
-      assertEqual(true, true, '单条仍超限返回 null 也是合法兜底')
+      // C5-019：null 分支的契约是「没有实际裁掉任何记录 ⇒ 不产生丢弃」（旧 assertEqual(true,true) 恒真）
+      assertEqual(droppedOut.length, 0, '返回 null（单条仍超限）时不得记为丢弃：没有实际裁掉任何记录')
     }
   })
 
@@ -1724,7 +1764,7 @@ console.log('========================================\n');
       assertEqual(fsmod.existsSync(lockPath), false, '同 PID 但启动时钟不同的陈旧锁应被回收')
     } finally {
       MessageStore._getTombstoneProcessStart = origStart
-      try { fsmod.unlinkSync(lockPath) } catch (e) {}
+      unlinkQuiet(lockPath)
     }
   })
 
@@ -1806,14 +1846,14 @@ console.log('========================================\n');
     // 查一下存储的内容（通过读文件验证）
     // isMessageInFile 只检查存在性，不返回值
     const exists = isMessageInFile({ id: 777 }, name)
-    assertEqual(exists, true)
+    assertEqual(exists, true, 'exists 应等于 true')
   })
 
   await test('文件名含特殊字符', () => {
     const name = getFileName('http://x.com/a/b/c/d.json')
-    assertEqual(name, 'd.json')
+    assertEqual(name, 'd.json', 'name 应等于 \'d.json\'')
     const name2 = getFileName('http://x.com/abc')
-    assertEqual(name2, 'abc.json')
+    assertEqual(name2, 'abc.json', 'name2 应等于 \'abc.json\'')
   })
 
   // ==================== 21. validateConfig 更多场景 ====================
@@ -1824,14 +1864,14 @@ console.log('========================================\n');
       pingbibiaoti: '京东\n\n[未闭合'
     })
     // 无 ### 时整个字符串当正则校验 → 不合法
-    assertEqual(warns.length >= 1, true)
+    assertEqual(warns.length >= 1, true, 'warns.length >= 1 应等于 true')
   })
 
   await test('多行天数配置：部分非法 → 有警告', () => {
     const warns = validateConfig({
       pingbitime: '微博线报###5<br>赚客吧###abc'
     })
-    assertEqual(warns.length, 1)
+    assertEqual(warns.length, 1, 'warns.length 应等于 1')
   })
   await test('多行天数配置：空值行/小数/超上限均告警（C049）', () => {
     const warns = validateConfig({
@@ -1843,13 +1883,13 @@ console.log('========================================\n');
   })
 
   await test('空配置对象 → 无警告', () => {
-    assertEqual(validateConfig({}).length, 0)
+    assertEqual(validateConfig({}).length, 0, 'validateConfig({}).length 应等于 0')
   })
 
   await test('所有配置都是空格 → 给出空白警告（审查10 #115）', () => {
     // 修复前空白配置静默；修复后给出明确警告
     const warns = validateConfig({ pingbibiaoti: ' ', pingbilouzhu: '  ' })
-    assertEqual(warns.some(w => w.includes('空白')), true)
+    assertEqual(warns.some(w => w.includes('空白')), true, 'warns.some(w => w.includes(\'空白\')) 应等于 true')
   })
 
   // ==================== 22. 综合极限场景 ====================
@@ -1862,8 +1902,8 @@ console.log('========================================\n');
       url: 'x',
       catename: 'c'
     })
-    assertEqual(r.includes('🎉'), true)
-    assertEqual(r.includes('🔥'), true)
+    assertEqual(r.includes('🎉'), true, 'r.includes(\'🎉\') 应等于 true')
+    assertEqual(r.includes('🔥'), true, 'r.includes(\'🔥\') 应等于 true')
   })
 
   await test('超长标题不崩溃', () => {
@@ -1871,34 +1911,34 @@ console.log('========================================\n');
     const r = tuisong_replace('{标题}', {
       title: longTitle, url: 'x', catename: 'c'
     })
-    assertEqual(r.length, 5000)
+    assertEqual(r.length, 5000, 'r.length 应等于 5000')
   })
 
   await test('listfilter 所有配置填满且全部匹配的排列组合', () => {
     // 分类匹配
     assertEqual(listfilter(makeItem({ catename: '微博线报' }), {
       pingbifenlei: '微博'
-    }), false)
+    }), false, 'listfilter(makeItem({ catename: \'微博线报\' }), { pingbifenlei: \'微博\' }) 应等于 false')
 
     // 楼主匹配
     assertEqual(listfilter(makeItem({ louzhu: '小黑' }), {
       pingbilouzhu: '小黑'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小黑\' }), { pingbilouzhu: \'小黑\' }) 应等于 false')
 
     // 标题匹配
     assertEqual(listfilter(makeItem({ title: '京东' }), {
       pingbibiaoti: '京东'
-    }), false)
+    }), false, 'listfilter(makeItem({ title: \'京东\' }), { pingbibiaoti: \'京东\' }) 应等于 false')
 
     // 内容匹配
     assertEqual(listfilter(makeItem({ content: '抢购' }), {
       pingbineirong: '抢购'
-    }), false)
+    }), false, 'listfilter(makeItem({ content: \'抢购\' }), { pingbineirong: \'抢购\' }) 应等于 false')
 
     // 天数匹配
     assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), {
       pingbitime: '5'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: \'5\'… 应等于 false')
   })
 
   await test('所有字段同时配置但都不匹配 → 保留', () => {
@@ -1914,7 +1954,7 @@ console.log('========================================\n');
         zhanxianneirong: '重磅',
         pingbitime: '100'
       }
-    ), true)
+    ), true, 'listfilter( makeItem({ catename: \'好单线报\', louzhu: \'普通用户\', title: \'普通商品… 应等于 true')
   })
 
   // ==================== 23. htmlToMarkdown 更多标签 ====================
@@ -1925,8 +1965,8 @@ console.log('========================================\n');
       content_html: '<ul><li>项目一</li><li>项目二</li></ul>',
       url: 'http://x'
     })
-    assertEqual(r.includes('项目一'), true)
-    assertEqual(r.includes('项目二'), true)
+    assertEqual(r.includes('项目一'), true, 'r.includes(\'项目一\') 应等于 true')
+    assertEqual(r.includes('项目二'), true, 'r.includes(\'项目二\') 应等于 true')
   })
 
   await test('<strong> 加粗标签 → 保留文本去掉标签', () => {
@@ -1934,8 +1974,8 @@ console.log('========================================\n');
       content_html: '普通<strong>加粗</strong>普通',
       url: 'http://x'
     })
-    assertEqual(r.includes('加粗'), true)
-    assertEqual(r.includes('<strong>'), false)
+    assertEqual(r.includes('加粗'), true, 'r.includes(\'加粗\') 应等于 true')
+    assertEqual(r.includes('<strong>'), false, 'r.includes(\'<strong>\') 应等于 false')
   })
 
   await test('<span> 内联标签 → 保留文本去掉标签', () => {
@@ -1943,8 +1983,8 @@ console.log('========================================\n');
       content_html: '<span style="color:red">红色文字</span>',
       url: 'http://x'
     })
-    assertEqual(r.includes('红色文字'), true)
-    assertEqual(r.includes('<span'), false)
+    assertEqual(r.includes('红色文字'), true, 'r.includes(\'红色文字\') 应等于 true')
+    assertEqual(r.includes('<span'), false, 'r.includes(\'<span\') 应等于 false')
   })
 
   await test('多个不同类型标签混合', () => {
@@ -1952,9 +1992,9 @@ console.log('========================================\n');
       content_html: '<p><strong>标题</strong>：<a href="http://url">链接</a><br>下一行</p>',
       url: 'http://x'
     })
-    assertEqual(r.includes('标题'), true)
-    assertEqual(r.includes('[链接](http://url)'), true)
-    assertEqual(r.includes('下一行'), true)
+    assertEqual(r.includes('标题'), true, 'r.includes(\'标题\') 应等于 true')
+    assertEqual(r.includes('[链接](http://url)'), true, 'r.includes(\'[链接](http://url)\') 应等于 true')
+    assertEqual(r.includes('下一行'), true, 'r.includes(\'下一行\') 应等于 true')
   })
 
   await test('<table> 表格 → 保留文本丢掉表格标签', () => {
@@ -1962,42 +2002,42 @@ console.log('========================================\n');
       content_html: '<table><tr><td>单元格1</td><td>单元格2</td></tr></table>',
       url: 'http://x'
     })
-    assertEqual(r.includes('单元格1'), true)
-    assertEqual(r.includes('单元格2'), true)
-    assertEqual(r.includes('<table>'), false)
+    assertEqual(r.includes('单元格1'), true, 'r.includes(\'单元格1\') 应等于 true')
+    assertEqual(r.includes('单元格2'), true, 'r.includes(\'单元格2\') 应等于 true')
+    assertEqual(r.includes('<table>'), false, 'r.includes(\'<table>\') 应等于 false')
   })
 
   // ==================== 24. listfilter 极端值 ====================
   console.log('\n📂 24. listfilter 极端值')
 
   await test('group 为 null → 不崩溃返回 true', () => {
-    assertEqual(listfilter(null, {}), true)
+    assertEqual(listfilter(null, {}), true, 'listfilter(null, {}) 应等于 true')
   })
 
   await test('group 为 undefined → 不崩溃返回 true', () => {
-    assertEqual(listfilter(undefined, {}), true)
+    assertEqual(listfilter(undefined, {}), true, 'listfilter(undefined, {}) 应等于 true')
   })
 
   await test('group 为空对象 → 跳过所有过滤返回 true', () => {
-    assertEqual(listfilter({}, { pingbibiaoti: '京东' }), true)
+    assertEqual(listfilter({}, { pingbibiaoti: '京东' }), true, 'listfilter({}, { pingbibiaoti: \'京东\' }) 应等于 true')
   })
 
   await test('字段值为 null 而非 undefined → 不崩溃', () => {
     assertEqual(listfilter({
       catename: '线报', louzhu: null, title: null, content: null
-    }, { pingbibiaoti: '京东', pingbilouzhu: '小明', pingbineirong: '广告' }), true)
+    }, { pingbibiaoti: '京东', pingbilouzhu: '小明', pingbineirong: '广告' }), true, 'listfilter({ catename: \'线报\', louzhu: null, title: null, content: null… 应等于 true')
   })
 
   await test('标题为数字 → 隐式转字符串匹配', () => {
     assertEqual(listfilter({
       catename: '线报', louzhu: '小明', title: '12345', content: '内容'
-    }, { pingbibiaoti: '123' }), false)
+    }, { pingbibiaoti: '123' }), false, 'listfilter({ catename: \'线报\', louzhu: \'小明\', title: \'12345\', content: \'… 应等于 false')
   })
 
   await test('catename 为 undefined → 不崩溃', () => {
     assertEqual(listfilter({
       louzhu: '小明', title: '京东', content: '内容'
-    }, { pingbifenlei: '微博' }), true) // catename 是 undefined，不匹配
+    }, { pingbifenlei: '微博' }), true, 'listfilter({ louzhu: \'小明\', title: \'京东\', content: \'内容\' }, { pingbifenl… 应等于 true') // catename 是 undefined，不匹配
   })
 
   await test('louzhuregtime 非法格式 → 与缺失一致放行', () => {
@@ -2009,7 +2049,7 @@ console.log('========================================\n');
       title: '京东',
       content: '内容',
       louzhuregtime: 'not-a-date'
-    }, { pingbitime: '5' }), true) // 解析失败 → 放行
+    }, { pingbitime: '5' }), true, 'listfilter({ catename: \'线报\', louzhu: \'小明\', title: \'京东\', content: \'内容\'… 应等于 true') // 解析失败 → 放行
   })
 
   // ==================== 25. 缓存管理 更多边界 ====================
@@ -2017,7 +2057,7 @@ console.log('========================================\n');
 
   await test('getFileName 边界：空字符串 URL → default.json（v3.20审查5）', () => {
     const name = getFileName('')
-    assertEqual(name, 'default.json')
+    assertEqual(name, 'default.json', 'name 应等于 \'default.json\'')
   })
 
   await test('appendMessageToFile 相同 ID 多次 → 只保留一条', () => {
@@ -2027,13 +2067,13 @@ console.log('========================================\n');
     appendMessageToFile({ id: 1, data: 'c' }, name)
     // 应该只有一条记录
     const exists = isMessageInFile({ id: 1 }, name)
-    assertEqual(exists, true)
+    assertEqual(exists, true, 'exists 应等于 true')
     // 检查文件只有一条（通过内部机制验证）
     // 连续添加不同 ID
     appendMessageToFile({ id: 2 }, name)
     appendMessageToFile({ id: 3 }, name)
-    assertEqual(isMessageInFile({ id: 2 }, name), true)
-    assertEqual(isMessageInFile({ id: 3 }, name), true)
+    assertEqual(isMessageInFile({ id: 2 }, name), true, 'isMessageInFile({ id: 2 }, name) 应等于 true')
+    assertEqual(isMessageInFile({ id: 3 }, name), true, 'isMessageInFile({ id: 3 }, name) 应等于 true')
   })
 
   // ==================== 26. tuisong_replace 极端值 ====================
@@ -2043,28 +2083,28 @@ console.log('========================================\n');
     const r = tuisong_replace('【{内容}】', {
       title: 'T', content: undefined, url: 'x', catename: 'c'
     })
-    assertEqual(r, '【】')
+    assertEqual(r, '【】', 'r 应等于 \'【】\'')
   })
 
   await test('标题为数字 → 转字符串输出', () => {
     const r = tuisong_replace('{标题}', {
       title: 999, url: 'x', catename: 'c'
     })
-    assertEqual(r, '999')
+    assertEqual(r, '999', 'r 应等于 \'999\'')
   })
 
   await test('所有字段都缺失 → 替换为空', () => {
     const r = tuisong_replace('{标题} - {分类名} - {链接}', {
       // 空对象
     })
-    assertEqual(r, ' -  - ')
+    assertEqual(r, ' -  - ', 'r 应等于 \' - - \'')
   })
 
   await test('空模板字符串 → 返回空', () => {
     const r = tuisong_replace('', {
       title: 'T', url: 'x', catename: 'c'
     })
-    assertEqual(r, '')
+    assertEqual(r, '', 'r 应等于 \'\'')
   })
 
   // ==================== 27. 关键冲突覆盖 ====================
@@ -2075,7 +2115,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianbiaoti: '京东',
       pingbibiaotiplus: '京东'
-    }), true) // 楼主show → 标题plus被跳过
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\' }), { zhanxianlouzhu:… 应等于 true') // 楼主show → 标题plus被跳过
   })
 
   await test('标题show + 内容plus都匹配 → 标题优先', () => {
@@ -2083,14 +2123,14 @@ console.log('========================================\n');
       zhanxianbiaoti: '京东',
       zhanxianneirong: '广告',
       pingbineirongplus: '广告'
-    }), true) // 标题show → 内容plus被跳过
+    }), true, 'listfilter(makeItem({ title: \'京东\', content: \'广告\' }), { zhanxianbiaoti… 应等于 true') // 标题show → 内容plus被跳过
   })
 
   await test('标题block + 标题plus都匹配 → block先触发', () => {
     assertEqual(listfilter(makeItem({ title: '京东' }), {
       pingbibiaoti: '京东',
       pingbibiaotiplus: '京东'
-    }), false) // block先触发 → 屏蔽
+    }), false, 'listfilter(makeItem({ title: \'京东\' }), { pingbibiaoti: \'京东\', pingbibia… 应等于 false') // block先触发 → 屏蔽
   })
 
   await test('天数拦截 + 分类匹配 + 标题匹配 → 天数优先', () => {
@@ -2098,7 +2138,7 @@ console.log('========================================\n');
       pingbitime: '5',
       pingbifenlei: '微博',
       pingbibiaoti: '京东'
-    }), false) // 天数拦截优先
+    }), false, 'listfilter(makeItem({ catename: \'微博线报\', title: \'京东\', louzhuregtime: d… 应等于 false') // 天数拦截优先
   })
 
   await test('天数不拦截 + 分类不匹配 + 标题匹配 → 标题屏蔽', () => {
@@ -2106,21 +2146,21 @@ console.log('========================================\n');
       pingbitime: '999',
       pingbifenlei: '微博',
       pingbibiaoti: '京东'
-    }), false) // 天数放过，分类不匹配，标题命中 → 屏蔽
+    }), false, 'listfilter(makeItem({ catename: \'好单线报\', title: \'京东\', louzhuregtime: d… 应等于 false') // 天数放过，分类不匹配，标题命中 → 屏蔽
   })
 
   await test('楼主block + 内容show → 楼主block优先', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小黑', content: '好东西' }), {
       pingbilouzhu: '小黑',
       zhanxianneirong: '好东西'
-    }), false) // 楼主先被屏蔽，内容show没机会执行
+    }), false, 'listfilter(makeItem({ louzhu: \'小黑\', content: \'好东西\' }), { pingbilouzhu… 应等于 false') // 楼主先被屏蔽，内容show没机会执行
   })
 
   await test('内容block + 内容show同时匹配 → show优先', () => {
     assertEqual(listfilter(makeItem({ content: '好东西' }), {
       pingbineirong: '好东西',
       zhanxianneirong: '好东西'
-    }), true) // 内容show > 内容block
+    }), true, 'listfilter(makeItem({ content: \'好东西\' }), { pingbineirong: \'好东西\', zhan… 应等于 true') // 内容show > 内容block
   })
 
   await test('楼主show + 标题plus → 楼主优先跳过标题plus', () => {
@@ -2128,7 +2168,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianbiaoti: '京东',
       pingbibiaotiplus: '京东'
-    }), true) // 楼主show → 标题plus被跳过
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\' }), { zhanxianlouzhu:… 应等于 true') // 楼主show → 标题plus被跳过
   })
 
   await test('楼主show + 内容plus → 楼主优先跳过内容plus', () => {
@@ -2136,7 +2176,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianneirong: '广告',
       pingbineirongplus: '广告'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', content: \'广告\' }), { zhanxianlouzh… 应等于 true')
   })
 
   await test('标题show + 内容plus → 标题优先跳过内容plus', () => {
@@ -2144,14 +2184,14 @@ console.log('========================================\n');
       zhanxianbiaoti: '京东',
       zhanxianneirong: '广告',
       pingbineirongplus: '广告'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'京东\', content: \'广告\' }), { zhanxianbiaoti… 应等于 true')
   })
 
   await test('天数拦截 + 楼主show → 天数优先', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小明', louzhuregtime: daysAgo(4) }), {
       pingbitime: '5',
       zhanxianlouzhu: '小明'
-    }), false) // 天数优先拦截
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\', louzhuregtime: daysAgo(4) }), { p… 应等于 false') // 天数优先拦截
   })
 
   await test('楼主block不匹配 + 标题show + 内容block → 标题show生效', () => {
@@ -2159,7 +2199,7 @@ console.log('========================================\n');
       pingbilouzhu: '小黑',
       zhanxianbiaoti: '京东',
       pingbineirong: '广告'
-    }), true) // 标题show生效，内容block被跳过
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\', content: \'广告\' }), { … 应等于 true') // 标题show生效，内容block被跳过
   })
 
   await test('楼主block + 标题block + 内容block全匹配 → 楼主优先拦截', () => {
@@ -2167,7 +2207,7 @@ console.log('========================================\n');
       pingbilouzhu: '小黑',
       pingbibiaoti: '京东',
       pingbineirong: '广告'
-    }), false) // 楼主先被拦了
+    }), false, 'listfilter(makeItem({ louzhu: \'小黑\', title: \'京东\', content: \'广告\' }), { … 应等于 false') // 楼主先被拦了
   })
 
   await test('楼主show + 标题show + 内容show全匹配 → 全部展现', () => {
@@ -2175,7 +2215,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       zhanxianbiaoti: '京东',
       zhanxianneirong: '广告'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\', content: \'广告\' }), { … 应等于 true')
   })
 
   await test('楼主plus + 标题plus + 内容plus全匹配 → 楼主优先拦截', () => {
@@ -2186,7 +2226,7 @@ console.log('========================================\n');
       pingbibiaotiplus: '京东',
       zhanxianneirong: '广告',
       pingbineirongplus: '广告'
-    }), false) // 楼主plus先拦截
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\', content: \'广告\' }), { … 应等于 false') // 楼主plus先拦截
   })
 
   await test('多行混合：小红被block → 屏蔽', () => {
@@ -2194,7 +2234,7 @@ console.log('========================================\n');
       pingbilouzhu: '线报###小红\n\n线报###小明\n\n线报###小黑',
       zhanxianlouzhu: '线报###小明',
       pingbilouzhuplus: '线报###小黑'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小红\' }), { pingbilouzhu: \'线报###小红\\n\\n线报… 应等于 false')
   })
 
   await test('多行混合：小明被show → 保留', () => {
@@ -2202,7 +2242,7 @@ console.log('========================================\n');
       pingbilouzhu: '小红\n\n小明\n\n小黑',
       zhanxianlouzhu: '小明',
       pingbilouzhuplus: '小黑'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\' }), { pingbilouzhu: \'小红\\n\\n小明\\n\\n小… 应等于 true')
   })
 
   await test('多行混合：小黑被plus → 屏蔽', () => {
@@ -2210,7 +2250,7 @@ console.log('========================================\n');
       pingbilouzhu: '小红\n\n小明\n\n小黑',
       zhanxianlouzhu: '小明',
       pingbilouzhuplus: '小黑'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小黑\' }), { pingbilouzhu: \'小红\\n\\n小明\\n\\n小… 应等于 false')
   })
 
   await test('五重过滤：天数+分类+楼主+标题+内容全匹配 → 天数优先', () => {
@@ -2220,7 +2260,7 @@ console.log('========================================\n');
       pingbilouzhu: '小明',
       pingbibiaoti: '京东',
       pingbineirong: '广告'
-    }), false)
+    }), false, 'listfilter(makeItem({ catename: \'微博线报\', louzhu: \'小明\', title: \'京东\', co… 应等于 false')
   })
 
   await test('五重过滤：全匹配但天数不拦截 → 分类拦截', () => {
@@ -2230,44 +2270,44 @@ console.log('========================================\n');
       pingbilouzhu: '小明',
       pingbibiaoti: '京东',
       pingbineirong: '广告'
-    }), false) // 天数不拦截 → 分类拦截
+    }), false, 'listfilter(makeItem({ catename: \'微博线报\', louzhu: \'小明\', title: \'京东\', co… 应等于 false') // 天数不拦截 → 分类拦截
   })
 
   await test('null 配置字段 → 不崩溃', () => {
-    assertEqual(listfilter(makeItem(), { pingbibiaoti: null }), true)
+    assertEqual(listfilter(makeItem(), { pingbibiaoti: null }), true, 'listfilter(makeItem(), { pingbibiaoti: null }) 应等于 true')
   })
 
   await test('空字符串配置 → 不崩溃', () => {
-    assertEqual(listfilter(makeItem(), { pingbibiaoti: '' }), true)
+    assertEqual(listfilter(makeItem(), { pingbibiaoti: '' }), true, 'listfilter(makeItem(), { pingbibiaoti: \'\' }) 应等于 true')
   })
 
   await test('标题含零宽字符 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ title: '\u200b京东\u200b' }), { pingbibiaoti: '京东' }), false)
+    assertEqual(listfilter(makeItem({ title: '\u200b京东\u200b' }), { pingbibiaoti: '京东' }), false, 'listfilter(makeItem({ title: \'\\u200b京东\\u200b\' }), { pingbibiaoti: \'京东… 应等于 false')
   })
 
   await test('内容含emoji → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ content: '🔥限时抢购🔥' }), { pingbineirong: '抢购' }), false)
+    assertEqual(listfilter(makeItem({ content: '🔥限时抢购🔥' }), { pingbineirong: '抢购' }), false, 'listfilter(makeItem({ content: \'🔥限时抢购🔥\' }), { pingbineirong: \'抢购\' }) 应等于 false')
   })
 
   await test('标题含括号 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ title: '【京东】大促' }), { pingbibiaoti: '京东' }), false)
+    assertEqual(listfilter(makeItem({ title: '【京东】大促' }), { pingbibiaoti: '京东' }), false, 'listfilter(makeItem({ title: \'【京东】大促\' }), { pingbibiaoti: \'京东\' }) 应等于 false')
   })
 
   await test('多行配置带空格 → trim后正常匹配（v3.22审查15）', () => {
     // 修复前空格进入正则导致不匹配；修复后 trim，空格不再影响
     assertEqual(listfilter(makeItem({ louzhu: '小明' }), {
       pingbilouzhu: ' 线报###小明 \n\n 线报###小黑 '
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\' }), { pingbilouzhu: \' 线报###小明 \\n\\n… 应等于 false')
   })
 
   await test('正则中文全角字符 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ title: '京东神券' }), { pingbibiaoti: '京东' }), false)
-    assertEqual(listfilter(makeItem({ title: '淘宝特价' }), { pingbibiaoti: '京东' }), true)
+    assertEqual(listfilter(makeItem({ title: '京东神券' }), { pingbibiaoti: '京东' }), false, 'listfilter(makeItem({ title: \'京东神券\' }), { pingbibiaoti: \'京东\' }) 应等于 false')
+    assertEqual(listfilter(makeItem({ title: '淘宝特价' }), { pingbibiaoti: '京东' }), true, 'listfilter(makeItem({ title: \'淘宝特价\' }), { pingbibiaoti: \'京东\' }) 应等于 true')
   })
 
   await test('超长分类名 → 不崩溃', () => {
     const longName = 'A'.repeat(1000)
-    assertEqual(listfilter(makeItem({ catename: longName }), { pingbifenlei: 'B' }), true)
+    assertEqual(listfilter(makeItem({ catename: longName }), { pingbifenlei: 'B' }), true, 'listfilter(makeItem({ catename: longName }), { pingbifenlei: \'B\' }) 应等于 true')
   })
 
   await test('所有配置为空字符串 → 全部保留', () => {
@@ -2282,25 +2322,25 @@ console.log('========================================\n');
       zhanxianneirong: '',
       pingbineirongplus: '',
       pingbitime: ''
-    }), true)
+    }), true, 'listfilter(makeItem(), { pingbifenlei: \'\', pingbilouzhu: \'\', zhanxian… 应等于 true')
   })
 
   await test('多行配置空行 → 跳过空行', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小明' }), {
       pingbilouzhu: '线报###小红\n\n\n\n线报###小明'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\' }), { pingbilouzhu: \'线报###小红\\n\\n\\n… 应等于 false')
   })
 
   await test('show/block/plus 同一字段全部不配置 → 保留', () => {
-    assertEqual(listfilter(makeItem({ louzhu: '小明', title: '京东', content: '广告' }), {}), true)
+    assertEqual(listfilter(makeItem({ louzhu: '小明', title: '京东', content: '广告' }), {}), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\', content: \'广告\' }), {}) 应等于 true')
   })
 
   await test('天数负数 → 不拦截', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '-1' }), true)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '-1' }), true, 'listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: \'-1… 应等于 true')
   })
 
   await test('天数极大值 → 全部拦截', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '999999' }), false)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: '999999' }), false, 'listfilter(makeItem({ louzhuregtime: daysAgo(4) }), { pingbitime: \'99… 应等于 false')
   })
 
   await test('楼主plus生效后 show被抵消 → 不应再被其他字段block', () => {
@@ -2309,44 +2349,44 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       pingbilouzhuplus: '小明',
       pingbibiaoti: '京东'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\', title: \'京东\' }), { zhanxianlouzhu:… 应等于 false')
   })
 
   await test('混合分隔符 <br> + \n\n 在相同配置中', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小明' }), {
       pingbilouzhu: '线报###小红<br>线报###小明\n\n线报###小黑'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\' }), { pingbilouzhu: \'线报###小红<br>线报… 应等于 false')
   })
 
   await test('内容含单引号 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ content: "它's 好物" }), { pingbineirong: "它's" }), false)
+    assertEqual(listfilter(makeItem({ content: "它's 好物" }), { pingbineirong: "它's" }), false, 'listfilter(makeItem({ content: "它\'s 好物" }), { pingbineirong: "它\'s" }) 应等于 false')
   })
 
   await test('楼主名含数字 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ louzhu: 'user123' }), { pingbilouzhu: 'user123' }), false)
+    assertEqual(listfilter(makeItem({ louzhu: 'user123' }), { pingbilouzhu: 'user123' }), false, 'listfilter(makeItem({ louzhu: \'user123\' }), { pingbilouzhu: \'user123\'… 应等于 false')
   })
 
   await test('标题全英文 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ title: 'iPhone 15 Pro Max' }), { pingbibiaoti: 'iPhone' }), false)
+    assertEqual(listfilter(makeItem({ title: 'iPhone 15 Pro Max' }), { pingbibiaoti: 'iPhone' }), false, 'listfilter(makeItem({ title: \'iPhone 15 Pro Max\' }), { pingbibiaoti: … 应等于 false')
   })
 
   await test('标题含斜杠 → 正常匹配', () => {
-    assertEqual(listfilter(makeItem({ title: 'Apple/iPhone/15' }), { pingbibiaoti: 'iPhone' }), false)
+    assertEqual(listfilter(makeItem({ title: 'Apple/iPhone/15' }), { pingbibiaoti: 'iPhone' }), false, 'listfilter(makeItem({ title: \'Apple/iPhone/15\' }), { pingbibiaoti: \'i… 应等于 false')
   })
 
   await test('内容含URL → 匹配URL的一部分', () => {
-    assertEqual(listfilter(makeItem({ content: '详情见 https://example.com/goods/123' }), { pingbineirong: 'example' }), false)
+    assertEqual(listfilter(makeItem({ content: '详情见 https://example.com/goods/123' }), { pingbineirong: 'example' }), false, 'listfilter(makeItem({ content: \'详情见 https://example.com/goods/123\' })… 应等于 false')
   })
 
   await test('分类含前缀 → 正则部分匹配', () => {
-    assertEqual(listfilter(makeItem({ catename: '微博线报-更多-京东' }), { pingbifenlei: '京东' }), false)
+    assertEqual(listfilter(makeItem({ catename: '微博线报-更多-京东' }), { pingbifenlei: '京东' }), false, 'listfilter(makeItem({ catename: \'微博线报-更多-京东\' }), { pingbifenlei: \'京东\'… 应等于 false')
   })
 
   await test('标题+内容同时命中block → 先标题拦截', () => {
     assertEqual(listfilter(makeItem({ title: '京东', content: '抢购' }), {
       pingbibiaoti: '京东',
       pingbineirong: '抢购'
-    }), false)
+    }), false, 'listfilter(makeItem({ title: \'京东\', content: \'抢购\' }), { pingbibiaoti: … 应等于 false')
   })
 
   await test('楼主block不匹配 + 标题block匹配 + 内容block匹配 → 标题拦截', () => {
@@ -2354,7 +2394,7 @@ console.log('========================================\n');
       pingbilouzhu: '李四',
       pingbibiaoti: '京东',
       pingbineirong: '广告'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'张三\', title: \'京东\', content: \'广告\' }), { … 应等于 false')
   })
 
   await test('楼主show不匹配 + 标题show不匹配 + 内容show匹配 → 内容保留', () => {
@@ -2363,23 +2403,23 @@ console.log('========================================\n');
       zhanxianbiaoti: '京东',
       zhanxianneirong: '好东西',
       pingbineirong: '好东西'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'张三\', title: \'淘宝\', content: \'好东西\' }), {… 应等于 true')
   })
 
   await test('天数精确边界：当天注册 pingbitime=1 → 当天是否拦截', () => {
     // v3.115：daysAgo(0)=UTC 今天
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(0) }), { pingbitime: '1' }), false)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(0) }), { pingbitime: '1' }), false, 'listfilter(makeItem({ louzhuregtime: daysAgo(0) }), { pingbitime: \'1\'… 应等于 false')
   })
 
   await test('配置中包含正则回溯 → 不耗尽性能', () => {
-    assertEqual(listfilter(makeItem({ title: '京东' }), { pingbibiaoti: '(a+)+b' }), true)
+    assertEqual(listfilter(makeItem({ title: '京东' }), { pingbibiaoti: '(a+)+b' }), true, 'listfilter(makeItem({ title: \'京东\' }), { pingbibiaoti: \'(a+)+b\' }) 应等于 true')
   })
 
   await test('getFileName URL 含复杂参数', () => {
     const v3 = require('./xbk_function_v3')
-    assertEqual(v3.getFileName('http://x.com/a/b/c.json'), 'c.json')
-    assertEqual(v3.getFileName(''), 'default.json')
-    assertEqual(v3.getFileName('http://x.com/a/b/'), 'default.json') // 尾部 / 兜底
+    assertEqual(v3.getFileName('http://x.com/a/b/c.json'), 'c.json', 'v3.getFileName(\'http://x.com/a/b/c.json\') 应等于 \'c.json\'')
+    assertEqual(v3.getFileName(''), 'default.json', 'v3.getFileName(\'\') 应等于 \'default.json\'')
+    assertEqual(v3.getFileName('http://x.com/a/b/'), 'default.json', 'v3.getFileName(\'http://x.com/a/b/\') 应等于 \'default.json\'') // 尾部 / 兜底
   })
 
   await test('缓存写入后立即读取 → 数据一致', () => {
@@ -2387,14 +2427,14 @@ console.log('========================================\n');
     const msg = { id: 666, data: '测试' }
     appendMessageToFile(msg, name)
     appendMessageToFile({ id: 666, data: '更新' }, name)
-    assertEqual(isMessageInFile(msg, name), true)
+    assertEqual(isMessageInFile(msg, name), true, 'isMessageInFile(msg, name) 应等于 true')
   })
 
   await test('多个不同缓存文件 → 互不干扰', () => {
     appendMessageToFile({ id: 1 }, 'test_a.json')
     appendMessageToFile({ id: 2 }, 'test_b.json')
-    assertEqual(isMessageInFile({ id: 1 }, 'test_a.json'), true)
-    assertEqual(isMessageInFile({ id: 1 }, 'test_b.json'), false)
+    assertEqual(isMessageInFile({ id: 1 }, 'test_a.json'), true, 'isMessageInFile({ id: 1 }, \'test_a.json\') 应等于 true')
+    assertEqual(isMessageInFile({ id: 1 }, 'test_b.json'), false, 'isMessageInFile({ id: 1 }, \'test_b.json\') 应等于 false')
   })
 
   await test('tuisong_replace 全字段含特殊字符', () => {
@@ -2405,80 +2445,81 @@ console.log('========================================\n');
       datetime: '2026-07-30',
       shorttime: '01:30'
     })
-    assertEqual(r, '特🔥价|线报|2026-07-30')
+    assertEqual(r, '特🔥价|线报|2026-07-30', 'r 应等于 \'特🔥价|线报|2026-07-30\'')
   })
 
   await test('多行配置 五行混合 → 只有最后一行匹配', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小明' }), {
       pingbilouzhu: 'a###x\n\nb###x\n\nc###x\n\nd###x\n\n线报###小明'
-    }), false)
+    }), false, 'listfilter(makeItem({ louzhu: \'小明\' }), { pingbilouzhu: \'a###x\\n\\nb###… 应等于 false')
   })
 
   await test('天数过滤 + 多行分类 + 多行标题 → 超复杂', () => {
     assertEqual(listfilter(makeItem({ catename: '赚客吧', title: '京东', louzhuregtime: daysAgo(4) }), {
       pingbitime: '微博线报###3\n\n赚客吧###5',
       pingbibiaoti: '微博线报###淘宝\n\n赚客吧###京东'
-    }), false) // 天数拦截
+    }), false, 'listfilter(makeItem({ catename: \'赚客吧\', title: \'京东\', louzhuregtime: da… 应等于 false') // 天数拦截
   })
 
   await test('天数不拦截 + 多行分类不匹配 + 多行标题匹配 → 标题拦截', () => {
     assertEqual(listfilter(makeItem({ catename: '赚客吧', title: '京东', louzhuregtime: daysAgo(100) }), {
       pingbitime: '微博线报###3\n\n赚客吧###1000',
       pingbibiaoti: '微博线报###淘宝\n\n赚客吧###京东'
-    }), false) // 标题拦截
+    }), false, 'listfilter(makeItem({ catename: \'赚客吧\', title: \'京东\', louzhuregtime: da… 应等于 false') // 标题拦截
   })
 
   await test('show 通配符 (.*) → 所有都展现', () => {
     assertEqual(listfilter(makeItem({ title: '随便什么标题' }), {
       pingbibiaoti: '(.*)',
       zhanxianbiaoti: '(.*)'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'随便什么标题\' }), { pingbibiaoti: \'(.*)\', zha… 应等于 true')
   })
 
   await test('show 通配符 + block 通配符 → show优先', () => {
     assertEqual(listfilter(makeItem({ title: '随便什么标题' }), {
       pingbibiaoti: '(.*)',
       zhanxianbiaoti: '(.*)'
-    }), true)
+    }), true, 'listfilter(makeItem({ title: \'随便什么标题\' }), { pingbibiaoti: \'(.*)\', zha… 应等于 true')
   })
 
   await test('配置中所有字段都是空格 → 当作有效正则', () => {
-    assertEqual(listfilter(makeItem({ title: '测试' }), { pingbibiaoti: '   ' }), true)
+    assertEqual(listfilter(makeItem({ title: '测试' }), { pingbibiaoti: '   ' }), true, 'listfilter(makeItem({ title: \'测试\' }), { pingbibiaoti: \' \' }) 应等于 true')
   })
 
   await test('tuisong_replace 内容含 \n → 保留原始换行', () => {
     const r = tuisong_replace('【{内容}】', {
       title: 't', content: '第一行\n第二行', url: 'x', catename: 'c'
     })
-    assertEqual(r.includes('\n'), true)
+    assertEqual(r.includes('\n'), true, 'r.includes(\'\\n\') 应等于 true')
   })
 
   await test('htmlToMarkdown 纯文本 → 保留', () => {
     const r = htmlToMarkdown({ content_html: '纯文本', url: 'http://x' })
-    assertEqual(r.includes('纯文本'), true)
+    assertEqual(r.includes('纯文本'), true, 'r.includes(\'纯文本\') 应等于 true')
   })
 
   await test('htmlToMarkdown 空 content_html → 不崩溃', () => {
     const r = htmlToMarkdown({ url: 'http://x' })
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, '原文链接：[http://x](http://x)', 'content_html 缺失时应只剩原文链接尾巴')
   })
 
   await test('天数过滤 pingbitime=0 → 不拦截任何人', () => {
-    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: '0' }), true)
+    assertEqual(listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: '0' }), true, 'listfilter(makeItem({ louzhuregtime: daysAgo(2) }), { pingbitime: \'0\'… 应等于 true')
   })
 
   await test('楼主: 强化屏蔽不匹配 → 强制展现生效(无普通屏蔽,简化场景)', () => {
     assertEqual(listfilter(makeItem({ louzhu: '小明' }), {
       zhanxianlouzhu: '小明',
       pingbilouzhuplus: '小黑'
-    }), true)
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\' }), { zhanxianlouzhu: \'小明\', pingbi… 应等于 true')
   })
 
   await test('内容强化屏蔽不匹配 → 强制展现生效', () => {
     assertEqual(listfilter(makeItem({ content: '好东西' }), {
       zhanxianneirong: '好东西',
       pingbineirongplus: '坏东西'
-    }), true)
+    }), true, 'listfilter(makeItem({ content: \'好东西\' }), { zhanxianneirong: \'好东西\', pi… 应等于 true')
   })
 
   await test('只看它 + 天数过滤 + 分类屏蔽 → 三重过滤', () => {
@@ -2487,7 +2528,7 @@ console.log('========================================\n');
       zhanxianbiaoti: '京东',
       pingbifenlei: '微博',
       pingbitime: '5'
-    }), false) // 天数拦截优先
+    }), false, 'listfilter(makeItem({ catename: \'微博线报\', title: \'京东神券\', louzhuregtime:… 应等于 false') // 天数拦截优先
   })
 
   await test('只看它 + 楼主强制展现 → 只看它不生效', () => {
@@ -2495,7 +2536,7 @@ console.log('========================================\n');
       zhanxianlouzhu: '小明',
       pingbibiaoti: '(.*)',
       zhanxianbiaoti: '京东'
-    }), true) // 楼主show → 标题block被跳过
+    }), true, 'listfilter(makeItem({ louzhu: \'小明\', title: \'淘宝\' }), { zhanxianlouzhu:… 应等于 true') // 楼主show → 标题block被跳过
   })
 
   await test('配置全部填满且全部不匹配 → 保留', () => {
@@ -2511,148 +2552,148 @@ console.log('========================================\n');
       zhanxianneirong: 'R',
       pingbineirongplus: 'Q',
       pingbitime: '100'
-    }), true)
+    }), true, 'listfilter(makeItem({ catename: \'A\', louzhu: \'B\', title: \'C\', content… 应等于 true')
   })
 
-  // ==================== 27. compileRules 预编译 ====================
-  console.log('\n📂 27. compileRules 预编译')
+  // ==================== 28. compileRules 预编译 ====================
+  console.log('\n📂 28. compileRules 预编译')
 
   await test('compileRules 简单正则字段', () => {
     const r = compileRules({ pingbifenlei: '微博|赚客吧' })
-    assertEqual(r.pingbifenlei._type, 're')
-    assertEqual(r.pingbifenlei.re.test('微博线报'), true)
-    assertEqual(r.pingbifenlei.re.test('好单线报'), false)
+    assertEqual(r.pingbifenlei._type, 're', 'r.pingbifenlei._type 应等于 \'re\'')
+    assertEqual(r.pingbifenlei.re.test('微博线报'), true, 'r.pingbifenlei.re.test(\'微博线报\') 应等于 true')
+    assertEqual(r.pingbifenlei.re.test('好单线报'), false, 'r.pingbifenlei.re.test(\'好单线报\') 应等于 false')
   })
 
   await test('" 美妆 " 校验/编译一致（C048 trim口径）', () => {
     // 简单模式 validateConfig 与 compileRules 都使用 trim 后的值
     const cfg = { pingbibiaoti: ' 美妆 ' }
-    assertEqual(validateConfig(cfg).length, 0)
+    assertEqual(validateConfig(cfg).length, 0, 'validateConfig(cfg).length 应等于 0')
     const r = compileRules(cfg)
-    assertEqual(r.pingbibiaoti._type, 're')
-    assertEqual(r.pingbibiaoti.re.source, '美妆')
-    assertEqual(matchesCompiled(r.pingbibiaoti, '美妆', '线报'), true)
+    assertEqual(r.pingbibiaoti._type, 're', 'r.pingbibiaoti._type 应等于 \'re\'')
+    assertEqual(r.pingbibiaoti.re.source, '美妆', 'r.pingbibiaoti.re.source 应等于 \'美妆\'')
+    assertEqual(matchesCompiled(r.pingbibiaoti, '美妆', '线报'), true, 'matchesCompiled(r.pingbibiaoti, \'美妆\', \'线报\') 应等于 true')
 
     // trim 暴露出的非法正则：compileRules 会跳过，validateConfig 也必须告警
-    assertEqual(validateConfig({ pingbibiaoti: ' * ' }).length, 1)
-    assertEqual(compileRules({ pingbibiaoti: ' * ' }).pingbibiaoti, null)
+    assertEqual(validateConfig({ pingbibiaoti: ' * ' }).length, 1, 'validateConfig({ pingbibiaoti: \' * \' }).length 应等于 1')
+    assertEqual(compileRules({ pingbibiaoti: ' * ' }).pingbibiaoti, null, 'compileRules({ pingbibiaoti: \' * \' }).pingbibiaoti 应等于 null')
   })
 
   await test('compileRules ### 多分类字段', () => {
     const r = compileRules({ pingbilouzhu: '线报###小明\n\n线报###小黑' })
-    assertEqual(r.pingbilouzhu._type, 'multi')
-    assertEqual(r.pingbilouzhu.rules.length, 2)
+    assertEqual(r.pingbilouzhu._type, 'multi', 'r.pingbilouzhu._type 应等于 \'multi\'')
+    assertEqual(r.pingbilouzhu.rules.length, 2, 'r.pingbilouzhu.rules.length 应等于 2')
   })
 
   await test('compileRules pingbifenlei 遇 ### 被忽略', () => {
     const r = compileRules({ pingbifenlei: '微博###京东' })
-    assertEqual(r.pingbifenlei, null)
+    assertEqual(r.pingbifenlei, null, 'r.pingbifenlei 应等于 null')
   })
 
   await test('compileRules 天数简单规则', () => {
     const r = compileRules({ pingbitime: '5' })
-    assertEqual(r.pingbitime._type, 'time')
-    assertEqual(r.pingbitime.value, 5)
+    assertEqual(r.pingbitime._type, 'time', 'r.pingbitime._type 应等于 \'time\'')
+    assertEqual(r.pingbitime.value, 5, 'r.pingbitime.value 应等于 5')
   })
 
   await test('compileRules 天数多分类规则', () => {
     const r = compileRules({ pingbitime: '微博线报###5\n\n赚客吧###3' })
-    assertEqual(r.pingbitime._type, 'timeMulti')
-    assertEqual(r.pingbitime.rules.length, 2)
+    assertEqual(r.pingbitime._type, 'timeMulti', 'r.pingbitime._type 应等于 \'timeMulti\'')
+    assertEqual(r.pingbitime.rules.length, 2, 'r.pingbitime.rules.length 应等于 2')
   })
 
   await test('compileRules 无效正则安全处理', () => {
     const r = compileRules({ pingbibiaoti: '[未闭合' })
-    assertEqual(r.pingbibiaoti, null)
+    assertEqual(r.pingbibiaoti, null, 'r.pingbibiaoti 应等于 null')
   })
 
   await test('长文本完整匹配不截断（v3.270）', () => {
     const c = compileRules({ pingbibiaoti: 'forbidden' })
     const value = 'x'.repeat(4096) + 'forbidden'
-    assertEqual(matchesCompiled(c.pingbibiaoti, value, 'cat'), true)
-    assertEqual(whitelistFilter({ title: value }, 'title', 'forbidden'), true)
+    assertEqual(matchesCompiled(c.pingbibiaoti, value, 'cat'), true, 'matchesCompiled(c.pingbibiaoti, value, \'cat\') 应等于 true')
+    assertEqual(whitelistFilter({ title: value }, 'title', 'forbidden'), true, 'whitelistFilter({ title: value }, \'title\', \'forbidden\') 应等于 true')
   })
 
   await test('matchesCompiled 简单正则匹配', () => {
     const r = compileRules({ pingbibiaoti: '京东|淘宝' })
-    assertEqual(matchesCompiled(r.pingbibiaoti, '京东神券', '线报'), true)
-    assertEqual(matchesCompiled(r.pingbibiaoti, '拼多多', '线报'), false)
+    assertEqual(matchesCompiled(r.pingbibiaoti, '京东神券', '线报'), true, 'matchesCompiled(r.pingbibiaoti, \'京东神券\', \'线报\') 应等于 true')
+    assertEqual(matchesCompiled(r.pingbibiaoti, '拼多多', '线报'), false, 'matchesCompiled(r.pingbibiaoti, \'拼多多\', \'线报\') 应等于 false')
   })
 
   await test('matchesCompiled 零宽字符归一（C038）', () => {
     const r = compileRules({ pingbibiaoti: 'bad' })
-    assertEqual(matchesCompiled(r.pingbibiaoti, 'ba\u200Bd', '线报'), true)
+    assertEqual(matchesCompiled(r.pingbibiaoti, 'ba\u200Bd', '线报'), true, 'matchesCompiled(r.pingbibiaoti, \'ba\\u200Bd\', \'线报\') 应等于 true')
   })
 
   await test('matchesCompiled 多分类规则匹配', () => {
     const r = compileRules({ pingbilouzhu: '线报###小明\n\n线报###小黑' })
     // 分类匹配+值匹配 → true
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '微博线报'), true)
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '微博线报'), true, 'matchesCompiled(r.pingbilouzhu, \'小明\', \'微博线报\') 应等于 true')
     // 分类不匹配 → false
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '其他分类'), false)
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '其他分类'), false, 'matchesCompiled(r.pingbilouzhu, \'小明\', \'其他分类\') 应等于 false')
     // 值不匹配 → false
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小红', '微博线报'), false)
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小红', '微博线报'), false, 'matchesCompiled(r.pingbilouzhu, \'小红\', \'微博线报\') 应等于 false')
   })
 
   await test('checkTimeCompiled 简单天数', () => {
     const r = compileRules({ pingbitime: '5' })
     // 注册2天 → 5 > 2 → 拦截 true
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }), true)
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }), true, 'checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }) 应等于 true')
     // 注册100天 → 5 > 100? 否 → 不拦截 false
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(100) }), false)
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(100) }), false, 'checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(100) }) 应等于 false')
   })
 
   await test('checkTimeCompiled 多分类天数', () => {
     const r = compileRules({ pingbitime: '微博线报###5\n\n赚客吧###3' })
     // 分类匹配+超天数 → 拦截
-    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '微博线报', louzhuregtime: daysAgo(3) }), true)
+    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '微博线报', louzhuregtime: daysAgo(3) }), true, 'checkTimeCompiled(r.pingbitime, { catename: \'微博线报\', louzhuregtime: da… 应等于 true')
     // 分类不匹配 → 不拦截
-    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '好单线报', louzhuregtime: daysAgo(3) }), false)
+    assertEqual(checkTimeCompiled(r.pingbitime, { catename: '好单线报', louzhuregtime: daysAgo(3) }), false, 'checkTimeCompiled(r.pingbitime, { catename: \'好单线报\', louzhuregtime: da… 应等于 false')
   })
 
   await test('compileRules boolean 值 → null（v3.257 口径对齐）', () => {
     const r = compileRules({ pingbibiaoti: true })
-    assertEqual(r.pingbibiaoti, null)
+    assertEqual(r.pingbibiaoti, null, 'r.pingbibiaoti 应等于 null')
   })
 
   await test('compileRules BigInt 值 → null（v3.257 口径对齐）', () => {
     const r = compileRules({ pingbibiaoti: 5n })
-    assertEqual(r.pingbibiaoti, null)
+    assertEqual(r.pingbibiaoti, null, 'r.pingbibiaoti 应等于 null')
   })
 
   await test('compileRules function 值 → null（v3.257 口径对齐）', () => {
     const r = compileRules({ pingbibiaoti: () => {} })
-    assertEqual(r.pingbibiaoti, null)
+    assertEqual(r.pingbibiaoti, null, 'r.pingbibiaoti 应等于 null')
   })
 
   await test('compileRules 正常字符串规则不受影响', () => {
     const r = compileRules({ pingbibiaoti: '京东|淘宝' })
-    assertEqual(r.pingbibiaoti._type, 're')
-    assertEqual(r.pingbibiaoti.re.test('京东'), true)
+    assertEqual(r.pingbibiaoti._type, 're', 'r.pingbibiaoti._type 应等于 \'re\'')
+    assertEqual(r.pingbibiaoti.re.test('京东'), true, 'r.pingbibiaoti.re.test(\'京东\') 应等于 true')
   })
 
   // ==================== C007 _legacyCompileKey 字符串/对象同缓存键 ====================
-  console.log('\n📂 C007 _legacyCompileKey 字符串/对象同缓存键')
+  console.log('\n📂 29. C007 _legacyCompileKey 字符串/对象同缓存键')
 
   await test('C007 先字符串后对象：对象按 compileRules null 放行', () => {
-    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
-    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: { toString: () => 'x' } }), true)
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: \'x\' }) 应等于 false')
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: { toString: () => 'x' } }), true, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: { toString: () =… 应等于 true')
   })
 
   await test('C007 先对象后字符串：不互相污染', () => {
-    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: { toString: () => 'x' } }), true)
-    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: { toString: () => 'x' } }), true, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: { toString: () =… 应等于 true')
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: \'x\' }) 应等于 false')
   })
 
   await test('C007 同类型同值仍共享缓存', () => {
-    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
-    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false)
-    assertEqual(listfilter(makeItem({ title: 'y' }), { pingbibiaoti: { toString: () => 'y' } }), true)
-    assertEqual(listfilter(makeItem({ title: 'y' }), { pingbibiaoti: { toString: () => 'y' } }), true)
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: \'x\' }) 应等于 false')
+    assertEqual(listfilter(makeItem({ title: 'x' }), { pingbibiaoti: 'x' }), false, 'listfilter(makeItem({ title: \'x\' }), { pingbibiaoti: \'x\' }) 应等于 false')
+    assertEqual(listfilter(makeItem({ title: 'y' }), { pingbibiaoti: { toString: () => 'y' } }), true, 'listfilter(makeItem({ title: \'y\' }), { pingbibiaoti: { toString: () =… 应等于 true')
+    assertEqual(listfilter(makeItem({ title: 'y' }), { pingbibiaoti: { toString: () => 'y' } }), true, 'listfilter(makeItem({ title: \'y\' }), { pingbibiaoti: { toString: () =… 应等于 true')
   })
 
   // ==================== C015 filterHash 类型归一 ====================
-  console.log('\n📂 C015 filterHash 类型归一')
+  console.log('\n📂 30. C015 filterHash 类型归一')
 
   await test('C015 filterHash number 0 与 string "0" 哈希不同', () => {
     assertEqual(filterHash({ pingbibiaoti: 0 }) === filterHash({ pingbibiaoti: '0' }), false, '0 与 "0" 应不同哈希')
@@ -2665,102 +2706,103 @@ console.log('========================================\n');
     assertEqual(a === b, true, '相同输入应产生相同哈希')
     // 64 位拼接形态（两段 32 位，'-' 分隔）
     assertEqual(typeof a === 'string' && a.includes('-'), true, `应输出 64 位拼接形态: ${a}`)
-    assertEqual(a.split('-').length === 2, true)
+    assertEqual(a.split('-').length === 2, true, 'a.split(\'-\').length === 2 应等于 true')
     // 不同输入 → 不同哈希
-    assertEqual(filterHash({ pingbibiaoti: '京东' }) === filterHash({ pingbibiaoti: '淘宝' }), false)
+    assertEqual(filterHash({ pingbibiaoti: '京东' }) === filterHash({ pingbibiaoti: '淘宝' }), false, 'filterHash({ pingbibiaoti: \'京东\' }) === filterHash({ pingbibiaoti: \'淘宝… 应等于 false')
   })
 
   await test('validateConfig 对 true 仍告警（v3.257 口径对齐）', () => {
     const warns = validateConfig({ pingbibiaoti: true })
-    assertEqual(warns.length, 1)
-    assertEqual(warns[0].includes('应为字符串'), true)
+    assertEqual(warns.length, 1, 'warns.length 应等于 1')
+    assertEqual(warns[0].includes('应为字符串'), true, 'warns[0].includes(\'应为字符串\') 应等于 true')
   })
 
-  // ==================== 28. whitelistFilter ====================
-  console.log('\n📂 28. whitelistFilter')
+  // ==================== 31. whitelistFilter ====================
+  console.log('\n📂 31. whitelistFilter')
 
   await test('whitelistFilter 空关键词 → 全部通过', () => {
-    assertEqual(whitelistFilter({ title: '随便' }, 'title', ''), true)
+    assertEqual(whitelistFilter({ title: '随便' }, 'title', ''), true, 'whitelistFilter({ title: \'随便\' }, \'title\', \'\') 应等于 true')
   })
 
   await test('whitelistFilter 非字符串 keyword → 放行', () => {
-    assertEqual(whitelistFilter({ title: 'foo' }, 'title', { toString: () => 'bar' }), true)
+    assertEqual(whitelistFilter({ title: 'foo' }, 'title', { toString: () => 'bar' }), true, 'whitelistFilter({ title: \'foo\' }, \'title\', { toString: () => \'bar\' }) 应等于 true')
   })
 
   await test('whitelistFilter 标题匹配', () => {
-    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true)
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \'京东\') 应等于 true')
   })
 
   await test('whitelistFilter 标题不匹配', () => {
-    assertEqual(whitelistFilter({ title: '淘宝特价' }, 'title', '京东'), false)
+    assertEqual(whitelistFilter({ title: '淘宝特价' }, 'title', '京东'), false, 'whitelistFilter({ title: \'淘宝特价\' }, \'title\', \'京东\') 应等于 false')
   })
 
   // 专杀 `hasNestedQuantifier(kwStr) → false`：风险关键词必须整条放行，不得退化成真匹配。
   // 取值故意不带 'a'，一旦闸门被去掉，RE2 编译成功但 test 为 false → 会被判「不匹配」而拦截。
   await test('whitelistFilter 嵌套量词关键词 → 一律放行（闸门不得退化成真匹配）', () => {
-    assertEqual(whitelistFilter({ title: 'zzz' }, 'title', '(a+)+'), true)
-    assertEqual(whitelistFilter({ title: 'zzz' }, 'title', '(a|a)+$'), true)
+    assertEqual(whitelistFilter({ title: 'zzz' }, 'title', '(a+)+'), true, 'whitelistFilter({ title: \'zzz\' }, \'title\', \'(a+)+\') 应等于 true')
+    assertEqual(whitelistFilter({ title: 'zzz' }, 'title', '(a|a)+$'), true, 'whitelistFilter({ title: \'zzz\' }, \'title\', \'(a|a)+$\') 应等于 true')
   })
 
   await test('whitelistFilter 内容字段匹配', () => {
-    assertEqual(whitelistFilter({ content: '限时抢购' }, 'content', '抢购'), true)
+    assertEqual(whitelistFilter({ content: '限时抢购' }, 'content', '抢购'), true, 'whitelistFilter({ content: \'限时抢购\' }, \'content\', \'抢购\') 应等于 true')
   })
 
   await test('whitelistFilter 楼主字段匹配', () => {
-    assertEqual(whitelistFilter({ louzhu: '小明' }, 'louzhu', '小明'), true)
+    assertEqual(whitelistFilter({ louzhu: '小明' }, 'louzhu', '小明'), true, 'whitelistFilter({ louzhu: \'小明\' }, \'louzhu\', \'小明\') 应等于 true')
   })
 
   await test('whitelistFilter 字段值缺失 → 放行（与 App.run 保留空标题口径一致）', () => {
-    assertEqual(whitelistFilter({}, 'title', '京东'), true)
+    assertEqual(whitelistFilter({}, 'title', '京东'), true, 'whitelistFilter({}, \'title\', \'京东\') 应等于 true')
   })
 
   await test('whitelistFilter 无效正则 → 放行（与 App.run 预编译失败口径一致）', () => {
-    assertEqual(whitelistFilter({ title: '京东' }, 'title', '[未闭合'), true)
+    assertEqual(whitelistFilter({ title: '京东' }, 'title', '[未闭合'), true, 'whitelistFilter({ title: \'京东\' }, \'title\', \'[未闭合\') 应等于 true')
   })
 
   await test('whitelistFilter 空串 + .* → true（空串视为缺失，不参与白名单匹配也不拦截）', () => {
-    assertEqual(whitelistFilter({ title: '' }, 'title', '.*'), true)
+    assertEqual(whitelistFilter({ title: '' }, 'title', '.*'), true, 'whitelistFilter({ title: \'\' }, \'title\', \'.*\') 应等于 true')
   })
 
   await test('whitelistFilter 空串 + 非空关键词 → true（与 App.run 空标题保留一致）', () => {
-    assertEqual(whitelistFilter({ title: '' }, 'title', 'abc'), true)
-    assertEqual(whitelistFilter({ title: '' }, 'title', 'foo'), true)
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'abc'), true, 'whitelistFilter({ title: \'\' }, \'title\', \'abc\') 应等于 true')
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'foo'), true, 'whitelistFilter({ title: \'\' }, \'title\', \'foo\') 应等于 true')
   })
 
   await test('whitelistFilter 0 + 关键词 "0" → true（0 参与匹配）', () => {
-    assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), true)
+    assertEqual(whitelistFilter({ title: 0 }, 'title', '0'), true, 'whitelistFilter({ title: 0 }, \'title\', \'0\') 应等于 true')
   })
 
   await test('whitelistFilter undefined → true（缺失视为放行）', () => {
-    assertEqual(whitelistFilter({ title: undefined }, 'title', '.*'), true)
+    assertEqual(whitelistFilter({ title: undefined }, 'title', '.*'), true, 'whitelistFilter({ title: undefined }, \'title\', \'.*\') 应等于 true')
   })
 
   await test('whitelistFilter 正常值匹配不受影响', () => {
-    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true)
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \'京东\') 应等于 true')
   })
 
-  // ==================== 29. saveBatch 批量写入 ====================
-  console.log('\n📂 29. saveBatch 批量写入')
+  // ==================== 32. saveBatch 批量写入 ====================
+  console.log('\n📂 32. saveBatch 批量写入')
 
   await test('saveBatch 批量写入多条', () => {
     saveBatch([{ id: 1 }, { id: 2 }, { id: 3 }], 'test_batch.json')
-    assertEqual(isMessageInFile({ id: 1 }, 'test_batch.json'), true)
-    assertEqual(isMessageInFile({ id: 2 }, 'test_batch.json'), true)
-    assertEqual(isMessageInFile({ id: 3 }, 'test_batch.json'), true)
+    assertEqual(isMessageInFile({ id: 1 }, 'test_batch.json'), true, 'isMessageInFile({ id: 1 }, \'test_batch.json\') 应等于 true')
+    assertEqual(isMessageInFile({ id: 2 }, 'test_batch.json'), true, 'isMessageInFile({ id: 2 }, \'test_batch.json\') 应等于 true')
+    assertEqual(isMessageInFile({ id: 3 }, 'test_batch.json'), true, 'isMessageInFile({ id: 3 }, \'test_batch.json\') 应等于 true')
   })
 
   await test('saveBatch 空数组 → 不报错', () => {
-    saveBatch([], 'test_batch_empty.json')
-    assertEqual(true, true)
+    // C5-019：契约是「不抛」（旧 assertEqual(true,true) 永远不会红），并断言确实没写入任何消息
+    assert.doesNotThrow(() => saveBatch([], 'test_batch_empty.json'), '空数组不得抛错')
+    assertEqual(readMessages(getFilePath('test_batch_empty.json')).length, 0, '空数组不得写入任何消息')
   })
 
   await test('saveBatch 含重复 id → 更新不重复', () => {
     saveBatch([{ id: 10, v: 'a' }, { id: 10, v: 'b' }], 'test_batch_dup.json')
     // 应该只有一条
-    assertEqual(isMessageInFile({ id: 10 }, 'test_batch_dup.json'), true)
+    assertEqual(isMessageInFile({ id: 10 }, 'test_batch_dup.json'), true, 'isMessageInFile({ id: 10 }, \'test_batch_dup.json\') 应等于 true')
     const fs = require('fs')
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_batch_dup.json'), 'utf8'))
-    assertEqual(msgs.filter(m => m.id === 10).length, 1)
+    assertEqual(msgs.filter(m => m.id === 10).length, 1, 'msgs.filter(m => m.id === 10).length 应等于 1')
   })
 
   await test('saveBatch 共享 addIndex 后索引化判重一致（f7）', () => {
@@ -2777,48 +2819,48 @@ console.log('========================================\n');
     assertEqual(msgs.length, 2, '共享 addIndex 后总条数不应因索引失效而膨胀')
   })
 
-  // ==================== 30. init & decodeHtmlEntities ====================
-  console.log('\n📂 30. init & decodeHtmlEntities')
+  // ==================== 33. init & decodeHtmlEntities ====================
+  console.log('\n📂 33. init & decodeHtmlEntities')
 
   await test('init 重复调用 → 不报错', () => {
-    init()
-    init()
-    assertEqual(true, true)
+    // C5-019：契约是「重复调用不抛」（旧 assertEqual(true,true) 永远不会红）
+    assert.doesNotThrow(() => { init(); init() }, '重复 init 不得抛错')
+    assertEqual(require('fs').existsSync(CACHE), true, '重复 init 后缓存目录仍存在')
   })
 
   await test('decodeHtmlEntities 全部常见实体', () => {
-    assertEqual(decodeHtmlEntities('&amp; &lt; &gt; &quot; &apos; &nbsp;'), "& < > \" '  ")
+    assertEqual(decodeHtmlEntities('&amp; &lt; &gt; &quot; &apos; &nbsp;'), "& < > \" '  ", 'decodeHtmlEntities(\'&amp; &lt; &gt; &quot; &apos; &nbsp;\') 应等于 "& < > \\" \' "')
   })
 
   await test('decodeHtmlEntities 空字符串 → 原样', () => {
-    assertEqual(decodeHtmlEntities(''), '')
+    assertEqual(decodeHtmlEntities(''), '', 'decodeHtmlEntities(\'\') 应等于 \'\'')
   })
 
   await test('decodeHtmlEntities 无实体 → 原样', () => {
-    assertEqual(decodeHtmlEntities('普通文本123'), '普通文本123')
+    assertEqual(decodeHtmlEntities('普通文本123'), '普通文本123', 'decodeHtmlEntities(\'普通文本123\') 应等于 \'普通文本123\'')
   })
 
   await test('decodeHtmlEntities 混合实体和文本', () => {
-    assertEqual(decodeHtmlEntities('a&amp;b&lt;c'), 'a&b<c')
+    assertEqual(decodeHtmlEntities('a&amp;b&lt;c'), 'a&b<c', 'decodeHtmlEntities(\'a&amp;b&lt;c\') 应等于 \'a&b<c\'')
   })
 
-  // ==================== 31. Formatter 惰性计算 ====================
-  console.log('\n📂 31. Formatter 惰性计算')
+  // ==================== 34. Formatter 惰性计算 ====================
+  console.log('\n📂 34. Formatter 惰性计算')
 
   await test('模板不用Markdown → 不触发htmlToMarkdown', () => {
     // 模板不含 {Markdown内容} → 结果里没有Markdown相关内容，正常输出标题
     const r = tuisong_replace('【{分类名}】{标题}', {
       catename: '线报', title: '测试', url: 'x'
     })
-    assertEqual(r, '【线报】测试')
+    assertEqual(r, '【线报】测试', 'r 应等于 \'【线报】测试\'')
   })
 
   await test('模板用Markdown → 正常输出', () => {
     const r = tuisong_replace('{Markdown内容}', {
       content_html: '<h2>标题</h2>', url: 'http://x'
     })
-    assertEqual(r.includes('## 标题'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('## 标题'), true, 'r.includes(\'## 标题\') 应等于 true')
+    assertEqual(r.includes('原文链接'), true, 'r.includes(\'原文链接\') 应等于 true')
   })
 
   await test('模板不用Html内容 → rawHtml 惰性生效（100k content_html <500ms）', () => {
@@ -2826,7 +2868,7 @@ console.log('========================================\n');
     const t0 = Date.now()
     const r = tuisong_replace('{标题}', { title: '测试', content_html: big })
     const dt = Date.now() - t0
-    assertEqual(r, '测试')
+    assertEqual(r, '测试', 'r 应等于 \'测试\'')
     const perfBudget = perfLimit(500) // 默认 500ms；沙箱按 PERF_MS 缩放（见文件头 PERF_MS 注释）
     assertEqual(dt < perfBudget, true, `耗时 ${dt}ms 应 <${perfBudget}ms`)
   })
@@ -2835,88 +2877,94 @@ console.log('========================================\n');
     const r = tuisong_replace('{Html内容}', {
       content_html: '<p>hello</p>', url: 'http://x'
     })
-    assertEqual(r.includes('hello'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('hello'), true, 'r.includes(\'hello\') 应等于 true')
   })
 
-  // ==================== 32. has() url fallback 判重 ====================
-  console.log('\n📂 32. has() url fallback 判重')
+  // ==================== 35. has() url fallback 判重 ====================
+  console.log('\n📂 35. has() url fallback 判重')
 
   await test('无id+相同url → 判重', () => {
     appendMessageToFile({ url: '/x/1.html', title: 'a' }, 'test_urlfb.json')
-    assertEqual(isMessageInFile({ url: '/x/1.html', title: 'b' }, 'test_urlfb.json'), true)
+    assertEqual(isMessageInFile({ url: '/x/1.html', title: 'b' }, 'test_urlfb.json'), true, 'isMessageInFile({ url: \'/x/1.html\', title: \'b\' }, \'test_urlfb.json\') 应等于 true')
   })
 
   await test('无id+不同url → 不判重', () => {
     appendMessageToFile({ url: '/x/2.html', title: 'a' }, 'test_urlfb.json')
-    assertEqual(isMessageInFile({ url: '/x/3.html', title: 'b' }, 'test_urlfb.json'), false)
+    assertEqual(isMessageInFile({ url: '/x/3.html', title: 'b' }, 'test_urlfb.json'), false, 'isMessageInFile({ url: \'/x/3.html\', title: \'b\' }, \'test_urlfb.json\') 应等于 false')
   })
 
   await test('有id优先用id判重（url不同也无所谓）', () => {
     appendMessageToFile({ id: 999, url: '/x/old.html' }, 'test_urlfb2.json')
     // 同id但不同url → 判重
-    assertEqual(isMessageInFile({ id: 999, url: '/x/new.html' }, 'test_urlfb2.json'), true)
+    assertEqual(isMessageInFile({ id: 999, url: '/x/new.html' }, 'test_urlfb2.json'), true, 'isMessageInFile({ id: 999, url: \'/x/new.html\' }, \'test_urlfb2.json\') 应等于 true')
   })
 
   await test('无id且无url → 不误判重复', () => {
     appendMessageToFile({ title: '无标识' }, 'test_urlfb3.json')
     // 两个都无id无url → 不应判重（避免 undefined===undefined 误判）
-    assertEqual(isMessageInFile({ title: '另一个无标识' }, 'test_urlfb3.json'), false)
+    assertEqual(isMessageInFile({ title: '另一个无标识' }, 'test_urlfb3.json'), false, 'isMessageInFile({ title: \'另一个无标识\' }, \'test_urlfb3.json\') 应等于 false')
   })
 
-  // ==================== 33. Config getter ====================
-  console.log('\n📂 33. Config getter')
+  // ==================== 36. Config getter ====================
+  console.log('\n📂 36. Config getter')
 
   await test('Config.api.pushUrl 正确拼接', () => {
-    assertEqual(Config.api.pushUrl, Config.domain + '/plus/json/push.json')
+    assertEqual(Config.api.pushUrl, Config.domain + '/plus/json/push.json', 'Config.api.pushUrl 应等于 Config.domain + \'/plus/json/push.json\'')
   })
 
   await test('Config.filter 包含完整过滤配置字段', () => {
-    assertEqual(typeof Config.filter.pingbifenlei, 'string')
-    assertEqual(typeof Config.filter.pingbibiaoti, 'string')
-    assertEqual(typeof Config.filter.zhanxianbiaoti, 'string')
-    assertEqual(typeof Config.filter.pingbibiaotiplus, 'string')
-    assertEqual(typeof Config.filter.pingbineirong, 'string')
-    assertEqual(typeof Config.filter.zhanxianneirong, 'string')
-    assertEqual(typeof Config.filter.pingbineirongplus, 'string')
-    assertEqual(typeof Config.filter.pingbilouzhu, 'string')
-    assertEqual(typeof Config.filter.zhanxianlouzhu, 'string')
-    assertEqual(typeof Config.filter.pingbilouzhuplus, 'string')
-    assertEqual(typeof Config.filter.pingbitime, 'string')
+    assertEqual(typeof Config.filter.pingbifenlei, 'string', 'typeof Config.filter.pingbifenlei 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbibiaoti, 'string', 'typeof Config.filter.pingbibiaoti 应等于 \'string\'')
+    assertEqual(typeof Config.filter.zhanxianbiaoti, 'string', 'typeof Config.filter.zhanxianbiaoti 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbibiaotiplus, 'string', 'typeof Config.filter.pingbibiaotiplus 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbineirong, 'string', 'typeof Config.filter.pingbineirong 应等于 \'string\'')
+    assertEqual(typeof Config.filter.zhanxianneirong, 'string', 'typeof Config.filter.zhanxianneirong 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbineirongplus, 'string', 'typeof Config.filter.pingbineirongplus 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbilouzhu, 'string', 'typeof Config.filter.pingbilouzhu 应等于 \'string\'')
+    assertEqual(typeof Config.filter.zhanxianlouzhu, 'string', 'typeof Config.filter.zhanxianlouzhu 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbilouzhuplus, 'string', 'typeof Config.filter.pingbilouzhuplus 应等于 \'string\'')
+    assertEqual(typeof Config.filter.pingbitime, 'string', 'typeof Config.filter.pingbitime 应等于 \'string\'')
+    // C4-008：11 条 typeof 只证明「都是字符串」，缺字段 / 多字段 / 默认配置编译不了都照样绿
+    assert.deepStrictEqual(Object.keys(Config.filter).sort(),
+      ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu', 'pingbilouzhuplus',
+        'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti', 'zhanxianlouzhu',
+        'zhanxianneirong'],
+      '默认过滤配置的字段集合必须与 compileRules 口径一致（缺/多都算回归）')
+    assertEqual(compileRules(Config.filter).__compiled, true, '默认过滤配置必须能编译出 __compiled')
   })
 
   await test('修改 domain 后 pushUrl 联动变化', () => {
     const original = Config.domain
     Config.domain = 'https://example.com'
-    assertEqual(Config.api.pushUrl, 'https://example.com/plus/json/push.json')
+    assertEqual(Config.api.pushUrl, 'https://example.com/plus/json/push.json', 'Config.api.pushUrl 应等于 \'https://example.com/plus/json/push.json\'')
     Config.domain = original // 恢复
   })
 
-  // ==================== 34. fetchData ====================
-  console.log('\n📂 34. fetchData')
+  // ==================== 37. fetchData ====================
+  console.log('\n📂 37. fetchData')
 
-  // ==================== 35. daysComputed 边界 ====================
-  console.log('\n📂 35. daysComputed 边界')
+  // ==================== 38. daysComputed 边界 ====================
+  console.log('\n📂 38. daysComputed 边界')
 
   await test('daysComputed 正常日期', () => {
-    assertEqual(typeof daysComputed('2026-07-28'), 'number')
-    assertEqual(daysComputed('2026-07-28') >= 0, true)
+    assertEqual(typeof daysComputed('2026-07-28'), 'number', 'typeof daysComputed(\'2026-07-28\') 应等于 \'number\'')
+    assertEqual(daysComputed('2026-07-28') >= 0, true, 'daysComputed(\'2026-07-28\') >= 0 应等于 true')
   })
 
   await test('daysComputed 空字符串 → 0', () => {
-    assertEqual(daysComputed(''), 0)
+    assertEqual(daysComputed(''), 0, 'daysComputed(\'\') 应等于 0')
   })
 
   await test('daysComputed undefined → 0', () => {
-    assertEqual(daysComputed(undefined), 0)
+    assertEqual(daysComputed(undefined), 0, 'daysComputed(undefined) 应等于 0')
   })
 
   await test('daysComputed 非法格式 → 0', () => {
-    assertEqual(daysComputed('not-a-date'), 0)
+    assertEqual(daysComputed('not-a-date'), 0, 'daysComputed(\'not-a-date\') 应等于 0')
   })
 
   await test('daysComputed 未来日期 → 0', () => {
-    assertEqual(daysComputed('2030-01-01'), 0)
+    assertEqual(daysComputed('2030-01-01'), 0, 'daysComputed(\'2030-01-01\') 应等于 0')
   })
 
   await test('daysComputed 带时刻注册：UTC 自然日差（v3.170 修复 24h 段少算 1 天）', () => {
@@ -3113,69 +3161,69 @@ console.log('========================================\n');
     assertEqual(tuisong_replace('{链接}', { url: '/haodan/123.html', title: 't' }), '/haodan/123.html', '相对路径保留')
   })
 
-  // ==================== 36. _splitLines 解析 ====================
-  console.log('\n📂 36. _splitLines 解析')
+  // ==================== 39. _splitLines 解析 ====================
+  console.log('\n📂 39. _splitLines 解析')
 
   await test('_splitLines 有### → 返回行数组（v3.22审查12：支持单\n）', () => {
     const lines = _splitLines('a###1\n\nb###2')
     // 单 \n 也作为分隔符（\n\n 会拆出空行）
-    assertEqual(lines.includes('a###1'), true)
-    assertEqual(lines.includes('b###2'), true)
+    assertEqual(lines.includes('a###1'), true, 'lines.includes(\'a###1\') 应等于 true')
+    assertEqual(lines.includes('b###2'), true, 'lines.includes(\'b###2\') 应等于 true')
     // 单 \n 分隔
     const lines2 = _splitLines('a###1\nb###2')
-    assertEqual(lines2.includes('a###1'), true)
-    assertEqual(lines2.includes('b###2'), true)
+    assertEqual(lines2.includes('a###1'), true, 'lines2.includes(\'a###1\') 应等于 true')
+    assertEqual(lines2.includes('b###2'), true, 'lines2.includes(\'b###2\') 应等于 true')
   })
 
   await test('_splitLines 无### → 返回null', () => {
-    assertEqual(_splitLines('京东|淘宝'), null)
+    assertEqual(_splitLines('京东|淘宝'), null, '_splitLines(\'京东|淘宝\') 应等于 null')
   })
 
   await test('_splitLines 空字符串 → 空数组', () => {
-    assertEqual(_splitLines('').length, 0)
+    assertEqual(_splitLines('').length, 0, '_splitLines(\'\').length 应等于 0')
   })
 
-  // ==================== 37. 过滤子方法直接测 ====================
-  console.log('\n📂 37. 过滤子方法直接测')
+  // ==================== 40. 过滤子方法直接测 ====================
+  console.log('\n📂 40. 过滤子方法直接测')
 
   await test('checkRegisterTime 无配置 → 通过', () => {
-    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(4) }, null), true)
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(4) }, null), true, 'checkRegisterTime({ louzhuregtime: daysAgo(4) }, null) 应等于 true')
   })
 
   await test('checkRegisterTime 天数拦截', () => {
     const compiled = compileRules({ pingbitime: '5' })
     // 注册2天 → 5>2 → 拦截 → checkRegisterTime 返回 false
-    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(3) }, compiled.pingbitime), false)
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(3) }, compiled.pingbitime), false, 'checkRegisterTime({ louzhuregtime: daysAgo(3) }, compiled.pingbitime) 应等于 false')
   })
 
   await test('checkRegisterTime 天数通过', () => {
     const compiled = compileRules({ pingbitime: '5' })
     // 注册100天 → 5>100? 否 → 通过
-    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(100) }, compiled.pingbitime), true)
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(100) }, compiled.pingbitime), true, 'checkRegisterTime({ louzhuregtime: daysAgo(100) }, compiled.pingbitim… 应等于 true')
   })
 
   await test('checkCategory 无配置 → 通过', () => {
-    assertEqual(checkCategory({ catename: '微博线报' }, null), true)
+    assertEqual(checkCategory({ catename: '微博线报' }, null), true, 'checkCategory({ catename: \'微博线报\' }, null) 应等于 true')
   })
 
   await test('checkCategory 分类匹配 → 拦截', () => {
     const compiled = compileRules({ pingbifenlei: '微博|赚客吧' })
-    assertEqual(checkCategory({ catename: '微博线报' }, compiled.pingbifenlei), false)
+    assertEqual(checkCategory({ catename: '微博线报' }, compiled.pingbifenlei), false, 'checkCategory({ catename: \'微博线报\' }, compiled.pingbifenlei) 应等于 false')
   })
 
   await test('checkCategory 分类不匹配 → 通过', () => {
     const compiled = compileRules({ pingbifenlei: '微博|赚客吧' })
-    assertEqual(checkCategory({ catename: '好单线报' }, compiled.pingbifenlei), true)
+    assertEqual(checkCategory({ catename: '好单线报' }, compiled.pingbifenlei), true, 'checkCategory({ catename: \'好单线报\' }, compiled.pingbifenlei) 应等于 true')
   })
 
   await test('checkFields 楼主block拦截', () => {
     const compiled = compileRules({ pingbilouzhu: '小黑' })
-    assertEqual(checkFields({ louzhu: '小黑', title: 'x', content: 'y' }, compiled), false)
+    assertEqual(checkFields({ louzhu: '小黑', title: 'x', content: 'y' }, compiled), false, 'checkFields({ louzhu: \'小黑\', title: \'x\', content: \'y\' }, compiled) 应等于 false')
   })
 
   await test('checkFields 楼主show优先', () => {
     const compiled = compileRules({ zhanxianlouzhu: '小明', pingbilouzhu: '小明' })
-    assertEqual(checkFields({ louzhu: '小明', title: 'x', content: 'y' }, compiled), true)
+    assertEqual(checkFields({ louzhu: '小明', title: 'x', content: 'y' }, compiled), true, 'checkFields({ louzhu: \'小明\', title: \'x\', content: \'y\' }, compiled) 应等于 true')
   })
 
   await test('checkFields 0/false 字段值参与匹配（P2：与 matchesCompiled C013 契约一致）', () => {
@@ -3192,51 +3240,52 @@ console.log('========================================\n');
 
   await test('checkFields 强化屏蔽抵消展现', () => {
     const compiled = compileRules({ zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' })
-    assertEqual(checkFields({ louzhu: 'x', title: '京东', content: 'y' }, compiled), false)
+    assertEqual(checkFields({ louzhu: 'x', title: '京东', content: 'y' }, compiled), false, 'checkFields({ louzhu: \'x\', title: \'京东\', content: \'y\' }, compiled) 应等于 false')
   })
 
   await test('checkFields 无任何配置 → 通过', () => {
     const compiled = compileRules({})
-    assertEqual(checkFields({ louzhu: 'x', title: 'y', content: 'z' }, compiled), true)
+    assertEqual(checkFields({ louzhu: 'x', title: 'y', content: 'z' }, compiled), true, 'checkFields({ louzhu: \'x\', title: \'y\', content: \'z\' }, compiled) 应等于 true')
   })
 
-  // ==================== 38. 缓存内部方法 ====================
-  console.log('\n📂 38. 缓存内部方法')
+  // ==================== 41. 缓存内部方法 ====================
+  console.log('\n📂 41. 缓存内部方法')
 
   await test('getFilePath 拼接路径', () => {
     const p = getFilePath('test.json')
-    assertEqual(p.endsWith('test.json'), true)
+    assertEqual(p.endsWith('test.json'), true, 'p.endsWith(\'test.json\') 应等于 true')
   })
 
   await test('getFilePath 非信息文件名回退 default.json（v3.176 修复#4）', () => {
     // 对象/布尔 String 化产物曾产生 xianbaoku_cache/[object Object] 垃圾文件——与 getFileName 口径一致
     // （不断言完整路径——前置测试可能改过 Config.cache.dir；只断言文件名部分与无垃圾名）
-    assertEqual(getFilePath({}).endsWith('default.json'), true)
-    assertEqual(getFilePath({}).includes('[object Object]'), false)
-    assertEqual(getFilePath(undefined).endsWith('default.json'), true)
-    assertEqual(getFilePath(null).endsWith('default.json'), true)
-    assertEqual(getFilePath(true).endsWith('default.json'), true)
-    assertEqual(getFilePath('').endsWith('default.json'), true)
+    assertEqual(getFilePath({}).endsWith('default.json'), true, 'getFilePath({}).endsWith(\'default.json\') 应等于 true')
+    assertEqual(getFilePath({}).includes('[object Object]'), false, 'getFilePath({}).includes(\'[object Object]\') 应等于 false')
+    assertEqual(getFilePath(undefined).endsWith('default.json'), true, 'getFilePath(undefined).endsWith(\'default.json\') 应等于 true')
+    assertEqual(getFilePath(null).endsWith('default.json'), true, 'getFilePath(null).endsWith(\'default.json\') 应等于 true')
+    assertEqual(getFilePath(true).endsWith('default.json'), true, 'getFilePath(true).endsWith(\'default.json\') 应等于 true')
+    assertEqual(getFilePath('').endsWith('default.json'), true, 'getFilePath(\'\').endsWith(\'default.json\') 应等于 true')
     // 正常文件名不受影响
-    assertEqual(getFilePath('正常.json').endsWith('正常.json'), true)
+    assertEqual(getFilePath('正常.json').endsWith('正常.json'), true, 'getFilePath(\'正常.json\').endsWith(\'正常.json\') 应等于 true')
   })
 
   await test('_ensureFileExists 创建文件', () => {
     _ensureFileExists(path.join(CACHE, 'test_ensure.json'))
-    assertEqual(require('fs').existsSync(path.join(CACHE, 'test_ensure.json')), true)
+    assertEqual(require('fs').existsSync(path.join(CACHE, 'test_ensure.json')), true, 'require(\'fs\').existsSync(path.join(CACHE, \'test_ensure.json\')) 应等于 true')
   })
 
   await test('readMessages 空文件返回[]', () => {
     _ensureFileExists(path.join(CACHE, 'test_read.json'))
     const msgs = readMessages(path.join(CACHE, 'test_read.json'))
-    assertEqual(Array.isArray(msgs), true)
+    assertEqual(Array.isArray(msgs), true, 'Array.isArray(msgs) 应等于 true')
+    assertEqual(msgs.length, 0, '空文件应返回空数组（返回占位元素/脏数据都算回归）')
   })
 
   await test('saveMessages 写入后 readMessages 可读', () => {
     const p = path.join(CACHE, 'test_wr.json')
     saveMessages(p, [{ id: 1 }, { id: 2 }])
     const msgs = readMessages(p)
-    assertEqual(msgs.length, 2)
+    assertEqual(msgs.length, 2, 'msgs.length 应等于 2')
   })
 
   await test('缓存初始化独占创建：不覆盖已存在文件（CodeAnt）', () => {
@@ -3250,7 +3299,7 @@ console.log('========================================\n');
     const p2 = path.join(CACHE, 'test_init_absent.json')
     const ok2 = writeAtomicIfAbsent(p2, '[]', '测试')
     assertEqual(ok2, true, '缺失文件应创建')
-    assertEqual(fs.readFileSync(p2, 'utf8'), '[]')
+    assertEqual(fs.readFileSync(p2, 'utf8'), '[]', 'fs.readFileSync(p2, \'utf8\') 应等于 \'[]\'')
   })
 
   await test('saveMessages 单条超读端上限 → 跳过落盘（防 tooLarge 自锁）', () => {
@@ -3261,7 +3310,7 @@ console.log('========================================\n');
     assertEqual(fs.existsSync(p), false, '不应写出超限缓存文件（F1 后读端仍能尾部恢复，但会多一次「旧身份重推」的代价；写端不得自造超限件）')
     const ok2 = saveMessages(p, [{ id: 1 }, { id: 2 }])
     assertEqual(ok2, true, '正常写入不应受影响')
-    assertEqual(readMessages(p).length, 2)
+    assertEqual(readMessages(p).length, 2, 'readMessages(p).length 应等于 2')
   })
 
   await test('saveMessages 非数组入参 → 返回 false 且不写空缓存（P2：防清空缓存路径）', () => {
@@ -3271,58 +3320,44 @@ console.log('========================================\n');
     assertEqual(ok, false, '非数组写入应被拒绝返回 false')
     const msgs = readMessages(p)
     assertEqual(msgs.length, 1, '非数组写入不应把缓存覆写为空数组')
-    assertEqual(msgs[0].id, 1)
+    assertEqual(msgs[0].id, 1, 'msgs[0].id 应等于 1')
   })
 
-  await test('saveMessages 超过maxSize自动裁剪', () => {
+  await test('saveMessages 超过maxSize自动裁剪', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_trim2.json')
     const many = []
     for (let i = 0; i < 150; i++) many.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限
-    try {
-      saveMessages(p, many)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, many)
     const msgs = readMessages(p)
-    assertEqual(msgs.length <= 100, true)
-  })
+    assertEqual(msgs.length <= 100, true, 'msgs.length <= 100 应等于 true')
+  }))
 
-  await test('saveMessages maxSize 字符串配置生效（v3.176 修复#1：层间一致）', () => {
+  await test('saveMessages maxSize 字符串配置生效（v3.176 修复#1：层间一致）', () => withCacheMaxSize('5000', () => {
     const p = path.join(CACHE, 'test_trim3.json')
     const many = []
     for (let i = 0; i < 12000; i++) many.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = '5000' // 环境变量字符串（validateConfig 认合法，函数层曾静默回退 10000）
-    try {
-      saveMessages(p, many)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, many)
     const msgs = readMessages(p)
     assertEqual(msgs.length, 5000, `字符串 maxSize '5000' 应生效（曾回退默认 10000），实际 ${msgs.length}`)
-  })
+  }))
 
-  // ==================== 39. {Html内容} 惰性计算分支 ====================
-  console.log('\n📂 39. {Html内容} 惰性计算分支')
+  // ==================== 42. {Html内容} 惰性计算分支 ====================
+  console.log('\n📂 42. {Html内容} 惰性计算分支')
 
   await test('模板用{Html内容} → 正常输出HTML', () => {
     const r = tuisong_replace('{Html内容}', {
       content_html: '测试<b>加粗</b>', url: 'http://x'
     })
-    assertEqual(r.includes('测试'), true)
-    assertEqual(r.includes('<b>'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('测试'), true, 'r.includes(\'测试\') 应等于 true')
+    assertEqual(r.includes('<b>'), true, 'r.includes(\'<b>\') 应等于 true')
   })
 
   await test('模板含{Html内容}和{标题}混合', () => {
     const r = tuisong_replace('{标题}\n{Html内容}', {
       title: '商品', content_html: '内容', url: 'http://x'
     })
-    assertEqual(r.includes('商品'), true)
-    assertEqual(r.includes('内容'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('商品'), true, 'r.includes(\'商品\') 应等于 true')
+    assertEqual(r.includes('内容'), true, 'r.includes(\'内容\') 应等于 true')
   })
 
   // C10-070（audit38）：100k 硬上限必须按 UTF-16 安全截断（SYSTEM_CONTRACT.md:31）。
@@ -3339,32 +3374,32 @@ console.log('========================================\n');
     assertEqual(md.includes('\uFFFD'), false, '{Markdown内容} 输出不得含替换字符 U+FFFD')
   })
 
-  // ==================== 40. 补充缺口覆盖 ====================
-  console.log('\n📂 40. 补充缺口覆盖')
+  // ==================== 43. 补充缺口覆盖 ====================
+  console.log('\n📂 43. 补充缺口覆盖')
 
   // validateConfig ### 多行正则校验
   await test('validateConfig ### 多行：分类正则无效 → 有警告', () => {
     const warns = validateConfig({ pingbibiaoti: '[未闭合###京东' })
-    assertEqual(warns.length >= 1, true)
+    assertEqual(warns.length >= 1, true, 'warns.length >= 1 应等于 true')
   })
 
   await test('validateConfig ### 多行：值正则无效 → 有警告', () => {
     const warns = validateConfig({ pingbibiaoti: '微博###[未闭合' })
-    assertEqual(warns.length >= 1, true)
+    assertEqual(warns.length >= 1, true, 'warns.length >= 1 应等于 true')
   })
 
   await test('validateConfig ### 多行：全部合法 → 无警告', () => {
     const warns = validateConfig({ pingbibiaoti: '微博###京东\n\n赚客吧###淘宝' })
-    assertEqual(warns.length, 0)
+    assertEqual(warns.length, 0, 'warns.length 应等于 0')
   })
 
   // matchesCompiled !rule.cat 分支（分类为空）
   await test('matchesCompiled ### 分类为空 → 走全局匹配', () => {
     const r = compileRules({ pingbilouzhu: '###小明' })
     // 分类部分为空 → 无分类限定
-    assertEqual(r.pingbilouzhu.rules[0].cat, null)
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '任意分类'), true)
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小红', '任意分类'), false)
+    assertEqual(r.pingbilouzhu.rules[0].cat, null, 'r.pingbilouzhu.rules[0].cat 应等于 null')
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '任意分类'), true, 'matchesCompiled(r.pingbilouzhu, \'小明\', \'任意分类\') 应等于 true')
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小红', '任意分类'), false, 'matchesCompiled(r.pingbilouzhu, \'小红\', \'任意分类\') 应等于 false')
   })
 
   // readMessages JSON 损坏（F1：只隔离不删除 + 重建空缓存 + 恢复推送能力）
@@ -3374,16 +3409,16 @@ console.log('========================================\n');
     const p = path.join(CACHE, name)
     const raw = '这不是合法JSON{{{'
     const cleanBaks = () => {
-      try { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n)) } catch (e) { /* 忽略 */ }
+      for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(CACHE, n))
     }
     cleanBaks()
-    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p)
     delete MessageStore._memoryCache[p]
     MessageStore._verified.delete(p)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
     fs.writeFileSync(p, raw, 'utf8')
     const msgs = readMessages(p)
-    assertEqual(Array.isArray(msgs), true)
+    assertEqual(Array.isArray(msgs), true, 'Array.isArray(msgs) 应等于 true')
     assertEqual(msgs.length, 0, '损坏缓存按空缓存降级（判错方向 = 可能重推，而非永久零推送）')
     // 原件必须被改名隔离保留（绝不 unlink/清空），原路径重建为合法空缓存
     const baks = fs.readdirSync(CACHE).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
@@ -3397,7 +3432,7 @@ console.log('========================================\n');
     // saveBatch 同样解除（此前首次调用也会拒绝覆写损坏文件）
     const name2 = 'test_corrupt_batch.json'
     const p2 = path.join(CACHE, name2)
-    try { fs.unlinkSync(p2) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p2)
     delete MessageStore._memoryCache[p2]
     MessageStore._verified.delete(p2)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
@@ -3405,13 +3440,13 @@ console.log('========================================\n');
     assertEqual(saveBatch([{ id: 9, title: 'x' }], name2), true, '隔离重建后 saveBatch 必须可写')
     assertEqual(JSON.parse(fs.readFileSync(p2, 'utf8')).some((m) => m.id === 9), true, 'saveBatch 新条目必须真正落盘')
     for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name2 + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n))
-    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-    try { fs.unlinkSync(p2) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p)
+    unlinkQuiet(p2)
   })
 
   // decodeHtmlEntities 未知实体 fallback
   await test('decodeHtmlEntities 未知实体 → 原样保留', () => {
-    assertEqual(decodeHtmlEntities('&foo;&bar;'), '&foo;&bar;')
+    assertEqual(decodeHtmlEntities('&foo;&bar;'), '&foo;&bar;', 'decodeHtmlEntities(\'&foo;&bar;\') 应等于 \'&foo;&bar;\'')
   })
 
   await test('createUtils 使用注入 safeRe 初始化实体正则', () => {
@@ -3421,67 +3456,92 @@ console.log('========================================\n');
       return new RegExp(source, flags)
     }
     const utils = createUtils({ safeRe })
-    assertEqual(utils.decodeHtmlEntities('&amp;'), '&')
-    assertEqual(calls.some(call => call.flags === 'g' && call.source.includes('amp')), true)
+    assertEqual(utils.decodeHtmlEntities('&amp;'), '&', 'utils.decodeHtmlEntities(\'&amp;\') 应等于 \'&\'')
+    assertEqual(calls.some(call => call.flags === 'g' && call.source.includes('amp')), true, 'calls.some(call => call.flags === \'g\' && call.source.includes(\'amp\')) 应等于 true')
   })
 
   // compileRules 多行中部分行正则无效 → 跳过无效行保留有效行
   await test('compileRules ### 部分行无效 → 保留有效行', () => {
     const r = compileRules({ pingbilouzhu: '[无效分类###小明\n\n线报###小黑' })
     // 第一行分类无效被跳过，第二行有效
-    assertEqual(r.pingbilouzhu._type, 'multi')
-    assertEqual(r.pingbilouzhu.rules.length, 1)
-    assertEqual(r.pingbilouzhu.rules[0].val.test('小黑'), true)
+    assertEqual(r.pingbilouzhu._type, 'multi', 'r.pingbilouzhu._type 应等于 \'multi\'')
+    assertEqual(r.pingbilouzhu.rules.length, 1, 'r.pingbilouzhu.rules.length 应等于 1')
+    assertEqual(r.pingbilouzhu.rules[0].val.test('小黑'), true, 'r.pingbilouzhu.rules[0].val.test(\'小黑\') 应等于 true')
   })
 
   // saveMessages 裁剪后数据正确
-  await test('saveMessages 裁剪后保留最新数据', () => {
+  await test('saveMessages 裁剪后保留最新数据', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_trim_new.json')
     const many = []
     for (let i = 0; i < 150; i++) many.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限
-    try {
-      saveMessages(p, many)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, many)
     const msgs = readMessages(p)
     // 裁剪后保留的是后面的数据（splice 删除前面的）
-    assertEqual(msgs.length, 100)
-    assertEqual(msgs.some(m => m.id === 0), false) // 最旧的被删
-    assertEqual(msgs.some(m => m.id === 149), true) // 最新的保留
-  })
+    assertEqual(msgs.length, 100, 'msgs.length 应等于 100')
+    assertEqual(msgs.some(m => m.id === 0), false, 'msgs.some(m => m.id === 0) 应等于 false') // 最旧的被删
+    assertEqual(msgs.some(m => m.id === 149), true, 'msgs.some(m => m.id === 149) 应等于 true') // 最新的保留
+  }))
 
-  // ==================== 41. 错误分支覆盖 ====================
-  console.log('\n📂 41. 错误分支覆盖')
+  // ==================== 44. 错误分支覆盖 ====================
+  console.log('\n📂 44. 错误分支覆盖')
 
   await test('compileRules pingbitime 非数字 → null 不编译（v3.157）', () => {
     const r = compileRules({ pingbitime: 'abc' })
-    assertEqual(r.pingbitime, null)
+    assertEqual(r.pingbitime, null, 'r.pingbitime 应等于 null')
   })
 
   await test('validateConfig pingbitime ### 分类正则无效 → 有警告', () => {
     const warns = validateConfig({ pingbitime: '[未闭合###5' })
-    assertEqual(warns.length >= 1, true)
+    assertEqual(warns.length >= 1, true, 'warns.length >= 1 应等于 true')
   })
 
   await test('init 在目录不存在时自动创建', () => {
     const fs = require('fs')
-    const dir = CACHE
-    // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
-    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-    init()
-    assertEqual(fs.existsSync(dir), true)
+    // C4-013：CACHE 由外部 XBK_PARALLEL_ID 决定——调度器给两个进程同一个 ID 时它是**共用**目录
+    // （此时 OWNS_CACHE_DIR=false，退出清理已经不删它）。整目录删除会把对方正在用的判重缓存清掉，
+    // 故只删 CACHE 之下本进程专属的子目录：用例要证的仍是「目录不存在 → init 自动创建」。
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_init_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    // 同分片里另一进程的活跃缓存：本用例跑完它必须还在（旧写法整目录删除时必丢）
+    const peerFile = path.join(CACHE, `peer_live_cache_${process.pid}.json`)
+    fs.mkdirSync(CACHE, { recursive: true })
+    fs.writeFileSync(peerFile, '{"peer":true}')
+    const orig = Config.cache.dir
+    try {
+      // 临时删除缓存目录（走已验证路径入口，禁止裸 rmSync 整体目录）
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      Config.cache.dir = sub
+      init()
+      assertEqual(fs.existsSync(dir), true, 'fs.existsSync(dir) 应等于 true')
+      assertEqual(fs.existsSync(peerFile), true, '不得删除共用分片里其它进程的缓存（C4-013：整目录删除不受 OWNS_CACHE_DIR 保护）')
+    } finally {
+      Config.cache.dir = orig
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      unlinkQuiet(peerFile)
+    }
   })
 
   await test('save 在目录不存在时自动创建（_ensureFileExists）', () => {
     const fs = require('fs')
-    const dir = CACHE
-    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
-    appendMessageToFile({ id: 555 }, 'test_recreate.json')
-    assertEqual(fs.existsSync(dir), true)
-    assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true)
+    // C4-013：同上——只删本进程专属子目录，不删可能被同 ID 的另一进程共用的 CACHE。
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_save_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    const peerFile = path.join(CACHE, `peer_live_cache_save_${process.pid}.json`)
+    fs.mkdirSync(CACHE, { recursive: true })
+    fs.writeFileSync(peerFile, '{"peer":true}')
+    const orig = Config.cache.dir
+    try {
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      Config.cache.dir = sub
+      appendMessageToFile({ id: 555 }, 'test_recreate.json')
+      assertEqual(fs.existsSync(dir), true, 'fs.existsSync(dir) 应等于 true')
+      assertEqual(isMessageInFile({ id: 555 }, 'test_recreate.json'), true, 'isMessageInFile({ id: 555 }, \'test_recreate.json\') 应等于 true')
+      assertEqual(fs.existsSync(peerFile), true, '不得删除共用分片里其它进程的缓存（C4-013：整目录删除不受 OWNS_CACHE_DIR 保护）')
+    } finally {
+      Config.cache.dir = orig
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+      unlinkQuiet(peerFile)
+    }
   })
 
   // v3.277（PR #156 复审）并发隔离回归：**撤销隔离即真红**——锁的是「假 Killed 真根因」，
@@ -3601,7 +3661,11 @@ console.log('========================================\n');
       removeDirInRoot(escapeShard.cacheDir, __dirname)
       assert.equal(fsMod.existsSync(victimFile), true, '穿越输入的清理不得删掉仓库外哨兵')
     } finally {
-      try { fsMod.rmSync(victimDir, { recursive: true, force: true }) } catch (e) { /* 清理哨兵 */ }
+      try {
+        fsMod.rmSync(victimDir, { recursive: true, force: true })
+      } catch (e) {
+        if (e.code !== 'ENOENT') console.warn(`⚠️ 哨兵目录清理失败，需手工删除：${victimDir} — ${e.message}`)
+      }
     }
   })
 
@@ -3672,59 +3736,59 @@ console.log('========================================\n');
       `递归删除只能收敛到 removeDirInRoot + 本用例哨兵清理（实得 ${rawRecursiveRm.length} 处）`)
   })
 
-  // ==================== 42. 剩余缺口覆盖 ====================
-  console.log('\n📂 42. 剩余缺口覆盖')
+  // ==================== 45. 剩余缺口覆盖 ====================
+  console.log('\n📂 45. 剩余缺口覆盖')
 
   await test('compileRules ### 值正则无效 → 跳过该行', () => {
     const r = compileRules({ pingbilouzhu: '线报###[未闭合' })
-    assertEqual(r.pingbilouzhu._type, 'multi') // 编译为 multi
-    assertEqual(r.pingbilouzhu.rules.length, 0) // 无效行被跳过
+    assertEqual(r.pingbilouzhu._type, 'multi', 'r.pingbilouzhu._type 应等于 \'multi\'') // 编译为 multi
+    assertEqual(r.pingbilouzhu.rules.length, 0, 'r.pingbilouzhu.rules.length 应等于 0') // 无效行被跳过
   })
 
   await test('compileRules pingbitime 分类无效 → 跳过该行', () => {
     const r = compileRules({ pingbitime: '[未闭合###5\n\n线报###3' })
-    assertEqual(r.pingbitime._type, 'timeMulti')
-    assertEqual(r.pingbitime.rules.length, 1) // 只剩有效行
+    assertEqual(r.pingbitime._type, 'timeMulti', 'r.pingbitime._type 应等于 \'timeMulti\'')
+    assertEqual(r.pingbitime.rules.length, 1, 'r.pingbitime.rules.length 应等于 1') // 只剩有效行
   })
 
   await test('matchesCompiled compiled为null → false', () => {
-    assertEqual(matchesCompiled(null, 'x', 'y'), false)
+    assertEqual(matchesCompiled(null, 'x', 'y'), false, 'matchesCompiled(null, \'x\', \'y\') 应等于 false')
   })
 
   await test('matchesCompiled fieldValue为空 → false', () => {
     const r = compileRules({ pingbibiaoti: '京东' })
-    assertEqual(matchesCompiled(r.pingbibiaoti, '', '线报'), false)
+    assertEqual(matchesCompiled(r.pingbibiaoti, '', '线报'), false, 'matchesCompiled(r.pingbibiaoti, \'\', \'线报\') 应等于 false')
   })
 
   await test('matchesCompiled 0/false 参与匹配（非缺失）', () => {
     // 修复 !fieldValue 短路把 0/false 误判为缺失：0/false 应参与匹配
-    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, 0), true)
-    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, false), true)
-    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, '0'), true)
-    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, 'false'), true)
-    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, '1'), false)
-    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, 'true'), false)
+    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, 0), true, 'matchesCompiled({ _type: \'re\', re: /0/i }, 0) 应等于 true')
+    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, false), true, 'matchesCompiled({ _type: \'re\', re: /false/i }, false) 应等于 true')
+    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, '0'), true, 'matchesCompiled({ _type: \'re\', re: /0/i }, \'0\') 应等于 true')
+    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, 'false'), true, 'matchesCompiled({ _type: \'re\', re: /false/i }, \'false\') 应等于 true')
+    assertEqual(matchesCompiled({ _type: 're', re: /0/i }, '1'), false, 'matchesCompiled({ _type: \'re\', re: /0/i }, \'1\') 应等于 false')
+    assertEqual(matchesCompiled({ _type: 're', re: /false/i }, 'true'), false, 'matchesCompiled({ _type: \'re\', re: /false/i }, \'true\') 应等于 false')
   })
 
   await test('checkTimeCompiled compiled为null → null', () => {
-    assertEqual(checkTimeCompiled(null, { louzhuregtime: daysAgo(4) }), null)
+    assertEqual(checkTimeCompiled(null, { louzhuregtime: daysAgo(4) }), null, 'checkTimeCompiled(null, { louzhuregtime: daysAgo(4) }) 应等于 null')
   })
 
   await test('checkTimeCompiled 天数分类为空 → 全局匹配', () => {
     const r = compileRules({ pingbitime: '###5' })
-    assertEqual(r.pingbitime.rules[0].cat, null)
+    assertEqual(r.pingbitime.rules[0].cat, null, 'r.pingbitime.rules[0].cat 应等于 null')
     // 注册2天 → 5>2 → 拦截 true
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }), true)
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }), true, 'checkTimeCompiled(r.pingbitime, { louzhuregtime: daysAgo(3) }) 应等于 true')
   })
 
   await test('validateConfig pingbifenlei ### → 有警告', () => {
     const warns = validateConfig({ pingbifenlei: '微博###京东' })
-    assertEqual(warns.length >= 1, true)
-    assertEqual(warns[0].includes('不支持 ###'), true)
+    assertEqual(warns.length >= 1, true, 'warns.length >= 1 应等于 true')
+    assertEqual(warns[0].includes('不支持 ###'), true, 'warns[0].includes(\'不支持 ###\') 应等于 true')
   })
 
-  // ==================== 43. save upsert 更新分支 ====================
-  console.log('\n📂 43. save upsert 更新分支')
+  // ==================== 46. save upsert 更新分支 ====================
+  console.log('\n📂 46. save upsert 更新分支')
 
   await test('save 已存在消息 → 内容被更新', () => {
     const fs = require('fs')
@@ -3734,8 +3798,8 @@ console.log('========================================\n');
     // 读取缓存文件，验证内容确实被更新
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))
     const item = msgs.find(m => m.id === 777)
-    assertEqual(item.title, '新标题') // 内容已更新
-    assertEqual(msgs.length, 1) // 没有重复新增
+    assertEqual(item.title, '新标题', 'item.title 应等于 \'新标题\'') // 内容已更新
+    assertEqual(msgs.length, 1, 'msgs.length 应等于 1') // 没有重复新增
   })
 
   await test('save 不同id → 各自追加不覆盖', () => {
@@ -3744,18 +3808,18 @@ console.log('========================================\n');
     appendMessageToFile({ id: 1, title: 'A' }, name)
     appendMessageToFile({ id: 2, title: 'B' }, name)
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))
-    assertEqual(msgs.length, 2)
-    assertEqual(msgs.some(m => m.id === 1), true)
-    assertEqual(msgs.some(m => m.id === 2), true)
+    assertEqual(msgs.length, 2, 'msgs.length 应等于 2')
+    assertEqual(msgs.some(m => m.id === 1), true, 'msgs.some(m => m.id === 1) 应等于 true')
+    assertEqual(msgs.some(m => m.id === 2), true, 'msgs.some(m => m.id === 2) 应等于 true')
   })
 
-  // ==================== 44. 变异测试盲区修复 ====================
-  console.log('\n📂 44. 变异测试盲区修复')
+  // ==================== 47. 变异测试盲区修复 ====================
+  console.log('\n📂 47. 变异测试盲区修复')
 
   await test('whitelistFilter 空关键词+字段为空 → 返回true', () => {
     // 空关键词应放行，即使字段为空（不误拦截）
-    assertEqual(whitelistFilter({}, 'title', ''), true)
-    assertEqual(whitelistFilter({ title: '' }, 'title', ''), true)
+    assertEqual(whitelistFilter({}, 'title', ''), true, 'whitelistFilter({}, \'title\', \'\') 应等于 true')
+    assertEqual(whitelistFilter({ title: '' }, 'title', ''), true, 'whitelistFilter({ title: \'\' }, \'title\', \'\') 应等于 true')
   })
 
   await test('readMessages 内存缓存生效 → 返回同一引用', () => {
@@ -3764,20 +3828,20 @@ console.log('========================================\n');
     const first = readMessages(p)
     const second = readMessages(p)
     // 第二次读应命中内存缓存，返回同一数组引用
-    assertEqual(first === second, true)
+    assertEqual(first === second, true, 'first === second 应等于 true')
   })
 
   await test('readMessages 外部删除文件 → 用内存快照自动恢复', () => {
     const fs = require('fs')
     const p = path.join(CACHE, 'test_mem_restore.json')
     saveMessages(p, [{ id: 7001, title: '内存恢复' }])
-    assertEqual(fs.existsSync(p), true)
+    assertEqual(fs.existsSync(p), true, 'fs.existsSync(p) 应等于 true')
     fs.unlinkSync(p)
     const msgs = readMessages(p)
-    assertEqual(msgs.length, 1)
-    assertEqual(msgs[0].id, 7001)
-    assertEqual(fs.existsSync(p), true)
-    assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1)
+    assertEqual(msgs.length, 1, 'msgs.length 应等于 1')
+    assertEqual(msgs[0].id, 7001, 'msgs[0].id 应等于 7001')
+    assertEqual(fs.existsSync(p), true, 'fs.existsSync(p) 应等于 true')
+    assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1, 'JSON.parse(fs.readFileSync(p, \'utf8\')).length 应等于 1')
   })
 
   await test('readMessages 磁盘缺失且恢复失败 → 不标记已验证，下次重新恢复（v3.257）', () => {
@@ -3786,26 +3850,26 @@ console.log('========================================\n');
     const parent = path.dirname(p)
     try {
       saveMessages(p, [{ id: 7002, title: '恢复重试' }])
-      assertEqual(fs.existsSync(p), true)
+      assertEqual(fs.existsSync(p), true, 'fs.existsSync(p) 应等于 true')
       fs.unlinkSync(p)
       // 用普通文件顶替父目录：existsSync(child) 为 false，但 saveMessages/writeAtomic 会拒绝写入
       fs.rmdirSync(parent)
       fs.writeFileSync(parent, '')
       const msgs = readMessages(p)
-      assertEqual(msgs.length, 1)
-      assertEqual(msgs[0].id, 7002)
-      assertEqual(fs.existsSync(p), false)
+      assertEqual(msgs.length, 1, 'msgs.length 应等于 1')
+      assertEqual(msgs[0].id, 7002, 'msgs[0].id 应等于 7002')
+      assertEqual(fs.existsSync(p), false, 'fs.existsSync(p) 应等于 false')
       // 排除故障后再次读取：应重新触发恢复并重建文件（若首次失败被固化 verified 则不会重建）
       fs.unlinkSync(parent)
       const msgs2 = readMessages(p)
-      assertEqual(msgs2.length, 1)
-      assertEqual(msgs2[0].id, 7002)
-      assertEqual(fs.existsSync(p), true)
-      assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1)
+      assertEqual(msgs2.length, 1, 'msgs2.length 应等于 1')
+      assertEqual(msgs2[0].id, 7002, 'msgs2[0].id 应等于 7002')
+      assertEqual(fs.existsSync(p), true, 'fs.existsSync(p) 应等于 true')
+      assertEqual(JSON.parse(fs.readFileSync(p, 'utf8')).length, 1, 'JSON.parse(fs.readFileSync(p, \'utf8\')).length 应等于 1')
     } finally {
-      try { if (fs.existsSync(p)) fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-      try { if (fs.statSync(parent).isDirectory()) fs.rmdirSync(parent) } catch (e) { /* 忽略 */ }
-      try { if (fs.existsSync(parent) && !fs.statSync(parent).isDirectory()) fs.unlinkSync(parent) } catch (e) { /* 忽略 */ }
+      if (fs.existsSync(p)) unlinkQuiet(p)
+      if (fs.existsSync(parent) && fs.statSync(parent).isDirectory()) rmdirQuiet(parent)
+      if (fs.existsSync(parent) && !fs.statSync(parent).isDirectory()) unlinkQuiet(parent)
     }
   })
 
@@ -3814,17 +3878,17 @@ console.log('========================================\n');
     const name = 'test_cache_symlink.json'
     const p = path.join(CACHE, name)
     const outside = path.join(process.env.TMPDIR || '/tmp', `xbk-cache-symlink-${process.pid}.json`)
-    const wipeBaks = () => { try { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(CACHE, n)) } catch (e) { /* 忽略 */ } }
+    const wipeBaks = () => { for (const n of fs.readdirSync(CACHE)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(CACHE, n)) }
     wipeBaks()
     try {
       fs.writeFileSync(outside, JSON.stringify([{ id: 9001 }]), 'utf8')
-      try { fs.unlinkSync(p) } catch (e) { /* 不存在 */ }
+      unlinkQuiet(p)
       fs.symlinkSync(outside, p)
       const msgs = readMessages(p)
-      assertEqual(msgs.length, 0)
+      assertEqual(msgs.length, 0, 'msgs.length 应等于 0')
       saveMessages(p, [{ id: 9002 }])
       // 核心安全断言：外部目标绝不被写入/改坏（写的是隔离后新建的普通文件，不是链接目标）
-      assertEqual(JSON.parse(fs.readFileSync(outside, 'utf8'))[0].id, 9001)
+      assertEqual(JSON.parse(fs.readFileSync(outside, 'utf8'))[0].id, 9001, 'JSON.parse(fs.readFileSync(outside, \'utf8\'))[0].id 应等于 9001')
       // F1：非普通文件走「重命名隔离 + 重建空缓存」——原符号链接被改名保留（绝不 unlink、绝不跟随），
       // 原路径成为新建普通文件。旧行为（保留链接 + 永久占住写闸门）会让整轮推送永久为零。
       const baks = fs.readdirSync(CACHE).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
@@ -3833,8 +3897,8 @@ console.log('========================================\n');
       assertEqual(fs.lstatSync(p).isSymbolicLink(), false, '原路径必须被重建为普通缓存文件')
       assertEqual(MessageStore._readFailed[p], undefined, '隔离重建成功后写闸门必须解除')
     } finally {
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-      try { fs.unlinkSync(outside) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
+      unlinkQuiet(outside)
       wipeBaks()
     }
   })
@@ -3844,9 +3908,9 @@ console.log('========================================\n');
     const r = tuisong_replace('{标题}', {
       title: '测试', content_html: '<h2>标题</h2>', url: 'http://x'
     })
-    assertEqual(r, '测试')
+    assertEqual(r, '测试', 'r 应等于 \'测试\'')
     // 不含{Markdown内容}，不应包含## 标题
-    assertEqual(r.includes('##'), false)
+    assertEqual(r.includes('##'), false, 'r.includes(\'##\') 应等于 false')
   })
 
   // ==================== 44b. 2026-08-03 盲区锁定（M1/M2/M3 变异未被抓住的行为） ====================
@@ -3885,35 +3949,35 @@ console.log('========================================\n');
     assertEqual(listfilter({ title: '', content: '', catename: '' }, c), true, '主流程空值放行（调用方保护）')
   })
 
-  // ==================== 45. htmlToMarkdown 输出细节断言 ====================
-  console.log('\n📂 45. htmlToMarkdown 输出细节断言')
+  // ==================== 48. htmlToMarkdown 输出细节断言 ====================
+  console.log('\n📂 48. htmlToMarkdown 输出细节断言')
 
   await test('htmlToMarkdown <br> → 换行', () => {
     const r = htmlToMarkdown({ content_html: '行一<br>行二', url: 'http://x' })
     // <br> 应转为换行（关键断言：中间是换行不是空格）
-    assertEqual(r.includes('行一\n\n行二'), true)
-    assertEqual(r.includes('行一 行二'), false)
+    assertEqual(r.includes('行一\n\n行二'), true, 'r.includes(\'行一\\n\\n行二\') 应等于 true')
+    assertEqual(r.includes('行一 行二'), false, 'r.includes(\'行一 行二\') 应等于 false')
   })
 
   await test('htmlToMarkdown <p> 段落 → 换行', () => {
     const r = htmlToMarkdown({ content_html: '<p>段落一</p><p>段落二</p>', url: 'http://x' })
     // <p> 应转为换行（关键断言：段落间是换行不是空格）
-    assertEqual(r.includes('段落一\n\n段落二'), true)
-    assertEqual(r.includes('段落一 段落二'), false)
+    assertEqual(r.includes('段落一\n\n段落二'), true, 'r.includes(\'段落一\\n\\n段落二\') 应等于 true')
+    assertEqual(r.includes('段落一 段落二'), false, 'r.includes(\'段落一 段落二\') 应等于 false')
   })
 
   await test('htmlToMarkdown 实体 &amp; 被解码', () => {
     const r = htmlToMarkdown({ content_html: 'A&amp;B', url: 'http://x' })
-    assertEqual(r.includes('A&B'), true)
-    assertEqual(r.includes('&amp;'), false)
+    assertEqual(r.includes('A&B'), true, 'r.includes(\'A&B\') 应等于 true')
+    assertEqual(r.includes('&amp;'), false, 'r.includes(\'&amp;\') 应等于 false')
   })
 
-  // ==================== 46. 第4轮变异盲区修复 ====================
-  console.log('\n📂 46. 第4轮变异盲区修复')
+  // ==================== 49. tuisong_replace 占位符与 save 时间戳 ====================
+  console.log('\n📂 49. tuisong_replace 占位符与 save 时间戳')
 
   await test('tuisong_replace {分类ID} 占位符', () => {
     const r = tuisong_replace('{分类ID}', { cateid: '30', url: 'x' })
-    assertEqual(r, '30')
+    assertEqual(r, '30', 'r 应等于 \'30\'')
   })
 
   await test('tuisong_replace {时间} 占位符', () => {
@@ -3931,36 +3995,36 @@ console.log('========================================\n');
     appendMessageToFile({ id: 888, title: 'b' }, name)
     const second = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))
     // 至少有一个 timestamp 字段
-    assertEqual(typeof second[0].timestamp, 'string')
-    assertEqual(second.length, 1)
+    assertEqual(typeof second[0].timestamp, 'string', 'typeof second[0].timestamp 应等于 \'string\'')
+    assertEqual(second.length, 1, 'second.length 应等于 1')
   })
 
-  // ==================== 47. 第5轮变异盲区修复 ====================
-  console.log('\n📂 47. 第5轮变异盲区修复')
+  // ==================== 50. tuisong_replace 占位符覆盖 ====================
+  console.log('\n📂 50. tuisong_replace 占位符覆盖')
 
   await test('tuisong_replace {类目} 占位符', () => {
     const r = tuisong_replace('{类目}', { category_name: '美妆', url: 'x' })
-    assertEqual(r, '美妆')
+    assertEqual(r, '美妆', 'r 应等于 \'美妆\'')
   })
 
   await test('tuisong_replace {价格} 占位符', () => {
     const r = tuisong_replace('{价格}', { price: '19.9', url: 'x' })
-    assertEqual(r, '19.9')
+    assertEqual(r, '19.9', 'r 应等于 \'19.9\'')
   })
 
   await test('tuisong_replace {商城} 占位符', () => {
     const r = tuisong_replace('{商城}', { mall_name: '淘宝', url: 'x' })
-    assertEqual(r, '淘宝')
+    assertEqual(r, '淘宝', 'r 应等于 \'淘宝\'')
   })
 
   await test('tuisong_replace {品牌} 占位符', () => {
     const r = tuisong_replace('{品牌}', { brand: '苹果', url: 'x' })
-    assertEqual(r, '苹果')
+    assertEqual(r, '苹果', 'r 应等于 \'苹果\'')
   })
 
   await test('tuisong_replace {图片} 占位符', () => {
     const r = tuisong_replace('{图片}', { pic: 'http://img/1.jpg', url: 'x' })
-    assertEqual(r, 'http://img/1.jpg')
+    assertEqual(r, 'http://img/1.jpg', 'r 应等于 \'http://img/1.jpg\'')
   })
 
   await test('tuisong_replace {图片} 危险协议被清空（v3.262 统一安全 URL 入口）', () => {
@@ -3972,7 +4036,7 @@ console.log('========================================\n');
 
   await test('htmlToMarkdown h2 换行精确断言', () => {
     const r = htmlToMarkdown({ content_html: '<h2>标题</h2>', url: 'http://x' })
-    assertEqual(r.includes('## 标题\n\n'), true)
+    assertEqual(r.includes('## 标题\n\n'), true, 'r.includes(\'## 标题\\n\\n\') 应等于 true')
   })
 
   await test('saveBatch 已存在消息 → 更新内容', () => {
@@ -3980,170 +4044,196 @@ console.log('========================================\n');
     saveBatch([{ id: 55, title: '旧' }], 'test_sb_up.json')
     saveBatch([{ id: 55, title: '新' }], 'test_sb_up.json')
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_sb_up.json'), 'utf8'))
-    assertEqual(msgs.length, 1)
-    assertEqual(msgs[0].title, '新')
+    assertEqual(msgs.length, 1, 'msgs.length 应等于 1')
+    assertEqual(msgs[0].title, '新', 'msgs[0].title 应等于 \'新\'')
   })
 
   await test('tuisong_replace {Html内容} content_html为空', () => {
     const r = tuisong_replace('{Html内容}', { url: 'http://x', content_html: undefined })
-    assertEqual(r.includes('原文链接'), true)
+    // 空 content_html ⇒ 正文段整段为空，只保留原文链接段（不得残留 undefined/null/花括号）
+    assertEqual(r, '<br>&nbsp;<br>&nbsp;<br>原文链接：<a href="http://x" target="_blank">http://x</a><br>&nbsp;<br>&nbsp;<br>',
+      '空 content_html 必须只输出原文链接段，正文段为空')
     // 空内容不应显示 "undefined" 文本
-    assertEqual(r.includes('undefined'), false)
+    assertEqual(r.includes('undefined'), false, 'r.includes(\'undefined\') 应等于 false')
   })
 
   await test('matchesCompiled multi catename为空', () => {
     const compiled = compileRules({ pingbilouzhu: '线报###小明' })
     // catename 为空 → 分类匹配失败 → 返回 false
-    assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', ''), false)
-    assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', null), false)
+    assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', ''), false, 'matchesCompiled(compiled.pingbilouzhu, \'小明\', \'\') 应等于 false')
+    assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', null), false, 'matchesCompiled(compiled.pingbilouzhu, \'小明\', null) 应等于 false')
   })
 
   await test('Config.domain 默认值', () => {
-    assertEqual(Config.domain, 'https://new.ixbk.net')
+    assertEqual(Config.domain, 'https://new.ixbk.net', 'Config.domain 应等于 \'https://new.ixbk.net\'')
   })
 
-  // ==================== 48. 第7轮变异盲区修复 ====================
-  console.log('\n📂 48. 第7轮变异盲区修复')
+  // ==================== 51. tuisong_replace 纯函数与原文链接 ====================
+  console.log('\n📂 51. tuisong_replace 纯函数与原文链接')
 
   await test('tuisong_replace 不修改原对象（纯函数）', () => {
     const original = { category_name: '分类', catename: '原分类', title: 'T', url: 'x' }
     const snapshot = { ...original }
     tuisong_replace('{分类名}', original)
     // 原对象应保持不变
-    assertEqual(original.catename, snapshot.catename)
-    assertEqual(original.title, snapshot.title)
-    assertEqual(Object.keys(original).length, Object.keys(snapshot).length)
+    assertEqual(original.catename, snapshot.catename, 'original.catename 应等于 snapshot.catename')
+    assertEqual(original.title, snapshot.title, 'original.title 应等于 snapshot.title')
+    assertEqual(Object.keys(original).length, Object.keys(snapshot).length, 'Object.keys(original).length 应等于 Object.keys(snapshot).length')
   })
 
   await test('tuisong_replace {Html内容} 原文链接URL正确', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/a.html' })
-    assertEqual(r.includes('http://example.com/a.html'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('http://example.com/a.html'), true, 'r.includes(\'http://example.com/a.html\') 应等于 true')
   })
 
-  // ==================== 49. 第8轮变异盲区修复（异常输入健壮性） ====================
-  console.log('\n📂 49. 第8轮变异盲区修复')
+  // ==================== 52. 脏输入兜底（null / 数字） ====================
+  console.log('\n📂 52. 脏输入兜底（null / 数字）')
 
   await test('tuisong_replace shuju为null → 不崩溃', () => {
     const r = tuisong_replace('{标题}', null)
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, '', '数据为 null 时应渲染成空串（不能把占位符原样吐出）')
   })
 
   await test('htmlToMarkdown shuju为null → 不崩溃', () => {
     const r = htmlToMarkdown(null)
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, '', '入参为 null 时应返回空串')
   })
 
   await test('compileRules rawCfg为null → 不崩溃', () => {
     const r = compileRules(null)
-    assertEqual(typeof r, 'object')
+    assertEqual(typeof r, 'object', 'typeof r 应等于 \'object\'')
+    // C4-008：`typeof null === 'object'` ⇒ 原断言对「返回 null」也成立，这里钉住真实形态
+    assertEqual(r.__compiled, true, 'null 配置应编译成空规则集（__compiled 标记必须为 true）')
+    assertEqual(r.pingbibiaoti, null, 'null 配置下每条规则都应为 null（不放行任何规则）')
   })
 
   await test('validateConfig cfg为null → 不崩溃', () => {
     const warns = validateConfig(null)
-    assertEqual(Array.isArray(warns), true)
+    assertEqual(Array.isArray(warns), true, 'Array.isArray(warns) 应等于 true')
+    assertEqual(warns.length, 0, 'null 配置没有可校验字段，不该凭空告警')
   })
 
   await test('MessageStore has message为null → 不崩溃', () => {
     const result = isMessageInFile(null, 'test_null_msg.json')
-    assertEqual(result, false)
+    assertEqual(result, false, 'result 应等于 false')
   })
 
   await test('getFileName url为undefined → 不崩溃', () => {
     const r = getFileName(undefined)
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, 'default.json', '无 URL 时应回落到 default.json（返回空串会让所有写入撞同一空名）')
   })
 
   await test('daysComputed time为0 → 不崩溃', () => {
     const r = daysComputed(0)
-    assertEqual(typeof r, 'number')
+    assertEqual(typeof r, 'number', 'typeof r 应等于 \'number\'')
+    // 独立 oracle：time=0 是 epoch，天数 = UTC 今天与 1970-01-01 的自然日差
+    const nowD = new Date()
+    const utcToday = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate())
+    assertEqual(r, Math.floor((utcToday - 0) / 86400000), 'time=0 应按 epoch 起算的天数（0/NaN 都算回归）')
   })
 
   await test('decodeHtmlEntities 输入数字 → 不崩溃', () => {
     const r = decodeHtmlEntities(123)
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, '123', '数字入参应转成其字符串形态（返回空串/undefined 文案都算回归）')
   })
 
   await test('tuisong_replace posttime=0 → 正常处理', () => {
     // posttime=0 是 falsy，应仍能处理（不崩溃）
     const r = tuisong_replace('{标题}', { title: 'T', posttime: 0, url: 'x' })
-    assertEqual(r, 'T')
+    assertEqual(r, 'T', 'r 应等于 \'T\'')
   })
 
-  // ==================== 50. 第9轮变异盲区修复（数字输入健壮性） ====================
-  console.log('\n📂 50. 第9轮变异盲区修复')
+  // ==================== 53. 脏输入边界（数字 / 连续实体） ====================
+  console.log('\n📂 53. 脏输入边界（数字 / 连续实体）')
 
   await test('htmlToMarkdown content_html为数字 → 不崩溃', () => {
     const r = htmlToMarkdown({ content_html: 12345, url: 'http://x' })
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, '原文链接：[http://x](http://x)', '非字符串 content_html 应被忽略（不得把 12345 漏进正文）')
   })
 
   await test('daysComputed time为数字 → 不崩溃', () => {
     const r = daysComputed(20260728)
-    assertEqual(typeof r, 'number')
+    assertEqual(typeof r, 'number', 'typeof r 应等于 \'number\'')
+    // 20260728 是 YYYYMMDD 形态，应解析成 2026-07-28 而不是当毫秒数
+    const nowD = new Date()
+    const utcToday = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate())
+    assertEqual(r, Math.floor((utcToday - Date.UTC(2026, 6, 28)) / 86400000), 'YYYYMMDD 应按日期解析')
   })
 
   await test('decodeHtmlEntities 连续实体 → 全部解码', () => {
-    assertEqual(decodeHtmlEntities('&amp;&lt;'), '&<')
-    assertEqual(decodeHtmlEntities('a&amp;b&lt;c&gt;d'), 'a&b<c>d')
+    assertEqual(decodeHtmlEntities('&amp;&lt;'), '&<', 'decodeHtmlEntities(\'&amp;&lt;\') 应等于 \'&<\'')
+    assertEqual(decodeHtmlEntities('a&amp;b&lt;c&gt;d'), 'a&b<c>d', 'decodeHtmlEntities(\'a&amp;b&lt;c&gt;d\') 应等于 \'a&b<c>d\'')
   })
 
   await test('validateConfig 字段值为数字 → 不崩溃', () => {
     const warns = validateConfig({ pingbibiaoti: 12345 })
-    assertEqual(Array.isArray(warns), true)
+    assertEqual(Array.isArray(warns), true, 'Array.isArray(warns) 应等于 true')
+    assertEqual(warns.length, 1, '单个非法字段应恰好告警一次')
+    assertEqual(warns[0].includes('pingbibiaoti') && warns[0].includes('应为字符串'), true,
+      `告警必须点名字段与原因（实际: ${warns[0]}）`)
   })
 
   await test('compileRules 字段值为数字 → 不崩溃', () => {
     const r = compileRules({ pingbibiaoti: 12345 })
-    assertEqual(typeof r, 'object')
+    assertEqual(typeof r, 'object', 'typeof r 应等于 \'object\'')
+    assertEqual(r.pingbibiaoti, null, '数字值的规则必须被跳过（null），不能编译成恒真/恒假正则')
   })
 
-  // ==================== 51. 第10-20轮边界覆盖 ====================
-  console.log('\n📂 51. 第10-20轮边界覆盖')
+  // ==================== 54. 边界值收集（大写实体 / ISO 时间 / 负天数） ====================
+  console.log('\n📂 54. 边界值收集（大写实体 / ISO 时间 / 负天数）')
 
   await test('decodeHtmlEntities 大写实体', () => {
     // HTML 实体一般小写，大写应原样保留（不误转换）
-    assertEqual(decodeHtmlEntities('&AMP;'), '&AMP;')
-    assertEqual(decodeHtmlEntities('&amp;'), '&')
+    assertEqual(decodeHtmlEntities('&AMP;'), '&AMP;', 'decodeHtmlEntities(\'&AMP;\') 应等于 \'&AMP;\'')
+    assertEqual(decodeHtmlEntities('&amp;'), '&', 'decodeHtmlEntities(\'&amp;\') 应等于 \'&\'')
   })
 
   await test('daysComputed 带T时间格式', () => {
     const r = daysComputed('2026-07-28T10:00:00')
-    assertEqual(typeof r, 'number')
-    assertEqual(r >= 0, true)
+    assertEqual(typeof r, 'number', 'typeof r 应等于 \'number\'')
+    assertEqual(r >= 0, true, 'r >= 0 应等于 true')
   })
 
   await test('compileRules 负天数', () => {
     const r = compileRules({ pingbitime: '-5' })
-    assertEqual(typeof r.pingbitime, 'object')
+    assertEqual(typeof r.pingbitime, 'object', 'typeof r.pingbitime 应等于 \'object\'')
+    // C4-008：`typeof null === 'object'` ⇒ 原断言连「负天数被静默接受」都测不出来
+    assertEqual(r.pingbitime, null, '负天数必须判为非法（null），不得编译出时间规则')
   })
 
   await test('tuisong_replace posttime为字符串', () => {
     const r = tuisong_replace('{日期}', { posttime: '1785346200', datetime: undefined, url: 'x' })
-    assertEqual(typeof r, 'string')
-    assertEqual(r.length > 0, true)
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r.length > 0, true, 'r.length > 0 应等于 true')
   })
 
   await test('saveBatch 非数组输入 → 不崩溃', () => {
+    // C5-019：契约是「每个脏输入都不抛」（旧 assertEqual(true,true) 永远不会红）
     for (const value of [undefined, null, {}, 123, true, Symbol('x'), 'abc']) {
-      saveBatch(value, 'test_sb_non_array.json')
+      assert.doesNotThrow(() => saveBatch(value, 'test_sb_non_array.json'), `非数组输入 ${String(value)} 不得抛错`)
     }
-    assertEqual(true, true)
+    assertEqual(readMessages(getFilePath('test_sb_non_array.json')).length, 0, '非数组输入不得写入消息')
   })
 
   await test('htmlToMarkdown 纯空格内容', () => {
     const r = htmlToMarkdown({ content_html: '   ', url: 'http://x' })
-    assertEqual(typeof r, 'string')
+    assertEqual(typeof r, 'string', 'typeof r 应等于 \'string\'')
+    assertEqual(r, '原文链接：[http://x](http://x)', '纯空白正文不应留下空行块（只保留原文链接）')
   })
 
   await test('compileRules 多行含空行', () => {
     const r = compileRules({ pingbilouzhu: '线报###小明\n\n\n\n线报###小黑' })
-    assertEqual(r.pingbilouzhu._type, 'multi')
+    assertEqual(r.pingbilouzhu._type, 'multi', 'r.pingbilouzhu._type 应等于 \'multi\'')
   })
 
   await test('compileRules 无匹配字段 → null', () => {
     const r = compileRules({ unknownField: 'x' })
-    assertEqual(r.pingbibiaoti, null)
+    assertEqual(r.pingbibiaoti, null, 'r.pingbibiaoti 应等于 null')
   })
 
   await test('MessageStore save 更新保留旧字段', () => {
@@ -4151,18 +4241,18 @@ console.log('========================================\n');
     appendMessageToFile({ id: 66, title: '旧', extra: '保留' }, 'test_keep.json')
     appendMessageToFile({ id: 66, title: '新' }, 'test_keep.json')
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_keep.json'), 'utf8'))
-    assertEqual(msgs.length, 1)
-    assertEqual(msgs[0].title, '新')
+    assertEqual(msgs.length, 1, 'msgs.length 应等于 1')
+    assertEqual(msgs[0].title, '新', 'msgs[0].title 应等于 \'新\'')
   })
 
-  // ==================== 52. 大规模变异盲区修复 ====================
-  console.log('\n📂 52. 大规模变异盲区修复')
+  // ==================== 55. 原文链接与配置默认值精确断言 ====================
+  console.log('\n📂 55. 原文链接与配置默认值精确断言')
 
   await test('htmlToMarkdown 原文链接格式精确断言', () => {
     const r = htmlToMarkdown({ content_html: '内容', url: 'http://x.com/1' })
     // 原文链接必须是 markdown 链接格式
-    assertEqual(r.includes('[http://x.com/1](http://x.com/1)'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('[http://x.com/1](http://x.com/1)'), true, 'r.includes(\'[http://x.com/1](http://x.com/1)\') 应等于 true')
+    assertEqual(r.includes('原文链接'), true, 'r.includes(\'原文链接\') 应等于 true')
   })
 
   await test('天数过滤 恰好等于阈值 → 不拦截', () => {
@@ -4173,12 +4263,12 @@ console.log('========================================\n');
     // pingbitime 设为 days → 不拦截（= 不是 >）；days+1 → 拦截
     const r1 = listfilter(item, { pingbitime: String(days) })
     const r2 = listfilter(item, { pingbitime: String(days + 1) })
-    assertEqual(r1, true) // days == pingbitime → 不拦截
-    assertEqual(r2, false) // days < pingbitime → 拦截
+    assertEqual(r1, true, 'r1 应等于 true') // days == pingbitime → 不拦截
+    assertEqual(r2, false, 'r2 应等于 false') // days < pingbitime → 拦截
   })
 
   await test('Config.filter.pingbitime 默认值', () => {
-    assertEqual(Config.filter.pingbitime, '5')
+    assertEqual(Config.filter.pingbitime, '5', 'Config.filter.pingbitime 应等于 \'5\'')
   })
 
   await test('saveMessages 恰好 maxSize 条 → 不裁剪', () => {
@@ -4187,66 +4277,60 @@ console.log('========================================\n');
     for (let i = 0; i < 100; i++) msgs.push({ id: i })
     saveMessages(p, msgs)
     const r = readMessages(p)
-    assertEqual(r.length, 100) // 恰好100条不裁剪
+    assertEqual(r.length, 100, 'r.length 应等于 100') // 恰好100条不裁剪
   })
 
-  await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 maxSize=100 验证裁剪逻辑）', () => {
+  await test('saveMessages 超过maxSize → 裁剪到上限（v3.120：显式 maxSize=100 验证裁剪逻辑）', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_over100.json')
     const msgs = []
     for (let i = 0; i < 101; i++) msgs.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // 显式小上限，验证裁剪（不依赖默认 10000）
-    try {
-      saveMessages(p, msgs)
-    } finally {
-      Config.cache.maxSize = orig // v3.120b：finally 保证恢复（断言失败也恢复，防污染）
-    }
+    saveMessages(p, msgs)
     const r = readMessages(p)
-    assertEqual(r.length, 100)
-  })
+    assertEqual(r.length, 100, 'r.length 应等于 100')
+  }))
 
   await test('htmlToMarkdown 连续换行合并', () => {
     // 3个以上连续换行应合并为2个
     const r = htmlToMarkdown({ content_html: 'a<br><br><br>b', url: 'http://x' })
-    assertEqual(r.includes('a\n\n\n\nb'), false) // 不应有3个以上换行
+    assertEqual(r.includes('a\n\n\n\nb'), false, 'r.includes(\'a\\n\\n\\n\\nb\') 应等于 false') // 不应有3个以上换行
   })
 
-  // ==================== 53. 第21-30轮盲区修复 ====================
-  console.log('\n📂 53. 第21-30轮盲区修复')
+  // ==================== 56. htmlToMarkdown 大小写与空白 ====================
+  console.log('\n📂 56. htmlToMarkdown 大小写与空白')
 
   await test('htmlToMarkdown 大写标签也转换（i flag）', () => {
     const r = htmlToMarkdown({ content_html: '<P>大写段落</P><BR>换行', url: 'http://x' })
-    assertEqual(r.includes('<P>'), false)
-    assertEqual(r.includes('<BR>'), false)
-    assertEqual(r.includes('大写段落'), true)
+    assertEqual(r.includes('<P>'), false, 'r.includes(\'<P>\') 应等于 false')
+    assertEqual(r.includes('<BR>'), false, 'r.includes(\'<BR>\') 应等于 false')
+    assertEqual(r.includes('大写段落'), true, 'r.includes(\'大写段落\') 应等于 true')
   })
 
   await test('htmlToMarkdown 输出首尾无多余空白（trim）', () => {
     const r = htmlToMarkdown({ content_html: '  内容  ', url: 'http://x' })
-    assertEqual(r[0] !== ' ', true)
-    assertEqual(r[r.length - 1] !== ' ', true)
+    assertEqual(r[0] !== ' ', true, 'r[0] !== \' \' 应等于 true')
+    assertEqual(r[r.length - 1] !== ' ', true, 'r[r.length - 1] !== \' \' 应等于 true')
   })
 
   await test('htmlToMarkdown 大写img标签', () => {
     const r = htmlToMarkdown({ content_html: '<IMG SRC="http://x/a.jpg">', url: 'http://x' })
-    assertEqual(r.includes('http://x/a.jpg'), true)
+    assertEqual(r.includes('http://x/a.jpg'), true, 'r.includes(\'http://x/a.jpg\') 应等于 true')
   })
 
-  // ==================== 54. 第1-10批×10变异盲区修复 ====================
-  console.log('\n📂 54. 第1-10批×10变异盲区修复')
+  // ==================== 57. 实体解码与时间戳更新 ====================
+  console.log('\n📂 57. 实体解码与时间戳更新')
 
   await test('htmlToMarkdown 多种实体都被解码', () => {
     const r = htmlToMarkdown({ content_html: 'a&amp;b&lt;c&gt;d&nbsp;e', url: 'http://x' })
-    assertEqual(r.includes('a&b<c>d e'), true)
-    assertEqual(r.includes('&amp;'), false)
-    assertEqual(r.includes('&lt;'), false)
-    assertEqual(r.includes('&gt;'), false)
+    assertEqual(r.includes('a&b<c>d e'), true, 'r.includes(\'a&b<c>d e\') 应等于 true')
+    assertEqual(r.includes('&amp;'), false, 'r.includes(\'&amp;\') 应等于 false')
+    assertEqual(r.includes('&lt;'), false, 'r.includes(\'&lt;\') 应等于 false')
+    assertEqual(r.includes('&gt;'), false, 'r.includes(\'&gt;\') 应等于 false')
   })
 
   await test('daysComputed 当天注册 = 0天', () => {
     // v3.115：daysAgo(0)=UTC 今天（本地日期字符串会在 Honolulu 等时区差 1 天）
     const d = daysComputed(daysAgo(0))
-    assertEqual(d, 0)
+    assertEqual(d, 0, 'd 应等于 0')
   })
 
   await test('save timestamp 每次更新为新值', () => {
@@ -4258,19 +4342,19 @@ console.log('========================================\n');
     appendMessageToFile({ id: 42 }, name)
     const t2 = JSON.parse(fs.readFileSync(path.join(CACHE, name), 'utf8'))[0].timestamp
     // 两次 timestamp 应该是 ISO 字符串格式
-    assertEqual(typeof t1, 'string')
-    assertEqual(typeof t2, 'string')
-    assertEqual(t2.length >= t1.length, true)
+    assertEqual(typeof t1, 'string', 'typeof t1 应等于 \'string\'')
+    assertEqual(typeof t2, 'string', 'typeof t2 应等于 \'string\'')
+    assertEqual(t2.length >= t1.length, true, 't2.length >= t1.length 应等于 true')
   })
 
-  // ==================== 55. 第11-20批×10盲区修复 ====================
-  console.log('\n📂 55. 第11-20批×10盲区修复')
+  // ==================== 58. h 标签层级与引号边界 ====================
+  console.log('\n📂 58. h 标签层级与引号边界')
 
   await test('htmlToMarkdown h标签#数量精确断言', () => {
     // ### 不能匹配为 ##，必须精确数量
     const r2 = htmlToMarkdown({ content_html: '<h2>标题</h2>', url: 'http://x' })
-    assertEqual(r2.includes('## 标题'), true)
-    assertEqual(r2.includes('### 标题'), false)
+    assertEqual(r2.includes('## 标题'), true, 'r2.includes(\'## 标题\') 应等于 true')
+    assertEqual(r2.includes('### 标题'), false, 'r2.includes(\'### 标题\') 应等于 false')
   })
 
   await test('htmlToMarkdown 引号内 > 不截断 + 未闭合引号不吞文本（Round2 C045）', () => {
@@ -4287,86 +4371,88 @@ console.log('========================================\n');
   })
 
   await test('whitelistFilter 大小写不敏感（i flag）', () => {
-    assertEqual(whitelistFilter({ title: 'JINGDONG神券' }, 'title', 'jingdong'), true)
-    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', 'JD'), false)
+    assertEqual(whitelistFilter({ title: 'JINGDONG神券' }, 'title', 'jingdong'), true, 'whitelistFilter({ title: \'JINGDONG神券\' }, \'title\', \'jingdong\') 应等于 true')
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', 'JD'), false, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \'JD\') 应等于 false')
   })
 
   await test('tuisong_replace category_name为空字符串', () => {
     // category_name 空字符串时不覆盖 catename
     const r = tuisong_replace('{分类名}', { category_name: '', catename: '原始分类', url: 'x' })
-    assertEqual(r, '原始分类')
+    assertEqual(r, '原始分类', 'r 应等于 \'原始分类\'')
   })
 
   await test('htmlToMarkdown 原文链接含**加粗', () => {
     const r = htmlToMarkdown({ content_html: '内容', url: 'http://x' })
-    assertEqual(r.includes('**['), false)
+    assertEqual(r.includes('**['), false, 'r.includes(\'**[\') 应等于 false')
   })
 
-  // ==================== 56. 第21-30批盲区修复 ====================
-  console.log('\n📂 56. 第21-30批盲区修复')
+  // ==================== 59. Html 内容链接与过滤默认值 ====================
+  console.log('\n📂 59. Html 内容链接与过滤默认值')
 
   await test('tuisong {Html内容} 原文链接含实际URL', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/p.html' })
-    assertEqual(r.includes('http://example.com/p.html'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('http://example.com/p.html'), true, 'r.includes(\'http://example.com/p.html\') 应等于 true')
   })
 
   await test('tuisong {Html内容} 链接文本是URL本身', () => {
     const r = tuisong_replace('{Html内容}', { content_html: '内容', url: 'http://example.com/p.html' })
     // 链接文本应是URL，不是固定文案
-    assertEqual(r.includes('>http://example.com/p.html<'), true)
+    assertEqual(r.includes('>http://example.com/p.html<'), true, 'r.includes(\'>http://example.com/p.html<\') 应等于 true')
   })
 
   await test('Config.filter 各字段默认值', () => {
     // v3.176：个人过滤配置不再硬编码进默认 Config（'美妆' 曾默认屏蔽——克隆用户意外继承）
-    assertEqual(Config.filter.pingbifenlei, '') // 需屏蔽分类请自行配置
-    assertEqual(Config.filter.pingbibiaoti, '')
-    assertEqual(Config.filter.zhanxianbiaoti, '')
-    assertEqual(Config.filter.pingbineirong, '')
+    assertEqual(Config.filter.pingbifenlei, '', 'Config.filter.pingbifenlei 应等于 \'\'') // 需屏蔽分类请自行配置
+    assertEqual(Config.filter.pingbibiaoti, '', 'Config.filter.pingbibiaoti 应等于 \'\'')
+    assertEqual(Config.filter.zhanxianbiaoti, '', 'Config.filter.zhanxianbiaoti 应等于 \'\'')
+    assertEqual(Config.filter.pingbineirong, '', 'Config.filter.pingbineirong 应等于 \'\'')
   })
 
-  // ==================== 57. 第31-40批盲区修复 ====================
-  console.log('\n📂 57. 第31-40批盲区修复')
+  // ==================== 60. 日期格式与正则大小写 ====================
+  console.log('\n📂 60. 日期格式与正则大小写')
 
   await test('tuisong 日期格式带-分隔', () => {
     const r = tuisong_replace('{日期}', { posttime: 1785346200, datetime: undefined, url: 'x' })
     // 日期格式应为 yyyy-mm-dd
-    assertEqual(/^\d{4}-\d{2}-\d{2}$/.test(r), true)
+    assertEqual(/^\d{4}-\d{2}-\d{2}$/.test(r), true, '/^\\d{4}-\\d{2}-\\d{2}$/.test(r) 应等于 true')
   })
 
   await test('compileRules 分类正则大小写不敏感', () => {
     const r = compileRules({ pingbilouzhu: '微博线报###小明' })
     // 分类大写也能匹配
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '微博线报'), true)
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '微博线报'), true, 'matchesCompiled(r.pingbilouzhu, \'小明\', \'微博线报\') 应等于 true')
   })
 
   await test('validateConfig 正则大小写不敏感', () => {
     // 大小写不同的配置不报错（i flag 正常）
     const warns = validateConfig({ pingbibiaoti: 'JINGDONG' })
-    assertEqual(Array.isArray(warns), true)
+    assertEqual(Array.isArray(warns), true, 'Array.isArray(warns) 应等于 true')
+    assertEqual(warns.length, 0, '合法的大写规则不应产生任何告警')
+    assertEqual(matchesCompiled(compileRules({ pingbibiaoti: 'JINGDONG' }).pingbibiaoti, 'jingdong', 'x'),
+      true, '大写规则必须按大小写不敏感命中')
   })
 
-  // ==================== 58. 盲区误判修复（实证发现） ====================
-  console.log('\n📂 58. 盲区误判修复')
+  // ==================== 61. 盲区误判修复（实证发现） ====================
+  console.log('\n📂 61. match/test 等价性与大小写口径')
 
   await test('whitelistFilter 用match测试也应匹配（test/exec等价性）', () => {
     // exec 和 test 对相同输入应返回一致结果
     const r1 = whitelistFilter({ title: '京东神券' }, 'title', '京东')
-    assertEqual(r1, true)
+    assertEqual(r1, true, 'r1 应等于 true')
     const r2 = whitelistFilter({ title: '淘宝特价' }, 'title', '京东')
-    assertEqual(r2, false)
+    assertEqual(r2, false, 'r2 应等于 false')
   })
 
   await test('compileRules 分类大小写不敏感（toLowerCase安全）', () => {
     const compiled = compileRules({ pingbilouzhu: '微博线报###小明' })
     // 分类大小写变体应匹配
-    assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', '微博线报'), true)
+    assertEqual(matchesCompiled(compiled.pingbilouzhu, '小明', '微博线报'), true, 'matchesCompiled(compiled.pingbilouzhu, \'小明\', \'微博线报\') 应等于 true')
   })
 
   await test('whitelistFilter 字段名大小写敏感（缺失字段放行）', () => {
     // 字段名是精确的，不因大小写变化；缺失字段（大小写不匹配）按空值放行
-    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true)
-    assertEqual(whitelistFilter({ Title: '京东' }, 'title', '京东'), true)
+    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东\' }, \'title\', \'京东\') 应等于 true')
+    assertEqual(whitelistFilter({ Title: '京东' }, 'title', '京东'), true, 'whitelistFilter({ Title: \'京东\' }, \'title\', \'京东\') 应等于 true')
   })
 
   await test('MS save 时间戳格式为ISO完整', () => {
@@ -4374,131 +4460,125 @@ console.log('========================================\n');
     appendMessageToFile({ id: 77 }, 'test_iso.json')
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_iso.json'), 'utf8'))
     // ISO 格式：yyyy-mm-ddThh:mm:ss.msZ（含 T 和 Z）
-    assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true)
+    assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true, '/^\\d{4}-\\d{2}-\\d{2}T/.test(msgs[0].timestamp) 应等于 true')
   })
 
-  // ==================== 59. 边缘误判修复（实证发现） ====================
-  console.log('\n📂 59. 边缘误判修复')
+  // ==================== 62. 边缘误判修复（实证发现） ====================
+  console.log('\n📂 62. 日期本地时间与空 url 回退')
 
   await test('daysComputed 日期解析为本地时间（非UTC）', () => {
     // 2026-07-28 解析后应是本地日期的天数
     const d = daysComputed('2026-07-28')
-    assertEqual(d >= 0, true)
+    assertEqual(d >= 0, true, 'd >= 0 应等于 true')
     // 用 UTC 解析会不同（东八区日期差），验证当前解析方式
-    assertEqual(typeof d, 'number')
+    assertEqual(typeof d, 'number', 'typeof d 应等于 \'number\'')
   })
 
   await test('compileRules ###检测 test与includes等价', () => {
     const r = compileRules({ pingbilouzhu: '线报###小明' })
-    assertEqual(r.pingbilouzhu._type, 'multi')
+    assertEqual(r.pingbilouzhu._type, 'multi', 'r.pingbilouzhu._type 应等于 \'multi\'')
     // 空配置不因 includes/test 差异出错
-    assertEqual(compileRules({}).pingbilouzhu, null)
+    assertEqual(compileRules({}).pingbilouzhu, null, 'compileRules({}).pingbilouzhu 应等于 null')
   })
 
   await test('getFileName 空url/undefined → default.json（v3.20审查5）', () => {
     const r = getFileName('')
-    assertEqual(r, 'default.json')
+    assertEqual(r, 'default.json', 'r 应等于 \'default.json\'')
     const r2 = getFileName(undefined)
-    assertEqual(r2, 'default.json')
+    assertEqual(r2, 'default.json', 'r2 应等于 \'default.json\'')
     // 正常 URL 不受影响
-    assertEqual(getFileName('http://x.com/push.json'), 'push.json')
+    assertEqual(getFileName('http://x.com/push.json'), 'push.json', 'getFileName(\'http://x.com/push.json\') 应等于 \'push.json\'')
   })
 
-  // ==================== 60. 误判实证修复（第二批） ====================
-  console.log('\n📂 60. 误判实证修复')
+  // ==================== 63. 误判实证修复（第二批） ====================
+  console.log('\n📂 63. 天数与年份精确值')
 
   await test('daysComputed 天数精确计算', () => {
     // 用精确日期验证天数（v3.115：expected 用 Date.UTC 与 parseTime UTC 解析口径一致）
     const days = daysComputed('2026-01-01')
     const expected = Math.floor((Date.now() - Date.UTC(2026, 0, 1)) / 86400000)
-    assertEqual(days, expected)
+    assertEqual(days, expected, 'days 应等于 expected')
   })
 
   await test('tuisong 年份精确', () => {
     const r = tuisong_replace('{日期}', { posttime: 1785346200, datetime: undefined, url: 'x' })
     const year = r.split('-')[0]
-    assertEqual(parseInt(year) >= 2026, true)
+    assertEqual(parseInt(year) >= 2026, true, 'parseInt(year) >= 2026 应等于 true')
   })
 
   await test('whitelistFilter 正则 边界', () => {
     // 关键词应匹配包含它的词， 影响边界匹配
-    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true)
-    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true)
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \'京东\') 应等于 true')
+    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东\' }, \'title\', \'京东\') 应等于 true')
   })
 
   await test('compileRules 天数值精确', () => {
     const r = compileRules({ pingbitime: '5' })
-    assertEqual(r.pingbitime.value, 5)
+    assertEqual(r.pingbitime.value, 5, 'r.pingbitime.value 应等于 5')
     const r2 = compileRules({ pingbitime: '线报###3' })
-    assertEqual(r2.pingbitime.rules[0].value, 3)
+    assertEqual(r2.pingbitime.rules[0].value, 3, 'r2.pingbitime.rules[0].value 应等于 3')
   })
 
-  // ==================== 61. 精确断言修复（实证盲区） ====================
-  console.log('\n📂 61. 精确断言修复')
+  // ==================== 64. 精确断言修复（实证盲区） ====================
+  console.log('\n📂 64. 天数 / 年份 / 正则边界精确断言')
 
   await test('daysComputed 天数精确（不因时区偏移变化）', () => {
     // 精确日期 → 精确天数
     const d1 = daysComputed('2026-07-26')
     const d2 = daysComputed('2026-07-25')
-    assertEqual(d2, d1 + 1) // 7-25 比 7-26 早1天，天数多1
+    assertEqual(d2, d1 + 1, 'd2 应等于 d1 + 1') // 7-25 比 7-26 早1天，天数多1
   })
 
   await test('tuisong 年份精确值', () => {
     const r = tuisong_replace('{日期}', { posttime: 1785346200, datetime: undefined, url: 'x' })
     // 具体年份（用当前年份验证范围）
     const year = parseInt(r.split('-')[0])
-    assertEqual(year >= 2026 && year <= 2027, true)
+    assertEqual(year >= 2026 && year <= 2027, true, 'year >= 2026 && year <= 2027 应等于 true')
   })
 
   await test('whitelistFilter 正则边界（\b 影响匹配）', () => {
     // 关键词边界：含关键词的词应匹配
-    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true)
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \'京东\') 应等于 true')
     // 大小写不敏感
-    assertEqual(whitelistFilter({ title: 'JINGDONG' }, 'title', 'jingdong'), true)
+    assertEqual(whitelistFilter({ title: 'JINGDONG' }, 'title', 'jingdong'), true, 'whitelistFilter({ title: \'JINGDONG\' }, \'title\', \'jingdong\') 应等于 true')
   })
 
   await test('MS save 时间戳是ISO格式非时间戳数字', () => {
     const fs = require('fs')
     appendMessageToFile({ id: 88 }, 'test_ts_iso.json')
     const msgs = JSON.parse(fs.readFileSync(path.join(CACHE, 'test_ts_iso.json'), 'utf8'))
-    assertEqual(typeof msgs[0].timestamp, 'string')
-    assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true)
+    assertEqual(typeof msgs[0].timestamp, 'string', 'typeof msgs[0].timestamp 应等于 \'string\'')
+    assertEqual(/^\d{4}-\d{2}-\d{2}T/.test(msgs[0].timestamp), true, '/^\\d{4}-\\d{2}-\\d{2}T/.test(msgs[0].timestamp) 应等于 true')
   })
 
   await test('compileRules 天数值精确（不减不加）', () => {
     const r = compileRules({ pingbitime: '5' })
-    assertEqual(r.pingbitime.value, 5)
+    assertEqual(r.pingbitime.value, 5, 'r.pingbitime.value 应等于 5')
     const r2 = compileRules({ pingbitime: '线报###3' })
-    assertEqual(r2.pingbitime.rules[0].value, 3)
+    assertEqual(r2.pingbitime.rules[0].value, 3, 'r2.pingbitime.rules[0].value 应等于 3')
   })
 
-  await test('MS 裁剪用splice保留后100条', () => {
+  await test('MS 裁剪用splice保留后100条', () => withCacheMaxSize(100, () => {
     const p = path.join(CACHE, 'test_splice.json')
     const msgs = []
     for (let i = 0; i < 150; i++) msgs.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限验证裁剪（默认已 10000）
-    try {
-      saveMessages(p, msgs)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, msgs)
     const r = readMessages(p)
-    assertEqual(r.length, 100)
+    assertEqual(r.length, 100, 'r.length 应等于 100')
     // 裁剪应删前面的，保留后面的
-    assertEqual(r.some(m => m.id === 0), false)
-    assertEqual(r.some(m => m.id === 149), true)
-  })
+    assertEqual(r.some(m => m.id === 0), false, 'r.some(m => m.id === 0) 应等于 false')
+    assertEqual(r.some(m => m.id === 149), true, 'r.some(m => m.id === 149) 应等于 true')
+  }))
 
-  // ==================== 62. 变异实证盲区修复（第41-50批） ====================
-  console.log('\n📂 62. 变异实证盲区修复')
+  // ==================== 65. 边界值与退化输入实证 ====================
+  console.log('\n📂 65. 边界值与退化输入实证')
 
   await test('add0 边界：9分钟补0 → 09', () => {
     // v3.115：{时间} 用 getUTC*——测试用 Date.UTC 构造（跨时区稳定）
     const ts = Math.floor(new Date(Date.UTC(2026, 0, 9, 12, 9, 0)).getTime() / 1000)
     const r = tuisong_replace('{日期}|{时间}', { posttime: ts, url: 'x' })
     // 变异 m<11 时 add0(9) 会变成 '9'，此处精确断言 '09'
-    assertEqual(r, '2026-01-09|12:09')
+    assertEqual(r, '2026-01-09|12:09', 'r 应等于 \'2026-01-09|12:09\'')
   })
 
   await test('add0 边界：10分钟不补0 → 10（变异 m<11 会错误补0成010）', () => {
@@ -4506,67 +4586,67 @@ console.log('========================================\n');
     const ts = Math.floor(new Date(Date.UTC(2026, 0, 10, 12, 10, 0)).getTime() / 1000)
     const r = tuisong_replace('{日期}|{时间}', { posttime: ts, url: 'x' })
     // 变异 m<11 时 add0(10) 会变成 '010'；变异 m<9 时 add0(9) 会丢0
-    assertEqual(r, '2026-01-10|12:10')
+    assertEqual(r, '2026-01-10|12:10', 'r 应等于 \'2026-01-10|12:10\'')
   })
 
   await test('decodeHtmlEntities undefined → 空串（变异 || 变 && 会返回 "undefined"）', () => {
     // 变异 if (str===undefined && str===null) 恒 false，String(undefined)='undefined'
-    assertEqual(decodeHtmlEntities(undefined), '')
+    assertEqual(decodeHtmlEntities(undefined), '', 'decodeHtmlEntities(undefined) 应等于 \'\'')
   })
 
   await test('decodeHtmlEntities null → 空串', () => {
-    assertEqual(decodeHtmlEntities(null), '')
+    assertEqual(decodeHtmlEntities(null), '', 'decodeHtmlEntities(null) 应等于 \'\'')
   })
 
   await test('daysComputed 明天（未来24h内）→ 0（变异 >-1 会返回负数）', () => {
     // v3.115：daysAgo(-1) = 明天（UTC，与 parseTime 口径一致）
-    assertEqual(daysComputed(daysAgo(-1)), 0)
+    assertEqual(daysComputed(daysAgo(-1)), 0, 'daysComputed(daysAgo(-1)) 应等于 0')
   })
 
   await test('htmlToMarkdown h0 无效标签 → 不转为标题', () => {
     const r = htmlToMarkdown({ content_html: '<h0>无效标题</h0>', url: 'http://x' })
     // 变异正则 [0-6] 匹配 h0 后 repeat('0') 会丢失 # 号（输出行为与原型一致，属等价变异，此处锁原型行为）
-    assertEqual(r.includes('无效标题'), true)
-    assertEqual(r.startsWith('无效标题'), true)
+    assertEqual(r.includes('无效标题'), true, 'r.includes(\'无效标题\') 应等于 true')
+    assertEqual(r.startsWith('无效标题'), true, 'r.startsWith(\'无效标题\') 应等于 true')
   })
 
   await test('htmlToMarkdown 恰好3个连续换行 → 合并为2个（变异 {4,} 会保留3个）', () => {
     const r = htmlToMarkdown({ content_html: '第一段\n\n\n第二段', url: 'http://x' })
     // 变异 \n{4,} 时 \n\n\n 不会被合并，输出中残留 3 个换行
-    assertEqual(r.includes('\n\n\n'), false)
-    assertEqual(r.includes('第一段\n\n第二段'), true)
+    assertEqual(r.includes('\n\n\n'), false, 'r.includes(\'\\n\\n\\n\') 应等于 false')
+    assertEqual(r.includes('第一段\n\n第二段'), true, 'r.includes(\'第一段\\n\\n第二段\') 应等于 true')
   })
 
   await test('compileRules 简单模式正则大小写不敏感（大写输入匹配）', () => {
     // 变异 DROP i flag 后 'JD' 无法匹配 'jd'
     const r = compileRules({ pingbibiaoti: 'jd' })
-    assertEqual(r.pingbibiaoti._type, 're')
-    assertEqual(matchesCompiled(r.pingbibiaoti, 'JD神券大促', null), true)
+    assertEqual(r.pingbibiaoti._type, 're', 'r.pingbibiaoti._type 应等于 \'re\'')
+    assertEqual(matchesCompiled(r.pingbibiaoti, 'JD神券大促', null), true, 'matchesCompiled(r.pingbibiaoti, \'JD神券大促\', null) 应等于 true')
   })
 
   await test('compileRules 多行值正则大小写不敏感（大写输入匹配）', () => {
     const r = compileRules({ pingbilouzhu: 'weibo###xiaoming' })
-    assertEqual(r.pingbilouzhu._type, 'multi')
+    assertEqual(r.pingbilouzhu._type, 'multi', 'r.pingbilouzhu._type 应等于 \'multi\'')
     // 变异 DROP i flag 后 'XIAOMING' 无法匹配 'xiaoming'
-    assertEqual(matchesCompiled(r.pingbilouzhu, 'XIAOMING', 'weibo'), true)
+    assertEqual(matchesCompiled(r.pingbilouzhu, 'XIAOMING', 'weibo'), true, 'matchesCompiled(r.pingbilouzhu, \'XIAOMING\', \'weibo\') 应等于 true')
     // 分类正则同样大小写不敏感
-    assertEqual(matchesCompiled(r.pingbilouzhu, 'xiaoming', 'WEIBO'), true)
+    assertEqual(matchesCompiled(r.pingbilouzhu, 'xiaoming', 'WEIBO'), true, 'matchesCompiled(r.pingbilouzhu, \'xiaoming\', \'WEIBO\') 应等于 true')
   })
 
   await test('compileRules 多行中含无###的行 → 该行被忽略（变异 >=1 会生成垃圾规则）', () => {
     // 变异 parts.length>=1 会把无 ### 的 "垃圾行" 编译成匹配 /undefined/ 的规则
     const r = compileRules({ pingbilouzhu: '微博线报###小明<br>垃圾行' })
-    assertEqual(r.pingbilouzhu.rules.length, 1)
+    assertEqual(r.pingbilouzhu.rules.length, 1, 'r.pingbilouzhu.rules.length 应等于 1')
     // 垃圾行本身不应匹配任何值
-    assertEqual(matchesCompiled(r.pingbilouzhu, '垃圾', '微博线报'), false)
+    assertEqual(matchesCompiled(r.pingbilouzhu, '垃圾', '微博线报'), false, 'matchesCompiled(r.pingbilouzhu, \'垃圾\', \'微博线报\') 应等于 false')
     // 有效规则仍生效
-    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '微博线报'), true)
+    assertEqual(matchesCompiled(r.pingbilouzhu, '小明', '微博线报'), true, 'matchesCompiled(r.pingbilouzhu, \'小明\', \'微博线报\') 应等于 true')
   })
 
   await test('compileRules pingbitime 多行中含无###的行 → 被忽略', () => {
     const r = compileRules({ pingbitime: '微博线报###3<br>垃圾行' })
-    assertEqual(r.pingbitime._type, 'timeMulti')
-    assertEqual(r.pingbitime.rules.length, 1)
+    assertEqual(r.pingbitime._type, 'timeMulti', 'r.pingbitime._type 应等于 \'timeMulti\'')
+    assertEqual(r.pingbitime.rules.length, 1, 'r.pingbitime.rules.length 应等于 1')
   })
 
   await test('checkFields 强制展现配置存在但字段为空 → 不触发白名单（变异 && 变 || 会越权）', () => {
@@ -4584,7 +4664,7 @@ console.log('========================================\n');
       url: '/w/1.html'
     }
     // 标题为空 → 不触发强制展现 → 内容屏蔽命中 → 被屏蔽
-    assertEqual(listfilter(group, cfg), false)
+    assertEqual(listfilter(group, cfg), false, 'listfilter(group, cfg) 应等于 false')
   })
 
   await test('checkFields 强制展现字段有值且匹配 → 正常免疫屏蔽', () => {
@@ -4600,40 +4680,40 @@ console.log('========================================\n');
       url: '/w/2.html'
     }
     // 标题非空且匹配强制展现 → 内容屏蔽被跳过 → 保留
-    assertEqual(listfilter(group, cfg), true)
+    assertEqual(listfilter(group, cfg), true, 'listfilter(group, cfg) 应等于 true')
   })
 
   await test('validateConfig pingbitime 无效数字警告包含具体值', () => {
     const warns = validateConfig({ pingbitime: '微博线报###abc' })
     // 变异模板字符串 parts[1]->parts[0] 时警告里会打印错误的值
-    assertEqual(warns.some(w => w.includes('「abc」')), true)
+    assertEqual(warns.some(w => w.includes('「abc」')), true, 'warns.some(w => w.includes(\'「abc」\')) 应等于 true')
   })
 
   await test('pingbitime 多行分类正则大小写不敏感（变异 L229 DROP i 后大写分类失配）', () => {
     // 变异 pingbitime 多行的 catRe 去掉 i flag 后，'weibo' 无法匹配 /WEIBO/
     const r = compileRules({ pingbitime: 'WEIBO###5' })
-    assertEqual(r.pingbitime._type, 'timeMulti')
+    assertEqual(r.pingbitime._type, 'timeMulti', 'r.pingbitime._type 应等于 \'timeMulti\'')
     // 2天前注册的新号（注册天数 < 5 → 应拦截）——v3.115：daysAgo(2) UTC 统一
     const group = { catename: 'weibo', louzhuregtime: daysAgo(2) }
     // 分类大小写不敏感 → 规则命中 → 拦截
-    assertEqual(checkTimeCompiled(r.pingbitime, group), true)
+    assertEqual(checkTimeCompiled(r.pingbitime, group), true, 'checkTimeCompiled(r.pingbitime, group) 应等于 true')
   })
 
   await test('matchesCompiled 未知规则类型 → 不匹配（变异 L269 兜底 true 会误匹配）', () => {
     // 变异兜底 return false->true 后，未知 _type 的规则会匹配任何非空字段
     const weird = { _type: 'unknown-type', re: /京东/ }
-    assertEqual(matchesCompiled(weird, '任意内容', null), false)
+    assertEqual(matchesCompiled(weird, '任意内容', null), false, 'matchesCompiled(weird, \'任意内容\', null) 应等于 false')
   })
 
   await test('checkTimeCompiled 未知规则类型 → 不拦截（变异 L292 兜底 true 会误拦截）', () => {
     // 变异兜底 return false->true 后，未知 _type 的天数规则会拦截所有人
     const weird = { _type: 'unknown-type', value: 5 }
     const group = { catename: '微博线报', louzhuregtime: '2026-07-01' }
-    assertEqual(checkTimeCompiled(weird, group), false)
+    assertEqual(checkTimeCompiled(weird, group), false, 'checkTimeCompiled(weird, group) 应等于 false')
   })
 
-  // ==================== 63. 第51批变异盲区修复（v2算子） ====================
-  console.log('\n📂 63. 第51批变异盲区修复')
+  // ==================== 66. 追加顺序与空标签转换（v2 算子） ====================
+  console.log('\n📂 66. 追加顺序与空标签转换')
 
   await test('saveBatch 新消息按顺序追加到末尾（变异 push->unshift 会倒序）', () => {
     // 变异 unshift 后新消息会插到数组开头，顺序颠倒
@@ -4643,8 +4723,8 @@ console.log('========================================\n');
     const i200 = msgs.findIndex(m => m.id === 200)
     const i201 = msgs.findIndex(m => m.id === 201)
     // 后保存的 201 必须在 200 之后（append 语义）
-    assertEqual(i200 >= 0, true)
-    assertEqual(i201 > i200, true)
+    assertEqual(i200 >= 0, true, 'i200 >= 0 应等于 true')
+    assertEqual(i201 > i200, true, 'i201 > i200 应等于 true')
   })
 
   await test('save 单条新消息同样追加到末尾', () => {
@@ -4652,43 +4732,41 @@ console.log('========================================\n');
     appendMessageToFile({ id: 300 }, 'test_save_order.json')
     appendMessageToFile({ id: 301 }, 'test_save_order.json')
     const msgs = readMessages(getFilePath('test_save_order.json'))
-    assertEqual(msgs[msgs.length - 1].id, 301)
-    assertEqual(msgs[0].id, 300)
+    assertEqual(msgs[msgs.length - 1].id, 301, 'msgs[msgs.length - 1].id 应等于 301')
+    assertEqual(msgs[0].id, 300, 'msgs[0].id 应等于 300')
   })
 
   await test('htmlToMarkdown 空h标签也转换（变异 .*?->.+? 会漏掉空标题）', () => {
     // 变异 (.*?)->(.+?) 后 <h1></h1> 空内容不匹配，不再转成标题
     const r = htmlToMarkdown({ content_html: '<h1></h1>', url: 'http://x' })
     // 空 h1 也应转成 '# '（repeat(1) + 空格）
-    assertEqual(r.includes('# '), true)
+    assertEqual(r.includes('# '), true, 'r.includes(\'# \') 应等于 true')
   })
 
   await test('htmlToMarkdown 链接替换模板无附加字符（变异 STR append 会多出x）', () => {
     const r = htmlToMarkdown({ content_html: '<a href="http://u">链接</a>', url: 'http://x' })
     // 变异替换模板 '[$2]($1)' 追加字符后输出会带 'x'
-    assertEqual(r.includes('[链接](http://u)x'), false)
+    assertEqual(r.includes('[链接](http://u)x'), false, 'r.includes(\'[链接](http://u)x\') 应等于 false')
     // 精确锁定替换结果本身
-    assertEqual(r.includes('[链接](http://u)\n'), true)
+    assertEqual(r.includes('[链接](http://u)\n'), true, 'r.includes(\'[链接](http://u)\\n\') 应等于 true')
   })
 
   await test('htmlToMarkdown img替换模板无附加字符', () => {
     const r1 = htmlToMarkdown({ content_html: '<img src="http://p.jpg" alt="图">', url: 'http://x' })
-    assertEqual(r1.includes('![图](http://p.jpg)x'), false)
+    assertEqual(r1.includes('![图](http://p.jpg)x'), false, 'r1.includes(\'![图](http://p.jpg)x\') 应等于 false')
     const r2 = htmlToMarkdown({ content_html: '<img src="http://p.jpg">', url: 'http://x' })
-    assertEqual(r2.includes('![](http://p.jpg)x'), false)
+    assertEqual(r2.includes('![](http://p.jpg)x'), false, 'r2.includes(\'![](http://p.jpg)x\') 应等于 false')
   })
 
   await test('tuisong {Html内容} 替换后无花括号残留（变异 key 截断会残留 }）', () => {
     // 变异 '{Html内容' 作为 key 时仍前缀匹配，替换结果末尾会残留 '}'
     const r = tuisong_replace('{Html内容}', { content_html: '测试', url: 'http://x' })
-    assertEqual(r.includes('}'), false)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('}'), false, 'r.includes(\'}\') 应等于 false')
   })
 
   await test('tuisong {Markdown内容} 替换后无花括号残留', () => {
     const r = tuisong_replace('{Markdown内容}', { content_html: '测试', url: 'http://x' })
-    assertEqual(r.includes('}'), false)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('}'), false, 'r.includes(\'}\') 应等于 false')
   })
 
   await test('validateConfig 逐字段验证无效正则（变异字段名数组会漏验）', () => {
@@ -4706,71 +4784,71 @@ console.log('========================================\n');
 
   await test('whitelistFilter 空字段不参与匹配（缺失按放行，不与关键词比对）', () => {
     // 空/缺失字段按缺失放行，不会与 'undefined' 等关键词比对
-    assertEqual(whitelistFilter({ title: '' }, 'title', 'undefined'), true)
-    assertEqual(whitelistFilter({ title: undefined }, 'title', 'undefined'), true)
+    assertEqual(whitelistFilter({ title: '' }, 'title', 'undefined'), true, 'whitelistFilter({ title: \'\' }, \'title\', \'undefined\') 应等于 true')
+    assertEqual(whitelistFilter({ title: undefined }, 'title', 'undefined'), true, 'whitelistFilter({ title: undefined }, \'title\', \'undefined\') 应等于 true')
   })
 
   await test('htmlToMarkdown h标签替换模板无附加字符（变异模板后追加x）', () => {
     // 变异替换回调 '\n\n' 追加 'x' 后，输出会多出 x
     const r = htmlToMarkdown({ content_html: '<h1>标题1</h1>', url: 'http://x' })
-    assertEqual(r.includes('标题1\n\nx'), false)
+    assertEqual(r.includes('标题1\n\nx'), false, 'r.includes(\'标题1\\n\\nx\') 应等于 false')
   })
 
   await test('htmlToMarkdown img模板无附加字符（带alt/无alt）', () => {
     const r1 = htmlToMarkdown({ content_html: '<img src="http://p.jpg" alt="图">', url: 'http://x' })
-    assertEqual(r1.includes('![图](http://p.jpg)\n\nx'), false)
+    assertEqual(r1.includes('![图](http://p.jpg)\n\nx'), false, 'r1.includes(\'![图](http://p.jpg)\\n\\nx\') 应等于 false')
     const r2 = htmlToMarkdown({ content_html: '<img src="http://p.jpg">', url: 'http://x' })
-    assertEqual(r2.includes('![](http://p.jpg)\n\nx'), false)
+    assertEqual(r2.includes('![](http://p.jpg)\n\nx'), false, 'r2.includes(\'![](http://p.jpg)\\n\\nx\') 应等于 false')
   })
 
-  // ==================== 64. fuzz 属性测试发现修复 ====================
-  console.log('\n📂 64. fuzz 属性测试发现修复')
+  // ==================== 67. fuzz 发现的换行与模板退化 ====================
+  console.log('\n📂 67. fuzz 发现的换行与模板退化')
 
   await test('htmlToMarkdown 内容尾部换行 + 模板拼接处 → 无3连换行（fuzz发现）', () => {
     // 内容以 <p> 结尾产生尾部 \n\n，拼接模板的 \n\n 原文链接 会拼出 4 连换行
     // 修复前：合并 \n{3,} 在拼接之前执行，拼接处残留 \n\n\n\n
     const r = htmlToMarkdown({ content_html: '<p>段落</p>', url: 'http://x' })
-    assertEqual(r.includes('\n\n\n'), false)
-    assertEqual(r.includes('段落\n\n原文链接'), true)
+    assertEqual(r.includes('\n\n\n'), false, 'r.includes(\'\\n\\n\\n\') 应等于 false')
+    assertEqual(r.includes('段落\n\n原文链接'), true, 'r.includes(\'段落\\n\\n原文链接\') 应等于 true')
   })
 
   await test('htmlToMarkdown 多p标签拼接处 → 无3连换行', () => {
     const r = htmlToMarkdown({ content_html: '<p>第一段</p><p>第二段</p>', url: 'http://x' })
-    assertEqual(r.includes('\n\n\n'), false)
-    assertEqual(r.includes('第一段\n\n第二段'), true)
-    assertEqual(r.includes('第二段\n\n原文链接'), true)
+    assertEqual(r.includes('\n\n\n'), false, 'r.includes(\'\\n\\n\\n\') 应等于 false')
+    assertEqual(r.includes('第一段\n\n第二段'), true, 'r.includes(\'第一段\\n\\n第二段\') 应等于 true')
+    assertEqual(r.includes('第二段\n\n原文链接'), true, 'r.includes(\'第二段\\n\\n原文链接\') 应等于 true')
   })
 
   await test('tuisong_replace 模板缺失/非字符串 → 不崩溃（针对性构造发现）', () => {
     // 真实场景模板配置缺失时 text 可能为 undefined/null
-    assertEqual(tuisong_replace(undefined, { title: 'x' }), '')
-    assertEqual(tuisong_replace(null, { title: 'x' }), '')
+    assertEqual(tuisong_replace(undefined, { title: 'x' }), '', 'tuisong_replace(undefined, { title: \'x\' }) 应等于 \'\'')
+    assertEqual(tuisong_replace(null, { title: 'x' }), '', 'tuisong_replace(null, { title: \'x\' }) 应等于 \'\'')
     // 数字模板被字符串化
-    assertEqual(tuisong_replace(123, { title: 'x' }), '123')
+    assertEqual(tuisong_replace(123, { title: 'x' }), '123', 'tuisong_replace(123, { title: \'x\' }) 应等于 \'123\'')
     // 正常模板不受影响
-    assertEqual(tuisong_replace('{标题}', { title: 'x' }), 'x')
+    assertEqual(tuisong_replace('{标题}', { title: 'x' }), 'x', 'tuisong_replace(\'{标题}\', { title: \'x\' }) 应等于 \'x\'')
   })
 
   await test('whitelistFilter item 缺失 → 不崩溃（针对性构造发现）', () => {
     // 防御：item 为 undefined 时，有关键词 → 不匹配；空关键词 → 全通过
-    assertEqual(whitelistFilter(undefined, 'title', '京东'), false)
-    assertEqual(whitelistFilter(undefined, 'title', ''), true)
-    assertEqual(whitelistFilter(null, 'title', '京东'), false)
+    assertEqual(whitelistFilter(undefined, 'title', '京东'), false, 'whitelistFilter(undefined, \'title\', \'京东\') 应等于 false')
+    assertEqual(whitelistFilter(undefined, 'title', ''), true, 'whitelistFilter(undefined, \'title\', \'\') 应等于 true')
+    assertEqual(whitelistFilter(null, 'title', '京东'), false, 'whitelistFilter(null, \'title\', \'京东\') 应等于 false')
   })
 
   await test('checkRegisterTime/checkCategory group 缺失 → 不崩溃（针对性构造发现）', () => {
     const c = compileRules({ pingbitime: '5', pingbifenlei: '微博' })
     // 防御：group 为 null/undefined 时不崩溃，视为通过
-    assertEqual(checkRegisterTime(null, c.pingbitime), true)
-    assertEqual(checkRegisterTime(undefined, c.pingbitime), true)
-    assertEqual(checkCategory(null, c.pingbifenlei), true)
-    assertEqual(checkCategory(undefined, c.pingbifenlei), true)
+    assertEqual(checkRegisterTime(null, c.pingbitime), true, 'checkRegisterTime(null, c.pingbitime) 应等于 true')
+    assertEqual(checkRegisterTime(undefined, c.pingbitime), true, 'checkRegisterTime(undefined, c.pingbitime) 应等于 true')
+    assertEqual(checkCategory(null, c.pingbifenlei), true, 'checkCategory(null, c.pingbifenlei) 应等于 true')
+    assertEqual(checkCategory(undefined, c.pingbifenlei), true, 'checkCategory(undefined, c.pingbifenlei) 应等于 true')
     // 正常 group 不受影响
-    assertEqual(checkCategory({ catename: '微博' }, c.pingbifenlei), false)
+    assertEqual(checkCategory({ catename: '微博' }, c.pingbifenlei), false, 'checkCategory({ catename: \'微博\' }, c.pingbifenlei) 应等于 false')
   })
 
-  // ==================== 65. 代码审查修复（v3.14 审查请求） ====================
-  console.log('\n📂 65. 代码审查修复')
+  // ==================== 68. saveBatch 无 id 判重口径 ====================
+  console.log('\n📂 68. saveBatch 无 id 判重口径')
 
   await test('saveBatch 无id不同url → 互不覆盖（修复前 undefined===undefined 误判覆盖）', () => {
     // 修复前 m.id === message.id 在两者都是 undefined 时为 true，
@@ -4779,7 +4857,7 @@ console.log('========================================\n');
     saveBatch([{ url: '/b.html', title: 'B' }], 'test_noid_diffurl.json')
     const r = readMessages(getFilePath('test_noid_diffurl.json'))
     assertEqual(r.length, 2, `应2条，实际${r.length}`)
-    assertEqual(r.map(m => m.title).join(','), 'A,B')
+    assertEqual(r.map(m => m.title).join(','), 'A,B', 'r.map(m => m.title).join(\',\') 应等于 \'A,B\'')
   })
 
   await test('saveBatch 无id非字符串 url → 不互相覆盖（v3.228）', () => {
@@ -4787,7 +4865,7 @@ console.log('========================================\n');
     saveBatch([{ url: {}, title: '对象URL-B' }], 'test_noid_invalid_url.json')
     const r = readMessages(getFilePath('test_noid_invalid_url.json'))
     assertEqual(r.length, 2, `非字符串 URL 的不同消息应分别保留，实际${r.length}`)
-    assertEqual(r.map(m => m.title).join(','), '对象URL-A,对象URL-B')
+    assertEqual(r.map(m => m.title).join(','), '对象URL-A,对象URL-B', 'r.map(m => m.title).join(\',\') 应等于 \'对象URL-A,对象URL-B\'')
   })
 
   await test('saveBatch 无id同url → 更新不重复', () => {
@@ -4795,7 +4873,7 @@ console.log('========================================\n');
     saveBatch([{ url: '/c.html', title: 'C2' }], 'test_noid_sameurl.json')
     const r = readMessages(getFilePath('test_noid_sameurl.json'))
     assertEqual(r.length, 1, `应1条，实际${r.length}`)
-    assertEqual(r[0].title, 'C2')
+    assertEqual(r[0].title, 'C2', 'r[0].title 应等于 \'C2\'')
   })
 
   await test('saveBatch 无id无url → 保守收录不判重', () => {
@@ -4812,15 +4890,15 @@ console.log('========================================\n');
     assertEqual(r.length, 2, `应2条，实际${r.length}`)
   })
 
-  // ==================== 66. v3.15 审查报告修复 ====================
-  console.log('\n📂 66. v3.15 审查报告修复')
+  // ==================== 69. save 判重对齐与数字实体解码 ====================
+  console.log('\n📂 69. save 判重对齐与数字实体解码')
 
   await test('save 无id不同url → 互不覆盖（v3.15审查3.1：save与saveBatch对齐）', () => {
     appendMessageToFile({ url: '/x1.html', title: 'A' }, 'test_save_noid.json')
     appendMessageToFile({ url: '/x2.html', title: 'B' }, 'test_save_noid.json')
     const r = readMessages(getFilePath('test_save_noid.json'))
     assertEqual(r.length, 2, `应2条，实际${r.length}`)
-    assertEqual(r.map(m => m.title).join(','), 'A,B')
+    assertEqual(r.map(m => m.title).join(','), 'A,B', 'r.map(m => m.title).join(\',\') 应等于 \'A,B\'')
   })
 
   await test('save 无id同url → 更新不重复', () => {
@@ -4828,47 +4906,47 @@ console.log('========================================\n');
     appendMessageToFile({ url: '/y.html', title: 'C2' }, 'test_save_sameurl.json')
     const r = readMessages(getFilePath('test_save_sameurl.json'))
     assertEqual(r.length, 1, `应1条，实际${r.length}`)
-    assertEqual(r[0].title, 'C2')
+    assertEqual(r[0].title, 'C2', 'r[0].title 应等于 \'C2\'')
   })
 
   await test('decodeHtmlEntities 数字实体十进制 → 转字符（v3.15审查4.2）', () => {
-    assertEqual(decodeHtmlEntities('&#39;'), "'")
-    assertEqual(decodeHtmlEntities('a&#65;b'), 'aAb')
-    assertEqual(decodeHtmlEntities('&#60;&#62;'), '<>')
+    assertEqual(decodeHtmlEntities('&#39;'), "'", 'decodeHtmlEntities(\'&#39;\') 应等于 "\'"')
+    assertEqual(decodeHtmlEntities('a&#65;b'), 'aAb', 'decodeHtmlEntities(\'a&#65;b\') 应等于 \'aAb\'')
+    assertEqual(decodeHtmlEntities('&#60;&#62;'), '<>', 'decodeHtmlEntities(\'&#60;&#62;\') 应等于 \'<>\'')
   })
 
   await test('decodeHtmlEntities 数字实体十六进制 → 转字符', () => {
-    assertEqual(decodeHtmlEntities('&#x41;'), 'A')
-    assertEqual(decodeHtmlEntities('&#x26;'), '&')
+    assertEqual(decodeHtmlEntities('&#x41;'), 'A', 'decodeHtmlEntities(\'&#x41;\') 应等于 \'A\'')
+    assertEqual(decodeHtmlEntities('&#x26;'), '&', 'decodeHtmlEntities(\'&#x26;\') 应等于 \'&\'')
     // 命名实体仍生效
-    assertEqual(decodeHtmlEntities('&amp;&#65;'), '&A')
+    assertEqual(decodeHtmlEntities('&amp;&#65;'), '&A', 'decodeHtmlEntities(\'&amp;&#65;\') 应等于 \'&A\'')
   })
 
   await test('decodeHtmlEntities 数字实体与命名实体混合', () => {
-    assertEqual(decodeHtmlEntities('&lt;&#49;&gt;'), '<1>')
-    assertEqual(decodeHtmlEntities('普通&#x4E2D;文'), '普通中文')
+    assertEqual(decodeHtmlEntities('&lt;&#49;&gt;'), '<1>', 'decodeHtmlEntities(\'&lt;&#49;&gt;\') 应等于 \'<1>\'')
+    assertEqual(decodeHtmlEntities('普通&#x4E2D;文'), '普通中文', 'decodeHtmlEntities(\'普通&#x4E2D;文\') 应等于 \'普通中文\'')
   })
 
   await test('saveMessages 原子写入后无 .tmp 残留（v3.16审查3.1）', () => {
     const p = getFilePath('test_atomic.json')
     saveMessages(p, [{ id: 1, title: '原子' }])
     const r = readMessages(p)
-    assertEqual(r.length, 1)
+    assertEqual(r.length, 1, 'r.length 应等于 1')
     // tmp 文件应在 rename 后被清掉
     const fs = require('fs')
     assertEqual(fs.existsSync(p + '.tmp'), false, 'tmp 文件应被清理')
   })
 
-  // ==================== 67. v3.18 审查报告修复 ====================
-  console.log('\n📂 67. v3.18 审查报告修复')
+  // ==================== 70. anonKey 稳定性与类目同源 ====================
+  console.log('\n📂 70. anonKey 稳定性与类目同源')
 
   await test('anonKey 稳定合成id：相同输入相同key（v3.18审查Bug2）', () => {
-    assertEqual(anonKey('京东', '内容A'), anonKey('京东', '内容A'))
+    assertEqual(anonKey('京东', '内容A'), anonKey('京东', '内容A'), 'anonKey(\'京东\', \'内容A\') 应等于 anonKey(\'京东\', \'内容A\')')
     // 空值处理
-    assertEqual(typeof anonKey(undefined, null), 'string')
-    assertEqual(anonKey('京东', '内容A') !== anonKey('淘宝', '内容A'), true)
+    assertEqual(typeof anonKey(undefined, null), 'string', 'typeof anonKey(undefined, null) 应等于 \'string\'')
+    assertEqual(anonKey('京东', '内容A') !== anonKey('淘宝', '内容A'), true, 'anonKey(\'京东\', \'内容A\') !== anonKey(\'淘宝\', \'内容A\') 应等于 true')
     // 格式: anon: 前缀 + 十六进制
-    assertEqual(/^anon:[0-9a-f]+$/.test(anonKey('x', 'y')), true)
+    assertEqual(/^anon:[0-9a-f]+$/.test(anonKey('x', 'y')), true, '/^anon:[0-9a-f]+$/.test(anonKey(\'x\', \'y\')) 应等于 true')
   })
 
   await test('anonKey 楼主不同 → 不同key（v3.176 修复#6）', () => {
@@ -4883,49 +4961,47 @@ console.log('========================================\n');
   await test('tuisong {类目} 与 {分类名} 统一来源（v3.18审查Bug3）', () => {
     // 数据源只有 catename（无 category_name）→ {类目} 也应有值
     const r = tuisong_replace('{类目}|{分类名}', { catename: '美妆', url: 'x' })
-    assertEqual(r, '美妆|美妆')
+    assertEqual(r, '美妆|美妆', 'r 应等于 \'美妆|美妆\'')
     // 只有 category_name → 归一化后两者一致
     const r2 = tuisong_replace('{类目}|{分类名}', { category_name: '数码', url: 'x' })
-    assertEqual(r2, '数码|数码')
+    assertEqual(r2, '数码|数码', 'r2 应等于 \'数码|数码\'')
   })
 
-  // ==================== 68. v3.20 审查报告修复 ====================
-  console.log('\n📂 68. v3.20 审查报告修复')
+  // ==================== 71. id 判重边界与 anon 前缀口径 ====================
+  console.log('\n📂 71. id 判重边界与 anon 前缀口径')
 
   await test('hasValidId 排除 null/空串（v3.20审查2：id判重过宽）', () => {
-    assertEqual(hasValidId({ id: undefined }), false)
-    assertEqual(hasValidId({ id: null }), false)
-    assertEqual(hasValidId({ id: '' }), false)
-    assertEqual(hasValidId({ id: 0 }), true) // 数字 0 是有效 id
-    assertEqual(hasValidId({ id: '123' }), true)
-    assertEqual(hasValidId({ id: 'anon:abc' }), true)
+    assertEqual(hasValidId({ id: undefined }), false, 'hasValidId({ id: undefined }) 应等于 false')
+    assertEqual(hasValidId({ id: null }), false, 'hasValidId({ id: null }) 应等于 false')
+    assertEqual(hasValidId({ id: '' }), false, 'hasValidId({ id: \'\' }) 应等于 false')
+    assertEqual(hasValidId({ id: 0 }), true, 'hasValidId({ id: 0 }) 应等于 true') // 数字 0 是有效 id
+    assertEqual(hasValidId({ id: '123' }), true, 'hasValidId({ id: \'123\' }) 应等于 true')
+    assertEqual(hasValidId({ id: 'anon:abc' }), true, 'hasValidId({ id: \'anon:abc\' }) 应等于 true')
   })
 
-  await test('真实 anon:... 前缀 id 保持 id 权威，跨 url 判重（v3.247 修复）', async () => {
+  await test('真实 anon:... 前缀 id 保持 id 权威，跨 url 判重（v3.247 修复）', () => {
     // 曾：无 url 的 id='anon:abc1' 被 /^anon:[0-9a-f]+$/i 误降级为匿名身份，与同 id 带 url 的
     // 记录（kind 'id'）判重路径分裂 → 同一条消息被重复推送。修复后保持 id 权威，按 idKey 合并。
-    const fs = require('fs')
     const name = 'test_identity_real_anon_id.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ id: 'anon:abc1', title: '真实A', url: '/u/x.html' }], name)
     saveBatch([{ id: 'anon:abc1', title: '真实A' }], name) // 同 id 无 url → 不应降级
     assertEqual(readMessages(p).length, 1, `真实 anon:... id 应保持 id 权威跨 url 合并，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
-  await test('历史 anon:hash 自身内容键仍降级匿名并跨运行去重（兼容保留）', async () => {
+  await test('历史 anon:hash 自身内容键仍降级匿名并跨运行去重（兼容保留）', () => {
     // 旧版 App 曾把 anonKey(自身字段) 写入 id 字段落缓存；该 id 与自身内容哈希一致 → 仍降级
     // 为匿名，与同内容的无 id 消息判同一身份（兼容路径不受影响）。
-    const fs = require('fs')
     const name = 'test_identity_legacy_anon_id.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const legacyId = anonKey('历史标题', '历史内容')
     saveBatch([{ id: legacyId, title: '历史标题', content: '历史内容' }], name)
     saveBatch([{ title: '历史标题', content: '历史内容' }], name) // 无 id → anonKey 相同
     assertEqual(readMessages(p).length, 1, `历史 anon:hash id 应降级匿名并与同内容无 id 消息去重，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('id为null的记录不与正常记录误合并（v3.20审查2）', () => {
@@ -4934,42 +5010,39 @@ console.log('========================================\n');
     saveBatch([{ id: null, url: '/b.html', title: 'B' }], 'test_nullid.json')
     const r = readMessages(getFilePath('test_nullid.json'))
     assertEqual(r.length, 2, `null id 不同 url 应2条，实际${r.length}`)
-    assertEqual(r.map(m => m.title).join(','), 'A,B')
+    assertEqual(r.map(m => m.title).join(','), 'A,B', 'r.map(m => m.title).join(\',\') 应等于 \'A,B\'')
   })
 
   // ==================== C006 继承属性 id 判重 vs 落盘丢 id ====================
-  console.log('\n📂 C006 继承属性 id 判重 vs 落盘丢 id')
+  console.log('\n📂 72. C006 继承属性 id 判重 vs 落盘丢 id')
 
-  await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', async () => {
-    const fs = require('fs')
+  await test('C006 继承 id 不参与判重（无自有字段不落盘，避免重复入库）', () => {
     const name = 'test_c006_inherited_noown.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([Object.create({ id: 'X' })], name)
     assertEqual(readMessages(p).length, 0, `仅继承 id 且无自有字段的消息不应落盘，实际${readMessages(p).length}`)
     assertEqual(isMessageInFile(Object.create({ id: 'X' }), name), false, '仅继承 id 且无自有字段的消息不应命中')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
-  await test('C006 继承 id 不参与判重（同构造含自有字段消息 saveBatch 后 has 命中）', async () => {
-    const fs = require('fs')
+  await test('C006 继承 id 不参与判重（同构造含自有字段消息 saveBatch 后 has 命中）', () => {
     const name = 'test_c006_inherited_ownfields.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const mk = () => { const m = Object.create({ id: 'X' }); m.title = '继承ID消息'; return m }
     saveBatch([mk()], name)
     assertEqual(isMessageInFile(mk(), name), true, '继承 id 不应参与判重，同构造消息应命中')
     const stored = readMessages(p)
     assertEqual(stored.length, 1, `同构造消息应合并为1条，实际${stored.length}`)
     assertEqual(Object.prototype.hasOwnProperty.call(stored[0], 'id'), false, '落盘副本不应携带继承 id')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
-  await test('C006 自有 id 正常判重', async () => {
-    const fs = require('fs')
+  await test('C006 自有 id 正常判重', () => {
     const name = 'test_c006_own_id.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     const mk = () => {
       const m = Object.create({ id: 'X' })
       m.id = 'own-X'
@@ -4979,47 +5052,46 @@ console.log('========================================\n');
     saveBatch([mk()], name)
     assertEqual(isMessageInFile(mk(), name), true, '自有 id 应正常判重命中')
     assertEqual(readMessages(p).length, 1, `自有 id 同构造消息应合并为1条，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
-  await test('C006 原身份用例不回归（普通自有 id/url 判重）', async () => {
-    const fs = require('fs')
+  await test('C006 原身份用例不回归（普通自有 id/url 判重）', () => {
     const name = 'test_c006_regress.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ id: 'c006-a', url: '/c006.html', title: 'old' }], name)
     saveBatch([{ id: 'c006-a', url: '/c006-other.html', title: 'new' }], name)
     assertEqual(readMessages(p).length, 1, `同自有 id 跨 url 仍应合并为1条，实际${readMessages(p).length}`)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('decodeHtmlEntities 超BMP emoji 实体（v3.20审查7：fromCodePoint）', () => {
-    assertEqual(decodeHtmlEntities('&#128512;'), '😀')
-    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀')
+    assertEqual(decodeHtmlEntities('&#128512;'), '😀', 'decodeHtmlEntities(\'&#128512;\') 应等于 \'😀\'')
+    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀', 'decodeHtmlEntities(\'&#x1F600;\') 应等于 \'😀\'')
     // 非法码点保留原文（不抛异常）
-    assertEqual(decodeHtmlEntities('&#99999999;'), '&#99999999;')
-    assertEqual(decodeHtmlEntities('&#x110000;'), '&#x110000;')
+    assertEqual(decodeHtmlEntities('&#99999999;'), '&#99999999;', 'decodeHtmlEntities(\'&#99999999;\') 应等于 \'&#99999999;\'')
+    assertEqual(decodeHtmlEntities('&#x110000;'), '&#x110000;', 'decodeHtmlEntities(\'&#x110000;\') 应等于 \'&#x110000;\'')
   })
 
   await test('htmlToMarkdown a标签单引号/属性顺序（v3.20审查8）', () => {
     // 单引号 href
     const r1 = htmlToMarkdown({ content_html: "<a href='http://u'>链接1</a>", url: 'http://x' })
-    assertEqual(r1.includes('[链接1](http://u)'), true)
+    assertEqual(r1.includes('[链接1](http://u)'), true, 'r1.includes(\'[链接1](http://u)\') 应等于 true')
     // href 不在首位
     const r2 = htmlToMarkdown({ content_html: '<a class="btn" href="http://u2">链接2</a>', url: 'http://x' })
-    assertEqual(r2.includes('[链接2](http://u2)'), true)
+    assertEqual(r2.includes('[链接2](http://u2)'), true, 'r2.includes(\'[链接2](http://u2)\') 应等于 true')
     // 原有双引号行为不变
     const r3 = htmlToMarkdown({ content_html: '<a href="http://u3">链接3</a>', url: 'http://x' })
-    assertEqual(r3.includes('[链接3](http://u3)'), true)
+    assertEqual(r3.includes('[链接3](http://u3)'), true, 'r3.includes(\'[链接3](http://u3)\') 应等于 true')
   })
 
-  // ==================== 69. v3.21 审查报告修复 ====================
-  console.log('\n📂 69. v3.21 审查报告修复')
+  // ==================== 73. 非法日期与脏后缀解析 ====================
+  console.log('\n📂 73. 非法日期与脏后缀解析')
 
   await test('daysComputed 非法日期 2026-02-31 → 0（v3.21审查1）', () => {
-    assertEqual(daysComputed('2026-02-31'), 0)
-    assertEqual(daysComputed('2026-13-01'), 0)
-    assertEqual(daysComputed('2026-00-10'), 0)
+    assertEqual(daysComputed('2026-02-31'), 0, 'daysComputed(\'2026-02-31\') 应等于 0')
+    assertEqual(daysComputed('2026-13-01'), 0, 'daysComputed(\'2026-13-01\') 应等于 0')
+    assertEqual(daysComputed('2026-00-10'), 0, 'daysComputed(\'2026-00-10\') 应等于 0')
   })
 
   await test('parseTime 斜杠/带时区 ISO 非法日期 → null（C017：宿主解析曾滚动到 2026-03-03）', () => {
@@ -5035,50 +5107,50 @@ console.log('========================================\n');
   })
 
   await test('daysComputed 脏后缀 2026-07-31abc → 0（v3.21审查2：锚定）', () => {
-    assertEqual(daysComputed('2026-07-31abc'), 0)
-    assertEqual(daysComputed('2026-07-31 乱字符'), 0)
+    assertEqual(daysComputed('2026-07-31abc'), 0, 'daysComputed(\'2026-07-31abc\') 应等于 0')
+    assertEqual(daysComputed('2026-07-31 乱字符'), 0, 'daysComputed(\'2026-07-31 乱字符\') 应等于 0')
     // 合法日期不受影响
-    assertEqual(typeof daysComputed('2026-07-28'), 'number')
+    assertEqual(typeof daysComputed('2026-07-28'), 'number', 'typeof daysComputed(\'2026-07-28\') 应等于 \'number\'')
   })
 
   await test('daysComputed 0 时间戳 → 走解析不跳过（v3.21审查3）', () => {
     // 0 = 1970-01-01，应返回大天数而非被 !time 短路
     const d = daysComputed(0)
-    assertEqual(d > 10000, true)
-    assertEqual(daysComputed(undefined), 0)
-    assertEqual(daysComputed(null), 0)
-    assertEqual(daysComputed(''), 0)
+    assertEqual(d > 10000, true, 'd > 10000 应等于 true')
+    assertEqual(daysComputed(undefined), 0, 'daysComputed(undefined) 应等于 0')
+    assertEqual(daysComputed(null), 0, 'daysComputed(null) 应等于 0')
+    assertEqual(daysComputed(''), 0, 'daysComputed(\'\') 应等于 0')
   })
 
   await test('tuisong 0 时间戳 → 生成日期（v3.21审查3）', () => {
     const r = tuisong_replace('{日期}', { posttime: 0, url: 'x' })
-    assertEqual(/^\d{4}-\d{2}-\d{2}$/.test(r), true)
+    assertEqual(/^\d{4}-\d{2}-\d{2}$/.test(r), true, '/^\\d{4}-\\d{2}-\\d{2}$/.test(r) 应等于 true')
   })
 
   await test('hasValidId 空白串 → 无效（v3.21审查4）', () => {
-    assertEqual(hasValidId({ id: '   ' }), false)
-    assertEqual(hasValidId({ id: '\t' }), false)
-    assertEqual(hasValidId({ id: ' a ' }), true)
+    assertEqual(hasValidId({ id: '   ' }), false, 'hasValidId({ id: \' \' }) 应等于 false')
+    assertEqual(hasValidId({ id: '\t' }), false, 'hasValidId({ id: \'\\t\' }) 应等于 false')
+    assertEqual(hasValidId({ id: ' a ' }), true, 'hasValidId({ id: \' a \' }) 应等于 true')
   })
 
   await test('htmlToMarkdown 无url → 无原文链接空壳（v3.21审查6）', () => {
     const r = htmlToMarkdown({ content_html: '内容', url: '' })
-    assertEqual(r.includes('[]()'), false)
-    assertEqual(r.includes('原文链接'), false)
+    assertEqual(r.includes('[]()'), false, 'r.includes(\'[]()\') 应等于 false')
+    assertEqual(r.includes('原文链接'), false, 'r.includes(\'原文链接\') 应等于 false')
     // 有 url 正常
-    assertEqual(htmlToMarkdown({ content_html: '内容', url: 'http://x' }).includes('原文链接'), true)
+    assertEqual(htmlToMarkdown({ content_html: '内容', url: 'http://x' }).includes('原文链接'), true, 'htmlToMarkdown({ content_html: \'内容\', url: \'http://x\' }).includes(\'原文链… 应等于 true')
   })
 
   await test('htmlToMarkdown h标签带属性 → 转换（v3.21审查8）', () => {
     const r = htmlToMarkdown({ content_html: '<h2 class="title" id="t">带属性标题</h2>', url: 'http://x' })
-    assertEqual(r.includes('## 带属性标题'), true)
+    assertEqual(r.includes('## 带属性标题'), true, 'r.includes(\'## 带属性标题\') 应等于 true')
   })
 
   await test('decodeHtmlEntities 扩展实体（v3.21审查10）', () => {
-    assertEqual(decodeHtmlEntities('&hellip;'), '…')
-    assertEqual(decodeHtmlEntities('&mdash;'), '—')
-    assertEqual(decodeHtmlEntities('&copy; 2026'), '© 2026')
-    assertEqual(decodeHtmlEntities('&euro;&times;'), '€×')
+    assertEqual(decodeHtmlEntities('&hellip;'), '…', 'decodeHtmlEntities(\'&hellip;\') 应等于 \'…\'')
+    assertEqual(decodeHtmlEntities('&mdash;'), '—', 'decodeHtmlEntities(\'&mdash;\') 应等于 \'—\'')
+    assertEqual(decodeHtmlEntities('&copy; 2026'), '© 2026', 'decodeHtmlEntities(\'&copy; 2026\') 应等于 \'© 2026\'')
+    assertEqual(decodeHtmlEntities('&euro;&times;'), '€×', 'decodeHtmlEntities(\'&euro;&times;\') 应等于 \'€×\'')
   })
 
   await test('readMessages 非数组 JSON → 改名隔离 + 重建空缓存（F1：只隔离不删除）', () => {
@@ -5087,16 +5159,16 @@ console.log('========================================\n');
     const fs = require('fs')
     const dir = path.dirname(p)
     const raw = JSON.stringify({ foo: 'bar' })
-    const wipeBaks = () => { try { for (const n of fs.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) fs.unlinkSync(path.join(dir, n)) } catch (e) { /* 忽略 */ } }
+    const wipeBaks = () => { for (const n of fs.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(dir, n)) }
     wipeBaks()
-    try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(p)
     delete MessageStore._memoryCache[p]
     MessageStore._verified.delete(p)
     MessageStore._memoCount = Math.max(0, MessageStore._memoCount - 1)
     fs.writeFileSync(p, raw, 'utf8')
     const r = readMessages(p)
-    assertEqual(Array.isArray(r), true)
-    assertEqual(r.length, 0)
+    assertEqual(Array.isArray(r), true, 'Array.isArray(r) 应等于 true')
+    assertEqual(r.length, 0, 'r.length 应等于 0')
     // F1：非数组同属确定性不可恢复判据——原件改名隔离保留（绝不 unlink/重置），原路径重建空缓存
     const baks = fs.readdirSync(dir).filter((n) => n.startsWith(name + '.corrupt.') && n.endsWith('.bak'))
     assertEqual(baks.length, 1, `非数组缓存必须被改名隔离：${JSON.stringify(fs.readdirSync(dir))}`)
@@ -5106,25 +5178,19 @@ console.log('========================================\n');
     wipeBaks()
   })
 
-  await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => {
+  await test('saveMessages 不原地修改传入数组（v3.21审查13）', () => withCacheMaxSize(100, () => {
     const arr = []
     for (let i = 0; i < 150; i++) arr.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限（默认已 10000）
-    try {
-      saveMessages(getFilePath('test_no_mutate.json'), arr)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(getFilePath('test_no_mutate.json'), arr)
     assertEqual(arr.length, 150, '原数组不应被截断')
     const r = readMessages(getFilePath('test_no_mutate.json'))
-    assertEqual(r.length, 100)
-  })
+    assertEqual(r.length, 100, 'r.length 应等于 100')
+  }))
 
   await test('getFileName 查询参数/保留字符清洗（v3.21审查14）', () => {
-    assertEqual(getFileName('http://x.com/a/b/c.json?token=1'), 'c.json')
-    assertEqual(getFileName('http://x.com/a/b/c:1.json'), 'c_1.json')
-    assertEqual(getFileName('a|b.json'), 'a_b.json')
+    assertEqual(getFileName('http://x.com/a/b/c.json?token=1'), 'c.json', 'getFileName(\'http://x.com/a/b/c.json?token=1\') 应等于 \'c.json\'')
+    assertEqual(getFileName('http://x.com/a/b/c:1.json'), 'c_1.json', 'getFileName(\'http://x.com/a/b/c:1.json\') 应等于 \'c_1.json\'')
+    assertEqual(getFileName('a|b.json'), 'a_b.json', 'getFileName(\'a|b.json\') 应等于 \'a_b.json\'')
   })
 
   await test('判重：旧url-only缓存 + 新id+url → 判重（v3.21审查16）', () => {
@@ -5132,7 +5198,7 @@ console.log('========================================\n');
     saveBatch([{ url: '/dup.html', title: '旧' }], 'test_idurl_dup.json')
     // 新数据带 id 同 url → 应判重不重复
     const r = readMessages(getFilePath('test_idurl_dup.json'))
-    assertEqual(r.length, 1)
+    assertEqual(r.length, 1, 'r.length 应等于 1')
   })
 
   await test('判重：空归一 URL 不得作为 id/url fallback 键', () => {
@@ -5144,39 +5210,33 @@ console.log('========================================\n');
       const r = readMessages(fp)
       assertEqual(r.length, 2, '有效 ID 不应被旧垃圾 URL 判重拦截')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   await test('判重：id 类型漂移 1 vs "1" → 判重（v3.21审查17）', () => {
     saveBatch([{ id: 1, url: '/t.html', title: '数字' }], 'test_idtype.json')
     const r = readMessages(getFilePath('test_idtype.json'))
-    assertEqual(r.length, 1)
+    assertEqual(r.length, 1, 'r.length 应等于 1')
     // 类型归一后 String(1)===String("1") → 更新不重复
   })
 
-  await test('saveMessages 内存缓存与裁剪结果一致', () => {
+  await test('saveMessages 内存缓存与裁剪结果一致', () => withCacheMaxSize(100, () => {
     const p = getFilePath('test_trim_mem.json')
     const arr = []
     for (let i = 0; i < 150; i++) arr.push({ id: i })
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 100 // v3.120：显式小上限（默认已 10000）
-    try {
-      saveMessages(p, arr)
-    } finally {
-      Config.cache.maxSize = orig
-    }
+    saveMessages(p, arr)
     const r = readMessages(p) // 应读内存缓存（已裁剪的 toSave）
-    assertEqual(r.length, 100)
-  })
+    assertEqual(r.length, 100, 'r.length 应等于 100')
+  }))
 
-  // ==================== 70. v3.22 审查报告修复 ====================
-  console.log('\n📂 70. v3.22 审查报告修复')
+  // ==================== 74. ISO / 毫秒时间戳解析口径 ====================
+  console.log('\n📂 74. ISO / 毫秒时间戳解析口径')
 
   await test('daysComputed ISO 时间串 → 正常解析（v3.22审查1）', () => {
     const d = daysComputed('2026-08-01T00:00:00Z')
-    assertEqual(typeof d, 'number')
-    assertEqual(d >= 0, true)
+    assertEqual(typeof d, 'number', 'typeof d 应等于 \'number\'')
+    assertEqual(d >= 0, true, 'd >= 0 应等于 true')
   })
 
   await test('daysComputed 12位毫秒时间戳 → 按毫秒解析（v3.22审查2）', () => {
@@ -5218,7 +5278,7 @@ console.log('========================================\n');
   await test('tuisong 毫秒 posttime → 日期正确（v3.22审查3）', () => {
     const ms = Date.parse('2026-01-10T12:00:00') || 0
     const r = tuisong_replace('{日期}', { posttime: ms, url: 'x' })
-    assertEqual(/^\d{4}-\d{2}-\d{2}$/.test(r), true)
+    assertEqual(/^\d{4}-\d{2}-\d{2}$/.test(r), true, '/^\\d{4}-\\d{2}-\\d{2}$/.test(r) 应等于 true')
   })
 
   await test('readMessages 数组含null元素 → 过滤不崩溃（v3.22审查4）', () => {
@@ -5226,32 +5286,32 @@ console.log('========================================\n');
     require('fs').writeFileSync(p, JSON.stringify([{ id: 1 }, null, 'x', 42]), 'utf8')
     const r = readMessages(p)
     assertEqual(r.length, 1, '只保留对象元素')
-    assertEqual(r[0].id, 1)
+    assertEqual(r[0].id, 1, 'r[0].id 应等于 1')
   })
 
   await test('htmlToMarkdown img 单引号/属性顺序（v3.22审查5）', () => {
     const r1 = htmlToMarkdown({ content_html: "<img src='http://p.jpg' alt='图1'>", url: 'http://x' })
-    assertEqual(r1.includes('![图1](http://p.jpg)'), true)
+    assertEqual(r1.includes('![图1](http://p.jpg)'), true, 'r1.includes(\'![图1](http://p.jpg)\') 应等于 true')
     const r2 = htmlToMarkdown({ content_html: '<img alt="图2" class="x" src="http://p2.jpg">', url: 'http://x' })
-    assertEqual(r2.includes('![图2](http://p2.jpg)'), true)
+    assertEqual(r2.includes('![图2](http://p2.jpg)'), true, 'r2.includes(\'![图2](http://p2.jpg)\') 应等于 true')
   })
 
   await test('htmlToMarkdown a标签多行链接文本（v3.22审查6）', () => {
     const r = htmlToMarkdown({ content_html: '<a href="http://u">第一行\n第二行</a>', url: 'http://x' })
-    assertEqual(r.includes('[第一行\n第二行](http://u)'), true)
+    assertEqual(r.includes('[第一行\n第二行](http://u)'), true, 'r.includes(\'[第一行\\n第二行](http://u)\') 应等于 true')
   })
 
   await test('decodeHtmlEntities 大写X十六进制（v3.22审查7）', () => {
-    assertEqual(decodeHtmlEntities('&#X1F600;'), '😀')
-    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀')
+    assertEqual(decodeHtmlEntities('&#X1F600;'), '😀', 'decodeHtmlEntities(\'&#X1F600;\') 应等于 \'😀\'')
+    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀', 'decodeHtmlEntities(\'&#x1F600;\') 应等于 \'😀\'')
   })
 
   await test('decodeHtmlEntities 扩展实体（v3.22审查8）', () => {
-    assertEqual(decodeHtmlEntities('&ndash;&bull;&yen;'), '–•¥')
+    assertEqual(decodeHtmlEntities('&ndash;&bull;&yen;'), '–•¥', 'decodeHtmlEntities(\'&ndash;&bull;&yen;\') 应等于 \'–•¥\'')
   })
 
   await test('getFileName 去 hash（v3.22审查9）', () => {
-    assertEqual(getFileName('http://x.com/a/b.json#section'), 'b.json')
+    assertEqual(getFileName('http://x.com/a/b.json#section'), 'b.json', 'getFileName(\'http://x.com/a/b.json#section\') 应等于 \'b.json\'')
   })
 
   await test('getFilePath 路径逃逸防护（v3.22审查11）', () => {
@@ -5262,13 +5322,12 @@ console.log('========================================\n');
     assertEqual(p1.startsWith(cacheDir), true, `应留在缓存目录内: ${p1}`)
     const p2 = getFilePath('/etc/passwd')
     assertEqual(p2.startsWith(cacheDir), true, `绝对路径应落入缓存目录: ${p2}`)
-    assertEqual(p2.includes('passwd'), true)
+    assertEqual(p2.includes('passwd'), true, 'p2.includes(\'passwd\') 应等于 true')
     // 正常文件名不受影响
-    assertEqual(getFilePath('normal.json').startsWith(cacheDir), true)
+    assertEqual(getFilePath('normal.json').startsWith(cacheDir), true, 'getFilePath(\'normal.json\').startsWith(cacheDir) 应等于 true')
   })
 
   await test('cache.dir 指向普通文件 → 回退安全缓存目录而不崩溃', () => {
-    const fs = require('fs')
     const name = 'test_cache_regular_file_dir.json'
     const original = Config.cache.dir
     let p = ''
@@ -5279,30 +5338,30 @@ console.log('========================================\n');
       saveBatch([{ id: 'regular-dir-safe' }], name)
       assertEqual(readMessages(p).length, 1, '回退目录应能正常落盘缓存')
     } finally {
-      try { fs.unlinkSync(p) } catch (e) {}
+      unlinkQuiet(p)
       Config.cache.dir = original
     }
   })
 
   await test('pingbitime 负数/Infinity → null 不编译（v3.157: 曾落 value:0 静默关闭过滤）', () => {
     const r = compileRules({ pingbitime: '-5' })
-    assertEqual(r.pingbitime, null)
+    assertEqual(r.pingbitime, null, 'r.pingbitime 应等于 null')
     const r2 = compileRules({ pingbitime: 'Infinity' })
-    assertEqual(r2.pingbitime, null)
+    assertEqual(r2.pingbitime, null, 'r2.pingbitime 应等于 null')
     const warns = validateConfig({ pingbitime: '-5' })
-    assertEqual(warns.some(w => w.includes('pingbitime')), true)
+    assertEqual(warns.some(w => w.includes('pingbitime')), true, 'warns.some(w => w.includes(\'pingbitime\')) 应等于 true')
   })
 
   await test('checkTimeCompiled louzhuregtime=0 → 走解析（v3.22审查18）', () => {
     // 0 = 1970-01-01 老号，value=5 不应拦截
     const r = compileRules({ pingbitime: '5' })
-    assertEqual(checkTimeCompiled(r.pingbitime, { catename: 'a', louzhuregtime: 0 }), false)
+    assertEqual(checkTimeCompiled(r.pingbitime, { catename: 'a', louzhuregtime: 0 }), false, 'checkTimeCompiled(r.pingbitime, { catename: \'a\', louzhuregtime: 0 }) 应等于 false')
   })
 
   await test('url 归一化判重：/foo 与 foo/ 视为同一（v3.22审查20）', () => {
-    assertEqual(normUrl('/foo/'), 'foo') // 首尾斜杠都去除
-    assertEqual(normUrl('/foo'), 'foo')
-    assertEqual(normUrl(' foo '), 'foo')
+    assertEqual(normUrl('/foo/'), 'foo', 'normUrl(\'/foo/\') 应等于 \'foo\'') // 首尾斜杠都去除
+    assertEqual(normUrl('/foo'), 'foo', 'normUrl(\'/foo\') 应等于 \'foo\'')
+    assertEqual(normUrl(' foo '), 'foo', 'normUrl(\' foo \') 应等于 \'foo\'')
     // S8786 线性化回归（CodeAnt 建议）：畸形输入与旧正则语义等价
     assertEqual(normUrl('https://'), 'https:', '协议尾斜杠被剥（与旧行为一致）')
     assertEqual(normUrl('https:///path'), 'https:///path', '空 host 原样保留')
@@ -5311,7 +5370,7 @@ console.log('========================================\n');
     assertEqual(normUrl('  / '), '', '纯斜杠空白归空')
     assertEqual(normUrl('/\t/  /x/ '), 'x', '交替空白/斜杠线性剥离')
     // 清理可能残留的旧缓存文件
-    try { require('fs').unlinkSync(getFilePath('test_urlnorm.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_urlnorm.json'))
     // 同一 url 不同形态（尾斜杠）→ 应判重为 1 条
     saveBatch([{ url: '/dup2.html' }], 'test_urlnorm.json')
     saveBatch([{ url: 'dup2.html/' }], 'test_urlnorm.json')
@@ -5384,8 +5443,8 @@ console.log('========================================\n');
     assert(Date.now() - t0 < PERF_REDOS_LIMIT, `![ 对抗输入应 <${PERF_REDOS_LIMIT}ms，实际 ${Date.now() - t0}ms`)
   })
 
-  // ==================== 71. 通读复查修复 ====================
-  console.log('\n📂 71. 通读复查修复')
+  // ==================== 75. 单换行配置与 0 时间戳口径 ====================
+  console.log('\n📂 75. 单换行配置与 0 时间戳口径')
 
   await test('validateConfig 单换行 pingbitime → 无误报警告（复查1）', () => {
     // 修复前分隔符不含单\n，单换行配置被粘成一行 → 误报"天数值不是有效数字"
@@ -5397,31 +5456,31 @@ console.log('========================================\n');
     const r = compileRules({ pingbitime: '30000' })
     // 0 = 1970-01-01 老号，但 30000 天阈值下仍按解析判断（两入口结论一致）
     // checkTimeCompiled: 拦截(true)；checkRegisterTime: 取反(false) = 不通过 = 拦截
-    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: 0 }), true)
-    assertEqual(checkRegisterTime({ louzhuregtime: 0 }, r.pingbitime), false)
+    assertEqual(checkTimeCompiled(r.pingbitime, { louzhuregtime: 0 }), true, 'checkTimeCompiled(r.pingbitime, { louzhuregtime: 0 }) 应等于 true')
+    assertEqual(checkRegisterTime({ louzhuregtime: 0 }, r.pingbitime), false, 'checkRegisterTime({ louzhuregtime: 0 }, r.pingbitime) 应等于 false')
     // 常规缺失仍是放行
-    assertEqual(checkRegisterTime({}, r.pingbitime), true)
+    assertEqual(checkRegisterTime({}, r.pingbitime), true, 'checkRegisterTime({}, r.pingbitime) 应等于 true')
   })
 
-  // ==================== 72. 审查3轮修复 ====================
-  console.log('\n📂 72. 审查3轮修复')
+  // ==================== 76. h 标签跨行标题 ====================
+  console.log('\n📂 76. h 标签跨行标题')
 
   await test('htmlToMarkdown h标签跨行标题 → 转换（审查3 B）', () => {
     const r = htmlToMarkdown({ content_html: '<h2>第一行\n第二行</h2>', url: 'http://x' })
-    assertEqual(r.includes('## 第一行\n第二行'), true)
+    assertEqual(r.includes('## 第一行\n第二行'), true, 'r.includes(\'## 第一行\\n第二行\') 应等于 true')
   })
 
-  // ==================== 73. 审查4轮修复 ====================
-  console.log('\n📂 73. 审查4轮修复')
+  // ==================== 77. 纯点串 URL 与无空格 ahref ====================
+  console.log('\n📂 77. 纯点串 URL 与无空格 ahref')
 
   await test('getFileName 纯点串URL → default.json（审查4-2）', () => {
-    assertEqual(getFileName('http://x.com/a/..'), 'default.json')
-    assertEqual(getFileName('http://x.com/.'), 'default.json')
+    assertEqual(getFileName('http://x.com/a/..'), 'default.json', 'getFileName(\'http://x.com/a/..\') 应等于 \'default.json\'')
+    assertEqual(getFileName('http://x.com/.'), 'default.json', 'getFileName(\'http://x.com/.\') 应等于 \'default.json\'')
   })
 
   await test('htmlToMarkdown 无空格ahref → 转换（审查4-5）', () => {
     const r = htmlToMarkdown({ content_html: '<ahref="http://u">链接</a>', url: 'http://x' })
-    assertEqual(r.includes('[链接](http://u)'), true)
+    assertEqual(r.includes('[链接](http://u)'), true, 'r.includes(\'[链接](http://u)\') 应等于 true')
   })
 
   await test('validateConfig pingbitime 多行带空格分类 → 无假警告（审查4-4）', () => {
@@ -5430,43 +5489,43 @@ console.log('========================================\n');
     assertEqual(warns.some(w => w.includes('pingbitime')), false, `不应有pingbitime警告: ${JSON.stringify(warns)}`)
   })
 
-  // ==================== 74. 审查5轮修复 ====================
-  console.log('\n📂 74. 审查5轮修复')
+  // ==================== 78. 非法 / 负 posttime 与 zkt_gjc 校验 ====================
+  console.log('\n📂 78. 非法 / 负 posttime 与 zkt_gjc 校验')
 
   await test('非法posttime → 日期留空不回退当前时间（审查5-1）', () => {
     const r = tuisong_replace('{日期}|{时间}', { posttime: 'abc', url: 'x' })
-    assertEqual(r, '|')
+    assertEqual(r, '|', 'r 应等于 \'|\'')
   })
 
   await test('负posttime → 日期留空不生成1969（审查5-2）', () => {
     const r = tuisong_replace('{日期}', { posttime: -1, url: 'x' })
-    assertEqual(r, '')
+    assertEqual(r, '', 'r 应等于 \'\'')
   })
 
   await test('validateConfig 校验 zkt_gjc（审查5-3）', () => {
     const warns = validateConfig({ zkt_gjc: '[' })
-    assertEqual(warns.some(w => w.includes('zkt_gjc')), true)
+    assertEqual(warns.some(w => w.includes('zkt_gjc')), true, 'warns.some(w => w.includes(\'zkt_gjc\')) 应等于 true')
     // 纯空白 → 与 App.run 口径一致，显式告警（p12 修复空白口径漂移）
     const blankWarns = validateConfig({ zkt_gjc: ' ' })
     assertEqual(blankWarns.some(w => w.includes('zkt_gjc') && w.includes('空白')), true, '空白 zkt_gjc 应显式告警')
     // 合法关键词不告警
-    assertEqual(validateConfig({ zkt_gjc: '京东' }).length, 0)
+    assertEqual(validateConfig({ zkt_gjc: '京东' }).length, 0, 'validateConfig({ zkt_gjc: \'京东\' }).length 应等于 0')
   })
 
   await test('decodeHtmlEntities NUL字符过滤（审查5-4）', () => {
-    assertEqual(decodeHtmlEntities('a&#0;b'), 'ab')
-    assertEqual(decodeHtmlEntities('&#0;'), '')
+    assertEqual(decodeHtmlEntities('a&#0;b'), 'ab', 'decodeHtmlEntities(\'a&#0;b\') 应等于 \'ab\'')
+    assertEqual(decodeHtmlEntities('&#0;'), '', 'decodeHtmlEntities(\'&#0;\') 应等于 \'\'')
   })
 
-  // ==================== 75. 审查6轮修复(推送模块/got/代理区) ====================
-  console.log('\n📂 75. 审查6轮修复')
+  // ==================== 79. 代理区字符与空通道拒绝 ====================
+  console.log('\n📂 79. 代理区字符与空通道拒绝')
 
   await test('decodeHtmlEntities 代理区字符保留原文（审查6-8）', () => {
-    assertEqual(decodeHtmlEntities('&#xD800;'), '&#xD800;')
-    assertEqual(decodeHtmlEntities('&#55296;'), '&#55296;')
+    assertEqual(decodeHtmlEntities('&#xD800;'), '&#xD800;', 'decodeHtmlEntities(\'&#xD800;\') 应等于 \'&#xD800;\'')
+    assertEqual(decodeHtmlEntities('&#55296;'), '&#55296;', 'decodeHtmlEntities(\'&#55296;\') 应等于 \'&#55296;\'')
     // emoji 不受影响
-    assertEqual(decodeHtmlEntities('&#128512;'), '😀')
-    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀')
+    assertEqual(decodeHtmlEntities('&#128512;'), '😀', 'decodeHtmlEntities(\'&#128512;\') 应等于 \'😀\'')
+    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀', 'decodeHtmlEntities(\'&#x1F600;\') 应等于 \'😀\'')
   })
 
   await test('推送模块无通道 → reject 不静默成功（审查6-2）', async () => {
@@ -5482,88 +5541,81 @@ console.log('========================================\n');
     assertEqual(rejected, true, '未配置通道应 reject（避免主流程误判推送成功并写缓存）')
   })
 
-  // ==================== 76. 审查7轮修复(主代码) ====================
-  console.log('\n📂 76. 审查7轮修复')
+  // ==================== 80. 关键词空白与空 href 链接 ====================
+  console.log('\n📂 80. 关键词空白与空 href 链接')
 
   await test('whitelistFilter 空格关键词 → 全通过（审查7-1）', () => {
-    assertEqual(whitelistFilter({ title: 'a b' }, 'title', ' '), true)
-    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', ' '), true)
+    assertEqual(whitelistFilter({ title: 'a b' }, 'title', ' '), true, 'whitelistFilter({ title: \'a b\' }, \'title\', \' \') 应等于 true')
+    assertEqual(whitelistFilter({ title: '京东神券' }, 'title', ' '), true, 'whitelistFilter({ title: \'京东神券\' }, \'title\', \' \') 应等于 true')
     // 正常关键词不受影响
-    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true)
-    assertEqual(whitelistFilter({ title: '淘宝' }, 'title', '京东'), false)
+    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东\' }, \'title\', \'京东\') 应等于 true')
+    assertEqual(whitelistFilter({ title: '淘宝' }, 'title', '京东'), false, 'whitelistFilter({ title: \'淘宝\' }, \'title\', \'京东\') 应等于 false')
   })
 
   await test('htmlToMarkdown 空href → 不生成空链接（审查7-2）', () => {
     const r = htmlToMarkdown({ content_html: '<a href="">空链接</a>', url: 'http://x' })
-    assertEqual(r.includes('[空链接]()'), false)
-    assertEqual(r.includes('空链接'), true) // 文本保留
+    assertEqual(r.includes('[空链接]()'), false, 'r.includes(\'[空链接]()\') 应等于 false')
+    assertEqual(r.includes('空链接'), true, 'r.includes(\'空链接\') 应等于 true') // 文本保留
   })
 
   await test('htmlToMarkdown 原文链接url含] → <>包裹（审查7-3）', () => {
     const r = htmlToMarkdown({ content_html: 'x', url: 'http://u/a]b.html' })
-    assertEqual(r.includes('(<http://u/a]b.html>)'), true)
+    assertEqual(r.includes('(<http://u/a]b.html>)'), true, 'r.includes(\'(<http://u/a]b.html>)\') 应等于 true')
     // 正常 url 不包裹
-    assertEqual(htmlToMarkdown({ content_html: 'x', url: 'http://u/a.html' }).includes('(http://u/a.html)'), true)
+    assertEqual(htmlToMarkdown({ content_html: 'x', url: 'http://u/a.html' }).includes('(http://u/a.html)'), true, 'htmlToMarkdown({ content_html: \'x\', url: \'http://u/a.html\' }).include… 应等于 true')
   })
 
-  // ==================== 77. 审查8轮(文档项升级修复) ====================
-  console.log('\n📂 77. 审查8轮(文档项升级修复)')
+  // ==================== 81. 对象字段 JSON 与 8 位日期 ====================
+  console.log('\n📂 81. 对象字段 JSON 与 8 位日期')
 
   await test('tuisong 对象字段 → JSON 显示（审查8-2）', () => {
     const r = tuisong_replace('{价格}', { price: { value: 5.9, unit: '元' }, url: 'x' })
-    assertEqual(r, '{"value":5.9,"unit":"元"}')
+    assertEqual(r, '{"value":5.9,"unit":"元"}', 'r 应等于 \'{"value":5.9,"unit":"元"}\'')
     // 普通字段不受影响
-    assertEqual(tuisong_replace('{标题}', { title: '正常' }), '正常')
+    assertEqual(tuisong_replace('{标题}', { title: '正常' }), '正常', 'tuisong_replace(\'{标题}\', { title: \'正常\' }) 应等于 \'正常\'')
   })
 
   await test('daysComputed 8位日期 YYYYMMDD → 解析（审查8-3）', () => {
     const d = daysComputed('20260701')
-    assertEqual(d > 0, true)
+    assertEqual(d > 0, true, 'd > 0 应等于 true')
     // 非法 8 位(13月/32日) → 0
-    assertEqual(daysComputed('20261332'), 0)
-    assertEqual(daysComputed('20260231'), 0)
+    assertEqual(daysComputed('20261332'), 0, 'daysComputed(\'20261332\') 应等于 0')
+    assertEqual(daysComputed('20260231'), 0, 'daysComputed(\'20260231\') 应等于 0')
   })
 
-  // ==================== 78. 审查9轮(文档项升级) ====================
-  console.log('\n📂 78. 审查9轮(文档项升级)')
+  // ==================== 82. maxSize 0/负回退默认 ====================
+  console.log('\n📂 82. maxSize 0/负回退默认')
 
-  await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.120）', () => {
-    const { Config } = require('./xbk_function_v3.js')
-    const orig = Config.cache.maxSize
-    Config.cache.maxSize = 0 // 恶意/误配
+  await test('saveMessages maxSize 0/负 → 回退默认10000（审查9-B，v3.120）', () => withCacheMaxSize(0, () => {
     const arr = []
     for (let i = 0; i < 150; i++) arr.push({ id: i })
-    try {
-      saveMessages(getFilePath('test_maxsize0.json'), arr)
-    } finally {
-      Config.cache.maxSize = orig // v3.120b：finally 保证恢复
-    }
+    saveMessages(getFilePath('test_maxsize0.json'), arr)
     const r = readMessages(getFilePath('test_maxsize0.json'))
     assertEqual(r.length, 150, 'maxSize=0 时回退默认 10000，150 条不裁剪')
-  })
+  }))
 
-  // ==================== 79. 审查10轮高价值修复 ====================
-  console.log('\n📂 79. 审查10轮高价值修复')
+  // ==================== 83. saveBatch 非对象元素跳过 ====================
+  console.log('\n📂 83. saveBatch 非对象元素跳过')
 
   await test('saveBatch 含非对象元素 → 跳过不崩（审查10 #158）', () => {
     saveBatch([{ id: 1 }, null, 'x', { id: 2 }], 'test_r10_elem.json')
     const r = readMessages(getFilePath('test_r10_elem.json'))
     assertEqual(r.length, 2, `应只存2条对象，实际${r.length}`)
-    assertEqual(r.map(m => m.id).join(','), '1,2')
+    assertEqual(r.map(m => m.id).join(','), '1,2', 'r.map(m => m.id).join(\',\') 应等于 \'1,2\'')
   })
 
-  // ==================== 80. 审查10轮批量修复(20项) ====================
-  console.log('\n📂 80. 审查10轮批量修复')
+  // ==================== 84. script/style 移除与 safeText 防御 ====================
+  console.log('\n📂 84. script/style 移除与 safeText 防御')
 
   await test('htmlToMarkdown script/style 内容移除（#62）', () => {
     const r = htmlToMarkdown({ content_html: '<script>var x=1;</script>正文<style>.a{}</style>', url: 'http://x' })
-    assertEqual(r.includes('var x=1'), false)
-    assertEqual(r.includes('正文'), true)
+    assertEqual(r.includes('var x=1'), false, 'r.includes(\'var x=1\') 应等于 false')
+    assertEqual(r.includes('正文'), true, 'r.includes(\'正文\') 应等于 true')
   })
 
   await test('htmlToMarkdown content_html 对象 → 空（#68）', () => {
     const r = htmlToMarkdown({ content_html: { a: 1 }, url: 'http://x' })
-    assertEqual(r.includes('[object Object]'), false)
+    assertEqual(r.includes('[object Object]'), false, 'r.includes(\'[object Object]\') 应等于 false')
   })
 
   await test('safeText：Symbol/异常对象/循环引用不抛且不泄漏伪文本（v3.229）', () => {
@@ -5584,32 +5636,32 @@ console.log('========================================\n');
 
   await test('_splitLines 单\r 分隔（#84）', () => {
     const lines = _splitLines('a###1\rb###2')
-    assertEqual(lines.includes('a###1'), true)
-    assertEqual(lines.includes('b###2'), true)
+    assertEqual(lines.includes('a###1'), true, 'lines.includes(\'a###1\') 应等于 true')
+    assertEqual(lines.includes('b###2'), true, 'lines.includes(\'b###2\') 应等于 true')
   })
 
   await test('pingbitime 小数 → 警告（#95）', () => {
     const warns = validateConfig({ pingbitime: '5.5' })
-    assertEqual(warns.some(w => w.includes('小数')), true)
+    assertEqual(warns.some(w => w.includes('小数')), true, 'warns.some(w => w.includes(\'小数\')) 应等于 true')
   })
 
   await test('validateConfig 三个### → 警告（#91）', () => {
     const warns = validateConfig({ pingbibiaoti: 'a###b###c' })
-    assertEqual(warns.some(w => w.includes('多个 ###')), true)
+    assertEqual(warns.some(w => w.includes('多个 ###')), true, 'warns.some(w => w.includes(\'多个 ###\')) 应等于 true')
   })
 
-  // ==================== 81. 审查10轮批量修复(补齐测试) ====================
-  console.log('\n📂 81. 审查10轮批量修复(补齐测试)')
+  // ==================== 85. htmlToMarkdown 标签细节补齐 ====================
+  console.log('\n📂 85. htmlToMarkdown 标签细节补齐')
 
   await test('htmlToMarkdown </br> → 换行（#58）', () => {
     const r = htmlToMarkdown({ content_html: 'a</br>b', url: 'http://x' })
-    assertEqual(r.includes('a\n\nb'), true)
+    assertEqual(r.includes('a\n\nb'), true, 'r.includes(\'a\\n\\nb\') 应等于 true')
   })
 
   await test('htmlToMarkdown 尖括号剥离（#61）', () => {
     const r = htmlToMarkdown({ content_html: '<<>> 文本 >>', url: 'http://x' })
-    assertEqual(r.includes('<<'), false)
-    assertEqual(r.includes('文本'), true)
+    assertEqual(r.includes('<<'), false, 'r.includes(\'<<\') 应等于 false')
+    assertEqual(r.includes('文本'), true, 'r.includes(\'文本\') 应等于 true')
     // v3.173：>> / << 合法文本不再被剥离（'5>>3' 曾误删成 '53'）
     const r2 = htmlToMarkdown({ content_html: '<p>5>>3 位运算</p>', url: '' })
     assertEqual(r2.includes('5>>3'), true, `>> 应保留: ${JSON.stringify(r2)}`)
@@ -5620,8 +5672,7 @@ console.log('========================================\n');
   await test('htmlToMarkdown 纯文本短路路径输出正确（#66）', () => {
     // 无标签内容走短路路径，输出应与正常路径一致
     const r = htmlToMarkdown({ content_html: '纯文本&nbsp;内容', url: 'http://x' })
-    assertEqual(r.includes('纯文本 内容'), true)
-    assertEqual(r.includes('原文链接'), true)
+    assertEqual(r.includes('纯文本 内容'), true, 'r.includes(\'纯文本 内容\') 应等于 true')
   })
 
   await test('getFilePath 超长文件名截断（#146）', () => {
@@ -5634,11 +5685,11 @@ console.log('========================================\n');
     const p = getFilePath('b'.repeat(250) + '.json')
     try {
       saveMessages(p, [{ id: 1 }])
-      assertEqual(fs.existsSync(p), true)
+      assertEqual(fs.existsSync(p), true, 'fs.existsSync(p) 应等于 true')
       assertEqual(fs.existsSync(p + '.tmp'), false, '不应有 tmp 残留')
     } finally {
       // 自清理：避免超长文件残留污染缓存目录（与其余测试的 unlinkSync 清理一致）
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
     }
   })
 
@@ -5646,18 +5697,18 @@ console.log('========================================\n');
     // 相同警告只出现一次
     const warns = validateConfig({ pingbibiaoti: '(', pingbilouzhu: '(' })
     const cnt = warns.filter(w => w.includes('pingbibiaoti') && w.includes('无效的正则')).length
-    assertEqual(cnt <= 1, true)
+    assertEqual(cnt <= 1, true, 'cnt <= 1 应等于 true')
   })
 
   await test('导出包含 Pusher（#174）', () => {
     const mod = require('./xbk_function_v3.js')
-    assertEqual(typeof mod.Pusher, 'object')
-    assertEqual(typeof mod.Pusher.send, 'function')
+    assertEqual(typeof mod.Pusher, 'object', 'typeof mod.Pusher 应等于 \'object\'')
+    assertEqual(typeof mod.Pusher.send, 'function', 'typeof mod.Pusher.send 应等于 \'function\'')
+    // C4-008：`typeof null === 'object'` 且任何函数都满足 typeof 'function'——钉住导出形状与身份
+    assert.deepStrictEqual(Object.keys(mod.Pusher), ['send'], 'Pusher 只应导出 send（改名/漏导都算回归）')
   })
 
-  await test('缓存裁剪给出提示（#243）', () => {
-    const orig = require('./xbk_function_v3.js').Config.cache.maxSize
-    require('./xbk_function_v3.js').Config.cache.maxSize = 5
+  await test('缓存裁剪给出提示（#243）', () => withCacheMaxSize(5, () => {
     const warns = []
     const origWarn = console.warn
     console.warn = (msg) => warns.push(String(msg))
@@ -5667,10 +5718,9 @@ console.log('========================================\n');
       saveMessages(getFilePath('test_trim_warn.json'), arr)
     } finally {
       console.warn = origWarn
-      require('./xbk_function_v3.js').Config.cache.maxSize = orig
     }
     assertEqual(warns.some(w => w.includes('裁剪')), true, '裁剪应提示')
-  })
+  }))
 
   await test('重复id覆盖给出提示（#252）', () => {
     const logs = []
@@ -5685,8 +5735,8 @@ console.log('========================================\n');
     assertEqual(logs.some(w => w.includes('更新缓存记录')), true, '覆盖应提示')
   })
 
-  // ==================== 82. 性质测试(Property-based) ====================
-  console.log('\n📂 82. 性质测试(Property-based)')
+  // ==================== 86. 性质测试(Property-based) ====================
+  console.log('\n📂 86. 性质测试(Property-based)')
 
   // 固定种子生成器(可复现)
   let propSeed = 20260801
@@ -5788,14 +5838,14 @@ console.log('========================================\n');
       }
       const c = compileRules(cfg)
       assertEqual(c && c.__compiled === true, true, '应返回编译对象')
-      assertEqual(typeof matchesCompiled(c.pingbibiaoti, prstr(3), prstr(2)), 'boolean')
+      assertEqual(typeof matchesCompiled(c.pingbibiaoti, prstr(3), prstr(2)), 'boolean', 'typeof matchesCompiled(c.pingbibiaoti, prstr(3), prstr(2)) 应等于 \'boolean\'')
       const t = checkTimeCompiled(c.pingbitime, { catename: prstr(2), louzhuregtime: prstr(4) })
-      assertEqual(t === null || typeof t === 'boolean', true)
+      assertEqual(t === null || typeof t === 'boolean', true, 't === null || typeof t === \'boolean\' 应等于 true')
     }
   })
 
-  // ==================== 83. 契约测试(锁定导出 API) ====================
-  console.log('\n📂 83. 契约测试(锁定导出 API)')
+  // ==================== 87. 契约测试(锁定导出 API) ====================
+  console.log('\n📂 87. 契约测试(锁定导出 API)')
 
   await test('契约: 全部导出键存在且类型正确', () => {
     const mod = require('./xbk_function_v3.js')
@@ -5846,13 +5896,13 @@ console.log('========================================\n');
   await test('契约: 关键导出可独立调用(bind 生效)', () => {
     const mod = require('./xbk_function_v3.js')
     // 独立调用不依赖 this(已 bind)
-    assertEqual(typeof mod.listfilter({}, {}), 'boolean')
-    assertEqual(typeof mod.daysComputed('2026-01-01'), 'number')
-    assertEqual(typeof mod.decodeHtmlEntities('&amp;'), 'string')
-    assertEqual(typeof mod.getFileName('http://x/a.json'), 'string')
-    assertEqual(typeof mod.whitelistFilter({ title: 'a' }, 'title', 'a'), 'boolean')
-    assertEqual(typeof mod.compileRules({}).__compiled, 'boolean')
-    assertEqual(mod.Config.domain, 'https://new.ixbk.net')
+    assertEqual(typeof mod.listfilter({}, {}), 'boolean', 'typeof mod.listfilter({}, {}) 应等于 \'boolean\'')
+    assertEqual(typeof mod.daysComputed('2026-01-01'), 'number', 'typeof mod.daysComputed(\'2026-01-01\') 应等于 \'number\'')
+    assertEqual(typeof mod.decodeHtmlEntities('&amp;'), 'string', 'typeof mod.decodeHtmlEntities(\'&amp;\') 应等于 \'string\'')
+    assertEqual(typeof mod.getFileName('http://x/a.json'), 'string', 'typeof mod.getFileName(\'http://x/a.json\') 应等于 \'string\'')
+    assertEqual(typeof mod.whitelistFilter({ title: 'a' }, 'title', 'a'), 'boolean', 'typeof mod.whitelistFilter({ title: \'a\' }, \'title\', \'a\') 应等于 \'boolean\'')
+    assertEqual(typeof mod.compileRules({}).__compiled, 'boolean', 'typeof mod.compileRules({}).__compiled 应等于 \'boolean\'')
+    assertEqual(mod.Config.domain, 'https://new.ixbk.net', 'mod.Config.domain 应等于 \'https://new.ixbk.net\'')
   })
 
   await test('契约: 单次入口全失败/部分失败均非零退出（部分消息失败附告警）', async () => {
@@ -5918,30 +5968,29 @@ console.log('========================================\n');
   })
 
   await test('契约: 核心判重链路导出互相一致(has/save/saveBatch 同口径)', () => {
-    const fs = require('fs')
     const mod = require('./xbk_function_v3.js')
     const f = 'test_contract_dedup.json'
-    try { fs.unlinkSync(mod.getFilePath(f)) } catch (e) {}
+    unlinkQuiet(mod.getFilePath(f))
     mod.appendMessageToFile({ id: 1, title: 'A' }, f)
     mod.appendMessageToFile({ id: 1, title: 'B' }, f)
     mod.saveBatch([{ id: 2, title: 'C' }], f)
     const msgs = mod.readMessages(mod.getFilePath(f))
     assertEqual(msgs.length, 2, '判重应只存2条')
     assertEqual(mod.isMessageInFile({ id: 1 }, f), true, 'has 应命中')
-    assertEqual(mod.isMessageInFile({ id: 3 }, f), false)
+    assertEqual(mod.isMessageInFile({ id: 3 }, f), false, 'mod.isMessageInFile({ id: 3 }, f) 应等于 false')
   })
 
-  // ==================== 84. 快照测试(锁定输出格式) ====================
-  console.log('\n📂 84. 快照测试(锁定输出格式)')
+  // ==================== 88. 快照测试(锁定输出格式) ====================
+  console.log('\n📂 88. 快照测试(锁定输出格式)')
 
   await test('快照: htmlToMarkdown 组合标签', () => {
     const r = htmlToMarkdown({ content_html: '<h2>标题</h2><p>段落</p><a href="http://u">链接</a><br>换行', url: 'http://x/1.html' })
-    assertEqual(r, '## 标题\n\n段落\n\n[链接](http://u)\n\n换行\n\n原文链接：[http://x/1.html](http://x/1.html)')
+    assertEqual(r, '## 标题\n\n段落\n\n[链接](http://u)\n\n换行\n\n原文链接：[http://x/1.html](http://x/1.html)', 'r 应等于 \'## 标题\\n\\n段落\\n\\n[链接](http://u)\\n\\n换行\\n\\n原文链接：[http://x/1.html](http:/…')
   })
 
   await test('快照: htmlToMarkdown 图片+文本', () => {
     const r = htmlToMarkdown({ content_html: '<img src="p.jpg" alt="图">正文', url: 'http://x/2.html' })
-    assertEqual(r, '![图](p.jpg)\n\n正文\n\n原文链接：[http://x/2.html](http://x/2.html)')
+    assertEqual(r, '![图](p.jpg)\n\n正文\n\n原文链接：[http://x/2.html](http://x/2.html)', 'r 应等于 \'![图](p.jpg)\\n\\n正文\\n\\n原文链接：[http://x/2.html](http://x/2.html)\'')
   })
 
   await test('htmlToMarkdown 列表/粗体/斜体 → Markdown（v3.48）', () => {
@@ -5995,7 +6044,42 @@ console.log('========================================\n');
 
   await test('快照: htmlToMarkdown 纯文本无url', () => {
     const r = htmlToMarkdown({ content_html: '纯文本&nbsp;内容', url: '' })
-    assertEqual(r, '纯文本 内容')
+    assertEqual(r, '纯文本 内容', 'r 应等于 \'纯文本 内容\'')
+  })
+
+  // ==================== 84b. C4-009：转换类 includes 断言改精确串 ====================
+  // 审计：全文件 100+ 处 `assertEqual(r.includes(X), true)`。X 只要出现在输入里，函数「把输入原样
+  // 吐回」或只做 stripTags 也能过（实测：stripTags 输出「项目一项目二」同样过 :1928/:1929 的断言）。
+  // 转换类用例的正确判据是**精确串**：下表每行期望值都带输入里不存在的 markdown 记号，
+  // identity / stripTags 实现逐行必红，includes 只保留给「危险内容不得出现」的否定断言。
+  await test('C4-009: htmlToMarkdown 转换类精确串（identity/stripTags 实现必红）', () => {
+    const cases = [
+      ['<a href="http://url">链接</a>', 'http://x', '[链接](http://url)\n\n原文链接：[http://x](http://x)'],
+      ['<img src="http://pic.jpg">', 'http://x', '![](http://pic.jpg)\n\n原文链接：[http://x](http://x)'],
+      ['<img src="p.jpg" alt="图">正文', '', '![图](p.jpg)\n\n正文'],
+      ['<h2>二级标题</h2>', '', '## 二级标题'],
+      ['<p>段落一</p><p>段落二</p>', '', '段落一\n\n段落二'],
+      ['<ul><li>苹果</li><li>香蕉</li></ul>', '', '- 苹果\n\n- 香蕉'],
+      ['<ol><li>第一步</li><li>第二步</li></ol>', '', '- 第一步\n\n- 第二步'],
+      ['<b>加粗</b>和<strong>重点</strong>与<i>斜体</i>', '', '**加粗**和**重点**与*斜体*'],
+      ['<div>商品一</div><div>商品二</div>', '', '商品一\n\n商品二'],
+      ['<table><tr><td>甲</td><td>乙</td></tr></table>', '', '| 甲 | 乙'],
+      ['<table><tr><th>名称</th><th>价格</th></tr></table>', '', '| 名称 | 价格'],
+      ['a&amp;b&lt;c&gt;d', '', 'a&b<c>d'],
+      ['<script>alert(1)</script>正文', '', '正文'],
+      ['<h2>标题</h2><p>段</p>', 'http://x/1.html', '## 标题\n\n段\n\n原文链接：[http://x/1.html](http://x/1.html)'],
+      ['纯文本', '', '纯文本'],
+      ['<div><p>段落<b>加粗</b></p></div>', 'http://x', '段落**加粗**\n\n原文链接：[http://x](http://x)'],
+      ['<a href="https://x">内<b>层</b></a>尾', '', '[内**层**](https://x)尾'],
+      ['<br>', '', ''],
+      ['行1<br><br><br>行2', '', '行1\n\n行2']
+    ]
+    for (const [html, url, expected] of cases) {
+      const out = htmlToMarkdown({ content_html: html, url })
+      assertEqual(out, expected, `精确输出不符（includes 判据下 identity 实现也能过）：${html}`)
+      // 输入含真实标签 ⇒ 输出必须与输入不同（identity 实现的机器判据）
+      if (html.includes('<')) assertEqual(out === html, false, `输出等于输入原样，标签未被转换：${html}`)
+    }
   })
 
   await test('快照: tuisong_replace 标题+日期时间', () => {
@@ -6008,18 +6092,18 @@ console.log('========================================\n');
   await test('快照: tuisong_replace Markdown内容', () => {
     const r = tuisong_replace('{Markdown内容}', { content_html: '<b>粗</b>文本', title: 'T', url: 'http://x' })
     // v3.48: <b> 转 Markdown 粗体 **（原剥成纯文本）
-    assertEqual(r, '**粗**文本\n\n原文链接：[http://x](http://x)')
+    assertEqual(r, '**粗**文本\n\n原文链接：[http://x](http://x)', 'r 应等于 \'**粗**文本\\n\\n原文链接：[http://x](http://x)\'')
     const safe = tuisong_replace('{Markdown内容}', { content_html: '<img src="javascript:x">', title: 'T', url: 'http://x' })
     assertEqual(/javascript:/i.test(safe), false, 'Markdown 图片不应保留危险 src')
   })
 
   await test('快照: tuisong_replace 多字段', () => {
     const r = tuisong_replace('{价格}|{商城}|{品牌}|{图片}', { price: '9.9', mall_name: '京东', brand: '某牌', pic: 'http://p.jpg' })
-    assertEqual(r, '9.9|京东|某牌|http://p.jpg')
+    assertEqual(r, '9.9|京东|某牌|http://p.jpg', 'r 应等于 \'9.9|京东|某牌|http://p.jpg\'')
   })
 
-  // ==================== 85. 性能基准(防性能回归) ====================
-  console.log('\n📂 85. 性能基准(防性能回归)')
+  // ==================== 89. 性能基准(防性能回归) ====================
+  console.log('\n📂 89. 性能基准(防性能回归)')
 
   // v3.175：基准测试负载容错——瞬时系统负载（CI 2核/并行残留进程）可能偶发超时误报，
   // 首次超时重跑一次（排除瞬时负载）；真实性能回归两次都超时仍会红（保留检测力）
@@ -6062,6 +6146,113 @@ console.log('========================================\n');
     }, 500, '5000次listfilter')
   })
 
+  // C4-012：上面三条预算的输入都是玩具形态（68 字符 HTML ×1000、单模板 ×1000、3 字段 ×5000），
+  // 而真实推送是「单条 100k 字符的 content_html」——此前这条形态零预算，O(n²) 退化（见 v3.251 长
+  // href 事故）只能在 CI 事后靠肉眼发现。这里按**真实可达形态**补预算：
+  //   · 真实形态是「11 个过滤字段（FILTER_FIELDS 10 个 + pingbitime）全部配满 + 多行 ### 规则」，
+  //     多行规则是分类不敏感的分支遍历。
+  // 阈值 1500/1500/1200ms 沿用（本次不放宽也不收紧）：本机 2 核逐条复刻下述输入的实测值
+  // （单跑脚本，多次采样的 min–max）：
+  //   100k htmlToMarkdown 36–77ms（2 个 CPU hog 争用 69–153ms）→ 余量 19×/9.8×；
+  //   100k tuisong 256–328ms（争用 624–920ms）→ 余量 4.6×/1.6×；
+  //   20000 次全字段 listfilter 56–111ms（争用 194–223ms）→ 余量 10.8×/5.4×。
+  //   tuisong 这条在争用下余量偏薄（预检实测最差用掉 89%），按「本组只加预算、不放宽既有阈值」
+  //   留作 follow-up，不在本组改动。
+  // 「100k 内容 × 数百条规则」的形态不在上面三条覆盖范围内（### 只限行内段数、不限行数），
+  // 由下面单独一条预算承担。
+  await test('基准: htmlToMarkdown 单文档 100k content_html < 1500ms（真实形态）', () => {
+    const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p><ul><li>项一</li><li>项二</li></ul><div>块</div>'
+    const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
+    assertEqual(html.length, 100000, '预算输入必须是真实的 100k 字符单文档')
+    benchRetry(() => { htmlToMarkdown({ content_html: html, url: 'http://x/1.html' }) }, 1500, '100k htmlToMarkdown')
+  })
+
+  await test('基准: tuisong_replace 单文档 100k content_html < 1500ms（真实推送形态）', () => {
+    const blockHtml = '<h2>标题</h2><p>段落<b>加粗</b><a href="http://u">链接</a><img src="p.jpg" alt="图"></p>'
+    const html = blockHtml.repeat(Math.ceil(100000 / blockHtml.length)).slice(0, 100000)
+    const data = { title: 'T', content: 'C', content_html: html, category_name: '分类', url: '/a', posttime: 1785346200 }
+    benchRetry(() => { tuisong_replace('【{分类名}】{标题}\n{Markdown内容}', data) }, 1500, '100k tuisong_replace')
+  })
+
+  await test('基准: listfilter 全字段规则集 20000 次 < 1200ms（真实形态：11 字段 + ### 多行）', () => {
+    const cfg = compileRules({
+      pingbifenlei: '赚客吧###什么值得买',
+      pingbibiaoti: '京东###淘宝',
+      zhanxianbiaoti: '拼多多',
+      pingbibiaotiplus: '神券###优惠',
+      pingbineirong: '返利',
+      zhanxianneirong: '红包',
+      pingbineirongplus: '线报###羊毛',
+      pingbilouzhu: '小明',
+      zhanxianlouzhu: '小红###小李',
+      pingbilouzhuplus: '楼主',
+      pingbitime: '5'
+    })
+    assertEqual(cfg.__compiled, true, '预算必须是编译后的真实规则集')
+    // 全字段都配满 ⇒ 每条消息都会走多行分支，不是「3 个字段短路」的玩具路径
+    // 口径（C4-012 返工）：本用例的规则总数只有 ~17 条（11 字段 × 行内 1–2 段，见
+    // cfg.pingbineirong.rules 等），group 也是 30 字符级短文——它量的是「多字段分支 + 分类判断」
+    // 的固定开销，**打不到**审计指的「100k 内容 × 数百条规则」形态（那条由下一条预算覆盖）。
+    const group = {
+      catename: '微博线报',
+      louzhu: '小明',
+      title: '京东神券大促',
+      content: '大促内容 123',
+      content_html: '<div>大促内容</div>',
+      url: 'http://example.com/p/1.html',
+      posttime: 1785346200,
+      louzhuregtime: '2026-10-20'
+    }
+    benchRetry(() => { for (let i = 0; i < 20000; i++) listfilter(group, cfg) }, 1200, '20000次全字段listfilter')
+  })
+
+  // C4-012 返工：审计指的「100k 内容 × 数百条规则」是**本仓可达形态**——上一版注释把 `###` 的
+  // 「只取前两段」当成了整份配置的上限，实际它只限制**行内**段数、不限行数：300 行「###关键字N」
+  // 经 compileRules 实测就是 rules.length === 300（真实配置，不是合成对象）。而上一版「20000 次
+  // 全字段」预算只有 ~17 条规则 × 30 字符 group，打不到这条热路径。
+  // 最坏路径：300 条规则全部不命中 ⇒ 每条规则都要对 100k 正文各跑一次 _normalizeReInput + test
+  // （matchesCompiled 的 multi 分支是 O(内容 × 规则)，任一条命中才短路）。
+  // 阈值标定（本机 2 核实测，整份 test_filter.js 内的实测值）：
+  //   · 空闲 481–526ms（单独跑同一负载另测 428–489ms）；
+  //   · 起 2 个 CPU hog 制造争用（本仓 check 会并发跑套件）1404–1880ms；
+  //   取 3000ms：空闲 5.7–6.2 倍余量、争用最差仍有 1.6 倍余量（不假红）；而审计形态的退化
+  //   （单条 ~113ms ⇒ 200 条 ≈22s；12–16s 级事故）在本口径下会把 3 次推到秒级 ⇒ 必红。
+  //   为什么不取「5 次一组 + 1500ms」：5 次实测空闲 733–777ms、2 hog 争用 1934–2553ms，1500ms
+  //   在争用下会假红；要让它绿得取 ≥3200ms，那会超过既有最大内部阈值 3000ms（C4-007 的
+  //   TIMEOUT_MS=4000 不变量按 perfLimit(3000) 推导），故取 3 次一组 + 3000ms
+  //   （3000ms 与既有「10000 条 listfilter」预算并列最大，仍严格小于 harness TIMEOUT_MS=4000）。
+  //   反向标定（实测，验证完已 checkout 还原）：把 _anyRule 的规则遍历放大 10 倍（实现退化）⇒
+  //   本断言实测 5184ms > 3000ms 真红，说明这条预算真的在量这条热路径，不是装饰。
+  await test('基准: listfilter 100k 内容 × 300 条 ### 规则 < 3000ms（审计形态）', () => {
+    // 300 行 ### 真配置：无分类前缀 ⇒ 规则对任意 catename 都参与匹配（分类不敏感的分支遍历）
+    const ruleLines = []
+    for (let i = 0; i < 300; i++) ruleLines.push('###zzz_nomatch_' + String(i).padStart(3, '0'))
+    const cfg300 = compileRules({ pingbineirong: ruleLines.join('\n') })
+    assertEqual(cfg300.__compiled, true, '预算必须是编译后的真实规则集')
+    assertEqual(cfg300.pingbineirong && cfg300.pingbineirong._type, 'multi', '300 行 ### 必须编译成多行规则，不是简单正则')
+    assertEqual(cfg300.pingbineirong.rules.length, 300, '300 行 ### 必须真的产出 300 条规则（### 只限行内段数）')
+    // 真实形态的 100k 正文（HTML 抽文后的纯文本），正文不含任何规则关键字 ⇒ 300 条全遍历
+    const para = '大促线报：京东自营满减叠加优惠券，名额有限先到先得。参考价 199 元，券后 129 元，库存 300 件。<br>'
+    let content = ''
+    while (content.length < 100000) content += para
+    content = content.slice(0, 100000)
+    assertEqual(content.length, 100000, '预算输入必须是真实的 100k 字符正文')
+    const g100k = {
+      catename: '微博线报',
+      louzhu: '小明',
+      title: '京东神券大促',
+      content,
+      content_html: content,
+      url: 'http://example.com/p/1.html',
+      posttime: 1785346200,
+      louzhuregtime: '2026-10-20'
+    }
+    // 预热 + 语义闸门：规则全不命中 ⇒ listfilter 放行（true）。若哪天规则意外命中，这里先红，
+    // 不让「测得快」其实是「首条规则短路早退」的假绿溜过去。
+    assertEqual(listfilter(g100k, cfg300), true, '300 条规则不得命中该正文（否则测的是短路早退，不是最坏路径）')
+    benchRetry(() => { for (let i = 0; i < 3; i++) listfilter(g100k, cfg300) }, 3000, '3×100k×300rules listfilter')
+  })
+
   // v3.278（PR #156 复审续）PERF_MS 缩放回归：**撤销缩放即真红**。
   // 人造耗时 800ms：> 默认口径 300ms（必须判不合格 ⇒ 断言没被改死），
   // < 沙箱口径 300×12=3600ms（必须放行 ⇒ 缩放真的生效）。两方向都在同一进程内断言，
@@ -6089,70 +6280,72 @@ console.log('========================================\n');
     assertEqual(perfLimitWith(300, 3000) > 1903, true, `沙箱 tuisong 预算须覆盖实测上界 1903ms，实际 ${perfLimitWith(300, 3000)}ms`)
     assertEqual(perfLimitWith(500, 3000) > 1210, true, `沙箱 htmlToMarkdown 预算须覆盖 CI 实测上界 1210ms，实际 ${perfLimitWith(500, 3000)}ms`)
     assertEqual(perfLimitWith(500, 3000) > 966, true, `沙箱 saveBatch 预算须覆盖实测上界 966ms，实际 ${perfLimitWith(500, 3000)}ms`)
-    // ⑥ 沙箱内 harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死
-    assertEqual(PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000), true, '沙箱内 harness 超时须严格大于最大内部阈值')
-    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 3000, '默认 harness 超时必须仍是 3000ms')
+    // ⑥ harness 超时必须严格大于最大内部阈值，否则缩放会被 harness 先掐死。
+    //    C4-007：原判据写成 `PERF_SCALE === 1 || TIMEOUT_MS > perfLimit(3000)` —— 唯一违规的
+    //    默认模式（3000 > 3000 为假）被短路恒真屏蔽。去掉短路，默认超时提到 4000ms 以满足严格大于。
+    assertEqual(TIMEOUT_MS > perfLimit(3000), true, 'harness 超时必须严格大于最大内部阈值（默认 4000 > 3000）')
+    if (PERF_SCALE === 1) assertEqual(TIMEOUT_MS, 4000, '默认 harness 超时必须为 4000ms（严格大于内部阈值 3000）')
   })
 
-  // ==================== 86. 分支覆盖显式验证(关键if两方向) ====================
-  console.log('\n📂 86. 分支覆盖显式验证')
+  // ==================== 90. 分支覆盖显式验证(关键if两方向) ====================
+  console.log('\n📂 90. 分支覆盖显式验证')
 
   await test('分支: checkCategory 命中/未命中/字段缺失', () => {
     const c = compileRules({ pingbifenlei: '微博' })
-    assertEqual(checkCategory({ catename: '微博线报' }, c.pingbifenlei), false) // 命中→拦截
-    assertEqual(checkCategory({ catename: '赚客吧' }, c.pingbifenlei), true) // 未命中→放行
-    assertEqual(checkCategory({ catename: '' }, c.pingbifenlei), true) // 缺失→放行
+    assertEqual(checkCategory({ catename: '微博线报' }, c.pingbifenlei), false, 'checkCategory({ catename: \'微博线报\' }, c.pingbifenlei) 应等于 false') // 命中→拦截
+    assertEqual(checkCategory({ catename: '赚客吧' }, c.pingbifenlei), true, 'checkCategory({ catename: \'赚客吧\' }, c.pingbifenlei) 应等于 true') // 未命中→放行
+    assertEqual(checkCategory({ catename: '' }, c.pingbifenlei), true, 'checkCategory({ catename: \'\' }, c.pingbifenlei) 应等于 true') // 缺失→放行
   })
 
   await test('分支: checkRegisterTime 超阈值/未超/缺失', () => {
     const c = compileRules({ pingbitime: '5' })
-    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(2) }, c.pingbitime), false) // 新号→拦截
-    assertEqual(checkRegisterTime({ louzhuregtime: '2026-01-01' }, c.pingbitime), true) // 老号→放行
-    assertEqual(checkRegisterTime({}, c.pingbitime), true) // 缺失→放行
+    assertEqual(checkRegisterTime({ louzhuregtime: daysAgo(2) }, c.pingbitime), false, 'checkRegisterTime({ louzhuregtime: daysAgo(2) }, c.pingbitime) 应等于 false') // 新号→拦截
+    assertEqual(checkRegisterTime({ louzhuregtime: '2026-01-01' }, c.pingbitime), true, 'checkRegisterTime({ louzhuregtime: \'2026-01-01\' }, c.pingbitime) 应等于 true') // 老号→放行
+    assertEqual(checkRegisterTime({}, c.pingbitime), true, 'checkRegisterTime({}, c.pingbitime) 应等于 true') // 缺失→放行
   })
 
   await test('分支: checkFields show/block/plus 三方向', () => {
     const c = compileRules({ zhanxianbiaoti: '白名单', pingbibiaoti: '屏蔽', pingbibiaotiplus: '强屏' })
-    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '白名单内容', content: 'c' }, c), true) // show
-    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '屏蔽词', content: 'c' }, c), false) // block
-    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '强屏词', content: 'c' }, c), false) // plus
-    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '普通', content: 'c' }, c), true) // 无规则
+    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '白名单内容', content: 'c' }, c), true, 'checkFields({ catename: \'a\', louzhu: \'x\', title: \'白名单内容\', content: \'c… 应等于 true') // show
+    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '屏蔽词', content: 'c' }, c), false, 'checkFields({ catename: \'a\', louzhu: \'x\', title: \'屏蔽词\', content: \'c\' … 应等于 false') // block
+    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '强屏词', content: 'c' }, c), false, 'checkFields({ catename: \'a\', louzhu: \'x\', title: \'强屏词\', content: \'c\' … 应等于 false') // plus
+    assertEqual(checkFields({ catename: 'a', louzhu: 'x', title: '普通', content: 'c' }, c), true, 'checkFields({ catename: \'a\', louzhu: \'x\', title: \'普通\', content: \'c\' }… 应等于 true') // 无规则
   })
 
   await test('分支: matchesCompiled re/multi/未知类型', () => {
     const c = compileRules({ pingbibiaoti: 'jd', pingbilouzhu: '微博###小明' })
-    assertEqual(matchesCompiled(c.pingbibiaoti, 'JD神券', null), true) // re 命中
-    assertEqual(matchesCompiled(c.pingbibiaoti, '淘宝', null), false) // re 未命中
-    assertEqual(matchesCompiled(c.pingbilouzhu, '小明', '微博线报'), true) // multi 命中
-    assertEqual(matchesCompiled(c.pingbilouzhu, '小明', '赚客吧'), false) // multi 分类不匹配
-    assertEqual(matchesCompiled({ _type: 'x' }, '任意', null), false) // 未知类型兜底
+    assertEqual(matchesCompiled(c.pingbibiaoti, 'JD神券', null), true, 'matchesCompiled(c.pingbibiaoti, \'JD神券\', null) 应等于 true') // re 命中
+    assertEqual(matchesCompiled(c.pingbibiaoti, '淘宝', null), false, 'matchesCompiled(c.pingbibiaoti, \'淘宝\', null) 应等于 false') // re 未命中
+    assertEqual(matchesCompiled(c.pingbilouzhu, '小明', '微博线报'), true, 'matchesCompiled(c.pingbilouzhu, \'小明\', \'微博线报\') 应等于 true') // multi 命中
+    assertEqual(matchesCompiled(c.pingbilouzhu, '小明', '赚客吧'), false, 'matchesCompiled(c.pingbilouzhu, \'小明\', \'赚客吧\') 应等于 false') // multi 分类不匹配
+    assertEqual(matchesCompiled({ _type: 'x' }, '任意', null), false, 'matchesCompiled({ _type: \'x\' }, \'任意\', null) 应等于 false') // 未知类型兜底
   })
 
   await test('分支: whitelistFilter 空/有/非法关键词', () => {
-    assertEqual(whitelistFilter({ title: 'a' }, 'title', ''), true) // 空关键词全过
-    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true) // 命中
-    assertEqual(whitelistFilter({ title: '淘宝' }, 'title', '京东'), false) // 未命中
-    assertEqual(whitelistFilter({ title: 'a' }, 'title', '('), true) // 非法正则→放行（宁可多推，与 App.run 口径一致）
+    assertEqual(whitelistFilter({ title: 'a' }, 'title', ''), true, 'whitelistFilter({ title: \'a\' }, \'title\', \'\') 应等于 true') // 空关键词全过
+    assertEqual(whitelistFilter({ title: '京东' }, 'title', '京东'), true, 'whitelistFilter({ title: \'京东\' }, \'title\', \'京东\') 应等于 true') // 命中
+    assertEqual(whitelistFilter({ title: '淘宝' }, 'title', '京东'), false, 'whitelistFilter({ title: \'淘宝\' }, \'title\', \'京东\') 应等于 false') // 未命中
+    assertEqual(whitelistFilter({ title: 'a' }, 'title', '('), true, 'whitelistFilter({ title: \'a\' }, \'title\', \'(\') 应等于 true') // 非法正则→放行（宁可多推，与 App.run 口径一致）
   })
 
   await test('分支: compileRules 简单/多行/###跳过/非法', () => {
-    assertEqual(compileRules({ pingbibiaoti: 'jd' }).pingbibiaoti._type, 're')
-    assertEqual(compileRules({ pingbilouzhu: '微博###小明' }).pingbilouzhu._type, 'multi')
-    assertEqual(compileRules({ pingbifenlei: 'a###b' }).pingbifenlei, null) // ### 跳过
-    assertEqual(compileRules({ pingbibiaoti: '(' }).pingbibiaoti, null) // 非法→null
-    assertEqual(compileRules({}).pingbibiaoti, null) // 空→null
+    assertEqual(compileRules({ pingbibiaoti: 'jd' }).pingbibiaoti._type, 're', 'compileRules({ pingbibiaoti: \'jd\' }).pingbibiaoti._type 应等于 \'re\'')
+    assertEqual(compileRules({ pingbilouzhu: '微博###小明' }).pingbilouzhu._type, 'multi', 'compileRules({ pingbilouzhu: \'微博###小明\' }).pingbilouzhu._type 应等于 \'multi\'')
+    assertEqual(compileRules({ pingbifenlei: 'a###b' }).pingbifenlei, null, 'compileRules({ pingbifenlei: \'a###b\' }).pingbifenlei 应等于 null') // ### 跳过
+    assertEqual(compileRules({ pingbibiaoti: '(' }).pingbibiaoti, null, 'compileRules({ pingbibiaoti: \'(\' }).pingbibiaoti 应等于 null') // 非法→null
+    assertEqual(compileRules({}).pingbibiaoti, null, 'compileRules({}).pingbibiaoti 应等于 null') // 空→null
   })
 
   await test('分支: daysComputed 日期/时间戳/非法/未来', () => {
-    assertEqual(typeof daysComputed('2026-07-31'), 'number') // 日期
-    assertEqual(typeof daysComputed(1785346200), 'number') // 时间戳
-    assertEqual(daysComputed('not-date'), 0) // 非法→0
-    assertEqual(daysComputed('2099-01-01'), 0) // 未来→0
-    assertEqual(daysComputed(null), 0) // 空→0
+    assertEqual(typeof daysComputed('2026-07-31'), 'number', 'typeof daysComputed(\'2026-07-31\') 应等于 \'number\'') // 日期
+    assertEqual(typeof daysComputed(1785346200), 'number', 'typeof daysComputed(1785346200) 应等于 \'number\'') // 时间戳
+    assertEqual(daysComputed('not-date'), 0, 'daysComputed(\'not-date\') 应等于 0') // 非法→0
+    assertEqual(daysComputed('2099-01-01'), 0, 'daysComputed(\'2099-01-01\') 应等于 0') // 未来→0
+    assertEqual(daysComputed(null), 0, 'daysComputed(null) 应等于 0') // 空→0
   })
 
-  // ==================== 87. 安全测试(原型污染+输出注入) ====================
-  console.log('\n📂 87. 安全测试')
+  // ==================== 91. 安全测试(原型污染+输出注入) ====================
+  console.log('\n📂 91. 安全测试')
 
   await test('安全: listfilter 不受 __proto__ 污染', () => {
     delete Object.prototype.polluted
@@ -6175,7 +6368,7 @@ console.log('========================================\n');
     saveBatch([msg], 'test_proto_safe.json')
     assertEqual(Object.prototype.polluted, undefined, '不应污染原型')
     const r = readMessages(getFilePath('test_proto_safe.json'))
-    assertEqual(Array.isArray(r), true)
+    assertEqual(Array.isArray(r), true, 'Array.isArray(r) 应等于 true')
   })
 
   await test('安全: htmlToMarkdown 输出无事件注入残留', () => {
@@ -6281,8 +6474,8 @@ console.log('========================================\n');
     assertEqual(/<\/?[a-z][a-z0-9]*\s*>/i.test(r), false, '不应残留任何 HTML 标签')
   })
 
-  // ==================== 88. 稳定性/时间旅行/竞态 ====================
-  console.log('\n📂 88. 稳定性/时间旅行/竞态')
+  // ==================== 92. 稳定性/时间旅行/竞态 ====================
+  console.log('\n📂 92. 稳定性/时间旅行/竞态')
 
   await test('稳定性: 连续500轮调用内存不显著增长', () => {
     global.gc && global.gc()
@@ -6312,44 +6505,64 @@ console.log('========================================\n');
     }
   })
 
-  await test('内存: _memoryCache 上限防御（防无限增长泄漏）', async () => {
-    const fs = require('fs')
+  await test('内存: _memoryCache 上限防御（防无限增长泄漏）', () => {
     // 写入 105 个不同文件名 → 内存缓存 key 超 100 应触发重置（磁盘权威不受影响）
     for (let i = 0; i < 105; i++) saveBatch([{ id: i }], 'test_memo_' + i + '.json')
     // 重置后重新读取仍正常（从磁盘恢复）
     const r = readMessages(getFilePath('test_memo_50.json'))
     assertEqual(Array.isArray(r) && r.length === 1, true, '超限重置后读取应正常')
     // 清理
-    for (let i = 0; i < 105; i++) { try { fs.unlinkSync(getFilePath('test_memo_' + i + '.json')) } catch (e) {} }
+    for (let i = 0; i < 105; i++) unlinkQuiet(getFilePath('test_memo_' + i + '.json'))
   })
 
   await test('竞态: 并发 saveBatch 到同一文件不损坏', async () => {
     const fs = require('fs')
-    try { fs.unlinkSync(getFilePath('test_race.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_race.json'))
     const batches = []
     for (let i = 0; i < 10; i++) batches.push([{ id: i, title: 't' + i }])
     await Promise.all(batches.map(b => Promise.resolve().then(() => saveBatch(b, 'test_race.json'))))
     // 并发后文件必须是合法 JSON 数组(原子写未损坏)
     const data = JSON.parse(fs.readFileSync(getFilePath('test_race.json'), 'utf8'))
-    assertEqual(Array.isArray(data), true)
-    assertEqual(data.length >= 1, true)
+    assertEqual(Array.isArray(data), true, 'Array.isArray(data) 应等于 true')
+    assertEqual(data.length >= 1, true, 'data.length >= 1 应等于 true')
   })
 
-  // ==================== 89. 配置矩阵(组合爆炸) ====================
-  console.log('\n📂 89. 配置矩阵')
+  // ==================== 93. 配置矩阵(组合爆炸) ====================
+  console.log('\n📂 93. 配置矩阵')
 
-  await test('矩阵: 过滤字段全组合 listfilter 不崩', () => {
+  await test('矩阵: 过滤字段全组合（2^10）逐组断言拦截/放行（独立 oracle）', () => {
     const fields = ['pingbifenlei', 'pingbibiaoti', 'zhanxianbiaoti', 'pingbibiaotiplus', 'pingbineirong', 'zhanxianneirong', 'pingbineirongplus', 'pingbilouzhu', 'zhanxianlouzhu', 'pingbilouzhuplus']
     const group = { catename: '微博线报', louzhu: '小明', title: '京东神券', content: '限时大促内容', louzhuregtime: '2026-01-01' }
-    // 2^10 全组合(每个字段 开/关)
-    for (let mask = 0; mask < 1024; mask++) {
-      const cfg = {}
-      for (let i = 0; i < fields.length; i++) {
-        if (mask & (1 << i)) cfg[fields[i]] = '京东'
+    // C4-014：原先 1024 组只断言 `typeof r === 'boolean'`——listfilter 恒 true（或恒 false）也全绿，
+    // 零鉴别力却贡献了「全组合」的覆盖面。这里由**独立 oracle** 按 mask 推导期望值，只依据字段语义
+    // 与夹具文本，不复用 listfilter / compileRules 的实现：
+    //   · 配置值一律 '京东'；夹具里只有标题 '京东神券' 含它（正文/楼主/分类都不含）
+    //   · pingbibiaotiplus 命中即拦（生产里 plus 优先于 show，展示不抵消 plus）
+    //   · pingbibiaoti 命中即拦，但同字段的 zhanxianbiaoti 同时开启时被「展示」抵消
+    //   · 其余 7 个字段在夹具文本里不命中 ⇒ 恒不拦截
+    //   · pingbitime=5 且注册日 2026-01-01 距固定今天 212 天 ⇒ 不拦截
+    // 「今天」必须固定：注册天数是距今自然日差，不固定则期望值随真实日期逐日漂移（同「时间旅行」用例）。
+    const origNow = Date.now
+    Date.now = () => Date.UTC(2026, 7, 1) // 固定"今天"= 2026-08-01 00:00 UTC
+    try {
+      const on = (mask, i) => (mask & (1 << i)) !== 0
+      const expected = (mask) => !(on(mask, 3) || (on(mask, 1) && !on(mask, 2)))
+      let blocked = 0
+      for (let mask = 0; mask < 1024; mask++) {
+        const cfg = {}
+        for (let i = 0; i < fields.length; i++) {
+          if (mask & (1 << i)) cfg[fields[i]] = '京东'
+        }
+        cfg.pingbitime = mask % 3 === 0 ? '5' : ''
+        const r = listfilter(group, cfg)
+        const exp = expected(mask)
+        if (r === false) blocked++
+        assertEqual(r, exp, `组合 ${mask}（${fields.filter((f, i) => mask & (1 << i)).join('+') || '全关'}）期望 ${exp}，实得 ${r}`)
       }
-      cfg.pingbitime = mask % 3 === 0 ? '5' : ''
-      const r = listfilter(group, cfg)
-      assertEqual(typeof r === 'boolean', true, `组合 ${mask} 应返回布尔`)
+      // 矩阵必须双向覆盖：恒放行 / 恒拦截两种退化实现都会让这个计数对不上
+      assertEqual(blocked, 640, `1024 组里应有 640 组被拦截（实得 ${blocked}）`)
+    } finally {
+      Date.now = origNow
     }
   })
 
@@ -6370,21 +6583,28 @@ console.log('========================================\n');
     }
     const c = compileRules(all)
     const g = { catename: '', louzhu: null, title: '', content: undefined }
-    assertEqual(typeof listfilter(g, c), 'boolean')
-    assertEqual(Array.isArray(validateConfig(all)), true)
+    assertEqual(typeof listfilter(g, c), 'boolean', 'typeof listfilter(g, c) 应等于 \'boolean\'')
+    assertEqual(listfilter(g, c), true, '全部规则都非法 ⇒ 一条都不生效 ⇒ 必须放行')
+    const warns = validateConfig(all)
+    assertEqual(Array.isArray(warns), true, 'Array.isArray(warns) 应等于 true')
+    // C4-008：非法值必须被**逐字段点名**——静默吞掉 = 用户配错规则却无人告知
+    const named = [...new Set(warns.map(w => (w.match(/「([^」]+)」/) || [])[1]).filter(Boolean))].sort()
+    assert.deepStrictEqual(named, ['pingbibiaoti', 'pingbibiaotiplus', 'pingbifenlei', 'pingbilouzhu',
+      'pingbilouzhuplus', 'pingbineirong', 'pingbineirongplus', 'pingbitime', 'zhanxianbiaoti',
+      'zhanxianneirong', 'zkt_gjc'], '每个非法字段都应被点名（漏报字段=该字段静默失效）')
   })
 
   // v3.311：覆盖文件读面（console GET / qinglong --check）与 App.run 共用同一套正则引擎，
   // 这两个导出是该口径的实现，必须在生产模块里真实可用（可达性用例也会引用）。
   await test('覆盖文件读面: compileUserRegex / _normalizeReInput 与运行期同口径', () => {
-    assertEqual(typeof compileUserRegex, 'function')
+    assertEqual(typeof compileUserRegex, 'function', 'typeof compileUserRegex 应等于 \'function\'')
     const re = compileUserRegex('^a', 'i')
-    assertEqual(Boolean(re && re.test('Ab')), true)
-    assertEqual(_normalizeReInput('a\u200Bb\uFEFFc'), 'abc')
+    assertEqual(Boolean(re && re.test('Ab')), true, 'Boolean(re && re.test(\'Ab\')) 应等于 true')
+    assertEqual(_normalizeReInput('a\u200Bb\uFEFFc'), 'abc', '_normalizeReInput(\'a\\u200Bb\\uFEFFc\') 应等于 \'abc\'')
   })
 
-  // ==================== 90. 死代码检测(可达性) ====================
-  console.log('\n📂 90. 死代码检测')
+  // ==================== 94. 死代码检测(可达性) ====================
+  console.log('\n📂 94. 死代码检测')
 
   await test('可达性: 全部导出被测试引用', () => {
     const mod = require('./xbk_function_v3.js')
@@ -6392,11 +6612,21 @@ console.log('========================================\n');
     const ta = require('fs').readFileSync(path.join(__dirname, '/test_app.js'), 'utf8')
     const tn = require('fs').readFileSync(path.join(__dirname, 'test_notify_selfcheck.js'), 'utf8')
     const all = tf + ta + tn
+    // C4-006：判据原为裸子串 includes(k)，`num` 靠 `number` 的子串恒过闸（把 Utils.num 调用删光
+    // 门禁仍绿）。改为标识符边界：名字前后不得紧邻 [A-Za-z0-9_$]，必须作为独立标识符出现
+    // （成员访问 Utils.num / 调用 num(...) / 解构 { num } 都算；number / numeral 不算）。
+    const isReferenced = (name, text) => new RegExp(
+      `(?:^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_$])`
+    ).test(text)
+    // 判据自检：反例必须只作为更长的标识符子串出现，否则门禁会再次退化成恒真
+    assertEqual(isReferenced('num', 'const number = 1; number.toFixed(2)'), false,
+      'num 仅作为 number 的子串出现时不得算引用（裸子串判据的恒真反例）')
+    assertEqual(isReferenced('num', 'Utils.num(x)'), true, 'Utils.num 成员访问必须算引用')
+    assertEqual(isReferenced('num', 'num(x)'), true, '裸调用必须算引用')
     const unused = []
     for (const k of Object.keys(mod)) {
       if (k === 'Config' || k === 'Pusher') continue
-      // 测试中是否出现该导出名
-      if (!all.includes(k) && !all.includes('.' + k)) unused.push(k)
+      if (!isReferenced(k, all)) unused.push(k)
     }
     assertEqual(unused.length, 0, `未使用的导出: ${unused.join(', ')}`)
   })
@@ -6415,12 +6645,44 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 91. Unicode 深度测试 ====================
-  console.log('\n📂 91. Unicode 深度测试')
+  // ==================== 95. 断言鉴别力 ====================
+  console.log('\n📂 95. 断言鉴别力')
+
+  // C5-019：字面恒真断言（assertEqual(true,true) / assert.ok(true) / assert(true)）永远不会失败——
+  // 把「不会红」当断言，只给报告凑断言数。这里做源码级零容忍：新增一处即红。
+  // needle 一律由常量拼接：字面量直接写进门禁源码会自己命中自己（同 C4-004 的 seed 门禁手法）。
+  await test('C5-019: 恒真断言零容忍（字面 true 断言一律不许）', () => {
+    const fsx = require('fs')
+    const TRUE_LIT = 'true'
+    const patterns = [
+      new RegExp(`assertEqual\\(\\s*${TRUE_LIT}\\s*,\\s*${TRUE_LIT}\\s*[,)]`),
+      new RegExp(`assert\\.(?:ok|strictEqual)\\(\\s*${TRUE_LIT}\\s*[,)]`),
+      new RegExp(`assert\\(\\s*${TRUE_LIT}\\s*\\)`)
+    ]
+    // 判据自检：三种形态都必须被认出，否则门禁本身退化成「恒绿」
+    for (const sample of [`assertEqual(${TRUE_LIT}, ${TRUE_LIT})`, `assert.ok(${TRUE_LIT})`, `assert(${TRUE_LIT})`]) {
+      assertEqual(patterns.some(re => re.test(sample)), true, `判据必须认出恒真断言形态：${sample}`)
+    }
+    const hits = []
+    for (const f of ['test_filter.js', 'test_doc_line_gates.js']) {
+      const lines = fsx.readFileSync(path.join(__dirname, f), 'utf8').split('\n')
+      lines.forEach((line, i) => {
+        const code = line.trim()
+        // 注释里提到该形态不算（说明文字要能解释为什么禁止它）
+        if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return
+        for (const re of patterns) if (re.test(line)) hits.push(`${f}:${i + 1}`)
+      })
+    }
+    assert.deepStrictEqual(hits, [],
+      '字面恒真断言零鉴别力（永远不会红），改成 assert.doesNotThrow / 真值断言：' + hits.join(', '))
+  })
+
+  // ==================== 96. Unicode 深度测试 ====================
+  console.log('\n📂 96. Unicode 深度测试')
 
   await test('Unicode: emoji 代理对在解码/格式化/判重中正常', () => {
-    assertEqual(decodeHtmlEntities('&#128512;'), '😀') // emoji 解码
-    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀') // hex emoji
+    assertEqual(decodeHtmlEntities('&#128512;'), '😀', 'decodeHtmlEntities(\'&#128512;\') 应等于 \'😀\'') // emoji 解码
+    assertEqual(decodeHtmlEntities('&#x1F600;'), '😀', 'decodeHtmlEntities(\'&#x1F600;\') 应等于 \'😀\'') // hex emoji
     const r = htmlToMarkdown({ content_html: '<p>🎉 大促 🚀</p>', url: 'http://x' })
     assertEqual(r.includes('🎉 大促 🚀'), true, 'emoji 保留')
     assertEqual(normUrl('http://A.com/🎉'), normUrl('http://a.com/🎉'), 'emoji url 判重一致')
@@ -6430,14 +6692,14 @@ console.log('========================================\n');
 
   await test('Unicode: 全角/组合字符/零宽不破坏', () => {
     const r = htmlToMarkdown({ content_html: '<p>ＡＢＣ　全角</p>', url: 'http://x' })
-    assertEqual(r.includes('ＡＢＣ　全角'), true)
+    assertEqual(r.includes('ＡＢＣ　全角'), true, 'r.includes(\'ＡＢＣ 全角\') 应等于 true')
     // 组合字符(é = e + ́)
     const comb = 'e\u0301'
     const r2 = tuisong_replace('{标题}', { title: comb })
-    assertEqual(r2, comb)
+    assertEqual(r2, comb, 'r2 应等于 comb')
     // 零宽空格保留
     const zw = 'a\u200bb'
-    assertEqual(decodeHtmlEntities(zw), zw)
+    assertEqual(decodeHtmlEntities(zw), zw, 'decodeHtmlEntities(zw) 应等于 zw')
   })
 
   await test('Unicode: 判重对 emoji/全角 id 稳定', () => {
@@ -6447,9 +6709,8 @@ console.log('========================================\n');
   })
 
   await test('判重: 布尔/对象/Symbol id 不误合并（v3.20 id:null 修复的同类漏网）', () => {
-    const fs = require('fs')
     // 布尔 id：false/true 曾被 String('false') 判为有效 → 不同数据误合并
-    try { fs.unlinkSync(getFilePath('test_boolid.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_boolid.json'))
     saveBatch([
       { id: false, url: '/a', title: '甲' },
       { id: false, url: '/b', title: '乙' },
@@ -6459,7 +6720,7 @@ console.log('========================================\n');
     assertEqual(r.length, 3, `布尔 id 应走 url 判重各存 1 条，实际 ${r.length}`)
     // 对象/Symbol id 同样无效
     const symId = Symbol('s')
-    try { fs.unlinkSync(getFilePath('test_objid.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_objid.json'))
     saveBatch([
       { id: {}, url: '/x', title: '对象甲' },
       { id: {}, url: '/y', title: '对象乙' },
@@ -6487,29 +6748,33 @@ console.log('========================================\n');
     assertEqual(cut2.length, 100, '配对完整时保留 100 码元')
     assertEqual(cut2, '😀'.repeat(50), '应为 50 个完整 emoji')
     // 中文/ASCII 不受影响（汉字 BMP 单码元）
-    assertEqual(truncateUtf16('你好世界abcdef', 4), '你好世界')
-    assertEqual(truncateUtf16('你好世界abcdef', 6), '你好世界ab')
-    assertEqual(truncateUtf16('abc', 5), 'abc')
+    assertEqual(truncateUtf16('你好世界abcdef', 4), '你好世界', 'truncateUtf16(\'你好世界abcdef\', 4) 应等于 \'你好世界\'')
+    assertEqual(truncateUtf16('你好世界abcdef', 6), '你好世界ab', 'truncateUtf16(\'你好世界abcdef\', 6) 应等于 \'你好世界ab\'')
+    assertEqual(truncateUtf16('abc', 5), 'abc', 'truncateUtf16(\'abc\', 5) 应等于 \'abc\'')
     // 不超限返回原串
-    assertEqual(truncateUtf16('😀😀', 4), '😀😀')
+    assertEqual(truncateUtf16('😀😀', 4), '😀😀', 'truncateUtf16(\'😀😀\', 4) 应等于 \'😀😀\'')
     // 混合：末尾恰为中文（无代理）不误退
-    assertEqual(truncateUtf16('😀😀中文', 4), '😀😀')
+    assertEqual(truncateUtf16('😀😀中文', 4), '😀😀', 'truncateUtf16(\'😀😀中文\', 4) 应等于 \'😀😀\'')
   })
 
-  // ==================== 92. 故障注入(fs错误) ====================
-  console.log('\n📂 92. 故障注入')
+  // ==================== 97. 故障注入(fs错误) ====================
+  console.log('\n📂 97. 故障注入')
 
   await test('故障注入: fs.writeFileSync 抛错 → saveMessages 不崩溃', () => {
     const fs = require('fs')
+    const p = getFilePath('test_fault.json')
+    unlinkQuiet(p)
     const orig = fs.writeFileSync
     fs.writeFileSync = () => { throw new Error('磁盘满') }
     try {
-      saveMessages(getFilePath('test_fault.json'), [{ id: 1 }])
-      // 不应抛到调用方(内部已 try-catch)
+      // C5-019：契约是「写失败不抛到调用方」（旧 assertEqual(true,true) 永远不会红），
+      // 且失败后不得留下半成品文件（会被下一次读盘当成有效缓存）
+      assert.doesNotThrow(() => saveMessages(p, [{ id: 1 }]), 'fs 写失败应被容错，不得抛到调用方')
+      assertEqual(fs.existsSync(p), false, '写失败后不得留下目标文件（半成品）')
     } finally {
       fs.writeFileSync = orig
+      unlinkQuiet(p)
     }
-    assertEqual(true, true, 'fs 写失败应被容错')
   })
 
   await test('故障注入: fs.readFileSync 抛错 → readMessages 返回空数组', () => {
@@ -6520,7 +6785,8 @@ console.log('========================================\n');
     fs.openSync = () => { throw new Error('IO错误') }
     try {
       const r = readMessages(getFilePath('test_fault_read.json'))
-      assertEqual(Array.isArray(r), true)
+      assertEqual(Array.isArray(r), true, 'Array.isArray(r) 应等于 true')
+      assertEqual(r.length, 0, '读失败应降级为空数组（返回半读内容会让上层误判缓存全量）')
     } finally {
       fs.openSync = orig
     }
@@ -6535,6 +6801,7 @@ console.log('========================================\n');
     try {
       const r = readMessages(getFilePath('test_dual_fault.json'))
       assertEqual(Array.isArray(r), true, '双故障应仍返回数组')
+      assertEqual(r.length, 0, '双故障必须降级为空数组（不是「返回了数组」就算过）')
     } finally {
       fs.openSync = origR
       fs.writeFileSync = origW
@@ -6547,20 +6814,20 @@ console.log('========================================\n');
     fs.renameSync = () => { throw new Error('rename失败') }
     const p = getFilePath('test_rename_fault.json')
     try {
-      saveMessages(p, [{ id: 1 }]) // 内部 try-catch，不应抛
+      // C5-019：契约是「rename 失败不抛到调用方」（旧 assertEqual(true,true) 永远不会红）
+      assert.doesNotThrow(() => saveMessages(p, [{ id: 1 }]), 'rename 失败应被容错，不得抛')
       assertEqual(fs.existsSync(p + '.tmp'), false, 'tmp 应被清理')
     } finally {
       fs.renameSync = orig
-      try { fs.unlinkSync(p) } catch (e) {}
+      unlinkQuiet(p)
     }
-    assertEqual(true, true, 'rename 失败应被容错')
   })
 
   await test('故障注入: saveBatch 落盘失败 → 内存缓存不得提前判重', () => {
     const fs = require('fs')
     const name = 'test_save_batch_persist_fail.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     // 先建立空的内存缓存快照，再模拟 rename 失败。
     readMessages(p)
     const orig = fs.renameSync
@@ -6571,14 +6838,14 @@ console.log('========================================\n');
       fs.renameSync = orig
     }
     assertEqual(isMessageInFile({ id: 991 }, name), false, '落盘失败的消息不能被内存缓存判定为已处理')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('故障注入: 缓存损坏且重置 rename 失败 → 不污染内存，恢复后可重新读取', () => {
     const fs = require('fs')
     const name = 'test_reset_failure_memory.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, '{bad json', 'utf8')
     const origRename = fs.renameSync
     fs.renameSync = () => { throw new Error('reset rename 失败') }
@@ -6591,14 +6858,14 @@ console.log('========================================\n');
     fs.writeFileSync(p, JSON.stringify([{ id: 992 }]), 'utf8')
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 992), true, '重置失败时不能缓存空数组，恢复后应重新读到磁盘内容')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('故障注入: 缓存读取 ioError → 不缓存空结果，恢复后重新读取', () => {
     const fs = require('fs')
     const name = 'test_read_failure_memory.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, JSON.stringify([{ id: 993 }]), 'utf8')
     const origRead = fs.openSync
     // STG-01：缓存内容改由 fd 有界读取（openSync + readSync），注入 readFileSync 不再影响内容读取；
@@ -6614,36 +6881,59 @@ console.log('========================================\n');
     }
     const recovered = readMessages(p)
     assertEqual(recovered.some(m => m.id === 993), true, '读取恢复后必须重新读取文件')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
-  await test('故障注入: fs.mkdirSync 抛错 → init 不崩溃', () => {
+  // C5-019：原用例在「CACHE 已存在」时 mkdirSync 根本不会被调用（注入点不可达），收尾再写
+  // assertEqual(true,true) —— 断言恒真且注入无效。真实契约（v3.245 P1）是「目录创建失败必须响亮
+  // 暴露」：既打 console.error 也把异常抛给调用方。改为在**缺失**的专属子目录上注入，两条都断言。
+  await test('故障注入: fs.mkdirSync 抛错 → init 必须暴露（日志 + 抛出）', () => {
     const fs = require('fs')
-    const orig = fs.mkdirSync
+    const sub = `${CACHE_DIR_NAME}/test_iso_probe_mkdir_${process.pid}`
+    const dir = path.join(__dirname, sub)
+    if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
+    const origMkdir = fs.mkdirSync
+    const origErr = console.error
+    const origDir = Config.cache.dir
+    const logs = []
     fs.mkdirSync = () => { throw new Error('权限不足') }
+    console.error = (...a) => { logs.push(a.join(' ')) }
     try {
-      init() // init 内部 try-catch(console.error)，不应抛
-      assertEqual(true, true)
+      Config.cache.dir = sub
+      assert.throws(() => init(), /权限不足/, '目录创建失败必须把异常抛给调用方（不得静默吞掉）')
+      assertEqual(logs.some(l => l.includes('缓存目录创建失败')), true, '目录创建失败必须打 console.error 留痕')
     } finally {
-      fs.mkdirSync = orig
+      fs.mkdirSync = origMkdir
+      console.error = origErr
+      Config.cache.dir = origDir
+      if (fs.existsSync(dir)) removeDirInRoot(dir, __dirname)
     }
   })
 
-  await test('故障注入: fs.readdirSync 抛错 → 测试清理不崩溃', () => {
+  await test('故障注入: cleanupTestCache 真实清理 test_ 残留，readdirSync 抛错不崩溃', () => {
     const fs = require('fs')
+    // C4-005：原用例把清理逻辑手抄了 7 行、最后 assertEqual(true, true)，生产 cleanupTestCache
+    // 从未被任何断言观察（只在 :319 起跑前 / 收尾各调一次）。改为直调生产函数：
+    // ① 正例——真删 test_ 前缀残留，且不碰同目录的非 test_ 文件（真实 push.json 就在同目录）；
+    const probe = getFilePath('test_c4005_probe.json')
+    const keep = path.join(CACHE, 'c4005_keep.json')
+    unlinkQuiet(probe)
+    unlinkQuiet(keep)
+    fs.writeFileSync(probe, '[]')
+    fs.writeFileSync(keep, '[]')
+    assertEqual(fs.existsSync(probe), true, '前置：test_ 探针文件应已创建')
+    cleanupTestCache()
+    assertEqual(fs.existsSync(probe), false, 'cleanupTestCache 必须删除 test_ 前缀残留')
+    assertEqual(fs.existsSync(keep), true, 'cleanupTestCache 不得删除非 test_ 文件（真实 push.json 同目录）')
+    // ② 故障注入——readdirSync 对所有路径抛错时，生产函数必须自行吞掉（外层 try-catch），
+    //    不得把异常抛给调用方（起跑前/收尾各调一次，抛错会把全绿判成红）
     const orig = fs.readdirSync
     fs.readdirSync = () => { throw new Error('readdir失败') }
     try {
-      // 模拟测试结尾清理逻辑（readdirSync 抛 → catch 吞）
-      try {
-        const dir = CACHE // 与 cleanupTestCache 同口径（本进程私有分片，不再碰共享目录）
-        if (fs.existsSync(dir)) {
-          fs.readdirSync(dir).forEach(() => { /* 清理 */ })
-        }
-      } catch (e) { /* 预期吞掉 */ }
-      assertEqual(true, true, 'readdir 失败应被容错')
+      assert.doesNotThrow(() => cleanupTestCache(), 'readdirSync 抛错时 cleanupTestCache 不得抛出')
     } finally {
       fs.readdirSync = orig
+      unlinkQuiet(keep)
     }
   })
 
@@ -6652,20 +6942,21 @@ console.log('========================================\n');
     const circular = { id: 1, title: '循环' }
     circular.self = circular // 循环引用
     const p = getFilePath('test_circular.json')
-    try { fs.unlinkSync(p) } catch (e) {}
-    saveMessages(p, [circular]) // 序列化失败应容错（内存保留不落盘）
-    assertEqual(true, true, 'saveMessages 循环引用应容错')
-    saveBatch([circular], 'test_circular.json') // _upsert 比较失败按更新处理
-    assertEqual(true, true, 'saveBatch 循环引用应容错')
+    unlinkQuiet(p)
+    // C5-019：契约是「序列化失败不抛」（旧 assertEqual(true,true) 永远不会红）；saveMessages
+    // 还必须做到「内存保留、磁盘无半成品」——半个 JSON 会被下一次读盘当成有效缓存。
+    assert.doesNotThrow(() => saveMessages(p, [circular]), 'saveMessages 循环引用应容错，不得抛')
+    assertEqual(fs.existsSync(p), false, '序列化失败不得落盘（不得留下半成品文件）')
+    assert.doesNotThrow(() => saveBatch([circular], 'test_circular.json'), 'saveBatch 循环引用应容错，不得抛')
   })
 
-  // ==================== 93. 深度嵌套压力 ====================
-  console.log('\n📂 93. 深度嵌套压力')
+  // ==================== 98. 深度嵌套压力 ====================
+  console.log('\n📂 98. 深度嵌套压力')
 
   await test('压力: 100层嵌套HTML不崩不卡', () => {
     const deep = '<div>'.repeat(100) + '最深层' + '</div>'.repeat(100)
     const r = htmlToMarkdown({ content_html: deep, url: 'http://x' })
-    assertEqual(r.includes('最深层'), true)
+    assertEqual(r.includes('最深层'), true, 'r.includes(\'最深层\') 应等于 true')
     assertEqual(r.includes('<div>'), false, '嵌套标签应剥净')
   })
 
@@ -6673,13 +6964,13 @@ console.log('========================================\n');
     let cfg = ''
     for (let i = 0; i < 100; i++) cfg += `分类${i}###关键词${i}\n`
     const c = compileRules({ pingbilouzhu: cfg })
-    assertEqual(c.pingbilouzhu.rules.length, 100)
-    assertEqual(matchesCompiled(c.pingbilouzhu, '关键词50', '分类50'), true)
-    assertEqual(matchesCompiled(c.pingbilouzhu, '关键词50', '其他'), false)
+    assertEqual(c.pingbilouzhu.rules.length, 100, 'c.pingbilouzhu.rules.length 应等于 100')
+    assertEqual(matchesCompiled(c.pingbilouzhu, '关键词50', '分类50'), true, 'matchesCompiled(c.pingbilouzhu, \'关键词50\', \'分类50\') 应等于 true')
+    assertEqual(matchesCompiled(c.pingbilouzhu, '关键词50', '其他'), false, 'matchesCompiled(c.pingbilouzhu, \'关键词50\', \'其他\') 应等于 false')
   })
 
-  // ==================== 94. 兼容性/契约/一致性 ====================
-  console.log('\n📂 94. 兼容性/契约/一致性')
+  // ==================== 99. 兼容性/契约/一致性 ====================
+  console.log('\n📂 99. 兼容性/契约/一致性')
 
   await test('兼容: 旧格式缓存(无timestamp/缺字段)读入不崩', () => {
     const fs = require('fs')
@@ -6687,40 +6978,40 @@ console.log('========================================\n');
     fs.writeFileSync(getFilePath('test_old_cache.json'), JSON.stringify([{ id: 1, title: '旧数据' }, '损坏行', { id: 2, url: '/u' }]), 'utf8')
     const r = readMessages(getFilePath('test_old_cache.json'))
     assertEqual(Array.isArray(r), true, '应返回数组')
-    assertEqual(r.filter(m => m && typeof m === 'object').length >= 1, true)
+    assertEqual(r.filter(m => m && typeof m === 'object').length >= 1, true, 'r.filter(m => m && typeof m === \'object\').length >= 1 应等于 true')
     // 不崩溃可继续使用
-    assertEqual(isMessageInFile({ id: 1 }, 'test_old_cache.json'), true)
+    assertEqual(isMessageInFile({ id: 1 }, 'test_old_cache.json'), true, 'isMessageInFile({ id: 1 }, \'test_old_cache.json\') 应等于 true')
   })
 
   await test('兼容: 缓存含多余字段不破坏判重', () => {
     const fs = require('fs')
     fs.writeFileSync(getFilePath('test_extra_fields.json'), JSON.stringify([{ id: 5, url: '/e', title: 'x', extra: { a: 1 }, legacy: 'old' }]), 'utf8')
-    assertEqual(isMessageInFile({ id: 5 }, 'test_extra_fields.json'), true)
-    assertEqual(isMessageInFile({ url: '/e' }, 'test_extra_fields.json'), true)
+    assertEqual(isMessageInFile({ id: 5 }, 'test_extra_fields.json'), true, 'isMessageInFile({ id: 5 }, \'test_extra_fields.json\') 应等于 true')
+    assertEqual(isMessageInFile({ url: '/e' }, 'test_extra_fields.json'), true, 'isMessageInFile({ url: \'/e\' }, \'test_extra_fields.json\') 应等于 true')
   })
 
   await test('契约: Config 默认值全量锁定', () => {
     const { Config } = require('./xbk_function_v3.js')
-    assertEqual(Config.domain, 'https://new.ixbk.net')
-    assertEqual(Config.api.timeout, 5000)
-    assertEqual(Config.api.retry, 2)
-    assertEqual(Config.filter.pingbitime, '5')
-    assertEqual(Config.keyword.zkt_gjc, '')
-    assertEqual(Config.timing.pushInterval, 0)
-    assertEqual(Config.timing.finalWait, 0)
-    assertEqual(Config.cache.maxSize, 10000)
+    assertEqual(Config.domain, 'https://new.ixbk.net', 'Config.domain 应等于 \'https://new.ixbk.net\'')
+    assertEqual(Config.api.timeout, 5000, 'Config.api.timeout 应等于 5000')
+    assertEqual(Config.api.retry, 2, 'Config.api.retry 应等于 2')
+    assertEqual(Config.filter.pingbitime, '5', 'Config.filter.pingbitime 应等于 \'5\'')
+    assertEqual(Config.keyword.zkt_gjc, '', 'Config.keyword.zkt_gjc 应等于 \'\'')
+    assertEqual(Config.timing.pushInterval, 0, 'Config.timing.pushInterval 应等于 0')
+    assertEqual(Config.timing.finalWait, 0, 'Config.timing.finalWait 应等于 0')
+    assertEqual(Config.cache.maxSize, 10000, 'Config.cache.maxSize 应等于 10000')
     // 生产默认目录：用隔离**之前**捕获的值断言（强度不变——生产把默认目录改掉这里仍会红）；
     // 同时锁住本套件已把生效目录隔离到进程私有分片（撤销隔离即真红）。
     assertEqual(PROD_DEFAULT_CACHE_DIR, 'xianbaoku_cache', '生产默认缓存目录必须仍是 xianbaoku_cache')
     assertEqual(Config.cache.dir, CACHE_DIR_NAME, '生效缓存目录必须已隔离到本进程私有分片目录')
-    assertEqual(Config.push.mode, 'parallel')
-    assertEqual(Config.push.parallelLimit, 10)
-    assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json')
+    assertEqual(Config.push.mode, 'parallel', 'Config.push.mode 应等于 \'parallel\'')
+    assertEqual(Config.push.parallelLimit, 10, 'Config.push.parallelLimit 应等于 10')
+    assertEqual(Config.api.pushUrl, 'https://new.ixbk.net/plus/json/push.json', 'Config.api.pushUrl 应等于 \'https://new.ixbk.net/plus/json/push.json\'')
   })
 
   await test('一致性: save 后内存缓存与磁盘文件一致', () => {
     const fs = require('fs')
-    try { fs.unlinkSync(getFilePath('test_mem_disk.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_mem_disk.json'))
     appendMessageToFile({ id: 1, title: 'A' }, 'test_mem_disk.json')
     appendMessageToFile({ id: 2, title: 'B' }, 'test_mem_disk.json')
     const mem = readMessages(getFilePath('test_mem_disk.json')) // 走内存缓存
@@ -6730,16 +7021,16 @@ console.log('========================================\n');
 
   await test('一致性: 多轮 saveBatch 后内存与磁盘同步', () => {
     const fs = require('fs')
-    try { fs.unlinkSync(getFilePath('test_mem_disk2.json')) } catch (e) {}
+    unlinkQuiet(getFilePath('test_mem_disk2.json'))
     for (let i = 0; i < 5; i++) saveBatch([{ id: i }], 'test_mem_disk2.json')
     const mem = readMessages(getFilePath('test_mem_disk2.json'))
     const disk = JSON.parse(fs.readFileSync(getFilePath('test_mem_disk2.json'), 'utf8'))
-    assertEqual(mem.length, 5)
+    assertEqual(mem.length, 5, 'mem.length 应等于 5')
     assertEqual(JSON.stringify(mem), JSON.stringify(disk), '多轮后仍一致')
   })
 
-  // ==================== 95. ReDoS 防护(灾难性回溯) ====================
-  console.log('\n📂 95. ReDoS 防护(灾难性回溯)')
+  // ==================== 100. ReDoS 防护(灾难性回溯) ====================
+  console.log('\n📂 100. ReDoS 防护(灾难性回溯)')
 
   // 95-1. hasNestedQuantifier 检测正确性
   await test('ReDoS: hasNestedQuantifier 命中嵌套量词模式', () => {
@@ -6795,12 +7086,12 @@ console.log('========================================\n');
     const c = compileRules({ pingbibiaoti: '(a+)+', pingbilouzhu: 'x###(a+)+' })
     const t0 = Date.now()
     const r = listfilter({ catename: 'a', louzhu: 'b', title: 'a'.repeat(5000), content: 'c', louzhuregtime: '2026-01-01' }, c)
-    assertEqual(typeof r === 'boolean', true)
+    assertEqual(typeof r === 'boolean', true, 'typeof r === \'boolean\' 应等于 true')
     assertEqual(Date.now() - t0 < PERF_REDOS_LIMIT, true, '嵌套量词配置不应卡死')
   })
 
-  // ==================== 96. 一致性修复(配置解析口径) ====================
-  console.log('\n📂 96. 一致性修复(配置解析口径)')
+  // ==================== 101. 一致性修复(配置解析口径) ====================
+  console.log('\n📂 101. 一致性修复(配置解析口径)')
 
   await test('一致性: validateConfig \\r 分隔与 _splitLines 口径一致', () => {
     // \r 单独分隔多行：compileRules 拆 2 行，validateConfig 不应误报"多个 ###"
@@ -6844,8 +7135,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 97. 官方 got 客户端直测(本地 server) ====================
-  console.log('\n📂 97. 官方 got 客户端直测')
+  // ==================== 102. 官方 got 客户端直测(本地 server) ====================
+  console.log('\n📂 102. 官方 got 客户端直测')
 
   await test('got: 302 重定向跟随 + JSON 解析', async () => {
     const http = require('http')
@@ -6875,7 +7166,7 @@ console.log('========================================\n');
     try {
       const res = await got(`http://127.0.0.1:${port}/pr`)
       assertEqual(res.statusCode, 200, `协议相对 location 应正确跟随，实际 ${res.statusCode}（修复前拼成 origin//host 404）`)
-      assertEqual(res.body, 'ok')
+      assertEqual(res.body, 'ok', 'res.body 应等于 \'ok\'')
     } finally {
       await new Promise(r => server.close(r))
     }
@@ -6892,7 +7183,7 @@ console.log('========================================\n');
     try {
       const res = await got(`http://127.0.0.1:${port}/r`)
       assertEqual(res.statusCode, 200, `路径相对 location 应正确跟随，实际 ${res.statusCode}`)
-      assertEqual(res.body, 'relative-ok')
+      assertEqual(res.body, 'relative-ok', 'res.body 应等于 \'relative-ok\'')
     } finally {
       await new Promise(r => server.close(r))
     }
@@ -7048,8 +7339,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 98. 异常路径批量(类型/网络边界) ====================
-  console.log('\n📂 98. 异常路径批量')
+  // ==================== 103. 异常路径批量(类型/网络边界) ====================
+  console.log('\n📂 103. 异常路径批量')
 
   await test('异常: 未知占位符 {不存在} 保留原文', () => {
     assertEqual(tuisong_replace('x{不存在}y', { title: 'T' }), 'x{不存在}y', '未知占位符应保留')
@@ -7057,13 +7348,13 @@ console.log('========================================\n');
 
   await test('异常: 对象字段不崩(category_name/louzhuregtime/posttime)', () => {
     // 对象 category_name → JSON 化（v3.30 口径）
-    assertEqual(tuisong_replace('{分类名}', { category_name: { a: 1 } }), '{"a":1}')
+    assertEqual(tuisong_replace('{分类名}', { category_name: { a: 1 } }), '{"a":1}', 'tuisong_replace(\'{分类名}\', { category_name: { a: 1 } }) 应等于 \'{"a":1}\'')
     // 对象 louzhuregtime → 解析失败 0（不崩）
-    assertEqual(daysComputed({ a: 1 }), 0)
+    assertEqual(daysComputed({ a: 1 }), 0, 'daysComputed({ a: 1 }) 应等于 0')
     // 对象 posttime → 日期空（不崩）
-    assertEqual(tuisong_replace('{日期}', { posttime: { a: 1 } }), '')
+    assertEqual(tuisong_replace('{日期}', { posttime: { a: 1 } }), '', 'tuisong_replace(\'{日期}\', { posttime: { a: 1 } }) 应等于 \'\'')
     // 对象 url → 不崩（urlOf 防御在集成层，此处格式化层 String 化）
-    assertEqual(typeof tuisong_replace('{链接}', { url: { a: 1 } }), 'string')
+    assertEqual(typeof tuisong_replace('{链接}', { url: { a: 1 } }), 'string', 'typeof tuisong_replace(\'{链接}\', { url: { a: 1 } }) 应等于 \'string\'')
   })
 
   await test('got: 重定向循环达到上限后 reject（官方 got 语义）', async () => {
@@ -7144,8 +7435,8 @@ console.log('========================================\n');
     }
   })
 
-  // ==================== 99. 边界精确值(锁定行为) ====================
-  console.log('\n📂 99. 边界精确值')
+  // ==================== 104. 边界精确值(锁定行为) ====================
+  console.log('\n📂 104. 边界精确值')
 
   await test('边界: TS_BOUND(1e11) 精确分界行为锁定', () => {
     // 10 位秒(2001年)→正常天数
@@ -7189,7 +7480,7 @@ console.log('========================================\n');
     assertEqual(decodeHtmlEntities('&#0;'), '', 'NUL过滤')
   })
 
-  console.log('\n📂 100. 审查项 #56/#65/#7')
+  console.log('\n📂 105. img 空 src / 换行 url / maxSize 校验归属')
 
   await test('#56: img 空 src / 纯空白 src → 不生成 ![]() 空图片', () => {
     const r1 = htmlToMarkdown({ content_html: '<img src="">', url: 'http://x' })
@@ -7224,16 +7515,16 @@ console.log('========================================\n');
 
   await test('#链接: {链接} 占位符 Markdown 安全化（v3.74）', () => {
     // 含空格/括号 → <> 包裹（与 htmlToMarkdown 的 mdUrl 同口径）
-    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a b', title: 't' }), '<http://x.com/a b>')
-    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a(b)', title: 't' }), '<http://x.com/a(b)>')
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a b', title: 't' }), '<http://x.com/a b>', 'tuisong_replace(\'{链接}\', { url: \'http://x.com/a b\', title: \'t\' }) 应等于 \'<http://x.com/a b>\'')
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a(b)', title: 't' }), '<http://x.com/a(b)>', 'tuisong_replace(\'{链接}\', { url: \'http://x.com/a(b)\', title: \'t\' }) 应等于 \'<http://x.com/a(b)>\'')
     // 含换行 → 剥离
-    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a\nb', title: 't' }), 'http://x.com/ab')
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/a\nb', title: 't' }), 'http://x.com/ab', 'tuisong_replace(\'{链接}\', { url: \'http://x.com/a\\nb\', title: \'t\' }) 应等于 \'http://x.com/ab\'')
     // 正常 url 原样；无 url → 空
-    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/ok', title: 't' }), 'http://x.com/ok')
-    assertEqual(tuisong_replace('{链接}', { title: 't' }), '')
+    assertEqual(tuisong_replace('{链接}', { url: 'http://x.com/ok', title: 't' }), 'http://x.com/ok', 'tuisong_replace(\'{链接}\', { url: \'http://x.com/ok\', title: \'t\' }) 应等于 \'http://x.com/ok\'')
+    assertEqual(tuisong_replace('{链接}', { title: 't' }), '', 'tuisong_replace(\'{链接}\', { title: \'t\' }) 应等于 \'\'')
   })
 
-  console.log('\n📂 101. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）')
+  console.log('\n📂 106. 版本一致性（防文件头版本号过时——v3.35 曾出现「v3.8 当前最新」过时误导）')
 
   await test('版本一致性：文件头版本号与 CHANGELOG 最新一致', () => {
     const fs = require('fs')
@@ -7268,7 +7559,7 @@ console.log('========================================\n');
   // v3.169：README 不再维护版本号（避免每次发布手动同步的过时源）——版本一致性收敛为
   // 文件头 ↔ CHANGELOG 最新 ↔ package.json ↔ package-lock 根元数据 四方自动校验；README 的版本信息指向 package.json/CHANGELOG
 
-  console.log('\n📂 102. 配置防御（v3.80）')
+  console.log('\n📂 107. 配置防御（v3.80）')
 
   await test('防御: cache.dir 非字符串 → 回退默认不崩（v3.80）', () => {
     const orig = Config.cache.dir
@@ -7277,7 +7568,7 @@ console.log('========================================\n');
       const p = getFilePath('test_102_cache.json')
       assertEqual(typeof p, 'string', '应返回字符串路径（回退默认目录）')
       assertEqual(p.includes('xianbaoku_cache'), true, `应回退默认缓存目录: ${p}`)
-      try { require('fs').unlinkSync(p) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
     } finally {
       Config.cache.dir = orig
     }
@@ -7290,8 +7581,8 @@ console.log('========================================\n');
     const link = path.join(__dirname, 'test_cache_symlink_probe')
     const target = path.join(os.tmpdir(), 'xbk-cache-symlink-target')
     try {
-      try { fs.unlinkSync(link) } catch (e) { /* 不存在 */ }
-      try { fs.rmdirSync(target) } catch (e) { /* 不存在 */ }
+      unlinkQuiet(link)
+      rmdirQuiet(target)
       fs.mkdirSync(target, { recursive: true })
       fs.symlinkSync(target, link, 'dir')
       Config.cache.dir = 'test_cache_symlink_probe'
@@ -7299,8 +7590,8 @@ console.log('========================================\n');
       assertEqual(fs.realpathSync(path.dirname(p)).startsWith(path.resolve(__dirname) + path.sep), true, `符号链接缓存目录不应逃逸: ${p}`)
     } finally {
       Config.cache.dir = orig
-      try { fs.unlinkSync(link) } catch (e) { /* 忽略 */ }
-      try { fs.rmdirSync(target) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(link)
+      rmdirQuiet(target)
     }
   })
 
@@ -7366,15 +7657,21 @@ console.log('========================================\n');
     assertEqual(Config.push.parallelLimit, 10, 'push.parallelLimit 默认')
   })
 
-  console.log('\n📂 103. 随机输入冒烟（Fuzz，固定 seed 确定性）')
+  console.log('\n📂 108. 随机输入冒烟（Fuzz，固定 seed 确定性）')
+  // C4-011：LCG 伪随机此前被逐字复制 26 份（19 份单行 + 7 份三行），改算法/模数要改 26 处、
+  // 漏一处就让「固定 seed ⇒ 跨运行一致」的 fuzz 用例静默分叉。收敛到 makeRand 之后，
+  // 本断言把「只剩一处实现」变成门禁：谁再复制一份即红（prnd 是 `& 0x7fffffff` 的另一序列，另算）。
+  await test('C4-011: LCG 伪随机只有 makeRand 一处实现（+ prnd 变体共 2 处）', () => {
+    const NEEDLE = '1103515' + '245' // 拆开写，免得本断言自己成为第 3 处
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const codeOnly = src.split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+    const hits = codeOnly.split(NEEDLE).length - 1
+    assertEqual(hits, 2, `LCG 常数只应出现在 makeRand 与 prnd 各一次（用例内复制即红），实际 ${hits} 处`)
+  })
 
   await test('Fuzz: 纯函数随机脏数据 500 轮不崩（v3.107）', () => {
     // 确定性伪随机（固定 seed 42——跨运行结果一致，88 章确定性精神）
-    let seed = 42
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(42)
     // 随机脏数据源：null/undefined/空串/大数/NaN/Infinity/对象/数组/含实体与标签的随机串
     const randomValue = () => {
       const r = rand()
@@ -7461,8 +7758,8 @@ console.log('========================================\n');
     assertEqual(r2.includes('http://x.com/ok'), true, '正常 url 不受影响')
   })
 
-  // ==================== 103. R1 低风险修复锁定（v3.105 不推版本） ====================
-  console.log('\n📂 103. 低风险修复批次锁定（R1-R6/R9：truncate/getFileName/splitLines/domain/maxSize/retry/原型键/url/title）')
+  // ==================== 109. R1 低风险修复锁定（v3.105 不推版本） ====================
+  console.log('\n📂 109. 低风险项锁定（truncate/getFileName/splitLines/domain/maxSize/retry/原型键/url/title）')
 
   await test('truncateUtf16: 非法 max(undefined/NaN/0/负数) 不截断（R1）', () => {
     assertEqual(truncateUtf16('abc', undefined), 'abc', 'undefined 不截断')
@@ -7493,33 +7790,32 @@ console.log('========================================\n');
     assertEqual(_splitLines('abc'), null, '简单模式仍返回 null（无 ### 不拆分）')
   })
 
-  await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2 整数化）', () => {
-    const saved = Config.cache.maxSize
-    const fs = require('fs')
+  await test('saveMessages: maxSize 小数回退默认、整数裁剪生效（R3-2 整数化）', async () => {
     const p = getFilePath('test_103_maxsize.json')
     const msgs = Array.from({ length: 100 }, (_, i) => ({ id: i, title: `t${i}` }))
     try {
       // 小数 maxSize → 回退默认 10000（v3.120）→ 100 条不裁剪
-      Config.cache.maxSize = 2.5
-      saveMessages(p, msgs)
-      assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 10000 不裁剪: ${readMessages(p).length}`)
+      await withCacheMaxSize(2.5, () => {
+        saveMessages(p, msgs)
+        assertEqual(readMessages(p).length, 100, `maxSize=2.5 应回退默认 10000 不裁剪: ${readMessages(p).length}`)
+      })
       // 整数 maxSize=3 → 裁剪到 3 条（上限语义为整数条数）
-      Config.cache.maxSize = 3
-      saveMessages(p, msgs)
-      assertEqual(readMessages(p).length, 3, `整数 maxSize=3 应裁剪到 3 条: ${readMessages(p).length}`)
+      await withCacheMaxSize(3, () => {
+        saveMessages(p, msgs)
+        assertEqual(readMessages(p).length, 3, `整数 maxSize=3 应裁剪到 3 条: ${readMessages(p).length}`)
+      })
       // 0/负值仍回退默认（原行为保持）
-      Config.cache.maxSize = 0
-      saveMessages(p, msgs)
-      assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认 10000 不裁剪')
+      await withCacheMaxSize(0, () => {
+        saveMessages(p, msgs)
+        assertEqual(readMessages(p).length, 100, 'maxSize=0 回退默认 10000 不裁剪')
+      })
     } finally {
-      Config.cache.maxSize = saved
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
-      try { fs.unlinkSync(p + '.tmp') } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
+      unlinkQuiet(p + '.tmp')
     }
   })
 
   await test('安全: readMessages 原型键 __proto__ 防御（R5-2）', () => {
-    const fs = require('fs')
     const p = getFilePath('__proto__')
     try {
       // 首次读：原型键不走内存直读（hasOwnProperty false）→ 磁盘初始化空数组
@@ -7532,9 +7828,9 @@ console.log('========================================\n');
       assertEqual(Object.prototype.constructor, Object, 'Object.prototype 不被污染')
       assertEqual(Object.prototype.polluted, undefined, '无 polluted 残留')
     } finally {
-      try { fs.unlinkSync(p) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(p)
       // readMessages 直接传 '__proto__'（触发原型键分支）时 _ensureFileExists 会在 cwd 创建文件——测试后清理
-      try { fs.unlinkSync(require('path').join(__dirname, '__proto__')) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(require('path').join(__dirname, '__proto__'))
     }
   })
 
@@ -7585,15 +7881,11 @@ console.log('========================================\n');
 
   // ================================================
 
-  console.log('\n📂 104. 深度 Fuzz（全导出扫描 + 不变量 Property Tests）')
+  console.log('\n📂 110. 深度 Fuzz（全导出扫描 + 不变量 Property Tests）')
 
   await test('Fuzz-深度: 扩展随机值生成器（Symbol/函数/BigInt/Date/RegExp/循环/Proxy）', () => {
     // 固定 seed，确定性
-    let seed = 20260801
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(20260801)
     const deep = (depth) => {
       if (depth <= 0) return randomScalar()
       const r = rand()
@@ -7672,11 +7964,7 @@ console.log('========================================\n');
   })
 
   await test('Property: normUrl 幂等（随机输入 normUrl(normUrl(x))===normUrl(x)）', () => {
-    let seed = 7
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(7)
     const urls = ['http://A.com/x', 'https://x.com/a/', '//host/path', '/rel/path', 'http://x.com', 'a?b=1', '///', 'http://x.com//d//', 'ftp://f.com/', 'HTTP://Mixed.COM/U']
     for (let i = 0; i < 1000; i++) {
       const base = urls[Math.floor(rand() * urls.length)]
@@ -7688,11 +7976,7 @@ console.log('========================================\n');
   })
 
   await test('Property: decodeHtmlEntities 的 & 计数只减不增（随机输入）', () => {
-    let seed = 99
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(99)
     for (let i = 0; i < 1000; i++) {
       let s = ''
       const len = Math.floor(rand() * 100)
@@ -7708,11 +7992,7 @@ console.log('========================================\n');
   })
 
   await test('Property: daysComputed 非负（随机时间输入）', () => {
-    let seed = 1234
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(1234)
     for (let i = 0; i < 2000; i++) {
       const t = Math.floor(rand() * 1e14)
       const d = daysComputed(t)
@@ -7722,11 +8002,7 @@ console.log('========================================\n');
   })
 
   await test('Property: anonKey 确定性（同输入同输出）+ 不抛', () => {
-    let seed = 55
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(55)
     for (let i = 0; i < 500; i++) {
       const a = Math.floor(rand() * 1e6)
       const b = rand() < 0.5 ? null : 'x' + Math.floor(rand() * 1e6)
@@ -7739,11 +8015,7 @@ console.log('========================================\n');
   })
 
   await test('Property: truncateUtf16 长度不超限（随机字符串+emoji）', () => {
-    let seed = 777
-    const rand = () => {
-      seed = (seed * 1103515245 + 12345) % 2147483648
-      return seed / 2147483648
-    }
+    const rand = makeRand(777)
     for (let i = 0; i < 1000; i++) {
       let s = ''
       const len = Math.floor(rand() * 200)
@@ -7772,7 +8044,7 @@ console.log('========================================\n');
     assertEqual(truncateUtf16(emojiHuge, 300).length <= 300, true, '超长 emoji 截断不崩')
   })
 
-  console.log('\n📂 105. Fuzz 回归锁定（嵌套 Symbol 数组全 API 防御）')
+  console.log('\n📂 111. Fuzz 回归锁定（嵌套 Symbol 数组全 API 防御）')
 
   await test('Fuzz 回归: 嵌套 Symbol 数组输入 16 个 API 不崩（v3.108）', () => {
     const symArr = [Symbol('x')]
@@ -7806,11 +8078,10 @@ console.log('========================================\n');
   })
 
   console.log('\n========================================')
-  console.log('\n📂 106. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）')
+  console.log('\n📂 112. 深度 Fuzz 二轮（跨函数不变量 + 正则安全 + IO + 深度压力）')
 
   await test('Property-2: truncateUtf16 单调性（max 更大 → 输出不更短）', () => {
-    let seed = 314159
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(314159)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 300)
@@ -7824,8 +8095,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: {分类名} 与 {类目} 同源一致（随机数据）', () => {
-    let seed = 2718
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(2718)
     for (let i = 0; i < 500; i++) {
       const catename = rand() < 0.2 ? null : '分类' + Math.floor(rand() * 100)
       const item = { catename, title: 't', content: 'c', url: '/x' }
@@ -7837,8 +8107,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: whitelistFilter 与 filterByKeyword 一致（随机数据）', () => {
-    let seed = 1618
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(1618)
     for (let i = 0; i < 500; i++) {
       const title = '标题' + Math.floor(rand() * 1000) + (rand() < 0.5 ? '京东' : '') + '神券'
       const kw = rand() < 0.3 ? '' : (rand() < 0.5 ? '京东' : (rand() < 0.8 ? '[' : '神券'))
@@ -7850,8 +8119,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: daysComputed 与 parseTime 一致性（无效/未来 → 0）', () => {
-    let seed = 4242
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(4242)
     for (let i = 0; i < 1000; i++) {
       const x = rand() < 0.3 ? (rand() < 0.5 ? 'abc' : null) : Math.floor(rand() * 1e13)
       const d = daysComputed(x)
@@ -7863,8 +8131,7 @@ console.log('========================================\n');
   })
 
   await test('Property-2: decodeHtmlEntities 幂等（递归解码收敛后稳定）', () => {
-    let seed = 8888
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(8888)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 40)
@@ -7879,8 +8146,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-正则: 100 个随机正则模式 hasNestedQuantifier 不崩且判定一致', () => {
-    let seed = 999
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(999)
     const atoms = ['a', 'b', '\\d', '.', '[ab]', '(ab)', '(?:cd)', 'a+', 'b*', 'a?', 'x{1,3}', 'y{2,}', '(a+)+', '(b*)*', '\\', '|', '^', '$']
     for (let i = 0; i < 100; i++) {
       let pat = ''
@@ -7909,8 +8175,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-IO: 随机文件名/内容 → 缓存 API 不崩（临时文件自动清理）', () => {
-    let seed = 12321
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(12321)
     const randName = () => {
       const chars = 'abcXYZ0123 ../\\\\?*:"<>|&.;\u4e2d\ud83d\ude00'
       let s = 'test_106_'
@@ -7951,16 +8216,12 @@ console.log('========================================\n');
       throw new Error(`IO fuzz 失败 name="${String(lastName).slice(0, 40)}" content=${JSON.stringify(lastContent).slice(0, 40)}: ${e.message}`)
     } finally {
       // v3.155：清理本测试实际写过的文件（曾声称"自动清理"但未实现，跑完留乱码名垃圾如 01Zc;Z.json）
-      try {
-        const fs = require('fs')
-        for (const fp of written) { try { fs.unlinkSync(fp) } catch (e) { /* 忽略 */ } }
-      } catch (e) { /* 清理失败忽略 */ }
+      for (const fp of written) { unlinkQuiet(fp) }
     }
   })
 
   await test('Fuzz-深度: 8 层嵌套 + 1MB 字符串 + 1000 轮大扫描', () => {
-    let seed = 55555
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(55555)
     const deep = (d) => {
       if (d <= 0) return rand() < 0.5 ? Math.floor(rand() * 1e9) : (rand() < 0.7 ? 'str' + Math.floor(rand() * 100) : null)
       return rand() < 0.5 ? { k: deep(d - 1) } : [deep(d - 1)]
@@ -7986,11 +8247,10 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 107. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）')
+  console.log('\n📂 113. 深度 Fuzz 三轮（广覆盖：单调性/前缀性/组合/极端/模板/存储一致性）')
 
   await test('Property-3: daysComputed 单调性（更早日期 → 天数不更小）', () => {
-    let seed = 112358
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(112358)
     const mkDate = () => {
       const y = 2020 + Math.floor(rand() * 10)
       const mo = 1 + Math.floor(rand() * 12)
@@ -8010,8 +8270,7 @@ console.log('========================================\n');
   })
 
   await test('Property-3: truncateUtf16 前缀性（输出是输入前缀，允许代理对回退）', () => {
-    let seed = 131071
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(131071)
     for (let i = 0; i < 500; i++) {
       let s = ''
       const len = Math.floor(rand() * 100)
@@ -8024,8 +8283,7 @@ console.log('========================================\n');
   })
 
   await test('Property-3: decode+htmlToMarkdown 组合无实体残留（随机实体 HTML）', () => {
-    let seed = 161803
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(161803)
     for (let i = 0; i < 500; i++) {
       let html = ''
       const len = Math.floor(rand() * 20)
@@ -8075,8 +8333,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-模板: 随机模板（占位符组合）tuisong_replace 不崩且已知占位符被替换', () => {
-    let seed = 271828
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(271828)
     const placeholders = ['{分类名}', '{分类ID}', '{标题}', '{链接}', '{日期}', '{时间}', '{楼主}', '{类目}', '{价格}', '{商城}', '{品牌}', '{图片}', '{Html内容}', '{Markdown内容}', '{不存在}', '{{标题}}', '{标题', '标题}']
     const data = {
       catename: '测试分类',
@@ -8116,11 +8373,10 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-存储: MessageStore 跨操作一致性（save→read→has 闭环）', () => {
-    let seed = 3141592
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(3141592)
     const file = 'test_107_store.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // 随机写入 50 条（含重复 id）
       const msgs = []
@@ -8146,11 +8402,11 @@ console.log('========================================\n');
       // 查询不存在的 id → false（has(message, filename) 参数顺序）
       assertEqual(isMessageInFile({ id: 99999, title: 'n' }, file), false, '不存在的 id 查不到')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
-  console.log('\n📂 108. Fuzz 回归二（孤立代理清洗）')
+  console.log('\n📂 114. Fuzz 回归二（孤立代理清洗）')
 
   await test('Fuzz 回归: 孤立代理 → tuisong_replace 输出 U+FFFD 且 encode 不崩（v3.110）', () => {
     const cases = ['a\ud800b', 'a\udfff b', '😀\ud800', '\udfff😀', '正常文本😀🎉', '&amp;\ud800&lt;']
@@ -8173,11 +8429,10 @@ console.log('========================================\n');
     assertEqual(out.includes('😀'), true, '完整代理对保留')
   })
 
-  console.log('\n📂 109. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）')
+  console.log('\n📂 115. 深度 Fuzz 四轮（过滤引擎组合/HTML 畸形/自定义 got/实体映射完整性）')
 
   await test('Fuzz-过滤: 随机 filter 配置 × 随机数据 → listfilter 不崩且返回 boolean', () => {
-    let seed = 20261201
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(20261201)
     const randRe = () => {
       const r = rand()
       if (r < 0.2) return ''
@@ -8219,8 +8474,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-HTML: 随机畸形标签 htmlToMarkdown 不崩且标签剥离干净', () => {
-    let seed = 2718282
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(2718282)
     const atoms = ['<b>', '</b>', '<a href="x">', '</a>', '<img src="i">', '<br>', '<br/>', '<p>', '</p>',
       '<h1>', '<h2>', '</h1>', '<li>', '</li>', '<table>', '<td>', '<tr>', '<div>', '<span>',
       '<', '>', '</', '<>', '</>', '<a>', '文本', 'x', '&amp;', '&lt;', '😀', '<script>', '</script>', '<style>', '</style>']
@@ -8297,8 +8551,7 @@ console.log('========================================\n');
     const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok') })
     await new Promise(r => server.listen(0, r))
     const port = server.address().port
-    let seed = 111111
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(111111)
     const randUrl = () => {
       const r = rand()
       if (r < 0.3) return `http://127.0.0.1:${port}/ok`
@@ -8335,8 +8588,7 @@ console.log('========================================\n');
   })
 
   await test('Fuzz-时间: checkTimeCompiled 随机 compiled × 随机 group 不崩', () => {
-    let seed = 99999
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(99999)
     const mkCompiled = () => {
       const r = rand()
       if (r < 0.25) return null
@@ -8356,7 +8608,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 110. 边界精确值二（官方 got 响应体/getFilePath 200 字节/跨日边界）')
+  console.log('\n📂 116. 边界精确值二（官方 got 响应体/getFilePath 200 字节/跨日边界）')
 
   await test('边界: 官方 got 响应体精确读取', async () => {
     const http = require('http')
@@ -8422,7 +8674,7 @@ console.log('========================================\n');
     }
   })
 
-  console.log('\n📂 111. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）')
+  console.log('\n📂 117. 边界回归补充（负数天数/空值/TS_BOUND 下界/normUrl 空）')
 
   await test('时区回归: 数字形态字符串无效(v3.142: 字符串-1曾宿主解析成2001)', () => {
     // 数字形态字符串（负号/小数）应无效——与数字 -1/2026.5 一致（审查5-2 精神）
@@ -8477,7 +8729,7 @@ console.log('========================================\n');
     assertEqual(normUrl('http://x.com/'), 'http://x.com', '尾斜杠去除')
   })
 
-  console.log('\n📂 112. saveBatch 索引化：判重一致性 + 性能基准')
+  console.log('\n📂 118. saveBatch 索引化：判重一致性 + 性能基准')
 
   await test('统一 URL 身份：伪 URL/危险 URL 不参与判重，脏 URL 走匿名身份', () => {
     const fs = require('fs')
@@ -8486,11 +8738,11 @@ console.log('========================================\n');
     assertEqual(validUrl('java\nscript:alert(1)'), '', '危险协议不应参与判重')
     const name = 'test_identity_url_contract.json'
     const p = getFilePath(name)
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, JSON.stringify([{ url: '[object Object]', title: '旧伪URL' }]), 'utf8')
     saveBatch([{ url: {}, title: '新匿名消息' }], name)
     assertEqual(readMessages(p).length, 2, '旧伪 URL 与新脏 URL 不应互相吞掉')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('异常 getter 字段在模板/HTML/缓存路径均安全降级（v3.231）', () => {
@@ -8544,12 +8796,11 @@ console.log('========================================\n');
     benchRetry(() => {
       saveBatch(msgs, 'test_112_perf.json')
     }, 500, '5000 条 saveBatch')
-    try { require('fs').unlinkSync(getFilePath('test_112_perf.json')) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(getFilePath('test_112_perf.json'))
   })
 
   await test('一致性: saveBatch 索引判重 vs 逐条 upsert 结果一致（随机数据）', () => {
-    let seed = 20261202
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(20261202)
     // 生成含重复 id/url/无 id 的随机消息流（覆盖 id 命中/url 命中/更新/追加）
     const mkMsgs = () => {
       const msgs = []
@@ -8568,27 +8819,27 @@ console.log('========================================\n');
       const msgs = mkMsgs()
       // A: saveBatch（索引版）
       const fa = getFilePath('test_112_cmp_a.json')
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
       saveBatch(msgs, 'test_112_cmp_a.json')
       const ra = readMessages(fa).map(x => ({ id: x.id, title: x.title, url: x.url }))
       // B: 逐条 appendMessageToFile（原 _upsert 逻辑，每批同序）
       const fb = getFilePath('test_112_cmp_b.json')
-      try { require('fs').unlinkSync(fb) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fb)
       for (const msg of msgs) {
         if (msg && typeof msg === 'object' && !Array.isArray(msg)) appendMessageToFile(msg, 'test_112_cmp_b.json')
       }
       const rb = readMessages(fb).map(x => ({ id: x.id, title: x.title, url: x.url }))
       // 结果数组必须一致（顺序 + 内容）
       assertEqual(JSON.stringify(ra), JSON.stringify(rb), `第${round}轮 saveBatch 与逐条 upsert 结果应一致`)
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
-      try { require('fs').unlinkSync(fb) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
+      unlinkQuiet(fb)
     }
   })
 
   await test('一致性: 更新后索引维护（id 变化/url 失效）', () => {
     const file = 'test_112_reindex.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       saveBatch([{ id: 1, title: 'old', url: '/a' }], file)
       saveBatch([{ id: 1, title: 'new', url: '/b' }], file) // 同 id 更新，url 变化
@@ -8604,7 +8855,7 @@ console.log('========================================\n');
       assertEqual(readMessages(fp).length, 2, '混合后 2 条')
       assertEqual(isMessageInFile({ id: 1, title: 'final' }, file), true, 'id1 更新')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -8617,7 +8868,7 @@ console.log('========================================\n');
   await test('一致性: 同批内「先更新位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_update.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // msg2 就地把位置 0 的 url 由 /x.html 换成 /y.html；msg3 再按「更新后的 url」做 url-only 匹配，
       // 必须命中位置 0。若更新路径未同步 identOf[0]，msg3 会读到旧身份（/x.html）→ 匹配失败 → 误追加。
@@ -8636,14 +8887,14 @@ console.log('========================================\n');
       assertEqual(disk.length, 1, `落盘应同为 1 条，实际 ${disk.length} 条`)
       assertEqual(disk[0].title, 'urlonly', '落盘记录应为就地更新后的 url-only 消息')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   await test('一致性: 同批内「先新增位置后匹配」身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_push.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // msg1 新增位置 0（id 身份、带 url /z.html）；msg2 按该 url 做 url-only 匹配必须命中位置 0。
       // 若新增路径未登记 identOf[0]，候选回调会读到 undefined 身份而抛错（或漏匹配成 2 条）。
@@ -8660,14 +8911,14 @@ console.log('========================================\n');
       assertEqual(disk.length, 1, `落盘应同为 1 条，实际 ${disk.length} 条`)
       assertEqual(disk[0].title, 'B', '落盘记录应为就地更新后的 url-only 消息')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   await test('一致性: 同批内 urlOnlyMap 候选（c2 分支）身份缓存同步（identOf 漂移必失败）', () => {
     const file = 'test_112_identof_c2.json'
     const fp = getFilePath(file)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       // c2 分支（xbk_message_store.js 的 firstIndex(urlOnlyMap, identity.url, …)）只在
       // 「缓存位置上挂着纯 url 身份」时才有候选。构造：脏缓存位置 0 是 id 身份（id c1 + url /c2.html），
@@ -8687,11 +8938,11 @@ console.log('========================================\n');
       assertEqual(r[0].title, 'idagain', '位置 0 标题应为末条消息（就地更新）')
       assertEqual(r[0].url, '/c2.html', '位置 0 url 应保持 /c2.html')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
-  console.log('\n📂 113. saveBatch 索引化强化验证（脏缓存/多批/同键多条 vs 旧逻辑）')
+  console.log('\n📂 119. saveBatch 索引化强化验证（脏缓存/多批/同键多条 vs 旧逻辑）')
 
   await test('一致性-强化: 30 轮随机（脏缓存+多批+同键多条）索引版 vs 旧 findIndex 逻辑', () => {
     // 旧逻辑精确复刻 _findDedupIndex（findIndex 顺序语义）——作为对照基准
@@ -8701,8 +8952,7 @@ console.log('========================================\n');
       return (isId(qid) && (String(mid) === String(qid) || (!isId(mid) && mm.url && message.url && normUrl(mm.url) === normUrl(message.url)))) ||
                (!isId(qid) && message.url && normUrl(mm.url) === normUrl(message.url))
     })
-    let seed = 424242
-    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const rand = makeRand(424242)
     const randMsg = () => {
       const r = rand()
       const msg = { title: 'T' + Math.floor(rand() * 1000) }
@@ -8728,11 +8978,11 @@ console.log('========================================\n');
       }
       // A：saveBatch（索引版）
       const fa = getFilePath(fname)
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
       require('fs').writeFileSync(fa, JSON.stringify(dirty))
       for (const batch of batches) saveBatch(batch, fname)
       const ra = readMessages(fa).map(x => ({ id: x.id === undefined ? undefined : String(x.id), title: x.title, url: x.url }))
-      try { require('fs').unlinkSync(fa) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fa)
       // B：旧 findIndex 逻辑（同数据）
       const arr = dirty.map(x => ({ ...x }))
       for (const batch of batches) {
@@ -8750,7 +9000,7 @@ console.log('========================================\n');
     // 场景：同 url 多条无 id 脏缓存，首条被 id 消息覆盖，再有无 id 同 url 消息
     const fname = 'test_113_dirty.json'
     const fp = getFilePath(fname)
-    try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       require('fs').writeFileSync(fp, JSON.stringify([{ title: 'x1', url: '/u/1' }, { title: 'x2', url: '/u/1' }]))
       saveBatch([{ id: 5, title: 'id5', url: '/u/1' }], fname)
@@ -8760,12 +9010,12 @@ console.log('========================================\n');
       assertEqual(r[0].title, 'noId', '无 id 消息更新了 index 0（id5 那条，url 匹配首个）')
       assertEqual(r[1].title, 'x2', 'x2 保留')
     } finally {
-      try { require('fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
-  // ==================== 100. v3.156 配置空白/normUrl/更新日志修复 ====================
-  console.log('\n📂 100. v3.156 修复')
+  // ==================== 120. v3.156 配置空白/normUrl/更新日志修复 ====================
+  console.log('\n📂 120. v3.156 修复')
 
   await test('空白 pingbibiaoti → 编译为 null + validateConfig 警告（#1/#6）', () => {
     const c = compileRules({ pingbibiaoti: '   ' })
@@ -8785,26 +9035,24 @@ console.log('========================================\n');
   })
 
   await test('normUrl 保留业务 query，仅忽略追踪参数（v3.271）', () => {
-    assertEqual(normUrl('/a?x=1'), 'a?x=1')
-    assertEqual(normUrl('/a?x=2'), 'a?x=2')
-    assertEqual(normUrl('/a?x=1&utm_source=x'), 'a?x=1')
-    assertEqual(normUrl('/a#sec'), 'a')
-    assertEqual(normUrl('https://A.com/p?u=1&t=2#top'), 'https://a.com/p?u=1&t=2')
-    const fs = require('fs')
+    assertEqual(normUrl('/a?x=1'), 'a?x=1', 'normUrl(\'/a?x=1\') 应等于 \'a?x=1\'')
+    assertEqual(normUrl('/a?x=2'), 'a?x=2', 'normUrl(\'/a?x=2\') 应等于 \'a?x=2\'')
+    assertEqual(normUrl('/a?x=1&utm_source=x'), 'a?x=1', 'normUrl(\'/a?x=1&utm_source=x\') 应等于 \'a?x=1\'')
+    assertEqual(normUrl('/a#sec'), 'a', 'normUrl(\'/a#sec\') 应等于 \'a\'')
+    assertEqual(normUrl('https://A.com/p?u=1&t=2#top'), 'https://a.com/p?u=1&t=2', 'normUrl(\'https://A.com/p?u=1&t=2#top\') 应等于 \'https://a.com/p?u=1&t=2\'')
     const p = getFilePath('test_q156.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ url: '/a?x=1', title: '同' }], 'test_q156.json')
     saveBatch([{ url: '/a?x=2', title: '同' }], 'test_q156.json')
     assertEqual(readMessages(p).length, 2, '不同业务 query 不应判重')
     saveBatch([{ url: '/a?x=1&utm_source=x', title: '同' }], 'test_q156.json')
     assertEqual(readMessages(p).length, 2, '仅追踪参数差异应判重')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('saveBatch 同内容更新不误报"更新缓存记录"（#5）', () => {
-    const fs = require('fs')
     const p = getFilePath('test_ts156.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     saveBatch([{ id: 1, title: 'A' }], 'test_ts156.json')
     const logs = []
     const orig = console.log
@@ -8815,11 +9063,11 @@ console.log('========================================\n');
       console.log = orig
     }
     assertEqual(logs.some(l => l.includes('更新缓存记录')), false, '内容相同不应报更新（曾因 timestamp 差异误报）')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
-  // ==================== 101. v3.157 修复 ====================
-  console.log('\n📂 101. v3.157 修复')
+  // ==================== 121. v3.157 修复 ====================
+  console.log('\n📂 121. v3.157 修复')
 
   await test('anonKey 字段差异不合并（#2/41）', () => {
     const k1 = anonKey('同标题', '同内容', null, null, 'pic1', '京东', '9.9', 'A牌', '分类')
@@ -8840,11 +9088,11 @@ console.log('========================================\n');
   await test('readMessages 数组元素被排除（#21）', () => {
     const fs = require('node:fs')
     const p = getFilePath('test_arr157.json')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
     fs.writeFileSync(p, JSON.stringify([{ id: 1, title: 'A' }, [1, 2], 'str', null]), 'utf8')
     const r = readMessages(p)
     assertEqual(r.length, 1, '数组/字符串/null 应被排除，仅保留对象')
-    try { fs.unlinkSync(p) } catch (e) {}
+    unlinkQuiet(p)
   })
 
   await test('getFileName 坏源命名（#10/49）', () => {
@@ -8898,11 +9146,11 @@ console.log('========================================\n');
   })
 
   // ==================== C002：sanitizeDecodedHtml ReDoS/性能 ====================
-  console.log('\n📂 C002 sanitizeDecodedHtml ReDoS/性能')
+  console.log('\n📂 122. C002 sanitizeDecodedHtml ReDoS/性能')
 
   await test('sanitizeDecodedHtml 正常 <script>...</script> 被移除', () => {
-    assertEqual(sanitizeDecodedHtml('a<script>alert(1)</script>b'), 'ab')
-    assertEqual(sanitizeDecodedHtml('<svg><script>x</script></svg>'), '')
+    assertEqual(sanitizeDecodedHtml('a<script>alert(1)</script>b'), 'ab', 'sanitizeDecodedHtml(\'a<script>alert(1)</script>b\') 应等于 \'ab\'')
+    assertEqual(sanitizeDecodedHtml('<svg><script>x</script></svg>'), '', 'sanitizeDecodedHtml(\'<svg><script>x</script></svg>\') 应等于 \'\'')
   })
 
   await test('sanitizeDecodedHtml 错配闭合标签不吞有效内容（CodeAnt L630）', () => {
@@ -9369,12 +9617,16 @@ console.log('========================================\n');
       for (const v of ['2026-08-01 ', ' 2026-08-01', '2026-08-01\n', '2026-08-01\t', '2026/08/01 ']) {
         assertEqual(daysComputed(v), baseline, `带空白日期应按 UTC 零点解析: ${JSON.stringify(v)}`)
       }
+      // C4-022：原收尾断言 `new Date(Date.UTC(2026,7,1)).getTime() === Date.UTC(2026,7,1)` 验的是
+      // Date 的定义（连本模块都不 require 也恒真），与本用例契约无关。换成同一「UTC 零点」契约的
+      // 两条真实输入：显式 ISO-Z 形态与纯日期同值；16:00Z 仍属前一天（宿主本地时区不得参与）。
+      assertEqual(daysComputed('2026-08-01T00:00:00Z'), baseline, '显式 ISO-Z 形态应与纯日期同值')
+      assertEqual(daysComputed('2026-07-31T16:00:00Z'), 3, 'UTC 口径：16:00Z 仍属 7/31（宿主本地时区不得参与）')
     } finally {
       Date.now = origNow
     }
     // 数字类型不受 trim 影响（String(number) 本无空白）
     assertEqual(daysComputed(1755300000), daysComputed('1755300000'), '数字与字符串时间戳口径一致')
-    assertEqual(new Date(Date.UTC(2026, 7, 1)).getTime(), Date.UTC(2026, 7, 1), 'UTC 零点常量自检')
   })
 
   await test('parseTime 全空白字符串 → 无效（P1-02：trim 后空串返回 null）', () => {
@@ -9526,7 +9778,7 @@ console.log('========================================\n');
     // 组/其他用户无需访问该测试缓存目录，且 0o755 会被 SonarCloud S2612 判为过宽权限
     // （本行一旦被某个 PR 改动就会变成「新代码」告警，正是 #140 门禁变红的同款触发方式）。
     require('fs').chmodSync(CACHE, 0o700)
-    try { require('fs').unlinkSync(p) } catch (e) { /* 清理容错: 只读目录下文件未创建 */ }
+    unlinkQuiet(p)
     assertEqual(threw, false, '恢复写入抛错时 readMessages 不得抛出（v3.236 降级）')
     assertEqual(Array.isArray(result) && result.length === 1 && result[0].id === 'restore-ok', true, '应返回内存快照而非清空')
   })
@@ -9536,7 +9788,6 @@ console.log('========================================\n');
   // ============================================================
 
   await test('B8-F3: 墓碑瞬时读失败不永久记忆——下次调用重试并恢复防重放身份', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f3_retry.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
@@ -9571,16 +9822,15 @@ console.log('========================================\n');
       MessageStore._readTombstoneData = realRead
       MessageStore._tombstoneLoaded.delete(fp)
       MessageStore._tombstones.delete(fp)
-      try { fsmod.unlinkSync(seenPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(seenPath)
     }
   })
 
   await test('B8-F3: 墓碑文件确认缺失仍置位（不做每次判重的同步磁盘 IO）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f3_missing.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp + '.seen.json')
     const realRead = MessageStore._readTombstoneData
     let calls = 0
     MessageStore._readTombstoneData = function (p) { calls++; return realRead.call(this, p) }
@@ -9614,7 +9864,7 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(guardPath), false, '陈旧且持有进程已退出的目录级哨兵应被启动清理回收')
     } finally {
-      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(guardPath)
     }
   })
 
@@ -9641,7 +9891,7 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(guardPath), true, '活跃进程持有的哨兵即使 mtime 陈旧也不得被删')
     } finally {
-      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(guardPath)
     }
   })
 
@@ -9670,7 +9920,7 @@ console.log('========================================\n');
       assertEqual(fsmod.existsSync(guardPath), false, 'starttime 与真实值不符（PID 复用）的陈旧哨兵应视为持有者已退出并回收')
     } finally {
       MessageStore._getTombstoneProcessStart = realStart
-      try { fsmod.unlinkSync(guardPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(guardPath)
     }
   })
 
@@ -9704,7 +9954,7 @@ console.log('========================================\n');
       assertEqual(fsmod.existsSync(fp), true, '合法缓存文件必须保留——被启动清理删除即整份判重记录丢失（下一轮全量重推）')
       assertEqual(fsmod.readFileSync(fp, 'utf8'), body, '合法缓存文件内容不得被改动')
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -9722,7 +9972,7 @@ console.log('========================================\n');
       MessageStore._cleanupResidualTombstoneLocks(dir)
       assertEqual(fsmod.existsSync(reclaimPath), false, '陈旧且持有进程已退出的 .reclaim 残留应被回收（回退该判据即红）')
     } finally {
-      try { fsmod.unlinkSync(reclaimPath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(reclaimPath)
     }
   })
 
@@ -9732,9 +9982,9 @@ console.log('========================================\n');
     const fp = getFilePath(name)
     const dir = path.dirname(fp)
     const raw = '{ 这不是合法 JSON'
-    const wipeBaks = () => { try { for (const n of fsmod.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) fsmod.unlinkSync(path.join(dir, n)) } catch (e) { /* 忽略 */ } }
+    const wipeBaks = () => { for (const n of fsmod.readdirSync(dir)) if (n.startsWith(name + '.corrupt.')) unlinkQuiet(path.join(dir, n)) }
     wipeBaks()
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     // 造一个「文件存在但内容不可解析」的损坏缓存：readMessages 走 F1 隔离重建分支
     fsmod.writeFileSync(fp, raw)
     delete MessageStore._memoryCache[fp]
@@ -9751,7 +10001,7 @@ console.log('========================================\n');
     assertEqual(accepted, true, '隔离重建后 saveBatch 必须放行（旧行为 = 永久拒绝 → 整轮零推送）')
     assertEqual(JSON.parse(fsmod.readFileSync(fp, 'utf8')).some((m) => m.id === 'f5-unblocked'), true, '解除保护后新条目必须真正落盘')
     wipeBaks()
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
   })
 
   await test('B8-F5: 成功读回磁盘后写闸门自动解除（既有解除路径不退化）', () => {
@@ -9775,8 +10025,8 @@ console.log('========================================\n');
   await test('B8-F-05: saveBatch 返回布尔——成功/空入参/无效身份/落盘失败口径一致', () => {
     const name = 'test_b8_f05_ret.json'
     const fp = getFilePath(name)
-    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
-    try { require('node:fs').unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
+    unlinkQuiet(fp + '.seen.json')
     MessageStore._memoryCache = {}
     MessageStore._memoCount = 0
     MessageStore._verified.clear()
@@ -9801,8 +10051,8 @@ console.log('========================================\n');
     assertEqual(MessageStore._readFailed[fp], undefined, '隔离重建后写闸门必须解除')
     const f05Baks = require('node:fs').readdirSync(path.dirname(fp)).filter((n) => n.startsWith(name + '.corrupt.'))
     assertEqual(f05Baks.length, 1, '解析失败必须留下隔离备份（只隔离不删除）')
-    for (const n of f05Baks) { try { require('node:fs').unlinkSync(path.join(path.dirname(fp), n)) } catch (e) { /* 忽略 */ } }
-    try { require('node:fs').unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    for (const n of f05Baks) { unlinkQuiet(path.join(path.dirname(fp), n)) }
+    unlinkQuiet(fp)
     delete MessageStore._readFailed[fp]
     delete MessageStore._memoryCache[fp]
     MessageStore._verified.delete(fp)
@@ -9813,10 +10063,9 @@ console.log('========================================\n');
   })
 
   await test('B8-F-02: 索引被原地改写后 has 不得误判为已存在（陈旧索引）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_stale.json'
     const fp = getFilePath(name)
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     saveMessages(fp, [{ id: 'f02-a', title: 'A' }, { id: 'f02-b', title: 'B' }, { id: 'f02-c', title: 'C' }])
     const arr = readMessages(fp)
     // 先让 _identityIndex 建立并缓存该数组的索引
@@ -9839,7 +10088,6 @@ console.log('========================================\n');
   // R4：B8 原「等价性对照」全程不改写数组 → 任何实现都通过（零区分力），替换为**逐形态**的
   // 原地改写 + 线性扫描 oracle 对拍。oracle = _indexHasIdentityDirect（零索引、独立实现）。
   await test('B8-F-02: 原地改写各形态下索引判重必须与线性扫描 oracle 逐值一致', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_oracle.json'
     const fp = getFilePath(name)
     const seed = () => [
@@ -9883,7 +10131,7 @@ console.log('========================================\n');
     ]
     try {
       for (const form of forms) {
-        try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+        unlinkQuiet(fp)
         saveMessages(fp, seed())
         const arr = readMessages(fp)
         assertEqual(isMessageInFile({ id: 'f02-a' }, name), true, `前置：${form.label} 前索引必须已建立`)
@@ -9896,19 +10144,18 @@ console.log('========================================\n');
         }
       }
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
   // R4 性能守位（B8 的取舍理由：逐位复检每次 ~20ms 会打死热路径）：修复只为「每个数组版本」
   // 付一次未命中复检，之后稳态 O(1)。断言重建次数上界——把复检改成「每次未命中都重建」时必红。
   await test('B8-F-02: 批量未命中不得每次重建索引（每数组版本至多一次 O(n) 复检）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_perf.json'
     const fp = getFilePath(name)
     const msgs = []
     for (let i = 0; i < 2000; i++) msgs.push({ id: 'f02p-' + i })
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     saveMessages(fp, msgs)
     const arr = readMessages(fp)
     assertEqual(isMessageInFile({ id: 'f02p-0' }, name), true, '前置：索引已建立且命中')
@@ -9922,7 +10169,7 @@ console.log('========================================\n');
       }
     } finally {
       MessageStore._buildIdentityIndex = realBuild
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
     assertEqual(builds >= 1, true, '首次未命中必须做一次全量复检（否则原地写入的新身份查不到——F-02 修复机制被删即红）')
     assertEqual(builds <= 2, true, `1000 次未命中最多重建 1~2 次索引，实际 ${builds} 次（每次未命中都重建 = O(n²)，B8 实测打死热路径）`)
@@ -9934,10 +10181,9 @@ console.log('========================================\n');
   // 但同样与线性扫描 oracle 不一致）。修法：未命中路径补两条旋转抽查窗（引用层 32 位置 / 身份层
   // 2 位置；n <= 8 时覆盖全表 ⇒ 首次未命中即精确）。两条窗都停掉时本条真红。
   await test('B8-F-02: 未命中重建后再原位替换非首元素，has 必须自愈（W2 粘滞反例）', () => {
-    const fsmod = require('node:fs')
     const name = 'test_b8_f02_sticky.json'
     const fp = getFilePath(name)
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     saveMessages(fp, [{ id: 'st-a' }, { id: 'st-b' }, { id: 'st-c' }])
     const arr = readMessages(fp)
     const oracle = (m) => MessageStore._indexHasIdentityDirect(arr, m)
@@ -9959,7 +10205,7 @@ console.log('========================================\n');
         assertEqual(got, oracle(p), `probe=${JSON.stringify(p)}：has()=${got} 必须等于 oracle=${oracle(p)}`)
       }
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -10032,16 +10278,40 @@ console.log('========================================\n');
   const { App: V3App, truncateUtf16: v3Truncate } = require('./xbk_function_v3.js')
   const fc = require('fast-check')
 
-  // 参考实现（与源码 _enabledFlag 同口径，仅用于属性测试对照）
-  // v3.267：同步空串/纯空白串关闭口径 + 移除 truthiness/规范化重叠
-  function refEnabledFlag (cfg) {
-    if (!cfg) return false
-    const en = cfg.enabled
-    const s = en == null ? '' : String(en).trim().toLowerCase()
-    return Boolean(en) && s !== '' && s !== 'false' && s !== '0'
+  // C4-004：fast-check 不给 seed 时默认随机（实测两次首值不同），与全文件 26 处 LCG 固定 seed
+  // 的确定性口径相反 —— 一次红过的属性失败下次可能不再复现。本门禁扫描全文 fc.assert 站点，
+  // 任一处缺固定 seed 即红。
+  // 两个假绿口子都要堵：① needle 用字符串拼接，否则门禁自身源码里的字面量会被最后一段吞进去，
+  // 在门禁用例之前新插一个无 seed 站点照样绿；② 逐段先剔注释（行/块）再判，否则删掉 seed 后
+  // 补一句含 needle 的 TODO 注释也能绿。
+  await test('属性测试: 全部 fc.assert 固定 seed（跨运行可复现）', () => {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const SITE = 'fc.' + 'assert('
+    const NEEDLE = 'seed' + ': 20260801'
+    const stripComments = (s) => s
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+    const sites = src.split(SITE).slice(1)
+    assert.ok(sites.length >= 8, `fc.assert 站点数不应减少：${sites.length}`)
+    sites.forEach((seg, i) => {
+      assertEqual(stripComments(seg).includes(NEEDLE), true,
+        `第 ${i + 1} 处 fc.assert 未固定 ${NEEDLE}（默认随机 seed，失败不可复现；注释里的字样不算）`)
+    })
+  })
+
+  // C4-003：这里原先放的是 xbk_app.js `_enabledFlag` 的逐字复制（仅函数名/尾逗号不同），
+  // 属性断言实际退化成 f(x) === f(x)：抄错或照抄同一处误解都照样绿。改为两个不同源判据：
+  // ① 规范词表 oracle —— 关闭值集合是**数据**（来自配置注释与上方表格用例），
+  //    不复制实现的 Boolean(en) 短路/三分支控制流；
+  // ② 变形不变式 —— 判定只依赖「trim + 小写」规范化与字符串化，独立于具体分支写法。
+  const OFF_ENABLED_WORDS = new Set(['', 'false', '0'])
+  function specEnabledFlag (rawEnabled) {
+    if (rawEnabled === undefined || rawEnabled === null || Number.isNaN(rawEnabled)) return false
+    const norm = String(rawEnabled).trim().toLowerCase()
+    return !OFF_ENABLED_WORDS.has(norm)
   }
 
-  await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', async () => {
+  await test('_enabledFlag：表格驱动——全部关闭/开启形态（杀 L2763+L2819 共 35 存活）', () => {
     const cases = [
     // [输入, 预期开启]
       [undefined, false], [null, false], [{}, false], [{ enabled: undefined }, false],
@@ -10060,22 +10330,46 @@ console.log('========================================\n');
     }
   })
 
-  await test('_enabledFlag：属性测试——任意输入与参考实现一致（不变量）', async () => {
+  await test('_enabledFlag：属性测试——规范词表 oracle + 变形不变式（不复制生产实现）', () => {
+    // ① 规范词表 oracle：关闭 = 缺省/null/NaN + 规范化后命中 {''/'false'/'0'}；其余开启。
+    //    生成器显式覆盖空白串/大小写变体，避免只靠随机串撞不到边界。
+    const closedWords = fc.constantFrom('', ' ', '  ', '\t', '\n', '\r\n', 'false', 'FALSE', 'False', ' false ', '0', ' 0 ', 'true', '1', 'yes', 'x')
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(undefined),
         fc.constant(null),
         fc.constant({}),
+        fc.constant({ enabled: undefined }),
+        fc.constant({ enabled: null }),
+        fc.constant({ enabled: NaN }),
         fc.record({ enabled: fc.oneof(fc.boolean(), fc.integer(), fc.string({ maxLength: 10 })) }),
-        fc.record({ enabled: fc.oneof(fc.constant(''), fc.constant(0), fc.constant('0'), fc.constant('false'), fc.constant(' true ')) })
+        fc.record({ enabled: closedWords })
       ),
       (cfg) => {
-        assertEqual(V3App._enabledFlag(cfg), refEnabledFlag(cfg), `cfg=${JSON.stringify(cfg)}`)
+        const got = V3App._enabledFlag(cfg)
+        assertEqual(typeof got, 'boolean', `必须返回布尔（cfg=${JSON.stringify(cfg)}）`)
+        assertEqual(got, specEnabledFlag(cfg && cfg.enabled), `cfg=${JSON.stringify(cfg)}：判定必须等于规范词表口径`)
       }
-    ), { numRuns: 400 })
+    ), { numRuns: 400, seed: 20260801 })
+    // ② 变形不变式：判定只依赖 trim+小写规范化 —— 大小写/首尾空白不得改变结果
+    fc.assert(fc.property(fc.string({ maxLength: 12 }), (s) => {
+      const base = V3App._enabledFlag({ enabled: s })
+      assertEqual(V3App._enabledFlag({ enabled: '  ' + s.toUpperCase() + '\t' }), base,
+        `大小写/首尾空白不得改变判定：${JSON.stringify(s)}`)
+      assertEqual(V3App._enabledFlag({ enabled: ' ' + s + ' ' }), base,
+        `首尾空白不得改变判定：${JSON.stringify(s)}`)
+    }), { numRuns: 400, seed: 20260801 })
+    // ③ 字符串化不变式：同一标量按数值/布尔传入与按字符串传入判定一致
+    fc.assert(fc.property(
+      fc.oneof(fc.boolean(), fc.integer(), fc.double({ noNaN: true }), fc.string({ maxLength: 6 })),
+      (v) => {
+        assertEqual(V3App._enabledFlag({ enabled: v }), V3App._enabledFlag({ enabled: String(v) }),
+          `字符串化不得改变判定：${String(v)}`)
+      }
+    ), { numRuns: 300, seed: 20260801 })
   })
 
-  await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', async () => {
+  await test('truncateUtf16：属性测试——任意字符串截断后无孤立代理且长度不超 max', () => {
     fc.assert(fc.property(
       fc.string({ maxLength: 150 }),
       fc.integer({ min: 1, max: 60 }),
@@ -10094,10 +10388,10 @@ console.log('========================================\n');
           }
         }
       }
-    ), { numRuns: 400 })
+    ), { numRuns: 400, seed: 20260801 })
   })
 
-  await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', async () => {
+  await test('_diskMinFree：表格驱动——边界配置解析（Utils.num 语义）', () => {
     const D = 50 * 1024 * 1024
     const cases = [
       [undefined, D],
@@ -10119,7 +10413,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_diskMinFree：属性测试——任意输入返回 null 或正数有限（不变量）', async () => {
+  await test('_diskMinFree：属性测试——任意输入返回 null 或正数有限（不变量）', () => {
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(undefined),
@@ -10134,10 +10428,10 @@ console.log('========================================\n');
           assert.ok(Number.isFinite(r) && r > 0, `应返回正数有限，实际 ${r}（cfg=${JSON.stringify(cfg)}）`)
         }
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
-  await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', async () => {
+  await test('_validateTplConfig：合法模板零警告 + 非法占位符警告（表格驱动）', () => {
     const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
     // 合法模板：全部占位符在支持列表内
@@ -10156,7 +10450,7 @@ console.log('========================================\n');
     }
   })
 
-  await test('_validateTplConfig：属性测试——任意模板不崩溃，合法占位符不产生警告', async () => {
+  await test('_validateTplConfig：属性测试——任意模板不崩溃，合法占位符不产生警告', () => {
     const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
       fc.assert(fc.property(
@@ -10176,13 +10470,13 @@ console.log('========================================\n');
             assert.ok(!warns.some(w => w.includes('含占位符')), `不应有占位符警告: ${JSON.stringify(warns)}`)
           }
         }
-      ), { numRuns: 200 })
+      ), { numRuns: 200, seed: 20260801 })
     } finally {
       Config.template = saved === undefined ? undefined : JSON.parse(saved)
     }
   })
 
-  await test('_safeCounter：表格驱动——计数归一化边界', async () => {
+  await test('_safeCounter：表格驱动——计数归一化边界', () => {
     const cases = [
       [0, 0], [1, 1], [999, 999], [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
       [-1, 0], [1.5, 0], [NaN, 0], [Infinity, 0], [-Infinity, 0],
@@ -10193,37 +10487,37 @@ console.log('========================================\n');
     }
   })
 
-  await test('_safeCounter：属性测试——任意输入返回非负整数（不变量）', async () => {
+  await test('_safeCounter：属性测试——任意输入返回非负整数（不变量）', () => {
     fc.assert(fc.property(
       fc.oneof(fc.integer(), fc.double(), fc.boolean(), fc.string(), fc.constant(null), fc.constant(undefined), fc.constant(NaN), fc.constant(Infinity)),
       (v) => {
         const r = V3App._safeCounter(v)
         assert.ok(Number.isInteger(r) && r >= 0 && r <= Number.MAX_SAFE_INTEGER, `应返回非负整数，实际 ${r}（输入 ${JSON.stringify(v)}）`)
       }
-    ), { numRuns: 300 })
+    ), { numRuns: 300, seed: 20260801 })
   })
 
-  await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', async () => {
+  await test('_normalizeReportState：表格驱动——损坏/异常输入归一化', () => {
     const blank = () => V3App._blankReportState()
     // 非对象 → blank
-    assertEqual(JSON.stringify(V3App._normalizeReportState(null)), JSON.stringify(blank()))
-    assertEqual(JSON.stringify(V3App._normalizeReportState(undefined)), JSON.stringify(blank()))
-    assertEqual(JSON.stringify(V3App._normalizeReportState(42)), JSON.stringify(blank()))
-    assertEqual(JSON.stringify(V3App._normalizeReportState('x')), JSON.stringify(blank()))
-    assertEqual(JSON.stringify(V3App._normalizeReportState([1, 2])), JSON.stringify(blank()))
+    assertEqual(JSON.stringify(V3App._normalizeReportState(null)), JSON.stringify(blank()), 'JSON.stringify(V3App._normalizeReportState(null)) 应等于 JSON.stringify(blank())')
+    assertEqual(JSON.stringify(V3App._normalizeReportState(undefined)), JSON.stringify(blank()), 'JSON.stringify(V3App._normalizeReportState(undefined)) 应等于 JSON.stringify(blank())')
+    assertEqual(JSON.stringify(V3App._normalizeReportState(42)), JSON.stringify(blank()), 'JSON.stringify(V3App._normalizeReportState(42)) 应等于 JSON.stringify(blank())')
+    assertEqual(JSON.stringify(V3App._normalizeReportState('x')), JSON.stringify(blank()), 'JSON.stringify(V3App._normalizeReportState(\'x\')) 应等于 JSON.stringify(blank())')
+    assertEqual(JSON.stringify(V3App._normalizeReportState([1, 2])), JSON.stringify(blank()), 'JSON.stringify(V3App._normalizeReportState([1, 2])) 应等于 JSON.stringify(blank())')
     // 正常对象
     const ok = V3App._normalizeReportState({ date: '2026-08-13', total: 5, dedup: '3', filtered: -1, pushed: 1.5, failed: true, truncated: 'abc' })
-    assertEqual(ok.date, '2026-08-13')
-    assertEqual(ok.total, 5)
-    assertEqual(ok.dedup, 3)
+    assertEqual(ok.date, '2026-08-13', 'ok.date 应等于 \'2026-08-13\'')
+    assertEqual(ok.total, 5, 'ok.total 应等于 5')
+    assertEqual(ok.dedup, 3, 'ok.dedup 应等于 3')
     assertEqual(ok.filtered, 0, '负数归 0')
     assertEqual(ok.pushed, 0, '小数归 0')
     assertEqual(ok.failed, 0, '布尔归 0')
     assertEqual(ok.truncated, 0, '非法字符串归 0')
     // pending 正常
     const withPending = V3App._normalizeReportState({ total: 1, pending: { total: 9, dedup: '2' } })
-    assertEqual(withPending.pending.total, 9)
-    assertEqual(withPending.pending.dedup, 2)
+    assertEqual(withPending.pending.total, 9, 'withPending.pending.total 应等于 9')
+    assertEqual(withPending.pending.dedup, 2, 'withPending.pending.dedup 应等于 2')
     // _loadReportState 的严格校验覆盖 pending 内部字段和 date 类型；归一化函数保持兼容旧调用口径
     // pending 损坏（非对象）→ 警告 + 空 pending
     const warns = []
@@ -10238,7 +10532,7 @@ console.log('========================================\n');
     assert.ok(warns.length >= 1, '损坏 pending 应告警')
   })
 
-  await test('_normalizeReportState：属性测试——任意输入不崩溃且计数合法（不变量）', async () => {
+  await test('_normalizeReportState：属性测试——任意输入不崩溃且计数合法（不变量）', () => {
     fc.assert(fc.property(
       fc.oneof(
         fc.constant(null), fc.constant(undefined), fc.constant(42), fc.constant('x'),
@@ -10270,10 +10564,10 @@ console.log('========================================\n');
           console.warn = oldWarn
         }
       }
-    ), { numRuns: 200 })
+    ), { numRuns: 200, seed: 20260801 })
   })
 
-  await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', async () => {
+  await test('_validateTplConfig：全部支持占位符不告警（CodeRabbit 建议——杀 SUPPORTED_TPL_KEYS 15 个 StringLiteral）', () => {
     const saved = Config.template === undefined ? undefined : JSON.stringify(Config.template)
     try {
       const keys = ['分类名', '分类ID', '标题', '链接', '日期', '时间', '楼主', '类目', '内容', '价格', '商城', '品牌', '图片', 'Html内容', 'Markdown内容']
@@ -10296,7 +10590,7 @@ console.log('========================================\n');
   // 目标：_now 单调时钟(v3.251/253)、_memoSet LRU(v3.260)、
   //       _contentChangedIgnoringTs(v3.156)、墓碑身份应用/索引、_localStamp
   // ============================================================
-  console.log('\n📂 补测：单调时钟 / 内存缓存 LRU / 判重深排 / 墓碑身份')
+  console.log('\n📂 123. 补测：单调时钟 / 内存缓存 LRU / 判重深排 / 墓碑身份')
 
   await test('P4 _now 同毫秒连续调用严格单调递增（v3.251/253 时钟回拨修复）', () => {
     MessageStore._nowLastTs = undefined
@@ -10424,15 +10718,15 @@ console.log('========================================\n');
     assertEqual(ts.idWithUrl.has('https://a.com/x'), true, 'idWithUrl 集合应含 url')
     assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ id: 5, url: 'https://a.com/x' })), false, '重复写入应返回 false')
     // 仅 id：idWithUrl 不新增
-    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ id: 6 })), true)
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ id: 6 })), true, 'MessageStore._applyTombstoneIdentity(ts, gid({ id: 6 })) 应等于 true')
     assertEqual(ts.idWithUrl.size, 1, '无 url 的 id 不得写 idWithUrl')
     // 纯 url
-    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ url: 'https://b.com/y' })), true)
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ url: 'https://b.com/y' })), true, 'MessageStore._applyTombstoneIdentity(ts, gid({ url: \'https://b.com/y\'… 应等于 true')
     assertEqual(ts.urlOnly.has('https://b.com/y'), true, 'url 类应写 urlOnly')
     assertEqual(MessageStore._applyTombstoneIdentity(ts, gid({ url: 'https://b.com/y' })), false, '重复 url 应返回 false')
     // anon
     const anon = gid({ title: 'anon-msg' })
-    assertEqual(MessageStore._applyTombstoneIdentity(ts, anon), true)
+    assertEqual(MessageStore._applyTombstoneIdentity(ts, anon), true, 'MessageStore._applyTombstoneIdentity(ts, anon) 应等于 true')
     assertEqual(ts.anon.has(anon.key), true, 'anon 应写匿名键')
     assertEqual(MessageStore._applyTombstoneIdentity(ts, anon), false, '重复 anon 应返回 false')
     // 无效身份
@@ -10464,7 +10758,7 @@ console.log('========================================\n');
   // 目标：_findDedupIndex、_indexHasIdentity、_evictOldestKeys、
   //       _evictTombstonesToSize、_trimTombstoneMaps、_cloneTombstones、_readTombstoneData
   // ============================================================
-  console.log('\n📂 补测 2：判重索引 / 墓碑淘汰 / 墓碑读取')
+  console.log('\n📂 124. 补测 2：判重索引 / 墓碑淘汰 / 墓碑读取')
 
   await test('P4 _findDedupIndex 统一判重：四类身份命中/未命中与防御', () => {
     assertEqual(MessageStore._findDedupIndex(null, { id: 1 }), -1, '非数组应返回 -1')
@@ -10535,10 +10829,9 @@ console.log('========================================\n');
     const name = 'test_tomb_trim_on_write.json'
     const fp = getFilePath(name)
     MessageStore._tombstoneLoaded.delete(fp)
-    const fsmod = require('node:fs')
     const lockPath = fp + '.seen.lock'
-    try { fsmod.unlinkSync(lockPath) } catch (e) { /* 忽略 */ }
-    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(lockPath)
+    unlinkQuiet(fp + '.seen.json')
     const token = MessageStore._acquireTombstoneLock(lockPath)
     assertEqual(typeof token === 'string' && token.length > 0, true, '前置：应拿到墓碑锁')
     const dropped = []
@@ -10566,7 +10859,7 @@ console.log('========================================\n');
     const fp = getFilePath('test_tomb_readdata.json')
     const fsmod = require('node:fs')
     const seen = fp + '.seen.json'
-    try { fsmod.unlinkSync(seen) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(seen)
     try {
       assertEqual(MessageStore._readTombstoneData(fp), null, '缺失应返回 null')
       fsmod.writeFileSync(seen, '{not json')
@@ -10583,7 +10876,7 @@ console.log('========================================\n');
       const d = MessageStore._readTombstoneData(fp)
       assertEqual(!!d && Array.isArray(d.id) && d.id.length === 2, true, '合法文件应解析')
     } finally {
-      try { fsmod.unlinkSync(seen) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(seen)
     }
   })
 
@@ -10592,12 +10885,12 @@ console.log('========================================\n');
   // 目标：_writeState、_writeTextAtomic、_readSafeState、
   //       _sendAlert(v3.251 lastAt 校验)、_warnLowDisk、_updateReport
   // ============================================================
-  console.log('\n📂 补测 3：状态读写 / 告警限频 / 日报更新')
+  console.log('\n📂 125. 补测 3：状态读写 / 告警限频 / 日报更新')
 
   await test('P4 _writeState 类型守卫：非对象/数组拒绝，合法对象原子落盘', () => {
     const fp = getFilePath('test_state_write.json')
     const fsmod = require('node:fs')
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     const oldWarn = console.warn
     console.warn = () => {}
     try {
@@ -10610,7 +10903,7 @@ console.log('========================================\n');
       assertEqual(JSON.parse(fsmod.readFileSync(fp, 'utf8')).lastAt, 123, '内容应正确')
     } finally {
       console.warn = oldWarn
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -10634,7 +10927,7 @@ console.log('========================================\n');
   await test('P4 _readSafeState 缺失/损坏/超限/合法四态', () => {
     const fp = getFilePath('test_state_read.json')
     const fsmod = require('node:fs')
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
     try {
       assertEqual(V3App._readSafeState(fp).status, 'missing', '缺失应 missing')
       fsmod.writeFileSync(fp, '{bad')
@@ -10650,7 +10943,7 @@ console.log('========================================\n');
       fsmod.writeFileSync(fp, JSON.stringify({ lastAt: 123 }))
       assertEqual(V3App._readSafeState(fp).status, 'ok', '合法小文件应 ok')
     } finally {
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
     }
   })
 
@@ -10682,7 +10975,6 @@ console.log('========================================\n');
   await test('P4 _sendAlert 未启用/限频内不发，lastAt=NaN 绕过限频（v3.251）', async () => {
     const saved = { alert: JSON.stringify(Config.alert), map: new Map(V3App._alertLastAtByPath) }
     const statePath = path.join(MessageStore.cacheDir, 'alert.state')
-    const fsmod = require('node:fs')
     const pusherMod = require('./xbk_function_v3.js').Pusher
     const origSend = pusherMod.send
     try {
@@ -10706,7 +10998,7 @@ console.log('========================================\n');
       pusherMod.send = origSend
       Config.alert = JSON.parse(saved.alert)
       V3App._alertLastAtByPath = saved.map
-      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(statePath)
     }
   })
 
@@ -10714,14 +11006,14 @@ console.log('========================================\n');
     const saved = { report: JSON.stringify(Config.report) }
     const statePath = path.join(MessageStore.cacheDir, 'report.state')
     const fsmod = require('node:fs')
-    try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+    unlinkQuiet(statePath)
     try {
       Config.report = { enabled: false }
       await V3App._updateReport({ total: 1, pushed: 1 })
       assertEqual(fsmod.existsSync(statePath), false, '关闭时不得写 report.state')
     } finally {
       Config.report = JSON.parse(saved.report)
-      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(statePath)
     }
   })
 
@@ -10751,7 +11043,7 @@ console.log('========================================\n');
       pusherMod.send = origSend
       Config.report = JSON.parse(saved.report)
       V3App._reportMemoryStateByPath = saved.map
-      try { fsmod.unlinkSync(statePath) } catch (e) { /* 忽略 */ }
+      unlinkQuiet(statePath)
     }
   })
 
@@ -10759,7 +11051,7 @@ console.log('========================================\n');
   // 补测 4：num 数值配置解析 + _upsert 统一更新/追加
   // 目标：num（导出零直接测试）、_upsert 防御分支/判重/墓碑拦截（v3.245 P1）
   // ============================================================
-  console.log('\n📂 补测 4：num 数值配置解析 / _upsert 统一更新')
+  console.log('\n📂 126. 补测 4：num 数值配置解析 / _upsert 统一更新')
 
   await test('P4 num 数值配置解析：脏类型回退默认、有效数字/数字串保留', () => {
     assertEqual(num(undefined), undefined, 'undefined 应回退默认')
@@ -10782,11 +11074,10 @@ console.log('========================================\n');
   })
 
   await test('P4 _upsert 防御分支：非数组/无效消息/无效身份不写', () => {
-    const fsmod = require('node:fs')
     // 清理可能残留的墓碑（f.json/f2.json 非 test_ 前缀，启动清理不会覆盖）
     for (const fn of ['f.json', 'f2.json']) {
       const fp = getFilePath(fn)
-      try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp + '.seen.json')
     }
     const arr = []
     assertEqual(MessageStore._upsert(null, { id: 1 }, 'f.json'), false, '非数组应 false')
@@ -10816,10 +11107,9 @@ console.log('========================================\n');
   })
 
   await test('P4 _upsert 撞墓碑：曾被裁剪的身份拒绝重入（防重推）', () => {
-    const fsmod = require('node:fs')
     const fp = getFilePath('test_upsert_tomb.json')
-    try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
-    try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+    unlinkQuiet(fp)
+    unlinkQuiet(fp + '.seen.json')
     try {
       MessageStore._tombstoneLoaded.delete(fp)
       MessageStore._saveTombstones(fp, { id: new Map([['777', true]]), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() })
@@ -10829,8 +11119,8 @@ console.log('========================================\n');
       assertEqual(arr.length, 1, '撞墓碑不得追加')
     } finally {
       MessageStore._tombstoneLoaded.delete(fp)
-      try { fsmod.unlinkSync(fp) } catch (e) { /* 忽略 */ }
-      try { fsmod.unlinkSync(fp + '.seen.json') } catch (e) { /* 忽略 */ }
+      unlinkQuiet(fp)
+      unlinkQuiet(fp + '.seen.json')
     }
   })
 
@@ -10899,7 +11189,7 @@ console.log('========================================\n');
   //   ④ whitelistFilter 非字符串字段值统一 String() 口径（与 matchesCompiled 同源）
   // 本区块为文末追加，不改动上方任何既有断言。
   // ============================================================
-  console.log('\n📂 补测：xbk_filter 形状守卫 / 编译失败告警 / 非字符串值口径')
+  console.log('\n📂 127. 补测：xbk_filter 形状守卫 / 编译失败告警 / 非字符串值口径')
 
   const { createFilterEngine: _createFilterEngine } = require('./xbk_filter')
   // 直测 xbk_filter 内部 _passIfMissing（主入口未导出 FilterEngine，故就地构造最小引擎）
@@ -11271,6 +11561,210 @@ console.log('========================================\n');
     assertEqual(threw, false, '__compiled 为伪造值时不得抛（fallback 路径须容错）')
   })
 
+  // C4-002：与 run_unit_tests.js 的 UT-04 同口径——立即终止进程不等待 stdout flush，
+  // CI（pipe）下尾部失败明细/汇总横幅的突发写入会被截断（391KB 突发实测只收到 111KB）。
+  // 判据用「全文调用点数」而不是行首正则：只钉行首写法时，`if (failed > 0) ...` 一行式
+  // 回退（同为立即退出、同样截断明细）会整句溜过。全文只允许 1 处调用点，且必须是开头的
+  // hostClean 预检守卫行；收尾区一处都不许有。needle 与错误消息均拼接构造，否则门禁自身
+  // 源码里的字样会把调用点数算成 3。
+  await test('收尾口径: 用 process.exitCode 而非立即退出（UT-04 管道 flush 对齐）', () => {
+    const self = require('fs').readFileSync(__filename, 'utf8')
+    const EXIT_CALL = 'process' + '.exit('
+    // 去注释（先行后块），块注释按换行数等长填充，行号仍与原文件对齐
+    const stripComments = (s) => s
+      .replace(/\/\/[^\n]*/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ''))
+    const code = stripComments(self)
+    const lines = code.split('\n')
+    const hitLines = []
+    lines.forEach((ln, i) => { if (ln.includes(EXIT_CALL)) hitLines.push(i + 1) })
+    assertEqual(hitLines.length, 1,
+      `全文只允许 1 处 ${EXIT_CALL} 调用点（hostClean 预检守卫），实际 ${hitLines.length} 处：${JSON.stringify(hitLines)}`)
+    assertEqual(hitLines[0] <= 20, true, `唯一调用点必须落在文件开头（:20 以内），实际第 ${hitLines[0]} 行`)
+    assertEqual(/hostClean\.shouldAbortForDirtyHost\(/.test(lines[hitLines[0] - 1]), true,
+      `第 ${hitLines[0]} 行不是 hostClean 预检守卫：${lines[hitLines[0] - 1].trim()}`)
+    // 收尾区显式再钉一次：最后一个用例之后不得出现任何调用点；退出码仍走 process.exitCode
+    const tail = code.slice(-800)
+    assertEqual(tail.includes(EXIT_CALL), false, `收尾区不得出现 ${EXIT_CALL}（不等待管道 flush，会截断尾部输出）`)
+    assertEqual(/process\.exitCode\s*=\s*failed > 0 \? 1 : 0/.test(tail), true, '收尾必须设置 process.exitCode = failed > 0 ? 1 : 0')
+  })
+
+  // C4-023：13 个互不相关的用例共用同一句 `assertEqual(r.includes('原文链接'), true)`，是照着上一个用例
+  // 补的样板尾巴，不是各自想清楚要锁什么：原文链接的格式由「htmlToMarkdown 原文链接格式精确断言」
+  // 专门覆盖，模板路径留 1–2 处即可。这条门禁防止样板再被复制回去（数量一涨即红，逼着写各自要锁的契约）。
+  await test('原文链接样板断言不得成片复制（C4-023：只留模板类 1–2 处 + 格式专门用例）', () => {
+    const self = require('fs').readFileSync(__filename, 'utf8')
+    const boiler = self.split('\n').filter((l) => /^\s*assertEqual\((?:r|result)\.includes\('原文链接'\), true\)$/.test(l))
+    assertEqual(boiler.length <= 2, true,
+      `同一句样板应只留 1–2 处（模板类 + 格式专门用例），实际 ${boiler.length} 处：${JSON.stringify(boiler.map((l) => l.trim()))}`)
+  })
+
+  // ==================== 测试代码卫生（源码级门禁） ====================
+  // 这一节的门禁读本文件源码：被测对象是「测试代码本身」的卫生，运行期行为看不出来。
+  // 判据一律先自检（证明 detector 能认出坏样本）再扫源码，否则门禁会退化成恒绿。
+  console.log('\n📂 128. 测试代码卫生')
+
+  const hygieneLines = () => require('fs').readFileSync(__filename, 'utf8').split('\n')
+  const isCommentLine = (ln) => {
+    const t = ln.trim()
+    return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')
+  }
+  // AST 遍历（门禁要看「代码结构」而不是行文本：字符串/注释里出现关键字不应误判）
+  const walkAst = (node, fn) => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) { node.forEach(n => walkAst(n, fn)); return }
+    if (typeof node.type === 'string') fn(node)
+    for (const k of Object.keys(node)) {
+      if (k === 'loc' || k === 'start' || k === 'end') continue
+      const v = node[k]
+      if (v && typeof v === 'object') walkAst(v, fn)
+    }
+  }
+  const parseHygiene = () => require('acorn').parse(require('fs').readFileSync(__filename, 'utf8'),
+    { ecmaVersion: 'latest', locations: true })
+  const countEmptyCatch = (ast) => {
+    const hits = []
+    walkAst(ast, n => { if (n.type === 'CatchClause' && n.body.body.length === 0) hits.push(n.loc.start.line) })
+    return hits
+  }
+  const containsAwait = (node) => {
+    let found = false
+    walkAst(node, n => { if (n.type === 'AwaitExpression') found = true })
+    return found
+  }
+  const countAsyncTestWithoutAwait = (ast) => {
+    const hits = []
+    walkAst(ast, n => {
+      if (n.type !== 'CallExpression' || !n.callee || n.callee.name !== 'test') return
+      const cb = n.arguments[1]
+      if (cb && cb.async && !containsAwait(cb.body)) hits.push(n.loc.start.line)
+    })
+    return hits
+  }
+  // C4-027：assertEqual(期望, 实际) 的第三参是失败信息——缺了它，报告只剩「期望=x, 实际=y」，
+  // 同一用例里有多条断言时无法判断是哪一条挂的。
+  const countAssertWithoutMsg = (ast) => {
+    const hits = []
+    walkAst(ast, n => {
+      if (n.type !== 'CallExpression' || !n.callee || n.callee.type !== 'Identifier') return
+      if (n.callee.name !== 'assertEqual') return
+      if (n.arguments.length < 3) hits.push(n.loc.start.line)
+    })
+    return hits
+  }
+
+  await test('C4-024: Config.cache.maxSize 只允许经 withCacheMaxSize 修改', () => {
+    // needle 拼接：门禁源码里不出现字面量，避免自己命中自己
+    const ASSIGN = 'Config.cache.maxSize' + ' ='
+    const lines = hygieneLines()
+    const hits = []
+    lines.forEach((ln, i) => {
+      if (isCommentLine(ln)) return
+      if (ln.includes(ASSIGN)) hits.push(i + 1)
+    })
+    assertEqual(hits.length, 2,
+      `maxSize 赋值点必须只落在 withCacheMaxSize 内（2 处），实际 ${hits.length} 处：${hits.join(', ')}`)
+    const start = lines.findIndex(l => l.startsWith('async function withCacheMaxSize'))
+    assertEqual(start >= 0, true, '必须存在 async function withCacheMaxSize 定义')
+    let end = start + 1
+    while (lines[end] !== '}') end++
+    for (const n of hits) {
+      assertEqual(n > start + 1 && n <= end, true,
+        `第 ${n} 行赋值落在 helper（第 ${start + 1}-${end} 行）之外：${lines[n - 1].trim()}`)
+    }
+  })
+
+  await test('C4-024: withCacheMaxSize 回调期间生效、成功与抛错都还原', async () => {
+    const before = Config.cache.maxSize
+    let seen = null
+    await withCacheMaxSize(7, () => { seen = Config.cache.maxSize })
+    assertEqual(seen, 7, '回调执行期间应看到临时上限 7')
+    assertEqual(Config.cache.maxSize, before, '成功返回后必须还原')
+    let caught = null
+    try {
+      await withCacheMaxSize(9, async () => {
+        assertEqual(Config.cache.maxSize, 9, 'async 回调期间临时上限应生效（同步版 helper 会提前还原）')
+        throw new Error('boom')
+      })
+    } catch (e) { caught = e.message }
+    assertEqual(caught, 'boom', '回调异常必须原样抛出（不得被 helper 吞掉）')
+    assertEqual(Config.cache.maxSize, before, '抛错后也必须还原')
+  })
+
+  await test('C4-028: 空 catch 零容忍（清理失败必须留痕，统一走 unlinkQuiet）', () => {
+    // 判据自检：AST 门禁必须能认出空 catch（含只写注释的"空"块），否则形同虚设
+    const sample = 'try { x() } catch (e) { /* 注释不算处理 */ }'
+    const sampleAst = require('acorn').parse(sample, { ecmaVersion: 'latest', locations: true })
+    assertEqual(countEmptyCatch(sampleAst).length, 1, '判据必须能认出「只有注释」的空 catch（自检）')
+    const hits = countEmptyCatch(parseHygiene())
+    assertEqual(hits.length, 0,
+      `空 catch 会把清理失败静默吞掉（本文件 cleanupDirInRoot 已立过此规矩），改用 unlinkQuiet：第 ${hits.join(', ')} 行`)
+  })
+
+  await test('C4-028: unlinkQuiet 只吞 ENOENT，其它清理失败必须告警', () => {
+    const fsx = require('node:fs')
+    const missing = path.join(CACHE, 'test_c4028_missing.json')
+    fsx.rmSync(missing, { force: true })
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (msg) => warns.push(String(msg))
+    const dir = path.join(CACHE, 'test_c4028_dir')
+    try {
+      assertEqual(unlinkQuiet(missing), undefined, '缺失文件应静默返回（ENOENT 是正常收尾）')
+      assertEqual(warns.length, 0, 'ENOENT 不得告警（否则每次收尾都刷日志）')
+      fsx.mkdirSync(dir, { recursive: true })
+      unlinkQuiet(dir) // unlinkSync 打目录：Linux=EISDIR / macOS=EPERM，都属非 ENOENT
+      assertEqual(warns.length, 1, '非 ENOENT 的清理失败必须留痕，不得静默吞掉')
+      assertEqual(warns[0].includes(dir), true, '告警必须带上目标路径，否则无法定位残留')
+    } finally {
+      console.warn = origWarn
+      fsx.rmdirSync(dir) // 空目录：非递归删除，避免与「递归删除只允许 3 处」的既有门禁冲突
+    }
+  })
+
+  await test('C4-026: async 用例回调必须真的 await（多余 async 会让读者误以为用例是异步的）', () => {
+    // 判据自检：三条样本里只有「async 且体内无 await」那条该被认出
+    const sample = '(async () => { await test("a", async () => { 1 }); await test("b", async () => { await p }); await test("c", () => { 1 }) })()'
+    const sampleAst = require('acorn').parse(sample, { ecmaVersion: 'latest', locations: true })
+    assertEqual(countAsyncTestWithoutAwait(sampleAst).length, 1, '判据自检：只有 async 且无 await 的用例回调应被认出')
+    const hits = countAsyncTestWithoutAwait(parseHygiene())
+    assertEqual(hits.length, 0, `用例回调声明 async 却没有任何 await（去掉 async 即可，行为不变）：第 ${hits.join(', ')} 行`)
+  })
+
+  await test('C4-027: assertEqual 必须带失败说明（不得只剩 期望=/实际=）', () => {
+    // 判据自检：两条样本里只有缺第三参的那条该被认出
+    const sampleAst = require('acorn').parse('assertEqual(a, b); assertEqual(c, d, "说明")', { ecmaVersion: 'latest', locations: true })
+    assertEqual(countAssertWithoutMsg(sampleAst).length, 1, '判据自检：无 msg 的断言应被认出、带 msg 的不应')
+    const hits = countAssertWithoutMsg(parseHygiene())
+    assertEqual(hits.length, 0,
+      `assertEqual 缺失败说明（失败报告只剩 期望=x/实际=y，多断言用例无法定位）：第 ${hits.slice(0, 20).join(', ')} 行${hits.length > 20 ? ` 等 ${hits.length} 处` : ''}`)
+  })
+
+  await test('C4-025: 分节编号按文件顺序 1..N 连续，标题按内容命名', () => {
+    const all = hygieneLines()
+    const secs = []
+    all.forEach((ln, i) => {
+      const m = ln.match(/^\s*console\.log\('(?:\\n)?📂 (\d+)\. (.+)'\)\s*$/)
+      if (m) secs.push({ line: i + 1, num: Number(m[1]), title: m[2] })
+    })
+    // 下限自检：扫不到标题说明判据坏了（门禁会恒绿），不是「文件里没问题」
+    assertEqual(secs.length > 100, true, `应能扫到全部分节标题，实际 ${secs.length} 个（<100 说明扫描规则失效）`)
+    const bad = []
+    secs.forEach((s, i) => { if (s.num !== i + 1) bad.push(`第 ${s.line} 行编号 ${s.num} 应为 ${i + 1}`) })
+    const ROUND = /审查|复审|轮次|批次|第\s*\d+\s*[-–~]?\s*\d*\s*(轮|批)/
+    secs.forEach(s => { if (ROUND.test(s.title)) bad.push(`第 ${s.line} 行标题仍按轮次/批次/审查命名：${s.title}`) })
+    // 源码注释头也要同步：控制台改成「52. 脏输入兜底」，注释头还写「52. 第8轮变异盲区修复」，
+    // 两处说法不一致，读代码的人仍会被轮次命名带偏（本轮实测漏了 8 处）。
+    secs.forEach(s => {
+      const prev = all[s.line - 2]
+      const hm = prev && prev.match(/^\s*\/\/ =+ (\d+)[a-z]?\. (.+?) =+$/)
+      if (!hm) return
+      if (Number(hm[1]) !== s.num) bad.push(`第 ${s.line - 1} 行注释头编号 ${hm[1]} 与分节编号 ${s.num} 不一致`)
+      if (ROUND.test(hm[2])) bad.push(`第 ${s.line - 1} 行注释头仍按轮次/批次/审查命名：${hm[2]}`)
+    })
+    assertEqual(bad.length, 0, '分节编号必须按文件顺序 1..N 连续、标题按内容命名：' + bad.slice(0, 8).join('；'))
+  })
+
   // 清理本套件产生的缓存测试文件（保留真实运行缓存 push.json；清理失败不影响测试结果）
   // C4-001：本行与下方汇总横幅原先停在文件**中段**（原 :9458-9469），其后又追加了 91 个顶层用例，
   // 于是横幅/三数字只覆盖前 819 例（910 例里恒少算 10%）、尾部用例的 ❌ 出现在绿色横幅之后且不进
@@ -11297,5 +11791,8 @@ console.log('========================================\n');
   }
   console.log('========================================\n')
 
-  process.exit(failed > 0 ? 1 : 0)
+  // C4-002（UT-04 同口径）：CI 下 stdout 是 pipe，process.exit() 不等待 flush —— 失败明细
+  // 与汇总横幅正是尾部突发写入，会被截断（实测 391KB 只到 111KB）。故用 process.exitCode
+  // 收尾，让事件循环自然排空 stdin/stdout 后再退出；退出码语义不变。
+  process.exitCode = failed > 0 ? 1 : 0
 })()

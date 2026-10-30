@@ -14,9 +14,14 @@ const { createApp } = require('./xbk_app.js')
 
 let passed = 0
 let failed = 0
+// 声明数（C5-004）：每注册一条用例（同步 check / 异步 checkAsync）就 +1，与「结算数 passed+failed」
+// 对账。asyncChecks 曾靠「for…of 读活数组」顺带跑到 drain 之后注册的用例，一旦 drain 前移或
+// 注册前出现真正的异步等待，那些用例会静默不跑且没有任何计数能看出来。
+let declared = 0
 const failures = []
 
 function check (name, fn) {
+  declared += 1
   try {
     fn()
     passed++
@@ -640,6 +645,23 @@ check('_writeRunLog 追加后 statSync 失败 ⇒ 静默，锁清理不跳过', 
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
 })
 
+// N1 回归（与 _updateChannelHealth 的 mutRuntimeError 同源）：锁 fd 落在 stdio 区（0/1/2）时绝不 close。
+// 旧实现把「未取得锁」编码成 -1，哨兵被 UnaryOperator 改成 +1 后 finally 的 closeSync(1) 会直接关掉
+// stdout，测试进程崩成 RuntimeError；且 stdio 已被外部关闭时 openSync 本就会返回 0/1/2 这样的真 fd。
+// 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，正常追加与追加抛错（异常路径）两条都要守住。
+check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍清理（含异常路径）', () => {
+  for (const fd of [0, 1, 2]) {
+    for (const appendThrows of [false, true]) {
+      const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? fd : 8), appendThrows })
+      const { app } = makeLogApp({ rec })
+      app._writeRunLog('x\n')
+      const tag = `fd=${fd} appendThrows=${appendThrows}`
+      assert.deepStrictEqual(rec.rec.close, [], `${tag}: 不得 close stdio，实际 close：${rec.rec.close.join(',')}`)
+      assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], `${tag}: 锁文件必须清理（漏删会让后续轮次一直被旧锁挡住）`)
+    }
+  }
+})
+
 // ----- _writeRunLog：ERROR 行只截 errMsg 段 -----
 check('_writeRunLog ERROR 行超 512 ⇒ 仅 errMsg 段截到 512，前缀与尾换行保留', () => {
   const rec = makeLogFs()
@@ -777,13 +799,15 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
-check('_writeRunLog 锁 fd 为 0 时 finally 仍释放（close/unlink），不得漏清理', () => {
+// fd 为 0 是 falsy：旧实现用 `if (lockFd)` 判定「是否取到锁」时会把 fd 0 当成「没取到」而整段跳过
+// 释放（锁文件残留）。这里守住「0 是有效 fd、必须走释放」；但 0 也是 stdin，close 必须被 >2 守卫拒绝。
+check('_writeRunLog 锁 fd 为 0（falsy）时 finally 仍释放：unlink 照做、不得 close stdio', () => {
   const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9) })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.write, [[0, `${process.pid}:42`]])
-  assert.deepStrictEqual(rec.rec.close, [0])
-  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+  assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], 'fd 0 不得被当成「未取锁」而跳过释放（锁文件会残留）')
+  assert.deepStrictEqual(rec.rec.close, [], 'fd 0 是 stdin，>2 守卫必须拒绝 close')
 })
 
 // ----- _warnLowDisk：阈值 / 只告警不阻断 / 限频 -----
@@ -897,7 +921,7 @@ check('_persistReportState 落盘前先 normalize（字符串计数转数字、�
 // ============================================================================
 
 const asyncChecks = []
-function checkAsync (name, fn) { asyncChecks.push([name, fn]) }
+function checkAsync (name, fn) { declared += 1; asyncChecks.push([name, fn]) }
 
 async function withCaptureAsync (level, fn) {
   const orig = console[level]
@@ -1418,8 +1442,9 @@ checkAsync('_sendAlert 成功路径：标题/正文分段/run.log 留痕/alert.s
   assert.strictEqual(parts[1].slice(0, 3), '时间：')
   assert.strictEqual(parts[2], '原因：boom')
   assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：boom\n'])
-  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000}']])
-  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: true })
+  // C1-004：状态文件有意扩展为 {lastAt, classes.<key>}（仍精确 deepEqual，未放宽）；lastAt 语义不变
+  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000,"classes":{"alert":1700000000000}}']])
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, classes: { alert: now }, persisted: true })
   // 杀 Math.ceil 与 /60000 口径：90000ms ⇒ 2 分钟
   assert.deepStrictEqual(msgs, ['已发送运行异常告警（限频 2 分钟）'])
 })
@@ -1508,7 +1533,7 @@ checkAsync('_sendAlert 已持久化内存状态但文件被删 ⇒ 丢弃内存�
   // 杀 `persisted && !fs.existsSync` 的条件取反：文件没了仍按内存限频 = 静默丢告警
   assert.strictEqual(r, true)
   assert.strictEqual(sent.length, 1)
-  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: true })
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, classes: { alert: now }, persisted: true })
 })
 
 checkAsync('_sendAlert 未持久化的内存状态不因文件存在与否重置（persisted 合取项）', async () => {
@@ -1579,8 +1604,8 @@ checkAsync('_sendAlert 持久化失败 ⇒ 仍返回 true 并告警，内存限�
   // 杀 if (!persisted) 取反与 persisted 标记写错
   assert.strictEqual(value, true)
   assert.deepStrictEqual(msgs, ['⚠️ 运行异常告警已发送，但 alert.state 持久化失败；本进程将继续使用内存限频'])
-  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000}']])
-  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, persisted: false })
+  assert.deepStrictEqual(stateWrites, [[ALERT_PATH, '{"lastAt":1700000000000,"classes":{"alert":1700000000000}}']])
+  assert.deepStrictEqual(app._alertLastAtByPath.get(ALERT_PATH), { lastAt: now, classes: { alert: now }, persisted: false })
 })
 
 checkAsync('_sendAlert 同步异常（Pusher.send 抛出）⇒ 返回 false 且不冒泡', async () => {
@@ -1715,25 +1740,6 @@ checkAsync('_sendAlert 留痕把连续换行折叠成一个空格（+ 量词与�
   await withFixedNowAsync(now, () => silentAlert(app, new Error('前段\n\n后段')))
   assert.deepStrictEqual(runLogs, ['STAMP ALERT [v1.2.3] ⚠️ xbk-push 运行异常 原因：前段 后段\n'])
 })
-
-// ===== 异步用例执行（同步用例已在上方跑完）=====
-;(async () => {
-  for (const [name, fn] of asyncChecks) {
-    try {
-      await fn()
-      passed++
-    } catch (e) {
-      failed++
-      failures.push(`${name} :: ${e.message}`)
-    }
-  }
-  console.log(`通过 ${passed} / 失败 ${failed}`)
-  if (failed > 0) {
-    for (const f of failures) console.log(`  ❌ ${f}`)
-    process.exit(1)
-  }
-  process.exit(0)
-})().catch(e => { console.error(e); process.exitCode = 1 })
 
 // ===== RE2 缺失警告簇（RE2 警告标记生命周期：pending→completed/回收/7天清理）=====
 // 全部经 makeApp 注入的内存 fs 桩运行，不触碰真实缓存目录。
@@ -2120,6 +2126,102 @@ async function runHealthWithCapturedConsole (app) {
   return { warns, errs }
 }
 
+// 变异回归（app mutation RuntimeError）：channelHealth 关闭时 _updateChannelHealth 早退，
+// finally 仍会走 _releaseChannelHealthLock。哨兵早已是 null（UnaryOperator 对 null 无从下手），
+// 真正挡住「把 stdio 当锁 fd 关掉」的是该方法的 `>2` 守卫：旧实现 -1 → +1 的变异体会在这里
+// close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError。
+// 这里用 closeSync 观察器把「关 stdio」变成可断言的失败，而不是让进程崩掉。
+checkAsync('通道健康锁: 关闭健康观测时不得关闭 stdio fd（>2 守卫回归）', async () => {
+  const realFs = require('fs')
+  const closed = []
+  const spyFs = new Proxy(realFs, {
+    get (target, prop) {
+      if (prop === 'closeSync') {
+        return (fd) => {
+          closed.push(fd)
+          if (fd > 2) target.closeSync(fd)
+        }
+      }
+      return target[prop]
+    }
+  })
+  const app = makeHealthApp2({ fs: spyFs, enabled: false })
+  await app._updateChannelHealth({ successfulChannels: [], failures: [] })
+  assert.deepStrictEqual(closed.filter(fd => fd >= 0 && fd <= 2), [],
+    `关闭健康观测时清理不得 close stdio fd，实际关闭：${closed.join(',')}`)
+})
+
+check('通道健康锁: 释放时拒绝 close stdio fd（0/1/2）', () => {
+  const closed = []
+  const app = makeHealthApp({
+    fs: {
+      closeSync: (fd) => closed.push(fd),
+      unlinkSync: () => {}
+    }
+  })
+  for (const fd of [0, 1, 2]) app._releaseChannelHealthLock('', fd)
+  assert.deepStrictEqual(closed, [], `不得关闭 stdio fd，实际关闭：${closed.join(',')}`)
+})
+
+// N2 回归：>2 守卫只管 close，不能把 unlink 一起跳过——fd 落在 stdio 区时锁文件仍必须删除。
+// 旧实现把 close 与 unlink 放在同一个 `lockFd > 2` 分支里，0/1/2 时锁文件残留，后续轮次
+// 一直被陈旧锁挡在门外（要等 mtime 超龄 + 存活复核才回收，健康状态整段漏更新）。
+check('通道健康锁: 释放时 fd 落在 stdio（0/1/2）仍清理锁文件，不得漏 unlink', () => {
+  for (const fd of [0, 1, 2]) {
+    const closed = []
+    const unlinked = []
+    const app = makeHealthApp({
+      fs: {
+        closeSync: (x) => closed.push(x),
+        unlinkSync: (p) => unlinked.push(p)
+      }
+    })
+    app._releaseChannelHealthLock(healthPath + '.lock', fd)
+    assert.deepStrictEqual(closed, [], `fd=${fd}: 不得关闭 stdio`)
+    assert.deepStrictEqual(unlinked, [healthPath + '.lock'], `fd=${fd}: 锁文件必须删除，否则后续轮次一直被挡`)
+  }
+  // 未取到锁（null / -1）时不得删别人的锁文件
+  const unlinked = []
+  const app = makeHealthApp({ fs: { closeSync: () => {}, unlinkSync: (p) => unlinked.push(p) } })
+  app._releaseChannelHealthLock(healthPath + '.lock', null)
+  app._releaseChannelHealthLock(healthPath + '.lock', -1)
+  assert.deepStrictEqual(unlinked, [], '未取到锁（null/-1）不得 unlink 他人的锁文件')
+})
+
+// N2 回归：>2 分支本身要有牙——此前把 `if (lockFd > 2) closeSync` 整段删掉，套件仍 242/242 全绿。
+check('通道健康锁: 释放时 fd>2 必须 close（close 分支不被静默删除）', () => {
+  const realFs = require('fs')
+  const closed = []
+  const app = makeHealthApp({
+    fs: {
+      closeSync: (fd) => { closed.push(fd); realFs.closeSync(fd) },
+      unlinkSync: () => {}
+    }
+  })
+  // 探针必须落在**不可预测**的私有目录里：旧写法 `os.tmpdir() + '/channel-health.state.fdprobe'`
+  // 名字可预测、写盘也不带 O_EXCL，同机任何进程都能抢先占位——先建同名目录 ⇒ 这里 `openSync` EISDIR
+  // 直接炸（用例在断言前崩），先建同名符号链接 ⇒ `'w'` 打开会把别人的目标文件截成 0 字节而套件照旧
+  // 全绿（实测 243/243、受害文件 31 → 0 字节）。CodeQL 视作「Insecure creation of file in the os temp dir」。
+  // 前缀按本文件 C5-025 口径用 `xbkunit-`（不是 `xbk-`：后者落进 check-host-clean 的「过期沙箱」命名
+  // 空间，被 SIGKILL 后的残留会误拦下一轮 check）；本用例是早期注册的，mkTmpFixture 的 const 尚未初始化，
+  // 故就地建目录并在 finally 里整目录删除。
+  const tmpDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-fdprobe-'))
+  const probePath = path.join(tmpDir, 'probe')
+  const probe = realFs.openSync(probePath, 'w')
+  try {
+    // 前置断言：探针必须真是本用例独占的普通文件（私有目录被同名目录/符号链接顶替时当场点名，
+    // 而不是让下面的 EBADF 断言在无关失败形态上给出误导文本）
+    assert.ok(realFs.statSync(probePath).isFile(), '探针必须落在 mkdtemp 私有目录里的普通文件上')
+    assert.ok(probe > 2, `探针 fd 必须 >2，实际 ${probe}`)
+    app._releaseChannelHealthLock(healthPath + '.lock', probe)
+    assert.deepStrictEqual(closed, [probe], `fd>2 时必须 close 锁 fd，实际关闭：${closed.join(',') || '无'}`)
+    assert.throws(() => realFs.fstatSync(probe), /EBADF/, 'close 之后该 fd 必须已失效')
+  } finally {
+    try { realFs.closeSync(probe) } catch { /* 已关闭 */ }
+    realFs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
 check('通道健康锁: 无锁时独占获取成功并写入 pid 令牌；释放删除锁文件', () => {
   const mfs = makeMemFs()
   const app = makeHealthApp({ fs: mfs })
@@ -2263,9 +2365,9 @@ checkAsync('恢复认领清零: 通道恢复成功后计数清零、lastRecovere
 
 // --- _updateChannelHealth 主流程用例（失败计数 / 告警入队 / 恢复认领 / 状态损坏防御）---
 // _sendAlert 经 makeHealthApp 无注入——检查其实现依赖 getNotify/Pusher。用 sendAlert 注入参数版本。
-function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true }) {
+function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true, enabled = true }) {
   return createApp({
-    Config: { channelHealth: { enabled: true, consecutiveFailures: threshold, intervalMs } },
+    Config: { channelHealth: { enabled, consecutiveFailures: threshold, intervalMs } },
     Utils: {
       safeErrorText: (e, d) => String((e && e.message) || d),
       num: (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d }
@@ -2384,16 +2486,56 @@ checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、
 // （Sonar「Make sure publicly writable directories are used safely here」/ CWE-377：公共可写目录里的
 // 固定名可被他人抢占/预建；本仓 6369482 已把记账文件统一改成 mkdtemp 私有目录，此处照同一口径）。
 // 注意：下面 AP-1…AP-3 用的是**注入的假 fs**，这些路径只是字符串、不落真磁盘，但命名口径仍按真实环境执行。
+//
+// C5-025：本文件的临时夹具一律走 `xbkunit-` 前缀 + 进程退出兜底清理，不再用 `xbk-`。
+// 为什么：scripts/check-host-clean.js 把 <tmp>/xbk-* 当作「套件/变异沙箱」，残留超过 30min 就判
+// 主机脏并给出 rm -rf 建议（实测 inspect()：61min 的 xbk-app-unit-* → ok=false、dirs 点名）。本文件
+// 的夹具不是那种沙箱，被 SIGKILL 后残留会被下一轮 `npm run check` 误拦。改名后该门禁不再替我们清场，
+// 所以用 exit 钩子自己清（与 AP_ROOT 原有兜底同口径）——两条都不丢。
+const TMP_FIXTURES = []
+function mkTmpFixture (tag) {
+  const realFs = require('fs')
+  const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-' + tag))
+  TMP_FIXTURES.push(d)
+  return d
+}
+process.once('exit', () => {
+  const realFs = require('fs')
+  for (const d of TMP_FIXTURES) {
+    try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 退出路径忽略清理失败 */ }
+  }
+})
 const AP_ROOT = (() => {
   const realFs = require('fs')
-  const d = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-app-unit-'))
+  const d = mkTmpFixture('app-unit-')
   try { realFs.chmodSync(d, 0o700) } catch (e) { /* 某些 FUSE 挂载不允许 chmod：目录名仍不可预测 */ } // nosemgrep（d 是 mkdtempSync 独占产物，无外部输入）
-  process.once('exit', () => { try { realFs.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
   return d
 })()
 // 唯一的动态来源是 mkdtemp 私有目录 + 本文件内硬编码的文件名常量，不接受任何外部输入
 // ⇒ Codacy 的 pathtraversal-non-literal-fs-filename 在此是结构性误报（口径同 xbk_storage.js:17 与 .codacy.yml 里 test_storage.js 的说明）
 const apPath = (name) => path.join(AP_ROOT, name) // nosemgrep
+
+// C5-025 守卫：本文件的临时夹具（哪怕 61 分钟没动）不得被 check-host-clean 当成过期沙箱。
+// 反例：夹具用 xbk- 前缀时，findStaleSandboxes 会把 61min 的目录点名成「过期沙箱」并判主机脏——
+// 一次 SIGKILL 残留就能让下一轮 `npm run check` 以「主机脏」拒跑（本机已端到端复现）。
+check('C5-025 夹具命名：本文件的临时目录不落进 check-host-clean 的沙箱命名空间', () => {
+  const realFs = require('fs')
+  const { findStaleSandboxes, activityMtimeMs } = require('./scripts/check-host-clean')
+  // ① 行为侧：真建一个夹具、把 mtime 拨到 61 分钟前，门禁的判据不得把它当残留
+  const d = mkTmpFixture('namespace-probe-')
+  try {
+    const past = new Date(Date.now() - 61 * 60000)
+    realFs.utimesSync(d, past, past)
+    assert.deepStrictEqual(
+      findStaleSandboxes([{ p: d, mtimeMs: activityMtimeMs(d) }], Date.now(), 30 * 60000), [],
+      `夹具目录 ${d} 落进了 check-host-clean 的沙箱命名空间：残留 >30min 会被判主机脏并误拦 check`)
+  } finally {
+    realFs.rmSync(d, { recursive: true, force: true })
+  }
+  // ② 源码侧：不允许再有绕过 mkTmpFixture 的裸 xbk- mkdtemp（注释里的示例不会命中，需带 mkdtempSync(）
+  const raw = realFs.readFileSync(__filename, 'utf8').match(/mkdtempSync\(path\.join\(os\.tmpdir\(\), 'xbk-/g) || []
+  assert.strictEqual(raw.length, 0, `本文件不得再有裸 xbk- 前缀的 mkdtempSync（应走 mkTmpFixture）：实际 ${raw.length} 处`)
+})
 
 // ===== G11-AP：RE2 标记原子写 / PID 复用识别 / 通道健康降级（c8 实测 xbk_app.js 分支 86.06%，
 // L341-350 与 L524-530 与 L843-845 与 L917-918 均未达）=====
@@ -2548,7 +2690,7 @@ checkAsync('AP-5 通道健康：更新过程整体抛错 ⇒ 补一行 WARN 留�
 //     的 getter 只接受根内 cache.dir，临时目录必须走部署开关才真正生效），断言后递归删除；
 //   · 覆盖文件按轮改写，证明「保存后下一轮生效」，且代码默认层 Config.filter 全程不被污染。
 // ============================================================
-function buildFilterRunHarness (cacheDir) {
+function buildFilterRunHarness (cacheDir, over = {}) {
   const realFs = require('fs')
   const nodeCrypto = require('crypto')
   const {
@@ -2617,7 +2759,7 @@ function buildFilterRunHarness (cacheDir) {
   let items = []
   const sends = []
   const Network = { fetchData: async () => items }
-  const Pusher = {
+  const Pusher = over.Pusher || {
     send: async (text, desp) => {
       sends.push({ text, desp })
       return { successfulChannels: ['stub'], failures: [] }
@@ -2659,6 +2801,7 @@ function buildFilterRunHarness (cacheDir) {
     Config,
     MessageStore,
     FilterStore,
+    Pusher,
     sends,
     baseConfig,
     setItems (next) { items = next },
@@ -2684,11 +2827,10 @@ async function runWithWarnings (app) {
 }
 
 checkAsync('FR-1 覆盖文件按轮生效：同一进程两次 App.run 读到不同规则，applied 快照与第二轮一致，Config.filter 不被污染', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests()
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2744,11 +2886,10 @@ checkAsync('FR-1 覆盖文件按轮生效：同一进程两次 App.run 读到不
 })
 
 checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _f 与 filter.hash，告警含 source/lastGoodUsed', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests()
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2793,11 +2934,10 @@ checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _
 })
 
 checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默认、告警 lastGoodUsed=false，仍不清 _f/不推进 hash', async () => {
-  const os = require('os')
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
   FilterStore.resetStoreStateForTests() // 关键：清掉进程内 last-known-good，模拟「本进程从未读到合法文件」
-  const cacheDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'xbk-filter-run-'))
+  const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN
   process.env.XBK_CACHE_DIR = cacheDir
@@ -2844,3 +2984,450 @@ checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默�
     else process.env.XBK_DRY_RUN = prevDryRun
   }
 })
+
+// ============================================================
+// 运行级回归（App.run 主链）：dry-run / 截断 / 告警分流 / 全脏数据可观测
+//
+// 为什么放在本文件（C1-001 / C1-003 的根因）：xbk_app.js 的 run() 主链此前只有
+// test_app.js（集成套件）覆盖，而 test_app.js 不进变异集（test_suite_registry.js 白名单 +
+// integration 过滤 ⇒ run_unit_tests.js / TAP 都不跑它）⇒ dry-run 判据、truncatedKeys 合取项
+// 这些「只在 run() 里生效」的分支在变异集内零执行、零断言，改坏也无人红。
+// 本段复用 buildFilterRunHarness 的真实装配（真 createApp + 真 MessageStore + 临时 cacheDir），
+// 只桩 Network.fetchData / Pusher.send ⇒ 落在单元入口 ⇒ 进 TAP 变异集。
+// ============================================================
+
+checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过日报（前后两个对照轮证明断言有判别力）', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('dryrun-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  // 日报必须真的「可写」——report 关着时「dry-run 不写日报」恒真、无判别力
+  h.Config.report = { enabled: true }
+  const reportPath = path.join(cacheDir, 'report.state')
+  const urlControl = 'https://example.invalid/dry-run-control.json'
+  const urlDry = 'https://example.invalid/dry-run-preview.json'
+  const cacheFileOf = (url) => path.join(cacheDir, h.MessageStore.getFileName(url))
+  try {
+    // ① 对照轮（非 dry-run）：必须真推送 + 写缓存 + 写日报
+    h.Config.api.pushUrl = urlControl
+    h.setItems([makeRunItem('dr-ctl-1', '对照甲')])
+    const ctl = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: ctl.summary.pushed, failed: ctl.summary.failed }, { pushed: 1, failed: 0 },
+      `对照轮摘要异常：${JSON.stringify(ctl.summary)}`)
+    assert.strictEqual(h.sends.length, 1, '对照轮必须真调用 Pusher.send（否则「dry-run 不推送」恒真）')
+    assert.strictEqual(h.cacheMessages().length, 1, '对照轮必须把成功条目写入缓存')
+    assert.ok(realFs.existsSync(reportPath), '对照轮必须写日报状态（否则「dry-run 不写日报」恒真）')
+
+    // ② dry-run：同一夹具、只多一个 XBK_DRY_RUN=1，换 URL 隔离缓存
+    realFs.rmSync(reportPath, { force: true })
+    const sentBefore = h.sends.length
+    h.Config.api.pushUrl = urlDry
+    h.setItems([makeRunItem('dr-1', '预览甲'), makeRunItem('dr-2', '预览乙')])
+    process.env.XBK_DRY_RUN = '1'
+    const logs = []
+    const origLog = console.log
+    const origWarn = console.warn
+    let dry
+    try {
+      console.log = (...a) => { logs.push(a.map(String).join(' ')) }
+      console.warn = () => {}
+      dry = await h.App.run()
+    } finally {
+      console.log = origLog
+      console.warn = origWarn
+    }
+    assert.deepStrictEqual({ total: dry.total, pushed: dry.pushed, failed: dry.failed },
+      { total: 2, pushed: 0, failed: 0 }, `dry-run 摘要不得伪造推送/失败：${JSON.stringify(dry)}`)
+    assert.strictEqual(h.sends.length, sentBefore,
+      'dry-run 不得调用 Pusher.send（preview() 必须在 Pusher.send 之前返回 true）')
+    // saveBatch([]) 允许创建空缓存文件（契约未禁止）；断言的是「没有任何条目被写进缓存」
+    const cachedInDryRun = realFs.existsSync(cacheFileOf(urlDry)) ? h.cacheMessages().length : 0
+    assert.strictEqual(cachedInDryRun, 0,
+      'dry-run 的 toCache 必须是空数组（写进缓存 = 下轮判重跳过，等于静默丢消息）')
+    assert.ok(!realFs.existsSync(reportPath), 'dry-run 必须整段跳过 _updateReport（不得写日报状态）')
+    assert.ok(logs.some(l => l.includes('🧪 预览：')), `dry-run 必须逐条打印预览内容：${JSON.stringify(logs.slice(-8))}`)
+    assert.ok(logs.some(l => l.includes('预览甲')), '预览内容必须含待推送条目的正文/标题')
+
+    // ③ 再对照：同一 URL 去掉 dry-run ⇒ 必须推送 2 条、写缓存 2 条、写日报
+    delete process.env.XBK_DRY_RUN
+    h.setItems([makeRunItem('dr-1', '预览甲'), makeRunItem('dr-2', '预览乙')])
+    const after = await runWithWarnings(h.App)
+    assert.strictEqual(after.summary.pushed, 2, `去掉 dry-run 后必须真推 2 条：${JSON.stringify(after.summary)}`)
+    assert.strictEqual(h.cacheMessages().length, 2,
+      '同一 URL 去掉 dry-run 后必须写缓存（证明 ② 的零来自 dryRun 判据，不是夹具不工作）')
+    assert.ok(realFs.existsSync(reportPath), '同一 URL 去掉 dry-run 后必须写日报（同上）')
+
+    // ④ dry-run + 1 条被规则拦下的条目：独立子段，专门钉「dry-run 一条都不写缓存」
+    //    ② 的条目全部通过过滤 ⇒ newMessages 与 items 同集、pushedKeys 恒空 ⇒ 即使去掉
+    //    xbk_app.js:1719 的 `dryRun ? [] : …` 短路，toCache 依然是空（断言无判别力）。
+    //    被规则过滤的条目不同：它进 newMessages（:1401）却不进 items/itemsKeys/truncatedKeys，
+    //    短路一旦消失就会被写进缓存 ⇒ 下轮判重跳过 ⇒ 被过滤条目永久漏推。
+    //    这里换独立 pushUrl（独立缓存文件），不动 ①②③ 的任何断言。
+    const urlDryFiltered = 'https://example.invalid/dry-run-filtered.json'
+    const rulesFile = h.FilterStore.filterRulesPaths(cacheDir).file
+    realFs.writeFileSync(rulesFile,
+      JSON.stringify({ schema: 1, revision: 1, filter: { pingbibiaoti: '预览乙', pingbitime: '' } }), { mode: 0o600 })
+    realFs.rmSync(reportPath, { force: true }) // ③ 已写过日报：先清掉，「dry-run 不写日报」才有判别力
+    h.Config.api.pushUrl = urlDryFiltered
+    h.setItems([makeRunItem('pb-1', '预览乙：被规则拦下的条目'), makeRunItem('pb-2', '预览丙：正常条目')])
+    process.env.XBK_DRY_RUN = '1'
+    const sentBeforeFiltered = h.sends.length
+    let dryFiltered
+    try {
+      console.log = (...a) => { logs.push(a.map(String).join(' ')) }
+      console.warn = () => {}
+      dryFiltered = await h.App.run()
+    } finally {
+      console.log = origLog
+      console.warn = origWarn
+    }
+    assert.deepStrictEqual(
+      { total: dryFiltered.total, filtered: dryFiltered.filtered, pushed: dryFiltered.pushed, failed: dryFiltered.failed },
+      { total: 2, filtered: 1, pushed: 0, failed: 0 },
+      `dry-run（含 1 条被过滤条目）摘要异常：${JSON.stringify(dryFiltered)}`)
+    assert.strictEqual(h.sends.length, sentBeforeFiltered,
+      'dry-run 不得调用 Pusher.send（这一轮同样含待推送条目）')
+    const cacheMsgsFiltered = realFs.existsSync(cacheFileOf(urlDryFiltered)) ? h.cacheMessages() : []
+    assert.strictEqual(cacheMsgsFiltered.length, 0,
+      `dry-run 不得把任何条目写进缓存——包括只进 newMessages、不进 items 的被过滤条目（实际写入：${JSON.stringify(cacheMsgsFiltered.map(m => m && m.id))}）`)
+    assert.ok(!realFs.existsSync(reportPath), 'dry-run 这一轮同样不得写日报状态（_updateReport 整段跳过）')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+checkAsync('TR-1 maxPerRun 截断：被截断条目不得写入缓存（下轮补推不丢不重），摘要 truncated 如实计数', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('trunc-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const fiveItems = () => [1, 2, 3, 4, 5].map(i => makeRunItem('tr-' + i, '截断' + i))
+  try {
+    // 第一轮：上限 2、来 5 条 ⇒ 只推前 2 条，后 3 条既不推也不缓存
+    h.Config.push.maxPerRun = 2
+    h.setItems(fiveItems())
+    const r1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r1.summary.total, pushed: r1.summary.pushed, truncated: r1.summary.truncated },
+      { total: 5, pushed: 2, truncated: 3 }, `第一轮摘要异常：${JSON.stringify(r1.summary)}`)
+    assert.ok(r1.warns.some(l => l.includes('超过上限')), `截断必须有 console.warn 提示：${JSON.stringify(r1.warns)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id).sort(), ['tr-1', 'tr-2'],
+      '只有真正推送成功的 2 条可入缓存；被截断的 3 条写入缓存 = 下轮判重跳过 = 永久漏推')
+    // run.log 摘要必须如实计数（cron/status 的可观测入口）
+    const runLog1 = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/truncated=3 pushed=2 failed=0/.test(runLog1), `run.log 摘要应记 truncated=3 pushed=2：${runLog1.slice(-400)}`)
+
+    // 第二轮：上限放宽，接口重放同样 5 条 ⇒ 缓存去重 2、补推 3（不丢不重）
+    h.Config.push.maxPerRun = 100
+    h.setItems(fiveItems())
+    const r2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: r2.summary.pushed, dedup: r2.summary.dedup, truncated: r2.summary.truncated },
+      { pushed: 3, dedup: 2, truncated: 0 }, `第二轮必须补推被截断的 3 条：${JSON.stringify(r2.summary)}`)
+    assert.strictEqual(h.cacheMessages().length, 5, '两轮结束后 5 条应全部入缓存（无重复、无遗漏）')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严格大于），不得多推也不得写截断告警', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('trunc-eq-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  try {
+    h.Config.push.maxPerRun = 2
+    h.setItems([makeRunItem('eq-1', '边界甲'), makeRunItem('eq-2', '边界乙')])
+    const r = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: r.summary.pushed, truncated: r.summary.truncated },
+      { pushed: 2, truncated: 0 }, `恰好等于上限时不得截断：${JSON.stringify(r.summary)}`)
+    assert.ok(!r.warns.some(l => l.includes('超过上限')),
+      `恰好等于上限不得输出截断告警（>= 会多发一条 0 条截断的告警）：${JSON.stringify(r.warns)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id).sort(), ['eq-1', 'eq-2'], '两条都必须入缓存')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+// 共享夹具：临时 cacheDir + 真装配 harness + 环境变量还原（异常路径也还原，避免污染后续用例）
+async function withRunHarness (over, fn) {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('runh-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir, over)
+  try {
+    return await fn(h, cacheDir, realFs)
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+}
+
+checkAsync('ALERT-1 异类告警不得互相压制：截断告警限频窗口内的「推送全部失败」必须送达，同类仍限频', async () => {
+  const now = 1700000000000
+  const { app, sent } = makeNotifyApp({ Config: { alert: { enabled: true, intervalMs: 3600000 } } })
+  const r1 = await withFixedNowAsync(now, () => app._sendAlert('截断 3 条', 'truncate'))
+  assert.strictEqual(r1, true, '首条截断告警应发送成功')
+  assert.strictEqual(sent.length, 1)
+  // 5 分钟后换一类：共用单一 lastAt 时这里会被整段压掉（返回 undefined、实发数仍为 1）
+  const r2 = await withFixedNowAsync(now + 300000, () => app._sendAlert('推送全部失败（2 条）', 'push-fail'))
+  assert.strictEqual(r2, true, '异类告警必须送达（曾被 alert.state 的单一 lastAt 压制）')
+  assert.strictEqual(sent.length, 2, `异类告警实发数应为 2，实际 ${sent.length}`)
+  // 同类仍在窗口内 ⇒ 必须继续压制（防轰炸是既定设计，不得为了「不压制」把它拆掉）
+  const r3 = await withFixedNowAsync(now + 600000, () => app._sendAlert('又一次全失败', 'push-fail'))
+  assert.strictEqual(r3, undefined, '同类告警在限频窗口内必须继续压制（防轰炸）')
+  assert.strictEqual(sent.length, 2, '同类压制生效，不得多发')
+  // 第三类同样不被前两类压制
+  const r4 = await withFixedNowAsync(now + 700000, () => app._sendAlert('接口 404', 'run-error'))
+  assert.strictEqual(r4, true, '第三类告警同样不得被其他类别压制')
+  assert.strictEqual(sent.length, 3)
+})
+
+checkAsync('ALERT-2 旧版 alert.state（只有 lastAt、无 classes）升级后仍限频：不得因格式变更放过轰炸', async () => {
+  const now = 1700000000000
+  const legacy = JSON.stringify({ lastAt: now - 60000 }) // 1 分钟前写过，无 classes 字段
+  const { app, sent } = makeNotifyApp({
+    Config: { alert: { enabled: true, intervalMs: 3600000 } },
+    readSafeTextResult: () => ({ status: 'ok', text: legacy })
+  })
+  await withFixedNowAsync(now, async () => {
+    for (const cls of ['truncate', 'push-fail', 'run-error']) {
+      const r = await app._sendAlert('boom', cls)
+      assert.strictEqual(r, undefined, `旧状态文件的 lastAt 必须继续压制 ${cls}（升级后第一个窗口不得放宽）`)
+    }
+  })
+  assert.strictEqual(sent.length, 0, '旧状态在窗口内不得触发任何告警')
+})
+
+checkAsync('ALERT-3 告警状态向后兼容：顶层 lastAt=最近一次（旧读者口径不变），并逐类记 classes', async () => {
+  const now = 1700000000000
+  const { app, stateWrites } = makeNotifyApp({ Config: { alert: { enabled: true, intervalMs: 3600000 } } })
+  await withFixedNowAsync(now, () => app._sendAlert('截断', 'truncate'))
+  await withFixedNowAsync(now + 300000, () => app._sendAlert('全失败', 'push-fail'))
+  assert.ok(stateWrites.length >= 2, `两次告警都应持久化状态：${JSON.stringify(stateWrites)}`)
+  const last = JSON.parse(stateWrites[stateWrites.length - 1][1])
+  assert.strictEqual(last.lastAt, now + 300000, '顶层 lastAt 必须是最近一次告警时间（status/旧版本读取口径不变）')
+  assert.deepStrictEqual(last.classes, { truncate: now, 'push-fail': now + 300000 },
+    'classes 必须逐类记录最后发送时间（异类分流的数据基础）')
+  // 显式码元序比较器：默认 sort() 也是 UTF-16 码元序，但依赖隐式行为在跨 locale/实现时不可确定
+  // （且读代码的人得自己推断），localeCompare 反过来会随 ICU/locale 变序 ⇒ 这里写死码元序。
+  assert.deepStrictEqual(Object.keys(last).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), ['classes', 'lastAt'], '状态字段只增不改（不得丢 lastAt）')
+})
+
+checkAsync('ALERT-4 同一轮「截断 + 推送全部失败」两类告警都必须送达（调用点必须各带类别）', async () => {
+  const alertSends = []
+  const Pusher = {
+    send: async (text, desp) => {
+      if (text.includes('运行异常')) {
+        alertSends.push({ text, desp })
+        return { successfulChannels: ['stub'], failures: [] }
+      }
+      throw new Error('模拟推送通道全失败')
+    }
+  }
+  await withRunHarness({ Pusher }, async (h) => {
+    h.Config.alert = { enabled: true, intervalMs: 3600000 }
+    h.Config.push.maxPerRun = 2
+    h.setItems([1, 2, 3, 4, 5].map(i => makeRunItem('al-' + i, '告警' + i)))
+    const r = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: r.summary.pushed, failed: r.summary.failed, truncated: r.summary.truncated },
+      { pushed: 0, failed: 2, truncated: 3 }, `夹具前提异常：${JSON.stringify(r.summary)}`)
+    assert.strictEqual(alertSends.length, 2,
+      `截断（truncate）与全失败（push-fail）是两类告警，都必须送达；共用单一 lastAt 时第二条被压掉（实际 ${alertSends.length}）`)
+    assert.ok(alertSends[0].desp.includes('截断'), `第一条应是截断告警：${alertSends[0].desp}`)
+    assert.ok(alertSends[1].desp.includes('推送全部失败'), `第二条应是全失败告警：${alertSends[1].desp}`)
+  })
+})
+
+checkAsync('ALERT-5 同类告警被限频压制时仍必须留痕：run.log 有 truncated= 与 ERROR 推送全部失败', async () => {
+  const alertSends = []
+  const Pusher = {
+    send: async (text) => {
+      if (text.includes('运行异常')) {
+        alertSends.push(text)
+        return { successfulChannels: ['stub'], failures: [] }
+      }
+      throw new Error('模拟推送通道全失败')
+    }
+  }
+  await withRunHarness({ Pusher }, async (h, cacheDir, realFs) => {
+    h.Config.alert = { enabled: true, intervalMs: 3600000 }
+    h.Config.push.maxPerRun = 2
+    const now = Date.now()
+    // 预置「两类都刚发过」的状态 ⇒ 本轮两条告警都被限频吞掉（压制是设计，但不得零留痕）
+    realFs.writeFileSync(path.join(cacheDir, 'alert.state'),
+      JSON.stringify({ lastAt: now, classes: { truncate: now, 'push-fail': now } }))
+    h.setItems([1, 2, 3, 4, 5].map(i => makeRunItem('qs-' + i, '压制' + i)))
+    const r = await runWithWarnings(h.App)
+    assert.strictEqual(r.summary.truncated, 3, '夹具前提：本轮确实截断 3 条')
+    assert.strictEqual(alertSends.length, 0, '限频窗口内同类告警必须被压制（本用例的前提）')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/truncated=3/.test(log), `截断必须在 run.log 摘要行留痕（“被压制=零留痕”不成立）：${log.slice(-400)}`)
+    assert.ok(/ERROR 推送全部失败 2 条/.test(log), `全失败必须有 ERROR 行（cron 翻日志可见）：${log.slice(-400)}`)
+  })
+})
+
+checkAsync('DAT-1 100% 脏数据必须可观测：run.log WARN + bad= 字段 + 告警，而空数组/全量去重不告警', async () => {
+  const alertSends = []
+  const Pusher = {
+    send: async (text, desp) => {
+      if (text.includes('运行异常')) {
+        alertSends.push({ text, desp })
+        return { successfulChannels: ['stub'], failures: [] }
+      }
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  await withRunHarness({ Pusher }, async (h, cacheDir, realFs) => {
+    h.Config.alert = { enabled: true, intervalMs: 0 } // 不限频：关注「有没有告警」而不是限频
+    const logPath = path.join(cacheDir, 'run.log')
+    const readLog = () => (realFs.existsSync(logPath) ? realFs.readFileSync(logPath, 'utf8') : '')
+    // 只数 WARN 行：ALERT 行的原因文本里也会出现「全部为脏数据」，按整句计数会把告警自身算进来
+    const dirtyLines = () => readLog().split('\n').filter(l => /WARN 本轮抓取 \d+ 条全部为脏数据/.test(l)).length
+
+    // ① 全部非法元素：契约不变（failed 只统计已进入推送的条目 ⇒ 0、退出码 0），但必须留痕 + 告警
+    h.setItems([null, 'oops', 123, [], true])
+    const r1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r1.summary.total, pushed: r1.summary.pushed, failed: r1.summary.failed },
+      { total: 5, pushed: 0, failed: 0 },
+      `既定契约：failed 只统计已进入推送的条目（100% 脏数据时恒为 0），不得改动：${JSON.stringify(r1.summary)}`)
+    assert.strictEqual(dirtyLines(), 1, `run.log 必须留一行「全部为脏数据」WARN：${readLog().slice(-500)}`)
+    assert.ok(/bad=5/.test(readLog()), `run.log 摘要行必须带 bad=5（非对象元素数）：${readLog().slice(-300)}`)
+    assert.strictEqual(alertSends.length, 1,
+      `100% 脏数据必须告警（旧实现零告警零留痕，脚本整天「绿色成功」却一条没推）：${JSON.stringify(alertSends)}`)
+    assert.ok(alertSends[0].desp.includes('脏数据'), `告警原因必须点名脏数据：${alertSends[0].desp}`)
+
+    // ② 全部无有效身份：同样可观测，并带 noidentity 明细
+    h.Config.api.pushUrl = 'https://example.invalid/dirty-noidentity.json'
+    h.setItems([{}, {}, { title: '' }])
+    const r2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r2.summary.total, pushed: r2.summary.pushed, failed: r2.summary.failed },
+      { total: 3, pushed: 0, failed: 0 }, `全无身份同样不得改 failed 口径：${JSON.stringify(r2.summary)}`)
+    assert.strictEqual(dirtyLines(), 2, '全无身份也必须留「全部为脏数据」WARN')
+    assert.ok(/noidentity=3/.test(readLog()), `摘要行必须带 noidentity=3：${readLog().slice(-300)}`)
+    assert.strictEqual(alertSends.length, 2, '全无身份同样必须告警')
+
+    // ③ 空数组：既定契约「空数据不告警」——不得因本修复被打破
+    h.Config.api.pushUrl = 'https://example.invalid/dirty-empty.json'
+    h.setItems([])
+    const r3 = await runWithWarnings(h.App)
+    assert.strictEqual(r3.summary.total, 0, `空数组 total 应为 0：${JSON.stringify(r3.summary)}`)
+    assert.strictEqual(dirtyLines(), 2, '空数组不得新增「全部为脏数据」WARN')
+    assert.strictEqual(alertSends.length, 2, '空数组不得告警（既定契约，test_app.js「空数据 → 不推送不崩溃」钉住）')
+
+    // ④ 全量去重（items 为空但一条不脏）：不得误报脏数据
+    h.Config.api.pushUrl = 'https://example.invalid/dirty-dedup.json'
+    h.setItems([makeRunItem('dd-1', '去重甲'), makeRunItem('dd-2', '去重乙')])
+    const warm = await runWithWarnings(h.App)
+    assert.strictEqual(warm.summary.pushed, 2, `预热轮应推 2 条：${JSON.stringify(warm.summary)}`)
+    h.setItems([makeRunItem('dd-1', '去重甲'), makeRunItem('dd-2', '去重乙')])
+    const r4 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ dedup: r4.summary.dedup, pushed: r4.summary.pushed },
+      { dedup: 2, pushed: 0 }, `预热轮后应全量去重：${JSON.stringify(r4.summary)}`)
+    assert.strictEqual(dirtyLines(), 2, '全量去重（非脏数据）不得误报「全部为脏数据」')
+    assert.strictEqual(alertSends.length, 2, '全量去重不得告警')
+  })
+})
+
+// ===== C5-016：「推送失败不写缓存」契约（变异集内唯一覆盖点）=====
+// run() 的失败路径此前在 test_app_unit.js 里零覆盖：三处 App.run 全用恒成功桩（Pusher.send
+// 永不抛）。该契约只有不进变异集的 test_app.js 守着，于是「推送失败仍写缓存」的变异体
+// （xbk_app.js 的 `ok: false` → `ok: true`、toCache 的 `|| pushedKeys.has(keyOf(m))` → `|| true`）
+// 在变异矩阵里可存活——后果是失败消息被写进缓存，下轮当「已推送」去重 ⇒ 永久漏推。
+// 断言必须落到**缓存文件内容**：只看 summary.failed 杀不掉 toCache 那个变异体。
+checkAsync('RUN-1 推送失败不写缓存：失败条目不得进缓存（含文件字节），下一轮必须重推', async () => {
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = mkTmpFixture('filter-run-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir)
+  const FAIL_TITLE = '通道失败乙'
+  const origSend = h.Pusher.send
+  let failTitle = FAIL_TITLE // null = 通道恢复
+  h.Pusher.send = async (text, desp) => {
+    if (failTitle && text.includes(failTitle)) throw new Error('push boom（模拟通道失败）')
+    return origSend(text, desp)
+  }
+  const cachePath = h.MessageStore.getFilePath(h.cacheName())
+  try {
+    h.setItems([makeRunItem('run1-a', '正常甲'), makeRunItem('run1-b', FAIL_TITLE)])
+    const round1 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: round1.summary.pushed, failed: round1.summary.failed }, { pushed: 1, failed: 1 },
+      `第一轮应是「1 推成功 + 1 推失败」：${JSON.stringify(round1.summary)}`)
+    const idsAfterFail = h.cacheMessages().map(m => m && m.id)
+    assert.deepStrictEqual(idsAfterFail, ['run1-a'],
+      `推送失败的条目绝不能被写进缓存（写进去 ⇒ 下轮被当已推送去重 ⇒ 永久漏推）：实际 ${JSON.stringify(idsAfterFail)}`)
+    // 字节级复核：读取层可能因形状/键名差异掩盖问题，缓存文件里也不得出现失败条目。
+    assert.ok(!realFs.readFileSync(cachePath, 'utf8').includes('run1-b'),
+      '缓存文件字节里不得出现失败条目 id（推送失败不写缓存）')
+
+    // 第二轮：通道恢复。失败条目必须被重推（若上轮被误写进缓存，这里会因去重而 pushed=0）。
+    failTitle = null
+    const round2 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: round2.summary.pushed, failed: round2.summary.failed }, { pushed: 1, failed: 0 },
+      `第二轮必须重推上轮失败的那条：${JSON.stringify(round2.summary)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m && m.id).sort(), ['run1-a', 'run1-b'],
+      '重推成功后两条都应进缓存')
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+})
+
+// ===== 异步用例执行（必须留在文件末尾）=====
+// C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
+// 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
+// 现在：① 移到文件末尾；② 先快照 asyncChecks 再跑；③ 对账「声明数 === 结算数」。
+;(async () => {
+  const pending = asyncChecks.slice()
+  for (const [name, fn] of pending) {
+    try {
+      await fn()
+      passed++
+    } catch (e) {
+      failed++
+      failures.push(`${name} :: ${e.message}`)
+    }
+  }
+  console.log(`通过 ${passed} / 失败 ${failed}（声明 ${declared} 例）`)
+  if (failed > 0) {
+    for (const f of failures) console.log(`  ❌ ${f}`)
+  }
+  if (passed + failed !== declared) {
+    console.log(`  ❌ 用例计数对账失败：声明 ${declared} 例，实际结算 ${passed + failed} 例（${declared - passed - failed} 例永远不会被执行）`)
+    process.exit(1)
+  }
+  process.exit(failed > 0 ? 1 : 0)
+})().catch(e => { console.error(e); process.exitCode = 1 })

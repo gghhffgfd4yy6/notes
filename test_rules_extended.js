@@ -63,7 +63,12 @@ console.log('=== xbk_rules.js 扩展测试 ===')
 check('compileRules: 空配置返回空编译结果', () => {
   const r = engine.compileRules({})
   // 契约：空配置下字段一律未编译（null），仅保留 __compiled 旗标
-  assert.deepStrictEqual(Object.keys(r).sort((a, b) => a.localeCompare(b)), ['__compiled', 'keyword', 'pingbitime', 'title'])
+  // C5-071：键序断言必须用码元序（显式比较器，与 `Array#sort` 默认序等价），不用 localeCompare。
+  // localeCompare 的默认 collation 随宿主 ICU/locale 变化（实测 sv-SE 把 ['z','å','a'] 排成 a,z,å，
+  // en-US 排成 a,å,z）——用它对固定期望数组排序，等于把断言押在 runner 的 LANG/ICU 数据上。
+  // 这 4 个 ASCII 键在 33 个 locale 下当前恰好同序（零行为差），但顺序契约来自码元序，不是来自词法排序。
+  // 比较器写出来（S2871）：不传比较器时排序口径是隐式的，读代码的人看不出这是刻意约定。
+  assert.deepStrictEqual(Object.keys(r).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), ['__compiled', 'keyword', 'pingbitime', 'title'])
   assert.strictEqual(r.keyword, null, '未配置的字段必须为 null（不得落成字符串语义）')
   assert.strictEqual(r.__compiled, true, '必须打上 __compiled 旗标')
 })
@@ -242,38 +247,45 @@ check('checkTimeCompiled: 无 louzhuregtime 返回 null（不拦截）', () => {
 })
 
 // ===== validateConfig =====
+// C5-055：本节此前整段是 test_rules.js:18-36 的重复，而且更弱——只做 `includes` 子串匹配：
+// 多一条垃圾告警、文案改几个字、告警挂到错误的字段上都照样绿。这里逐条收紧成「精确全文数组」
+// （deepStrictEqual），并在末尾补一条 test_rules.js 没有的多字段组合用例（两个字段的告警顺序与集合）。
 check('validateConfig: 空配置无警告', () => {
   const warnings = engine.validateConfig({})
   assert.strictEqual(warnings.length, 0, '空配置应无警告')
 })
 
-check('validateConfig: 非字符串值告警', () => {
+check('validateConfig: 非字符串值告警（精确文案）', () => {
   const warnings = engine.validateConfig({ keyword: 123 })
-  assert.ok(warnings.some(w => w.includes('应为字符串')), '非字符串值应告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」应为字符串，当前为 number，已忽略该字段过滤'],
+    '非字符串值必须恰好产出一条精确告警（多一条/文案漂移即红）')
 })
 
-check('validateConfig: 多行模式下某行缺少 ### 分隔符告警', () => {
+check('validateConfig: 多行模式下某行缺少 ### 分隔符告警（精确文案，且只此一条）', () => {
   const warnings = engine.validateConfig({ keyword: 'cat###abc\nbadline' })
-  assert.ok(warnings.some(w => w.includes('缺少') && w.includes('分隔符')), '缺少分隔符应告警')
-  assert.ok(warnings.some(w => w.includes('badline')), '警告应包含缺少分隔符的行')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」行缺少 ### 分隔符，该行将被忽略：「badline」'],
+    '缺少分隔符必须恰好一条告警且回显该行（合法行不得额外告警）')
 })
 
-check('validateConfig: 多个 ### 告警', () => {
+check('validateConfig: 多个 ### 告警（精确文案）', () => {
   const warnings = engine.validateConfig({ keyword: 'a###b###c' })
-  assert.ok(warnings.some(w => w.includes('多个')), '多个 ### 应告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」行包含多个 ###，仅前两段生效：「a###b###c」'],
+    '多个 ### 必须恰好一条告警且回显整行')
 })
 
-check('validateConfig: 值正则为空告警', () => {
+check('validateConfig: 值正则为空告警（精确文案，且只此一条）', () => {
   const warnings = engine.validateConfig({ keyword: 'cat###' })
-  assert.ok(warnings.some(w => w.includes('为空')), '空值应告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」值正则为空，该行将被忽略（避免永真规则）：「cat###」'],
+    '空值必须恰好一条告警（重复上报即红）')
 })
 
-check('validateConfig: 嵌套量词告警', () => {
+check('validateConfig: 嵌套量词告警（精确文案）', () => {
   const warnings = engine.validateConfig({ keyword: 'cat###(a+)+' })
-  assert.ok(warnings.some(w => w.includes('嵌套量词')), '嵌套量词应告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」值正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(a+)+」'],
+    '嵌套量词必须恰好一条告警且回显被拦下的模式')
 })
 
-check('validateConfig: 非法正则在 re2 可用时告警', () => {
+check('validateConfig: 非法正则在 re2 可用时告警（精确文案，不得用「无效/不支持」二选一放水）', () => {
   const engineRe2 = createRuleEngine({
     Utils: mockUtils,
     FILTER_FIELDS: ['keyword'],
@@ -281,17 +293,28 @@ check('validateConfig: 非法正则在 re2 可用时告警', () => {
     isRe2Available: () => true
   })
   const warnings = engineRe2.validateConfig({ keyword: 'cat###[invalid' })
-  assert.ok(warnings.some(w => w.includes('无效') || w.includes('不支持')), 're2 可用时非法正则应告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」值正则无效或当前环境不支持：「[invalid」'],
+    're2 可用时非法正则必须恰好一条精确告警')
 })
 
-check('validateConfig: pingbitime 首尾空白告警', () => {
+check('validateConfig: pingbitime 首尾空白告警（精确文案）', () => {
   const warnings = engine.validateConfig({ pingbitime: '  5  ' })
-  assert.ok(warnings.some(w => w.includes('首尾空白')), '首尾空白应告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「pingbitime」含首尾空白，已按去空格后的值处理'],
+    '首尾空白必须恰好一条精确告警')
 })
 
-check('validateConfig: pingbitime 非数字告警', () => {
+check('validateConfig: pingbitime 非数字告警（精确文案，不得只断言「有告警」）', () => {
   const warnings = engine.validateConfig({ pingbitime: 'abc' })
-  assert.ok(warnings.length > 0, '非数字 pingbitime 应有告警')
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「pingbitime」的值「abc」不是有效数字（需 ≥0 的有限数）'],
+    '非数字 pingbitime 必须恰好一条精确告警（旧断言只要求 length > 0）')
+})
+
+check('validateConfig: 多字段同时非法时告警集合与顺序固定（test_rules.js 只逐字段断言）', () => {
+  const warnings = engine.validateConfig({ keyword: 'a###b###c', pingbitime: '  5  ' })
+  assert.deepStrictEqual(warnings, [
+    '⚠️ 配置「keyword」行包含多个 ###，仅前两段生效：「a###b###c」',
+    '⚠️ 配置「pingbitime」含首尾空白，已按去空格后的值处理'
+  ], '多字段告警必须逐条精确、按过滤器顺序输出（不得合并/重排/多报）')
 })
 
 check('validateConfig: 正常配置无警告', () => {

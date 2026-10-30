@@ -31,15 +31,54 @@ if (String(dns.lookup).includes('=>')) {
 const REAL_DNS_LOOKUP = dns.lookup
 // 精简容器可能 /etc/hosts 缺 localhost 或 DNS 不可达，导致 dnsLookup 真实解析失败而误报。
 // 统一回环解析，使 dnsCache 的填充/命中/失效路径仍可验证且不触网。
-// ⚠️ 显式声明：本 mock 不模拟 family/options 语义——无条件返回 family=4，并忽略入参 options
-// （family/all/hints）。若将来新增“XBK_DNS_FAMILY=6 → 解析出 IPv6”等断言，需在此依据
-// options.family / options.all 返回对应结果，否则会因固定返回 4 而假绿。
-dns.lookup = (hostname, options, callback) => {
-  const cb = typeof options === 'function' ? options : callback
-  process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
+//
+// C5-054：dns.lookup 替身只有一个来源（本节的两个 helper），不再逐块手抄。
+// 旧写法的问题有两处：
+//   ① 12 处替身里有 2 处只认三参：`dns.lookup(host, cb)`（Node 合法两参形态）会以
+//      TypeError: callback is not a function 崩在 nextTick 里，而不是断言失败；
+//   ② 除 1 处按 family/hints/order 建模的替身外，其余都忽略 options：all:true 拿到标量、
+//      family:6 拿回 family 4——依赖这两种形状的断言全都在假形状上通过。
+// `withResolver` 原先只存在于最后一个 test 块内部，前面的块作用域够不到，只能各自手抄装/拆。
+const lookupStub = ({ address = 'legacy-scalar-address', family = 4, onCall } = {}) => (hostname, options, callback) => {
+  const twoArg = typeof options === 'function'
+  const opts = twoArg ? {} : (options || {})
+  const cb = twoArg ? options : callback
+  if (typeof cb !== 'function') throw new TypeError('dns.lookup 替身收到非函数回调：' + typeof cb)
+  if (onCall) onCall(hostname, opts)
+  // 按 Node 语义建模两种回调形状：all:true → [{address, family}]；否则标量地址 + 族。
+  // family 选项按 4/6 回显（其余取值按 Node 默认 4）。
+  const fam = opts.family === 6 ? 6 : family
+  const list = [{ address, family: fam }]
+  process.nextTick(() => cb(null, opts.all === true ? list : address, opts.all === true ? undefined : fam))
 }
+const DEFAULT_LOOKUP = lookupStub()
+// 装/拆成对：无论断言如何中途失败都还原本块之前的替身（原先多处只在成功路径末尾还原）。
+const withResolver = async (fn, body) => {
+  const prev = dns.lookup
+  dns.lookup = fn
+  try { return await body() } finally { dns.lookup = prev }
+}
+dns.lookup = DEFAULT_LOOKUP
 
 ;(async () => {
+  // ===== [夹具自检] 文件级 dns.lookup 替身必须按 options 建模（C5-054）=====
+  // 这三条锁住替身本身的保真度：只认三参 / 吞掉 options 的替身会让调用方的错误在 nextTick 里
+  // 变成 TypeError，或让「all / family 不同」的断言在假形状上通过。
+  {
+    const call = (options) => new Promise((resolve, reject) => {
+      const cb = (e, address, family) => e ? reject(e) : resolve({ address, family })
+      if (options === undefined) dns.lookup('dns-stub-selfcheck.invalid', cb) // 两参形态
+      else dns.lookup('dns-stub-selfcheck.invalid', options, cb)
+    })
+    const twoArg = await call(undefined)
+    assert.strictEqual(twoArg.address, 'legacy-scalar-address', '两参调用 dns.lookup(host, cb) 必须可用（只认三参的替身会 TypeError）')
+    const asAll = await call({ all: true })
+    assert.ok(Array.isArray(asAll.address), 'all:true 必须按 Node 形状返回数组（旧替身返回标量：依赖该形状的断言会假绿）')
+    assert.strictEqual(asAll.address[0].address, 'legacy-scalar-address', 'all:true 的数组项应含 address')
+    const v6 = await call({ family: 6 })
+    assert.strictEqual(v6.family, 6, 'family:6 必须回显 6（旧替身一律返回 4，等于吞掉 options.family）')
+  }
+
   // ===== profileMs：有限数值四舍五入，否则 'n/a' =====
   assert.strictEqual(profileMs(123.6), 124, '有限数值应四舍五入')
   assert.strictEqual(profileMs(0), 0, '0 应保留')
@@ -99,20 +138,13 @@ dns.lookup = (hostname, options, callback) => {
   {
     const timeoutHost = 'timeout-invalidate-probe.invalid'
     let timeoutLookups = 0
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      timeoutLookups += 1
-      process.nextTick(() => cb(null, '192.0.2.9', 4))
-    }
-    await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
-    assert.strictEqual(timeoutLookups, 1, '首次解析应走底层')
-    assert.strictEqual(invalidateDnsForError({ code: 'ETIMEDOUT' }, `https://${timeoutHost}/api`), true, 'ETIMEDOUT 应触发缓存失效（AGENTS-02）')
-    await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
-    assert.strictEqual(timeoutLookups, 2, 'ETIMEDOUT 失效后同一主机应重新解析（旧口径此处仍为 1）')
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
-    }
+    await withResolver(lookupStub({ address: '192.0.2.9', onCall: () => { timeoutLookups += 1 } }), async () => {
+      await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
+      assert.strictEqual(timeoutLookups, 1, '首次解析应走底层')
+      assert.strictEqual(invalidateDnsForError({ code: 'ETIMEDOUT' }, `https://${timeoutHost}/api`), true, 'ETIMEDOUT 应触发缓存失效（AGENTS-02）')
+      await new Promise((resolve, reject) => dnsLookup(timeoutHost, {}, (e) => e ? reject(e) : resolve()))
+      assert.strictEqual(timeoutLookups, 2, 'ETIMEDOUT 失效后同一主机应重新解析（旧口径此处仍为 1）')
+    })
     console.log('✅ AGENTS-02：ETIMEDOUT 清理 DNS 缓存后重试窗口重新解析')
   }
 
@@ -120,24 +152,17 @@ dns.lookup = (hostname, options, callback) => {
   {
     const certHost = 'cert-invalidate-probe.invalid'
     let certLookups = 0
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      certLookups += 1
-      process.nextTick(() => cb(null, '192.0.2.11', 4))
-    }
-    await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
-    assert.strictEqual(certLookups, 1, '首次解析应走底层')
-    assert.strictEqual(
-      invalidateDnsForError({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }, `https://${certHost}/api`),
-      false,
-      '证书错误不应触发 DNS 失效（AGENTS-08）'
-    )
-    await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
-    assert.strictEqual(certLookups, 1, '证书错误后缓存应仍然有效（旧口径此处为 2）')
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
-    }
+    await withResolver(lookupStub({ address: '192.0.2.11', onCall: () => { certLookups += 1 } }), async () => {
+      await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
+      assert.strictEqual(certLookups, 1, '首次解析应走底层')
+      assert.strictEqual(
+        invalidateDnsForError({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }, `https://${certHost}/api`),
+        false,
+        '证书错误不应触发 DNS 失效（AGENTS-08）'
+      )
+      await new Promise((resolve, reject) => dnsLookup(certHost, {}, (e) => e ? reject(e) : resolve()))
+      assert.strictEqual(certLookups, 1, '证书错误后缓存应仍然有效（旧口径此处为 2）')
+    })
     console.log('✅ AGENTS-08：证书主机名不匹配不再清 DNS 缓存')
   }
 
@@ -219,55 +244,49 @@ dns.lookup = (hostname, options, callback) => {
   {
     const keyProbeHost = 'prewarm-key-probe.invalid'
     const keyCalls = []
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      const opts = typeof options === 'function' ? {} : (options || {})
-      keyCalls.push({ hostname, options: opts })
-      process.nextTick(() => cb(null, opts.all ? [{ address: '192.0.2.7', family: 4 }] : '192.0.2.7', 4))
-    }
-    const warm = await prewarmDns(keyProbeHost)
-    assert.strictEqual(warm.ok, true, '预热应成功')
-    assert.strictEqual(keyCalls.length, 1, '预热应发起 1 次底层解析')
-    assert.strictEqual(keyCalls[0].options.all, true, '底层应统一按 all:true 解析（缓存完整地址列表）')
-    // 预热必须与生产请求同源取值：hints 必须等于 net 实测传的 ADDRCONFIG（family 未指定时）
-    assert.strictEqual(keyCalls[0].options.hints, dns.ADDRCONFIG, '预热应按生产请求选项取 hints=ADDRCONFIG')
-    // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目。
-    // ⚠️ hints 必须与实现（xbk_agents 的 PRODUCTION_LOOKUP_HINTS）同源取 dns.ADDRCONFIG，不得把本机
-    // 观测到的 1024 写死：该常量是**平台相关**取值（本机 Linux 为 1024，个别平台可为 0）。写死会在
-    // 常量≠1024 的平台上构造出与预热不同的 key，把「同选项必须命中」这条断言变成平台专属假红
-    // （CI 实测：本机绿、CI 红，底层解析次数 2 而非 1）。
-    const allHit = await new Promise((resolve, reject) => {
-      dnsLookup(keyProbeHost, { hints: dns.ADDRCONFIG, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
-    })
-    assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（不同 key 时为 2），实际 ${keyCalls.length}`)
-    assert.ok(Array.isArray(allHit.address) && allHit.address[0] && allHit.address[0].address === '192.0.2.7', 'all:true 调用方应拿到地址数组')
-    // 同一缓存条目服务非 all 调用方：形状适配为标量（调用方选项与预热同源，故仍共享条目）
-    const scalarHit = await new Promise((resolve, reject) => {
-      dnsLookup(keyProbeHost, { hints: dns.ADDRCONFIG }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
-    })
-    assert.strictEqual(keyCalls.length, 1, '同选项的非 all 调用方也应命中同一缓存条目，不应再发起解析')
-    assert.strictEqual(scalarHit.address, '192.0.2.7', '非 all 调用方应拿到标量地址')
-    assert.strictEqual(scalarHit.family, 4, '非 all 调用方应拿到地址族')
-    // 选项不同的调用方（未指定 hints）语义不同，不得复用上面按 ADDRCONFIG 筛过的条目：必须自己解析。
-    // ⚠️ 前提是 dns.ADDRCONFIG !== 0（同样是平台相关常量）：若该常量为 0，预热选项 hints 与未指定的 {}
-    // 在 xbk_agents 的 dnsSelectionSignature 里归一后同为 0（`opts.hints || 0`）——两者**就是同一个 key**，
-    // 「选项不同 ⇒ 必须重新解析」在数学上不可构造。这种平台上必须显式跳过并说明，不能留成恒假断言
-    // （也不改成恒真：跳过路径不产生任何通过记录）。非 0 平台照旧逐条断言，强度不变。
-    if (dns.ADDRCONFIG === 0) {
-      console.log('⏭ 跳过 AGENTS-11「不同 hints 必须重新解析」：本平台 dns.ADDRCONFIG === 0，{} 与预热选项同 key（差异不可构造）')
-    } else {
-      const plainHit = await new Promise((resolve, reject) => {
-        dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+    await withResolver(lookupStub({
+      address: '192.0.2.7',
+      onCall: (hostname, opts) => keyCalls.push({ hostname, options: opts })
+    }), async () => {
+      const warm = await prewarmDns(keyProbeHost)
+      assert.strictEqual(warm.ok, true, '预热应成功')
+      assert.strictEqual(keyCalls.length, 1, '预热应发起 1 次底层解析')
+      assert.strictEqual(keyCalls[0].options.all, true, '底层应统一按 all:true 解析（缓存完整地址列表）')
+      // 预热必须与生产请求同源取值：hints 必须等于 net 实测传的 ADDRCONFIG（family 未指定时）
+      assert.strictEqual(keyCalls[0].options.hints, dns.ADDRCONFIG, '预热应按生产请求选项取 hints=ADDRCONFIG')
+      // 真实请求形态：net 传 hints=ADDRCONFIG + all=true → 必须命中预热写入的缓存条目。
+      // ⚠️ hints 必须与实现（xbk_agents 的 PRODUCTION_LOOKUP_HINTS）同源取 dns.ADDRCONFIG，不得把本机
+      // 观测到的 1024 写死：该常量是**平台相关**取值（本机 Linux 为 1024，个别平台可为 0）。写死会在
+      // 常量≠1024 的平台上构造出与预热不同的 key，把「同选项必须命中」这条断言变成平台专属假红
+      // （CI 实测：本机绿、CI 红，底层解析次数 2 而非 1）。
+      const allHit = await new Promise((resolve, reject) => {
+        dnsLookup(keyProbeHost, { hints: dns.ADDRCONFIG, all: true }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
       })
-      assert.strictEqual(keyCalls.length, 2, 'hints:0 与预热的 hints:ADDRCONFIG 选项不同 → 必须重新解析（AGENTS-11）')
-      assert.ok(!keyCalls[1].options.hints, '重新解析必须把调用方自己的 hints（此处未指定）交给底层')
-      assert.strictEqual(plainHit.address, '192.0.2.7', 'hints:0 调用方应拿到自己那次解析的结果')
-    }
-    // 恢复文件头的确定性 mock（保持后续断言的既定语义）
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
-    }
+      assert.strictEqual(keyCalls.length, 1, `预热后真实请求形态的 lookup 应命中同一缓存（不同 key 时为 2），实际 ${keyCalls.length}`)
+      assert.ok(Array.isArray(allHit.address) && allHit.address[0] && allHit.address[0].address === '192.0.2.7', 'all:true 调用方应拿到地址数组')
+      // 同一缓存条目服务非 all 调用方：形状适配为标量（调用方选项与预热同源，故仍共享条目）
+      const scalarHit = await new Promise((resolve, reject) => {
+        dnsLookup(keyProbeHost, { hints: dns.ADDRCONFIG }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+      })
+      assert.strictEqual(keyCalls.length, 1, '同选项的非 all 调用方也应命中同一缓存条目，不应再发起解析')
+      assert.strictEqual(scalarHit.address, '192.0.2.7', '非 all 调用方应拿到标量地址')
+      assert.strictEqual(scalarHit.family, 4, '非 all 调用方应拿到地址族')
+      // 选项不同的调用方（未指定 hints）语义不同，不得复用上面按 ADDRCONFIG 筛过的条目：必须自己解析。
+      // ⚠️ 前提是 dns.ADDRCONFIG !== 0（同样是平台相关常量）：若该常量为 0，预热选项 hints 与未指定的 {}
+      // 在 xbk_agents 的 dnsSelectionSignature 里归一后同为 0（`opts.hints || 0`）——两者**就是同一个 key**，
+      // 「选项不同 ⇒ 必须重新解析」在数学上不可构造。这种平台上必须显式跳过并说明，不能留成恒假断言
+      // （也不改成恒真：跳过路径不产生任何通过记录）。非 0 平台照旧逐条断言，强度不变。
+      if (dns.ADDRCONFIG === 0) {
+        console.log('⏭ 跳过 AGENTS-11「不同 hints 必须重新解析」：本平台 dns.ADDRCONFIG === 0，{} 与预热选项同 key（差异不可构造）')
+      } else {
+        const plainHit = await new Promise((resolve, reject) => {
+          dnsLookup(keyProbeHost, {}, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+        })
+        assert.strictEqual(keyCalls.length, 2, 'hints:0 与预热的 hints:ADDRCONFIG 选项不同 → 必须重新解析（AGENTS-11）')
+        assert.ok(!keyCalls[1].options.hints, '重新解析必须把调用方自己的 hints（此处未指定）交给底层')
+        assert.strictEqual(plainHit.address, '192.0.2.7', 'hints:0 调用方应拿到自己那次解析的结果')
+      }
+    })
     console.log('✅ AGENTS-01/11：预热与真实请求同 key；选项不同（hints）不再互相复用条目')
   }
 
@@ -380,10 +399,7 @@ dns.lookup = (hostname, options, callback) => {
     assert.strictEqual(families(r2), '4', '同选项并发调用方应共享同一次解析结果')
     assert.strictEqual(families(r3), '6,4', '不同选项的并发调用方应拿到自己那次解析的结果')
     // 恢复文件头的确定性 mock（保持后续断言的既定语义）
-    dns.lookup = (hostname, options, callback) => {
-      const cb = typeof options === 'function' ? options : callback
-      process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
-    }
+    dns.lookup = DEFAULT_LOOKUP
     console.log('✅ AGENTS-11：缓存键含 family/hints/verbatim(order)——不同选项不复用不匹配地址，同选项仍共享条目')
   }
 
@@ -406,11 +422,7 @@ dns.lookup = (hostname, options, callback) => {
   // invalidateDns 的 key 前缀必须是 `host + '|'`（既不是「删全部」，也不是裸 host 前缀）
   const mrLookup = dns.lookup
   let mrCalls = 0
-  dns.lookup = (hostname, options, callback) => {
-    mrCalls += 1
-    const cb = typeof options === 'function' ? options : callback
-    process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
-  }
+  dns.lookup = lookupStub({ onCall: () => { mrCalls += 1 } })
   // 计时器必须在 race settle 后清掉：p 先 settle 时原写法仍留着定时器存活，
   // 会把进程多留 ms 毫秒（反复的变异运行逐次累积这段空等）。见 PR #173 评审。
   const mrSettle = (p) => {
@@ -433,11 +445,7 @@ dns.lookup = (hostname, options, callback) => {
   // 显式 order 的建模：合法取值必须仍进缓存（DNS_RESULT_ORDERS 被置空后全部退化为「不缓存」）
   const mrLookup2 = dns.lookup
   let mrCalls2 = 0
-  dns.lookup = (hostname, options, callback) => {
-    mrCalls2 += 1
-    const cb = typeof options === 'function' ? options : callback
-    process.nextTick(() => cb(null, 'legacy-scalar-address', 4))
-  }
+  dns.lookup = lookupStub({ onCall: () => { mrCalls2 += 1 } })
   try {
     await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order.test', { order: 'verbatim' }, (e) => e ? reject(e) : resolve())))
     await mrSettle(new Promise((resolve, reject) => dnsLookup('mr-order.test', { order: 'verbatim' }, (e) => e ? reject(e) : resolve())))
@@ -493,14 +501,8 @@ dns.lookup = (hostname, options, callback) => {
       }
       return state
     }
-    const withResolver = async (fn, body) => {
-      const prev = dns.lookup
-      dns.lookup = fn
-      try { return await body() } finally { dns.lookup = prev }
-    }
 
     // AGENTS-20：未知选项键 ⇒ 签名 null ⇒ 既不读也不写缓存，且不得污染同主机的已建模条目
-    await withResolver(makeCounter().fn, async () => {})
     {
       const st = makeCounter()
       await withResolver(st.fn, async () => {
@@ -659,6 +661,15 @@ dns.lookup = (hostname, options, callback) => {
         assert.strictEqual(st.calls, 1, '生产选项必须命中预热条目；不同 key 则预热写进了一个永不被读的条目（预热完全无效）')
       })
     }
+  }
+
+  // ===== [夹具自检] 不许留「装了替身却什么都不做」的空动作（C5-065）=====
+  // 反例：把 makeCounter().fn 塞进 withResolver、body 留空（`async () => {}`）—— 装一次替身、零断言。
+  // 它让读者以为紧随其后的分支已被覆盖，实际什么都没验证；真正的 AGENTS-20 用例在下一个块里。
+  {
+    const src = require('fs').readFileSync(__filename, 'utf8')
+    const emptyBodies = src.match(/withResolver\([^\n]*,\s*async\s*\(\)\s*=>\s*\{\s*\}\s*\)/g) || []
+    assert.strictEqual(emptyBodies.length, 0, `withResolver 不得留空 body（装了替身却零断言），实际 ${emptyBodies.length} 处`)
   }
 
   console.log('test_agents OK')

@@ -68,20 +68,37 @@ function sandboxEnv (home, sourceEnv = process.env) {
   return env
 }
 
+// C5-009：子进程一律带上限 + SIGKILL。没有 timeout 的 spawnSync 在钩子/脚本挂住时会无界等待，
+// 套件只能挂到 run_unit_tests 的 600s（CI 是 job 级 45min）才失败，归因只剩「套件超时」；
+// r.error 存在即明确失败，消息带 error.code / signal / killed —— 能区分「被本上限强杀」与
+// 「子进程自己非零退出」。（调用方仍可用 opts.timeout 覆盖，如 pre-push 端到端保持 180s。）
+const CHILD_TIMEOUT_MS = 20000
+const CHILD_KILL_SIGNAL = 'SIGKILL'
+// C5-010：环境性跳过必须可见且计数（此前只有 console.log，末尾汇总里看不到少跑了什么）。
+const envSkips = []
+const skipEnv = (why) => { envSkips.push(why); console.log('  ⏭ SKIP（环境性）：' + why) }
+function boundedSpawn (bin, args, opts) {
+  const r = spawnSync(bin, args, { timeout: CHILD_TIMEOUT_MS, killSignal: CHILD_KILL_SIGNAL, ...opts })
+  if (r.error) {
+    assert.fail(`子进程未正常收场（${bin} ${args.join(' ')}）：error=${r.error.code} signal=${r.signal} killed=${r.killed}`)
+  }
+  return r
+}
+
 function runVerify (cwd, home) {
-  return spawnSync(NODE_EXEC, [INSTALL_HOOKS, '--verify'], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(NODE_EXEC, [INSTALL_HOOKS, '--verify'], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function runPlugin (cwd, home, args) {
-  return spawnSync(NODE_EXEC, [INSTALL_HOOKS, ...args], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(NODE_EXEC, [INSTALL_HOOKS, ...args], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function gitConfig (cwd, home, key) {
-  return spawnSync(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
+  return boundedSpawn(GIT, ['config', '--get', key], { cwd, encoding: 'utf8', env: sandboxEnv(home) })
 }
 
 function initRepo (dir, home, env = sandboxEnv(home)) {
-  const init = spawnSync(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
+  const init = boundedSpawn(GIT, ['init', '-q'], { cwd: dir, encoding: 'utf8', env })
   assert.strictEqual(init.status, 0, `git init 失败：${init.stderr}`)
 }
 
@@ -371,7 +388,7 @@ const FIXTURE_SCAN_GATE_JS = [
 
 // 绝对路径调用真实 git；失败即断言失败（夹具建不起来不能静默跳过）。
 function mustGit (args, opts, what) {
-  const r = spawnSync(GIT, args, { encoding: 'utf8', ...opts })
+  const r = boundedSpawn(GIT, args, { encoding: 'utf8', ...opts })
   assert.strictEqual(r.status, 0, `${what || ('git ' + args.join(' '))} 失败（退出码 ${r.status}）：${r.stderr || r.stdout}`)
   return r.stdout
 }
@@ -877,6 +894,8 @@ function assertNoResidue (fx, label) {
     let honoring = false
     try { fs.chmodSync(probe, 0o700); fs.accessSync(probe, fs.constants.X_OK); honoring = true } catch (e) { honoring = false }
     if (!honoring) {
+      // 不删断言：只在 noexec 挂载/不尊重 chmod 的宿主上登记跳过，并由用例 6/9 继续锁「失败必须显形」。
+      skipEnv('安装必须修好执行位（chmod honoring 探测为假）：本机文件系统不尊重执行位，正结果不可观测')
       console.log('  （本机不支持 chmod 执行位：本条按环境性跳过，改由用例 6/9 锁“失败必须显形”）')
     } else {
       const { dir, home } = makeCase()
@@ -900,6 +919,143 @@ function assertNoResidue (fx, label) {
     }
   } finally {
     fs.rmSync(probeRoot.dir, { recursive: true, force: true })
+  }
+}
+
+// ── C10-042：pre-commit 只拒绝「本次提交涉及的文件仍有未暂存改动」────────────────
+// 为什么测它：五道门禁全部读**工作树**，而 git 提交的是 index——同一文件「已暂存旧内容、盘上又有
+// 新改动」时，门禁绿不代表提交内容绿。判据必须是「index vs HEAD」与「工作树 vs index」的**交集**；
+// 旧实现用 `git diff --quiet` 全量比较，把 `git commit -- <path>` 与「只 add 了 a、b 还脏」这两类
+// 正常提交误拦（基线钩子放行；本文件实测旧钩子在这两种形态下 rc=1），而这条拒绝路径此前零测试。
+// 夹具：hermetic 临时仓库 + 真钩子的逐字节副本；五道门禁用 PATH 上的 npm/node 桩短路（exit 0），
+// 本组用例只锁定这条新检查，不为它拖进整条 lint 工具链。提交一律走真 `git commit`——只有真 git 才会
+// 为 `-a` 在钩子前预写 index、为 pathspec 生成 `.git/next-index-*.lock` 临时索引，手搓 index 测不到。
+const REAL_PRE_COMMIT = path.join(__dirname, '.githooks', 'pre-commit')
+
+function makePreCommitFixture () {
+  const { dir, home } = makeCase()
+  // 仓库只占 dir/repo：HOME、钩子副本、桩 bin 都在工作树**之外**，否则用例 ① 的 `git add -A`
+  // 会把它们一并提交，污染「本次提交涉及哪些文件」的观测面。
+  const repo = path.join(dir, 'repo')
+  fs.mkdirSync(repo)
+  const bin = path.join(dir, 'stub-bin')
+  fs.mkdirSync(bin)
+  for (const name of ['npm', 'node']) {
+    const f = path.join(bin, name)
+    fs.writeFileSync(f, '#!/bin/sh\nexit 0\n')
+    fs.chmodSync(f, 0o700)
+  }
+  const env = sandboxEnv(home, { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` })
+  initRepo(repo, home, env)
+  // 夹具仓库必须自带身份：sandboxEnv 关掉了 global/system 配置，CI 上没有可自动探测的
+  // user.name/email，`git commit` 会以 128「Author identity unknown」失败（本机靠 git 的
+  // 自动探测才没暴露）。身份写在仓库本地，夹具仍是 hermetic 的。
+  mustGit(['config', 'user.name', 'fixture'], { cwd: repo, env }, '配置夹具 user.name')
+  mustGit(['config', 'user.email', 'fixture@example.invalid'], { cwd: repo, env }, '配置夹具 user.email')
+  const hooks = path.join(dir, 'hooks')
+  fs.mkdirSync(hooks)
+  const copied = path.join(hooks, 'pre-commit')
+  fs.copyFileSync(REAL_PRE_COMMIT, copied)
+  fs.chmodSync(copied, 0o700)
+  assert.strictEqual(fs.readFileSync(copied, 'utf8'), fs.readFileSync(REAL_PRE_COMMIT, 'utf8'),
+    '夹具必须是 .githooks/pre-commit 的逐字节副本（否则测的不是真钩子）')
+  mustGit(['config', 'core.hooksPath', hooks], { cwd: repo, env }, '配置 core.hooksPath')
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'base-a\n')
+  fs.writeFileSync(path.join(repo, 'b.txt'), 'base-b\n')
+  mustGit(['add', '-A'], { cwd: repo, env })
+  mustGit(['commit', '-qm', 'chore: 夹具初始提交'], { cwd: repo, env })
+  return { dir, repo, env }
+}
+
+function commitIn (fx, args) {
+  return boundedSpawn(GIT, ['commit', ...args], { cwd: fx.repo, encoding: 'utf8', env: fx.env })
+}
+function commitOut (r) { return (r.stdout || '') + (r.stderr || '') }
+const committedFiles = (fx) => mustGit(['show', '--name-only', '--pretty=format:', 'HEAD'], { cwd: fx.repo, env: fx.env })
+  .split('\n').map((s) => s.trim()).filter(Boolean).sort()
+const isDirty = (fx, name) => mustGit(['status', '--porcelain'], { cwd: fx.repo, env: fx.env }).includes(name)
+
+{
+  // ① `git add -A`：index 与工作树对齐 → 通过（旧实现也通过，锁定不许收紧）
+  const fx = makePreCommitFixture()
+  try {
+    fs.appendFileSync(path.join(fx.repo, 'a.txt'), 'x\n')
+    fs.writeFileSync(path.join(fx.repo, 'c.txt'), 'new\n')
+    mustGit(['add', '-A'], { cwd: fx.repo, env: fx.env })
+    const r = commitIn(fx, ['-qm', 'chore: ① 全部暂存'])
+    assert.strictEqual(r.status, 0, `① git add -A 后提交必须通过：${commitOut(r).slice(0, 300)}`)
+    assert.match(commitOut(r), /pre-commit 全部通过/, '① 必须真的跑过 pre-commit（否则测的是「没钩子」）')
+    assert.deepStrictEqual(committedFiles(fx), ['a.txt', 'c.txt'], '① 提交内容应含两个改动文件')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+{
+  // ② `git commit -a`：git 在钩子运行前已按工作树重写 index → 通过
+  const fx = makePreCommitFixture()
+  try {
+    fs.appendFileSync(path.join(fx.repo, 'a.txt'), 'x\n')
+    fs.appendFileSync(path.join(fx.repo, 'b.txt'), 'y\n')
+    const r = commitIn(fx, ['-qam', 'chore: ② commit -a'])
+    assert.strictEqual(r.status, 0, `② git commit -a 必须通过：${commitOut(r).slice(0, 300)}`)
+    assert.match(commitOut(r), /pre-commit 全部通过/, '② 必须真的跑过 pre-commit')
+    assert.deepStrictEqual(committedFiles(fx), ['a.txt', 'b.txt'], '② commit -a 应提交两个已跟踪文件')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+{
+  // ③ 只暂存 a、b 还脏但不在本次提交里 → **通过**（旧实现 rc=1 的误拦点之一）。
+  //    语义：提交内容 = index，b 的脏与这次提交无关。
+  const fx = makePreCommitFixture()
+  try {
+    fs.appendFileSync(path.join(fx.repo, 'a.txt'), 'x\n')
+    fs.appendFileSync(path.join(fx.repo, 'b.txt'), 'y\n')
+    mustGit(['add', 'a.txt'], { cwd: fx.repo, env: fx.env })
+    const r = commitIn(fx, ['-qm', 'chore: ③ 只暂存 a'])
+    assert.strictEqual(r.status, 0, `③ 只暂存 a（b 脏且不在本次提交）必须通过：${commitOut(r).slice(0, 300)}`)
+    assert.deepStrictEqual(committedFiles(fx), ['a.txt'], '③ 本次提交只能含 a.txt（b 不参与）')
+    assert.ok(isDirty(fx, 'b.txt'), '③ b.txt 的未暂存改动必须原样留在工作树')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+{
+  // ④ a 已 add 之后又改盘上内容 → **拒绝**并点名 a.txt（门禁验证的内容 ≠ 被提交的内容）
+  const fx = makePreCommitFixture()
+  try {
+    const a = path.join(fx.repo, 'a.txt')
+    fs.appendFileSync(a, 'staged\n')
+    mustGit(['add', 'a.txt'], { cwd: fx.repo, env: fx.env })
+    fs.appendFileSync(a, 'unstaged\n')
+    const before = mustGit(['rev-parse', 'HEAD'], { cwd: fx.repo, env: fx.env }).trim()
+    const r = commitIn(fx, ['-qm', 'chore: ④ 暂存后又改'])
+    assert.notStrictEqual(r.status, 0, `④ 已暂存文件仍有未暂存改动时必须拒绝：${commitOut(r).slice(0, 300)}`)
+    assert.match(commitOut(r), /未暂存改动/, '④ 拒绝文案必须点明「未暂存改动」')
+    assert.match(commitOut(r), /a\.txt/, '④ 必须点名具体文件（只说「不一致」等于不教人怎么改）')
+    assert.strictEqual(mustGit(['rev-parse', 'HEAD'], { cwd: fx.repo, env: fx.env }).trim(), before,
+      '④ 拒绝时不得产生任何提交')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
+  }
+}
+
+{
+  // ⑤ `git commit -- a.txt` 且 b 脏 → **通过**（旧实现 rc=1 的误拦点之二）。
+  //    pathspec 提交的临时索引只含 a.txt 且内容取自工作树，交集必然为空。
+  const fx = makePreCommitFixture()
+  try {
+    fs.appendFileSync(path.join(fx.repo, 'a.txt'), 'x\n')
+    fs.appendFileSync(path.join(fx.repo, 'b.txt'), 'y\n')
+    const r = commitIn(fx, ['-qm', 'chore: ⑤ pathspec', '--', 'a.txt'])
+    assert.strictEqual(r.status, 0, `⑤ git commit -- a.txt（b 脏）必须通过：${commitOut(r).slice(0, 300)}`)
+    assert.deepStrictEqual(committedFiles(fx), ['a.txt'], '⑤ pathspec 提交只能含 a.txt')
+    assert.ok(isDirty(fx, 'b.txt'), '⑤ b.txt 的未暂存改动必须原样留在工作树')
+  } finally {
+    fs.rmSync(fx.dir, { recursive: true, force: true })
   }
 }
 
@@ -1153,5 +1309,9 @@ function runInMergeState (lines) {
   }
 }
 
+if (envSkips.length > 0) {
+  console.log(`⏭ install-hooks 环境性跳过 ${envSkips.length} 项（原因见上方 SKIP 行；断言未删除，只是本机缺少观测面）`)
+}
 console.log('✅ install-hooks --verify 只读自检：未生效 fail-closed / 生效 exit 0 / 不改配置不改权限；pre-push（v3.276）列入清单且缺失/无执行位均被检出')
+console.log('✅ pre-commit C10-042：只拒「本次提交涉及的文件仍有未暂存改动」——add -A / commit -a / 只暂存 a（b 脏）/ commit -- path（b 脏）四种形态通过，a add 后再改被拒绝并点名（旧实现前两种误拦 → 本组必红）')
 console.log('✅ pre-push 门禁对象回归（PR #156）：快路径只跑一次 / 脏工作树按**被推提交内容**判定（旧实现必红）/ 非当前检出走隔离 worktree 且清理干净 / 隔离建不起来即 fail-closed 不跑工作树 / 去重+删除引用+非推送上下文 / 一次推多个非 HEAD sha 时每个隔离 worktree 都被清理（旧实现必红）/ 未跟踪文件算脏：扫描式门禁下「提交 fail、工作树的未跟踪文件补绿」仍必须真红且门禁在隔离目录里跑（旧口径假绿，G 必红）+ 有未跟踪文件改走隔离路径（旧口径只警告仍走快路径，H 必红）')

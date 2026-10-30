@@ -19,56 +19,85 @@ function test (name, fn) {
 ;(async () => {
   console.log('test_pusher')
 
-  // ===== 探针：createPusher.send 超时分支 =====
-  // 最高风险契约：10s 超时后必须 reject，且 error.failures 含 PUSH_TIMEOUT
-  await test('P1 超时 reject 且 failures 含 PUSH_TIMEOUT（探针）', async () => {
+  // ===== 追加：按 SYSTEM_CONTRACT「推送」条杀 xbk_pusher.send 的变异体 =====
+  // 统一注入式发送：定时器 mock 只触发 10s 那个、捕获入参 params / 告警 / 拒绝原因，绝不真实等 10 秒。
+  const runSend = async (mod, opts = {}) => {
     const originalSetTimeout = global.setTimeout
-    // 看门狗：若实现 bug 导致超时分支不 settle，5 秒后强制失败而非无限挂起
+    const originalAbortController = global.AbortController
+    const originalWarn = console.warn
+    const warns = []
+    let captured = null
     let watchdogTimer
+    let timerFired = false
     const watchdog = new Promise((_resolve, reject) => {
-      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
+      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未 settle（reject 可能被删）')), 5000)
     })
-    // mock：仅立即触发“10000ms 超时定时器”（其余定时器不触发），确保导致 reject 的超时定时器就是它。
-    // 若实现改用别的延迟计时，超时分支不会触发、看门狗兜底 → 断言失败，
-    // 杜绝“任意 10000ms 定时器蒙混过关”的假绿（回应 sourcery-ai 评审）。
-    // 第 3 个及以后参数按 Node 语义原样转发给回调（fn(...args)）。
-    // 注意：mock 赋值纳入 try，确保异常时 finally 也能还原 global.setTimeout。
-    let timeoutTimerFired = false
     try {
+      console.warn = (...args) => { warns.push(args.join(' ')) }
+      if (opts.noAbortController) global.AbortController = undefined
+      if (opts.countAborts) {
+        // 计数版 AbortController：超时分支的 controller.abort() 会被 finally 的兜底 abort 掩盖
+        // （signal.aborted 早已为 true），只有数调用次数才能区分「超时路径 abort 了两次」与「一次」。
+        global.AbortController = class {
+          constructor () { this.signal = { aborted: false, addEventListener () {}, removeEventListener () {} }; this.abortCount = 0 }
+          abort () { this.abortCount++; this.signal.aborted = true; opts.onController && opts.onController(this) }
+        }
+      }
       global.setTimeout = (fn, ms, ...args) => {
-        if (ms === 10000) { timeoutTimerFired = true; fn(...args) }
-        return originalSetTimeout(() => {}, 0)
+        if (ms === 10000) {
+          // 在真实 0ms 宏任务里触发 10s 定时器：立即结算的成功路径会在微任务中先赢下 race（不误走超时），
+          // 挂起的通道则在同一轮事件循环内立刻进入超时分支——既不真等 10 秒，也不靠同步时序蒙混。
+          return originalSetTimeout(() => { timerFired = true; fn(...args) }, 0)
+        }
+        return originalSetTimeout(fn, ms, ...args)
       }
-      const neverResolve = new Promise(() => {})
-      const notifyMod = {
-        sendNotify: () => neverResolve,
-        configuredChannelNames: () => ['ch1', 'ch2']
-      }
-      const p = createPusher({
-        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
-        getNotify: async () => notifyMod,
-        looksLikeHtmlLinear: () => false
+      const orig = mod.sendNotify
+      const wrapped = Object.assign({}, mod, {
+        sendNotify: (t, d, params) => {
+          captured = { text: t, desp: d, params }
+          return typeof orig === 'function' ? orig(t, d, params) : undefined
+        }
       })
-      let rejected = false
-      let err
+      const p = createPusher({
+        Utils: opts.utils || { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
+        getNotify: async () => wrapped
+      })
+      const text = 'text' in opts ? opts.text : 'text'
+      const desp = 'desp' in opts ? opts.desp : 'desp'
+      let err = null
+      let value
       try {
-        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
+        value = await Promise.race([p.send(text, desp, wrapped), watchdog])
       } catch (e) {
-        rejected = true
         err = e
       }
-      assert.strictEqual(rejected, true, '超时必须 reject，不能挂起或静默成功')
-      assert.ok(err.message.includes('超时'), `error.message 应含"超时"，实际: ${err.message}`)
-      assert.ok(Array.isArray(err.failures), 'error.failures 应为数组')
-      assert.strictEqual(err.failures.length, 2, 'failures 应包含所有配置通道（2 个）')
-      assert.strictEqual(err.failures[0].code, 'PUSH_TIMEOUT', 'failure.code 应为 PUSH_TIMEOUT')
-      assert.strictEqual(err.failures[0].channel, 'ch1', 'failure.channel 应对应配置通道名')
-      assert.strictEqual(err.failures[1].channel, 'ch2', '第二个通道名应正确')
-      assert.strictEqual(timeoutTimerFired, true, '实现必须按 10s 触发超时定时器，且该定时器即 reject 的来源（仅它被触发，杜绝无关定时器蒙混）')
+      return { err, value, captured, warns, timerFired }
     } finally {
       clearTimeout(watchdogTimer)
       global.setTimeout = originalSetTimeout
+      global.AbortController = originalAbortController
+      console.warn = originalWarn
     }
+  }
+
+  // ===== 探针：createPusher.send 超时分支 =====
+  // 最高风险契约：10s 超时后必须 reject，且 error.failures 含 PUSH_TIMEOUT
+  await test('P1 超时 reject 且 failures 含 PUSH_TIMEOUT（探针）', async () => {
+    const notifyMod = {
+      sendNotify: () => new Promise(() => {}),
+      configuredChannelNames: () => ['ch1', 'ch2']
+    }
+    // 走 runSend 唯一夹具：10s 定时器只在真实 0ms 宏任务里触发（不等真 10 秒、也不靠同步时序蒙混），
+    // 其余定时器透传 ⇒ 导致 reject 的只能是它（timerFired 断言锁定这一条）。
+    const { err, timerFired } = await runSend(notifyMod)
+    assert.ok(err, '超时必须 reject，不能挂起或静默成功')
+    assert.ok(err.message.includes('超时'), `error.message 应含"超时"，实际: ${err.message}`)
+    assert.ok(Array.isArray(err.failures), 'error.failures 应为数组')
+    assert.strictEqual(err.failures.length, 2, 'failures 应包含所有配置通道（2 个）')
+    assert.strictEqual(err.failures[0].code, 'PUSH_TIMEOUT', 'failure.code 应为 PUSH_TIMEOUT')
+    assert.strictEqual(err.failures[0].channel, 'ch1', 'failure.channel 应对应配置通道名')
+    assert.strictEqual(err.failures[1].channel, 'ch2', '第二个通道名应正确')
+    assert.strictEqual(timerFired, true, '实现必须按 10s 触发超时定时器，且该定时器即 reject 的来源（仅它被触发，杜绝无关定时器蒙混）')
   })
 
   // ===== htmlTagNameEnd 纯函数 =====
@@ -159,36 +188,13 @@ function test (name, fn) {
   // 回归：超时 reject 的 error 必须能自描述。改动前只有 error.failures[].code，
   // 顶层 error.code 为 undefined（failures 为空时更无从判断失败原因是超时）。
   await test('P8 超时 error 顶层 code = PUSH_TIMEOUT（不止 failures 内层）', async () => {
-    const originalSetTimeout = global.setTimeout
-    let watchdogTimer
-    const watchdog = new Promise((_resolve, reject) => {
-      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
-    })
-    try {
-      global.setTimeout = (fn, ms, ...args) => {
-        if (ms === 10000) fn(...args)
-        return originalSetTimeout(() => {}, 0)
-      }
-      const notifyMod = {
-        sendNotify: () => new Promise(() => {}),
-        configuredChannelNames: () => ['ch1']
-      }
-      const p = createPusher({
-        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
-        getNotify: async () => notifyMod
-      })
-      let err = null
-      try {
-        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
-      } catch (e) {
-        err = e
-      }
-      assert.ok(err && err.message.includes('超时'), `超时分支必须 reject 且 message 含"超时"，实际: ${err && err.message}`)
-      assert.strictEqual(err.code, 'PUSH_TIMEOUT', '顶层 error.code 应为 PUSH_TIMEOUT（回退 P3 后此处为 undefined）')
-    } finally {
-      clearTimeout(watchdogTimer)
-      global.setTimeout = originalSetTimeout
+    const notifyMod = {
+      sendNotify: () => new Promise(() => {}),
+      configuredChannelNames: () => ['ch1']
     }
+    const { err } = await runSend(notifyMod)
+    assert.ok(err && err.message.includes('超时'), `超时分支必须 reject 且 message 含"超时"，实际: ${err && err.message}`)
+    assert.strictEqual(err.code, 'PUSH_TIMEOUT', '顶层 error.code 应为 PUSH_TIMEOUT（回退 P3 后此处为 undefined）')
   })
 
   // ===== 超长 desp 截断（审查 2026-08-15 P4）=====
@@ -277,71 +283,18 @@ function test (name, fn) {
 
   // ===== 超时归因缺失告警（审查 2026-08-15 P3 零风险半边②）=====
   await test('P11 超时且 configuredChannelNames 缺失 → failures 为空并告警', async () => {
-    const originalSetTimeout = global.setTimeout
-    let watchdogTimer
-    const watchdog = new Promise((_resolve, reject) => {
-      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
-    })
-    const warns = []
-    const originalWarn = console.warn
-    try {
-      console.warn = (...args) => { warns.push(args.join(' ')) }
-      global.setTimeout = (fn, ms, ...args) => {
-        if (ms === 10000) fn(...args)
-        return originalSetTimeout(() => {}, 0)
-      }
-      const notifyMod = { sendNotify: () => new Promise(() => {}) } // 刻意不提供 configuredChannelNames
-      const p = createPusher({
-        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
-        getNotify: async () => notifyMod
-      })
-      let err = null
-      try {
-        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
-      } catch (e) {
-        err = e
-      }
-      assert.ok(err && err.message.includes('超时'), `超时分支必须 reject，实际: ${err && err.message}`)
-      assert.deepStrictEqual(err.failures, [], '无法取得通道清单时 failures 为空（既有语义不变）')
-      assert.ok(warns.some(w => w.includes('configuredChannelNames')),
-        `归因整体缺失必须告警；实际 warns=${JSON.stringify(warns)}`)
-    } finally {
-      clearTimeout(watchdogTimer)
-      console.warn = originalWarn
-      global.setTimeout = originalSetTimeout
-    }
+    const notifyMod = { sendNotify: () => new Promise(() => {}) } // 刻意不提供 configuredChannelNames
+    const { err, warns } = await runSend(notifyMod)
+    assert.ok(err && err.message.includes('超时'), `超时分支必须 reject，实际: ${err && err.message}`)
+    assert.deepStrictEqual(err.failures, [], '无法取得通道清单时 failures 为空（既有语义不变）')
+    assert.ok(warns.some(w => w.includes('configuredChannelNames')),
+      `归因整体缺失必须告警；实际 warns=${JSON.stringify(warns)}`)
   })
 
   // ===== P3（跨批协同）超时按「仍在飞的通道」归因 =====
   // 契约：Pusher 把 { inFlightTracker } 交给 sendNotify；投递层（slim）启动通道任务前回填
   // tracker.pending（未结算通道名），每通道 settle 时移除。不支持该契约的模块（既有测试替身）
   // 忽略它 → pending 保持 null → 退回「配置通道全量列出」的既有语义（P1/P11 已锁定）。
-  const withTimeoutNow = async (notifyMod, warns) => {
-    const originalSetTimeout = global.setTimeout
-    let watchdogTimer
-    const watchdog = new Promise((_resolve, reject) => {
-      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未在预期时间内 settle')), 5000)
-    })
-    try {
-      global.setTimeout = (fn, ms, ...args) => {
-        if (ms === 10000) fn(...args)
-        return originalSetTimeout(() => {}, 0)
-      }
-      const p = createPusher({
-        Utils: { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
-        getNotify: async () => notifyMod
-      })
-      try {
-        await Promise.race([p.send('text', 'desp', notifyMod), watchdog])
-        return null
-      } catch (e) {
-        return e
-      }
-    } finally {
-      clearTimeout(watchdogTimer)
-      global.setTimeout = originalSetTimeout
-    }
-  }
 
   await test('P12 归因只列在飞通道：已结算通道不得被标为 PUSH_TIMEOUT（P3）', async () => {
     let trackerSeen = null
@@ -354,7 +307,7 @@ function test (name, fn) {
       },
       configuredChannelNames: () => ['ch1', 'ch2']
     }
-    const err = await withTimeoutNow(notifyMod)
+    const { err } = await runSend(notifyMod)
     assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
     assert.ok(trackerSeen && typeof trackerSeen === 'object', 'Pusher 必须把在飞追踪器交给 sendNotify（跨文件契约）')
     assert.deepStrictEqual(err.failures.map(f => f.channel), ['ch2'],
@@ -363,25 +316,18 @@ function test (name, fn) {
   })
 
   await test('P13 在飞清单为空数组 → failures 为空且不得误报「清单缺失」告警（P3）', async () => {
-    const warns = []
-    const originalWarn = console.warn
-    try {
-      console.warn = (...args) => { warns.push(args.join(' ')) }
-      const notifyMod = {
-        sendNotify: (t, d, params) => {
-          if (params && params.inFlightTracker) params.inFlightTracker.pending = [] // 全部通道已结算
-          return new Promise(() => {})
-        },
-        configuredChannelNames: () => ['ch1', 'ch2'] // 有清单，但必须被在飞清单取代
-      }
-      const err = await withTimeoutNow(notifyMod)
-      assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
-      assert.deepStrictEqual(err.failures, [], '全部已结算时 failures 必须为空（不得回落静态清单）')
-      assert.ok(!warns.some(w => w.includes('configuredChannelNames')),
-        `有在飞清单时不得误报清单缺失；实际 warns=${JSON.stringify(warns)}`)
-    } finally {
-      console.warn = originalWarn
+    const notifyMod = {
+      sendNotify: (t, d, params) => {
+        if (params && params.inFlightTracker) params.inFlightTracker.pending = [] // 全部通道已结算
+        return new Promise(() => {})
+      },
+      configuredChannelNames: () => ['ch1', 'ch2'] // 有清单，但必须被在飞清单取代
     }
+    const { err, warns } = await runSend(notifyMod)
+    assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
+    assert.deepStrictEqual(err.failures, [], '全部已结算时 failures 必须为空（不得回落静态清单）')
+    assert.ok(!warns.some(w => w.includes('configuredChannelNames')),
+      `有在飞清单时不得误报清单缺失；实际 warns=${JSON.stringify(warns)}`)
   })
 
   await test('P14 未支持该契约的模块 → 保持既有「配置通道全量列出」语义（P3 回退）', async () => {
@@ -389,7 +335,7 @@ function test (name, fn) {
       sendNotify: () => new Promise(() => {}), // 忽略 params（既有替身形态）
       configuredChannelNames: () => ['pushplus', 'telegram']
     }
-    const err = await withTimeoutNow(notifyMod)
+    const { err } = await runSend(notifyMod)
     assert.ok(err && err.message.includes('超时'), '超时分支必须 reject')
     assert.deepStrictEqual(err.failures.map(f => f.channel), ['pushplus', 'telegram'],
       '不支持在飞契约时必须退回既有语义（test_pusher P1 / test_app 锁定口径）')
@@ -416,67 +362,6 @@ function test (name, fn) {
     assert.strictEqual(isTagNameBoundary('ab>', 1), false, 'ch 是字母 b 时，即使 s[pos+1] 是 > 也不是边界')
     assert.strictEqual(isTagNameBoundary('a/>', 1), true, 'ch 是 / 且后继是 > 才是自闭合边界')
   })
-
-  // ===== 追加：按 SYSTEM_CONTRACT「推送」条杀 xbk_pusher.send 的变异体 =====
-  // 统一注入式发送：定时器 mock 只触发 10s 那个、捕获入参 params / 告警 / 拒绝原因，绝不真实等 10 秒。
-  const runSend = async (mod, opts = {}) => {
-    const originalSetTimeout = global.setTimeout
-    const originalAbortController = global.AbortController
-    const originalWarn = console.warn
-    const warns = []
-    let captured = null
-    let watchdogTimer
-    let timerFired = false
-    const watchdog = new Promise((_resolve, reject) => {
-      watchdogTimer = originalSetTimeout(() => reject(new Error('测试看门狗：p.send 未 settle（reject 可能被删）')), 5000)
-    })
-    try {
-      console.warn = (...args) => { warns.push(args.join(' ')) }
-      if (opts.noAbortController) global.AbortController = undefined
-      if (opts.countAborts) {
-        // 计数版 AbortController：超时分支的 controller.abort() 会被 finally 的兜底 abort 掩盖
-        // （signal.aborted 早已为 true），只有数调用次数才能区分「超时路径 abort 了两次」与「一次」。
-        global.AbortController = class {
-          constructor () { this.signal = { aborted: false, addEventListener () {}, removeEventListener () {} }; this.abortCount = 0 }
-          abort () { this.abortCount++; this.signal.aborted = true; opts.onController && opts.onController(this) }
-        }
-      }
-      global.setTimeout = (fn, ms, ...args) => {
-        if (ms === 10000) {
-          // 在真实 0ms 宏任务里触发 10s 定时器：立即结算的成功路径会在微任务中先赢下 race（不误走超时），
-          // 挂起的通道则在同一轮事件循环内立刻进入超时分支——既不真等 10 秒，也不靠同步时序蒙混。
-          return originalSetTimeout(() => { timerFired = true; fn(...args) }, 0)
-        }
-        return originalSetTimeout(fn, ms, ...args)
-      }
-      const orig = mod.sendNotify
-      const wrapped = Object.assign({}, mod, {
-        sendNotify: (t, d, params) => {
-          captured = { text: t, desp: d, params }
-          return typeof orig === 'function' ? orig(t, d, params) : undefined
-        }
-      })
-      const p = createPusher({
-        Utils: opts.utils || { sanitizeDecodedHtml: s => s, decodeHtmlEntities: s => s },
-        getNotify: async () => wrapped
-      })
-      const text = 'text' in opts ? opts.text : 'text'
-      const desp = 'desp' in opts ? opts.desp : 'desp'
-      let err = null
-      let value
-      try {
-        value = await Promise.race([p.send(text, desp, wrapped), watchdog])
-      } catch (e) {
-        err = e
-      }
-      return { err, value, captured, warns, timerFired }
-    } finally {
-      clearTimeout(watchdogTimer)
-      global.setTimeout = originalSetTimeout
-      global.AbortController = originalAbortController
-      console.warn = originalWarn
-    }
-  }
 
   // ===== 收口 P18–P24 登记的 3 个可击杀缺口（父代理补齐）=====
   // 缺口①（id 9，ConditionalExpression@L10:41）：P18 只测了 text=undefined，漏了 text===null 这一格。
@@ -505,6 +390,21 @@ function test (name, fn) {
     const r2 = await runSend(ok, { countAborts: true, onController: c => c2.push(c.abortCount) })
     assert.strictEqual(r2.timerFired, false, '成功路径不得走超时分支')
     assert.strictEqual(Math.max(...c2), 1, '成功路径同一 controller 的 abort 次数必须恰好 1（仅 finally 兜底）')
+  })
+
+  // C8-001：Pusher 必须把「单通道预算」显式交给投递层（params.channelTimeoutMs），且严格小于
+  // 10s 整体 race——否则 slim 的 15s 单通道 timeout 在这条路径上永远等不到：慢通道被外层 abort 时
+  // 已送达的通道也一起判 PUSH_TIMEOUT，本轮不写缓存、下轮全通道重推。
+  await test('P27 单通道预算经 params.channelTimeoutMs 下发，且严格小于 10s 整体 race', async () => {
+    const mod = { sendNotify: async () => 'ok', configuredChannelNames: () => [] }
+    const r = await runSend(mod)
+    const ms = r.captured.params && r.captured.params.channelTimeoutMs
+    assert.ok(Number.isInteger(ms), `params.channelTimeoutMs 必须是整数（实际：${ms}）`)
+    assert.ok(ms > 0 && ms < 10000, `单通道预算必须 >0 且严格小于 10s 整体 race，实际：${ms}`)
+    assert.ok(ms <= 9000, `单通道预算必须给外层留结算余量（≤9000ms），实际：${ms}`)
+    // 预算与「有没有 AbortController」无关：两条分支必须下发同一个值。
+    const r2 = await runSend(mod, { noAbortController: true })
+    assert.strictEqual(r2.captured.params.channelTimeoutMs, ms, '两种分支必须下发同一个单通道预算')
   })
 
   // 杀 L10/L11 条件恒真/恒假、等号方向（归一化被吞 → 推送文本 "undefined" 或吞掉正常内容）

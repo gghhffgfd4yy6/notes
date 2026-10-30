@@ -1,6 +1,11 @@
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
+// 整体 race 上限 10s 是 SYSTEM_CONTRACT 的明文契约（不得上调）。单通道 HTTP 预算必须严格小于
+// 它、并留出结算/归因余量：9s 结算 + 1s 归因。这个值经 params.channelTimeoutMs 显式交给 slim，
+// 而不是靠「有没有 signal」推断——signal 是取消通路，不是预算声明。
+const CHANNEL_TIMEOUT_MS = 9000
+
 function createPusher ({ Utils, getNotify }) {
   return {
     // notifyModule：可选推送模块实例（延迟加载）；未传时按需加载
@@ -54,7 +59,10 @@ function createPusher ({ Utils, getNotify }) {
         desp = Utils.sanitizeDecodedHtml(Utils.decodeHtmlEntities(desp))
       }
       // 抛异常由主流程处理：推送失败的消息不写缓存，下次运行重试（避免永久丢失）
-      // 加整体超时：整体 race 上限 10s（slim 层每通道 HTTP timeout 15s 为单通道上限），
+      // 加整体超时：整体 race 上限 10s（SYSTEM_CONTRACT「推送整体超时 10s」，不得上调）。
+      // slim 的单通道 HTTP timeout 默认 15s，那只留给完全绕过 Pusher 的直调（scripts/console.js 的
+      // 关注词监控直接调 sendNotify）；本路径不论有没有 signal 都用 params.channelTimeoutMs 显式收到
+      // 9s——慢通道只让自己失败，给整体预算留 1s 结算与归因。
       // 避免慢通道把整批推送拖到数分钟
       // v3.121：clearTimeout 清除超时定时器——Promise.race 完成后定时器仍挂着会导致
       // 进程退出延迟（事件循环被 keep-alive）+ 多次推送定时器堆积（资源泄漏）
@@ -69,9 +77,11 @@ function createPusher ({ Utils, getNotify }) {
         // params.inFlightTracker）；不支持该契约的模块会忽略它 → tracker.pending 保持 null → 超时归因
         // 退回既有「按静态配置清单全量列出」语义（其口径被 test_pusher.js / test_app.js 双向锁定）。
         const inFlight = { pending: null }
+        // 单通道预算显式下发给 slim（params.channelTimeoutMs）：整体 race 只有 10s，单通道必须
+        // 先于它结算，慢通道才会只让自己失败而不是把已送达的通道一起拖成 PUSH_TIMEOUT。
         const sendParams = controller
-          ? { signal: controller.signal, inFlightTracker: inFlight }
-          : { inFlightTracker: inFlight }
+          ? { signal: controller.signal, inFlightTracker: inFlight, channelTimeoutMs: CHANNEL_TIMEOUT_MS }
+          : { inFlightTracker: inFlight, channelTimeoutMs: CHANNEL_TIMEOUT_MS }
         const sendResult = notifyMod.sendNotify(text, desp, sendParams)
         if (!sendResult || typeof sendResult.then !== 'function') {
           throw new Error('推送模块 sendNotify 未返回 Promise，拒绝静默成功')

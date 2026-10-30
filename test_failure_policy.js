@@ -1,13 +1,18 @@
 'use strict'
 
 const assert = require('assert')
+const path = require('path')
+const { spawnSync } = require('child_process')
 const {
   classifyFailure,
   classifySummary,
+  summarizeError,
   RETRYABLE_CODES,
   PERMANENT_CODES
 } = require('./xbk_failure_policy')
 const { runResident, shouldAutoInstallDependencies } = require('./qinglong/xbk_push')
+
+const TRUNCATED_FAILURE_MESSAGE = '[嵌套失败结构过深或自引用，已截断]'
 
 function error (message, code) {
   const e = new Error(message)
@@ -15,11 +20,84 @@ function error (message, code) {
   return e
 }
 
-(async () => {
+function check (actual, expected, why) {
+  return assert.strictEqual(actual, expected, why)
+}
+
+// C5-012：逐用例 harness。旧实现是「一个 async IIFE 跑到底 + 唯一顶层 catch」——
+// 任一条断言失败就跳过后面的全部断言，254 条断言只报第一条，定位性极差。
+// 现在每条用例独立注册、独立 try/catch：失败只记该用例，其余用例照跑，最后按失败数置退出码。
+const CASES = []
+function testCase (name, fn) {
+  CASES.push({ name, fn })
+}
+
+// 环境变量基线（跑完后交叉核对是否还原；见文件末尾的 harness）。
+const ENV_BASELINE = {
+  XBK_INTERVAL_MS: process.env.XBK_INTERVAL_MS,
+  XBK_RETRY_BACKOFF_CAP_MS: process.env.XBK_RETRY_BACKOFF_CAP_MS
+}
+
+// 共享夹具工厂：原来这些对象在单条用例里跨小节复用；拆成用例后每次新建，避免用例间互相污染
+// （自引用/敌意对象一旦被某条用例改过，另一条用例的前置条件就会失去意义）。
+function makeDeepChainNodes () {
+  const nodes = []
+  for (let i = 0; i < 7; i++) nodes.push({ message: `L${i}` })
+  for (let i = 0; i < 6; i++) nodes[i].failures = [nodes[i + 1]]
+  return nodes
+}
+
+function makeRevokedFailures () {
+  const revocable = Proxy.revocable([], {})
+  revocable.revoke()
+  return revocable.proxy
+}
+
+function makeHostileIndexFailures () {
+  const hostile = []
+  Object.defineProperty(hostile, 0, {
+    get () { throw new Error('index getter boom') },
+    enumerable: true,
+    configurable: true
+  })
+  return hostile
+}
+
+// C5-002：脱敏的墙钟上界必须在**子进程**里量。正则回溯是同步 CPU 死循环，同线程的
+// setTimeout / Promise.race 永远不会被调度（事件循环被占住），唯一能给硬上界的是
+// 「子进程 + SIGKILL」。返回 { timedOut, timings }；子进程异常退出按断言失败处理。
+function timeRedactInChild (samples, timeoutMs) {
+  const script = [
+    'const { summarizeError } = require(process.argv[1])',
+    'const samples = JSON.parse(process.argv[2])',
+    'const timings = samples.map(({ message, via }) => {',
+    '  const started = process.hrtime.bigint()',
+    '  const out = via === "failureInfo"',
+    '    ? summarizeError({ failureInfo: { message } }).message',
+    '    : summarizeError({ message }).message',
+    '  return { ms: Number(process.hrtime.bigint() - started) / 1e6, out }',
+    '})',
+    'process.stdout.write(JSON.stringify(timings))'
+  ].join('\n')
+  const result = spawnSync(process.execPath, ['-e', script, path.join(__dirname, 'xbk_failure_policy.js'), JSON.stringify(samples)], {
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024
+  })
+  if (result.error && result.error.code === 'ETIMEDOUT') return { timedOut: true, timings: null }
+  assert.strictEqual(result.status, 0,
+    `脱敏计时探针子进程异常退出（status=${result.status}, signal=${result.signal}）：${(result.stderr || '').slice(0, 400)}`)
+  return { timedOut: false, timings: JSON.parse(result.stdout) }
+}
+
+testCase('shouldAutoInstallDependencies 只接受显式 1', async () => {
   assert.strictEqual(shouldAutoInstallDependencies({}), false, '默认不得在任务运行时安装依赖')
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: '1' }), true, '显式开关应允许自动安装依赖')
   assert.strictEqual(shouldAutoInstallDependencies({ XBK_AUTO_INSTALL_DEPS: 'true' }), false, '仅接受明确值 1，避免误开启')
+})
 
+testCase('classifyFailure 错误码集合与空响应体口径', async () => {
   assert.strictEqual(classifyFailure(error('timeout', 'ETIMEDOUT')).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('HTTP 500', 'HTTP_500')).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('HTTP 401', 'HTTP_401')).kind, 'permanent')
@@ -48,7 +126,9 @@ function error (message, code) {
   assert.strictEqual(classifyFailure(error('Response is not JSON: empty body', 'ERR_EMPTY_BODY')).kind, 'retryable', '空体必须可重试')
   assert.strictEqual(classifyFailure(error('Response is not JSON: empty body', 'ERR_EMPTY_BODY')).reason, 'ERR_EMPTY_BODY', '空体的归类理由必须是本码本身（不是 UNKNOWN）')
   assert.strictEqual(classifyFailure(error('Response is not JSON: body 9 chars', 'ERR_BODY_NOT_JSON')).kind, 'permanent', '非 JSON 体仍判永久')
+})
 
+testCase('classifyFailure statusCode / 文本兜底 / SyntaxError', async () => {
   assert.strictEqual(classifyFailure({ response: { statusCode: 500 }, message: 'server' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ response: { statusCode: 408 }, message: 'timeout' }).kind, 'retryable')
   assert.strictEqual(classifyFailure({ response: { statusCode: 400 }, message: 'bad request' }).kind, 'permanent')
@@ -99,7 +179,9 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ message: 'invalid state transition' }).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('完全未知故障')).kind, 'retryable')
   assert.strictEqual(classifyFailure(Object.assign(new SyntaxError('代码解析失败'), { name: 'SyntaxError' })).kind, 'permanent')
+})
 
+testCase('XFP-01 4xx 承载字段与区间一致性', async () => {
   // XFP-01：同一 4xx 语义在不同承载字段下必须分类一致。反例（改动前）：数字 code/providerCode
   // 落在 400-499 一律 permanent（providerCode 连 '429' 特判都没有），把 408/409/425/429 判为永久，
   // 与 RETRYABLE_CODES 的 HTTP_408/409/425/429 及 statusCode 路径相反 → 限流/冲突/超时被永久停推。
@@ -124,7 +206,9 @@ function error (message, code) {
   ]
   assert.deepStrictEqual(kinds429, ['retryable', 'retryable', 'retryable', 'retryable'],
     `429 在四种承载形态下必须同判可重试，实际 ${JSON.stringify(kinds429)}`)
+})
 
+testCase('XHTTP-06 终态 3xx 判永久', async () => {
   // XHTTP-06：终态 3xx 是确定性重定向（重试同一 URL 结果不变）→ 必须显式判永久，且四种承载字段一致。
   // 反例（改动前）：3xx 在数字 code / providerCode / HTTP_ 前缀 / statusCode 下都落 UNKNOWN → 可重试，
   // 而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）——同一状态码在「错误码字符串」与「statusCode」
@@ -146,7 +230,9 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ code: 'HTTP_429' }).kind, 'retryable', '429 仍可重试')
   assert.strictEqual(classifyFailure({ code: 'HTTP_503' }).kind, 'retryable', '5xx 仍可重试')
   assert.strictEqual(classifyFailure({ statusCode: 400 }).kind, 'permanent', 'statusCode 400 仍判永久')
+})
 
+testCase('XFP-05 failureInfo.failures 子级仲裁', async () => {
   // XFP-05：子错误挂在 failureInfo.failures 时，父级 permanent 同样不得覆盖子级 retryable。
   // 反例（改动前）：classifyFailure 只读 error.failures，qinglong 产生的形状
   // {failureKind:'permanent', failureInfo:{failures:[{code:'ETIMEDOUT'}]}} 直接按父标签判 permanent，
@@ -164,7 +250,9 @@ function error (message, code) {
   assert.strictEqual(classifyFailure({ failureKind: 'retryable', failureInfo: {} }).kind, 'retryable')
   // failureInfo.failures 为空数组同样不构成「有子项」，父标签继续生效
   assert.strictEqual(classifyFailure({ failureKind: 'permanent', failureInfo: { failures: [] } }).kind, 'permanent')
+})
 
+testCase('TLS / 证书文本分类', async () => {
   // TLS / 证书分类：明确证书故障文本判 permanent，瞬时连接/超时/复合文本仍保持 retryable
   assert.strictEqual(classifyFailure(error('certificate has expired')).kind, 'permanent')
   assert.strictEqual(classifyFailure(error('certificate is not yet valid')).kind, 'permanent')
@@ -186,7 +274,9 @@ function error (message, code) {
   assert.strictEqual(classifyFailure(error('TLS handshake temporarily unavailable')).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('certificate handshake timed out', 'ETIMEDOUT')).kind, 'retryable')
   assert.strictEqual(classifyFailure(error('certificate socket reset', 'ECONNRESET')).kind, 'retryable')
+})
 
+testCase('summarizeError 基础字段与 getter 容错', async () => {
   const summarized = require('./xbk_failure_policy').summarizeError({
     code: 'HTTP_500',
     providerCode: 500,
@@ -205,7 +295,9 @@ function error (message, code) {
   const getterError = {}
   Object.defineProperty(getterError, 'message', { get: () => { throw new Error('getter') } })
   assert.doesNotThrow(() => classifyFailure(getterError))
+})
 
+testCase('classifySummary 熔断口径', async () => {
   assert.strictEqual(classifySummary({
     total: 1,
     pushed: 0,
@@ -274,7 +366,9 @@ function error (message, code) {
     failures: [{ code: 'ETIMEDOUT', message: 'one message transient failure' }]
   })
   assert.strictEqual(partialTransient.reason, 'PARTIAL_MESSAGE_FAILURE')
+})
 
+testCase('runResident 常驻重试/恢复与环境变量还原', async () => {
   const oldInterval = process.env.XBK_INTERVAL_MS
   const oldBackoffCap = process.env.XBK_RETRY_BACKOFF_CAP_MS
   process.env.XBK_INTERVAL_MS = '0'
@@ -400,7 +494,9 @@ function error (message, code) {
     if (oldBackoffCap === undefined) delete process.env.XBK_RETRY_BACKOFF_CAP_MS
     else process.env.XBK_RETRY_BACKOFF_CAP_MS = oldBackoffCap
   }
+})
 
+testCase('补测 classifyFailure 聚合与 classifySummary 边界', async () => {
   // ============ 补测：xbk_failure_policy 未覆盖分支（契约→反例→证据） ============
 
   // [探针] 最高风险契约：聚合失败所有子通道均永久 → 整体永久停止。
@@ -497,10 +593,10 @@ function error (message, code) {
     failed: 1,
     failures: [{ failureKind: 'permanent', failureReason: 'EXPLICIT_X', message: 'm' }]
   }).kind, 'permanent')
+})
 
+testCase('summarizeError 递归防护（自引用/深度/兄弟重复）', async () => {
   // ============ 补测：失败摘要递归防护（自引用 / 深度上限 / 兄弟重复）+ failureInfo 脱敏 ============
-  const summarizeError = require('./xbk_failure_policy').summarizeError
-  const TRUNCATED_FAILURE_MESSAGE = '[嵌套失败结构过深或自引用，已截断]'
 
   // [自引用·常规路径] 本模块契约“不抛异常”：failures 指向自身必须截断为标记，而不是无限递归栈溢出。
   // 反例（改动前）：summarizeError({message, failures:[self]}) 抛 RangeError: Maximum call stack size exceeded。
@@ -518,9 +614,7 @@ function error (message, code) {
 
   // [深度上限] MAX_FAILURE_DEPTH=5：第 1..5 层完整展开，第 6 层截断。
   // 反例（改动前无上限）：7 节点深链被完整保留，第 5 层的子节点仍是原始对象而非截断标记。
-  const deepChainNodes = []
-  for (let i = 0; i < 7; i++) deepChainNodes.push({ message: `L${i}` })
-  for (let i = 0; i < 6; i++) deepChainNodes[i].failures = [deepChainNodes[i + 1]]
+  const deepChainNodes = makeDeepChainNodes()
   const deepSummary = summarizeError(deepChainNodes[0])
   assert.strictEqual(deepSummary.message, 'L0')
   let deepCursor = deepSummary
@@ -553,9 +647,12 @@ function error (message, code) {
     ['leaf', 'leaf'],
     '不同父路径下的同一子对象也应完整展开'
   )
+})
 
+testCase('summarizeError failureInfo 深度上限', async () => {
   // [深度上限·failureInfo 路径] failureInfo 内的失败链与常规路径同口径：
   // 反例（改动前是整对象浅拷贝）：深链原样带出，不截断。
+  const deepChainNodes = makeDeepChainNodes()
   const fiDeepSummary = summarizeError({ failureInfo: deepChainNodes[0] })
   assert.strictEqual(fiDeepSummary.failures.length, 1)
   let fiDeepCursor = fiDeepSummary
@@ -566,7 +663,9 @@ function error (message, code) {
   }
   assert.strictEqual(fiDeepCursor.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
     'failureInfo 内第 6 层应截断为标记')
+})
 
+testCase('classifyFailure reason 细分（全可重试 vs 混合）', async () => {
   // [reason 细分] 全部子项可重试并非“原因混合”：kind 仍 retryable，reason 改为 ALL_CHANNELS_RETRYABLE。
   // 反例（改动前）：此分支恒返回 MIXED_CHANNEL_FAILURES，诊断失真。
   const allRetryable = classifyFailure({
@@ -582,7 +681,9 @@ function error (message, code) {
   })
   assert.strictEqual(mixedAggregate.kind, 'retryable')
   assert.strictEqual(mixedAggregate.reason, 'MIXED_CHANNEL_FAILURES', '存在永久子项时仍为原因混合')
+})
 
+testCase('summarizeError failureInfo 脱敏', async () => {
   // [failureInfo 脱敏] failureInfo 不再是原样浅拷贝，字符串字段与常规路径同口径清洗。
   // 反例（改动前）：{...failureInfo} 让 message 原样带出 token=SECRET123。
   assert.strictEqual(summarizeError({ failureInfo: { message: 'token=SECRET123' } }).message, 'token=***',
@@ -591,7 +692,9 @@ function error (message, code) {
     'failureInfo 的任意字符串字段都应脱敏')
   assert.strictEqual(summarizeError({ failureInfo: { message: 'l1\nl2' } }).message, 'l1 l2',
     'failureInfo.message 应与常规路径一致折叠换行')
+})
 
+testCase('XFP-04 脱敏覆盖（Authorization/JSON/裸 scheme）', async () => {
   // [XFP-04 脱敏覆盖] 同一凭据换一种书写形态就不能漏抹——脱敏是「按形态」的，漏一种就是泄漏一种。
   // ① Authorization 头形态：反例（改动前）只吃掉 scheme，凭据残留 → `Authorization: *** SECRET123 x`。
   assert.strictEqual(summarizeError({ message: 'Authorization: Bearer SECRET123 x' }).message,
@@ -619,7 +722,9 @@ function error (message, code) {
     'upstream said: Bearer *** rejected', '裸 Bearer 凭据必须脱敏（保留原大小写）')
   assert.strictEqual(summarizeError({ message: 'Basic YWJjOmRlZg==' }).message,
     'Basic ***', '裸 Basic 与裸 Bearer 必须对称处理（A 组反例：旧实现只认 Bearer）')
+})
 
+testCase('XFP-04 对抗补漏（引号/URL query/关键字边界/幂等）', async () => {
   // ============ 独立对抗审查 A 组补漏：同一凭据被引号包住/换引号种类/非字符串值 ============
   // 反例（补漏前实测）：下面每一条都会把凭据原样留在日志里。脱敏是安全控制，漏抹即泄漏。
   assert.strictEqual(summarizeError({ message: 'Authorization: "Bearer SECRET123"' }).message,
@@ -649,7 +754,9 @@ function error (message, code) {
     '逗号视为值分隔符（有意收窄，避免吞掉后续参数）——若改为吞到空白需同步改本条')
   // 未闭合引号值同样必须抹掉（否则整段漏抹）
   assert.strictEqual(summarizeError({ message: 'token="x' }).message, 'token="***"', '未闭合引号值必须脱敏')
+})
 
+testCase('qodo PR #152 结构化值/裸 scheme/关键字边界', async () => {
   // ============ qodo PR #152 的 4 条（已逐条复现后修复）============
   // #1 结构化值（数组/对象）：旧实现裸值分支遇 `,`/`}`/`]` 即停，凭据后半段残留。
   assert.strictEqual(summarizeError({ message: 'token=[0,"SECRET"]' }).message, 'token=***',
@@ -728,7 +835,9 @@ function error (message, code) {
   assert.doesNotThrow(() => { fiSelfRefSummary = summarizeError({ failureInfo: fiSelfRef }) }, 'failureInfo 自引用不得抛异常')
   assert.strictEqual(fiSelfRefSummary.failures[0].message, TRUNCATED_FAILURE_MESSAGE,
     'failureInfo 内的自引用应截断为标记')
+})
 
+testCase('failureInfo.failures 敌意对象（revoked proxy / 抛错 getter）', async () => {
   // ============ 补测：failureInfo.failures 敌意对象（qodo #147-11：revoked proxy / 抛错索引 getter） ============
   // 契约：failureInfo 分支同样「绝不抛」。Array.isArray 对 revoked proxy 会抛 TypeError，
   // 索引 getter 抛错的数组在取元素时会抛——二者都必须被挡在 try 内，失败即退回原值透传（不遍历）。
@@ -736,9 +845,7 @@ function error (message, code) {
   // [revoked proxy] 关键点：Array.isArray(revoked) 自身就抛，所以判定必须在 try 里。
   // 反例（qodo 修复前，HEAD 45a63b8 的 `key === 'failures' && Array.isArray(value)`）：判定裸写在 try 外，
   // summarizeError({failureInfo:{failures:revoked}}) 直接抛 TypeError，破坏本模块的不抛契约。
-  const revocableFailures = Proxy.revocable([], {})
-  revocableFailures.revoke()
-  const revokedFailures = revocableFailures.proxy
+  const revokedFailures = makeRevokedFailures()
   assert.throws(() => Array.isArray(revokedFailures), TypeError, '前置条件：Array.isArray 对 revoked proxy 必须抛 TypeError')
   let revokedFailuresSummary
   assert.doesNotThrow(
@@ -752,12 +859,7 @@ function error (message, code) {
 
   // [抛错索引 getter] Array.isArray 为 true，但读第 0 项即抛。
   // 反例（qodo 修复前）：`value.map(...)` 遍历索引 → summarizeError 抛 'index getter boom'。
-  const hostileIndexFailures = []
-  Object.defineProperty(hostileIndexFailures, 0, {
-    get () { throw new Error('index getter boom') },
-    enumerable: true,
-    configurable: true
-  })
+  const hostileIndexFailures = makeHostileIndexFailures()
   assert.strictEqual(hostileIndexFailures.length, 1, '前置条件：定义索引 0 的 getter 后数组长度为 1')
   assert.strictEqual(Array.isArray(hostileIndexFailures), true, '前置条件：带索引 getter 的对象仍是数组')
   assert.throws(() => hostileIndexFailures.map(item => item), /index getter boom/, '前置条件：遍历该数组必然抛错')
@@ -784,13 +886,17 @@ function error (message, code) {
   assert.strictEqual(normalFiSummary.failures[1].code, 'ETIMEDOUT')
   assert.strictEqual(normalFiSummary.failures[1].message, 'token=*** next', 'failureInfo 子项的 message 仍应脱敏并折叠换行')
   assert.strictEqual(normalFiSummary.failures[1].failures[0].code, 'ECONNRESET', 'failureInfo 子项的下级 failures 仍应递归归一')
+})
 
+testCase('顶层 failures 敌意对象同一收口', async () => {
   // [顶层 failures 同一收口 —— 主代理在 qodo 复核后补的第二轮]
   // 反例（只保住 failureInfo 分支时）：summarizeError 常规路径的 `Array.isArray(failures)`、
   // classifyOne 的 `Array.isArray(info.failures)`、classifyFailure 的 `Array.isArray(nested)`、
   // classifySummary 的 `Array.isArray(summary.failures)` 都裸写在 try 外——敌意数组挂在**顶层** failures
   // （或经 failureInfo 透传后被 classifyOne 再读一次）时仍会抛，等于异常只是被推迟了一层。
   // 现统一经 safeArray 取值，以下四条锁定这条口径。
+  const revokedFailures = makeRevokedFailures()
+  const hostileIndexFailures = makeHostileIndexFailures()
   assert.doesNotThrow(() => summarizeError({ message: 'x', failures: revokedFailures }),
     '顶层 failures 为 revoked proxy 时 summarizeError 不得抛 TypeError')
   assert.doesNotThrow(() => summarizeError({ message: 'x', failures: hostileIndexFailures }),
@@ -807,7 +913,9 @@ function error (message, code) {
   assert.strictEqual(normalTopFailures.failures[0].code, 'ETIMEDOUT')
   assert.strictEqual(classifyFailure({ failures: [{ code: 'ETIMEDOUT' }] }).kind, 'retryable',
     '顶层可重试子项仍应让整体判 retryable')
+})
 
+testCase('safeArray 不得经 Symbol.species 逃逸', async () => {
   // ============ 补测（CodeRabbit PR #147）：safeArray 不得经 Array.prototype.slice 走 Symbol.species ============
   // 契约：safeArray 的返回值恒为「真数组」——有 .length 且可 .map，不得因数组子类的自定义
   // Symbol.species 而变成没有数组方法的对象。
@@ -837,7 +945,9 @@ function error (message, code) {
   }, '顶层 failures 为自定义 Symbol.species 的数组子类时 summarizeError 不得抛 TypeError')
   assert.strictEqual(Array.isArray(speciesTopSummary.failures), true, '顶层 failures 必须是真数组')
   assert.strictEqual(speciesTopSummary.failures[0].code, 'ETIMEDOUT', '顶层子项仍应逐项归一')
+})
 
+testCase('failureInfo __proto__ 污染不得伪造 failureKind', async () => {
   // ============ 补测（CodeRabbit PR #147）：failureInfo 的 __proto__ 污染不得伪造 failureKind ============
   // 契约：sanitizeFailureInfo 用 Object.create(null) 承载清洗结果；来自外部 JSON 的**自有**
   // `__proto__` 字段不得改写结果原型，更不得让 classifyOne 读到继承来的伪造 failureKind。
@@ -852,9 +962,10 @@ function error (message, code) {
   assert.strictEqual(protoSafe.message, 'm', '同一 failureInfo 内的正常字段仍应保留')
   assert.strictEqual(classifyFailure({ failureInfo: protoPollutedInfo }).kind, 'retryable',
     '伪造 failureKind 不得把可重试失败带成永久停止（m 无永久文本 → UNKNOWN → retryable）')
+})
 
+testCase('靶向 carrierCases（承载字段 × 区间）', async () => {
   // ================= 靶向补充：failure-planA 三簇（杀 Stryker Survived 变异体） =================
-  const check = (actual, expected, why) => assert.strictEqual(actual, expected, why)
 
   // 【簇2 · 模块级常量 L26】5 个 HTTP_4xx 永久码必须是精确字面量：改成空串/近邻码即漏判永久停止。
   for (const c of ['HTTP_415', 'HTTP_422', 'HTTP_423', 'HTTP_426', 'HTTP_451']) {
@@ -906,14 +1017,30 @@ function error (message, code) {
     ['statusCode 499 是 4xx 上界 → 永久', { statusCode: 499 }, 'permanent', 'HTTP_499'],
     ['statusCode 600 超出取值域 → 保守重试', { statusCode: 600, message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
     ['providerCode 1001 是限流码 → 可重试', { providerCode: '1001' }, 'retryable', 'PROVIDER_RATE_LIMIT'],
-    ['数字 code 1001 走 provider 可重试分支', { code: '1001' }, 'retryable', 'PROVIDER_1001']
+    ['数字 code 1001 走 provider 可重试分支', { code: '1001' }, 'retryable', 'PROVIDER_1001'],
+    // ↓ C5-059：原「区间边界（数字 code / providerCode / statusCode）」表的 12 组维度并入本表，
+    //   逐条保留 why/期望（原先同一批口径分成两张表，改一处忘另一处就是两份口径）。
+    ['数字 code 299 在 3xx 下界之下 → 保守重试', { code: '299', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['数字 code 300 是 3xx 下界（无关 message 不得改写归类）→ 永久', { code: '300', message: 'upstream odd' }, 'permanent', 'PROVIDER_300'],
+    ['数字 code 400 是 4xx 下界 → 永久', { code: '400', message: 'upstream odd' }, 'permanent', 'PROVIDER_400'],
+    ['数字 code 499 是 4xx 上界 → 永久', { code: '499', message: 'upstream odd' }, 'permanent', 'PROVIDER_499'],
+    ['providerCode 299 在 3xx 下界之下 → 保守重试', { providerCode: '299', message: 'upstream odd' }, 'retryable', 'UNKNOWN'],
+    ['providerCode 300 是 3xx 下界 → 永久', { providerCode: '300', message: 'upstream odd' }, 'permanent', 'PROVIDER_300'],
+    ['providerCode 400 是 4xx 下界 → 永久', { providerCode: '400', message: 'upstream odd' }, 'permanent', 'PROVIDER_400'],
+    ['providerCode 499 是 4xx 上界 → 永久', { providerCode: '499', message: 'upstream odd' }, 'permanent', 'PROVIDER_499'],
+    ['statusCode 300 是 3xx 下界 → 永久', { statusCode: 300 }, 'permanent', 'HTTP_300'],
+    ['statusCode 400 是 4xx 下界 → 永久', { statusCode: 400 }, 'permanent', 'HTTP_400'],
+    ['HTTP_300 是 3xx 下界 → 永久', { code: 'HTTP_300' }, 'permanent', 'HTTP_300'],
+    ['非 HTTP_ 前缀的码不得按状态区间判永久', { code: 'PAD__302', message: 'upstream odd' }, 'retryable', 'UNKNOWN']
   ]
   for (const [why, e, kind, reason] of carrierCases) {
     const r = classifyFailure(e)
     check(r.kind, kind, `${why}（kind）`)
     check(r.reason, reason, `${why}（reason）`)
   }
+})
 
+testCase('permanentMessage 五条正则', async () => {
   // 【簇1 · permanentMessage 五条正则】每条只与“近邻但不命中”的负例成对出现，
   // 杀 Regex / StringLiteral / LogicalOperator 的放宽与短路变异体。
   const permanentTexts = [
@@ -938,7 +1065,9 @@ function error (message, code) {
     check(r.kind, 'retryable', `非永久文本「${m}」不得被放宽的正则误判永久`)
     check(r.reason, 'UNKNOWN', `非永久文本「${m}」应为 UNKNOWN 保守重试`)
   }
+})
 
+testCase('瞬态文本与限流文本正则', async () => {
   // 【簇1 · 瞬态文本正则】命中 → TRANSIENT_TEXT 可重试；负例锁住“条件恒真”。
   const transientTexts = [
     'request timeout', 'timed out', '连接超时', 'econn reset by peer', 'eai_again',
@@ -955,7 +1084,9 @@ function error (message, code) {
     check(r.kind, 'retryable', `限流文本「${m}」必须可重试`)
     check(r.reason, 'PROVIDER_RATE_LIMIT', `限流文本「${m}」必须走 PROVIDER_RATE_LIMIT 分支`)
   }
+})
 
+testCase('渠道黑白名单（wxpusher / 企业微信）', async () => {
   // 【簇1 · wxpusher / 企业微信】providerCode 黑白名单 + && 与 || 的边界：
   // 通道不匹配时带 providerCode 也必须走通用区间判定（杀 channel&&providerCode → ||）。
   const channelCases = [
@@ -979,7 +1110,9 @@ function error (message, code) {
     check(r.kind, kind, `${why}（kind）`)
     check(r.reason, reason, `${why}（reason）`)
   }
+})
 
+testCase('显式 failureKind 分支', async () => {
   // 【簇1 · 显式 failureKind】经 failureInfo 进入 classifyOne 的 failureKind 分支：
   // 显式标签压过文本判定、非法值不生效、无 reason 时必须是精确字面量 EXPLICIT。
   const explicitCases = [
@@ -995,7 +1128,9 @@ function error (message, code) {
     check(r.kind, kind, `${why}（kind）`)
     check(r.reason, reason, `${why}（reason）`)
   }
+})
 
+testCase('聚合子级仲裁（error.failures / failureInfo.failures）', async () => {
   // 【簇1 · 聚合子级仲裁】认 error.failures 与 failureInfo.failures 两种形状：
   // 任一子级可重试即整体可重试（父级 permanent 标签不得压掉），空数组不算“有子级”。
   const nestedCases = [
@@ -1013,14 +1148,18 @@ function error (message, code) {
     check(r.kind, kind, `${why}（kind）`)
     check(r.reason, reason, `${why}（reason）`)
   }
+})
 
+testCase('Error.name 分支', async () => {
   // 【簇1 · Error.name 分支】仅精确 SyntaxError/ReferenceError 判永久（大小写归一），其余名称不得触发。
   check(classifyFailure({ name: 'SyntaxError', message: 'boom' }).kind, 'permanent', 'SyntaxError 必须判永久')
   check(classifyFailure({ name: 'SyntaxError', message: 'boom' }).reason, 'SYNTAXERROR', 'SyntaxError 的 reason 必须是大写名称')
   check(classifyFailure({ name: 'ReferenceError', message: 'boom' }).kind, 'permanent', 'ReferenceError 必须判永久')
   check(classifyFailure({ name: 'ReferenceError', message: 'boom' }).reason, 'REFERENCEERROR', 'ReferenceError 的 reason 必须是大写名称')
   check(classifyFailure({ name: 'TypeError', message: 'upstream odd' }).kind, 'retryable', '其他 Error 名称不得被判永久')
+})
 
+testCase('summarizeError 返回结构精确契约', async () => {
   // 【簇3 · summarizeError】返回结构精确契约：字段归一、折叠换行、截断、缺省值，
   // 杀 L177-204 的 ConditionalExpression / LogicalOperator / EqualityOperator / MethodExpression / StringLiteral 变异体。
   check(summarizeError({ code: 'e1' }).code, 'E1', 'code 必须大写透出')
@@ -1051,39 +1190,9 @@ function error (message, code) {
   check(withChild.failures.length, 1, '子失败必须逐个摘要')
   check(withChild.failures[0].message, 'child', '子失败的 message 必须保留')
   check(summarizeError({ failures: 'nope' }).failures, undefined, '非数组 failures 不得透出')
+})
 
-  // 【簇1 · 区间边界补齐】3xx/4xx 的下界/上界必须精确：杀 >=、< 被翻成 > / <= 后仍落同 reason 的变异体。
-  for (const [c, kind, reason] of [
-    ['299', 'retryable', 'UNKNOWN'],
-    ['300', 'permanent', 'PROVIDER_300'],
-    ['400', 'permanent', 'PROVIDER_400'],
-    ['499', 'permanent', 'PROVIDER_499']
-  ]) {
-    const r = classifyFailure({ code: c, message: 'upstream odd' })
-    check(r.kind, kind, `数字 code=${c} 的 kind（区间边界）`)
-    check(r.reason, reason, `数字 code=${c} 的 reason（区间边界）`)
-  }
-  for (const [pc, kind, reason] of [
-    ['299', 'retryable', 'UNKNOWN'],
-    ['300', 'permanent', 'PROVIDER_300'],
-    ['400', 'permanent', 'PROVIDER_400'],
-    ['499', 'permanent', 'PROVIDER_499']
-  ]) {
-    const r = classifyFailure({ providerCode: pc, message: 'upstream odd' })
-    check(r.kind, kind, `providerCode=${pc} 的 kind（区间边界）`)
-    check(r.reason, reason, `providerCode=${pc} 的 reason（区间边界）`)
-  }
-  check(classifyFailure({ statusCode: 300 }).kind, 'permanent', 'statusCode 300 是 3xx 下界 → 永久')
-  check(classifyFailure({ statusCode: 300 }).reason, 'HTTP_300', 'statusCode 300 的 reason 即归一码')
-  check(classifyFailure({ statusCode: 400 }).kind, 'permanent', 'statusCode 400 是 4xx 下界 → 永久')
-  check(classifyFailure({ statusCode: 400 }).reason, 'HTTP_400', 'statusCode 400 的 reason 即归一码')
-  check(classifyFailure({ code: 'HTTP_300' }).kind, 'permanent', 'HTTP_300 是 3xx 下界 → 永久')
-  check(classifyFailure({ code: 'HTTP_300' }).reason, 'HTTP_300', 'HTTP_300 的 reason 即码本身')
-  // 前缀必须精确：非 HTTP_ 前缀的码不得被按 HTTP 状态区间判永久（杀 'HTTP_' 字面量与前缀守卫被短路）。
-  const paddedCode = classifyFailure({ code: 'PAD__302', message: 'upstream odd' })
-  check(paddedCode.kind, 'retryable', '非 HTTP_ 前缀的码不得按状态区间判永久')
-  check(paddedCode.reason, 'UNKNOWN', '非 HTTP_ 前缀的码应落 UNKNOWN 保守重试')
-
+testCase('祖先环守卫', async () => {
   // 【簇3 · 祖先环守卫】自引用子失败必须在**环处**截断，而不是靠深度上限兜底：
   // 杀 childAncestors 的 `ancestors || []` 与空数组字面量变异体（丢祖先后第一层子项会被继续展开）。
   const cyclicError = { message: 'root' }
@@ -1092,9 +1201,124 @@ function error (message, code) {
   check(cyclicSummary.message, 'root', '自引用结构的根摘要仍应可读')
   check(cyclicSummary.failures.length, 1, '自引用结构的子项仍应产出摘要')
   check(cyclicSummary.failures[0].failures, undefined, '自引用子项必须在祖先环处截断，不得继续展开')
+})
 
-  console.log('✅ 常驻失败策略：可重试错误持续退避重试、永久错误立即停止、部分消息失败降级、成功后恢复')
-})().catch(error => {
-  console.error(error)
-  process.exit(1)
+testCase('C5-002 脱敏对抗样本墙钟上界', async () => {
+  // ============ C5-002：对抗样本 + 墙钟上界（畸形结构化值不得把脱敏拖进指数回溯） ============
+  // 既有脱敏用例只喂短、闭合、单形态样本（token=[0,"SECRET"] / token={"a":"SECRET"} / token=[1,2,3]），
+  // 且此前全文没有任何计时断言 ⇒ 生产正则在「重复引号元素 × 未闭合括号」上的指数回溯在测试里完全
+  // 不可见：C9-001 实测 `token=[` + `"a",`×n 的耗时 n=9/43B→93ms、10→745ms、11→3194ms、12→19714ms
+  // （每多一个元素约 ×5.5），199B（48 个元素）30s 未返回；而厂商响应 data.msg 截到 200 字符正好能
+  // 截出这个形态。本块钉住两件事：① 墙钟上界（退化时真的红，不看计数）；② 脱敏语义不变
+  // （该抹的必须抹、输出长度不得缩水）。
+  //
+  // 阈值口径：500ms 上界 / 5s 子进程外壳。线性实现实测 <1ms（3 个数量级余量），只有指数或超长
+  // 回溯才会撞线，故不是对机器速度敏感的判据。
+  const sample199 = 'token=[' + '"a",'.repeat(48)
+  assert.strictEqual(sample199.length, 199, '前置条件：对抗样本必须正好 199 字节（落在上游 200 字符截断内）')
+
+  // 多倍规模采样：48（199B）/ 96（391B）/ 192（775B）/ 384（1543B）。
+  // 期望输出按既有口径精确给出：数组未闭合 ⇒ 落回裸值分支，抹到第一个分隔符（`,`）为止；
+  // summarizeError 的 message 截断 500 在脱敏**之后**，故大样本按 500 截断。
+  const probeSamples = []
+  for (const n of [48, 96, 192, 384]) {
+    const message = 'token=[' + '"a",'.repeat(n)
+    probeSamples.push({
+      name: `${n} 个重复引号元素（${message.length}B，数组未闭合）`,
+      message,
+      expected: ('token=***' + message.slice('token=["a"'.length)).slice(0, 500)
+    })
+  }
+  // failureInfo 里的字符串不走「上游 200 字符截断」这条路，换个调用点同样不能退化/漏抹。
+  probeSamples.push({
+    name: '未闭合数组内嵌真凭据（failureInfo 路径）',
+    message: 'token=["SECRET1234","a",' + '"a",'.repeat(40),
+    via: 'failureInfo',
+    forbid: 'SECRET1234'
+  })
+
+  const probe = timeRedactInChild(probeSamples, 5000)
+  assert.strictEqual(probe.timedOut, false,
+    '脱敏对抗样本 5s 内必须返回：子进程被 SIGKILL 说明结构化值扫描已退化成指数/超长回溯' +
+    '（C9-001 形态：199B/48 元素修复前 30s 不返回）')
+  assert.strictEqual(probe.timings.length, probeSamples.length, '每个对抗样本都必须有计时结果')
+  for (let i = 0; i < probeSamples.length; i++) {
+    const sample = probeSamples[i]
+    const timing = probe.timings[i]
+    assert.ok(timing.ms < 500,
+      `「${sample.name}」耗时 ${timing.ms.toFixed(1)}ms 超过 500ms 上界（线性实现 <1ms；撞线即退化）`)
+    if (sample.expected !== undefined) {
+      assert.strictEqual(timing.out, sample.expected,
+        `「${sample.name}」脱敏结果必须与既有口径一致（长度不得缩水、该抹的必须抹掉）`)
+    }
+    if (sample.forbid) {
+      assert.ok(!timing.out.includes(sample.forbid), '「' + sample.name + '」凭据不得残留')
+      assert.ok(timing.out.startsWith('token=***'), '「' + sample.name + '」凭据值必须整体抹掉')
+    }
+  }
+  const probeTotalMs = probe.timings.reduce((sum, t) => sum + t.ms, 0)
+  assert.ok(probeTotalMs < 500,
+    `多倍规模（48/96/192/384 元素）合计 ${probeTotalMs.toFixed(1)}ms 超过 500ms 上界`)
+  // 反向守卫：性能修复不得把结构化值分支整个砍掉——闭合数组仍必须整体抹成 token=***
+  assert.strictEqual(summarizeError({ message: 'token=["SECRET123","b"]' }).message, 'token=***',
+    '闭合数组仍必须整体脱敏（性能修复不得砍掉结构化值分支）')
+})
+
+// 逐用例执行：失败不中止其余用例；退出码仍按「有没有失败」置 1。
+// XBK_TEST_ONLY 仅供本地单节诊断（子串匹配），CI 不设置 ⇒ 默认跑全部用例；
+// 匹配不到任何用例时直接判红，避免「开关写错 = 静默零覆盖」。
+//
+// 顶层 IIFE 的 rejection 必须自己兜住并置退出码：裸 `;(async () => {...})()` 在
+// `--unhandled-rejections=warn` 的宿主上只打一行警告、进程仍以 0 退出 ⇒ 套件「全绿」实为
+// 异常被吞（Sonar S18）。这里接上 `.catch` 落红（不加 `void`：standard 的 no-void 不允许）。
+;(async () => {
+  const only = process.env.XBK_TEST_ONLY
+  const selected = only ? CASES.filter(item => item.name.includes(only)) : CASES
+  if (only) {
+    console.log(`⚠️ XBK_TEST_ONLY=${only}：只跑 ${selected.length}/${CASES.length} 个用例（本地诊断用，CI 不设置）`)
+  }
+  if (selected.length === 0) {
+    console.error(`❌ XBK_TEST_ONLY=${only} 没有匹配任何用例（共 ${CASES.length} 个）`)
+    process.exitCode = 1
+    return
+  }
+  const failed = []
+  const suiteStarted = process.hrtime.bigint()
+  for (const item of selected) {
+    const caseStarted = process.hrtime.bigint()
+    try {
+      await item.fn()
+      const ms = Number(process.hrtime.bigint() - caseStarted) / 1e6
+      console.log(`✅ ${item.name}（${ms.toFixed(1)}ms）`)
+    } catch (e) {
+      const ms = Number(process.hrtime.bigint() - caseStarted) / 1e6
+      failed.push({ name: item.name, error: e })
+      console.error(`❌ ${item.name}（${ms.toFixed(1)}ms）`)
+      console.error(e && e.stack ? e.stack : String(e))
+    }
+  }
+  // 环境变量还原必须可验证：runResident 用例在 finally 里还原，这里在整套跑完后交叉核对一次。
+  // 即使用例中途抛错，finally 也已执行；任何泄漏都在这里显式记一条失败（不靠人肉看代码）。
+  for (const key of Object.keys(ENV_BASELINE)) {
+    if (process.env[key] !== ENV_BASELINE[key]) {
+      failed.push({
+        name: `环境变量 ${key} 未还原`,
+        error: new Error(`期望 ${JSON.stringify(ENV_BASELINE[key])}，实际 ${JSON.stringify(process.env[key])}`)
+      })
+    }
+  }
+  const totalMs = (Number(process.hrtime.bigint() - suiteStarted) / 1e6).toFixed(1)
+  if (failed.length === 0) {
+    console.log(`✅ 常驻失败策略：${selected.length} 个用例全部通过（${totalMs}ms）`)
+    return
+  }
+  console.error(`\n❌ ${failed.length}/${selected.length} 个用例失败（${totalMs}ms）：`)
+  for (const item of failed) {
+    console.error(`  - ${item.name}: ${item.error && item.error.message ? item.error.message : String(item.error)}`)
+  }
+  process.exitCode = 1
+})().catch((e) => {
+  console.error('❌ 常驻失败策略套件异常退出（顶层 IIFE 的 rejection 未被用例循环兜住）：')
+  console.error(e && e.stack ? e.stack : String(e))
+  process.exitCode = 1
 })

@@ -5,7 +5,8 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants, generateMutants, judgingTestFiles } = require('./run_mutation')
+const { spawnSync } = require('node:child_process')
+const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutants, generateMutants, judgingTestFiles, defaultCheckpointFile } = require('./run_mutation')
 
 ;(async () => {
   // 防重入：run_mutation.js 的 runTests 在临时目录内运行 run_unit_tests.js 时会设置
@@ -136,6 +137,75 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
       if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
       else process.env.MUTATION_CHECKPOINT = originalCheckpoint
       fs.rmSync(path.dirname(ckpt), { recursive: true, force: true })
+      if (hadReport === null) fs.rmSync(reportFile, { force: true })
+      else fs.writeFileSync(reportFile, hadReport)
+    }
+  }
+
+  // ===== 默认断点文件按「仓库 + 进程」隔离（C10-041）=====
+  // 旧默认固定写 ROOT/mutation-progress.json：同一 clone 里两份本机评估共用同一个文件——A 的 persist()
+  // 覆盖 B 的进度、A 正常收尾的 unlink() 抹掉 B 的恢复点（并发时 B 还会把 A 的部分判定当成自己的续跑）。
+  {
+    assert.strictEqual(typeof defaultCheckpointFile, 'function',
+      '必须导出 defaultCheckpointFile：默认断点路径要能与仓库根解耦，并且可被断言')
+    const own = defaultCheckpointFile()
+    const again = defaultCheckpointFile()
+    assert.strictEqual(own, again, '同一进程内默认断点路径必须稳定（persist 每批写同一个文件）')
+    assert.strictEqual(path.dirname(own), os.tmpdir(), `默认断点必须落在临时目录，实际 ${own}`)
+    assert.ok(!path.resolve(own).startsWith(path.resolve(__dirname) + path.sep),
+      `默认断点不得落在仓库内（否则是未跟踪文件 + 同 clone 共用），实际 ${own}`)
+    assert.ok(path.basename(own).includes(String(process.pid)),
+      `文件名必须含进程号（同机两份评估不得共享同一断点），实际 ${path.basename(own)}`)
+    // 另一个进程（另一份评估）必须拿到不同路径
+    const probe = spawnSync(process.execPath,
+      ['-e', "process.stdout.write(require('./run_mutation').defaultCheckpointFile())"],
+      { cwd: __dirname, encoding: 'utf8' })
+    assert.strictEqual(probe.status, 0, '子进程探针必须能加载 run_mutation.js：' + (probe.stderr || ''))
+    const childPath = String(probe.stdout || '').trim()
+    assert.ok(childPath.length > 0, '子进程必须输出默认断点路径')
+    assert.notStrictEqual(childPath, own,
+      '两个进程（同机两份评估）的默认断点路径必须不同，否则会共享/互删同一个恢复点')
+    // 生产路径不得回退到仓库根固定文件
+    const src = fs.readFileSync(path.join(__dirname, 'run_mutation.js'), 'utf8')
+    assert.ok(!/path\\.join\\(ROOT,\\s*'mutation-progress\\.json'\\)/.test(src),
+      'main() 默认断点路径不得回退到仓库根固定文件（C10-041）')
+  }
+  // main() 未设 MUTATION_CHECKPOINT 时必须真的用默认路径：用「指纹匹配 + pending 为空」让它一次都不
+  // 评估批次，停在「未判定」分支（该分支保留断点文件），据此核对文件落点。
+  {
+    const originalExitCode = process.exitCode
+    const originalCheckpoint = process.env.MUTATION_CHECKPOINT
+    const ckpt = defaultCheckpointFile()
+    const rootCkpt = path.join(__dirname, 'mutation-progress.json')
+    const reportFile = path.join(__dirname, 'mutation-report.json')
+    let hadReport = null
+    try { hadReport = fs.readFileSync(reportFile) } catch (e) { if (e.code !== 'ENOENT') throw e }
+    const hadRootCkpt = fs.existsSync(rootCkpt)
+    fs.rmSync(ckpt, { force: true })
+    try {
+      delete process.env.MUTATION_CHECKPOINT
+      const fingerprint = mutantFingerprint(collectMutants(DEFAULT_FILES))
+      fs.writeFileSync(ckpt, JSON.stringify({
+        total: 1,
+        batchSize: 50,
+        fingerprint,
+        killed: [[1, { status: 'killed' }]],
+        survived: [],
+        compileErrors: [],
+        pending: []
+      }))
+      await main({ allowLocal: true, evaluate: async () => ({ status: 'pass', code: 0, signal: null, output: 'ok' }) })
+      assert.strictEqual(process.exitCode, 1, '存在未判定项仍必须非 0 退出（语义不变）')
+      assert.ok(fs.existsSync(ckpt), '未判定时断点必须保留在默认路径（供排查/续跑）')
+      if (!hadRootCkpt) {
+        assert.ok(!fs.existsSync(rootCkpt),
+          '默认路径不得再写到仓库根 mutation-progress.json：同机两份评估会共享同一份断点并互删')
+      }
+    } finally {
+      process.exitCode = originalExitCode
+      if (originalCheckpoint === undefined) delete process.env.MUTATION_CHECKPOINT
+      else process.env.MUTATION_CHECKPOINT = originalCheckpoint
+      fs.rmSync(ckpt, { force: true })
       if (hadReport === null) fs.rmSync(reportFile, { force: true })
       else fs.writeFileSync(reportFile, hadReport)
     }

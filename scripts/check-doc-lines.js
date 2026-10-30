@@ -36,6 +36,15 @@ function isSkippedDir (name) {
   return SKIP_PREFIXES.some((p) => name.startsWith(p))
 }
 
+// 显式码元序比较器（Sonar S2879）：默认 `sort()` 对字符串的比较口径正是 UTF-16 码元字典序，
+// 写出来是为了让「为什么是这个顺序」可见，并把口径钉在**与宿主无关**的那一维上（不用 locale）。
+// **不得**换成 localeCompare：它按宿主语言环境做大小写/重音不敏感的排序，'Linked.md' 与 'a.md'
+// 的相对位置会与码元序相反 ⇒ 扫描面顺序随机器 locale 漂移。`--selftest` 里有靶向断言钉这一点。
+function byCodeUnit (a, b) {
+  if (a === b) return 0
+  return a < b ? -1 : 1
+}
+
 // 收集扫描面：返回排序后的相对路径（POSIX 分隔）。确定性排序是断言可复现的前提。
 // fail-closed：非跳过目录读不下去 ⇒ **抛出**而非静默 omit——扫描面不完整时 main 必须判红，
 // 否则「少扫了一个目录」与「全绿」在输出里长得一样（与 v3.280「新增钩子/workflow 不得假定没被
@@ -56,15 +65,17 @@ function findMarkdownFiles (rootDir, opts) {
       if (e.isDirectory()) {
         if (isSkippedDir(e.name)) continue
         walk(path.join(dir, e.name), childRel)
-      } else if (e.isFile() && e.name.toLowerCase().endsWith('.md')) {
+      } else if (e.name.toLowerCase().endsWith('.md') && (e.isFile() || e.isSymbolicLink())) {
+        // 符号链接的 .md 同样在扫描面内（C10-065）：readdir 的 Dirent 对链接 `isFile()` 为 false，
+        // 旧实现因此静默把它排除——「链接指向的长文档」与「全绿」在输出里长得一样。链接目标不是
+        // 常规文件（断链 / 指向目录）时，checkOne 的读盘失败照旧判红（fail-closed），不会静默略过。
         out.push(childRel)
       }
     }
   }
   walk(rootDir, '')
-  // 显式比较器：默认 sort 会把元素 toString 后按 UTF-16 码元字典序排（此处正是想要的稳定顺序），
-  // 但把口径写出来才能让「为什么是这个顺序」可见（Sonar S2879）。
-  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  // 显式比较器（Sonar S2879）：口径是 UTF-16 码元字典序，见 byCodeUnit 的注释与 --selftest 的靶向断言。
+  return out.sort(byCodeUnit)
 }
 
 // 换行符不是正文：统一剥掉 CRLF 的行尾 `\r`，保留 String.length 的 UTF-16 码元口径。
@@ -168,6 +179,31 @@ function selftest () {
         return fs.readdirSync(d, { withFileTypes: true })
       }
     }), ['a.md', 'docs/b.md'], '跳过名单的目录不得参与遍历，也不得因注入的读取失败而报错')
+    // —— 符号链接的 .md 必须在扫描面内（C10-065）：Dirent 对链接 `isFile()` 为 false，旧实现静默略过。
+    // 用注入的 Dirent 而不是真建符号链接：本仓已登记 FUSE/Termux 宿主建链接会失败，门禁行为不该
+    // 取决于宿主能否 symlink。
+    const linkDirent = (name) => ({
+      name, isDirectory: () => false, isFile: () => false, isSymbolicLink: () => true
+    })
+    const withLink = findMarkdownFiles(tmp, {
+      readdir: (d) => {
+        const entries = fs.readdirSync(d, { withFileTypes: true })
+        return d === tmp ? [...entries, linkDirent('linked.md')] : entries
+      }
+    })
+    assert.ok(withLink.includes('linked.md'),
+      '符号链接的 .md 不得掉出扫描面（旧实现按 isFile() 判定 ⇒ 链接被静默略过）')
+    assert.deepStrictEqual([...withLink].sort(byCodeUnit), withLink, '含符号链接时扫描面仍必须确定性排序')
+    // 比较器口径必须是**码元序**：注入大小写混排的链接名，'Linked.md'（'L' = 0x4C）必须排在
+    // 'a.md'（'a' = 0x61）之前。localeCompare 按语言环境做大小写不敏感比较，会把这个顺序反过来
+    // ⇒ 换成 localeCompare 时这条必红（本仓不许扫描面顺序随宿主 locale 漂移）。
+    assert.deepStrictEqual(findMarkdownFiles(tmp, {
+      readdir: (d) => {
+        const entries = fs.readdirSync(d, { withFileTypes: true })
+        return d === tmp ? [...entries, linkDirent('Linked.md')] : entries
+      }
+    }), ['Linked.md', 'a.md', 'docs/b.md'],
+    '扫描面必须按 UTF-16 码元序（localeCompare 会把 a.md 排到 Linked.md 之前）')
     // —— 超长文件不得靠 spread 求最长行（150k 行会让 Math.max(...args) 当场 RangeError）
     const hugeRel = 'huge.md'
     fs.writeFileSync(path.join(tmp, hugeRel), Array.from({ length: 200000 }, () => 'x').join('\n'))
@@ -181,33 +217,38 @@ function selftest () {
   const real = findMarkdownFiles(path.join(__dirname, '..'))
   assert.ok(real.length >= 7, '本仓至少应有 7 个 md 在册，实得 ' + real.length)
   assert.ok(real.includes('README.md') && real.includes('AGENTS.md') && real.includes('.github/pull_request_template.md'))
-  console.log('✅ check-doc-lines --selftest 全部通过（28 断言）')
+  console.log('✅ check-doc-lines --selftest 全部通过（31 断言）')
 }
 
-function main () {
-  const argv = process.argv.slice(2)
-  if (argv.includes('--selftest')) {
+// C5-058：main 接受 (argv, opts)，以便被套件直接断言——argv 默认取 process.argv.slice(2)，
+// opts.root / opts.log 只供测试注入临时根与输出收集。CLI 形态（process.exit(main())）与判定
+// 行为一字未改：以前 main 与退出码零覆盖，把「有超限」分支改成永假，真实 CLI 打印着 75 行超限
+// 仍然输出「✅ 全部通过」并 exit 0，而套件全绿（判据恒返回 0 也抓不到）。
+function main (argv, opts) {
+  const args = argv || process.argv.slice(2)
+  const log = (opts && opts.log) || ((s) => console.log(s))
+  if (args.includes('--selftest')) {
     selftest()
     return 0
   }
-  const maxIdx = argv.indexOf('--max')
-  const max = maxIdx >= 0 ? Number(argv[maxIdx + 1]) : MAX_DOC_LINE
+  const maxIdx = args.indexOf('--max')
+  const max = maxIdx >= 0 ? Number(args[maxIdx + 1]) : MAX_DOC_LINE
   if (!Number.isInteger(max) || max <= 0) {
-    console.log('❌ --max 必须是正整数，实得 ' + JSON.stringify(argv[maxIdx + 1]))
+    log('❌ --max 必须是正整数，实得 ' + JSON.stringify(args[maxIdx + 1]))
     return 1
   }
-  const root = path.join(__dirname, '..')
+  const root = (opts && opts.root) || path.join(__dirname, '..')
   let files
   try {
     files = findMarkdownFiles(root)
   } catch (e) {
-    console.log('❌ ' + ((e && e.message) || String(e)))
-    console.log('   「扫描面不完整」不等于「全部通过」：与「空扫描面=红」「单文件读盘失败=红」同一条 fail-closed 口径')
+    log('❌ ' + ((e && e.message) || String(e)))
+    log('   「扫描面不完整」不等于「全部通过」：与「空扫描面=红」「单文件读盘失败=红」同一条 fail-closed 口径')
     return 1
   }
-  console.log('🔍 文档行长闸门：阈值 ' + max + ' 字符/行，扫描面 ' + files.length + ' 个 markdown')
+  log('🔍 文档行长闸门：阈值 ' + max + ' 字符/行，扫描面 ' + files.length + ' 个 markdown')
   if (decideEmptyScan(files.length) === 'fail') {
-    console.log('❌ 扫描面为空（一个 markdown 都没收集到）＝不可判定＝红；绝不把「没扫到」当「全绿」')
+    log('❌ 扫描面为空（一个 markdown 都没收集到）＝不可判定＝红；绝不把「没扫到」当「全绿」')
     return 1
   }
   let red = false
@@ -218,21 +259,21 @@ function main () {
     if (!r.ok) {
       red = true
       if (r.offenders.length === 0) {
-        console.log('❌ ' + rel + '：' + r.reason)
+        log('❌ ' + rel + '：' + r.reason)
       } else {
-        console.log('❌ ' + rel + '：' + r.offenders.length + ' 行超限（阈值 ' + max + '）')
+        log('❌ ' + rel + '：' + r.offenders.length + ' 行超限（阈值 ' + max + '）')
         for (const o of r.offenders.slice(0, 5)) {
-          console.log('   L' + o.line + ' = ' + o.len + ' 字符 → 按语义拆成子弹/表格（拆完跑逐字守恒核对）')
+          log('   L' + o.line + ' = ' + o.len + ' 字符 → 按语义拆成子弹/表格（拆完跑逐字守恒核对）')
         }
-        if (r.offenders.length > 5) console.log('   …另有 ' + (r.offenders.length - 5) + ' 行')
+        if (r.offenders.length > 5) log('   …另有 ' + (r.offenders.length - 5) + ' 行')
       }
     }
   }
   if (red) {
-    console.log('❌ 文档行长未通过：把超限的行拆开，不要调大阈值——阈值放宽=闸门形同虚设')
+    log('❌ 文档行长未通过：把超限的行拆开，不要调大阈值——阈值放宽=闸门形同虚设')
     return 1
   }
-  console.log('✅ 文档行长全部通过（' + files.length + ' 个文件，最长 ' + longest + ' 字符）')
+  log('✅ 文档行长全部通过（' + files.length + ' 个文件，最长 ' + longest + ' 字符）')
   return 0
 }
 
@@ -240,4 +281,4 @@ if (require.main === module) {
   process.exit(main())
 }
 
-module.exports = { MAX_DOC_LINE, isSkippedDir, findMarkdownFiles, scanOffenders, decideEmptyScan, checkOne }
+module.exports = { MAX_DOC_LINE, isSkippedDir, findMarkdownFiles, scanOffenders, decideEmptyScan, checkOne, main }

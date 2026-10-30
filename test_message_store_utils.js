@@ -8,29 +8,47 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW } = require('./xbk_message_store')
 
-const mockUtils = {
-  anonKey: (s) => 'anon' + String(s).length,
-  safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
-  getMessageIdentity: () => ({ valid: false }),
-  isValidItem: () => true,
-  num: () => 10000,
-  addIndex: () => {}
+// C3-002（backlog）：夹具加载期先清掉外部部署开关 XBK_CACHE_DIR。
+// 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
+// 而本套件下方用 Config.cache.dir 把 F1 夹具隔离到私有目录——在 export 过该变量的 shell 里直跑
+// 本套件，隔离会被 env 顶掉、夹具写进部署缓存目录（实测：17 条用例假红 + 12 个夹具文件落进哨兵目录）。
+const { isolateProcessCacheDirEnv } = require('./scripts/test-env-isolation')
+isolateProcessCacheDirEnv()
+
+// 夹具装配只允许一处真相（C5-075）：父进程 store / 探针 store / 子进程 preamble 全部由下面两个工厂生成。
+// 子进程侧用 Function.prototype.toString() 把同一份源码注入 `node -e`——工厂签名或 Config 口径一变自动同步；
+// 旧实现把这段装配逐字抄进 CHILD_PREAMBLE，签名一变子进程就静默停在旧副本上（探针在测过期夹具，套件仍绿）。
+function buildMockUtils () {
+  return {
+    anonKey: (s) => 'anon' + String(s).length,
+    safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
+    getMessageIdentity: () => ({ valid: false }),
+    isValidItem: () => true,
+    num: () => 10000,
+    addIndex: () => {}
+  }
 }
 
-const store = createMessageStore({
-  Config: { cache: { maxSize: 10000 } },
-  Utils: mockUtils,
-  fs: {
-    existsSync: () => true,
-    lstatSync: () => ({ isDirectory: () => true }),
-    realpathSync: (p) => p
-  },
-  path,
-  crypto: { randomUUID: () => 'uuid' },
-  normalize: () => {},
-  storage: {},
-  constants: {}
-})
+const mockUtils = buildMockUtils()
+
+function buildFixtureStore ({ createMessageStore, path, storage, Utils }) {
+  return createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils,
+    fs: {
+      existsSync: () => true,
+      lstatSync: () => ({ isDirectory: () => true }),
+      realpathSync: (p) => p
+    },
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: storage || {},
+    constants: {}
+  })
+}
+
+const store = buildFixtureStore({ createMessageStore, path, Utils: mockUtils })
 
 let pass = 0
 let fail = 0
@@ -56,48 +74,20 @@ function tombstoneBytes (ts) {
 
 // 注入 writeAtomic 探针，用于证明「放弃持久化」时确实没有写盘。
 function createProbeStore (storage) {
-  return createMessageStore({
-    Config: { cache: { maxSize: 10000 } },
-    Utils: mockUtils,
-    fs: {
-      existsSync: () => true,
-      lstatSync: () => ({ isDirectory: () => true }),
-      realpathSync: (p) => p
-    },
-    path,
-    crypto: { randomUUID: () => 'uuid' },
-    normalize: () => {},
-    storage: storage || {},
-    constants: {}
-  })
+  return buildFixtureStore({ createMessageStore, path, storage, Utils: mockUtils })
 }
 
 // 死循环守卫的「有限时间」证明必须借子进程设界：同进程内的 setTimeout 无法中断同步
 // 自旋，只有 execFileSync 的 timeout 能杀掉挂死调用。子进程共用一段 store 装配前导，
 // 后接各自探针体；NODE_OPTIONS 的 execpath-shim 已把 process.execPath 指向真实 node，
-// 与 test_cli.js 同一手法。
+// 与 test_cli.js 同一手法。装配由父进程工厂源码生成（C5-075），不再手抄一份。
 const CHILD_PREAMBLE = `
 const path = require('node:path')
 const { createMessageStore } = require('./xbk_message_store')
-const mockUtils = {
-  anonKey: (s) => 'anon' + String(s).length,
-  safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)),
-  getMessageIdentity: () => ({ valid: false }),
-  isValidItem: () => true,
-  num: () => 10000,
-  addIndex: () => {}
-}
+const mockUtils = (${buildMockUtils.toString()})()
+const buildFixtureStore = ${buildFixtureStore.toString()}
 function makeStore (storage) {
-  return createMessageStore({
-    Config: { cache: { maxSize: 10000 } },
-    Utils: mockUtils,
-    fs: { existsSync: () => true, lstatSync: () => ({ isDirectory: () => true }), realpathSync: (p) => p },
-    path,
-    crypto: { randomUUID: () => 'uuid' },
-    normalize: () => {},
-    storage: storage || {},
-    constants: {}
-  })
+  return buildFixtureStore({ createMessageStore, path, storage, Utils: mockUtils })
 }
 `
 
@@ -139,80 +129,8 @@ function runChildProbe (body) {
 
 console.log('=== xbk_message_store.js 纯函数方法测试 ===')
 
-// ===== getFilePath =====
-check('getFilePath: 正常文件名返回缓存目录下路径', () => {
-  const r = store.getFilePath('test.json')
-  assert.ok(r.endsWith(path.sep + 'test.json'), '应返回缓存目录下的 test.json')
-})
-
-check('getFilePath: 路径穿越被阻止（只取 basename）', () => {
-  const r = store.getFilePath('../../etc/passwd')
-  assert.ok(!r.includes('..'), '路径穿越应被阻止')
-  assert.ok(r.endsWith(path.sep + 'passwd'), '应只取 basename')
-})
-
-check('getFilePath: 绝对路径被阻止（只取 basename）', () => {
-  const r = store.getFilePath('/etc/passwd')
-  assert.ok(r.endsWith(path.sep + 'passwd'), '绝对路径应只取 basename')
-})
-
-check('getFilePath: 非法文件名字符被清洗', () => {
-  const r = store.getFilePath('a:b*c?d"e<f>g|h.json')
-  assert.ok(!/[:*?"<>|]/.test(path.basename(r)), '非法字符应被清洗')
-})
-
-check('getFilePath: NUL 字符被清洗', () => {
-  const r = store.getFilePath('test\u0000.json')
-  assert.ok(!r.includes('\u0000'), 'NUL 字符应被清洗')
-})
-
-check('getFilePath: 空文件名回退 default.json', () => {
-  const r = store.getFilePath('')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '空文件名应回退 default.json')
-})
-
-check('getFilePath: undefined 回退 default.json', () => {
-  const r = store.getFilePath(undefined)
-  assert.ok(r.endsWith(path.sep + 'default.json'), 'undefined 应回退 default.json')
-})
-
-check('getFilePath: null 回退 default.json', () => {
-  const r = store.getFilePath(null)
-  assert.ok(r.endsWith(path.sep + 'default.json'), 'null 应回退 default.json')
-})
-
-check('getFilePath: [object Object] 回退 default.json', () => {
-  const r = store.getFilePath('[object Object]')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '[object Object] 应回退 default.json')
-})
-
-check('getFilePath: . 回退 default.json', () => {
-  const r = store.getFilePath('.')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '. 应回退 default.json')
-})
-
-check('getFilePath: .. 回退 default.json', () => {
-  const r = store.getFilePath('..')
-  assert.ok(r.endsWith(path.sep + 'default.json'), '.. 应回退 default.json')
-})
-
-check('getFilePath: 超长文件名截断到 200 字节', () => {
-  const longName = 'a'.repeat(300) + '.json'
-  const r = store.getFilePath(longName)
-  const basename = path.basename(r)
-  assert.ok(Buffer.byteLength(basename, 'utf8') <= 200, '文件名应截断到 200 字节以内')
-})
-
-check('getFilePath: 超长文件名保留扩展名', () => {
-  const longName = 'a'.repeat(300) + '.json'
-  const r = store.getFilePath(longName)
-  assert.ok(r.endsWith('.json'), '超长文件名应保留 .json 扩展名')
-})
-
-check('getFilePath: 数字文件名正常处理', () => {
-  const r = store.getFilePath(123)
-  assert.ok(r.endsWith(path.sep + '123'), '数字文件名应 String 化')
-})
+// getFilePath 的专项覆盖已收拢为单一参数表（C5-046：首版 14 条 + 持久化契约 4 条 + PlanP 4 条 + MS-05 1 条），
+// 见下方「===== getFilePath：入参 → 产物 参数表 =====」；MS-05（超长扩展名分支）仍在原处单独成 check。
 
 // ===== getFileName =====
 check('getFileName: 正常 URL 提取文件名', () => {
@@ -331,6 +249,42 @@ check('_saveTombstones: 可达标时正常序列化并交给 writeAtomic（对�
   assert.strictEqual(writes.length, 1, '应恰好调用一次 writeAtomic')
   assert.ok(writes[0].p.endsWith('dsh_probe_ok.seen.json'), '写入目标应为 <filePath>.seen.json')
   assert.strictEqual(Buffer.byteLength(writes[0].text, 'utf8'), 53, '写入内容应为 53 字节空墓碑文本')
+})
+
+// ===== C5-031：放弃持久化分支必须在**进程内**执行（TAP 覆盖可归因）=====
+// 同一行为已由上面带超时的子进程探针验过，但 TAP 档 perTest 覆盖只归因到测试进程：变异目标只在
+// 子进程里被执行 ⇒ 判 NoCoverage 且不跑任何测试（message-store 段 3 个击杀静默丢失）。
+// 这里用**真实入参**（空墓碑 + maxBytes=1）在进程内走完「淘汰无法达标 ⇒ 放弃持久化」整条链；
+// 子进程探针保留——死循环守卫的「有限时间」证明必须靠外部 timeout。
+check('_saveTombstones: 无法达标时放弃持久化（告警 + 不写盘 + 返回 false）在进程内被执行（覆盖可归因）', () => {
+  const writes = []
+  const probe = createProbeStore({ writeAtomic: (p) => { writes.push(p); return true } })
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  try {
+    const ret = probe._saveTombstones(path.join(__dirname, 'dsh_probe_inproc'), emptyTombstoneMaps(), 1)
+    assert.strictEqual(ret, false, '无法通过淘汰达标时应放弃持久化并返回 false')
+    assert.strictEqual(writes.length, 0, '放弃持久化时不得调用 writeAtomic 写盘')
+    assert.ok(warns.some((w) => w.includes('放弃持久化') && w.includes('dsh_probe_inproc.seen.json')),
+      `应告警「超限且无法通过淘汰达标，放弃持久化」并带上路径，实际告警: ${JSON.stringify(warns)}`)
+  } finally {
+    console.warn = origWarn
+  }
+})
+
+// ===== C5-075：子进程夹具必须与父进程同源 =====
+// 旧实现把父进程的 mockUtils + createMessageStore 装配逐字抄进 CHILD_PREAMBLE；工厂签名/Config 口径一变
+// 子进程侧就静默停在旧副本上，探针变成「在测一份过期的夹具」而套件仍绿。下面两条把同源关系钉死。
+check('CHILD_PREAMBLE: 不得内联一份 createMessageStore 装配（必须由父进程夹具工厂生成）', () => {
+  assert.ok(!/const mockUtils = \{/.test(CHILD_PREAMBLE), 'preamble 不得再手抄 mockUtils 字面量：工厂签名/Config 一变就静默漂移')
+  assert.ok(CHILD_PREAMBLE.includes(String(buildFixtureStore)) && CHILD_PREAMBLE.includes(String(buildMockUtils)),
+    'preamble 必须由 buildFixtureStore/buildMockUtils 源码生成（父进程/探针/子进程同源）')
+})
+
+check('CHILD_PREAMBLE: 子进程夹具与父进程夹具对拍（_resolveMaxSize 同值）', () => {
+  const child = runChildProbe('process.stdout.write(String(makeStore()._resolveMaxSize()))').trim()
+  assert.strictEqual(child, String(store._resolveMaxSize()), '子进程夹具必须与父进程同源（不得是抄过去的旧副本）')
 })
 
 // ===== QX-08：缓存目录解析由生产与青龙 --status 共用同一实现 =====
@@ -641,42 +595,40 @@ check('F7 残留: getFileName 性质测试——同名缓存文件必来自等�
 // （换元素或改 id/url 字段）不会触发重建，旧索引把已不存在的身份判为「已存在」→ has() 返回 true
 // → 主流程跳过推送（漏推，与 SYSTEM_CONTRACT「宁可多推」相反）。这里用真实 Utils + 假 fs +
 // 内存权威数组做单元级 oracle 对拍（oracle = _indexHasIdentityDirect 零索引线性扫描）。
-const identityStore = createMessageStore({
-  Config: { cache: { maxSize: 10000 } },
-  Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
-  fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
-  path,
-  crypto: { randomUUID: () => 'uuid' },
-  normalize: () => {},
-  storage: {
-    readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
-    writeAtomic: () => true,
-    writeAtomicIfAbsent: () => true
-  },
-  constants: {
-    DEFAULT_MAX_SIZE: 10000,
-    MESSAGE_CACHE_MAX_BYTES: 8388608,
-    TOMBSTONE_MAX_KEYS: 5000,
-    TOMBSTONE_MAX_BYTES: 262144,
-    TOMBSTONE_LOCK_STALE_MS: 10000
-  }
-})
+// C5-077：每次 seed 都 new 一个实例——隔离由构造保证，不再靠「文件名不撞」的命名约定，
+// 也不需要手工回退 _memoryCache / _memoCount / _verified（旧写法一旦漏写或换名，陈旧条目
+// 就被下一个用例当作「已推送」判重，曾实锤漏推假绿）。
+function makeIdentityStore () {
+  return createMessageStore({
+    Config: { cache: { maxSize: 10000 } },
+    Utils: createUtils({ fs: require('node:fs'), safeRe: (p, f) => new RegExp(p, f) }),
+    fs: makeCacheFs({ [FAKE_ROOT]: 'dir' }),
+    path,
+    crypto: { randomUUID: () => 'uuid' },
+    normalize: () => {},
+    storage: {
+      readSafeTextResult: () => ({ status: 'missing' }), // 墓碑文件按「确认缺失」处理
+      writeAtomic: () => true,
+      writeAtomicIfAbsent: () => true
+    },
+    constants: {
+      DEFAULT_MAX_SIZE: 10000,
+      MESSAGE_CACHE_MAX_BYTES: 8388608,
+      TOMBSTONE_MAX_KEYS: 5000,
+      TOMBSTONE_MAX_BYTES: 262144,
+      TOMBSTONE_LOCK_STALE_MS: 10000
+    }
+  })
+}
+
+let identityStore = makeIdentityStore()
 
 function seedIdentityProbe (messages, name) {
+  // 全新实例 ⇒ 同一用例内不存在前序用例的 _memoryCache/_verified/_memoCount 残留
+  identityStore = makeIdentityStore()
   // 必须经 getFilePath 求路径：has(message, filename) 内部同样先 getFilePath(filename)，
   // 直接塞绝对路径会让两次路径不一致、内存权威数组命不中。
   const fp = identityStore.getFilePath(name)
-  // ⚠️ 状态泄漏防御（用例间状态猎杀 #198 后续）：identityStore 是模块级共享实例，
-  // _memoryCache/_verified/_memoCount 跨用例累积且 _verified 恒真永不重读磁盘——
-  // 前一用例 mutate 后的陈旧快照会被后续用例当作「已推送」判重（曾实锤复现：
-  // f02_form_2_22.json 派生名碰撞 + f02_stale.json 原地改写后 has 误真）。
-  // 同名 fp 的旧条目在重新 seed 前先清掉：陈旧快照/verified 标志/计数一起回退，
-  // 使每个 seed 用例看到的是「干净的同名缓存文件」而非前序用例的遗留态。
-  if (Object.prototype.hasOwnProperty.call(identityStore._memoryCache, fp)) {
-    delete identityStore._memoryCache[fp]
-    identityStore._memoCount -= 1
-    identityStore._verified.delete(fp)
-  }
   identityStore._memoryCache[fp] = messages
   identityStore._memoCount += 1
   identityStore._verified.add(fp) // 跳过「内存命中未验证」的真实磁盘检查
@@ -1107,48 +1059,118 @@ check('_isTombstoneLockOwner: 只有长度与内容都相同的字符串 token �
   // 空 token 分支不可达（生产 _newTombstoneLockToken 恒返回非空 token），不再断言空串同长同内容。
 })
 
-// ===== getFilePath：截断单射的持久化格式契约 =====
-// 说明：下方 `187 字节前缀 + -anon305.json` **不是内部细节**，而是**持久化格式**——缓存文件名
-// 直接来自 getFilePath，摘要口径一变，既有长 pushUrl 用户的缓存文件即被孤立（判重记录丢失 →
-// 重复推送）。故此字面量与 anonKey/filterHash 的精确值同属「跨版本兼容」契约（非任意快照）。
-check('getFilePath: 超长名截断用足 200 字节、保留最长前缀并附全名摘要（持久化格式兼容）', () => {
-  const r = store.getFilePath('a'.repeat(300) + '.json')
-  const base = path.basename(r)
-  assert.strictEqual(base, 'a'.repeat(187) + '-anon305.json', '截断产物必须逐字节精确（187 字节前缀 + -anon305.json）')
-  assert.strictEqual(Buffer.byteLength(base, 'utf8'), 200, '必须用足 200 字节上限')
-  // 契约本体（单射）：仅第 200 字节之后不同的两条长名不得映射到同一路径，产物一律 <= 200 字节。
-  // 用 longNameStore（**真实** Utils.anonKey）：本文件的 store 用固定 anonKey 桩（故上方字面量为
-  // '-anon305.json'），桩体现不出摘要的单射性，碰撞性质必须由真实摘要验证（与 F7 用例同口径）。
-  const x = longNameStore.getFilePath('a'.repeat(300) + 'x.json')
-  const y = longNameStore.getFilePath('a'.repeat(300) + 'y.json')
-  assert.notStrictEqual(x, y, '仅第 200 字节之后不同的长名不得碰撞（否则判重缓存互相覆盖）')
-  for (const p of [r, x, y]) {
-    assert.ok(Buffer.byteLength(path.basename(p), 'utf8') <= 200, `截断产物必须 <= 200 字节：${path.basename(p)}`)
+// ===== getFilePath：入参 → 产物 参数表（C5-046：四波重复覆盖收拢为单表）=====
+// 背景：同一函数曾被四个波次逐条重复覆盖（首版 14 个 check / 持久化契约 4 个 / PlanP 4 个 / MS-05 1 个），
+// 同一入参的同一期望最多出现三份（'../../etc/passwd'、''/'undefined'/'null' 等回退名、200 字节截断各 2~3 份）。
+// 现收拢为「一行 = 一种独有入参维度 × 期望产物」，由 runGfCases 统一执行；MS-05（超长**扩展名**分支）留在
+// 原处独立成 check——它测的是「扩展名本身超预算 ⇒ 放弃扩展名保摘要」这条不同分支，与通用截断表不重叠。
+// 期望口径：产物 = 缓存目录 + 消毒后的 basename，故每行都断言「逐字 basename」与「整串以该 basename 结尾」；
+// 后者即路径安全不变量（任何 ../ 或绝对路径都逃不出缓存目录），比首版只查 endsWith('/passwd') 更严。
+const GF_ILLEGAL = /[\\/:*?"<>|]/
+const GF_CTRL = /[\u0000-\u001F]/
+const GF_LONE_HIGH = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/
+const GF_LONE_LOW = /(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/
+// 'stub' = 固定 anonKey 桩（store：长名摘要恒为 anon305，用于钉住持久化格式字面量）；
+// 'real' = 真实 anonKey（longNameStore：摘要的单射性只能用真摘要验证，桩会让「不同长名不同路径」变恒真）。
+const GF_STORES = { stub: store, real: longNameStore }
+const GF_REPR = (v) => (typeof v === 'string' ? JSON.stringify(v) : String(v))
+// 无信息文件名（空串 / 纯点串 / 对象与布尔的 String 化产物）：一律回退 default.json。
+const GF_FALLBACK_ARGS = ['', '.', '..', '[object Object]', 'undefined', 'null', 'true', 'false', undefined, null]
+
+const GF_CASES = {
+  base: [
+    { name: '普通文件名', arg: 'test.json', basename: 'test.json' },
+    { name: '短名不得被截断/加摘要（反向对照）', arg: 'ok.json', basename: 'ok.json' },
+    { name: '正常名不得被回退掉', arg: 'normal-name.json', basename: 'normal-name.json' },
+    { name: '数字入参必须 String 化', arg: 123, basename: '123' },
+    { name: '相对路径穿越必须被 basename 消除', arg: '../../etc/passwd', basename: 'passwd', noDotDot: true },
+    { name: '绝对路径必须只取末段', arg: '/etc/passwd', basename: 'passwd' },
+    { name: '多级相对路径只取末段', arg: 'a/b', basename: 'b' }
+  ],
+  sanitize: [
+    // Windows 保留字符 + 多段路径：POSIX 下 '\' 不是分隔符，故末段里的 '\' 也要按保留字符删除。
+    { name: 'Windows 保留字符与多段路径全清', arg: 'a/b\\c:d*e?f"g<h>i|j.json', basename: 'bcdefghij.json', noIllegal: true },
+    { name: '非法字符被删除（精确产物，不是只查"不含"）', arg: 'a:b*c?d"e<f>g|h.json', basename: 'abcdefgh.json', noIllegal: true },
+    { name: 'NUL 被删除（原样进路径会让 fs 抛 ERR_INVALID_ARG_VALUE）', arg: 'test\u0000.json', basename: 'test.json', noCtl: true },
+    { name: 'NUL 夹在名字中间同样被删除', arg: 'bad\u0000name.json', basename: 'badname.json', noCtl: true },
+    { name: 'C0 控制字符同样被删除', arg: 'ctrl\u0001\u001F.json', basename: 'ctrl.json', noCtl: true }
+  ],
+  fallback: GF_FALLBACK_ARGS.map((arg) => ({ name: `无信息名 ${GF_REPR(arg)} 回退 default.json`, arg, basename: 'default.json' })),
+  truncate: [
+    // 字面量不是内部细节：缓存文件名直接来自此处，摘要口径一变，既有长 pushUrl 用户的缓存文件即被孤立
+    // （判重记录丢失 → 重复推送），故与 anonKey/filterHash 的精确值同属「跨版本兼容」契约。
+    // 一行同时覆盖首版的「≤200 字节」与「保留 .json 扩展名」两条弱断言（bytes=200 蕴含 ≤200）。
+    { name: '超长 ASCII 名：逐字 200 字节产物（187 字节前缀 + -anon305.json）', arg: 'a'.repeat(300) + '.json', basename: 'a'.repeat(187) + '-anon305.json', bytes: 200, endsWith: '.json' },
+    // 单射：仅第 200 字节之后不同的两条长名不得映射到同一缓存文件，且单射不得以突破长度上限为代价。
+    { name: '真实摘要：仅第 200 字节之后不同的长名不得碰撞', store: 'real', arg: 'a'.repeat(300) + 'x.json', distinctFrom: 'a'.repeat(300) + 'y.json', maxBytes: 200 }
+  ],
+  multibyte: [
+    { name: '多字节长名（3 字节/字）截断后仍须是合法 UTF-8', arg: '中'.repeat(80) + '.json', maxBytes: 200, utf8: true },
+    { name: '代理对长名（4 字节/个）不得留孤立代理', arg: '😀'.repeat(60) + '.json', maxBytes: 200, surrogate: true },
+    { name: '代理对更长名：末位不得落在半个码点上', arg: '😀'.repeat(80) + '.json', maxBytes: 200, surrogate: true }
+  ],
+  realDigest: [
+    // 真实 anonKey 含 ':'，摘要必须只留 [0-9a-zA-Z._-]（否则又引入路径保留字符），且要用足 200 字节。
+    { name: '真实 anonKey 摘要不得引入路径保留字符或空白', store: 'real', arg: 'u'.repeat(260) + 'aaaa.json', charset: /^[0-9a-zA-Z._-]+$/, bytes: 200 }
+  ],
+  coerce: [
+    { name: '带自定义 toString 的对象必须可 String 化', arg: { toString () { return 'obj-name.json' } }, repr: "{ toString: () => 'obj-name.json' }", basename: 'obj-name.json', noThrow: true },
+    // Symbol：String(Symbol) 本身不抛（会得到 'Symbol(s)'），但若被当数组/模板拼接则抛；此处只钉「不得抛」
+    // 与产物可用（落在缓存目录、无保留字符），不钉具体名字——名字内容是 JS 内建 String 化的细节，不是本函数契约。
+    { name: 'Symbol 必须被兜住且产物可用（不得抛）', arg: Symbol('s'), noThrow: true, noIllegal: true }
+  ]
+}
+
+function runGfCases (cases) {
+  for (const c of cases) {
+    const s = GF_STORES[c.store || 'stub']
+    const label = `${c.name}｜getFilePath(${c.repr || GF_REPR(c.arg)})`
+    let full
+    if (c.noThrow) {
+      let threw = false
+      try { full = s.getFilePath(c.arg) } catch (e) { threw = true }
+      assert.strictEqual(threw, false, `${label}：String 化失败必须被兜住（不得抛）`)
+    } else {
+      full = s.getFilePath(c.arg)
+    }
+    const base = path.basename(full)
+    const bytes = Buffer.byteLength(base, 'utf8')
+    // ① 产物逐字（一行 = 一种入参维度；real 摘要分支不钉摘要字面量，改钉下面 ③ 的性质）
+    if (c.basename !== undefined) {
+      assert.strictEqual(base, c.basename, `${label}：产物必须逐字为 ${c.basename}，实际 ${base}`)
+    }
+    // ② 路径安全不变量：产物 = 缓存目录 + basename
+    assert.ok(full.endsWith(path.sep + base), `${label}：产物必须是「缓存目录 + basename」，实际 ${full}`)
+    if (c.noDotDot) assert.strictEqual(full.includes('..'), false, `${label}：产物不得含 .. 片段`)
+    // ③ 按维度的附加性质
+    if (c.noIllegal) assert.strictEqual(GF_ILLEGAL.test(base), false, `${label}：路径保留字符必须全部清洗`)
+    if (c.noCtl) assert.strictEqual(GF_CTRL.test(base), false, `${label}：C0 控制字符必须清洗`)
+    if (c.bytes !== undefined) assert.strictEqual(bytes, c.bytes, `${label}：产物必须恰好 ${c.bytes} 字节，实际 ${bytes}`)
+    if (c.maxBytes !== undefined) assert.ok(bytes <= c.maxBytes, `${label}：产物不得超 ${c.maxBytes} 字节，实际 ${bytes}`)
+    if (c.endsWith) assert.ok(full.endsWith(c.endsWith), `${label}：产物必须保留 ${c.endsWith} 扩展名，实际 ${base}`)
+    if (c.charset) assert.ok(c.charset.test(base), `${label}：摘要产物只允许 ${c.charset}，实际 ${base}`)
+    if (c.utf8) {
+      assert.strictEqual(base, Buffer.from(base, 'utf8').toString('utf8'), `${label}：截断结果必须是合法 UTF-8`)
+      assert.strictEqual(base.includes('\uFFFD'), false, `${label}：不得出现替换字符（切在多字节中间会留 U+FFFD）`)
+    }
+    if (c.surrogate) {
+      assert.strictEqual(GF_LONE_HIGH.test(base), false, `${label}：不得残留孤立高位代理`)
+      assert.strictEqual(GF_LONE_LOW.test(base), false, `${label}：不得残留孤立低位代理`)
+    }
+    if (c.distinctFrom !== undefined) {
+      assert.notStrictEqual(full, s.getFilePath(c.distinctFrom), `${label}：仅第 ${c.maxBytes} 字节之后不同的长名不得碰撞（否则判重缓存互相覆盖 = 漏推/重推）`)
+    }
   }
-})
+}
 
-check('getFilePath: 多字节长名截断不得切出孤立代理对', () => {
-  const r = store.getFilePath('😀'.repeat(60) + '.json')
-  const base = path.basename(r)
-  assert.ok(Buffer.byteLength(base, 'utf8') <= 200, `截断产物不得超过 200 字节：${Buffer.byteLength(base, 'utf8')}`)
-  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(base), '不得残留孤立高位代理')
-  assert.ok(!/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(base), '不得残留孤立低位代理')
-})
-
-check('getFilePath: 非法字符必须被删除（精确产物），无信息名一律回退 default.json', () => {
-  assert.strictEqual(path.basename(store.getFilePath('a:b*c?d"e<f>g|h.json')), 'abcdefgh.json')
-  assert.strictEqual(path.basename(store.getFilePath('test\u0000.json')), 'test.json', 'NUL 与控制字符必须被清洗')
-  for (const bad of ['undefined', 'null', 'true', 'false', '[object Object]', '.', '..', '']) {
-    assert.strictEqual(path.basename(store.getFilePath(bad)), 'default.json', `${JSON.stringify(bad)} 应回退 default.json`)
-  }
-})
-
-check('getFilePath: 摘要不得引入路径保留字符或空白（真实 anonKey 含 ":"）', () => {
-  const a = 'u'.repeat(260) + 'aaaa.json'
-  const base = path.basename(longNameStore.getFilePath(a))
-  assert.ok(/^[0-9a-zA-Z._-]+$/.test(base), `摘要产物只允许 [0-9a-zA-Z._-]，实际 ${base}`)
-  assert.strictEqual(Buffer.byteLength(base, 'utf8'), 200)
-})
+// 每条 check = 一族维度（表驱动执行）；失败信息里带行名与入参，定位粒度不亚于原来一条 check 一个用例。
+check('getFilePath 参数表：basename 与路径安全（正常名 / 数字 / 穿越 / 绝对路径 / 多段路径）', () => runGfCases(GF_CASES.base))
+check('getFilePath 参数表：非法字符与控制字符必须被删除（精确产物）', () => runGfCases(GF_CASES.sanitize))
+check('getFilePath 参数表：无信息文件名一律回退 default.json', () => runGfCases(GF_CASES.fallback))
+check('getFilePath 参数表：超长名截断（逐字 200 字节产物 + 真实摘要单射）', () => runGfCases(GF_CASES.truncate))
+check('getFilePath 参数表：多字节与代理对截断不得切破码点', () => runGfCases(GF_CASES.multibyte))
+check('getFilePath 参数表：真实 anonKey 摘要只允许安全字符', () => runGfCases(GF_CASES.realDigest))
+check('getFilePath 参数表：String 化必须被兜住（toString 对象 / Symbol）', () => runGfCases(GF_CASES.coerce))
 
 // ===== readMessages：内存命中/恢复窗口/读失败标记 =====
 check('readMessages: 内存命中且磁盘存在时不得写盘，并标记已验证（后续命中不再重查磁盘）', () => {
@@ -1975,67 +1997,27 @@ check('_probeIndexMiss: 小数组（n<=8）必须整表抽查（首次未命中�
   assert.deepStrictEqual(identityStore._probeIndexMiss(entry, arr, { id: 'absent' }), { hit: false, diverged: true }, 'n=8 必须整表抽查，第 5 位字段改写必须被看见')
 })
 
-// ===== 补测 PlanP：getFilePath / _getTombstoneProcessStart（message-store 未直测的方法）=====
-// 反例（改动前）：两者在既有 104 项里只经高层路径间接覆盖，其**消毒/回退/截断**与
-// **/proc 解析**的精确口径从未被直接断言 —— 本段用 createProbeStore 直接调用。
+// ===== C5-077：identityStore 隔离必须由「每用例新实例」保证，不能靠命名约定 + 手工回退计数 =====
+// 旧实现是模块级共享实例，seedIdentityProbe 靠删 _memoryCache[fp] / _memoCount -= 1 / _verified.delete
+// 手工回退；一旦新用例换了文件名或忘写清理，陈旧条目与 _memoCount 就跨用例累积（曾实锤漏推假绿）。
+check('identity 隔离：每个 seed 用例拿到全新实例（_memoCount/_verified 不得跨用例累积）', () => {
+  seedIdentityProbe([{ id: 'iso-1' }], 'iso_probe_1.json')
+  assert.strictEqual(identityStore._memoCount, 1, `seed 之后 _memoCount 必须只反映本次 seed，实际 ${identityStore._memoCount}（模块级实例跨用例累积）`)
+  seedIdentityProbe([{ id: 'iso-2' }], 'iso_probe_2.json')
+  assert.strictEqual(identityStore._memoCount, 1, '再次 seed 必须仍是 1 条（不得把上一个用例的条目带过来）')
+  assert.deepStrictEqual(Object.keys(identityStore._memoryCache), [identityStore.getFilePath('iso_probe_2.json')], '不得残留前一用例的缓存条目')
+  assert.strictEqual(identityStore._verified.size, 1, '_verified 不得累积')
+})
+
+// ===== 补测 PlanP：_getTombstoneProcessStart（message-store 未直测的方法）=====
+// 反例（改动前）：它在既有 104 项里只经高层路径间接覆盖，**/proc 解析**的精确口径从未被直接断言
+// —— 本段用 createProbeStore 直接调用。（同一段里原有的 getFilePath 补测已并入参数表，见上。）
 {
   const S = createProbeStore()
-  // —— getFilePath：路径安全（只取 basename + 清洗非法字符）——
-  check('PlanP getFilePath: 路径穿越必须被 basename 消除、非法字符被清洗', () => {
-    const p1 = S.getFilePath('../../etc/passwd')
-    // 注意：返回值是**完整缓存路径**（含目录分隔符），安全性体现在「basename 被消毒」上，
-    // 故断言必须落在 basename 而非整串（首版写成「整串不含 /」是错的）。
-    assert.strictEqual(path.basename(p1), 'passwd', '路径穿越必须被 basename 消除为末段')
-    assert.strictEqual(p1.includes('..'), false, '产物不得含 .. 片段')
-    assert.strictEqual(path.basename(S.getFilePath('a/b')), 'b', '多级路径同样只取末段')
-    const p2 = path.basename(S.getFilePath('a/b\\c:d*e?f"g<h>i|j.json'))
-    assert.strictEqual(/[\\/:*?"<>|]/.test(p2), false, '非法字符必须全部清洗（含 Windows 保留字符）——断言落在 basename')
-    const p3 = S.getFilePath('bad\u0000name.json')
-    assert.strictEqual(p3.includes('\u0000'), false, 'NUL 必须清洗（否则 fs 抛 ERR_INVALID_ARG_VALUE）')
-    const p4 = S.getFilePath('ctrl\u0001\u001F.json')
-    assert.strictEqual(/[\u0000-\u001F]/.test(p4), false, 'C0 控制字符同样清洗')
-  })
-
-  check('PlanP getFilePath: 非信息文件名必须回退 default.json', () => {
-    for (const bad of ['', '.', '..', '[object Object]', 'undefined', 'null', 'true', 'false']) {
-      const got = S.getFilePath(bad)
-      assert.strictEqual(got.includes('default.json'), true, `${JSON.stringify(bad)} 必须回退 default.json（曾产生 [object Object] 垃圾文件）`)
-    }
-    const ok = S.getFilePath('normal-name.json')
-    assert.strictEqual(ok.includes('normal-name.json'), true, '正常名不得被回退掉')
-  })
-
-  check('PlanP getFilePath: 带自定义 toString 的对象与非字符串必须可 String 化且不抛', () => {
-    let threw = false
-    try {
-      S.getFilePath({ toString () { return 'obj-name.json' } })
-      S.getFilePath(123)
-      S.getFilePath(Symbol('s'))
-    } catch (e) { threw = true }
-    assert.strictEqual(threw, false, 'String 化失败必须被兜住（Symbol 会抛 TypeError）')
-  })
-
+  // —— getFilePath：四波重复覆盖已收拢为单表（C5-046），见「===== getFilePath：入参 → 产物 参数表 =====」——
+  // 原 PlanP 的 4 条 getFilePath 用例（穿越/清洗、回退 default.json、String 化不抛、200 字节截断）逐条落在
+  // 该表的 base / sanitize / fallback / truncate / multibyte / coerce 六族里，入参与维度均未减少。
   // —— _getTombstoneProcessStart：/proc 解析的边界 ——
-  check('PlanP getFilePath: 超长名必须按 UTF-8 字节截到 200 且不切半代理对', () => {
-    // 驱动 getFilePath 的**字节截断分支**（L427-437）——首版用例只测了短名，故该分支 30 个靶子全存活。
-    const base = (nm) => path.basename(S.getFilePath(nm))
-    // 纯 ASCII 超长：截到 200 字节（含 .json 后缀与摘要段）
-    const ascii = base('x'.repeat(300) + '.json')
-    assert.strictEqual(Buffer.byteLength(ascii, 'utf8'), 200, '超长 ASCII 名必须恰好截到 200 字节')
-    // 多字节（中文 3 字节/字）：仍须 ≤200 且为合法 UTF-8（不得截出半个字符）
-    const cn = base('中'.repeat(80) + '.json')
-    assert.ok(Buffer.byteLength(cn, 'utf8') <= 200, '多字节名不得超 200 字节')
-    assert.strictEqual(cn, Buffer.from(cn, 'utf8').toString('utf8'), '截断结果必须是合法 UTF-8')
-    assert.strictEqual(cn.includes('\uFFFD'), false, '不得出现替换字符（切在多字节中间会留 U+FFFD）')
-    // 代理对（emoji 4 字节/个）：末位不得是孤立高代理 ⇒ 字节数会退到 198
-    const em = base('😀'.repeat(80) + '.json')
-    const last = em.charCodeAt(em.length - 1)
-    assert.strictEqual(last >= 0xd800 && last <= 0xdbff, false, '末位不得是孤立高代理（必须回退一格丢弃半个码点）')
-    assert.ok(Buffer.byteLength(em, 'utf8') <= 200, '代理对场景同样不得超 200 字节')
-    // 短名不受截断影响（反向对照）
-    assert.strictEqual(base('ok.json').startsWith('ok.json'), true, '短名不得被截断/加摘要')
-  })
-
   check('PlanP _getTombstoneProcessStart: 非 Linux 返回 null、读取失败返回 null', () => {
     const orig = process.platform
     try {
@@ -2584,11 +2566,169 @@ check('MS-14 哨兵认领: 复核发现持有者存活必须把哨兵搬回原�
     `还原失败必须 WARN 并显式说明哨兵已丢（不得静默）：${JSON.stringify(warnsB)}`)
 })
 
+// ===== C3-001：0 字节缓存 / 短读必须与「缓存缺失」区分开 =====
+// 缺陷：`JSON.parse(result.text || '[]')` 把 0 字节文件洗成「合法空缓存」，随后清除 _readFailed、
+// 写内存快照并固化「已验证」——方向（全量重推）本身是契约允许的（SYSTEM_CONTRACT 核心原则 1），
+// 缺口是**零告警**：运维无法把「缓存被外部截断成 0 字节」与「首次运行没有缓存」区分开。
+// 修复口径：方向不变（仍按空缓存重建、仍解除写闸门 = 不引入 F1 的永久零推送自锁），只补「响亮」；
+// 短读（读到的字节少于 fstat 观测值）另按瞬时读失败 fail-closed —— 部分内容不得被当成完整判重
+// 记录，否则下一轮 save 会把读不到的身份静默丢掉（判重数据丢失）。
+check('C3-001: 0 字节 push.json 必须点名告警（不得静默当合法空缓存），方向仍是按空缓存重建', () => {
+  cleanF1Dir()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const store = makeRealStore()
+  const name = 'c3001_empty.json'
+  const fp = store.getFilePath(name)
+  REAL_FS.writeFileSync(fp, '')
+  store._readFailed[fp] = true // 前置：写闸门本已占位（旧实现会静默清掉且不留任何痕迹）
+  let msgs
+  const errs = captureConsole('error', () => { msgs = store.readMessages(fp) })
+  assert.deepStrictEqual(msgs, [], '0 字节按空缓存返回（全量重推方向不变）')
+  const hits = errs.filter(l => l.includes(fp))
+  assert.strictEqual(hits.length, 1, `0 字节必须且只能产出一条点名该文件的诊断（修前为 0 条）：${JSON.stringify(errs)}`)
+  assert.ok(hits[0].includes('0 字节') && hits[0].includes('重推'),
+    `诊断必须说明「0 字节」及其后果（全量重推）：${hits[0]}`)
+  assert.strictEqual(store._readFailed[fp], undefined, '写闸门必须解除（否则永久零推送：F1 自锁）')
+  assert.deepStrictEqual(store._memoryCache[fp], [], '内存快照按空缓存')
+  assert.strictEqual(store._verified.has(fp), true, '读取成功后固化「已验证」')
+  assert.deepStrictEqual(corruptBackups(name), [], '0 字节没有任何字节可隔离 ⇒ 不得产生 .bak（与「解析失败」区分）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '', '读取本身不得改写文件')
+  assert.strictEqual(store.saveMessages(fp, [{ id: 'x' }]), true, '门解除后必须能正常落盘（不得引入永久零推送）')
+})
+
+check('C3-001: 缓存缺失（初始化写 []）不得触发 0 字节告警（两类必须区分开）', () => {
+  cleanF1Dir()
+  REAL_FS.mkdirSync(F1_DIR, { recursive: true })
+  const store = makeRealStore()
+  const fp = store.getFilePath('c3001_missing.json')
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(store.readMessages(fp), []) })
+  assert.deepStrictEqual(errs, [], '首次初始化是正常路径，不得有任何错误诊断（否则每次新 pushUrl 都刷告警）')
+  assert.strictEqual(REAL_FS.readFileSync(fp, 'utf8'), '[]', '缺失缓存初始化内容仍是 []（行为不变）')
+})
+
+check('C3-001: 短读（读到的字节少于 fstat 观测值）必须 fail-closed：绝不把部分内容当完整判重记录', () => {
+  const name = 'c3001_short.json'
+  const h = makeBatchStore({
+    name,
+    files: { [cachePath(name)]: '[{"id":"a"}]' },
+    readStatus: () => ({ status: 'ok', text: '[{"id":"a"}]', shortRead: true })
+  })
+  const errs = captureConsole('error', () => { assert.deepStrictEqual(h.store.readMessages(h.filePath), []) })
+  assert.strictEqual(h.store._readFailed[h.filePath], true, '短读与 ioError/replaced 同口径：保持写闸门')
+  assert.ok(errs.some(l => l.includes('不完整') && l.includes(h.filePath)),
+    `必须点名「读取不完整」并指向该文件：${JSON.stringify(errs)}`)
+  assert.deepStrictEqual(h.storage.writes.filter(w => w.p === h.filePath), [], '短读后绝不得覆写磁盘')
+  assert.strictEqual(h.store._memoryCache[h.filePath], undefined, '短读结果不得进内存快照（否则下一轮 save 用它覆写）')
+  assert.deepStrictEqual(h.store._drainRecoveryEvents(), [], '短读是瞬时故障，绝不进入隔离开口（不得 rename）')
+})
+
+// ===== C3-002：测试入口/夹具必须隔离 XBK_CACHE_DIR =====
+// 缺陷：XBK_CACHE_DIR 无条件压过 Config.cache.dir 并跳过根内校验——这是 SYSTEM_CONTRACT:19 的
+// 三方同源契约（生产行为正确，**不得改动**）；真实缺陷在测试侧：两个测试入口 spawn/exec 子进程时
+// 不传 env（继承 shell），全仓也没有任何一处删除它 ⇒ 在 export 过该变量的 shell 里跑测试，夹具会
+// 写进部署缓存目录（实测：本套件带该变量启动时 17 条用例假红、12 个夹具文件落进哨兵目录）。
+// 修复口径：只改测试侧——入口把剥离后的 env 传给子进程，高风险夹具在加载期自清；生产 getter 的
+// 「env 压过配置」语义一字不改（下方 raw 对照分支就是在锁这条，防止有人「顺手」改生产语义）。
+const ENV_ISOLATION = './scripts/test-env-isolation'
+
+check('C3-002: stripCacheDirEnv 必须剥离 XBK_CACHE_DIR 且不改动入参（入口唯一实现）', () => {
+  const { stripCacheDirEnv } = require(ENV_ISOLATION)
+  const base = { XBK_CACHE_DIR: '/deploy/cache', KEEP: '1' }
+  const { env, cleared } = stripCacheDirEnv(base)
+  assert.strictEqual(env.XBK_CACHE_DIR, undefined, '剥离后不得残留 XBK_CACHE_DIR')
+  assert.strictEqual(env.KEEP, '1', '其它环境变量必须原样保留')
+  assert.strictEqual(cleared, '/deploy/cache', '必须回传被清除的原值（入口据此告警）')
+  assert.strictEqual(base.XBK_CACHE_DIR, '/deploy/cache', '不得原地修改入参（process.env 只由显式 API 改）')
+  assert.strictEqual(stripCacheDirEnv({ XBK_CACHE_DIR: '' }).cleared, '', '空值按「未设置」处理（不算泄漏）')
+  assert.strictEqual(stripCacheDirEnv({}).env.XBK_CACHE_DIR, undefined, '未设置时不得凭空造键')
+})
+
+check('C3-002: 两个测试入口都必须把剥离后的 env 传给子进程（接线内容断言）', () => {
+  for (const entry of ['run_tests.js', 'run_unit_tests.js']) {
+    const src = REAL_FS.readFileSync(path.join(__dirname, entry), 'utf8')
+    assert.ok(src.includes(`require('${ENV_ISOLATION}')`), `${entry} 必须 require ${ENV_ISOLATION}`)
+    assert.ok(/env:\s*SUITE_ENV/.test(src),
+      `${entry} 必须把 SUITE_ENV 传给子进程（否则 shell 里的 XBK_CACHE_DIR 照旧泄漏进每个套件）`)
+  }
+})
+
+check('C3-002: 高风险夹具（test_filter / 本套件）加载期必须自清 XBK_CACHE_DIR', () => {
+  for (const file of ['test_filter.js', 'test_message_store_utils.js']) {
+    const src = REAL_FS.readFileSync(path.join(__dirname, file), 'utf8')
+    assert.ok(/isolateProcessCacheDirEnv\(\)/.test(src), `${file} 必须在加载期调用 isolateProcessCacheDirEnv()`)
+  }
+  assert.strictEqual(process.env.XBK_CACHE_DIR, undefined, '本套件加载后进程内不得残留 XBK_CACHE_DIR')
+})
+
+// 行为验证：子进程以 XBK_CACHE_DIR=<哨兵目录> 启动，raw = 不隔离（生产契约：env 压过配置，必须
+// 照旧成立），isolate = 走测试侧的显式清除。两条分支合起来同时锁住「缺陷机制真实存在」与
+// 「隔离后不再写进部署目录」。
+const C3002_OWN = `xianbaoku_cache_c3002_own_${process.pid}`
+const C3002_SENTINEL = `xianbaoku_cache_c3002_sentinel_${process.pid}`
+const C3002_PREAMBLE = `
+const path = require('node:path')
+const fs = require('node:fs')
+const { createMessageStore } = require('./xbk_message_store')
+`
+function c3002Body (mode) {
+  return C3002_PREAMBLE + `
+if (${JSON.stringify(mode)} === 'isolate') require('${ENV_ISOLATION}').isolateProcessCacheDirEnv({ log: () => {} })
+const store = createMessageStore({
+  Config: { cache: { dir: ${JSON.stringify(C3002_OWN)}, maxSize: 10000 } },
+  Utils: { anonKey: (s) => 'anon' + String(s).length, safeObjectCopy: (o) => JSON.parse(JSON.stringify(o)), getMessageIdentity: () => ({ valid: false }), isValidItem: () => true, num: () => 10000, addIndex: () => {} },
+  fs,
+  path,
+  crypto: require('node:crypto'),
+  normalize: (o) => o,
+  storage: require('./xbk_storage'),
+  constants: { DEFAULT_MAX_SIZE: 10000, MESSAGE_CACHE_MAX_BYTES: 8388608, TOMBSTONE_MAX_KEYS: 5000, TOMBSTONE_MAX_BYTES: 262144, TOMBSTONE_LOCK_STALE_MS: 10000 }
+})
+const fp = store.getFilePath('c3002_probe.json')
+const ok = store.saveMessages(fp, [{ id: 'x' }])
+process.stdout.write(JSON.stringify({ cacheDir: store.cacheDir, filePath: fp, ok }))
+`
+}
+
+check('C3-002: 带 XBK_CACHE_DIR 启动子进程——raw 仍写 env 目录（生产契约），isolate 后只写私有目录', () => {
+  const ownDir = path.join(__dirname, C3002_OWN)
+  const sentinelDir = path.join(__dirname, C3002_SENTINEL)
+  const cleanup = () => {
+    for (const d of [ownDir, sentinelDir]) {
+      try { REAL_FS.rmSync(d, { recursive: true, force: true }) } catch (e) { /* 忽略 */ }
+    }
+  }
+  const run = (mode) => {
+    let out
+    try {
+      out = execFileSync(process.execPath, ['-e', c3002Body(mode)], {
+        encoding: 'utf8', timeout: 8000, cwd: __dirname, env: { ...process.env, XBK_CACHE_DIR: sentinelDir }
+      })
+    } catch (e) {
+      assert.fail(`C3-002 子进程（${mode}）未能正常返回（code=${e.code}）：${e.message}`)
+    }
+    return JSON.parse(out)
+  }
+  cleanup()
+  try {
+    const raw = run('raw')
+    assert.strictEqual(raw.ok, true, 'raw 分支写入必须成功（缺陷复现的前置）')
+    assert.strictEqual(raw.cacheDir, sentinelDir, '生产契约：XBK_CACHE_DIR 必须压过 Config.cache.dir（本修复不得改动）')
+    assert.ok(raw.filePath.startsWith(sentinelDir + path.sep),
+      `raw 分支必须写进 env 指向的目录（这就是「测试写进部署缓存」的机制）：${raw.filePath}`)
+    cleanup()
+    const isolated = run('isolate')
+    assert.strictEqual(isolated.ok, true, 'isolate 分支写入必须成功')
+    assert.strictEqual(isolated.cacheDir, ownDir, '隔离后必须回到 Config.cache.dir 解析出的私有目录')
+    assert.ok(isolated.filePath.startsWith(ownDir + path.sep), `隔离后必须写私有目录：${isolated.filePath}`)
+    assert.strictEqual(REAL_FS.existsSync(sentinelDir), false, '隔离后绝不得再创建/写入部署目录（哨兵必须不存在）')
+  } finally {
+    cleanup()
+  }
+})
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_message_store_utils.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
-// ===== 套件退场：identityStore 模块级状态清理（用例间状态猎杀 #198 后续）=====
-// seedIdentityProbe 的条目在本文件内已按同名 fp 自清理，但 mutate 类用例（F-02 组）的
-// _memoryCache/_verified/_memoCount 仍会在套件结束后残留——同进程聚合执行（变异测试/
-// 合并 runner）时污染后续套件。退场统一清空，保证套件边界零残留。
+// ===== 套件退场：清掉最后一个 identityStore 实例的残留（用例间状态猎杀 #198 后续）=====
+// 隔离已由 makeIdentityStore 每用例新实例保证；这里兜底清一次，保证套件边界零残留——
+// 同进程聚合执行（变异测试 / 合并 runner）时不会把最后一条 seed 的条目带进后续套件。
 for (const fp of Object.keys(identityStore._memoryCache)) {
   delete identityStore._memoryCache[fp]
   identityStore._verified.delete(fp)

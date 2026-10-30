@@ -13,6 +13,36 @@ const zlib = require('node:zlib')
 const net = require('node:net')
 const { spawn, spawnSync } = require('node:child_process')
 
+// C5-020：源码锁的两条纪律。
+// ① 切片的锚点必须先存在：`src.slice(src.indexOf(a), src.indexOf(b))` 在锚点消失时 indexOf
+//    返回 -1 ⇒ slice(-1, x) 静默退化成「末字符/空段」，后面的 includes 断言要么假红（错位）
+//    要么假绿（判据根本没覆盖到目标段），而失败信息只会说「长度不对」。
+// ② 判据不得被注释满足：注释里留着实现原句时 includes 照样绿（实现已删也没人发现）。
+function sliceBetween (source, startAnchor, endAnchor, label) {
+  const start = source.indexOf(startAnchor)
+  assert.ok(start > -1, `${label}：起始锚点缺失（${startAnchor}）`)
+  const end = endAnchor === undefined ? source.length : source.indexOf(endAnchor, start)
+  assert.ok(end > start, `${label}：结束锚点缺失或在起点之前（${endAnchor}）`)
+  const seg = source.slice(start, end)
+  assert.ok(seg.length > 0, `${label}：切片为空（${startAnchor} → ${endAnchor}）`)
+  return seg
+}
+function sliceTo (source, endAnchor, label) {
+  const end = source.indexOf(endAnchor)
+  assert.ok(end > 0, `${label}：结束锚点缺失或在文件头（${endAnchor}）`)
+  return source.slice(0, end)
+}
+// 按行剥注释（行首 //、*、/* 整行剥掉；行内 // 只在前面没有引号时才算注释起点，
+// 'https://x' 这类字符串不被截断）。要锁「代码里真有这句」的地方把它套在源码上再 includes。
+function codeOf (source) {
+  return source.split('\n').map((line) => {
+    const trimmed = line.trimStart()
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return ''
+    const idx = line.indexOf('//')
+    if (idx > -1 && !/['"`]/.test(line.slice(0, idx))) return line.slice(0, idx)
+    return line
+  }).join('\n')
+}
 // 前端模块清单（v3.364）：拆 app.js 时，测试按固定顺序把自家模块拼回一份源码——
 // 653 条源码文本断言因此不必随搬家逐条改锚点。新增模块时把文件追加到入口之前。
 const CONSOLE_MODULE_FILES = [
@@ -26,7 +56,13 @@ const CONSOLE_MODULE_FILES = [
 ]
 function readConsoleSource () {
   return CONSOLE_MODULE_FILES
-    .map((file) => fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8'))
+    .map((file) => {
+      const text = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8')
+      // C5-020：清单里的模块被清空/搬走时，拼接结果会静默变短，653 条文本断言里有一部分
+      // 仍然能过（另一些以「找不到」红在很远的地方）。这里先按文件钉住「非空且像源码」。
+      assert.ok(text.length > 0, `前端模块 ${file} 不得为空（readConsoleSource 会静默少拼一段）`)
+      return text
+    })
     .join('\n')
 }
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
@@ -86,6 +122,8 @@ const {
   filterLockIdentity,
   claimStaleFilterLock,
   runtimeFilterDeps,
+  // C2-004：注入「校验期抛错」的引擎，钉住异常兜底 catch 的错误码与日志
+  setFilterDepsForTests,
   // v3.357 两步验证：TOTP/恢复码/Cookie/配置读取
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
@@ -158,6 +196,22 @@ function trackSockets (server) {
 // interval。unref 过的 interval（生产 SSE 每连接 heartbeat、用例自己 unref 的）不钉事件循环，
 // 因此不算泄漏、不入 ♻️、不计失败——但**仍然 clearInterval**：测试结束就不该留后台定时器，
 // 否则它自己的 teardown 失败时会一直空跑到进程退出（评审 3）。
+// C5-028：用例级 server 的收尾归 harness，不再由用例最后一行 close。
+// listen() 是全文件唯一开监听的口子 ⇒ 它登记过的 server，生命周期就是「这一条用例」。
+// 旧写法把 server.close() 放在用例最后一行（70 处）：断言提前失败时那一行不执行，同一段
+// 收尾要重复写 70 遍，而且每写错一次就把「跑完不退出」的坑重新埋回去。
+// 与真实泄漏的分界：harness 登记的 server 静默关掉（不计 ♻️、不进 leakedScopes）；
+// 只有没走 listen() 的句柄与 ref interval 才算泄漏（仍由 reapTestScope 记账）。
+function closeCaseServers () {
+  let closed = 0
+  for (const server of liveServers) {
+    for (const socket of server._testSockets || []) { try { socket.destroy() } catch (e) {} }
+    if (server.listening) { try { server.close() } catch (e) {} closed++ }
+  }
+  liveServers.clear()
+  return closed
+}
+
 function reapTestScope (label) {
   let closed = 0
   let cleared = 0
@@ -179,6 +233,17 @@ function reapTestScope (label) {
     leakedScopes.push(`${label}（server ${closed} / interval ${cleared}）`)
   }
   return { closed, cleared }
+}
+
+// C5-029：泄漏兜底闸的判定抽成函数——此前它只写在 main().then 的尾巴里（一段 if），
+// 把判定改成恒不成立、或把 harvested 结果换成常量，没有任何一条用例会红；唯一的信号是
+// Stryker 等满 timeoutMS（延迟 18h 才可见）。抽出来之后由用例直接钉住「有泄漏 ⇒ 非空报告」。
+function leakedResourceReport (lastReap) {
+  if (leakedScopes.length === 0 && lastReap.closed <= 0 && lastReap.cleared <= 0) return null
+  const detail = leakedScopes.length > 0
+    ? `${leakedScopes.length} 次收尾兜底（${leakedScopes.join('；')}）`
+    : `套件末收到 server ${lastReap.closed} 个 / interval ${lastReap.cleared} 个`
+  return `[console-suite] 检测到测试资源泄漏：${detail}——退出码置 1`
 }
 
 // 上一个 aok 超时未收尾的标记：aok 用 Promise.race 定局后原 work 仍在跑，Promise 没有取消
@@ -209,21 +274,102 @@ function refdHandleNames (ignore) {
   return names
 }
 
+// C5-021：失败只打 e.message 会把栈一起丢掉——TypeError 只剩「x is not a function」，
+// 这类套件上万行，排障只能在本地重跑一遍才知道断在哪。统一打「message（含 actual/expected）
+// + 栈首几帧」：AssertionError 也给栈，它指向的那一行就是断言现场。
+const FAILURE_STACK_FRAMES = 6
+function failureText (e) {
+  let detail = ''
+  // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
+  // 排障时看不出差在哪。这里补上短摘要，超长截断。
+  if (e && e.actual !== undefined) {
+    try { detail = ` (actual=${JSON.stringify(e.actual)} expected=${JSON.stringify(e.expected)})`.slice(0, 200) } catch (err) { detail = '' }
+  }
+  const message = `${(e && e.message) || String(e)}${detail}`
+  const stack = e && e.stack ? String(e.stack).split('\n').slice(1, 1 + FAILURE_STACK_FRAMES).filter((l) => l.trim()) : []
+  return stack.length > 0 ? `${message}\n${stack.map((l) => `    ${l.trim()}`).join('\n')}` : message
+}
+
+// ── C5-068：失败清单必须能唯一定位 ──
+// 旧实现失败时只 push(name)：本文件 60 条共用「结构红线:」前缀，跨文件还出现过真重号
+// （test_pusher 的 P3/P7、test_status_report 的 S11–S17 各两处）。汇总里两行一模一样，
+// 只能重跑整份套件自己数第几条。现在注册时抓调用行（栈里第一条不属于 harness 的帧），
+// 失败行打成 `<name> @L<行>`；同名用例再带 `#<第几次>` ⇒ 重号与泛化前缀都能落到源码行。
+const caseNameSeen = new Map()
+const duplicateCaseNames = new Set()
+function caseCallSite () {
+  const frames = String((new Error()).stack || '').split('\n').slice(1)
+  for (const frame of frames) {
+    if (!/test_console\.js:\d+:\d+/.test(frame)) continue
+    if (/\bat (ok|aok|caseLabel|caseCallSite) \(/.test(frame)) continue
+    const m = frame.match(/test_console\.js:(\d+):\d+/)
+    if (m) return Number(m[1])
+  }
+  return 0
+}
+function caseLabel (name) {
+  const line = caseCallSite()
+  const seq = (caseNameSeen.get(name) || 0) + 1
+  caseNameSeen.set(name, seq)
+  if (seq > 1) duplicateCaseNames.add(name)
+  return `${name}${seq > 1 ? ` #${seq}` : ''} @L${line}`
+}
+
 function ok (name, fn) {
+  const label = caseLabel(name)
   reapStaleTimeout(name)
-  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(name); console.log(`  ❌ ${name}: ${e.message}`) } finally { reapTestScope(name) }
+  try { fn(); passed++; console.log(`  ✅ ${name}`) } catch (e) { failed++; failedNames.push(label); console.log(`  ❌ ${name}: ${failureText(e)}`) } finally { closeCaseServers(); reapTestScope(name) }
 }
 // 变异体还有第二类 Timeout：不是「跑完不退出」，而是用例内部 await 永不返回（例如变异体
 // 删掉 res.end 后 request() 永远等不到响应）。收尾收割只能在用例结束后跑，因此必须给每条
 // 用例一个上界：超时记失败、继续下一条。
-// 取值 25s 的依据（评审 4 校准，旧注释 15s 的口径是错的）：
-//   · 基线最慢单条 5.3–5.5s（readRunHistory 尾窗），25s ≈ 4.5x，慢机器/抖动仍有富余；
-//   · 必须严格大于 SSE 用例的最长内层等待 20s（untilTornDown(20000)：超限硬断要等满 20s
-//     才能判负），否则合法慢用例会先被看门狗判红——15s 时这条用例本来就在赌，机器一慢就假红。
+// 取值 35s 的依据（C5-003 校准，旧口径 25s/「只论证 20s」是错的）：
+//   · 基线最慢单条 5.3–5.5s（readRunHistory 尾窗），35s ≈ 6x，慢机器/抖动仍有富余；
+//   · 必须严格大于**每一处**内层等待上界，而内层上界有两类：
+//       ① 子进程/服务收尾轮询 5 处，各 RUN_DEADLINE_MS=30s（原先散落成 5 个 30000 字面量）；
+//       ② SSE 超限硬断用例是**串行两段**：untilTornDown(SSE_TEARDOWN_WAIT_MS=20s) 之后才
+//          untilEnded(SSE_END_WAIT_MS=10s)，最坏和 = 30s（旧注释只论证了前一段 20s < 25s，
+//          漏掉后一段 ⇒ 慢机上先红看门狗、用例自己的断言永远不执行）。
+//   · 因此 TEST_TIMEOUT_MS = max(两类上界) + WATCHDOG_MARGIN_MS。下面那条「看门狗不死不变式」
+//     用例把这条关系锁死：改任何一个内层上界而不同步看门狗，套件当场变红。
 // 已知边界：同步死循环（while (true) {}）用同线程定时器打断不了——看门狗自己也是这个线程上的
 // 回调，永远轮不到它执行。那种形态只能靠上层兜住（Stryker 的 timeoutMS、CI 的 step 超时）。
-const TEST_TIMEOUT_MS = 25000
+const RUN_DEADLINE_MS = 30000 // 5 处「等子进程/服务收尾」轮询上界（用例断言文案写「30s 内结束」）
+const SSE_TEARDOWN_WAIT_MS = 20000 // SSE 超限硬断：等「服务端连接被摘除」
+const SSE_END_WAIT_MS = 10000 // 随后等「客户端读到 close」（与上一步串行）
+const SSE_SERIAL_WAIT_MS = SSE_TEARDOWN_WAIT_MS + SSE_END_WAIT_MS
+const WATCHDOG_MARGIN_MS = 5000 // 看门狗在内层上界之外留的余量
+const TEST_TIMEOUT_MS = Math.max(RUN_DEADLINE_MS, SSE_SERIAL_WAIT_MS) + WATCHDOG_MARGIN_MS
+// ── C5-067：阈值只能引用常量，不能在用例里复制成裸数 ──
+// 陈旧锁判定阈值由 scripts/console.js 定义但**未导出**（`const FILTER_LOCK_STALE_MS = 10 * 1000`），
+// 测试侧只能持有一份具名常量（下方注释钉住来源），样本则由它派生——旧写法是 3 处裸 11000，
+// 生产把阈值调到 15s 后这里仍在「11s 前」造锁，用例名说陈旧、实际测的是活锁。
+const FILTER_LOCK_STALE_MS = 10 * 1000 // = scripts/console.js 的 FILTER_LOCK_STALE_MS（未导出）
+const FILTER_LOCK_STALE_SAMPLE_MS = FILTER_LOCK_STALE_MS + 1000 // 刚过期 1s，边界之上
+// lastaccept 重放窗直接用生产导出的常量（旧写法散着 30000/61000 两个裸数）。
+const REPLAY_WINDOW_MS = REPLAY_WINDOW_NOTIFY_TEST_MS
+// ── C5-033：按函数名取函数体（花括号配对）──
+// 必须容错：变异档里 scripts/console.js 会被 @stryker-mutator/instrumenter 实插桩，
+// 插桩器重排签名空白（`function tickAuto (` → `function tickAuto(`）。定点串匹配在插桩后
+// 源码上取到 0 字节，把「函数体长度 > 500」的守卫变成恒抛，整套变异报告恒红失真——
+// 容错定位 + 自测（见「C5-033 函数体定位器」用例）一起兜住这个回归。
+function functionBodyOf (text, fnName) {
+  const m = new RegExp('function\\s+' + fnName + '\\s*\\(').exec(text)
+  if (!m) return ''
+  const open = text.indexOf('{', m.index + m[0].length)
+  if (open < 0) return ''
+  let depth = 0
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}') {
+      depth--
+      if (depth === 0) return text.slice(open + 1, i)
+    }
+  }
+  return ''
+}
 async function aok (name, fn) {
+  const label = caseLabel(name)
   reapStaleTimeout(name)
   let watchdog = null
   let timedOut = false
@@ -249,18 +395,13 @@ async function aok (name, fn) {
     console.log(`  ✅ ${name}`)
   } catch (e) {
     failed++
-    failedNames.push(name)
+    failedNames.push(label)
     // 超时是真超时（不是用例自己抛的错）才记僵尸标记：后续用例开始前会因此补收割一次。
     if (timedOut) timedOutStale = name
-    // 带自定义消息的 assert 会把 actual/expected 藏起来（只留「剩余秒数按 5s 窗算」这种描述），
-    // 排障时看不出差在哪。这里补上短摘要，超长截断。
-    let detail = ''
-    if (e && e.actual !== undefined) {
-      try { detail = ` (actual=${JSON.stringify(e.actual)} expected=${JSON.stringify(e.expected)})`.slice(0, 200) } catch (err) { detail = '' }
-    }
-    console.log(`  ❌ ${name}: ${e.message}${detail}`)
+    console.log(`  ❌ ${name}: ${failureText(e)}`)
   } finally {
     if (watchdog) realClearTimeout(watchdog)
+    closeCaseServers()
     reapTestScope(name)
   }
 }
@@ -276,6 +417,35 @@ function mkTmp (prefix) {
   return dir
 }
 function tmpDir () { return mkTmp('xbk-console-test-') }
+
+// ── FIFO 夹具（C5-070）──
+// mkfifo 只有 coreutils 提供（Node 22 没有 mkfifoSync），而旧写法把 /usr/bin/mkfifo 写死：
+// macOS / 精简容器 / 某些 Android 上该路径不存在 ⇒ execFileSync 抛 ENOENT，用例变红而不是
+// 显式跳过，把「本机没有这个工具」误报成契约失败。改为固定落点探测（仍不做 PATH 查找——
+// Sonar S4036：可写目录里的同名程序不该被执行），缺失时记一笔 SKIPPED 并打印出来。
+// 只跳过依赖 FIFO 的那一小段，同一用例里其它断言照跑（不整条用例静默消失）。
+const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
+let skipped = 0
+function findMkfifo (candidates = MKFIFO_CANDIDATES) {
+  for (const p of candidates) {
+    try {
+      // 存在还不够：目录/不可执行的同名文件同样会 Enoent/EACCES；只认「普通文件」。
+      if (fs.statSync(p).isFile()) return p
+    } catch (e) { /* 不存在/读不到 ⇒ 试下一个候选 */ }
+  }
+  return ''
+}
+function makeFifo (target, label) {
+  const bin = findMkfifo()
+  if (!bin) {
+    skipped++
+    console.log(`  ⏭️ ${label}：本机没有 mkfifo（已探测 ${MKFIFO_CANDIDATES.join(' / ')}），只跳过 FIFO 夹具`)
+    return false
+  }
+  fs.rmSync(target, { force: true })
+  require('node:child_process').execFileSync(bin, [target])
+  return true
+}
 
 // 收割：删不掉就**不静默**——把路径与原因写 stderr，否则 30 分钟后 check-host-clean 只会说
 // 「有过期沙箱」，没人知道是哪一轮没删掉（退出码不变：清理失败是环境问题，不该冒充测试结果）。
@@ -318,6 +488,109 @@ async function withSettingsConsole (fn, prepare) {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 }
+
+// ── 看门狗不死不变式（C5-003）──
+// 断言对象是「常量之间的关系」而不是某条业务行为：看门狗先响时，用例自己的断言永远不执行，
+// 失败文案还会误导成「实现挂死」（假红 + 排错方向错）。这条关系以前只写在注释里，注释漏写了
+// SSE 后半段 10s，于是 25s 的看门狗其实小于 20s+10s 的串行上界——必须由测试自己守住。
+ok('看门狗不死不变式：TEST_TIMEOUT_MS 必须大于每一处内层等待上界（且留余量）', () => {
+  assert.ok(TEST_TIMEOUT_MS > RUN_DEADLINE_MS,
+    `看门狗 ${TEST_TIMEOUT_MS}ms 必须大于子进程轮询上界 ${RUN_DEADLINE_MS}ms`)
+  assert.ok(TEST_TIMEOUT_MS > SSE_SERIAL_WAIT_MS,
+    `看门狗 ${TEST_TIMEOUT_MS}ms 必须大于 SSE 串行等待 ${SSE_TEARDOWN_WAIT_MS}+${SSE_END_WAIT_MS}=${SSE_SERIAL_WAIT_MS}ms`)
+  const slack = TEST_TIMEOUT_MS - Math.max(RUN_DEADLINE_MS, SSE_SERIAL_WAIT_MS)
+  assert.ok(slack >= WATCHDOG_MARGIN_MS,
+    `看门狗相对最长内层等待必须留 ≥${WATCHDOG_MARGIN_MS}ms 余量（实际 ${slack}ms）`)
+  // 锁住 30s 这个量级：5 处断言的文案与文档都写「30s 内结束」，调大必须连带重估看门狗。
+  assert.strictEqual(RUN_DEADLINE_MS, 30000, '轮询上界必须仍是 30s（用例文案与文档口径）')
+  // 内层上界必须**全部**从常量派生：散落字面量对上面三条关系断言是隐形的（改字面量不改关系）。
+  const src = fs.readFileSync(__filename, 'utf8')
+  const derived = src.match(/Date\.now\(\) \+ RUN_DEADLINE_MS/g) || []
+  assert.strictEqual(derived.length, 5, `5 处轮询上界必须派生自 RUN_DEADLINE_MS（实际 ${derived.length} 处）`)
+  assert.strictEqual((src.match(/untilTornDown\(SSE_TEARDOWN_WAIT_MS\)/g) || []).length, 1,
+    'SSE 拆除等待必须走 SSE_TEARDOWN_WAIT_MS 常量')
+  assert.strictEqual((src.match(/untilEnded\(SSE_END_WAIT_MS\)/g) || []).length, 1,
+    'SSE 终结等待必须走 SSE_END_WAIT_MS 常量')
+})
+
+// ── C5-021：harness 自己的失败输出必须有栈 ──
+// 旧实现两个 catch 都只打 `e.message`：TypeError 在 CI 日志里就是一行「x is not a function」，
+// 上万行的套件里没有栈帧就只能本地重跑定位。这条用例走真实 ok() 打印路径取证（不是读源码），
+// 打印前后把计数器与失败名还原，避免自证式污染通过/失败数。
+ok('harness 失败输出必须带栈（C5-021：走真实 ok() 打印路径）', () => {
+  const lines = []
+  const origLog = console.log
+  const snapshot = { passed, failed, names: failedNames.slice(), leaked: leakedScopes.slice() }
+  try {
+    console.log = (...args) => lines.push(args.join(' '))
+    ok('探针：故意抛 TypeError', () => { throw new TypeError('probe is not a function') })
+  } finally {
+    console.log = origLog
+    passed = snapshot.passed
+    failed = snapshot.failed
+    failedNames.length = 0
+    failedNames.push(...snapshot.names)
+    leakedScopes.length = 0
+    leakedScopes.push(...snapshot.leaked)
+  }
+  const out = lines.join('\n')
+  assert.ok(out.includes('probe is not a function'), `失败输出必须保留 message（实际：${JSON.stringify(out)}）`)
+  assert.ok(out.includes('❌ 探针：故意抛 TypeError'), '失败输出必须保留用例名')
+  assert.ok(/^ {4}at /m.test(out), `失败输出必须带栈帧（旧实现只打 e.message，实际：${JSON.stringify(out)}）`)
+  // AssertionError 同样要给栈（message 里那句自定义文案之外，actual/expected 也要留）
+  const assertion = new assert.AssertionError({ message: '期望 A', actual: 2, expected: 1 })
+  assert.ok(failureText(assertion).includes('actual=2') && failureText(assertion).includes('expected=1'),
+    'AssertionError 的 actual/expected 摘要不得丢')
+  assert.ok(/^ {4}at /m.test(failureText(assertion)), 'AssertionError 的栈同样不得丢')
+})
+
+// ── C5-068：失败清单必须能唯一定位（重号 / 60 条泛化前缀）──
+// 走真实 ok() 注册路径取证：两条完全同名、且都在不同行抛错的用例，失败清单必须给出不同的行；
+// 第二条还要带 `#2`。全部还原计数器与注册表，不污染通过/失败数和后续重号统计。
+ok('harness 失败清单必须能唯一定位（C5-068：同名用例带 #n 与 @L 行号）', () => {
+  const origLog = console.log
+  const snapshot = {
+    passed,
+    failed,
+    names: failedNames.slice(),
+    seen: new Map(caseNameSeen),
+    dups: new Set(duplicateCaseNames)
+  }
+  let got = []
+  try {
+    console.log = () => {}
+    ok('探针：重名用例', () => { throw new Error('first') })
+    ok('探针：重名用例', () => { throw new Error('second') })
+    got = failedNames.slice(snapshot.names.length)
+  } finally {
+    console.log = origLog
+    passed = snapshot.passed
+    failed = snapshot.failed
+    failedNames.length = 0
+    failedNames.push(...snapshot.names)
+    caseNameSeen.clear()
+    for (const [k, v] of snapshot.seen) caseNameSeen.set(k, v)
+    duplicateCaseNames.clear()
+    for (const n of snapshot.dups) duplicateCaseNames.add(n)
+  }
+  assert.strictEqual(got.length, 2, `两条探针都必须进失败清单（实际 ${JSON.stringify(got)}）`)
+  assert.notStrictEqual(got[0], got[1], '同名用例的失败行不得一模一样（旧实现只打名字）')
+  const l0 = got[0].match(/@L(\d+)$/)
+  const l1 = got[1].match(/@L(\d+)$/)
+  assert.ok(l0 && l1 && Number(l0[1]) > 0 && Number(l1[1]) > 0, `每条失败行必须带源码行号（实际 ${JSON.stringify(got)}）`)
+  assert.notStrictEqual(l0[1], l1[1], '两条用例的调用行必须不同')
+  assert.ok(got[1].includes('#2'), `第二条同名用例必须带 #2（实际 ${got[1]}）`)
+})
+
+// C5-070 自查：FIFO 夹具的 mkfifo 探测必须是「找不到就返回空串、不抛异常」——旧写法把
+// /usr/bin/mkfifo 写死，非该路径的平台直接在 execFileSync 里抛 ENOENT（用例红成契约失败）。
+ok('FIFO 夹具: mkfifo 探测只认固定落点（缺失不抛、不做 PATH 查找）', () => {
+  assert.strictEqual(findMkfifo(['/nonexistent/mkfifo-u05']), '', '全部候选都不存在时必须返回空串（不得抛 ENOENT）')
+  assert.strictEqual(findMkfifo([process.execPath]), process.execPath, '存在的候选必须原样返回')
+  assert.strictEqual(findMkfifo([]), '', '空候选表返回空串')
+  assert.ok(MKFIFO_CANDIDATES.every((p) => path.isAbsolute(p)),
+    '候选必须是绝对路径：PATH 查找会执行可写目录里的同名程序（Sonar S4036）')
+})
 
 // ── token 校验 ──
 ok(`isValidToken: ≥${TOKEN_MIN_LEN} 字符合法`, () => {
@@ -1440,7 +1713,7 @@ async function filterRuleApiTests () {
 
       // 陈旧锁（mtime 11s 前）：保存应接管并成功（不是 409）。
       fs.writeFileSync(paths.lock, '{}')
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       const takeover = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 4, filter: { pingbibiaoti: 'v5' } })
       assert.strictEqual(takeover.status, 200, '陈旧锁应被接管')
@@ -1501,7 +1774,7 @@ async function filterRuleApiTests () {
     try {
       // 活锁：pid 是当前测试进程（活），mtime 已过期——旧实现会按 mtime 抢走，导致原持有者失去互斥。
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, startedAt: Date.now() - 60000, token: 'live-holder' }), { mode: 0o600 })
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       const blocked = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } })
       assert.strictEqual(blocked.status, 409, '活锁必须 409 write_busy')
@@ -1626,16 +1899,22 @@ async function filterRuleApiTests () {
       const candidate = buildSaveCandidate(first.override, ['pingbitime'], draft, ['pingbilouzhu', 'zhanxianlouzhu', 'pingbitime'])
       assert.deepStrictEqual(candidate, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
         '候选必须是「覆盖文件已有字段 + 本次改动字段」，且不得把未改动的代码默认带出去')
-      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+      const saved = await postFilterJson(port, '/api/config/filter', {
         schema: 1, baseRevision: first.revision, filter: candidate
-      })).status, 200)
+      })
+      assert.strictEqual(saved.status, 200)
       const kept = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
       assert.deepStrictEqual(kept.filter, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
         'A 与改动后的 B 必须同时留在覆盖文件里（这正是本次修复的不变式）')
+      // 下一步的乐观锁基线取自**服务端响应**，不取落盘的覆盖文件：文件内容是这一段的断言对象，
+      // 让它回流进下一个请求体既是 js/file-access-to-http（CodeQL 102）的形状，也把「校验落盘」
+      // 与「驱动下一次写入」耦成一条链。落盘值仍被这句钉住，断言强度不变。
+      const savedRevision = JSON.parse(saved.text).revision
+      assert.strictEqual(kept.revision, savedRevision, '落盘 revision 必须等于响应 revision')
 
       // 第三步：旧行为反例——只提交 B，A 会被整份替换静默删掉（说明本用例确实覆盖此 bug）。
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
-        schema: 1, baseRevision: kept.revision, filter: { pingbitime: '7' }
+        schema: 1, baseRevision: savedRevision, filter: { pingbitime: '7' }
       })).status, 200)
       const dropped = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
       assert.deepStrictEqual(Object.keys(dropped.filter), ['pingbitime'], '服务端仍是整份替换：只提交 B 会丢掉 A')
@@ -1783,13 +2062,66 @@ async function filterRuleApiTests () {
     }
   })
 
+  // backlog b3 / C2-004：异常兜底 catch 此前对只读端点也回 write_failed（把「预检/试算失败」说成
+  // 「写盘失败」），且 `.catch(() => …)` 不接错误对象、不打日志 ⇒ TypeError 一类未预期异常只剩一个
+  // 500，排障无线索。这里钉两件事：错误码按端点语义区分（只读端点不得回 write_failed），且 catch
+  // 必须留一行带 e.message 的诊断日志（不含凭证）；真正的写端点仍回 write_failed。
+  await aok('过滤规则异常兜底: validate/preview 错误码分语义 + 留诊断日志（C2-004）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const caught = []
+    const realConsoleError = console.error
+    console.error = (...args) => { caught.push(args.map((a) => String(a)).join(' ')) }
+    // 注入「校验期就抛错」的引擎：validateCandidate 里的 hasNestedQuantifier 未包 try，异常会一路
+    // 冒到 handler 的 .catch——正是条目说的「未预期异常被压成 500」形态。
+    setFilterDepsForTests({
+      RuleEngine: {
+        hasNestedQuantifier: () => { throw new Error('boom-validate-engine') },
+        compileRules: () => ({})
+      },
+      compileUserRegex: () => null,
+      re2Available: true,
+      isRe2Available: () => true
+    })
+    try {
+      const payload = { schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'x' } }
+      const validateRes = await postFilterJson(port, '/api/config/filter/validate', payload)
+      assert.strictEqual(validateRes.status, 500)
+      const validateBody = JSON.parse(validateRes.text)
+      assert.strictEqual(validateBody.code, 'validate_failed', '只预检端点不得回 write_failed')
+      assert.strictEqual(validateBody.error, 'validate_failed')
+
+      const previewRes = await postFilterJson(port, '/api/config/filter/preview', payload)
+      assert.strictEqual(previewRes.status, 500)
+      const previewBody = JSON.parse(previewRes.text)
+      assert.strictEqual(previewBody.code, 'preview_failed', '只读试算端点不得回 write_failed')
+      assert.strictEqual(previewBody.error, 'preview_failed')
+
+      // 真正的写端点仍回 write_failed：改的是只读端点的语义，不是把写失败改名。
+      const saveRes = await postFilterJson(port, '/api/config/filter', payload)
+      assert.strictEqual(saveRes.status, 500)
+      assert.strictEqual(JSON.parse(saveRes.text).code, 'write_failed')
+
+      // 三个 catch 各留一行日志，且能定位到异常 message；日志不得夹带访问 token。
+      const joined = caught.join('\n')
+      assert.ok(joined.includes('boom-validate-engine'), `catch 必须记录 e.message：${joined.slice(0, 300)}`)
+      assert.ok(!joined.includes(TOKEN), '诊断日志不得包含访问 token')
+      assert.ok(caught.length >= 3, `三个失败请求各留一行日志（实际 ${caught.length}）`)
+    } finally {
+      setFilterDepsForTests(null)
+      console.error = realConsoleError
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   // ── 评审修复靶向用例（Sourcery 12 项）────────────────────────────────────
   await aok('过滤锁: 两个写者同判同一把旧锁过期 → 只有先到者完成接管（rename + inode 核验）', async () => {
     const dir = mkTmp('xbk-console-filter-lock-')
     const paths = filterPaths(dir)
     try {
       fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 1 }), { mode: 0o600 })
-      const old = new Date(Date.now() - 11000)
+      const old = new Date(Date.now() - FILTER_LOCK_STALE_SAMPLE_MS)
       fs.utimesSync(paths.lock, old, old)
       // 竞态起点：两个写者在「判过期」这一刻拿到同一份快照。
       const judgedA = filterLockIdentity(paths.lock)
@@ -2943,6 +3275,144 @@ async function watchMonitorTests () {
 }
 
 async function main () {
+  // ── C5-020：源码锁的纪律（缺锚点响亮失败 / 注释不得满足判据）──
+  ok('C5-020 源码切片缺锚点或空切片必须响亮失败（旧写法 slice(-1) 静默假绿）', () => {
+    const src = 'function A () { return 1 }\nfunction B () { return 2 }\n'
+    assert.strictEqual(sliceBetween(src, 'function A', 'function B', '探针').trim(), 'function A () { return 1 }')
+    assert.strictEqual(sliceTo(src, 'function B', '探针').trim(), 'function A () { return 1 }')
+    assert.throws(() => sliceBetween(src, 'function Missing', 'function B', '探针'), /起始锚点缺失/, '缺起始锚点必须响')
+    assert.throws(() => sliceBetween(src, 'function A', 'function Missing', '探针'), /结束锚点缺失/, '缺结束锚点必须响')
+    assert.throws(() => sliceBetween(src, 'function B', 'function A', '探针'), /结束锚点缺失或在起点之前/, '锚点顺序反了必须响')
+    assert.throws(() => sliceTo(src, 'function Missing', '探针'), /结束锚点缺失/, 'sliceTo 缺锚点必须响')
+    // 旧写法复现：锚点消失 ⇒ indexOf = -1 ⇒ slice(-1, N) 只剩最后一个字符，后面的
+    // includes 断言既可能假红（切片错位）也可能假绿（根本没覆盖目标段）。
+    const legacy = src.slice(src.indexOf('function Missing'), src.indexOf('function B'))
+    assert.ok(legacy.length <= 1, `旧写法缺锚点时只切出 ${legacy.length} 个字符（静默）`)
+  })
+
+  ok('C5-020 注释不得满足文本判据（codeOf 先按行剥注释）', () => {
+    const src = '// locking && html`<span class="trigger-busy"/\nconst real = 1\n'
+    assert.ok(src.includes('trigger-busy'), '裸 includes 会被注释里的原句满足——这正是旧判据的漏洞')
+    assert.strictEqual(codeOf(src).includes('trigger-busy'), false, 'codeOf 必须把注释行剥掉')
+    // 行内注释同样不算；字符串里的 // 不得被当成注释起点（'https://x' 要完整保留）。
+    // 夹具用 https 而不是 http：这条只测「字符串里的 // 不被截断」，一个字节都没发出去
+    // （无真实网络、无凭证），但也没必要在源码里留明文协议字面量给 S5332 这类规则报。
+    assert.strictEqual(codeOf('const a = 1 // busy-badge\n').trim(), 'const a = 1')
+    assert.ok(codeOf("const u = 'https://x/y'\n").includes('https://x/y'), '字符串里的 // 不得被截断')
+  })
+
+  // C5-028：用例级 server 由 harness 收尾——用例提前失败（最后一行 close 没跑到）也不会
+  // 留监听句柄，且这种「harness 登记过的 server」不算泄漏（不进 ♻️ / leakedScopes）。
+  await aok('C5-028 closeCaseServers 静默收掉用例级 server，且不计泄漏', async () => {
+    const probe = http.createServer((_req, res) => res.end('probe'))
+    await listen(probe)
+    assert.strictEqual(probe.listening, true, '探针 server 必须先在监听')
+    const before = leakedScopes.length
+    assert.strictEqual(closeCaseServers(), 1, '必须报告关掉 1 个用例级 server')
+    assert.strictEqual(probe.listening, false, '必须真的摘掉监听句柄')
+    assert.strictEqual(liveServers.size, 0, '登记表必须清空（否则下一条用例会重复收割）')
+    assert.strictEqual(leakedScopes.length, before, 'harness 自己登记的 server 不得记成泄漏（否则每轮 exit 1）')
+    // 幂等：没有 server 时返回 0，不抛。
+    assert.strictEqual(closeCaseServers(), 0, '没有 server 时必须返回 0')
+  })
+
+  // ── C5-029：收尾机制自身的用例 ──
+  // 收割（reapTestScope）与泄漏兜底闸此前零用例：把收割改成 no-op、把闸的判定改成恒不成立，
+  // 没有任何一条用例会红——表现是 Stryker 等满 timeoutMS（延迟 18h 才可见）。这两条自己故意
+  // 漏一个 server / 一个 ref interval，直接钉住「真的关掉 + 真的记账 + 闸真的给出非空报告」。
+  // 计数可判定的前提是此刻进程里还没有别的 server/interval，所以放在套件最前面。
+  // 探针自己那一笔记账在 finally 里摘掉，不留给套件末的兜底闸（否则每次都 exit 1）。
+  await aok('C5-029 reapTestScope 必须关掉用例漏关的 server（句柄真的释放，不只记账）', async () => {
+    const probe = http.createServer((_req, res) => res.end('probe'))
+    const port = await listen(probe) // 与用例同一个入口：登记进 liveServers
+    const before = leakedScopes.length
+    try {
+      assert.strictEqual(probe.listening, true, '探针 server 必须先在监听')
+      const reaped = reapTestScope('C5-029 探针 server')
+      assert.strictEqual(reaped.closed, 1, '收割必须报告关掉 1 个 server')
+      assert.strictEqual(reaped.cleared, 0, '本探针没有 interval，不该记 interval')
+      assert.strictEqual(probe.listening, false, '收割必须真的摘掉监听句柄（不是只写一行 ♻️）')
+      assert.strictEqual(leakedScopes.length, before + 1, '真收割必须记进 leakedScopes（兜底闸的输入）')
+      assert.ok(leakedResourceReport({ closed: 0, cleared: 0 }), '有泄漏记录时兜底闸必须给出非空报告')
+      // 端口必须真的空出来：只把 server 从集合里删掉、不碰句柄的实现过不了这一步。
+      const again = http.createServer((_req, res) => res.end('again'))
+      await new Promise((resolve, reject) => {
+        again.once('error', reject)
+        again.listen(port, '127.0.0.1', resolve)
+      })
+      await new Promise((resolve) => again.close(resolve))
+    } finally {
+      leakedScopes.splice(before)
+    }
+  })
+
+  await aok('C5-029 reapTestScope 必须 clear ref interval，unref 的只清不记（不误红）', async () => {
+    // clear 的判据必须行为化：Node 22 实测 clearInterval 之后 hasRef() 仍返回 true，
+    // 拿它当「已 clear」的证据等于什么都没证明。改成「clear 之后回调不得再跑」。
+    const before = leakedScopes.length
+    let refFired = 0
+    let unrefFired = 0
+    setInterval(() => { refFired++ }, 20) // 全局包装登记进 liveIntervals
+    const unrefTimer = setInterval(() => { unrefFired++ }, 20)
+    unrefTimer.unref()
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 60)) // 先证明两个定时器本来是活的
+      assert.ok(refFired > 0, `ref interval 必须先真的跑起来（实际 ${refFired} 次）`)
+      assert.ok(unrefFired > 0, `unref interval 也必须先真的跑起来（实际 ${unrefFired} 次）`)
+      const reaped = reapTestScope('C5-029 探针 interval')
+      assert.strictEqual(reaped.cleared, 1, '只有 ref interval 记泄漏（unref 不钉事件循环）')
+      assert.strictEqual(reaped.closed, 0, '本探针没有 server')
+      assert.strictEqual(liveIntervals.size, 0, '两个 interval 都必须从登记表摘掉')
+      assert.strictEqual(leakedScopes.length, before + 1, '只有 ref interval 记一笔')
+      const frozen = { refFired, unrefFired }
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      assert.strictEqual(refFired, frozen.refFired, 'reap 之后 ref interval 不得再跑（必须真的 clearInterval）')
+      assert.strictEqual(unrefFired, frozen.unrefFired, 'reap 之后 unref interval 同样不得再跑')
+    } finally {
+      leakedScopes.splice(before)
+    }
+    // 无泄漏时闸必须沉默——否则套件每轮都以 1 退出，等于把闸变成噪声。
+    // （探针自己的记账已在 finally 摘掉，这里是「真实基线」的形态。）
+    assert.strictEqual(leakedResourceReport({ closed: 0, cleared: 0 }), null, '无泄漏时兜底闸不得误报')
+    // 报告必须带上计数（改坏判据、只打印一句空话都过不了）。
+    assert.ok(/server 1 个/.test(leakedResourceReport({ closed: 1, cleared: 0 })), '报告必须点出被收割的 server 数')
+  })
+
+  // ── C5-030：main() reject 的收尾 ──
+  // 旧实现 .catch 只打 e.message 并置 exitCode=1：没有分项汇总（通过/失败 + 失败用例名），
+  // 也没装强退闸。这条用例直接跑真实收尾接线（runSuite + rejected promise），取证三件事都做到。
+  await aok('C5-030 main() reject 也必须走「分项汇总 + 强退闸」，不是只打 e.message', async () => {
+    const lines = []
+    const origLog = console.log
+    const origErr = console.error
+    const snapshot = { passed, failed, names: failedNames.slice(), leaked: leakedScopes.slice(), exitCode: process.exitCode }
+    let guard = null
+    try {
+      console.log = (...args) => lines.push(args.join(' '))
+      console.error = (...args) => lines.push(args.join(' '))
+      guard = await runSuite(Promise.reject(new Error('probe main 崩了')))
+    } finally {
+      console.log = origLog
+      console.error = origErr
+      // 强退闸是给真实收尾用的：探针必须撤掉，否则 3s 后它会把整个套件杀掉。
+      if (guard) realClearTimeout(guard)
+      passed = snapshot.passed
+      failed = snapshot.failed
+      failedNames.length = 0
+      failedNames.push(...snapshot.names)
+      leakedScopes.length = 0
+      leakedScopes.push(...snapshot.leaked)
+      process.exitCode = snapshot.exitCode
+    }
+    const out = lines.join('\n')
+    const summary = /控制台套件：通过 (\d+) \/ 失败 (\d+)/.exec(out)
+    assert.ok(summary, `异常路径也必须打分项汇总（实际：${JSON.stringify(out)}）`)
+    assert.ok(Number(summary[2]) >= 1, `异常必须计入失败数（实际汇总：${summary[0]}）`)
+    assert.ok(out.includes('失败用例：'), '异常路径必须列失败用例名（CI 只看得到日志尾部）')
+    assert.ok(out.includes('probe main 崩了'), '异常本身必须被打印（不得吞掉）')
+    assert.ok(guard && typeof guard.hasRef === 'function', '异常路径必须装上强退闸：否则 ref 句柄会把 CI 拖到 timeoutMS')
+  })
+
   await lineSearchTests()
   await watchMonitorTests()
   await filterRuleApiTests()
@@ -2955,7 +3425,6 @@ async function main () {
     assert.strictEqual(noAuth.status, 401)
     const badAuth = await request(port, 'GET', '/', { token: 'y'.repeat(32) })
     assert.strictEqual(badAuth.status, 401)
-    server.close()
   })
   await aok('HTTP: 看板页为 SPA 壳（JSON 岛 + 资产引用 + noscript 降级）', async () => {
     const dir = tmpDir()
@@ -2980,7 +3449,6 @@ async function main () {
     // Sourcery #37：缺文件夹具必须断言「缺失」分支文案，不许「正常」蒙混——
     // 两种文案都接受的断言抓不住缺失降级走错分支的回归。
     assert.ok(res.text.includes('缺失'), `空缓存目录必须渲染「缺失」分支，实际片段：${res.text.slice(0, 400)}`)
-    server.close()
   })
   await aok('HTTP: /assets/* 须鉴权（无凭证 401；token/Cookie 200）；未知资产/穿越仍 404', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -3112,7 +3580,6 @@ async function main () {
     assert.strictEqual(nope.status, 404, '白名单外 404')
     const traversal = await request(port, 'GET', '/assets/..%2F..%2Fconsole.js', { token: TOKEN })
     assert.strictEqual(traversal.status, 404, '路径穿越形态 404（白名单精确匹配，不解码拼接）')
-    server.close()
   })
   await aok('资产: 每个模块 import 的文件都在白名单里（漏登记 = 整页白屏且测试全绿）', () => {
     const acorn = require('acorn')
@@ -3295,7 +3762,6 @@ async function main () {
     assert.strictEqual(api.status, 200, '查询参数对 JSON API 同样放行')
     const noTok = await request(port, 'GET', '/')
     assert.strictEqual(noTok.status, 401)
-    server.close()
   })
   await aok('HTTP: /api/status 返回 JSON（status 字段齐全）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -3306,7 +3772,6 @@ async function main () {
     for (const key of ['generatedAt', 'report', 'channels', 'run', 'diagnostics']) {
       assert.ok(Object.prototype.hasOwnProperty.call(data, key), `缺 ${key}`)
     }
-    server.close()
   })
   await aok('HTTP: 只读快照端点 ETag/304（命中回空体、不匹配照常 200、不退化成可缓存）', async () => {
     const { server, runs } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -3331,7 +3796,6 @@ async function main () {
     // /api/status 每次请求都生成新时间戳/锁龄：不得发 ETag（发了也永远不命中）。
     const volatile = await request(port, 'GET', '/api/status', { token: TOKEN })
     assert.strictEqual(volatile.headers.etag, undefined, '/api/status 不得下发 ETag（响应本身是易变的）')
-    server.close()
   })
   await aok('HTTP: SSE 响应头不带 Content-Encoding（流式增量不压缩）', async () => {
     const dir = tmpDir()
@@ -3729,7 +4193,6 @@ async function main () {
     const port = await listen(server)
     const res = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=hack' })
     assert.strictEqual(res.status, 400)
-    server.close()
   })
   await aok('HTTP: POST /trigger 合法动作 → 202 且锁文件生成；运行中再触发 → 409；结束后锁释放', async () => {
     const dir = tmpDir()
@@ -3744,7 +4207,7 @@ async function main () {
     assert.strictEqual(second.status, 409, '持有期内第二个触发必须 409')
     // 模拟子进程结束：找到 run 里的 fake 记录——真实子进程已 spawn（node qinglong/xbk_push.js --check 在本机可跑），
     // 等 close 事件释放锁（--check 只做环境检查，秒级完成）。
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     while (Date.now() < deadline) {
       const rec = runs.get(firstBody.id)
       if (rec && rec.finishedAt) break
@@ -3792,7 +4255,6 @@ async function main () {
     assert.strictEqual(replayAfterRestart.status, 409, '重启后重放窗仍拦截（lastAccept 落盘回读）')
     assert.strictEqual(JSON.parse(replayAfterRestart.text).runId, firstBody.id, '重启后仍指向首轮 run')
     server2.close()
-    server.close()
   })
   // ── 批次④ 4.1：通知自检端点 ──────────────────────────────────────────────
   await aok('HTTP: notify-test 动作映射与导出面（K1）', async () => {
@@ -3824,7 +4286,6 @@ async function main () {
     const rejected = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=run-auto' })
     assert.strictEqual(rejected.status, 400, 'HTTP 直接触发 run-auto 必须 400')
     assert.strictEqual(JSON.parse(rejected.text).error, '未知 action', '按未知动作拒绝，不能落进真实推送')
-    server.close()
   })
   await aok('HTTP: /api/auto 服务器端自动运行开关与持久化（K1d）', async () => {
     const dir = tmpDir()
@@ -3918,7 +4379,76 @@ async function main () {
     assert.strictEqual(badAuth.status, 401, '错 token 401')
     const csrf = await request(port, 'POST', '/api/notify-test', { headers: { cookie: `xbk_session=${TOKEN}` }, body: '' })
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 401（CSRF 面）')
-    server.close()
+  })
+  // backlog b3 / C2-002：四个改状态端点（备份导入 / 手动触发 / 通知自检 / 停止任务）此前只靠全局
+  // authorize()，而它对任意方法都放行 `?token=`（URL 查询串凭证），与过滤写端点的「写面仅 Bearer」
+  // 不一致。这里把「URL 凭证不得用于写」钉在行为上：400 query_token_not_allowed，且拒绝必须发生在
+  // readBody / 取锁 / spawn 之前（无任何副作用）；同一端点用 Bearer 仍照常进业务层。
+  await aok('HTTP: 改状态端点拒绝 URL query token（C2-002）', async () => {
+    const dir = tmpDir()
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    // runs 是模块级 Map（跨实例共享），只能比增量——断言「本次没有新记录」。
+    const runsBefore = runs.size
+    const lastAcceptFile = path.join(dir, 'console-lastaccept.json')
+    const viaQueryUrl = '?token=' + encodeURIComponent(TOKEN)
+    // 四条端点各配一个「鉴权之后必然确定的」分支：导入=坏 JSON、触发=非法动作、取消=不存在的 id、
+    // 自检=重放窗（预置 30s 帧），都不 spawn 真实子进程、不落盘。
+    const endpoints = [
+      ['/api/backup/import', '{}'],
+      ['/trigger', 'action=check'],
+      ['/api/notify-test', ''],
+      ['/api/runs/cancel', 'id=1700000000000.1']
+    ]
+    try {
+      for (const [endpoint, body] of endpoints) {
+        const viaQuery = await request(port, 'POST', endpoint + viaQueryUrl, { body })
+        assert.strictEqual(viaQuery.status, 400, `${endpoint} 带 ?token= 必须 400`)
+        assert.strictEqual(JSON.parse(viaQuery.text).code, 'query_token_not_allowed', `${endpoint} 错误码`)
+        // 即使同时带合法 Bearer 也拒绝：URL 里的凭证不得被当成可用写法（与过滤写端点同口径）。
+        const both = await request(port, 'POST', endpoint + viaQueryUrl, { token: TOKEN, body })
+        assert.strictEqual(both.status, 400, `${endpoint} ?token= + Bearer 仍必须 400`)
+        assert.strictEqual(JSON.parse(both.text).code, 'query_token_not_allowed')
+        // 仅 Cookie：写面不收 Cookie（CSRF 面），错误码要具体到 cookie_not_allowed。
+        const cookieOnly = await request(port, 'POST', endpoint, {
+          body,
+          headers: { cookie: `xbk_session=${TOKEN}` }
+        })
+        assert.strictEqual(cookieOnly.status, 401, `${endpoint} 仅 Cookie 必须 401`)
+        assert.strictEqual(JSON.parse(cookieOnly.text).code, 'cookie_not_allowed')
+      }
+      // 拒绝发生在副作用之前：没有运行记录（不 spawn）、没有触发锁、没有重放帧。
+      assert.strictEqual(runs.size, runsBefore, '被拒请求不得创建运行记录')
+      // 用一次 readdir 快照断言「一个文件都没留下」，代替 `existsSync(lockFile)` /
+      // `existsSync(lastAcceptFile)`：本用例随后就要按同一路径写重放帧（下面那行 writeFileSync），
+      // 「先判存在、再按同一路径写」正是 js/file-system-race（CodeQL 121）的 check-then-use 形状，
+      // 而报告方判的其实是「检查看到的」与「实际写到的」可能不是同一个对象。快照同时更强：
+      // 触发锁、重放帧之外任何意料外的落盘都算失败。
+      assert.deepStrictEqual(fs.readdirSync(dir), [], '被拒请求不得在 stateDir 留下任何文件（触发锁 / 重放帧 / 运行记录）')
+      // 反向：Bearer 照常通过鉴权（各自走到鉴权之后的确定性分支，不 spawn）。
+      const importBadJson = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: '{not-json'
+      })
+      assert.strictEqual(importBadJson.status, 400, 'Bearer 应已过鉴权（导入坏 JSON 400）')
+      assert.strictEqual(JSON.parse(importBadJson.text).code, 'invalid_json')
+      const triggerBadAction = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=hack' })
+      assert.strictEqual(triggerBadAction.status, 400, 'Bearer 应已过鉴权（非法动作 400）')
+      assert.strictEqual(JSON.parse(triggerBadAction.text).error, '未知 action')
+      const cancelMissing = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1700000000000.1' })
+      assert.strictEqual(cancelMissing.status, 404, 'Bearer 应已过鉴权（不存在的 id 404）')
+      fs.writeFileSync(lastAcceptFile, JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1700000000000.7' } }))
+      const notifyReplay = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
+      assert.strictEqual(notifyReplay.status, 409, 'Bearer 应已过鉴权（60s 窗内重放 409）')
+      assert.strictEqual(JSON.parse(notifyReplay.text).replayBlocked, true)
+      // 只读端点不能跟着被砍：GET 仍接受 ?token=（浏览器开页/EventSource 用法）。
+      const readViaQuery = await request(port, 'GET', '/api/runs' + viaQueryUrl)
+      assert.strictEqual(readViaQuery.status, 200, '只读端点仍接受 ?token=')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
   await aok('HTTP: notify-test 60s 独立重放窗行为区分（K3）', async () => {
     // 两个独立实例（独立 stateDir）：lastAccept 是「内存 Map + 实时读盘合并（at 更大者胜）」，
@@ -3928,7 +4458,7 @@ async function main () {
       const dir = tmpDir()
       const { server } = createConsole({ token: TOKEN, stateDir: dir })
       const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.7' } }))
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.7' } }))
       const blocked = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(blocked.status, 409, '60s 窗内重放必须 409')
       const blockedBody = JSON.parse(blocked.text)
@@ -3946,7 +4476,7 @@ async function main () {
       const dir = tmpDir()
       const { server } = createConsole({ token: TOKEN, stateDir: dir })
       const port = await listen(server)
-      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - 61000, runId: '1750000000000.7' } }))
+      fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'notify-test': { at: Date.now() - (REPLAY_WINDOW_MS + 1000), runId: '1750000000000.7' } }))
       assert.strictEqual(acquireLock(dir, Date.now(), 'other-token'), true, '预占锁成功')
       const lockConflict = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(lockConflict.status, 409, '越窗后撞锁仍 409')
@@ -4203,22 +4733,23 @@ async function main () {
     // 之前）。用子进程 + 看门狗：真挂死也只杀子进程，不会把整套件拖成 10 分钟超时。
     const fifoDir = tmpDir()
     const fifoSettings = path.join(fifoDir, CONSOLE_SETTINGS_FILE)
-    fs.rmSync(fifoSettings, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoSettings])
-    const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
-      'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
-      'console.log("SETTINGS_READ_NONBLOCKING")\n' +
-      'process.exit(0)\n'
-    const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
-    let probeOut = ''
-    probe.stdout.on('data', (c) => { probeOut += c })
-    probe.stderr.resume()
-    const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
-    const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
-    await probeDone
-    clearTimeout(probeTimer)
-    assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
-      'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    if (makeFifo(fifoSettings, '设置文件 FIFO（非阻塞启动）')) {
+      const probeSrc = 'const { createConsole } = require(' + JSON.stringify(require.resolve('./scripts/console')) + ')\n' +
+        'createConsole({ token: "x".repeat(20), stateDir: process.argv[1], log: () => {} })\n' +
+        'console.log("SETTINGS_READ_NONBLOCKING")\n' +
+        'process.exit(0)\n'
+      const probe = spawn(process.execPath, ['-e', probeSrc, fifoDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let probeOut = ''
+      probe.stdout.on('data', (c) => { probeOut += c })
+      probe.stderr.resume()
+      const probeDone = new Promise((resolve) => { probe.on('exit', resolve); probe.on('error', resolve) })
+      const probeTimer = setTimeout(() => { try { probe.kill('SIGKILL') } catch (e) {} }, 5000)
+      await probeDone
+      clearTimeout(probeTimer)
+      assert.ok(probeOut.includes('SETTINGS_READ_NONBLOCKING'),
+        'FIFO 设置文件必须按 unsafe 回默认（不得阻塞 createConsole 启动）')
+    }
+    // 清理放在 if 外：没有 mkfifo 时这份沙箱同样要删（否则只能等退出时的全局收割）。
     fs.rmSync(fifoDir, { recursive: true, force: true })
   })
 
@@ -4294,7 +4825,7 @@ async function main () {
 
   await aok('HTTP: 全局重放窗 60s（D2-S16：窗内 409 带剩余秒数，文案不谎称有任务在运行）', async () => {
     const dir = tmpDir()
-    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 30000, runId: '1750000000000.3' } }))
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.3' } }))
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
@@ -4305,24 +4836,22 @@ async function main () {
     assert.ok(!/已有触发任务在运行/.test(b.error), '文案不得谎称「已有任务在运行」（锁早就释放了）')
     assert.match(b.error, /重复提交/)
     assert.strictEqual(b.replayWindowS, 60, '普通动作的 409 也必须回带生效窗（60 秒）')
-    server.close()
   })
   await aok('HTTP: 全局重放窗越窗放行（61s 前受理 → 202；旧 12min 窗会拦）', async () => {
     const dir = tmpDir()
-    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - 61000, runId: '1750000000000.3' } }))
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), JSON.stringify({ 'dry-run': { at: Date.now() - (REPLAY_WINDOW_MS + 1000), runId: '1750000000000.3' } }))
     const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     const okRes = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=dry-run' })
     assert.strictEqual(okRes.status, 202, '越过 60s 窗必须放行（旧 12min 窗下这里会 409，人工重跑要等 12 分钟）')
     // 收尾：等子进程结束释放锁，避免影响后续用例
     const id = JSON.parse(okRes.text).id
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     while (Date.now() < deadline) {
       const rec = runs.get(id)
       if (rec && rec.finishedAt) break
       await new Promise(resolve => setTimeout(resolve, 100))
     }
-    server.close()
   })
   await aok('HTTP: /trigger 的 action=notify-test 与独立端点共享受理序列（K7 侧通道一致）', async () => {
     const dir = tmpDir()
@@ -4330,11 +4859,10 @@ async function main () {
     const port = await listen(server)
     const laPath = path.join(dir, 'console-lastaccept.json')
     // 独立端点 60s 窗内 → /trigger 侧同键同窗同样拦截（共享 lastAccept 键）
-    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - 30000, runId: '1750000000000.8' } }))
+    fs.writeFileSync(laPath, JSON.stringify({ 'notify-test': { at: Date.now() - REPLAY_WINDOW_MS / 2, runId: '1750000000000.8' } }))
     const viaTrigger = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=notify-test' })
     assert.strictEqual(viaTrigger.status, 409, '/trigger 侧通道同键同窗拦截（D6 有意行为）')
     assert.strictEqual(JSON.parse(viaTrigger.text).runId, '1750000000000.8', '回带同一首轮 runId')
-    server.close()
   })
   await aok('HTTP: /api/runs 列表与 /api/runs/:id 详情', async () => {
     const dir = tmpDir()
@@ -4346,7 +4874,7 @@ async function main () {
     assert.ok(Array.isArray(list.runs) && list.runs.some(r => r.id === id))
     // Sourcery #39：等子进程结束再断言 output 非空——--check 必然打印环境信息，
     // 只断言「是字符串」抓不住输出捕获链路整体失效的回归。
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     let detail = null
     while (Date.now() < deadline) {
       detail = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
@@ -4371,14 +4899,12 @@ async function main () {
     assert.strictEqual(postNoAuth.status, 401, 'POST detail 无凭证 401（鉴权与 GET 一致）')
     const missing = await request(port, 'GET', '/api/runs/99999', { token: TOKEN })
     assert.strictEqual(missing.status, 404)
-    server.close()
   })
   await aok('HTTP: 未知路径 → 404', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
     const res = await request(port, 'GET', '/nope', { token: TOKEN })
     assert.strictEqual(res.status, 404)
-    server.close()
   })
   // ── v3.297 扩展端点：/api/messages、/api/trends、/api/logs、/api/sys ──
   await aok('HTTP: /api/messages 三态 + 分页钳制 + 过滤（回归：URL 未验证输入不得越界）', async () => {
@@ -4444,7 +4970,6 @@ async function main () {
     // 无凭证 401
     const noAuth = await request(port, 'GET', '/api/messages')
     assert.strictEqual(noAuth.status, 401)
-    server.close()
   })
   await aok('HTTP: /api/messages missing/invalid 三态如实下发', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4472,7 +4997,6 @@ async function main () {
     // 仅 Cookie（POST 不走 Cookie 会话路径，authorize :637 显式排除）
     const cookieOnly = await request(port, 'POST', '/api/messages/export', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'format=json' })
     assert.strictEqual(cookieOnly.status, 401, 'POST 不得凭 Cookie 放行')
-    server.close()
   })
   await aok('T2 format 白名单: xml/缺省 → 400；GET 同路径 → 404 兜底', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4483,7 +5007,6 @@ async function main () {
     assert.strictEqual(noFmt.status, 400, '缺 format 必须 400')
     const get = await request(port, 'GET', '/api/messages/export', { token: TOKEN })
     assert.strictEqual(get.status, 404, '方法不匹配走 404 兜底')
-    server.close()
   })
   await aok('T3 CSV 转义三形态 + BOM + 响应头（全串比对，拒绝 naive split）', async () => {
     const dir = tmpDir()
@@ -4529,7 +5052,6 @@ async function main () {
     const attachLog = JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
     const attachHit = [...attachLog.items].reverse().find((it) => it.path === '/api/messages/export')
     assert.ok(attachHit && attachHit.method === 'POST' && attachHit.status === 200, 'CSV 附件出口（writeHead+end，非 sendJson）必须入访问日志')
-    server.close()
   })
   await aok('T4 5000 钳制 + X-Export-Truncated: 5010 条截断/30 条不出头/展示分页互不干扰', async () => {
     const dir = tmpDir()
@@ -4574,7 +5096,6 @@ async function main () {
     const page2 = JSON.parse((await request(port2, 'GET', '/api/messages?size=100', { token: TOKEN })).text)
     assert.strictEqual(page2.items.length, 30)
     s2.close()
-    server.close()
   })
   await aok('T5 JSON 字段白名单: 恰五键，内部字段零携带', async () => {
     const dir = tmpDir()
@@ -4592,7 +5113,6 @@ async function main () {
       assert.ok(!raw.includes(`"${k}"`), `不得携带内部字段 ${k}`)
     }
     assert.strictEqual(j[0].id, '9', 'id 为字符串形态')
-    server.close()
   })
   await aok('T7 导出: 240 字节边界落在代理对中间 → 不得留孤立代理项（X-Export-Query-Used 必须可编码）', async () => {
     // C2-017：clampQueryBytes 用 `query.slice(0,-1)` 按 UTF-16 码元退格。237 个 ASCII +
@@ -4657,7 +5177,6 @@ async function main () {
     const g = JSON.parse((await request(port, 'GET', `/api/messages?q=${encodeURIComponent('牛奶')}`, { token: TOKEN })).text)
     assert.strictEqual(g.items.length, 1)
     assert.strictEqual(String(g.items[0].id), j[0].id, '导出与列表过滤同源')
-    server.close()
   })
   await aok('T-P4 buildMessagesCsv: 表头固定字面量 + 行序 + 尾 \\r\\n（确定性输出）', () => {
     const csv = buildMessagesCsv([
@@ -4686,7 +5205,6 @@ async function main () {
       const g = JSON.parse((await request(port, 'GET', `/api/messages?${getListQs}`, { token: TOKEN })).text)
       assert.deepStrictEqual(j.map(m => m.id), g.items.map(m => String(m.id)), `筛选「${exportBody}」两侧 id 序列一致`)
     }
-    server.close()
   })
   await aok('T8 读取三态: missing/invalid/tooLarge → 200 + application/json + items 空（前端不下载判据）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4743,7 +5261,6 @@ async function main () {
     const big = 'q=' + 'x'.repeat(5000)
     const r = await request(port, 'POST', '/api/messages/export', { token: TOKEN, body: big })
     assert.strictEqual(r.status, 400)
-    server.close()
   })
   await aok('HTTP: /trigger 超限 body 分 3 chunk 发送仍收到 413（D2-S2：修前只见 ECONNRESET）', async () => {
     const dir = tmpDir()
@@ -4769,7 +5286,6 @@ async function main () {
     })
     assert.strictEqual(res.status, 413, '多 chunk 超限必须能读到 413（修前 req.destroy() 先断流）')
     assert.match(res.text, /请求体超限/)
-    server.close()
   })
   await aok('readMessages: (ino,size,mtime) 缓存命中 + 文件变化自动失效 + rawTotal 含 _f（D2-S18/D2-S11）', async () => {
     const dir = tmpDir()
@@ -4826,7 +5342,6 @@ async function main () {
     assert.strictEqual(dIn2.pushed, 20)
     // 窗口外的日期（今天-20）不进任何桶（14 天窗口）
     assert.ok(!t.byDay.some(d => d.date === D_OUT), `${D_OUT} 不得进 14 天窗口`)
-    server.close()
   })
   await aok('HTTP: /api/logs 尾读（>1MiB 截断保留尾部）+ missing；/api/sys 版本与缓存目录、无环境变量泄漏', async () => {
     const dir = tmpDir()
@@ -4863,7 +5378,6 @@ async function main () {
       const na = await request(port, 'GET', p)
       assert.strictEqual(na.status, 401, `${p} 无凭证必须 401`)
     }
-    server.close()
   })
   await aok('HTTP: 畸形 request-target → 400 且进程存活（回归：裸 new URL 曾崩整个控制台）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4872,7 +5386,6 @@ async function main () {
     assert.strictEqual(bad.status, 400, '畸形请求行必须 400，不得崩进程')
     const alive = await request(port, 'GET', '/api/status', { token: TOKEN })
     assert.strictEqual(alive.status, 200, '同一条畸形请求处理后服务必须继续可用')
-    server.close()
   })
   await aok('HTTP: GET / 下发 CSP 响应头（回归：frame-ancestors 仅 meta 承载是规范 no-op）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4883,7 +5396,6 @@ async function main () {
     assert.ok(csp, '必须存在 CSP 响应头')
     assert.ok(csp.includes("frame-ancestors 'none'"), '响应头 CSP 必须含 frame-ancestors')
     assert.ok(csp.includes("default-src 'none'"), '响应头 CSP 必须含 default-src')
-    server.close()
   })
   await aok('HTTP: SIGTERM 优雅关闭——锁帧 released + 子进程被杀 + 退出码 0（端到端）', async () => {
     const dir = mkTmp('xbk-console-e2e-')
@@ -4918,18 +5430,22 @@ async function main () {
       assert.strictEqual(trig.status, 202, '触发必须受理')
       assert.strictEqual(fs.existsSync(lockFile), true, '触发后锁文件必须存在')
       await new Promise(resolve => setTimeout(resolve, 150))
-      // Sourcery #225 M6：SIGTERM 前无法直接观测孙进程（--check 在控制台进程内 spawn），
-      // 用退出延迟区分「杀掉子进程走 close 收尾」（毫秒级）与「子进程没死、3s 看门狗
-      // 强退」（≥3s）——若关停逻辑不再杀子进程，此断言必红。
-      const killAt = Date.now()
+      // C5-018：这里原先还有一条 `shutdownMs < 2800`，用退出延迟当「没走 3s 关停看门狗」的
+      // 代理。两个问题：① 余量只有 200ms，小于 quality job 8 路并发的抖动，机器慢时无代码改动
+      // 也红；② 它测不到真契约——`--check` 子进程 0.2s 就退场了（实测），SIGTERM 时手上常常
+      // 根本没有在跑的子进程，杀不杀子进程都很快退出。墙钟判据在这里整体删掉，只留下面
+      // 「8s 内必须退出且退出码 0」（这条上界只是防挂死，不表达性能契约，失败文案也这么写）；
+      // 「关停必须真的杀在跑的子进程」改由事件序用例
+      // 「C5-018 关停必须真的杀掉在跑子进程」守——不读毫秒，读子进程的 exit signal。
       child.kill('SIGTERM')
       const code = await new Promise(resolve => {
+        // 8s 只是「不许挂死」的上界：关停自身有 3s 看门狗 + 1s 强退兜底，正常路径毫秒级。
         const to = setTimeout(() => resolve('timeout'), 8000)
         child.on('exit', (c) => { clearTimeout(to); resolve(c) })
       })
-      const shutdownMs = Date.now() - killAt
-      assert.ok(shutdownMs < 2800, `关停耗时 ${shutdownMs}ms ≥ 2800ms：疑似走了 3s 看门狗（子进程未被杀）\n${out.slice(-400)}`)
-      assert.strictEqual(code, 0, `SIGTERM 后必须 0 退出（实际 ${code}）\n${out.slice(-400)}`)
+      assert.strictEqual(code, 0, `SIGTERM 后必须 8s 内以 0 退出（实际 ${code}，timeout = 关停挂死）\n${out.slice(-400)}`)
+      // 结构性判据：关停横幅必须出现（走的是 SIGTERM 的 shutdown 序列，不是异常退出）。
+      assert.ok(out.includes('收到 SIGTERM，关闭控制台'), `必须走 SIGTERM 关停序列：${out.slice(-400)}`)
       const frame = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
       assert.strictEqual(frame.released, true, '退出后锁帧必须为 released（原地产出，不靠外部清理）')
     } catch (e) {
@@ -4939,6 +5455,35 @@ async function main () {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+  // C5-018：「关停必须杀掉在跑子进程」的判据不能是毫秒——e2e 里的 --check 子进程 0.2s
+  // 就退场了，SIGTERM 时手上常常没有活着的子进程，于是「杀 / 不杀」都很快退出（旧判据
+  // shutdownMs < 2800 实测对「摘掉 kill 循环」仍然全绿）。这里直接调关停序列，注入一个
+  // 长命子进程（activeChildren 是 createConsole 显式暴露给测试的注册表），只读事件：
+  // 子进程必须收到 SIGKILL、onExit 必须在它退出之后才被调用。
+  await aok('C5-018 关停必须真的杀掉在跑子进程（事件序判据，不读墙钟毫秒）', async () => {
+    const { server, activeChildren, wireGracefulShutdown } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    await listen(server)
+    const longChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    // 先等它真的起来：否则「exit signal」可能来自 spawn 失败，而不是关停的 SIGKILL。
+    await new Promise((resolve, reject) => {
+      longChild.once('spawn', resolve)
+      longChild.once('error', reject)
+    })
+    activeChildren.add(longChild)
+    const order = []
+    const exited = new Promise((resolve) => longChild.once('exit', (code, signal) => { order.push('child-exit'); resolve(signal) }))
+    // registerSignal 注入空函数：不要给测试进程装真的 SIGTERM handler。
+    const { shutdown } = wireGracefulShutdown({ onExit: (code) => order.push(`onExit:${code}`), registerSignal: () => {} })
+    shutdown('SIGTERM')
+    assert.strictEqual(await exited, 'SIGKILL', '关停必须对在跑子进程发 SIGKILL（不是等它自然结束）')
+    // 事件序是「不是 3s 看门狗强退」的结构判据：看门狗那条路会在子进程还活着时就退出进程
+    // （onExit 先于 child-exit 出现），而正常路径必须等子进程收齐才收尾（锁释放挂在 close 上）。
+    const deadline = Date.now() + 2000
+    while (order.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.deepStrictEqual(order, ['child-exit', 'onExit:0'],
+      `子进程死后才允许收尾，且只收尾一次（实际 ${JSON.stringify(order)}）`)
+  })
+
   await aok('HTTP: /trigger 落盘失败 → 500 且可立即重试（回归 Sourcery #225 M2：pending 条目必须回滚）', async () => {
     const dir = tmpDir()
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
@@ -4952,7 +5497,6 @@ async function main () {
     fs.rmdirSync(path.join(dir, 'console-lastaccept.json'))
     const retry = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
     assert.strictEqual(retry.status, 202, '失败动作在窗口内必须可立即重试（pending 条目已回滚），不得 409')
-    server.close()
   })
   await aok('HTTP: /trigger 锁写失败（ENOTDIR）→ 500 lock_failed，不得伪装成 409「已有任务在运行」', async () => {
     // C2-006：stateDir 被换成普通文件后锁路径 open 必然 ENOTDIR（非 EEXIST）。旧实现把它
@@ -5069,7 +5613,6 @@ async function main () {
     const done = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: 'id=1750000000000.7' })
     assert.strictEqual(done.status, 409, '已结束任务必须 409')
     assert.strictEqual(runs.get('1750000000000.7').cancelled, false, '409 路径不得置 cancelled')
-    server.close()
   })
   await aok('HTTP: cancel 运行中任务（真子进程）→ 202 + SIGTERM + close 释放锁 + cancelled 徽章', async () => {
     const dir = tmpDir()
@@ -5097,7 +5640,7 @@ async function main () {
     const again = await request(port, 'POST', '/api/runs/cancel', { token: TOKEN, body: `id=${cancelId}` })
     assert.ok(again.status === 200 || again.status === 409, `重复 cancel 幂等（实际 ${again.status}：任务可能已自然结束）`)
     // 子进程被信号终止后 close 释放锁（SIGTERM 对无 handler 子进程近即时）。
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     while (Date.now() < deadline && rec.finishedAt === 0) await new Promise((_resolve) => setTimeout(_resolve, 100))
     assert.ok(rec.finishedAt > 0, '被取消任务必须走到 close（锁释放唯一入口）')
     const lockAfter = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
@@ -5106,7 +5649,6 @@ async function main () {
     const list = JSON.parse((await request(port, 'GET', '/api/runs', { token: TOKEN })).text)
     const row = list.runs.find((r) => r.id === cancelId)
     assert.strictEqual(row.cancelled, true, '/api/runs 必须下发 cancelled')
-    server.close()
   })
   await aok('cancel 信号纪律：SIGTERM → 宽限后 SIGKILL 兜底；重复 cancel 不发第二次信号', async () => {
     const dir = tmpDir()
@@ -5132,7 +5674,6 @@ async function main () {
     // 常量按生产值 3000ms 走）。
     await new Promise((resolve) => setTimeout(resolve, 3400))
     assert.ok(events.includes('SIGKILL'), `宽限后必须 SIGKILL 兜底（events=${events}）`)
-    server.close()
   })
   // ── v3.300 批次③ 3.1 SSE 端到端 ──
   await aok('SSE T1 鉴权与方法：无/错凭证 401；仅 Cookie 放行（GET 收 Cookie）；POST → 404 兜底', async () => {
@@ -5151,7 +5692,6 @@ async function main () {
     sse.close()
     const post = await request(port, 'POST', '/api/runs/stream', { token: TOKEN })
     assert.strictEqual(post.status, 404, 'POST 不匹配 → 落 404 兜底')
-    server.close()
   })
   await aok('SSE T2 参数闸：缺 id/坏形态 400、不存在 404、since 非法值 200 且按 0 钳制', async () => {
     const dir = tmpDir()
@@ -5176,7 +5716,6 @@ async function main () {
       assert.strictEqual(JSON.parse(frames[0].data), 'hello', `since=${badSince} 首帧=整段（按 0 钳制）`)
       sse.close()
     }
-    server.close()
   })
   await aok('SSE T3 响应头：event-stream / x-accel-buffering: no / cache-control: no-cache', async () => {
     const dir = tmpDir()
@@ -5195,7 +5734,6 @@ async function main () {
     assert.strictEqual(head.headers['x-accel-buffering'], 'no')
     assert.strictEqual(head.headers['cache-control'], 'no-cache')
     head.destroy()
-    server.close()
   })
   await aok('SSE T4 增量推送与游标：since=0 全串 → 追加收增量 → 拼接不重不漏 → close 后 Set 归零', async () => {
     const dir = tmpDir()
@@ -5218,7 +5756,6 @@ async function main () {
     const deadline = Date.now() + 3000
     while (Date.now() < deadline && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
     assert.strictEqual(sseConnections.size, 0, 'close 后服务端连接必须清理归零')
-    server.close()
   })
   await aok('SSE T5 多字节 since 切片：since=3 → 恰一帧「文🐮」（逐码元，不重不漏）', async () => {
     const dir = tmpDir()
@@ -5233,7 +5770,6 @@ async function main () {
     assert.strictEqual(frames.length, 1, '恰一帧')
     assert.strictEqual(JSON.parse(frames[0].data), '文🐮')
     sse.close()
-    server.close()
   })
   await aok('SSE L1 Last-Event-ID 续传：header 优先于 since，只补缺口不重发', async () => {
     const dir = tmpDir()
@@ -5252,7 +5788,6 @@ async function main () {
     assert.strictEqual(frames[0].id, '6', '数据帧必须带绝对游标 id（浏览器据此回传 Last-Event-ID）')
     assert.strictEqual(sse.events.some((e) => e.event === 'reset'), false, '游标可用时不得整段重发')
     sse.close()
-    server.close()
   })
   await aok('SSE L2 非法 Last-Event-ID：回落整段并标 reset（客户端替换而非追加）', async () => {
     const dir = tmpDir()
@@ -5276,7 +5811,6 @@ async function main () {
     })
     assert.strictEqual(await sseSci.waitFor((e) => e.event === 'reset'), true, '1e3/0x10 一类非十进制游标必须 reset 而非静默钳位')
     sseSci.close()
-    server.close()
   })
   await aok('SSE M3 超前 since 钳制：since=99999 → 钳到尾部，追加照常收增量（不吞输出）', async () => {
     const dir = tmpDir()
@@ -5292,7 +5826,6 @@ async function main () {
     streamAppend(rec, '增量') // 建流后追加：修复前（保留超前游标）永远无帧
     assert.strictEqual(await sse.waitFor((e) => e.event === 'message' && JSON.parse(e.data) === '增量'), true, '追加后增量帧必须到达（超前游标已钳尾部）')
     sse.close()
-    server.close()
   })
   await aok('SSE M2 背压下 done 不丢：暂停客户端 → 关停广播排队 done → teardown flush（非 abort 路径）', async () => {
     const dir = tmpDir()
@@ -5326,7 +5859,6 @@ async function main () {
     clearInterval(kick)
     assert.strictEqual(raw.includes('event: done'), true, '背压排队的 done 帧经 teardown flush 照常送达')
     sock.destroy()
-    server.close()
   })
   await aok('脱敏 D1 深层编码：三层 %2574oken 与 畸形转义+编码键 同串 → 全 ***（不动点 + 尽力解码）', () => {
     // 三层编码（%2574oken= → %74oken= → token=）：判定用解码副本，落盘保留原串
@@ -5371,7 +5903,6 @@ async function main () {
     assert.strictEqual(sseB.events.some((e) => e.event === 'reset'), false, '不得误发 reset')
     assert.strictEqual(JSON.parse(sseB.events.find((e) => e.event === 'message').data), 'y'.repeat(950), '增量恰为 slice(150−100)=950 码元')
     sseB.close()
-    server.close()
   })
   await aok('SSE T7 完结 done + 关流：finishedAt 已设且游标对齐 → done 帧 + res.end', async () => {
     const dir = tmpDir()
@@ -5391,7 +5922,6 @@ async function main () {
     while (Date.now() < deadline2 && sseConnections.size > 0) await new Promise((_resolve) => setTimeout(_resolve, 25))
     assert.strictEqual(sseConnections.size, 0, '关流后连接不在 Set')
     sse.close()
-    server.close()
   })
   await aok('SSE T8 淘汰 done：runs.delete 后写循环复查感知 → done + end（20 条淘汰路径零 diff 验证）', async () => {
     const dir = tmpDir()
@@ -5408,7 +5938,6 @@ async function main () {
     while (Date.now() < deadline && !sse.isEnded()) await new Promise((_resolve) => setTimeout(_resolve, 25))
     assert.strictEqual(sse.isEnded(), true, 'done 后关流')
     sse.close()
-    server.close()
   })
   await aok('SSE T9 连接上限：第 9 条 503；关 1 条可再开；全关 Set 归零', async () => {
     const dir = tmpDir()
@@ -5441,7 +5970,6 @@ async function main () {
     assert.ok(String(reopen.headers['content-type']).startsWith('text/event-stream'))
     reopen.destroy()
     for (const sse of conns) sse.close()
-    server.close()
   })
   await aok('SSE T10 慢客户端积压硬断：暂停读 + 大快照 + 定隔追加 → 待发超限硬断（无 done 帧）', async () => {
     const dir = tmpDir()
@@ -5501,7 +6029,7 @@ async function main () {
       }
       return sseConnections.size === 0
     }
-    torn = await untilTornDown(20000)
+    torn = await untilTornDown(SSE_TEARDOWN_WAIT_MS)
     if (appendTimer) clearInterval(appendTimer)
     assert.strictEqual(torn, true, '超限硬断 → 服务端连接已 teardown 摘除')
     sock.on('data', (c) => { raw += c })
@@ -5517,12 +6045,11 @@ async function main () {
       }
       return ended
     }
-    assert.strictEqual(await untilEnded(10000), true, '恢复读后客户端收到连接终结（排队字节流尽 → close）')
+    assert.strictEqual(await untilEnded(SSE_END_WAIT_MS), true, '恢复读后客户端收到连接终结（排队字节流尽 → close）')
     clearInterval(kick)
     assert.strictEqual(sseConnections.size, 0, '硬断后服务端连接保持摘除')
     assert.strictEqual(raw.includes('event: done'), false, '超限硬断不发 done 帧（区别于淘汰/完结收尾路径）')
     assert.ok(raw.length > 0, '硬断前已排队的数据帧照常流入客户端')
-    server.close()
   })
   await aok('SSE T11 shuttingDown 广播：置位 → 活跃连接收 done + end；新连接 503', async () => {
     const dir = tmpDir()
@@ -5556,7 +6083,6 @@ async function main () {
     const again = await request(port, 'GET', '/api/runs/stream?id=1750000000000.9', { token: TOKEN })
     assert.strictEqual(again.status, 503, '关停窗口新连接 503')
     sse.close()
-    server.close()
   })
   await aok('SSE T12 outputTotalLength 端到端：真子进程 check 轮详情输出数值计数器且常态等于 output.length', async () => {
     const dir = tmpDir()
@@ -5572,7 +6098,7 @@ async function main () {
       assert.strictEqual(trig.status, 202)
     }
     const { id } = JSON.parse(trig.text)
-    const deadline = Date.now() + 30000
+    const deadline = Date.now() + RUN_DEADLINE_MS
     let detail = null
     while (Date.now() < deadline) {
       const r = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: `id=${id}` })
@@ -5586,7 +6112,6 @@ async function main () {
     assert.strictEqual(detail.outputTotalLength, detail.output.length, 'check 输出 < 512KiB 无淘汰 → 恒等')
     const get = JSON.parse((await request(port, 'GET', `/api/runs/${id}`, { token: TOKEN })).text)
     assert.strictEqual(get.outputTotalLength, detail.outputTotalLength, 'GET 详情响应体等价')
-    server.close()
   })
   // ── v3.374 全站 SSE 通知（/api/stream）：变化才推、连接上限、收尾不挂 ──
   // 只读响应头就返回的建连器：这条流永不 end（靠心跳与 tick），request() 会一直等下去。
@@ -5626,7 +6151,6 @@ async function main () {
     assert.strictEqual(h['cache-control'], 'no-store', '带鉴权的流不得允许缓存存储（no-store 而非 no-cache）')
     assert.strictEqual(h['x-accel-buffering'], 'no', '必须禁反向代理缓冲，否则 tick 要等代理攒满')
     sse.close()
-    server.close()
   })
   await aok('全站 SSE S2 变化才推：写 run.log ≤3s 收到 tick（具名事件 + 毫秒时间戳）', async () => {
     const dir = tmpDir()
@@ -5641,7 +6165,6 @@ async function main () {
     assert.strictEqual(typeof payload.at, 'number', 'tick 载荷必须带毫秒时间戳')
     assert.ok(Math.abs(Date.now() - payload.at) < 60000, '时间戳必须是当前时刻（不是恒定的假值）')
     sse.close()
-    server.close()
   })
   await aok('全站 SSE S3 无变化不刷帧；三类指纹各自触发 tick（注入 60ms 采样）', async () => {
     const dir = tmpDir()
@@ -5667,7 +6190,6 @@ async function main () {
       assert.strictEqual(await sse.waitFor(() => tickCount() > before, 2000), true, `${label} 变化必须推 tick`)
     }
     sse.close()
-    server.close()
   })
   await aok('全站 SSE S4 共享采样 + 连接上限：一条写两个连接各收一帧；第 21 条 503；全关后采样器停', async () => {
     const dir = tmpDir()
@@ -5708,7 +6230,6 @@ async function main () {
     b.close()
     assert.strictEqual(await until(() => streamClients.size === 0), true, '全部断开后 Set 归零')
     assert.strictEqual(await until(() => streamSamplerActive() === false), true, '最后一个连接走掉必须停采样定时器')
-    server.close()
   })
   await aok('全站 SSE S5 收尾：server.close() 主动断开在途流（客户端收到 end，不留悬挂句柄）', async () => {
     const dir = tmpDir()
@@ -5864,7 +6385,6 @@ async function main () {
     assert.strictEqual(r4.items.length, 3, '超限钳制到 200 但全部轮次 <200 时原样返回')
     const r5 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=abc&before=-3', { token: TOKEN })).text)
     assert.strictEqual(r5.items.length, 3, '非法参数回默认不报错')
-    server.close()
   })
   await aok('readRunHistory: 尾窗指纹不匹配返回 stale（超窗翻页不跳轮）', () => {
     const { readRunHistory } = require('./scripts/status')
@@ -6116,7 +6636,6 @@ async function main () {
     const r2 = JSON.parse((await request(port, 'GET', '/api/run-history?limit=50&before=' + (d.items[49].lineNo - 1), { token: TOKEN })).text)
     assert.strictEqual(r2.items.length, 50, '游标续页 50 条')
     assert.ok(r2.items[0].lineNo < d.items[49].lineNo, '续页条目必须比上页最旧更早（无重复无跳过）')
-    server.close()
   })
   await aok('readRunHistory: missing 透传 / 崩溃轮占位最新位（#12）/ 失败行归属下一摘要轮（#3）', async () => {
     const { readRunHistory } = require('./scripts/status')
@@ -6233,7 +6752,6 @@ async function main () {
     // 不存在的 key（锚点轮已滚出尾窗）→ stale，前端回第 1 页
     const gone = readRunHistory(dir, { limit: 2, before: 'deadbeef' })
     assert.strictEqual(gone.status, 'stale')
-    server.close()
   })
   await aok('readRunHistory: 尾窗指纹不因首行为空/超长而退化（审查 D1-N6）', () => {
     const { readRunHistory } = require('./scripts/status')
@@ -6295,11 +6813,11 @@ async function main () {
     // mkfifo 需要专用系统调用（Node 22 无 mkfifoSync）——用 coreutils 绝对路径
     // （Sonar S4036：不做可写目录 PATH 查找），普通文件先删除再建 FIFO。
     const fifo = path.join(dir, 'pipe')
-    fs.rmSync(fifo, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
-    const t0 = Date.now()
-    assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    if (makeFifo(fifo, 'statSafeMeta FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(statSafeMeta(path.join(dir, 'pipe')).status, 'unsafe')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 打开必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    }
   })
   await aok('只读纯函数: classifyStateFile 分类与 F4 反例（.seen.cleanup.lock.json 是缓存不是锁）', () => {
     assert.strictEqual(classifyStateFile('push.json', 'push.json'), 'cache')
@@ -6378,11 +6896,11 @@ async function main () {
     assert.strictEqual(tombstoneCounts(dir2, 'push.json').bytes, null)
     // FIFO 也走 unsafe 闸（statSafeMeta 的 O_NONBLOCK 立即返回）——若闸失效此用例挂死
     const fifoTomb = path.join(dir2, 'push.json.seen.json')
-    fs.rmSync(fifoTomb, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifoTomb])
-    const t0 = Date.now()
-    assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+    if (makeFifo(fifoTomb, 'tombstone FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
+    }
   })
   await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
     const { readSafeTextResult } = require('./xbk_storage')
@@ -6396,11 +6914,11 @@ async function main () {
     assert.strictEqual(noOpt.status, 'ok', '不传 options 的既有调用方语义不变')
     // FIFO（无写者）：O_NONBLOCK open 立即 ENXIO → unsafe；若回归为裸 open 此用例挂死
     const fifo = path.join(dir, 'pipe')
-    fs.rmSync(fifo, { force: true })
-    require('node:child_process').execFileSync('/usr/bin/mkfifo', [fifo])
-    const t0 = Date.now()
-    assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
-    assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    if (makeFifo(fifo, 'readSafeTextResult FIFO')) {
+      const t0 = Date.now()
+      assert.strictEqual(readSafeTextResult(fifo, 1024, { openNonBlocking: true }).status, 'unsafe')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO open 必须立即返回（O_NONBLOCK），不得阻塞等写者')
+    }
   })
   await aok('只读纯函数: defaultHealthLimits entryMax 与 _resolveMaxSize 同口径（数字/字符串/脏值回退）', () => {
     const { defaultHealthLimits } = require('./scripts/console')
@@ -6506,7 +7024,6 @@ async function main () {
     // 无凭证 401
     const na = await request(port, 'GET', '/api/config')
     assert.strictEqual(na.status, 401)
-    server.close()
   })
   await aok('HTTP: /api/files 清单（真实文件 / symlink 显性 / 名称无路径 / 无凭证 401）', async () => {
     const dir = tmpDir()
@@ -6530,7 +7047,6 @@ async function main () {
     }
     const na = await request(port, 'GET', '/api/files')
     assert.strictEqual(na.status, 401)
-    server.close()
   })
   await aok('HTTP: /api/cache-health（ok 快照 / 字节数真实 / 无凭证 401）', async () => {
     const dir = tmpDir()
@@ -6554,7 +7070,6 @@ async function main () {
     assert.strictEqual(data.entryCountFiltered, 0, '无 _f 条目时 filteredCount=0')
     const na = await request(port, 'GET', '/api/cache-health')
     assert.strictEqual(na.status, 401)
-    server.close()
   })
   await aok('cache-health: entryCount 必须计入 _f（D2-S11：9000 _f + 1500 正常 → 10500 已超限）', async () => {
     const dir = tmpDir()
@@ -6569,7 +7084,6 @@ async function main () {
     assert.strictEqual(data.entryCountFiltered, 60, '_f 条数单独可见')
     const page = JSON.parse((await request(port, 'GET', '/api/messages', { token: TOKEN })).text)
     assert.strictEqual(page.grandTotal, 40, '推送记录页仍只算已推送条目')
-    server.close()
   })
   await aok('cache-health: 超过条数统计阈值 → 不整读，如实 tooLarge（D2-S12）', async () => {
     const dir = tmpDir()
@@ -6585,7 +7099,6 @@ async function main () {
     assert.strictEqual(data.entryCount, null, '条数不可得时不得编数')
     assert.strictEqual(data.entryCountStatus, 'tooLarge')
     assert.match(String(data.entryCountHint || ''), /MiB/, '必须说明为何不可得')
-    server.close()
   })
   await aok('HTTP: /api/trends?days 白名单（30/60 放大窗口；非法/越界钳回 14）', async () => {
     const dir = tmpDir()
@@ -6620,7 +7133,6 @@ async function main () {
       const t = JSON.parse((await request(port, 'GET', `/api/trends?days=${bad}`, { token: TOKEN })).text)
       assert.strictEqual(t.byDay.length, TREND_DAYS_DEFAULT, `days=${bad} 必须钳回默认`)
     }
-    server.close()
   })
   // ── v3.300 访问日志端到端（蓝图 §3.3 T1-T7）────────────────────────────────
   const fetchLog = async (port) => JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
@@ -6636,7 +7148,6 @@ async function main () {
     assert.strictEqual(hit.status, 401)
     assert.ok(!JSON.stringify(log.items).includes(FAKE), 'token 原文在响应体零出现（深断言）')
     assert.strictEqual(log.unauthorizedCount, 1, '独立 server 全程仅此一次 401（N1 收紧）')
-    server.close()
   })
   await aok('访问日志: 逃逸形态全 ***（重复参数 + %74oken 编码键名）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -6650,7 +7161,6 @@ async function main () {
     assert.ok(!flat.includes('x1') && !flat.includes('y2') && !flat.includes('z3'), `逃逸原文零出现（items=${flat}）`)
     assert.ok(log.items.some((it) => it.path === '/api/nope?a=1&token=***&token=***'), '重复参数形态全 ***')
     assert.ok(log.items.some((it) => it.path === '/api/nope?%74oken=***'), '编码键名命中，落盘保留原串形态（D2-N2）')
-    server.close()
   })
   await aok('访问日志: 401 独立计数（3 次未授权后 =3，重复查询不漂移）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -6665,7 +7175,6 @@ async function main () {
     assert.strictEqual(log.unauthorizedCount, 3, `3 次未授权后计数必须为 3（实际 ${log.unauthorizedCount}）`)
     const again = await fetchLog(port)
     assert.strictEqual(again.unauthorizedCount, 3, '查询自身（200）不计入，值不漂移')
-    server.close()
   })
   await aok('访问日志: 环形 201 挤最旧 + 自举（查询自身入日志且最新）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -6687,7 +7196,6 @@ async function main () {
     assert.ok(log2.items[log2.items.length - 1].path === '/api/access-log', `自举：上次查询自身入日志且最新（实际末条 ${log2.items[log2.items.length - 1].path}）`)
     assert.ok(log2.items[0].path.includes('seq=2'), `第二轮后最旧存活 = seq=2（seq=0/1 已挤出；实际 ${log2.items[0].path}）`)
     assert.ok(!log2.items.some((it) => it.path.endsWith('seq=0') || it.path.endsWith('seq=1')), 'seq=0/seq=1 必须已被挤出')
-    server.close()
   })
   // v3.330：每 60s 一条的版本探针不能把 200 条环形挤干净（Sourcery #294）。
   await aok('访问日志: v3.330 探针 ?probe=version 200 不入环形 / 普通 /api/sys 照记 / 响应 no-store', async () => {
@@ -6705,7 +7213,6 @@ async function main () {
     assert.strictEqual(bad.status, 401)
     const log2 = JSON.parse((await request(port, 'GET', '/api/access-log', { token: TOKEN })).text)
     assert.ok(log2.items.some((it) => it.path.includes('probe=version') && it.status === 401), '探针 401 必须入日志')
-    server.close()
   })
 
   await aok('访问日志: 降噪白名单 2xx 不入 / 404、5xx 入（含 POST /runs/detail 与 503 出口）', async () => {
@@ -6739,7 +7246,6 @@ async function main () {
     }
     assert.ok(log.items.some((it) => it.status === 404 && it.path.includes('/api/nope-x')), '404 必须入日志')
     assert.ok(log.items.some((it) => it.status === 503 && it.path.includes('/api/runs/cancel')), '503（cancel 出口）必须入日志')
-    server.close()
   })
   await aok('访问日志: 畸形 request-target 400 入日志且脱敏（raw 串路径 D2/D3）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -6756,7 +7262,6 @@ async function main () {
     assert.ok(log.items.some((it) => it.status === 400 && it.path.includes('//@:99999')), `畸形 target 的 400 必须入日志（items=${JSON.stringify(log.items.map((i) => [i.path, i.status]))}）`)
     assert.ok(log.items.some((it) => it.status === 401 && it.path.includes('token=***')), 'raw token 请求 401 条目必须脱敏')
     assert.ok(!JSON.stringify(log.items).includes(SEKRIT), 'SEKRIT 原文零出现（raw request-target 也过脱敏闸）')
-    server.close()
   })
   await aok('访问日志: 字段形状六字段 / at 上海戳 / ms≥0 / src=127.0.0.1', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -6778,7 +7283,6 @@ async function main () {
     for (let i = 1; i < log.items.length; i++) {
       assert.ok(log.items[i - 1].at <= log.items[i].at, '时间正序')
     }
-    server.close()
   })
 
   await aok('静态红线: app.js 所有 fetch/EventSource 第一参数均为字面量或字面量起点三元', () => {
@@ -7358,15 +7862,13 @@ async function main () {
 
   await aok('手动触发: 忙碌/错误提示都不许插行顶动布局', () => {
     const js = readConsoleSource()
-    const start = js.indexOf('function TriggerBar')
-    const end = js.indexOf('// ── 组件：运行历史', start)
-    assert.ok(start > -1 && end > start, '应能定位 TriggerBar 组件')
-    const block = js.slice(start, end)
+    const block = sliceBetween(js, 'function TriggerBar', '// ── 组件：运行历史', 'TriggerBar 组件')
     // 手动触发状态区（面板头 + 按钮行 + 提示）里不许出现行内 Hint。
-    const triggerArea = block.slice(0, block.indexOf('<div class="auto-run">'))
+    const triggerArea = sliceTo(block, '<div class="auto-run">', 'TriggerBar 手动触发状态区')
     // 忙碌提示原先插在按钮行与自动运行之间，出现/消失会把下方内容整体顶下 ~28px，
     // 手机上点一下就像「弹一下」；它必须由 locking 直接条件渲染成面板头徽标（不占额外高度）。
-    assert.ok(/locking && html`<span class="trigger-busy"/.test(triggerArea),
+    // C5-020：过 codeOf 再判——注释里留着这句原话时，裸 includes 会让「实现已删」也绿。
+    assert.ok(/locking && html`<span class="trigger-busy"/.test(codeOf(triggerArea)),
       '忙碌徽标必须由 locking 直接条件渲染（只留类名字符串不算）')
     // 行内 Hint 无论装忙碌还是错误都会插行：面板头与按钮行之间一个都不许留。
     assert.ok(!/<\$\{Hint\}/.test(triggerArea), '手动触发状态区不得再渲染行内 Hint（出现/消失会顶动布局）')
@@ -7409,8 +7911,8 @@ async function main () {
       const n = arr[1].trim() === '' ? 0 : arr[1].split("', '").length
       assert.strictEqual(n, rows, `「${title}」占位卡必须固定 ${rows} 行明细`)
     })
-    const seg = src.slice(src.indexOf('function StatusCards'), src.indexOf('// ── 组件：触发按钮'))
-    const head = seg.slice(0, seg.indexOf('const rep ='))
+    const seg = sliceBetween(src, 'function StatusCards', '// ── 组件：触发按钮', 'StatusCards 组件')
+    const head = sliceTo(seg, 'const rep =', 'StatusCards 占位分支')
     assert.ok(!/return null/.test(head), '占位分支之前不得有任何 return null：首帧必须画出卡片')
     const branch = head.match(/if \(!state\) \{[\s\S]*?return html`<\$\{CardsGrid\} cards=\$\{cards\} busy=\$\{!err\} \/>`/)
     assert.ok(branch, 'StatusCards 的第一个分支必须直接返回占位网格')
@@ -7707,6 +8209,29 @@ async function main () {
     assert.ok(!/\.page\s*\{[^}]*min-height:/.test(css), '不得再用固定减值的 min-height（短页会多出滚动）')
   })
 
+  // ── C5-033 返工：函数体定位器自测 ──
+  // 变异档里 console.js 被插桩器重写，签名空白会被压掉。定位器必须对「带空格 / 无空格」
+  // 两种形态都取到同一条非空函数体；否则下面 length>500 的守卫每轮恒抛，变异报告失真。
+  await aok('C5-033 函数体定位器: 带空格/无空格（插桩后）两种签名都能取到 tickAuto 函数体', () => {
+    const body = '  if (!lockVerdict.ok) return\n  auto.fails += 1\n'.repeat(20)
+    const spaced = `function tickAuto () {\n${body}}\n`
+    const tight = `function tickAuto() {\n${body}}\n`
+    assert.ok(spaced.includes('function tickAuto ('), 'fixture 必须覆盖「带空格」形态')
+    assert.ok(tight.includes('function tickAuto(') && !tight.includes('function tickAuto ('),
+      'fixture 必须覆盖插桩器产出的「无空格」形态')
+    const fromSpaced = functionBodyOf(spaced, 'tickAuto')
+    const fromTight = functionBodyOf(tight, 'tickAuto')
+    assert.ok(fromSpaced.length > 500, '带空格形态必须取到 >500 字节的函数体')
+    assert.ok(fromTight.length > 500, `无空格形态（插桩后）必须取到 >500 字节，实取 ${fromTight.length}`)
+    assert.strictEqual(fromTight, fromSpaced, '两种形态必须取到同一条函数体')
+    assert.ok(fromTight.includes('lockVerdict'), '取到的必须是函数体内容，不是签名')
+    // 旧写法（定点串）在无空格形态上必然 miss：这就是「取 0 字节 → 恒抛」的根因。
+    assert.strictEqual(tight.indexOf('function tickAuto ('), -1, '旧定点串在插桩后源码上必然 miss')
+    // 真文件也过一遍：变异沙箱里读到的就是插桩后的 console.js。
+    const realSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    assert.ok(functionBodyOf(realSrc, 'tickAuto').length > 500, '真实 console.js 上的 tickAuto 函数体必须取得非空')
+  })
+
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
@@ -7715,31 +8240,18 @@ async function main () {
     assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
       '保存/启动前必须统一 clamp 到 3–20')
     const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
+    // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
+    // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
+    // 这条红线，删除/替换 tickAuto 的锁必红。
+    // 定位器已提到模块作用域（functionBodyOf），签名按函数名 + 正则容错匹配，
+    // 见下方 C5-033 定位器自测。
     // 变异沙箱里 console.js 是机器生成代码（语句被 stryMutAct_* 条件包裹 + 覆盖率计数），
     // 所有源码串断言只对原始源文件有意义——与「测试隔离」红线同一口径，交 Test workflow 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
-      // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
-      // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
-      // {ok:true} 整套仍绿（C2-006 返工实测）。取函数体后只有 tickAuto 自己的锁调用能喂饱
-      // 这条红线，删除/替换 tickAuto 的锁必红。
-      const functionBodyOf = (text, signature) => {
-        const at = text.indexOf(signature)
-        if (at < 0) return ''
-        const open = text.indexOf('{', at + signature.length)
-        if (open < 0) return ''
-        let depth = 0
-        for (let i = open; i < text.length; i++) {
-          if (text[i] === '{') depth++
-          else if (text[i] === '}') {
-            depth--
-            if (depth === 0) return text.slice(open + 1, i)
-          }
-        }
-        return ''
-      }
-      const tickAutoBody = functionBodyOf(consoleSrc, 'function tickAuto (')
+      const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
       assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
         consoleSrc.includes("startAction('run-auto'") &&
         tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
@@ -7779,6 +8291,31 @@ async function main () {
         "server.on('close', () => { disposeAuto(); killAll() })",
         "server.on('close', () => { killAll() }); disposeAuto()")),
       '清理调用移出关闭回调不得算数')
+    } else {
+      // C5-033：变异档不再整段跳过（旧写法让这 8 条红线在变异评估里零防护）。
+      // 插桩只改写语句/表达式文本（字面量被 stryMutAct_* 包住），标识符、字符串字面量与
+      // 函数体结构都还在 ⇒ 用「函数体 + 标识符」这一族断言兜同一批红线：删掉 tickAuto 的锁、
+      // 单飞判定或连续失败计数，或把 run-auto 挪到别处，都会在这里变红。
+      const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
+      assert.ok(tickAutoBody.length > 500, '变异档必须仍能取到 tickAuto 函数体（否则下面几条恒真）')
+      assert.ok(consoleSrc.includes('AUTO_MIN_S') && consoleSrc.includes('AUTO_MAX_S') &&
+        consoleSrc.includes('clampAutoSeconds'),
+      '服务器端 3–20 秒夹紧常量与夹紧函数必须还在（文本被插桩改写，只认标识符）')
+      assert.ok(consoleSrc.includes('AUTO_MAX_FAILS') && tickAutoBody.includes('startAction') &&
+        tickAutoBody.includes("'run-auto'"),
+      '自动调度必须在服务器进程内跑 run-auto')
+      assert.ok(tickAutoBody.includes('acquireLockResult') && /lockVerdict\s*\.\s*ok/.test(tickAutoBody),
+        'tickAuto 体内必须先取单飞锁（换成 {ok:true} 即变红）')
+      assert.ok(tickAutoBody.includes('autoInFlightId') && /activeChildren\s*\.\s*size/.test(tickAutoBody),
+        '上一轮未结束不得叠跑')
+      assert.ok(tickAutoBody.includes('auto.fails') && tickAutoBody.includes('AUTO_MAX_FAILS') &&
+        tickAutoBody.includes('stopAuto'),
+      '连续失败计数必须仍参与自动停机判定')
+      assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
+        '自动开关/间隔必须由服务器持久化，重启可恢复')
+      assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
+      assert.ok(consoleSrc.includes('disposeAuto') && consoleSrc.includes('killAll'),
+        '控制台关闭时必须清理自动定时器')
     }
 
     const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
@@ -10241,37 +10778,332 @@ async function main () {
     assert.ok(escSeg.includes('inst.close()') && escSeg.includes('restoreFocus()'),
       'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
+
+  await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
+    const src = readConsoleSource()
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.searchBodyView, 'function',
+      '结果区渲染判定必须是 pure.mjs 的纯函数（htm/React 不能在 Node 里跑，行为只能在这测）')
+    const a = { status: 'ok', q: 'a', page: 1, pages: 3, count: 20, items: [] }
+    const b = { status: 'ok', q: 'b', page: 1, pages: 1, count: 5, items: [] }
+    assert.strictEqual(pure.searchBodyView({ q: '', live: null, prev: a, loading: false, err: '' }), 'prompt',
+      '空关键词只提示输入')
+    assert.strictEqual(pure.searchBodyView({ q: 'a', live: null, prev: null, loading: true, err: '' }), 'skeleton',
+      '首次搜索（一份结果都没有）才出骨架')
+    // 关键回归：setReq 已落地、loading 还没置真的那一帧——旧实现五个分支一个都不命中，body 是
+    // undefined，结果区整块空白（长列表塌成 0 行）后才补骨架。
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: a, loading: false, err: '' }), 'stale',
+      '换词那一帧必须继续画上一份结果（旧实现这里 body 为 undefined，整块空白）')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: a, loading: true, err: '' }), 'stale',
+      '本轮响应未到时继续画上一份结果，不得换回 3 行骨架')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: b, prev: a, loading: false, err: '' }), 'results',
+      '本次结果到了立刻画本次的')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: { status: 'upstream_error' }, prev: a, loading: false, err: '' }), 'upstream',
+      '上游错误走错误提示，不得把上一份结果当成本次的')
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: null, prev: null, loading: false, err: '加载失败' }), 'error',
+      '加载失败必须走 LoadError（带重试按钮）')
+    // 关键回归（B2 返工 a1）：同一 q 的刷新/翻页失败时 loader 保留旧 data ⇒ live 仍是上一份 ok 结果。
+    // 旧实现只有 `if (err) return 'error'` 这一个错误出口，live 非空就把它整个跳过：失败无提示、
+    // 无重试，且 req.page 已前进而按钮重新启用 → 再点下一页从第 1 页跳到第 3 页。
+    assert.strictEqual(pure.searchBodyView({ q: 'b', live: b, prev: b, loading: false, err: '加载失败：网络请求失败' }), 'results',
+      '同 q 刷新失败仍画旧结果（不得整块卸载），但错误必须另有出口')
+    assert.strictEqual(pure.searchRefreshError({ live: b, err: '加载失败：网络请求失败' }), true,
+      '同 q 刷新失败必须给出错误提示 + 重试：err 不得被非空 live 静默吞掉（旧实现此处失败完全不可见）')
+    assert.strictEqual(pure.searchRefreshError({ live: b, err: '' }), false,
+      '没有错误时不得凭空多出一条错误提示')
+    // 接线：q 守卫不能为了「保留上一份结果」被放宽；body 不得再有 undefined 分支。
+    const panel = src.slice(src.indexOf('function SearchPanel'), src.indexOf('function LogsPanel'))
+    assert.ok(panel.length > 1000, '应能定位 SearchPanel')
+    assert.ok(panel.includes("const live = data && (data.status !== 'ok' || data.q === req.q) ? data : null"),
+      'q 校验必须原样保留：A 的条目不得挂到 B 下面（也不能用 A 的结果把 B 标成已读）')
+    assert.ok(panel.includes('searchBodyView({'), '结果区必须走 pure.mjs 的判定，不得在组件里另拼一套分支')
+    assert.ok(!panel.includes('} else if (loading && !live) {'),
+      '不得再无条件把结果区换成骨架（换词/翻页会整块卸载）')
+    assert.ok(panel.includes('const lastShownRef = useRef(null)'),
+      '必须另存一份「上次画出来的结果」用于占位（live 的归属语义不变）')
+    assert.ok(panel.includes('const refreshErr = searchRefreshError({ live, err })'),
+      '失败提示必须由纯函数判定（searchRefreshError）：err 与非空 live 同时存在时不得静默')
+    const D = '$' // no-template-curly-in-string：含 `${` 的字符串要拼出来
+    assert.ok(panel.includes(D + '{refreshErr && html`<' + D + '{Hint} tone="error">' + D + '{err}'),
+      'results 分支顶部必须渲染 err（Hint tone="error"）：否则同 q 刷新失败无提示、无重试')
+    assert.ok(panel.includes('disabled=$' + '{stale || !!err || req.page <= 1 || loading}'),
+      '占位态/失败期间必须禁用翻页：上一份结果的页码不得被当成本次页码提交，失败后也不得继续翻页（否则从第 1 页跳到第 3 页）')
+    assert.ok(panel.includes('disabled=$' + '{stale || !!err || req.page >= pages || loading}'),
+      '下一页/末页同样要在失败期间禁用')
+    assert.ok(panel.includes('class="ls-results"'), '结果区必须挂 .ls-results（min-height 占位）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(/\.ls-results\s*\{[^}]*min-height:\s*\d+px/.test(css),
+      '结果区必须有 min-height 占位：长列表 ↔ 骨架之间页面高度不得塌陷')
+  })
+
+  await aok('C7-003 过滤规则 notice.tone 不再被吞（warn 必须真的渲染成琥珀提示）', () => {
+    const src = readConsoleSource()
+    const panel = sliceBetween(src, 'function FilterRulesPanel', 'export {', 'FilterRulesPanel 组件')
+    assert.ok(panel.length > 5000, '应能定位 FilterRulesPanel')
+    // 唯一渲染点必须把 tone 传给 Hint。旧实现只渲染 notice.text ⇒ 7 处 setNotice 的
+    // warn/ok 全是同一个中性 .hint，「服务器草稿清理失败」和「已保存 rN」长得一模一样。
+    assert.ok(/<\$\{Hint\} tone=\$\{notice\.tone\}>\$\{notice\.text\}<\/\/>/.test(panel),
+      'notice 渲染必须透传 tone（<Hint> 的 warn 分支与 .hint-warn 样式都已就绪，只差调用点）')
+    const sets = []
+    for (let i = panel.indexOf('setNotice({'); i !== -1; i = panel.indexOf('setNotice({', i + 1)) sets.push(i)
+    assert.ok(sets.length >= 6, `setNotice 的对象字面量写入点至少 6 处，实际 ${sets.length}`)
+    sets.forEach((pos, i) => {
+      const body = panel.slice(pos, pos + 300)
+      assert.ok(body.includes('tone:'), `第 ${i + 1} 处 setNotice 必须带 tone，否则新提示又会退化成中性：${body.slice(0, 80)}`)
+    })
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const hint = comp.slice(comp.indexOf('function Hint ('), comp.indexOf('// 入场包装'))
+    assert.ok(hint.includes("tone === 'warn' ? 'hint hint-warn'"), 'Hint 必须把 warn 渲染成 hint-warn（本修复的前提）')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(css.includes('.hint-warn'), 'app.css 必须有 .hint-warn 规则（否则传了 tone 也看不出差别）')
+  })
+
+  await aok('C7-005 今日卡标注 stats.truncated（与周卡同口径，不再把少算的总数判绿）', async () => {
+    const pure = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(typeof pure.todayCardView, 'function', '今日卡的 tone/badge 判定必须是 pure.mjs 的纯函数')
+    assert.strictEqual(typeof pure.statsTailNote, 'function', '两卡共用的尾部标注必须是纯函数')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: false, failed: 0, rounds: 0, truncated: false }),
+      { tone: 'run', badge: '—', note: '' }, '没有 run.log 数据时保持「—」/中性（占位不谎报）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 2, rounds: 3, truncated: false }),
+      { tone: 'bad', badge: '异常', note: '' }, '有失败必须判红（与旧版一致）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 0, rounds: 3, truncated: false }),
+      { tone: 'ok', badge: '正常', note: '' }, '未截断时判绿不变')
+    // 关键回归：run.log 超 1 MiB（后端只读尾部）——少算的「0 失败」不得再画成绿色「正常」。
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 0, rounds: 3, truncated: true }),
+      { tone: 'warn', badge: '仅尾部', note: ' · 仅统计尾部' },
+      '截断时今日卡必须标注「仅统计尾部」并降成琥珀（旧实现只看 failed/rounds ⇒ 绿「正常」且无标注）')
+    assert.deepStrictEqual(pure.todayCardView({ hasData: true, failed: 1, rounds: 3, truncated: true }),
+      { tone: 'bad', badge: '异常', note: ' · 仅统计尾部' }, '真失败仍判红，但同样要标注只统计了尾部')
+    assert.strictEqual(pure.statsTailNote({ truncated: true }), ' · 仅统计尾部', '周卡/今日卡共用一个标注文案')
+    assert.strictEqual(pure.statsTailNote({ truncated: false }), '', '未截断不标注')
+    assert.strictEqual(pure.statsTailNote(null), '', '没有 stats 时不得报截断')
+    // 接线：今日卡必须走这个判定（不能只给周卡加标注），hint 里必须带上 note。
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = comp.slice(comp.indexOf('function StatusCards'), comp.indexOf('// ── 组件：触发按钮'))
+    assert.ok(seg.includes('todayCardView({'), '今日卡必须用 todayCardView 判定 tone/badge/标注')
+    assert.ok(/\$\{todayCard\.note\}/.test(seg), '今日卡的 hint 必须带上尾部标注')
+    assert.ok(/\$\{statsTailNote\(stats\)\}/.test(seg), '周卡必须复用同一个尾部标注（两卡口径不得再分叉）')
+    assert.ok(!/\(\s*stats\.truncated/.test(seg), '不得再在卡片里就地读 stats.truncated（判定只留在 pure.mjs）')
+  })
+
+  // ── C5-064：服务端 renderPage 输出断言（组件级渲染：DEFER，见下）──
+  // 病根：本文件几千条断言里没有一条调用过渲染入口，全是 readConsoleSource() 的正则。
+  // 「文本里有这行代码」与「页面真的这么渲染」是两件事：把 renderPage 改成返回固定串、
+  // 或把 boot 岛里的 token/instance 丢掉，旧断言全绿。这里直接调导出的 renderPage /
+  // renderUnauthorizedPage 渲染真实 state，对返回的 HTML 做断言。
+  //
+  // 口径（C5-064 正式 DEFER）：下面 5 条只覆盖**服务端字符串渲染**（state → HTML 文本），
+  // 不是组件级行为测试。scripts/console-assets/pages.js(5067 行)/components.js(1451 行)
+  // 里的组件（弹窗打开后焦点、Esc 关闭回调、空列表空态文案）仍无一条用例真渲染过，
+  // 预检原文「没有一条渲染过组件」成立，不得把这批用例记作组件行为测试。
+  // 已尝试但本轮落不了地（证据留档）：
+  //   1) 资产是浏览器 ESM（import './htm-preact.module.js'），package.json 无 "type":"module"
+  //      ⇒ CJS 测试进程直 import .js 会按 CJS 解析报错；要跑需先拷贝改名 .mjs 并改写说明符。
+  //   2) 组件渲染需要 DOM：htm-preact.module.js 本身能在 Node 里 import（已实测），但本机没有
+  //      任何 DOM 实现——jsdom / happy-dom / linkedom 在 worktree 与共享 node_modules 里全 absent。
+  //   3) `npm i -D happy-dom` 两次实测（180s、420s）均卡在 reify 阶段超时；registry 镜像
+  //      (mirrors.tencentyun.com) 对大 reify 不可用，中途还把关掉的 node_modules 删成半残（已还原）。
+  // 结论：补真组件测试的前置条件是先解依赖（离线 happy-dom tarball，或给资产加测试专用 ESM 入口）。
+  // 在这之前，"C5-064 已覆盖组件行为" 的说法不成立。
+  // state 骨架按 formatStatus 的读取面构造（generatedAt + report/run/channels/diagnostics 四部件）。
+  function uiState (over = {}) {
+    return {
+      generatedAt: Date.UTC(2026, 9, 27, 3, 4, 5),
+      report: { status: 'ok', value: { date: '2026-10-27', runs: 3, pushed: 12, failed: 1, truncated: 0 } },
+      run: { status: 'ok', value: { at: '2026-10-27 11:03:00', total: 20, dedup: 3, filtered: 2, pushed: 14, failed: 1, truncated: 0, elapsed: '4s' } },
+      channels: { status: 'ok', value: { xianbao: { consecutiveFailures: 1, lastFailureAt: 0, lastAlertAt: 0 } } },
+      diagnostics: { status: 'ok', value: { at: '2026-10-27 10:00:00', byReason: { dedup: 3 } } },
+      ...over
+    }
+  }
+  // boot JSON 岛是前端拿 token/version/instance 的唯一通道：抽出来按 JSON 解析，顺便证明
+  // 「转义之后仍是合法 JSON」——旧断言只看源码里有没有 bootJson 这个标识符。
+  function bootIsland (html) {
+    const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(html)
+    assert.ok(m, '必须渲染出 id="xbk-boot" 的 JSON 岛，否则前端拿不到凭证/实例名')
+    return JSON.parse(m[1])
+  }
+
+  await aok('C5-064 renderPage: 用户可控状态字段必须转义（服务端渲染输出，尖括号不得原样落地）', () => {
+    const { renderPage } = require('./scripts/console')
+    const payload = '<script>alert(1)</script>'
+    const attr = 'x" onmouseover="alert(1)'
+    const html = renderPage(uiState({
+      report: { status: 'ok', value: { date: payload, runs: 1 } },
+      run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
+      channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
+    }), [], new URLSearchParams(), 'tok', 'deep')
+    assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
+    assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
+    assert.ok(html.includes('&quot; onmouseover=&quot;alert(1)'), '双引号必须转成 &quot;（转义完整性）')
+  })
+
+  await aok('C5-064 renderPage: 空 state/无 run/空 runsList 不抛，且输出完整合法骨架', () => {
+    const { renderPage } = require('./scripts/console')
+    const bare = {
+      generatedAt: 0,
+      report: { status: 'missing', value: null },
+      run: { status: 'missing', value: null },
+      channels: { status: 'missing', value: null },
+      diagnostics: { status: 'missing', value: null }
+    }
+    // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
+    const html = renderPage(bare, [], undefined, '', 'deep')
+    assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
+    assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
+    assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
+    assert.ok(html.includes('<noscript>') && html.includes('缺失'), '无脚本降级必须保留，且缺失部件如实写「缺失」')
+    assert.strictEqual((html.match(/<\/html>/g) || []).length, 1)
+    const boot = bootIsland(html)
+    assert.strictEqual(boot.token, '', '没传凭证时 boot token 必须是空串')
+    assert.strictEqual(boot.instance, '', '没传 instanceId 时必须回退空串（不能是 undefined）')
+    assert.strictEqual(typeof boot.version, 'string')
+    assert.ok(boot.version.length > 0, 'version 必须非空，否则资产 URL 带不上版本号、缓存永远不失效')
+  })
+
+  await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
+    const { renderPage } = require('./scripts/console')
+    const dark = renderPage(uiState(), [], new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), [], new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
+    assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
+    assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
+    assert.strictEqual(bootIsland(dark).token, 'tok-AAA', 'boot token 必须是本请求验过的凭证')
+    assert.strictEqual(bootIsland(dark).instance, 'inst-1', 'instanceId 必须进 boot（前端快照的命名空间）')
+    assert.strictEqual(bootIsland(light).token, 'tok-BBB')
+    assert.strictEqual(bootIsland(light).instance, 'inst-2')
+    // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
+    const evil = renderPage(uiState(), [], new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
+    assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
+  })
+
+  await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
+    const { renderPage } = require('./scripts/console')
+    const fromQuery = renderPage(uiState(), [], new URLSearchParams('token=from-query'), '', 'deep')
+    assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
+    const fromSession = renderPage(uiState(), [], new URLSearchParams('token=from-query'), 'from-session', 'deep')
+    assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
+    // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
+    const breakout = renderPage(uiState(), [], new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
+    assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
+    assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')
+  })
+
+  await aok('C5-064 renderUnauthorizedPage: 令牌/错误文案转义，条件字段按参数出现', () => {
+    const { renderUnauthorizedPage } = require('./scripts/console')
+    const plain = renderUnauthorizedPage()
+    assert.ok(plain.includes('<input id="token"'), '未带码时必须有可见令牌输入框')
+    assert.ok(plain.includes('autofocus'), '未带码时令牌框自动聚焦（否则用户对着空表单先按一次 Tab）')
+    assert.ok(!plain.includes('name="code"'), '未要求第二因子时不得渲染验证码框')
+    assert.ok(!plain.includes('type="hidden" name="token"'), '未要求第二因子时不得把令牌塞进 hidden')
+    assert.ok(!plain.includes('记住这台设备'), '未要求第二因子时不得出现信任设备勾选')
+    const twofa = renderUnauthorizedPage({ requireCode: true, token: 'tok</script>', error: '<img src=x onerror=alert(1)>' })
+    assert.ok(twofa.includes('type="hidden" name="token" value="tok&lt;/script&gt;"'), '令牌必须经 hidden 回填且转义')
+    assert.ok(twofa.includes('name="code"'), '要求第二因子时必须渲染验证码/恢复码框')
+    assert.ok(twofa.includes('&lt;img src=x onerror=alert(1)&gt;'), '错误文案必须转义后输出')
+    assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
+    assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
+  })
 }
 
-main()
-  .then(() => {
-    console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}`)
-    if (failed > 0) {
-      process.exitCode = 1
-      // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
-      console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+// ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
+// 旧实现只在 .then 里做这三件事；main() reject 时只打一行 e.message 并置 exitCode=1：
+// 既没有「通过 N / 失败 M + 失败用例清单」（分项汇总），也没有强退闸——只要还有 ref 句柄
+// 攥着事件循环（迟到回调、孙进程），CI 照样白等满 timeoutMS，而日志里看不出是哪条用例烂了。
+function finishSuite () {
+  // 跳过必须可见（C5-070）：FIFO 夹具缺 mkfifo 时只跳过那一小段，不能让它静默消失。
+  const skippedNote = skipped > 0 ? ` / 跳过 ${skipped}（本机缺工具，已逐条打印原因）` : ''
+  console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}${skippedNote}`)
+  if (failed > 0) {
+    process.exitCode = 1
+    // 汇总末尾再列一次失败用例名：CI 的诊断步骤只 tail 日志尾部，行内 ❌ 会被截掉。
+    console.log(`失败用例：\n${failedNames.map(n => `  - ${n}`).join('\n')}`)
+    // 同名用例：`@L` 行号已能区分，这里再点名，免得有人把「两条同名」读成重复打印（C5-068）。
+    if (duplicateCaseNames.size > 0) {
+      console.log(`同名（重号）用例 ${duplicateCaseNames.size} 个，按 #n 区分：${[...duplicateCaseNames].join(' / ')}`)
     }
-    const lastReap = reapTestScope('套件末')
-    // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
-    // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
-    // unref interval 只 clear 不计（见 reapTestScope），不参与本判定，所以不会误伤基线。
-    if (leakedScopes.length > 0 || lastReap.closed > 0 || lastReap.cleared > 0) {
+  }
+  // 兜底闸（评审 1）：最后一次收割仍收到 server / ref interval，或本轮任何一次收割收到过
+  // 真家伙，都必须让退出码非 0——旧版这里是「有泄漏但仍 exit 0」，泄漏被静默吞掉。
+  // unref interval 只 clear 不计（见 reapTestScope），不参与本判定，所以不会误伤基线。
+  const leakReport = leakedResourceReport(reapTestScope('套件末'))
+  if (leakReport) {
+    process.exitCode = 1
+    console.error(leakReport)
+  }
+  // 最后一道闸：万一还有用例之外的东西攥着事件循环（孙进程 / 未走 listen 的句柄 / 超时
+  // 用例的迟到回调刚造出来的资源），也不让 CI 白等满 timeoutMS。unref() 保证没有泄漏时它
+  // 根本不触发。强退前必须再判一次：真发现 ref 句柄就把退出码置 1 并说明原因（评审 1）。
+  const guard = realSetTimeout(() => {
+    const handles = refdHandleNames(guard)
+    if (handles.length > 0) {
       process.exitCode = 1
-      console.error(`[console-suite] 检测到测试资源泄漏：${leakedScopes.length} 次收尾兜底（${leakedScopes.join('；')}）——退出码置 1`)
+      console.error(`[console-suite] 汇总后仍有活跃句柄（${handles.join(',')}），判定泄漏：退出码置 1 后强制退出`)
+    } else {
+      console.error('[console-suite] 汇总后事件循环仍未排空，但未发现 ref 句柄（unref 句柄不钉循环），强制退出')
     }
-    // 最后一道闸：万一还有用例之外的东西攥着事件循环（孙进程 / 未走 listen 的句柄 / 超时
-    // 用例的迟到回调刚造出来的资源），也不让 CI 白等满 timeoutMS。unref() 保证没有泄漏时它
-    // 根本不触发。强退前必须再判一次：真发现 ref 句柄就把退出码置 1 并说明原因（评审 1）。
-    const guard = realSetTimeout(() => {
-      const handles = refdHandleNames(guard)
-      if (handles.length > 0) {
-        process.exitCode = 1
-        console.error(`[console-suite] 汇总后仍有活跃句柄（${handles.join(',')}），判定泄漏：退出码置 1 后强制退出`)
-      } else {
-        console.error('[console-suite] 汇总后事件循环仍未排空，但未发现 ref 句柄（unref 句柄不钉循环），强制退出')
-      }
-      process.exit(process.exitCode || 0)
-    }, 3000)
-    guard.unref()
-  })
-  .catch(e => { console.error('套件执行异常:', e.message); process.exitCode = 1; reapTestScope('套件异常') })
+    process.exit(process.exitCode || 0)
+  }, 3000)
+  guard.unref()
+  return guard
+}
+
+// 两条路径共用同一个收尾：正常跑完 / main() 中途 reject。后者必须也打汇总并装强退闸，
+// 否则「套件炸在半路」与「跑完了但泄漏」在 CI 上是同一种表现：等满 timeoutMS、无判据。
+async function runSuite (mainPromise) {
+  try {
+    await mainPromise
+  } catch (e) {
+    process.exitCode = 1
+    // 中止也是失败：计数与失败清单里必须留下痕迹，否则汇总会打出「通过 N / 失败 0」的假绿。
+    failed++
+    failedNames.push('main() 异常中止（未跑到套件末）')
+    console.error('套件执行异常:', failureText(e))
+  }
+  return finishSuite()
+}
+
+// 收尾自身抛出（finishSuite 里的清点 / 强退闸）也必须让进程非 0：这就是 Sonar S9383 指的
+// dangling promise。不接的话拒约只落到 unhandledRejection 上，而它的默认行为随 node 版本与
+// `--unhandled-rejections` 取值而变（warn 档退出码仍是 0）⇒ CI 上会退化成「跑完了但没判据」。
+function handleSuiteFinishError (e) {
+  process.exitCode = 1
+  // 与 runSuite 内部同口径留痕：收尾都炸了，汇总行打不出来，失败清单是唯一线索。
+  failed++
+  failedNames.push('套件收尾异常（finishSuite 抛出，未打出汇总）')
+  console.error('套件收尾异常:', failureText(e))
+}
+
+// S15 回归（闸门 A）：此前这条 .catch 只有口头探针（注入 throw 后看 exit 1），没有committed 断言。
+// 把处理器提成具名函数后在这里直接验：置退出码 1 + 失败计数 +1 + 清单留痕，三项缺一即红。
+ok('S15 回归：收尾异常处理器置退出码 1 并在失败清单留痕', () => {
+  const savedExit = process.exitCode
+  const savedFailed = failed
+  const savedLen = failedNames.length
+  const savedError = console.error
+  try {
+    process.exitCode = 0
+    console.error = () => {}
+    handleSuiteFinishError(new Error('probe-s15-handler'))
+    assert.strictEqual(process.exitCode, 1, '收尾异常必须把退出码置 1')
+    assert.strictEqual(failed, savedFailed + 1, '失败计数必须 +1')
+    assert.ok(failedNames.slice(savedLen).some(n => n.includes('套件收尾异常')), '失败清单必须留痕')
+  } finally {
+    process.exitCode = savedExit
+    failed = savedFailed
+    failedNames.length = savedLen
+    console.error = savedError
+  }
+})
+
+// S15 接线：handler 有了，接线也必须锁住——退回 .catch(() => {}) 时上面的用例照样绿。
+ok('S15 接线：runSuite(main()) 必须接到 handleSuiteFinishError', () => {
+  const src = fs.readFileSync(__filename, 'utf8')
+  assert.match(src, /runSuite\(main\(\)\)\.catch\(handleSuiteFinishError\)/,
+    '收尾必须接到具名 handler；换成空 catch 等于把兜底丢掉')
+})
+
+runSuite(main()).catch(handleSuiteFinishError)

@@ -551,7 +551,12 @@ try {
   assert.strictEqual(parseArgs(['--segment', 'storage', 'a.json']).segment, 'storage', '--segment <值> 必须落到 segment')
   assert.deepStrictEqual(parseArgs(['--segment', 'storage', 'a.json']).paths, ['a.json'], '位置参数必须落到 paths')
   assert.strictEqual(parseArgs(['--segment=v3-entry', 'b.json']).segment, 'v3-entry', '--segment= 内联值必须同样生效')
-  assert.strictEqual(parseArgs(['--segment', '   ', 'c.json']).segment, null, '空白段名必须归一为 null')
+  // C10-054 返工：空白段名的旧契约「归一为 null」已取消——空取值会让守卫在没有段标签的情况下继续跑
+  // （label 落到 basename，killed 基线与段名对不上却看不出来），故改为 fail-closed。下面三条是同一契约的
+  // 三种非法形态，任一被退回「静默接受」，守卫就会在参数不明时照常出结论。
+  assert.throws(() => parseArgs(['--segment', '   ', 'c.json']), /取值为空/, '空白段名必须 fail-closed（旧契约「归一为 null」已按 C10-054 取消）')
+  assert.throws(() => parseArgs(['--segment', 'a', '--segment', 'b']), /重复指定/, '重复指定段名必须 fail-closed（旧实现后者静默覆盖前者，取哪个都靠猜）')
+  assert.throws(() => parseArgs(['--segment', '--label', 'x']), /看起来是另一个参数/, '取值看起来是另一个参数时必须 fail-closed（旧实现把 --label 当段名、x 当报告路径）')
   assert.deepStrictEqual(parseArgs(['--', '-weird.json', 'd.json']).paths, ['-weird.json', 'd.json'], '-- 之后必须全部按路径处理')
   assert.throws(() => parseArgs(['--segmnt', 'storage']), /未知参数/, '参数笔误必须 fail-closed，不得静默忽略成“无路径”空转')
   assert.throws(() => parseArgs(['--segment']), /缺少取值/, '--segment 缺取值必须抛，不能当成未提供')
@@ -561,6 +566,190 @@ try {
   assert.ok(errw.join('').includes('守卫参数非法'), 'stderr 必须说明根因：' + errw.join(''))
   assert.ok(errw.join('').includes('用法：node scripts/mutation-guard.js'), '必须给出可照抄的用法行：' + errw.join(''))
   assert.strictEqual(outw.length, 0, '参数非法时不得向 stdout 写结论（避免被当成有效判定）')
-  console.log('✅ mutation-guard 形态守卫与参数解析断言通过（9 条 throw 路径 + 7 条参数契约 + run 出口）')
+  console.log('✅ mutation-guard 形态守卫与参数解析断言通过（9 条形态 throw + 4 条参数接纳 + 5 条参数非法（含 C10-054 空白/重复/取值像参数）+ run 出口）')
+}
+
+// ===== C10-021：killed 下降判据（判据 ⑤）——默认关闭 / 可比才判 / 容忍值 / 坏基线 fail-closed =====
+// 该判据只在**显式**给基线时生效（默认关闭 = 没有基线时这个门禁不存在）。本节两侧都锁：
+//   ① 不开就不生效——否则所有历史调用方会被凭空判红；
+//   ② 开了就真判——把 evaluateReports 里 `killed < baseline - tolerance` 改成永假、或把
+//      readKilledBaseline 的同 commit / mode=full / 无 reuse 痕迹三条校验删掉，本节必红，
+//      而其余用例（全部不设该变量）一律照绿。故这是这两处新门禁唯一的回归出口。
+{
+  const {
+    run, readKilledBaseline, resolveKilledTolerance,
+    KILLED_BASELINE_ENV, KILLED_TOLERANCE_ENV
+  } = require('./scripts/mutation-guard.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutation-killed-baseline-'))
+  const loc = { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } }
+  const reportOf = (killed) => ({
+    files: {
+      'x.js': {
+        mutants: Array.from({ length: killed }, (_, i) => ({
+          id: String(i + 1), mutatorName: 'BlockStatement', status: 'Killed', location: loc
+        }))
+      }
+    }
+  })
+  const writeJson = (name, body) => {
+    const file = path.join(dir, name)
+    fs.writeFileSync(file, JSON.stringify(body))
+    return file
+  }
+  const SHA = 'c10-021-sha'
+  let argv = [] // 只在 try 里回填（报告路径要等落盘后才知道）
+  // run() 不结束进程（只返回退出码），故同进程可反复调用；一次采集退出码 + stdout/stderr 全文。
+  const invoke = (env, args = argv) => {
+    const out = []
+    const err = []
+    const code = run(args, {
+      stdout: { write: (s) => out.push(String(s)) },
+      stderr: { write: (s) => err.push(String(s)) },
+      env
+    })
+    return { code, out: out.join(''), err: err.join(''), text: out.join('') + err.join('') }
+  }
+  try {
+    const report90 = writeJson('r90.json', reportOf(90))
+    argv = ['--segment', 'storage', report90]
+    const baseline = writeJson('baseline.json', { commit: SHA, mode: 'full', segments: { storage: { killed: 100 } } })
+    // 正向前置：合法基线必须读得出来（否则下面的「坏基线必抛」可以靠「恒抛」蒙过）
+    const parsed = readKilledBaseline(baseline, { commit: SHA })
+    assert.strictEqual(parsed.segments.get('storage'), 100, '合法基线必须解析出 segments.storage=100')
+    assert.strictEqual(parsed.commit, SHA, '合法基线必须带上 commit')
+
+    // ① 无基线 ⇒ 判据 ⑤ 不存在：exit 0，且输出里不得出现该判据的任何字样
+    {
+      const r = invoke({})
+      assert.strictEqual(r.code, 0, `无基线时守卫必须照旧 exit 0（90 killed 是合法报告），实际 ${r.code}：${r.text}`)
+      assert.ok(!r.text.includes('判据 ⑤'), '无基线时不得输出判据 ⑤ 的字样（默认关闭 ⇒ 这个门禁不存在）')
+    }
+    // ② 基线 killed=100、本轮 90 ⇒ 必须 exit 1（这正是「测试变弱」要抓的形状）
+    {
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: baseline })
+      assert.strictEqual(r.code, 1, `killed 从 100 掉到 90 必须 exit 1，实际 ${r.code}：${r.text}`)
+      assert.ok(r.err.includes('killed 数下降'), 'stderr 必须点名 killed 下降：' + r.err)
+      assert.ok(r.err.includes('本轮 90 < 基线 100'), '诊断必须带上两侧数字：' + r.err)
+      assert.ok(r.out.includes('判据 ⑤'), '启用后必须在 stdout 显形判据 ⑤（否则看不出这道门禁开着）')
+    }
+    // ③ 容忍值：10 ⇒ 90 不低于 100-10 ⇒ 不红；9 ⇒ 90 < 91 ⇒ 红。改错比较方向或忽略容忍值都会红。
+    {
+      const tol = (v) => invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: baseline, [KILLED_TOLERANCE_ENV]: v })
+      const t10 = tol('10')
+      assert.strictEqual(t10.code, 0, `容忍 10 时 90 相对 100 属抖动范围，必须 exit 0，实际 ${t10.code}：${t10.text}`)
+      assert.ok(t10.out.includes('容忍 10'), 'stdout 必须显形生效的容忍值：' + t10.out)
+      const t9 = tol('9')
+      assert.strictEqual(t9.code, 1, `容忍 9 时 90 < 91，必须 exit 1，实际 ${t9.code}：${t9.text}`)
+      assert.ok(t9.err.includes('容忍 9'), '诊断必须带上生效的容忍值：' + t9.err)
+    }
+    // ④ 坏基线一律 fail-closed（读不出来也不许当「没有判据」放行）
+    //   a) 跨 commit：基线来自别的提交 ⇒ killed 不可比
+    {
+      const otherCommit = writeJson('baseline-other-commit.json', { commit: 'deadbeef', mode: 'full', segments: { storage: { killed: 100 } } })
+      assert.throws(() => readKilledBaseline(otherCommit, { commit: SHA }), /跨 commit 的 killed 不可比/,
+        '跨 commit 的基线必须抛（旧实现只比数值，会把别的提交的 killed 当基线）')
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: otherCommit })
+      assert.strictEqual(r.code, 1, `跨 commit 的基线必须 exit 1，实际 ${r.code}：${r.text}`)
+      assert.ok(r.err.includes('跨 commit 的 killed 不可比'), 'stderr 必须点名跨 commit：' + r.err)
+    }
+    //   b) mode 不是 full（增量/部分重算）
+    {
+      const partial = writeJson('baseline-partial.json', { commit: SHA, mode: 'partial', segments: { storage: { killed: 100 } } })
+      assert.throws(() => readKilledBaseline(partial, { commit: SHA }), /mode 必须是/, 'mode 非 full 必须抛')
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: partial })
+      assert.strictEqual(r.code, 1, `mode=partial 的基线必须 exit 1，实际 ${r.code}：${r.text}`)
+    }
+    //   c) 带 reuse 痕迹（上一轮 artifact / 增量结果）
+    {
+      const reused = writeJson('baseline-reuse.json', { commit: SHA, mode: 'full', reuse: {}, segments: { storage: { killed: 100 } } })
+      assert.throws(() => readKilledBaseline(reused, { commit: SHA }), /疑似上一轮 artifact/, '带 reuse 字段的基线必须抛')
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: reused })
+      assert.strictEqual(r.code, 1, `带 reuse 字段的基线必须 exit 1，实际 ${r.code}：${r.text}`)
+    }
+    //   d) 本轮 commit 缺失（GITHUB_SHA 未设置）⇒ 无法证明同 commit
+    {
+      assert.throws(() => readKilledBaseline(baseline, {}), /GITHUB_SHA/, '缺本轮 commit 时必须抛')
+      const r = invoke({ [KILLED_BASELINE_ENV]: baseline })
+      assert.strictEqual(r.code, 1, `GITHUB_SHA 缺失时必须 exit 1，实际 ${r.code}：${r.text}`)
+      assert.ok(r.err.includes('GITHUB_SHA'), 'stderr 必须点名 GITHUB_SHA：' + r.err)
+    }
+    //   e) 容忍值非法：只认非负整数（负数等于反向放宽、1.5/1e3 会让判据变形）
+    for (const bad of ['-1', '1.5', '1e3', 'x', ' 9.0']) {
+      assert.throws(() => resolveKilledTolerance(bad), /必须是非负整数/, `容忍值 ${JSON.stringify(bad)} 必须抛`)
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: baseline, [KILLED_TOLERANCE_ENV]: bad })
+      assert.strictEqual(r.code, 1, `容忍值 ${JSON.stringify(bad)} 必须 exit 1，实际 ${r.code}：${r.text}`)
+    }
+    // 未设置 / 空串 ⇒ 0（缺省不放大容忍）
+    assert.strictEqual(resolveKilledTolerance(undefined), 0, '未设置容忍值 ⇒ 0')
+    assert.strictEqual(resolveKilledTolerance('  '), 0, '空白容忍值 ⇒ 0')
+    assert.strictEqual(resolveKilledTolerance('10'), 10, '合法容忍值必须原样解析')
+    //   f) 本段不在基线的 segments 里 ⇒ 无法比较 ⇒ 红（不接受「没比到就算通过」）
+    {
+      const noSeg = writeJson('baseline-no-seg.json', { commit: SHA, mode: 'full', segments: { 'other-seg': { killed: 100 } } })
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: noSeg })
+      assert.strictEqual(r.code, 1, `基线不含本段必须 exit 1，实际 ${r.code}：${r.text}`)
+      assert.ok(r.err.includes('本段不在 killed 基线'), 'stderr 必须点名段名不在基线：' + r.err)
+    }
+    //   g) 基线变量被显式置空串 ⇒ 不得当成「未启用」（空值不等于关闭）
+    {
+      const r = invoke({ GITHUB_SHA: SHA, [KILLED_BASELINE_ENV]: '   ' })
+      assert.strictEqual(r.code, 1, `基线变量为空串必须 exit 1，实际 ${r.code}：${r.text}`)
+      assert.ok(r.err.includes('不能为空串'), 'stderr 必须说明空串不等于不启用：' + r.err)
+    }
+    console.log('✅ C10-021 killed 下降判据断言通过（默认关闭不生效 / 100→90 判红 / 容忍 10 不红·9 红 / 跨 commit·mode·reuse·缺 SHA·非法容忍值 全部 fail-closed）')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+// C1 回归（闸门 B / 复审 B）：readKilledBaseline 单 fd 读——FIFO 不阻塞、上限在 fstat 阶段早拒、
+// 失败路径不漏 fd。三条都直接打在 fd 路径上，任一退化都会在这里红。
+{
+  const { readKilledBaseline } = require('./scripts/mutation-guard.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'killed-baseline-c1-'))
+  try {
+    // a) FIFO：单开只读会阻塞到出现写端；O_NONBLOCK 让 open 立即返回，随后按非普通文件拒绝
+    const mkfifo = ['/usr/bin/mkfifo', '/bin/mkfifo'].find(p => fs.existsSync(p))
+    let fifoChecked = false
+    if (mkfifo) {
+      const fifo = path.join(dir, 'baseline.fifo')
+      spawnSync(mkfifo, [fifo], { timeout: 5000 })
+      const t0 = Date.now()
+      assert.throws(() => readKilledBaseline(fifo, { maxFileBytes: 1024 }), /不是普通文件/, 'FIFO 必须按非普通文件拒绝')
+      assert.ok(Date.now() - t0 < 2000, 'FIFO 读取不得阻塞（必须带 O_NONBLOCK）')
+      fifoChecked = true
+    }
+    // b) 上限：必须在 fstat 阶段拒绝，不得先把整份文件读进内存再拒（复审 B 指出此前删掉
+    //    `stat.size > maxFileBytes` 仍全绿）。用 monkey-patch 观察 readFileSync 有没有被调用。
+    const big = path.join(dir, 'big.json')
+    fs.writeFileSync(big, 'x'.repeat(4096))
+    const realRead = fs.readFileSync
+    let readCalled = false
+    fs.readFileSync = function (...args) { readCalled = true; return realRead.apply(fs, args) }
+    try {
+      assert.throws(() => readKilledBaseline(big, { maxFileBytes: 1024 }), /基线文件过大/, '超限文件必须拒绝')
+    } finally {
+      fs.readFileSync = realRead
+    }
+    assert.strictEqual(readCalled, false, '超限必须在 fstat 阶段拒绝，不得先读到内存')
+    // c) fd 不泄漏：连续 50 次「open 后失败」的路径，打开的 fd 数不得增长。
+    //    /proc/self/fd 只有 Linux 有；别的宿主跳过而不是崩（复审 B 的守卫建议）。
+    const fdDir = '/proc/self/fd'
+    let fdChecked = false
+    if (fs.existsSync(fdDir)) {
+      const noMode = path.join(dir, 'no-mode.json')
+      fs.writeFileSync(noMode, JSON.stringify({ commit: 'x', segments: {} }))
+      const before = fs.readdirSync(fdDir).length
+      for (let i = 0; i < 50; i++) {
+        assert.throws(() => readKilledBaseline(noMode, { maxFileBytes: 1024 }), /mode/, '缺 mode 必须拒绝')
+      }
+      const after = fs.readdirSync(fdDir).length
+      assert.ok(after - before <= 2, `连续失败路径不得漏 fd：${before} → ${after}`)
+      fdChecked = true
+    }
+    const skippedNote = [fifoChecked ? '' : 'FIFO（无 mkfifo）', fdChecked ? '' : 'fd 泄漏（无 /proc/self/fd）'].filter(Boolean).join('、')
+    console.log(`✅ C1 回归：上限早拒 + ${fifoChecked ? 'FIFO 不阻塞' : ''}${fifoChecked && fdChecked ? ' + ' : ''}${fdChecked ? '失败路径不漏 fd' : ''}${skippedNote ? `（跳过：${skippedNote}）` : ''}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 }
 console.log(`\n🎉 test_mutation_json.js 全部通过（${pass} 项）`)

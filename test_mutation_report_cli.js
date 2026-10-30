@@ -6,6 +6,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { execFileSync, spawnSync } = require('node:child_process')
+// YAML `run: |` 正文提取的唯一实现（C5-044：原先两份副本的规则已经分叉，见 test/_yaml.js 头注释）。
+const { runBodyOf } = require('./test/_yaml')
 
 const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 
@@ -40,17 +42,36 @@ const limitOf = (seg) => {
   return ms === undefined ? '—' : `${Math.round(ms / 1000)}s`
 }
 
+// 宿主 env 剥离（C5-043）：本套件会读的门禁注入变量若由调用方 shell 导出，**对照跑**会变成假红——
+// 例如在 `export MUTATION_RUN_STARTED_AT=…` 的 shell 里跑，场景 8/9/10 的「关闸即放行」对照跑会被
+// 第③层「早于本轮运行起点」拦下，而报错说「闸门没关」；场景 10 的「未注入必须放行」同样必红。
+// 所以默认**不继承**这些变量，需要注入的用例走 runCliAtRunStart 显式给值；新增会改判据的 env 必须
+// 加进这个清单（清单是唯一入口，散在各调用点的 delete 就是下一个漏点——场景 20 原先只有它自己删）。
+const HOST_ENV_STRIP = ['MUTATION_RUN_STARTED_AT']
+function cleanEnv (extra = {}) {
+  const env = { ...process.env }
+  for (const key of HOST_ENV_STRIP) delete env[key]
+  return Object.assign(env, extra)
+}
+
 function runCli (args, opts = {}) {
   try {
     const stdout = execFileSync(process.execPath, [SCRIPT, ...args], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      ...opts
+      ...opts,
+      // 覆盖点放在 ...opts 之后：调用方给的 env 是**增量**，宿主同名的门禁变量先被剥掉再合并。
+      env: cleanEnv(opts.env)
     })
     return { code: 0, stdout, stderr: '' }
   } catch (e) {
     return { code: e.status, stdout: e.stdout || '', stderr: e.stderr || '' }
   }
+}
+
+// 「本轮运行起点」唯一允许显式注入的入口（场景 10 用它证明第③层真的在起作用）。
+function runCliAtRunStart (args, iso, opts = {}) {
+  return runCli(args, { ...opts, env: { ...(opts.env || {}), MUTATION_RUN_STARTED_AT: iso } })
 }
 
 // stryker json reporter 的必填字段（权威来源：本仓已安装的 mutation-testing-report-schema）：
@@ -97,6 +118,30 @@ function schemaReport (seg, mutants) {
   const r = runCli(['/nonexistent/path/xyz123'])
   assert.strictEqual(r.code, 1, '不存在的目录应 exit 1')
   assert.ok(r.stderr.includes('不存在') || r.stderr.includes('不可访问'), '应输出目录不存在错误')
+}
+
+// 场景 2b（C10-058）：参数是普通文件（存在但不是目录）→ exit 1 + 「不是目录」。
+// 这条分支只在 analyze() 里判定（main 的 existsSync 前置检查放行普通文件），改前改后都必须由
+// 「抛错 → main 的 catch → exit 1」这条路收尾：库函数不再自己 process.exit，CLI 行为逐字不变。
+// C4：夹具落点必须是**不可预测**的临时路径。旧写法 `path.join(os.tmpdir(), 'xbk-mut-report-notdir-<pid>')`
+// 名字可预测、写盘也不带 O_EXCL，同机任何进程都能抢先占位：先建同名目录 ⇒ 这里 `writeFileSync` EISDIR
+// 直接炸（用例还没跑到断言就崩），先建同名符号链接 ⇒ 写入被引到别人的目标文件上。CodeQL 据此判
+// 「Insecure creation of file in the os temp dir」。改为 mkdtempSync 先拿唯一目录（0700），普通文件落在里面。
+{
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-notdir-'))
+  const tmpFile = path.join(tmpDir, 'plain-file')
+  try {
+    fs.writeFileSync(tmpFile, 'x')
+    // 前置断言：夹具必须真是普通文件。否则（路径不存在 ⇒ 走「不存在」分支）下面的 `不是目录` 断言
+    // 会在错误的分支上给出无关的失败文本，或者更糟——两条分支文案都变的时候假绿。
+    assert.ok(fs.statSync(tmpFile).isFile(), '夹具必须是普通文件（不得被同名目录顶替；本断言跟随符号链接，不覆盖链接形态）')
+    const r = runCli([tmpFile])
+    assert.strictEqual(r.code, 1, '普通文件应 exit 1')
+    assert.ok(r.stderr.includes('不是目录'), `stderr 应点名「不是目录」，实际：${r.stderr}`)
+    assert.ok(r.stderr.includes('用法'), '仍应带用法提示')
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
 }
 
 // 场景 3：有效目录 + 全部分段的 mutation.json → exit 0 + 输出 markdown
@@ -372,7 +417,7 @@ function schemaReport (seg, mutants) {
     assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
 
     // 同一夹具 + 关闭闸门 → 必须放行：排除「其它校验碰巧拦下」的假阳性解释
-    const rOff = runCli([tmp], { env: { ...process.env, MUTATION_REPORT_MAX_SKEW_MS: '0' } })
+    const rOff = runCli([tmp], { env: { MUTATION_REPORT_MAX_SKEW_MS: '0' } })
     assert.strictEqual(rOff.code, 0, `关闭新鲜度闸门后同一夹具应放行，stderr：${rOff.stderr}`)
     assert.ok(rOff.stdout.includes('🧬 变异测试日报'), '闸门关闭时应正常输出日报正文')
   } finally {
@@ -403,7 +448,7 @@ function schemaReport (seg, mutants) {
       `错误应逐段给出距今小时数，实际 stderr：${r.stderr}`)
     assert.ok(!r.stdout.includes('🧬 变异测试日报'), '拒绝发布时不得输出日报正文')
 
-    const rOff = runCli([tmp], { env: { ...process.env, MUTATION_REPORT_MAX_SKEW_MS: '0' } })
+    const rOff = runCli([tmp], { env: { MUTATION_REPORT_MAX_SKEW_MS: '0' } })
     assert.strictEqual(rOff.code, 0, `关闭闸门后同一夹具应放行（排除别处顺手拦下），stderr：${rOff.stderr}`)
     assert.ok(rOff.stdout.includes('🧬 变异测试日报'), '闸门关闭时应正常输出日报正文')
   } finally {
@@ -431,7 +476,7 @@ function schemaReport (seg, mutants) {
     assert.strictEqual(noRunStart.code, 0,
       `未注入本轮起点时 11h 的全体报告在阈值内，必须放行（否则本地手工运行日报会误红），stderr：${noRunStart.stderr}`)
 
-    const r = runCli([tmp], { env: { ...process.env, MUTATION_RUN_STARTED_AT: new Date().toISOString() } })
+    const r = runCliAtRunStart([tmp], new Date().toISOString())
     assert.notStrictEqual(r.code, 0, '注入本轮运行起点后，同日跨轮回填必须拒绝发布')
     assert.ok(r.stderr.includes('早于本轮运行起点'), `错误应点名「早于本轮运行起点」，实际 stderr：${r.stderr}`)
     assert.ok(r.stderr.includes('11 小时'), `错误应给出折算小时数，实际 stderr：${r.stderr}`)
@@ -523,16 +568,10 @@ function schemaReport (seg, mutants) {
   // ① 执行级验证：桩 gh 实跑 run 段，覆盖成功 / 空值 / 不可解析 / API 失败四条分支。
   //    纯文本断言会被「删掉空值守卫但留下 API 失败文案」骗过（Sourcery 指出），必须看真实退出码与落盘值。
   //    逐行解析 run: | 块（不用 /^(\s*)run: \|/ + [\s\S]*$/ 这类嵌套量词，Sonar S8786 会判超线性回溯）。
-  const resolveLines2 = resolve.text.split('\n')
-  const runLineIdx = resolveLines2.findIndex(l => l.trim() === 'run: |')
-  assert.ok(runLineIdx >= 0, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
-  const runIndent = resolveLines2[runLineIdx].search(/\S/)
-  const body = []
-  for (let i = runLineIdx + 1; i < resolveLines2.length; i++) {
-    if (resolveLines2[i].trim() === '') { body.push(''); continue }
-    if (resolveLines2[i].search(/\S/) <= runIndent) break
-    body.push(resolveLines2[i].slice(runIndent + 2))
-  }
+  // 正文提取走 test/_yaml.js 的唯一实现（C5-044）：本处需要「保留注释与空行 + 相对缩进」，故显式给
+  // dedent；另一处（剥离步骤）需要「注释不算证据 + 遇空行即停」，差异只体现在选项上，不再各写一份循环。
+  const body = runBodyOf(resolve.text, { dedent: true })
+  assert.ok(body !== null, `解析步骤必须有 run: | 块，实际：${resolve.text}`)
   const script = body.join('\n').trimEnd()
   assert.ok(script.includes('gh api'), `run 段必须实际调用 gh api，实际：${script}`)
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-resolver-'))
@@ -728,7 +767,7 @@ function schemaReport (seg, mutants) {
       mutantOf({ id: '0', statusReason: 'x'.repeat(5000) })
     ])))
     const before = fs.readFileSync(p)
-    const r = runCli(['--strip', p], { env: { ...process.env, XBK_MUTATION_REPORT_MAX_BYTES: '16' } })
+    const r = runCli(['--strip', p], { env: { XBK_MUTATION_REPORT_MAX_BYTES: '16' } })
     assert.notStrictEqual(r.code, 0, '超过预读上限必须 exit 非 0')
     assert.ok(r.stderr.includes('超过预读上限'), `stderr 应说明超限根因，实际：${r.stderr}`)
     assert.deepStrictEqual(fs.readFileSync(p), before, '失败时原文件必须逐字节不变')
@@ -777,16 +816,8 @@ function schemaReport (seg, mutants) {
     // 取 `run: |` 之后的 shell 正文（缩进深于 run: 的行）作为唯一判据：注释不算证据——
     // 注释行必须在这里剔除，否则把活动命令整行改成 `# node scripts/…` 后正文里仍带着命令原文，
     // `includes('node scripts/mutation-report.js --strip')` 会被注释满足（CI 不再剥离而套件全绿）。
-    const stepLines = text.split('\n')
-    const runAt = stepLines.findIndex(l => l.trim() === 'run: |')
-    assert.ok(runAt >= 0, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
-    const runIndent = stepLines[runAt].length - stepLines[runAt].trimStart().length
-    const shellBody = []
-    for (let i = runAt + 1; i < stepLines.length; i++) {
-      if (stepLines[i].trim() === '' || (stepLines[i].length - stepLines[i].trimStart().length) <= runIndent) break
-      if (stepLines[i].trim().startsWith('#')) continue // shell 注释不是证据
-      shellBody.push(stepLines[i])
-    }
+    const shellBody = runBodyOf(text, { skipComments: true, stopAtBlank: true })
+    assert.ok(shellBody !== null, '剥离步骤必须以 `run: |` 执行 shell（否则无从核对剥离目标）')
     const shell = shellBody.join('\n')
     assert.ok(shell.includes('reports/mutation/mutation.json'), '剥离必须覆盖 stryker 的 mutation.json')
     assert.ok(!shell.includes('reports/inc-'),
@@ -1146,8 +1177,8 @@ globalThis.fetch = async function (url, opts) {
   throw new Error('unexpected fetch: ' + method + ' ' + url)
 }
 `)
-    const env = { ...process.env, GITHUB_TOKEN: 'stub-token', GITHUB_REPOSITORY: 'owner/repo', STUB_CALLS_FILE: callsPath, STUB_TODAY: today, STUB_YESTERDAY: yesterday }
-    delete env.MUTATION_RUN_STARTED_AT // 夹具刚写盘 ⇒ 新鲜度闸门用默认 12h 即可，别让外部注入的起点判定干扰
+    // cleanEnv 统一剥离宿主注入（C5-043）：夹具刚写盘 ⇒ 新鲜度闸门用默认 12h 即可，别让外部注入的起点判定干扰。
+    const env = cleanEnv({ GITHUB_TOKEN: 'stub-token', GITHUB_REPOSITORY: 'owner/repo', STUB_CALLS_FILE: callsPath, STUB_TODAY: today, STUB_YESTERDAY: yesterday })
     // 用 spawnSync 而不是 runCli（execFileSync）：成功路径也要拿到 stderr（warn 就在那里），
     // execFileSync 正常返回时只给 stdout，会把「warn 有没有打出来」这条断言变成恒真。
     const r = spawnSync(process.execPath, ['-r', stubPath, SCRIPT, tmp, '--issue'], { encoding: 'utf8', env })
