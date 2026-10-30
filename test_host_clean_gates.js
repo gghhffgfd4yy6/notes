@@ -21,6 +21,11 @@ const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
 const probeEnv = (extra) => {
   const env = { ...process.env, ...(extra || {}) }
   delete env.XBK_MUTATION_CHILD
+  // CI 的「全量单元测试」步骤会设 SKIP_SUITES（真实套件名），而夹具里的 test_suites.js 只有
+  // `SUITES: []` ⇒ 若继承该变量，run_unit_tests.js 会先炸「SKIP_SUITES 含不存在的套件」并 exit 1，
+  // 永远到不了本用例要观察的检查点（本机不设该变量所以没暴露）。夹具环境必须自洽：与
+  // XBK_MUTATION_CHILD 同口径，不继承外部调度变量。
+  delete env.SKIP_SUITES
   return env
 }
 // C5-022：harness 必须「逐条捕获」而不是裸调用。旧实现是 `fn(); checks++; console.log('✅')`——
