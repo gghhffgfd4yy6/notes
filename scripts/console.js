@@ -30,6 +30,7 @@ const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, re
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_KEYS, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
 const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
+const { removeStaleTombstoneFile } = require('../xbk_message_store') // C3-013：清残留墓碑（实现与注释见 store）
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
 // 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
 const FilterStore = require('../xbk_filter_store')
@@ -4384,13 +4385,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
-          if (plans.messages.seenText !== undefined &&
-              !writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) {
-            abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
-            return
-          }
+          // C3-013：备份不含判重历史 → 清掉残留 .seen.json（已入 rollback 备份，响应带 imported.dedupCleared）
+          if (plans.messages.seenText !== undefined) {
+            if (!writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) { abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' }); return }
+            imported.dedup = true
+          } else if (removeStaleTombstoneFile(fs, seenPath)) imported.dedupCleared = true
           imported.messages = plans.messages.count
-          if (plans.messages.seenText !== undefined) imported.dedup = true
         }
         if (plans.settings) {
           const next = {
