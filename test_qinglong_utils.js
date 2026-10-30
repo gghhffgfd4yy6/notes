@@ -349,7 +349,35 @@ const deps = async (spec) => {
   })
   out.deps.rebuildTimeout = await deps({
     bare: { got: 'ok', re2: 'dlopen' },
-    plan: [{}, { result: { status: null, signal: 'SIGTERM' } }]
+    plan: [{}, { result: { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' } } }]
+  })
+  // CR-07：两个超时变量都只接受「正的安全整数」。0.5 会让 spawnSync 的 validateTimeout 在启动 npm
+  // 之前抛 ERR_OUT_OF_RANGE（旧实现照收 ⇒ 依赖恢复直接失败，而不是回退默认上限）；超出 uint32 的
+  // 「安全整数」同样抛 ERR_OUT_OF_RANGE。三例都必须回退默认值并走完恢复流程。
+  out.deps.installTimeoutFractional = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    env: { XBK_NPM_TIMEOUT_MS: '0.5' },
+    plan: [{ result: { status: 0 }, after: 'installed' }]
+  })
+  out.deps.installTimeoutOverflow = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    env: { XBK_NPM_TIMEOUT_MS: '4294967296' },
+    plan: [{ result: { status: 0 }, after: 'installed' }]
+  })
+  out.deps.rebuildTimeoutFractional = await deps({
+    bare: { got: 'ok', re2: 'dlopen' },
+    env: { XBK_NPM_REBUILD_TIMEOUT_MS: '0.5' },
+    plan: [{ result: { status: 0 } }, { result: { status: 0 }, after: 'installed' }]
+  })
+  // CR-10：被系统信号杀掉（status=null + signal，没有 ETIMEDOUT）不是超时——旧实现把 signal 非空
+  // 一律当超时，OOM killer / 外部 kill 会被误报成「超时到了，去调大上限」。
+  out.deps.installSignalKilled = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    plan: [{ result: { status: null, signal: 'SIGKILL' } }]
+  })
+  out.deps.rebuildSignalKilled = await deps({
+    bare: { got: 'ok', re2: 'dlopen' },
+    plan: [{ result: { status: 0 } }, { result: { status: null, signal: 'SIGKILL' } }]
   })
   // C5-060：旧直调副本里有两个维度是子进程探针原先没覆盖的（auto-install 未开、npm 安装非零退出）。
   // 去重前先把它们迁进来，否则删掉副本就等于丢覆盖（实测：把生产里的「未设置自动安装即抛错」整段删掉，
@@ -469,6 +497,28 @@ const deps = async (spec) => {
     /npm rebuild re2 超过 600000ms 未完成/, '重建超时必须点名 npm rebuild re2 与被超时的上限值')
   assert.match(String(d.deps.rebuildTimeout.thrown && d.deps.rebuildTimeout.thrown.message),
     /XBK_NPM_REBUILD_TIMEOUT_MS/, '重建超时文案必须给出可调的上限环境变量')
+
+  // --- CR-07：超时变量只接受正的安全整数（小数/超界值回退默认，否则 spawnSync 启动 npm 前就抛 ERR_OUT_OF_RANGE）---
+  assert.strictEqual(d.deps.installTimeoutFractional.spawns[0].timeout, 120000,
+    'XBK_NPM_TIMEOUT_MS=0.5 必须回退默认 120000（spawnSync 只接受整数，不能把小数照收）')
+  assert.strictEqual(d.deps.installTimeoutFractional.thrown, null,
+    '小数超时不得让依赖恢复失败：回退默认后应正常走完安装与恢复')
+  assert.strictEqual(d.deps.installTimeoutOverflow.spawns[0].timeout, 120000,
+    '超出 spawnSync uint32 上限的超时（4294967296）同样必须回退默认 120000')
+  assert.strictEqual(d.deps.rebuildTimeoutFractional.spawns[1].timeout, 600000,
+    'XBK_NPM_REBUILD_TIMEOUT_MS=0.5 必须回退默认 600000（重建同样只接受整数）')
+  assert.strictEqual(d.deps.rebuildTimeoutFractional.thrown, null,
+    '重建超时的小数同样不得让依赖恢复失败')
+
+  // --- CR-10：系统信号终止（status=null + signal，无 ETIMEDOUT）不得谎报成超时 ---
+  assert.match(String(d.deps.installSignalKilled.thrown && d.deps.installSignalKilled.thrown.message),
+    /被系统信号 SIGKILL 终止/, 'SIGKILL 必须单独报「被系统信号终止」，不得只说「退出码 null」')
+  assert.doesNotMatch(String(d.deps.installSignalKilled.thrown && d.deps.installSignalKilled.thrown.message),
+    /超过 \d+ms 未完成/, 'SIGKILL 不是超时：文案不得报「超过 N ms 未完成」并诱导调大上限')
+  assert.match(String(d.deps.rebuildSignalKilled.thrown && d.deps.rebuildSignalKilled.thrown.message),
+    /npm rebuild re2 被系统信号 SIGKILL 终止/, '重建被信号终止同样必须点名信号，不得报成超时')
+  assert.doesNotMatch(String(d.deps.rebuildSignalKilled.thrown && d.deps.rebuildSignalKilled.thrown.message),
+    /超过 \d+ms 未完成/, '重建被信号终止不得报「超过 N ms 未完成」')
 
   // --- C10-037：package.json 的 engines.node 必须与入口的受支持范围同口径 ---
   // 旧值 `>=22.22.2` 放行 23.x / 25.x / 24.0–24.14，而 re2 在这些版本上构建必然失败：

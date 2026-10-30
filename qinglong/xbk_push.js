@@ -165,19 +165,26 @@ function sanitizeModuleName (name) {
 const NPM_INSTALL_TIMEOUT_MS = 120000
 const NPM_REBUILD_TIMEOUT_MS = 600000
 
-// 只接受正数；未设置/空串/非数字/非正数一律回退默认值（配置写错不得让子进程无超时）。
+// 只接受「正的安全整数」；未设置/空串/非数字/非正数/小数/超界值一律回退默认值（配置写错不得让子进程无超时）。
+// CR-07：spawnSync 的 timeout 只接受整数（Node 的 validateTimeout 按 uint32 校验），0.5 这类小数会在
+// **启动 npm 之前**抛 ERR_OUT_OF_RANGE —— 于是「配置写错」变成「依赖恢复直接失败」，而不是按注释回退默认值。
+// 上界同样按 spawnSync 的 uint32 取 0xFFFFFFFF：更大的「安全整数」照样抛 ERR_OUT_OF_RANGE。
+const SPAWN_TIMEOUT_MAX_MS = 0xFFFFFFFF
 function positiveTimeout (env, name, fallback) {
   const raw = env && env[name]
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
   const value = Number(raw)
-  return Number.isFinite(value) && value > 0 ? value : fallback
+  if (!Number.isSafeInteger(value) || value <= 0 || value > SPAWN_TIMEOUT_MAX_MS) return fallback
+  return value
 }
 
 // spawnSync 超时的形状是 status=null + signal（Node 另给 error.code='ETIMEDOUT'）。必须与
 // 「非零退出」「spawn 自身失败」分开报，否则现场只看到「退出码 null」，既不知是超时也不知能调什么。
+// CR-10：只有 error.code==='ETIMEDOUT' 才是超时——被系统信号杀掉时 status 同样是 null，旧实现把
+// 「signal 非空」一律当超时，OOM killer / 外部 kill 于是被误报成「超时到了，去调大上限」（调大无用）。
 function spawnTimedOut (result) {
   if (!result || result.status !== null) return false
-  return Boolean(result.signal) || Boolean(result.error && result.error.code === 'ETIMEDOUT')
+  return Boolean(result.error && result.error.code === 'ETIMEDOUT')
 }
 
 function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env = process.env, lockExists = () => fs.existsSync(path.join(ROOT, 'package-lock.json')) } = {}) {
@@ -240,6 +247,8 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   // 就只剩「spawnSync npm ETIMEDOUT」，看不出该调哪个上限。
   if (spawnTimedOut(install)) throw new Error(`npm ${installVerb} 超过 ${installTimeout}ms 未完成，已终止（网络/镜像卡住时先排查；确属慢环境可调大 XBK_NPM_TIMEOUT_MS 后重试）`)
   if (install.error) throw install.error
+  // CR-10：status=null 但没有 ETIMEDOUT ⇒ 被系统信号终止（OOM killer / 外部 kill），不是超时——调大上限无用，得先查内存与并发。
+  if (install.signal) throw new Error(`npm ${installVerb} 被系统信号 ${install.signal} 终止（不是超时；多为内存不足被 OOM killer 杀掉或外部 kill，先查可用内存与并发进程后重试）`)
   if (install.status !== 0) throw new Error(`npm ${installVerb} 失败，退出码 ${install.status}`)
 
   // 仅当安装后 re2 仍无法加载才恢复：单纯 got 缺失但 re2 正常时，不要求无关的 C++ 构建环境。
@@ -253,6 +262,8 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
     ], { cwd: ROOT, stdio: 'inherit', timeout: rebuildTimeout })
     if (spawnTimedOut(rebuild)) throw new Error(`npm rebuild re2 超过 ${rebuildTimeout}ms 未完成，已终止（源码编译较慢；可调大 XBK_NPM_REBUILD_TIMEOUT_MS 后重试，或按 README 预装 re2）`)
     if (rebuild.error) throw rebuild.error
+    // CR-10：同安装路径——信号终止（常见于源码编译时内存耗尽被 OOM killer 杀掉）单独报，不得谎报成超时。
+    if (rebuild.signal) throw new Error(`npm rebuild re2 被系统信号 ${rebuild.signal} 终止（不是超时；源码编译很吃内存，多为 OOM killer 或外部 kill，先查可用内存/交换分区后重试）`)
     if (rebuild.status !== 0) throw new Error(`re2 原生模块恢复失败，退出码 ${rebuild.status}`)
   }
 

@@ -45,14 +45,13 @@ function createApp ({
       return isRegularOrMissing(filePath)
     },
 
-    // C1-027：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
-    // 而 _writeRunLog / 各类状态文件每写一行都要拼一次路径——旧实现因此每行都重做整套安全检查。
-    // run() 在 init 成功后解析一次并固定到 _cacheDirForRun（单轮内 cache.dir 是静态配置），结束时清空；
-    // 语义不变：run() 之外（如直调 _writeRunLog 的用例）仍每次走 getter，MessageStore.init() 自己
-    // 「校验后目录被换成符号链接 ⇒ 二次求值必须失败」的契约（MS-01）也不受影响。
-    _cacheDirForRun: null,
+    // C1-027/CR-03：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
+    // **每次访问都要重新求值**——「运行期间父目录被换成指向项目外的符号链接」只在求值那一刻可见。
+    // 本 PR 曾把重复求值优化成 run() 里解析一次并钉到 _cacheDirForRun（单轮内 cache.dir 是静态配置），
+    // 代价是轮次内的日志/状态写入不再过 lstat/realpath 校验：写路径会跟着被替换的链接走，符号链接
+    // 防御从「每次写入」降级成「只看启动那一刻」。现撤回该缓存：配置在单轮内静态，目录本身不是。
     _cacheDir () {
-      return this._cacheDirForRun || MessageStore.cacheDir
+      return MessageStore.cacheDir
     },
 
     // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
@@ -1158,8 +1157,8 @@ function createApp ({
       warmupPromise.catch(() => {})
       try {
         MessageStore.init()
-        // C1-027：本轮缓存目录只解析一次（init 已确保目录可用），后续每行日志/状态文件都复用该结果。
-        this._cacheDirForRun = MessageStore.cacheDir
+        // CR-03：不在此处缓存 cacheDir——init 只保证「此刻」目录可用，后续每行日志/状态文件都要
+        // 重新过 getter 的 lstat+realpath 校验（运行期目录被替换成外部符号链接时必须当场失败）。
         checkpoint('cache-init')
         if (!dryRun) await this._warnMissingRe2()
         this._warnLowDisk()
@@ -1928,7 +1927,6 @@ function createApp ({
       // v3.233：flag 兜底 getNotify() 未 resolve 的竞态——controller 尚未创建时主流程已结束，
       // then 回调稍后凭 flag 跳过启动，防止预热请求拖住退出。
         warmupCancelled = true
-        this._cacheDirForRun = null // C1-027：本轮结束即失效，下一轮重新解析（配置/环境可能已变）
         if (warmupController) warmupController.abort()
       }
     }
