@@ -240,17 +240,48 @@ function readKilledBaseline (filePath, options = {}) {
   const maxFileBytes = Number.isFinite(options.maxFileBytes)
     ? options.maxFileBytes
     : resolveMaxReportBytes(process.env.XBK_MUTATION_REPORT_MAX_BYTES)
-  let stat
+  // 单 fd 读（与 scripts/mutation-json.js 的 readGuardedBytes 同一手法）：早先是
+  // `statSync(路径)` 判类型/大小、再 `readFileSync(路径)` 二次查找，于是「检查看到的」与
+  // 「实际读到的」可以是两个不同对象（换 inode / 被追加 / 被换成 FIFO），size 上限随之形同虚设。
+  // 改成一次 openSync + 只对 fd 做 fstat 与读取：类型/大小判定与读入作用于同一个 inode，
+  // 不存在「检查后被换」的窗口（CodeQL js/file-system-race 119）。
+  // O_NONBLOCK：FIFO 单开只读会阻塞到出现写端；加上后 open 立即返回、随后被 fstat 按
+  // 「非普通文件」拒绝，对常规文件无副作用。
+  let fd
   try {
-    stat = fs.statSync(filePath)
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK)
   } catch (err) {
     throw new Error(`基线文件不可读（${filePath}）：${err.message}`)
   }
-  if (!stat.isFile()) throw new Error(`基线不是普通文件（${filePath}）`)
-  if (stat.size > maxFileBytes) throw new Error(`基线文件过大（${stat.size} > ${maxFileBytes} 字节）`)
+  let buf
+  try {
+    let stat
+    try {
+      stat = fs.fstatSync(fd)
+    } catch (err) {
+      throw new Error(`基线文件不可读（${filePath}）：${err.message}`)
+    }
+    if (!stat.isFile()) throw new Error(`基线不是普通文件（${filePath}）`)
+    if (stat.size > maxFileBytes) throw new Error(`基线文件过大（${stat.size} > ${maxFileBytes} 字节）`)
+    try {
+      // 按 fd 读（不再按路径二次查找）：读到的就是上面 fstat 判定的那个对象。
+      buf = fs.readFileSync(fd)
+    } catch (err) {
+      throw new Error(`基线文件不可读（${filePath}）：${err.message}`)
+    }
+    // fstat 之后仍可能被追加（同一 inode 追加不是换文件）：按真正读进来的字节数再判一次，
+    // 上限不能只在「检查时」成立。
+    if (buf.length > maxFileBytes) throw new Error(`基线文件过大（${buf.length} > ${maxFileBytes} 字节）`)
+  } finally {
+    try {
+      fs.closeSync(fd)
+    } catch (err) {
+      // 关闭失败不得覆盖主流程的结果；后果只有 fd 泄漏，且进程随后退出。
+    }
+  }
   let baseline
   try {
-    baseline = JSON.parse(fs.readFileSync(filePath, 'utf8')) // nosemgrep（路径来自显式配置的基线变量）
+    baseline = JSON.parse(buf.toString('utf8'))
   } catch (err) {
     throw new Error(`基线不是合法 JSON（${filePath}）：${err.message}`)
   }

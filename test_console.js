@@ -33,7 +33,7 @@ function sliceTo (source, endAnchor, label) {
   return source.slice(0, end)
 }
 // 按行剥注释（行首 //、*、/* 整行剥掉；行内 // 只在前面没有引号时才算注释起点，
-// 'http://x' 这类字符串不被截断）。要锁「代码里真有这句」的地方把它套在源码上再 includes。
+// 'https://x' 这类字符串不被截断）。要锁「代码里真有这句」的地方把它套在源码上再 includes。
 function codeOf (source) {
   return source.split('\n').map((line) => {
     const trimmed = line.trimStart()
@@ -1899,16 +1899,22 @@ async function filterRuleApiTests () {
       const candidate = buildSaveCandidate(first.override, ['pingbitime'], draft, ['pingbilouzhu', 'zhanxianlouzhu', 'pingbitime'])
       assert.deepStrictEqual(candidate, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
         '候选必须是「覆盖文件已有字段 + 本次改动字段」，且不得把未改动的代码默认带出去')
-      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+      const saved = await postFilterJson(port, '/api/config/filter', {
         schema: 1, baseRevision: first.revision, filter: candidate
-      })).status, 200)
+      })
+      assert.strictEqual(saved.status, 200)
       const kept = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
       assert.deepStrictEqual(kept.filter, { pingbilouzhu: '屏蔽楼主规则', pingbitime: '6' },
         'A 与改动后的 B 必须同时留在覆盖文件里（这正是本次修复的不变式）')
+      // 下一步的乐观锁基线取自**服务端响应**，不取落盘的覆盖文件：文件内容是这一段的断言对象，
+      // 让它回流进下一个请求体既是 js/file-access-to-http（CodeQL 102）的形状，也把「校验落盘」
+      // 与「驱动下一次写入」耦成一条链。落盘值仍被这句钉住，断言强度不变。
+      const savedRevision = JSON.parse(saved.text).revision
+      assert.strictEqual(kept.revision, savedRevision, '落盘 revision 必须等于响应 revision')
 
       // 第三步：旧行为反例——只提交 B，A 会被整份替换静默删掉（说明本用例确实覆盖此 bug）。
       assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
-        schema: 1, baseRevision: kept.revision, filter: { pingbitime: '7' }
+        schema: 1, baseRevision: savedRevision, filter: { pingbitime: '7' }
       })).status, 200)
       const dropped = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
       assert.deepStrictEqual(Object.keys(dropped.filter), ['pingbitime'], '服务端仍是整份替换：只提交 B 会丢掉 A')
@@ -3288,9 +3294,11 @@ async function main () {
     const src = '// locking && html`<span class="trigger-busy"/\nconst real = 1\n'
     assert.ok(src.includes('trigger-busy'), '裸 includes 会被注释里的原句满足——这正是旧判据的漏洞')
     assert.strictEqual(codeOf(src).includes('trigger-busy'), false, 'codeOf 必须把注释行剥掉')
-    // 行内注释同样不算；字符串里的 // 不得被当成注释起点（'http://x' 要完整保留）
+    // 行内注释同样不算；字符串里的 // 不得被当成注释起点（'https://x' 要完整保留）。
+    // 夹具用 https 而不是 http：这条只测「字符串里的 // 不被截断」，一个字节都没发出去
+    // （无真实网络、无凭证），但也没必要在源码里留明文协议字面量给 S5332 这类规则报。
     assert.strictEqual(codeOf('const a = 1 // busy-badge\n').trim(), 'const a = 1')
-    assert.ok(codeOf("const u = 'http://x/y'\n").includes('http://x/y'), '字符串里的 // 不得被截断')
+    assert.ok(codeOf("const u = 'https://x/y'\n").includes('https://x/y'), '字符串里的 // 不得被截断')
   })
 
   // C5-028：用例级 server 由 harness 收尾——用例提前失败（最后一行 close 没跑到）也不会
@@ -4382,7 +4390,6 @@ async function main () {
     const port = await listen(server)
     // runs 是模块级 Map（跨实例共享），只能比增量——断言「本次没有新记录」。
     const runsBefore = runs.size
-    const lockFile = path.join(dir, 'console-trigger.lock')
     const lastAcceptFile = path.join(dir, 'console-lastaccept.json')
     const viaQueryUrl = '?token=' + encodeURIComponent(TOKEN)
     // 四条端点各配一个「鉴权之后必然确定的」分支：导入=坏 JSON、触发=非法动作、取消=不存在的 id、
@@ -4412,8 +4419,12 @@ async function main () {
       }
       // 拒绝发生在副作用之前：没有运行记录（不 spawn）、没有触发锁、没有重放帧。
       assert.strictEqual(runs.size, runsBefore, '被拒请求不得创建运行记录')
-      assert.strictEqual(fs.existsSync(lockFile), false, '被拒请求不得取触发锁')
-      assert.strictEqual(fs.existsSync(lastAcceptFile), false, '被拒请求不得写重放帧')
+      // 用一次 readdir 快照断言「一个文件都没留下」，代替 `existsSync(lockFile)` /
+      // `existsSync(lastAcceptFile)`：本用例随后就要按同一路径写重放帧（下面那行 writeFileSync），
+      // 「先判存在、再按同一路径写」正是 js/file-system-race（CodeQL 121）的 check-then-use 形状，
+      // 而报告方判的其实是「检查看到的」与「实际写到的」可能不是同一个对象。快照同时更强：
+      // 触发锁、重放帧之外任何意料外的落盘都算失败。
+      assert.deepStrictEqual(fs.readdirSync(dir), [], '被拒请求不得在 stateDir 留下任何文件（触发锁 / 重放帧 / 运行记录）')
       // 反向：Bearer 照常通过鉴权（各自走到鉴权之后的确定性分支，不 spawn）。
       const importBadJson = await request(port, 'POST', '/api/backup/import', {
         token: TOKEN,
@@ -11055,4 +11066,44 @@ async function runSuite (mainPromise) {
   return finishSuite()
 }
 
-runSuite(main())
+// 收尾自身抛出（finishSuite 里的清点 / 强退闸）也必须让进程非 0：这就是 Sonar S9383 指的
+// dangling promise。不接的话拒约只落到 unhandledRejection 上，而它的默认行为随 node 版本与
+// `--unhandled-rejections` 取值而变（warn 档退出码仍是 0）⇒ CI 上会退化成「跑完了但没判据」。
+function handleSuiteFinishError (e) {
+  process.exitCode = 1
+  // 与 runSuite 内部同口径留痕：收尾都炸了，汇总行打不出来，失败清单是唯一线索。
+  failed++
+  failedNames.push('套件收尾异常（finishSuite 抛出，未打出汇总）')
+  console.error('套件收尾异常:', failureText(e))
+}
+
+// S15 回归（闸门 A）：此前这条 .catch 只有口头探针（注入 throw 后看 exit 1），没有committed 断言。
+// 把处理器提成具名函数后在这里直接验：置退出码 1 + 失败计数 +1 + 清单留痕，三项缺一即红。
+ok('S15 回归：收尾异常处理器置退出码 1 并在失败清单留痕', () => {
+  const savedExit = process.exitCode
+  const savedFailed = failed
+  const savedLen = failedNames.length
+  const savedError = console.error
+  try {
+    process.exitCode = 0
+    console.error = () => {}
+    handleSuiteFinishError(new Error('probe-s15-handler'))
+    assert.strictEqual(process.exitCode, 1, '收尾异常必须把退出码置 1')
+    assert.strictEqual(failed, savedFailed + 1, '失败计数必须 +1')
+    assert.ok(failedNames.slice(savedLen).some(n => n.includes('套件收尾异常')), '失败清单必须留痕')
+  } finally {
+    process.exitCode = savedExit
+    failed = savedFailed
+    failedNames.length = savedLen
+    console.error = savedError
+  }
+})
+
+// S15 接线：handler 有了，接线也必须锁住——退回 .catch(() => {}) 时上面的用例照样绿。
+ok('S15 接线：runSuite(main()) 必须接到 handleSuiteFinishError', () => {
+  const src = fs.readFileSync(__filename, 'utf8')
+  assert.match(src, /runSuite\(main\(\)\)\.catch\(handleSuiteFinishError\)/,
+    '收尾必须接到具名 handler；换成空 catch 等于把兜底丢掉')
+})
+
+runSuite(main()).catch(handleSuiteFinishError)
