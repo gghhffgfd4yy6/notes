@@ -349,7 +349,7 @@ const deps = async (spec) => {
   })
   out.deps.rebuildTimeout = await deps({
     bare: { got: 'ok', re2: 'dlopen' },
-    plan: [{}, { result: { status: null, signal: 'SIGTERM' } }]
+    plan: [{}, { result: { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' } } }]
   })
   // CR-07：两个超时变量都只接受「正的安全整数」。0.5 会让 spawnSync 的 validateTimeout 在启动 npm
   // 之前抛 ERR_OUT_OF_RANGE（旧实现照收 ⇒ 依赖恢复直接失败，而不是回退默认上限）；超出 uint32 的
@@ -368,6 +368,16 @@ const deps = async (spec) => {
     bare: { got: 'ok', re2: 'dlopen' },
     env: { XBK_NPM_REBUILD_TIMEOUT_MS: '0.5' },
     plan: [{ result: { status: 0 } }, { result: { status: 0 }, after: 'installed' }]
+  })
+  // CR-10：被系统信号杀掉（status=null + signal，没有 ETIMEDOUT）不是超时——旧实现把 signal 非空
+  // 一律当超时，OOM killer / 外部 kill 会被误报成「超时到了，去调大上限」。
+  out.deps.installSignalKilled = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    plan: [{ result: { status: null, signal: 'SIGKILL' } }]
+  })
+  out.deps.rebuildSignalKilled = await deps({
+    bare: { got: 'ok', re2: 'dlopen' },
+    plan: [{ result: { status: 0 } }, { result: { status: null, signal: 'SIGKILL' } }]
   })
   // C5-060：旧直调副本里有两个维度是子进程探针原先没覆盖的（auto-install 未开、npm 安装非零退出）。
   // 去重前先把它们迁进来，否则删掉副本就等于丢覆盖（实测：把生产里的「未设置自动安装即抛错」整段删掉，
@@ -499,6 +509,16 @@ const deps = async (spec) => {
     'XBK_NPM_REBUILD_TIMEOUT_MS=0.5 必须回退默认 600000（重建同样只接受整数）')
   assert.strictEqual(d.deps.rebuildTimeoutFractional.thrown, null,
     '重建超时的小数同样不得让依赖恢复失败')
+
+  // --- CR-10：系统信号终止（status=null + signal，无 ETIMEDOUT）不得谎报成超时 ---
+  assert.match(String(d.deps.installSignalKilled.thrown && d.deps.installSignalKilled.thrown.message),
+    /被系统信号 SIGKILL 终止/, 'SIGKILL 必须单独报「被系统信号终止」，不得只说「退出码 null」')
+  assert.doesNotMatch(String(d.deps.installSignalKilled.thrown && d.deps.installSignalKilled.thrown.message),
+    /超过 \d+ms 未完成/, 'SIGKILL 不是超时：文案不得报「超过 N ms 未完成」并诱导调大上限')
+  assert.match(String(d.deps.rebuildSignalKilled.thrown && d.deps.rebuildSignalKilled.thrown.message),
+    /npm rebuild re2 被系统信号 SIGKILL 终止/, '重建被信号终止同样必须点名信号，不得报成超时')
+  assert.doesNotMatch(String(d.deps.rebuildSignalKilled.thrown && d.deps.rebuildSignalKilled.thrown.message),
+    /超过 \d+ms 未完成/, '重建被信号终止不得报「超过 N ms 未完成」')
 
   // --- C10-037：package.json 的 engines.node 必须与入口的受支持范围同口径 ---
   // 旧值 `>=22.22.2` 放行 23.x / 25.x / 24.0–24.14，而 re2 在这些版本上构建必然失败：
