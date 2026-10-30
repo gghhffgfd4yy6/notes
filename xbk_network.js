@@ -1,6 +1,6 @@
 'use strict'
 
-// 🌐 Network — 网络请求层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
+// 🌐 Network — 网络请求层（由 xbk_function_v3.js 的组合根 createNetwork 注入，生产每轮都经它发请求）
 // 依赖全部由组合根注入，避免反向 require 主入口及重复单例。
 //
 // net-1：PERMANENT_CODES 目前组合根尚未接线（xbk_function_v3.js 只注入 RETRYABLE_CODES），缺省回落到

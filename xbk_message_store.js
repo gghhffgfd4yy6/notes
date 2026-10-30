@@ -60,7 +60,7 @@ const IDENTITY_INDEX_IDENTITY_PROBE_WINDOW = 2
 // 数组都落在这里），代价上界 8 个位置；更大的数组才退回固定窗口（代价与 n 无关，有界自愈）。
 const IDENTITY_INDEX_PROBE_FULL_MAX = 8
 
-// 💾 MessageStore — 缓存管理层（从 xbk_function_v3.js 独立准备，暂不接入主入口）
+// 💾 MessageStore — 缓存管理层（由 xbk_function_v3.js 的组合根 createMessageStore 注入，生产每轮读写缓存都走它）
 // 依赖全部由组合根注入；不反向 require 主入口，不复制共享单例。
 function createMessageStore ({
   Config,
