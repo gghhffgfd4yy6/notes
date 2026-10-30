@@ -26,6 +26,8 @@ const {
   readAppliedSnapshot,
   resetStoreStateForTests
 } = require('./xbk_filter_store')
+// C10-019：直调收紧入口的用例需要拿到函数本身（走 loadFilterRules 的集成路径看不到收紧分支）。
+const { enforceOwnerOnlyMode } = require('./scripts/owner-only-mode')
 
 // 循环依赖防线：本模块不得在加载链上 require 主入口（xbk_function_v3 → xbk_app → FilterStore）。
 assert.strictEqual(
@@ -593,9 +595,11 @@ test('A3 权限过宽且无法收紧 → 按损坏处理并说明原因（不改
   writeJson(file, { schema: 1, revision: 5, filter: { pingbibiaoti: '权限坏' } })
   const widened = (fs.statSync(file).mode & 0o777) | 0o044
   fs.chmodSync(file, widened)
-  // 模块持有的是同一个 fs 模块对象，方法查找发生在调用时 ⇒ 临时替换即可覆盖 chmod 失败分支。
-  const realChmod = fs.chmodSync
-  fs.chmodSync = () => {
+  // 模块持有的是同一个 fs 模块对象，方法查找发生在调用时 ⇒ 临时替换即可覆盖收紧失败分支。
+  // 注入点必须是 fchmodSync：C10-019 返工后收紧按已校验的 fd 走 fchmod，按路径的 chmodSync
+  // 已经不再被调用——继续拦 chmodSync 会让这条用例变成「什么都没拦到也照绿」。
+  const realFchmod = fs.fchmodSync
+  fs.fchmodSync = () => {
     const err = new Error('EPERM: operation not permitted')
     err.code = 'EPERM'
     throw err
@@ -604,13 +608,91 @@ test('A3 权限过宽且无法收紧 → 按损坏处理并说明原因（不改
   try {
     loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
   } finally {
-    fs.chmodSync = realChmod
+    fs.fchmodSync = realFchmod
   }
   assert.strictEqual(loaded.source, 'corrupt')
   assert.strictEqual(loaded.lastGoodUsed, false)
   assert.match(loaded.error.message, /权限过宽/, `message 必须说明权限过宽：${loaded.error.message}`)
   assert.match(loaded.error.message, /EPERM|无法收紧/, `message 必须说明收紧失败：${loaded.error.message}`)
   assert.strictEqual(fs.statSync(file).mode & 0o777, widened, '收紧失败时文件权限保持原样（本模块不假装成功）')
+})
+
+test('A3/C10-019 覆盖文件是符号链接 → 拒绝收紧，绝不改链接目标（旧实现按路径 chmod 会落到 victim 上）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const victim = path.join(dir, 'victim.json')
+  writeJson(victim, { schema: 1, revision: 3, filter: { pingbibiaoti: '链接目标规则' } })
+  // 构造「victim 权限过宽」：收紧若跟随链接，就会把 victim 改到 0600（= 改了别人的文件）。
+  const widened = (fs.statSync(victim).mode & 0o777) | 0o044
+  fs.chmodSync(victim, widened)
+  const file = filterRulesPaths(dir).file
+  fs.symlinkSync(victim, file)
+
+  const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loaded.source, 'corrupt', '符号链接不是可用的覆盖文件（读路径 O_NOFOLLOW 判 unsafe）')
+  assert.strictEqual(loaded.lastGoodUsed, false)
+  assert.match(String(loaded.error && loaded.error.message), /不可读|符号链接|非普通文件/,
+    `必须说明覆盖文件不可用：${loaded.error && loaded.error.message}`)
+  assert.strictEqual(fs.statSync(victim).mode & 0o777, widened,
+    '链接目标的权限必须原样保留——旧实现 stat/chmod 都跟随链接，会把 victim 收紧成 0600')
+})
+
+// 上面那条走的是 loadFilterRules：静态链接在 readSafeTextResult 就判 unsafe 并直接 corrupt，
+// enforceOwnerOnlyMode 从未被调用 —— 它守的是「读」这一侧，把收紧改回 chmodSync(file) 也照样全绿。
+// 下面两条直调收紧入口，才真正钉住「改的是链接目标还是已校验的 inode」。
+test('C10-019 直调 enforceOwnerOnlyMode：路径本身是符号链接 → ok:false，链接目标权限不变', () => {
+  const dir = makeDir()
+  const victim = path.join(dir, 'victim.json')
+  writeJson(victim, { schema: 1, revision: 3, filter: { pingbibiaoti: '链接目标规则' } })
+  const widened = (fs.statSync(victim).mode & 0o777) | 0o044
+  fs.chmodSync(victim, widened)
+  const link = path.join(dir, 'link.json')
+  fs.symlinkSync(victim, link)
+
+  const result = enforceOwnerOnlyMode(link)
+  assert.strictEqual(result.ok, false, '末级是符号链接：不是可收紧的对象，必须拒绝')
+  assert.match(result.message, /符号链接|非普通文件/, `必须说明拒绝原因：${result.message}`)
+  assert.strictEqual(fs.statSync(victim).mode & 0o777, widened,
+    '链接目标的权限必须原样保留——按路径 chmod 在这一路上会把 victim 改成 0600')
+})
+
+test('C10-019 直调 enforceOwnerOnlyMode：校验通过后路径被换成符号链接 → 收紧只落在已校验的 inode 上，链接目标不动', () => {
+  const dir = makeDir()
+  const file = path.join(dir, 'filter-rules.json')
+  const victim = path.join(dir, 'victim.json')
+  const parked = path.join(dir, 'parked.json')
+  writeJson(file, { schema: 1, revision: 1, filter: { pingbibiaoti: '待收紧' } })
+  writeJson(victim, { schema: 1, revision: 2, filter: { pingbibiaoti: '别人的文件' } })
+  const fileMode = (fs.statSync(file).mode & 0o777) | 0o044
+  fs.chmodSync(file, fileMode)
+  const victimMode = (fs.statSync(victim).mode & 0o777) | 0o044
+  fs.chmodSync(victim, victimMode)
+
+  // 精确复现「校验通过之后、写入之前」这个窗口：真实的 lstat 结果照原样交回（校验看到的仍是
+  // 刚打开的那个普通文件，dev/ino 都对得上），交回之前把路径换成指向 victim 的链接。
+  const realLstat = fs.lstatSync
+  let swapped = false
+  fs.lstatSync = function (target, options) {
+    if (swapped || target !== file) return realLstat.call(fs, target, options)
+    swapped = true
+    const stat = realLstat.call(fs, target, options)
+    fs.renameSync(file, parked)
+    fs.symlinkSync(victim, file)
+    return stat
+  }
+  let result
+  try {
+    result = enforceOwnerOnlyMode(file)
+  } finally {
+    fs.lstatSync = realLstat
+  }
+  assert.strictEqual(swapped, true, '前置：替换窗口必须真的被执行到（否则这条用例什么都没测）')
+  assert.strictEqual(fs.statSync(victim).mode & 0o777, victimMode,
+    '链接目标（victim）权限必须原样保留——按路径 chmod 会跟随链接把 victim 改成 0600，还只报「复检仍为 0664」')
+  assert.strictEqual(fs.statSync(parked).mode & 0o777, 0o600,
+    '收紧必须落在已经校验过的那份 inode 上（路径被搬走后它仍在同一 inode）')
+  assert.deepStrictEqual(result, { ok: true, tightened: true },
+    '收紧对象是已校验的 fd，写入必然作用在它上面 ⇒ 成功；按路径改的实现会返回「复检仍为 0664」')
 })
 
 test('A4 文件删除即作废本目录 lastGood：后续畸形文件不得复活旧规则', () => {

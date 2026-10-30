@@ -26,8 +26,11 @@ function loadApp () {
   }
 }
 
-// 与 re2 的 engines.node（^22.22.2 || ^24.15.0 || >=26.0.0）对齐：--check 和常驻告警
+// 与 package.json / re2 的 engines.node（^22.22.2 || ^24.15.0 || >=26.0.0）对齐：--check 和常驻告警
 // 必须拒绝 23.x、25.x 及 24.0–24.14，不能只检查一个最低版本。
+// C10-037：package.json 的 engines 此前只写 `>=22.22.2`，比 re2 的实际支持范围宽——23.x / 25.x /
+// 24.0–24.14 能装上但 re2 必然构建失败。三处（package.json、package-lock.json、本常量）现已同一口径，
+// 由 test_qinglong_utils.js 的 engines 一致性断言锁住，不允许再各写各的。
 const SUPPORTED_NODE_RANGES = '^22.22.2 || ^24.15.0 || >=26.0.0'
 const NODE_RANGE_MINIMA = [[22, 22, 2], [24, 15, 0]]
 const STABLE_NODE_VERSION_RE = /^v?((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
@@ -153,6 +156,30 @@ function sanitizeModuleName (name) {
 // got 是主 HTTP 依赖；re2 则是用户过滤规则的安全执行引擎。
 // 安装命令刻意使用 --ignore-scripts 防供应链风险，但这也会跳过 re2 原生模块构建；
 // 因此必须显式构建并加载校验，不能只因 got 可用就带着“所有正则规则被跳过”的状态启动。
+//
+// C10-017：两个 npm 子进程的超时上限（此前两处都硬编码 120000）。
+//   · 安装（npm ci / npm install）120s：下载 + 解包，超时通常意味着网络/镜像卡住，快失败更好；
+//   · 重建（npm rebuild re2）走 re2 的官方 install 脚本：取不到预编译包时会现场 node-gyp 编译，
+//     慢机器/ARM 上远超 120s——硬编码会在编译中途杀掉子进程，只报「退出码 null」，看不出是超时。
+// 两个上限都可由环境变量覆盖（长构建、离线镜像、受限带宽等场景），默认值保持向后兼容。
+const NPM_INSTALL_TIMEOUT_MS = 120000
+const NPM_REBUILD_TIMEOUT_MS = 600000
+
+// 只接受正数；未设置/空串/非数字/非正数一律回退默认值（配置写错不得让子进程无超时）。
+function positiveTimeout (env, name, fallback) {
+  const raw = env && env[name]
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+// spawnSync 超时的形状是 status=null + signal（Node 另给 error.code='ETIMEDOUT'）。必须与
+// 「非零退出」「spawn 自身失败」分开报，否则现场只看到「退出码 null」，既不知是超时也不知能调什么。
+function spawnTimedOut (result) {
+  if (!result || result.status !== null) return false
+  return Boolean(result.signal) || Boolean(result.error && result.error.code === 'ETIMEDOUT')
+}
+
 function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env = process.env, lockExists = () => fs.existsSync(path.join(ROOT, 'package-lock.json')) } = {}) {
   // 固定依赖路径只作为兜底：入口不会将外部输入拼入模块或构建路径（两个模块名都是本文件字面量，
   // 且经 sanitizeModuleName 白名单复核——见该函数注释）。
@@ -207,7 +234,11 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
     '--prefix', ROOT
   ]
   if (!useCi) installArgs.push('--no-package-lock')
-  const install = spawnSyncFn(npm, installArgs, { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
+  const installTimeout = positiveTimeout(env, 'XBK_NPM_TIMEOUT_MS', NPM_INSTALL_TIMEOUT_MS)
+  const install = spawnSyncFn(npm, installArgs, { cwd: ROOT, stdio: 'inherit', timeout: installTimeout })
+  // 超时先判：Node 会把 status 置 null 并顺带给出 error(ETIMEDOUT)，若先走 `install.error`
+  // 就只剩「spawnSync npm ETIMEDOUT」，看不出该调哪个上限。
+  if (spawnTimedOut(install)) throw new Error(`npm ${installVerb} 超过 ${installTimeout}ms 未完成，已终止（网络/镜像卡住时先排查；确属慢环境可调大 XBK_NPM_TIMEOUT_MS 后重试）`)
   if (install.error) throw install.error
   if (install.status !== 0) throw new Error(`npm ${installVerb} 失败，退出码 ${install.status}`)
 
@@ -216,9 +247,11 @@ function ensureDependencies ({ requireFn = require, spawnSyncFn = spawnSync, env
   if (re2AfterInstall) {
     if (!isRecoverable(re2AfterInstall)) throw re2AfterInstall
     // `npm rebuild re2` 执行包的官方 install 脚本：优先取带 SHA-256 校验的预编译包，失败才源码构建。
+    const rebuildTimeout = positiveTimeout(env, 'XBK_NPM_REBUILD_TIMEOUT_MS', NPM_REBUILD_TIMEOUT_MS)
     const rebuild = spawnSyncFn(npm, [
       'rebuild', 're2'
-    ], { cwd: ROOT, stdio: 'inherit', timeout: 120000 })
+    ], { cwd: ROOT, stdio: 'inherit', timeout: rebuildTimeout })
+    if (spawnTimedOut(rebuild)) throw new Error(`npm rebuild re2 超过 ${rebuildTimeout}ms 未完成，已终止（源码编译较慢；可调大 XBK_NPM_REBUILD_TIMEOUT_MS 后重试，或按 README 预装 re2）`)
     if (rebuild.error) throw rebuild.error
     if (rebuild.status !== 0) throw new Error(`re2 原生模块恢复失败，退出码 ${rebuild.status}`)
   }
@@ -519,4 +552,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg, nodeVersionWarning, statusCacheDir }
+module.exports = { classifyFailure, classifySummary, runResident, runDryRunOnce, refreshConnections, intervalMs, shouldAutoInstallDependencies, ensureDependencies, retryBackoffMs, runCheck, hasArg, nodeVersionWarning, statusCacheDir, SUPPORTED_NODE_RANGES }

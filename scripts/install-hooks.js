@@ -26,8 +26,23 @@ const HOOKS_DIR = '.githooks'
 // pre-push（npm run test:filter，v3.276 起从 pre-commit 迁来）。
 const HOOK_FILES = ['pre-commit', 'commit-msg', 'pre-push']
 
+// 只认 --verify 一个参数。未知参数一律**拒绝执行**（C10-031）：旧实现用 includes('--verify')
+// 判定模式，`--verfiy` 这类笔误会被静默忽略并落到安装路径、真的写入 core.hooksPath——
+// 调用方以为在做只读自检，实际改了仓库配置。参数白名单 + fail-closed 才能让笔误暴露出来。
+const KNOWN_ARGS = new Set(['--verify'])
+
+function parseArgs (argv) {
+  const unknown = argv.filter(arg => !KNOWN_ARGS.has(arg))
+  if (unknown.length > 0) {
+    console.error(`[hooks] ❌ 未识别参数：${unknown.join(' ')}（可用参数：--verify；不带参数＝安装 core.hooksPath）`)
+    console.error('[hooks]    已拒绝执行（fail-closed）：拼错的 --verify 会落到安装路径并写入 core.hooksPath。')
+    process.exit(2)
+  }
+  return argv.includes('--verify')
+}
+
 // 只读自检模式（--verify）：不写 core.hooksPath、不 chmod、不创建/删除任何文件。
-const VERIFY_ONLY = process.argv.includes('--verify')
+const VERIFY_ONLY = parseArgs(process.argv.slice(2))
 
 // git config --get 的退出码语义：0 = 键存在（值可能是空串）、1 = 键不存在、其它 = 读取失败。
 const GIT_CONFIG_KEY_MISSING = 1
@@ -63,13 +78,78 @@ function isDirectory (target) {
   }
 }
 
-function isExecutable (file) {
+// ── 执行位核验（C10-032）───────────────────────────────────────────────────────
+// 为什么要三条信号：chmod 只能改 mode 位，改不了挂载选项；而 git 执行钩子走的是 execve。
+// 旧实现只问 accessSync(X_OK)，把两件不同的事混成一个布尔值：
+//   · mode 位缺失 → chmod 能修好；
+//   · 挂载点 noexec → chmod 立即成功、位也变成 0700，但 execve 照样 EACCES；
+//     而 access() 的判定在某些文件系统/实现上不反映挂载选项（本机实测 tmpfs noexec 会返回
+//     EACCES，但不能假定所有平台都如此），于是「核验通过」的钩子仍可能被 git 静默跳过。
+// 这里先读 mode 与挂载选项（纯元数据，不执行任何东西），再用 access 兜底，并给出可区分的诊断。
+const OWNER_EXEC_BIT = 0o100
+const PROC_MOUNTS = '/proc/self/mounts'
+
+// /proc/self/mounts 用 \040 \011 \012 \134 转义空白与反斜杠；挂载点路径含空格时不解码就匹配不上。
+function decodeMountField (field) {
+  return field.replace(/\\([0-7]{3})/g, (m, oct) => String.fromCharCode(Number.parseInt(oct, 8)))
+}
+
+// 返回 {point, noexec}，或 null 表示无法判定（非 Linux 平台没有 /proc/self/mounts）。
+// 按最长前缀匹配：嵌套挂载（如 /home 与 /home/x 各挂一份）必须取更里层那个的选项。
+function mountOf (file) {
+  let mounts
+  try {
+    mounts = fs.readFileSync(PROC_MOUNTS, 'utf8')
+  } catch (e) {
+    return null
+  }
+  let dir
+  try {
+    dir = fs.realpathSync(path.dirname(file))
+  } catch (e) {
+    dir = path.resolve(path.dirname(file))
+  }
+  let best = null
+  for (const line of mounts.split('\n')) {
+    if (line === '') continue
+    const fields = line.split(' ')
+    if (fields.length < 4) continue
+    const point = decodeMountField(fields[1])
+    const covers = dir === point || dir.startsWith(point.endsWith('/') ? point : point + '/')
+    if (!covers) continue
+    if (best === null || point.length > best.point.length) {
+      best = { point, noexec: fields[3].split(',').includes('noexec') }
+    }
+  }
+  return best
+}
+
+function describeError (e) {
+  return (e && (e.code || e.message)) || '未知错误'
+}
+
+// 单文件执行性诊断：{ok, fixable, code, reason}。
+// code 让调用方能区分处置方式：missing-mode（chmod 可修）/ noexec（换挂载点）/ access（ACL、策略）/ stat。
+function execDiagnosis (file) {
+  const mount = mountOf(file)
+  let mode
+  try {
+    mode = fs.lstatSync(file).mode & 0o777
+  } catch (e) {
+    return { ok: false, fixable: false, code: 'stat', reason: `无法读取权限位（${describeError(e)}）` }
+  }
+  if (mount && mount.noexec) {
+    return { ok: false, fixable: false, code: 'noexec', reason: `所在挂载点 ${mount.point} 带 noexec，执行位改了也 execve 不了` }
+  }
+  if ((mode & OWNER_EXEC_BIT) === 0) {
+    return { ok: false, fixable: true, code: 'missing-mode', reason: `缺少属主执行位（0${mode.toString(8)}）` }
+  }
   try {
     fs.accessSync(file, fs.constants.X_OK)
-    return true
   } catch (e) {
-    return false
+    return { ok: false, fixable: false, code: 'access', reason: `权限位齐备，但 access(X_OK) 判定不可执行（${describeError(e)}；可能来自 ACL/文件系统策略）` }
   }
+  return { ok: true, fixable: false, code: 'ok', reason: '' }
 }
 
 // 核验 .githooks 下受版本控制的钩子是否真的能被 git 调用。
@@ -87,23 +167,38 @@ function verifyHooks (dir) {
     console.error('[hooks]    当前分支/导出可能不含这些钩子；只写配置不会让缺失的钩子生效。')
     process.exit(1)
   }
-  const notExecutable = HOOK_FILES.filter(name => {
+  const blocked = []
+  for (const name of HOOK_FILES) {
     const file = path.join(dir, name)
-    if (isExecutable(file)) return false
-    try {
-      // 0o700：钩子只需属主可读可执行（git 以属主身份运行钩子）。不用 0o755——
-      // 组/其他用户可读可执行对本仓库钩子没有必要，且会被 Sonar S2612 判为过宽权限。
-      fs.chmodSync(file, 0o700)
-    } catch (e) {
-      // chmod 失败不单独报错，交由下方复检统一给出结论与指引
+    let diag = execDiagnosis(file)
+    // 只对「chmod 有机会修好」的情形尝试修复；noexec 挂载上 chmod 只会假装成功。
+    if (!diag.ok && diag.fixable) {
+      let chmodError = null
+      try {
+        // 0o700：钩子只需属主可读可执行（git 以属主身份运行钩子）。不用 0o755——
+        // 组/其他用户可读可执行对本仓库钩子没有必要，且会被 Sonar S2612 判为过宽权限。
+        fs.chmodSync(file, 0o700)
+      } catch (e) {
+        // chmod 失败不单独报错，交由下方复检统一给出结论与指引
+        chmodError = e
+      }
+      diag = chmodError
+        ? { ok: false, fixable: false, code: 'chmod', reason: `chmod 0o700 失败（${describeError(chmodError)}）` }
+        : execDiagnosis(file)
     }
-    return !isExecutable(file)
-  })
-  if (notExecutable.length > 0) {
-    const list = notExecutable.map(name => `${HOOKS_DIR}/${name}`).join('、')
+    if (!diag.ok) blocked.push({ name, diag })
+  }
+  if (blocked.length > 0) {
+    const list = blocked.map(item => `${HOOKS_DIR}/${item.name}`).join('、')
     console.warn(`[hooks] ⚠️  以下钩子不可执行，git 会静默跳过，提交门禁实际未生效：${list}`)
-    console.warn('[hooks]    已尝试 chmod 700 但仍无执行位，常见于 noexec 挂载（如 /storage/emulated）或 core.filemode=false 的检出。')
-    console.warn(`[hooks]    请手动执行后重跑本脚本自检：chmod +x ${list.replace(/、/g, ' ')}`)
+    for (const item of blocked) console.warn(`[hooks]    ${HOOKS_DIR}/${item.name}：${item.diag.reason}`)
+    // 指引必须按原因给：noexec 上 chmod 一定「成功」却毫无作用，再叫人 chmod +x 等于把人送进死循环。
+    if (blocked.some(item => item.diag.code === 'noexec')) {
+      console.warn('[hooks]    所在文件系统带 noexec：chmod 无效，只能把仓库换到可执行的文件系统，或由管理员去掉挂载选项。')
+    }
+    if (blocked.some(item => item.diag.code !== 'noexec')) {
+      console.warn(`[hooks]    其余情况请手动修复后重跑本脚本自检：chmod +x ${list.replace(/、/g, ' ')}`)
+    }
     return false
   }
   return true
@@ -121,10 +216,18 @@ function reportHookGate (dir) {
     console.error(`[hooks] ❌ 门禁未生效：缺少钩子文件 ${missing.map(name => `${HOOKS_DIR}/${name}`).join('、')}`)
     return false
   }
-  const notExecutable = HOOK_FILES.filter(name => !isExecutable(path.join(dir, name)))
-  if (notExecutable.length > 0) {
-    console.error(`[hooks] ❌ 门禁未生效：钩子不可执行（git 会静默跳过）${notExecutable.map(name => `${HOOKS_DIR}/${name}`).join('、')}`)
-    console.error('[hooks]    --verify 只读，不尝试 chmod；请手动执行：chmod +x ' + notExecutable.map(name => `${HOOKS_DIR}/${name}`).join(' '))
+  const blocked = HOOK_FILES
+    .map(name => ({ name, diag: execDiagnosis(path.join(dir, name)) }))
+    .filter(item => !item.diag.ok)
+  if (blocked.length > 0) {
+    console.error(`[hooks] ❌ 门禁未生效：钩子不可执行（git 会静默跳过）${blocked.map(item => `${HOOKS_DIR}/${item.name}`).join('、')}`)
+    for (const item of blocked) console.error(`[hooks]    ${HOOKS_DIR}/${item.name}：${item.diag.reason}`)
+    // --verify 只读：不 chmod，但也不能把 noexec 场景指向「chmod +x」这条死路。
+    if (blocked.every(item => item.diag.code === 'noexec')) {
+      console.error('[hooks]    --verify 只读：所在文件系统带 noexec，chmod 无效；请换到可执行的文件系统或由管理员去掉挂载选项。')
+    } else {
+      console.error('[hooks]    --verify 只读，不尝试 chmod；缺执行位请手动执行：chmod +x ' + blocked.map(item => `${HOOKS_DIR}/${item.name}`).join(' '))
+    }
     return false
   }
   console.log(`[hooks] ✅ 门禁已生效：core.hooksPath=${HOOKS_DIR}，${HOOKS_DIR}/ 下 ${HOOK_FILES.join('、')} 存在且可执行`)

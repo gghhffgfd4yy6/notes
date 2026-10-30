@@ -10,7 +10,8 @@ const {
   intervalMs,
   retryBackoffMs,
   runDryRunOnce,
-  nodeVersionWarning
+  nodeVersionWarning,
+  SUPPORTED_NODE_RANGES
 } = require('./qinglong/xbk_push')
 
 // console 三路的**唯二**允许改写点（C5-063）：基线在这里取一次，捕获函数必须在 finally 里还原到基线。
@@ -299,7 +300,8 @@ const deps = async (spec) => {
     requireFn: requireFn,
     spawnSyncFn: spawnSyncFn,
     // autoInstall:false 模拟「未设置 XBK_AUTO_INSTALL_DEPS」的部署（C5-060 迁移自旧直调副本的唯一维度之一）
-    env: spec.autoInstall === false ? {} : { XBK_AUTO_INSTALL_DEPS: '1' },
+    // spec.env 追加覆盖项（C10-017 的超时变量用它驱动，不改默认 env 口径）
+    env: Object.assign(spec.autoInstall === false ? {} : { XBK_AUTO_INSTALL_DEPS: '1' }, spec.env || {}),
     lockExists: () => spec.lock !== false
   }))
   r.calls = calls
@@ -334,6 +336,21 @@ const deps = async (spec) => {
   out.deps.rebuildSpawnError = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { error: { message: 'EBOOM' } } }] })
   out.deps.rebuildExit7 = await deps({ bare: { got: 'ok', re2: 'dlopen' }, plan: [{}, { result: { status: 7 } }] })
   out.deps.gotEaccesAfterInstall = await deps({ bare: { got: 'nf', re2: 'ok' }, plan: [{ after: 'eaccesGot' }] })
+  // C10-017：npm 子进程超时（status=null + signal；Node 还给 error.code=ETIMEDOUT）必须与
+  // 「非零退出」分开报，且两个上限可用环境变量覆盖。旧实现硬编码 120000、超时只会报「退出码 null」。
+  out.deps.installTimeout = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    plan: [{ result: { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' } } }]
+  })
+  out.deps.installTimeoutOverride = await deps({
+    bare: { got: 'nf', re2: 'ok' },
+    env: { XBK_NPM_TIMEOUT_MS: '5000' },
+    plan: [{ result: { status: 1 } }]
+  })
+  out.deps.rebuildTimeout = await deps({
+    bare: { got: 'ok', re2: 'dlopen' },
+    plan: [{}, { result: { status: null, signal: 'SIGTERM' } }]
+  })
   // C5-060：旧直调副本里有两个维度是子进程探针原先没覆盖的（auto-install 未开、npm 安装非零退出）。
   // 去重前先把它们迁进来，否则删掉副本就等于丢覆盖（实测：把生产里的「未设置自动安装即抛错」整段删掉，
   // 只留探针的版本仍然全绿）。
@@ -436,6 +453,29 @@ const deps = async (spec) => {
   assert.strictEqual(d.deps.rebuildSpawnError.thrown && d.deps.rebuildSpawnError.thrown.message, 'EBOOM', '重建子进程自身失败必须原样抛出')
   assert.strictEqual(d.deps.rebuildExit7.thrown && d.deps.rebuildExit7.thrown.message, 're2 原生模块恢复失败，退出码 7', '重建非零退出必须带真实退出码')
   assert.strictEqual(d.deps.gotEaccesAfterInstall.thrown && d.deps.gotEaccesAfterInstall.thrown.message, '依赖恢复后 got 仍不可用：[object Object]', '无 message 的错误必须退化为 String(error)')
+
+  // --- C10-017：npm 子进程超时可配 + 超时不得只报「退出码 null」 ---
+  assert.match(String(d.deps.installTimeout.thrown && d.deps.installTimeout.thrown.message),
+    /npm ci 超过 120000ms 未完成/, '安装超时必须报「超过 N ms 未完成」，旧实现只报「退出码 null」')
+  assert.match(String(d.deps.installTimeout.thrown && d.deps.installTimeout.thrown.message),
+    /XBK_NPM_TIMEOUT_MS/, '超时文案必须给出可调的上限环境变量，否则现场无从下手')
+  assert.strictEqual(d.deps.installTimeoutOverride.spawns[0].timeout, 5000,
+    'XBK_NPM_TIMEOUT_MS 必须真的覆盖安装子进程的上限')
+  assert.strictEqual(d.deps.installTimeoutOverride.thrown && d.deps.installTimeoutOverride.thrown.message,
+    'npm ci 失败，退出码 1', '覆盖超时不得改变「非零退出」的既有报错口径')
+  assert.strictEqual(d.deps.rebuildTimeout.spawns[1].timeout, 600000,
+    're2 源码重建的上限默认值必须高于安装的 120s（旧值在慢机器编译中途被杀）')
+  assert.match(String(d.deps.rebuildTimeout.thrown && d.deps.rebuildTimeout.thrown.message),
+    /npm rebuild re2 超过 600000ms 未完成/, '重建超时必须点名 npm rebuild re2 与被超时的上限值')
+  assert.match(String(d.deps.rebuildTimeout.thrown && d.deps.rebuildTimeout.thrown.message),
+    /XBK_NPM_REBUILD_TIMEOUT_MS/, '重建超时文案必须给出可调的上限环境变量')
+
+  // --- C10-037：package.json 的 engines.node 必须与入口的受支持范围同口径 ---
+  // 旧值 `>=22.22.2` 放行 23.x / 25.x / 24.0–24.14，而 re2 在这些版本上构建必然失败：
+  // npm 说「可安装」、入口说「不受支持」，两套口径把问题推到运行期。
+  const pkgEngines = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).engines.node
+  assert.strictEqual(pkgEngines, SUPPORTED_NODE_RANGES,
+    `package.json engines.node 必须与 qinglong 入口的受支持范围一致，实际 ${JSON.stringify(pkgEngines)}`)
 
   // --- 迁移自旧直调副本的两个维度（C5-060）：未开自动安装必须给部署提示且零 spawn；npm 安装非零退出必须带真实退出码 ---
   assert.match(String(d.deps.autoInstallOff.thrown && d.deps.autoInstallOff.thrown.message),
