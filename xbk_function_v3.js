@@ -89,7 +89,7 @@ const fs = profile3Require('fs', () => require('node:fs'))
 const { fetchJson } = profile3Require('xbk_http', () => require('./xbk_http'))
 const { prewarmDns, prewarmTls } = profile3Require('xbk_agents', () => require('./xbk_agents'))
 const { isRegularOrMissing, readSafeTextResult, writeAtomic, writeAtomicIfAbsent } = profile3Require('xbk_storage', () => require('./xbk_storage'))
-const { summarizeError, RETRYABLE_CODES } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
+const { summarizeError, RETRYABLE_CODES, classifySummary } = profile3Require('xbk_failure_policy', () => require('./xbk_failure_policy'))
 const path = profile3Require('path', () => require('path'))
 // 版本号一致性由 package.json、文件头和 CHANGELOG 的测试自动校验
 // 缺 package.json、坏 JSON 或 version 字段非法（null/空串/非字符串且非有限数值）时回退 '3.x'（移植性防御）
@@ -361,7 +361,7 @@ async function runSingleEntry (app = App) {
   // 单次入口与常驻入口统一失败语义：App.run 保持返回摘要兼容，
   // 但待推送项全部失败时设置非零退出码，不能让调度器误认为成功。
   try {
-    const { classifySummary } = require('./xbk_failure_policy')
+    // C6-010：classifySummary 与顶层 profile3Require 同一来源，此处不再 require 一次
     const decision = classifySummary(summary)
     if (decision) {
       console.error(`程序运行失败（${decision.reason}）：${decision.kind === 'permanent' ? '不可恢复' : '可重试'}`)
@@ -448,7 +448,7 @@ if (require.main === module) {
     runNotifyTest(cliArgs).catch(e => {
       // 统一脱敏出口：summarizeError 承诺不抛且 message 已 redact + 截断；
       // 绝不 console.log(e)/JSON.stringify(e)（error.options/response 可能带 URL query 凭证）。
-      const { summarizeError } = require('./xbk_failure_policy')
+      // C6-010：用顶部 profile3Require 注入的 summarizeError，不再 require 一次（会遮蔽模块级绑定）
       const info = summarizeError(e)
       console.error(`通知自检失败：${stripTerminalCtrl(info.message || '未知错误')}`)
       if (Array.isArray(info.failures)) {
