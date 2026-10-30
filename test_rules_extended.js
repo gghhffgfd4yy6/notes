@@ -281,7 +281,7 @@ check('validateConfig: 值正则为空告警（精确文案，且只此一条）
 
 check('validateConfig: 嵌套量词告警（精确文案）', () => {
   const warnings = engine.validateConfig({ keyword: 'cat###(a+)+' })
-  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」值正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(a+)+」'],
+  assert.deepStrictEqual(warnings, ['⚠️ 配置「keyword」值正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），该行将被忽略：「(a+)+」'],
     '嵌套量词必须恰好一条告警且回显被拦下的模式')
 })
 
@@ -448,7 +448,7 @@ check('_validateCatRe：嵌套量词/交替歧义分支优先于 re2 有效性�
   const w = []
   e._validateCatRe('(a+)+', 'keyword', w)
   assert.strictEqual(w.length, 1, '嵌套量词必须恰好产出一条警告')
-  assert.ok(w[0].endsWith('配置「keyword」分类正则含嵌套量词，可能导致灾难性回溯，该行将被忽略：「(a+)+」'), `嵌套量词警告文本必须精确：${w[0]}`)
+  assert.ok(w[0].endsWith('配置「keyword」分类正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），该行将被忽略：「(a+)+」'), `嵌套量词警告文本必须精确：${w[0]}`)
   const w2 = []
   e._validateCatRe('(a|aa)+', 'pingbitime', w2)
   assert.strictEqual(w2.length, 1, '交替歧义同样命中嵌套量词分支')

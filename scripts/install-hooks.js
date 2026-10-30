@@ -173,7 +173,12 @@ const resolvedHooksDir = path.join(repoRoot, HOOKS_DIR)
 
 // PR 评审 F4：只有退出码 1（键不存在）才算「未配置」。其它失败（配置损坏、git 异常等）
 // 不能当成「未配置」——那会在已有配置的情况下把它覆盖掉，违反 :5 的硬保证。
+// C10-069：`current === ''` 是两个不同事实的合流——(a) 键**不存在**（unset，新克隆即此状态）、
+// (b) 键存在但值**是空串**（core.hooksPath=""）。二者对门禁的后果相同（git 都退回默认 hooks
+// 目录 ⇒ 本仓库门禁不生效），但对用户是两件事：把 (a) 说成「检测到空串」是假话。故另记 state，
+// 输出按真实语义区分（unset / empty / set；值仅含空白时 git() 已 trim，按 empty 归类）。
 let current = ''
+let hooksPathState = 'unset'
 let hooksPathConfigured = false
 try {
   current = git(['config', '--get', 'core.hooksPath'])
@@ -181,6 +186,7 @@ try {
   // 本仓库门禁并不生效——语义上等同「未配置」，仍走下方安装分支。
   // qodo #147-1：此前把空串也算「已配置」→ 只告警并 exit 0，自动化会误判「安装成功」，
   // 而门禁其实从未生效（本文件 :5 的硬保证要求不得出现这种假成功）。
+  hooksPathState = current === '' ? 'empty' : 'set'
   hooksPathConfigured = current !== ''
 } catch (e) {
   if (e.status === GIT_CONFIG_KEY_MISSING) {
@@ -196,7 +202,7 @@ try {
 // --verify：只读自检，必须在任何写配置/chmod 之前返回（本分支不落到下面的安装逻辑）。
 if (VERIFY_ONLY) {
   if (current !== HOOKS_DIR) {
-    console.error(`[hooks] ❌ 门禁未生效：core.hooksPath=${current === '' ? '(未设置或空串)' : current}，期望 ${HOOKS_DIR}`)
+    console.error(`[hooks] ❌ 门禁未生效：core.hooksPath=${current === '' ? (hooksPathState === 'empty' ? '(空串：显式设为空)' : '(未设置：键不存在)') : current}，期望 ${HOOKS_DIR}`)
     process.exit(1)
   }
   if (!reportHookGate(resolvedHooksDir)) process.exit(1)
@@ -216,8 +222,10 @@ if (hooksPathConfigured) {
   console.warn(`[hooks] 已存在 core.hooksPath=${current}，未覆盖；本仓库提交门禁不会生效。如需改用本仓库钩子：git config core.hooksPath ${HOOKS_DIR}`)
   process.exit(0)
 }
-if (current === '') {
-  console.warn('[hooks] 检测到 core.hooksPath 为空串（git 退回默认 hooks 目录，本仓库门禁不生效），按未配置处理并写入本仓库钩子。')
+if (hooksPathState === 'empty') {
+  console.warn('[hooks] 检测到 core.hooksPath 已被显式设为空串（键存在、值为 ""；git 退回默认 hooks 目录，本仓库门禁不生效），按未配置处理并写入本仓库钩子。')
+} else if (hooksPathState === 'unset') {
+  console.warn('[hooks] 未检测到 core.hooksPath 配置（键不存在 = 从未设置，新克隆的默认状态；git 用默认 hooks 目录，本仓库门禁不生效），按未配置处理并写入本仓库钩子。')
 }
 
 // PR 评审 #140：钩子不可执行时（如 noexec 文件系统上 chmod 静默无效）不写配置、也不以 0 退出——

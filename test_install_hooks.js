@@ -142,7 +142,7 @@ function makeCase () {
     writeHooks(dir)
     const r = runVerify(dir, home)
     assert.strictEqual(r.status, 1, 'core.hooksPath 未配置时门禁不生效，--verify 必须非 0')
-    assert.match(r.stderr, /core\.hooksPath=\(未设置或空串\)/, '应回显当前配置值')
+    assert.match(r.stderr, /core\.hooksPath=\(未设置：键不存在\)/, '应回显当前配置值（未设置，不是「空串」）')
     const cfg = gitConfig(dir, home, 'core.hooksPath')
     assert.notStrictEqual(cfg.status, 0, '--verify 是只读的：不得顺手写入 core.hooksPath')
   } finally {

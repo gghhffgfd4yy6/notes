@@ -216,11 +216,10 @@ function createFormatter ({ Utils, safeRe }) {
     // 仍 12-16s）。v3.261：h/a/script/style 全部改为 _replaceTagged 线性定位（开标签互不
     // 重叠、indexOf 找首个闭合，全程 O(n)），入口截断保留作为下游（解码/清洗）的防护。
     if (html.length > HTML_TEXT_MAX_LEN) html = Utils.truncateUtf16(html, HTML_TEXT_MAX_LEN)
-    // URL 文本/目标统一使用 safeUrl：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
+    // URL 文本/目标统一使用 urlText（唯一来源是 Utils.safeUrl）：非字符串、空值、伪 URL、危险协议和换行都不生成 Markdown 链接。
     const urlText = Utils.safeUrl(shuju && shuju.url)
-    const safeUrl = urlText
     // url 含 Markdown 特殊字符(空格/括号/])时用 <> 包裹（短路与正常路径共用）；锚点 href 同口径
-    const mdUrl = this._mdDestination(safeUrl)
+    const mdUrl = this._mdDestination(urlText)
     // 显示文本转义：urlText 原样插入 [] 会被 Markdown 特殊字符(] [ \\)破坏，转义后与 mdUrl 口径一致
     const mdLinkText = urlText ? urlText.replace(/[[\]\\]/g, '\\$&') : urlText
     // 无标签内容短路：跳过整个替换链（性能优化）

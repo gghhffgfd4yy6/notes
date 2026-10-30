@@ -296,18 +296,18 @@ function validateFilterRules (input, deps) {
   }
   if (errors.length) return { ok: false, errors }
 
-  // ---------- 闸门 3：嵌套量词（ReDoS）+ RE2 可用性 + 正则语法 ----------
+  // ---------- 闸门 3：灾难性回溯结构（ReDoS；错误码仍为 nested_quantifier，勿改）+ RE2 可用性 + 正则语法 ----------
   for (const rule of ruleLines) {
     if (rule.cat && engine.hasNestedQuantifier(rule.cat)) {
-      addError(errors, rule.field, 'nested_quantifier', `分类正则含嵌套量词：「${rule.cat}」`)
+      addError(errors, rule.field, 'nested_quantifier', `分类正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+）：「${rule.cat}」`)
     }
     if (engine.hasNestedQuantifier(rule.val)) {
-      addError(errors, rule.field, 'nested_quantifier', `正则含嵌套量词：「${rule.val}」`)
+      addError(errors, rule.field, 'nested_quantifier', `正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+）：「${rule.val}」`)
     }
   }
   for (const rule of simpleRules) {
     if (engine.hasNestedQuantifier(rule.val)) {
-      addError(errors, rule.field, 'nested_quantifier', `正则含嵌套量词：「${rule.val}」`)
+      addError(errors, rule.field, 'nested_quantifier', `正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+）：「${rule.val}」`)
     }
   }
   if (errors.length) return { ok: false, errors }
