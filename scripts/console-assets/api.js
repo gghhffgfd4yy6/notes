@@ -6,22 +6,41 @@ import { FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, BACKUP_BROWSER_MAX_BYTES, NO
 // token 由 renderPage 注入的 JSON 岛（<script type="application/json" id="xbk-boot">）提供。
 // 岛内文本由服务端做 JSON 转义（控制字符 → \uXXXX；不用 HTML 实体——script 文本不做实体解码，
 // 实体会让 JSON.parse 得到含 &amp; 的错误 token，Sourcery vwK）。
-// 解析后立即移除该节点（用后即焚，token 不常驻 DOM）。
+// 解析后立即移除该节点（用后即焚，token 不常驻 DOM）——解析失败同样要移除：节点里带着明文 token。
+// bootError 把「没有 token」的两种情形分开（C7-034）：'missing' = 页面没注入岛（Cookie 会话 /
+// 老页面，凭证本来就不走这里，不算错误）；'invalid-json' = 注入了但解析不了（页面数据坏了）。
+// 只回空 token 会把后者伪装成「凭证失效」——随后必然出现的 401 让控制台提示「用带 ?token= 的
+// 链接重开」，而真正的原因（注入内容损坏）被埋掉，也没有任何日志可查。
 function readBoot () {
+  const el = document.getElementById('xbk-boot')
+  if (!el) return { token: '', version: '', instance: '', bootError: 'missing' }
+  let data = null
+  let fault = null
   try {
-    const el = document.getElementById('xbk-boot')
-    if (!el) return { token: '' }
-    const data = JSON.parse(el.textContent || '{}')
+    data = JSON.parse(el.textContent || '{}')
+  } catch (e) {
+    fault = e
+  } finally {
     el.remove()
-    // version：页面启动时的构建版本（服务端注入），用来发现「部署后还开着旧标签页」。
-    return {
-      token: typeof data.token === 'string' ? data.token : '',
-      version: typeof data.version === 'string' ? data.version : '',
-      // instance：本实例的短 id（服务端按 stateDir 派生）。只用于给 localStorage 里的
-      // 首屏快照做命名空间，防止同一 origin 换实例后渲染上一个实例的数据。
-      instance: typeof data.instance === 'string' ? data.instance : ''
+  }
+  // JSON 合法但不是对象（"1" / null）与解析失败同一口径：岛里的内容不可用。
+  let bootError = ''
+  if (fault !== null || data === null || typeof data !== 'object') {
+    bootError = 'invalid-json'
+    if (typeof console !== 'undefined' && typeof console.error === 'function') {
+      console.error('xbk-boot 启动数据不可用（不是凭证失效）：JSON 岛解析失败或不是对象', fault)
     }
-  } catch (e) { return { token: '', version: '', instance: '' } }
+    data = {}
+  }
+  // version：页面启动时的构建版本（服务端注入），用来发现「部署后还开着旧标签页」。
+  return {
+    token: typeof data.token === 'string' ? data.token : '',
+    version: typeof data.version === 'string' ? data.version : '',
+    // instance：本实例的短 id（服务端按 stateDir 派生）。只用于给 localStorage 里的
+    // 首屏快照做命名空间，防止同一 origin 换实例后渲染上一个实例的数据。
+    instance: typeof data.instance === 'string' ? data.instance : '',
+    bootError
+  }
 }
 const BOOT = readBoot()
 
