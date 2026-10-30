@@ -41,9 +41,20 @@ function createApp ({
     },
 
     _writeTextAtomic (filePath, text) {
-    // v3.245 P1：writeAtomic 内部有 try/catch 正常不抛；此处再加一层防御（如 text 含
-    // Symbol 等 String 化异常），任何意外不向调用链冒泡。
-      try { return writeAtomic(filePath, text, '缓存文件') } catch (e) { return false }
+    // v3.245 P1：writeAtomic 内部有 try/catch（失败会 console.error 后返回 false），正常不抛；
+    // 这一层只兜「String 化异常」等意外，任何异常都不向调用链冒泡。
+    // C1-016：旧实现 `catch (e) { return false }` 把原因整条丢掉——调用方与运维只看到 false，
+    // 分不清「磁盘/权限失败」与「text 无法字符串化」。不冒泡的契约不变，原因必须留痕。
+      try {
+        return writeAtomic(filePath, text, '缓存文件')
+      } catch (e) {
+      // 原因自己安全字符串化（不依赖 Utils：本方法的既有单测用最小 Utils 替身，且这里正好是
+      // 「text 不可字符串化」的兜底路径，取原因本身也不能再抛一次）。
+        let reason = ''
+        try { reason = String((e && e.message) || e) } catch (e2) { reason = '<不可字符串化的异常>' }
+        console.warn(`⚠️ 缓存文件写入异常（已拦截，不冒泡）：${filePath}: ${reason}`)
+        return false
+      }
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
@@ -1278,7 +1289,13 @@ function createApp ({
           // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
           // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
           if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
-            this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)
+          // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
+          // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
+          // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
+            if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
+              console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
+              this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
+            }
           }
         }
         const newMessages = []
@@ -1710,20 +1727,24 @@ function createApp ({
           }
           if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
           if (result.failure) {
-            // APP2-03：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。投递层
-            // 只在「全部通道失败」时抛错（xbk_sendNotify_slim.js:1573 `okCount === 0`），此时
-            // successfulChannels 恒为空数组——该分支不可达。
-            // 返工结论（R1a）：① 删除该分支写不出可证伪断言（删死代码无行为差异）；
-            // ② 唯一可证伪的出路是让 summarizeError 透出 successfulChannels，但那要改
-            //    xbk_failure_policy.js（不在本代理白名单）；③ 更要紧的是它**不该**透出：
-            //    channelSuccessful/成功缓存已由上方 `sent.successfulChannels` 覆盖，而在
-            //    `okCount === 0` 的抛错路径上该数组恒空，透出只会把「全部失败」记录成
-            //    「部分成功」并污染 _updateChannelHealth 的通道健康统计。
-            // 故保留死分支 + 契约注释，不按清单建议①改（理由见 .local/reports/fix-r1a-REPORT.md）。
-            if (Array.isArray(result.failure.successfulChannels)) {
-              for (const channel of result.failure.successfulChannels) channelSuccessful.add(channel)
+            // APP2-03 / C1-015：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。
+            // 「全部通道失败」在投递层是**抛错**（xbk_sendNotify_slim.js 的 `okCount === 0` ⇒
+            // ALL_CHANNELS_FAILED，错误对象挂 failures=[逐通道失败]），所以这时 sent 恒不存在，
+            // 下面这段 failure.failures 是这类失败**唯一**能进 _updateChannelHealth 通道健康统计的
+            // 入口（sent.failures 那条路走不到）。旧注释称整段「分支不可达」并据此保留了一段
+            // 死分支——按那个论证删代码会把这条在跑的路一起删掉，健康统计从此静默漏记整轮全通道失败。
+            // 真正不可达的只有 successfulChannels 半边：summarizeError 只透出 code/name/statusCode/
+            // providerCode/channel/message/failureKind/failures（不拷贝 successfulChannels），且
+            // okCount===0 路径上该数组恒为空；即便日后透出也**不该**记成功（会把「全部失败」记成
+            // 「部分成功」并污染健康统计）⇒ 该半边已删除，不再保留会被误读为可删死代码的形态。
+            const failedChannels = result.failure.failures
+            if (Array.isArray(failedChannels)) {
+              channelFailures.push(...failedChannels)
+            } else if (result.failure.code === 'ALL_CHANNELS_FAILED') {
+            // 聚合失败的载荷就是 error.failures，摘要里缺失说明摘要链路被改坏：此时健康统计会静默
+            // 漏掉整轮失败（不报警、不累计），必须响亮而不是当作「没有失败通道」吞掉。
+              console.warn('⚠️ 全通道失败的摘要缺少 failures 明细（摘要链路异常），本轮通道健康统计将漏记这些通道')
             }
-            if (Array.isArray(result.failure.failures)) channelFailures.push(...result.failure.failures)
           }
         }
         for (const result of pushResults) recordChannelOutcome(result)

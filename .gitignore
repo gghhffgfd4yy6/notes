@@ -1,5 +1,9 @@
 node_modules
 xianbaoku_cache*
+# C3-014：resolveCacheDirInRoot 的两级生产兜底缓存目录（.xbk_cache_safe / .xbk_cache_safe_internal）
+# 同样是本机运行时产物（默认目录被普通文件占位、或 realpath 逃出项目根时 cacheDir 落在这里），
+# 绝不入库。目录名在 xbk_message_store.js 里字面量构造——改名必须同步本行。
+.xbk_cache_safe*
 push_config.local.js
 # 控制台 token（本机部署产物，绝不入库）
 .console.env

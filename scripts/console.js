@@ -4082,6 +4082,24 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       throw e
     }
   }
+  // C3-013：判重由 `push.json` + `push.json.seen.json` 共同构成。导入备份把主存整份替换后，
+  // 机器上残留的 .seen.json 描述的是**另一段历史**：它会把已被淘汰的身份判成「已推送」，使恢复后
+  // 的判重主存看起来少了记录却又不重推（旧行为：静默保留、无提示）。因此「备份里没有判重历史」
+  // 时把残留墓碑一并清掉（调用方已把 seenPath 纳入 rollback 备份，回滚会原样复原）。
+  // 只删普通文件：符号链接/目录不是墓碑形态，一律不碰（绝不顺着链接删到别处）。
+  const removeStaleTombstones = (seenPath) => {
+    try {
+      const st = fs.lstatSync(seenPath)
+      if (!st || !st.isFile()) return false
+      fs.unlinkSync(seenPath)
+      return true
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') {
+        console.warn(`⚠️ 导入时清理残留判重历史失败 ${seenPath}: ${e && e.message ? e.message : e}`)
+      }
+      return false
+    }
+  }
   const handleBackupExport = (req, res) => {
     readBody(req, 16 * 1024).then(({ body, over, aborted }) => {
       if (over || aborted) { sendJson(res, over ? 413 : 400, { error: '请求体不完整或超限' }); return }
@@ -4388,13 +4406,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
-          if (plans.messages.seenText !== undefined &&
-              !writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) {
-            abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
-            return
+          if (plans.messages.seenText !== undefined) {
+            if (!writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) {
+              abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
+              return
+            }
+            imported.dedup = true
+          } else if (removeStaleTombstones(seenPath)) {
+            // C3-013：备份里没有判重历史（旧备份，或导出时墓碑读取失败/超限被 skipped）——
+            // 留下来的 .seen.json 属于另一份历史，会让恢复后的判重主存「少了记录却不重推」。
+            // 已随 rollback 备份（targets 含 seenPath），响应里显式告知这次清理，不静默。
+            imported.dedupCleared = true
           }
           imported.messages = plans.messages.count
-          if (plans.messages.seenText !== undefined) imported.dedup = true
         }
         if (plans.settings) {
           const next = {
