@@ -1163,9 +1163,12 @@ function App () {
   // 主轮询已停，徽章显示的是离开时的快照——必须注明，不能永久挂着「任务运行中」（审查 #246）。
   // 顶栏徽章只在「自动刷新开 + 未失效」时是活状态；所有页都轮询（v3.348），
   // 不再有「（快照）」后缀——数据新旧看后面的时间。
+  // 启动数据损坏 ≠ 凭证失效（C7-034）：readBoot 把「注入内容解析失败」单独标成 bootError，
+  // 提示要指向真正能做的动作（刷新重注入），不能把用户引去「重新取 token」这条错路。
+  const bootBroken = BOOT.bootError === 'invalid-json'
   const livePolling = !authExpired && autoRefresh
   const badgeText = authExpired
-    ? '凭证失效'
+    ? (bootBroken ? '启动数据损坏' : '凭证失效')
     : locking ? '任务运行中' : '空闲'
   // 顶栏状态行：所有页同一套词，只有时间来源不同（概览看最近刷新，其它页看本页拉到数据的时间）。
   const syncAt = tab === 'overview' ? lastSync : panelSync
@@ -1197,8 +1200,10 @@ function App () {
 
     ${authExpired && html`<div class="alert-banner bad" role="alert">
       <div class="alert-main">
-        <strong>凭证已失效，控制台已停止自动刷新</strong>
-        <span class="alert-sub">请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。</span>
+        <strong>${bootBroken ? '页面启动数据损坏，控制台已停止自动刷新' : '凭证已失效，控制台已停止自动刷新'}</strong>
+        <span class="alert-sub">${bootBroken
+          ? html`页面注入的 xbk-boot JSON 岛解析失败（<strong>不是凭证问题</strong>）：刷新页面重新注入；仍失败请检查服务端 renderPage 的注入内容。`
+          : html`请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。`}</span>
       </div>
       <a class="alert-action" href="/">重新登录</a>
     </div>`}
