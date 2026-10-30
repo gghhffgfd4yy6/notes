@@ -19,7 +19,9 @@
 // 进程/账号，或未来的多租户部署）能在读与收紧之间把该路径换成符号链接，而按路径
 // 的 stat/chmod 都会跟随链接 —— 收紧动作就落到链接目标上，改的是别人的权限位
 // （C10-019）。故本模块以 O_NOFOLLOW 打开、按 fd 确认普通文件、再对比路径的
-// inode，最后才对路径 chmod 并按 fd 复检位宽。
+// inode，最后只在这个**已校验的 fd** 上 fchmod 并按同一 fd 复检位宽：检查完成到
+// 写入之间路径即使被换掉，改的也只是「刚打开并校验过的那份 inode」，链接目标与
+// 别人的文件一律碰不到（同仓 scripts/console.js:2070/2285 的 O_NOFOLLOW + fchmod 范式）。
 // ============================================================
 
 const fs = require('fs')
@@ -68,13 +70,14 @@ function enforceOwnerOnlyMode (file) {
     const mode = fdStat.mode & 0o777
     if ((mode & GROUP_OTHER_BITS) === 0) return { ok: true, tightened: false }
     try {
-      fs.chmodSync(file, OWNER_ONLY_MODE)
+      // 只按 fd 改（C10-019）：路径在 lstat 校验之后被换成符号链接/别人的文件时，
+      // chmodSync(file) 会跟随链接改到目标上；fchmodSync 作用于上面校验过的这份 inode。
+      fs.fchmodSync(fd, OWNER_ONLY_MODE)
     } catch (e) {
       return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且无法收紧到 0600：${safeErrorMessage(e)}` }
     }
-    // 按 fd 复检：这一份 inode 的位宽真的被收窄了吗？路径在 chmod 前被换掉时，
-    // chmod 落到别的节点上，这里会看到位宽未变 ⇒ 报失败，而不是把「别人的权限改了」
-    // 说成「本文件已收紧」。
+    // 按 fd 复检：这一份 inode 的位宽真的被收窄了吗？写入不生效（只读挂载/文件系统
+    // 不认 mode）时这里会看到位宽未变 ⇒ 报失败，而不是把「没改成」说成「已收紧」。
     let after
     try {
       after = fs.fstatSync(fd).mode & 0o777
@@ -82,7 +85,7 @@ function enforceOwnerOnlyMode (file) {
       return { ok: false, message: `覆盖文件收紧后无法复检权限（${safeErrorMessage(e)}）` }
     }
     if ((after & GROUP_OTHER_BITS) !== 0) {
-      return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且收紧后复检仍为 0${after.toString(8)}：路径可能在收紧期间被替换` }
+      return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且收紧后复检仍为 0${after.toString(8)}：该 fd 的位宽未被改写` }
     }
     return { ok: true, tightened: true }
   } finally {
