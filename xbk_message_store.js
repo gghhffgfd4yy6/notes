@@ -9,16 +9,21 @@
 // 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
 const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
 
-// 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01）：
-//   max(TOMBSTONE_MAX_KEYS, maxSize)
-// TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 才是生产同一次裁剪
-// 最多能丢的条数（默认 10000 > 旧固定上限 5000：接口不能继续上报一个生产根本不执行的值）。
+// 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
+//   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
+// TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
+// 的条数（默认 10000 > 旧固定上限 5000：接口不能继续上报一个生产根本不执行的值）；
+// droppedCount 是本次**实际**落墓碑的身份数上界——saveBatch 没有入参上限（maxSize=10000 时一批
+// 20001 条会丢 10001 条，字节上限还会再补刀），只按 maxSize sizing 会让 _trimTombstoneMaps 把
+// 刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
 // 控制台 /api/cache-health 的上报值（limits.tombstoneKeyMax）也调本函数推导，保证「报出的上限」
 // 与「生产真正强制的上限」是同一份规则，不出现两处各写一份常量。
 // floorKeys 仅供实例注入的 constants 覆盖（测试用小常量），生产缺省即 xbk_utils 的常量本尊。
-function tombstoneKeyCap (maxSize, floorKeys = TOMBSTONE_MAX_KEYS) {
-  const floor = Number.isInteger(floorKeys) && floorKeys > 0 ? floorKeys : TOMBSTONE_MAX_KEYS
-  return Number.isInteger(maxSize) && maxSize > floor ? maxSize : floor
+function tombstoneKeyCap (maxSize, droppedCount = 0, floorKeys = TOMBSTONE_MAX_KEYS) {
+  let cap = Number.isInteger(floorKeys) && floorKeys > 0 ? floorKeys : TOMBSTONE_MAX_KEYS
+  if (Number.isInteger(maxSize) && maxSize > cap) cap = maxSize
+  if (Number.isInteger(droppedCount) && droppedCount > cap) cap = droppedCount
+  return cap
 }
 
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
@@ -758,8 +763,8 @@ function createMessageStore ({
      *  最旧的一半身份当场失去防重放保护（缓存上限默认 10000 条 > 旧固定上限 5000 键）。
      *  规则只有一份实现：模块级 tombstoneKeyCap（控制台 /api/cache-health 也用它上报），
      *  这里只把实例注入的 constants.TOMBSTONE_MAX_KEYS 当下限传进去。 */
-    _tombstoneKeyCap (maxSize) {
-      return tombstoneKeyCap(maxSize, TOMBSTONE_MAX_KEYS)
+    _tombstoneKeyCap (maxSize, droppedCount = 0) {
+      return tombstoneKeyCap(maxSize, droppedCount, TOMBSTONE_MAX_KEYS)
     },
 
     // ===== F1（P1）：坏/超限缓存的「隔离 + 重建」自愈 =====
@@ -921,7 +926,9 @@ function createMessageStore ({
         console.error(`缓存尾部恢复：单条即超过读端上限，无法自动恢复（保持写闸门）${filePath}`)
         return null
       }
-      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped, this._tombstoneKeyCap(maxSize))
+      // CR-02：容量按**本次实际丢弃的全量** sizing——尾部恢复的 dropped 同时含条数裁剪与字节
+      // 上限淘汰的条目，总数可超过 maxSize（条数无入参上限，字节裁剪还会再补刀）。
+      return this._isolateAndRebuild(filePath, elements, text, '超限尾部恢复', dropped, this._tombstoneKeyCap(maxSize, dropped.length))
     },
 
     /** 把不可读缓存改名隔离（绝不 unlink）后，在原路径原子重建（解析失败/非普通文件为空缓存，
@@ -957,7 +964,8 @@ function createMessageStore ({
       this._memoSet(filePath, messages)
       try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       // 落墓碑放在写盘成功之后：与 saveMessages 同口径——未真正落盘就登记会把仍在磁盘上的身份
-      // 误判成「已推送」而漏推。maxKeys 由调用方按当次 maxSize 给出（C6-006：容量须覆盖本次裁剪量）。
+      // 误判成「已推送」而漏推。maxKeys 由调用方按「本次实际丢弃条数」给出（C6-006 / CR-02：
+      // 容量须覆盖本次裁剪量，不能只按 maxSize）。
       if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, maxKeys)
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
@@ -1053,9 +1061,10 @@ function createMessageStore ({
       // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
       try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
       // 缓存写盘成功：被裁剪记录才真正退出磁盘缓存，此时落墓碑防重放（防重复推送）
-      // C6-006：墓碑键数上限取 max(TOMBSTONE_MAX_KEYS, maxSize)——本次最多裁掉
-      // toSave.length - maxSize 条，容量不低于 maxSize 才能让这批身份全部留在墓碑里。
-      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize))
+      // C6-006 / CR-02：墓碑键数上限按**本次实际丢弃的全量** sizing（条数裁剪 + 字节上限裁剪）——
+      // saveBatch 没有入参上限，maxSize=10000 时一批 20001 条会丢 10001 条，只按 maxSize 给容量
+      // 就会让 _trimTombstoneMaps 把刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
+      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
       return true
     },
 
@@ -1363,8 +1372,8 @@ function createMessageStore ({
       return false
     },
 
-    /** 四类墓碑 Map 超 maxKeys（默认 TOMBSTONE_MAX_KEYS 下限；生产按当次 maxSize 取
-     *  _tombstoneKeyCap，见 C6-006）时丢最旧键 */
+    /** 四类墓碑 Map 超 maxKeys（默认 TOMBSTONE_MAX_KEYS 下限；生产按「本次实际丢弃条数」取
+     *  _tombstoneKeyCap，见 C6-006 / CR-02）时丢最旧键 */
     _trimTombstoneMaps (ts, maxKeys = TOMBSTONE_MAX_KEYS) {
       for (const map of [ts.id, ts.urlOnly, ts.idWithUrl, ts.anon]) {
         while (map.size > maxKeys) {
