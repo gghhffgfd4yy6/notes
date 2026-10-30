@@ -1,5 +1,26 @@
 'use strict'
 require('./scripts/mutation-run-guard.js').assertLocalMutationAllowed()
+
+// ── C10-010：TAP 档的跳过集合**由本文件强制清空**，不再依赖「CI 的 step env 没设 SKIP_SUITES」这条假设。
+//   command 档的同源做法在 scripts/mutation-child.js：require run_unit_tests.js 之前写死
+//   `process.env.SKIP_SUITES = ''`。TAP 档不经该脚本（tap-runner 逐文件 spawn 测试文件），而 tap-runner 的
+//   runFile() 给子进程的环境是 `{ ...process.env, <STRYKER_* 标志> }`（tap-runner 的
+//   dist/src/tap-test-runner.js，runFile 里 `childProcess.spawn('node', args, { env })`），且 tap-runner 由
+//   Stryker 主进程在**配置加载之后**逐文件 spawn ⇒ 在这里清空 process.env 就等于清空整个 TAP 档。
+//   修前本文件只在注释里声明「SKIP_SUITES 在变异场景恒为空串……CI 的 step env 亦未设置该变量」：那是
+//   **环境假设**，而这个变量就活在仓库自己的 test.yml 单元步骤里（job/step 层继承即可带进来）。一旦带进来，
+//   TAP 档会静默少跑套件：下方显式 testFiles 清单与 perTest 覆盖归因随 command 档分叉，两档分数不可比，
+//   而且没有任何信号（tap-shim 会把被跳过的文件如实记成 `ok # SKIP`，满屏皆绿）。
+//   判据只看清空后的值：继承到非空值 → 清空 + stderr 留一行证据（带原值，便于定位是谁设的），不清空即红
+//   （test_ci_skip_suites.js 的 3k 用真子进程跑真配置锁定本条）。
+//   纵深防御：mutation.yml 的「变异测试」step 显式写 `SKIP_SUITES: ''`（step 级 env 覆盖上层继承值）。
+const inheritedSkipSuites = process.env.SKIP_SUITES
+if (inheritedSkipSuites) {
+  process.env.SKIP_SUITES = ''
+  try {
+    process.stderr.write(`stryker.tap.config.js: 忽略继承的 SKIP_SUITES=${inheritedSkipSuites}（TAP 档恒不跳过任何套件，与 command 档一致）\n`)
+  } catch { /* stderr 不可写：清空已生效，留证降级不影响判据 */ }
+}
 // ============================================================
 // TAP 档 Stryker 配置（**CI 生产档**）
 //
@@ -44,9 +65,9 @@ const { SUITES } = require('./test_suites')
 // tap-runner 的 testFiles 不支持取反 glob（glob 不支持 ! 排除），因此用**显式清单**。
 // 清单必须与 command 链（stryker.config.js 的 commandRunner -> scripts/mutation-child.js ->
 // run_unit_tests.js 的 UNIT_SUITES）完全一致：SUITES 过滤掉 integration / mutationSkip；
-// SKIP_SUITES 在变异场景恒为空串——command 档由 scripts/mutation-child.js 强制 SKIP_SUITES=''，
-// tap 档不经该脚本（tap-runner 直接 spawn 测试文件），CI 的 step env 亦未设置该变量 ⇒ 同样为空串，
-// 两档的跳过集合因此严格一致（tap-shim 运行期再按同一口径兜底）。故这里按「无显式跳过」推导。
+// SKIP_SUITES 在变异场景恒为空串，且**由本文件顶部那段代码强制**，不是靠「CI 的 step env 没设它」这条
+// 环境假设（C10-010）：配置加载期就把继承到的非空值清空，tap-runner 逐文件 spawn 时按 {...process.env}
+// 继承 ⇒ 整档的跳过集合恒为空。故这里按「无显式跳过」推导。
 const commandChainTestFiles = SUITES
   .filter(s => !s.integration && !s.mutationSkip)
   .map(s => s.file)
