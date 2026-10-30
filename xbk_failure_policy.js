@@ -456,13 +456,25 @@ function classifyFailure (error) {
 // 的摘要因此落进 failed<=0 分支被判成功（退出码 0，失败被静默吞掉）。计数只描述规模，不该是「有没有失败」
 // 的唯一证据：缺失/非法时用结构化 failures 的条数兜底（有多少条失败原因就至少有多少条没送达）。
 // 显式合法计数（含 0）仍然优先——`failed: 0` 是上报方的明确断言（dry-run 就是这种口径），不在这里翻案。
-// 用 try 包住 Number()：Symbol 等类型会让 Number() 抛 TypeError，破坏本模块「绝不抛」契约。
+// **先校验类型再转换**：Number() 是强制转换而非解析，null / '' / 纯空白 / [] / false 都不抛错，而是被
+// 转成 0——「没上报计数」与「明确 0 条失败」被混为一谈，同一票面只把 failed 换个类型就能重新落进
+// failed<=0 判成功。故只接受 number（有限、非负）或「非空、可整体转成非负有限数字」的字符串，
+// null / '' / 纯空白串 / 数组 / 布尔 / 对象 / Symbol 一律按非法处理 → 回落 failures 条数。
+// try 保留：Symbol 等类型会让 Number() 抛 TypeError，本模块「绝不抛」契约不能破（取值也可能来自
+// 敌意 getter，readProp 已兜住，这里仍按非法计数收口）。
 function failureCountOf (summary, failures) {
+  const fallback = failures.length
   try {
-    const n = Number(readProp(summary, 'failed'))
-    if (Number.isFinite(n) && n >= 0) return n
+    const raw = readProp(summary, 'failed')
+    if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+    if (typeof raw === 'string') {
+      const text = raw.trim()
+      if (text === '') return fallback
+      const n = Number(text)
+      return Number.isFinite(n) && n >= 0 ? n : fallback
+    }
   } catch (e) { /* 非法计数：落到 failures 条数 */ }
-  return failures.length
+  return fallback
 }
 
 function classifySummary (summary) {
