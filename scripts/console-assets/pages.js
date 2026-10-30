@@ -5046,7 +5046,6 @@ const LOG_SCROLLER = '.logpre-main'
 
 export {
   CacheHealthPanel,
-  CategoryPicker,
   ConfigPanel,
   FilesPanel,
   FilterRulesPanel,

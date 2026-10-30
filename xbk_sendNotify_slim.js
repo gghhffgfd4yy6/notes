@@ -79,7 +79,7 @@ function safeSlice (s, max) {
   return shared().truncateUtf16(str, max)
 }
 // 错误摘要（v3.75）：失败日志统一打摘要而非整个 err 对象——
-// $.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
+// pushHttp.post 回调的 err 是 err.response.body（API 异常响应体，可能回显请求参数含密钥），
 // 直接 console.log(err) 会在 cron 日志重定向/分享时泄露；截断 200 字符防超长刷屏
 const SECRET_FIELD_RE = /(?:token|app[_-]?token|secret|password|authorization|(?:^|_)(?:key|auth)|bark_push|push_key|pushme_key|deer_key|xizhi_key|bot_token|user_id)/i
 
@@ -355,7 +355,7 @@ for (const [configKey, names] of Object.entries(ENV_ALIASES)) {
   if (envName !== undefined) push_config[configKey] = process.env[envName]
 }
 
-async function one () {
+async function fetchHitokoto () { // 取一条一言（hitokoto.cn）：一句话推送装饰，唯一出口是 got.get
   const url = 'https://v1.hitokoto.cn/'
   // v3.151：3s 短超时——一言是推送装饰，API 慢/挂时不应阻塞推送（曾默认 15s，启用 HITOKOTO 用户每次推送延迟）
   // v3.273（审查 S4）：显式关闭 got 内置重试（与 xbk_network/xbk_agents.prewarmTls 同口径）——
@@ -374,7 +374,7 @@ async function one () {
 
 // 推送层响应体上限（审查 F5/S3）：got@11 没有 maxResponseSize（实测 11.8.6 无该选项），promise API 会把
 // 整个响应体读进内存并再 JSON.parse——20MB 上限此前只在 xbk_http.fetchJson 的流式路径生效，推送出口
-// （$.post）完全没有上限。这里取 xbk_http.DEFAULT_MAX_BODY 的同一口径（同为 20MB）：官方 got 走流式
+// （pushHttp.post）完全没有上限。这里取 xbk_http.DEFAULT_MAX_BODY 的同一口径（同为 20MB）：官方 got 走流式
 // 限长读取，超限报 EBODYLIMIT（与 fetchJson 同错误码）并销毁流；测试注入的 got 替身通常只提供 promise API
 // （见 test_notify.js），此时保持原 promise 路径不变（调用方行为零变更）。
 // 刻意不 require('./xbk_http') 取常量：test_app.js 会先 require 本模块、之后才替换 require.cache 里的 got
@@ -389,7 +389,7 @@ function canStreamRequest (method) {
 function streamRequest (method, url, options, callback) {
   // 白名单闸门（跟进 Codacy dynamic-method-invocation，PR #154）：调用点只传字面量 method，
   // 其余一律 fail-closed，避免「用非静态数据取对象方法再调用」这种形态。
-  // 现状（v3.279 删掉 $.get 死代码之后）：本模块唯一的调用点传 'post'；'get' 一侧保留是为了这个
+  // 现状（v3.279 删掉 get 死代码之后）：本模块唯一的调用点传 'post'；'get' 一侧保留是为了这个
   // 通用助手仍可用于 GET 场景（无人依赖不等于能力该被砍），但它**没有调用方**，别当成已覆盖的路径。
   if (method !== 'post' && method !== 'get') throw new Error('streamRequest: 不支持的 method: ' + method)
   const stream = (method === 'post' ? got.stream.post : got.stream.get)(url, options)
@@ -432,7 +432,7 @@ function streamRequest (method, url, options, callback) {
   })
 }
 
-const $ = {
+const pushHttp = { // 推送层 HTTP 客户端（v3.300 起只剩 post + logErr）；原短名 `$` 已名不副实
   post: (params, callback) => {
     const { url, ...others } = params
     if (canStreamRequest('post')) {
@@ -489,7 +489,7 @@ function pushPlusNotify (text, desp, params = {}) {
         },
         timeout: channelTimeout(params)
       }
-      $.post(options, (err, resp, data) => {
+      pushHttp.post(options, (err, resp, data) => {
         try {
           if (err) {
             const failure = channelError(err, 'pushplus', resp)
@@ -528,7 +528,7 @@ function pushPlusNotify (text, desp, params = {}) {
           // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
           const failure = channelError(e, 'pushplus', resp)
           reject(failure)
-          $.logErr(safeErr(failure))
+          pushHttp.logErr(safeErr(failure))
         } finally {
           resolve(data)
         }
@@ -568,7 +568,7 @@ function serverNotify (text, desp, params = {}) {
         },
         timeout: channelTimeout(params)
       }
-      $.post(options, (err, resp, data) => {
+      pushHttp.post(options, (err, resp, data) => {
         try {
           if (err) {
             reject(err)
@@ -600,7 +600,7 @@ function serverNotify (text, desp, params = {}) {
         } catch (e) {
           // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
           reject(e)
-          $.logErr(safeErr(e))
+          pushHttp.logErr(safeErr(e))
         } finally {
           resolve(data)
         }
@@ -664,7 +664,7 @@ function barkNotify (text, desp, params = {}) {
       }
 
       return new Promise((innerResolve) => {
-        $.post(options, (err, resp, data) => {
+        pushHttp.post(options, (err, resp, data) => {
           try {
             if (err) {
               const failure = channelError(err, 'bark', resp)
@@ -690,7 +690,7 @@ function barkNotify (text, desp, params = {}) {
             }
           } catch (e) {
             const failure = channelError(e, 'bark', resp)
-            $.logErr(safeErr(failure))
+            pushHttp.logErr(safeErr(failure))
             innerResolve({ ok: false, error: failure })
           } finally {
             innerResolve({ ok: false })
@@ -743,7 +743,7 @@ function pushMeNotify (text, desp, params = {}) {
       }
 
       return new Promise((innerResolve) => {
-        $.post(options, (err, resp, data) => {
+        pushHttp.post(options, (err, resp, data) => {
           try {
             if (err) {
               const failure = channelError(err, 'pushme', resp)
@@ -768,7 +768,7 @@ function pushMeNotify (text, desp, params = {}) {
             }
           } catch (e) {
             const failure = channelError(e, 'pushme', resp)
-            $.logErr(safeErr(failure))
+            pushHttp.logErr(safeErr(failure))
             innerResolve({ ok: false, error: failure })
           } finally {
             innerResolve({ ok: false })
@@ -808,7 +808,7 @@ function qywxBotNotify (text, desp, params = {}) {
       timeout: channelTimeout(params)
     }
     if (QYWX_KEY) {
-      $.post(options, (err, resp, data) => {
+      pushHttp.post(options, (err, resp, data) => {
         try {
           if (err) {
             reject(err)
@@ -832,7 +832,7 @@ function qywxBotNotify (text, desp, params = {}) {
         } catch (e) {
           // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
           reject(e)
-          $.logErr(safeErr(e))
+          pushHttp.logErr(safeErr(e))
         } finally {
           resolve(data)
         }
@@ -1354,7 +1354,7 @@ function wxPusherPost (channel, text, desp, params = {}) {
       headers: { 'Content-Type': 'application/json' },
       timeout: channelTimeout(params)
     }
-    $.post(options, (err, resp, data, timings) => {
+    pushHttp.post(options, (err, resp, data, timings) => {
       try {
         if (err) {
           wxPusherProfile(channel, 'network_error', started, timings)
@@ -1373,7 +1373,7 @@ function wxPusherPost (channel, text, desp, params = {}) {
         }
       } catch (e) {
         reject(e)
-        $.logErr(safeErr(e))
+        pushHttp.logErr(safeErr(e))
       }
     })
   })
@@ -1427,7 +1427,7 @@ function wxXiZhiNotify (text, desp, params = {}) {
     }
 
     if (WX_XIZHI_KEY) {
-      $.post(options, (err, resp, data) => {
+      pushHttp.post(options, (err, resp, data) => {
         try {
           if (err) {
             reject(err)
@@ -1453,7 +1453,7 @@ function wxXiZhiNotify (text, desp, params = {}) {
         } catch (e) {
           // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
           reject(e)
-          $.logErr(safeErr(e))
+          pushHttp.logErr(safeErr(e))
         } finally {
           resolve(data)
         }
@@ -1480,7 +1480,7 @@ function pushDeerNotify (text, desp, params = {}) {
         },
         timeout: channelTimeout(params)
       }
-      $.post(options, (err, resp, data) => {
+      pushHttp.post(options, (err, resp, data) => {
         try {
           if (err) {
             reject(err)
@@ -1510,7 +1510,7 @@ function pushDeerNotify (text, desp, params = {}) {
         } catch (e) {
           // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
           reject(e)
-          $.logErr(safeErr(e))
+          pushHttp.logErr(safeErr(e))
         } finally {
           resolve(data)
         }
@@ -1558,7 +1558,7 @@ function tgNotify (text, desp, params = {}) {
         },
         timeout: channelTimeout(params)
       }
-      $.post(options, (err, resp, data) => {
+      pushHttp.post(options, (err, resp, data) => {
         try {
           if (err) {
             reject(err)
@@ -1581,7 +1581,7 @@ function tgNotify (text, desp, params = {}) {
         } catch (e) {
           // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
           reject(e)
-          $.logErr(safeErr(e))
+          pushHttp.logErr(safeErr(e))
         } finally {
           resolve(data)
         }
@@ -1786,13 +1786,13 @@ async function sendNotify (text, desp, params = {}) {
   const hitokotoEnabled = push_config.HITOKOTO === true ||
         (typeof push_config.HITOKOTO === 'string' && push_config.HITOKOTO.toLowerCase() === 'true')
   if (hitokotoEnabled) {
-    if (typeof one === 'function') {
+    if (typeof fetchHitokoto === 'function') {
       // v3.273（审查 S8）：一言文本在入口 cleanSurrogates 之后拼接，其 JSON 里可能带转义孤立代理
       // （\ud800 类）→ 下游 serverNotify/pushDeerNotify 直接 encodeURIComponent 会抛 URIError，
       // 该通道每轮确定性失败。拼接后再清洗一次，与入口「推送前统一处理孤立代理」一致。
       // v3.273（评审 CodeRabbit PR #145）：失败日志改走 safeErr——此前直接打印 e.message/String(e)，
       // 会绕过本模块的密钥脱敏（redactSecrets），与「异常摘要经脱敏再落日志」口径不符。
-      try { desp = cleanSurrogates(desp + '\n\n' + (await one())) } catch (e) { console.log('一言获取失败，跳过:', safeErr(e)) }
+      try { desp = cleanSurrogates(desp + '\n\n' + (await fetchHitokoto())) } catch (e) { console.log('一言获取失败，跳过:', safeErr(e)) }
     }
   }
   // P1（跨批协同，high）：出口清洗门槛必须与内容渲染判定作用于【同一份】串。
