@@ -321,6 +321,9 @@ function App () {
   const busyRunIdRef = useRef(null)
   // 首次刷新完成前不判「无活跃任务」（启动时 runs 尚空，会把丢失响应的 busy 立刻清掉）。
   const refreshedOnceRef = useRef(false)
+  // 首屏那一发不受暂停开关影响（暂停也要先把页面填上）；之后暂停期间的 effect 重跑
+  // （切页签 / locking 翻转）不再补发请求（C7-040）。
+  const bootFetchedRef = useRef(false)
 
   // 每个页签记住自己的「数据截至」：切回已来过的页签时先显示上次时间，
   // 不再先闪一下「手动刷新」再跳成时间。第一次进入才显示占位符。
@@ -744,7 +747,13 @@ function App () {
 
   useEffect(() => {
     if (authExpired) return undefined
-    refreshSplit()
+    // 只有「首屏」与「真的在自动刷新」才补这一发：暂停时切页签 / locking 翻转同样会让本
+    // effect 重跑，无条件 refreshSplit() 等于按了暂停还在打接口（C7-040）。首屏例外——
+    // 否则暂停着重开页面就是一片空白。
+    if (autoRefresh || !bootFetchedRef.current) {
+      bootFetchedRef.current = true
+      refreshSplit()
+    }
     clearInterval(timerRef.current)
     // v3.348：所有页都轮询（用户要求：推送记录/配置/过滤规则/系统 的「自动刷新」必须真的在跑）。
     // 概览/日志拉状态与历史；其余页由统一 tick 让当前面板重拉自己的数据。
