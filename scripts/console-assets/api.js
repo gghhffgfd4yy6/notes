@@ -48,6 +48,34 @@ const BOOT = readBoot()
 // 服务端（形状对但不是日期由服务端判）；日期区间组件（app.js）复用同一个判定。
 const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
 
+// 搜索词长度上限（UTF-8 字节，与服务端 console.js 的钳制同口径）：推送记录
+// MESSAGES_QUERY_MAX_BYTES=240（80 个汉字）、线报全站搜索 LINE_SEARCH_QUERY_MAX_BYTES=120。
+// 日期参数形状不对就不发；搜索词同样不能无上限（C7-057）——超长 q 会把 URL 顶到服务端/代理的
+// 长度上限（414，或服务端按字节截断后回包的 queryUsed 与发出去的不是同一个词）。数据层先按同一
+// 上限截断，URL 长度有界，且发出去的就是服务端真正会用的那个词（前端不必再靠 queryUsed 兜）。
+const MESSAGES_QUERY_MAX_BYTES = 240
+const LINE_SEARCH_QUERY_MAX_BYTES = 120
+const UTF8_ENCODER = typeof TextEncoder === 'function' ? new TextEncoder() : null
+function clampQueryBytes (raw, maxBytes) {
+  if (typeof raw !== 'string') return ''
+  // 服务端两个端点都是「先 trim 再按字节截断」（console.js /api/messages 与 clampLineQuery），
+  // 这里同口径：否则首尾空格会把真正生效的词挤出上限，queryUsed 与请求又不一致。
+  const s = raw.trim()
+  if (s.length === 0) return ''
+  // 绝大多数词远未到上限：先整体编码一次走快路径。
+  if (UTF8_ENCODER && UTF8_ENCODER.encode(s).length <= maxBytes) return s
+  // 截断按码点走（for...of），不切断代理对/emoji；字节口径与服务端 sliceUtf8Bytes 一致。
+  let out = ''
+  let used = 0
+  for (const ch of s) {
+    const n = UTF8_ENCODER ? UTF8_ENCODER.encode(ch).length : ch.length
+    if (used + n > maxBytes) break
+    out += ch
+    used += n
+  }
+  return out
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 // token 只走 Authorization: Bearer 头（URL 不带任何凭证；console.js 服务端不打访问日志，
 // 但浏览器扩展/中间代理可能记 URL——凭证不进 URL 是更安全的默认）。
@@ -244,7 +272,9 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(size) && size !== 20) params.set('size', String(size))
   if (typeof cate === 'string' && cate.length > 0) params.set('cate', cate)
-  if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  // 搜索词按服务端同一上限（240 字节）截断后再发：URL 有界，且发出去的就是生效的那个词。
+  const qText = clampQueryBytes(q, MESSAGES_QUERY_MAX_BYTES)
+  if (qText.length > 0) params.set('q', qText)
   // 时间窗（v3.307）：0/未传=全部；1/3/7/30=近 N 个上海日历日（服务端白名单兜底）
   if (Number.isSafeInteger(days) && days > 0) params.set('days', String(days))
   // 自定义区间（v3.326）：YYYY-MM-DD 闭区间，服务端优先于 days（非法/颠倒时静默回落）
@@ -657,7 +687,10 @@ async function triggerNotifyTest () {
 // URLSearchParams，authority 恒为字面量；期限比普通端点长（服务端上游超时 8s）。
 function apiSearchLines ({ q, page, limit } = {}) {
   const params = new URLSearchParams()
-  if (typeof q === 'string' && q.length > 0) params.set('q', q)
+  // 搜索词上限 120 字节（服务端 LINE_SEARCH_QUERY_MAX_BYTES 同口径）：面板已在输入侧钳制，
+  // 数据层再兜一道——直接调 apiSearchLines 的路径（关注词/深链）也不能发出超长 q。
+  const qText = clampQueryBytes(q, LINE_SEARCH_QUERY_MAX_BYTES)
+  if (qText.length > 0) params.set('q', qText)
   if (Number.isSafeInteger(page) && page > 1) params.set('page', String(page))
   if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   const qs = params.toString()
