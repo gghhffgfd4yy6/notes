@@ -228,6 +228,26 @@ function makeCase () {
   }
 }
 
+// 7b) 【C10-031 靶向】拼错的参数（--verfiy）必须拒绝执行：旧实现只看 includes('--verify')，
+//     未知参数被静默忽略 ⇒ 直接落到安装路径并**真的写入 core.hooksPath**——一次笔误就改了仓库配置，
+//     调用方还以为自己在做只读自检。现在必须非 0 退出、点名参数本身，且绝不写配置。
+{
+  const { dir, home } = makeCase()
+  try {
+    initRepo(dir, home)
+    writeHooks(dir, EXPECTED_HOOKS)
+    const r = runPlugin(dir, home, ['--verfiy'])
+    assert.strictEqual(r.status, 2, `未知参数必须 fail-closed（参数错误用 2，与「门禁未生效」的 1 区分）：${r.stderr}`)
+    assert.match(r.stderr, /未识别参数/, '必须点名「未识别参数」')
+    assert.match(r.stderr, /--verfiy/, '必须回显拼错的参数，否则用户看不出是笔误（--verfiy vs --verify）')
+    assert.notStrictEqual(gitConfig(dir, home, 'core.hooksPath').status, 0,
+      '未知参数不得写入 core.hooksPath（旧实现把笔误 --verfiy 当成安装执行）')
+    assert.doesNotMatch(r.stdout, /已注册|已就绪/, '拒绝执行时不得打印任何「已注册/已就绪」的成功结论')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 // 8) 【v3.276 靶向断言】旧清单（只有 pre-commit + commit-msg，缺 pre-push）：--verify 必须非 0 并点名
 //    pre-push。把 HOOK_FILES 回退成迁移前的 ['pre-commit','commit-msg']，本用例必红：那版实现认为
 //    门禁齐备 → exit 0，而承载 test:filter 的 pre-push 实际不存在（提交/推送门禁被静默削弱）。
