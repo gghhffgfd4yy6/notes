@@ -394,8 +394,11 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
   await test('脱敏红线: guard catch 走 summarizeError、原始 error 不得进打印/序列化', () => {
     const body = guardHandlerBodyOf(entrySrc, GUARD_CATCH_ANCHOR)
     assert.ok(body.length > 200, `必须真的取到 guard catch 处理器体（实际 ${body.length} 字节）`)
-    // 实参名从锚点之后取：文件更早的地方还有别的 .catch(...)，不能全文件找第一个
-    const caught = /\.catch\(\s*\(?\s*([A-Za-z_$][\w$]*)\s*=>/.exec(entrySrc.slice(entrySrc.indexOf(GUARD_CATCH_ANCHOR)))
+    // 实参名从锚点之后取：文件更早的地方还有别的 .catch(...)，不能全文件找第一个。
+    // 形态：`.catch(e =>` / `.catch( (err =>`（多余空白可省）。旧写法 `\s*\(?\s*` 中间夹一个可省的 `(`，
+    // 两侧量词在纯空白串上可以任意切分 ⇒ 超线性回切（S5852）。把 `(` 与它后面的空白捆成一组的可选前缀
+    // 后，每个空白的归属唯一（`(` 不可能是空白），匹配语言与旧写法完全相同（探针里穷举短串比对过）。
+    const caught = /\.catch\(\s*(?:\(\s*)?([A-Za-z_$][\w$]*)\s*=>/.exec(entrySrc.slice(entrySrc.indexOf(GUARD_CATCH_ANCHOR)))
     assert.ok(caught, 'guard catch 必须带具名实参（取段与负断言都依赖它）')
     assert.ok(body.includes(`summarizeError(${caught[1]})`),
       `guard catch 必须过 summarizeError(${caught[1]})`)

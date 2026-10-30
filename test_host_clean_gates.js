@@ -106,14 +106,23 @@ if (process.env.XBK_HOST_CLEAN_THROW_PROBE !== '1') {
     assert.match(probe.stdout, /❌ 💥 探针：故意抛错/, '抛错的检查必须打印 ❌ + label，而不是抛栈退出：' + both.slice(-600))
     assert.ok(probe.stdout.includes('✅ 清理建议必须对空格和 shell 元字符进行 POSIX 引用'),
       '抛错之后的检查必须照跑（末条检查的 ✅ 缺失说明整份文件中止了）：' + both.slice(-600))
-    // 计数按「真实数量」核对（不写死通过数：宿主机不干净时其它检查可能连带失败，那与本用例无关）
-    const summary = probe.stdout.match(/(\d+) 通过 \/ (\d+) 失败（共 (\d+) 检查）/)
+    // 计数按「真实数量」核对（不写死通过数：宿主机不干净时其它检查可能连带失败，那与本用例无关）。
+    // 数字收敛成 1..9 位（S5852）：无界 `\d+` 的回退步数随数字串长度增长，有界后每个起点最多 9 次。
+    // V8 实测本形态没有可测退化（4e6 字符 2.45ms），所以这条是「把上界写死」而不是修性能；
+    // 计数不可能到十位，真到了也不会静默截断——total = passed + failed，任一项 ≥10 位时第三组
+    // 没法在 ` 检查）` 前收口 ⇒ summary 为 null ⇒ 下一行 assert.ok 当场判红。
+    // 三个数字的口径断言（失败≥1 / passed+failed=total / passed≥13）一字未动。
+    const summary = probe.stdout.match(/(\d{1,9}) 通过 \/ (\d{1,9}) 失败（共 (\d{1,9}) 检查）/)
     assert.ok(summary, '有失败时必须有汇总行（旧实现连结论都没有）：' + both.slice(-600))
     const [, passed, failed, total] = summary.map(Number)
     assert.ok(failed >= 1, `汇总必须记下失败条数（实得 ${failed}）：` + both.slice(-600))
     assert.strictEqual(passed + failed, total, `汇总三数字必须自洽（${passed}+${failed}≠${total}）`)
     assert.ok(passed >= 13, `探头之后仍有 13 条检查必须跑完（实得 ${passed} 通过）：` + both.slice(-600))
-    assert.ok(!/Error: probe-throw\s*\n\s*at /.test(both),
+    // 直观形态是 `Error: probe-throw` 换行后跟若干层 `    at …`。旧写法 `\s*\n\s*` 里 `\s` 也能吃换行，
+    // 中间的 `\n` 与两侧量词抢同一段空白 ⇒ 超线性回切（S5852）。去掉中间的换行字面量后只剩一个量词，
+    // 后面紧跟的 `at` 又不可能属于空白 ⇒ 判定唯一。顺带更严：旧写法要求消息与帧之间有换行，
+    // 内联吐出来的栈（`Error: probe-throw       at …`）它漏判，新写法照样抓住。
+    assert.ok(!/Error: probe-throw\s*at /.test(both),
       '不得把原始异常栈直接抛到顶层（旧实现的行为）：' + both.slice(-600))
   })
 }
@@ -210,7 +219,12 @@ check('require 容错只吞「本模块不存在」，模块内部依赖缺失�
     }
     // ③ 生产路径不得回退：先 require.resolve 预判，resolve 成功后的 require 异常照常抛
     const src = read(c.entry)
-    assert.match(src, /try \{\s*\n\s*require\.resolve\(HOST_CLEAN_MODULE\)/,
+    // 可匹配形态：`try {` 换行后紧跟 `require.resolve(HOST_CLEAN_MODULE)`（中间允许空行）。
+    // 旧写法 `\s*\n\s*` 里 `\s` 也能吃换行，两侧抢同一段空白 ⇒ 超线性回切（S5852）。
+    // 把「行尾空白」限定成 [ \t]（不含换行）后，`\n` 只能由字面量吃掉，判定退化为一次线性扫描；
+    // 「先 require.resolve、再 require」这条判据本身一字未变——坏形态反例（直接 require 进 catch）
+    // 由紧随其后的负断言继续兜住。
+    assert.match(src, /try \{[ \t]*\n\s*require\.resolve\(HOST_CLEAN_MODULE\)/,
       `${c.entry} 必须先 require.resolve 本模块、再 require 它（否则任何 MODULE_NOT_FOUND 又会被当成「脚本不存在」）`)
     assert.ok(!/hostClean = require\('\.\/scripts\/check-host-clean\.js'\)\s*\n\}\s*catch/.test(src),
       `${c.entry} 不得把 require 直接放在只判 e.code 的 catch 里（C10-028 的原形）`)
