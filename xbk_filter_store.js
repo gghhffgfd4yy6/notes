@@ -501,6 +501,9 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
+  // 两道「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
+  // + 读后复检 inode，末级是链接直接判 unsafe），收紧走 enforceOwnerOnlyMode（O_NOFOLLOW 打开、
+  // 对比 lstat 的 dev/ino、chmod 后按 fd 复检）——任一处被换成链接都不会读到、更不会 chmod 到链接目标。
   const read = readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES)
   if (read.status === 'missing') {
     // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废。

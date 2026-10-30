@@ -14,12 +14,20 @@
 // 安全事实：入参只来自 FilterStore 的 filterRulesPaths(cacheDir).file —— 目录由
 // 调用方（控制台 stateDir / XBK_CACHE_DIR / 测试临时目录）传入，文件名是本仓
 // 字面量常量；不接受请求体/URL 拼出的路径。本模块只 stat + chmod，不读内容。
+//
+// 但是「路径来自内部」不等于「路径上的节点不可被替换」：状态目录可写者（同机其它
+// 进程/账号，或未来的多租户部署）能在读与收紧之间把该路径换成符号链接，而按路径
+// 的 stat/chmod 都会跟随链接 —— 收紧动作就落到链接目标上，改的是别人的权限位
+// （C10-019）。故本模块以 O_NOFOLLOW 打开、按 fd 确认普通文件、再对比路径的
+// inode，最后才对路径 chmod 并按 fd 复检位宽。
 // ============================================================
 
 const fs = require('fs')
 
 const OWNER_ONLY_MODE = 0o600
 const GROUP_OTHER_BITS = 0o077
+// O_NOFOLLOW 在 Windows 上不存在：此时退化为 0（由下方 lstat 的符号链接判断兜底）。
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0
 
 function safeErrorMessage (err) {
   if (!err) return '未知错误'
@@ -27,26 +35,59 @@ function safeErrorMessage (err) {
 }
 
 /**
- * 把已存在的文件收紧到 0600。
+ * 把已存在的**普通文件**收紧到 0600；符号链接一律拒绝（绝不改链接目标的权限）。
  * @param {string} file 状态目录内的固定文件（见模块头部的安全事实）
  * @returns {{ok:true, tightened:boolean}|{ok:false, message:string}}
  */
 function enforceOwnerOnlyMode (file) {
-  let stat
+  let fd
   try {
-    stat = fs.statSync(file)
+    // O_NOFOLLOW：末级是符号链接时 open 直接 ELOOP，从源头上不跟随。
+    fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW)
   } catch (e) {
-    // 读成功后 stat 仍失败（并发删除/替换）：无法确认权限 ⇒ 按损坏降级。
+    if (e && e.code === 'ELOOP') {
+      return { ok: false, message: '覆盖文件是符号链接，拒绝按路径收紧权限（这会改到链接目标）' }
+    }
+    // 读成功后 open 仍失败（并发删除/替换/权限变化）：无法确认权限 ⇒ 按损坏降级。
     return { ok: false, message: `覆盖文件无法确认权限（${safeErrorMessage(e)}）` }
   }
-  const mode = stat.mode & 0o777
-  if ((mode & GROUP_OTHER_BITS) === 0) return { ok: true, tightened: false }
   try {
-    fs.chmodSync(file, OWNER_ONLY_MODE)
-  } catch (e) {
-    return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且无法收紧到 0600：${safeErrorMessage(e)}` }
+    let fdStat
+    let pathStat
+    try {
+      fdStat = fs.fstatSync(fd)
+      pathStat = fs.lstatSync(file)
+    } catch (e) {
+      return { ok: false, message: `覆盖文件无法确认权限（${safeErrorMessage(e)}）` }
+    }
+    // 三重确认「路径此刻指向的就是我们打开的这个普通文件」：非普通文件、路径已是链接、
+    // 或 inode 不符（打开后被原子替换）都拒绝，不去碰任何目标。
+    if (!fdStat.isFile() || pathStat.isSymbolicLink() || pathStat.dev !== fdStat.dev || pathStat.ino !== fdStat.ino) {
+      return { ok: false, message: '覆盖文件不是稳定的普通文件（符号链接/类型变化/读取期间被替换），拒绝收紧权限' }
+    }
+    const mode = fdStat.mode & 0o777
+    if ((mode & GROUP_OTHER_BITS) === 0) return { ok: true, tightened: false }
+    try {
+      fs.chmodSync(file, OWNER_ONLY_MODE)
+    } catch (e) {
+      return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且无法收紧到 0600：${safeErrorMessage(e)}` }
+    }
+    // 按 fd 复检：这一份 inode 的位宽真的被收窄了吗？路径在 chmod 前被换掉时，
+    // chmod 落到别的节点上，这里会看到位宽未变 ⇒ 报失败，而不是把「别人的权限改了」
+    // 说成「本文件已收紧」。
+    let after
+    try {
+      after = fs.fstatSync(fd).mode & 0o777
+    } catch (e) {
+      return { ok: false, message: `覆盖文件收紧后无法复检权限（${safeErrorMessage(e)}）` }
+    }
+    if ((after & GROUP_OTHER_BITS) !== 0) {
+      return { ok: false, message: `覆盖文件权限过宽（0${mode.toString(8)}）且收紧后复检仍为 0${after.toString(8)}：路径可能在收紧期间被替换` }
+    }
+    return { ok: true, tightened: true }
+  } finally {
+    try { fs.closeSync(fd) } catch (e) { /* 忽略关闭失败 */ }
   }
-  return { ok: true, tightened: true }
 }
 
 module.exports = { enforceOwnerOnlyMode, OWNER_ONLY_MODE, GROUP_OTHER_BITS }

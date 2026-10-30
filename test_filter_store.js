@@ -613,6 +613,26 @@ test('A3 权限过宽且无法收紧 → 按损坏处理并说明原因（不改
   assert.strictEqual(fs.statSync(file).mode & 0o777, widened, '收紧失败时文件权限保持原样（本模块不假装成功）')
 })
 
+test('A3/C10-019 覆盖文件是符号链接 → 拒绝收紧，绝不改链接目标（旧实现按路径 chmod 会落到 victim 上）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const victim = path.join(dir, 'victim.json')
+  writeJson(victim, { schema: 1, revision: 3, filter: { pingbibiaoti: '链接目标规则' } })
+  // 构造「victim 权限过宽」：收紧若跟随链接，就会把 victim 改到 0600（= 改了别人的文件）。
+  const widened = (fs.statSync(victim).mode & 0o777) | 0o044
+  fs.chmodSync(victim, widened)
+  const file = filterRulesPaths(dir).file
+  fs.symlinkSync(victim, file)
+
+  const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loaded.source, 'corrupt', '符号链接不是可用的覆盖文件（读路径 O_NOFOLLOW 判 unsafe）')
+  assert.strictEqual(loaded.lastGoodUsed, false)
+  assert.match(String(loaded.error && loaded.error.message), /不可读|符号链接|非普通文件/,
+    `必须说明覆盖文件不可用：${loaded.error && loaded.error.message}`)
+  assert.strictEqual(fs.statSync(victim).mode & 0o777, widened,
+    '链接目标的权限必须原样保留——旧实现 stat/chmod 都跟随链接，会把 victim 收紧成 0600')
+})
+
 test('A4 文件删除即作废本目录 lastGood：后续畸形文件不得复活旧规则', () => {
   resetStoreStateForTests()
   const dir = makeDir()
