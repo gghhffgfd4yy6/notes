@@ -88,6 +88,10 @@ function isDirectory (target) {
 // 这里先读 mode 与挂载选项（纯元数据，不执行任何东西），再用 access 兜底，并给出可区分的诊断。
 const OWNER_EXEC_BIT = 0o100
 const PROC_MOUNTS = '/proc/self/mounts'
+// Windows 没有 POSIX 执行位（评审 CR-06）：chmod 只切只读标志，mode 位永远不置位，而 access(X_OK)
+// 在 Windows 上只等价于「存在」。按 POSIX 口径判 owner 执行位会把**可正常执行**的钩子判成
+// missing-mode，且 verifyHooks 的自动修复（chmod 0o700）清不掉 ⇒ 安装与 --verify 一起假红。
+const IS_WINDOWS = process.platform === 'win32'
 
 // /proc/self/mounts 用 \040 \011 \012 \134 转义空白与反斜杠；挂载点路径含空格时不解码就匹配不上。
 function decodeMountField (field) {
@@ -141,7 +145,8 @@ function execDiagnosis (file) {
   if (mount && mount.noexec) {
     return { ok: false, fixable: false, code: 'noexec', reason: `所在挂载点 ${mount.point} 带 noexec，执行位改了也 execve 不了` }
   }
-  if ((mode & OWNER_EXEC_BIT) === 0) {
+  // Windows 跳过 owner 执行位判定（见 IS_WINDOWS 注释）：这里的 mode 位没有执行语义。
+  if (!IS_WINDOWS && (mode & OWNER_EXEC_BIT) === 0) {
     return { ok: false, fixable: true, code: 'missing-mode', reason: `缺少属主执行位（0${mode.toString(8)}）` }
   }
   try {
