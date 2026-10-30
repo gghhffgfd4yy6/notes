@@ -968,6 +968,12 @@ function TrendsPanel ({ active = true }) {
   const [selDay, setSelDay] = useState(null)
   const toggleDay = (date) => setSelDay((cur) => (cur === date ? null : date))
   // 横向滚动：默认停在最右侧（最近一天），用户可直接左滑看更早日期
+  // 对齐重算的触发指纹（C7-051）：旧依赖只有 byDay.length，等长窗口切换（14 天区间 → 另一段
+  // 14 天区间、或 30→60→30 来回切回同样天数）时列集合全换了但 key 没变，内联 paddingRight
+  // 停在上一组列算出的值 ⇒ 右端空白累积/最右几列跑出容器。列宽是固定的 34px（.trend-col），
+  // 几何只由「列数 + 各自日期」决定，故指纹只取日期序列：条数变化（同一窗口的下一拍轮询）
+  // 不该重跑——那会把用户左滑查看的位置强行拽回最右端。
+  const alignKey = byDay.map((d) => d.date).join('|')
   const scrollRef = useRef(null)
   // 对齐必须在绘制前完成：切窗口时一组新列在同一个 commit 里换进来，
   // 若放到 useEffect（绘制后）再对齐，会先画出一帧「沿用旧 scrollLeft、指向窗口最早几天」的
@@ -1007,7 +1013,7 @@ function TrendsPanel ({ active = true }) {
     }
     const schedule = () => { if (raf === 0) raf = window.requestAnimationFrame(align) }
     align()
-    // 容器宽度变化（横竖屏、窗口缩放）时 byDay.length 不变，也必须重新对齐；
+    // 容器宽度变化（横竖屏、窗口缩放）时列集合固定，也必须重新对齐；
     // 否则会保留旧 padding/滚动位置，最右几列又跑出容器（Sourcery #254）。
     let ro = null
     if (typeof window.ResizeObserver === 'function') {
@@ -1021,7 +1027,7 @@ function TrendsPanel ({ active = true }) {
       if (ro !== null) ro.disconnect()
       else window.removeEventListener('resize', schedule)
     }
-  }, [byDay.length])
+  }, [alignKey])
   return html`<div class="panel">
     <${PanelHead} title=${shownRange ? `运行趋势（${shownRange}）` : (shownDays ? `近 ${shownDays} 日运行趋势` : '运行趋势')}
       afterTitle=${html`<div class="toolbar">
