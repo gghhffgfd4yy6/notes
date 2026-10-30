@@ -1104,7 +1104,14 @@ function CacheHealthPanel ({ paused = false, active = true }) {
         filesLoader.load().catch(() => {})
       }
     }
-    const t = setInterval(() => { if (document.visibilityState !== 'hidden') load().catch(() => {}) }, 60000)
+    const t = setInterval(() => {
+      if (document.visibilityState === 'hidden') return
+      // C7-043：右列文件清单必须跟左列同一拍刷新。旧实现只调 load()，两列从此各自新鲜度
+      // 不同步——页面开着过夜时左列 mtime 在走、右列还停在首次快照（files 数组与大小都过期）。
+      // /api/files 与文件清单页共用 once('files') 的在飞去重，不会和那边的请求叠发。
+      load().catch(() => {})
+      filesLoader.load().catch(() => {})
+    }, 60000)
     // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
     // 通知当前页签的面板，这里再挂一个就会被拉两次（Sourcery PR #300）。
     return () => clearInterval(t)
