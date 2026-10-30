@@ -91,13 +91,16 @@ jobs:
             console.log('tag 与 package.json 版本一致：v' + tagVer)
           " "$VERSION"
 
-      - name: 安装依赖
+      # C10-048：--ignore-scripts 只跳过**所有依赖**的安装脚本；re2 自己的 install 脚本由下一步用
+      # `npm rebuild re2` 限定到这一个包恢复（手工调 install-from-cache.js 会丢掉脚本里的 node-gyp 回退）。
+      - name: 安装依赖（跳过全部依赖的安装脚本）
         run: npm ci --ignore-scripts
 
-      # 仅执行 re2 自身安装脚本，优先使用带 SHA-256 校验的预编译包，失败时由其脚本回退 node-gyp 源码构建。
-      - name: 安装并验证 re2 原生模块
+      # 仅执行 re2 自身的安装脚本：npm rebuild 保证只跑这一个包，并由 npm 提供 cwd / npm_package_json；
+      # 预编译包带 SHA-256 校验，下载失败时由 re2 脚本回退 node-gyp 源码构建。
+      - name: 安装并验证 re2 原生模块（只重建 re2）
         run: |
-          (cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node --host-var RE2_DOWNLOAD_MIRROR --skip-path-var RE2_DOWNLOAD_SKIP_PATH --skip-ver-var RE2_DOWNLOAD_SKIP_VER --force-build-var RE2_DOWNLOAD_FORCE_BUILD)
+          npm rebuild re2 --foreground-scripts --ignore-scripts=false
           node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
 
       - name: 版本一致性校验（101 章：文件头 ↔ CHANGELOG ↔ package.json）

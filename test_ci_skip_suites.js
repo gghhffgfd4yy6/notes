@@ -2824,6 +2824,134 @@ const parseMatrixTimeouts = (ymlText) => parseMatrixInclude(ymlText, MATRIX_FIEL
 }
 console.log('✅ stryker.tap.config.js：报告路径为 stryker 默认、runner 契约（testRunner=tap / coverageAnalysis=perTest / tap.testFiles 非空）均已锁（靶向反例已锁）；mutation.yml 矩阵逐段 config 齐备、文件真实存在、恰 v3-entry/storage/qinglong-push/check-deps 四段 command 档，且消费点逐字用 $' + '{' + '{ matrix.config }}（靶向反例已锁）')
 
+// ── 3k TAP 档跳过集合的强制清空（C10-010）────────────────────────────────────────────────────
+// 缺陷形态：stryker.tap.config.js 只在**注释**里宣称「SKIP_SUITES 在变异场景恒为空串……CI 的 step env
+//   亦未设置该变量 ⇒ 同样为空串」——那是环境假设，而这个变量就活在仓库自己的 test.yml 单元步骤里（job/
+//   step 层继承即可带进 mutation）。一旦带进来，TAP 档会静默少跑套件（tap-shim 把被跳过的文件如实记成
+//   `ok # SKIP`，满屏皆绿），下方显式 testFiles 清单与 perTest 归因随 command 档分叉，两档分数不可比。
+// 判据三层，缺一层就退回假设：
+//   ① 运行期：加载**真配置**后 process.env.SKIP_SUITES 必须是空串（子进程实测，不是读源码正则）；
+//   ② 传播：tap-runner 给被测文件的环境是 {...process.env}（dist/src/tap-test-runner.js 的 runFile），
+//      故按同一形态 spawn 孙进程——孙进程看到的也必须是空串（否则「清了父进程、子进程仍跳过」）；
+//   ③ 声明：mutation.yml 的「变异测试」step 显式写 SKIP_SUITES: ''（step 级 env 覆盖上层继承值）。
+{
+  // 探针：加载目标配置 → 按 tap-runner 的形态 spawn 孙进程 → 报告父/子两处看到的 SKIP_SUITES。
+  // 目标配置经 env 传入（不用 argv：`node -e` 的 argv 语义随 Node 版本变，env 是确定的）。
+  const PROBE = [
+    "const { spawnSync } = require('node:child_process')",
+    'require(process.env.CFG)',
+    "const g = spawnSync(process.execPath, ['-e', \"process.stdout.write('[' + String(process.env.SKIP_SUITES) + ']')\"], { encoding: 'utf8', env: { ...process.env } })",
+    "process.stdout.write(JSON.stringify({ after: '[' + String(process.env.SKIP_SUITES) + ']', child: g.stdout }))"
+  ].join('\n')
+  const runProbe = (cfg, skipValue) => {
+    const r = spawnSync(process.execPath, ['-e', PROBE], {
+      encoding: 'utf8', cwd: __dirname, env: { ...baseEnv, CFG: cfg, SKIP_SUITES: skipValue }, timeout: 60000
+    })
+    assert.strictEqual(r.status, 0, `探针必须正常收场（stderr: ${r.stderr}）`)
+    return { ...JSON.parse(r.stdout), stderr: r.stderr }
+  }
+
+  // 反例夹具（证明探针能发现「没清空」，不是恒真）：一份**什么都不做**的空壳配置。
+  const fixDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-tap-skip-'))
+  try {
+    const stub = path.join(fixDir, 'no-clear.config.js')
+    fs.writeFileSync(stub, 'module.exports = {}\n')
+    const dirty = runProbe(stub, 'test_filter.js')
+    assert.strictEqual(dirty.after, '[test_filter.js]',
+      '反例夹具必须让继承值原样活到配置加载之后（否则下面「已清空」的断言证明不了任何事）')
+    assert.strictEqual(dirty.child, '[test_filter.js]',
+      '反例夹具的孙进程必须同样看到继承值（否则 ② 的传播判据不是真的在看子进程）')
+  } finally {
+    fs.rmSync(fixDir, { recursive: true, force: true })
+  }
+
+  // ① + ②：真配置
+  const real = runProbe(path.join(__dirname, 'stryker.tap.config.js'), 'test_filter.js,test_storage.js')
+  assert.strictEqual(real.after, '[]',
+    'stryker.tap.config.js 加载后必须把继承的 SKIP_SUITES 强制清空（C10-010：不得再靠「CI 的 step env 没设它」）')
+  assert.strictEqual(real.child, '[]',
+    '清空必须覆盖 tap-runner 的子进程：它给被测文件的环境是 {...process.env}，父进程清了子进程就必须是空串')
+  assert.match(real.stderr, /忽略继承的 SKIP_SUITES=test_filter\.js,test_storage\.js/,
+    `清空必须留一行可归因的证据（带原值），否则「谁把它设进来的」永远查不到（实际 stderr：${JSON.stringify(real.stderr)}）`)
+
+  // ③ mutation.yml 的声明层：只认「变异测试」step 内那一行，注释不算证据。
+  const mutationStepLines = (yml) => {
+    const lines = yml.split('\n')
+    const start = lines.findIndex(l => /^\s*- name: 变异测试（/.test(l))
+    assert.notStrictEqual(start, -1, 'mutation.yml 必须有「变异测试」step（改名即红：本判据不得静默失效）')
+    const indent = lines[start].match(/^\s*/)[0].length
+    let end = lines.length
+    for (let i = start + 1; i < lines.length; i++) {
+      const m = lines[i].match(/^(\s*)- name:/)
+      if (m && m[1].length === indent) { end = i; break }
+    }
+    return lines.slice(start, end)
+  }
+  const assertSkipDeclaration = (yml) => {
+    const envLines = mutationStepLines(yml).filter(l => /^\s*SKIP_SUITES:/.test(l))
+    assert.strictEqual(envLines.length, 1,
+      '「变异测试」step 必须**恰有一行** SKIP_SUITES（0 行 = 声明层退回环境假设；多行 = YAML 重复键，后者静默覆盖前者）')
+    assert.strictEqual(envLines[0].trim(), "SKIP_SUITES: ''",
+      "该行必须是 SKIP_SUITES: ''（step 级覆盖上层继承值；写成非空串会让 TAP 档少跑套件）")
+  }
+  assertSkipDeclaration(mutationYml)
+  // 靶向反例：删掉这行 ⇒ 必须红（证明 ③ 真的在断言它，而不是恰好通过）
+  {
+    const stripped = mutationYml.split('\n').filter(l => !/^\s*SKIP_SUITES: ''\s*$/.test(l)).join('\n')
+    assert.notStrictEqual(stripped, mutationYml, '反例夹具必须真的删掉了那行声明')
+    assert.throws(() => assertSkipDeclaration(stripped), /恰有一行\*\* SKIP_SUITES/,
+      '删掉声明行后必须红：否则「step 显式置空」这条声明层防线会静默消失')
+  }
+  console.log("✅ C10-010：TAP 档跳过集合由 stryker.tap.config.js 加载期强制清空（真子进程实测：父进程与 tap-runner 形态的孙进程都为空串、并留带原值的证据）；mutation.yml 变异测试 step 显式 SKIP_SUITES: ''（靶向反例已锁）")
+}
+
+// ── 3l re2 安装脚本：声明与实际一致，且作用域由 npm 限定（C10-048）──────────────────────────────
+// 缺陷形态：`npm ci --ignore-scripts` 的 step 名/注释宣称「忽略脚本，防供应链风险」，紧随其后的下一步却
+//   手工执行 re2 包里的 install-from-cache.js —— 声明被自己抵消，读者会以为本 job 一个安装脚本都没跑。
+//   更实质的后果：re2 的 install 脚本是 `install-from-cache … || node-gyp -j max rebuild`，手工直调 bin
+//   **把回退丢掉了**（预编译包下载失败即硬失败），而注释一直宣称「失败时由其脚本回退源码构建」。
+// 判据（只认活动行，注释不算证据）：
+//   a) workflow 不得直接调用依赖包内的 bin（install-from-cache）——恢复安装脚本只能经 npm 的包级作用域；
+//   b) 每处 `npm rebuild re2` 必须显式 --ignore-scripts=false（否则 npm 配置一旦默认忽略脚本，这步静默 no-op）；
+//   c) test.yml / mutation.yml / release.yml 各自至少一处 npm rebuild re2（re2 是唯一需要安装脚本的依赖）。
+{
+  const WF = ['test.yml', 'mutation.yml', 'release.yml']
+  const wfText = (f) => fs.readFileSync(path.join(__dirname, '.github', 'workflows', f), 'utf8')
+  const assertRe2Scoped = (text, label) => {
+    const active = text.split('\n').filter(l => l.trim() !== '' && !/^\s*#/.test(l))
+    const direct = active.filter(l => l.includes('install-from-cache'))
+    assert.deepStrictEqual(direct, [],
+      `${label}: 不得直接调用依赖包里的 install 脚本（${direct.join(' | ')}）——恢复 re2 的安装脚本只能经 ` +
+      '`npm rebuild re2` 的包级作用域：直调 bin 会丢掉 re2 install 脚本里的 `|| node-gyp -j max rebuild` 回退，' +
+      '同时让 `npm ci --ignore-scripts` 的声明变成一句空话')
+    const rebuilds = active.filter(l => /\bnpm rebuild re2\b/.test(l))
+    assert.ok(rebuilds.length > 0, `${label}: 必须有一处 \`npm rebuild re2\`（re2 是唯一需要安装脚本的原生依赖）`)
+    for (const l of rebuilds) {
+      assert.match(l, /--ignore-scripts=false/,
+        `${label}: \`npm rebuild re2\` 必须显式 --ignore-scripts=false（否则 npm 配置一旦默认忽略脚本，这步静默什么都不做，re2 缺失要到下一步 require 才炸）——实际：${l.trim()}`)
+    }
+  }
+  for (const f of WF) assertRe2Scoped(wfText(f), f)
+  // 靶向反例 1：把 test.yml 的 npm rebuild 换回旧的手工直调 ⇒ 必须红（证明 a) 不是空断言）
+  {
+    const text = wfText('test.yml')
+    const mutated = text.replace(/^(\s*)npm rebuild re2 --foreground-scripts --ignore-scripts=false$/m,
+      '$1(cd node_modules/re2 && npm_package_json="$PWD/package.json" node ../install-artifact-from-github/bin/install-from-cache.js --artifact build/Release/re2.node)')
+    assert.notStrictEqual(mutated, text, '反例夹具必须真的把 npm rebuild 换成了手工直调')
+    assert.throws(() => assertRe2Scoped(mutated, 'fixture'), /不得直接调用/,
+      '直调依赖包内 bin 后必须红：否则「声明被下一步抵消」这个缺陷可以原样回来而门禁全绿')
+  }
+  // 靶向反例 2：去掉 --ignore-scripts=false ⇒ 必须红
+  {
+    const text = wfText('release.yml')
+    const mutated = text.replace('npm rebuild re2 --foreground-scripts --ignore-scripts=false', 'npm rebuild re2 --foreground-scripts')
+    assert.notStrictEqual(mutated, text, '反例夹具必须真的去掉了显式重开')
+    assert.throws(() => assertRe2Scoped(mutated, 'fixture'), /--ignore-scripts=false/,
+      '去掉显式重开后必须红：否则「只重开 re2 一个包」的声明随时会退化成静默 no-op')
+  }
+  console.log('✅ C10-048：test.yml / mutation.yml / release.yml 的 re2 恢复都经 `npm rebuild re2 --ignore-scripts=false`（包级作用域，保留脚本内的 node-gyp 回退），无手工直调 install-from-cache（两条靶向反例已锁）')
+}
+
 // ── 3j 逐段 timeoutMS（console 12 段 60s）的接线契约 ────────────────────────────────────────────
 // 为什么必须锁：`timeoutMS` 只允许经 **CLI** 覆盖（`--timeoutMS ${{ matrix.timeout_ms || 300000 }}`），
 //   理由是 stryker core 的 config-reader 是 deepMerge(options, cliOptions)、而「恢复增量缓存」的 key 只
