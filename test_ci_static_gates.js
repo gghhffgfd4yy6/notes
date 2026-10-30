@@ -24,6 +24,10 @@ const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
 // 判成潜在超线性回溯（S5852），而这里的语义本来就只是「某一行的内容等于 / 以 X 起头」。
 const lineThat = (text, re) => text.split('\n').map((l) => l.trim()).find((l) => re.test(l))
 const linesThat = (text, re) => text.split('\n').map((l) => l.trim()).filter((l) => re.test(l))
+// 显式码元序比较器（Sonar S2879）：两处扫描面比对共用一份，口径 = UTF-16 码元字典序。
+// **不得**换成 localeCompare：它按宿主语言环境做大小写/重音不敏感排序，'pre-push' 与 'Pre-push'
+// 这类混排的相对位置会翻转 ⇒ `.githooks` 扫描面比对随机器 locale 漂移（下面有靶向断言钉这一点）。
+const byCodeUnit = (a, b) => (a === b ? 0 : a < b ? -1 : 1)
 
 // C5-022：harness 不能在一条检查抛错时就中断整个文件。旧实现 `fn()` 直接穿出顶层：不打印 label、
 // 不计数、无汇总，后面的检查一条都不跑（与 test_doc_line_gates.js 同一套工厂形态）。每条检查独立
@@ -171,8 +175,12 @@ check('C5-013 扫描面守卫：门禁真的会扫到 N 个 .githooks 文件（N
   assert.ok(targets.length >= 2, `扫描面不得塌成 0：实际 ${targets.length} 个（扫描循环被删/目录读空即红）`)
   const onDisk = fs.readdirSync(path.join(__dirname, '.githooks'))
     .filter((f) => fs.lstatSync(path.join(__dirname, '.githooks', f)).isFile())
-  assert.deepStrictEqual([...targets].sort(), [...onDisk].sort(),
+  assert.deepStrictEqual([...targets].sort(byCodeUnit), [...onDisk].sort(byCodeUnit),
     '.githooks 下的常规文件必须全部在扫描面内（新增钩子漏扫 = 门禁缺一块）')
+  // 比较器口径必须是码元序：'B'（0x42）排在 'a'（0x61）之前，而 localeCompare 按语言环境做
+  // 大小写不敏感比较会给出相反顺序 ⇒ 换成 localeCompare 时这条红（扫描面比对不许随宿主 locale 漂移）。
+  assert.deepStrictEqual(['a', 'B'].sort(byCodeUnit), ['B', 'a'],
+    '扫描面比对必须按 UTF-16 码元序（localeCompare 会把 a 排到 B 之前）')
   for (const must of ['pre-commit', 'pre-push']) {
     assert.ok(targets.includes(must), `${must} 必须在扫描面内`)
   }

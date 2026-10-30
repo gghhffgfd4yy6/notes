@@ -12,6 +12,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
+const { resolveTool } = require('./scripts/check-ci-static')
 
 // 仓库根固定路径：本套件以仓库根为 cwd 运行（CI 的 npm run test:unit、copyProject 沙箱、stryker 沙箱
 // 都在仓库/沙箱根启动），故统一用字面量相对路径——不动态拼路径，静态分析也就没有误报空间。
@@ -1424,6 +1425,15 @@ try {
   assert.strictEqual(shimOk.status, 0, `对照：正常退出应 exit 0：${shimOk.stderr}`)
   assert.match(shimOk.stdout, /^ok 1 - test_stub_tap_probe\.js$/m, '对照：TAP 点必须投递到 stdout')
   assert.match(shimOk.stdout, /^1\.\.1$/m, '对照：plan 行必须投递到 stdout')
+  // C2 回归：这一跑**没有** stryker coverage JSON（hook 未预加载）⇒ 注解必须静默跳过。
+  //   去掉 existsSync 之后，存在性只能由**这次读自己的 ENOENT** 判定；漏掉那条分支就会落进外层
+  //   catch，在 stderr 打出「tapPoints 未能写进 coverage JSON」——把「hook 没产出」误报成注解失败
+  //   （C2 修复前的形态不是误报，而是 check-then-use；这条回归锁的是修完之后的语义不变）。
+  //   两条断言各守一半：a) 不得有那条误报；b) 不得凭空创建 stryker-output-*.json（注解只改**已产出**的文件）。
+  assert.doesNotMatch(shimOk.stderr, /tapPoints 未能写进 coverage JSON/,
+    `无 coverage JSON 时必须静默跳过注解（ENOENT 是正常路径），实际 stderr：${JSON.stringify(shimOk.stderr)}`)
+  assert.deepStrictEqual(fs.readdirSync(shimProbeDir).filter(f => f.startsWith('stryker-output-')), [],
+    '无 coverage JSON 时不得凭空创建 stryker-output-*.json（注解只改 hook 已产出的那份）')
   // C10-008：成功投递的点数必须落成记录（mutation.yml 的空流判据只有这一条数据来源）
   {
     const recs = readShimRecords()
@@ -2444,7 +2454,13 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
   //     变异体全 Survived。旧判据（tests == 0）在这份输入上**放行**——下面第一条断言先把这一点钉死，
   //     否则这份夹具证明不了任何东西（夹具又退回自造 tests:0 时它会立刻红）。
   {
-    const jqProbe = spawnSync('jq', ['--version'], { encoding: 'utf8' })
+    // S08（闸门 B 返工）：同一条 Sonar S4036 在本仓的既定口径是「纯 JS 扫 PATH → 绝对路径 spawn、
+    // 不挂 NOSONAR 压制」——见 scripts/check-ci-static.js 头注（PR #207）与 test_install_hooks.js
+    // 对 git 的同款解析。此处复用 resolveTool：既不按名 spawn（命令解析依赖 PATH），也不写死某个
+    // 宿主的固定路径（Linux /usr/bin、macOS /opt/homebrew/bin、Termux $PREFIX/bin 各不相同）。
+    const jq = resolveTool('jq')
+    assert.ok(jq, '未能在 PATH 中找到 jq（CI 的 ubuntu-latest 预装 jq）；jq 不可用时无从核对 workflow 判据，按失败计')
+    const jqProbe = spawnSync(jq, ['--version'], { encoding: 'utf8' })
     assert.strictEqual(jqProbe.status, 0,
       '本用例用 jq 执行 workflow 的真实判据（CI 的 ubuntu-latest 预装 jq）；jq 不可用时无从核对，按失败计')
     // 夹具构造：只允许「每文件 1 条 TestResult」这一种真实形态（刻意不提供 tests:0 的入口）

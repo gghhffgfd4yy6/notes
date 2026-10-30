@@ -192,8 +192,21 @@ const coverageJsonName = `stryker-output-${process.pid}.json`
 //    注解只是附加键，注解本身出问题不该把整段判成 RuntimeError。
 function annotateCoverageJson (points) {
   try {
-    if (!fs.existsSync(coverageJsonName)) return
-    const parsed = JSON.parse(fs.readFileSync(coverageJsonName, 'utf8'))
+    // 存在性由**这一次读**自己判定，不再先 `existsSync` 探一次：那是 check-then-use——检查与使用之间
+    // 路径可被替换（换 inode / 换类型），于是「检查看到的」与「实际读写的」可以不是同一个对象
+    // （CodeQL js/file-system-race；本仓同一条规则的先例：scripts/console.js 读锁帧、
+    // scripts/mutation-json.js 的 readGuardedBytes）。
+    // 语义不变：ENOENT = hook 没产出这个文件（非 tap-runner 环境、或 hook 未被预加载）本是正常路径之一，
+    // 旧实现由 `existsSync` 静默返回；现在只看这次读自己的 errno。其它错误照旧交给外层 catch：
+    // stderr 留证、**不动退出码**。
+    let raw
+    try {
+      raw = fs.readFileSync(coverageJsonName, 'utf8')
+    } catch (err) {
+      if (err && err.code === 'ENOENT') return
+      throw err
+    }
+    const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
     parsed.tapPoints = points
     fs.writeFileSync(coverageJsonName, JSON.stringify(parsed))
