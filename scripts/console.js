@@ -4392,7 +4392,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (plans.messages.seenText !== undefined) {
             if (!writeAtomic(seenPath, plans.messages.seenText, '判重历史恢复')) { abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' }); return }
             imported.dedup = true
-          } else if (removeStaleTombstoneFile(fs, seenPath)) imported.dedupCleared = true
+          } else {
+            // 评审 CR-05：删除残留墓碑失败时必须中止并回滚，不能只按「删掉了吗」一个布尔值判断成功——
+            // 旧墓碑仍在会把导入历史里缺失的身份继续判成「已推送」，响应却报导入成功。
+            const cleared = removeStaleTombstoneFile(fs, seenPath)
+            if (cleared.status === 'failed') {
+              console.error(`⚠️ 导入中止：残留判重历史无法删除（${cleared.message}），旧墓碑会继续压制导入历史里缺失的消息：${seenPath}`)
+              abortImport('messages', 500, { error: 'dedup_clear_failed', code: 'dedup_clear_failed' })
+              return
+            }
+            if (cleared.status === 'removed') imported.dedupCleared = true
+          }
           imported.messages = plans.messages.count
         }
         if (plans.settings) {

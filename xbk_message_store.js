@@ -1886,20 +1886,33 @@ function createMessageStore ({
 // C3-013：判重历史由 `push.json` + `push.json.seen.json`（墓碑）两个文件共同构成。控制台「数据备份」
 // 导入时若备份不含判重历史，机器上残留的 .seen.json 描述的是**另一段历史**——它会把已被淘汰的身份继续
 // 判成「已推送」，使恢复后的主存「少了记录却不重推」且全程无提示。导入侧因此需要一个「清残留」动作：
-// 只删普通文件（符号链接/目录不是墓碑形态，绝不顺着链接删到别处）；ENOENT 视为没有残留；其它错误
-// 告警但不改判定。fs 由调用方注入（与 resolveCacheDirInRoot 同口径，测试无需真实删盘即可驱动）。
+// 只删普通文件（符号链接/目录不是墓碑形态，绝不顺着链接删到别处）。fs 由调用方注入（与
+// resolveCacheDirInRoot 同口径，测试无需真实删盘即可驱动）。
 // 判重数据本身**绝不自动销毁**：是否调用、以及回滚备份，全部由调用方（控制台导入流程）决定。
+//
+// 返回三态（评审 CR-05：旧实现把「本来就不存在」与「删除失败」都折叠成 false，导入照旧报成功）：
+//   { status: 'removed' }                → 真的删掉了残留墓碑；
+//   { status: 'absent' }                 → 本来就没有残留（ENOENT；或路径不是普通文件——符号链接/目录
+//                                          不是墓碑形态，不能顺着删，语义上也没有可清的残留）；
+//   { status: 'failed', message }        → 是普通文件却删不掉（EACCES/EROFS/EBUSY…）。调用方**必须**
+//                                          中止并回滚导入：旧墓碑仍在，会把导入历史里缺失的身份继续判成
+//                                          「已推送」，此时报成功等于静默留下另一段判重历史。
 function removeStaleTombstoneFile (fs, seenPath) {
+  const describe = (e) => (e && (e.code || e.message)) || String(e)
+  let st = null
   try {
-    const st = fs.lstatSync(seenPath)
-    if (!st || !st.isFile()) return false
-    fs.unlinkSync(seenPath)
-    return true
+    st = fs.lstatSync(seenPath)
   } catch (e) {
-    if (!e || e.code !== 'ENOENT') {
-      console.warn(`⚠️ 导入时清理残留判重历史失败 ${seenPath}: ${e && e.message ? e.message : e}`)
-    }
-    return false
+    // 没有这个路径 = 本来就没有残留；其它（父目录读不了等）无法确认 ⇒ 按失败处理，不谎报清理成功
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'failed', message: describe(e) }
+  }
+  if (!st || !st.isFile()) return { status: 'absent' }
+  try {
+    fs.unlinkSync(seenPath)
+    return { status: 'removed' }
+  } catch (e) {
+    // 检查后被别的进程删掉：确实没有残留，不是失败
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'failed', message: describe(e) }
   }
 }
 
