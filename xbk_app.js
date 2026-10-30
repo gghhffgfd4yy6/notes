@@ -8,6 +8,17 @@ function createApp ({
   summarizeError, PROFILE3, PROFILE3_BOOT_MARKS, prewarmDns, prewarmTls,
   getNotify, PKG_VERSION, trimTrailingSlashes, compileUserRegex
 }) {
+  // C1-026：parallelLimit 的**唯一**夹取口径。此前三处各自夹取（预热窗口按 10、并行 worker 按 50、
+  // 0/负数按 items.length），于是「预热连接数与并发窗口对齐」的注释不成立：窗口 >10 时预热恒定只开
+  // 10 条连接。规则收敛为：正数向下取整；0/负数/非法回退「按消息总数」（调用方拿不到条目数时传
+  // 单轮上限，语义仍是同一上限）；统一受 MAX_PARALLEL_WORKERS 约束，空批次兜底 1。
+  const MAX_PARALLEL_WORKERS = 50
+  const resolveParallelWindow = (configured, totalItems) => {
+    const pl = Utils.num(configured, 0)
+    const items = Number.isFinite(totalItems) && totalItems > 0 ? Math.floor(totalItems) : 0
+    const base = pl > 0 ? Math.floor(pl) : items
+    return Math.max(1, Math.min(base, MAX_PARALLEL_WORKERS))
+  }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
   // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
@@ -32,6 +43,16 @@ function createApp ({
     // 拒绝符号链接/目录作为文件目标，避免 filter.hash/run.log 等路径跟随链接逃逸。
     _isRegularOrMissing (filePath) {
       return isRegularOrMissing(filePath)
+    },
+
+    // C1-027：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
+    // 而 _writeRunLog / 各类状态文件每写一行都要拼一次路径——旧实现因此每行都重做整套安全检查。
+    // run() 在 init 成功后解析一次并固定到 _cacheDirForRun（单轮内 cache.dir 是静态配置），结束时清空；
+    // 语义不变：run() 之外（如直调 _writeRunLog 的用例）仍每次走 getter，MessageStore.init() 自己
+    // 「校验后目录被换成符号链接 ⇒ 二次求值必须失败」的契约（MS-01）也不受影响。
+    _cacheDirForRun: null,
+    _cacheDir () {
+      return this._cacheDirForRun || MessageStore.cacheDir
     },
 
     // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
@@ -77,7 +98,7 @@ function createApp ({
     _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
         const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
-        const logPath = path.join(MessageStore.cacheDir, safeFilename)
+        const logPath = path.join(this._cacheDir(), safeFilename)
         if (!this._isRegularOrMissing(logPath)) {
           console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
           return
@@ -236,7 +257,7 @@ function createApp ({
       const now = Date.now()
       // 同一进程最多每小时提示一次，避免磁盘低时刷屏；限流前置，避免高频写入时每次都无谓同步 statfs 阻塞事件循环。
       if (now - this._diskWarningAt < 3600000) return
-      const info = Utils.diskSpace(MessageStore.cacheDir)
+      const info = Utils.diskSpace(this._cacheDir())
       // freeBytes 需有限性校验：NaN 时 >=minFree 为 false 会误入告警并在 toFixed 抛 RangeError。
       if (!info || !Number.isFinite(info.freeBytes) || info.freeBytes >= minFree) return
       this._diskWarningAt = now
@@ -258,7 +279,7 @@ function createApp ({
       // v3.258：启用判断提取到 _enabledFlag（口径不变，供测试直接打纯函数）
         if (!this._enabledFlag(Config.alert)) return
         const classKey = typeof alertKey === 'string' && alertKey ? alertKey : 'alert'
-        const statePath = path.join(MessageStore.cacheDir, 'alert.state')
+        const statePath = path.join(this._cacheDir(), 'alert.state')
         const alertMemory = this._alertLastAtByPath.get(statePath)
         let lastAt = alertMemory ? alertMemory.lastAt : 0
         let classes = alertMemory && alertMemory.classes && typeof alertMemory.classes === 'object'
@@ -422,7 +443,7 @@ function createApp ({
       // 标记记录 pid + 进程启动时钟（incarnation）+ 状态（pending/completed）：
       // 已完成的标记永不回收，只有 pending（崩溃未完成）才允许回收（CodeRabbit 第八轮）。
       const stamp = this._localStamp().slice(0, 10) // YYYY-MM-DD
-      const statePath = path.join(MessageStore.cacheDir, `${RE2_WARN_STATE_FILE}.${stamp}`)
+      const statePath = path.join(this._cacheDir(), `${RE2_WARN_STATE_FILE}.${stamp}`)
       const token = JSON.stringify({
         warnedAt: Date.now(),
         pid: process.pid,
@@ -528,7 +549,7 @@ function createApp ({
 
     _cleanupStaleRe2WarnMarkers () {
       try {
-        const cacheDir = MessageStore.cacheDir
+        const cacheDir = this._cacheDir()
         const prefix = RE2_WARN_STATE_FILE + '.'
         const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) // 保留 7 天
         // APP-05：cutoff 与标记名必须同用上海日界。标记名来自 _localStamp()（已是上海），
@@ -726,7 +747,7 @@ function createApp ({
     async _updateReport (summary) {
       try {
         if (!this._enabledFlag(Config.report)) return
-        const statePath = path.join(MessageStore.cacheDir, 'report.state')
+        const statePath = path.join(this._cacheDir(), 'report.state')
         const state = this._loadReportState(statePath)
         if (!state) return
         const today = this._reportToday()
@@ -898,7 +919,7 @@ function createApp ({
       const pendingAlerts = []
       try {
         if (!this._enabledFlag(Config.channelHealth)) return
-        statePath = path.join(MessageStore.cacheDir, 'channel-health.state')
+        statePath = path.join(this._cacheDir(), 'channel-health.state')
         lockPath = statePath + '.lock'
         lockFd = this._tryAcquireChannelHealthLock(lockPath)
         if (lockFd < 0) {
@@ -1010,6 +1031,13 @@ function createApp ({
           if (alert.type === 'recovered') this._clearChannelRecoverPending(statePath, alert.channel, alert.claim)
         } catch (e) {
           // 健康告警失败不得影响主推送、缓存或下一次重试。
+          // C1-022：发送失败此前完全无痕——既不写 run.log 也不打印，于是「通道连续失败」与「连告警都发不出去」
+          // 在日志上长得一样，排障只能靠猜。两处都留（stdout 供青龙任务日志，run.log 供事后回溯）。
+          const reason = Utils.safeErrorText(e, '未知错误').replace(/[\r\n]+/g, ' ').slice(0, 200)
+          const alertLabel = alert.type === 'recovered' ? '恢复' : '异常'
+          const failureText = `通道健康${alertLabel}告警发送失败（${alert.channel}）：${reason}`
+          console.warn(`⚠️ ${failureText}`)
+          try { this._writeRunLog(`${this._localStamp()} WARN ${failureText}\n`) } catch (logError) { /* 留痕失败静默 */ }
           // FX3：恢复通知发送失败须释放本次认领（保留 pending），否则下一轮会被自己的租约挡到
           // 租约到期才重发——APP2-02「不丢」的即时重试语义会被破坏。
           if (alert.type === 'recovered') this._releaseChannelRecoverClaim(statePath, alert.channel, alert.claim)
@@ -1096,11 +1124,11 @@ function createApp ({
           .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result })
           .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup })
         const prewarmCount = (() => {
-          const pl = Utils.num(Config.push.parallelLimit, 10)
+          // C1-026：预热发生在拿到数据之前，条目数未知——把单轮上限 maxPerRun 作为「消息总数」输入，
+          // 走与并行 worker 同一个 resolveParallelWindow（不再单独夹到 10，连接数才真的与并发窗口一致）。
           const maxPerRun = Utils.num(Config.push.maxPerRun, 100)
-          const window = pl > 0 ? Math.min(Math.floor(pl), 10) : 10
           const batch = Number.isInteger(maxPerRun) && maxPerRun > 0 ? maxPerRun : 100
-          return Math.max(1, Math.min(window, batch))
+          return resolveParallelWindow(Config.push.parallelLimit, batch)
         })()
         // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
         const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
@@ -1119,6 +1147,8 @@ function createApp ({
       warmupPromise.catch(() => {})
       try {
         MessageStore.init()
+        // C1-027：本轮缓存目录只解析一次（init 已确保目录可用），后续每行日志/状态文件都复用该结果。
+        this._cacheDirForRun = MessageStore.cacheDir
         checkpoint('cache-init')
         if (!dryRun) await this._warnMissingRe2()
         this._warnLowDisk()
@@ -1130,7 +1160,7 @@ function createApp ({
         // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
         // 优先沿用进程内 last-known-good，本进程从未读到合法文件才回代码默认。
         const active = FilterStore.loadFilterRules({
-          cacheDir: MessageStore.cacheDir,
+          cacheDir: this._cacheDir(),
           defaults: Config.filter,
           keyword: Config.keyword,
           // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
@@ -1203,7 +1233,7 @@ function createApp ({
         const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
         // 生效快照：证明「本轮实际用的是哪一版规则」，供控制台显示「已生效 rN」。写失败只告警，绝不抛穿本轮推送。
         if (!FilterStore.writeAppliedSnapshot({
-          cacheDir: MessageStore.cacheDir,
+          cacheDir: this._cacheDir(),
           filter: active.filter,
           keyword: active.keyword,
           revision: active.revision,
@@ -1239,7 +1269,7 @@ function createApp ({
         // 覆盖文件损坏（active.degraded）时**整段跳过**：不清 _f、不推进 filter.hash——
         // 降级不能放宽规则，也就不能触发「之前被过滤的条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
         if (!active.degraded) {
-          const hashPath = path.join(MessageStore.cacheDir, 'filter.hash')
+          const hashPath = path.join(this._cacheDir(), 'filter.hash')
           let lastFile = ''
           let lastHash = ''
           let filterStateReady = true
@@ -1440,11 +1470,19 @@ function createApp ({
             if (RuleEngine.hasNestedQuantifier(kw)) {
               console.warn('⚠️ 配置「zkt_gjc」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），已忽略只看它过滤')
             } else {
+            // C1-023：编译闸门本身不抛错（内部 catch 后返回 null），失败原因经 onError 回传；旧实现用一个
+            // 空 catch 包住调用，既拿不到唯一失败原因，告警又只剩「无效或环境不支持」——
+            // 「正则写错」与「没装 re2」这两种完全不同的处置在日志里无法区分。
+              let kwReError = null
               try {
-                kwRe = compileUserRegex(kw, 'i')
+                kwRe = compileUserRegex(kw, 'i', (e) => { kwReError = e })
               } catch (e) {
+                kwReError = e // 闸门自身异常（契约外）：同样作为告警原因，不静默吞掉
               }
-              if (!kwRe) console.warn('⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式，已忽略只看它过滤')
+              if (!kwRe) {
+                const reason = Utils.safeErrorText(kwReError, '原因未知').replace(/[\r\n]+/g, ' ').slice(0, 200)
+                console.warn(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式（${reason}），已忽略只看它过滤`)
+              }
             }
             if (kwRe) {
             // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
@@ -1653,14 +1691,8 @@ function createApp ({
         }
         if (Config.push && Config.push.mode === 'parallel') {
         // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
-        // parallelLimit 防御：小数取整（0.5 取 0 后回退 1）、0/负数回退全量、空 items 兜底 1。
-          const MAX_PARALLEL_WORKERS = 50 // 并行推送硬性上限：防超大 parallelLimit/大批量瞬时拉起海量 worker
-          const limit = (() => {
-            const pl = Utils.num(Config.push.parallelLimit, 0)
-            // 有效正数取整；0/负数/非法回退全量 items；二者均受硬性上限约束，空 items 兜底 1
-            const base = pl > 0 ? Math.floor(pl) : items.length
-            return Math.min(base, MAX_PARALLEL_WORKERS)
-          })() || 1
+        // parallelLimit 防御：夹取口径只在 resolveParallelWindow（取整（0.5 取 0 后回退 1）、0/负数按消息总数、硬性上限 50）。
+          const limit = resolveParallelWindow(Config.push.parallelLimit, items.length)
           const pushInterval = Utils.num(Config.timing.pushInterval, 0)
           const results = new Array(items.length)
           let nextIndex = 0
@@ -1682,7 +1714,9 @@ function createApp ({
           for (const r of results) {
             if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
           }
-          successCount = results.filter(r => r && r.ok && !r.preview).length
+          // C1-024：preview 分支返回 { ok:false, preview:true }，故 `r.ok && !r.preview` 里的 !r.preview
+          // 恒真——成功只认 r.ok（与顺序分支 `if (r.ok)` 同口径），预览不伪造成功也不计失败。
+          successCount = results.filter(r => r && r.ok).length
         } else {
         // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
           const pushInterval = Utils.num(Config.timing.pushInterval, 0)
@@ -1873,6 +1907,7 @@ function createApp ({
       // v3.233：flag 兜底 getNotify() 未 resolve 的竞态——controller 尚未创建时主流程已结束，
       // then 回调稍后凭 flag 跳过启动，防止预热请求拖住退出。
         warmupCancelled = true
+        this._cacheDirForRun = null // C1-027：本轮结束即失效，下一轮重新解析（配置/环境可能已变）
         if (warmupController) warmupController.abort()
       }
     }
