@@ -508,6 +508,22 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   const connectionCount = Number.isFinite(requestedCount) && requestedCount >= 1
     ? Math.min(requestedCount, MAX_PREWARM_TLS_CONNECTIONS)
     : 1
+  // C10-075：HEAD 被拒（405 等 statusCode>=400，throwHttpErrors=false 时不进 catch）与 HEAD 抛错（外层
+  // catch）都要回退 GET 建连，旧实现把同一段回退逐字写了两份——修一处漏一处必然漂移（AGENTS-06 的取消语义
+  // 就是这样补了两次）。收敛成单一实现：先看取消 → GET → 成功标 viaGet / 失败按取消或错误归类，
+  // 结果对象形状与两份旧代码逐字段一致（cancelled / error / viaGet 三选一 + elapsedMs）。
+  const fallbackGet = async (singleStart) => {
+    if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
+    try {
+      await got.get(`https://${hostname}/`, baseOptions)
+      return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true }
+    } catch (e2) {
+      // v3.233/AGENTS-06：GET 独立捕获，失败绝不再落回外层 catch 重发一次 GET（同一主机重复建连）；
+      // 回退期间被 abort 时返回 cancelled 而非普通 error。
+      if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
+      return { ok: false, error: e2 && (e2.code || e2.message) ? String(e2.code || e2.message) : String(e2), elapsedMs: Date.now() - singleStart }
+    }
+  }
   const results = await Promise.all(Array.from({ length: connectionCount }, async () => {
     const singleStart = Date.now()
     try {
@@ -515,30 +531,12 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
       // 比 GET 下载首页快得多（GET 会把 body 下载时间也算进预取）。
       const response = await got.head(`https://${hostname}/`, baseOptions)
       // throwHttpErrors=false 时 405 不会进入 catch，显式检查后才回退 GET。
-      if (response && response.statusCode >= 400) {
-        if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
-        try {
-          await got.get(`https://${hostname}/`, baseOptions)
-          return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true }
-        } catch (e2) {
-          // v3.233：GET 独立捕获，失败不回落到外层 catch 再发一次 GET（同一主机重复建连）
-          // 复核修正：保持取消语义——GET 被 abort 时返回 cancelled 而非 error（此前外层 catch 会识别）
-          if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
-          return { ok: false, error: e2 && (e2.code || e2.message) ? String(e2.code || e2.message) : String(e2), elapsedMs: Date.now() - singleStart }
-        }
-      }
+      if (response && response.statusCode >= 400) return await fallbackGet(singleStart)
       return { ok: true, elapsedMs: Date.now() - singleStart }
     } catch (e) {
       if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
-      // 服务端不支持 HEAD（如 405）时回退 GET 建连；仍失败则静默跳过。
-      try {
-        await got.get(`https://${hostname}/`, baseOptions)
-        return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true }
-      } catch (e2) {
-        // AGENTS-06：与 405 回退分支同口径——GET 回退被 abort 时返回 cancelled 而非普通 error。
-        if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
-        return { ok: false, error: e2 && (e2.code || e2.message) ? String(e2.code || e2.message) : String(e2), elapsedMs: Date.now() - singleStart }
-      }
+      // 服务端不支持 HEAD（如 405 抛出）时回退 GET 建连；仍失败则静默跳过。
+      return await fallbackGet(singleStart)
     }
   }))
   // AGENTS-07：返回值带显式 kind（与 prewarmDns 的 kind:'dns' 对称）——此前 DNS/TLS 两条预热结果都只
