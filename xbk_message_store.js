@@ -1849,9 +1849,30 @@ function createMessageStore ({
   return MessageStore
 }
 
+// C3-013：判重历史由 `push.json` + `push.json.seen.json`（墓碑）两个文件共同构成。控制台「数据备份」
+// 导入时若备份不含判重历史，机器上残留的 .seen.json 描述的是**另一段历史**——它会把已被淘汰的身份继续
+// 判成「已推送」，使恢复后的主存「少了记录却不重推」且全程无提示。导入侧因此需要一个「清残留」动作：
+// 只删普通文件（符号链接/目录不是墓碑形态，绝不顺着链接删到别处）；ENOENT 视为没有残留；其它错误
+// 告警但不改判定。fs 由调用方注入（与 resolveCacheDirInRoot 同口径，测试无需真实删盘即可驱动）。
+// 判重数据本身**绝不自动销毁**：是否调用、以及回滚备份，全部由调用方（控制台导入流程）决定。
+function removeStaleTombstoneFile (fs, seenPath) {
+  try {
+    const st = fs.lstatSync(seenPath)
+    if (!st || !st.isFile()) return false
+    fs.unlinkSync(seenPath)
+    return true
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') {
+      console.warn(`⚠️ 导入时清理残留判重历史失败 ${seenPath}: ${e && e.message ? e.message : e}`)
+    }
+    return false
+  }
+}
+
 module.exports = {
   createMessageStore,
   resolveCacheDirInRoot,
+  removeStaleTombstoneFile,
   IDENTITY_INDEX_REF_PROBE_WINDOW,
   IDENTITY_INDEX_IDENTITY_PROBE_WINDOW
 }
