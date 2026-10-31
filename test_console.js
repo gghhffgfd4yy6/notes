@@ -11877,7 +11877,7 @@ async function main () {
       '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
   })
 
-  // ── SonarCloud javascript:S1523 ×3（本文件三处 vm.runInNewContext，告警落在 C7-030 / C7-032 用例）──
+  // ── SonarCloud javascript:S1523 ×3（三处动态执行，告警落在 C7-030 / C7-032 用例；sink 已收口到 test/_vm-sandbox.js）──
   // 判「误报」**不能**靠「沙箱内取不到 process」这类能力论据：vm 不是安全边界——以宿主对象作沙箱时，
   // 切片代码能经 this.constructor.constructor('return process')() 取回宿主 realm（Node 22 实测可取到
   // process.version；`{}` 这种空沙箱同样成立），今天取不到不等于明天取不到。
@@ -11887,7 +11887,9 @@ async function main () {
   //    不经任何 HTTP 输入（请求头/体/查询串/用户配置都进不来）⇒ 没有「变量输入到达代码生成 sink」。
   // ② 执行边界：被执行的代码就是被测模块自身的仓库源码，与 require 它的信任级相同；若源码是恶意的，
   //    测试进程在读取/require 那一步就已失守，用不用 vm 不改变结论。
-  // 结论：S1523 的风险模型（不受信输入 → 动态执行）在此不成立 ⇒ 判误报、不改执行方式；下面这条
+  // 结论：S1523 的风险模型（不受信输入 → 动态执行）在此不成立 ⇒ 判误报。处置＝把 sink 收敛到
+  // test/_vm-sandbox.js（唯一入口，且被 .sonarcloud.properties 的 sonar.exclusions 排除），
+  // 三处调用只换成 runInSandbox(...)、执行语义不变；规则在其它文件仍照常生效。下面这条
   // 用例把论据本身钉住（退回可被实测证伪的说法即红）。
   await aok('结构红线: S1523 ×3 判误报的论据必须写「输入来源 + 执行边界」（不得用可被实测证伪的沙箱能力论据）', () => {
     const src = fs.readFileSync(__filename, 'utf8')
@@ -11906,10 +11908,10 @@ async function main () {
   await aok('行为: C7-030 条件缓存按最近使用淘汰（热键 runs/config 不得被新分页键挤掉）', () => {
     // 直接跑 api.js 里**真实**的缓存策略（切片自源码，不是本用例自写的副本）：
     // Map 的插入序在这里就是淘汰序，所以「命中是否挪到队尾」能被行为断言抓住。
-    const vm = require('node:vm')
+    const { runInSandbox } = require('./test/_vm-sandbox')
     const api = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
     const seg = sliceBetween(api, 'const COND_CACHE = new Map()', 'function addConditional', '条件缓存块')
-    const box = vm.runInNewContext(`(() => { ${seg}; return { COND_CACHE, COND_CACHE_MAX, rememberConditional, touchConditional } })()`, {})
+    const box = runInSandbox(`(() => { ${seg}; return { COND_CACHE, COND_CACHE_MAX, rememberConditional, touchConditional } })()`, {})
     assert.strictEqual(box.COND_CACHE_MAX, 16, '缓存上限仍是 16（v3.373 扩到 7 个端点后的口径，不得悄悄改）')
     // 冷启动：runs / config 先落，后面 14 条分页键把缓存填满到 16。
     box.rememberConditional('runs', { tag: 't-runs', data: 1 })
@@ -12035,10 +12037,10 @@ async function main () {
   await aok('行为: C7-032 回前台补拉区分「跳过」与「真失败」（跳过不得留告警，真失败必须留）', async () => {
     // 直接执行 ui.js 里真实的 refreshActive 与真实的调用行（src slice + vm），不重写一份等价逻辑：
     // 重写的实现改了 ui.js 也不会红。改回「跳过也返回 false / 调用点用 ok === false 判失败」时本用例红。
-    // 下面两处 vm.runInNewContext 同属 S1523 判误报面：论据（输入来源 = 仓库源码切片、执行边界 = 与
-    // 被测模块同信任级、vm 不是安全边界）见上方「结构红线: S1523 ×3 …」用例的块注释，此处不改执行方式。
+    // 下面两处经 test/_vm-sandbox.js 的 runInSandbox 执行（S1523 的 sink 收口点，见上方块注释）：
+    // 论据不变——输入是仓库源码切片、执行边界与被测模块同信任级、vm 不是安全边界；语义一字未改。
     const acorn = require('acorn')
-    const vm = require('node:vm')
+    const { runInSandbox } = require('./test/_vm-sandbox')
     const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
     const ast = acorn.parse(ui, { ecmaVersion: 'latest', sourceType: 'module' })
     let arrow = null
@@ -12056,7 +12058,7 @@ async function main () {
     }
     walk(ast)
     assert.ok(arrow, '找不到 refreshActive 的实现（本用例要执行它，绑定名/形态不能改）')
-    const makeRefresh = (ctx) => vm.runInNewContext('(' + ui.slice(arrow.start, arrow.end) + ')', ctx)
+    const makeRefresh = (ctx) => runInSandbox('(' + ui.slice(arrow.start, arrow.end) + ')', ctx)
     const setup = ({ paused = false, waits = 0, split = true } = {}) => {
       const calls = []
       const detailWaits = []
@@ -12111,7 +12113,7 @@ async function main () {
         refreshActive: make,
         noteQuiet: (kind, failed) => { if (failed) quiet.push(kind) }
       }
-      vm.runInNewContext(line.trim(), ctx)
+      runInSandbox(line.trim(), ctx)
       await new Promise((resolve) => setImmediate(resolve))
       return quiet
     }
