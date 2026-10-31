@@ -462,12 +462,13 @@ function createMessageStore ({
       return /^\.seen\.cleanup\.lock\.\d+\.\d+\.reclaim$/.test(name)
     },
 
-    /** 目录级非阻塞哨兵：串行化启动清理与墓碑锁创建，覆盖检查-删除竞态。 */
+    /** 目录级非阻塞哨兵：串行化启动清理与墓碑锁创建，覆盖检查-删除竞态。
+   *  显式 `mode: 0o600`：文件内容只有 PID 令牌，权限不得随 umask 放宽（与另外三处锁同口径）。 */
     _acquireTombstoneCleanupGuard (dir) {
       const guardPath = path.join(dir, '.seen.cleanup.lock')
       const token = this._newTombstoneLockToken()
       try {
-        fs.writeFileSync(guardPath, token, { flag: 'wx' })
+        fs.writeFileSync(guardPath, token, { flag: 'wx', mode: 0o600 })
         return token
       } catch (e) {
         if (e.code !== 'EEXIST') {
@@ -501,7 +502,7 @@ function createMessageStore ({
           return null
         }
         try {
-          fs.writeFileSync(guardPath, token, { flag: 'wx' })
+          fs.writeFileSync(guardPath, token, { flag: 'wx', mode: 0o600 })
           return token
         } catch (retryError) {
           return null
@@ -1443,11 +1444,11 @@ function createMessageStore ({
       }
     },
 
-    /** 独占创建锁文件（wx），内容写入 owner token（PID:随机串）；EEXIST 立即返回 null。 */
+    /** 独占创建锁文件（wx + 显式 `0o600`，权限不随 umask 放宽），内容写入 owner token（PID:随机串）；EEXIST 立即返回 null。 */
     _acquireTombstoneLock (lockPath) {
       const token = this._newTombstoneLockToken()
       try {
-        fs.writeFileSync(lockPath, token, { flag: 'wx' })
+        fs.writeFileSync(lockPath, token, { flag: 'wx', mode: 0o600 })
         return token
       } catch (e) {
         if (e.code !== 'EEXIST') {
