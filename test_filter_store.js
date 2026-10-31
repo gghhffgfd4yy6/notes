@@ -155,6 +155,75 @@ test('合法规则通过校验并原样返回已提交字段（不做 trim 改�
   }, '校验不得就地改写入参')
 })
 
+test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字段 4000 上限挡不住多字段累积）', () => {
+  // 11 个字段各 4000 个中文字（UTF-8 3 字节/字）⇒ 约 132 KB，远超读端 FILTER_RULES_MAX_BYTES。
+  // 旧实现只限单字段：保存返回 200，下一轮读盘整份判 tooLarge 被丢弃（用户看到「保存成功但不生效」）。
+  const filter = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    if (field === 'pingbitime') continue
+    filter[field] = '中'.repeat(4000)
+  }
+  const result = validateFilterRules({ schema: 1, revision: 0, filter }, deps)
+  assert.strictEqual(result.ok, false, '整份超过 64 KiB 必须拒绝保存')
+  const err = result.errors.find(e => e.code === 'too_large')
+  assert.ok(err, `应给出 too_large 错误码：${JSON.stringify(result.errors)}`)
+  assert.strictEqual(err.field, 'filter', '字段归属必须是 filter（整份而非某一字段超限）')
+  assert.ok(/\d+ 字节/.test(err.message) && err.message.includes(String(64 * 1024)),
+    `错误文案必须给出实际字节数与上限：${err.message}`)
+  // 对照：把字段砍到总量在预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
+  const small = { pingbibiaoti: '中'.repeat(4000), pingbineirong: '中'.repeat(4000) }
+  const okSmall = validateFilterRules({ schema: 1, revision: 0, filter: small }, deps)
+  assert.strictEqual(okSmall.ok, true, JSON.stringify(okSmall.errors))
+})
+
+test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 判 corrupt（(64 KiB-32, 64 KiB] 区间）', () => {
+  // 旧版控制台 body 上限 64 KiB、落盘形状只多约 13 字节包装 ⇒ 该区间的覆盖文件是真实存量。
+  // 闸门 5 落在 validateFilterRules 里，读路径的 deepValidationError 复用同一函数后：
+  // 65505..65535 这些「readSafeTextResult 读得到、结构也合法」的文件被重新序列化量字节 ⇒ too_large
+  // ⇒ corrupt，生产每轮降级、规则静默不生效。这里按落盘字节数逐个断言 source 必须为 override。
+  resetStoreStateForTests()
+  const buildAtBytes = (target) => {
+    const filter = {}
+    const fields = FILTER_RULE_FIELDS.filter(f => f !== 'pingbitime')
+    for (const f of fields) filter[f] = ''
+    const size = () => Buffer.byteLength(JSON.stringify({ schema: 1, revision: 0, filter }), 'utf8')
+    let remaining = target - size()
+    for (const f of fields) {
+      const cn = Math.min(4000, Math.floor(remaining / 3))
+      filter[f] = '线'.repeat(cn)
+      remaining -= cn * 3
+      const ascii = Math.min(4000 - cn, remaining)
+      filter[f] += 'a'.repeat(ascii)
+      remaining -= ascii
+      if (remaining === 0) break
+    }
+    assert.strictEqual(size(), target, `夹具必须恰为 ${target} 字节`)
+    return filter
+  }
+  for (const target of [65505, 65520, 65535]) {
+    const dir = makeDir()
+    const file = filterRulesPaths(dir).file
+    const filter = buildAtBytes(target)
+    writeJson(file, { schema: 1, revision: 3, filter })
+    assert.strictEqual(fs.statSync(file).size, target, `夹具文件字节数必须恰为 ${target}`)
+    const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps })
+    assert.strictEqual(loaded.source, 'override',
+      `${target} 字节的可读合法覆盖文件必须照常生效：${JSON.stringify(loaded.error || {})}`)
+    assert.strictEqual(loaded.degraded, false)
+    assert.strictEqual(loaded.revision, 3)
+  }
+  // 对照 1：同一份内容走**保存**路径仍必须被闸门 5 拒绝（不得借读路径放行「保存后下轮必被丢弃」的内容）
+  const tooBig = validateFilterRules({ schema: 1, revision: 3, filter: buildAtBytes(65520) }, deps)
+  assert.strictEqual(tooBig.ok, false)
+  assert.ok(tooBig.errors.some(e => e.code === 'too_large'), `保存路径必须仍拒绝：${JSON.stringify(tooBig.errors)}`)
+  // 对照 2：真正超过读端 64 KiB 的覆盖文件仍按 tooLarge 判 corrupt（读路径不放松读端上限）
+  const overDir = makeDir()
+  writeRaw(filterRulesPaths(overDir).file, JSON.stringify({ schema: 1, revision: 4, filter: buildAtBytes(65537) }))
+  const over = loadFilterRules({ cacheDir: overDir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(over.source, 'corrupt', '超过 64 KiB 的覆盖文件必须仍判损坏（读端上限不变）')
+  assert.match(over.error.message, /不可读（tooLarge）/)
+})
+
 test('revision 缺省按 0 通过（/validate 可只带 filter）', () => {
   const result = validateFilterRules({ filter: { pingbibiaoti: 'x' } }, deps)
   assert.strictEqual(result.ok, true, JSON.stringify(result.errors))
@@ -800,7 +869,30 @@ test('readAppliedSnapshot：missing / invalid / ioError 三态', () => {
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ioError')
 })
 
+test('C9-019 生效快照 filter/keyword 字段按覆盖文件同口径收紧（非字符串/未知字段即 invalid）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const base = { schema: 1, revision: 1, source: 'override', hash: 'h', appliedAt: '2026-10-18T00:00:00.000Z' }
+  const cases = [
+    { filter: { pingbibiaoti: 123 }, keyword: {}, why: 'filter 字段是数字' },
+    { filter: { pingbibiaoti: { a: 1 } }, keyword: {}, why: 'filter 字段是对象' },
+    { filter: { evil: 'x' }, keyword: {}, why: 'filter 含白名单外字段' },
+    { filter: { pingbibiaoti: 'x' }, keyword: { zkt_gjc: 42 }, why: 'keyword.zkt_gjc 是数字' },
+    { filter: { pingbibiaoti: 'x' }, keyword: { zkt_gjc: ['a'] }, why: 'keyword.zkt_gjc 是数组' }
+  ]
+  for (const c of cases) {
+    writeRaw(paths.applied, JSON.stringify({ ...base, filter: c.filter, keyword: c.keyword }))
+    const read = readAppliedSnapshot(dir)
+    assert.strictEqual(read.status, 'invalid', `${c.why} 必须判 invalid（不能当合法快照读回）`)
+    assert.strictEqual(read.error.code, 'invalid_schema', `${c.why} 的错误码应为 invalid_schema`)
+  }
+  // 对照：未提供的字段视同空（与 parseStoredRules 一致，不强制补齐 11 个），合法快照照旧 ok
+  writeRaw(paths.applied, JSON.stringify({ ...base, filter: { pingbibiaoti: 'x' }, keyword: {} }))
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '缺省字段不得被误判为损坏')
+})
+
 // ===== 路径 helper =====
+
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {
   const base = path.join(tmp, 'paths-base')
   const paths = filterRulesPaths(base)
