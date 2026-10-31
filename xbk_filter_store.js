@@ -386,6 +386,28 @@ function validateFilterRules (input, deps) {
     if (ruleLines.some(rule => rule.field === field && WIDE_MATCH_VALUES.has(rule.val))) wideMatch.push(field)
   }
 
+  // ---------- 闸门 5：整份规则文件的字节预算（C9-012）----------
+  // 读端按 FILTER_RULES_MAX_BYTES（64 KiB）硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到
+  // 上次合法规则/代码默认。而闸门 1 只限**单字段** 4000 码元：11 个字段全填满中文（UTF-8 3 字节/字）
+  // 就能堆出 130 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
+  // 不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给 revision 位数增长。
+  let serializedBytes
+  try {
+    serializedBytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter }), 'utf8')
+  } catch (e) {
+    return { ok: false, errors: [{ field: 'filter', code: 'serialize_failed', message: `规则无法序列化为 JSON：${safeErrorMessage(e)}` }] }
+  }
+  if (serializedBytes > FILTER_RULES_MAX_BYTES - 32) {
+    return {
+      ok: false,
+      errors: [{
+        field: 'filter',
+        code: 'too_large',
+        message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_RULES_MAX_BYTES} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
+      }]
+    }
+  }
+
   return { ok: true, value: filter, wideMatch }
 }
 

@@ -155,6 +155,27 @@ test('合法规则通过校验并原样返回已提交字段（不做 trim 改�
   }, '校验不得就地改写入参')
 })
 
+test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字段 4000 上限挡不住多字段累积）', () => {
+  // 11 个字段各 4000 个中文字（UTF-8 3 字节/字）⇒ 约 132 KB，远超读端 FILTER_RULES_MAX_BYTES。
+  // 旧实现只限单字段：保存返回 200，下一轮读盘整份判 tooLarge 被丢弃（用户看到「保存成功但不生效」）。
+  const filter = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    if (field === 'pingbitime') continue
+    filter[field] = '中'.repeat(4000)
+  }
+  const result = validateFilterRules({ schema: 1, revision: 0, filter }, deps)
+  assert.strictEqual(result.ok, false, '整份超过 64 KiB 必须拒绝保存')
+  const err = result.errors.find(e => e.code === 'too_large')
+  assert.ok(err, `应给出 too_large 错误码：${JSON.stringify(result.errors)}`)
+  assert.strictEqual(err.field, 'filter', '字段归属必须是 filter（整份而非某一字段超限）')
+  assert.ok(/\d+ 字节/.test(err.message) && err.message.includes(String(64 * 1024)),
+    `错误文案必须给出实际字节数与上限：${err.message}`)
+  // 对照：把字段砍到总量在预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
+  const small = { pingbibiaoti: '中'.repeat(4000), pingbineirong: '中'.repeat(4000) }
+  const okSmall = validateFilterRules({ schema: 1, revision: 0, filter: small }, deps)
+  assert.strictEqual(okSmall.ok, true, JSON.stringify(okSmall.errors))
+})
+
 test('revision 缺省按 0 通过（/validate 可只带 filter）', () => {
   const result = validateFilterRules({ filter: { pingbibiaoti: 'x' } }, deps)
   assert.strictEqual(result.ok, true, JSON.stringify(result.errors))
