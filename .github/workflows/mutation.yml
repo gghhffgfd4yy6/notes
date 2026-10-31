@@ -313,7 +313,7 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 6995 行（CR-05 导入回滚 +13 行后同步；历史上 W1-C2-023 删死代码 formatMs 净 -4 行、b3 C2-002/C2-004 +41 行、定位重构 +3 行都需同步；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7778 体，变异评估
+          # console.js 7034 行（C2-015 分发器兜底 + C2-014 单因子登录限速 +39 行后同步；历史上 CR-05 导入回滚 +13 行、W1-C2-023 删死代码 formatMs 净 -4 行、b3 C2-002/C2-004 +41 行、定位重构 +3 行都需同步；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7878 体，变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
           # ⇒ 整段 ≈ 1660min、远超 step 330min 上限。按上限倒推取 12 片（末片 849 行实测 >330min 被杀，再对半：
           # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-6982，末四片约 400 / 600 / 700 / 482 行
@@ -380,7 +380,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part12
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6501-6995"
+            mutate: "scripts/console.js:6501-7034"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:
