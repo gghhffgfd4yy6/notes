@@ -11539,6 +11539,30 @@ async function main () {
       '离开系统页必须清掉待确认（否则回页面时弹窗自己弹出来）')
   })
 
+  await aok('结构红线: C7-036 「取消关注」先确认再发，删完焦点落回关注词区', () => {
+    const src = readConsoleSource()
+    const D = '$'
+    const panel = sliceBetween(src, 'function SearchPanel', 'function LogsPanel', 'SearchPanel 片段')
+    const xAt = panel.indexOf('class="ls-chip-x"')
+    assert.ok(xAt > -1, '应能定位取消关注按钮')
+    const btn = panel.slice(xAt, panel.indexOf('>×</button>', xAt))
+    assert.ok(btn.includes('setAskRemove(w.q)') && !btn.includes('removeWatch('),
+      '× 只置待确认态，不得一键直删（删了要重新搜一次才能加回）')
+    const dlgAt = panel.indexOf('<' + D + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '必须有确认弹窗')
+    const dlg = panel.slice(dlgAt, panel.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('open=' + D + '{askRemove !== null && active}'),
+      '确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    assert.ok(dlg.includes('Promise.resolve(removeWatch(q))'), '确认后才真的调 removeWatch')
+    assert.ok(dlg.includes('watchBoxRef.current') && dlg.includes('el.focus({ preventScroll: true })'),
+      '删除后必须把焦点落回关注词区域：× 所在行卸载后焦点会掉到 body，键盘用户失去落点')
+    assert.ok(panel.includes('class="ls-watch" ref=' + D + '{watchBoxRef} tabIndex=' + D + '{-1}'),
+      '关注词区域必须可编程聚焦（tabIndex=-1），否则焦点无处可落')
+    const guardAt = panel.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && panel.slice(guardAt, guardAt + 80).includes('setAskRemove(null)'),
+      '离开搜索页必须清掉待确认（否则切回来弹窗自己出现）')
+  })
+
   }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

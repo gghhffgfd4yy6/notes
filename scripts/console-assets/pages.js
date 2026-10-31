@@ -2192,6 +2192,14 @@ function SearchPanel ({ onSync, active = true }) {
   const markedRef = useRef('')
   // 关注词列表的版本号：读写并发时，旧 GET/旧检查结果不得覆盖新状态（Sourcery #328）。
   const watchEpoch = useRef(0)
+  // C7-036：取消关注是「删了就回不来」的动作（要加回来得重新搜一次），先确认再发。
+  // 弹窗关掉后焦点不能跟着 × 一起卸载掉到 body——落到关注词区域（键盘用户接着往下走）。
+  const [askRemove, setAskRemove] = useState(null)
+  const watchBoxRef = useRef(null)
+  useEffect(() => {
+    if (active) return
+    setAskRemove(null)
+  }, [active])
 
   const fetchSearch = useCallback(() => {
     if (req.q === '') return Promise.resolve({ status: 'empty', q: '', page: 1, pages: 1, count: 0, items: [] })
@@ -2264,7 +2272,7 @@ function SearchPanel ({ onSync, active = true }) {
   }
   const removeWatch = (q) => {
     watchEpoch.current += 1
-    apiPostLineWatch({ action: 'remove', q }).then((d) => {
+    return apiPostLineWatch({ action: 'remove', q }).then((d) => {
       watchEpoch.current += 1
       setWatch(Array.isArray(d.words) ? d.words : [])
       setNewCounts((prev) => {
@@ -2503,7 +2511,7 @@ function SearchPanel ({ onSync, active = true }) {
       <div class="ls-cfg-help">「搜索页每页」只管搜索页翻页，不影响监控。开启监控后，每 ${cfgDraft.intervalMin} 分钟看一次关注词：上次检查之后多出来的线报，每条单独推送；没有新的就不推。监控会从最新往回翻到上次检查的位置（最多 5 页），不会因为超过一页的条数就漏推。推过的会记在文件里，重启不重推。</div>
       ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查时间：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
     </details>
-    <div class="ls-watch">
+    <div class="ls-watch" ref=${watchBoxRef} tabIndex=${-1} aria-label="关注词">
       <div class="ls-watch-head">
         <span class="ls-watch-title">关注词</span>
         ${watch.length > 0 && html`<${Button} variant="ghost" disabled=${checking} onClick=${checkWatch}>${checking ? '检查中…' : '检查更新'}<//>`}
@@ -2514,11 +2522,27 @@ function SearchPanel ({ onSync, active = true }) {
         : html`<div class="ls-chips">
           ${watch.map((w) => html`<span class="ls-chip-wrap" key=${w.q}>
             <button type="button" class="ls-chip${w.q === req.q ? ' on' : ''}" onClick=${() => searchWatch(w)}>${w.q}${newCounts[w.q] > 0 ? html`<span class="ls-chip-n">${newCounts[w.q]} 条新</span>` : ''}</button>
-            <button type="button" class="ls-chip-x" aria-label=${`取消关注 ${w.q}`} title="取消关注" onClick=${() => removeWatch(w.q)}>×</button>
+            <button type="button" class="ls-chip-x" aria-label=${`取消关注 ${w.q}`} title="取消关注" onClick=${() => setAskRemove(w.q)}>×</button>
           </span>`)}
         </div>`}
       ${watchErr && html`<${Hint} tone="error">${watchErr}<//>`}
     </div>
+    ${/* C7-036：取消关注先确认再发；确认后把焦点落回关注词区域（× 随行卸载后焦点会掉到 body）。 */ ''}
+    <${ConfirmDialog} open=${askRemove !== null && active}
+      title="取消关注这个词？"
+      confirmLabel="取消关注"
+      onConfirm=${() => {
+        const q = askRemove
+        setAskRemove(null)
+        Promise.resolve(removeWatch(q)).finally(() => {
+          const el = watchBoxRef.current
+          if (el && el.isConnected && typeof el.focus === 'function') el.focus({ preventScroll: true })
+        })
+      }}
+      onCancel=${() => setAskRemove(null)}>
+      <div>「${askRemove || ''}」会从关注词里删掉；要加回来得重新搜一次这个词。</div>
+      <div class="modal-note">已经推过的线报不受影响，推送记录里仍在。</div>
+    <//>
     ${body}
   </div>`
 }
