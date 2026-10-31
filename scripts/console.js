@@ -1004,7 +1004,9 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, runsList, query, sessionToken, theme, instanceId = '') {
+function renderPage (state, query, sessionToken, theme, instanceId = '') {
+  // C2-016：旧签名的第二个参数 runsList 从未被使用（`/` 的 HTML 壳不含 run 列表，列表走
+  // /api/runs），调用方却每次打开页面都对全部 runs 排一次序。参数已删，排序一并去掉。
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
   // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
@@ -5650,7 +5652,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       //   no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
       applyPageHeaders(res)
       const state = readStatus(stateDir)
-      const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
       // SameSite=Lax（审查 #224：Strict 会让「从聊天点链接」的跨站顶层导航不带 Cookie，
       // 首屏必 401；Lax 对同源子请求照常携带，而写动作 POST /trigger 本就不收 Cookie，
@@ -5665,7 +5666,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       // HTML 只发 identity：压缩统一由边缘 Caddy 完成（见 sendJson 注释）。
       // no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入。
-      const html = renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
+      const html = renderPage(state, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际

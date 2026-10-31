@@ -926,7 +926,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   const TOKEN2 = 'q'.repeat(32)
   const dir = tmpDir()
   const state = readStatus(dir) // 空目录 → 全部件「缺失」，formatStatus 合法渲染
-  const withToken = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  const withToken = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
   // JSON 岛注入（v3.285：SPA 壳；fetch 由前端发起，不再有原生表单/meta refresh）
   assert.ok(withToken.includes(`"token":"${TOKEN2}"`), 'JSON 岛带 token')
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
@@ -934,7 +934,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
   // v3.376：theme-color 跟主题底色一致，Android 系统栏/地址栏才不会在切页时漏白。
   assert.ok(withToken.includes('<meta name="theme-color" content="#0b0f17">'), 'theme-color 必须是默认主题底色')
-  const lightPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
+  const lightPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
   assert.ok(lightPage.includes('<meta name="theme-color" content="#f3f5f9">'), 'theme-color 必须跟随主题')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
@@ -946,26 +946,26 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   // v3.323 主题：首帧必须由服务端把 <html data-theme> 渲染出来（放 body 或只在 JS 里设都不算）。
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(withToken), '默认首帧 data-theme 必须是 deep')
-  const nordPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
+  const nordPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
   assert.ok(/<html lang="zh-CN" data-theme="nord">/.test(nordPage), '首帧必须跟随传入的主题')
-  const badPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
+  const badPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(badPage), '白名单外主题必须回落 deep')
   assert.ok(!/<body[^>]*data-theme/.test(nordPage), 'data-theme 必须在 <html> 上（放到 body 不生效）')
-  const noToken = renderPage(state, [], null)
+  const noToken = renderPage(state, null)
   assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
   assert.ok(!noToken.includes(`"token":"${TOKEN2}"`), '无 token 时不回显')
   assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支（noscript 降级）')
   // Sourcery vwK：特殊字符 token 必须以 \uXXXX JSON 转义进岛（script 文本不做实体解码，
   // HTML 实体会让前端 parse 出错误 token）；JSON.parse 后必须还原为原值。
   const WEIRD = 'a<b>&"\\u2028' + 'z'.repeat(20)
-  const weirdPage = renderPage(state, [], new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
+  const weirdPage = renderPage(state, new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
   assert.ok(!weirdPage.includes('<b>'), '岛内不得出现裸 <script 片段')
   const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(weirdPage)
   assert.ok(m, 'JSON 岛可提取')
   const parsed = JSON.parse(m[1].replace(/\\u003c/g, '<').replace(/\\u003e/g, '>'))
   assert.strictEqual(parsed.token, WEIRD, '岛内 token 经 JSON 解析还原为原值')
   // 常规 token 原样进岛（不引入任何实体）
-  const plain = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  const plain = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
   assert.ok(plain.includes(`"token":"${TOKEN2}"`), '常规 token 原样回显')
 })
 
@@ -3680,7 +3680,7 @@ async function main () {
     }
     assert.ok(closure.length > 0, '闭包不得为空（否则下面的对账恒真）')
     const { readStatus } = require('./scripts/status')
-    const html = renderPage(readStatus(tmpDir()), [], new URLSearchParams(`token=${TOKEN}`))
+    const html = renderPage(readStatus(tmpDir()), new URLSearchParams(`token=${TOKEN}`))
     // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
     const hrefsRaw = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
     // v3.375：版本号在路径里（/assets/<16hex>/x.js），模块间的相对 import 才会共享同一前缀。
@@ -11082,7 +11082,7 @@ async function main () {
       report: { status: 'ok', value: { date: payload, runs: 1 } },
       run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
       channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
-    }), [], new URLSearchParams(), 'tok', 'deep')
+    }), new URLSearchParams(), 'tok', 'deep')
     assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
     assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
     assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
@@ -11099,7 +11099,7 @@ async function main () {
       diagnostics: { status: 'missing', value: null }
     }
     // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
-    const html = renderPage(bare, [], undefined, '', 'deep')
+    const html = renderPage(bare, undefined, '', 'deep')
     assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
     assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
     assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
@@ -11114,8 +11114,8 @@ async function main () {
 
   await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
     const { renderPage } = require('./scripts/console')
-    const dark = renderPage(uiState(), [], new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
-    const light = renderPage(uiState(), [], new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    const dark = renderPage(uiState(), new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
     assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
     assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
     assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
@@ -11124,19 +11124,19 @@ async function main () {
     assert.strictEqual(bootIsland(light).token, 'tok-BBB')
     assert.strictEqual(bootIsland(light).instance, 'inst-2')
     // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
-    const evil = renderPage(uiState(), [], new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    const evil = renderPage(uiState(), new URLSearchParams(), '', 'deep" onload="alert(1)', '')
     assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
     assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
   })
 
   await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
     const { renderPage } = require('./scripts/console')
-    const fromQuery = renderPage(uiState(), [], new URLSearchParams('token=from-query'), '', 'deep')
+    const fromQuery = renderPage(uiState(), new URLSearchParams('token=from-query'), '', 'deep')
     assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
-    const fromSession = renderPage(uiState(), [], new URLSearchParams('token=from-query'), 'from-session', 'deep')
+    const fromSession = renderPage(uiState(), new URLSearchParams('token=from-query'), 'from-session', 'deep')
     assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
     // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
-    const breakout = renderPage(uiState(), [], new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    const breakout = renderPage(uiState(), new URLSearchParams(), 'tok</script><img src=x>', 'deep')
     assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
     assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
     assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')
