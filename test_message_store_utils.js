@@ -907,6 +907,31 @@ check('C3-010 缓存目录回退必须 WARN（且按 raw→目标去重，不随
     `告警必须同时点名「被拒绝的配置」与「实际回退目录」：${fb[0]}`)
 })
 
+// ===== C3-007：不同 pushUrl 撞到同一缓存文件必须显形 =====
+// 缓存文件名只由 URL 末段派生：两个不同来源（换域名、同末段的两个接口）会静默共用一份 push.json
+// ⇒ 两边的判重记录互相覆盖（方向=漏推）。改名会迁移既有判重记录（等同全量重推），故只告警不改名。
+check('C3-007 两个不同 pushUrl 撞到同一缓存名必须 WARN（每对一次），同名同源不告警', () => {
+  const h = makeBatchStore({ name: 'c3007.json' })
+  const u1 = 'https://a.example.com/api/push.json'
+  const u2 = 'https://b.example.com/api/push.json'
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(h.store.getFileName(u1), 'push.json')
+    assert.strictEqual(h.store.getFileName(u2), 'push.json', '末段相同 ⇒ 同一缓存名（共用判重主存的入口）')
+    assert.strictEqual(h.store.getFileName(u2), 'push.json', '重复调用结果不变')
+    assert.strictEqual(h.store.getFileName(u1), 'push.json')
+  })
+  const hits = warns.filter(w => w.includes('同一缓存文件'))
+  assert.strictEqual(hits.length, 1, `同一对撞名只应告警一次：${JSON.stringify(warns)}`)
+  assert.ok(hits[0].includes(u1) && hits[0].includes(u2), `告警必须点名两端 URL：${hits[0]}`)
+  // 对照：同一个 URL 反复取用不得告警（否则每轮每源都刷一条，噪音淹没真撞名）
+  const h2 = makeBatchStore({ name: 'c3007b.json' })
+  const warns2 = captureConsole('warn', () => {
+    h2.store.getFileName(u1)
+    h2.store.getFileName(u1)
+  })
+  assert.strictEqual(warns2.filter(w => w.includes('同一缓存文件')).length, 0, `同源重复取用不得告警：${JSON.stringify(warns2)}`)
+})
+
 // ===== C3-009：超限裁剪的序列化次数 =====
 // 旧实现把整份数组序列化三次：saveMessages 的初稿、_trimCacheByBytes 的「真实数组口径校准」、
 // 以及 splicing 之后的终稿——超限轮次的峰值内存因此是 3×（初稿在裁剪期间一直活着）。

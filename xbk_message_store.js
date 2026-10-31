@@ -224,6 +224,9 @@ function createMessageStore ({
     _tombstoneWarned: new Set(),
     // C3-005：本次进程用 O_EXCL 预留（0 字节占位）的备份名——隔离失败/回滚时只释放这些名字。
     _reservedBackupPaths: new Set(),
+    // C3-007：缓存名 → 首个使用它的 pushUrl，以及已告警的 (名字, url) 组合（撞名 = 共用判重主存）。
+    _fileNameSources: new Map(),
+    _fileNameCollisionWarned: new Set(),
     // C3-013：已就「判重主存重建为空但墓碑仍在」告警过的文件（每进程每文件一次，防刷屏）。
     _residualTombstoneWarned: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -1994,7 +1997,33 @@ function createMessageStore ({
       return saved
     },
 
+    // C3-007：缓存文件名只由 pushUrl 末段派生（不含来源/域名指纹）⇒ 两个不同 pushUrl 撞到同一
+    // 末段时会静默共用一份判重主存（互相覆盖推送记录：方向=漏推）。改名会迁移既有部署的判重记录
+    // （等同一次全量重推），故这里**只把撞名显形**：同一进程内同一个缓存名被第二个不同 url 取用时
+    // 告警一次（每对 name+url 一次），并点明两端 URL，便于判断「是不是同源/该不该迁移」。
     getFileName (url) {
+      const name = this._fileNameFor(url)
+      this._noteFileNameCollision(name, url)
+      return name
+    },
+
+    /** C3-007：撞名告警（每进程每 (缓存名, url) 一次）。name 来自 _fileNameFor 的最终产物。 */
+    _noteFileNameCollision (name, url) {
+      try {
+        if (typeof name !== 'string' || typeof url !== 'string' || url === '') return
+        const prev = this._fileNameSources.get(name)
+        if (prev === undefined) { this._fileNameSources.set(name, url); return }
+        if (prev === url) return
+        const key = name + '\u0000' + url
+        if (this._fileNameCollisionWarned.has(key)) return
+        this._fileNameCollisionWarned.add(key)
+        console.warn(`⚠️ 两个不同的 pushUrl 映射到同一缓存文件 ${name}：${prev} / ${url}——` +
+          '判重记录被共用（可能漏推或互相覆盖）；若确实是切换数据源，请先迁移/清空该缓存文件再运行')
+      } catch (e) { /* 纯诊断：任何异常都不得影响取文件名（判重主路径） */ }
+    },
+
+    /** getFileName 的纯计算部分（C3-007 抽出：碰撞检测要看**最终**文件名，故必须单点返回）。 */
+    _fileNameFor (url) {
     // 防御（R1）：非字符串 url → 可区分坏源(数字/布尔)哈希命名；无信息(空串/对象)保持 default.json
     // v3.157：数字/布尔 String 化可区分（123 vs 456），曾与空串/对象共用 default.json 互相误判重
       if (typeof url !== 'string') {
