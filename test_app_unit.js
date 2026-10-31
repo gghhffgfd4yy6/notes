@@ -3271,6 +3271,28 @@ checkAsync('C1-029 明细被预算挤掉必须留痕：detailsDropped 分类计�
     assert.strictEqual(run3.detailCount, 1, `预算 1 时明细只能有 1 条：${JSON.stringify(run3)}`)
     assert.deepStrictEqual(run3.detailsDropped, { passed: 1, filtered: 0 },
       `通过项被预算挤掉必须单独计数：${JSON.stringify(run3)}`)
+
+    // ④ ⑤「只看它」（zkt_gjc）分支的被挤掉计数：includePassed=true + 预算 1，首条通过项先占满预算，
+    //    随后两条在该分支被白名单拒 ⇒ 明细只留那 1 条，另 2 条必须计入 detailsDropped.filtered。
+    //    这条分支的 else 计数（xbk_app.js ⑤ 段）此前无任何用例覆盖：删掉它 ①/③ 仍全绿，
+    //    因为 ① 走的是 ④ 规则过滤分支、③ 走的是通过项分支。
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 1, includePassed: true }
+    h.Config.filter.pingbibiaoti = ''
+    h.Config.keyword.zkt_gjc = '白名单'
+    h.setItems([makeRunItem('bd-9', '白名单甲'), makeRunItem('bd-10', '别的内容一'), makeRunItem('bd-11', '别的内容二')])
+    const r4 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r4.summary.total, filtered: r4.summary.filtered },
+      { total: 3, filtered: 2 },
+      `前置：只看它过滤应拒 2 留 1：${JSON.stringify(r4.summary)}`)
+    const run4 = lastRunRecord()
+    assert.strictEqual(run4.passed, 1, `前置：只看它过滤后应剩 1 条通过项：${JSON.stringify(run4)}`)
+    assert.strictEqual(run4.detailCount, 1, `预算 1 时明细只能有 1 条：${JSON.stringify(run4)}`)
+    assert.deepStrictEqual(run4.detailsDropped, { passed: 0, filtered: 2 },
+      `只看它分支被预算挤掉的屏蔽项必须如实计数（落进 passed 也算错）：${JSON.stringify(run4)}`)
+    // 被挤掉条数必须是「没写进明细的决策」的一个划分：同一条在④按通过记、到⑤被拒又按屏蔽记，
+    // 会报出 4 条被挤掉（实际只有 2 条）——这里用总数守恒把重复计数也一并锁住。
+    assert.strictEqual(run4.detailCount + run4.detailsDropped.passed + run4.detailsDropped.filtered, 3,
+      `明细 + 被挤掉必须等于本轮参与决策的条数（3），不得重复计数：${JSON.stringify(run4)}`)
   })
 })
 

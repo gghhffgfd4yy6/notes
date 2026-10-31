@@ -1505,6 +1505,11 @@ function createApp ({
         // 明细**不留痕**：detailCount 恰好等于预算，文件里看起来「全记下了」，运维修过滤规则时
         // 会以为「屏蔽项只有这几条」。这里按 decision 分类记被挤掉的条数，随 run 记录落盘。
         const diagnosticDrops = { passed: 0, filtered: 0 }
+        // C1-029 返工：⑤「只看它」（zkt_gjc）会在④「通过项」之后再把条目拒掉。一条明细若在④已因
+        // 预算被记进 detailsDropped.passed，到⑤又被拒，就该按**最终决策**改记到 filtered——两个计数器
+        // 各记一次会把「被挤掉条数」算成条目数的两倍（3 条数据能报出 1 条明细 + 4 条被挤掉）。
+        // 这里登记「已按 passed 记过被挤掉」的条目，⑤ 拒掉时改记（passed-- / filtered++）。
+        const passedDropItems = new Set()
         const filterReasonCounts = {}
         const filterExplanations = new Map()
         const filterLogCfg = Config.diagnostics && Config.diagnostics.filterLog
@@ -1569,7 +1574,7 @@ function createApp ({
             items.push(item)
             if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
               if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
-              else diagnosticDrops.passed++
+              else { diagnosticDrops.passed++; passedDropItems.add(item) } // ⑤ 若随后拒掉，按最终决策改记 filtered
             }
           } else {
             filteredCount++
@@ -1642,7 +1647,12 @@ function createApp ({
                       protections: explanation.protections,
                       skipped: explanation.skipped
                     }))
-                  } else diagnosticDrops.filtered++
+                  } else {
+                    // C1-029：该条若在④已按「通过项被挤掉」记过，这里改记 filtered——最终决策是被
+                    // 「只看它」拒掉，两个计数器各记一次会把被挤掉条数算成条目数的两倍。
+                    if (passedDropItems.delete(it)) diagnosticDrops.passed--
+                    diagnosticDrops.filtered++
+                  }
                 }
               }
               items = kept
