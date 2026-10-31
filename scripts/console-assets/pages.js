@@ -2,7 +2,7 @@
 // 运行历史 / 逐轮历史 / 趋势 / 缓存健康 / 推送记录 / 运行日志 / 控制台设置 / 备份 / 两步验证 /
 // 系统 / 文件 / 配置 / 过滤规则。只依赖 components.js 与基础模块，不认识 App，也没有顶层副作用。
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
-import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S } from './constants.js'
+import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT_URL_REVOKE_MS, PANEL_FRESH_MS, SAVED_HINT_MS, SNAP_INFLIGHT_MS, VERSION_TIP_MS } from './constants.js'
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
@@ -442,7 +442,7 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   const fetchSnap = useCallback((k) => {
     const seq = ++preSeqRef.current[k]
     const now = Date.now()
-    if (snapInflightRef.current && now - snapInflightRef.current.at < 3000) return snapInflightRef.current.p
+    if (snapInflightRef.current && now - snapInflightRef.current.at < SNAP_INFLIGHT_MS) return snapInflightRef.current.p
     const write = ++snapWriteRef.current
     const p = apiGetRunHistory({ limit: RUN_FETCH_LIMIT })
       .then((d) => {
@@ -776,6 +776,8 @@ function usePanelAutoLoad (active, load, { queue = false } = {}) {
     if (!first && !becameActive && !loadChanged) return
     // 首次点开时若预加载还在飞、或刚回来不到 3s，直接用手里的/路上的数据，
     // 不再发第二发把预加载响应顶掉（Sourcery #272）。更久才点开则补一次新鲜的。
+    // 这里的 3000 是 test_console.js 逐字锁定该表达式的断言口径（C7-049 只把 SysPanel
+    // 的同一判定换成了 PANEL_FRESH_MS，这一份保持原样以免动到既有断言）。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current && !loadChanged) return
     pendingRef.current = true
@@ -1111,6 +1113,8 @@ function CacheHealthPanel ({ paused = false, active = true }) {
       // /api/files 与文件清单页共用 once('files') 的在飞去重，不会和那边的请求叠发。
       load().catch(() => {})
       filesLoader.load().catch(() => {})
+      // 本处保留裸数字：test_console.js 的「缓存健康必须每分钟刷新」断言按字面量锁这一段，
+      // 改走常量会让那条既有断言失去判据。
     }, 60000)
     // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
     // 通知当前页签的面板，这里再挂一个就会被拉两次（Sourcery PR #300）。
@@ -1891,7 +1895,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       // revoke 延迟到 click 之后一拍（评审 231-M5）：浏览器解析下载是异步的，同步
       // revoke 会让 deferred download 拿不到 blob。1 分钟后回收（URL 规范建议的
       // 「延迟 revoke」口径，内存占用一次性、不累积）。
-      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
+      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, OBJECT_URL_REVOKE_MS)
       setExporting('')
     }
   }, [exporting, cate, query, days, rangeActive, range.from, range.to])
@@ -2124,7 +2128,11 @@ function SearchPanel ({ onSync, active = true }) {
   const [cfg, setCfg] = useState({ limit: 20, intervalMin: 10, enabled: false, lastCheckAt: 0 })
   const [cfgReady, setCfgReady] = useState(false)
   const [cfgDraft, setCfgDraft] = useState({ limit: 20, intervalMin: 10, enabled: false })
+  // 保存设置的提示同一个 span 承载三态：中性（保存中…）/ 成功 / 失败。
+  // 旧实现 CSS 写死 color: var(--ok-fg)，失败文案也用成功绿（C7-035）。
   const [cfgMsg, setCfgMsg] = useState('')
+  const [cfgMsgTone, setCfgMsgTone] = useState('')
+  const showCfgMsg = (text, tone = '') => { setCfgMsg(text); setCfgMsgTone(tone) }
   const cfgDirty = useRef(false)
   const [checking, setChecking] = useState(false)
   const [newCounts, setNewCounts] = useState({})
@@ -2215,15 +2223,15 @@ function SearchPanel ({ onSync, active = true }) {
   }
   const editCfg = (patch) => {
     cfgDirty.current = true
-    setCfgMsg('')
+    showCfgMsg('')
     setCfgDraft((d) => ({ ...d, ...patch }))
   }
   const saveCfg = () => {
     const limit = Number(cfgDraft.limit)
     const intervalMin = Number(cfgDraft.intervalMin)
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) { setCfgMsg('条数要 1–100'); return }
-    if (!Number.isSafeInteger(intervalMin) || intervalMin < 1 || intervalMin > 1440) { setCfgMsg('间隔要 1–1440 分钟'); return }
-    setCfgMsg('保存中…')
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) { showCfgMsg('条数要 1–100', 'bad'); return }
+    if (!Number.isSafeInteger(intervalMin) || intervalMin < 1 || intervalMin > 1440) { showCfgMsg('间隔要 1–1440 分钟', 'bad'); return }
+    showCfgMsg('保存中…')
     watchEpoch.current += 1
     apiPostLineWatch({ action: 'config', limit, intervalMin, enabled: cfgDraft.enabled === true }).then((d) => {
       watchEpoch.current += 1
@@ -2236,9 +2244,9 @@ function SearchPanel ({ onSync, active = true }) {
       cfgDirty.current = false
       setCfg(next)
       setCfgDraft({ limit: next.limit, intervalMin: next.intervalMin, enabled: next.enabled })
-      setCfgMsg('已保存')
+      showCfgMsg('已保存', 'ok')
       if (Array.isArray(d.words)) setWatch(d.words)
-    }).catch((e) => setCfgMsg(`保存失败：${e.message}`))
+    }).catch((e) => showCfgMsg(`保存失败：${e.message}`, 'bad'))
   }
   const checkWatch = async () => {
     if (checking || watch.length === 0) return
@@ -2435,7 +2443,7 @@ function SearchPanel ({ onSync, active = true }) {
             onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动检查并推送新线报
         </label>
         <${Button} variant="ghost" onClick=${saveCfg}>保存设置<//>
-        ${cfgMsg && html`<span class="ls-cfg-msg">${cfgMsg}</span>`}
+        ${cfgMsg && html`<span class=${'ls-cfg-msg' + (cfgMsgTone ? ' is-' + cfgMsgTone : '')}>${cfgMsg}</span>`}
       </div>
       <div class="ls-cfg-help">「搜索页每页」只管搜索页翻页，不影响监控。开启监控后，每 ${cfgDraft.intervalMin} 分钟看一次关注词：上次检查之后多出来的线报，每条单独推送；没有新的就不推。监控会从最新往回翻到上次检查的位置（最多 5 页），不会因为超过一页的条数就漏推。推过的会记在文件里，重启不重推。</div>
       ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查时间：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
@@ -2989,7 +2997,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       setWinDirty(false)
       setWinSaved(true)
       clearTimeout(winSavedTimerRef.current)
-      winSavedTimerRef.current = setTimeout(() => setWinSaved(false), 1500)
+      winSavedTimerRef.current = setTimeout(() => setWinSaved(false), SAVED_HINT_MS)
       await loadSettings()
       if (typeof onSaved === 'function') onSaved()
     } catch (e) {
@@ -3021,7 +3029,7 @@ function ConsoleSettingsBlock ({ settings, settingsErr, loadSettings, onSaved, a
       if (typeof onSaved === 'function') onSaved()
       setDateSaved(true)
       clearTimeout(dateSavedTimerRef.current)
-      dateSavedTimerRef.current = setTimeout(() => setDateSaved(false), 1500)
+      dateSavedTimerRef.current = setTimeout(() => setDateSaved(false), SAVED_HINT_MS)
     } catch (e) {
       setDateErr(`保存失败：${e && e.message ? e.message : e}`)
     } finally {
@@ -3207,7 +3215,7 @@ function BackupBlock ({ onImported }) {
     } catch (e) {
       setErr(`导出失败：${e && e.message ? e.message : e}`)
     } finally {
-      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, 60000)
+      if (url !== '') setTimeout(() => { try { URL.revokeObjectURL(url) } catch (e) { /* 已回收 */ } }, OBJECT_URL_REVOKE_MS)
       setBusy('')
     }
   }
@@ -3234,7 +3242,8 @@ function BackupBlock ({ onImported }) {
     e.target.value = '' // 允许重复选同一个文件
     if (!file) return
     setErr(''); setNote('')
-    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr('备份文件太大（上限 48MB）'); return }
+    // 上限跟常量走（C7-047）：文案写死数字时，改 BACKUP_FILE_MAX_BYTES 会让提示说谎。
+    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr(`备份文件太大（上限 ${fmtBytes(BACKUP_FILE_MAX_BYTES)}）`); return }
     try {
       const text = await file.text()
       const data = JSON.parse(text)
@@ -3605,13 +3614,13 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
       }
       verBusyRef.current = false
       setVerState('latest')
-      verTimerRef.current = setTimeout(() => setVerState(''), 2500)
+      verTimerRef.current = setTimeout(() => setVerState(''), VERSION_TIP_MS)
     }).catch(() => {
       if (seq !== verSeqRef.current) return
       verBusyRef.current = false
       clearTimeout(verTimerRef.current)
       setVerState('error')
-      verTimerRef.current = setTimeout(() => setVerState(''), 2500)
+      verTimerRef.current = setTimeout(() => setVerState(''), VERSION_TIP_MS)
     })
   }
   const { data: access, err: accessErr, load: loadAccess } = usePanelLoader(apiGetAccessLog)
@@ -3629,7 +3638,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     // （/api/sys + /api/access-log + /api/config/console），首次进入才算首访。
     if (!active) return
     // 首次点开时上一发还在飞/刚回来不到 3s，直接用手里的数据；更久才点开则补一次。
-    if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
+    if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < PANEL_FRESH_MS))) return
     if (pendingRef.current) return
     pendingRef.current = true
     Promise.allSettled([load(), loadAccess(), loadSettings()]).then(() => {

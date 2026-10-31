@@ -1051,7 +1051,10 @@
     background: var(--bg); color: var(--text); font: inherit;
   }
   .ls-cfg-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); min-height: 38px; }
-  .ls-cfg-msg { font-size: var(--fs-xs); color: var(--ok-fg); }
+  /* 三态：中性（保存中…）/ 成功 / 失败——同一个 span 不再默认成功绿（C7-035）。 */
+  .ls-cfg-msg { font-size: var(--fs-xs); color: var(--text-dim); }
+  .ls-cfg-msg.is-ok { color: var(--ok-fg); }
+  .ls-cfg-msg.is-bad { color: var(--bad-fg); }
   .ls-cfg-help { padding: 0 var(--sp-3) var(--sp-2); color: var(--text-dim); font-size: var(--fs-xs); line-height: 1.6; }
   .ls-watch {
     border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel-2);

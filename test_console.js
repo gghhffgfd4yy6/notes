@@ -8113,6 +8113,55 @@ async function main () {
     assert.ok(!cache.includes("addEventListener('visibilitychange'"), '切回前台补拉交给 App 统一路径，面板不得再自己挂（会重复请求）')
   })
 
+  // C7-049（评审 must_fix）：注释里复述同一个数会替既有断言兜底 —— 把定时器改成别的数，
+  // 上面那条 `cache.includes('60000')` 仍然绿，「缓存健康必须每分钟刷新」从此没有判据。
+  // 该字面量只许出现在代码里；回退掉源码注释的修复即红。
+  await aok('结构红线: 缓存健康字面量只许在代码里，注释不得复述（回退修复即红）', () => {
+    const src = readConsoleSource()
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    const rawHits = (cache.match(/60000/g) || []).length
+    const codeHits = (codeOf(cache).match(/60000/g) || []).length
+    assert.strictEqual(codeHits, 1, '缓存健康必须保留每分钟一次的裸数字定时器（既有断言按字面量锁它）')
+    assert.strictEqual(rawHits, codeHits, '该字面量只能出现在代码里，注释复述会削弱既有断言的判据')
+  })
+
+  // C7-035/C7-047/C7-049（评审 must_fix）：这三条修复此前只有未入库的 scratch 探针兜底 ——
+  // 把 main 的 pages.js/app.css/constants.js 覆盖回来跑既有套件仍是 330/0，回归只能靠人工复核。
+  // 下面每条独立成例：回退对应修复必须逐条变红，否则「修好了」就只是一句自述。
+  await aok('结构红线: 保存设置的失败提示必须按 tone 拼 is-ok/is-bad（回退修复即红）', () => {
+    const src = readConsoleSource()
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(codeOf(src).includes("'ls-cfg-msg' + (cfgMsgTone ? ' is-' + cfgMsgTone : '')"),
+      '保存设置的提示必须按 tone 拼 is-ok/is-bad，写死成功绿会让失败与「已保存」同色')
+    const base = (css.match(/\.ls-cfg-msg\s*\{[^}]*\}/) || [''])[0]
+    const okRule = (css.match(/\.ls-cfg-msg\.is-ok\s*\{[^}]*\}/) || [''])[0]
+    const badRule = (css.match(/\.ls-cfg-msg\.is-bad\s*\{[^}]*\}/) || [''])[0]
+    // 基类必须中性：基类还吃 --ok-fg 的话，三态类再全也挡不住「失败也是绿」。
+    assert.ok(/color:\s*var\(--text-dim\)/.test(base), '.ls-cfg-msg 基类必须是中性的 --text-dim')
+    assert.ok(/color:\s*var\(--ok-fg\)/.test(okRule), '.ls-cfg-msg.is-ok 必须用 --ok-fg')
+    assert.ok(/color:\s*var\(--bad-fg\)/.test(badRule), '.ls-cfg-msg.is-bad 必须用 --bad-fg（失败提示不得再是成功绿）')
+  })
+
+  await aok('结构红线: 备份超限文案必须由 BACKUP_FILE_MAX_BYTES 拼出（回退修复即红）', () => {
+    const pagesSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    assert.ok(codeOf(pagesSrc).includes('fmtBytes(BACKUP_FILE_MAX_BYTES)'),
+      '备份超限文案必须用 fmtBytes(BACKUP_FILE_MAX_BYTES) 拼出，写死数字后改常量会让提示说谎')
+    // 含注释全文件扫：注释里复述同一个数，同样会让「文案与常量脱钩」无人发现。
+    assert.ok(!pagesSrc.includes('上限 48MB'), 'pages.js 全文不得再出现写死的「上限 48MB」')
+  })
+
+  await aok('结构红线: 面板时长必须引用 constants 命名常量（回退修复即红）', () => {
+    // 只认 pages.js：constants.js 本来就带定义与导出，拼整份源码会把「没人引用」也判成绿。
+    const pagesSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const pageCode = codeOf(pagesSrc)
+    const names = ['SNAP_INFLIGHT_MS', 'PANEL_FRESH_MS', 'SAVED_HINT_MS', 'VERSION_TIP_MS', 'OBJECT_URL_REVOKE_MS']
+    for (const name of names) {
+      const hits = (pageCode.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length
+      // import 一行 + 至少一处使用 = 2；只剩 1 次说明常量被重新写回裸数字。
+      assert.ok(hits >= 2, `pages.js 必须在 import 之外引用 ${name}，裸数字回潮即红`)
+    }
+  })
+
   await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')

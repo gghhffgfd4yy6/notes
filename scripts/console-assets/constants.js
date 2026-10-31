@@ -24,6 +24,20 @@ const BUSY_FALLBACK_MS = 11 * 60 * 1000
 const FETCH_TIMEOUT_MS = 8000
 // 备份是「整包上传/下载」，不能套 8 秒的普通 API 期限：慢网络下大文件会被误判失败。
 const BACKUP_FETCH_TIMEOUT_MS = 120000
+
+// ── 面板时长（毫秒，C7-049）────────────────────────────────────────────────
+// 此前 60000/3000/1500/2500 散在 pages.js 各处当裸数字，语义只靠注释；同一个 3000
+// 在两处含义不同（请求复用 vs 补发抑制），必须分开命名。
+// 运行历史快照的在飞复用窗（Sourcery #315-5）：3s 内切档直接复用同一发请求。
+const SNAP_INFLIGHT_MS = 3000
+// 面板「刚加载过」的新鲜窗（Sourcery #272）：3s 内点开用手里的/路上的数据，不再补发。
+const PANEL_FRESH_MS = 3000
+// 「已保存」提示的停留时长（通知自检窗 / 显示开关各一处）。
+const SAVED_HINT_MS = 1500
+// 版本核对结论（已是最新 / 核对失败）的提示停留时长。
+const VERSION_TIP_MS = 2500
+// 导出 blob 的 URL 延迟回收：立刻 revoke 会让部分浏览器的下载落空。
+const OBJECT_URL_REVOKE_MS = 60000
 // 通知自检重复提交拦截窗的客户端边界（与 console.js NOTIFY_REPLAY_MIN_S/MAX_S 同口径）：
 // 这层只负责「非法值不发请求」，服务端仍是唯一权威（越界/类型错一律 400）。
 const NOTIFY_WINDOW_MIN_S = 0
@@ -42,4 +56,4 @@ const TZ_LABEL = '北京时间'
 const BACKUP_BROWSER_MAX_BYTES = 32 * 1024 * 1024
 const BACKUP_FILE_MAX_BYTES = 48 * 1024 * 1024
 
-export { POLL_MS, POLL_BUSY_MS, SSE_HEARTBEAT_MS, VERSION_CHECK_MS, BUSY_FALLBACK_MS, FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, BACKUP_BROWSER_MAX_BYTES, BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MIN_S, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_DEFAULT_S, TZ_LABEL }
+export { POLL_MS, POLL_BUSY_MS, SSE_HEARTBEAT_MS, VERSION_CHECK_MS, BUSY_FALLBACK_MS, FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, SNAP_INFLIGHT_MS, PANEL_FRESH_MS, SAVED_HINT_MS, VERSION_TIP_MS, OBJECT_URL_REVOKE_MS, BACKUP_BROWSER_MAX_BYTES, BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MIN_S, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_DEFAULT_S, TZ_LABEL }
