@@ -603,6 +603,28 @@ check('C9-007：多行规则整次扫描只归一化一次（次数与规则数�
     'catename=null 时必须不命中（不得落到 /null/ 字面量）')
 })
 
+check('C9-011：行分割只有一份实现（compileRules/validateConfig 同源，含 <br/> 与 <br />）', () => {
+  // 反例（改动前）：同一个 /<br\s*\/?>|\r\n|\r|\n/ 在 xbk_rules 里被抄 3 份（_splitLines +
+  // validateConfig 的过滤字段与 pingbitime 两处就地重写），只能靠注释「与 _splitLines 口径一致」同步。
+  const { eng } = r2xMake({ fields: ['keyword'] })
+  const seps = ['<br>', '<br/>', '<br />', '\r\n', '\r', '\n']
+  for (const sep of seps) {
+    const cfg = ['微博###小明', 'cat2###小红'].join(sep)
+    assert.deepStrictEqual(eng._splitLines(cfg), ['微博###小明', 'cat2###小红'], `${JSON.stringify(sep)} 必须由同一实现拆分`)
+    assert.deepStrictEqual(eng.splitRuleLines(cfg), ['微博###小明', 'cat2###小红'], `splitRuleLines 必须与 _splitLines 同源：${JSON.stringify(sep)}`)
+    assert.deepStrictEqual(eng.validateConfig({ keyword: cfg }), [], `validateConfig 对 ${JSON.stringify(sep)} 不得产生警告`)
+    assert.deepStrictEqual(eng.validateConfig({ pingbitime: ['微博###3', 'cat2###5'].join(sep) }), [], `pingbitime 校验对 ${JSON.stringify(sep)} 不得产生警告`)
+  }
+  // 结构断言：_splitLines 与 validateConfig 都必须委托 splitRuleLines —— 给 splitRuleLines 装一个
+  // 哨兵行（含两个 ###），两处都必须「看到」它；若谁还留着自己那份就地 split，就看不到哨兵。
+  const orig = eng.splitRuleLines
+  eng.splitRuleLines = () => ['cat###v###extra']
+  assert.deepStrictEqual(eng._splitLines('a###1'), ['cat###v###extra'], '_splitLines 必须委托 splitRuleLines')
+  const warns = eng.validateConfig({ keyword: 'a###1' })
+  assert.ok(warns.some(w => w.includes('多个 ###')), 'validateConfig 必须经 _splitLines → splitRuleLines 取行')
+  eng.splitRuleLines = orig
+})
+
 check('checkTimeCompiled：不拦截(null) 与拦截(true/false) 两侧，阈值比较必须严格大于', () => {
   // 杀 checkTimeCompiled L387/L391/L398/L399：缺失/非法注册时间放行，time 与 timeMulti 均不得用 >=
   const { eng } = r2xMake()

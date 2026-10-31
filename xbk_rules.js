@@ -6,6 +6,13 @@
 function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available }) {
   // C9-008：正则 .test 异常只在进程内首次告警一次——热路径（每条消息 × 每个字段 × 每条规则）
   // 重复告警会淹没 run.log，静默又会让「规则全废」不可见。
+  // C9-011：规则行分隔形态的**唯一实现**（此前 xbk_rules 里有 3 处、xbk_filter_store 与
+  // scripts/console 各 1 处，靠「与 _splitLines 口径一致」的注释当同步机制）。加一种分隔形态
+  // （如 <BR>）漏改一处，症状只能是 filter_store 闸门 4 的「编译出 N 条、有效行数 M」这种事后错误。
+  // 跨模块那两处（filter_store 的 LINE_SPLIT_RE、console 的 split）属别的模块，本批不动；
+  // 它们改为调用 RuleEngine.splitRuleLines 即可与这里同源。
+  const RULE_LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
+
   let testFailWarned = false
   const RuleEngine = {
     // RULES-06：此处原有 _compileUserRegex 包装方法，全仓库（含测试）无任何调用者，
@@ -155,16 +162,27 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       }
     },
 
+    /** 规则行分割的唯一实现（C9-011）：<br> / <br/> / <br /> / \r\n / \r / \n。
+     *  恒返回数组，不做「有没有 ###」的判断——那是 _splitLines 的历史兼容契约（C9-017 登记）。
+     *  xbk_filter_store 的 LINE_SPLIT_RE 与 scripts/console 的 split 属别的模块，本批未动；
+     *  它们引用本方法即可与运行期同源（新增分隔形态只改上面那一个正则）。 */
+    splitRuleLines (configStr) {
+      if (configStr === undefined || configStr === null) return []
+      let s
+      try { s = typeof configStr === 'string' ? configStr : String(configStr) } catch (e) { return [] }
+      if (!s) return []
+      return s.split(RULE_LINE_SPLIT_RE)
+    },
+
     /** 解析多行配置（<br> / \n\n 分割），返回行数组 */
     _splitLines (configStr) {
     // v3.108 fuzz：/###/.test(Symbol) 隐式 String() 抛 TypeError——Symbol 视为无配置
       if (configStr === undefined || configStr === null || typeof configStr === 'symbol') return []
       let s
       try { s = String(configStr) } catch (e) { return [] } // 嵌套 Symbol 数组 String() 崩 → 无配置
-      configStr = s
-      if (!configStr) return []
-      if (!/###/.test(configStr)) return null // 简单模式（测试锁定契约；调用方均有 /###/ 守卫才调用）
-      return configStr.split(/<br\s*\/?>|\r\n|\r|\n/) // R2：支持 <br/> 自闭合（与 htmlToMarkdown br 口径一致）
+      if (!s) return []
+      if (!/###/.test(s)) return null // 简单模式（测试锁定契约；调用方均有 /###/ 守卫才调用）
+      return this.splitRuleLines(s) // C9-011：分隔形态只有一份实现
     },
 
     /**
@@ -519,7 +537,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         if (field === 'pingbifenlei' && /###/.test(val)) continue
         // 多行模式：逐行验证
         if (/###/.test(val)) {
-          const lines = val.split(/<br\s*\/?>|\r\n|\r|\n/) // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
+          const lines = this._splitLines(val) // C9-011：与 compileRules 同一份实现（此前就地重写正则）
           for (const line of lines) {
             const t = line.trim()
             if (!t) continue
@@ -602,7 +620,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         // 校验侧却静默通过，两端口径不一致）。
         const PINGBITIME_MAX_DAYS = 3650000 // 与 compileRules 口径一致：超过上限视为无效
         if (/###/.test(pbStr)) {
-          const lines = pbStr.split(/<br\s*\/?>|\r\n|\r|\n/) // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
+          const lines = this._splitLines(pbStr) // C9-011：与 compileRules 同一份实现（此前就地重写正则）
           for (const line of lines) {
             const { cat, val, parts } = this._parseLine(line)
             if (parts.length >= 2) {
