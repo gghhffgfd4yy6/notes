@@ -8113,6 +8113,18 @@ async function main () {
     assert.ok(!cache.includes("addEventListener('visibilitychange'"), '切回前台补拉交给 App 统一路径，面板不得再自己挂（会重复请求）')
   })
 
+  // C7-049（评审 must_fix）：注释里复述同一个数会替既有断言兜底 —— 把定时器改成别的数，
+  // 上面那条 `cache.includes('60000')` 仍然绿，「缓存健康必须每分钟刷新」从此没有判据。
+  // 该字面量只许出现在代码里；回退掉源码注释的修复即红。
+  await aok('结构红线: 缓存健康字面量只许在代码里，注释不得复述（回退修复即红）', () => {
+    const src = readConsoleSource()
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    const rawHits = (cache.match(/60000/g) || []).length
+    const codeHits = (codeOf(cache).match(/60000/g) || []).length
+    assert.strictEqual(codeHits, 1, '缓存健康必须保留每分钟一次的裸数字定时器（既有断言按字面量锁它）')
+    assert.strictEqual(rawHits, codeHits, '该字面量只能出现在代码里，注释复述会削弱既有断言的判据')
+  })
+
   await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')

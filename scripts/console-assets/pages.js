@@ -1113,8 +1113,8 @@ function CacheHealthPanel ({ paused = false, active = true }) {
       // /api/files 与文件清单页共用 once('files') 的在飞去重，不会和那边的请求叠发。
       load().catch(() => {})
       filesLoader.load().catch(() => {})
-      // 保持裸 60000：test_console.js 的「缓存健康必须每分钟刷新」断言按字面量锁这一段
-      // （C7-049 只命名了其余散落的时长，这一处不动以免削弱既有断言）。
+      // 本处保留裸数字：test_console.js 的「缓存健康必须每分钟刷新」断言按字面量锁这一段，
+      // 改走常量会让那条既有断言失去判据。
     }, 60000)
     // 切回前台不再自己补拉：App 的「回前台补拉」（VISIBLE_STALE_MS）会经下拉事件
     // 通知当前页签的面板，这里再挂一个就会被拉两次（Sourcery PR #300）。
