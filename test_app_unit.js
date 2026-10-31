@@ -3122,6 +3122,47 @@ checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过�
   }
 })
 
+checkAsync('C1-021 dry-run 不得清 _f / 写回缓存 / 推进 filter.hash（否则一次诊断就消费掉「规则变更」）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const hashPath = path.join(cacheDir, 'filter.hash')
+    const cachePath = path.join(cacheDir, h.cacheName())
+    const prevDryRun = process.env.XBK_DRY_RUN
+    try {
+      // ① 真跑：规则「甲」拦下条目 ⇒ 缓存留下 _f，filter.hash 落盘（后续两步的对照基线）
+      h.Config.filter.pingbibiaoti = '甲'
+      h.setItems([makeRunItem('dry-1', '甲条'), makeRunItem('dry-1b', '正常条')])
+      await runWithWarnings(h.App)
+      const cacheAfterReal = realFs.readFileSync(cachePath, 'utf8')
+      const hashAfterReal = realFs.readFileSync(hashPath, 'utf8')
+      assert.ok(JSON.parse(cacheAfterReal).some((m) => m._f === true), '前置：被拦下的条目应带 _f 落缓存')
+      assert.ok(hashAfterReal.length > 0, '前置：真跑必须写出 filter.hash')
+
+      // ② 改规则后 dry-run：判重缓存与 filter.hash 都必须一字不动
+      h.Config.filter.pingbibiaoti = '乙'
+      h.setItems([makeRunItem('dry-2', '乙条')])
+      process.env.XBK_DRY_RUN = '1'
+      await runWithWarnings(h.App)
+      assert.strictEqual(realFs.readFileSync(cachePath, 'utf8'), cacheAfterReal,
+        'dry-run 不得改写判重缓存——清 _f 也是一次改写：被清掉的条目本应在真跑里重新评估/补推')
+      assert.strictEqual(realFs.readFileSync(hashPath, 'utf8'), hashAfterReal,
+        'dry-run 不得推进 filter.hash——推进即「规则变更」事件被消费，真跑不再重评')
+
+      // ③ 同一份新规则真跑：必须真的把「规则变更失效」的旧 _f 条目移出缓存、推进 hash
+      //    （证明 ② 的「没变」来自 dryRun 判据，而不是「本来就无事发生」）
+      delete process.env.XBK_DRY_RUN
+      h.setItems([makeRunItem('dry-3', '乙条三')])
+      await runWithWarnings(h.App)
+      const idsAfterSecondReal = JSON.parse(realFs.readFileSync(cachePath, 'utf8')).map((m) => m.id)
+      assert.strictEqual(idsAfterSecondReal.includes('dry-1'), false,
+        `真跑必须把旧 _f 条目移出缓存（否则改宽规则后永不重评）：${JSON.stringify(idsAfterSecondReal)}`)
+      assert.notStrictEqual(realFs.readFileSync(hashPath, 'utf8'), hashAfterReal, '真跑必须推进 filter.hash')
+    } finally {
+      if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = prevDryRun
+    }
+  })
+})
+
 checkAsync('TR-1 maxPerRun 截断：被截断条目不得写入缓存（下轮补推不丢不重），摘要 truncated 如实计数', async () => {
   const realFs = require('fs')
   const cacheDir = mkTmpFixture('trunc-')

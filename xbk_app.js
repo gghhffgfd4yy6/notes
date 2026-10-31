@@ -1161,8 +1161,13 @@ function createApp ({
     // pushedKeys、通道健康更新晚于 saveBatch）此前只写在注释里，挪行没有任何测试会红。
     // 覆盖文件损坏（active.degraded）时**整段跳过**：降级不能放宽规则，也就不能触发「之前被过滤的
     // 条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
-    _invalidateFilteredCache ({ active, cacheName, filterHash }) {
-      if (!active || active.degraded) return
+    _invalidateFilteredCache ({ active, cacheName, filterHash, dryRun }) {
+      // C1-021：dry-run 是**诊断**形态，除 run.log 外不得产生持久副作用。旧实现照常清 _f、写回缓存
+      // 并推进 filter.hash —— 跑一次 --dry-run 就把「规则变更」这个一次性事件消费掉：缓存里的 _f
+      // 已被清（这些条目原本要靠它重新评估），hash 也已对齐，之后真跑不再重评、不再补推。这里整体
+      // 跳过。代价如实登记：dry-run 的预览不再含「因规则变更才被清 _f」的条目，会比真跑少报几条 ——
+      // 诊断只读语义优先，宁可少报也不改缓存/hash。
+      if (dryRun === true || !active || active.degraded) return
       const hashPath = path.join(this._cacheDir(), 'filter.hash')
       let lastFile = ''
       let lastHash = ''
@@ -1436,7 +1441,7 @@ function createApp ({
         // ③b 规则变更 ⇒ 失效「过滤写入」缓存（覆盖文件损坏时的跳过判据在方法内）。**顺序不变式**：
         // 必须先于下方 MessageStore.readMessages(cacheFilePath) 建判重索引——否则被清掉 _f 的条目
         // 已经进了 cacheIds/墓碑索引，本轮仍被判重跳过，改宽规则后静默漏推（回归用例 ORD-1 锁住这条）。
-        this._invalidateFilteredCache({ active, cacheName, filterHash })
+        this._invalidateFilteredCache({ active, cacheName, filterHash, dryRun })
         const newMessages = []
         // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
         // 接口异常返回海量数据（maxPerRun 想防的同一场景）时判重卡死——实测 N=2万/M=1万 → 11.6s，
