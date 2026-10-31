@@ -11415,6 +11415,37 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti, probe, 'cat'), true, 'matchesCompiled 同口径命中')
   })
 
+  // C9-007：归一化吐 null（值不可判定）必须与「字段缺失」同口径——不得落成字面量 "null" 参与匹配
+  await test('C9-007: 字段值不可判定（ToString/Symbol 抛错）时多行规则必须放行，不得当字面量 "null" 命中', () => {
+    // 反例（改动前）：_normalizeMatchText 的 try/catch 把 String() 异常吞成 null，matchOnce 又把
+    // null 直接交给 _safeTestText ⇒ 真正进 .test 的是字符串 "null"。值侧模式 /null/、/.*/ 一旦命中，
+    // 判定就从「放行」翻成「拦截」（本批唯一一处把「异常即不命中」改成「异常当 'null' 命中」）。
+    const poisonedObj = { toString () { throw new TypeError('boom') } }
+    const poisonedSymbolArr = [Symbol('boom')] // String([Symbol]) 同样抛 TypeError
+    const nullCfg = compileRules({ pingbineirong: '微博###null' })
+    const dotCfg = compileRules({ pingbineirong: '微博###.*' })
+    const poisoned = [['抛错 toString 的对象', poisonedObj], ['含 Symbol 的数组', poisonedSymbolArr]]
+    const cfgs = [['/null/', nullCfg], ['/.*/', dotCfg]]
+    for (const [label, value] of poisoned) {
+      for (const [cfgName, cfg] of cfgs) {
+        const item = makeItem({ catename: '微博', louzhu: 'y', title: 'x', content: value })
+        const r = explainFilter(item, cfg)
+        assertEqual(r.passed, true, `content 不可判定时必须放行（${label} × ${cfgName}）`)
+        assertEqual(r.reason, null, `放行时不得给出拦截原因（${label} × ${cfgName}）`)
+        assertEqual(listfilter(item, cfg), true, `listfilter 同口径放行（${label} × ${cfgName}）`)
+        assertEqual(checkFields(item, cfg), true, `checkFields 同口径放行（${label} × ${cfgName}）`)
+      }
+    }
+    // 真假成对：同一批规则对可判定的文本仍必须照旧命中（不得把规则本身修失效）
+    const literal = makeItem({ catename: '微博', louzhu: 'y', title: 'x', content: 'null' })
+    const rLiteral = explainFilter(literal, nullCfg)
+    assertEqual(rLiteral.passed, false, '可判定文本 "null" 仍必须被 /null/ 拦截')
+    assertEqual(rLiteral.reason.stage, 'content', '拦截原因应指向 content 阶段')
+    assertEqual(rLiteral.reason.configKey, 'pingbineirong', '拦截原因应指向 pingbineirong')
+    assertEqual(explainFilter(makeItem({ catename: '微博', content: '随便什么内容' }), dotCfg).passed, false, '/.*/ 对可判定文本仍必须拦截')
+    assertEqual(explainFilter(makeItem({ catename: '数码', content: '随便什么内容' }), dotCfg).passed, true, '分类不匹配时仍放行（规则语义不得被改坏）')
+  })
+
   // ==================== 补测（PlanA）：timeMatchedRule / checkFields / _passIfMissing ====================
   // 靶标：高价值存活变异簇（时间过滤判定 79 / 字段过滤入口 45 / 缺字段放行 26）。
   // 断言一律对契约与注释意图，真假两侧成对，精确值断言，不依赖时区/遍历顺序。
@@ -11556,6 +11587,43 @@ console.log('========================================\n');
     assertEqual(checkFields(makeItem({ title: 0 }), compileRules({ zhanxianbiaoti: '0', pingbibiaoti: '0' })), true, 'title=0 亦应能触发强制展现')
     assertEqual(checkFields(makeItem({ title: undefined }), compileRules({ pingbibiaoti: '京东' })), true, 'title 缺失应跳过该字段')
     assertEqual(checkFields(makeItem({ title: '' }), compileRules({ pingbibiaoti: '京东' })), true, 'title 空串应跳过该字段')
+  })
+
+  // C9-009：checkFields 是 explainFilter 的兼容壳（优先级矩阵只有一份实现）
+  await test('C9-009: checkFields 与生产入口 explainFilter 同判定（含分类/时间过滤）', () => {
+    // 反例（改动前）：checkFields 手写第二份矩阵、字段命名都不同，且完全不做 pingbifenlei/pingbitime
+    // 判定 ⇒ 同一输入 checkFields=true / listfilter=false 的分裂。
+    const catBlock = compileRules({ pingbifenlei: '美妆' })
+    const gCat = makeItem({ catename: '美妆', title: '口红' })
+    assertEqual(checkFields(gCat, catBlock), false, '分类屏蔽必须同样作用于 checkFields（此前被忽略）')
+    assertEqual(checkFields(gCat, catBlock), listfilter(gCat, catBlock), 'checkFields 必须与 listfilter 同判定')
+
+    const timeBlock = compileRules({ pingbitime: '5' })
+    const gNew = makeItem({ louzhuregtime: daysAgo(4) })
+    const gOld = makeItem({ louzhuregtime: daysAgo(100) })
+    assertEqual(checkFields(gNew, timeBlock), false, '注册 4 天 < 5 天必须被时间过滤拦下（此前 checkFields 不看时间）')
+    assertEqual(checkFields(gOld, timeBlock), true, '注册 100 天不在窗口内应放行')
+
+    // 全矩阵一致性：同一批配置 × 同一条目，两个入口必须逐项相同（形状守卫之外不再有第二份语义）
+    const cases = [
+      [{}, {}],
+      [{ pingbibiaoti: '京东' }, {}],
+      [{ pingbibiaoti: '拼多多' }, {}],
+      [{ zhanxianbiaoti: '京东', pingbibiaoti: '京东' }, {}],
+      [{ zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' }, {}],
+      [{ zhanxianlouzhu: '小明', pingbibiaoti: '京东' }, {}],
+      [{ pingbilouzhu: '小明', pingbibiaoti: '京东' }, {}],
+      [{ zhanxianneirong: '抢购', pingbineirong: '抢购' }, {}],
+      [{ pingbineirongplus: '抢购' }, {}],
+      [{ pingbibiaoti: '京东', pingbitime: '5' }, { louzhuregtime: daysAgo(1) }],
+      [{ pingbibiaoti: '京东', pingbifenlei: '微博线报' }, {}]
+    ]
+    for (const [cfg, overrides] of cases) {
+      const item = makeItem(overrides)
+      const compiled = compileRules(cfg)
+      assertEqual(checkFields(item, compiled), explainFilter(item, compiled).passed,
+        `checkFields 必须与 explainFilter 同判定：${JSON.stringify(cfg)} ${JSON.stringify(overrides)}`)
+    }
   })
 
   // ---- timeMatchedRule（经 explainFilter 的可观测出口 reason.rule 判定）----
