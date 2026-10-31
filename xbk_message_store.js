@@ -1087,7 +1087,7 @@ function createMessageStore ({
       try { this._pruneCorruptBackups(filePath) } catch (e) { /* 保留策略失败不影响本次重建 */ }
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
-      console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除）${filePath} → ${backupPath}；` +
+      console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除；同族隔离件按每缓存文件最多 ${CORRUPT_BACKUP_KEEP} 份保留、更旧的自动回收）${filePath} → ${backupPath}；` +
         `重建 ${messages.length} 条、落墓碑 ${dropped.length} 条；未读到的旧身份不落墓碑（可能重推）`)
       return messages
     },
@@ -1348,7 +1348,7 @@ function createMessageStore ({
           this._tombstoneLoadStatus[filePath] = 'corrupt'
           try { this._pruneCorruptBackups(seenPath) } catch (e) { /* 保留策略失败不影响本次隔离 */ }
           this._warnTombstoneOnce(filePath, 'corrupt',
-            `⚠️ 墓碑文件损坏（${reason}），已改名隔离（只隔离不删除）${seenPath} → ${backupPath}；本次按空集处理，下一次落墓碑将重建该文件（旧身份未被读到的部分可能重推）`)
+            `⚠️ 墓碑文件损坏（${reason}），已改名隔离（只隔离不删除；同族隔离件按每缓存文件最多 ${CORRUPT_BACKUP_KEEP} 份保留、更旧的自动回收）${seenPath} → ${backupPath}；本次按空集处理，下一次落墓碑将重建该文件（旧身份未被读到的部分可能重推）`)
           return null
         }
         return data

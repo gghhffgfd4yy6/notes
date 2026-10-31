@@ -170,7 +170,8 @@ function compileOk (deps, source) {
 }
 
 /**
- * 校验待保存/待预检的过滤规则（四道闸，规格 §3 / 计划 §3.3）。
+ * 校验待保存/待预检的过滤规则（五道闸：schema/字段白名单/长度 → 行语法 → RE2 与嵌套量词 →
+ * 编译对账 → 整份字节预算；最后一道只约束保存入参，读路径以 options.fromDisk 跳过。规格 §3 / 计划 §3.3）。
  *
  * @param {{schema?:number, revision?:number, filter:Object}} input
  *   revision 省略按 0 处理（`/validate` 允许只带 filter）；**显式传 null/''/字符串等非法值一律拒绝**。
@@ -422,7 +423,7 @@ function validateFilterRules (input, deps, options) {
 }
 
 function parseStoredRules (text) {
-  // 覆盖文件的**结构**校验（与用户输入的四道闸分开）：JSON / schema / revision / 字段白名单 /
+  // 覆盖文件的**结构**校验（与用户输入的五道闸分开）：JSON / schema / revision / 字段白名单 /
   // 字符串 / 长度 / 控制字符。刻意不做正则编译与嵌套量词检查——那需要 RE2，且读路径必须
   // 在缺依赖时仍可用（否则一次缺 re2 就会把**合法**覆盖文件判成损坏并降级）。
   let data
@@ -480,7 +481,8 @@ function canDeepValidate (deps) {
 }
 
 /**
- * 对「结构已合法」的覆盖文件再做一次四道闸校验（A1）。
+ * 对「结构已合法」的覆盖文件再做一次五道闸校验（A1；整份字节预算闸只约束保存入参，这里按
+ * options.fromDisk 跳过——已能读回的文件不得因「重新序列化后比阈值大 32 字节」被判损坏）。
  * 结构校验只证明形状合法：手工编辑写入的非法正则/嵌套量词会被运行期 compileRules 静默跳过，
  * 而 App.run 仍推进 filter.hash 并清 _f ⇒ 被过滤记录被补推且无任何损坏告警。
  * @returns {string|null} 失败描述（首条错误的 field+message），通过返回 null
@@ -575,7 +577,8 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
  * 任何异常都不得抛穿；文件不存在 → source:'default'、revision:0、filter 为代码默认深拷贝。
  * @param {{cacheDir:string, defaults:Object, keyword:Object,
  *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options
- *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的四道闸（A1）；
+ *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的五道闸（A1；
+ *   其中「整份字节预算」闸不作用于读路径，`fromDisk` 跳过）；
  *   不提供时保持「只做结构校验」的既有契约（console/qinglong 等调用方无需改造）。
  * @returns {{filter:Object, override:Object, keyword:{zkt_gjc:string}, source:'override'|'default'|'corrupt',
  *   revision:number, degraded:boolean, lastGoodUsed:boolean, error?:{code:string,message:string}}}
