@@ -245,6 +245,24 @@ check('AG-11 直接挂 advisory 的高危包：部分豁免不得放行（钉住
   ok0(run(onlyExempt), '同一包全部 advisory 均在豁免清单时必须放行')
 })
 
+check('AG-13 间接链命中豁免：warning 必须带出真实理由（旧实现反解不出 GHSA ⇒ 理由为空）', () => {
+  // 缺陷本体（C10-066）：显形处原先靠 item.indexOf('(') 反解 GHSA id，而间接链命中项只存了
+  // 包名、没有括号 ⇒ ghsaId='' ⇒ 打出「被显式豁免：」后面空理由。豁免的唯一显形通道因此丢掉
+  // 了追溯信息（AG-07 只覆盖「直接挂 advisory」那条路径，这条一直无人守护）。
+  const r = run({
+    vulnerabilities: indirect([
+      { name: 'got' },
+      { name: 'cacheable-request', advisories: [EXEMPT_URL] }
+    ])
+  })
+  ok0(r, '全部 advisory 在豁免清单的间接链必须放行')
+  const warning = r.stdout.split('\n').find((line) => line.startsWith('::warning title=安全审计豁免显形::'))
+  assert.ok(warning, `必须打印 warning 注解（实际 stdout：${r.stdout.slice(0, 200)}）`)
+  assert.match(warning, /got 被显式豁免：\S/, `理由不得为空（实际：${warning}）`)
+  assert.match(warning, /got@11 传递依赖已停更/, `理由必须取自 ALLOWED_ADVISORIES 的原文（实际：${warning}）`)
+  assert.doesNotMatch(r.stdout, /豁免清单未记录理由/, '理由查得到时不得落到兜底文案')
+})
+
 fs.rmSync(tmp, { recursive: true, force: true })
 console.log(`\n${fail === 0 ? '🎉' : '⚠️'} test_audit_gate.js 通过 ${pass}/${pass + fail} 项${fail > 0 ? `，失败 ${fail} 项` : '，全部通过'}`)
 process.exit(fail === 0 ? 0 : 1)

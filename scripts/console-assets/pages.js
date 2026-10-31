@@ -1610,6 +1610,9 @@ const MSG_PAGE_MAX = 10000
 
 // 形状对 ≠ 是真日期：2026-02-31 / 2026-13-01 都能过 DAY_KEY_RE，而服务端会判非法区间并返回
 // 未过滤结果——URL 就成了「看起来筛了、其实没筛」（Sourcery #315-2）。按 Date 回读校验。
+// 服务端 canonical 是 scripts/status.js 的 isRealDayKey（C10-053：服务端两份已收敛到那一个实现，
+// readTrends 与 console 的 parseDayKey 都调它）；这里跑在浏览器、本仓无构建步骤可共享模块，只能做
+// **镜像**实现——改一处必须同步另一处，判据（DAY_KEY_RE + Date 回读回环）要与那侧保持同义。
 function isValidDayKey (s) {
   if (typeof s !== 'string' || !DAY_KEY_RE.test(s)) return false
   const d = new Date(`${s}T00:00:00Z`)

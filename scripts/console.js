@@ -25,7 +25,7 @@ const qrcode = require('qrcode-generator')
 // v3.363：只读快照端点的条件请求（ETag/304）。零传递依赖（etag 自身无依赖），
 // 与「青龙 --omit=dev 只装 dependencies」的部署约束兼容。
 const etag = require('etag')
-const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, isRealDayKey } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
@@ -2843,12 +2843,10 @@ function filterMessagesByDays (items, days, now = Date.now()) {
 // 自定义日期区间（v3.326）：from/to 为上海日历日 YYYY-MM-DD，闭区间，前缀比较与 days 同口径。
 // 非法格式/不存在的日期/颠倒区间一律忽略（宽松输入，与 days 越界回「全部」同一哲学，不 400）。
 // 正则无嵌套量词、定长锚定，无 ReDoS 面（本仓正则红线）。
+// C10-053：校验口径以 status.js 的 isRealDayKey 为唯一真源（原先这里是一份独立实现，
+// 回环校验的边界语义随两份代码各自演化——2026-02-30 会被 Date 归一化成 03-02，只测正则必漏）。
 function parseDayKey (v) {
-  if (typeof v !== 'string' || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(v)) return ''
-  const t = new Date(v + 'T00:00:00Z')
-  // 回环校验：2026-02-30 会被 Date 归一化成 03-02，必须与输入不等即拒。
-  if (Number.isNaN(t.getTime()) || t.toISOString().slice(0, 10) !== v) return ''
-  return v
+  return isRealDayKey(v) ? v : ''
 }
 
 function filterMessagesByRange (items, from, to) {
