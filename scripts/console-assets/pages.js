@@ -3228,6 +3228,23 @@ function backupEntrySummary (last) {
   return `${last.kind === 'import' ? '上次导入' : '上次导出'} ${stamp}${last.detail ? ` · ${last.detail}` : ''}`
 }
 
+// 异步动作的公共状态机（C7-020）：清错 → 置 busy（标签）→ 执行 → 失败写横幅 → finally 复位。
+// 六个动作（解密 / 导入 / 生成设置密钥 / 确认开启 / 关闭两步验证 / 退出设备）此前各抄一份
+// 「setBusy→try→catch→finally」，改一处漏五处；这里只收状态机，业务与失败文案仍留在调用点。
+async function runBusyAction ({ setBusy, setErr, tag, label, run, onStart }) {
+  setBusy(tag)
+  setErr('')
+  if (typeof onStart === 'function') onStart()
+  try {
+    return await run()
+  } catch (e) {
+    setErr(`${label}：${e && e.message ? e.message : e}`)
+    return undefined
+  } finally {
+    setBusy('')
+  }
+}
+
 function BackupBlock ({ onImported }) {
   const [selected, setSelected] = useState(() => {
     const out = {}
@@ -3359,19 +3376,20 @@ function BackupBlock ({ onImported }) {
   const doUnlock = async () => {
     if (!locked || busy !== '') return
     if (unlockPassword === '') { setErr('请输入备份密码'); return }
-    setBusy('unlock'); setErr('')
-    try {
-      const bundle = await decryptBackup(locked.data, unlockPassword)
-      const parts = backupFileSummary(bundle.data)
-      if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
-      setPending({ bundle, summary: parts, key: newBackupImportKey(), encrypted: true })
-      setLocked(null)
-      setUnlockPassword('')
-    } catch (e) {
-      setErr(`解密失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'unlock',
+      label: '解密失败',
+      run: async () => {
+        const bundle = await decryptBackup(locked.data, unlockPassword)
+        const parts = backupFileSummary(bundle.data)
+        if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
+        setPending({ bundle, summary: parts, key: newBackupImportKey(), encrypted: true })
+        setLocked(null)
+        setUnlockPassword('')
+      }
+    })
   }
   const closeUnlock = () => {
     if (busy === 'unlock') return
@@ -3379,32 +3397,33 @@ function BackupBlock ({ onImported }) {
   }
   const doImport = async () => {
     if (!pending || busy !== '') return
-    setBusy('import'); setErr('')
-    try {
-      const res = await apiPostBackupImport(pending.bundle, pending.key)
-      // consumeJsonResult 对非 2xx 只回 { ok:false, status, data }，不抛错：409 busy /
-      // 400 校验失败 / 507 审计满原本都会走进成功分支并提示「导入完成」。先过这一道；
-      // 抛错时 pending 不清 ⇒ 确认弹窗仍开着、错误显示在弹窗里，可直接改完重试。
-      const problem = backupImportProblem(res)
-      if (problem !== '') throw new Error(problem)
-      setPending(null)
-      const result = res && res.data ? res.data : (res || {})
-      const imported = result.imported ? result.imported : {}
-      const bits = []
-      if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
-      if (imported.dedup) bits.push('判重历史')
-      if (imported.filter) bits.push('过滤规则')
-      if (imported.settings) bits.push('控制台设置')
-      if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
-      if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
-      setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
-      setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
-      if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
-    } catch (e) {
-      setErr(`导入失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'import',
+      label: '导入失败',
+      run: async () => {
+        const res = await apiPostBackupImport(pending.bundle, pending.key)
+        // consumeJsonResult 对非 2xx 只回 { ok:false, status, data }，不抛错：409 busy /
+        // 400 校验失败 / 507 审计满原本都会走进成功分支并提示「导入完成」。先过这一道；
+        // 抛错时 pending 不清 ⇒ 确认弹窗仍开着、错误显示在弹窗里，可直接改完重试。
+        const problem = backupImportProblem(res)
+        if (problem !== '') throw new Error(problem)
+        setPending(null)
+        const result = res && res.data ? res.data : (res || {})
+        const imported = result.imported ? result.imported : {}
+        const bits = []
+        if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
+        if (imported.dedup) bits.push('判重历史')
+        if (imported.filter) bits.push('过滤规则')
+        if (imported.settings) bits.push('控制台设置')
+        if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
+        if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
+        setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
+        setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
+        if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
+      }
+    })
   }
   return html`<div class="cfg-block backup-block">
     <div class="backup-actions backup-actions-main">
@@ -3543,68 +3562,76 @@ function TwoFactorBlock ({ active = true }) {
   }
   const startSetup = async () => {
     if (busy !== '') return
-    setBusy('setup'); setErr(''); setNote(''); setRecoveryCodes([])
-    try {
-      const res = await apiPostTwoFactorSetup()
-      if (!res.ok) throw new Error(messageOf(res))
-      setSetup(res.data || null)
-      setCode('')
-    } catch (e) {
-      setErr(`生成设置密钥失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'setup',
+      label: '生成设置密钥失败',
+      onStart: () => { setNote(''); setRecoveryCodes([]) },
+      run: async () => {
+        const res = await apiPostTwoFactorSetup()
+        if (!res.ok) throw new Error(messageOf(res))
+        setSetup(res.data || null)
+        setCode('')
+      }
+    })
   }
   const enable = async () => {
     if (busy !== '' || !setup || code.trim().length < 6) return
-    setBusy('enable'); setErr(''); setNote('')
-    try {
-      const res = await apiPostTwoFactorEnable(code.trim(), setup.setupId)
-      if (!res.ok) throw new Error(messageOf(res))
-      const data = res.data || {}
-      setRecoveryCodes(Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [])
-      setStatus({ enabled: true, pending: false, recoveryRemaining: data.recoveryRemaining || 0 })
-      setSetup(null)
-      setCode('')
-      setNote('两步验证已开启。下次打开控制台要再输一次手机上的 6 位数字。')
-    } catch (e) {
-      setErr(`确认开启失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'enable',
+      label: '确认开启失败',
+      onStart: () => setNote(''),
+      run: async () => {
+        const res = await apiPostTwoFactorEnable(code.trim(), setup.setupId)
+        if (!res.ok) throw new Error(messageOf(res))
+        const data = res.data || {}
+        setRecoveryCodes(Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [])
+        setStatus({ enabled: true, pending: false, recoveryRemaining: data.recoveryRemaining || 0 })
+        setSetup(null)
+        setCode('')
+        setNote('两步验证已开启。下次打开控制台要再输一次手机上的 6 位数字。')
+      }
+    })
   }
   const disable = async () => {
     if (busy !== '' || disableCode.trim() === '') return
-    setBusy('disable'); setErr(''); setNote('')
-    try {
-      const res = await apiPostTwoFactorDisable(disableCode.trim())
-      if (!res.ok) throw new Error(messageOf(res))
-      setStatus({ enabled: false, pending: false, recoveryRemaining: 0 })
-      setDisableOpen(false)
-      setDisableCode('')
-      setRecoveryCodes([])
-      setNote('两步验证已关闭。')
-    } catch (e) {
-      setErr(`关闭失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'disable',
+      label: '关闭失败',
+      onStart: () => setNote(''),
+      run: async () => {
+        const res = await apiPostTwoFactorDisable(disableCode.trim())
+        if (!res.ok) throw new Error(messageOf(res))
+        setStatus({ enabled: false, pending: false, recoveryRemaining: 0 })
+        setDisableOpen(false)
+        setDisableCode('')
+        setRecoveryCodes([])
+        setNote('两步验证已关闭。')
+      }
+    })
   }
   // 「退出所有信任设备」（v3.374）：清空服务端列表并让这台浏览器的设备 Cookie 失效，
-  // 之后每台设备（包括当前这台）下次打开都要重新输验证码。
+  // 之后每台设备（包括当前这台）下次打开都要重新输验证码。C7-037 起先过确认弹窗。
   const revokeDevices = async () => {
     if (busy !== '') return
-    setBusy('revoke'); setErr(''); setNote('')
-    try {
-      const res = await apiPostDevicesRevoke()
-      if (!res.ok) throw new Error(messageOf(res))
-      setStatus((prev) => ({ ...(prev || {}), trustedDevices: 0 }))
-      setNote('所有信任设备都已退出。下次在任何设备上打开控制台，都要重新输验证码。')
-    } catch (e) {
-      setErr(`退出信任设备失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'revoke',
+      label: '退出信任设备失败',
+      onStart: () => setNote(''),
+      run: async () => {
+        const res = await apiPostDevicesRevoke()
+        if (!res.ok) throw new Error(messageOf(res))
+        setStatus((prev) => ({ ...(prev || {}), trustedDevices: 0 }))
+        setNote('所有信任设备都已退出。下次在任何设备上打开控制台，都要重新输验证码。')
+      }
+    })
   }
   const copyText = async (text) => {
     let err = null

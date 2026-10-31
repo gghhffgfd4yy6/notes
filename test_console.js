@@ -11563,6 +11563,34 @@ async function main () {
       '离开搜索页必须清掉待确认（否则切回来弹窗自己出现）')
   })
 
+  await aok('结构红线: C7-020 六个异步动作共用一份 busy 状态机（清错→busy→catch→finally）', () => {
+    const src = readConsoleSource()
+    const code = codeOf(src)
+    // 骨架只留一份：runBusyAction 自己 setBusy/清错/写横幅/复位。
+    const helper = sliceBetween(src, 'async function runBusyAction', 'function BackupBlock', 'runBusyAction')
+    assert.ok(helper.includes('setBusy(tag)') && helper.includes("setErr('')") &&
+      helper.includes('setBusy(\'\')') && helper.includes('`' + '$' + '{label}：'),
+    '公共骨架必须自己置 busy、清错、写「<动作>失败：…」横幅并复位')
+    // 六个动作都必须走它（顺序：解密 / 导入 / 生成设置密钥 / 确认开启 / 关闭 / 退出设备）。
+    const sites = (code.match(/runBusyAction\(\{/g) || []).length
+    assert.strictEqual(sites, 6, `六个动作必须都走公共骨架，实际 ${sites} 处`)
+    const backup = sliceBetween(src, 'function BackupBlock', 'function TwoFactorBlock', 'BackupBlock')
+    const twofa = sliceBetween(src, 'function TwoFactorBlock', 'function SysPanel', 'TwoFactorBlock')
+    // 备份块只留 doExport 自己的 busy（它要接 URL 回收）；解密/导入两条不得再手写骨架。
+    assert.strictEqual((codeOf(backup).match(/setBusy\('[a-z]/g) || []).length, 1,
+      'BackupBlock 只应有 doExport 一处自写 setBusy(tag)（其余走 runBusyAction）')
+    assert.ok(backup.includes("tag: 'unlock'") && backup.includes("tag: 'import'"),
+      '解密/导入必须各自带 busy 标签走公共骨架')
+    assert.strictEqual((codeOf(twofa).match(/setBusy\('[a-z]/g) || []).length, 0,
+      'TwoFactorBlock 的四个动作必须全部走公共骨架（不得再手写 setBusy(tag)/try/finally）')
+    for (const tag of ['setup', 'enable', 'disable', 'revoke']) {
+      assert.ok(twofa.includes(`tag: '${tag}'`), `TwoFactorBlock 缺 tag: ${tag}（动作必须带各自的 busy 标签）`)
+    }
+    // 失败横幅的文案口径不变（「导入失败：」这类前缀必须还在）。
+    assert.ok(backup.includes("label: '导入失败'") && backup.includes("label: '解密失败'"),
+      '失败横幅前缀必须保留（用户看到的「导入失败：…」不变）')
+  })
+
   }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
