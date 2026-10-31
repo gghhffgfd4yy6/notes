@@ -3821,8 +3821,10 @@ check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
-  assert.strictEqual((code.match(/fs\.openSync\(lockPath, 'wx'\)/g) || []).length, 2,
-    '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开）')
+  // 0o600 是 CodeQL js/insecure-temporary-file 收口后的口径：锁文件只含 pid:starttime，
+  // 显式收紧 mode；这里连 mode 一起钉住——改回两参 openSync 或放宽 mode 都会在此变红。
+  assert.strictEqual((code.match(/fs\.openSync\(lockPath, 'wx', 0o600\)/g) || []).length, 2,
+    '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开），且都带 0o600')
   assert.strictEqual((code.match(/LOCK_STALE_MS/g) || []).length, 2,
     'LOCK_STALE_MS 必须只有「定义 + 使用」各一处（原先三份实现各写一份）')
   assert.strictEqual(/mtimeMs > 10000/.test(code), false, '不得再出现写死的 10000（通道健康那份的漂移形态）')
