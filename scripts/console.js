@@ -1705,12 +1705,27 @@ function authorize (req, token, urlQuery) {
 // 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
 // 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
 // 凭证，同一份内容按不同凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+// 参数名的解码口径与 Utils._isTrackingQueryName 一致（`+` 还原成空格、decodeURIComponent、
+// 解码失败保留原串，且不做大小写折叠——authorize 的 URLSearchParams.get('token') 本身区分
+// 大小写）。authorize 认的 `?token=` 是 **URLSearchParams 解码后**的键，所以 `?%74oken=abc`
+// 同样是有效凭证，必须在这里一起剔掉——否则同一份内容会按 token 的编码写法算出两个 tag，
+// 条件缓存被凭空的变体打散（且 variant 里留着凭证片段）。
+function decodedQueryName (part) {
+  const eq = part.indexOf('=')
+  const rawName = eq < 0 ? part : part.slice(0, eq)
+  try {
+    return decodeURIComponent(rawName.replace(/\+/g, '%20'))
+  } catch (e) {
+    return rawName // 畸形 % 序列：保留原形，交给上层 URL 校验
+  }
+}
+
 function conditionalVariant (req) {
   const raw = String((req && req.url) || '')
   const qAt = raw.indexOf('?')
   if (qAt < 0) return raw
   const params = raw.slice(qAt + 1).split('&')
-    .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
+    .filter((part) => part !== '' && decodedQueryName(part) !== 'token')
   // 显式按码点比较：默认 sort() 会先转字符串再按 UTF-16 码元排，语义虽相同，但 Sonar
   // S2871 要求给出比较函数；同时避免依赖实现默认行为。
   params.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
