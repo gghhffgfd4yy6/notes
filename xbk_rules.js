@@ -13,6 +13,13 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
   // 它们改为调用 RuleEngine.splitRuleLines 即可与这里同源。
   const RULE_LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
 
+  // C9-018：pingbitime 天数上限的**唯一字面量**（3650000 天 ≈ 10000 年）。此前 compileRules 与
+  // validateConfig 各写一份、xbk_filter_store 再写一份，靠「与…同值」的注释同步；调上限时漏一处：
+  // store 严于运行期 ⇒ 保存被 invalid_number 拒；运行期严于 store ⇒ 运行期静默丢弃规则，
+  // 表现为 filter_store 闸门 4 的对账失败（「编译结果应为 time，实际 null」）。
+  // 暴露在 RuleEngine 上，注入方（deps.RuleEngine）可直接取；xbk_filter_store 那份属别的模块，本批未动。
+  const PINGBITIME_MAX_DAYS = 3650000
+
   let testFailWarned = false
   const RuleEngine = {
     // RULES-06：此处原有 _compileUserRegex 包装方法，全仓库（含测试）无任何调用者，
@@ -279,7 +286,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       // v3.156：先 trim——空白('   ')曾 Number→0 静默关闭时间过滤
       // v3.x：pingbitime 天数加上限 PINGBITIME_MAX_DAYS（3650000 天≈10000 年），
       // 超过视为无效（置 null 不编译）——巨大值(如 1e20)会让注册年龄永远达不到上限，等效永久拦截新账号。
-      const PINGBITIME_MAX_DAYS = 3650000
+      // C9-018：上限值取自引擎级唯一常量（不再就地写字面量），与 validateConfig 同源。
       let pbRaw = ''
       try { pbRaw = rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : String(rawCfg.pingbitime).trim() } catch (e) { pbRaw = '' } // 脏配置无法转字符串时忽略规则，不让启动崩溃
       if (pbRaw) {
@@ -324,6 +331,10 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       compiled.__compiled = true
       return compiled
     },
+
+    /** pingbitime 天数上限（C9-018）：单一字面量，compileRules 与 validateConfig 共用；
+     *  注入方（deps.RuleEngine）可直接取，用来替掉自己的同值副本（xbk_filter_store 的副本属别的模块）。 */
+    PINGBITIME_MAX_DAYS,
 
     /** FILTER-01 / RULES-05：规则「实际编译生效」指纹。
      *  filterHash 此前只由配置**字节**（FILTER_FIELDS + pingbitime + zkt_gjc + 可选 UTC 日期）驱动，
@@ -617,8 +628,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       }
       if (pbStr.trim()) {
         // RULES-03：上限常量提为两形态共用——简单形态此前缺上限告警（compileRules 已置 null 并告警，
-        // 校验侧却静默通过，两端口径不一致）。
-        const PINGBITIME_MAX_DAYS = 3650000 // 与 compileRules 口径一致：超过上限视为无效
+        // 校验侧却静默通过，两端口径不一致）。C9-018：值同样取自引擎级唯一常量。
         if (/###/.test(pbStr)) {
           const lines = this._splitLines(pbStr) // C9-011：与 compileRules 同一份实现（此前就地重写正则）
           for (const line of lines) {

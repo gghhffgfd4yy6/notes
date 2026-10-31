@@ -625,6 +625,22 @@ check('C9-011：行分割只有一份实现（compileRules/validateConfig 同源
   eng.splitRuleLines = orig
 })
 
+check('C9-018：pingbitime 上限只有一个字面量，编译与校验同源', () => {
+  // 反例（改动前）：compileRules 与 validateConfig 各写一份 3650000（store 还有第三份，属别的模块）。
+  // 调上限时漏一处 ⇒ 保存被拒或运行期静默丢规则，表现为对账失败。
+  const { eng } = r2xMake({ fields: ['keyword'] })
+  const max = eng.PINGBITIME_MAX_DAYS
+  assert.strictEqual(max, 3650000, '上限对外取值必须是 3650000 天')
+  // 两侧都必须以同一个 max 为界：max 通过、max+1 被拒
+  assert.strictEqual(eng.compileRules({ pingbitime: String(max) }).pingbitime._type, 'time', '恰为上限必须可编译')
+  assert.strictEqual(eng.compileRules({ pingbitime: String(max + 1) }).pingbitime, null, '超过上限必须不编译')
+  assert.deepStrictEqual(eng.validateConfig({ pingbitime: String(max) }), [], '恰为上限不得告警')
+  assert.ok(eng.validateConfig({ pingbitime: String(max + 1) }).some(w => w.includes('超过上限')), '超过上限必须告警')
+  // 多行形态同一界（分类###天数）
+  assert.deepStrictEqual(eng.validateConfig({ pingbitime: `cat###${max}` }), [], '多行形态恰为上限不得告警')
+  assert.ok(eng.validateConfig({ pingbitime: `cat###${max + 1}` }).some(w => w.includes('超过上限')), '多行形态超过上限必须告警')
+})
+
 check('checkTimeCompiled：不拦截(null) 与拦截(true/false) 两侧，阈值比较必须严格大于', () => {
   // 杀 checkTimeCompiled L387/L391/L398/L399：缺失/非法注册时间放行，time 与 timeMulti 均不得用 >=
   const { eng } = r2xMake()
