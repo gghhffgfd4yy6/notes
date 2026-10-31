@@ -128,6 +128,8 @@ const {
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
   makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
+  // C2-014：限速阈值从实现取，测试不自己写死 10
+  TWO_FACTOR_LOGIN_MAX_FAILS,
   // v3.374 信任设备：签发/校验纯函数 + 落盘读写
   DEVICE_FILE, DEVICE_COOKIE, DEVICE_TTL_MS, DEVICE_MAX,
   makeDeviceRecord, parseDeviceCookie, trustedDeviceOf, appendDeviceRecord,
@@ -10412,6 +10414,105 @@ async function main () {
         headers: { ...form, 'x-forwarded-for': '203.0.113.78' }
       })
       assert.strictEqual(res.status, 303, '不同客户端 IP 不应被同一把锁误伤')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // C2-014：2FA 关闭是默认部署形态，此前限速整段写在 `if (twoFactor.enabled)` 里 ⇒ 单因子
+  // 登录既不查限速也不计数，访问令牌可被无限在线穷举。这条锁死「两条失败路径都计数」，
+  // 阈值仍是实现里的 10 次 / 5 分钟（用例不自带数字，改阈值时这条跟着走）。
+  await aok('登录: 2FA 关闭时错误令牌同样计入限速（默认部署不能无限猜）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    // 走 XFF 模拟代理后的客户端：loopback 直连时 clientAddress 才认这个头。
+    const clientA = { ...form, 'x-forwarded-for': '198.51.100.24' }
+    try {
+      let res
+      for (let i = 0; i < TWO_FACTOR_LOGIN_MAX_FAILS; i++) {
+        res = await request(port, 'POST', '/login', {
+          body: new URLSearchParams({ token: 'wrong-token-0000000000' }).toString(),
+          headers: clientA
+        })
+        assert.strictEqual(res.status, 401, `第 ${i + 1} 次错误令牌只回登录页（未到阈值）`)
+        assert.ok(res.text.includes('需要访问令牌'), '2FA 关闭时错误凭证回单因子登录页')
+      }
+      // 已达阈值（10 次）：正确令牌也必须先吃 429——限速先于凭证比较。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN }).toString(),
+        headers: clientA
+      })
+      assert.strictEqual(res.status, 429, '2FA 关闭时错误令牌也必须计入限速')
+      assert.ok(res.text.includes('尝试次数过多'), '限速页给出可读原因')
+      assert.ok(res.text.includes('需要访问令牌'), '限速页仍是单因子登录页')
+      assert.ok(!res.text.includes('name="code"'), '2FA 未开启时不得渲染验证码输入框')
+
+      // 按来源 IP 隔离：换一个客户端不能跟着被锁。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN }).toString(),
+        headers: { ...form, 'x-forwarded-for': '198.51.100.25' }
+      })
+      assert.strictEqual(res.status, 303, '不同客户端 IP 不应被同一把锁误伤')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // C2-015：分发器此前没有外层 try/catch（只有 new URL 一处单独兜底），一次同步 TypeError
+  // 就是进程级 uncaughtException ⇒ 整个看板下线。这里直接把一个「鉴权阶段同步抛错」的请求
+  // 喂给 request 监听器（真实 HTTP 里 req.headers 恒存在，用它只为驱动外层兜底），断言
+  // 回 500、日志可 grep、且监听器/进程仍然存活。
+  await aok('分发器: handler 同步抛错回 500，且不带走进程', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    // 假响应：dispatchRequest 只用 on/writeHead/end（sendJson 的两个出口）。
+    const fakeRes = (headersSent) => ({
+      headersSent,
+      statusCode: 0,
+      body: '',
+      destroyed: false,
+      setHeader () {},
+      writeHead (code) { this.statusCode = code; this.headersSent = true },
+      end (body) { this.body = String(body === undefined ? '' : body) },
+      on () {},
+      destroy () { this.destroyed = true }
+    })
+    const captured = []
+    const savedError = console.error
+    try {
+      console.error = (msg) => { captured.push(String(msg)) }
+      // ① 响应头还没发：兜底必须回 500，且响应体不带内部细节。
+      const plain = fakeRes(false)
+      server.emit('request', { method: 'GET', url: '/api/status', socket: {} }, plain)
+      assert.strictEqual(plain.statusCode, 500, '同步抛错必须回 500')
+      assert.match(plain.body, /internal error/, '500 体不得泄露内部错误信息')
+      assert.ok(captured.some((line) => line.includes('控制台端点异常（dispatch）')), '兜底路径必须落一行可 grep 日志')
+      // ② 响应头已发：再写 500 会二次抛 ERR_HTTP_HEADERS_SENT，只能断链。
+      const halfSent = fakeRes(true)
+      server.emit('request', { method: 'GET', url: '/api/status', socket: {} }, halfSent)
+      assert.strictEqual(halfSent.statusCode, 0, 'headersSent 后不得再写状态行')
+      assert.strictEqual(halfSent.destroyed, true, 'headersSent 后必须断链（兜底自身不得二次抛错）')
+    } finally {
+      console.error = savedError
+    }
+    try {
+      // 兜底不能把监听器/进程一起带走：同一个 server 仍然正常服务。
+      const alive = await request(port, 'GET', '/api/status', { token: TOKEN })
+      assert.strictEqual(alive.status, 200, '分发器越界异常之后服务仍可正常响应')
+
+      // 进程级还有一道：main() 必须注册 uncaughtException（记日志后 exit(1)，不吞掉继续跑）。
+      const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+      const mainBody = codeOf(sliceBetween(src, 'function main () {', 'if (require.main === module) main()', 'main() 函数体'))
+      assert.ok(mainBody.includes("process.on('uncaughtException'"), 'main() 必须注册 uncaughtException 兜底')
+      assert.match(mainBody, /uncaughtException[\s\S]{0,600}process\.exit\(1\)/,
+        'uncaughtException 必须记日志后 exit(1)；吞掉继续跑会把未知状态当正常服务')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
