@@ -4323,7 +4323,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const saved = path.join(backupDir, target.name)
           try {
             if (fs.existsSync(saved)) {
-              fs.copyFileSync(saved, target.src)
+              // C2-008：回滚本身也在覆盖活文件，必须原子提交。copyFileSync 直接写目标，
+              // 中途被 kill / 磁盘满就把 push.json、run.log 截成半截文件——「回滚把数据弄坏」
+              // 比不回滚更难查。改走 writeAtomic（tmp + fsync + rename）：要么旧内容、
+              // 要么备份内容，不存在中间态。
+              const data = fs.readFileSync(saved)
+              if (!writeAtomic(target.src, data, `导入回滚 ${target.name}`)) {
+                throw new Error('原子写失败')
+              }
             } else {
               // 导入前文件不存在：写成功过才需要删；symlink/目录一律不碰，避免误删。
               let st = null
