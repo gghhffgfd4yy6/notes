@@ -117,6 +117,20 @@ const BACKUP_CATEGORIES = ['messages', 'filter', 'settings', 'auto', 'runLog']
 // 「当前条数不可得」），需要精确条数时去推送记录页看 grandTotal。阈值内的文件走
 // readMessages 的 (ino,size,mtime) 缓存，重复请求不再 parse。
 const CACHE_HEALTH_COUNT_MAX_BYTES = 8 * 1024 * 1024
+// 运行记录保留条数（C2-028）：runs 是进程内存表，只留最近 N 轮给 /api/runs 与取消端点。
+const RUNS_KEEP_MAX = 20
+// 请求体上限（C2-028）：按端点语义集中命名，不再在各处散落行内字面量。
+// 默认 4096 = JSON 写端点（关注词 / 2FA / 自动运行 / 控制台设置 / 通知自检）的公共上限；
+// 登录表单 2048 = token + 6 位验证码，更大的 body 一定不是本表单；
+// 备份导出 16KiB = 只带一个 categories 数组。
+const BODY_DEFAULT_MAX_BYTES = 4096
+const BODY_LOGIN_FORM_MAX_BYTES = 2048
+const BODY_BACKUP_EXPORT_MAX_BYTES = 16 * 1024
+// 世界时 → 上海时间的固定偏移（C2-021）：中国无夏令时，UTC+8 即 Asia/Shanghai。需要按
+// 「北京日历日/时分」做**算术**的地方一律走这个常量，不要再手写「+8 小时」的毫秒数——多写一处
+// 就多一个漏改点（导出文件名、run.log 时间戳解析、趋势日窗三处曾各写一份，还混着 8*60*60 变体）。
+// 展示字符串仍走 xbk_utils.shanghaiStamp（Intl + ICU 兜底），两者语义同一时区。
+const SHANGHAI_OFFSET_MS = 8 * 3600 * 1000
 // 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
 // LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
 const LOG_VIEW_MAX_BYTES = 1024 * 1024
@@ -570,9 +584,9 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     _lockToken: lockToken
   }
   runs.set(id, record)
-  if (runs.size > 20) {
-    // 只保留最近 20 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
-    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - 20)
+  if (runs.size > RUNS_KEEP_MAX) {
+    // 只保留最近 RUNS_KEEP_MAX 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
+    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - RUNS_KEEP_MAX)
     for (const k of oldest) runs.delete(k)
   }
   // 环境继承：剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，
@@ -944,7 +958,7 @@ function exportStamp (now = new Date()) {
   // 不再切 accessStamp 的字符串：它 ICU 异常时兜底 ISO（UTC），照切会把 UTC 时分标成北京时间
   // （Sourcery #315-8）。中国无夏令时，直接 +8 与 Asia/Shanghai 等价。
   // 精确到秒：同一分钟内连导两次不会撞名、后一次不会覆盖前一次（Sourcery #315-7）。
-  const t = (now instanceof Date ? now.getTime() : Date.now()) + 8 * 3600 * 1000
+  const t = (now instanceof Date ? now.getTime() : Date.now()) + SHANGHAI_OFFSET_MS
   const d = new Date(t)
   const p2 = (n) => String(n).padStart(2, '0')
   return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}-${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}`
@@ -1696,12 +1710,27 @@ function authorize (req, token, urlQuery) {
 // 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
 // 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
 // 凭证，同一份内容按不同凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+// 参数名的解码口径与 Utils._isTrackingQueryName 一致（`+` 还原成空格、decodeURIComponent、
+// 解码失败保留原串，且不做大小写折叠——authorize 的 URLSearchParams.get('token') 本身区分
+// 大小写）。authorize 认的 `?token=` 是 **URLSearchParams 解码后**的键，所以 `?%74oken=abc`
+// 同样是有效凭证，必须在这里一起剔掉——否则同一份内容会按 token 的编码写法算出两个 tag，
+// 条件缓存被凭空的变体打散（且 variant 里留着凭证片段）。
+function decodedQueryName (part) {
+  const eq = part.indexOf('=')
+  const rawName = eq < 0 ? part : part.slice(0, eq)
+  try {
+    return decodeURIComponent(rawName.replace(/\+/g, '%20'))
+  } catch (e) {
+    return rawName // 畸形 % 序列：保留原形，交给上层 URL 校验
+  }
+}
+
 function conditionalVariant (req) {
   const raw = String((req && req.url) || '')
   const qAt = raw.indexOf('?')
   if (qAt < 0) return raw
   const params = raw.slice(qAt + 1).split('&')
-    .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
+    .filter((part) => part !== '' && decodedQueryName(part) !== 'token')
   // 显式按码点比较：默认 sort() 会先转字符串再按 UTF-16 码元排，语义虽相同，但 Sonar
   // S2871 要求给出比较函数；同时避免依赖实现默认行为。
   params.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1807,7 +1836,7 @@ const BODY_DRAIN_TIMEOUT_MS = 10 * 1000
 // 还**漏了对象校验**（`[]`/`"x"`/`null` 会被当成空 payload 继续往下走，错误形态变成
 // 「验证码不对」而不是「body 必须是对象」）。收成一份：返回 { ok:true, payload } 或
 // { ok:false, status, body }，调用方只负责发包。
-function readJsonObjectBody (req, maxBytes = 4096) {
+function readJsonObjectBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
   return readBody(req, maxBytes).then(({ body, aborted, over }) => {
     if (aborted) return { ok: false, status: 400, body: { error: '请求中断，动作未执行' } }
     if (over) return { ok: false, status: 413, body: { error: '请求体超限' } }
@@ -1823,7 +1852,7 @@ function readJsonObjectBody (req, maxBytes = 4096) {
     return { ok: true, payload }
   })
 }
-function readBody (req, maxBytes = 4096) {
+function readBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
     let buf = ''
@@ -1952,7 +1981,9 @@ function runtimeFilterDeps () {
     re2Available: Boolean(RE2),
     isRe2Available: () => Boolean(RE2),
     explainFilter: v3 && typeof v3.explainFilter === 'function' ? v3.explainFilter : null,
-    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null
+    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null,
+    // FILTER-01：与 App.run 同口径的「编译生效」维度（缺导出时 filterHashOf 退回纯配置摘要）。
+    compileStateOf: v3 && typeof v3.compileStateOf === 'function' ? v3.compileStateOf : null
   }
   return filterDepsCache
 }
@@ -2264,11 +2295,20 @@ function wideMatchFields (filter) {
   return out
 }
 
+// 过滤规则摘要：必须与运行期 App.run 的 filter.hash **同口径**——它算的是
+// Utils.filterHash(active.filter, zkt_gjc, RuleEngine.compileStateOf(compiledRules))，
+// 第三参是「规则实际编译生效」维度（re2 可用性 + 各字段是否编译出规则）。这里此前只传前两参，
+// 于是控制台返回的 hash 与运行期写进生效快照的 filter.hash 永远不相等（同一份规则两个值，
+// 「已生效」对账只能退回比 revision）。编译失败/依赖缺失时退化为纯配置摘要，不让摘要变成 null。
 function filterHashOf (deps, filter, keyword) {
   const zkt = keyword && typeof keyword.zkt_gjc === 'string' ? keyword.zkt_gjc : ''
   try {
     if (deps && typeof deps.filterHash === 'function') {
-      const hash = deps.filterHash(filter, zkt)
+      let compileState
+      if (typeof deps.compileStateOf === 'function' && deps.RuleEngine && typeof deps.RuleEngine.compileRules === 'function') {
+        try { compileState = deps.compileStateOf(deps.RuleEngine.compileRules(filter)) } catch (e) { compileState = undefined }
+      }
+      const hash = deps.filterHash(filter, zkt, compileState)
       if (typeof hash === 'string' && hash.length > 0) return hash
     }
   } catch (e) { /* 回退 sha256（deps 注入/Config 异常时仍给出稳定摘要） */ }
@@ -2530,7 +2570,7 @@ function decodeLineHtml (raw) {
 function parseLineStamp (stamp) {
   const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(typeof stamp === 'string' ? stamp : '')
   if (!m) return null
-  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - 8 * 60 * 60 * 1000
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - SHANGHAI_OFFSET_MS
   return Number.isFinite(ms) ? ms : null
 }
 
@@ -2790,7 +2830,7 @@ function filterMessageItems (items, cate, needle) {
 // datetime 缺失/非法的条目在时间窗模式下不展示（无法证明它属于窗口，不猜）。
 function filterMessagesByDays (items, days, now = Date.now()) {
   if (!(Number.isSafeInteger(days) && days > 0)) return items
-  const offsetMs = 8 * 3600 * 1000
+  const offsetMs = SHANGHAI_OFFSET_MS
   const todayKey = new Date(now + offsetMs).toISOString().slice(0, 10)
   const startKey = new Date(now - (days - 1) * 86400000 + offsetMs).toISOString().slice(0, 10)
   return items.filter((m) => {
@@ -2935,12 +2975,14 @@ function statSafeMeta (p) {
   try {
     fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0))
     const st = fs.fstatSync(fd)
-    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null }
-    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs) }
+    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+    // ino 供 tombstoneCounts 的 (ino,size,mtimeMs) 缓存识别「同一份文件」：仅靠 size+mtime
+    // 抓不到同毫秒同大小的原子替换（inode 会变）。
+    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs), ino: st.ino }
   } catch (e) {
-    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null }
-    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null }
-    return { status: 'ioError', size: null, mtimeMs: null }
+    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null, ino: null }
+    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+    return { status: 'ioError', size: null, mtimeMs: null, ino: null }
   } finally {
     if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
   }
@@ -2957,12 +2999,34 @@ function statSafeMeta (p) {
 // 残余边界（登记）：meta 过闸后、read 开打前纳米级窗口内被换成 FIFO 仍会阻塞——该原语
 // （readSafeTextResult）被全部读取端点共用，在其内部加 O_NONBLOCK 属跨切面改动（影响 F1
 // 恢复链与既有变异基线），不在本 PR 范围；观测面已被 meta 闸收窄到「替换竞态」。
+// 墓碑计数缓存（C2-019）：/api/cache-health 每拍都会算一次墓碑计数，而墓碑文件上限 8MiB、
+// 整读 + JSON.parse 全压在 HTTP 事件循环上。墓碑只在裁剪/淘汰时整份原子替换，
+// (ino,size,mtimeMs) 三元组足以识别「同一份文件」；叠 60s TTL 兜底（同 status.readMessages 的
+// D2-S18 口径）。mtime 太新（<100ms）的文件不进缓存——写后立刻读必须看到新内容。
+// 只缓存 status==='ok'：unsafe/invalid/missing 是「此刻的状态」，缓存它们会把一次原子替换/
+// 人工修复挡在 TTL 之外。缓存值是不可变结果对象，调用方只读。
+const TOMBSTONE_CACHE_TTL_MS = 60 * 1000
+const TOMBSTONE_CACHE_MIN_AGE_MS = 100
+const TOMBSTONE_CACHE_MAX = 4
+const tombstoneCache = new Map()
+
+function tombstoneSignature (meta) {
+  if (!meta || meta.status !== 'ok') return null
+  if (Date.now() - meta.mtimeMs < TOMBSTONE_CACHE_MIN_AGE_MS) return null
+  return `${meta.ino}:${meta.size}:${meta.mtimeMs}`
+}
+
 function tombstoneCounts (stateDir, messagesFile) {
   const p = path.join(stateDir, `${messagesFile}.seen.json`)
   const counts = { id: 0, urlOnly: 0, idWithUrl: 0, anon: 0, total: 0 }
   const meta = statSafeMeta(p)
   if (meta.status === 'unsafe' || meta.status === 'ioError') {
     return { status: meta.status, bytes: null, counts }
+  }
+  const sig = tombstoneSignature(meta)
+  if (sig) {
+    const hit = tombstoneCache.get(p)
+    if (hit && hit.sig === sig && Date.now() - hit.at < TOMBSTONE_CACHE_TTL_MS) return hit.value
   }
   // FIFO TOCTOU（Sourcery High）：meta 闸与读之间路径可被换成 FIFO——readSafeTextResult
   // 开 openNonBlocking，open 立即返回（普通文件不变，FIFO→unsafe），绝不阻塞等写者。
@@ -2987,7 +3051,13 @@ function tombstoneCounts (stateDir, messagesFile) {
   } catch (e) {
     return { status: 'invalid', bytes, counts }
   }
-  return { status: 'ok', bytes, counts }
+  const value = { status: 'ok', bytes, counts }
+  if (sig) {
+    tombstoneCache.delete(p)
+    tombstoneCache.set(p, { sig, at: Date.now(), value })
+    while (tombstoneCache.size > TOMBSTONE_CACHE_MAX) tombstoneCache.delete(tombstoneCache.keys().next().value)
+  }
+  return value
 }
 
 // 缓存健康快照（GET /api/cache-health）：push.json 字节占用对照两级上限（生产写端 64MiB /
@@ -4230,7 +4300,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
   const handleBackupExport = (req, res) => {
-    readBody(req, 16 * 1024).then(({ body, over, aborted }) => {
+    readBody(req, BODY_BACKUP_EXPORT_MAX_BYTES).then(({ body, over, aborted }) => {
       if (over || aborted) { sendJson(res, over ? 413 : 400, { error: '请求体不完整或超限' }); return }
       let selected = BACKUP_CATEGORIES.slice()
       if (body && body.trim() !== '') {
@@ -4424,7 +4494,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       // 手动重试的幂等键：响应丢失后用户再点一次，不能把期间新产生的推送记录又覆盖回旧备份。
       const importKey = importKeyOf(req)
-      const bundleHash = sha256Hex(JSON.stringify(bundle))
+      // C2-018：摘要直接取**上传的原始字节**，不再 JSON.stringify(bundle) 把整份备份重新序列化
+      // 一遍——256MiB 上限下一次导入会因此多出一份等长字符串与整树遍历，纯属把峰值内存翻倍。
+      // 口径也更硬：幂等键认的是「同一份文件」（字节相同），不再是「语义等价的 JSON」；
+      // 备份里本来就带 exportedAt，两次导出不可能逐字相同，语义归一从未真正生效。
+      const bundleHash = sha256Hex(body)
       if (importKey) {
         const prior = readImportResult(importKey)
         if (prior) {
@@ -5525,7 +5599,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 地址栏与浏览器历史、Referer 与中间代理日志；POST 校验成功后 303 到干净 `/`，
     // 只下发 HttpOnly Cookie。直接打开 `?token=` 的分享链接仍兼容（见下方 authorize）。
     if (req.method === 'POST' && url.pathname === '/login') {
-      readBody(req, 2048).then(({ body, aborted, over }) => {
+      readBody(req, BODY_LOGIN_FORM_MAX_BYTES).then(({ body, aborted, over }) => {
         if (aborted || over) {
           sendJson(res, over ? 413 : 400, { error: over ? '登录请求过大' : '登录请求不完整' })
           return
@@ -6154,7 +6228,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readJsonObjectBody(req, 4096).then((read) => {
+      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
         if (!read.ok) { sendJson(res, read.status, read.body); return }
         const payload = read.payload
         const code = typeof payload.code === 'string' ? payload.code.trim() : ''
@@ -6219,7 +6293,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readJsonObjectBody(req, 4096).then((read) => {
+      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
         if (!read.ok) { sendJson(res, read.status, read.body); return }
         const payload = read.payload
         const code = typeof payload.code === 'string' ? payload.code.trim() : ''

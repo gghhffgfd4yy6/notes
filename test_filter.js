@@ -6661,6 +6661,22 @@ console.log('========================================\n');
       'FIFO 只淘汰最旧键：最近的键必须仍命中（淘汰错端在此变红）')
   })
 
+  // FILTER-01：compileStateOf 是 filter.hash 的第三维（App.run 折入「规则实际编译生效」）。
+  // 控制台保存规则后要用同一口径算摘要，所以这个导出必须真的被测试执行到（不只被生产代码引用）：
+  // 同一份配置在「规则被编译出来」与「规则被 ReDoS/编译守卫丢弃」两种结果下指纹必须不同。
+  await test('FILTER-01: compileStateOf 折入 re2 可用性与字段编译结果（控制台摘要与运行期同口径）', () => {
+    const v3 = require('./xbk_function_v3.js')
+    const compiled = v3.compileStateOf(v3.compileRules({ pingbibiaoti: 'abc' }))
+    assertEqual(typeof compiled, 'string', 'compileStateOf 必须返回稳定字符串')
+    assertEqual(compiled.includes('re2='), true, `指纹必须带 re2 可用性维度（实际 ${compiled}）`)
+    assertEqual(compiled.includes('pingbibiaoti=re'), true, `已编译出正则的字段必须体现类型（实际 ${compiled}）`)
+    // 同一环境内必须稳定：否则 App 每轮都清 _f、每轮全量重评
+    assertEqual(compiled, v3.compileStateOf(v3.compileRules({ pingbibiaoti: 'abc' })), '同一环境内指纹必须逐字稳定')
+    // 非法正则被编译守卫丢弃 ⇒ 编译生效面变了，指纹必须跟着变（否则改宽后静默漏推）
+    const dropped = v3.compileStateOf(v3.compileRules({ pingbibiaoti: '(' }))
+    assertEqual(dropped !== compiled, true, '编译结果变化必须改变指纹（否则 filter.hash 不变、_f 永不失效）')
+  })
+
   // ==================== 94. 死代码检测(可达性) ====================
   console.log('\n📂 94. 死代码检测')
 

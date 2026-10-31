@@ -4,6 +4,8 @@
 // 不必从 app.js 源码里截字符串再 eval（SonarCloud S1523 视动态执行代码为 Critical Vulnerability）。
 // 这里只放可注入时钟/纯输入的判定，任何 DOM 或 fetch 逻辑都不要进来。
 
+import { SHANGHAI_OFFSET_MS } from './constants.js'
+
 export const DAY_MS = 1000 * 60 * 60 * 24
 
 // 回到顶部的滚动方式（v3.321）：开了「减少动效」或宿主没有 scrollBehavior（老 Safari）时
@@ -191,7 +193,7 @@ export function relDay (dateStr, nowMs = Date.now()) {
   if (typeof dateStr !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return ''
   const [y, m, d] = dateStr.split('-').map(Number)
   const target = Date.UTC(y, m - 1, d)
-  const now = new Date(Number(nowMs) + 8 * 3600 * 1000)
+  const now = new Date(Number(nowMs) + SHANGHAI_OFFSET_MS)
   const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
   const gap = Math.round((today - target) / DAY_MS)
   if (!Number.isFinite(gap) || gap < 0) return ''

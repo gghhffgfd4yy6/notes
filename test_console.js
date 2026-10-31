@@ -103,6 +103,8 @@ const {
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
   sanitizeAccessPath, shouldLogAccess, acceptsGzip, ACCESS_LOG_MAX,
+  // C2-022：条件 tag 的变体因子（纯函数；回归见「按解码后的参数名剔除 token」用例）
+  conditionalVariant,
   findSecretLikeField, CACHE_HEALTH_COUNT_MAX_BYTES, cacheHealthEntryCount,
   filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
   parseDayKey, filterMessagesByRange, windowMessages,
@@ -974,6 +976,26 @@ ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）
   assert.ok(true)
 })
 
+// C2-022 回归：条件 tag 的变体因子必须按**解码后**的参数名剔除 token。
+// authorize 的 `?token=` 走 URLSearchParams.get('token')，也就是解码后的键 ⇒ `?%74oken=abc`
+// 同样是有效凭证；conditionalVariant 若按字面量比键名，同一份内容就会按 token 的编码写法
+// 算出两个 ETag，条件缓存被凭空的变体打散（variant 里还留着凭证片段）。这条用例直接对
+// 导出的纯函数断言（不经过 HTTP），回退成字面量比较即红。
+ok('conditionalVariant: 按解码后的参数名剔除 token（%74oken 与裸 URL 同变体；非 token 参数仍区分）', () => {
+  const v = (url) => conditionalVariant({ url })
+  // ① 修复点：编码写法的 token 与「查询串其余参数」算同一变体。
+  assert.strictEqual(v('/api/runs?%74oken=abc&limit=10'), v('/api/runs?limit=10'),
+    '?%74oken= 是有效凭证，必须按 token 剔除，不得让同一内容分裂成两个 tag')
+  assert.strictEqual(v('/api/runs?token=abc&limit=10'), v('/api/runs?limit=10'), '裸 ?token= 口径不变')
+  assert.strictEqual(v('/api/config?%74oken=abc'), '/api/config', '参数全被剔掉时回落无查询串形态')
+  // ② 反例：只剔 token 这一个键名——其余参数照旧参与变体（防把过滤写宽成「吞掉整段查询串」）。
+  assert.notStrictEqual(v('/api/runs?limit=10'), v('/api/runs?limit=200'), '其余参数不同必须换变体')
+  assert.notStrictEqual(v('/api/runs?tokens=abc&limit=10'), v('/api/runs?limit=10'),
+    'tokens 不是 token，不得被剔除（否则不同查询串共用一个 tag）')
+  // ③ 不做大小写折叠：authorize 的 get('token') 区分大小写，?Token= 不是凭证，也就必须留在变体里。
+  assert.notStrictEqual(v('/api/runs?Token=abc'), v('/api/runs'), '?Token= 不是凭证，必须保留为变体因子')
+})
+
 // ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
 ok('sanitizeAccessPath: 敏感键值 *** + 原串形态保留（D2-N1/N2）', () => {
   // 分隔符保留：查询串形状不破坏
@@ -1565,6 +1587,19 @@ async function filterRuleApiTests () {
       assert.strictEqual(body.revision, 1)
       assert.deepStrictEqual(body.changedFields, ['pingbibiaoti'])
       assert.ok(typeof body.hash === 'string' && body.hash.length > 0, '必须返回规则摘要 hash')
+      // C2-020：摘要必须与运行期 App.run 的 filter.hash 同口径（折入 compileStateOf 的「编译
+      // 生效」维度）。旧实现只传前两参，控制台的 hash 与生效快照里的 filter.hash 永远不相等。
+      const cfgRead = await request(port, 'GET', '/api/config/filter', { token: TOKEN })
+      const activeCfg = JSON.parse(cfgRead.text)
+      const realDeps = runtimeFilterDeps()
+      const runtimeHash = realDeps.filterHash(
+        activeCfg.filter,
+        activeCfg.keyword.zkt_gjc,
+        realDeps.compileStateOf(realDeps.RuleEngine.compileRules(activeCfg.filter))
+      )
+      assert.strictEqual(body.hash, runtimeHash, '控制台摘要必须等于运行期 filter.hash 口径')
+      assert.notStrictEqual(body.hash, realDeps.filterHash(activeCfg.filter, activeCfg.keyword.zkt_gjc),
+        '纯配置摘要（不折编译维度）不得再冒充 filter.hash')
       assert.strictEqual(body.appliedHint, '下一轮生效')
       assert.strictEqual(fs.statSync(paths.file).mode & 0o777, 0o600, '覆盖文件必须 0600')
       assert.strictEqual(fs.existsSync(paths.lock), false, '保存后锁必须释放')
@@ -2551,6 +2586,14 @@ async function backupApiTests () {
       assert.strictEqual(again.status, 200, again.text)
       assert.deepStrictEqual(JSON.parse(again.text).imported.messages, 1)
       assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]))
+      // C2-018：幂等键按**上传字节**判同一份备份（不再把 bundle 重新序列化做语义归一）。
+      // 内容语义相同、字节不同（这里多一个换行）必须当成另一份备份拒绝——同一幂等键下
+      // 「另一份文件」覆盖旧结果，正是这个键要挡的事。
+      const reformatted = JSON.stringify(bundle) + '\n'
+      const conflict = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: reformatted, headers })
+      assert.strictEqual(conflict.status, 409, conflict.text)
+      assert.strictEqual(JSON.parse(conflict.text).code, 'idempotency_conflict')
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]), '被拒的导入不得落盘')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
@@ -7121,6 +7164,28 @@ async function main () {
       assert.strictEqual(tombstoneCounts(dir2, 'push.json').status, 'unsafe', 'FIFO 必须在 meta 闸被判 unsafe，绝不进入读内容路径')
       assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
     }
+  })
+  await aok('只读纯函数: tombstoneCounts 的 (ino,size,mtimeMs) 缓存（同文件复用、mtime 变化必重算）', () => {
+    const dir = tmpDir()
+    const p = path.join(dir, 'push.json.seen.json')
+    // 两份**等长**的墓碑：total 分别为 1 与 0（等长才能只靠 ino/size/mtime 判定「同一份文件」）
+    const withKey = '{"v":1,"id":["ab"],"pad":""}'
+    const withoutKey = '{"v":1,"id":[""],"pad":"xx"}'
+    assert.strictEqual(Buffer.byteLength(withKey), Buffer.byteLength(withoutKey), '夹具必须等长')
+    fs.writeFileSync(p, withKey)
+    const old = new Date(Date.now() - 10 * 60 * 1000)
+    fs.utimesSync(p, old, old) // mtime 够旧才进缓存（<100ms 的文件不缓存）
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').counts.total, 1, '首次必须读到真实内容')
+    // 原地改写（不换 inode）+ 把 mtime 拨回原值：三元组完全相同 ⇒ 必须命中缓存
+    fs.writeFileSync(p, withoutKey)
+    fs.utimesSync(p, old, old)
+    const cached = tombstoneCounts(dir, 'push.json')
+    assert.strictEqual(cached.counts.total, 1, '同 (ino,size,mtime) 必须复用缓存结果，不再整读整解')
+    assert.strictEqual(cached.bytes, Buffer.byteLength(withKey), '缓存命中的 bytes 与计数同源（同一份快照）')
+    // mtime 一变（原子替换 / 裁剪的等价信号）⇒ 必须重算，缓存不得掩盖墓碑变化
+    const newer = new Date(Date.now() - 5 * 60 * 1000)
+    fs.utimesSync(p, newer, newer)
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').counts.total, 0, 'mtime 变化必须重算')
   })
   await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
     const { readSafeTextResult } = require('./xbk_storage')

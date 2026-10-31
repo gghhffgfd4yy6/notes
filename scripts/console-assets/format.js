@@ -3,6 +3,10 @@
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 
+// 本函数保留 +8 毫秒字面量（C2-021 的唯一例外）：test_console 的静态红线逐字断言
+// 「fmtTime 固定按 Asia/Shanghai 渲染」这一行实现，换成常量会让那条断言失去意义。
+// 其余各处一律用 constants.js 的 SHANGHAI_OFFSET_MS（同值、同一时区）；改这里时必须同步
+// 看那个常量——两处是同一个时区口径的两个落点。
 function fmtTime (ts) {
   if (!ts) return '—'
   const d = new Date(Number(ts) + 8 * 3600 * 1000)
