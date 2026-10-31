@@ -11608,6 +11608,26 @@ async function main () {
     // 导出与读面接线：pages.js 的导出下载端点也要走同一个 helper。
     assert.ok(src.includes('apiSearchLines, AUTH_HEADER, timedRequest'), 'pages.js 必须从 api.js 取用 AUTH_HEADER（导出下载走同一个鉴权头）')
   })
+
+  await aok('结构红线: C7-032 后台静默失败要在界面上留痕（不再 catch(() => {})）', () => {
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // 这三处此前都是空 catch：设置读取（顶栏日期设置不生效）、版本探针（部署后不提示刷新）、
+    // 回前台补拉（切回来还是旧数据），失败在界面零痕迹。
+    const settings = sliceBetween(ui, 'const reloadUiSettings = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'reloadUiSettings')
+    assert.ok(!settings.includes('.catch(() => {})'), '设置读取失败不得再静默（用户会看到「改了没生效」却没有任何线索）')
+    assert.ok(settings.includes("noteQuiet('设置读取失败', true)"), '设置读取失败必须落一条可见痕迹')
+    const probe = sliceBetween(ui, 'const check = () => {', 'check()\n    const timer = setInterval(check', '版本探针')
+    assert.ok(!probe.includes('.catch(() => {})'), '版本探针失败不得再静默（部署后不提示刷新就是这条被吞掉的）')
+    assert.ok(probe.includes("noteQuiet('版本探针失败', true)"), '版本探针失败必须落一条可见痕迹')
+    const resume = sliceBetween(ui, 'refreshActive({ respectFormPause: true })', 'const pull = usePullToRefresh', '回前台补拉')
+    assert.ok(!resume.includes('}).catch(() => {})'), '回前台补拉失败不得再静默（否则切回来还是旧数据，看不出为什么）')
+    assert.ok(resume.includes("noteQuiet('回前台补拉失败'"), '回前台补拉失败必须落一条可见痕迹')
+    // 痕迹必须真的渲染出来，并且成功时按 kind 撤掉（否则一次失败会永久挂一条假告警）。
+    assert.ok(ui.includes('${quietErrs.length > 0 && html`<div class="sync-fail sync-fail-quiet" role="status">'),
+      '失败条目必须渲染成可见的 role=status 行（只写 console.warn 在手机上看不到）')
+    const helper = sliceBetween(ui, 'const noteQuiet = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'noteQuiet')
+    assert.ok(helper.includes('if (!failed && has) return prev.filter'), '成功必须撤掉对应条目（不能留一条过期告警）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

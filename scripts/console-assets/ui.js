@@ -178,6 +178,20 @@ function App () {
   // 单调时钟：本次成功加载的时刻，只用于释放滚动垫高；不受系统时钟回拨影响。
   const [panelReadyAt, setPanelReadyAt] = useState(0)
   const [syncErr, setSyncErr] = useState('')
+  // 后台静默失败（C7-032）：设置读取 / 版本探针 / 回前台补拉三处都曾 catch(() => {})，
+  // 失败在界面上零痕迹——用户只看到「设置没生效」「没有更新提示」「数据停在旧值」，
+  // 无从判断是网络/服务端/权限。这里收成一个可见条目（顶栏一行，自动重试），
+  // 成功时按 kind 撤掉；devtools 里另留一条 console.warn（手机打不开 devtools 时靠前面那行）。
+  const [quietErrs, setQuietErrs] = useState([])
+  const noteQuiet = useCallback((kind, failed) => {
+    if (failed) console.warn('[xbk-console] 后台请求失败：' + kind + '（自动重试中）')
+    setQuietErrs((prev) => {
+      const has = prev.includes(kind)
+      if (failed && !has) return prev.concat(kind)
+      if (!failed && has) return prev.filter((k) => k !== kind)
+      return prev
+    })
+  }, [])
   // 「状态接口本身失败」要立刻反映到状态卡的占位文案上：/api/runs 可能还在路上，
   // 不能等 Promise.allSettled 两边都落定才把「正在读取…」改成「读取失败」。
   const [statusFailed, setStatusFailed] = useState(false)
@@ -263,8 +277,9 @@ function App () {
     // consumeJson 直接回 body（不是 { ok, data }），别按写面 consumeJsonResult 的形状取。
     apiGetConsoleSettings().then((body) => {
       applyUiSettings(body)
-    }).catch(() => {})
-  }, [applyUiSettings])
+      noteQuiet('设置读取失败', false)
+    }).catch(() => { noteQuiet('设置读取失败', true) })
+  }, [applyUiSettings, noteQuiet])
   useEffect(() => { reloadUiSettings() }, [reloadUiSettings])
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
@@ -294,7 +309,8 @@ function App () {
         const v = s && typeof s.version === 'string' ? s.version : ''
         // 与启动版本重新对齐（回滚也算）就收起提示，别留一条过期横幅。
         setNewVersion(v !== '' && v !== bootVersion ? v : '')
-      }).catch(() => {})
+        noteQuiet('版本探针失败', false)
+      }).catch(() => { noteQuiet('版本探针失败', true) })
     }
     check()
     const timer = setInterval(check, VERSION_CHECK_MS)
@@ -952,11 +968,11 @@ function App () {
     const onVis = () => {
       if (document.hidden) return
       if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return
-      refreshActive({ respectFormPause: true }).catch(() => {})
+      refreshActive({ respectFormPause: true }).then((ok) => noteQuiet('回前台补拉失败', ok === false), () => noteQuiet('回前台补拉失败', true))
     }
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
-  }, [refreshActive, authExpired])
+  }, [refreshActive, authExpired, noteQuiet])
   const pull = usePullToRefresh(pullRefresh, !authExpired)
   // 手机窄屏 .sync 是横向可滚动的：用户把它滑到右边时，行内状态会被裁在视口外。
   // 下拉一开始就把它滚回最左（状态就在第一个位置），保证反馈看得见。
@@ -1198,6 +1214,7 @@ function App () {
           title=${'主题：' + themeLabel + ' → ' + nextThemeLabel}>◐ ${themeLabel}</button>
       </div>
       ${syncErr ? html`<div class="sync-fail" role="status">${syncErr}</div>` : ''}
+      ${quietErrs.length > 0 && html`<div class="sync-fail sync-fail-quiet" role="status">后台刷新异常：${quietErrs.join(' / ')}（自动重试中）</div>`}
     </header>
 
     ${newVersion !== '' && html`<div class="alert-banner nudge" role="status">
