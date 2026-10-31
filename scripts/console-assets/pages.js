@@ -1921,9 +1921,10 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   }, [exporting, cate, query, days, rangeActive, range.from, range.to])
   const items = data && Array.isArray(data.items) ? data.items : []
   // 列表 FLIP（v3.360）：翻页/增删时卡片在位置上滑过去，而不是瞬间重排。
-  // 依赖「列表是否存在」：列表首次出现时挂载控制器，轮询更新不重建。
+  // deps 只跟「这一页数据」走（C7-014）：不传 deps 时 useLayoutEffect 每次渲染都执行，
+  // 输入防抖、抽屉开关、慢标志翻转都会对整页卡片各量一次布局，并把入场动画重播一遍。
   const motionRef = useRef(null)
-  useFlipList(motionRef)
+  useFlipList(motionRef, [data])
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
   // 直接用 grandTotal 会在「今天」里显示全量 374，看起来像筛选没生效。

@@ -10976,6 +10976,23 @@ async function main () {
       '首次点开且手里没有新鲜快照时必须真的发一发')
   })
 
+  await aok('结构红线: C7-014 列表 FLIP 带 deps（不再每次渲染都量布局 / 重播入场）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function MessagesPanel')
+    const end = src.indexOf('function LogsPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 MessagesPanel')
+    const seg = src.slice(at, end)
+    // 省略 deps = useLayoutEffect(fn) 每次渲染都跑：对整页卡片各量一次 getBoundingClientRect，
+    // 且新 key 一律 enter() 重播入场（输入防抖/抽屉开关/慢标志都会触发）。
+    assert.ok(/useFlipList\(motionRef, \[data\]\)/.test(seg),
+      'useFlipList 必须传 deps（省略 = 每次渲染都强制读布局并重播入场）')
+    const motion = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'motion.js'), 'utf8')
+    const flipAt = motion.indexOf('export function useFlipList')
+    assert.ok(flipAt > -1, '应能定位 useFlipList')
+    const flip = motion.slice(flipAt, motion.indexOf('\n}\n', flipAt))
+    assert.ok(/\}, deps\)/.test(flip), 'deps 必须真的交给 useLayoutEffect 的依赖数组')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')
