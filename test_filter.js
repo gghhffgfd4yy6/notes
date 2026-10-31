@@ -11558,6 +11558,43 @@ console.log('========================================\n');
     assertEqual(checkFields(makeItem({ title: '' }), compileRules({ pingbibiaoti: '京东' })), true, 'title 空串应跳过该字段')
   })
 
+  // C9-009：checkFields 是 explainFilter 的兼容壳（优先级矩阵只有一份实现）
+  await test('C9-009: checkFields 与生产入口 explainFilter 同判定（含分类/时间过滤）', () => {
+    // 反例（改动前）：checkFields 手写第二份矩阵、字段命名都不同，且完全不做 pingbifenlei/pingbitime
+    // 判定 ⇒ 同一输入 checkFields=true / listfilter=false 的分裂。
+    const catBlock = compileRules({ pingbifenlei: '美妆' })
+    const gCat = makeItem({ catename: '美妆', title: '口红' })
+    assertEqual(checkFields(gCat, catBlock), false, '分类屏蔽必须同样作用于 checkFields（此前被忽略）')
+    assertEqual(checkFields(gCat, catBlock), listfilter(gCat, catBlock), 'checkFields 必须与 listfilter 同判定')
+
+    const timeBlock = compileRules({ pingbitime: '5' })
+    const gNew = makeItem({ louzhuregtime: daysAgo(4) })
+    const gOld = makeItem({ louzhuregtime: daysAgo(100) })
+    assertEqual(checkFields(gNew, timeBlock), false, '注册 4 天 < 5 天必须被时间过滤拦下（此前 checkFields 不看时间）')
+    assertEqual(checkFields(gOld, timeBlock), true, '注册 100 天不在窗口内应放行')
+
+    // 全矩阵一致性：同一批配置 × 同一条目，两个入口必须逐项相同（形状守卫之外不再有第二份语义）
+    const cases = [
+      [{}, {}],
+      [{ pingbibiaoti: '京东' }, {}],
+      [{ pingbibiaoti: '拼多多' }, {}],
+      [{ zhanxianbiaoti: '京东', pingbibiaoti: '京东' }, {}],
+      [{ zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' }, {}],
+      [{ zhanxianlouzhu: '小明', pingbibiaoti: '京东' }, {}],
+      [{ pingbilouzhu: '小明', pingbibiaoti: '京东' }, {}],
+      [{ zhanxianneirong: '抢购', pingbineirong: '抢购' }, {}],
+      [{ pingbineirongplus: '抢购' }, {}],
+      [{ pingbibiaoti: '京东', pingbitime: '5' }, { louzhuregtime: daysAgo(1) }],
+      [{ pingbibiaoti: '京东', pingbifenlei: '微博线报' }, {}]
+    ]
+    for (const [cfg, overrides] of cases) {
+      const item = makeItem(overrides)
+      const compiled = compileRules(cfg)
+      assertEqual(checkFields(item, compiled), explainFilter(item, compiled).passed,
+        `checkFields 必须与 explainFilter 同判定：${JSON.stringify(cfg)} ${JSON.stringify(overrides)}`)
+    }
+  })
+
   // ---- timeMatchedRule（经 explainFilter 的可观测出口 reason.rule 判定）----
   await test('PlanA timeMatchedRule：多行天数规则记录实际命中行（分类限定不得串行）', () => {
     const cfg = compileRules({ pingbitime: '微博线报###5<br>赚客吧###3' })

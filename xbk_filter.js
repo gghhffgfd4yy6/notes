@@ -99,6 +99,11 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
      *
      * 参数形状：compiled = compileRules(...) 的整份产物（__compiled === true），
      *           与 checkCategory/checkRegisterTime 接收字段级规则（_type）不同；缺失 → 放行。
+     *
+     * C9-009：优先级矩阵**只有一份实现在 explainFilter**（生产链 xbk_app → listfilter →
+     * explainFilter），本方法只是兼容壳：保留 __compiled 形状守卫与告警，再把判定交给同一实现。
+     * 此前这里手写了第二份矩阵（连字段命名都不同），只能靠人同步——且它完全不做
+     * pingbifenlei/pingbitime 判定，同一输入会出现 checkFields=true / listfilter=false 的分裂。
      */
   checkFields (group, compiled) {
     // FILTER-03：形状守卫——本入口接收整份编译产物（__compiled === true）。传原始配置或错形状
@@ -110,49 +115,8 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       if (compiled) console.warn('⚠️ checkFields 收到未编译的配置或错形状参数，已保守放行')
       return true
     }
-    const fieldStages = [
-      { key: 'louzhu', getVal: (g) => Utils.safeGet(g, 'louzhu'), showCfg: compiled.zhanxianlouzhu, blockCfg: compiled.pingbilouzhu, plusCfg: compiled.pingbilouzhuplus, blockedBy: [] },
-      { key: 'title', getVal: (g) => Utils.safeGet(g, 'title'), showCfg: compiled.zhanxianbiaoti, blockCfg: compiled.pingbibiaoti, plusCfg: compiled.pingbibiaotiplus, blockedBy: ['louzhu'] },
-      { key: 'content', getVal: (g) => Utils.safeGet(g, 'content'), showCfg: compiled.zhanxianneirong, blockCfg: compiled.pingbineirong, plusCfg: compiled.pingbineirongplus, blockedBy: ['louzhu', 'title'] }
-    ]
-
-    const showFlags = {}
-    const blockFlags = {}
-    const blockPlusFlags = {}
-
-    // 第一轮：强制展现
-    for (const stage of fieldStages) {
-      const val = stage.getVal(group)
-      // P2（审查 2026-08-15）：真值判定会把 0/false 当「字段缺失」跳过匹配，与 matchesCompiled
-      // C013 契约（0/false 为有效值、参与匹配）分裂——统一为仅 undefined/null/空串视为缺失。
-      if (stage.showCfg && val !== undefined && val !== null && val !== '') {
-        if (RuleEngine.matchesCompiled(stage.showCfg, val, Utils.safeGet(group, 'catename'))) {
-          showFlags[stage.key] = true
-        }
-      }
-    }
-
-    // 第二轮：屏蔽 + 强化屏蔽
-    for (const stage of fieldStages) {
-      const val = stage.getVal(group)
-      // P2（同上）：0/false 是有效字段值，参与屏蔽/强化屏蔽匹配
-      if (val === undefined || val === null || val === '') continue
-      const blocked = stage.blockedBy.some(k => showFlags[k])
-
-      if (stage.blockCfg && !blocked && !showFlags[stage.key]) {
-        if (RuleEngine.matchesCompiled(stage.blockCfg, val, Utils.safeGet(group, 'catename'))) {
-          blockFlags[stage.key] = true
-        }
-      }
-      if (stage.plusCfg && !blocked && !blockFlags[stage.key]) {
-        if (RuleEngine.matchesCompiled(stage.plusCfg, val, Utils.safeGet(group, 'catename'))) {
-          blockPlusFlags[stage.key] = true
-          showFlags[stage.key] = false
-        }
-      }
-      if (blockFlags[stage.key] || blockPlusFlags[stage.key]) return false
-    }
-    return true
+    // C9-009：与生产入口同一实现（含分类屏蔽与时间过滤），不再维护第二份矩阵
+    return this.explainFilter(group, compiled).passed
   },
 
   /**
