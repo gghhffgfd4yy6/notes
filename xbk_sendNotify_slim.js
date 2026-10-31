@@ -700,7 +700,8 @@ function barkNotify (text, desp, params = {}) {
             if (err) {
               const failure = channelError(err, 'bark', resp)
               // C8-008：先结算再打日志（日志抛错不得改写结算结果），且不再有 finally 兜底 settlement
-              innerResolve({ ok: false, error: failure })
+              // C8-003：失败目标带上脱敏标识，供聚合逐目标记账
+              innerResolve({ ok: false, error: failure, target: maskUrl(pushUrl) })
               logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(failure)))
               return
             }
@@ -718,11 +719,11 @@ function barkNotify (text, desp, params = {}) {
             )
             // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
             // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
-            innerResolve({ ok: false, error: failure })
+            innerResolve({ ok: false, error: failure, target: maskUrl(pushUrl) })
             logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(failure)}\n`))
           } catch (e) {
             const failure = channelError(e, 'bark', resp)
-            innerResolve({ ok: false, error: failure })
+            innerResolve({ ok: false, error: failure, target: maskUrl(pushUrl) })
             logQuietly(() => pushHttp.logErr(safeErr(failure)))
           }
         })
@@ -731,9 +732,17 @@ function barkNotify (text, desp, params = {}) {
 
     // 等待所有推送完成
     // v3.166：至少一个设备成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
+    // C8-003：部分成功时把**失败目标**连同脱敏标识一并透出。旧实现只 `resolve()`，坏设备每轮失败、
+    // 每轮被「至少一个成功」盖住：日志里有一行失败，调用方（通道健康/告警/自检）却只看到「bark 成功」。
     Promise.all(pushPromises).then(results => {
-      if (results.some(r => r && r.ok)) resolve()
-      else reject(aggregateChannelError('bark', 'Bark 全部设备发送失败', results.map(r => r && r.error)))
+      const failedTargets = results.filter(r => !(r && r.ok))
+      if (failedTargets.length < results.length) {
+        resolve(failedTargets.length
+          ? { partialFailures: failedTargets.map(r => ({ target: (r && r.target) || '', error: r && r.error })) }
+          : undefined)
+        return
+      }
+      reject(aggregateChannelError('bark', 'Bark 全部设备发送失败', results.map(r => r && r.error)))
     }).catch(reject)
   })
 }
@@ -778,7 +787,8 @@ function pushMeNotify (text, desp, params = {}) {
             if (err) {
               const failure = channelError(err, 'pushme', resp)
               // C8-008：先结算再打日志（日志抛错不得改写结算结果），且不再有 finally 兜底 settlement
-              innerResolve({ ok: false, error: failure })
+              // C8-003：失败 key 带上脱敏标识，供聚合逐目标记账
+              innerResolve({ ok: false, error: failure, target: maskKey(trimmedKey) })
               logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(failure)))
               return
             }
@@ -795,11 +805,11 @@ function pushMeNotify (text, desp, params = {}) {
             )
             // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
             // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
-            innerResolve({ ok: false, error: failure })
+            innerResolve({ ok: false, error: failure, target: maskKey(trimmedKey) })
             logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(failure)}\n`))
           } catch (e) {
             const failure = channelError(e, 'pushme', resp)
-            innerResolve({ ok: false, error: failure })
+            innerResolve({ ok: false, error: failure, target: maskKey(trimmedKey) })
             logQuietly(() => pushHttp.logErr(safeErr(failure)))
           }
         })
@@ -808,9 +818,16 @@ function pushMeNotify (text, desp, params = {}) {
 
     // 等待所有推送完成
     // v3.166：至少一个 key 成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
+    // C8-003：部分成功时把失败 key 连同脱敏标识一并透出（同 bark：旧实现只 resolve()，坏 key 零记账）
     Promise.all(pushPromises).then(results => {
-      if (results.some(r => r && r.ok)) resolve()
-      else reject(aggregateChannelError('pushme', 'PushMe 全部 key 发送失败', results.map(r => r && r.error)))
+      const failedTargets = results.filter(r => !(r && r.ok))
+      if (failedTargets.length < results.length) {
+        resolve(failedTargets.length
+          ? { partialFailures: failedTargets.map(r => ({ target: (r && r.target) || '', error: r && r.error })) }
+          : undefined)
+        return
+      }
+      reject(aggregateChannelError('pushme', 'PushMe 全部 key 发送失败', results.map(r => r && r.error)))
     }).catch(reject)
   })
 }
@@ -1913,7 +1930,40 @@ async function sendNotify (text, desp, params = {}) {
     error.successfulChannels = successfulChannels
     throw error
   }
-  return { successfulChannels, failures: failedChannels }
+  // C8-003：多目标通道（Bark/PushMe 按 # 分割）部分成功时，失败目标旧实现只留一行日志、零记账——
+  // 聚合只 resolve()，调用方（通道健康/告警/自检）只看到「通道成功」，坏目标每轮失败且每轮被
+  // 「至少一个成功」盖住。现把目标级失败整理成 partialFailures 一并返回：**不改 failures 语义**
+  // （通道整体仍算成功，既有「部分成功不得记失败」契约、缓存写入与通道健康口径都不动），
+  // 失败目标另有独立通道可读，并在 run.log 里留一条点名告警。
+  const partialFailures = []
+  results.forEach((result, index) => {
+    if (result.status !== 'fulfilled') return
+    const raw = result.value && Array.isArray(result.value.partialFailures) ? result.value.partialFailures : []
+    if (raw.length === 0) return
+    const channel = enabledTasks[index].name
+    for (const item of raw) {
+      const reason = item && item.error
+      const failure = new Error(`${channel} 部分目标发送失败: ${safeErr(reason) || '未知错误'}`)
+      // channel/target 是健康台账与告警的归属键；target 已是脱敏产物（maskUrl / maskKey）
+      failure.channel = channel
+      failure.target = item && typeof item.target === 'string' ? item.target : ''
+      failure.partial = true
+      try {
+        if (reason && typeof reason === 'object' && reason.code !== undefined) failure.code = reason.code
+        if (reason && typeof reason === 'object' && reason.providerCode !== undefined) failure.providerCode = reason.providerCode
+        const statusCode = failureStatusCode(reason)
+        if (statusCode !== null) failure.statusCode = statusCode
+      } catch (e) { /* 异常字段只保留安全消息 */ }
+      partialFailures.push(failure)
+    }
+  })
+  if (partialFailures.length > 0) {
+    logQuietly(() => console.warn(
+      `⚠️ 部分目标发送失败：${partialFailures.map(f => `${f.channel}(${f.target || '目标'})`).join('、')}` +
+      '；其余目标已送达，本条消息按通道成功处理（不重试失败目标）'
+    ))
+  }
+  return { successfulChannels, failures: failedChannels, partialFailures }
 }
 
 module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, configuredChannelNames, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, pickWxPusherClickUrl }

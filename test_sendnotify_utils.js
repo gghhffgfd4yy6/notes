@@ -853,6 +853,94 @@ function assertSettled (outcome, label, why) {
     }
   }
 
+  // ===== C8-003：多目标通道部分成功必须逐目标记账 =====
+  // 缺陷形状（改动前）：Bark/PushMe 多目标（# 分割）「至少一个成功 = 通道成功」时只 resolve()，
+  // 失败目标零记账——坏设备/坏 key 每轮失败、每轮被「至少一个成功」盖住，调用方只看到通道成功。
+  // 判据：failures 语义不变（既有「部分成功不得记失败」契约，red 线不动），但 partialFailures
+  // 必须逐目标出现（channel + 脱敏 target + partial 标记），并有一条点名告警进日志。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    let handler = () => ({ body: { code: 200 } })
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = (url) => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      const reply = handler(String(url))
+      setImmediate(() => {
+        if (reply.error) { em.emit('error', reply.error); return }
+        em.emit('response', { statusCode: 200, headers: {}, timings: {} })
+        em.emit('data', Buffer.from(typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body)))
+        em.emit('end')
+      })
+      return em
+    }
+    const warns = []
+    const origWarn = console.warn
+    console.warn = function (...args) { warns.push(args.map(String).join(' ')) }
+    try {
+      clearCfg()
+      cfg.BARK_PUSH = 'https://api.day.app/c8ok#https://api.day.app/c8bad'
+      handler = (url) => ({ body: url.includes('c8ok') ? { code: 200 } : { code: 500, message: 'device key invalid' } })
+      const res = await slim.sendNotify('T', 'D')
+      // ① 通道整体仍算成功（v3.166 语义与缓存写入口径不动）
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], '一成一败仍算通道成功')
+      assert.deepStrictEqual(res.failures, [], 'failures 语义不变：部分成功不得记成通道失败')
+      // ② 但失败目标必须逐条透出（旧实现这里是 undefined ⇒ 红）
+      assert.ok(Array.isArray(res.partialFailures), 'sendNotify 必须返回 partialFailures 数组（旧实现无此字段）')
+      assert.strictEqual(res.partialFailures.length, 1, '恰好一个目标失败时必须恰好一条 partialFailure')
+      const pf = res.partialFailures[0]
+      assert.strictEqual(pf.channel, 'bark', 'partialFailure 必须点名通道')
+      assert.strictEqual(pf.partial, true, '必须带 partial 标记（与真通道失败区分）')
+      assert.match(pf.message, /部分目标发送失败/, `文案必须说明是目标级失败，实际：${pf.message}`)
+      assert.strictEqual(pf.statusCode, 200, '目标级失败必须透出 HTTP 状态码（来自 response 形参）')
+      assert.strictEqual(pf.providerCode, 500, '目标级失败必须透出业务码')
+      assert.ok(typeof pf.target === 'string' && pf.target.length > 0, 'partialFailure 必须带脱敏目标标识')
+      assert.strictEqual(pf.target.includes('c8bad'), false, `目标标识必须已脱敏，不得回显设备码：${pf.target}`)
+      // ③ 日志里必须有一条点名告警（cron/run.log 的读者据此发现坏目标）
+      assert.ok(warns.some(w => w.includes('部分目标发送失败') && w.includes('bark')),
+        `必须有一条点名告警进日志，实际 warn：${JSON.stringify(warns)}`)
+      // ④ PushMe 同口径
+      clearCfg()
+      cfg.PUSHME_KEY = 'pmok1#pmbad2'
+      let pmCalls = 0
+      gotMod.stream.post = (url) => {
+        const em = new EventEmitter()
+        em.destroy = () => {}
+        pmCalls++
+        const body = pmCalls === 1 ? 'success' : 'error'
+        setImmediate(() => {
+          em.emit('response', { statusCode: 200, headers: {}, timings: {} })
+          em.emit('data', Buffer.from(body))
+          em.emit('end')
+        })
+        return em
+      }
+      const pmRes = await slim.sendNotify('T', 'D')
+      assert.deepStrictEqual(pmRes.successfulChannels, ['pushme'], 'PushMe 一成一败仍算通道成功')
+      assert.deepStrictEqual(pmRes.failures, [], 'PushMe 部分成功不得记通道失败')
+      assert.strictEqual(pmRes.partialFailures.length, 1, 'PushMe 必须逐 key 透出失败目标')
+      assert.strictEqual(pmRes.partialFailures[0].channel, 'pushme', 'PushMe partialFailure 必须点名通道')
+      // ⑤ 全失败走原路径：不得同时产生 partialFailures（两种记账只能二选一）
+      clearCfg()
+      cfg.BARK_PUSH = 'https://api.day.app/bad1#https://api.day.app/bad2'
+      let err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      assert.strictEqual(err && err.code, 'ALL_CHANNELS_FAILED', '全设备失败必须整体上抛')
+      assert.strictEqual(err.failures.length, 1, '全失败仍是通道级聚合（不是逐目标 partial）')
+      console.log('✅ C8-003 多目标部分成功：failures 语义不变 + partialFailures 逐目标（脱敏/状态码/业务码）+ 点名告警')
+    } finally {
+      console.warn = origWarn
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
   // ===== 补测 PlanF：normalizeFailure 与失败聚合（经 sendNotify 的 failures 观测）=====
   // 反例（改动前）：normalizeFailure 20 个靶子被登记为「不可达」——**该判断同样是错的**：
   // 它在 channelResults 里被调用（L1612），而 sendNotify 在**全部通道失败**时把 failures 一路抛出。
