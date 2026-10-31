@@ -1044,9 +1044,12 @@ function createApp ({
           }
         }
         const succeeded = new Set(Array.isArray(outcome && outcome.successfulChannels) ? outcome.successfulChannels.filter(x => typeof x === 'string' && x) : [])
-        const failures = Array.isArray(outcome && outcome.failures) ? outcome.failures : []
+        // C1-025：外层是「失败对象数组」，与下面按通道累计的「连续失败次数」是两种东西。
+        // 旧实现两处都叫 failures（相隔十余行），内层把外层遮住——读代码时极易把数组当计数用；
+        // 现分别命名为 failureList（数组）与 failCount（次数）。
+        const failureList = Array.isArray(outcome && outcome.failures) ? outcome.failures : []
         const failed = new Map()
-        for (const failure of failures) {
+        for (const failure of failureList) {
           const channel = failure && typeof failure.channel === 'string' ? failure.channel : ''
           if (channel) failed.set(channel, summarizeError(failure))
         }
@@ -1082,13 +1085,13 @@ function createApp ({
           // 本轮也失败过 ⇒ 已按失败计数（见上），不得再按「恢复」清零。
           if (failed.has(channel)) continue
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
-          const failures = this._safeCounter(entry.consecutiveFailures)
+          const failCount = this._safeCounter(entry.consecutiveFailures)
           const recoverPending = entry.recoverAlertPending === true
           if (recoverPending && this._isChannelRecoverClaimAlive(entry, now)) {
             // FX3：另一轮已认领这次恢复告警且租约未过期（它的发送还在飞）——本轮不得重复入队，
             // 且必须原样保留认领字段，否则后继轮次会当成「无主认领」重复发送。
             state[channel] = {
-              consecutiveFailures: failures,
+              consecutiveFailures: failCount,
               lastFailureAt: this._safeCounter(entry.lastFailureAt),
               lastAlertAt: this._safeCounter(entry.lastAlertAt),
               lastRecoveredAt: this._safeCounter(entry.lastRecoveredAt),
@@ -1096,14 +1099,14 @@ function createApp ({
               recoverAlertClaim: entry.recoverAlertClaim,
               recoverAlertClaimAt: this._safeCounter(entry.recoverAlertClaimAt)
             }
-          } else if (failures >= threshold || recoverPending) {
+          } else if (failCount >= threshold || recoverPending) {
             // APP2-02：恢复告警只能在「确认送达」后清零计数——此处先保留失败计数与
             // recoverAlertPending（发送成功后再于告警循环里清零落盘）。原实现发送前即清零点外写盘，
             // 恢复通知一旦发送失败就永久丢失（后续轮次因计数已清零不再触发恢复告警）。
             // FX3：入队的同时在锁内原子认领（令牌+租约），堵住「保持 pending → 释放锁 → 锁外发送」
             // 期间第二个重叠运行看到同一 pending 而各发一条的重复通知竞态；陈旧认领超租约后可接管。
             state[channel] = {
-              consecutiveFailures: failures,
+              consecutiveFailures: failCount,
               lastFailureAt: this._safeCounter(entry.lastFailureAt),
               lastAlertAt: this._safeCounter(entry.lastAlertAt),
               lastRecoveredAt: now,

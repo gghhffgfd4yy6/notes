@@ -3678,6 +3678,24 @@ check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回
   assert.ok(/const acquireLockWithRetry = \(lockPath\) =>/.test(code), '重试口径必须来自同一个获取函数')
 })
 
+// ===== C1-025：_updateChannelHealth 里两种「failures」不再同名互相遮蔽 =====
+// 审计条目：外层是失败对象数组（outcome.failures），内层是按通道累计的连续失败次数，相隔十余行
+// 却同名——读代码时容易把数组当计数（或反之）。这里锁住两个名字：回退重命名后内层断言立刻变红。
+check('C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const body = code.slice(code.indexOf('async _updateChannelHealth'))
+  assert.ok(/const failureList = Array\.isArray\(outcome && outcome\.failures\)/.test(body),
+    '外层失败对象数组必须命名为 failureList（不得与次数同名）')
+  assert.ok(/const failCount = this\._safeCounter\(entry\.consecutiveFailures\)/.test(body),
+    '内层连续失败次数必须命名为 failCount')
+  assert.strictEqual(/const failures = this\._safeCounter\(entry\.consecutiveFailures\)/.test(body), false,
+    '内层不得再用 failures 遮蔽外层的失败对象数组')
+  assert.strictEqual(/consecutiveFailures: failures\b/.test(body), false,
+    '计数落盘不得再引用被遮蔽的 failures')
+})
+
 checkAsync('C1-013 收敛后语义不变：通道健康锁仍单次尝试（EACCES 立即 -1 且带 errno 原因）', async () => {
   const mfs = makeMemFs()
   mfs.openSync = () => { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e }
