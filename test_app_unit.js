@@ -3187,6 +3187,52 @@ checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严�
   }
 })
 
+// ===== C1-029：明细预算被挤掉的条数必须随 run 记录落盘 =====
+// 审计条目：100 条预算先到先得，通过项与屏蔽项共用一个坑位，被挤掉的整批屏蔽项在文件里没有任何痕迹
+// （detailCount 恰好等于预算，看起来「全记下了」）。修法取审计给的第二个选项：run 记录补
+// detailsBudget / detailsDropped{passed,filtered}——不改「每轮最多 N 条」的既定配置语义与文件体积上限。
+checkAsync('C1-029 明细被预算挤掉必须留痕：detailsDropped 分类计数 + detailsBudget 回显', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const logPath = path.join(cacheDir, 'filter-diagnostics.ndjson')
+    const lastRunRecord = () => {
+      const text = realFs.existsSync(logPath) ? realFs.readFileSync(logPath, 'utf8').trim() : ''
+      if (!text) return null
+      const runs = text.split('\n').map((line) => JSON.parse(line)).filter((r) => r.type === 'run')
+      return runs[runs.length - 1] || null
+    }
+    // ① 预算 1 + 三条全被规则拦下 ⇒ 只落 1 条明细，另 2 条必须计入 detailsDropped.filtered
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 1, includePassed: false }
+    h.Config.filter.pingbibiaoti = '预算'
+    h.setItems([makeRunItem('bd-1', '预算甲'), makeRunItem('bd-2', '预算乙'), makeRunItem('bd-3', '预算丙')])
+    const r1 = await runWithWarnings(h.App)
+    assert.strictEqual(r1.summary.filtered, 3, `前置：三条都应被规则拦下：${JSON.stringify(r1.summary)}`)
+    const run1 = lastRunRecord()
+    assert.ok(run1, '必须写出 run 汇总记录')
+    assert.strictEqual(run1.detailCount, 1, '明细条数不得超过预算')
+    assert.strictEqual(run1.detailsBudget, 1, `run 记录必须回显本轮预算（否则 1 条明细会被读成全量）：${JSON.stringify(run1)}`)
+    assert.deepStrictEqual(run1.detailsDropped, { passed: 0, filtered: 2 },
+      `被预算挤掉的屏蔽项必须如实计数：${JSON.stringify(run1)}`)
+
+    // ② 预算放大 ⇒ 换新条目跑同样三条，detailsDropped 必须归零（证明 ① 的 2 来自预算而非固定值）
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 100, includePassed: false }
+    h.setItems([makeRunItem('bd-4', '预算丁'), makeRunItem('bd-5', '预算戊'), makeRunItem('bd-6', '预算己')])
+    await runWithWarnings(h.App)
+    const run2 = lastRunRecord()
+    assert.strictEqual(run2.detailCount, 3, `预算充足时三条明细都应落盘：${JSON.stringify(run2)}`)
+    assert.deepStrictEqual(run2.detailsDropped, { passed: 0, filtered: 0 }, '预算充足时不得报被截断')
+
+    // ③ includePassed=true + 预算 1：通过项也占坑，被挤掉的通过项单独计数（不得混进 filtered）
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 1, includePassed: true }
+    h.Config.filter.pingbibiaoti = ''
+    h.setItems([makeRunItem('bd-7', '通过甲'), makeRunItem('bd-8', '通过乙')])
+    await runWithWarnings(h.App)
+    const run3 = lastRunRecord()
+    assert.strictEqual(run3.detailCount, 1, `预算 1 时明细只能有 1 条：${JSON.stringify(run3)}`)
+    assert.deepStrictEqual(run3.detailsDropped, { passed: 1, filtered: 0 },
+      `通过项被预算挤掉必须单独计数：${JSON.stringify(run3)}`)
+  })
+})
+
 // 共享夹具：临时 cacheDir + 真装配 harness + 环境变量还原（异常路径也还原，避免污染后续用例）
 async function withRunHarness (over, fn) {
   const realFs = require('fs')

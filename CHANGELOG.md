@@ -1107,6 +1107,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **运行日志锁与通道健康锁不再关闭 stdio fd（`xbk_app.js`）**：`run.log.lock` 此前用 `lockFd >= 0` 判「是否持锁」并在 finally 里 `closeSync(lockFd)`——哨兵一旦被变异成真 fd（或 stdio 已被外部关闭、`open` 返回 0/1/2），就是一次 `close(1)`，stdout 被关、进程崩成变异测试的 RuntimeError；`channel-health.state.lock` 则把 close 与 unlink 绑在同一个 `lockFd > 2` 分支里，fd 落在 stdio 区时锁文件不删，后续轮次一直被陈旧锁挡住、健康状态整段漏更新。现在两处同口径：哨兵用 `null`（UnaryOperator 无从下手）、close 只接受 `>2` 的 fd、unlink 只看「本轮是否取到锁」。**行为差异只在 0/1/2 这类 stdio 边界**，正常 fd（>=3）路径与锁语义不变。
 - **三处 O_EXCL 锁的释放改为令牌校验（`xbk_app.js`）**：`run.log.lock` / `re2warn.state.<date>.lock` / `channel-health.state.lock` 此前释放时按路径无条件 `unlinkSync`。持锁进程的令牌写盘失败（内容为空）时 `_isTombstoneLockProcessAlive` 解析不出存活证据 ⇒ 另一进程在 mtime 超龄后 unlink 重建「接管」，而先来者的迟到释放会把接管者（或随后的第三方）正持有的锁删掉，同一临界区出现两个进程（截尾读改写可冲掉并发追加的日志行）。现三处共用 `releaseLock`：读回锁内容与 `pid:starttime` 令牌做定时安全比较，不匹配只关 fd、保留别人的锁；读不到（ENOENT/io）同样不删，残留由「mtime 超龄 + 持有进程已退出」在 10s 后回收。
 - **运行日志写入只认白名单文件名（`xbk_app.js`）**：`_writeRunLog` 旧判据只挡 `../` 与绝对路径，任何同名基名都能穿过——内部调用若传 `push.json`，一行日志文本会被追加进判重缓存（整份 JSON 数组），读侧判坏后原件改名隔离、缓存重建为空 ⇒ 判重身份全丢、全量重推。现为白名单 `run.log` / `filter-diagnostics.ndjson`（新增日志必须显式入名单），越界回退 `run.log` 并 `console.error` 点名。
+- **过滤诊断 run 记录补 `detailsBudget` / `detailsDropped`（`xbk_app.js`）**：`maxDetailsPerRun`（默认 100）是「先到先得」的共享坑位，通过项与屏蔽项竞争——旧实现被挤掉的明细**不留任何痕迹**，`detailCount` 恰好等于预算，运维修规则时会以为「屏蔽项只有这几条」。现 run 记录（`filter-diagnostics.ndjson` 每轮首行）多两个字段：本轮生效预算，以及按决策分类的被挤掉条数 `{passed, filtered}`。配置语义（每轮最多 N 条）与文件体积上限不变，读侧 `scripts/status.js` 的校验只看既有字段，故向后兼容。
 
 ## v3.387 — 夜间审计 56 条（P2 15 / P3 41）
 

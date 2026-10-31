@@ -1488,6 +1488,10 @@ function createApp ({
         const batchAnonKeys = new Set()
 
         const filterDiagnostics = []
+        // C1-029：明细预算（maxDetailsPerRun）是先到先得 —— 谁先被评估谁先占坑。旧实现被挤掉的
+        // 明细**不留痕**：detailCount 恰好等于预算，文件里看起来「全记下了」，运维修过滤规则时
+        // 会以为「屏蔽项只有这几条」。这里按 decision 分类记被挤掉的条数，随 run 记录落盘。
+        const diagnosticDrops = { passed: 0, filtered: 0 }
         const filterReasonCounts = {}
         const filterExplanations = new Map()
         const filterLogCfg = Config.diagnostics && Config.diagnostics.filterLog
@@ -1550,8 +1554,9 @@ function createApp ({
           filterExplanations.set(item, explanation)
           if (explanation.passed) {
             items.push(item)
-            if ((explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) && filterDiagnostics.length < maxDiagnosticDetails) {
-              filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
+            if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
+              if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
+              else diagnosticDrops.passed++
             }
           } else {
             filteredCount++
@@ -1559,6 +1564,7 @@ function createApp ({
             const reasonKey = `${explanation.reason.stage}.${explanation.reason.kind}.${explanation.reason.configKey}`
             filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
             if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'filtered', explanation))
+            else diagnosticDrops.filtered++
           }
           newMessages.push(item)
         }
@@ -1623,7 +1629,7 @@ function createApp ({
                       protections: explanation.protections,
                       skipped: explanation.skipped
                     }))
-                  }
+                  } else diagnosticDrops.filtered++
                 }
               }
               items = kept
@@ -1642,7 +1648,10 @@ function createApp ({
             passed: items.length,
             // 不能从受 maxDetailsPerRun 截断的明细反算，否则汇总会少计。
             byReason: filterReasonCounts,
-            detailCount: filterDiagnostics.length
+            detailCount: filterDiagnostics.length,
+            // C1-029：本轮明细预算与「被预算挤掉」的分类条数——被截断必须能从文件里看出来。
+            detailsBudget: maxDiagnosticDetails,
+            detailsDropped: diagnosticDrops
           },
           ...filterDiagnostics
         ])
