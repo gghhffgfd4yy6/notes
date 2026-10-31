@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -260,6 +260,16 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
   // 结果徽章由下一轮轮询的 cancelled/finishedAt 驱动。
   const [cancelPending, setCancelPending] = useState(null)
   const [cancelErr, setCancelErr] = useState('')
+  // C7-009：「停止」是破坏性且不可撤销的动作，先弹确认再发。后果（已发出但没记进
+  // 推送记录的通知，下一轮会重推）必须写在弹窗正文里——只塞进按钮 title 的话，
+  // 触屏（无 hover）与键盘用户永远看不到。
+  const [cancelAsk, setCancelAsk] = useState(null)
+  // 与概览确认弹窗同一口径（C7-001）：本组件渲染在会被 display:none 的 section 里，
+  // 切页时若不收口，dialog 会塌成 0×0 且整页继续 inert。
+  useEffect(() => {
+    if (active) return
+    setCancelAsk(null)
+  }, [active])
   // 首屏行入场（只播一次；后续轮询只更新文字，不再闪）。
   const listRef = useRef(null)
   useRevealWhen(listRef, runs.length > 0, 'tbody tr', { transform: false, duration: MOTION.fast, step: 0.02, cap: 6 })
@@ -297,7 +307,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
             <td>${statusOf(r)}</td>
             <td>
               ${!r.finishedAt && html`<${Button} variant=${'ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
-                onClick=${() => { doCancel(r.id).catch(() => {}) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止<//>`}
+                onClick=${() => { setCancelAsk(r.id) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止<//>`}
               <${Button} variant="ghost" onClick=${() => openLog(r.id)}>
                 ${openId === r.id ? '收起' : '日志'}
               <//>
@@ -319,6 +329,16 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
           : (typeof detailForOpen.output === 'string' && detailForOpen.output.length > 0 ? detailForOpen.output : '（无输出）'))
       }</pre>
     </div>`}
+    ${/* C7-009：「停止」先确认再发。不可撤销与「下轮重推」的后果写在正文里（触屏/键盘都看得到），
+         不再只挂在按钮 title 上。 */ ''}
+    <${ConfirmDialog} open=${cancelAsk !== null && active}
+      title="停止这一轮任务？"
+      confirmLabel="停止任务"
+      onConfirm=${() => { const id = cancelAsk; setCancelAsk(null); doCancel(id).catch(() => {}) }}
+      onCancel=${() => setCancelAsk(null)}>
+      <div>会向运行中的任务 #${cancelAsk} 立刻发 SIGTERM，3 秒后仍未退出就强杀；停止<b>不能撤销</b>，这一轮只能重跑。</div>
+      <div class="modal-note">已经发出、但还没写进推送记录的通知不会作废——下一轮重推时可能重复到达。</div>
+    <//>
   </div>`
 }
 
@@ -579,13 +599,18 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 消费即清旗：返回 null 也不再重试（否则旗子会挂到下一次操作上）。
   useLayoutEffect(() => {
     if (!landRef.current) return
+    // C7-018：逐轮历史没有服务端分页，改页码是同步的；但「切档」在没命中快照时是异步的
+    // （changeMode → fetchSnap）。这两道门挡的正是那段空窗：拿旧档列表的位置先落一次点，
+    // 真正换好的数据回来时旗子已经没了 —— 用户看到的是「跳了，但跳错位置」。
+    if (loading) return // 新一轮加载在飞：数据还没落地，保留旗子
+    if (pendingMode !== null) return // 目标档还没画出来：同上（快照落地时 mode/data 同批变化，effect 会再跑）
     landRef.current = false
     // 请求飞行期间用户自己滚动时撤销落点，别把人拽回列表顶（夹取/锚定不算）。
     if (userMovedRef.current) return
     const y = listLandTarget(listRef.current)
     if (y === null) return
     window.scrollTo(0, y)
-  }, [data, loading, err, pageNo, size, mode, runRange.from, runRange.to])
+  }, [data, loading, err, pendingMode, pageNo, size, mode, runRange.from, runRange.to])
   const jumpLog = (r) => {
     if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
     const key = `${r.at}-${r.lineNo}`
@@ -1901,9 +1926,10 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
   }, [exporting, cate, query, days, rangeActive, range.from, range.to])
   const items = data && Array.isArray(data.items) ? data.items : []
   // 列表 FLIP（v3.360）：翻页/增删时卡片在位置上滑过去，而不是瞬间重排。
-  // 依赖「列表是否存在」：列表首次出现时挂载控制器，轮询更新不重建。
+  // deps 只跟「这一页数据」走（C7-014）：不传 deps 时 useLayoutEffect 每次渲染都执行，
+  // 输入防抖、抽屉开关、慢标志翻转都会对整页卡片各量一次布局，并把入场动画重播一遍。
   const motionRef = useRef(null)
-  useFlipList(motionRef)
+  useFlipList(motionRef, [data])
   const categories = data && Array.isArray(data.categories) ? data.categories : []
   // 分类弹层的「全部分类」计数必须跟时间窗走（服务端 days>0 时 categories 已按窗口重算）；
   // 直接用 grandTotal 会在「今天」里显示全量 374，看起来像筛选没生效。
@@ -2270,7 +2296,9 @@ function SearchPanel ({ onSync, active = true }) {
         try {
           // 和监控用同一套范围：从第 1 页往回翻到锚点所在页（最多 5 页），
           // 不能只数第 1 页——新增超过一页时角标会少报。
-          const since = w.lastReadAt > 0 ? w.lastReadAt : Date.now()
+          // C7-015：since 直接用 lastReadAt（0 = 从未读过 ⇒ 全部算新），不再拿 Date.now()
+          // 兜底——那会让「角标显示 N 条新」与「检查更新说 0 条新」同时成立。
+          const since = w.lastReadAt
           let count = 0
           for (let page = 1; page <= 5; page += 1) {
             const d = await apiSearchLines({ q: w.q, page, limit: 100 })
@@ -2280,8 +2308,8 @@ function SearchPanel ({ onSync, active = true }) {
             // 同一分钟内发布的新线报。锚点不在当前页时按 ts 比较，并继续往前翻。
             const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
             if (idx >= 0) { count += idx; break }
-            const allNew = d.items.every((it) => typeof it.ts === 'number' && it.ts > since)
-            count += d.items.filter((it) => typeof it.ts === 'number' && it.ts > since).length
+            const allNew = d.items.every((it) => isNewerThan(it.ts, since))
+            count += d.items.filter((it) => isNewerThan(it.ts, since)).length
             if (!allNew) break
             if (page >= Math.min(Number(d.pages) || 1, 5)) break
           }
@@ -2399,7 +2427,7 @@ function SearchPanel ({ onSync, active = true }) {
             <div class="msg-item-head">
               <a class="msg-title ls-title" href=${it.url} target="_blank" rel="noopener noreferrer" title=${`打开线报酷原文：${it.title}`}>${hit(it.title)}</a>
               ${typeof it.price === 'number' ? html`<span class="msg-price">¥${it.price}</span>` : ''}
-              ${!stale && req.since !== null && typeof it.ts === 'number' && it.ts > req.since ? html`<span class="ls-new">新</span>` : ''}
+              ${!stale && req.since !== null && isNewerThan(it.ts, req.since) ? html`<span class="ls-new">新</span>` : ''}
             </div>
             <div class="msg-meta">
               ${it.catename ? html`<span class="msg-cate" aria-label=${it.catename}>${cateParts(it.catename).map((part, j) => html`<span class="msg-cate-part" key=${j}>${part}</span>`)}</span>` : ''}
@@ -2468,7 +2496,8 @@ function SearchPanel ({ onSync, active = true }) {
   </div>`
 }
 
-// 运行日志：run.log 尾部（服务端 1MiB 上限），启动预加载 + 手动/切回刷新；有任务在跑时跟随轮询。
+// 运行日志：run.log 尾部（服务端 1MiB 上限），第一次点开页签才拉（C7-012）+ 手动/切回刷新；
+// 有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
 // ── 日志行渲染（v3.317）────────────────────────────────────────────────────
 // 旧版把整段尾部文本塞进一个 <pre>：ERROR/ALERT 与普通行同色；搜「推送」命中 53 行
@@ -2639,8 +2668,17 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const dataAtRef = useRef(0)
   useEffect(() => { if (data) dataAtRef.current = Date.now() }, [data])
   useEffect(() => {
-    // 首访预加载：页签还没点开也先把日志拉下来；之后离开不拉，切回再补。
+    // C7-012：页签还没点开就不预取（首屏零预取契约，与 usePanelAutoLoad 同口径）。
+    // 冷启动时日志尾部可能满 1 MiB：在隐藏页签里拉下来再整串 split/计数，是白付的
+    // 带宽与 CPU。这里只登记「首访已挂载」，真正的第一发留给第一次 active=true 的
+    // firstReveal 分支。
+    if (!active && !preloadedRef.current) {
+      preloadedRef.current = true
+      revealedRef.current = false
+      return undefined
+    }
     if (!active && preloadedRef.current) return undefined
+    // 之后离开不拉，切回再补。第一次点开时用 firstReveal 的「首发补拉」。
     const firstReveal = preloadedRef.current && active && !revealedRef.current
     const seeded = seededRef.current
     seededRef.current = false

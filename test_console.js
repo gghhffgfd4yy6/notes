@@ -11147,6 +11147,113 @@ async function main () {
       'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
 
+  await aok('结构红线: C7-009 「停止」先确认再发（后果写进正文，切页即收口）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function RunsPanel')
+    const end = src.indexOf('// ── 组件：逐轮运行历史', at)
+    assert.ok(at > -1 && end > at, '应能定位 RunsPanel')
+    const seg = src.slice(at, end)
+    // 一键直发且不可撤销：停止按钮只能先置「待确认」，不得直接调 doCancel/apiCancelRun。
+    const btnAt = seg.indexOf('>停止<')
+    assert.ok(btnAt > -1, '应能定位停止按钮')
+    const btn = seg.slice(seg.lastIndexOf('<' + '$' + '{Button}', btnAt), btnAt)
+    assert.ok(btn.includes('setCancelAsk(r.id)') && !btn.includes('doCancel('),
+      '停止按钮必须先置待确认态，不得一键直发 doCancel/apiCancelRun')
+    // 确认弹窗：与 C7-001 同口径受当前页门控，且只有确认才真的发。
+    assert.ok(seg.includes(attrOpen('cancelAsk !== null && active')),
+      '停止确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    const dlgAt = seg.indexOf('<' + '$' + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '应能定位停止确认弹窗')
+    const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('doCancel(id)'), '确认后才调 doCancel')
+    assert.ok(dlg.includes('不能撤销') && dlg.includes('重复到达'),
+      '后果（不可撤销 / 下轮重推）必须写在弹窗正文里，不能只留在 title')
+    // 切页收口：离开当前页清掉待确认，回到本页不得再弹一次。
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && seg.slice(guardAt, guardAt + 80).includes('setCancelAsk(null)'),
+      '离开当前页必须清掉待确认（只 dialog.close() 会留下卡死的 cancelAsk）')
+  })
+
+  await aok('结构红线: C7-012 未点开的日志页签不预取 1 MiB（首访零预取契约）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function LogsPanel')
+    const end = src.indexOf('function SysPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 LogsPanel')
+    const seg = src.slice(at, end)
+    // 冷启动时日志尾部可能满 1 MiB：隐藏页签里拉下来再整串 split/计数都是白付的。
+    const guardAt = seg.indexOf('if (!active && !preloadedRef.current) {')
+    assert.ok(guardAt > -1, '日志首挂（尚未点开）必须先短路，不得直接拉 1 MiB')
+    const guard = seg.slice(guardAt, seg.indexOf('if (!active && preloadedRef.current) return undefined', guardAt))
+    assert.ok(guard.includes('preloadedRef.current = true') && guard.includes('return undefined'),
+      '首挂只登记「首访已挂载」，不发请求')
+    assert.ok(!guard.includes('load('), '隐藏页签不得发日志请求（首屏零预取）')
+    // 懒加载不是不加载：第一次点开必须仍走 firstReveal 的补拉，否则日志页永远空白。
+    assert.ok(seg.includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
+      '第一次点开仍要走 firstReveal 补拉')
+    assert.ok(seg.slice(guardAt).includes('if (stale) load(true).catch'),
+      '首次点开且手里没有新鲜快照时必须真的发一发')
+  })
+
+  await aok('结构红线: C7-014 列表 FLIP 带 deps（不再每次渲染都量布局 / 重播入场）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function MessagesPanel')
+    const end = src.indexOf('function LogsPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 MessagesPanel')
+    const seg = src.slice(at, end)
+    // 省略 deps = useLayoutEffect(fn) 每次渲染都跑：对整页卡片各量一次 getBoundingClientRect，
+    // 且新 key 一律 enter() 重播入场（输入防抖/抽屉开关/慢标志都会触发）。
+    assert.ok(/useFlipList\(motionRef, \[data\]\)/.test(seg),
+      'useFlipList 必须传 deps（省略 = 每次渲染都强制读布局并重播入场）')
+    const motion = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'motion.js'), 'utf8')
+    const flipAt = motion.indexOf('export function useFlipList')
+    assert.ok(flipAt > -1, '应能定位 useFlipList')
+    const flip = motion.slice(flipAt, motion.indexOf('\n}\n', flipAt))
+    assert.ok(/\}, deps\)/.test(flip), 'deps 必须真的交给 useLayoutEffect 的依赖数组')
+  })
+
+  await aok('C7-015 「新条数」口径统一（0 基线 / 严格大于 / 三处接线）', async () => {
+    const { isNewerThan } = await import('./scripts/console-assets/pure.mjs')
+    // 旧实现：检查更新把 lastReadAt=0 兜底成 Date.now()（⇒ 一律 0 条新），角标却按 0 算
+    // （⇒ 全部标「新」）。同一个词因此能同时显示两种结论；比较符也一处 >、一处 >=。
+    assert.strictEqual(isNewerThan(1000, 0), true, '从未读过（基线 0）⇒ 全部算新')
+    assert.strictEqual(isNewerThan(1000, 1000), false, '等于已读锚点的那条不再算新')
+    assert.strictEqual(isNewerThan(1001, 1000), true)
+    assert.strictEqual(isNewerThan(999, 1000), false)
+    assert.strictEqual(isNewerThan(0, 0), false, '没有时间戳的条目不算新')
+    assert.strictEqual(isNewerThan(undefined, 0), false)
+    assert.strictEqual(isNewerThan(Number.NaN, 1000), false)
+    const src = readConsoleSource()
+    const at = src.indexOf('function SearchPanel ')
+    const end = src.indexOf('function LogsPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 SearchPanel')
+    const seg = src.slice(at, end)
+    assert.ok((seg.match(/isNewerThan\(/g) || []).length >= 2,
+      '关注词角标与检查更新都必须走同一个比较（两处接线）')
+    assert.ok(!/it\.ts > (?:since|req\.since)/.test(seg), '不得再留裸 ts > since 的第二套口径')
+    assert.ok(!/w\.lastReadAt > 0 \? w\.lastReadAt : Date\.now\(\)/.test(seg),
+      '0 基线不得再被 Date.now() 兜底（那正是「角标 N 条新 / 检查 0 条新」的来源）')
+  })
+
+  await aok('结构红线: C7-018 逐轮历史切档落点等目标数据（不拿旧档列表抢落点）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function RunHistoryPanel')
+    const end = src.indexOf('// ── 组件：整体', at)
+    assert.ok(at > -1 && end > at, '应能定位 RunHistoryPanel')
+    const seg = src.slice(at, end)
+    const effectAt = seg.indexOf('useLayoutEffect(() => {')
+    const effect = seg.slice(effectAt, seg.indexOf('}, [data', effectAt))
+    assert.ok(effectAt > -1 && effect.length > 0, '应能定位落点 effect')
+    // 改页码是同步的；「切档」在没命中快照时要先 fetchSnap。没有这两道门时，轮询/切档
+    // 响应谁先到谁消费旗子：旧档列表先落一次点，真正换好的数据回来时旗子已经没了。
+    assert.ok(effect.includes('if (loading) return'), '加载在飞时必须保留旗子（数据还没落地）')
+    assert.ok(effect.includes('if (pendingMode !== null) return'),
+      '切档目标数据未落地时必须保留旗子（否则拿旧档列表抢落点）')
+    assert.ok(effect.indexOf('if (pendingMode !== null) return') < effect.indexOf('landRef.current = false'),
+      '守卫必须在消费之前：提前清旗会丢掉真正落地时的那次落点')
+    assert.ok(effect.indexOf('landRef.current = false') < effect.indexOf('if (y === null) return'),
+      '消费即清旗：返回 null 不重试')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')
