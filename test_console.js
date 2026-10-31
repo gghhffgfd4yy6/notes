@@ -11494,7 +11494,9 @@ async function main () {
     // id 不得额外领号：titleId 的形态被既有用例逐字钉住，bodyId 复用同一序号。
     assert.ok(/const \[bodyId\] = useState\(\(\) => `confirm-body-\$\{dialogSeq\}`\)/.test(seg),
       'body id 必须每实例唯一，且不额外消耗 dialogSeq（否则标题 id 与正文 id 序号错开）')
-    assert.ok(seg.includes('aria-labelledby=${titleId} aria-describedby=${bodyId}'),
+    // 模板占位符拼出来再比对（直接写 ${...} 会触发 no-template-curly-in-string）
+    const at = (name) => '$' + '{' + name + '}'
+    assert.ok(seg.includes('aria-labelledby=' + at('titleId') + ' aria-describedby=' + at('bodyId')),
       '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
   })
 
