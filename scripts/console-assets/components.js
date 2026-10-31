@@ -8,7 +8,7 @@ import flatpickr from './flatpickr.js'
 // 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
 import { MOTION, useMorphDialog, useMountReveal, useRevealWhen } from './motion.js'
-import { TZ_LABEL } from './constants.js'
+import { SHANGHAI_OFFSET_MS, TZ_LABEL } from './constants.js'
 import { fmtClock, fmtDuration, fmtLocalTime, fmtNum } from './format.js'
 import { DAY_KEY_RE, apiGetConfig, trigger, triggerNotifyTest } from './api.js'
 
@@ -58,7 +58,7 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
 // 星期几也只按北京时间取：本地 getDay() 在北京时间跨零点时会差一天，和上面的时间对不上。
 function fmtWeekday (ts) {
   if (!ts) return ''
-  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + SHANGHAI_OFFSET_MS).getUTCDay()]
 }
 
 // 两个弹层共用：computePosition 的结果直写 DOM。不走 vdom 的 style 属性——控制台每 500ms
@@ -417,7 +417,7 @@ const EMPTY_RANGE = { from: '', to: '' }
 
 // 上海日历日（与 run.log / 服务端同口径）：按钮文案按它判断「是不是今年」。
 function todayKeyShanghai () {
-  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
+  return new Date(Date.now() + SHANGHAI_OFFSET_MS).toISOString().slice(0, 10)
 }
 
 function fmtDayKey (d) {

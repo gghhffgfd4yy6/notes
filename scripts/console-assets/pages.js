@@ -2,7 +2,7 @@
 // 运行历史 / 逐轮历史 / 趋势 / 缓存健康 / 推送记录 / 运行日志 / 控制台设置 / 备份 / 两步验证 /
 // 系统 / 文件 / 配置 / 过滤规则。只依赖 components.js 与基础模块，不认识 App，也没有顶层副作用。
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
-import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT_URL_REVOKE_MS, PANEL_FRESH_MS, SAVED_HINT_MS, SNAP_INFLIGHT_MS, VERSION_TIP_MS } from './constants.js'
+import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT_URL_REVOKE_MS, PANEL_FRESH_MS, SAVED_HINT_MS, SHANGHAI_OFFSET_MS, SNAP_INFLIGHT_MS, VERSION_TIP_MS } from './constants.js'
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
@@ -2139,7 +2139,7 @@ function buildSearchHash ({ q, page }) {
 }
 
 function watchAtText (ts) {
-  return new Date(ts + 8 * 3600 * 1000).toISOString().slice(5, 16).replace('T', ' ')
+  return new Date(ts + SHANGHAI_OFFSET_MS).toISOString().slice(5, 16).replace('T', ' ')
 }
 
 function SearchPanel ({ onSync, active = true }) {

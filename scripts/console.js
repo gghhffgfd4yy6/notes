@@ -126,6 +126,11 @@ const RUNS_KEEP_MAX = 20
 const BODY_DEFAULT_MAX_BYTES = 4096
 const BODY_LOGIN_FORM_MAX_BYTES = 2048
 const BODY_BACKUP_EXPORT_MAX_BYTES = 16 * 1024
+// 世界时 → 上海时间的固定偏移（C2-021）：中国无夏令时，UTC+8 即 Asia/Shanghai。需要按
+// 「北京日历日/时分」做**算术**的地方一律走这个常量，不要再手写「+8 小时」的毫秒数——多写一处
+// 就多一个漏改点（导出文件名、run.log 时间戳解析、趋势日窗三处曾各写一份，还混着 8*60*60 变体）。
+// 展示字符串仍走 xbk_utils.shanghaiStamp（Intl + ICU 兜底），两者语义同一时区。
+const SHANGHAI_OFFSET_MS = 8 * 3600 * 1000
 // 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
 // LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
 const LOG_VIEW_MAX_BYTES = 1024 * 1024
@@ -953,7 +958,7 @@ function exportStamp (now = new Date()) {
   // 不再切 accessStamp 的字符串：它 ICU 异常时兜底 ISO（UTC），照切会把 UTC 时分标成北京时间
   // （Sourcery #315-8）。中国无夏令时，直接 +8 与 Asia/Shanghai 等价。
   // 精确到秒：同一分钟内连导两次不会撞名、后一次不会覆盖前一次（Sourcery #315-7）。
-  const t = (now instanceof Date ? now.getTime() : Date.now()) + 8 * 3600 * 1000
+  const t = (now instanceof Date ? now.getTime() : Date.now()) + SHANGHAI_OFFSET_MS
   const d = new Date(t)
   const p2 = (n) => String(n).padStart(2, '0')
   return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}-${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}`
@@ -2565,7 +2570,7 @@ function decodeLineHtml (raw) {
 function parseLineStamp (stamp) {
   const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(typeof stamp === 'string' ? stamp : '')
   if (!m) return null
-  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - 8 * 60 * 60 * 1000
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - SHANGHAI_OFFSET_MS
   return Number.isFinite(ms) ? ms : null
 }
 
@@ -2825,7 +2830,7 @@ function filterMessageItems (items, cate, needle) {
 // datetime 缺失/非法的条目在时间窗模式下不展示（无法证明它属于窗口，不猜）。
 function filterMessagesByDays (items, days, now = Date.now()) {
   if (!(Number.isSafeInteger(days) && days > 0)) return items
-  const offsetMs = 8 * 3600 * 1000
+  const offsetMs = SHANGHAI_OFFSET_MS
   const todayKey = new Date(now + offsetMs).toISOString().slice(0, 10)
   const startKey = new Date(now - (days - 1) * 86400000 + offsetMs).toISOString().slice(0, 10)
   return items.filter((m) => {
