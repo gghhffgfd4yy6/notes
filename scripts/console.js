@@ -2959,12 +2959,14 @@ function statSafeMeta (p) {
   try {
     fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0))
     const st = fs.fstatSync(fd)
-    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null }
-    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs) }
+    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+    // ino 供 tombstoneCounts 的 (ino,size,mtimeMs) 缓存识别「同一份文件」：仅靠 size+mtime
+    // 抓不到同毫秒同大小的原子替换（inode 会变）。
+    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs), ino: st.ino }
   } catch (e) {
-    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null }
-    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null }
-    return { status: 'ioError', size: null, mtimeMs: null }
+    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null, ino: null }
+    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+    return { status: 'ioError', size: null, mtimeMs: null, ino: null }
   } finally {
     if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
   }
@@ -2981,12 +2983,34 @@ function statSafeMeta (p) {
 // 残余边界（登记）：meta 过闸后、read 开打前纳米级窗口内被换成 FIFO 仍会阻塞——该原语
 // （readSafeTextResult）被全部读取端点共用，在其内部加 O_NONBLOCK 属跨切面改动（影响 F1
 // 恢复链与既有变异基线），不在本 PR 范围；观测面已被 meta 闸收窄到「替换竞态」。
+// 墓碑计数缓存（C2-019）：/api/cache-health 每拍都会算一次墓碑计数，而墓碑文件上限 8MiB、
+// 整读 + JSON.parse 全压在 HTTP 事件循环上。墓碑只在裁剪/淘汰时整份原子替换，
+// (ino,size,mtimeMs) 三元组足以识别「同一份文件」；叠 60s TTL 兜底（同 status.readMessages 的
+// D2-S18 口径）。mtime 太新（<100ms）的文件不进缓存——写后立刻读必须看到新内容。
+// 只缓存 status==='ok'：unsafe/invalid/missing 是「此刻的状态」，缓存它们会把一次原子替换/
+// 人工修复挡在 TTL 之外。缓存值是不可变结果对象，调用方只读。
+const TOMBSTONE_CACHE_TTL_MS = 60 * 1000
+const TOMBSTONE_CACHE_MIN_AGE_MS = 100
+const TOMBSTONE_CACHE_MAX = 4
+const tombstoneCache = new Map()
+
+function tombstoneSignature (meta) {
+  if (!meta || meta.status !== 'ok') return null
+  if (Date.now() - meta.mtimeMs < TOMBSTONE_CACHE_MIN_AGE_MS) return null
+  return `${meta.ino}:${meta.size}:${meta.mtimeMs}`
+}
+
 function tombstoneCounts (stateDir, messagesFile) {
   const p = path.join(stateDir, `${messagesFile}.seen.json`)
   const counts = { id: 0, urlOnly: 0, idWithUrl: 0, anon: 0, total: 0 }
   const meta = statSafeMeta(p)
   if (meta.status === 'unsafe' || meta.status === 'ioError') {
     return { status: meta.status, bytes: null, counts }
+  }
+  const sig = tombstoneSignature(meta)
+  if (sig) {
+    const hit = tombstoneCache.get(p)
+    if (hit && hit.sig === sig && Date.now() - hit.at < TOMBSTONE_CACHE_TTL_MS) return hit.value
   }
   // FIFO TOCTOU（Sourcery High）：meta 闸与读之间路径可被换成 FIFO——readSafeTextResult
   // 开 openNonBlocking，open 立即返回（普通文件不变，FIFO→unsafe），绝不阻塞等写者。
@@ -3011,7 +3035,13 @@ function tombstoneCounts (stateDir, messagesFile) {
   } catch (e) {
     return { status: 'invalid', bytes, counts }
   }
-  return { status: 'ok', bytes, counts }
+  const value = { status: 'ok', bytes, counts }
+  if (sig) {
+    tombstoneCache.delete(p)
+    tombstoneCache.set(p, { sig, at: Date.now(), value })
+    while (tombstoneCache.size > TOMBSTONE_CACHE_MAX) tombstoneCache.delete(tombstoneCache.keys().next().value)
+  }
+  return value
 }
 
 // 缓存健康快照（GET /api/cache-health）：push.json 字节占用对照两级上限（生产写端 64MiB /

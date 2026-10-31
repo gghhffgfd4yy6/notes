@@ -7122,6 +7122,28 @@ async function main () {
       assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
     }
   })
+  await aok('只读纯函数: tombstoneCounts 的 (ino,size,mtimeMs) 缓存（同文件复用、mtime 变化必重算）', () => {
+    const dir = tmpDir()
+    const p = path.join(dir, 'push.json.seen.json')
+    // 两份**等长**的墓碑：total 分别为 1 与 0（等长才能只靠 ino/size/mtime 判定「同一份文件」）
+    const withKey = '{"v":1,"id":["ab"],"pad":""}'
+    const withoutKey = '{"v":1,"id":[""],"pad":"xx"}'
+    assert.strictEqual(Buffer.byteLength(withKey), Buffer.byteLength(withoutKey), '夹具必须等长')
+    fs.writeFileSync(p, withKey)
+    const old = new Date(Date.now() - 10 * 60 * 1000)
+    fs.utimesSync(p, old, old) // mtime 够旧才进缓存（<100ms 的文件不缓存）
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').counts.total, 1, '首次必须读到真实内容')
+    // 原地改写（不换 inode）+ 把 mtime 拨回原值：三元组完全相同 ⇒ 必须命中缓存
+    fs.writeFileSync(p, withoutKey)
+    fs.utimesSync(p, old, old)
+    const cached = tombstoneCounts(dir, 'push.json')
+    assert.strictEqual(cached.counts.total, 1, '同 (ino,size,mtime) 必须复用缓存结果，不再整读整解')
+    assert.strictEqual(cached.bytes, Buffer.byteLength(withKey), '缓存命中的 bytes 与计数同源（同一份快照）')
+    // mtime 一变（原子替换 / 裁剪的等价信号）⇒ 必须重算，缓存不得掩盖墓碑变化
+    const newer = new Date(Date.now() - 5 * 60 * 1000)
+    fs.utimesSync(p, newer, newer)
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').counts.total, 0, 'mtime 变化必须重算')
+  })
   await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
     const { readSafeTextResult } = require('./xbk_storage')
     const dir = tmpDir()
