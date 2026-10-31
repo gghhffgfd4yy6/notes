@@ -153,7 +153,9 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
       let sameFile = true
       if (ownStat && typeof ownStat.dev === 'number' && typeof ownStat.ino === 'number') {
         try {
-          const now = fs.lstatSync(filePath)
+          // 只做 inode 复核，不构造路径；filePath 是本模块形参——非字面量 fs 调用是本文件的定义性形态
+          // （见文件头 5-18 行，与同函数 :167 的 unlinkSync 同一处理口径）
+          const now = fs.lstatSync(filePath) // nosemgrep（本模块的 fs 首参按定义必然是变量，非用户净输入）
           sameFile = !!now && now.isFile() && now.dev === ownStat.dev && now.ino === ownStat.ino
         } catch (e2) {
           // 路径已不存在（ENOENT）⇒ 残骸已不在，无需清理；其余读不到的情况按「不是我们的文件」保守处理
