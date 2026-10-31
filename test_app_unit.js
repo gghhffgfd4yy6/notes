@@ -3290,9 +3290,14 @@ checkAsync('C1-029 明细被预算挤掉必须留痕：detailsDropped 分类计�
     assert.deepStrictEqual(run4.detailsDropped, { passed: 0, filtered: 2 },
       `只看它分支被预算挤掉的屏蔽项必须如实计数（落进 passed 也算错）：${JSON.stringify(run4)}`)
     // 被挤掉条数必须是「没写进明细的决策」的一个划分：同一条在④按通过记、到⑤被拒又按屏蔽记，
-    // 会报出 4 条被挤掉（实际只有 2 条）——这里用总数守恒把重复计数也一并锁住。
+    // 会报出 4 条被挤掉（实际只有 2 条）——本夹具（预算 1；⑤ 拒掉的两条在④已被预算挤掉、只走
+    // passed--/filtered++ 改记）用总数守恒把这种重复计数锁住。
+    // 注意：这不是普适恒等式（CHANGELOG v3.388 已如实登记）。④ 已记过 passed 明细的条目若被⑤拒掉，
+    // 同一条目会留下两条记录——预算还有余位 ⇒ passed + filtered 两条明细；预算此时已满 ⇒ 一条明细
+    // 再加一条 filtered 被挤掉。两种都会让 detailCount + 被挤掉比参与决策的条数多 1；改⑤属于另一件事，
+    // 故本断言只锁「预算已满、走改记」这条实际覆盖的路径，断言值（3 = 本夹具参与的 3 条）也不外推。
     assert.strictEqual(run4.detailCount + run4.detailsDropped.passed + run4.detailsDropped.filtered, 3,
-      `明细 + 被挤掉必须等于本轮参与决策的条数（3），不得重复计数：${JSON.stringify(run4)}`)
+      `本夹具（预算已满、走⑤改记分支）：明细 + 被挤掉必须等于 3 条参与决策，不得重复计数：${JSON.stringify(run4)}`)
   })
 })
 
