@@ -1033,7 +1033,6 @@ check('C3-005 隔离备份保留上限：每缓存文件最多 10 份、最旧�
   }
 })
 
-
 // ===== C3-008：墓碑 0 字节 / 损坏不得被当成「空集」静默吞掉 =====
 // 旧实现：0 字节走 `!result.text` 直接 return null（status 仍是 ok）、损坏走 JSON.parse 异常，
 // 两条出口都不置位 _tombstoneLoaded ⇒ 每条消息重读一次整份墓碑（上限 8MiB）+ 每条一条 WARN；
@@ -1080,7 +1079,6 @@ check('C3-008 墓碑 0 字节：按 empty 置位、不产生 .bak、只读一次
   assert.deepStrictEqual(h.fs.ops.rename, [], '0 字节没有任何字节可隔离 ⇒ 不得产生备份')
   assert.strictEqual(warns.filter(w => w.includes('0 字节')).length, 1, `0 字节只应告警一次：${JSON.stringify(warns)}`)
 })
-
 
 check('_memoSet: 非字符串键必须 String 化后落键（Symbol 键也要可枚举、可参与淘汰）', () => {
   const s = createProbeStore()

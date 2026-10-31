@@ -237,7 +237,7 @@ const {
     throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
   }
   let c3006Ret
-  let c3006Warns = []
+  const c3006Warns = []
   const origWarnC3006 = console.warn
   console.warn = (...args) => { c3006Warns.push(args.map(String).join(' ')) }
   try { c3006Ret = writeAtomicIfAbsent(c3006, '[]') } finally {
