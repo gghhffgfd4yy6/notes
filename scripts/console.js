@@ -2164,6 +2164,69 @@ function rollbackFilterOverride (paths, previousText) {
   }
 }
 
+// C2-010：保存（POST /api/config/filter）、回滚（/restore）、导入（/api/backup/import）三处
+// 各写了一遍「备份当前覆盖文件 → 原子写新一代 → 合并生效 → 追加审计 → 审计失败回滚」。
+// 三份只差 action / 写入 label / 失败后由谁收尾，改一处必漏两处。收成一份：
+//   返回 { ok:true, revision, changedFields, hash } 或 { ok:false, status, body }（body 可直接下发）。
+//   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
+//   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
+//   computeHash=false 给导入用：它不返回 hash，也就不必为拿摘要去懒加载规则引擎。
+function commitFilterOverride ({
+  paths, deps, defaults, loaded, filterValue, action, actorToken,
+  writeLabel = '过滤规则覆盖文件', computeHash = true, rollbackOnAuditFailure = true
+}) {
+  const curRevision = loaded.source === 'corrupt' ? 0 : loaded.revision
+  // 改文件前先备份当前这一代：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
+  // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
+  let previousText = null
+  if (loaded.source === 'override' || loaded.source === 'corrupt') {
+    const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+    if (raw.status === 'ok') previousText = raw.text
+    // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
+    if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+      return { ok: false, status: 500, body: { error: 'backup_failed', code: 'backup_failed' } }
+    }
+  }
+  const nextRevision = curRevision + 1
+  const nextFile = {
+    schema: FilterStore.FILTER_RULES_SCHEMA,
+    revision: nextRevision,
+    filter: filterValue
+  }
+  if (!writeAtomic(paths.file, JSON.stringify(nextFile), writeLabel)) {
+    return { ok: false, status: 500, body: { error: 'write_failed', code: 'write_failed' } }
+  }
+  const nextActive = FilterStore.mergeActiveFilter({
+    defaults: defaults.filter,
+    keyword: defaults.keyword,
+    override: filterValue
+  })
+  const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
+  const hash = computeHash ? filterHashOf(deps, nextActive.filter, nextActive.keyword) : null
+  const audit = appendFilterAudit({
+    auditPath: paths.audit,
+    actor: actorOf(actorToken),
+    action,
+    revision: nextRevision,
+    changedFields
+  })
+  if (!audit.ok) {
+    // 审计不落地 ⇒ 本次写入整体作废，绝不报成功。
+    if (!rollbackOnAuditFailure) {
+      return { ok: false, status: 500, body: { error: audit.code, code: audit.code } }
+    }
+    const rolled = rollbackFilterOverride(paths, previousText)
+    return {
+      ok: false,
+      status: 500,
+      body: { error: audit.code, code: audit.code, rolledBack: rolled.ok, rollbackMode: rolled.mode }
+    }
+  }
+  // 剪枝只在整个提交（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
+  pruneFilterBackups(paths)
+  return { ok: true, revision: nextRevision, changedFields, hash }
+}
+
 // 字段级 diff：只报字段名（顺序与 FILTER_RULE_FIELDS 一致），值绝不入响应/日志。
 function diffFilterFields (before, after) {
   const out = []
@@ -4530,49 +4593,28 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           imported.runLogBytes = Buffer.byteLength(plans.runLog.text, 'utf8')
         }
         // 过滤规则放最后：审计是它的提交点，审计失败时前面几类统一回滚，避免
-        // 「文件恢复了一半、审计没记录」的中间态。
+        // 「文件恢复了一半、审计没记录」的中间态。C2-010：与保存/回滚共用提交链，
+        // 但收尾交给 abortImport 的多文件回滚（rollbackOnAuditFailure:false）。
         if (plans.filter) {
           const loaded = loadCurrentFilter()
-          const current = loaded.source === 'corrupt' ? 0 : loaded.revision
-          let previousText = null
-          if (loaded.source === 'override' || loaded.source === 'corrupt') {
-            const raw = readSafeTextResult(filterPaths.file, FILTER_BODY_MAX_BYTES)
-            if (raw.status === 'ok') previousText = raw.text
-            if (loaded.source === 'override' && !backupFilterFile(filterPaths, current, previousText)) {
-              abortImport('filter', 500, { error: 'backup_failed', code: 'backup_failed' })
-              return
-            }
-          }
-          const nextFile = {
-            schema: FilterStore.FILTER_RULES_SCHEMA,
-            revision: current + 1,
-            filter: plans.filter.result.value
-          }
-          if (!writeAtomic(filterPaths.file, JSON.stringify(nextFile), '过滤规则恢复')) {
-            abortImport('filter', 500, { error: 'write_failed', code: 'write_failed' })
-            return
-          }
-          const defaults = filterDefaults()
-          const nextActive = FilterStore.mergeActiveFilter({
-            defaults: defaults.filter,
-            keyword: defaults.keyword,
-            override: plans.filter.result.value
-          })
-          const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-          const audit = appendFilterAudit({
-            auditPath: filterPaths.audit,
-            actor: actorOf(token),
+          const committed = commitFilterOverride({
+            paths: filterPaths,
+            deps: null,
+            defaults: filterDefaults(),
+            loaded,
+            filterValue: plans.filter.result.value,
             action: 'import',
-            revision: nextFile.revision,
-            changedFields
+            actorToken: token,
+            writeLabel: '过滤规则恢复',
+            computeHash: false,
+            rollbackOnAuditFailure: false
           })
-          if (!audit.ok) {
-            abortImport('filter', 500, { error: audit.code, code: audit.code })
+          if (!committed.ok) {
+            abortImport('filter', committed.status, { error: committed.body.error, code: committed.body.code })
             return
           }
-          pruneFilterBackups(filterPaths)
           imported.filter = true
-          imported.filterRevision = nextFile.revision
+          imported.filterRevision = committed.revision
         }
         // 所有文件都成功后才删草稿：中途失败时草稿仍是导入前那份，便于继续编辑。
         if (plans.filter) clearFilterDraftFile()
@@ -4684,62 +4726,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 保存前快照：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
-        // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
-        let previousText = null
-        if (loaded.source === 'override' || corrupt) {
-          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') previousText = raw.text
-          // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
-          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
-            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
-            return
-          }
-        }
-        const nextRevision = curRevision + 1
-        const nextFile = {
-          schema: FilterStore.FILTER_RULES_SCHEMA,
-          revision: nextRevision,
-          filter: result.value
-        }
-        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
-          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-          return
-        }
-        const nextActive = FilterStore.mergeActiveFilter({
-          defaults: defaults.filter,
-          keyword: defaults.keyword,
-          override: result.value
+        // C2-010：备份→原子写→合并生效→审计→失败回滚 统一走 commitFilterOverride。
+        const committed = commitFilterOverride({
+          paths, deps, defaults, loaded, filterValue: result.value, action: 'save', actorToken
         })
-        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        const audit = appendFilterAudit({
-          auditPath: paths.audit,
-          actor: actorOf(actorToken),
-          action: 'save',
-          revision: nextRevision,
-          changedFields
-        })
-        if (!audit.ok) {
-          // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
-          const rolled = rollbackFilterOverride(paths, previousText)
-          sendJson(res, 500, {
-            error: audit.code,
-            code: audit.code,
-            rolledBack: rolled.ok,
-            rollbackMode: rolled.mode
-          })
-          return
-        }
-        // 剪枝只在整个保存（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
-        pruneFilterBackups(paths)
+        if (!committed.ok) { sendJson(res, committed.status, committed.body); return }
         // 正式保存成功：没保存的草稿已经失去意义，删掉避免下次误恢复。
         clearFilterDraftFile()
         sendJson(res, 200, {
           ok: true,
-          revision: nextRevision,
-          changedFields,
-          hash,
+          revision: committed.revision,
+          changedFields: committed.changedFields,
+          hash: committed.hash,
           appliedHint: '下一轮生效'
         })
       } finally {
@@ -4946,62 +4944,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 改文件前先备份当前配置：被替换的这一代必须仍能从备份列表回滚回来。
-        let previousText = null
-        if (loaded.source === 'override' || loaded.source === 'corrupt') {
-          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') previousText = raw.text
-          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
-            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
-            return
-          }
-        }
-        const nextRevision = curRevision + 1
-        const nextFile = {
-          schema: FilterStore.FILTER_RULES_SCHEMA,
-          revision: nextRevision,
-          filter: toDefault ? {} : restoredFilter
-        }
-        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
-          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-          return
-        }
-        const nextActive = toDefault
-          ? FilterStore.mergeActiveFilter({ defaults: defaults.filter, keyword: defaults.keyword })
-          : FilterStore.mergeActiveFilter({
-            defaults: defaults.filter,
-            keyword: defaults.keyword,
-            override: restoredFilter
-          })
-        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        const audit = appendFilterAudit({
-          auditPath: paths.audit,
-          actor: actorOf(actorToken),
+        // C2-010：与保存/导入共用同一条提交链。
+        const committed = commitFilterOverride({
+          paths,
+          deps,
+          defaults,
+          loaded,
+          filterValue: toDefault ? {} : restoredFilter,
           action: toDefault ? 'reset_default' : 'restore',
-          revision: nextRevision,
-          changedFields
+          actorToken
         })
-        if (!audit.ok) {
-          const rolled = rollbackFilterOverride(paths, previousText)
-          sendJson(res, 500, {
-            error: audit.code,
-            code: audit.code,
-            rolledBack: rolled.ok,
-            rollbackMode: rolled.mode
-          })
-          return
-        }
-        // 剪枝只在整个回滚（含审计）成功后才执行。
-        pruneFilterBackups(paths)
+        if (!committed.ok) { sendJson(res, committed.status, committed.body); return }
         // 回滚/恢复默认也是一次正式写入，草稿随之作废。
         clearFilterDraftFile()
         const payload = {
           ok: true,
-          revision: nextRevision,
+          revision: committed.revision,
           restoredFrom: toDefault ? 'default' : to,
-          changedFields
+          changedFields: committed.changedFields
         }
-        if (!toDefault) payload.hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
+        if (!toDefault) payload.hash = committed.hash
         sendJson(res, 200, payload)
       } finally {
         releaseFilterLock(lock)
