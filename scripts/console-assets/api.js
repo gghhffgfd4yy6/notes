@@ -116,19 +116,31 @@ function timedRequest (opts, timeoutMs = FETCH_TIMEOUT_MS) {
 // 命中 If-None-Match 时回 304 空体——前端复用上一份 data，省掉重复 body。
 // 只存内存（刷新即空），不落 localStorage；凭证不进这个 Map。
 // 有界（Sourcery PR #321）：messages 的缓存键含筛选/分页，键空间无上限——留 16 条
-// 覆盖「当前视图 + 来回切几个筛选 + 趋势/历史/配置/缓存健康各一份」，超出按插入序
-// 淘汰（Map 保序，最老的先走）。v3.373：8→16，因为条件请求从 3 个端点扩到 7 个。
+// 覆盖「当前视图 + 来回切几个筛选 + 趋势/历史/配置/缓存健康各一份」，超出按**最近使用**
+// 淘汰。v3.373：8→16，因为条件请求从 3 个端点扩到 7 个。
+// C7-030：旧实现只在写入时 Map.set，读取从不改顺序 ⇒ 淘汰退化成 FIFO：冷启动第一批
+// 放进去的 runs / config（页签保活后一直在用）反而最先被淘汰，而每次翻页都新建的
+// messages 分页键把它们挤出去。命中即挪到队尾（touchConditional），写回也算一次使用。
 const COND_CACHE = new Map()
 const COND_CACHE_MAX = 16
+function touchConditional (key) {
+  const hit = COND_CACHE.get(key)
+  if (!hit) return null
+  // Map 的插入序就是淘汰序：删掉再插 = 挪到队尾（不复制对象，tag/data 仍是同一份）。
+  COND_CACHE.delete(key)
+  COND_CACHE.set(key, hit)
+  return hit
+}
 function rememberConditional (key, entry) {
-  if (COND_CACHE.size >= COND_CACHE_MAX && !COND_CACHE.has(key)) {
+  if (COND_CACHE.has(key)) COND_CACHE.delete(key) // 覆盖同样是「刚用过」：先删再插
+  else if (COND_CACHE.size >= COND_CACHE_MAX) {
     const oldest = COND_CACHE.keys().next()
     if (!oldest.done) COND_CACHE.delete(oldest.value)
   }
   COND_CACHE.set(key, entry)
 }
 function addConditional (merged, key) {
-  const hit = COND_CACHE.get(key)
+  const hit = touchConditional(key)
   if (!hit || !hit.tag) return null
   merged.headers = { ...merged.headers, 'If-None-Match': hit.tag }
   // 把「这次请求发出去的是哪个 tag」交回调用方：304 到达时要用它核对缓存条还是不是
@@ -153,7 +165,8 @@ async function consumeJson (p, condKey, retry, sentTag) {
   }
   if (res.status === 304) {
     // 304 无 body：直接复用条件缓存里的上一份（服务端已确认内容未变）。
-    const hit = condKey ? COND_CACHE.get(condKey) : null
+    // 命中也是「用过这一条」（C7-030）：走 touchConditional 挪到队尾，别让热键被淘汰。
+    const hit = condKey ? touchConditional(condKey) : null
     // 只有缓存条仍是我们发出去的那个 tag 才复用它；被别的并发响应换掉时必须重取，
     // 否则会把 T2 的快照当成 T1 的 304 结果（配置/趋势/历史短暂显示错数据）。
     if (hit && (!sentTag || hit.tag === sentTag)) return hit.data

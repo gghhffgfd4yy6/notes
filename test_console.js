@@ -11497,6 +11497,32 @@ async function main () {
     assert.ok(seg.includes('aria-labelledby=${titleId} aria-describedby=${bodyId}'),
       '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
   })
+
+  await aok('行为: C7-030 条件缓存按最近使用淘汰（热键 runs/config 不得被新分页键挤掉）', () => {
+    // 直接跑 api.js 里**真实**的缓存策略（切片自源码，不是本用例自写的副本）：
+    // Map 的插入序在这里就是淘汰序，所以「命中是否挪到队尾」能被行为断言抓住。
+    const vm = require('node:vm')
+    const api = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const seg = sliceBetween(api, 'const COND_CACHE = new Map()', 'function addConditional', '条件缓存块')
+    const box = vm.runInNewContext(`(() => { ${seg}; return { COND_CACHE, COND_CACHE_MAX, rememberConditional, touchConditional } })()`, {})
+    assert.strictEqual(box.COND_CACHE_MAX, 16, '缓存上限仍是 16（v3.373 扩到 7 个端点后的口径，不得悄悄改）')
+    // 冷启动：runs / config 先落，后面 14 条分页键把缓存填满到 16。
+    box.rememberConditional('runs', { tag: 't-runs', data: 1 })
+    box.rememberConditional('config', { tag: 't-config', data: 2 })
+    for (let i = 0; i < 14; i++) box.rememberConditional('messages?page=' + i, { tag: 't' + i, data: i })
+    assert.strictEqual(box.COND_CACHE.size, 16)
+    // 翻回第 1 页（读路径命中）⇒ 该键变成「刚用过」；runs 仍是 FIFO 里最老的。
+    assert.ok(box.touchConditional('messages?page=1'), '命中必须返回缓存条（否则 304 会退化成重取）')
+    assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['messages?page=1'], '命中后必须挪到队尾')
+    // 再写一条新的：被淘汰的必须是「真正最久没用过」的 runs，而不是刚用过的 page=1。
+    box.rememberConditional('messages?page=99', { tag: 't99', data: 99 })
+    assert.strictEqual(box.COND_CACHE.has('runs'), false, 'runs 已是最久没用过的键，必须先被淘汰')
+    assert.strictEqual(box.COND_CACHE.has('messages?page=1'), true, '刚命中过的键不得被淘汰（FIFO 会把它当成「第 2 老的」）')
+    // 写回同一键也算一次使用：覆盖后仍在队尾，不因原位置靠前而先出局。
+    box.rememberConditional('config', { tag: 't-config-2', data: 22 })
+    assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['config'], '覆盖写回必须挪到队尾')
+    assert.strictEqual(box.touchConditional('nope'), null, '未命中返回 null（交给调用方按无条件请求发）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
