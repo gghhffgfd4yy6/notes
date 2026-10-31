@@ -403,6 +403,9 @@ const LIMIT = 1024 * 1024
 
 function makeLogFs (over = {}) {
   const rec = { append: [], open: [], write: [], read: [], close: [], unlink: [], stat: [] }
+  // C1-020：锁文件的真实内容（writeSync 写进去的 pid:start 令牌）。释放路径要靠读回它来证明
+  // 「锁仍是本进程的」——桩不模拟这一点，令牌校验就永远不会被这些既有用例执行到。
+  let lockText = ''
   const stub = {
     existsSync: () => true,
     openSync (p, flag) {
@@ -410,7 +413,11 @@ function makeLogFs (over = {}) {
       if (over.openSync) return over.openSync(p, flag)
       return flag === 'r+' ? 8 : 7
     },
-    writeSync (fd, data) { rec.write.push([fd, String(data)]) },
+    writeSync (fd, data) { rec.write.push([fd, String(data)]); lockText = String(data) },
+    readFileSync (p) {
+      if (over.readFileSync) return over.readFileSync(p)
+      return lockText
+    },
     appendFileSync (p, data, enc) {
       if (over.appendThrows) throw new Error('append 失败')
       rec.append.push([p, String(data), enc])
@@ -3831,6 +3838,50 @@ check('C1-010 探针不计「原文链接」尾巴：正文略短于 contentMax 
   }
   assert.ok(!brokenLink(fullDesp), '前置条件：全量转换的推送正文不含坏链接')
   assert.ok(!brokenLink(despOf(bounded)), '不得把被截断的「原文链接：[https://…」推进正文')
+})
+
+// ----- C1-020 回归：锁释放必须先证明「锁里还是我的令牌」，绝不按路径无条件删除 -----
+// 旧实现 close + unlinkSync(lockPath) 不看内容：我方令牌为空（写盘失败）时会被别的进程判成
+// 陈旧锁并接管（unlink + 重建），而我方的迟到释放会把**接管者/第三方**手里的锁删掉 ⇒ 互斥失效。
+// 三处锁（run.log / re2warn / channel-health）统一走 releaseLock，这里逐处钉住。
+check('C1-020 run.log 锁：锁已被接管（内容不再是本进程令牌）⇒ 只关 fd、不 unlink', () => {
+  const rec = makeLogFs({ readFileSync: () => '999999:1' })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('x\n')
+  assert.deepStrictEqual(rec.rec.close, [7], '锁 fd 仍必须关闭（否则泄漏 fd）')
+  assert.deepStrictEqual(rec.rec.unlink, [],
+    '锁已不属于本进程时不得删除——删了接管者就会与本进程同时进临界区')
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']], '日志本身仍必须写进去')
+})
+
+check('C1-020 run.log 锁：读锁失败（ENOENT/io）⇒ 不删归属不明的锁，也不抛', () => {
+  const e = new Error('gone'); e.code = 'ENOENT'
+  const rec = makeLogFs({ readFileSync: () => { throw e } })
+  const { app } = makeLogApp({ rec })
+  assert.strictEqual(app._writeRunLog('x\n'), undefined)
+  assert.deepStrictEqual(rec.rec.unlink, [], '读不到内容就无法证明归属，只能不删（残留由 stale 回收）')
+  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']])
+})
+
+check('C1-020 通道健康锁：锁文件已被接管 ⇒ 保留别人的锁文件', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  const fd = app._tryAcquireChannelHealthLock(healthPath + '.lock')
+  assert.ok(fd >= 0, '前置：无竞争时必须取到锁')
+  mfs.writeFileSync(healthPath + '.lock', '999999:other') // 别人接管后的令牌
+  app._releaseChannelHealthLock(healthPath + '.lock', fd)
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), true, '锁归别人时必须保留（否则互斥失效）')
+})
+
+check('C1-020 RE2 标记锁：锁文件已被接管 ⇒ 保留别人的锁文件', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir })
+  const acquired = app._acquireRe2WarnLock(statePath)
+  assert.ok(acquired, '前置：无锁时应获取成功')
+  mfs.writeFileSync(statePath + '.lock', '999999:other')
+  app._releaseRe2WarnLock(statePath, acquired)
+  assert.strictEqual(mfs._files.has(statePath + '.lock'), true, '锁归别人时必须保留（否则互斥失效）')
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====

@@ -31,14 +31,18 @@ function createApp ({
   const LOCK_RETRY_INTERVAL_MS = 10
   const lockTokenOf = () => `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
 
-  /** 单次 O_EXCL 尝试（含陈旧锁回收）。成功返回 { fd }，失败返回 { reason, error }：
+  /** 单次 O_EXCL 尝试（含陈旧锁回收）。成功返回 { fd, token }，失败返回 { reason, error }：
    *  reason='open' 非 EEXIST 的 open 失败；'busy' 锁被活跃或未超龄的持有者占着；
-   *  'unlink' 陈旧锁回收失败；'reopen' 回收后二次 open 失败。 */
+   *  'unlink' 陈旧锁回收失败；'reopen' 回收后二次 open 失败。
+   *  C1-020：token 随 fd 一起回传——释放时要用它证明「锁文件里仍是我的令牌」。
+   *  token 在写盘**之前**就固定下来：写失败时文件内容为空，释放时按「不属于我」处理（只关闭、
+   *  不删除），而不是退回按路径删除——那正是误删接管者锁的入口。 */
   const tryLockOnce = (lockPath) => {
     try {
       const fd = fs.openSync(lockPath, 'wx')
-      try { fs.writeSync(fd, lockTokenOf()) } catch (e) { /* 锁内容仅供排查，失败不影响 */ }
-      return { fd }
+      const token = lockTokenOf()
+      try { fs.writeSync(fd, token) } catch (e) { /* 锁内容仅供排查及归属校验，失败不影响持有 */ }
+      return { fd, token }
     } catch (e) {
       if (!e || e.code !== 'EEXIST') return { reason: 'open', error: e }
       let stale = false
@@ -50,8 +54,9 @@ function createApp ({
       try { fs.unlinkSync(lockPath) } catch (e2) { return { reason: 'unlink', error: e2 } }
       try {
         const fd = fs.openSync(lockPath, 'wx')
-        try { fs.writeSync(fd, lockTokenOf()) } catch (e2) { /* 同上 */ }
-        return { fd }
+        const token = lockTokenOf()
+        try { fs.writeSync(fd, token) } catch (e2) { /* 同上 */ }
+        return { fd, token }
       } catch (e2) { return { reason: 'reopen', error: e2 } }
     }
   }
@@ -68,6 +73,31 @@ function createApp ({
       try { Atomics.wait(lockWaiter, 0, 0, LOCK_RETRY_INTERVAL_MS) } catch (e) { /* 非主线程/受限：直接重试 */ }
     }
   }
+  /** 释放锁：只关 fd 还不够——必须确认「锁文件里仍是我写入的令牌」才删除。C1-020：旧实现按
+   *  路径无条件 unlink。持锁者的令牌为空（写盘失败）时 _isTombstoneLockProcessAlive 解析不出存活
+   *  证据，另一进程在 mtime 超龄后会 unlink 重建接管；接管者正常释放、第三方取到同一把锁之后，
+   *  先来者的迟到释放会把第三方手里的锁文件删掉 ⇒ 互斥当场失效（本仓 _releaseTombstoneLock 早已
+   *  是 token 校验口径）。判据同源：读回内容做定时安全比较，不匹配只关 fd、保留别人的锁；
+   *  读不到（ENOENT/权限/io）同样不删——锁残留由 stale + 持有进程存活复核在 10s 后回收，误删
+   *  别人的锁则是立即破坏互斥。令牌未知（直接调用本方法、注入的 fs 替身没有读能力）时退回旧行为
+   *  （按路径删除）：生产路径上两者恒不成立（令牌由 tryLockOnce 一路带出，真实 fs 必有 readFileSync）。 */
+  const releaseLock = (lockPath, fd, token) => {
+    // 只关真锁 fd：0/1/2 是 stdio，宁可漏关一个不该出现的锁 fd，也不能关掉进程输出。
+    if (typeof fd === 'number' && fd > 2) {
+      try { fs.closeSync(fd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
+    }
+    let owned = true
+    if (typeof token === 'string' && token !== '' && typeof fs.readFileSync === 'function') {
+      try {
+        owned = timingSafeEqualStr(fs.readFileSync(lockPath, 'utf8'), token, crypto)
+      } catch (e) {
+        owned = false // 已不存在（ENOENT）无需删除；其余读错误无法判定归属 ⇒ 不删
+      }
+    }
+    if (!owned) return
+    try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+  }
+
   // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
   // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
   // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
@@ -186,12 +216,13 @@ function createApp ({
         // 改成 +1，release 分支把 1 当锁 fd 去 close，直接关掉 stdout、进程崩成 RuntimeError。
         // close 另加 >2 守卫：stdio 已被外部关闭时 openSync 本就会返回 0/1/2 这样的真 fd。
         let lockFd = null
+        let lockToken = null
         try {
         // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
         // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）。
         // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry，三处锁共用同一份判据。
           const lock = acquireLockWithRetry(lockPath)
-          if (typeof lock.fd === 'number') lockFd = lock.fd
+          if (typeof lock.fd === 'number') { lockFd = lock.fd; lockToken = lock.token }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
           // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
@@ -247,12 +278,9 @@ function createApp ({
           }
         } finally {
           if (lockFd !== null) {
-            // 只关真锁 fd：0/1/2 是 stdio，宁可漏关一个不该出现的锁 fd，也不能关掉进程输出。
-            // 锁文件仍要删（不管 fd 落在哪个区）——漏 unlink 会让后续轮次一直被陈旧锁挡住。
-            if (lockFd > 2) {
-              try { fs.closeSync(lockFd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
-            }
-            try { fs.unlinkSync(lockPath) } catch (e) { /* 锁文件已被抢删等，忽略 */ }
+            // C1-020：close 只对真锁 fd（0/1/2 是 stdio）；unlink 交给 releaseLock 按令牌判定——
+            // 锁文件若已被别人接管（内容不再是本进程令牌），删掉它就会让第三方与我们同时进临界区。
+            releaseLock(lockPath, lockFd, lockToken)
           }
         }
       } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
@@ -610,13 +638,13 @@ function createApp ({
     _acquireRe2WarnLock (statePath) {
       const lockPath = statePath + '.lock'
       const lock = acquireLockWithRetry(lockPath)
-      return typeof lock.fd === 'number' ? { lockPath, fd: lock.fd } : null
+      return typeof lock.fd === 'number' ? { lockPath, fd: lock.fd, token: lock.token } : null
     },
 
     _releaseRe2WarnLock (statePath, acquired) {
       if (!acquired) return
-      try { fs.closeSync(acquired.fd) } catch (e) { /* 忽略 */ }
-      try { fs.unlinkSync(acquired.lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+      // C1-020：令牌校验后才删除（同 releaseLock），不按路径无条件 unlink。
+      releaseLock(acquired.lockPath, acquired.fd, acquired.token)
     },
 
     // 清理超过保留期的 re2 标记文件（best-effort；仅删除严格早于 cutoff 的日期）：
@@ -867,10 +895,15 @@ function createApp ({
      *  open 失败、unlink 失败、二次 open 失败都是真实故障，此前全折叠成 -1 被谎报成并发）。 */
     _tryAcquireChannelHealthLock (lockPath) {
       this._lastChannelHealthLockFailure = null
+      // C1-020：令牌与本轮 fd 成对保存——释放时用它证明锁仍是自己的（见 releaseLock）。
+      this._lastChannelHealthLockToken = null
       // C1-013：单次尝试（观测性写入不为拿锁阻塞事件循环），与 run.log / RE2 标记共用同一份
       // tryLockOnce；失败原因按 reason 分流，供调用点区分「另一轮在更新」与真实故障（C1-008）。
       const attempt = tryLockOnce(lockPath)
-      if (typeof attempt.fd === 'number') return attempt.fd
+      if (typeof attempt.fd === 'number') {
+        this._lastChannelHealthLockToken = attempt.token
+        return attempt.fd
+      }
       this._lastChannelHealthLockFailure = {
         reason: attempt.reason,
         code: (attempt.error && attempt.error.code) || '',
@@ -880,16 +913,11 @@ function createApp ({
     },
 
     _releaseChannelHealthLock (lockPath, lockFd) {
-      // 锁 fd 只可能是 openSync 返回的 >=3；0/1/2 是 stdio。哨兵被误改成 +1 时
-      // 旧判据会 close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError（app 变异守卫红）。
-      // 这里拒绝 stdio fd：宁可漏关一个不该出现的锁 fd，也不能关闭进程输出。
-      // 但 close 与 unlink 是两件事：unlink 必须在「本轮确实取到了锁」时执行（fd 落在
-      // stdio 区也一样），否则锁文件残留、后续轮次一直被陈旧锁挡住；只有 null/-1 才整段跳过。
+      // 未取到锁（null / -1）时整段跳过。
       if (typeof lockFd !== 'number' || lockFd < 0) return
-      if (lockFd > 2) {
-        try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
-      }
-      try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+      // C1-020：close 只接受 >2（0/1/2 是 stdio，见 _writeRunLog 同口径注释）；unlink 由
+      // releaseLock 按令牌判定——锁若已被接管，按路径删除会让第三方与本轮同时进临界区。
+      releaseLock(lockPath, lockFd, this._lastChannelHealthLockToken)
     },
 
     /** FX3：生成一次恢复告警发送尝试的唯一认领令牌（pid+时刻+序号+随机，跨进程/跨轮次不撞）。
