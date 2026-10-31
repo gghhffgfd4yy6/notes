@@ -45,8 +45,16 @@ function tombstoneKeyCap (maxSize, droppedCount = 0, floorKeys = TOMBSTONE_MAX_K
 // 判重主存换成另一份文件、原目录的 push.json 就此被「遗忘」⇒ 要么全量重推、要么两处各记一半。
 // 而运维侧唯一的可见信号曾是「什么都没说」。这里回退一次打一条 WARN（按 raw→chosen 去重，
 // 每进程每组合一次：getter 每轮都会求值，不做去重会把日志刷满）。
+// C3-010 续（Codacy path-join-resolve-traversal 收口）：回退判定只能由本模块给出。青龙 `--check`
+// 原先用 `path.resolve(生效目录) !== path.resolve(ROOT, 配置值)` 自己重算一遍——既重复了本模块
+// 「root + fallback」的解析口径（两侧一旦分叉就出现「目录判断说反话」），又让配置值在 CLI 里以
+// 路径拼接形态出现（静态分析把 path.resolve 当 I/O sink）。这里记录**最近一次**求值的回退判定，
+// 调用方只读结论（MessageStore.cacheDirFallback），不做任何路径运算。
+let lastCacheDirFallback = null
 const warnedCacheDirFallbacks = new Set()
 function warnCacheDirFallback (raw, candidate, chosen) {
+  // 记录先于去重：告警按 raw→chosen 每进程只打一条，但判定必须反映**本次**求值
+  lastCacheDirFallback = { raw: String(raw), chosen: String(chosen) }
   const key = String(raw) + '\u0000' + String(chosen)
   if (warnedCacheDirFallbacks.has(key)) return
   warnedCacheDirFallbacks.add(key)
@@ -56,6 +64,8 @@ function warnCacheDirFallback (raw, candidate, chosen) {
 }
 
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
+  // 每次求值先清零：读到的一定是**本次**判定，不可能是上一轮（或上一组配置）的残留
+  lastCacheDirFallback = null
   const candidate = path.resolve(root, raw)
   const realInsideRoot = (p) => {
     const lexicalInside = p !== root && p.startsWith(root + path.sep)
@@ -193,6 +203,9 @@ function createMessageStore ({
   // v3.172：cache.dir 非法回退时支持并行 worker 隔离（test_app_parallel 用 XBK_PARALLEL_ID 分片，
   // 回退硬编码 'xianbaoku_cache' 会让 t51 等非法配置测试撞共享目录竞态）
     get cacheDir () {
+      // 清零放在 getter 入口而不是只放 resolveCacheDirInRoot：XBK_CACHE_DIR 绝对路径分支有意
+      // 不做根内校验、会在调用 resolveCacheDirInRoot 之前早退，那条路径也必须把判定清成「未回退」。
+      lastCacheDirFallback = null
       const fallback = process.env.XBK_PARALLEL_ID ? `xianbaoku_cache_p${process.env.XBK_PARALLEL_ID}` : 'xianbaoku_cache'
       const configured = typeof Config.cache.dir === 'string' && Config.cache.dir ? Config.cache.dir : fallback
       // XBK_CACHE_DIR（审查 #241 M1）：与青龙 `--status` / 控制台**同一套取值规则**——只采纳
@@ -209,6 +222,10 @@ function createMessageStore ({
       // 青龙 `--status` 复用同一函数（QX-08），两侧口径不再各写一份。
       return resolveCacheDirInRoot({ fs, path, root: path.resolve(__dirname), raw: configured, fallback })
     },
+    // C3-010 续：最近一次 cacheDir 求值是否因「项目根内 + 不跟随根外符号链接」检查回退。
+    // { raw, chosen } = 配置原文与实际落到的目录；null = 未回退，或本次求值走的是 XBK_CACHE_DIR
+    // 绝对路径覆盖（那条路径有意不做根内校验）。qinglong `--check` 只读这个结论，不再自己解析路径。
+    get cacheDirFallback () { return lastCacheDirFallback },
     _memoryCache: {},
     // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
     _memoCount: 0,

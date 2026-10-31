@@ -141,15 +141,19 @@ function makeApp (overrides = {}) {
   // （实际写在别处：缓存「丢失」/重复推送的误判来源）。
   mockNotify(1)
   const fallbackDir = path.join(__dirname, '.xbk_cache_safe')
-  const rFallback = withHealthyEnv(() => captureRunCheck(makeApp({ MessageStore: { cacheDir: fallbackDir } })))
+  // 回退判定改由 MessageStore 给出（Codacy path-join-resolve-traversal 收口）：桩提供生产
+  // MessageStore 在回退时记录的 { raw, chosen }，--check 只负责显示，不再自己用 path.resolve 重算。
+  const configuredDir = path.join(__dirname, '.test-cache')
+  const rFallback = withHealthyEnv(() => captureRunCheck(makeApp({
+    MessageStore: { cacheDir: fallbackDir, cacheDirFallback: { raw: configuredDir, chosen: fallbackDir } }
+  })))
   assert.strictEqual(rFallback.code, 0, '回退本身不是失败（生产口径），但必须可见')
   assert.ok(rFallback.output.includes(`✅ 缓存目录：${fallbackDir}`),
     `--check 必须打印生效目录而非配置值：${rFallback.output}`)
-  assert.ok(rFallback.output.includes('未通过根内安全检查，已回退'),
-    `--check 必须点明「配置值未生效、已回退」：${rFallback.output}`)
-  // 对照：生效值 === 配置值时不加任何赘述（否则「已回退」会变成永远为真的噪声）
-  const configuredDir = path.join(__dirname, '.test-cache')
-  const rSame = withHealthyEnv(() => captureRunCheck(makeApp({ MessageStore: { cacheDir: configuredDir } })))
+  assert.ok(rFallback.output.includes(`配置值 ${configuredDir} 未通过根内安全检查，已回退到 ${fallbackDir}`),
+    `--check 必须点明「配置值未生效、回退到哪」：${rFallback.output}`)
+  // 对照：未回退（cacheDirFallback = null）时不加任何赘述（否则「已回退」会变成永远为真的噪声）
+  const rSame = withHealthyEnv(() => captureRunCheck(makeApp({ MessageStore: { cacheDir: configuredDir, cacheDirFallback: null } })))
   assert.ok(rSame.output.includes(`✅ 缓存目录：${configuredDir}\n`),
     `生效值等于配置值时只打印路径：${rSame.output}`)
   assert.ok(!rSame.output.includes('已回退'), '未回退时不得出现「已回退」说明')
