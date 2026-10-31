@@ -11482,6 +11482,21 @@ async function main () {
     assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
     assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
   })
+
+  // ── W2 g4（C7-010/013/026/027/028/029/030/031/032/038/044/056）─────────────
+  await aok('结构红线: C7-038 确认弹窗的正文有 aria-describedby（危险后果要能被读屏念出来）', () => {
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = sliceBetween(comp, 'function ConfirmDialog', '// 未保存草稿的离开拦截', 'ConfirmDialog 组件')
+    assert.ok(/aria-describedby=\$\{bodyId\}/.test(seg),
+      '弹窗必须用 aria-describedby 指向正文：只挂 aria-labelledby 时读屏只念标题，用户听不到「会真实推送」')
+    assert.ok(/<div class="modal-body" id=\$\{bodyId\}>/.test(seg),
+      'aria-describedby 必须指向正文节点自己的 id（否则引用悬空，等同于没写）')
+    // id 不得额外领号：titleId 的形态被既有用例逐字钉住，bodyId 复用同一序号。
+    assert.ok(/const \[bodyId\] = useState\(\(\) => `confirm-body-\$\{dialogSeq\}`\)/.test(seg),
+      'body id 必须每实例唯一，且不额外消耗 dialogSeq（否则标题 id 与正文 id 序号错开）')
+    assert.ok(seg.includes('aria-labelledby=${titleId} aria-describedby=${bodyId}'),
+      '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
