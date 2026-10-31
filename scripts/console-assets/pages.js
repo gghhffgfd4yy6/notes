@@ -1674,7 +1674,8 @@ function buildMessagesHash (state) {
 
 // ── 推送记录：条目详情抽屉（v3.379）────────────────────────────────────────
 // 行内展开会把下面的条目顶走：读一条正文，列表就换了位置，想接着看下一条还得重新找。
-// 改成右侧抽屉后列表原地不动（滚动位置不跳），抽屉宽度 520 与列表并排做对照。
+// 改成右侧抽屉后列表原地不动（滚动位置不跳）。注意它不是「并排对照」：抽屉带遮罩压暗
+// 列表，桌面从右侧占 520px，手机铺满整屏（见 app.css 的 .drawer-backdrop / .drawer）。
 // 抽屉里只有「标签 + 值」的行，布局走最小内联样式——键值表只在抽屉里出现一次，
 // 故不复用列表卡片的 .msg-meta（那是横向 pill 行，不是键值表）。
 function DetailRow ({ label, children }) {
@@ -2132,8 +2133,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         </div>`}
       ${renderPager(loading && pagerSlow)}
     </div>`}
-    ${/* v3.379：条目详情抽屉。列表留在背后做对照（滚动位置不动），宽度 520 与抽屉默认值一致，
-         手机上由 Drawer 自己铺满整屏。detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
+    ${/* v3.379：条目详情抽屉。列表留在背后不动（滚动位置不跳），但被遮罩压暗、不算并排对照；
+           width=520 与 .drawer 的默认宽度一致，手机上由 CSS 的 min(520px, 100%) 铺满整屏。
+           detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
     ${detail && html`<${Drawer} open=${true} width=${520}
       title=${detail.title ? hit(detail.title, hitMarkStyle) : '（无标题）'}
       sub=${msgTimeText(detail)}

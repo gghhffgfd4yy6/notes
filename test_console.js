@@ -11641,7 +11641,20 @@ async function main () {
       '留痕不能取代面板自己的可见错误')
   })
 
-  }
+  await aok('结构红线: C7-052 抽屉注释不得再说「与列表并排做对照」（与遮罩实现相反）', () => {
+    const src = readConsoleSource()
+    // 实现是 fixed 遮罩 + 压暗列表（app.css 的 .drawer-backdrop::before），手机还铺满整屏，
+    // 「并排对照」是旧叙述里唯一与代码相反的一条——注释必须改成可被代码验证的说法。
+    assert.ok(!src.includes('与列表并排做对照'), '注释不得声称抽屉与列表并排对照（遮罩把列表压暗了）')
+    assert.ok(!src.includes('列表留在背后做对照'), '注释不得声称列表在背后「做对照」')
+    assert.ok(src.includes('但被遮罩压暗、不算并排对照'), '抽屉注释必须写明遮罩压暗、不是并排对照')
+    assert.ok(src.includes('桌面从右侧占 520px，手机铺满整屏'), '抽屉注释必须写明桌面 520px / 手机铺满')
+    // 版本号只作「这条规矩哪来的」溯源，不得当成变更日志的分行清单：抽屉这一段不许再堆 v3.xxx 行。
+    const drawer = sliceBetween(src, '// ── 推送记录：条目详情抽屉', 'function DetailRow', '抽屉注释')
+    assert.strictEqual((drawer.match(/v3\.\d+/g) || []).length, 1,
+      '抽屉注释只保留一处版本溯源（v3.379），不堆版本号当变更日志')
+  })
+}
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
 // 旧实现只在 .then 里做这三件事；main() reject 时只打一行 e.message 并置 exitCode=1：
