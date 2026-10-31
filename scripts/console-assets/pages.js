@@ -3490,6 +3490,14 @@ function TwoFactorBlock ({ active = true }) {
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
+  // C7-037：「退出所有信任设备」会把包括当前这台在内的所有浏览器踢下线（下次都要重输验证码），
+  // 一次误触就要重新配一遍——必须先弹确认。与 C7-001/C7-009 同口径：切页即收口，
+  // 隐藏 section 里的 dialog 会塌成 0×0 且整页继续 inert。
+  const [revokeAsk, setRevokeAsk] = useState(false)
+  useEffect(() => {
+    if (active) return
+    setRevokeAsk(false)
+  }, [active])
 
   const load = useCallback(() => {
     setErr('')
@@ -3628,7 +3636,7 @@ function TwoFactorBlock ({ active = true }) {
     </div>`}
     ${status && status.enabled && html`<div class="twofa-row">
       <div class="cfg-block-sub">已记住 ${status.trustedDevices || 0} 台设备。勾了「记住这台设备」的浏览器，90 天内打开控制台不用再输验证码；最多记 20 台，满了自动把最久没用的挤掉。</div>
-      <${Button} variant="secondary" disabled=${busy !== '' || !(status.trustedDevices > 0)} onClick=${revokeDevices}>${busy === 'revoke' ? '退出中…' : '退出所有信任设备'}<//>
+      <${Button} variant="secondary" disabled=${busy !== '' || !(status.trustedDevices > 0)} onClick=${() => setRevokeAsk(true)}>退出所有信任设备<//>
     </div>`}
     ${disableOpen && html`<div class="twofa-setup">
       <div class="twofa-step">关闭前先输一次当前验证码（或恢复码）：</div>
@@ -3643,6 +3651,16 @@ function TwoFactorBlock ({ active = true }) {
       <div class="twofa-codes">${recoveryCodes.map((c) => html`<code key=${c}>${c}</code>`)}</div>
       <${Button} variant="ghost" disabled=${busy !== ''} onClick=${() => copyText(recoveryCodes.join('\n'))}>复制全部<//>
     </div>`}
+    ${/* C7-037：误触一次就要在每台设备上重新过一遍验证码，先确认再发。 */ ''}
+    <${ConfirmDialog} open=${revokeAsk && active}
+      title="退出所有信任设备？"
+      confirmLabel=${busy === 'revoke' ? '退出中…' : '全部退出'}
+      busy=${busy === 'revoke'}
+      onConfirm=${() => { revokeDevices().finally(() => setRevokeAsk(false)) }}
+      onCancel=${() => { if (busy !== 'revoke') setRevokeAsk(false) }}>
+      <div>会清空 ${status && status.trustedDevices ? status.trustedDevices : '所有'} 台已记住的设备——<b>包括当前这台浏览器</b>。</div>
+      <div class="modal-note">之后每台设备打开控制台都要重新输一次手机上的 6 位数字；恢复码仍然可用，不会被清掉。</div>
+    <//>
     <${Hint}>两步验证只保护浏览器打开控制台；接口仍使用访问令牌。手机丢了用恢复码，恢复码丢了只能让部署者删除 <code>console-2fa.json</code> 后重配。<//>
   </div>`
 }

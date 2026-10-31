@@ -11517,6 +11517,28 @@ async function main () {
       'query 归属回写必须保留（旧响应不得把刚输入的新词覆盖回去）')
   })
 
+  await aok('结构红线: C7-037 「退出所有信任设备」先确认再发（后果写进正文，切页即收口）', () => {
+    const src = readConsoleSource()
+    const D = '$'
+    const seg = sliceBetween(src, 'function TwoFactorBlock', 'function SysPanel', 'TwoFactorBlock 片段')
+    const btnAt = seg.indexOf('>退出所有信任设备<')
+    assert.ok(btnAt > -1, '应能定位「退出所有信任设备」按钮')
+    const btn = seg.slice(seg.lastIndexOf('<' + D + '{Button}', btnAt), btnAt)
+    assert.ok(btn.includes('setRevokeAsk(true)') && !btn.includes('revokeDevices'),
+      '按钮只置待确认态，不得一键直发 revokeDevices')
+    const dlgAt = seg.indexOf('<' + D + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '必须有确认弹窗（一次误触会把所有设备踢下线）')
+    const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('open=' + D + '{revokeAsk && active}'),
+      '确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    assert.ok(dlg.includes('revokeDevices()'), '确认后才调 revokeDevices')
+    assert.ok(dlg.includes('包括当前这台浏览器') && dlg.includes('恢复码仍然可用'),
+      '后果（含当前这台 / 恢复码仍可用）必须写在弹窗正文里，不能只留在按钮 title')
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && seg.slice(guardAt, guardAt + 80).includes('setRevokeAsk(false)'),
+      '离开系统页必须清掉待确认（否则回页面时弹窗自己弹出来）')
+  })
+
   }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
