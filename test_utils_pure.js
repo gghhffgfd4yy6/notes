@@ -1588,8 +1588,19 @@ check('PKG_VERSION 回退口径：trim、有限数值、null/NaN/带 trim 的脏
   assert.strictEqual(out.cuInvalid, 'null', 'compileUserRegex 对无效模式必须返回 null（catch 体不得被清空）')
   assert.strictEqual(out.netArgKeys, 'Config,PKG_VERSION,PROFILE3,RETRYABLE_CODES,Utils,crypto,fetchJson,getNotify,logger,prewarmDns',
     'createNetwork 必须收到完整的 10 键注入对象（ObjectLiteral 变 {} 或丢键即红）')
-  assert.strictEqual(out.pusherArgKeys, 'Utils,getNotify,looksLikeHtmlLinear',
-    'createPusher 必须收到完整的 3 键注入对象（ObjectLiteral 变 {} 或丢键即红）')
+  // C8-006：注入面收窄为工厂真正解构的两个键。此前这里断言的是 'Utils,getNotify,looksLikeHtmlLinear'
+  // 三键串——它把「组合根往 createPusher 塞了一个工厂根本不读的键」钉成了参数契约（死接线被冻结）。
+  // 出口门槛自 v3.273 起是 looksLikeHtmlEnvelope（xbk_pusher 内部实现），不再是注入项，故期望串收窄为
+  // 两键：这条断言仍然防「ObjectLiteral 变 {} 或丢键」（丢失真实依赖即红），只是不再要求那个死键。
+  assert.strictEqual(out.pusherArgKeys, 'Utils,getNotify',
+    'createPusher 必须只收到工厂解构的 2 键注入对象（ObjectLiteral 变 {} 或丢键即红；多塞死键同样即红）')
+  // 死接线不得回潮：组合根注入的键必须与 xbk_pusher 里解构的键逐字一致
+  const pusherFactorySrc = require('node:fs').readFileSync(require('node:path').join(__dirname, 'xbk_pusher.js'), 'utf8')
+  const factoryHead = /function createPusher\s*\(\s*\{([^}]*)\}/.exec(pusherFactorySrc)
+  assert.ok(factoryHead, 'xbk_pusher 必须仍以 function createPusher ({ ... }) 形态声明注入面')
+  assert.strictEqual(factoryHead[1].split(',').map(s => s.trim()).filter(Boolean).sort().join(','),
+    out.pusherArgKeys,
+    `组合根注入的键必须与 createPusher 解构的键逐字一致（多传的键是死接线，少传会静默 undefined）`)
 })
 
 // Config 默认口径（README/SYSTEM_CONTRACT 配置节）：过滤默认全空、健康/日报/诊断/磁盘余量精确值
