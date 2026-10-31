@@ -2564,6 +2564,14 @@ async function backupApiTests () {
       assert.strictEqual(again.status, 200, again.text)
       assert.deepStrictEqual(JSON.parse(again.text).imported.messages, 1)
       assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]))
+      // C2-018：幂等键按**上传字节**判同一份备份（不再把 bundle 重新序列化做语义归一）。
+      // 内容语义相同、字节不同（这里多一个换行）必须当成另一份备份拒绝——同一幂等键下
+      // 「另一份文件」覆盖旧结果，正是这个键要挡的事。
+      const reformatted = JSON.stringify(bundle) + '\n'
+      const conflict = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: reformatted, headers })
+      assert.strictEqual(conflict.status, 409, conflict.text)
+      assert.strictEqual(JSON.parse(conflict.text).code, 'idempotency_conflict')
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]), '被拒的导入不得落盘')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })

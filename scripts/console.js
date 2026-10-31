@@ -4489,7 +4489,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       // 手动重试的幂等键：响应丢失后用户再点一次，不能把期间新产生的推送记录又覆盖回旧备份。
       const importKey = importKeyOf(req)
-      const bundleHash = sha256Hex(JSON.stringify(bundle))
+      // C2-018：摘要直接取**上传的原始字节**，不再 JSON.stringify(bundle) 把整份备份重新序列化
+      // 一遍——256MiB 上限下一次导入会因此多出一份等长字符串与整树遍历，纯属把峰值内存翻倍。
+      // 口径也更硬：幂等键认的是「同一份文件」（字节相同），不再是「语义等价的 JSON」；
+      // 备份里本来就带 exportedAt，两次导出不可能逐字相同，语义归一从未真正生效。
+      const bundleHash = sha256Hex(body)
       if (importKey) {
         const prior = readImportResult(importKey)
         if (prior) {
