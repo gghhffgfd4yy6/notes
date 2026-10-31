@@ -161,6 +161,25 @@ function makeApp (overrides = {}) {
   } finally {
     delete process.env.XBK_CACHE_DIR
   }
+  // 对照（C3-010 返工）：相对路径 / 纯空白会被 MessageStore 与 statusCacheDir 忽略（模块自己告警
+  // 「不是绝对路径，已忽略」），--check 不得把它说成「由 XBK_CACHE_DIR 覆盖，配置值 <同一值>」——
+  // 同一份诊断自相矛盾，运维会以为读写落在 env 目录（本条修复的目的正是「别让目录判断说反话」）。
+  const defaultConfigured = path.join(__dirname, '.test-cache')
+  for (const ignoredEnv of ['relative/cache', '   ']) {
+    process.env.XBK_CACHE_DIR = ignoredEnv
+    try {
+      const rIgnored = withHealthyEnv(() => captureRunCheck(makeApp()))
+      assert.ok(!rIgnored.output.includes('由 XBK_CACHE_DIR 覆盖'),
+        `被忽略的 XBK_CACHE_DIR（${JSON.stringify(ignoredEnv)}）不得说成已覆盖：${rIgnored.output}`)
+      assert.ok(rIgnored.output.includes(`✅ 缓存目录：${defaultConfigured}`),
+        `必须打印实际生效的配置目录：${rIgnored.output}`)
+      if (ignoredEnv.trim()) {
+        assert.ok(rIgnored.output.includes('已忽略'), `相对路径必须点明「已忽略」：${rIgnored.output}`)
+      }
+    } finally {
+      delete process.env.XBK_CACHE_DIR
+    }
+  }
   restoreNotify()
 
   console.log('test_qinglong_runcheck OK')
