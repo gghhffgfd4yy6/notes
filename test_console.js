@@ -103,6 +103,8 @@ const {
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
   sanitizeAccessPath, shouldLogAccess, acceptsGzip, ACCESS_LOG_MAX,
+  // C2-022：条件 tag 的变体因子（纯函数；回归见「按解码后的参数名剔除 token」用例）
+  conditionalVariant,
   findSecretLikeField, CACHE_HEALTH_COUNT_MAX_BYTES, cacheHealthEntryCount,
   filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
   parseDayKey, filterMessagesByRange, windowMessages,
@@ -972,6 +974,26 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
 ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
   // 端到端用例在下方；这里登记实现约束。
   assert.ok(true)
+})
+
+// C2-022 回归：条件 tag 的变体因子必须按**解码后**的参数名剔除 token。
+// authorize 的 `?token=` 走 URLSearchParams.get('token')，也就是解码后的键 ⇒ `?%74oken=abc`
+// 同样是有效凭证；conditionalVariant 若按字面量比键名，同一份内容就会按 token 的编码写法
+// 算出两个 ETag，条件缓存被凭空的变体打散（variant 里还留着凭证片段）。这条用例直接对
+// 导出的纯函数断言（不经过 HTTP），回退成字面量比较即红。
+ok('conditionalVariant: 按解码后的参数名剔除 token（%74oken 与裸 URL 同变体；非 token 参数仍区分）', () => {
+  const v = (url) => conditionalVariant({ url })
+  // ① 修复点：编码写法的 token 与「查询串其余参数」算同一变体。
+  assert.strictEqual(v('/api/runs?%74oken=abc&limit=10'), v('/api/runs?limit=10'),
+    '?%74oken= 是有效凭证，必须按 token 剔除，不得让同一内容分裂成两个 tag')
+  assert.strictEqual(v('/api/runs?token=abc&limit=10'), v('/api/runs?limit=10'), '裸 ?token= 口径不变')
+  assert.strictEqual(v('/api/config?%74oken=abc'), '/api/config', '参数全被剔掉时回落无查询串形态')
+  // ② 反例：只剔 token 这一个键名——其余参数照旧参与变体（防把过滤写宽成「吞掉整段查询串」）。
+  assert.notStrictEqual(v('/api/runs?limit=10'), v('/api/runs?limit=200'), '其余参数不同必须换变体')
+  assert.notStrictEqual(v('/api/runs?tokens=abc&limit=10'), v('/api/runs?limit=10'),
+    'tokens 不是 token，不得被剔除（否则不同查询串共用一个 tag）')
+  // ③ 不做大小写折叠：authorize 的 get('token') 区分大小写，?Token= 不是凭证，也就必须留在变体里。
+  assert.notStrictEqual(v('/api/runs?Token=abc'), v('/api/runs'), '?Token= 不是凭证，必须保留为变体因子')
 })
 
 // ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
