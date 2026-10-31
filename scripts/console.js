@@ -3360,9 +3360,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     lastRunId: auto.lastRunId
   })
   const persistAuto = () => {
+    // C2-007：改 writeAtomic（tmp + fsync + rename）——裸 writeFileSync 整写在崩溃/ENOSPC
+    // 时会在 autoPath 留下半截 JSON，重启读盘把它当「读取失败，按停止处理」，
+    // 自动运行开关被静默关掉；原子写只会有「旧文件」或「新文件」两态。
     try {
-      fs.writeFileSync(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }))
-      return true
+      if (writeAtomic(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }), '自动运行状态')) return true
+      console.error('⚠️ 自动运行状态落盘失败（进程内仍生效）')
+      return false
     } catch (e) {
       console.error(`⚠️ 自动运行状态落盘失败（进程内仍生效）：${e && e.message ? e.message : e}`)
       return false
@@ -3484,6 +3488,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 落盘到 stateDir/console-lastaccept.json（readStatus 同目录），受理时同步写、启动时回读。
   // 写入失败不阻断受理（主链路是单飞锁，落盘只是重放窗的持久化增强）。
   const lastAcceptPath = path.join(stateDir, 'console-lastaccept.json')
+  // C2-007：重放窗记录同样走原子写。裸 writeFileSync 整写遇到崩溃/ENOSPC 会在
+  // lastAcceptPath 留下半截 JSON，重启后整份记录被当成「损坏 = 空窗」——窗口内的
+  // 自动重试就能穿透，重复跑一轮真实推送。writeAtomic 只留旧/新两态。
+  const persistLastAccept = () => writeAtomic(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)), '重放窗记录')
   try {
     for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
   } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
@@ -3765,9 +3773,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         lastAccept.set(action, { at: now, runId: 0 })
-        try {
-          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-        } catch (e) {
+        if (!persistLastAccept()) {
           // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
           // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
           // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
@@ -3789,10 +3795,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 关键：pending 帧已落盘（runId=0），只删内存会让下一次请求重读旧帧 → 整个
           // 重放窗都 409「重复提交」，但实际没有子进程跑过。这里把删除后的 Map 重新落盘；
           // 落盘失败只能告警（内存已回滚，本进程内可重试，重启后可能重现 409）。
-          try {
-            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-          } catch (persistErr) {
-            console.error(`⚠️ ${action} 启动失败后清理重放帧失败：${persistErr && persistErr.message ? persistErr.message : persistErr}`)
+          if (!persistLastAccept()) {
+            console.error(`⚠️ ${action} 启动失败后清理重放帧失败`)
           }
           const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
@@ -3802,9 +3806,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         record._lockAt = now
         lastAccept.set(action, { at: now, runId: record.id })
-        try {
-          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-        } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
+        // 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截。
+        persistLastAccept()
         sendJson(res, 202, { id: record.id, action, label: record.label })
       })
       .catch((e) => { logCaught('trigger/readBody', e); sendJson(res, 500, { error: '读取请求体失败' }) })
