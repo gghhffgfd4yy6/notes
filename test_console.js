@@ -11547,6 +11547,249 @@ async function main () {
     assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
     assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
   })
+
+  // ── W2 g2（C7-019/020/022/023/036/037/045/052）──────────────────────────────
+  await aok('结构红线: C7-023 缓存健康对 limits 全守（不存在的 limits 不得在渲染期解引用）', () => {
+    const src = readConsoleSource()
+    const D = '$' // no-template-curly-in-string：含 ${ 的字符串要拼出来
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    assert.ok(cache.includes("const lim = ok && data.limits && typeof data.limits === 'object' ? data.limits : null"),
+      'limits 必须先归一成 lim（存在性只判一处），旧写法只在 readCap 判、其它行直接解引用 data.limits')
+    // 归一化之后，本组件内不得再出现 data.limits.xxx 的解引用：漏一处就还是「半守半不守」。
+    assert.ok(!/data\.limits\./.test(codeOf(cache)),
+      '归一化后不得再直接解引用 data.limits（缺失时整页渲染期抛 TypeError）')
+    assert.ok(cache.includes(D + '{ok && !lim && html`<' + D + '{Hint} tone="error">'),
+      '拿不到 limits 时必须如实提示，而不是静默少画几行')
+    assert.ok(cache.includes(D + '{lim && html`<div class="sys-grid">'),
+      '上限对照整块必须以 lim 为门（不是 ok）：limits 缺失时不得解引用')
+  })
+
+  await aok('结构红线: C7-022 推送列表的响应归属守卫（旧筛选数据不得冒充新筛选结果）', () => {
+    const src = readConsoleSource()
+    const panel = sliceBetween(src, 'function MessagesPanel', 'function LogsPanel', 'MessagesPanel 片段')
+    // 指纹必须覆盖全部会改变结果集的筛选；旧实现只记 query（loadedQueryRef），分类/页码/时间窗全漏。
+    const key = src.slice(src.indexOf('function msgFilterKey'), src.indexOf('function buildMessagesHash'))
+    assert.ok(key.includes('q, cate, page, size, days, from, to'), '筛选指纹必须覆盖 q/cate/page/size/days/from/to')
+    assert.ok(panel.includes('const key = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })'),
+      'fetchMessages 必须按「本次请求实际用的筛选」生成指纹')
+    assert.ok(panel.includes('{ ...d, filterKey: key }'), '响应必须带上本次筛选指纹（服务端字段原样保留）')
+    assert.ok(panel.includes('data.filterKey !== filtersKey'),
+      '渲染必须比对响应指纹与当前筛选：不一致就是上一组的数据')
+    assert.ok(panel.includes('下面仍是上一组筛选的'),
+      '旧数据占屏时必须明说归属（否则换分类/翻页后旧条目看起来就是新筛选的结果）')
+    // query 的既有归属回写不能为了这次改动被删：服务端截断后的 queryUsed 只在「本次响应属于当前 query」时回写。
+    assert.ok(panel.includes('if (seq === loadSeqRef.current) loadedQueryRef.current = requested'),
+      'query 归属回写必须保留（旧响应不得把刚输入的新词覆盖回去）')
+  })
+
+  await aok('结构红线: C7-037 「退出所有信任设备」先确认再发（后果写进正文，切页即收口）', () => {
+    const src = readConsoleSource()
+    const D = '$'
+    const seg = sliceBetween(src, 'function TwoFactorBlock', 'function SysPanel', 'TwoFactorBlock 片段')
+    const btnAt = seg.indexOf('>退出所有信任设备<')
+    assert.ok(btnAt > -1, '应能定位「退出所有信任设备」按钮')
+    const btn = seg.slice(seg.lastIndexOf('<' + D + '{Button}', btnAt), btnAt)
+    assert.ok(btn.includes('setRevokeAsk(true)') && !btn.includes('revokeDevices'),
+      '按钮只置待确认态，不得一键直发 revokeDevices')
+    const dlgAt = seg.indexOf('<' + D + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '必须有确认弹窗（一次误触会把所有设备踢下线）')
+    const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('open=' + D + '{revokeAsk && active}'),
+      '确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    assert.ok(dlg.includes('revokeDevices()'), '确认后才调 revokeDevices')
+    assert.ok(dlg.includes('包括当前这台浏览器') && dlg.includes('恢复码仍然可用'),
+      '后果（含当前这台 / 恢复码仍可用）必须写在弹窗正文里，不能只留在按钮 title')
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && seg.slice(guardAt, guardAt + 80).includes('setRevokeAsk(false)'),
+      '离开系统页必须清掉待确认（否则回页面时弹窗自己弹出来）')
+  })
+
+  await aok('结构红线: C7-036 「取消关注」先确认再发，删完焦点落回关注词区', () => {
+    const src = readConsoleSource()
+    const D = '$'
+    const panel = sliceBetween(src, 'function SearchPanel', 'function LogsPanel', 'SearchPanel 片段')
+    const xAt = panel.indexOf('class="ls-chip-x"')
+    assert.ok(xAt > -1, '应能定位取消关注按钮')
+    const btn = panel.slice(xAt, panel.indexOf('>×</button>', xAt))
+    assert.ok(btn.includes('setAskRemove(w.q)') && !btn.includes('removeWatch('),
+      '× 只置待确认态，不得一键直删（删了要重新搜一次才能加回）')
+    const dlgAt = panel.indexOf('<' + D + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '必须有确认弹窗')
+    const dlg = panel.slice(dlgAt, panel.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('open=' + D + '{askRemove !== null && active}'),
+      '确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    assert.ok(dlg.includes('Promise.resolve(removeWatch(q))'), '确认后才真的调 removeWatch')
+    assert.ok(dlg.includes('watchBoxRef.current') && dlg.includes('el.focus({ preventScroll: true })'),
+      '删除后必须把焦点落回关注词区域：× 所在行卸载后焦点会掉到 body，键盘用户失去落点')
+    assert.ok(panel.includes('class="ls-watch" ref=' + D + '{watchBoxRef} tabIndex=' + D + '{-1}'),
+      '关注词区域必须可编程聚焦（tabIndex=-1），否则焦点无处可落')
+    const guardAt = panel.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && panel.slice(guardAt, guardAt + 80).includes('setAskRemove(null)'),
+      '离开搜索页必须清掉待确认（否则切回来弹窗自己出现）')
+  })
+
+  await aok('结构红线: C7-020 六个异步动作共用一份 busy 状态机（清错→busy→catch→finally）', () => {
+    const src = readConsoleSource()
+    const code = codeOf(src)
+    // 骨架只留一份：runBusyAction 自己 setBusy/清错/写横幅/复位。
+    const helper = sliceBetween(src, 'async function runBusyAction', 'function BackupBlock', 'runBusyAction')
+    assert.ok(helper.includes('setBusy(tag)') && helper.includes("setErr('')") &&
+      helper.includes('setBusy(\'\')') && helper.includes('`' + '$' + '{label}：'),
+    '公共骨架必须自己置 busy、清错、写「<动作>失败：…」横幅并复位')
+    // 六个动作都必须走它（顺序：解密 / 导入 / 生成设置密钥 / 确认开启 / 关闭 / 退出设备）。
+    const sites = (code.match(/runBusyAction\(\{/g) || []).length
+    assert.strictEqual(sites, 6, `六个动作必须都走公共骨架，实际 ${sites} 处`)
+    const backup = sliceBetween(src, 'function BackupBlock', 'function TwoFactorBlock', 'BackupBlock')
+    const twofa = sliceBetween(src, 'function TwoFactorBlock', 'function SysPanel', 'TwoFactorBlock')
+    // 备份块只留 doExport 自己的 busy（它要接 URL 回收）；解密/导入两条不得再手写骨架。
+    assert.strictEqual((codeOf(backup).match(/setBusy\('[a-z]/g) || []).length, 1,
+      'BackupBlock 只应有 doExport 一处自写 setBusy(tag)（其余走 runBusyAction）')
+    assert.ok(backup.includes("tag: 'unlock'") && backup.includes("tag: 'import'"),
+      '解密/导入必须各自带 busy 标签走公共骨架')
+    assert.strictEqual((codeOf(twofa).match(/setBusy\('[a-z]/g) || []).length, 0,
+      'TwoFactorBlock 的四个动作必须全部走公共骨架（不得再手写 setBusy(tag)/try/finally）')
+    for (const tag of ['setup', 'enable', 'disable', 'revoke']) {
+      assert.ok(twofa.includes(`tag: '${tag}'`), `TwoFactorBlock 缺 tag: ${tag}（动作必须带各自的 busy 标签）`)
+    }
+    // 失败横幅的文案口径不变（「导入失败：」这类前缀必须还在）。
+    assert.ok(backup.includes("label: '导入失败'") && backup.includes("label: '解密失败'"),
+      '失败横幅前缀必须保留（用户看到的「导入失败：…」不变）')
+  })
+
+  await aok('结构红线: C7-019 懒加载 + 3s 节流只剩一份骨架（hook 与 SysPanel 共用 runAutoLoad）', () => {
+    const src = readConsoleSource()
+    // 骨架只能有一份实现：单飞闸 + 结算时间戳 + queue 排队都在 runAutoLoad 里。
+    const helper = sliceBetween(src, 'function runAutoLoad', '// queue=true 用于日志', 'runAutoLoad')
+    assert.ok(helper.includes('if (pendingRef.current && !force) return false'), '单飞闸必须在公共骨架里')
+    assert.ok(helper.includes('loadedAtRef.current = Date.now()'), '结算时间戳必须在公共骨架里（新鲜度判断的唯一来源）')
+    // hook 侧：仍走公共骨架，且被既有断言逐字锁定的 3000 表达式原样保留。
+    const hook = sliceBetween(src, 'function usePanelAutoLoad', '// ── 下拉刷新', 'usePanelAutoLoad')
+    assert.strictEqual((codeOf(hook).match(/pendingRef\.current = true/g) || []).length, 0,
+      'usePanelAutoLoad 不得自己置 pendingRef（单飞闸只在 runAutoLoad 里）')
+    // CacheHealth 的「私有半份」是首访播种（无单飞/无 3s），不得再长出第二套新鲜度判定。
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    assert.ok(!cache.includes('loadedAtRef'), '缓存健康只做首访播种，不应再私藏一份 loadedAt 节流')
+    assert.ok(hook.includes('runAutoLoad({ pendingRef, loadedAtRef, load, queue, force: loadChanged })'),
+      'usePanelAutoLoad 必须走公共骨架（不得再手抄一遍 Promise 链）')
+    assert.ok(hook.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+      'hook 的 3s 判据被 test_console.js 逐字锁定，不得为了「统一」改成常量')
+    // SysPanel 侧：三段 loader 仍要一起结算才报 ready，但骨架来自 runAutoLoad。
+    const sys = sliceBetween(src, 'function SysPanel', 'function FilesPanel', 'SysPanel 片段')
+    assert.ok(sys.includes('runAutoLoad({'), 'SysPanel 的首访/切回加载必须走公共骨架')
+    assert.ok(sys.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
+      '系统页仍要等系统信息 + 访问日志 + 设置三条都结算')
+    assert.ok(sys.includes('onSettled: () => setReadyTick((v) => v + 1)'),
+      '结算后必须通知 ready（否则滚动层收口/数据截至不更新）')
+    assert.ok(!sys.includes('pendingRef.current = true'),
+      'SysPanel 不得再手写单飞闸（C7-019 的重复骨架就来自这一份）')
+    assert.ok(sys.includes('PANEL_FRESH_MS'), 'SysPanel 的新鲜度阈值必须引用 constants 的命名常量')
+  })
+
+  await aok('结构红线: C7-045 后台失败不许静默（裸 catch 改成带作用域的留痕）', () => {
+    const src = readConsoleSource()
+    const code = codeOf(src)
+    // 留痕器只有一份：前缀固定、吞掉「console 不存在」的环境（老浏览器/测试桩）。
+    const helper = sliceBetween(src, 'function logBgFailure', '// 面板加载器公共骨架', 'logBgFailure')
+    assert.ok(helper.includes('console.error(') && helper.includes('[xbk-console]'),
+      '留痕器必须写 console.error 并带 [xbk-console] 前缀（排障时能按前缀捞）')
+    assert.ok(helper.includes('typeof console === \'undefined\''), '留痕器必须对无 console 环境短路')
+    // 八条后台链路逐条点名：改回空 catch 时这里必须红。
+    for (const scope of ['关注词已读回写', '导入后刷新', '服务器草稿清理', '服务器草稿同步']) {
+      assert.ok(code.includes('logBgFailure(\'' + scope + '\')'), `后台链路「${scope}」的失败必须留痕`)
+    }
+    // pushDraftNow 的吞错点在里面（外层 .catch 是死代码，别为了「看起来有 catch」去改调用点：
+    // test_console.js 的草稿用例逐字锁定 setInterval 那一行）。
+    const push = sliceBetween(src, 'const pushDraftNow = useCallback', 'const clearServerDraft = useCallback', 'pushDraftNow')
+    assert.ok(push.includes("logBgFailure('服务器草稿同步')(e)"), '草稿 PUT 抛错必须在 pushDraftNow 里留痕')
+    // 用户可见兜底不变：面板仍靠自己的 err 渲染（「加载失败：<映射文案>」），留痕只是多一条控制台线索。
+    assert.ok(src.includes('加载失败：' + '$' + '{loadErrorText(e)}') && src.includes('loadErrorText(e)'),
+      '留痕不能取代面板自己的可见错误')
+  })
+
+  await aok('结构红线: C7-052 抽屉不许说「能与背后并排对照」（判据绑实现、按语义扫全部文档面）', () => {
+    const src = readConsoleSource()
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const block = (head) => {
+      const i = css.indexOf(head)
+      if (i < 0) return ''
+      const open = css.indexOf('{', i)
+      if (open < 0) return ''
+      let depth = 0
+      for (let k = open; k < css.length; k++) {
+        if (css[k] === '{') depth++
+        else if (css[k] === '}' && --depth === 0) return css.slice(open, k + 1)
+      }
+      return ''
+    }
+    // ① 判据的事实依据来自实现（返工 C7-052）：遮罩 fixed + inset:0 盖满视口、::before 用
+    //    rgba 黑压暗、抽屉自己只占 min(520px,100%)。三条同时成立 ⇒「背后的列表/表单能并排
+    //    对照」是假话。这一段是行为侧断言：实现真改成分栏（不再盖满 / 不再压暗）就先红，
+    //    逼着连文档和判据一起改，而不是让注释自说自话。
+    const backdrop = block('\n  .drawer-backdrop {')
+    const before = block('.drawer-backdrop::before {')
+    const drawer = block('\n  .drawer {')
+    assert.ok(/position:\s*fixed/.test(backdrop) && /inset:\s*0/.test(backdrop),
+      '抽屉遮罩必须是 fixed + inset:0（盖满视口）：要改成分栏并排，就得同时改文档与本断言')
+    const alpha = /background:\s*rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*([\d.]+)\s*\)/.exec(before)
+    assert.ok(alpha !== null && Number(alpha[1]) >= 0.4,
+      '遮罩必须以 ≥0.4 不透明度的黑压暗背后内容（背后那层因此不能当对照面）')
+    assert.ok(/width:\s*min\(var\(--drawer-w,\s*520px\),\s*100%\)/.test(drawer),
+      '抽屉宽度口径必须是 min(var(--drawer-w,520px),100%)（桌面 520 / 手机铺满）')
+    // ② 语义扫描：README / SYSTEM_CONTRACT / app.css / 全部前端模块里，凡是「抽屉语境」下的
+    //    「对照 / 参照 / 并看」一律只能是否定口径。不钉具体句子 ⇒ 换个措辞（「留出左侧列表做
+    //    对照」「表单留在背后做对照」「要对照用抽屉」）同样会被抓到；语境取同句或前后三行，
+    //    因为注释块/文档条目里的「抽屉」常写在上一句。
+    const CLAIM = /对照|参照|并看/
+    const DRAWER_CTX = /抽屉|Drawer|drawer|遮罩/
+    const NEGATED = /(不算|不是|不能|没有|没法|无法|不可能|不得|别|而非)[^。；]{0,16}(并排|左右|对照|参照|并看)|(并排|左右|对照|参照|并看)[^。；]{0,10}(不成立|不可能|做不到|的余地)/
+    const surfaces = [
+      ['README.md', fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')],
+      ['SYSTEM_CONTRACT.md', fs.readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')],
+      ['scripts/console-assets/app.css', css]
+    ]
+    for (const file of CONSOLE_MODULE_FILES) {
+      surfaces.push(['scripts/console-assets/' + file, fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8')])
+    }
+    let judged = 0
+    for (const [file, body] of surfaces) {
+      const lines = body.split('\n')
+      lines.forEach((line, i) => {
+        for (const raw of line.split(/[。；]/)) {
+          const sentence = raw.trim()
+          if (sentence === '' || !CLAIM.test(sentence)) continue
+          if (!DRAWER_CTX.test(lines.slice(Math.max(0, i - 3), i + 4).join('\n'))) continue
+          assert.ok(NEGATED.test(sentence),
+            `${file}:${i + 1}「${sentence.slice(0, 60)}」把抽屉写成能与背后内容对照；` +
+            '实现是盖满视口 + 压暗，只能写「留在原处但被遮罩压暗、不能并排对照」')
+          judged++
+        }
+      })
+    }
+    // 扫描面必须真的命中抽屉的「对照」叙述：命中数是 0/1 说明语境界定写歪了，等于没扫。
+    assert.ok(judged >= 4, `抽屉的「对照」叙述必须真的被扫到（只命中 ${judged} 处 ⇒ 语境界定写歪了，等于没扫）`)
+    // ③ 三处文档面必须正面写明「被遮罩压暗 + 不能并排对照」：只把「做对照」几个字删掉不算修好。
+    const readme = surfaces[0][1]
+    const readmeAt = readme.indexOf('- 抽屉（v3.378')
+    assert.ok(readmeAt > -1, 'README 必须还留着抽屉条目（锚点缺失说明条目被改名/删了）')
+    const mustState = [
+      ['README.md 的抽屉条目', readme.slice(readmeAt, readme.indexOf('\n', readmeAt))],
+      ['components.js 的抽屉用法说明', sliceBetween(src, '// ── 组件：右侧抽屉', 'function Drawer (', '抽屉用法说明')],
+      ['pages.js 的保存复核注释', sliceBetween(src, '// 保存前复核是「核对」不是「确认」', 'const wide = Array.isArray(dialog.wide)', '保存复核注释')]
+    ]
+    for (const [label, seg] of mustState) {
+      assert.ok(seg.includes('压暗'), `${label} 必须写明背后被遮罩压暗（不能只把「做对照」几个字删掉）`)
+      assert.ok(NEGATED.test(seg.replace(/\n/g, '')), `${label} 必须写明不能并排对照（措辞可变，口径必须是否定）`)
+    }
+    // ④ 旧的两条字面量与「版本号只留一处溯源」原样保留（回退到旧措辞时它们仍会先报错）。
+    assert.ok(!src.includes('与列表并排做对照'), '注释不得声称抽屉与列表并排对照（遮罩把列表压暗了）')
+    assert.ok(!src.includes('列表留在背后做对照'), '注释不得声称列表在背后「做对照」')
+    assert.ok(src.includes('但被遮罩压暗、不算并排对照'), '抽屉注释必须写明遮罩压暗、不是并排对照')
+    assert.ok(src.includes('桌面从右侧占 520px，手机铺满整屏'), '抽屉注释必须写明桌面 520px / 手机铺满')
+    // 版本号只作「这条规矩哪来的」溯源，不得当成变更日志的分行清单：抽屉这一段不许再堆 v3.xxx 行。
+    const drawerSeg = sliceBetween(src, '// ── 推送记录：条目详情抽屉', 'function DetailRow', '抽屉注释')
+    assert.strictEqual((drawerSeg.match(/v3\.\d+/g) || []).length, 1,
+      '抽屉注释只保留一处版本溯源（v3.379），不堆版本号当变更日志')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

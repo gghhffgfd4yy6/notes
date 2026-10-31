@@ -741,6 +741,16 @@ function loadErrorText (e) {
   return raw === '' ? '未知错误' : raw
 }
 
+// 后台失败留痕（C7-045）：这类请求不打断界面（面板自己的 err 会渲染、草稿另有「未同步」
+// 标记），但旧写法一律 `.catch(() => {})`，排障时完全无声 —— 谁在反复失败、失败在哪条链路
+// 都查不到。统一走一条带作用域的控制台错误，不影响用户可见行为。
+function logBgFailure (scope) {
+  return (e) => {
+    if (typeof console === 'undefined' || typeof console.error !== 'function') return
+    console.error(`[xbk-console] ${scope}失败：`, e)
+  }
+}
+
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
 function usePanelLoader (apiFn, onLoaded, initialData = null) {
@@ -784,6 +794,24 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
 // 首屏停在推送记录页时，不再替概览/系统页预取 /api/trends、/api/run-history、
 // /api/access-log、/api/cache-health（旧版「先拉一遍，点开就有」要 17 个请求、71KB）。
 // 首帧空白由面板自己的骨架补（见 PanelSkeleton）。
+// 单飞 + 结算时间戳（C7-019）：上一发未回就不再发（force=true 例外，供「load 身份变了」的
+// 强制补发）；成功回来记时间，给调用方的新鲜度判断用。三份「懒加载 + 节流」里的两份
+// （本 hook 与 SysPanel）共用这一段，差异只剩新鲜度阈值：hook 的 3000 被 test_console.js
+// 逐字锁定，SysPanel 用 PANEL_FRESH_MS。
+function runAutoLoad ({ pendingRef, loadedAtRef, load, queue = false, force = false, onSettled }) {
+  if (pendingRef.current && !force) return false
+  pendingRef.current = true
+  const p = queue ? load(true) : load()
+  Promise.resolve(p)
+    .then(() => {
+      loadedAtRef.current = Date.now()
+      if (typeof onSettled === 'function') onSettled()
+    })
+    .catch(() => {})
+    .finally(() => { pendingRef.current = false })
+  return true
+}
+
 // queue=true 用于日志这种自带互斥的 loader（在飞时排队，而不是丢掉这次刷新）。
 function usePanelAutoLoad (active, load, { queue = false } = {}) {
   const seenRef = useRef(null)
@@ -805,9 +833,7 @@ function usePanelAutoLoad (active, load, { queue = false } = {}) {
     // 的同一判定换成了 PANEL_FRESH_MS，这一份保持原样以免动到既有断言）。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current && !loadChanged) return
-    pendingRef.current = true
-    const p = queue ? load(true) : load()
-    Promise.resolve(p).then(() => { loadedAtRef.current = Date.now() }).catch(() => {}).finally(() => { pendingRef.current = false })
+    runAutoLoad({ pendingRef, loadedAtRef, load, queue, force: loadChanged })
   }, [active, load, queue])
 }
 
@@ -1149,14 +1175,18 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 认 active 不认 paused：暂停自动刷新时手动下拉照样要能刷。
   usePullRefresh(active, () => Promise.allSettled([load(), filesLoader.load()]))
   const ok = data && data.status === 'ok'
+  // C7-023：limits 必须「全守」——旧写法只在 readCap 一处判存在性，条目数/字节上限直接解引用；
+  // 服务端漏下发 limits（老版本 / 中间层裁剪）时整页在渲染期抛 TypeError，连「不可读」都看不到。
+  // 现在统一定义 lim：拿不到就整块不画上限对照，另给一条如实提示。
+  const lim = ok && data.limits && typeof data.limits === 'object' ? data.limits : null
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
   // 最近写入：显示相对时间；超过 24 小时只陈述事实（不推断链路断没断——调度暂停同样会这样）。
   const write = ok ? cacheWriteInfo(data.mtimeMs) : { ageText: '', stale: false }
   // 控制台可读：长解释收进 title，首屏只留结论。上限取服务端下发的
   // limits.consoleReadMaxBytes（此前写死 32 MiB，服务端调到 64 MiB 后文案说谎）。
-  const readCap = ok && data.limits && typeof data.limits.consoleReadMaxBytes === 'number'
-    ? fmtBytes(data.limits.consoleReadMaxBytes)
+  const readCap = lim && typeof lim.consoleReadMaxBytes === 'number'
+    ? fmtBytes(lim.consoleReadMaxBytes)
     : '控制台读取上限'
   const readableText = data && data.consoleReadable
     ? `是（未超 ${readCap} 读取封顶）`
@@ -1165,19 +1195,20 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 条数预警：服务端在 cache-health 响应里附带 entryCount（/api/status 同源的
   // readMessageCount；tooLarge 时 null）对照写端条目上限；接近上限时下轮保存
   // 会裁最旧条目（与字节裁剪同一出口）。
-  const entryNear = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax * 0.8
-  const entryOver = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax
+  const entryNear = lim && typeof data.entryCount === 'number' && data.entryCount >= lim.entryMax * 0.8
+  const entryOver = lim && typeof data.entryCount === 'number' && data.entryCount >= lim.entryMax
   const files = filesLoader.data && Array.isArray(filesLoader.data.files) ? filesLoader.data.files : []
   return html`<div class="panel">
     <${PanelHead} title="缓存健康" sub=${(data && data.file ? data.file : 'push.json') + ' · 判重缓存占用'}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !ok && html`<div class="empty">${data.status === 'missing' ? '缓存尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
-    ${ok && html`<div class="sys-grid">
+    ${ok && !lim && html`<${Hint} tone="error">服务端没有下发缓存上限（limits），本页暂不显示字节/条目对照；缓存本身不受影响。<//>`}
+    ${lim && html`<div class="sys-grid">
       <table class="sys-table"><tbody>
-        <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(data.limits.writeMaxBytes)}）</td></tr>
+        <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(lim.writeMaxBytes)}）</td></tr>
         <tr><td>占用比例</td><td>${ratioText}${data.nearTrim ? ' · ⚠️ 临近字节裁剪' : ''}${data.overLimit ? ' · ⛔ 已超写端上限' : ''}</td></tr>
-        <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${data.limits.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${data.limits.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
+        <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${lim.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${lim.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
         <tr><td>控制台可读</td><td title=${readableTitle}>${readableText}</td></tr>
       </tbody></table>
       <div class="cache-side">
@@ -1618,6 +1649,13 @@ function sameMsgFilters (a, b) {
     a.days === b.days && a.from === b.from && a.to === b.to
 }
 
+// 响应归属指纹（C7-022）：把「这次请求实际用的筛选」随响应一起带回，渲染时与当前筛选比对。
+// 旧实现只记了 query（loadedQueryRef），换分类/翻页/换时间窗时 loader 保留的旧 data
+// 会原样挂在新筛选下面（条数、页码、分类计数全是上一组的），页面上没有任何提示。
+function msgFilterKey ({ q, cate, page, size, days, from, to }) {
+  return [q, cate, page, size, days, from, to].join('\u0000')
+}
+
 function buildMessagesHash (state) {
   const p = new URLSearchParams()
   if (state.q) p.set('q', state.q)
@@ -1636,7 +1674,8 @@ function buildMessagesHash (state) {
 
 // ── 推送记录：条目详情抽屉（v3.379）────────────────────────────────────────
 // 行内展开会把下面的条目顶走：读一条正文，列表就换了位置，想接着看下一条还得重新找。
-// 改成右侧抽屉后列表原地不动（滚动位置不跳），抽屉宽度 520 与列表并排做对照。
+// 改成右侧抽屉后列表原地不动（滚动位置不跳）。注意它不是「并排对照」：抽屉带遮罩压暗
+// 列表，桌面从右侧占 520px，手机铺满整屏（见 app.css 的 .drawer-backdrop / .drawer）。
 // 抽屉里只有「标签 + 值」的行，布局走最小内联样式——键值表只在抽屉里出现一次，
 // 故不复用列表卡片的 .msg-meta（那是横向 pill 行，不是键值表）。
 function DetailRow ({ label, children }) {
@@ -1776,13 +1815,21 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     () => {
       const requested = query
       const seq = ++loadSeqRef.current
+      // C7-022：本次请求用的筛选指纹随响应带回（见 msgFilterKey），渲染时据此判「这份数据
+      // 属不属于当前筛选」。服务端字段原样保留，只多挂一个 filterKey。
+      const key = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })
       return apiGetMessages({ page, size, cate, q: requested, days: rangeActive ? 0 : days, from: range.from, to: range.to }).then((d) => {
         if (seq === loadSeqRef.current) loadedQueryRef.current = requested
-        return d
+        return d && typeof d === 'object' ? { ...d, filterKey: key } : d
       })
     },
     [page, size, cate, query, days, rangeActive, range.from, range.to])
   const { data, err, load, loading, settleTick } = usePanelLoader(fetchMessages, onSync)
+  // 当前筛选的指纹：与 data.filterKey 不一致表示屏幕上的条目属于上一组筛选（换分类/翻页/
+  // 换时间窗/改搜索词后的在飞窗口，或这次请求失败后退回的旧数据）。旧实现没有任何标记，
+  // 用户看到的是「新筛选 + 旧条目 + 旧页码」。
+  const filtersKey = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })
+  const filtersStale = !!(data && data.status === 'ok' && data.filterKey !== filtersKey)
   const slowLoading = useSlowFlag(loading)
   // 分页器禁用态的「在飞」部分延迟 120ms 才置位（C7-041，见下面 renderPager）：一次翻页的
   // loading 常常只存在十几毫秒（条件请求命中 304 / 本地缓存快），整排按钮立刻压到 .7 透明度
@@ -2042,6 +2089,13 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
     ${err && html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`}
+    ${/* C7-022：归属提示。换分类/翻页/换时间窗后请求还没回来（或失败退回旧数据）时，
+         屏幕上的条目、条数、页码都属于上一组筛选——必须明说，不能让旧数据冒充新筛选的结果。 */ ''}
+    ${filtersStale && html`<div class="msg-count msg-loading" role="status" aria-live="polite">${
+      loading
+        ? `筛选已改变，正在加载新结果… 下面仍是上一组筛选的 ${data.total} 条`
+        : `这次加载没成功，下面仍是上一组筛选的 ${data.total} 条；点「刷新」再试`
+    }</div>`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
     ${loading && !data && html`<${PanelSkeleton} label="正在加载推送记录" />`}
@@ -2079,8 +2133,9 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
         </div>`}
       ${renderPager(loading && pagerSlow)}
     </div>`}
-    ${/* v3.379：条目详情抽屉。列表留在背后做对照（滚动位置不动），宽度 520 与抽屉默认值一致，
-         手机上由 Drawer 自己铺满整屏。detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
+    ${/* v3.379：条目详情抽屉。列表留在背后不动（滚动位置不跳），但被遮罩压暗、不算并排对照；
+           width=520 与 .drawer 的默认宽度一致，手机上由 CSS 的 min(520px, 100%) 铺满整屏。
+           detail 是打开那一刻的快照，轮询换掉 items 也不影响阅读。 */ ''}
     ${detail && html`<${Drawer} open=${true} width=${520}
       title=${detail.title ? hit(detail.title, hitMarkStyle) : '（无标题）'}
       sub=${msgTimeText(detail)}
@@ -2165,6 +2220,14 @@ function SearchPanel ({ onSync, active = true }) {
   const markedRef = useRef('')
   // 关注词列表的版本号：读写并发时，旧 GET/旧检查结果不得覆盖新状态（Sourcery #328）。
   const watchEpoch = useRef(0)
+  // C7-036：取消关注是「删了就回不来」的动作（要加回来得重新搜一次），先确认再发。
+  // 弹窗关掉后焦点不能跟着 × 一起卸载掉到 body——落到关注词区域（键盘用户接着往下走）。
+  const [askRemove, setAskRemove] = useState(null)
+  const watchBoxRef = useRef(null)
+  useEffect(() => {
+    if (active) return
+    setAskRemove(null)
+  }, [active])
 
   const fetchSearch = useCallback(() => {
     if (req.q === '') return Promise.resolve({ status: 'empty', q: '', page: 1, pages: 1, count: 0, items: [] })
@@ -2237,7 +2300,7 @@ function SearchPanel ({ onSync, active = true }) {
   }
   const removeWatch = (q) => {
     watchEpoch.current += 1
-    apiPostLineWatch({ action: 'remove', q }).then((d) => {
+    return apiPostLineWatch({ action: 'remove', q }).then((d) => {
       watchEpoch.current += 1
       setWatch(Array.isArray(d.words) ? d.words : [])
       setNewCounts((prev) => {
@@ -2352,7 +2415,7 @@ function SearchPanel ({ onSync, active = true }) {
         delete next[req.q]
         return next
       })
-    }).catch(() => {})
+    }).catch(logBgFailure('关注词已读回写'))
   }, [data, req, watch])
 
   // 地址栏跟随筛选（只 replaceState，不新增历史记录）；刷新/后退能回到同一页。
@@ -2476,7 +2539,7 @@ function SearchPanel ({ onSync, active = true }) {
       <div class="ls-cfg-help">「搜索页每页」只管搜索页翻页，不影响监控。开启监控后，每 ${cfgDraft.intervalMin} 分钟看一次关注词：上次检查之后多出来的线报，每条单独推送；没有新的就不推。监控会从最新往回翻到上次检查的位置（最多 5 页），不会因为超过一页的条数就漏推。推过的会记在文件里，重启不重推。</div>
       ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查时间：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
     </details>
-    <div class="ls-watch">
+    <div class="ls-watch" ref=${watchBoxRef} tabIndex=${-1} aria-label="关注词">
       <div class="ls-watch-head">
         <span class="ls-watch-title">关注词</span>
         ${watch.length > 0 && html`<${Button} variant="ghost" disabled=${checking} onClick=${checkWatch}>${checking ? '检查中…' : '检查更新'}<//>`}
@@ -2487,11 +2550,27 @@ function SearchPanel ({ onSync, active = true }) {
         : html`<div class="ls-chips">
           ${watch.map((w) => html`<span class="ls-chip-wrap" key=${w.q}>
             <button type="button" class="ls-chip${w.q === req.q ? ' on' : ''}" onClick=${() => searchWatch(w)}>${w.q}${newCounts[w.q] > 0 ? html`<span class="ls-chip-n">${newCounts[w.q]} 条新</span>` : ''}</button>
-            <button type="button" class="ls-chip-x" aria-label=${`取消关注 ${w.q}`} title="取消关注" onClick=${() => removeWatch(w.q)}>×</button>
+            <button type="button" class="ls-chip-x" aria-label=${`取消关注 ${w.q}`} title="取消关注" onClick=${() => setAskRemove(w.q)}>×</button>
           </span>`)}
         </div>`}
       ${watchErr && html`<${Hint} tone="error">${watchErr}<//>`}
     </div>
+    ${/* C7-036：取消关注先确认再发；确认后把焦点落回关注词区域（× 随行卸载后焦点会掉到 body）。 */ ''}
+    <${ConfirmDialog} open=${askRemove !== null && active}
+      title="取消关注这个词？"
+      confirmLabel="取消关注"
+      onConfirm=${() => {
+        const q = askRemove
+        setAskRemove(null)
+        Promise.resolve(removeWatch(q)).finally(() => {
+          const el = watchBoxRef.current
+          if (el && el.isConnected && typeof el.focus === 'function') el.focus({ preventScroll: true })
+        })
+      }}
+      onCancel=${() => setAskRemove(null)}>
+      <div>「${askRemove || ''}」会从关注词里删掉；要加回来得重新搜一次这个词。</div>
+      <div class="modal-note">已经推过的线报不受影响，推送记录里仍在。</div>
+    <//>
     ${body}
   </div>`
 }
@@ -3177,6 +3256,23 @@ function backupEntrySummary (last) {
   return `${last.kind === 'import' ? '上次导入' : '上次导出'} ${stamp}${last.detail ? ` · ${last.detail}` : ''}`
 }
 
+// 异步动作的公共状态机（C7-020）：清错 → 置 busy（标签）→ 执行 → 失败写横幅 → finally 复位。
+// 六个动作（解密 / 导入 / 生成设置密钥 / 确认开启 / 关闭两步验证 / 退出设备）此前各抄一份
+// 「setBusy→try→catch→finally」，改一处漏五处；这里只收状态机，业务与失败文案仍留在调用点。
+async function runBusyAction ({ setBusy, setErr, tag, label, run, onStart }) {
+  setBusy(tag)
+  setErr('')
+  if (typeof onStart === 'function') onStart()
+  try {
+    return await run()
+  } catch (e) {
+    setErr(`${label}：${e && e.message ? e.message : e}`)
+    return undefined
+  } finally {
+    setBusy('')
+  }
+}
+
 function BackupBlock ({ onImported }) {
   const [selected, setSelected] = useState(() => {
     const out = {}
@@ -3308,19 +3404,20 @@ function BackupBlock ({ onImported }) {
   const doUnlock = async () => {
     if (!locked || busy !== '') return
     if (unlockPassword === '') { setErr('请输入备份密码'); return }
-    setBusy('unlock'); setErr('')
-    try {
-      const bundle = await decryptBackup(locked.data, unlockPassword)
-      const parts = backupFileSummary(bundle.data)
-      if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
-      setPending({ bundle, summary: parts, key: newBackupImportKey(), encrypted: true })
-      setLocked(null)
-      setUnlockPassword('')
-    } catch (e) {
-      setErr(`解密失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'unlock',
+      label: '解密失败',
+      run: async () => {
+        const bundle = await decryptBackup(locked.data, unlockPassword)
+        const parts = backupFileSummary(bundle.data)
+        if (parts.length === 0) throw new Error('备份文件里没有可恢复的数据')
+        setPending({ bundle, summary: parts, key: newBackupImportKey(), encrypted: true })
+        setLocked(null)
+        setUnlockPassword('')
+      }
+    })
   }
   const closeUnlock = () => {
     if (busy === 'unlock') return
@@ -3328,32 +3425,33 @@ function BackupBlock ({ onImported }) {
   }
   const doImport = async () => {
     if (!pending || busy !== '') return
-    setBusy('import'); setErr('')
-    try {
-      const res = await apiPostBackupImport(pending.bundle, pending.key)
-      // consumeJsonResult 对非 2xx 只回 { ok:false, status, data }，不抛错：409 busy /
-      // 400 校验失败 / 507 审计满原本都会走进成功分支并提示「导入完成」。先过这一道；
-      // 抛错时 pending 不清 ⇒ 确认弹窗仍开着、错误显示在弹窗里，可直接改完重试。
-      const problem = backupImportProblem(res)
-      if (problem !== '') throw new Error(problem)
-      setPending(null)
-      const result = res && res.data ? res.data : (res || {})
-      const imported = result.imported ? result.imported : {}
-      const bits = []
-      if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
-      if (imported.dedup) bits.push('判重历史')
-      if (imported.filter) bits.push('过滤规则')
-      if (imported.settings) bits.push('控制台设置')
-      if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
-      if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
-      setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
-      setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
-      if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
-    } catch (e) {
-      setErr(`导入失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'import',
+      label: '导入失败',
+      run: async () => {
+        const res = await apiPostBackupImport(pending.bundle, pending.key)
+        // consumeJsonResult 对非 2xx 只回 { ok:false, status, data }，不抛错：409 busy /
+        // 400 校验失败 / 507 审计满原本都会走进成功分支并提示「导入完成」。先过这一道；
+        // 抛错时 pending 不清 ⇒ 确认弹窗仍开着、错误显示在弹窗里，可直接改完重试。
+        const problem = backupImportProblem(res)
+        if (problem !== '') throw new Error(problem)
+        setPending(null)
+        const result = res && res.data ? res.data : (res || {})
+        const imported = result.imported ? result.imported : {}
+        const bits = []
+        if (Number.isInteger(imported.messages)) bits.push(`推送记录 ${imported.messages} 条`)
+        if (imported.dedup) bits.push('判重历史')
+        if (imported.filter) bits.push('过滤规则')
+        if (imported.settings) bits.push('控制台设置')
+        if (Number.isInteger(imported.autoInterval)) bits.push(`自动运行间隔 ${imported.autoInterval} 秒`)
+        if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
+        setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
+        setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
+        if (typeof onImported === 'function') Promise.resolve(onImported()).catch(logBgFailure('导入后刷新'))
+      }
+    })
   }
   return html`<div class="cfg-block backup-block">
     <div class="backup-actions backup-actions-main">
@@ -3463,6 +3561,14 @@ function TwoFactorBlock ({ active = true }) {
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
+  // C7-037：「退出所有信任设备」会把包括当前这台在内的所有浏览器踢下线（下次都要重输验证码），
+  // 一次误触就要重新配一遍——必须先弹确认。与 C7-001/C7-009 同口径：切页即收口，
+  // 隐藏 section 里的 dialog 会塌成 0×0 且整页继续 inert。
+  const [revokeAsk, setRevokeAsk] = useState(false)
+  useEffect(() => {
+    if (active) return
+    setRevokeAsk(false)
+  }, [active])
 
   const load = useCallback(() => {
     setErr('')
@@ -3484,68 +3590,76 @@ function TwoFactorBlock ({ active = true }) {
   }
   const startSetup = async () => {
     if (busy !== '') return
-    setBusy('setup'); setErr(''); setNote(''); setRecoveryCodes([])
-    try {
-      const res = await apiPostTwoFactorSetup()
-      if (!res.ok) throw new Error(messageOf(res))
-      setSetup(res.data || null)
-      setCode('')
-    } catch (e) {
-      setErr(`生成设置密钥失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'setup',
+      label: '生成设置密钥失败',
+      onStart: () => { setNote(''); setRecoveryCodes([]) },
+      run: async () => {
+        const res = await apiPostTwoFactorSetup()
+        if (!res.ok) throw new Error(messageOf(res))
+        setSetup(res.data || null)
+        setCode('')
+      }
+    })
   }
   const enable = async () => {
     if (busy !== '' || !setup || code.trim().length < 6) return
-    setBusy('enable'); setErr(''); setNote('')
-    try {
-      const res = await apiPostTwoFactorEnable(code.trim(), setup.setupId)
-      if (!res.ok) throw new Error(messageOf(res))
-      const data = res.data || {}
-      setRecoveryCodes(Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [])
-      setStatus({ enabled: true, pending: false, recoveryRemaining: data.recoveryRemaining || 0 })
-      setSetup(null)
-      setCode('')
-      setNote('两步验证已开启。下次打开控制台要再输一次手机上的 6 位数字。')
-    } catch (e) {
-      setErr(`确认开启失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'enable',
+      label: '确认开启失败',
+      onStart: () => setNote(''),
+      run: async () => {
+        const res = await apiPostTwoFactorEnable(code.trim(), setup.setupId)
+        if (!res.ok) throw new Error(messageOf(res))
+        const data = res.data || {}
+        setRecoveryCodes(Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [])
+        setStatus({ enabled: true, pending: false, recoveryRemaining: data.recoveryRemaining || 0 })
+        setSetup(null)
+        setCode('')
+        setNote('两步验证已开启。下次打开控制台要再输一次手机上的 6 位数字。')
+      }
+    })
   }
   const disable = async () => {
     if (busy !== '' || disableCode.trim() === '') return
-    setBusy('disable'); setErr(''); setNote('')
-    try {
-      const res = await apiPostTwoFactorDisable(disableCode.trim())
-      if (!res.ok) throw new Error(messageOf(res))
-      setStatus({ enabled: false, pending: false, recoveryRemaining: 0 })
-      setDisableOpen(false)
-      setDisableCode('')
-      setRecoveryCodes([])
-      setNote('两步验证已关闭。')
-    } catch (e) {
-      setErr(`关闭失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'disable',
+      label: '关闭失败',
+      onStart: () => setNote(''),
+      run: async () => {
+        const res = await apiPostTwoFactorDisable(disableCode.trim())
+        if (!res.ok) throw new Error(messageOf(res))
+        setStatus({ enabled: false, pending: false, recoveryRemaining: 0 })
+        setDisableOpen(false)
+        setDisableCode('')
+        setRecoveryCodes([])
+        setNote('两步验证已关闭。')
+      }
+    })
   }
   // 「退出所有信任设备」（v3.374）：清空服务端列表并让这台浏览器的设备 Cookie 失效，
-  // 之后每台设备（包括当前这台）下次打开都要重新输验证码。
+  // 之后每台设备（包括当前这台）下次打开都要重新输验证码。C7-037 起先过确认弹窗。
   const revokeDevices = async () => {
     if (busy !== '') return
-    setBusy('revoke'); setErr(''); setNote('')
-    try {
-      const res = await apiPostDevicesRevoke()
-      if (!res.ok) throw new Error(messageOf(res))
-      setStatus((prev) => ({ ...(prev || {}), trustedDevices: 0 }))
-      setNote('所有信任设备都已退出。下次在任何设备上打开控制台，都要重新输验证码。')
-    } catch (e) {
-      setErr(`退出信任设备失败：${e && e.message ? e.message : e}`)
-    } finally {
-      setBusy('')
-    }
+    await runBusyAction({
+      setBusy,
+      setErr,
+      tag: 'revoke',
+      label: '退出信任设备失败',
+      onStart: () => setNote(''),
+      run: async () => {
+        const res = await apiPostDevicesRevoke()
+        if (!res.ok) throw new Error(messageOf(res))
+        setStatus((prev) => ({ ...(prev || {}), trustedDevices: 0 }))
+        setNote('所有信任设备都已退出。下次在任何设备上打开控制台，都要重新输验证码。')
+      }
+    })
   }
   const copyText = async (text) => {
     let err = null
@@ -3601,7 +3715,7 @@ function TwoFactorBlock ({ active = true }) {
     </div>`}
     ${status && status.enabled && html`<div class="twofa-row">
       <div class="cfg-block-sub">已记住 ${status.trustedDevices || 0} 台设备。勾了「记住这台设备」的浏览器，90 天内打开控制台不用再输验证码；最多记 20 台，满了自动把最久没用的挤掉。</div>
-      <${Button} variant="secondary" disabled=${busy !== '' || !(status.trustedDevices > 0)} onClick=${revokeDevices}>${busy === 'revoke' ? '退出中…' : '退出所有信任设备'}<//>
+      <${Button} variant="secondary" disabled=${busy !== '' || !(status.trustedDevices > 0)} onClick=${() => setRevokeAsk(true)}>退出所有信任设备<//>
     </div>`}
     ${disableOpen && html`<div class="twofa-setup">
       <div class="twofa-step">关闭前先输一次当前验证码（或恢复码）：</div>
@@ -3616,6 +3730,16 @@ function TwoFactorBlock ({ active = true }) {
       <div class="twofa-codes">${recoveryCodes.map((c) => html`<code key=${c}>${c}</code>`)}</div>
       <${Button} variant="ghost" disabled=${busy !== ''} onClick=${() => copyText(recoveryCodes.join('\n'))}>复制全部<//>
     </div>`}
+    ${/* C7-037：误触一次就要在每台设备上重新过一遍验证码，先确认再发。 */ ''}
+    <${ConfirmDialog} open=${revokeAsk && active}
+      title="退出所有信任设备？"
+      confirmLabel=${busy === 'revoke' ? '退出中…' : '全部退出'}
+      busy=${busy === 'revoke'}
+      onConfirm=${() => { revokeDevices().finally(() => setRevokeAsk(false)) }}
+      onCancel=${() => { if (busy !== 'revoke') setRevokeAsk(false) }}>
+      <div>会清空 ${status && status.trustedDevices ? status.trustedDevices : '所有'} 台已记住的设备——<b>包括当前这台浏览器</b>。</div>
+      <div class="modal-note">之后每台设备打开控制台都要重新输一次手机上的 6 位数字；恢复码仍然可用，不会被清掉。</div>
+    <//>
     <${Hint}>两步验证只保护浏览器打开控制台；接口仍使用访问令牌。手机丢了用恢复码，恢复码丢了只能让部署者删除 <code>console-2fa.json</code> 后重配。<//>
   </div>`
 }
@@ -3676,14 +3800,15 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     // （/api/sys + /api/access-log + /api/config/console），首次进入才算首访。
     if (!active) return
     // 首次点开时上一发还在飞/刚回来不到 3s，直接用手里的数据；更久才点开则补一次。
+    // 单飞闸与结算时间戳交给公共的 runAutoLoad（C7-019）：这段骨架原先是 usePanelAutoLoad
+    // 的第二份手抄，改一处漏一处。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < PANEL_FRESH_MS))) return
-    if (pendingRef.current) return
-    pendingRef.current = true
-    Promise.allSettled([load(), loadAccess(), loadSettings()]).then(() => {
-      pendingRef.current = false
-      loadedAtRef.current = Date.now()
-      setReadyTick((v) => v + 1)
-    }).catch(() => {})
+    runAutoLoad({
+      pendingRef,
+      loadedAtRef,
+      load: () => Promise.allSettled([load(), loadAccess(), loadSettings()]),
+      onSettled: () => setReadyTick((v) => v + 1)
+    })
   }, [active, load, loadAccess, loadSettings])
   // 设置块每次读到（含轮询）就同步给 App 的顶栏缓存：别的标签页改了 syncShowDate，
   // 这边最多一个轮询周期就跟上，不用等用户手动保存（Sourcery #303 M6）。
@@ -4247,7 +4372,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         setDraftSavedAt(0)
         setDraftSyncedAt(0)
         // 草稿和正式规则一样，已经没有任何可恢复的内容：把服务器那份也清掉。
-        if (remote) apiDeleteFilterDraft().catch(() => {})
+        if (remote) apiDeleteFilterDraft().catch(logBgFailure('服务器草稿清理'))
       }
     } else {
       setDraftSavedAt(0)
@@ -4310,7 +4435,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
             }
             return false
           })
-          .catch(() => false)
+          .catch((e) => { logBgFailure('服务器草稿同步')(e); return false })
       })
     draftPushChainRef.current = task.catch(() => false)
     return task
@@ -4874,8 +4999,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     if (!dialog) return null
     if (dialog.kind === 'save') {
       // 保存前复核是「核对」不是「确认」：改动字段 + 补推影响 + 命中样本都可能很长，
-      // 弹窗会把背后的表单挡死、用户没法对照着看哪个字段写成了什么。改成右侧抽屉
-      // （宽 560，含 .* 全命中规则时 640），表单留在背后做对照。
+      // 居中弹窗只有 440 宽、又没有自己的滚动区，长内容会顶出屏幕。改成右侧抽屉
+      // （宽 560，含 .* 全命中规则时 640，.drawer-body 自己滚）：表单留在原处但被
+      // 遮罩压暗，不能并排对照。
       // 短确认（未保存离开的三选一）仍走居中弹窗：那类内容一屏就够，弹窗更省视线移动。
       const wide = Array.isArray(dialog.wide) ? dialog.wide : []
       const changed = Array.isArray(dialog.changed) ? dialog.changed : []
