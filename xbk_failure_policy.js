@@ -34,6 +34,25 @@ function safeString (value) {
   try { return String(value === undefined || value === null ? '' : value) } catch (e) { return '' }
 }
 
+// C9-005：脱敏的输入必须有界，且顺序必须是「先截断、再脱敏」。
+//  · 进 redact 的文本来自外部响应体（网关把 HTML/JSON 回显进 message/failureInfo 是常见形态）。
+//    C9-001 把 redact 修成线性之后，这里仍是「线性 × 无界长度」——旧实现的 500 字符上限
+//    只在脱敏**之后**生效，只保护日志体积，不保护 CPU。
+//  · 非 message/reason 的字符串字段此前**完全没有上限**（redact(value) 后原样返回），
+//    任意大的外部字符串可以整段进摘要、再进 run.log。
+// 2000 字符足够覆盖任何凭据前缀（脱敏只需前缀；先截断只会「多抹」不会「少抹」——
+// 被截掉的尾部本来就不会出现在 message 的 500 字符窗口里）。
+const MAX_FAILURE_TEXT_CHARS = 2000 // 进脱敏前的原始字符上限
+const MAX_FAILURE_MESSAGE_CHARS = 500 // message/reason 的落盘上限（原有口径）
+const MAX_FAILURE_CHANNEL_CHARS = 40 // channel 的落盘上限（原有口径）
+const MAX_FAILURE_CODE_CHARS = 200 // code/name/providerCode/failureReason 的落盘上限（新增）
+
+/** 安全字符串化 + 截断：任何字段都不允许把无界外部文本带进脱敏与日志（C9-005）。 */
+function boundedText (value, max = MAX_FAILURE_TEXT_CHARS) {
+  const text = safeString(value)
+  return text.length > max ? text.slice(0, max) : text
+}
+
 // XFP-04（含独立对抗审查 A 组与 qodo #152 的补漏）：脱敏必须**整体**抹掉凭据，且要覆盖写法差异。
 // 一条键值规则 + 一条裸 scheme 规则，比按形态堆多条正则更好推理，也不会出现「前一条把后一条的
 // 输入改掉」的耦合。
@@ -260,9 +279,11 @@ function sanitizeFailureInfo (info, ancestors, depth) {
       continue
     }
     // message/reason 与常规路径一致：折叠换行并截断；其余字符串只做脱敏，保留原值语义。
+    // C9-005：先截断再脱敏——进正则的是有界前缀，非 message 字段同样有界（此前完全无上限）。
+    const text = boundedText(value, MAX_FAILURE_TEXT_CHARS)
     sanitized[key] = key === 'message' || key === 'reason' || key === 'failureReason'
-      ? redact(value).replace(/[\r\n]+/g, ' ').slice(0, 500)
-      : redact(value)
+      ? redact(text).replace(/[\r\n]+/g, ' ').slice(0, MAX_FAILURE_MESSAGE_CHARS)
+      : redact(text)
   }
   return sanitized
 }
@@ -280,17 +301,17 @@ function summarizeError (error, ancestors, depth) {
   const rawName = readProp(source, 'name')
   const rawMessage = readProp(source, 'message') || readProp(source, 'reason') || source
   const info = {
-    code: codeOf(source),
-    name: rawName ? safeString(rawName).toUpperCase() : '',
+    code: boundedText(codeOf(source), MAX_FAILURE_CODE_CHARS),
+    name: rawName ? boundedText(rawName, MAX_FAILURE_CODE_CHARS).toUpperCase() : '',
     statusCode: statusCodeOf(source),
-    providerCode: rawProviderCode === undefined || rawProviderCode === null ? '' : safeString(rawProviderCode),
-    channel: rawChannel ? redact(rawChannel).slice(0, 40) : '',
-    message: redact(rawMessage).replace(/[\r\n]+/g, ' ').slice(0, 500)
+    providerCode: rawProviderCode === undefined || rawProviderCode === null ? '' : boundedText(rawProviderCode, MAX_FAILURE_CODE_CHARS),
+    channel: rawChannel ? redact(boundedText(rawChannel, MAX_FAILURE_TEXT_CHARS)).slice(0, MAX_FAILURE_CHANNEL_CHARS) : '',
+    message: redact(boundedText(rawMessage, MAX_FAILURE_TEXT_CHARS)).replace(/[\r\n]+/g, ' ').slice(0, MAX_FAILURE_MESSAGE_CHARS)
   }
   const sourceKind = readProp(source, 'failureKind')
   if (sourceKind === 'retryable' || sourceKind === 'permanent') {
     info.failureKind = sourceKind
-    info.failureReason = readProp(source, 'failureReason') || ''
+    info.failureReason = boundedText(readProp(source, 'failureReason') || '', MAX_FAILURE_CODE_CHARS)
   }
   const failures = safeArray(readProp(source, 'failures'))
   if (failures) {
@@ -312,8 +333,20 @@ function codeIs (code, set) {
 // 无差别判定，同一 4xx 语义在不同承载字段下会分类相反，4xx 的限流/超时被误判永久而停止重试。
 const RETRYABLE_HTTP_STATUS = new Set([408, 409, 425, 429])
 
-function isRetryableHttpStatus (n) {
-  return RETRYABLE_HTTP_STATUS.has(n) || (n >= 500 && n <= 599)
+// C9-004：HTTP 状态码语义的**唯一判据**。此前 classifyOne 对四个承载字段（数字 code /
+// providerCode / `HTTP_` 前缀 / statusCode）各写一遍区间判定，其中后两份还把
+// `408 || 409 || 425 || 429` 内联重写、RETRYABLE_HTTP_STATUS 只覆盖一半——任一处漏改，
+// 同一状态码在不同承载字段下分类相反，而每个分支的单测都能过，口径分叉没有任何断言能发现。
+// 返回 'retryable' / 'permanent' / null（不属于 HTTP 状态码语义）。
+// 5xx 上界固定 599（statusCodeOf 只接受 100-599）。旧实现的 `n >= 500` 没有上界，'HTTP_600'
+// 这类越界伪码会被判成可重试并记 reason=HTTP_600；现在落 null → 走兜底 UNKNOWN（同样可重试，
+// 但不再声称它是 HTTP 状态码）。
+function classifyHttpStatus (n) {
+  if (!Number.isInteger(n)) return null
+  if (RETRYABLE_HTTP_STATUS.has(n) || (n >= 500 && n <= 599)) return 'retryable'
+  if (n >= 300 && n <= 399) return 'permanent'
+  if (n >= 400 && n <= 499) return 'permanent'
+  return null
 }
 
 function classifyOne (error) {
@@ -381,43 +414,35 @@ function classifyOne (error) {
   // HTTP_ 前缀、statusCode）下都落 UNKNOWN → 可重试，而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）
   // ——同一状态码在「错误码字符串」与「statusCode」两条路径上分类相反。这里按区间统一，不逐条枚举
   // （HTTP_300-399 共 100 项）。
+  // C9-004：四个承载字段统一走 classifyHttpStatus，语义只有一份实现。
   const numericCode = Number(code)
-  if (code === '1001' || (Number.isInteger(numericCode) && isRetryableHttpStatus(numericCode))) {
+  const codeVerdict = classifyHttpStatus(numericCode)
+  if (code === '1001' || codeVerdict === 'retryable') {
     return { kind: 'retryable', reason: `PROVIDER_${code}`, info }
   }
-  if (Number.isInteger(numericCode) && numericCode >= 300 && numericCode < 400) {
-    return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
-  }
-  if (Number.isInteger(numericCode) && numericCode >= 400 && numericCode < 500) {
+  if (codeVerdict === 'permanent') {
     return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
   }
   if (providerCode === '1001' || /(?:限流|限频|rate.?limit)/.test(message)) {
     return { kind: 'retryable', reason: 'PROVIDER_RATE_LIMIT', info }
   }
   const providerNumber = Number(providerCode)
-  if (Number.isInteger(providerNumber) && isRetryableHttpStatus(providerNumber)) {
+  const providerVerdict = classifyHttpStatus(providerNumber)
+  if (providerVerdict === 'retryable') {
     return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
   }
-  if (Number.isInteger(providerNumber) && providerNumber >= 300 && providerNumber < 400) {
-    return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
-  }
-  if (Number.isInteger(providerNumber) && providerNumber >= 400 && providerNumber < 500) {
+  if (providerVerdict === 'permanent') {
     return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
   }
   if (code.startsWith('HTTP_')) {
-    const n = Number(code.slice(5))
-    if (n === 408 || n === 409 || n === 425 || n === 429 || n >= 500) {
-      return { kind: 'retryable', reason: code, info }
-    }
-    if (n >= 300 && n < 400) return { kind: 'permanent', reason: code, info }
-    if (n >= 400 && n < 500) return { kind: 'permanent', reason: code, info }
+    const verdict = classifyHttpStatus(Number(code.slice(5)))
+    if (verdict === 'retryable') return { kind: 'retryable', reason: code, info }
+    if (verdict === 'permanent') return { kind: 'permanent', reason: code, info }
   }
   if (status !== null) {
-    if (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500) {
-      return { kind: 'retryable', reason: `HTTP_${status}`, info }
-    }
-    if (status >= 300 && status < 400) return { kind: 'permanent', reason: `HTTP_${status}`, info }
-    if (status >= 400 && status < 500) return { kind: 'permanent', reason: `HTTP_${status}`, info }
+    const verdict = classifyHttpStatus(status)
+    if (verdict === 'retryable') return { kind: 'retryable', reason: `HTTP_${status}`, info }
+    if (verdict === 'permanent') return { kind: 'permanent', reason: `HTTP_${status}`, info }
   }
 
   if (/(?:timeout|timed out|超时|econn|eai_again|enet|ehost|epipe|socket|rate.?limit|限流|限频|暂时|服务.*(?:不可用|繁忙)|连接.*(?:失败|重置))/.test(message)) {

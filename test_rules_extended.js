@@ -573,6 +573,94 @@ check('_catMatches / _anyRule / _firstMatchingRule：分类守卫、异常兜底
   assert.strictEqual(eng._firstMatchingRule([{ cat: /zzz/, val: /a/ }], 'x', () => true), null)
 })
 
+check('C9-007：多行规则整次扫描只归一化一次（次数与规则数无关）', () => {
+  // 反例（改动前）：multi 分支的谓词是 r => _safeTest(r.val, value)，而 _safeTest 内含
+  // _normalizeReInput —— 每条规则都对同一段正文重跑一遍零宽替换；分类名同样经
+  // _catMatches → _safeTest 逐条重归一化 ⇒ 成本 = 规则数 × 文本长度（纯白扫）。
+  // 断言「归一化次数」而不是墙钟：次数是确定性契约，墙钟在不同负载下会抖。
+  const { eng } = r2xMake()
+  const counts = { n: 0 }
+  const original = eng._normalizeReInput.bind(eng)
+  eng._normalizeReInput = (s) => { counts.n++; return original(s) }
+  const mkRules = (n) => Array.from({ length: n }, (_, i) => ({ cat: null, val: new RegExp('zzz_nomatch_' + i) }))
+  const value = '京东线报 ' + '\u200B'.repeat(10) + ' 内容'
+  const catename = '微博\u200C线报'
+
+  counts.n = 0
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: mkRules(1) }, value, catename), false)
+  const one = counts.n
+  counts.n = 0
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: mkRules(200) }, value, catename), false)
+  const many = counts.n
+  assert.strictEqual(one, 2, `1 条规则时归一化次数应为 2（正文 + 分类名各一次），实际 ${one}`)
+  assert.strictEqual(many, 2, `200 条规则时归一化次数仍应为 2（不得随规则数增长），实际 ${many}`)
+
+  // 计数对了但语义错了同样是 bug：归一化后的文本必须真的进 .test（零宽已剥离才可能命中）
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: [{ cat: /^微博线报$/, val: /^京东线报\s+内容$/ }] }, value, catename), true,
+    '零宽剥离后分类名与正文都必须命中（归一化结果必须真的用于匹配）')
+  // 分类名缺失/空串仍必须按「不命中」处理（归一化不得把 null 变成字面 "null"）
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: [{ cat: /null/, val: /x/ }] }, 'x', null), false,
+    'catename=null 时必须不命中（不得落到 /null/ 字面量）')
+})
+
+check('C9-008：_safeTest 的形状守卫也必须在 try 内（伪造规则对象不得抛穿）', () => {
+  // 反例（改动前）：`typeof re.test !== 'function'` 写在 try 外面 ⇒ 带抛错 test getter 的伪造
+  // 规则对象 / Proxy 会在**读形状**这一步就抛给调用方——正是 C9-008 立契约要堵的「一条坏规则
+  // 抛穿整轮 run」；docstring 写死的契约是「异常永不冒泡，一律按 onFail 处理」。
+  const { eng } = r2xMake()
+  const bomb = { get test () { throw new Error('throwing getter') } }
+  assert.strictEqual(eng._safeTest(bomb, 'x', true), true, '白名单口径：读形状抛错必须按 onFail=true 保留')
+  assert.strictEqual(eng._safeTest(bomb, 'x'), false, '默认 onFail=false：必须不命中而不是抛')
+  assert.strictEqual(eng._safeTestText(bomb, 'x', true), true, '批量入口同口径（onFail=true）')
+  assert.strictEqual(eng._safeTestText(bomb, 'x'), false, '批量入口同口径（默认 onFail=false）')
+  // 真实调用面：分类规则是抛错 getter 时，_catMatches / _firstMatchingRule 不得抛
+  assert.strictEqual(eng._catMatches({ cat: bomb }, 'x'), false, '_catMatches 不得被读形状的异常抛穿')
+  assert.strictEqual(eng._firstMatchingRule([{ cat: bomb, val: /x/ }], 'x', () => true), null,
+    '_firstMatchingRule 不得把坏规则的形状异常抛给调用方')
+  // 输入侧 String() 抛错同样按 onFail（不得抛）
+  const poisoned = { toString () { throw new TypeError('boom') } }
+  assert.strictEqual(eng._safeTest(/x/, poisoned, true), true, '输入不可判定时白名单口径保留')
+  assert.strictEqual(eng._safeTest(/.*/, poisoned), false, '输入不可判定时默认口径不命中（不得抛、不得匹配字面 "null"）')
+})
+
+check('C9-011：行分割只有一份实现（compileRules/validateConfig 同源，含 <br/> 与 <br />）', () => {
+  // 反例（改动前）：同一个 /<br\s*\/?>|\r\n|\r|\n/ 在 xbk_rules 里被抄 3 份（_splitLines +
+  // validateConfig 的过滤字段与 pingbitime 两处就地重写），只能靠注释「与 _splitLines 口径一致」同步。
+  const { eng } = r2xMake({ fields: ['keyword'] })
+  const seps = ['<br>', '<br/>', '<br />', '\r\n', '\r', '\n']
+  for (const sep of seps) {
+    const cfg = ['微博###小明', 'cat2###小红'].join(sep)
+    assert.deepStrictEqual(eng._splitLines(cfg), ['微博###小明', 'cat2###小红'], `${JSON.stringify(sep)} 必须由同一实现拆分`)
+    assert.deepStrictEqual(eng.splitRuleLines(cfg), ['微博###小明', 'cat2###小红'], `splitRuleLines 必须与 _splitLines 同源：${JSON.stringify(sep)}`)
+    assert.deepStrictEqual(eng.validateConfig({ keyword: cfg }), [], `validateConfig 对 ${JSON.stringify(sep)} 不得产生警告`)
+    assert.deepStrictEqual(eng.validateConfig({ pingbitime: ['微博###3', 'cat2###5'].join(sep) }), [], `pingbitime 校验对 ${JSON.stringify(sep)} 不得产生警告`)
+  }
+  // 结构断言：_splitLines 与 validateConfig 都必须委托 splitRuleLines —— 给 splitRuleLines 装一个
+  // 哨兵行（含两个 ###），两处都必须「看到」它；若谁还留着自己那份就地 split，就看不到哨兵。
+  const orig = eng.splitRuleLines
+  eng.splitRuleLines = () => ['cat###v###extra']
+  assert.deepStrictEqual(eng._splitLines('a###1'), ['cat###v###extra'], '_splitLines 必须委托 splitRuleLines')
+  const warns = eng.validateConfig({ keyword: 'a###1' })
+  assert.ok(warns.some(w => w.includes('多个 ###')), 'validateConfig 必须经 _splitLines → splitRuleLines 取行')
+  eng.splitRuleLines = orig
+})
+
+check('C9-018：pingbitime 上限只有一个字面量，编译与校验同源', () => {
+  // 反例（改动前）：compileRules 与 validateConfig 各写一份 3650000（store 还有第三份，属别的模块）。
+  // 调上限时漏一处 ⇒ 保存被拒或运行期静默丢规则，表现为对账失败。
+  const { eng } = r2xMake({ fields: ['keyword'] })
+  const max = eng.PINGBITIME_MAX_DAYS
+  assert.strictEqual(max, 3650000, '上限对外取值必须是 3650000 天')
+  // 两侧都必须以同一个 max 为界：max 通过、max+1 被拒
+  assert.strictEqual(eng.compileRules({ pingbitime: String(max) }).pingbitime._type, 'time', '恰为上限必须可编译')
+  assert.strictEqual(eng.compileRules({ pingbitime: String(max + 1) }).pingbitime, null, '超过上限必须不编译')
+  assert.deepStrictEqual(eng.validateConfig({ pingbitime: String(max) }), [], '恰为上限不得告警')
+  assert.ok(eng.validateConfig({ pingbitime: String(max + 1) }).some(w => w.includes('超过上限')), '超过上限必须告警')
+  // 多行形态同一界（分类###天数）
+  assert.deepStrictEqual(eng.validateConfig({ pingbitime: `cat###${max}` }), [], '多行形态恰为上限不得告警')
+  assert.ok(eng.validateConfig({ pingbitime: `cat###${max + 1}` }).some(w => w.includes('超过上限')), '多行形态超过上限必须告警')
+})
+
 check('checkTimeCompiled：不拦截(null) 与拦截(true/false) 两侧，阈值比较必须严格大于', () => {
   // 杀 checkTimeCompiled L387/L391/L398/L399：缺失/非法注册时间放行，time 与 timeMulti 均不得用 >=
   const { eng } = r2xMake()

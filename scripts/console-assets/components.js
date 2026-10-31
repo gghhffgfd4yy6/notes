@@ -8,7 +8,7 @@ import flatpickr from './flatpickr.js'
 // 定位引擎（vendored 单文件 ESM，MIT）：只导出 computePosition/offset/flip/shift/size。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
 import { MOTION, useMorphDialog, useMountReveal, useRevealWhen } from './motion.js'
-import { TZ_LABEL } from './constants.js'
+import { SHANGHAI_OFFSET_MS, TZ_LABEL } from './constants.js'
 import { fmtClock, fmtDuration, fmtLocalTime, fmtNum } from './format.js'
 import { DAY_KEY_RE, apiGetConfig, trigger, triggerNotifyTest } from './api.js'
 
@@ -58,7 +58,7 @@ function AutoRefreshText ({ nextAt, pollMs, lastSync, showDate = true, paused = 
 // 星期几也只按北京时间取：本地 getDay() 在北京时间跨零点时会差一天，和上面的时间对不上。
 function fmtWeekday (ts) {
   if (!ts) return ''
-  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + 8 * 3600 * 1000).getUTCDay()]
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(Number(ts) + SHANGHAI_OFFSET_MS).getUTCDay()]
 }
 
 // 两个弹层共用：computePosition 的结果直写 DOM。不走 vdom 的 style 属性——控制台每 500ms
@@ -417,7 +417,7 @@ const EMPTY_RANGE = { from: '', to: '' }
 
 // 上海日历日（与 run.log / 服务端同口径）：按钮文案按它判断「是不是今年」。
 function todayKeyShanghai () {
-  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10)
+  return new Date(Date.now() + SHANGHAI_OFFSET_MS).toISOString().slice(0, 10)
 }
 
 function fmtDayKey (d) {
@@ -1046,6 +1046,11 @@ function useDialogChrome (open, onCancel, { initialFocusRef = null, fallbackRef 
 function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
   const cancelRef = useRef(null)
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
+  // C7-038：危险正文（「会真实推送」「发到哪些渠道」）此前只有 aria-labelledby——
+  // 读屏打开弹窗时只念标题，用户按「确定」前听不到后果。正文必须有自己的 id 并被
+  // aria-describedby 引用。id 复用 dialogSeq 的**当前值**（标题的初始化器已经 +1 过），
+  // 不额外领号：既保证每实例唯一，也不动既有「标题 id 形态」契约。
+  const [bodyId] = useState(() => `confirm-body-${dialogSeq}`)
   // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
   const backRef = useRef(null)
   const boxRef = useRef(null)
@@ -1060,11 +1065,11 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
   // 遮罩与面板合成一个 <dialog>：浏览器负责顶层、焦点陷阱与背景 inert，视觉仍由
   // .modal-backdrop / .modal 两条规则决定（class 名与选择器不变）。
   return html`<dialog class="modal-backdrop" ref=${backRef} role="dialog" aria-modal="true"
-    aria-labelledby=${titleId} oncancel=${onCancelEvent}
+    aria-labelledby=${titleId} aria-describedby=${bodyId} oncancel=${onCancelEvent}
     onClick=${(e) => { if (e.target === e.currentTarget) dismiss(() => onCancelRef.current()) }}>
     <div class="modal" ref=${boxRef}>
       <div class="modal-title" id=${titleId}>${title}</div>
-      <div class="modal-body">${children}</div>
+      <div class="modal-body" id=${bodyId}>${children}</div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => dismiss(() => onCancelRef.current())}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || confirmDisabled || dialogClosing} onClick=${onConfirm}>${confirmLabel}<//>
@@ -1105,10 +1110,11 @@ function LeaveGuardDialog ({ open, count, busy, onCancel, onSave, onDiscard }) {
 }
 
 // ── 组件：右侧抽屉（v3.378）──────────────────────────────────────────────
-// 用法边界（按「内容少用弹窗 / 要对照用抽屉 / 彻底换流程用整页」）：
+// 用法边界（按「内容少用弹窗 / 要留住背后上下文用抽屉 / 彻底换流程用整页」）：
 //   列表点开一条、改完还要接着看下一条 ⇒ 抽屉（背后列表保持不动，滚动位置不跳）；
 //   短确认、二选一 ⇒ ConfirmDialog；长表单、深流程 ⇒ 整页。
-// 宽度 520 起步：桌面留出左侧列表做对照；≤640px 铺满（手机上没有并排对照的余地）。
+// 宽度 520 起步：桌面从右侧占 520px，左侧列表原地不动但被遮罩压暗、不能并排对照；
+// ≤640px 铺满（手机上没有并排对照的余地）。
 // 与弹窗共用 useDialogChrome：打开时焦点落在关闭按钮；Esc、点遮罩、关闭按钮三条路径都走
 // requestClose。焦点陷阱与「关闭后焦点回到触发元素」由原生 <dialog> 负责。
 function Drawer ({ open, title, sub = '', width = 520, busy = false, onClose, children, footer = null }) {

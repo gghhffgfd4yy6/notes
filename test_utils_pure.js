@@ -961,16 +961,24 @@ check('_removeActiveTags: 未闭合主动标签移除（含只有 embed 才有�
   assert.strictEqual(Utils._removeActiveTags('<BASE href=x>'), '')
 })
 check('_removeActiveTags: embed 开/闭标签不对称只断言安全性质（登记为疑似生产缺陷）', () => {
-  // 生产 docstring（xbk_utils.js _removeActiveTags）把 embed 列为应移除的主动标签，但外层守卫与
-  // 「孤立闭合标签」规则都不含 embed ⇒ 成对 <embed></embed> 只去掉开标签、</embed> 残留。
-  // 该不对称**不是契约**（已登记为「疑似生产缺陷 / 待修」：正确行为应整对移除），故此用例只锁
-  // 安全性质，不把 `'</embed>'` 这个产物写成有意行为。
+  // 生产 docstring（xbk_utils.js _removeActiveTags）把 embed 列为应移除的主动标签；C6-004 之前
+  // 外层守卫与「孤立闭合标签」规则都不含 embed ⇒ 成对 <embed></embed> 只去掉开标签、</embed> 残留。
+  // 该不对称从来不是契约（正确行为应整对移除），C6-004 已把四处清单收敛为 ACTIVE_TAGS 单一来源；
+  // 本用例作为安全性质回归保留（不把任何一种残留产物写成有意行为）。
   const out = Utils._removeActiveTags('<embed src=x></embed>')
   assert.ok(!/<embed/i.test(out), `不得残留 embed 开标签：${out}`)
   assert.ok(!/on[a-z]+\s*=/i.test(out), `不得残留事件属性：${out}`)
   assert.ok(!/javascript:|vbscript:/i.test(out), `不得残留危险协议：${out}`)
   const armed = Utils._removeActiveTags('<embed src=javascript:alert(1) onload=x></embed>')
   assert.ok(!/javascript:|onload/i.test(armed), `危险载荷不得残留：${armed}`)
+})
+check('_removeActiveTags: 主动标签清单单一来源——成对/孤立 embed 都整对移除（C6-004）', () => {
+  // 反例（改动前）：守卫、逐标签循环、闭合标签清单各少一个 embed ⇒ `<embed></embed>` 只剩
+  // `</embed>`、孤立 `</embed>` 原样出网。四处现由 ACTIVE_TAGS 派生，不可能再漂移（含大小写）。
+  assert.strictEqual(Utils._removeActiveTags('<embed src=x></embed>'), '', '成对 embed 必须整对移除')
+  assert.strictEqual(Utils._removeActiveTags('<EMBED src=x></EMBED>'), '', '大小写不敏感')
+  assert.strictEqual(Utils._removeActiveTags('keep</embed>tail'), 'keeptail', '孤立闭合标签移除、周围文本保留')
+  assert.strictEqual(Utils._removeActiveTags('<embed src=x>'), '', '空元素常规写法仍由未闭合分支兜底')
 })
 check('_removeActiveTags: 孤立闭合主动标签移除（gi 标志不可省）', () => {
   assert.strictEqual(Utils._removeActiveTags('</SCRIPT>'), '')
@@ -1588,8 +1596,23 @@ check('PKG_VERSION 回退口径：trim、有限数值、null/NaN/带 trim 的脏
   assert.strictEqual(out.cuInvalid, 'null', 'compileUserRegex 对无效模式必须返回 null（catch 体不得被清空）')
   assert.strictEqual(out.netArgKeys, 'Config,PKG_VERSION,PROFILE3,RETRYABLE_CODES,Utils,crypto,fetchJson,getNotify,logger,prewarmDns',
     'createNetwork 必须收到完整的 10 键注入对象（ObjectLiteral 变 {} 或丢键即红）')
-  assert.strictEqual(out.pusherArgKeys, 'Utils,getNotify,looksLikeHtmlLinear',
-    'createPusher 必须收到完整的 3 键注入对象（ObjectLiteral 变 {} 或丢键即红）')
+  // C8-006：注入面收窄为工厂真正解构的两个键。此前这里断言的是 'Utils,getNotify,looksLikeHtmlLinear'
+  // 三键串——它把「组合根往 createPusher 塞了一个工厂根本不读的键」钉成了参数契约（死接线被冻结）。
+  // 出口门槛自 v3.273 起是 looksLikeHtmlEnvelope（xbk_pusher 内部实现），不再是注入项，故期望串收窄为
+  // 两键：这条断言仍然防「ObjectLiteral 变 {} 或丢键」（丢失真实依赖即红），只是不再要求那个死键。
+  assert.strictEqual(out.pusherArgKeys, 'Utils,getNotify',
+    'createPusher 必须只收到工厂解构的 2 键注入对象（ObjectLiteral 变 {} 或丢键即红；多塞死键同样即红）')
+  // 死接线不得回潮：组合根注入的键必须与 xbk_pusher 里解构的键逐字一致
+  const pusherFactorySrc = require('node:fs').readFileSync(require('node:path').join(__dirname, 'xbk_pusher.js'), 'utf8')
+  const factoryHead = /function createPusher\s*\(\s*\{([^}]*)\}/.exec(pusherFactorySrc)
+  assert.ok(factoryHead, 'xbk_pusher 必须仍以 function createPusher ({ ... }) 形态声明注入面')
+  // 显式码元序比较器（Sonar javascript:S2871 要求 sort() 带比较函数）：默认 sort() 对字符串正是
+  // 逐 UTF-16 码元比较，把它写实后断言值一字不变；刻意不用消息里建议的 localeCompare——它随宿主
+  // ICU/locale 变序，会与 out.pusherArgKeys（默认 sort 的码元序）错开，断言随机器漂移。
+  const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+  assert.strictEqual(factoryHead[1].split(',').map(s => s.trim()).filter(Boolean).sort(byCodeUnit).join(','),
+    out.pusherArgKeys,
+    '组合根注入的键必须与 createPusher 解构的键逐字一致（多传的键是死接线，少传会静默 undefined）')
 })
 
 // Config 默认口径（README/SYSTEM_CONTRACT 配置节）：过滤默认全空、健康/日报/诊断/磁盘余量精确值

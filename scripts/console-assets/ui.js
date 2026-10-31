@@ -5,7 +5,7 @@ import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, Button, LeaveGuard
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
-import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
+import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, snapshotOk, TAB_KEYS, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { Component, html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -64,10 +64,10 @@ function readSnapshot () {
     const raw = window.localStorage.getItem(SNAP_KEY)
     if (!raw) return null
     const v = JSON.parse(raw)
-    if (!v || v.v !== BOOT.version || typeof v.at !== 'number') return null
-    if (!v.status || typeof v.status !== 'object' || Array.isArray(v.status)) return null
-    if (!Array.isArray(v.runs)) return null
-    return v
+    // 版本守卫留在这层（既有红线逐字钉住 `v.v !== BOOT.version`，且它同时挡住下面
+    // 对 v 的解引用）；深层结构校验走 pure.mjs 的 snapshotOk（C7-056，Node 侧可测）。
+    if (!v || v.v !== BOOT.version) return null
+    return snapshotOk(v, BOOT.version) ? v : null
   } catch (e) { return null }
 }
 function writeSnapshot (status, runs, startedAt) {
@@ -85,6 +85,19 @@ function writeSnapshot (status, runs, startedAt) {
   } catch (e) { /* 隐私模式 / 超限：静默降级，数据面不受影响 */ }
 }
 const SNAPSHOT = readSnapshot()
+
+// 页签的中文名（C7-031）：键的真源是 pure.mjs 的 TAB_KEYS（路由、保活集合都认它），这里
+// 只补展示名，键的先后就是标签栏顺序。新增页签改两处即可（旧实现还要改 App 里的 TABS
+// 字面量与一条 /^#\/filter$/ 正则补丁）。漏写名字会渲染成空标签，标签栏一眼可见。
+const TAB_LABELS = {
+  overview: '概览',
+  messages: '推送记录',
+  search: '线报搜索',
+  logs: '运行日志',
+  config: '配置',
+  filter: '过滤规则',
+  sys: '系统'
+}
 
 // ── 主题（v3.323）──────────────────────────────────────────────────────────
 // 4 套配色只换 token（见 app.css 的 data-theme 块），不动布局。首帧由服务端把
@@ -165,19 +178,30 @@ function App () {
   // 单调时钟：本次成功加载的时刻，只用于释放滚动垫高；不受系统时钟回拨影响。
   const [panelReadyAt, setPanelReadyAt] = useState(0)
   const [syncErr, setSyncErr] = useState('')
+  // 后台静默失败（C7-032）：设置读取 / 版本探针 / 回前台补拉三处都曾 catch(() => {})，
+  // 失败在界面上零痕迹——用户只看到「设置没生效」「没有更新提示」「数据停在旧值」，
+  // 无从判断是网络/服务端/权限。这里收成一个可见条目（顶栏一行，自动重试），
+  // 成功时按 kind 撤掉；devtools 里另留一条 console.warn（手机打不开 devtools 时靠前面那行）。
+  const [quietErrs, setQuietErrs] = useState([])
+  const noteQuiet = useCallback((kind, failed) => {
+    if (failed) console.warn('[xbk-console] 后台请求失败：' + kind + '（自动重试中）')
+    setQuietErrs((prev) => {
+      const has = prev.includes(kind)
+      if (failed && !has) return prev.concat(kind)
+      if (!failed && has) return prev.filter((k) => k !== kind)
+      return prev
+    })
+  }, [])
   // 「状态接口本身失败」要立刻反映到状态卡的占位文案上：/api/runs 可能还在路上，
   // 不能等 Promise.allSettled 两边都落定才把「正在读取…」改成「读取失败」。
   const [statusFailed, setStatusFailed] = useState(false)
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
-  // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
-  // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
-  // （刷新/后退不丢当前页；非法值仍回概览）。v3.370 的 search 已进 TAB_KEYS。
+  // v3.370 的 search 已进 TAB_KEYS（纯函数模块，Node 侧直接测）。
   // 推送记录页会把筛选条件写进 hash query（#/messages?q=…&page=3，见 buildMessagesHash）：
   // 解析页签前先剥掉 query，否则带参数的地址会被判成非法值、刷新后掉回概览。
-  const resolveTab = (hash) => {
-    const raw = typeof hash === 'string' ? hash.split('?')[0] : ''
-    return /^#\/filter$/.test(raw) ? 'filter' : tabFromHash(raw)
-  }
+  // C7-031：页签白名单**只有** TAB_KEYS 一处真源——旧实现在这里补了一条
+  // /^#\/filter$/ 的正则（filter 当年没进 TAB_KEYS），白名单与路由两套口径必然漂移。
+  const resolveTab = (hash) => tabFromHash(typeof hash === 'string' ? hash.split('?')[0] : '')
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 切页入场（v3.360）：只动新页的 opacity/transform，不动高度 ⇒ 不改变滚动锚点、
   // 不会把首屏内容顶走。tab 变化只在真正切页时发生，轮询不触发。
@@ -253,8 +277,9 @@ function App () {
     // consumeJson 直接回 body（不是 { ok, data }），别按写面 consumeJsonResult 的形状取。
     apiGetConsoleSettings().then((body) => {
       applyUiSettings(body)
-    }).catch(() => {})
-  }, [applyUiSettings])
+      noteQuiet('设置读取失败', false)
+    }).catch(() => { noteQuiet('设置读取失败', true) })
+  }, [applyUiSettings, noteQuiet])
   useEffect(() => { reloadUiSettings() }, [reloadUiSettings])
   // 凭证失效（审查 #224）：任一 API 401 ⇒ 停轮询并显示自助恢复提示，不再每 5s 空打。
   const [authExpired, setAuthExpired] = useState(false)
@@ -284,7 +309,8 @@ function App () {
         const v = s && typeof s.version === 'string' ? s.version : ''
         // 与启动版本重新对齐（回滚也算）就收起提示，别留一条过期横幅。
         setNewVersion(v !== '' && v !== bootVersion ? v : '')
-      }).catch(() => {})
+        noteQuiet('版本探针失败', false)
+      }).catch(() => { noteQuiet('版本探针失败', true) })
     }
     check()
     const timer = setInterval(check, VERSION_CHECK_MS)
@@ -611,6 +637,9 @@ function App () {
   // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃（落后 ≠ 失败，
   // 落后者静默丢弃不报错——Sourcery vwB：报「刷新失败」是误导）。
   const refreshSplit = useCallback(async (opts = {}) => {
+    // 返回三态（C7-032）：true=刷新成功；false=**这一拍没发请求**（表单暂停 / 上一拍还在飞 /
+    // 序号过期）；'failed'=真发出去但失败。旧实现把「跳过」与「失败」都写成 false，调用方
+    // 只能把跳过当失败 ⇒ 过滤规则页带未保存草稿时回前台会常驻一条撤不掉的假告警。
     // 表单交互暂停期间不发起刷新；已在途的响应也会在下方 apply 前被丢弃。
     // 下拉刷新是明确的手势意图，传 { force: true } 跨过这段暂停。
     if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return false
@@ -663,7 +692,7 @@ function App () {
       // 只有两边都落定才算「刷新成功」：调用方（回前台补拉）据此决定要不要推进时间戳。
       // 轮询成功也记一笔：否则「刚轮询完就切回前台」会被当成很久没刷新而多发一轮（Sourcery #315-11）。
       if (errs.length === 0) lastRefreshRef.current = Date.now()
-      return errs.length === 0
+      return errs.length === 0 ? true : 'failed'
     } finally {
       inFlightRef.current = false
       if (pendingRefreshRef.current) {
@@ -679,7 +708,12 @@ function App () {
   const markRef = useRef(null)
   const runTick = useCallback(() => {
     if (document.hidden) return
-    if (Date.now() < resumeQuietUntilRef.current) return
+    // 回前台静默窗（C7-013）：它要挡的是「刚补拉过、定时器又正好到期」的那一发重复请求，
+    // 而不是窗内所有的刷新信号。旧实现只按时间窗关死 ⇒ 窗内到达的 SSE tick（服务端说
+    // 「有新数据」）被一起吞掉，页面最多停在补拉那一刻一个轮询周期（SSE 在线时 60s）。
+    // 现在多加一道「距上次成功刷新多久」：刚补拉过（< POLL_BUSY_MS）才跳过，之后放行。
+    // 补拉失败时 lastRefreshRef 不前进（见 refreshActive），窗内仍会立刻重试。
+    if (Date.now() < resumeQuietUntilRef.current && Date.now() - lastRefreshRef.current < POLL_BUSY_MS) return
     if (Date.now() < formPauseUntilRef.current) return
     refreshSplit()
     if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
@@ -921,7 +955,11 @@ function App () {
     const ok = sRes.status === 'fulfilled' && sRes.value === true
     // 失败不推进时间戳：否则接下来 30s 内都不会再补，数据一直停在旧值。
     if (ok) lastRefreshRef.current = Date.now()
-    return ok
+    // 返回三态（C7-032）：true=成功、false=**没发请求**（上面的表单暂停 / 没有面板接手）、
+    // 'failed'=真发出去但失败。只有后者该在顶栏记一条告警——旧实现两种都回 false，
+    // 调用点用 ok === false 判失败，于是「跳过」也变成「后台刷新异常（自动重试中）」。
+    if (ok) return true
+    return sRes.status === 'rejected' || sRes.value === 'failed' ? 'failed' : false
   }, [refreshSplit, refreshAuto])
   const pullRefresh = useCallback(() => refreshActive({ force: true }), [refreshActive])
   // 回到前台：隐藏期间所有轮询都停了（主轮询 tick、面板自己的 interval、/api/auto），
@@ -937,11 +975,13 @@ function App () {
     const onVis = () => {
       if (document.hidden) return
       if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return
-      refreshActive({ respectFormPause: true }).catch(() => {})
+      // 只有真发出去又失败才留痕（C7-032）：refreshActive 的 false 是「跳过/没发请求」
+      // （表单暂停、过滤规则页带未保存草稿时该面板不接下拉），跳过不是失败。
+      refreshActive({ respectFormPause: true }).then((state) => noteQuiet('回前台补拉失败', state === 'failed'), () => noteQuiet('回前台补拉失败', true))
     }
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
-  }, [refreshActive, authExpired])
+  }, [refreshActive, authExpired, noteQuiet])
   const pull = usePullToRefresh(pullRefresh, !authExpired)
   // 手机窄屏 .sync 是横向可滚动的：用户把它滑到右边时，行内状态会被裁在视口外。
   // 下拉一开始就把它滚回最左（状态就在第一个位置），保证反馈看得见。
@@ -989,17 +1029,12 @@ function App () {
     if (data && data.auto) setAutoState(data.auto)
   }, [])
 
-  // v3.297 标签页状态：概览 / 推送记录 / 日志 / 系统。非概览页不跑主轮询，
-  // 避免每 5s 的 App 重渲染让推送记录/配置页「闪一下」（刷新记录页有自己的加载）。
-  const TABS = [
-    { key: 'overview', label: '概览' },
-    { key: 'messages', label: '推送记录' },
-    { key: 'search', label: '线报搜索' },
-    { key: 'logs', label: '运行日志' },
-    { key: 'config', label: '配置' },
-    { key: 'filter', label: '过滤规则' },
-    { key: 'sys', label: '系统' }
-  ]
+  // 页签清单单一真源（C7-031）：**键**只在 pure.mjs 的 TAB_KEYS 里（hash 路由、tabFromHash、
+  // 保活集合都认它），这里只补展示用的中文名。旧实现是三处真源：pure.mjs 的 TAB_KEYS、
+  // 这里的 TABS 字面量、外加 resolveTab 里一条 /^#\/filter$/ 正则补丁——新增页签要改三处，
+  // 漏一处就是「路由认、标签不认」（filter 就是这么被补丁接上的）。
+  // v3.297 标签页状态：非概览页不跑主轮询，避免每拍 App 重渲染让推送记录/配置页「闪一下」。
+  const TABS = TAB_KEYS.map((key) => ({ key, label: TAB_LABELS[key] }))
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
   // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
   // v3.307 同步写 hash：刷新/后退能回到同一页。
@@ -1188,6 +1223,7 @@ function App () {
           title=${'主题：' + themeLabel + ' → ' + nextThemeLabel}>◐ ${themeLabel}</button>
       </div>
       ${syncErr ? html`<div class="sync-fail" role="status">${syncErr}</div>` : ''}
+      ${quietErrs.length > 0 && html`<div class="sync-fail sync-fail-quiet" role="status">后台刷新异常：${quietErrs.join(' / ')}（自动重试中）</div>`}
     </header>
 
     ${newVersion !== '' && html`<div class="alert-banner nudge" role="status">

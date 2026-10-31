@@ -44,6 +44,11 @@ function readBoot () {
 }
 const BOOT = readBoot()
 
+// 鉴权头单一出口（C7-029）：此前 22 处端点函数逐字复制 `Authorization: Bearer ${BOOT.token}`
+// ——改一处口径（前缀/字段名/多一条头）要改 22 遍，漏一处就是「这个端点 401、别的正常」。
+// 展开成普通对象字面量即可（各端点仍各自写 headers 的其余字段）。
+const AUTH_HEADER = { Authorization: `Bearer ${BOOT.token}` }
+
 // 日期键（YYYY-MM-DD）：数据层的 from/to 查询参数只接受这个形状——形状不对的值不发给
 // 服务端（形状对但不是日期由服务端判）；日期区间组件（app.js）复用同一个判定。
 const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
@@ -116,19 +121,31 @@ function timedRequest (opts, timeoutMs = FETCH_TIMEOUT_MS) {
 // 命中 If-None-Match 时回 304 空体——前端复用上一份 data，省掉重复 body。
 // 只存内存（刷新即空），不落 localStorage；凭证不进这个 Map。
 // 有界（Sourcery PR #321）：messages 的缓存键含筛选/分页，键空间无上限——留 16 条
-// 覆盖「当前视图 + 来回切几个筛选 + 趋势/历史/配置/缓存健康各一份」，超出按插入序
-// 淘汰（Map 保序，最老的先走）。v3.373：8→16，因为条件请求从 3 个端点扩到 7 个。
+// 覆盖「当前视图 + 来回切几个筛选 + 趋势/历史/配置/缓存健康各一份」，超出按**最近使用**
+// 淘汰。v3.373：8→16，因为条件请求从 3 个端点扩到 7 个。
+// C7-030：旧实现只在写入时 Map.set，读取从不改顺序 ⇒ 淘汰退化成 FIFO：冷启动第一批
+// 放进去的 runs / config（页签保活后一直在用）反而最先被淘汰，而每次翻页都新建的
+// messages 分页键把它们挤出去。命中即挪到队尾（touchConditional），写回也算一次使用。
 const COND_CACHE = new Map()
 const COND_CACHE_MAX = 16
+function touchConditional (key) {
+  const hit = COND_CACHE.get(key)
+  if (!hit) return null
+  // Map 的插入序就是淘汰序：删掉再插 = 挪到队尾（不复制对象，tag/data 仍是同一份）。
+  COND_CACHE.delete(key)
+  COND_CACHE.set(key, hit)
+  return hit
+}
 function rememberConditional (key, entry) {
-  if (COND_CACHE.size >= COND_CACHE_MAX && !COND_CACHE.has(key)) {
+  if (COND_CACHE.has(key)) COND_CACHE.delete(key) // 覆盖同样是「刚用过」：先删再插
+  else if (COND_CACHE.size >= COND_CACHE_MAX) {
     const oldest = COND_CACHE.keys().next()
     if (!oldest.done) COND_CACHE.delete(oldest.value)
   }
   COND_CACHE.set(key, entry)
 }
 function addConditional (merged, key) {
-  const hit = COND_CACHE.get(key)
+  const hit = touchConditional(key)
   if (!hit || !hit.tag) return null
   merged.headers = { ...merged.headers, 'If-None-Match': hit.tag }
   // 把「这次请求发出去的是哪个 tag」交回调用方：304 到达时要用它核对缓存条还是不是
@@ -153,7 +170,8 @@ async function consumeJson (p, condKey, retry, sentTag) {
   }
   if (res.status === 304) {
     // 304 无 body：直接复用条件缓存里的上一份（服务端已确认内容未变）。
-    const hit = condKey ? COND_CACHE.get(condKey) : null
+    // 命中也是「用过这一条」（C7-030）：走 touchConditional 挪到队尾，别让热键被淘汰。
+    const hit = condKey ? touchConditional(condKey) : null
     // 只有缓存条仍是我们发出去的那个 tag 才复用它；被别的并发响应换掉时必须重取，
     // 否则会把 T2 的快照当成 T1 的 304 结果（配置/趋势/历史短暂显示错数据）。
     if (hit && (!sentTag || hit.tag === sentTag)) return hit.data
@@ -191,7 +209,7 @@ function consumeConditional (condKey, attempt) {
 function conditionalRequest (condKey, build) {
   const attempt = (conditional) => {
     const merged = timedRequest({
-      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+      headers: { Accept: 'application/json', ...AUTH_HEADER }
     })
     // 必须在 fetch 之前注入：fetch 调用时就快照 headers（Sourcery PR #321）。
     const sentTag = conditional ? addConditional(merged, condKey) : null
@@ -202,7 +220,7 @@ function conditionalRequest (condKey, build) {
 
 function apiGetStatus () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   // /api/status 含 generatedAt / lock.ageMs（每拍都在变），不做条件请求——给它发 ETag
   // 永远不会命中（服务端 sendJsonConditional 注释同口径）。
@@ -215,7 +233,7 @@ function apiGetRuns () {
   // （fetch 调用时就快照 headers）。
   const attempt = (conditional) => {
     const merged = timedRequest({
-      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+      headers: { Accept: 'application/json', ...AUTH_HEADER }
     })
     const sentTag = conditional ? addConditional(merged, 'runs') : null
     return { p: fetch('/api/runs', merged), sentTag }
@@ -234,7 +252,7 @@ async function apiGetRunDetail (id) {
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       Accept: 'application/json',
-      Authorization: `Bearer ${BOOT.token}`
+      ...AUTH_HEADER
     },
     body
   })
@@ -253,7 +271,7 @@ function apiCancelRun (id) {
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       Accept: 'application/json',
-      Authorization: `Bearer ${BOOT.token}`
+      ...AUTH_HEADER
     },
     body
   })
@@ -300,7 +318,7 @@ function apiGetMessages ({ page, size, cate, q, days, from, to }) {
   const condKey = `messages?${qs}`
   const attempt = (conditional) => {
     const merged = timedRequest({
-      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+      headers: { Accept: 'application/json', ...AUTH_HEADER }
     })
     const sentTag = conditional ? addConditional(merged, condKey) : null
     return { p: fetch(qs.length > 0 ? `/api/messages?${qs}` : '/api/messages', merged), sentTag }
@@ -347,7 +365,7 @@ function apiGetFiles () {
   // 启动预加载会同时命中缓存健康右列、系统页文件清单、过滤规则备份下拉；
   // 共享同一个在飞 Promise，避免对大目录做三次同步扫描（Sourcery #272）。
   return once('files', () => consumeJson(fetch('/api/files', timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   }))))
 }
 
@@ -358,7 +376,7 @@ function apiGetConfig () {
 
 function apiGetLogs () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   return consumeJson(fetch('/api/logs', merged))
 }
@@ -367,7 +385,7 @@ function apiGetLogs () {
 // 同时 no-store，防代理/浏览器启发式缓存把旧版本喂回来，让「有新版本」永远判不出来。
 function apiGetSys ({ probeVersion = false } = {}) {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` },
+    headers: { Accept: 'application/json', ...AUTH_HEADER },
     ...(probeVersion ? { cache: 'no-store' } : {})
   })
   return consumeJson(fetch(probeVersion ? '/api/sys?probe=version' : '/api/sys', merged))
@@ -378,7 +396,7 @@ function apiGetAuto () {
   // 条件请求 + 「304 无本地副本就重取」（C7-025）。条件头在 fetch 之前注入。
   const attempt = (conditional) => {
     const merged = timedRequest({
-      headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+      headers: { Accept: 'application/json', ...AUTH_HEADER }
     })
     const sentTag = conditional ? addConditional(merged, 'auto') : null
     return { p: fetch('/api/auto', merged), sentTag }
@@ -392,7 +410,7 @@ function apiSetAuto (payload) {
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      Authorization: `Bearer ${BOOT.token}`
+      ...AUTH_HEADER
     },
     body: JSON.stringify(payload)
   })
@@ -403,7 +421,7 @@ function apiSetAuto (payload) {
 // fetch 第一参数纯字面量（Codacy SSRF 全绿形态，静态红线测试自动覆盖）。
 function apiGetAccessLog () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   return consumeJson(fetch('/api/access-log', merged))
 }
@@ -440,21 +458,21 @@ function filterWriteHeaders () {
   return {
     Accept: 'application/json',
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${BOOT.token}`
+    ...AUTH_HEADER
   }
 }
 
 function apiGetFilter () {
   // 配置页和过滤规则页启动预加载时都会要同一份过滤规则快照，共享在飞 Promise。
   return once('filter', () => consumeJson(fetch('/api/config/filter', timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   }))))
 }
 
 // 服务器草稿：读面沿用 Cookie/?token= 均可的全局鉴权；写/删只认 Bearer。
 function apiGetFilterDraft () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   return consumeJson(fetch('/api/config/filter/draft', merged))
 }
@@ -472,7 +490,7 @@ function apiPostFilterDraft (filter, baseRevision, { keepalive = false } = {}) {
 function apiDeleteFilterDraft () {
   const merged = timedRequest({
     method: 'DELETE',
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` },
+    headers: { Accept: 'application/json', ...AUTH_HEADER },
     keepalive: true
   })
   return consumeJsonResult(fetch('/api/config/filter/draft', merged))
@@ -562,7 +580,7 @@ function apiPostFilterRestore (body) {
 // 写面复用 filterWriteHeaders（Bearer + application/json，服务端 415 闸要求后者）。
 function apiGetConsoleSettings () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   return consumeJson(fetch('/api/config/console', merged))
 }
@@ -579,7 +597,7 @@ function apiPostConsoleSettings (body) {
 // 两步验证（v3.357）：状态读取 + 开启/确认/关闭。写面与其它写端点同款 Bearer + JSON。
 function apiGetTwoFactorStatus () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   return consumeJson(fetch('/api/2fa/status', merged))
 }
@@ -660,7 +678,7 @@ async function trigger (action) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Bearer ${BOOT.token}`
+        ...AUTH_HEADER
       },
       body
     },
@@ -676,7 +694,7 @@ async function triggerNotifyTest () {
   return triggerVia(
     {
       method: 'POST',
-      headers: { Authorization: `Bearer ${BOOT.token}` }
+      headers: { ...AUTH_HEADER }
     },
     (merged) => fetch('/api/notify-test', merged),
     (data) => {
@@ -706,14 +724,14 @@ function apiSearchLines ({ q, page, limit } = {}) {
   if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(limit))
   const qs = params.toString()
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   }, 12000)
   return consumeJson(fetch(qs.length > 0 ? `/api/line-search?${qs}` : '/api/line-search', merged))
 }
 
 function apiGetLineWatch () {
   const merged = timedRequest({
-    headers: { Accept: 'application/json', Authorization: `Bearer ${BOOT.token}` }
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   return consumeJson(fetch('/api/line-watch', merged))
 }
@@ -731,7 +749,7 @@ function apiPostLineWatch (payload = {}) {
 }
 
 export {
-  BOOT, DAY_KEY_RE, timedRequest, trigger,
+  BOOT, AUTH_HEADER, DAY_KEY_RE, timedRequest, trigger,
   triggerNotifyTest, apiGetStatus, apiGetRuns, apiGetRunDetail,
   apiCancelRun, apiGetRunHistory, apiGetMessages, apiGetTrends,
   apiGetCacheHealth, apiGetFiles, apiGetConfig, apiGetLogs,

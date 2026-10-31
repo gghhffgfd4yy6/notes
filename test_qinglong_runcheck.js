@@ -60,6 +60,8 @@ function makeApp (overrides = {}) {
   return {
     validateConfig: overrides.validateConfig || (() => []),
     init: overrides.init || (() => {}),
+    // C3-010：--check 现在打印 MessageStore.cacheDir（生效值）；桩不注入时按「未回退」口径走配置值。
+    MessageStore: overrides.MessageStore,
     Config: {
       filter: overrides.filter || {},
       keyword: { zkt_gjc: overrides.zkt_gjc || '' },
@@ -131,6 +133,57 @@ function makeApp (overrides = {}) {
   assert.strictEqual(rNoMethod.code, 1, 'notify 无 configuredChannelCount 方法应返回 1')
   assert.ok(rNoMethod.output.includes('❌ 通知通道'), '失败项应为"通知通道"，输出应含 ❌ 通知通道')
   assert.ok(rNoMethod.output.includes('未检测到完整通道配置'), '应显示未检测到通道配置')
+  restoreNotify()
+
+  // ===== C3-010：--check 的「缓存目录」必须打印**生效值**，回退时必须点明原因 =====
+  // 旧实现只打印 app.Config.cache.dir：cache.dir 被根内安全检查拒绝时生产已静默回退到
+  // .xbk_cache_safe，而 --check 仍显示 ✅ 配置值 ⇒ 运维以为判重主存写在配置位置
+  // （实际写在别处：缓存「丢失」/重复推送的误判来源）。
+  mockNotify(1)
+  const fallbackDir = path.join(__dirname, '.xbk_cache_safe')
+  // 回退判定改由 MessageStore 给出（Codacy path-join-resolve-traversal 收口）：桩提供生产
+  // MessageStore 在回退时记录的 { raw, chosen }，--check 只负责显示，不再自己用 path.resolve 重算。
+  const configuredDir = path.join(__dirname, '.test-cache')
+  const rFallback = withHealthyEnv(() => captureRunCheck(makeApp({
+    MessageStore: { cacheDir: fallbackDir, cacheDirFallback: { raw: configuredDir, chosen: fallbackDir } }
+  })))
+  assert.strictEqual(rFallback.code, 0, '回退本身不是失败（生产口径），但必须可见')
+  assert.ok(rFallback.output.includes(`✅ 缓存目录：${fallbackDir}`),
+    `--check 必须打印生效目录而非配置值：${rFallback.output}`)
+  assert.ok(rFallback.output.includes(`配置值 ${configuredDir} 未通过根内安全检查，已回退到 ${fallbackDir}`),
+    `--check 必须点明「配置值未生效、回退到哪」：${rFallback.output}`)
+  // 对照：未回退（cacheDirFallback = null）时不加任何赘述（否则「已回退」会变成永远为真的噪声）
+  const rSame = withHealthyEnv(() => captureRunCheck(makeApp({ MessageStore: { cacheDir: configuredDir, cacheDirFallback: null } })))
+  assert.ok(rSame.output.includes(`✅ 缓存目录：${configuredDir}\n`),
+    `生效值等于配置值时只打印路径：${rSame.output}`)
+  assert.ok(!rSame.output.includes('已回退'), '未回退时不得出现「已回退」说明')
+  // XBK_CACHE_DIR 覆盖时点明来源（与 statusCacheDir 同源口径）
+  process.env.XBK_CACHE_DIR = fallbackDir
+  try {
+    const rEnv = withHealthyEnv(() => captureRunCheck(makeApp()))
+    assert.ok(rEnv.output.includes('由 XBK_CACHE_DIR 覆盖'), `环境变量覆盖必须显形：${rEnv.output}`)
+  } finally {
+    delete process.env.XBK_CACHE_DIR
+  }
+  // 对照（C3-010 返工）：相对路径 / 纯空白会被 MessageStore 与 statusCacheDir 忽略（模块自己告警
+  // 「不是绝对路径，已忽略」），--check 不得把它说成「由 XBK_CACHE_DIR 覆盖，配置值 <同一值>」——
+  // 同一份诊断自相矛盾，运维会以为读写落在 env 目录（本条修复的目的正是「别让目录判断说反话」）。
+  const defaultConfigured = path.join(__dirname, '.test-cache')
+  for (const ignoredEnv of ['relative/cache', '   ']) {
+    process.env.XBK_CACHE_DIR = ignoredEnv
+    try {
+      const rIgnored = withHealthyEnv(() => captureRunCheck(makeApp()))
+      assert.ok(!rIgnored.output.includes('由 XBK_CACHE_DIR 覆盖'),
+        `被忽略的 XBK_CACHE_DIR（${JSON.stringify(ignoredEnv)}）不得说成已覆盖：${rIgnored.output}`)
+      assert.ok(rIgnored.output.includes(`✅ 缓存目录：${defaultConfigured}`),
+        `必须打印实际生效的配置目录：${rIgnored.output}`)
+      if (ignoredEnv.trim()) {
+        assert.ok(rIgnored.output.includes('已忽略'), `相对路径必须点明「已忽略」：${rIgnored.output}`)
+      }
+    } finally {
+      delete process.env.XBK_CACHE_DIR
+    }
+  }
   restoreNotify()
 
   console.log('test_qinglong_runcheck OK')

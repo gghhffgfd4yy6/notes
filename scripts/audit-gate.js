@@ -81,7 +81,11 @@ function main () {
     return
   }
   // 收集命中的 advisory：via 里的直接 advisory（source/GHSA url）+ 间接链上引用的 advisory
-  const hitAllowed = []
+  // C10-066：豁免命中项必须**带着**理由来源（GHSA id）走到显形处，不能回头反解格式化后的
+  // 字符串。旧实现把「pkg(GHSA)」拼成字符串、再用 indexOf('(')/lastIndexOf(')') 反解 id，
+  // 而间接链命中项当时只存了包名（无括号）⇒ 反解失败即 ghsaId='' ⇒ 打出「被显式豁免：」后面
+  // 空理由，审计追溯断链（而这条 warning 正是豁免唯一的显形通道）。
+  const hitAllowed = [] // { label: 显形文案, ids: [理由来源的 GHSA id] }
   const hitBlocked = []
   for (const v of high) {
     const vias = Array.isArray(v.via) ? v.via : []
@@ -93,7 +97,7 @@ function main () {
       const byName = new Map(entries.map(e => [e.name, e]))
       const visited = new Set([v.name])
       let current = v
-      let allowed = false
+      let allowedIds = null
       let broken = false
       while (true) {
         const viaNames = (Array.isArray(current.via) ? current.via : []).filter(x => typeof x === 'string')
@@ -105,30 +109,34 @@ function main () {
         if (!next) { broken = true; break } // via 指向 vulnerabilities 中不存在的条目：信息不足，保守 block
         const nextAdvisories = (Array.isArray(next.via) ? next.via : []).filter(x => typeof x === 'object' && x.url)
         if (nextAdvisories.length > 0) {
-          // 根 advisory 节点：仅当其全部 advisory 均在豁免清单才放行
-          allowed = nextAdvisories.every(a => ALLOWED_ADVISORIES.has(urlGhsa(a.url)))
+          // 根 advisory 节点：仅当其全部 advisory 均在豁免清单才放行（every，不得写成 some）
+          // ids 一并带出去——显形处的理由靠它查表，而不是反解文案（C10-066）
+          const ids = nextAdvisories.map(a => urlGhsa(a.url))
+          if (ids.every(id => ALLOWED_ADVISORIES.has(id))) allowedIds = ids
           break
         }
         current = next
       }
-      if (!broken && allowed) hitAllowed.push(v.name)
+      if (!broken && allowedIds) hitAllowed.push({ label: v.name, ids: allowedIds })
       else hitBlocked.push(v.name)
       continue
     }
     const allAllowed = advisories.every(a => ALLOWED_ADVISORIES.has(urlGhsa(a.url)))
     if (allAllowed) {
-      for (const a of advisories) hitAllowed.push(`${v.name}(${urlGhsa(a.url)})`)
+      for (const a of advisories) {
+        const id = urlGhsa(a.url)
+        hitAllowed.push({ label: `${v.name}(${id})`, ids: [id] })
+      }
     } else {
       hitBlocked.push(v.name)
     }
   }
   for (const item of hitAllowed) {
-    const open = item.indexOf('(')
-    const close = item.lastIndexOf(')')
-    const ghsaId = open >= 0 && close > open ? item.slice(open + 1, close) : ''
-    const reason = ghsaId ? (ALLOWED_ADVISORIES.get(ghsaId) || '') : ''
-    console.log(`::warning title=安全审计豁免显形::${item} 被显式豁免：${reason}`)
-    console.log(`  ⚠️ 豁免：${item}`)
+    // 理由直接来自豁免清单（键就是上一步记录的 GHSA id）。兜底文案保留：若豁免清单被改成
+    // 「有 id 无理由」，要显形这件事本身，而不是打一个空尾让人以为理由为空。
+    const reason = item.ids.map(id => ALLOWED_ADVISORIES.get(id) || '').filter(Boolean).join('；') || '（豁免清单未记录理由）'
+    console.log(`::warning title=安全审计豁免显形::${item.label} 被显式豁免：${reason}`)
+    console.log(`  ⚠️ 豁免：${item.label}`)
   }
   if (hitBlocked.length > 0) {
     console.error(`❌ 安全审计失败：存在未豁免的高危漏洞：${hitBlocked.join(', ')}`)

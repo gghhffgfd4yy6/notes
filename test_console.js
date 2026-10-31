@@ -103,6 +103,8 @@ const {
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
   buildConfigView, configuredFlag, TREND_DAYS_DEFAULT, FILES_LIST_MAX,
   sanitizeAccessPath, shouldLogAccess, acceptsGzip, ACCESS_LOG_MAX,
+  // C2-022：条件 tag 的变体因子（纯函数；回归见「按解码后的参数名剔除 token」用例）
+  conditionalVariant,
   findSecretLikeField, CACHE_HEALTH_COUNT_MAX_BYTES, cacheHealthEntryCount,
   filterMessageItems, filterMessagesByDays, messageCategoriesOf, MESSAGE_DAYS_ALLOWED,
   parseDayKey, filterMessagesByRange, windowMessages,
@@ -128,6 +130,8 @@ const {
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
   makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
+  // C2-014：限速阈值从实现取，测试不自己写死 10
+  TWO_FACTOR_LOGIN_MAX_FAILS,
   // v3.374 信任设备：签发/校验纯函数 + 落盘读写
   DEVICE_FILE, DEVICE_COOKIE, DEVICE_TTL_MS, DEVICE_MAX,
   makeDeviceRecord, parseDeviceCookie, trustedDeviceOf, appendDeviceRecord,
@@ -924,7 +928,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   const TOKEN2 = 'q'.repeat(32)
   const dir = tmpDir()
   const state = readStatus(dir) // 空目录 → 全部件「缺失」，formatStatus 合法渲染
-  const withToken = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  const withToken = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
   // JSON 岛注入（v3.285：SPA 壳；fetch 由前端发起，不再有原生表单/meta refresh）
   assert.ok(withToken.includes(`"token":"${TOKEN2}"`), 'JSON 岛带 token')
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
@@ -932,7 +936,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
   // v3.376：theme-color 跟主题底色一致，Android 系统栏/地址栏才不会在切页时漏白。
   assert.ok(withToken.includes('<meta name="theme-color" content="#0b0f17">'), 'theme-color 必须是默认主题底色')
-  const lightPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
+  const lightPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
   assert.ok(lightPage.includes('<meta name="theme-color" content="#f3f5f9">'), 'theme-color 必须跟随主题')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
@@ -944,32 +948,52 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   // v3.323 主题：首帧必须由服务端把 <html data-theme> 渲染出来（放 body 或只在 JS 里设都不算）。
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(withToken), '默认首帧 data-theme 必须是 deep')
-  const nordPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
+  const nordPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
   assert.ok(/<html lang="zh-CN" data-theme="nord">/.test(nordPage), '首帧必须跟随传入的主题')
-  const badPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
+  const badPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(badPage), '白名单外主题必须回落 deep')
   assert.ok(!/<body[^>]*data-theme/.test(nordPage), 'data-theme 必须在 <html> 上（放到 body 不生效）')
-  const noToken = renderPage(state, [], null)
+  const noToken = renderPage(state, null)
   assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
   assert.ok(!noToken.includes(`"token":"${TOKEN2}"`), '无 token 时不回显')
   assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支（noscript 降级）')
   // Sourcery vwK：特殊字符 token 必须以 \uXXXX JSON 转义进岛（script 文本不做实体解码，
   // HTML 实体会让前端 parse 出错误 token）；JSON.parse 后必须还原为原值。
   const WEIRD = 'a<b>&"\\u2028' + 'z'.repeat(20)
-  const weirdPage = renderPage(state, [], new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
+  const weirdPage = renderPage(state, new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
   assert.ok(!weirdPage.includes('<b>'), '岛内不得出现裸 <script 片段')
   const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(weirdPage)
   assert.ok(m, 'JSON 岛可提取')
   const parsed = JSON.parse(m[1].replace(/\\u003c/g, '<').replace(/\\u003e/g, '>'))
   assert.strictEqual(parsed.token, WEIRD, '岛内 token 经 JSON 解析还原为原值')
   // 常规 token 原样进岛（不引入任何实体）
-  const plain = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  const plain = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
   assert.ok(plain.includes(`"token":"${TOKEN2}"`), '常规 token 原样回显')
 })
 
 ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）', () => {
   // 端到端用例在下方；这里登记实现约束。
   assert.ok(true)
+})
+
+// C2-022 回归：条件 tag 的变体因子必须按**解码后**的参数名剔除 token。
+// authorize 的 `?token=` 走 URLSearchParams.get('token')，也就是解码后的键 ⇒ `?%74oken=abc`
+// 同样是有效凭证；conditionalVariant 若按字面量比键名，同一份内容就会按 token 的编码写法
+// 算出两个 ETag，条件缓存被凭空的变体打散（variant 里还留着凭证片段）。这条用例直接对
+// 导出的纯函数断言（不经过 HTTP），回退成字面量比较即红。
+ok('conditionalVariant: 按解码后的参数名剔除 token（%74oken 与裸 URL 同变体；非 token 参数仍区分）', () => {
+  const v = (url) => conditionalVariant({ url })
+  // ① 修复点：编码写法的 token 与「查询串其余参数」算同一变体。
+  assert.strictEqual(v('/api/runs?%74oken=abc&limit=10'), v('/api/runs?limit=10'),
+    '?%74oken= 是有效凭证，必须按 token 剔除，不得让同一内容分裂成两个 tag')
+  assert.strictEqual(v('/api/runs?token=abc&limit=10'), v('/api/runs?limit=10'), '裸 ?token= 口径不变')
+  assert.strictEqual(v('/api/config?%74oken=abc'), '/api/config', '参数全被剔掉时回落无查询串形态')
+  // ② 反例：只剔 token 这一个键名——其余参数照旧参与变体（防把过滤写宽成「吞掉整段查询串」）。
+  assert.notStrictEqual(v('/api/runs?limit=10'), v('/api/runs?limit=200'), '其余参数不同必须换变体')
+  assert.notStrictEqual(v('/api/runs?tokens=abc&limit=10'), v('/api/runs?limit=10'),
+    'tokens 不是 token，不得被剔除（否则不同查询串共用一个 tag）')
+  // ③ 不做大小写折叠：authorize 的 get('token') 区分大小写，?Token= 不是凭证，也就必须留在变体里。
+  assert.notStrictEqual(v('/api/runs?Token=abc'), v('/api/runs'), '?Token= 不是凭证，必须保留为变体因子')
 })
 
 // ── v3.300 访问日志：纯函数表（无 HTTP；端到端用例见下方 T1-T7）──
@@ -1563,6 +1587,19 @@ async function filterRuleApiTests () {
       assert.strictEqual(body.revision, 1)
       assert.deepStrictEqual(body.changedFields, ['pingbibiaoti'])
       assert.ok(typeof body.hash === 'string' && body.hash.length > 0, '必须返回规则摘要 hash')
+      // C2-020：摘要必须与运行期 App.run 的 filter.hash 同口径（折入 compileStateOf 的「编译
+      // 生效」维度）。旧实现只传前两参，控制台的 hash 与生效快照里的 filter.hash 永远不相等。
+      const cfgRead = await request(port, 'GET', '/api/config/filter', { token: TOKEN })
+      const activeCfg = JSON.parse(cfgRead.text)
+      const realDeps = runtimeFilterDeps()
+      const runtimeHash = realDeps.filterHash(
+        activeCfg.filter,
+        activeCfg.keyword.zkt_gjc,
+        realDeps.compileStateOf(realDeps.RuleEngine.compileRules(activeCfg.filter))
+      )
+      assert.strictEqual(body.hash, runtimeHash, '控制台摘要必须等于运行期 filter.hash 口径')
+      assert.notStrictEqual(body.hash, realDeps.filterHash(activeCfg.filter, activeCfg.keyword.zkt_gjc),
+        '纯配置摘要（不折编译维度）不得再冒充 filter.hash')
       assert.strictEqual(body.appliedHint, '下一轮生效')
       assert.strictEqual(fs.statSync(paths.file).mode & 0o777, 0o600, '覆盖文件必须 0600')
       assert.strictEqual(fs.existsSync(paths.lock), false, '保存后锁必须释放')
@@ -2549,6 +2586,14 @@ async function backupApiTests () {
       assert.strictEqual(again.status, 200, again.text)
       assert.deepStrictEqual(JSON.parse(again.text).imported.messages, 1)
       assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]))
+      // C2-018：幂等键按**上传字节**判同一份备份（不再把 bundle 重新序列化做语义归一）。
+      // 内容语义相同、字节不同（这里多一个换行）必须当成另一份备份拒绝——同一幂等键下
+      // 「另一份文件」覆盖旧结果，正是这个键要挡的事。
+      const reformatted = JSON.stringify(bundle) + '\n'
+      const conflict = await request(port, 'POST', '/api/backup/import', { token: TOKEN, body: reformatted, headers })
+      assert.strictEqual(conflict.status, 409, conflict.text)
+      assert.strictEqual(JSON.parse(conflict.text).code, 'idempotency_conflict')
+      assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 10, title: 'newer' }]), '被拒的导入不得落盘')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
@@ -3032,6 +3077,11 @@ async function watchMonitorTests () {
       const failed = await failing.runWatchOnce()
       assert.strictEqual(failed.pushed, 0)
       assert.strictEqual(failed.results[0].error, 'push_failed')
+      // C2-009 入库回归：旧的四个失败分支先 push 一条 error 条目、循环外又无条件 push 一条
+      // 「成功形态」，同一个词在 results 里出现两次（前端一个标红一个标绿）。只查 results[0]
+      // 抓不到，必须钉长度。
+      assert.strictEqual(failed.results.length, 1,
+        `推送失败时同一个词只能有一条结果（实际 ${failed.results.length} 条：${JSON.stringify(failed.results)}）`)
       const kept = readWatchState(dir)
       assert.deepStrictEqual(kept.words[0].sentIds, [])
       assert.strictEqual(kept.words[0].lastReadId, 'haodan-7303544', '失败不得推进锚点')
@@ -3274,6 +3324,243 @@ async function watchMonitorTests () {
   })
 }
 
+// ── 返工回归（w1-g1 must_fix）：以下修复此前的反向验证只存在于未入库的 scratch 探针，
+// 仓库里没有任何断言会在修复被回退时变红。这里把每条行为修复落成入库断言：
+//   C2-007 状态文件（console-auto.json / console-lastaccept.json）必须经 writeAtomic 落盘，
+//          且重放窗落盘失败必须 fail-closed 500（旧的裸 writeFileSync 会照常 202 并 spawn）；
+//   C2-008 导入失败的回滚必须经 writeAtomic 原子提交，回滚写失败要如实报 rolledBack:false；
+//   C2-012 2FA 两处补对象校验（body=[] 旧实现 200 {enabled:false}，把畸形请求报成成功）；
+//   C2-013 重放窗文件损坏必须在启动时点名文件 + 原因 + 后果；
+//   C2-009 结果去重补在既有关注词用例里（同一份夹具，不复制第二套）；
+//   C2-010/C2-011 是纯重构（三份实现合并成一份，行为等价、无行为差异可断言），按评审给的口径
+//          补结构断言，且先剥注释（codeOf）防注释里的原句满足判据。
+// 行为类判据一律走真实入口（HTTP / createConsole / 落盘桩），不做源码字符串匹配。
+async function withStorageWriteStub (impl, fn) {
+  // scripts/console.js 在**加载期**就把 writeAtomic 解构进闭包（`const { readSafeTextResult,
+  // writeAtomic } = require('../xbk_storage')`），运行期改 require.cache 里的导出对它无效。
+  // 要观察「某处落盘是否真的走 writeAtomic」，只能换掉 xbk_storage 的导出后重新加载 console。
+  // 桩只多记一条 {file,label,result}，其余导出原样透传；跑完把两份 require.cache 还原，
+  // 后续用例看到的仍是本文件顶部那个实例（模块级 runs Map 不受影响）。
+  const storagePath = require.resolve('./xbk_storage')
+  const consolePath = require.resolve('./scripts/console')
+  const realStorage = require.cache[storagePath]
+  const realConsole = require.cache[consolePath]
+  assert.ok(realStorage && realStorage.exports, 'xbk_storage 必须已加载（否则桩无法透传真实实现）')
+  const realWrite = realStorage.exports.writeAtomic
+  assert.strictEqual(typeof realWrite, 'function', 'xbk_storage.writeAtomic 必须存在')
+  const calls = []
+  require.cache[storagePath] = {
+    id: storagePath,
+    filename: storagePath,
+    loaded: true,
+    exports: {
+      ...realStorage.exports,
+      writeAtomic: (file, text, label) => {
+        const entry = { file: String(file), label: label === undefined ? '' : String(label) }
+        let result = false
+        try {
+          result = impl(entry, text, realWrite)
+        } catch (e) {
+          result = false
+        }
+        calls.push({ ...entry, result })
+        return result
+      }
+    }
+  }
+  let mod
+  try {
+    delete require.cache[consolePath]
+    mod = require('./scripts/console')
+  } finally {
+    delete require.cache[consolePath]
+    require.cache[storagePath] = realStorage
+    if (realConsole) require.cache[consolePath] = realConsole
+  }
+  return fn(mod, calls)
+}
+
+// 同步抓 stderr：createConsole 启动期的告警是同步 console.error 出来的。
+function capturedStderr (fn) {
+  const chunks = []
+  const orig = process.stderr.write
+  process.stderr.write = (c) => { chunks.push(String(c)); return true }
+  try {
+    fn()
+  } finally {
+    process.stderr.write = orig
+  }
+  return chunks.join('')
+}
+
+async function reworkRegressionTests () {
+  await aok('结构红线: 过滤规则提交链只有一份实现（C2-010）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((code.match(/function commitFilterOverride \(/g) || []).length, 1,
+      'commitFilterOverride 只能有一处定义（保存/回滚/导入各写一遍就是回退了修复）')
+    assert.strictEqual((code.match(/commitFilterOverride\(\{/g) || []).length, 3,
+      '保存、回滚、导入三个写动作必须共用同一条提交链')
+    assert.strictEqual((code.match(/function appendFilterAudit \(/g) || []).length, 1)
+    assert.strictEqual((code.match(/appendFilterAudit\(\{/g) || []).length, 1,
+      '审计只能由提交链写一次（散着写必然出现「某条路径不写审计」）')
+  })
+
+  await aok('结构红线: 上游响应体读取只有一份实现（C2-011）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((code.match(/getReader\(\)/g) || []).length, 1,
+      'getReader() 只应出现在共用实现里（搜索/详情各写一份就是回退了修复）')
+    assert.strictEqual((code.match(/readUpstreamTextCapped/g) || []).length, 3,
+      'readUpstreamTextCapped 必须 1 处定义 + 搜索/详情 2 个调用点')
+  })
+
+  await aok('结构红线: 摘要正则只有一份（C10-057）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
+    assert.strictEqual((code.match(/total=\(\\d\+\) dedup=/g) || []).length, 1,
+      '摘要行正则只能有一处定义（parseLastRun 再内联一份就是回退了修复：两份的分组形态还会各自漂）')
+    const { RUN_SUMMARY_LINE_RE } = require('./scripts/status')
+    const m = RUN_SUMMARY_LINE_RE.exec('2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1.0s')
+    assert.ok(m, '摘要行必须能被这一份正则命中')
+    assert.strictEqual(m[1].trim(), '2026-09-08 10:00:00',
+      '分组 1 必须是整段时间戳（改成只有日期 ⇒ 面板「时间 2026-09-08」，S12/S13/S15 会红）')
+    assert.strictEqual(m[8], '1.0s', '分组 8 仍是 elapsed（分组编号被挤动过一次）')
+  })
+
+  await aok('结构红线: 日期回环校验服务端只有一份（C10-053）', () => {
+    const status = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
+    const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((status.match(/function isRealDayKey \(/g) || []).length, 1,
+      'isRealDayKey 只能在 status.js 定义一次（服务端唯一真源）')
+    assert.strictEqual((status.match(/toISOString\(\)\.slice\(0, 10\) === /g) || []).length, 1,
+      '回读比对只能出现在 isRealDayKey 里（readTrends 再内联一份就是回退了修复）')
+    assert.strictEqual((consoleSrc.match(/toISOString\(\)\.slice\(0, 10\) !== /g) || []).length, 0,
+      'console.js 不得自带回读比对（parseDayKey 必须调 isRealDayKey）')
+    assert.strictEqual((consoleSrc.match(/isRealDayKey/g) || []).length, 2,
+      'console.js 必须恰好一处 import + 一处调用 isRealDayKey')
+  })
+
+  await aok('2FA 写端点: body 不是对象必须 400（C2-012）', async () => {
+    const dir = mkTmp('xbk-console-c2012-')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const json = { 'content-type': 'application/json' }
+    try {
+      for (const [endpoint, body] of [['/api/2fa/disable', '[]'], ['/api/2fa/enable', '"x"'], ['/api/2fa/disable', 'null']]) {
+        const res = await request(port, 'POST', endpoint, { token: TOKEN, headers: json, body })
+        assert.strictEqual(res.status, 400,
+          `${endpoint} body=${body} 必须是 400（旧实现按空 payload 继续走，把畸形请求报成成功：${res.text}）`)
+        assert.strictEqual(JSON.parse(res.text).error, 'body 必须是对象', `${endpoint} body=${body} 错误码`)
+      }
+      // 对象形态照旧走原语义（2FA 未开启时关闭 = 200 {enabled:false}）：校验只拒绝畸形 body。
+      const normal = await request(port, 'POST', '/api/2fa/disable', { token: TOKEN, headers: json, body: '{}' })
+      assert.strictEqual(normal.status, 200, normal.text)
+      assert.deepStrictEqual(JSON.parse(normal.text), { enabled: false })
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('重放窗记录损坏: 启动时点名文件与原因告警（C2-013）', () => {
+    const dir = mkTmp('xbk-console-c2013-')
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), '{"check":{"at":17') // 半截 JSON：崩溃/ENOSPC 的典型残留
+    let inst
+    const stderr = capturedStderr(() => { inst = createConsole({ token: TOKEN, stateDir: dir }) })
+    try {
+      assert.ok(stderr.includes('console-lastaccept.json'), `告警必须点名文件（实际 stderr：${JSON.stringify(stderr)}）`)
+      assert.ok(stderr.includes('内容不是合法 JSON'), '告警必须点名原因（旧实现静默按空窗处理）')
+      assert.ok(stderr.includes('重复跑一轮真实推送'), '告警必须点名后果，否则运维不知道窗口已经失效')
+    } finally {
+      inst.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('状态文件落盘: auto/lastaccept 都经 writeAtomic，重放窗写不进则 fail-closed（C2-007）', async () => {
+    const dir = mkTmp('xbk-console-c2007-')
+    const json = { 'content-type': 'application/json' }
+    let failLastAccept = false
+    await withStorageWriteStub((entry, text, realWrite) => {
+      if (failLastAccept && entry.label === '重放窗记录') return false
+      return realWrite(entry.file, text, entry.label)
+    }, async (mod, calls) => {
+      const { server } = mod.createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      try {
+        // ① 只保存间隔（on 仍 false ⇒ stopAuto ⇒ persistAuto），不启动自动运行、不 spawn。
+        const saved = await request(port, 'POST', '/api/auto', { token: TOKEN, headers: json, body: JSON.stringify({ interval: 5 }) })
+        assert.strictEqual(saved.status, 200, saved.text)
+        const autoCall = calls.find((c) => c.label === '自动运行状态')
+        assert.ok(autoCall, `自动运行状态必须经 writeAtomic 落盘（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(autoCall.file, path.join(dir, 'console-auto.json'))
+        assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).interval, 5)
+
+        // ② 重放窗桩返回 false：/trigger 必须 500 fail-closed（旧实现裸 writeFileSync 会 202 并 spawn）。
+        failLastAccept = true
+        const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+        assert.strictEqual(blocked.status, 500, `重放窗落盘失败必须 fail-closed（实际 ${blocked.status}：${blocked.text}）`)
+        assert.match(String(JSON.parse(blocked.text).error), /fail-closed/)
+        const lastAcceptCall = calls.find((c) => c.label === '重放窗记录')
+        assert.ok(lastAcceptCall, `重放窗记录必须经 writeAtomic 落盘（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(lastAcceptCall.file, path.join(dir, 'console-lastaccept.json'))
+        // fail-closed 分支必须释放触发锁，否则后续 10 分钟都被 409 挡住。
+        const lockRaw = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
+        assert.ok(!lockRaw || lockRaw.released === true, 'fail-closed 分支必须释放触发锁')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  await aok('数据备份: 导入失败的回滚经 writeAtomic 原子提交（C2-008）', async () => {
+    const dir = mkTmp('xbk-console-c2008-')
+    const pushPath = path.join(dir, 'push.json')
+    const oldPush = JSON.stringify([{ id: 1, title: 'old' }])
+    fs.writeFileSync(pushPath, oldPush)
+    fs.mkdirSync(path.join(dir, 'run.log')) // run.log 是目录 ⇒ 写到它必失败 ⇒ 触发整体回滚
+    const bundle = {
+      kind: 'xbk-console-backup',
+      schema: 1,
+      data: {
+        messages: { count: 1, text: JSON.stringify([{ id: 2, title: 'new' }]) },
+        runLog: { text: 'new log\n' }
+      }
+    }
+    let failRollback = false
+    await withStorageWriteStub((entry, text, realWrite) => {
+      if (failRollback && entry.label === '导入回滚 push.json') return false
+      return realWrite(entry.file, text, entry.label)
+    }, async (mod, calls) => {
+      const { server } = mod.createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      const doImport = () => request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(bundle)
+      })
+      try {
+        const failed = await doImport()
+        assert.strictEqual(failed.status, 500, failed.text)
+        assert.strictEqual(JSON.parse(failed.text).rolledBack, true, '回滚必须成功')
+        const rollbackCall = calls.find((c) => c.label === '导入回滚 push.json')
+        assert.ok(rollbackCall, `回滚必须经 writeAtomic 原子提交（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(rollbackCall.file, pushPath)
+        assert.strictEqual(rollbackCall.result, true)
+        assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), oldPush, '回滚内容必须逐字还原')
+
+        // 回滚写入本身失败：必须如实上报 rolledBack:false，不得把「回滚没做成」报成成功。
+        failRollback = true
+        const failed2 = await doImport()
+        assert.strictEqual(failed2.status, 500, failed2.text)
+        assert.strictEqual(JSON.parse(failed2.text).rolledBack, false, '回滚写失败必须如实上报 rolledBack:false')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+}
+
 async function main () {
   // ── C5-020：源码锁的纪律（缺锚点响亮失败 / 注释不得满足判据）──
   ok('C5-020 源码切片缺锚点或空切片必须响亮失败（旧写法 slice(-1) 静默假绿）', () => {
@@ -3418,6 +3705,7 @@ async function main () {
   await filterRuleApiTests()
   await backupApiTests()
   await backupUiStructureTests()
+  await reworkRegressionTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -3631,6 +3919,50 @@ async function main () {
       assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
+  await aok('资产: 跨模块具名导入在 ESM 链接期都能解析（漏导出 = 整张模块图不实例化、白屏）', () => {
+    // C7-029：api.js 定义了 AUTH_HEADER 却没写进 export 块，pages.js 却 `import { AUTH_HEADER }`。
+    // 浏览器原生 ESM 在**链接期**（求值之前）就抛 SyntaxError「does not provide an export named」，
+    // 整页模块图不实例化 ⇒ 白屏；而源码文本断言（Authorization 行数、import 串）照样全绿。
+    // 这里用 Node 的 vm.SourceTextModule 只做实例化（link）不执行：不需要 document 桩，报错与浏览器同一句。
+    // 子进程独立跑（vm 模块需要 --experimental-vm-modules，不能给整个套件加）。
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const script = [
+      "'use strict'",
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      "const vm = require('node:vm')",
+      "const { pathToFileURL } = require('node:url')",
+      'const dir = process.argv[1]',
+      "const { STATIC_ASSETS } = require(path.join(dir, '..', 'console.js'))",
+      'const cache = new Map()',
+      'function load (file) {',
+      "  if (!cache.has(file)) cache.set(file, new vm.SourceTextModule(fs.readFileSync(file, 'utf8'), { identifier: pathToFileURL(file).href }))",
+      '  return cache.get(file)',
+      '}',
+      '(async () => {',
+      "  const root = load(path.join(dir, 'app.js'))",
+      '  await root.link((spec) => {',
+      "    const route = '/assets/' + spec.replace(/^\\.\\//, '')",
+      '    const entry = STATIC_ASSETS[route]',
+      "    if (!entry) throw new Error('import 目标未登记白名单：' + spec)",
+      '    return load(path.join(dir, entry.file))',
+      '  })',
+      '  // 入口闭包必须覆盖目录里每个模块：漏一个就等于这段链接检查没跑到它。',
+      '  const linked = new Set([...cache.keys()].map((p) => path.basename(p)))',
+      '  const unlinked = fs.readdirSync(dir).filter((f) => /\\.(js|mjs)$/.test(f) && !linked.has(f))',
+      "  if (unlinked.length > 0) throw new Error('模块不在 app.js 的 import 闭包里（本用例没检查到）：' + unlinked.join(','))",
+      "  process.stdout.write('LINK OK')",
+      '})().catch((e) => { console.error((e && e.message) || String(e)); process.exit(1) })'
+    ].join('\n')
+    const out = spawnSync(process.execPath, ['--experimental-vm-modules', '-e', script, dir], { encoding: 'utf8' })
+    // 只留真正的错误行：Node 的 ExperimentalWarning 会排在前面，把 SyntaxError 挤出消息。
+    const errText = String(out.stderr || '').split('\n')
+      .filter((l) => l.trim() && !/^\(node:\d+\)|^\(Use `node --trace-warnings/.test(l.trim()))
+      .join(' | ')
+    assert.strictEqual(out.status, 0,
+      '模块图链接失败（浏览器会在链接期 SyntaxError ⇒ 整页白屏）：' + errText)
+    assert.strictEqual(out.stdout, 'LINK OK', '链接检查没有跑完（stdout 不是 LINK OK）')
+  })
   await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（版本路径、排在入口之前）', () => {
     // 预加载是手工维护的一行一模块（v3.384 起 12 行），两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
     // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
@@ -3678,7 +4010,7 @@ async function main () {
     }
     assert.ok(closure.length > 0, '闭包不得为空（否则下面的对账恒真）')
     const { readStatus } = require('./scripts/status')
-    const html = renderPage(readStatus(tmpDir()), [], new URLSearchParams(`token=${TOKEN}`))
+    const html = renderPage(readStatus(tmpDir()), new URLSearchParams(`token=${TOKEN}`))
     // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
     const hrefsRaw = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
     // v3.375：版本号在路径里（/assets/<16hex>/x.js），模块间的相对 import 才会共享同一前缀。
@@ -6902,6 +7234,28 @@ async function main () {
       assert.ok(Date.now() - t0 < 2000, 'FIFO 闸必须立即返回')
     }
   })
+  await aok('只读纯函数: tombstoneCounts 的 (ino,size,mtimeMs) 缓存（同文件复用、mtime 变化必重算）', () => {
+    const dir = tmpDir()
+    const p = path.join(dir, 'push.json.seen.json')
+    // 两份**等长**的墓碑：total 分别为 1 与 0（等长才能只靠 ino/size/mtime 判定「同一份文件」）
+    const withKey = '{"v":1,"id":["ab"],"pad":""}'
+    const withoutKey = '{"v":1,"id":[""],"pad":"xx"}'
+    assert.strictEqual(Buffer.byteLength(withKey), Buffer.byteLength(withoutKey), '夹具必须等长')
+    fs.writeFileSync(p, withKey)
+    const old = new Date(Date.now() - 10 * 60 * 1000)
+    fs.utimesSync(p, old, old) // mtime 够旧才进缓存（<100ms 的文件不缓存）
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').counts.total, 1, '首次必须读到真实内容')
+    // 原地改写（不换 inode）+ 把 mtime 拨回原值：三元组完全相同 ⇒ 必须命中缓存
+    fs.writeFileSync(p, withoutKey)
+    fs.utimesSync(p, old, old)
+    const cached = tombstoneCounts(dir, 'push.json')
+    assert.strictEqual(cached.counts.total, 1, '同 (ino,size,mtime) 必须复用缓存结果，不再整读整解')
+    assert.strictEqual(cached.bytes, Buffer.byteLength(withKey), '缓存命中的 bytes 与计数同源（同一份快照）')
+    // mtime 一变（原子替换 / 裁剪的等价信号）⇒ 必须重算，缓存不得掩盖墓碑变化
+    const newer = new Date(Date.now() - 5 * 60 * 1000)
+    fs.utimesSync(p, newer, newer)
+    assert.strictEqual(tombstoneCounts(dir, 'push.json').counts.total, 0, 'mtime 变化必须重算')
+  })
   await aok('readSafeTextResult: openNonBlocking 选项（普通文件语义不变 / FIFO 立即 unsafe 不阻塞）', () => {
     const { readSafeTextResult } = require('./xbk_storage')
     const dir = tmpDir()
@@ -8111,6 +8465,55 @@ async function main () {
     const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
     assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
     assert.ok(!cache.includes("addEventListener('visibilitychange'"), '切回前台补拉交给 App 统一路径，面板不得再自己挂（会重复请求）')
+  })
+
+  // C7-049（评审 must_fix）：注释里复述同一个数会替既有断言兜底 —— 把定时器改成别的数，
+  // 上面那条 `cache.includes('60000')` 仍然绿，「缓存健康必须每分钟刷新」从此没有判据。
+  // 该字面量只许出现在代码里；回退掉源码注释的修复即红。
+  await aok('结构红线: 缓存健康字面量只许在代码里，注释不得复述（回退修复即红）', () => {
+    const src = readConsoleSource()
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    const rawHits = (cache.match(/60000/g) || []).length
+    const codeHits = (codeOf(cache).match(/60000/g) || []).length
+    assert.strictEqual(codeHits, 1, '缓存健康必须保留每分钟一次的裸数字定时器（既有断言按字面量锁它）')
+    assert.strictEqual(rawHits, codeHits, '该字面量只能出现在代码里，注释复述会削弱既有断言的判据')
+  })
+
+  // C7-035/C7-047/C7-049（评审 must_fix）：这三条修复此前只有未入库的 scratch 探针兜底 ——
+  // 把 main 的 pages.js/app.css/constants.js 覆盖回来跑既有套件仍是 330/0，回归只能靠人工复核。
+  // 下面每条独立成例：回退对应修复必须逐条变红，否则「修好了」就只是一句自述。
+  await aok('结构红线: 保存设置的失败提示必须按 tone 拼 is-ok/is-bad（回退修复即红）', () => {
+    const src = readConsoleSource()
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    assert.ok(codeOf(src).includes("'ls-cfg-msg' + (cfgMsgTone ? ' is-' + cfgMsgTone : '')"),
+      '保存设置的提示必须按 tone 拼 is-ok/is-bad，写死成功绿会让失败与「已保存」同色')
+    const base = (css.match(/\.ls-cfg-msg\s*\{[^}]*\}/) || [''])[0]
+    const okRule = (css.match(/\.ls-cfg-msg\.is-ok\s*\{[^}]*\}/) || [''])[0]
+    const badRule = (css.match(/\.ls-cfg-msg\.is-bad\s*\{[^}]*\}/) || [''])[0]
+    // 基类必须中性：基类还吃 --ok-fg 的话，三态类再全也挡不住「失败也是绿」。
+    assert.ok(/color:\s*var\(--text-dim\)/.test(base), '.ls-cfg-msg 基类必须是中性的 --text-dim')
+    assert.ok(/color:\s*var\(--ok-fg\)/.test(okRule), '.ls-cfg-msg.is-ok 必须用 --ok-fg')
+    assert.ok(/color:\s*var\(--bad-fg\)/.test(badRule), '.ls-cfg-msg.is-bad 必须用 --bad-fg（失败提示不得再是成功绿）')
+  })
+
+  await aok('结构红线: 备份超限文案必须由 BACKUP_FILE_MAX_BYTES 拼出（回退修复即红）', () => {
+    const pagesSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    assert.ok(codeOf(pagesSrc).includes('fmtBytes(BACKUP_FILE_MAX_BYTES)'),
+      '备份超限文案必须用 fmtBytes(BACKUP_FILE_MAX_BYTES) 拼出，写死数字后改常量会让提示说谎')
+    // 含注释全文件扫：注释里复述同一个数，同样会让「文案与常量脱钩」无人发现。
+    assert.ok(!pagesSrc.includes('上限 48MB'), 'pages.js 全文不得再出现写死的「上限 48MB」')
+  })
+
+  await aok('结构红线: 面板时长必须引用 constants 命名常量（回退修复即红）', () => {
+    // 只认 pages.js：constants.js 本来就带定义与导出，拼整份源码会把「没人引用」也判成绿。
+    const pagesSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
+    const pageCode = codeOf(pagesSrc)
+    const names = ['SNAP_INFLIGHT_MS', 'PANEL_FRESH_MS', 'SAVED_HINT_MS', 'VERSION_TIP_MS', 'OBJECT_URL_REVOKE_MS']
+    for (const name of names) {
+      const hits = (pageCode.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length
+      // import 一行 + 至少一处使用 = 2；只剩 1 次说明常量被重新写回裸数字。
+      assert.ok(hits >= 2, `pages.js 必须在 import 之外引用 ${name}，裸数字回潮即红`)
+    }
   })
 
   await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
@@ -10369,6 +10772,105 @@ async function main () {
     }
   })
 
+  // C2-014：2FA 关闭是默认部署形态，此前限速整段写在 `if (twoFactor.enabled)` 里 ⇒ 单因子
+  // 登录既不查限速也不计数，访问令牌可被无限在线穷举。这条锁死「两条失败路径都计数」，
+  // 阈值仍是实现里的 10 次 / 5 分钟（用例不自带数字，改阈值时这条跟着走）。
+  await aok('登录: 2FA 关闭时错误令牌同样计入限速（默认部署不能无限猜）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    // 走 XFF 模拟代理后的客户端：loopback 直连时 clientAddress 才认这个头。
+    const clientA = { ...form, 'x-forwarded-for': '198.51.100.24' }
+    try {
+      let res
+      for (let i = 0; i < TWO_FACTOR_LOGIN_MAX_FAILS; i++) {
+        res = await request(port, 'POST', '/login', {
+          body: new URLSearchParams({ token: 'wrong-token-0000000000' }).toString(),
+          headers: clientA
+        })
+        assert.strictEqual(res.status, 401, `第 ${i + 1} 次错误令牌只回登录页（未到阈值）`)
+        assert.ok(res.text.includes('需要访问令牌'), '2FA 关闭时错误凭证回单因子登录页')
+      }
+      // 已达阈值（10 次）：正确令牌也必须先吃 429——限速先于凭证比较。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN }).toString(),
+        headers: clientA
+      })
+      assert.strictEqual(res.status, 429, '2FA 关闭时错误令牌也必须计入限速')
+      assert.ok(res.text.includes('尝试次数过多'), '限速页给出可读原因')
+      assert.ok(res.text.includes('需要访问令牌'), '限速页仍是单因子登录页')
+      assert.ok(!res.text.includes('name="code"'), '2FA 未开启时不得渲染验证码输入框')
+
+      // 按来源 IP 隔离：换一个客户端不能跟着被锁。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN }).toString(),
+        headers: { ...form, 'x-forwarded-for': '198.51.100.25' }
+      })
+      assert.strictEqual(res.status, 303, '不同客户端 IP 不应被同一把锁误伤')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // C2-015：分发器此前没有外层 try/catch（只有 new URL 一处单独兜底），一次同步 TypeError
+  // 就是进程级 uncaughtException ⇒ 整个看板下线。这里直接把一个「鉴权阶段同步抛错」的请求
+  // 喂给 request 监听器（真实 HTTP 里 req.headers 恒存在，用它只为驱动外层兜底），断言
+  // 回 500、日志可 grep、且监听器/进程仍然存活。
+  await aok('分发器: handler 同步抛错回 500，且不带走进程', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    // 假响应：dispatchRequest 只用 on/writeHead/end（sendJson 的两个出口）。
+    const fakeRes = (headersSent) => ({
+      headersSent,
+      statusCode: 0,
+      body: '',
+      destroyed: false,
+      setHeader () {},
+      writeHead (code) { this.statusCode = code; this.headersSent = true },
+      end (body) { this.body = String(body === undefined ? '' : body) },
+      on () {},
+      destroy () { this.destroyed = true }
+    })
+    const captured = []
+    const savedError = console.error
+    try {
+      console.error = (msg) => { captured.push(String(msg)) }
+      // ① 响应头还没发：兜底必须回 500，且响应体不带内部细节。
+      const plain = fakeRes(false)
+      server.emit('request', { method: 'GET', url: '/api/status', socket: {} }, plain)
+      assert.strictEqual(plain.statusCode, 500, '同步抛错必须回 500')
+      assert.match(plain.body, /internal error/, '500 体不得泄露内部错误信息')
+      assert.ok(captured.some((line) => line.includes('控制台端点异常（dispatch）')), '兜底路径必须落一行可 grep 日志')
+      // ② 响应头已发：再写 500 会二次抛 ERR_HTTP_HEADERS_SENT，只能断链。
+      const halfSent = fakeRes(true)
+      server.emit('request', { method: 'GET', url: '/api/status', socket: {} }, halfSent)
+      assert.strictEqual(halfSent.statusCode, 0, 'headersSent 后不得再写状态行')
+      assert.strictEqual(halfSent.destroyed, true, 'headersSent 后必须断链（兜底自身不得二次抛错）')
+    } finally {
+      console.error = savedError
+    }
+    try {
+      // 兜底不能把监听器/进程一起带走：同一个 server 仍然正常服务。
+      const alive = await request(port, 'GET', '/api/status', { token: TOKEN })
+      assert.strictEqual(alive.status, 200, '分发器越界异常之后服务仍可正常响应')
+
+      // 进程级还有一道：main() 必须注册 uncaughtException（记日志后 exit(1)，不吞掉继续跑）。
+      const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+      const mainBody = codeOf(sliceBetween(src, 'function main () {', 'if (require.main === module) main()', 'main() 函数体'))
+      assert.ok(mainBody.includes("process.on('uncaughtException'"), 'main() 必须注册 uncaughtException 兜底')
+      assert.match(mainBody, /uncaughtException[\s\S]{0,600}process\.exit\(1\)/,
+        'uncaughtException 必须记日志后 exit(1)；吞掉继续跑会把未知状态当正常服务')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   // ── v3.374 信任设备（「记住这台设备」）──────────────────────────────────────
   await aok('信任设备: 签发→验证、篡改/过期/revoke 后失败、21 台淘汰最旧、2FA 关闭不认', () => {
     const dir = tmpDir()
@@ -10779,6 +11281,113 @@ async function main () {
       'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
 
+  await aok('结构红线: C7-009 「停止」先确认再发（后果写进正文，切页即收口）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function RunsPanel')
+    const end = src.indexOf('// ── 组件：逐轮运行历史', at)
+    assert.ok(at > -1 && end > at, '应能定位 RunsPanel')
+    const seg = src.slice(at, end)
+    // 一键直发且不可撤销：停止按钮只能先置「待确认」，不得直接调 doCancel/apiCancelRun。
+    const btnAt = seg.indexOf('>停止<')
+    assert.ok(btnAt > -1, '应能定位停止按钮')
+    const btn = seg.slice(seg.lastIndexOf('<' + '$' + '{Button}', btnAt), btnAt)
+    assert.ok(btn.includes('setCancelAsk(r.id)') && !btn.includes('doCancel('),
+      '停止按钮必须先置待确认态，不得一键直发 doCancel/apiCancelRun')
+    // 确认弹窗：与 C7-001 同口径受当前页门控，且只有确认才真的发。
+    assert.ok(seg.includes(attrOpen('cancelAsk !== null && active')),
+      '停止确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    const dlgAt = seg.indexOf('<' + '$' + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '应能定位停止确认弹窗')
+    const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('doCancel(id)'), '确认后才调 doCancel')
+    assert.ok(dlg.includes('不能撤销') && dlg.includes('重复到达'),
+      '后果（不可撤销 / 下轮重推）必须写在弹窗正文里，不能只留在 title')
+    // 切页收口：离开当前页清掉待确认，回到本页不得再弹一次。
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && seg.slice(guardAt, guardAt + 80).includes('setCancelAsk(null)'),
+      '离开当前页必须清掉待确认（只 dialog.close() 会留下卡死的 cancelAsk）')
+  })
+
+  await aok('结构红线: C7-012 未点开的日志页签不预取 1 MiB（首访零预取契约）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function LogsPanel')
+    const end = src.indexOf('function SysPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 LogsPanel')
+    const seg = src.slice(at, end)
+    // 冷启动时日志尾部可能满 1 MiB：隐藏页签里拉下来再整串 split/计数都是白付的。
+    const guardAt = seg.indexOf('if (!active && !preloadedRef.current) {')
+    assert.ok(guardAt > -1, '日志首挂（尚未点开）必须先短路，不得直接拉 1 MiB')
+    const guard = seg.slice(guardAt, seg.indexOf('if (!active && preloadedRef.current) return undefined', guardAt))
+    assert.ok(guard.includes('preloadedRef.current = true') && guard.includes('return undefined'),
+      '首挂只登记「首访已挂载」，不发请求')
+    assert.ok(!guard.includes('load('), '隐藏页签不得发日志请求（首屏零预取）')
+    // 懒加载不是不加载：第一次点开必须仍走 firstReveal 的补拉，否则日志页永远空白。
+    assert.ok(seg.includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
+      '第一次点开仍要走 firstReveal 补拉')
+    assert.ok(seg.slice(guardAt).includes('if (stale) load(true).catch'),
+      '首次点开且手里没有新鲜快照时必须真的发一发')
+  })
+
+  await aok('结构红线: C7-014 列表 FLIP 带 deps（不再每次渲染都量布局 / 重播入场）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function MessagesPanel')
+    const end = src.indexOf('function LogsPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 MessagesPanel')
+    const seg = src.slice(at, end)
+    // 省略 deps = useLayoutEffect(fn) 每次渲染都跑：对整页卡片各量一次 getBoundingClientRect，
+    // 且新 key 一律 enter() 重播入场（输入防抖/抽屉开关/慢标志都会触发）。
+    assert.ok(/useFlipList\(motionRef, \[data\]\)/.test(seg),
+      'useFlipList 必须传 deps（省略 = 每次渲染都强制读布局并重播入场）')
+    const motion = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'motion.js'), 'utf8')
+    const flipAt = motion.indexOf('export function useFlipList')
+    assert.ok(flipAt > -1, '应能定位 useFlipList')
+    const flip = motion.slice(flipAt, motion.indexOf('\n}\n', flipAt))
+    assert.ok(/\}, deps\)/.test(flip), 'deps 必须真的交给 useLayoutEffect 的依赖数组')
+  })
+
+  await aok('C7-015 「新条数」口径统一（0 基线 / 严格大于 / 三处接线）', async () => {
+    const { isNewerThan } = await import('./scripts/console-assets/pure.mjs')
+    // 旧实现：检查更新把 lastReadAt=0 兜底成 Date.now()（⇒ 一律 0 条新），角标却按 0 算
+    // （⇒ 全部标「新」）。同一个词因此能同时显示两种结论；比较符也一处 >、一处 >=。
+    assert.strictEqual(isNewerThan(1000, 0), true, '从未读过（基线 0）⇒ 全部算新')
+    assert.strictEqual(isNewerThan(1000, 1000), false, '等于已读锚点的那条不再算新')
+    assert.strictEqual(isNewerThan(1001, 1000), true)
+    assert.strictEqual(isNewerThan(999, 1000), false)
+    assert.strictEqual(isNewerThan(0, 0), false, '没有时间戳的条目不算新')
+    assert.strictEqual(isNewerThan(undefined, 0), false)
+    assert.strictEqual(isNewerThan(Number.NaN, 1000), false)
+    const src = readConsoleSource()
+    const at = src.indexOf('function SearchPanel ')
+    const end = src.indexOf('function LogsPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 SearchPanel')
+    const seg = src.slice(at, end)
+    assert.ok((seg.match(/isNewerThan\(/g) || []).length >= 2,
+      '关注词角标与检查更新都必须走同一个比较（两处接线）')
+    assert.ok(!/it\.ts > (?:since|req\.since)/.test(seg), '不得再留裸 ts > since 的第二套口径')
+    assert.ok(!/w\.lastReadAt > 0 \? w\.lastReadAt : Date\.now\(\)/.test(seg),
+      '0 基线不得再被 Date.now() 兜底（那正是「角标 N 条新 / 检查 0 条新」的来源）')
+  })
+
+  await aok('结构红线: C7-018 逐轮历史切档落点等目标数据（不拿旧档列表抢落点）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function RunHistoryPanel')
+    const end = src.indexOf('// ── 组件：整体', at)
+    assert.ok(at > -1 && end > at, '应能定位 RunHistoryPanel')
+    const seg = src.slice(at, end)
+    const effectAt = seg.indexOf('useLayoutEffect(() => {')
+    const effect = seg.slice(effectAt, seg.indexOf('}, [data', effectAt))
+    assert.ok(effectAt > -1 && effect.length > 0, '应能定位落点 effect')
+    // 改页码是同步的；「切档」在没命中快照时要先 fetchSnap。没有这两道门时，轮询/切档
+    // 响应谁先到谁消费旗子：旧档列表先落一次点，真正换好的数据回来时旗子已经没了。
+    assert.ok(effect.includes('if (loading) return'), '加载在飞时必须保留旗子（数据还没落地）')
+    assert.ok(effect.includes('if (pendingMode !== null) return'),
+      '切档目标数据未落地时必须保留旗子（否则拿旧档列表抢落点）')
+    assert.ok(effect.indexOf('if (pendingMode !== null) return') < effect.indexOf('landRef.current = false'),
+      '守卫必须在消费之前：提前清旗会丢掉真正落地时的那次落点')
+    assert.ok(effect.indexOf('landRef.current = false') < effect.indexOf('if (y === null) return'),
+      '消费即清旗：返回 null 不重试')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')
@@ -10932,7 +11541,7 @@ async function main () {
       report: { status: 'ok', value: { date: payload, runs: 1 } },
       run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
       channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
-    }), [], new URLSearchParams(), 'tok', 'deep')
+    }), new URLSearchParams(), 'tok', 'deep')
     assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
     assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
     assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
@@ -10949,7 +11558,7 @@ async function main () {
       diagnostics: { status: 'missing', value: null }
     }
     // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
-    const html = renderPage(bare, [], undefined, '', 'deep')
+    const html = renderPage(bare, undefined, '', 'deep')
     assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
     assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
     assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
@@ -10964,8 +11573,8 @@ async function main () {
 
   await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
     const { renderPage } = require('./scripts/console')
-    const dark = renderPage(uiState(), [], new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
-    const light = renderPage(uiState(), [], new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    const dark = renderPage(uiState(), new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
     assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
     assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
     assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
@@ -10974,19 +11583,19 @@ async function main () {
     assert.strictEqual(bootIsland(light).token, 'tok-BBB')
     assert.strictEqual(bootIsland(light).instance, 'inst-2')
     // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
-    const evil = renderPage(uiState(), [], new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    const evil = renderPage(uiState(), new URLSearchParams(), '', 'deep" onload="alert(1)', '')
     assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
     assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
   })
 
   await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
     const { renderPage } = require('./scripts/console')
-    const fromQuery = renderPage(uiState(), [], new URLSearchParams('token=from-query'), '', 'deep')
+    const fromQuery = renderPage(uiState(), new URLSearchParams('token=from-query'), '', 'deep')
     assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
-    const fromSession = renderPage(uiState(), [], new URLSearchParams('token=from-query'), 'from-session', 'deep')
+    const fromSession = renderPage(uiState(), new URLSearchParams('token=from-query'), 'from-session', 'deep')
     assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
     // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
-    const breakout = renderPage(uiState(), [], new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    const breakout = renderPage(uiState(), new URLSearchParams(), 'tok</script><img src=x>', 'deep')
     assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
     assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
     assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')
@@ -11006,6 +11615,515 @@ async function main () {
     assert.ok(twofa.includes('&lt;img src=x onerror=alert(1)&gt;'), '错误文案必须转义后输出')
     assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
     assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
+  })
+
+  // ── W2 g2（C7-019/020/022/023/036/037/045/052）──────────────────────────────
+  await aok('结构红线: C7-023 缓存健康对 limits 全守（不存在的 limits 不得在渲染期解引用）', () => {
+    const src = readConsoleSource()
+    const D = '$' // no-template-curly-in-string：含 ${ 的字符串要拼出来
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    assert.ok(cache.includes("const lim = ok && data.limits && typeof data.limits === 'object' ? data.limits : null"),
+      'limits 必须先归一成 lim（存在性只判一处），旧写法只在 readCap 判、其它行直接解引用 data.limits')
+    // 归一化之后，本组件内不得再出现 data.limits.xxx 的解引用：漏一处就还是「半守半不守」。
+    assert.ok(!/data\.limits\./.test(codeOf(cache)),
+      '归一化后不得再直接解引用 data.limits（缺失时整页渲染期抛 TypeError）')
+    assert.ok(cache.includes(D + '{ok && !lim && html`<' + D + '{Hint} tone="error">'),
+      '拿不到 limits 时必须如实提示，而不是静默少画几行')
+    assert.ok(cache.includes(D + '{lim && html`<div class="sys-grid">'),
+      '上限对照整块必须以 lim 为门（不是 ok）：limits 缺失时不得解引用')
+  })
+
+  await aok('结构红线: C7-022 推送列表的响应归属守卫（旧筛选数据不得冒充新筛选结果）', () => {
+    const src = readConsoleSource()
+    const panel = sliceBetween(src, 'function MessagesPanel', 'function LogsPanel', 'MessagesPanel 片段')
+    // 指纹必须覆盖全部会改变结果集的筛选；旧实现只记 query（loadedQueryRef），分类/页码/时间窗全漏。
+    const key = src.slice(src.indexOf('function msgFilterKey'), src.indexOf('function buildMessagesHash'))
+    assert.ok(key.includes('q, cate, page, size, days, from, to'), '筛选指纹必须覆盖 q/cate/page/size/days/from/to')
+    assert.ok(panel.includes('const key = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })'),
+      'fetchMessages 必须按「本次请求实际用的筛选」生成指纹')
+    assert.ok(panel.includes('{ ...d, filterKey: key }'), '响应必须带上本次筛选指纹（服务端字段原样保留）')
+    assert.ok(panel.includes('data.filterKey !== filtersKey'),
+      '渲染必须比对响应指纹与当前筛选：不一致就是上一组的数据')
+    assert.ok(panel.includes('下面仍是上一组筛选的'),
+      '旧数据占屏时必须明说归属（否则换分类/翻页后旧条目看起来就是新筛选的结果）')
+    // query 的既有归属回写不能为了这次改动被删：服务端截断后的 queryUsed 只在「本次响应属于当前 query」时回写。
+    assert.ok(panel.includes('if (seq === loadSeqRef.current) loadedQueryRef.current = requested'),
+      'query 归属回写必须保留（旧响应不得把刚输入的新词覆盖回去）')
+  })
+
+  await aok('结构红线: C7-037 「退出所有信任设备」先确认再发（后果写进正文，切页即收口）', () => {
+    const src = readConsoleSource()
+    const D = '$'
+    const seg = sliceBetween(src, 'function TwoFactorBlock', 'function SysPanel', 'TwoFactorBlock 片段')
+    const btnAt = seg.indexOf('>退出所有信任设备<')
+    assert.ok(btnAt > -1, '应能定位「退出所有信任设备」按钮')
+    const btn = seg.slice(seg.lastIndexOf('<' + D + '{Button}', btnAt), btnAt)
+    assert.ok(btn.includes('setRevokeAsk(true)') && !btn.includes('revokeDevices'),
+      '按钮只置待确认态，不得一键直发 revokeDevices')
+    const dlgAt = seg.indexOf('<' + D + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '必须有确认弹窗（一次误触会把所有设备踢下线）')
+    const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('open=' + D + '{revokeAsk && active}'),
+      '确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    assert.ok(dlg.includes('revokeDevices()'), '确认后才调 revokeDevices')
+    assert.ok(dlg.includes('包括当前这台浏览器') && dlg.includes('恢复码仍然可用'),
+      '后果（含当前这台 / 恢复码仍可用）必须写在弹窗正文里，不能只留在按钮 title')
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && seg.slice(guardAt, guardAt + 80).includes('setRevokeAsk(false)'),
+      '离开系统页必须清掉待确认（否则回页面时弹窗自己弹出来）')
+  })
+
+  await aok('结构红线: C7-036 「取消关注」先确认再发，删完焦点落回关注词区', () => {
+    const src = readConsoleSource()
+    const D = '$'
+    const panel = sliceBetween(src, 'function SearchPanel', 'function LogsPanel', 'SearchPanel 片段')
+    const xAt = panel.indexOf('class="ls-chip-x"')
+    assert.ok(xAt > -1, '应能定位取消关注按钮')
+    const btn = panel.slice(xAt, panel.indexOf('>×</button>', xAt))
+    assert.ok(btn.includes('setAskRemove(w.q)') && !btn.includes('removeWatch('),
+      '× 只置待确认态，不得一键直删（删了要重新搜一次才能加回）')
+    const dlgAt = panel.indexOf('<' + D + '{ConfirmDialog}')
+    assert.ok(dlgAt > -1, '必须有确认弹窗')
+    const dlg = panel.slice(dlgAt, panel.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('open=' + D + '{askRemove !== null && active}'),
+      '确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    assert.ok(dlg.includes('Promise.resolve(removeWatch(q))'), '确认后才真的调 removeWatch')
+    assert.ok(dlg.includes('watchBoxRef.current') && dlg.includes('el.focus({ preventScroll: true })'),
+      '删除后必须把焦点落回关注词区域：× 所在行卸载后焦点会掉到 body，键盘用户失去落点')
+    assert.ok(panel.includes('class="ls-watch" ref=' + D + '{watchBoxRef} tabIndex=' + D + '{-1}'),
+      '关注词区域必须可编程聚焦（tabIndex=-1），否则焦点无处可落')
+    const guardAt = panel.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && panel.slice(guardAt, guardAt + 80).includes('setAskRemove(null)'),
+      '离开搜索页必须清掉待确认（否则切回来弹窗自己出现）')
+  })
+
+  await aok('结构红线: C7-020 六个异步动作共用一份 busy 状态机（清错→busy→catch→finally）', () => {
+    const src = readConsoleSource()
+    const code = codeOf(src)
+    // 骨架只留一份：runBusyAction 自己 setBusy/清错/写横幅/复位。
+    const helper = sliceBetween(src, 'async function runBusyAction', 'function BackupBlock', 'runBusyAction')
+    assert.ok(helper.includes('setBusy(tag)') && helper.includes("setErr('')") &&
+      helper.includes('setBusy(\'\')') && helper.includes('`' + '$' + '{label}：'),
+    '公共骨架必须自己置 busy、清错、写「<动作>失败：…」横幅并复位')
+    // 六个动作都必须走它（顺序：解密 / 导入 / 生成设置密钥 / 确认开启 / 关闭 / 退出设备）。
+    const sites = (code.match(/runBusyAction\(\{/g) || []).length
+    assert.strictEqual(sites, 6, `六个动作必须都走公共骨架，实际 ${sites} 处`)
+    const backup = sliceBetween(src, 'function BackupBlock', 'function TwoFactorBlock', 'BackupBlock')
+    const twofa = sliceBetween(src, 'function TwoFactorBlock', 'function SysPanel', 'TwoFactorBlock')
+    // 备份块只留 doExport 自己的 busy（它要接 URL 回收）；解密/导入两条不得再手写骨架。
+    assert.strictEqual((codeOf(backup).match(/setBusy\('[a-z]/g) || []).length, 1,
+      'BackupBlock 只应有 doExport 一处自写 setBusy(tag)（其余走 runBusyAction）')
+    assert.ok(backup.includes("tag: 'unlock'") && backup.includes("tag: 'import'"),
+      '解密/导入必须各自带 busy 标签走公共骨架')
+    assert.strictEqual((codeOf(twofa).match(/setBusy\('[a-z]/g) || []).length, 0,
+      'TwoFactorBlock 的四个动作必须全部走公共骨架（不得再手写 setBusy(tag)/try/finally）')
+    for (const tag of ['setup', 'enable', 'disable', 'revoke']) {
+      assert.ok(twofa.includes(`tag: '${tag}'`), `TwoFactorBlock 缺 tag: ${tag}（动作必须带各自的 busy 标签）`)
+    }
+    // 失败横幅的文案口径不变（「导入失败：」这类前缀必须还在）。
+    assert.ok(backup.includes("label: '导入失败'") && backup.includes("label: '解密失败'"),
+      '失败横幅前缀必须保留（用户看到的「导入失败：…」不变）')
+  })
+
+  await aok('结构红线: C7-019 懒加载 + 3s 节流只剩一份骨架（hook 与 SysPanel 共用 runAutoLoad）', () => {
+    const src = readConsoleSource()
+    // 骨架只能有一份实现：单飞闸 + 结算时间戳 + queue 排队都在 runAutoLoad 里。
+    const helper = sliceBetween(src, 'function runAutoLoad', '// queue=true 用于日志', 'runAutoLoad')
+    assert.ok(helper.includes('if (pendingRef.current && !force) return false'), '单飞闸必须在公共骨架里')
+    assert.ok(helper.includes('loadedAtRef.current = Date.now()'), '结算时间戳必须在公共骨架里（新鲜度判断的唯一来源）')
+    // hook 侧：仍走公共骨架，且被既有断言逐字锁定的 3000 表达式原样保留。
+    const hook = sliceBetween(src, 'function usePanelAutoLoad', '// ── 下拉刷新', 'usePanelAutoLoad')
+    assert.strictEqual((codeOf(hook).match(/pendingRef\.current = true/g) || []).length, 0,
+      'usePanelAutoLoad 不得自己置 pendingRef（单飞闸只在 runAutoLoad 里）')
+    // CacheHealth 的「私有半份」是首访播种（无单飞/无 3s），不得再长出第二套新鲜度判定。
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    assert.ok(!cache.includes('loadedAtRef'), '缓存健康只做首访播种，不应再私藏一份 loadedAt 节流')
+    assert.ok(hook.includes('runAutoLoad({ pendingRef, loadedAtRef, load, queue, force: loadChanged })'),
+      'usePanelAutoLoad 必须走公共骨架（不得再手抄一遍 Promise 链）')
+    assert.ok(hook.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+      'hook 的 3s 判据被 test_console.js 逐字锁定，不得为了「统一」改成常量')
+    // SysPanel 侧：三段 loader 仍要一起结算才报 ready，但骨架来自 runAutoLoad。
+    const sys = sliceBetween(src, 'function SysPanel', 'function FilesPanel', 'SysPanel 片段')
+    assert.ok(sys.includes('runAutoLoad({'), 'SysPanel 的首访/切回加载必须走公共骨架')
+    assert.ok(sys.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
+      '系统页仍要等系统信息 + 访问日志 + 设置三条都结算')
+    assert.ok(sys.includes('onSettled: () => setReadyTick((v) => v + 1)'),
+      '结算后必须通知 ready（否则滚动层收口/数据截至不更新）')
+    assert.ok(!sys.includes('pendingRef.current = true'),
+      'SysPanel 不得再手写单飞闸（C7-019 的重复骨架就来自这一份）')
+    assert.ok(sys.includes('PANEL_FRESH_MS'), 'SysPanel 的新鲜度阈值必须引用 constants 的命名常量')
+  })
+
+  await aok('结构红线: C7-045 后台失败不许静默（裸 catch 改成带作用域的留痕）', () => {
+    const src = readConsoleSource()
+    const code = codeOf(src)
+    // 留痕器只有一份：前缀固定、吞掉「console 不存在」的环境（老浏览器/测试桩）。
+    const helper = sliceBetween(src, 'function logBgFailure', '// 面板加载器公共骨架', 'logBgFailure')
+    assert.ok(helper.includes('console.error(') && helper.includes('[xbk-console]'),
+      '留痕器必须写 console.error 并带 [xbk-console] 前缀（排障时能按前缀捞）')
+    assert.ok(helper.includes('typeof console === \'undefined\''), '留痕器必须对无 console 环境短路')
+    // 八条后台链路逐条点名：改回空 catch 时这里必须红。
+    for (const scope of ['关注词已读回写', '导入后刷新', '服务器草稿清理', '服务器草稿同步']) {
+      assert.ok(code.includes('logBgFailure(\'' + scope + '\')'), `后台链路「${scope}」的失败必须留痕`)
+    }
+    // pushDraftNow 的吞错点在里面（外层 .catch 是死代码，别为了「看起来有 catch」去改调用点：
+    // test_console.js 的草稿用例逐字锁定 setInterval 那一行）。
+    const push = sliceBetween(src, 'const pushDraftNow = useCallback', 'const clearServerDraft = useCallback', 'pushDraftNow')
+    assert.ok(push.includes("logBgFailure('服务器草稿同步')(e)"), '草稿 PUT 抛错必须在 pushDraftNow 里留痕')
+    // 用户可见兜底不变：面板仍靠自己的 err 渲染（「加载失败：<映射文案>」），留痕只是多一条控制台线索。
+    assert.ok(src.includes('加载失败：' + '$' + '{loadErrorText(e)}') && src.includes('loadErrorText(e)'),
+      '留痕不能取代面板自己的可见错误')
+  })
+
+  await aok('结构红线: C7-052 抽屉不许说「能与背后并排对照」（判据绑实现、按语义扫全部文档面）', () => {
+    const src = readConsoleSource()
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const block = (head) => {
+      const i = css.indexOf(head)
+      if (i < 0) return ''
+      const open = css.indexOf('{', i)
+      if (open < 0) return ''
+      let depth = 0
+      for (let k = open; k < css.length; k++) {
+        if (css[k] === '{') depth++
+        else if (css[k] === '}' && --depth === 0) return css.slice(open, k + 1)
+      }
+      return ''
+    }
+    // ① 判据的事实依据来自实现（返工 C7-052）：遮罩 fixed + inset:0 盖满视口、::before 用
+    //    rgba 黑压暗、抽屉自己只占 min(520px,100%)。三条同时成立 ⇒「背后的列表/表单能并排
+    //    对照」是假话。这一段是行为侧断言：实现真改成分栏（不再盖满 / 不再压暗）就先红，
+    //    逼着连文档和判据一起改，而不是让注释自说自话。
+    const backdrop = block('\n  .drawer-backdrop {')
+    const before = block('.drawer-backdrop::before {')
+    const drawer = block('\n  .drawer {')
+    assert.ok(/position:\s*fixed/.test(backdrop) && /inset:\s*0/.test(backdrop),
+      '抽屉遮罩必须是 fixed + inset:0（盖满视口）：要改成分栏并排，就得同时改文档与本断言')
+    const alpha = /background:\s*rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*([\d.]+)\s*\)/.exec(before)
+    assert.ok(alpha !== null && Number(alpha[1]) >= 0.4,
+      '遮罩必须以 ≥0.4 不透明度的黑压暗背后内容（背后那层因此不能当对照面）')
+    assert.ok(/width:\s*min\(var\(--drawer-w,\s*520px\),\s*100%\)/.test(drawer),
+      '抽屉宽度口径必须是 min(var(--drawer-w,520px),100%)（桌面 520 / 手机铺满）')
+    // ② 语义扫描：README / SYSTEM_CONTRACT / app.css / 全部前端模块里，凡是「抽屉语境」下的
+    //    「对照 / 参照 / 并看」一律只能是否定口径。不钉具体句子 ⇒ 换个措辞（「留出左侧列表做
+    //    对照」「表单留在背后做对照」「要对照用抽屉」）同样会被抓到；语境取同句或前后三行，
+    //    因为注释块/文档条目里的「抽屉」常写在上一句。
+    const CLAIM = /对照|参照|并看/
+    const DRAWER_CTX = /抽屉|Drawer|drawer|遮罩/
+    const NEGATED = /(不算|不是|不能|没有|没法|无法|不可能|不得|别|而非)[^。；]{0,16}(并排|左右|对照|参照|并看)|(并排|左右|对照|参照|并看)[^。；]{0,10}(不成立|不可能|做不到|的余地)/
+    const surfaces = [
+      ['README.md', fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')],
+      ['SYSTEM_CONTRACT.md', fs.readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')],
+      ['scripts/console-assets/app.css', css]
+    ]
+    for (const file of CONSOLE_MODULE_FILES) {
+      surfaces.push(['scripts/console-assets/' + file, fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8')])
+    }
+    let judged = 0
+    for (const [file, body] of surfaces) {
+      const lines = body.split('\n')
+      lines.forEach((line, i) => {
+        for (const raw of line.split(/[。；]/)) {
+          const sentence = raw.trim()
+          if (sentence === '' || !CLAIM.test(sentence)) continue
+          if (!DRAWER_CTX.test(lines.slice(Math.max(0, i - 3), i + 4).join('\n'))) continue
+          assert.ok(NEGATED.test(sentence),
+            `${file}:${i + 1}「${sentence.slice(0, 60)}」把抽屉写成能与背后内容对照；` +
+            '实现是盖满视口 + 压暗，只能写「留在原处但被遮罩压暗、不能并排对照」')
+          judged++
+        }
+      })
+    }
+    // 扫描面必须真的命中抽屉的「对照」叙述：命中数是 0/1 说明语境界定写歪了，等于没扫。
+    assert.ok(judged >= 4, `抽屉的「对照」叙述必须真的被扫到（只命中 ${judged} 处 ⇒ 语境界定写歪了，等于没扫）`)
+    // ③ 三处文档面必须正面写明「被遮罩压暗 + 不能并排对照」：只把「做对照」几个字删掉不算修好。
+    const readme = surfaces[0][1]
+    const readmeAt = readme.indexOf('- 抽屉（v3.378')
+    assert.ok(readmeAt > -1, 'README 必须还留着抽屉条目（锚点缺失说明条目被改名/删了）')
+    const mustState = [
+      ['README.md 的抽屉条目', readme.slice(readmeAt, readme.indexOf('\n', readmeAt))],
+      ['components.js 的抽屉用法说明', sliceBetween(src, '// ── 组件：右侧抽屉', 'function Drawer (', '抽屉用法说明')],
+      ['pages.js 的保存复核注释', sliceBetween(src, '// 保存前复核是「核对」不是「确认」', 'const wide = Array.isArray(dialog.wide)', '保存复核注释')]
+    ]
+    for (const [label, seg] of mustState) {
+      assert.ok(seg.includes('压暗'), `${label} 必须写明背后被遮罩压暗（不能只把「做对照」几个字删掉）`)
+      assert.ok(NEGATED.test(seg.replace(/\n/g, '')), `${label} 必须写明不能并排对照（措辞可变，口径必须是否定）`)
+    }
+    // ④ 旧的两条字面量与「版本号只留一处溯源」原样保留（回退到旧措辞时它们仍会先报错）。
+    assert.ok(!src.includes('与列表并排做对照'), '注释不得声称抽屉与列表并排对照（遮罩把列表压暗了）')
+    assert.ok(!src.includes('列表留在背后做对照'), '注释不得声称列表在背后「做对照」')
+    assert.ok(src.includes('但被遮罩压暗、不算并排对照'), '抽屉注释必须写明遮罩压暗、不是并排对照')
+    assert.ok(src.includes('桌面从右侧占 520px，手机铺满整屏'), '抽屉注释必须写明桌面 520px / 手机铺满')
+    // 版本号只作「这条规矩哪来的」溯源，不得当成变更日志的分行清单：抽屉这一段不许再堆 v3.xxx 行。
+    const drawerSeg = sliceBetween(src, '// ── 推送记录：条目详情抽屉', 'function DetailRow', '抽屉注释')
+    assert.strictEqual((drawerSeg.match(/v3\.\d+/g) || []).length, 1,
+      '抽屉注释只保留一处版本溯源（v3.379），不堆版本号当变更日志')
+  })
+
+  // ── W2 g4（C7-010/013/026/027/028/029/030/031/032/038/044/056）─────────────
+  await aok('结构红线: C7-038 确认弹窗的正文有 aria-describedby（危险后果要能被读屏念出来）', () => {
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = sliceBetween(comp, 'function ConfirmDialog', '// 未保存草稿的离开拦截', 'ConfirmDialog 组件')
+    assert.ok(/aria-describedby=\$\{bodyId\}/.test(seg),
+      '弹窗必须用 aria-describedby 指向正文：只挂 aria-labelledby 时读屏只念标题，用户听不到「会真实推送」')
+    assert.ok(/<div class="modal-body" id=\$\{bodyId\}>/.test(seg),
+      'aria-describedby 必须指向正文节点自己的 id（否则引用悬空，等同于没写）')
+    // id 不得额外领号：titleId 的形态被既有用例逐字钉住，bodyId 复用同一序号。
+    assert.ok(/const \[bodyId\] = useState\(\(\) => `confirm-body-\$\{dialogSeq\}`\)/.test(seg),
+      'body id 必须每实例唯一，且不额外消耗 dialogSeq（否则标题 id 与正文 id 序号错开）')
+    // 模板占位符拼出来再比对（直接写 ${...} 会触发 no-template-curly-in-string）
+    const at = (name) => '$' + '{' + name + '}'
+    assert.ok(seg.includes('aria-labelledby=' + at('titleId') + ' aria-describedby=' + at('bodyId')),
+      '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
+  })
+
+  // ── SonarCloud javascript:S1523 ×3（三处动态执行，告警落在 C7-030 / C7-032 用例；sink 已收口到 test/_vm-sandbox.js）──
+  // 判「误报」**不能**靠「沙箱内取不到 process」这类能力论据：vm 不是安全边界——以宿主对象作沙箱时，
+  // 切片代码能经 this.constructor.constructor('return process')() 取回宿主 realm（Node 22 实测可取到
+  // process.version；`{}` 这种空沙箱同样成立），今天取不到不等于明天取不到。
+  // 成立的论据只有两条：
+  // ① 输入来源：被执行的字符串全部来自本仓库源码的切片（api.js 的 COND_CACHE 块、acorn 定位的
+  //    ui.js refreshActive、ui.js 里那条真实调用行），提交时就已固定、随 diff 一起评审；这些字符串
+  //    不经任何 HTTP 输入（请求头/体/查询串/用户配置都进不来）⇒ 没有「变量输入到达代码生成 sink」。
+  // ② 执行边界：被执行的代码就是被测模块自身的仓库源码，与 require 它的信任级相同；若源码是恶意的，
+  //    测试进程在读取/require 那一步就已失守，用不用 vm 不改变结论。
+  // 结论：S1523 的风险模型（不受信输入 → 动态执行）在此不成立 ⇒ 判误报。处置＝把 sink 收敛到
+  // test/_vm-sandbox.js（唯一入口，且被 .sonarcloud.properties 的 sonar.exclusions 排除），
+  // 三处调用只换成 runInSandbox(...)、执行语义不变；规则在其它文件仍照常生效。下面这条
+  // 用例把论据本身钉住（退回可被实测证伪的说法即红）。
+  await aok('结构红线: S1523 ×3 判误报的论据必须写「输入来源 + 执行边界」（不得用可被实测证伪的沙箱能力论据）', () => {
+    const src = fs.readFileSync(__filename, 'utf8')
+    // 只切论据块本身来断言：断言文本若直接写在同一字符串里会「自证」，那就锁不住论据被删。
+    const block = sliceBetween(src, '// ── SonarCloud javascript:S1523', "await aok('结构红线: S1523", 'S1523 误报论据块')
+    assert.ok(block.includes('vm 不是安全边界'), '必须写明 vm 不是隔离边界：空沙箱也能取回宿主 realm，能力面会变')
+    assert.ok(block.includes('① 输入来源：被执行的字符串全部来自本仓库源码的切片'),
+      '必须点名输入来源是仓库源码切片（S1523 的风险模型需要不受信输入到达 sink）')
+    assert.ok(block.includes('② 执行边界：被执行的代码就是被测模块自身的仓库源码'),
+      '必须写明执行边界：与被测模块同信任级，源码恶意则测试进程早已失守')
+    const abilityArgs = block.split('\n').filter((line) => line.includes('沙箱') && line.includes('拿不到'))
+    assert.deepStrictEqual(abilityArgs, [],
+      '不得再用「沙箱内取不到宿主能力」这类能力论据（能力面可被实测证伪，只能按输入来源判定）')
+  })
+
+  await aok('行为: C7-030 条件缓存按最近使用淘汰（热键 runs/config 不得被新分页键挤掉）', () => {
+    // 直接跑 api.js 里**真实**的缓存策略（切片自源码，不是本用例自写的副本）：
+    // Map 的插入序在这里就是淘汰序，所以「命中是否挪到队尾」能被行为断言抓住。
+    const { runInSandbox } = require('./test/_vm-sandbox')
+    const api = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const seg = sliceBetween(api, 'const COND_CACHE = new Map()', 'function addConditional', '条件缓存块')
+    const box = runInSandbox(`(() => { ${seg}; return { COND_CACHE, COND_CACHE_MAX, rememberConditional, touchConditional } })()`, {})
+    assert.strictEqual(box.COND_CACHE_MAX, 16, '缓存上限仍是 16（v3.373 扩到 7 个端点后的口径，不得悄悄改）')
+    // 冷启动：runs / config 先落，后面 14 条分页键把缓存填满到 16。
+    box.rememberConditional('runs', { tag: 't-runs', data: 1 })
+    box.rememberConditional('config', { tag: 't-config', data: 2 })
+    for (let i = 0; i < 14; i++) box.rememberConditional('messages?page=' + i, { tag: 't' + i, data: i })
+    assert.strictEqual(box.COND_CACHE.size, 16)
+    // 翻回第 1 页（读路径命中）⇒ 该键变成「刚用过」；runs 仍是 FIFO 里最老的。
+    assert.ok(box.touchConditional('messages?page=1'), '命中必须返回缓存条（否则 304 会退化成重取）')
+    assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['messages?page=1'], '命中后必须挪到队尾')
+    // 再写一条新的：被淘汰的必须是「真正最久没用过」的 runs，而不是刚用过的 page=1。
+    box.rememberConditional('messages?page=99', { tag: 't99', data: 99 })
+    assert.strictEqual(box.COND_CACHE.has('runs'), false, 'runs 已是最久没用过的键，必须先被淘汰')
+    assert.strictEqual(box.COND_CACHE.has('messages?page=1'), true, '刚命中过的键不得被淘汰（FIFO 会把它当成「第 2 老的」）')
+    // 写回同一键也算一次使用：覆盖后仍在队尾，不因原位置靠前而先出局。
+    box.rememberConditional('config', { tag: 't-config-2', data: 22 })
+    assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['config'], '覆盖写回必须挪到队尾')
+    assert.strictEqual(box.touchConditional('nope'), null, '未命中返回 null（交给调用方按无条件请求发）')
+  })
+
+  await aok('行为: C7-056 首屏快照逐层校验（容器对、嵌套部件坏掉也必须丢弃）', async () => {
+    const { snapshotOk } = await import('./scripts/console-assets/pure.mjs')
+    const part = (status, value) => ({ status, value })
+    const base = (over = {}) => ({
+      v: 'v3.400',
+      at: 1760000000000,
+      status: { generatedAt: 1, run: part('ok', { at: '2026-10-31 10:00:00', total: 3 }), report: part('ok', { date: '2026-10-31' }) },
+      runs: [{ id: '1.2', startedAt: 1 }],
+      ...over
+    })
+    assert.strictEqual(snapshotOk(base(), 'v3.400'), true, '合法快照必须接受（否则每帧都退回骨架屏）')
+    assert.strictEqual(snapshotOk(base({ v: 'v3.399' }), 'v3.400'), false, '版本不符照旧丢弃')
+    assert.strictEqual(snapshotOk(base({ at: 'x' }), 'v3.400'), false, 'at 必须是数字')
+    assert.strictEqual(snapshotOk(base({ at: Number.NaN }), 'v3.400'), false, 'at 为 NaN 的快照要丢（typeof NaN === "number" 会漏过旧判据）')
+    // 容器层全对、只有嵌套部件坏掉——旧实现全部放行，坏字段直接进 StatusCards。
+    assert.strictEqual(snapshotOk(base({ status: { run: 'ok' } }), 'v3.400'), false, '部件是字符串必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { run: { value: { total: 1 } } } }), 'v3.400'), false, '部件缺 status 必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { run: { status: 'ok', value: '1 条推送' } } }), 'v3.400'), false, 'value 是标量必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { stats: { status: 'ok', value: [1, 2] } } }), 'v3.400'), false, 'value 是数组必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { lock: 3 } }), 'v3.400'), false, 'lock 是标量必须丢弃（App 读 lock.held）')
+    // 数组里混进 null：旧实现 Array.isArray 通过，渲染期 runs.some(r => …) 直接 TypeError。
+    assert.strictEqual(snapshotOk(base({ runs: [{ id: '1.2' }, null] }), 'v3.400'), false, 'runs 里混 null 必须丢弃（渲染期会当场抛）')
+    assert.strictEqual(snapshotOk(base({ runs: [1, 2] }), 'v3.400'), false, 'runs 条目是标量必须丢弃')
+    // 部件整体缺席不算坏：服务端只给一部分时，缺的卡片自己显示占位。
+    assert.strictEqual(snapshotOk(base({ status: { generatedAt: 1 } }), 'v3.400'), true, '部件缺席不等于损坏')
+    // 接线：readSnapshot 必须走这个校验，别在 ui.js 里再留一份浅校验。
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const fn = sliceBetween(ui, 'function readSnapshot', 'function writeSnapshot', 'readSnapshot')
+    assert.ok(fn.includes('snapshotOk(v, BOOT.version)'), 'readSnapshot 必须交给 pure.mjs 的 snapshotOk 判定')
+    assert.ok(!fn.includes('typeof v.at'), '不得保留第二份浅校验（两套口径会分叉）')
+  })
+
+  await aok('行为: C7-031 页签清单单一真源（filter 进 TAB_KEYS，ui.js 不再有正则补丁）', async () => {
+    const { TAB_KEYS, tabFromHash } = await import('./scripts/console-assets/pure.mjs')
+    // filter 必须由真源认识：旧实现靠 ui.js 的 /^#\/filter$/ 补丁，纯函数模块不认它。
+    assert.ok(TAB_KEYS.includes('filter'), 'TAB_KEYS 必须含 filter（否则 hash 路由又得靠补丁）')
+    assert.strictEqual(tabFromHash('#/filter'), 'filter', '#/filter 必须解析成 filter')
+    assert.strictEqual(tabFromHash('#/filter?tab=1'), 'overview', 'tabFromHash 只认裸 hash（带 query 的由 ui.js 先剥）')
+    assert.strictEqual(tabFromHash('#/nope'), 'overview', '非法 hash 仍回概览')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // ① 页签清单必须由 TAB_KEYS 派生，不再写第二份键列表。
+    assert.ok(ui.includes('const TABS = TAB_KEYS.map((key) => ({ key, label: TAB_LABELS[key] }))'),
+      'TABS 必须由 TAB_KEYS 派生（旧实现是 App 里的第三份页签清单）')
+    assert.ok(!/'filter'/.test(sliceBetween(ui, 'const TABS =', '// 切页回到顶部', 'TABS 定义')),
+      'TABS 定义里不得再手写页签键（写死一处就多一处真源）')
+    // ② resolveTab 只留「剥 query」，filter 的专门补丁必须消失。
+    const resolve = sliceBetween(ui, 'const resolveTab =', 'const [tab, setTab]', 'resolveTab')
+    assert.ok(!resolve.includes('filter'), 'resolveTab 不得再为 filter 开特例（白名单已在 pure.mjs）')
+    assert.ok(resolve.includes("hash.split('?')[0]"), 'resolveTab 必须保留剥 query 的行为（#/messages?q=… 不能被判成非法）')
+    // ③ 每个键都要有中文名：新增页签只改 TAB_KEYS 却忘写名字时，标签栏会出现空按钮。
+    const labels = sliceBetween(ui, 'const TAB_LABELS = {', '// ── 主题', 'TAB_LABELS')
+    for (const key of TAB_KEYS) {
+      assert.ok(new RegExp('\\b' + key + ':').test(labels), `TAB_LABELS 缺少 ${key} 的中文名（会渲染成空标签）`)
+    }
+  })
+
+  await aok('结构红线: C7-013 回前台静默窗只挡「刚补拉过」的那一拍（不吞 SSE tick）', () => {
+    const src = readConsoleSource()
+    const tick = sliceBetween(src, 'const runTick = useCallback(', 'const runTickRef = useRef(runTick)', 'runTick')
+    assert.ok(tick.includes('if (document.hidden) return'), '后台整拍跳过仍在（别把隐藏页改成照跑）')
+    assert.ok(tick.includes('Date.now() < resumeQuietUntilRef.current'),
+      '静默窗仍在：回前台补拉与「定时器正好到期」必须去重，删掉会连发两发')
+    // 只按时间窗关死 = 窗内到达的 SSE tick（服务端报「有新数据」）被一起吞掉，
+    // 页面最多停在补拉那一刻一个轮询周期（SSE 在线时 60s）。
+    assert.ok(/Date\.now\(\) < resumeQuietUntilRef\.current && Date\.now\(\) - lastRefreshRef\.current < POLL_BUSY_MS/.test(tick),
+      '静默窗必须叠加「距上次成功刷新 < POLL_BUSY_MS」：否则窗内的 SSE tick 会被静默吞掉')
+    // 判据的另一半：补拉成功要推进 lastRefreshRef，否则上面那道条件恒真，等于又关死。
+    const active = sliceBetween(src, 'const refreshActive = useCallback(', 'const pullRefresh = useCallback(', 'refreshActive')
+    assert.ok(active.includes('if (ok) lastRefreshRef.current = Date.now()'),
+      '补拉成功必须推进 lastRefreshRef（失败不推进：窗内仍要能重试）')
+  })
+
+  await aok('结构红线: C7-029 鉴权头只有一个出口（22 处端点不再逐字复制）', () => {
+    const src = readConsoleSource()
+    const hits = src.split('\n').filter((l) => l.includes('Authorization:') && !l.trim().startsWith('//'))
+    assert.strictEqual(hits.length, 1, `鉴权头必须只写一处（实际 ${hits.length} 处）：改前缀/加头时漏一处就是「这个端点 401、别的正常」`)
+    assert.ok(hits[0].includes('const AUTH_HEADER = { Authorization:'), '唯一那处必须是 AUTH_HEADER 定义（其余端点靠展开复用它）')
+    const spreads = src.split('\n').filter((l) => l.includes('...AUTH_HEADER')).length
+    assert.ok(spreads >= 20, `端点必须真的改用 AUTH_HEADER（实际展开 ${spreads} 处）：只留 helper 不改调用点等于没修`)
+    // 导出与读面接线：pages.js 的导出下载端点也要走同一个 helper。
+    assert.ok(src.includes('apiSearchLines, AUTH_HEADER, timedRequest'), 'pages.js 必须从 api.js 取用 AUTH_HEADER（导出下载走同一个鉴权头）')
+  })
+
+  await aok('结构红线: C7-032 后台静默失败要在界面上留痕（不再 catch(() => {})）', () => {
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // 这三处此前都是空 catch：设置读取（顶栏日期设置不生效）、版本探针（部署后不提示刷新）、
+    // 回前台补拉（切回来还是旧数据），失败在界面零痕迹。
+    const settings = sliceBetween(ui, 'const reloadUiSettings = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'reloadUiSettings')
+    assert.ok(!settings.includes('.catch(() => {})'), '设置读取失败不得再静默（用户会看到「改了没生效」却没有任何线索）')
+    assert.ok(settings.includes("noteQuiet('设置读取失败', true)"), '设置读取失败必须落一条可见痕迹')
+    const probe = sliceBetween(ui, 'const check = () => {', 'check()\n    const timer = setInterval(check', '版本探针')
+    assert.ok(!probe.includes('.catch(() => {})'), '版本探针失败不得再静默（部署后不提示刷新就是这条被吞掉的）')
+    assert.ok(probe.includes("noteQuiet('版本探针失败', true)"), '版本探针失败必须落一条可见痕迹')
+    const resume = sliceBetween(ui, 'refreshActive({ respectFormPause: true })', 'const pull = usePullToRefresh', '回前台补拉')
+    assert.ok(!resume.includes('}).catch(() => {})'), '回前台补拉失败不得再静默（否则切回来还是旧数据，看不出为什么）')
+    assert.ok(resume.includes("noteQuiet('回前台补拉失败'"), '回前台补拉失败必须落一条可见痕迹')
+    // 痕迹必须真的渲染出来，并且成功时按 kind 撤掉（否则一次失败会永久挂一条假告警）。
+    assert.ok(ui.includes('${quietErrs.length > 0 && html`<div class="sync-fail sync-fail-quiet" role="status">'),
+      '失败条目必须渲染成可见的 role=status 行（只写 console.warn 在手机上看不到）')
+    const helper = sliceBetween(ui, 'const noteQuiet = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'noteQuiet')
+    assert.ok(helper.includes('if (!failed && has) return prev.filter'), '成功必须撤掉对应条目（不能留一条过期告警）')
+  })
+
+  await aok('行为: C7-032 回前台补拉区分「跳过」与「真失败」（跳过不得留告警，真失败必须留）', async () => {
+    // 直接执行 ui.js 里真实的 refreshActive 与真实的调用行（src slice + vm），不重写一份等价逻辑：
+    // 重写的实现改了 ui.js 也不会红。改回「跳过也返回 false / 调用点用 ok === false 判失败」时本用例红。
+    // 下面两处经 test/_vm-sandbox.js 的 runInSandbox 执行（S1523 的 sink 收口点，见上方块注释）：
+    // 论据不变——输入是仓库源码切片、执行边界与被测模块同信任级、vm 不是安全边界；语义一字未改。
+    const acorn = require('acorn')
+    const { runInSandbox } = require('./test/_vm-sandbox')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const ast = acorn.parse(ui, { ecmaVersion: 'latest', sourceType: 'module' })
+    let arrow = null
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return
+      if (node.type === 'VariableDeclarator' && node.id && node.id.name === 'refreshActive' &&
+        node.init && node.init.type === 'CallExpression' && node.init.arguments[0] &&
+        node.init.arguments[0].type === 'ArrowFunctionExpression') arrow = node.init.arguments[0]
+      for (const key of Object.keys(node)) {
+        if (key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach(walk)
+        else if (value && typeof value === 'object') walk(value)
+      }
+    }
+    walk(ast)
+    assert.ok(arrow, '找不到 refreshActive 的实现（本用例要执行它，绑定名/形态不能改）')
+    const makeRefresh = (ctx) => runInSandbox('(' + ui.slice(arrow.start, arrow.end) + ')', ctx)
+    const setup = ({ paused = false, waits = 0, split = true } = {}) => {
+      const calls = []
+      const detailWaits = []
+      for (let i = 0; i < waits; i++) detailWaits.push(Promise.resolve())
+      const ctx = {
+        Date,
+        Promise,
+        CustomEvent,
+        PULL_EVENT: 'xbk-console-pull-probe',
+        formPauseUntilRef: { current: paused ? Date.now() + 60000 : 0 },
+        lastRefreshRef: { current: 0 },
+        refreshAuto: () => Promise.resolve(),
+        refreshSplit: (...args) => {
+          calls.push(args)
+          return split instanceof Error ? Promise.reject(split) : Promise.resolve(split)
+        },
+        window: { dispatchEvent: (ev) => { if (ev && ev.detail) ev.detail.waits = detailWaits.slice() } }
+      }
+      return { ctx, calls }
+    }
+    // ① 表单交互暂停：一个请求都不发 ⇒ false（未尝试），不是 'failed'。
+    const paused = setup({ paused: true, waits: 1, split: true })
+    assert.strictEqual(await makeRefresh(paused.ctx)({ respectFormPause: true }), false,
+      '表单暂停时回前台补拉是「跳过」，不得返回失败态（否则顶栏常驻假告警）')
+    assert.strictEqual(paused.calls.length, 0, '表单暂停期间不得发请求')
+    // ② 当前页没有面板接手（过滤规则页带未保存草稿时不注册下拉监听）⇒ 跳过。
+    const noPanel = setup({ waits: 0, split: true })
+    assert.strictEqual(await makeRefresh(noPanel.ctx)({}), false,
+      '没有面板接手时是「跳过」，不得返回失败态')
+    assert.strictEqual(noPanel.calls.length, 0, '没有面板接手时连全局请求也不得发')
+    // ③ 真发出去但失败 ⇒ 'failed'（唯一该留告警的状态）。
+    const failed = setup({ waits: 1, split: 'failed' })
+    assert.strictEqual(await makeRefresh(failed.ctx)({}), 'failed', '真失败的刷新必须回失败态')
+    assert.strictEqual(failed.calls.length, 1, '失败分支确实发起了刷新')
+    // ④ refreshSplit 回 false = 上一拍还在飞 / 序号过期（没发或结果已作废）⇒ 仍是跳过。
+    const inFlight = setup({ waits: 1, split: false })
+    assert.strictEqual(await makeRefresh(inFlight.ctx)({}), false,
+      'refreshSplit 的 false（在飞/序号过期）不是失败，不得升级成失败态')
+    // ⑤ 成功 ⇒ true，并推进 lastRefreshRef（否则回前台静默窗的判据恒真）。
+    const okRun = setup({ waits: 1, split: true })
+    assert.strictEqual(await makeRefresh(okRun.ctx)({}), true, '刷新成功必须回成功态')
+    assert.ok(okRun.ctx.lastRefreshRef.current > 0, '成功后必须推进 lastRefreshRef')
+    // ⑥ refreshSplit 抛错 ⇒ 失败态（不能当成跳过被静默）。
+    const thrown = setup({ waits: 1, split: new Error('boom') })
+    assert.strictEqual(await makeRefresh(thrown.ctx)({}), 'failed', '刷新抛错必须回失败态')
+    // 调用点（取 ui.js 里真实那一行执行）：只有 'failed' 才 noteQuiet 留痕；false/true 都不留。
+    const line = ui.split('\n').find((l) => l.includes('refreshActive({ respectFormPause: true })'))
+    assert.ok(line, '找不到回前台补拉的调用行')
+    const quietFor = async (make) => {
+      const quiet = []
+      const ctx = {
+        refreshActive: make,
+        noteQuiet: (kind, failed) => { if (failed) quiet.push(kind) }
+      }
+      runInSandbox(line.trim(), ctx)
+      await new Promise((resolve) => setImmediate(resolve))
+      return quiet
+    }
+    assert.deepStrictEqual(await quietFor(async () => false), [],
+      '跳过（没发请求）不得产生「后台刷新异常」条目')
+    assert.deepStrictEqual(await quietFor(async () => true), [], '成功不得留下告警')
+    assert.deepStrictEqual(await quietFor(async () => 'failed'), ['回前台补拉失败'],
+      '真失败必须在顶栏留一条可见痕迹')
+    assert.deepStrictEqual(await quietFor(async () => { throw new Error('boom') }), ['回前台补拉失败'],
+      '请求抛错必须在顶栏留一条可见痕迹')
   })
 }
 

@@ -126,7 +126,29 @@ function runCheck (app) {
   add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告：${warnings.join('；')}` : '合法')
   try {
     app.init()
-    add('缓存目录', true, app.Config.cache.dir)
+    // C3-010：init() 成功不等于 cache.dir 生效——被根内安全检查拒绝时会**静默回退**到
+    // .xbk_cache_safe / .xbk_cache_safe_internal，而这里原先只打印配置值：运维看到
+    // 「✅ 缓存目录：<配置值>」会以为判重主存写在配置位置，实际写在别处（误判「缓存丢了/在重复推送」）。
+    // 故打印**生效值**，并在与配置值不一致时点明「谁覆盖/为什么回退」。
+    const configured = app.Config.cache.dir
+    const effective = app.MessageStore && typeof app.MessageStore.cacheDir === 'string' ? app.MessageStore.cacheDir : configured
+    // XBK_CACHE_DIR 的「是否覆盖」必须与 MessageStore / statusCacheDir 同源：trim 后且是绝对路径才被
+    // 采纳（xbk_message_store 对相对路径/纯空白会告警「已忽略」）。只看真值会把「被忽略」说成
+    // 「由 XBK_CACHE_DIR 覆盖，配置值 <同一值>」——同一份诊断自相矛盾，运维会以为读写在 env 目录。
+    const envRaw = typeof process.env.XBK_CACHE_DIR === 'string' ? process.env.XBK_CACHE_DIR.trim() : ''
+    const cacheDirNotes = []
+    // 回退判定直接取 MessageStore 的结论（C3-010 + Codacy path-join-resolve-traversal 收口）：
+    // 旧实现在这里用 `path.resolve(生效值) !== path.resolve(ROOT, 配置值)` 自己重算一遍，既重复了
+    // 模块「root + fallback」的解析口径（两侧分叉就出现「目录判断说反话」），又让配置值以路径拼接
+    // 形态出现在 CLI 里。MessageStore 求值 cacheDir 时记录本次判定，这里只读结论、不做路径运算。
+    const fallback = app.MessageStore ? app.MessageStore.cacheDirFallback : null
+    if (envRaw && path.isAbsolute(envRaw)) {
+      cacheDirNotes.push(`由 XBK_CACHE_DIR 覆盖，配置值 ${configured}`)
+    } else {
+      if (envRaw) cacheDirNotes.push(`XBK_CACHE_DIR（${envRaw}）不是绝对路径，已忽略`)
+      if (fallback) cacheDirNotes.push(`配置值 ${fallback.raw} 未通过根内安全检查，已回退到 ${fallback.chosen}`)
+    }
+    add('缓存目录', true, cacheDirNotes.length ? `${effective}（${cacheDirNotes.join('；')}）` : effective)
   } catch (e) { add('缓存目录', false, e.message) }
   const notify = require(path.join(ROOT, 'xbk_sendNotify_slim'))
   const count = typeof notify.configuredChannelCount === 'function' ? notify.configuredChannelCount() : 0

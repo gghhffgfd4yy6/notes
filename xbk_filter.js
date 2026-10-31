@@ -99,6 +99,11 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
      *
      * 参数形状：compiled = compileRules(...) 的整份产物（__compiled === true），
      *           与 checkCategory/checkRegisterTime 接收字段级规则（_type）不同；缺失 → 放行。
+     *
+     * C9-009：优先级矩阵**只有一份实现在 explainFilter**（生产链 xbk_app → listfilter →
+     * explainFilter），本方法只是兼容壳：保留 __compiled 形状守卫与告警，再把判定交给同一实现。
+     * 此前这里手写了第二份矩阵（连字段命名都不同），只能靠人同步——且它完全不做
+     * pingbifenlei/pingbitime 判定，同一输入会出现 checkFields=true / listfilter=false 的分裂。
      */
   checkFields (group, compiled) {
     // FILTER-03：形状守卫——本入口接收整份编译产物（__compiled === true）。传原始配置或错形状
@@ -110,49 +115,8 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       if (compiled) console.warn('⚠️ checkFields 收到未编译的配置或错形状参数，已保守放行')
       return true
     }
-    const fieldStages = [
-      { key: 'louzhu', getVal: (g) => Utils.safeGet(g, 'louzhu'), showCfg: compiled.zhanxianlouzhu, blockCfg: compiled.pingbilouzhu, plusCfg: compiled.pingbilouzhuplus, blockedBy: [] },
-      { key: 'title', getVal: (g) => Utils.safeGet(g, 'title'), showCfg: compiled.zhanxianbiaoti, blockCfg: compiled.pingbibiaoti, plusCfg: compiled.pingbibiaotiplus, blockedBy: ['louzhu'] },
-      { key: 'content', getVal: (g) => Utils.safeGet(g, 'content'), showCfg: compiled.zhanxianneirong, blockCfg: compiled.pingbineirong, plusCfg: compiled.pingbineirongplus, blockedBy: ['louzhu', 'title'] }
-    ]
-
-    const showFlags = {}
-    const blockFlags = {}
-    const blockPlusFlags = {}
-
-    // 第一轮：强制展现
-    for (const stage of fieldStages) {
-      const val = stage.getVal(group)
-      // P2（审查 2026-08-15）：真值判定会把 0/false 当「字段缺失」跳过匹配，与 matchesCompiled
-      // C013 契约（0/false 为有效值、参与匹配）分裂——统一为仅 undefined/null/空串视为缺失。
-      if (stage.showCfg && val !== undefined && val !== null && val !== '') {
-        if (RuleEngine.matchesCompiled(stage.showCfg, val, Utils.safeGet(group, 'catename'))) {
-          showFlags[stage.key] = true
-        }
-      }
-    }
-
-    // 第二轮：屏蔽 + 强化屏蔽
-    for (const stage of fieldStages) {
-      const val = stage.getVal(group)
-      // P2（同上）：0/false 是有效字段值，参与屏蔽/强化屏蔽匹配
-      if (val === undefined || val === null || val === '') continue
-      const blocked = stage.blockedBy.some(k => showFlags[k])
-
-      if (stage.blockCfg && !blocked && !showFlags[stage.key]) {
-        if (RuleEngine.matchesCompiled(stage.blockCfg, val, Utils.safeGet(group, 'catename'))) {
-          blockFlags[stage.key] = true
-        }
-      }
-      if (stage.plusCfg && !blocked && !blockFlags[stage.key]) {
-        if (RuleEngine.matchesCompiled(stage.plusCfg, val, Utils.safeGet(group, 'catename'))) {
-          blockPlusFlags[stage.key] = true
-          showFlags[stage.key] = false
-        }
-      }
-      if (blockFlags[stage.key] || blockPlusFlags[stage.key]) return false
-    }
-    return true
+    // C9-009：与生产入口同一实现（含分类屏蔽与时间过滤），不再维护第二份矩阵
+    return this.explainFilter(group, compiled).passed
   },
 
   /**
@@ -197,7 +161,14 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     const matchOnce = (compiled, value, catename) => {
       if (!compiled || value === undefined || value === null || value === '') return { hit: false, rule: null }
       if (compiled._type !== 'multi') return { hit: RuleEngine.matchesCompiled(compiled, value, catename), rule: null }
-      const rule = RuleEngine._firstMatchingRule(compiled.rules, catename, r => RuleEngine._safeTest(r.val, value))
+      // C9-007：正文整次扫描只归一化一次——逐条谓词里再归一化等于「规则数 × 文本长度」的白扫
+      // （归一化是纯函数，同一输入结果恒定）；分类名的归一化由 _firstMatchingRule 做一次。
+      const text = RuleEngine._normalizeMatchText(value)
+      // 归一化吐 null = 该字段值不可判定（ToString/Symbol 抛错），必须与「字段缺失」同口径不命中：
+      // 直接交给 .test 会把 null 当字面量 'null' 去匹配（值侧模式 /null/、/.*/ 一命中，
+      // 判定就从「放行」翻成「拦截」，方向是本项目最忌的少推）。
+      if (text === null) return { hit: false, rule: null }
+      const rule = RuleEngine._firstMatchingRule(compiled.rules, catename, r => RuleEngine._safeTestText(r.val, text))
       return { hit: rule !== null, rule }
     }
     const timeMatchedRule = (compiled, group) => {

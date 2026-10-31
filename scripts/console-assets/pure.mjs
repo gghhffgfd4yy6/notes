@@ -4,6 +4,8 @@
 // 不必从 app.js 源码里截字符串再 eval（SonarCloud S1523 视动态执行代码为 Critical Vulnerability）。
 // 这里只放可注入时钟/纯输入的判定，任何 DOM 或 fetch 逻辑都不要进来。
 
+import { SHANGHAI_OFFSET_MS } from './constants.js'
+
 export const DAY_MS = 1000 * 60 * 60 * 24
 
 // 回到顶部的滚动方式（v3.321）：开了「减少动效」或宿主没有 scrollBehavior（老 Safari）时
@@ -191,7 +193,7 @@ export function relDay (dateStr, nowMs = Date.now()) {
   if (typeof dateStr !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return ''
   const [y, m, d] = dateStr.split('-').map(Number)
   const target = Date.UTC(y, m - 1, d)
-  const now = new Date(Number(nowMs) + 8 * 3600 * 1000)
+  const now = new Date(Number(nowMs) + SHANGHAI_OFFSET_MS)
   const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
   const gap = Math.round((today - target) / DAY_MS)
   if (!Number.isFinite(gap) || gap < 0) return ''
@@ -347,6 +349,17 @@ export function todayCardView ({ hasData, failed, rounds, truncated }) {
   return { tone: 'run', badge: '—', note }
 }
 
+// 「新条数」的唯一口径（C7-015）：关注词角标、检查更新里的条目判定、搜索结果的「新」
+// 标记共用这一个比较。since <= 0 表示「从未读过」⇒ 全部算新（旧实现里检查更新用
+// Date.now() 兜底、角标用 0，同一个词能同时出现「N 条新」和「0 条新」两种结论）；
+// since > 0 时严格大于：等于 lastReadAt 的那条就是已读锚点本身，不能再算新。
+// 注意 since=null（普通搜索、没有关注词基线）不是 0：调用方要先挡住 null。
+export function isNewerThan (ts, since) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return false
+  if (typeof since !== 'number' || !Number.isFinite(since) || since <= 0) return true
+  return ts > since
+}
+
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
 // issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
 // 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。
@@ -406,9 +419,39 @@ export function isTimeoutError (err) {
   return /abort|timed ?out|timeout|响应体读取超时/i.test(raw)
 }
 
+// 首屏快照的逐层校验（C7-056）：readSnapshot 此前只校验到容器层（status 是对象、
+// runs 是数组），部件里的 value 原样透传给渲染层。快照是**上一个页面版本**写下的
+// localStorage——服务端字段形状一变，坏快照会直接喂给 StatusCards（state.run.value.*、
+// stats.today.*、runs 每条的 r.id/r.finishedAt），首帧就抛在 ErrorBoundary 上，而
+// 「先用旧值渲染」本来是弱网冷启动的兜底路径（最不该在这条路上炸）。
+// 口径只认「读得安全」：部件必须是对象、status 必须是字符串、value 必须是对象或空；
+// runs 每条必须是非空对象（数组里混进 null 会让 runs.some 当场 TypeError）。
+const SNAPSHOT_PART_KEYS = ['run', 'report', 'channels', 'diagnostics', 'stats']
+function snapshotPartOk (part) {
+  if (part === null || part === undefined) return true // 部件缺席不算坏（服务端没给）
+  if (typeof part !== 'object' || Array.isArray(part)) return false
+  if (typeof part.status !== 'string') return false
+  const value = part.value
+  if (value === null || value === undefined) return true
+  return typeof value === 'object' && !Array.isArray(value)
+}
+export function snapshotOk (v, version) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  if (v.v !== version || !Number.isFinite(v.at)) return false
+  if (!v.status || typeof v.status !== 'object' || Array.isArray(v.status)) return false
+  for (const key of SNAPSHOT_PART_KEYS) {
+    if (!snapshotPartOk(v.status[key])) return false
+  }
+  const lock = v.status.lock
+  if (lock !== null && lock !== undefined && (typeof lock !== 'object' || Array.isArray(lock))) return false
+  if (!Array.isArray(v.runs)) return false
+  return v.runs.every((r) => !!r && typeof r === 'object' && !Array.isArray(r))
+}
+
 // 标签页哈希（v3.307）：刷新/后退不丢当前页。只认白名单，非法 hash 回概览。
-// v3.370 加 search（线报搜索）；filter 仍由 ui.js 的 resolveTab 单独认（历史原因）。
-export const TAB_KEYS = ['overview', 'messages', 'search', 'logs', 'config', 'sys']
+// v3.370 加 search（线报搜索）；v3.371/C7-031 补 filter（过滤规则）——此前 filter 不在
+// 白名单里，ui.js 只能自己加一条 /^#\/filter$/ 正则补丁，页签清单于是有了三处真源。
+export const TAB_KEYS = ['overview', 'messages', 'search', 'logs', 'config', 'filter', 'sys']
 export function tabFromHash (hash) {
   const m = /^#\/([a-z]+)$/.exec(typeof hash === 'string' ? hash : '')
   return m && TAB_KEYS.includes(m[1]) ? m[1] : 'overview'

@@ -142,7 +142,11 @@ function looksLikeRoundFailure (line) {
 // run.log 摘要行正则（parseLastRun 只看最后一条；readTrends / readRunHistory / parseRunStats
 // 都按同一逐行形态解析）。dry-run 行（含 dry-run未推送=）计入轮次与获取数，但 pushed 恒为 0，
 // 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
-const RUN_SUMMARY_LINE_RE = /^(?:(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}\S* )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
+// C10-057：**唯一**一份摘要正则。分组 1 = 行首完整时间戳（本地 `YYYY-MM-DD HH:MM:SS` 或历史
+// ISO，含其后可能的分段后缀），2..7 = 六项计数，8 = elapsed。需要「日历日」的调用方一律用
+// `m[1].slice(0, 10)` 派生——此前 parseLastRun 内联了第二份正则，且两份的分组 1 语义不同
+// （一份是整段时间戳、一份只有日期），同一位置两个含义，改一处必漏另一处。
+const RUN_SUMMARY_LINE_RE = /^((?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*) )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
 
 // ── 轮界归属（parseLastRun / readRunHistory 共用）────────────────────────────
 // 生产写序（xbk_app.js）：失败行写在所属轮的摘要行**之前**——「推送全部失败」ERROR 后紧跟
@@ -262,7 +266,8 @@ function parseLastRun (read) {
     // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
     // 审查 SS-01：时间戳由非捕获组改为捕获组（旧实现只用来锚定，结果里没有任何时间字段，
     // 输出无法判断这一轮是何时跑的、也看不出日志已经很久没更新）。
-    const match = /^((?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*) )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=([^\s]+)/.exec(lines[i])
+    // C10-057：改用模块级 RUN_SUMMARY_LINE_RE（唯一真源），分组 1 就是整段时间戳。
+    const match = RUN_SUMMARY_LINE_RE.exec(lines[i])
     if (!match) continue
     // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
     const counters = match.slice(2, 8).map(Number)
@@ -318,7 +323,8 @@ function parseRunStats (read, now = Date.now()) {
     if (!m) continue
     const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
     if (!counters.every(validCounter)) continue
-    const day = m[1]
+    // 分组 1 是整段时间戳，日历日取前 10 位（C10-057：与 RUN_SUMMARY_LINE_RE 单一真源配套）
+    const day = m[1] ? m[1].slice(0, 10) : ''
     // 只统计 [本周起点, 今天]：未来日期（时钟回拨/手写 fixture/坏摘要）会把周汇总和
     // lastFailure 一起推高（Sourcery 未来摘要污染周统计）。
     if (!day || day < weekStartKey || day > todayKey) continue
@@ -440,6 +446,18 @@ function formatStatus (status) {
 
 function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 
+// YYYY-MM-DD「形状对且真存在」的回环校验（C10-053：服务端两份收敛到这一个实现）。
+// 2026-02-30 这类键能过正则、但 Date 会把它归一化成 03-02 ⇒ 只测正则会让它进区间模式
+// （Sourcery #288）。readTrends 的区间参数与 console 的 parseDayKey 都调本函数。
+// 浏览器侧 scripts/console-assets/pages.js 的 isValidDayKey 是同一口径的**镜像**实现
+// （跑在浏览器、本仓无构建步骤可共享模块），改这里必须同步那一处。
+const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+function isRealDayKey (v) {
+  if (typeof v !== 'string' || !DAY_KEY_RE.test(v)) return false
+  const t = Date.parse(v + 'T00:00:00Z')
+  return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v
+}
+
 // 近 N 日运行趋势：摘要行按本地日期（YYYY-MM-DD）聚合。文件缺失/不可读返回 { status }，
 // 与 readStatus 部件三态（missing/ok/invalid）一致，前端沿用 partTone 归类。
 // v3.326：支持自定义日期区间（from/to，上海日历日）。区间优先于 days；跨度上限 92 天
@@ -469,15 +487,7 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
   if (read.status !== 'ok') return { status: read.status }
   const todayKey = shanghaiDayKey(now)
-  const dayRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
-  // 回环校验：2026-02-30 这类「日期形状但不存在」的键，Date 会归一化成 03-02，
-  // 只测正则会让它进区间模式（Sourcery #288）。
-  const realDay = (v) => {
-    if (typeof v !== 'string' || !dayRe.test(v)) return false
-    const t = Date.parse(v + 'T00:00:00Z')
-    return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v
-  }
-  const rangeMode = realDay(from) && realDay(to) && from <= to
+  const rangeMode = isRealDayKey(from) && isRealDayKey(to) && from <= to
   // 区间模式：to 超过今天按今天截；跨度上限 92 天（超出时保留靠近 to 的一端）。
   const endKey = rangeMode ? (to > todayKey ? todayKey : to) : todayKey
   // 显式区间但起点已晚于截断后的终点（未来区间）：区间内没有任何上海日 → 空结果，
@@ -503,7 +513,8 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
     const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
     if (!counters.every(validInt)) continue
     // 无时间戳的历史行（极旧格式）没有日期键，归不进任何一天——跳过（诚实于「不知道」）。
-    const day = m[1]
+    // 分组 1 是整段时间戳，日历日取前 10 位（C10-057：与 RUN_SUMMARY_LINE_RE 单一真源配套）
+    const day = m[1] ? m[1].slice(0, 10) : ''
     if (!day) continue
     // 只聚合窗口内：旧日志行不进窗口（避免「总计」被陈旧数据污染）。
     if (day < startKey || day > endKey) continue
@@ -835,4 +846,4 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return value
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE }
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey }

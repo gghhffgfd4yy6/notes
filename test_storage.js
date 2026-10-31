@@ -223,6 +223,34 @@ const {
   assert.strictEqual(fs.readFileSync(winTarget, 'utf8'), '[]',
     '下一次初始化必须写入有效内容（残骸被当成「已初始化」时这里是半写的 half）')
 
+  // ===== C3-006：写失败清理必须按 inode 复核，绝不删并发进程刚提交的有效缓存 =====
+  // 旧实现 catch 里直接 `fs.unlinkSync(filePath)`：wx 打开成功、写失败（ENOSPC）之后，若另一进程
+  // 已删掉半写残骸并原子提交了一份有效缓存（新 inode），这条 unlink 会把**它刚重建的判重主存**
+  // 删掉。修法：close 前 fstat 记下本次创建文件的 dev/ino，清理前 lstat 复核，不一致就只告警不删。
+  const c3006 = make('c3006-absent.txt')
+  const origWriteC3006 = fs.writeFileSync
+  fs.writeFileSync = (target, ...rest) => {
+    if (typeof target !== 'number') return origWriteC3006.call(fs, target, ...rest)
+    // 模拟并发进程：删掉我们的半写残骸，并原子提交一份有效缓存（新 inode）
+    fs.unlinkSync(c3006)
+    origWriteC3006.call(fs, c3006, '[]')
+    throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+  }
+  let c3006Ret
+  const c3006Warns = []
+  const origWarnC3006 = console.warn
+  console.warn = (...args) => { c3006Warns.push(args.map(String).join(' ')) }
+  try { c3006Ret = writeAtomicIfAbsent(c3006, '[]') } finally {
+    fs.writeFileSync = origWriteC3006
+    console.warn = origWarnC3006
+  }
+  assert.strictEqual(c3006Ret, false, '写失败仍必须返回 false（失败语义不变）')
+  assert.strictEqual(fs.existsSync(c3006), true, '并发进程刚提交的有效缓存不得被本进程的失败清理删掉')
+  assert.strictEqual(fs.readFileSync(c3006, 'utf8'), '[]', '保留下来的必须是并发进程写入的有效内容')
+  assert.ok(c3006Warns.some(w => w.includes('inode 已变') && w.includes(c3006)),
+    `跳过清理必须显式告警并点名路径：${JSON.stringify(c3006Warns)}`)
+  // 反向对照：无人替换时（残骸仍是本次创建的那个 inode），清理照旧生效（上面的 STG-02 已锁）
+
   // 反向对照：EEXIST（另一进程已创建）不得被「清理残骸」误删——那是别人的有效缓存
   const keep = make('keep.txt')
   fs.writeFileSync(keep, 'first')

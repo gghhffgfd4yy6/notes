@@ -6603,6 +6603,80 @@ console.log('========================================\n');
     assertEqual(_normalizeReInput('a\u200Bb\uFEFFc'), 'abc', '_normalizeReInput(\'a\\u200Bb\\uFEFFc\') 应等于 \'abc\'')
   })
 
+  // C6-009（复审 a/b）：compileUserRegex 的 (源码, flags) 有限缓存语义必须由入库用例钉住，不能靠
+  // 一次性 scratch 探针。四条边界：(a) 同键命中同一实例；(b) 不同 flags 不串键、带 g/y 不缓存
+  // （lastIndex 有状态，共享实例会改变调用方可见语义）；(c) 编译失败不缓存（每次调用都经 onError
+  // 回传）；(d) 上限 256 + 超限按插入序（FIFO）淘汰最旧键。
+  // (d) 的判据与「本用例之前缓存里已有多少条」无关：连续插入 256 条新键后，容量上限 256 意味着
+  // 存活集恰好是这 256 条（更早的条目会被先挤掉），故「第 0 条仍命中」只在 MAX >= 256 时成立；
+  // 再插 1 条后第 0 条必须被淘汰（重新编译 ⇒ 新实例），即 MAX <= 256。
+  await test('C6-009: compileUserRegex 按 (源码,flags) 缓存——同键复用 / 不同 flags 与 g,y 不复用 / 失败不入缓存 / 256 条 FIFO 上限', () => {
+    // (a) 同 (源码, flags) 两次调用必须复用同一实例
+    const a1 = compileUserRegex('c6-009-same-key', 'i')
+    const a2 = compileUserRegex('c6-009-same-key', 'i')
+    assertEqual(Boolean(a1), true, '前置：re2 可用时合法模式必须编译成功（本套件其余用例同样依赖 re2）')
+    assertEqual(a1 === a2, true, '同 (源码, flags) 两次调用必须返回同一 RE2 实例（缓存未命中 = 每轮重复编译）')
+
+    // (b1) 同源码不同 flags 是两个不同的正则，不得串键
+    const bm = compileUserRegex('c6-009-flags', 'm')
+    const bi = compileUserRegex('c6-009-flags', 'i')
+    assertEqual(bm === bi, false, '同源码不同 flags 必须是两个不同实例（缓存键必须含 flags）')
+    assertEqual(bm.flags.includes('m') && !bm.flags.includes('i'), true, `flags=m 的实例必须带 m 且不带 i（实际 ${bm.flags}）`)
+    assertEqual(bi.flags.includes('i') && !bi.flags.includes('m'), true, `flags=i 的实例必须带 i 且不带 m（实际 ${bi.flags}）`)
+
+    // (b2) 带 g / y 的模式有 lastIndex 状态，共享实例会改变调用方可见语义 ⇒ 一律不缓存
+    const bg1 = compileUserRegex('c6-009-global', 'g')
+    assertEqual(bg1.test('xc6-009-global'), true, '前置：带 g 的实例必须能匹配')
+    assertEqual(bg1.lastIndex > 0, true, '前置：带 g 的实例 test 命中后 lastIndex 必须前进（只有共享实例才会串状态）')
+    const bg2 = compileUserRegex('c6-009-global', 'g')
+    assertEqual(bg2 === bg1, false, '带 g 的模式不得进入缓存（否则 lastIndex 状态跨调用方泄漏）')
+    assertEqual(bg2.lastIndex, 0, '带 g 的新实例 lastIndex 必须为 0（first-match 语义不受前一次调用影响）')
+    assertEqual(bg2.test('xc6-009-global'), true, '带 g 的新实例必须重新从 0 开始匹配并命中')
+    const by1 = compileUserRegex('c6-009-sticky', 'iy')
+    const by2 = compileUserRegex('c6-009-sticky', 'iy')
+    assertEqual(by1 === by2, false, "带 y（'iy'）的模式同样不得缓存（lastIndex 会串）")
+    assertEqual(by1.flags.includes('i') && by1.flags.includes('y'), true, `iy 实例必须同时带 i 与 y（实际 ${by1.flags}）`)
+
+    // (c) 编译失败不入缓存：两次调用都必须经 onError 回传，且都返回 null
+    const reasons = []
+    const onError = (reason) => reasons.push(reason)
+    const c1 = compileUserRegex('c6-009-(', 'i', onError)
+    const c2 = compileUserRegex('c6-009-(', 'i', onError)
+    assertEqual(c1, null, '无效模式必须返回 null')
+    assertEqual(c2, null, '无效模式每次调用都必须返回 null（失败不得被当成可用实例缓存下来）')
+    assertEqual(reasons.length, 2, '编译失败不得入缓存：两次调用都必须经 onError 回传原因（命中失败缓存会少一次告警）')
+    assertEqual(reasons.every(r => r instanceof Error), true, 'onError 回传的原因必须是 Error 实例（调用方据此写告警与 run.log）')
+
+    // (d) 上限 256 + FIFO：插入恰好 256 条后最旧一条仍命中；再插 1 条后它必须被淘汰，且最近的键仍命中
+    const prefix = 'c6-009-limit-'
+    const first = compileUserRegex(prefix + 0, 'i')
+    for (let n = 1; n < 256; n++) compileUserRegex(prefix + n, 'i')
+    assertEqual(compileUserRegex(prefix + 0, 'i') === first, true,
+      '插入恰好 256 条后最早的一条仍必须命中（上限不得小于 256，否则会提前淘汰在用的规则）')
+    const newest = compileUserRegex(prefix + 255, 'i')
+    compileUserRegex(prefix + 'over', 'i')
+    assertEqual(compileUserRegex(prefix + 0, 'i') === first, false,
+      '超过 256 条后最早插入的键必须被淘汰（重新编译 ⇒ 新实例；删掉上限即被动态关键词撑成无界内存）')
+    assertEqual(compileUserRegex(prefix + 255, 'i') === newest, true,
+      'FIFO 只淘汰最旧键：最近的键必须仍命中（淘汰错端在此变红）')
+  })
+
+  // FILTER-01：compileStateOf 是 filter.hash 的第三维（App.run 折入「规则实际编译生效」）。
+  // 控制台保存规则后要用同一口径算摘要，所以这个导出必须真的被测试执行到（不只被生产代码引用）：
+  // 同一份配置在「规则被编译出来」与「规则被 ReDoS/编译守卫丢弃」两种结果下指纹必须不同。
+  await test('FILTER-01: compileStateOf 折入 re2 可用性与字段编译结果（控制台摘要与运行期同口径）', () => {
+    const v3 = require('./xbk_function_v3.js')
+    const compiled = v3.compileStateOf(v3.compileRules({ pingbibiaoti: 'abc' }))
+    assertEqual(typeof compiled, 'string', 'compileStateOf 必须返回稳定字符串')
+    assertEqual(compiled.includes('re2='), true, `指纹必须带 re2 可用性维度（实际 ${compiled}）`)
+    assertEqual(compiled.includes('pingbibiaoti=re'), true, `已编译出正则的字段必须体现类型（实际 ${compiled}）`)
+    // 同一环境内必须稳定：否则 App 每轮都清 _f、每轮全量重评
+    assertEqual(compiled, v3.compileStateOf(v3.compileRules({ pingbibiaoti: 'abc' })), '同一环境内指纹必须逐字稳定')
+    // 非法正则被编译守卫丢弃 ⇒ 编译生效面变了，指纹必须跟着变（否则改宽后静默漏推）
+    const dropped = v3.compileStateOf(v3.compileRules({ pingbibiaoti: '(' }))
+    assertEqual(dropped !== compiled, true, '编译结果变化必须改变指纹（否则 filter.hash 不变、_f 永不失效）')
+  })
+
   // ==================== 94. 死代码检测(可达性) ====================
   console.log('\n📂 94. 死代码检测')
 
@@ -11341,6 +11415,37 @@ console.log('========================================\n');
     assertEqual(matchesCompiled(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti, probe, 'cat'), true, 'matchesCompiled 同口径命中')
   })
 
+  // C9-007：归一化吐 null（值不可判定）必须与「字段缺失」同口径——不得落成字面量 "null" 参与匹配
+  await test('C9-007: 字段值不可判定（ToString/Symbol 抛错）时多行规则必须放行，不得当字面量 "null" 命中', () => {
+    // 反例（改动前）：_normalizeMatchText 的 try/catch 把 String() 异常吞成 null，matchOnce 又把
+    // null 直接交给 _safeTestText ⇒ 真正进 .test 的是字符串 "null"。值侧模式 /null/、/.*/ 一旦命中，
+    // 判定就从「放行」翻成「拦截」（本批唯一一处把「异常即不命中」改成「异常当 'null' 命中」）。
+    const poisonedObj = { toString () { throw new TypeError('boom') } }
+    const poisonedSymbolArr = [Symbol('boom')] // String([Symbol]) 同样抛 TypeError
+    const nullCfg = compileRules({ pingbineirong: '微博###null' })
+    const dotCfg = compileRules({ pingbineirong: '微博###.*' })
+    const poisoned = [['抛错 toString 的对象', poisonedObj], ['含 Symbol 的数组', poisonedSymbolArr]]
+    const cfgs = [['/null/', nullCfg], ['/.*/', dotCfg]]
+    for (const [label, value] of poisoned) {
+      for (const [cfgName, cfg] of cfgs) {
+        const item = makeItem({ catename: '微博', louzhu: 'y', title: 'x', content: value })
+        const r = explainFilter(item, cfg)
+        assertEqual(r.passed, true, `content 不可判定时必须放行（${label} × ${cfgName}）`)
+        assertEqual(r.reason, null, `放行时不得给出拦截原因（${label} × ${cfgName}）`)
+        assertEqual(listfilter(item, cfg), true, `listfilter 同口径放行（${label} × ${cfgName}）`)
+        assertEqual(checkFields(item, cfg), true, `checkFields 同口径放行（${label} × ${cfgName}）`)
+      }
+    }
+    // 真假成对：同一批规则对可判定的文本仍必须照旧命中（不得把规则本身修失效）
+    const literal = makeItem({ catename: '微博', louzhu: 'y', title: 'x', content: 'null' })
+    const rLiteral = explainFilter(literal, nullCfg)
+    assertEqual(rLiteral.passed, false, '可判定文本 "null" 仍必须被 /null/ 拦截')
+    assertEqual(rLiteral.reason.stage, 'content', '拦截原因应指向 content 阶段')
+    assertEqual(rLiteral.reason.configKey, 'pingbineirong', '拦截原因应指向 pingbineirong')
+    assertEqual(explainFilter(makeItem({ catename: '微博', content: '随便什么内容' }), dotCfg).passed, false, '/.*/ 对可判定文本仍必须拦截')
+    assertEqual(explainFilter(makeItem({ catename: '数码', content: '随便什么内容' }), dotCfg).passed, true, '分类不匹配时仍放行（规则语义不得被改坏）')
+  })
+
   // ==================== 补测（PlanA）：timeMatchedRule / checkFields / _passIfMissing ====================
   // 靶标：高价值存活变异簇（时间过滤判定 79 / 字段过滤入口 45 / 缺字段放行 26）。
   // 断言一律对契约与注释意图，真假两侧成对，精确值断言，不依赖时区/遍历顺序。
@@ -11482,6 +11587,43 @@ console.log('========================================\n');
     assertEqual(checkFields(makeItem({ title: 0 }), compileRules({ zhanxianbiaoti: '0', pingbibiaoti: '0' })), true, 'title=0 亦应能触发强制展现')
     assertEqual(checkFields(makeItem({ title: undefined }), compileRules({ pingbibiaoti: '京东' })), true, 'title 缺失应跳过该字段')
     assertEqual(checkFields(makeItem({ title: '' }), compileRules({ pingbibiaoti: '京东' })), true, 'title 空串应跳过该字段')
+  })
+
+  // C9-009：checkFields 是 explainFilter 的兼容壳（优先级矩阵只有一份实现）
+  await test('C9-009: checkFields 与生产入口 explainFilter 同判定（含分类/时间过滤）', () => {
+    // 反例（改动前）：checkFields 手写第二份矩阵、字段命名都不同，且完全不做 pingbifenlei/pingbitime
+    // 判定 ⇒ 同一输入 checkFields=true / listfilter=false 的分裂。
+    const catBlock = compileRules({ pingbifenlei: '美妆' })
+    const gCat = makeItem({ catename: '美妆', title: '口红' })
+    assertEqual(checkFields(gCat, catBlock), false, '分类屏蔽必须同样作用于 checkFields（此前被忽略）')
+    assertEqual(checkFields(gCat, catBlock), listfilter(gCat, catBlock), 'checkFields 必须与 listfilter 同判定')
+
+    const timeBlock = compileRules({ pingbitime: '5' })
+    const gNew = makeItem({ louzhuregtime: daysAgo(4) })
+    const gOld = makeItem({ louzhuregtime: daysAgo(100) })
+    assertEqual(checkFields(gNew, timeBlock), false, '注册 4 天 < 5 天必须被时间过滤拦下（此前 checkFields 不看时间）')
+    assertEqual(checkFields(gOld, timeBlock), true, '注册 100 天不在窗口内应放行')
+
+    // 全矩阵一致性：同一批配置 × 同一条目，两个入口必须逐项相同（形状守卫之外不再有第二份语义）
+    const cases = [
+      [{}, {}],
+      [{ pingbibiaoti: '京东' }, {}],
+      [{ pingbibiaoti: '拼多多' }, {}],
+      [{ zhanxianbiaoti: '京东', pingbibiaoti: '京东' }, {}],
+      [{ zhanxianbiaoti: '京东', pingbibiaotiplus: '京东' }, {}],
+      [{ zhanxianlouzhu: '小明', pingbibiaoti: '京东' }, {}],
+      [{ pingbilouzhu: '小明', pingbibiaoti: '京东' }, {}],
+      [{ zhanxianneirong: '抢购', pingbineirong: '抢购' }, {}],
+      [{ pingbineirongplus: '抢购' }, {}],
+      [{ pingbibiaoti: '京东', pingbitime: '5' }, { louzhuregtime: daysAgo(1) }],
+      [{ pingbibiaoti: '京东', pingbifenlei: '微博线报' }, {}]
+    ]
+    for (const [cfg, overrides] of cases) {
+      const item = makeItem(overrides)
+      const compiled = compileRules(cfg)
+      assertEqual(checkFields(item, compiled), explainFilter(item, compiled).passed,
+        `checkFields 必须与 explainFilter 同判定：${JSON.stringify(cfg)} ${JSON.stringify(overrides)}`)
+    }
   })
 
   // ---- timeMatchedRule（经 explainFilter 的可观测出口 reason.rule 判定）----
