@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -2291,7 +2291,9 @@ function SearchPanel ({ onSync, active = true }) {
         try {
           // 和监控用同一套范围：从第 1 页往回翻到锚点所在页（最多 5 页），
           // 不能只数第 1 页——新增超过一页时角标会少报。
-          const since = w.lastReadAt > 0 ? w.lastReadAt : Date.now()
+          // C7-015：since 直接用 lastReadAt（0 = 从未读过 ⇒ 全部算新），不再拿 Date.now()
+          // 兜底——那会让「角标显示 N 条新」与「检查更新说 0 条新」同时成立。
+          const since = w.lastReadAt
           let count = 0
           for (let page = 1; page <= 5; page += 1) {
             const d = await apiSearchLines({ q: w.q, page, limit: 100 })
@@ -2301,8 +2303,8 @@ function SearchPanel ({ onSync, active = true }) {
             // 同一分钟内发布的新线报。锚点不在当前页时按 ts 比较，并继续往前翻。
             const idx = w.lastReadId ? d.items.findIndex((it) => it.id === w.lastReadId) : -1
             if (idx >= 0) { count += idx; break }
-            const allNew = d.items.every((it) => typeof it.ts === 'number' && it.ts > since)
-            count += d.items.filter((it) => typeof it.ts === 'number' && it.ts > since).length
+            const allNew = d.items.every((it) => isNewerThan(it.ts, since))
+            count += d.items.filter((it) => isNewerThan(it.ts, since)).length
             if (!allNew) break
             if (page >= Math.min(Number(d.pages) || 1, 5)) break
           }
@@ -2420,7 +2422,7 @@ function SearchPanel ({ onSync, active = true }) {
             <div class="msg-item-head">
               <a class="msg-title ls-title" href=${it.url} target="_blank" rel="noopener noreferrer" title=${`打开线报酷原文：${it.title}`}>${hit(it.title)}</a>
               ${typeof it.price === 'number' ? html`<span class="msg-price">¥${it.price}</span>` : ''}
-              ${!stale && req.since !== null && typeof it.ts === 'number' && it.ts > req.since ? html`<span class="ls-new">新</span>` : ''}
+              ${!stale && req.since !== null && isNewerThan(it.ts, req.since) ? html`<span class="ls-new">新</span>` : ''}
             </div>
             <div class="msg-meta">
               ${it.catename ? html`<span class="msg-cate" aria-label=${it.catename}>${cateParts(it.catename).map((part, j) => html`<span class="msg-cate-part" key=${j}>${part}</span>`)}</span>` : ''}

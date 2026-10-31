@@ -347,6 +347,17 @@ export function todayCardView ({ hasData, failed, rounds, truncated }) {
   return { tone: 'run', badge: '—', note }
 }
 
+// 「新条数」的唯一口径（C7-015）：关注词角标、检查更新里的条目判定、搜索结果的「新」
+// 标记共用这一个比较。since <= 0 表示「从未读过」⇒ 全部算新（旧实现里检查更新用
+// Date.now() 兜底、角标用 0，同一个词能同时出现「N 条新」和「0 条新」两种结论）；
+// since > 0 时严格大于：等于 lastReadAt 的那条就是已读锚点本身，不能再算新。
+// 注意 since=null（普通搜索、没有关注词基线）不是 0：调用方要先挡住 null。
+export function isNewerThan (ts, since) {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return false
+  if (typeof since !== 'number' || !Number.isFinite(since) || since <= 0) return true
+  return ts > since
+}
+
 // 各筛选模式的计数（v3.307）：前端 chips 显示数字，纯函数避免每次渲染把 6 个模式各扫一遍。
 // issue = isIssueLogLine；error 只看真正的业务 ERROR，控制台生命周期单独归 console——
 // 否则每次启停的「ERROR 控制台停止」会把错误数抬到上百，排障时反而找不到真错误。

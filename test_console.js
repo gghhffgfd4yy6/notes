@@ -10993,6 +10993,29 @@ async function main () {
     assert.ok(/\}, deps\)/.test(flip), 'deps 必须真的交给 useLayoutEffect 的依赖数组')
   })
 
+  await aok('C7-015 「新条数」口径统一（0 基线 / 严格大于 / 三处接线）', async () => {
+    const { isNewerThan } = await import('./scripts/console-assets/pure.mjs')
+    // 旧实现：检查更新把 lastReadAt=0 兜底成 Date.now()（⇒ 一律 0 条新），角标却按 0 算
+    // （⇒ 全部标「新」）。同一个词因此能同时显示两种结论；比较符也一处 >、一处 >=。
+    assert.strictEqual(isNewerThan(1000, 0), true, '从未读过（基线 0）⇒ 全部算新')
+    assert.strictEqual(isNewerThan(1000, 1000), false, '等于已读锚点的那条不再算新')
+    assert.strictEqual(isNewerThan(1001, 1000), true)
+    assert.strictEqual(isNewerThan(999, 1000), false)
+    assert.strictEqual(isNewerThan(0, 0), false, '没有时间戳的条目不算新')
+    assert.strictEqual(isNewerThan(undefined, 0), false)
+    assert.strictEqual(isNewerThan(Number.NaN, 1000), false)
+    const src = readConsoleSource()
+    const at = src.indexOf('function SearchPanel ')
+    const end = src.indexOf('function LogsPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 SearchPanel')
+    const seg = src.slice(at, end)
+    assert.ok((seg.match(/isNewerThan\(/g) || []).length >= 2,
+      '关注词角标与检查更新都必须走同一个比较（两处接线）')
+    assert.ok(!/it\.ts > (?:since|req\.since)/.test(seg), '不得再留裸 ts > since 的第二套口径')
+    assert.ok(!/w\.lastReadAt > 0 \? w\.lastReadAt : Date\.now\(\)/.test(seg),
+      '0 基线不得再被 Date.now() 兜底（那正是「角标 N 条新 / 检查 0 条新」的来源）')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')
