@@ -122,10 +122,15 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
     return false
   }
   let fd = -1
+  // C3-006：记录本进程创建的那个 inode（fstat 必须在 close 之前取，close 之后 fd 就失效了）。
+  // 失败清理只允许删「仍是本次创建的那个文件」——旧实现按路径无条件 unlink，若并发进程在我们
+  // 写失败后删掉半写残骸并原子提交了一份有效缓存，这条 unlink 会把**别人刚重建的有效缓存**删掉。
+  let ownStat = null
   try {
     ensureParent(filePath)
     // wx 打开成功即证明该文件由本次调用创建；EEXIST 时 openSync 抛错、fd 仍为 -1，不会误删他人文件。
     fd = fs.openSync(filePath, 'wx', 0o600) // nosemgrep（filePath 已过 isRegularOrMissing 类型闸门）
+    try { ownStat = fs.fstatSync(fd) } catch (e) { ownStat = null } // 拿不到 inode 时退回旧口径（见下方清理）
     fs.writeFileSync(fd, text, { encoding: 'utf8' }) // nosemgrep（首参是 fd 不是路径）
     fs.fsyncSync(fd) // 与 writeAtomic 同口径：内容落盘后再视为初始化成功（审查 STG-04）
     return true
@@ -142,7 +147,25 @@ function writeAtomicIfAbsent (filePath, text, label = '缓存初始化') {
       try { fs.closeSync(fd) } catch (e2) { /* 关闭失败不阻止尽力清理残骸 */ }
       fd = -1
       // 清理半写残骸（可能是本次写入的部分内容，也可能是空文件）；失败只告警，不影响返回语义。
-      try { fs.unlinkSync(filePath) } catch (e2) { console.warn(`${label}半写残骸清理失败 ${filePath}:`, e2.message) } // nosemgrep
+      // C3-006：删之前先复核路径仍指向**本次创建的那个 inode**——close 与 unlink 之间并发进程可能
+      // 已删掉残骸并原子提交了有效缓存，按路径删会把这份有效判重记录一并毁掉（方向=重推，但属
+      // 无谓的数据丢失）。拿不到 inode 时（极端平台/注入 fs）保持旧口径尽力清理。
+      let sameFile = true
+      if (ownStat && typeof ownStat.dev === 'number' && typeof ownStat.ino === 'number') {
+        try {
+          const now = fs.lstatSync(filePath)
+          sameFile = !!now && now.isFile() && now.dev === ownStat.dev && now.ino === ownStat.ino
+        } catch (e2) {
+          // 路径已不存在（ENOENT）⇒ 残骸已不在，无需清理；其余读不到的情况按「不是我们的文件」保守处理
+          sameFile = false
+        }
+        if (!sameFile) {
+          console.warn(`${label}半写残骸已被并发进程替换（inode 已变），跳过清理以保留其刚写入的有效缓存 ${filePath}`)
+        }
+      }
+      if (sameFile) {
+        try { fs.unlinkSync(filePath) } catch (e2) { console.warn(`${label}半写残骸清理失败 ${filePath}:`, e2.message) } // nosemgrep
+      }
     }
     console.error(`${label}写入失败 ${filePath}:`, e.message)
     return false
@@ -277,6 +300,13 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
 // maxBytes / options 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限、超限判 tooLarge），
 // 调用方可据此对这条读取入口显式设限（审查 STG-05：非法值由 readSafeTextResult 统一告警），
 // 或以 options.tail 只读尾部（审查 SS-03）。
+//
+// C3-015（契约收口）：本函数把**全部**非 ok 状态（missing / ioError / unsafe / tooLarge /
+// replaced / shortRead）折叠成 null —— 调用方无法区分「文件不存在」与「文件存在但读不出」，
+// 因此**不得**用它的返回值判断存在性，也不得据此做隔离/重建决策。需要区分原因时一律用
+// readSafeTextResult（返回 {status, text, error, empty, shortRead, truncated}）。
+// 现状：仓内生产代码没有调用方（仅 test_storage.js 覆盖本入口），故保留签名与语义不变；
+// 若将来新增生产调用方，必须先确认它要的是「内容或 null」而不是五种状态之一。
 function readSafeText (filePath, maxBytes, options) {
   const result = readSafeTextResult(filePath, maxBytes, options)
   return result.status === 'ok' ? result.text : null

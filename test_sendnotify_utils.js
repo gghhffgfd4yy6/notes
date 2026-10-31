@@ -665,8 +665,276 @@ function assertSettled (outcome, label, why) {
       assert.strictEqual(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c3), false,
         '截断不得留下孤立代理（代理对必须整体保留或整体丢弃）')
       assert.ok(Buffer.byteLength(c3, 'utf8') <= 4096, '代理对场景同样不得超预算')
-      console.log('✅ PlanD truncateBytes：经企微通道观测字节级截断（短正文原样 / 超长 ≤4096 且合法 UTF-8 / 代理对不孤立）')
+      // ④ C8-010：按字节截断必须是**二分**（log2(maxBytes) 级探测），不是逐字符回退（O(n²)）。
+      // 判据取「Buffer.byteLength 调用次数」这一确定性量，而不是计时：旧实现（逐字符 cut = cut.slice(0,-1)）
+      // 同一输入实测 2637 次，二分 13 次，差两个数量级；计时断言在 CI 上正是本仓已登记 flake 的来源
+      // （见 test_sendnotify_pure.js 的 PERF_MS 缩放小节），故这里用可数不变量锁住形状。
+      captured.length = 0
+      const origByteLength = Buffer.byteLength
+      let byteLengthCalls = 0
+      Buffer.byteLength = function (...args) { byteLengthCalls++; return origByteLength.apply(Buffer, args) }
+      try {
+        await slim.sendNotify('T', '中'.repeat(4000)).catch(() => {})
+      } finally {
+        Buffer.byteLength = origByteLength
+      }
+      assert.ok(byteLengthCalls < 100,
+        `truncateBytes 必须二分（同一输入逐字符回退实测 2637 次 byteLength），实际 ${byteLengthCalls} 次`)
+      console.log('✅ PlanD truncateBytes：经企微通道观测字节级截断（短正文原样 / 超长 ≤4096 且合法 UTF-8 / 代理对不孤立 / 二分形状）')
     } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== C8-008：结算与日志分离（一条回调只有一个出口）=====
+  // 缺陷形状（改动前）：六个通道把「成功日志」和「结算」写在同一条 try/catch/finally 里——
+  //   · 成功日志在 try 内、结算在 finally 里：cron 管道关闭（EPIPE）时 console.log 抛错，
+  //     catch 把它当通道失败 reject ⇒ 已送达的消息被重新推一遍（重复轰炸）；
+  //   · finally 的 `resolve(data)` 无条件：将来任何一处漏掉 reject 或中途 return，失败会被洗成成功。
+  // 判据：把 console.log 换成「成功日志一调用就抛 EPIPE」，交付结果必须仍是成功。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    let replyBody = { ok: true, result: { message_id: 1 } }
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = () => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => {
+        em.emit('response', { statusCode: 200, headers: {}, timings: {} })
+        em.emit('data', Buffer.from(JSON.stringify(replyBody)))
+        em.emit('end')
+      })
+      return em
+    }
+    const origLog = console.log
+    // 模拟 cron 管道关闭：只在「成功日志」上抛，其余日志照常（避免把无关路径搅乱）
+    const installEpipeOnSuccessLog = () => {
+      console.log = function (...args) {
+        if (String(args[0]).includes('发送通知消息成功')) {
+          const e = new Error('write EPIPE')
+          e.code = 'EPIPE'
+          throw e
+        }
+        return origLog.apply(console, args)
+      }
+    }
+    try {
+      clearCfg()
+      cfg.TG_BOT_TOKEN = 'probe-tg-token'
+      cfg.TG_USER_ID = 'probe-tg-user'
+      // ① 成功响应 + 成功日志抛 EPIPE：交付必须仍是成功（旧实现：catch 收走 → reject → 全通道失败）
+      installEpipeOnSuccessLog()
+      let outcome = null
+      let failure = null
+      try { outcome = await slim.sendNotify('T', 'D') } catch (e) { failure = e }
+      console.log = origLog
+      assert.strictEqual(failure, null, `成功日志抛错不得把已送达的消息判失败（实际抛出：${failure && failure.message}）`)
+      assert.deepStrictEqual(outcome && outcome.successfulChannels, ['telegram'], '日志抛错时通道必须仍记为成功')
+      assert.deepStrictEqual(outcome && outcome.failures, [], '成功分支不得产生任何 failure 记录')
+      // ② 失败响应 + 失败日志抛错：仍必须判失败（日志不参与结算的另一侧）
+      replyBody = { ok: false, description: 'tg-boom' }
+      console.log = function (...args) {
+        if (String(args[0]).includes('发送通知消息异常')) {
+          const e = new Error('write EPIPE')
+          e.code = 'EPIPE'
+          throw e
+        }
+        return origLog.apply(console, args)
+      }
+      failure = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { failure = e }
+      console.log = origLog
+      assert.strictEqual(failure && failure.code, 'ALL_CHANNELS_FAILED', '失败日志抛错不得把失败洗成成功')
+      assert.strictEqual(failure.failures[0].channel, 'telegram', '失败必须仍归因到 telegram')
+    } finally {
+      console.log = origLog
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+    console.log('✅ C8-008 结算与日志分离：成功日志抛 EPIPE 仍判成功 / 失败日志抛错仍判失败')
+  }
+  // ③ 源码形状：通道回调不得再把结算写进 finally（否则「成功日志在 try 内 + finally 无条件 resolve」
+  // 这条缺陷会以任何一处漏写 reject / 中途 return 的形式复活）。扫描方式：从 `finally {` 起按花括号
+  // 配平找到块尾，块内不得出现 resolve/reject/innerResolve 调用。
+  {
+    const srcPath = require('node:path').join(__dirname, 'xbk_sendNotify_slim.js')
+    const lines = require('node:fs').readFileSync(srcPath, 'utf8').split('\n')
+    const settlingFinally = []
+    for (let i = 0; i < lines.length; i++) {
+      const m = /\bfinally\s*\{/.exec(lines[i])
+      if (!m) continue
+      // 只从 finally 自身的 '{' 之后开始配平——同一行左侧往往还有上一块的 '}'，
+      // 从行首起算会把 depth 立刻配平到 0，扫出来永远是 0 处（假绿）。
+      const startIdx = m.index + m[0].length - 1
+      let depth = 0
+      for (let j = i; j < lines.length; j++) {
+        const from = j === i ? startIdx : 0
+        for (let k = from; k < lines[j].length; k++) {
+          const ch = lines[j][k]
+          if (ch === '{') depth++
+          else if (ch === '}') depth--
+        }
+        const text = j === i ? lines[j].slice(startIdx) : lines[j]
+        if (j > i && /\b(resolve|reject|innerResolve)\s*\(/.test(text)) settlingFinally.push(j + 1)
+        if (depth <= 0) break
+      }
+    }
+    assert.deepStrictEqual(settlingFinally, [],
+      `finally 块内不得结算 Promise（C8-008 单一出口），命中行：${settlingFinally.join(', ')}`)
+    console.log('✅ C8-008 源码形状：finally 块内零结算调用')
+  }
+
+  // ===== C8-009：通道清单单一真源（启用判定 == 实际执行的通道）=====
+  // 缺陷形状（改动前）：同一份 9 通道清单在 configuredChannelCount / configuredChannelNames /
+  // sendNotify 的 configuredFlags / channelTasks 各抄一遍，flags[i] 与 tasks[i] 只靠下标对齐——
+  // 加删通道要改 4 处，写反一个就让「已配置的通道」与「真正被调用的通道」分叉（静默失效）。
+  // 判据：逐个只配一个通道时，计数/名单/实际失败归因三者必须都指向同一个名字。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = () => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => em.emit('error', new Error('probe-no-io')))
+      return em
+    }
+    // 顺序即历史日志顺序（Push+ / Server酱 / Bark / 企微 / wxpusher / 息知 / PushDeer / PushMe / TG）
+    const CASES = [
+      ['pushplus', { PUSH_PLUS_TOKEN: 'probe-plus-token' }],
+      ['server酱', { PUSH_KEY: 'SCTprobe' }],
+      ['bark', { BARK_PUSH: 'probe-bark-device' }],
+      ['企业微信', { QYWX_KEY: 'probe-qywx-key' }],
+      ['wxpusher', { WX_pusher_appToken: 'AT_probe_token' }],
+      ['息知', { WX_XIZHI_KEY: 'https://xizhi.example/probe' }],
+      ['pushdeer', { DEER_KEY: 'probe-deer-key' }],
+      ['pushme', { PUSHME_KEY: 'probe-pushme-key' }],
+      ['telegram', { TG_BOT_TOKEN: 'probe-tg-token', TG_USER_ID: 'probe-tg-uid' }]
+    ]
+    try {
+      for (const [name, conf] of CASES) {
+        clearCfg()
+        Object.assign(cfg, conf)
+        assert.strictEqual(configuredChannelCount(), 1, `${name}：单独配置时计数必须恰好 1`)
+        assert.deepStrictEqual(configuredChannelNames(), [name], `${name}：单独配置时名单必须恰好只有自己`)
+        const tracker = {}
+        let err = null
+        try { await slim.sendNotify('T', 'D', { inFlightTracker: tracker }) } catch (e) { err = e }
+        assert.strictEqual(err && err.code, 'ALL_CHANNELS_FAILED', `${name}：探针应让该通道失败而不是静默跳过`)
+        assert.strictEqual(err.failures.length, 1, `${name}：只应有一个通道被调用（多调用说明清单重复）`)
+        assert.strictEqual(err.failures[0].channel, name,
+          `${name}：实际执行的通道名必须与启用清单一致（flags/tasks 下标错位会在此变红）`)
+        assert.deepStrictEqual(tracker.pending, [], `${name}：在飞清单必须随结算清空`)
+      }
+      // 全家桶：名单顺序必须与历史日志顺序逐字一致（顺序漂移会让日志/归因的既有读者错位）
+      clearCfg()
+      for (const [, conf] of CASES) Object.assign(cfg, conf)
+      assert.deepStrictEqual(configuredChannelNames(),
+        ['pushplus', 'server酱', 'bark', '企业微信', 'wxpusher', '息知', 'pushdeer', 'pushme', 'telegram'],
+        '九通道名单与顺序必须由同一张表派生')
+      assert.strictEqual(configuredChannelCount(), 9, '九通道全配置时计数必须为 9')
+      console.log('✅ C8-009 通道清单单一真源：9 个通道逐个「计数 / 名单 / 实际执行」三者一致 + 全家桶顺序不变')
+    } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
+  // ===== C8-003：多目标通道部分成功必须逐目标记账 =====
+  // 缺陷形状（改动前）：Bark/PushMe 多目标（# 分割）「至少一个成功 = 通道成功」时只 resolve()，
+  // 失败目标零记账——坏设备/坏 key 每轮失败、每轮被「至少一个成功」盖住，调用方只看到通道成功。
+  // 判据：failures 语义不变（既有「部分成功不得记失败」契约，red 线不动），但 partialFailures
+  // 必须逐目标出现（channel + 脱敏 target + partial 标记），并有一条点名告警进日志。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    let handler = () => ({ body: { code: 200 } })
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = (url) => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      const reply = handler(String(url))
+      setImmediate(() => {
+        if (reply.error) { em.emit('error', reply.error); return }
+        em.emit('response', { statusCode: 200, headers: {}, timings: {} })
+        em.emit('data', Buffer.from(typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body)))
+        em.emit('end')
+      })
+      return em
+    }
+    const warns = []
+    const origWarn = console.warn
+    console.warn = function (...args) { warns.push(args.map(String).join(' ')) }
+    try {
+      clearCfg()
+      cfg.BARK_PUSH = 'https://api.day.app/c8ok#https://api.day.app/c8bad'
+      handler = (url) => ({ body: url.includes('c8ok') ? { code: 200 } : { code: 500, message: 'device key invalid' } })
+      const res = await slim.sendNotify('T', 'D')
+      // ① 通道整体仍算成功（v3.166 语义与缓存写入口径不动）
+      assert.deepStrictEqual(res.successfulChannels, ['bark'], '一成一败仍算通道成功')
+      assert.deepStrictEqual(res.failures, [], 'failures 语义不变：部分成功不得记成通道失败')
+      // ② 但失败目标必须逐条透出（旧实现这里是 undefined ⇒ 红）
+      assert.ok(Array.isArray(res.partialFailures), 'sendNotify 必须返回 partialFailures 数组（旧实现无此字段）')
+      assert.strictEqual(res.partialFailures.length, 1, '恰好一个目标失败时必须恰好一条 partialFailure')
+      const pf = res.partialFailures[0]
+      assert.strictEqual(pf.channel, 'bark', 'partialFailure 必须点名通道')
+      assert.strictEqual(pf.partial, true, '必须带 partial 标记（与真通道失败区分）')
+      assert.match(pf.message, /部分目标发送失败/, `文案必须说明是目标级失败，实际：${pf.message}`)
+      assert.strictEqual(pf.statusCode, 200, '目标级失败必须透出 HTTP 状态码（来自 response 形参）')
+      assert.strictEqual(pf.providerCode, 500, '目标级失败必须透出业务码')
+      assert.ok(typeof pf.target === 'string' && pf.target.length > 0, 'partialFailure 必须带脱敏目标标识')
+      assert.strictEqual(pf.target.includes('c8bad'), false, `目标标识必须已脱敏，不得回显设备码：${pf.target}`)
+      // ③ 日志里必须有一条点名告警（cron/run.log 的读者据此发现坏目标）
+      assert.ok(warns.some(w => w.includes('部分目标发送失败') && w.includes('bark')),
+        `必须有一条点名告警进日志，实际 warn：${JSON.stringify(warns)}`)
+      // ④ PushMe 同口径
+      clearCfg()
+      cfg.PUSHME_KEY = 'pmok1#pmbad2'
+      let pmCalls = 0
+      gotMod.stream.post = (url) => {
+        const em = new EventEmitter()
+        em.destroy = () => {}
+        pmCalls++
+        const body = pmCalls === 1 ? 'success' : 'error'
+        setImmediate(() => {
+          em.emit('response', { statusCode: 200, headers: {}, timings: {} })
+          em.emit('data', Buffer.from(body))
+          em.emit('end')
+        })
+        return em
+      }
+      const pmRes = await slim.sendNotify('T', 'D')
+      assert.deepStrictEqual(pmRes.successfulChannels, ['pushme'], 'PushMe 一成一败仍算通道成功')
+      assert.deepStrictEqual(pmRes.failures, [], 'PushMe 部分成功不得记通道失败')
+      assert.strictEqual(pmRes.partialFailures.length, 1, 'PushMe 必须逐 key 透出失败目标')
+      assert.strictEqual(pmRes.partialFailures[0].channel, 'pushme', 'PushMe partialFailure 必须点名通道')
+      // ⑤ 全失败走原路径：不得同时产生 partialFailures（两种记账只能二选一）
+      clearCfg()
+      cfg.BARK_PUSH = 'https://api.day.app/bad1#https://api.day.app/bad2'
+      let err = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { err = e }
+      assert.strictEqual(err && err.code, 'ALL_CHANNELS_FAILED', '全设备失败必须整体上抛')
+      assert.strictEqual(err.failures.length, 1, '全失败仍是通道级聚合（不是逐目标 partial）')
+      console.log('✅ C8-003 多目标部分成功：failures 语义不变 + partialFailures 逐目标（脱敏/状态码/业务码）+ 点名告警')
+    } finally {
+      console.warn = origWarn
       if (origStreamPost) gotMod.stream.post = origStreamPost
       clearCfg()
       for (const [k, v] of Object.entries(saved)) cfg[k] = v

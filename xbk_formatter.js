@@ -2,6 +2,42 @@
 
 /* eslint indent: off */
 // Formatter extracted verbatim; integration remains the main entrypoint's responsibility.
+
+// C10-055：引号属性值区间的容器。旧实现是 Set<index> 逐字符 add——未闭合引号要一直加到串尾，
+// 一个 100k 串就是 10 万个键；更糟的是 htmlToMarkdown 每轮要建 3 遍（h/a/script/style 三次
+// _replaceTagged 各扫一遍同一份 html）。改为 [from, to) 区间数组 + 二分判定：
+// 登记是 O(1)、判定是 O(log k)，并配一份「上一次结果」缓存让三次调用共享同一份区间表。
+// 对外保持既有调用面（.has(index) / .size / 可展开），测试与 _replaceTagged 都不必改。
+class QuotedSpanView {
+  constructor (spans) {
+    this.spans = spans
+    let total = 0
+    for (const [from, to] of spans) total += to - from
+    this.size = total
+  }
+
+  has (index) {
+    const spans = this.spans
+    let lo = 0
+    let hi = spans.length - 1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      const span = spans[mid]
+      if (index < span[0]) hi = mid - 1
+      else if (index >= span[1]) lo = mid + 1
+      else return true
+    }
+    return false
+  }
+
+  // 仅测试/调试用（展开成具体索引）：正常路径只用 has()，不物化任何下标
+  * [Symbol.iterator] () {
+    for (const [from, to] of this.spans) {
+      for (let k = from; k < to; k++) yield k
+    }
+  }
+}
+
 function createFormatter ({ Utils, safeRe }) {
   if (!Utils || typeof safeRe !== 'function') throw new TypeError('createFormatter requires Utils and safeRe')
   // 模板占位符全集（与 xbk_app.js SUPPORTED_TPL_KEYS 及 tuisong_replace 的 map 键一致）：单趟
@@ -13,6 +49,8 @@ function createFormatter ({ Utils, safeRe }) {
   // 注：xbk_pusher.js 的 HTML_LIKE_MAX_LEN 同值但独立持有——那里 Utils 是注入依赖、缺
   // truncateUtf16 时要退回本地代理对退位实现，跨文件合并常量得同时改注入契约，不在本次范围。
   const HTML_TEXT_MAX_LEN = 100000
+  // C10-055：最近一次 _quotedAttrSpans 的结果（同一次转换里 h/a/script/style 三次调用共用；只留一份）
+  let attrSpanCache = null
   const Formatter = {
   /** Markdown 收尾：合并连续换行 + 去首尾空白（短路与正常路径共用） */
   _finalizeMd (s) {
@@ -163,7 +201,10 @@ function createFormatter ({ Utils, safeRe }) {
    *  <a>/<h1>（审查 2026-09-14 F-03）。定界符引号未闭合时仍按 HTML 语义延伸到串尾
    *  （引号状态中的 > 不结束标签），与 _findTagEnd 的退化口径一致。 */
   _quotedAttrSpans (html) {
-    const inside = new Set()
+    // 三次 _replaceTagged 传的是同一份 html ⇒ 单槽缓存让区间表只建一次（C10-055）。
+    // 缓存键用字符串本身（不可变，同值即可复用），只留最近一份，不累积内存。
+    if (attrSpanCache !== null && attrSpanCache.html === html) return attrSpanCache.view
+    const spans = []
     let inTag = false
     let lastNonWs = ''
     let i = 0
@@ -184,25 +225,26 @@ function createFormatter ({ Utils, safeRe }) {
         continue
       }
       if ((c === '"' || c === "'") && lastNonWs === '=') {
-        i = this._markQuotedSpan(html, c, i, inside)
+        i = this._markQuotedSpan(html, c, i, spans)
         lastNonWs = '' // 属性值消费完：闭合引号之后的字符重新起算，避免沿用旧的 =
         continue
       }
       if (!/\s/.test(c)) lastNonWs = c
       i++
     }
-    return inside
+    const view = new QuotedSpanView(spans)
+    attrSpanCache = { html, view }
+    return view
   },
 
-  /** 标记单个引号属性值跨度（供 _quotedAttrSpans 使用）：返回扫描结束位置；未闭合引号视为延伸到串尾。 */
+  /** 标记单个引号属性值跨度（供 _quotedAttrSpans 使用）：返回扫描结束位置；未闭合引号视为延伸到串尾。
+   *  C10-055：生产路径传区间数组（O(1) 登记一个 [from, to)）；仍接受 Set 以便既有调用面（测试/调试）不变。 */
   _markQuotedSpan (html, quote, from, inside) {
     const closeQ = html.indexOf(quote, from + 1)
-    if (closeQ === -1) {
-      for (let k = from + 1; k < html.length; k++) inside.add(k)
-      return html.length
-    }
-    for (let k = from + 1; k < closeQ; k++) inside.add(k)
-    return closeQ + 1
+    const to = closeQ === -1 ? html.length : closeQ
+    if (Array.isArray(inside)) inside.push([from + 1, to])
+    else for (let k = from + 1; k < to; k++) inside.add(k)
+    return closeQ === -1 ? html.length : closeQ + 1
   },
 
   htmlToMarkdown (shuju) {

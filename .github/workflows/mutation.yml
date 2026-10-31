@@ -231,7 +231,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-544"
+            mutate: "xbk_function_v3.js:1-571"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -271,14 +271,14 @@ jobs:
             src: "xbk_utils.js"
             mutate: "xbk_utils.js"
             config: "stryker.tap.config.js"
-          # sendnotify（1891 行，C8-001 单通道预算后重算）拆 2 段（v3.313 通知点击直达后重算；原 v3.279 基线 1612 行）
+          # sendnotify（1969 行，C8-003 目标级失败透出后重算）拆 2 段（v3.313 通知点击直达后重算；原 v3.279 基线 1612 行）
           - name: sendnotify-part1
             src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
             config: "stryker.tap.config.js"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1891"
+            mutate: "xbk_sendNotify_slim.js:751-1969"
             config: "stryker.tap.config.js"
           # 小文件各一任务
           - name: failure-policy
@@ -313,10 +313,17 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 6995 行（CR-05 导入回滚 +13 行后同步；历史上 W1-C2-023 删死代码 formatMs 净 -4 行、b3 C2-002/C2-004 +41 行、定位重构 +3 行都需同步；历史实测：2384 行时 2678 变异体，密度 ≈1.12 体/行）⇒ 全量约 7778 体，变异评估
+          # console.js 7111 行（C10-057/C10-053 净 -2 行后同步：摘要正则收敛为单一真源、日期回环校验
+          # 收敛到 isRealDayKey——两处都是删重复实现。此前本批 +74 行后同步：请求体上限/保留数常量化 +9、
+          # 条件 tag 按解码后参数名
+          # 剔 token +15、墓碑计数加 (ino,size,mtimeMs) 缓存 +30、过滤摘要折入编译生效维度 +11、导入幂等键
+          # 改按上传字节 +4、时区偏移收敛常量 +5；此前 C2-015 分发器兜底 + C2-014 单因子登录限速 +39 行、
+          # C2-010 抽 commitFilterOverride 净 +5 行后同步；历史上 CR-05 导入回滚 +13 行、W1-C2-023 删死代码
+          # formatMs 净 -4 行、b3 C2-002/C2-004 +41 行、定位重构 +3 行都需同步；历史实测：2384 行时 2678
+          # 变异体，密度 ≈1.12 体/行）⇒ 全量约 7964 体（7111 × 1.12），变异评估
           # 成本 ≈ 变异体数 × 13.3s（C=8，历史成功段实测：524 体 117min、866 体 192min，每变异体恒定 ~13.3s）
-          # ⇒ 整段 ≈ 1660min、远超 step 330min 上限。按上限倒推取 12 片（末片 849 行实测 >330min 被杀，再对半：
-          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-6982，末四片约 400 / 600 / 700 / 482 行
+          # ⇒ 整段 ≈ 1765min（7964 × 13.3s）、远超 step 330min 上限。按上限倒推取 12 片（末片 849 行实测 >330min 被杀，再对半：
+          # 3251-3675 / 3676-4370 / 4371-4800 / 4801-5200 / 5201-5800 / 5801-6500 / 6501-7111，末四片约 400 / 600 / 700 / 611 行
           # ≈100-200min（700 行 × 1.12 体/行 × 13.3s 估 ≈174min，仍低于 330min；v3.374 合 SSE + 信任设备后按 700 行硬上限新开 part12）。
           # 行段连续不重叠全覆盖（check-mutation-ranges 校验）；段名与 mutation-report EXPECTED_SEGMENTS 双向对账。
           # `timeout_ms: 60000`（仅这 12 段）：单次变异体运行的等待上限从配置文件的 300000ms 降到 60000ms。
@@ -380,7 +387,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part12
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6501-6995"
+            mutate: "scripts/console.js:6501-7111"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

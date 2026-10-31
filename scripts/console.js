@@ -25,7 +25,7 @@ const qrcode = require('qrcode-generator')
 // v3.363：只读快照端点的条件请求（ETag/304）。零传递依赖（etag 自身无依赖），
 // 与「青龙 --omit=dev 只装 dependencies」的部署约束兼容。
 const etag = require('etag')
-const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, isRealDayKey } = require('./status')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
@@ -117,6 +117,20 @@ const BACKUP_CATEGORIES = ['messages', 'filter', 'settings', 'auto', 'runLog']
 // 「当前条数不可得」），需要精确条数时去推送记录页看 grandTotal。阈值内的文件走
 // readMessages 的 (ino,size,mtime) 缓存，重复请求不再 parse。
 const CACHE_HEALTH_COUNT_MAX_BYTES = 8 * 1024 * 1024
+// 运行记录保留条数（C2-028）：runs 是进程内存表，只留最近 N 轮给 /api/runs 与取消端点。
+const RUNS_KEEP_MAX = 20
+// 请求体上限（C2-028）：按端点语义集中命名，不再在各处散落行内字面量。
+// 默认 4096 = JSON 写端点（关注词 / 2FA / 自动运行 / 控制台设置 / 通知自检）的公共上限；
+// 登录表单 2048 = token + 6 位验证码，更大的 body 一定不是本表单；
+// 备份导出 16KiB = 只带一个 categories 数组。
+const BODY_DEFAULT_MAX_BYTES = 4096
+const BODY_LOGIN_FORM_MAX_BYTES = 2048
+const BODY_BACKUP_EXPORT_MAX_BYTES = 16 * 1024
+// 世界时 → 上海时间的固定偏移（C2-021）：中国无夏令时，UTC+8 即 Asia/Shanghai。需要按
+// 「北京日历日/时分」做**算术**的地方一律走这个常量，不要再手写「+8 小时」的毫秒数——多写一处
+// 就多一个漏改点（导出文件名、run.log 时间戳解析、趋势日窗三处曾各写一份，还混着 8*60*60 变体）。
+// 展示字符串仍走 xbk_utils.shanghaiStamp（Intl + ICU 兜底），两者语义同一时区。
+const SHANGHAI_OFFSET_MS = 8 * 3600 * 1000
 // 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
 // LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
 const LOG_VIEW_MAX_BYTES = 1024 * 1024
@@ -160,6 +174,38 @@ const LINE_WATCH_INTERVAL_MAX_MIN = 1440
 const LINE_WATCH_SENT_MAX = 200
 // 调度器每 30s 看一次是否到点；实际间隔由配置决定（默认 10 分钟）。
 const LINE_WATCH_TICK_MS = 30 * 1000
+
+// 上游响应体读取（C2-011）：搜索页与详情页此前各写一份「流式边读边计字节 + 非流回退」。
+// 两处字节口径现已一致（流式都按 Buffer 长度、非流都按 Buffer.byteLength），但副本仍在——
+// 上限、取消读流、超限文案各写一遍，改一处必漏一处。收成一份：
+// 返回 { ok:true, text } 或 { ok:false, code:'too_large'|'read_failed' }，具体文案由调用方给。
+async function readUpstreamTextCapped (upstream, maxBytes) {
+  try {
+    const stream = upstream.body
+    if (stream && typeof stream.getReader === 'function') {
+      const reader = stream.getReader()
+      const chunks = []
+      let total = 0
+      for (;;) {
+        const step = await reader.read()
+        if (step.done) break
+        const chunk = Buffer.from(step.value)
+        total += chunk.length
+        if (total > maxBytes) {
+          try { await reader.cancel() } catch (e) { /* 已断开 */ }
+          return { ok: false, code: 'too_large' }
+        }
+        chunks.push(chunk)
+      }
+      return { ok: true, text: Buffer.concat(chunks).toString('utf8') }
+    }
+    const text = await upstream.text()
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) return { ok: false, code: 'too_large' }
+    return { ok: true, text }
+  } catch (e) {
+    return { ok: false, code: 'read_failed' }
+  }
+}
 
 // ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
 // 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
@@ -538,9 +584,9 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     _lockToken: lockToken
   }
   runs.set(id, record)
-  if (runs.size > 20) {
-    // 只保留最近 20 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
-    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - 20)
+  if (runs.size > RUNS_KEEP_MAX) {
+    // 只保留最近 RUNS_KEEP_MAX 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
+    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - RUNS_KEEP_MAX)
     for (const k of oldest) runs.delete(k)
   }
   // 环境继承：剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，
@@ -912,7 +958,7 @@ function exportStamp (now = new Date()) {
   // 不再切 accessStamp 的字符串：它 ICU 异常时兜底 ISO（UTC），照切会把 UTC 时分标成北京时间
   // （Sourcery #315-8）。中国无夏令时，直接 +8 与 Asia/Shanghai 等价。
   // 精确到秒：同一分钟内连导两次不会撞名、后一次不会覆盖前一次（Sourcery #315-7）。
-  const t = (now instanceof Date ? now.getTime() : Date.now()) + 8 * 3600 * 1000
+  const t = (now instanceof Date ? now.getTime() : Date.now()) + SHANGHAI_OFFSET_MS
   const d = new Date(t)
   const p2 = (n) => String(n).padStart(2, '0')
   return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}-${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}`
@@ -1004,7 +1050,9 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, runsList, query, sessionToken, theme, instanceId = '') {
+function renderPage (state, query, sessionToken, theme, instanceId = '') {
+  // C2-016：旧签名的第二个参数 runsList 从未被使用（`/` 的 HTML 壳不含 run 列表，列表走
+  // /api/runs），调用方却每次打开页面都对全部 runs 排一次序。参数已删，排序一并去掉。
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
   // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
@@ -1662,12 +1710,27 @@ function authorize (req, token, urlQuery) {
 // 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
 // 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
 // 凭证，同一份内容按不同凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+// 参数名的解码口径与 Utils._isTrackingQueryName 一致（`+` 还原成空格、decodeURIComponent、
+// 解码失败保留原串，且不做大小写折叠——authorize 的 URLSearchParams.get('token') 本身区分
+// 大小写）。authorize 认的 `?token=` 是 **URLSearchParams 解码后**的键，所以 `?%74oken=abc`
+// 同样是有效凭证，必须在这里一起剔掉——否则同一份内容会按 token 的编码写法算出两个 tag，
+// 条件缓存被凭空的变体打散（且 variant 里留着凭证片段）。
+function decodedQueryName (part) {
+  const eq = part.indexOf('=')
+  const rawName = eq < 0 ? part : part.slice(0, eq)
+  try {
+    return decodeURIComponent(rawName.replace(/\+/g, '%20'))
+  } catch (e) {
+    return rawName // 畸形 % 序列：保留原形，交给上层 URL 校验
+  }
+}
+
 function conditionalVariant (req) {
   const raw = String((req && req.url) || '')
   const qAt = raw.indexOf('?')
   if (qAt < 0) return raw
   const params = raw.slice(qAt + 1).split('&')
-    .filter((part) => part !== '' && part !== 'token' && !part.startsWith('token='))
+    .filter((part) => part !== '' && decodedQueryName(part) !== 'token')
   // 显式按码点比较：默认 sort() 会先转字符串再按 UTF-16 码元排，语义虽相同，但 Sonar
   // S2871 要求给出比较函数；同时避免依赖实现默认行为。
   params.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1768,7 +1831,28 @@ function parseSseCursor (raw) {
 
 // 超限后的排空上限（D2-S2）：客户端若只发一半就挂住，不能让连接无限期占着事件循环。
 const BODY_DRAIN_TIMEOUT_MS = 10 * 1000
-function readBody (req, maxBytes = 4096) {
+// C2-012：五个 JSON 写端点（关注词、2FA enable/disable、自动运行、控制台设置）此前各抄一份
+// 「readBody → aborted/over → JSON.parse(body||'{}') → 必须是对象」前言。除了重复，2FA 那两处
+// 还**漏了对象校验**（`[]`/`"x"`/`null` 会被当成空 payload 继续往下走，错误形态变成
+// 「验证码不对」而不是「body 必须是对象」）。收成一份：返回 { ok:true, payload } 或
+// { ok:false, status, body }，调用方只负责发包。
+function readJsonObjectBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
+  return readBody(req, maxBytes).then(({ body, aborted, over }) => {
+    if (aborted) return { ok: false, status: 400, body: { error: '请求中断，动作未执行' } }
+    if (over) return { ok: false, status: 413, body: { error: '请求体超限' } }
+    let payload
+    try {
+      payload = JSON.parse(body || '{}')
+    } catch (e) {
+      return { ok: false, status: 400, body: { error: 'invalid_json' } }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { ok: false, status: 400, body: { error: 'body 必须是对象' } }
+    }
+    return { ok: true, payload }
+  })
+}
+function readBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
     let buf = ''
@@ -1897,7 +1981,9 @@ function runtimeFilterDeps () {
     re2Available: Boolean(RE2),
     isRe2Available: () => Boolean(RE2),
     explainFilter: v3 && typeof v3.explainFilter === 'function' ? v3.explainFilter : null,
-    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null
+    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null,
+    // FILTER-01：与 App.run 同口径的「编译生效」维度（缺导出时 filterHashOf 退回纯配置摘要）。
+    compileStateOf: v3 && typeof v3.compileStateOf === 'function' ? v3.compileStateOf : null
   }
   return filterDepsCache
 }
@@ -2109,6 +2195,69 @@ function rollbackFilterOverride (paths, previousText) {
   }
 }
 
+// C2-010：保存（POST /api/config/filter）、回滚（/restore）、导入（/api/backup/import）三处
+// 各写了一遍「备份当前覆盖文件 → 原子写新一代 → 合并生效 → 追加审计 → 审计失败回滚」。
+// 三份只差 action / 写入 label / 失败后由谁收尾，改一处必漏两处。收成一份：
+//   返回 { ok:true, revision, changedFields, hash } 或 { ok:false, status, body }（body 可直接下发）。
+//   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
+//   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
+//   computeHash=false 给导入用：它不返回 hash，也就不必为拿摘要去懒加载规则引擎。
+function commitFilterOverride ({
+  paths, deps, defaults, loaded, filterValue, action, actorToken,
+  writeLabel = '过滤规则覆盖文件', computeHash = true, rollbackOnAuditFailure = true
+}) {
+  const curRevision = loaded.source === 'corrupt' ? 0 : loaded.revision
+  // 改文件前先备份当前这一代：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
+  // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
+  let previousText = null
+  if (loaded.source === 'override' || loaded.source === 'corrupt') {
+    const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+    if (raw.status === 'ok') previousText = raw.text
+    // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
+    if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+      return { ok: false, status: 500, body: { error: 'backup_failed', code: 'backup_failed' } }
+    }
+  }
+  const nextRevision = curRevision + 1
+  const nextFile = {
+    schema: FilterStore.FILTER_RULES_SCHEMA,
+    revision: nextRevision,
+    filter: filterValue
+  }
+  if (!writeAtomic(paths.file, JSON.stringify(nextFile), writeLabel)) {
+    return { ok: false, status: 500, body: { error: 'write_failed', code: 'write_failed' } }
+  }
+  const nextActive = FilterStore.mergeActiveFilter({
+    defaults: defaults.filter,
+    keyword: defaults.keyword,
+    override: filterValue
+  })
+  const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
+  const hash = computeHash ? filterHashOf(deps, nextActive.filter, nextActive.keyword) : null
+  const audit = appendFilterAudit({
+    auditPath: paths.audit,
+    actor: actorOf(actorToken),
+    action,
+    revision: nextRevision,
+    changedFields
+  })
+  if (!audit.ok) {
+    // 审计不落地 ⇒ 本次写入整体作废，绝不报成功。
+    if (!rollbackOnAuditFailure) {
+      return { ok: false, status: 500, body: { error: audit.code, code: audit.code } }
+    }
+    const rolled = rollbackFilterOverride(paths, previousText)
+    return {
+      ok: false,
+      status: 500,
+      body: { error: audit.code, code: audit.code, rolledBack: rolled.ok, rollbackMode: rolled.mode }
+    }
+  }
+  // 剪枝只在整个提交（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
+  pruneFilterBackups(paths)
+  return { ok: true, revision: nextRevision, changedFields, hash }
+}
+
 // 字段级 diff：只报字段名（顺序与 FILTER_RULE_FIELDS 一致），值绝不入响应/日志。
 function diffFilterFields (before, after) {
   const out = []
@@ -2146,11 +2295,20 @@ function wideMatchFields (filter) {
   return out
 }
 
+// 过滤规则摘要：必须与运行期 App.run 的 filter.hash **同口径**——它算的是
+// Utils.filterHash(active.filter, zkt_gjc, RuleEngine.compileStateOf(compiledRules))，
+// 第三参是「规则实际编译生效」维度（re2 可用性 + 各字段是否编译出规则）。这里此前只传前两参，
+// 于是控制台返回的 hash 与运行期写进生效快照的 filter.hash 永远不相等（同一份规则两个值，
+// 「已生效」对账只能退回比 revision）。编译失败/依赖缺失时退化为纯配置摘要，不让摘要变成 null。
 function filterHashOf (deps, filter, keyword) {
   const zkt = keyword && typeof keyword.zkt_gjc === 'string' ? keyword.zkt_gjc : ''
   try {
     if (deps && typeof deps.filterHash === 'function') {
-      const hash = deps.filterHash(filter, zkt)
+      let compileState
+      if (typeof deps.compileStateOf === 'function' && deps.RuleEngine && typeof deps.RuleEngine.compileRules === 'function') {
+        try { compileState = deps.compileStateOf(deps.RuleEngine.compileRules(filter)) } catch (e) { compileState = undefined }
+      }
+      const hash = deps.filterHash(filter, zkt, compileState)
       if (typeof hash === 'string' && hash.length > 0) return hash
     }
   } catch (e) { /* 回退 sha256（deps 注入/Config 异常时仍给出稳定摘要） */ }
@@ -2412,7 +2570,7 @@ function decodeLineHtml (raw) {
 function parseLineStamp (stamp) {
   const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(typeof stamp === 'string' ? stamp : '')
   if (!m) return null
-  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - 8 * 60 * 60 * 1000
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])) - SHANGHAI_OFFSET_MS
   return Number.isFinite(ms) ? ms : null
 }
 
@@ -2672,7 +2830,7 @@ function filterMessageItems (items, cate, needle) {
 // datetime 缺失/非法的条目在时间窗模式下不展示（无法证明它属于窗口，不猜）。
 function filterMessagesByDays (items, days, now = Date.now()) {
   if (!(Number.isSafeInteger(days) && days > 0)) return items
-  const offsetMs = 8 * 3600 * 1000
+  const offsetMs = SHANGHAI_OFFSET_MS
   const todayKey = new Date(now + offsetMs).toISOString().slice(0, 10)
   const startKey = new Date(now - (days - 1) * 86400000 + offsetMs).toISOString().slice(0, 10)
   return items.filter((m) => {
@@ -2685,12 +2843,10 @@ function filterMessagesByDays (items, days, now = Date.now()) {
 // 自定义日期区间（v3.326）：from/to 为上海日历日 YYYY-MM-DD，闭区间，前缀比较与 days 同口径。
 // 非法格式/不存在的日期/颠倒区间一律忽略（宽松输入，与 days 越界回「全部」同一哲学，不 400）。
 // 正则无嵌套量词、定长锚定，无 ReDoS 面（本仓正则红线）。
+// C10-053：校验口径以 status.js 的 isRealDayKey 为唯一真源（原先这里是一份独立实现，
+// 回环校验的边界语义随两份代码各自演化——2026-02-30 会被 Date 归一化成 03-02，只测正则必漏）。
 function parseDayKey (v) {
-  if (typeof v !== 'string' || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(v)) return ''
-  const t = new Date(v + 'T00:00:00Z')
-  // 回环校验：2026-02-30 会被 Date 归一化成 03-02，必须与输入不等即拒。
-  if (Number.isNaN(t.getTime()) || t.toISOString().slice(0, 10) !== v) return ''
-  return v
+  return isRealDayKey(v) ? v : ''
 }
 
 function filterMessagesByRange (items, from, to) {
@@ -2817,12 +2973,14 @@ function statSafeMeta (p) {
   try {
     fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0))
     const st = fs.fstatSync(fd)
-    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null }
-    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs) }
+    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+    // ino 供 tombstoneCounts 的 (ino,size,mtimeMs) 缓存识别「同一份文件」：仅靠 size+mtime
+    // 抓不到同毫秒同大小的原子替换（inode 会变）。
+    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs), ino: st.ino }
   } catch (e) {
-    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null }
-    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null }
-    return { status: 'ioError', size: null, mtimeMs: null }
+    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null, ino: null }
+    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+    return { status: 'ioError', size: null, mtimeMs: null, ino: null }
   } finally {
     if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
   }
@@ -2839,12 +2997,34 @@ function statSafeMeta (p) {
 // 残余边界（登记）：meta 过闸后、read 开打前纳米级窗口内被换成 FIFO 仍会阻塞——该原语
 // （readSafeTextResult）被全部读取端点共用，在其内部加 O_NONBLOCK 属跨切面改动（影响 F1
 // 恢复链与既有变异基线），不在本 PR 范围；观测面已被 meta 闸收窄到「替换竞态」。
+// 墓碑计数缓存（C2-019）：/api/cache-health 每拍都会算一次墓碑计数，而墓碑文件上限 8MiB、
+// 整读 + JSON.parse 全压在 HTTP 事件循环上。墓碑只在裁剪/淘汰时整份原子替换，
+// (ino,size,mtimeMs) 三元组足以识别「同一份文件」；叠 60s TTL 兜底（同 status.readMessages 的
+// D2-S18 口径）。mtime 太新（<100ms）的文件不进缓存——写后立刻读必须看到新内容。
+// 只缓存 status==='ok'：unsafe/invalid/missing 是「此刻的状态」，缓存它们会把一次原子替换/
+// 人工修复挡在 TTL 之外。缓存值是不可变结果对象，调用方只读。
+const TOMBSTONE_CACHE_TTL_MS = 60 * 1000
+const TOMBSTONE_CACHE_MIN_AGE_MS = 100
+const TOMBSTONE_CACHE_MAX = 4
+const tombstoneCache = new Map()
+
+function tombstoneSignature (meta) {
+  if (!meta || meta.status !== 'ok') return null
+  if (Date.now() - meta.mtimeMs < TOMBSTONE_CACHE_MIN_AGE_MS) return null
+  return `${meta.ino}:${meta.size}:${meta.mtimeMs}`
+}
+
 function tombstoneCounts (stateDir, messagesFile) {
   const p = path.join(stateDir, `${messagesFile}.seen.json`)
   const counts = { id: 0, urlOnly: 0, idWithUrl: 0, anon: 0, total: 0 }
   const meta = statSafeMeta(p)
   if (meta.status === 'unsafe' || meta.status === 'ioError') {
     return { status: meta.status, bytes: null, counts }
+  }
+  const sig = tombstoneSignature(meta)
+  if (sig) {
+    const hit = tombstoneCache.get(p)
+    if (hit && hit.sig === sig && Date.now() - hit.at < TOMBSTONE_CACHE_TTL_MS) return hit.value
   }
   // FIFO TOCTOU（Sourcery High）：meta 闸与读之间路径可被换成 FIFO——readSafeTextResult
   // 开 openNonBlocking，open 立即返回（普通文件不变，FIFO→unsafe），绝不阻塞等写者。
@@ -2869,7 +3049,13 @@ function tombstoneCounts (stateDir, messagesFile) {
   } catch (e) {
     return { status: 'invalid', bytes, counts }
   }
-  return { status: 'ok', bytes, counts }
+  const value = { status: 'ok', bytes, counts }
+  if (sig) {
+    tombstoneCache.delete(p)
+    tombstoneCache.set(p, { sig, at: Date.now(), value })
+    while (tombstoneCache.size > TOMBSTONE_CACHE_MAX) tombstoneCache.delete(tombstoneCache.keys().next().value)
+  }
+  return value
 }
 
 // 缓存健康快照（GET /api/cache-health）：push.json 字节占用对照两级上限（生产写端 64MiB /
@@ -3360,9 +3546,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     lastRunId: auto.lastRunId
   })
   const persistAuto = () => {
+    // C2-007：改 writeAtomic（tmp + fsync + rename）——裸 writeFileSync 整写在崩溃/ENOSPC
+    // 时会在 autoPath 留下半截 JSON，重启读盘把它当「读取失败，按停止处理」，
+    // 自动运行开关被静默关掉；原子写只会有「旧文件」或「新文件」两态。
     try {
-      fs.writeFileSync(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }))
-      return true
+      if (writeAtomic(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }), '自动运行状态')) return true
+      console.error('⚠️ 自动运行状态落盘失败（进程内仍生效）')
+      return false
     } catch (e) {
       console.error(`⚠️ 自动运行状态落盘失败（进程内仍生效）：${e && e.message ? e.message : e}`)
       return false
@@ -3460,22 +3650,38 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     auto.startedAt = Date.now()
     scheduleAuto(auto.interval * 1000)
   }
-  // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
-  // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
+  // 读取持久化重放记录：返回 { entries, problem }。
+  // problem = null：正常，或文件根本不存在（首次启动）。非空字符串：**文件在、但读不出来**
+  // （EACCES/EISDIR、JSON 损坏、顶层不是对象、有条目字段非法）。
+  // C2-013：旧实现把这几类全折叠成「空窗」且不输出任何东西——重复推送保护无声失效，
+  // 运维看不出窗口记录已经丢了（重启后一次自动重试就能再跑一轮真实推送）。
   const readLastAccept = (p) => {
+    let text
     try {
-      const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
-      const out = []
-      if (parsed && typeof parsed === 'object') {
-        for (const [k, v] of Object.entries(parsed)) {
-          // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
-          const ridOk = v && typeof v.at === 'number' &&
-            (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
-          if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
-        }
-      }
-      return out
-    } catch (e) { return [] }
+      text = fs.readFileSync(p, 'utf8')
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return { entries: [], problem: null }
+      return { entries: [], problem: `读取失败（${e && e.code ? e.code : (e && e.message) || e}）` }
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch (e) {
+      return { entries: [], problem: '内容不是合法 JSON' }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { entries: [], problem: '顶层不是对象' }
+    }
+    const out = []
+    let dropped = 0
+    for (const [k, v] of Object.entries(parsed)) {
+      // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
+      const ridOk = v && typeof v.at === 'number' &&
+        (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
+      if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
+      else dropped += 1
+    }
+    return { entries: out, problem: dropped > 0 ? `${dropped} 条记录字段非法，已忽略` : null }
   }
   // ── v3.300 访问日志（内存环形，蓝图 §3.3）：闭包态，access-log 端点与 finish 钩子共用。
   const accessLog = []
@@ -3484,9 +3690,21 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 落盘到 stateDir/console-lastaccept.json（readStatus 同目录），受理时同步写、启动时回读。
   // 写入失败不阻断受理（主链路是单飞锁，落盘只是重放窗的持久化增强）。
   const lastAcceptPath = path.join(stateDir, 'console-lastaccept.json')
-  try {
-    for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
-  } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
+  // C2-007：重放窗记录同样走原子写。裸 writeFileSync 整写遇到崩溃/ENOSPC 会在
+  // lastAcceptPath 留下半截 JSON，重启后整份记录被当成「损坏 = 空窗」——窗口内的
+  // 自动重试就能穿透，重复跑一轮真实推送。writeAtomic 只留旧/新两态。
+  const persistLastAccept = () => writeAtomic(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)), '重放窗记录')
+  // C2-013：重放窗落在触发热路径上，每个问题只吵一次（逐次告警会把日志刷满）。
+  // 文案必须说清后果：按空窗处理 ⇒ 窗口内重试会被当成新触发，可能重复跑一轮真实推送。
+  let reportedLastAcceptProblem = ''
+  const reportLastAcceptProblem = (problem) => {
+    if (!problem || problem === reportedLastAcceptProblem) return
+    reportedLastAcceptProblem = problem
+    console.error(`⚠️ 重放窗记录（${lastAcceptPath}）不可用：${problem}。本进程按空窗处理——${Math.round(REPLAY_WINDOW_MS / 1000)} 秒窗口内的重试会被当成新触发，可能重复跑一轮真实推送；修复或删除该文件后重启即可恢复。`)
+  }
+  const persistedLastAccept = readLastAccept(lastAcceptPath)
+  reportLastAcceptProblem(persistedLastAccept.problem)
+  for (const [k, v] of persistedLastAccept.entries) lastAccept.set(k, v)
 
   // ── SSE 连接管理（v3.300 3.1）────────────────────────────────────────────
   // 按实例隔离（createConsole 闭包内，非模块级）：测试会创建多个 console 实例，
@@ -3727,9 +3945,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         if (!lockVerdict.ok) {
-          // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
+          // readLastAccept 返回 { entries, problem }（不是 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
-          const prevPrePair = persistedPre.find(([k]) => k === action)
+          reportLastAcceptProblem(persistedPre.problem)
+          const prevPrePair = persistedPre.entries.find(([k]) => k === action)
           const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
           // 窗口为 0 = 明确关闭拦截；时钟回拨（now < prev.at）时差值变成负数，若照常比较会
           // 把小负数也判成「还在窗内」，用户要等时钟追上来才能再触发——所以两个条件都要显式排除。
@@ -3743,7 +3962,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         const persisted = readLastAccept(lastAcceptPath)
-        for (const [k, v] of persisted) {
+        reportLastAcceptProblem(persisted.problem)
+        for (const [k, v] of persisted.entries) {
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
@@ -3765,9 +3985,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         lastAccept.set(action, { at: now, runId: 0 })
-        try {
-          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-        } catch (e) {
+        if (!persistLastAccept()) {
           // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
           // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
           // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
@@ -3789,10 +4007,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 关键：pending 帧已落盘（runId=0），只删内存会让下一次请求重读旧帧 → 整个
           // 重放窗都 409「重复提交」，但实际没有子进程跑过。这里把删除后的 Map 重新落盘；
           // 落盘失败只能告警（内存已回滚，本进程内可重试，重启后可能重现 409）。
-          try {
-            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-          } catch (persistErr) {
-            console.error(`⚠️ ${action} 启动失败后清理重放帧失败：${persistErr && persistErr.message ? persistErr.message : persistErr}`)
+          if (!persistLastAccept()) {
+            console.error(`⚠️ ${action} 启动失败后清理重放帧失败`)
           }
           const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
@@ -3802,9 +4018,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         record._lockAt = now
         lastAccept.set(action, { at: now, runId: record.id })
-        try {
-          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-        } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
+        // 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截。
+        persistLastAccept()
         sendJson(res, 202, { id: record.id, action, label: record.label })
       })
       .catch((e) => { logCaught('trigger/readBody', e); sendJson(res, 500, { error: '读取请求体失败' }) })
@@ -4083,7 +4298,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
   const handleBackupExport = (req, res) => {
-    readBody(req, 16 * 1024).then(({ body, over, aborted }) => {
+    readBody(req, BODY_BACKUP_EXPORT_MAX_BYTES).then(({ body, over, aborted }) => {
       if (over || aborted) { sendJson(res, over ? 413 : 400, { error: '请求体不完整或超限' }); return }
       let selected = BACKUP_CATEGORIES.slice()
       if (body && body.trim() !== '') {
@@ -4277,7 +4492,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       // 手动重试的幂等键：响应丢失后用户再点一次，不能把期间新产生的推送记录又覆盖回旧备份。
       const importKey = importKeyOf(req)
-      const bundleHash = sha256Hex(JSON.stringify(bundle))
+      // C2-018：摘要直接取**上传的原始字节**，不再 JSON.stringify(bundle) 把整份备份重新序列化
+      // 一遍——256MiB 上限下一次导入会因此多出一份等长字符串与整树遍历，纯属把峰值内存翻倍。
+      // 口径也更硬：幂等键认的是「同一份文件」（字节相同），不再是「语义等价的 JSON」；
+      // 备份里本来就带 exportedAt，两次导出不可能逐字相同，语义归一从未真正生效。
+      const bundleHash = sha256Hex(body)
       if (importKey) {
         const prior = readImportResult(importKey)
         if (prior) {
@@ -4320,7 +4539,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const saved = path.join(backupDir, target.name)
           try {
             if (fs.existsSync(saved)) {
-              fs.copyFileSync(saved, target.src)
+              // C2-008：回滚本身也在覆盖活文件，必须原子提交。copyFileSync 直接写目标，
+              // 中途被 kill / 磁盘满就把 push.json、run.log 截成半截文件——「回滚把数据弄坏」
+              // 比不回滚更难查。改走 writeAtomic（tmp + fsync + rename）：要么旧内容、
+              // 要么备份内容，不存在中间态。
+              const data = fs.readFileSync(saved)
+              if (!writeAtomic(target.src, data, `导入回滚 ${target.name}`)) {
+                throw new Error('原子写失败')
+              }
             } else {
               // 导入前文件不存在：写成功过才需要删；symlink/目录一律不碰，避免误删。
               let st = null
@@ -4439,49 +4665,28 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           imported.runLogBytes = Buffer.byteLength(plans.runLog.text, 'utf8')
         }
         // 过滤规则放最后：审计是它的提交点，审计失败时前面几类统一回滚，避免
-        // 「文件恢复了一半、审计没记录」的中间态。
+        // 「文件恢复了一半、审计没记录」的中间态。C2-010：与保存/回滚共用提交链，
+        // 但收尾交给 abortImport 的多文件回滚（rollbackOnAuditFailure:false）。
         if (plans.filter) {
           const loaded = loadCurrentFilter()
-          const current = loaded.source === 'corrupt' ? 0 : loaded.revision
-          let previousText = null
-          if (loaded.source === 'override' || loaded.source === 'corrupt') {
-            const raw = readSafeTextResult(filterPaths.file, FILTER_BODY_MAX_BYTES)
-            if (raw.status === 'ok') previousText = raw.text
-            if (loaded.source === 'override' && !backupFilterFile(filterPaths, current, previousText)) {
-              abortImport('filter', 500, { error: 'backup_failed', code: 'backup_failed' })
-              return
-            }
-          }
-          const nextFile = {
-            schema: FilterStore.FILTER_RULES_SCHEMA,
-            revision: current + 1,
-            filter: plans.filter.result.value
-          }
-          if (!writeAtomic(filterPaths.file, JSON.stringify(nextFile), '过滤规则恢复')) {
-            abortImport('filter', 500, { error: 'write_failed', code: 'write_failed' })
-            return
-          }
-          const defaults = filterDefaults()
-          const nextActive = FilterStore.mergeActiveFilter({
-            defaults: defaults.filter,
-            keyword: defaults.keyword,
-            override: plans.filter.result.value
-          })
-          const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-          const audit = appendFilterAudit({
-            auditPath: filterPaths.audit,
-            actor: actorOf(token),
+          const committed = commitFilterOverride({
+            paths: filterPaths,
+            deps: null,
+            defaults: filterDefaults(),
+            loaded,
+            filterValue: plans.filter.result.value,
             action: 'import',
-            revision: nextFile.revision,
-            changedFields
+            actorToken: token,
+            writeLabel: '过滤规则恢复',
+            computeHash: false,
+            rollbackOnAuditFailure: false
           })
-          if (!audit.ok) {
-            abortImport('filter', 500, { error: audit.code, code: audit.code })
+          if (!committed.ok) {
+            abortImport('filter', committed.status, { error: committed.body.error, code: committed.body.code })
             return
           }
-          pruneFilterBackups(filterPaths)
           imported.filter = true
-          imported.filterRevision = nextFile.revision
+          imported.filterRevision = committed.revision
         }
         // 所有文件都成功后才删草稿：中途失败时草稿仍是导入前那份，便于继续编辑。
         if (plans.filter) clearFilterDraftFile()
@@ -4593,62 +4798,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 保存前快照：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
-        // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
-        let previousText = null
-        if (loaded.source === 'override' || corrupt) {
-          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') previousText = raw.text
-          // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
-          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
-            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
-            return
-          }
-        }
-        const nextRevision = curRevision + 1
-        const nextFile = {
-          schema: FilterStore.FILTER_RULES_SCHEMA,
-          revision: nextRevision,
-          filter: result.value
-        }
-        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
-          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-          return
-        }
-        const nextActive = FilterStore.mergeActiveFilter({
-          defaults: defaults.filter,
-          keyword: defaults.keyword,
-          override: result.value
+        // C2-010：备份→原子写→合并生效→审计→失败回滚 统一走 commitFilterOverride。
+        const committed = commitFilterOverride({
+          paths, deps, defaults, loaded, filterValue: result.value, action: 'save', actorToken
         })
-        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        const audit = appendFilterAudit({
-          auditPath: paths.audit,
-          actor: actorOf(actorToken),
-          action: 'save',
-          revision: nextRevision,
-          changedFields
-        })
-        if (!audit.ok) {
-          // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
-          const rolled = rollbackFilterOverride(paths, previousText)
-          sendJson(res, 500, {
-            error: audit.code,
-            code: audit.code,
-            rolledBack: rolled.ok,
-            rollbackMode: rolled.mode
-          })
-          return
-        }
-        // 剪枝只在整个保存（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
-        pruneFilterBackups(paths)
+        if (!committed.ok) { sendJson(res, committed.status, committed.body); return }
         // 正式保存成功：没保存的草稿已经失去意义，删掉避免下次误恢复。
         clearFilterDraftFile()
         sendJson(res, 200, {
           ok: true,
-          revision: nextRevision,
-          changedFields,
-          hash,
+          revision: committed.revision,
+          changedFields: committed.changedFields,
+          hash: committed.hash,
           appliedHint: '下一轮生效'
         })
       } finally {
@@ -4855,62 +5016,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 改文件前先备份当前配置：被替换的这一代必须仍能从备份列表回滚回来。
-        let previousText = null
-        if (loaded.source === 'override' || loaded.source === 'corrupt') {
-          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') previousText = raw.text
-          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
-            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
-            return
-          }
-        }
-        const nextRevision = curRevision + 1
-        const nextFile = {
-          schema: FilterStore.FILTER_RULES_SCHEMA,
-          revision: nextRevision,
-          filter: toDefault ? {} : restoredFilter
-        }
-        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
-          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-          return
-        }
-        const nextActive = toDefault
-          ? FilterStore.mergeActiveFilter({ defaults: defaults.filter, keyword: defaults.keyword })
-          : FilterStore.mergeActiveFilter({
-            defaults: defaults.filter,
-            keyword: defaults.keyword,
-            override: restoredFilter
-          })
-        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        const audit = appendFilterAudit({
-          auditPath: paths.audit,
-          actor: actorOf(actorToken),
+        // C2-010：与保存/导入共用同一条提交链。
+        const committed = commitFilterOverride({
+          paths,
+          deps,
+          defaults,
+          loaded,
+          filterValue: toDefault ? {} : restoredFilter,
           action: toDefault ? 'reset_default' : 'restore',
-          revision: nextRevision,
-          changedFields
+          actorToken
         })
-        if (!audit.ok) {
-          const rolled = rollbackFilterOverride(paths, previousText)
-          sendJson(res, 500, {
-            error: audit.code,
-            code: audit.code,
-            rolledBack: rolled.ok,
-            rollbackMode: rolled.mode
-          })
-          return
-        }
-        // 剪枝只在整个回滚（含审计）成功后才执行。
-        pruneFilterBackups(paths)
+        if (!committed.ok) { sendJson(res, committed.status, committed.body); return }
         // 回滚/恢复默认也是一次正式写入，草稿随之作废。
         clearFilterDraftFile()
         const payload = {
           ok: true,
-          revision: nextRevision,
+          revision: committed.revision,
           restoredFrom: toDefault ? 'default' : to,
-          changedFields
+          changedFields: committed.changedFields
         }
-        if (!toDefault) payload.hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
+        if (!toDefault) payload.hash = committed.hash
         sendJson(res, 200, payload)
       } finally {
         releaseFilterLock(lock)
@@ -4989,40 +5114,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
       }
       // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
-      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
-      let text = ''
-      try {
-        const stream = upstream.body
-        if (stream && typeof stream.getReader === 'function') {
-          const reader = stream.getReader()
-          const chunks = []
-          let total = 0
-          for (;;) {
-            const step = await reader.read()
-            if (step.done) break
-            const chunk = Buffer.from(step.value)
-            total += chunk.length
-            if (total > LINE_SEARCH_MAX_BYTES) {
-              try { await reader.cancel() } catch (e) {}
-              return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-            }
-            chunks.push(chunk)
-          }
-          text = Buffer.concat(chunks).toString('utf8')
-        } else {
-          text = await upstream.text()
-          if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
-            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-          }
-        }
-      } catch (e) {
+      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存（C2-011 共用实现）。
+      const read = await readUpstreamTextCapped(upstream, LINE_SEARCH_MAX_BYTES)
+      clearTimeout(timer)
+      if (!read.ok) {
         return {
           ok: false,
-          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
+          error: read.code === 'too_large'
+            ? '线报酷返回内容过大，已放弃解析'
+            : (controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试')
         }
-      } finally {
-        clearTimeout(timer)
       }
+      const text = read.text
       const parsed = parseLineSearchHtml(text, baseUrl)
       if (!parsed.matched) {
         // 结构对不上 ≠ 没有结果：如实报错，别让调用方以为这个搜索词真的 0 条。
@@ -5084,28 +5187,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       })
       if (upstream && upstream.status >= 300 && upstream.status < 400) return { ok: false, error: '线报酷返回重定向，已中止' }
       if (!upstream || !upstream.ok) return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
-      let text = ''
-      const stream = upstream.body
-      if (stream && typeof stream.getReader === 'function') {
-        const reader = stream.getReader()
-        const chunks = []
-        let total = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          total += value.length
-          if (total > LINE_DETAIL_MAX_BYTES) {
-            try { await reader.cancel() } catch (e) {}
-            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-          }
-          chunks.push(value)
+      // 与搜索页共用同一套「流式计数 + 非流回退」（C2-011）：上限/取消/超限文案只维护一处。
+      const read = await readUpstreamTextCapped(upstream, LINE_DETAIL_MAX_BYTES)
+      if (!read.ok) {
+        return {
+          ok: false,
+          error: read.code === 'too_large'
+            ? '线报酷返回内容过大，已放弃解析'
+            : (controller.signal.aborted ? '线报酷响应超时（8s）' : '线报酷连接失败')
         }
-        text = Buffer.concat(chunks).toString('utf8')
-      } else {
-        text = await upstream.text()
-        if (Buffer.byteLength(text, 'utf8') > LINE_DETAIL_MAX_BYTES) return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
       }
-      const contentHtml = extractArticleHtml(text)
+      const contentHtml = extractArticleHtml(read.text)
       if (contentHtml === '') return { ok: false, error: '线报酷详情页结构变了（找不到正文）' }
       return { ok: true, value: { contentHtml } }
     } catch (e) {
@@ -5213,16 +5305,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
       return
     }
-    readBody(req)
-      .then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-          sendJson(res, 400, { error: 'body 必须是对象' })
-          return
-        }
+    readJsonObjectBody(req)
+      .then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
         const action = payload.action
         let state = readWatchState(stateDir)
         if (state.status === 'invalid') {
@@ -5372,6 +5458,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         candidates.reverse() // 旧→新：中途推送失败时锚点停在已推的最后一条，下轮接着推
         let count = 0
         let stopped = false
+        // C2-009：一个词只能产出一条结果。旧实现失败时先 push 带 error 的条目再 break，
+        // 循环外又无条件 push 一条「成功形态」的条目 ⇒ 同一个词在 results 里出现两次
+        // （前端一个标红一个标绿，状态自相矛盾）。改为记下失败原因、循环外统一 push 一次。
+        let failure = ''
         for (const item of candidates) {
           // 每条发送前重读状态：用户中途停用/删词/标已读或已推过，都不能再发。
           const live = readWatchState(stateDir)
@@ -5397,7 +5487,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             }
             await notifyWatch(title, body)
           } catch (e) {
-            results.push({ q: word.q, pushed: count, error: 'push_failed' })
+            failure = 'push_failed'
             break
           }
           count += 1
@@ -5405,11 +5495,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 推一条记一条：重新读盘再改，避免覆盖期间 UI 的增删/配置。
           const fresh = readWatchState(stateDir)
           if (fresh.status !== 'ok') {
-            results.push({ q: word.q, pushed: count, error: 'state_read_failed' })
+            failure = 'state_read_failed'
             break
           }
           const w = fresh.words.find((x) => x.q === word.q)
-          if (!w) { results.push({ q: word.q, pushed: count, error: 'removed' }); break }
+          if (!w) { failure = 'removed'; break }
           w.sentIds = (Array.isArray(w.sentIds) ? w.sentIds : []).concat([item.id]).slice(-LINE_WATCH_SENT_MAX)
           // 锚点按「在列表里的先后」前进，而不是只按时间：上游时间只有分钟精度，
           // 同一分钟的多条线报 ts 相等，只用 > 会让锚点停在原地、下一轮重复判新。
@@ -5423,11 +5513,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
           }
           if (!saveWatchState(stateDir, fresh)) {
-            results.push({ q: word.q, pushed: count, error: 'save_failed' })
+            failure = 'save_failed'
             break
           }
         }
-        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
+        if (failure) {
+          results.push({ q: word.q, pushed: count, error: failure })
+        } else {
+          results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
+        }
       }
       return { status: 'ok', pushed, results }
     } finally {
@@ -5435,7 +5529,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
 
-  const server = http.createServer((req, res) => {
+  // 分发器外层兜底（C2-015）：请求处理里任何**同步**抛错（参数形态、注入依赖、库内部）
+  // 此前只有 new URL 一处单独兜住，之后 1100+ 行的分发没有任何外层保护 ⇒ 一句 TypeError
+  // 就是进程级 uncaughtException ⇒ 整个看板下线（systemd 重启周期内都不可用）。
+  // 把分发体抽成 dispatchRequest，createServer 回调只保留这一层 try/catch 边界。
+  // 只兜同步异常：异步路径各自已有 .catch（logCaught + 5xx），不靠这层。
+  const dispatchRequest = (req, res) => {
     // 协商式压缩的每请求决策（v3.373 gzip，v3.382 起 br 优先）：JSON 出口（sendJson /
     // sendJsonConditional）与 SPA 页面出口读这个标记——SSE、导出附件、登录页各自直接 writeHead，
     // 按语义不压缩（压缩在边缘完成，见 sendJson 注释）。
@@ -5498,7 +5597,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 地址栏与浏览器历史、Referer 与中间代理日志；POST 校验成功后 303 到干净 `/`，
     // 只下发 HttpOnly Cookie。直接打开 `?token=` 的分享链接仍兼容（见下方 authorize）。
     if (req.method === 'POST' && url.pathname === '/login') {
-      readBody(req, 2048).then(({ body, aborted, over }) => {
+      readBody(req, BODY_LOGIN_FORM_MAX_BYTES).then(({ body, aborted, over }) => {
         if (aborted || over) {
           sendJson(res, over ? 413 : 400, { error: over ? '登录请求过大' : '登录请求不完整' })
           return
@@ -5506,19 +5605,27 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         const params = new URLSearchParams(body)
         const submitted = params.get('token') || ''
         const code = params.get('code') || ''
+        // 限速先于任何凭证比较，且不区分 2FA 是否开启（C2-014）：此前整段限速写在
+        // `if (twoFactor.enabled)` 分支内，2FA 关闭（默认部署）走 else 直接 401、既不查
+        // 也不计数 ⇒ 单因子部署的访问令牌可被无限在线穷举（token 再长也怕字典）。
+        // 阈值/窗口保持原值（10 次 / 5 分钟），这里只是把「查限速」与「计数」提到分支外。
+        if (loginThrottled(req)) {
+          // 2FA 关闭时回单因子登录页（不渲染验证码输入框），隐藏 token 只在挑战页有意义。
+          sendHtml(res, 429, renderUnauthorizedPage({
+            requireCode: twoFactor.enabled,
+            token: twoFactor.enabled ? submitted : '',
+            error: '尝试次数过多，请 5 分钟后再试。'
+          }))
+          return
+        }
+        if (!timingSafeEqualStr(submitted, token)) {
+          // 与「令牌通过但缺验证码」返回同一个挑战页，不暴露第一因子是否猜中；
+          // hidden 里回填的是本次提交值（无效），不会变成可用凭证。
+          noteLoginFailure(req)
+          sendHtml(res, 401, renderUnauthorizedPage(twoFactor.enabled ? { requireCode: true, token: submitted } : {}))
+          return
+        }
         if (twoFactor.enabled) {
-          // 先限速再看令牌：否则错误令牌在比较处提前返回，第一因子可无限猜。
-          if (loginThrottled(req)) {
-            sendHtml(res, 429, renderUnauthorizedPage({ requireCode: true, token: submitted, error: '尝试次数过多，请 5 分钟后再试。' }))
-            return
-          }
-          if (!timingSafeEqualStr(submitted, token)) {
-            // 与「令牌通过但缺验证码」返回同一个挑战页，不暴露第一因子是否猜中；
-            // hidden 里回填的是本次提交值（无效），不会变成可用凭证。
-            noteLoginFailure(req)
-            sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted }))
-            return
-          }
           if (code.trim() === '') {
             sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted }))
             return
@@ -5534,11 +5641,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted, error: why }))
             return
           }
-          clearLoginFailures(req)
-        } else if (!timingSafeEqualStr(submitted, token)) {
-          sendHtml(res, 401, renderUnauthorizedPage())
-          return
         }
+        // 成功即清空该来源的失败窗：否则 5 分钟内累计的旧失败会继续压着下一次登录。
+        clearLoginFailures(req)
         const cookies = [sessionCookieHeaderFor(req, token)]
         if (twoFactor.enabled) cookies.push(twoFactorCookieHeader(req, twoFactor.secret))
         // 「记住这台设备」（默认勾选）：签 90 天设备 cookie。只有真正过了第二因子才会走到这里，
@@ -5621,7 +5726,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       //   no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
       applyPageHeaders(res)
       const state = readStatus(stateDir)
-      const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
       // SameSite=Lax（审查 #224：Strict 会让「从聊天点链接」的跨站顶层导航不带 Cookie，
       // 首屏必 401；Lax 对同源子请求照常携带，而写动作 POST /trigger 本就不收 Cookie，
@@ -5636,7 +5740,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       // HTML 只发 identity：压缩统一由边缘 Caddy 完成（见 sendJson 注释）。
       // no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入。
-      const html = renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
+      const html = renderPage(state, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
@@ -6122,13 +6226,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readBody(req, 4096).then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
-        const setupId = payload && typeof payload.setupId === 'string' ? payload.setupId : ''
+      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
+        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
+        const setupId = typeof payload.setupId === 'string' ? payload.setupId : ''
         if (twoFactor.enabled) {
           // 成功响应丢包时允许同一 setupId + 仍有效的验证码重取一次恢复码（短时、只存内存）。
           const receipt = lastEnableResult
@@ -6189,12 +6291,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readBody(req, 4096).then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
+      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
+        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
         if (!twoFactor.enabled) {
           res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
           sendJson(res, 200, { enabled: false })
@@ -6247,17 +6347,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
+      readJsonObjectBody(req)
+        .then((read) => {
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          let payload
-          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            sendJson(res, 400, { error: 'body 必须是对象' })
-            return
-          }
+          if (!read.ok) { sendJson(res, read.status, read.body); return }
+          const payload = read.payload
           let on = auto.on
           if (Object.prototype.hasOwnProperty.call(payload, 'on')) {
             if (typeof payload.on !== 'boolean') { sendJson(res, 400, { error: 'on 必须是布尔值' }); return }
@@ -6319,17 +6413,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
         return
       }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
+      readJsonObjectBody(req)
+        .then((read) => {
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          let payload
-          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            sendJson(res, 400, { error: 'body 必须是对象' })
-            return
-          }
+          if (!read.ok) { sendJson(res, read.status, read.body); return }
+          const payload = read.payload
           // v3.342：两字段都是可选的「部分更新」，但至少要给一个；给了就必须严格合法——
           // 字符串 '60' / 1.5 / null / 越界 / 非布尔的显示开关全部拒绝，含糊接受会让
           // 「保存成功但生效值不是用户以为的那个」变成静默事故。
@@ -6639,6 +6727,24 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     sendJson(res, 404, { error: 'not found' })
+  }
+  const server = http.createServer((req, res) => {
+    try {
+      dispatchRequest(req, res)
+    } catch (e) {
+      logCaught('dispatch', e)
+      // 响应头已发出：再写 500 会二次抛 ERR_HTTP_HEADERS_SENT，把兜底自己变成崩溃点；
+      // 此时只能断链（客户端看到连接中断，好过挂到读超时）。
+      if (res.headersSent) {
+        try { res.destroy() } catch (e2) { /* 连接已断 */ }
+        return
+      }
+      try {
+        sendJson(res, 500, { error: 'internal error' })
+      } catch (e2) {
+        try { res.destroy() } catch (e3) { /* 连接已断 */ }
+      }
+    }
   })
   // Sourcery High：关闭时终止所有活跃子进程（SIGKILL），避免控制台停了触发任务还在跑。
   // 覆写 close：先杀子进程再走原生 close；'close' 事件再兜底清一次。
@@ -6779,6 +6885,16 @@ function listenErrorHint (code, host, port) {
 }
 
 function main () {
+  // 进程级兜底（C2-015）：分发器已有外层 try/catch，但仍可能有同步异常从别的入口漏出来
+  // （定时器回调、SSE tick、模块级回调、启动期装配）。默认行为是打一整段栈后直接退出、
+  // 没有任何可 grep 的结论，systemd 每 5s 拉起一次也看不出根因——这里补一行结论再退出。
+  // 有意不吞掉继续跑：异常发生时进程状态未知（可能是半把锁、半个写），继续服务比重启更危险。
+  process.on('uncaughtException', (e) => {
+    try {
+      console.error(`❌ 控制台未捕获异常，按 fail-closed 退出（交 systemd 重启）：${(e && e.stack) || e}`)
+    } catch (e2) { /* stderr 都写不了：只能直接退出 */ }
+    process.exit(1)
+  })
   const token = process.env.XBK_CONSOLE_TOKEN
   // Sourcery #225 M5：XBK_CONSOLE_PORT 非空但非法（非数字/超范围）时 Number() 得 NaN，
   // 旧 || 7777 会把合法的 0（随机端口）一起吞掉；先区分「未设置」与「设了但坏」——

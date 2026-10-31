@@ -172,6 +172,72 @@ require.cache[gotPath] = { id: gotPath, filename: gotPath, loaded: true, exports
   assert.ok(!('error' in cancelledAgg), 'aggregate 当前不暴露 per-connection 的 error（AGENTS-06 现状，修形状时同步改本测试）')
 
   console.log('✅ TLS 预热 GET 回退 cancelled 分支：可执行覆盖 + 公开契约特征化（不可观测性已由断言记录）')
+
+  // ===== C10-073：预热 GET 回退的响应体上限 =====
+  // 缺陷形状（改动前）：await got.get(...) 会把整个响应体读进内存——预热只为建连、正文一点不需要，
+  // 而 got@11 没有 maxResponseSize，xbk_http 的 20MB 上限只覆盖 fetchJson ⇒ 此路径零上限
+  // （× 最多 64 条连接）。实测 got@11 的 afterResponse 钩子**不能**拦下响应体（8MB 响应体照样被读完），
+  // 故只能走 got.stream 逐块累计。三条判据：
+  //   ① 上限口径必须与 xbk_http.DEFAULT_MAX_BODY 一致（不新造数字）；
+  //   ② 未超限必须读到 end（不读完 socket 回不回 keep-alive 池，预热就白做了）；
+  //   ③ 超限必须 destroy 且立刻结算（不挂死），且 destroy 后冒出的 premature-close error 不得炸进程。
+  {
+    const { EventEmitter } = require('node:events')
+    const { PREWARM_BODY_CAP } = require('./xbk_agents')
+    assert.strictEqual(PREWARM_BODY_CAP, require('./xbk_http').DEFAULT_MAX_BODY,
+      '预热响应体上限必须与 xbk_http 的 DEFAULT_MAX_BODY 同口径（两处写死同一个数就算红）')
+    assert.ok(PREWARM_BODY_CAP > 0 && Number.isFinite(PREWARM_BODY_CAP), '上限必须是有限正数')
+
+    const runWithStream = async (behave) => {
+      const calls = { get: 0, destroy: 0, data: 0 }
+      const stream = new EventEmitter()
+      stream.destroy = () => {
+        calls.destroy += 1
+        // 真实 got.stream 在 destroy 后会冒 ERR_STREAM_PREMATURE_CLOSE：必须被消费掉
+        setImmediate(() => stream.emit('error', Object.assign(new Error('premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })))
+      }
+      const savedStream = fakeGot.stream
+      const savedHead = fakeGot.head
+      fakeGot.stream = { get: () => { calls.get += 1; setImmediate(() => behave(stream, calls)); return stream } }
+      fakeGot.head = async () => { throw new Error('HEAD 不被支持') }
+      try {
+        const agg = await prewarmTls('tls-probe.invalid', 100, 1)
+        return { agg, calls }
+      } finally {
+        fakeGot.stream = savedStream
+        fakeGot.head = savedHead
+      }
+    }
+
+    // ② 未超限：读到 end、不 destroy ⇒ 连接可回池，按成功计
+    const under = await runWithStream((stream, calls) => {
+      calls.data += 1
+      stream.emit('data', Buffer.alloc(64 * 1024))
+      stream.emit('end')
+    })
+    assert.strictEqual(under.calls.get, 1, '应恰好发起 1 次预热 GET')
+    assert.strictEqual(under.calls.destroy, 0, '未超限时不得 destroy（destroy 会让 socket 报废、预热失去意义）')
+    assert.strictEqual(under.agg.okCount, 1, '未超限的预热应记为建连成功')
+    assert.strictEqual(under.agg.ok, true, '未超限时 aggregate ok 应为 true')
+
+    // ③ 超限：destroy 一次、立刻结算（不挂死），仍按「建连成功」计（TLS 握手已经完成）
+    const over = await runWithStream((stream) => {
+      stream.emit('data', Buffer.alloc(PREWARM_BODY_CAP + 1))
+      // 故意不 emit 'end'：实现必须靠 destroy 分支自己结算，否则本用例会挂到超时
+    })
+    assert.strictEqual(over.calls.destroy, 1, '超限必须 destroy 一次并停止读取')
+    assert.strictEqual(over.agg.okCount, 1, '超限只是不读正文：TLS 握手已完成，仍应计为建连成功')
+    assert.strictEqual(over.agg.ok, true, '超限时 aggregate ok 应为 true（不把建连成功报成失败）')
+
+    // ④ 流错误：按失败计（未建连）
+    const failed = await runWithStream((stream) => {
+      stream.emit('error', Object.assign(new Error('boom'), { code: 'ECONNRESET' }))
+    })
+    assert.strictEqual(failed.agg.okCount, 0, 'GET 流错误时不得记为建连成功')
+    assert.strictEqual(failed.agg.ok, false, 'GET 流错误时 aggregate ok 必须为 false')
+
+    console.log('✅ C10-073：预热 GET 有体量上限（口径同 DEFAULT_MAX_BODY / 未超限读到 end / 超限 destroy 即结算 / 流错误按失败计）')
+  }
 })().catch(error => {
   console.error(error)
   process.exit(1)

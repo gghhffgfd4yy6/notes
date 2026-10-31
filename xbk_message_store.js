@@ -9,6 +9,20 @@
 // 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
 const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
 
+// C3-005：每个缓存文件最多保留几份 `<name>.corrupt.<stamp>.bak` 隔离备份（最旧先删）。
+// 隔离件的上限就是缓存读端上限（64MiB/份），只增不减会把目录撑大；10 份足够人工取回最近几次现场。
+const CORRUPT_BACKUP_KEEP = 10
+
+// C3-007：缓存名 → 使用它的 pushUrl 的**落盘**记录（`<缓存目录>/push-sources.json`）。
+// 为什么必须落盘：告警判据是「同一缓存文件被两个不同 pushUrl 取用」，而生产里 pushUrl 是单值的
+// （`<domain>/plus/json/push.json`，末段恒为 push.json）、每轮只调一次 getFileName、Config.domain
+// 无运行期变更 ⇒「换源/换域名」只可能发生在**跨进程**（改配置后重启），进程内 Map 永远看不到第二个
+// url，告警一次都不会打。记录只在「首次登记」与「换源」时写一次，稳态零写盘。
+const PUSH_SOURCES_FILE = 'push-sources.json'
+const PUSH_SOURCES_MAX_BYTES = 64 * 1024
+const PUSH_SOURCES_MAX_ENTRIES = 500
+const PUSH_SOURCES_MAX_URL_LEN = 2048
+
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
 //   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
 // TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
@@ -24,6 +38,21 @@ function tombstoneKeyCap (maxSize, droppedCount = 0, floorKeys = TOMBSTONE_MAX_K
   if (Number.isInteger(maxSize) && maxSize > cap) cap = maxSize
   if (Number.isInteger(droppedCount) && droppedCount > cap) cap = droppedCount
   return cap
+}
+
+// C3-010：回退必须显形。cache.dir 被根内安全检查拒绝时（越界 `..`/绝对路径、普通文件占位、
+// 层级里是指向根外的符号链接），生产会**静默**落到 .xbk_cache_safe / .xbk_cache_safe_internal：
+// 判重主存换成另一份文件、原目录的 push.json 就此被「遗忘」⇒ 要么全量重推、要么两处各记一半。
+// 而运维侧唯一的可见信号曾是「什么都没说」。这里回退一次打一条 WARN（按 raw→chosen 去重，
+// 每进程每组合一次：getter 每轮都会求值，不做去重会把日志刷满）。
+const warnedCacheDirFallbacks = new Set()
+function warnCacheDirFallback (raw, candidate, chosen) {
+  const key = String(raw) + '\u0000' + String(chosen)
+  if (warnedCacheDirFallbacks.has(key)) return
+  warnedCacheDirFallbacks.add(key)
+  console.warn(`⚠️ 缓存目录配置未生效：${raw}（解析为 ${candidate}）未通过「项目根内 + 不跟随根外符号链接」安全检查，` +
+    `已回退到 ${chosen}——push.json（判重主存）、run.log、filter.hash 都写在回退目录；` +
+    '请检查该路径是否指向项目外、是否被普通文件占位、层级里是否有指向根外的符号链接（XBK_CACHE_DIR / XBK_PARALLEL_ID 同受影响）')
 }
 
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
@@ -48,7 +77,7 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
   if (realInsideRoot(candidate)) return candidate
   const safeFallback = path.resolve(root, fallback)
-  if (realInsideRoot(safeFallback)) return safeFallback
+  if (realInsideRoot(safeFallback)) { warnCacheDirFallback(raw, candidate, safeFallback); return safeFallback }
   // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
   // C3-014：下面两个兜底目录名与 .gitignore 的 `.xbk_cache_safe*` 一一对应——它们是**生产**兜底
   // 写入目标（默认目录被占位/被换成根外符号链接时 cacheDir 就落在这里），改名必须同步改 .gitignore，
@@ -56,12 +85,12 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   // 的风险，也会让 pre-push 的「工作树干净」快路径失效）。
   const emergencyFallback = path.join(root, '.xbk_cache_safe')
   // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
-  if (realInsideRoot(emergencyFallback)) return emergencyFallback
+  if (realInsideRoot(emergencyFallback)) { warnCacheDirFallback(raw, candidate, emergencyFallback); return emergencyFallback }
   // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
   // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
   // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
   const internalFallback = path.join(root, '.xbk_cache_safe_internal')
-  if (realInsideRoot(internalFallback)) return internalFallback
+  if (realInsideRoot(internalFallback)) { warnCacheDirFallback(raw, candidate, internalFallback); return internalFallback }
   // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
   // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
   throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')
@@ -200,6 +229,17 @@ function createMessageStore ({
     // 墓碑最近一次读盘结果（按缓存文件路径）：仅用于区分「确认缺失」与「读取失败」，
     // 决定 _tombstoneLoaded 是否置位（missing/ok 置位，其余保留重试窗口）。
     _tombstoneLoadStatus: {},
+    // C3-008：已告警过的墓碑读取问题（每进程每文件每类一次）——旧实现 ioError/损坏每次调用都 warn，
+    // 而损坏文件又不置位 _tombstoneLoaded ⇒ 每条消息一条 WARN（N 条消息 = N 条日志 + N 次全文件读）。
+    _tombstoneWarned: new Set(),
+    // C3-005：本次进程用 O_EXCL 预留（0 字节占位）的备份名——隔离失败/回滚时只释放这些名字。
+    _reservedBackupPaths: new Set(),
+    // C3-007：缓存名 → 首个使用它的 pushUrl，以及已告警的 (名字, url) 组合（撞名 = 共用判重主存）。
+    _fileNameSources: new Map(),
+    _fileNameCollisionWarned: new Set(),
+    // C3-007：落盘来源记录的内存态（每缓存目录一份：{dir, map, dirty}）。进程内 Map 只覆盖
+    // 同进程内的「两个 url」，跨进程换源必须靠它（见 PUSH_SOURCES_FILE 处注释）。
+    _fileNameSourcesDisk: null,
     // C3-013：已就「判重主存重建为空但墓碑仍在」告警过的文件（每进程每文件一次，防刷屏）。
     _residualTombstoneWarned: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -781,16 +821,90 @@ function createMessageStore ({
 
     /** 生成隔离备份路径 <filePath>.corrupt.<ISO时间戳>.bak。同一毫秒重复隔离（或目录里已有同名
      *  备份）时追加序号——renameSync 会静默覆盖已存在的目标，而「备份」绝不能覆盖掉上一份备份。
-     *  100 次仍冲突返回 null（调用方 fail-closed，绝不复用可能被覆盖的名字）。 */
+     *  100 次仍冲突返回 null（调用方 fail-closed，绝不复用可能被覆盖的名字）。
+     *
+     *  C3-005：existsSync → rename 之间有一次独立系统调用的空窗，另一进程（或同一毫秒内的另一次
+     *  隔离）可以在这条缝里抢先创建同名备份，随后 rename 会把**它**静默覆盖掉——上一份备份
+     *  就这样被销毁。能用 openSync 时改用 O_EXCL **原子预留**：占位文件一落地，这个名字就归本次
+     *  调用，rename 覆盖的只是自己刚建的 0 字节占位。fs 无 openSync（测试假 fs）时退回 existsSync 探测。 */
     _corruptBackupPath (filePath) {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      // 目录不能 rename 覆盖到**文件**目标上（ENOTDIR）⇒ 「非普通文件隔离」必须退回 existsSync 探测。
+      let srcIsDir = false
+      try { srcIsDir = typeof fs.lstatSync === 'function' && fs.lstatSync(filePath).isDirectory() === true } catch (e) { srcIsDir = false }
+      const canReserve = !srcIsDir && typeof fs.openSync === 'function' && typeof fs.closeSync === 'function'
       for (let n = 0; n < 100; n++) {
         const candidate = n === 0 ? `${filePath}.corrupt.${stamp}.bak` : `${filePath}.corrupt.${stamp}.${n}.bak`
-        let exists = false
-        try { exists = fs.existsSync(candidate) } catch (e) { return candidate }
-        if (!exists) return candidate
+        if (!canReserve) {
+          let exists = false
+          try { exists = fs.existsSync(candidate) } catch (e) { return candidate }
+          if (!exists) return candidate
+          continue
+        }
+        let fd = -1
+        try {
+          fd = fs.openSync(candidate, 'wx', 0o600) // 预留占位：EEXIST = 这个名字已被占用（可能正是别人的备份）
+        } catch (e) {
+          if (e && e.code === 'EEXIST') continue
+          // 预留失败但无法判定占用状态（EACCES/ELOOP/父目录不存在…）：与 existsSync 抛错同口径，
+          // 直接返回该候选，让 rename 去暴露真实错误（不静默改名、不吞错）。
+          return candidate
+        } finally {
+          if (fd >= 0) { try { fs.closeSync(fd) } catch (e) { /* close 失败只影响占位，rename 仍可覆盖 */ } }
+        }
+        try { this._reservedBackupPaths.add(candidate) } catch (e) { /* 忽略 */ }
+        return candidate
       }
       return null
+    },
+
+    /** 释放本次**预留**的占位备份名（隔离改名失败 / 重建回滚后）。只删集合里登记过的名字，且仅当
+     *  它还是 0 字节普通文件——绝不按路径无条件 unlink：这个名字可能已被别人 rename 覆盖成真备份。 */
+    _releaseReservedBackup (backupPath) {
+      if (!this._reservedBackupPaths || !this._reservedBackupPaths.has(backupPath)) return
+      this._reservedBackupPaths.delete(backupPath)
+      try {
+        const st = fs.lstatSync(backupPath)
+        if (!st || !st.isFile() || st.size !== 0) return // 已被覆盖成真备份：留着
+        fs.unlinkSync(backupPath) // nosemgrep（只删本次预留的空占位）
+      } catch (e) { /* 已被删走（rename 成功/他人清理）：无需处理 */ }
+    },
+
+    /** C3-005：隔离备份只增不减（每份最长 = 缓存读端上限 64MiB）而每次隔离都在产出一份 ⇒ 长期反复
+     *  损坏会把目录撑大。这里按「每缓存文件最多 CORRUPT_BACKUP_KEEP 份、最旧先删」收敛；只认本模块
+     *  的命名口径（<basename>.corrupt.<stamp>[.n].bak）且只删普通文件，目录/符号链接一律不碰。
+     *  清理失败不阻断（单份失败跳过，下一轮再来）。返回实际删除份数。 */
+    _pruneCorruptBackups (filePath) {
+      if (typeof fs.readdirSync !== 'function' || typeof fs.lstatSync !== 'function' || typeof fs.unlinkSync !== 'function') return 0
+      const dir = path.dirname(filePath)
+      const prefix = path.basename(filePath) + '.corrupt.'
+      let names
+      try { names = fs.readdirSync(dir) } catch (e) { return 0 }
+      if (!Array.isArray(names)) return 0
+      const found = []
+      for (const name of names) {
+        if (typeof name !== 'string' || !name.startsWith(prefix) || !name.endsWith('.bak')) continue
+        // 只认 <stamp>[.<n>].bak（stamp = ISO 时间戳把 : 和 . 换成 -，字符集固定）
+        if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{3}Z(\.[0-9]+)?\.bak$/.test(name.slice(prefix.length))) continue
+        const full = path.join(dir, name)
+        try {
+          const st = fs.lstatSync(full)
+          if (!st || !st.isFile()) continue // 目录/符号链接（可能是别人的东西）一律不碰
+          found.push({ full, mtime: Number(st.mtimeMs) || 0 })
+        } catch (e) { /* 读不到就跳过，不阻断本次隔离 */ }
+      }
+      if (found.length <= CORRUPT_BACKUP_KEEP) return 0
+      // 新 → 旧；同一毫秒落地的多份（mtime 相同，测试与高频隔离都会出现）按文件名倒序兜底，
+      // 保证「谁算最旧」是确定的（文件名里的 ISO 时间戳字典序即时间序）。
+      found.sort((a, b) => (b.mtime - a.mtime) || (a.full < b.full ? 1 : a.full > b.full ? -1 : 0))
+      let removed = 0
+      for (const victim of found.slice(CORRUPT_BACKUP_KEEP)) {
+        try { fs.unlinkSync(victim.full); removed++ } catch (e) { /* 单份失败不阻断 */ }
+      }
+      if (removed > 0) {
+        console.warn(`隔离备份超过保留上限（每缓存文件 ${CORRUPT_BACKUP_KEEP} 份），已清理最旧 ${removed} 份：${dir}`)
+      }
+      return removed
     },
 
     /** 反向、字符串感知的花括号配对：从 closeIdx（调用方保证是 '}'）向前找配对的 '{'，找不到返回 -1。
@@ -950,13 +1064,15 @@ function createMessageStore ({
       try {
         fs.renameSync(filePath, backupPath) // 隔离：改名保留原件，绝不 unlink
       } catch (e) {
+        // 改名没成功 ⇒ 预留的占位名回滚掉（否则每失败一次就在目录里留一个 0 字节 .bak）
+        this._releaseReservedBackup(backupPath)
         console.error(`${label}：隔离改名失败，保持写闸门（原件未被改动）${filePath}:`, e && e.message)
         return null
       }
       const saved = writeAtomic(filePath, text, '缓存重建')
       if (!saved) {
         // 重建写盘失败（磁盘满/只读/权限）：尽力把原件改回原路径，避免「原件被搬走 + 路径空着」
-        try { fs.renameSync(backupPath, filePath) } catch (e) { console.error(`${label}：重建失败且原件未能改回 ${backupPath}:`, e && e.message) }
+        try { fs.renameSync(backupPath, filePath); this._reservedBackupPaths.delete(backupPath) } catch (e) { console.error(`${label}：重建失败且原件未能改回 ${backupPath}:`, e && e.message) }
         console.error(`${label}：重建写盘失败，保持写闸门 ${filePath}`)
         return null
       }
@@ -967,9 +1083,11 @@ function createMessageStore ({
       // 误判成「已推送」而漏推。maxKeys 由调用方按「本次实际丢弃条数」给出（C6-006 / CR-02：
       // 容量须覆盖本次裁剪量，不能只按 maxSize）。
       if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, maxKeys)
+      // C3-005：隔离备份按「每缓存文件最多 CORRUPT_BACKUP_KEEP 份」收敛（失败不阻断本次恢复）
+      try { this._pruneCorruptBackups(filePath) } catch (e) { /* 保留策略失败不影响本次重建 */ }
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
-      console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除）${filePath} → ${backupPath}；` +
+      console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除；同族隔离件按每缓存文件最多 ${CORRUPT_BACKUP_KEEP} 份保留、更旧的自动回收）${filePath} → ${backupPath}；` +
         `重建 ${messages.length} 条、落墓碑 ${dropped.length} 条；未读到的旧身份不落墓碑（可能重推）`)
       return messages
     },
@@ -1037,7 +1155,13 @@ function createMessageStore ({
       // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 每轮整轮零推送、只能人工删文件。
       // （F1/v3.277 起读端对该形态改走「有界尾部恢复 + 原件隔离」，不再永久自锁；但写端仍必须自己
       //   不制造超限文件——多一轮恢复就多一次「旧身份重推」的代价，对齐上限仍是首选防线。）
+      // C3-009：先量一次字节数，**确认超限**就把这份第 1 次全量序列化立刻丢掉（引用置空，等 GC）——
+      // 裁剪阶段只需要逐条 sizes（每条一次 stringify），峰值从「旧文本 + sizes + 新文本」≈3× 降到
+      // 「sizes + 终稿」≈2×。未超限（绝大多数轮次）继续复用这份唯一序列化，不额外 stringify。
+      let textBytes = null
+      try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
       try {
+        if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
         text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
       } catch (e) {
       // 评审 qodo（v3.267）：裁剪阶段意外异常（如极端不可序列化元素）也不崩溃进程，与序列化失败同口径 fail-open
@@ -1074,7 +1198,8 @@ function createMessageStore ({
    *  本方法不写墓碑：被裁剪记录追加到 droppedOut（与条数裁剪统一），
    *  由 saveMessages 在缓存原子写盘成功后一并落墓碑（CodeAnt Round2 时序修复）。 */
     _trimCacheByBytes (text, toSave, filePath, maxBytes = MESSAGE_CACHE_MAX_BYTES, droppedOut = null) {
-      if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+      // text === null 表示「调用方已确认超限并主动丢弃了首份序列化」（C3-009）：跳过快路径，直接裁剪后重新序列化。
+      if (text !== null && Buffer.byteLength(text, 'utf8') <= maxBytes) return text
       if (toSave.length <= 1) {
         console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
         return null
@@ -1102,18 +1227,27 @@ function createMessageStore ({
       // 评审 coderabbit（v3.267）：key-sensitive toJSON 时根级估算可能低估数组内真实字节
       // （根级 key='' vs 数组内 key=索引，toJSON 可返回不同长度，实测可低估 10 倍）——
       // 收敛后做一次真实数组口径校验，超限则线性回退（极罕见场景，正常路径零额外开销），防写盘超限触发读端 tooLarge 自锁
-      while (lo > 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-lo)), 'utf8') > maxBytes) lo--
-      // 二分收敛到 lo=1 时校验最新单条本身（真实数组口径）：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
-      if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > maxBytes) {
+      // C3-009：真实数组口径校验与「产出终稿」合并成一次循环——旧实现校验时 stringify 一次、
+      // 产出终稿再 stringify 一次，超限场景每次多背一份全量字符串。收敛到 lo < 1 即「连最新单条都超限」，
+      // 与单条超限路径同口径跳过落盘（防读端 tooLarge 自锁），且不产生任何丢弃。
+      let out = null
+      while (lo >= 1) {
+        out = JSON.stringify(toSave.slice(-lo))
+        if (Buffer.byteLength(out, 'utf8') <= maxBytes) break
+        out = null
+        lo--
+      }
+      if (out === null) {
         console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
-        // 未实际裁剪任何记录：不产生丢弃（与单条超限路径同口径，见 saveMessages）
         return null
       }
       const dropped = toSave.length - lo
-      console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
-      const droppedMsgs = toSave.splice(0, dropped)
-      if (droppedOut) droppedOut.push(...droppedMsgs)
-      return JSON.stringify(toSave)
+      if (dropped > 0) console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
+      if (dropped > 0) {
+        const droppedMsgs = toSave.splice(0, dropped)
+        if (droppedOut) droppedOut.push(...droppedMsgs)
+      }
+      return out
     },
 
     /** 读取/初始化某缓存文件的墓碑身份集；缺失/损坏按空集处理，不阻断主流程。
@@ -1140,38 +1274,88 @@ function createMessageStore ({
         fill(ts.idWithUrl, data.idWithUrl)
         fill(ts.anon, data.anon)
         this._tombstoneLoaded.add(filePath)
-      } else if (this._tombstoneLoadStatus[filePath] === 'missing') {
+      } else if (this._tombstoneLoadStatus[filePath] === 'missing' ||
+        this._tombstoneLoadStatus[filePath] === 'empty' ||
+        this._tombstoneLoadStatus[filePath] === 'corrupt') {
+        // C3-008：missing（确认不存在）/ empty（0 字节，没有任何身份可复用）/ corrupt（已改名隔离）
+        // 都是「磁盘已给出确定答案」，必须置位——旧实现只认 missing，0 字节与损坏文件于是每条消息
+        // 都重读一次整份墓碑（上限 8MiB ⇒ N×8MiB 读放大）且每次读失败都再打一条 WARN。
         this._tombstoneLoaded.add(filePath)
       }
       return ts
     },
 
+    /** 墓碑读取问题告警：每进程每文件每类只打一次（C3-008：旧实现每条消息都 warn）。 */
+    _warnTombstoneOnce (filePath, kind, message) {
+      const key = filePath + '|' + kind
+      if (this._tombstoneWarned.has(key)) return false
+      this._tombstoneWarned.add(key)
+      console.warn(message)
+      return true
+    },
+
     /** 读墓碑文件并解析；缺失/损坏/非对象统一返回 null（调用方按空集处理）。
-   *  损坏仅警告一次（每进程每文件首次加载），不抛异常不阻断主流程。
+   *  告警每进程每文件每类一次（C3-008），不抛异常不阻断主流程。
    *  P3（审查 2026-09-15）：missing（正常空集）静默；ioError/unsafe/tooLarge 属瞬时/环境故障，
    *  按空集使用会静默丢失防重放身份，补一条含状态与路径的告警便于观测。仍不改变「按空集处理」
-   *  的既有语义，也不改动 _loadTombstones 的 _tombstoneLoaded 置位时机（失败后是否重试属
-   *  墓碑状态机口径：读失败返回空集，并把本次结果记入 _tombstoneLoadStatus，
-   *  由 _loadTombstones 决定是否置位 _tombstoneLoaded（仅 missing 与成功置位，
-   *  ioError/unsafe/tooLarge 保留下次重试窗口）。 */
+   *  的既有语义；_tombstoneLoaded 的置位口径见 _loadTombstones（确认缺失 / 0 字节 / 已隔离损坏
+   *  都置位；ioError/unsafe/tooLarge 保留下次重试窗口）。
+   *  C3-008：0 字节记 'empty'、损坏记 'corrupt'（原件已改名隔离），二者都算「磁盘已给出确定答案」
+   *  ——旧实现两者都不置位，每条消息重读整份墓碑，损坏文件还会在下一次落墓碑时被整份覆盖（无 .bak）。 */
     _readTombstoneData (filePath) {
+      const seenPath = filePath + '.seen.json'
       try {
-        const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
+        const result = readSafeTextResult(seenPath, TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
         this._tombstoneLoadStatus[filePath] = result.status
         if (result.status !== 'ok') {
           if (result.status !== 'missing') {
             const detail = result.error && result.error.message ? ': ' + result.error.message : ''
-            console.warn(`墓碑读取失败（按空集处理，下次调用重试）${filePath}.seen.json: ${result.status}${detail}`)
+            this._warnTombstoneOnce(filePath, 'read:' + result.status,
+              `墓碑读取失败（按空集处理，下次调用重试）${seenPath}: ${result.status}${detail}`)
           }
           return null
         }
-        if (!result.text) return null
-        const data = JSON.parse(result.text)
-        if (!data || typeof data !== 'object') return null
+        // C3-008：0 字节 = 文件在、内容没了。没有任何字节可隔离（不是「损坏」），语义等价于确认缺失：
+        // 置位 'empty' 让 _loadTombstones 缓存空集，并在下一次落墓碑时按空集重建该文件。
+        if (!result.text) {
+          this._tombstoneLoadStatus[filePath] = 'empty'
+          this._warnTombstoneOnce(filePath, 'empty', `墓碑文件为 0 字节（文件存在但无任何内容），按空集处理：${seenPath}`)
+          return null
+        }
+        let data = null
+        try { data = JSON.parse(result.text) } catch (e) { data = null }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+          // C3-008：损坏墓碑不能只「本进程按空集用」——旧实现既不置位（每条消息重读一次整份文件、
+          // 每条一条 WARN），下一次落墓碑又会把损坏文件整份覆盖写回（无 .bak，永久销毁现场）。
+          // 改为先改名隔离（只隔离、绝不删除），再按空集处理并置位；隔离失败才退回「下次重试」旧口径。
+          const reason = data ? '根节点不是对象' : '不是合法 JSON'
+          const backupPath = this._corruptBackupPath(seenPath)
+          if (!backupPath) {
+            this._tombstoneLoadStatus[filePath] = 'ioError'
+            this._warnTombstoneOnce(filePath, 'corrupt:nobackup',
+              `墓碑文件损坏（${reason}）且无法生成隔离备份名，本次按空集处理（下次调用重试）：${seenPath}`)
+            return null
+          }
+          try {
+            fs.renameSync(seenPath, backupPath)
+          } catch (e) {
+            this._releaseReservedBackup(backupPath) // 只释放本次预留的 0 字节占位（C3-005）
+            this._tombstoneLoadStatus[filePath] = 'ioError'
+            this._warnTombstoneOnce(filePath, 'corrupt:rename',
+              `墓碑文件损坏（${reason}）且隔离改名失败，本次按空集处理（下次调用重试）：${seenPath}: ${e && e.message ? e.message : e}`)
+            return null
+          }
+          this._tombstoneLoadStatus[filePath] = 'corrupt'
+          try { this._pruneCorruptBackups(seenPath) } catch (e) { /* 保留策略失败不影响本次隔离 */ }
+          this._warnTombstoneOnce(filePath, 'corrupt',
+            `⚠️ 墓碑文件损坏（${reason}），已改名隔离（只隔离不删除；同族隔离件按每缓存文件最多 ${CORRUPT_BACKUP_KEEP} 份保留、更旧的自动回收）${seenPath} → ${backupPath}；本次按空集处理，下一次落墓碑将重建该文件（旧身份未被读到的部分可能重推）`)
+          return null
+        }
         return data
       } catch (e) {
         this._tombstoneLoadStatus[filePath] = 'ioError'
-        console.warn(`墓碑读取异常，按空集处理（下次调用重试）${filePath}.seen.json:`, e?.message)
+        this._warnTombstoneOnce(filePath, 'read:throw',
+          `墓碑读取异常，按空集处理（下次调用重试）${seenPath}: ${e && e.message ? e.message : e}`)
         return null
       }
     },
@@ -1826,7 +2010,89 @@ function createMessageStore ({
       return saved
     },
 
+    // C3-007：缓存文件名只由 pushUrl 末段派生（不含来源/域名指纹）⇒ 两个不同 pushUrl 撞到同一
+    // 末段时会静默共用一份判重主存（互相覆盖推送记录：方向=漏推）。改名会迁移既有部署的判重记录
+    // （等同一次全量重推），故这里**只把撞名显形**：同一个缓存名被第二个不同 url 取用时告警一次
+    // （每进程每缓存名一次），并点明两端 URL，便于判断「是不是同源/该不该迁移」。
+    // 判据同时覆盖**跨进程**：生产每轮只取一次 getFileName、pushUrl 单值，换源/换域名只能跨进程发生，
+    // 故首个 url 落盘（<缓存目录>/push-sources.json），下一次运行读到不同的 url 才可能告警。
     getFileName (url) {
+      const name = this._fileNameFor(url)
+      this._noteFileNameCollision(name, url)
+      return name
+    },
+
+    /** C3-007：撞名告警（每进程每 (缓存名, url) 一次）。name 来自 _fileNameFor 的最终产物。 */
+    _noteFileNameCollision (name, url) {
+      try {
+        if (typeof name !== 'string' || typeof url !== 'string' || url === '') return
+        const prev = this._fileNameSources.get(name)
+        if (prev === undefined) this._fileNameSources.set(name, url)
+        else if (prev !== url) this._warnFileNameCollision(name, prev, url)
+        // 跨进程：读落盘记录（每缓存目录只读一次），首次登记/换源后写回（稳态零写盘）。
+        const record = this._fileNameSourcesDiskRecord()
+        if (!record) return
+        const diskPrev = record.map.get(name)
+        if (diskPrev === undefined) {
+          record.map.set(name, url)
+          record.dirty = true
+        } else if (diskPrev !== url) {
+          this._warnFileNameCollision(name, diskPrev, url)
+          // 记成「最近一次使用的 url」：换源只告警一次，反复启动不会每轮刷同一条。
+          record.map.set(name, url)
+          record.dirty = true
+        }
+        if (record.dirty) this._flushFileNameSources(record)
+      } catch (e) { /* 纯诊断：任何异常都不得影响取文件名（判重主路径） */ }
+    },
+
+    _warnFileNameCollision (name, prev, url) {
+      // 每个缓存名每进程只告警一次：同一对 url 反复出现（换源后又换回）只值一条，反复刷会淹没真信号。
+      if (this._fileNameCollisionWarned.has(name)) return
+      this._fileNameCollisionWarned.add(name)
+      console.warn(`⚠️ 两个不同的 pushUrl 映射到同一缓存文件 ${name}：${prev} / ${url}——` +
+        '判重记录被共用（可能漏推或互相覆盖）；若确实是切换数据源，请先迁移/清空该缓存文件再运行')
+    },
+
+    /**
+     * C3-007：读落盘来源记录（`<缓存目录>/push-sources.json`，每缓存目录读一次后进程内缓存）。
+     * 读不到/坏文件/超限一律按空记录处理——纯诊断数据，绝不因为一条记录影响判重主路径。
+     * @returns {{dir:string, map:Map<string,string>, dirty:boolean}|null}
+     */
+    _fileNameSourcesDiskRecord () {
+      let dir
+      try { dir = this.cacheDir } catch (e) { return null } // cacheDir 求值失败（兜底目录也全不可用）→ 不做跨进程比对
+      const cached = this._fileNameSourcesDisk
+      if (cached && cached.dir === dir) return cached
+      const record = { dir, map: new Map(), dirty: false }
+      this._fileNameSourcesDisk = record // 先登记：坏文件也只读一次，不随每轮 getFileName 重读
+      try {
+        const read = readSafeTextResult(path.join(dir, PUSH_SOURCES_FILE), PUSH_SOURCES_MAX_BYTES)
+        if (read.status !== 'ok') return record
+        const data = JSON.parse(read.text)
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return record
+        const names = Object.keys(data)
+        for (let i = 0; i < names.length && record.map.size < PUSH_SOURCES_MAX_ENTRIES; i++) {
+          const value = data[names[i]]
+          if (typeof value !== 'string' || !value || value.length > PUSH_SOURCES_MAX_URL_LEN) continue
+          record.map.set(names[i], value)
+        }
+      } catch (e) { /* 坏 JSON/读盘异常：按空记录处理（只失去跨进程比对，不影响本轮判重） */ }
+      return record
+    },
+
+    /** C3-007：写回落盘来源记录（原子写；失败下一轮再试，绝不抛穿 getFileName）。 */
+    _flushFileNameSources (record) {
+      try {
+        const payload = {}
+        for (const [name, url] of record.map) payload[name] = url
+        const ok = writeAtomic(path.join(record.dir, PUSH_SOURCES_FILE), JSON.stringify(payload), '推送来源记录')
+        record.dirty = ok !== true
+      } catch (e) { record.dirty = true }
+    },
+
+    /** getFileName 的纯计算部分（C3-007 抽出：碰撞检测要看**最终**文件名，故必须单点返回）。 */
+    _fileNameFor (url) {
     // 防御（R1）：非字符串 url → 可区分坏源(数字/布尔)哈希命名；无信息(空串/对象)保持 default.json
     // v3.157：数字/布尔 String 化可区分（123 vs 456），曾与空串/对象共用 default.json 互相误判重
       if (typeof url !== 'string') {

@@ -882,6 +882,251 @@ function captureConsole (method, fn) {
 
 const cacheWrites = (writes) => writes.filter(w => w.label === '缓存')
 
+// ===== C3-010：cache.dir 被安全检查拒绝时必须可见（静默回退 = 判重主存换文件）=====
+// 旧实现直接 return 回退目录、一句都不说：运维只看到「缓存没了 / 又开始重复推送」，无从知道
+// push.json 已经写到 .xbk_cache_safe。这里用假 fs 把默认目录做成「普通文件占位」，断言回退
+// 目录 + 恰好一条 WARN（getter 每轮都会求值，必须按 raw→chosen 去重，不能每轮刷一条）。
+check('C3-010 缓存目录回退必须 WARN（且按 raw→目标去重，不随每轮求值刷屏）', () => {
+  // raw 用唯一值：去重表是模块级的，别的用例可能已经告过同一个 raw→目标组合
+  const raw = 'c3010_probe_cache'
+  const rejected = path.join(FAKE_ROOT, raw)
+  const fakeFs = {
+    existsSync: (p) => p === rejected, // 自定义目录被**普通文件**占位（真实生产里最常见的拒绝形态）
+    lstatSync: (p) => ({ isDirectory: () => p !== rejected }), // 只有它不是一个目录
+    realpathSync: (p) => p
+  }
+  const warns = captureConsole('warn', () => {
+    const a = resolveCacheDirInRoot({ fs: fakeFs, path, root: FAKE_ROOT, raw, fallback: 'xianbaoku_cache' })
+    const b = resolveCacheDirInRoot({ fs: fakeFs, path, root: FAKE_ROOT, raw, fallback: 'xianbaoku_cache' })
+    assert.strictEqual(a, b, '同一输入两次求值必须同结果（去重不得影响返回值）')
+    assert.strictEqual(a, DEFAULT_DIR, `自定义目录被拒绝时回退到默认目录：${a}`)
+  })
+  const fb = warns.filter(w => w.includes('缓存目录配置未生效'))
+  assert.strictEqual(fb.length, 1, `回退只应告警一次（getter 每轮求值）：${JSON.stringify(warns)}`)
+  assert.ok(fb[0].includes(rejected) && fb[0].includes(DEFAULT_DIR),
+    `告警必须同时点名「被拒绝的配置」与「实际回退目录」：${fb[0]}`)
+})
+
+// ===== C3-007：不同 pushUrl 撞到同一缓存文件必须显形 =====
+// 缓存文件名只由 URL 末段派生：两个不同来源（换域名、同末段的两个接口）会静默共用一份 push.json
+// ⇒ 两边的判重记录互相覆盖（方向=漏推）。改名会迁移既有判重记录（等同全量重推），故只告警不改名。
+check('C3-007 两个不同 pushUrl 撞到同一缓存名必须 WARN（每对一次），同名同源不告警', () => {
+  const h = makeBatchStore({ name: 'c3007.json' })
+  const u1 = 'https://a.example.com/api/push.json'
+  const u2 = 'https://b.example.com/api/push.json'
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(h.store.getFileName(u1), 'push.json')
+    assert.strictEqual(h.store.getFileName(u2), 'push.json', '末段相同 ⇒ 同一缓存名（共用判重主存的入口）')
+    assert.strictEqual(h.store.getFileName(u2), 'push.json', '重复调用结果不变')
+    assert.strictEqual(h.store.getFileName(u1), 'push.json')
+  })
+  const hits = warns.filter(w => w.includes('同一缓存文件'))
+  assert.strictEqual(hits.length, 1, `同一对撞名只应告警一次：${JSON.stringify(warns)}`)
+  assert.ok(hits[0].includes(u1) && hits[0].includes(u2), `告警必须点名两端 URL：${hits[0]}`)
+  // 对照：同一个 URL 反复取用不得告警（否则每轮每源都刷一条，噪音淹没真撞名）
+  const h2 = makeBatchStore({ name: 'c3007b.json' })
+  const warns2 = captureConsole('warn', () => {
+    h2.store.getFileName(u1)
+    h2.store.getFileName(u1)
+  })
+  assert.strictEqual(warns2.filter(w => w.includes('同一缓存文件')).length, 0, `同源重复取用不得告警：${JSON.stringify(warns2)}`)
+})
+
+// ===== C3-007（返工）：换源/换域名是**跨进程**事件，告警必须靠落盘来源记录 =====
+// 生产里 pushUrl 单值（`<domain>/plus/json/push.json`，末段恒为 push.json）、每轮只调一次
+// getFileName、Config.domain 无运行期变更 ⇒ 同一进程内永远看不到第二个 url；上面那条用例手工喂
+// 两个 url 的调用序列在生产不可达。这里用两个 store 实例共享同一份「缓存目录」（模拟重启/换进程）：
+// A 只见过 u1，B 只见过 u2 —— 只有落盘记录能让 B 看出「同一个缓存文件被另一个 url 用过」。
+check('C3-007 换源（跨进程）也必须告警：来源落盘、下一次运行比对后 WARN 一次且不重复刷', () => {
+  const u1 = 'https://old.example.com/plus/json/push.json'
+  const u2 = 'https://new.example.com/plus/json/push.json'
+  const shared = makeMemFs({ [cachePath('c3007_cross.json')]: '[]' })
+  const sourcePath = path.join(CACHE_DIR, 'push-sources.json')
+  const warnsOf = (lines) => lines.filter(w => w.includes('同一缓存文件'))
+
+  // 第一次运行：只有 u1（生产同一个进程内也只有这一个 url）
+  const a = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsA = captureConsole('warn', () => {
+    assert.strictEqual(a.store.getFileName(u1), 'push.json')
+  })
+  assert.strictEqual(warnsOf(warnsA).length, 0, `首次使用不得告警：${JSON.stringify(warnsA)}`)
+  assert.ok(shared.files.has(sourcePath), '首次使用必须把「缓存名 → pushUrl」落盘（跨进程比对的前提）')
+  assert.deepStrictEqual(JSON.parse(shared.files.get(sourcePath)), { 'push.json': u1 })
+
+  // 第二次运行（新进程/重启，进程内 Map 为空）：换成了 u2 —— 必须点名两端 URL
+  const b = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsB = captureConsole('warn', () => {
+    assert.strictEqual(b.store.getFileName(u2), 'push.json')
+    assert.strictEqual(b.store.getFileName(u2), 'push.json', '同一次运行内重复取用不得再告警')
+  })
+  const hitsB = warnsOf(warnsB)
+  assert.strictEqual(hitsB.length, 1, `跨进程换源必须告警一次：${JSON.stringify(warnsB)}`)
+  assert.ok(hitsB[0].includes(u1) && hitsB[0].includes(u2), `告警必须点名两端 URL：${hitsB[0]}`)
+  assert.deepStrictEqual(JSON.parse(shared.files.get(sourcePath)), { 'push.json': u2 }, '落盘记录必须更新为最近一次使用的 url')
+
+  // 第三次运行（仍是 u2）：换源只告警一次，反复重启不得每轮刷同一条
+  const c = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsC = captureConsole('warn', () => { c.store.getFileName(u2) })
+  assert.strictEqual(warnsOf(warnsC).length, 0, `记录已更新后不得重复告警：${JSON.stringify(warnsC)}`)
+
+  // 对照：来源记录损坏/超限一律按空记录处理，不得影响取文件名，也不得抛穿
+  shared.files.set(sourcePath, '{not json')
+  const d = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsD = captureConsole('warn', () => {
+    assert.strictEqual(d.store.getFileName(u2), 'push.json', '坏来源记录不得影响文件名计算')
+  })
+  assert.strictEqual(warnsOf(warnsD).length, 0, `坏记录不得伪造撞名：${JSON.stringify(warnsD)}`)
+  assert.deepStrictEqual(JSON.parse(shared.files.get(sourcePath)), { 'push.json': u2 }, '坏记录必须被重写成合法记录')
+})
+
+// ===== C3-009：超限裁剪的序列化次数 =====
+// 旧实现把整份数组序列化三次：saveMessages 的初稿、_trimCacheByBytes 的「真实数组口径校准」、
+// 以及 splicing 之后的终稿——超限轮次的峰值内存因此是 3×（初稿在裁剪期间一直活着）。
+// 修后：初稿确认超限即丢弃，校准与终稿合并成一次 ⇒ 整份数组只序列化 2 次；未超限仍是 1 次。
+check('C3-009 超限裁剪只序列化整份数组 2 次（旧实现 3 次）', () => {
+  const name = 'c3009_trim.json'
+  const h = makeBatchStore({ name, constants: { MESSAGE_CACHE_MAX_BYTES: 400 } })
+  const msgs = []
+  for (let i = 0; i < 30; i++) msgs.push({ id: 'id-' + i, title: 't'.repeat(60), url: 'https://example.com/' + i })
+  const origStringify = JSON.stringify
+  let arrayCalls = 0
+  JSON.stringify = function (value, ...rest) {
+    if (Array.isArray(value)) arrayCalls++
+    return origStringify.call(JSON, value, ...rest)
+  }
+  let ok
+  try { ok = h.store.saveMessages(h.filePath, msgs) } finally { JSON.stringify = origStringify }
+  assert.strictEqual(ok, true, '裁剪后应成功落盘')
+  assert.strictEqual(arrayCalls, 2, `整份数组的序列化次数必须恰为 2（初稿 + 终稿），实际 ${arrayCalls} 次`)
+  const written = h.fs.files.get(h.filePath)
+  assert.ok(Buffer.byteLength(written, 'utf8') <= 400, '终稿必须落在读端上限内')
+  assert.ok(JSON.parse(written).length < 30, '必须真的裁掉最早的若干条')
+})
+
+check('C3-009 对照：未超限时仍然只序列化 1 次（不得为省内存白白多一次全量 stringify）', () => {
+  const name = 'c3009_fast.json'
+  const h = makeBatchStore({ name, constants: { MESSAGE_CACHE_MAX_BYTES: 1048576 } })
+  const msgs = [{ id: 'a', title: 'x' }, { id: 'b', title: 'y' }]
+  const origStringify = JSON.stringify
+  let arrayCalls = 0
+  JSON.stringify = function (value, ...rest) {
+    if (Array.isArray(value)) arrayCalls++
+    return origStringify.call(JSON, value, ...rest)
+  }
+  let ok
+  try { ok = h.store.saveMessages(h.filePath, msgs) } finally { JSON.stringify = origStringify }
+  assert.strictEqual(ok, true, '未超限应直接落盘')
+  assert.strictEqual(arrayCalls, 1, `未超限只应有 1 次整份序列化，实际 ${arrayCalls} 次`)
+})
+
+// ===== C3-005：隔离备份「名字要原子预留、份数要有上限」=====
+// 旧实现 existsSync → rename 之间有空窗：另一进程能在缝里抢先建同名 .bak，rename 随后把它静默
+// 覆盖（上一份备份被销毁）。修法 = O_EXCL 预留占位（名字一落地就归本次调用）。判别式断言是
+// 「返回的名字**立刻**就存在（0 字节占位）且两次调用必不同」——旧实现返回的名字当时都不存在。
+check('C3-005 隔离备份名必须 O_EXCL 原子预留：返回即存在、连续两次必不同（不覆盖上一份备份）', () => {
+  const dir = path.join(__dirname, 'xianbaoku_cache', 'c3005_reserve')
+  const base = path.join(dir, 'r.json')
+  REAL_FS.mkdirSync(dir, { recursive: true })
+  try {
+    const s = storeWithFs(REAL_FS, path.relative(ROOT_DIR, dir))
+    const a = s._corruptBackupPath(base)
+    assert.ok(typeof a === 'string' && a.endsWith('.bak'), `必须返回备份名：${a}`)
+    assert.strictEqual(REAL_FS.existsSync(a), true, '返回的备份名必须已由本次调用原子预留（占位文件当场存在）')
+    assert.strictEqual(REAL_FS.lstatSync(a).isFile(), true, '预留必须是普通文件占位')
+    assert.strictEqual(REAL_FS.lstatSync(a).size, 0, '预留占位必须是 0 字节（rename 覆盖它不丢任何内容）')
+    const b = s._corruptBackupPath(base)
+    assert.notStrictEqual(b, a, '同名备份已被占用时必须换名——绝不复用（否则 rename 覆盖上一份备份）')
+    assert.strictEqual(REAL_FS.existsSync(b), true, '第二个名字同样必须已预留')
+    assert.strictEqual(REAL_FS.lstatSync(a).size, 0, '第二个名字的预留不得动到第一份（仍是空占位）')
+    // 释放：只删本次预留的空占位
+    s._releaseReservedBackup(a)
+    assert.strictEqual(REAL_FS.existsSync(a), false, '释放必须删掉本次预留的空占位')
+    REAL_FS.writeFileSync(b, '已写入的真实备份')
+    s._releaseReservedBackup(b)
+    assert.strictEqual(REAL_FS.existsSync(b), true, '已被覆盖成真备份的名字不得被释放逻辑删掉')
+  } finally {
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C3-005 隔离备份保留上限：每缓存文件最多 10 份、最旧先删、非本模块命名的文件不动', () => {
+  const dir = path.join(__dirname, 'xianbaoku_cache', 'c3005_prune')
+  REAL_FS.mkdirSync(dir, { recursive: true })
+  const base = path.join(dir, 'p.json')
+  const stamp = (i) => `2026-10-31T00-00-00-${String(i).padStart(3, '0')}Z`
+  try {
+    for (let i = 0; i < 12; i++) {
+      const f = `${base}.corrupt.${stamp(i)}.bak`
+      REAL_FS.writeFileSync(f, `backup-${i}`)
+      // 退避到确定的 mtime（同一毫秒写完时排序只能靠文件名兜底，这里显式把时间序也铺开）
+      REAL_FS.utimesSync(f, new Date(1761900000000 + i * 1000), new Date(1761900000000 + i * 1000))
+    }
+    REAL_FS.writeFileSync(path.join(dir, 'notes.txt'), 'x')
+    REAL_FS.writeFileSync(`${base}.corrupt.not-a-stamp.bak`, 'y')
+    const s = storeWithFs(REAL_FS, path.relative(ROOT_DIR, dir))
+    const warns = captureConsole('warn', () => {
+      assert.strictEqual(s._pruneCorruptBackups(base), 2, '12 份备份 + 上限 10 ⇒ 必须删掉最旧 2 份')
+    })
+    const left = REAL_FS.readdirSync(dir).filter(n => n.startsWith('p.json.corrupt.') && /^p\.json\.corrupt\.2026-10-31T00-00-00-\d{3}Z\.bak$/.test(n)).sort()
+    assert.strictEqual(left.length, 10, `保留份数必须恰为 10：${JSON.stringify(left)}`)
+    assert.ok(!left.includes(`p.json.corrupt.${stamp(0)}.bak`), '最旧的一份必须被清理')
+    assert.ok(!left.includes(`p.json.corrupt.${stamp(1)}.bak`), '次旧的一份必须被清理')
+    assert.ok(left.includes(`p.json.corrupt.${stamp(11)}.bak`), '最新的一份必须保留')
+    assert.strictEqual(REAL_FS.existsSync(path.join(dir, 'notes.txt')), true, '非本模块命名的文件一律不动')
+    assert.strictEqual(REAL_FS.existsSync(`${base}.corrupt.not-a-stamp.bak`), true, '命名口径不符的文件不动（不得按前缀误删）')
+    assert.ok(warns.some(w => w.includes('保留上限') && w.includes('2')), `清理必须有告警说明：${JSON.stringify(warns)}`)
+  } finally {
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ===== C3-008：墓碑 0 字节 / 损坏不得被当成「空集」静默吞掉 =====
+// 旧实现：0 字节走 `!result.text` 直接 return null（status 仍是 ok）、损坏走 JSON.parse 异常，
+// 两条出口都不置位 _tombstoneLoaded ⇒ 每条消息重读一次整份墓碑（上限 8MiB）+ 每条一条 WARN；
+// 下一次落墓碑又把损坏文件整份覆盖写回（无 .bak，现场永久销毁）。修后：0 字节记 empty、
+// 损坏先改名隔离再记 corrupt，二者都算「磁盘已给出确定答案」（置位 + 只告警一次）。
+check('C3-008 墓碑损坏：先改名隔离（原件保留）再按空集处理，置位且只读一次/只告警一次', () => {
+  const name = 'c3008_corrupt.json'
+  const seenPath = path.join(__dirname, 'xianbaoku_cache', name) + '.seen.json'
+  const corruptText = '{"v":1,"id":["a"],"urlOnly":['
+  let reads = 0
+  const h = makeBatchStore({ name, files: { [seenPath]: corruptText }, readStatus: (p) => { if (p === seenPath) reads++; return null } })
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-a' }), false, '损坏墓碑按空集处理')
+    assert.strictEqual(h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-b' }), false, '第二次判重不得命中')
+  })
+  assert.strictEqual(reads, 1, `损坏墓碑确认后不得每条消息重读磁盘（实际读盘 ${reads} 次）`)
+  assert.strictEqual(h.store._tombstoneLoaded.has(h.filePath), true, '已隔离的损坏墓碑必须置位（否则每条消息重读）')
+  assert.strictEqual(h.store._tombstoneLoadStatus[h.filePath], 'corrupt', '读盘状态必须如实记为 corrupt')
+  const backups = [...h.fs.files.keys()].filter(p => p.startsWith(seenPath + '.corrupt.') && p.endsWith('.bak'))
+  assert.strictEqual(backups.length, 1, `损坏墓碑必须改名隔离一份（实际 ${JSON.stringify([...h.fs.files.keys()])}）`)
+  assert.strictEqual(h.fs.files.get(backups[0]), corruptText, '隔离件必须逐字保留损坏原文（只隔离不删除）')
+  assert.strictEqual(h.fs.files.has(seenPath), false, '在线路径必须让出来（下一次落墓碑重建）')
+  assert.strictEqual(warns.filter(w => w.includes('墓碑文件损坏') && w.includes('已改名隔离')).length, 1,
+    `损坏只应告警一次（每条消息一条 WARN 会把日志刷屏）：${JSON.stringify(warns)}`)
+  // 下一次落墓碑按空集重建：新文件可写，且隔离件仍在（旧身份可人工取回）
+  h.store._tombstoneDropped(h.filePath, [{ id: 'rebuilt-7' }])
+  assert.strictEqual(h.fs.files.has(seenPath), true, '下一次落墓碑必须在原路径重建')
+  assert.ok(String(h.fs.files.get(seenPath)).includes('rebuilt-7'), '重建内容必须包含本次身份')
+  assert.strictEqual(h.fs.files.get(backups[0]), corruptText, '重建不得动隔离件（旧身份仍在 .bak 里）')
+})
+
+check('C3-008 墓碑 0 字节：按 empty 置位、不产生 .bak、只读一次/只告警一次', () => {
+  const name = 'c3008_empty.json'
+  const seenPath = path.join(__dirname, 'xianbaoku_cache', name) + '.seen.json'
+  let reads = 0
+  const h = makeBatchStore({ name, files: { [seenPath]: '' }, readStatus: (p) => { if (p === seenPath) reads++; return null } })
+  const warns = captureConsole('warn', () => {
+    h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-a' })
+    h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-b' })
+  })
+  assert.strictEqual(reads, 1, `0 字节墓碑确认后不得每条消息重读磁盘（实际读盘 ${reads} 次）`)
+  assert.strictEqual(h.store._tombstoneLoaded.has(h.filePath), true, '0 字节墓碑必须置位（等价于确认缺失）')
+  assert.strictEqual(h.store._tombstoneLoadStatus[h.filePath], 'empty', '读盘状态必须与「损坏」区分开（empty）')
+  assert.deepStrictEqual(h.fs.ops.rename, [], '0 字节没有任何字节可隔离 ⇒ 不得产生备份')
+  assert.strictEqual(warns.filter(w => w.includes('0 字节')).length, 1, `0 字节只应告警一次：${JSON.stringify(warns)}`)
+})
+
 check('_memoSet: 非字符串键必须 String 化后落键（Symbol 键也要可枚举、可参与淘汰）', () => {
   const s = createProbeStore()
   assert.strictEqual(s._memoSet(Symbol('sk'), 'v'), true)

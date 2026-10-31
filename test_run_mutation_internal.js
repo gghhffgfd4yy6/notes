@@ -285,6 +285,11 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       // 进而使 test_run_mutation_cli.js 的「沙箱内单元测试应整体通过」断言失败（沙箱整体红）
       assert.ok(fs.existsSync(path.join(projDir, 'check-version.js')), 'check-version.js 应复制（test_check_version.js 顶层 require 它）')
       assert.ok(fs.existsSync(path.join(projDir, '.github/workflows/test.yml')), '.github/workflows/test.yml 应复制（test_ci_skip_suites.js 读取它与显式步骤对账）')
+      // 回归：C7-052 结构红线在 test_console.js 里直接读 README.md/SYSTEM_CONTRACT.md，
+      // 漏拷 → 沙箱 ENOENT → 基线整体红 → 8066 个变异体全记 survived（门禁假红）
+      for (const doc of ['README.md', 'AGENTS.md', 'SYSTEM_CONTRACT.md', 'CONTRIBUTING.md', 'SECURITY.md']) {
+        assert.ok(fs.existsSync(path.join(projDir, doc)), `${doc} 应复制（test_console 结构红线 / 文档行数闸门读取它）`)
+      }
       const nmStat = fs.lstatSync(path.join(projDir, 'node_modules'))
       assert.ok(nmStat.isSymbolicLink(), 'node_modules 应为 symlink')
     })

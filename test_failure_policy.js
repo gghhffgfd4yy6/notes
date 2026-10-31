@@ -1078,6 +1078,72 @@ testCase('靶向 carrierCases（承载字段 × 区间）', async () => {
   }
 })
 
+testCase('C9-004：状态码语义单点化（4 承载字段 × 状态码矩阵）', async () => {
+  // 反例（改动前）：classifyOne 对四个承载字段各写一遍区间判定，其中 HTTP_ 前缀与 statusCode
+  // 两份还把 408|409|425|429 内联重写（RETRYABLE_HTTP_STATUS 只覆盖一半）。任一处漏改，
+  // 同一状态码在不同承载字段下分类相反，而每个分支单测都还是绿的。
+  // 断言必须连 reason 一起锁：只断 kind 时「漏了 5xx 分支 → 落 UNKNOWN」仍是 retryable，测不出来。
+  const carriers = [
+    { name: '数字 code', build: (n) => ({ code: String(n), message: 'server replied' }), reason: (n) => `PROVIDER_${n}` },
+    { name: 'providerCode', build: (n) => ({ providerCode: String(n), message: 'server replied' }), reason: (n) => `PROVIDER_${n}` },
+    { name: 'HTTP_ 前缀', build: (n) => ({ code: `HTTP_${n}`, message: 'server replied' }), reason: (n) => `HTTP_${n}` },
+    { name: 'statusCode', build: (n) => ({ statusCode: n, message: 'server replied' }), reason: (n) => `HTTP_${n}` }
+  ]
+  const matrix = [
+    [408, 'retryable'], [409, 'retryable'], [425, 'retryable'], [429, 'retryable'],
+    [500, 'retryable'], [503, 'retryable'], [599, 'retryable'],
+    [300, 'permanent'], [304, 'permanent'], [399, 'permanent'],
+    [400, 'permanent'], [401, 'permanent'], [413, 'permanent'], [499, 'permanent']
+  ]
+  for (const carrier of carriers) {
+    for (const [n, kind] of matrix) {
+      const r = classifyFailure(carrier.build(n))
+      check(r.kind, kind, `${carrier.name} ${n} → ${kind}（kind）`)
+      check(r.reason, carrier.reason(n), `${carrier.name} ${n} 的 reason 必须落在本承载字段口径（不得回落到 UNKNOWN）`)
+    }
+  }
+  // 越界伪码：旧实现凭 `n >= 500` 把 HTTP_600/HTTP_999 当成「可重试的 HTTP 状态码」（reason=HTTP_6xx）；
+  // 统一判据后它们不属于 HTTP 语义 ⇒ 落兜底 UNKNOWN（kind 仍是可重试，但不再冒充状态码）。
+  for (const code of ['HTTP_600', 'HTTP_999', 'HTTP_abc']) {
+    const r = classifyFailure({ code, message: 'upstream odd' })
+    check(r.kind, 'retryable', `${code} 越界/非数字 → 兜底可重试`)
+    check(r.reason, 'UNKNOWN', `${code} 不得再被当成可重试的 HTTP 状态码（reason 必须回落 UNKNOWN）`)
+  }
+})
+
+testCase('C9-005：非 message 字段有界、脱敏在截断之后（199KB 外部文本）', async () => {
+  // 反例（改动前）：`redact(value).replace(...).slice(0, 500)` —— 先做最贵的事再截断，进正则的是
+  // 无界外部文本；且非 message/reason 字段只 `redact(value)`，连那 500 都没有（199KB 可原样进日志）。
+  const HUGE = 199 * 1024
+  const big = 'x'.repeat(HUGE)
+  // 1) failureInfo 的非 message 字符串此前完全无上限
+  check(summarizeError({ failureInfo: { extra: big } }).extra.length, 2000, 'failureInfo.extra 必须截断到 2000')
+  // 2) message 仍按 500 落盘（既有口径不变）
+  check(summarizeError({ message: big }).message.length, 500, 'message 仍按 500 落盘')
+  // 3) 先截断再脱敏：前缀内的凭据仍必须整体抹掉（截断不得让脱敏漏抹）
+  const secret = 'SECRET_ABCDEFGH'
+  const prefixed = summarizeError({ failureInfo: { extra: 'token=' + secret + '&' + big } })
+  check(prefixed.extra.includes(secret), false, '前缀内的凭据必须脱敏（截断在前不得漏抹）')
+  check(prefixed.extra.startsWith('token=***'), true, '凭据值必须整体抹掉')
+  check(prefixed.extra.length <= 2000, true, '脱敏后的字段同样必须有界')
+  // 4) 2000 之后的内容不进摘要（截断点之后无需再扫）
+  const late = summarizeError({ failureInfo: { extra: 'a'.repeat(2000) + 'token=' + secret } })
+  check(late.extra.includes(secret), false, '2000 字符之后的凭据不会进摘要')
+  check(late.extra.length, 2000, '恰为上限的字段不得被继续放大')
+  // 5) 其余非 message 字段（name/providerCode/channel/failureReason）同样必须有界
+  const all = summarizeError({ name: big, providerCode: big, channel: big, failureKind: 'permanent', failureReason: big })
+  check(all.name.length, 200, 'name 必须有界（200）')
+  check(all.providerCode.length, 200, 'providerCode 必须有界（200）')
+  check(all.channel.length, 40, 'channel 必须有界（40）')
+  check(all.failureReason.length, 200, 'failureReason 必须有界（200）')
+  // 6) 199KB 输入的墙钟上界：线性实现实测个位数 ms，1s 上界只拦「无界/退化」的形态
+  const started = process.hrtime.bigint()
+  summarizeError({ message: big })
+  summarizeError({ failureInfo: { extra: big, message: big } })
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+  assert.ok(elapsedMs < 1000, `199KB 输入的摘要耗时 ${elapsedMs.toFixed(1)}ms 超过 1000ms 上界`)
+})
+
 testCase('permanentMessage 五条正则', async () => {
   // 【簇1 · permanentMessage 五条正则】每条只与“近邻但不命中”的负例成对出现，
   // 杀 Regex / StringLiteral / LogicalOperator 的放宽与短路变异体。

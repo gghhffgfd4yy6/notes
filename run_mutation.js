@@ -295,7 +295,11 @@ function copyProject (dir, files) {
   const entries = fs.readdirSync(ROOT)
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
-  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md', 'check-version.js', 'stryker.config.js', 'stryker.tap.config.js']
+  const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md', 'check-version.js', 'stryker.config.js', 'stryker.tap.config.js',
+    // 文档类必选：test_console.js 的 C7-052 结构红线直接 readFileSync README.md/SYSTEM_CONTRACT.md，
+    // test_doc_line_gates.js 与 test_ci_skip_suites.js 也对账这几份 prose 文档的行数/存在性。
+    // 漏拷的后果与 #143 同类：沙箱 ENOENT → 套件红 → evaluate 恒 fail（8066 个变异体全被记 survived，门禁假红）。
+    'README.md', 'AGENTS.md', 'SYSTEM_CONTRACT.md', 'CONTRIBUTING.md', 'SECURITY.md']
   // 固定清单（extraTop + 调用方传入的 files + DEFAULT_FILES）属必选：缺失须响亮报错，不能静默 continue——
   // 漏拷文件会留下沙箱 MODULE_NOT_FOUND/ENOENT → evaluate 恒 fail 的不响亮回归（#120/#122 一类根因）。
   // DEFAULT_FILES 在此无条件纳入（D3）：main() 已不再 existsSync 预过滤，缺任一变异目标源文件时由本处响亮报错。

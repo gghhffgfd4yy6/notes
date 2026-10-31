@@ -504,6 +504,31 @@ check('mdImagesToPlain: 预算耗尽后角括号分支必须短路 + 畸形输�
   )
 })
 
+// ===== mdToPlain 整链性能预算（C8-005）=====
+// 为什么要有这条：mdToPlain 是 Push+/Bark/TG 的**生产入口**（每次推送都要过），而上面的预算用例只覆盖
+// 它内部两个环节（mdLinksToPlain / mdImagesToPlain）——本文件历史上正是这两个环节的 O(n²) 受害者，
+// 加一层 stripAngleTags、6 条实体解码与两条正则之后，「整链是否仍线性」此前没有任何计时断言：
+// 任一环退回超线性，单测全绿、生产端却卡死。故按真实形态补一条端到端预算。
+// 输入取真实线报规模（≈100k，与 Pusher 的 100k 出口上限同量级）：良性=完整链接/图片/粗体，
+// 畸形=大量未配对的 [ / ![ / < 与未闭合目标段（历史退化形态）。
+// 变量名刻意不用 tMal/tBenign：本文件另有一条「恰好 4 条比值断言行 + 全部走 ratioBudget」的源码扫描
+// （PERF_MS 缩放 ④），新增断言行沿用同名会把那条既有契约扫成 5 条——这里用 tChain 系列，判定仍走
+// ratioBudget（同样带 PERF_SCALE 与噪声地板），不给沙箱添新的假红面。
+check('mdToPlain 整链：真实 100k 消息不退化（端到端预算，C8-005）', () => {
+  const benignMsg = ('【线报】某店铺 满减活动 **限时** 到手价 9.9 元 [详情](https://example.com/a/b) ![图](https://img.example.com/x.png) ').repeat(700)
+  const heavyMsg = '[a](() 中文正文 ![b](() <a href=" '.repeat(3400)
+  assert.ok(benignMsg.length >= 60000 && heavyMsg.length >= 100000, '用例前提：两份输入都必须是真实线报量级')
+  assert.ok(!heavyMsg.includes('>'), '用例前提：畸形输入整串不含 ">"（未闭合目标段/未闭合标签）')
+  const { a: tChain, b: tPlain } = ratioOf(() => mdToPlain(heavyMsg), () => mdToPlain(benignMsg))
+  // 绝对上界（不随 PERF_MS 缩放）：秒级退化在沙箱里也必须红。本机实测整链 ~1–2ms，余量 500×
+  assert.ok(tChain < 1000, `100k 畸形消息的 mdToPlain 整链应在 1000ms 内完成，实测 ${tChain.toFixed(1)}ms`)
+  // 比值型上界（随 PERF_MS 缩放）：挡「比同规模良性输入慢一个数量级」的超线性退化
+  assert.ok(
+    tChain <= ratioBudget(25, tPlain, 50),
+    `mdToPlain 整链耗时不得相对同规模良性输入爆炸（默认 25 倍 + 50ms，本进程生效上界 ${ratioBudget(25, tPlain, 50).toFixed(1)}ms）：实测良性=${tPlain.toFixed(2)}ms 畸形=${tChain.toFixed(2)}ms`
+  )
+})
+
 // ===== mdToPlain =====
 check('mdToPlain: 粗体去除', () => {
   assert.strictEqual(mdToPlain('**bold**'), 'bold')

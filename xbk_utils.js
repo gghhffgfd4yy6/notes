@@ -22,6 +22,15 @@ function messageAnonKey (utils, message) {
   return utils.anonKey(...IDENTITY_ANON_FIELDS.map((field) => utils.safeGet(message, field)))
 }
 
+// C6-004：sanitizeDecodedHtml 的主动标签清单——单一来源。
+// 同一份集合此前散在四处（外层守卫 / 逐标签成对移除 / 未闭合移除 / 孤立闭合移除）各写一遍，
+// embed 只补进了「未闭合移除」⇒ `<embed src=x></embed>` 只去掉开标签、`</embed>` 残留，而
+// docstring 早把 embed 列为应移除（test_utils_pure 把它登记为「疑似生产缺陷 / 待修」）。
+// embed 是空元素：常规写法 `<embed ...>` 没有闭合标签，由「未闭合移除」兜底；成对移除与孤立
+// 闭合移除覆盖畸形输入。四处一律由本清单派生，避免再次漂移。
+const ACTIVE_TAGS = Object.freeze(['script', 'style', 'iframe', 'object', 'embed', 'svg', 'math'])
+const ACTIVE_TAG_ALT = ACTIVE_TAGS.join('|')
+
 // ---------- 魔法数字常量 ----------
 const DAY_MS = 24 * 60 * 60 * 1000 // 一天的毫秒数
 const TS_BOUND = Number('100000000000') // 秒/毫秒时间戳分界（10位秒 / 12+位毫秒）
@@ -708,9 +717,9 @@ function createUtils (options = {}) {
     // 下方未闭合/孤立闭合规则兜底。不用反向引用 `<\1`：RE2 不支持，且 `[\s\S]*?<\/\1`
     // 无法做字面量快速搜索，畸形输入（大量无闭合 `<script`）会退化为 O(n²) 回溯。
     let out = html
-    // 外层守卫：无任何主动标签时整轮跳过（热路径常见纯文本/无主动标签内容，省 6 次正则）
-    if (safeRe(String.raw`<(?:script|style|iframe|object|svg|math)\b`, 'i').test(out)) {
-      for (const tag of ['script', 'style', 'iframe', 'object', 'svg', 'math']) {
+    // 外层守卫：无任何主动标签时整轮跳过（热路径常见纯文本/无主动标签内容，省 7 次正则）
+    if (safeRe(String.raw`<(?:${ACTIVE_TAG_ALT})\b`, 'i').test(out)) {
+      for (const tag of ACTIVE_TAGS) {
         // 逐标签快速预检：无该标签时跳过整轮 replace
         if (safeRe(String.raw`<${tag}\b`, 'i').test(out)) {
           out = out.replace(safeRe(String.raw`<${tag}\b[\s\S]*?<\/${tag}\s*>`, 'gi'), '')
@@ -722,8 +731,8 @@ function createUtils (options = {}) {
       // 匹配失败时逐位回溯呈指数级（`<iframe` + 40 个引号实测 3.6s，47 个 >100s）。
       // 收紧为同时排除双引号(\x22)与单引号(\x27)后每字符只有一个分支可选，保持线性；
       // 两个引号串分支不变，srcdoc 等跨尖括号的引号值仍被整段匹配。
-      .replace(safeRe('<(?:script|style|iframe|object|embed|svg|math)\\b(?:[^<>\\x22\\x27]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
-      .replace(safeRe('<\\/(?:script|style|iframe|object|svg|math)\\s*>', 'gi'), '')
+      .replace(safeRe('<(?:' + ACTIVE_TAG_ALT + ')\\b(?:[^<>\\x22\\x27]|"[^"]*"|\'[^\']*\')*>', 'gi'), '')
+      .replace(safeRe('<\\/(?:' + ACTIVE_TAG_ALT + ')\\s*>', 'gi'), '')
       .replace(safeRe('<(?:base|link|meta)\\b[^<>]*>', 'gi'), '')
   },
 

@@ -170,15 +170,18 @@ function compileOk (deps, source) {
 }
 
 /**
- * 校验待保存/待预检的过滤规则（四道闸，规格 §3 / 计划 §3.3）。
+ * 校验待保存/待预检的过滤规则（五道闸：schema/字段白名单/长度 → 行语法 → RE2 与嵌套量词 →
+ * 编译对账 → 整份字节预算；最后一道只约束保存入参，读路径以 options.fromDisk 跳过。规格 §3 / 计划 §3.3）。
  *
  * @param {{schema?:number, revision?:number, filter:Object}} input
  *   revision 省略按 0 处理（`/validate` 允许只带 filter）；**显式传 null/''/字符串等非法值一律拒绝**。
  *   filter 只接受 11 个白名单字段的字符串值；未出现的字段不参与覆盖（回代码默认）。
  * @param {{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}} deps
+ * @param {{fromDisk?:boolean}} [options] fromDisk=true 表示「校验的是已落盘的覆盖文件」：闸门 5
+ *   （整份文件字节预算）只约束**保存入参**，读路径一律不跑（见闸门 5 处注释）。
  * @returns {{ok:true, value:Object, wideMatch:string[]}|{ok:false, errors:Array<{field:string, code:string, message:string}>}}
  */
-function validateFilterRules (input, deps) {
+function validateFilterRules (input, deps, options) {
   const errors = []
   const engine = deps && deps.RuleEngine
   if (!engine || typeof engine.hasNestedQuantifier !== 'function' || typeof engine.compileRules !== 'function' ||
@@ -386,11 +389,41 @@ function validateFilterRules (input, deps) {
     if (ruleLines.some(rule => rule.field === field && WIDE_MATCH_VALUES.has(rule.val))) wideMatch.push(field)
   }
 
+  // ---------- 闸门 5：整份规则文件的字节预算（C9-012）----------
+  // 读端按 FILTER_RULES_MAX_BYTES（64 KiB）硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到
+  // 上次合法规则/代码默认。而闸门 1 只限**单字段** 4000 码元：11 个字段全填满中文（UTF-8 3 字节/字）
+  // 就能堆出 130 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
+  // 不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给 revision 位数增长。
+  //
+  // **只对保存入参生效**（评审 C9-012）：读路径（deepValidationError）复用本函数时必须跳过此闸——
+  // 已落盘文件是经 readSafeTextResult(FILTER_RULES_MAX_BYTES) 有界读进来的，能读到就必然 ≤ 读端上限，
+  // 再按「落盘形状重新序列化」量一遍字节，会把 (MAX_BYTES-32, MAX_BYTES] 这段**合法且可读**的存量
+  // 覆盖文件判成 corrupt（旧版控制台 body 上限 64 KiB，落盘形状只多约 13 字节包装 ⇒ 该区间是真实存量），
+  // 于是每轮降级、规则静默不生效，也与 SYSTEM_CONTRACT「超限（>64 KiB）」口径相反。
+  if (!(options && options.fromDisk === true)) {
+    let serializedBytes
+    try {
+      serializedBytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter }), 'utf8')
+    } catch (e) {
+      return { ok: false, errors: [{ field: 'filter', code: 'serialize_failed', message: `规则无法序列化为 JSON：${safeErrorMessage(e)}` }] }
+    }
+    if (serializedBytes > FILTER_RULES_MAX_BYTES - 32) {
+      return {
+        ok: false,
+        errors: [{
+          field: 'filter',
+          code: 'too_large',
+          message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_RULES_MAX_BYTES} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
+        }]
+      }
+    }
+  }
+
   return { ok: true, value: filter, wideMatch }
 }
 
 function parseStoredRules (text) {
-  // 覆盖文件的**结构**校验（与用户输入的四道闸分开）：JSON / schema / revision / 字段白名单 /
+  // 覆盖文件的**结构**校验（与用户输入的五道闸分开）：JSON / schema / revision / 字段白名单 /
   // 字符串 / 长度 / 控制字符。刻意不做正则编译与嵌套量词检查——那需要 RE2，且读路径必须
   // 在缺依赖时仍可用（否则一次缺 re2 就会把**合法**覆盖文件判成损坏并降级）。
   let data
@@ -448,7 +481,8 @@ function canDeepValidate (deps) {
 }
 
 /**
- * 对「结构已合法」的覆盖文件再做一次四道闸校验（A1）。
+ * 对「结构已合法」的覆盖文件再做一次五道闸校验（A1；整份字节预算闸只约束保存入参，这里按
+ * options.fromDisk 跳过——已能读回的文件不得因「重新序列化后比阈值大 32 字节」被判损坏）。
  * 结构校验只证明形状合法：手工编辑写入的非法正则/嵌套量词会被运行期 compileRules 静默跳过，
  * 而 App.run 仍推进 filter.hash 并清 _f ⇒ 被过滤记录被补推且无任何损坏告警。
  * @returns {string|null} 失败描述（首条错误的 field+message），通过返回 null
@@ -459,7 +493,7 @@ function deepValidationError (parsed, deps) {
     schema: FILTER_RULES_SCHEMA,
     revision: parsed.revision,
     filter: parsed.filter
-  }, deps)
+  }, deps, { fromDisk: true })
   if (result && result.ok === true) return null
   const first = result && Array.isArray(result.errors) ? result.errors[0] : null
   const field = first ? safeString(safeGet(first, 'field')) : ''
@@ -543,7 +577,8 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
  * 任何异常都不得抛穿；文件不存在 → source:'default'、revision:0、filter 为代码默认深拷贝。
  * @param {{cacheDir:string, defaults:Object, keyword:Object,
  *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options
- *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的四道闸（A1）；
+ *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的五道闸（A1；
+ *   其中「整份字节预算」闸不作用于读路径，`fromDisk` 跳过）；
  *   不提供时保持「只做结构校验」的既有契约（console/qinglong 等调用方无需改造）。
  * @returns {{filter:Object, override:Object, keyword:{zkt_gjc:string}, source:'override'|'default'|'corrupt',
  *   revision:number, degraded:boolean, lastGoodUsed:boolean, error?:{code:string,message:string}}}
@@ -621,8 +656,30 @@ function readAppliedSnapshot (cacheDir) {
   if (!snapshot.filter || typeof snapshot.filter !== 'object' || Array.isArray(snapshot.filter)) {
     return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 filter 必须是对象' } }
   }
+  // C9-019：只校验「filter 是对象」时，字段被写成对象/数字/数组也照读 ok，而覆盖文件的读路径
+  // （parseStoredRules）对同一批字段要求「白名单内 + 必须是字符串」——两条读路径口径不一致，
+  // 快照一旦被写坏，控制台就会把非字符串当成规则正文显示/回填。这里按 parseStoredRules 同口径
+  // 收紧：存在即必须是白名单字段且为字符串（未提供的字段与读覆盖文件一样视同空，不强制补齐）。
+  let snapshotKeys
+  try { snapshotKeys = Object.keys(snapshot.filter) } catch (e) { snapshotKeys = null }
+  if (snapshotKeys === null) {
+    return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 filter 不是可枚举对象' } }
+  }
+  for (const field of snapshotKeys) {
+    if (!FIELD_SET.has(field)) {
+      return { status: 'invalid', error: { code: 'invalid_schema', message: `生效快照含未知字段「${field}」` } }
+    }
+    if (typeof safeGet(snapshot.filter, field) !== 'string') {
+      return { status: 'invalid', error: { code: 'invalid_schema', message: `生效快照字段「${field}」必须是字符串` } }
+    }
+  }
   if (!snapshot.keyword || typeof snapshot.keyword !== 'object' || Array.isArray(snapshot.keyword)) {
     return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 keyword 必须是对象' } }
+  }
+  // keyword 写入侧恒为 {zkt_gjc: 字符串}；出现非字符串说明快照被改坏（控制台会照原样显示）。
+  const snapshotKeyword = safeGet(snapshot.keyword, 'zkt_gjc')
+  if (snapshotKeyword !== undefined && typeof snapshotKeyword !== 'string') {
+    return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 keyword.zkt_gjc 必须是字符串' } }
   }
   return { status: 'ok', snapshot }
 }

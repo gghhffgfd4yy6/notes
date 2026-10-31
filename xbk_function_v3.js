@@ -50,11 +50,29 @@ const safeRe = (src, flags) => {
 // 静默不生效；未安装 re2 时同样跳过（不回退 V8），不存在「不装就能用反向引用/lookbehind」的选项——只能改写为 RE2 兼容语法，这是「防 ReDoS 卡死事件循环」的刻意取舍。
 // C1-023：编译失败原因曾被内部 catch 吞掉，调用方只剩「无效或环境不支持」的泛化告警——三种失败（源码非字符串 /
 // 未安装 re2 / RE2 语法不支持）的处置完全不同，故经 onError 回传，供调用方写进告警与 run.log，不再有无原因的失败。
+// C6-009：同一用户模式在单轮运行里被重复编译——zkt_gjc 先编译一次判空、随即又交给 whitelistFilter 重建，
+// validateConfig 与 compileRules 对同一条规则也各编译一次。故按 (源码, 标志) 做有限缓存：命中原样返回
+// 同一 RE2 实例，超限淘汰最旧键（Map 插入序，FIFO），防动态关键词把缓存撑爆。编译失败不缓存（保留
+// 每次 onError 回传原因的行为）；带 g/y 的模式有 lastIndex 状态，共享实例会改变调用方可见语义，故不缓存
+// （现有调用方标志均为 'i'，不受影响）。
+const USER_RE_CACHE_MAX = 256
+const _userReCache = new Map()
 function compileUserRegex (source, flags = 'i', onError) {
   const fail = (reason) => { if (typeof onError === 'function') onError(reason); return null }
   if (typeof source !== 'string') return fail(new Error('正则源码不是字符串'))
   if (!RE2C) return fail(new Error('当前环境未安装可用的 re2，用户配置正则被跳过'))
-  try { return new RE2C(source, flags) } catch (e) { return fail(e) }
+  const flagText = String(flags) // 缓存键必须含标志：同源码不同标志是两个不同的正则
+  const key = source + '\u0000' + flagText
+  const cached = _userReCache.get(key)
+  if (cached) return cached
+  try {
+    const re = new RE2C(source, flags)
+    if (!/[gy]/.test(flagText)) {
+      _userReCache.set(key, re)
+      if (_userReCache.size > USER_RE_CACHE_MAX) _userReCache.delete(_userReCache.keys().next().value)
+    }
+    return re
+  } catch (e) { return fail(e) }
 }
 
 function isRe2Available () {
@@ -311,8 +329,14 @@ const Network = createNetwork({
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
+// C8-006：只注入工厂真正解构的依赖。此前这里还传了 looksLikeHtmlLinear（第三个键）——出口门槛
+// 在 v3.273 换成 looksLikeHtmlEnvelope 后，createPusher 早已不再解构它，这个注入是死接线：工厂静默
+// 丢弃、却让测试把「注入 3 键」钉成参数契约（test_utils_pure.js 的 pusherArgKeys）。
+// looksLikeHtmlLinear 仍保留**导出**：它不是死代码，test_filter.js 用它锁定「不跨界」语义（遇到 <
+// 就跳过，与宽松包络 looksLikeHtmlEnvelope 有意不同），只是生产链已不再用它当出口门槛。
 const { createPusher, looksLikeHtmlLinear } = profile3Require('xbk_pusher', () => require('./xbk_pusher'))
-const Pusher = createPusher({ Utils, getNotify, looksLikeHtmlLinear })
+// 注入面只留工厂真正解构的两个键（looksLikeHtmlLinear 只用于本文件的导出面，见下方 module.exports）
+const Pusher = createPusher({ Utils, getNotify })
 // ============================================================
 // 🗂️ FilterStore — 过滤规则覆盖文件存储层
 // ============================================================
@@ -499,6 +523,9 @@ if (typeof module !== 'undefined' && module.exports) {
     // 补充导出（供更全面的测试）
     whitelistFilter: FilterEngine.whitelistFilter.bind(FilterEngine),
     compileRules: RuleEngine.compileRules.bind(RuleEngine),
+    // FILTER-01：规则「实际编译生效」指纹。App.run 把它折进 filter.hash；控制台保存规则后
+    // 要用**同一口径**算摘要，否则两边 hash 永远不相等（控制台的那份成了无意义的纯配置摘要）。
+    compileStateOf: RuleEngine.compileStateOf.bind(RuleEngine),
     matchesCompiled: RuleEngine.matchesCompiled.bind(RuleEngine),
     checkTimeCompiled: RuleEngine.checkTimeCompiled.bind(RuleEngine),
     saveBatch: MessageStore.saveBatch.bind(MessageStore),

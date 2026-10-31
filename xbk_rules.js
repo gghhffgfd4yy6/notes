@@ -6,6 +6,20 @@
 function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available }) {
   // C9-008：正则 .test 异常只在进程内首次告警一次——热路径（每条消息 × 每个字段 × 每条规则）
   // 重复告警会淹没 run.log，静默又会让「规则全废」不可见。
+  // C9-011：规则行分隔形态的**唯一实现**（此前 xbk_rules 里有 3 处、xbk_filter_store 与
+  // scripts/console 各 1 处，靠「与 _splitLines 口径一致」的注释当同步机制）。加一种分隔形态
+  // （如 <BR>）漏改一处，症状只能是 filter_store 闸门 4 的「编译出 N 条、有效行数 M」这种事后错误。
+  // 跨模块那两处（filter_store 的 LINE_SPLIT_RE、console 的 split）属别的模块，本批不动；
+  // 它们改为调用 RuleEngine.splitRuleLines 即可与这里同源。
+  const RULE_LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
+
+  // C9-018：pingbitime 天数上限的**唯一字面量**（3650000 天 ≈ 10000 年）。此前 compileRules 与
+  // validateConfig 各写一份、xbk_filter_store 再写一份，靠「与…同值」的注释同步；调上限时漏一处：
+  // store 严于运行期 ⇒ 保存被 invalid_number 拒；运行期严于 store ⇒ 运行期静默丢弃规则，
+  // 表现为 filter_store 闸门 4 的对账失败（「编译结果应为 time，实际 null」）。
+  // 暴露在 RuleEngine 上，注入方（deps.RuleEngine）可直接取；xbk_filter_store 那份属别的模块，本批未动。
+  const PINGBITIME_MAX_DAYS = 3650000
+
   let testFailWarned = false
   const RuleEngine = {
     // RULES-06：此处原有 _compileUserRegex 包装方法，全仓库（含测试）无任何调用者，
@@ -155,16 +169,27 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       }
     },
 
+    /** 规则行分割的唯一实现（C9-011）：<br> / <br/> / <br /> / \r\n / \r / \n。
+     *  恒返回数组，不做「有没有 ###」的判断——那是 _splitLines 的历史兼容契约（C9-017 登记）。
+     *  xbk_filter_store 的 LINE_SPLIT_RE 与 scripts/console 的 split 属别的模块，本批未动；
+     *  它们引用本方法即可与运行期同源（新增分隔形态只改上面那一个正则）。 */
+    splitRuleLines (configStr) {
+      if (configStr === undefined || configStr === null) return []
+      let s
+      try { s = typeof configStr === 'string' ? configStr : String(configStr) } catch (e) { return [] }
+      if (!s) return []
+      return s.split(RULE_LINE_SPLIT_RE)
+    },
+
     /** 解析多行配置（<br> / \n\n 分割），返回行数组 */
     _splitLines (configStr) {
     // v3.108 fuzz：/###/.test(Symbol) 隐式 String() 抛 TypeError——Symbol 视为无配置
       if (configStr === undefined || configStr === null || typeof configStr === 'symbol') return []
       let s
       try { s = String(configStr) } catch (e) { return [] } // 嵌套 Symbol 数组 String() 崩 → 无配置
-      configStr = s
-      if (!configStr) return []
-      if (!/###/.test(configStr)) return null // 简单模式（测试锁定契约；调用方均有 /###/ 守卫才调用）
-      return configStr.split(/<br\s*\/?>|\r\n|\r|\n/) // R2：支持 <br/> 自闭合（与 htmlToMarkdown br 口径一致）
+      if (!s) return []
+      if (!/###/.test(s)) return null // 简单模式（测试锁定契约；调用方均有 /###/ 守卫才调用）
+      return this.splitRuleLines(s) // C9-011：分隔形态只有一份实现
     },
 
     /**
@@ -261,7 +286,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       // v3.156：先 trim——空白('   ')曾 Number→0 静默关闭时间过滤
       // v3.x：pingbitime 天数加上限 PINGBITIME_MAX_DAYS（3650000 天≈10000 年），
       // 超过视为无效（置 null 不编译）——巨大值(如 1e20)会让注册年龄永远达不到上限，等效永久拦截新账号。
-      const PINGBITIME_MAX_DAYS = 3650000
+      // C9-018：上限值取自引擎级唯一常量（不再就地写字面量），与 validateConfig 同源。
       let pbRaw = ''
       try { pbRaw = rawCfg.pingbitime === undefined || rawCfg.pingbitime === null ? '' : String(rawCfg.pingbitime).trim() } catch (e) { pbRaw = '' } // 脏配置无法转字符串时忽略规则，不让启动崩溃
       if (pbRaw) {
@@ -307,6 +332,10 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       return compiled
     },
 
+    /** pingbitime 天数上限（C9-018）：单一字面量，compileRules 与 validateConfig 共用；
+     *  注入方（deps.RuleEngine）可直接取，用来替掉自己的同值副本（xbk_filter_store 的副本属别的模块）。 */
+    PINGBITIME_MAX_DAYS,
+
     /** FILTER-01 / RULES-05：规则「实际编译生效」指纹。
      *  filterHash 此前只由配置**字节**（FILTER_FIELDS + pingbitime + zkt_gjc + 可选 UTC 日期）驱动，
      *  因此「同一份配置、不同环境/不同编译结果」时哈希不变：re2 缺失（compileUserRegex 恒返回 null，
@@ -340,6 +369,23 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       return s.replace(/[\u200B-\u200D\uFEFF]+/g, '')
     },
 
+    /** 匹配入口的文本归一化（C9-007）：undefined/null/空串 → null（该字段不参与匹配，
+     *  与 matchesCompiled/_catMatches 的缺失守卫同口径），其余经 String() 兜底后剥零宽。
+     *  归一化是纯函数、同一输入结果恒定 ⇒ 调用方必须在**整次匹配**里只做一次。
+     *  此前它藏在 _safeTest 里，multi 规则的逐条谓词把同一段正文归一化了「规则数」遍，
+     *  成本 = O(规则数 × 文本长度) 的白扫（数百条规则 × 100k 正文可达数百 MB 级替换）。 */
+    _normalizeMatchText (input) {
+      if (input === undefined || input === null || input === '') return null
+      try { return this._normalizeReInput(typeof input === 'string' ? input : String(input)) } catch (e) { return null }
+    },
+
+    /** 执行异常的一次性告警（本进程只发一次，热路径逐次告警会淹没 run.log） */
+    _warnTestFail () {
+      if (testFailWarned) return
+      testFailWarned = true
+      console.warn('⚠️ 过滤规则正则执行异常，已按「不命中/不拦截」处理（本进程不再重复告警）')
+    },
+
     /** 规则正则 .test 的唯一出口（C9-008）
      *  .test 会在**运行时**抛（new RegExp 不抛）：V8 对超长正则延迟到首次 test 才编译并抛
      *  "Regular expression too large"；re2 包装对象、被污染/伪造的规则对象同理。
@@ -350,17 +396,30 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
      *  拦截规则（matchesCompiled / checkTimeCompiled / _catMatches）不命中 ⇒ 放行；
      *  白名单（whitelistFilter）传 onFail=true ⇒ 保留（宁可多推不可少推）。re 形状不对
      *  （null/没有 test）与异常同处理：都无法判定是否命中，口径必须一致。
-     *  告警每进程只发一次：这里是每条消息 × 每个字段 × 每条规则的热路径，逐次告警会淹没 run.log。 */
+     *  告警每进程只发一次：这里是每条消息 × 每个字段 × 每条规则的热路径，逐次告警会淹没 run.log。
+     *  本方法自行归一化输入（单次调用口径）；批量扫描请用归一化后的 _safeTestText（C9-007）。 */
     _safeTest (re, input, onFail = false) {
+      let text
+      try {
+        // 形状守卫必须留在 try 内：伪造/被污染的规则对象可以是带抛错 test getter 的对象或 Proxy，
+        // 「读一次 re.test」本身就会抛——放在 try 外等于给「异常永不冒泡」开一个后门。
+        if (!re || typeof re.test !== 'function') return onFail
+        text = this._normalizeReInput(typeof input === 'string' ? input : String(input))
+      } catch (e) {
+        this._warnTestFail()
+        return onFail
+      }
+      return this._safeTestText(re, text, onFail)
+    },
+
+    /** 已归一化文本的 .test 出口（C9-007）：异常口径与 _safeTest 完全相同，只省掉归一化。
+     *  text 必须来自 _normalizeMatchText/_normalizeReInput（调用方负责只做一次）。 */
+    _safeTestText (re, text, onFail = false) {
       try {
         if (!re || typeof re.test !== 'function') return onFail
-        const text = this._normalizeReInput(typeof input === 'string' ? input : String(input))
         return !!re.test(text)
       } catch (e) {
-        if (!testFailWarned) {
-          testFailWarned = true
-          console.warn('⚠️ 过滤规则正则执行异常，已按「不命中/不拦截」处理（本进程不再重复告警）')
-        }
+        this._warnTestFail()
         return onFail
       }
     },
@@ -370,6 +429,14 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       if (!rule.cat) return true
       if (catename === undefined || catename === null || catename === '') return false
       return this._safeTest(rule.cat, catename)
+    },
+
+    /** 已归一化分类名的匹配（C9-007）：catText 由 _normalizeMatchText 得到，
+     *  null = 分类名缺失/不可用 ⇒ 不命中（与 _catMatches 的前置守卫同口径）。 */
+    _catMatchesText (rule, catText) {
+      if (!rule.cat) return true
+      if (catText === null) return false
+      return this._safeTestText(rule.cat, catText)
     },
 
     /** 多行规则任意匹配：分类匹配 + 断言成立即短路（与 _firstMatchingRule 共用同一遍扫描） */
@@ -383,8 +450,11 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
     /** 返回首个命中的多行规则（供可解释过滤复用；无命中返回 null） */
     _firstMatchingRule (rules, catename, predicate) {
       if (!Array.isArray(rules)) return null
+      // C9-007：分类名在整次扫描里只归一化一次（此前 _catMatches → _safeTest 对每条规则
+      // 都重跑一遍零宽替换，成本 = 规则数 × 分类名长度）；谓词侧的正文同样由调用方预归一化。
+      const catText = this._normalizeMatchText(catename)
       for (const rule of rules) {
-        if (this._catMatches(rule, catename) && predicate(rule)) return rule
+        if (this._catMatchesText(rule, catText) && predicate(rule)) return rule
       }
       return null
     },
@@ -394,16 +464,19 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       if (!compiled || fieldValue === undefined || fieldValue === null || fieldValue === '') return false
       let value
       try { value = typeof fieldValue === 'string' ? fieldValue : String(fieldValue) } catch (e) { return false } // 脏字段 toString/Symbol 失败时保守放行，不让整批 run 崩溃
+      // C9-007：正文整次匹配只归一化一次——multi 分支的逐条谓词此前对同一段文本重跑归一化
+      // （规则数 × 文本长度的纯浪费；归一化是纯函数，重复做结果不变）。
+      const text = this._normalizeReInput(value)
 
       if (compiled._type === 're') {
-      // 简单正则（形状守卫与 .test 异常处理都在 _safeTest 内：不命中即放行）
-        return this._safeTest(compiled.re, value)
+      // 简单正则（形状守卫与 .test 异常处理都在 _safeTestText 内：不命中即放行）
+        return this._safeTestText(compiled.re, text)
       }
 
       if (compiled._type === 'multi') {
-      // 多行多分类：任意一行匹配即匹配
+      // 多行多分类：任意一行匹配即匹配（分类名与正文都已在本次匹配里归一化过一次）
         if (!Array.isArray(compiled.rules) || compiled.rules.length === 0) return false
-        return this._anyRule(compiled.rules, catename, r => this._safeTest(r.val, value))
+        return this._anyRule(compiled.rules, catename, r => this._safeTestText(r.val, text))
       }
 
       return false
@@ -477,7 +550,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         if (field === 'pingbifenlei' && /###/.test(val)) continue
         // 多行模式：逐行验证
         if (/###/.test(val)) {
-          const lines = val.split(/<br\s*\/?>|\r\n|\r|\n/) // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
+          const lines = this._splitLines(val) // C9-011：与 compileRules 同一份实现（此前就地重写正则）
           for (const line of lines) {
             const t = line.trim()
             if (!t) continue
@@ -557,10 +630,9 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       }
       if (pbStr.trim()) {
         // RULES-03：上限常量提为两形态共用——简单形态此前缺上限告警（compileRules 已置 null 并告警，
-        // 校验侧却静默通过，两端口径不一致）。
-        const PINGBITIME_MAX_DAYS = 3650000 // 与 compileRules 口径一致：超过上限视为无效
+        // 校验侧却静默通过，两端口径不一致）。C9-018：值同样取自引擎级唯一常量。
         if (/###/.test(pbStr)) {
-          const lines = pbStr.split(/<br\s*\/?>|\r\n|\r|\n/) // 与 _splitLines 口径一致(含单独 \r、<br/>，R2)
+          const lines = this._splitLines(pbStr) // C9-011：与 compileRules 同一份实现（此前就地重写正则）
           for (const line of lines) {
             const { cat, val, parts } = this._parseLine(line)
             if (parts.length >= 2) {
