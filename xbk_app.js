@@ -89,6 +89,9 @@ function createApp ({
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
   const CHANNEL_RECOVER_CLAIM_LEASE_MS = 60000
   let channelRecoverClaimSeq = 0 // 同进程内单调序号，配合 pid/时刻/随机数保证令牌唯一
+  // C1-010：Markdown 转换输入窗口的安全余量——前缀产物必须比 contentMax 多出这么多字符，
+  // 才能保证切点尾部的差异（未闭合标签/半个实体）落在被保留的正文之外。
+  const MD_BOUND_MARGIN = 64
   // APP-05：所有「按天/按时刻」的呈现口径统一到硬编码 Asia/Shanghai——日志与台账时间戳
   // （_localStamp）、日报日界（_reportToday）、运行异常告警正文的时间、RE2 标记保留期的 cutoff。
   // 进程本地时区（如 CI runner 的 UTC）不参与其中：混用会让同一时刻的 run.log 行、日报日界与
@@ -314,6 +317,29 @@ function createApp ({
         }
       }
       return warns
+    },
+
+    // C1-010：content_html 的**有界前缀**（Markdown 转换的输入窗口）。htmlToMarkdown 会把最多
+    // 10 万字符 HTML 全量转成 Markdown（实测 tag 密集样本 42.66ms/条），而产物随后立刻被
+    // contentMax（默认 3000）截断——只有 5.71% 会留在推送正文里。转换是顺序变换：前缀的产物
+    // 就是全量产物的前缀（差异只可能落在切点尾部），所以只要「前缀产物 ≥ contentMax + 余量」，
+    // 被保留的那段与全量转换逐字符相同；不足就退回全量（老路径），不改任何一条消息的内容。
+    // 只在 HTML 超过候选窗口时才做这次探针（窗口内本来就是全量转换，多探一次反而更慢）。
+    // 模板用到 {Html内容} 时调用方不得走这里——那一路是把 HTML 原样发出（10 万上限），截前缀
+    // 会真丢内容。
+    _boundMarkdownHtml (item, contentMax) {
+      if (!Formatter || typeof Formatter.htmlToMarkdown !== 'function') return item
+      const html = item && typeof item.content_html === 'string' ? item.content_html : ''
+      const window = Math.max(4096, Math.floor(contentMax * 3))
+      if (html.length <= window) return item
+      let probe
+      try {
+        probe = Formatter.htmlToMarkdown(Object.assign({}, item, { content_html: html.slice(0, window) }))
+      } catch (e) {
+        return item // 探针异常：按老路径全量转换（渲染失败由 pushOne 的既有 catch 兜住）
+      }
+      if (typeof probe !== 'string' || probe.length < contentMax + MD_BOUND_MARGIN) return item
+      return Object.assign({}, item, { content_html: html.slice(0, window) })
     },
 
     _warnLowDisk () {
@@ -1675,13 +1701,15 @@ function createApp ({
                 return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
               })()
             }
+            // C1-010：只对「要转 Markdown」的渲染做有界前缀（{Html内容} 原样发 HTML，截前缀会丢内容）。
+            const renderItem = contentTpl.includes('{Html内容}') ? pushItem : this._boundMarkdownHtml(pushItem, contentMax)
             // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
             // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
-            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax)
+            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, renderItem), titleMax)
             // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
             // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
             // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
-            const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
+            const rawDesp = Formatter.tuisong_replace(contentTpl, renderItem)
             const rawClean = Utils.sanitizeSurrogates(rawDesp)
             desp = Utils.truncateUtf16(rawClean, contentMax)
             // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留

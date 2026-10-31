@@ -3708,6 +3708,87 @@ checkAsync('C1-007 失败不得抹掉已认领的恢复通知（pending/claim �
   assert.strictEqual(st.pushdeer.recoverAlertClaim, 'tok-keep', '认领令牌必须原样保留（否则会被当成无主认领重发/吞掉）')
 })
 
+// ===== C1-010：Markdown 转换的输入窗口（先截断再转换） =====
+// 审计条目：转换发生在截断之前——每条消息最多转换 10 万字符 HTML，实测 tag 密集样本 42.66ms/条、
+// 产物 52498 字符，只有 5.71% 留在 3000 字符正文里。修复把「转换输入」限制到 contentMax×3 的
+// 有界前缀，并**证明输出不变**：前缀产物 ≥ contentMax+余量 时，被保留的正文与全量转换逐字符相同。
+function makeFormatterApp (Formatter, Utils) {
+  return createApp({
+    Config: {},
+    Utils,
+    Formatter,
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: { cacheDir: os.tmpdir() },
+    Network: {},
+    Pusher: {},
+    fs: { existsSync: () => false },
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 1048576,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: '',
+    RE2_MISSING_WARNING: '',
+    summarizeError: () => '',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+}
+
+check('C1-010 有界前缀不改变推送正文：窗口化转换与全量转换逐字符相同', () => {
+  const { createFormatter } = require('./xbk_formatter')
+  const { createUtils } = require('./xbk_utils')
+  const safeRe = (src, flags) => new RegExp(src, flags)
+  const realUtils = createUtils({ fs: require('fs'), safeRe })
+  const F = createFormatter({ Utils: realUtils, safeRe })
+  const app = makeFormatterApp(F, realUtils)
+  let html = ''
+  while (html.length < 100000) html += '<div class="x"><b>标题</b>正文内容一段，含<a href="https://e.com/a">链接</a>与&nbsp;实体。</div>'
+  html = html.slice(0, 100000) // 与审计实测同形：转换产物 52498 字符（保留率 5.71%）
+  const item = { content_html: html, url: 'https://e.com/m', title: 't', content: 'c' }
+  const fullDesp = realUtils.truncateUtf16(F.tuisong_replace('{Markdown内容}', item), 3000)
+  const bounded = app._boundMarkdownHtml(item, 3000)
+  assert.ok(bounded !== item, '超窗口 HTML 必须走窗口化路径')
+  assert.strictEqual(bounded.content_html.length, 9000, '窗口 = max(4096, contentMax×3)')
+  const boundedDesp = realUtils.truncateUtf16(F.tuisong_replace('{Markdown内容}', bounded), 3000)
+  assert.strictEqual(boundedDesp, fullDesp, '窗口化后推送正文必须与全量转换逐字符相同（不得丢内容）')
+})
+
+check('C1-010 窗口化只在安全时启用：短 HTML / 产物不足 / 无 htmlToMarkdown 都走老路径', () => {
+  const { createFormatter } = require('./xbk_formatter')
+  const { createUtils } = require('./xbk_utils')
+  const safeRe = (src, flags) => new RegExp(src, flags)
+  const realUtils = createUtils({ fs: require('fs'), safeRe })
+  const F = createFormatter({ Utils: realUtils, safeRe })
+  const app = makeFormatterApp(F, realUtils)
+  const shortItem = { content_html: '正文'.repeat(10), url: '' }
+  assert.strictEqual(app._boundMarkdownHtml(shortItem, 3000), shortItem, '窗口内不得改动（避免多算一次）')
+  // 纯标签 HTML：窗口内转换产物远不足 contentMax ⇒ 必须退回全量，不能输出半截
+  const tagOnly = { content_html: '<div class="bloat">'.repeat(6000), url: '' }
+  assert.strictEqual(app._boundMarkdownHtml(tagOnly, 3000), tagOnly, '前缀产物不足时退回全量转换')
+  const noFormatter = makeFormatterApp({}, realUtils)
+  assert.strictEqual(noFormatter._boundMarkdownHtml({ content_html: 'x'.repeat(50000) }, 3000).content_html.length, 50000,
+    'Formatter 没有 htmlToMarkdown 时不得改动（注入依赖可能缺能力）')
+})
+
+check('C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  assert.ok(/contentTpl\.includes\('\{Html内容\}'\) \? pushItem : this\._boundMarkdownHtml\(pushItem, contentMax\)/.test(code),
+    'pushOne 必须按模板是否含 {Html内容} 分流')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
