@@ -1715,6 +1715,19 @@ function createApp ({
 
         let successCount = 0
         const pushResults = []
+        // C1-017：并行/顺序两条循环的**共用**口径（成功日志、成功计数、补位间隔）收敛到一处。
+        // 旧实现里每个分支各写一遍控制台文案、`successCount` 口径与 `pushInterval` 解析——文案改一处
+        // 就漂移（并行分支曾漏掉 `!r.preview` 的等价改写），间隔语义也容易只改一边。
+        // per-worker 语义保留：并行分支每完成一条（且还有待推条目）等一次间隔，全局速率 =
+        // parallelLimit × interval；顺序分支每条之后都等（含最后一条，与旧行为逐字一致）。
+        const pushInterval = Utils.num(Config.timing.pushInterval, 0)
+        const waitPushSlot = async () => { if (pushInterval > 0) await delay(pushInterval) }
+        // 成功才打日志并计数：preview/失败都不算成功（旧并行分支 `r.ok && !r.preview` 的 !preview 恒真）。
+        const logPushed = (r) => {
+          if (!r || !r.ok) return 0
+          console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
+          return 1
+        }
         // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
         if (Config.push && Config.push.mode && Config.push.mode !== 'sequential' && Config.push.mode !== 'parallel') {
           console.warn(`⚠️ 配置「push.mode」值无效：「${safeConfigText(Config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`)
@@ -1723,7 +1736,6 @@ function createApp ({
         // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
         // parallelLimit 防御：夹取口径只在 resolveParallelWindow（取整（0.5 取 0 后回退 1）、0/负数按消息总数、硬性上限 50）。
           const limit = resolveParallelWindow(Config.push.parallelLimit, items.length)
-          const pushInterval = Utils.num(Config.timing.pushInterval, 0)
           const results = new Array(items.length)
           let nextIndex = 0
           const worker = async () => {
@@ -1733,28 +1745,20 @@ function createApp ({
               results[index] = await pushOne(items[index], notifyModule)
               // 保留可配置的补位间隔（per-worker 语义：每个 worker 完成一条后等 pushInterval 再补下一条，
               // 并行全局速率 = parallelLimit × interval；已知取舍，量小+重试兜底不改），pushInterval=0 即完成即补。
-              if (pushInterval > 0 && nextIndex < items.length) {
-                await delay(pushInterval)
-              }
+              if (nextIndex < items.length) await waitPushSlot()
             }
           }
           await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
           pushResults.push(...results)
           // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
-          for (const r of results) {
-            if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
-          }
-          // C1-024：preview 分支返回 { ok:false, preview:true }，故 `r.ok && !r.preview` 里的 !r.preview
-          // 恒真——成功只认 r.ok（与顺序分支 `if (r.ok)` 同口径），预览不伪造成功也不计失败。
-          successCount = results.filter(r => r && r.ok).length
+          for (const r of results) successCount += logPushed(r)
         } else {
         // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
-          const pushInterval = Utils.num(Config.timing.pushInterval, 0)
           for (const item of items) {
             const r = await pushOne(item, notifyModule)
             pushResults.push(r)
-            if (r.ok) { successCount++; console.log(`发现到新数据：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${urlOf(item)}`) }
-            if (pushInterval > 0) await delay(pushInterval)
+            successCount += logPushed(r)
+            await waitPushSlot()
           }
         }
         checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`)

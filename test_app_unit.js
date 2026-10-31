@@ -3595,6 +3595,21 @@ checkAsync('C1-009 用户主动关闭告警（_sendAlert 返回 undefined 且 al
   assert.strictEqual(parsed.status, 'completed', '用户关闭告警时本地已留痕，标记置 completed 防每轮重跑')
 })
 
+// ===== C1-017：并行/顺序两条推送循环的共用口径 =====
+// 审计条目：两条循环各自实现日志、成功计数、补位间隔。这里锁住「只剩一份实现」——回退修复后
+// 成功日志文案与 pushInterval 解析会各自回到两份，计数立刻变红。
+check('C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const logHits = code.match(/发现到新数据：/g) || []
+  assert.strictEqual(logHits.length, 1, `成功日志文案必须只有一处（logPushed），实际 ${logHits.length} 处`)
+  const intervalHits = code.match(/Utils\.num\(Config\.timing\.pushInterval, 0\)/g) || []
+  assert.strictEqual(intervalHits.length, 1, `pushInterval 解析必须只有一处，实际 ${intervalHits.length} 处`)
+  const countHits = code.match(/successCount \+= logPushed\(r\)/g) || []
+  assert.strictEqual(countHits.length, 2, `并行/顺序都必须经同一 logPushed 计数，实际 ${countHits.length} 处`)
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
