@@ -4999,8 +4999,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     if (!dialog) return null
     if (dialog.kind === 'save') {
       // 保存前复核是「核对」不是「确认」：改动字段 + 补推影响 + 命中样本都可能很长，
-      // 弹窗会把背后的表单挡死、用户没法对照着看哪个字段写成了什么。改成右侧抽屉
-      // （宽 560，含 .* 全命中规则时 640），表单留在背后做对照。
+      // 居中弹窗只有 440 宽、又没有自己的滚动区，长内容会顶出屏幕。改成右侧抽屉
+      // （宽 560，含 .* 全命中规则时 640，.drawer-body 自己滚）：表单留在原处但被
+      // 遮罩压暗，不能并排对照。
       // 短确认（未保存离开的三选一）仍走居中弹窗：那类内容一屏就够，弹窗更省视线移动。
       const wide = Array.isArray(dialog.wide) ? dialog.wide : []
       const changed = Array.isArray(dialog.changed) ? dialog.changed : []

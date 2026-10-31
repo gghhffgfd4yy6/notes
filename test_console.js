@@ -11641,17 +11641,88 @@ async function main () {
       '留痕不能取代面板自己的可见错误')
   })
 
-  await aok('结构红线: C7-052 抽屉注释不得再说「与列表并排做对照」（与遮罩实现相反）', () => {
+  await aok('结构红线: C7-052 抽屉不许说「能与背后并排对照」（判据绑实现、按语义扫全部文档面）', () => {
     const src = readConsoleSource()
-    // 实现是 fixed 遮罩 + 压暗列表（app.css 的 .drawer-backdrop::before），手机还铺满整屏，
-    // 「并排对照」是旧叙述里唯一与代码相反的一条——注释必须改成可被代码验证的说法。
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const block = (head) => {
+      const i = css.indexOf(head)
+      if (i < 0) return ''
+      const open = css.indexOf('{', i)
+      if (open < 0) return ''
+      let depth = 0
+      for (let k = open; k < css.length; k++) {
+        if (css[k] === '{') depth++
+        else if (css[k] === '}' && --depth === 0) return css.slice(open, k + 1)
+      }
+      return ''
+    }
+    // ① 判据的事实依据来自实现（返工 C7-052）：遮罩 fixed + inset:0 盖满视口、::before 用
+    //    rgba 黑压暗、抽屉自己只占 min(520px,100%)。三条同时成立 ⇒「背后的列表/表单能并排
+    //    对照」是假话。这一段是行为侧断言：实现真改成分栏（不再盖满 / 不再压暗）就先红，
+    //    逼着连文档和判据一起改，而不是让注释自说自话。
+    const backdrop = block('\n  .drawer-backdrop {')
+    const before = block('.drawer-backdrop::before {')
+    const drawer = block('\n  .drawer {')
+    assert.ok(/position:\s*fixed/.test(backdrop) && /inset:\s*0/.test(backdrop),
+      '抽屉遮罩必须是 fixed + inset:0（盖满视口）：要改成分栏并排，就得同时改文档与本断言')
+    const alpha = /background:\s*rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*([\d.]+)\s*\)/.exec(before)
+    assert.ok(alpha !== null && Number(alpha[1]) >= 0.4,
+      '遮罩必须以 ≥0.4 不透明度的黑压暗背后内容（背后那层因此不能当对照面）')
+    assert.ok(/width:\s*min\(var\(--drawer-w,\s*520px\),\s*100%\)/.test(drawer),
+      '抽屉宽度口径必须是 min(var(--drawer-w,520px),100%)（桌面 520 / 手机铺满）')
+    // ② 语义扫描：README / SYSTEM_CONTRACT / app.css / 全部前端模块里，凡是「抽屉语境」下的
+    //    「对照 / 参照 / 并看」一律只能是否定口径。不钉具体句子 ⇒ 换个措辞（「留出左侧列表做
+    //    对照」「表单留在背后做对照」「要对照用抽屉」）同样会被抓到；语境取同句或前后三行，
+    //    因为注释块/文档条目里的「抽屉」常写在上一句。
+    const CLAIM = /对照|参照|并看/
+    const DRAWER_CTX = /抽屉|Drawer|drawer|遮罩/
+    const NEGATED = /(不算|不是|不能|没有|没法|无法|不可能|不得|别|而非)[^。；]{0,16}(并排|左右|对照|参照|并看)|(并排|左右|对照|参照|并看)[^。；]{0,10}(不成立|不可能|做不到|的余地)/
+    const surfaces = [
+      ['README.md', fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')],
+      ['SYSTEM_CONTRACT.md', fs.readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')],
+      ['scripts/console-assets/app.css', css]
+    ]
+    for (const file of CONSOLE_MODULE_FILES) {
+      surfaces.push(['scripts/console-assets/' + file, fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', file), 'utf8')])
+    }
+    let judged = 0
+    for (const [file, body] of surfaces) {
+      const lines = body.split('\n')
+      lines.forEach((line, i) => {
+        for (const raw of line.split(/[。；]/)) {
+          const sentence = raw.trim()
+          if (sentence === '' || !CLAIM.test(sentence)) continue
+          if (!DRAWER_CTX.test(lines.slice(Math.max(0, i - 3), i + 4).join('\n'))) continue
+          assert.ok(NEGATED.test(sentence),
+            `${file}:${i + 1}「${sentence.slice(0, 60)}」把抽屉写成能与背后内容对照；` +
+            '实现是盖满视口 + 压暗，只能写「留在原处但被遮罩压暗、不能并排对照」')
+          judged++
+        }
+      })
+    }
+    // 扫描面必须真的命中抽屉的「对照」叙述：命中数是 0/1 说明语境界定写歪了，等于没扫。
+    assert.ok(judged >= 4, `抽屉的「对照」叙述必须真的被扫到（只命中 ${judged} 处 ⇒ 语境界定写歪了，等于没扫）`)
+    // ③ 三处文档面必须正面写明「被遮罩压暗 + 不能并排对照」：只把「做对照」几个字删掉不算修好。
+    const readme = surfaces[0][1]
+    const readmeAt = readme.indexOf('- 抽屉（v3.378')
+    assert.ok(readmeAt > -1, 'README 必须还留着抽屉条目（锚点缺失说明条目被改名/删了）')
+    const mustState = [
+      ['README.md 的抽屉条目', readme.slice(readmeAt, readme.indexOf('\n', readmeAt))],
+      ['components.js 的抽屉用法说明', sliceBetween(src, '// ── 组件：右侧抽屉', 'function Drawer (', '抽屉用法说明')],
+      ['pages.js 的保存复核注释', sliceBetween(src, '// 保存前复核是「核对」不是「确认」', 'const wide = Array.isArray(dialog.wide)', '保存复核注释')]
+    ]
+    for (const [label, seg] of mustState) {
+      assert.ok(seg.includes('压暗'), `${label} 必须写明背后被遮罩压暗（不能只把「做对照」几个字删掉）`)
+      assert.ok(NEGATED.test(seg.replace(/\n/g, '')), `${label} 必须写明不能并排对照（措辞可变，口径必须是否定）`)
+    }
+    // ④ 旧的两条字面量与「版本号只留一处溯源」原样保留（回退到旧措辞时它们仍会先报错）。
     assert.ok(!src.includes('与列表并排做对照'), '注释不得声称抽屉与列表并排对照（遮罩把列表压暗了）')
     assert.ok(!src.includes('列表留在背后做对照'), '注释不得声称列表在背后「做对照」')
     assert.ok(src.includes('但被遮罩压暗、不算并排对照'), '抽屉注释必须写明遮罩压暗、不是并排对照')
     assert.ok(src.includes('桌面从右侧占 520px，手机铺满整屏'), '抽屉注释必须写明桌面 520px / 手机铺满')
     // 版本号只作「这条规矩哪来的」溯源，不得当成变更日志的分行清单：抽屉这一段不许再堆 v3.xxx 行。
-    const drawer = sliceBetween(src, '// ── 推送记录：条目详情抽屉', 'function DetailRow', '抽屉注释')
-    assert.strictEqual((drawer.match(/v3\.\d+/g) || []).length, 1,
+    const drawerSeg = sliceBetween(src, '// ── 推送记录：条目详情抽屉', 'function DetailRow', '抽屉注释')
+    assert.strictEqual((drawerSeg.match(/v3\.\d+/g) || []).length, 1,
       '抽屉注释只保留一处版本溯源（v3.379），不堆版本号当变更日志')
   })
 }
