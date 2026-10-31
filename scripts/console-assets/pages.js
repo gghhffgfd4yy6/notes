@@ -2124,7 +2124,11 @@ function SearchPanel ({ onSync, active = true }) {
   const [cfg, setCfg] = useState({ limit: 20, intervalMin: 10, enabled: false, lastCheckAt: 0 })
   const [cfgReady, setCfgReady] = useState(false)
   const [cfgDraft, setCfgDraft] = useState({ limit: 20, intervalMin: 10, enabled: false })
+  // 保存设置的提示同一个 span 承载三态：中性（保存中…）/ 成功 / 失败。
+  // 旧实现 CSS 写死 color: var(--ok-fg)，失败文案也用成功绿（C7-035）。
   const [cfgMsg, setCfgMsg] = useState('')
+  const [cfgMsgTone, setCfgMsgTone] = useState('')
+  const showCfgMsg = (text, tone = '') => { setCfgMsg(text); setCfgMsgTone(tone) }
   const cfgDirty = useRef(false)
   const [checking, setChecking] = useState(false)
   const [newCounts, setNewCounts] = useState({})
@@ -2215,15 +2219,15 @@ function SearchPanel ({ onSync, active = true }) {
   }
   const editCfg = (patch) => {
     cfgDirty.current = true
-    setCfgMsg('')
+    showCfgMsg('')
     setCfgDraft((d) => ({ ...d, ...patch }))
   }
   const saveCfg = () => {
     const limit = Number(cfgDraft.limit)
     const intervalMin = Number(cfgDraft.intervalMin)
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) { setCfgMsg('条数要 1–100'); return }
-    if (!Number.isSafeInteger(intervalMin) || intervalMin < 1 || intervalMin > 1440) { setCfgMsg('间隔要 1–1440 分钟'); return }
-    setCfgMsg('保存中…')
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) { showCfgMsg('条数要 1–100', 'bad'); return }
+    if (!Number.isSafeInteger(intervalMin) || intervalMin < 1 || intervalMin > 1440) { showCfgMsg('间隔要 1–1440 分钟', 'bad'); return }
+    showCfgMsg('保存中…')
     watchEpoch.current += 1
     apiPostLineWatch({ action: 'config', limit, intervalMin, enabled: cfgDraft.enabled === true }).then((d) => {
       watchEpoch.current += 1
@@ -2236,9 +2240,9 @@ function SearchPanel ({ onSync, active = true }) {
       cfgDirty.current = false
       setCfg(next)
       setCfgDraft({ limit: next.limit, intervalMin: next.intervalMin, enabled: next.enabled })
-      setCfgMsg('已保存')
+      showCfgMsg('已保存', 'ok')
       if (Array.isArray(d.words)) setWatch(d.words)
-    }).catch((e) => setCfgMsg(`保存失败：${e.message}`))
+    }).catch((e) => showCfgMsg(`保存失败：${e.message}`, 'bad'))
   }
   const checkWatch = async () => {
     if (checking || watch.length === 0) return
@@ -2435,7 +2439,7 @@ function SearchPanel ({ onSync, active = true }) {
             onChange=${(e) => editCfg({ enabled: e.target.checked })} /> 自动检查并推送新线报
         </label>
         <${Button} variant="ghost" onClick=${saveCfg}>保存设置<//>
-        ${cfgMsg && html`<span class="ls-cfg-msg">${cfgMsg}</span>`}
+        ${cfgMsg && html`<span class=${'ls-cfg-msg' + (cfgMsgTone ? ' is-' + cfgMsgTone : '')}>${cfgMsg}</span>`}
       </div>
       <div class="ls-cfg-help">「搜索页每页」只管搜索页翻页，不影响监控。开启监控后，每 ${cfgDraft.intervalMin} 分钟看一次关注词：上次检查之后多出来的线报，每条单独推送；没有新的就不推。监控会从最新往回翻到上次检查的位置（最多 5 页），不会因为超过一页的条数就漏推。推过的会记在文件里，重启不重推。</div>
       ${cfg.enabled && cfg.lastCheckAt > 0 && html`<div class="ls-cfg-help">上次检查时间：${watchAtText(cfg.lastCheckAt)}（北京时间）</div>`}
