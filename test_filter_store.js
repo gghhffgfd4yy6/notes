@@ -171,9 +171,11 @@ test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字�
   // 文案形态「<数字> 字节」用逐字符扫描判定：Sonar javascript:S8786 把 `\d+ 字节` 判成可回溯
   // （量词 + 字面量），而这条判据需要的只是「' 字节' 前面紧邻一位数字」；扫描与 /\d+ 字节/ 等价
   // （多个 ' 字节' 出现处逐个看），无回溯面，代价 O(文案长度)。
+  // 循环条件是纯终止条件（`at >= 0`）：offset 0 是**有效命中位置**，兼作终止条件会让
+  // ' 字节 70000 字节' 这种「首个命中在开头」的文案直接退出、漏掉后面的数字。
   const hasByteCount = (text) => {
     const unit = ' 字节'
-    for (let at = text.indexOf(unit); at > 0; at = text.indexOf(unit, at + unit.length)) {
+    for (let at = text.indexOf(unit); at >= 0; at = text.indexOf(unit, at + unit.length)) {
       const prev = text[at - 1]
       if (prev >= '0' && prev <= '9') return true
     }
@@ -181,6 +183,14 @@ test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字�
   }
   assert.ok(hasByteCount(err.message) && err.message.includes(String(64 * 1024)),
     `错误文案必须给出实际字节数与上限：${err.message}`)
+  // 与 /\d+ 字节/ 的对拍：两条正向（含 offset 0 的边界）+ 一条反向控制，逐面与正则对齐。
+  // ① offset 0：旧实现 `at > 0` 把 0 当「没找到」退出，' 字节 70000 字节' 被判 false。
+  assert.strictEqual(hasByteCount(' 字节 70000 字节'), true,
+    '首个「 字节」在 offset 0 时必须继续看后面的命中（at > 0 会漏成 false，而 /\\d+ 字节/ 为 true）')
+  assert.strictEqual(hasByteCount('整份 70000 字节，上限 65536 字节'), true,
+    '普通文案（数字紧邻「 字节」）必须命中')
+  assert.strictEqual(hasByteCount('没有数字的 字节 文案'), false,
+    '「 字节」前面没有数字时不得误判（防「一律 true」让上面两条失去鉴别力）')
   // 对照：把字段砍到总量在预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
   const small = { pingbibiaoti: '中'.repeat(4000), pingbineirong: '中'.repeat(4000) }
   const okSmall = validateFilterRules({ schema: 1, revision: 0, filter: small }, deps)
