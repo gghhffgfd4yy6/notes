@@ -6603,6 +6603,64 @@ console.log('========================================\n');
     assertEqual(_normalizeReInput('a\u200Bb\uFEFFc'), 'abc', '_normalizeReInput(\'a\\u200Bb\\uFEFFc\') 应等于 \'abc\'')
   })
 
+  // C6-009（复审 a/b）：compileUserRegex 的 (源码, flags) 有限缓存语义必须由入库用例钉住，不能靠
+  // 一次性 scratch 探针。四条边界：(a) 同键命中同一实例；(b) 不同 flags 不串键、带 g/y 不缓存
+  // （lastIndex 有状态，共享实例会改变调用方可见语义）；(c) 编译失败不缓存（每次调用都经 onError
+  // 回传）；(d) 上限 256 + 超限按插入序（FIFO）淘汰最旧键。
+  // (d) 的判据与「本用例之前缓存里已有多少条」无关：连续插入 256 条新键后，容量上限 256 意味着
+  // 存活集恰好是这 256 条（更早的条目会被先挤掉），故「第 0 条仍命中」只在 MAX >= 256 时成立；
+  // 再插 1 条后第 0 条必须被淘汰（重新编译 ⇒ 新实例），即 MAX <= 256。
+  await test('C6-009: compileUserRegex 按 (源码,flags) 缓存——同键复用 / 不同 flags 与 g,y 不复用 / 失败不入缓存 / 256 条 FIFO 上限', () => {
+    // (a) 同 (源码, flags) 两次调用必须复用同一实例
+    const a1 = compileUserRegex('c6-009-same-key', 'i')
+    const a2 = compileUserRegex('c6-009-same-key', 'i')
+    assertEqual(Boolean(a1), true, '前置：re2 可用时合法模式必须编译成功（本套件其余用例同样依赖 re2）')
+    assertEqual(a1 === a2, true, '同 (源码, flags) 两次调用必须返回同一 RE2 实例（缓存未命中 = 每轮重复编译）')
+
+    // (b1) 同源码不同 flags 是两个不同的正则，不得串键
+    const bm = compileUserRegex('c6-009-flags', 'm')
+    const bi = compileUserRegex('c6-009-flags', 'i')
+    assertEqual(bm === bi, false, '同源码不同 flags 必须是两个不同实例（缓存键必须含 flags）')
+    assertEqual(bm.flags.includes('m') && !bm.flags.includes('i'), true, `flags=m 的实例必须带 m 且不带 i（实际 ${bm.flags}）`)
+    assertEqual(bi.flags.includes('i') && !bi.flags.includes('m'), true, `flags=i 的实例必须带 i 且不带 m（实际 ${bi.flags}）`)
+
+    // (b2) 带 g / y 的模式有 lastIndex 状态，共享实例会改变调用方可见语义 ⇒ 一律不缓存
+    const bg1 = compileUserRegex('c6-009-global', 'g')
+    assertEqual(bg1.test('xc6-009-global'), true, '前置：带 g 的实例必须能匹配')
+    assertEqual(bg1.lastIndex > 0, true, '前置：带 g 的实例 test 命中后 lastIndex 必须前进（只有共享实例才会串状态）')
+    const bg2 = compileUserRegex('c6-009-global', 'g')
+    assertEqual(bg2 === bg1, false, '带 g 的模式不得进入缓存（否则 lastIndex 状态跨调用方泄漏）')
+    assertEqual(bg2.lastIndex, 0, '带 g 的新实例 lastIndex 必须为 0（first-match 语义不受前一次调用影响）')
+    assertEqual(bg2.test('xc6-009-global'), true, '带 g 的新实例必须重新从 0 开始匹配并命中')
+    const by1 = compileUserRegex('c6-009-sticky', 'iy')
+    const by2 = compileUserRegex('c6-009-sticky', 'iy')
+    assertEqual(by1 === by2, false, "带 y（'iy'）的模式同样不得缓存（lastIndex 会串）")
+    assertEqual(by1.flags.includes('i') && by1.flags.includes('y'), true, `iy 实例必须同时带 i 与 y（实际 ${by1.flags}）`)
+
+    // (c) 编译失败不入缓存：两次调用都必须经 onError 回传，且都返回 null
+    const reasons = []
+    const onError = (reason) => reasons.push(reason)
+    const c1 = compileUserRegex('c6-009-(', 'i', onError)
+    const c2 = compileUserRegex('c6-009-(', 'i', onError)
+    assertEqual(c1, null, '无效模式必须返回 null')
+    assertEqual(c2, null, '无效模式每次调用都必须返回 null（失败不得被当成可用实例缓存下来）')
+    assertEqual(reasons.length, 2, '编译失败不得入缓存：两次调用都必须经 onError 回传原因（命中失败缓存会少一次告警）')
+    assertEqual(reasons.every(r => r instanceof Error), true, 'onError 回传的原因必须是 Error 实例（调用方据此写告警与 run.log）')
+
+    // (d) 上限 256 + FIFO：插入恰好 256 条后最旧一条仍命中；再插 1 条后它必须被淘汰，且最近的键仍命中
+    const prefix = 'c6-009-limit-'
+    const first = compileUserRegex(prefix + 0, 'i')
+    for (let n = 1; n < 256; n++) compileUserRegex(prefix + n, 'i')
+    assertEqual(compileUserRegex(prefix + 0, 'i') === first, true,
+      '插入恰好 256 条后最早的一条仍必须命中（上限不得小于 256，否则会提前淘汰在用的规则）')
+    const newest = compileUserRegex(prefix + 255, 'i')
+    compileUserRegex(prefix + 'over', 'i')
+    assertEqual(compileUserRegex(prefix + 0, 'i') === first, false,
+      '超过 256 条后最早插入的键必须被淘汰（重新编译 ⇒ 新实例；删掉上限即被动态关键词撑成无界内存）')
+    assertEqual(compileUserRegex(prefix + 255, 'i') === newest, true,
+      'FIFO 只淘汰最旧键：最近的键必须仍命中（淘汰错端在此变红）')
+  })
+
   // ==================== 94. 死代码检测(可达性) ====================
   console.log('\n📂 94. 死代码检测')
 
