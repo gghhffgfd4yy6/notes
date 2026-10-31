@@ -5,7 +5,7 @@ import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, Button, LeaveGuard
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
-import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, tabFromHash } from './pure.mjs'
+import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, snapshotOk, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { Component, html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -64,10 +64,10 @@ function readSnapshot () {
     const raw = window.localStorage.getItem(SNAP_KEY)
     if (!raw) return null
     const v = JSON.parse(raw)
-    if (!v || v.v !== BOOT.version || typeof v.at !== 'number') return null
-    if (!v.status || typeof v.status !== 'object' || Array.isArray(v.status)) return null
-    if (!Array.isArray(v.runs)) return null
-    return v
+    // 版本守卫留在这层（既有红线逐字钉住 `v.v !== BOOT.version`，且它同时挡住下面
+    // 对 v 的解引用）；深层结构校验走 pure.mjs 的 snapshotOk（C7-056，Node 侧可测）。
+    if (!v || v.v !== BOOT.version) return null
+    return snapshotOk(v, BOOT.version) ? v : null
   } catch (e) { return null }
 }
 function writeSnapshot (status, runs, startedAt) {

@@ -11525,6 +11525,38 @@ async function main () {
     assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['config'], '覆盖写回必须挪到队尾')
     assert.strictEqual(box.touchConditional('nope'), null, '未命中返回 null（交给调用方按无条件请求发）')
   })
+
+  await aok('行为: C7-056 首屏快照逐层校验（容器对、嵌套部件坏掉也必须丢弃）', async () => {
+    const { snapshotOk } = await import('./scripts/console-assets/pure.mjs')
+    const part = (status, value) => ({ status, value })
+    const base = (over = {}) => ({
+      v: 'v3.400',
+      at: 1760000000000,
+      status: { generatedAt: 1, run: part('ok', { at: '2026-10-31 10:00:00', total: 3 }), report: part('ok', { date: '2026-10-31' }) },
+      runs: [{ id: '1.2', startedAt: 1 }],
+      ...over
+    })
+    assert.strictEqual(snapshotOk(base(), 'v3.400'), true, '合法快照必须接受（否则每帧都退回骨架屏）')
+    assert.strictEqual(snapshotOk(base({ v: 'v3.399' }), 'v3.400'), false, '版本不符照旧丢弃')
+    assert.strictEqual(snapshotOk(base({ at: 'x' }), 'v3.400'), false, 'at 必须是数字')
+    assert.strictEqual(snapshotOk(base({ at: Number.NaN }), 'v3.400'), false, 'at 为 NaN 的快照要丢（typeof NaN === "number" 会漏过旧判据）')
+    // 容器层全对、只有嵌套部件坏掉——旧实现全部放行，坏字段直接进 StatusCards。
+    assert.strictEqual(snapshotOk(base({ status: { run: 'ok' } }), 'v3.400'), false, '部件是字符串必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { run: { value: { total: 1 } } } }), 'v3.400'), false, '部件缺 status 必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { run: { status: 'ok', value: '1 条推送' } } }), 'v3.400'), false, 'value 是标量必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { stats: { status: 'ok', value: [1, 2] } } }), 'v3.400'), false, 'value 是数组必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { lock: 3 } }), 'v3.400'), false, 'lock 是标量必须丢弃（App 读 lock.held）')
+    // 数组里混进 null：旧实现 Array.isArray 通过，渲染期 runs.some(r => …) 直接 TypeError。
+    assert.strictEqual(snapshotOk(base({ runs: [{ id: '1.2' }, null] }), 'v3.400'), false, 'runs 里混 null 必须丢弃（渲染期会当场抛）')
+    assert.strictEqual(snapshotOk(base({ runs: [1, 2] }), 'v3.400'), false, 'runs 条目是标量必须丢弃')
+    // 部件整体缺席不算坏：服务端只给一部分时，缺的卡片自己显示占位。
+    assert.strictEqual(snapshotOk(base({ status: { generatedAt: 1 } }), 'v3.400'), true, '部件缺席不等于损坏')
+    // 接线：readSnapshot 必须走这个校验，别在 ui.js 里再留一份浅校验。
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const fn = sliceBetween(ui, 'function readSnapshot', 'function writeSnapshot', 'readSnapshot')
+    assert.ok(fn.includes('snapshotOk(v, BOOT.version)'), 'readSnapshot 必须交给 pure.mjs 的 snapshotOk 判定')
+    assert.ok(!fn.includes('typeof v.at'), '不得保留第二份浅校验（两套口径会分叉）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

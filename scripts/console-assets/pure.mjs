@@ -417,6 +417,35 @@ export function isTimeoutError (err) {
   return /abort|timed ?out|timeout|响应体读取超时/i.test(raw)
 }
 
+// 首屏快照的逐层校验（C7-056）：readSnapshot 此前只校验到容器层（status 是对象、
+// runs 是数组），部件里的 value 原样透传给渲染层。快照是**上一个页面版本**写下的
+// localStorage——服务端字段形状一变，坏快照会直接喂给 StatusCards（state.run.value.*、
+// stats.today.*、runs 每条的 r.id/r.finishedAt），首帧就抛在 ErrorBoundary 上，而
+// 「先用旧值渲染」本来是弱网冷启动的兜底路径（最不该在这条路上炸）。
+// 口径只认「读得安全」：部件必须是对象、status 必须是字符串、value 必须是对象或空；
+// runs 每条必须是非空对象（数组里混进 null 会让 runs.some 当场 TypeError）。
+const SNAPSHOT_PART_KEYS = ['run', 'report', 'channels', 'diagnostics', 'stats']
+function snapshotPartOk (part) {
+  if (part === null || part === undefined) return true // 部件缺席不算坏（服务端没给）
+  if (typeof part !== 'object' || Array.isArray(part)) return false
+  if (typeof part.status !== 'string') return false
+  const value = part.value
+  if (value === null || value === undefined) return true
+  return typeof value === 'object' && !Array.isArray(value)
+}
+export function snapshotOk (v, version) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  if (v.v !== version || !Number.isFinite(v.at)) return false
+  if (!v.status || typeof v.status !== 'object' || Array.isArray(v.status)) return false
+  for (const key of SNAPSHOT_PART_KEYS) {
+    if (!snapshotPartOk(v.status[key])) return false
+  }
+  const lock = v.status.lock
+  if (lock !== null && lock !== undefined && (typeof lock !== 'object' || Array.isArray(lock))) return false
+  if (!Array.isArray(v.runs)) return false
+  return v.runs.every((r) => !!r && typeof r === 'object' && !Array.isArray(r))
+}
+
 // 标签页哈希（v3.307）：刷新/后退不丢当前页。只认白名单，非法 hash 回概览。
 // v3.370 加 search（线报搜索）；filter 仍由 ui.js 的 resolveTab 单独认（历史原因）。
 export const TAB_KEYS = ['overview', 'messages', 'search', 'logs', 'config', 'sys']
