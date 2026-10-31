@@ -3789,6 +3789,50 @@ check('C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 
     'pushOne 必须按模板是否含 {Html内容} 分流')
 })
 
+// C1-010 返工（评审 must_fix）：探针长度不得把 htmlToMarkdown 追加的「原文链接」尾巴算进正文余量。
+// 构造：10 万字符 HTML，前 9000 字符（窗口）只产出 2965 字符正文（< contentMax=3000），其余部分是
+// '**B**' 密集正文（全量 60001 字符）；url 75 字符 ⇒ 尾巴 161 字符把「带 url 的探针」顶到 3126，
+// 越过 contentMax + 64 = 3064。旧实现据此保留窗口：截断后的推送正文尾部变成
+// `…原文链接：[https://`（首差在下标 2965/3000），而 pushOne 见 '原文链接' 已存在便不再补链 ⇒
+// 收件人拿到一条被截断的坏链接。全量转换在同一位置是干净正文，尾部由 pushOne 补完整链接。
+check('C1-010 探针不计「原文链接」尾巴：正文略短于 contentMax + 长 url 时必须退回全量转换', () => {
+  const { createFormatter } = require('./xbk_formatter')
+  const { createUtils } = require('./xbk_utils')
+  const safeRe = (src, flags) => new RegExp(src, flags)
+  const realUtils = createUtils({ fs: require('fs'), safeRe })
+  const F = createFormatter({ Utils: realUtils, safeRe })
+  const app = makeFormatterApp(F, realUtils)
+  const contentMax = 3000
+  const windowLen = Math.max(4096, contentMax * 3)
+  const bodyChars = 2965 // < contentMax；且 (windowLen - bodyChars) 可被 '<script></script>'(17) 整除
+  const pad = '<script></script>' // 转换产物为空（实测），只用来把窗口填满
+  const item = {
+    title: 't',
+    content: 'c',
+    url: 'https://e.com/' + 's'.repeat(61), // 75 字符 ⇒ 尾巴 161 字符
+    content_html: 'A'.repeat(bodyChars) + pad.repeat((windowLen - bodyChars) / pad.length) +
+      '<b>B</b>'.repeat((100000 - windowLen) / 8)
+  }
+  const despOf = (it) => realUtils.truncateUtf16(F.tuisong_replace('{Markdown内容}', it), contentMax)
+  const windowItem = (over) => Object.assign({}, item, { content_html: item.content_html.slice(0, windowLen) }, over)
+  // 前置条件（锁定复现形态）：窗口正文本身短于 contentMax，是 url 尾巴把它顶过阈值的
+  assert.strictEqual(F.htmlToMarkdown(windowItem({ url: '' })).length, bodyChars, '前置条件：窗口正文长度 = bodyChars')
+  assert.ok(bodyChars < contentMax, '前置条件：窗口正文短于 contentMax')
+  assert.ok(F.htmlToMarkdown(windowItem({})).length >= contentMax + 64,
+    '前置条件：把 url 尾巴算进探针会越过 contentMax+64（旧实现的误判入口）')
+  const fullDesp = despOf(item)
+  const bounded = app._boundMarkdownHtml(item, contentMax)
+  assert.strictEqual(bounded, item, '正文不足时必须退回全量转换，不得保留窗口')
+  assert.strictEqual(despOf(bounded), fullDesp, '推送正文必须与全量转换逐字符相同')
+  // 「原文链接」要么整条不在正文里（交给 pushOne 补一条完整链接），要么是完整链接；不得出现被截断的半条
+  const brokenLink = (s) => {
+    const i = s.lastIndexOf('原文链接：')
+    return i !== -1 && !/^原文链接：\[[^\]\n]*\]\(<?https?:\/\/[^)\s]+>?\)/.test(s.slice(i))
+  }
+  assert.ok(!brokenLink(fullDesp), '前置条件：全量转换的推送正文不含坏链接')
+  assert.ok(!brokenLink(despOf(bounded)), '不得把被截断的「原文链接：[https://…」推进正文')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
