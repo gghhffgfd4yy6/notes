@@ -637,6 +637,9 @@ function App () {
   // 乱序防护（Sourcery vwE）：每次 refresh 领号，落后响应直接丢弃（落后 ≠ 失败，
   // 落后者静默丢弃不报错——Sourcery vwB：报「刷新失败」是误导）。
   const refreshSplit = useCallback(async (opts = {}) => {
+    // 返回三态（C7-032）：true=刷新成功；false=**这一拍没发请求**（表单暂停 / 上一拍还在飞 /
+    // 序号过期）；'failed'=真发出去但失败。旧实现把「跳过」与「失败」都写成 false，调用方
+    // 只能把跳过当失败 ⇒ 过滤规则页带未保存草稿时回前台会常驻一条撤不掉的假告警。
     // 表单交互暂停期间不发起刷新；已在途的响应也会在下方 apply 前被丢弃。
     // 下拉刷新是明确的手势意图，传 { force: true } 跨过这段暂停。
     if (!(opts && opts.force) && Date.now() < formPauseUntilRef.current) return false
@@ -689,7 +692,7 @@ function App () {
       // 只有两边都落定才算「刷新成功」：调用方（回前台补拉）据此决定要不要推进时间戳。
       // 轮询成功也记一笔：否则「刚轮询完就切回前台」会被当成很久没刷新而多发一轮（Sourcery #315-11）。
       if (errs.length === 0) lastRefreshRef.current = Date.now()
-      return errs.length === 0
+      return errs.length === 0 ? true : 'failed'
     } finally {
       inFlightRef.current = false
       if (pendingRefreshRef.current) {
@@ -952,7 +955,11 @@ function App () {
     const ok = sRes.status === 'fulfilled' && sRes.value === true
     // 失败不推进时间戳：否则接下来 30s 内都不会再补，数据一直停在旧值。
     if (ok) lastRefreshRef.current = Date.now()
-    return ok
+    // 返回三态（C7-032）：true=成功、false=**没发请求**（上面的表单暂停 / 没有面板接手）、
+    // 'failed'=真发出去但失败。只有后者该在顶栏记一条告警——旧实现两种都回 false，
+    // 调用点用 ok === false 判失败，于是「跳过」也变成「后台刷新异常（自动重试中）」。
+    if (ok) return true
+    return sRes.status === 'rejected' || sRes.value === 'failed' ? 'failed' : false
   }, [refreshSplit, refreshAuto])
   const pullRefresh = useCallback(() => refreshActive({ force: true }), [refreshActive])
   // 回到前台：隐藏期间所有轮询都停了（主轮询 tick、面板自己的 interval、/api/auto），
@@ -968,7 +975,9 @@ function App () {
     const onVis = () => {
       if (document.hidden) return
       if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return
-      refreshActive({ respectFormPause: true }).then((ok) => noteQuiet('回前台补拉失败', ok === false), () => noteQuiet('回前台补拉失败', true))
+      // 只有真发出去又失败才留痕（C7-032）：refreshActive 的 false 是「跳过/没发请求」
+      // （表单暂停、过滤规则页带未保存草稿时该面板不接下拉），跳过不是失败。
+      refreshActive({ respectFormPause: true }).then((state) => noteQuiet('回前台补拉失败', state === 'failed'), () => noteQuiet('回前台补拉失败', true))
     }
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)

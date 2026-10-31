@@ -11672,6 +11672,96 @@ async function main () {
     const helper = sliceBetween(ui, 'const noteQuiet = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'noteQuiet')
     assert.ok(helper.includes('if (!failed && has) return prev.filter'), '成功必须撤掉对应条目（不能留一条过期告警）')
   })
+
+  await aok('行为: C7-032 回前台补拉区分「跳过」与「真失败」（跳过不得留告警，真失败必须留）', async () => {
+    // 直接执行 ui.js 里真实的 refreshActive 与真实的调用行（src slice + vm），不重写一份等价逻辑：
+    // 重写的实现改了 ui.js 也不会红。改回「跳过也返回 false / 调用点用 ok === false 判失败」时本用例红。
+    const acorn = require('acorn')
+    const vm = require('node:vm')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const ast = acorn.parse(ui, { ecmaVersion: 'latest', sourceType: 'module' })
+    let arrow = null
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return
+      if (node.type === 'VariableDeclarator' && node.id && node.id.name === 'refreshActive' &&
+        node.init && node.init.type === 'CallExpression' && node.init.arguments[0] &&
+        node.init.arguments[0].type === 'ArrowFunctionExpression') arrow = node.init.arguments[0]
+      for (const key of Object.keys(node)) {
+        if (key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach(walk)
+        else if (value && typeof value === 'object') walk(value)
+      }
+    }
+    walk(ast)
+    assert.ok(arrow, '找不到 refreshActive 的实现（本用例要执行它，绑定名/形态不能改）')
+    const makeRefresh = (ctx) => vm.runInNewContext('(' + ui.slice(arrow.start, arrow.end) + ')', ctx)
+    const setup = ({ paused = false, waits = 0, split = true } = {}) => {
+      const calls = []
+      const detailWaits = []
+      for (let i = 0; i < waits; i++) detailWaits.push(Promise.resolve())
+      const ctx = {
+        Date,
+        Promise,
+        CustomEvent,
+        PULL_EVENT: 'xbk-console-pull-probe',
+        formPauseUntilRef: { current: paused ? Date.now() + 60000 : 0 },
+        lastRefreshRef: { current: 0 },
+        refreshAuto: () => Promise.resolve(),
+        refreshSplit: (...args) => {
+          calls.push(args)
+          return split instanceof Error ? Promise.reject(split) : Promise.resolve(split)
+        },
+        window: { dispatchEvent: (ev) => { if (ev && ev.detail) ev.detail.waits = detailWaits.slice() } }
+      }
+      return { ctx, calls }
+    }
+    // ① 表单交互暂停：一个请求都不发 ⇒ false（未尝试），不是 'failed'。
+    const paused = setup({ paused: true, waits: 1, split: true })
+    assert.strictEqual(await makeRefresh(paused.ctx)({ respectFormPause: true }), false,
+      '表单暂停时回前台补拉是「跳过」，不得返回失败态（否则顶栏常驻假告警）')
+    assert.strictEqual(paused.calls.length, 0, '表单暂停期间不得发请求')
+    // ② 当前页没有面板接手（过滤规则页带未保存草稿时不注册下拉监听）⇒ 跳过。
+    const noPanel = setup({ waits: 0, split: true })
+    assert.strictEqual(await makeRefresh(noPanel.ctx)({}), false,
+      '没有面板接手时是「跳过」，不得返回失败态')
+    assert.strictEqual(noPanel.calls.length, 0, '没有面板接手时连全局请求也不得发')
+    // ③ 真发出去但失败 ⇒ 'failed'（唯一该留告警的状态）。
+    const failed = setup({ waits: 1, split: 'failed' })
+    assert.strictEqual(await makeRefresh(failed.ctx)({}), 'failed', '真失败的刷新必须回失败态')
+    assert.strictEqual(failed.calls.length, 1, '失败分支确实发起了刷新')
+    // ④ refreshSplit 回 false = 上一拍还在飞 / 序号过期（没发或结果已作废）⇒ 仍是跳过。
+    const inFlight = setup({ waits: 1, split: false })
+    assert.strictEqual(await makeRefresh(inFlight.ctx)({}), false,
+      'refreshSplit 的 false（在飞/序号过期）不是失败，不得升级成失败态')
+    // ⑤ 成功 ⇒ true，并推进 lastRefreshRef（否则回前台静默窗的判据恒真）。
+    const okRun = setup({ waits: 1, split: true })
+    assert.strictEqual(await makeRefresh(okRun.ctx)({}), true, '刷新成功必须回成功态')
+    assert.ok(okRun.ctx.lastRefreshRef.current > 0, '成功后必须推进 lastRefreshRef')
+    // ⑥ refreshSplit 抛错 ⇒ 失败态（不能当成跳过被静默）。
+    const thrown = setup({ waits: 1, split: new Error('boom') })
+    assert.strictEqual(await makeRefresh(thrown.ctx)({}), 'failed', '刷新抛错必须回失败态')
+    // 调用点（取 ui.js 里真实那一行执行）：只有 'failed' 才 noteQuiet 留痕；false/true 都不留。
+    const line = ui.split('\n').find((l) => l.includes('refreshActive({ respectFormPause: true })'))
+    assert.ok(line, '找不到回前台补拉的调用行')
+    const quietFor = async (make) => {
+      const quiet = []
+      const ctx = {
+        refreshActive: make,
+        noteQuiet: (kind, failed) => { if (failed) quiet.push(kind) }
+      }
+      vm.runInNewContext(line.trim(), ctx)
+      await new Promise((resolve) => setImmediate(resolve))
+      return quiet
+    }
+    assert.deepStrictEqual(await quietFor(async () => false), [],
+      '跳过（没发请求）不得产生「后台刷新异常」条目')
+    assert.deepStrictEqual(await quietFor(async () => true), [], '成功不得留下告警')
+    assert.deepStrictEqual(await quietFor(async () => 'failed'), ['回前台补拉失败'],
+      '真失败必须在顶栏留一条可见痕迹')
+    assert.deepStrictEqual(await quietFor(async () => { throw new Error('boom') }), ['回前台补拉失败'],
+      '请求抛错必须在顶栏留一条可见痕迹')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
