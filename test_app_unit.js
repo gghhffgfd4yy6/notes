@@ -3610,6 +3610,37 @@ check('C1-017 推送循环共用口径：成功日志文案与 pushInterval 解�
   assert.strictEqual(countHits.length, 2, `并行/顺序都必须经同一 logPushed 计数，实际 ${countHits.length} 处`)
 })
 
+// ===== C1-011：run.log 的 fail-open 分支必须有次级上限 =====
+// 审计条目：≤1MiB + 行完整只在拿到锁时成立；拿不到锁（锁文件 EACCES/属主异常）就无限追加。
+// 既有用例（「锁异常（EACCES）⇒ fail-open 仅追加；超限也不截尾」）锁的是 2×1MiB 仍要追加，
+// 所以次级上限必须高于它；这里验证超过硬上限后不再写盘、行回显 stdout、且仍不做无锁读改写。
+check('C1-011 fail-open 且超过次级上限 ⇒ 不再写盘、行回显 stdout、不做无锁读改写', () => {
+  const e = new Error('x'); e.code = 'EACCES'
+  const rec = makeLogFs({ openSync: (p, flag) => { if (flag === 'wx') throw e; return 8 }, size: 9 * LIMIT })
+  const { app } = makeLogApp({ rec })
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => logs.push(a.map(String).join(' '))
+  try {
+    app._writeRunLog('overflow-line\n')
+  } finally {
+    console.log = origLog
+  }
+  assert.deepStrictEqual(rec.rec.append, [], '超过次级上限后不得继续追加（无界增长的根因）')
+  assert.deepStrictEqual(logs, ['overflow-line'], '行不得丢：必须回显到 stdout（青龙任务日志可见）')
+  assert.strictEqual(rec.rec.read.length, 0, '无锁路径不得做读改写（会冲掉并发追加的行）')
+  assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx'], '不得在无锁时开 r+')
+  assert.strictEqual(rec.rec.unlink.length, 0)
+})
+
+check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁内截尾（8×1MiB 上限不得误伤）', () => {
+  const rec = makeLogFs({ size: 2 * LIMIT, tail: '\nTAIL' })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.strictEqual(rec.rec.append.length, 1, '持锁时照常追加')
+  assert.strictEqual(cap.length, 1, '持锁时超 1MiB 必须走原子写回（截尾）')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

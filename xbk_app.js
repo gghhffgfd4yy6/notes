@@ -176,9 +176,23 @@ function createApp ({
             if (trailingNl) rest = rest.slice(0, -1)
             out = prefix + Utils.truncateUtf16(rest, 512) + (trailingNl ? '\n' : '')
           }
+          // C1-011：fail-open（拿不到锁）分支的**次级上限**。旧实现只在锁内截尾（下方
+          // `lockFd !== null` 才是截尾前提），拿不到锁就无限追加：锁文件属主/权限异常（EACCES）
+          // 时锁永远拿不到，run.log 无界增长，能占满缓存盘。这里给无锁路径一个硬上限
+          // （8×1MiB）：超过后不再写盘、整行回显 stdout（青龙任务日志仍可见，行不丢）。
+          // 真正的截尾仍只在锁内做——无锁读改写会冲掉并发追加的行，那条边界不放宽。
+          const LIMIT = 1024 * 1024
+          const FAIL_OPEN_HARD_LIMIT = 8 * LIMIT
+          if (lockFd === null) {
+            let oversized = false
+            try { oversized = fs.statSync(logPath).size > FAIL_OPEN_HARD_LIMIT } catch (e) { oversized = false }
+            if (oversized) {
+              console.log(out.endsWith('\n') ? out.slice(0, -1) : out)
+              return
+            }
+          }
           fs.appendFileSync(logPath, out, 'utf8')
           const st = fs.statSync(logPath)
-          const LIMIT = 1024 * 1024
           // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
           // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
           if (lockFd !== null && st.size > LIMIT) {
