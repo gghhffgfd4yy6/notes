@@ -571,6 +571,18 @@ check('_writeRunLog 合法基名保留：filter-diagnostics.ndjson', () => {
   assert.deepStrictEqual(rec.rec.append, [[path.join(CACHE_DIR, 'filter-diagnostics.ndjson'), 'l\n', 'utf8']])
 })
 
+check('C1-028 _writeRunLog 只认白名单日志名：push.json 不得被当成日志追加（判重缓存会变坏 JSON）', () => {
+  const rec = makeLogFs()
+  const seen = []
+  const { app } = makeLogApp({ rec, isRegularOrMissing: (p) => { seen.push(p); return true } })
+  const r = withCapture('error', () => app._writeRunLog('{"x":1}\n', 'push.json'))
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, '{"x":1}\n', 'utf8']],
+    '越界基名必须回退 run.log——追加进 push.json 会让判重缓存读侧判坏、原件被隔离、全量重推')
+  assert.deepStrictEqual(seen, [LOG_PATH], '落盘目标只能是白名单里的日志文件')
+  assert.ok(r.msgs.some((m) => m.includes('拒绝写入非白名单日志文件 push.json')),
+    `越界必须点名告警（否则日志行凭空换位置）：${JSON.stringify(r.msgs)}`)
+})
+
 // ----- _writeRunLog：锁语义 / 清理 / 失败静默 -----
 check('_writeRunLog 正常追加：默认 run.log、utf8、锁令牌 pid:start、锁清理', () => {
   const rec = makeLogFs()

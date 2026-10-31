@@ -98,6 +98,8 @@ function createApp ({
     try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
   }
 
+  // C1-028：_writeRunLog 允许写入的**唯一**文件名名单（见该方法头注释）。新增日志只改这里。
+  const LOG_FILES = Object.freeze(new Set(['run.log', 'filter-diagnostics.ndjson']))
   // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
   // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
   // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
@@ -198,14 +200,21 @@ function createApp ({
     // 常驻实例共用同一 cacheDir）——进程 A「追加→读尾→原子改写」的读改写间隙里，B 刚追加的行会被
     // A 的整文件覆盖冲掉（丢日志）。修复：用 run.log.lock（O_EXCL）把「追加 + 超限截尾」包成互斥
     // 临界区；拿不到锁（竞争/陈旧锁/异常）时 fail-open 只追加不截尾，日志绝不因锁而丢。
-    // 日志记录名仅接受文件基名，防未来调用传入 ../ 或绝对路径写出缓存目录。
+    // 日志记录名仅接受**白名单内的基名**：光挡 ../ 与绝对路径不够（C1-028）——任何「同名基名」
+    // 都能穿过旧判据，内部调用一旦传 'push.json' 就会把一行文本追加进判重缓存。缓存是整份 JSON
+    // 数组，坏文本会被读侧判 corrupt ⇒ 原件改名隔离、缓存重建为空 ⇒ 判重身份全丢、全量重推。
+    // 新增日志文件必须显式加进 LOG_FILES（越界即回退 run.log 并点名，不静默丢弃）。
     // C1-006：opts.truncateError=false 关闭「单行 ERROR 截断」启发式——_writeFilterDiagnostics 传的是
     // 整批 NDJSON（lines.join('\n')），按整串首个 " ERROR " 截到 512 字符会把后面的记录连同其 JSON
     // 结构一起切掉，末行留下半条非法 JSON（13 条只落 4~7 行）。批量写入必须逐条整行落盘，截断只在
     // 单条日志自己身上发生。
     _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
-        const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
+        const isWhitelisted = typeof filename === 'string' && LOG_FILES.has(filename)
+        if (!isWhitelisted && typeof filename === 'string') {
+          console.error(`拒绝写入非白名单日志文件 ${filename}（仅允许 ${[...LOG_FILES].join(' / ')}），已改回 run.log`)
+        }
+        const safeFilename = isWhitelisted ? filename : 'run.log'
         const logPath = path.join(this._cacheDir(), safeFilename)
         if (!this._isRegularOrMissing(logPath)) {
           console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
