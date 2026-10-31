@@ -882,6 +882,54 @@ function captureConsole (method, fn) {
 
 const cacheWrites = (writes) => writes.filter(w => w.label === '缓存')
 
+// ===== C3-008：墓碑 0 字节 / 损坏不得被当成「空集」静默吞掉 =====
+// 旧实现：0 字节走 `!result.text` 直接 return null（status 仍是 ok）、损坏走 JSON.parse 异常，
+// 两条出口都不置位 _tombstoneLoaded ⇒ 每条消息重读一次整份墓碑（上限 8MiB）+ 每条一条 WARN；
+// 下一次落墓碑又把损坏文件整份覆盖写回（无 .bak，现场永久销毁）。修后：0 字节记 empty、
+// 损坏先改名隔离再记 corrupt，二者都算「磁盘已给出确定答案」（置位 + 只告警一次）。
+check('C3-008 墓碑损坏：先改名隔离（原件保留）再按空集处理，置位且只读一次/只告警一次', () => {
+  const name = 'c3008_corrupt.json'
+  const seenPath = path.join(__dirname, 'xianbaoku_cache', name) + '.seen.json'
+  const corruptText = '{"v":1,"id":["a"],"urlOnly":['
+  let reads = 0
+  const h = makeBatchStore({ name, files: { [seenPath]: corruptText }, readStatus: (p) => { if (p === seenPath) reads++; return null } })
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-a' }), false, '损坏墓碑按空集处理')
+    assert.strictEqual(h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-b' }), false, '第二次判重不得命中')
+  })
+  assert.strictEqual(reads, 1, `损坏墓碑确认后不得每条消息重读磁盘（实际读盘 ${reads} 次）`)
+  assert.strictEqual(h.store._tombstoneLoaded.has(h.filePath), true, '已隔离的损坏墓碑必须置位（否则每条消息重读）')
+  assert.strictEqual(h.store._tombstoneLoadStatus[h.filePath], 'corrupt', '读盘状态必须如实记为 corrupt')
+  const backups = [...h.fs.files.keys()].filter(p => p.startsWith(seenPath + '.corrupt.') && p.endsWith('.bak'))
+  assert.strictEqual(backups.length, 1, `损坏墓碑必须改名隔离一份（实际 ${JSON.stringify([...h.fs.files.keys()])}）`)
+  assert.strictEqual(h.fs.files.get(backups[0]), corruptText, '隔离件必须逐字保留损坏原文（只隔离不删除）')
+  assert.strictEqual(h.fs.files.has(seenPath), false, '在线路径必须让出来（下一次落墓碑重建）')
+  assert.strictEqual(warns.filter(w => w.includes('墓碑文件损坏') && w.includes('已改名隔离')).length, 1,
+    `损坏只应告警一次（每条消息一条 WARN 会把日志刷屏）：${JSON.stringify(warns)}`)
+  // 下一次落墓碑按空集重建：新文件可写，且隔离件仍在（旧身份可人工取回）
+  h.store._tombstoneDropped(h.filePath, [{ id: 'rebuilt-7' }])
+  assert.strictEqual(h.fs.files.has(seenPath), true, '下一次落墓碑必须在原路径重建')
+  assert.ok(String(h.fs.files.get(seenPath)).includes('rebuilt-7'), '重建内容必须包含本次身份')
+  assert.strictEqual(h.fs.files.get(backups[0]), corruptText, '重建不得动隔离件（旧身份仍在 .bak 里）')
+})
+
+check('C3-008 墓碑 0 字节：按 empty 置位、不产生 .bak、只读一次/只告警一次', () => {
+  const name = 'c3008_empty.json'
+  const seenPath = path.join(__dirname, 'xianbaoku_cache', name) + '.seen.json'
+  let reads = 0
+  const h = makeBatchStore({ name, files: { [seenPath]: '' }, readStatus: (p) => { if (p === seenPath) reads++; return null } })
+  const warns = captureConsole('warn', () => {
+    h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-a' })
+    h.store._tombstoneHasIdentity(h.filePath, { id: 'probe-b' })
+  })
+  assert.strictEqual(reads, 1, `0 字节墓碑确认后不得每条消息重读磁盘（实际读盘 ${reads} 次）`)
+  assert.strictEqual(h.store._tombstoneLoaded.has(h.filePath), true, '0 字节墓碑必须置位（等价于确认缺失）')
+  assert.strictEqual(h.store._tombstoneLoadStatus[h.filePath], 'empty', '读盘状态必须与「损坏」区分开（empty）')
+  assert.deepStrictEqual(h.fs.ops.rename, [], '0 字节没有任何字节可隔离 ⇒ 不得产生备份')
+  assert.strictEqual(warns.filter(w => w.includes('0 字节')).length, 1, `0 字节只应告警一次：${JSON.stringify(warns)}`)
+})
+
+
 check('_memoSet: 非字符串键必须 String 化后落键（Symbol 键也要可枚举、可参与淘汰）', () => {
   const s = createProbeStore()
   assert.strictEqual(s._memoSet(Symbol('sk'), 'v'), true)

@@ -200,6 +200,9 @@ function createMessageStore ({
     // 墓碑最近一次读盘结果（按缓存文件路径）：仅用于区分「确认缺失」与「读取失败」，
     // 决定 _tombstoneLoaded 是否置位（missing/ok 置位，其余保留重试窗口）。
     _tombstoneLoadStatus: {},
+    // C3-008：已告警过的墓碑读取问题（每进程每文件每类一次）——旧实现 ioError/损坏每次调用都 warn，
+    // 而损坏文件又不置位 _tombstoneLoaded ⇒ 每条消息一条 WARN（N 条消息 = N 条日志 + N 次全文件读）。
+    _tombstoneWarned: new Set(),
     // C3-013：已就「判重主存重建为空但墓碑仍在」告警过的文件（每进程每文件一次，防刷屏）。
     _residualTombstoneWarned: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -1140,38 +1143,87 @@ function createMessageStore ({
         fill(ts.idWithUrl, data.idWithUrl)
         fill(ts.anon, data.anon)
         this._tombstoneLoaded.add(filePath)
-      } else if (this._tombstoneLoadStatus[filePath] === 'missing') {
+      } else if (this._tombstoneLoadStatus[filePath] === 'missing' ||
+        this._tombstoneLoadStatus[filePath] === 'empty' ||
+        this._tombstoneLoadStatus[filePath] === 'corrupt') {
+        // C3-008：missing（确认不存在）/ empty（0 字节，没有任何身份可复用）/ corrupt（已改名隔离）
+        // 都是「磁盘已给出确定答案」，必须置位——旧实现只认 missing，0 字节与损坏文件于是每条消息
+        // 都重读一次整份墓碑（上限 8MiB ⇒ N×8MiB 读放大）且每次读失败都再打一条 WARN。
         this._tombstoneLoaded.add(filePath)
       }
       return ts
     },
 
+    /** 墓碑读取问题告警：每进程每文件每类只打一次（C3-008：旧实现每条消息都 warn）。 */
+    _warnTombstoneOnce (filePath, kind, message) {
+      const key = filePath + '|' + kind
+      if (this._tombstoneWarned.has(key)) return false
+      this._tombstoneWarned.add(key)
+      console.warn(message)
+      return true
+    },
+
     /** 读墓碑文件并解析；缺失/损坏/非对象统一返回 null（调用方按空集处理）。
-   *  损坏仅警告一次（每进程每文件首次加载），不抛异常不阻断主流程。
+   *  告警每进程每文件每类一次（C3-008），不抛异常不阻断主流程。
    *  P3（审查 2026-09-15）：missing（正常空集）静默；ioError/unsafe/tooLarge 属瞬时/环境故障，
    *  按空集使用会静默丢失防重放身份，补一条含状态与路径的告警便于观测。仍不改变「按空集处理」
-   *  的既有语义，也不改动 _loadTombstones 的 _tombstoneLoaded 置位时机（失败后是否重试属
-   *  墓碑状态机口径：读失败返回空集，并把本次结果记入 _tombstoneLoadStatus，
-   *  由 _loadTombstones 决定是否置位 _tombstoneLoaded（仅 missing 与成功置位，
-   *  ioError/unsafe/tooLarge 保留下次重试窗口）。 */
+   *  的既有语义；_tombstoneLoaded 的置位口径见 _loadTombstones（确认缺失 / 0 字节 / 已隔离损坏
+   *  都置位；ioError/unsafe/tooLarge 保留下次重试窗口）。
+   *  C3-008：0 字节记 'empty'、损坏记 'corrupt'（原件已改名隔离），二者都算「磁盘已给出确定答案」
+   *  ——旧实现两者都不置位，每条消息重读整份墓碑，损坏文件还会在下一次落墓碑时被整份覆盖（无 .bak）。 */
     _readTombstoneData (filePath) {
+      const seenPath = filePath + '.seen.json'
       try {
-        const result = readSafeTextResult(filePath + '.seen.json', TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
+        const result = readSafeTextResult(seenPath, TOMBSTONE_MAX_BYTES, { openNonBlocking: true })
         this._tombstoneLoadStatus[filePath] = result.status
         if (result.status !== 'ok') {
           if (result.status !== 'missing') {
             const detail = result.error && result.error.message ? ': ' + result.error.message : ''
-            console.warn(`墓碑读取失败（按空集处理，下次调用重试）${filePath}.seen.json: ${result.status}${detail}`)
+            this._warnTombstoneOnce(filePath, 'read:' + result.status,
+              `墓碑读取失败（按空集处理，下次调用重试）${seenPath}: ${result.status}${detail}`)
           }
           return null
         }
-        if (!result.text) return null
-        const data = JSON.parse(result.text)
-        if (!data || typeof data !== 'object') return null
+        // C3-008：0 字节 = 文件在、内容没了。没有任何字节可隔离（不是「损坏」），语义等价于确认缺失：
+        // 置位 'empty' 让 _loadTombstones 缓存空集，并在下一次落墓碑时按空集重建该文件。
+        if (!result.text) {
+          this._tombstoneLoadStatus[filePath] = 'empty'
+          this._warnTombstoneOnce(filePath, 'empty', `墓碑文件为 0 字节（文件存在但无任何内容），按空集处理：${seenPath}`)
+          return null
+        }
+        let data = null
+        try { data = JSON.parse(result.text) } catch (e) { data = null }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+          // C3-008：损坏墓碑不能只「本进程按空集用」——旧实现既不置位（每条消息重读一次整份文件、
+          // 每条一条 WARN），下一次落墓碑又会把损坏文件整份覆盖写回（无 .bak，永久销毁现场）。
+          // 改为先改名隔离（只隔离、绝不删除），再按空集处理并置位；隔离失败才退回「下次重试」旧口径。
+          const reason = data ? '根节点不是对象' : '不是合法 JSON'
+          const backupPath = this._corruptBackupPath(seenPath)
+          if (!backupPath) {
+            this._tombstoneLoadStatus[filePath] = 'ioError'
+            this._warnTombstoneOnce(filePath, 'corrupt:nobackup',
+              `墓碑文件损坏（${reason}）且无法生成隔离备份名，本次按空集处理（下次调用重试）：${seenPath}`)
+            return null
+          }
+          try {
+            fs.renameSync(seenPath, backupPath)
+          } catch (e) {
+            try { fs.unlinkSync(backupPath) } catch (e2) { /* 占位/空备份清理失败：仅多一个空文件 */ }
+            this._tombstoneLoadStatus[filePath] = 'ioError'
+            this._warnTombstoneOnce(filePath, 'corrupt:rename',
+              `墓碑文件损坏（${reason}）且隔离改名失败，本次按空集处理（下次调用重试）：${seenPath}: ${e && e.message ? e.message : e}`)
+            return null
+          }
+          this._tombstoneLoadStatus[filePath] = 'corrupt'
+          this._warnTombstoneOnce(filePath, 'corrupt',
+            `⚠️ 墓碑文件损坏（${reason}），已改名隔离（只隔离不删除）${seenPath} → ${backupPath}；本次按空集处理，下一次落墓碑将重建该文件（旧身份未被读到的部分可能重推）`)
+          return null
+        }
         return data
       } catch (e) {
         this._tombstoneLoadStatus[filePath] = 'ioError'
-        console.warn(`墓碑读取异常，按空集处理（下次调用重试）${filePath}.seen.json:`, e?.message)
+        this._warnTombstoneOnce(filePath, 'read:throw',
+          `墓碑读取异常，按空集处理（下次调用重试）${seenPath}: ${e && e.message ? e.message : e}`)
         return null
       }
     },
