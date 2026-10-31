@@ -3505,6 +3505,334 @@ checkAsync('CD-1 cacheDir 每次访问都重新校验：运行中目录被换成
   }
 })
 
+// ===== C1-014：日报计数器名单必须是单一来源 =====
+// 审计条目：7 个计数器名在 9 处各写一遍，加字段必漏。这里用**源码形状**断言把「只剩一份名单」
+// 钉住：回退修复（把名单拆回 _blankReportState 字面量 / 各校验循环 / nextState 字面量）会让
+// 下面的计数立刻变红，避免下次重构又悄悄长出第二份。
+check('C1-014 计数器名单单一来源：字面量仅常量一处，其余一律引用 REPORT_COUNTERS', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  // 去掉整行注释（注释里复述名单不算实现重复；行内注释保留，行内复述即视为漂移）
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const literalLists = code.match(/'runs', 'total'/g) || []
+  assert.strictEqual(literalLists.length, 1,
+    `计数器名单字面量必须只剩常量这一处，实际 ${literalLists.length} 处（加字段必漏的根因就是它多份）`)
+  const refs = code.match(/REPORT_COUNTERS/g) || []
+  assert.ok(refs.length >= 5, `清零/归一化/校验/日报结转都必须引用 REPORT_COUNTERS，实际引用 ${refs.length} 处`)
+  assert.strictEqual(/runs:\s*0,\s*total:\s*0/.test(code), false,
+    '不得再出现手写七字段零值字面量（新增计数器时它会漏掉）')
+})
+
+check('C1-014 _blankReportState 与名单同源：所有计数器为 0、date 为空、无多余键', () => {
+  const app = makeApp()
+  const blank = app._blankReportState()
+  assert.deepStrictEqual(Object.keys(blank), ['date', 'runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'])
+  for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+    assert.strictEqual(blank[k], 0, `${k} 必须清零`)
+  }
+})
+
+check('C1-014 归一化与跨天结转都按同一名单搬运：丢掉名单外键、保留名单内计数', () => {
+  const app = makeApp()
+  const st = app._normalizeReportState({ date: '2024-03-15', runs: 2, pending: { pushed: 3, junk: 9 }, junk: 1 })
+  assert.strictEqual(st.junk, undefined, '名单外的顶键必须丢弃')
+  assert.strictEqual(st.pending.junk, undefined, 'pending 里名单外的键同样丢弃')
+  assert.strictEqual(st.pending.pushed, 3, 'pending 的名单内计数必须原样保留')
+  assert.strictEqual(st.runs, 2)
+})
+
+// ===== C1-009：re2 缺失提醒链的三个静默口 =====
+// 审计条目：(a) dry-run 完全不提；(b) _sendAlert 返回 undefined（限频/禁用）被当已处理；(c) 规则侧
+// 逐字段告警只在全局提醒链里被覆盖——全局链一静默，规则全量跳过就零痕迹。
+// 这里分别钉住 (a)(b)；(c) 由这两条共同覆盖（compileRules 在 re2 缺失时不逐字段告警，见 xbk_rules.js
+// 的 `if (!isRe2Available()) { compiled[field] = null; continue }`）。
+checkAsync('C1-009 dry-run 时 re2 缺失必须本地留痕（console.warn + run.log），但不发告警、不写标记', async () => {
+  const mfs = makeMemFs()
+  const dir2 = os.tmpdir()
+  let alerted = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir2, sendAlert: async () => { alerted++; return true } })
+  const logs = []
+  app._writeRunLog = (line) => { logs.push(String(line)) }
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...a) => warns.push(a.map(String).join(' '))
+  try {
+    await app._warnMissingRe2({ dryRun: true })
+  } finally {
+    console.warn = origWarn
+  }
+  assert.strictEqual(alerted, 0, 'dry-run 不得发送告警（无通知副作用）')
+  assert.strictEqual(mfs._files.size, 0, 'dry-run 不得写标记文件（否则会把当天的真实告警吞掉）')
+  assert.ok(warns.some(m => m.includes('[re2 缺失提醒]')), `dry-run 必须打印 re2 缺失提醒，实际：${JSON.stringify(warns)}`)
+  assert.ok(logs.some(l => l.includes('WARN') && l.includes('[re2 缺失提醒]')), `dry-run 必须在 run.log 留一行 WARN，实际：${JSON.stringify(logs)}`)
+})
+
+checkAsync('C1-009 告警启用但本轮被限频（_sendAlert 返回 undefined）⇒ 标记保留 pending，不得当已处理', async () => {
+  const mfs = makeMemFs()
+  const dir3 = os.tmpdir()
+  const sp = dir3 + '/re2warn.state.' + stamp
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir3, sendAlert: async () => true })
+  app._writeRunLog = () => {}
+  // 模拟「告警启用但本轮被限频跳过」：_sendAlert 返回 undefined（限频/状态不可读的唯一出口）
+  app._sendAlert = async () => undefined
+  await app._warnMissingRe2()
+  assert.strictEqual(mfs._files.has(sp), true, '跳过（undefined）时不得删除 pending 标记')
+  const parsed = JSON.parse(mfs.readFileSync(sp))
+  assert.strictEqual(parsed.status, 'pending', '未送达的提醒必须保持 pending，下一轮才能在限频窗口过后重发')
+})
+
+checkAsync('C1-009 用户主动关闭告警（_sendAlert 返回 undefined 且 alert.enabled=false）⇒ 置 completed，不每轮重试', async () => {
+  const mfs = makeMemFs()
+  const dir4 = os.tmpdir()
+  const sp = dir4 + '/re2warn.state.' + stamp
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir4, sendAlert: async () => true })
+  app._writeRunLog = () => {}
+  app._sendAlert = async () => undefined
+  // 关闭告警：Config.alert 由 makeRe2WarnApp 固定为 { enabled: true }，这里直接让开关判定为关
+  app._enabledFlag = (cfg) => { if (cfg === undefined) return false; return cfg && cfg.enabled !== true }
+  await app._warnMissingRe2()
+  const parsed = JSON.parse(mfs.readFileSync(sp))
+  assert.strictEqual(parsed.status, 'completed', '用户关闭告警时本地已留痕，标记置 completed 防每轮重跑')
+})
+
+// ===== C1-017：并行/顺序两条推送循环的共用口径 =====
+// 审计条目：两条循环各自实现日志、成功计数、补位间隔。这里锁住「只剩一份实现」——回退修复后
+// 成功日志文案与 pushInterval 解析会各自回到两份，计数立刻变红。
+check('C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const logHits = code.match(/发现到新数据：/g) || []
+  assert.strictEqual(logHits.length, 1, `成功日志文案必须只有一处（logPushed），实际 ${logHits.length} 处`)
+  const intervalHits = code.match(/Utils\.num\(Config\.timing\.pushInterval, 0\)/g) || []
+  assert.strictEqual(intervalHits.length, 1, `pushInterval 解析必须只有一处，实际 ${intervalHits.length} 处`)
+  const countHits = code.match(/successCount \+= logPushed\(r\)/g) || []
+  assert.strictEqual(countHits.length, 2, `并行/顺序都必须经同一 logPushed 计数，实际 ${countHits.length} 处`)
+})
+
+// ===== C1-011：run.log 的 fail-open 分支必须有次级上限 =====
+// 审计条目：≤1MiB + 行完整只在拿到锁时成立；拿不到锁（锁文件 EACCES/属主异常）就无限追加。
+// 既有用例（「锁异常（EACCES）⇒ fail-open 仅追加；超限也不截尾」）锁的是 2×1MiB 仍要追加，
+// 所以次级上限必须高于它；这里验证超过硬上限后不再写盘、行回显 stdout、且仍不做无锁读改写。
+check('C1-011 fail-open 且超过次级上限 ⇒ 不再写盘、行回显 stdout、不做无锁读改写', () => {
+  const e = new Error('x'); e.code = 'EACCES'
+  const rec = makeLogFs({ openSync: (p, flag) => { if (flag === 'wx') throw e; return 8 }, size: 9 * LIMIT })
+  const { app } = makeLogApp({ rec })
+  const logs = []
+  const origLog = console.log
+  console.log = (...a) => logs.push(a.map(String).join(' '))
+  try {
+    app._writeRunLog('overflow-line\n')
+  } finally {
+    console.log = origLog
+  }
+  assert.deepStrictEqual(rec.rec.append, [], '超过次级上限后不得继续追加（无界增长的根因）')
+  assert.deepStrictEqual(logs, ['overflow-line'], '行不得丢：必须回显到 stdout（青龙任务日志可见）')
+  assert.strictEqual(rec.rec.read.length, 0, '无锁路径不得做读改写（会冲掉并发追加的行）')
+  assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx'], '不得在无锁时开 r+')
+  assert.strictEqual(rec.rec.unlink.length, 0)
+})
+
+check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁内截尾（8×1MiB 上限不得误伤）', () => {
+  const rec = makeLogFs({ size: 2 * LIMIT, tail: '\nTAIL' })
+  const { app, cap } = makeLogApp({ rec })
+  app._writeRunLog('l\n')
+  assert.strictEqual(rec.rec.append.length, 1, '持锁时照常追加')
+  assert.strictEqual(cap.length, 1, '持锁时超 1MiB 必须走原子写回（截尾）')
+})
+
+// ===== C1-013：三处 O_EXCL 锁收敛为同一实现 =====
+// 审计条目：run.log / RE2 标记 / 通道健康各写一遍同样的独占创建+超龄回收，常数各写一份且已漂移
+// （通道健康把 10000 写死）。这里锁住「只剩一份实现」：回退后 openSync('wx') 会回到 4 处、
+// LOCK_STALE_MS 会回到 2 份定义，计数立刻变红。语义差异（重试 vs 单次）由调用方选择保留。
+check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  assert.strictEqual((code.match(/fs\.openSync\(lockPath, 'wx'\)/g) || []).length, 2,
+    '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开）')
+  assert.strictEqual((code.match(/LOCK_STALE_MS/g) || []).length, 2,
+    'LOCK_STALE_MS 必须只有「定义 + 使用」各一处（原先三份实现各写一份）')
+  assert.strictEqual(/mtimeMs > 10000/.test(code), false, '不得再出现写死的 10000（通道健康那份的漂移形态）')
+  assert.strictEqual((code.match(/_isTombstoneLockProcessAlive\(lockPath\)/g) || []).length, 1,
+    '持有进程存活复核必须只有一处')
+  assert.ok(/const acquireLockWithRetry = \(lockPath\) =>/.test(code), '重试口径必须来自同一个获取函数')
+})
+
+checkAsync('C1-013 收敛后语义不变：通道健康锁仍单次尝试（EACCES 立即 -1 且带 errno 原因）', async () => {
+  const mfs = makeMemFs()
+  mfs.openSync = () => { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e }
+  const app = makeHealthApp({ fs: mfs })
+  assert.strictEqual(app._tryAcquireChannelHealthLock(healthPath + '.lock'), -1)
+  assert.strictEqual(app._lastChannelHealthLockFailure.reason, 'open', '非 EEXIST 必须归类 open（C1-008 的分流依据）')
+  assert.strictEqual(app._lastChannelHealthLockFailure.code, 'EACCES')
+})
+
+// ===== C1-007：同一轮既成功又失败的通道必须按失败累计 =====
+// 审计条目：失败分支有 `if (succeeded.has(channel)) continue`，同一轮「推 1 条成功 + 1 条失败」的
+// 通道只走成功分支被清零 ⇒ 间歇失败永远攒不满阈值。这里连跑 3 轮（阈值 3）验证计数真的累加。
+checkAsync('C1-007 同一轮既成功又失败的通道必须按失败累计（间歇失败也攒满阈值）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs, threshold: 3, intervalMs: 3600000 })
+  const outcome = { successfulChannels: ['pushdeer'], failures: [{ channel: 'pushdeer', message: 'boom' }] }
+  for (let round = 1; round <= 3; round++) {
+    await app._updateChannelHealth(outcome)
+    const st = JSON.parse(mfs.readFileSync(healthPath))
+    assert.strictEqual(st.pushdeer.consecutiveFailures, round,
+      `第 ${round} 轮：本轮有过成功也不得清零失败计数（旧实现短路后恒为 0）`)
+  }
+  const st = JSON.parse(mfs.readFileSync(healthPath))
+  assert.ok(st.pushdeer.lastAlertAt > 0, '达到阈值必须排入异常告警（lastAlertAt 落盘即证据）')
+})
+
+checkAsync('C1-007 零失败轮次才算恢复：成功分支排入恢复告警（计数待送达确认后清零）', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 3, lastFailureAt: 1, lastAlertAt: 2, lastRecoveredAt: 0 } }))
+  const app = makeHealthApp({ fs: mfs, threshold: 3, intervalMs: 3600000 })
+  await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [] })
+  const st = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(st.pushdeer.recoverAlertPending, true, '本轮零失败 ⇒ 必须排入恢复告警（APP2-02）')
+  assert.strictEqual(st.pushdeer.consecutiveFailures, 3, '计数只在恢复告警确认送达后清零（此处尚未送达）')
+})
+
+checkAsync('C1-007 失败不得抹掉已认领的恢复通知（pending/claim 原样保留）', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath, JSON.stringify({
+    pushdeer: { consecutiveFailures: 2, lastFailureAt: 1, lastAlertAt: 0, lastRecoveredAt: 5, recoverAlertPending: true, recoverAlertClaim: 'tok-keep', recoverAlertClaimAt: Date.now() }
+  }))
+  const app = makeHealthApp({ fs: mfs, threshold: 3, intervalMs: 3600000 })
+  await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  const st = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(st.pushdeer.consecutiveFailures, 3, '失败计数照常累加')
+  assert.strictEqual(st.pushdeer.recoverAlertPending, true, '已认领的恢复通知不得因一次失败被丢弃')
+  assert.strictEqual(st.pushdeer.recoverAlertClaim, 'tok-keep', '认领令牌必须原样保留（否则会被当成无主认领重发/吞掉）')
+})
+
+// ===== C1-010：Markdown 转换的输入窗口（先截断再转换） =====
+// 审计条目：转换发生在截断之前——每条消息最多转换 10 万字符 HTML，实测 tag 密集样本 42.66ms/条、
+// 产物 52498 字符，只有 5.71% 留在 3000 字符正文里。修复把「转换输入」限制到 contentMax×3 的
+// 有界前缀，并**证明输出不变**：前缀产物 ≥ contentMax+余量 时，被保留的正文与全量转换逐字符相同。
+function makeFormatterApp (Formatter, Utils) {
+  return createApp({
+    Config: {},
+    Utils,
+    Formatter,
+    RuleEngine: {},
+    FilterEngine: {},
+    MessageStore: { cacheDir: os.tmpdir() },
+    Network: {},
+    Pusher: {},
+    fs: { existsSync: () => false },
+    path: require('path'),
+    crypto: require('crypto'),
+    readSafeTextResult: () => ({ status: 'missing', text: '' }),
+    writeAtomic: () => true,
+    isRegularOrMissing: () => true,
+    STATE_TEXT_MAX_BYTES: 1048576,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: null,
+    RE2_WARN_STATE_FILE: '',
+    RE2_MISSING_WARNING: '',
+    summarizeError: () => '',
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => null,
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex: () => {}
+  })
+}
+
+check('C1-010 有界前缀不改变推送正文：窗口化转换与全量转换逐字符相同', () => {
+  const { createFormatter } = require('./xbk_formatter')
+  const { createUtils } = require('./xbk_utils')
+  const safeRe = (src, flags) => new RegExp(src, flags)
+  const realUtils = createUtils({ fs: require('fs'), safeRe })
+  const F = createFormatter({ Utils: realUtils, safeRe })
+  const app = makeFormatterApp(F, realUtils)
+  let html = ''
+  while (html.length < 100000) html += '<div class="x"><b>标题</b>正文内容一段，含<a href="https://e.com/a">链接</a>与&nbsp;实体。</div>'
+  html = html.slice(0, 100000) // 与审计实测同形：转换产物 52498 字符（保留率 5.71%）
+  const item = { content_html: html, url: 'https://e.com/m', title: 't', content: 'c' }
+  const fullDesp = realUtils.truncateUtf16(F.tuisong_replace('{Markdown内容}', item), 3000)
+  const bounded = app._boundMarkdownHtml(item, 3000)
+  assert.ok(bounded !== item, '超窗口 HTML 必须走窗口化路径')
+  assert.strictEqual(bounded.content_html.length, 9000, '窗口 = max(4096, contentMax×3)')
+  const boundedDesp = realUtils.truncateUtf16(F.tuisong_replace('{Markdown内容}', bounded), 3000)
+  assert.strictEqual(boundedDesp, fullDesp, '窗口化后推送正文必须与全量转换逐字符相同（不得丢内容）')
+})
+
+check('C1-010 窗口化只在安全时启用：短 HTML / 产物不足 / 无 htmlToMarkdown 都走老路径', () => {
+  const { createFormatter } = require('./xbk_formatter')
+  const { createUtils } = require('./xbk_utils')
+  const safeRe = (src, flags) => new RegExp(src, flags)
+  const realUtils = createUtils({ fs: require('fs'), safeRe })
+  const F = createFormatter({ Utils: realUtils, safeRe })
+  const app = makeFormatterApp(F, realUtils)
+  const shortItem = { content_html: '正文'.repeat(10), url: '' }
+  assert.strictEqual(app._boundMarkdownHtml(shortItem, 3000), shortItem, '窗口内不得改动（避免多算一次）')
+  // 纯标签 HTML：窗口内转换产物远不足 contentMax ⇒ 必须退回全量，不能输出半截
+  const tagOnly = { content_html: '<div class="bloat">'.repeat(6000), url: '' }
+  assert.strictEqual(app._boundMarkdownHtml(tagOnly, 3000), tagOnly, '前缀产物不足时退回全量转换')
+  const noFormatter = makeFormatterApp({}, realUtils)
+  assert.strictEqual(noFormatter._boundMarkdownHtml({ content_html: 'x'.repeat(50000) }, 3000).content_html.length, 50000,
+    'Formatter 没有 htmlToMarkdown 时不得改动（注入依赖可能缺能力）')
+})
+
+check('C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  assert.ok(/contentTpl\.includes\('\{Html内容\}'\) \? pushItem : this\._boundMarkdownHtml\(pushItem, contentMax\)/.test(code),
+    'pushOne 必须按模板是否含 {Html内容} 分流')
+})
+
+// C1-010 返工（评审 must_fix）：探针长度不得把 htmlToMarkdown 追加的「原文链接」尾巴算进正文余量。
+// 构造：10 万字符 HTML，前 9000 字符（窗口）只产出 2965 字符正文（< contentMax=3000），其余部分是
+// '**B**' 密集正文（全量 60001 字符）；url 75 字符 ⇒ 尾巴 161 字符把「带 url 的探针」顶到 3126，
+// 越过 contentMax + 64 = 3064。旧实现据此保留窗口：截断后的推送正文尾部变成
+// `…原文链接：[https://`（首差在下标 2965/3000），而 pushOne 见 '原文链接' 已存在便不再补链 ⇒
+// 收件人拿到一条被截断的坏链接。全量转换在同一位置是干净正文，尾部由 pushOne 补完整链接。
+check('C1-010 探针不计「原文链接」尾巴：正文略短于 contentMax + 长 url 时必须退回全量转换', () => {
+  const { createFormatter } = require('./xbk_formatter')
+  const { createUtils } = require('./xbk_utils')
+  const safeRe = (src, flags) => new RegExp(src, flags)
+  const realUtils = createUtils({ fs: require('fs'), safeRe })
+  const F = createFormatter({ Utils: realUtils, safeRe })
+  const app = makeFormatterApp(F, realUtils)
+  const contentMax = 3000
+  const windowLen = Math.max(4096, contentMax * 3)
+  const bodyChars = 2965 // < contentMax；且 (windowLen - bodyChars) 可被 '<script></script>'(17) 整除
+  const pad = '<script></script>' // 转换产物为空（实测），只用来把窗口填满
+  const item = {
+    title: 't',
+    content: 'c',
+    url: 'https://e.com/' + 's'.repeat(61), // 75 字符 ⇒ 尾巴 161 字符
+    content_html: 'A'.repeat(bodyChars) + pad.repeat((windowLen - bodyChars) / pad.length) +
+      '<b>B</b>'.repeat((100000 - windowLen) / 8)
+  }
+  const despOf = (it) => realUtils.truncateUtf16(F.tuisong_replace('{Markdown内容}', it), contentMax)
+  const windowItem = (over) => Object.assign({}, item, { content_html: item.content_html.slice(0, windowLen) }, over)
+  // 前置条件（锁定复现形态）：窗口正文本身短于 contentMax，是 url 尾巴把它顶过阈值的
+  assert.strictEqual(F.htmlToMarkdown(windowItem({ url: '' })).length, bodyChars, '前置条件：窗口正文长度 = bodyChars')
+  assert.ok(bodyChars < contentMax, '前置条件：窗口正文短于 contentMax')
+  assert.ok(F.htmlToMarkdown(windowItem({})).length >= contentMax + 64,
+    '前置条件：把 url 尾巴算进探针会越过 contentMax+64（旧实现的误判入口）')
+  const fullDesp = despOf(item)
+  const bounded = app._boundMarkdownHtml(item, contentMax)
+  assert.strictEqual(bounded, item, '正文不足时必须退回全量转换，不得保留窗口')
+  assert.strictEqual(despOf(bounded), fullDesp, '推送正文必须与全量转换逐字符相同')
+  // 「原文链接」要么整条不在正文里（交给 pushOne 补一条完整链接），要么是完整链接；不得出现被截断的半条
+  const brokenLink = (s) => {
+    const i = s.lastIndexOf('原文链接：')
+    return i !== -1 && !/^原文链接：\[[^\]\n]*\]\(<?https?:\/\/[^)\s]+>?\)/.test(s.slice(i))
+  }
+  assert.ok(!brokenLink(fullDesp), '前置条件：全量转换的推送正文不含坏链接')
+  assert.ok(!brokenLink(despOf(bounded)), '不得把被截断的「原文链接：[https://…」推进正文')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

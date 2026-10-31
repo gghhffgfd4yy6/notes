@@ -20,10 +20,78 @@ function createApp ({
     return Math.max(1, Math.min(base, MAX_PARALLEL_WORKERS))
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // C1-013：O_EXCL 文件锁的**唯一**实现与唯一常数来源。run.log / RE2 标记 / 通道健康此前各写
+  // 一遍「独占创建 + pid:start 令牌 + mtime 超龄 + 持有进程存活复核 + 抢占重开」，常数也各写一份
+  // （通道健康把 10000 写死成字面量，run.log 与 RE2 各有一份 LOCK_STALE_MS，deadline/退避也是
+  // 各自写死的 3000/10）。三处的真实差异只有「拿不到锁时怎么办」：run.log 与 RE2 标记的临界区都
+  // 只有几毫秒，短退避重试到 deadline；通道健康是观测性写入，只试一次（不为拿锁阻塞事件循环）
+  // ⇒ 由调用方选择 tryLockOnce / acquireLockWithRetry 表达，而不是第三份实现。
+  const LOCK_STALE_MS = 10000
+  const LOCK_ACQUIRE_DEADLINE_MS = 3000
+  const LOCK_RETRY_INTERVAL_MS = 10
+  const lockTokenOf = () => `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
+
+  /** 单次 O_EXCL 尝试（含陈旧锁回收）。成功返回 { fd }，失败返回 { reason, error }：
+   *  reason='open' 非 EEXIST 的 open 失败；'busy' 锁被活跃或未超龄的持有者占着；
+   *  'unlink' 陈旧锁回收失败；'reopen' 回收后二次 open 失败。 */
+  const tryLockOnce = (lockPath) => {
+    try {
+      const fd = fs.openSync(lockPath, 'wx')
+      try { fs.writeSync(fd, lockTokenOf()) } catch (e) { /* 锁内容仅供排查，失败不影响 */ }
+      return { fd }
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') return { reason: 'open', error: e }
+      let stale = false
+      // 锁文件刚被释放/删除（statSync 失败）：当作空位重试。
+      try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS } catch (e2) { stale = true }
+      // APP-02：mtime 超龄只说明「可能陈旧」，还须持有进程已确认退出才可回收。进程仍存活
+      // （如被暂停 >10s）时绝不抢占——否则双进程同时进入临界区，截尾读改写会冲掉并发追加的行。
+      if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return { reason: 'busy', error: e }
+      try { fs.unlinkSync(lockPath) } catch (e2) { return { reason: 'unlink', error: e2 } }
+      try {
+        const fd = fs.openSync(lockPath, 'wx')
+        try { fs.writeSync(fd, lockTokenOf()) } catch (e2) { /* 同上 */ }
+        return { fd }
+      } catch (e2) { return { reason: 'reopen', error: e2 } }
+    }
+  }
+
+  /** 带短退避重试的获取：deadline 内反复尝试，超过 deadline 或遇非 EEXIST 的 open 错误立刻返回
+   *  最后一次失败（调用方按 fail-open 处理：日志只追加不截尾 / 标记跳过本轮）。 */
+  const acquireLockWithRetry = (lockPath) => {
+    const deadline = Date.now() + LOCK_ACQUIRE_DEADLINE_MS
+    for (;;) {
+      const attempt = tryLockOnce(lockPath)
+      if (typeof attempt.fd === 'number') return attempt
+      if (attempt.reason === 'open') return attempt // 权限/只读：重试无意义，直接 fail-open
+      if (Date.now() >= deadline) return attempt
+      try { Atomics.wait(lockWaiter, 0, 0, LOCK_RETRY_INTERVAL_MS) } catch (e) { /* 非主线程/受限：直接重试 */ }
+    }
+  }
+  // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
+  // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
+  // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
+  // 两处 nextState 字面量与 Object.assign 映射…），加字段必漏一处：漏掉 _normalizeReportState
+  // 的那处会静默丢计数（它只搬名单内的键，写盘时新字段直接消失）。
+  const REPORT_COUNTERS = Object.freeze(['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'])
+  const blankCounters = () => {
+    const counters = {}
+    for (const key of REPORT_COUNTERS) counters[key] = 0
+    return counters
+  }
+  // 与旧 `pending.runs || 0` 同口径：非数/缺字段/0 都归 0（负数不在这里修，走 _safeCounter 归一化）。
+  const pickCounters = (source) => {
+    const counters = {}
+    for (const key of REPORT_COUNTERS) counters[key] = (source && source[key]) || 0
+    return counters
+  }
   // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
   const CHANNEL_RECOVER_CLAIM_LEASE_MS = 60000
   let channelRecoverClaimSeq = 0 // 同进程内单调序号，配合 pid/时刻/随机数保证令牌唯一
+  // C1-010：Markdown 转换输入窗口的安全余量——前缀产物必须比 contentMax 多出这么多字符，
+  // 才能保证切点尾部的差异（未闭合标签/半个实体）落在被保留的正文之外。
+  const MD_BOUND_MARGIN = 64
   // APP-05：所有「按天/按时刻」的呈现口径统一到硬编码 Asia/Shanghai——日志与台账时间戳
   // （_localStamp）、日报日界（_reportToday）、运行异常告警正文的时间、RE2 标记保留期的 cutoff。
   // 进程本地时区（如 CI runner 的 UTC）不参与其中：混用会让同一时刻的 run.log 行、日报日界与
@@ -120,34 +188,10 @@ function createApp ({
         let lockFd = null
         try {
         // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
-        // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）
-          const LOCK_STALE_MS = 10000
-          const lockDeadline = Date.now() + 3000
-          for (;;) {
-            try {
-              lockFd = fs.openSync(lockPath, 'wx')
-              try {
-                fs.writeSync(lockFd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
-              } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
-              break
-            } catch (e) {
-              if (e.code !== 'EEXIST') break // 权限等异常：拿不到锁也继续（fail-open，只追加）
-              let stale = false
-              try {
-                const ls = fs.statSync(lockPath)
-                stale = Date.now() - ls.mtimeMs > LOCK_STALE_MS
-              } catch (e2) { stale = true } // 锁文件刚被释放/删除：当作空位重试
-              // APP-02：mtime 超龄只说明「可能陈旧」，还须持有进程已确认退出才可回收（与 RE2 锁同口径）。
-              // 进程仍存活（如被暂停 >10s）时绝不抢占——否则双进程同时进入临界区，截尾读改写会冲掉
-              // 并发追加的行；此时按拿不到锁处理（fail-open，仅追加不截尾）。
-              if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
-                try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
-                continue
-              }
-              if (Date.now() >= lockDeadline) break // 超时：fail-open，仅追加不截尾
-              try { Atomics.wait(lockWaiter, 0, 0, 10) } catch (e2) { /* 非主线程/受限时退避失败，直接重试 */ }
-            }
-          }
+        // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）。
+        // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry，三处锁共用同一份判据。
+          const lock = acquireLockWithRetry(lockPath)
+          if (typeof lock.fd === 'number') lockFd = lock.fd
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
           // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
@@ -159,9 +203,23 @@ function createApp ({
             if (trailingNl) rest = rest.slice(0, -1)
             out = prefix + Utils.truncateUtf16(rest, 512) + (trailingNl ? '\n' : '')
           }
+          // C1-011：fail-open（拿不到锁）分支的**次级上限**。旧实现只在锁内截尾（下方
+          // `lockFd !== null` 才是截尾前提），拿不到锁就无限追加：锁文件属主/权限异常（EACCES）
+          // 时锁永远拿不到，run.log 无界增长，能占满缓存盘。这里给无锁路径一个硬上限
+          // （8×1MiB）：超过后不再写盘、整行回显 stdout（青龙任务日志仍可见，行不丢）。
+          // 真正的截尾仍只在锁内做——无锁读改写会冲掉并发追加的行，那条边界不放宽。
+          const LIMIT = 1024 * 1024
+          const FAIL_OPEN_HARD_LIMIT = 8 * LIMIT
+          if (lockFd === null) {
+            let oversized = false
+            try { oversized = fs.statSync(logPath).size > FAIL_OPEN_HARD_LIMIT } catch (e) { oversized = false }
+            if (oversized) {
+              console.log(out.endsWith('\n') ? out.slice(0, -1) : out)
+              return
+            }
+          }
           fs.appendFileSync(logPath, out, 'utf8')
           const st = fs.statSync(logPath)
-          const LIMIT = 1024 * 1024
           // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
           // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
           if (lockFd !== null && st.size > LIMIT) {
@@ -259,6 +317,36 @@ function createApp ({
         }
       }
       return warns
+    },
+
+    // C1-010：content_html 的**有界前缀**（Markdown 转换的输入窗口）。htmlToMarkdown 会把最多
+    // 10 万字符 HTML 全量转成 Markdown（实测 tag 密集样本 42.66ms/条），而产物随后立刻被
+    // contentMax（默认 3000）截断——只有 5.71% 会留在推送正文里。转换是顺序变换：前缀的产物
+    // 就是全量产物的前缀（差异只可能落在切点尾部），所以只要「前缀正文 ≥ contentMax + 余量」，
+    // 被保留的那段与全量转换逐字符相同；不足就退回全量（老路径），不改任何一条消息的内容。
+    // 只在 HTML 超过候选窗口时才做这次探针（窗口内本来就是全量转换，多探一次反而更慢）。
+    // 模板用到 {Html内容} 时调用方不得走这里——那一路是把 HTML 原样发出（10 万上限），截前缀
+    // 会真丢内容。
+    // C1-010 返工（评审）：探针必须**清掉 url** 再转换。htmlToMarkdown 在产物尾部追加
+    // `\n\n原文链接：[url](url)`（约 2×urlLen+11 字符），默认模板 `{Markdown内容}` 下这段就是
+    // 推送正文的一部分；把它算进探针长度等于拿「正文 + 尾巴」去比「正文余量」——正文只有
+    // 2907–2997 字符（< contentMax）的样本会凭 ~161 字符的尾巴越过 contentMax+64，于是窗口被
+    // 保留，截断后的正文尾部落进被切掉的链接（`…原文链接：[https://`），而 pushOne 的
+    // 「原文链接缺失才补链」看到 '原文链接' 已存在便不再补，收件人拿到一条坏链接。清 url 后
+    // 探针长度即纯正文长度（_finalizeMd 的 trim 只会让它偏小 ⇒ 方向保守，最坏是多做一次全量）。
+    _boundMarkdownHtml (item, contentMax) {
+      if (!Formatter || typeof Formatter.htmlToMarkdown !== 'function') return item
+      const html = item && typeof item.content_html === 'string' ? item.content_html : ''
+      const window = Math.max(4096, Math.floor(contentMax * 3))
+      if (html.length <= window) return item
+      let probe
+      try {
+        probe = Formatter.htmlToMarkdown(Object.assign({}, item, { content_html: html.slice(0, window), url: '' }))
+      } catch (e) {
+        return item // 探针异常：按老路径全量转换（渲染失败由 pushOne 的既有 catch 兜住）
+      }
+      if (typeof probe !== 'string' || probe.length < contentMax + MD_BOUND_MARGIN) return item
+      return Object.assign({}, item, { content_html: html.slice(0, window) })
     },
 
     _warnLowDisk () {
@@ -442,10 +530,19 @@ function createApp ({
       }
     },
 
-    async _warnMissingRe2 () {
+    async _warnMissingRe2 (opts = {}) {
     // Sourcery 第八轮：RE2C 可用时也要顺带清理残留旧标记文件，否则安装 re2 后堆积文件永不清理。
       if (RE2C) {
         this._cleanupStaleRe2WarnMarkers()
+        return
+      }
+      // C1-009：dry-run 也必须**本地**留痕。旧实现由调用方 `if (!dryRun)` 整段跳过，于是预演时
+      // 「用户过滤正则一条都没生效」既不打日志也不进 run.log——而 dry-run 恰恰是排障时最常跑的
+      // 形态。这里不做任何通知副作用（不写标记、不发告警），只保留 console.warn + run.log 两处
+      // 本地痕迹（dry-run 本来就会写 run.log 摘要，不引入新的写盘语义）。
+      if (opts.dryRun === true) {
+        console.warn(RE2_MISSING_WARNING)
+        this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
         return
       }
       // 跨进程防重（终版）：按天命名的标记文件 + per-date 互斥锁。
@@ -488,44 +585,32 @@ function createApp ({
       console.warn(RE2_MISSING_WARNING)
       this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
       // 发送结果三态：true 成功 / false 失败删标记重试 /
-      // undefined 跳过（禁用/限频）——成功与跳过都视为当天已处理，标记置 completed（CodeRabbit 第八轮：
-      // 防止正常进程退出后被误判为残留造成同一天重复提醒）。
+      // undefined 跳过（禁用/限频）——成功与「用户主动关闭告警」都视为当天已处理，标记置 completed
+      // （CodeRabbit 第八轮：防止正常进程退出后被误判为残留造成同一天重复提醒）。
+      // C1-009：旧实现把 undefined 一律当「已处理」——限频窗口内（intervalMs 默认 1h）或限频状态
+      // 读取失败时告警根本没发出去，标记却被置 completed，于是这一天的提醒被永久吞掉（下一轮连
+      // run.log 的 WARN 行都不会再写）。现在只有「确实送达」或「用户关掉了告警」才置 completed；
+      // 「启用但本轮被跳过」保留 pending，让后续轮次在限频窗口过后重发（本进程内 pending+自身 pid
+      // 存活 ⇒ 不会重复提醒，进程退出后下一轮才回收重试）。
+      const alertsEnabled = this._enabledFlag(Config.alert)
       const sent = await this._sendAlert(RE2_MISSING_WARNING, 're2-missing')
       if (sent === false) {
       // 发送失败：锁内删除自己的 pending 标记（完整 token 校验），下次运行可重试
         this._removeRe2WarnMarker(statePath, token)
-      } else {
-      // 成功或跳过：锁内把标记置 completed（防止正常进程退出后被误判残留导致同一天重复提醒）
+      } else if (sent === true || !alertsEnabled) {
+      // 发送成功，或用户明确关闭告警（本地已留痕，不必每轮重试）：锁内把标记置 completed
         this._completeRe2WarnMarker(statePath, token)
       }
+      // 其余情况（告警启用但本轮被限频/限频状态不可读）：保留 pending 供下一轮重试。
     },
 
     // 单个日期标记的跨进程互斥锁（O_EXCL 独占创建 + 短退避 + 陈旧锁抢占）：
     // 把「读-判-写」标记串行化，使同一时刻只有一个进程能创建/回收当天的标记。
+    // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry（与 run.log / 通道健康同一份）。
     _acquireRe2WarnLock (statePath) {
       const lockPath = statePath + '.lock'
-      const LOCK_STALE_MS = 10000
-      const deadline = Date.now() + 3000
-      const lockToken = `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
-      for (;;) {
-        try {
-          const fd = fs.openSync(lockPath, 'wx')
-          try { fs.writeSync(fd, lockToken) } catch (e) { /* 锁内容仅供排查 */ }
-          return { lockPath, fd }
-        } catch (e) {
-          if (e.code !== 'EEXIST') return null // 权限等异常：无法加锁，放弃本次
-          let stale = false
-          try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS } catch (e2) { stale = true }
-          if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
-          // 年龄超限且持有进程已确认退出（含损坏/无主锁）才回收；
-          // 进程仍存活（如被暂停>10s）绝不回收，避免双进程同时进入临界区（CodeRabbit 第十一轮）。
-            try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
-            continue
-          }
-          if (Date.now() >= deadline) return null // 超时：放弃本次（避免阻塞事件循环）
-          try { Atomics.wait(lockWaiter, 0, 0, 10) } catch (e2) { /* 受限环境退避失败直接重试 */ }
-        }
-      }
+      const lock = acquireLockWithRetry(lockPath)
+      return typeof lock.fd === 'number' ? { lockPath, fd: lock.fd } : null
     },
 
     _releaseRe2WarnLock (statePath, acquired) {
@@ -612,7 +697,7 @@ function createApp ({
 
     // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
     _blankReportState () {
-      return { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+      return Object.assign({ date: '' }, blankCounters())
     },
     _safeCounter (v) {
       if (typeof v === 'symbol') return 0 // Number(Symbol) 抛 TypeError（子代理审查 commit-12）
@@ -635,10 +720,10 @@ function createApp ({
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blank()
       const st = blank()
       st.date = typeof raw.date === 'string' ? raw.date : ''
-      for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = this._safeCounter(raw[k])
+      for (const k of REPORT_COUNTERS) st[k] = this._safeCounter(raw[k])
       if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
         st.pending = blank()
-        for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = this._safeCounter(raw.pending[k])
+        for (const k of REPORT_COUNTERS) st.pending[k] = this._safeCounter(raw.pending[k])
       } else if (raw.pending) {
       // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
       // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
@@ -684,7 +769,7 @@ function createApp ({
           if (raw.date !== undefined && !this._isValidReportDate(raw.date)) {
             throw new Error('日报状态 date 字段无效')
           }
-          for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+          for (const k of REPORT_COUNTERS) {
             if (raw[k] !== undefined && (!Number.isSafeInteger(raw[k]) || raw[k] < 0)) {
               throw new Error(`日报状态字段 ${k} 无效`)
             }
@@ -693,7 +778,7 @@ function createApp ({
             if (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending)) {
               throw new Error('日报状态 pending 字段无效')
             }
-            for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+            for (const k of REPORT_COUNTERS) {
               if (raw.pending[k] !== undefined && (!Number.isSafeInteger(raw.pending[k]) || raw.pending[k] < 0)) {
                 throw new Error(`日报 pending 字段 ${k} 无效`)
               }
@@ -734,16 +819,7 @@ function createApp ({
       try {
       // 单次青龙入口会在 App.run 返回后退出，必须等待日报发送完成。
         await Pusher.send(reportText, reportBody)
-        const nextState = {
-          date: today,
-          runs: pendingState.pending.runs || 0,
-          total: pendingState.pending.total || 0,
-          dedup: pendingState.pending.dedup || 0,
-          filtered: pendingState.pending.filtered || 0,
-          pushed: pendingState.pending.pushed || 0,
-          failed: pendingState.pending.failed || 0,
-          truncated: pendingState.pending.truncated || 0
-        }
+        const nextState = Object.assign({ date: today }, pickCounters(pendingState.pending))
         const nextSaved = this._persistReportState(statePath, nextState)
         if (nextSaved) console.log('已发送昨日运行日报')
         else console.warn('⚠️ 昨日日报已发送，但最终状态未持久化，重启后可能重复发送')
@@ -762,25 +838,14 @@ function createApp ({
         if (!state) return
         const today = this._reportToday()
         if (state.date && state.date !== today) {
-          const reportKeys = ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
+          const reportKeys = REPORT_COUNTERS
           const hasCounters = value => Boolean(value && reportKeys.some(k => value[k] > 0))
           if (hasCounters(state) || hasCounters(state.pending)) {
             await this._sendCrossDayReport(statePath, state, summary, today)
             return
           }
           const pending = state.pending
-          const nextState = { date: today, runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-          if (pending) {
-            Object.assign(nextState, {
-              runs: pending.runs || 0,
-              total: pending.total || 0,
-              dedup: pending.dedup || 0,
-              filtered: pending.filtered || 0,
-              pushed: pending.pushed || 0,
-              failed: pending.failed || 0,
-              truncated: pending.truncated || 0
-            })
-          }
+          const nextState = Object.assign({ date: today }, pickCounters(pending))
           this._accumulateReport(nextState, summary)
           this._persistReportState(statePath, nextState)
           return
@@ -801,36 +866,17 @@ function createApp ({
      *  （C1-008：只有 EEXIST 且持有进程存活才是「另一轮在更新」；EACCES/ENOSPC/EROFS/EMFILE 等
      *  open 失败、unlink 失败、二次 open 失败都是真实故障，此前全折叠成 -1 被谎报成并发）。 */
     _tryAcquireChannelHealthLock (lockPath) {
-      const fail = (reason, err) => {
-        this._lastChannelHealthLockFailure = {
-          reason,
-          code: (err && err.code) || '',
-          message: (err && err.message) || ''
-        }
-        return -1
-      }
       this._lastChannelHealthLockFailure = null
-      const writeToken = (fd) => {
-        try {
-          fs.writeSync(fd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
-        } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+      // C1-013：单次尝试（观测性写入不为拿锁阻塞事件循环），与 run.log / RE2 标记共用同一份
+      // tryLockOnce；失败原因按 reason 分流，供调用点区分「另一轮在更新」与真实故障（C1-008）。
+      const attempt = tryLockOnce(lockPath)
+      if (typeof attempt.fd === 'number') return attempt.fd
+      this._lastChannelHealthLockFailure = {
+        reason: attempt.reason,
+        code: (attempt.error && attempt.error.code) || '',
+        message: (attempt.error && attempt.error.message) || ''
       }
-      try {
-        const fd = fs.openSync(lockPath, 'wx')
-        writeToken(fd)
-        return fd
-      } catch (e) {
-        if (!e || e.code !== 'EEXIST') return fail('open', e)
-        let stale = false
-        try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
-        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return fail('busy', e)
-        try { fs.unlinkSync(lockPath) } catch (e2) { return fail('unlink', e2) } // 竞争者已接管/无权限，按跳过处理
-        try {
-          const fd = fs.openSync(lockPath, 'wx')
-          writeToken(fd)
-          return fd
-        } catch (e2) { return fail('reopen', e2) }
-      }
+      return -1
     },
 
     _releaseChannelHealthLock (lockPath, lockFd) {
@@ -971,7 +1017,33 @@ function createApp ({
         const interval = Math.max(0, Utils.num(Config.channelHealth.intervalMs, 3600000))
         const now = Date.now()
         const alerts = []
+        // C1-007：**先按失败计，再按成功恢复**。旧实现先跑成功分支、再在失败分支里
+        // `if (succeeded.has(channel)) continue` 短路——同一轮里「推 1 条成功 + 1 条失败」的通道
+        // 只走成功分支被清零，间歇失败永远攒不满阈值，这类「半可用」通道既不告警也不进健康台账。
+        // 现在成功只在本轮**零失败**时才算恢复；本轮有失败就计数 +1（成功不覆盖失败）。
+        for (const [channel, failure] of failed) {
+          const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
+          const count = this._safeCounter(entry.consecutiveFailures) + 1
+          const lastAlertAt = this._safeCounter(entry.lastAlertAt)
+          // APP2-01：限频按「告警尝试」计时——告警通道本身不可用时发送必然失败，若只在发送成功后
+          // 回填 lastAlertAt，intervalMs（默认 1h）限频完全失效，每轮都重发。故在排入告警时即落盘。
+          const alertDue = count >= threshold && (!interval || now - lastAlertAt >= interval)
+          const next = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt: alertDue ? now : lastAlertAt }
+          // APP2-02：失败不得抹掉**已认领**的恢复通知——否则「恢复告警还没送出就遇到一次失败」
+          // 会把 pending/claim 一起丢掉，之后再也不会有恢复通知（不丢契约）。原样保留待下一次
+          // 零失败的轮次由成功分支处理。
+          if (entry.recoverAlertPending === true) {
+            next.recoverAlertPending = true
+            next.recoverAlertClaim = entry.recoverAlertClaim
+            next.recoverAlertClaimAt = this._safeCounter(entry.recoverAlertClaimAt)
+            next.lastRecoveredAt = this._safeCounter(entry.lastRecoveredAt)
+          }
+          state[channel] = next
+          if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
+        }
         for (const channel of succeeded) {
+          // 本轮也失败过 ⇒ 已按失败计数（见上），不得再按「恢复」清零。
+          if (failed.has(channel)) continue
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
           const failures = this._safeCounter(entry.consecutiveFailures)
           const recoverPending = entry.recoverAlertPending === true
@@ -1006,17 +1078,6 @@ function createApp ({
           } else {
             state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
           }
-        }
-        for (const [channel, failure] of failed) {
-          if (succeeded.has(channel)) continue
-          const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
-          const count = this._safeCounter(entry.consecutiveFailures) + 1
-          const lastAlertAt = this._safeCounter(entry.lastAlertAt)
-          // APP2-01：限频按「告警尝试」计时——告警通道本身不可用时发送必然失败，若只在发送成功后
-          // 回填 lastAlertAt，intervalMs（默认 1h）限频完全失效，每轮都重发。故在排入告警时即落盘。
-          const alertDue = count >= threshold && (!interval || now - lastAlertAt >= interval)
-          state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt: alertDue ? now : lastAlertAt }
-          if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
         }
         if (!this._writeState(statePath, state)) return
         for (const alert of alerts) pendingAlerts.push(alert)
@@ -1160,7 +1221,8 @@ function createApp ({
         // CR-03：不在此处缓存 cacheDir——init 只保证「此刻」目录可用，后续每行日志/状态文件都要
         // 重新过 getter 的 lstat+realpath 校验（运行期目录被替换成外部符号链接时必须当场失败）。
         checkpoint('cache-init')
-        if (!dryRun) await this._warnMissingRe2()
+        // C1-009：dry-run 也走这条链（内部 dryRun 分支只写 console/run.log，不发告警、不写标记）
+        await this._warnMissingRe2({ dryRun })
         this._warnLowDisk()
         checkpoint('disk-check')
 
@@ -1646,13 +1708,15 @@ function createApp ({
                 return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
               })()
             }
+            // C1-010：只对「要转 Markdown」的渲染做有界前缀（{Html内容} 原样发 HTML，截前缀会丢内容）。
+            const renderItem = contentTpl.includes('{Html内容}') ? pushItem : this._boundMarkdownHtml(pushItem, contentMax)
             // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
             // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
-            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, pushItem), titleMax)
+            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, renderItem), titleMax)
             // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
             // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
             // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
-            const rawDesp = Formatter.tuisong_replace(contentTpl, pushItem)
+            const rawDesp = Formatter.tuisong_replace(contentTpl, renderItem)
             const rawClean = Utils.sanitizeSurrogates(rawDesp)
             desp = Utils.truncateUtf16(rawClean, contentMax)
             // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
@@ -1701,6 +1765,19 @@ function createApp ({
 
         let successCount = 0
         const pushResults = []
+        // C1-017：并行/顺序两条循环的**共用**口径（成功日志、成功计数、补位间隔）收敛到一处。
+        // 旧实现里每个分支各写一遍控制台文案、`successCount` 口径与 `pushInterval` 解析——文案改一处
+        // 就漂移（并行分支曾漏掉 `!r.preview` 的等价改写），间隔语义也容易只改一边。
+        // per-worker 语义保留：并行分支每完成一条（且还有待推条目）等一次间隔，全局速率 =
+        // parallelLimit × interval；顺序分支每条之后都等（含最后一条，与旧行为逐字一致）。
+        const pushInterval = Utils.num(Config.timing.pushInterval, 0)
+        const waitPushSlot = async () => { if (pushInterval > 0) await delay(pushInterval) }
+        // 成功才打日志并计数：preview/失败都不算成功（旧并行分支 `r.ok && !r.preview` 的 !preview 恒真）。
+        const logPushed = (r) => {
+          if (!r || !r.ok) return 0
+          console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
+          return 1
+        }
         // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
         if (Config.push && Config.push.mode && Config.push.mode !== 'sequential' && Config.push.mode !== 'parallel') {
           console.warn(`⚠️ 配置「push.mode」值无效：「${safeConfigText(Config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`)
@@ -1709,7 +1786,6 @@ function createApp ({
         // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
         // parallelLimit 防御：夹取口径只在 resolveParallelWindow（取整（0.5 取 0 后回退 1）、0/负数按消息总数、硬性上限 50）。
           const limit = resolveParallelWindow(Config.push.parallelLimit, items.length)
-          const pushInterval = Utils.num(Config.timing.pushInterval, 0)
           const results = new Array(items.length)
           let nextIndex = 0
           const worker = async () => {
@@ -1719,28 +1795,20 @@ function createApp ({
               results[index] = await pushOne(items[index], notifyModule)
               // 保留可配置的补位间隔（per-worker 语义：每个 worker 完成一条后等 pushInterval 再补下一条，
               // 并行全局速率 = parallelLimit × interval；已知取舍，量小+重试兜底不改），pushInterval=0 即完成即补。
-              if (pushInterval > 0 && nextIndex < items.length) {
-                await delay(pushInterval)
-              }
+              if (nextIndex < items.length) await waitPushSlot()
             }
           }
           await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
           pushResults.push(...results)
           // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
-          for (const r of results) {
-            if (r && r.ok) console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
-          }
-          // C1-024：preview 分支返回 { ok:false, preview:true }，故 `r.ok && !r.preview` 里的 !r.preview
-          // 恒真——成功只认 r.ok（与顺序分支 `if (r.ok)` 同口径），预览不伪造成功也不计失败。
-          successCount = results.filter(r => r && r.ok).length
+          for (const r of results) successCount += logPushed(r)
         } else {
         // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
-          const pushInterval = Utils.num(Config.timing.pushInterval, 0)
           for (const item of items) {
             const r = await pushOne(item, notifyModule)
             pushResults.push(r)
-            if (r.ok) { successCount++; console.log(`发现到新数据：${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】${urlOf(item)}`) }
-            if (pushInterval > 0) await delay(pushInterval)
+            successCount += logPushed(r)
+            await waitPushSlot()
           }
         }
         checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`)
