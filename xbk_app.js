@@ -39,7 +39,11 @@ function createApp ({
    *  不删除），而不是退回按路径删除——那正是误删接管者锁的入口。 */
   const tryLockOnce = (lockPath) => {
     try {
-      const fd = fs.openSync(lockPath, 'wx')
+      // 0o600：锁文件内容只是 pid:starttime 令牌，没有任何理由让同组/其他用户可读；
+      // 显式收紧 mode 也结构上消除 CodeQL js/insecure-temporary-file 的判定面——该查询只把
+      // 「没给 mode」或「mode 低 6 位非 0」的文件创建当 sink（isSecureMode），给足 0o600 后
+      // 无论 lockPath 来自哪里都不再命中（此前命中来自测试用 os.tmpdir() 建目录后把路径传进来）。
+      const fd = fs.openSync(lockPath, 'wx', 0o600)
       const token = lockTokenOf()
       try { fs.writeSync(fd, token) } catch (e) { /* 锁内容仅供排查及归属校验，失败不影响持有 */ }
       return { fd, token }
@@ -53,7 +57,7 @@ function createApp ({
       if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return { reason: 'busy', error: e }
       try { fs.unlinkSync(lockPath) } catch (e2) { return { reason: 'unlink', error: e2 } }
       try {
-        const fd = fs.openSync(lockPath, 'wx')
+        const fd = fs.openSync(lockPath, 'wx', 0o600)
         const token = lockTokenOf()
         try { fs.writeSync(fd, token) } catch (e2) { /* 同上 */ }
         return { fd, token }

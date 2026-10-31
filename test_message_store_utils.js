@@ -1282,6 +1282,41 @@ check('_acquireTombstoneCleanupGuard: 认领期间出现的新哨兵不得被覆
   assert.strictEqual(fsMock.files.get(guardPath), '777777777:0:competitor', '不得覆盖竞争者刚创建的哨兵')
 })
 
+// ===== MS-15：SYSTEM_CONTRACT 边界「四处锁一律 O_EXCL + 显式 0o600、权限不受 umask 影响」=====
+// 墓碑锁 `.seen.lock` 与目录级哨兵 `.seen.cleanup.lock` 此前用 `writeFileSync(..., { flag: 'wx' })`，
+// 没给 mode ⇒ 权限随 umask（umask 000 时落到 0666）。契约写了代码没做，故这里按**真实文件系统 + umask 000**
+// 实测创建后的权限：只要任一处去掉 `mode: 0o600`（含认领重建的第二处写点）这条必红。
+check('MS-15 墓碑锁与清理哨兵必须显式 0600：umask 000 下创建出来也不得放宽', () => {
+  const dir = path.join(ROOT_DIR, `xianbaoku_cache_lockmode_${process.pid}`)
+  REAL_FS.rmSync(dir, { recursive: true, force: true })
+  REAL_FS.mkdirSync(dir, { recursive: true })
+  const prevUmask = process.umask(0o000)
+  try {
+    const s = storeWithFs(REAL_FS, path.basename(dir))
+    const lockPath = path.join(dir, 'lockmode.json.seen.lock')
+    const guardPath = path.join(dir, '.seen.cleanup.lock')
+    const modeOf = (p) => REAL_FS.statSync(p).mode & 0o777
+    // ① 无竞争路径：哨兵 + 墓碑锁各一处 writeFileSync
+    assert.strictEqual(typeof s._acquireTombstoneCleanupGuard(dir), 'string', '无竞争时哨兵必须创建成功')
+    assert.strictEqual(typeof s._acquireTombstoneLock(lockPath), 'string', '无竞争时墓碑锁必须创建成功')
+    for (const p of [guardPath, lockPath]) {
+      const mode = modeOf(p)
+      assert.strictEqual(mode, 0o600,
+        `${path.basename(p)} 权限必须是 0600，实际 0o${mode.toString(8)}（umask 000 下 0666/0644 = 随 umask 放宽）`)
+    }
+    // ② 陈旧哨兵认领后的重建：第二条 writeFileSync（守卫重开）同样必须带 mode
+    REAL_FS.unlinkSync(guardPath)
+    REAL_FS.writeFileSync(guardPath, '999999999:0:dead-owner')
+    assert.strictEqual(typeof s._acquireTombstoneCleanupGuard(dir), 'string', '持有者已退出的陈旧哨兵必须可认领重建')
+    const rebuilt = modeOf(guardPath)
+    assert.strictEqual(rebuilt, 0o600,
+      `认领重建的哨兵权限必须是 0600，实际 0o${rebuilt.toString(8)}（这一写点漏 mode 同样破坏契约）`)
+  } finally {
+    process.umask(prevUmask)
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 check('_isTombstoneLockOwner: 只有长度与内容都相同的字符串 token 才算持有者', () => {
   const lockPath = '/mem/seen.lock'
   let calls = 0

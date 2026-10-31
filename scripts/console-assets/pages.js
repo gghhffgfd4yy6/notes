@@ -2565,10 +2565,13 @@ function SearchPanel ({ onSync, active = true }) {
       onConfirm=${() => {
         const q = askRemove
         setAskRemove(null)
+        // S9383：确认框回调不能 await ⇒ 链尾补 .catch 兜住拒绝（removeWatch 内部已把失败写进
+        // watchErr，正常路径不会 reject；这里只防将来改成会 reject 时留下未处理的拒绝），
+        // 焦点回落仍走 finally、与原来逐条一致。standard 禁用 void，故用 .catch 而非 void 标记。
         Promise.resolve(removeWatch(q)).finally(() => {
           const el = watchBoxRef.current
           if (el && el.isConnected && typeof el.focus === 'function') el.focus({ preventScroll: true })
-        })
+        }).catch(() => {})
       }}
       onCancel=${() => setAskRemove(null)}>
       <div>「${askRemove || ''}」会从关注词里删掉；要加回来得重新搜一次这个词。</div>
@@ -3738,7 +3741,7 @@ function TwoFactorBlock ({ active = true }) {
       title="退出所有信任设备？"
       confirmLabel=${busy === 'revoke' ? '退出中…' : '全部退出'}
       busy=${busy === 'revoke'}
-      onConfirm=${() => { revokeDevices().finally(() => setRevokeAsk(false)) }}
+      onConfirm=${() => { revokeDevices().finally(() => setRevokeAsk(false)).catch(() => {}) }}
       onCancel=${() => { if (busy !== 'revoke') setRevokeAsk(false) }}>
       <div>会清空 ${status && status.trustedDevices ? status.trustedDevices : '所有'} 台已记住的设备——<b>包括当前这台浏览器</b>。</div>
       <div class="modal-note">之后每台设备打开控制台都要重新输一次手机上的 6 位数字；恢复码仍然可用，不会被清掉。</div>
