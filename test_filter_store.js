@@ -168,7 +168,18 @@ test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字�
   const err = result.errors.find(e => e.code === 'too_large')
   assert.ok(err, `应给出 too_large 错误码：${JSON.stringify(result.errors)}`)
   assert.strictEqual(err.field, 'filter', '字段归属必须是 filter（整份而非某一字段超限）')
-  assert.ok(/\d+ 字节/.test(err.message) && err.message.includes(String(64 * 1024)),
+  // 文案形态「<数字> 字节」用逐字符扫描判定：Sonar javascript:S8786 把 `\d+ 字节` 判成可回溯
+  // （量词 + 字面量），而这条判据需要的只是「' 字节' 前面紧邻一位数字」；扫描与 /\d+ 字节/ 等价
+  // （多个 ' 字节' 出现处逐个看），无回溯面，代价 O(文案长度)。
+  const hasByteCount = (text) => {
+    const unit = ' 字节'
+    for (let at = text.indexOf(unit); at > 0; at = text.indexOf(unit, at + unit.length)) {
+      const prev = text[at - 1]
+      if (prev >= '0' && prev <= '9') return true
+    }
+    return false
+  }
+  assert.ok(hasByteCount(err.message) && err.message.includes(String(64 * 1024)),
     `错误文案必须给出实际字节数与上限：${err.message}`)
   // 对照：把字段砍到总量在预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
   const small = { pingbibiaoti: '中'.repeat(4000), pingbineirong: '中'.repeat(4000) }
