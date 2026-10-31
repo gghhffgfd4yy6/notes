@@ -926,7 +926,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   const TOKEN2 = 'q'.repeat(32)
   const dir = tmpDir()
   const state = readStatus(dir) // 空目录 → 全部件「缺失」，formatStatus 合法渲染
-  const withToken = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  const withToken = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
   // JSON 岛注入（v3.285：SPA 壳；fetch 由前端发起，不再有原生表单/meta refresh）
   assert.ok(withToken.includes(`"token":"${TOKEN2}"`), 'JSON 岛带 token')
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
@@ -934,7 +934,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
   // v3.376：theme-color 跟主题底色一致，Android 系统栏/地址栏才不会在切页时漏白。
   assert.ok(withToken.includes('<meta name="theme-color" content="#0b0f17">'), 'theme-color 必须是默认主题底色')
-  const lightPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
+  const lightPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
   assert.ok(lightPage.includes('<meta name="theme-color" content="#f3f5f9">'), 'theme-color 必须跟随主题')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
@@ -946,26 +946,26 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   // v3.323 主题：首帧必须由服务端把 <html data-theme> 渲染出来（放 body 或只在 JS 里设都不算）。
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(withToken), '默认首帧 data-theme 必须是 deep')
-  const nordPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
+  const nordPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
   assert.ok(/<html lang="zh-CN" data-theme="nord">/.test(nordPage), '首帧必须跟随传入的主题')
-  const badPage = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
+  const badPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(badPage), '白名单外主题必须回落 deep')
   assert.ok(!/<body[^>]*data-theme/.test(nordPage), 'data-theme 必须在 <html> 上（放到 body 不生效）')
-  const noToken = renderPage(state, [], null)
+  const noToken = renderPage(state, null)
   assert.ok(noToken.includes('"token":""'), '无 token 时 JSON 岛为空串（前端触发会 401，符合 fail-closed）')
   assert.ok(!noToken.includes(`"token":"${TOKEN2}"`), '无 token 时不回显')
   assert.ok(noToken.includes('缺失'), '空缓存目录渲染「缺失」分支（noscript 降级）')
   // Sourcery vwK：特殊字符 token 必须以 \uXXXX JSON 转义进岛（script 文本不做实体解码，
   // HTML 实体会让前端 parse 出错误 token）；JSON.parse 后必须还原为原值。
   const WEIRD = 'a<b>&"\\u2028' + 'z'.repeat(20)
-  const weirdPage = renderPage(state, [], new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
+  const weirdPage = renderPage(state, new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
   assert.ok(!weirdPage.includes('<b>'), '岛内不得出现裸 <script 片段')
   const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(weirdPage)
   assert.ok(m, 'JSON 岛可提取')
   const parsed = JSON.parse(m[1].replace(/\\u003c/g, '<').replace(/\\u003e/g, '>'))
   assert.strictEqual(parsed.token, WEIRD, '岛内 token 经 JSON 解析还原为原值')
   // 常规 token 原样进岛（不引入任何实体）
-  const plain = renderPage(state, [], new URLSearchParams(`token=${TOKEN2}`))
+  const plain = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
   assert.ok(plain.includes(`"token":"${TOKEN2}"`), '常规 token 原样回显')
 })
 
@@ -3034,6 +3034,11 @@ async function watchMonitorTests () {
       const failed = await failing.runWatchOnce()
       assert.strictEqual(failed.pushed, 0)
       assert.strictEqual(failed.results[0].error, 'push_failed')
+      // C2-009 入库回归：旧的四个失败分支先 push 一条 error 条目、循环外又无条件 push 一条
+      // 「成功形态」，同一个词在 results 里出现两次（前端一个标红一个标绿）。只查 results[0]
+      // 抓不到，必须钉长度。
+      assert.strictEqual(failed.results.length, 1,
+        `推送失败时同一个词只能有一条结果（实际 ${failed.results.length} 条：${JSON.stringify(failed.results)}）`)
       const kept = readWatchState(dir)
       assert.deepStrictEqual(kept.words[0].sentIds, [])
       assert.strictEqual(kept.words[0].lastReadId, 'haodan-7303544', '失败不得推进锚点')
@@ -3276,6 +3281,218 @@ async function watchMonitorTests () {
   })
 }
 
+// ── 返工回归（w1-g1 must_fix）：以下修复此前的反向验证只存在于未入库的 scratch 探针，
+// 仓库里没有任何断言会在修复被回退时变红。这里把每条行为修复落成入库断言：
+//   C2-007 状态文件（console-auto.json / console-lastaccept.json）必须经 writeAtomic 落盘，
+//          且重放窗落盘失败必须 fail-closed 500（旧的裸 writeFileSync 会照常 202 并 spawn）；
+//   C2-008 导入失败的回滚必须经 writeAtomic 原子提交，回滚写失败要如实报 rolledBack:false；
+//   C2-012 2FA 两处补对象校验（body=[] 旧实现 200 {enabled:false}，把畸形请求报成成功）；
+//   C2-013 重放窗文件损坏必须在启动时点名文件 + 原因 + 后果；
+//   C2-009 结果去重补在既有关注词用例里（同一份夹具，不复制第二套）；
+//   C2-010/C2-011 是纯重构（三份实现合并成一份，行为等价、无行为差异可断言），按评审给的口径
+//          补结构断言，且先剥注释（codeOf）防注释里的原句满足判据。
+// 行为类判据一律走真实入口（HTTP / createConsole / 落盘桩），不做源码字符串匹配。
+async function withStorageWriteStub (impl, fn) {
+  // scripts/console.js 在**加载期**就把 writeAtomic 解构进闭包（`const { readSafeTextResult,
+  // writeAtomic } = require('../xbk_storage')`），运行期改 require.cache 里的导出对它无效。
+  // 要观察「某处落盘是否真的走 writeAtomic」，只能换掉 xbk_storage 的导出后重新加载 console。
+  // 桩只多记一条 {file,label,result}，其余导出原样透传；跑完把两份 require.cache 还原，
+  // 后续用例看到的仍是本文件顶部那个实例（模块级 runs Map 不受影响）。
+  const storagePath = require.resolve('./xbk_storage')
+  const consolePath = require.resolve('./scripts/console')
+  const realStorage = require.cache[storagePath]
+  const realConsole = require.cache[consolePath]
+  assert.ok(realStorage && realStorage.exports, 'xbk_storage 必须已加载（否则桩无法透传真实实现）')
+  const realWrite = realStorage.exports.writeAtomic
+  assert.strictEqual(typeof realWrite, 'function', 'xbk_storage.writeAtomic 必须存在')
+  const calls = []
+  require.cache[storagePath] = {
+    id: storagePath,
+    filename: storagePath,
+    loaded: true,
+    exports: {
+      ...realStorage.exports,
+      writeAtomic: (file, text, label) => {
+        const entry = { file: String(file), label: label === undefined ? '' : String(label) }
+        let result = false
+        try {
+          result = impl(entry, text, realWrite)
+        } catch (e) {
+          result = false
+        }
+        calls.push({ ...entry, result })
+        return result
+      }
+    }
+  }
+  let mod
+  try {
+    delete require.cache[consolePath]
+    mod = require('./scripts/console')
+  } finally {
+    delete require.cache[consolePath]
+    require.cache[storagePath] = realStorage
+    if (realConsole) require.cache[consolePath] = realConsole
+  }
+  return fn(mod, calls)
+}
+
+// 同步抓 stderr：createConsole 启动期的告警是同步 console.error 出来的。
+function capturedStderr (fn) {
+  const chunks = []
+  const orig = process.stderr.write
+  process.stderr.write = (c) => { chunks.push(String(c)); return true }
+  try {
+    fn()
+  } finally {
+    process.stderr.write = orig
+  }
+  return chunks.join('')
+}
+
+async function reworkRegressionTests () {
+  await aok('结构红线: 过滤规则提交链只有一份实现（C2-010）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((code.match(/function commitFilterOverride \(/g) || []).length, 1,
+      'commitFilterOverride 只能有一处定义（保存/回滚/导入各写一遍就是回退了修复）')
+    assert.strictEqual((code.match(/commitFilterOverride\(\{/g) || []).length, 3,
+      '保存、回滚、导入三个写动作必须共用同一条提交链')
+    assert.strictEqual((code.match(/function appendFilterAudit \(/g) || []).length, 1)
+    assert.strictEqual((code.match(/appendFilterAudit\(\{/g) || []).length, 1,
+      '审计只能由提交链写一次（散着写必然出现「某条路径不写审计」）')
+  })
+
+  await aok('结构红线: 上游响应体读取只有一份实现（C2-011）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((code.match(/getReader\(\)/g) || []).length, 1,
+      'getReader() 只应出现在共用实现里（搜索/详情各写一份就是回退了修复）')
+    assert.strictEqual((code.match(/readUpstreamTextCapped/g) || []).length, 3,
+      'readUpstreamTextCapped 必须 1 处定义 + 搜索/详情 2 个调用点')
+  })
+
+  await aok('2FA 写端点: body 不是对象必须 400（C2-012）', async () => {
+    const dir = mkTmp('xbk-console-c2012-')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const json = { 'content-type': 'application/json' }
+    try {
+      for (const [endpoint, body] of [['/api/2fa/disable', '[]'], ['/api/2fa/enable', '"x"'], ['/api/2fa/disable', 'null']]) {
+        const res = await request(port, 'POST', endpoint, { token: TOKEN, headers: json, body })
+        assert.strictEqual(res.status, 400,
+          `${endpoint} body=${body} 必须是 400（旧实现按空 payload 继续走，把畸形请求报成成功：${res.text}）`)
+        assert.strictEqual(JSON.parse(res.text).error, 'body 必须是对象', `${endpoint} body=${body} 错误码`)
+      }
+      // 对象形态照旧走原语义（2FA 未开启时关闭 = 200 {enabled:false}）：校验只拒绝畸形 body。
+      const normal = await request(port, 'POST', '/api/2fa/disable', { token: TOKEN, headers: json, body: '{}' })
+      assert.strictEqual(normal.status, 200, normal.text)
+      assert.deepStrictEqual(JSON.parse(normal.text), { enabled: false })
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('重放窗记录损坏: 启动时点名文件与原因告警（C2-013）', () => {
+    const dir = mkTmp('xbk-console-c2013-')
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), '{"check":{"at":17') // 半截 JSON：崩溃/ENOSPC 的典型残留
+    let inst
+    const stderr = capturedStderr(() => { inst = createConsole({ token: TOKEN, stateDir: dir }) })
+    try {
+      assert.ok(stderr.includes('console-lastaccept.json'), `告警必须点名文件（实际 stderr：${JSON.stringify(stderr)}）`)
+      assert.ok(stderr.includes('内容不是合法 JSON'), '告警必须点名原因（旧实现静默按空窗处理）')
+      assert.ok(stderr.includes('重复跑一轮真实推送'), '告警必须点名后果，否则运维不知道窗口已经失效')
+    } finally {
+      inst.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('状态文件落盘: auto/lastaccept 都经 writeAtomic，重放窗写不进则 fail-closed（C2-007）', async () => {
+    const dir = mkTmp('xbk-console-c2007-')
+    const json = { 'content-type': 'application/json' }
+    let failLastAccept = false
+    await withStorageWriteStub((entry, text, realWrite) => {
+      if (failLastAccept && entry.label === '重放窗记录') return false
+      return realWrite(entry.file, text, entry.label)
+    }, async (mod, calls) => {
+      const { server } = mod.createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      try {
+        // ① 只保存间隔（on 仍 false ⇒ stopAuto ⇒ persistAuto），不启动自动运行、不 spawn。
+        const saved = await request(port, 'POST', '/api/auto', { token: TOKEN, headers: json, body: JSON.stringify({ interval: 5 }) })
+        assert.strictEqual(saved.status, 200, saved.text)
+        const autoCall = calls.find((c) => c.label === '自动运行状态')
+        assert.ok(autoCall, `自动运行状态必须经 writeAtomic 落盘（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(autoCall.file, path.join(dir, 'console-auto.json'))
+        assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).interval, 5)
+
+        // ② 重放窗桩返回 false：/trigger 必须 500 fail-closed（旧实现裸 writeFileSync 会 202 并 spawn）。
+        failLastAccept = true
+        const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+        assert.strictEqual(blocked.status, 500, `重放窗落盘失败必须 fail-closed（实际 ${blocked.status}：${blocked.text}）`)
+        assert.match(String(JSON.parse(blocked.text).error), /fail-closed/)
+        const lastAcceptCall = calls.find((c) => c.label === '重放窗记录')
+        assert.ok(lastAcceptCall, `重放窗记录必须经 writeAtomic 落盘（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(lastAcceptCall.file, path.join(dir, 'console-lastaccept.json'))
+        // fail-closed 分支必须释放触发锁，否则后续 10 分钟都被 409 挡住。
+        const lockRaw = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
+        assert.ok(!lockRaw || lockRaw.released === true, 'fail-closed 分支必须释放触发锁')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  await aok('数据备份: 导入失败的回滚经 writeAtomic 原子提交（C2-008）', async () => {
+    const dir = mkTmp('xbk-console-c2008-')
+    const pushPath = path.join(dir, 'push.json')
+    const oldPush = JSON.stringify([{ id: 1, title: 'old' }])
+    fs.writeFileSync(pushPath, oldPush)
+    fs.mkdirSync(path.join(dir, 'run.log')) // run.log 是目录 ⇒ 写到它必失败 ⇒ 触发整体回滚
+    const bundle = {
+      kind: 'xbk-console-backup',
+      schema: 1,
+      data: {
+        messages: { count: 1, text: JSON.stringify([{ id: 2, title: 'new' }]) },
+        runLog: { text: 'new log\n' }
+      }
+    }
+    let failRollback = false
+    await withStorageWriteStub((entry, text, realWrite) => {
+      if (failRollback && entry.label === '导入回滚 push.json') return false
+      return realWrite(entry.file, text, entry.label)
+    }, async (mod, calls) => {
+      const { server } = mod.createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      const doImport = () => request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(bundle)
+      })
+      try {
+        const failed = await doImport()
+        assert.strictEqual(failed.status, 500, failed.text)
+        assert.strictEqual(JSON.parse(failed.text).rolledBack, true, '回滚必须成功')
+        const rollbackCall = calls.find((c) => c.label === '导入回滚 push.json')
+        assert.ok(rollbackCall, `回滚必须经 writeAtomic 原子提交（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(rollbackCall.file, pushPath)
+        assert.strictEqual(rollbackCall.result, true)
+        assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), oldPush, '回滚内容必须逐字还原')
+
+        // 回滚写入本身失败：必须如实上报 rolledBack:false，不得把「回滚没做成」报成成功。
+        failRollback = true
+        const failed2 = await doImport()
+        assert.strictEqual(failed2.status, 500, failed2.text)
+        assert.strictEqual(JSON.parse(failed2.text).rolledBack, false, '回滚写失败必须如实上报 rolledBack:false')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+}
+
 async function main () {
   // ── C5-020：源码锁的纪律（缺锚点响亮失败 / 注释不得满足判据）──
   ok('C5-020 源码切片缺锚点或空切片必须响亮失败（旧写法 slice(-1) 静默假绿）', () => {
@@ -3420,6 +3637,7 @@ async function main () {
   await filterRuleApiTests()
   await backupApiTests()
   await backupUiStructureTests()
+  await reworkRegressionTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
@@ -3680,7 +3898,7 @@ async function main () {
     }
     assert.ok(closure.length > 0, '闭包不得为空（否则下面的对账恒真）')
     const { readStatus } = require('./scripts/status')
-    const html = renderPage(readStatus(tmpDir()), [], new URLSearchParams(`token=${TOKEN}`))
+    const html = renderPage(readStatus(tmpDir()), new URLSearchParams(`token=${TOKEN}`))
     // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
     const hrefsRaw = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
     // v3.375：版本号在路径里（/assets/<16hex>/x.js），模块间的相对 import 才会共享同一前缀。
@@ -11082,7 +11300,7 @@ async function main () {
       report: { status: 'ok', value: { date: payload, runs: 1 } },
       run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
       channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
-    }), [], new URLSearchParams(), 'tok', 'deep')
+    }), new URLSearchParams(), 'tok', 'deep')
     assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
     assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
     assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
@@ -11099,7 +11317,7 @@ async function main () {
       diagnostics: { status: 'missing', value: null }
     }
     // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
-    const html = renderPage(bare, [], undefined, '', 'deep')
+    const html = renderPage(bare, undefined, '', 'deep')
     assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
     assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
     assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
@@ -11114,8 +11332,8 @@ async function main () {
 
   await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
     const { renderPage } = require('./scripts/console')
-    const dark = renderPage(uiState(), [], new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
-    const light = renderPage(uiState(), [], new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    const dark = renderPage(uiState(), new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
     assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
     assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
     assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
@@ -11124,19 +11342,19 @@ async function main () {
     assert.strictEqual(bootIsland(light).token, 'tok-BBB')
     assert.strictEqual(bootIsland(light).instance, 'inst-2')
     // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
-    const evil = renderPage(uiState(), [], new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    const evil = renderPage(uiState(), new URLSearchParams(), '', 'deep" onload="alert(1)', '')
     assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
     assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
   })
 
   await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
     const { renderPage } = require('./scripts/console')
-    const fromQuery = renderPage(uiState(), [], new URLSearchParams('token=from-query'), '', 'deep')
+    const fromQuery = renderPage(uiState(), new URLSearchParams('token=from-query'), '', 'deep')
     assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
-    const fromSession = renderPage(uiState(), [], new URLSearchParams('token=from-query'), 'from-session', 'deep')
+    const fromSession = renderPage(uiState(), new URLSearchParams('token=from-query'), 'from-session', 'deep')
     assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
     // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
-    const breakout = renderPage(uiState(), [], new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    const breakout = renderPage(uiState(), new URLSearchParams(), 'tok</script><img src=x>', 'deep')
     assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
     assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
     assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')

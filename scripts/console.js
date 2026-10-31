@@ -161,6 +161,38 @@ const LINE_WATCH_SENT_MAX = 200
 // 调度器每 30s 看一次是否到点；实际间隔由配置决定（默认 10 分钟）。
 const LINE_WATCH_TICK_MS = 30 * 1000
 
+// 上游响应体读取（C2-011）：搜索页与详情页此前各写一份「流式边读边计字节 + 非流回退」。
+// 两处字节口径现已一致（流式都按 Buffer 长度、非流都按 Buffer.byteLength），但副本仍在——
+// 上限、取消读流、超限文案各写一遍，改一处必漏一处。收成一份：
+// 返回 { ok:true, text } 或 { ok:false, code:'too_large'|'read_failed' }，具体文案由调用方给。
+async function readUpstreamTextCapped (upstream, maxBytes) {
+  try {
+    const stream = upstream.body
+    if (stream && typeof stream.getReader === 'function') {
+      const reader = stream.getReader()
+      const chunks = []
+      let total = 0
+      for (;;) {
+        const step = await reader.read()
+        if (step.done) break
+        const chunk = Buffer.from(step.value)
+        total += chunk.length
+        if (total > maxBytes) {
+          try { await reader.cancel() } catch (e) { /* 已断开 */ }
+          return { ok: false, code: 'too_large' }
+        }
+        chunks.push(chunk)
+      }
+      return { ok: true, text: Buffer.concat(chunks).toString('utf8') }
+    }
+    const text = await upstream.text()
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) return { ok: false, code: 'too_large' }
+    return { ok: true, text }
+  } catch (e) {
+    return { ok: false, code: 'read_failed' }
+  }
+}
+
 // ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
 // 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
 const EXPORT_MAX_ROWS = 5000
@@ -1004,7 +1036,9 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, runsList, query, sessionToken, theme, instanceId = '') {
+function renderPage (state, query, sessionToken, theme, instanceId = '') {
+  // C2-016：旧签名的第二个参数 runsList 从未被使用（`/` 的 HTML 壳不含 run 列表，列表走
+  // /api/runs），调用方却每次打开页面都对全部 runs 排一次序。参数已删，排序一并去掉。
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
   // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
@@ -1768,6 +1802,27 @@ function parseSseCursor (raw) {
 
 // 超限后的排空上限（D2-S2）：客户端若只发一半就挂住，不能让连接无限期占着事件循环。
 const BODY_DRAIN_TIMEOUT_MS = 10 * 1000
+// C2-012：五个 JSON 写端点（关注词、2FA enable/disable、自动运行、控制台设置）此前各抄一份
+// 「readBody → aborted/over → JSON.parse(body||'{}') → 必须是对象」前言。除了重复，2FA 那两处
+// 还**漏了对象校验**（`[]`/`"x"`/`null` 会被当成空 payload 继续往下走，错误形态变成
+// 「验证码不对」而不是「body 必须是对象」）。收成一份：返回 { ok:true, payload } 或
+// { ok:false, status, body }，调用方只负责发包。
+function readJsonObjectBody (req, maxBytes = 4096) {
+  return readBody(req, maxBytes).then(({ body, aborted, over }) => {
+    if (aborted) return { ok: false, status: 400, body: { error: '请求中断，动作未执行' } }
+    if (over) return { ok: false, status: 413, body: { error: '请求体超限' } }
+    let payload
+    try {
+      payload = JSON.parse(body || '{}')
+    } catch (e) {
+      return { ok: false, status: 400, body: { error: 'invalid_json' } }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { ok: false, status: 400, body: { error: 'body 必须是对象' } }
+    }
+    return { ok: true, payload }
+  })
+}
 function readBody (req, maxBytes = 4096) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
@@ -2107,6 +2162,69 @@ function rollbackFilterOverride (paths, previousText) {
   } catch (e) {
     return { ok: false, mode: 'remove_failed' }
   }
+}
+
+// C2-010：保存（POST /api/config/filter）、回滚（/restore）、导入（/api/backup/import）三处
+// 各写了一遍「备份当前覆盖文件 → 原子写新一代 → 合并生效 → 追加审计 → 审计失败回滚」。
+// 三份只差 action / 写入 label / 失败后由谁收尾，改一处必漏两处。收成一份：
+//   返回 { ok:true, revision, changedFields, hash } 或 { ok:false, status, body }（body 可直接下发）。
+//   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
+//   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
+//   computeHash=false 给导入用：它不返回 hash，也就不必为拿摘要去懒加载规则引擎。
+function commitFilterOverride ({
+  paths, deps, defaults, loaded, filterValue, action, actorToken,
+  writeLabel = '过滤规则覆盖文件', computeHash = true, rollbackOnAuditFailure = true
+}) {
+  const curRevision = loaded.source === 'corrupt' ? 0 : loaded.revision
+  // 改文件前先备份当前这一代：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
+  // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
+  let previousText = null
+  if (loaded.source === 'override' || loaded.source === 'corrupt') {
+    const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+    if (raw.status === 'ok') previousText = raw.text
+    // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
+    if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+      return { ok: false, status: 500, body: { error: 'backup_failed', code: 'backup_failed' } }
+    }
+  }
+  const nextRevision = curRevision + 1
+  const nextFile = {
+    schema: FilterStore.FILTER_RULES_SCHEMA,
+    revision: nextRevision,
+    filter: filterValue
+  }
+  if (!writeAtomic(paths.file, JSON.stringify(nextFile), writeLabel)) {
+    return { ok: false, status: 500, body: { error: 'write_failed', code: 'write_failed' } }
+  }
+  const nextActive = FilterStore.mergeActiveFilter({
+    defaults: defaults.filter,
+    keyword: defaults.keyword,
+    override: filterValue
+  })
+  const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
+  const hash = computeHash ? filterHashOf(deps, nextActive.filter, nextActive.keyword) : null
+  const audit = appendFilterAudit({
+    auditPath: paths.audit,
+    actor: actorOf(actorToken),
+    action,
+    revision: nextRevision,
+    changedFields
+  })
+  if (!audit.ok) {
+    // 审计不落地 ⇒ 本次写入整体作废，绝不报成功。
+    if (!rollbackOnAuditFailure) {
+      return { ok: false, status: 500, body: { error: audit.code, code: audit.code } }
+    }
+    const rolled = rollbackFilterOverride(paths, previousText)
+    return {
+      ok: false,
+      status: 500,
+      body: { error: audit.code, code: audit.code, rolledBack: rolled.ok, rollbackMode: rolled.mode }
+    }
+  }
+  // 剪枝只在整个提交（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
+  pruneFilterBackups(paths)
+  return { ok: true, revision: nextRevision, changedFields, hash }
 }
 
 // 字段级 diff：只报字段名（顺序与 FILTER_RULE_FIELDS 一致），值绝不入响应/日志。
@@ -3360,9 +3478,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     lastRunId: auto.lastRunId
   })
   const persistAuto = () => {
+    // C2-007：改 writeAtomic（tmp + fsync + rename）——裸 writeFileSync 整写在崩溃/ENOSPC
+    // 时会在 autoPath 留下半截 JSON，重启读盘把它当「读取失败，按停止处理」，
+    // 自动运行开关被静默关掉；原子写只会有「旧文件」或「新文件」两态。
     try {
-      fs.writeFileSync(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }))
-      return true
+      if (writeAtomic(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }), '自动运行状态')) return true
+      console.error('⚠️ 自动运行状态落盘失败（进程内仍生效）')
+      return false
     } catch (e) {
       console.error(`⚠️ 自动运行状态落盘失败（进程内仍生效）：${e && e.message ? e.message : e}`)
       return false
@@ -3460,22 +3582,38 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     auto.startedAt = Date.now()
     scheduleAuto(auto.interval * 1000)
   }
-  // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
-  // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
+  // 读取持久化重放记录：返回 { entries, problem }。
+  // problem = null：正常，或文件根本不存在（首次启动）。非空字符串：**文件在、但读不出来**
+  // （EACCES/EISDIR、JSON 损坏、顶层不是对象、有条目字段非法）。
+  // C2-013：旧实现把这几类全折叠成「空窗」且不输出任何东西——重复推送保护无声失效，
+  // 运维看不出窗口记录已经丢了（重启后一次自动重试就能再跑一轮真实推送）。
   const readLastAccept = (p) => {
+    let text
     try {
-      const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
-      const out = []
-      if (parsed && typeof parsed === 'object') {
-        for (const [k, v] of Object.entries(parsed)) {
-          // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
-          const ridOk = v && typeof v.at === 'number' &&
-            (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
-          if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
-        }
-      }
-      return out
-    } catch (e) { return [] }
+      text = fs.readFileSync(p, 'utf8')
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return { entries: [], problem: null }
+      return { entries: [], problem: `读取失败（${e && e.code ? e.code : (e && e.message) || e}）` }
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch (e) {
+      return { entries: [], problem: '内容不是合法 JSON' }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { entries: [], problem: '顶层不是对象' }
+    }
+    const out = []
+    let dropped = 0
+    for (const [k, v] of Object.entries(parsed)) {
+      // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
+      const ridOk = v && typeof v.at === 'number' &&
+        (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
+      if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
+      else dropped += 1
+    }
+    return { entries: out, problem: dropped > 0 ? `${dropped} 条记录字段非法，已忽略` : null }
   }
   // ── v3.300 访问日志（内存环形，蓝图 §3.3）：闭包态，access-log 端点与 finish 钩子共用。
   const accessLog = []
@@ -3484,9 +3622,21 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 落盘到 stateDir/console-lastaccept.json（readStatus 同目录），受理时同步写、启动时回读。
   // 写入失败不阻断受理（主链路是单飞锁，落盘只是重放窗的持久化增强）。
   const lastAcceptPath = path.join(stateDir, 'console-lastaccept.json')
-  try {
-    for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
-  } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
+  // C2-007：重放窗记录同样走原子写。裸 writeFileSync 整写遇到崩溃/ENOSPC 会在
+  // lastAcceptPath 留下半截 JSON，重启后整份记录被当成「损坏 = 空窗」——窗口内的
+  // 自动重试就能穿透，重复跑一轮真实推送。writeAtomic 只留旧/新两态。
+  const persistLastAccept = () => writeAtomic(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)), '重放窗记录')
+  // C2-013：重放窗落在触发热路径上，每个问题只吵一次（逐次告警会把日志刷满）。
+  // 文案必须说清后果：按空窗处理 ⇒ 窗口内重试会被当成新触发，可能重复跑一轮真实推送。
+  let reportedLastAcceptProblem = ''
+  const reportLastAcceptProblem = (problem) => {
+    if (!problem || problem === reportedLastAcceptProblem) return
+    reportedLastAcceptProblem = problem
+    console.error(`⚠️ 重放窗记录（${lastAcceptPath}）不可用：${problem}。本进程按空窗处理——${Math.round(REPLAY_WINDOW_MS / 1000)} 秒窗口内的重试会被当成新触发，可能重复跑一轮真实推送；修复或删除该文件后重启即可恢复。`)
+  }
+  const persistedLastAccept = readLastAccept(lastAcceptPath)
+  reportLastAcceptProblem(persistedLastAccept.problem)
+  for (const [k, v] of persistedLastAccept.entries) lastAccept.set(k, v)
 
   // ── SSE 连接管理（v3.300 3.1）────────────────────────────────────────────
   // 按实例隔离（createConsole 闭包内，非模块级）：测试会创建多个 console 实例，
@@ -3727,9 +3877,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         if (!lockVerdict.ok) {
-          // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
+          // readLastAccept 返回 { entries, problem }（不是 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
-          const prevPrePair = persistedPre.find(([k]) => k === action)
+          reportLastAcceptProblem(persistedPre.problem)
+          const prevPrePair = persistedPre.entries.find(([k]) => k === action)
           const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
           // 窗口为 0 = 明确关闭拦截；时钟回拨（now < prev.at）时差值变成负数，若照常比较会
           // 把小负数也判成「还在窗内」，用户要等时钟追上来才能再触发——所以两个条件都要显式排除。
@@ -3743,7 +3894,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         const persisted = readLastAccept(lastAcceptPath)
-        for (const [k, v] of persisted) {
+        reportLastAcceptProblem(persisted.problem)
+        for (const [k, v] of persisted.entries) {
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
@@ -3765,9 +3917,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         lastAccept.set(action, { at: now, runId: 0 })
-        try {
-          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-        } catch (e) {
+        if (!persistLastAccept()) {
           // 落盘失败 = 无持久重放记录，为满足「重试不得重复推送」必须拒绝受理（Sourcery High）。
           // 此时锁刚拿到、子进程未启动（activeChildren 无登记，close 回调无从释放）——
           // 必须显式释放（Sourcery #225 M3/M4：releaseLockFor 返回 false = 文件系统
@@ -3789,10 +3939,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 关键：pending 帧已落盘（runId=0），只删内存会让下一次请求重读旧帧 → 整个
           // 重放窗都 409「重复提交」，但实际没有子进程跑过。这里把删除后的 Map 重新落盘；
           // 落盘失败只能告警（内存已回滚，本进程内可重试，重启后可能重现 409）。
-          try {
-            fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-          } catch (persistErr) {
-            console.error(`⚠️ ${action} 启动失败后清理重放帧失败：${persistErr && persistErr.message ? persistErr.message : persistErr}`)
+          if (!persistLastAccept()) {
+            console.error(`⚠️ ${action} 启动失败后清理重放帧失败`)
           }
           const releasedOk = releaseLockFor({ _stateDir: stateDir, _lockToken: runToken })
           if (!releasedOk) console.error(`⚠️ 触发锁释放失败（stateDir=${stateDir}）：锁将保留到陈旧接管（约 10 分钟）。`)
@@ -3802,9 +3950,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         record._lockAt = now
         lastAccept.set(action, { at: now, runId: record.id })
-        try {
-          fs.writeFileSync(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)))
-        } catch (e) { /* 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截 */ }
+        // 二次落盘失败：pending 帧已持久化（runId=0），重试仍被窗口拦截。
+        persistLastAccept()
         sendJson(res, 202, { id: record.id, action, label: record.label })
       })
       .catch((e) => { logCaught('trigger/readBody', e); sendJson(res, 500, { error: '读取请求体失败' }) })
@@ -4320,7 +4467,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           const saved = path.join(backupDir, target.name)
           try {
             if (fs.existsSync(saved)) {
-              fs.copyFileSync(saved, target.src)
+              // C2-008：回滚本身也在覆盖活文件，必须原子提交。copyFileSync 直接写目标，
+              // 中途被 kill / 磁盘满就把 push.json、run.log 截成半截文件——「回滚把数据弄坏」
+              // 比不回滚更难查。改走 writeAtomic（tmp + fsync + rename）：要么旧内容、
+              // 要么备份内容，不存在中间态。
+              const data = fs.readFileSync(saved)
+              if (!writeAtomic(target.src, data, `导入回滚 ${target.name}`)) {
+                throw new Error('原子写失败')
+              }
             } else {
               // 导入前文件不存在：写成功过才需要删；symlink/目录一律不碰，避免误删。
               let st = null
@@ -4439,49 +4593,28 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           imported.runLogBytes = Buffer.byteLength(plans.runLog.text, 'utf8')
         }
         // 过滤规则放最后：审计是它的提交点，审计失败时前面几类统一回滚，避免
-        // 「文件恢复了一半、审计没记录」的中间态。
+        // 「文件恢复了一半、审计没记录」的中间态。C2-010：与保存/回滚共用提交链，
+        // 但收尾交给 abortImport 的多文件回滚（rollbackOnAuditFailure:false）。
         if (plans.filter) {
           const loaded = loadCurrentFilter()
-          const current = loaded.source === 'corrupt' ? 0 : loaded.revision
-          let previousText = null
-          if (loaded.source === 'override' || loaded.source === 'corrupt') {
-            const raw = readSafeTextResult(filterPaths.file, FILTER_BODY_MAX_BYTES)
-            if (raw.status === 'ok') previousText = raw.text
-            if (loaded.source === 'override' && !backupFilterFile(filterPaths, current, previousText)) {
-              abortImport('filter', 500, { error: 'backup_failed', code: 'backup_failed' })
-              return
-            }
-          }
-          const nextFile = {
-            schema: FilterStore.FILTER_RULES_SCHEMA,
-            revision: current + 1,
-            filter: plans.filter.result.value
-          }
-          if (!writeAtomic(filterPaths.file, JSON.stringify(nextFile), '过滤规则恢复')) {
-            abortImport('filter', 500, { error: 'write_failed', code: 'write_failed' })
-            return
-          }
-          const defaults = filterDefaults()
-          const nextActive = FilterStore.mergeActiveFilter({
-            defaults: defaults.filter,
-            keyword: defaults.keyword,
-            override: plans.filter.result.value
-          })
-          const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-          const audit = appendFilterAudit({
-            auditPath: filterPaths.audit,
-            actor: actorOf(token),
+          const committed = commitFilterOverride({
+            paths: filterPaths,
+            deps: null,
+            defaults: filterDefaults(),
+            loaded,
+            filterValue: plans.filter.result.value,
             action: 'import',
-            revision: nextFile.revision,
-            changedFields
+            actorToken: token,
+            writeLabel: '过滤规则恢复',
+            computeHash: false,
+            rollbackOnAuditFailure: false
           })
-          if (!audit.ok) {
-            abortImport('filter', 500, { error: audit.code, code: audit.code })
+          if (!committed.ok) {
+            abortImport('filter', committed.status, { error: committed.body.error, code: committed.body.code })
             return
           }
-          pruneFilterBackups(filterPaths)
           imported.filter = true
-          imported.filterRevision = nextFile.revision
+          imported.filterRevision = committed.revision
         }
         // 所有文件都成功后才删草稿：中途失败时草稿仍是导入前那份，便于继续编辑。
         if (plans.filter) clearFilterDraftFile()
@@ -4593,62 +4726,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 保存前快照：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
-        // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
-        let previousText = null
-        if (loaded.source === 'override' || corrupt) {
-          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') previousText = raw.text
-          // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
-          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
-            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
-            return
-          }
-        }
-        const nextRevision = curRevision + 1
-        const nextFile = {
-          schema: FilterStore.FILTER_RULES_SCHEMA,
-          revision: nextRevision,
-          filter: result.value
-        }
-        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
-          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-          return
-        }
-        const nextActive = FilterStore.mergeActiveFilter({
-          defaults: defaults.filter,
-          keyword: defaults.keyword,
-          override: result.value
+        // C2-010：备份→原子写→合并生效→审计→失败回滚 统一走 commitFilterOverride。
+        const committed = commitFilterOverride({
+          paths, deps, defaults, loaded, filterValue: result.value, action: 'save', actorToken
         })
-        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        const hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
-        const audit = appendFilterAudit({
-          auditPath: paths.audit,
-          actor: actorOf(actorToken),
-          action: 'save',
-          revision: nextRevision,
-          changedFields
-        })
-        if (!audit.ok) {
-          // 审计不落地 ⇒ 本次保存整体作废（回滚覆盖文件），绝不报成功。
-          const rolled = rollbackFilterOverride(paths, previousText)
-          sendJson(res, 500, {
-            error: audit.code,
-            code: audit.code,
-            rolledBack: rolled.ok,
-            rollbackMode: rolled.mode
-          })
-          return
-        }
-        // 剪枝只在整个保存（含审计）成功后才执行：任何失败路径都不得剪掉最老备份。
-        pruneFilterBackups(paths)
+        if (!committed.ok) { sendJson(res, committed.status, committed.body); return }
         // 正式保存成功：没保存的草稿已经失去意义，删掉避免下次误恢复。
         clearFilterDraftFile()
         sendJson(res, 200, {
           ok: true,
-          revision: nextRevision,
-          changedFields,
-          hash,
+          revision: committed.revision,
+          changedFields: committed.changedFields,
+          hash: committed.hash,
           appliedHint: '下一轮生效'
         })
       } finally {
@@ -4855,62 +4944,26 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           })
           return
         }
-        // 改文件前先备份当前配置：被替换的这一代必须仍能从备份列表回滚回来。
-        let previousText = null
-        if (loaded.source === 'override' || loaded.source === 'corrupt') {
-          const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
-          if (raw.status === 'ok') previousText = raw.text
-          if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
-            sendJson(res, 500, { error: 'backup_failed', code: 'backup_failed' })
-            return
-          }
-        }
-        const nextRevision = curRevision + 1
-        const nextFile = {
-          schema: FilterStore.FILTER_RULES_SCHEMA,
-          revision: nextRevision,
-          filter: toDefault ? {} : restoredFilter
-        }
-        if (!writeAtomic(paths.file, JSON.stringify(nextFile), '过滤规则覆盖文件')) {
-          sendJson(res, 500, { error: 'write_failed', code: 'write_failed' })
-          return
-        }
-        const nextActive = toDefault
-          ? FilterStore.mergeActiveFilter({ defaults: defaults.filter, keyword: defaults.keyword })
-          : FilterStore.mergeActiveFilter({
-            defaults: defaults.filter,
-            keyword: defaults.keyword,
-            override: restoredFilter
-          })
-        const changedFields = diffFilterFields(loaded.filter, nextActive.filter)
-        const audit = appendFilterAudit({
-          auditPath: paths.audit,
-          actor: actorOf(actorToken),
+        // C2-010：与保存/导入共用同一条提交链。
+        const committed = commitFilterOverride({
+          paths,
+          deps,
+          defaults,
+          loaded,
+          filterValue: toDefault ? {} : restoredFilter,
           action: toDefault ? 'reset_default' : 'restore',
-          revision: nextRevision,
-          changedFields
+          actorToken
         })
-        if (!audit.ok) {
-          const rolled = rollbackFilterOverride(paths, previousText)
-          sendJson(res, 500, {
-            error: audit.code,
-            code: audit.code,
-            rolledBack: rolled.ok,
-            rollbackMode: rolled.mode
-          })
-          return
-        }
-        // 剪枝只在整个回滚（含审计）成功后才执行。
-        pruneFilterBackups(paths)
+        if (!committed.ok) { sendJson(res, committed.status, committed.body); return }
         // 回滚/恢复默认也是一次正式写入，草稿随之作废。
         clearFilterDraftFile()
         const payload = {
           ok: true,
-          revision: nextRevision,
+          revision: committed.revision,
           restoredFrom: toDefault ? 'default' : to,
-          changedFields
+          changedFields: committed.changedFields
         }
-        if (!toDefault) payload.hash = filterHashOf(deps, nextActive.filter, nextActive.keyword)
+        if (!toDefault) payload.hash = committed.hash
         sendJson(res, 200, payload)
       } finally {
         releaseFilterLock(lock)
@@ -4989,40 +5042,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
       }
       // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
-      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
-      let text = ''
-      try {
-        const stream = upstream.body
-        if (stream && typeof stream.getReader === 'function') {
-          const reader = stream.getReader()
-          const chunks = []
-          let total = 0
-          for (;;) {
-            const step = await reader.read()
-            if (step.done) break
-            const chunk = Buffer.from(step.value)
-            total += chunk.length
-            if (total > LINE_SEARCH_MAX_BYTES) {
-              try { await reader.cancel() } catch (e) {}
-              return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-            }
-            chunks.push(chunk)
-          }
-          text = Buffer.concat(chunks).toString('utf8')
-        } else {
-          text = await upstream.text()
-          if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
-            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-          }
-        }
-      } catch (e) {
+      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存（C2-011 共用实现）。
+      const read = await readUpstreamTextCapped(upstream, LINE_SEARCH_MAX_BYTES)
+      clearTimeout(timer)
+      if (!read.ok) {
         return {
           ok: false,
-          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
+          error: read.code === 'too_large'
+            ? '线报酷返回内容过大，已放弃解析'
+            : (controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试')
         }
-      } finally {
-        clearTimeout(timer)
       }
+      const text = read.text
       const parsed = parseLineSearchHtml(text, baseUrl)
       if (!parsed.matched) {
         // 结构对不上 ≠ 没有结果：如实报错，别让调用方以为这个搜索词真的 0 条。
@@ -5084,28 +5115,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       })
       if (upstream && upstream.status >= 300 && upstream.status < 400) return { ok: false, error: '线报酷返回重定向，已中止' }
       if (!upstream || !upstream.ok) return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
-      let text = ''
-      const stream = upstream.body
-      if (stream && typeof stream.getReader === 'function') {
-        const reader = stream.getReader()
-        const chunks = []
-        let total = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          total += value.length
-          if (total > LINE_DETAIL_MAX_BYTES) {
-            try { await reader.cancel() } catch (e) {}
-            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-          }
-          chunks.push(value)
+      // 与搜索页共用同一套「流式计数 + 非流回退」（C2-011）：上限/取消/超限文案只维护一处。
+      const read = await readUpstreamTextCapped(upstream, LINE_DETAIL_MAX_BYTES)
+      if (!read.ok) {
+        return {
+          ok: false,
+          error: read.code === 'too_large'
+            ? '线报酷返回内容过大，已放弃解析'
+            : (controller.signal.aborted ? '线报酷响应超时（8s）' : '线报酷连接失败')
         }
-        text = Buffer.concat(chunks).toString('utf8')
-      } else {
-        text = await upstream.text()
-        if (Buffer.byteLength(text, 'utf8') > LINE_DETAIL_MAX_BYTES) return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
       }
-      const contentHtml = extractArticleHtml(text)
+      const contentHtml = extractArticleHtml(read.text)
       if (contentHtml === '') return { ok: false, error: '线报酷详情页结构变了（找不到正文）' }
       return { ok: true, value: { contentHtml } }
     } catch (e) {
@@ -5213,16 +5233,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
       return
     }
-    readBody(req)
-      .then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-          sendJson(res, 400, { error: 'body 必须是对象' })
-          return
-        }
+    readJsonObjectBody(req)
+      .then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
         const action = payload.action
         let state = readWatchState(stateDir)
         if (state.status === 'invalid') {
@@ -5372,6 +5386,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         candidates.reverse() // 旧→新：中途推送失败时锚点停在已推的最后一条，下轮接着推
         let count = 0
         let stopped = false
+        // C2-009：一个词只能产出一条结果。旧实现失败时先 push 带 error 的条目再 break，
+        // 循环外又无条件 push 一条「成功形态」的条目 ⇒ 同一个词在 results 里出现两次
+        // （前端一个标红一个标绿，状态自相矛盾）。改为记下失败原因、循环外统一 push 一次。
+        let failure = ''
         for (const item of candidates) {
           // 每条发送前重读状态：用户中途停用/删词/标已读或已推过，都不能再发。
           const live = readWatchState(stateDir)
@@ -5397,7 +5415,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             }
             await notifyWatch(title, body)
           } catch (e) {
-            results.push({ q: word.q, pushed: count, error: 'push_failed' })
+            failure = 'push_failed'
             break
           }
           count += 1
@@ -5405,11 +5423,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 推一条记一条：重新读盘再改，避免覆盖期间 UI 的增删/配置。
           const fresh = readWatchState(stateDir)
           if (fresh.status !== 'ok') {
-            results.push({ q: word.q, pushed: count, error: 'state_read_failed' })
+            failure = 'state_read_failed'
             break
           }
           const w = fresh.words.find((x) => x.q === word.q)
-          if (!w) { results.push({ q: word.q, pushed: count, error: 'removed' }); break }
+          if (!w) { failure = 'removed'; break }
           w.sentIds = (Array.isArray(w.sentIds) ? w.sentIds : []).concat([item.id]).slice(-LINE_WATCH_SENT_MAX)
           // 锚点按「在列表里的先后」前进，而不是只按时间：上游时间只有分钟精度，
           // 同一分钟的多条线报 ts 相等，只用 > 会让锚点停在原地、下一轮重复判新。
@@ -5423,11 +5441,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
           }
           if (!saveWatchState(stateDir, fresh)) {
-            results.push({ q: word.q, pushed: count, error: 'save_failed' })
+            failure = 'save_failed'
             break
           }
         }
-        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
+        if (failure) {
+          results.push({ q: word.q, pushed: count, error: failure })
+        } else {
+          results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
+        }
       }
       return { status: 'ok', pushed, results }
     } finally {
@@ -5632,7 +5654,6 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       //   no-store 同时禁掉 bfcache 与磁盘缓存，保证每次打开都拿到当前凭证。
       applyPageHeaders(res)
       const state = readStatus(stateDir)
-      const runsList = [...runs.values()].sort((a, b) => b.id - a.id)
       // 鉴权通过后下发会话 Cookie（Sourcery G_oJ）：HttpOnly（JS 不可读，XSS 拿不走）、
       // SameSite=Lax（审查 #224：Strict 会让「从聊天点链接」的跨站顶层导航不带 Cookie，
       // 首屏必 401；Lax 对同源子请求照常携带，而写动作 POST /trigger 本就不收 Cookie，
@@ -5647,7 +5668,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       // HTML 只发 identity：压缩统一由边缘 Caddy 完成（见 sendJson 注释）。
       // no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入。
-      const html = renderPage(state, runsList, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
+      const html = renderPage(state, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
@@ -6133,13 +6154,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readBody(req, 4096).then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
-        const setupId = payload && typeof payload.setupId === 'string' ? payload.setupId : ''
+      readJsonObjectBody(req, 4096).then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
+        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
+        const setupId = typeof payload.setupId === 'string' ? payload.setupId : ''
         if (twoFactor.enabled) {
           // 成功响应丢包时允许同一 setupId + 仍有效的验证码重取一次恢复码（短时、只存内存）。
           const receipt = lastEnableResult
@@ -6200,12 +6219,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readBody(req, 4096).then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
+      readJsonObjectBody(req, 4096).then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
+        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
         if (!twoFactor.enabled) {
           res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
           sendJson(res, 200, { enabled: false })
@@ -6258,17 +6275,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
+      readJsonObjectBody(req)
+        .then((read) => {
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          let payload
-          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            sendJson(res, 400, { error: 'body 必须是对象' })
-            return
-          }
+          if (!read.ok) { sendJson(res, read.status, read.body); return }
+          const payload = read.payload
           let on = auto.on
           if (Object.prototype.hasOwnProperty.call(payload, 'on')) {
             if (typeof payload.on !== 'boolean') { sendJson(res, 400, { error: 'on 必须是布尔值' }); return }
@@ -6330,17 +6341,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
         return
       }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
+      readJsonObjectBody(req)
+        .then((read) => {
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          let payload
-          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            sendJson(res, 400, { error: 'body 必须是对象' })
-            return
-          }
+          if (!read.ok) { sendJson(res, read.status, read.body); return }
+          const payload = read.payload
           // v3.342：两字段都是可选的「部分更新」，但至少要给一个；给了就必须严格合法——
           // 字符串 '60' / 1.5 / null / 越界 / 非布尔的显示开关全部拒绝，含糊接受会让
           // 「保存成功但生效值不是用户以为的那个」变成静默事故。
