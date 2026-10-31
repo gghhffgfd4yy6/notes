@@ -446,6 +446,18 @@ function formatStatus (status) {
 
 function validInt (v) { return Number.isSafeInteger(v) && v >= 0 }
 
+// YYYY-MM-DD「形状对且真存在」的回环校验（C10-053：服务端两份收敛到这一个实现）。
+// 2026-02-30 这类键能过正则、但 Date 会把它归一化成 03-02 ⇒ 只测正则会让它进区间模式
+// （Sourcery #288）。readTrends 的区间参数与 console 的 parseDayKey 都调本函数。
+// 浏览器侧 scripts/console-assets/pages.js 的 isValidDayKey 是同一口径的**镜像**实现
+// （跑在浏览器、本仓无构建步骤可共享模块），改这里必须同步那一处。
+const DAY_KEY_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
+function isRealDayKey (v) {
+  if (typeof v !== 'string' || !DAY_KEY_RE.test(v)) return false
+  const t = Date.parse(v + 'T00:00:00Z')
+  return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v
+}
+
 // 近 N 日运行趋势：摘要行按本地日期（YYYY-MM-DD）聚合。文件缺失/不可读返回 { status }，
 // 与 readStatus 部件三态（missing/ok/invalid）一致，前端沿用 partTone 归类。
 // v3.326：支持自定义日期区间（from/to，上海日历日）。区间优先于 days；跨度上限 92 天
@@ -475,15 +487,7 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
   if (read.status !== 'ok') return { status: read.status }
   const todayKey = shanghaiDayKey(now)
-  const dayRe = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/
-  // 回环校验：2026-02-30 这类「日期形状但不存在」的键，Date 会归一化成 03-02，
-  // 只测正则会让它进区间模式（Sourcery #288）。
-  const realDay = (v) => {
-    if (typeof v !== 'string' || !dayRe.test(v)) return false
-    const t = Date.parse(v + 'T00:00:00Z')
-    return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v
-  }
-  const rangeMode = realDay(from) && realDay(to) && from <= to
+  const rangeMode = isRealDayKey(from) && isRealDayKey(to) && from <= to
   // 区间模式：to 超过今天按今天截；跨度上限 92 天（超出时保留靠近 to 的一端）。
   const endKey = rangeMode ? (to > todayKey ? todayKey : to) : todayKey
   // 显式区间但起点已晚于截断后的终点（未来区间）：区间内没有任何上海日 → 空结果，
@@ -842,4 +846,4 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return value
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE }
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey }
