@@ -3233,6 +3233,45 @@ checkAsync('C1-029 明细被预算挤掉必须留痕：detailsDropped 分类计�
   })
 })
 
+// ===== C1-018：三条阶段间顺序不变式必须有执行物（不再只写在注释里） =====
+// 审计条目的根因是「挪行没有测试会红」：这里给两条可观察的顺序不变式补回归 ——
+// ORD-1 `_f` 失效先于读缓存（⑤ 判重）、ORD-2 通道健康更新晚于缓存落盘（⑦ saveBatch 之后）。
+// 第三条「toCache 晚于 pushedKeys」已由 RUN-1（推送失败不写缓存）与 TR-1（截断不写缓存）锁住。
+checkAsync('ORD-1 阶段顺序：_f 失效必须先于读缓存判重（否则改宽规则后仍被判重跳过、静默漏推）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const cachePath = path.join(cacheDir, h.cacheName())
+    // 预置：缓存里有一条被规则拦下过的记录（_f），且没有 filter.hash ⇒ 本轮必须走「规则变更清理」
+    realFs.writeFileSync(cachePath, JSON.stringify([Object.assign(makeRunItem('ord-1', '顺序甲'), { _f: true })]), { mode: 0o600 })
+    h.setItems([makeRunItem('ord-1', '顺序甲')])
+    const r = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ dedup: r.summary.dedup, pushed: r.summary.pushed }, { dedup: 0, pushed: 1 },
+      `_f 条目必须先移出缓存再建判重索引：顺序反了本轮会判重跳过、永不重推（${JSON.stringify(r.summary)}）`)
+    const onDisk = JSON.parse(realFs.readFileSync(cachePath, 'utf8'))
+    assert.deepStrictEqual(onDisk.map(m => m.id), ['ord-1'], '清理后重新推送的条目必须重新落进缓存')
+    assert.strictEqual(onDisk[0]._f, undefined, '推送成功后 _f 必须消失（否则下次规则变更又被清一次）')
+  })
+})
+
+checkAsync('ORD-2 阶段顺序：通道健康更新必须在缓存落盘之后（顺序反了会拿空缓存做健康台账）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const cachePath = path.join(cacheDir, h.cacheName())
+    const observed = []
+    const realUpdate = h.App._updateChannelHealth
+    // 只观察调用时刻的磁盘缓存内容；健康状态写入本身走原实现（channelHealth 夹具默认关闭）
+    h.App._updateChannelHealth = async (outcome) => {
+      observed.push(realFs.existsSync(cachePath)
+        ? JSON.parse(realFs.readFileSync(cachePath, 'utf8')).map((m) => m && m.id)
+        : [])
+      return realUpdate.call(h.App, outcome)
+    }
+    h.setItems([makeRunItem('ord-2', '顺序乙')])
+    const r = await runWithWarnings(h.App)
+    assert.strictEqual(r.summary.pushed, 1, `前置：应推送 1 条：${JSON.stringify(r.summary)}`)
+    assert.deepStrictEqual(observed, [['ord-2']],
+      `_updateChannelHealth 被调用时缓存必须已含本轮推送成功的条目，实际读到：${JSON.stringify(observed)}`)
+  })
+})
+
 // 共享夹具：临时 cacheDir + 真装配 harness + 环境变量还原（异常路径也还原，避免污染后续用例）
 async function withRunHarness (over, fn) {
   const realFs = require('fs')

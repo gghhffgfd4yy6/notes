@@ -1156,6 +1156,61 @@ function createApp ({
       }
     },
 
+    // C1-018 阶段边界：③b「规则变更 ⇒ 失效过滤写入缓存」独立成方法，run() 里以单条调用表达
+    // 「必须在读取缓存做判重之前」。这三条阶段间顺序不变式（_f 清理先于读缓存、toCache 晚于
+    // pushedKeys、通道健康更新晚于 saveBatch）此前只写在注释里，挪行没有任何测试会红。
+    // 覆盖文件损坏（active.degraded）时**整段跳过**：降级不能放宽规则，也就不能触发「之前被过滤的
+    // 条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
+    _invalidateFilteredCache ({ active, cacheName, filterHash }) {
+      if (!active || active.degraded) return
+      const hashPath = path.join(this._cacheDir(), 'filter.hash')
+      let lastFile = ''
+      let lastHash = ''
+      let filterStateReady = true
+      const hashResult = this._readSafeState(hashPath)
+      if (hashResult.status === 'ok') {
+      // v3.262 P2：filter.hash 记录「上次清理的缓存文件名 + 规则哈希」两行。
+      // 切 pushUrl 后旧缓存文件的 _f 条目也能被重新评估——此前全局 hash 被别的源
+      // 推进后，旧文件 _f 永久失效（改宽规则静默漏推）。兼容旧格式（单行纯 hash）：
+      // 文件名段视为与当前不符，触发一次安全重评（宁可多推）。
+        const parts = (hashResult.text || '').trim().split('\n')
+        lastFile = (parts[0] || '').trim()
+        lastHash = (parts[1] || '').trim()
+      } else if (hashResult.status !== 'missing') {
+      // ioError/unsafe/tooLarge：读不到已存 hash。若当"无 hash"处理会静默跳过规则
+      // 变更检测且立即覆写 hash；保守视为未就绪，本次不检测也不推进 hash，下次重试。
+        console.error(`过滤规则 hash 读取失败(${hashResult.status})，跳过本次规则变更检测 ${hashPath}`)
+        filterStateReady = false
+      }
+      // 规则哈希变化（正常失效）或「上次清理的文件 ≠ 当前缓存文件」（切源后回到本文件也重评）
+      const hashKnown = hashResult.status === 'ok' && lastFile !== '' && lastHash !== ''
+      if (!hashKnown || lastHash !== filterHash || lastFile !== cacheName) {
+        const fp = MessageStore.getFilePath(cacheName)
+        const msgs = MessageStore.readMessages(fp)
+        const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true))
+        if (kept.length !== msgs.length) {
+          filterStateReady = MessageStore.saveMessages(fp, kept)
+          if (filterStateReady) {
+            console.warn(`⚠️ 检测到过滤规则/只看它变更或缓存文件切换（${(lastHash || lastFile || '?').slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`)
+          } else {
+            console.warn('⚠️ 过滤缓存失效写入失败，本次不更新 filter.hash，下次运行将继续重试规则变更处理')
+          }
+        }
+      }
+      // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
+      // P2（审查 2026-08-15）：缓存读失败时 readMessages 返回 [] 且置 _readFailed，kept.length===msgs.length
+      // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
+      // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
+      if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
+      // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
+      // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
+      // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
+        if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
+          console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
+          this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
+        }
+      }
+    },
     async run () {
       const runStart = Date.now()
       const detailedProfile = process.env.XBK_PROFILE === '2' || PROFILE3
@@ -1378,57 +1433,10 @@ function createApp ({
         // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
         // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
         // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
-        // 覆盖文件损坏（active.degraded）时**整段跳过**：不清 _f、不推进 filter.hash——
-        // 降级不能放宽规则，也就不能触发「之前被过滤的条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
-        if (!active.degraded) {
-          const hashPath = path.join(this._cacheDir(), 'filter.hash')
-          let lastFile = ''
-          let lastHash = ''
-          let filterStateReady = true
-          const hashResult = this._readSafeState(hashPath)
-          if (hashResult.status === 'ok') {
-          // v3.262 P2：filter.hash 记录「上次清理的缓存文件名 + 规则哈希」两行。
-          // 切 pushUrl 后旧缓存文件的 _f 条目也能被重新评估——此前全局 hash 被别的源
-          // 推进后，旧文件 _f 永久失效（改宽规则静默漏推）。兼容旧格式（单行纯 hash）：
-          // 文件名段视为与当前不符，触发一次安全重评（宁可多推）。
-            const parts = (hashResult.text || '').trim().split('\n')
-            lastFile = (parts[0] || '').trim()
-            lastHash = (parts[1] || '').trim()
-          } else if (hashResult.status !== 'missing') {
-          // ioError/unsafe/tooLarge：读不到已存 hash。若当"无 hash"处理会静默跳过规则
-          // 变更检测且立即覆写 hash；保守视为未就绪，本次不检测也不推进 hash，下次重试。
-            console.error(`过滤规则 hash 读取失败(${hashResult.status})，跳过本次规则变更检测 ${hashPath}`)
-            filterStateReady = false
-          }
-          // 规则哈希变化（正常失效）或「上次清理的文件 ≠ 当前缓存文件」（切源后回到本文件也重评）
-          const hashKnown = hashResult.status === 'ok' && lastFile !== '' && lastHash !== ''
-          if (!hashKnown || lastHash !== filterHash || lastFile !== cacheName) {
-            const fp = MessageStore.getFilePath(cacheName)
-            const msgs = MessageStore.readMessages(fp)
-            const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true))
-            if (kept.length !== msgs.length) {
-              filterStateReady = MessageStore.saveMessages(fp, kept)
-              if (filterStateReady) {
-                console.warn(`⚠️ 检测到过滤规则/只看它变更或缓存文件切换（${(lastHash || lastFile || '?').slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`)
-              } else {
-                console.warn('⚠️ 过滤缓存失效写入失败，本次不更新 filter.hash，下次运行将继续重试规则变更处理')
-              }
-            }
-          }
-          // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
-          // P2（审查 2026-08-15）：缓存读失败时 readMessages 返回 [] 且置 _readFailed，kept.length===msgs.length
-          // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
-          // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
-          if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
-          // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
-          // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
-          // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
-            if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
-              console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
-              this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
-            }
-          }
-        }
+        // ③b 规则变更 ⇒ 失效「过滤写入」缓存（覆盖文件损坏时的跳过判据在方法内）。**顺序不变式**：
+        // 必须先于下方 MessageStore.readMessages(cacheFilePath) 建判重索引——否则被清掉 _f 的条目
+        // 已经进了 cacheIds/墓碑索引，本轮仍被判重跳过，改宽规则后静默漏推（回归用例 ORD-1 锁住这条）。
+        this._invalidateFilteredCache({ active, cacheName, filterHash })
         const newMessages = []
         // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
         // 接口异常返回海量数据（maxPerRun 想防的同一场景）时判重卡死——实测 N=2万/M=1万 → 11.6s，
