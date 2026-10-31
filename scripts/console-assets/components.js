@@ -1046,6 +1046,11 @@ function useDialogChrome (open, onCancel, { initialFocusRef = null, fallbackRef 
 function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = false, initialFocusRef = null, onConfirm, onCancel, children }) {
   const cancelRef = useRef(null)
   const [titleId] = useState(() => `confirm-title-${++dialogSeq}`)
+  // C7-038：危险正文（「会真实推送」「发到哪些渠道」）此前只有 aria-labelledby——
+  // 读屏打开弹窗时只念标题，用户按「确定」前听不到后果。正文必须有自己的 id 并被
+  // aria-describedby 引用。id 复用 dialogSeq 的**当前值**（标题的初始化器已经 +1 过），
+  // 不额外领号：既保证每实例唯一，也不动既有「标题 id 形态」契约。
+  const [bodyId] = useState(() => `confirm-body-${dialogSeq}`)
   // 弹窗「从哪来回哪去」：从触发按钮的位置放大展开，取消/遮罩/Esc 时缩回按钮再卸载。
   const backRef = useRef(null)
   const boxRef = useRef(null)
@@ -1060,11 +1065,11 @@ function ConfirmDialog ({ open, title, confirmLabel, busy, confirmDisabled = fal
   // 遮罩与面板合成一个 <dialog>：浏览器负责顶层、焦点陷阱与背景 inert，视觉仍由
   // .modal-backdrop / .modal 两条规则决定（class 名与选择器不变）。
   return html`<dialog class="modal-backdrop" ref=${backRef} role="dialog" aria-modal="true"
-    aria-labelledby=${titleId} oncancel=${onCancelEvent}
+    aria-labelledby=${titleId} aria-describedby=${bodyId} oncancel=${onCancelEvent}
     onClick=${(e) => { if (e.target === e.currentTarget) dismiss(() => onCancelRef.current()) }}>
     <div class="modal" ref=${boxRef}>
       <div class="modal-title" id=${titleId}>${title}</div>
-      <div class="modal-body">${children}</div>
+      <div class="modal-body" id=${bodyId}>${children}</div>
       <div class="modal-actions">
         <${Button} variant="secondary" buttonRef=${cancelRef} disabled=${dialogClosing} onClick=${() => dismiss(() => onCancelRef.current())}>取消<//>
         <${Button} variant="danger-solid" disabled=${busy || confirmDisabled || dialogClosing} onClick=${onConfirm}>${confirmLabel}<//>

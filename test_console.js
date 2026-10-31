@@ -3894,6 +3894,50 @@ async function main () {
       assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
+  await aok('资产: 跨模块具名导入在 ESM 链接期都能解析（漏导出 = 整张模块图不实例化、白屏）', () => {
+    // C7-029：api.js 定义了 AUTH_HEADER 却没写进 export 块，pages.js 却 `import { AUTH_HEADER }`。
+    // 浏览器原生 ESM 在**链接期**（求值之前）就抛 SyntaxError「does not provide an export named」，
+    // 整页模块图不实例化 ⇒ 白屏；而源码文本断言（Authorization 行数、import 串）照样全绿。
+    // 这里用 Node 的 vm.SourceTextModule 只做实例化（link）不执行：不需要 document 桩，报错与浏览器同一句。
+    // 子进程独立跑（vm 模块需要 --experimental-vm-modules，不能给整个套件加）。
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const script = [
+      "'use strict'",
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      "const vm = require('node:vm')",
+      "const { pathToFileURL } = require('node:url')",
+      'const dir = process.argv[1]',
+      "const { STATIC_ASSETS } = require(path.join(dir, '..', 'console.js'))",
+      'const cache = new Map()',
+      'function load (file) {',
+      "  if (!cache.has(file)) cache.set(file, new vm.SourceTextModule(fs.readFileSync(file, 'utf8'), { identifier: pathToFileURL(file).href }))",
+      '  return cache.get(file)',
+      '}',
+      '(async () => {',
+      "  const root = load(path.join(dir, 'app.js'))",
+      '  await root.link((spec) => {',
+      "    const route = '/assets/' + spec.replace(/^\\.\\//, '')",
+      '    const entry = STATIC_ASSETS[route]',
+      "    if (!entry) throw new Error('import 目标未登记白名单：' + spec)",
+      '    return load(path.join(dir, entry.file))',
+      '  })',
+      '  // 入口闭包必须覆盖目录里每个模块：漏一个就等于这段链接检查没跑到它。',
+      '  const linked = new Set([...cache.keys()].map((p) => path.basename(p)))',
+      '  const unlinked = fs.readdirSync(dir).filter((f) => /\\.(js|mjs)$/.test(f) && !linked.has(f))',
+      "  if (unlinked.length > 0) throw new Error('模块不在 app.js 的 import 闭包里（本用例没检查到）：' + unlinked.join(','))",
+      "  process.stdout.write('LINK OK')",
+      '})().catch((e) => { console.error((e && e.message) || String(e)); process.exit(1) })'
+    ].join('\n')
+    const out = spawnSync(process.execPath, ['--experimental-vm-modules', '-e', script, dir], { encoding: 'utf8' })
+    // 只留真正的错误行：Node 的 ExperimentalWarning 会排在前面，把 SyntaxError 挤出消息。
+    const errText = String(out.stderr || '').split('\n')
+      .filter((l) => l.trim() && !/^\(node:\d+\)|^\(Use `node --trace-warnings/.test(l.trim()))
+      .join(' | ')
+    assert.strictEqual(out.status, 0,
+      '模块图链接失败（浏览器会在链接期 SyntaxError ⇒ 整页白屏）：' + errText)
+    assert.strictEqual(out.stdout, 'LINK OK', '链接检查没有跑完（stdout 不是 LINK OK）')
+  })
   await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（版本路径、排在入口之前）', () => {
     // 预加载是手工维护的一行一模块（v3.384 起 12 行），两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
     // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从
@@ -11789,6 +11833,242 @@ async function main () {
     const drawerSeg = sliceBetween(src, '// ── 推送记录：条目详情抽屉', 'function DetailRow', '抽屉注释')
     assert.strictEqual((drawerSeg.match(/v3\.\d+/g) || []).length, 1,
       '抽屉注释只保留一处版本溯源（v3.379），不堆版本号当变更日志')
+  })
+
+  // ── W2 g4（C7-010/013/026/027/028/029/030/031/032/038/044/056）─────────────
+  await aok('结构红线: C7-038 确认弹窗的正文有 aria-describedby（危险后果要能被读屏念出来）', () => {
+    const comp = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'components.js'), 'utf8')
+    const seg = sliceBetween(comp, 'function ConfirmDialog', '// 未保存草稿的离开拦截', 'ConfirmDialog 组件')
+    assert.ok(/aria-describedby=\$\{bodyId\}/.test(seg),
+      '弹窗必须用 aria-describedby 指向正文：只挂 aria-labelledby 时读屏只念标题，用户听不到「会真实推送」')
+    assert.ok(/<div class="modal-body" id=\$\{bodyId\}>/.test(seg),
+      'aria-describedby 必须指向正文节点自己的 id（否则引用悬空，等同于没写）')
+    // id 不得额外领号：titleId 的形态被既有用例逐字钉住，bodyId 复用同一序号。
+    assert.ok(/const \[bodyId\] = useState\(\(\) => `confirm-body-\$\{dialogSeq\}`\)/.test(seg),
+      'body id 必须每实例唯一，且不额外消耗 dialogSeq（否则标题 id 与正文 id 序号错开）')
+    // 模板占位符拼出来再比对（直接写 ${...} 会触发 no-template-curly-in-string）
+    const at = (name) => '$' + '{' + name + '}'
+    assert.ok(seg.includes('aria-labelledby=' + at('titleId') + ' aria-describedby=' + at('bodyId')),
+      '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
+  })
+
+  await aok('行为: C7-030 条件缓存按最近使用淘汰（热键 runs/config 不得被新分页键挤掉）', () => {
+    // 直接跑 api.js 里**真实**的缓存策略（切片自源码，不是本用例自写的副本）：
+    // Map 的插入序在这里就是淘汰序，所以「命中是否挪到队尾」能被行为断言抓住。
+    const vm = require('node:vm')
+    const api = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'api.js'), 'utf8')
+    const seg = sliceBetween(api, 'const COND_CACHE = new Map()', 'function addConditional', '条件缓存块')
+    const box = vm.runInNewContext(`(() => { ${seg}; return { COND_CACHE, COND_CACHE_MAX, rememberConditional, touchConditional } })()`, {})
+    assert.strictEqual(box.COND_CACHE_MAX, 16, '缓存上限仍是 16（v3.373 扩到 7 个端点后的口径，不得悄悄改）')
+    // 冷启动：runs / config 先落，后面 14 条分页键把缓存填满到 16。
+    box.rememberConditional('runs', { tag: 't-runs', data: 1 })
+    box.rememberConditional('config', { tag: 't-config', data: 2 })
+    for (let i = 0; i < 14; i++) box.rememberConditional('messages?page=' + i, { tag: 't' + i, data: i })
+    assert.strictEqual(box.COND_CACHE.size, 16)
+    // 翻回第 1 页（读路径命中）⇒ 该键变成「刚用过」；runs 仍是 FIFO 里最老的。
+    assert.ok(box.touchConditional('messages?page=1'), '命中必须返回缓存条（否则 304 会退化成重取）')
+    assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['messages?page=1'], '命中后必须挪到队尾')
+    // 再写一条新的：被淘汰的必须是「真正最久没用过」的 runs，而不是刚用过的 page=1。
+    box.rememberConditional('messages?page=99', { tag: 't99', data: 99 })
+    assert.strictEqual(box.COND_CACHE.has('runs'), false, 'runs 已是最久没用过的键，必须先被淘汰')
+    assert.strictEqual(box.COND_CACHE.has('messages?page=1'), true, '刚命中过的键不得被淘汰（FIFO 会把它当成「第 2 老的」）')
+    // 写回同一键也算一次使用：覆盖后仍在队尾，不因原位置靠前而先出局。
+    box.rememberConditional('config', { tag: 't-config-2', data: 22 })
+    assert.deepStrictEqual([...box.COND_CACHE.keys()].slice(-1), ['config'], '覆盖写回必须挪到队尾')
+    assert.strictEqual(box.touchConditional('nope'), null, '未命中返回 null（交给调用方按无条件请求发）')
+  })
+
+  await aok('行为: C7-056 首屏快照逐层校验（容器对、嵌套部件坏掉也必须丢弃）', async () => {
+    const { snapshotOk } = await import('./scripts/console-assets/pure.mjs')
+    const part = (status, value) => ({ status, value })
+    const base = (over = {}) => ({
+      v: 'v3.400',
+      at: 1760000000000,
+      status: { generatedAt: 1, run: part('ok', { at: '2026-10-31 10:00:00', total: 3 }), report: part('ok', { date: '2026-10-31' }) },
+      runs: [{ id: '1.2', startedAt: 1 }],
+      ...over
+    })
+    assert.strictEqual(snapshotOk(base(), 'v3.400'), true, '合法快照必须接受（否则每帧都退回骨架屏）')
+    assert.strictEqual(snapshotOk(base({ v: 'v3.399' }), 'v3.400'), false, '版本不符照旧丢弃')
+    assert.strictEqual(snapshotOk(base({ at: 'x' }), 'v3.400'), false, 'at 必须是数字')
+    assert.strictEqual(snapshotOk(base({ at: Number.NaN }), 'v3.400'), false, 'at 为 NaN 的快照要丢（typeof NaN === "number" 会漏过旧判据）')
+    // 容器层全对、只有嵌套部件坏掉——旧实现全部放行，坏字段直接进 StatusCards。
+    assert.strictEqual(snapshotOk(base({ status: { run: 'ok' } }), 'v3.400'), false, '部件是字符串必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { run: { value: { total: 1 } } } }), 'v3.400'), false, '部件缺 status 必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { run: { status: 'ok', value: '1 条推送' } } }), 'v3.400'), false, 'value 是标量必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { stats: { status: 'ok', value: [1, 2] } } }), 'v3.400'), false, 'value 是数组必须丢弃')
+    assert.strictEqual(snapshotOk(base({ status: { lock: 3 } }), 'v3.400'), false, 'lock 是标量必须丢弃（App 读 lock.held）')
+    // 数组里混进 null：旧实现 Array.isArray 通过，渲染期 runs.some(r => …) 直接 TypeError。
+    assert.strictEqual(snapshotOk(base({ runs: [{ id: '1.2' }, null] }), 'v3.400'), false, 'runs 里混 null 必须丢弃（渲染期会当场抛）')
+    assert.strictEqual(snapshotOk(base({ runs: [1, 2] }), 'v3.400'), false, 'runs 条目是标量必须丢弃')
+    // 部件整体缺席不算坏：服务端只给一部分时，缺的卡片自己显示占位。
+    assert.strictEqual(snapshotOk(base({ status: { generatedAt: 1 } }), 'v3.400'), true, '部件缺席不等于损坏')
+    // 接线：readSnapshot 必须走这个校验，别在 ui.js 里再留一份浅校验。
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const fn = sliceBetween(ui, 'function readSnapshot', 'function writeSnapshot', 'readSnapshot')
+    assert.ok(fn.includes('snapshotOk(v, BOOT.version)'), 'readSnapshot 必须交给 pure.mjs 的 snapshotOk 判定')
+    assert.ok(!fn.includes('typeof v.at'), '不得保留第二份浅校验（两套口径会分叉）')
+  })
+
+  await aok('行为: C7-031 页签清单单一真源（filter 进 TAB_KEYS，ui.js 不再有正则补丁）', async () => {
+    const { TAB_KEYS, tabFromHash } = await import('./scripts/console-assets/pure.mjs')
+    // filter 必须由真源认识：旧实现靠 ui.js 的 /^#\/filter$/ 补丁，纯函数模块不认它。
+    assert.ok(TAB_KEYS.includes('filter'), 'TAB_KEYS 必须含 filter（否则 hash 路由又得靠补丁）')
+    assert.strictEqual(tabFromHash('#/filter'), 'filter', '#/filter 必须解析成 filter')
+    assert.strictEqual(tabFromHash('#/filter?tab=1'), 'overview', 'tabFromHash 只认裸 hash（带 query 的由 ui.js 先剥）')
+    assert.strictEqual(tabFromHash('#/nope'), 'overview', '非法 hash 仍回概览')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // ① 页签清单必须由 TAB_KEYS 派生，不再写第二份键列表。
+    assert.ok(ui.includes('const TABS = TAB_KEYS.map((key) => ({ key, label: TAB_LABELS[key] }))'),
+      'TABS 必须由 TAB_KEYS 派生（旧实现是 App 里的第三份页签清单）')
+    assert.ok(!/'filter'/.test(sliceBetween(ui, 'const TABS =', '// 切页回到顶部', 'TABS 定义')),
+      'TABS 定义里不得再手写页签键（写死一处就多一处真源）')
+    // ② resolveTab 只留「剥 query」，filter 的专门补丁必须消失。
+    const resolve = sliceBetween(ui, 'const resolveTab =', 'const [tab, setTab]', 'resolveTab')
+    assert.ok(!resolve.includes('filter'), 'resolveTab 不得再为 filter 开特例（白名单已在 pure.mjs）')
+    assert.ok(resolve.includes("hash.split('?')[0]"), 'resolveTab 必须保留剥 query 的行为（#/messages?q=… 不能被判成非法）')
+    // ③ 每个键都要有中文名：新增页签只改 TAB_KEYS 却忘写名字时，标签栏会出现空按钮。
+    const labels = sliceBetween(ui, 'const TAB_LABELS = {', '// ── 主题', 'TAB_LABELS')
+    for (const key of TAB_KEYS) {
+      assert.ok(new RegExp('\\b' + key + ':').test(labels), `TAB_LABELS 缺少 ${key} 的中文名（会渲染成空标签）`)
+    }
+  })
+
+  await aok('结构红线: C7-013 回前台静默窗只挡「刚补拉过」的那一拍（不吞 SSE tick）', () => {
+    const src = readConsoleSource()
+    const tick = sliceBetween(src, 'const runTick = useCallback(', 'const runTickRef = useRef(runTick)', 'runTick')
+    assert.ok(tick.includes('if (document.hidden) return'), '后台整拍跳过仍在（别把隐藏页改成照跑）')
+    assert.ok(tick.includes('Date.now() < resumeQuietUntilRef.current'),
+      '静默窗仍在：回前台补拉与「定时器正好到期」必须去重，删掉会连发两发')
+    // 只按时间窗关死 = 窗内到达的 SSE tick（服务端报「有新数据」）被一起吞掉，
+    // 页面最多停在补拉那一刻一个轮询周期（SSE 在线时 60s）。
+    assert.ok(/Date\.now\(\) < resumeQuietUntilRef\.current && Date\.now\(\) - lastRefreshRef\.current < POLL_BUSY_MS/.test(tick),
+      '静默窗必须叠加「距上次成功刷新 < POLL_BUSY_MS」：否则窗内的 SSE tick 会被静默吞掉')
+    // 判据的另一半：补拉成功要推进 lastRefreshRef，否则上面那道条件恒真，等于又关死。
+    const active = sliceBetween(src, 'const refreshActive = useCallback(', 'const pullRefresh = useCallback(', 'refreshActive')
+    assert.ok(active.includes('if (ok) lastRefreshRef.current = Date.now()'),
+      '补拉成功必须推进 lastRefreshRef（失败不推进：窗内仍要能重试）')
+  })
+
+  await aok('结构红线: C7-029 鉴权头只有一个出口（22 处端点不再逐字复制）', () => {
+    const src = readConsoleSource()
+    const hits = src.split('\n').filter((l) => l.includes('Authorization:') && !l.trim().startsWith('//'))
+    assert.strictEqual(hits.length, 1, `鉴权头必须只写一处（实际 ${hits.length} 处）：改前缀/加头时漏一处就是「这个端点 401、别的正常」`)
+    assert.ok(hits[0].includes('const AUTH_HEADER = { Authorization:'), '唯一那处必须是 AUTH_HEADER 定义（其余端点靠展开复用它）')
+    const spreads = src.split('\n').filter((l) => l.includes('...AUTH_HEADER')).length
+    assert.ok(spreads >= 20, `端点必须真的改用 AUTH_HEADER（实际展开 ${spreads} 处）：只留 helper 不改调用点等于没修`)
+    // 导出与读面接线：pages.js 的导出下载端点也要走同一个 helper。
+    assert.ok(src.includes('apiSearchLines, AUTH_HEADER, timedRequest'), 'pages.js 必须从 api.js 取用 AUTH_HEADER（导出下载走同一个鉴权头）')
+  })
+
+  await aok('结构红线: C7-032 后台静默失败要在界面上留痕（不再 catch(() => {})）', () => {
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // 这三处此前都是空 catch：设置读取（顶栏日期设置不生效）、版本探针（部署后不提示刷新）、
+    // 回前台补拉（切回来还是旧数据），失败在界面零痕迹。
+    const settings = sliceBetween(ui, 'const reloadUiSettings = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'reloadUiSettings')
+    assert.ok(!settings.includes('.catch(() => {})'), '设置读取失败不得再静默（用户会看到「改了没生效」却没有任何线索）')
+    assert.ok(settings.includes("noteQuiet('设置读取失败', true)"), '设置读取失败必须落一条可见痕迹')
+    const probe = sliceBetween(ui, 'const check = () => {', 'check()\n    const timer = setInterval(check', '版本探针')
+    assert.ok(!probe.includes('.catch(() => {})'), '版本探针失败不得再静默（部署后不提示刷新就是这条被吞掉的）')
+    assert.ok(probe.includes("noteQuiet('版本探针失败', true)"), '版本探针失败必须落一条可见痕迹')
+    const resume = sliceBetween(ui, 'refreshActive({ respectFormPause: true })', 'const pull = usePullToRefresh', '回前台补拉')
+    assert.ok(!resume.includes('}).catch(() => {})'), '回前台补拉失败不得再静默（否则切回来还是旧数据，看不出为什么）')
+    assert.ok(resume.includes("noteQuiet('回前台补拉失败'"), '回前台补拉失败必须落一条可见痕迹')
+    // 痕迹必须真的渲染出来，并且成功时按 kind 撤掉（否则一次失败会永久挂一条假告警）。
+    assert.ok(ui.includes('${quietErrs.length > 0 && html`<div class="sync-fail sync-fail-quiet" role="status">'),
+      '失败条目必须渲染成可见的 role=status 行（只写 console.warn 在手机上看不到）')
+    const helper = sliceBetween(ui, 'const noteQuiet = useCallback(', 'useEffect(() => { reloadUiSettings() }', 'noteQuiet')
+    assert.ok(helper.includes('if (!failed && has) return prev.filter'), '成功必须撤掉对应条目（不能留一条过期告警）')
+  })
+
+  await aok('行为: C7-032 回前台补拉区分「跳过」与「真失败」（跳过不得留告警，真失败必须留）', async () => {
+    // 直接执行 ui.js 里真实的 refreshActive 与真实的调用行（src slice + vm），不重写一份等价逻辑：
+    // 重写的实现改了 ui.js 也不会红。改回「跳过也返回 false / 调用点用 ok === false 判失败」时本用例红。
+    const acorn = require('acorn')
+    const vm = require('node:vm')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    const ast = acorn.parse(ui, { ecmaVersion: 'latest', sourceType: 'module' })
+    let arrow = null
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return
+      if (node.type === 'VariableDeclarator' && node.id && node.id.name === 'refreshActive' &&
+        node.init && node.init.type === 'CallExpression' && node.init.arguments[0] &&
+        node.init.arguments[0].type === 'ArrowFunctionExpression') arrow = node.init.arguments[0]
+      for (const key of Object.keys(node)) {
+        if (key === 'start' || key === 'end') continue
+        const value = node[key]
+        if (Array.isArray(value)) value.forEach(walk)
+        else if (value && typeof value === 'object') walk(value)
+      }
+    }
+    walk(ast)
+    assert.ok(arrow, '找不到 refreshActive 的实现（本用例要执行它，绑定名/形态不能改）')
+    const makeRefresh = (ctx) => vm.runInNewContext('(' + ui.slice(arrow.start, arrow.end) + ')', ctx)
+    const setup = ({ paused = false, waits = 0, split = true } = {}) => {
+      const calls = []
+      const detailWaits = []
+      for (let i = 0; i < waits; i++) detailWaits.push(Promise.resolve())
+      const ctx = {
+        Date,
+        Promise,
+        CustomEvent,
+        PULL_EVENT: 'xbk-console-pull-probe',
+        formPauseUntilRef: { current: paused ? Date.now() + 60000 : 0 },
+        lastRefreshRef: { current: 0 },
+        refreshAuto: () => Promise.resolve(),
+        refreshSplit: (...args) => {
+          calls.push(args)
+          return split instanceof Error ? Promise.reject(split) : Promise.resolve(split)
+        },
+        window: { dispatchEvent: (ev) => { if (ev && ev.detail) ev.detail.waits = detailWaits.slice() } }
+      }
+      return { ctx, calls }
+    }
+    // ① 表单交互暂停：一个请求都不发 ⇒ false（未尝试），不是 'failed'。
+    const paused = setup({ paused: true, waits: 1, split: true })
+    assert.strictEqual(await makeRefresh(paused.ctx)({ respectFormPause: true }), false,
+      '表单暂停时回前台补拉是「跳过」，不得返回失败态（否则顶栏常驻假告警）')
+    assert.strictEqual(paused.calls.length, 0, '表单暂停期间不得发请求')
+    // ② 当前页没有面板接手（过滤规则页带未保存草稿时不注册下拉监听）⇒ 跳过。
+    const noPanel = setup({ waits: 0, split: true })
+    assert.strictEqual(await makeRefresh(noPanel.ctx)({}), false,
+      '没有面板接手时是「跳过」，不得返回失败态')
+    assert.strictEqual(noPanel.calls.length, 0, '没有面板接手时连全局请求也不得发')
+    // ③ 真发出去但失败 ⇒ 'failed'（唯一该留告警的状态）。
+    const failed = setup({ waits: 1, split: 'failed' })
+    assert.strictEqual(await makeRefresh(failed.ctx)({}), 'failed', '真失败的刷新必须回失败态')
+    assert.strictEqual(failed.calls.length, 1, '失败分支确实发起了刷新')
+    // ④ refreshSplit 回 false = 上一拍还在飞 / 序号过期（没发或结果已作废）⇒ 仍是跳过。
+    const inFlight = setup({ waits: 1, split: false })
+    assert.strictEqual(await makeRefresh(inFlight.ctx)({}), false,
+      'refreshSplit 的 false（在飞/序号过期）不是失败，不得升级成失败态')
+    // ⑤ 成功 ⇒ true，并推进 lastRefreshRef（否则回前台静默窗的判据恒真）。
+    const okRun = setup({ waits: 1, split: true })
+    assert.strictEqual(await makeRefresh(okRun.ctx)({}), true, '刷新成功必须回成功态')
+    assert.ok(okRun.ctx.lastRefreshRef.current > 0, '成功后必须推进 lastRefreshRef')
+    // ⑥ refreshSplit 抛错 ⇒ 失败态（不能当成跳过被静默）。
+    const thrown = setup({ waits: 1, split: new Error('boom') })
+    assert.strictEqual(await makeRefresh(thrown.ctx)({}), 'failed', '刷新抛错必须回失败态')
+    // 调用点（取 ui.js 里真实那一行执行）：只有 'failed' 才 noteQuiet 留痕；false/true 都不留。
+    const line = ui.split('\n').find((l) => l.includes('refreshActive({ respectFormPause: true })'))
+    assert.ok(line, '找不到回前台补拉的调用行')
+    const quietFor = async (make) => {
+      const quiet = []
+      const ctx = {
+        refreshActive: make,
+        noteQuiet: (kind, failed) => { if (failed) quiet.push(kind) }
+      }
+      vm.runInNewContext(line.trim(), ctx)
+      await new Promise((resolve) => setImmediate(resolve))
+      return quiet
+    }
+    assert.deepStrictEqual(await quietFor(async () => false), [],
+      '跳过（没发请求）不得产生「后台刷新异常」条目')
+    assert.deepStrictEqual(await quietFor(async () => true), [], '成功不得留下告警')
+    assert.deepStrictEqual(await quietFor(async () => 'failed'), ['回前台补拉失败'],
+      '真失败必须在顶栏留一条可见痕迹')
+    assert.deepStrictEqual(await quietFor(async () => { throw new Error('boom') }), ['回前台补拉失败'],
+      '请求抛错必须在顶栏留一条可见痕迹')
   })
 }
 
