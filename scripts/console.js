@@ -161,6 +161,38 @@ const LINE_WATCH_SENT_MAX = 200
 // 调度器每 30s 看一次是否到点；实际间隔由配置决定（默认 10 分钟）。
 const LINE_WATCH_TICK_MS = 30 * 1000
 
+// 上游响应体读取（C2-011）：搜索页与详情页此前各写一份「流式边读边计字节 + 非流回退」。
+// 两处字节口径现已一致（流式都按 Buffer 长度、非流都按 Buffer.byteLength），但副本仍在——
+// 上限、取消读流、超限文案各写一遍，改一处必漏一处。收成一份：
+// 返回 { ok:true, text } 或 { ok:false, code:'too_large'|'read_failed' }，具体文案由调用方给。
+async function readUpstreamTextCapped (upstream, maxBytes) {
+  try {
+    const stream = upstream.body
+    if (stream && typeof stream.getReader === 'function') {
+      const reader = stream.getReader()
+      const chunks = []
+      let total = 0
+      for (;;) {
+        const step = await reader.read()
+        if (step.done) break
+        const chunk = Buffer.from(step.value)
+        total += chunk.length
+        if (total > maxBytes) {
+          try { await reader.cancel() } catch (e) { /* 已断开 */ }
+          return { ok: false, code: 'too_large' }
+        }
+        chunks.push(chunk)
+      }
+      return { ok: true, text: Buffer.concat(chunks).toString('utf8') }
+    }
+    const text = await upstream.text()
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) return { ok: false, code: 'too_large' }
+    return { ok: true, text }
+  } catch (e) {
+    return { ok: false, code: 'read_failed' }
+  }
+}
+
 // ── v3.300 批次③ 3.2 消息导出常量 ───────────────────────────────────────────
 // 单次导出行数上限：超出即截断 + 响应头 X-Export-Truncated: true 如实披露。
 const EXPORT_MAX_ROWS = 5000
@@ -5048,40 +5080,18 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
       }
       // 8s 计时器读到响应体结束才停：上游先回头再慢慢吐 body 也不能拖住控制台。
-      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存。
-      let text = ''
-      try {
-        const stream = upstream.body
-        if (stream && typeof stream.getReader === 'function') {
-          const reader = stream.getReader()
-          const chunks = []
-          let total = 0
-          for (;;) {
-            const step = await reader.read()
-            if (step.done) break
-            const chunk = Buffer.from(step.value)
-            total += chunk.length
-            if (total > LINE_SEARCH_MAX_BYTES) {
-              try { await reader.cancel() } catch (e) {}
-              return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-            }
-            chunks.push(chunk)
-          }
-          text = Buffer.concat(chunks).toString('utf8')
-        } else {
-          text = await upstream.text()
-          if (Buffer.byteLength(text, 'utf8') > LINE_SEARCH_MAX_BYTES) {
-            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-          }
-        }
-      } catch (e) {
+      // 有流就边读边计字节，超过 4 MiB 立刻取消，不把超大响应整段缓冲进内存（C2-011 共用实现）。
+      const read = await readUpstreamTextCapped(upstream, LINE_SEARCH_MAX_BYTES)
+      clearTimeout(timer)
+      if (!read.ok) {
         return {
           ok: false,
-          error: controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试'
+          error: read.code === 'too_large'
+            ? '线报酷返回内容过大，已放弃解析'
+            : (controller.signal.aborted ? '线报酷响应超时（8s），稍后再试' : '线报酷响应读取失败，稍后再试')
         }
-      } finally {
-        clearTimeout(timer)
       }
+      const text = read.text
       const parsed = parseLineSearchHtml(text, baseUrl)
       if (!parsed.matched) {
         // 结构对不上 ≠ 没有结果：如实报错，别让调用方以为这个搜索词真的 0 条。
@@ -5143,28 +5153,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       })
       if (upstream && upstream.status >= 300 && upstream.status < 400) return { ok: false, error: '线报酷返回重定向，已中止' }
       if (!upstream || !upstream.ok) return { ok: false, error: `线报酷返回 HTTP ${upstream ? upstream.status : '—'}` }
-      let text = ''
-      const stream = upstream.body
-      if (stream && typeof stream.getReader === 'function') {
-        const reader = stream.getReader()
-        const chunks = []
-        let total = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          total += value.length
-          if (total > LINE_DETAIL_MAX_BYTES) {
-            try { await reader.cancel() } catch (e) {}
-            return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
-          }
-          chunks.push(value)
+      // 与搜索页共用同一套「流式计数 + 非流回退」（C2-011）：上限/取消/超限文案只维护一处。
+      const read = await readUpstreamTextCapped(upstream, LINE_DETAIL_MAX_BYTES)
+      if (!read.ok) {
+        return {
+          ok: false,
+          error: read.code === 'too_large'
+            ? '线报酷返回内容过大，已放弃解析'
+            : (controller.signal.aborted ? '线报酷响应超时（8s）' : '线报酷连接失败')
         }
-        text = Buffer.concat(chunks).toString('utf8')
-      } else {
-        text = await upstream.text()
-        if (Buffer.byteLength(text, 'utf8') > LINE_DETAIL_MAX_BYTES) return { ok: false, error: '线报酷返回内容过大，已放弃解析' }
       }
-      const contentHtml = extractArticleHtml(text)
+      const contentHtml = extractArticleHtml(read.text)
       if (contentHtml === '') return { ok: false, error: '线报酷详情页结构变了（找不到正文）' }
       return { ok: true, value: { contentHtml } }
     } catch (e) {
