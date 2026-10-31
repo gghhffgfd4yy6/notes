@@ -3505,6 +3505,42 @@ checkAsync('CD-1 cacheDir 每次访问都重新校验：运行中目录被换成
   }
 })
 
+// ===== C1-014：日报计数器名单必须是单一来源 =====
+// 审计条目：7 个计数器名在 9 处各写一遍，加字段必漏。这里用**源码形状**断言把「只剩一份名单」
+// 钉住：回退修复（把名单拆回 _blankReportState 字面量 / 各校验循环 / nextState 字面量）会让
+// 下面的计数立刻变红，避免下次重构又悄悄长出第二份。
+check('C1-014 计数器名单单一来源：字面量仅常量一处，其余一律引用 REPORT_COUNTERS', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  // 去掉整行注释（注释里复述名单不算实现重复；行内注释保留，行内复述即视为漂移）
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const literalLists = code.match(/'runs', 'total'/g) || []
+  assert.strictEqual(literalLists.length, 1,
+    `计数器名单字面量必须只剩常量这一处，实际 ${literalLists.length} 处（加字段必漏的根因就是它多份）`)
+  const refs = code.match(/REPORT_COUNTERS/g) || []
+  assert.ok(refs.length >= 5, `清零/归一化/校验/日报结转都必须引用 REPORT_COUNTERS，实际引用 ${refs.length} 处`)
+  assert.strictEqual(/runs:\s*0,\s*total:\s*0/.test(code), false,
+    '不得再出现手写七字段零值字面量（新增计数器时它会漏掉）')
+})
+
+check('C1-014 _blankReportState 与名单同源：所有计数器为 0、date 为空、无多余键', () => {
+  const app = makeApp()
+  const blank = app._blankReportState()
+  assert.deepStrictEqual(Object.keys(blank), ['date', 'runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'])
+  for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+    assert.strictEqual(blank[k], 0, `${k} 必须清零`)
+  }
+})
+
+check('C1-014 归一化与跨天结转都按同一名单搬运：丢掉名单外键、保留名单内计数', () => {
+  const app = makeApp()
+  const st = app._normalizeReportState({ date: '2024-03-15', runs: 2, pending: { pushed: 3, junk: 9 }, junk: 1 })
+  assert.strictEqual(st.junk, undefined, '名单外的顶键必须丢弃')
+  assert.strictEqual(st.pending.junk, undefined, 'pending 里名单外的键同样丢弃')
+  assert.strictEqual(st.pending.pushed, 3, 'pending 的名单内计数必须原样保留')
+  assert.strictEqual(st.runs, 2)
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

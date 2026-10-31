@@ -20,6 +20,23 @@ function createApp ({
     return Math.max(1, Math.min(base, MAX_PARALLEL_WORKERS))
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
+  // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
+  // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
+  // 两处 nextState 字面量与 Object.assign 映射…），加字段必漏一处：漏掉 _normalizeReportState
+  // 的那处会静默丢计数（它只搬名单内的键，写盘时新字段直接消失）。
+  const REPORT_COUNTERS = Object.freeze(['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'])
+  const blankCounters = () => {
+    const counters = {}
+    for (const key of REPORT_COUNTERS) counters[key] = 0
+    return counters
+  }
+  // 与旧 `pending.runs || 0` 同口径：非数/缺字段/0 都归 0（负数不在这里修，走 _safeCounter 归一化）。
+  const pickCounters = (source) => {
+    const counters = {}
+    for (const key of REPORT_COUNTERS) counters[key] = (source && source[key]) || 0
+    return counters
+  }
   // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
   const CHANNEL_RECOVER_CLAIM_LEASE_MS = 60000
@@ -612,7 +629,7 @@ function createApp ({
 
     // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
     _blankReportState () {
-      return { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
+      return Object.assign({ date: '' }, blankCounters())
     },
     _safeCounter (v) {
       if (typeof v === 'symbol') return 0 // Number(Symbol) 抛 TypeError（子代理审查 commit-12）
@@ -635,10 +652,10 @@ function createApp ({
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blank()
       const st = blank()
       st.date = typeof raw.date === 'string' ? raw.date : ''
-      for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st[k] = this._safeCounter(raw[k])
+      for (const k of REPORT_COUNTERS) st[k] = this._safeCounter(raw[k])
       if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
         st.pending = blank()
-        for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) st.pending[k] = this._safeCounter(raw.pending[k])
+        for (const k of REPORT_COUNTERS) st.pending[k] = this._safeCounter(raw.pending[k])
       } else if (raw.pending) {
       // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
       // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
@@ -684,7 +701,7 @@ function createApp ({
           if (raw.date !== undefined && !this._isValidReportDate(raw.date)) {
             throw new Error('日报状态 date 字段无效')
           }
-          for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+          for (const k of REPORT_COUNTERS) {
             if (raw[k] !== undefined && (!Number.isSafeInteger(raw[k]) || raw[k] < 0)) {
               throw new Error(`日报状态字段 ${k} 无效`)
             }
@@ -693,7 +710,7 @@ function createApp ({
             if (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending)) {
               throw new Error('日报状态 pending 字段无效')
             }
-            for (const k of ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']) {
+            for (const k of REPORT_COUNTERS) {
               if (raw.pending[k] !== undefined && (!Number.isSafeInteger(raw.pending[k]) || raw.pending[k] < 0)) {
                 throw new Error(`日报 pending 字段 ${k} 无效`)
               }
@@ -734,16 +751,7 @@ function createApp ({
       try {
       // 单次青龙入口会在 App.run 返回后退出，必须等待日报发送完成。
         await Pusher.send(reportText, reportBody)
-        const nextState = {
-          date: today,
-          runs: pendingState.pending.runs || 0,
-          total: pendingState.pending.total || 0,
-          dedup: pendingState.pending.dedup || 0,
-          filtered: pendingState.pending.filtered || 0,
-          pushed: pendingState.pending.pushed || 0,
-          failed: pendingState.pending.failed || 0,
-          truncated: pendingState.pending.truncated || 0
-        }
+        const nextState = Object.assign({ date: today }, pickCounters(pendingState.pending))
         const nextSaved = this._persistReportState(statePath, nextState)
         if (nextSaved) console.log('已发送昨日运行日报')
         else console.warn('⚠️ 昨日日报已发送，但最终状态未持久化，重启后可能重复发送')
@@ -762,25 +770,14 @@ function createApp ({
         if (!state) return
         const today = this._reportToday()
         if (state.date && state.date !== today) {
-          const reportKeys = ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
+          const reportKeys = REPORT_COUNTERS
           const hasCounters = value => Boolean(value && reportKeys.some(k => value[k] > 0))
           if (hasCounters(state) || hasCounters(state.pending)) {
             await this._sendCrossDayReport(statePath, state, summary, today)
             return
           }
           const pending = state.pending
-          const nextState = { date: today, runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
-          if (pending) {
-            Object.assign(nextState, {
-              runs: pending.runs || 0,
-              total: pending.total || 0,
-              dedup: pending.dedup || 0,
-              filtered: pending.filtered || 0,
-              pushed: pending.pushed || 0,
-              failed: pending.failed || 0,
-              truncated: pending.truncated || 0
-            })
-          }
+          const nextState = Object.assign({ date: today }, pickCounters(pending))
           this._accumulateReport(nextState, summary)
           this._persistReportState(statePath, nextState)
           return
