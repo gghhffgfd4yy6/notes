@@ -10956,6 +10956,26 @@ async function main () {
       '离开当前页必须清掉待确认（只 dialog.close() 会留下卡死的 cancelAsk）')
   })
 
+  await aok('结构红线: C7-012 未点开的日志页签不预取 1 MiB（首访零预取契约）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function LogsPanel')
+    const end = src.indexOf('function SysPanel', at)
+    assert.ok(at > -1 && end > at, '应能定位 LogsPanel')
+    const seg = src.slice(at, end)
+    // 冷启动时日志尾部可能满 1 MiB：隐藏页签里拉下来再整串 split/计数都是白付的。
+    const guardAt = seg.indexOf('if (!active && !preloadedRef.current) {')
+    assert.ok(guardAt > -1, '日志首挂（尚未点开）必须先短路，不得直接拉 1 MiB')
+    const guard = seg.slice(guardAt, seg.indexOf('if (!active && preloadedRef.current) return undefined', guardAt))
+    assert.ok(guard.includes('preloadedRef.current = true') && guard.includes('return undefined'),
+      '首挂只登记「首访已挂载」，不发请求')
+    assert.ok(!guard.includes('load('), '隐藏页签不得发日志请求（首屏零预取）')
+    // 懒加载不是不加载：第一次点开必须仍走 firstReveal 的补拉，否则日志页永远空白。
+    assert.ok(seg.includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
+      '第一次点开仍要走 firstReveal 补拉')
+    assert.ok(seg.slice(guardAt).includes('if (stale) load(true).catch'),
+      '首次点开且手里没有新鲜快照时必须真的发一发')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')

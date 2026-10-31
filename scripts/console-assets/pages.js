@@ -2488,7 +2488,8 @@ function SearchPanel ({ onSync, active = true }) {
   </div>`
 }
 
-// 运行日志：run.log 尾部（服务端 1MiB 上限），启动预加载 + 手动/切回刷新；有任务在跑时跟随轮询。
+// 运行日志：run.log 尾部（服务端 1MiB 上限），第一次点开页签才拉（C7-012）+ 手动/切回刷新；
+// 有任务在跑时跟随轮询。
 // 异常口径与筛选在 pure.mjs（isIssueLogLine / filterLogLines），组件与测试共用。
 // ── 日志行渲染（v3.317）────────────────────────────────────────────────────
 // 旧版把整段尾部文本塞进一个 <pre>：ERROR/ALERT 与普通行同色；搜「推送」命中 53 行
@@ -2659,8 +2660,17 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const dataAtRef = useRef(0)
   useEffect(() => { if (data) dataAtRef.current = Date.now() }, [data])
   useEffect(() => {
-    // 首访预加载：页签还没点开也先把日志拉下来；之后离开不拉，切回再补。
+    // C7-012：页签还没点开就不预取（首屏零预取契约，与 usePanelAutoLoad 同口径）。
+    // 冷启动时日志尾部可能满 1 MiB：在隐藏页签里拉下来再整串 split/计数，是白付的
+    // 带宽与 CPU。这里只登记「首访已挂载」，真正的第一发留给第一次 active=true 的
+    // firstReveal 分支。
+    if (!active && !preloadedRef.current) {
+      preloadedRef.current = true
+      revealedRef.current = false
+      return undefined
+    }
     if (!active && preloadedRef.current) return undefined
+    // 之后离开不拉，切回再补。第一次点开时用 firstReveal 的「首发补拉」。
     const firstReveal = preloadedRef.current && active && !revealedRef.current
     const seeded = seededRef.current
     seededRef.current = false
