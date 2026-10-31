@@ -3466,22 +3466,38 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     auto.startedAt = Date.now()
     scheduleAuto(auto.interval * 1000)
   }
-  // 读取持久化重放记录：返回合法条目的键值对数组（文件不存在/损坏返回空）。
-  // 每次受理前实时调用（Sourcery High：多进程共享 stateDir 时，启动时读的快照会过期）。
+  // 读取持久化重放记录：返回 { entries, problem }。
+  // problem = null：正常，或文件根本不存在（首次启动）。非空字符串：**文件在、但读不出来**
+  // （EACCES/EISDIR、JSON 损坏、顶层不是对象、有条目字段非法）。
+  // C2-013：旧实现把这几类全折叠成「空窗」且不输出任何东西——重复推送保护无声失效，
+  // 运维看不出窗口记录已经丢了（重启后一次自动重试就能再跑一轮真实推送）。
   const readLastAccept = (p) => {
+    let text
     try {
-      const parsed = JSON.parse(fs.readFileSync(p, 'utf8'))
-      const out = []
-      if (parsed && typeof parsed === 'object') {
-        for (const [k, v] of Object.entries(parsed)) {
-          // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
-          const ridOk = v && typeof v.at === 'number' &&
-            (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
-          if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
-        }
-      }
-      return out
-    } catch (e) { return [] }
+      text = fs.readFileSync(p, 'utf8')
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return { entries: [], problem: null }
+      return { entries: [], problem: `读取失败（${e && e.code ? e.code : (e && e.message) || e}）` }
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch (e) {
+      return { entries: [], problem: '内容不是合法 JSON' }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { entries: [], problem: '顶层不是对象' }
+    }
+    const out = []
+    let dropped = 0
+    for (const [k, v] of Object.entries(parsed)) {
+      // runId 形态（v3.299 评审）：数字 0 = pending 帧哨兵；字符串「epoch.seq」= 已 spawn。
+      const ridOk = v && typeof v.at === 'number' &&
+        (v.runId === 0 || (typeof v.runId === 'string' && /^\d{13,}\.\d{1,10}$/.test(v.runId)))
+      if (ridOk) out.push([k, { at: v.at, runId: v.runId }])
+      else dropped += 1
+    }
+    return { entries: out, problem: dropped > 0 ? `${dropped} 条记录字段非法，已忽略` : null }
   }
   // ── v3.300 访问日志（内存环形，蓝图 §3.3）：闭包态，access-log 端点与 finish 钩子共用。
   const accessLog = []
@@ -3494,9 +3510,17 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // lastAcceptPath 留下半截 JSON，重启后整份记录被当成「损坏 = 空窗」——窗口内的
   // 自动重试就能穿透，重复跑一轮真实推送。writeAtomic 只留旧/新两态。
   const persistLastAccept = () => writeAtomic(lastAcceptPath, JSON.stringify(Object.fromEntries(lastAccept)), '重放窗记录')
-  try {
-    for (const [k, v] of readLastAccept(lastAcceptPath)) lastAccept.set(k, v)
-  } catch (e) { /* 文件不存在/损坏 = 空窗口，正常 */ }
+  // C2-013：重放窗落在触发热路径上，每个问题只吵一次（逐次告警会把日志刷满）。
+  // 文案必须说清后果：按空窗处理 ⇒ 窗口内重试会被当成新触发，可能重复跑一轮真实推送。
+  let reportedLastAcceptProblem = ''
+  const reportLastAcceptProblem = (problem) => {
+    if (!problem || problem === reportedLastAcceptProblem) return
+    reportedLastAcceptProblem = problem
+    console.error(`⚠️ 重放窗记录（${lastAcceptPath}）不可用：${problem}。本进程按空窗处理——${Math.round(REPLAY_WINDOW_MS / 1000)} 秒窗口内的重试会被当成新触发，可能重复跑一轮真实推送；修复或删除该文件后重启即可恢复。`)
+  }
+  const persistedLastAccept = readLastAccept(lastAcceptPath)
+  reportLastAcceptProblem(persistedLastAccept.problem)
+  for (const [k, v] of persistedLastAccept.entries) lastAccept.set(k, v)
 
   // ── SSE 连接管理（v3.300 3.1）────────────────────────────────────────────
   // 按实例隔离（createConsole 闭包内，非模块级）：测试会创建多个 console 实例，
@@ -3737,9 +3761,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         if (!lockVerdict.ok) {
-          // readLastAccept 返回 [key, value] 数组（非 Map），用 find 取当前动作记录。
+          // readLastAccept 返回 { entries, problem }（不是 Map），用 find 取当前动作记录。
           const persistedPre = readLastAccept(lastAcceptPath)
-          const prevPrePair = persistedPre.find(([k]) => k === action)
+          reportLastAcceptProblem(persistedPre.problem)
+          const prevPrePair = persistedPre.entries.find(([k]) => k === action)
           const prevPre = prevPrePair ? prevPrePair[1] : lastAccept.get(action)
           // 窗口为 0 = 明确关闭拦截；时钟回拨（now < prev.at）时差值变成负数，若照常比较会
           // 把小负数也判成「还在窗内」，用户要等时钟追上来才能再触发——所以两个条件都要显式排除。
@@ -3753,7 +3778,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           return
         }
         const persisted = readLastAccept(lastAcceptPath)
-        for (const [k, v] of persisted) {
+        reportLastAcceptProblem(persisted.problem)
+        for (const [k, v] of persisted.entries) {
           if (!lastAccept.has(k) || lastAccept.get(k).at < v.at) lastAccept.set(k, v)
         }
         const prev = lastAccept.get(action)
