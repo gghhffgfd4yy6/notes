@@ -943,6 +943,37 @@ check('cacheDirFallback 反映**本次**求值：回退给出 {raw,chosen}，未
   }
 })
 
+// ===== C3-010 续（B-MF1）：回退判定必须经得起**连续多次**求值 =====
+// 「记录先于去重」是本次修复的用户可见效果所在：告警按 raw→chosen 每进程只打一条（getter 每轮求值，
+// 不去重会刷屏），但青龙 `--check` 一轮里会对 cacheDir 求值 2~3 次。若把记录挪到去重之后，第二次求值
+// 只剩「已去重 ⇒ 早退」这一条路径，`cacheDirFallback` 读回 null ⇒ `--check` 静默丢掉「已回退到哪」。
+// 故对**同一个** bad store 连续求值两次，两次都必须读到本次判定，且告警仍只有一条（去重没被破坏）。
+check('cacheDirFallback 连续两次求值都必须给出回退结论（记录先于去重）', () => {
+  const savedEnv = process.env.XBK_CACHE_DIR
+  delete process.env.XBK_CACHE_DIR // 环境变量绝对路径会跳过根内校验，本用例只测配置值分支
+  try {
+    const raw = 'c3010c_probe_cache'
+    const rejected = path.join(ROOT_DIR, raw)
+    const badFs = makeMemFs({})
+    badFs.files.set(rejected, 'x') // 普通文件占位 ⇒ 根内校验拒绝
+    const bad = makeBatchStore({ fsMock: badFs, configDir: raw })
+    const expected = { raw, chosen: path.join(ROOT_DIR, 'xianbaoku_cache') }
+    const warns = captureConsole('warn', () => {
+      assert.strictEqual(bad.store.cacheDir, expected.chosen, '第一次求值必须回退到默认目录')
+      assert.deepStrictEqual(bad.store.cacheDirFallback, expected,
+        '第一次求值必须给出 {raw, chosen}')
+      // 与 runCheck 的实际求值次数一致：--check 一轮会读 cacheDir 2~3 次
+      assert.strictEqual(bad.store.cacheDir, expected.chosen, '第二次求值必须回退到同一目录')
+      assert.deepStrictEqual(bad.store.cacheDirFallback, expected,
+        '第二次求值仍必须是本次判定——记录若晚于去重，这里会读回 null，--check 静默丢掉回退目标')
+    })
+    const hits = warns.filter(w => w.includes('缓存目录配置未生效'))
+    assert.strictEqual(hits.length, 1, `告警仍必须按 raw→chosen 只打一条：${JSON.stringify(warns)}`)
+  } finally {
+    if (savedEnv !== undefined) process.env.XBK_CACHE_DIR = savedEnv
+  }
+})
+
 // ===== C3-007：不同 pushUrl 撞到同一缓存文件必须显形 =====
 // 缓存文件名只由 URL 末段派生：两个不同来源（换域名、同末段的两个接口）会静默共用一份 push.json
 // ⇒ 两边的判重记录互相覆盖（方向=漏推）。改名会迁移既有判重记录（等同全量重推），故只告警不改名。
