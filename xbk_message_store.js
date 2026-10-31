@@ -30,6 +30,21 @@ function tombstoneKeyCap (maxSize, droppedCount = 0, floorKeys = TOMBSTONE_MAX_K
   return cap
 }
 
+// C3-010：回退必须显形。cache.dir 被根内安全检查拒绝时（越界 `..`/绝对路径、普通文件占位、
+// 层级里是指向根外的符号链接），生产会**静默**落到 .xbk_cache_safe / .xbk_cache_safe_internal：
+// 判重主存换成另一份文件、原目录的 push.json 就此被「遗忘」⇒ 要么全量重推、要么两处各记一半。
+// 而运维侧唯一的可见信号曾是「什么都没说」。这里回退一次打一条 WARN（按 raw→chosen 去重，
+// 每进程每组合一次：getter 每轮都会求值，不做去重会把日志刷满）。
+const warnedCacheDirFallbacks = new Set()
+function warnCacheDirFallback (raw, candidate, chosen) {
+  const key = String(raw) + '\u0000' + String(chosen)
+  if (warnedCacheDirFallbacks.has(key)) return
+  warnedCacheDirFallbacks.add(key)
+  console.warn(`⚠️ 缓存目录配置未生效：${raw}（解析为 ${candidate}）未通过「项目根内 + 不跟随根外符号链接」安全检查，` +
+    `已回退到 ${chosen}——push.json（判重主存）、run.log、filter.hash 都写在回退目录；` +
+    '请检查该路径是否指向项目外、是否被普通文件占位、层级里是否有指向根外的符号链接（XBK_CACHE_DIR / XBK_PARALLEL_ID 同受影响）')
+}
+
 function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   const candidate = path.resolve(root, raw)
   const realInsideRoot = (p) => {
@@ -52,7 +67,7 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
   if (realInsideRoot(candidate)) return candidate
   const safeFallback = path.resolve(root, fallback)
-  if (realInsideRoot(safeFallback)) return safeFallback
+  if (realInsideRoot(safeFallback)) { warnCacheDirFallback(raw, candidate, safeFallback); return safeFallback }
   // 默认目录本身若被替换成外部符号链接，也不能原样返回；使用项目根内的应急目录。
   // C3-014：下面两个兜底目录名与 .gitignore 的 `.xbk_cache_safe*` 一一对应——它们是**生产**兜底
   // 写入目标（默认目录被占位/被换成根外符号链接时 cacheDir 就落在这里），改名必须同步改 .gitignore，
@@ -60,12 +75,12 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   // 的风险，也会让 pre-push 的「工作树干净」快路径失效）。
   const emergencyFallback = path.join(root, '.xbk_cache_safe')
   // C022：应急目录同样校验 realpath；被替换成外部符号链接时不能原样返回。
-  if (realInsideRoot(emergencyFallback)) return emergencyFallback
+  if (realInsideRoot(emergencyFallback)) { warnCacheDirFallback(raw, candidate, emergencyFallback); return emergencyFallback }
   // 校验失败回退到根目录下唯一安全路径（固定新目录名，不跟随外部符号链接）。
   // P2（审查 2026-08-15）：最末兜底目录同样校验 realpath——若该固定名已存在且被替换为
   // 指向项目外的符号链接，写入会逃出根目录（前两级候选均先过 realInsideRoot，唯独此级曾直接返回）。
   const internalFallback = path.join(root, '.xbk_cache_safe_internal')
-  if (realInsideRoot(internalFallback)) return internalFallback
+  if (realInsideRoot(internalFallback)) { warnCacheDirFallback(raw, candidate, internalFallback); return internalFallback }
   // 所有候选目录（含应急目录）均不可用：说明项目根目录层级已被外部符号链接劫持，
   // 继续返回任意路径都会逃出根目录——显式抛错，由 init()/App.run 的 try/catch 暴露，禁止静默写穿。
   throw new Error('缓存目录安全检查失败：所有候选目录（含 .xbk_cache_safe_internal）均不可用，可能被符号链接劫持')

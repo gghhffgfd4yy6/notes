@@ -60,6 +60,8 @@ function makeApp (overrides = {}) {
   return {
     validateConfig: overrides.validateConfig || (() => []),
     init: overrides.init || (() => {}),
+    // C3-010：--check 现在打印 MessageStore.cacheDir（生效值）；桩不注入时按「未回退」口径走配置值。
+    MessageStore: overrides.MessageStore,
     Config: {
       filter: overrides.filter || {},
       keyword: { zkt_gjc: overrides.zkt_gjc || '' },
@@ -131,6 +133,34 @@ function makeApp (overrides = {}) {
   assert.strictEqual(rNoMethod.code, 1, 'notify 无 configuredChannelCount 方法应返回 1')
   assert.ok(rNoMethod.output.includes('❌ 通知通道'), '失败项应为"通知通道"，输出应含 ❌ 通知通道')
   assert.ok(rNoMethod.output.includes('未检测到完整通道配置'), '应显示未检测到通道配置')
+  restoreNotify()
+
+  // ===== C3-010：--check 的「缓存目录」必须打印**生效值**，回退时必须点明原因 =====
+  // 旧实现只打印 app.Config.cache.dir：cache.dir 被根内安全检查拒绝时生产已静默回退到
+  // .xbk_cache_safe，而 --check 仍显示 ✅ 配置值 ⇒ 运维以为判重主存写在配置位置
+  // （实际写在别处：缓存「丢失」/重复推送的误判来源）。
+  mockNotify(1)
+  const fallbackDir = path.join(__dirname, '.xbk_cache_safe')
+  const rFallback = withHealthyEnv(() => captureRunCheck(makeApp({ MessageStore: { cacheDir: fallbackDir } })))
+  assert.strictEqual(rFallback.code, 0, '回退本身不是失败（生产口径），但必须可见')
+  assert.ok(rFallback.output.includes(`✅ 缓存目录：${fallbackDir}`),
+    `--check 必须打印生效目录而非配置值：${rFallback.output}`)
+  assert.ok(rFallback.output.includes('未通过根内安全检查，已回退'),
+    `--check 必须点明「配置值未生效、已回退」：${rFallback.output}`)
+  // 对照：生效值 === 配置值时不加任何赘述（否则「已回退」会变成永远为真的噪声）
+  const configuredDir = path.join(__dirname, '.test-cache')
+  const rSame = withHealthyEnv(() => captureRunCheck(makeApp({ MessageStore: { cacheDir: configuredDir } })))
+  assert.ok(rSame.output.includes(`✅ 缓存目录：${configuredDir}\n`),
+    `生效值等于配置值时只打印路径：${rSame.output}`)
+  assert.ok(!rSame.output.includes('已回退'), '未回退时不得出现「已回退」说明')
+  // XBK_CACHE_DIR 覆盖时点明来源（与 statusCacheDir 同源口径）
+  process.env.XBK_CACHE_DIR = fallbackDir
+  try {
+    const rEnv = withHealthyEnv(() => captureRunCheck(makeApp()))
+    assert.ok(rEnv.output.includes('由 XBK_CACHE_DIR 覆盖'), `环境变量覆盖必须显形：${rEnv.output}`)
+  } finally {
+    delete process.env.XBK_CACHE_DIR
+  }
   restoreNotify()
 
   console.log('test_qinglong_runcheck OK')

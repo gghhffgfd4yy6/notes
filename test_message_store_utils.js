@@ -882,6 +882,31 @@ function captureConsole (method, fn) {
 
 const cacheWrites = (writes) => writes.filter(w => w.label === '缓存')
 
+// ===== C3-010：cache.dir 被安全检查拒绝时必须可见（静默回退 = 判重主存换文件）=====
+// 旧实现直接 return 回退目录、一句都不说：运维只看到「缓存没了 / 又开始重复推送」，无从知道
+// push.json 已经写到 .xbk_cache_safe。这里用假 fs 把默认目录做成「普通文件占位」，断言回退
+// 目录 + 恰好一条 WARN（getter 每轮都会求值，必须按 raw→chosen 去重，不能每轮刷一条）。
+check('C3-010 缓存目录回退必须 WARN（且按 raw→目标去重，不随每轮求值刷屏）', () => {
+  // raw 用唯一值：去重表是模块级的，别的用例可能已经告过同一个 raw→目标组合
+  const raw = 'c3010_probe_cache'
+  const rejected = path.join(FAKE_ROOT, raw)
+  const fakeFs = {
+    existsSync: (p) => p === rejected, // 自定义目录被**普通文件**占位（真实生产里最常见的拒绝形态）
+    lstatSync: (p) => ({ isDirectory: () => p !== rejected }), // 只有它不是一个目录
+    realpathSync: (p) => p
+  }
+  const warns = captureConsole('warn', () => {
+    const a = resolveCacheDirInRoot({ fs: fakeFs, path, root: FAKE_ROOT, raw, fallback: 'xianbaoku_cache' })
+    const b = resolveCacheDirInRoot({ fs: fakeFs, path, root: FAKE_ROOT, raw, fallback: 'xianbaoku_cache' })
+    assert.strictEqual(a, b, '同一输入两次求值必须同结果（去重不得影响返回值）')
+    assert.strictEqual(a, DEFAULT_DIR, `自定义目录被拒绝时回退到默认目录：${a}`)
+  })
+  const fb = warns.filter(w => w.includes('缓存目录配置未生效'))
+  assert.strictEqual(fb.length, 1, `回退只应告警一次（getter 每轮求值）：${JSON.stringify(warns)}`)
+  assert.ok(fb[0].includes(rejected) && fb[0].includes(DEFAULT_DIR),
+    `告警必须同时点名「被拒绝的配置」与「实际回退目录」：${fb[0]}`)
+})
+
 // ===== C3-005：隔离备份「名字要原子预留、份数要有上限」=====
 // 旧实现 existsSync → rename 之间有空窗：另一进程能在缝里抢先建同名 .bak，rename 随后把它静默
 // 覆盖（上一份备份被销毁）。修法 = O_EXCL 预留占位（名字一落地就归本次调用）。判别式断言是

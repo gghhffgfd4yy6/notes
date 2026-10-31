@@ -126,7 +126,20 @@ function runCheck (app) {
   add('过滤配置', warnings.length === 0, warnings.length ? `${warnings.length} 条警告：${warnings.join('；')}` : '合法')
   try {
     app.init()
-    add('缓存目录', true, app.Config.cache.dir)
+    // C3-010：init() 成功不等于 cache.dir 生效——被根内安全检查拒绝时会**静默回退**到
+    // .xbk_cache_safe / .xbk_cache_safe_internal，而这里原先只打印配置值：运维看到
+    // 「✅ 缓存目录：<配置值>」会以为判重主存写在配置位置，实际写在别处（误判「缓存丢了/在重复推送」）。
+    // 故打印**生效值**，并在与配置值不一致时点明「谁覆盖/为什么回退」。
+    const configured = app.Config.cache.dir
+    const effective = app.MessageStore && typeof app.MessageStore.cacheDir === 'string' ? app.MessageStore.cacheDir : configured
+    let detail = effective
+    if (process.env.XBK_CACHE_DIR) {
+      detail = `${effective}（由 XBK_CACHE_DIR 覆盖，配置值 ${configured}）`
+    } else if (typeof configured === 'string' && configured && typeof effective === 'string' &&
+      path.resolve(effective) !== path.resolve(ROOT, configured)) {
+      detail = `${effective}（配置值 ${configured} 未通过根内安全检查，已回退）`
+    }
+    add('缓存目录', true, detail)
   } catch (e) { add('缓存目录', false, e.message) }
   const notify = require(path.join(ROOT, 'xbk_sendNotify_slim'))
   const count = typeof notify.configuredChannelCount === 'function' ? notify.configuredChannelCount() : 0
