@@ -821,7 +821,30 @@ test('readAppliedSnapshot：missing / invalid / ioError 三态', () => {
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ioError')
 })
 
+test('C9-019 生效快照 filter/keyword 字段按覆盖文件同口径收紧（非字符串/未知字段即 invalid）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const base = { schema: 1, revision: 1, source: 'override', hash: 'h', appliedAt: '2026-10-18T00:00:00.000Z' }
+  const cases = [
+    { filter: { pingbibiaoti: 123 }, keyword: {}, why: 'filter 字段是数字' },
+    { filter: { pingbibiaoti: { a: 1 } }, keyword: {}, why: 'filter 字段是对象' },
+    { filter: { evil: 'x' }, keyword: {}, why: 'filter 含白名单外字段' },
+    { filter: { pingbibiaoti: 'x' }, keyword: { zkt_gjc: 42 }, why: 'keyword.zkt_gjc 是数字' },
+    { filter: { pingbibiaoti: 'x' }, keyword: { zkt_gjc: ['a'] }, why: 'keyword.zkt_gjc 是数组' }
+  ]
+  for (const c of cases) {
+    writeRaw(paths.applied, JSON.stringify({ ...base, filter: c.filter, keyword: c.keyword }))
+    const read = readAppliedSnapshot(dir)
+    assert.strictEqual(read.status, 'invalid', `${c.why} 必须判 invalid（不能当合法快照读回）`)
+    assert.strictEqual(read.error.code, 'invalid_schema', `${c.why} 的错误码应为 invalid_schema`)
+  }
+  // 对照：未提供的字段视同空（与 parseStoredRules 一致，不强制补齐 11 个），合法快照照旧 ok
+  writeRaw(paths.applied, JSON.stringify({ ...base, filter: { pingbibiaoti: 'x' }, keyword: {} }))
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '缺省字段不得被误判为损坏')
+})
+
 // ===== 路径 helper =====
+
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {
   const base = path.join(tmp, 'paths-base')
   const paths = filterRulesPaths(base)

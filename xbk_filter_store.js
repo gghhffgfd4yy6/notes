@@ -643,8 +643,30 @@ function readAppliedSnapshot (cacheDir) {
   if (!snapshot.filter || typeof snapshot.filter !== 'object' || Array.isArray(snapshot.filter)) {
     return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 filter 必须是对象' } }
   }
+  // C9-019：只校验「filter 是对象」时，字段被写成对象/数字/数组也照读 ok，而覆盖文件的读路径
+  // （parseStoredRules）对同一批字段要求「白名单内 + 必须是字符串」——两条读路径口径不一致，
+  // 快照一旦被写坏，控制台就会把非字符串当成规则正文显示/回填。这里按 parseStoredRules 同口径
+  // 收紧：存在即必须是白名单字段且为字符串（未提供的字段与读覆盖文件一样视同空，不强制补齐）。
+  let snapshotKeys
+  try { snapshotKeys = Object.keys(snapshot.filter) } catch (e) { snapshotKeys = null }
+  if (snapshotKeys === null) {
+    return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 filter 不是可枚举对象' } }
+  }
+  for (const field of snapshotKeys) {
+    if (!FIELD_SET.has(field)) {
+      return { status: 'invalid', error: { code: 'invalid_schema', message: `生效快照含未知字段「${field}」` } }
+    }
+    if (typeof safeGet(snapshot.filter, field) !== 'string') {
+      return { status: 'invalid', error: { code: 'invalid_schema', message: `生效快照字段「${field}」必须是字符串` } }
+    }
+  }
   if (!snapshot.keyword || typeof snapshot.keyword !== 'object' || Array.isArray(snapshot.keyword)) {
     return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 keyword 必须是对象' } }
+  }
+  // keyword 写入侧恒为 {zkt_gjc: 字符串}；出现非字符串说明快照被改坏（控制台会照原样显示）。
+  const snapshotKeyword = safeGet(snapshot.keyword, 'zkt_gjc')
+  if (snapshotKeyword !== undefined && typeof snapshotKeyword !== 'string') {
+    return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 keyword.zkt_gjc 必须是字符串' } }
   }
   return { status: 'ok', snapshot }
 }
