@@ -3541,6 +3541,60 @@ check('C1-014 归一化与跨天结转都按同一名单搬运：丢掉名单外
   assert.strictEqual(st.runs, 2)
 })
 
+// ===== C1-009：re2 缺失提醒链的三个静默口 =====
+// 审计条目：(a) dry-run 完全不提；(b) _sendAlert 返回 undefined（限频/禁用）被当已处理；(c) 规则侧
+// 逐字段告警只在全局提醒链里被覆盖——全局链一静默，规则全量跳过就零痕迹。
+// 这里分别钉住 (a)(b)；(c) 由这两条共同覆盖（compileRules 在 re2 缺失时不逐字段告警，见 xbk_rules.js
+// 的 `if (!isRe2Available()) { compiled[field] = null; continue }`）。
+checkAsync('C1-009 dry-run 时 re2 缺失必须本地留痕（console.warn + run.log），但不发告警、不写标记', async () => {
+  const mfs = makeMemFs()
+  const dir2 = os.tmpdir()
+  let alerted = 0
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir2, sendAlert: async () => { alerted++; return true } })
+  const logs = []
+  app._writeRunLog = (line) => { logs.push(String(line)) }
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...a) => warns.push(a.map(String).join(' '))
+  try {
+    await app._warnMissingRe2({ dryRun: true })
+  } finally {
+    console.warn = origWarn
+  }
+  assert.strictEqual(alerted, 0, 'dry-run 不得发送告警（无通知副作用）')
+  assert.strictEqual(mfs._files.size, 0, 'dry-run 不得写标记文件（否则会把当天的真实告警吞掉）')
+  assert.ok(warns.some(m => m.includes('[re2 缺失提醒]')), `dry-run 必须打印 re2 缺失提醒，实际：${JSON.stringify(warns)}`)
+  assert.ok(logs.some(l => l.includes('WARN') && l.includes('[re2 缺失提醒]')), `dry-run 必须在 run.log 留一行 WARN，实际：${JSON.stringify(logs)}`)
+})
+
+checkAsync('C1-009 告警启用但本轮被限频（_sendAlert 返回 undefined）⇒ 标记保留 pending，不得当已处理', async () => {
+  const mfs = makeMemFs()
+  const dir3 = os.tmpdir()
+  const sp = dir3 + '/re2warn.state.' + stamp
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir3, sendAlert: async () => true })
+  app._writeRunLog = () => {}
+  // 模拟「告警启用但本轮被限频跳过」：_sendAlert 返回 undefined（限频/状态不可读的唯一出口）
+  app._sendAlert = async () => undefined
+  await app._warnMissingRe2()
+  assert.strictEqual(mfs._files.has(sp), true, '跳过（undefined）时不得删除 pending 标记')
+  const parsed = JSON.parse(mfs.readFileSync(sp))
+  assert.strictEqual(parsed.status, 'pending', '未送达的提醒必须保持 pending，下一轮才能在限频窗口过后重发')
+})
+
+checkAsync('C1-009 用户主动关闭告警（_sendAlert 返回 undefined 且 alert.enabled=false）⇒ 置 completed，不每轮重试', async () => {
+  const mfs = makeMemFs()
+  const dir4 = os.tmpdir()
+  const sp = dir4 + '/re2warn.state.' + stamp
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir4, sendAlert: async () => true })
+  app._writeRunLog = () => {}
+  app._sendAlert = async () => undefined
+  // 关闭告警：Config.alert 由 makeRe2WarnApp 固定为 { enabled: true }，这里直接让开关判定为关
+  app._enabledFlag = (cfg) => { if (cfg === undefined) return false; return cfg && cfg.enabled !== true }
+  await app._warnMissingRe2()
+  const parsed = JSON.parse(mfs.readFileSync(sp))
+  assert.strictEqual(parsed.status, 'completed', '用户关闭告警时本地已留痕，标记置 completed 防每轮重跑')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

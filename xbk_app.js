@@ -459,10 +459,19 @@ function createApp ({
       }
     },
 
-    async _warnMissingRe2 () {
+    async _warnMissingRe2 (opts = {}) {
     // Sourcery 第八轮：RE2C 可用时也要顺带清理残留旧标记文件，否则安装 re2 后堆积文件永不清理。
       if (RE2C) {
         this._cleanupStaleRe2WarnMarkers()
+        return
+      }
+      // C1-009：dry-run 也必须**本地**留痕。旧实现由调用方 `if (!dryRun)` 整段跳过，于是预演时
+      // 「用户过滤正则一条都没生效」既不打日志也不进 run.log——而 dry-run 恰恰是排障时最常跑的
+      // 形态。这里不做任何通知副作用（不写标记、不发告警），只保留 console.warn + run.log 两处
+      // 本地痕迹（dry-run 本来就会写 run.log 摘要，不引入新的写盘语义）。
+      if (opts.dryRun === true) {
+        console.warn(RE2_MISSING_WARNING)
+        this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
         return
       }
       // 跨进程防重（终版）：按天命名的标记文件 + per-date 互斥锁。
@@ -505,16 +514,23 @@ function createApp ({
       console.warn(RE2_MISSING_WARNING)
       this._writeRunLog(`${this._localStamp()} WARN ${RE2_MISSING_WARNING}\n`)
       // 发送结果三态：true 成功 / false 失败删标记重试 /
-      // undefined 跳过（禁用/限频）——成功与跳过都视为当天已处理，标记置 completed（CodeRabbit 第八轮：
-      // 防止正常进程退出后被误判为残留造成同一天重复提醒）。
+      // undefined 跳过（禁用/限频）——成功与「用户主动关闭告警」都视为当天已处理，标记置 completed
+      // （CodeRabbit 第八轮：防止正常进程退出后被误判为残留造成同一天重复提醒）。
+      // C1-009：旧实现把 undefined 一律当「已处理」——限频窗口内（intervalMs 默认 1h）或限频状态
+      // 读取失败时告警根本没发出去，标记却被置 completed，于是这一天的提醒被永久吞掉（下一轮连
+      // run.log 的 WARN 行都不会再写）。现在只有「确实送达」或「用户关掉了告警」才置 completed；
+      // 「启用但本轮被跳过」保留 pending，让后续轮次在限频窗口过后重发（本进程内 pending+自身 pid
+      // 存活 ⇒ 不会重复提醒，进程退出后下一轮才回收重试）。
+      const alertsEnabled = this._enabledFlag(Config.alert)
       const sent = await this._sendAlert(RE2_MISSING_WARNING, 're2-missing')
       if (sent === false) {
       // 发送失败：锁内删除自己的 pending 标记（完整 token 校验），下次运行可重试
         this._removeRe2WarnMarker(statePath, token)
-      } else {
-      // 成功或跳过：锁内把标记置 completed（防止正常进程退出后被误判残留导致同一天重复提醒）
+      } else if (sent === true || !alertsEnabled) {
+      // 发送成功，或用户明确关闭告警（本地已留痕，不必每轮重试）：锁内把标记置 completed
         this._completeRe2WarnMarker(statePath, token)
       }
+      // 其余情况（告警启用但本轮被限频/限频状态不可读）：保留 pending 供下一轮重试。
     },
 
     // 单个日期标记的跨进程互斥锁（O_EXCL 独占创建 + 短退避 + 陈旧锁抢占）：
@@ -1157,7 +1173,8 @@ function createApp ({
         // CR-03：不在此处缓存 cacheDir——init 只保证「此刻」目录可用，后续每行日志/状态文件都要
         // 重新过 getter 的 lstat+realpath 校验（运行期目录被替换成外部符号链接时必须当场失败）。
         checkpoint('cache-init')
-        if (!dryRun) await this._warnMissingRe2()
+        // C1-009：dry-run 也走这条链（内部 dryRun 分支只写 console/run.log，不发告警、不写标记）
+        await this._warnMissingRe2({ dryRun })
         this._warnLowDisk()
         checkpoint('disk-check')
 
