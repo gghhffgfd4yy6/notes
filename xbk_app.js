@@ -31,14 +31,18 @@ function createApp ({
   const LOCK_RETRY_INTERVAL_MS = 10
   const lockTokenOf = () => `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
 
-  /** 单次 O_EXCL 尝试（含陈旧锁回收）。成功返回 { fd }，失败返回 { reason, error }：
+  /** 单次 O_EXCL 尝试（含陈旧锁回收）。成功返回 { fd, token }，失败返回 { reason, error }：
    *  reason='open' 非 EEXIST 的 open 失败；'busy' 锁被活跃或未超龄的持有者占着；
-   *  'unlink' 陈旧锁回收失败；'reopen' 回收后二次 open 失败。 */
+   *  'unlink' 陈旧锁回收失败；'reopen' 回收后二次 open 失败。
+   *  C1-020：token 随 fd 一起回传——释放时要用它证明「锁文件里仍是我的令牌」。
+   *  token 在写盘**之前**就固定下来：写失败时文件内容为空，释放时按「不属于我」处理（只关闭、
+   *  不删除），而不是退回按路径删除——那正是误删接管者锁的入口。 */
   const tryLockOnce = (lockPath) => {
     try {
       const fd = fs.openSync(lockPath, 'wx')
-      try { fs.writeSync(fd, lockTokenOf()) } catch (e) { /* 锁内容仅供排查，失败不影响 */ }
-      return { fd }
+      const token = lockTokenOf()
+      try { fs.writeSync(fd, token) } catch (e) { /* 锁内容仅供排查及归属校验，失败不影响持有 */ }
+      return { fd, token }
     } catch (e) {
       if (!e || e.code !== 'EEXIST') return { reason: 'open', error: e }
       let stale = false
@@ -50,8 +54,9 @@ function createApp ({
       try { fs.unlinkSync(lockPath) } catch (e2) { return { reason: 'unlink', error: e2 } }
       try {
         const fd = fs.openSync(lockPath, 'wx')
-        try { fs.writeSync(fd, lockTokenOf()) } catch (e2) { /* 同上 */ }
-        return { fd }
+        const token = lockTokenOf()
+        try { fs.writeSync(fd, token) } catch (e2) { /* 同上 */ }
+        return { fd, token }
       } catch (e2) { return { reason: 'reopen', error: e2 } }
     }
   }
@@ -68,6 +73,33 @@ function createApp ({
       try { Atomics.wait(lockWaiter, 0, 0, LOCK_RETRY_INTERVAL_MS) } catch (e) { /* 非主线程/受限：直接重试 */ }
     }
   }
+  /** 释放锁：只关 fd 还不够——必须确认「锁文件里仍是我写入的令牌」才删除。C1-020：旧实现按
+   *  路径无条件 unlink。持锁者的令牌为空（写盘失败）时 _isTombstoneLockProcessAlive 解析不出存活
+   *  证据，另一进程在 mtime 超龄后会 unlink 重建接管；接管者正常释放、第三方取到同一把锁之后，
+   *  先来者的迟到释放会把第三方手里的锁文件删掉 ⇒ 互斥当场失效（本仓 _releaseTombstoneLock 早已
+   *  是 token 校验口径）。判据同源：读回内容做定时安全比较，不匹配只关 fd、保留别人的锁；
+   *  读不到（ENOENT/权限/io）同样不删——锁残留由 stale + 持有进程存活复核在 10s 后回收，误删
+   *  别人的锁则是立即破坏互斥。令牌未知（直接调用本方法、注入的 fs 替身没有读能力）时退回旧行为
+   *  （按路径删除）：生产路径上两者恒不成立（令牌由 tryLockOnce 一路带出，真实 fs 必有 readFileSync）。 */
+  const releaseLock = (lockPath, fd, token) => {
+    // 只关真锁 fd：0/1/2 是 stdio，宁可漏关一个不该出现的锁 fd，也不能关掉进程输出。
+    if (typeof fd === 'number' && fd > 2) {
+      try { fs.closeSync(fd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
+    }
+    let owned = true
+    if (typeof token === 'string' && token !== '' && typeof fs.readFileSync === 'function') {
+      try {
+        owned = timingSafeEqualStr(fs.readFileSync(lockPath, 'utf8'), token, crypto)
+      } catch (e) {
+        owned = false // 已不存在（ENOENT）无需删除；其余读错误无法判定归属 ⇒ 不删
+      }
+    }
+    if (!owned) return
+    try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+  }
+
+  // C1-028：_writeRunLog 允许写入的**唯一**文件名名单（见该方法头注释）。新增日志只改这里。
+  const LOG_FILES = Object.freeze(new Set(['run.log', 'filter-diagnostics.ndjson']))
   // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
   // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
   // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
@@ -168,14 +200,21 @@ function createApp ({
     // 常驻实例共用同一 cacheDir）——进程 A「追加→读尾→原子改写」的读改写间隙里，B 刚追加的行会被
     // A 的整文件覆盖冲掉（丢日志）。修复：用 run.log.lock（O_EXCL）把「追加 + 超限截尾」包成互斥
     // 临界区；拿不到锁（竞争/陈旧锁/异常）时 fail-open 只追加不截尾，日志绝不因锁而丢。
-    // 日志记录名仅接受文件基名，防未来调用传入 ../ 或绝对路径写出缓存目录。
+    // 日志记录名仅接受**白名单内的基名**：光挡 ../ 与绝对路径不够（C1-028）——任何「同名基名」
+    // 都能穿过旧判据，内部调用一旦传 'push.json' 就会把一行文本追加进判重缓存。缓存是整份 JSON
+    // 数组，坏文本会被读侧判 corrupt ⇒ 原件改名隔离、缓存重建为空 ⇒ 判重身份全丢、全量重推。
+    // 新增日志文件必须显式加进 LOG_FILES（越界即回退 run.log 并点名，不静默丢弃）。
     // C1-006：opts.truncateError=false 关闭「单行 ERROR 截断」启发式——_writeFilterDiagnostics 传的是
     // 整批 NDJSON（lines.join('\n')），按整串首个 " ERROR " 截到 512 字符会把后面的记录连同其 JSON
     // 结构一起切掉，末行留下半条非法 JSON（13 条只落 4~7 行）。批量写入必须逐条整行落盘，截断只在
     // 单条日志自己身上发生。
     _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
-        const safeFilename = typeof filename === 'string' && path.basename(filename) === filename ? filename : 'run.log'
+        const isWhitelisted = typeof filename === 'string' && LOG_FILES.has(filename)
+        if (!isWhitelisted && typeof filename === 'string') {
+          console.error(`拒绝写入非白名单日志文件 ${filename}（仅允许 ${[...LOG_FILES].join(' / ')}），已改回 run.log`)
+        }
+        const safeFilename = isWhitelisted ? filename : 'run.log'
         const logPath = path.join(this._cacheDir(), safeFilename)
         if (!this._isRegularOrMissing(logPath)) {
           console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
@@ -186,12 +225,13 @@ function createApp ({
         // 改成 +1，release 分支把 1 当锁 fd 去 close，直接关掉 stdout、进程崩成 RuntimeError。
         // close 另加 >2 守卫：stdio 已被外部关闭时 openSync 本就会返回 0/1/2 这样的真 fd。
         let lockFd = null
+        let lockToken = null
         try {
         // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
         // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）。
         // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry，三处锁共用同一份判据。
           const lock = acquireLockWithRetry(lockPath)
-          if (typeof lock.fd === 'number') lockFd = lock.fd
+          if (typeof lock.fd === 'number') { lockFd = lock.fd; lockToken = lock.token }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
           // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
@@ -247,12 +287,9 @@ function createApp ({
           }
         } finally {
           if (lockFd !== null) {
-            // 只关真锁 fd：0/1/2 是 stdio，宁可漏关一个不该出现的锁 fd，也不能关掉进程输出。
-            // 锁文件仍要删（不管 fd 落在哪个区）——漏 unlink 会让后续轮次一直被陈旧锁挡住。
-            if (lockFd > 2) {
-              try { fs.closeSync(lockFd) } catch (e) { /* 锁 fd 关闭失败忽略 */ }
-            }
-            try { fs.unlinkSync(lockPath) } catch (e) { /* 锁文件已被抢删等，忽略 */ }
+            // C1-020：close 只对真锁 fd（0/1/2 是 stdio）；unlink 交给 releaseLock 按令牌判定——
+            // 锁文件若已被别人接管（内容不再是本进程令牌），删掉它就会让第三方与我们同时进临界区。
+            releaseLock(lockPath, lockFd, lockToken)
           }
         }
       } catch (e) { /* 日志写失败静默（磁盘只读/权限等，不中断推送） */ }
@@ -610,13 +647,13 @@ function createApp ({
     _acquireRe2WarnLock (statePath) {
       const lockPath = statePath + '.lock'
       const lock = acquireLockWithRetry(lockPath)
-      return typeof lock.fd === 'number' ? { lockPath, fd: lock.fd } : null
+      return typeof lock.fd === 'number' ? { lockPath, fd: lock.fd, token: lock.token } : null
     },
 
     _releaseRe2WarnLock (statePath, acquired) {
       if (!acquired) return
-      try { fs.closeSync(acquired.fd) } catch (e) { /* 忽略 */ }
-      try { fs.unlinkSync(acquired.lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+      // C1-020：令牌校验后才删除（同 releaseLock），不按路径无条件 unlink。
+      releaseLock(acquired.lockPath, acquired.fd, acquired.token)
     },
 
     // 清理超过保留期的 re2 标记文件（best-effort；仅删除严格早于 cutoff 的日期）：
@@ -867,10 +904,15 @@ function createApp ({
      *  open 失败、unlink 失败、二次 open 失败都是真实故障，此前全折叠成 -1 被谎报成并发）。 */
     _tryAcquireChannelHealthLock (lockPath) {
       this._lastChannelHealthLockFailure = null
+      // C1-020：令牌与本轮 fd 成对保存——释放时用它证明锁仍是自己的（见 releaseLock）。
+      this._lastChannelHealthLockToken = null
       // C1-013：单次尝试（观测性写入不为拿锁阻塞事件循环），与 run.log / RE2 标记共用同一份
       // tryLockOnce；失败原因按 reason 分流，供调用点区分「另一轮在更新」与真实故障（C1-008）。
       const attempt = tryLockOnce(lockPath)
-      if (typeof attempt.fd === 'number') return attempt.fd
+      if (typeof attempt.fd === 'number') {
+        this._lastChannelHealthLockToken = attempt.token
+        return attempt.fd
+      }
       this._lastChannelHealthLockFailure = {
         reason: attempt.reason,
         code: (attempt.error && attempt.error.code) || '',
@@ -880,16 +922,11 @@ function createApp ({
     },
 
     _releaseChannelHealthLock (lockPath, lockFd) {
-      // 锁 fd 只可能是 openSync 返回的 >=3；0/1/2 是 stdio。哨兵被误改成 +1 时
-      // 旧判据会 close(1) 直接关掉 stdout，把测试进程崩成 RuntimeError（app 变异守卫红）。
-      // 这里拒绝 stdio fd：宁可漏关一个不该出现的锁 fd，也不能关闭进程输出。
-      // 但 close 与 unlink 是两件事：unlink 必须在「本轮确实取到了锁」时执行（fd 落在
-      // stdio 区也一样），否则锁文件残留、后续轮次一直被陈旧锁挡住；只有 null/-1 才整段跳过。
+      // 未取到锁（null / -1）时整段跳过。
       if (typeof lockFd !== 'number' || lockFd < 0) return
-      if (lockFd > 2) {
-        try { fs.closeSync(lockFd) } catch (e) { /* 忽略 */ }
-      }
-      try { fs.unlinkSync(lockPath) } catch (e) { /* 锁已被外部清理时忽略 */ }
+      // C1-020：close 只接受 >2（0/1/2 是 stdio，见 _writeRunLog 同口径注释）；unlink 由
+      // releaseLock 按令牌判定——锁若已被接管，按路径删除会让第三方与本轮同时进临界区。
+      releaseLock(lockPath, lockFd, this._lastChannelHealthLockToken)
     },
 
     /** FX3：生成一次恢复告警发送尝试的唯一认领令牌（pid+时刻+序号+随机，跨进程/跨轮次不撞）。
@@ -1007,9 +1044,12 @@ function createApp ({
           }
         }
         const succeeded = new Set(Array.isArray(outcome && outcome.successfulChannels) ? outcome.successfulChannels.filter(x => typeof x === 'string' && x) : [])
-        const failures = Array.isArray(outcome && outcome.failures) ? outcome.failures : []
+        // C1-025：外层是「失败对象数组」，与下面按通道累计的「连续失败次数」是两种东西。
+        // 旧实现两处都叫 failures（相隔十余行），内层把外层遮住——读代码时极易把数组当计数用；
+        // 现分别命名为 failureList（数组）与 failCount（次数）。
+        const failureList = Array.isArray(outcome && outcome.failures) ? outcome.failures : []
         const failed = new Map()
-        for (const failure of failures) {
+        for (const failure of failureList) {
           const channel = failure && typeof failure.channel === 'string' ? failure.channel : ''
           if (channel) failed.set(channel, summarizeError(failure))
         }
@@ -1045,13 +1085,13 @@ function createApp ({
           // 本轮也失败过 ⇒ 已按失败计数（见上），不得再按「恢复」清零。
           if (failed.has(channel)) continue
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
-          const failures = this._safeCounter(entry.consecutiveFailures)
+          const failCount = this._safeCounter(entry.consecutiveFailures)
           const recoverPending = entry.recoverAlertPending === true
           if (recoverPending && this._isChannelRecoverClaimAlive(entry, now)) {
             // FX3：另一轮已认领这次恢复告警且租约未过期（它的发送还在飞）——本轮不得重复入队，
             // 且必须原样保留认领字段，否则后继轮次会当成「无主认领」重复发送。
             state[channel] = {
-              consecutiveFailures: failures,
+              consecutiveFailures: failCount,
               lastFailureAt: this._safeCounter(entry.lastFailureAt),
               lastAlertAt: this._safeCounter(entry.lastAlertAt),
               lastRecoveredAt: this._safeCounter(entry.lastRecoveredAt),
@@ -1059,14 +1099,14 @@ function createApp ({
               recoverAlertClaim: entry.recoverAlertClaim,
               recoverAlertClaimAt: this._safeCounter(entry.recoverAlertClaimAt)
             }
-          } else if (failures >= threshold || recoverPending) {
+          } else if (failCount >= threshold || recoverPending) {
             // APP2-02：恢复告警只能在「确认送达」后清零计数——此处先保留失败计数与
             // recoverAlertPending（发送成功后再于告警循环里清零落盘）。原实现发送前即清零点外写盘，
             // 恢复通知一旦发送失败就永久丢失（后续轮次因计数已清零不再触发恢复告警）。
             // FX3：入队的同时在锁内原子认领（令牌+租约），堵住「保持 pending → 释放锁 → 锁外发送」
             // 期间第二个重叠运行看到同一 pending 而各发一条的重复通知竞态；陈旧认领超租约后可接管。
             state[channel] = {
-              consecutiveFailures: failures,
+              consecutiveFailures: failCount,
               lastFailureAt: this._safeCounter(entry.lastFailureAt),
               lastAlertAt: this._safeCounter(entry.lastAlertAt),
               lastRecoveredAt: now,
@@ -1116,6 +1156,67 @@ function createApp ({
       }
     },
 
+    // C1-018 阶段边界：③b「规则变更 ⇒ 失效过滤写入缓存」独立成方法，run() 里以单条调用表达
+    // 「必须在读取缓存做判重之前」。这三条阶段间顺序不变式（_f 清理先于读缓存、toCache 晚于
+    // pushedKeys、通道健康更新晚于 saveBatch）此前只写在注释里，挪行没有任何测试会红。
+    // 覆盖文件损坏（active.degraded）时**整段跳过**：降级不能放宽规则，也就不能触发「之前被过滤的
+    // 条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
+    _invalidateFilteredCache ({ active, cacheName, filterHash, dryRun }) {
+      // C1-021：dry-run 是**诊断**形态，不得改写任何影响后续运行的判重/过滤状态（缓存里的 _f、
+      // 判重缓存本身、filter.hash；run.log、过滤诊断、生效快照等留痕文件仍照写）。旧实现照常清 _f、
+      // 写回缓存并推进 filter.hash —— 跑一次 --dry-run 就把「规则变更」这个一次性事件消费掉：缓存里的 _f
+      // 已被清（这些条目原本要靠它重新评估），hash 也已对齐，之后真跑不再重评、不再补推。这里整体
+      // 跳过。代价如实登记：dry-run 的预览不再含「因规则变更才被清 _f」的条目，会比真跑少报几条 ——
+      // 诊断只读语义优先，宁可少报也不改缓存/hash。
+      if (dryRun === true || !active || active.degraded) return
+      const hashPath = path.join(this._cacheDir(), 'filter.hash')
+      let lastFile = ''
+      let lastHash = ''
+      let filterStateReady = true
+      const hashResult = this._readSafeState(hashPath)
+      if (hashResult.status === 'ok') {
+      // v3.262 P2：filter.hash 记录「上次清理的缓存文件名 + 规则哈希」两行。
+      // 切 pushUrl 后旧缓存文件的 _f 条目也能被重新评估——此前全局 hash 被别的源
+      // 推进后，旧文件 _f 永久失效（改宽规则静默漏推）。兼容旧格式（单行纯 hash）：
+      // 文件名段视为与当前不符，触发一次安全重评（宁可多推）。
+        const parts = (hashResult.text || '').trim().split('\n')
+        lastFile = (parts[0] || '').trim()
+        lastHash = (parts[1] || '').trim()
+      } else if (hashResult.status !== 'missing') {
+      // ioError/unsafe/tooLarge：读不到已存 hash。若当"无 hash"处理会静默跳过规则
+      // 变更检测且立即覆写 hash；保守视为未就绪，本次不检测也不推进 hash，下次重试。
+        console.error(`过滤规则 hash 读取失败(${hashResult.status})，跳过本次规则变更检测 ${hashPath}`)
+        filterStateReady = false
+      }
+      // 规则哈希变化（正常失效）或「上次清理的文件 ≠ 当前缓存文件」（切源后回到本文件也重评）
+      const hashKnown = hashResult.status === 'ok' && lastFile !== '' && lastHash !== ''
+      if (!hashKnown || lastHash !== filterHash || lastFile !== cacheName) {
+        const fp = MessageStore.getFilePath(cacheName)
+        const msgs = MessageStore.readMessages(fp)
+        const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true))
+        if (kept.length !== msgs.length) {
+          filterStateReady = MessageStore.saveMessages(fp, kept)
+          if (filterStateReady) {
+            console.warn(`⚠️ 检测到过滤规则/只看它变更或缓存文件切换（${(lastHash || lastFile || '?').slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`)
+          } else {
+            console.warn('⚠️ 过滤缓存失效写入失败，本次不更新 filter.hash，下次运行将继续重试规则变更处理')
+          }
+        }
+      }
+      // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
+      // P2（审查 2026-08-15）：缓存读失败时 readMessages 返回 [] 且置 _readFailed，kept.length===msgs.length
+      // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
+      // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
+      if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
+      // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
+      // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
+      // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
+        if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
+          console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
+          this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
+        }
+      }
+    },
     async run () {
       const runStart = Date.now()
       const detailedProfile = process.env.XBK_PROFILE === '2' || PROFILE3
@@ -1338,57 +1439,10 @@ function createApp ({
         // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
         // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
         // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
-        // 覆盖文件损坏（active.degraded）时**整段跳过**：不清 _f、不推进 filter.hash——
-        // 降级不能放宽规则，也就不能触发「之前被过滤的条目重新评估」，否则一次文件损坏就会补推一堆历史条目。
-        if (!active.degraded) {
-          const hashPath = path.join(this._cacheDir(), 'filter.hash')
-          let lastFile = ''
-          let lastHash = ''
-          let filterStateReady = true
-          const hashResult = this._readSafeState(hashPath)
-          if (hashResult.status === 'ok') {
-          // v3.262 P2：filter.hash 记录「上次清理的缓存文件名 + 规则哈希」两行。
-          // 切 pushUrl 后旧缓存文件的 _f 条目也能被重新评估——此前全局 hash 被别的源
-          // 推进后，旧文件 _f 永久失效（改宽规则静默漏推）。兼容旧格式（单行纯 hash）：
-          // 文件名段视为与当前不符，触发一次安全重评（宁可多推）。
-            const parts = (hashResult.text || '').trim().split('\n')
-            lastFile = (parts[0] || '').trim()
-            lastHash = (parts[1] || '').trim()
-          } else if (hashResult.status !== 'missing') {
-          // ioError/unsafe/tooLarge：读不到已存 hash。若当"无 hash"处理会静默跳过规则
-          // 变更检测且立即覆写 hash；保守视为未就绪，本次不检测也不推进 hash，下次重试。
-            console.error(`过滤规则 hash 读取失败(${hashResult.status})，跳过本次规则变更检测 ${hashPath}`)
-            filterStateReady = false
-          }
-          // 规则哈希变化（正常失效）或「上次清理的文件 ≠ 当前缓存文件」（切源后回到本文件也重评）
-          const hashKnown = hashResult.status === 'ok' && lastFile !== '' && lastHash !== ''
-          if (!hashKnown || lastHash !== filterHash || lastFile !== cacheName) {
-            const fp = MessageStore.getFilePath(cacheName)
-            const msgs = MessageStore.readMessages(fp)
-            const kept = msgs.filter(m => !(m && typeof m === 'object' && m._f === true))
-            if (kept.length !== msgs.length) {
-              filterStateReady = MessageStore.saveMessages(fp, kept)
-              if (filterStateReady) {
-                console.warn(`⚠️ 检测到过滤规则/只看它变更或缓存文件切换（${(lastHash || lastFile || '?').slice(0, 8)} → ${filterHash.slice(0, 8)}），已清除 ${msgs.length - kept.length} 条「过滤写入」缓存——之前被过滤的条目将重新评估（改宽后即重新推送）`)
-              } else {
-                console.warn('⚠️ 过滤缓存失效写入失败，本次不更新 filter.hash，下次运行将继续重试规则变更处理')
-              }
-            }
-          }
-          // 只有过滤缓存清理成功后才推进 hash；否则下次运行必须继续重试，避免旧 _f 永久失效。
-          // P2（审查 2026-08-15）：缓存读失败时 readMessages 返回 [] 且置 _readFailed，kept.length===msgs.length
-          // （0===0）不会进清理分支，filterStateReady 保持 true 曾导致 hash 照常覆写——缓存修复后规则变更
-          // 检测永不再次触发（改宽过滤规则后旧条目永远不再重新评估/推送）。与 hash 读失败同口径：不推进，下轮重试。
-          if (filterStateReady && !MessageStore._readFailed[MessageStore.getFilePath(cacheName)]) {
-          // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
-          // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
-          // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
-            if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
-              console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
-              this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
-            }
-          }
-        }
+        // ③b 规则变更 ⇒ 失效「过滤写入」缓存（覆盖文件损坏时的跳过判据在方法内）。**顺序不变式**：
+        // 必须先于下方 MessageStore.readMessages(cacheFilePath) 建判重索引——否则被清掉 _f 的条目
+        // 已经进了 cacheIds/墓碑索引，本轮仍被判重跳过，改宽规则后静默漏推（回归用例 ORD-1 锁住这条）。
+        this._invalidateFilteredCache({ active, cacheName, filterHash, dryRun })
         const newMessages = []
         // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
         // 接口异常返回海量数据（maxPerRun 想防的同一场景）时判重卡死——实测 N=2万/M=1万 → 11.6s，
@@ -1448,6 +1502,15 @@ function createApp ({
         const batchAnonKeys = new Set()
 
         const filterDiagnostics = []
+        // C1-029：明细预算（maxDetailsPerRun）是先到先得 —— 谁先被评估谁先占坑。旧实现被挤掉的
+        // 明细**不留痕**：detailCount 恰好等于预算，文件里看起来「全记下了」，运维修过滤规则时
+        // 会以为「屏蔽项只有这几条」。这里按 decision 分类记被挤掉的条数，随 run 记录落盘。
+        const diagnosticDrops = { passed: 0, filtered: 0 }
+        // C1-029 返工：⑤「只看它」（zkt_gjc）会在④「通过项」之后再把条目拒掉。一条明细若在④已因
+        // 预算被记进 detailsDropped.passed，到⑤又被拒，就该按**最终决策**改记到 filtered——两个计数器
+        // 各记一次会把「被挤掉条数」算成条目数的两倍（3 条数据能报出 1 条明细 + 4 条被挤掉）。
+        // 这里登记「已按 passed 记过被挤掉」的条目，⑤ 拒掉时改记（passed-- / filtered++）。
+        const passedDropItems = new Set()
         const filterReasonCounts = {}
         const filterExplanations = new Map()
         const filterLogCfg = Config.diagnostics && Config.diagnostics.filterLog
@@ -1510,8 +1573,9 @@ function createApp ({
           filterExplanations.set(item, explanation)
           if (explanation.passed) {
             items.push(item)
-            if ((explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) && filterDiagnostics.length < maxDiagnosticDetails) {
-              filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
+            if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
+              if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
+              else { diagnosticDrops.passed++; passedDropItems.add(item) } // ⑤ 若随后拒掉，按最终决策改记 filtered
             }
           } else {
             filteredCount++
@@ -1519,6 +1583,7 @@ function createApp ({
             const reasonKey = `${explanation.reason.stage}.${explanation.reason.kind}.${explanation.reason.configKey}`
             filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
             if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'filtered', explanation))
+            else diagnosticDrops.filtered++
           }
           newMessages.push(item)
         }
@@ -1583,6 +1648,11 @@ function createApp ({
                       protections: explanation.protections,
                       skipped: explanation.skipped
                     }))
+                  } else {
+                    // C1-029：该条若在④已按「通过项被挤掉」记过，这里改记 filtered——最终决策是被
+                    // 「只看它」拒掉，两个计数器各记一次会把被挤掉条数算成条目数的两倍。
+                    if (passedDropItems.delete(it)) diagnosticDrops.passed--
+                    diagnosticDrops.filtered++
                   }
                 }
               }
@@ -1602,7 +1672,10 @@ function createApp ({
             passed: items.length,
             // 不能从受 maxDetailsPerRun 截断的明细反算，否则汇总会少计。
             byReason: filterReasonCounts,
-            detailCount: filterDiagnostics.length
+            detailCount: filterDiagnostics.length,
+            // C1-029：本轮明细预算与「被预算挤掉」的分类条数——被截断必须能从文件里看出来。
+            detailsBudget: maxDiagnosticDetails,
+            detailsDropped: diagnosticDrops
           },
           ...filterDiagnostics
         ])

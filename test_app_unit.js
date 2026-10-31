@@ -403,6 +403,9 @@ const LIMIT = 1024 * 1024
 
 function makeLogFs (over = {}) {
   const rec = { append: [], open: [], write: [], read: [], close: [], unlink: [], stat: [] }
+  // C1-020：锁文件的真实内容（writeSync 写进去的 pid:start 令牌）。释放路径要靠读回它来证明
+  // 「锁仍是本进程的」——桩不模拟这一点，令牌校验就永远不会被这些既有用例执行到。
+  let lockText = ''
   const stub = {
     existsSync: () => true,
     openSync (p, flag) {
@@ -410,7 +413,11 @@ function makeLogFs (over = {}) {
       if (over.openSync) return over.openSync(p, flag)
       return flag === 'r+' ? 8 : 7
     },
-    writeSync (fd, data) { rec.write.push([fd, String(data)]) },
+    writeSync (fd, data) { rec.write.push([fd, String(data)]); lockText = String(data) },
+    readFileSync (p) {
+      if (over.readFileSync) return over.readFileSync(p)
+      return lockText
+    },
     appendFileSync (p, data, enc) {
       if (over.appendThrows) throw new Error('append 失败')
       rec.append.push([p, String(data), enc])
@@ -562,6 +569,18 @@ check('_writeRunLog 合法基名保留：filter-diagnostics.ndjson', () => {
   const { app } = makeLogApp({ rec })
   app._writeRunLog('l\n', 'filter-diagnostics.ndjson')
   assert.deepStrictEqual(rec.rec.append, [[path.join(CACHE_DIR, 'filter-diagnostics.ndjson'), 'l\n', 'utf8']])
+})
+
+check('C1-028 _writeRunLog 只认白名单日志名：push.json 不得被当成日志追加（判重缓存会变坏 JSON）', () => {
+  const rec = makeLogFs()
+  const seen = []
+  const { app } = makeLogApp({ rec, isRegularOrMissing: (p) => { seen.push(p); return true } })
+  const r = withCapture('error', () => app._writeRunLog('{"x":1}\n', 'push.json'))
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, '{"x":1}\n', 'utf8']],
+    '越界基名必须回退 run.log——追加进 push.json 会让判重缓存读侧判坏、原件被隔离、全量重推')
+  assert.deepStrictEqual(seen, [LOG_PATH], '落盘目标只能是白名单里的日志文件')
+  assert.ok(r.msgs.some((m) => m.includes('拒绝写入非白名单日志文件 push.json')),
+    `越界必须点名告警（否则日志行凭空换位置）：${JSON.stringify(r.msgs)}`)
 })
 
 // ----- _writeRunLog：锁语义 / 清理 / 失败静默 -----
@@ -3103,6 +3122,47 @@ checkAsync('DR-1 dry-run：预览短路不调 Pusher、toCache 为空、跳过�
   }
 })
 
+checkAsync('C1-021 dry-run 不得清 _f / 写回缓存 / 推进 filter.hash（否则一次诊断就消费掉「规则变更」）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const hashPath = path.join(cacheDir, 'filter.hash')
+    const cachePath = path.join(cacheDir, h.cacheName())
+    const prevDryRun = process.env.XBK_DRY_RUN
+    try {
+      // ① 真跑：规则「甲」拦下条目 ⇒ 缓存留下 _f，filter.hash 落盘（后续两步的对照基线）
+      h.Config.filter.pingbibiaoti = '甲'
+      h.setItems([makeRunItem('dry-1', '甲条'), makeRunItem('dry-1b', '正常条')])
+      await runWithWarnings(h.App)
+      const cacheAfterReal = realFs.readFileSync(cachePath, 'utf8')
+      const hashAfterReal = realFs.readFileSync(hashPath, 'utf8')
+      assert.ok(JSON.parse(cacheAfterReal).some((m) => m._f === true), '前置：被拦下的条目应带 _f 落缓存')
+      assert.ok(hashAfterReal.length > 0, '前置：真跑必须写出 filter.hash')
+
+      // ② 改规则后 dry-run：判重缓存与 filter.hash 都必须一字不动
+      h.Config.filter.pingbibiaoti = '乙'
+      h.setItems([makeRunItem('dry-2', '乙条')])
+      process.env.XBK_DRY_RUN = '1'
+      await runWithWarnings(h.App)
+      assert.strictEqual(realFs.readFileSync(cachePath, 'utf8'), cacheAfterReal,
+        'dry-run 不得改写判重缓存——清 _f 也是一次改写：被清掉的条目本应在真跑里重新评估/补推')
+      assert.strictEqual(realFs.readFileSync(hashPath, 'utf8'), hashAfterReal,
+        'dry-run 不得推进 filter.hash——推进即「规则变更」事件被消费，真跑不再重评')
+
+      // ③ 同一份新规则真跑：必须真的把「规则变更失效」的旧 _f 条目移出缓存、推进 hash
+      //    （证明 ② 的「没变」来自 dryRun 判据，而不是「本来就无事发生」）
+      delete process.env.XBK_DRY_RUN
+      h.setItems([makeRunItem('dry-3', '乙条三')])
+      await runWithWarnings(h.App)
+      const idsAfterSecondReal = JSON.parse(realFs.readFileSync(cachePath, 'utf8')).map((m) => m.id)
+      assert.strictEqual(idsAfterSecondReal.includes('dry-1'), false,
+        `真跑必须把旧 _f 条目移出缓存（否则改宽规则后永不重评）：${JSON.stringify(idsAfterSecondReal)}`)
+      assert.notStrictEqual(realFs.readFileSync(hashPath, 'utf8'), hashAfterReal, '真跑必须推进 filter.hash')
+    } finally {
+      if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+      else process.env.XBK_DRY_RUN = prevDryRun
+    }
+  })
+})
+
 checkAsync('TR-1 maxPerRun 截断：被截断条目不得写入缓存（下轮补推不丢不重），摘要 truncated 如实计数', async () => {
   const realFs = require('fs')
   const cacheDir = mkTmpFixture('trunc-')
@@ -3166,6 +3226,118 @@ checkAsync('TR-2 待推送数恰好等于 maxPerRun：不得判为截断（严�
     if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
     else process.env.XBK_DRY_RUN = prevDryRun
   }
+})
+
+// ===== C1-029：明细预算被挤掉的条数必须随 run 记录落盘 =====
+// 审计条目：100 条预算先到先得，通过项与屏蔽项共用一个坑位，被挤掉的整批屏蔽项在文件里没有任何痕迹
+// （detailCount 恰好等于预算，看起来「全记下了」）。修法取审计给的第二个选项：run 记录补
+// detailsBudget / detailsDropped{passed,filtered}——不改「每轮最多 N 条」的既定配置语义与文件体积上限。
+checkAsync('C1-029 明细被预算挤掉必须留痕：detailsDropped 分类计数 + detailsBudget 回显', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const logPath = path.join(cacheDir, 'filter-diagnostics.ndjson')
+    const lastRunRecord = () => {
+      const text = realFs.existsSync(logPath) ? realFs.readFileSync(logPath, 'utf8').trim() : ''
+      if (!text) return null
+      const runs = text.split('\n').map((line) => JSON.parse(line)).filter((r) => r.type === 'run')
+      return runs[runs.length - 1] || null
+    }
+    // ① 预算 1 + 三条全被规则拦下 ⇒ 只落 1 条明细，另 2 条必须计入 detailsDropped.filtered
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 1, includePassed: false }
+    h.Config.filter.pingbibiaoti = '预算'
+    h.setItems([makeRunItem('bd-1', '预算甲'), makeRunItem('bd-2', '预算乙'), makeRunItem('bd-3', '预算丙')])
+    const r1 = await runWithWarnings(h.App)
+    assert.strictEqual(r1.summary.filtered, 3, `前置：三条都应被规则拦下：${JSON.stringify(r1.summary)}`)
+    const run1 = lastRunRecord()
+    assert.ok(run1, '必须写出 run 汇总记录')
+    assert.strictEqual(run1.detailCount, 1, '明细条数不得超过预算')
+    assert.strictEqual(run1.detailsBudget, 1, `run 记录必须回显本轮预算（否则 1 条明细会被读成全量）：${JSON.stringify(run1)}`)
+    assert.deepStrictEqual(run1.detailsDropped, { passed: 0, filtered: 2 },
+      `被预算挤掉的屏蔽项必须如实计数：${JSON.stringify(run1)}`)
+
+    // ② 预算放大 ⇒ 换新条目跑同样三条，detailsDropped 必须归零（证明 ① 的 2 来自预算而非固定值）
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 100, includePassed: false }
+    h.setItems([makeRunItem('bd-4', '预算丁'), makeRunItem('bd-5', '预算戊'), makeRunItem('bd-6', '预算己')])
+    await runWithWarnings(h.App)
+    const run2 = lastRunRecord()
+    assert.strictEqual(run2.detailCount, 3, `预算充足时三条明细都应落盘：${JSON.stringify(run2)}`)
+    assert.deepStrictEqual(run2.detailsDropped, { passed: 0, filtered: 0 }, '预算充足时不得报被截断')
+
+    // ③ includePassed=true + 预算 1：通过项也占坑，被挤掉的通过项单独计数（不得混进 filtered）
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 1, includePassed: true }
+    h.Config.filter.pingbibiaoti = ''
+    h.setItems([makeRunItem('bd-7', '通过甲'), makeRunItem('bd-8', '通过乙')])
+    await runWithWarnings(h.App)
+    const run3 = lastRunRecord()
+    assert.strictEqual(run3.detailCount, 1, `预算 1 时明细只能有 1 条：${JSON.stringify(run3)}`)
+    assert.deepStrictEqual(run3.detailsDropped, { passed: 1, filtered: 0 },
+      `通过项被预算挤掉必须单独计数：${JSON.stringify(run3)}`)
+
+    // ④ ⑤「只看它」（zkt_gjc）分支的被挤掉计数：includePassed=true + 预算 1，首条通过项先占满预算，
+    //    随后两条在该分支被白名单拒 ⇒ 明细只留那 1 条，另 2 条必须计入 detailsDropped.filtered。
+    //    这条分支的 else 计数（xbk_app.js ⑤ 段）此前无任何用例覆盖：删掉它 ①/③ 仍全绿，
+    //    因为 ① 走的是 ④ 规则过滤分支、③ 走的是通过项分支。
+    h.Config.diagnostics.filterLog = { enabled: true, maxDetailsPerRun: 1, includePassed: true }
+    h.Config.filter.pingbibiaoti = ''
+    h.Config.keyword.zkt_gjc = '白名单'
+    h.setItems([makeRunItem('bd-9', '白名单甲'), makeRunItem('bd-10', '别的内容一'), makeRunItem('bd-11', '别的内容二')])
+    const r4 = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ total: r4.summary.total, filtered: r4.summary.filtered },
+      { total: 3, filtered: 2 },
+      `前置：只看它过滤应拒 2 留 1：${JSON.stringify(r4.summary)}`)
+    const run4 = lastRunRecord()
+    assert.strictEqual(run4.passed, 1, `前置：只看它过滤后应剩 1 条通过项：${JSON.stringify(run4)}`)
+    assert.strictEqual(run4.detailCount, 1, `预算 1 时明细只能有 1 条：${JSON.stringify(run4)}`)
+    assert.deepStrictEqual(run4.detailsDropped, { passed: 0, filtered: 2 },
+      `只看它分支被预算挤掉的屏蔽项必须如实计数（落进 passed 也算错）：${JSON.stringify(run4)}`)
+    // 被挤掉条数必须是「没写进明细的决策」的一个划分：同一条在④按通过记、到⑤被拒又按屏蔽记，
+    // 会报出 4 条被挤掉（实际只有 2 条）——本夹具（预算 1；⑤ 拒掉的两条在④已被预算挤掉、只走
+    // passed--/filtered++ 改记）用总数守恒把这种重复计数锁住。
+    // 注意：这不是普适恒等式（CHANGELOG v3.388 已如实登记）。④ 已记过 passed 明细的条目若被⑤拒掉，
+    // 同一条目会留下两条记录——预算还有余位 ⇒ passed + filtered 两条明细；预算此时已满 ⇒ 一条明细
+    // 再加一条 filtered 被挤掉。两种都会让 detailCount + 被挤掉比参与决策的条数多 1；改⑤属于另一件事，
+    // 故本断言只锁「预算已满、走改记」这条实际覆盖的路径，断言值（3 = 本夹具参与的 3 条）也不外推。
+    assert.strictEqual(run4.detailCount + run4.detailsDropped.passed + run4.detailsDropped.filtered, 3,
+      `本夹具（预算已满、走⑤改记分支）：明细 + 被挤掉必须等于 3 条参与决策，不得重复计数：${JSON.stringify(run4)}`)
+  })
+})
+
+// ===== C1-018：三条阶段间顺序不变式必须有执行物（不再只写在注释里） =====
+// 审计条目的根因是「挪行没有测试会红」：这里给两条可观察的顺序不变式补回归 ——
+// ORD-1 `_f` 失效先于读缓存（⑤ 判重）、ORD-2 通道健康更新晚于缓存落盘（⑦ saveBatch 之后）。
+// 第三条「toCache 晚于 pushedKeys」已由 RUN-1（推送失败不写缓存）与 TR-1（截断不写缓存）锁住。
+checkAsync('ORD-1 阶段顺序：_f 失效必须先于读缓存判重（否则改宽规则后仍被判重跳过、静默漏推）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const cachePath = path.join(cacheDir, h.cacheName())
+    // 预置：缓存里有一条被规则拦下过的记录（_f），且没有 filter.hash ⇒ 本轮必须走「规则变更清理」
+    realFs.writeFileSync(cachePath, JSON.stringify([Object.assign(makeRunItem('ord-1', '顺序甲'), { _f: true })]), { mode: 0o600 })
+    h.setItems([makeRunItem('ord-1', '顺序甲')])
+    const r = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ dedup: r.summary.dedup, pushed: r.summary.pushed }, { dedup: 0, pushed: 1 },
+      `_f 条目必须先移出缓存再建判重索引：顺序反了本轮会判重跳过、永不重推（${JSON.stringify(r.summary)}）`)
+    const onDisk = JSON.parse(realFs.readFileSync(cachePath, 'utf8'))
+    assert.deepStrictEqual(onDisk.map(m => m.id), ['ord-1'], '清理后重新推送的条目必须重新落进缓存')
+    assert.strictEqual(onDisk[0]._f, undefined, '推送成功后 _f 必须消失（否则下次规则变更又被清一次）')
+  })
+})
+
+checkAsync('ORD-2 阶段顺序：通道健康更新必须在缓存落盘之后（顺序反了会拿空缓存做健康台账）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const cachePath = path.join(cacheDir, h.cacheName())
+    const observed = []
+    const realUpdate = h.App._updateChannelHealth
+    // 只观察调用时刻的磁盘缓存内容；健康状态写入本身走原实现（channelHealth 夹具默认关闭）
+    h.App._updateChannelHealth = async (outcome) => {
+      observed.push(realFs.existsSync(cachePath)
+        ? JSON.parse(realFs.readFileSync(cachePath, 'utf8')).map((m) => m && m.id)
+        : [])
+      return realUpdate.call(h.App, outcome)
+    }
+    h.setItems([makeRunItem('ord-2', '顺序乙')])
+    const r = await runWithWarnings(h.App)
+    assert.strictEqual(r.summary.pushed, 1, `前置：应推送 1 条：${JSON.stringify(r.summary)}`)
+    assert.deepStrictEqual(observed, [['ord-2']],
+      `_updateChannelHealth 被调用时缓存必须已含本轮推送成功的条目，实际读到：${JSON.stringify(observed)}`)
+  })
 })
 
 // 共享夹具：临时 cacheDir + 真装配 harness + 环境变量还原（异常路径也还原，避免污染后续用例）
@@ -3659,6 +3831,24 @@ check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回
   assert.ok(/const acquireLockWithRetry = \(lockPath\) =>/.test(code), '重试口径必须来自同一个获取函数')
 })
 
+// ===== C1-025：_updateChannelHealth 里两种「failures」不再同名互相遮蔽 =====
+// 审计条目：外层是失败对象数组（outcome.failures），内层是按通道累计的连续失败次数，相隔十余行
+// 却同名——读代码时容易把数组当计数（或反之）。这里锁住两个名字：回退重命名后内层断言立刻变红。
+check('C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const body = code.slice(code.indexOf('async _updateChannelHealth'))
+  assert.ok(/const failureList = Array\.isArray\(outcome && outcome\.failures\)/.test(body),
+    '外层失败对象数组必须命名为 failureList（不得与次数同名）')
+  assert.ok(/const failCount = this\._safeCounter\(entry\.consecutiveFailures\)/.test(body),
+    '内层连续失败次数必须命名为 failCount')
+  assert.strictEqual(/const failures = this\._safeCounter\(entry\.consecutiveFailures\)/.test(body), false,
+    '内层不得再用 failures 遮蔽外层的失败对象数组')
+  assert.strictEqual(/consecutiveFailures: failures\b/.test(body), false,
+    '计数落盘不得再引用被遮蔽的 failures')
+})
+
 checkAsync('C1-013 收敛后语义不变：通道健康锁仍单次尝试（EACCES 立即 -1 且带 errno 原因）', async () => {
   const mfs = makeMemFs()
   mfs.openSync = () => { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e }
@@ -3831,6 +4021,50 @@ check('C1-010 探针不计「原文链接」尾巴：正文略短于 contentMax 
   }
   assert.ok(!brokenLink(fullDesp), '前置条件：全量转换的推送正文不含坏链接')
   assert.ok(!brokenLink(despOf(bounded)), '不得把被截断的「原文链接：[https://…」推进正文')
+})
+
+// ----- C1-020 回归：锁释放必须先证明「锁里还是我的令牌」，绝不按路径无条件删除 -----
+// 旧实现 close + unlinkSync(lockPath) 不看内容：我方令牌为空（写盘失败）时会被别的进程判成
+// 陈旧锁并接管（unlink + 重建），而我方的迟到释放会把**接管者/第三方**手里的锁删掉 ⇒ 互斥失效。
+// 三处锁（run.log / re2warn / channel-health）统一走 releaseLock，这里逐处钉住。
+check('C1-020 run.log 锁：锁已被接管（内容不再是本进程令牌）⇒ 只关 fd、不 unlink', () => {
+  const rec = makeLogFs({ readFileSync: () => '999999:1' })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('x\n')
+  assert.deepStrictEqual(rec.rec.close, [7], '锁 fd 仍必须关闭（否则泄漏 fd）')
+  assert.deepStrictEqual(rec.rec.unlink, [],
+    '锁已不属于本进程时不得删除——删了接管者就会与本进程同时进临界区')
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']], '日志本身仍必须写进去')
+})
+
+check('C1-020 run.log 锁：读锁失败（ENOENT/io）⇒ 不删归属不明的锁，也不抛', () => {
+  const e = new Error('gone'); e.code = 'ENOENT'
+  const rec = makeLogFs({ readFileSync: () => { throw e } })
+  const { app } = makeLogApp({ rec })
+  assert.strictEqual(app._writeRunLog('x\n'), undefined)
+  assert.deepStrictEqual(rec.rec.unlink, [], '读不到内容就无法证明归属，只能不删（残留由 stale 回收）')
+  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']])
+})
+
+check('C1-020 通道健康锁：锁文件已被接管 ⇒ 保留别人的锁文件', () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs })
+  const fd = app._tryAcquireChannelHealthLock(healthPath + '.lock')
+  assert.ok(fd >= 0, '前置：无竞争时必须取到锁')
+  mfs.writeFileSync(healthPath + '.lock', '999999:other') // 别人接管后的令牌
+  app._releaseChannelHealthLock(healthPath + '.lock', fd)
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), true, '锁归别人时必须保留（否则互斥失效）')
+})
+
+check('C1-020 RE2 标记锁：锁文件已被接管 ⇒ 保留别人的锁文件', () => {
+  const mfs = makeMemFs()
+  const app = makeRe2WarnApp({ fs: mfs, cacheDir: dir })
+  const acquired = app._acquireRe2WarnLock(statePath)
+  assert.ok(acquired, '前置：无锁时应获取成功')
+  mfs.writeFileSync(statePath + '.lock', '999999:other')
+  app._releaseRe2WarnLock(statePath, acquired)
+  assert.strictEqual(mfs._files.has(statePath + '.lock'), true, '锁归别人时必须保留（否则互斥失效）')
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====
