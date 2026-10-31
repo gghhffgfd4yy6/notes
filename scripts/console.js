@@ -117,6 +117,15 @@ const BACKUP_CATEGORIES = ['messages', 'filter', 'settings', 'auto', 'runLog']
 // 「当前条数不可得」），需要精确条数时去推送记录页看 grandTotal。阈值内的文件走
 // readMessages 的 (ino,size,mtime) 缓存，重复请求不再 parse。
 const CACHE_HEALTH_COUNT_MAX_BYTES = 8 * 1024 * 1024
+// 运行记录保留条数（C2-028）：runs 是进程内存表，只留最近 N 轮给 /api/runs 与取消端点。
+const RUNS_KEEP_MAX = 20
+// 请求体上限（C2-028）：按端点语义集中命名，不再在各处散落行内字面量。
+// 默认 4096 = JSON 写端点（关注词 / 2FA / 自动运行 / 控制台设置 / 通知自检）的公共上限；
+// 登录表单 2048 = token + 6 位验证码，更大的 body 一定不是本表单；
+// 备份导出 16KiB = 只带一个 categories 数组。
+const BODY_DEFAULT_MAX_BYTES = 4096
+const BODY_LOGIN_FORM_MAX_BYTES = 2048
+const BODY_BACKUP_EXPORT_MAX_BYTES = 16 * 1024
 // 日志查看（GET /api/logs）取尾部：日志消费方只关心最近的记录，与 scripts/status.js 的
 // LOG_READ_OPTIONS.tail 同一口径（超限读尾 1MiB，不全拒）。
 const LOG_VIEW_MAX_BYTES = 1024 * 1024
@@ -570,9 +579,9 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     _lockToken: lockToken
   }
   runs.set(id, record)
-  if (runs.size > 20) {
-    // 只保留最近 20 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
-    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - 20)
+  if (runs.size > RUNS_KEEP_MAX) {
+    // 只保留最近 RUNS_KEEP_MAX 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
+    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - RUNS_KEEP_MAX)
     for (const k of oldest) runs.delete(k)
   }
   // 环境继承：剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，
@@ -1807,7 +1816,7 @@ const BODY_DRAIN_TIMEOUT_MS = 10 * 1000
 // 还**漏了对象校验**（`[]`/`"x"`/`null` 会被当成空 payload 继续往下走，错误形态变成
 // 「验证码不对」而不是「body 必须是对象」）。收成一份：返回 { ok:true, payload } 或
 // { ok:false, status, body }，调用方只负责发包。
-function readJsonObjectBody (req, maxBytes = 4096) {
+function readJsonObjectBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
   return readBody(req, maxBytes).then(({ body, aborted, over }) => {
     if (aborted) return { ok: false, status: 400, body: { error: '请求中断，动作未执行' } }
     if (over) return { ok: false, status: 413, body: { error: '请求体超限' } }
@@ -1823,7 +1832,7 @@ function readJsonObjectBody (req, maxBytes = 4096) {
     return { ok: true, payload }
   })
 }
-function readBody (req, maxBytes = 4096) {
+function readBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
     let buf = ''
@@ -4230,7 +4239,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
   const handleBackupExport = (req, res) => {
-    readBody(req, 16 * 1024).then(({ body, over, aborted }) => {
+    readBody(req, BODY_BACKUP_EXPORT_MAX_BYTES).then(({ body, over, aborted }) => {
       if (over || aborted) { sendJson(res, over ? 413 : 400, { error: '请求体不完整或超限' }); return }
       let selected = BACKUP_CATEGORIES.slice()
       if (body && body.trim() !== '') {
@@ -5525,7 +5534,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 地址栏与浏览器历史、Referer 与中间代理日志；POST 校验成功后 303 到干净 `/`，
     // 只下发 HttpOnly Cookie。直接打开 `?token=` 的分享链接仍兼容（见下方 authorize）。
     if (req.method === 'POST' && url.pathname === '/login') {
-      readBody(req, 2048).then(({ body, aborted, over }) => {
+      readBody(req, BODY_LOGIN_FORM_MAX_BYTES).then(({ body, aborted, over }) => {
         if (aborted || over) {
           sendJson(res, over ? 413 : 400, { error: over ? '登录请求过大' : '登录请求不完整' })
           return
@@ -6154,7 +6163,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readJsonObjectBody(req, 4096).then((read) => {
+      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
         if (!read.ok) { sendJson(res, read.status, read.body); return }
         const payload = read.payload
         const code = typeof payload.code === 'string' ? payload.code.trim() : ''
@@ -6219,7 +6228,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readJsonObjectBody(req, 4096).then((read) => {
+      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
         if (!read.ok) { sendJson(res, read.status, read.body); return }
         const payload = read.payload
         const code = typeof payload.code === 'string' ? payload.code.trim() : ''
