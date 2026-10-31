@@ -1600,7 +1600,7 @@ check('PKG_VERSION 回退口径：trim、有限数值、null/NaN/带 trim 的脏
   assert.ok(factoryHead, 'xbk_pusher 必须仍以 function createPusher ({ ... }) 形态声明注入面')
   assert.strictEqual(factoryHead[1].split(',').map(s => s.trim()).filter(Boolean).sort().join(','),
     out.pusherArgKeys,
-    `组合根注入的键必须与 createPusher 解构的键逐字一致（多传的键是死接线，少传会静默 undefined）`)
+    '组合根注入的键必须与 createPusher 解构的键逐字一致（多传的键是死接线，少传会静默 undefined）')
 })
 
 // Config 默认口径（README/SYSTEM_CONTRACT 配置节）：过滤默认全空、健康/日报/诊断/磁盘余量精确值
