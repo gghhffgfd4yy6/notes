@@ -389,10 +389,12 @@ function canStreamRequest (method) {
 function streamRequest (method, url, options, callback) {
   // 白名单闸门（跟进 Codacy dynamic-method-invocation，PR #154）：调用点只传字面量 method，
   // 其余一律 fail-closed，避免「用非静态数据取对象方法再调用」这种形态。
-  // 现状（v3.279 删掉 get 死代码之后）：本模块唯一的调用点传 'post'；'get' 一侧保留是为了这个
-  // 通用助手仍可用于 GET 场景（无人依赖不等于能力该被砍），但它**没有调用方**，别当成已覆盖的路径。
-  if (method !== 'post' && method !== 'get') throw new Error('streamRequest: 不支持的 method: ' + method)
-  const stream = (method === 'post' ? got.stream.post : got.stream.get)(url, options)
+  // 白名单只剩 'post'：v3.279 删掉 $.get 之后 'get' 一侧就再没有调用方（本模块唯一入口
+  // pushHttp.post 传字面量 'post'），把 'get' 留在放行名单里只是给一条零执行路径发通行证——
+  // 它不会被任何用例覆盖，却看起来像「GET 也走这条已覆盖的流式路径」。要恢复 GET 支持，
+  // 把分支、调用方和覆盖用例一起加回来，别只往白名单里塞字符串。
+  if (method !== 'post') throw new Error('streamRequest: 不支持的 method: ' + method)
+  const stream = got.stream.post(url, options)
   const chunks = []
   let response = null
   let total = 0
