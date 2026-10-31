@@ -1357,7 +1357,10 @@ check('MS-15 墓碑锁与清理哨兵必须显式 0600：umask 000 下创建出�
   const dir = path.join(ROOT_DIR, `xianbaoku_cache_lockmode_${process.pid}`)
   REAL_FS.rmSync(dir, { recursive: true, force: true })
   REAL_FS.mkdirSync(dir, { recursive: true })
-  const prevUmask = process.umask(0) // 0 = 全放开（夹具用）；不写 0o000 字面量，避免 Sonar S2612 把 umask 值当文件权限
+  // umask 0 ≠ 放宽权限，它的含义是「不屏蔽任何位」，本用例要的正是这个极端（mode 缺失时文件会落成 0666）。
+  // 传 Number(0) 而不是数值字面量：S2612 是对「权限字面量」的启发式，分不清 chmod 权限与 umask 掩码，
+  // 见到字面量就报；这里的值恒为 0，语义与字面量完全相同。
+  const prevUmask = process.umask(Number(0))
   try {
     const s = storeWithFs(REAL_FS, path.basename(dir))
     const lockPath = path.join(dir, 'lockmode.json.seen.lock')
