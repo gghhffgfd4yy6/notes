@@ -1770,6 +1770,27 @@ function parseSseCursor (raw) {
 
 // 超限后的排空上限（D2-S2）：客户端若只发一半就挂住，不能让连接无限期占着事件循环。
 const BODY_DRAIN_TIMEOUT_MS = 10 * 1000
+// C2-012：五个 JSON 写端点（关注词、2FA enable/disable、自动运行、控制台设置）此前各抄一份
+// 「readBody → aborted/over → JSON.parse(body||'{}') → 必须是对象」前言。除了重复，2FA 那两处
+// 还**漏了对象校验**（`[]`/`"x"`/`null` 会被当成空 payload 继续往下走，错误形态变成
+// 「验证码不对」而不是「body 必须是对象」）。收成一份：返回 { ok:true, payload } 或
+// { ok:false, status, body }，调用方只负责发包。
+function readJsonObjectBody (req, maxBytes = 4096) {
+  return readBody(req, maxBytes).then(({ body, aborted, over }) => {
+    if (aborted) return { ok: false, status: 400, body: { error: '请求中断，动作未执行' } }
+    if (over) return { ok: false, status: 413, body: { error: '请求体超限' } }
+    let payload
+    try {
+      payload = JSON.parse(body || '{}')
+    } catch (e) {
+      return { ok: false, status: 400, body: { error: 'invalid_json' } }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { ok: false, status: 400, body: { error: 'body 必须是对象' } }
+    }
+    return { ok: true, payload }
+  })
+}
 function readBody (req, maxBytes = 4096) {
   return new Promise((resolve) => {
     const decoder = new StringDecoder('utf8')
@@ -5251,16 +5272,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
       return
     }
-    readBody(req)
-      .then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-          sendJson(res, 400, { error: 'body 必须是对象' })
-          return
-        }
+    readJsonObjectBody(req)
+      .then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
         const action = payload.action
         let state = readWatchState(stateDir)
         if (state.status === 'invalid') {
@@ -6178,13 +6193,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readBody(req, 4096).then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
-        const setupId = payload && typeof payload.setupId === 'string' ? payload.setupId : ''
+      readJsonObjectBody(req, 4096).then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
+        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
+        const setupId = typeof payload.setupId === 'string' ? payload.setupId : ''
         if (twoFactor.enabled) {
           // 成功响应丢包时允许同一 setupId + 仍有效的验证码重取一次恢复码（短时、只存内存）。
           const receipt = lastEnableResult
@@ -6245,12 +6258,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readBody(req, 4096).then(({ body, aborted, over }) => {
-        if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-        if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-        let payload
-        try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-        const code = payload && typeof payload.code === 'string' ? payload.code.trim() : ''
+      readJsonObjectBody(req, 4096).then((read) => {
+        if (!read.ok) { sendJson(res, read.status, read.body); return }
+        const payload = read.payload
+        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
         if (!twoFactor.enabled) {
           res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
           sendJson(res, 200, { enabled: false })
@@ -6303,17 +6314,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
+      readJsonObjectBody(req)
+        .then((read) => {
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          let payload
-          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            sendJson(res, 400, { error: 'body 必须是对象' })
-            return
-          }
+          if (!read.ok) { sendJson(res, read.status, read.body); return }
+          const payload = read.payload
           let on = auto.on
           if (Object.prototype.hasOwnProperty.call(payload, 'on')) {
             if (typeof payload.on !== 'boolean') { sendJson(res, 400, { error: 'on 必须是布尔值' }); return }
@@ -6375,17 +6380,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
         return
       }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
+      readJsonObjectBody(req)
+        .then((read) => {
           if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted) { sendJson(res, 400, { error: '请求中断，动作未执行' }); return }
-          if (over) { sendJson(res, 413, { error: '请求体超限' }); return }
-          let payload
-          try { payload = JSON.parse(body || '{}') } catch (e) { sendJson(res, 400, { error: 'invalid_json' }); return }
-          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-            sendJson(res, 400, { error: 'body 必须是对象' })
-            return
-          }
+          if (!read.ok) { sendJson(res, read.status, read.body); return }
+          const payload = read.payload
           // v3.342：两字段都是可选的「部分更新」，但至少要给一个；给了就必须严格合法——
           // 字符串 '60' / 1.5 / null / 越界 / 非布尔的显示开关全部拒绝，含糊接受会让
           // 「保存成功但生效值不是用户以为的那个」变成静默事故。
