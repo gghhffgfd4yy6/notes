@@ -137,14 +137,16 @@ function runCheck (app) {
     // 「由 XBK_CACHE_DIR 覆盖，配置值 <同一值>」——同一份诊断自相矛盾，运维会以为读写在 env 目录。
     const envRaw = typeof process.env.XBK_CACHE_DIR === 'string' ? process.env.XBK_CACHE_DIR.trim() : ''
     const cacheDirNotes = []
+    // 回退判定直接取 MessageStore 的结论（C3-010 + Codacy path-join-resolve-traversal 收口）：
+    // 旧实现在这里用 `path.resolve(生效值) !== path.resolve(ROOT, 配置值)` 自己重算一遍，既重复了
+    // 模块「root + fallback」的解析口径（两侧分叉就出现「目录判断说反话」），又让配置值以路径拼接
+    // 形态出现在 CLI 里。MessageStore 求值 cacheDir 时记录本次判定，这里只读结论、不做路径运算。
+    const fallback = app.MessageStore ? app.MessageStore.cacheDirFallback : null
     if (envRaw && path.isAbsolute(envRaw)) {
       cacheDirNotes.push(`由 XBK_CACHE_DIR 覆盖，配置值 ${configured}`)
     } else {
       if (envRaw) cacheDirNotes.push(`XBK_CACHE_DIR（${envRaw}）不是绝对路径，已忽略`)
-      if (typeof configured === 'string' && configured && typeof effective === 'string' &&
-        path.resolve(effective) !== path.resolve(ROOT, configured)) {
-        cacheDirNotes.push(`配置值 ${configured} 未通过根内安全检查，已回退`)
-      }
+      if (fallback) cacheDirNotes.push(`配置值 ${fallback.raw} 未通过根内安全检查，已回退到 ${fallback.chosen}`)
     }
     add('缓存目录', true, cacheDirNotes.length ? `${effective}（${cacheDirNotes.join('；')}）` : effective)
   } catch (e) { add('缓存目录', false, e.message) }

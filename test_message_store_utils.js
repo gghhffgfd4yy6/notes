@@ -853,7 +853,7 @@ function makeBatchStore (opts = {}) {
   const fsMock = opts.fsMock || makeMemFs(opts.files)
   const storage = makeRecordingStorage(fsMock, opts)
   const store = createMessageStore({
-    Config: opts.noMaxSize ? { cache: {} } : { cache: { dir: 'xianbaoku_cache', maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
+    Config: opts.noMaxSize ? { cache: {} } : { cache: { dir: opts.configDir || 'xianbaoku_cache', maxSize: opts.maxSize === undefined ? 10000 : opts.maxSize } },
     Utils: createUtils({ fs: REAL_FS, safeRe: (p, f) => new RegExp(p, f) }),
     fs: fsMock,
     path,
@@ -905,6 +905,73 @@ check('C3-010 缓存目录回退必须 WARN（且按 raw→目标去重，不随
   assert.strictEqual(fb.length, 1, `回退只应告警一次（getter 每轮求值）：${JSON.stringify(warns)}`)
   assert.ok(fb[0].includes(rejected) && fb[0].includes(DEFAULT_DIR),
     `告警必须同时点名「被拒绝的配置」与「实际回退目录」：${fb[0]}`)
+})
+
+// ===== C3-010 续：回退判定由 MessageStore 记录，调用方只读结论（不做路径运算）=====
+// 青龙 `--check` 原先用 `path.resolve(生效值) !== path.resolve(ROOT, 配置值)` 自己重算「配置值
+// 应该解析成什么」：既重复了本模块 root+fallback 的口径（分叉就说反话），又让配置值在 CLI 里以
+// 路径拼接形态出现（Codacy path-join-resolve-traversal 把 path.resolve 当 I/O sink）。
+// 判定的唯一来源改为本模块：cacheDir 每次求值先清零，回退时才落 {raw, chosen}。
+check('cacheDirFallback 反映**本次**求值：回退给出 {raw,chosen}，未回退必须清成 null', () => {
+  const savedEnv = process.env.XBK_CACHE_DIR
+  delete process.env.XBK_CACHE_DIR // 环境变量绝对路径会跳过根内校验，本用例只测配置值分支
+  try {
+    // ① 自定义目录被普通文件占位 → 根内校验拒绝 → 回退，且记录 raw/chosen
+    const raw = 'c3010b_probe_cache'
+    const rejected = path.join(ROOT_DIR, raw)
+    const badFs = makeMemFs({})
+    badFs.files.set(rejected, 'x')
+    const bad = makeBatchStore({ fsMock: badFs, configDir: raw })
+    let resolvedDir
+    const warns = captureConsole('warn', () => { resolvedDir = bad.store.cacheDir })
+    assert.ok(warns.some(w => w.includes('缓存目录配置未生效')), `回退必须 WARN：${JSON.stringify(warns)}`)
+    assert.strictEqual(resolvedDir, path.join(ROOT_DIR, 'xianbaoku_cache'),
+      `被拒绝的配置必须回退到默认目录：${resolvedDir}`)
+    assert.deepStrictEqual(bad.store.cacheDirFallback, { raw, chosen: resolvedDir },
+      '回退时 cacheDirFallback 必须是本次判定的 {raw, chosen}')
+
+    // ② 换一个合法配置再求值：记录必须清成 null——判定是模块级状态，不清零会把上一轮的
+    //    「已回退」带进下一次 --check（「已回退」于是变成永远为真的噪声）
+    const good = makeBatchStore({ fsMock: makeMemFs({}) })
+    const legalDir = good.store.cacheDir
+    assert.strictEqual(legalDir, path.join(ROOT_DIR, 'xianbaoku_cache'),
+      `合法配置应原样生效（不得被上一轮的判定影响）：${legalDir}`)
+    assert.strictEqual(good.store.cacheDirFallback, null,
+      '未回退（或换成合法配置）时必须清成 null，不得沿用上一轮判定')
+  } finally {
+    if (savedEnv !== undefined) process.env.XBK_CACHE_DIR = savedEnv
+  }
+})
+
+// ===== C3-010 续（B-MF1）：回退判定必须经得起**连续多次**求值 =====
+// 「记录先于去重」是本次修复的用户可见效果所在：告警按 raw→chosen 每进程只打一条（getter 每轮求值，
+// 不去重会刷屏），但青龙 `--check` 一轮里会对 cacheDir 求值 2~3 次。若把记录挪到去重之后，第二次求值
+// 只剩「已去重 ⇒ 早退」这一条路径，`cacheDirFallback` 读回 null ⇒ `--check` 静默丢掉「已回退到哪」。
+// 故对**同一个** bad store 连续求值两次，两次都必须读到本次判定，且告警仍只有一条（去重没被破坏）。
+check('cacheDirFallback 连续两次求值都必须给出回退结论（记录先于去重）', () => {
+  const savedEnv = process.env.XBK_CACHE_DIR
+  delete process.env.XBK_CACHE_DIR // 环境变量绝对路径会跳过根内校验，本用例只测配置值分支
+  try {
+    const raw = 'c3010c_probe_cache'
+    const rejected = path.join(ROOT_DIR, raw)
+    const badFs = makeMemFs({})
+    badFs.files.set(rejected, 'x') // 普通文件占位 ⇒ 根内校验拒绝
+    const bad = makeBatchStore({ fsMock: badFs, configDir: raw })
+    const expected = { raw, chosen: path.join(ROOT_DIR, 'xianbaoku_cache') }
+    const warns = captureConsole('warn', () => {
+      assert.strictEqual(bad.store.cacheDir, expected.chosen, '第一次求值必须回退到默认目录')
+      assert.deepStrictEqual(bad.store.cacheDirFallback, expected,
+        '第一次求值必须给出 {raw, chosen}')
+      // 与 runCheck 的实际求值次数一致：--check 一轮会读 cacheDir 2~3 次
+      assert.strictEqual(bad.store.cacheDir, expected.chosen, '第二次求值必须回退到同一目录')
+      assert.deepStrictEqual(bad.store.cacheDirFallback, expected,
+        '第二次求值仍必须是本次判定——记录若晚于去重，这里会读回 null，--check 静默丢掉回退目标')
+    })
+    const hits = warns.filter(w => w.includes('缓存目录配置未生效'))
+    assert.strictEqual(hits.length, 1, `告警仍必须按 raw→chosen 只打一条：${JSON.stringify(warns)}`)
+  } finally {
+    if (savedEnv !== undefined) process.env.XBK_CACHE_DIR = savedEnv
+  }
 })
 
 // ===== C3-007：不同 pushUrl 撞到同一缓存文件必须显形 =====
