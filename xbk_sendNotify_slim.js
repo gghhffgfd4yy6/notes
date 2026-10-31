@@ -485,6 +485,15 @@ const pushHttp = { // 推送层 HTTP 客户端（v3.300 起只剩 post + logErr�
   logErr: console.log
 }
 
+// C8-008：日志不得参与结算。cron 管道关闭（EPIPE）等场景 console.log 会抛错，而六个通道把
+// 「成功日志」和「结算」写在同一条 try/catch/finally 里：日志一抛错就被 catch 收走并 reject ⇒
+// 已送达的消息被判失败 ⇒ 主流程不写缓存 ⇒ 下一轮重推（重复轰炸）；反过来删掉 reject 或中途
+// return 时，finally 的无条件 resolve(data) 又会把失败洗成成功（写缓存后永久漏推）。
+// 口径：成功分支显式 resolve(data)、失败分支 reject，日志一律经本封装（自吞异常）。
+function logQuietly (run) {
+  try { run() } catch (e) { /* 日志失败不影响结算 */ }
+}
+
 function pushPlusNotify (text, desp, params = {}) {
   return new Promise((resolve, reject) => {
     const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config
@@ -519,43 +528,42 @@ function pushPlusNotify (text, desp, params = {}) {
           if (err) {
             const failure = channelError(err, 'pushplus', resp)
             reject(failure)
-            console.log(
+            logQuietly(() => console.log(
                             `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                             }通知消息失败😞\n`,
                             safeErr(failure)
-            )
-          } else {
-            // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
-            // TypeError → catch 只记日志 → finally resolve(data) 虚假成功 → 主流程写缓存
-            // → 消息永久丢失（系统验证实测确认，P1）
-            if (data && isCode(data.code, 200)) {
-              console.log(
+            ))
+            return
+          }
+          // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
+          // TypeError → catch 只记日志 → finally resolve(data) 虚假成功 → 主流程写缓存
+          // → 消息永久丢失（系统验证实测确认，P1）
+          if (data && isCode(data.code, 200)) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息完成🎉\n`
-              )
-            } else {
-              console.log(
+            ))
+            return
+          }
+          logQuietly(() => console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息异常 ${data && data.msg ? safeErr(data.msg) : ''}\n`
-              ) // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
-              // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
-              // 单通道用户主流程写缓存 → 消息永久丢失
-              const failure = channelError(
-                new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'),
-                'pushplus',
-                resp,
-                data && data.code
-              )
-              reject(failure)
-            }
-          }
+          )) // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
+          // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
+          // 单通道用户主流程写缓存 → 消息永久丢失
+          reject(channelError(
+            new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'),
+            'pushplus',
+            resp,
+            data && data.code
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           const failure = channelError(e, 'pushplus', resp)
           reject(failure)
-          pushHttp.logErr(safeErr(failure))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(failure)))
         }
       })
     } else {
@@ -593,37 +601,39 @@ function serverNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('Server 酱发送通知调用API失败😞\n', safeErr(err))
-          } else {
-            // server酱和Server酱·Turbo版的返回json格式不太一样
-            // 响应防御：Server酱/Turbo 返回结构不同，且异常时可能缺字段
-            const rawErrno = data && (data.errno !== undefined ? data.errno : (data.data && data.data.errno))
-            const errno = rawErrno === '0' || rawErrno === 0
-              ? 0
-              : (rawErrno === '1024' || rawErrno === 1024 ? 1024 : rawErrno)
-            if (errno === 0) {
-              console.log('Server 酱发送通知消息成功🎉\n')
-            } else if (errno === 1024) {
-              // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
-              console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`)
-            } else {
-              console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`)
-              // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'),
-                'server酱',
-                resp,
-                rawErrno
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('Server 酱发送通知调用API失败😞\n', safeErr(err)))
+            return
           }
+          // server酱和Server酱·Turbo版的返回json格式不太一样
+          // 响应防御：Server酱/Turbo 返回结构不同，且异常时可能缺字段
+          const rawErrno = data && (data.errno !== undefined ? data.errno : (data.data && data.data.errno))
+          const errno = rawErrno === '0' || rawErrno === 0
+            ? 0
+            : (rawErrno === '1024' || rawErrno === 1024 ? 1024 : rawErrno)
+          if (errno === 0) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('Server 酱发送通知消息成功🎉\n'))
+            return
+          }
+          if (errno === 1024) {
+            // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
+            resolve(data)
+            logQuietly(() => console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`))
+            return
+          }
+          logQuietly(() => console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`))
+          // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'),
+            'server酱',
+            resp,
+            rawErrno
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -689,32 +699,31 @@ function barkNotify (text, desp, params = {}) {
           try {
             if (err) {
               const failure = channelError(err, 'bark', resp)
-              console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(failure))
+              // C8-008：先结算再打日志（日志抛错不得改写结算结果），且不再有 finally 兜底 settlement
               innerResolve({ ok: false, error: failure })
-            } else {
-              // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
-              if (data && isCode(data.code, 200)) {
-                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`)
-                innerResolve({ ok: true })
-              } else {
-                const failure = channelError(
-                  new Error(data && data.message ? safeErr(data.message) : 'Bark 发送失败'),
-                  'bark',
-                  resp,
-                  data && data.code
-                )
-                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(failure)}\n`)
-                // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
-                // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
-                innerResolve({ ok: false, error: failure })
-              }
+              logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(failure)))
+              return
             }
+            // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
+            if (data && isCode(data.code, 200)) {
+              innerResolve({ ok: true })
+              logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`))
+              return
+            }
+            const failure = channelError(
+              new Error(data && data.message ? safeErr(data.message) : 'Bark 发送失败'),
+              'bark',
+              resp,
+              data && data.code
+            )
+            // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
+            // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
+            innerResolve({ ok: false, error: failure })
+            logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(failure)}\n`))
           } catch (e) {
             const failure = channelError(e, 'bark', resp)
-            pushHttp.logErr(safeErr(failure))
             innerResolve({ ok: false, error: failure })
-          } finally {
-            innerResolve({ ok: false })
+            logQuietly(() => pushHttp.logErr(safeErr(failure)))
           }
         })
       })
@@ -768,31 +777,30 @@ function pushMeNotify (text, desp, params = {}) {
           try {
             if (err) {
               const failure = channelError(err, 'pushme', resp)
-              console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(failure))
+              // C8-008：先结算再打日志（日志抛错不得改写结算结果），且不再有 finally 兜底 settlement
               innerResolve({ ok: false, error: failure })
-            } else {
-              if (data === 'success') {
-                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`)
-                innerResolve({ ok: true })
-              } else {
-                const failure = channelError(
-                  new Error('PushMe 发送失败'),
-                  'pushme',
-                  resp,
-                  data && (data.code !== undefined ? data.code : data.error_code || data.errno)
-                )
-                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(failure)}\n`)
-                // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
-                // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
-                innerResolve({ ok: false, error: failure })
-              }
+              logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(failure)))
+              return
             }
+            if (data === 'success') {
+              innerResolve({ ok: true })
+              logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`))
+              return
+            }
+            const failure = channelError(
+              new Error('PushMe 发送失败'),
+              'pushme',
+              resp,
+              data && (data.code !== undefined ? data.code : data.error_code || data.errno)
+            )
+            // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
+            // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
+            innerResolve({ ok: false, error: failure })
+            logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(failure)}\n`))
           } catch (e) {
             const failure = channelError(e, 'pushme', resp)
-            pushHttp.logErr(safeErr(failure))
             innerResolve({ ok: false, error: failure })
-          } finally {
-            innerResolve({ ok: false })
+            logQuietly(() => pushHttp.logErr(safeErr(failure)))
           }
         })
       })
@@ -833,29 +841,28 @@ function qywxBotNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('企业微信发送通知消息失败😞\n', safeErr(err))
-          } else {
-            // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-            if (data && isCode(data.errcode, 0)) {
-              console.log('企业微信发送通知消息成功🎉。\n')
-            } else {
-              console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`) // v3.180：errmsg 判空（同 Push+ else 分支）
-              // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'),
-                '企业微信',
-                resp,
-                data && data.errcode
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('企业微信发送通知消息失败😞\n', safeErr(err)))
+            return
           }
+          // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+          if (data && isCode(data.errcode, 0)) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('企业微信发送通知消息成功🎉。\n'))
+            return
+          }
+          logQuietly(() => console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`)) // v3.180：errmsg 判空（同 Push+ else 分支）
+          // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'),
+            '企业微信',
+            resp,
+            data && data.errcode
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -1452,31 +1459,32 @@ function wxXiZhiNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('息知发送通知消息失败😞\n', safeErr(err))
-          } else {
-            // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-            if (data && isCode(data.code, 200)) {
-              console.log('息知发送通知消息成功🎉。\n')
-            } else {
-              console.log('息知发送通知消息异常 \n')
-              // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
-              console.log(safeErr(data))
-              // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
-              const failure = channelError(
-                new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'),
-                '息知',
-                resp,
-                data && (data.code !== undefined ? data.code : data.errcode)
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('息知发送通知消息失败😞\n', safeErr(err)))
+            return
           }
+          // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+          if (data && isCode(data.code, 200)) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('息知发送通知消息成功🎉。\n'))
+            return
+          }
+          logQuietly(() => {
+            console.log('息知发送通知消息异常 \n')
+            // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
+            console.log(safeErr(data))
+          })
+          // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
+          reject(channelError(
+            new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'),
+            '息知',
+            resp,
+            data && (data.code !== undefined ? data.code : data.errcode)
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -1505,35 +1513,34 @@ function pushDeerNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('PushDeer 通知调用API失败😞\n', safeErr(err))
-          } else {
-            // 通过返回的result的长度来判断是否成功（响应防御：异常时可能缺 content/result 字段）
-            if (
-              data && data.content && data.content.result &&
-                            data.content.result.length !== undefined &&
-                            data.content.result.length > 0
-            ) {
-              console.log('PushDeer 发送通知消息成功🎉\n')
-            } else {
-              console.log(
-                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}\n`
-              )
-              // v3.160：API 级失败(result 空) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error('PushDeer 发送失败'),
-                'pushdeer',
-                resp,
-                data && (data.code !== undefined ? data.code : data.error_code || data.errno)
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('PushDeer 通知调用API失败😞\n', safeErr(err)))
+            return
           }
+          // 通过返回的result的长度来判断是否成功（响应防御：异常时可能缺 content/result 字段）
+          if (
+            data && data.content && data.content.result &&
+                        data.content.result.length !== undefined &&
+                        data.content.result.length > 0
+          ) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('PushDeer 发送通知消息成功🎉\n'))
+            return
+          }
+          logQuietly(() => console.log(
+                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}\n`
+          ))
+          // v3.160：API 级失败(result 空) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error('PushDeer 发送失败'),
+            'pushdeer',
+            resp,
+            data && (data.code !== undefined ? data.code : data.error_code || data.errno)
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -1583,28 +1590,27 @@ function tgNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('Telegram 发送通知消息失败😞\n', safeErr(err))
-          } else {
-            if (data && data.ok === true) {
-              console.log('Telegram 发送通知消息成功🎉\n')
-            } else {
-              console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`)
-              // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'),
-                'telegram',
-                resp,
-                data && data.error_code
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('Telegram 发送通知消息失败😞\n', safeErr(err)))
+            return
           }
+          if (data && data.ok === true) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('Telegram 发送通知消息成功🎉\n'))
+            return
+          }
+          logQuietly(() => console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`))
+          // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'),
+            'telegram',
+            resp,
+            data && data.error_code
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {

@@ -688,6 +688,110 @@ function assertSettled (outcome, label, why) {
     }
   }
 
+  // ===== C8-008：结算与日志分离（一条回调只有一个出口）=====
+  // 缺陷形状（改动前）：六个通道把「成功日志」和「结算」写在同一条 try/catch/finally 里——
+  //   · 成功日志在 try 内、结算在 finally 里：cron 管道关闭（EPIPE）时 console.log 抛错，
+  //     catch 把它当通道失败 reject ⇒ 已送达的消息被重新推一遍（重复轰炸）；
+  //   · finally 的 `resolve(data)` 无条件：将来任何一处漏掉 reject 或中途 return，失败会被洗成成功。
+  // 判据：把 console.log 换成「成功日志一调用就抛 EPIPE」，交付结果必须仍是成功。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    let replyBody = { ok: true, result: { message_id: 1 } }
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = () => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => {
+        em.emit('response', { statusCode: 200, headers: {}, timings: {} })
+        em.emit('data', Buffer.from(JSON.stringify(replyBody)))
+        em.emit('end')
+      })
+      return em
+    }
+    const origLog = console.log
+    // 模拟 cron 管道关闭：只在「成功日志」上抛，其余日志照常（避免把无关路径搅乱）
+    const installEpipeOnSuccessLog = () => {
+      console.log = function (...args) {
+        if (String(args[0]).includes('发送通知消息成功')) {
+          const e = new Error('write EPIPE')
+          e.code = 'EPIPE'
+          throw e
+        }
+        return origLog.apply(console, args)
+      }
+    }
+    try {
+      clearCfg()
+      cfg.TG_BOT_TOKEN = 'probe-tg-token'
+      cfg.TG_USER_ID = 'probe-tg-user'
+      // ① 成功响应 + 成功日志抛 EPIPE：交付必须仍是成功（旧实现：catch 收走 → reject → 全通道失败）
+      installEpipeOnSuccessLog()
+      let outcome = null
+      let failure = null
+      try { outcome = await slim.sendNotify('T', 'D') } catch (e) { failure = e }
+      console.log = origLog
+      assert.strictEqual(failure, null, `成功日志抛错不得把已送达的消息判失败（实际抛出：${failure && failure.message}）`)
+      assert.deepStrictEqual(outcome && outcome.successfulChannels, ['telegram'], '日志抛错时通道必须仍记为成功')
+      assert.deepStrictEqual(outcome && outcome.failures, [], '成功分支不得产生任何 failure 记录')
+      // ② 失败响应 + 失败日志抛错：仍必须判失败（日志不参与结算的另一侧）
+      replyBody = { ok: false, description: 'tg-boom' }
+      console.log = function (...args) {
+        if (String(args[0]).includes('发送通知消息异常')) {
+          const e = new Error('write EPIPE')
+          e.code = 'EPIPE'
+          throw e
+        }
+        return origLog.apply(console, args)
+      }
+      failure = null
+      try { await slim.sendNotify('T', 'D') } catch (e) { failure = e }
+      console.log = origLog
+      assert.strictEqual(failure && failure.code, 'ALL_CHANNELS_FAILED', '失败日志抛错不得把失败洗成成功')
+      assert.strictEqual(failure.failures[0].channel, 'telegram', '失败必须仍归因到 telegram')
+    } finally {
+      console.log = origLog
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+    console.log('✅ C8-008 结算与日志分离：成功日志抛 EPIPE 仍判成功 / 失败日志抛错仍判失败')
+  }
+  // ③ 源码形状：通道回调不得再把结算写进 finally（否则「成功日志在 try 内 + finally 无条件 resolve」
+  // 这条缺陷会以任何一处漏写 reject / 中途 return 的形式复活）。扫描方式：从 `finally {` 起按花括号
+  // 配平找到块尾，块内不得出现 resolve/reject/innerResolve 调用。
+  {
+    const srcPath = require('node:path').join(__dirname, 'xbk_sendNotify_slim.js')
+    const lines = require('node:fs').readFileSync(srcPath, 'utf8').split('\n')
+    const settlingFinally = []
+    for (let i = 0; i < lines.length; i++) {
+      const m = /\bfinally\s*\{/.exec(lines[i])
+      if (!m) continue
+      // 只从 finally 自身的 '{' 之后开始配平——同一行左侧往往还有上一块的 '}'，
+      // 从行首起算会把 depth 立刻配平到 0，扫出来永远是 0 处（假绿）。
+      const startIdx = m.index + m[0].length - 1
+      let depth = 0
+      for (let j = i; j < lines.length; j++) {
+        const from = j === i ? startIdx : 0
+        for (let k = from; k < lines[j].length; k++) {
+          const ch = lines[j][k]
+          if (ch === '{') depth++
+          else if (ch === '}') depth--
+        }
+        const text = j === i ? lines[j].slice(startIdx) : lines[j]
+        if (j > i && /\b(resolve|reject|innerResolve)\s*\(/.test(text)) settlingFinally.push(j + 1)
+        if (depth <= 0) break
+      }
+    }
+    assert.deepStrictEqual(settlingFinally, [],
+      `finally 块内不得结算 Promise（C8-008 单一出口），命中行：${settlingFinally.join(', ')}`)
+    console.log('✅ C8-008 源码形状：finally 块内零结算调用')
+  }
+
   // ===== 补测 PlanF：normalizeFailure 与失败聚合（经 sendNotify 的 failures 观测）=====
   // 反例（改动前）：normalizeFailure 20 个靶子被登记为「不可达」——**该判断同样是错的**：
   // 它在 channelResults 里被调用（L1612），而 sendNotify 在**全部通道失败**时把 failures 一路抛出。
