@@ -810,6 +810,50 @@ check('_quotedAttrSpans：标签外/标签后的 = 与引号不得开启属性�
   assert.strictEqual(formatter.htmlToMarkdown({ content_html: "='<h1></h1>" }), "='#")
 })
 
+// ===== C10-055：引号属性值区间改「区间数组 + 二分判定」+ 单槽缓存 =====
+// 缺陷形状（改动前）：_quotedAttrSpans 用 Set<index> 逐字符 add。未闭合引号要一路加到串尾 ⇒ 一个
+// 100k 串就是 10 万个键；且 htmlToMarkdown 一轮里 h/a/script/style 三次 _replaceTagged 各扫一遍
+// 同一份 html ⇒ 同一份 10 万键的 Set 建 3 遍。现在登记是 O(1) 一个 [from,to) 区间、判定走二分，
+// 三次调用共享同一份区间表（单槽缓存）。
+check('C10-055：未闭合引号只登记 1 个区间（不得逐字符建键）', () => {
+  const big = '<a title="' + 'x'.repeat(200000)
+  const view = formatter._quotedAttrSpans(big)
+  assert.strictEqual(Array.isArray(view.spans), true, '必须暴露区间表（区间数组），否则退回了逐字符登记')
+  assert.strictEqual(view.spans.length, 1, `未闭合引号只应登记 1 个区间，实际 ${view.spans.length} 个`)
+  assert.strictEqual(view.size, big.length - 10, 'size 口径不变：仍是被标记的字符数')
+  assert.strictEqual(view.has(big.length - 1), true, '区间延伸到串尾：末位必须在区间内')
+})
+
+check('C10-055：二分判定端点口径（from 含、to 不含、区间外为假）', () => {
+  // '<div a="bc" a='de'>'：引号在 7 与 14 ⇒ 属性值区间 [8,10) 与 [15,17)
+  const html = '<div a="bc" a=\'de\'>'
+  assert.strictEqual(html[7], '"')
+  assert.strictEqual(html[8] + html[9], 'bc')
+  const view = formatter._quotedAttrSpans(html)
+  assert.strictEqual(view.spans.length, 2, '两个引号属性值应登记 2 个区间')
+  assert.deepStrictEqual(view.spans, [[8, 10], [15, 17]], '区间端点必须是 [引号后一位, 闭合引号位)')
+  assert.strictEqual(view.has(7), false, '开引号本身不在区间内')
+  assert.strictEqual(view.has(8), true, '区间起点算命中')
+  assert.strictEqual(view.has(9), true, '区间内算命中')
+  assert.strictEqual(view.has(10), false, '闭合引号位不算命中（[from,to) 口径）')
+  assert.strictEqual(view.has(13), false, '两区间之间的属性名/等号不算命中')
+  assert.strictEqual(view.has(15), true, '第二个区间起点算命中')
+  assert.strictEqual(view.has(17), false, '第二个区间终点不算命中')
+  assert.strictEqual(view.size, 4, 'size 应等于两个区间长度之和（2+2）')
+  assert.deepStrictEqual([...view], [8, 9, 15, 16], '可展开（既有调用面 [...spans] 不变）')
+})
+
+check('C10-055：同一份 html 的三次调用必须复用同一份区间表', () => {
+  const html = '<div a="b"><a href="https://x">t</a><h1 c="d">h</h1>'
+  const first = formatter._quotedAttrSpans(html)
+  const second = formatter._quotedAttrSpans(html)
+  assert.strictEqual(second, first, '同串再次调用必须直接复用（旧实现每次都重建一遍全量键）')
+  // 反例：不同的串不得命中缓存（否则会把上一份区间套到新串上）
+  const other = formatter._quotedAttrSpans('<div a="zz">')
+  assert.notStrictEqual(other, first, '不同 html 不得命中同一份缓存')
+  assert.deepStrictEqual(other.spans, [[8, 10]], '不同 html 必须重新计算')
+})
+
 // ===== 追加：击杀 xbk_formatter.js planB 未覆盖簇的 Survived 变异体 =====
 
 // ---- _tagOpFor：p/div 前缀匹配（无 \b）与闭合标签白名单 ----
