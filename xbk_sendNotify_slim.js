@@ -485,6 +485,15 @@ const pushHttp = { // 推送层 HTTP 客户端（v3.300 起只剩 post + logErr�
   logErr: console.log
 }
 
+// C8-008：日志不得参与结算。cron 管道关闭（EPIPE）等场景 console.log 会抛错，而六个通道把
+// 「成功日志」和「结算」写在同一条 try/catch/finally 里：日志一抛错就被 catch 收走并 reject ⇒
+// 已送达的消息被判失败 ⇒ 主流程不写缓存 ⇒ 下一轮重推（重复轰炸）；反过来删掉 reject 或中途
+// return 时，finally 的无条件 resolve(data) 又会把失败洗成成功（写缓存后永久漏推）。
+// 口径：成功分支显式 resolve(data)、失败分支 reject，日志一律经本封装（自吞异常）。
+function logQuietly (run) {
+  try { run() } catch (e) { /* 日志失败不影响结算 */ }
+}
+
 function pushPlusNotify (text, desp, params = {}) {
   return new Promise((resolve, reject) => {
     const { PUSH_PLUS_TOKEN, PUSH_PLUS_USER } = push_config
@@ -519,43 +528,42 @@ function pushPlusNotify (text, desp, params = {}) {
           if (err) {
             const failure = channelError(err, 'pushplus', resp)
             reject(failure)
-            console.log(
+            logQuietly(() => console.log(
                             `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                             }通知消息失败😞\n`,
                             safeErr(failure)
-            )
-          } else {
-            // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
-            // TypeError → catch 只记日志 → finally resolve(data) 虚假成功 → 主流程写缓存
-            // → 消息永久丢失（系统验证实测确认，P1）
-            if (data && isCode(data.code, 200)) {
-              console.log(
+            ))
+            return
+          }
+          // v3.180：data 判空防御——HTTP 200 + 响应体 JSON null 时 data.code 曾抛
+          // TypeError → catch 只记日志 → finally resolve(data) 虚假成功 → 主流程写缓存
+          // → 消息永久丢失（系统验证实测确认，P1）
+          if (data && isCode(data.code, 200)) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息完成🎉\n`
-              )
-            } else {
-              console.log(
+            ))
+            return
+          }
+          logQuietly(() => console.log(
                                 `Push+ 发送${PUSH_PLUS_USER ? '一对多' : '一对一'
                                 }通知消息异常 ${data && data.msg ? safeErr(data.msg) : ''}\n`
-              ) // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
-              // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
-              // 单通道用户主流程写缓存 → 消息永久丢失
-              const failure = channelError(
-                new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'),
-                'pushplus',
-                resp,
-                data && data.code
-              )
-              reject(failure)
-            }
-          }
+          )) // v3.180：data.msg 也判空——null 时模板访问曾二次抛错走 catch→虚假成功
+          // v3.160：API 级失败(code≠200) reject（与 wxpusher v3.154 同口径）——曾静默 resolve，
+          // 单通道用户主流程写缓存 → 消息永久丢失
+          reject(channelError(
+            new Error(data && data.msg ? safeErr(data.msg) : 'Push+ 发送失败'),
+            'pushplus',
+            resp,
+            data && data.code
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           const failure = channelError(e, 'pushplus', resp)
           reject(failure)
-          pushHttp.logErr(safeErr(failure))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(failure)))
         }
       })
     } else {
@@ -570,14 +578,10 @@ function serverNotify (text, desp, params = {}) {
     if (PUSH_KEY) {
       // v3.176：PUSH_KEY 数字/对象脏配置 → String 化（曾 .includes 抛 TypeError 通道静默失败）
       const pushKey = String(PUSH_KEY)
-      // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断
-      // （安全处理代理对：末尾高代理退一位，避免切坏 emoji）
-      if (text.length > 32) {
-        let cut = text.slice(0, 32)
-        const last = cut.charCodeAt(cut.length - 1)
-        if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)
-        text = cut
-      }
+      // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断。
+      // C8-010：改用 safeSlice（= 主代码 Utils.truncateUtf16 薄封装），不再手写「只退高代理」的
+      // 第二份实现——手写版缺 VS16/ZWJ/组合字符退位，会把 ❤️/👨‍👩‍👧‍👦 切成半截序列。
+      text = safeSlice(text, 32)
       // 微信server酱推送通知一个\n不会换行，需要两个\n才能换行，故做此替换
       // v3.148：只加倍"单个 \n"——\n\n（Markdown 段落分隔）已是 Server酱换行格式，曾整体加倍成 \n\n\n\n 大段空白
       desp = desp.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/([^\n])\n(?!\n)/g, '$1\n\n')
@@ -597,37 +601,39 @@ function serverNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('Server 酱发送通知调用API失败😞\n', safeErr(err))
-          } else {
-            // server酱和Server酱·Turbo版的返回json格式不太一样
-            // 响应防御：Server酱/Turbo 返回结构不同，且异常时可能缺字段
-            const rawErrno = data && (data.errno !== undefined ? data.errno : (data.data && data.data.errno))
-            const errno = rawErrno === '0' || rawErrno === 0
-              ? 0
-              : (rawErrno === '1024' || rawErrno === 1024 ? 1024 : rawErrno)
-            if (errno === 0) {
-              console.log('Server 酱发送通知消息成功🎉\n')
-            } else if (errno === 1024) {
-              // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
-              console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`)
-            } else {
-              console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`)
-              // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'),
-                'server酱',
-                resp,
-                rawErrno
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('Server 酱发送通知调用API失败😞\n', safeErr(err)))
+            return
           }
+          // server酱和Server酱·Turbo版的返回json格式不太一样
+          // 响应防御：Server酱/Turbo 返回结构不同，且异常时可能缺字段
+          const rawErrno = data && (data.errno !== undefined ? data.errno : (data.data && data.data.errno))
+          const errno = rawErrno === '0' || rawErrno === 0
+            ? 0
+            : (rawErrno === '1024' || rawErrno === 1024 ? 1024 : rawErrno)
+          if (errno === 0) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('Server 酱发送通知消息成功🎉\n'))
+            return
+          }
+          if (errno === 1024) {
+            // 一分钟内发送相同的内容会触发（内容已送达，视为成功不重试）
+            resolve(data)
+            logQuietly(() => console.log(`Server 酱发送通知消息异常 ${safeErr(data && data.errmsg)}\n`))
+            return
+          }
+          logQuietly(() => console.log(`Server 酱发送通知消息异常 ${safeErr(data)}\n`))
+          // v3.160：API 级失败(errno≠0/1024) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error(data && data.errmsg ? safeErr(data.errmsg) : 'Server酱 发送失败'),
+            'server酱',
+            resp,
+            rawErrno
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -693,32 +699,32 @@ function barkNotify (text, desp, params = {}) {
           try {
             if (err) {
               const failure = channelError(err, 'bark', resp)
-              console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(failure))
-              innerResolve({ ok: false, error: failure })
-            } else {
-              // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
-              if (data && isCode(data.code, 200)) {
-                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`)
-                innerResolve({ ok: true })
-              } else {
-                const failure = channelError(
-                  new Error(data && data.message ? safeErr(data.message) : 'Bark 发送失败'),
-                  'bark',
-                  resp,
-                  data && data.code
-                )
-                console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(failure)}\n`)
-                // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
-                // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
-                innerResolve({ ok: false, error: failure })
-              }
+              // C8-008：先结算再打日志（日志抛错不得改写结算结果），且不再有 finally 兜底 settlement
+              // C8-003：失败目标带上脱敏标识，供聚合逐目标记账
+              innerResolve({ ok: false, error: failure, target: maskUrl(pushUrl) })
+              logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 失败😞\n`, safeErr(failure)))
+              return
             }
+            // data 判空：HTTP 200 + JSON null 时不依赖 catch 兜底，避免 TypeError 噪音
+            if (data && isCode(data.code, 200)) {
+              innerResolve({ ok: true })
+              logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 成功🎉\n`))
+              return
+            }
+            const failure = channelError(
+              new Error(data && data.message ? safeErr(data.message) : 'Bark 发送失败'),
+              'bark',
+              resp,
+              data && data.code
+            )
+            // v3.166：单设备失败不拖垮整体——多设备（# 分割）一个失效时，
+            // 曾外层 reject → 有效设备已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效设备重复轰炸
+            innerResolve({ ok: false, error: failure, target: maskUrl(pushUrl) })
+            logQuietly(() => console.log(`Bark APP 发送通知到 ${maskUrl(pushUrl)} 异常 ${safeErr(failure)}\n`))
           } catch (e) {
             const failure = channelError(e, 'bark', resp)
-            pushHttp.logErr(safeErr(failure))
-            innerResolve({ ok: false, error: failure })
-          } finally {
-            innerResolve({ ok: false })
+            innerResolve({ ok: false, error: failure, target: maskUrl(pushUrl) })
+            logQuietly(() => pushHttp.logErr(safeErr(failure)))
           }
         })
       })
@@ -726,9 +732,17 @@ function barkNotify (text, desp, params = {}) {
 
     // 等待所有推送完成
     // v3.166：至少一个设备成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
+    // C8-003：部分成功时把**失败目标**连同脱敏标识一并透出。旧实现只 `resolve()`，坏设备每轮失败、
+    // 每轮被「至少一个成功」盖住：日志里有一行失败，调用方（通道健康/告警/自检）却只看到「bark 成功」。
     Promise.all(pushPromises).then(results => {
-      if (results.some(r => r && r.ok)) resolve()
-      else reject(aggregateChannelError('bark', 'Bark 全部设备发送失败', results.map(r => r && r.error)))
+      const failedTargets = results.filter(r => !(r && r.ok))
+      if (failedTargets.length < results.length) {
+        resolve(failedTargets.length
+          ? { partialFailures: failedTargets.map(r => ({ target: (r && r.target) || '', error: r && r.error })) }
+          : undefined)
+        return
+      }
+      reject(aggregateChannelError('bark', 'Bark 全部设备发送失败', results.map(r => r && r.error)))
     }).catch(reject)
   })
 }
@@ -772,31 +786,31 @@ function pushMeNotify (text, desp, params = {}) {
           try {
             if (err) {
               const failure = channelError(err, 'pushme', resp)
-              console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(failure))
-              innerResolve({ ok: false, error: failure })
-            } else {
-              if (data === 'success') {
-                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`)
-                innerResolve({ ok: true })
-              } else {
-                const failure = channelError(
-                  new Error('PushMe 发送失败'),
-                  'pushme',
-                  resp,
-                  data && (data.code !== undefined ? data.code : data.error_code || data.errno)
-                )
-                console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(failure)}\n`)
-                // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
-                // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
-                innerResolve({ ok: false, error: failure })
-              }
+              // C8-008：先结算再打日志（日志抛错不得改写结算结果），且不再有 finally 兜底 settlement
+              // C8-003：失败 key 带上脱敏标识，供聚合逐目标记账
+              innerResolve({ ok: false, error: failure, target: maskKey(trimmedKey) })
+              logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 失败😞\n`, safeErr(failure)))
+              return
             }
+            if (data === 'success') {
+              innerResolve({ ok: true })
+              logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 成功🎉\n`))
+              return
+            }
+            const failure = channelError(
+              new Error('PushMe 发送失败'),
+              'pushme',
+              resp,
+              data && (data.code !== undefined ? data.code : data.error_code || data.errno)
+            )
+            // v3.166：单 key 失败不拖垮整体——多 key（# 分割）一个失效时，
+            // 曾外层 reject → 有效 key 已收到但通道整体失败 → 不写缓存 → 每次运行重试 → 有效 key 重复轰炸
+            innerResolve({ ok: false, error: failure, target: maskKey(trimmedKey) })
+            logQuietly(() => console.log(`PushMe 发送通知到 KEY ${maskKey(trimmedKey)} 异常: ${safeErr(failure)}\n`))
           } catch (e) {
             const failure = channelError(e, 'pushme', resp)
-            pushHttp.logErr(safeErr(failure))
-            innerResolve({ ok: false, error: failure })
-          } finally {
-            innerResolve({ ok: false })
+            innerResolve({ ok: false, error: failure, target: maskKey(trimmedKey) })
+            logQuietly(() => pushHttp.logErr(safeErr(failure)))
           }
         })
       })
@@ -804,9 +818,16 @@ function pushMeNotify (text, desp, params = {}) {
 
     // 等待所有推送完成
     // v3.166：至少一个 key 成功 = 通道成功（与 sendNotify allSettled 哲学一致）——全部失败才 reject
+    // C8-003：部分成功时把失败 key 连同脱敏标识一并透出（同 bark：旧实现只 resolve()，坏 key 零记账）
     Promise.all(pushPromises).then(results => {
-      if (results.some(r => r && r.ok)) resolve()
-      else reject(aggregateChannelError('pushme', 'PushMe 全部 key 发送失败', results.map(r => r && r.error)))
+      const failedTargets = results.filter(r => !(r && r.ok))
+      if (failedTargets.length < results.length) {
+        resolve(failedTargets.length
+          ? { partialFailures: failedTargets.map(r => ({ target: (r && r.target) || '', error: r && r.error })) }
+          : undefined)
+        return
+      }
+      reject(aggregateChannelError('pushme', 'PushMe 全部 key 发送失败', results.map(r => r && r.error)))
     }).catch(reject)
   })
 }
@@ -837,29 +858,28 @@ function qywxBotNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('企业微信发送通知消息失败😞\n', safeErr(err))
-          } else {
-            // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-            if (data && isCode(data.errcode, 0)) {
-              console.log('企业微信发送通知消息成功🎉。\n')
-            } else {
-              console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`) // v3.180：errmsg 判空（同 Push+ else 分支）
-              // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'),
-                '企业微信',
-                resp,
-                data && data.errcode
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('企业微信发送通知消息失败😞\n', safeErr(err)))
+            return
           }
+          // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+          if (data && isCode(data.errcode, 0)) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('企业微信发送通知消息成功🎉。\n'))
+            return
+          }
+          logQuietly(() => console.log(`企业微信发送通知消息异常 ${data && data.errmsg ? safeErr(data.errmsg) : ''}\n`)) // v3.180：errmsg 判空（同 Push+ else 分支）
+          // v3.160：API 级失败(errcode≠0) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error(data && data.errmsg ? safeErr(data.errmsg) : '企业微信 发送失败'),
+            '企业微信',
+            resp,
+            data && data.errcode
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -975,30 +995,37 @@ function delimitedNonEmpty (v) {
   try { return String(v).split('#').some(s => s.trim() !== '') } catch (e) { return false }
 }
 
+// 通道清单（唯一真源）：name（日志/健康统计用的通道名）、enabled(push_config)、run(执行体)。
+// C8-009：此前同一份 9 通道清单抄了 4 遍——configuredChannelCount 数一遍、configuredChannelNames
+// 列一遍、sendNotify 的 configuredFlags 列一遍、channelTasks 再列一遍；加删通道要改 4 处，而
+// flags[i] 与 tasks[i] 只靠「两处数组顺序一致」绑定，漏写/写反一个就静默失效（旧代码在那一处只留了
+// 「漏一个就会静默失效」的注释当护栏——注释拦不住这件事）。现在计数、名单、启用判定与执行体
+// 全部由本表派生，顺序/名称/判定/执行只在这里出现一次。
+// 谓词口径见上方 nonEmpty/delimitedNonEmpty：0/false/空白 → 未配置；'0'/'false' 仍算已配置。
+// 顺序与历史日志顺序一致（Push+/Server酱/Bark/企微/wxpusher/息知/PushDeer/PushMe/TG）。
+const CHANNELS = [
+  { name: 'pushplus', enabled: c => nonEmpty(c.PUSH_PLUS_TOKEN), run: (text, desp, params) => pushPlusNotify(text, desp, params) },
+  { name: 'server酱', enabled: c => nonEmpty(c.PUSH_KEY), run: (text, desp, params) => serverNotify(text, desp, params) },
+  { name: 'bark', enabled: c => delimitedNonEmpty(c.BARK_PUSH), run: (text, desp, params) => barkNotify(text, desp, params) },
+  { name: '企业微信', enabled: c => nonEmpty(c.QYWX_KEY), run: (text, desp, params) => qywxBotNotify(text, desp, params) },
+  // wxpusher 是唯一需要原始 desp 的通道（contentType=2 直接渲染 HTML，见 C8-002）：其余通道拿降级后的 textDesp。
+  { name: 'wxpusher', enabled: c => hasWxPusherConfigured(), rawDesp: true, run: (text, desp, params) => wxPusherNotify(text, desp, params) },
+  { name: '息知', enabled: c => nonEmpty(c.WX_XIZHI_KEY), run: (text, desp, params) => wxXiZhiNotify(text, desp, params) },
+  { name: 'pushdeer', enabled: c => nonEmpty(c.DEER_KEY), run: (text, desp, params) => pushDeerNotify(text, desp, params) },
+  { name: 'pushme', enabled: c => delimitedNonEmpty(c.PUSHME_KEY), run: (text, desp, params) => pushMeNotify(text, desp, params) },
+  { name: 'telegram', enabled: c => nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID), run: (text, desp, params) => tgNotify(text, desp, params) }
+]
+
+function enabledChannels () {
+  return CHANNELS.filter(channel => channel.enabled(push_config))
+}
+
 function configuredChannelCount () {
-  const c = push_config
-  let count = 0
-  if (nonEmpty(c.PUSH_PLUS_TOKEN)) count++
-  if (nonEmpty(c.PUSH_KEY)) count++
-  if (delimitedNonEmpty(c.BARK_PUSH)) count++
-  if (nonEmpty(c.QYWX_KEY)) count++
-  if (hasWxPusherConfigured()) count++
-  if (nonEmpty(c.WX_XIZHI_KEY)) count++
-  if (nonEmpty(c.DEER_KEY)) count++
-  if (delimitedNonEmpty(c.PUSHME_KEY)) count++
-  if (nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID)) count++
-  return count
+  return enabledChannels().length
 }
 
 function configuredChannelNames () {
-  const c = push_config
-  return [
-    [nonEmpty(c.PUSH_PLUS_TOKEN), 'pushplus'], [nonEmpty(c.PUSH_KEY), 'server酱'],
-    [delimitedNonEmpty(c.BARK_PUSH), 'bark'], [nonEmpty(c.QYWX_KEY), '企业微信'],
-    [hasWxPusherConfigured(), 'wxpusher'], [nonEmpty(c.WX_XIZHI_KEY), '息知'],
-    [nonEmpty(c.DEER_KEY), 'pushdeer'], [delimitedNonEmpty(c.PUSHME_KEY), 'pushme'],
-    [nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID), 'telegram']
-  ].filter(([enabled]) => enabled).map(([, name]) => name)
+  return enabledChannels().map(channel => channel.name)
 }
 
 function hasWxPusherConfigured () {
@@ -1456,31 +1483,32 @@ function wxXiZhiNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('息知发送通知消息失败😞\n', safeErr(err))
-          } else {
-            // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
-            if (data && isCode(data.code, 200)) {
-              console.log('息知发送通知消息成功🎉。\n')
-            } else {
-              console.log('息知发送通知消息异常 \n')
-              // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
-              console.log(safeErr(data))
-              // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
-              const failure = channelError(
-                new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'),
-                '息知',
-                resp,
-                data && (data.code !== undefined ? data.code : data.errcode)
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('息知发送通知消息失败😞\n', safeErr(err)))
+            return
           }
+          // v3.180：data 判空防御（同 Push+，HTTP 200 + JSON null 曾虚假成功）
+          if (data && isCode(data.code, 200)) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('息知发送通知消息成功🎉。\n'))
+            return
+          }
+          logQuietly(() => {
+            console.log('息知发送通知消息异常 \n')
+            // 打印响应摘要（不打印完整对象——异常响应可能回显请求参数）
+            console.log(safeErr(data))
+          })
+          // v3.160：API 级失败(code≠200) reject——曾静默 resolve 致单通道用户消息永久丢失
+          reject(channelError(
+            new Error(data && data.msg ? safeErr(data.msg) : '息知 发送失败'),
+            '息知',
+            resp,
+            data && (data.code !== undefined ? data.code : data.errcode)
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -1509,35 +1537,34 @@ function pushDeerNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('PushDeer 通知调用API失败😞\n', safeErr(err))
-          } else {
-            // 通过返回的result的长度来判断是否成功（响应防御：异常时可能缺 content/result 字段）
-            if (
-              data && data.content && data.content.result &&
-                            data.content.result.length !== undefined &&
-                            data.content.result.length > 0
-            ) {
-              console.log('PushDeer 发送通知消息成功🎉\n')
-            } else {
-              console.log(
-                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}\n`
-              )
-              // v3.160：API 级失败(result 空) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error('PushDeer 发送失败'),
-                'pushdeer',
-                resp,
-                data && (data.code !== undefined ? data.code : data.error_code || data.errno)
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('PushDeer 通知调用API失败😞\n', safeErr(err)))
+            return
           }
+          // 通过返回的result的长度来判断是否成功（响应防御：异常时可能缺 content/result 字段）
+          if (
+            data && data.content && data.content.result &&
+                        data.content.result.length !== undefined &&
+                        data.content.result.length > 0
+          ) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('PushDeer 发送通知消息成功🎉\n'))
+            return
+          }
+          logQuietly(() => console.log(
+                                `PushDeer 发送通知消息异常😞 ${safeErr(data)}\n`
+          ))
+          // v3.160：API 级失败(result 空) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error('PushDeer 发送失败'),
+            'pushdeer',
+            resp,
+            data && (data.code !== undefined ? data.code : data.error_code || data.errno)
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -1587,28 +1614,27 @@ function tgNotify (text, desp, params = {}) {
         try {
           if (err) {
             reject(err)
-            console.log('Telegram 发送通知消息失败😞\n', safeErr(err))
-          } else {
-            if (data && data.ok === true) {
-              console.log('Telegram 发送通知消息成功🎉\n')
-            } else {
-              console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`)
-              // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
-              const failure = channelError(
-                new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'),
-                'telegram',
-                resp,
-                data && data.error_code
-              )
-              reject(failure)
-            }
+            logQuietly(() => console.log('Telegram 发送通知消息失败😞\n', safeErr(err)))
+            return
           }
+          if (data && data.ok === true) {
+            // C8-008：先结算（成功）再打日志——日志抛错不得把已送达的消息翻成失败
+            resolve(data)
+            logQuietly(() => console.log('Telegram 发送通知消息成功🎉\n'))
+            return
+          }
+          logQuietly(() => console.log(`Telegram 发送通知消息异常 ${safeErr(data)}\n`))
+          // v3.160：API 级失败(ok≠true) reject——曾静默 resolve 致单通道用户消息丢失
+          reject(channelError(
+            new Error(data && data.description ? safeErr(data.description) : 'Telegram 发送失败'),
+            'telegram',
+            resp,
+            data && data.error_code
+          ))
         } catch (e) {
-          // 响应结构异常（含 getter 抛错）必须按通道失败处理；否则 finally 的 resolve 会把消息误记为成功。
+          // 响应结构异常（含 getter 抛错）必须按通道失败处理——这里是最后一道，显式 reject
           reject(e)
-          pushHttp.logErr(safeErr(e))
-        } finally {
-          resolve(data)
+          logQuietly(() => pushHttp.logErr(safeErr(e)))
         }
       })
     } else {
@@ -1618,14 +1644,23 @@ function tgNotify (text, desp, params = {}) {
 }
 
 // 按 UTF-8 字节截断（v3.139：企微 markdown content 4096 字节上限；代理对安全——末尾高代理退一位）
+// C8-010：逐字符回退（`while (… > maxBytes) cut = cut.slice(0, -1)`）是 O(n²)——4096 字节上限、
+// 3000 汉字时要退约 1600 次、每次都对整串重算 byteLength（审查实测 3.92ms/次，每次企微推送都付）。
+// 改二分：byteLength 对前缀是单调的，log2(4096)≈12 次探测即得最长合法前缀，语义（≤maxBytes 的最长
+// 前缀 + 不留孤立高代理）与旧实现逐字一致，由 test_sendnotify_utils 的 PlanD 通道级用例锁定。
 function truncateBytes (s, maxBytes) {
   const str = String(s === undefined || s === null ? '' : s)
   if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str
-  let cut = str.slice(0, maxBytes) // 近似（UTF-8 多字节可能超）
-  while (Buffer.byteLength(cut, 'utf8') > maxBytes) cut = cut.slice(0, -1)
-  const last = cut.charCodeAt(cut.length - 1)
-  if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1) // 高代理退位
-  return cut
+  let lo = 0
+  let hi = Math.min(str.length, Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0)
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes) lo = mid
+    else hi = mid - 1
+  }
+  // 末位若是高代理，说明切在代理对中间：回退一格丢弃半个码点（不留孤代理）
+  if (lo > 0 && str.charCodeAt(lo - 1) >= 0xD800 && str.charCodeAt(lo - 1) <= 0xDBFF) lo -= 1
+  return str.slice(0, lo)
 }
 
 // markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
@@ -1789,19 +1824,15 @@ async function sendNotify (text, desp, params = {}) {
   // v3.110：入口统一清洗孤立代理（encodeURIComponent 对孤立代理抛 URIError → 通道发送失败）
   text = cleanSurrogates(text)
   desp = cleanSurrogates(desp)
-  // 通道配置检查：一个都没配 → 拒绝（避免"静默成功"让主流程以为推送完成并写缓存）
-  // 注意：这里必须与下方 Promise.all 实际调用的通道一一对应，漏一个就会让已配置的通道静默失效。
+  // 通道配置检查：一个都没配 → 拒绝（避免"静默成功"让主流程以为推送完成并写缓存）。
   // 分隔型配置（Bark/PushMe）还要排除只有分隔符/空白的值，否则通道函数会无请求地 resolve，
-  // configuredFlags 又把它计为已配置，最终出现「无实际设备却虚假成功」的 P1。
-  // v3.273（审查 S7/F3）：谓词提升到模块级（上方 nonEmpty/delimitedNonEmpty），
-  // 供 configuredChannelCount / configuredChannelNames 共用同一口径——三处曾各有一份实现。
-  const configuredFlags = [
-    nonEmpty(push_config.PUSH_PLUS_TOKEN), nonEmpty(push_config.PUSH_KEY), delimitedNonEmpty(push_config.BARK_PUSH),
-    nonEmpty(push_config.QYWX_KEY), parseWxPusherChannels().length > 0, nonEmpty(push_config.WX_XIZHI_KEY),
-    nonEmpty(push_config.DEER_KEY), delimitedNonEmpty(push_config.PUSHME_KEY),
-    nonEmpty(push_config.TG_BOT_TOKEN) && nonEmpty(push_config.TG_USER_ID)
-  ]
-  if (!configuredFlags.some(Boolean)) {
+  // 启用清单又把它计为已配置，最终出现「无实际设备却虚假成功」的 P1。
+  // v3.273（审查 S7/F3）：谓词收成模块级 nonEmpty/delimitedNonEmpty，各处共用同一口径。
+  // C8-009：启用判定与执行体都由 CHANNELS 表派生（此前 configuredFlags 与 channelTasks 各抄一份
+  // 9 通道清单、只靠下标对齐，漏一个就静默失效）。两者的差别只有 desp 来源——wxpusher 用原始 desp
+  // （contentType=2 渲染 HTML），其余 8 个用降级后的 textDesp——这一条由表里的 rawDesp 标记表达。
+  const enabledTasks = enabledChannels()
+  if (enabledTasks.length === 0) {
     const error = new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）')
     error.code = 'NO_CHANNEL_CONFIG'
     throw error
@@ -1837,18 +1868,6 @@ async function sendNotify (text, desp, params = {}) {
   // C8-002：HTML 形态的 desp 只有 wxpusher 能真渲染（contentType=2），其余 8 个通道统一改用降级后的
   // textDesp（HTML→Markdown→纯文本），避免段落换行丢失 / <img> 连 alt 消失 / 源码外露。
   const textDesp = htmlToPlainText(desp)
-  const channelTasks = [
-    [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, textDesp, params)],
-    [configuredFlags[1], 'server酱', () => serverNotify(text, textDesp, params)],
-    [configuredFlags[2], 'bark', () => barkNotify(text, textDesp, params)],
-    [configuredFlags[3], '企业微信', () => qywxBotNotify(text, textDesp, params)],
-    [configuredFlags[4], 'wxpusher', () => wxPusherNotify(text, desp, params)],
-    [configuredFlags[5], '息知', () => wxXiZhiNotify(text, textDesp, params)],
-    [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, textDesp, params)],
-    [configuredFlags[7], 'pushme', () => pushMeNotify(text, textDesp, params)],
-    [configuredFlags[8], 'telegram', () => tgNotify(text, textDesp, params)]
-  ]
-  const enabledTasks = channelTasks.filter(([enabled]) => enabled)
   // P3（跨批协同，low）：向调用方（Pusher）透出本次 sendNotify 的「在飞/已结算通道」状态。
   // Pusher 的整体超时（10s race）会在 slim 的 Promise.allSettled 尚未 settle 时触发，此前只能按
   // 静态配置清单把【所有】配置通道都标成 PUSH_TIMEOUT（含已成功通道）；有了在飞清单，超时归因
@@ -1859,18 +1878,19 @@ async function sendNotify (text, desp, params = {}) {
   const inFlightTracker = params && params.inFlightTracker && typeof params.inFlightTracker === 'object'
     ? params.inFlightTracker
     : null
-  const pendingChannels = inFlightTracker ? enabledTasks.map(([, name]) => name) : null
+  const pendingChannels = inFlightTracker ? enabledTasks.map(channel => channel.name) : null
   if (inFlightTracker) inFlightTracker.pending = pendingChannels
   const trackSettle = (name) => {
     const idx = pendingChannels.indexOf(name)
     if (idx !== -1) pendingChannels.splice(idx, 1)
   }
   const results = await Promise.allSettled(
-    enabledTasks.map(([, name, task]) => {
+    enabledTasks.map((channel) => {
+      const task = () => channel.run(text, channel.rawDesp ? desp : textDesp, params)
       if (!pendingChannels) return task()
       let running
-      try { running = task() } catch (e) { trackSettle(name); throw e }
-      return Promise.resolve(running).finally(() => trackSettle(name))
+      try { running = task() } catch (e) { trackSettle(channel.name); throw e }
+      return Promise.resolve(running).finally(() => trackSettle(channel.name))
     })
   )
   const normalizeFailure = (reason, channel) => {
@@ -1889,9 +1909,9 @@ async function sendNotify (text, desp, params = {}) {
     return failure
   }
   const channelResults = results.map((result, index) => ({
-    channel: enabledTasks[index][1],
+    channel: enabledTasks[index].name,
     status: result.status,
-    failure: result.status === 'rejected' ? normalizeFailure(result.reason, enabledTasks[index][1]) : null
+    failure: result.status === 'rejected' ? normalizeFailure(result.reason, enabledTasks[index].name) : null
   }))
   const attempted = channelResults
   const okCount = attempted.filter(r => r.status === 'fulfilled').length
@@ -1910,7 +1930,40 @@ async function sendNotify (text, desp, params = {}) {
     error.successfulChannels = successfulChannels
     throw error
   }
-  return { successfulChannels, failures: failedChannels }
+  // C8-003：多目标通道（Bark/PushMe 按 # 分割）部分成功时，失败目标旧实现只留一行日志、零记账——
+  // 聚合只 resolve()，调用方（通道健康/告警/自检）只看到「通道成功」，坏目标每轮失败且每轮被
+  // 「至少一个成功」盖住。现把目标级失败整理成 partialFailures 一并返回：**不改 failures 语义**
+  // （通道整体仍算成功，既有「部分成功不得记失败」契约、缓存写入与通道健康口径都不动），
+  // 失败目标另有独立通道可读，并在 run.log 里留一条点名告警。
+  const partialFailures = []
+  results.forEach((result, index) => {
+    if (result.status !== 'fulfilled') return
+    const raw = result.value && Array.isArray(result.value.partialFailures) ? result.value.partialFailures : []
+    if (raw.length === 0) return
+    const channel = enabledTasks[index].name
+    for (const item of raw) {
+      const reason = item && item.error
+      const failure = new Error(`${channel} 部分目标发送失败: ${safeErr(reason) || '未知错误'}`)
+      // channel/target 是健康台账与告警的归属键；target 已是脱敏产物（maskUrl / maskKey）
+      failure.channel = channel
+      failure.target = item && typeof item.target === 'string' ? item.target : ''
+      failure.partial = true
+      try {
+        if (reason && typeof reason === 'object' && reason.code !== undefined) failure.code = reason.code
+        if (reason && typeof reason === 'object' && reason.providerCode !== undefined) failure.providerCode = reason.providerCode
+        const statusCode = failureStatusCode(reason)
+        if (statusCode !== null) failure.statusCode = statusCode
+      } catch (e) { /* 异常字段只保留安全消息 */ }
+      partialFailures.push(failure)
+    }
+  })
+  if (partialFailures.length > 0) {
+    logQuietly(() => console.warn(
+      `⚠️ 部分目标发送失败：${partialFailures.map(f => `${f.channel}(${f.target || '目标'})`).join('、')}` +
+      '；其余目标已送达，本条消息按通道成功处理（不重试失败目标）'
+    ))
+  }
+  return { successfulChannels, failures: failedChannels, partialFailures }
 }
 
 module.exports = { sendNotify, push_config, hasWxPusherConfigured, configuredChannelCount, configuredChannelNames, maskKey, maskUrl, safeSlice, safeErr, getWxPusherProfileSummary, printWxPusherProfileSummary, mdLinksToPlain, mdImagesToPlain, mdToPlain, looksHtml, stripAngleTags, pickWxPusherClickUrl }

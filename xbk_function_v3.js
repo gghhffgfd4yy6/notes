@@ -329,8 +329,14 @@ const Network = createNetwork({
 // ============================================================
 // 📤 Pusher — 推送层
 // ============================================================
+// C8-006：只注入工厂真正解构的依赖。此前这里还传了 looksLikeHtmlLinear（第三个键）——出口门槛
+// 在 v3.273 换成 looksLikeHtmlEnvelope 后，createPusher 早已不再解构它，这个注入是死接线：工厂静默
+// 丢弃、却让测试把「注入 3 键」钉成参数契约（test_utils_pure.js 的 pusherArgKeys）。
+// looksLikeHtmlLinear 仍保留**导出**：它不是死代码，test_filter.js 用它锁定「不跨界」语义（遇到 <
+// 就跳过，与宽松包络 looksLikeHtmlEnvelope 有意不同），只是生产链已不再用它当出口门槛。
 const { createPusher, looksLikeHtmlLinear } = profile3Require('xbk_pusher', () => require('./xbk_pusher'))
-const Pusher = createPusher({ Utils, getNotify, looksLikeHtmlLinear })
+// 注入面只留工厂真正解构的两个键（looksLikeHtmlLinear 只用于本文件的导出面，见下方 module.exports）
+const Pusher = createPusher({ Utils, getNotify })
 // ============================================================
 // 🗂️ FilterStore — 过滤规则覆盖文件存储层
 // ============================================================

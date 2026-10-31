@@ -231,7 +231,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-565"
+            mutate: "xbk_function_v3.js:1-571"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -271,14 +271,14 @@ jobs:
             src: "xbk_utils.js"
             mutate: "xbk_utils.js"
             config: "stryker.tap.config.js"
-          # sendnotify（1916 行，C8-015 密钥集缓存后重算）拆 2 段（v3.313 通知点击直达后重算；原 v3.279 基线 1612 行）
+          # sendnotify（1969 行，C8-003 目标级失败透出后重算）拆 2 段（v3.313 通知点击直达后重算；原 v3.279 基线 1612 行）
           - name: sendnotify-part1
             src: "xbk_sendNotify_slim.js"
             mutate: "xbk_sendNotify_slim.js:1-750"
             config: "stryker.tap.config.js"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1916"
+            mutate: "xbk_sendNotify_slim.js:751-1969"
             config: "stryker.tap.config.js"
           # 小文件各一任务
           - name: failure-policy

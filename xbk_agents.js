@@ -478,6 +478,52 @@ function invalidateDns (hostname) {
 // 既要挡住误填，也不能收紧既有合法用途。
 const MAX_PREWARM_TLS_CONNECTIONS = 64
 
+// C10-073：预热 GET 回退的响应体上限。与 xbk_http.js 的 DEFAULT_MAX_BODY 同值同口径（那边是 20MB），
+// 但**不 require xbk_http**——xbk_http 反向 require 本文件，循环依赖会让其中一侧在加载期拿到 undefined
+// （谁先被 require 谁就拿不到对方的导出）。两处一致性由 test_tls_prewarm.js 直接比对常量断言。
+const PREWARM_BODY_CAP = 20 * 1024 * 1024
+
+// C10-073：「有上限」的预热 GET。预热只为建连、正文不需要，但也不能一律 destroy——不读完响应体
+// socket 就回不到 keep-alive 池，预热本身失去意义。故：逐块累计，未超限则读到 end（连接回池），
+// 超限立刻 destroy 并停止读取（此时 TLS 握手早已成功，按 ok:true 记建连 + bodyExceeded 供诊断）。
+// 用 stream 而不是 got.get：got@11 没有 maxResponseSize 选项，got.get 的 promise 要等整个响应体读完
+// 才 settle（实测 8MB 响应体会被完整读入）。
+function prewarmConnectGet (url, options) {
+  return new Promise((resolve, reject) => {
+    // 替身/精简版 got 没有 stream.get（真实 got 恒有）：回落到 got.get，保持既有可测路径不变
+    if (!got.stream || typeof got.stream.get !== 'function') {
+      got.get(url, options).then(() => resolve({ bodyExceeded: false }), reject)
+      return
+    }
+    let stream
+    try {
+      stream = got.stream.get(url, options)
+    } catch (e) {
+      reject(e)
+      return
+    }
+    let received = 0
+    let settled = false
+    const finish = (err, value) => {
+      if (settled) return
+      settled = true
+      if (err) reject(err)
+      else resolve(value)
+    }
+    // error 用 on（不是 once）：destroy 之后可能再冒一个 ERR_STREAM_PREMATURE_CLOSE，settle 已完成后
+    // 它必须仍被消费掉，否则会变成未捕获的 'error' 事件把进程打挂
+    stream.on('error', (e) => finish(e))
+    stream.on('data', (chunk) => {
+      received += chunk && chunk.length ? chunk.length : 0
+      if (received > PREWARM_BODY_CAP) {
+        stream.destroy()
+        finish(null, { bodyExceeded: true })
+      }
+    })
+    stream.once('end', () => finish(null, { bodyExceeded: false }))
+  })
+}
+
 async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null) {
   const started = Date.now()
   // AGENTS-07：所有出口都带 kind，调用方可按字段区分 DNS/TLS（两条预热路径的返回值都带 hostname）
@@ -489,9 +535,8 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
     // （xbk_app.js 先判 skipped 再报「跳过」，qinglong 只在 PROFILE3 打点）。
     if (!got.stream) return { kind: 'tls', hostname, count, skipped: true, ok: false, okCount: 0, error: 'got.stream 不可用（未建连）', elapsedMs: Date.now() - started }
   } catch (e) { /* 忽略 */ }
-  // AGENTS-05（已知缺口，未改行为）：本 HEAD→GET 回退只为建连、但 await 会读完整个响应体，而这里没有
-  // 体量上限——got@11 无 maxResponseSize 选项，xbk_http.js 的 20MB 上限只覆盖 fetchJson。补上限需要
-  // 统一的响应体策略，属跨文件口径决策，故仅记录现状。
+  // AGENTS-05 / C10-073：本 HEAD→GET 回退只为建连。旧实现 await got.get 会读完整个响应体且零上限；
+  // 现由 prewarmConnectGet 逐块累计、超 PREWARM_BODY_CAP（= xbk_http 的 20MB 口径）即 destroy。
   const baseOptions = {
     ...baseRequestOptions(),
     timeout: timeoutMs,
@@ -512,11 +557,15 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   // catch）都要回退 GET 建连，旧实现把同一段回退逐字写了两份——修一处漏一处必然漂移（AGENTS-06 的取消语义
   // 就是这样补了两次）。收敛成单一实现：先看取消 → GET → 成功标 viaGet / 失败按取消或错误归类，
   // 结果对象形状与两份旧代码逐字段一致（cancelled / error / viaGet 三选一 + elapsedMs）。
+  // C10-073：GET 回退必须有体量上限。预热只为建连、正文一点不需要，而旧实现 await got.get(...) 会把
+  // 整个响应体读进内存（× count 条连接，最多 64 条）；got@11 没有 maxResponseSize 选项，xbk_http.js
+  // 的 DEFAULT_MAX_BODY 只覆盖 fetchJson ⇒ 此路径此前零上限。口径直接复用 DEFAULT_MAX_BODY（不新造
+  // 数字），实现用 got.stream.get 逐块累计：超限立即 destroy 并停止读取。
   const fallbackGet = async (singleStart) => {
     if (signal && signal.aborted) return { ok: false, cancelled: true, elapsedMs: Date.now() - singleStart }
     try {
-      await got.get(`https://${hostname}/`, baseOptions)
-      return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true }
+      const outcome = await prewarmConnectGet(`https://${hostname}/`, baseOptions)
+      return { ok: true, elapsedMs: Date.now() - singleStart, viaGet: true, ...(outcome && outcome.bodyExceeded ? { bodyExceeded: true } : {}) }
     } catch (e2) {
       // v3.233/AGENTS-06：GET 独立捕获，失败绝不再落回外层 catch 重发一次 GET（同一主机重复建连）；
       // 回退期间被 abort 时返回 cancelled 而非普通 error。
@@ -553,4 +602,4 @@ async function prewarmTls (hostname, timeoutMs = 5000, count = 1, signal = null)
   }
 }
 
-module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS, DNS_REAL_INFLIGHT_MAX }
+module.exports = { AGENTS, DNS_LOOKUP_IP_VERSION, dnsLookup, invalidateDns, shouldInvalidateDns, profileMs, baseRequestOptions, invalidateDnsForError, prewarmDns, prewarmTls, PREWARM_BODY_CAP, DNS_PENDING_MAX_WAITERS, DNS_PENDING_TIMEOUT_MS, DNS_INFLIGHT_MAX, DNS_INFLIGHT_MAX_PER_KEY, DNS_INFLIGHT_MAX_AGE_MS, DNS_REAL_INFLIGHT_MAX }
