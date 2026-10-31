@@ -10369,6 +10369,62 @@ async function main () {
     }
   })
 
+  // C2-015：分发器此前没有外层 try/catch（只有 new URL 一处单独兜底），一次同步 TypeError
+  // 就是进程级 uncaughtException ⇒ 整个看板下线。这里直接把一个「鉴权阶段同步抛错」的请求
+  // 喂给 request 监听器（真实 HTTP 里 req.headers 恒存在，用它只为驱动外层兜底），断言
+  // 回 500、日志可 grep、且监听器/进程仍然存活。
+  await aok('分发器: handler 同步抛错回 500，且不带走进程', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    // 假响应：dispatchRequest 只用 on/writeHead/end（sendJson 的两个出口）。
+    const fakeRes = (headersSent) => ({
+      headersSent,
+      statusCode: 0,
+      body: '',
+      destroyed: false,
+      setHeader () {},
+      writeHead (code) { this.statusCode = code; this.headersSent = true },
+      end (body) { this.body = String(body === undefined ? '' : body) },
+      on () {},
+      destroy () { this.destroyed = true }
+    })
+    const captured = []
+    const savedError = console.error
+    try {
+      console.error = (msg) => { captured.push(String(msg)) }
+      // ① 响应头还没发：兜底必须回 500，且响应体不带内部细节。
+      const plain = fakeRes(false)
+      server.emit('request', { method: 'GET', url: '/api/status', socket: {} }, plain)
+      assert.strictEqual(plain.statusCode, 500, '同步抛错必须回 500')
+      assert.match(plain.body, /internal error/, '500 体不得泄露内部错误信息')
+      assert.ok(captured.some((line) => line.includes('控制台端点异常（dispatch）')), '兜底路径必须落一行可 grep 日志')
+      // ② 响应头已发：再写 500 会二次抛 ERR_HTTP_HEADERS_SENT，只能断链。
+      const halfSent = fakeRes(true)
+      server.emit('request', { method: 'GET', url: '/api/status', socket: {} }, halfSent)
+      assert.strictEqual(halfSent.statusCode, 0, 'headersSent 后不得再写状态行')
+      assert.strictEqual(halfSent.destroyed, true, 'headersSent 后必须断链（兜底自身不得二次抛错）')
+    } finally {
+      console.error = savedError
+    }
+    try {
+      // 兜底不能把监听器/进程一起带走：同一个 server 仍然正常服务。
+      const alive = await request(port, 'GET', '/api/status', { token: TOKEN })
+      assert.strictEqual(alive.status, 200, '分发器越界异常之后服务仍可正常响应')
+
+      // 进程级还有一道：main() 必须注册 uncaughtException（记日志后 exit(1)，不吞掉继续跑）。
+      const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+      const mainBody = codeOf(sliceBetween(src, 'function main () {', 'if (require.main === module) main()', 'main() 函数体'))
+      assert.ok(mainBody.includes("process.on('uncaughtException'"), 'main() 必须注册 uncaughtException 兜底')
+      assert.match(mainBody, /uncaughtException[\s\S]{0,600}process\.exit\(1\)/,
+        'uncaughtException 必须记日志后 exit(1)；吞掉继续跑会把未知状态当正常服务')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   // ── v3.374 信任设备（「记住这台设备」）──────────────────────────────────────
   await aok('信任设备: 签发→验证、篡改/过期/revoke 后失败、21 台淘汰最旧、2FA 关闭不认', () => {
     const dir = tmpDir()

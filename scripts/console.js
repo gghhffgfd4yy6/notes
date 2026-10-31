@@ -5435,7 +5435,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
 
-  const server = http.createServer((req, res) => {
+  // 分发器外层兜底（C2-015）：请求处理里任何**同步**抛错（参数形态、注入依赖、库内部）
+  // 此前只有 new URL 一处单独兜住，之后 1100+ 行的分发没有任何外层保护 ⇒ 一句 TypeError
+  // 就是进程级 uncaughtException ⇒ 整个看板下线（systemd 重启周期内都不可用）。
+  // 把分发体抽成 dispatchRequest，createServer 回调只保留这一层 try/catch 边界。
+  // 只兜同步异常：异步路径各自已有 .catch（logCaught + 5xx），不靠这层。
+  const dispatchRequest = (req, res) => {
     // 协商式压缩的每请求决策（v3.373 gzip，v3.382 起 br 优先）：JSON 出口（sendJson /
     // sendJsonConditional）与 SPA 页面出口读这个标记——SSE、导出附件、登录页各自直接 writeHead，
     // 按语义不压缩（压缩在边缘完成，见 sendJson 注释）。
@@ -6639,6 +6644,24 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     sendJson(res, 404, { error: 'not found' })
+  }
+  const server = http.createServer((req, res) => {
+    try {
+      dispatchRequest(req, res)
+    } catch (e) {
+      logCaught('dispatch', e)
+      // 响应头已发出：再写 500 会二次抛 ERR_HTTP_HEADERS_SENT，把兜底自己变成崩溃点；
+      // 此时只能断链（客户端看到连接中断，好过挂到读超时）。
+      if (res.headersSent) {
+        try { res.destroy() } catch (e2) { /* 连接已断 */ }
+        return
+      }
+      try {
+        sendJson(res, 500, { error: 'internal error' })
+      } catch (e2) {
+        try { res.destroy() } catch (e3) { /* 连接已断 */ }
+      }
+    }
   })
   // Sourcery High：关闭时终止所有活跃子进程（SIGKILL），避免控制台停了触发任务还在跑。
   // 覆写 close：先杀子进程再走原生 close；'close' 事件再兜底清一次。
@@ -6779,6 +6802,16 @@ function listenErrorHint (code, host, port) {
 }
 
 function main () {
+  // 进程级兜底（C2-015）：分发器已有外层 try/catch，但仍可能有同步异常从别的入口漏出来
+  // （定时器回调、SSE tick、模块级回调、启动期装配）。默认行为是打一整段栈后直接退出、
+  // 没有任何可 grep 的结论，systemd 每 5s 拉起一次也看不出根因——这里补一行结论再退出。
+  // 有意不吞掉继续跑：异常发生时进程状态未知（可能是半把锁、半个写），继续服务比重启更危险。
+  process.on('uncaughtException', (e) => {
+    try {
+      console.error(`❌ 控制台未捕获异常，按 fail-closed 退出（交 systemd 重启）：${(e && e.stack) || e}`)
+    } catch (e2) { /* stderr 都写不了：只能直接退出 */ }
+    process.exit(1)
+  })
   const token = process.env.XBK_CONSOLE_TOKEN
   // Sourcery #225 M5：XBK_CONSOLE_PORT 非空但非法（非数字/超范围）时 Number() 得 NaN，
   // 旧 || 7777 会把合法的 0（随机端口）一起吞掉；先区分「未设置」与「设了但坏」——
