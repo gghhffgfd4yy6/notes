@@ -164,6 +164,10 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
       // C9-007：正文整次扫描只归一化一次——逐条谓词里再归一化等于「规则数 × 文本长度」的白扫
       // （归一化是纯函数，同一输入结果恒定）；分类名的归一化由 _firstMatchingRule 做一次。
       const text = RuleEngine._normalizeMatchText(value)
+      // 归一化吐 null = 该字段值不可判定（ToString/Symbol 抛错），必须与「字段缺失」同口径不命中：
+      // 直接交给 .test 会把 null 当字面量 'null' 去匹配（值侧模式 /null/、/.*/ 一命中，
+      // 判定就从「放行」翻成「拦截」，方向是本项目最忌的少推）。
+      if (text === null) return { hit: false, rule: null }
       const rule = RuleEngine._firstMatchingRule(compiled.rules, catename, r => RuleEngine._safeTestText(r.val, text))
       return { hit: rule !== null, rule }
     }
