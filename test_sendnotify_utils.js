@@ -865,7 +865,10 @@ function assertSettled (outcome, label, why) {
     const saved = {}
     const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
     for (const k of Object.keys(cfg)) saved[k] = cfg[k]
-    let handler = () => ({ body: { code: 200 } })
+    // 「URL → 响应体」表只有一个实现：原先写成零参默认值、再由下面的用例体覆盖，那个默认值从未
+    // 被执行过（死默认），零参形态还让 Sonar 判 javascript:S930「函数不收参数却传了 1 个」。
+    // 这里按真实签名（收 url）声明唯一实现，Bark 一成一败的判据不变。
+    const handler = (url) => ({ body: url.includes('c8ok') ? { code: 200 } : { code: 500, message: 'device key invalid' } })
     gotMod.stream = gotMod.stream || {}
     gotMod.stream.post = (url) => {
       const em = new EventEmitter()
@@ -885,7 +888,6 @@ function assertSettled (outcome, label, why) {
     try {
       clearCfg()
       cfg.BARK_PUSH = 'https://api.day.app/c8ok#https://api.day.app/c8bad'
-      handler = (url) => ({ body: url.includes('c8ok') ? { code: 200 } : { code: 500, message: 'device key invalid' } })
       const res = await slim.sendNotify('T', 'D')
       // ① 通道整体仍算成功（v3.166 语义与缓存写入口径不动）
       assert.deepStrictEqual(res.successfulChannels, ['bark'], '一成一败仍算通道成功')

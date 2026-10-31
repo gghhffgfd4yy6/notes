@@ -11877,6 +11877,32 @@ async function main () {
       '两个 aria 引用必须同时挂在 <dialog> 上（只留一个等于把标题或正文丢弃）')
   })
 
+  // ── SonarCloud javascript:S1523 ×3（本文件三处 vm.runInNewContext，告警落在 C7-030 / C7-032 用例）──
+  // 判「误报」**不能**靠「沙箱内取不到 process」这类能力论据：vm 不是安全边界——以宿主对象作沙箱时，
+  // 切片代码能经 this.constructor.constructor('return process')() 取回宿主 realm（Node 22 实测可取到
+  // process.version；`{}` 这种空沙箱同样成立），今天取不到不等于明天取不到。
+  // 成立的论据只有两条：
+  // ① 输入来源：被执行的字符串全部来自本仓库源码的切片（api.js 的 COND_CACHE 块、acorn 定位的
+  //    ui.js refreshActive、ui.js 里那条真实调用行），提交时就已固定、随 diff 一起评审；这些字符串
+  //    不经任何 HTTP 输入（请求头/体/查询串/用户配置都进不来）⇒ 没有「变量输入到达代码生成 sink」。
+  // ② 执行边界：被执行的代码就是被测模块自身的仓库源码，与 require 它的信任级相同；若源码是恶意的，
+  //    测试进程在读取/require 那一步就已失守，用不用 vm 不改变结论。
+  // 结论：S1523 的风险模型（不受信输入 → 动态执行）在此不成立 ⇒ 判误报、不改执行方式；下面这条
+  // 用例把论据本身钉住（退回可被实测证伪的说法即红）。
+  await aok('结构红线: S1523 ×3 判误报的论据必须写「输入来源 + 执行边界」（不得用可被实测证伪的沙箱能力论据）', () => {
+    const src = fs.readFileSync(__filename, 'utf8')
+    // 只切论据块本身来断言：断言文本若直接写在同一字符串里会「自证」，那就锁不住论据被删。
+    const block = sliceBetween(src, '// ── SonarCloud javascript:S1523', "await aok('结构红线: S1523", 'S1523 误报论据块')
+    assert.ok(block.includes('vm 不是安全边界'), '必须写明 vm 不是隔离边界：空沙箱也能取回宿主 realm，能力面会变')
+    assert.ok(block.includes('① 输入来源：被执行的字符串全部来自本仓库源码的切片'),
+      '必须点名输入来源是仓库源码切片（S1523 的风险模型需要不受信输入到达 sink）')
+    assert.ok(block.includes('② 执行边界：被执行的代码就是被测模块自身的仓库源码'),
+      '必须写明执行边界：与被测模块同信任级，源码恶意则测试进程早已失守')
+    const abilityArgs = block.split('\n').filter((line) => line.includes('沙箱') && line.includes('拿不到'))
+    assert.deepStrictEqual(abilityArgs, [],
+      '不得再用「沙箱内取不到宿主能力」这类能力论据（能力面可被实测证伪，只能按输入来源判定）')
+  })
+
   await aok('行为: C7-030 条件缓存按最近使用淘汰（热键 runs/config 不得被新分页键挤掉）', () => {
     // 直接跑 api.js 里**真实**的缓存策略（切片自源码，不是本用例自写的副本）：
     // Map 的插入序在这里就是淘汰序，所以「命中是否挪到队尾」能被行为断言抓住。
@@ -12009,6 +12035,8 @@ async function main () {
   await aok('行为: C7-032 回前台补拉区分「跳过」与「真失败」（跳过不得留告警，真失败必须留）', async () => {
     // 直接执行 ui.js 里真实的 refreshActive 与真实的调用行（src slice + vm），不重写一份等价逻辑：
     // 重写的实现改了 ui.js 也不会红。改回「跳过也返回 false / 调用点用 ok === false 判失败」时本用例红。
+    // 下面两处 vm.runInNewContext 同属 S1523 判误报面：论据（输入来源 = 仓库源码切片、执行边界 = 与
+    // 被测模块同信任级、vm 不是安全边界）见上方「结构红线: S1523 ×3 …」用例的块注释，此处不改执行方式。
     const acorn = require('acorn')
     const vm = require('node:vm')
     const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')

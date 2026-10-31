@@ -1606,7 +1606,11 @@ check('PKG_VERSION 回退口径：trim、有限数值、null/NaN/带 trim 的脏
   const pusherFactorySrc = require('node:fs').readFileSync(require('node:path').join(__dirname, 'xbk_pusher.js'), 'utf8')
   const factoryHead = /function createPusher\s*\(\s*\{([^}]*)\}/.exec(pusherFactorySrc)
   assert.ok(factoryHead, 'xbk_pusher 必须仍以 function createPusher ({ ... }) 形态声明注入面')
-  assert.strictEqual(factoryHead[1].split(',').map(s => s.trim()).filter(Boolean).sort().join(','),
+  // 显式码元序比较器（Sonar javascript:S2871 要求 sort() 带比较函数）：默认 sort() 对字符串正是
+  // 逐 UTF-16 码元比较，把它写实后断言值一字不变；刻意不用消息里建议的 localeCompare——它随宿主
+  // ICU/locale 变序，会与 out.pusherArgKeys（默认 sort 的码元序）错开，断言随机器漂移。
+  const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+  assert.strictEqual(factoryHead[1].split(',').map(s => s.trim()).filter(Boolean).sort(byCodeUnit).join(','),
     out.pusherArgKeys,
     '组合根注入的键必须与 createPusher 解构的键逐字一致（多传的键是死接线，少传会静默 undefined）')
 })
