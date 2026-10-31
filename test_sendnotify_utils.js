@@ -665,7 +665,22 @@ function assertSettled (outcome, label, why) {
       assert.strictEqual(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c3), false,
         '截断不得留下孤立代理（代理对必须整体保留或整体丢弃）')
       assert.ok(Buffer.byteLength(c3, 'utf8') <= 4096, '代理对场景同样不得超预算')
-      console.log('✅ PlanD truncateBytes：经企微通道观测字节级截断（短正文原样 / 超长 ≤4096 且合法 UTF-8 / 代理对不孤立）')
+      // ④ C8-010：按字节截断必须是**二分**（log2(maxBytes) 级探测），不是逐字符回退（O(n²)）。
+      // 判据取「Buffer.byteLength 调用次数」这一确定性量，而不是计时：旧实现（逐字符 cut = cut.slice(0,-1)）
+      // 同一输入实测 2637 次，二分 13 次，差两个数量级；计时断言在 CI 上正是本仓已登记 flake 的来源
+      // （见 test_sendnotify_pure.js 的 PERF_MS 缩放小节），故这里用可数不变量锁住形状。
+      captured.length = 0
+      const origByteLength = Buffer.byteLength
+      let byteLengthCalls = 0
+      Buffer.byteLength = function (...args) { byteLengthCalls++; return origByteLength.apply(Buffer, args) }
+      try {
+        await slim.sendNotify('T', '中'.repeat(4000)).catch(() => {})
+      } finally {
+        Buffer.byteLength = origByteLength
+      }
+      assert.ok(byteLengthCalls < 100,
+        `truncateBytes 必须二分（同一输入逐字符回退实测 2637 次 byteLength），实际 ${byteLengthCalls} 次`)
+      console.log('✅ PlanD truncateBytes：经企微通道观测字节级截断（短正文原样 / 超长 ≤4096 且合法 UTF-8 / 代理对不孤立 / 二分形状）')
     } finally {
       if (origStreamPost) gotMod.stream.post = origStreamPost
       clearCfg()

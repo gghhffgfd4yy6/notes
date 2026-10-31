@@ -570,14 +570,10 @@ function serverNotify (text, desp, params = {}) {
     if (PUSH_KEY) {
       // v3.176：PUSH_KEY 数字/对象脏配置 → String 化（曾 .includes 抛 TypeError 通道静默失败）
       const pushKey = String(PUSH_KEY)
-      // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断
-      // （安全处理代理对：末尾高代理退一位，避免切坏 emoji）
-      if (text.length > 32) {
-        let cut = text.slice(0, 32)
-        const last = cut.charCodeAt(cut.length - 1)
-        if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1)
-        text = cut
-      }
+      // v3.126：Server酱 title 上限 32 字符——主代码 titleMax=100 不满足，此处通道层精准截断。
+      // C8-010：改用 safeSlice（= 主代码 Utils.truncateUtf16 薄封装），不再手写「只退高代理」的
+      // 第二份实现——手写版缺 VS16/ZWJ/组合字符退位，会把 ❤️/👨‍👩‍👧‍👦 切成半截序列。
+      text = safeSlice(text, 32)
       // 微信server酱推送通知一个\n不会换行，需要两个\n才能换行，故做此替换
       // v3.148：只加倍"单个 \n"——\n\n（Markdown 段落分隔）已是 Server酱换行格式，曾整体加倍成 \n\n\n\n 大段空白
       desp = desp.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/([^\n])\n(?!\n)/g, '$1\n\n')
@@ -1618,14 +1614,23 @@ function tgNotify (text, desp, params = {}) {
 }
 
 // 按 UTF-8 字节截断（v3.139：企微 markdown content 4096 字节上限；代理对安全——末尾高代理退一位）
+// C8-010：逐字符回退（`while (… > maxBytes) cut = cut.slice(0, -1)`）是 O(n²)——4096 字节上限、
+// 3000 汉字时要退约 1600 次、每次都对整串重算 byteLength（审查实测 3.92ms/次，每次企微推送都付）。
+// 改二分：byteLength 对前缀是单调的，log2(4096)≈12 次探测即得最长合法前缀，语义（≤maxBytes 的最长
+// 前缀 + 不留孤立高代理）与旧实现逐字一致，由 test_sendnotify_utils 的 PlanD 通道级用例锁定。
 function truncateBytes (s, maxBytes) {
   const str = String(s === undefined || s === null ? '' : s)
   if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str
-  let cut = str.slice(0, maxBytes) // 近似（UTF-8 多字节可能超）
-  while (Buffer.byteLength(cut, 'utf8') > maxBytes) cut = cut.slice(0, -1)
-  const last = cut.charCodeAt(cut.length - 1)
-  if (last >= 0xD800 && last <= 0xDBFF) cut = cut.slice(0, -1) // 高代理退位
-  return cut
+  let lo = 0
+  let hi = Math.min(str.length, Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0)
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes) lo = mid
+    else hi = mid - 1
+  }
+  // 末位若是高代理，说明切在代理对中间：回退一格丢弃半个码点（不留孤代理）
+  if (lo > 0 && str.charCodeAt(lo - 1) >= 0xD800 && str.charCodeAt(lo - 1) <= 0xDBFF) lo -= 1
+  return str.slice(0, lo)
 }
 
 // markdown → 纯文本（v3.128：Bark/Push+ 不支持 markdown 渲染，desp 会显示 ** 等原始符号）
