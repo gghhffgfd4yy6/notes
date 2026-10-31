@@ -128,6 +128,8 @@ const {
   base32Encode, base32Decode, generateTotpSecret, totpQrDataUrl, totpCodeAt, verifyTotpCode,
   generateRecoveryCodes, recoveryRecordOf, consumeRecoveryCode,
   makeTwoFactorCookie, verifyTwoFactorCookie, loadTwoFactorState, TWO_FACTOR_FILE,
+  // C2-014：限速阈值从实现取，测试不自己写死 10
+  TWO_FACTOR_LOGIN_MAX_FAILS,
   // v3.374 信任设备：签发/校验纯函数 + 落盘读写
   DEVICE_FILE, DEVICE_COOKIE, DEVICE_TTL_MS, DEVICE_MAX,
   makeDeviceRecord, parseDeviceCookie, trustedDeviceOf, appendDeviceRecord,
@@ -10361,6 +10363,49 @@ async function main () {
       res = await request(port, 'POST', '/login', {
         body: new URLSearchParams({ token: TOKEN, code: fresh }).toString(),
         headers: { ...form, 'x-forwarded-for': '203.0.113.78' }
+      })
+      assert.strictEqual(res.status, 303, '不同客户端 IP 不应被同一把锁误伤')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // C2-014：2FA 关闭是默认部署形态，此前限速整段写在 `if (twoFactor.enabled)` 里 ⇒ 单因子
+  // 登录既不查限速也不计数，访问令牌可被无限在线穷举。这条锁死「两条失败路径都计数」，
+  // 阈值仍是实现里的 10 次 / 5 分钟（用例不自带数字，改阈值时这条跟着走）。
+  await aok('登录: 2FA 关闭时错误令牌同样计入限速（默认部署不能无限猜）', async () => {
+    const dir = tmpDir()
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    server.unref()
+    const form = { 'content-type': 'application/x-www-form-urlencoded' }
+    // 走 XFF 模拟代理后的客户端：loopback 直连时 clientAddress 才认这个头。
+    const clientA = { ...form, 'x-forwarded-for': '198.51.100.24' }
+    try {
+      let res
+      for (let i = 0; i < TWO_FACTOR_LOGIN_MAX_FAILS; i++) {
+        res = await request(port, 'POST', '/login', {
+          body: new URLSearchParams({ token: 'wrong-token-0000000000' }).toString(),
+          headers: clientA
+        })
+        assert.strictEqual(res.status, 401, `第 ${i + 1} 次错误令牌只回登录页（未到阈值）`)
+        assert.ok(res.text.includes('需要访问令牌'), '2FA 关闭时错误凭证回单因子登录页')
+      }
+      // 已达阈值（10 次）：正确令牌也必须先吃 429——限速先于凭证比较。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN }).toString(),
+        headers: clientA
+      })
+      assert.strictEqual(res.status, 429, '2FA 关闭时错误令牌也必须计入限速')
+      assert.ok(res.text.includes('尝试次数过多'), '限速页给出可读原因')
+      assert.ok(res.text.includes('需要访问令牌'), '限速页仍是单因子登录页')
+      assert.ok(!res.text.includes('name="code"'), '2FA 未开启时不得渲染验证码输入框')
+
+      // 按来源 IP 隔离：换一个客户端不能跟着被锁。
+      res = await request(port, 'POST', '/login', {
+        body: new URLSearchParams({ token: TOKEN }).toString(),
+        headers: { ...form, 'x-forwarded-for': '198.51.100.25' }
       })
       assert.strictEqual(res.status, 303, '不同客户端 IP 不应被同一把锁误伤')
     } finally {

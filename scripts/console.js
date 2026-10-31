@@ -5511,19 +5511,27 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         const params = new URLSearchParams(body)
         const submitted = params.get('token') || ''
         const code = params.get('code') || ''
+        // 限速先于任何凭证比较，且不区分 2FA 是否开启（C2-014）：此前整段限速写在
+        // `if (twoFactor.enabled)` 分支内，2FA 关闭（默认部署）走 else 直接 401、既不查
+        // 也不计数 ⇒ 单因子部署的访问令牌可被无限在线穷举（token 再长也怕字典）。
+        // 阈值/窗口保持原值（10 次 / 5 分钟），这里只是把「查限速」与「计数」提到分支外。
+        if (loginThrottled(req)) {
+          // 2FA 关闭时回单因子登录页（不渲染验证码输入框），隐藏 token 只在挑战页有意义。
+          sendHtml(res, 429, renderUnauthorizedPage({
+            requireCode: twoFactor.enabled,
+            token: twoFactor.enabled ? submitted : '',
+            error: '尝试次数过多，请 5 分钟后再试。'
+          }))
+          return
+        }
+        if (!timingSafeEqualStr(submitted, token)) {
+          // 与「令牌通过但缺验证码」返回同一个挑战页，不暴露第一因子是否猜中；
+          // hidden 里回填的是本次提交值（无效），不会变成可用凭证。
+          noteLoginFailure(req)
+          sendHtml(res, 401, renderUnauthorizedPage(twoFactor.enabled ? { requireCode: true, token: submitted } : {}))
+          return
+        }
         if (twoFactor.enabled) {
-          // 先限速再看令牌：否则错误令牌在比较处提前返回，第一因子可无限猜。
-          if (loginThrottled(req)) {
-            sendHtml(res, 429, renderUnauthorizedPage({ requireCode: true, token: submitted, error: '尝试次数过多，请 5 分钟后再试。' }))
-            return
-          }
-          if (!timingSafeEqualStr(submitted, token)) {
-            // 与「令牌通过但缺验证码」返回同一个挑战页，不暴露第一因子是否猜中；
-            // hidden 里回填的是本次提交值（无效），不会变成可用凭证。
-            noteLoginFailure(req)
-            sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted }))
-            return
-          }
           if (code.trim() === '') {
             sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted }))
             return
@@ -5539,11 +5547,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: submitted, error: why }))
             return
           }
-          clearLoginFailures(req)
-        } else if (!timingSafeEqualStr(submitted, token)) {
-          sendHtml(res, 401, renderUnauthorizedPage())
-          return
         }
+        // 成功即清空该来源的失败窗：否则 5 分钟内累计的旧失败会继续压着下一次登录。
+        clearLoginFailures(req)
         const cookies = [sessionCookieHeaderFor(req, token)]
         if (twoFactor.enabled) cookies.push(twoFactorCookieHeader(req, twoFactor.secret))
         // 「记住这台设备」（默认勾选）：签 90 天设备 cookie。只有真正过了第二因子才会走到这里，
