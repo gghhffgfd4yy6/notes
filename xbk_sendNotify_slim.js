@@ -1820,6 +1820,14 @@ function cleanSurrogates (s) {
   return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD')
 }
 
+// 同步调用取值：通道 run 既可能同步抛错（既有语义：从 map 直接抛给调用方），也可能返回 promise
+// （其拒绝由外层 Promise.allSettled 逐通道归因）。try 里只放 thunk() 一句、返回值是普通对象，
+// 不把 promise 留在 try 内——Sonar S4822 的判据正是「try 内全是 thenable ⇒ catch 抓不到拒绝」，
+// 而这里要抓的只有同步异常；把 promise 留在 try 里既误导读者、也会被规则判成假 catch。
+function callSync (thunk) {
+  try { return { ok: true, value: thunk() } } catch (e) { return { ok: false, error: e } }
+}
+
 async function sendNotify (text, desp, params = {}) {
   // v3.110：入口统一清洗孤立代理（encodeURIComponent 对孤立代理抛 URIError → 通道发送失败）
   text = cleanSurrogates(text)
@@ -1888,9 +1896,14 @@ async function sendNotify (text, desp, params = {}) {
     enabledTasks.map((channel) => {
       const task = () => channel.run(text, channel.rawDesp ? desp : textDesp, params)
       if (!pendingChannels) return task()
-      let running
-      try { running = task() } catch (e) { trackSettle(channel.name); throw e }
-      return Promise.resolve(running).finally(() => trackSettle(channel.name))
+      // 同步抛错：先把该通道从 pending 摘掉再抛（既有语义，旧实现直接从 map 抛出）；
+      // 返回的 promise 若拒绝，由外层 Promise.allSettled 归因到该通道。
+      const outcome = callSync(task)
+      if (!outcome.ok) {
+        trackSettle(channel.name)
+        throw outcome.error
+      }
+      return Promise.resolve(outcome.value).finally(() => trackSettle(channel.name))
     })
   )
   const normalizeFailure = (reason, channel) => {

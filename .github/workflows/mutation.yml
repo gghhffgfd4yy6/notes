@@ -278,7 +278,7 @@ jobs:
             config: "stryker.tap.config.js"
           - name: sendnotify-part2
             src: "xbk_sendNotify_slim.js"
-            mutate: "xbk_sendNotify_slim.js:751-1969"
+            mutate: "xbk_sendNotify_slim.js:751-1982"
             config: "stryker.tap.config.js"
           # 小文件各一任务
           - name: failure-policy
