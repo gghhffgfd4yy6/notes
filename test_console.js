@@ -3413,6 +3413,31 @@ async function reworkRegressionTests () {
       'readUpstreamTextCapped 必须 1 处定义 + 搜索/详情 2 个调用点')
   })
 
+  await aok('结构红线: 摘要正则只有一份（C10-057）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
+    assert.strictEqual((code.match(/total=\(\\d\+\) dedup=/g) || []).length, 1,
+      '摘要行正则只能有一处定义（parseLastRun 再内联一份就是回退了修复：两份的分组形态还会各自漂）')
+    const { RUN_SUMMARY_LINE_RE } = require('./scripts/status')
+    const m = RUN_SUMMARY_LINE_RE.exec('2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1.0s')
+    assert.ok(m, '摘要行必须能被这一份正则命中')
+    assert.strictEqual(m[1].trim(), '2026-09-08 10:00:00',
+      '分组 1 必须是整段时间戳（改成只有日期 ⇒ 面板「时间 2026-09-08」，S12/S13/S15 会红）')
+    assert.strictEqual(m[8], '1.0s', '分组 8 仍是 elapsed（分组编号被挤动过一次）')
+  })
+
+  await aok('结构红线: 日期回环校验服务端只有一份（C10-053）', () => {
+    const status = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
+    const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((status.match(/function isRealDayKey \(/g) || []).length, 1,
+      'isRealDayKey 只能在 status.js 定义一次（服务端唯一真源）')
+    assert.strictEqual((status.match(/toISOString\(\)\.slice\(0, 10\) === /g) || []).length, 1,
+      '回读比对只能出现在 isRealDayKey 里（readTrends 再内联一份就是回退了修复）')
+    assert.strictEqual((consoleSrc.match(/toISOString\(\)\.slice\(0, 10\) !== /g) || []).length, 0,
+      'console.js 不得自带回读比对（parseDayKey 必须调 isRealDayKey）')
+    assert.strictEqual((consoleSrc.match(/isRealDayKey/g) || []).length, 2,
+      'console.js 必须恰好一处 import + 一处调用 isRealDayKey')
+  })
+
   await aok('2FA 写端点: body 不是对象必须 400（C2-012）', async () => {
     const dir = mkTmp('xbk-console-c2012-')
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
