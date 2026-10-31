@@ -300,6 +300,13 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
 // maxBytes / options 透传给 readSafeTextResult：不传时与旧行为完全一致（不设上限、超限判 tooLarge），
 // 调用方可据此对这条读取入口显式设限（审查 STG-05：非法值由 readSafeTextResult 统一告警），
 // 或以 options.tail 只读尾部（审查 SS-03）。
+//
+// C3-015（契约收口）：本函数把**全部**非 ok 状态（missing / ioError / unsafe / tooLarge /
+// replaced / shortRead）折叠成 null —— 调用方无法区分「文件不存在」与「文件存在但读不出」，
+// 因此**不得**用它的返回值判断存在性，也不得据此做隔离/重建决策。需要区分原因时一律用
+// readSafeTextResult（返回 {status, text, error, empty, shortRead, truncated}）。
+// 现状：仓内生产代码没有调用方（仅 test_storage.js 覆盖本入口），故保留签名与语义不变；
+// 若将来新增生产调用方，必须先确认它要的是「内容或 null」而不是五种状态之一。
 function readSafeText (filePath, maxBytes, options) {
   const result = readSafeTextResult(filePath, maxBytes, options)
   return result.status === 'ok' ? result.text : null
