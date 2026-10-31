@@ -11557,6 +11557,30 @@ async function main () {
     assert.ok(fn.includes('snapshotOk(v, BOOT.version)'), 'readSnapshot 必须交给 pure.mjs 的 snapshotOk 判定')
     assert.ok(!fn.includes('typeof v.at'), '不得保留第二份浅校验（两套口径会分叉）')
   })
+
+  await aok('行为: C7-031 页签清单单一真源（filter 进 TAB_KEYS，ui.js 不再有正则补丁）', async () => {
+    const { TAB_KEYS, tabFromHash } = await import('./scripts/console-assets/pure.mjs')
+    // filter 必须由真源认识：旧实现靠 ui.js 的 /^#\/filter$/ 补丁，纯函数模块不认它。
+    assert.ok(TAB_KEYS.includes('filter'), 'TAB_KEYS 必须含 filter（否则 hash 路由又得靠补丁）')
+    assert.strictEqual(tabFromHash('#/filter'), 'filter', '#/filter 必须解析成 filter')
+    assert.strictEqual(tabFromHash('#/filter?tab=1'), 'overview', 'tabFromHash 只认裸 hash（带 query 的由 ui.js 先剥）')
+    assert.strictEqual(tabFromHash('#/nope'), 'overview', '非法 hash 仍回概览')
+    const ui = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'ui.js'), 'utf8')
+    // ① 页签清单必须由 TAB_KEYS 派生，不再写第二份键列表。
+    assert.ok(ui.includes('const TABS = TAB_KEYS.map((key) => ({ key, label: TAB_LABELS[key] }))'),
+      'TABS 必须由 TAB_KEYS 派生（旧实现是 App 里的第三份页签清单）')
+    assert.ok(!/'filter'/.test(sliceBetween(ui, 'const TABS =', '// 切页回到顶部', 'TABS 定义')),
+      'TABS 定义里不得再手写页签键（写死一处就多一处真源）')
+    // ② resolveTab 只留「剥 query」，filter 的专门补丁必须消失。
+    const resolve = sliceBetween(ui, 'const resolveTab =', 'const [tab, setTab]', 'resolveTab')
+    assert.ok(!resolve.includes('filter'), 'resolveTab 不得再为 filter 开特例（白名单已在 pure.mjs）')
+    assert.ok(resolve.includes("hash.split('?')[0]"), 'resolveTab 必须保留剥 query 的行为（#/messages?q=… 不能被判成非法）')
+    // ③ 每个键都要有中文名：新增页签只改 TAB_KEYS 却忘写名字时，标签栏会出现空按钮。
+    const labels = sliceBetween(ui, 'const TAB_LABELS = {', '// ── 主题', 'TAB_LABELS')
+    for (const key of TAB_KEYS) {
+      assert.ok(new RegExp('\\b' + key + ':').test(labels), `TAB_LABELS 缺少 ${key} 的中文名（会渲染成空标签）`)
+    }
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

@@ -5,7 +5,7 @@ import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, Button, LeaveGuard
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
 import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
-import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, snapshotOk, tabFromHash } from './pure.mjs'
+import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, snapshotOk, TAB_KEYS, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { Component, html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -85,6 +85,19 @@ function writeSnapshot (status, runs, startedAt) {
   } catch (e) { /* 隐私模式 / 超限：静默降级，数据面不受影响 */ }
 }
 const SNAPSHOT = readSnapshot()
+
+// 页签的中文名（C7-031）：键的真源是 pure.mjs 的 TAB_KEYS（路由、保活集合都认它），这里
+// 只补展示名，键的先后就是标签栏顺序。新增页签改两处即可（旧实现还要改 App 里的 TABS
+// 字面量与一条 /^#\/filter$/ 正则补丁）。漏写名字会渲染成空标签，标签栏一眼可见。
+const TAB_LABELS = {
+  overview: '概览',
+  messages: '推送记录',
+  search: '线报搜索',
+  logs: '运行日志',
+  config: '配置',
+  filter: '过滤规则',
+  sys: '系统'
+}
 
 // ── 主题（v3.323）──────────────────────────────────────────────────────────
 // 4 套配色只换 token（见 app.css 的 data-theme 块），不动布局。首帧由服务端把
@@ -169,15 +182,12 @@ function App () {
   // 不能等 Promise.allSettled 两边都落定才把「正在读取…」改成「读取失败」。
   const [statusFailed, setStatusFailed] = useState(false)
   // 标签页写 hash（v3.307）：刷新/后退不丢当前页；初始值从 hash 读，非法值回概览。
-  // v3.310「过滤规则」新增为第六个页签。pure.mjs 的 tabFromHash 只认 v3.307 的五个键
-  // （该模块本批不改），这里补一层本文件内的白名单，保持 hash 路由对新页签同样生效
-  // （刷新/后退不丢当前页；非法值仍回概览）。v3.370 的 search 已进 TAB_KEYS。
+  // v3.370 的 search 已进 TAB_KEYS（纯函数模块，Node 侧直接测）。
   // 推送记录页会把筛选条件写进 hash query（#/messages?q=…&page=3，见 buildMessagesHash）：
   // 解析页签前先剥掉 query，否则带参数的地址会被判成非法值、刷新后掉回概览。
-  const resolveTab = (hash) => {
-    const raw = typeof hash === 'string' ? hash.split('?')[0] : ''
-    return /^#\/filter$/.test(raw) ? 'filter' : tabFromHash(raw)
-  }
+  // C7-031：页签白名单**只有** TAB_KEYS 一处真源——旧实现在这里补了一条
+  // /^#\/filter$/ 的正则（filter 当年没进 TAB_KEYS），白名单与路由两套口径必然漂移。
+  const resolveTab = (hash) => tabFromHash(typeof hash === 'string' ? hash.split('?')[0] : '')
   const [tab, setTab] = useState(() => resolveTab(window.location.hash))
   // 切页入场（v3.360）：只动新页的 opacity/transform，不动高度 ⇒ 不改变滚动锚点、
   // 不会把首屏内容顶走。tab 变化只在真正切页时发生，轮询不触发。
@@ -989,17 +999,12 @@ function App () {
     if (data && data.auto) setAutoState(data.auto)
   }, [])
 
-  // v3.297 标签页状态：概览 / 推送记录 / 日志 / 系统。非概览页不跑主轮询，
-  // 避免每 5s 的 App 重渲染让推送记录/配置页「闪一下」（刷新记录页有自己的加载）。
-  const TABS = [
-    { key: 'overview', label: '概览' },
-    { key: 'messages', label: '推送记录' },
-    { key: 'search', label: '线报搜索' },
-    { key: 'logs', label: '运行日志' },
-    { key: 'config', label: '配置' },
-    { key: 'filter', label: '过滤规则' },
-    { key: 'sys', label: '系统' }
-  ]
+  // 页签清单单一真源（C7-031）：**键**只在 pure.mjs 的 TAB_KEYS 里（hash 路由、tabFromHash、
+  // 保活集合都认它），这里只补展示用的中文名。旧实现是三处真源：pure.mjs 的 TAB_KEYS、
+  // 这里的 TABS 字面量、外加 resolveTab 里一条 /^#\/filter$/ 正则补丁——新增页签要改三处，
+  // 漏一处就是「路由认、标签不认」（filter 就是这么被补丁接上的）。
+  // v3.297 标签页状态：非概览页不跑主轮询，避免每拍 App 重渲染让推送记录/配置页「闪一下」。
+  const TABS = TAB_KEYS.map((key) => ({ key, label: TAB_LABELS[key] }))
   // 切页回到顶部（v3.306）：手机从概览滚到底部再点「推送记录」，此前会停在
   // 新页面的中段/底部（window.scrollY 被保留），看起来像页面缺了开头。
   // v3.307 同步写 hash：刷新/后退能回到同一页。
