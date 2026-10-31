@@ -1078,6 +1078,39 @@ testCase('靶向 carrierCases（承载字段 × 区间）', async () => {
   }
 })
 
+testCase('C9-004：状态码语义单点化（4 承载字段 × 状态码矩阵）', async () => {
+  // 反例（改动前）：classifyOne 对四个承载字段各写一遍区间判定，其中 HTTP_ 前缀与 statusCode
+  // 两份还把 408|409|425|429 内联重写（RETRYABLE_HTTP_STATUS 只覆盖一半）。任一处漏改，
+  // 同一状态码在不同承载字段下分类相反，而每个分支单测都还是绿的。
+  // 断言必须连 reason 一起锁：只断 kind 时「漏了 5xx 分支 → 落 UNKNOWN」仍是 retryable，测不出来。
+  const carriers = [
+    { name: '数字 code', build: (n) => ({ code: String(n), message: 'server replied' }), reason: (n) => `PROVIDER_${n}` },
+    { name: 'providerCode', build: (n) => ({ providerCode: String(n), message: 'server replied' }), reason: (n) => `PROVIDER_${n}` },
+    { name: 'HTTP_ 前缀', build: (n) => ({ code: `HTTP_${n}`, message: 'server replied' }), reason: (n) => `HTTP_${n}` },
+    { name: 'statusCode', build: (n) => ({ statusCode: n, message: 'server replied' }), reason: (n) => `HTTP_${n}` }
+  ]
+  const matrix = [
+    [408, 'retryable'], [409, 'retryable'], [425, 'retryable'], [429, 'retryable'],
+    [500, 'retryable'], [503, 'retryable'], [599, 'retryable'],
+    [300, 'permanent'], [304, 'permanent'], [399, 'permanent'],
+    [400, 'permanent'], [401, 'permanent'], [413, 'permanent'], [499, 'permanent']
+  ]
+  for (const carrier of carriers) {
+    for (const [n, kind] of matrix) {
+      const r = classifyFailure(carrier.build(n))
+      check(r.kind, kind, `${carrier.name} ${n} → ${kind}（kind）`)
+      check(r.reason, carrier.reason(n), `${carrier.name} ${n} 的 reason 必须落在本承载字段口径（不得回落到 UNKNOWN）`)
+    }
+  }
+  // 越界伪码：旧实现凭 `n >= 500` 把 HTTP_600/HTTP_999 当成「可重试的 HTTP 状态码」（reason=HTTP_6xx）；
+  // 统一判据后它们不属于 HTTP 语义 ⇒ 落兜底 UNKNOWN（kind 仍是可重试，但不再冒充状态码）。
+  for (const code of ['HTTP_600', 'HTTP_999', 'HTTP_abc']) {
+    const r = classifyFailure({ code, message: 'upstream odd' })
+    check(r.kind, 'retryable', `${code} 越界/非数字 → 兜底可重试`)
+    check(r.reason, 'UNKNOWN', `${code} 不得再被当成可重试的 HTTP 状态码（reason 必须回落 UNKNOWN）`)
+  }
+})
+
 testCase('permanentMessage 五条正则', async () => {
   // 【簇1 · permanentMessage 五条正则】每条只与“近邻但不命中”的负例成对出现，
   // 杀 Regex / StringLiteral / LogicalOperator 的放宽与短路变异体。

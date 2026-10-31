@@ -312,8 +312,20 @@ function codeIs (code, set) {
 // 无差别判定，同一 4xx 语义在不同承载字段下会分类相反，4xx 的限流/超时被误判永久而停止重试。
 const RETRYABLE_HTTP_STATUS = new Set([408, 409, 425, 429])
 
-function isRetryableHttpStatus (n) {
-  return RETRYABLE_HTTP_STATUS.has(n) || (n >= 500 && n <= 599)
+// C9-004：HTTP 状态码语义的**唯一判据**。此前 classifyOne 对四个承载字段（数字 code /
+// providerCode / `HTTP_` 前缀 / statusCode）各写一遍区间判定，其中后两份还把
+// `408 || 409 || 425 || 429` 内联重写、RETRYABLE_HTTP_STATUS 只覆盖一半——任一处漏改，
+// 同一状态码在不同承载字段下分类相反，而每个分支的单测都能过，口径分叉没有任何断言能发现。
+// 返回 'retryable' / 'permanent' / null（不属于 HTTP 状态码语义）。
+// 5xx 上界固定 599（statusCodeOf 只接受 100-599）。旧实现的 `n >= 500` 没有上界，'HTTP_600'
+// 这类越界伪码会被判成可重试并记 reason=HTTP_600；现在落 null → 走兜底 UNKNOWN（同样可重试，
+// 但不再声称它是 HTTP 状态码）。
+function classifyHttpStatus (n) {
+  if (!Number.isInteger(n)) return null
+  if (RETRYABLE_HTTP_STATUS.has(n) || (n >= 500 && n <= 599)) return 'retryable'
+  if (n >= 300 && n <= 399) return 'permanent'
+  if (n >= 400 && n <= 499) return 'permanent'
+  return null
 }
 
 function classifyOne (error) {
@@ -381,43 +393,35 @@ function classifyOne (error) {
   // HTTP_ 前缀、statusCode）下都落 UNKNOWN → 可重试，而 HTTP 层把终态 3xx 归成 ERR_BODY_NOT_JSON（永久）
   // ——同一状态码在「错误码字符串」与「statusCode」两条路径上分类相反。这里按区间统一，不逐条枚举
   // （HTTP_300-399 共 100 项）。
+  // C9-004：四个承载字段统一走 classifyHttpStatus，语义只有一份实现。
   const numericCode = Number(code)
-  if (code === '1001' || (Number.isInteger(numericCode) && isRetryableHttpStatus(numericCode))) {
+  const codeVerdict = classifyHttpStatus(numericCode)
+  if (code === '1001' || codeVerdict === 'retryable') {
     return { kind: 'retryable', reason: `PROVIDER_${code}`, info }
   }
-  if (Number.isInteger(numericCode) && numericCode >= 300 && numericCode < 400) {
-    return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
-  }
-  if (Number.isInteger(numericCode) && numericCode >= 400 && numericCode < 500) {
+  if (codeVerdict === 'permanent') {
     return { kind: 'permanent', reason: `PROVIDER_${code}`, info }
   }
   if (providerCode === '1001' || /(?:限流|限频|rate.?limit)/.test(message)) {
     return { kind: 'retryable', reason: 'PROVIDER_RATE_LIMIT', info }
   }
   const providerNumber = Number(providerCode)
-  if (Number.isInteger(providerNumber) && isRetryableHttpStatus(providerNumber)) {
+  const providerVerdict = classifyHttpStatus(providerNumber)
+  if (providerVerdict === 'retryable') {
     return { kind: 'retryable', reason: `PROVIDER_${providerNumber}`, info }
   }
-  if (Number.isInteger(providerNumber) && providerNumber >= 300 && providerNumber < 400) {
-    return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
-  }
-  if (Number.isInteger(providerNumber) && providerNumber >= 400 && providerNumber < 500) {
+  if (providerVerdict === 'permanent') {
     return { kind: 'permanent', reason: `PROVIDER_${providerNumber}`, info }
   }
   if (code.startsWith('HTTP_')) {
-    const n = Number(code.slice(5))
-    if (n === 408 || n === 409 || n === 425 || n === 429 || n >= 500) {
-      return { kind: 'retryable', reason: code, info }
-    }
-    if (n >= 300 && n < 400) return { kind: 'permanent', reason: code, info }
-    if (n >= 400 && n < 500) return { kind: 'permanent', reason: code, info }
+    const verdict = classifyHttpStatus(Number(code.slice(5)))
+    if (verdict === 'retryable') return { kind: 'retryable', reason: code, info }
+    if (verdict === 'permanent') return { kind: 'permanent', reason: code, info }
   }
   if (status !== null) {
-    if (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500) {
-      return { kind: 'retryable', reason: `HTTP_${status}`, info }
-    }
-    if (status >= 300 && status < 400) return { kind: 'permanent', reason: `HTTP_${status}`, info }
-    if (status >= 400 && status < 500) return { kind: 'permanent', reason: `HTTP_${status}`, info }
+    const verdict = classifyHttpStatus(status)
+    if (verdict === 'retryable') return { kind: 'retryable', reason: `HTTP_${status}`, info }
+    if (verdict === 'permanent') return { kind: 'permanent', reason: `HTTP_${status}`, info }
   }
 
   if (/(?:timeout|timed out|超时|econn|eai_again|enet|ehost|epipe|socket|rate.?limit|限流|限频|暂时|服务.*(?:不可用|繁忙)|连接.*(?:失败|重置))/.test(message)) {
