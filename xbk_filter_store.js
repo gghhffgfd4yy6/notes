@@ -176,9 +176,11 @@ function compileOk (deps, source) {
  *   revision 省略按 0 处理（`/validate` 允许只带 filter）；**显式传 null/''/字符串等非法值一律拒绝**。
  *   filter 只接受 11 个白名单字段的字符串值；未出现的字段不参与覆盖（回代码默认）。
  * @param {{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}} deps
+ * @param {{fromDisk?:boolean}} [options] fromDisk=true 表示「校验的是已落盘的覆盖文件」：闸门 5
+ *   （整份文件字节预算）只约束**保存入参**，读路径一律不跑（见闸门 5 处注释）。
  * @returns {{ok:true, value:Object, wideMatch:string[]}|{ok:false, errors:Array<{field:string, code:string, message:string}>}}
  */
-function validateFilterRules (input, deps) {
+function validateFilterRules (input, deps, options) {
   const errors = []
   const engine = deps && deps.RuleEngine
   if (!engine || typeof engine.hasNestedQuantifier !== 'function' || typeof engine.compileRules !== 'function' ||
@@ -391,20 +393,28 @@ function validateFilterRules (input, deps) {
   // 上次合法规则/代码默认。而闸门 1 只限**单字段** 4000 码元：11 个字段全填满中文（UTF-8 3 字节/字）
   // 就能堆出 130 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
   // 不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给 revision 位数增长。
-  let serializedBytes
-  try {
-    serializedBytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter }), 'utf8')
-  } catch (e) {
-    return { ok: false, errors: [{ field: 'filter', code: 'serialize_failed', message: `规则无法序列化为 JSON：${safeErrorMessage(e)}` }] }
-  }
-  if (serializedBytes > FILTER_RULES_MAX_BYTES - 32) {
-    return {
-      ok: false,
-      errors: [{
-        field: 'filter',
-        code: 'too_large',
-        message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_RULES_MAX_BYTES} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
-      }]
+  //
+  // **只对保存入参生效**（评审 C9-012）：读路径（deepValidationError）复用本函数时必须跳过此闸——
+  // 已落盘文件是经 readSafeTextResult(FILTER_RULES_MAX_BYTES) 有界读进来的，能读到就必然 ≤ 读端上限，
+  // 再按「落盘形状重新序列化」量一遍字节，会把 (MAX_BYTES-32, MAX_BYTES] 这段**合法且可读**的存量
+  // 覆盖文件判成 corrupt（旧版控制台 body 上限 64 KiB，落盘形状只多约 13 字节包装 ⇒ 该区间是真实存量），
+  // 于是每轮降级、规则静默不生效，也与 SYSTEM_CONTRACT「超限（>64 KiB）」口径相反。
+  if (!(options && options.fromDisk === true)) {
+    let serializedBytes
+    try {
+      serializedBytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter }), 'utf8')
+    } catch (e) {
+      return { ok: false, errors: [{ field: 'filter', code: 'serialize_failed', message: `规则无法序列化为 JSON：${safeErrorMessage(e)}` }] }
+    }
+    if (serializedBytes > FILTER_RULES_MAX_BYTES - 32) {
+      return {
+        ok: false,
+        errors: [{
+          field: 'filter',
+          code: 'too_large',
+          message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_RULES_MAX_BYTES} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
+        }]
+      }
     }
   }
 
@@ -481,7 +491,7 @@ function deepValidationError (parsed, deps) {
     schema: FILTER_RULES_SCHEMA,
     revision: parsed.revision,
     filter: parsed.filter
-  }, deps)
+  }, deps, { fromDisk: true })
   if (result && result.ok === true) return null
   const first = result && Array.isArray(result.errors) ? result.errors[0] : null
   const field = first ? safeString(safeGet(first, 'field')) : ''
