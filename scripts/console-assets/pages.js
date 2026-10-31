@@ -1149,14 +1149,18 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 认 active 不认 paused：暂停自动刷新时手动下拉照样要能刷。
   usePullRefresh(active, () => Promise.allSettled([load(), filesLoader.load()]))
   const ok = data && data.status === 'ok'
+  // C7-023：limits 必须「全守」——旧写法只在 readCap 一处判存在性，条目数/字节上限直接解引用；
+  // 服务端漏下发 limits（老版本 / 中间层裁剪）时整页在渲染期抛 TypeError，连「不可读」都看不到。
+  // 现在统一定义 lim：拿不到就整块不画上限对照，另给一条如实提示。
+  const lim = ok && data.limits && typeof data.limits === 'object' ? data.limits : null
   const ratioText = ok && data.writeRatio != null ? `${(data.writeRatio * 100).toFixed(1)}%` : '—'
   const tomb = data && data.tombstone ? data.tombstone : null
   // 最近写入：显示相对时间；超过 24 小时只陈述事实（不推断链路断没断——调度暂停同样会这样）。
   const write = ok ? cacheWriteInfo(data.mtimeMs) : { ageText: '', stale: false }
   // 控制台可读：长解释收进 title，首屏只留结论。上限取服务端下发的
   // limits.consoleReadMaxBytes（此前写死 32 MiB，服务端调到 64 MiB 后文案说谎）。
-  const readCap = ok && data.limits && typeof data.limits.consoleReadMaxBytes === 'number'
-    ? fmtBytes(data.limits.consoleReadMaxBytes)
+  const readCap = lim && typeof lim.consoleReadMaxBytes === 'number'
+    ? fmtBytes(lim.consoleReadMaxBytes)
     : '控制台读取上限'
   const readableText = data && data.consoleReadable
     ? `是（未超 ${readCap} 读取封顶）`
@@ -1165,19 +1169,20 @@ function CacheHealthPanel ({ paused = false, active = true }) {
   // 条数预警：服务端在 cache-health 响应里附带 entryCount（/api/status 同源的
   // readMessageCount；tooLarge 时 null）对照写端条目上限；接近上限时下轮保存
   // 会裁最旧条目（与字节裁剪同一出口）。
-  const entryNear = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax * 0.8
-  const entryOver = ok && typeof data.entryCount === 'number' && data.entryCount >= data.limits.entryMax
+  const entryNear = lim && typeof data.entryCount === 'number' && data.entryCount >= lim.entryMax * 0.8
+  const entryOver = lim && typeof data.entryCount === 'number' && data.entryCount >= lim.entryMax
   const files = filesLoader.data && Array.isArray(filesLoader.data.files) ? filesLoader.data.files : []
   return html`<div class="panel">
     <${PanelHead} title="缓存健康" sub=${(data && data.file ? data.file : 'push.json') + ' · 判重缓存占用'}
       right=${html`<${Button} variant="ghost" onClick=${load}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${data && !ok && html`<div class="empty">${data.status === 'missing' ? '缓存尚未生成（跑一轮后这里就有数据）' : `不可读（${data.status}）`}</div>`}
-    ${ok && html`<div class="sys-grid">
+    ${ok && !lim && html`<${Hint} tone="error">服务端没有下发缓存上限（limits），本页暂不显示字节/条目对照；缓存本身不受影响。<//>`}
+    ${lim && html`<div class="sys-grid">
       <table class="sys-table"><tbody>
-        <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(data.limits.writeMaxBytes)}）</td></tr>
+        <tr><td>缓存大小</td><td>${fmtBytes(data.bytes)}（上限 ${fmtBytes(lim.writeMaxBytes)}）</td></tr>
         <tr><td>占用比例</td><td>${ratioText}${data.nearTrim ? ' · ⚠️ 临近字节裁剪' : ''}${data.overLimit ? ' · ⛔ 已超写端上限' : ''}</td></tr>
-        <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${data.limits.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${data.limits.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
+        <tr><td>条目数</td><td>${ok && typeof data.entryCount === 'number' ? `${data.entryCount} / ${lim.entryMax} 条上限${entryOver ? ' · ⛔ 已达上限，旧记录将被裁剪' : entryNear ? ' · ⚠️ 临近条目上限' : ''}` : `上限 ${lim.entryMax} 条${ok && data.entryCountStatus === 'tooLarge' ? '（当前条数不可得：缓存超控制台读取封顶）' : '（进推送记录页获取当前条数）'}`}</td></tr>
         <tr><td>控制台可读</td><td title=${readableTitle}>${readableText}</td></tr>
       </tbody></table>
       <div class="cache-side">

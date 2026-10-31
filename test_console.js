@@ -11482,7 +11482,24 @@ async function main () {
     assert.ok(!twofa.includes('<img src=x onerror=alert(1)>'), '错误文案不得原样落地')
     assert.ok(twofa.includes('记住这台设备'), '信任设备勾选项必须存在（90 天免码是这套方案的体验来源）')
   })
-}
+
+  // ── W2 g2（C7-019/020/022/023/036/037/045/052）──────────────────────────────
+  await aok('结构红线: C7-023 缓存健康对 limits 全守（不存在的 limits 不得在渲染期解引用）', () => {
+    const src = readConsoleSource()
+    const D = '$' // no-template-curly-in-string：含 ${ 的字符串要拼出来
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    assert.ok(cache.includes("const lim = ok && data.limits && typeof data.limits === 'object' ? data.limits : null"),
+      'limits 必须先归一成 lim（存在性只判一处），旧写法只在 readCap 判、其它行直接解引用 data.limits')
+    // 归一化之后，本组件内不得再出现 data.limits.xxx 的解引用：漏一处就还是「半守半不守」。
+    assert.ok(!/data\.limits\./.test(codeOf(cache)),
+      '归一化后不得再直接解引用 data.limits（缺失时整页渲染期抛 TypeError）')
+    assert.ok(cache.includes(D + '{ok && !lim && html`<' + D + '{Hint} tone="error">'),
+      '拿不到 limits 时必须如实提示，而不是静默少画几行')
+    assert.ok(cache.includes(D + '{lim && html`<div class="sys-grid">'),
+      '上限对照整块必须以 lim 为门（不是 ok）：limits 缺失时不得解引用')
+  })
+
+  }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
 // 旧实现只在 .then 里做这三件事；main() reject 时只打一行 e.message 并置 exitCode=1：
