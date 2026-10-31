@@ -11581,6 +11581,22 @@ async function main () {
       assert.ok(new RegExp('\\b' + key + ':').test(labels), `TAB_LABELS 缺少 ${key} 的中文名（会渲染成空标签）`)
     }
   })
+
+  await aok('结构红线: C7-013 回前台静默窗只挡「刚补拉过」的那一拍（不吞 SSE tick）', () => {
+    const src = readConsoleSource()
+    const tick = sliceBetween(src, 'const runTick = useCallback(', 'const runTickRef = useRef(runTick)', 'runTick')
+    assert.ok(tick.includes('if (document.hidden) return'), '后台整拍跳过仍在（别把隐藏页改成照跑）')
+    assert.ok(tick.includes('Date.now() < resumeQuietUntilRef.current'),
+      '静默窗仍在：回前台补拉与「定时器正好到期」必须去重，删掉会连发两发')
+    // 只按时间窗关死 = 窗内到达的 SSE tick（服务端报「有新数据」）被一起吞掉，
+    // 页面最多停在补拉那一刻一个轮询周期（SSE 在线时 60s）。
+    assert.ok(/Date\.now\(\) < resumeQuietUntilRef\.current && Date\.now\(\) - lastRefreshRef\.current < POLL_BUSY_MS/.test(tick),
+      '静默窗必须叠加「距上次成功刷新 < POLL_BUSY_MS」：否则窗内的 SSE tick 会被静默吞掉')
+    // 判据的另一半：补拉成功要推进 lastRefreshRef，否则上面那道条件恒真，等于又关死。
+    const active = sliceBetween(src, 'const refreshActive = useCallback(', 'const pullRefresh = useCallback(', 'refreshActive')
+    assert.ok(active.includes('if (ok) lastRefreshRef.current = Date.now()'),
+      '补拉成功必须推进 lastRefreshRef（失败不推进：窗内仍要能重试）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

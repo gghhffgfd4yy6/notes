@@ -689,7 +689,12 @@ function App () {
   const markRef = useRef(null)
   const runTick = useCallback(() => {
     if (document.hidden) return
-    if (Date.now() < resumeQuietUntilRef.current) return
+    // 回前台静默窗（C7-013）：它要挡的是「刚补拉过、定时器又正好到期」的那一发重复请求，
+    // 而不是窗内所有的刷新信号。旧实现只按时间窗关死 ⇒ 窗内到达的 SSE tick（服务端说
+    // 「有新数据」）被一起吞掉，页面最多停在补拉那一刻一个轮询周期（SSE 在线时 60s）。
+    // 现在多加一道「距上次成功刷新多久」：刚补拉过（< POLL_BUSY_MS）才跳过，之后放行。
+    // 补拉失败时 lastRefreshRef 不前进（见 refreshActive），窗内仍会立刻重试。
+    if (Date.now() < resumeQuietUntilRef.current && Date.now() - lastRefreshRef.current < POLL_BUSY_MS) return
     if (Date.now() < formPauseUntilRef.current) return
     refreshSplit()
     if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
