@@ -984,7 +984,33 @@ function createApp ({
         const interval = Math.max(0, Utils.num(Config.channelHealth.intervalMs, 3600000))
         const now = Date.now()
         const alerts = []
+        // C1-007：**先按失败计，再按成功恢复**。旧实现先跑成功分支、再在失败分支里
+        // `if (succeeded.has(channel)) continue` 短路——同一轮里「推 1 条成功 + 1 条失败」的通道
+        // 只走成功分支被清零，间歇失败永远攒不满阈值，这类「半可用」通道既不告警也不进健康台账。
+        // 现在成功只在本轮**零失败**时才算恢复；本轮有失败就计数 +1（成功不覆盖失败）。
+        for (const [channel, failure] of failed) {
+          const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
+          const count = this._safeCounter(entry.consecutiveFailures) + 1
+          const lastAlertAt = this._safeCounter(entry.lastAlertAt)
+          // APP2-01：限频按「告警尝试」计时——告警通道本身不可用时发送必然失败，若只在发送成功后
+          // 回填 lastAlertAt，intervalMs（默认 1h）限频完全失效，每轮都重发。故在排入告警时即落盘。
+          const alertDue = count >= threshold && (!interval || now - lastAlertAt >= interval)
+          const next = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt: alertDue ? now : lastAlertAt }
+          // APP2-02：失败不得抹掉**已认领**的恢复通知——否则「恢复告警还没送出就遇到一次失败」
+          // 会把 pending/claim 一起丢掉，之后再也不会有恢复通知（不丢契约）。原样保留待下一次
+          // 零失败的轮次由成功分支处理。
+          if (entry.recoverAlertPending === true) {
+            next.recoverAlertPending = true
+            next.recoverAlertClaim = entry.recoverAlertClaim
+            next.recoverAlertClaimAt = this._safeCounter(entry.recoverAlertClaimAt)
+            next.lastRecoveredAt = this._safeCounter(entry.lastRecoveredAt)
+          }
+          state[channel] = next
+          if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
+        }
         for (const channel of succeeded) {
+          // 本轮也失败过 ⇒ 已按失败计数（见上），不得再按「恢复」清零。
+          if (failed.has(channel)) continue
           const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
           const failures = this._safeCounter(entry.consecutiveFailures)
           const recoverPending = entry.recoverAlertPending === true
@@ -1019,17 +1045,6 @@ function createApp ({
           } else {
             state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
           }
-        }
-        for (const [channel, failure] of failed) {
-          if (succeeded.has(channel)) continue
-          const entry = state[channel] && typeof state[channel] === 'object' ? state[channel] : {}
-          const count = this._safeCounter(entry.consecutiveFailures) + 1
-          const lastAlertAt = this._safeCounter(entry.lastAlertAt)
-          // APP2-01：限频按「告警尝试」计时——告警通道本身不可用时发送必然失败，若只在发送成功后
-          // 回填 lastAlertAt，intervalMs（默认 1h）限频完全失效，每轮都重发。故在排入告警时即落盘。
-          const alertDue = count >= threshold && (!interval || now - lastAlertAt >= interval)
-          state[channel] = { consecutiveFailures: count, lastFailureAt: now, lastAlertAt: alertDue ? now : lastAlertAt }
-          if (alertDue) alerts.push({ type: 'failed', channel, count, failure })
         }
         if (!this._writeState(statePath, state)) return
         for (const alert of alerts) pendingAlerts.push(alert)

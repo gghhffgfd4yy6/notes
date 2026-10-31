@@ -3668,6 +3668,46 @@ checkAsync('C1-013 收敛后语义不变：通道健康锁仍单次尝试（EACC
   assert.strictEqual(app._lastChannelHealthLockFailure.code, 'EACCES')
 })
 
+// ===== C1-007：同一轮既成功又失败的通道必须按失败累计 =====
+// 审计条目：失败分支有 `if (succeeded.has(channel)) continue`，同一轮「推 1 条成功 + 1 条失败」的
+// 通道只走成功分支被清零 ⇒ 间歇失败永远攒不满阈值。这里连跑 3 轮（阈值 3）验证计数真的累加。
+checkAsync('C1-007 同一轮既成功又失败的通道必须按失败累计（间歇失败也攒满阈值）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp({ fs: mfs, threshold: 3, intervalMs: 3600000 })
+  const outcome = { successfulChannels: ['pushdeer'], failures: [{ channel: 'pushdeer', message: 'boom' }] }
+  for (let round = 1; round <= 3; round++) {
+    await app._updateChannelHealth(outcome)
+    const st = JSON.parse(mfs.readFileSync(healthPath))
+    assert.strictEqual(st.pushdeer.consecutiveFailures, round,
+      `第 ${round} 轮：本轮有过成功也不得清零失败计数（旧实现短路后恒为 0）`)
+  }
+  const st = JSON.parse(mfs.readFileSync(healthPath))
+  assert.ok(st.pushdeer.lastAlertAt > 0, '达到阈值必须排入异常告警（lastAlertAt 落盘即证据）')
+})
+
+checkAsync('C1-007 零失败轮次才算恢复：成功分支排入恢复告警（计数待送达确认后清零）', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath, JSON.stringify({ pushdeer: { consecutiveFailures: 3, lastFailureAt: 1, lastAlertAt: 2, lastRecoveredAt: 0 } }))
+  const app = makeHealthApp({ fs: mfs, threshold: 3, intervalMs: 3600000 })
+  await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [] })
+  const st = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(st.pushdeer.recoverAlertPending, true, '本轮零失败 ⇒ 必须排入恢复告警（APP2-02）')
+  assert.strictEqual(st.pushdeer.consecutiveFailures, 3, '计数只在恢复告警确认送达后清零（此处尚未送达）')
+})
+
+checkAsync('C1-007 失败不得抹掉已认领的恢复通知（pending/claim 原样保留）', async () => {
+  const mfs = makeMemFs()
+  mfs.writeFileSync(healthPath, JSON.stringify({
+    pushdeer: { consecutiveFailures: 2, lastFailureAt: 1, lastAlertAt: 0, lastRecoveredAt: 5, recoverAlertPending: true, recoverAlertClaim: 'tok-keep', recoverAlertClaimAt: Date.now() }
+  }))
+  const app = makeHealthApp({ fs: mfs, threshold: 3, intervalMs: 3600000 })
+  await app._updateChannelHealth({ successfulChannels: ['pushdeer'], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  const st = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(st.pushdeer.consecutiveFailures, 3, '失败计数照常累加')
+  assert.strictEqual(st.pushdeer.recoverAlertPending, true, '已认领的恢复通知不得因一次失败被丢弃')
+  assert.strictEqual(st.pushdeer.recoverAlertClaim, 'tok-keep', '认领令牌必须原样保留（否则会被当成无主认领重发/吞掉）')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
