@@ -399,9 +399,11 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
      *  告警每进程只发一次：这里是每条消息 × 每个字段 × 每条规则的热路径，逐次告警会淹没 run.log。
      *  本方法自行归一化输入（单次调用口径）；批量扫描请用归一化后的 _safeTestText（C9-007）。 */
     _safeTest (re, input, onFail = false) {
-      if (!re || typeof re.test !== 'function') return onFail
       let text
       try {
+        // 形状守卫必须留在 try 内：伪造/被污染的规则对象可以是带抛错 test getter 的对象或 Proxy，
+        // 「读一次 re.test」本身就会抛——放在 try 外等于给「异常永不冒泡」开一个后门。
+        if (!re || typeof re.test !== 'function') return onFail
         text = this._normalizeReInput(typeof input === 'string' ? input : String(input))
       } catch (e) {
         this._warnTestFail()

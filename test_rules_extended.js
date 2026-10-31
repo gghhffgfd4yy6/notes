@@ -603,6 +603,26 @@ check('C9-007：多行规则整次扫描只归一化一次（次数与规则数�
     'catename=null 时必须不命中（不得落到 /null/ 字面量）')
 })
 
+check('C9-008：_safeTest 的形状守卫也必须在 try 内（伪造规则对象不得抛穿）', () => {
+  // 反例（改动前）：`typeof re.test !== 'function'` 写在 try 外面 ⇒ 带抛错 test getter 的伪造
+  // 规则对象 / Proxy 会在**读形状**这一步就抛给调用方——正是 C9-008 立契约要堵的「一条坏规则
+  // 抛穿整轮 run」；docstring 写死的契约是「异常永不冒泡，一律按 onFail 处理」。
+  const { eng } = r2xMake()
+  const bomb = { get test () { throw new Error('throwing getter') } }
+  assert.strictEqual(eng._safeTest(bomb, 'x', true), true, '白名单口径：读形状抛错必须按 onFail=true 保留')
+  assert.strictEqual(eng._safeTest(bomb, 'x'), false, '默认 onFail=false：必须不命中而不是抛')
+  assert.strictEqual(eng._safeTestText(bomb, 'x', true), true, '批量入口同口径（onFail=true）')
+  assert.strictEqual(eng._safeTestText(bomb, 'x'), false, '批量入口同口径（默认 onFail=false）')
+  // 真实调用面：分类规则是抛错 getter 时，_catMatches / _firstMatchingRule 不得抛
+  assert.strictEqual(eng._catMatches({ cat: bomb }, 'x'), false, '_catMatches 不得被读形状的异常抛穿')
+  assert.strictEqual(eng._firstMatchingRule([{ cat: bomb, val: /x/ }], 'x', () => true), null,
+    '_firstMatchingRule 不得把坏规则的形状异常抛给调用方')
+  // 输入侧 String() 抛错同样按 onFail（不得抛）
+  const poisoned = { toString () { throw new TypeError('boom') } }
+  assert.strictEqual(eng._safeTest(/x/, poisoned, true), true, '输入不可判定时白名单口径保留')
+  assert.strictEqual(eng._safeTest(/.*/, poisoned), false, '输入不可判定时默认口径不命中（不得抛、不得匹配字面 "null"）')
+})
+
 check('C9-011：行分割只有一份实现（compileRules/validateConfig 同源，含 <br/> 与 <br />）', () => {
   // 反例（改动前）：同一个 /<br\s*\/?>|\r\n|\r|\n/ 在 xbk_rules 里被抄 3 份（_splitLines +
   // validateConfig 的过滤字段与 pingbitime 两处就地重写），只能靠注释「与 _splitLines 口径一致」同步。
