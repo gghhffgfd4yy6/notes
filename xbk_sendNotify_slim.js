@@ -123,7 +123,27 @@ function collectConfiguredSecrets (value, fieldName, secrets, seen) {
   }
 }
 
+// 密钥候选清单缓存（C8-015）：redactSecrets 是失败日志的热路径——每条失败一次，safeErr 的
+// 字段循环里还会再调十几次，而 push_config 在进程内基本只读（加载期由 push_config.local.js 与
+// ENV_ALIASES 写入；运行期唯一的写入是自检临时改 HITOKOTO 再还原）。此前每次调用都重建整份清单：
+// 遍历 push_config + 对 channels 的 JSON 字符串试 parse + 排序。
+// 失效判据 = push_config 的**内容指纹**（JSON 序列化：键名、键序、以及嵌套值的内容——原地改
+// push_config.WX_pusher_channels[0].appToken 这类写入同样会让指纹变化，不会拿旧密钥集顶替）。
+// 指纹取不到时（循环引用、getter 抛错）**不写缓存**、本轮现算：宁可多算一遍，也不让「读不出
+// 指纹」退化成「始终用第一次的密钥集」——脱敏失效的代价是明文密钥落进 cron 日志。
+let secretsCache = { fingerprint: null, candidates: [] }
+
+function pushConfigFingerprint () {
+  try {
+    return JSON.stringify(push_config)
+  } catch (e) {
+    return null // 读不出指纹 ⇒ 本次不信任缓存（见上方失效判据）
+  }
+}
+
 function configuredSecrets () {
+  const fingerprint = pushConfigFingerprint()
+  if (fingerprint !== null && fingerprint === secretsCache.fingerprint) return secretsCache.candidates
   const secrets = new Set()
   try {
     const seen = new WeakSet()
@@ -131,7 +151,10 @@ function configuredSecrets () {
       collectConfiguredSecrets(value, key, secrets, seen)
     }
   } catch (e) { /* 配置脏值不影响日志输出 */ }
-  return [...secrets].sort((a, b) => b.length - a.length)
+  // 长密钥优先的排序语义不变（短候选先替换会残留长密钥的明文尾部）
+  const candidates = [...secrets].sort((a, b) => b.length - a.length)
+  if (fingerprint !== null) secretsCache = { fingerprint, candidates }
+  return candidates
 }
 
 function redactSecrets (text) {
@@ -389,10 +412,12 @@ function canStreamRequest (method) {
 function streamRequest (method, url, options, callback) {
   // 白名单闸门（跟进 Codacy dynamic-method-invocation，PR #154）：调用点只传字面量 method，
   // 其余一律 fail-closed，避免「用非静态数据取对象方法再调用」这种形态。
-  // 现状（v3.279 删掉 get 死代码之后）：本模块唯一的调用点传 'post'；'get' 一侧保留是为了这个
-  // 通用助手仍可用于 GET 场景（无人依赖不等于能力该被砍），但它**没有调用方**，别当成已覆盖的路径。
-  if (method !== 'post' && method !== 'get') throw new Error('streamRequest: 不支持的 method: ' + method)
-  const stream = (method === 'post' ? got.stream.post : got.stream.get)(url, options)
+  // 白名单只剩 'post'：v3.279 删掉 $.get 之后 'get' 一侧就再没有调用方（本模块唯一入口
+  // pushHttp.post 传字面量 'post'），把 'get' 留在放行名单里只是给一条零执行路径发通行证——
+  // 它不会被任何用例覆盖，却看起来像「GET 也走这条已覆盖的流式路径」。要恢复 GET 支持，
+  // 把分支、调用方和覆盖用例一起加回来，别只往白名单里塞字符串。
+  if (method !== 'post') throw new Error('streamRequest: 不支持的 method: ' + method)
+  const stream = got.stream.post(url, options)
   const chunks = []
   let response = null
   let total = 0
