@@ -123,7 +123,27 @@ function collectConfiguredSecrets (value, fieldName, secrets, seen) {
   }
 }
 
+// 密钥候选清单缓存（C8-015）：redactSecrets 是失败日志的热路径——每条失败一次，safeErr 的
+// 字段循环里还会再调十几次，而 push_config 在进程内基本只读（加载期由 push_config.local.js 与
+// ENV_ALIASES 写入；运行期唯一的写入是自检临时改 HITOKOTO 再还原）。此前每次调用都重建整份清单：
+// 遍历 push_config + 对 channels 的 JSON 字符串试 parse + 排序。
+// 失效判据 = push_config 的**内容指纹**（JSON 序列化：键名、键序、以及嵌套值的内容——原地改
+// push_config.WX_pusher_channels[0].appToken 这类写入同样会让指纹变化，不会拿旧密钥集顶替）。
+// 指纹取不到时（循环引用、getter 抛错）**不写缓存**、本轮现算：宁可多算一遍，也不让「读不出
+// 指纹」退化成「始终用第一次的密钥集」——脱敏失效的代价是明文密钥落进 cron 日志。
+let secretsCache = { fingerprint: null, candidates: [] }
+
+function pushConfigFingerprint () {
+  try {
+    return JSON.stringify(push_config)
+  } catch (e) {
+    return null // 读不出指纹 ⇒ 本次不信任缓存（见上方失效判据）
+  }
+}
+
 function configuredSecrets () {
+  const fingerprint = pushConfigFingerprint()
+  if (fingerprint !== null && fingerprint === secretsCache.fingerprint) return secretsCache.candidates
   const secrets = new Set()
   try {
     const seen = new WeakSet()
@@ -131,7 +151,10 @@ function configuredSecrets () {
       collectConfiguredSecrets(value, key, secrets, seen)
     }
   } catch (e) { /* 配置脏值不影响日志输出 */ }
-  return [...secrets].sort((a, b) => b.length - a.length)
+  // 长密钥优先的排序语义不变（短候选先替换会残留长密钥的明文尾部）
+  const candidates = [...secrets].sort((a, b) => b.length - a.length)
+  if (fingerprint !== null) secretsCache = { fingerprint, candidates }
+  return candidates
 }
 
 function redactSecrets (text) {
