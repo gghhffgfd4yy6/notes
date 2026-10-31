@@ -1111,6 +1111,39 @@ testCase('C9-004：状态码语义单点化（4 承载字段 × 状态码矩阵�
   }
 })
 
+testCase('C9-005：非 message 字段有界、脱敏在截断之后（199KB 外部文本）', async () => {
+  // 反例（改动前）：`redact(value).replace(...).slice(0, 500)` —— 先做最贵的事再截断，进正则的是
+  // 无界外部文本；且非 message/reason 字段只 `redact(value)`，连那 500 都没有（199KB 可原样进日志）。
+  const HUGE = 199 * 1024
+  const big = 'x'.repeat(HUGE)
+  // 1) failureInfo 的非 message 字符串此前完全无上限
+  check(summarizeError({ failureInfo: { extra: big } }).extra.length, 2000, 'failureInfo.extra 必须截断到 2000')
+  // 2) message 仍按 500 落盘（既有口径不变）
+  check(summarizeError({ message: big }).message.length, 500, 'message 仍按 500 落盘')
+  // 3) 先截断再脱敏：前缀内的凭据仍必须整体抹掉（截断不得让脱敏漏抹）
+  const secret = 'SECRET_ABCDEFGH'
+  const prefixed = summarizeError({ failureInfo: { extra: 'token=' + secret + '&' + big } })
+  check(prefixed.extra.includes(secret), false, '前缀内的凭据必须脱敏（截断在前不得漏抹）')
+  check(prefixed.extra.startsWith('token=***'), true, '凭据值必须整体抹掉')
+  check(prefixed.extra.length <= 2000, true, '脱敏后的字段同样必须有界')
+  // 4) 2000 之后的内容不进摘要（截断点之后无需再扫）
+  const late = summarizeError({ failureInfo: { extra: 'a'.repeat(2000) + 'token=' + secret } })
+  check(late.extra.includes(secret), false, '2000 字符之后的凭据不会进摘要')
+  check(late.extra.length, 2000, '恰为上限的字段不得被继续放大')
+  // 5) 其余非 message 字段（name/providerCode/channel/failureReason）同样必须有界
+  const all = summarizeError({ name: big, providerCode: big, channel: big, failureKind: 'permanent', failureReason: big })
+  check(all.name.length, 200, 'name 必须有界（200）')
+  check(all.providerCode.length, 200, 'providerCode 必须有界（200）')
+  check(all.channel.length, 40, 'channel 必须有界（40）')
+  check(all.failureReason.length, 200, 'failureReason 必须有界（200）')
+  // 6) 199KB 输入的墙钟上界：线性实现实测个位数 ms，1s 上界只拦「无界/退化」的形态
+  const started = process.hrtime.bigint()
+  summarizeError({ message: big })
+  summarizeError({ failureInfo: { extra: big, message: big } })
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+  assert.ok(elapsedMs < 1000, `199KB 输入的摘要耗时 ${elapsedMs.toFixed(1)}ms 超过 1000ms 上界`)
+})
+
 testCase('permanentMessage 五条正则', async () => {
   // 【簇1 · permanentMessage 五条正则】每条只与“近邻但不命中”的负例成对出现，
   // 杀 Regex / StringLiteral / LogicalOperator 的放宽与短路变异体。

@@ -34,6 +34,25 @@ function safeString (value) {
   try { return String(value === undefined || value === null ? '' : value) } catch (e) { return '' }
 }
 
+// C9-005：脱敏的输入必须有界，且顺序必须是「先截断、再脱敏」。
+//  · 进 redact 的文本来自外部响应体（网关把 HTML/JSON 回显进 message/failureInfo 是常见形态）。
+//    C9-001 把 redact 修成线性之后，这里仍是「线性 × 无界长度」——旧实现的 500 字符上限
+//    只在脱敏**之后**生效，只保护日志体积，不保护 CPU。
+//  · 非 message/reason 的字符串字段此前**完全没有上限**（redact(value) 后原样返回），
+//    任意大的外部字符串可以整段进摘要、再进 run.log。
+// 2000 字符足够覆盖任何凭据前缀（脱敏只需前缀；先截断只会「多抹」不会「少抹」——
+// 被截掉的尾部本来就不会出现在 message 的 500 字符窗口里）。
+const MAX_FAILURE_TEXT_CHARS = 2000 // 进脱敏前的原始字符上限
+const MAX_FAILURE_MESSAGE_CHARS = 500 // message/reason 的落盘上限（原有口径）
+const MAX_FAILURE_CHANNEL_CHARS = 40 // channel 的落盘上限（原有口径）
+const MAX_FAILURE_CODE_CHARS = 200 // code/name/providerCode/failureReason 的落盘上限（新增）
+
+/** 安全字符串化 + 截断：任何字段都不允许把无界外部文本带进脱敏与日志（C9-005）。 */
+function boundedText (value, max = MAX_FAILURE_TEXT_CHARS) {
+  const text = safeString(value)
+  return text.length > max ? text.slice(0, max) : text
+}
+
 // XFP-04（含独立对抗审查 A 组与 qodo #152 的补漏）：脱敏必须**整体**抹掉凭据，且要覆盖写法差异。
 // 一条键值规则 + 一条裸 scheme 规则，比按形态堆多条正则更好推理，也不会出现「前一条把后一条的
 // 输入改掉」的耦合。
@@ -260,9 +279,11 @@ function sanitizeFailureInfo (info, ancestors, depth) {
       continue
     }
     // message/reason 与常规路径一致：折叠换行并截断；其余字符串只做脱敏，保留原值语义。
+    // C9-005：先截断再脱敏——进正则的是有界前缀，非 message 字段同样有界（此前完全无上限）。
+    const text = boundedText(value, MAX_FAILURE_TEXT_CHARS)
     sanitized[key] = key === 'message' || key === 'reason' || key === 'failureReason'
-      ? redact(value).replace(/[\r\n]+/g, ' ').slice(0, 500)
-      : redact(value)
+      ? redact(text).replace(/[\r\n]+/g, ' ').slice(0, MAX_FAILURE_MESSAGE_CHARS)
+      : redact(text)
   }
   return sanitized
 }
@@ -280,17 +301,17 @@ function summarizeError (error, ancestors, depth) {
   const rawName = readProp(source, 'name')
   const rawMessage = readProp(source, 'message') || readProp(source, 'reason') || source
   const info = {
-    code: codeOf(source),
-    name: rawName ? safeString(rawName).toUpperCase() : '',
+    code: boundedText(codeOf(source), MAX_FAILURE_CODE_CHARS),
+    name: rawName ? boundedText(rawName, MAX_FAILURE_CODE_CHARS).toUpperCase() : '',
     statusCode: statusCodeOf(source),
-    providerCode: rawProviderCode === undefined || rawProviderCode === null ? '' : safeString(rawProviderCode),
-    channel: rawChannel ? redact(rawChannel).slice(0, 40) : '',
-    message: redact(rawMessage).replace(/[\r\n]+/g, ' ').slice(0, 500)
+    providerCode: rawProviderCode === undefined || rawProviderCode === null ? '' : boundedText(rawProviderCode, MAX_FAILURE_CODE_CHARS),
+    channel: rawChannel ? redact(boundedText(rawChannel, MAX_FAILURE_TEXT_CHARS)).slice(0, MAX_FAILURE_CHANNEL_CHARS) : '',
+    message: redact(boundedText(rawMessage, MAX_FAILURE_TEXT_CHARS)).replace(/[\r\n]+/g, ' ').slice(0, MAX_FAILURE_MESSAGE_CHARS)
   }
   const sourceKind = readProp(source, 'failureKind')
   if (sourceKind === 'retryable' || sourceKind === 'permanent') {
     info.failureKind = sourceKind
-    info.failureReason = readProp(source, 'failureReason') || ''
+    info.failureReason = boundedText(readProp(source, 'failureReason') || '', MAX_FAILURE_CODE_CHARS)
   }
   const failures = safeArray(readProp(source, 'failures'))
   if (failures) {
