@@ -3238,7 +3238,8 @@ function BackupBlock ({ onImported }) {
     e.target.value = '' // 允许重复选同一个文件
     if (!file) return
     setErr(''); setNote('')
-    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr('备份文件太大（上限 48MB）'); return }
+    // 上限跟常量走（C7-047）：文案写死数字时，改 BACKUP_FILE_MAX_BYTES 会让提示说谎。
+    if (file.size > BACKUP_FILE_MAX_BYTES) { setErr(`备份文件太大（上限 ${fmtBytes(BACKUP_FILE_MAX_BYTES)}）`); return }
     try {
       const text = await file.text()
       const data = JSON.parse(text)
