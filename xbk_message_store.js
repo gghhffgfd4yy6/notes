@@ -1139,7 +1139,13 @@ function createMessageStore ({
       // tooLarge → 置 _readFailed → 写端被 _readFailed 拒绝覆写 → 每轮整轮零推送、只能人工删文件。
       // （F1/v3.277 起读端对该形态改走「有界尾部恢复 + 原件隔离」，不再永久自锁；但写端仍必须自己
       //   不制造超限文件——多一轮恢复就多一次「旧身份重推」的代价，对齐上限仍是首选防线。）
+      // C3-009：先量一次字节数，**确认超限**就把这份第 1 次全量序列化立刻丢掉（引用置空，等 GC）——
+      // 裁剪阶段只需要逐条 sizes（每条一次 stringify），峰值从「旧文本 + sizes + 新文本」≈3× 降到
+      // 「sizes + 终稿」≈2×。未超限（绝大多数轮次）继续复用这份唯一序列化，不额外 stringify。
+      let textBytes = null
+      try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
       try {
+        if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
         text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
       } catch (e) {
       // 评审 qodo（v3.267）：裁剪阶段意外异常（如极端不可序列化元素）也不崩溃进程，与序列化失败同口径 fail-open
@@ -1176,7 +1182,8 @@ function createMessageStore ({
    *  本方法不写墓碑：被裁剪记录追加到 droppedOut（与条数裁剪统一），
    *  由 saveMessages 在缓存原子写盘成功后一并落墓碑（CodeAnt Round2 时序修复）。 */
     _trimCacheByBytes (text, toSave, filePath, maxBytes = MESSAGE_CACHE_MAX_BYTES, droppedOut = null) {
-      if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+      // text === null 表示「调用方已确认超限并主动丢弃了首份序列化」（C3-009）：跳过快路径，直接裁剪后重新序列化。
+      if (text !== null && Buffer.byteLength(text, 'utf8') <= maxBytes) return text
       if (toSave.length <= 1) {
         console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
         return null
@@ -1204,18 +1211,27 @@ function createMessageStore ({
       // 评审 coderabbit（v3.267）：key-sensitive toJSON 时根级估算可能低估数组内真实字节
       // （根级 key='' vs 数组内 key=索引，toJSON 可返回不同长度，实测可低估 10 倍）——
       // 收敛后做一次真实数组口径校验，超限则线性回退（极罕见场景，正常路径零额外开销），防写盘超限触发读端 tooLarge 自锁
-      while (lo > 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-lo)), 'utf8') > maxBytes) lo--
-      // 二分收敛到 lo=1 时校验最新单条本身（真实数组口径）：仍超限则无法裁剪，与单条路径同口径跳过落盘（防自锁）
-      if (lo === 1 && Buffer.byteLength(JSON.stringify(toSave.slice(-1)), 'utf8') > maxBytes) {
+      // C3-009：真实数组口径校验与「产出终稿」合并成一次循环——旧实现校验时 stringify 一次、
+      // 产出终稿再 stringify 一次，超限场景每次多背一份全量字符串。收敛到 lo < 1 即「连最新单条都超限」，
+      // 与单条超限路径同口径跳过落盘（防读端 tooLarge 自锁），且不产生任何丢弃。
+      let out = null
+      while (lo >= 1) {
+        out = JSON.stringify(toSave.slice(-lo))
+        if (Buffer.byteLength(out, 'utf8') <= maxBytes) break
+        out = null
+        lo--
+      }
+      if (out === null) {
         console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
-        // 未实际裁剪任何记录：不产生丢弃（与单条超限路径同口径，见 saveMessages）
         return null
       }
       const dropped = toSave.length - lo
-      console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
-      const droppedMsgs = toSave.splice(0, dropped)
-      if (droppedOut) droppedOut.push(...droppedMsgs)
-      return JSON.stringify(toSave)
+      if (dropped > 0) console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
+      if (dropped > 0) {
+        const droppedMsgs = toSave.splice(0, dropped)
+        if (droppedOut) droppedOut.push(...droppedMsgs)
+      }
+      return out
     },
 
     /** 读取/初始化某缓存文件的墓碑身份集；缺失/损坏按空集处理，不阻断主流程。

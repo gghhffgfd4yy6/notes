@@ -907,6 +907,46 @@ check('C3-010 缓存目录回退必须 WARN（且按 raw→目标去重，不随
     `告警必须同时点名「被拒绝的配置」与「实际回退目录」：${fb[0]}`)
 })
 
+// ===== C3-009：超限裁剪的序列化次数 =====
+// 旧实现把整份数组序列化三次：saveMessages 的初稿、_trimCacheByBytes 的「真实数组口径校准」、
+// 以及 splicing 之后的终稿——超限轮次的峰值内存因此是 3×（初稿在裁剪期间一直活着）。
+// 修后：初稿确认超限即丢弃，校准与终稿合并成一次 ⇒ 整份数组只序列化 2 次；未超限仍是 1 次。
+check('C3-009 超限裁剪只序列化整份数组 2 次（旧实现 3 次）', () => {
+  const name = 'c3009_trim.json'
+  const h = makeBatchStore({ name, constants: { MESSAGE_CACHE_MAX_BYTES: 400 } })
+  const msgs = []
+  for (let i = 0; i < 30; i++) msgs.push({ id: 'id-' + i, title: 't'.repeat(60), url: 'https://example.com/' + i })
+  const origStringify = JSON.stringify
+  let arrayCalls = 0
+  JSON.stringify = function (value, ...rest) {
+    if (Array.isArray(value)) arrayCalls++
+    return origStringify.call(JSON, value, ...rest)
+  }
+  let ok
+  try { ok = h.store.saveMessages(h.filePath, msgs) } finally { JSON.stringify = origStringify }
+  assert.strictEqual(ok, true, '裁剪后应成功落盘')
+  assert.strictEqual(arrayCalls, 2, `整份数组的序列化次数必须恰为 2（初稿 + 终稿），实际 ${arrayCalls} 次`)
+  const written = h.fs.files.get(h.filePath)
+  assert.ok(Buffer.byteLength(written, 'utf8') <= 400, '终稿必须落在读端上限内')
+  assert.ok(JSON.parse(written).length < 30, '必须真的裁掉最早的若干条')
+})
+
+check('C3-009 对照：未超限时仍然只序列化 1 次（不得为省内存白白多一次全量 stringify）', () => {
+  const name = 'c3009_fast.json'
+  const h = makeBatchStore({ name, constants: { MESSAGE_CACHE_MAX_BYTES: 1048576 } })
+  const msgs = [{ id: 'a', title: 'x' }, { id: 'b', title: 'y' }]
+  const origStringify = JSON.stringify
+  let arrayCalls = 0
+  JSON.stringify = function (value, ...rest) {
+    if (Array.isArray(value)) arrayCalls++
+    return origStringify.call(JSON, value, ...rest)
+  }
+  let ok
+  try { ok = h.store.saveMessages(h.filePath, msgs) } finally { JSON.stringify = origStringify }
+  assert.strictEqual(ok, true, '未超限应直接落盘')
+  assert.strictEqual(arrayCalls, 1, `未超限只应有 1 次整份序列化，实际 ${arrayCalls} 次`)
+})
+
 // ===== C3-005：隔离备份「名字要原子预留、份数要有上限」=====
 // 旧实现 existsSync → rename 之间有空窗：另一进程能在缝里抢先建同名 .bak，rename 随后把它静默
 // 覆盖（上一份备份被销毁）。修法 = O_EXCL 预留占位（名字一落地就归本次调用）。判别式断言是
