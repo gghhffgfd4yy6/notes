@@ -11620,6 +11620,27 @@ async function main () {
     assert.ok(sys.includes('PANEL_FRESH_MS'), 'SysPanel 的新鲜度阈值必须引用 constants 的命名常量')
   })
 
+  await aok('结构红线: C7-045 后台失败不许静默（裸 catch 改成带作用域的留痕）', () => {
+    const src = readConsoleSource()
+    const code = codeOf(src)
+    // 留痕器只有一份：前缀固定、吞掉「console 不存在」的环境（老浏览器/测试桩）。
+    const helper = sliceBetween(src, 'function logBgFailure', '// 面板加载器公共骨架', 'logBgFailure')
+    assert.ok(helper.includes('console.error(') && helper.includes('[xbk-console]'),
+      '留痕器必须写 console.error 并带 [xbk-console] 前缀（排障时能按前缀捞）')
+    assert.ok(helper.includes('typeof console === \'undefined\''), '留痕器必须对无 console 环境短路')
+    // 八条后台链路逐条点名：改回空 catch 时这里必须红。
+    for (const scope of ['关注词已读回写', '导入后刷新', '服务器草稿清理', '服务器草稿同步']) {
+      assert.ok(code.includes('logBgFailure(\'' + scope + '\')'), `后台链路「${scope}」的失败必须留痕`)
+    }
+    // pushDraftNow 的吞错点在里面（外层 .catch 是死代码，别为了「看起来有 catch」去改调用点：
+    // test_console.js 的草稿用例逐字锁定 setInterval 那一行）。
+    const push = sliceBetween(src, 'const pushDraftNow = useCallback', 'const clearServerDraft = useCallback', 'pushDraftNow')
+    assert.ok(push.includes("logBgFailure('服务器草稿同步')(e)"), '草稿 PUT 抛错必须在 pushDraftNow 里留痕')
+    // 用户可见兜底不变：面板仍靠自己的 err 渲染（「加载失败：<映射文案>」），留痕只是多一条控制台线索。
+    assert.ok(src.includes('加载失败：' + '$' + '{loadErrorText(e)}') && src.includes('loadErrorText(e)'),
+      '留痕不能取代面板自己的可见错误')
+  })
+
   }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

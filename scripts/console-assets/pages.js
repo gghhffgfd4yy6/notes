@@ -741,6 +741,16 @@ function loadErrorText (e) {
   return raw === '' ? '未知错误' : raw
 }
 
+// 后台失败留痕（C7-045）：这类请求不打断界面（面板自己的 err 会渲染、草稿另有「未同步」
+// 标记），但旧写法一律 `.catch(() => {})`，排障时完全无声 —— 谁在反复失败、失败在哪条链路
+// 都查不到。统一走一条带作用域的控制台错误，不影响用户可见行为。
+function logBgFailure (scope) {
+  return (e) => {
+    if (typeof console === 'undefined' || typeof console.error !== 'function') return
+    console.error(`[xbk-console] ${scope}失败：`, e)
+  }
+}
+
 // 面板加载器公共骨架：data/err 状态 + load()（成功清错、失败写横幅）。
 // apiFn 由调用方用 useCallback/useMemo 固定引用，避免 effect 风暴。
 function usePanelLoader (apiFn, onLoaded, initialData = null) {
@@ -2403,7 +2413,7 @@ function SearchPanel ({ onSync, active = true }) {
         delete next[req.q]
         return next
       })
-    }).catch(() => {})
+    }).catch(logBgFailure('关注词已读回写'))
   }, [data, req, watch])
 
   // 地址栏跟随筛选（只 replaceState，不新增历史记录）；刷新/后退能回到同一页。
@@ -3437,7 +3447,7 @@ function BackupBlock ({ onImported }) {
         if (Number.isInteger(imported.runLogBytes)) bits.push('运行日志')
         setLast({ kind: 'import', at: Date.now(), detail: bits.length > 0 ? `${bits.length} 类数据` : '' })
         setNote(`导入完成${bits.length > 0 ? `：${bits.join('、')}` : ''}${result.backupDir ? `。当前数据已先备份到 ${result.backupDir}` : ''}`)
-        if (typeof onImported === 'function') Promise.resolve(onImported()).catch(() => {})
+        if (typeof onImported === 'function') Promise.resolve(onImported()).catch(logBgFailure('导入后刷新'))
       }
     })
   }
@@ -4360,7 +4370,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         setDraftSavedAt(0)
         setDraftSyncedAt(0)
         // 草稿和正式规则一样，已经没有任何可恢复的内容：把服务器那份也清掉。
-        if (remote) apiDeleteFilterDraft().catch(() => {})
+        if (remote) apiDeleteFilterDraft().catch(logBgFailure('服务器草稿清理'))
       }
     } else {
       setDraftSavedAt(0)
@@ -4423,7 +4433,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
             }
             return false
           })
-          .catch(() => false)
+          .catch((e) => { logBgFailure('服务器草稿同步')(e); return false })
       })
     draftPushChainRef.current = task.catch(() => false)
     return task
