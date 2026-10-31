@@ -3,7 +3,7 @@
 // 系统 / 文件 / 配置 / 过滤规则。只依赖 components.js 与基础模块，不认识 App，也没有顶层副作用。
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT_URL_REVOKE_MS, PANEL_FRESH_MS, SAVED_HINT_MS, SNAP_INFLIGHT_MS, VERSION_TIP_MS } from './constants.js'
-import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, timedRequest } from './api.js'
+import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, AUTH_HEADER, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
@@ -1877,7 +1877,7 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Bearer ${BOOT.token}`
+        ...AUTH_HEADER
       },
       body
     })

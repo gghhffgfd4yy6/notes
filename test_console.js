@@ -11597,6 +11597,17 @@ async function main () {
     assert.ok(active.includes('if (ok) lastRefreshRef.current = Date.now()'),
       '补拉成功必须推进 lastRefreshRef（失败不推进：窗内仍要能重试）')
   })
+
+  await aok('结构红线: C7-029 鉴权头只有一个出口（22 处端点不再逐字复制）', () => {
+    const src = readConsoleSource()
+    const hits = src.split('\n').filter((l) => l.includes('Authorization:') && !l.trim().startsWith('//'))
+    assert.strictEqual(hits.length, 1, `鉴权头必须只写一处（实际 ${hits.length} 处）：改前缀/加头时漏一处就是「这个端点 401、别的正常」`)
+    assert.ok(hits[0].includes('const AUTH_HEADER = { Authorization:'), '唯一那处必须是 AUTH_HEADER 定义（其余端点靠展开复用它）')
+    const spreads = src.split('\n').filter((l) => l.includes('...AUTH_HEADER')).length
+    assert.ok(spreads >= 20, `端点必须真的改用 AUTH_HEADER（实际展开 ${spreads} 处）：只留 helper 不改调用点等于没修`)
+    // 导出与读面接线：pages.js 的导出下载端点也要走同一个 helper。
+    assert.ok(src.includes('apiSearchLines, AUTH_HEADER, timedRequest'), 'pages.js 必须从 api.js 取用 AUTH_HEADER（导出下载走同一个鉴权头）')
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
