@@ -882,6 +882,68 @@ function captureConsole (method, fn) {
 
 const cacheWrites = (writes) => writes.filter(w => w.label === '缓存')
 
+// ===== C3-005：隔离备份「名字要原子预留、份数要有上限」=====
+// 旧实现 existsSync → rename 之间有空窗：另一进程能在缝里抢先建同名 .bak，rename 随后把它静默
+// 覆盖（上一份备份被销毁）。修法 = O_EXCL 预留占位（名字一落地就归本次调用）。判别式断言是
+// 「返回的名字**立刻**就存在（0 字节占位）且两次调用必不同」——旧实现返回的名字当时都不存在。
+check('C3-005 隔离备份名必须 O_EXCL 原子预留：返回即存在、连续两次必不同（不覆盖上一份备份）', () => {
+  const dir = path.join(__dirname, 'xianbaoku_cache', 'c3005_reserve')
+  const base = path.join(dir, 'r.json')
+  REAL_FS.mkdirSync(dir, { recursive: true })
+  try {
+    const s = storeWithFs(REAL_FS, path.relative(ROOT_DIR, dir))
+    const a = s._corruptBackupPath(base)
+    assert.ok(typeof a === 'string' && a.endsWith('.bak'), `必须返回备份名：${a}`)
+    assert.strictEqual(REAL_FS.existsSync(a), true, '返回的备份名必须已由本次调用原子预留（占位文件当场存在）')
+    assert.strictEqual(REAL_FS.lstatSync(a).isFile(), true, '预留必须是普通文件占位')
+    assert.strictEqual(REAL_FS.lstatSync(a).size, 0, '预留占位必须是 0 字节（rename 覆盖它不丢任何内容）')
+    const b = s._corruptBackupPath(base)
+    assert.notStrictEqual(b, a, '同名备份已被占用时必须换名——绝不复用（否则 rename 覆盖上一份备份）')
+    assert.strictEqual(REAL_FS.existsSync(b), true, '第二个名字同样必须已预留')
+    assert.strictEqual(REAL_FS.lstatSync(a).size, 0, '第二个名字的预留不得动到第一份（仍是空占位）')
+    // 释放：只删本次预留的空占位
+    s._releaseReservedBackup(a)
+    assert.strictEqual(REAL_FS.existsSync(a), false, '释放必须删掉本次预留的空占位')
+    REAL_FS.writeFileSync(b, '已写入的真实备份')
+    s._releaseReservedBackup(b)
+    assert.strictEqual(REAL_FS.existsSync(b), true, '已被覆盖成真备份的名字不得被释放逻辑删掉')
+  } finally {
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+check('C3-005 隔离备份保留上限：每缓存文件最多 10 份、最旧先删、非本模块命名的文件不动', () => {
+  const dir = path.join(__dirname, 'xianbaoku_cache', 'c3005_prune')
+  REAL_FS.mkdirSync(dir, { recursive: true })
+  const base = path.join(dir, 'p.json')
+  const stamp = (i) => `2026-10-31T00-00-00-${String(i).padStart(3, '0')}Z`
+  try {
+    for (let i = 0; i < 12; i++) {
+      const f = `${base}.corrupt.${stamp(i)}.bak`
+      REAL_FS.writeFileSync(f, `backup-${i}`)
+      // 退避到确定的 mtime（同一毫秒写完时排序只能靠文件名兜底，这里显式把时间序也铺开）
+      REAL_FS.utimesSync(f, new Date(1761900000000 + i * 1000), new Date(1761900000000 + i * 1000))
+    }
+    REAL_FS.writeFileSync(path.join(dir, 'notes.txt'), 'x')
+    REAL_FS.writeFileSync(`${base}.corrupt.not-a-stamp.bak`, 'y')
+    const s = storeWithFs(REAL_FS, path.relative(ROOT_DIR, dir))
+    const warns = captureConsole('warn', () => {
+      assert.strictEqual(s._pruneCorruptBackups(base), 2, '12 份备份 + 上限 10 ⇒ 必须删掉最旧 2 份')
+    })
+    const left = REAL_FS.readdirSync(dir).filter(n => n.startsWith('p.json.corrupt.') && /^p\.json\.corrupt\.2026-10-31T00-00-00-\d{3}Z\.bak$/.test(n)).sort()
+    assert.strictEqual(left.length, 10, `保留份数必须恰为 10：${JSON.stringify(left)}`)
+    assert.ok(!left.includes(`p.json.corrupt.${stamp(0)}.bak`), '最旧的一份必须被清理')
+    assert.ok(!left.includes(`p.json.corrupt.${stamp(1)}.bak`), '次旧的一份必须被清理')
+    assert.ok(left.includes(`p.json.corrupt.${stamp(11)}.bak`), '最新的一份必须保留')
+    assert.strictEqual(REAL_FS.existsSync(path.join(dir, 'notes.txt')), true, '非本模块命名的文件一律不动')
+    assert.strictEqual(REAL_FS.existsSync(`${base}.corrupt.not-a-stamp.bak`), true, '命名口径不符的文件不动（不得按前缀误删）')
+    assert.ok(warns.some(w => w.includes('保留上限') && w.includes('2')), `清理必须有告警说明：${JSON.stringify(warns)}`)
+  } finally {
+    REAL_FS.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
 // ===== C3-008：墓碑 0 字节 / 损坏不得被当成「空集」静默吞掉 =====
 // 旧实现：0 字节走 `!result.text` 直接 return null（status 仍是 ok）、损坏走 JSON.parse 异常，
 // 两条出口都不置位 _tombstoneLoaded ⇒ 每条消息重读一次整份墓碑（上限 8MiB）+ 每条一条 WARN；

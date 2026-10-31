@@ -9,6 +9,10 @@
 // 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
 const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
 
+// C3-005：每个缓存文件最多保留几份 `<name>.corrupt.<stamp>.bak` 隔离备份（最旧先删）。
+// 隔离件的上限就是缓存读端上限（64MiB/份），只增不减会把目录撑大；10 份足够人工取回最近几次现场。
+const CORRUPT_BACKUP_KEEP = 10
+
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
 //   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
 // TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
@@ -203,6 +207,8 @@ function createMessageStore ({
     // C3-008：已告警过的墓碑读取问题（每进程每文件每类一次）——旧实现 ioError/损坏每次调用都 warn，
     // 而损坏文件又不置位 _tombstoneLoaded ⇒ 每条消息一条 WARN（N 条消息 = N 条日志 + N 次全文件读）。
     _tombstoneWarned: new Set(),
+    // C3-005：本次进程用 O_EXCL 预留（0 字节占位）的备份名——隔离失败/回滚时只释放这些名字。
+    _reservedBackupPaths: new Set(),
     // C3-013：已就「判重主存重建为空但墓碑仍在」告警过的文件（每进程每文件一次，防刷屏）。
     _residualTombstoneWarned: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -784,16 +790,90 @@ function createMessageStore ({
 
     /** 生成隔离备份路径 <filePath>.corrupt.<ISO时间戳>.bak。同一毫秒重复隔离（或目录里已有同名
      *  备份）时追加序号——renameSync 会静默覆盖已存在的目标，而「备份」绝不能覆盖掉上一份备份。
-     *  100 次仍冲突返回 null（调用方 fail-closed，绝不复用可能被覆盖的名字）。 */
+     *  100 次仍冲突返回 null（调用方 fail-closed，绝不复用可能被覆盖的名字）。
+     *
+     *  C3-005：existsSync → rename 之间有一次独立系统调用的空窗，另一进程（或同一毫秒内的另一次
+     *  隔离）可以在这条缝里抢先创建同名备份，随后 rename 会把**它**静默覆盖掉——上一份备份
+     *  就这样被销毁。能用 openSync 时改用 O_EXCL **原子预留**：占位文件一落地，这个名字就归本次
+     *  调用，rename 覆盖的只是自己刚建的 0 字节占位。fs 无 openSync（测试假 fs）时退回 existsSync 探测。 */
     _corruptBackupPath (filePath) {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      // 目录不能 rename 覆盖到**文件**目标上（ENOTDIR）⇒ 「非普通文件隔离」必须退回 existsSync 探测。
+      let srcIsDir = false
+      try { srcIsDir = typeof fs.lstatSync === 'function' && fs.lstatSync(filePath).isDirectory() === true } catch (e) { srcIsDir = false }
+      const canReserve = !srcIsDir && typeof fs.openSync === 'function' && typeof fs.closeSync === 'function'
       for (let n = 0; n < 100; n++) {
         const candidate = n === 0 ? `${filePath}.corrupt.${stamp}.bak` : `${filePath}.corrupt.${stamp}.${n}.bak`
-        let exists = false
-        try { exists = fs.existsSync(candidate) } catch (e) { return candidate }
-        if (!exists) return candidate
+        if (!canReserve) {
+          let exists = false
+          try { exists = fs.existsSync(candidate) } catch (e) { return candidate }
+          if (!exists) return candidate
+          continue
+        }
+        let fd = -1
+        try {
+          fd = fs.openSync(candidate, 'wx', 0o600) // 预留占位：EEXIST = 这个名字已被占用（可能正是别人的备份）
+        } catch (e) {
+          if (e && e.code === 'EEXIST') continue
+          // 预留失败但无法判定占用状态（EACCES/ELOOP/父目录不存在…）：与 existsSync 抛错同口径，
+          // 直接返回该候选，让 rename 去暴露真实错误（不静默改名、不吞错）。
+          return candidate
+        } finally {
+          if (fd >= 0) { try { fs.closeSync(fd) } catch (e) { /* close 失败只影响占位，rename 仍可覆盖 */ } }
+        }
+        try { this._reservedBackupPaths.add(candidate) } catch (e) { /* 忽略 */ }
+        return candidate
       }
       return null
+    },
+
+    /** 释放本次**预留**的占位备份名（隔离改名失败 / 重建回滚后）。只删集合里登记过的名字，且仅当
+     *  它还是 0 字节普通文件——绝不按路径无条件 unlink：这个名字可能已被别人 rename 覆盖成真备份。 */
+    _releaseReservedBackup (backupPath) {
+      if (!this._reservedBackupPaths || !this._reservedBackupPaths.has(backupPath)) return
+      this._reservedBackupPaths.delete(backupPath)
+      try {
+        const st = fs.lstatSync(backupPath)
+        if (!st || !st.isFile() || st.size !== 0) return // 已被覆盖成真备份：留着
+        fs.unlinkSync(backupPath) // nosemgrep（只删本次预留的空占位）
+      } catch (e) { /* 已被删走（rename 成功/他人清理）：无需处理 */ }
+    },
+
+    /** C3-005：隔离备份只增不减（每份最长 = 缓存读端上限 64MiB）而每次隔离都在产出一份 ⇒ 长期反复
+     *  损坏会把目录撑大。这里按「每缓存文件最多 CORRUPT_BACKUP_KEEP 份、最旧先删」收敛；只认本模块
+     *  的命名口径（<basename>.corrupt.<stamp>[.n].bak）且只删普通文件，目录/符号链接一律不碰。
+     *  清理失败不阻断（单份失败跳过，下一轮再来）。返回实际删除份数。 */
+    _pruneCorruptBackups (filePath) {
+      if (typeof fs.readdirSync !== 'function' || typeof fs.lstatSync !== 'function' || typeof fs.unlinkSync !== 'function') return 0
+      const dir = path.dirname(filePath)
+      const prefix = path.basename(filePath) + '.corrupt.'
+      let names
+      try { names = fs.readdirSync(dir) } catch (e) { return 0 }
+      if (!Array.isArray(names)) return 0
+      const found = []
+      for (const name of names) {
+        if (typeof name !== 'string' || !name.startsWith(prefix) || !name.endsWith('.bak')) continue
+        // 只认 <stamp>[.<n>].bak（stamp = ISO 时间戳把 : 和 . 换成 -，字符集固定）
+        if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{3}Z(\.[0-9]+)?\.bak$/.test(name.slice(prefix.length))) continue
+        const full = path.join(dir, name)
+        try {
+          const st = fs.lstatSync(full)
+          if (!st || !st.isFile()) continue // 目录/符号链接（可能是别人的东西）一律不碰
+          found.push({ full, mtime: Number(st.mtimeMs) || 0 })
+        } catch (e) { /* 读不到就跳过，不阻断本次隔离 */ }
+      }
+      if (found.length <= CORRUPT_BACKUP_KEEP) return 0
+      // 新 → 旧；同一毫秒落地的多份（mtime 相同，测试与高频隔离都会出现）按文件名倒序兜底，
+      // 保证「谁算最旧」是确定的（文件名里的 ISO 时间戳字典序即时间序）。
+      found.sort((a, b) => (b.mtime - a.mtime) || (a.full < b.full ? 1 : a.full > b.full ? -1 : 0))
+      let removed = 0
+      for (const victim of found.slice(CORRUPT_BACKUP_KEEP)) {
+        try { fs.unlinkSync(victim.full); removed++ } catch (e) { /* 单份失败不阻断 */ }
+      }
+      if (removed > 0) {
+        console.warn(`隔离备份超过保留上限（每缓存文件 ${CORRUPT_BACKUP_KEEP} 份），已清理最旧 ${removed} 份：${dir}`)
+      }
+      return removed
     },
 
     /** 反向、字符串感知的花括号配对：从 closeIdx（调用方保证是 '}'）向前找配对的 '{'，找不到返回 -1。
@@ -953,13 +1033,15 @@ function createMessageStore ({
       try {
         fs.renameSync(filePath, backupPath) // 隔离：改名保留原件，绝不 unlink
       } catch (e) {
+        // 改名没成功 ⇒ 预留的占位名回滚掉（否则每失败一次就在目录里留一个 0 字节 .bak）
+        this._releaseReservedBackup(backupPath)
         console.error(`${label}：隔离改名失败，保持写闸门（原件未被改动）${filePath}:`, e && e.message)
         return null
       }
       const saved = writeAtomic(filePath, text, '缓存重建')
       if (!saved) {
         // 重建写盘失败（磁盘满/只读/权限）：尽力把原件改回原路径，避免「原件被搬走 + 路径空着」
-        try { fs.renameSync(backupPath, filePath) } catch (e) { console.error(`${label}：重建失败且原件未能改回 ${backupPath}:`, e && e.message) }
+        try { fs.renameSync(backupPath, filePath); this._reservedBackupPaths.delete(backupPath) } catch (e) { console.error(`${label}：重建失败且原件未能改回 ${backupPath}:`, e && e.message) }
         console.error(`${label}：重建写盘失败，保持写闸门 ${filePath}`)
         return null
       }
@@ -970,6 +1052,8 @@ function createMessageStore ({
       // 误判成「已推送」而漏推。maxKeys 由调用方按「本次实际丢弃条数」给出（C6-006 / CR-02：
       // 容量须覆盖本次裁剪量，不能只按 maxSize）。
       if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, maxKeys)
+      // C3-005：隔离备份按「每缓存文件最多 CORRUPT_BACKUP_KEEP 份」收敛（失败不阻断本次恢复）
+      try { this._pruneCorruptBackups(filePath) } catch (e) { /* 保留策略失败不影响本次重建 */ }
       this._recoveryEvents.push({ label, filePath, backupPath, recovered: messages.length, dropped: dropped.length })
       if (this._recoveryEvents.length > 8) this._recoveryEvents.splice(0, this._recoveryEvents.length - 8)
       console.error(`⚠️ 缓存${label}：不可读文件已改名隔离（只隔离不删除）${filePath} → ${backupPath}；` +
@@ -1208,13 +1292,14 @@ function createMessageStore ({
           try {
             fs.renameSync(seenPath, backupPath)
           } catch (e) {
-            try { fs.unlinkSync(backupPath) } catch (e2) { /* 占位/空备份清理失败：仅多一个空文件 */ }
+            this._releaseReservedBackup(backupPath) // 只释放本次预留的 0 字节占位（C3-005）
             this._tombstoneLoadStatus[filePath] = 'ioError'
             this._warnTombstoneOnce(filePath, 'corrupt:rename',
               `墓碑文件损坏（${reason}）且隔离改名失败，本次按空集处理（下次调用重试）：${seenPath}: ${e && e.message ? e.message : e}`)
             return null
           }
           this._tombstoneLoadStatus[filePath] = 'corrupt'
+          try { this._pruneCorruptBackups(seenPath) } catch (e) { /* 保留策略失败不影响本次隔离 */ }
           this._warnTombstoneOnce(filePath, 'corrupt',
             `⚠️ 墓碑文件损坏（${reason}），已改名隔离（只隔离不删除）${seenPath} → ${backupPath}；本次按空集处理，下一次落墓碑将重建该文件（旧身份未被读到的部分可能重推）`)
           return null
