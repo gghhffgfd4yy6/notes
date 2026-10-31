@@ -87,7 +87,7 @@ node qinglong/xbk_push.js
 node qinglong/xbk_push.js --check
 ```
 
-`--check` 只检查 Node.js、依赖和配置，不会抓取或推送。
+`--check` 只检查 Node.js、依赖和配置，不会抓取或推送。其中「缓存目录」一项打印实际生效目录；`Config.cache.dir` 未通过「项目根内 + 不跟随根外符号链接」检查而回退时，会同时点名被拒绝的配置值和实际回退目录（`push.json` 判重主存、`run.log`、`filter.hash` 都写在回退目录）。
 
 ## 常用操作
 

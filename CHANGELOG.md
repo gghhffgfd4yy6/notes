@@ -1118,3 +1118,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **配置与门禁（C5/C10，17 条）**：`LOCAL_ONLY_KEYS` 的 catch 不再吞根因（local 配置坏掉时打印原因，而不是按「已配置」跑）；`install-hooks` 未知参数直接拒绝（`--verfiy` 笔误不再写 `core.hooksPath`）、可执行位核验补 `noexec` 探测、权限收紧不再跟随符号链接；`engines.node` 收窄到 re2 实际支持面；re2 恢复链的 120s 硬编码改为可配；TAP 档强制清空 `SKIP_SUITES`；条目级 severity 缺失不再压成空串判「无高危」；TLS GET 回退的两份逐字重复块收敛为单一实现；AGENTS.md 的依赖版本、空流判定形状、看门狗 15s→35s、固定文件数 4→5 等漂移对齐。
 - **控制台（C7，11 条）**：`readBoot` 的 JSON 解析失败不再伪装成「凭证失效」；搜索词加长度上限；缓存健康 60s 定时器同时刷新右列文件清单；推送记录分页器翻页不再整体置灰闪一帧；趋势图等长窗口切换重算内联 padding；拦截窗输入框恢复可键入并接回非法值校验；切页签 / locking 翻转不再补发无谓 `refreshSplit()`；`pollIntervalFor` / `diagCard` 的重复计算收敛；删除死导出 `useEnterOnOpen`、`CategoryPicker`。
 - **清理（C2，4 条）**：删除 `formatMs`、`readLineWatchWords` 死代码；`serveStatic` 内的 `const etag` 不再遮蔽顶层 `require('etag')`；会话 Cookie 注释的 Max-Age 与代码口径对齐（86400 秒 = 1 天）。
+
+## 未发布（PR #367 待合并）
+
+- **青龙 `--check`：缓存目录回退判定改由 `xbk_message_store` 给出（Codacy `javascript.lang.security.audit.path-traversal.path-join-resolve-traversal`）**：`--check` 原先用 `path.resolve(生效目录) !== path.resolve(ROOT, 配置值)` 自己重算「配置值该解析成什么」——既重复了模块 root+fallback 的解析口径（两侧分叉就出现「目录判断说反话」），又让配置值以 `path.join`/`path.resolve` 实参形态出现（该规则是 taint 规则：源＝函数形参，sink＝路径拼接；判定结果原本只进诊断字符串，不触碰文件系统）。现 `xbk_message_store` 新增公开面 `MessageStore.cacheDirFallback`（`{raw, chosen}` = 被拒绝的配置原文与实际落到的目录；每次 `cacheDir` 求值先清零、仅在回退时记录；未回退或走绝对 `XBK_CACHE_DIR` 覆盖时为 `null`），CLI 只读该结论、不做任何路径运算，`--check` 回退时打印「配置值 X 未通过根内安全检查，已回退到 Y」。
+- **判定记录先于告警去重（用户可见差异）**：告警仍按 raw→chosen 每进程只打一条（getter 每轮求值，不去重会刷屏），但判定记录落在去重之前——`--check` 一轮会对 `cacheDir` 求值 2~3 次，记录若晚于去重，第二次求值只剩「已去重 ⇒ 早退」，`--check` 会静默丢掉回退目标。回归用例对同一个被拒绝的配置**连续求值两次**、两次都断言 `{raw, chosen}`，并把行序固定为被测契约（挪回去重之后本用例必红）。
+- 不变量已写入 `SYSTEM_CONTRACT.md`「缓存目录」段（回退判定只能由 `xbk_message_store` 给出、调用方不得自行 `path.resolve` 重算、记录先于去重），`README.md` 的 `--check` 说明补上「回退时同时点名配置值与实际回退目录」。
