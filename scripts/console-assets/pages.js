@@ -784,6 +784,24 @@ function usePanelLoader (apiFn, onLoaded, initialData = null) {
 // 首屏停在推送记录页时，不再替概览/系统页预取 /api/trends、/api/run-history、
 // /api/access-log、/api/cache-health（旧版「先拉一遍，点开就有」要 17 个请求、71KB）。
 // 首帧空白由面板自己的骨架补（见 PanelSkeleton）。
+// 单飞 + 结算时间戳（C7-019）：上一发未回就不再发（force=true 例外，供「load 身份变了」的
+// 强制补发）；成功回来记时间，给调用方的新鲜度判断用。三份「懒加载 + 节流」里的两份
+// （本 hook 与 SysPanel）共用这一段，差异只剩新鲜度阈值：hook 的 3000 被 test_console.js
+// 逐字锁定，SysPanel 用 PANEL_FRESH_MS。
+function runAutoLoad ({ pendingRef, loadedAtRef, load, queue = false, force = false, onSettled }) {
+  if (pendingRef.current && !force) return false
+  pendingRef.current = true
+  const p = queue ? load(true) : load()
+  Promise.resolve(p)
+    .then(() => {
+      loadedAtRef.current = Date.now()
+      if (typeof onSettled === 'function') onSettled()
+    })
+    .catch(() => {})
+    .finally(() => { pendingRef.current = false })
+  return true
+}
+
 // queue=true 用于日志这种自带互斥的 loader（在飞时排队，而不是丢掉这次刷新）。
 function usePanelAutoLoad (active, load, { queue = false } = {}) {
   const seenRef = useRef(null)
@@ -805,9 +823,7 @@ function usePanelAutoLoad (active, load, { queue = false } = {}) {
     // 的同一判定换成了 PANEL_FRESH_MS，这一份保持原样以免动到既有断言）。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))) return
     if (pendingRef.current && !loadChanged) return
-    pendingRef.current = true
-    const p = queue ? load(true) : load()
-    Promise.resolve(p).then(() => { loadedAtRef.current = Date.now() }).catch(() => {}).finally(() => { pendingRef.current = false })
+    runAutoLoad({ pendingRef, loadedAtRef, load, queue, force: loadChanged })
   }, [active, load, queue])
 }
 
@@ -3772,14 +3788,15 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
     // （/api/sys + /api/access-log + /api/config/console），首次进入才算首访。
     if (!active) return
     // 首次点开时上一发还在飞/刚回来不到 3s，直接用手里的数据；更久才点开则补一次。
+    // 单飞闸与结算时间戳交给公共的 runAutoLoad（C7-019）：这段骨架原先是 usePanelAutoLoad
+    // 的第二份手抄，改一处漏一处。
     if (becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < PANEL_FRESH_MS))) return
-    if (pendingRef.current) return
-    pendingRef.current = true
-    Promise.allSettled([load(), loadAccess(), loadSettings()]).then(() => {
-      pendingRef.current = false
-      loadedAtRef.current = Date.now()
-      setReadyTick((v) => v + 1)
-    }).catch(() => {})
+    runAutoLoad({
+      pendingRef,
+      loadedAtRef,
+      load: () => Promise.allSettled([load(), loadAccess(), loadSettings()]),
+      onSettled: () => setReadyTick((v) => v + 1)
+    })
   }, [active, load, loadAccess, loadSettings])
   // 设置块每次读到（含轮询）就同步给 App 的顶栏缓存：别的标签页改了 syncShowDate，
   // 这边最多一个轮询周期就跟上，不用等用户手动保存（Sourcery #303 M6）。

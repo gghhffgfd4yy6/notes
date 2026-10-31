@@ -11591,6 +11591,35 @@ async function main () {
       '失败横幅前缀必须保留（用户看到的「导入失败：…」不变）')
   })
 
+  await aok('结构红线: C7-019 懒加载 + 3s 节流只剩一份骨架（hook 与 SysPanel 共用 runAutoLoad）', () => {
+    const src = readConsoleSource()
+    // 骨架只能有一份实现：单飞闸 + 结算时间戳 + queue 排队都在 runAutoLoad 里。
+    const helper = sliceBetween(src, 'function runAutoLoad', '// queue=true 用于日志', 'runAutoLoad')
+    assert.ok(helper.includes('if (pendingRef.current && !force) return false'), '单飞闸必须在公共骨架里')
+    assert.ok(helper.includes('loadedAtRef.current = Date.now()'), '结算时间戳必须在公共骨架里（新鲜度判断的唯一来源）')
+    // hook 侧：仍走公共骨架，且被既有断言逐字锁定的 3000 表达式原样保留。
+    const hook = sliceBetween(src, 'function usePanelAutoLoad', '// ── 下拉刷新', 'usePanelAutoLoad')
+    assert.strictEqual((codeOf(hook).match(/pendingRef\.current = true/g) || []).length, 0,
+      'usePanelAutoLoad 不得自己置 pendingRef（单飞闸只在 runAutoLoad 里）')
+    // CacheHealth 的「私有半份」是首访播种（无单飞/无 3s），不得再长出第二套新鲜度判定。
+    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
+    assert.ok(!cache.includes('loadedAtRef'), '缓存健康只做首访播种，不应再私藏一份 loadedAt 节流')
+    assert.ok(hook.includes('runAutoLoad({ pendingRef, loadedAtRef, load, queue, force: loadChanged })'),
+      'usePanelAutoLoad 必须走公共骨架（不得再手抄一遍 Promise 链）')
+    assert.ok(hook.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
+      'hook 的 3s 判据被 test_console.js 逐字锁定，不得为了「统一」改成常量')
+    // SysPanel 侧：三段 loader 仍要一起结算才报 ready，但骨架来自 runAutoLoad。
+    const sys = sliceBetween(src, 'function SysPanel', 'function FilesPanel', 'SysPanel 片段')
+    assert.ok(sys.includes('runAutoLoad({'), 'SysPanel 的首访/切回加载必须走公共骨架')
+    assert.ok(sys.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
+      '系统页仍要等系统信息 + 访问日志 + 设置三条都结算')
+    assert.ok(sys.includes('onSettled: () => setReadyTick((v) => v + 1)'),
+      '结算后必须通知 ready（否则滚动层收口/数据截至不更新）')
+    assert.ok(!sys.includes('pendingRef.current = true'),
+      'SysPanel 不得再手写单飞闸（C7-019 的重复骨架就来自这一份）')
+    assert.ok(sys.includes('PANEL_FRESH_MS'), 'SysPanel 的新鲜度阈值必须引用 constants 的命名常量')
+  })
+
   }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
