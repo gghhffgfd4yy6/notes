@@ -260,6 +260,16 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
   // 结果徽章由下一轮轮询的 cancelled/finishedAt 驱动。
   const [cancelPending, setCancelPending] = useState(null)
   const [cancelErr, setCancelErr] = useState('')
+  // C7-009：「停止」是破坏性且不可撤销的动作，先弹确认再发。后果（已发出但没记进
+  // 推送记录的通知，下一轮会重推）必须写在弹窗正文里——只塞进按钮 title 的话，
+  // 触屏（无 hover）与键盘用户永远看不到。
+  const [cancelAsk, setCancelAsk] = useState(null)
+  // 与概览确认弹窗同一口径（C7-001）：本组件渲染在会被 display:none 的 section 里，
+  // 切页时若不收口，dialog 会塌成 0×0 且整页继续 inert。
+  useEffect(() => {
+    if (active) return
+    setCancelAsk(null)
+  }, [active])
   // 首屏行入场（只播一次；后续轮询只更新文字，不再闪）。
   const listRef = useRef(null)
   useRevealWhen(listRef, runs.length > 0, 'tbody tr', { transform: false, duration: MOTION.fast, step: 0.02, cap: 6 })
@@ -297,7 +307,7 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
             <td>${statusOf(r)}</td>
             <td>
               ${!r.finishedAt && html`<${Button} variant=${'ghost btn-danger' + (cancelPending === r.id ? ' btn-busy' : '')} disabled=${cancelPending === r.id}
-                onClick=${() => { doCancel(r.id).catch(() => {}) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止<//>`}
+                onClick=${() => { setCancelAsk(r.id) }} title="停止该任务（SIGTERM，3 秒后强杀；已发送但未记录的通知下轮会重推）">停止<//>`}
               <${Button} variant="ghost" onClick=${() => openLog(r.id)}>
                 ${openId === r.id ? '收起' : '日志'}
               <//>
@@ -319,6 +329,16 @@ function RunsPanel ({ runs, status = 'ok', pollMs, onRefresh, active = true }) {
           : (typeof detailForOpen.output === 'string' && detailForOpen.output.length > 0 ? detailForOpen.output : '（无输出）'))
       }</pre>
     </div>`}
+    ${/* C7-009：「停止」先确认再发。不可撤销与「下轮重推」的后果写在正文里（触屏/键盘都看得到），
+         不再只挂在按钮 title 上。 */ ''}
+    <${ConfirmDialog} open=${cancelAsk !== null && active}
+      title="停止这一轮任务？"
+      confirmLabel="停止任务"
+      onConfirm=${() => { const id = cancelAsk; setCancelAsk(null); doCancel(id).catch(() => {}) }}
+      onCancel=${() => setCancelAsk(null)}>
+      <div>会向运行中的任务 #${cancelAsk} 立刻发 SIGTERM，3 秒后仍未退出就强杀；停止<b>不能撤销</b>，这一轮只能重跑。</div>
+      <div class="modal-note">已经发出、但还没写进推送记录的通知不会作废——下一轮重推时可能重复到达。</div>
+    <//>
   </div>`
 }
 

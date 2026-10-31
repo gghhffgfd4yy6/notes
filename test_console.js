@@ -10929,6 +10929,33 @@ async function main () {
       'Esc 仍必须关闭日历并把焦点还给触发按钮')
   })
 
+  await aok('结构红线: C7-009 「停止」先确认再发（后果写进正文，切页即收口）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function RunsPanel')
+    const end = src.indexOf('// ── 组件：逐轮运行历史', at)
+    assert.ok(at > -1 && end > at, '应能定位 RunsPanel')
+    const seg = src.slice(at, end)
+    // 一键直发且不可撤销：停止按钮只能先置「待确认」，不得直接调 doCancel/apiCancelRun。
+    const btnAt = seg.indexOf('>停止<')
+    assert.ok(btnAt > -1, '应能定位停止按钮')
+    const btn = seg.slice(seg.lastIndexOf('<${Button}', btnAt), btnAt)
+    assert.ok(btn.includes('setCancelAsk(r.id)') && !btn.includes('doCancel('),
+      '停止按钮必须先置待确认态，不得一键直发 doCancel/apiCancelRun')
+    // 确认弹窗：与 C7-001 同口径受当前页门控，且只有确认才真的发。
+    assert.ok(seg.includes(attrOpen('cancelAsk !== null && active')),
+      '停止确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    const dlgAt = seg.indexOf('<${ConfirmDialog}')
+    assert.ok(dlgAt > -1, '应能定位停止确认弹窗')
+    const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
+    assert.ok(dlg.includes('doCancel(id)'), '确认后才调 doCancel')
+    assert.ok(dlg.includes('不能撤销') && dlg.includes('重复到达'),
+      '后果（不可撤销 / 下轮重推）必须写在弹窗正文里，不能只留在 title')
+    // 切页收口：离开当前页清掉待确认，回到本页不得再弹一次。
+    const guardAt = seg.indexOf('if (active) return')
+    assert.ok(guardAt > -1 && seg.slice(guardAt, guardAt + 80).includes('setCancelAsk(null)'),
+      '离开当前页必须清掉待确认（只 dialog.close() 会留下卡死的 cancelAsk）')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')
