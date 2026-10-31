@@ -1565,6 +1565,19 @@ async function filterRuleApiTests () {
       assert.strictEqual(body.revision, 1)
       assert.deepStrictEqual(body.changedFields, ['pingbibiaoti'])
       assert.ok(typeof body.hash === 'string' && body.hash.length > 0, '必须返回规则摘要 hash')
+      // C2-020：摘要必须与运行期 App.run 的 filter.hash 同口径（折入 compileStateOf 的「编译
+      // 生效」维度）。旧实现只传前两参，控制台的 hash 与生效快照里的 filter.hash 永远不相等。
+      const cfgRead = await request(port, 'GET', '/api/config/filter', { token: TOKEN })
+      const activeCfg = JSON.parse(cfgRead.text)
+      const realDeps = runtimeFilterDeps()
+      const runtimeHash = realDeps.filterHash(
+        activeCfg.filter,
+        activeCfg.keyword.zkt_gjc,
+        realDeps.compileStateOf(realDeps.RuleEngine.compileRules(activeCfg.filter))
+      )
+      assert.strictEqual(body.hash, runtimeHash, '控制台摘要必须等于运行期 filter.hash 口径')
+      assert.notStrictEqual(body.hash, realDeps.filterHash(activeCfg.filter, activeCfg.keyword.zkt_gjc),
+        '纯配置摘要（不折编译维度）不得再冒充 filter.hash')
       assert.strictEqual(body.appliedHint, '下一轮生效')
       assert.strictEqual(fs.statSync(paths.file).mode & 0o777, 0o600, '覆盖文件必须 0600')
       assert.strictEqual(fs.existsSync(paths.lock), false, '保存后锁必须释放')

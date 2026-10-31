@@ -231,7 +231,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-562"
+            mutate: "xbk_function_v3.js:1-565"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -381,7 +381,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part12
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6501-7093"
+            mutate: "scripts/console.js:6501-7104"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

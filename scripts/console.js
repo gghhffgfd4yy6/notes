@@ -1976,7 +1976,9 @@ function runtimeFilterDeps () {
     re2Available: Boolean(RE2),
     isRe2Available: () => Boolean(RE2),
     explainFilter: v3 && typeof v3.explainFilter === 'function' ? v3.explainFilter : null,
-    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null
+    filterHash: v3 && typeof v3.filterHash === 'function' ? v3.filterHash : null,
+    // FILTER-01：与 App.run 同口径的「编译生效」维度（缺导出时 filterHashOf 退回纯配置摘要）。
+    compileStateOf: v3 && typeof v3.compileStateOf === 'function' ? v3.compileStateOf : null
   }
   return filterDepsCache
 }
@@ -2288,11 +2290,20 @@ function wideMatchFields (filter) {
   return out
 }
 
+// 过滤规则摘要：必须与运行期 App.run 的 filter.hash **同口径**——它算的是
+// Utils.filterHash(active.filter, zkt_gjc, RuleEngine.compileStateOf(compiledRules))，
+// 第三参是「规则实际编译生效」维度（re2 可用性 + 各字段是否编译出规则）。这里此前只传前两参，
+// 于是控制台返回的 hash 与运行期写进生效快照的 filter.hash 永远不相等（同一份规则两个值，
+// 「已生效」对账只能退回比 revision）。编译失败/依赖缺失时退化为纯配置摘要，不让摘要变成 null。
 function filterHashOf (deps, filter, keyword) {
   const zkt = keyword && typeof keyword.zkt_gjc === 'string' ? keyword.zkt_gjc : ''
   try {
     if (deps && typeof deps.filterHash === 'function') {
-      const hash = deps.filterHash(filter, zkt)
+      let compileState
+      if (typeof deps.compileStateOf === 'function' && deps.RuleEngine && typeof deps.RuleEngine.compileRules === 'function') {
+        try { compileState = deps.compileStateOf(deps.RuleEngine.compileRules(filter)) } catch (e) { compileState = undefined }
+      }
+      const hash = deps.filterHash(filter, zkt, compileState)
       if (typeof hash === 'string' && hash.length > 0) return hash
     }
   } catch (e) { /* 回退 sha256（deps 注入/Config 异常时仍给出稳定摘要） */ }
