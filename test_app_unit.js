@@ -3822,9 +3822,16 @@ check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
   // 0o600 是 CodeQL js/insecure-temporary-file 收口后的口径：锁文件只含 pid:starttime，
-  // 显式收紧 mode；这里连 mode 一起钉住——改回两参 openSync 或放宽 mode 都会在此变红。
-  assert.strictEqual((code.match(/fs\.openSync\(lockPath, 'wx', 0o600\)/g) || []).length, 2,
-    '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开），且都带 0o600')
+  // 显式收紧 mode。这里钉两个数：wx 打开点总数（首试 + 回收后重开 = 2）与其中显式带 0o600
+  // 的条数（= 2）。只统计「带 mode」那一条不够——再插一处两参 openSync 时它会照样通过，
+  // 而 CodeQL 报的正是那种形态。
+  const wxOpenPoints = code.match(/fs\.openSync\(lockPath, 'wx'/g) || []
+  const wxOpenPointsWithMode = code.match(/fs\.openSync\(lockPath, 'wx', 0o600\)/g) || []
+  assert.strictEqual(wxOpenPoints.length, 2,
+    '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开），实际 ' + wxOpenPoints.length + ' 处')
+  assert.strictEqual(wxOpenPointsWithMode.length, 2,
+    '两处 wx 打开点都必须显式带 0o600（CodeQL isSecureMode 要求 mode 低 6 位为 0），实际 ' +
+      wxOpenPointsWithMode.length + ' 处带 mode')
   assert.strictEqual((code.match(/LOCK_STALE_MS/g) || []).length, 2,
     'LOCK_STALE_MS 必须只有「定义 + 使用」各一处（原先三份实现各写一份）')
   assert.strictEqual(/mtimeMs > 10000/.test(code), false, '不得再出现写死的 10000（通道健康那份的漂移形态）')
