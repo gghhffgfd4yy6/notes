@@ -3851,6 +3851,50 @@ async function main () {
       assert.strictEqual(spec.file, want, `route 与文件名必须一致：${route} → ${spec.file}（期望 ${want}）`)
     }
   })
+  await aok('资产: 跨模块具名导入在 ESM 链接期都能解析（漏导出 = 整张模块图不实例化、白屏）', () => {
+    // C7-029：api.js 定义了 AUTH_HEADER 却没写进 export 块，pages.js 却 `import { AUTH_HEADER }`。
+    // 浏览器原生 ESM 在**链接期**（求值之前）就抛 SyntaxError「does not provide an export named」，
+    // 整页模块图不实例化 ⇒ 白屏；而源码文本断言（Authorization 行数、import 串）照样全绿。
+    // 这里用 Node 的 vm.SourceTextModule 只做实例化（link）不执行：不需要 document 桩，报错与浏览器同一句。
+    // 子进程独立跑（vm 模块需要 --experimental-vm-modules，不能给整个套件加）。
+    const dir = path.join(__dirname, 'scripts', 'console-assets')
+    const script = [
+      "'use strict'",
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      "const vm = require('node:vm')",
+      "const { pathToFileURL } = require('node:url')",
+      'const dir = process.argv[1]',
+      "const { STATIC_ASSETS } = require(path.join(dir, '..', 'console.js'))",
+      'const cache = new Map()',
+      'function load (file) {',
+      "  if (!cache.has(file)) cache.set(file, new vm.SourceTextModule(fs.readFileSync(file, 'utf8'), { identifier: pathToFileURL(file).href }))",
+      '  return cache.get(file)',
+      '}',
+      '(async () => {',
+      "  const root = load(path.join(dir, 'app.js'))",
+      '  await root.link((spec) => {',
+      "    const route = '/assets/' + spec.replace(/^\\.\\//, '')",
+      '    const entry = STATIC_ASSETS[route]',
+      "    if (!entry) throw new Error('import 目标未登记白名单：' + spec)",
+      '    return load(path.join(dir, entry.file))',
+      '  })',
+      '  // 入口闭包必须覆盖目录里每个模块：漏一个就等于这段链接检查没跑到它。',
+      '  const linked = new Set([...cache.keys()].map((p) => path.basename(p)))',
+      '  const unlinked = fs.readdirSync(dir).filter((f) => /\\.(js|mjs)$/.test(f) && !linked.has(f))',
+      "  if (unlinked.length > 0) throw new Error('模块不在 app.js 的 import 闭包里（本用例没检查到）：' + unlinked.join(','))",
+      "  process.stdout.write('LINK OK')",
+      '})().catch((e) => { console.error((e && e.message) || String(e)); process.exit(1) })'
+    ].join('\n')
+    const out = spawnSync(process.execPath, ['--experimental-vm-modules', '-e', script, dir], { encoding: 'utf8' })
+    // 只留真正的错误行：Node 的 ExperimentalWarning 会排在前面，把 SyntaxError 挤出消息。
+    const errText = String(out.stderr || '').split('\n')
+      .filter((l) => l.trim() && !/^\(node:\d+\)|^\(Use `node --trace-warnings/.test(l.trim()))
+      .join(' | ')
+    assert.strictEqual(out.status, 0,
+      '模块图链接失败（浏览器会在链接期 SyntaxError ⇒ 整页白屏）：' + errText)
+    assert.strictEqual(out.stdout, 'LINK OK', '链接检查没有跑完（stdout 不是 LINK OK）')
+  })
   await aok('资产: 首屏 modulepreload 覆盖 app.js 的 import 闭包（版本路径、排在入口之前）', () => {
     // 预加载是手工维护的一行一模块（v3.384 起 12 行），两种错都不会被别的用例抓住：① 漏一个模块（瀑布还在，只是
     // 短了点）；② 把 flatpickr 写成 flatpickr.module.js（404，白下一次）。这里用 acorn 从

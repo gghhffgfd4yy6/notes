@@ -749,7 +749,7 @@ function apiPostLineWatch (payload = {}) {
 }
 
 export {
-  BOOT, DAY_KEY_RE, timedRequest, trigger,
+  BOOT, AUTH_HEADER, DAY_KEY_RE, timedRequest, trigger,
   triggerNotifyTest, apiGetStatus, apiGetRuns, apiGetRunDetail,
   apiCancelRun, apiGetRunHistory, apiGetMessages, apiGetTrends,
   apiGetCacheHealth, apiGetFiles, apiGetConfig, apiGetLogs,
