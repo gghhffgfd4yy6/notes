@@ -792,6 +792,67 @@ function assertSettled (outcome, label, why) {
     console.log('✅ C8-008 源码形状：finally 块内零结算调用')
   }
 
+  // ===== C8-009：通道清单单一真源（启用判定 == 实际执行的通道）=====
+  // 缺陷形状（改动前）：同一份 9 通道清单在 configuredChannelCount / configuredChannelNames /
+  // sendNotify 的 configuredFlags / channelTasks 各抄一遍，flags[i] 与 tasks[i] 只靠下标对齐——
+  // 加删通道要改 4 处，写反一个就让「已配置的通道」与「真正被调用的通道」分叉（静默失效）。
+  // 判据：逐个只配一个通道时，计数/名单/实际失败归因三者必须都指向同一个名字。
+  {
+    const gotMod = require('got')
+    const { EventEmitter } = require('node:events')
+    const origStreamPost = gotMod.stream && gotMod.stream.post
+    const saved = {}
+    const clearCfg = () => { for (const k of Object.keys(cfg)) delete cfg[k] }
+    for (const k of Object.keys(cfg)) saved[k] = cfg[k]
+    gotMod.stream = gotMod.stream || {}
+    gotMod.stream.post = () => {
+      const em = new EventEmitter()
+      em.destroy = () => {}
+      setImmediate(() => em.emit('error', new Error('probe-no-io')))
+      return em
+    }
+    // 顺序即历史日志顺序（Push+ / Server酱 / Bark / 企微 / wxpusher / 息知 / PushDeer / PushMe / TG）
+    const CASES = [
+      ['pushplus', { PUSH_PLUS_TOKEN: 'probe-plus-token' }],
+      ['server酱', { PUSH_KEY: 'SCTprobe' }],
+      ['bark', { BARK_PUSH: 'probe-bark-device' }],
+      ['企业微信', { QYWX_KEY: 'probe-qywx-key' }],
+      ['wxpusher', { WX_pusher_appToken: 'AT_probe_token' }],
+      ['息知', { WX_XIZHI_KEY: 'https://xizhi.example/probe' }],
+      ['pushdeer', { DEER_KEY: 'probe-deer-key' }],
+      ['pushme', { PUSHME_KEY: 'probe-pushme-key' }],
+      ['telegram', { TG_BOT_TOKEN: 'probe-tg-token', TG_USER_ID: 'probe-tg-uid' }]
+    ]
+    try {
+      for (const [name, conf] of CASES) {
+        clearCfg()
+        Object.assign(cfg, conf)
+        assert.strictEqual(configuredChannelCount(), 1, `${name}：单独配置时计数必须恰好 1`)
+        assert.deepStrictEqual(configuredChannelNames(), [name], `${name}：单独配置时名单必须恰好只有自己`)
+        const tracker = {}
+        let err = null
+        try { await slim.sendNotify('T', 'D', { inFlightTracker: tracker }) } catch (e) { err = e }
+        assert.strictEqual(err && err.code, 'ALL_CHANNELS_FAILED', `${name}：探针应让该通道失败而不是静默跳过`)
+        assert.strictEqual(err.failures.length, 1, `${name}：只应有一个通道被调用（多调用说明清单重复）`)
+        assert.strictEqual(err.failures[0].channel, name,
+          `${name}：实际执行的通道名必须与启用清单一致（flags/tasks 下标错位会在此变红）`)
+        assert.deepStrictEqual(tracker.pending, [], `${name}：在飞清单必须随结算清空`)
+      }
+      // 全家桶：名单顺序必须与历史日志顺序逐字一致（顺序漂移会让日志/归因的既有读者错位）
+      clearCfg()
+      for (const [, conf] of CASES) Object.assign(cfg, conf)
+      assert.deepStrictEqual(configuredChannelNames(),
+        ['pushplus', 'server酱', 'bark', '企业微信', 'wxpusher', '息知', 'pushdeer', 'pushme', 'telegram'],
+        '九通道名单与顺序必须由同一张表派生')
+      assert.strictEqual(configuredChannelCount(), 9, '九通道全配置时计数必须为 9')
+      console.log('✅ C8-009 通道清单单一真源：9 个通道逐个「计数 / 名单 / 实际执行」三者一致 + 全家桶顺序不变')
+    } finally {
+      if (origStreamPost) gotMod.stream.post = origStreamPost
+      clearCfg()
+      for (const [k, v] of Object.entries(saved)) cfg[k] = v
+    }
+  }
+
   // ===== 补测 PlanF：normalizeFailure 与失败聚合（经 sendNotify 的 failures 观测）=====
   // 反例（改动前）：normalizeFailure 20 个靶子被登记为「不可达」——**该判断同样是错的**：
   // 它在 channelResults 里被调用（L1612），而 sendNotify 在**全部通道失败**时把 failures 一路抛出。

@@ -978,30 +978,37 @@ function delimitedNonEmpty (v) {
   try { return String(v).split('#').some(s => s.trim() !== '') } catch (e) { return false }
 }
 
+// 通道清单（唯一真源）：name（日志/健康统计用的通道名）、enabled(push_config)、run(执行体)。
+// C8-009：此前同一份 9 通道清单抄了 4 遍——configuredChannelCount 数一遍、configuredChannelNames
+// 列一遍、sendNotify 的 configuredFlags 列一遍、channelTasks 再列一遍；加删通道要改 4 处，而
+// flags[i] 与 tasks[i] 只靠「两处数组顺序一致」绑定，漏写/写反一个就静默失效（旧代码在那一处只留了
+// 「漏一个就会静默失效」的注释当护栏——注释拦不住这件事）。现在计数、名单、启用判定与执行体
+// 全部由本表派生，顺序/名称/判定/执行只在这里出现一次。
+// 谓词口径见上方 nonEmpty/delimitedNonEmpty：0/false/空白 → 未配置；'0'/'false' 仍算已配置。
+// 顺序与历史日志顺序一致（Push+/Server酱/Bark/企微/wxpusher/息知/PushDeer/PushMe/TG）。
+const CHANNELS = [
+  { name: 'pushplus', enabled: c => nonEmpty(c.PUSH_PLUS_TOKEN), run: (text, desp, params) => pushPlusNotify(text, desp, params) },
+  { name: 'server酱', enabled: c => nonEmpty(c.PUSH_KEY), run: (text, desp, params) => serverNotify(text, desp, params) },
+  { name: 'bark', enabled: c => delimitedNonEmpty(c.BARK_PUSH), run: (text, desp, params) => barkNotify(text, desp, params) },
+  { name: '企业微信', enabled: c => nonEmpty(c.QYWX_KEY), run: (text, desp, params) => qywxBotNotify(text, desp, params) },
+  // wxpusher 是唯一需要原始 desp 的通道（contentType=2 直接渲染 HTML，见 C8-002）：其余通道拿降级后的 textDesp。
+  { name: 'wxpusher', enabled: c => hasWxPusherConfigured(), rawDesp: true, run: (text, desp, params) => wxPusherNotify(text, desp, params) },
+  { name: '息知', enabled: c => nonEmpty(c.WX_XIZHI_KEY), run: (text, desp, params) => wxXiZhiNotify(text, desp, params) },
+  { name: 'pushdeer', enabled: c => nonEmpty(c.DEER_KEY), run: (text, desp, params) => pushDeerNotify(text, desp, params) },
+  { name: 'pushme', enabled: c => delimitedNonEmpty(c.PUSHME_KEY), run: (text, desp, params) => pushMeNotify(text, desp, params) },
+  { name: 'telegram', enabled: c => nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID), run: (text, desp, params) => tgNotify(text, desp, params) }
+]
+
+function enabledChannels () {
+  return CHANNELS.filter(channel => channel.enabled(push_config))
+}
+
 function configuredChannelCount () {
-  const c = push_config
-  let count = 0
-  if (nonEmpty(c.PUSH_PLUS_TOKEN)) count++
-  if (nonEmpty(c.PUSH_KEY)) count++
-  if (delimitedNonEmpty(c.BARK_PUSH)) count++
-  if (nonEmpty(c.QYWX_KEY)) count++
-  if (hasWxPusherConfigured()) count++
-  if (nonEmpty(c.WX_XIZHI_KEY)) count++
-  if (nonEmpty(c.DEER_KEY)) count++
-  if (delimitedNonEmpty(c.PUSHME_KEY)) count++
-  if (nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID)) count++
-  return count
+  return enabledChannels().length
 }
 
 function configuredChannelNames () {
-  const c = push_config
-  return [
-    [nonEmpty(c.PUSH_PLUS_TOKEN), 'pushplus'], [nonEmpty(c.PUSH_KEY), 'server酱'],
-    [delimitedNonEmpty(c.BARK_PUSH), 'bark'], [nonEmpty(c.QYWX_KEY), '企业微信'],
-    [hasWxPusherConfigured(), 'wxpusher'], [nonEmpty(c.WX_XIZHI_KEY), '息知'],
-    [nonEmpty(c.DEER_KEY), 'pushdeer'], [delimitedNonEmpty(c.PUSHME_KEY), 'pushme'],
-    [nonEmpty(c.TG_BOT_TOKEN) && nonEmpty(c.TG_USER_ID), 'telegram']
-  ].filter(([enabled]) => enabled).map(([, name]) => name)
+  return enabledChannels().map(channel => channel.name)
 }
 
 function hasWxPusherConfigured () {
@@ -1800,19 +1807,15 @@ async function sendNotify (text, desp, params = {}) {
   // v3.110：入口统一清洗孤立代理（encodeURIComponent 对孤立代理抛 URIError → 通道发送失败）
   text = cleanSurrogates(text)
   desp = cleanSurrogates(desp)
-  // 通道配置检查：一个都没配 → 拒绝（避免"静默成功"让主流程以为推送完成并写缓存）
-  // 注意：这里必须与下方 Promise.all 实际调用的通道一一对应，漏一个就会让已配置的通道静默失效。
+  // 通道配置检查：一个都没配 → 拒绝（避免"静默成功"让主流程以为推送完成并写缓存）。
   // 分隔型配置（Bark/PushMe）还要排除只有分隔符/空白的值，否则通道函数会无请求地 resolve，
-  // configuredFlags 又把它计为已配置，最终出现「无实际设备却虚假成功」的 P1。
-  // v3.273（审查 S7/F3）：谓词提升到模块级（上方 nonEmpty/delimitedNonEmpty），
-  // 供 configuredChannelCount / configuredChannelNames 共用同一口径——三处曾各有一份实现。
-  const configuredFlags = [
-    nonEmpty(push_config.PUSH_PLUS_TOKEN), nonEmpty(push_config.PUSH_KEY), delimitedNonEmpty(push_config.BARK_PUSH),
-    nonEmpty(push_config.QYWX_KEY), parseWxPusherChannels().length > 0, nonEmpty(push_config.WX_XIZHI_KEY),
-    nonEmpty(push_config.DEER_KEY), delimitedNonEmpty(push_config.PUSHME_KEY),
-    nonEmpty(push_config.TG_BOT_TOKEN) && nonEmpty(push_config.TG_USER_ID)
-  ]
-  if (!configuredFlags.some(Boolean)) {
+  // 启用清单又把它计为已配置，最终出现「无实际设备却虚假成功」的 P1。
+  // v3.273（审查 S7/F3）：谓词收成模块级 nonEmpty/delimitedNonEmpty，各处共用同一口径。
+  // C8-009：启用判定与执行体都由 CHANNELS 表派生（此前 configuredFlags 与 channelTasks 各抄一份
+  // 9 通道清单、只靠下标对齐，漏一个就静默失效）。两者的差别只有 desp 来源——wxpusher 用原始 desp
+  // （contentType=2 渲染 HTML），其余 8 个用降级后的 textDesp——这一条由表里的 rawDesp 标记表达。
+  const enabledTasks = enabledChannels()
+  if (enabledTasks.length === 0) {
     const error = new Error('未配置任何推送通道（Push+/Server酱/Bark/企业微信/wxpusher/息知/PushDeer/PushMe/Telegram）')
     error.code = 'NO_CHANNEL_CONFIG'
     throw error
@@ -1848,18 +1851,6 @@ async function sendNotify (text, desp, params = {}) {
   // C8-002：HTML 形态的 desp 只有 wxpusher 能真渲染（contentType=2），其余 8 个通道统一改用降级后的
   // textDesp（HTML→Markdown→纯文本），避免段落换行丢失 / <img> 连 alt 消失 / 源码外露。
   const textDesp = htmlToPlainText(desp)
-  const channelTasks = [
-    [configuredFlags[0], 'pushplus', () => pushPlusNotify(text, textDesp, params)],
-    [configuredFlags[1], 'server酱', () => serverNotify(text, textDesp, params)],
-    [configuredFlags[2], 'bark', () => barkNotify(text, textDesp, params)],
-    [configuredFlags[3], '企业微信', () => qywxBotNotify(text, textDesp, params)],
-    [configuredFlags[4], 'wxpusher', () => wxPusherNotify(text, desp, params)],
-    [configuredFlags[5], '息知', () => wxXiZhiNotify(text, textDesp, params)],
-    [configuredFlags[6], 'pushdeer', () => pushDeerNotify(text, textDesp, params)],
-    [configuredFlags[7], 'pushme', () => pushMeNotify(text, textDesp, params)],
-    [configuredFlags[8], 'telegram', () => tgNotify(text, textDesp, params)]
-  ]
-  const enabledTasks = channelTasks.filter(([enabled]) => enabled)
   // P3（跨批协同，low）：向调用方（Pusher）透出本次 sendNotify 的「在飞/已结算通道」状态。
   // Pusher 的整体超时（10s race）会在 slim 的 Promise.allSettled 尚未 settle 时触发，此前只能按
   // 静态配置清单把【所有】配置通道都标成 PUSH_TIMEOUT（含已成功通道）；有了在飞清单，超时归因
@@ -1870,18 +1861,19 @@ async function sendNotify (text, desp, params = {}) {
   const inFlightTracker = params && params.inFlightTracker && typeof params.inFlightTracker === 'object'
     ? params.inFlightTracker
     : null
-  const pendingChannels = inFlightTracker ? enabledTasks.map(([, name]) => name) : null
+  const pendingChannels = inFlightTracker ? enabledTasks.map(channel => channel.name) : null
   if (inFlightTracker) inFlightTracker.pending = pendingChannels
   const trackSettle = (name) => {
     const idx = pendingChannels.indexOf(name)
     if (idx !== -1) pendingChannels.splice(idx, 1)
   }
   const results = await Promise.allSettled(
-    enabledTasks.map(([, name, task]) => {
+    enabledTasks.map((channel) => {
+      const task = () => channel.run(text, channel.rawDesp ? desp : textDesp, params)
       if (!pendingChannels) return task()
       let running
-      try { running = task() } catch (e) { trackSettle(name); throw e }
-      return Promise.resolve(running).finally(() => trackSettle(name))
+      try { running = task() } catch (e) { trackSettle(channel.name); throw e }
+      return Promise.resolve(running).finally(() => trackSettle(channel.name))
     })
   )
   const normalizeFailure = (reason, channel) => {
@@ -1900,9 +1892,9 @@ async function sendNotify (text, desp, params = {}) {
     return failure
   }
   const channelResults = results.map((result, index) => ({
-    channel: enabledTasks[index][1],
+    channel: enabledTasks[index].name,
     status: result.status,
-    failure: result.status === 'rejected' ? normalizeFailure(result.reason, enabledTasks[index][1]) : null
+    failure: result.status === 'rejected' ? normalizeFailure(result.reason, enabledTasks[index].name) : null
   }))
   const attempted = channelResults
   const okCount = attempted.filter(r => r.status === 'fulfilled').length
