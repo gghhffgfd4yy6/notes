@@ -11499,6 +11499,24 @@ async function main () {
       '上限对照整块必须以 lim 为门（不是 ok）：limits 缺失时不得解引用')
   })
 
+  await aok('结构红线: C7-022 推送列表的响应归属守卫（旧筛选数据不得冒充新筛选结果）', () => {
+    const src = readConsoleSource()
+    const panel = sliceBetween(src, 'function MessagesPanel', 'function LogsPanel', 'MessagesPanel 片段')
+    // 指纹必须覆盖全部会改变结果集的筛选；旧实现只记 query（loadedQueryRef），分类/页码/时间窗全漏。
+    const key = src.slice(src.indexOf('function msgFilterKey'), src.indexOf('function buildMessagesHash'))
+    assert.ok(key.includes('q, cate, page, size, days, from, to'), '筛选指纹必须覆盖 q/cate/page/size/days/from/to')
+    assert.ok(panel.includes('const key = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })'),
+      'fetchMessages 必须按「本次请求实际用的筛选」生成指纹')
+    assert.ok(panel.includes('{ ...d, filterKey: key }'), '响应必须带上本次筛选指纹（服务端字段原样保留）')
+    assert.ok(panel.includes('data.filterKey !== filtersKey'),
+      '渲染必须比对响应指纹与当前筛选：不一致就是上一组的数据')
+    assert.ok(panel.includes('下面仍是上一组筛选的'),
+      '旧数据占屏时必须明说归属（否则换分类/翻页后旧条目看起来就是新筛选的结果）')
+    // query 的既有归属回写不能为了这次改动被删：服务端截断后的 queryUsed 只在「本次响应属于当前 query」时回写。
+    assert.ok(panel.includes('if (seq === loadSeqRef.current) loadedQueryRef.current = requested'),
+      'query 归属回写必须保留（旧响应不得把刚输入的新词覆盖回去）')
+  })
+
   }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

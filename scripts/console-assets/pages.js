@@ -1623,6 +1623,13 @@ function sameMsgFilters (a, b) {
     a.days === b.days && a.from === b.from && a.to === b.to
 }
 
+// 响应归属指纹（C7-022）：把「这次请求实际用的筛选」随响应一起带回，渲染时与当前筛选比对。
+// 旧实现只记了 query（loadedQueryRef），换分类/翻页/换时间窗时 loader 保留的旧 data
+// 会原样挂在新筛选下面（条数、页码、分类计数全是上一组的），页面上没有任何提示。
+function msgFilterKey ({ q, cate, page, size, days, from, to }) {
+  return [q, cate, page, size, days, from, to].join('\u0000')
+}
+
 function buildMessagesHash (state) {
   const p = new URLSearchParams()
   if (state.q) p.set('q', state.q)
@@ -1781,13 +1788,21 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
     () => {
       const requested = query
       const seq = ++loadSeqRef.current
+      // C7-022：本次请求用的筛选指纹随响应带回（见 msgFilterKey），渲染时据此判「这份数据
+      // 属不属于当前筛选」。服务端字段原样保留，只多挂一个 filterKey。
+      const key = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })
       return apiGetMessages({ page, size, cate, q: requested, days: rangeActive ? 0 : days, from: range.from, to: range.to }).then((d) => {
         if (seq === loadSeqRef.current) loadedQueryRef.current = requested
-        return d
+        return d && typeof d === 'object' ? { ...d, filterKey: key } : d
       })
     },
     [page, size, cate, query, days, rangeActive, range.from, range.to])
   const { data, err, load, loading, settleTick } = usePanelLoader(fetchMessages, onSync)
+  // 当前筛选的指纹：与 data.filterKey 不一致表示屏幕上的条目属于上一组筛选（换分类/翻页/
+  // 换时间窗/改搜索词后的在飞窗口，或这次请求失败后退回的旧数据）。旧实现没有任何标记，
+  // 用户看到的是「新筛选 + 旧条目 + 旧页码」。
+  const filtersKey = msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })
+  const filtersStale = !!(data && data.status === 'ok' && data.filterKey !== filtersKey)
   const slowLoading = useSlowFlag(loading)
   // 分页器禁用态的「在飞」部分延迟 120ms 才置位（C7-041，见下面 renderPager）：一次翻页的
   // loading 常常只存在十几毫秒（条件请求命中 304 / 本地缓存快），整排按钮立刻压到 .7 透明度
@@ -2047,6 +2062,13 @@ function MessagesPanel ({ onSync, active = true, pollTick = 0 }) {
       <${Button} variant="ghost" disabled=${exporting !== ''} onClick=${() => doExport('json')}>${exporting === 'json' ? '导出中…' : '导出 JSON'}<//>
     </div>
     ${err && html`<${LoadError} text=${err} busy=${loading} onRetry=${() => { load().catch(() => {}) }} />`}
+    ${/* C7-022：归属提示。换分类/翻页/换时间窗后请求还没回来（或失败退回旧数据）时，
+         屏幕上的条目、条数、页码都属于上一组筛选——必须明说，不能让旧数据冒充新筛选的结果。 */ ''}
+    ${filtersStale && html`<div class="msg-count msg-loading" role="status" aria-live="polite">${
+      loading
+        ? `筛选已改变，正在加载新结果… 下面仍是上一组筛选的 ${data.total} 条`
+        : `这次加载没成功，下面仍是上一组筛选的 ${data.total} 条；点「刷新」再试`
+    }</div>`}
     ${exportErr && html`<${Hint} tone="error">${exportErr}<//>`}
     ${exportNote && html`<${Hint}>${exportNote}<//>`}
     ${loading && !data && html`<${PanelSkeleton} label="正在加载推送记录" />`}
