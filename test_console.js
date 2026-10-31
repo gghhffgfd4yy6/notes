@@ -3034,6 +3034,11 @@ async function watchMonitorTests () {
       const failed = await failing.runWatchOnce()
       assert.strictEqual(failed.pushed, 0)
       assert.strictEqual(failed.results[0].error, 'push_failed')
+      // C2-009 入库回归：旧的四个失败分支先 push 一条 error 条目、循环外又无条件 push 一条
+      // 「成功形态」，同一个词在 results 里出现两次（前端一个标红一个标绿）。只查 results[0]
+      // 抓不到，必须钉长度。
+      assert.strictEqual(failed.results.length, 1,
+        `推送失败时同一个词只能有一条结果（实际 ${failed.results.length} 条：${JSON.stringify(failed.results)}）`)
       const kept = readWatchState(dir)
       assert.deepStrictEqual(kept.words[0].sentIds, [])
       assert.strictEqual(kept.words[0].lastReadId, 'haodan-7303544', '失败不得推进锚点')
@@ -3276,6 +3281,218 @@ async function watchMonitorTests () {
   })
 }
 
+// ── 返工回归（w1-g1 must_fix）：以下修复此前的反向验证只存在于未入库的 scratch 探针，
+// 仓库里没有任何断言会在修复被回退时变红。这里把每条行为修复落成入库断言：
+//   C2-007 状态文件（console-auto.json / console-lastaccept.json）必须经 writeAtomic 落盘，
+//          且重放窗落盘失败必须 fail-closed 500（旧的裸 writeFileSync 会照常 202 并 spawn）；
+//   C2-008 导入失败的回滚必须经 writeAtomic 原子提交，回滚写失败要如实报 rolledBack:false；
+//   C2-012 2FA 两处补对象校验（body=[] 旧实现 200 {enabled:false}，把畸形请求报成成功）；
+//   C2-013 重放窗文件损坏必须在启动时点名文件 + 原因 + 后果；
+//   C2-009 结果去重补在既有关注词用例里（同一份夹具，不复制第二套）；
+//   C2-010/C2-011 是纯重构（三份实现合并成一份，行为等价、无行为差异可断言），按评审给的口径
+//          补结构断言，且先剥注释（codeOf）防注释里的原句满足判据。
+// 行为类判据一律走真实入口（HTTP / createConsole / 落盘桩），不做源码字符串匹配。
+async function withStorageWriteStub (impl, fn) {
+  // scripts/console.js 在**加载期**就把 writeAtomic 解构进闭包（`const { readSafeTextResult,
+  // writeAtomic } = require('../xbk_storage')`），运行期改 require.cache 里的导出对它无效。
+  // 要观察「某处落盘是否真的走 writeAtomic」，只能换掉 xbk_storage 的导出后重新加载 console。
+  // 桩只多记一条 {file,label,result}，其余导出原样透传；跑完把两份 require.cache 还原，
+  // 后续用例看到的仍是本文件顶部那个实例（模块级 runs Map 不受影响）。
+  const storagePath = require.resolve('./xbk_storage')
+  const consolePath = require.resolve('./scripts/console')
+  const realStorage = require.cache[storagePath]
+  const realConsole = require.cache[consolePath]
+  assert.ok(realStorage && realStorage.exports, 'xbk_storage 必须已加载（否则桩无法透传真实实现）')
+  const realWrite = realStorage.exports.writeAtomic
+  assert.strictEqual(typeof realWrite, 'function', 'xbk_storage.writeAtomic 必须存在')
+  const calls = []
+  require.cache[storagePath] = {
+    id: storagePath,
+    filename: storagePath,
+    loaded: true,
+    exports: {
+      ...realStorage.exports,
+      writeAtomic: (file, text, label) => {
+        const entry = { file: String(file), label: label === undefined ? '' : String(label) }
+        let result = false
+        try {
+          result = impl(entry, text, realWrite)
+        } catch (e) {
+          result = false
+        }
+        calls.push({ ...entry, result })
+        return result
+      }
+    }
+  }
+  let mod
+  try {
+    delete require.cache[consolePath]
+    mod = require('./scripts/console')
+  } finally {
+    delete require.cache[consolePath]
+    require.cache[storagePath] = realStorage
+    if (realConsole) require.cache[consolePath] = realConsole
+  }
+  return fn(mod, calls)
+}
+
+// 同步抓 stderr：createConsole 启动期的告警是同步 console.error 出来的。
+function capturedStderr (fn) {
+  const chunks = []
+  const orig = process.stderr.write
+  process.stderr.write = (c) => { chunks.push(String(c)); return true }
+  try {
+    fn()
+  } finally {
+    process.stderr.write = orig
+  }
+  return chunks.join('')
+}
+
+async function reworkRegressionTests () {
+  await aok('结构红线: 过滤规则提交链只有一份实现（C2-010）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((code.match(/function commitFilterOverride \(/g) || []).length, 1,
+      'commitFilterOverride 只能有一处定义（保存/回滚/导入各写一遍就是回退了修复）')
+    assert.strictEqual((code.match(/commitFilterOverride\(\{/g) || []).length, 3,
+      '保存、回滚、导入三个写动作必须共用同一条提交链')
+    assert.strictEqual((code.match(/function appendFilterAudit \(/g) || []).length, 1)
+    assert.strictEqual((code.match(/appendFilterAudit\(\{/g) || []).length, 1,
+      '审计只能由提交链写一次（散着写必然出现「某条路径不写审计」）')
+  })
+
+  await aok('结构红线: 上游响应体读取只有一份实现（C2-011）', () => {
+    const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
+    assert.strictEqual((code.match(/getReader\(\)/g) || []).length, 1,
+      'getReader() 只应出现在共用实现里（搜索/详情各写一份就是回退了修复）')
+    assert.strictEqual((code.match(/readUpstreamTextCapped/g) || []).length, 3,
+      'readUpstreamTextCapped 必须 1 处定义 + 搜索/详情 2 个调用点')
+  })
+
+  await aok('2FA 写端点: body 不是对象必须 400（C2-012）', async () => {
+    const dir = mkTmp('xbk-console-c2012-')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    const json = { 'content-type': 'application/json' }
+    try {
+      for (const [endpoint, body] of [['/api/2fa/disable', '[]'], ['/api/2fa/enable', '"x"'], ['/api/2fa/disable', 'null']]) {
+        const res = await request(port, 'POST', endpoint, { token: TOKEN, headers: json, body })
+        assert.strictEqual(res.status, 400,
+          `${endpoint} body=${body} 必须是 400（旧实现按空 payload 继续走，把畸形请求报成成功：${res.text}）`)
+        assert.strictEqual(JSON.parse(res.text).error, 'body 必须是对象', `${endpoint} body=${body} 错误码`)
+      }
+      // 对象形态照旧走原语义（2FA 未开启时关闭 = 200 {enabled:false}）：校验只拒绝畸形 body。
+      const normal = await request(port, 'POST', '/api/2fa/disable', { token: TOKEN, headers: json, body: '{}' })
+      assert.strictEqual(normal.status, 200, normal.text)
+      assert.deepStrictEqual(JSON.parse(normal.text), { enabled: false })
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('重放窗记录损坏: 启动时点名文件与原因告警（C2-013）', () => {
+    const dir = mkTmp('xbk-console-c2013-')
+    fs.writeFileSync(path.join(dir, 'console-lastaccept.json'), '{"check":{"at":17') // 半截 JSON：崩溃/ENOSPC 的典型残留
+    let inst
+    const stderr = capturedStderr(() => { inst = createConsole({ token: TOKEN, stateDir: dir }) })
+    try {
+      assert.ok(stderr.includes('console-lastaccept.json'), `告警必须点名文件（实际 stderr：${JSON.stringify(stderr)}）`)
+      assert.ok(stderr.includes('内容不是合法 JSON'), '告警必须点名原因（旧实现静默按空窗处理）')
+      assert.ok(stderr.includes('重复跑一轮真实推送'), '告警必须点名后果，否则运维不知道窗口已经失效')
+    } finally {
+      inst.server.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('状态文件落盘: auto/lastaccept 都经 writeAtomic，重放窗写不进则 fail-closed（C2-007）', async () => {
+    const dir = mkTmp('xbk-console-c2007-')
+    const json = { 'content-type': 'application/json' }
+    let failLastAccept = false
+    await withStorageWriteStub((entry, text, realWrite) => {
+      if (failLastAccept && entry.label === '重放窗记录') return false
+      return realWrite(entry.file, text, entry.label)
+    }, async (mod, calls) => {
+      const { server } = mod.createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      try {
+        // ① 只保存间隔（on 仍 false ⇒ stopAuto ⇒ persistAuto），不启动自动运行、不 spawn。
+        const saved = await request(port, 'POST', '/api/auto', { token: TOKEN, headers: json, body: JSON.stringify({ interval: 5 }) })
+        assert.strictEqual(saved.status, 200, saved.text)
+        const autoCall = calls.find((c) => c.label === '自动运行状态')
+        assert.ok(autoCall, `自动运行状态必须经 writeAtomic 落盘（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(autoCall.file, path.join(dir, 'console-auto.json'))
+        assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).interval, 5)
+
+        // ② 重放窗桩返回 false：/trigger 必须 500 fail-closed（旧实现裸 writeFileSync 会 202 并 spawn）。
+        failLastAccept = true
+        const blocked = await request(port, 'POST', '/trigger', { token: TOKEN, body: 'action=check' })
+        assert.strictEqual(blocked.status, 500, `重放窗落盘失败必须 fail-closed（实际 ${blocked.status}：${blocked.text}）`)
+        assert.match(String(JSON.parse(blocked.text).error), /fail-closed/)
+        const lastAcceptCall = calls.find((c) => c.label === '重放窗记录')
+        assert.ok(lastAcceptCall, `重放窗记录必须经 writeAtomic 落盘（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(lastAcceptCall.file, path.join(dir, 'console-lastaccept.json'))
+        // fail-closed 分支必须释放触发锁，否则后续 10 分钟都被 409 挡住。
+        const lockRaw = fs.existsSync(lockPath(dir)) ? JSON.parse(fs.readFileSync(lockPath(dir), 'utf8')) : null
+        assert.ok(!lockRaw || lockRaw.released === true, 'fail-closed 分支必须释放触发锁')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  await aok('数据备份: 导入失败的回滚经 writeAtomic 原子提交（C2-008）', async () => {
+    const dir = mkTmp('xbk-console-c2008-')
+    const pushPath = path.join(dir, 'push.json')
+    const oldPush = JSON.stringify([{ id: 1, title: 'old' }])
+    fs.writeFileSync(pushPath, oldPush)
+    fs.mkdirSync(path.join(dir, 'run.log')) // run.log 是目录 ⇒ 写到它必失败 ⇒ 触发整体回滚
+    const bundle = {
+      kind: 'xbk-console-backup',
+      schema: 1,
+      data: {
+        messages: { count: 1, text: JSON.stringify([{ id: 2, title: 'new' }]) },
+        runLog: { text: 'new log\n' }
+      }
+    }
+    let failRollback = false
+    await withStorageWriteStub((entry, text, realWrite) => {
+      if (failRollback && entry.label === '导入回滚 push.json') return false
+      return realWrite(entry.file, text, entry.label)
+    }, async (mod, calls) => {
+      const { server } = mod.createConsole({ token: TOKEN, stateDir: dir })
+      const port = await listen(server)
+      const doImport = () => request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(bundle)
+      })
+      try {
+        const failed = await doImport()
+        assert.strictEqual(failed.status, 500, failed.text)
+        assert.strictEqual(JSON.parse(failed.text).rolledBack, true, '回滚必须成功')
+        const rollbackCall = calls.find((c) => c.label === '导入回滚 push.json')
+        assert.ok(rollbackCall, `回滚必须经 writeAtomic 原子提交（实际命中：${JSON.stringify(calls.map((c) => c.label))}）`)
+        assert.strictEqual(rollbackCall.file, pushPath)
+        assert.strictEqual(rollbackCall.result, true)
+        assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), oldPush, '回滚内容必须逐字还原')
+
+        // 回滚写入本身失败：必须如实上报 rolledBack:false，不得把「回滚没做成」报成成功。
+        failRollback = true
+        const failed2 = await doImport()
+        assert.strictEqual(failed2.status, 500, failed2.text)
+        assert.strictEqual(JSON.parse(failed2.text).rolledBack, false, '回滚写失败必须如实上报 rolledBack:false')
+      } finally {
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+}
+
 async function main () {
   // ── C5-020：源码锁的纪律（缺锚点响亮失败 / 注释不得满足判据）──
   ok('C5-020 源码切片缺锚点或空切片必须响亮失败（旧写法 slice(-1) 静默假绿）', () => {
@@ -3420,6 +3637,7 @@ async function main () {
   await filterRuleApiTests()
   await backupApiTests()
   await backupUiStructureTests()
+  await reworkRegressionTests()
   await aok('HTTP: 无 token / 错 token → 401', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
