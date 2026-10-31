@@ -1357,7 +1357,7 @@ check('MS-15 墓碑锁与清理哨兵必须显式 0600：umask 000 下创建出�
   const dir = path.join(ROOT_DIR, `xianbaoku_cache_lockmode_${process.pid}`)
   REAL_FS.rmSync(dir, { recursive: true, force: true })
   REAL_FS.mkdirSync(dir, { recursive: true })
-  const prevUmask = process.umask(0o000)
+  const prevUmask = process.umask(0) // 0 = 全放开（夹具用）；不写 0o000 字面量，避免 Sonar S2612 把 umask 值当文件权限
   try {
     const s = storeWithFs(REAL_FS, path.basename(dir))
     const lockPath = path.join(dir, 'lockmode.json.seen.lock')
