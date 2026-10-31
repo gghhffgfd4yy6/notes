@@ -5382,6 +5382,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         candidates.reverse() // 旧→新：中途推送失败时锚点停在已推的最后一条，下轮接着推
         let count = 0
         let stopped = false
+        // C2-009：一个词只能产出一条结果。旧实现失败时先 push 带 error 的条目再 break，
+        // 循环外又无条件 push 一条「成功形态」的条目 ⇒ 同一个词在 results 里出现两次
+        // （前端一个标红一个标绿，状态自相矛盾）。改为记下失败原因、循环外统一 push 一次。
+        let failure = ''
         for (const item of candidates) {
           // 每条发送前重读状态：用户中途停用/删词/标已读或已推过，都不能再发。
           const live = readWatchState(stateDir)
@@ -5407,7 +5411,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             }
             await notifyWatch(title, body)
           } catch (e) {
-            results.push({ q: word.q, pushed: count, error: 'push_failed' })
+            failure = 'push_failed'
             break
           }
           count += 1
@@ -5415,11 +5419,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 推一条记一条：重新读盘再改，避免覆盖期间 UI 的增删/配置。
           const fresh = readWatchState(stateDir)
           if (fresh.status !== 'ok') {
-            results.push({ q: word.q, pushed: count, error: 'state_read_failed' })
+            failure = 'state_read_failed'
             break
           }
           const w = fresh.words.find((x) => x.q === word.q)
-          if (!w) { results.push({ q: word.q, pushed: count, error: 'removed' }); break }
+          if (!w) { failure = 'removed'; break }
           w.sentIds = (Array.isArray(w.sentIds) ? w.sentIds : []).concat([item.id]).slice(-LINE_WATCH_SENT_MAX)
           // 锚点按「在列表里的先后」前进，而不是只按时间：上游时间只有分钟精度，
           // 同一分钟的多条线报 ts 相等，只用 > 会让锚点停在原地、下一轮重复判新。
@@ -5433,11 +5437,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             if (/^[A-Za-z0-9._:/-]{1,80}$/.test(item.id)) w.lastReadId = item.id
           }
           if (!saveWatchState(stateDir, fresh)) {
-            results.push({ q: word.q, pushed: count, error: 'save_failed' })
+            failure = 'save_failed'
             break
           }
         }
-        results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
+        if (failure) {
+          results.push({ q: word.q, pushed: count, error: failure })
+        } else {
+          results.push({ q: word.q, pushed: count, ...(stopped ? { stopped: true } : {}), ...(truncated ? { truncated: true } : {}) })
+        }
       }
       return { status: 'ok', pushed, results }
     } finally {
