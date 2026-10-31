@@ -10938,13 +10938,13 @@ async function main () {
     // 一键直发且不可撤销：停止按钮只能先置「待确认」，不得直接调 doCancel/apiCancelRun。
     const btnAt = seg.indexOf('>停止<')
     assert.ok(btnAt > -1, '应能定位停止按钮')
-    const btn = seg.slice(seg.lastIndexOf('<${Button}', btnAt), btnAt)
+    const btn = seg.slice(seg.lastIndexOf('<' + '$' + '{Button}', btnAt), btnAt)
     assert.ok(btn.includes('setCancelAsk(r.id)') && !btn.includes('doCancel('),
       '停止按钮必须先置待确认态，不得一键直发 doCancel/apiCancelRun')
     // 确认弹窗：与 C7-001 同口径受当前页门控，且只有确认才真的发。
     assert.ok(seg.includes(attrOpen('cancelAsk !== null && active')),
       '停止确认弹窗的 open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）')
-    const dlgAt = seg.indexOf('<${ConfirmDialog}')
+    const dlgAt = seg.indexOf('<' + '$' + '{ConfirmDialog}')
     assert.ok(dlgAt > -1, '应能定位停止确认弹窗')
     const dlg = seg.slice(dlgAt, seg.indexOf('<//>', dlgAt))
     assert.ok(dlg.includes('doCancel(id)'), '确认后才调 doCancel')
