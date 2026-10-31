@@ -11016,6 +11016,26 @@ async function main () {
       '0 基线不得再被 Date.now() 兜底（那正是「角标 N 条新 / 检查 0 条新」的来源）')
   })
 
+  await aok('结构红线: C7-018 逐轮历史切档落点等目标数据（不拿旧档列表抢落点）', () => {
+    const src = readConsoleSource()
+    const at = src.indexOf('function RunHistoryPanel')
+    const end = src.indexOf('// ── 组件：整体', at)
+    assert.ok(at > -1 && end > at, '应能定位 RunHistoryPanel')
+    const seg = src.slice(at, end)
+    const effectAt = seg.indexOf('useLayoutEffect(() => {')
+    const effect = seg.slice(effectAt, seg.indexOf('}, [data', effectAt))
+    assert.ok(effectAt > -1 && effect.length > 0, '应能定位落点 effect')
+    // 改页码是同步的；「切档」在没命中快照时要先 fetchSnap。没有这两道门时，轮询/切档
+    // 响应谁先到谁消费旗子：旧档列表先落一次点，真正换好的数据回来时旗子已经没了。
+    assert.ok(effect.includes('if (loading) return'), '加载在飞时必须保留旗子（数据还没落地）')
+    assert.ok(effect.includes('if (pendingMode !== null) return'),
+      '切档目标数据未落地时必须保留旗子（否则拿旧档列表抢落点）')
+    assert.ok(effect.indexOf('if (pendingMode !== null) return') < effect.indexOf('landRef.current = false'),
+      '守卫必须在消费之前：提前清旗会丢掉真正落地时的那次落点')
+    assert.ok(effect.indexOf('landRef.current = false') < effect.indexOf('if (y === null) return'),
+      '消费即清旗：返回 null 不重试')
+  })
+
   await aok('C7-002 线报搜索：换词/翻页期间结果区不整块卸载（stale-while-revalidate + min-height）', async () => {
     const src = readConsoleSource()
     const pure = await import('./scripts/console-assets/pure.mjs')

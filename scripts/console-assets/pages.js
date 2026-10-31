@@ -599,13 +599,18 @@ function RunHistoryPanel ({ onOpenLog, active = true }) {
   // 消费即清旗：返回 null 也不再重试（否则旗子会挂到下一次操作上）。
   useLayoutEffect(() => {
     if (!landRef.current) return
+    // C7-018：逐轮历史没有服务端分页，改页码是同步的；但「切档」在没命中快照时是异步的
+    // （changeMode → fetchSnap）。这两道门挡的正是那段空窗：拿旧档列表的位置先落一次点，
+    // 真正换好的数据回来时旗子已经没了 —— 用户看到的是「跳了，但跳错位置」。
+    if (loading) return // 新一轮加载在飞：数据还没落地，保留旗子
+    if (pendingMode !== null) return // 目标档还没画出来：同上（快照落地时 mode/data 同批变化，effect 会再跑）
     landRef.current = false
     // 请求飞行期间用户自己滚动时撤销落点，别把人拽回列表顶（夹取/锚定不算）。
     if (userMovedRef.current) return
     const y = listLandTarget(listRef.current)
     if (y === null) return
     window.scrollTo(0, y)
-  }, [data, loading, err, pageNo, size, mode, runRange.from, runRange.to])
+  }, [data, loading, err, pendingMode, pageNo, size, mode, runRange.from, runRange.to])
   const jumpLog = (r) => {
     if (!onOpenLog || typeof r.at !== 'string' || r.at.length < 10) return
     const key = `${r.at}-${r.lineNo}`
