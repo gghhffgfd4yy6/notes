@@ -3641,6 +3641,33 @@ check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁�
   assert.strictEqual(cap.length, 1, '持锁时超 1MiB 必须走原子写回（截尾）')
 })
 
+// ===== C1-013：三处 O_EXCL 锁收敛为同一实现 =====
+// 审计条目：run.log / RE2 标记 / 通道健康各写一遍同样的独占创建+超龄回收，常数各写一份且已漂移
+// （通道健康把 10000 写死）。这里锁住「只剩一份实现」：回退后 openSync('wx') 会回到 4 处、
+// LOCK_STALE_MS 会回到 2 份定义，计数立刻变红。语义差异（重试 vs 单次）由调用方选择保留。
+check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份', () => {
+  const fs = require('fs')
+  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  assert.strictEqual((code.match(/fs\.openSync\(lockPath, 'wx'\)/g) || []).length, 2,
+    '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开）')
+  assert.strictEqual((code.match(/LOCK_STALE_MS/g) || []).length, 2,
+    'LOCK_STALE_MS 必须只有「定义 + 使用」各一处（原先三份实现各写一份）')
+  assert.strictEqual(/mtimeMs > 10000/.test(code), false, '不得再出现写死的 10000（通道健康那份的漂移形态）')
+  assert.strictEqual((code.match(/_isTombstoneLockProcessAlive\(lockPath\)/g) || []).length, 1,
+    '持有进程存活复核必须只有一处')
+  assert.ok(/const acquireLockWithRetry = \(lockPath\) =>/.test(code), '重试口径必须来自同一个获取函数')
+})
+
+checkAsync('C1-013 收敛后语义不变：通道健康锁仍单次尝试（EACCES 立即 -1 且带 errno 原因）', async () => {
+  const mfs = makeMemFs()
+  mfs.openSync = () => { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e }
+  const app = makeHealthApp({ fs: mfs })
+  assert.strictEqual(app._tryAcquireChannelHealthLock(healthPath + '.lock'), -1)
+  assert.strictEqual(app._lastChannelHealthLockFailure.reason, 'open', '非 EEXIST 必须归类 open（C1-008 的分流依据）')
+  assert.strictEqual(app._lastChannelHealthLockFailure.code, 'EACCES')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

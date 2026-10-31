@@ -20,6 +20,54 @@ function createApp ({
     return Math.max(1, Math.min(base, MAX_PARALLEL_WORKERS))
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // C1-013：O_EXCL 文件锁的**唯一**实现与唯一常数来源。run.log / RE2 标记 / 通道健康此前各写
+  // 一遍「独占创建 + pid:start 令牌 + mtime 超龄 + 持有进程存活复核 + 抢占重开」，常数也各写一份
+  // （通道健康把 10000 写死成字面量，run.log 与 RE2 各有一份 LOCK_STALE_MS，deadline/退避也是
+  // 各自写死的 3000/10）。三处的真实差异只有「拿不到锁时怎么办」：run.log 与 RE2 标记的临界区都
+  // 只有几毫秒，短退避重试到 deadline；通道健康是观测性写入，只试一次（不为拿锁阻塞事件循环）
+  // ⇒ 由调用方选择 tryLockOnce / acquireLockWithRetry 表达，而不是第三份实现。
+  const LOCK_STALE_MS = 10000
+  const LOCK_ACQUIRE_DEADLINE_MS = 3000
+  const LOCK_RETRY_INTERVAL_MS = 10
+  const lockTokenOf = () => `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
+
+  /** 单次 O_EXCL 尝试（含陈旧锁回收）。成功返回 { fd }，失败返回 { reason, error }：
+   *  reason='open' 非 EEXIST 的 open 失败；'busy' 锁被活跃或未超龄的持有者占着；
+   *  'unlink' 陈旧锁回收失败；'reopen' 回收后二次 open 失败。 */
+  const tryLockOnce = (lockPath) => {
+    try {
+      const fd = fs.openSync(lockPath, 'wx')
+      try { fs.writeSync(fd, lockTokenOf()) } catch (e) { /* 锁内容仅供排查，失败不影响 */ }
+      return { fd }
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') return { reason: 'open', error: e }
+      let stale = false
+      // 锁文件刚被释放/删除（statSync 失败）：当作空位重试。
+      try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS } catch (e2) { stale = true }
+      // APP-02：mtime 超龄只说明「可能陈旧」，还须持有进程已确认退出才可回收。进程仍存活
+      // （如被暂停 >10s）时绝不抢占——否则双进程同时进入临界区，截尾读改写会冲掉并发追加的行。
+      if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return { reason: 'busy', error: e }
+      try { fs.unlinkSync(lockPath) } catch (e2) { return { reason: 'unlink', error: e2 } }
+      try {
+        const fd = fs.openSync(lockPath, 'wx')
+        try { fs.writeSync(fd, lockTokenOf()) } catch (e2) { /* 同上 */ }
+        return { fd }
+      } catch (e2) { return { reason: 'reopen', error: e2 } }
+    }
+  }
+
+  /** 带短退避重试的获取：deadline 内反复尝试，超过 deadline 或遇非 EEXIST 的 open 错误立刻返回
+   *  最后一次失败（调用方按 fail-open 处理：日志只追加不截尾 / 标记跳过本轮）。 */
+  const acquireLockWithRetry = (lockPath) => {
+    const deadline = Date.now() + LOCK_ACQUIRE_DEADLINE_MS
+    for (;;) {
+      const attempt = tryLockOnce(lockPath)
+      if (typeof attempt.fd === 'number') return attempt
+      if (attempt.reason === 'open') return attempt // 权限/只读：重试无意义，直接 fail-open
+      if (Date.now() >= deadline) return attempt
+      try { Atomics.wait(lockWaiter, 0, 0, LOCK_RETRY_INTERVAL_MS) } catch (e) { /* 非主线程/受限：直接重试 */ }
+    }
+  }
   // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
   // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
   // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
@@ -137,34 +185,10 @@ function createApp ({
         let lockFd = null
         try {
         // 跨进程互斥锁：O_EXCL 原子创建，带短退避重试与陈旧锁兜底；崩溃遗留的锁靠「mtime 超龄
-        // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）
-          const LOCK_STALE_MS = 10000
-          const lockDeadline = Date.now() + 3000
-          for (;;) {
-            try {
-              lockFd = fs.openSync(lockPath, 'wx')
-              try {
-                fs.writeSync(lockFd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
-              } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
-              break
-            } catch (e) {
-              if (e.code !== 'EEXIST') break // 权限等异常：拿不到锁也继续（fail-open，只追加）
-              let stale = false
-              try {
-                const ls = fs.statSync(lockPath)
-                stale = Date.now() - ls.mtimeMs > LOCK_STALE_MS
-              } catch (e2) { stale = true } // 锁文件刚被释放/删除：当作空位重试
-              // APP-02：mtime 超龄只说明「可能陈旧」，还须持有进程已确认退出才可回收（与 RE2 锁同口径）。
-              // 进程仍存活（如被暂停 >10s）时绝不抢占——否则双进程同时进入临界区，截尾读改写会冲掉
-              // 并发追加的行；此时按拿不到锁处理（fail-open，仅追加不截尾）。
-              if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
-                try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
-                continue
-              }
-              if (Date.now() >= lockDeadline) break // 超时：fail-open，仅追加不截尾
-              try { Atomics.wait(lockWaiter, 0, 0, 10) } catch (e2) { /* 非主线程/受限时退避失败，直接重试 */ }
-            }
-          }
+        // 且持有进程已退出」抢占（APP-02：写入 pid:starttime 令牌供存活复核与 PID 复用判别）。
+        // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry，三处锁共用同一份判据。
+          const lock = acquireLockWithRetry(lockPath)
+          if (typeof lock.fd === 'number') lockFd = lock.fd
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
           // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
@@ -549,30 +573,11 @@ function createApp ({
 
     // 单个日期标记的跨进程互斥锁（O_EXCL 独占创建 + 短退避 + 陈旧锁抢占）：
     // 把「读-判-写」标记串行化，使同一时刻只有一个进程能创建/回收当天的标记。
+    // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry（与 run.log / 通道健康同一份）。
     _acquireRe2WarnLock (statePath) {
       const lockPath = statePath + '.lock'
-      const LOCK_STALE_MS = 10000
-      const deadline = Date.now() + 3000
-      const lockToken = `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`
-      for (;;) {
-        try {
-          const fd = fs.openSync(lockPath, 'wx')
-          try { fs.writeSync(fd, lockToken) } catch (e) { /* 锁内容仅供排查 */ }
-          return { lockPath, fd }
-        } catch (e) {
-          if (e.code !== 'EEXIST') return null // 权限等异常：无法加锁，放弃本次
-          let stale = false
-          try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS } catch (e2) { stale = true }
-          if (stale && !MessageStore._isTombstoneLockProcessAlive(lockPath)) {
-          // 年龄超限且持有进程已确认退出（含损坏/无主锁）才回收；
-          // 进程仍存活（如被暂停>10s）绝不回收，避免双进程同时进入临界区（CodeRabbit 第十一轮）。
-            try { fs.unlinkSync(lockPath) } catch (e2) { /* 抢占失败则下一轮重试 */ }
-            continue
-          }
-          if (Date.now() >= deadline) return null // 超时：放弃本次（避免阻塞事件循环）
-          try { Atomics.wait(lockWaiter, 0, 0, 10) } catch (e2) { /* 受限环境退避失败直接重试 */ }
-        }
-      }
+      const lock = acquireLockWithRetry(lockPath)
+      return typeof lock.fd === 'number' ? { lockPath, fd: lock.fd } : null
     },
 
     _releaseRe2WarnLock (statePath, acquired) {
@@ -828,36 +833,17 @@ function createApp ({
      *  （C1-008：只有 EEXIST 且持有进程存活才是「另一轮在更新」；EACCES/ENOSPC/EROFS/EMFILE 等
      *  open 失败、unlink 失败、二次 open 失败都是真实故障，此前全折叠成 -1 被谎报成并发）。 */
     _tryAcquireChannelHealthLock (lockPath) {
-      const fail = (reason, err) => {
-        this._lastChannelHealthLockFailure = {
-          reason,
-          code: (err && err.code) || '',
-          message: (err && err.message) || ''
-        }
-        return -1
-      }
       this._lastChannelHealthLockFailure = null
-      const writeToken = (fd) => {
-        try {
-          fs.writeSync(fd, `${process.pid}:${MessageStore._getTombstoneProcessStart(process.pid) || ''}`)
-        } catch (e) { /* 锁文件内容仅供排查，失败不影响 */ }
+      // C1-013：单次尝试（观测性写入不为拿锁阻塞事件循环），与 run.log / RE2 标记共用同一份
+      // tryLockOnce；失败原因按 reason 分流，供调用点区分「另一轮在更新」与真实故障（C1-008）。
+      const attempt = tryLockOnce(lockPath)
+      if (typeof attempt.fd === 'number') return attempt.fd
+      this._lastChannelHealthLockFailure = {
+        reason: attempt.reason,
+        code: (attempt.error && attempt.error.code) || '',
+        message: (attempt.error && attempt.error.message) || ''
       }
-      try {
-        const fd = fs.openSync(lockPath, 'wx')
-        writeToken(fd)
-        return fd
-      } catch (e) {
-        if (!e || e.code !== 'EEXIST') return fail('open', e)
-        let stale = false
-        try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > 10000 } catch (e2) { stale = true }
-        if (!stale || MessageStore._isTombstoneLockProcessAlive(lockPath)) return fail('busy', e)
-        try { fs.unlinkSync(lockPath) } catch (e2) { return fail('unlink', e2) } // 竞争者已接管/无权限，按跳过处理
-        try {
-          const fd = fs.openSync(lockPath, 'wx')
-          writeToken(fd)
-          return fd
-        } catch (e2) { return fail('reopen', e2) }
-      }
+      return -1
     },
 
     _releaseChannelHealthLock (lockPath, lockFd) {
