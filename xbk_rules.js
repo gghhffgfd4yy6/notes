@@ -340,6 +340,23 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       return s.replace(/[\u200B-\u200D\uFEFF]+/g, '')
     },
 
+    /** 匹配入口的文本归一化（C9-007）：undefined/null/空串 → null（该字段不参与匹配，
+     *  与 matchesCompiled/_catMatches 的缺失守卫同口径），其余经 String() 兜底后剥零宽。
+     *  归一化是纯函数、同一输入结果恒定 ⇒ 调用方必须在**整次匹配**里只做一次。
+     *  此前它藏在 _safeTest 里，multi 规则的逐条谓词把同一段正文归一化了「规则数」遍，
+     *  成本 = O(规则数 × 文本长度) 的白扫（数百条规则 × 100k 正文可达数百 MB 级替换）。 */
+    _normalizeMatchText (input) {
+      if (input === undefined || input === null || input === '') return null
+      try { return this._normalizeReInput(typeof input === 'string' ? input : String(input)) } catch (e) { return null }
+    },
+
+    /** 执行异常的一次性告警（本进程只发一次，热路径逐次告警会淹没 run.log） */
+    _warnTestFail () {
+      if (testFailWarned) return
+      testFailWarned = true
+      console.warn('⚠️ 过滤规则正则执行异常，已按「不命中/不拦截」处理（本进程不再重复告警）')
+    },
+
     /** 规则正则 .test 的唯一出口（C9-008）
      *  .test 会在**运行时**抛（new RegExp 不抛）：V8 对超长正则延迟到首次 test 才编译并抛
      *  "Regular expression too large"；re2 包装对象、被污染/伪造的规则对象同理。
@@ -350,17 +367,28 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
      *  拦截规则（matchesCompiled / checkTimeCompiled / _catMatches）不命中 ⇒ 放行；
      *  白名单（whitelistFilter）传 onFail=true ⇒ 保留（宁可多推不可少推）。re 形状不对
      *  （null/没有 test）与异常同处理：都无法判定是否命中，口径必须一致。
-     *  告警每进程只发一次：这里是每条消息 × 每个字段 × 每条规则的热路径，逐次告警会淹没 run.log。 */
+     *  告警每进程只发一次：这里是每条消息 × 每个字段 × 每条规则的热路径，逐次告警会淹没 run.log。
+     *  本方法自行归一化输入（单次调用口径）；批量扫描请用归一化后的 _safeTestText（C9-007）。 */
     _safeTest (re, input, onFail = false) {
+      if (!re || typeof re.test !== 'function') return onFail
+      let text
+      try {
+        text = this._normalizeReInput(typeof input === 'string' ? input : String(input))
+      } catch (e) {
+        this._warnTestFail()
+        return onFail
+      }
+      return this._safeTestText(re, text, onFail)
+    },
+
+    /** 已归一化文本的 .test 出口（C9-007）：异常口径与 _safeTest 完全相同，只省掉归一化。
+     *  text 必须来自 _normalizeMatchText/_normalizeReInput（调用方负责只做一次）。 */
+    _safeTestText (re, text, onFail = false) {
       try {
         if (!re || typeof re.test !== 'function') return onFail
-        const text = this._normalizeReInput(typeof input === 'string' ? input : String(input))
         return !!re.test(text)
       } catch (e) {
-        if (!testFailWarned) {
-          testFailWarned = true
-          console.warn('⚠️ 过滤规则正则执行异常，已按「不命中/不拦截」处理（本进程不再重复告警）')
-        }
+        this._warnTestFail()
         return onFail
       }
     },
@@ -370,6 +398,14 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       if (!rule.cat) return true
       if (catename === undefined || catename === null || catename === '') return false
       return this._safeTest(rule.cat, catename)
+    },
+
+    /** 已归一化分类名的匹配（C9-007）：catText 由 _normalizeMatchText 得到，
+     *  null = 分类名缺失/不可用 ⇒ 不命中（与 _catMatches 的前置守卫同口径）。 */
+    _catMatchesText (rule, catText) {
+      if (!rule.cat) return true
+      if (catText === null) return false
+      return this._safeTestText(rule.cat, catText)
     },
 
     /** 多行规则任意匹配：分类匹配 + 断言成立即短路（与 _firstMatchingRule 共用同一遍扫描） */
@@ -383,8 +419,11 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
     /** 返回首个命中的多行规则（供可解释过滤复用；无命中返回 null） */
     _firstMatchingRule (rules, catename, predicate) {
       if (!Array.isArray(rules)) return null
+      // C9-007：分类名在整次扫描里只归一化一次（此前 _catMatches → _safeTest 对每条规则
+      // 都重跑一遍零宽替换，成本 = 规则数 × 分类名长度）；谓词侧的正文同样由调用方预归一化。
+      const catText = this._normalizeMatchText(catename)
       for (const rule of rules) {
-        if (this._catMatches(rule, catename) && predicate(rule)) return rule
+        if (this._catMatchesText(rule, catText) && predicate(rule)) return rule
       }
       return null
     },
@@ -394,16 +433,19 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       if (!compiled || fieldValue === undefined || fieldValue === null || fieldValue === '') return false
       let value
       try { value = typeof fieldValue === 'string' ? fieldValue : String(fieldValue) } catch (e) { return false } // 脏字段 toString/Symbol 失败时保守放行，不让整批 run 崩溃
+      // C9-007：正文整次匹配只归一化一次——multi 分支的逐条谓词此前对同一段文本重跑归一化
+      // （规则数 × 文本长度的纯浪费；归一化是纯函数，重复做结果不变）。
+      const text = this._normalizeReInput(value)
 
       if (compiled._type === 're') {
-      // 简单正则（形状守卫与 .test 异常处理都在 _safeTest 内：不命中即放行）
-        return this._safeTest(compiled.re, value)
+      // 简单正则（形状守卫与 .test 异常处理都在 _safeTestText 内：不命中即放行）
+        return this._safeTestText(compiled.re, text)
       }
 
       if (compiled._type === 'multi') {
-      // 多行多分类：任意一行匹配即匹配
+      // 多行多分类：任意一行匹配即匹配（分类名与正文都已在本次匹配里归一化过一次）
         if (!Array.isArray(compiled.rules) || compiled.rules.length === 0) return false
-        return this._anyRule(compiled.rules, catename, r => this._safeTest(r.val, value))
+        return this._anyRule(compiled.rules, catename, r => this._safeTestText(r.val, text))
       }
 
       return false

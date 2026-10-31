@@ -197,7 +197,10 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     const matchOnce = (compiled, value, catename) => {
       if (!compiled || value === undefined || value === null || value === '') return { hit: false, rule: null }
       if (compiled._type !== 'multi') return { hit: RuleEngine.matchesCompiled(compiled, value, catename), rule: null }
-      const rule = RuleEngine._firstMatchingRule(compiled.rules, catename, r => RuleEngine._safeTest(r.val, value))
+      // C9-007：正文整次扫描只归一化一次——逐条谓词里再归一化等于「规则数 × 文本长度」的白扫
+      // （归一化是纯函数，同一输入结果恒定）；分类名的归一化由 _firstMatchingRule 做一次。
+      const text = RuleEngine._normalizeMatchText(value)
+      const rule = RuleEngine._firstMatchingRule(compiled.rules, catename, r => RuleEngine._safeTestText(r.val, text))
       return { hit: rule !== null, rule }
     }
     const timeMatchedRule = (compiled, group) => {

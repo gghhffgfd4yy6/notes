@@ -573,6 +573,36 @@ check('_catMatches / _anyRule / _firstMatchingRule：分类守卫、异常兜底
   assert.strictEqual(eng._firstMatchingRule([{ cat: /zzz/, val: /a/ }], 'x', () => true), null)
 })
 
+check('C9-007：多行规则整次扫描只归一化一次（次数与规则数无关）', () => {
+  // 反例（改动前）：multi 分支的谓词是 r => _safeTest(r.val, value)，而 _safeTest 内含
+  // _normalizeReInput —— 每条规则都对同一段正文重跑一遍零宽替换；分类名同样经
+  // _catMatches → _safeTest 逐条重归一化 ⇒ 成本 = 规则数 × 文本长度（纯白扫）。
+  // 断言「归一化次数」而不是墙钟：次数是确定性契约，墙钟在不同负载下会抖。
+  const { eng } = r2xMake()
+  const counts = { n: 0 }
+  const original = eng._normalizeReInput.bind(eng)
+  eng._normalizeReInput = (s) => { counts.n++; return original(s) }
+  const mkRules = (n) => Array.from({ length: n }, (_, i) => ({ cat: null, val: new RegExp('zzz_nomatch_' + i) }))
+  const value = '京东线报 ' + '\u200B'.repeat(10) + ' 内容'
+  const catename = '微博\u200C线报'
+
+  counts.n = 0
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: mkRules(1) }, value, catename), false)
+  const one = counts.n
+  counts.n = 0
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: mkRules(200) }, value, catename), false)
+  const many = counts.n
+  assert.strictEqual(one, 2, `1 条规则时归一化次数应为 2（正文 + 分类名各一次），实际 ${one}`)
+  assert.strictEqual(many, 2, `200 条规则时归一化次数仍应为 2（不得随规则数增长），实际 ${many}`)
+
+  // 计数对了但语义错了同样是 bug：归一化后的文本必须真的进 .test（零宽已剥离才可能命中）
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: [{ cat: /^微博线报$/, val: /^京东线报\s+内容$/ }] }, value, catename), true,
+    '零宽剥离后分类名与正文都必须命中（归一化结果必须真的用于匹配）')
+  // 分类名缺失/空串仍必须按「不命中」处理（归一化不得把 null 变成字面 "null"）
+  assert.strictEqual(eng.matchesCompiled({ _type: 'multi', rules: [{ cat: /null/, val: /x/ }] }, 'x', null), false,
+    'catename=null 时必须不命中（不得落到 /null/ 字面量）')
+})
+
 check('checkTimeCompiled：不拦截(null) 与拦截(true/false) 两侧，阈值比较必须严格大于', () => {
   // 杀 checkTimeCompiled L387/L391/L398/L399：缺失/非法注册时间放行，time 与 timeMulti 均不得用 >=
   const { eng } = r2xMake()
