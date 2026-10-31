@@ -13,6 +13,16 @@ const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
 // 隔离件的上限就是缓存读端上限（64MiB/份），只增不减会把目录撑大；10 份足够人工取回最近几次现场。
 const CORRUPT_BACKUP_KEEP = 10
 
+// C3-007：缓存名 → 使用它的 pushUrl 的**落盘**记录（`<缓存目录>/push-sources.json`）。
+// 为什么必须落盘：告警判据是「同一缓存文件被两个不同 pushUrl 取用」，而生产里 pushUrl 是单值的
+// （`<domain>/plus/json/push.json`，末段恒为 push.json）、每轮只调一次 getFileName、Config.domain
+// 无运行期变更 ⇒「换源/换域名」只可能发生在**跨进程**（改配置后重启），进程内 Map 永远看不到第二个
+// url，告警一次都不会打。记录只在「首次登记」与「换源」时写一次，稳态零写盘。
+const PUSH_SOURCES_FILE = 'push-sources.json'
+const PUSH_SOURCES_MAX_BYTES = 64 * 1024
+const PUSH_SOURCES_MAX_ENTRIES = 500
+const PUSH_SOURCES_MAX_URL_LEN = 2048
+
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
 //   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
 // TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
@@ -227,6 +237,9 @@ function createMessageStore ({
     // C3-007：缓存名 → 首个使用它的 pushUrl，以及已告警的 (名字, url) 组合（撞名 = 共用判重主存）。
     _fileNameSources: new Map(),
     _fileNameCollisionWarned: new Set(),
+    // C3-007：落盘来源记录的内存态（每缓存目录一份：{dir, map, dirty}）。进程内 Map 只覆盖
+    // 同进程内的「两个 url」，跨进程换源必须靠它（见 PUSH_SOURCES_FILE 处注释）。
+    _fileNameSourcesDisk: null,
     // C3-013：已就「判重主存重建为空但墓碑仍在」告警过的文件（每进程每文件一次，防刷屏）。
     _residualTombstoneWarned: new Set(),
     // 内存缓存 key 上限（防御：pushUrl 变化等场景下防止无限增长泄漏；磁盘缓存为权威可重建）
@@ -1999,8 +2012,10 @@ function createMessageStore ({
 
     // C3-007：缓存文件名只由 pushUrl 末段派生（不含来源/域名指纹）⇒ 两个不同 pushUrl 撞到同一
     // 末段时会静默共用一份判重主存（互相覆盖推送记录：方向=漏推）。改名会迁移既有部署的判重记录
-    // （等同一次全量重推），故这里**只把撞名显形**：同一进程内同一个缓存名被第二个不同 url 取用时
-    // 告警一次（每对 name+url 一次），并点明两端 URL，便于判断「是不是同源/该不该迁移」。
+    // （等同一次全量重推），故这里**只把撞名显形**：同一个缓存名被第二个不同 url 取用时告警一次
+    // （每进程每缓存名一次），并点明两端 URL，便于判断「是不是同源/该不该迁移」。
+    // 判据同时覆盖**跨进程**：生产每轮只取一次 getFileName、pushUrl 单值，换源/换域名只能跨进程发生，
+    // 故首个 url 落盘（<缓存目录>/push-sources.json），下一次运行读到不同的 url 才可能告警。
     getFileName (url) {
       const name = this._fileNameFor(url)
       this._noteFileNameCollision(name, url)
@@ -2012,14 +2027,68 @@ function createMessageStore ({
       try {
         if (typeof name !== 'string' || typeof url !== 'string' || url === '') return
         const prev = this._fileNameSources.get(name)
-        if (prev === undefined) { this._fileNameSources.set(name, url); return }
-        if (prev === url) return
-        const key = name + '\u0000' + url
-        if (this._fileNameCollisionWarned.has(key)) return
-        this._fileNameCollisionWarned.add(key)
-        console.warn(`⚠️ 两个不同的 pushUrl 映射到同一缓存文件 ${name}：${prev} / ${url}——` +
-          '判重记录被共用（可能漏推或互相覆盖）；若确实是切换数据源，请先迁移/清空该缓存文件再运行')
+        if (prev === undefined) this._fileNameSources.set(name, url)
+        else if (prev !== url) this._warnFileNameCollision(name, prev, url)
+        // 跨进程：读落盘记录（每缓存目录只读一次），首次登记/换源后写回（稳态零写盘）。
+        const record = this._fileNameSourcesDiskRecord()
+        if (!record) return
+        const diskPrev = record.map.get(name)
+        if (diskPrev === undefined) {
+          record.map.set(name, url)
+          record.dirty = true
+        } else if (diskPrev !== url) {
+          this._warnFileNameCollision(name, diskPrev, url)
+          // 记成「最近一次使用的 url」：换源只告警一次，反复启动不会每轮刷同一条。
+          record.map.set(name, url)
+          record.dirty = true
+        }
+        if (record.dirty) this._flushFileNameSources(record)
       } catch (e) { /* 纯诊断：任何异常都不得影响取文件名（判重主路径） */ }
+    },
+
+    _warnFileNameCollision (name, prev, url) {
+      // 每个缓存名每进程只告警一次：同一对 url 反复出现（换源后又换回）只值一条，反复刷会淹没真信号。
+      if (this._fileNameCollisionWarned.has(name)) return
+      this._fileNameCollisionWarned.add(name)
+      console.warn(`⚠️ 两个不同的 pushUrl 映射到同一缓存文件 ${name}：${prev} / ${url}——` +
+        '判重记录被共用（可能漏推或互相覆盖）；若确实是切换数据源，请先迁移/清空该缓存文件再运行')
+    },
+
+    /**
+     * C3-007：读落盘来源记录（`<缓存目录>/push-sources.json`，每缓存目录读一次后进程内缓存）。
+     * 读不到/坏文件/超限一律按空记录处理——纯诊断数据，绝不因为一条记录影响判重主路径。
+     * @returns {{dir:string, map:Map<string,string>, dirty:boolean}|null}
+     */
+    _fileNameSourcesDiskRecord () {
+      let dir
+      try { dir = this.cacheDir } catch (e) { return null } // cacheDir 求值失败（兜底目录也全不可用）→ 不做跨进程比对
+      const cached = this._fileNameSourcesDisk
+      if (cached && cached.dir === dir) return cached
+      const record = { dir, map: new Map(), dirty: false }
+      this._fileNameSourcesDisk = record // 先登记：坏文件也只读一次，不随每轮 getFileName 重读
+      try {
+        const read = readSafeTextResult(path.join(dir, PUSH_SOURCES_FILE), PUSH_SOURCES_MAX_BYTES)
+        if (read.status !== 'ok') return record
+        const data = JSON.parse(read.text)
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return record
+        const names = Object.keys(data)
+        for (let i = 0; i < names.length && record.map.size < PUSH_SOURCES_MAX_ENTRIES; i++) {
+          const value = data[names[i]]
+          if (typeof value !== 'string' || !value || value.length > PUSH_SOURCES_MAX_URL_LEN) continue
+          record.map.set(names[i], value)
+        }
+      } catch (e) { /* 坏 JSON/读盘异常：按空记录处理（只失去跨进程比对，不影响本轮判重） */ }
+      return record
+    },
+
+    /** C3-007：写回落盘来源记录（原子写；失败下一轮再试，绝不抛穿 getFileName）。 */
+    _flushFileNameSources (record) {
+      try {
+        const payload = {}
+        for (const [name, url] of record.map) payload[name] = url
+        const ok = writeAtomic(path.join(record.dir, PUSH_SOURCES_FILE), JSON.stringify(payload), '推送来源记录')
+        record.dirty = ok !== true
+      } catch (e) { record.dirty = true }
     },
 
     /** getFileName 的纯计算部分（C3-007 抽出：碰撞检测要看**最终**文件名，故必须单点返回）。 */

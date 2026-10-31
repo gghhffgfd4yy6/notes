@@ -932,6 +932,53 @@ check('C3-007 两个不同 pushUrl 撞到同一缓存名必须 WARN（每对一�
   assert.strictEqual(warns2.filter(w => w.includes('同一缓存文件')).length, 0, `同源重复取用不得告警：${JSON.stringify(warns2)}`)
 })
 
+// ===== C3-007（返工）：换源/换域名是**跨进程**事件，告警必须靠落盘来源记录 =====
+// 生产里 pushUrl 单值（`<domain>/plus/json/push.json`，末段恒为 push.json）、每轮只调一次
+// getFileName、Config.domain 无运行期变更 ⇒ 同一进程内永远看不到第二个 url；上面那条用例手工喂
+// 两个 url 的调用序列在生产不可达。这里用两个 store 实例共享同一份「缓存目录」（模拟重启/换进程）：
+// A 只见过 u1，B 只见过 u2 —— 只有落盘记录能让 B 看出「同一个缓存文件被另一个 url 用过」。
+check('C3-007 换源（跨进程）也必须告警：来源落盘、下一次运行比对后 WARN 一次且不重复刷', () => {
+  const u1 = 'https://old.example.com/plus/json/push.json'
+  const u2 = 'https://new.example.com/plus/json/push.json'
+  const shared = makeMemFs({ [cachePath('c3007_cross.json')]: '[]' })
+  const sourcePath = path.join(CACHE_DIR, 'push-sources.json')
+  const warnsOf = (lines) => lines.filter(w => w.includes('同一缓存文件'))
+
+  // 第一次运行：只有 u1（生产同一个进程内也只有这一个 url）
+  const a = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsA = captureConsole('warn', () => {
+    assert.strictEqual(a.store.getFileName(u1), 'push.json')
+  })
+  assert.strictEqual(warnsOf(warnsA).length, 0, `首次使用不得告警：${JSON.stringify(warnsA)}`)
+  assert.ok(shared.files.has(sourcePath), '首次使用必须把「缓存名 → pushUrl」落盘（跨进程比对的前提）')
+  assert.deepStrictEqual(JSON.parse(shared.files.get(sourcePath)), { 'push.json': u1 })
+
+  // 第二次运行（新进程/重启，进程内 Map 为空）：换成了 u2 —— 必须点名两端 URL
+  const b = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsB = captureConsole('warn', () => {
+    assert.strictEqual(b.store.getFileName(u2), 'push.json')
+    assert.strictEqual(b.store.getFileName(u2), 'push.json', '同一次运行内重复取用不得再告警')
+  })
+  const hitsB = warnsOf(warnsB)
+  assert.strictEqual(hitsB.length, 1, `跨进程换源必须告警一次：${JSON.stringify(warnsB)}`)
+  assert.ok(hitsB[0].includes(u1) && hitsB[0].includes(u2), `告警必须点名两端 URL：${hitsB[0]}`)
+  assert.deepStrictEqual(JSON.parse(shared.files.get(sourcePath)), { 'push.json': u2 }, '落盘记录必须更新为最近一次使用的 url')
+
+  // 第三次运行（仍是 u2）：换源只告警一次，反复重启不得每轮刷同一条
+  const c = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsC = captureConsole('warn', () => { c.store.getFileName(u2) })
+  assert.strictEqual(warnsOf(warnsC).length, 0, `记录已更新后不得重复告警：${JSON.stringify(warnsC)}`)
+
+  // 对照：来源记录损坏/超限一律按空记录处理，不得影响取文件名，也不得抛穿
+  shared.files.set(sourcePath, '{not json')
+  const d = makeBatchStore({ fsMock: shared, name: 'c3007_cross.json' })
+  const warnsD = captureConsole('warn', () => {
+    assert.strictEqual(d.store.getFileName(u2), 'push.json', '坏来源记录不得影响文件名计算')
+  })
+  assert.strictEqual(warnsOf(warnsD).length, 0, `坏记录不得伪造撞名：${JSON.stringify(warnsD)}`)
+  assert.deepStrictEqual(JSON.parse(shared.files.get(sourcePath)), { 'push.json': u2 }, '坏记录必须被重写成合法记录')
+})
+
 // ===== C3-009：超限裁剪的序列化次数 =====
 // 旧实现把整份数组序列化三次：saveMessages 的初稿、_trimCacheByBytes 的「真实数组口径校准」、
 // 以及 splicing 之后的终稿——超限轮次的峰值内存因此是 3×（初稿在裁剪期间一直活着）。
