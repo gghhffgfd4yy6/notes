@@ -4810,6 +4810,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           revision: committed.revision,
           changedFields: committed.changedFields,
           hash: committed.hash,
+          // v3.391：回吐「实际落盘」的规则正文与去重条数——前端据此把重复行从编辑框里收掉，
+          // 不必等下次读取才发现「少了几行」。
+          filter: result.value,
+          deduped: result.deduped || {},
           appliedHint: '下一轮生效'
         })
       } finally {

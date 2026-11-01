@@ -138,6 +138,27 @@ test('FILTER_RULE_FIELDS 与 xbk_utils.FILTER_FIELDS 同源（10 字段 + pingbi
 })
 
 // ===== 闸门 1：schema / revision / 白名单 / 类型 / 长度 / 控制字符 =====
+test('v3.391 保存时按行自动去重（大小写/首尾空格差异算同一条，保留首次原样）', () => {
+  const filter = {
+    pingbibiaoti: '牙膏\n车厘子\n牙膏\n\n 牙膏 \nZDM\nzdm',
+    pingbineirong: 'a###分类A\na###分类A\nb###分类B'
+  }
+  const result = validateFilterRules({ schema: 1, revision: 0, filter }, deps)
+  assert.strictEqual(result.ok, true, JSON.stringify(result.errors))
+  assert.strictEqual(result.value.pingbibiaoti, '牙膏\n车厘子\nZDM', '重复行只留首次出现的原样文本，空行丢弃')
+  assert.strictEqual(result.value.pingbineirong, 'a###分类A\nb###分类B', '### 多行规则同样按行去重')
+  assert.deepStrictEqual(result.deduped, { pingbibiaoti: 3, pingbineirong: 1 }, '按字段回报去掉的条数')
+})
+
+test('v3.391 无重复时 deduped 为空对象，value 与入参逐字一致', () => {
+  const filter = { pingbibiaoti: '牙膏\n牙刷', pingbitime: '8' }
+  const result = validateFilterRules({ schema: 1, revision: 0, filter }, deps)
+  assert.strictEqual(result.ok, true, JSON.stringify(result.errors))
+  assert.deepStrictEqual(result.deduped, {})
+  assert.strictEqual(result.value.pingbibiaoti, '牙膏\n牙刷')
+  assert.strictEqual(result.value.pingbitime, '8')
+})
+
 test('合法规则通过校验并原样返回已提交字段（不做 trim 改写）', () => {
   const filter = {
     pingbibiaoti: ' 屏蔽词 ',
