@@ -248,7 +248,10 @@ jobs:
           # C10-046：shellcheck 与 zizmor 都**钉版本**——扫描口径必须由本仓决定，不能随 runner 镜像
           # 漂移。SHELLCHECK_VERSION = 本机基线（`shellcheck --version`）；升级时本机 apt/pipx 与
           # 此处两处同步，并对 .githooks 重跑 npm run check:ci-static 复核发现集合。
-          SHELLCHECK_VERSION: '0.9.0'
+          # 2026-11-01：GitHub runner 镜像把自带 shellcheck 从 0.9.0 升到 0.11.0，本步骤按设计判红
+          # （漂移不许静默放行）。已在本机 0.11.0 上重跑 npm run check:ci-static：.githooks 3 个文件
+          # 0 发现、zizmor 0 发现 ⇒ 基线随之上调到 0.11.0。
+          SHELLCHECK_VERSION: '0.11.0'
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
           found="$(shellcheck --version | sed -n 's/^version: //p')"
