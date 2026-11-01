@@ -4191,6 +4191,27 @@ function wideFieldsOf (filter) {
   return FILTER_FIELD_NAMES.filter((name) => isWideMatchValue(src[name]))
 }
 
+// v3.393：保存确认弹窗只报「增/删」——口径与服务端 diff 完全一致（按行、trim + 小写、忽略空行），
+// 否则同一份改动在弹窗里和保存后的摘要里会给出两套结论。
+const RULE_LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
+const diffRuleLinesUi = (prevValue, nextValue) => {
+  const index = (value) => {
+    const map = new Map()
+    for (const line of String(value === undefined || value === null ? '' : value).split(RULE_LINE_SPLIT_RE)) {
+      const key = line.trim().toLowerCase()
+      if (key !== '' && !map.has(key)) map.set(key, line.trim())
+    }
+    return map
+  }
+  const before = index(prevValue)
+  const after = index(nextValue)
+  const added = []
+  const removed = []
+  for (const [key, text] of after) if (!before.has(key)) added.push(text)
+  for (const [key, text] of before) if (!after.has(key)) removed.push(text)
+  return { added, removed }
+}
+
 // GET 返回的 filter 只含 11 个服务端字段；缺字段按空串（不把 undefined 塞进 textarea）。
 function filterDraftFrom (data) {
   const src = data && data.filter && typeof data.filter === 'object' ? data.filter : {}
@@ -5050,9 +5071,22 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           含 .* 全命中规则：${wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
         </div>`}
         <div class="fr-restore">
-          <div class="fr-restore-head">改动字段（${changed.length}）</div>
-          <ul class="fr-samples">
-            ${changed.map((f) => html`<li key=${f.name}><span class="fr-sample-title">${f.label}</span><span class="fr-sample-id">${f.value === '' ? '（留空）' : f.value}</span></li>`)}
+          <div class="fr-restore-head">改动字段（${changed.length}）· 只列新增与删除</div>
+          <ul class="fr-samples fr-diff-list">
+            ${changed.map((f) => {
+              const delta = diffRuleLinesUi(base ? base[f.name] : '', f.value)
+              return html`<li key=${f.name}>
+                <div class="fr-diff-row">
+                  <span class="fr-sample-title">${f.label}</span>
+                  <span class="fr-diff-count">${delta.added.length > 0 ? `＋${delta.added.length}` : ''}${delta.added.length > 0 && delta.removed.length > 0 ? ' / ' : ''}${delta.removed.length > 0 ? `－${delta.removed.length}` : ''}</span>
+                </div>
+                ${(delta.added.length > 0 || delta.removed.length > 0) && html`<div class="fr-diff-lines">
+                  ${delta.added.map((text) => html`<span class="fr-diff-add" key=${'a:' + text}>＋${text}</span>`)}
+                  ${delta.removed.map((text) => html`<span class="fr-diff-del" key=${'d:' + text}>－${text}</span>`)}
+                </div>`}
+                ${delta.added.length === 0 && delta.removed.length === 0 && html`<div class="fr-diff-none">没有增删，只是顺序或空白不同</div>`}
+              </li>`
+            })}
           </ul>
           <div class="fr-field-hint">表单仍在背后，逐条对一遍再保存；取消或关闭不写盘，草稿仍保留。</div>
         </div>
