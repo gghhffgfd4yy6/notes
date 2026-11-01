@@ -430,6 +430,28 @@ function tmpDir () { return mkTmp('xbk-console-test-') }
 // 只跳过依赖 FIFO 的那一小段，同一用例里其它断言照跑（不整条用例静默消失）。
 const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
 let skipped = 0
+
+// ── Stryker 插桩沙箱的源码形状断言闸（run 41257085862 实测）───────────────────
+// console-part* / status 段变异时，Stryker 会把 scripts/console.js 插桩（每个表达式包成
+// stryMutAct_/stryCov_），任何「数命中次数 / 按锚点切片」的结构断言都会失真：
+//   · C2-010 commitFilterOverride 只一处定义 → 命中 0
+//   · finishRun 收尾锚点、run-auto 单飞锁锚点、v3.332 boot 版本注入、main() 切片 → 全部 actual=false
+// 这与功能无关（同一次 dry run 里行为用例全绿），跳过后单独计入 skipped，不冒充通过。
+const INSTRUMENTED_SOURCES = (() => {
+  const hit = new Set()
+  for (const rel of ['scripts/console.js', 'scripts/status.js']) {
+    try {
+      if (fs.readFileSync(require('node:path').join(__dirname, rel), 'utf8').includes('stryMutAct_')) hit.add(rel)
+    } catch (e) { /* 文件缺失按未插桩处理，交给原断言响亮报错 */ }
+  }
+  return hit
+})()
+function skipIfInstrumented (label, rel = 'scripts/console.js') {
+  if (!INSTRUMENTED_SOURCES.has(rel)) return false
+  skipped++
+  console.log(`  ⏭️ ${label}：Stryker 沙箱内 ${rel} 已插桩，源码形状断言不适用`)
+  return true
+}
 function findMkfifo (candidates = MKFIFO_CANDIDATES) {
   for (const p of candidates) {
     try {
@@ -3395,6 +3417,7 @@ function capturedStderr (fn) {
 
 async function reworkRegressionTests () {
   await aok('结构红线: 过滤规则提交链只有一份实现（C2-010）', () => {
+    if (skipIfInstrumented('C2-010')) return
     const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
     assert.strictEqual((code.match(/function commitFilterOverride \(/g) || []).length, 1,
       'commitFilterOverride 只能有一处定义（保存/回滚/导入各写一遍就是回退了修复）')
@@ -3414,6 +3437,7 @@ async function reworkRegressionTests () {
   })
 
   await aok('结构红线: 摘要正则只有一份（C10-057）', () => {
+    if (skipIfInstrumented('C10-057', 'scripts/status.js')) return
     const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
     assert.strictEqual((code.match(/total=\(\\d\+\) dedup=/g) || []).length, 1,
       '摘要行正则只能有一处定义（parseLastRun 再内联一份就是回退了修复：两份的分组形态还会各自漂）')
@@ -3426,6 +3450,7 @@ async function reworkRegressionTests () {
   })
 
   await aok('结构红线: 日期回环校验服务端只有一份（C10-053）', () => {
+    if (skipIfInstrumented('C10-053', 'scripts/status.js')) return
     const status = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
     const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8'))
     assert.strictEqual((status.match(/function isRealDayKey \(/g) || []).length, 1,
@@ -6857,6 +6882,7 @@ async function main () {
     }
   })
   await aok('finishRun: exit 即收尾且幂等（finishedAt 只落一次、锁只释放一次，审查 #229 S6）', () => {
+    if (skipIfInstrumented('finishRun')) return
     const dir1 = tmpDir()
     const token1 = 'tok1'
     assert.strictEqual(acquireLock(dir1, Date.now(), token1), true)
@@ -8636,6 +8662,7 @@ async function main () {
   })
 
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {
+    if (skipIfInstrumented('run-auto')) return
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     assert.ok(src.includes('const AUTO_MIN_S = 3') && src.includes('const AUTO_MAX_S = 20'),
@@ -10448,6 +10475,7 @@ async function main () {
 
   // ── v3.332 部署后旧标签页提示 ─────────────────────────────────────────
   await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
+    if (skipIfInstrumented('v3.332')) return
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
     const server = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
@@ -10820,6 +10848,7 @@ async function main () {
   // 喂给 request 监听器（真实 HTTP 里 req.headers 恒存在，用它只为驱动外层兜底），断言
   // 回 500、日志可 grep、且监听器/进程仍然存活。
   await aok('分发器: handler 同步抛错回 500，且不带走进程', async () => {
+    if (skipIfInstrumented('handler')) return
     const dir = tmpDir()
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
@@ -12133,7 +12162,7 @@ async function main () {
 // 攥着事件循环（迟到回调、孙进程），CI 照样白等满 timeoutMS，而日志里看不出是哪条用例烂了。
 function finishSuite () {
   // 跳过必须可见（C5-070）：FIFO 夹具缺 mkfifo 时只跳过那一小段，不能让它静默消失。
-  const skippedNote = skipped > 0 ? ` / 跳过 ${skipped}（本机缺工具，已逐条打印原因）` : ''
+  const skippedNote = skipped > 0 ? ` / 跳过 ${skipped}（本机缺工具或沙箱已插桩，已逐条打印原因）` : ''
   console.log(`\n控制台套件：通过 ${passed} / 失败 ${failed}${skippedNote}`)
   if (failed > 0) {
     process.exitCode = 1
