@@ -3075,6 +3075,12 @@ async function watchMonitorTests () {
       assert.strictEqual(first.pushed, 1, '锚点之上只有 1 条新线报')
       assert.strictEqual(pushes.length, 1)
       assert.ok(pushes[0].title.includes('十月稻田'))
+      // v3.389：标题必须带上该条线报的实际标题，不能只写关注词（否则同一天的推送在通知栏里
+      // 全是一个样子）。32 字符上限是既有口径，故只断言标题部分出现在标题里。
+      assert.ok(pushes[0].title.startsWith('新线报 · '), `标题须保留固定前缀（实际：${pushes[0].title}）`)
+      assert.ok(pushes[0].title.includes('五常香米5kg'),
+        `标题须用该条线报的实际标题（实际：${pushes[0].title}）`)
+      assert.ok(!pushes[0].title.includes('十月稻田十月稻田'), '前缀与关注词不得重复堆叠')
       assert.ok(pushes[0].body.includes('十月稻田五常香米5kg 20.85元'))
       assert.ok(pushes[0].body.includes('/haodan/7305598.html'), '推送正文必须带原文链接')
       const saved = readWatchState(dir)

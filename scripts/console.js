@@ -5476,7 +5476,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             : typeof item.ts === 'number' && item.ts > (lw.lastReadAt || 0)
           if (!stillNew) continue
           try {
-            const title = `新线报 · ${word.q}`.slice(0, 32)
+            // 标题＝固定前缀 + 该条线报的真实标题（v3.389）：只写关注词时，同一天十几条
+            // 通知在手机通知栏里长得一模一样，看不出是哪条线报。标题拿不到才退回关注词。
+            const itemTitle = item && typeof item.title === 'string' ? item.title.trim() : ''
+            const title = `新线报 · ${itemTitle !== '' ? itemTitle : word.q}`.slice(0, 32)
             // 正文优先用详情页富文本（真实领券/下单链接 + 海报图，渲染走生产同源的 htmlToMarkdown）；
             // 抓不到就退回纯文本——绝不因为详情页失败而不推这一条。
             let body = formatWatchPush(item)
