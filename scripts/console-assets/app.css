@@ -1258,6 +1258,28 @@
   .fr-status-v { font-family: var(--mono); font-size: var(--fs-xs); overflow-wrap: anywhere; }
   .fr-status-muted { color: var(--text-dim); font-size: var(--fs-xs); }
 
+  /* v3.392：保存后的变更摘要——只列增/删，不铺整段规则 */
+  .fr-diff {
+    display: flex; flex-direction: column; gap: var(--sp-1);
+    padding: var(--sp-3); margin-bottom: var(--sp-3);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-md);
+  }
+  .fr-diff-head { font-size: var(--fs-xs); color: var(--text-dim); font-weight: 600; }
+  .fr-diff-row {
+    display: flex; align-items: baseline; gap: var(--sp-2); flex-wrap: wrap;
+    padding-top: var(--sp-2); border-top: 1px dashed var(--border-soft);
+  }
+  .fr-diff-row:first-of-type { border-top: 0; }
+  .fr-diff-field { font-size: var(--fs-sm); font-weight: 500; }
+  .fr-diff-count { font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-dim); }
+  .fr-diff-lines { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 6px; }
+  .fr-diff-add, .fr-diff-del {
+    padding: 1px 8px; border-radius: var(--r-pill); font-size: var(--fs-xs);
+    max-width: 100%; overflow-wrap: anywhere;
+  }
+  .fr-diff-add { color: var(--ok-fg); background: var(--ok-soft); border: 1px solid var(--ok-line); }
+  .fr-diff-del { color: var(--bad-fg); background: var(--bad-soft); border: 1px solid var(--bad-line); text-decoration: line-through; }
+
   /* 首启（source=default）：不自动建文件，说明 + 一个显式复制按钮 */
   .fr-firstrun {
     display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2);

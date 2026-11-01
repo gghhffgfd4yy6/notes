@@ -4741,6 +4741,36 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     sendJson(res, 200, payload)
   }
 
+  // v3.392：保存时回吐「这次到底改了什么」——按字段比对新旧规则行（口径同去重：trim + 小写），
+  // 只报新增/删除，不搬整段文本。前端据此显示变更摘要，用户不用自己比对两版列表。
+  const RULE_LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
+  const indexRuleLines = (value) => {
+    const map = new Map()
+    for (const line of String(value === undefined || value === null ? '' : value).split(RULE_LINE_SPLIT_RE)) {
+      const key = line.trim().toLowerCase()
+      if (key !== '' && !map.has(key)) map.set(key, line.trim())
+    }
+    return map
+  }
+  const diffFilterFields = (prevOverride, nextFilter) => {
+    const out = {}
+    const prev = prevOverride && typeof prevOverride === 'object' ? prevOverride : {}
+    for (const field of FilterStore.FILTER_RULE_FIELDS) {
+      const before = typeof prev[field] === 'string' ? prev[field] : ''
+      const after = typeof nextFilter[field] === 'string' ? nextFilter[field] : ''
+      if (before === after) continue
+      const beforeMap = indexRuleLines(before)
+      const afterMap = indexRuleLines(after)
+      const added = []
+      const removed = []
+      for (const [key, text] of afterMap) if (!beforeMap.has(key)) added.push(text)
+      for (const [key, text] of beforeMap) if (!afterMap.has(key)) removed.push(text)
+      if (added.length === 0 && removed.length === 0) continue
+      out[field] = { added, removed }
+    }
+    return out
+  }
+
   // POST /api/config/filter：保存。鉴权/媒体类型已由调用方处理。
   // 锁内顺序：读当前 → CAS → 损坏确认 → 备份 → 原子写 → 审计 → 释放（全程同步）。
   const handleFilterSave = (req, res, actorToken) => {
@@ -4770,6 +4800,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       try {
         const paths = FilterStore.filterRulesPaths(stateDir)
         const loaded = loadCurrentFilter()
+        // v3.392：基线是「覆盖文件里的旧规则」，不是代码默认——用户关心的是自己改了什么。
+        const diff = diffFilterFields(loaded.override, result.value)
         const corrupt = loaded.source === 'corrupt'
         const curRevision = corrupt ? 0 : loaded.revision
         if (baseRevision !== curRevision) {
@@ -4814,6 +4846,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           // 不必等下次读取才发现「少了几行」。
           filter: result.value,
           deduped: result.deduped || {},
+          diff,
           appliedHint: '下一轮生效'
         })
       } finally {

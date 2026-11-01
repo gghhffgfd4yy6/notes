@@ -4307,6 +4307,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const [err, setErr] = useState('')
   const [fieldErrors, setFieldErrors] = useState({})
   const [notice, setNotice] = useState(null)
+  // v3.392：上次保存的「增/删」摘要（服务端算好的），保存成功后显示，编辑或重载时清掉。
+  const [savedDiff, setSavedDiff] = useState(null)
   const [preview, setPreview] = useState(null)
   const [dialog, setDialog] = useState(null)
   const [draftSavedAt, setDraftSavedAt] = useState(0)
@@ -4618,6 +4620,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const setFieldValue = useCallback((name, value) => {
     setDraft((cur) => (cur ? { ...cur, [name]: value } : cur))
     setDraftSyncedAt(0)
+    setSavedDiff(null) // 又改了：上一版摘要不再代表当前编辑内容
     setFieldErrors((cur) => {
       if (!cur[name]) return cur
       const next = { ...cur }
@@ -4802,6 +4805,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           ? { ...filter, ...payload.filter }
           : filter
         applySaved(savedFilter, payload.revision, copy === true)
+        // v3.392：把服务端算好的增/删摘要显示出来（没有变化就清空，别留上一版）。
+        const savedDiffData = payload.diff && typeof payload.diff === 'object' ? payload.diff : {}
+        setSavedDiff(Object.keys(savedDiffData).length > 0 ? savedDiffData : null)
         if (dedupedTotal > 0) {
           const fields = FILTER_FIELD_NAMES.filter((n) => Number(dedupedCounts[n]) > 0).map((n) => FILTER_FIELD_LABELS[n] || n)
           setNotice({ tone: 'ok', text: `已自动去掉 ${dedupedTotal} 条重复规则（${fields.join('、')}），已保存${Number.isSafeInteger(payload.revision) ? ` r${payload.revision}` : ''}，下一轮生效。` })
@@ -5146,6 +5152,22 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     <${PanelHead} title="过滤规则" level=${1} sub="覆盖文件编辑 · 保存后在下一轮生效，当前轮不换规则" />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${notice && html`<${Hint} tone=${notice.tone}>${notice.text}<//>`}
+    ${savedDiff && html`<div class="fr-diff" role="status" aria-live="polite">
+      <div class="fr-diff-head">本次保存的变更</div>
+      ${FILTER_FIELD_NAMES.filter((name) => savedDiff[name]).map((name) => {
+        const item = savedDiff[name] || {}
+        const added = Array.isArray(item.added) ? item.added : []
+        const removed = Array.isArray(item.removed) ? item.removed : []
+        return html`<div class="fr-diff-row" key=${name}>
+          <span class="fr-diff-field">${FILTER_FIELD_LABELS[name] || name}</span>
+          <span class="fr-diff-count">${added.length > 0 ? `＋${added.length}` : ''}${added.length > 0 && removed.length > 0 ? ' / ' : ''}${removed.length > 0 ? `－${removed.length}` : ''}</span>
+          <div class="fr-diff-lines">
+            ${added.map((text) => html`<span class="fr-diff-add" key=${'a:' + text}>＋${text}</span>`)}
+            ${removed.map((text) => html`<span class="fr-diff-del" key=${'d:' + text}>－${text}</span>`)}
+          </div>
+        </div>`
+      })}
+    </div>`}
     ${loading && !data && html`<div class="empty">加载中…</div>`}
     ${!loading && !data && html`<div class="empty">暂无可显示的规则（上方为错误详情）</div>`}
     ${data && html`<div>
