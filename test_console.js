@@ -1586,6 +1586,27 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则 POST: 去重与变更摘要（deduped / diff 只报新增与删除）', async () => {
+    const dir = mkTmp('xbk-console-filter-diff-')
+    const { server, port } = await filterServer(dir)
+    try {
+      const first = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '甲\n乙\n甲' } })
+      assert.strictEqual(first.status, 200)
+      const firstBody = JSON.parse(first.text)
+      assert.strictEqual(firstBody.filter.pingbibiaoti, '甲\n乙', '落盘正文必须是去重后的')
+      assert.deepStrictEqual(firstBody.deduped, { pingbibiaoti: 1 })
+      assert.deepStrictEqual(firstBody.diff, { pingbibiaoti: { added: ['甲', '乙'], removed: [] } }, '首存全部算新增')
+
+      const second = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 1, filter: { pingbibiaoti: '乙\n丙' } })
+      assert.strictEqual(second.status, 200)
+      assert.deepStrictEqual(JSON.parse(second.text).diff, { pingbibiaoti: { added: ['丙'], removed: ['甲'] } }, '只报新增/删除，未动的行不出现')
+
+      const same = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 2, filter: { pingbibiaoti: '丙\n乙' } })
+      assert.strictEqual(same.status, 200)
+      assert.deepStrictEqual(JSON.parse(same.text).diff, {}, '只换顺序不算变化（按行集合比对）')
+    } finally { server.close() }
+  })
+
   await aok('过滤规则 POST: 非法规则 400 且不落盘；合法保存 0600 + revision+1 + changedFields', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
