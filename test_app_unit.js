@@ -20,15 +20,33 @@ let failed = 0
 let declared = 0
 const failures = []
 
+// 跳过机制：仅用于「在 Stryker 插桩沙箱里没有意义」的源码形状断言（见 sourceShapeGuard）。
+// 跳过单独计数，不混进 passed——否则等于把没跑的用例记成通过。
+let skipped = 0
+const skips = []
+function skip (name, why) {
+  skipped += 1
+  skips.push(`${name} :: ${why}`)
+  return 'skip'
+}
+
 function check (name, fn) {
   declared += 1
   try {
-    fn()
+    if (fn() === 'skip') return
     passed++
   } catch (e) {
     failed++
     failures.push(`${name} :: ${e.message}`)
   }
+}
+
+// Stryker 沙箱里被变异文件的源码会被插桩（每个表达式包成 stryMutAct_/stryCov_ 调用），
+// 源码形状断言（数命中次数、比对片段）在那里必然失真：实测 'runs', 'total' 1→0、
+// fs.openSync(lockPath, 'wx') 2→0（run 41253679046 的 dry run 红）。
+// 这类断言守护的是「实现只剩一份」，属评审期红线，只在未插桩的运行（本地 / 单测 / 门禁）里有意义。
+function sourceShapeGuard (src, name) {
+  return src.indexOf('stryMutAct_') !== -1 ? skip(name, 'Stryker 沙箱内源码已插桩，源码形状断言不适用') : null
 }
 
 // 桩：fs / readSafeTextResult 全部由本文件控制，不触碰真实缓存目录
@@ -3684,6 +3702,8 @@ checkAsync('CD-1 cacheDir 每次访问都重新校验：运行中目录被换成
 check('C1-014 计数器名单单一来源：字面量仅常量一处，其余一律引用 REPORT_COUNTERS', () => {
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const sandboxSkip = sourceShapeGuard(src, 'C1-014 计数器名单单一来源：字面量仅常量一处，其余一律引用 REPORT_COUNTERS')
+  if (sandboxSkip) return sandboxSkip
   // 去掉整行注释（注释里复述名单不算实现重复；行内注释保留，行内复述即视为漂移）
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
   const literalLists = code.match(/'runs', 'total'/g) || []
@@ -3773,6 +3793,8 @@ checkAsync('C1-009 用户主动关闭告警（_sendAlert 返回 undefined 且 al
 check('C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份', () => {
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const sandboxSkip = sourceShapeGuard(src, 'C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份')
+  if (sandboxSkip) return sandboxSkip
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
   const logHits = code.match(/发现到新数据：/g) || []
   assert.strictEqual(logHits.length, 1, `成功日志文案必须只有一处（logPushed），实际 ${logHits.length} 处`)
@@ -3820,6 +3842,8 @@ check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁�
 check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份', () => {
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const sandboxSkip = sourceShapeGuard(src, 'C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份')
+  if (sandboxSkip) return sandboxSkip
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
   // 0o600 是 CodeQL js/insecure-temporary-file 收口后的口径：锁文件只含 pid:starttime，
   // 显式收紧 mode。这里钉两个数：wx 打开点总数（首试 + 回收后重开 = 2）与其中显式带 0o600
@@ -3846,6 +3870,8 @@ check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回
 check('C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）', () => {
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const sandboxSkip = sourceShapeGuard(src, 'C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）')
+  if (sandboxSkip) return sandboxSkip
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
   const body = code.slice(code.indexOf('async _updateChannelHealth'))
   assert.ok(/const failureList = Array\.isArray\(outcome && outcome\.failures\)/.test(body),
@@ -3983,6 +4009,8 @@ check('C1-010 窗口化只在安全时启用：短 HTML / 产物不足 / 无 htm
 check('C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）', () => {
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+  const sandboxSkip = sourceShapeGuard(src, 'C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）')
+  if (sandboxSkip) return sandboxSkip
   const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
   assert.ok(/contentTpl\.includes\('\{Html内容\}'\) \? pushItem : this\._boundMarkdownHtml\(pushItem, contentMax\)/.test(code),
     'pushOne 必须按模板是否含 {Html内容} 分流')
@@ -4091,12 +4119,15 @@ check('C1-020 RE2 标记锁：锁文件已被接管 ⇒ 保留别人的锁文件
       failures.push(`${name} :: ${e.message}`)
     }
   }
-  console.log(`通过 ${passed} / 失败 ${failed}（声明 ${declared} 例）`)
+  console.log(`通过 ${passed} / 失败 ${failed}${skipped ? ` / 跳过 ${skipped}` : ''}（声明 ${declared} 例）`)
+  if (skipped) {
+    for (const t of skips) console.log(`  ⏭️  ${t}`)
+  }
   if (failed > 0) {
     for (const f of failures) console.log(`  ❌ ${f}`)
   }
-  if (passed + failed !== declared) {
-    console.log(`  ❌ 用例计数对账失败：声明 ${declared} 例，实际结算 ${passed + failed} 例（${declared - passed - failed} 例永远不会被执行）`)
+  if (passed + failed + skipped !== declared) {
+    console.log(`  ❌ 用例计数对账失败：声明 ${declared} 例，实际结算 ${passed + failed + skipped} 例（${declared - passed - failed - skipped} 例永远不会被执行）`)
     process.exit(1)
   }
   process.exit(failed > 0 ? 1 : 0)
