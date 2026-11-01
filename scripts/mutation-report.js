@@ -1,4 +1,5 @@
 // 变异测试日报汇总：解析各段 stryker mutation-report.json → 汇总 → 发 GitHub Issue
+// （固定一条跟踪 issue，当日正文作为评论追加；见 TRACKER_ISSUE_TITLE）
 // 用法：node scripts/mutation-report.js <reports-dir> [--issue]
 //   <reports-dir>：包含 mutation-report-* 子目录的目录（各子目录内有 mutation-report.json）
 //   --issue：发 GitHub Issue（需 GITHUB_TOKEN 环境变量）；不带则只打印汇总
@@ -35,10 +36,11 @@ const LIST_QUERY_TIMEOUT_MS = 15000
 // 单条 Issue 的创建写请求远快于它，挂满 15s 只可能是对端不响应。
 const ISSUE_POST_TIMEOUT_MS = 15000
 
-// 历史日报清理（卫生项，不是门禁）：日报每天新建一条 Issue 且从不关闭 ⇒ 会无限堆积（就是 #206…#343
-// 那批 open 日报）。下面这套口径刻意比「看着像日报就关」窄得多：
+// 历史日报清理（卫生项，不是门禁）：日报**曾经**每天新建一条 Issue 且从不关闭 ⇒ 会无限堆积（就是
+// #206…#343 那批 open 日报）。v3.388 起日报改为固定一条跟踪 issue（见 TRACKER_ISSUE_TITLE），这套清理
+// 只用来收掉历史上已积压的按日 issue。下面这套口径刻意比「看着像日报就关」窄得多：
 //   * 标题必须**严格**等于 `🧬 变异测试日报 YYYY-MM-DD`——右侧带后缀（「… 2026-10-20 手改」）、
-//     前后加字的标题一律不匹配，用户的普通 issue 一条都不碰；
+//     前后加字的标题一律不匹配，用户的普通 issue 一条都不碰（**跟踪 issue 的标题结构上就不在匹配集内**）；
 //   * state 必须是 open（已经关掉的再 PATCH 只是白费配额）；
 //   * 创建者必须是 bot（列表查询已按 creator 过滤，这里再自查一次：查询参数哪天被改坏 / 被删时，
 //     这一层仍然挡得住「把用户 issue 批量关掉」）；
@@ -47,6 +49,14 @@ const ISSUE_POST_TIMEOUT_MS = 15000
 // warn，绝不 throw、不改退出码，也不影响当天日报的创建与返回值（调用点都走 *BestEffort 包装）。
 const DAILY_REPORT_TITLE_RE = /^🧬 变异测试日报 (\d{4}-\d{2}-\d{2})$/
 const BOT_ISSUE_LOGIN = 'github-actions[bot]'
+// 跟踪 issue：日报固定发这一条，当日正文作为评论追加（不再每天新建 issue）。
+// 标题**有意**不带日期——DAILY_REPORT_TITLE_RE 要求「日报」之后紧跟一个空格加 `YYYY-MM-DD`，本标题是
+// 「（持续更新）」，两者结构上无法匹配 ⇒ 每轮的清理逻辑永远不会把它当历史日报关掉（另有一层显式判等
+// 兜底，见 findClosableDailyIssues）。**改标题前先看 test_mutation_report.js 的锁定用例**：换成任何能
+// 匹配该正则的标题 = 跟踪 issue 每天被清理逻辑关掉一次。
+const TRACKER_ISSUE_TITLE = '🧬 变异测试日报（持续更新）'
+// 评论正文的机器可读前缀（同日去重锚点）。HTML 注释渲染后不可见，API 原样返回。
+const DAILY_COMMENT_MARKER_PREFIX = '<!-- mutation-daily:'
 // 单轮最多关 30 条 + 整段预算 60s：一起兜住「积压上百 × 每条 15s 超时」的尾部时长。积压超过上限时
 // 剩下的留给下一次运行（日报每天一轮，追平很快）——清理慢一点没关系，把 report job 拖住不行。
 const MAX_CLOSE_PER_RUN = 30
@@ -1582,6 +1592,9 @@ function findClosableDailyIssues (list, today) {
     if (issue.pull_request) return false
     if (!Number.isInteger(issue.number) || issue.number <= 0) return false
     if (!issue.user || issue.user.login !== BOT_ISSUE_LOGIN) return false
+    // 纵深防御：跟踪 issue 的标题结构上就匹配不了 DAILY_REPORT_TITLE_RE（见 TRACKER_ISSUE_TITLE 处注释），
+    // 这一层显式判等是第二道锁——将来有人把正则放宽成「以日报开头就关」时，跟踪 issue 也不会被关掉。
+    if (issue.title === TRACKER_ISSUE_TITLE) return false
     const m = DAILY_REPORT_TITLE_RE.exec(typeof issue.title === 'string' ? issue.title : '')
     if (!m) return false
     if (!isRealDayKey(m[1])) return false
@@ -1636,7 +1649,7 @@ async function closeDailyIssues (candidates, opts) {
  * 查询 open 的 bot issue 并清理更早的日报（best-effort：查询失败只 warn 并跳过本轮清理）。
  * 查询刻意用 `state=open&creator=bot` 单独拉一次，而不复用去重查询的 `state=all` 结果：后者按创建
  * 时间倒序只给最近 100 条，积压跨过 100 条之后，老的那批会永远落在这个窗口外 —— 那正是要消灭的
- * 「看不见的堆积」。open 列表天然自我限制（清完就只剩当天那条），`per_page=100` 足够。
+ * 「看不见的堆积」。open 列表天然自我限制（清完就只剩跟踪 issue —— 它不在清理口径内），`per_page=100` 足够。
  * @param {{token: string, repo: string, today: string, fetchImpl?: Function, now?: Function}} opts
  * @returns {Promise<{closed: number, failed: number, skipped: number}>}
  */
@@ -1695,50 +1708,186 @@ function resolveIssueRepo (raw) {
   return repo
 }
 
+// 统一请求头：只拼本机环境变量里的 token，不含任何远端数据（S5145 的另一半：远端响应体一律不进日志）。
+function ghHeaders (token, withJson) {
+  const headers = { Authorization: `token ${token}`, 'User-Agent': 'mutation-report' }
+  if (withJson) headers['Content-Type'] = 'application/json'
+  return headers
+}
+
 /**
- * 汇总日报并按上海自然日创建或复用 GitHub Issue。
+ * 纯函数：从 Issue 列表里挑出跟踪 issue（标题精确等于 TRACKER_ISSUE_TITLE 的那一条）。
+ * 只看标题 + 非 PR + 合法 number——`state` 不参与判定：已关闭的跟踪 issue 也要找出来（随后会被重开），
+ * 否则每次关闭都会让下一天再建一条新的，退回「一堆 issue」的老问题。
+ * @param {Array<object>} list Issue 列表（调用方按 state=all + creator=bot 查询）
+ * @returns {object|null} 命中的 issue；入参形态不对时返回 null，绝不抛错
+ */
+function findTrackerIssue (list) {
+  if (!Array.isArray(list)) return null
+  for (const issue of list) {
+    if (!issue || typeof issue !== 'object') continue
+    if (issue.pull_request) continue // issues 列表会把 PR 一起返回
+    if (!Number.isInteger(issue.number) || issue.number <= 0) continue
+    if (issue.title === TRACKER_ISSUE_TITLE) return issue
+  }
+  return null
+}
+
+// 纯函数：评论正文 = 同日去重标记 + 日报正文。标记必须在最前，且日期取上海自然日（与日报日界同口径）。
+function withDailyMarker (body, today) {
+  return `${DAILY_COMMENT_MARKER_PREFIX}${today} -->\n\n${body}`
+}
+
+// 纯函数：这段文本里是否有当天的日报标记。评论正文与跟踪 issue 的**初始 body** 都走同一判据
+// （第一天没有评论，日报就在建 issue 的正文里——只查评论会漏掉它，同日第二次运行会再追一条）。
+function hasDailyMarker (text, today) {
+  if (typeof text !== 'string') return false
+  return text.includes(`${DAILY_COMMENT_MARKER_PREFIX}${today} -->`)
+}
+
+// 纯函数：评论列表里是否已有当天的日报。按标记判等，不按正文长度/标题猜（日报正文每天几乎一样，
+// 靠「正文含日期」之类会误判）。入参不是数组时返回 false。
+function hasDailyComment (comments, today) {
+  if (!Array.isArray(comments)) return false
+  return comments.some((c) => c && hasDailyMarker(c.body, today))
+}
+
+/**
+ * 查跟踪 issue **当日起**的评论，判断当天是否已追加过（fail-open：任何失败只 warn 并返回 false）。
+ *
+ * 为什么必须带 `since`：GitHub 的「List issue comments」**默认按 id 升序**（最旧在前），只有
+ * `per_page=100` 时拿到的是**最旧**的 100 条——累计超过 100 条之后，当天的标记永远落在第一页之外，
+ * 去重会**静默失效**（每天两次定时（UTC 16:17 主跑 / 04:17 补偿）属同一上海自然日，于是每天追两条）。
+ * 故把结果压到「当日起」：`since` = 当日 00:00（上海）换算成的 UTC 时刻。
+ * （实测：`?per_page=100` 对 6 条评论返回 id 升序；`&since=<未来>` 返回 0 条、`&since=1970…` 返回 6 条。）
+ *
+ * fail-open 是硬约束：去重只是「别刷两遍」，而日报发不出去是「今天什么都没看到」——后者严重得多。
+ * 失败形态与非 2xx 一律走 warn（S5145：远端响应体不打印，只记状态码），然后照常追加；
+ * `today` 形态非法时 `toISOString()` 抛 RangeError，同样落进这个 catch。
+ * @param {{repo: string, number: number, token: string, today: string, fetchImpl?: Function}} opts
+ * @returns {Promise<boolean>}
+ */
+async function hasCommentedToday (opts) {
+  const doFetch = opts.fetchImpl || fetch
+  try {
+    const since = new Date(`${opts.today}T00:00:00+08:00`).toISOString()
+    const res = await doFetch(`https://api.github.com/repos/${opts.repo}/issues/${opts.number}/comments?per_page=100&since=${encodeURIComponent(since)}`, {
+      headers: ghHeaders(opts.token),
+      signal: AbortSignal.timeout(LIST_QUERY_TIMEOUT_MS)
+    })
+    if (!res.ok) {
+      await res.text().catch(() => {}) // S5145：响应体不打印，只记状态码
+      console.warn(`⚠️  当日评论查询失败（HTTP ${res.status}），跳过去重直接追加`)
+      return false
+    }
+    return hasDailyComment(await res.json(), opts.today)
+  } catch (e) {
+    console.warn(`⚠️  当日评论查询失败（${sanitizeLogText(e)}），跳过去重直接追加`)
+    return false
+  }
+}
+
+/**
+ * 汇总日报并发布到**固定一条**跟踪 issue（每天把当日正文作为评论追加）。
+ *
+ * 旧行为：每天按标题 `🧬 变异测试日报 <上海日期>` 新建一条 issue，发完再关掉更早的 open 日报
+ * ⇒ 一年堆 300+ 条。现在只有一条 issue：不存在则创建、存在则追加评论、被关掉则先重开再追加；
+ * 同日重复运行靠 `<!-- mutation-daily:YYYY-MM-DD -->` 标记去重：标记写进每条评论的正文，也写进跟踪
+ * issue 的初始 body（第一天只有 body、没有评论），查评论时按 `since=当日 00:00（上海）` 只取当日起。
+ *
+ * 失败口径（沿用 F7，两类必须分开）：
+ *   * **只读链路**（列表查询 / 评论查询）任何失败都只 warn 后照常发布——查不出去重信息不是吞掉当天
+ *     日报的理由。列表查询失败时退化回旧形态（按日期标题新建一条），由下一次运行的清理逻辑收掉。
+ *   * **写入链路**（创建 issue / 追加评论）失败照旧抛错，让 main exit 1——那是日报真的没发出去。
+ *
  * @param {string} body 已渲染的日报 Markdown
- * @returns {Promise<object>} 新建或已存在的 Issue 信息
+ * @returns {Promise<object>} Issue 信息（`{number, html_url}`；同日已追加过时带 `skipped: true`）
  */
 async function postIssue (body) {
   const token = process.env.GITHUB_TOKEN
   if (!token) throw new Error('缺少 GITHUB_TOKEN')
   const repo = resolveIssueRepo(process.env.GITHUB_REPOSITORY)
   const today = shanghaiDate()
-  const title = `🧬 变异测试日报 ${today}`
-  // 同天去重：当天已有日报则跳过（避免多次运行重复发 Issue）。
-  // F7：去重查询必须整体容错——非 2xx / 网络异常 / 超时 / 200 但响应体非 JSON，一律按既有口径
-  // 「跳过去重直接创建」并输出可观测 warn。旧实现有两条能吞掉当天日报的路径：
-  //   ① `await listRes.json()` 未包 try：列表 API 返回 200 + 非 JSON（代理页/限流说明页）时抛
-  //      SyntaxError，整个 run 失败，日报不发；
-  //   ② fetch 无超时：列表接口挂住会把 report job 一起拖死（GitHub API 偶发长时间无响应）。
-  // 只用本机异常文本拼 warn（非远端响应体），折叠换行/控制字符后截断，避免伪造日志行。
-  let existing
+  const headers = ghHeaders(token)
+  const jsonHeaders = ghHeaders(token, true)
+  // 跟踪 issue 查询：必须整体容错——非 2xx / 网络异常 / 超时 / 200 但响应体非 JSON 一律降级
+  // （旧实现的两条吞日报路径见 F7：`await listRes.json()` 未包 try、fetch 无超时）。
+  let tracker = null
+  let lookupFailed = false
   try {
     const listRes = await fetch(`https://api.github.com/repos/${repo}/issues?state=all&per_page=100&creator=github-actions%5Bbot%5D`, {
-      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'mutation-report' },
+      headers,
       signal: AbortSignal.timeout(LIST_QUERY_TIMEOUT_MS)
     })
     if (!listRes.ok) {
+      await listRes.text().catch(() => {}) // S5145：响应体不打印，只记状态码
+      lookupFailed = true
       console.warn(`⚠️  日报列表查询失败（HTTP ${listRes.status}），跳过去重直接创建`)
     } else {
-      const list = await listRes.json()
-      existing = (list || []).find(i => i.title === title)
+      tracker = findTrackerIssue(await listRes.json())
     }
   } catch (e) {
+    lookupFailed = true
     console.warn(`⚠️  日报列表查询失败（${sanitizeLogText(e)}），跳过去重直接创建`)
   }
-  // 卫生（不是门禁）：当天日报已就位后，关掉更早的 open 日报。当天是「新建」还是「复用」都做同一件事
-  // ——清理的前提是「今天的日报存在」，不是「今天新建了日报」；否则同日重跑时旧日报会一直留在 open。
-  if (existing) {
-    console.log('⏭️  当日日报已存在，跳过重复发布')
+
+  if (tracker) {
+    const number = tracker.number
+    // 跟踪 issue 被手动/误关后必须自动重开：否则之后的日报全打进一条「已关闭」的 issue，等于没人看。
+    // 重开失败只 warn 并继续追加（GitHub 允许给已关闭 issue 写评论），日报不得被一次 PATCH 失败吞掉。
+    let reopened = false
+    if (tracker.state === 'closed') {
+      try {
+        const patchRes = await fetch(`https://api.github.com/repos/${repo}/issues/${number}`, {
+          method: 'PATCH',
+          headers: jsonHeaders,
+          body: JSON.stringify({ state: 'open' }),
+          signal: AbortSignal.timeout(ISSUE_POST_TIMEOUT_MS)
+        })
+        if (patchRes.ok) {
+          reopened = true
+        } else {
+          await patchRes.text().catch(() => {}) // S5145：只记状态码
+          console.warn(`⚠️  跟踪 issue 重新打开失败（HTTP ${patchRes.status}），仍尝试追加当日日报`)
+        }
+      } catch (e) {
+        console.warn(`⚠️  跟踪 issue 重新打开失败（${sanitizeLogText(e)}），仍尝试追加当日日报`)
+      }
+    }
+    // 同日去重：**先看跟踪 issue 的初始 body**（当天新建的那条，日报正文就在 body 里），再看当日起的评论。
+    // 只查评论会漏掉「当天建的跟踪 issue」——同日第二次运行会再追加一条重复日报。查询失败一律 fail-open。
+    if (hasDailyMarker(tracker.body, today) || await hasCommentedToday({ repo, number, token, today })) {
+      console.log('⏭️  当日日报已追加到跟踪 issue，跳过重复发布')
+      await pruneOldDailyIssuesBestEffort({ token, repo, today })
+      return { number, html_url: tracker.html_url, skipped: true }
+    }
+    const res = await fetch(`https://api.github.com/repos/${repo}/issues/${number}/comments`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ body: withDailyMarker(body, today) }),
+      signal: AbortSignal.timeout(ISSUE_POST_TIMEOUT_MS)
+    })
+    if (!res.ok) {
+      // S5145：远端响应体不可信（可能含换行/控制字符/伪日志前缀），只记录固定状态码
+      await res.text().catch(() => {})
+      throw new Error(`追加日报评论失败，HTTP 状态码：${res.status}`)
+    }
+    await res.json().catch(() => null) // 排空响应体：内容不用、不打印（S5145）
+    // 同一条口径：日报落地后清理更早的按日 open 日报（跟踪 issue 不在清理口径内，见 findClosableDailyIssues）
     await pruneOldDailyIssuesBestEffort({ token, repo, today })
-    return { number: existing.number, html_url: existing.html_url, skipped: true }
+    return { number, html_url: tracker.html_url, commentAdded: true, reopened }
   }
+
+  // 两种落点：① 列表查询失败（lookupFailed）⇒ 退化回旧形态，按日期标题新建一条，下次运行的清理逻辑会收掉；
+  // ② 查询成功但没有跟踪 issue ⇒ 现在就用当日日报把它建出来（body 即当日日报）。
+  const title = lookupFailed ? `🧬 变异测试日报 ${today}` : TRACKER_ISSUE_TITLE
+  // 跟踪 issue 的初始 body 必须带同日标记：它就是「第一天」的日报，同日的第二次运行要靠它认出来
+  // （那时还没有任何评论）。降级形态的按日 issue **不带**标记——没有任何后续逻辑会读它的 body。
+  const createBody = lookupFailed ? body : withDailyMarker(body, today)
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'mutation-report' },
-    body: JSON.stringify({ title, body }),
+    headers: jsonHeaders,
+    body: JSON.stringify({ title, body: createBody }),
     // C10-024：本请求自己的超时信号（不复用列表查询那一个：两者各自计时）
     signal: AbortSignal.timeout(ISSUE_POST_TIMEOUT_MS)
   })
@@ -1905,7 +2054,10 @@ async function main () {
     // CodeRabbit 审查：跳过分支补 number，且跳过不应标记为“已发布”
     if (issue.skipped) {
       // S5145：existing.number 来自远端 Issue 列表，属用户可控数据——跳过时不输出
-      console.log('\n⏭️ 日报已存在，跳过发布')
+      console.log('\n⏭️ 当日日报已存在，跳过发布')
+    } else if (issue.commentAdded) {
+      // 固定跟踪 issue 形态：当日正文作为评论追加（S5145：同样不打印远端字段）
+      console.log('\n✅ 日报已发布（已追加到跟踪 issue）')
     } else {
       // S5145：number 来自远端响应（POST /issues），属用户可控数据——日志不再输出远端字段
       console.log('\n✅ 日报已发布')
@@ -1935,6 +2087,16 @@ module.exports = {
   render,
   shanghaiDate,
   postIssue,
+  // 固定跟踪 issue（v3.388）：纯谓词 + 同日去重锚点/查询，导出以便 mock fetch 测
+  // 「无则新建 / 有则追评 / 同日跳过 / 关闭后重开 / 清理不动它」五类口径。
+  TRACKER_ISSUE_TITLE,
+  DAILY_REPORT_TITLE_RE,
+  DAILY_COMMENT_MARKER_PREFIX,
+  findTrackerIssue,
+  withDailyMarker,
+  hasDailyMarker,
+  hasDailyComment,
+  hasCommentedToday,
   // 历史日报清理（卫生项）：纯谓词 + 查询/关闭两段，均导出以便 mock fetch 测「关闭成功 / 关闭失败 /
   // 当天已存在 / 标题不匹配」四类口径，不必起真网络。
   sanitizeLogText,

@@ -1190,12 +1190,91 @@ globalThis.fetch = async function (url, opts) {
     const calls = fs.readFileSync(callsPath, 'utf8').trim().split('\n').map(l => JSON.parse(l))
     const by = (m, frag) => calls.filter(c => c.method === m && (!frag || c.url.includes(frag)))
     assert.strictEqual(by('GET', 'state=all').length, 1, '去重查询一次')
-    assert.strictEqual(by('POST').length, 1, '当天日报创建一次')
+    assert.strictEqual(by('POST').length, 1, '跟踪 issue 创建一次（state=all 为空 ⇒ 首建那条固定 issue）')
     assert.strictEqual(by('GET', 'state=open').length, 1, '清理候选查询一次')
     const patches = by('PATCH')
     assert.deepStrictEqual(patches.map(p => p.url.replace(/^.*\/issues\//, '')), ['901', '902'],
       '两条历史日报都要尝试关闭（第一条失败后不得中断）')
     for (const p of patches) {
+      assert.deepStrictEqual(p.body, { state: 'closed', state_reason: 'not_planned' }, 'PATCH 请求体口径')
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// 场景 21（v3.388 · 固定跟踪 issue 的完整 CLI 链路）：跟踪 issue **已存在但被关闭**，`--issue` 必须
+// PATCH 重开 → 查评论（只有昨天的标记）→ POST 当日评论 → 再清理按日日报（跟踪 issue 不在清理口径内）。
+// 为什么落在子进程：① main() 的「已发布 / 追加 / 跳过」打印分支与退出码只有真跑 CLI 才算验过；② 纯函数
+// 套件的 mock 不覆盖「真脚本 + 真参数解析」这条链。fetch 同样用 `-r` 预加载的桩顶掉。
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-mut-report-tracker-'))
+  try {
+    for (const seg of REQUIRED_SEGS) {
+      const segDir = path.join(tmp, 'mutation-report-' + seg)
+      fs.mkdirSync(segDir, { recursive: true })
+      fs.writeFileSync(path.join(segDir, 'mutation.json'), JSON.stringify(schemaReport(seg, [mutantOf()])))
+    }
+    const { shanghaiDate, TRACKER_ISSUE_TITLE } = require('./scripts/mutation-report.js')
+    const today = shanghaiDate()
+    const yesterday = shanghaiDate(new Date(Date.now() - 86400000))
+    const stubPath = path.join(tmp, 'stub-fetch-tracker.js')
+    const callsPath = path.join(tmp, 'calls.jsonl')
+    fs.writeFileSync(stubPath, `'use strict'
+const fs = require('node:fs')
+const TRACKER = process.env.STUB_TRACKER_TITLE
+const BOT = { login: 'github-actions[bot]' }
+const res = (ok, status, body) => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) })
+globalThis.fetch = async function (url, opts) {
+  const method = (opts && opts.method) || 'GET'
+  fs.appendFileSync(process.env.STUB_CALLS_FILE, JSON.stringify({ method, url, body: opts && opts.body ? JSON.parse(opts.body) : null }) + '\\n')
+  if (method === 'GET' && url.includes('state=all')) {
+    return res(true, 200, [{ number: 950, state: 'closed', title: TRACKER, user: BOT }])
+  }
+  if (method === 'PATCH' && url.endsWith('/issues/950')) return res(true, 200, { number: 950, state: 'open' })
+  if (method === 'GET' && url.includes('/issues/950/comments')) {
+    return res(true, 200, [{ id: 1, body: '<!-- mutation-daily:' + process.env.STUB_YESTERDAY + ' -->\\n\\n## 昨天' }])
+  }
+  if (method === 'POST' && url.endsWith('/issues/950/comments')) return res(true, 201, { id: 2 })
+  if (method === 'GET' && url.includes('state=open')) {
+    return res(true, 200, [
+      { number: 951, state: 'open', title: '🧬 变异测试日报 ' + process.env.STUB_YESTERDAY, user: BOT },
+      { number: 950, state: 'open', title: TRACKER, user: BOT }
+    ])
+  }
+  if (method === 'PATCH' && url.endsWith('/issues/951')) return res(true, 200, {})
+  throw new Error('unexpected fetch: ' + method + ' ' + url)
+}
+`)
+    const env = cleanEnv({
+      GITHUB_TOKEN: 'stub-token',
+      GITHUB_REPOSITORY: 'owner/repo',
+      STUB_CALLS_FILE: callsPath,
+      STUB_YESTERDAY: yesterday,
+      STUB_TRACKER_TITLE: TRACKER_ISSUE_TITLE
+    })
+    const r = spawnSync(process.execPath, ['-r', stubPath, SCRIPT, tmp, '--issue'], { encoding: 'utf8', env })
+    assert.strictEqual(r.status, 0, `跟踪 issue 路径不得让日报 job 变红，实际 exit ${r.status}；stderr：${r.stderr}`)
+    assert.ok(r.stdout.includes('✅ 日报已发布'), `追加评论后必须打印「已发布」，实际 stdout 缺该行：\n${r.stdout}`)
+    assert.ok(!r.stdout.includes('⏭️'), '昨天的标记不得被当成本日已发（否则今天的日报被吞掉）')
+    const calls = fs.readFileSync(callsPath, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    const by = (m, frag) => calls.filter(c => c.method === m && (!frag || c.url.includes(frag)))
+    // 顺序：查跟踪 issue → 重开 → 查评论 → 追评 → 查 open 列表 → 关按日日报
+    assert.deepStrictEqual(calls.map(c => c.method), ['GET', 'PATCH', 'GET', 'POST', 'GET', 'PATCH'],
+      `调用序列必须是「重开在前、追评在后」，实际：${calls.map(c => c.method + ' ' + c.url).join(' | ')}`)
+    assert.ok(by('GET', 'state=all').length === 1, '跟踪 issue 只查一次')
+    assert.ok(by('GET', '/comments')[0].url.includes('since='), '评论查询必须带 since（默认升序，只翻页会在 100 条后静默失效）')
+    assert.strictEqual(by('POST').length, 1, '只允许一次写请求：追加评论（不得再新建 issue）')
+    const commentPost = by('POST')[0]
+    assert.ok(commentPost.url.endsWith('/issues/950/comments'), `日报必须作为评论进跟踪 issue，实际：${commentPost.url}`)
+    assert.ok(commentPost.body.body.startsWith(`<!-- mutation-daily:${today} -->`),
+      `评论正文必须以当日标记开头，实际：${String(commentPost.body.body).slice(0, 80)}`)
+    const reopen = by('PATCH')[0]
+    assert.deepStrictEqual(reopen.body, { state: 'open' }, '被关闭的跟踪 issue 必须先重开')
+    const closes = by('PATCH').filter(p => p.body && p.body.state === 'closed')
+    assert.deepStrictEqual(closes.map(p => p.url.replace(/^.*\/issues\//, '')), ['951'],
+      '只有按日日报被关闭；跟踪 issue #950 绝不能被关')
+    for (const p of closes) {
       assert.deepStrictEqual(p.body, { state: 'closed', state_reason: 'not_planned' }, 'PATCH 请求体口径')
     }
   } finally {
