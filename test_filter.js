@@ -2590,6 +2590,24 @@ console.log('========================================\n');
     assertEqual(r.pingbifenlei, null, 'r.pingbifenlei 应等于 null')
   })
 
+  await test('v3.390 换行=或：按行写的多个分类/关键词是并集', () => {
+    // 控制台提示里一直是「正则（如 美妆|数码）」，但用户按行写是最自然的；旧实现把换行原样
+    // 编进正则（'美妆\n宠物' 只匹配「美妆+换行+宠物」）⇒ 两行配置零告警地永不命中。
+    const r = compileRules({ pingbifenlei: '美妆\n宠物' })
+    assertEqual(r.pingbifenlei._type, 're', 'r.pingbifenlei._type 应等于 \'re\'')
+    assertEqual(r.pingbifenlei.re.source, '美妆|宠物', 'r.pingbifenlei.re.source 应等于 \'美妆|宠物\'')
+    assertEqual(matchesCompiled(r.pingbifenlei, '美妆', '美妆'), true, '多行配置必须命中第一行')
+    assertEqual(matchesCompiled(r.pingbifenlei, '宠物', '宠物'), true, '多行配置必须命中第二行')
+    assertEqual(matchesCompiled(r.pingbifenlei, '数码', '数码'), false, '未列出的分类仍放行')
+
+    // CRLF / 行首尾空白 / 空行一并归一；单行输入逐字不变（不做多余改写）
+    assertEqual(compileRules({ pingbibiaoti: '  京东  \r\n\r\n  拼多多  ' }).pingbibiaoti.re.source, '京东|拼多多', 'CRLF+空白+空行应归一为 京东|拼多多')
+    assertEqual(compileRules({ pingbibiaoti: '京东' }).pingbibiaoti.re.source, '京东', '单行输入不得被改写')
+
+    // validateConfig 与 compileRules 必须看同一份归一后的值：多行本身不是告警
+    assertEqual(validateConfig({ pingbifenlei: '美妆\n宠物' }).length, 0, '多行配置不应产生告警')
+  })
+
   await test('compileRules 天数简单规则', () => {
     const r = compileRules({ pingbitime: '5' })
     assertEqual(r.pingbitime._type, 'time', 'r.pingbitime._type 应等于 \'time\'')

@@ -141,8 +141,8 @@ XBK_INTERVAL_MS=30000 node qinglong/xbk_push.js
 
 ```js
 filter: {
-  pingbifenlei: '美妆',       // 过滤分类
-  pingbibiaoti: '京东|拼多多', // 过滤标题
+  pingbifenlei: '美妆',       // 过滤分类（多个分类写 美妆|数码，或一行一个）
+  pingbibiaoti: '京东|拼多多', // 过滤标题（同样支持一行一个，多行取并集）
   pingbilouzhu: '广告号',     // 过滤发布人
   pingbitime: '5'             // 时间范围
 }
