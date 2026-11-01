@@ -13,6 +13,19 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
   // 它们改为调用 RuleEngine.splitRuleLines 即可与这里同源。
   const RULE_LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
 
+  // v3.390：**简单模式（整串一条正则、不含 ###）下换行等价于「或」**。
+  // 控制台里「一行一条」是这批字段最自然的写法（分类名/标题/正文/楼主都是单行文本，换行在里面
+  // 没有任何正则语义），而旧实现把换行原样编进正则：「美妆\n宠物」只能匹配「美妆+换行+宠物」，
+  // 于是两行配置零告警地永不命中（用户看到的就是「规则填了但不生效」）。这里按行拆分、去空白行、
+  // 用 | 连接；单行输入原样返回（不做任何改写）。
+  // 只作用于简单模式：含 ### 的配置走多行规则（每行「分类###值」），分隔口径见 RULE_LINE_SPLIT_RE。
+  const SIMPLE_LINE_SPLIT_RE = /\r\n|\r|\n/
+  const joinSimpleRegexLines = (val) => {
+    const s = String(val)
+    if (!SIMPLE_LINE_SPLIT_RE.test(s)) return s
+    return s.split(SIMPLE_LINE_SPLIT_RE).map((line) => line.trim()).filter((line) => line !== '').join('|')
+  }
+
   // C9-018：pingbitime 天数上限的**唯一字面量**（3650000 天 ≈ 10000 年）。此前 compileRules 与
   // validateConfig 各写一份、xbk_filter_store 再写一份，靠「与…同值」的注释同步；调上限时漏一处：
   // store 严于运行期 ⇒ 保存被 invalid_number 拒；运行期严于 store ⇒ 运行期静默丢弃规则，
@@ -264,6 +277,9 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
         // 简单模式：直接编译为 RegExp
         // v3.156：先 trim——空白配置('   ')曾编译成 /   /i 假过滤（validateConfig 说忽略但实际生效）
           val = val.trim()
+          if (!val) { compiled[field] = null; continue }
+          // v3.390：按行写的多个值等价于 a|b（见 joinSimpleRegexLines）
+          val = joinSimpleRegexLines(val)
           if (!val) { compiled[field] = null; continue }
           if (this.hasNestedQuantifier(val)) { compiled[field] = null; continue } // ReDoS 防护
           const re = compileUserRegex(val, 'i')
@@ -580,7 +596,7 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
             warnings.push(`⚠️ 配置「${field}」为空白字符，将被忽略`)
             continue
           }
-          const trimmedVal = val.trim() // C048：简单模式与 compileRules 一致，用 trim 后值校验
+          const trimmedVal = joinSimpleRegexLines(val.trim()) // C048：简单模式与 compileRules 一致，用 trim 后值校验；v3.390 换行=或
           if (this.hasNestedQuantifier(trimmedVal)) {
             warnings.push(`⚠️ 配置「${field}」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），该规则将被忽略：「${trimmedVal}」`)
             continue

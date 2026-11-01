@@ -4089,7 +4089,7 @@ const FILTER_GROUPS = [
     title: '分类',
     note: '第 2 步 · 分类名命中即屏蔽',
     fields: [
-      { name: 'pingbifenlei', label: '屏蔽分类', hint: '分类名正则（如 美妆|数码），不支持 ### 多行语法。' }
+      { name: 'pingbifenlei', label: '屏蔽分类', hint: '分类名正则（如 美妆|数码）；也可以一行写一个（多行取并集）。不支持 ### 多行分类语法。' }
     ]
   },
   {
