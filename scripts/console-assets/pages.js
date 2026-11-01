@@ -4794,7 +4794,18 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       })
       if (res.ok) {
         const payload = res.data && typeof res.data === 'object' ? res.data : {}
-        applySaved(filter, payload.revision, copy === true)
+        // v3.391：服务端保存时自动去重，落盘的是去重后的正文。把这份正文接回编辑器，
+        // 否则用户看到的还是自己粘进去的那一坨重复行，以为没生效。
+        const dedupedCounts = payload.deduped && typeof payload.deduped === 'object' ? payload.deduped : {}
+        const dedupedTotal = Object.keys(dedupedCounts).reduce((n, k) => n + (Number(dedupedCounts[k]) || 0), 0)
+        const savedFilter = dedupedTotal > 0 && payload.filter && typeof payload.filter === 'object'
+          ? { ...filter, ...payload.filter }
+          : filter
+        applySaved(savedFilter, payload.revision, copy === true)
+        if (dedupedTotal > 0) {
+          const fields = FILTER_FIELD_NAMES.filter((n) => Number(dedupedCounts[n]) > 0).map((n) => FILTER_FIELD_LABELS[n] || n)
+          setNotice({ tone: 'ok', text: `已自动去掉 ${dedupedTotal} 条重复规则（${fields.join('、')}），已保存${Number.isSafeInteger(payload.revision) ? ` r${payload.revision}` : ''}，下一轮生效。` })
+        }
         // 保存并继续：真正落盘成功后才放行原来的切页/后退动作。
         settleSaveResult(true)
         refreshBackups(Number.isSafeInteger(payload.revision) ? payload.revision : data.revision)

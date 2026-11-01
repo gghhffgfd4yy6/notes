@@ -58,6 +58,25 @@ const PINGBITIME_MAX_DAYS = 3650000
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
 // 行分隔口径必须与运行期 RuleEngine._splitLines / validateConfig 完全一致（含 <br> 与单独 \r）。
 const LINE_SPLIT_RE = /<br\s*\/?>|\r\n|\r|\n/
+
+// v3.391：保存时按行去重（大小写不敏感，保留首次出现的写法与顺序）。
+// 用户习惯整段粘贴关键词列表——重复项不改变判定结果，却会让规则文件膨胀、编译与 ReDoS 扫描
+// 白扫一遍，也让人看不出到底有多少条在真正生效。空行一并丢弃（运行期本来就忽略空行）。
+function dedupeRuleLines (value) {
+  const lines = String(value).split(LINE_SPLIT_RE)
+  const seen = new Set()
+  const kept = []
+  let removed = 0
+  for (const line of lines) {
+    if (line.trim() === '') continue // 空行运行期本就忽略，顺手丢掉
+    // 比较键 trim+小写：运行期编译时同样 trim、正则又带 i 标志，这两类差别不产生新语义。
+    const key = line.trim().toLowerCase()
+    if (seen.has(key)) { removed += 1; continue }
+    seen.add(key)
+    kept.push(line) // 保留首次出现的原样文本（含用户写的空格），不擅自改写规则
+  }
+  return { value: kept.join('\n'), removed }
+}
 // 全命中：trim 后等于这两个字面量即视为「放行一切」，console 需二次确认。
 const WIDE_MATCH_VALUES = new Set(['.*', '^.*$'])
 const FIELD_SET = new Set(FILTER_RULE_FIELDS)
@@ -244,6 +263,18 @@ function validateFilterRules (input, deps, options) {
   }
   if (errors.length) return { ok: false, errors }
 
+  // v3.391：自动去重（同一字段内重复行只留第一次，大小写不敏感）。只改落盘/回显的规则正文，
+  // 判定语义不变：运行期本来就按 | 连接这些行，重复项等价于同一条规则写了两遍。
+  const deduped = {}
+  for (const field of Object.keys(filter)) {
+    const result = dedupeRuleLines(filter[field])
+    // 整段只有空白时保持原样：交给闸门 2 按既有口径报 empty_value，
+    // 不能被「去重后变成空串」悄悄放行成一条空规则。
+    if (result.value === '') continue
+    filter[field] = result.value
+    if (result.removed > 0) deduped[field] = result.removed
+  }
+
   // ---------- 闸门 2：行语法（### 最多两段 / 值不能空 / pingbifenlei 不允许 ###）----------
   const ruleLines = [] // 多行规则的每一有效行：{ field, cat, val }
   const simpleRules = [] // 简单规则：{ field, val }
@@ -419,7 +450,7 @@ function validateFilterRules (input, deps, options) {
     }
   }
 
-  return { ok: true, value: filter, wideMatch }
+  return { ok: true, value: filter, wideMatch, deduped }
 }
 
 function parseStoredRules (text) {
