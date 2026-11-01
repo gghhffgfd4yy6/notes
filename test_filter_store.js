@@ -176,16 +176,16 @@ test('合法规则通过校验并原样返回已提交字段（不做 trim 改�
   }, '校验不得就地改写入参')
 })
 
-test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字段 4000 上限挡不住多字段累积）', () => {
-  // 11 个字段各 4000 个中文字（UTF-8 3 字节/字）⇒ 约 132 KB，远超读端 FILTER_RULES_MAX_BYTES。
+test('C9-012 整份规则文件超过读端 256 KiB 上限必须拒绝（单字段 16000 上限挡不住多字段累积）', () => {
+  // 11 个字段各 16000 个中文字（UTF-8 3 字节/字）⇒ 约 528 KB，远超读端 FILTER_RULES_MAX_BYTES。
   // 旧实现只限单字段：保存返回 200，下一轮读盘整份判 tooLarge 被丢弃（用户看到「保存成功但不生效」）。
   const filter = {}
   for (const field of FILTER_RULE_FIELDS) {
     if (field === 'pingbitime') continue
-    filter[field] = '中'.repeat(4000)
+    filter[field] = '中'.repeat(16000)
   }
   const result = validateFilterRules({ schema: 1, revision: 0, filter }, deps)
-  assert.strictEqual(result.ok, false, '整份超过 64 KiB 必须拒绝保存')
+  assert.strictEqual(result.ok, false, '整份超过 256 KiB 必须拒绝保存')
   const err = result.errors.find(e => e.code === 'too_large')
   assert.ok(err, `应给出 too_large 错误码：${JSON.stringify(result.errors)}`)
   assert.strictEqual(err.field, 'filter', '字段归属必须是 filter（整份而非某一字段超限）')
@@ -202,7 +202,7 @@ test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字�
     }
     return false
   }
-  assert.ok(hasByteCount(err.message) && err.message.includes(String(64 * 1024)),
+  assert.ok(hasByteCount(err.message) && err.message.includes(String(256 * 1024)),
     `错误文案必须给出实际字节数与上限：${err.message}`)
   // 与 /\d+ 字节/ 的对拍：两条正向（含 offset 0 的边界）+ 一条反向控制，逐面与正则对齐。
   // ① offset 0：旧实现 `at > 0` 把 0 当「没找到」退出，' 字节 70000 字节' 被判 false。
@@ -213,13 +213,13 @@ test('C9-012 整份规则文件超过读端 64 KiB 上限必须拒绝（单字�
   assert.strictEqual(hasByteCount('没有数字的 字节 文案'), false,
     '「 字节」前面没有数字时不得误判（防「一律 true」让上面两条失去鉴别力）')
   // 对照：把字段砍到总量在预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
-  const small = { pingbibiaoti: '中'.repeat(4000), pingbineirong: '中'.repeat(4000) }
+  const small = { pingbibiaoti: '中'.repeat(16000), pingbineirong: '中'.repeat(16000) }
   const okSmall = validateFilterRules({ schema: 1, revision: 0, filter: small }, deps)
   assert.strictEqual(okSmall.ok, true, JSON.stringify(okSmall.errors))
 })
 
-test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 判 corrupt（(64 KiB-32, 64 KiB] 区间）', () => {
-  // 旧版控制台 body 上限 64 KiB、落盘形状只多约 13 字节包装 ⇒ 该区间的覆盖文件是真实存量。
+test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 判 corrupt（(256 KiB-32, 256 KiB] 区间）', () => {
+  // 旧版控制台 body 上限 256 KiB、落盘形状只多约 13 字节包装 ⇒ 该区间的覆盖文件是真实存量。
   // 闸门 5 落在 validateFilterRules 里，读路径的 deepValidationError 复用同一函数后：
   // 65505..65535 这些「readSafeTextResult 读得到、结构也合法」的文件被重新序列化量字节 ⇒ too_large
   // ⇒ corrupt，生产每轮降级、规则静默不生效。这里按落盘字节数逐个断言 source 必须为 override。
@@ -231,10 +231,10 @@ test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 �
     const size = () => Buffer.byteLength(JSON.stringify({ schema: 1, revision: 0, filter }), 'utf8')
     let remaining = target - size()
     for (const f of fields) {
-      const cn = Math.min(4000, Math.floor(remaining / 3))
+      const cn = Math.min(16000, Math.floor(remaining / 3))
       filter[f] = '线'.repeat(cn)
       remaining -= cn * 3
-      const ascii = Math.min(4000 - cn, remaining)
+      const ascii = Math.min(16000 - cn, remaining)
       filter[f] += 'a'.repeat(ascii)
       remaining -= ascii
       if (remaining === 0) break
@@ -242,7 +242,7 @@ test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 �
     assert.strictEqual(size(), target, `夹具必须恰为 ${target} 字节`)
     return filter
   }
-  for (const target of [65505, 65520, 65535]) {
+  for (const target of [262113, 262130, 262144]) {
     const dir = makeDir()
     const file = filterRulesPaths(dir).file
     const filter = buildAtBytes(target)
@@ -255,14 +255,14 @@ test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 �
     assert.strictEqual(loaded.revision, 3)
   }
   // 对照 1：同一份内容走**保存**路径仍必须被闸门 5 拒绝（不得借读路径放行「保存后下轮必被丢弃」的内容）
-  const tooBig = validateFilterRules({ schema: 1, revision: 3, filter: buildAtBytes(65520) }, deps)
+  const tooBig = validateFilterRules({ schema: 1, revision: 3, filter: buildAtBytes(262130) }, deps)
   assert.strictEqual(tooBig.ok, false)
   assert.ok(tooBig.errors.some(e => e.code === 'too_large'), `保存路径必须仍拒绝：${JSON.stringify(tooBig.errors)}`)
-  // 对照 2：真正超过读端 64 KiB 的覆盖文件仍按 tooLarge 判 corrupt（读路径不放松读端上限）
+  // 对照 2：真正超过读端 256 KiB 的覆盖文件仍按 tooLarge 判 corrupt（读路径不放松读端上限）
   const overDir = makeDir()
-  writeRaw(filterRulesPaths(overDir).file, JSON.stringify({ schema: 1, revision: 4, filter: buildAtBytes(65537) }))
+  writeRaw(filterRulesPaths(overDir).file, JSON.stringify({ schema: 1, revision: 4, filter: buildAtBytes(262145) }))
   const over = loadFilterRules({ cacheDir: overDir, defaults: DEFAULTS, keyword: {}, deps })
-  assert.strictEqual(over.source, 'corrupt', '超过 64 KiB 的覆盖文件必须仍判损坏（读端上限不变）')
+  assert.strictEqual(over.source, 'corrupt', '超过 256 KiB 的覆盖文件必须仍判损坏（读端上限不变）')
   assert.match(over.error.message, /不可读（tooLarge）/)
 })
 
@@ -281,10 +281,10 @@ test('非字符串值被拒绝', () => {
   }
 })
 
-test('超长字段被拒绝（4000 边界通过 / 4001 拒绝）', () => {
-  const okBoundary = validateFilterRules({ revision: 0, filter: { pingbibiaoti: 'a'.repeat(4000) } }, deps)
+test('超长字段被拒绝（16000 边界通过 / 16001 拒绝）', () => {
+  const okBoundary = validateFilterRules({ revision: 0, filter: { pingbibiaoti: 'a'.repeat(16000) } }, deps)
   assert.strictEqual(okBoundary.ok, true, JSON.stringify(okBoundary.errors))
-  expectError(validateFilterRules({ revision: 0, filter: { pingbibiaoti: 'a'.repeat(4001) } }, deps), 'pingbibiaoti', 'too_long', '超长')
+  expectError(validateFilterRules({ revision: 0, filter: { pingbibiaoti: 'a'.repeat(16001) } }, deps), 'pingbibiaoti', 'too_long', '超长')
 })
 
 test('控制字符被拒绝，\\n \\r \\t 允许', () => {

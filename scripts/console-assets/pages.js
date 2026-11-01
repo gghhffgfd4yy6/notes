@@ -4705,7 +4705,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     }
     if (res.status === 401) { fail('凭证已失效（401），写操作被拒绝；请用带 token 的完整链接重新打开控制台。'); return 'unauthorized' }
     if (code === 'engine_unavailable' || res.status === 503) { fail('安全正则引擎（re2）暂不可用，本次不落盘；请检查部署后重试。'); return 'engine_unavailable' }
-    if (code === 'body_too_large' || res.status === 413) { fail('规则内容超过 64 KiB 上限，请精简后再保存。'); return 'body_too_large' }
+    if (code === 'body_too_large' || res.status === 413) { fail('规则内容超过 256 KiB 上限，请精简后再保存。'); return 'body_too_large' }
     if (code === 'unsupported_media_type' || res.status === 415) { fail('请求格式不被接受（写端点要求 application/json）。'); return 'unsupported_media_type' }
     if (code === 'write_busy') { fail(`另一个写入正在进行，请 1 秒后重试（Retry-After: ${res.retryAfter || '1'}）。`); return 'write_busy' }
     if (code === 'store_corrupt') { fail('覆盖文件已损坏：保存需要确认覆盖（确认后损坏内容不可回滚）。'); return 'store_corrupt' }
