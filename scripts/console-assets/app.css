@@ -1279,6 +1279,12 @@
   }
   .fr-diff-add { color: var(--ok-fg); background: var(--ok-soft); border: 1px solid var(--ok-line); }
   .fr-diff-del { color: var(--bad-fg); background: var(--bad-soft); border: 1px solid var(--bad-line); text-decoration: line-through; }
+  /* v3.393：保存确认弹窗按字段列增删（复用上面的标签样式） */
+  .fr-diff-list { padding-left: 0; list-style: none; }
+  .fr-diff-list li { margin: 0 0 var(--sp-2); }
+  .fr-diff-list li:last-child { margin-bottom: 0; }
+  .fr-diff-list .fr-diff-row { padding-top: 0; border-top: 0; }
+  .fr-diff-none { color: var(--text-dim); font-size: var(--fs-xs); }
 
   /* 首启（source=default）：不自动建文件，说明 + 一个显式复制按钮 */
   .fr-firstrun {

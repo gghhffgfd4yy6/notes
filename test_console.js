@@ -9413,6 +9413,11 @@ async function main () {
     const iSamples = save.indexOf('命中样本（')
     assert.ok(iPreview > -1 && iPreview < iChanged && iChanged < iSamples,
       '抽屉内容顺序：补推影响 → 改动字段 → 命中样本')
+    // v3.393：改动字段块只列增删，不再整段回显字段内容（fr-sample-id 只留给命中样本）。
+    const changedBlock = save.slice(iChanged, iSamples > iChanged ? iSamples : save.length)
+    assert.ok(changedBlock.includes('diffRuleLinesUi(') && changedBlock.includes('fr-diff-add') && changedBlock.includes('fr-diff-del'),
+      '改动字段必须用 diffRuleLinesUi 渲染增删标签')
+    assert.ok(!changedBlock.includes('fr-sample-id'), '改动字段块不得再整段回显（旧 fr-sample-id 必须移出该块）')
     // ③ 底部按钮：取消不写盘，保存仍走原来的 submitSave（接口/参数一字不改）。
     assert.ok(save.includes('variant="secondary" disabled=' + ph('saving') + ' onClick=' + ph('closeDialog') + '>取消'),
       '底部必须有「取消」且保存中禁用')
