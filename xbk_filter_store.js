@@ -45,10 +45,11 @@ const FILTER_RULE_FIELDS = Object.freeze([
 ])
 
 const FILTER_RULES_SCHEMA = 1
-// 单字段正文上限：4000 个 UTF-16 码元（与文档行长闸门的 String.length 口径一致）。
-// 覆盖文件整体上限 64 KiB：与 console 的 body 上限同源，避免「能保存但读不回」。
-const FILTER_FIELD_MAX_LEN = 4000
-const FILTER_RULES_MAX_BYTES = 64 * 1024
+// 单字段正文上限：16000 个 UTF-16 码元（与文档行长闸门的 String.length 口径一致）。
+// v3.394：4000 → 16000（用户实测到 386 条 ≈1500 字符后要求放宽，按三字词算约 4000 条/字段）。
+// 覆盖文件整体上限 256 KiB：与 console 的 body 上限同源，避免「能保存但读不回」。
+const FILTER_FIELD_MAX_LEN = 16000
+const FILTER_RULES_MAX_BYTES = 256 * 1024
 // pingbitime 天数上限：与 xbk_rules.compileRules / validateConfig 的 PINGBITIME_MAX_DAYS 同值。
 // 超上限的行会被运行期静默丢弃 ⇒ 编译对账必然失败，这里提前给出明确错误码。
 const PINGBITIME_MAX_DAYS = 3650000
@@ -422,8 +423,8 @@ function validateFilterRules (input, deps, options) {
 
   // ---------- 闸门 5：整份规则文件的字节预算（C9-012）----------
   // 读端按 FILTER_RULES_MAX_BYTES（64 KiB）硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到
-  // 上次合法规则/代码默认。而闸门 1 只限**单字段** 4000 码元：11 个字段全填满中文（UTF-8 3 字节/字）
-  // 就能堆出 130 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
+  // 上次合法规则/代码默认。而闸门 1 只限**单字段** 16000 码元：11 个字段全填满中文（UTF-8 3 字节/字）
+  // 就能堆出 528 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
   // 不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给 revision 位数增长。
   //
   // **只对保存入参生效**（评审 C9-012）：读路径（deepValidationError）复用本函数时必须跳过此闸——

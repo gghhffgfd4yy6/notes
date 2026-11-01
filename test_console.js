@@ -1559,7 +1559,7 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则写端点: 415（text/plain、Content-Encoding:gzip）与 413（>64KiB）', async () => {
+  await aok('过滤规则写端点: 415（text/plain、Content-Encoding:gzip）与 413（>256KiB）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     try {
@@ -1578,7 +1578,7 @@ async function filterRuleApiTests () {
       })
       assert.strictEqual(gz.status, 415, '压缩体不解析')
 
-      const big = JSON.stringify({ schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'a'.repeat(70 * 1024) } })
+      const big = JSON.stringify({ schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'a'.repeat(300 * 1024) } })
       const tooBig = await postFilterJson(port, '/api/config/filter', null, { raw: big })
       assert.strictEqual(tooBig.status, 413)
       assert.strictEqual(JSON.parse(tooBig.text).code, 'body_too_large')
