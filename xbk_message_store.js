@@ -859,7 +859,10 @@ function createMessageStore ({
           if (!exists) return candidate
           continue
         }
-        let fd = -1
+        // 用 null 而不是 -1 当哨兵：-1 会被变异成 +1，而 +1 是 stdout 的 fd 号，
+        // 收尾的 closeSync(+1) 会把 stdout 关掉 ⇒ 后续 console.log 抛 EBADF，整条测试进程崩
+        // （run 41257085862 message-store 段 mutant #940 的 RuntimeError 即此）。
+        let fd = null
         try {
           fd = fs.openSync(candidate, 'wx', 0o600) // 预留占位：EEXIST = 这个名字已被占用（可能正是别人的备份）
         } catch (e) {
@@ -868,7 +871,7 @@ function createMessageStore ({
           // 直接返回该候选，让 rename 去暴露真实错误（不静默改名、不吞错）。
           return candidate
         } finally {
-          if (fd >= 0) { try { fs.closeSync(fd) } catch (e) { /* close 失败只影响占位，rename 仍可覆盖 */ } }
+          if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* close 失败只影响占位，rename 仍可覆盖 */ } }
         }
         try { this._reservedBackupPaths.add(candidate) } catch (e) { /* 忽略 */ }
         return candidate
