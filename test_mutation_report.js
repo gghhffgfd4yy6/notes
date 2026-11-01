@@ -21,7 +21,8 @@ const {
   // 历史日报清理（卫生项）：谓词 + 关闭循环
   findClosableDailyIssues, isRealDayKey, closeDailyIssues, MAX_CLOSE_PER_RUN,
   // 固定跟踪 issue（v3.388）：标题常量 + 同日去重锚点/谓词
-  TRACKER_ISSUE_TITLE, DAILY_REPORT_TITLE_RE, DAILY_COMMENT_MARKER_PREFIX, findTrackerIssue, withDailyMarker, hasDailyComment,
+  TRACKER_ISSUE_TITLE, DAILY_REPORT_TITLE_RE, DAILY_COMMENT_MARKER_PREFIX, findTrackerIssue, withDailyMarker, hasDailyMarker,
+  hasDailyComment,
   hasCommentedToday
 } = require('./scripts/mutation-report.js')
 
@@ -2029,8 +2030,8 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     assert.strictEqual(result.number, 42)
     assert.strictEqual(result.html_url, tracker.html_url)
     assert.ok(listRes.capturedUrl.includes('/issues?state=all'), '应调用列表查询 API')
-    assert.ok(commentsRes.capturedUrl.endsWith('/issues/42/comments?per_page=100'),
-      `去重前应拉评论列表（只读最近一页），实际：${commentsRes.capturedUrl}`)
+    assert.ok(commentsRes.capturedUrl.includes('/issues/42/comments?per_page=100&since='),
+      `去重前应拉评论列表（只取当日起），实际：${commentsRes.capturedUrl}`)
     assert.ok(cleanupRes.capturedUrl.includes('state=open'), '清理候选必须单独查 open 列表（不复用 state=all 的 100 条窗口）')
     assert.deepStrictEqual(calls.map(c => c.method), ['GET', 'GET', 'GET'], '跳过分支不得产生任何写请求')
   })
@@ -2050,7 +2051,10 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     const postBody = JSON.parse(createRes.capturedOpts.body)
     assert.strictEqual(postBody.title, TRACKER_ISSUE_TITLE, '首建的就是固定跟踪 issue（标题不带日期）')
     assert.ok(!DAILY_REPORT_TITLE_RE.test(postBody.title), '跟踪标题不得匹配按日日报正则（否则每天被清理逻辑关掉）')
-    assert.strictEqual(postBody.body, 'test body content', '建跟踪 issue 时 body 就是当日日报')
+    // 初始 body 必须带同日标记：它承载「第一天」的日报，同日第二次运行时还没有评论，只能靠 body 认出来。
+    assert.ok(postBody.body.startsWith(`<!-- mutation-daily:${shanghaiDate()} -->`),
+      `首建 body 必须带同日标记，实际：${String(postBody.body).slice(0, 60)}`)
+    assert.ok(postBody.body.endsWith('test body content'), '标记之后必须原样跟当日日报正文')
     // #30 修复：验证列表查询和创建请求的 method/per_page/creator 参数（篡改存活）
     // 列表查询：GET 方法，URL 含 per_page=100 和 creator=github-actions[bot]
     assert.ok(listRes.capturedOpts.method === undefined || listRes.capturedOpts.method === 'GET', '列表查询应为 GET（默认或显式）')
@@ -2061,6 +2065,24 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     assert.strictEqual(createRes.capturedOpts.method, 'POST', '创建 Issue 应为 POST 方法')
     assert.strictEqual(createRes.capturedOpts.headers['Content-Type'], 'application/json', '创建请求 Content-Type 应为 application/json')
     assert.ok(createRes.capturedOpts.headers.Authorization.includes('test-token'), '创建请求应携带 Authorization token')
+  })
+
+  // 第一天就重跑（CodeRabbit 评审）：跟踪 issue 是当天新建的，日报在**初始 body** 里、还没有任何评论。
+  // 去重必须先看 body——只看评论会再追一条重复日报。
+  await acheck('postIssue 首建当天重跑：body 已有当日标记 ⇒ 跳过且不查评论、不写任何东西', async () => {
+    process.env.GITHUB_TOKEN = 'test-token'
+    process.env.GITHUB_REPOSITORY = 'owner/repo'
+    const today = shanghaiDate()
+    const tracker = trackerOf({ number: 61, body: withDailyMarker('## 今天的日报', today) })
+    const listRes = makeRes(true, 200, [tracker])
+    const cleanupRes = makeRes(true, 200, [])
+    const calls = mockFetch([listRes, cleanupRes])
+    const result = await postIssue('## 今天的日报（重跑）')
+    assert.strictEqual(result.skipped, true, 'body 里的当日标记必须被认出来（否则每天多一条评论）')
+    assert.strictEqual(result.number, 61)
+    assert.deepStrictEqual(calls.map(c => c.method), ['GET', 'GET'],
+      `跳过分支只允许两次只读请求（列表 + 清理候选），绝不能去查评论或写评论，实际：${JSON.stringify(calls)}`)
+    assert.ok(!calls.some(c => c.url.includes('/comments')), 'body 命中时不必再查评论（省一次请求）')
   })
 
   await acheck('postIssue 跟踪 issue 存在时追加评论（不新建 issue）', async () => {
@@ -2172,8 +2194,12 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
 
   // hasCommentedToday 的三态（命中 / 未命中 / 失败）单独测：它是去重的唯一判据，失败必须返回 false
   // （「当作没发过」）——返回 true 会把当天日报直接吞掉。
+  // 2026-11-01（CodeRabbit 评审）：GitHub 的评论列表**默认按 id 升序**，只用 per_page=100 拿到的是最旧
+  // 100 条 ⇒ 这里必须断言 `since` 恰好是「当日 00:00（上海）换算的 UTC 时刻」，而不是「某次请求带了 since」。
   await acheck('hasCommentedToday：命中 / 未命中 / 查询失败三态，失败按「没发过」处理且只 warn 一次', async () => {
     const today = shanghaiDate()
+    const sinceIso = new Date(`${today}T00:00:00+08:00`).toISOString()
+    assert.ok(sinceIso.endsWith('T16:00:00.000Z'), `上海日 00:00 对应的 UTC 必须是前一日 16:00Z，实际：${sinceIso}`)
     let seenUrl = ''
     let seenOpts = null
     const okRes = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => '' })
@@ -2185,24 +2211,39 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
       fetchImpl: async (url, opts) => { seenUrl = url; seenOpts = opts; return okRes([{ body: `<!-- mutation-daily:${today} -->` }]) }
     })
     assert.strictEqual(hit, true)
-    assert.ok(seenUrl.endsWith('/repos/o/r/issues/7/comments?per_page=100'), `只拉最近一页评论，实际：${seenUrl}`)
+    assert.ok(seenUrl.endsWith(`/repos/o/r/issues/7/comments?per_page=100&since=${encodeURIComponent(sinceIso)}`),
+      `评论查询必须只取当日起（since=当日 00:00 上海），实际：${seenUrl}`)
+    assert.ok(!seenUrl.includes('&page='), '不得靠翻页拿最新评论（默认升序 + 翻页会在 100 条后失效）')
     assert.ok(seenOpts.signal instanceof AbortSignal, '评论查询必须带超时')
     const miss = await hasCommentedToday({ repo: 'o/r', number: 7, token: 't', today, fetchImpl: async () => okRes([{ body: '无标记' }]) })
     assert.strictEqual(miss, false)
     const notOk = await hasCommentedToday({ repo: 'o/r', number: 7, token: 't', today, fetchImpl: async () => ({ ok: false, status: 403, json: async () => ({}), text: async () => '' }) })
     assert.strictEqual(notOk, false, '非 2xx 必须按「没发过」处理（fail-open）')
+    // today 形态非法（不是真实日期）⇒ toISOString 抛 RangeError，必须落进既有的 fail-open，不得炸穿调用方
     const warns = []
     const origWarn = console.warn
     console.warn = (...args) => { warns.push(args.join(' ')) }
     let failed
+    let badDay
+    let badDayCalls = 0
     try {
       failed = await hasCommentedToday({ repo: 'o/r', number: 7, token: 't', today, fetchImpl: async () => { throw new Error('boom-net') } })
+      badDay = await hasCommentedToday({
+        repo: 'o/r',
+        number: 7,
+        token: 't',
+        today: '2026-13-45',
+        fetchImpl: async () => { badDayCalls++; return okRes([]) }
+      })
     } finally {
       console.warn = origWarn
     }
     assert.strictEqual(failed, false, '异常必须按「没发过」处理（fail-open）')
-    assert.strictEqual(warns.length, 1, `应恰好 warn 一次，实际 ${warns.length}`)
+    assert.strictEqual(badDay, false, '非法 today 也必须按「没发过」处理（fail-open）')
+    assert.strictEqual(badDayCalls, 0, '非法 today 应在发请求之前就被 RangeError 拦下（不带坏参数打远端）')
+    assert.strictEqual(warns.length, 2, `应恰好 warn 两次，实际 ${warns.length}：${JSON.stringify(warns)}`)
     assert.ok(warns[0].includes('boom-net'), `warn 应带根因，实际：${warns[0]}`)
+    assert.ok(!/[\r\n]/.test(warns[1]), 'warn 不得含换行')
   })
 
   await acheck('postIssue 列表查询失败时跳过去重直接创建', async () => {
@@ -2872,7 +2913,7 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     assert.strictEqual(findTrackerIssue(null), null, '非数组入参返回 null（不抛）')
   })
 
-  check('withDailyMarker / hasDailyComment：标记只在当日命中，昨天的不算', () => {
+  check('withDailyMarker / hasDailyMarker / hasDailyComment：标记只在当日命中，昨天的不算', () => {
     const today = shanghaiDate()
     const yesterday = dayBefore(1)
     const marked = withDailyMarker('## 日报正文', today)
@@ -2883,6 +2924,11 @@ check('render 大数量截断：Top10 文件 + Top15 变异类型 + 30+ 存活�
     assert.strictEqual(hasDailyComment([{ body: '## 没有标记' }], today), false)
     assert.strictEqual(hasDailyComment([{ body: null }, {}], today), false, '脏条目不抛错')
     assert.strictEqual(hasDailyComment(null, today), false, '非数组入参返回 false')
+    // 跟踪 issue 的初始 body 与评论正文共用同一判据（第一天只有 body、没有评论）
+    assert.strictEqual(hasDailyMarker(marked, today), true)
+    assert.strictEqual(hasDailyMarker(marked, yesterday), false)
+    assert.strictEqual(hasDailyMarker(null, today), false, 'issue 列表里 body 缺失时返回 false，不抛')
+    assert.strictEqual(hasDailyMarker(undefined, today), false)
   })
 
   check('findClosableDailyIssues：只认「严格标题 + open + bot + 真实日期 + 早于今天」', () => {

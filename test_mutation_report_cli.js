@@ -1263,6 +1263,7 @@ globalThis.fetch = async function (url, opts) {
     assert.deepStrictEqual(calls.map(c => c.method), ['GET', 'PATCH', 'GET', 'POST', 'GET', 'PATCH'],
       `调用序列必须是「重开在前、追评在后」，实际：${calls.map(c => c.method + ' ' + c.url).join(' | ')}`)
     assert.ok(by('GET', 'state=all').length === 1, '跟踪 issue 只查一次')
+    assert.ok(by('GET', '/comments')[0].url.includes('since='), '评论查询必须带 since（默认升序，只翻页会在 100 条后静默失效）')
     assert.strictEqual(by('POST').length, 1, '只允许一次写请求：追加评论（不得再新建 issue）')
     const commentPost = by('POST')[0]
     assert.ok(commentPost.url.endsWith('/issues/950/comments'), `日报必须作为评论进跟踪 issue，实际：${commentPost.url}`)

@@ -1738,25 +1738,40 @@ function withDailyMarker (body, today) {
   return `${DAILY_COMMENT_MARKER_PREFIX}${today} -->\n\n${body}`
 }
 
-// 纯函数：最近一页评论里是否已有当天的日报。按标记判等，不按正文长度/标题猜（日报正文每天几乎一样，
+// 纯函数：这段文本里是否有当天的日报标记。评论正文与跟踪 issue 的**初始 body** 都走同一判据
+// （第一天没有评论，日报就在建 issue 的正文里——只查评论会漏掉它，同日第二次运行会再追一条）。
+function hasDailyMarker (text, today) {
+  if (typeof text !== 'string') return false
+  return text.includes(`${DAILY_COMMENT_MARKER_PREFIX}${today} -->`)
+}
+
+// 纯函数：评论列表里是否已有当天的日报。按标记判等，不按正文长度/标题猜（日报正文每天几乎一样，
 // 靠「正文含日期」之类会误判）。入参不是数组时返回 false。
 function hasDailyComment (comments, today) {
   if (!Array.isArray(comments)) return false
-  const marker = `${DAILY_COMMENT_MARKER_PREFIX}${today} -->`
-  return comments.some((c) => c && typeof c.body === 'string' && c.body.includes(marker))
+  return comments.some((c) => c && hasDailyMarker(c.body, today))
 }
 
 /**
- * 查跟踪 issue 最近 100 条评论，判断当天是否已追加过（fail-open：任何失败只 warn 并返回 false）。
- * 为什么 fail-open 是硬约束：去重只是「别刷两遍」，而日报发不出去是「今天什么都没看到」——后者严重得多。
- * 失败形态与非 2xx 一律走 warn（S5145：远端响应体不打印，只记状态码），然后照常追加。
+ * 查跟踪 issue **当日起**的评论，判断当天是否已追加过（fail-open：任何失败只 warn 并返回 false）。
+ *
+ * 为什么必须带 `since`：GitHub 的「List issue comments」**默认按 id 升序**（最旧在前），只有
+ * `per_page=100` 时拿到的是**最旧**的 100 条——累计超过 100 条之后，当天的标记永远落在第一页之外，
+ * 去重会**静默失效**（每天两次定时（UTC 16:17 主跑 / 04:17 补偿）属同一上海自然日，于是每天追两条）。
+ * 故把结果压到「当日起」：`since` = 当日 00:00（上海）换算成的 UTC 时刻。
+ * （实测：`?per_page=100` 对 6 条评论返回 id 升序；`&since=<未来>` 返回 0 条、`&since=1970…` 返回 6 条。）
+ *
+ * fail-open 是硬约束：去重只是「别刷两遍」，而日报发不出去是「今天什么都没看到」——后者严重得多。
+ * 失败形态与非 2xx 一律走 warn（S5145：远端响应体不打印，只记状态码），然后照常追加；
+ * `today` 形态非法时 `toISOString()` 抛 RangeError，同样落进这个 catch。
  * @param {{repo: string, number: number, token: string, today: string, fetchImpl?: Function}} opts
  * @returns {Promise<boolean>}
  */
 async function hasCommentedToday (opts) {
   const doFetch = opts.fetchImpl || fetch
   try {
-    const res = await doFetch(`https://api.github.com/repos/${opts.repo}/issues/${opts.number}/comments?per_page=100`, {
+    const since = new Date(`${opts.today}T00:00:00+08:00`).toISOString()
+    const res = await doFetch(`https://api.github.com/repos/${opts.repo}/issues/${opts.number}/comments?per_page=100&since=${encodeURIComponent(since)}`, {
       headers: ghHeaders(opts.token),
       signal: AbortSignal.timeout(LIST_QUERY_TIMEOUT_MS)
     })
@@ -1777,7 +1792,8 @@ async function hasCommentedToday (opts) {
  *
  * 旧行为：每天按标题 `🧬 变异测试日报 <上海日期>` 新建一条 issue，发完再关掉更早的 open 日报
  * ⇒ 一年堆 300+ 条。现在只有一条 issue：不存在则创建、存在则追加评论、被关掉则先重开再追加；
- * 同日重复运行靠评论正文里的 `<!-- mutation-daily:YYYY-MM-DD -->` 标记去重。
+ * 同日重复运行靠 `<!-- mutation-daily:YYYY-MM-DD -->` 标记去重：标记写进每条评论的正文，也写进跟踪
+ * issue 的初始 body（第一天只有 body、没有评论），查评论时按 `since=当日 00:00（上海）` 只取当日起。
  *
  * 失败口径（沿用 F7，两类必须分开）：
  *   * **只读链路**（列表查询 / 评论查询）任何失败都只 warn 后照常发布——查不出去重信息不是吞掉当天
@@ -1838,8 +1854,9 @@ async function postIssue (body) {
         console.warn(`⚠️  跟踪 issue 重新打开失败（${sanitizeLogText(e)}），仍尝试追加当日日报`)
       }
     }
-    // 同日去重：只看最近一页评论（日报一天一条，100 条足够）。查询失败一律 fail-open。
-    if (await hasCommentedToday({ repo, number, token, today })) {
+    // 同日去重：**先看跟踪 issue 的初始 body**（当天新建的那条，日报正文就在 body 里），再看当日起的评论。
+    // 只查评论会漏掉「当天建的跟踪 issue」——同日第二次运行会再追加一条重复日报。查询失败一律 fail-open。
+    if (hasDailyMarker(tracker.body, today) || await hasCommentedToday({ repo, number, token, today })) {
       console.log('⏭️  当日日报已追加到跟踪 issue，跳过重复发布')
       await pruneOldDailyIssuesBestEffort({ token, repo, today })
       return { number, html_url: tracker.html_url, skipped: true }
@@ -1864,10 +1881,13 @@ async function postIssue (body) {
   // 两种落点：① 列表查询失败（lookupFailed）⇒ 退化回旧形态，按日期标题新建一条，下次运行的清理逻辑会收掉；
   // ② 查询成功但没有跟踪 issue ⇒ 现在就用当日日报把它建出来（body 即当日日报）。
   const title = lookupFailed ? `🧬 变异测试日报 ${today}` : TRACKER_ISSUE_TITLE
+  // 跟踪 issue 的初始 body 必须带同日标记：它就是「第一天」的日报，同日的第二次运行要靠它认出来
+  // （那时还没有任何评论）。降级形态的按日 issue **不带**标记——没有任何后续逻辑会读它的 body。
+  const createBody = lookupFailed ? body : withDailyMarker(body, today)
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ title, body }),
+    body: JSON.stringify({ title, body: createBody }),
     // C10-024：本请求自己的超时信号（不复用列表查询那一个：两者各自计时）
     signal: AbortSignal.timeout(ISSUE_POST_TIMEOUT_MS)
   })
@@ -2074,6 +2094,7 @@ module.exports = {
   DAILY_COMMENT_MARKER_PREFIX,
   findTrackerIssue,
   withDailyMarker,
+  hasDailyMarker,
   hasDailyComment,
   hasCommentedToday,
   // 历史日报清理（卫生项）：纯谓词 + 查询/关闭两段，均导出以便 mock fetch 测「关闭成功 / 关闭失败 /
