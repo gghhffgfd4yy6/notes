@@ -1175,3 +1175,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **改动**：`FILTER_FIELD_MAX_LEN` 4000 → 16000（约 4000 个三字词/字段）；`FILTER_RULES_MAX_BYTES` 64 KiB → 256 KiB；控制台请求体 `FILTER_BODY_MAX_BYTES` 同步 256 KiB、草稿单字段 16000；UI 413 文案改为「超过 256 KiB 上限」。
 - **口径不变**：整份字节预算（落盘形状量字节）仍是硬闸——11 个字段各填满 16000 字节约 528 KB，会被 `too_large` 明确拒绝，不会出现「保存成功、下一轮整份丢弃」。
 - **测试**：`test_filter_store.js` 的 C9-012 两例与超长边界按新上限重写（256 KiB−32 到 256 KiB 的区间仍可读、>256 KiB 判损坏、16000 通过 / 16001 拒绝）；`test_console.js` 的 413 用例改为 >256 KiB。
+
+## v3.395 — 过滤诊断明细不再写整份规则文本（截断 + 指纹）
+
+- **问题**：`filter-diagnostics.ndjson` 每条 item 的 `reason.rule` 对「按行写的简单字段」存的是**整段配置**（实测 3374 字符 / 688 行），单条记录约 7 KB；日志 1 MiB 上限只装得下约 35 分钟，且 1 MiB 截尾会把写在第一行的 run 汇总切掉，`status` 直接判不可读。
+- **改动**：在序列化边界（`xbk_app.js` 的 `diagnosticItem`）折叠 `rule`——≤120 字原样透传（`###` 命中行、预览语义、既有断言都不变）；超长则截到 120 字并附 `ruleLen` / `ruleLines` / `ruleHash`（sha1 前 8 位），需要原文时用指纹回查 `filter-rules.applied.json` 的 `filter` 字段。`protections` / `skipped` 与「只看它」的 `zkt_gjc` 原因同样收口。
+- **不动的地方**：`xbk_filter.js` 的 `reason.rule` 语义保持原样（filter 层契约与 5 条断言不变），`_writeFilterDiagnostics` 的逐条透传也不变。
+- **可回查**：额外带 `ruleRev`（生效 revision）与 `fieldHash`（整段字段的 sha1 前 8 位），`###` 命中行被截断时也能按 revision 找回字段原文。
+- **单轮预算**：明细总字节上限 192 KiB（新增 `pushDiagnostic` 统一入队口），超出部分记入 `detailsDropped`，保证「run 汇总 + 明细」不会写满 1 MiB 日志后把汇总挤掉（旧实现里 1000 条 × 长规则足够触发）。
+- **文档**：`SYSTEM_CONTRACT.md` 补明细记录形状与回查方式。
+- **测试**：`test_app.js` 新增两例——「超长规则折叠为截断+指纹」（≤120 字、长度/行数/指纹正确、不含原文、单条 <1 KB）与「单轮明细字节预算」（700 条命中触发预算、run 汇总仍在、`detailsDropped.filtered > 0`）。

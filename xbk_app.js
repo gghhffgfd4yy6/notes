@@ -1523,6 +1523,41 @@ function createApp ({
           const value = Utils.num(filterLogCfg && filterLogCfg.maxDetailsPerRun, 100)
           return Number.isInteger(value) && value > 0 ? Math.min(value, 1000) : 100
         })()
+        // v3.395：诊断明细不再写整份规则文本。`explainFilter` 的 reason.rule 对「### 多行规则」
+        // 是命中行（有价值，原样保留），但对按行写的简单字段是**整段配置**（实测 3374 字符/688 行），
+        // 一条 item 被放大到约 7 KB，1 MiB 日志窗口只够装约 35 分钟。这里在序列化边界折叠：
+        // 短规则原样透传（既有断言与预览语义不变）；超长规则截断并附长度/行数/两个指纹：
+        //   · ruleHash  —— 命中行（reason.rule）的 sha1 前 8 位；
+        //   · fieldHash —— 整个字段配置的 sha1 前 8 位，配合 ruleRev 回查 filter-rules.applied.json
+        //                  / .bak.<rev>.json 的 filter[configKey] 原文（### 命中行也定位得到）。
+        const DIAG_RULE_TEXT_MAX = 120
+        // 单轮明细总字节预算：保证「汇总 + 明细」不会写满 1 MiB 日志、把写在最前的 run 汇总挤掉
+        // （_writeRunLog 超限只保留尾部 512 KiB，旧实现里一轮 1000 条 × 长规则足够触发）。
+        const DIAG_BATCH_MAX_BYTES = 192 * 1024
+        const sha1Short = (text) => {
+          try { return crypto.createHash('sha1').update(text, 'utf8').digest('hex').slice(0, 8) } catch (e) { return '' }
+        }
+        // 行数按规则解析器认的分隔符统计（\r\n / \r / \n / <br>），并忽略结尾空行
+        const ruleLineCount = (text) => {
+          const parts = String(text).split(/\r\n|\r|\n|<br\s*\/?>/i)
+          while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
+          return parts.length
+        }
+        const thinReason = (value) => {
+          if (!value || typeof value !== 'object') return value
+          const raw = typeof value.rule === 'string' ? value.rule : (value.rule == null ? '' : String(value.rule))
+          const fieldText = active && active.filter && value.configKey ? String(active.filter[value.configKey] || '') : ''
+          const out = { ...value }
+          if (active && Number.isInteger(active.revision)) out.ruleRev = active.revision
+          if (raw.length <= DIAG_RULE_TEXT_MAX) return out
+          out.rule = Utils.truncateUtf16(raw, DIAG_RULE_TEXT_MAX)
+          out.ruleLen = raw.length
+          out.ruleLines = ruleLineCount(raw)
+          out.ruleHash = sha1Short(raw)
+          out.fieldHash = sha1Short(fieldText || raw)
+          return out
+        }
+        const thinReasonList = (list) => (Array.isArray(list) ? list.map(thinReason) : list)
         const diagnosticItem = (item, decision, explanation) => ({
           type: 'item',
           at: this._localStamp(),
@@ -1530,10 +1565,21 @@ function createApp ({
           id: Utils.safeText(Utils.safeGet(item, 'id'), ''),
           title: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'title'), ''), 200),
           category: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'catename'), ''), 100),
-          reason: explanation.reason,
-          protections: explanation.protections,
-          skipped: explanation.skipped
+          reason: thinReason(explanation.reason),
+          protections: thinReasonList(explanation.protections),
+          skipped: thinReasonList(explanation.skipped)
         })
+        let diagnosticBytes = 0
+        // 统一入队口：条数上限 + 单轮字节预算，超限返回 false 交给调用方记 detailsDropped
+        const pushDiagnostic = (item, decision, explanation) => {
+          const record = diagnosticItem(item, decision, explanation)
+          let size = 0
+          try { size = Buffer.byteLength(JSON.stringify(record), 'utf8') } catch (e) { size = 0 }
+          if (diagnosticBytes + size > DIAG_BATCH_MAX_BYTES) return false
+          diagnosticBytes += size
+          filterDiagnostics.push(record)
+          return true
+        }
         let badElementCount = 0 // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
         let skippedNoIdentity = 0 // APP-04：isValidItem 通过但 getMessageIdentity 判无效的条目（丢弃正确，但必须可对账）
         let regTimePresent = 0 // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
@@ -1578,16 +1624,17 @@ function createApp ({
           if (explanation.passed) {
             items.push(item)
             if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
-              if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'passed', explanation))
-              else { diagnosticDrops.passed++; passedDropItems.add(item) } // ⑤ 若随后拒掉，按最终决策改记 filtered
+              if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'passed', explanation))) {
+                diagnosticDrops.passed++
+                passedDropItems.add(item) // ⑤ 若随后拒掉，按最终决策改记 filtered
+              }
             }
           } else {
             filteredCount++
             Utils.safeSet(item, '_f', true) // v3.159：过滤写入标记（规则变更时失效）
             const reasonKey = `${explanation.reason.stage}.${explanation.reason.kind}.${explanation.reason.configKey}`
             filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
-            if (filterDiagnostics.length < maxDiagnosticDetails) filterDiagnostics.push(diagnosticItem(item, 'filtered', explanation))
-            else diagnosticDrops.filtered++
+            if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'filtered', explanation))) diagnosticDrops.filtered++
           }
           newMessages.push(item)
         }
@@ -1647,11 +1694,16 @@ function createApp ({
                   filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
                   if (filterDiagnostics.length < maxDiagnosticDetails) {
                     const explanation = filterExplanations.get(it) || { protections: [], skipped: [] }
-                    filterDiagnostics.push(diagnosticItem(it, 'filtered', {
-                      reason: whitelistReason,
-                      protections: explanation.protections,
-                      skipped: explanation.skipped
-                    }))
+                    const pushed = pushDiagnostic(it, 'filtered', {
+                      reason: thinReason(whitelistReason),
+                      protections: thinReasonList(explanation.protections),
+                      skipped: thinReasonList(explanation.skipped)
+                    })
+                    if (!pushed) {
+                      if (passedDropItems.delete(it)) diagnosticDrops.passed--
+                      diagnosticDrops.filtered++
+                      continue
+                    }
                   } else {
                     // C1-029：该条若在④已按「通过项被挤掉」记过，这里改记 filtered——最终决策是被
                     // 「只看它」拒掉，两个计数器各记一次会把被挤掉条数算成条目数的两倍。

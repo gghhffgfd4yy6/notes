@@ -517,6 +517,63 @@ console.log('========================================\n');
     }
   })
 
+  await test('过滤诊断：超长规则折叠为截断+指纹，不把整份配置写进明细', async () => {
+    reset()
+    setPushUrl('t03_filter_diagnostics_thin')
+    const crypto = require('node:crypto')
+    const logPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    // 60 行规则 ≈ 700 字符，超过 120 字折叠阈值：命中后 reason.rule 必须是截断值 + 指纹
+    const longRule = Array.from({ length: 60 }, (_, i) => `测试屏蔽词${i}`).join('\n')
+    try {
+      Config.filter.pingbibiaoti = longRule
+      Config.diagnostics.filterLog.includePassed = false
+      fakeData = [makeItem({ id: 'diag-long', title: '测试屏蔽词12 好价' })]
+      await xbk.run()
+      const records = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      const blocked = records.find(record => record.type === 'item' && record.id === 'diag-long')
+      ok(blocked && blocked.decision === 'filtered', '长规则命中应写入明细')
+      ok(blocked.reason.configKey === 'pingbibiaoti', `命中字段错误: ${JSON.stringify(blocked.reason)}`)
+      ok(blocked.reason.rule.length <= 120, `明细中的规则应被截断，实际 ${blocked.reason.rule.length} 字`)
+      ok(blocked.reason.ruleLen === longRule.length, `应记录原始长度 ${longRule.length}，实际 ${blocked.reason.ruleLen}`)
+      ok(blocked.reason.ruleLines === 60, `应记录原始行数 60，实际 ${blocked.reason.ruleLines}`)
+      const expectedHash = crypto.createHash('sha1').update(longRule, 'utf8').digest('hex').slice(0, 8)
+      ok(blocked.reason.ruleHash === expectedHash, `规则指纹不符: ${blocked.reason.ruleHash} != ${expectedHash}`)
+      ok(!JSON.stringify(blocked).includes(longRule), '明细不得包含整份规则原文')
+      ok(Buffer.byteLength(JSON.stringify(blocked), 'utf8') < 1024, '单条明细应远小于 1KB')
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
+  await test('过滤诊断：单轮明细有字节预算，明细不得把 run 汇总挤出日志', async () => {
+    reset()
+    setPushUrl('t03_filter_diagnostics_budget')
+    const logPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+    try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    const longRule = Array.from({ length: 60 }, (_, i) => `预算屏蔽词${i}`).join('\n')
+    try {
+      Config.filter.pingbibiaoti = longRule
+      Config.diagnostics.filterLog.includePassed = false
+      Config.diagnostics.filterLog.maxDetailsPerRun = 1000
+      // 700 条命中：按每条 400~500 字节估算远超 192 KiB 预算，必须触发 detailsDropped
+      fakeData = Array.from({ length: 700 }, (_, i) => makeItem({ id: `budget-${i}`, title: `预算屏蔽词12 好价 ${i}` }))
+      await xbk.run()
+      const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n')
+      const records = lines.map(line => JSON.parse(line))
+      const run = records.find(record => record.type === 'run')
+      ok(run, 'run 汇总必须存在（不得被明细挤出日志）')
+      const items = records.filter(record => record.type === 'item')
+      const bytes = lines.filter(line => line.includes('"type":"item"')).reduce((sum, line) => sum + Buffer.byteLength(line, 'utf8'), 0)
+      ok(bytes <= 192 * 1024, `单轮明细字节 ${bytes} 超预算`)
+      ok(items.length < 700, `应触发字节预算，实际写入 ${items.length} 条`)
+      ok(run.detailCount === items.length, `detailCount 应与实际明细一致: ${run.detailCount} != ${items.length}`)
+      ok(run.detailsDropped.filtered > 0, `预算挤掉必须留痕: ${JSON.stringify(run.detailsDropped)}`)
+    } finally {
+      try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
+    }
+  })
+
   await test('dry-run：接口失败时不发送告警通知', async () => {
     reset()
     setPushUrl('t03a_dry_run_fetch_error')
