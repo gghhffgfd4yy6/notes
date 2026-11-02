@@ -416,8 +416,8 @@ check('_reportToday 用 Asia/Shanghai 日界，UTC 20:00 已跨到次日', () =>
 const CACHE_DIR = '/vcache'
 const LOG_PATH = path.join(CACHE_DIR, 'run.log')
 const LOCK_PATH = LOG_PATH + '.lock'
-const KEEP = 512 * 1024
-const LIMIT = 1024 * 1024
+const KEEP = 10 * 1024 * 1024
+const LIMIT = 20 * 1024 * 1024
 
 function makeLogFs (over = {}) {
   const rec = { append: [], open: [], write: [], read: [], close: [], unlink: [], stat: [] }
@@ -780,11 +780,12 @@ check('_writeFilterDiagnostics 一批 13 条（含含 " ERROR " 的记录）⇒ 
   assert.deepStrictEqual(JSON.parse(lines[2]), records[2], '含 " ERROR " 的记录必须原样整条写入（不得截掉 errMsg 之后的 JSON 结构）')
 })
 
-// ----- _writeRunLog：超 1MiB 截尾到 512KiB 且按换行对齐 -----
-check('_writeRunLog size === 1MiB ⇒ 不截尾（严格大于）', () => {
+// ----- _writeRunLog：超 20MiB 截尾到 10MiB 且按换行对齐 -----
+check('_writeRunLog size === LIMIT ⇒ 不截尾（严格大于），但必须照常追加', () => {
   const rec = makeLogFs({ size: LIMIT, tail: 'IGNORED' })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'l\n', 'utf8']], '边界大小不得静默丢行')
   assert.strictEqual(rec.rec.read.length, 0)
   assert.strictEqual(cap.length, 0)
 })
@@ -918,6 +919,39 @@ check('_warnLowDisk 默认阈值 50MiB（Config.storage 缺失）：上下两侧
 check('_diskMinFree 阈值来自字符串配置（Utils.num 口径）', () => {
   const { app } = makeLogApp({ Config: { storage: { minFreeBytes: '1048576' } } })
   assert.strictEqual(app._diskMinFree({ storage: { minFreeBytes: '1048576' } }), 1048576)
+})
+
+// ----- _writeRunLog：磁盘余量闸 / 截尾失败退避（v3.396 审查加固）-----
+check('_writeRunLog 磁盘余量 < minFreeBytes ⇒ 不追加，整行只回显 stdout', () => {
+  const rec = makeLogFs({ size: 0 })
+  const { app } = makeLogApp({ rec, Config: { storage: { minFreeBytes: 50 * 1024 * 1024 } }, Utils: { diskSpace: () => ({ freeBytes: 1024 }) } })
+  const r = withCapture('log', () => app._writeRunLog('LOWDISK\n'))
+  assert.deepStrictEqual(rec.rec.append, [], '余量不足时不得追加日志')
+  assert.deepStrictEqual(r.msgs, ['LOWDISK'], '整行回显 stdout，行不丢')
+})
+
+check('_writeRunLog 磁盘余量恰好等于 minFreeBytes ⇒ 仍可追加（>= 口径）', () => {
+  const minFree = 50 * 1024 * 1024
+  const rec = makeLogFs({ size: 0 })
+  const { app } = makeLogApp({ rec, Config: { storage: { minFreeBytes: minFree } }, Utils: { diskSpace: () => ({ freeBytes: minFree }) } })
+  app._writeRunLog('OK\n')
+  assert.strictEqual(rec.rec.append.length, 1)
+})
+
+check('_writeRunLog 截尾失败 ⇒ 60s 内不再追加，窗口过后恢复', () => {
+  const t0 = 1700000000000
+  const rec = makeLogFs({ size: 2 * LIMIT, tail: 'X'.repeat(KEEP) })
+  const { app } = makeLogApp({ rec })
+  app._writeTextAtomic = () => false
+  withFixedNow(t0, () => app._writeRunLog('A\n'))
+  const afterFirst = rec.rec.append.length
+  assert.ok(afterFirst >= 1, '首行先追加后才尝试截尾')
+  const blocked = withCapture('log', () => withFixedNow(t0 + 1000, () => app._writeRunLog('B\n')))
+  assert.strictEqual(rec.rec.append.length, afterFirst, '退避窗口内不得继续追加')
+  assert.deepStrictEqual(blocked.msgs, ['B'], '被挡下的行回显 stdout')
+  const resumed = withFixedNow(t0 + 61 * 1000, () => app._writeRunLog('C\n'))
+  assert.strictEqual(rec.rec.append.length, afterFirst + 1, '窗口过后恢复追加')
+  assert.strictEqual(resumed, undefined)
 })
 
 // ----- _persistReportState：写成功才更新内存快照；失败保留内存 + 低磁盘告警 -----
@@ -3810,7 +3844,8 @@ check('C1-017 推送循环共用口径：成功日志文案与 pushInterval 解�
 // 所以次级上限必须高于它；这里验证超过硬上限后不再写盘、行回显 stdout、且仍不做无锁读改写。
 check('C1-011 fail-open 且超过次级上限 ⇒ 不再写盘、行回显 stdout、不做无锁读改写', () => {
   const e = new Error('x'); e.code = 'EACCES'
-  const rec = makeLogFs({ openSync: (p, flag) => { if (flag === 'wx') throw e; return 8 }, size: 9 * LIMIT })
+  // 5×LIMIT：高于 4× 硬上限、低于旧 8×——写成 8× 时这里会误放行，能真正守住新阈值。
+  const rec = makeLogFs({ openSync: (p, flag) => { if (flag === 'wx') throw e; return 8 }, size: 5 * LIMIT })
   const { app } = makeLogApp({ rec })
   const logs = []
   const origLog = console.log
@@ -3825,6 +3860,14 @@ check('C1-011 fail-open 且超过次级上限 ⇒ 不再写盘、行回显 stdou
   assert.strictEqual(rec.rec.read.length, 0, '无锁路径不得做读改写（会冲掉并发追加的行）')
   assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx'], '不得在无锁时开 r+')
   assert.strictEqual(rec.rec.unlink.length, 0)
+})
+
+check('C1-011 fail-open 恰好 4×LIMIT ⇒ 仍追加（硬上限是严格大于）', () => {
+  const e = new Error('x'); e.code = 'EACCES'
+  const rec = makeLogFs({ openSync: (p, flag) => { if (flag === 'wx') throw e; return 8 }, size: 4 * LIMIT })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('edge\n')
+  assert.deepStrictEqual(rec.rec.append.map(a => a[1]), ['edge\n'], '恰好等于硬上限不得丢行')
 })
 
 check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁内截尾（8×1MiB 上限不得误伤）', () => {

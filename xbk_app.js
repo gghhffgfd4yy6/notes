@@ -224,6 +224,12 @@ function createApp ({
           console.error(`拒绝写入非普通运行日志文件 ${logPath}`)
           return
         }
+        // v3.396 审查加固：截尾失败（临时文件写不进/rename 失败，多见于磁盘将满）后 60s 内不再追加，
+        // 只回显 stdout——否则每次调用都「先追加、再截尾失败」，超限日志会继续长到把盘吃光。
+        if (this._logRotateBackoffUntil && Date.now() < this._logRotateBackoffUntil) {
+          console.log(String(line).replace(/\n$/, ''))
+          return
+        }
         const lockPath = logPath + '.lock'
         // null 哨兵（与 _updateChannelHealth 同口径）：-1 这类数值哨兵在变异测试里会被 UnaryOperator
         // 改成 +1，release 分支把 1 当锁 fd 去 close，直接关掉 stdout、进程崩成 RuntimeError。
@@ -252,8 +258,25 @@ function createApp ({
           // 时锁永远拿不到，run.log 无界增长，能占满缓存盘。这里给无锁路径一个硬上限
           // （8×1MiB）：超过后不再写盘、整行回显 stdout（青龙任务日志仍可见，行不丢）。
           // 真正的截尾仍只在锁内做——无锁读改写会冲掉并发追加的行，那条边界不放宽。
-          const LIMIT = 1024 * 1024
-          const FAIL_OPEN_HARD_LIMIT = 8 * LIMIT
+          // v3.396 审查加固：日志不得侵占缓存/状态所需空间。余量低于 minFreeBytes 时整行只回显
+          // stdout（青龙任务日志仍可见），不追加——fail-open 路径同样受这道闸约束，否则无锁写盘
+          // 可能把缓存写不进去，导致已推送消息重复发送（拿不到 _f 标记）。
+          const logMinFree = this._diskMinFree(Config)
+          if (logMinFree !== null) {
+            const disk = Utils.diskSpace(this._cacheDir())
+            if (disk && Number.isFinite(disk.freeBytes) && disk.freeBytes < logMinFree) {
+              console.log(out.endsWith('\n') ? out.slice(0, -1) : out)
+              return
+            }
+          }
+          // v3.396：诊断日志单条已折叠到 ~700 字节，容量阈值同步放大到 20 MiB（截尾保留 10 MiB）。
+          // 实测截尾成本：10 MB 30ms / 20 MB 57ms / 40 MB 128ms（读尾部 KEEP + 原子写回），
+          // 而截尾每写满 KEEP 才发生一次，摊薄后可忽略；status 侧仍只读尾部 1 MiB（~8ms），
+          // 所以放大上限只增加保留时长，不影响响应速度。
+          const LIMIT = 20 * 1024 * 1024
+          // fail-open（拿不到锁）硬上限：旧实现是 8×LIMIT；LIMIT 放大后 8× 会到 160 MiB，
+          // 磁盘余量闸只有 50 MiB，改成 4×（80 MiB）仍然远大于正常窗口。
+          const FAIL_OPEN_HARD_LIMIT = 4 * LIMIT
           if (lockFd === null) {
             let oversized = false
             try { oversized = fs.statSync(logPath).size > FAIL_OPEN_HARD_LIMIT } catch (e) { oversized = false }
@@ -269,7 +292,7 @@ function createApp ({
           if (lockFd !== null && st.size > LIMIT) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
-            const KEEP = 512 * 1024
+            const KEEP = 10 * 1024 * 1024
             const fd = fs.openSync(logPath, 'r+')
             try {
               const readLen = Math.min(KEEP, st.size)
@@ -284,7 +307,13 @@ function createApp ({
               if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
               const nl = trimmed.indexOf('\n')
               // 原子写入（tmp + rename）覆盖原文件，避免中断留下半写日志
-              this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)
+              if (this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)) {
+                this._logRotateBackoffUntil = 0
+              } else {
+                // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）
+                this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+              }
             } finally {
               fs.closeSync(fd)
             }

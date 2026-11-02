@@ -110,7 +110,9 @@ const BACKUP_SCHEMA = 1
 // 导出上限必须与导入上限一致：源文件各有上限，但 JSON 字符串转义会膨胀（换行/引号至少 2×），
 // 128MiB 时「能导出却导不回来」。256MiB 覆盖 64MiB 推送记录 + 8MiB 墓碑 + 16MiB 日志的正常转义。
 const BACKUP_MAX_BYTES = 256 * 1024 * 1024
-const BACKUP_RUN_LOG_MAX_BYTES = 16 * 1024 * 1024
+// v3.396：run.log 截尾阈值已放大到 20 MiB，备份导出上限必须 ≥ 它，否则 16~20 MiB 区间
+// 会被判 tooLarge 并把 runLog 类别静默跳过（下载到的备份缺运行历史）。
+const BACKUP_RUN_LOG_MAX_BYTES = 24 * 1024 * 1024
 const BACKUP_CATEGORIES = ['messages', 'filter', 'settings', 'auto', 'runLog']
 // cache-health 的条数统计阈值（D2-S12）：这个端点在 HTTP 事件循环上同步整读 + parse，
 // 20MB/29704 条实测 232ms 阻塞。超过阈值就不整读——条数如实报 null + tooLarge（前端显示

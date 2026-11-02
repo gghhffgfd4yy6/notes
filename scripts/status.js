@@ -25,9 +25,10 @@ function result (status, value) {
 // （审查 Sourcery PR#227）。实现与 run.log 戳/日报日界同源（xbk_utils.shanghaiDayKey）。
 
 // 日志类部件（run.log / filter-diagnostics.ndjson）的读取上限与取尾部选项（审查 SS-03）。
-// 上限与写入侧 xbk_app 的截尾阈值同为 1 MiB，但写入侧在拿不到日志锁时是 fail-open（只追加、
-// 不截尾），文件可以真正超过 1 MiB；旧行为对超限文件一律返回 tooLarge，于是「最近一轮」「过滤诊断」
-// 整体变成「不可读（tooLarge）」。日志消费方只关心最近的记录，故超限时读尾部 1 MiB。
+// 读取窗口固定 1 MiB（约 1400 条折叠后的明细，读取+解析实测 ~8ms），与写入侧截尾阈值解耦：
+// 写入侧 v3.396 起截尾阈值 20 MiB / 保留 10 MiB，fail-open 时文件还可以更大；旧行为对超限文件
+// 一律返回 tooLarge，于是「最近一轮」「过滤诊断」整体变成「不可读（tooLarge）」。日志消费方只关心
+// 最近的记录，故超限时读尾部 1 MiB（run 汇总只有几百字节，1 MiB 足够覆盖很多轮）。
 const LOG_MAX_BYTES = 1024 * 1024
 const LOG_READ_OPTIONS = { tail: true }
 
