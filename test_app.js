@@ -901,14 +901,14 @@ console.log('========================================\n');
     setPushUrl('t06f_similar_dup')
     const simPath = path.join(CACHE_DIR, 'similar-t06f_similar_dup.json')
     try { fs.unlinkSync(simPath) } catch (e) {}
-    fakeData = [makeItem({ id: 601, title: '大家各个平台都看看 如果出现负数就跑吧' })]
+    fakeData = [makeItem({ id: 601, url: '/weibo/601.html', title: '大家各个平台都看看 如果出现负数就跑吧' })]
     await xbk.run()
     ok(pushCalls.length === 1, `首条应推送，实际 ${pushCalls.length}`)
-    fakeData = [makeItem({ id: 602, title: '大家各个平台看看 负数就跑' })]
+    fakeData = [makeItem({ id: 602, url: '/weibo/602.html', title: '大家各个平台看看 负数就跑' })]
     const s2 = await xbk.run()
     ok(s2.pushed === 0 && s2.total === 1, `近似重复不应再推，实际 ${JSON.stringify(s2)}`)
     // 不相关标题不受影响
-    fakeData = [makeItem({ id: 603, title: '伊利高钙奶粉礼盒装30元一罐 61元两罐' })]
+    fakeData = [makeItem({ id: 603, url: '/weibo/603.html', title: '伊利高钙奶粉礼盒装30元一罐 61元两罐' })]
     const s3 = await xbk.run()
     ok(s3.pushed === 1, `不相关标题应正常推送，实际 ${JSON.stringify(s3)}`)
     try { fs.unlinkSync(simPath) } catch (e) {}
@@ -921,7 +921,7 @@ console.log('========================================\n');
     fs.writeFileSync(simPath, JSON.stringify([
       { t: '大家各个平台都看看如果出现负数就跑吧', at: Date.now() - 11 * 60 * 1000 }
     ]))
-    fakeData = [makeItem({ id: 611, title: '大家各个平台看看 负数就跑' })]
+    fakeData = [makeItem({ id: 611, url: '/weibo/611.html', title: '大家各个平台看看 负数就跑' })]
     const s = await xbk.run()
     ok(s.pushed === 1, `过期窗口应恢复推送，实际 ${JSON.stringify(s)}`)
     try { fs.unlinkSync(simPath) } catch (e) {}

@@ -4183,12 +4183,19 @@ check('近似去重：空标题/非字符串一律不判重', () => {
 check('近似去重：时间窗裁剪与上限', () => {
   const now = 1_700_000_000_000
   let list = []
-  for (let i = 0; i < 5; i++) list = Similar.appendRecent(list, `测试标题第${i}号商品`, now - i * 60 * 1000)
+  for (let i = 0; i < 5; i++) list = Similar.appendRecent(list, `近似去重测试标题第${i}号商品描述`, now - i * 60 * 1000)
   assert.strictEqual(Similar.pruneRecent(list, now).length, 5)
   assert.strictEqual(Similar.pruneRecent(list, now + 11 * 60 * 1000).length, 0)
   let big = []
-  for (let i = 0; i < Similar.MAX_ENTRIES + 20; i++) big = Similar.appendRecent(big, `标题${i}`, now)
+  for (let i = 0; i < Similar.MAX_ENTRIES + 20; i++) big = Similar.appendRecent(big, `近似去重上限测试标题${i}号`, now)
   assert.strictEqual(big.length, Similar.MAX_ENTRIES)
+})
+
+check('近似去重：短标题不写入窗口（避免挤掉有效历史）', () => {
+  const now = 1_700_000_000_000
+  const list = Similar.appendRecent([], '京东神券100元', now)
+  assert.strictEqual(list.length, 0)
+  assert.strictEqual(Similar.appendRecent([], '这是一个足够长的测试标题内容', now).length, 1)
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====

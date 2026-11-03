@@ -1473,13 +1473,20 @@ function createApp ({
         const similarPath = path.join(this._cacheDir(), `similar-${cacheName}`)
         const similarNow = Date.now()
         let recentTitles = []
+        const batchTitles = []
+        let similarCorrupt = false
         try {
-          const loaded = this._readSafeState(similarPath)
+          const loaded = readSafeTextResult(similarPath, 256 * 1024)
           if (loaded && loaded.status === 'ok' && loaded.text) {
             const parsed = JSON.parse(loaded.text)
-            recentTitles = Similar.pruneRecent(Array.isArray(parsed) ? parsed : [], similarNow)
+            if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')
+            recentTitles = Similar.pruneRecent(parsed, similarNow)
+          } else if (loaded && loaded.status !== 'ok' && loaded.status !== 'missing') {
+            similarCorrupt = true
+            console.warn(`⚠️ 近似去重缓存不可用（${loaded.status}），本轮按空窗口处理：${similarPath}`)
           }
         } catch (e) {
+          similarCorrupt = true
           console.warn(`⚠️ 近似去重缓存读取/解析失败，按空窗口处理：${Utils.safeErrorText(e, '未知错误')}`)
         }
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
@@ -1668,12 +1675,14 @@ function createApp ({
           filterExplanations.set(item, explanation)
           if (explanation.passed) {
             // v3.397：与时间窗内已推标题近似重复 → 不再重复推送（仍进 newMessages，按已处理落缓存）
-            if (Similar.isSimilarTitle(Utils.safeText(Utils.safeGet(item, 'title'), ''), recentTitles, { now: similarNow })) {
+            const titleText = Utils.safeText(Utils.safeGet(item, 'title'), '')
+            if (Similar.isSimilarTitle(titleText, recentTitles.concat(batchTitles), { now: similarNow })) {
               similarCount++
               newMessages.push(item)
               continue
             }
             items.push(item)
+            batchTitles.push({ t: Similar.normalizeTitle(titleText), at: similarNow })
             if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
               if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'passed', explanation))) {
                 diagnosticDrops.passed++
@@ -2056,9 +2065,13 @@ function createApp ({
         // v3.397：把本轮推送成功的标题写进近似去重窗口（失败的标题不写，下次还能正常推）
         if (!dryRun) {
           try {
+            const savedAt = Date.now() // 写入时刻而非本轮开始时刻：单轮超过 10 分钟时不至于一落盘就过期
             let list = recentTitles
             for (const m of items) {
-              if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), similarNow)
+              if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt)
+            }
+            if (similarCorrupt) {
+              try { fs.renameSync(similarPath, `${similarPath}.corrupt-${Date.now()}`) } catch (e) { /* 文件可能已不在 */ }
             }
             if (list !== recentTitles) {
               recentTitles = list

@@ -51,7 +51,8 @@ function appendRecent (entries, title, now) {
   const at = Number.isFinite(now) ? now : Date.now()
   const key = normalizeTitle(title)
   const list = pruneRecent(entries, at)
-  if (!key) return list
+  // 短标题不会被 isSimilarTitle 比较，存进来只会挤占 300 条上限、把有用历史顶掉
+  if (!key || key.length < MIN_LEN) return list
   return list.concat([{ t: key, at }]).slice(-MAX_ENTRIES)
 }
 
