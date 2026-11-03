@@ -4191,6 +4191,15 @@ check('近似去重：时间窗裁剪与上限', () => {
   assert.strictEqual(big.length, Similar.MAX_ENTRIES)
 })
 
+check('近似去重：满减档位不同不判重（1000-150 vs 1000-120）', () => {
+  const now = 1_700_000_000_000
+  const recent = Similar.appendRecent([], '斯凯奇1000-120有价券 点击进入传送门', now)
+  assert.strictEqual(Similar.isSimilarTitle('1000-150有价券 点击进入传送门', recent, { now }), false)
+  // 档位相同仍按相似度判重
+  const same = Similar.appendRecent([], '斯凯奇1000-120有价券 点击进入传送门', now)
+  assert.strictEqual(Similar.isSimilarTitle('1000-120有价券 点击进入传送门 速领', same, { now }), true)
+})
+
 check('近似去重：短标题不写入窗口（避免挤掉有效历史）', () => {
   const now = 1_700_000_000_000
   const list = Similar.appendRecent([], '京东神券100元', now)

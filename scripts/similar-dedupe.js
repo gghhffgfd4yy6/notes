@@ -35,6 +35,12 @@ function pruneRecent (entries, now, windowMs = WINDOW_MS) {
     .slice(-MAX_ENTRIES)
 }
 
+// 满减/券档位（如 1000-150、200-20）：两边都有但档位不同，说明是不同活动/不同券，不能判重
+function couponRange (text) {
+  const m = String(text).match(/\d+\s*-\s*\d+/g)
+  return m ? m.map(x => x.replace(/\s+/g, '')).sort().join(',') : ''
+}
+
 // 是否与时间窗内已推标题近似重复
 function isSimilarTitle (title, entries, opts = {}) {
   const now = Number.isFinite(opts.now) ? opts.now : Date.now()
@@ -42,8 +48,16 @@ function isSimilarTitle (title, entries, opts = {}) {
   const threshold = Number.isFinite(opts.threshold) ? opts.threshold : THRESHOLD
   const key = normalizeTitle(title)
   if (!key || key.length < MIN_LEN) return false
+  const keyCoupon = couponRange(title)
   const recent = pruneRecent(entries, now, windowMs)
-  return recent.some(e => e.t.length >= MIN_LEN && similarity(key, e.t) >= threshold)
+  return recent.some(e => {
+    if (e.t.length < MIN_LEN) return false
+    // 档位冲突直接不判重：实测「1000-150有价券」与「斯凯奇1000-120有价券」相似度 0.81，
+    // 但它们是不同面额的券；只有两边都写了档位且不同才排除，避免漏掉「带价格/不带价格」的真重复
+    const otherCoupon = typeof e.c === 'string' ? e.c : ''
+    if (keyCoupon && otherCoupon && keyCoupon !== otherCoupon) return false
+    return similarity(key, e.t) >= threshold
+  })
 }
 
 // 追加一条已推标题，返回新数组（不修改入参）
@@ -53,7 +67,8 @@ function appendRecent (entries, title, now) {
   const list = pruneRecent(entries, at)
   // 短标题不会被 isSimilarTitle 比较，存进来只会挤占 300 条上限、把有用历史顶掉
   if (!key || key.length < MIN_LEN) return list
-  return list.concat([{ t: key, at }]).slice(-MAX_ENTRIES)
+  // c = 满减/券档位（原始标题上提取，归一化会去掉连字符）
+  return list.concat([{ t: key, at, c: couponRange(title) }]).slice(-MAX_ENTRIES)
 }
 
 module.exports = {
@@ -62,6 +77,7 @@ module.exports = {
   MAX_ENTRIES,
   MIN_LEN,
   normalizeTitle,
+  couponRange,
   similarity,
   pruneRecent,
   isSimilarTitle,
