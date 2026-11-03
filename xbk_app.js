@@ -1480,7 +1480,6 @@ function createApp ({
             recentTitles = Similar.pruneRecent(Array.isArray(parsed) ? parsed : [], similarNow)
           }
         } catch (e) {
-          recentTitles = []
           console.warn(`⚠️ 近似去重缓存读取/解析失败，按空窗口处理：${Utils.safeErrorText(e, '未知错误')}`)
         }
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
