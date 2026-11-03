@@ -1476,11 +1476,12 @@ function createApp ({
         const batchTitles = []
         let similarCorrupt = false
         try {
-          const loaded = readSafeTextResult(similarPath, 256 * 1024)
+          const loaded = readSafeTextResult(similarPath, 2 * 1024 * 1024) // 标题 120 字 + 正文 200 字 × 300 条约 400 KB
           if (loaded && loaded.status === 'ok' && loaded.text) {
             const parsed = JSON.parse(loaded.text)
             if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')
             // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
+            // 只要求 c（v3.398 起的行都有）；p/x 缺失按空串处理，升级时不丢最近窗口
             recentTitles = Similar.pruneRecent(parsed.filter(e => e && typeof e.c === 'string'), similarNow)
           } else if (loaded && loaded.status !== 'ok' && loaded.status !== 'missing') {
             similarCorrupt = true
@@ -1677,13 +1678,14 @@ function createApp ({
           if (explanation.passed) {
             // v3.397：与时间窗内已推标题近似重复 → 不再重复推送（仍进 newMessages，按已处理落缓存）
             const titleText = Utils.safeText(Utils.safeGet(item, 'title'), '')
-            if (Similar.isSimilarTitle(titleText, recentTitles.concat(batchTitles), { now: similarNow })) {
+            const contentText = Utils.safeText(Utils.safeGet(item, 'content'), '')
+            if (Similar.isSimilarTitle(titleText, recentTitles.concat(batchTitles), { now: similarNow, content: contentText })) {
               similarCount++
               newMessages.push(item)
               continue
             }
             items.push(item)
-            batchTitles.push({ t: Similar.normalizeTitle(titleText), at: similarNow, c: Similar.couponRange(titleText) })
+            batchTitles.push({ t: Similar.normalizeTitle(titleText), at: similarNow, c: Similar.couponRange(titleText), p: Similar.priceSignature(titleText), x: Similar.normalizeContent(contentText) })
             if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
               if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'passed', explanation))) {
                 diagnosticDrops.passed++
@@ -2069,7 +2071,7 @@ function createApp ({
             const savedAt = Date.now() // 写入时刻而非本轮开始时刻：单轮超过 10 分钟时不至于一落盘就过期
             let list = recentTitles
             for (const m of items) {
-              if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt)
+              if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt, Utils.safeText(Utils.safeGet(m, 'content'), ''))
             }
             if (similarCorrupt) {
               try { fs.renameSync(similarPath, `${similarPath}.corrupt-${Date.now()}`) } catch (e) { /* 文件可能已不在 */ }

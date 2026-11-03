@@ -4172,6 +4172,23 @@ check('近似去重：超出 10 分钟窗口不再判重', () => {
   assert.strictEqual(Similar.isSimilarTitle('大家各个平台看看 负数就跑', recent, { now: now + 11 * 60 * 1000 }), false)
 })
 
+check('近似去重：同款但价格不同 → 不判重（保住降价）', () => {
+  const now = 1_700_000_000_000
+  const recent = Similar.appendRecent([], '维达抽纸24包 59.9元 包邮', now)
+  assert.strictEqual(Similar.isSimilarTitle('维达抽纸24包 49.9元 包邮', recent, { now }), false)
+  const same = Similar.appendRecent([], '维达抽纸24包 59.9元 包邮', now)
+  assert.strictEqual(Similar.isSimilarTitle('维达抽纸24包 59.9元 包邮 秒杀', same, { now }), true)
+})
+
+check('近似去重：标题不够像但正文几乎一致 → 判重（正文二次确认）', () => {
+  const now = 1_700_000_000_000
+  const body = '拍2件立减 叠加店铺券 到手更划算 库存有限 先到先得 下单备注不要赠品'
+  const recent = Similar.appendRecent([], '洁婷卫生巾拍6件赠4件总到手10包 19.9元', now, body)
+  assert.strictEqual(Similar.isSimilarTitle('洁婷卫生巾10包 19.9元', recent, { now, content: body }), true)
+  // 正文相同但标题完全不搭（模板复用）→ 不判重
+  assert.strictEqual(Similar.isSimilarTitle('胡姬花食用油古法花生油158ml 1.9元', recent, { now, content: body }), false)
+})
+
 check('近似去重：空标题/非字符串一律不判重', () => {
   const now = 1_700_000_000_000
   const recent = Similar.appendRecent([], '大家各个平台都看看 如果出现负数就跑吧', now)
