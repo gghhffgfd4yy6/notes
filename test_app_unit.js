@@ -4147,6 +4147,57 @@ check('C1-020 RE2 标记锁：锁文件已被接管 ⇒ 保留别人的锁文件
   assert.strictEqual(mfs._files.has(statePath + '.lock'), true, '锁归别人时必须保留（否则互斥失效）')
 })
 
+// ===== v3.397 近似去重（xbk_similar.js）=====
+const Similar = require('./scripts/similar-dedupe.js')
+
+check('近似去重：归一化去空白/标点并小写', () => {
+  assert.strictEqual(Similar.normalizeTitle('  大家，都好！！ ABC '), '大家都好abc')
+})
+
+check('近似去重：同一句话改几个字判定为重复（实测相似度 0.80）', () => {
+  const now = 1_700_000_000_000
+  const recent = Similar.appendRecent([], '大家各个平台都看看 如果出现负数就跑吧', now)
+  assert.strictEqual(Similar.isSimilarTitle('大家各个平台看看 负数就跑', recent, { now }), true)
+})
+
+check('近似去重：不相关商品不判重', () => {
+  const now = 1_700_000_000_000
+  const recent = Similar.appendRecent([], '大家各个平台都看看 如果出现负数就跑吧', now)
+  assert.strictEqual(Similar.isSimilarTitle('伊利高钙奶粉礼盒装30元一罐 61元两罐', recent, { now }), false)
+})
+
+check('近似去重：超出 10 分钟窗口不再判重', () => {
+  const now = 1_700_000_000_000
+  const recent = Similar.appendRecent([], '大家各个平台都看看 如果出现负数就跑吧', now)
+  assert.strictEqual(Similar.isSimilarTitle('大家各个平台看看 负数就跑', recent, { now: now + 11 * 60 * 1000 }), false)
+})
+
+check('近似去重：空标题/非字符串一律不判重', () => {
+  const now = 1_700_000_000_000
+  const recent = Similar.appendRecent([], '大家各个平台都看看 如果出现负数就跑吧', now)
+  assert.strictEqual(Similar.isSimilarTitle('', recent, { now }), false)
+  assert.strictEqual(Similar.isSimilarTitle(undefined, recent, { now }), false)
+  assert.strictEqual(Similar.normalizeTitle(null), '')
+})
+
+check('近似去重：时间窗裁剪与上限', () => {
+  const now = 1_700_000_000_000
+  let list = []
+  for (let i = 0; i < 5; i++) list = Similar.appendRecent(list, `近似去重测试标题第${i}号商品描述`, now - i * 60 * 1000)
+  assert.strictEqual(Similar.pruneRecent(list, now).length, 5)
+  assert.strictEqual(Similar.pruneRecent(list, now + 11 * 60 * 1000).length, 0)
+  let big = []
+  for (let i = 0; i < Similar.MAX_ENTRIES + 20; i++) big = Similar.appendRecent(big, `近似去重上限测试标题${i}号`, now)
+  assert.strictEqual(big.length, Similar.MAX_ENTRIES)
+})
+
+check('近似去重：短标题不写入窗口（避免挤掉有效历史）', () => {
+  const now = 1_700_000_000_000
+  const list = Similar.appendRecent([], '京东神券100元', now)
+  assert.strictEqual(list.length, 0)
+  assert.strictEqual(Similar.appendRecent([], '这是一个足够长的测试标题内容', now).length, 1)
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
