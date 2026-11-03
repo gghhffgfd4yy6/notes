@@ -37,8 +37,10 @@ function pruneRecent (entries, now, windowMs = WINDOW_MS) {
 
 // 满减/券档位（如 1000-150、200-20）：两边都有但档位不同，说明是不同活动/不同券，不能判重
 function couponRange (text) {
-  const m = String(text).match(/\d+\s*-\s*\d+/g)
-  return m ? m.map(x => x.replace(/\s+/g, '')).sort().join(',') : ''
+  // 先整体去空白再匹配，正则里不带 \s*（避免 Sonar 的 super-linear 回溯告警）
+  const compact = String(text).replace(/\s+/g, '')
+  const m = compact.match(/\d+-\d+/g)
+  return m ? m.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(',') : ''
 }
 
 // 是否与时间窗内已推标题近似重复
