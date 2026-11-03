@@ -1480,7 +1480,8 @@ function createApp ({
           if (loaded && loaded.status === 'ok' && loaded.text) {
             const parsed = JSON.parse(loaded.text)
             if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')
-            recentTitles = Similar.pruneRecent(parsed, similarNow)
+            // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
+            recentTitles = Similar.pruneRecent(parsed.filter(e => e && typeof e.c === 'string'), similarNow)
           } else if (loaded && loaded.status !== 'ok' && loaded.status !== 'missing') {
             similarCorrupt = true
             console.warn(`⚠️ 近似去重缓存不可用（${loaded.status}），本轮按空窗口处理：${similarPath}`)
@@ -1682,7 +1683,7 @@ function createApp ({
               continue
             }
             items.push(item)
-            batchTitles.push({ t: Similar.normalizeTitle(titleText), at: similarNow })
+            batchTitles.push({ t: Similar.normalizeTitle(titleText), at: similarNow, c: Similar.couponRange(titleText) })
             if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
               if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'passed', explanation))) {
                 diagnosticDrops.passed++
