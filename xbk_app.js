@@ -1,5 +1,6 @@
 const { setTimeout: delay } = require('node:timers/promises')
 const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
+const Similar = require('./scripts/similar-dedupe.js')
 
 function createApp ({
   Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, FilterStore, Network, Pusher,
@@ -1463,9 +1464,25 @@ function createApp ({
         // ③b 字段归一化 + ④ 去重/全局过滤（合并为一次遍历，顺序保证：校验→归一化→判重）
         let items = []
         let dedupCount = 0
+        // v3.397：近似去重（标题相似度 + 10 分钟窗）——拦同一句话改几个字重发，ID/URL/标题精确去重抓不到。
+        let similarCount = 0
         let filteredCount = 0
         let truncatedCount = 0 // v3.145：maxPerRun 截断数计入统计（曾凭空消失）
         const cacheName = MessageStore.getFileName(Config.api.pushUrl)
+        // 与判重缓存同源命名：一个推送源一份窗口，避免不同来源互相压制（也让测试按 pushUrl 天然隔离）
+        const similarPath = path.join(this._cacheDir(), `similar-${cacheName}`)
+        const similarNow = Date.now()
+        let recentTitles = []
+        try {
+          const loaded = this._readSafeState(similarPath)
+          if (loaded && loaded.status === 'ok' && loaded.text) {
+            const parsed = JSON.parse(loaded.text)
+            recentTitles = Similar.pruneRecent(Array.isArray(parsed) ? parsed : [], similarNow)
+          }
+        } catch (e) {
+          recentTitles = []
+          console.warn(`⚠️ 近似去重缓存读取/解析失败，按空窗口处理：${Utils.safeErrorText(e, '未知错误')}`)
+        }
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
         // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
         // FILTER-01 / RULES-05：哈希除配置字节外还折入「规则实际编译生效」维度
@@ -1651,6 +1668,12 @@ function createApp ({
           const explanation = FilterEngine.explainFilter(item, compiledRules, active.filter)
           filterExplanations.set(item, explanation)
           if (explanation.passed) {
+            // v3.397：与时间窗内已推标题近似重复 → 不再重复推送（仍进 newMessages，按已处理落缓存）
+            if (Similar.isSimilarTitle(Utils.safeText(Utils.safeGet(item, 'title'), ''), recentTitles, { now: similarNow })) {
+              similarCount++
+              newMessages.push(item)
+              continue
+            }
             items.push(item)
             if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
               if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'passed', explanation))) {
@@ -2030,6 +2053,24 @@ function createApp ({
           console.warn(`⚠️ 缓存落盘失败：本轮 ${toCache.length} 条记录未写入缓存文件（下次运行会重新推送）`)
         }
         checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`)
+
+        // v3.397：把本轮推送成功的标题写进近似去重窗口（失败的标题不写，下次还能正常推）
+        if (!dryRun) {
+          try {
+            let list = recentTitles
+            for (const m of items) {
+              if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), similarNow)
+            }
+            if (list !== recentTitles) {
+              recentTitles = list
+              if (!this._writeTextAtomic(similarPath, JSON.stringify(list))) {
+                console.warn('⚠️ 近似去重缓存写入失败（不影响本轮推送，最坏结果是下次再发一遍同类标题）')
+              }
+            }
+          } catch (e) {
+            console.warn(`⚠️ 近似去重缓存更新失败（不影响本轮推送）：${Utils.safeErrorText(e, '未知错误')}`)
+          }
+        }
         await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
 
         // 预取收尾：只观察已完成结果，不等待后台预取，避免它拖慢主流程退出。
@@ -2043,6 +2084,7 @@ function createApp ({
         console.log('\n══════════ 本次运行 ══════════')
         console.log(`  获取:     ${xbkdata.length} 条`)
         console.log(`  去重跳过:  ${dedupCount} 条`)
+        if (similarCount > 0) console.log(`  近似重复:  ${similarCount} 条（10 分钟内标题相似，已跳过）`)
         console.log(`  过滤屏蔽:  ${filteredCount} 条`)
         if (truncatedCount > 0) console.log(`  截断待推:  ${truncatedCount} 条（下次运行推送，防推送风暴）`)
         if (badElementCount > 0) console.log(`  非对象元素: ${badElementCount} 条（接口脏数据，已跳过）`)
@@ -2095,7 +2137,7 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}${similarCount > 0 ? ` similar=${similarCount}` : ''}\n`)
         // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
         // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
         // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。
