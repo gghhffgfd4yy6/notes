@@ -1481,7 +1481,8 @@ function createApp ({
             const parsed = JSON.parse(loaded.text)
             if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')
             // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
-            recentTitles = Similar.pruneRecent(parsed.filter(e => e && typeof e.c === 'string' && typeof e.p === 'string'), similarNow)
+            // 只要求 c（v3.398 起的行都有）；p/x 缺失按空串处理，升级时不丢最近窗口
+            recentTitles = Similar.pruneRecent(parsed.filter(e => e && typeof e.c === 'string'), similarNow)
           } else if (loaded && loaded.status !== 'ok' && loaded.status !== 'missing') {
             similarCorrupt = true
             console.warn(`⚠️ 近似去重缓存不可用（${loaded.status}），本轮按空窗口处理：${similarPath}`)

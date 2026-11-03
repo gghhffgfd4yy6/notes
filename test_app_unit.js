@@ -4166,10 +4166,10 @@ check('近似去重：不相关商品不判重', () => {
   assert.strictEqual(Similar.isSimilarTitle('伊利高钙奶粉礼盒装30元一罐 61元两罐', recent, { now }), false)
 })
 
-check('近似去重：超出 5 分钟窗口不再判重', () => {
+check('近似去重：超出 10 分钟窗口不再判重', () => {
   const now = 1_700_000_000_000
   const recent = Similar.appendRecent([], '大家各个平台都看看 如果出现负数就跑吧', now)
-  assert.strictEqual(Similar.isSimilarTitle('大家各个平台看看 负数就跑', recent, { now: now + 6 * 60 * 1000 }), false)
+  assert.strictEqual(Similar.isSimilarTitle('大家各个平台看看 负数就跑', recent, { now: now + 11 * 60 * 1000 }), false)
 })
 
 check('近似去重：同款但价格不同 → 不判重（保住降价）', () => {
