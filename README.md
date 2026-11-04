@@ -43,7 +43,7 @@ cp push_config.local.js.example push_config.local.js
 
 模板中已列出各渠道的配置名称和示例。没有使用的渠道可以保持注释。
 
-> WxPusher 支持「点击通知直达」：推送时带上原文链接（`WX_pusher_clickUrl` = `detail`（默认，点通知打开线报原文页）/`deal`（正文第一条商品/活动外链）/`off`），在 App 里把「我的 → 通用 → 通知点击设置」设为「原文链接」后，点通知可直接打开对应页面。
+> WxPusher 支持「点击通知直达」：推送时带上原文链接（`WX_pusher_clickUrl` = `detail`（默认，点通知打开线报原文页）/`deal`（正文第一条商品/活动外链）/`off`），在 App 里把「我的 → 通用 → 通知点击设置」设为「原文链接」后，点通知可直接打开对应页面。`detail` 只在末尾「原文链接」段内取链接，`[文字](url)` 与裸 `https://…` 两种写法都认；该段没有可用链接时不带链接（不会退回正文外链）。
 
 > `push_config.local.js` 含有密钥，已被忽略，不要提交到 Git 或发给别人。
 

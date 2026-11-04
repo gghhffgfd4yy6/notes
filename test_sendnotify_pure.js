@@ -1501,6 +1501,56 @@ check('WxPusher clickUrl: detail 模式只看「原文链接」段，正文外�
   assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://new.xianbao.fun/haodan/1.html')
 })
 
+// 控制台关注词推送的兜底正文、用户自配模板都可能写成「原文链接：https://…」（裸 URL，不是 [text](url)），
+// 两款链接解析器都抓不到 ⇒ detail 模式会静默丢链接。v3.401 起在同一段内做裸 URL 兜底。
+check('WxPusher clickUrl: detail 模式支持「原文链接：裸 URL」（兜底正文/自配模板形态）', () => {
+  const desp = '测试线报\n少部分地区有货\n原文链接：https://new.xianbao.fun/haodan/1.html'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), 'https://new.xianbao.fun/haodan/1.html')
+})
+
+check('WxPusher clickUrl: 裸 URL 尾部中文标点/右括号要剥掉（粘链接常带）', () => {
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：https://new.xianbao.fun/haodan/1.html。', 'detail'),
+    'https://new.xianbao.fun/haodan/1.html')
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：https://new.xianbao.fun/haodan/1.html）', 'detail'),
+    'https://new.xianbao.fun/haodan/1.html')
+})
+
+check('WxPusher clickUrl: 裸 URL 兜底仍不跨段（正文段的裸链接不是原文链接）', () => {
+  const desp = '下单 https://m.tb.cn/h.abc\n\n原文链接：（无）'
+  assert.strictEqual(pickWxPusherClickUrl(desp, 'detail'), '')
+})
+
+check('WxPusher clickUrl: 裸 URL 兜底只认 http(s)、且照样受 1000 字符上限约束', () => {
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：javascript:alert(1)', 'detail'), '')
+  const long = '原文链接：https://x.example/' + 'y'.repeat(1200)
+  assert.strictEqual(pickWxPusherClickUrl(long, 'detail'), '')
+})
+
+check('WxPusher clickUrl: 裸 URL 只扫「原文链接」段，后续段落的链接不算', () => {
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：（无）\n\n推荐位 https://other.example/x', 'detail'), '')
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：https://new.xianbao.fun/haodan/1.html\n\n页脚 https://other.example/y', 'detail'),
+    'https://new.xianbao.fun/haodan/1.html')
+})
+
+check('WxPusher clickUrl: 图片地址不得当成原文链接（Markdown 图片 / HTML img）', () => {
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：![海报](https://img.example/a.png)', 'detail'), '')
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：<img src="https://img.example/a.png">', 'detail'), '')
+  // 图片后面的真链接仍要取到
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：![海报](https://img.example/a.png) [原文](https://new.xianbao.fun/haodan/1.html)', 'detail'),
+    'https://new.xianbao.fun/haodan/1.html')
+})
+
+check('WxPusher clickUrl: 伪协议里嵌的 http 链接不算（javascript:/data:）', () => {
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：javascript:https://evil.example/x', 'detail'), '')
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：data:text/html,https://evil.example/y', 'detail'), '')
+})
+
+check('WxPusher clickUrl: 裸 URL 自带成对括号不被截断', () => {
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：https://x.example/a(b)c', 'detail'), 'https://x.example/a(b)c')
+  // 不成对的右括号是标点，剥掉
+  assert.strictEqual(pickWxPusherClickUrl('原文链接：（https://x.example/a(b)c）', 'detail'), 'https://x.example/a(b)c')
+})
+
 check('WxPusher clickUrl: Markdown 行内代码/围栏里的链接是示例文本，不当跳转目标', () => {
   assert.strictEqual(pickWxPusherClickUrl('示例 `[点我](https://evil.example/inline)` 结束\n\n[真](https://m.tb.cn/h.ok)', 'deal'),
     'https://m.tb.cn/h.ok')
