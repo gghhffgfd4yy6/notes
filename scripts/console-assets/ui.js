@@ -1024,6 +1024,15 @@ function App () {
     if (data && data.auto) { setAutoState(data.auto); setAutoNow(Date.now()) }
     return v
   }, [])
+  const saveAutoSchedule = useCallback(async (schedule) => {
+    // 带上读取时的 updatedAt：另一个标签页先保存时后端回 409，避免后写覆盖先写
+    const base = autoState && typeof autoState.updatedAt === 'number' && autoState.updatedAt > 0
+      ? { baseUpdatedAt: autoState.updatedAt }
+      : {}
+    const data = await apiSetAuto({ schedule, ...base })
+    if (data && data.auto) setAutoState(data.auto)
+    return data
+  }, [autoState && autoState.updatedAt])
   const stopAuto = useCallback(async () => {
     const data = await apiSetAuto({ on: false })
     if (data && data.auto) setAutoState(data.auto)
@@ -1257,7 +1266,7 @@ function App () {
       <${AlertBanner} state=${state} onOpenLog=${openLog} />
       <${StatusCards} state=${state} err=${statusFailed} />
       <${TriggerBar} onTriggered=${handleTriggered} locking=${locking} setBusy=${setBusy} runs=${runs} active=${tab === 'overview'}
-        auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
+        auto=${{ on: autoOn, interval: autoState && Number.isInteger(autoState.interval) ? autoState.interval : AUTO_DEFAULT_S, schedule: autoState && Array.isArray(autoState.schedule) ? autoState.schedule : [], saveSchedule: saveAutoSchedule, runs: autoState && autoState.runs ? autoState.runs : 0, err: autoState && autoState.lastError ? autoState.lastError : '', nextAt: autoState && autoState.nextAt ? autoState.nextAt : 0, now: autoNow, start: startAuto, stop: stopAuto, save: saveAutoInterval }} />
       <${RunsPanel} runs=${runs} status=${runsState} active=${tab === 'overview'} pollMs=${autoRefresh && tab === 'overview' ? pollMs : 0} onRefresh=${refreshSplit} />
       <${TrendsPanel} active=${tab === 'overview'} />
       <${RunHistoryPanel} onOpenLog=${openLog} active=${tab === 'overview'} />

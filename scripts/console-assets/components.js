@@ -1259,6 +1259,53 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
   // 自动间隔草稿：输入框可自由键入，保存/开始时统一夹到 3–20；运行状态由 App 持有。
   const [autoDraft, setAutoDraft] = useState(String(auto.interval))
   const [autoSaved, setAutoSaved] = useState(false)
+  // 分时段间隔（v3.401）：服务器返回已校验的窗口列表，这里只做本地编辑，保存时再交给后端校验。
+  // 默认值 03:00–07:00 / 60 秒只是「新增一行」的起点，用户可以改成任意时段（支持跨午夜）。
+  const [schedDraft, setSchedDraft] = useState(Array.isArray(auto.schedule) ? auto.schedule : [])
+  const [schedSaved, setSchedSaved] = useState(false)
+  // 每 2 秒的 /api/auto 轮询会换掉 auto.schedule 的数组身份；直接同步会把正在编辑的草稿冲掉
+  // （Sourcery High）。按内容签名比较：只有服务端内容真的变了、且本地没有未保存修改时才同步。
+  const [schedDirty, setSchedDirty] = useState(false)
+  const schedSavedTimerRef = useRef(0)
+  const serverSchedSig = JSON.stringify(Array.isArray(auto.schedule) ? auto.schedule : [])
+  const lastSchedSigRef = useRef(serverSchedSig)
+  useEffect(() => {
+    if (serverSchedSig === lastSchedSigRef.current) return
+    lastSchedSigRef.current = serverSchedSig
+    if (schedDirty) return
+    setSchedDraft(Array.isArray(auto.schedule) ? auto.schedule.map((r) => ({ ...r })) : [])
+  }, [serverSchedSig, schedDirty])
+  useEffect(() => () => clearTimeout(schedSavedTimerRef.current), [])
+  const editSched = (i, key, value) => {
+    setSchedDraft((prev) => prev.map((r, k) => (k === i ? { ...r, [key]: value } : r)))
+    setSchedSaved(false)
+    setSchedDirty(true)
+  }
+  const addSched = () => {
+    setSchedDraft((prev) => prev.length >= 8 ? prev : [...prev, { start: '03:00', end: '07:00', interval: 60 }])
+    setSchedSaved(false)
+    setSchedDirty(true)
+  }
+  const removeSched = (i) => {
+    setSchedDraft((prev) => prev.filter((_, k) => k !== i))
+    setSchedSaved(false)
+    setSchedDirty(true)
+  }
+  const saveSched = async () => {
+    setErr('')
+    try {
+      const payload = schedDraft.map((r) => ({ start: String(r.start || ''), end: String(r.end || ''), interval: Number(r.interval) }))
+      if (auto.saveSchedule) await auto.saveSchedule(payload)
+      setSchedDraft(payload)
+      setSchedDirty(false)
+      lastSchedSigRef.current = JSON.stringify(payload)
+      setSchedSaved(true)
+      clearTimeout(schedSavedTimerRef.current)
+      schedSavedTimerRef.current = setTimeout(() => setSchedSaved(false), 1500)
+    } catch (e) {
+      setErr(`保存分时段失败：${e && e.message ? e.message : e}`)
+    }
+  }
   const autoSavedTimerRef = useRef(0)
   useEffect(() => { setAutoDraft(String(auto.interval)) }, [auto.interval])
   useEffect(() => () => clearTimeout(autoSavedTimerRef.current), [])
@@ -1394,6 +1441,31 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
       </div>`}
       <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
+      <div class="auto-sched">
+        <div class="auto-sched-title">分时段间隔<span class="auto-sched-sub">窗口内按下面的秒数跑，其余时间用上面的 ${auto.interval} 秒；可加多条，跨午夜（如 23:00–07:00）也支持</span></div>
+        ${schedDraft.length === 0
+          ? html`<div class="auto-sched-empty">还没有分时段，全天都用上面的间隔。</div>`
+          : schedDraft.map((r, i) => html`<div class="auto-sched-row" key=${i}>
+              <input class="auto-sched-time" type="time" value=${r.start}
+                aria-label=${`第 ${i + 1} 条开始时间`}
+                onInput=${(e) => editSched(i, 'start', e.currentTarget.value)} />
+              <span class="auto-sched-dash">–</span>
+              <input class="auto-sched-time" type="time" value=${r.end}
+                aria-label=${`第 ${i + 1} 条结束时间`}
+                onInput=${(e) => editSched(i, 'end', e.currentTarget.value)} />
+              <input class="auto-sched-num" type="number" inputmode="numeric" min="3" max="600" step="1" value=${r.interval}
+                aria-label=${`第 ${i + 1} 条间隔（秒）`}
+                onInput=${(e) => editSched(i, 'interval', e.currentTarget.value)} />
+              <span class="auto-unit">秒</span>
+              <button type="button" class="auto-sched-del" aria-label=${`删除第 ${i + 1} 条分时段`}
+                onClick=${() => removeSched(i)}>删除</button>
+            </div>`)}
+        <div class="btn-row auto-sched-actions">
+          <${Button} variant="secondary" onClick=${addSched}>添加时段<//>
+          <${Button} variant="secondary" onClick=${saveSched}>保存分时段<//>
+          ${schedSaved && html`<span class="auto-saved">已保存</span>`}
+        </div>
+      </div>
       ${auto.on && html`<div class="auto-run-status">${auto.nextAt > 0 ? `下一轮 ${Math.max(0, Math.ceil((auto.nextAt - auto.now) / 1000))} 秒` : '本轮进行中'} · 已自动运行 ${auto.runs} 轮</div>`}
       ${!auto.on && html`<div class="auto-run-status">${autoSaved ? '间隔已保存' : ''}</div>`}
       ${auto.err && html`<${Hint} tone="error">${auto.err}<//>`}
