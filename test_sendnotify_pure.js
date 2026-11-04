@@ -1535,8 +1535,8 @@ check('WxPusher clickUrl: 数字实体 &#38; 与命名实体都能解码', () =>
     'https://x.example/a?b=1&c=2')
 })
 
-check('WxPusher clickUrl: 出厂默认是 deal（改默认值必须显式改这条断言）', () => {
-  assert.strictEqual(push_config.WX_pusher_clickUrl, 'deal', '默认模式变了就等于默认行为变了，不能被空值回退掩盖')
+check('WxPusher clickUrl: 出厂默认是 detail（改默认值必须显式改这条断言）', () => {
+  assert.strictEqual(push_config.WX_pusher_clickUrl, 'detail', '默认模式变了就等于默认行为变了，不能被空值回退掩盖')
 })
 
 check('WxPusher clickUrl: off 模式不产生链接（保持旧行为），大小写不敏感', () => {

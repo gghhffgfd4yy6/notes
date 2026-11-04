@@ -277,9 +277,10 @@ const push_config = {
   WX_pusher_topicIds: '', // wxpusher 主题ID(真实ID已移除)
   // 多应用分流：[{ appToken: '...', topicIds: '主题ID' }]；为空时兼容上面单应用配置
   WX_pusher_channels: [],
-  // v3.314：通知点击直达——deal=正文第一条商品/活动外链（默认），detail=末尾「原文链接」，
-  // off=不带链接。需要在 WxPusher App「我的 → 通用 → 通知点击设置」选「原文链接」才会生效。
-  WX_pusher_clickUrl: 'deal',
+  // v3.400：通知点击直达——detail=末尾「原文链接」（默认，点通知直接打开线报原文），
+  // deal=正文第一条商品/活动外链，off=不带链接。
+  // 需要在 WxPusher App「我的 → 通用 → 通知点击设置」选「原文链接」才会生效。
+  WX_pusher_clickUrl: 'detail',
 
   // 息知文档：https://xz.qqoq.net/
   // 推送地址示例：https://xizhi.qqoq.net/xxxxxxxxxxxxx.send
@@ -1354,19 +1355,19 @@ function firstClickUrl (text) {
 
 function normalizeClickMode (value) {
   const raw = safeString(value).trim().toLowerCase()
-  if (raw === '') return 'deal'
+  if (raw === '') return 'detail'
   if (WXPUSHER_CLICK_MODES.includes(raw)) return raw
   if (!wxPusherClickModeWarned) {
     wxPusherClickModeWarned = true
-    console.warn(`⚠️ WX_pusher_clickUrl 值无效：「${raw}」（应为 deal/detail/off），已按 deal 执行`)
+    console.warn(`⚠️ WX_pusher_clickUrl 值无效：「${raw}」（应为 deal/detail/off），已按 detail 执行`)
   }
-  return 'deal'
+  return 'detail'
 }
 
 /**
  * 选取 WxPusher 通知点击要打开的链接。
  * deal：正文里第一条 http(s) 链接（线报的商品/活动外链；正文没有外链时自然落到末尾的原文链接）
- * detail：末尾「原文链接」段里的链接（模板没写该段时回退第一条）
+ * detail：末尾「原文链接」段里的链接（模板没写该段时不带链接，不退回正文外链）
  * off：不带动跳链接（保持旧行为）
  */
 function pickWxPusherClickUrl (desp, mode) {

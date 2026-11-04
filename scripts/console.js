@@ -2777,8 +2777,8 @@ function extractArticleHtml (html) {
 }
 
 // 正文渲染**不另写一套**：直接复用生产出口的 htmlToMarkdown（与主推送同源——<a> 转 Markdown
-// 链接、<img> 转 ![]()、末尾补「原文链接」）。于是 WxPusher 的 clickUrl=deal 取到的第一条外链
-// 就是正文里的领券链接，而不是原文链接（旧实现正文只有纯文本 + 原文链接，点开必落线报酷详情页）。
+// 链接、<img> 转 ![]()、末尾补「原文链接」）。于是 clickUrl=deal（显式选择时）取到的第一条外链
+// 就是正文里的领券链接，而不是原文链接；默认 detail 仍落在末尾「原文链接」段（v3.400）。
 let watchMarkdownFn = null
 function watchMarkdown (contentHtml, url) {
   if (watchMarkdownFn === null) {

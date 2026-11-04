@@ -446,19 +446,28 @@ console.log('========================================\n');
         `无HTML标签应保持Markdown(contentType=3): ${gotCalls[0].options.json.contentType}`)
   }))
 
-  // 6c-2. WxPusher 点击直达（v3.314）：url 字段决定点通知后打开什么
-  await test('wxpusher: 出厂默认 clickUrl=deal（显式断言，避免空值回退掩盖默认值回归）', () => {
-    assert(notify.push_config.WX_pusher_clickUrl === 'deal',
-      `出厂默认应为 deal，实际 ${notify.push_config.WX_pusher_clickUrl}`)
+  // 6c-2. WxPusher 点击直达（v3.314；v3.400 起出厂默认 detail=点通知打开线报原文）
+  await test('wxpusher: 出厂默认 clickUrl=detail（显式断言，避免空值回退掩盖默认值回归）', () => {
+    assert(notify.push_config.WX_pusher_clickUrl === 'detail',
+      `出厂默认应为 detail，实际 ${notify.push_config.WX_pusher_clickUrl}`)
   })
 
-  await test('wxpusher: 默认取正文第一条外链进 url 字段', () => withChannels(async () => {
+  await test('wxpusher: 默认（detail）取末尾原文链接进 url 字段', () => withChannels(async () => {
     cfg.WX_pusher_appToken = 'AT123'
     cfg.WX_pusher_topicIds = '456'
     await notify.sendNotify('标题', '[下单](https://m.tb.cn/h.abc)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)')
     assert(gotCalls.length === 1, '仅 wxpusher 一次请求')
+    assert(gotCalls[0].options.json.url === 'https://new.xianbao.fun/haodan/1.html',
+      `默认应取原文链接，实际 ${gotCalls[0].options.json.url}`)
+  }))
+
+  await test('wxpusher: clickUrl=deal 时 url 指向正文第一条外链', () => withChannels(async () => {
+    cfg.WX_pusher_appToken = 'AT123'
+    cfg.WX_pusher_topicIds = '456'
+    cfg.WX_pusher_clickUrl = 'deal'
+    await notify.sendNotify('标题', '[下单](https://m.tb.cn/h.abc)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)')
     assert(gotCalls[0].options.json.url === 'https://m.tb.cn/h.abc',
-      `默认应取正文外链，实际 ${gotCalls[0].options.json.url}`)
+      `deal 应取正文外链，实际 ${gotCalls[0].options.json.url}`)
   }))
 
   await test('wxpusher: clickUrl=detail 时 url 指向原文链接', () => withChannels(async () => {
