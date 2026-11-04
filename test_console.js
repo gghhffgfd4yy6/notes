@@ -3156,6 +3156,8 @@ async function watchMonitorTests () {
       const body = formatWatchPush({ title: '测试线报', price: 15, datetime: '2026-10-24 16:55', content: '少部分地区有货', url: 'https://x/1' })
       assert.ok(body.includes('价格：¥15'))
       assert.ok(body.includes('少部分地区有货'))
+      // 兜底正文必须带「原文链接：」标记：WxPusher 默认 detail 模式只认这段，裸 URL 会让点通知落回详情页
+      assert.ok(body.includes('原文链接：https://x/1'), `兜底正文必须带原文链接标记: ${body}`)
     } finally {
       server.close()
       fs.rmSync(dir, { recursive: true, force: true })
@@ -3258,8 +3260,8 @@ async function watchMonitorTests () {
   })
 
   // 关注词推送正文：搜索列表的 data-content 是纯文本（上游剥掉了 <a>），只剩「领 拍」空壳，
-  // 于是正文里唯一外链是原文链接 ⇒ WxPusher clickUrl=deal 点开必落线报酷详情页。
-  // 现在改为取详情页正文走生产 htmlToMarkdown：链接与海报图都回来，点开落在领券链接上。
+  // 于是正文里唯一外链是原文链接 ⇒ 旧实现 clickUrl=deal 点开必落线报酷详情页。
+  // 现在改为取详情页正文走生产 htmlToMarkdown：链接与海报图都回来，deal 模式点开落在领券链接上。
   const RICH_LIST_HTML = `<html><body><ul class="new-post">
 <li class="article-list"><p class="title"><time class="badge red" datetime="2026-10-27" title="2026-10-27 16:38">16:38</time><a href="/haodan/9000010.html" title="十月稻田东北五常大米5kg*2袋 65元" data-price="">十月稻田东北五常大米5kg*2袋 65元</a></p></li>
 </ul><div class="pagebar"><a href="/search.php?q=x&amp;page=1">1</a></div></body></html>`
@@ -3293,7 +3295,7 @@ async function watchMonitorTests () {
       // 子串校验等于没校验（任意 host 前后缀都能混过去），CodeQL 会按 js/incomplete-url-substring-sanitization 报高优。
       const mdLinks = Array.from(body.matchAll(/\]\((https?:\/\/[^)]+)\)/g), (m) => m[1])
       const COUPON = 'http://t.yuebuy.xin/kqRNzWx' // NOSONAR 夹具照抄上游详情页真实 http 领券链接，不是生产在发 http
-      assert.strictEqual(mdLinks[0], COUPON, `正文第一条链接必须是领券链接（clickUrl=deal 取它）: ${body.slice(0, 200)}`)
+      assert.strictEqual(mdLinks[0], COUPON, `正文第一条链接必须是领券链接（deal 模式取它）: ${body.slice(0, 200)}`)
       assert.ok(mdLinks.some((u) => u === 'https://u.jd.com/5GowgUb'), '正文必须带真实下单链接')
       assert.ok(mdLinks.some((u) => u === 'https://img14.360buyimg.com/pop/x.jpg'), '海报图必须随正文发出（生产同源 Markdown）')
       assert.ok(body.includes('原文链接：'), '仍保留原文链接段')

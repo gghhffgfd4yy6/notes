@@ -37,8 +37,8 @@ module.exports = {
     //     { appToken: '应用2appToken', topicIds: '主题ID2' },
     // ],
     // 通知点击直达（需在 WxPusher App「我的 → 通用 → 通知点击设置」选「原文链接」）：
-    // deal=正文第一条商品/活动外链（默认）、detail=末尾原文链接、off=不带链接
-    // WX_pusher_clickUrl: 'deal',
+    // detail=末尾原文链接（默认，点通知打开线报原文）、deal=正文第一条商品/活动外链、off=不带链接
+    // WX_pusher_clickUrl: 'detail',
 
     // 息知（https://xz.qqoq.net/）
     // WX_XIZHI_KEY: 'https://xizhi.qqoq.net/你的key',
