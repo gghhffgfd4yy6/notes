@@ -447,9 +447,14 @@ console.log('========================================\n');
   }))
 
   // 6c-2. WxPusher 点击直达（v3.314；v3.400 起出厂默认 detail=点通知打开线报原文）
+  // 有 push_config.local.js 时默认值不可观测（local 在模块加载期覆盖），与 test_sendnotify_pure 的默认值表同口径跳过。
   await test('wxpusher: 出厂默认 clickUrl=detail（显式断言，避免空值回退掩盖默认值回归）', () => {
-    assert(notify.push_config.WX_pusher_clickUrl === 'detail',
-      `出厂默认应为 detail，实际 ${notify.push_config.WX_pusher_clickUrl}`)
+    let hasLocal = true
+    try { require.resolve('./push_config.local.js') } catch (e) { hasLocal = false }
+    if (!hasLocal) {
+      assert(notify.push_config.WX_pusher_clickUrl === 'detail',
+        `出厂默认应为 detail，实际 ${notify.push_config.WX_pusher_clickUrl}`)
+    }
   })
 
   await test('wxpusher: 默认（detail）取末尾原文链接进 url 字段', () => withChannels(async () => {

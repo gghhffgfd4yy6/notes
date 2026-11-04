@@ -2740,7 +2740,9 @@ function formatWatchPush (item) {
   }
   if (item && typeof item.datetime === 'string' && item.datetime !== '') lines.push(item.datetime)
   if (item && typeof item.content === 'string' && item.content.trim() !== '') lines.push(item.content.trim().slice(0, 200))
-  if (item && typeof item.url === 'string' && item.url !== '') lines.push(item.url)
+  // 兜底正文也必须带「原文链接：」标记：WxPusher 默认 detail 模式只认这段标记，
+  // 裸 URL（旧写法）在 detail 下取不到链接，点通知会退化成打开详情页。
+  if (item && typeof item.url === 'string' && item.url !== '') lines.push(`原文链接：${item.url}`)
   return lines.join('\n')
 }
 

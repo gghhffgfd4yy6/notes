@@ -3156,6 +3156,8 @@ async function watchMonitorTests () {
       const body = formatWatchPush({ title: '测试线报', price: 15, datetime: '2026-10-24 16:55', content: '少部分地区有货', url: 'https://x/1' })
       assert.ok(body.includes('价格：¥15'))
       assert.ok(body.includes('少部分地区有货'))
+      // 兜底正文必须带「原文链接：」标记：WxPusher 默认 detail 模式只认这段，裸 URL 会让点通知落回详情页
+      assert.ok(body.includes('原文链接：https://x/1'), `兜底正文必须带原文链接标记: ${body}`)
     } finally {
       server.close()
       fs.rmSync(dir, { recursive: true, force: true })

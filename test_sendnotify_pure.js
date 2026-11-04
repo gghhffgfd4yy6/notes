@@ -1071,6 +1071,7 @@ check('push_config: 默认值逐键精确（空串默认不得被占位文本替
     DEER_URL: '',
     PUSH_PLUS_USER: '',
     WX_pusher_topicIds: '',
+    WX_pusher_clickUrl: 'detail',
     PUSHME_URL: 'https://push.i-i.me',
     PUSHME_KEY: '',
     TG_USER_ID: '',
@@ -1535,8 +1536,10 @@ check('WxPusher clickUrl: 数字实体 &#38; 与命名实体都能解码', () =>
     'https://x.example/a?b=1&c=2')
 })
 
-check('WxPusher clickUrl: 出厂默认是 detail（改默认值必须显式改这条断言）', () => {
-  assert.strictEqual(push_config.WX_pusher_clickUrl, 'detail', '默认模式变了就等于默认行为变了，不能被空值回退掩盖')
+check('WxPusher clickUrl: 空模式回落 detail（出厂默认值见 push_config 默认值表，本地配置存在时不可观测）', () => {
+  const desp = '[下单](https://m.tb.cn/h.abc)\n\n原文链接：[线报](https://new.xianbao.fun/haodan/1.html)'
+  assert.strictEqual(pickWxPusherClickUrl(desp, ''), 'https://new.xianbao.fun/haodan/1.html', '空值必须回落到 detail，否则本地留空又回到 deal')
+  assert.strictEqual(pickWxPusherClickUrl(desp, undefined), 'https://new.xianbao.fun/haodan/1.html')
 })
 
 check('WxPusher clickUrl: off 模式不产生链接（保持旧行为），大小写不敏感', () => {
