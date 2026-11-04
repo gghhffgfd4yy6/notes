@@ -1353,6 +1353,38 @@ function firstClickUrl (text) {
   return ''
 }
 
+// 裸 URL 兜底：模板/兜底正文可能写成「原文链接：https://…」（不是 [text](url)），
+// 上面两条链接解析器都抓不到。只在「原文链接」段内扫（段 = 标记到其后第一个空行，页脚/推荐位不算），
+// 仍走同一套校验（http(s)/长度/控制字符）。
+const BARE_CLICK_URL_RE = /https?:\/\/[^\s<>"'】]+/gi
+// 允许紧贴 URL 的前一个字符：行首/空白/全角标点/左括号。ASCII ':' 与 ',' 不算——
+// 那正是 javascript:https://… / data:text/html,https://… 这类「伪协议里嵌 URL」的形态。
+const BARE_URL_PREV_OK = /[\s，。；：、（(【[]/
+
+// 尾部标点剥掉；ASCII 右括号只在不成对时剥（URL 自带 a(b)c 这种括号要保留）
+function trimBareUrl (raw) {
+  let url = raw
+  while (url !== '' && /[，。；、,.;:：!！?？）】\]]$/.test(url)) url = url.slice(0, -1)
+  const closes = (url.match(/\)/g) || []).length
+  const opens = (url.match(/\(/g) || []).length
+  for (let i = 0; i < closes - opens && url.endsWith(')'); i++) url = url.slice(0, -1)
+  return url
+}
+
+function firstBareClickUrl (text) {
+  // 图片不是「原文链接」：Markdown 图片与 HTML 标签先抹掉，免得把图片地址当成跳转目标
+  const cleaned = maskCode(text).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ').replace(/<[^>]*>/g, ' ')
+  BARE_CLICK_URL_RE.lastIndex = 0
+  let m
+  while ((m = BARE_CLICK_URL_RE.exec(cleaned)) !== null) {
+    const prev = m.index > 0 ? cleaned[m.index - 1] : ''
+    if (prev !== '' && !BARE_URL_PREV_OK.test(prev)) continue
+    const url = normalizeClickUrl(trimBareUrl(m[0]))
+    if (url) return url
+  }
+  return ''
+}
+
 function normalizeClickMode (value) {
   const raw = safeString(value).trim().toLowerCase()
   if (raw === '') return 'detail'
@@ -1367,7 +1399,7 @@ function normalizeClickMode (value) {
 /**
  * 选取 WxPusher 通知点击要打开的链接。
  * deal：正文里第一条 http(s) 链接（线报的商品/活动外链；正文没有外链时自然落到末尾的原文链接）
- * detail：末尾「原文链接」段里的链接（模板没写该段时不带链接，不退回正文外链）
+ * detail：末尾「原文链接」段里的链接（Markdown 链接或裸 http(s)；模板没写该段时不带链接，不退回正文外链）
  * off：不带动跳链接（保持旧行为）
  */
 function pickWxPusherClickUrl (desp, mode) {
@@ -1379,7 +1411,12 @@ function pickWxPusherClickUrl (desp, mode) {
     // detail 只认「原文链接」段：没有该段就返回空，不能悄悄退回正文外链——
     // 用户选了 detail 却在点通知时打开商品页，比不跳转更糟。
     const at = text.lastIndexOf(WXPUSHER_DETAIL_MARKER)
-    return at < 0 ? '' : firstClickUrl(text.slice(at))
+    if (at < 0) return ''
+    // 段 = 标记到其后第一个空行：后面的页脚/推荐位链接不算原文链接
+    const tail = text.slice(at)
+    const blank = tail.indexOf('\n\n')
+    const section = blank < 0 ? tail : tail.slice(0, blank)
+    return firstClickUrl(section) || firstBareClickUrl(section)
   }
   return firstClickUrl(text)
 }
