@@ -537,6 +537,27 @@
   .auto-unit { color: var(--text-dim); font-size: var(--fs-sm); }
   .auto-run-note { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-2xs); line-height: 1.55; }
   .auto-run-status { min-height: 17px; margin-top: var(--sp-1); color: var(--accent); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+  /* ── 分时段间隔（v3.401）──
+     每行「开始 – 结束 [秒数] 删除」；手机上允许折行（时间选择器本身较宽）。 */
+  .auto-sched { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px dashed var(--border); }
+  .auto-sched-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-2); color: var(--text); font-size: var(--fs-sm); font-weight: 600; }
+  .auto-sched-sub { color: var(--text-dim); font-size: var(--fs-2xs); font-weight: 400; line-height: 1.5; }
+  .auto-sched-empty { margin-top: var(--sp-2); color: var(--text-dim); font-size: var(--fs-2xs); }
+  .auto-sched-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-2); margin-top: var(--sp-2); }
+  .auto-sched-time, .auto-sched-num {
+    padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r-2);
+    background: var(--panel); color: var(--text); font-size: var(--fs-sm); font-variant-numeric: tabular-nums;
+  }
+  .auto-sched-time { width: 8.2em; }
+  .auto-sched-num { width: 5.2em; text-align: right; }
+  .auto-sched-dash { color: var(--text-dim); }
+  .auto-sched-del {
+    padding: 4px 10px; border: 1px solid var(--border); border-radius: var(--r-2);
+    background: transparent; color: var(--text-dim); font-size: var(--fs-2xs); cursor: pointer;
+  }
+  .auto-sched-del:hover, .auto-sched-del:focus-visible { color: var(--text); border-color: var(--text-dim); }
+  .auto-sched-actions { margin-top: var(--sp-2); align-items: center; }
+  .auto-saved { color: var(--accent); font-size: var(--fs-2xs); }
 
   /* ── 确认弹窗（v3.307）──
      v3.384：遮罩层换成原生 <dialog>（顶层 + 焦点陷阱 + 背景 inert 由浏览器负责）。

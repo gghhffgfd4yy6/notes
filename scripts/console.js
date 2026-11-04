@@ -289,10 +289,71 @@ const AUTO_MAX_S = 20
 const AUTO_DEFAULT_S = 10
 const AUTO_MAX_FAILS = 3
 const AUTO_STATE_FILE = 'console-auto.json'
+// 分时段间隔：最多 8 条窗口，窗口内的间隔允许放宽到 600 秒（主间隔仍是 3–20 秒）。
+const AUTO_SCHEDULE_MAX = 8
+const AUTO_SCHEDULE_MAX_S = 600
+// 分时段按北京时间判定（服务器时区不保证是 CST，测试环境跑 UTC —— 不能直接用 getHours）。
+const AUTO_TZ_OFFSET_MS = 8 * 60 * 60 * 1000
+const AUTO_DAY_MS = 24 * 60 * 60 * 1000
 function clampAutoSeconds (v) {
   const n = Math.round(Number(v))
   if (!Number.isFinite(n)) return AUTO_DEFAULT_S
   return Math.min(AUTO_MAX_S, Math.max(AUTO_MIN_S, n))
+}
+// "HH:MM" → 当天分钟数；非法返回 null。
+function parseAutoHHMM (s) {
+  if (typeof s !== 'string') return null
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(s.trim())
+  if (!m) return null
+  return Number(m[1]) * 60 + Number(m[2])
+}
+// 校验并归一化分时段列表：返回 { ok, value, error }。
+// value 里保留 start/end/interval，另带 startMin/endMin 供调度用（落盘时剥离）。
+function normalizeAutoSchedule (list) {
+  if (list === undefined) return { ok: true, value: [] }
+  if (!Array.isArray(list)) return { ok: false, error: 'schedule 必须是数组' }
+  if (list.length > AUTO_SCHEDULE_MAX) return { ok: false, error: `最多 ${AUTO_SCHEDULE_MAX} 条分时段` }
+  const out = []
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i]
+    if (!r || typeof r !== 'object') return { ok: false, error: `第 ${i + 1} 条分时段格式不对` }
+    const startMin = parseAutoHHMM(r.start)
+    const endMin = parseAutoHHMM(r.end)
+    if (startMin === null) return { ok: false, error: `第 ${i + 1} 条开始时间必须是 HH:MM` }
+    if (endMin === null) return { ok: false, error: `第 ${i + 1} 条结束时间必须是 HH:MM` }
+    if (startMin === endMin) return { ok: false, error: `第 ${i + 1} 条起止时间不能相同` }
+    if (typeof r.interval !== 'number' || !Number.isInteger(r.interval)) {
+      return { ok: false, error: `第 ${i + 1} 条间隔必须是 ${AUTO_MIN_S}–${AUTO_SCHEDULE_MAX_S} 的整数` }
+    }
+    const interval = r.interval
+    if (interval < AUTO_MIN_S || interval > AUTO_SCHEDULE_MAX_S) {
+      return { ok: false, error: `第 ${i + 1} 条间隔必须是 ${AUTO_MIN_S}–${AUTO_SCHEDULE_MAX_S} 的整数` }
+    }
+    out.push({ start: r.start.trim(), end: r.end.trim(), interval, startMin, endMin })
+  }
+  return { ok: true, value: out }
+}
+// 当前生效间隔 + 距下一个窗口边界的毫秒数（跨午夜窗口按 start > end 处理）。
+function autoIntervalAt (schedule, baseInterval, ms) {
+  const list = Array.isArray(schedule) ? schedule : []
+  if (list.length === 0) return { interval: baseInterval, untilChangeMs: 0 }
+  const local = ((ms + AUTO_TZ_OFFSET_MS) % AUTO_DAY_MS + AUTO_DAY_MS) % AUTO_DAY_MS
+  const minute = Math.floor(local / 60000)
+  let interval = baseInterval
+  let best = Infinity
+  for (const r of list) {
+    const inWin = r.startMin < r.endMin
+      ? (minute >= r.startMin && minute < r.endMin)
+      : (minute >= r.startMin || minute < r.endMin)
+    if (inWin) interval = r.interval
+    for (const b of [r.startMin, r.endMin]) {
+      let delta = b - minute
+      if (delta <= 0) delta += 1440
+      if (delta < best) best = delta
+    }
+  }
+  const untilChangeMs = Number.isFinite(best) ? Math.max(1000, best * 60000 - (local % 60000)) : 0
+  return { interval, untilChangeMs }
 }
 
 // ── v3.300 访问日志常量 ─────────────────────────────────────────────────────
@@ -3518,6 +3579,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const auto = {
     on: false,
     interval: AUTO_DEFAULT_S,
+    schedule: [],
     startedAt: 0,
     nextAt: 0,
     runs: 0,
@@ -3530,6 +3592,10 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (raw && typeof raw === 'object') {
       if (raw.on === true) auto.on = true
       if (raw.interval !== undefined) auto.interval = clampAutoSeconds(raw.interval)
+      // 分时段读盘同样校验：坏条目整份丢弃（不让半截规则参与调度），但保留主间隔。
+      const loadedSchedule = normalizeAutoSchedule(raw.schedule)
+      if (loadedSchedule.ok) auto.schedule = loadedSchedule.value
+      else console.error(`⚠️ 自动运行分时段配置无效，已忽略：${loadedSchedule.error}`)
     }
   } catch (e) {
     if (!e || e.code !== 'ENOENT') {
@@ -3543,6 +3609,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const autoSnapshot = () => ({
     on: auto.on,
     interval: auto.interval,
+    schedule: auto.schedule.map((r) => ({ start: r.start, end: r.end, interval: r.interval })),
     startedAt: auto.startedAt,
     nextAt: auto.nextAt,
     runs: auto.runs,
@@ -3555,7 +3622,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 时会在 autoPath 留下半截 JSON，重启读盘把它当「读取失败，按停止处理」，
     // 自动运行开关被静默关掉；原子写只会有「旧文件」或「新文件」两态。
     try {
-      if (writeAtomic(autoPath, JSON.stringify({ on: auto.on, interval: auto.interval, updatedAt: Date.now() }), '自动运行状态')) return true
+      if (writeAtomic(autoPath, JSON.stringify({
+        on: auto.on,
+        interval: auto.interval,
+        schedule: auto.schedule.map((r) => ({ start: r.start, end: r.end, interval: r.interval })),
+        updatedAt: Date.now()
+      }), '自动运行状态')) return true
       console.error('⚠️ 自动运行状态落盘失败（进程内仍生效）')
       return false
     } catch (e) {
@@ -3577,6 +3649,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     auto.lastError = reason
     persistAuto()
   }
+  // 下一轮延迟：窗口内用窗口间隔；并在最近一次窗口边界处醒一次，
+  // 否则「夜里 600 秒一轮」会跨过窗口结束、把白天也拖成 600 秒。
+  function autoDelayMs () {
+    const eff = autoIntervalAt(auto.schedule, auto.interval, Date.now())
+    const base = eff.interval * 1000
+    const delay = eff.untilChangeMs > 0 ? Math.min(base, eff.untilChangeMs) : base
+    return Math.max(1000, delay)
+  }
   function scheduleAuto (delayMs) {
     clearAutoTimer()
     if (!auto.on || shuttingDown) return
@@ -3592,7 +3672,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (!auto.on || shuttingDown) return
     // 手动/上一次自动运行还没结束：不叠跑，按间隔再试。
     if (autoInFlightId || activeChildren.size > 0) {
-      scheduleAuto(auto.interval * 1000)
+      scheduleAuto(autoDelayMs())
       return
     }
     const now = Date.now()
@@ -3606,11 +3686,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         auto.lastError = `锁获取失败：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`
         console.error(`⚠️ 自动运行锁获取失败（stateDir=${stateDir}）：${auto.lastError}`)
         if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次锁获取失败，已停止`)
-        else scheduleAuto(auto.interval * 1000)
+        else scheduleAuto(autoDelayMs())
         return
       }
       // 青龙/另一控制台实例持锁：不抢跑，也不计失败。
-      scheduleAuto(auto.interval * 1000)
+      scheduleAuto(autoDelayMs())
       return
     }
     let record
@@ -3621,7 +3701,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       auto.fails += 1
       auto.lastError = `启动失败：${e && e.message ? e.message : e}`
       if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次启动失败，已停止`)
-      else scheduleAuto(auto.interval * 1000)
+      else scheduleAuto(autoDelayMs())
       return
     }
     record._lockAt = now
@@ -3647,13 +3727,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         auto.fails = 0
         auto.lastError = ''
       }
-      if (auto.on) scheduleAuto(auto.interval * 1000)
+      if (auto.on) scheduleAuto(autoDelayMs())
     }, 250)
     if (typeof autoWaitTimer.unref === 'function') autoWaitTimer.unref()
   }
   if (auto.on) {
     auto.startedAt = Date.now()
-    scheduleAuto(auto.interval * 1000)
+    scheduleAuto(autoDelayMs())
   }
   // 读取持久化重放记录：返回 { entries, problem }。
   // problem = null：正常，或文件根本不存在（首次启动）。非空字符串：**文件在、但读不出来**
@@ -4696,7 +4776,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 所有文件都成功后才删草稿：中途失败时草稿仍是导入前那份，便于继续编辑。
         if (plans.filter) clearFilterDraftFile()
         // 间隔已成功落盘，再调整待执行的定时器；自动运行开关本身始终不变。
-        if (plans.auto && auto.on) scheduleAuto(auto.interval * 1000)
+        if (plans.auto && auto.on) scheduleAuto(autoDelayMs())
         const response = {
           ok: true,
           imported,
@@ -6385,7 +6465,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     // 服务器端自动正式运行：状态/开关/间隔。GET 走全局鉴权；POST 只认 Bearer（写面防 CSRF）。
     if (req.method === 'GET' && url.pathname === '/api/auto') {
-      sendJsonConditional(req, res, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
+      sendJsonConditional(req, res, {
+        auto: autoSnapshot(),
+        min: AUTO_MIN_S,
+        max: AUTO_MAX_S,
+        maxFails: AUTO_MAX_FAILS,
+        scheduleMax: AUTO_SCHEDULE_MAX,
+        scheduleMaxSeconds: AUTO_SCHEDULE_MAX_S
+      })
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/auto') {
@@ -6411,8 +6498,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             }
             interval = payload.interval
           }
+          let schedule = auto.schedule
+          if (Object.prototype.hasOwnProperty.call(payload, 'schedule')) {
+            const parsed = normalizeAutoSchedule(payload.schedule)
+            if (!parsed.ok) { sendJson(res, 400, { error: parsed.error }); return }
+            schedule = parsed.value
+          }
           if (on) {
             auto.interval = interval
+            auto.schedule = schedule
             if (!auto.on) {
               auto.on = true
               auto.startedAt = Date.now()
@@ -6422,12 +6516,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             }
             persistAuto()
             // 有在途轮次时不重排；它结束后按新间隔排下一轮。
-            if (!autoInFlightId) scheduleAuto(auto.interval * 1000)
+            if (!autoInFlightId) scheduleAuto(autoDelayMs())
           } else {
             auto.interval = interval
+            auto.schedule = schedule
             stopAuto('')
           }
-          sendJson(res, 200, { auto: autoSnapshot(), min: AUTO_MIN_S, max: AUTO_MAX_S, maxFails: AUTO_MAX_FAILS })
+          sendJson(res, 200, {
+            auto: autoSnapshot(),
+            min: AUTO_MIN_S,
+            max: AUTO_MAX_S,
+            maxFails: AUTO_MAX_FAILS,
+            scheduleMax: AUTO_SCHEDULE_MAX,
+            scheduleMaxSeconds: AUTO_SCHEDULE_MAX_S
+          })
         })
         .catch((e) => { logCaught('auto/config', e); sendJson(res, 500, { error: '读取请求体失败' }) })
       return
@@ -7144,6 +7246,12 @@ module.exports = {
   extractArticleHtml,
   formatWatchPushRich,
   clampWatchInt,
+  // v3.401 自动运行分时段间隔：纯函数入口（HTTP 之外的边界/跨午夜单测）
+  parseAutoHHMM,
+  normalizeAutoSchedule,
+  autoIntervalAt,
+  AUTO_SCHEDULE_MAX,
+  AUTO_SCHEDULE_MAX_S,
   LINE_WATCH_FILE,
   LINE_WATCH_MAX_WORDS,
   LINE_WATCH_DEFAULT_LIMIT,

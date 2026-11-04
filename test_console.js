@@ -4715,15 +4715,37 @@ async function main () {
     })
     assert.strictEqual(badType.status, 400, 'interval 必须是整数，不接受字符串')
 
+    const schedBadTime = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ schedule: [{ start: '3:00', end: '07:00', interval: 60 }] })
+    })
+    assert.strictEqual(schedBadTime.status, 400, '时间格式不合法拒绝')
+    const schedBadIv = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ schedule: [{ start: '03:00', end: '07:00', interval: 601 }] })
+    })
+    assert.strictEqual(schedBadIv.status, 400, '分时段间隔超出 600 拒绝')
+    const schedBadSame = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ schedule: [{ start: '03:00', end: '03:00', interval: 60 }] })
+    })
+    assert.strictEqual(schedBadSame.status, 400, '起止相同拒绝')
+
     const save = await request(port, 'POST', '/api/auto', {
       token: TOKEN,
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ interval: 5 })
+      body: JSON.stringify({ interval: 5, schedule: [{ start: '03:00', end: '07:00', interval: 30 }] })
     })
     assert.strictEqual(save.status, 200)
     assert.strictEqual(JSON.parse(save.text).auto.on, false, '只保存间隔不启动')
     assert.strictEqual(JSON.parse(save.text).auto.interval, 5)
-    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).on, false)
+    assert.deepStrictEqual(JSON.parse(save.text).auto.schedule, [{ start: '03:00', end: '07:00', interval: 30 }], '分时段保存后立即生效')
+    const savedFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
+    assert.strictEqual(savedFile.on, false)
+    assert.deepStrictEqual(savedFile.schedule, [{ start: '03:00', end: '07:00', interval: 30 }], '分时段要落盘')
 
     const start = await request(port, 'POST', '/api/auto', {
       token: TOKEN,
@@ -4745,6 +4767,7 @@ async function main () {
     assert.strictEqual(resumed.status, 200)
     assert.strictEqual(JSON.parse(resumed.text).auto.on, true, '服务器重启后应恢复自动运行')
     assert.strictEqual(JSON.parse(resumed.text).auto.interval, 5, '间隔也应恢复')
+    assert.deepStrictEqual(JSON.parse(resumed.text).auto.schedule, [{ start: '03:00', end: '07:00', interval: 30 }], '分时段也应恢复')
 
     const stop = await request(port2, 'POST', '/api/auto', {
       token: TOKEN,
@@ -4756,6 +4779,56 @@ async function main () {
     assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8')).on, false)
     await new Promise(resolve => second.server.close(resolve))
   })
+  await aok('自动运行分时段：校验 / 窗口命中 / 跨午夜 / 边界唤醒（v3.401）', () => {
+    const { parseAutoHHMM, normalizeAutoSchedule, autoIntervalAt } = require('./scripts/console.js')
+    assert.strictEqual(parseAutoHHMM('00:00'), 0)
+    assert.strictEqual(parseAutoHHMM('23:59'), 1439)
+    assert.strictEqual(parseAutoHHMM('3:00'), null, '必须两位小时')
+    assert.strictEqual(parseAutoHHMM('24:00'), null)
+    assert.strictEqual(parseAutoHHMM('03:60'), null)
+
+    const bad = [
+      ['not-array', { }],
+      ['too-many', Array.from({ length: 9 }, () => ({ start: '01:00', end: '02:00', interval: 10 }))],
+      ['bad-start', [{ start: '3:00', end: '07:00', interval: 10 }]],
+      ['same', [{ start: '03:00', end: '03:00', interval: 10 }]],
+      ['iv-low', [{ start: '03:00', end: '07:00', interval: 2 }]],
+      ['iv-high', [{ start: '03:00', end: '07:00', interval: 601 }]],
+      ['iv-str', [{ start: '03:00', end: '07:00', interval: '10' }]]
+    ]
+    for (const [name, list] of bad) {
+      const r = normalizeAutoSchedule(Array.isArray(list) ? list : name)
+      assert.strictEqual(r.ok, false, `${name} 必须拒绝`)
+    }
+    const okv = normalizeAutoSchedule([{ start: '03:00', end: '07:00', interval: 60 }])
+    assert.strictEqual(okv.ok, true)
+    assert.deepStrictEqual({ start: okv.value[0].start, end: okv.value[0].end, interval: okv.value[0].interval },
+      { start: '03:00', end: '07:00', interval: 60 })
+
+    const bj = (h, m) => Date.UTC(2026, 10, 4, h - 8, m) // 北京时间 → UTC 毫秒
+    const sched = normalizeAutoSchedule([{ start: '03:00', end: '07:00', interval: 60 }]).value
+    assert.strictEqual(autoIntervalAt(sched, 5, bj(2, 59)).interval, 5, '窗口外走主间隔')
+    assert.strictEqual(autoIntervalAt(sched, 5, bj(3, 0)).interval, 60, '窗口起点含')
+    assert.strictEqual(autoIntervalAt(sched, 5, bj(6, 59)).interval, 60)
+    assert.strictEqual(autoIntervalAt(sched, 5, bj(7, 0)).interval, 5, '窗口终点不含')
+    const at3 = autoIntervalAt(sched, 5, bj(3, 30))
+    assert.ok(at3.untilChangeMs > 0 && at3.untilChangeMs <= 3.5 * 3600 * 1000, '必须给出到 07:00 的边界')
+
+    // 跨午夜 23:00–07:00：23:30 与 06:59 都在窗口内
+    const cross = normalizeAutoSchedule([{ start: '23:00', end: '07:00', interval: 120 }]).value
+    assert.strictEqual(autoIntervalAt(cross, 5, bj(23, 30)).interval, 120)
+    assert.strictEqual(autoIntervalAt(cross, 5, bj(6, 59)).interval, 120)
+    assert.strictEqual(autoIntervalAt(cross, 5, bj(12, 0)).interval, 5)
+
+    // 多条窗口：后命中的覆盖前者（按顺序取最后一个命中，便于临时覆盖）
+    const multi = normalizeAutoSchedule([
+      { start: '09:00', end: '12:00', interval: 8 },
+      { start: '10:00', end: '11:00', interval: 3 }
+    ]).value
+    assert.strictEqual(autoIntervalAt(multi, 5, bj(9, 30)).interval, 8)
+    assert.strictEqual(autoIntervalAt(multi, 5, bj(10, 30)).interval, 3, '重叠窗口后者优先')
+  })
+
   await aok('HTTP: POST /api/notify-test 鉴权面（K2）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
