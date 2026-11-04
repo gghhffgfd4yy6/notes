@@ -333,22 +333,34 @@ function normalizeAutoSchedule (list) {
   }
   return { ok: true, value: out }
 }
-// 当前生效间隔 + 距下一个窗口边界的毫秒数（跨午夜窗口按 start > end 处理）。
-function autoIntervalAt (schedule, baseInterval, ms) {
-  const list = Array.isArray(schedule) ? schedule : []
-  if (list.length === 0) return { interval: baseInterval, untilChangeMs: 0 }
-  const local = ((ms + AUTO_TZ_OFFSET_MS) % AUTO_DAY_MS + AUTO_DAY_MS) % AUTO_DAY_MS
-  const minute = Math.floor(local / 60000)
+// 某一分钟（0–1439）的生效间隔：窗口按顺序覆盖，后一条优先（重叠时便于临时改一档）。
+function autoIntervalForMinute (list, baseInterval, minute) {
   let interval = baseInterval
-  let best = Infinity
   for (const r of list) {
     const inWin = r.startMin < r.endMin
       ? (minute >= r.startMin && minute < r.endMin)
       : (minute >= r.startMin || minute < r.endMin)
     if (inWin) interval = r.interval
+  }
+  return interval
+}
+// 当前生效间隔 + 距下一个「真正改变间隔」的窗口边界的毫秒数（跨午夜窗口按 start > end 处理）。
+// 只把改变生效间隔的边界算进来：被后一条窗口遮住的边界不唤醒，否则会白跑一轮扫描
+// （Sourcery Medium：masked boundary 不得触发额外扫描）。
+function autoIntervalAt (schedule, baseInterval, ms) {
+  const list = Array.isArray(schedule) ? schedule : []
+  if (list.length === 0) return { interval: baseInterval, untilChangeMs: 0 }
+  const local = ((ms + AUTO_TZ_OFFSET_MS) % AUTO_DAY_MS + AUTO_DAY_MS) % AUTO_DAY_MS
+  const minute = Math.floor(local / 60000)
+  const interval = autoIntervalForMinute(list, baseInterval, minute)
+  let best = Infinity
+  for (const r of list) {
     for (const b of [r.startMin, r.endMin]) {
       let delta = b - minute
       if (delta <= 0) delta += 1440
+      // 边界处（b 分钟）与边界前一分钟（b-1，跨午夜取模）若生效间隔相同，这条边界不改变行为
+      const beforeMin = (b + 1439) % 1440
+      if (autoIntervalForMinute(list, baseInterval, beforeMin) === autoIntervalForMinute(list, baseInterval, b)) continue
       if (delta < best) best = delta
     }
   }
@@ -3580,6 +3592,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     on: false,
     interval: AUTO_DEFAULT_S,
     schedule: [],
+    updatedAt: 0,
     startedAt: 0,
     nextAt: 0,
     runs: 0,
@@ -3596,6 +3609,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const loadedSchedule = normalizeAutoSchedule(raw.schedule)
       if (loadedSchedule.ok) auto.schedule = loadedSchedule.value
       else console.error(`⚠️ 自动运行分时段配置无效，已忽略：${loadedSchedule.error}`)
+      if (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) auto.updatedAt = raw.updatedAt
     }
   } catch (e) {
     if (!e || e.code !== 'ENOENT') {
@@ -3610,6 +3624,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     on: auto.on,
     interval: auto.interval,
     schedule: auto.schedule.map((r) => ({ start: r.start, end: r.end, interval: r.interval })),
+    updatedAt: auto.updatedAt,
     startedAt: auto.startedAt,
     nextAt: auto.nextAt,
     runs: auto.runs,
@@ -3622,11 +3637,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 时会在 autoPath 留下半截 JSON，重启读盘把它当「读取失败，按停止处理」，
     // 自动运行开关被静默关掉；原子写只会有「旧文件」或「新文件」两态。
     try {
+      auto.updatedAt = Date.now()
       if (writeAtomic(autoPath, JSON.stringify({
         on: auto.on,
         interval: auto.interval,
         schedule: auto.schedule.map((r) => ({ start: r.start, end: r.end, interval: r.interval })),
-        updatedAt: Date.now()
+        updatedAt: auto.updatedAt
       }), '自动运行状态')) return true
       console.error('⚠️ 自动运行状态落盘失败（进程内仍生效）')
       return false
@@ -4452,7 +4468,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
       }
       if (selected.includes('auto')) {
-        data.auto = { interval: auto.interval }
+        // v3.401：备份必须带上分时段窗口，否则恢复后夜间间隔丢失（Sourcery Medium）
+        data.auto = {
+          interval: auto.interval,
+          schedule: auto.schedule.map((r) => ({ start: r.start, end: r.end, interval: r.interval }))
+        }
       }
       if (selected.includes('runLog')) {
         const read = readBackupFile(path.join(historyDir(), 'run.log'), BACKUP_RUN_LOG_MAX_BYTES)
@@ -4553,10 +4573,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       if (data.auto !== undefined) {
         const interval = data.auto && data.auto.interval
+        const rawSchedule = data.auto && data.auto.schedule
         if (!Number.isInteger(interval) || interval < AUTO_MIN_S || interval > AUTO_MAX_S) {
           errors.push({ field: 'auto', code: 'invalid_auto', message: '自动运行间隔备份无效' })
         } else {
-          plans.auto = { interval }
+          let schedule = []
+          if (rawSchedule !== undefined) {
+            const parsed = normalizeAutoSchedule(rawSchedule)
+            if (!parsed.ok) {
+              errors.push({ field: 'auto', code: 'invalid_auto_schedule', message: `自动运行分时段备份无效：${parsed.error}` })
+            } else {
+              schedule = parsed.value
+            }
+          }
+          if (!errors.some((e) => e.field === 'auto')) plans.auto = { interval, schedule }
         }
       }
       if (data.runLog !== undefined) {
@@ -4736,11 +4766,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         }
         if (plans.auto) {
           auto.interval = plans.auto.interval
+          auto.schedule = Array.isArray(plans.auto.schedule) ? plans.auto.schedule : []
           if (!persistAuto()) {
             abortImport('auto', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
+          if (auto.on) scheduleAuto(autoDelayMs())
           imported.autoInterval = plans.auto.interval
+          imported.autoSchedule = auto.schedule.length
         }
         if (plans.runLog) {
           if (!writeAtomic(runLogPath, plans.runLog.text, '运行日志恢复')) {
@@ -6499,7 +6532,14 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             interval = payload.interval
           }
           let schedule = auto.schedule
-          if (Object.prototype.hasOwnProperty.call(payload, 'schedule')) {
+          const writesSchedule = Object.prototype.hasOwnProperty.call(payload, 'schedule')
+          if (writesSchedule) {
+            // 乐观并发：两个标签页各改一份再保存时，后提交者不得静默覆盖先提交者的窗口。
+            // 客户端带上读取时的 updatedAt；可选参数，老客户端/脚本不带也能写（兼容）。
+            if (typeof payload.baseUpdatedAt === 'number' && payload.baseUpdatedAt !== auto.updatedAt) {
+              sendJson(res, 409, { error: 'schedule_conflict', message: '另一个标签页刚改过分时段，请刷新后再保存', auto: autoSnapshot() })
+              return
+            }
             const parsed = normalizeAutoSchedule(payload.schedule)
             if (!parsed.ok) { sendJson(res, 400, { error: parsed.error }); return }
             schedule = parsed.value
@@ -6514,13 +6554,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
               auto.fails = 0
               auto.lastError = ''
             }
-            persistAuto()
+            if (!persistAuto()) {
+              sendJson(res, 500, { error: '自动运行配置落盘失败，请检查缓存目录权限/磁盘' })
+              return
+            }
             // 有在途轮次时不重排；它结束后按新间隔排下一轮。
             if (!autoInFlightId) scheduleAuto(autoDelayMs())
           } else {
             auto.interval = interval
             auto.schedule = schedule
             stopAuto('')
+            if (!persistAuto()) {
+              sendJson(res, 500, { error: '自动运行配置落盘失败，请检查缓存目录权限/磁盘' })
+              return
+            }
           }
           sendJson(res, 200, {
             auto: autoSnapshot(),

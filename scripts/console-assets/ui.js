@@ -1025,10 +1025,14 @@ function App () {
     return v
   }, [])
   const saveAutoSchedule = useCallback(async (schedule) => {
-    const data = await apiSetAuto({ schedule })
+    // 带上读取时的 updatedAt：另一个标签页先保存时后端回 409，避免后写覆盖先写
+    const base = autoState && typeof autoState.updatedAt === 'number' && autoState.updatedAt > 0
+      ? { baseUpdatedAt: autoState.updatedAt }
+      : {}
+    const data = await apiSetAuto({ schedule, ...base })
     if (data && data.auto) setAutoState(data.auto)
     return data
-  }, [])
+  }, [autoState && autoState.updatedAt])
   const stopAuto = useCallback(async () => {
     const data = await apiSetAuto({ on: false })
     if (data && data.auto) setAutoState(data.auto)

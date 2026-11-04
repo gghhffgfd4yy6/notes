@@ -2493,7 +2493,7 @@ async function backupApiTests () {
     fs.writeFileSync(path.join(dir, 'filter-rules.json'), JSON.stringify({ schema: 1, revision: 2, filter: { pingbifenlei: 'old' } }))
     fs.writeFileSync(path.join(dir, 'run.log'), 'old log\n')
     fs.writeFileSync(path.join(dir, 'console-settings.json'), JSON.stringify({ revision: 2, updatedAt: Date.now(), notifyTestReplayWindowS: 9, syncShowDate: false }))
-    fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: false, interval: 7, updatedAt: Date.now() }))
+    fs.writeFileSync(path.join(dir, 'console-auto.json'), JSON.stringify({ on: false, interval: 7, schedule: [{ start: '03:00', end: '07:00', interval: 60 }], updatedAt: Date.now() }))
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
     try {
@@ -2509,6 +2509,7 @@ async function backupApiTests () {
       assert.deepStrictEqual(Object.keys(bundle.data).sort((a, b) => a.localeCompare(b)), ['auto', 'filter', 'messages', 'runLog', 'settings'])
       assert.strictEqual(bundle.data.messages.count, 2)
       assert.strictEqual(bundle.data.auto.interval, 7)
+      assert.deepStrictEqual(bundle.data.auto.schedule, [{ start: '03:00', end: '07:00', interval: 60 }], '备份必须带上分时段窗口')
       assert.ok(!Object.prototype.hasOwnProperty.call(bundle.data.auto, 'on'), '备份文件不得记录自动运行开关')
       assert.strictEqual(bundle.data.settings.notifyTestReplayWindowS, 9)
       assert.ok(bundle.data.filter.text.includes('pingbifenlei'))
@@ -2660,7 +2661,7 @@ async function backupApiTests () {
           messages: { count: 1, text: JSON.stringify([{ id: 9, title: 'new' }]) },
           filter: { text: JSON.stringify({ schema: 1, revision: 8, filter: { pingbifenlei: 'new' } }) },
           settings: { notifyTestReplayWindowS: 5, syncShowDate: true },
-          auto: { interval: 12 },
+          auto: { interval: 12, schedule: [{ start: '23:00', end: '07:00', interval: 120 }] },
           runLog: { text: 'new log\n' }
         }
       }
@@ -2674,6 +2675,7 @@ async function backupApiTests () {
       assert.strictEqual(result.ok, true)
       assert.strictEqual(result.imported.messages, 1)
       assert.strictEqual(result.imported.autoInterval, 12)
+      assert.strictEqual(result.imported.autoSchedule, 1, '恢复必须带回分时段窗口')
       assert.ok(result.backupDir)
       assert.strictEqual(fs.readFileSync(path.join(dir, 'push.json'), 'utf8'), '[{"id":9,"title":"new"}]')
       assert.match(fs.readFileSync(path.join(dir, 'filter-rules.json'), 'utf8'), /"pingbifenlei":"new"/)
@@ -2683,6 +2685,7 @@ async function backupApiTests () {
       const autoFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
       assert.strictEqual(autoFile.interval, 12)
       assert.strictEqual(autoFile.on, false, '导入不得把自动运行打开')
+      assert.deepStrictEqual(autoFile.schedule, [{ start: '23:00', end: '07:00', interval: 120 }], '分时段窗口要落盘')
       const settingsFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-settings.json'), 'utf8'))
       assert.strictEqual(settingsFile.notifyTestReplayWindowS, 5)
       assert.strictEqual(settingsFile.syncShowDate, true)
@@ -4746,6 +4749,17 @@ async function main () {
     const savedFile = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
     assert.strictEqual(savedFile.on, false)
     assert.deepStrictEqual(savedFile.schedule, [{ start: '03:00', end: '07:00', interval: 30 }], '分时段要落盘')
+    assert.ok(savedFile.updatedAt > 0, '落盘要带 updatedAt（乐观并发基准）')
+    // 另一个标签页拿着过期 updatedAt 提交 ⇒ 409，不得静默覆盖
+    const conflict = await request(port, 'POST', '/api/auto', {
+      token: TOKEN,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ schedule: [{ start: '01:00', end: '02:00', interval: 20 }], baseUpdatedAt: savedFile.updatedAt - 1 })
+    })
+    assert.strictEqual(conflict.status, 409, '过期基准必须 409')
+    assert.strictEqual(JSON.parse(conflict.text).error, 'schedule_conflict')
+    const afterConflict = JSON.parse(fs.readFileSync(path.join(dir, 'console-auto.json'), 'utf8'))
+    assert.deepStrictEqual(afterConflict.schedule, [{ start: '03:00', end: '07:00', interval: 30 }], '冲突时不得写入')
 
     const start = await request(port, 'POST', '/api/auto', {
       token: TOKEN,
@@ -4812,6 +4826,10 @@ async function main () {
     assert.strictEqual(autoIntervalAt(sched, 5, bj(6, 59)).interval, 60)
     assert.strictEqual(autoIntervalAt(sched, 5, bj(7, 0)).interval, 5, '窗口终点不含')
     const at3 = autoIntervalAt(sched, 5, bj(3, 30))
+    // 边界必须扣掉当前分钟内的秒/毫秒，否则会晚醒（Sourcery Medium：04:30:45.123 → 距 07:00 应 ≈ 2:29:14.877）
+    const at3s = autoIntervalAt(sched, 5, bj(3, 30) + 45 * 1000 + 123)
+    assert.ok(Math.abs(at3s.untilChangeMs - (3.5 * 3600 * 1000 - 45 * 1000 - 123)) < 1000,
+      `边界要扣掉秒/毫秒，实际 ${at3s.untilChangeMs}`)
     assert.ok(at3.untilChangeMs > 0 && at3.untilChangeMs <= 3.5 * 3600 * 1000, '必须给出到 07:00 的边界')
 
     // 跨午夜 23:00–07:00：23:30 与 06:59 都在窗口内
@@ -4827,6 +4845,14 @@ async function main () {
     ]).value
     assert.strictEqual(autoIntervalAt(multi, 5, bj(9, 30)).interval, 8)
     assert.strictEqual(autoIntervalAt(multi, 5, bj(10, 30)).interval, 3, '重叠窗口后者优先')
+
+    // 被后一条窗口遮住的边界不算「生效间隔变化」，不得唤醒白跑一轮（Sourcery Medium）
+    const masked = normalizeAutoSchedule([
+      { start: '03:00', end: '09:00', interval: 60 },
+      { start: '03:00', end: '07:00', interval: 60 }
+    ]).value
+    // 06:00 时 07:00 边界不改变间隔（两条都是 60）⇒ 下一个真正的变化点是 09:00
+    assert.strictEqual(autoIntervalAt(masked, 5, bj(6, 0)).untilChangeMs, 3 * 3600 * 1000)
   })
 
   await aok('HTTP: POST /api/notify-test 鉴权面（K2）', async () => {

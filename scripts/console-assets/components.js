@@ -1263,25 +1263,42 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
   // 默认值 03:00–07:00 / 60 秒只是「新增一行」的起点，用户可以改成任意时段（支持跨午夜）。
   const [schedDraft, setSchedDraft] = useState(Array.isArray(auto.schedule) ? auto.schedule : [])
   const [schedSaved, setSchedSaved] = useState(false)
+  // 每 2 秒的 /api/auto 轮询会换掉 auto.schedule 的数组身份；直接同步会把正在编辑的草稿冲掉
+  // （Sourcery High）。按内容签名比较：只有服务端内容真的变了、且本地没有未保存修改时才同步。
+  const [schedDirty, setSchedDirty] = useState(false)
   const schedSavedTimerRef = useRef(0)
+  const serverSchedSig = JSON.stringify(Array.isArray(auto.schedule) ? auto.schedule : [])
+  const lastSchedSigRef = useRef(serverSchedSig)
   useEffect(() => {
+    if (serverSchedSig === lastSchedSigRef.current) return
+    lastSchedSigRef.current = serverSchedSig
+    if (schedDirty) return
     setSchedDraft(Array.isArray(auto.schedule) ? auto.schedule.map((r) => ({ ...r })) : [])
-  }, [auto.schedule])
+  }, [serverSchedSig, schedDirty])
   useEffect(() => () => clearTimeout(schedSavedTimerRef.current), [])
   const editSched = (i, key, value) => {
     setSchedDraft((prev) => prev.map((r, k) => (k === i ? { ...r, [key]: value } : r)))
     setSchedSaved(false)
+    setSchedDirty(true)
   }
   const addSched = () => {
     setSchedDraft((prev) => prev.length >= 8 ? prev : [...prev, { start: '03:00', end: '07:00', interval: 60 }])
     setSchedSaved(false)
+    setSchedDirty(true)
   }
-  const removeSched = (i) => { setSchedDraft((prev) => prev.filter((_, k) => k !== i)); setSchedSaved(false) }
+  const removeSched = (i) => {
+    setSchedDraft((prev) => prev.filter((_, k) => k !== i))
+    setSchedSaved(false)
+    setSchedDirty(true)
+  }
   const saveSched = async () => {
     setErr('')
     try {
       const payload = schedDraft.map((r) => ({ start: String(r.start || ''), end: String(r.end || ''), interval: Number(r.interval) }))
       if (auto.saveSchedule) await auto.saveSchedule(payload)
+      setSchedDraft(payload)
+      setSchedDirty(false)
+      lastSchedSigRef.current = JSON.stringify(payload)
       setSchedSaved(true)
       clearTimeout(schedSavedTimerRef.current)
       schedSavedTimerRef.current = setTimeout(() => setSchedSaved(false), 1500)
