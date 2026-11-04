@@ -796,9 +796,31 @@ check('_writeRunLog size > 1MiB ⇒ 只读尾部 512KiB，按首个换行对齐�
   const rec = makeLogFs({ size: 2 * LIMIT, tail: head + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(rec.rec.read, [[8, KEEP, 2 * LIMIT - KEEP, KEEP]])
+  assert.deepStrictEqual(rec.rec.read, [[8, KEEP, 2 * LIMIT - KEEP, KEEP], [8, 2 * LIMIT - KEEP, 0, 2 * LIMIT - KEEP]])
   assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
+  assert.deepStrictEqual(rec.rec.append.map((a) => a[0]), [LOG_PATH, `${LOG_PATH}.archive.gz`], '被丢弃的头部必须归档成 gzip')
+})
+
+check('_archiveLogHead：归档是合法多成员 gzip，解压后等于被丢弃的头部；无头部 / 读失败都静默跳过', () => {
+  const zlib = require('node:zlib')
+  const parts = []
+  const head = 'ARCHIVED-HEAD\n'
+  const fs2 = {
+    readSync: (fd, buf, off, len, pos) => { Buffer.from(head).copy(buf, off); return len },
+    statSync: () => ({ size: 0 }),
+    appendFileSync: (p, data) => { parts.push([p, data]) },
+    unlinkSync: () => {}
+  }
+  const app = makeApp({ fs: fs2, Utils: makeUtils() })
+  app._archiveLogHead(LOG_PATH, 8, head.length)
+  assert.strictEqual(parts.length, 1, '必须追加一次')
+  assert.strictEqual(parts[0][0], `${LOG_PATH}.archive.gz`)
+  assert.strictEqual(zlib.gunzipSync(parts[0][1]).toString('utf8'), head, '解压后必须与头部逐字节一致')
+  app._archiveLogHead(LOG_PATH, 8, 0)
+  assert.strictEqual(parts.length, 1, 'headLen<=0 时不得写归档')
+  const appBad = makeApp({ fs: { readSync: () => { throw new Error('EIO') }, statSync: () => ({ size: 0 }), appendFileSync: () => { throw new Error('boom') } }, Utils: makeUtils() })
+  assert.doesNotThrow(() => appBad._archiveLogHead(LOG_PATH, 8, 10), '归档失败不得抛出（不能阻断截尾）')
 })
 
 check('_writeRunLog 尾部无换行 ⇒ 整体写回（不得写空）', () => {
@@ -833,7 +855,7 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
-  assert.strictEqual(rec.rec.read.length, 1)
+  assert.strictEqual(rec.rec.read.length, 2, '尾部读 + 归档头读')
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
@@ -944,13 +966,14 @@ check('_writeRunLog 截尾失败 ⇒ 60s 内不再追加，窗口过后恢复', 
   const { app } = makeLogApp({ rec })
   app._writeTextAtomic = () => false
   withFixedNow(t0, () => app._writeRunLog('A\n'))
-  const afterFirst = rec.rec.append.length
+  const logAppends = () => rec.rec.append.filter((a) => a[0] === LOG_PATH).length
+  const afterFirst = logAppends()
   assert.ok(afterFirst >= 1, '首行先追加后才尝试截尾')
   const blocked = withCapture('log', () => withFixedNow(t0 + 1000, () => app._writeRunLog('B\n')))
-  assert.strictEqual(rec.rec.append.length, afterFirst, '退避窗口内不得继续追加')
+  assert.strictEqual(logAppends(), afterFirst, '退避窗口内不得继续追加')
   assert.deepStrictEqual(blocked.msgs, ['B'], '被挡下的行回显 stdout')
   const resumed = withFixedNow(t0 + 61 * 1000, () => app._writeRunLog('C\n'))
-  assert.strictEqual(rec.rec.append.length, afterFirst + 1, '窗口过后恢复追加')
+  assert.strictEqual(logAppends(), afterFirst + 1, '窗口过后恢复追加')
   assert.strictEqual(resumed, undefined)
 })
 
@@ -3874,7 +3897,7 @@ check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁�
   const rec = makeLogFs({ size: 2 * LIMIT, tail: '\nTAIL' })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.strictEqual(rec.rec.append.length, 1, '持锁时照常追加')
+  assert.strictEqual(rec.rec.append.filter((a) => a[0] === LOG_PATH).length, 1, '持锁时照常追加')
   assert.strictEqual(cap.length, 1, '持锁时超 1MiB 必须走原子写回（截尾）')
 })
 

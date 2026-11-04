@@ -1,4 +1,5 @@
 const { setTimeout: delay } = require('node:timers/promises')
+const zlib = require('node:zlib')
 const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 const Similar = require('./scripts/similar-dedupe.js')
 
@@ -213,6 +214,26 @@ function createApp ({
     // 整批 NDJSON（lines.join('\n')），按整串首个 " ERROR " 截到 512 字符会把后面的记录连同其 JSON
     // 结构一起切掉，末行留下半条非法 JSON（13 条只落 4~7 行）。批量写入必须逐条整行落盘，截断只在
     // 单条日志自己身上发生。
+    // v3.400：把截尾将要丢弃的头部追加进 <日志>.archive.gz（多成员 gzip，zcat/gunzip 直接可读）。
+    // 只做尽力而为：读/压缩/追加任一步失败就整体跳过——归档是附加价值，绝不能让截尾失败。
+    // 归档体积超过 64 MiB 时先删旧档再写，避免长期运行把缓存盘占满。
+    _archiveLogHead (logPath, fd, headLen) {
+      if (!Number.isFinite(headLen) || headLen <= 0) return
+      try {
+        const head = Buffer.alloc(headLen)
+        let read = 0
+        while (read < headLen) {
+          const n = fs.readSync(fd, head, read, headLen - read, read)
+          if (!n) break
+          read += n
+        }
+        if (read <= 0) return
+        const archive = `${logPath}.archive.gz`
+        try { if (fs.statSync(archive).size > 64 * 1024 * 1024) fs.unlinkSync(archive) } catch (e) { /* 旧档不存在或不可删：照常追加 */ }
+        fs.appendFileSync(archive, zlib.gzipSync(head.subarray(0, read)))
+      } catch (e) { /* 归档失败不影响截尾 */ }
+    },
+
     _writeRunLog (line, filename = 'run.log', opts = {}) {
       try {
         const isWhitelisted = typeof filename === 'string' && LOG_FILES.has(filename)
@@ -307,6 +328,9 @@ function createApp ({
               const last = trimmed.charCodeAt(trimmed.length - 1)
               if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
               const nl = trimmed.indexOf('\n')
+              // v3.400：截尾前把即将被丢弃的头部追加归档成 gzip（多成员 gzip，zcat 可直接读）。
+              // 归档纯尽力而为：失败只跳过归档，绝不阻断截尾——否则磁盘只读/配额满时日志会停在超限大小。
+              this._archiveLogHead(logPath, fd, st.size - readLen)
               // 原子写入（tmp + rename）覆盖原文件，避免中断留下半写日志
               if (this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)) {
                 this._logRotateBackoffUntil = 0
