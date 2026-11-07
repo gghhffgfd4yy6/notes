@@ -164,42 +164,46 @@ function scanIntoFd (idx, fd, from, to) {
   idx.size = pos
 }
 
-// 打开一次、fstat 同一 fd、读完即关：不做「stat 路径 → open 路径」（CodeQL js/file-system-race）。
+// 索引与取页共用同一个 fd：不出现「fd A 里 fstat 过、再去 open 路径 B 读」的形态
+// （CodeQL js/file-system-race 会把这种跨 fd 的检查-使用判成竞态）。
+function loadPlainIndexFd (fd, logPath, size) {
+  let idx = plainIdxCache.get(logPath)
+  if (!idx) {
+    // 冷启动：sidecar 若与当前文件前缀一致（文件只增长过）可直接复用其条目
+    try {
+      const disk = JSON.parse(fs.readFileSync(plainIndexPath(logPath), 'utf8'))
+      if (disk && Array.isArray(disk.entries) && disk.size <= size) {
+        idx = { size: disk.size, lines: disk.lines, lastMark: disk.lines, entries: disk.entries }
+      }
+    } catch (e) {}
+  }
+  if (idx && size >= idx.size) {
+    if (size > idx.size) scanIntoFd(idx, fd, idx.size, size)
+  } else {
+    idx = { size: 0, lines: 0, lastMark: 0, entries: [{ line: 0, off: 0 }] }
+    scanIntoFd(idx, fd, 0, size)
+  }
+  plainIdxCache.set(logPath, idx)
+  return idx
+}
+
 function loadPlainIndex (logPath) {
   const fd = fs.openSync(logPath, 'r')
   try {
-    const size = fs.fstatSync(fd).size
-    let idx = plainIdxCache.get(logPath)
-    if (!idx) {
-      // 冷启动：sidecar 若与当前文件前缀一致（文件只增长过）可直接复用其条目
-      try {
-        const disk = JSON.parse(fs.readFileSync(plainIndexPath(logPath), 'utf8'))
-        if (disk && Array.isArray(disk.entries) && disk.size <= size) {
-          idx = { size: disk.size, lines: disk.lines, lastMark: disk.lines, entries: disk.entries }
-        }
-      } catch (e) {}
-    }
-    if (idx && size >= idx.size) {
-      if (size > idx.size) scanIntoFd(idx, fd, idx.size, size)
-    } else {
-      idx = { size: 0, lines: 0, lastMark: 0, entries: [{ line: 0, off: 0 }] }
-      scanIntoFd(idx, fd, 0, size)
-    }
-    plainIdxCache.set(logPath, idx)
-    return idx
+    return loadPlainIndexFd(fd, logPath, fs.fstatSync(fd).size)
   } finally { try { fs.closeSync(fd) } catch (e) {} }
 }
 
 function readPlainPage (logPath, page, size) {
-  const idx = loadPlainIndex(logPath)
-  const total = idx.lines
-  const pages = Math.max(1, Math.ceil(total / size))
-  const p = Math.min(Math.max(1, page), pages)
-  const startLine = (p - 1) * size
-  let ent = idx.entries[0]
-  for (const e of idx.entries) { if (e.line <= startLine) ent = e; else break }
   const fd = fs.openSync(logPath, 'r')
   try {
+    const idx = loadPlainIndexFd(fd, logPath, fs.fstatSync(fd).size)
+    const total = idx.lines
+    const pages = Math.max(1, Math.ceil(total / size))
+    const p = Math.min(Math.max(1, page), pages)
+    const startLine = (p - 1) * size
+    let ent = idx.entries[0]
+    for (const e of idx.entries) { if (e.line <= startLine) ent = e; else break }
     // 不先 fstat 再按 size 读（CodeQL js/file-system-race）：固定窗读一个足以覆盖
     // 200 行的块，读完按实际字节数切；窗口比页大两个数量级，短读也能凑够。
     const want = Math.max(64 * 1024, (size + PLAIN_INDEX_STEP) * 200)
