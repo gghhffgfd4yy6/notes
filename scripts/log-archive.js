@@ -334,14 +334,26 @@ function readPlainPage (logPath, page, size) {
   } finally { try { fs.closeSync(fd) } catch (e) {} }
 }
 
+const MAX_MEMBER_BYTES = 64 * 1024 * 1024 // 1MiB 成员的理论上限；异常 idx 不许让 buf 无限分配
+
 function readGzIndex (gzPath) {
-  try { return JSON.parse(fs.readFileSync(gzPath + '.idx.json', 'utf8')) } catch (e) { return null } // nosemgrep（路径=白名单周键 + .idx.json）
+  // 索引本身也可能被换成符号链接：走 O_NOFOLLOW 打开，再按 fd 读。
+  let o = null
+  try {
+    o = openLog(gzPath + '.idx.json', false)
+    const idx = JSON.parse(fs.readFileSync(o.fd, 'utf8'))
+    if (!idx || !Array.isArray(idx.members) || !idx.members.length) return null
+    for (const m of idx.members) {
+      if (!Number.isSafeInteger(m.off) || m.off < 0 || !Number.isSafeInteger(m.len) || m.len < 0 || m.len > MAX_MEMBER_BYTES) return null
+    }
+    return idx
+  } catch (e) { return null } finally { if (o) { try { fs.closeSync(o.fd) } catch (e) {} } }
 }
 
 // gz 档按页读：定位目标页落在哪个成员，只解压需要的那几个 1MiB 块。
 function readGzPage (gzPath, page, size) {
   const idx = readGzIndex(gzPath)
-  if (!idx || !Array.isArray(idx.members) || !idx.members.length) return null
+  if (!idx) return null
   const total = idx.lines
   const pages = Math.max(1, Math.ceil(total / size))
   const p = Math.min(Math.max(1, page), pages)

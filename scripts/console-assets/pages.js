@@ -2625,7 +2625,8 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       page: d.page,
       pages: d.pages,
       total: d.total,
-      text: (d.lines || []).join('\n')
+      text: (d.lines || []).join('\n'),
+      err: ''
     }))
     stickRef.current = false
     // 预判：当前页一到手就悄悄取下一页；用户点「下一页」或滚到底时直接命中缓存。
@@ -2649,7 +2650,10 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       }
       d = await p
     }
-    if (!d || d.status !== 'ok') return d
+    if (!d || d.status !== 'ok') {
+      if (apply && my === navSeqRef.current) setArch((prev) => ({ files: (prev && prev.files) || [], file, page, pages: 1, total: 0, text: null, err: (d && d.status) || 'error' }))
+      return d
+    }
     if (apply && my === navSeqRef.current) applyPage(d)
     return d
   }, [applyPage, putPage])
@@ -3004,6 +3008,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     }
   }
   const refreshNow = () => {
+    apiGetLogFiles().then((r) => { if (r && r.status === 'ok') setArch((prev) => ({ ...(prev || { file: '', page: 1, pages: 1, total: 0, text: null }), files: r.files || [] })) }).catch(() => {})
     if (arch && arch.file) {
       // 日志在增长/被截尾：整份缓存都可能过期，清掉再取当前页。
       pageCacheRef.current.clear()
@@ -3086,7 +3091,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${active && html`<div class="log-tools log-arch">
       <${MiniSelect} value=${arch && arch.file ? arch.file : ''} ariaLabel="选择日志文件"
-        options=${[{ value: '', label: '当周（实时尾部）' }].concat((((arch && arch.files) || [])).map((f) => ({ value: f.file, label: archLabel(f) })))}
+        options=${[{ value: '', label: '当周（实时尾部）' }].concat((((arch && arch.files) || [])).filter((f) => !f.current).map((f) => ({ value: f.file, label: archLabel(f) })))}
         onChange=${(v) => { if (!v) { setArch((prev) => ({ files: (prev && prev.files) || [], file: '', page: 1, pages: 1, total: 0, text: null })); setJumpText(''); return } openFile(v) }} />
     </div>`}
     ${/* v3.320：首帧就按最终高度占位（.log-empty 与 .logpre-main 同高）。旧版首帧只有
@@ -3117,6 +3122,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
         value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
     </div>
     <div class="log-count">${countText}</div>
+    ${arch && arch.err && html`<div class="log-empty" role="alert">周档读取失败（${arch.err}），点「刷新」重试；本周实时日志仍可看。</div>`}
     ${arch && arch.file && html`<div class="log-count log-pager" role="group" aria-label="日志翻页">
       <span>第 ${arch.page} / ${arch.pages} 页 · 共 ${arch.total} 行</span>
       <button type="button" class="log-chip" disabled=${arch.page <= 1} onClick=${() => goPage(arch.page - 1)}>上一页</button>

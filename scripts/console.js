@@ -6273,10 +6273,16 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         const size = Math.min(500, Math.max(50, parseInt(url.searchParams.get('size') || '200', 10) || 200))
         const abs = path.join(dir, file)
         let out = null
+        let exists = false
+        try { exists = fs.existsSync(abs) } catch (e) {}
         try {
           out = file.endsWith('.gz') ? LogArchive.readGzPage(abs, page, size) : LogArchive.readPlainPage(abs, page, size)
         } catch (e) { out = null }
-        if (!out) { sendJson(res, 200, { status: 'missing', file, page, pages: 1, total: 0, lines: [] }); return }
+        if (!out) {
+          // 文件在但读/解压失败 → corrupt（别伪装成 missing 让控制台静默）；确实没有才 missing。
+          sendJson(res, 200, { status: exists ? 'corrupt' : 'missing', file, page, pages: 1, total: 0, lines: [] })
+          return
+        }
         sendJson(res, 200, { status: 'ok', file, page: out.page, pages: out.pages, total: out.total, size, lines: out.lines })
         return
       }
