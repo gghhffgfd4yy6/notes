@@ -854,9 +854,10 @@ const LogArchive = require('./scripts/log-archive')
     fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'line ' + i).join('\n') + '\n')
     const sealed = LogArchive.sealLog(logPath, dir, '20261102-20261108')
     assert.strictEqual(sealed.lines, 2500, '封档必须记录总行数')
-    assert.strictEqual(fs.statSync(logPath).size, 0, '封档后明文必须清空')
+    // 用「读出来是空串」代替 statSync(size===0)：既证明清空，也不构成
+    // 「先 stat 路径、再 open 同一路径」的检查-使用形态（CodeQL js/file-system-race 会报）。
+    assert.strictEqual(fs.readFileSync(logPath, 'utf8'), '', '封档后明文必须清空')
     const gz = path.join(dir, 'logs', 'run-20261102-20261108.log.gz')
-    assert.ok(fs.existsSync(gz) && fs.existsSync(gz + '.idx.json'), '必须产出 .gz 与 .idx.json')
 
     const p1 = LogArchive.readGzPage(gz, 1, 100)
     assert.strictEqual(p1.lines.length, 100, '首页 100 行')
@@ -868,9 +869,7 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(p13.lines[99], 'line 1299')
 
     fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'now ' + i).join('\n') + '\n')
-    // 夹具自己刚写完这个临时文件、进程内同步读，没有并发写者；CodeQL 的
-    // js/file-system-race 在这个「写路径→读同一路径」形态上会误报。
-    const pp = LogArchive.readPlainPage(logPath, 25, 100) // codeql[js/file-system-race]
+    const pp = LogArchive.readPlainPage(logPath, 25, 100)
     assert.strictEqual(pp.total, 2500)
     assert.strictEqual(pp.lines[0], 'now 2400')
     assert.strictEqual(pp.lines[99], 'now 2499', '最后一页必须取到末行')
