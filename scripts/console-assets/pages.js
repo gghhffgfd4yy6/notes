@@ -2607,6 +2607,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const [arch, setArch] = useState(null)
   const [jumpText, setJumpText] = useState('')
   const pageCacheRef = useRef(new Map())
+  const inflightRef = useRef(new Set())
   const prefetchRef = useRef(null)
   const applyPage = useCallback((d) => {
     if (!d || d.status !== 'ok') return
@@ -2621,7 +2622,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     stickRef.current = false
     // 预判：当前页一到手就悄悄取下一页；用户点「下一页」或滚到底时直接命中缓存。
     const next = d.page + 1
-    if (next <= d.pages && !pageCacheRef.current.has(d.file + ':' + next)) {
+    if (next <= d.pages && !pageCacheRef.current.has(d.file + ':' + next) && !inflightRef.current.has(d.file + ':' + next)) {
       apiGetLogPage(d.file, next, 200).then((r) => { if (r && r.status === 'ok') pageCacheRef.current.set(d.file + ':' + next, r) }).catch(() => {})
     }
   }, [])
@@ -2629,8 +2630,14 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     const key = file + ':' + page
     let d = pageCacheRef.current.get(key)
     if (!d) {
-      d = await apiGetLogPage(file, page, 200)
-      if (d && d.status === 'ok') pageCacheRef.current.set(key, d)
+      // 同一页只允许一个请求在飞：预取（applyPage/滚动/打字预判）可能同时命中下一页，
+      // 没有这道闸就会对同一页发两次（实测重复过）。
+      if (inflightRef.current.has(key)) return null
+      inflightRef.current.add(key)
+      try {
+        d = await apiGetLogPage(file, page, 200)
+        if (d && d.status === 'ok') pageCacheRef.current.set(key, d)
+      } finally { inflightRef.current.delete(key) }
     }
     if (apply) applyPage(d)
     return d
@@ -2653,7 +2660,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     let alive = true
     apiGetLogFiles().then((r) => {
       if (!alive || !r || r.status !== 'ok') return
-      setArch((prev) => ({ file: prev ? prev.file : '', page: prev ? prev.page : 1, pages: prev ? prev.pages : 1, total: prev ? prev.total : 0, text: prev ? prev.text : '', files: r.files || [] }))
+      setArch((prev) => ({ file: prev ? prev.file : '', page: prev ? prev.page : 1, pages: prev ? prev.pages : 1, total: prev ? prev.total : 0, text: prev ? prev.text : null, files: r.files || [] }))
     }).catch(() => {})
     return () => { alive = false }
   }, [active])
@@ -2666,7 +2673,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     prefetchRef.current = setTimeout(() => {
       const pg = Math.min(Math.max(1, n), arch.pages || 1)
       const key = arch.file + ':' + pg
-      if (!pageCacheRef.current.has(key)) getPage(arch.file, pg, false).catch(() => {})
+      if (!pageCacheRef.current.has(key) && !inflightRef.current.has(key)) getPage(arch.file, pg, false).catch(() => {})
     }, 600)
   }
   // v3.318：跳转前预取的快照只用于本次挂载——首帧即最终日志，且不再立刻重拉一次。
@@ -3003,7 +3010,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const countLine = [
     mode !== 'all'
       ? `在「${modeLabel}」筛选下 · 显示 ${ranged.length} / ${lines.length} 行`
-      : ((kw !== '' || logRangeActive) ? `显示 ${ranged.length} / ${lines.length} 行` : `共 ${lines.length} 行`),
+      : ((kw !== '' || logRangeActive)
+          ? `显示 ${ranged.length} / ${lines.length} 行`
+          : ((arch && arch.file) ? `本页 ${lines.length} 行` : `共 ${lines.length} 行`)),
     (mode === 'issue' || mode === 'error') ? '已排除控制台停止记录' : '',
     heavy ? `行数过多（>${LOG_HIGHLIGHT_MAX}），已关闭高亮` : '',
     logRangeActive ? `日期 ${logRange.from} ~ ${logRange.to}` : '',
