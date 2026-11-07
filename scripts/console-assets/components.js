@@ -84,8 +84,13 @@ function scrollIntoBox (el, box) {
 // 过滤规则首个错误行、日志行定位五处同口径；散着写时漏一处 +8 就整体偏 8px。
 // 用 height 而不是 bottom：页签还没吸顶时 bottom 会多算它自己的页面偏移。
 function stickyPad () {
+  // 吸顶带 = .topbar（sticky top:0）+ .tabs（sticky top:var(--topbar-h)）+ 8。
+  // 只算 .tabs 会少掉顶栏那 40px：翻页落点/错误行定位会把首条卡片塞到页签底下
+  // （手机上表现为每页第一条被裁掉一截，2026-11-07 手机录屏复现）。
+  const bar = document.querySelector('.topbar')
   const tabs = document.querySelector('.tabs')
-  return (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+  return (bar ? bar.getBoundingClientRect().height : 0) +
+    (tabs ? tabs.getBoundingClientRect().height : 0) + 8
 }
 
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
