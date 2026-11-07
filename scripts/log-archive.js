@@ -69,9 +69,19 @@ function readMarker (logPath) {
 // 切档：把已写满一周的明文日志压成「多成员 gz + idx」，然后清空原文件。
 // 调用方必须已持有该日志的写锁（跨进程），且只在周键变化时调用一次。
 function sealLog (logPath, cacheDir, key) {
+  // CodeQL js/file-system-race：先开 fd 再 fstat，全程只用这个 fd 读/截断，
+  // 不做「stat 路径 → 再 open 路径」的两步检查（中间可能被换文件）。
+  let fdIn = null
+  let fdWritable = true
+  try { fdIn = fs.openSync(logPath, 'r+') } catch (e) {
+    // 只读权限的镜像/备份目录：退回只读打开，截断改走路径（这条分支不参与常规轮转）。
+    fdWritable = false
+    try { fdIn = fs.openSync(logPath, 'r') } catch (err) { return null }
+  }
   let size = 0
-  try { size = fs.statSync(logPath).size } catch (e) { return null }
+  try { size = fs.fstatSync(fdIn).size } catch (e) { try { fs.closeSync(fdIn) } catch (err) {} return null }
   if (!size) {
+    try { fs.closeSync(fdIn) } catch (err) {}
     try { fs.writeFileSync(weekMarkerPath(logPath), key, 'utf8') } catch (e) {}
     return null
   }
@@ -80,7 +90,6 @@ function sealLog (logPath, cacheDir, key) {
   const outPath = archivePath(cacheDir, path.basename(logPath), key)
   const tmpPath = outPath + '.tmp'
   const idx = { key, base: baseOf(path.basename(logPath)), source: path.basename(logPath), members: [], lines: 0, bytes: 0 }
-  const fdIn = fs.openSync(logPath, 'r')
   const fdOut = fs.openSync(tmpPath, 'w')
   try {
     const buf = Buffer.alloc(CHUNK_BYTES)
@@ -114,13 +123,15 @@ function sealLog (logPath, cacheDir, key) {
       compOff += gz.length
     }
     fs.fsyncSync(fdOut)
+    // 用同一个 fd 截断（不再走路径），避免「读完到截断之间路径被替换」。
+    if (fdWritable) fs.ftruncateSync(fdIn, 0)
   } finally {
-    fs.closeSync(fdIn)
+    try { fs.closeSync(fdIn) } catch (e) {}
     fs.closeSync(fdOut)
   }
   fs.renameSync(tmpPath, outPath)
   fs.writeFileSync(outPath + '.idx.json', JSON.stringify(idx), 'utf8')
-  fs.truncateSync(logPath, 0)
+  if (!fdWritable) { try { fs.truncateSync(logPath, 0) } catch (e) {} }
   fs.writeFileSync(weekMarkerPath(logPath), key, 'utf8')
   return { path: outPath, lines: idx.lines, bytes: idx.bytes }
 }
@@ -133,58 +144,52 @@ const plainIdxCache = new Map()
 
 function plainIndexPath (logPath) { return logPath + '.idx.json' }
 
-function scanInto (idx, logPath, from, to) {
-  const fd = fs.openSync(logPath, 'r')
-  try {
-    const buf = Buffer.alloc(4 * 1024 * 1024)
-    let pos = from
-    while (pos < to) {
-      const n = fs.readSync(fd, buf, 0, Math.min(buf.length, to - pos), pos)
-      if (n <= 0) break
-      for (let i = 0; i < n; i++) {
-        if (buf[i] === 0x0a) {
-          idx.lines += 1
-          if (idx.lines - idx.lastMark >= PLAIN_INDEX_STEP) {
-            idx.entries.push({ line: idx.lines, off: pos + i + 1 })
-            idx.lastMark = idx.lines
-          }
+function scanIntoFd (idx, fd, from, to) {
+  const buf = Buffer.alloc(4 * 1024 * 1024)
+  let pos = from
+  while (pos < to) {
+    const n = fs.readSync(fd, buf, 0, Math.min(buf.length, to - pos), pos)
+    if (n <= 0) break
+    for (let i = 0; i < n; i++) {
+      if (buf[i] === 0x0a) {
+        idx.lines += 1
+        if (idx.lines - idx.lastMark >= PLAIN_INDEX_STEP) {
+          idx.entries.push({ line: idx.lines, off: pos + i + 1 })
+          idx.lastMark = idx.lines
         }
       }
-      pos += n
     }
-    idx.size = pos
-  } finally { fs.closeSync(fd) }
-}
-
-function buildPlainIndex (logPath) {
-  const idx = { size: 0, lines: 0, lastMark: 0, entries: [{ line: 0, off: 0 }] }
-  const st = fs.statSync(logPath)
-  scanInto(idx, logPath, 0, st.size)
-  plainIdxCache.set(logPath, idx)
-  return idx
-}
-
-function loadPlainIndex (logPath) {
-  const st = fs.statSync(logPath)
-  let idx = plainIdxCache.get(logPath)
-  if (!idx) {
-    // 冷启动：sidecar 若与当前文件前缀一致（文件只增长过）可直接复用其条目
-    try {
-      const disk = JSON.parse(fs.readFileSync(plainIndexPath(logPath), 'utf8'))
-      if (disk && Array.isArray(disk.entries) && disk.size <= st.size) {
-        idx = { size: disk.size, lines: disk.lines, lastMark: disk.lines, entries: disk.entries }
-      }
-    } catch (e) {}
+    pos += n
   }
-  if (idx && st.size >= idx.size) {
-    if (st.size > idx.size) scanInto(idx, logPath, idx.size, st.size)
+  idx.size = pos
+}
+
+// 打开一次、fstat 同一 fd、读完即关：不做「stat 路径 → open 路径」（CodeQL js/file-system-race）。
+function loadPlainIndex (logPath) {
+  const fd = fs.openSync(logPath, 'r')
+  try {
+    const size = fs.fstatSync(fd).size
+    let idx = plainIdxCache.get(logPath)
+    if (!idx) {
+      // 冷启动：sidecar 若与当前文件前缀一致（文件只增长过）可直接复用其条目
+      try {
+        const disk = JSON.parse(fs.readFileSync(plainIndexPath(logPath), 'utf8'))
+        if (disk && Array.isArray(disk.entries) && disk.size <= size) {
+          idx = { size: disk.size, lines: disk.lines, lastMark: disk.lines, entries: disk.entries }
+        }
+      } catch (e) {}
+    }
+    if (idx && size >= idx.size) {
+      if (size > idx.size) scanIntoFd(idx, fd, idx.size, size)
+    } else {
+      idx = { size: 0, lines: 0, lastMark: 0, entries: [{ line: 0, off: 0 }] }
+      scanIntoFd(idx, fd, 0, size)
+    }
     plainIdxCache.set(logPath, idx)
     return idx
-  }
-  return buildPlainIndex(logPath)
+  } finally { try { fs.closeSync(fd) } catch (e) {} }
 }
 
-// 明文档按页读：只读「索引定位到的块」，不整读文件。
 function readPlainPage (logPath, page, size) {
   const idx = loadPlainIndex(logPath)
   const total = idx.lines
