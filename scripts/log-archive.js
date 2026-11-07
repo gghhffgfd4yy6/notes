@@ -200,11 +200,13 @@ function readPlainPage (logPath, page, size) {
   for (const e of idx.entries) { if (e.line <= startLine) ent = e; else break }
   const fd = fs.openSync(logPath, 'r')
   try {
-    const fst = fs.fstatSync(fd)
-    const readLen = Math.min(fst.size - ent.off, Math.max(64 * 1024, (size + PLAIN_INDEX_STEP) * 200))
-    const buf = Buffer.alloc(Math.max(0, readLen))
-    fs.readSync(fd, buf, 0, buf.length, ent.off)
-    const lines = buf.toString('utf8').split('\n')
+    // 不先 fstat 再按 size 读（CodeQL js/file-system-race）：固定窗读一个足以覆盖
+    // 200 行的块，读完按实际字节数切；窗口比页大两个数量级，短读也能凑够。
+    const want = Math.max(64 * 1024, (size + PLAIN_INDEX_STEP) * 200)
+    const buf = Buffer.alloc(want)
+    const n = fs.readSync(fd, buf, 0, want, ent.off)
+    const text = buf.slice(0, n).toString('utf8')
+    const lines = text.split('\n')
     if (lines.length && lines[lines.length - 1] === '') lines.pop()
     const skip = startLine - ent.line
     return { page: p, pages, total, lines: lines.slice(skip, skip + size) }
