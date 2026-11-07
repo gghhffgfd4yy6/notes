@@ -9055,9 +9055,15 @@ async function main () {
     const padSeg = components.slice(padAt, components.indexOf('\n}', padAt))
     assert.ok(
       padSeg.includes("document.querySelector('.topbar')") && padSeg.includes("document.querySelector('.tabs')") &&
-      padSeg.includes('getBoundingClientRect().height') && padSeg.includes('+ 8'),
-      'stickyPad = .topbar + .tabs 实测高度 + 8（顶栏也吸顶，漏算会把首行塞到页签下）'
+      (padSeg.match(/getBoundingClientRect\(\)\.height/g) || []).length >= 2,
+      'stickyPad 必须分别实测 .topbar 与 .tabs 的高度（只 query 不取高度、或漏掉顶栏都要红）'
     )
+    // 返回值必须真的把两段并集加进去：只写 document.querySelector('.topbar') 但不加高度，上面那条查不出来。
+    const padReturn = padSeg.slice(padSeg.indexOf('return ')).replace(/\s+/g, '')
+    assert.ok(padReturn.includes('Math.max(barH,tabsTop+tabsH)+8'),
+      'stickyPad = max(.topbar 高度, 页签吸顶偏移 + .tabs 高度) + 8（并集只算一次，漏顶栏会把首行塞到页签下）')
+    assert.ok(padSeg.includes('window.getComputedStyle(tabs).top'),
+      '页签吸顶偏移必须取 computed top（var(--topbar-h) 解析成 px），不得写死 40')
     assert.ok(!padSeg.includes('getBoundingClientRect().bottom'), 'pad 不得用 .tabs 的 bottom（未吸顶时会多算一截偏移）')
     // ── scrollIntoBox：focus 不带滚动 + 只在框内时修 scrollTop；矩形差值来自 pure.mjs ──
     const boxAt = components.indexOf('function scrollIntoBox (el, box)')
