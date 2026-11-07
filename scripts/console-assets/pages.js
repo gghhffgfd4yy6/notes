@@ -2607,8 +2607,16 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const [arch, setArch] = useState(null)
   const [jumpText, setJumpText] = useState('')
   const pageCacheRef = useRef(new Map())
-  const inflightRef = useRef(new Set())
+  const inflightRef = useRef(new Map())
+  const navSeqRef = useRef(0)
   const prefetchRef = useRef(null)
+  // 页缓存有上限（只留最近 24 页）：翻几百页也不会把整周日志攒在浏览器内存里。
+  const putPage = useCallback((key, d) => {
+    const m = pageCacheRef.current
+    if (m.has(key)) m.delete(key)
+    m.set(key, d)
+    while (m.size > 24) { const k = m.keys().next().value; m.delete(k) }
+  }, [])
   const applyPage = useCallback((d) => {
     if (!d || d.status !== 'ok') return
     setArch((prev) => ({
@@ -2622,26 +2630,29 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     stickRef.current = false
     // 预判：当前页一到手就悄悄取下一页；用户点「下一页」或滚到底时直接命中缓存。
     const next = d.page + 1
-    if (next <= d.pages && !pageCacheRef.current.has(d.file + ':' + next) && !inflightRef.current.has(d.file + ':' + next)) {
-      apiGetLogPage(d.file, next, 200).then((r) => { if (r && r.status === 'ok') pageCacheRef.current.set(d.file + ':' + next, r) }).catch(() => {})
-    }
+    if (next <= d.pages) getPage(d.file, next, false).catch(() => {})
   }, [])
+  // 取页：同一页在飞时复用同一个 Promise（否则预取与点击各发一次，点击还可能拿不到结果）；
+  // apply=true 的请求带导航序号，晚到的旧响应不再覆盖用户已经切过去的视图。
   const getPage = useCallback(async (file, page, apply) => {
     const key = file + ':' + page
+    const my = apply ? ++navSeqRef.current : 0
     let d = pageCacheRef.current.get(key)
     if (!d) {
-      // 同一页只允许一个请求在飞：预取（applyPage/滚动/打字预判）可能同时命中下一页，
-      // 没有这道闸就会对同一页发两次（实测重复过）。
-      if (inflightRef.current.has(key)) return null
-      inflightRef.current.add(key)
-      try {
-        d = await apiGetLogPage(file, page, 200)
-        if (d && d.status === 'ok') pageCacheRef.current.set(key, d)
-      } finally { inflightRef.current.delete(key) }
+      let p = inflightRef.current.get(key)
+      if (!p) {
+        p = apiGetLogPage(file, page, 200).then((r) => {
+          if (r && r.status === 'ok') putPage(key, r)
+          return r
+        }).finally(() => { inflightRef.current.delete(key) })
+        inflightRef.current.set(key, p)
+      }
+      d = await p
     }
-    if (apply) applyPage(d)
+    if (!d || d.status !== 'ok') return d
+    if (apply && my === navSeqRef.current) applyPage(d)
     return d
-  }, [applyPage])
+  }, [applyPage, putPage])
   const goPage = useCallback((p) => {
     const a = arch
     if (!a || !a.file) return
@@ -2651,7 +2662,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const openFile = useCallback((file) => {
     if (!file) return
     setJumpText('')
+    navSeqRef.current++
     pageCacheRef.current.clear()
+    inflightRef.current.clear()
     getPage(file, 1, true).catch(() => {})
   }, [getPage])
   // 列表只在页签第一次 active 时拉一次；失败不影响看当周日志。
@@ -2992,7 +3005,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   }
   const refreshNow = () => {
     if (arch && arch.file) {
-      pageCacheRef.current.delete(arch.file + ':' + arch.page)
+      // 日志在增长/被截尾：整份缓存都可能过期，清掉再取当前页。
+      pageCacheRef.current.clear()
+      inflightRef.current.clear()
       getPage(arch.file, arch.page, true).catch(() => {})
       return
     }
@@ -3051,7 +3066,10 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // （panel 583），数据到达后筛选栏凭空插进来（+134）再加计数行（+19），日志框连下半页
   // 一起被推走 153px。现在 chips 用同一组标签、计数先显示 —，计数行显示「读取中…」。
   const logReady = !!(data && data.status === 'ok')
-  const countText = logReady ? countLine : ((data || err) ? '—' : '读取中…')
+  // 周档页可能先于尾部请求成功（或尾部请求失败）：有分页文本就算可读，不能只认 logReady。
+  const archReady = !!(arch && typeof arch.text === 'string')
+  const viewReady = logReady || archReady
+  const countText = viewReady ? countLine : ((data || err) ? '—' : '读取中…')
   // v3.403：周档下拉的显示名——当周标明「实时」，历史周显示起止日期（周一到周日）。
   const archLabel = (f) => {
     const diag = f.file.indexOf('diag') >= 0 || f.file.indexOf('diagnostics') >= 0
@@ -3073,18 +3091,18 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     </div>`}
     ${/* v3.320：首帧就按最终高度占位（.log-empty 与 .logpre-main 同高）。旧版首帧只有
          90px，数据到达后 .logpre 一次性出现（776px），文档高度突跳一次。 */ ''}
-    ${logReady && focusMode === 'day' && html`<div class="log-focus" role="status">
+    ${viewReady && focusMode === 'day' && html`<div class="log-focus" role="status">
       <span class="log-focus-text">已定位：<span class="log-focus-time">${focusAt}</span> 这一轮${focusHits > 1 ? `（同秒 ${focusHits} 行，均已高亮）` : ''}</span>
       <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusAt) }}>只看这一轮</button>
     </div>`}
-    ${logReady && focusMode === 'only' && html`<div class="log-focus" role="status">
+    ${viewReady && focusMode === 'only' && html`<div class="log-focus" role="status">
       <span class="log-focus-text">只看：<span class="log-focus-time">${focusAt}</span> 这一轮</span>
       <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusDate) }}>看当天全部</button>
     </div>`}
-    ${logReady && focusMiss && html`<div class="log-focus log-focus-miss" role="status">
+    ${viewReady && focusMiss && html`<div class="log-focus log-focus-miss" role="status">
       <span class="log-focus-text">这一轮不在当前日志尾部（可能已轮转），下面只显示当天其他轮次</span>
     </div>`}
-    ${logReady && focusHeavy && html`<div class="log-focus log-focus-miss" role="status">
+    ${viewReady && focusHeavy && html`<div class="log-focus log-focus-miss" role="status">
       <span class="log-focus-text">当天日志超过 ${LOG_HIGHLIGHT_MAX} 行，整行高亮已关闭</span>
       <button type="button" class="log-chip" onClick=${() => { stickRef.current = true; setQ(focusAt) }}>只看这一轮</button>
     </div>`}
@@ -3114,7 +3132,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
          整个消失，跳转/切页后页面高度反向塌一次。 */ ''}
     ${err && !data && html`<div class="log-empty" role="status">日志读取失败</div>`}
     ${data && data.status !== 'ok' && html`<div class="log-empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
-    ${logReady && (ranged.length === 0
+    ${viewReady && (ranged.length === 0
       ? html`<div class="log-empty" role="status">
         <div class="log-empty-text">${emptyText}</div>
         ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}

@@ -247,17 +247,26 @@ function createApp ({
           // v3.403：自然周切档（周一 00:00 CST）。只在持锁时做——两个进程同时封档会把同一份
           // 明文压两遍。首次升级（没有 .week 标记）只记下当前周、不封档，避免把已有日志误判成
           // 上一周；之后跨周时把上一周压成多成员 gz + idx（控制台按页只解一个 1MiB 成员）。
+          let archivePending = false
           if (lockFd !== null) {
-            try {
-              const week = LogArchive.weekRange(Date.now())
-              const marker = LogArchive.readMarker(logPath)
-              if (!marker) {
-                fs.writeFileSync(LogArchive.weekMarkerPath(logPath), week.key, 'utf8')
-              } else if (marker !== week.key) {
-                const sealed = LogArchive.sealLog(logPath, this._cacheDir(), marker)
-                if (sealed) LogArchive.pruneArchives(this._cacheDir(), path.basename(logPath))
+            const weekKey = LogArchive.weekRange(Date.now()).key
+            const marker = LogArchive.readMarker(logPath)
+            if (!marker) {
+              try { fs.writeFileSync(LogArchive.weekMarkerPath(logPath), weekKey, 'utf8') } catch (e) {}
+            } else if (marker !== weekKey) {
+              // 跨周：上一周还在明文里。归档没成功前不许截尾（否则整周数据被 KEEP 覆盖掉）。
+              archivePending = true
+              try {
+                const sealed = LogArchive.sealLog(logPath, this._cacheDir(), marker, weekKey)
+                if (sealed) {
+                  archivePending = false
+                  LogArchive.pruneArchives(this._cacheDir(), path.basename(logPath))
+                }
+              } catch (e) {
+                // 失败要留痕（不递归写日志，避免归档故障放大成日志风暴）：下周重试。
+                console.warn(`⚠️ 日志归档失败（下周重试）：${path.basename(logPath)} ${(e && e.code) || ''}`)
               }
-            } catch (e) { /* 归档失败不阻断日志写入（下一轮会重试） */ }
+            }
           }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
           // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
@@ -310,7 +319,7 @@ function createApp ({
           const st = fs.statSync(logPath)
           // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
           // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
-          if (lockFd !== null && st.size > LIMIT) {
+          if (lockFd !== null && !archivePending && st.size > LIMIT) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
             const KEEP = 10 * 1024 * 1024

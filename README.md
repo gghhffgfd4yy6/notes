@@ -239,6 +239,13 @@ XBK_CONSOLE_TOKEN=请换成至少16位的随机字符串 npm run console
 - 触发历史里运行中的任务可点**「停止」**：控制台对子进程先 SIGTERM、3 秒宽限后 SIGKILL。两个如实披露：①被停止的任务若已推送部分通知但尚未写缓存，这些条目**下轮会重推**（与任务超时被杀的语义一致）；②取消后同一动作的重放冷却窗照常生效（普通动作 60 秒）——这是防止「手滑停止后误触重推」的保护，确需立即重跑请等窗口过后再触发。自动运行不接受 HTTP 触发，没有外部冷却窗。
 - 相关变量：`XBK_CONSOLE_PORT`（默认 `7777`）、`XBK_CONSOLE_HOST`（默认 `127.0.0.1`，对外暴露需显式修改并自行做好访问控制）。
 
+### 运行日志与周档（v3.403）
+
+- `run.log` / `filter-diagnostics.ndjson` 上限 **100MB**（`XBK_LOG_LIMIT_BYTES` 可覆盖，测试用）。
+- 每周一 00:00（北京时间）在写锁内把上一周压成 `xianbaoku_cache/logs/<run|diag>-YYYYMMDD-YYYYMMDD.log.gz`：多成员 gzip（1MiB/成员）+ 同名 `.idx.json`（成员偏移/长度/行数），保留 53 周（一年）。没有 `.idx.json` 的 gz 视为半成品，控制台不列出。
+- 控制台「运行日志」页可选当周/历史周，按页读（默认 200 行/页）：打开只取首页、翻页只解目标页所在成员；上一页/下一页、页码跳转（输入停手 600ms 才预判目标页，打字过程不发请求）。
+- 备份导出只带运行日志**尾部 24MiB**（`BACKUP_RUN_LOG_MAX_BYTES`）；完整历史看周档，不在备份里。
+
 ## 自动部署（拉取式）
 
 线上目录 `~/notes-live` 是 git worktree（detached HEAD），由 systemd 服务 `xbk-console`（`127.0.0.1:7777`）跑着。`scripts/auto-deploy.sh` 让这台机器**自己拉取**：定时 `git fetch origin main`，有更新且没有任务在跑时 `checkout -f` 到新提交、重启服务、按 `/api/sys` 的 `version` 与 `package.json` 对账；30 秒内对不上就自动回滚到旧提交再验一次。仓库侧不需要任何私钥，也不需要 GitHub Actions。

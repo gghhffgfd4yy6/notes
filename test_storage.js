@@ -840,7 +840,7 @@ const LogArchive = require('./scripts/log-archive')
     restoreLogs()
   }
 
-  // ===== v3.403 日志周档：切周 / 封档 / 分页 =====
+  // ===== v3.403 日志周档：切周 / 封档 / 多成员分页 / 尾行 =====
   {
     // 2026-11-07 是周六 → 所在自然周为 11-02（周一）~11-08（周日）
     const wk = LogArchive.weekRange(Date.parse('2026-11-07T12:00:00+08:00'))
@@ -851,34 +851,49 @@ const LogArchive = require('./scripts/log-archive')
     const dir = make('logarch')
     fs.mkdirSync(dir, { recursive: true })
     const logPath = path.join(dir, 'run.log')
-    fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'line ' + i).join('\n') + '\n')
-    const sealed = LogArchive.sealLog(logPath, dir, '20261102-20261108')
-    assert.strictEqual(sealed.lines, 2500, '封档必须记录总行数')
-    // 用「读出来是空串」代替 statSync(size===0)：既证明清空，也不构成
-    // 「先 stat 路径、再 open 同一路径」的检查-使用形态（CodeQL js/file-system-race 会报）。
-    assert.strictEqual(fs.readFileSync(logPath, 'utf8'), '', '封档后明文必须清空')
-    const gz = path.join(dir, 'logs', 'run-20261102-20261108.log.gz')
 
+    // ① 小文件：2500 行 → 单成员档，验证页数/按行号定位/清空/标记
+    fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'line ' + i).join('\n') + '\n')
+    const sealed = LogArchive.sealLog(logPath, dir, '20261102-20261108', '20261109-20261115')
+    assert.strictEqual(sealed.lines, 2500, '封档必须记录总行数')
+    assert.strictEqual(fs.readFileSync(logPath, 'utf8'), '', '封档后明文必须清空')
+    assert.strictEqual(LogArchive.readMarker(logPath), '20261109-20261115', '封档后标记必须前进到新周（否则下周会覆盖旧档）')
+    const gz = path.join(dir, 'logs', 'run-20261102-20261108.log.gz')
     const p1 = LogArchive.readGzPage(gz, 1, 100)
     assert.strictEqual(p1.lines.length, 100, '首页 100 行')
     assert.strictEqual(p1.lines[0], 'line 0')
     assert.strictEqual(p1.total, 2500)
     assert.strictEqual(p1.pages, 25)
     const p13 = LogArchive.readGzPage(gz, 13, 100)
-    assert.strictEqual(p13.lines[0], 'line 1200', '第 13 页必须按行号定位（只解目标块）')
+    assert.strictEqual(p13.lines[0], 'line 1200', '第 13 页必须按行号定位')
     assert.strictEqual(p13.lines[99], 'line 1299')
 
-    fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'now ' + i).join('\n') + '\n')
+    // ② 多成员：6 万行 × ~40B ≈ 2.4MB → 至少 3 个 1MiB 成员，验证跨成员取页
+    const big = Array.from({ length: 60000 }, (_, i) => 'line ' + i + ' ' + 'x'.repeat(24))
+    fs.writeFileSync(logPath, big.join('\n') + '\n')
+    const sealedBig = LogArchive.sealLog(logPath, dir, '20261109-20261115', '20261116-20261122')
+    assert.strictEqual(sealedBig.lines, 60000)
+    const bigGz = sealedBig.path
+    const idxBig = JSON.parse(fs.readFileSync(bigGz + '.idx.json', 'utf8'))
+    assert.ok(idxBig.members.length >= 3, `必须真的切成多个成员（实际 ${idxBig.members.length}）`)
+    const midPage = LogArchive.readGzPage(bigGz, 250, 200) // 第 49800~49999 行，落在第二个成员之后
+    assert.strictEqual(midPage.lines[0], big[49800], '跨成员取页必须仍按行号对齐')
+    assert.strictEqual(midPage.lines.length, 200)
+    assert.strictEqual(midPage.total, 60000)
+
+    // ③ 明文尾行没有换行：也要算一行、最后一页要能取到
+    fs.writeFileSync(logPath, Array.from({ length: 2499 }, (_, i) => 'now ' + i).join('\n') + '\nnow 2499')
     const pp = LogArchive.readPlainPage(logPath, 25, 100)
-    assert.strictEqual(pp.total, 2500)
+    assert.strictEqual(pp.total, 2500, '无换行尾行必须计入总行数')
     assert.strictEqual(pp.lines[0], 'now 2400')
     assert.strictEqual(pp.lines[99], 'now 2499', '最后一页必须取到末行')
+    const tiny = LogArchive.readPlainPage(logPath, 1, 3000)
+    assert.strictEqual(tiny.lines.length, 2500)
 
+    // ④ 列表只认「gz + idx 都在」的成品；保留 0 周连 idx 一起删
     const list = LogArchive.listArchives(dir, 'run.log')
-    assert.strictEqual(list.length, 1)
-    assert.strictEqual(list[0].key, '20261102-20261108')
-    assert.strictEqual(list[0].lines, 2500)
-    // 保留 0 周：立即清掉归档与 idx
+    assert.strictEqual(list.length, 2)
+    assert.strictEqual(list[0].key, '20261109-20261115')
     LogArchive.pruneArchives(dir, 'run.log', 0)
     assert.ok(!fs.existsSync(gz) && !fs.existsSync(gz + '.idx.json'), '超期归档必须连 idx 一起删除')
   }
