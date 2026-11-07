@@ -80,12 +80,20 @@ function scrollIntoBox (el, box) {
   if (d !== 0) box.scrollTop += d
 }
 
-// 吸顶页签下方的落点留白 = .tabs 实测高度 + 8。列表落点、落点门（推送记录/逐轮历史）、
-// 过滤规则首个错误行、日志行定位五处同口径；散着写时漏一处 +8 就整体偏 8px。
-// 用 height 而不是 bottom：页签还没吸顶时 bottom 会多算它自己的页面偏移。
+// 吸顶带下方的落点留白 = max(.topbar 实测高度, 页签吸顶偏移 + 页签高度) + 8。
+// 列表落点、落点门（推送记录/逐轮历史）、过滤规则首个错误行、日志行定位五处同口径；
+// 散着写时漏一处 +8 就整体偏 8px。用 height 而不是 bottom：页签还没吸顶时 bottom 会
+// 多算它自己的页面偏移。顶栏在同步/刷新报错时会换行变高，而页签仍吸在 --topbar-h：
+// 两段重叠部分只能算一次，所以取 max，不能简单相加（相加会让落点偏低、列表上方多出空白）。
 function stickyPad () {
+  const bar = document.querySelector('.topbar')
   const tabs = document.querySelector('.tabs')
-  return (tabs ? tabs.getBoundingClientRect().height : 0) + 8
+  const barH = bar ? bar.getBoundingClientRect().height : 0
+  const tabsH = tabs ? tabs.getBoundingClientRect().height : 0
+  // getComputedStyle().top 把 var(--topbar-h) 解析成 px；页签不吸顶时是 auto → 0。
+  const tabsTop = tabs ? (parseFloat(window.getComputedStyle(tabs).top) || 0) : 0
+  // 覆盖带 = 顶栏 [0, barH] 与页签 [tabsTop, tabsTop+tabsH] 的并集；取右端点，不重复计重叠。
+  return Math.max(barH, tabsTop + tabsH) + 8
 }
 
 // v3.341：窄屏下顶栏状态行会被省略号截断（时间只剩半截）。点一下就地弹出完整文本，点页面
