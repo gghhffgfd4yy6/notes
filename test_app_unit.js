@@ -10,6 +10,8 @@ const assert = require('assert')
 const path = require('path')
 const crypto = require('crypto')
 
+// v3.403：日志上限在生产是 100MiB；本套件用桩 fs 造夹具，按 20MiB 注入即可覆盖同一套截尾逻辑
+process.env.XBK_LOG_LIMIT_BYTES = String(20 * 1024 * 1024)
 const { createApp } = require('./xbk_app.js')
 
 let passed = 0

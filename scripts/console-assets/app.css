@@ -768,6 +768,11 @@
   }
   /* 日志筛选（v3.306）：全部/异常 + 关键字；异常收窄后仍是同一份尾部文本，不发请求。 */
   .log-tools { display: flex; gap: var(--sp-2); flex-wrap: wrap; align-items: center; margin-bottom: var(--sp-2); }
+  /* v3.402：周档下拉 + 翻页条（手机上换行不挤掉 chips） */
+  .log-arch { margin-bottom: 0; }
+  .log-arch .mini-select { max-width: 100%; }
+  .log-pager { display: flex; gap: var(--sp-2); flex-wrap: wrap; align-items: center; }
+  .log-jump { width: 84px; }
   .log-chips { display: flex; gap: 6px; flex-wrap: wrap; }
   .log-chip {
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim);

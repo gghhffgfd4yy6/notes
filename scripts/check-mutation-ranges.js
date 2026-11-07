@@ -229,6 +229,8 @@ const MUTATION_EXEMPT = new Map([
     '同源抽出的**仅 stat+chmod** 权限收紧助手（52 行，入参只来自 FilterStore 的字面量文件名路径）；行为由 filter-store 套件的 0600 收紧用例经调用方覆盖，矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
   ['scripts/message-signature.js',
     '只做一次 statSync + mtime 签名的只读助手（21 行，给默认 push.json 判重缓存用），返回 null 的每条降级分支由 status 套件经 readStatus 覆盖；矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
+  ['scripts/log-archive.js',
+    '日志周档的 IO 编排（周界计算/封档/多成员 gzip 分页/保留清理），与 fs 强耦合、变异体多为「读不到就崩」的等价体；行为由 test_storage.js 的周档用例直测（自然周边界/封档行数与清空/第 13 页按行号定位/明文档末页/保留 0 周连 idx 删除）+ 控制台 e2e 手测（list/页码/压缩档第 3 页）覆盖。矩阵暂未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
   ['scripts/similar-dedupe.js',
     '近似去重的纯函数助手（归一化/相似度/时间窗裁剪/追加，无 IO、无定时器），第三方 fuzzball 负责打分；矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口。行为由 test_app_unit.js 的 6 例直测（重复/不相关/过期窗口/空标题/短标题/上限裁剪）+ test_app.js 的 2 例经 run() 端到端覆盖（10 分钟内只推一条、过期恢复推送）']
 ])

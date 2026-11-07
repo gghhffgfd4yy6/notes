@@ -538,7 +538,13 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
     const key = new Date(startKeyMs + i * 86400000).toISOString().slice(0, 10)
     out.push(byDay.get(key) || { date: key, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 })
   }
-  return result('ok', { days: spanDays, from: rangeMode ? startKey : '', to: rangeMode ? endKey : '', byDay: out, truncated, today: todayKey })
+  // 周档轮转后，run.log 只剩本周：更早的日子不是「真的 0」，而是收进了 logs/ 周档。
+  // 如实置 truncated（前端会提示「更早轮次已丢失/见周档」），并给出周档数量。
+  let archivedWeeks = 0
+  try {
+    archivedWeeks = require('node:fs').readdirSync(path.join(dir, 'logs')).filter((n) => /^run-\d{8}-\d{8}\.log\.gz$/.test(n)).length
+  } catch (e) {}
+  return result('ok', { days: spanDays, from: rangeMode ? startKey : '', to: rangeMode ? endKey : '', byDay: out, truncated: truncated || archivedWeeks > 0, archivedWeeks, today: todayKey })
 }
 
 // ── 逐轮运行历史（v3.299 批次②）：run.log 摘要行 → 时间倒序逐轮条目 ─────────────
@@ -755,7 +761,12 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
     lineNo: r.i + 1,
     key: roundKey.get(r.i)
   }))
-  return { status: 'ok', items, hasMore: pool.length > items.length, truncated, windowKey: key }
+  // 同 readTrends：run.log 被周档切走后，更早的轮次不是不存在，而是进了 logs/。
+  let archivedWeeks = 0
+  try {
+    archivedWeeks = require('node:fs').readdirSync(path.join(dir, 'logs')).filter((n) => /^run-\d{8}-\d{8}\.log\.gz$/.test(n)).length
+  } catch (e) {}
+  return { status: 'ok', items, hasMore: pool.length > items.length, truncated: truncated || archivedWeeks > 0, archivedWeeks, windowKey: key }
 }
 
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。

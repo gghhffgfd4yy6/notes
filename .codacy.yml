@@ -274,6 +274,13 @@ exclude_paths:
   # 硬编码夹具文件名，另有以测试常量构造的 new RegExp(src, flags) mock；
   # 目录/文件名/正则源全为测试字面量，无外部输入，静态路径与 ReDoS 告警属误报。
   - "test_filter_store.js"
+  # ---- v3.403 日志周档：静态路径构造的误报登记 ----
+  # scripts/log-archive.js 的路径 = 运行期缓存目录 + 本文件字面量文件名（run.log /
+  # filter-diagnostics.ndjson）+ 由时间戳生成的 YYYYMMDD-YYYYMMDD 周键；周键只由
+  # Date 计算、不来自请求，控制台侧另有 /^logs\/(run|diag)-\d{8}-\d{8}\.log(\.gz)?$/
+  # 白名单。所有打开都走 O_NOFOLLOW + fstat 常规文件校验。
+  # Semgrep 的非字面量 fs 路径告警在此属误报。
+  - "scripts/log-archive.js"
   # ---- v3.311 覆盖文件权限收紧助手（同 filter-rules-paths 的误报口径）----
   # scripts/owner-only-mode.js 只对 FilterStore 传入的固定文件做 stat + chmod
   # (0600)，入参来自运行期状态目录 + 本仓字面量文件名，不接受请求体/URL 拼路径；

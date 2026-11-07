@@ -6247,6 +6247,45 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 读取源与 /api/run-history、/api/status 同走 historyDir()（D2-S5 复核）：run.log 由
       // 运行侧 MessageStore.cacheDir 写入，Config.cache.dir/XBK_CACHE_DIR 漂移或嵌入式注入
       // 时与 stateDir 分居——旧实现读 stateDir/run.log，日志页在那种部署里恒为空。
+      // v3.403：新增 ?list=1（列出当周 + 历史周）与 ?file=&page=&size=（按页读）；
+      // 不带这些参数时保持旧的「尾部 1MiB 全文」口径，老前端与测试不受影响。
+      const LogArchive = require('./log-archive')
+      const dir = historyDir()
+      const pageRaw = url.searchParams.get('page')
+      const fileRaw = url.searchParams.get('file')
+      if (url.searchParams.get('list') === '1') {
+        const cur = []
+        for (const name of ['run.log', 'filter-diagnostics.ndjson']) {
+          let st = null
+          try { st = fs.statSync(path.join(dir, name)) } catch (e) {}
+          if (st) cur.push({ file: name, key: 'current', size: st.size, mtimeMs: st.mtimeMs, kind: 'plain', current: true })
+        }
+        const files = cur.concat(LogArchive.listArchives(dir, 'run.log'), LogArchive.listArchives(dir, 'filter-diagnostics.ndjson'))
+        sendJson(res, 200, { status: 'ok', files })
+        return
+      }
+      if (fileRaw || pageRaw) {
+        const file = String(fileRaw || 'run.log')
+        const ok = file === 'run.log' || file === 'filter-diagnostics.ndjson' ||
+          /^logs\/(run|diag)-\d{8}-\d{8}\.log(\.gz)?$/.test(file)
+        if (!ok) { sendJson(res, 400, { status: 'bad_file', error: '未知日志文件' }); return }
+        const page = Math.max(1, parseInt(pageRaw || '1', 10) || 1)
+        const size = Math.min(500, Math.max(50, parseInt(url.searchParams.get('size') || '200', 10) || 200))
+        const abs = path.join(dir, file)
+        let out = null
+        let exists = false
+        try { exists = fs.existsSync(abs) } catch (e) {}
+        try {
+          out = file.endsWith('.gz') ? LogArchive.readGzPage(abs, page, size) : LogArchive.readPlainPage(abs, page, size)
+        } catch (e) { out = null }
+        if (!out) {
+          // 文件在但读/解压失败 → corrupt（别伪装成 missing 让控制台静默）；确实没有才 missing。
+          sendJson(res, 200, { status: exists ? 'corrupt' : 'missing', file, page, pages: 1, total: 0, lines: [] })
+          return
+        }
+        sendJson(res, 200, { status: 'ok', file, page: out.page, pages: out.pages, total: out.total, size, lines: out.lines })
+        return
+      }
       const { readSafeTextResult } = require('../xbk_storage')
       const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true })
       if (safe.status === 'missing') {

@@ -3,7 +3,7 @@
 // 系统 / 文件 / 配置 / 过滤规则。只依赖 components.js 与基础模块，不认识 App，也没有顶层副作用。
 // 顺序在 ui.js 之前（App 在 ui.js 里 import 这些面板）。
 import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT_URL_REVOKE_MS, PANEL_FRESH_MS, SAVED_HINT_MS, SHANGHAI_OFFSET_MS, SNAP_INFLIGHT_MS, VERSION_TIP_MS } from './constants.js'
-import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, AUTH_HEADER, timedRequest } from './api.js'
+import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetLogFiles, apiGetLogPage, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, AUTH_HEADER, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
 import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
@@ -2602,6 +2602,97 @@ const VIRT_ADAPTER = { observeElementRect, observeElementOffset, scrollToFn: ele
 
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialData = null, focusAt = '', focusDate = '', onSync, active = true }) {
   const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync, initialData)
+  // v3.403：周档（当周 + 历史周）按页读。默认仍看当周尾部；选了文件/翻页后 text 覆盖 data.text。
+  // 只缓存已取过的页（Map），不整份解压、不保留整周文本；首屏只发一次 list + 一次 page。
+  const [arch, setArch] = useState(null)
+  const [jumpText, setJumpText] = useState('')
+  const pageCacheRef = useRef(new Map())
+  const inflightRef = useRef(new Map())
+  const navSeqRef = useRef(0)
+  const prefetchRef = useRef(null)
+  // 页缓存有上限（只留最近 24 页）：翻几百页也不会把整周日志攒在浏览器内存里。
+  const putPage = useCallback((key, d) => {
+    const m = pageCacheRef.current
+    if (m.has(key)) m.delete(key)
+    m.set(key, d)
+    while (m.size > 24) { const k = m.keys().next().value; m.delete(k) }
+  }, [])
+  const applyPage = useCallback((d) => {
+    if (!d || d.status !== 'ok') return
+    setArch((prev) => ({
+      files: (prev && prev.files) || [],
+      file: d.file,
+      page: d.page,
+      pages: d.pages,
+      total: d.total,
+      text: (d.lines || []).join('\n'),
+      err: ''
+    }))
+    stickRef.current = false
+    // 预判：当前页一到手就悄悄取下一页；用户点「下一页」或滚到底时直接命中缓存。
+    const next = d.page + 1
+    if (next <= d.pages) getPage(d.file, next, false).catch(() => {})
+  }, [])
+  // 取页：同一页在飞时复用同一个 Promise（否则预取与点击各发一次，点击还可能拿不到结果）；
+  // apply=true 的请求带导航序号，晚到的旧响应不再覆盖用户已经切过去的视图。
+  const getPage = useCallback(async (file, page, apply) => {
+    const key = file + ':' + page
+    const my = apply ? ++navSeqRef.current : 0
+    let d = pageCacheRef.current.get(key)
+    if (!d) {
+      let p = inflightRef.current.get(key)
+      if (!p) {
+        p = apiGetLogPage(file, page, 200).then((r) => {
+          if (r && r.status === 'ok') putPage(key, r)
+          return r
+        }).finally(() => { inflightRef.current.delete(key) })
+        inflightRef.current.set(key, p)
+      }
+      d = await p
+    }
+    if (!d || d.status !== 'ok') {
+      if (apply && my === navSeqRef.current) setArch((prev) => ({ files: (prev && prev.files) || [], file, page, pages: 1, total: 0, text: null, err: (d && d.status) || 'error' }))
+      return d
+    }
+    if (apply && my === navSeqRef.current) applyPage(d)
+    return d
+  }, [applyPage, putPage])
+  const goPage = useCallback((p) => {
+    const a = arch
+    if (!a || !a.file) return
+    const pg = Math.min(Math.max(1, p), a.pages || 1)
+    getPage(a.file, pg, true).catch(() => {})
+  }, [arch, getPage])
+  const openFile = useCallback((file) => {
+    if (!file) return
+    setJumpText('')
+    navSeqRef.current++
+    pageCacheRef.current.clear()
+    inflightRef.current.clear()
+    getPage(file, 1, true).catch(() => {})
+  }, [getPage])
+  // 列表只在页签第一次 active 时拉一次；失败不影响看当周日志。
+  useEffect(() => {
+    if (!active) return undefined
+    let alive = true
+    apiGetLogFiles().then((r) => {
+      if (!alive || !r || r.status !== 'ok') return
+      setArch((prev) => ({ file: prev ? prev.file : '', page: prev ? prev.page : 1, pages: prev ? prev.pages : 1, total: prev ? prev.total : 0, text: prev ? prev.text : null, files: r.files || [] }))
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [active])
+  // 页码输入：打字过程中不发请求；停手 600ms 才「预取」目标页（不切视图），点确定时直接命中。
+  const onJumpInput = (v) => {
+    setJumpText(v)
+    if (prefetchRef.current) clearTimeout(prefetchRef.current)
+    const n = parseInt(v, 10)
+    if (!arch || !arch.file || !Number.isFinite(n)) return
+    prefetchRef.current = setTimeout(() => {
+      const pg = Math.min(Math.max(1, n), arch.pages || 1)
+      const key = arch.file + ':' + pg
+      if (!pageCacheRef.current.has(key) && !inflightRef.current.has(key)) getPage(arch.file, pg, false).catch(() => {})
+    }, 600)
+  }
   // v3.318：跳转前预取的快照只用于本次挂载——首帧即最终日志，且不再立刻重拉一次。
   const seededRef = useRef(initialData !== null)
   const preRef = useRef(null)
@@ -2793,7 +2884,10 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     }
     return () => { if (t !== null) clearInterval(t) }
   }, [load, pollMs, active])
-  const rawText = data && data.status === 'ok' && typeof data.text === 'string' ? data.text : ''
+  // v3.403：选了周档/翻页时用分页文本；否则维持「当周尾部 1MiB」的旧口径。
+  const rawText = arch && typeof arch.text === 'string'
+    ? arch.text
+    : (data && data.status === 'ok' && typeof data.text === 'string' ? data.text : '')
   // 1 MiB 文本的 split/lowercase 只在输入变化时做一次（审查 #248 可选：此前每次渲染
   // 3 次全量 split + 2 次 lowercase，手机输入关键字会掉帧）。
   const lines = useMemo(() => filterLogLines(rawText, 'all', ''), [rawText])
@@ -2907,8 +3001,21 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     if (!el) return
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
     syncRail()
+    // v3.403：离底 400px 内就预取下一页；命中缓存不重复发，用户点「下一页」是秒开。
+    if (arch && arch.file && arch.page < arch.pages && el.scrollHeight - el.scrollTop - el.clientHeight < 400) {
+      const key = arch.file + ':' + (arch.page + 1)
+      if (!pageCacheRef.current.has(key)) getPage(arch.file, arch.page + 1, false).catch(() => {})
+    }
   }
   const refreshNow = () => {
+    apiGetLogFiles().then((r) => { if (r && r.status === 'ok') setArch((prev) => ({ ...(prev || { file: '', page: 1, pages: 1, total: 0, text: null }), files: r.files || [] })) }).catch(() => {})
+    if (arch && arch.file) {
+      // 日志在增长/被截尾：整份缓存都可能过期，清掉再取当前页。
+      pageCacheRef.current.clear()
+      inflightRef.current.clear()
+      getPage(arch.file, arch.page, true).catch(() => {})
+      return
+    }
     stickRef.current = true
     load(true).catch(() => {})
   }
@@ -2923,7 +3030,9 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   const countLine = [
     mode !== 'all'
       ? `在「${modeLabel}」筛选下 · 显示 ${ranged.length} / ${lines.length} 行`
-      : ((kw !== '' || logRangeActive) ? `显示 ${ranged.length} / ${lines.length} 行` : `共 ${lines.length} 行`),
+      : ((kw !== '' || logRangeActive)
+          ? `显示 ${ranged.length} / ${lines.length} 行`
+          : ((arch && arch.file) ? `本页 ${lines.length} 行` : `共 ${lines.length} 行`)),
     (mode === 'issue' || mode === 'error') ? '已排除控制台停止记录' : '',
     heavy ? `行数过多（>${LOG_HIGHLIGHT_MAX}），已关闭高亮` : '',
     logRangeActive ? `日期 ${logRange.from} ~ ${logRange.to}` : '',
@@ -2962,25 +3071,43 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // （panel 583），数据到达后筛选栏凭空插进来（+134）再加计数行（+19），日志框连下半页
   // 一起被推走 153px。现在 chips 用同一组标签、计数先显示 —，计数行显示「读取中…」。
   const logReady = !!(data && data.status === 'ok')
-  const countText = logReady ? countLine : ((data || err) ? '—' : '读取中…')
+  // 周档页可能先于尾部请求成功（或尾部请求失败）：有分页文本就算可读，不能只认 logReady。
+  const archReady = !!(arch && typeof arch.text === 'string')
+  const viewReady = logReady || archReady
+  const countText = viewReady ? countLine : ((data || err) ? '—' : '读取中…')
+  // v3.403：周档下拉的显示名——当周标明「实时」，历史周显示起止日期（周一到周日）。
+  const archLabel = (f) => {
+    const diag = f.file.indexOf('diag') >= 0 || f.file.indexOf('diagnostics') >= 0
+    const kind = diag ? '诊断日志' : '运行日志'
+    if (f.current) return '本周' + kind + '（实时）'
+    const k = String(f.key || '')
+    if (!/^\d{8}-\d{8}$/.test(k)) return kind
+    const fmt = (x) => x.slice(4, 6) + '.' + x.slice(6, 8)
+    return kind + ' ' + fmt(k.slice(0, 8)) + '–' + fmt(k.slice(9))
+  }
   return html`<div class="panel">
     <${PanelHead} title="运行日志" level=${1} sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
       right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
+    ${active && html`<div class="log-tools log-arch">
+      <${MiniSelect} value=${arch && arch.file ? arch.file : ''} ariaLabel="选择日志文件"
+        options=${[{ value: '', label: '当周（实时尾部）' }].concat((((arch && arch.files) || [])).filter((f) => !f.current).map((f) => ({ value: f.file, label: archLabel(f) })))}
+        onChange=${(v) => { if (!v) { setArch((prev) => ({ files: (prev && prev.files) || [], file: '', page: 1, pages: 1, total: 0, text: null })); setJumpText(''); return } openFile(v) }} />
+    </div>`}
     ${/* v3.320：首帧就按最终高度占位（.log-empty 与 .logpre-main 同高）。旧版首帧只有
          90px，数据到达后 .logpre 一次性出现（776px），文档高度突跳一次。 */ ''}
-    ${logReady && focusMode === 'day' && html`<div class="log-focus" role="status">
+    ${viewReady && focusMode === 'day' && html`<div class="log-focus" role="status">
       <span class="log-focus-text">已定位：<span class="log-focus-time">${focusAt}</span> 这一轮${focusHits > 1 ? `（同秒 ${focusHits} 行，均已高亮）` : ''}</span>
       <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusAt) }}>只看这一轮</button>
     </div>`}
-    ${logReady && focusMode === 'only' && html`<div class="log-focus" role="status">
+    ${viewReady && focusMode === 'only' && html`<div class="log-focus" role="status">
       <span class="log-focus-text">只看：<span class="log-focus-time">${focusAt}</span> 这一轮</span>
       <button type="button" class="log-chip" onClick=${() => { focusDoneRef.current = ''; setQ(focusDate) }}>看当天全部</button>
     </div>`}
-    ${logReady && focusMiss && html`<div class="log-focus log-focus-miss" role="status">
+    ${viewReady && focusMiss && html`<div class="log-focus log-focus-miss" role="status">
       <span class="log-focus-text">这一轮不在当前日志尾部（可能已轮转），下面只显示当天其他轮次</span>
     </div>`}
-    ${logReady && focusHeavy && html`<div class="log-focus log-focus-miss" role="status">
+    ${viewReady && focusHeavy && html`<div class="log-focus log-focus-miss" role="status">
       <span class="log-focus-text">当天日志超过 ${LOG_HIGHLIGHT_MAX} 行，整行高亮已关闭</span>
       <button type="button" class="log-chip" onClick=${() => { stickRef.current = true; setQ(focusAt) }}>只看这一轮</button>
     </div>`}
@@ -2995,12 +3122,23 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
         value=${q} onInput=${(e) => { stickRef.current = true; setFocusDismissed(true); setQ(e.target.value) }} />
     </div>
     <div class="log-count">${countText}</div>
+    ${arch && arch.err && html`<div class="log-empty" role="alert">周档读取失败（${arch.err}），点「刷新」重试；本周实时日志仍可看。</div>`}
+    ${arch && arch.file && html`<div class="log-count log-pager" role="group" aria-label="日志翻页">
+      <span>第 ${arch.page} / ${arch.pages} 页 · 共 ${arch.total} 行</span>
+      <button type="button" class="log-chip" disabled=${arch.page <= 1} onClick=${() => goPage(arch.page - 1)}>上一页</button>
+      <button type="button" class="log-chip" disabled=${arch.page >= arch.pages} onClick=${() => goPage(arch.page + 1)}>下一页</button>
+      <input class="msg-search log-jump" type="number" min="1" max=${arch.pages} inputmode="numeric"
+        aria-label="跳到第几页" placeholder="页码" value=${jumpText}
+        onInput=${(e) => onJumpInput(e.target.value)}
+        onKeyDown=${(e) => { if (e.key === 'Enter') { goPage(parseInt(jumpText, 10) || 1); setJumpText('') } }} />
+      <button type="button" class="log-chip" onClick=${() => { goPage(parseInt(jumpText, 10) || 1); setJumpText('') }}>跳转</button>
+    </div>`}
     ${!data && !err && html`<div class="log-empty" role="status">日志读取中…</div>`}
     ${/* v3.320：首次加载就失败时也给同高占位。旧版错误路径只有顶部 Hint，520px 日志框
          整个消失，跳转/切页后页面高度反向塌一次。 */ ''}
     ${err && !data && html`<div class="log-empty" role="status">日志读取失败</div>`}
     ${data && data.status !== 'ok' && html`<div class="log-empty">日志${data.status === 'missing' ? '尚未生成' : `不可读（${data.status}）`}</div>`}
-    ${logReady && (ranged.length === 0
+    ${viewReady && (ranged.length === 0
       ? html`<div class="log-empty" role="status">
         <div class="log-empty-text">${emptyText}</div>
         ${mode !== 'all' && html`<button type="button" class="log-chip" onClick=${searchAllLogs}>在全部日志中搜索</button>`}
