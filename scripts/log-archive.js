@@ -97,12 +97,12 @@ function writeAtomic (filePath, data) {
     writeAllSync(fd, Buffer.from(data, 'utf8'))
     fs.fsyncSync(fd)
   } finally { try { fs.closeSync(fd) } catch (e) {} }
-  fs.renameSync(tmp, filePath)
+  fs.renameSync(tmp, filePath) // nosemgrep（目标=白名单日志名；tmp 同目录随机后缀）
 }
 
 function fsyncDirBestEffort (dir) {
   try {
-    const fd = fs.openSync(dir, fs.constants.O_RDONLY)
+    const fd = fs.openSync(dir, fs.constants.O_RDONLY) // nosemgrep（dir=缓存目录/logs）
     try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
   } catch (e) { /* 部分文件系统不支持目录 fsync */ }
 }
@@ -121,7 +121,7 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   fs.mkdirSync(dir, { recursive: true }) // nosemgrep（固定子目录）
   const outPath = archivePath(cacheDir, path.basename(logPath), prevKey)
   // 同名归档已存在（上次崩在「发布后、写标记前」）：不覆盖已有数据，交给下一轮。
-  try { if (fs.existsSync(outPath)) return null } catch (e) {}
+  try { if (fs.existsSync(outPath)) return null } catch (e) {} // nosemgrep（outPath=缓存目录/logs + 白名单周键）
 
   let opened
   try { opened = openLog(logPath, true) } catch (e) {
@@ -176,7 +176,7 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   } catch (e) {
     try { fs.closeSync(fdIn) } catch (err) {}
     if (fdOut !== null) { try { fs.closeSync(fdOut) } catch (err) {} }
-    try { fs.unlinkSync(tmpPath) } catch (err) {}
+    try { fs.unlinkSync(tmpPath) } catch (err) {} // nosemgrep（tmpPath 同上，仅清理自己的临时文件）
     throw e
   }
   try { fs.closeSync(fdOut) } catch (e) {}
