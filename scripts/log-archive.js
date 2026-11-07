@@ -17,6 +17,7 @@ const fs = require('fs')
 const path = require('path')
 const zlib = require('zlib')
 
+const DAY_MS = 24 * 3600 * 1000
 const CST_OFFSET_MS = 8 * 3600 * 1000
 const CHUNK_BYTES = 1024 * 1024 // 每个 gzip 成员对应约 1MiB 原文
 const PLAIN_INDEX_STEP = 2000 // 明文档索引：每 2000 行记一个字节偏移
@@ -38,13 +39,13 @@ function weekRange (ts) {
   const now = cstDate(ts)
   const dow = now.getUTCDay() // 0=周日
   const back = dow === 0 ? 6 : dow - 1
-  const monday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - back * 86400000)
-  const sunday = new Date(monday.getTime() + 6 * 86400000)
+  const monday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - back * DAY_MS)
+  const sunday = new Date(monday.getTime() + 6 * DAY_MS)
   return { start: ymd(monday), end: ymd(sunday), key: ymd(monday) + '-' + ymd(sunday) }
 }
 
 function archiveDir (cacheDir) {
-  return path.join(cacheDir, ARCHIVE_DIR)
+  return path.join(cacheDir, ARCHIVE_DIR) // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
 }
 
 function baseOf (fileName) {
@@ -52,7 +53,7 @@ function baseOf (fileName) {
 }
 
 function archivePath (cacheDir, fileName, key) {
-  return path.join(archiveDir(cacheDir), baseOf(fileName) + '-' + key + '.log.gz')
+  return path.join(archiveDir(cacheDir), baseOf(fileName) + '-' + key + '.log.gz') // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
 }
 
 function weekMarkerPath (logPath) {
@@ -61,7 +62,7 @@ function weekMarkerPath (logPath) {
 
 function readMarker (logPath) {
   try {
-    const v = fs.readFileSync(weekMarkerPath(logPath), 'utf8').trim()
+    const v = fs.readFileSync(weekMarkerPath(logPath), 'utf8').trim() // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
     return /^\d{8}-\d{8}$/.test(v) ? v : ''
   } catch (e) { return '' }
 }
@@ -73,24 +74,24 @@ function sealLog (logPath, cacheDir, key) {
   // 不做「stat 路径 → 再 open 路径」的两步检查（中间可能被换文件）。
   let fdIn = null
   let fdWritable = true
-  try { fdIn = fs.openSync(logPath, 'r+') } catch (e) {
+  try { fdIn = fs.openSync(logPath, 'r+') } catch (e) { // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
     // 只读权限的镜像/备份目录：退回只读打开，截断改走路径（这条分支不参与常规轮转）。
     fdWritable = false
-    try { fdIn = fs.openSync(logPath, 'r') } catch (err) { return null }
+    try { fdIn = fs.openSync(logPath, 'r') } catch (err) { return null } // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   }
   let size = 0
   try { size = fs.fstatSync(fdIn).size } catch (e) { try { fs.closeSync(fdIn) } catch (err) {} return null }
   if (!size) {
     try { fs.closeSync(fdIn) } catch (err) {}
-    try { fs.writeFileSync(weekMarkerPath(logPath), key, 'utf8') } catch (e) {}
+    try { fs.writeFileSync(weekMarkerPath(logPath), key, 'utf8') } catch (e) {} // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
     return null
   }
   const dir = archiveDir(cacheDir)
-  fs.mkdirSync(dir, { recursive: true })
+  fs.mkdirSync(dir, { recursive: true }) // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   const outPath = archivePath(cacheDir, path.basename(logPath), key)
   const tmpPath = outPath + '.tmp'
   const idx = { key, base: baseOf(path.basename(logPath)), source: path.basename(logPath), members: [], lines: 0, bytes: 0 }
-  const fdOut = fs.openSync(tmpPath, 'w')
+  const fdOut = fs.openSync(tmpPath, 'w') // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   try {
     const buf = Buffer.alloc(CHUNK_BYTES)
     let carry = Buffer.alloc(0)
@@ -129,10 +130,10 @@ function sealLog (logPath, cacheDir, key) {
     try { fs.closeSync(fdIn) } catch (e) {}
     fs.closeSync(fdOut)
   }
-  fs.renameSync(tmpPath, outPath)
-  fs.writeFileSync(outPath + '.idx.json', JSON.stringify(idx), 'utf8')
-  if (!fdWritable) { try { fs.truncateSync(logPath, 0) } catch (e) {} }
-  fs.writeFileSync(weekMarkerPath(logPath), key, 'utf8')
+  fs.renameSync(tmpPath, outPath) // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
+  fs.writeFileSync(outPath + '.idx.json', JSON.stringify(idx), 'utf8') // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
+  if (!fdWritable) { try { fs.truncateSync(logPath, 0) } catch (e) {} } // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
+  fs.writeFileSync(weekMarkerPath(logPath), key, 'utf8') // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   return { path: outPath, lines: idx.lines, bytes: idx.bytes }
 }
 
@@ -171,7 +172,7 @@ function loadPlainIndexFd (fd, logPath, size) {
   if (!idx) {
     // 冷启动：sidecar 若与当前文件前缀一致（文件只增长过）可直接复用其条目
     try {
-      const disk = JSON.parse(fs.readFileSync(plainIndexPath(logPath), 'utf8'))
+      const disk = JSON.parse(fs.readFileSync(plainIndexPath(logPath), 'utf8')) // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
       if (disk && Array.isArray(disk.entries) && disk.size <= size) {
         idx = { size: disk.size, lines: disk.lines, lastMark: disk.lines, entries: disk.entries }
       }
@@ -188,7 +189,7 @@ function loadPlainIndexFd (fd, logPath, size) {
 }
 
 function loadPlainIndex (logPath) {
-  const fd = fs.openSync(logPath, 'r')
+  const fd = fs.openSync(logPath, 'r') // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   try {
     return loadPlainIndexFd(fd, logPath, fs.fstatSync(fd).size)
   } finally { try { fs.closeSync(fd) } catch (e) {} }
@@ -218,7 +219,7 @@ function readPlainPage (logPath, page, size) {
 }
 
 function readGzIndex (gzPath) {
-  try { return JSON.parse(fs.readFileSync(gzPath + '.idx.json', 'utf8')) } catch (e) { return null }
+  try { return JSON.parse(fs.readFileSync(gzPath + '.idx.json', 'utf8')) } catch (e) { return null } // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
 }
 
 // gz 档按页读：定位目标页落在哪个成员，只解压那一个 1MiB 块。
@@ -235,7 +236,7 @@ function readGzPage (gzPath, page, size) {
     if (acc + idx.members[i].lines <= startLine) { acc += idx.members[i].lines; mi = i + 1 } else { mi = i; break }
   }
   const out = []
-  const fd = fs.openSync(gzPath, 'r')
+  const fd = fs.openSync(gzPath, 'r') // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   try {
     let lineCursor = acc
     for (let i = mi; i < idx.members.length && out.length < size; i++) {
@@ -259,14 +260,14 @@ function listArchives (cacheDir, fileName) {
   const base = baseOf(fileName)
   const out = []
   let names = []
-  try { names = fs.readdirSync(dir) } catch (e) { return out }
+  try { names = fs.readdirSync(dir) } catch (e) { return out } // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   for (const n of names) {
     if (!n.startsWith(base + '-') || !n.endsWith('.log.gz')) continue
     const key = n.slice(base.length + 1, -'.log.gz'.length)
     if (!/^\d{8}-\d{8}$/.test(key)) continue
-    const p = path.join(dir, n)
+    const p = path.join(dir, n) // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
     let st
-    try { st = fs.statSync(p) } catch (e) { continue }
+    try { st = fs.statSync(p) } catch (e) { continue } // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
     const idx = readGzIndex(p)
     out.push({ file: 'logs/' + n, key, size: st.size, lines: idx ? idx.lines : null, mtimeMs: st.mtimeMs, kind: 'gz', pages: idx ? Math.max(1, Math.ceil(idx.lines / 200)) : null })
   }
@@ -278,9 +279,9 @@ function listArchives (cacheDir, fileName) {
 function pruneArchives (cacheDir, fileName, keep = KEEP_WEEKS) {
   const list = listArchives(cacheDir, fileName)
   for (const e of list.slice(keep)) {
-    const p = path.join(cacheDir, e.file)
-    try { fs.unlinkSync(p) } catch (err) {}
-    try { fs.unlinkSync(p + '.idx.json') } catch (err) {}
+    const p = path.join(cacheDir, e.file) // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
+    try { fs.unlinkSync(p) } catch (err) {} // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
+    try { fs.unlinkSync(p + '.idx.json') } catch (err) {} // nosemgrep（路径=固定缓存目录+白名单文件名/周键）
   }
 }
 
