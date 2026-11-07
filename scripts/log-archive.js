@@ -1,6 +1,6 @@
 'use strict'
 
-// 日志按周归档（v3.402）：run.log / filter-diagnostics.ndjson
+// 日志按周归档（v3.403）：run.log / filter-diagnostics.ndjson
 //
 // 设计（与用户约定）：
 //   - 两个日志各自上限 100MB；

@@ -2602,7 +2602,7 @@ const VIRT_ADAPTER = { observeElementRect, observeElementOffset, scrollToFn: ele
 
 function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialData = null, focusAt = '', focusDate = '', onSync, active = true }) {
   const { data, err, load: loadRaw, loading } = usePanelLoader(apiGetLogs, onSync, initialData)
-  // v3.402：周档（当周 + 历史周）按页读。默认仍看当周尾部；选了文件/翻页后 text 覆盖 data.text。
+  // v3.403：周档（当周 + 历史周）按页读。默认仍看当周尾部；选了文件/翻页后 text 覆盖 data.text。
   // 只缓存已取过的页（Map），不整份解压、不保留整周文本；首屏只发一次 list + 一次 page。
   const [arch, setArch] = useState(null)
   const [jumpText, setJumpText] = useState('')
@@ -2867,7 +2867,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     }
     return () => { if (t !== null) clearInterval(t) }
   }, [load, pollMs, active])
-  // v3.402：选了周档/翻页时用分页文本；否则维持「当周尾部 1MiB」的旧口径。
+  // v3.403：选了周档/翻页时用分页文本；否则维持「当周尾部 1MiB」的旧口径。
   const rawText = arch && typeof arch.text === 'string'
     ? arch.text
     : (data && data.status === 'ok' && typeof data.text === 'string' ? data.text : '')
@@ -2984,7 +2984,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     if (!el) return
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
     syncRail()
-    // v3.402：离底 400px 内就预取下一页；命中缓存不重复发，用户点「下一页」是秒开。
+    // v3.403：离底 400px 内就预取下一页；命中缓存不重复发，用户点「下一页」是秒开。
     if (arch && arch.file && arch.page < arch.pages && el.scrollHeight - el.scrollTop - el.clientHeight < 400) {
       const key = arch.file + ':' + (arch.page + 1)
       if (!pageCacheRef.current.has(key)) getPage(arch.file, arch.page + 1, false).catch(() => {})
@@ -3052,7 +3052,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
   // 一起被推走 153px。现在 chips 用同一组标签、计数先显示 —，计数行显示「读取中…」。
   const logReady = !!(data && data.status === 'ok')
   const countText = logReady ? countLine : ((data || err) ? '—' : '读取中…')
-  // v3.402：周档下拉的显示名——当周标明「实时」，历史周显示起止日期（周一到周日）。
+  // v3.403：周档下拉的显示名——当周标明「实时」，历史周显示起止日期（周一到周日）。
   const archLabel = (f) => {
     const diag = f.file.indexOf('diag') >= 0 || f.file.indexOf('diagnostics') >= 0
     const kind = diag ? '诊断日志' : '运行日志'

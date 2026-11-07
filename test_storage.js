@@ -840,7 +840,7 @@ const LogArchive = require('./scripts/log-archive')
     restoreLogs()
   }
 
-  // ===== v3.402 日志周档：切周 / 封档 / 分页 =====
+  // ===== v3.403 日志周档：切周 / 封档 / 分页 =====
   {
     // 2026-11-07 是周六 → 所在自然周为 11-02（周一）~11-08（周日）
     const wk = LogArchive.weekRange(Date.parse('2026-11-07T12:00:00+08:00'))

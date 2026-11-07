@@ -6247,7 +6247,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 读取源与 /api/run-history、/api/status 同走 historyDir()（D2-S5 复核）：run.log 由
       // 运行侧 MessageStore.cacheDir 写入，Config.cache.dir/XBK_CACHE_DIR 漂移或嵌入式注入
       // 时与 stateDir 分居——旧实现读 stateDir/run.log，日志页在那种部署里恒为空。
-      // v3.402：新增 ?list=1（列出当周 + 历史周）与 ?file=&page=&size=（按页读）；
+      // v3.403：新增 ?list=1（列出当周 + 历史周）与 ?file=&page=&size=（按页读）；
       // 不带这些参数时保持旧的「尾部 1MiB 全文」口径，老前端与测试不受影响。
       const LogArchive = require('./log-archive')
       const dir = historyDir()

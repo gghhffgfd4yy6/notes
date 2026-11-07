@@ -381,7 +381,7 @@ function apiGetLogs () {
   return consumeJson(fetch('/api/logs', merged))
 }
 
-// v3.402：周档列表 + 按页读取（只解目标页所在的那个 1MiB gzip 成员）。
+// v3.403：周档列表 + 按页读取（只解目标页所在的那个 1MiB gzip 成员）。
 function apiGetLogFiles () {
   const merged = timedRequest({
     headers: { Accept: 'application/json', ...AUTH_HEADER }
