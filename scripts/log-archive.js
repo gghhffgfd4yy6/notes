@@ -340,7 +340,7 @@ function readGzIndex (gzPath) {
   // 索引本身也可能被换成符号链接：走 O_NOFOLLOW 打开，再按 fd 读。
   let o = null
   try {
-    o = openLog(gzPath + '.idx.json', false)
+    o = openLog(gzPath + '.idx.json', false) // nosemgrep（gzPath=白名单周档名，.idx.json 同目录）
     const idx = JSON.parse(fs.readFileSync(o.fd, 'utf8'))
     if (!idx || !Array.isArray(idx.members) || !idx.members.length) return null
     for (const m of idx.members) {
