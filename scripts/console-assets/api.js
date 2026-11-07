@@ -381,6 +381,22 @@ function apiGetLogs () {
   return consumeJson(fetch('/api/logs', merged))
 }
 
+// v3.402：周档列表 + 按页读取（只解目标页所在的那个 1MiB gzip 成员）。
+function apiGetLogFiles () {
+  const merged = timedRequest({
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
+  })
+  return consumeJson(fetch('/api/logs?list=1', merged))
+}
+
+function apiGetLogPage (file, page, size = 200) {
+  const qs = new URLSearchParams({ file: String(file), page: String(page), size: String(size) })
+  const merged = timedRequest({
+    headers: { Accept: 'application/json', ...AUTH_HEADER }
+  })
+  return consumeJson(fetch('/api/logs?' + qs.toString(), merged))
+}
+
 // v3.332：版本探针走 ?probe=version——服务端据此不把它记进访问日志（60s 一条会挤掉真实历史）；
 // 同时 no-store，防代理/浏览器启发式缓存把旧版本喂回来，让「有新版本」永远判不出来。
 function apiGetSys ({ probeVersion = false } = {}) {
@@ -752,7 +768,7 @@ export {
   BOOT, AUTH_HEADER, DAY_KEY_RE, timedRequest, trigger,
   triggerNotifyTest, apiGetStatus, apiGetRuns, apiGetRunDetail,
   apiCancelRun, apiGetRunHistory, apiGetMessages, apiGetTrends,
-  apiGetCacheHealth, apiGetFiles, apiGetConfig, apiGetLogs,
+  apiGetCacheHealth, apiGetFiles, apiGetConfig, apiGetLogs, apiGetLogFiles, apiGetLogPage,
   apiGetSys, apiGetAuto, apiSetAuto, apiGetAccessLog,
   apiGetFilter, apiGetFilterDraft, apiPostFilterDraft, apiDeleteFilterDraft,
   apiPostFilterSave, apiPostFilterValidate, apiPostFilterPreview, apiPostBackupExport,

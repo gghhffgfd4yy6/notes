@@ -11,6 +11,7 @@ const {
   readSafeText,
   readSafeTextResult
 } = require('./xbk_storage')
+const LogArchive = require('./scripts/log-archive')
 
 ;(async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-storage-'))
@@ -837,6 +838,48 @@ const {
     assert.ok(!closed8.includes(undefined), `reFd 未取得时不得 closeSync(undefined)（实际 ${JSON.stringify(closed8)}）`)
 
     restoreLogs()
+  }
+
+  // ===== v3.402 日志周档：切周 / 封档 / 分页 =====
+  {
+    // 2026-11-07 是周六 → 所在自然周为 11-02（周一）~11-08（周日）
+    const wk = LogArchive.weekRange(Date.parse('2026-11-07T12:00:00+08:00'))
+    assert.deepStrictEqual(wk, { start: '20261102', end: '20261108', key: '20261102-20261108' }, '自然周必须是周一到周日（CST）')
+    const wkSun = LogArchive.weekRange(Date.parse('2026-11-08T23:59:00+08:00'))
+    assert.strictEqual(wkSun.key, wk.key, '周日深夜仍属同一周（不得按 UTC 掉到下一周）')
+
+    const dir = make('logarch')
+    fs.mkdirSync(dir, { recursive: true })
+    const logPath = path.join(dir, 'run.log')
+    fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'line ' + i).join('\n') + '\n')
+    const sealed = LogArchive.sealLog(logPath, dir, '20261102-20261108')
+    assert.strictEqual(sealed.lines, 2500, '封档必须记录总行数')
+    assert.strictEqual(fs.statSync(logPath).size, 0, '封档后明文必须清空')
+    const gz = path.join(dir, 'logs', 'run-20261102-20261108.log.gz')
+    assert.ok(fs.existsSync(gz) && fs.existsSync(gz + '.idx.json'), '必须产出 .gz 与 .idx.json')
+
+    const p1 = LogArchive.readGzPage(gz, 1, 100)
+    assert.strictEqual(p1.lines.length, 100, '首页 100 行')
+    assert.strictEqual(p1.lines[0], 'line 0')
+    assert.strictEqual(p1.total, 2500)
+    assert.strictEqual(p1.pages, 25)
+    const p13 = LogArchive.readGzPage(gz, 13, 100)
+    assert.strictEqual(p13.lines[0], 'line 1200', '第 13 页必须按行号定位（只解目标块）')
+    assert.strictEqual(p13.lines[99], 'line 1299')
+
+    fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'now ' + i).join('\n') + '\n')
+    const pp = LogArchive.readPlainPage(logPath, 25, 100)
+    assert.strictEqual(pp.total, 2500)
+    assert.strictEqual(pp.lines[0], 'now 2400')
+    assert.strictEqual(pp.lines[99], 'now 2499', '最后一页必须取到末行')
+
+    const list = LogArchive.listArchives(dir, 'run.log')
+    assert.strictEqual(list.length, 1)
+    assert.strictEqual(list[0].key, '20261102-20261108')
+    assert.strictEqual(list[0].lines, 2500)
+    // 保留 0 周：立即清掉归档与 idx
+    LogArchive.pruneArchives(dir, 'run.log', 0)
+    assert.ok(!fs.existsSync(gz) && !fs.existsSync(gz + '.idx.json'), '超期归档必须连 idx 一起删除')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

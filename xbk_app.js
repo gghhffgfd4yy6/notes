@@ -1,6 +1,7 @@
 const { setTimeout: delay } = require('node:timers/promises')
 const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 const Similar = require('./scripts/similar-dedupe.js')
+const LogArchive = require('./scripts/log-archive.js')
 
 function createApp ({
   Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, FilterStore, Network, Pusher,
@@ -243,6 +244,21 @@ function createApp ({
         // C1-013：实现与常数统一在 tryLockOnce/acquireLockWithRetry，三处锁共用同一份判据。
           const lock = acquireLockWithRetry(lockPath)
           if (typeof lock.fd === 'number') { lockFd = lock.fd; lockToken = lock.token }
+          // v3.402：自然周切档（周一 00:00 CST）。只在持锁时做——两个进程同时封档会把同一份
+          // 明文压两遍。首次升级（没有 .week 标记）只记下当前周、不封档，避免把已有日志误判成
+          // 上一周；之后跨周时把上一周压成多成员 gz + idx（控制台按页只解一个 1MiB 成员）。
+          if (lockFd !== null) {
+            try {
+              const week = LogArchive.weekRange(Date.now())
+              const marker = LogArchive.readMarker(logPath)
+              if (!marker) {
+                fs.writeFileSync(LogArchive.weekMarkerPath(logPath), week.key, 'utf8')
+              } else if (marker !== week.key) {
+                const sealed = LogArchive.sealLog(logPath, this._cacheDir(), marker)
+                if (sealed) LogArchive.pruneArchives(this._cacheDir(), path.basename(logPath))
+              }
+            } catch (e) { /* 归档失败不阻断日志写入（下一轮会重试） */ }
+          }
           // C043：ERROR 行 errMsg 截断到 512 字符（与日志行口径一致），防止超长异常 message 撑爆日志行
           // C1-006：仅对单行日志启用；批量 NDJSON 显式传 opts.truncateError=false，见方法头注释
           let out = line
@@ -274,7 +290,11 @@ function createApp ({
           // 实测截尾成本：10 MB 30ms / 20 MB 57ms / 40 MB 128ms（读尾部 KEEP + 原子写回），
           // 而截尾每写满 KEEP 才发生一次，摊薄后可忽略；status 侧仍只读尾部 1 MiB（~8ms），
           // 所以放大上限只增加保留时长，不影响响应速度。
-          const LIMIT = 20 * 1024 * 1024
+          // v3.402：单测用 XBK_LOG_LIMIT_BYTES 注入 20MiB 的桩（否则要造 200MB 夹具）；生产默认 100MiB
+          const LIMIT = (() => {
+            const v = Number(process.env.XBK_LOG_LIMIT_BYTES)
+            return Number.isFinite(v) && v > 0 ? v : 100 * 1024 * 1024
+          })()
           // fail-open（拿不到锁）硬上限：旧实现是 8×LIMIT；LIMIT 放大后 8× 会到 160 MiB，
           // 磁盘余量闸只有 50 MiB，改成 4×（80 MiB）仍然远大于正常窗口。
           const FAIL_OPEN_HARD_LIMIT = 4 * LIMIT
