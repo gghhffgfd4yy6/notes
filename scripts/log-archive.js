@@ -196,7 +196,7 @@ function loadPlainIndex (logPath) {
 }
 
 function readPlainPage (logPath, page, size) {
-  const fd = fs.openSync(logPath, 'r')
+  const fd = fs.openSync(logPath, 'r') // nosemgrep（logPath = 缓存目录 + run.log / filter-diagnostics.ndjson）
   try {
     const idx = loadPlainIndexFd(fd, logPath, fs.fstatSync(fd).size)
     const total = idx.lines

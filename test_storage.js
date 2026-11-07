@@ -868,7 +868,9 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(p13.lines[99], 'line 1299')
 
     fs.writeFileSync(logPath, Array.from({ length: 2500 }, (_, i) => 'now ' + i).join('\n') + '\n')
-    const pp = LogArchive.readPlainPage(logPath, 25, 100)
+    // 夹具自己刚写完这个临时文件、进程内同步读，没有并发写者；CodeQL 的
+    // js/file-system-race 在这个「写路径→读同一路径」形态上会误报。
+    const pp = LogArchive.readPlainPage(logPath, 25, 100) // codeql[js/file-system-race]
     assert.strictEqual(pp.total, 2500)
     assert.strictEqual(pp.lines[0], 'now 2400')
     assert.strictEqual(pp.lines[99], 'now 2499', '最后一页必须取到末行')

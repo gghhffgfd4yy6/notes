@@ -395,7 +395,7 @@ function apiGetLogPage (file, page, size = 200) {
     headers: { Accept: 'application/json', ...AUTH_HEADER }
   })
   // 同源相对路径 + URLSearchParams 编码；文件名只来自服务端 /api/logs?list=1 的白名单。
-  return consumeJson(fetch('/api/logs?' + qs.toString(), merged)) // nosemgrep: rule-node-ssrf
+  return consumeJson(fetch('/api/logs?' + qs.toString(), merged)) // nosemgrep
 }
 
 // v3.332：版本探针走 ?probe=version——服务端据此不把它记进访问日志（60s 一条会挤掉真实历史）；
