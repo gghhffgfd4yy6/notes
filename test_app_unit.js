@@ -891,13 +891,65 @@ check('_writeRunLog 最后换行在 10MiB 窗口之外 ⇒ 流式重写，不整
   assert.ok(!app._logRotateBackoffByPath.has(LOG_PATH), '成功截尾后必须清除这条日志的退避')
 })
 
-check('_writeRunLog 尾部多个换行 ⇒ 从 KEEP 窗口起保留完整行，不只剩最后一行', () => {
+check('_writeRunLog 尾部多个换行 ⇒ 保留约 KEEP 字节、从换行处对齐、含最新内容', () => {
   // 8b3bd07 的回归夹具：日志总以 '\n' 结尾，旧实现取「最后一个换行之后」⇒ 只留最后一行 / 0 字节。
   const rest = 'B'.repeat(100) + '\n' + 'C'.repeat(KEEP - 102)
   const rec = makeLogFs({ size: 2 * LIMIT, tail: '\n' + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
+  assert.strictEqual(cap.length, 1, '超限必须截尾一次')
+  const kept = cap[0][1]
+  assert.strictEqual(cap[0][0], LOG_PATH)
+  // 保留段起点 = 夹具里 '\n' 之后的字节：读位置必须正好跨过那个换行（否则会把半行当新文件头）。
+  const lastRead = rec.rec.read[rec.rec.read.length - 1]
+  assert.deepStrictEqual(lastRead, [8, rest.length, 2 * LIMIT - rest.length, rest.length],
+    '读起点必须是换行之后的第一个字节（从换行处对齐）')
+  assert.ok(kept.length > KEEP - 1024 && kept.length <= KEEP,
+    `保留段必须约为 KEEP（实际 ${kept.length}，KEEP=${KEEP}）`)
+  assert.ok(!kept.startsWith('\n') && kept.startsWith('B'.repeat(100) + '\n'),
+    '保留段必须从完整行开始，不能是半行')
+  assert.ok(kept.endsWith('C'.repeat(1024)), '最新内容必须在保留段里（尾部不能被吃掉）')
+  assert.strictEqual(kept, rest, '夹具里唯一合法的保留段就是最后换行后的整段内容')
+})
+
+check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、行首对齐、不丢最新行', () => {
+  // 单测桩的 appendFileSync 只记录不追加，真实场景（写一行让文件以 '\n' 结尾后再截尾）永远不出现：
+  // 8b3bd07 的错误语义在桩下全绿。这里用真实临时文件走一遍完整路径。
+  const rfs = require('fs')
+  const { writeAtomic } = require('./xbk_storage.js')
+  const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trim-real-'))
+  const logPath = path.join(dir, 'run.log')
+  const WIDTH = 1024
+  const line = 'x'.repeat(WIDTH - 1) + '\n'
+  const lines = Math.ceil((11 * 1024 * 1024) / WIDTH)
+  const prevLimit = process.env.XBK_LOG_LIMIT_BYTES
+  try {
+    rfs.writeFileSync(logPath, line.repeat(lines))
+    const before = rfs.statSync(logPath).size
+    assert.ok(before > KEEP, `夹具必须先超过 KEEP（实际 ${before}）`)
+    process.env.XBK_LOG_LIMIT_BYTES = String(10 * 1024 * 1024 + 512 * 1024) // 10.5MiB：11MiB 夹具超限
+    const app = makeApp({
+      fs: rfs,
+      writeAtomic,
+      Utils: makeUtils(),
+      MessageStore: { cacheDir: dir, _getTombstoneProcessStart: () => 42, _isTombstoneLockProcessAlive: () => false }
+    })
+    const r = withCapture('warn', () => app._writeRunLog('LATEST-LINE-MARKER\n'))
+    const after = rfs.statSync(logPath).size
+    const kept = rfs.readFileSync(logPath, 'utf8')
+    assert.deepStrictEqual(r.msgs.filter((m) => m.includes('日志截尾')), [], `正常截尾不得告警：${JSON.stringify(r.msgs)}`)
+    assert.ok(after <= KEEP, `截尾后不得超过 KEEP（实际 ${after}）`)
+    assert.ok(after > KEEP - WIDTH, `保留段必须约为 KEEP（实际 ${after}）`)
+    assert.strictEqual(kept.slice(0, WIDTH - 1).includes('\n'), false, '首行必须是完整行（切点不能落在行中间）')
+    assert.ok(kept.endsWith('LATEST-LINE-MARKER\n'), '最新追加的行必须保留')
+    assert.strictEqual((before + 'LATEST-LINE-MARKER\n'.length - after) % WIDTH, 0,
+      '丢弃的前缀必须正好是整数行（截尾从换行处对齐）')
+    assert.strictEqual(rfs.readdirSync(dir).filter((f) => f.endsWith('.trim')).length, 0, '不得残留临时文件')
+  } finally {
+    if (prevLimit === undefined) delete process.env.XBK_LOG_LIMIT_BYTES
+    else process.env.XBK_LOG_LIMIT_BYTES = prevLimit
+    rfs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // ----- 截尾定位/重写（Sourcery PRRT_kwDOT8kkjs61Mcxl）：换行在 10MiB 窗口之外 -----
