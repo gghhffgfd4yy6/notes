@@ -1007,15 +1007,24 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(fs.readFileSync(log13, 'utf8'), '', '重试成功后明文必须被截断')
     assert.strictEqual(LogArchive.readGzPage(retry13.path, 1, 100).lines[0], 'F13 第0行', '重试后归档必须仍可读')
 
+    // ⑧ 现场的按路径入口集中在观测窗口外：目录与初始明文只准备一次，随后用同一个 r+ fd 贯穿
+    // 长度核验、追加写入与读回。窗口内（'// ⑧ F1-4：' 起）只允许 fstatSync/readSync/writeSync/
+    // closeSync，由 ⑧d 结构回归锁逐字守住（CodeQL js/file-system-race #131/#132 防回潮）。
+    const seedF14 = (dir, data) => {
+      fs.mkdirSync(dir, { recursive: true })
+      const p = path.join(dir, 'run.log')
+      fs.writeFileSync(p, data)
+      return p
+    }
+    const openF14 = (p) => fs.openSync(p, 'r+')
+
     // ⑧ F1-4：截断成功但 .week 写失败（明文=0、gz+idx 已发布、marker 仍旧周）后，新周内容已追加
     // 且长度超过 idx.bytes —— 旧恢复分支只按 st.size >= idx.bytes 认定「明文前缀还是归档内容」，
     // 会把 [idx.bytes, size) 搬到文件头再截断：静默丢掉新内容开头 idx.bytes 字节、留下半行，
     // 随后 marker 照常推进，数据不可恢复且无任何 WARN。
     const dir14 = make('logarch-f14')
-    fs.mkdirSync(dir14, { recursive: true })
-    const log14 = path.join(dir14, 'run.log')
     const old14 = Buffer.from(Array.from({ length: 40 }, (_, i) => 'F14 上周第' + i + '行 ' + 'a'.repeat(12)).join('\n') + '\n')
-    fs.writeFileSync(log14, old14)
+    const log14 = seedF14(dir14, old14)
     LogArchive.writeMarker(log14, '20261102-20261108')
     const first14 = LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115')
     // 复现现场：明文已截到 0、gz+idx 都在、marker 仍是旧周（.week 写入失败）
@@ -1032,24 +1041,29 @@ const LogArchive = require('./scripts/log-archive')
       try { LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr14 = e }
     } finally { fs.renameSync = origRename14 }
     assert.ok(markerErr14 && markerErr14.code === 'EBUSY', '注入必须让 .week 写入失败（复现现场）')
-    // CodeQL js/file-system-race（CWE-367，alert #131/#132）修法：现场长度必须经 fd 核验。
-    // 旧写法「按路径 statSync 取 size」是一次检查，随后 1040 的 appendFileSync / 1050 的
-    // readFileSync 又按路径使用同一路径，构成 check-by-path → use-by-path 的 TOCTOU 配对；
-    // 换名竞态下两次路径解析可能指向不同文件。改成 open → fstat(fd) → close 后核验钉在
-    // 同一个 inode 上，数据流不再经过「路径检查」。断言语义（现场明文长度为 0）逐字保留。
-    const fd14 = fs.openSync(log14, 'r')
+    // CodeQL js/file-system-race（CWE-367，alert #131）修法：现场长度核验与追加写入必须落在
+    // 同一个 fd 上（open 'r+' → fstatSync(fd) → writeSync(fd) → closeSync）。旧写法先按路径
+    // open/stat 检查、再按路径 appendFileSync 追加，仍是 check-by-path → use-by-path 的 TOCTOU
+    // 配对：换名竞态下两次路径解析可能指向不同文件。断言语义（现场明文长度为 0）逐字保留。
+    const fd14 = openF14(log14)
     let size14 = -1
+    let new14 = null
     try {
       size14 = fs.fstatSync(fd14).size
+      assert.strictEqual(size14, 0, '现场必须是「明文已截断到 0」')
+      assert.strictEqual(LogArchive.readMarker(log14), '20261102-20261108', '现场 marker 仍停在旧周')
+      // 新周内容必须比 idx.bytes 长，否则会落进「明文比归档短」分支，掩盖本缺陷
+      new14 = Buffer.from(Array.from({ length: 90 }, (_, i) => 'F14 新周第' + i + '行 ' + 'b'.repeat(12)).join('\n') + '\n')
+      assert.ok(new14.length > first14.bytes, `新周内容必须超过 idx.bytes（${new14.length} vs ${first14.bytes}）`)
+      let wrote14 = 0
+      while (wrote14 < new14.length) {
+        const n = fs.writeSync(fd14, new14, wrote14, new14.length - wrote14, wrote14)
+        assert.ok(n > 0, `⑧ 现场追加不得短写（${wrote14}/${new14.length}）`)
+        wrote14 += n
+      }
     } finally {
       fs.closeSync(fd14)
     }
-    assert.strictEqual(size14, 0, '现场必须是「明文已截断到 0」')
-    assert.strictEqual(LogArchive.readMarker(log14), '20261102-20261108', '现场 marker 仍停在旧周')
-    // 新周内容必须比 idx.bytes 长，否则会落进「明文比归档短」分支，掩盖本缺陷
-    const new14 = Buffer.from(Array.from({ length: 90 }, (_, i) => 'F14 新周第' + i + '行 ' + 'b'.repeat(12)).join('\n') + '\n')
-    assert.ok(new14.length > first14.bytes, `新周内容必须超过 idx.bytes（${new14.length} vs ${first14.bytes}）`)
-    fs.appendFileSync(log14, new14)
     const warns14 = []
     const origWarn14 = console.warn
     let second14 = null
