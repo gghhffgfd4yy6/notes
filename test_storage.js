@@ -1705,12 +1705,30 @@ const LogArchive = require('./scripts/log-archive')
     // fail-open 追加（真实调用方在失败后继续写日志）：长度变成 before + extra，不再是 before
     const extra33 = Buffer.from('F33 封档失败后写入的一行 ' + 'f'.repeat(120) + '\n')
     fs.appendFileSync(log33, extra33)
-    assert.ok(fs.statSync(log33).size > journal33.before, '夹具：恢复前必须有追加，长度大于 before')
+    // CodeQL js/file-system-race：长度核验也走 fd（不再按路径 statSync 之后按路径使用同一路径）。
+    const fd33 = fs.openSync(log33, 'r')
+    let size33 = -1
+    try {
+      size33 = fs.fstatSync(fd33).size
+    } finally {
+      fs.closeSync(fd33)
+    }
+    assert.ok(size33 > journal33.before, '夹具：恢复前必须有追加，长度大于 before')
     const second33 = LogArchive.sealLog(log33, dir33, '20261102-20261108', '20261109-20261115')
     assert.ok(second33, '有 fail-open 追加时也必须自动补完（真实调用方每轮都会先写一行再重试）')
     assert.strictEqual(LogArchive.readMarker(log33), '20261109-20261115', '补完后 marker 必须推进')
-    assert.ok(!fs.existsSync(log33 + '.seal.json'), '补完后事务记录必须清理')
-    const plain33 = fs.readFileSync(log33)
+    // CodeQL js/file-system-race（CWE-367，alert #136）修法：同 M8-5 —— 事务记录检查改成
+    // openSync 拿 fd + closeSync、捕 ENOENT 判「已清理」，明文读回走同一个 fd（readAllByFd），
+    // 不再有 existsSync → readFileSync 的 check-by-path/use-by-path 配对。
+    let journalGone33 = false
+    try {
+      fs.closeSync(fs.openSync(log33 + '.seal.json', 'r'))
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+      journalGone33 = true
+    }
+    assert.ok(journalGone33, '补完后事务记录必须清理')
+    const plain33 = readAllByFd(log33)
     const expected33 = Buffer.concat([new33, extra33])
     assert.strictEqual(plain33.length, expected33.length,
       `明文长度必须是「新周内容 + 失败后追加」（实际 ${plain33.length}，期望 ${expected33.length}）`)
