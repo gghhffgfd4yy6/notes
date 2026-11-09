@@ -451,7 +451,8 @@ function makeLogFs (over = {}) {
     readSync (fd, buf, off, len, pos) {
       rec.read.push([fd, len, pos, buf.length])
       // 位置感知的虚拟文件：size 字节里，尾部 tail.length 字节是 over.tail，其余填 'A'（无换行）。
-      // 截尾现在会从 EOF 向前按块扫描，忽略 pos 的桩会让扫描读到错误的内容。
+      // 截尾扫描的起点是 size-KEEP、方向向后（窗口内找不到换行再向前回退），
+      // 忽略 pos 的桩会让扫描读到错误的内容。
       const size = over.size === undefined ? 0 : over.size
       buf.fill(0x41, off, off + len)
       if (over.newlineAt !== undefined && over.newlineAt >= pos && over.newlineAt < pos + len) {
@@ -805,7 +806,7 @@ check('_writeRunLog size === LIMIT ⇒ 不截尾（严格大于），但必须�
   assert.strictEqual(cap.length, 0)
 })
 
-check('_writeRunLog size > 1MiB ⇒ 从 EOF 扫描换行，只写回保留段', () => {
+check('_writeRunLog size > 1MiB ⇒ 从 size-KEEP 扫描换行，只写回保留段', () => {
   const head = 'H'.repeat(1000) + '\n'
   const rest = 'T'.repeat(KEEP - head.length)
   const rec = makeLogFs({ size: 2 * LIMIT, tail: head + rest })
@@ -964,7 +965,7 @@ check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、�
 })
 
 // ----- 截尾定位/重写（Sourcery PRRT_kwDOT8kkjs61Mcxl）：换行在 10MiB 窗口之外 -----
-check('_logTrimCut 从 EOF 向前跨块扫描：最后换行在 10MiB 窗口之外仍返回其结束位置', () => {
+check('_logTrimCut 跨块回退扫描：最后换行在 10MiB 窗口之外仍返回其结束位置', () => {
   const rfs = require('fs')
   const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trimcut-'))
   const p = path.join(dir, 'run.log')
