@@ -1267,6 +1267,28 @@ const LogArchive = require('./scripts/log-archive')
     LogArchive.sealLog(log20, dir20, '20261102-20261108', '20261109-20261115')
     assert.strictEqual(LogArchive.readMarker(log20), '20261109-20261115', '补完 marker 后必须推进')
     assert.ok(!fs.existsSync(log20 + '.seal.json'), 'marker 成功后必须清掉事务记录')
+
+    // ⑬ F1-10：索引重建必须限制单个成员解压后的体积。高压缩比成员（33MiB 零字节）在旧实现里
+    // 会被整份 inflate 进内存；现在应给出可恢复的 EARCHIVE，而不是把 logger 的内存打爆。
+    const dir21 = make('logarch-f21')
+    fs.mkdirSync(path.join(dir21, 'logs'), { recursive: true })
+    const log21 = path.join(dir21, 'run.log')
+    fs.writeFileSync(log21, 'F21 明文\n')
+    LogArchive.writeMarker(log21, '20261102-20261108')
+    const bomb21 = zlib.gzipSync(Buffer.alloc(33 * 1024 * 1024))
+    fs.writeFileSync(LogArchive.archivePath(dir21, 'run.log', '20261102-20261108'), bomb21)
+    let bombErr21 = null
+    const origWarn21 = console.warn
+    try {
+      console.warn = () => {}
+      try { LogArchive.sealLog(log21, dir21, '20261102-20261108', '20261109-20261115') } catch (e) { bombErr21 = e }
+    } finally { console.warn = origWarn21 }
+    assert.ok(bombErr21 && bombErr21.code === 'EARCHIVE', `解压超限必须抛 EARCHIVE（实际 ${bombErr21 && bombErr21.code}）`)
+    assert.ok(bombErr21.message.includes('超过上限') && bombErr21.message.includes(dir21),
+      `错误必须说明上限并带路径：${bombErr21.message}`)
+    assert.ok(!fs.existsSync(LogArchive.archivePath(dir21, 'run.log', '20261102-20261108') + '.idx.json'),
+      '重建失败不得写出索引（半成品索引会让控制台读到坏档）')
+    assert.strictEqual(LogArchive.readMarker(log21), '20261102-20261108', '重建失败不得推进 marker')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

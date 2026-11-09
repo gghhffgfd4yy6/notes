@@ -270,56 +270,84 @@ function countNewlines (buf) {
 // （flags=0，无 FNAME/FEXTRA 等附加字段），故成员长度 = 10 + deflate + 8（CRC32 + ISIZE）。
 // 头形态/长度/CRC/ISIZE 任一对不上都抛错——恢复路径宁可拒绝，也不能按猜出来的偏移生成一份
 // 会把控制台读坏的索引。
+//
+// 内存边界（Sourcery PRRT_kwDOT8kkjs61McwH）：旧实现先 Buffer.alloc(整个 gz) 再无限解压，
+// 大档案或高压缩比成员能把进程内存打爆（logger 直接崩，而不是给出可恢复的 EARCHIVE）。
+// 现在按成员定点读：压缩输入从 64KiB 起倍增、封顶 MAX_REBUILD_INPUT；inflateRawSync 用
+// maxOutputLength 限制单个成员解压上限（超过即拒绝）。任一时刻只持有一个成员的输入/输出。
+const MAX_REBUILD_INPUT = 16 * 1024 * 1024
+const MAX_REBUILD_MEMBER = 32 * 1024 * 1024
+const REBUILD_INPUT_STEP = 64 * 1024
+
+function inflateMemberBounded (fd, start, end, gzPath, off) {
+  const avail = end - start
+  if (avail <= 0) throw archiveError(`归档索引缺失且 gz 成员无法解压（偏移 ${off}）：${gzPath}（无数据）`)
+  let len = Math.min(REBUILD_INPUT_STEP, avail)
+  for (;;) {
+    const slice = readExactAt(fd, start, len)
+    if (!slice) throw archiveError(`归档索引缺失且 gz 读不完整：${gzPath}`)
+    let inflated
+    try {
+      inflated = zlib.inflateRawSync(slice, { info: true, maxOutputLength: MAX_REBUILD_MEMBER })
+    } catch (e) {
+      if (e && e.code === 'ERR_BUFFER_TOO_LARGE') {
+        throw archiveError(`归档索引缺失且 gz 成员解压后超过上限（偏移 ${off}，上限 ${MAX_REBUILD_MEMBER} 字节）：${gzPath}`)
+      }
+      if (len < avail && len < MAX_REBUILD_INPUT) {
+        // 切片不够长（成员本身没问题）：加倍重试；maxOutputLength 仍在每次调用上生效。
+        len = Math.min(len * 2, MAX_REBUILD_INPUT, avail)
+        continue
+      }
+      throw archiveError(`归档索引缺失且 gz 成员无法解压（偏移 ${off}）：${gzPath}（${e.code || e.message}）`)
+    }
+    return inflated
+  }
+}
+
 function rebuildGzIndex (gzPath, prevKey, fileName) {
   let opened
   try { opened = openLog(gzPath, false) } catch (e) {
     throw archiveError(`归档索引缺失且 gz 无法读取：${gzPath}（${e.code || e.message}）`)
   }
-  let buf
+  const fd = opened.fd
   try {
-    buf = Buffer.alloc(opened.size)
-    let got = 0
-    while (got < opened.size) {
-      const n = fs.readSync(opened.fd, buf, got, opened.size - got, got)
-      if (n <= 0) break
-      got += n
+    if (!opened.size) throw archiveError(`归档索引缺失且 gz 为空：${gzPath}`)
+    const idx = { key: prevKey, base: baseOf(fileName), source: fileName, members: [], lines: 0, bytes: 0 }
+    let off = 0
+    while (off < opened.size) {
+      const head = readExactAt(fd, off, 10)
+      if (!head) throw archiveError(`归档索引缺失且 gz 读不完整：${gzPath}`)
+      if (opened.size - off < 18 || head[0] !== 0x1f || head[1] !== 0x8b || head[2] !== 0x08 || head[3] !== 0) {
+        throw archiveError(`归档索引缺失且 gz 成员头非法（偏移 ${off}）：${gzPath}`)
+      }
+      const inflated = inflateMemberBounded(fd, off + 10, opened.size, gzPath, off)
+      const deflateLen = inflated.engine && inflated.engine.bytesWritten
+      const len = 10 + deflateLen + 8
+      if (!Number.isSafeInteger(deflateLen) || deflateLen <= 0 || off + len > opened.size) {
+        throw archiveError(`归档索引缺失且 gz 成员长度异常（偏移 ${off}）：${gzPath}`)
+      }
+      const text = inflated.buffer
+      const crcOff = off + 10 + deflateLen
+      const trailer = readExactAt(fd, crcOff, 8)
+      if (!trailer || !text.length || trailer.readUInt32LE(4) !== (text.length >>> 0) ||
+          (typeof zlib.crc32 === 'function' && (zlib.crc32(text) >>> 0) !== trailer.readUInt32LE(0))) {
+        throw archiveError(`归档索引缺失且 gz 成员校验失败（偏移 ${off}）：${gzPath}`)
+      }
+      const nl = countNewlines(text)
+      const tail = text[text.length - 1] !== 0x0a
+      if (tail && off + len !== opened.size) {
+        throw archiveError(`归档索引缺失且 gz 中间成员无换行结尾（偏移 ${off}）：${gzPath}`)
+      }
+      if (!Number.isSafeInteger(idx.bytes + text.length) || !Number.isSafeInteger(idx.lines + nl + (tail ? 1 : 0))) {
+        throw archiveError(`归档索引缺失且 gz 统计溢出（偏移 ${off}）：${gzPath}`)
+      }
+      idx.members.push(tail ? { off, len, lines: nl + 1, tail: true } : { off, len, lines: nl })
+      idx.lines += nl + (tail ? 1 : 0)
+      idx.bytes += text.length
+      off += len
     }
-    if (got !== opened.size) throw archiveError(`归档索引缺失且 gz 读不完整：${gzPath}`)
-  } finally { try { fs.closeSync(opened.fd) } catch (e) {} }
-
-  if (!buf.length) throw archiveError(`归档索引缺失且 gz 为空：${gzPath}`)
-  const idx = { key: prevKey, base: baseOf(fileName), source: fileName, members: [], lines: 0, bytes: 0 }
-  let off = 0
-  while (off < buf.length) {
-    if (buf.length - off < 18 || buf[off] !== 0x1f || buf[off + 1] !== 0x8b || buf[off + 2] !== 0x08 || buf[off + 3] !== 0) {
-      throw archiveError(`归档索引缺失且 gz 成员头非法（偏移 ${off}）：${gzPath}`)
-    }
-    let inflated
-    try { inflated = zlib.inflateRawSync(buf.subarray(off + 10), { info: true }) } catch (e) {
-      throw archiveError(`归档索引缺失且 gz 成员无法解压（偏移 ${off}）：${gzPath}（${e.code || e.message}）`)
-    }
-    const deflateLen = inflated.engine && inflated.engine.bytesWritten
-    const len = 10 + deflateLen + 8
-    if (!Number.isSafeInteger(deflateLen) || deflateLen <= 0 || off + len > buf.length) {
-      throw archiveError(`归档索引缺失且 gz 成员长度异常（偏移 ${off}）：${gzPath}`)
-    }
-    const text = inflated.buffer
-    const crcOff = off + 10 + deflateLen
-    if (!text.length || buf.readUInt32LE(crcOff + 4) !== (text.length >>> 0) ||
-        (typeof zlib.crc32 === 'function' && (zlib.crc32(text) >>> 0) !== buf.readUInt32LE(crcOff))) {
-      throw archiveError(`归档索引缺失且 gz 成员校验失败（偏移 ${off}）：${gzPath}`)
-    }
-    const nl = countNewlines(text)
-    const tail = text[text.length - 1] !== 0x0a
-    if (tail && off + len !== buf.length) {
-      throw archiveError(`归档索引缺失且 gz 中间成员无换行结尾（偏移 ${off}）：${gzPath}`)
-    }
-    idx.members.push(tail ? { off, len, lines: nl + 1, tail: true } : { off, len, lines: nl })
-    idx.lines += nl + (tail ? 1 : 0)
-    idx.bytes += text.length
-    off += len
-  }
-  return idx
+    return idx
+  } finally { try { fs.closeSync(fd) } catch (e) {} }
 }
 
 // 切档：把上一周（prevKey）的明文压成「多成员 gz + idx」，截断明文，最后写新周标记（nextKey）。
