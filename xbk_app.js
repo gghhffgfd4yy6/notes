@@ -310,7 +310,7 @@ function createApp ({
         }
         // v3.396 审查加固：截尾失败（临时文件写不进/rename 失败，多见于磁盘将满）后 60s 内不再追加，
         // 只回显 stdout——否则每次调用都「先追加、再截尾失败」，超限日志会继续长到把盘吃光。
-        // v3.408（Sourcery PRRT_kwDOT8kkjs61Mcx6）：退避必须按日志路径分开记。共享一个字段时，
+        // v3.405（Sourcery PRRT_kwDOT8kkjs61Mcx6）：退避必须按日志路径分开记。共享一个字段时，
         // 一条日志截尾放弃会让另一条白名单日志的写入也静默跳过 60s（只回显 stdout）。
         const rotateBackoffUntil = this._logRotateBackoffByPath.get(logPath) || 0
         if (rotateBackoffUntil && Date.now() < rotateBackoffUntil) {
