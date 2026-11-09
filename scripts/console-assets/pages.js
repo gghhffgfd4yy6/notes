@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetLogFiles, apiGetLogPage, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, AUTH_HEADER, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterCorruptNotice, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -5359,9 +5359,11 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       ${(corrupt || auditBroken) && html`<div class="alert-banner" role="alert">
         <span class="alert-dot" aria-hidden="true"></span>
         <div class="alert-main">
-          <strong>${corrupt ? '过滤规则覆盖文件损坏，运行侧已降级' : '过滤规则审计链断链'}</strong>
+          <strong>${corrupt
+            ? (applied && applied.source === 'corrupt' ? '过滤规则覆盖文件损坏，运行侧已降级' : '过滤规则覆盖文件损坏（下一次加载起降级）')
+            : '过滤规则审计链断链'}</strong>
           <span class="alert-sub">${corrupt
-            ? `运行侧优先使用进程内 last-known-good，首次加载即损坏才回退代码默认（不清 _f、不推进过滤 hash）。${data.error && data.error.message ? `原因：${data.error.message}` : ''}`
+            ? `${filterCorruptNotice({ appliedSource: applied && applied.source, appliedRevision: appliedRev, lastGoodUsed: data.lastGoodUsed === true })}${data.error && data.error.message ? `原因：${data.error.message}` : ''}`
             : `审计链在${data.auditChain.brokenAt === null || data.auditChain.brokenAt === undefined ? '未知位置' : `第 ${data.auditChain.brokenAt} 条`}断开，可能存在静默删除/篡改（只保证可检测，不声称防 root）。`}
             <br />本轮不换规则、下一轮生效：这里保存的修改从下一轮开始生效，正在跑的一轮继续用已生效规则。</span>
         </div>

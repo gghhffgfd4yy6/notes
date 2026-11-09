@@ -158,6 +158,29 @@ export function effectiveFilterRows (configFilter, activeFilter) {
   }))
 }
 
+// 过滤规则页「覆盖文件损坏」红条的**降级说明**（I2/F4-1 返工 R3）。文案必须描述代码里真实的链路：
+// 运行侧读不到覆盖文件时，先读进程内缓存，再读持久 LKG `<缓存目录>/filter-rules.lastgood.json`，
+// 两者都没有才回代码默认。旧文案写的是「先进程内缓存、只在首次加载就坏时才回退默认」——那正是本
+// item 修掉的旧机制（控制台 auto-run 每轮都是新进程，进程内缓存等于不存在）。
+// 光有「已降级」不够——用户要知道规则**现在到底还在不在**，所以由运行侧 applied 快照分三态：
+//   · lastGoodUsed=true：最近一轮沿用了上次合法规则（规则没变，但必须尽快修）；
+//   · 上一轮就是 corrupt 而没沿用：确实回退代码默认（规则可能被放宽/收紧，最危险）；
+//   · 上一轮正常 / 还没有快照：降级还没发生，不得冒充「已回退代码默认」。
+// 入参全部来自 GET /api/config/filter（lastGoodUsed 只认运行侧 applied.json），控制台进程自己读文件的
+// 结果不得用来推断运行侧状态。
+export function filterCorruptNotice ({ appliedSource, appliedRevision, lastGoodUsed } = {}) {
+  const rev = Number.isSafeInteger(appliedRevision) && appliedRevision >= 0 ? appliedRevision : null
+  const tail = '（不清 _f、不推进过滤 hash）'
+  if (lastGoodUsed === true) {
+    return `运行侧最近一轮沿用上次合法规则（持久 LKG${rev === null ? '' : ` r${rev}`}），未回退代码默认${tail}。`
+  }
+  if (appliedSource === 'corrupt') {
+    return `运行侧最近一轮没有可用的 LKG，已回退代码默认——规则与上次合法版本不同，请尽快修复${tail}。`
+  }
+  const lead = appliedSource ? '运行侧最近一轮仍是正常加载（尚未遇到降级）' : '运行侧还没有生效快照'
+  return `${lead}；真的读不到覆盖文件时会先试进程内缓存、再试持久 LKG <缓存目录>/filter-rules.lastgood.json，都没有才回退代码默认${tail}。`
+}
+
 // 配置页过滤规则块的副标题（v3.312）。把「已保存」与「已生效」分开：
 // 覆盖文件可能在上一轮跑完之后才保存 ⇒ 页面显示保存的规则（下一轮生效），但不得
 // 把文件 revision 说成「已生效」——那会让用户以为本轮已经换规则。
