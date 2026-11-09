@@ -1032,7 +1032,19 @@ const LogArchive = require('./scripts/log-archive')
       try { LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr14 = e }
     } finally { fs.renameSync = origRename14 }
     assert.ok(markerErr14 && markerErr14.code === 'EBUSY', '注入必须让 .week 写入失败（复现现场）')
-    assert.strictEqual(fs.statSync(log14).size, 0, '现场必须是「明文已截断到 0」')
+    // CodeQL js/file-system-race（CWE-367，alert #131/#132）修法：现场长度必须经 fd 核验。
+    // 旧写法「按路径 statSync 取 size」是一次检查，随后 1040 的 appendFileSync / 1050 的
+    // readFileSync 又按路径使用同一路径，构成 check-by-path → use-by-path 的 TOCTOU 配对；
+    // 换名竞态下两次路径解析可能指向不同文件。改成 open → fstat(fd) → close 后核验钉在
+    // 同一个 inode 上，数据流不再经过「路径检查」。断言语义（现场明文长度为 0）逐字保留。
+    const fd14 = fs.openSync(log14, 'r')
+    let size14 = -1
+    try {
+      size14 = fs.fstatSync(fd14).size
+    } finally {
+      fs.closeSync(fd14)
+    }
+    assert.strictEqual(size14, 0, '现场必须是「明文已截断到 0」')
     assert.strictEqual(LogArchive.readMarker(log14), '20261102-20261108', '现场 marker 仍停在旧周')
     // 新周内容必须比 idx.bytes 长，否则会落进「明文比归档短」分支，掩盖本缺陷
     const new14 = Buffer.from(Array.from({ length: 90 }, (_, i) => 'F14 新周第' + i + '行 ' + 'b'.repeat(12)).join('\n') + '\n')
@@ -1080,6 +1092,21 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(again11 && again11.lines === 60000, '多成员档案必须能正常补完封档')
     assert.strictEqual(fs.readFileSync(log11, 'utf8'), '', '多成员档案恢复后明文必须被截断')
     assert.strictEqual(LogArchive.readMarker(log11), '20261116-20261122', '多成员档案恢复后 marker 必须推进')
+
+    // ⑧d CodeQL js/file-system-race 结构回归锁（alert #131/#132）：⑧ 现场的「明文长度」核验必须
+    // 走 fd（openSync → fstatSync(fd) → closeSync），不得回退成「按路径检查、再按路径读/写」。
+    // 回退该修复（把 fd14 那段换回按路径 statSync）时本断言变红 —— 这是本机没有 CodeQL CLI 时
+    // 唯一能守住该数据流不回潮的手段；CodeQL 自身的终局判定由下一个 head 的扫描给出。
+    const selfSrc14 = fs.readFileSync(__filename, 'utf8')
+    const blockStart14 = selfSrc14.indexOf('// ⑧ F1-4：')
+    const blockEnd14 = selfSrc14.indexOf('// ⑧b 正路径不回归')
+    assert.ok(blockStart14 >= 0 && blockEnd14 > blockStart14, '必须能定位 ⑧ 现场代码块（结构回归锁的观测面）')
+    const block14 = selfSrc14.slice(blockStart14, blockEnd14)
+    assert.ok(block14.includes('fs.fstatSync('), '⑧ 现场长度核验必须走 fd（fstatSync），否则同源 TOCTOU 会回来')
+    const pathCheckToks14 = ['fs.statSync(', 'fs.lstatSync(', 'fs.existsSync(', 'fs.accessSync(']
+    const pathChecks14 = pathCheckToks14.filter((tok) => block14.includes(tok))
+    assert.deepStrictEqual(pathChecks14, [],
+      `⑧ 现场不得再出现按路径的前置检查（CodeQL js/file-system-race 数据流）：${pathChecks14.join(', ')}`)
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
