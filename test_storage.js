@@ -957,7 +957,49 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(pg12.lines[0], 'F12 第0行 中文内容 ' + 'y'.repeat(20), '重建的索引必须能让控制台正常读档')
     assert.strictEqual(pg12.total, 3000)
 
-    // ⑥b 无法重建（gz 是空的）⇒ 必须抛带路径的明确错误，不得静默 null
+    // ⑥b F1-2 续：单行超过 1MiB（CHUNK_BYTES）时 sealLog 按块硬切，中间成员不以换行结尾——
+    // 这是本模块自己产出的合法归档。旧 rebuildGzIndex 把「中间成员无换行结尾」判成 EARCHIVE，
+    // 于是 gz 已发布、idx 丢失的现场永远无法恢复：archivePending 永久为真、100MB 截尾被禁用。
+    const dir26 = make('logarch-f26')
+    fs.mkdirSync(dir26, { recursive: true })
+    const log26 = path.join(dir26, 'run.log')
+    const bigLine26 = 'F26 超长行 ' + 'g'.repeat(3 * 1024 * 1024)
+    const body26 = Buffer.from(
+      Array.from({ length: 20 }, (_, i) => 'F26 第' + i + '行').join('\n') + '\n' +
+      bigLine26 + '\n' +
+      Array.from({ length: 20 }, (_, i) => 'F26 后第' + i + '行').join('\n') + '\n')
+    fs.writeFileSync(log26, body26)
+    const first26 = LogArchive.sealLog(log26, dir26, '20261102-20261108', '20261109-20261115')
+    const idxBefore26 = JSON.parse(fs.readFileSync(first26.path + '.idx.json', 'utf8'))
+    assert.ok(idxBefore26.members.length >= 4, `3MiB 单行必须切成多个成员（实际 ${idxBefore26.members.length}）`)
+    assert.ok(idxBefore26.members.filter((m) => m.lines === 0).length >= 2,
+      `夹具必须包含「无换行结尾的中间成员」（行数分布：${idxBefore26.members.map((m) => m.lines).join(',')}）`)
+    // 复现崩溃现场：gz 已在、明文未截断、idx 丢失、marker 仍旧周
+    fs.writeFileSync(log26, body26)
+    LogArchive.writeMarker(log26, '20261102-20261108')
+    fs.unlinkSync(first26.path + '.idx.json')
+    const warns26 = []
+    const origWarn26 = console.warn
+    let second26 = null
+    let err26 = null
+    try {
+      console.warn = (...a) => { warns26.push(a.map(String).join(' ')) }
+      try { second26 = LogArchive.sealLog(log26, dir26, '20261102-20261108', '20261109-20261115') } catch (e) { err26 = e }
+    } finally { console.warn = origWarn26 }
+    assert.strictEqual(err26, null, `本模块自己产出的合法归档必须能重建索引：${err26 && err26.message}`)
+    assert.ok(!warns26.some((w) => w.includes('索引重建失败')), `重建成功不得告警：${JSON.stringify(warns26)}`)
+    assert.ok(second26, '重建后必须继续完成封档')
+    assert.ok(fs.existsSync(first26.path + '.idx.json'), '缺失的 idx 必须被补写')
+    const idxAfter26 = JSON.parse(fs.readFileSync(first26.path + '.idx.json', 'utf8'))
+    assert.deepStrictEqual(idxAfter26.members, idxBefore26.members,
+      `重建的成员表必须与丢失前一致（中间成员允许无换行尾）：${JSON.stringify(idxAfter26.members.map((m) => [m.off, m.len, m.lines, !!m.tail]))}`)
+    assert.strictEqual(idxAfter26.lines, idxBefore26.lines, '重建的行数必须与丢失前一致')
+    assert.strictEqual(idxAfter26.bytes, body26.length, '重建的字节数必须等于原文长度')
+    assert.strictEqual(fs.readFileSync(log26, 'utf8'), '', '补 idx 后必须完成明文截断')
+    assert.strictEqual(LogArchive.readMarker(log26), '20261109-20261115', '补 idx 后 marker 必须推进')
+    assert.strictEqual(LogArchive.readGzPage(first26.path, 1, 30).lines[0], 'F26 第0行', '重建的索引必须可读档')
+
+    // ⑥c 无法重建（gz 是空的）⇒ 必须抛带路径的明确错误，不得静默 null
     const dir12b = make('logarch-f12b')
     fs.mkdirSync(path.join(dir12b, 'logs'), { recursive: true })
     const log12b = path.join(dir12b, 'run.log')

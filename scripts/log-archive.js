@@ -368,14 +368,18 @@ function rebuildGzIndex (gzPath, prevKey, fileName) {
       }
       const nl = countNewlines(text)
       const tail = text[text.length - 1] !== 0x0a
-      if (tail && off + len !== opened.size) {
-        throw archiveError(`归档索引缺失且 gz 中间成员无换行结尾（偏移 ${off}）：${gzPath}`)
-      }
-      if (!Number.isSafeInteger(idx.bytes + text.length) || !Number.isSafeInteger(idx.lines + nl + (tail ? 1 : 0))) {
+      const isLast = off + len === opened.size
+      // 中间成员不以换行结尾是 sealLog 的合法产物：单行超过 CHUNK_BYTES（1MiB）时按块硬切，
+      // 只有最后一个成员可能是「没有结尾换行的半行」。旧实现把这种成员判成 EARCHIVE，等于
+      // 「本模块自己产出的合法归档」在 idx 丢失后永远无法重建（Sourcery 评审 R5-4）。
+      // 行数只在「末成员 + 无换行尾」时 +1（半行也算一行）；中间成员按换行数计，剩余部分
+      // 由下一个成员继续，不能重复计数。
+      const memberLines = nl + (tail && isLast ? 1 : 0)
+      if (!Number.isSafeInteger(idx.bytes + text.length) || !Number.isSafeInteger(idx.lines + memberLines)) {
         throw archiveError(`归档索引缺失且 gz 统计溢出（偏移 ${off}）：${gzPath}`)
       }
-      idx.members.push(tail ? { off, len, lines: nl + 1, tail: true } : { off, len, lines: nl })
-      idx.lines += nl + (tail ? 1 : 0)
+      idx.members.push(tail && isLast ? { off, len, lines: memberLines, tail: true } : { off, len, lines: memberLines })
+      idx.lines += memberLines
       idx.bytes += text.length
       off += len
     }
