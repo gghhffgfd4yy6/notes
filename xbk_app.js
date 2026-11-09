@@ -331,8 +331,12 @@ function createApp ({
                 // 下一轮重试。_writeRunLog 每写一行都会走到这段，故同一周键的失败 60s 内只告警一次，
                 // 否则 stderr 会被同一条错误刷屏（F1-2：故障必须可见，但不能变成日志风暴）。
                 const now = Date.now()
-                if (this._archiveWarnKey !== marker || !this._archiveWarnAt || now - this._archiveWarnAt >= 60 * 1000) {
-                  this._archiveWarnKey = marker
+                // v3.409（Sourcery PRRT_kwDOT8kkjs61McyA）：限频键必须带日志路径。只按周键限频时，
+                // run.log 先失败会吞掉 filter-diagnostics.ndjson 在同一 60s 内的失败告警，
+                // 运维只看到第一个文件名、不知道第二个归档也坏了。
+                const warnKey = logPath + '|' + marker
+                if (this._archiveWarnKey !== warnKey || !this._archiveWarnAt || now - this._archiveWarnAt >= 60 * 1000) {
+                  this._archiveWarnKey = warnKey
                   this._archiveWarnAt = now
                   console.warn(`⚠️ 日志归档失败（下一轮重试，本轮禁用截尾）：${path.basename(logPath)} ${(e && e.message) || (e && e.code) || e}`)
                 }

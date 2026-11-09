@@ -852,6 +852,31 @@ check('_writeRunLog 一条日志的截尾退避不影响另一条白名单日志
   assert.ok(!app._logRotateBackoffByPath.has(diagPath), '另一条日志不得被写入退避表')
 })
 
+check('_writeRunLog 两条日志同周归档失败 ⇒ 各自告警（限频键含路径）', () => {
+  const LogArchive = require('./scripts/log-archive.js')
+  const origReadMarker = LogArchive.readMarker
+  const origSeal = LogArchive.sealLog
+  LogArchive.readMarker = () => '20261102-20261108'
+  LogArchive.sealLog = () => { throw Object.assign(new Error('归档失败注入'), { code: 'EARCHIVE' }) }
+  try {
+    const rec = makeLogFs()
+    const { app } = makeLogApp({ rec })
+    const t0 = 1700000000000
+    const r = withFixedNow(t0, () => withCapture('warn', () => {
+      app._writeRunLog('a\n')
+      app._writeRunLog('b\n', 'filter-diagnostics.ndjson')
+    }))
+    const archiveWarns = r.msgs.filter((m) => m.includes('日志归档失败'))
+    assert.strictEqual(archiveWarns.length, 2,
+      `两条日志同一周失败必须各告警一次（旧实现只按周键限频，第二条被吞）：${JSON.stringify(r.msgs)}`)
+    assert.ok(archiveWarns[0].includes('run.log'), `第一条必须点名 run.log：${archiveWarns[0]}`)
+    assert.ok(archiveWarns[1].includes('filter-diagnostics.ndjson'), `第二条必须点名诊断日志：${archiveWarns[1]}`)
+  } finally {
+    LogArchive.readMarker = origReadMarker
+    LogArchive.sealLog = origSeal
+  }
+})
+
 check('_writeRunLog 最后换行在 10MiB 窗口之外 ⇒ 流式重写，不整轮放弃', () => {
   // 20MiB 文件：最后换行在 9MiB，之后 11MiB 没有换行。旧实现只看尾部 10MiB ⇒ 判「无换行」放弃；
   // 新实现继续向前找到 9MiB 的换行，保留段 > KEEP，走流式重写。
