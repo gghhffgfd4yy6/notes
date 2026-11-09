@@ -201,6 +201,88 @@ function createApp ({
       return this._writeTextAtomic(filePath, text)
     },
 
+    // 定位截尾后的保留段起点：从「size - keep」起**向后**找第一个换行，返回该换行之后的位置
+    // （保留最新 keep 字节、从行首对齐）。KEEP 窗口里一条换行都没有（单条超长行横跨整个窗口）时
+    // 回退到窗口之前最后一个换行之后——保留段会超过 keep，由调用方流式重写；整份文件连一个换行
+    // 都没有才返回 -1（任何位置写回都会得到半行，只能保留原文件并退避）。
+    // 「从 EOF 向前找最后一个换行」是 8b3bd07 的数据丢失回归：run.log 几乎总以 '\n' 结尾，
+    // 那样 cut == size、保留 0 字节，等于每次超限就把整份日志清空（Sourcery PRRT_kwDOT8kkjs61Mcxl
+    // 修的是「超长行不该让日志停在限额之上」，不该反过来丢掉整个文件）。
+    _logTrimCut (fd, size, keep = 10 * 1024 * 1024) {
+      const CHUNK = 4 * 1024 * 1024
+      const readChunk = (from, len) => {
+        const buf = Buffer.alloc(len)
+        let got = 0
+        while (got < len) {
+          const n = fs.readSync(fd, buf, got, len - got, from + got)
+          if (n <= 0) break
+          got += n
+        }
+        return got === len ? buf : null
+      }
+      const start = Math.max(0, size - keep)
+      // 1) 向后：KEEP 窗口里的第一个换行。换行正好是文件最后一个字节时不算——它之后没有内容，
+      //    保留段会是 0 字节；此时必须回退到前一个换行，绝不能把整份日志清空。
+      for (let pos = start; pos < size;) {
+        const len = Math.min(CHUNK, size - pos)
+        const buf = readChunk(pos, len)
+        if (!buf) return -1
+        const i = buf.indexOf(0x0a)
+        if (i >= 0) {
+          if (pos + i + 1 < size) return pos + i + 1
+          break
+        }
+        pos += len
+      }
+      // 2) 向前：窗口之前最后一个换行（超长行只能整行保留，保留段可能 > keep）。
+      for (let end = start; end > 0;) {
+        const from = Math.max(0, end - CHUNK)
+        const buf = readChunk(from, end - from)
+        if (!buf) return -1
+        const i = buf.lastIndexOf(0x0a)
+        if (i >= 0) return from + i + 1
+        end = from
+      }
+      return -1
+    },
+
+    // 把 [from, EOF) 流式写进同目录临时文件再原子替换：保留段可能远超 10MiB（最后一个换行在
+    // 窗口之外），整段读进内存会放大峰值；复制按 1MiB 块进行，失败返回 false 并清理临时文件。
+    _rewriteLogFrom (logPath, from) {
+      const tmp = logPath + '.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(6).toString('hex') + '.trim'
+      let fdIn = null
+      let fdOut = null
+      try {
+        fdIn = fs.openSync(logPath, 'r')
+        fdOut = fs.openSync(tmp, 'wx', 0o600)
+        const buf = Buffer.alloc(1024 * 1024)
+        let pos = from
+        for (;;) {
+          const n = fs.readSync(fdIn, buf, 0, buf.length, pos)
+          if (n <= 0) break
+          let off = 0
+          while (off < n) {
+            const w = fs.writeSync(fdOut, buf, off, n - off)
+            if (!(w > 0)) throw new Error('short write')
+            off += w
+          }
+          pos += n
+        }
+        fs.fsyncSync(fdOut)
+        fs.closeSync(fdOut)
+        fdOut = null
+        fs.closeSync(fdIn)
+        fdIn = null
+        fs.renameSync(tmp, logPath)
+        return true
+      } catch (e) {
+        if (fdOut !== null) { try { fs.closeSync(fdOut) } catch (e2) {} }
+        if (fdIn !== null) { try { fs.closeSync(fdIn) } catch (e2) {} }
+        try { fs.unlinkSync(tmp) } catch (e2) {} // nosemgrep（tmp 由 logPath + pid + 时间 + 随机后缀构成）
+        return false
+      }
+    },
+
     // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
     // v3.xxx P3 并发安全：appendFileSync 在单进程内全程同步无交错；真正竞态在跨进程（重叠 cron/
     // 常驻实例共用同一 cacheDir）——进程 A「追加→读尾→原子改写」的读改写间隙里，B 刚追加的行会被
@@ -228,7 +310,10 @@ function createApp ({
         }
         // v3.396 审查加固：截尾失败（临时文件写不进/rename 失败，多见于磁盘将满）后 60s 内不再追加，
         // 只回显 stdout——否则每次调用都「先追加、再截尾失败」，超限日志会继续长到把盘吃光。
-        if (this._logRotateBackoffUntil && Date.now() < this._logRotateBackoffUntil) {
+        // v3.405（Sourcery PRRT_kwDOT8kkjs61Mcx6）：退避必须按日志路径分开记。共享一个字段时，
+        // 一条日志截尾放弃会让另一条白名单日志的写入也静默跳过 60s（只回显 stdout）。
+        const rotateBackoffUntil = this._logRotateBackoffByPath.get(logPath) || 0
+        if (rotateBackoffUntil && Date.now() < rotateBackoffUntil) {
           console.log(String(line).replace(/\n$/, ''))
           return
         }
@@ -263,8 +348,23 @@ function createApp ({
                   LogArchive.pruneArchives(this._cacheDir(), path.basename(logPath))
                 }
               } catch (e) {
-                // 失败要留痕（不递归写日志，避免归档故障放大成日志风暴）：下周重试。
-                console.warn(`⚠️ 日志归档失败（下周重试）：${path.basename(logPath)} ${(e && e.code) || ''}`)
+                // 失败要留痕（不递归写日志，避免归档故障放大成日志风暴）：archivePending 保持为真，
+                // 下一轮重试。_writeRunLog 每写一行都会走到这段，故「同一日志 + 同一周键」的失败
+                // 60s 内只告警一次，否则 stderr 会被同一条错误刷屏（F1-2：故障必须可见，但不能变成日志风暴）。
+                const now = Date.now()
+                // v3.405（Sourcery PRRT_kwDOT8kkjs61McyA）：限频状态必须按「日志路径|周键」分开记
+                // （与 log-archive.js 的 warnArchive 同口径）。单个标量槽位时，run.log 与
+                // filter-diagnostics.ndjson 交替失败会把槽位来回覆盖，每次写入都重新告警——
+                // 两条日志都坏时 60s 限频完全失效，正是要防的 stderr 刷屏。
+                const warnKey = logPath + '|' + marker
+                const lastWarnAt = this._archiveWarnAtByKey.get(warnKey) || 0
+                if (!lastWarnAt || now - lastWarnAt >= 60 * 1000) {
+                  if (this._archiveWarnAtByKey.size > 64) {
+                    for (const [k, at] of this._archiveWarnAtByKey) if (now - at >= 60 * 1000) this._archiveWarnAtByKey.delete(k)
+                  }
+                  this._archiveWarnAtByKey.set(warnKey, now)
+                  console.warn(`⚠️ 日志归档失败（下一轮重试，本轮禁用截尾）：${path.basename(logPath)} ${(e && e.message) || (e && e.code) || e}`)
+                }
               }
             }
           }
@@ -319,30 +419,53 @@ function createApp ({
           const st = fs.statSync(logPath)
           // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
           // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
-          if (lockFd !== null && !archivePending && st.size > LIMIT) {
+          // 截尾目标是「保留最新 KEEP=10MiB、从换行处对齐」；文件没超过 KEEP 时无需截尾
+          // （XBK_LOG_LIMIT_BYTES 调到 10MiB 以下的测试配置不会把整份日志重写一遍）。
+          const KEEP = 10 * 1024 * 1024
+          if (lockFd !== null && !archivePending && st.size > LIMIT && st.size > KEEP) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
-            const KEEP = 10 * 1024 * 1024
+          // v3.405（Sourcery PRRT_kwDOT8kkjs61Mcxl）：旧实现只看「尾部 10MiB」窗口，
+          // 窗口里没有换行就整轮放弃；一条跨窗口的超长行会让文件长期停在 LIMIT 之上，
+          // 60s 退避后每追加一行又重复一次。现在从 size-KEEP 向后找第一个换行，保留其后的
+          // 最新内容；窗口里没有换行才回退到窗口之前的最后一个换行（整行保留、流式重写）；
+          // 只有整份文件连一个换行都没有（单条巨行）才放弃并告警。
             const fd = fs.openSync(logPath, 'r+')
             try {
-              const readLen = Math.min(KEEP, st.size)
-              const buf = Buffer.alloc(readLen)
-              fs.readSync(fd, buf, 0, readLen, st.size - readLen) // 只读末尾 KEEP 字节
-              let trimmed = buf.toString('utf8')
-              // v3.178：尾部切片可能切在代理对中间（首字符为孤立低代理/尾字符为孤立高代理）→
-              // 写回后文件含非法 UTF-8 序列，下次读取显示 U+FFFD（§10-C）——退位到完整字符
-              const first = trimmed.charCodeAt(0)
-              if (first >= 0xDC00 && first <= 0xDFFF) trimmed = trimmed.slice(1) // 开头孤立低代理（高代理被切掉）
-              const last = trimmed.charCodeAt(trimmed.length - 1)
-              if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
-              const nl = trimmed.indexOf('\n')
-              // 原子写入（tmp + rename）覆盖原文件，避免中断留下半写日志
-              if (this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)) {
-                this._logRotateBackoffUntil = 0
+              const cut = this._logTrimCut(fd, st.size, KEEP)
+              const trimmedLen = cut >= 0 ? st.size - cut : -1
+              if (cut < 0) {
+                // 整份文件没有任何换行：无法在不写半行的前提下截断，保留原文件并退避。
+                this._logRotateBackoffByPath.set(logPath, Date.now() + 60 * 1000)
+                console.warn(`⚠️ 日志截尾放弃（整份文件无换行，原文件保留，暂停追加 60s）：${logPath}`)
+              } else if (trimmedLen > KEEP) {
+                // 保留段超过 10MiB（最后一个换行在窗口之外）：流式重写，避免把整段读进内存。
+                if (this._rewriteLogFrom(logPath, cut)) {
+                  this._logRotateBackoffByPath.delete(logPath)
+                } else {
+                  this._logRotateBackoffByPath.set(logPath, Date.now() + 60 * 1000)
+                  console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+                }
               } else {
-                // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）
-                this._logRotateBackoffUntil = Date.now() + 60 * 1000
-                console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+                const buf = Buffer.alloc(trimmedLen)
+                let got = 0
+                while (got < trimmedLen) {
+                  const n = fs.readSync(fd, buf, got, trimmedLen - got, cut + got)
+                  if (n <= 0) break
+                  got += n
+                }
+                let trimmed = got === trimmedLen ? buf.toString('utf8') : ''
+                // v3.178：尾部切片可能切在代理对中间（尾字符为孤立高代理）→ 写回后文件含
+                // 非法 UTF-8 序列。起点固定在换行之后，不会出现开头孤立低代理。
+                const last = trimmed.charCodeAt(trimmed.length - 1)
+                if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1)
+                if (got === trimmedLen && this._writeTextAtomic(logPath, trimmed)) {
+                  this._logRotateBackoffByPath.delete(logPath)
+                } else {
+                  // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）
+                  this._logRotateBackoffByPath.set(logPath, Date.now() + 60 * 1000)
+                  console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+                }
               }
             } finally {
               fs.closeSync(fd)
@@ -370,6 +493,9 @@ function createApp ({
     },
 
     _diskWarningAt: 0,
+    _logRotateBackoffByPath: new Map(),
+    // 归档失败告警的限频状态：键 = 日志路径 + '|' + 周键（每个日志每周各一条 60s 窗口）。
+    _archiveWarnAtByKey: new Map(),
     _alertLastAtByPath: new Map(),
     _reportMemoryStateByPath: new Map(),
 
