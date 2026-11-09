@@ -1603,9 +1603,29 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(journal32.size, new32.length, `待截断长度必须是搬运后的新周长度（实际 ${journal32.size}）`)
     assert.strictEqual(journal32.before, idx32.bytes + new32.length,
       `truncating 必须记录搬运前长度 bytes + size（实际 ${journal32.before}）`)
-    assert.strictEqual(fs.statSync(log32).size, beforeSize32, '搬运不改文件长度；截断失败必须原样保留')
+    // CodeQL js/file-system-race（CWE-367，alert #134）修法：现场长度核验与明文头部读回必须落在
+    // 同一个 fd 上（openSync → fstatSync/readSync → finally closeSync）。旧写法先按路径 statSync
+    // 取长度、再按路径 readFileSync 读同一路径，构成 check-by-path → use-by-path 的 TOCTOU 配对：
+    // 两次路径解析之间文件可能被换名/替换。断言语义（长度等于 beforeSize32、头部逐字节等于 new32）
+    // 逐字保留。
+    const fd32 = fs.openSync(log32, 'r')
+    let size32 = -1
+    let head32 = null
+    try {
+      size32 = fs.fstatSync(fd32).size
+      head32 = Buffer.alloc(new32.length)
+      let got32 = 0
+      while (got32 < head32.length) {
+        const n = fs.readSync(fd32, head32, got32, head32.length - got32, got32)
+        if (n <= 0) break
+        got32 += n
+      }
+    } finally {
+      fs.closeSync(fd32)
+    }
+    assert.strictEqual(size32, beforeSize32, '搬运不改文件长度；截断失败必须原样保留')
     assert.strictEqual(LogArchive.readMarker(log32), '20261102-20261108', '截断失败时 marker 绝不能推进')
-    assert.ok(fs.readFileSync(log32).subarray(0, new32.length).equals(new32),
+    assert.ok(head32.equals(new32),
       '夹具必须真的完成搬运（明文头部已是新周内容）')
     // 第二轮注入仍失败：必须继续 EARCHTRUNC（保留下一轮重试机会），不得退化成不可恢复的 EARCHIVE
     assert.ok(err32b && err32b.code === 'EARCHTRUNC', `第二轮截断失败仍须 EARCHTRUNC（实际 ${err32b && err32b.code}）`)
