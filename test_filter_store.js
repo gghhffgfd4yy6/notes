@@ -18,10 +18,13 @@ const { FILTER_FIELDS } = require('./xbk_utils')
 const {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
+  LASTGOOD_MAX_BYTES,
   filterRulesPaths,
   validateFilterRules,
   mergeActiveFilter,
   loadFilterRules,
+  writeLastGoodFile,
+  readLastGood,
   writeAppliedSnapshot,
   appliedLastGoodUsed,
   readAppliedSnapshot,
@@ -1277,6 +1280,94 @@ test('F4-1 resetStoreStateForTests 同步清掉持久 LKG（测试隔离前提�
   assert.strictEqual(fs.existsSync(paths.lastgood), true)
   resetStoreStateForTests()
   assert.strictEqual(fs.existsSync(paths.lastgood), false, '清空 LKG 必须同时删除落盘文件，否则「全新进程」用例会互相污染')
+})
+
+// ===== F4-1 返工 R3：LKG 包装层的读写口径必须一致（写成功 ≠ 读得回）=====
+// LKG 是覆盖文件的**再包装**：比覆盖文件多出 `"hash":"<64 位十六进制>",`（74 字节）与
+// `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。旧实现读写共用 256 KiB ⇒ 覆盖文件落在
+// (256 KiB-76, 256 KiB] 这段（保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG 必然 > 读上限，
+// readLastGood 判 tooLarge 返回 null，新进程照样回代码默认，而 writeLastGoodFile 还返回 true。
+const RULES_READ_MAX_BYTES = 256 * 1024 // 与 xbk_filter_store.FILTER_RULES_MAX_BYTES 同值（未导出）
+// 把 11 个字段堆到接近上限（单字段上限 16000 码元，中文 3 字节/字；pingbitime 是数字型字段）
+function nearLimitFilter (targetBytes) {
+  const filter = {}
+  for (const field of FILTER_RULE_FIELDS) filter[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  const sizeOf = () => Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 1, filter }), 'utf8')
+  let size = sizeOf()
+  for (let i = FILTER_RULE_FIELDS.length - 2; i >= 0 && size > targetBytes; i--) {
+    const field = FILTER_RULE_FIELDS[i]
+    const chars = filter[field].length
+    const cut = Math.min(chars - 1, Math.ceil((size - targetBytes) / 3))
+    filter[field] = '中'.repeat(chars - cut)
+    size = sizeOf()
+  }
+  return { filter, size }
+}
+
+test('F4-1 R3 覆盖文件贴读上限时持久 LKG 仍必须被**新进程**读回（包装 +76 不得越过读上限）', () => {
+  resetStoreStateForTests()
+  // 两档：①控制台保存闸门允许的最大形状（≤ MAX-32）②手改能到的 MAX。旧实现在两档都写不出可读的 LKG。
+  for (const target of [RULES_READ_MAX_BYTES - 44, RULES_READ_MAX_BYTES]) {
+    const { filter, size } = nearLimitFilter(target)
+    assert.ok(size > RULES_READ_MAX_BYTES - 76 && size <= RULES_READ_MAX_BYTES,
+      `夹具必须落在缺陷窗口 (${RULES_READ_MAX_BYTES - 76}, ${RULES_READ_MAX_BYTES}]：实得 ${size}`)
+    if (size <= RULES_READ_MAX_BYTES - 32) {
+      const gate = validateFilterRules({ schema: FILTER_RULES_SCHEMA, revision: 1, filter }, deps)
+      assert.strictEqual(gate.ok, true,
+        `前置：${size} 字节的覆盖文件必须能过保存闸门（否则只是「本来就存不进去」）：${JSON.stringify(gate.errors)}`)
+    }
+    const dir = makeDir()
+    const paths = filterRulesPaths(dir)
+    writeJson(paths.file, { schema: 1, revision: 1, filter })
+    const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+    assert.strictEqual(loaded.source, 'override', `${size} 字节的覆盖文件必须被正常加载`)
+    const lkgBytes = fs.statSync(paths.lastgood).size
+    assert.ok(lkgBytes > RULES_READ_MAX_BYTES,
+      `夹具必须让 LKG 越过覆盖文件读上限（LKG ${lkgBytes} 字节，包装 +${lkgBytes - size}）`)
+
+    writeRaw(paths.file, '{ 坏掉的 JSON')
+    const fresh = runLkgProbe(dir)
+    assert.strictEqual(fresh.source, 'corrupt')
+    assert.strictEqual(fresh.lastGoodUsed, true,
+      `${size} 字节覆盖文件的 LKG（${lkgBytes} 字节）必须能被新进程读回——旧实现按 ${RULES_READ_MAX_BYTES} 读判 tooLarge，静默回代码默认`)
+    assert.ok(lkgBytes <= LASTGOOD_MAX_BYTES, `写出的 LKG 必须落在自己的读上限内：${lkgBytes} > ${LASTGOOD_MAX_BYTES}`)
+    assert.strictEqual(fresh.revision, 1, 'revision 必须沿用上次合法值')
+    for (const field of FILTER_RULE_FIELDS) {
+      assert.strictEqual(fresh.filter[field], filter[field], `LKG 恢复的字段 ${field} 必须与上次合法 override 逐字相等`)
+    }
+  }
+})
+
+test('F4-1 R3 写侧同口径：序列化后超过 LKG 读上限 ⇒ 不落盘 + 告警（不得返回 true 骗调用方）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const huge = {}
+  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  const bytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter: huge }), 'utf8')
+  assert.ok(bytes > LASTGOOD_MAX_BYTES, `前置：夹具必须超过 LKG 读上限（${bytes} vs ${LASTGOOD_MAX_BYTES}）`)
+  const warned = []
+  const origWarn = console.warn
+  console.warn = (...args) => { warned.push(args.join(' ')) }
+  let ok
+  try {
+    ok = writeLastGoodFile(paths.lastgood, huge, 3)
+  } finally {
+    console.warn = origWarn
+  }
+  assert.strictEqual(ok, false, '写不进去必须返回 false（否则调用方以为降级兜底已就位）')
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '超过读上限的 LKG 不得落盘（落盘即「写成功但读不回」）')
+  assert.match(warned.join('\n'), /超过 LKG 读上限/, `写侧必须留一条告警，实际：${JSON.stringify(warned)}`)
+})
+
+test('F4-1 R3 读侧仍是有界读：LKG 超过 LASTGOOD_MAX_BYTES ⇒ 当「没有 LKG」（不部分采用）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  // 合法 JSON、形状也合法，只是体积超过 LKG 读上限（模拟包装膨胀或被外部塞了大文件）
+  const override = {}
+  for (const field of FILTER_RULE_FIELDS) override[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  writeRaw(paths.lastgood, JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 1, hash: 'x', override }))
+  assert.ok(fs.statSync(paths.lastgood).size > LASTGOOD_MAX_BYTES)
+  assert.strictEqual(readLastGood(paths.lastgood), null, '超过上限的 LKG 必须当没有（有界读，不得无界整读）')
 })
 
 // ===== F4-2：FIFO/非普通文件不得挂死（读取必须 O_NONBLOCK + 普通文件校验）=====

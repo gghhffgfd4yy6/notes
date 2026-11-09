@@ -56,6 +56,16 @@ const FILTER_RULES_SCHEMA = 1
 // 覆盖文件整体上限 256 KiB：与 console 的 body 上限同源，避免「能保存但读不回」。
 const FILTER_FIELD_MAX_LEN = 16000
 const FILTER_RULES_MAX_BYTES = 256 * 1024
+// 持久 LKG 的读上限（F4-1 返工 R3）：LKG 是覆盖文件的**再包装**——`{schema,revision,hash,override}`
+// 比覆盖文件的 `{schema,revision,filter}` 多出 `"hash":"<64 位十六进制>",`（74 字节）与
+// `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。若读写共用 FILTER_RULES_MAX_BYTES，
+// 则覆盖文件落在 (MAX-76, MAX] 这段（控制台保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG
+// 必然 > MAX ⇒ readSafeTextResult 判 tooLarge ⇒ readLastGood 返回 null ⇒ 新进程降级回代码默认，
+// 而写入侧仍返回 true（「写成功但读不回」，与 C9-012 同类的阈值差几字节缺陷，只是差在包装层）。
+// 故读上限 = 覆盖文件上限 + 包装预算；写入侧（writeLastGoodFile）用同一常量预检，绝不产出读不回的文件。
+// 1024 的余量足够：覆盖文件能读回就 ≤ 256 KiB，包装固定 +76，revision 最多 16 位数字也吃不满。
+const LASTGOOD_WRAPPER_BYTES = 1024
+const LASTGOOD_MAX_BYTES = FILTER_RULES_MAX_BYTES + LASTGOOD_WRAPPER_BYTES
 // pingbitime 天数上限：与 xbk_rules.compileRules / validateConfig 的 PINGBITIME_MAX_DAYS 同值。
 // 超上限的行会被运行期静默丢弃 ⇒ 编译对账必然失败，这里提前给出明确错误码。
 const PINGBITIME_MAX_DAYS = 3650000
@@ -596,7 +606,16 @@ function writeLastGoodFile (filePath, filter, revision) {
       hash: lastGoodHash(override, revision),
       override
     }
-    const ok = writeAtomic(filePath, JSON.stringify(payload), '过滤规则 LKG')
+    const text = JSON.stringify(payload)
+    // 写侧与读侧同口径（读上限 LASTGOOD_MAX_BYTES）：超出就**不写**并留痕，绝不落一个「写成功但
+    // readLastGood 永远读不回」的文件。正常形状下这里恒不触发（覆盖文件能读回就 ≤ 上限，包装 +76）；
+    // 它守的是「以后改包装/改上限时不会静默退化」——否则降级兜底会无声失效，writeLastGoodFile 还返回 true。
+    const bytes = Buffer.byteLength(text, 'utf8')
+    if (bytes > LASTGOOD_MAX_BYTES) {
+      warnLastGoodWrite(filePath, `序列化后 ${bytes} 字节超过 LKG 读上限 ${LASTGOOD_MAX_BYTES} 字节（写出去也读不回，本轮不落盘）`)
+      return false
+    }
+    const ok = writeAtomic(filePath, text, '过滤规则 LKG')
     if (!ok) warnLastGoodWrite(filePath, 'writeAtomic 返回 false')
     return ok
   } catch (e) {
@@ -607,12 +626,14 @@ function writeLastGoodFile (filePath, filter, revision) {
 
 /**
  * 读持久 LKG。任何异常/不合格形态一律返回 null（= 没有 LKG），绝不抛错、绝不部分采用。
+ * 读上限用 LASTGOOD_MAX_BYTES（覆盖文件上限 + 包装预算）：拿 FILTER_RULES_MAX_BYTES 读会把
+ * 「自身合法、只是多了包装」的 LKG 判成 tooLarge ⇒ 静默失效（F4-1 返工 R3）。
  * @returns {{filter:Object, revision:number}|null}
  */
 function readLastGood (filePath) {
   if (typeof filePath !== 'string' || filePath === '') return null
   try {
-    const read = storage.readSafeTextResult(filePath, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
+    const read = storage.readSafeTextResult(filePath, LASTGOOD_MAX_BYTES, { openNonBlocking: true })
     if (!read || read.status !== 'ok' || typeof read.text !== 'string') return null
     let data
     try { data = JSON.parse(read.text) } catch (e) { return null }
@@ -925,10 +946,15 @@ function resetStoreStateForTests () {
 module.exports = {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
+  // LKG 包装层的读上限（仅测试用：断言「写出的 LKG 必须 ≤ 读上限」这条不变式）
+  LASTGOOD_MAX_BYTES,
   filterRulesPaths,
   validateFilterRules,
   mergeActiveFilter,
   loadFilterRules,
+  // 仅供测试直调（生产代码只经 loadFilterRules / corruptResult 使用）：验证「写侧不得产出读不回的文件」
+  writeLastGoodFile,
+  readLastGood,
   writeAppliedSnapshot,
   appliedLastGoodUsed,
   readAppliedSnapshot,
