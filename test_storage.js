@@ -26,6 +26,25 @@ const LogArchive = require('./scripts/log-archive')
   // exit 钩子在 process.exit 时同步执行，rmSync 幂等（与末尾显式清理重复也无害）。
   process.once('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } })
   const make = (rel) => path.join(tmp, rel)
+  // CodeQL js/file-system-race（CWE-367）修法公用：按路径只 open 一次拿 fd，长度核验与读回全部落在
+  // 这个 fd 上（fstatSync 定长 + readSync 循环读满 → finally closeSync），块内不再出现「按路径检查
+  // → 按路径读写」的配对。日志归档现场（⑰/⑰e）用它读回明文，替代 statSync + readFileSync 的旧写法。
+  const readAllByFd = (p) => {
+    const fd = fs.openSync(p, 'r')
+    try {
+      const size = fs.fstatSync(fd).size
+      const buf = Buffer.alloc(size)
+      let got = 0
+      while (got < buf.length) {
+        const n = fs.readSync(fd, buf, got, buf.length - got, got)
+        if (n <= 0) break
+        got += n
+      }
+      return buf
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
 
   // ===== isRegularOrMissing =====
   assert.strictEqual(isRegularOrMissing(123), false, '非字符串应返回 false')
@@ -1634,8 +1653,18 @@ const LogArchive = require('./scripts/log-archive')
     const second32 = LogArchive.sealLog(log32, dir32, '20261102-20261108', '20261109-20261115')
     assert.ok(second32, '搬运完成、截断失败后的下一轮必须自动补完，不得永久 EARCHIVE')
     assert.strictEqual(LogArchive.readMarker(log32), '20261109-20261115', '补完截断后 marker 必须推进')
-    assert.ok(!fs.existsSync(log32 + '.seal.json'), '补完后事务记录必须清理')
-    const plain32 = fs.readFileSync(log32)
+    // CodeQL js/file-system-race（CWE-367，alert #135）修法：「事务记录是否已清理」不能先用 existsSync
+    // 按路径查、再按路径读明文（alert #135 的配对就是 existsSync(log32 + '.seal.json') → readFileSync(log32)）。
+    // 改成 openSync 直接拿 fd、捕 ENOENT 判「已清理」，closeSync 走 finally；明文读回走同一个 fd。
+    let journalGone32 = false
+    try {
+      fs.closeSync(fs.openSync(log32 + '.seal.json', 'r'))
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+      journalGone32 = true
+    }
+    assert.ok(journalGone32, '补完后事务记录必须清理')
+    const plain32 = readAllByFd(log32)
     assert.strictEqual(plain32.length, new32.length,
       `明文长度必须等于搬运后的新周内容（实际 ${plain32.length}；旧周残留必须被截掉）`)
     assert.ok(plain32.equals(new32), '补完截断后明文必须逐字节等于新周内容')
