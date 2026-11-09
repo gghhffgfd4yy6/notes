@@ -423,6 +423,7 @@ const LIMIT = 20 * 1024 * 1024
 
 function makeLogFs (over = {}) {
   const rec = { append: [], open: [], write: [], read: [], close: [], unlink: [], stat: [] }
+  const tailBuf = over.tail === undefined ? null : Buffer.from(over.tail, 'utf8')
   // C1-020：锁文件的真实内容（writeSync 写进去的 pid:start 令牌）。释放路径要靠读回它来证明
   // 「锁仍是本进程的」——桩不模拟这一点，令牌校验就永远不会被这些既有用例执行到。
   let lockText = ''
@@ -449,7 +450,19 @@ function makeLogFs (over = {}) {
     },
     readSync (fd, buf, off, len, pos) {
       rec.read.push([fd, len, pos, buf.length])
-      if (over.tail !== undefined) Buffer.from(over.tail, 'utf8').copy(buf, off)
+      // 位置感知的虚拟文件：size 字节里，尾部 tail.length 字节是 over.tail，其余填 'A'（无换行）。
+      // 截尾现在会从 EOF 向前按块扫描，忽略 pos 的桩会让扫描读到错误的内容。
+      const size = over.size === undefined ? 0 : over.size
+      buf.fill(0x41, off, off + len)
+      if (over.newlineAt !== undefined && over.newlineAt >= pos && over.newlineAt < pos + len) {
+        buf[off + over.newlineAt - pos] = 0x0a
+      }
+      if (tailBuf) {
+        const tailStart = size - tailBuf.length
+        const from = Math.max(pos, tailStart)
+        const to = Math.min(pos + len, tailStart + tailBuf.length)
+        if (to > from) tailBuf.copy(buf, off + (from - pos), from - tailStart, to - tailStart)
+      }
       return len
     },
     closeSync (fd) { rec.close.push(fd) },
@@ -792,18 +805,21 @@ check('_writeRunLog size === LIMIT ⇒ 不截尾（严格大于），但必须�
   assert.strictEqual(cap.length, 0)
 })
 
-check('_writeRunLog size > 1MiB ⇒ 只读尾部 512KiB，按首个换行对齐后原子写回', () => {
+check('_writeRunLog size > 1MiB ⇒ 从 EOF 扫描换行，只写回保留段', () => {
   const head = 'H'.repeat(1000) + '\n'
   const rest = 'T'.repeat(KEEP - head.length)
   const rec = makeLogFs({ size: 2 * LIMIT, tail: head + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(rec.rec.read, [[8, KEEP, 2 * LIMIT - KEEP, KEEP]])
+  const lastRead = rec.rec.read[rec.rec.read.length - 1]
+  assert.deepStrictEqual(lastRead, [8, rest.length, 2 * LIMIT - rest.length, rest.length],
+    '扫描定位后只读保留段（最后一个换行之后）')
+  assert.ok(rec.rec.read.length > 1, '换行在 10MiB 窗口之外时必须先向前扫描')
   assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
-check('_writeRunLog 尾部 10MiB 无换行 ⇒ 放弃截尾、不写半行、原文件保留并告警（F1-6）', () => {
+check('_writeRunLog 整份文件无换行 ⇒ 放弃截尾、不写半行、原文件保留并告警', () => {
   const tail = 'N'.repeat(100)
   const rec = makeLogFs({ size: 2 * LIMIT, tail })
   const { app, cap } = makeLogApp({ rec })
@@ -816,12 +832,60 @@ check('_writeRunLog 尾部 10MiB 无换行 ⇒ 放弃截尾、不写半行、原
   assert.strictEqual(app._logRotateBackoffUntil, t0 + 60 * 1000, '放弃后必须退避 60s（否则每次追加都重读 10MiB）')
 })
 
-check('_writeRunLog 尾部多个换行 ⇒ 以首个换行为界（slice(nl+1)）', () => {
+check('_writeRunLog 最后换行在 10MiB 窗口之外 ⇒ 流式重写，不整轮放弃', () => {
+  // 20MiB 文件：最后换行在 9MiB，之后 11MiB 没有换行。旧实现只看尾部 10MiB ⇒ 判「无换行」放弃；
+  // 新实现继续向前找到 9MiB 的换行，保留段 > KEEP，走流式重写。
+  const size = 20 * 1024 * 1024 + 100
+  const rec = makeLogFs({ size, tail: 'Z'.repeat(10 * 1024 * 1024 + 100), newlineAt: 9 * 1024 * 1024 })
+  const { app, cap } = makeLogApp({ rec })
+  const rewrites = []
+  app._rewriteLogFrom = (p, from) => { rewrites.push([p, from]); return true }
+  app._writeRunLog('l\n')
+  assert.deepStrictEqual(rewrites, [[LOG_PATH, 9 * 1024 * 1024 + 1]], '必须从最后换行之后流式重写')
+  assert.deepStrictEqual(cap, [], '保留段超过 KEEP 时不得整段读进内存再原子写')
+  assert.strictEqual(app._logRotateBackoffUntil, 0, '成功截尾后必须清除退避')
+})
+
+check('_writeRunLog 尾部多个换行 ⇒ 保留最后一个换行之后的完整行', () => {
   const rest = 'B'.repeat(100) + '\n' + 'C'.repeat(KEEP - 102)
   const rec = makeLogFs({ size: 2 * LIMIT, tail: '\n' + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
+  assert.deepStrictEqual(cap, [[LOG_PATH, 'C'.repeat(KEEP - 102)]])
+})
+
+// ----- 截尾定位/重写（Sourcery PRRT_kwDOT8kkjs61Mcxl）：换行在 10MiB 窗口之外 -----
+check('_logTrimCut 从 EOF 向前跨块扫描：最后换行在 10MiB 窗口之外仍返回其结束位置', () => {
+  const rfs = require('fs')
+  const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trimcut-'))
+  const p = path.join(dir, 'run.log')
+  const head = Buffer.from('A'.repeat(1024 * 1024) + '\n')
+  const tail = Buffer.from('Z'.repeat(11 * 1024 * 1024))
+  try {
+    rfs.writeFileSync(p, Buffer.concat([head, tail]))
+    const fd = rfs.openSync(p, 'r')
+    try {
+      const app = makeApp({ fs: rfs })
+      assert.strictEqual(app._logTrimCut(fd, rfs.fstatSync(fd).size), head.length,
+        '必须返回最后换行之后的字节偏移（旧实现只看尾部 10MiB，会误判为「无换行」）')
+    } finally { rfs.closeSync(fd) }
+  } finally { rfs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+check('_rewriteLogFrom 流式保留 [from, EOF) 并原子替换原文件', () => {
+  const rfs = require('fs')
+  const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trimwrite-'))
+  const p = path.join(dir, 'run.log')
+  const cut = 1024 * 1024 + 1
+  const head = Buffer.from('A'.repeat(1024 * 1024) + '\n')
+  const tail = Buffer.from('Z'.repeat(3 * 1024 * 1024))
+  try {
+    rfs.writeFileSync(p, Buffer.concat([head, tail]))
+    const app = makeApp({ fs: rfs })
+    assert.strictEqual(app._rewriteLogFrom(p, cut), true)
+    assert.ok(rfs.readFileSync(p).equals(tail), '重写后必须只剩 [from, EOF) 且逐字节一致')
+    assert.deepStrictEqual(rfs.readdirSync(dir), ['run.log'], '不得残留 .trim 临时文件')
+  } finally { rfs.rmSync(dir, { recursive: true, force: true }) }
 })
 
 check('_writeRunLog filename 非字符串 ⇒ 回退 run.log（typeof 守卫不可省）', () => {
@@ -840,7 +904,8 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
-  assert.strictEqual(rec.rec.read.length, 1)
+  assert.ok(rec.rec.read.length >= 1, '超限时必须真的去定位保留段')
+  assert.deepStrictEqual(rec.rec.read[rec.rec.read.length - 1], [9, rest.length, 2 * LIMIT - rest.length, rest.length])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 

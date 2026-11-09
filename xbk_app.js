@@ -201,6 +201,67 @@ function createApp ({
       return this._writeTextAtomic(filePath, text)
     },
 
+    // 从 EOF 向前按块找最后一行换行的结束位置（返回「最后换行之后」的字节偏移；没有换行返回 -1）。
+    // 只要文件里存在换行，就一定能在某个块里找到——不会因为「尾部 10MiB 窗口内没有换行」就
+    // 放弃截尾（Sourcery PRRT_kwDOT8kkjs61Mcxl）。4MiB 块避免一次读入整份 100MiB 日志。
+    _logTrimCut (fd, size) {
+      const CHUNK = 4 * 1024 * 1024
+      let end = size
+      while (end > 0) {
+        const from = Math.max(0, end - CHUNK)
+        const len = end - from
+        const buf = Buffer.alloc(len)
+        let got = 0
+        while (got < len) {
+          const n = fs.readSync(fd, buf, got, len - got, from + got)
+          if (n <= 0) break
+          got += n
+        }
+        if (got !== len) return -1
+        const i = buf.lastIndexOf(0x0a)
+        if (i >= 0) return from + i + 1
+        end = from
+      }
+      return -1
+    },
+
+    // 把 [from, EOF) 流式写进同目录临时文件再原子替换：保留段可能远超 10MiB（最后一个换行在
+    // 窗口之外），整段读进内存会放大峰值；复制按 1MiB 块进行，失败返回 false 并清理临时文件。
+    _rewriteLogFrom (logPath, from) {
+      const tmp = logPath + '.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(6).toString('hex') + '.trim'
+      let fdIn = null
+      let fdOut = null
+      try {
+        fdIn = fs.openSync(logPath, 'r')
+        fdOut = fs.openSync(tmp, 'wx', 0o600)
+        const buf = Buffer.alloc(1024 * 1024)
+        let pos = from
+        for (;;) {
+          const n = fs.readSync(fdIn, buf, 0, buf.length, pos)
+          if (n <= 0) break
+          let off = 0
+          while (off < n) {
+            const w = fs.writeSync(fdOut, buf, off, n - off)
+            if (!(w > 0)) throw new Error('short write')
+            off += w
+          }
+          pos += n
+        }
+        fs.fsyncSync(fdOut)
+        fs.closeSync(fdOut)
+        fdOut = null
+        fs.closeSync(fdIn)
+        fdIn = null
+        fs.renameSync(tmp, logPath)
+        return true
+      } catch (e) {
+        if (fdOut !== null) { try { fs.closeSync(fdOut) } catch (e2) {} }
+        if (fdIn !== null) { try { fs.closeSync(fdIn) } catch (e2) {} }
+        try { fs.unlinkSync(tmp) } catch (e2) {} // nosemgrep（tmp 由 logPath + pid + 时间 + 随机后缀构成）
+        return false
+      }
+    },
+
     // 运行日志：追加一行到缓存目录 run.log（成功摘要/失败 ERROR 共用），超过 1MB 截断保留尾部（防无限增长；写失败静默不中断）
     // v3.xxx P3 并发安全：appendFileSync 在单进程内全程同步无交错；真正竞态在跨进程（重叠 cron/
     // 常驻实例共用同一 cacheDir）——进程 A「追加→读尾→原子改写」的读改写间隙里，B 刚追加的行会被
@@ -329,32 +390,47 @@ function createApp ({
           if (lockFd !== null && !archivePending && st.size > LIMIT) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
+          // v3.407（Sourcery PRRT_kwDOT8kkjs61Mcxl）：旧实现只看「尾部 10MiB」窗口，
+          // 窗口里没有换行就整轮放弃；一条跨窗口的超长行会让文件长期停在 LIMIT 之上，
+          // 60s 退避后每追加一行又重复一次。现在从 EOF 向前按块扫描，找到最后一个换行
+          // 再决定截到哪；只有整份文件连一个换行都没有（单条巨行）才放弃并告警。
             const KEEP = 10 * 1024 * 1024
             const fd = fs.openSync(logPath, 'r+')
             try {
-              const readLen = Math.min(KEEP, st.size)
-              const buf = Buffer.alloc(readLen)
-              fs.readSync(fd, buf, 0, readLen, st.size - readLen) // 只读末尾 KEEP 字节
-              let trimmed = buf.toString('utf8')
-              // v3.178：尾部切片可能切在代理对中间（首字符为孤立低代理/尾字符为孤立高代理）→
-              // 写回后文件含非法 UTF-8 序列，下次读取显示 U+FFFD（§10-C）——退位到完整字符
-              const first = trimmed.charCodeAt(0)
-              if (first >= 0xDC00 && first <= 0xDFFF) trimmed = trimmed.slice(1) // 开头孤立低代理（高代理被切掉）
-              const last = trimmed.charCodeAt(trimmed.length - 1)
-              if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
-              const nl = trimmed.indexOf('\n')
-              if (nl < 0) {
-                // F1-6：尾部 10MiB 里找不到换行（整份是一条超长行，或换行落在窗口之前）⇒ 放弃本次
-                // 截尾、保留原文件。旧实现直接写回 trimmed，等于把「窗口起点切在行中间」的半行当成
-                // 新文件头：内容被截断、首行还是半条。同时设 60s 退避，避免每次追加都重读 10MiB。
+              const cut = this._logTrimCut(fd, st.size)
+              const trimmedLen = cut >= 0 ? st.size - cut : -1
+              if (cut < 0) {
+                // 整份文件没有任何换行：无法在不写半行的前提下截断，保留原文件并退避。
                 this._logRotateBackoffUntil = Date.now() + 60 * 1000
-                console.warn(`⚠️ 日志截尾放弃（尾部 10MiB 无换行，原文件保留，暂停追加 60s）：${logPath}`)
-              } else if (this._writeTextAtomic(logPath, trimmed.slice(nl + 1))) {
-                this._logRotateBackoffUntil = 0
+                console.warn(`⚠️ 日志截尾放弃（整份文件无换行，原文件保留，暂停追加 60s）：${logPath}`)
+              } else if (trimmedLen > KEEP) {
+                // 保留段超过 10MiB（最后一个换行在窗口之外）：流式重写，避免把整段读进内存。
+                if (this._rewriteLogFrom(logPath, cut)) {
+                  this._logRotateBackoffUntil = 0
+                } else {
+                  this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                  console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+                }
               } else {
-                // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）
-                this._logRotateBackoffUntil = Date.now() + 60 * 1000
-                console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+                const buf = Buffer.alloc(trimmedLen)
+                let got = 0
+                while (got < trimmedLen) {
+                  const n = fs.readSync(fd, buf, got, trimmedLen - got, cut + got)
+                  if (n <= 0) break
+                  got += n
+                }
+                let trimmed = got === trimmedLen ? buf.toString('utf8') : ''
+                // v3.178：尾部切片可能切在代理对中间（尾字符为孤立高代理）→ 写回后文件含
+                // 非法 UTF-8 序列。起点固定在换行之后，不会出现开头孤立低代理。
+                const last = trimmed.charCodeAt(trimmed.length - 1)
+                if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1)
+                if (got === trimmedLen && this._writeTextAtomic(logPath, trimmed)) {
+                  this._logRotateBackoffUntil = 0
+                } else {
+                  // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）
+                  this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                  console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
+                }
               }
             } finally {
               fs.closeSync(fd)
