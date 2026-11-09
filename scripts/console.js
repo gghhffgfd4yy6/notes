@@ -2273,7 +2273,7 @@ function rollbackFilterOverride (paths, previousText) {
 
 // C2-010：保存（POST /api/config/filter）、回滚（/restore）、导入（/api/backup/import）三处
 // 各写了一遍「备份当前覆盖文件 → 原子写新一代 → 合并生效 → 追加审计 → 审计失败回滚」。
-// 三份只差 action / 写入 label / 失败后由谁收尾，改一处必漏两处。收成一份：
+// 三份只差 action / 写入 label / 失败后由谁收尾，改一处必漏两处。收成一份（F4-2/R1-3：其中「备份当前覆盖文件」的读必须 O_NONBLOCK——FIFO 正好被判 corrupt，裸 O_RDONLY 会让保存/回滚/导入三条入口一起永久阻塞）：
 //   返回 { ok:true, revision, changedFields, hash } 或 { ok:false, status, body }（body 可直接下发）。
 //   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
 //   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
@@ -2287,7 +2287,7 @@ function commitFilterOverride ({
   // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
   let previousText = null
   if (loaded.source === 'override' || loaded.source === 'corrupt') {
-    const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES)
+    const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
     if (raw.status === 'ok') previousText = raw.text
     // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
     if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
@@ -4259,7 +4259,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const handleFilterDraftGet = (req, res) => {
     const revision = currentFilterRevision()
     const paths = filterDraftPaths()
-    const read = readSafeTextResult(paths.draft, FILTER_BODY_MAX_BYTES)
+    const read = readSafeTextResult(paths.draft, FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
     if (read.status === 'missing') {
       sendJson(res, 200, { ok: true, revision, draft: null })
       return
@@ -4374,7 +4374,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   }
   const importResultPath = (key) => path.join(stateDir, 'backup', `import-${sha256Hex(key)}.json`)
   const readImportResult = (key) => {
-    const read = readSafeTextResult(importResultPath(key), 64 * 1024)
+    const read = readSafeTextResult(importResultPath(key), 64 * 1024, { openNonBlocking: true })
     if (read.status !== 'ok') return null
     try {
       const parsed = JSON.parse(read.text)
@@ -5032,7 +5032,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const limit = Number.isFinite(limitRaw)
         ? Math.min(FILTER_PREVIEW_SAMPLE_MAX, Math.max(1, Math.floor(limitRaw)))
         : FILTER_PREVIEW_SAMPLE_DEFAULT
-      const read = readSafeTextResult(path.join(stateDir, messagesFile), FILTER_PREVIEW_MAX_BYTES)
+      const read = readSafeTextResult(path.join(stateDir, messagesFile), FILTER_PREVIEW_MAX_BYTES, { openNonBlocking: true })
       let records = null
       if (read.status === 'ok') {
         try {
@@ -5130,7 +5130,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const paths = FilterStore.filterRulesPaths(stateDir)
       let restoredFilter = null
       if (!toDefault) {
-        const read = readSafeTextResult(paths.backupFor(to), FILTER_BODY_MAX_BYTES)
+        const read = readSafeTextResult(paths.backupFor(to), FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
         if (read.status === 'missing') {
           sendJson(res, 404, { error: 'backup_not_found', code: 'backup_not_found' })
           return
@@ -6290,7 +6290,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         return
       }
       const { readSafeTextResult } = require('../xbk_storage')
-      const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true })
+      const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true, openNonBlocking: true })
       if (safe.status === 'missing') {
         sendJson(res, 200, { status: 'missing', text: '' })
         return

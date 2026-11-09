@@ -1498,6 +1498,66 @@ process.stdout.write(JSON.stringify({ code: probe.status, signal: probe.signal, 
   assert.match(r.out, /通道健康：不可读（unsafe）/, `--status 必须如实点名 unsafe，实际输出：${String(r.out).slice(-300)}`)
 })
 
+// R1-3：commitFilterOverride 备份「当前一代」时读的正是 filter-rules.json（spec 点名必须非阻塞的文件）。
+// 进入条件是 loaded.source==='override'|'corrupt'，而 FIFO 恰好被判 corrupt ⇒ 保存/回滚/导入三条
+// 写入口会一起在裸 O_RDONLY 上永久阻塞，单线程 http server 整只挂死且没有任何日志。
+test('F4-2 FIFO 覆盖文件 + 写入口：保存 / 回滚 / 备份导入三条入口都不得挂死（R1-3）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 写入口探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('filter-rules.json')
+  const r = runProbeUnderTimeout(`
+const http = require('node:http')
+const { createConsole } = require('./scripts/console')
+const token = 'probe-token-0123456789'
+const { server } = createConsole({ token, stateDir: process.env.XBK_FIFO_DIR, log: () => {} })
+const request = (port, method, p, body) => new Promise((resolve, reject) => {
+  const payload = body === undefined ? '' : JSON.stringify(body)
+  const req = http.request({ host: '127.0.0.1', port, path: p, method, headers: {
+    Authorization: 'Bearer ' + token,
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload)
+  } }, (res) => {
+    let text = ''
+    res.setEncoding('utf8')
+    res.on('data', (chunk) => { text += chunk })
+    res.on('end', () => resolve({ status: res.statusCode, error: JSON.parse(text).error }))
+  })
+  req.on('error', reject)
+  req.end(payload)
+})
+server.listen(0, '127.0.0.1', async () => {
+  try {
+    const port = server.address().port
+    const started = Date.now()
+    const save = await request(port, 'POST', '/api/config/filter', { filter: {}, baseRevision: 0, confirmReplaceCorrupt: true })
+    const saveMs = Date.now() - started
+    const restore = await request(port, 'POST', '/api/config/filter/restore', { confirm: true, to: 'default', baseRevision: 0 })
+    const imported = await request(port, 'POST', '/api/backup/import', { kind: 'xbk-console-backup', schema: 1, data: { filter: { text: JSON.stringify({ schema: 1, revision: 1, filter: { pingbibiaoti: 'x' } }) } } })
+    process.stdout.write(JSON.stringify({ save, saveMs, restore, imported, ms: Date.now() - started }))
+  } finally {
+    server.close(() => process.exit(0))
+  }
+})
+`, dir)
+  assert.ok(r.saveMs < 2000, `POST 保存必须 2 秒内响应（实耗 ${r.saveMs}ms）：FIFO 上裸 O_RDONLY 会永久阻塞整只控制台`)
+  assert.strictEqual(r.save.status, 500, `FIFO 覆盖文件写入必须如实失败（实际 ${r.save.status}）`)
+  assert.strictEqual(r.save.error, 'write_failed', `保存失败码必须是 write_failed（实际 ${r.save.error}）`)
+  assert.strictEqual(r.restore.status, 500, `回滚同样不得挂死，且必须如实失败（实际 ${r.restore.status}）`)
+  assert.strictEqual(r.restore.error, 'write_failed', `回滚失败码必须是 write_failed（实际 ${r.restore.error}）`)
+  assert.ok(r.imported.status >= 400, `备份导入不得报成功（实际 ${r.imported.status}）：filter-rules.json 写不进去`)
+  assert.ok(r.ms < 3000, `三条入口合计必须 3 秒内结束（实耗 ${r.ms}ms）`)
+})
+
+test('R1-3 静态接线：备份当前一代的读必须显式 openNonBlocking（回退成裸读即红）', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+  const line = src.split('\n').find(l => l.includes('readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES'))
+  assert.ok(line, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）')
+  assert.match(line, /openNonBlocking: true/,
+    `备份当前一代的读必须带 openNonBlocking:true（FIFO 会永久阻塞）：${line.trim()}`)
+})
+
 // ===== 路径 helper =====
 
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {
