@@ -426,7 +426,12 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   }
 
   if (!idx) {
-    const tmpPath = outPath + '.tmp'
+    // 旧实现用确定性的 `<outPath>.tmp` + O_EXCL：进程崩在创建临时文件与 rename 之间后，
+    // 以后每次重试都 EEXIST，封档永久卡死、100MB 截尾被禁用（Sourcery PRRT_kwDOT8kkjs61McwT）。
+    // 现在每次用唯一临时名（pid + 随机后缀）；旧版本遗留的确定性临时文件先尽力清掉，避免占盘。
+    const legacyTmp = outPath + '.tmp'
+    try { fs.unlinkSync(legacyTmp) } catch (e) {} // nosemgrep（路径=缓存目录 + 白名单周键 + .tmp）
+    const tmpPath = outPath + '.' + process.pid + '.' + crypto.randomBytes(4).toString('hex') + '.tmp'
     idx = { key: prevKey, base: baseOf(path.basename(logPath)), source: path.basename(logPath), members: [], lines: 0, bytes: 0 }
     let fdOut = null
     try {

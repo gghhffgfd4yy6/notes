@@ -1322,6 +1322,21 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(err22a && err22a.code === 'EARCHIVE', '第一次重建失败必须抛 EARCHIVE')
     assert.ok(err22b && err22b.message.includes('不再重试'), `第二次必须短路并说明冷却：${err22b && err22b.message}`)
     assert.strictEqual(LogArchive.readMarker(log22), '20261102-20261108', '重建失败不得推进 marker')
+
+    // ⑮ F1-12：崩溃遗留的 <outPath>.tmp 不得让后续封档永久 EEXIST。
+    // 旧实现用确定性临时名 + O_EXCL，残留文件会让每次重试都失败、archivePending 永远清不掉。
+    const dir23 = make('logarch-f23')
+    fs.mkdirSync(path.join(dir23, 'logs'), { recursive: true })
+    const log23 = path.join(dir23, 'run.log')
+    fs.writeFileSync(log23, Array.from({ length: 40 }, (_, i) => 'F23 第' + i + '行').join('\n') + '\n')
+    LogArchive.writeMarker(log23, '20261102-20261108')
+    const out23 = LogArchive.archivePath(dir23, 'run.log', '20261102-20261108')
+    fs.writeFileSync(out23 + '.tmp', 'stale half-written archive')
+    const sealed23 = LogArchive.sealLog(log23, dir23, '20261102-20261108', '20261109-20261115')
+    assert.ok(sealed23 && sealed23.lines === 40, '存在陈旧 .tmp 时仍必须能完成封档')
+    assert.ok(!fs.existsSync(out23 + '.tmp'), '陈旧的确定性临时文件必须被清掉')
+    assert.strictEqual(LogArchive.readGzPage(out23, 1, 100).lines.length, 40, '新发布归档必须可读')
+    assert.strictEqual(LogArchive.readMarker(log23), '20261109-20261115', '封档成功必须推进 marker')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
