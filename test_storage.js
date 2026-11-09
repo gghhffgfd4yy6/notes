@@ -1705,14 +1705,10 @@ const LogArchive = require('./scripts/log-archive')
     // fail-open 追加（真实调用方在失败后继续写日志）：长度变成 before + extra，不再是 before
     const extra33 = Buffer.from('F33 封档失败后写入的一行 ' + 'f'.repeat(120) + '\n')
     fs.appendFileSync(log33, extra33)
-    // CodeQL js/file-system-race：长度核验也走 fd（不再按路径 statSync 之后按路径使用同一路径）。
-    const fd33 = fs.openSync(log33, 'r')
-    let size33 = -1
-    try {
-      size33 = fs.fstatSync(fd33).size
-    } finally {
-      fs.closeSync(fd33)
-    }
+    // 长度直接由本用例写入的字节数算出（上周明文 + 新周内容 + fail-open 追加）：不再为「只取 size」
+    // 单独按路径 open 一次——那次 open 只用 fstatSync，close 之后还要按路径 open 读回明文，正是
+    // CodeQL js/file-system-race 的 check-by-path → use-by-path 配对（与本轮 alert #137 同型）。
+    const size33 = old33.length + new33.length + extra33.length
     assert.ok(size33 > journal33.before, '夹具：恢复前必须有追加，长度大于 before')
     const second33 = LogArchive.sealLog(log33, dir33, '20261102-20261108', '20261109-20261115')
     assert.ok(second33, '有 fail-open 追加时也必须自动补完（真实调用方每轮都会先写一行再重试）')

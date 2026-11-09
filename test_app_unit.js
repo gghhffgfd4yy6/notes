@@ -940,16 +940,14 @@ check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、�
   const lines = Math.ceil((11 * 1024 * 1024) / WIDTH)
   const prevLimit = process.env.XBK_LOG_LIMIT_BYTES
   try {
-    rfs.writeFileSync(logPath, line.repeat(lines))
-    // 前置长度核验也走 fd：`statSync` 这类按路径检查之后紧跟按路径的 open/read，正是 CodeQL
-    // js/file-system-race 眼里的 check-by-path → use-by-path（即便夹具在私有 mkdtemp 目录里）。
-    const fdBefore = rfs.openSync(logPath, 'r')
-    let before = -1
-    try {
-      before = rfs.fstatSync(fdBefore).size
-    } finally {
-      rfs.closeSync(fdBefore)
-    }
+    const payload = line.repeat(lines)
+    rfs.writeFileSync(logPath, payload)
+    // 前置长度直接取已写入 payload 的字节数：不为「只取长度」单独按路径 open 一次——那次 open
+    // 只用 fstatSync 取 before，close 之后还要按路径 open 读回，正是 CodeQL js/file-system-race
+    // （CWE-367）眼里的 check-by-path → use-by-path 配对（alert #137：两次 open 挂在同一路径上）。
+    // 这里也不能「整段只 open 一次」：_writeRunLog 走 writeAtomic 重写，可能 rename 换掉 inode，
+    // 截尾前拿到的 fd 会读到旧 inode 的内容，故用写入侧已知的字节数。
+    const before = Buffer.byteLength(payload)
     assert.ok(before > KEEP, `夹具必须先超过 KEEP（实际 ${before}）`)
     process.env.XBK_LOG_LIMIT_BYTES = String(10 * 1024 * 1024 + 512 * 1024) // 10.5MiB：11MiB 夹具超限
     const app = makeApp({
