@@ -1,4 +1,7 @@
 const { setTimeout: delay } = require('node:timers/promises')
+// R2-1：文件常量只认**本模块** require 的 node:fs。createApp 的 fs 是「按需注入的能力子集」，
+// 单测桩只实现被调用到的方法（默认桩仅 existsSync），不保证带 constants / fstatSync / writeFileSync。
+const nodeFs = require('node:fs')
 const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 const Similar = require('./scripts/similar-dedupe.js')
 const LogArchive = require('./scripts/log-archive.js')
@@ -159,14 +162,23 @@ function createApp ({
     // ELOOP/ENOTDIR，再用 fstat 复核「打开后的这个 fd 真是普通文件」——FIFO 有读者时 open 会成功，
     // 只有 fstat 能拦住「把周键写进管道」。
     // 失败只告警（run.log 照常写，归档下一轮重试），绝不抛穿 _writeRunLog。
+    // R2-1：注入的 fs 是**能力子集**，不是 node:fs 的完整替身。原先在 try 之外读 `fs.constants`，
+    // 桩上一抛 TypeError 就穿出本方法、被 _writeRunLog 最外层 catch 吞掉 ⇒ 整行日志连 append 都没做
+    // （test_app_unit 28 例红）。常量一律取本模块 require 的 node:fs；能力先探测再调用，缺任何一项
+    // 就本轮不写（没有 fstat 就无法排除「把周键写进管道」，宁可下一轮归档时重试）。
     _writeWeekMarker (markerPath, weekKey) {
-      const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC |
-        fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW
+      const capable = ['openSync', 'fstatSync', 'writeFileSync', 'closeSync']
+        .every((name) => typeof fs[name] === 'function')
+      if (!capable) return false
+      const flags = nodeFs.constants.O_WRONLY | nodeFs.constants.O_CREAT | nodeFs.constants.O_TRUNC |
+        nodeFs.constants.O_NONBLOCK | (nodeFs.constants.O_NOFOLLOW || 0)
       let fd = null
+      let opened = false
       try {
         fd = fs.openSync(markerPath, flags, 0o600)
+        opened = true
         const st = fs.fstatSync(fd)
-        if (!st.isFile()) {
+        if (!st || typeof st.isFile !== 'function' || !st.isFile()) {
           console.warn(`⚠️ 日志周标记不是普通文件，拒绝写入（归档下一轮重试）：${markerPath}`)
           return false
         }
@@ -176,7 +188,9 @@ function createApp ({
         console.warn(`⚠️ 日志周标记写入失败（归档下一轮重试）：${markerPath}：${Utils.safeErrorText(e, '未知错误')}`)
         return false
       } finally {
-        if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* fd 已失效时忽略 */ } }
+        // R2-1：只关「本函数确实 open 成功的那个 fd」。openSync 抛错时 fd 保持 null；桩的 openSync
+        // 恒返同一个号数时，无条件 close 会去关别人（例如同一调用链里的锁 fd）。
+        if (opened && fd !== null) { try { fs.closeSync(fd) } catch (e) { /* fd 已失效时忽略 */ } }
       }
     },
 
