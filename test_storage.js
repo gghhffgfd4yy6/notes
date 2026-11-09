@@ -1268,6 +1268,38 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(LogArchive.readMarker(log20), '20261109-20261115', '补完 marker 后必须推进')
     assert.ok(!fs.existsSync(log20 + '.seal.json'), 'marker 成功后必须清掉事务记录')
 
+    // ⑫b F1-9（Mcv9）：截断成功、marker 写失败的确切现场——明文已空、旧 marker 仍在、
+    // 事务记录带完整 prevKey/nextKey/bytes；下一轮只补 marker，不重新归档、不丢 gz。
+    const dir25 = make('logarch-f25')
+    fs.mkdirSync(dir25, { recursive: true })
+    const log25 = path.join(dir25, 'run.log')
+    const body25 = Array.from({ length: 30 }, (_, i) => 'F25 第' + i + '行').join('\n') + '\n'
+    fs.writeFileSync(log25, body25)
+    LogArchive.writeMarker(log25, '20261102-20261108')
+    const origRename25 = fs.renameSync
+    let markerErr25 = null
+    try {
+      fs.renameSync = (from, to) => {
+        if (typeof to === 'string' && to.endsWith('.week')) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' })
+        return origRename25.call(fs, from, to)
+      }
+      try { LogArchive.sealLog(log25, dir25, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr25 = e }
+    } finally { fs.renameSync = origRename25 }
+    assert.ok(markerErr25, '注入必须让 marker 写入失败')
+    assert.strictEqual(LogArchive.readMarker(log25), '20261102-20261108', 'marker 失败时旧周标记必须保留')
+    assert.strictEqual(fs.statSync(log25).size, 0, '截断已成功：明文必须为空')
+    const journal25 = JSON.parse(fs.readFileSync(log25 + '.seal.json', 'utf8'))
+    assert.deepStrictEqual(
+      { prevKey: journal25.prevKey, nextKey: journal25.nextKey, bytes: journal25.bytes, lines: journal25.lines },
+      { prevKey: '20261102-20261108', nextKey: '20261109-20261115', bytes: Buffer.byteLength(body25), lines: 30 },
+      '事务记录必须能证明「这份归档已截断、该补哪个 marker」')
+    const gz25 = LogArchive.archivePath(dir25, 'run.log', '20261102-20261108')
+    const gzBefore25 = fs.readFileSync(gz25)
+    LogArchive.sealLog(log25, dir25, '20261102-20261108', '20261109-20261115')
+    assert.strictEqual(LogArchive.readMarker(log25), '20261109-20261115', '恢复时只补 marker 并推进')
+    assert.ok(!fs.existsSync(log25 + '.seal.json'), '恢复成功后事务记录必须清理')
+    assert.ok(fs.readFileSync(gz25).equals(gzBefore25), '恢复不得重新归档/改写已发布的 gz')
+
     // ⑬ F1-10：索引重建必须限制单个成员解压后的体积。高压缩比成员（33MiB 零字节）在旧实现里
     // 会被整份 inflate 进内存；现在应给出可恢复的 EARCHIVE，而不是把 logger 的内存打爆。
     const dir21 = make('logarch-f21')
