@@ -13,8 +13,9 @@
 //   - 所有 open 走 O_NOFOLLOW + fstat 常规文件校验：日志路径被换成符号链接/FIFO 时不跟。
 //   - 归档写入用 O_EXCL 临时文件 + rename；索引先写 .tmp 再 rename；没有索引的 gz
 //     对控制台不可见（listArchives 过滤），避免把半成品当成品读。
-//   - 切档顺序：发布 gz → 发布 idx → 写「新周」标记 → 截断明文。标记写失败就抛错、
-//     不截断：宁可下次重复归档，也不丢上一周的数据。
+//   - 切档顺序：发布 gz → 发布 idx → 截断明文 → 写「新周」标记（v3.405：先截断后标记）。
+//     截断失败就抛错、保留旧标记：宁可下一轮重试，也不让「标记已进新周、明文还是上一周」
+//     的错位状态把上一周数据交给 100MB 截尾覆盖。
 //   - 上次崩在「发布之后、截断/标记之前」时（gz 在、idx 缺 / gz+idx 都在、标记仍旧）不返回
 //     null：idx 缺则从 gz 重建并补写，然后继续补做截断与标记；重建失败抛明确错误。
 //   - 读完到截断之间若有 fail-open 写者追加，把追加段搬回文件开头再截断，不吞这几行。
@@ -282,11 +283,10 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
     fsyncDirBestEffort(dir)
   }
 
-  // 标记先落到「新周」再截断：标记写失败抛错、明文保持原样（重复归档好过丢数据）。
-  // F1-3 会把它移到截断成功之后（当前提交只修 F1-2 的索引重建）。
-  writeAtomic(weekMarkerPath(logPath), nextKey)
-
-  // 读完到截断之间可能有 fail-open 写者追加：把 [idx.bytes, size) 搬回文件开头再截断。
+  // F1-3：先截断成功、再推进 marker。旧顺序（先 marker 后截断）在截断失败时会把 marker 留在
+  // 新周而明文还全是上一周——下一轮直接跳过归档，上一周明文被 100MB 截尾覆盖。截断失败必须
+  // 留痕并抛错（调用方保留 archivePending）。读完到截断之间可能有 fail-open 写者追加：
+  // 把 [idx.bytes, size) 搬回文件开头再截断。
   try {
     const st = fs.fstatSync(fdIn)
     let keepLen = 0
@@ -305,13 +305,21 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
         off += n
       }
       keepLen = off
+      fs.ftruncateSync(fdIn, keepLen)
+    } else if (writable) {
+      // 明文比归档短：可能上次截断成功但标记没写成功。不做截断（避免删掉未归档的新内容），只补标记。
+      console.warn(`⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
+    } else {
+      // 只读打开（rw 失败）无法截断，但数据已在 gz 里；留下告警而不是静默跳过。
+      console.warn(`⚠️ 日志归档：明文不可写，跳过截断（数据已归档）：${logPath}`)
     }
-    if (writable) fs.ftruncateSync(fdIn, keepLen)
   } catch (e) {
-    // 截断失败不影响归档（数据已在 gz 里），下一轮会再试。
+    console.warn(`⚠️ 日志归档：截断明文失败，保留旧周标记以便下一轮重试：${logPath}（${e.code || e.message}）`)
+    throw Object.assign(new Error(`日志归档截断失败：${logPath}（${e.code || e.message}）`), { code: 'EARCHTRUNC', cause: e })
   } finally {
     try { fs.closeSync(fdIn) } catch (e) {}
   }
+
   writeAtomic(weekMarkerPath(logPath), nextKey)
   return { path: outPath, lines: idx.lines, bytes: idx.bytes }
 }

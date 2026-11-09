@@ -970,6 +970,42 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(rebuildErr.message.includes('gz 为空') && rebuildErr.message.includes(dir12b),
       `错误必须带路径与原因：${rebuildErr.message}`)
     assert.strictEqual(LogArchive.readMarker(log12b), '20261102-20261108', '重建失败不得推进 marker')
+
+    // ⑦ F1-3：截断抛错 ⇒ marker 不推进、明文原样保留、必须有 WARN；下一轮重试成功。
+    // 旧顺序是「先写 marker 再截断 + 空 catch」：截断失败被静默吞掉，下一轮 marker 已是新周，
+    // 上一周明文直接暴露给 100MB 截尾。
+    const dir13 = make('logarch-f13')
+    fs.mkdirSync(dir13, { recursive: true })
+    const log13 = path.join(dir13, 'run.log')
+    const body13 = Buffer.from(Array.from({ length: 500 }, (_, i) => 'F13 第' + i + '行').join('\n') + '\n')
+    fs.writeFileSync(log13, body13)
+    LogArchive.writeMarker(log13, '20261102-20261108')
+    const warns13 = []
+    const origWarn13 = console.warn
+    const origTrunc13 = fs.ftruncateSync
+    let truncErr13 = null
+    try {
+      fs.ftruncateSync = () => { const e = new Error('EIO: 注入截断失败'); e.code = 'EIO'; throw e }
+      console.warn = (...a) => { warns13.push(a.map(String).join(' ')) }
+      try { LogArchive.sealLog(log13, dir13, '20261102-20261108', '20261109-20261115') } catch (e) { truncErr13 = e }
+    } finally {
+      fs.ftruncateSync = origTrunc13
+      console.warn = origWarn13
+    }
+    assert.ok(truncErr13, '截断失败必须抛错（调用方据此保留 archivePending）')
+    assert.strictEqual(truncErr13.code, 'EARCHTRUNC', `错误码必须可识别（实际 ${truncErr13.code}）`)
+    assert.ok(truncErr13.message.includes('截断失败') && truncErr13.message.includes(log13),
+      `错误必须带路径与原因：${truncErr13.message}`)
+    assert.ok(warns13.some((w) => w.includes('截断明文失败') && w.includes(log13)),
+      `截断失败必须 WARN（不得静默）：${JSON.stringify(warns13)}`)
+    assert.strictEqual(LogArchive.readMarker(log13), '20261102-20261108', '截断失败时 marker 绝不能推进')
+    assert.ok(fs.readFileSync(log13).equals(body13), '截断失败必须保留明文原样（下一轮才好重试）')
+    // 下一轮（不注入）：走「gz + idx 已存在」的补做路径，必须完成截断并推进 marker
+    const retry13 = LogArchive.sealLog(log13, dir13, '20261102-20261108', '20261109-20261115')
+    assert.ok(retry13 && retry13.lines === 500, '下一轮必须能重试成功')
+    assert.strictEqual(LogArchive.readMarker(log13), '20261109-20261115', '重试成功后 marker 才推进')
+    assert.strictEqual(fs.readFileSync(log13, 'utf8'), '', '重试成功后明文必须被截断')
+    assert.strictEqual(LogArchive.readGzPage(retry13.path, 1, 100).lines[0], 'F13 第0行', '重试后归档必须仍可读')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
