@@ -941,7 +941,15 @@ check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、�
   const prevLimit = process.env.XBK_LOG_LIMIT_BYTES
   try {
     rfs.writeFileSync(logPath, line.repeat(lines))
-    const before = rfs.statSync(logPath).size
+    // 前置长度核验也走 fd：`statSync` 这类按路径检查之后紧跟按路径的 open/read，正是 CodeQL
+    // js/file-system-race 眼里的 check-by-path → use-by-path（即便夹具在私有 mkdtemp 目录里）。
+    const fdBefore = rfs.openSync(logPath, 'r')
+    let before = -1
+    try {
+      before = rfs.fstatSync(fdBefore).size
+    } finally {
+      rfs.closeSync(fdBefore)
+    }
     assert.ok(before > KEEP, `夹具必须先超过 KEEP（实际 ${before}）`)
     process.env.XBK_LOG_LIMIT_BYTES = String(10 * 1024 * 1024 + 512 * 1024) // 10.5MiB：11MiB 夹具超限
     const app = makeApp({
@@ -951,8 +959,27 @@ check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、�
       MessageStore: { cacheDir: dir, _getTombstoneProcessStart: () => 42, _isTombstoneLockProcessAlive: () => false }
     })
     const r = withCapture('warn', () => app._writeRunLog('LATEST-LINE-MARKER\n'))
-    const after = rfs.statSync(logPath).size
-    const kept = rfs.readFileSync(logPath, 'utf8')
+    // CodeQL js/file-system-race（CWE-367，alert #133）修法：截尾后的长度核验与明文读回必须落在
+    // 同一个 fd 上（openSync → fstatSync/readSync → finally closeSync）。旧写法先按路径 statSync
+    // 取长度、再按路径 readFileSync 读同一路径，构成 check-by-path → use-by-path 的 TOCTOU 配对：
+    // 两次路径解析之间文件可能被换名/替换，读回的就不是被检查的那个 inode。断言语义（长度不超过
+    // KEEP、保留段约为 KEEP、首行完整、末行保留、前缀按整行丢弃）逐字保留。
+    const fdAfter = rfs.openSync(logPath, 'r')
+    let after = -1
+    let kept = ''
+    try {
+      after = rfs.fstatSync(fdAfter).size
+      const buf = Buffer.alloc(after)
+      let got = 0
+      while (got < buf.length) {
+        const n = rfs.readSync(fdAfter, buf, got, buf.length - got, got)
+        if (n <= 0) break
+        got += n
+      }
+      kept = buf.toString('utf8')
+    } finally {
+      rfs.closeSync(fdAfter)
+    }
     assert.deepStrictEqual(r.msgs.filter((m) => m.includes('日志截尾')), [], `正常截尾不得告警：${JSON.stringify(r.msgs)}`)
     assert.ok(after <= KEEP, `截尾后不得超过 KEEP（实际 ${after}）`)
     assert.ok(after > KEEP - WIDTH, `保留段必须约为 KEEP（实际 ${after}）`)
