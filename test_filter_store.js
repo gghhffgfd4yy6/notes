@@ -1418,6 +1418,86 @@ process.stdout.write(JSON.stringify({ marker: readMarker(path.join(dir, 'run.log
   assert.strictEqual(r.mode, 0o600, `周标记必须是 0600（与其它状态文件同口径），实际 ${r.mode.toString(8)}`)
 })
 
+// R1-2：readStatus 里的 report.state / channel-health.state 此前调 readText 时没传 options，
+// 走的是裸 O_RDONLY——FIFO 上没有写者就永久阻塞。控制台 GET /、GET /api/status 与青龙 --status
+// 全走这条路径，一处漏传就是「整个单线程 http server 被钉死」。
+test('F4-2 FIFO 状态文件：report.state / channel-health.state 注入 FIFO 后 readStatus 2 秒内返回 unsafe（R1-2）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 状态文件探针：${FIFO_SKIP}`)
+    return
+  }
+  for (const [name, key] of [['report.state', 'report'], ['channel-health.state', 'channels']]) {
+    const { dir } = makeFifoDir(name)
+    const r = runProbeUnderTimeout(`
+const { readStatus } = require('./scripts/status')
+const t0 = Date.now()
+const out = readStatus(process.env.XBK_FIFO_DIR)
+process.stdout.write(JSON.stringify({ report: out.report.status, channels: out.channels.status, run: out.run.status, ms: Date.now() - t0 }))
+`, dir)
+    assert.ok(r.ms < 2000, `${name} 的 readStatus 必须 2 秒内返回（实耗 ${r.ms}ms）：裸 O_RDONLY 会阻塞等写者`)
+    assert.strictEqual(r[key], 'unsafe', `${name} 必须按非普通文件判 unsafe（实际 ${r[key]}）——不得挂死也不得当空文件读`)
+    assert.strictEqual(r.run, 'missing', '其余部件不受影响（同一目录下没有 run.log）')
+  }
+})
+
+test('F4-2 FIFO 状态文件 + 控制台读面：GET /api/status 与 GET / 都不得挂死（R1-2）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 控制台读面探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('report.state')
+  const r = runProbeUnderTimeout(`
+const http = require('node:http')
+const { createConsole } = require('./scripts/console')
+const token = 'probe-token-0123456789'
+const { server } = createConsole({ token, stateDir: process.env.XBK_FIFO_DIR, log: () => {} })
+const get = (port, p) => new Promise((resolve, reject) => {
+  const req = http.get({ host: '127.0.0.1', port, path: p, headers: { Authorization: 'Bearer ' + token } }, (res) => {
+    let body = ''
+    res.setEncoding('utf8')
+    res.on('data', (chunk) => { body += chunk })
+    res.on('end', () => resolve({ status: res.statusCode, bytes: body.length }))
+  })
+  req.on('error', reject)
+})
+server.listen(0, '127.0.0.1', async () => {
+  try {
+    const port = server.address().port
+    const t0 = Date.now()
+    const api = await get(port, '/api/status')
+    const page = await get(port, '/')
+    process.stdout.write(JSON.stringify({ api, page, ms: Date.now() - t0 }))
+  } finally {
+    server.close(() => process.exit(0))
+  }
+})
+`, dir)
+  assert.ok(r.ms < 2000, `控制台读面必须 2 秒内响应（实耗 ${r.ms}ms）：单线程 server 一挂就是整只控制台不可用`)
+  assert.strictEqual(r.api.status, 200, `GET /api/status 必须正常返回（实际 ${r.api.status}）：读不到不等于挂死`)
+  assert.strictEqual(r.page.status, 200, `GET / 必须正常返回（实际 ${r.page.status}）`)
+})
+
+test('F4-2 FIFO 状态文件 + --status：青龙 --status 2 秒内正常退出并如实报 unsafe（R1-2）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO --status 探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('channel-health.state')
+  const r = runProbeUnderTimeout(`
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+const t0 = Date.now()
+const probe = spawnSync(process.execPath, [path.resolve('qinglong/xbk_push.js'), '--status'], {
+  encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: process.env.XBK_FIFO_DIR }, timeout: 2500
+})
+process.stdout.write(JSON.stringify({ code: probe.status, signal: probe.signal, ms: Date.now() - t0, out: String(probe.stdout || '') + String(probe.stderr || '') }))
+`, dir)
+  assert.ok(r.ms < 2000, `--status 必须 2 秒内结束（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.signal, null, `--status 不得被超时强杀（signal=${r.signal}）`)
+  assert.strictEqual(r.code, 0, `--status 必须正常退出（实际 code=${r.code}）：状态不可读是展示内容，不是命令失败`)
+  assert.match(r.out, /通道健康：不可读（unsafe）/, `--status 必须如实点名 unsafe，实际输出：${String(r.out).slice(-300)}`)
+})
+
 // ===== 路径 helper =====
 
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {

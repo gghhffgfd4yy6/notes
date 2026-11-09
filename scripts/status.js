@@ -33,7 +33,13 @@ const LOG_MAX_BYTES = 1024 * 1024
 const LOG_READ_OPTIONS = { tail: true }
 
 function readText (dir, name, maxBytes = LOG_MAX_BYTES, options) {
-  const safe = readSafeTextResult(path.join(dir, name), maxBytes, options)
+  // F4-2/R1-2：所有状态文件读取一律 O_NONBLOCK + 普通文件校验，默认值收在这唯一入口。
+  // readStatus 的 report.state / channel-health.state 此前调 readText(dir, name, 64*1024) 没传
+  // options ⇒ 走 readSafeTextResult 的裸 O_RDONLY：FIFO 上没有写者时同步 open 永久阻塞，
+  // 控制台 GET / 与 GET /api/status 的单线程事件循环被钉死、青龙 --status 整条命令挂起。
+  // 收成默认（而不是逐个调用点补）也顺手堵住下一个新调用点漏传。
+  const opts = { ...(options && typeof options === 'object' ? options : {}), openNonBlocking: true }
+  const safe = readSafeTextResult(path.join(dir, name), maxBytes, opts)
   if (safe.status !== 'ok') return result(safe.status)
   const out = result('ok', safe.text)
   // 尾部窗口读取（run.log 超过 1 MiB）会切掉更早行：调用方要能区分「没有旧轮」与
