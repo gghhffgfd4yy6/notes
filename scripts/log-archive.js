@@ -153,7 +153,10 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
       const nl = chunk.lastIndexOf(0x0a)
       if (nl >= 0) cut = nl + 1
       const take = chunk.slice(0, cut)
-      carry = chunk.slice(cut)
+      // F1-1：carry 必须是独立副本。chunk 可能是读缓冲 buf 的零拷贝视图，下一轮
+      // readSync(fdIn, buf, ...) 会覆盖它——Buffer.concat 就会把「新块头部」当成上一块行尾
+      // 拼进来，每次跨块封档在 member0→member1 边界固定坏一行（丢 k 字节 + 重复 k 字节）。
+      carry = Buffer.from(chunk.subarray(cut))
       if (!take.length) continue
       const gz = zlib.gzipSync(take, { level: 6 })
       writeAllSync(fdOut, gz)

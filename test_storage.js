@@ -4,6 +4,7 @@ const assert = require('assert')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const zlib = require('zlib')
 const {
   isRegularOrMissing,
   writeAtomic,
@@ -896,6 +897,38 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(list[0].key, '20261109-20261115')
     LogArchive.pruneArchives(dir, 'run.log', 0)
     assert.ok(!fs.existsSync(gz) && !fs.existsSync(gz + '.idx.json'), '超期归档必须连 idx 一起删除')
+
+    // ⑤ F1-1：多成员归档解压全部成员后必须与原文逐字节相等（覆盖 member0→member1 的 carry 边界）。
+    // 旧实现 carry = chunk.slice(cut) 是读缓冲的零拷贝视图，下一轮 readSync 覆盖后会把新块头部
+    // 当成上一块行尾拼进来：总大小不变，但边界处固定「丢 k 字节 + 重复 k 字节」。68k 行 × 中文
+    // ≈ 4.3MiB（5 个成员），任何偏移错位都会被 Buffer.equals 抓到。
+    const dir11 = make('logarch-f11')
+    fs.mkdirSync(dir11, { recursive: true })
+    const log11 = path.join(dir11, 'run.log')
+    const src11 = Buffer.from(Array.from({ length: 60000 }, (_, i) => '2026-11-09 12:00:00 INFO 线报第' + i + '条 商品名称测试数据 ' + String(i).padStart(6, '0')).join('\n') + '\n')
+    assert.ok(src11.length >= 3 * 1024 * 1024, `夹具必须 ≥3MiB（实际 ${src11.length} 字节）`)
+    fs.writeFileSync(log11, src11)
+    const sealed11 = LogArchive.sealLog(log11, dir11, '20261109-20261115', '20261116-20261122')
+    const idx11 = JSON.parse(fs.readFileSync(sealed11.path + '.idx.json', 'utf8'))
+    assert.ok(idx11.members.length >= 3, `必须真的切成多个成员（实际 ${idx11.members.length}）`)
+    const fd11 = fs.openSync(sealed11.path, 'r')
+    const parts11 = []
+    try {
+      for (const m of idx11.members) {
+        const b = Buffer.alloc(m.len)
+        let got = 0
+        while (got < m.len) {
+          const n = fs.readSync(fd11, b, got, m.len - got, m.off + got)
+          if (n <= 0) break
+          got += n
+        }
+        parts11.push(zlib.gunzipSync(b))
+      }
+    } finally { fs.closeSync(fd11) }
+    const out11 = Buffer.concat(parts11)
+    assert.strictEqual(sealed11.lines, 60000, '行数必须精确')
+    assert.strictEqual(sealed11.bytes, src11.length, '归档字节数必须等于原文长度')
+    assert.ok(out11.equals(src11), '解压全部成员拼接必须与原文逐字节相等（F1-1：carry 别名会在成员边界坏一行）')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
