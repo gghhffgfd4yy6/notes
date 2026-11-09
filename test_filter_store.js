@@ -933,7 +933,7 @@ test('C9-019 生效快照 filter/keyword 字段按覆盖文件同口径收紧（
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '缺省字段不得被误判为损坏')
 })
 
-// ===== F4-2：FIFO/非普通文件不得挂死（读取必须 O_NONBLOCK + 普通文件校验）=====
+// ===== FIFO 探针夹具（F4-2 与 F4-1 的 LKG 读取共用）=====
 // 为什么必须借子进程 + timeout：同步 open 阻塞的是整个事件循环，同进程内没有任何超时能打断它；
 // 只有外部 `timeout 3` 能证明「进程在 2 秒内自己结束了」——exit=124 就是挂死的证据。
 const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
@@ -970,6 +970,179 @@ function makeFifoDir (name) {
   return { dir, file }
 }
 
+// ===== F4-1：持久 LKG（新进程降级时沿用上次合法 override）=====
+// 为什么必须开子进程：本套件的 loadFilterRules 调用都在同一进程里，进程内 lastGood 会掩盖
+// 「新进程拿到的是代码默认」这个缺陷本体——控制台 auto-run 每 5 秒 spawn 的正是新进程。
+const LKG_PROBE = `
+const { loadFilterRules, writeAppliedSnapshot, readAppliedSnapshot } = require('./xbk_filter_store')
+const dir = process.env.XBK_LKG_DIR
+const defaults = JSON.parse(process.env.XBK_LKG_DEFAULTS)
+const r = loadFilterRules({ cacheDir: dir, defaults, keyword: {} })
+writeAppliedSnapshot({ cacheDir: dir, filter: r.filter, keyword: r.keyword, revision: r.revision, source: r.source, hash: 'probe-hash', lastGoodUsed: r.lastGoodUsed })
+const applied = readAppliedSnapshot(dir)
+process.stdout.write(JSON.stringify({
+  source: r.source,
+  degraded: r.degraded,
+  lastGoodUsed: r.lastGoodUsed,
+  revision: r.revision,
+  filter: r.filter,
+  applied: applied.status === 'ok' ? { status: 'ok', source: applied.snapshot.source, lastGoodUsed: applied.snapshot.lastGoodUsed, filter: applied.snapshot.filter } : { status: applied.status }
+}))
+`
+function runLkgProbe (dir) {
+  const probe = spawnSync(process.execPath, ['-e', LKG_PROBE], {
+    encoding: 'utf8',
+    cwd: __dirname,
+    env: { ...process.env, XBK_LKG_DIR: dir, XBK_LKG_DEFAULTS: JSON.stringify(DEFAULTS) }
+  })
+  const out = `${probe.stdout || ''}${probe.stderr || ''}`
+  assert.strictEqual(probe.status, 0, `LKG 探针必须正常结束：${out.slice(-600)}`)
+  return JSON.parse(String(probe.stdout).trim().split('\n').pop())
+}
+
+test('F4-1 成功加载 override 后落盘持久 LKG（0600、{schema,revision,hash,override}）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 7, filter: { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' } })
+  const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loaded.source, 'override', '前置：覆盖文件必须被正常加载')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '成功加载 override 必须写 filter-rules.lastgood.json（否则新进程没有降级兜底）')
+  assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, 0o600, 'LKG 必须是 0600（含用户规则正文）')
+  const lkg = readJson(paths.lastgood)
+  assert.deepStrictEqual(Object.keys(lkg).sort(), ['hash', 'override', 'revision', 'schema'], `LKG 形状必须恰为 {schema,revision,hash,override}：${JSON.stringify(Object.keys(lkg))}`)
+  assert.strictEqual(lkg.schema, 1)
+  assert.strictEqual(lkg.revision, 7)
+  assert.match(lkg.hash, /^[0-9a-f]{64}$/, 'hash 必须是内容摘要（sha256 十六进制）')
+  assert.deepStrictEqual(lkg.override, { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' },
+    'override 只含覆盖文件里实际存在的字段原文（不得是「默认 + 覆盖」的合并结果，否则缺字段会被钉死成旧默认）')
+})
+
+test('F4-1 验收 1：写坏覆盖文件后**新进程**沿用上次合法 override（applied.lastGoodUsed=true，逐字段等于上次合并结果）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 7, filter: { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' } })
+  const good = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(good.source, 'override')
+  const expected = mergeActiveFilter({ defaults: DEFAULTS, keyword: {}, override: { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' } })
+  writeRaw(file, '{ 坏掉的 JSON')
+
+  const fresh = runLkgProbe(dir)
+  assert.strictEqual(fresh.source, 'corrupt', '坏文件必须判 corrupt/degraded（不是静默 override）')
+  assert.strictEqual(fresh.degraded, true)
+  assert.strictEqual(fresh.lastGoodUsed, true, '新进程必须用持久 LKG（旧实现这里恒为 false：进程内 Map 对新进程不存在）')
+  assert.strictEqual(fresh.revision, 7, 'revision 必须沿用上次合法值')
+  for (const field of FILTER_RULE_FIELDS) {
+    assert.strictEqual(fresh.filter[field], expected.filter[field], `字段 ${field} 必须等于「上次合法 override + 代码默认」的合并结果`)
+  }
+  assert.notStrictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti, '绝不能回代码默认（那会悄悄放宽/改变规则）')
+  assert.strictEqual(fresh.applied.status, 'ok', '探针必须写进 applied 快照')
+  assert.strictEqual(fresh.applied.source, 'corrupt', 'applied 快照必须如实记录本轮来源是降级')
+  assert.strictEqual(fresh.applied.lastGoodUsed, true, 'applied.json 必须带 lastGoodUsed=true（控制台口径据此展示）')
+  assert.strictEqual(fresh.applied.filter.pingbibiaoti, expected.filter.pingbibiaoti, 'applied 快照的 filter 必须是本轮真实生效的合并结果')
+})
+
+test('F4-1 验收 2：删除覆盖文件 → LKG 一并失效，畸形文件不得复活旧规则（新进程同样回默认）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 9, filter: { pingbibiaoti: '旧规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '前置：LKG 已写')
+
+  fs.rmSync(paths.file)
+  const defaulted = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(defaulted.source, 'default', '删文件 = 恢复代码默认')
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '删正式覆盖文件必须同步删除 LKG（否则「删文件=恢复默认」不成立）')
+
+  writeRaw(paths.file, '不是 JSON')
+  const fresh = runLkgProbe(dir)
+  assert.strictEqual(fresh.source, 'corrupt')
+  assert.strictEqual(fresh.lastGoodUsed, false, 'LKG 已随删除作废，畸形文件不得把旧规则复活')
+  assert.strictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti)
+  assert.strictEqual(fresh.applied.lastGoodUsed, false, 'applied 快照必须如实记录 lastGoodUsed=false')
+})
+
+test('F4-1 applied.json 不能当 LKG：只有 applied 没有 lastgood 时必须回代码默认', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  // applied 每轮无条件覆盖（连降级轮都写），这里模拟「上一次是 override 轮」留下的快照。
+  writeJson(paths.applied, {
+    schema: 1,
+    revision: 5,
+    source: 'override',
+    hash: 'h',
+    appliedAt: '2026-11-09T00:00:00.000Z',
+    filter: { pingbibiaoti: '从 applied 误用', pingbineirong: '从 applied 误用' },
+    keyword: { zkt_gjc: '' }
+  })
+  writeRaw(paths.file, '{ 坏掉的 JSON')
+  const fresh = runLkgProbe(dir)
+  assert.strictEqual(fresh.source, 'corrupt')
+  assert.strictEqual(fresh.lastGoodUsed, false, '没有 lastgood.json 时不得把 applied.json 当 LKG')
+  assert.strictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti, 'applied 里的规则不得被代入降级轮')
+  assert.strictEqual(fresh.revision, 0, '没有 LKG 时 revision 必须是 0')
+})
+
+test('F4-1 LKG 被改写/损坏（hash 不符、未知字段、非普通文件）一律当没有 LKG', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 4, filter: { pingbibiaoti: '好规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  const original = readJson(paths.lastgood)
+  writeRaw(paths.file, '{ 坏掉的 JSON')
+
+  const cases = [
+    ['hash 不符（内容被改过）', { ...original, hash: 'deadbeef' }],
+    ['override 含未知字段', { ...original, override: { ...original.override, evil: 'x' } }],
+    ['override 值非字符串', { ...original, override: { pingbibiaoti: 42 } }],
+    ['schema 不符', { ...original, schema: 2 }],
+    ['revision 非法', { ...original, revision: -1 }],
+    ['不是对象', [1, 2]]
+  ]
+  for (const [label, payload] of cases) {
+    writeJson(paths.lastgood, payload)
+    const fresh = runLkgProbe(dir)
+    assert.strictEqual(fresh.lastGoodUsed, false, `${label}：不合格的 LKG 必须被拒绝（不得部分采用）`)
+    assert.strictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti, `${label}：必须回代码默认`)
+  }
+})
+
+test('F4-1 LKG 是 FIFO 时降级轮不得挂死（读取同样 O_NONBLOCK）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO LKG 探针：${FIFO_SKIP}`)
+    return
+  }
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeRaw(filterRulesPaths(dir).file, '{ 坏掉的 JSON')
+  require('node:child_process').execFileSync(MKFIFO, [filterRulesPaths(dir).lastgood])
+  const r = runProbeUnderTimeout(`
+const { loadFilterRules } = require('./xbk_filter_store')
+const t0 = Date.now()
+const r = loadFilterRules({ cacheDir: process.env.XBK_FIFO_DIR, defaults: {}, keyword: {} })
+process.stdout.write(JSON.stringify({ source: r.source, lastGoodUsed: r.lastGoodUsed, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO LKG 读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.source, 'corrupt')
+  assert.strictEqual(r.lastGoodUsed, false, 'FIFO 不是普通文件，必须当「没有 LKG」')
+})
+
+test('F4-1 resetStoreStateForTests 同步清掉持久 LKG（测试隔离前提）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 1, filter: { pingbibiaoti: 'x' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true)
+  resetStoreStateForTests()
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '清空 LKG 必须同时删除落盘文件，否则「全新进程」用例会互相污染')
+})
+
+// ===== F4-2：FIFO/非普通文件不得挂死（读取必须 O_NONBLOCK + 普通文件校验）=====
 test('F4-2 参数层：覆盖文件与生效快照的读取必须传 openNonBlocking（裸 O_RDONLY 会挂死）', () => {
   resetStoreStateForTests()
   const dir = makeDir()

@@ -3,8 +3,8 @@
 // ============================================================
 // 过滤规则覆盖文件族的路径构造（唯一职责，不含任何读写逻辑）。
 //
-// 为什么单独成模块：`FilterStore.filterRulesPaths(dir)` 的 5 个固定文件
-// （filter-rules.json / .applied.json / .audit.ndjson / .draft.json / .lock）与按
+// 为什么单独成模块：`FilterStore.filterRulesPaths(dir)` 的 6 个固定文件
+// （filter-rules.json / .applied.json / .lastgood.json / .audit.ndjson / .draft.json / .lock）与按
 // revision 编号的备份文件，都是 `path.join(<运行期目录>, <本文件硬编码文件名>)` 形态。
 // Codacy/Semgrep 的 path-traversal 规则对「非字面量首参 + path.join」一律报
 // `dynamically constructs file or path information`，无法区分这里的目录来自
@@ -38,6 +38,10 @@ function filterRulesPaths (cacheDir) {
   return {
     file: path.join(dir, 'filter-rules.json'),
     applied: path.join(dir, 'filter-rules.applied.json'),
+    // F4-1 持久 LKG：最近一次「成功加载的 override」快照，供**下一个进程**在覆盖文件瞬时
+    // 不可读/损坏时沿用。与 applied 的区别：applied 每轮无条件覆盖（连降级轮都写），
+    // 无法区分「这轮实际生效的是合法覆盖还是降级结果」；lastgood 只在成功加载 override 时写。
+    lastgood: path.join(dir, 'filter-rules.lastgood.json'),
     audit: path.join(dir, 'filter-rules.audit.ndjson'),
     draft: path.join(dir, 'filter-rules.draft.json'),
     lock: path.join(dir, 'filter-rules.lock'),

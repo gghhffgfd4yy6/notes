@@ -1602,7 +1602,10 @@ function createApp ({
           keyword: active.keyword,
           revision: active.revision,
           source: active.source,
-          hash: filterHash
+          hash: filterHash,
+          // F4-1：把「本轮是否沿用了持久 LKG」一起写进快照——控制台 GET 只认这个运行侧事实，
+          // 不得用控制台进程自己的 lastGood 冒充。
+          lastGoodUsed: active.lastGoodUsed
         })) {
           console.warn('⚠️ 过滤规则生效快照写入失败（不影响本轮过滤/推送，下一轮会重试）')
           this._writeRunLog(`${this._localStamp()} WARN 过滤规则生效快照写入失败（不影响本轮过滤/推送）\n`)
