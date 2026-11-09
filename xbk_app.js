@@ -179,19 +179,37 @@ function createApp ({
         opened = true
         const st = fs.fstatSync(fd)
         if (!st || typeof st.isFile !== 'function' || !st.isFile()) {
-          console.warn(`⚠️ 日志周标记不是普通文件，拒绝写入（归档下一轮重试）：${markerPath}`)
+          this._warnWeekMarkerOnce(markerPath, `⚠️ 日志周标记不是普通文件，拒绝写入（归档下一轮重试）：${markerPath}`)
           return false
         }
         fs.writeFileSync(fd, weekKey, { encoding: 'utf8' })
         return true
       } catch (e) {
-        console.warn(`⚠️ 日志周标记写入失败（归档下一轮重试）：${markerPath}：${Utils.safeErrorText(e, '未知错误')}`)
+        this._warnWeekMarkerOnce(markerPath, `⚠️ 日志周标记写入失败（归档下一轮重试）：${markerPath}：${Utils.safeErrorText(e, '未知错误')}`)
         return false
       } finally {
         // R2-1：只关「本函数确实 open 成功的那个 fd」。openSync 抛错时 fd 保持 null；桩的 openSync
         // 恒返同一个号数时，无条件 close 会去关别人（例如同一调用链里的锁 fd）。
         if (opened && fd !== null) { try { fs.closeSync(fd) } catch (e) { /* fd 已失效时忽略 */ } }
       }
+    },
+
+    // R2-2：周标记写失败告警的 60s 限频——与相邻的归档失败告警（_archiveWarnAtByKey）同一口径。
+    // 为什么必须限频：标记写不进去时 readMarker 恒返回空串，于是**每次** _writeRunLog 都会重试
+    // _writeWeekMarker 并再告警；一轮 19 个调用点、控制台 auto-run 每 5 秒一轮 ⇒ 同一条告警刷屏
+    // （FIFO / 只读缓存目录期间）。故障必须可见，但不能变成日志风暴。键 = 标记路径
+    // （run.log.week 与 filter-diagnostics.ndjson.week 各自独立窗口，互不刷新）。
+    _warnWeekMarkerOnce (markerPath, line) {
+      const now = Date.now()
+      const lastWarnAt = this._weekMarkerWarnAtByKey.get(markerPath) || 0
+      if (lastWarnAt && now - lastWarnAt < 60 * 1000) return false
+      // 与归档告警同样的自清理：键只随「日志路径」增长（白名单日志数量有限），超过 64 条时清掉过期项。
+      if (this._weekMarkerWarnAtByKey.size > 64) {
+        for (const [k, at] of this._weekMarkerWarnAtByKey) if (now - at >= 60 * 1000) this._weekMarkerWarnAtByKey.delete(k)
+      }
+      this._weekMarkerWarnAtByKey.set(markerPath, now)
+      console.warn(line)
+      return true
     },
 
     // C1-027/CR-03：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
@@ -543,6 +561,8 @@ function createApp ({
     _logRotateBackoffByPath: new Map(),
     // 归档失败告警的限频状态：键 = 日志路径 + '|' + 周键（每个日志每周各一条 60s 窗口）。
     _archiveWarnAtByKey: new Map(),
+    // R2-2：周标记写失败告警的限频状态：键 = 标记路径（每条白名单日志各一条 60s 窗口）。
+    _weekMarkerWarnAtByKey: new Map(),
     _alertLastAtByPath: new Map(),
     _reportMemoryStateByPath: new Map(),
 

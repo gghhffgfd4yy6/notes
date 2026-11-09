@@ -765,6 +765,68 @@ check('R2-1 能力齐备 ⇒ 周标记用 node:fs 常量非阻塞写当周键并
     `只关「本函数 open 成功的周标记 fd」与锁 fd 各一次，实际：${JSON.stringify(rec.rec.close)}`)
 })
 
+// ----- R2-2：周标记写失败告警必须 60s 限频（与相邻的归档失败告警同口径） -----
+// 标记写不进去时 readMarker 恒返回空串 ⇒ 每次 _writeRunLog 都重试并再告警；一轮 19 个调用点、
+// 控制台 auto-run 每 5 秒一轮，不限频就是同一条文案刷屏。旧实现每次调用一条 WARN。
+function markerFailFs (err) {
+  const rec = makeLogFs({
+    openSync: (p, flag) => {
+      if (String(p).endsWith('.week')) throw err
+      return flag === 'wx' ? 7 : 8
+    }
+  })
+  // 让桩具备「写标记所需的全部能力」，但 open 一定失败：测的是告警限频，不是能力探测。
+  rec.stub.fstatSync = () => ({ isFile: () => true })
+  rec.stub.writeFileSync = () => {}
+  return rec
+}
+
+check('R2-2 周标记连续写失败 ⇒ 60s 内只 1 条告警，窗口到期后再出第 2 条', () => {
+  const rec = markerFailFs(Object.assign(new Error('marker is a fifo'), { code: 'ENXIO' }))
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => {
+    for (let i = 0; i < 5; i++) app._writeRunLog(`l${i}\n`)
+  }))
+  const warns = r.msgs.filter((m) => m.includes('日志周标记写入失败'))
+  assert.strictEqual(warns.length, 1, `连续 5 次写失败只出 1 条告警（旧实现 5 条）：${JSON.stringify(r.msgs)}`)
+  assert.ok(warns[0].includes('run.log.week'), `告警必须点名标记路径：${warns[0]}`)
+  assert.strictEqual(rec.rec.append.length, 5, '标记写失败不得影响日志本体（每行都要落盘）')
+  const r2 = withFixedNow(t0 + 59999, () => withCapture('warn', () => app._writeRunLog('edge\n')))
+  assert.strictEqual(r2.msgs.filter((m) => m.includes('日志周标记写入失败')).length, 0, '窗口内（差 1ms）不得重复告警')
+  const r3 = withFixedNow(t0 + 60000, () => withCapture('warn', () => app._writeRunLog('again\n')))
+  assert.strictEqual(r3.msgs.filter((m) => m.includes('日志周标记写入失败')).length, 1, '60s 窗口到期后必须再告警一次')
+})
+
+check('R2-2 限频按标记路径分键：两条日志同时写失败各告警一次，交替不互相刷新', () => {
+  const rec = markerFailFs(new Error('EACCES'))
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => {
+    for (let i = 0; i < 3; i++) {
+      app._writeRunLog('a\n')
+      app._writeRunLog('b\n', 'filter-diagnostics.ndjson')
+    }
+  }))
+  const warns = r.msgs.filter((m) => m.includes('日志周标记写入失败'))
+  assert.strictEqual(warns.length, 2, `两条日志各自一条窗口（单槽位会被来回覆盖成 6 条）：${JSON.stringify(r.msgs)}`)
+  assert.ok(warns[0].includes('run.log.week'), `第一条必须点名 run.log.week：${warns[0]}`)
+  assert.ok(warns[1].includes('filter-diagnostics.ndjson.week'), `第二条必须点名诊断日志的标记：${warns[1]}`)
+})
+
+check('R2-2 「不是普通文件」分支同样限频：连续 3 次只 1 条告警', () => {
+  const rec = makeLogFs()
+  rec.stub.fstatSync = () => ({ isFile: () => false })
+  rec.stub.writeFileSync = () => { throw new Error('不应写进非普通文件') }
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => {
+    for (let i = 0; i < 3; i++) app._writeRunLog('x\n')
+  }))
+  const warns = r.msgs.filter((m) => m.includes('日志周标记不是普通文件'))
+  assert.strictEqual(warns.length, 1, `同一标记的同一故障只留一条：${JSON.stringify(r.msgs)}`)
+})
+
 // ----- _writeRunLog：ERROR 行只截 errMsg 段 -----
 check('_writeRunLog ERROR 行超 512 ⇒ 仅 errMsg 段截到 512，前缀与尾换行保留', () => {
   const rec = makeLogFs()
