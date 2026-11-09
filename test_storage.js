@@ -1289,6 +1289,39 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(!fs.existsSync(LogArchive.archivePath(dir21, 'run.log', '20261102-20261108') + '.idx.json'),
       '重建失败不得写出索引（半成品索引会让控制台读到坏档）')
     assert.strictEqual(LogArchive.readMarker(log21), '20261102-20261108', '重建失败不得推进 marker')
+
+    // ⑭ F1-11：重建失败必须在冷却期内短路，不能在每次日志写入时重新打开/扫描整份档案。
+    // 旧实现对每个写日志的调用都重跑 rebuildGzIndex（同步解压），持续故障会拖死事件循环。
+    const dir22 = make('logarch-f22')
+    fs.mkdirSync(path.join(dir22, 'logs'), { recursive: true })
+    const log22 = path.join(dir22, 'run.log')
+    fs.writeFileSync(log22, 'F22 明文\n')
+    LogArchive.writeMarker(log22, '20261102-20261108')
+    const gz22 = LogArchive.archivePath(dir22, 'run.log', '20261102-20261108')
+    fs.writeFileSync(gz22, Buffer.alloc(0))
+    const origOpen22 = fs.openSync
+    let gzOpens22 = 0
+    let err22a = null
+    let err22b = null
+    const origWarn22 = console.warn
+    try {
+      fs.openSync = function (p, flags, mode) {
+        if (p === gz22) gzOpens22 += 1
+        return origOpen22.call(fs, p, flags, mode)
+      }
+      console.warn = () => {}
+      try { LogArchive.sealLog(log22, dir22, '20261102-20261108', '20261109-20261115') } catch (e) { err22a = e }
+      const opensAfterFirst = gzOpens22
+      try { LogArchive.sealLog(log22, dir22, '20261102-20261108', '20261109-20261115') } catch (e) { err22b = e }
+      assert.ok(gzOpens22 === opensAfterFirst,
+        `冷却期内不得重新打开/扫描 gz（第一次 ${opensAfterFirst} 次，第二次累计 ${gzOpens22} 次）`)
+    } finally {
+      fs.openSync = origOpen22
+      console.warn = origWarn22
+    }
+    assert.ok(err22a && err22a.code === 'EARCHIVE', '第一次重建失败必须抛 EARCHIVE')
+    assert.ok(err22b && err22b.message.includes('不再重试'), `第二次必须短路并说明冷却：${err22b && err22b.message}`)
+    assert.strictEqual(LogArchive.readMarker(log22), '20261102-20261108', '重建失败不得推进 marker')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

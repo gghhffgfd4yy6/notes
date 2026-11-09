@@ -279,6 +279,20 @@ const MAX_REBUILD_INPUT = 16 * 1024 * 1024
 const MAX_REBUILD_MEMBER = 32 * 1024 * 1024
 const REBUILD_INPUT_STEP = 64 * 1024
 
+// 索引重建失败缓存（Sourcery PRRT_kwDOT8kkjs61McwM）：调用方每个日志行都会重试 sealLog，
+// 若每次都在同步重建 + 解压整份档案，持续失败会反复阻塞事件循环并反复分配内存。
+// 同一 gz 重建失败后 60s 内直接抛缓存错误（与调用方的告警限频同窗口），成功即清除。
+const REBUILD_FAIL_COOLDOWN_MS = 60 * 1000
+const rebuildFailures = new Map()
+
+function rememberRebuildFailure (gzPath, message) {
+  const now = Date.now()
+  if (rebuildFailures.size > 32) {
+    for (const [k, v] of rebuildFailures) if (now - v.at >= REBUILD_FAIL_COOLDOWN_MS) rebuildFailures.delete(k)
+  }
+  rebuildFailures.set(gzPath, { at: now, message })
+}
+
 function inflateMemberBounded (fd, start, end, gzPath, off) {
   const avail = end - start
   if (avail <= 0) throw archiveError(`归档索引缺失且 gz 成员无法解压（偏移 ${off}）：${gzPath}（无数据）`)
@@ -364,12 +378,22 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   if (fs.existsSync(outPath)) { // nosemgrep（outPath=缓存目录/logs + 白名单周键）
     idx = readGzIndex(outPath)
     if (!idx) {
-      idx = rebuildGzIndex(outPath, prevKey, path.basename(logPath))
+      const failed = rebuildFailures.get(outPath)
+      if (failed && Date.now() - failed.at < REBUILD_FAIL_COOLDOWN_MS) throw archiveError(failed.message)
       try {
-        writeAtomic(outPath + '.idx.json', JSON.stringify(idx))
+        idx = rebuildGzIndex(outPath, prevKey, path.basename(logPath))
+        try {
+          writeAtomic(outPath + '.idx.json', JSON.stringify(idx))
+        } catch (e) {
+          throw archiveError(`归档索引重建后写盘失败：${outPath}.idx.json（${e.code || e.message}）`)
+        }
       } catch (e) {
-        throw archiveError(`归档索引重建后写盘失败：${outPath}.idx.json（${e.code || e.message}）`)
+        const detail = e && e.code === 'EARCHIVE' ? e.message : `归档索引缺失且重建失败：${outPath}（${(e && (e.code || e.message)) || e}）`
+        const message = `索引重建失败（${REBUILD_FAIL_COOLDOWN_MS / 1000}s 内不再重试）：${detail}`
+        rememberRebuildFailure(outPath, message)
+        throw archiveError(message)
       }
+      rebuildFailures.delete(outPath)
       fsyncDirBestEffort(dir)
     }
   }
