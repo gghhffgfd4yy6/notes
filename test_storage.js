@@ -1041,12 +1041,16 @@ const LogArchive = require('./scripts/log-archive')
       try { LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr14 = e }
     } finally { fs.renameSync = origRename14 }
     assert.ok(markerErr14 && markerErr14.code === 'EBUSY', '注入必须让 .week 写入失败（复现现场）')
-    // CodeQL js/file-system-race（CWE-367，alert #131）修法：现场长度核验与追加写入必须落在
-    // 同一个 fd 上（open 'r+' → fstatSync(fd) → writeSync(fd) → closeSync）。旧写法先按路径
-    // open/stat 检查、再按路径 appendFileSync 追加，仍是 check-by-path → use-by-path 的 TOCTOU
-    // 配对：换名竞态下两次路径解析可能指向不同文件。断言语义（现场明文长度为 0）逐字保留。
+    // CodeQL js/file-system-race（CWE-367，alert #131/#132）修法：现场长度核验、追加写入与读回
+    // 必须落在同一个 fd 上（open 'r+' → fstatSync/writeSync/readSync → closeSync）。旧写法先按
+    // 路径 open/stat 检查、再按路径 appendFileSync/readFileSync 使用同一路径，仍是 check-by-path
+    // → use-by-path 的 TOCTOU 配对：换名竞态下两次路径解析可能指向不同文件。
+    // fd 可贯穿二次 sealLog：sealLog 的 openLog 用 O_RDWR 打开明文（无 O_TRUNC），截断/搬家走
+    // ftruncateSync(fdIn)/writeSync(fdIn)，renameSync 只替换 .week 与归档文件，明文 inode 不变。
     const fd14 = openF14(log14)
     let size14 = -1
+    let sizeAfter14 = -1
+    let readBack14 = null
     let new14 = null
     try {
       size14 = fs.fstatSync(fd14).size
@@ -1061,21 +1065,32 @@ const LogArchive = require('./scripts/log-archive')
         assert.ok(n > 0, `⑧ 现场追加不得短写（${wrote14}/${new14.length}）`)
         wrote14 += n
       }
+      const warns14 = []
+      const origWarn14 = console.warn
+      let second14 = null
+      try {
+        console.warn = (...a) => { warns14.push(a.map(String).join(' ')) }
+        second14 = LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115')
+      } finally { console.warn = origWarn14 }
+      assert.ok(second14, '恢复必须补完 marker，不得返回 null')
+      assert.strictEqual(LogArchive.readMarker(log14), '20261109-20261115', 'marker 必须推进到新周')
+      assert.ok(warns14.some((w) => w.includes('前缀与归档内容不一致') && w.includes(log14)),
+        `前缀核验失败必须有 WARN（不得静默丢数据）：${JSON.stringify(warns14)}`)
+      // 用同一 fd 读回（不按路径二次解析）：长度与逐字节内容都必须等于 new14。
+      sizeAfter14 = fs.fstatSync(fd14).size
+      readBack14 = Buffer.alloc(sizeAfter14)
+      let got14 = 0
+      while (got14 < readBack14.length) {
+        const n = fs.readSync(fd14, readBack14, got14, readBack14.length - got14, got14)
+        if (n <= 0) break
+        got14 += n
+      }
+      assert.strictEqual(got14, readBack14.length, `⑧ 现场 fd 读回必须完整（${got14}/${readBack14.length}）`)
     } finally {
       fs.closeSync(fd14)
     }
-    const warns14 = []
-    const origWarn14 = console.warn
-    let second14 = null
-    try {
-      console.warn = (...a) => { warns14.push(a.map(String).join(' ')) }
-      second14 = LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115')
-    } finally { console.warn = origWarn14 }
-    assert.ok(second14, '恢复必须补完 marker，不得返回 null')
-    assert.strictEqual(LogArchive.readMarker(log14), '20261109-20261115', 'marker 必须推进到新周')
-    assert.ok(fs.readFileSync(log14).equals(new14), '新周明文一个字节都不能丢（旧实现会丢掉开头 idx.bytes 字节）')
-    assert.ok(warns14.some((w) => w.includes('前缀与归档内容不一致') && w.includes(log14)),
-      `前缀核验失败必须有 WARN（不得静默丢数据）：${JSON.stringify(warns14)}`)
+    assert.strictEqual(sizeAfter14, new14.length, `新周明文长度不得变化（${sizeAfter14} vs ${new14.length}）`)
+    assert.ok(readBack14.equals(new14), '新周明文一个字节都不能丢（旧实现会丢掉开头 idx.bytes 字节）')
     const pg14 = LogArchive.readGzPage(first14.path, 1, 100)
     assert.strictEqual(pg14.lines[0], 'F14 上周第0行 ' + 'a'.repeat(12), '旧归档必须保持可读')
     assert.strictEqual(pg14.total, 40, '旧归档行数不变')
