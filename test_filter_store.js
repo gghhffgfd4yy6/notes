@@ -23,6 +23,7 @@ const {
   mergeActiveFilter,
   loadFilterRules,
   writeAppliedSnapshot,
+  appliedLastGoodUsed,
   readAppliedSnapshot,
   resetStoreStateForTests
 } = require('./xbk_filter_store')
@@ -969,6 +970,56 @@ function makeFifoDir (name) {
   require('node:child_process').execFileSync(MKFIFO, [file])
   return { dir, file }
 }
+
+// ===== 控制台口径对齐：lastGoodUsed 只认运行侧 applied.json =====
+test('applied 快照 lastGoodUsed：写入布尔化、读回保持（旧快照缺省按 false 兼容）', () => {
+  const dir = makeDir()
+  assert.strictEqual(writeAppliedSnapshot({
+    cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'corrupt', hash: 'h', lastGoodUsed: true
+  }), true)
+  const read = readAppliedSnapshot(dir)
+  assert.strictEqual(read.status, 'ok')
+  assert.strictEqual(read.snapshot.lastGoodUsed, true, '降级轮必须把 lastGoodUsed=true 落进快照')
+  assert.strictEqual(appliedLastGoodUsed(read.snapshot), true)
+
+  // 不传 lastGoodUsed 的调用方（旧代码/其他入口）落盘为 false，不得写成 undefined
+  assert.strictEqual(writeAppliedSnapshot({ cacheDir: dir, filter: {}, keyword: {}, revision: 1, source: 'override', hash: 'h' }), true)
+  const second = readAppliedSnapshot(dir)
+  assert.strictEqual(second.snapshot.lastGoodUsed, false)
+  assert.deepStrictEqual(readJson(filterRulesPaths(dir).applied), second.snapshot, '落盘内容与读回一致')
+
+  // 旧快照（v3.405 及以前没有该字段）必须照旧 ok、按 false 处理
+  const paths = filterRulesPaths(dir)
+  writeRaw(paths.applied, JSON.stringify({
+    schema: 1, revision: 3, source: 'corrupt', hash: 'h', appliedAt: '2026-11-09T00:00:00.000Z', filter: {}, keyword: {}
+  }))
+  const legacy = readAppliedSnapshot(dir)
+  assert.strictEqual(legacy.status, 'ok', '缺少 lastGoodUsed 的旧快照不得被判损坏')
+  assert.strictEqual(appliedLastGoodUsed(legacy.snapshot), false, '旧快照无该字段 ⇒ 不得声称沿用了 LKG')
+})
+
+test('appliedLastGoodUsed 口径：只有 source=corrupt 且 lastGoodUsed=true 才算沿用 LKG', () => {
+  assert.strictEqual(appliedLastGoodUsed({ source: 'corrupt', lastGoodUsed: true }), true)
+  assert.strictEqual(appliedLastGoodUsed({ source: 'corrupt', lastGoodUsed: false }), false)
+  assert.strictEqual(appliedLastGoodUsed({ source: 'override', lastGoodUsed: true }), false,
+    'override 轮的 lastGoodUsed 无意义（规则已正常加载），不得据此显示「沿用上次」')
+  assert.strictEqual(appliedLastGoodUsed({ source: 'default', lastGoodUsed: true }), false)
+  assert.strictEqual(appliedLastGoodUsed({ source: 'corrupt' }), false, '缺字段按 false')
+  assert.strictEqual(appliedLastGoodUsed(null), false, '没有快照（missing/不可读）按 false')
+  assert.strictEqual(appliedLastGoodUsed([1]), false, '数组不是快照')
+})
+
+test('控制台口径：GET /api/config/filter 的 lastGoodUsed 取自 applied，不用控制台进程自己的 LKG', () => {
+  // 本 item 只允许跑 test_filter_store/test_filter 两个定向套件（console 套件不在其中），
+  // 故这处接线用源码断言锁定：回退成 loaded.lastGoodUsed（控制台进程读文件时的 LKG）即变红。
+  const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+  const line = src.split('\n').find(l => l.includes('lastGoodUsed:'))
+  assert.ok(line, 'GET /api/config/filter 的 payload 必须带 lastGoodUsed 字段（控制台要能展示运行侧降级状态）')
+  assert.ok(line.includes('FilterStore.appliedLastGoodUsed(applied)'),
+    `lastGoodUsed 必须由 applied 快照推导（运行侧口径）：${line.trim()}`)
+  assert.ok(!line.includes('loaded.lastGoodUsed'),
+    `不得用控制台进程自己读文件的 lastGoodUsed 冒充运行侧：${line.trim()}`)
+})
 
 // ===== F4-3：瞬时读失败（replaced/ioError）重读一次，不折叠成永久降级 =====
 // 用替换 storage.readSafeTextResult 的方式注入——真实竞态（另一进程在 fstat 后 rename）不可

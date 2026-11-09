@@ -820,6 +820,18 @@ function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, ha
 }
 
 /**
+ * 运行侧口径的 lastGoodUsed：只认**本轮生效快照**（applied.json）。
+ * 控制台进程读文件时自己也会产出 LKG（同一份 filter-rules.lastgood.json），但那是「下一次降级
+ * 可以用什么」，与「上一轮运行实际用了什么」是两件事——GET 不得拿它冒充运行侧状态。
+ * 判据与运行侧写入口径一致：只有 source==='corrupt' 且 lastGoodUsed===true 才算「本轮沿用了 LKG」。
+ * @returns {boolean}
+ */
+function appliedLastGoodUsed (snapshot) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false
+  return snapshot.source === 'corrupt' && snapshot.lastGoodUsed === true
+}
+
+/**
  * 读回生效快照。状态机：missing / invalid / ioError / ok（不抛错）。
  * @returns {{status:'ok',snapshot:Object}|{status:'missing'}|{status:'invalid',error:Object}|{status:'ioError',error:Object}}
  */
@@ -909,6 +921,7 @@ module.exports = {
   mergeActiveFilter,
   loadFilterRules,
   writeAppliedSnapshot,
+  appliedLastGoodUsed,
   readAppliedSnapshot,
   resetStoreStateForTests
 }

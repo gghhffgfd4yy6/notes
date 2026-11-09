@@ -4848,6 +4848,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       },
       wideMatch: wideMatchFields(loaded.filter),
       applied,
+      // 口径对齐（I2/F4-1）：lastGoodUsed 只认运行侧本轮写进 applied.json 的记录。控制台进程读文件
+      // 时自己也会刷新 LKG（那描述的是「下次降级能用什么」），拿它冒充运行侧状态会给出假绿。
+      lastGoodUsed: FilterStore.appliedLastGoodUsed(applied),
       auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt }
     }
     if (corrupt) {
