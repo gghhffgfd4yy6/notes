@@ -9,6 +9,7 @@
 const assert = require('assert')
 const path = require('path')
 const crypto = require('crypto')
+const os = require('os')
 
 // v3.403：日志上限在生产是 100MiB；本套件用桩 fs 造夹具，按 20MiB 注入即可覆盖同一套截尾逻辑
 process.env.XBK_LOG_LIMIT_BYTES = String(20 * 1024 * 1024)
@@ -929,7 +930,10 @@ check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、�
   // 8b3bd07 的错误语义在桩下全绿。这里用真实临时文件走一遍完整路径。
   const rfs = require('fs')
   const { writeAtomic } = require('./xbk_storage.js')
-  const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trim-real-'))
+  // 父目录用 os.tmpdir()（SonarCloud javascript:S5443：不能用 process.env.TMPDIR 之类可被外部改写的
+  // 「公开可写目录」拼临时路径）。mkdtempSync 再在平台临时目录下建不可预测的独占子目录，夹具名用
+  // `xbkunit-` 前缀（不落进 check-host-clean 的 `xbk-*` 过期沙箱命名空间，见文件内 C5-025 说明）。
+  const dir = rfs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-trim-real-'))
   const logPath = path.join(dir, 'run.log')
   const WIDTH = 1024
   const line = 'x'.repeat(WIDTH - 1) + '\n'
@@ -2064,7 +2068,6 @@ function makeMemFs () {
 }
 
 // 构造带内存 fs 的 app：MessageStore 提供 cacheDir 与 _getTombstoneProcessStart/_isTombstoneLockProcessAlive 桩
-const os = require('os')
 
 checkAsync('RE2 警告: RE2C 可用时 _warnMissingRe2 早退只清理残留标记、不发警告', async () => {
   const mfs = makeMemFs()
