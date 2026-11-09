@@ -23,6 +23,9 @@
 //     搬家前先逐成员核验明文 [0, idx.bytes) 与归档逐字节一致：不一致时，只有 `<log>.seal.json`
 //     事务记录（上次确实已完成截断）能证明明文是新周内容；没有该记录就抛错保留 archivePending，
 //     绝不推进 marker（否则 100MB 截尾会覆盖仅存的明文副本）。
+//   - 事务记录带相位（v3.405 R6）：moving = 已经/即将动明文（搬运可能只做了一半）、truncating =
+//     搬运完成但截断未确认、truncated = 截断已完成。只有 truncated 能证明「明文全是新周内容」，
+//     moving 留在盘上必须走恢复/报错路径，绝不推进 marker。
 
 const fs = require('fs')
 const path = require('path')
@@ -107,19 +110,23 @@ function writeAllAtSync (fd, buf, len, pos) {
   }
 }
 
-// 把明文 [from, EOF) 搬到文件开头并截断，作为「已归档前缀 + 并发追加段」的压缩动作。
+// 把明文 [from, EOF) 搬到 to（正常路径 to=0；恢复路径 to=「搬完待截断」记录的位置）并截断，
+// 作为「已归档前缀 + 并发追加段」的压缩动作。
 // fail-open 写者（拿不到锁的进程）可能在 fstat 快照之后继续 append：只按快照长度搬一次再
 // ftruncate 会把快照之后的追加整段删掉（写者以为写成功，日志里却没有这一行）。这里的做法是
 // 「搬完再 fstat」：只要 EOF 比已搬到的位置更远，就继续搬新增段；只有确认已搬位置 == 当前 EOF
 // 才允许截断。极端情况下写者持续追加（轮次上限）就抛错、把截断推迟到下一轮——宁可这轮不清空，
 // 也不能吞掉别人已经写成功的行。
+// beforeTruncate(dst) 在确认「已搬到 EOF」之后、ftruncate 之前调用（把事务记录升级为 truncating）；
+// 它本身要落盘（fsync + rename），期间仍可能有追加，所以调用之后必须重新核验 EOF 才能截断。
+// afterTruncate(dst) 在 ftruncate 成功之后调用（把事务记录升级为 truncated）。
 const MOVE_CHUNK_BYTES = 256 * 1024
 const MOVE_MAX_ROUNDS = 16
 
-function moveTailToHeadAndTruncate (fdIn, from, logPath) {
+function moveRangeAndTruncate (fdIn, from, to, logPath, beforeTruncate, afterTruncate) {
   const buf = Buffer.alloc(MOVE_CHUNK_BYTES)
   let src = from
-  let dst = 0
+  let dst = to
   for (let round = 0; ; round++) {
     const size = fs.fstatSync(fdIn).size
     while (src < size) {
@@ -130,12 +137,19 @@ function moveTailToHeadAndTruncate (fdIn, from, logPath) {
       src += n
       dst += n
     }
-    if (fs.fstatSync(fdIn).size <= src) break
+    if (fs.fstatSync(fdIn).size <= src) {
+      if (beforeTruncate) beforeTruncate(dst)
+      // 写 journal 期间可能又有 fail-open 追加：核验过再决定截断。
+      if (fs.fstatSync(fdIn).size <= src) {
+        fs.ftruncateSync(fdIn, dst)
+        if (afterTruncate) afterTruncate(dst)
+        return dst
+      }
+    }
     if (round >= MOVE_MAX_ROUNDS) {
       throw archiveError(`归档搬运期间明文持续追加，推迟到下一轮再截断：${logPath}`)
     }
   }
-  fs.ftruncateSync(fdIn, dst)
 }
 
 function writeAtomic (filePath, data) {
@@ -185,15 +199,28 @@ function warnArchive (kind, logPath, msg) {
   return true
 }
 
-// 封档事务日志：记录「gz+idx 已发布、正在/已经截断明文」这一步。
+// 封档事务日志：记录「搬运/截断明文」这一步走到哪里了。
 // 为什么需要它（Sourcery PRRT_kwDOT8kkjs61McwB）：截断成功但 .week 写失败时，明文里可能
 // 已经追加了新周内容；下次 sealLog 看到「前缀与归档不一致」必须能区分两种现场——
-//   (a) 上次截断已完成（有 journal）⇒ 明文全是新周内容，保留并推进 marker；
-//   (b) 归档损坏/明文被替换（无 journal）⇒ 无法证明归档就是这份明文的副本，绝不能推进 marker
-//       （否则调用方清掉 archivePending，100MB 截尾会把仅存的明文副本丢掉）。
-// journal 在动明文之前写入、marker 成功之后删除；写到一半崩溃时它仍在，下一次 sealLog 先补齐
-// marker（截断已完成）或重新执行截断（截断未完成，前缀仍与归档一致），两种现场都不会丢数据。
-const SEAL_JOURNAL_VERSION = 1
+//   (a) 上次截断已完成（journal phase=truncated）⇒ 明文全是新周内容，保留并推进 marker；
+//   (b) 归档损坏/明文被替换（无 journal 或 journal 与本次事务不匹配）⇒ 无法证明归档就是
+//       这份明文的副本，绝不能推进 marker（否则调用方清掉 archivePending，100MB 截尾会把
+//       仅存的明文副本丢掉）。
+// 为什么还要相位（v3.405 R6）：旧实现「动明文之前就写 journal、成功后删」，journal 本身无法
+// 区分「已截断完成」与「搬到一半」——搬运中途 pwrite 失败（EIO/ENOSPC，或持续追加超
+// MOVE_MAX_ROUNDS）会留下「头部已被追加段覆盖、但没截断」的明文，journal 却已经在了；
+// 下一次 sealLog 只核 prevKey/nextKey/bytes 就 WARN「上次截断已完成」并推进 marker。
+// 现在 journal 的相位就是状态机：
+//   moving     = 已经/即将动明文（搬运可能只做了一半），不能作为任何凭证；
+//   truncating = 搬运完成（[0,size) 已是全部新周内容）、截断未确认，size = 待截断长度；
+//   truncated  = 截断已完成，size = 截断后的明文长度——唯一允许推进 marker 的相位。
+// journal 在动明文之前写入、marker 成功之后删除。moving 留在盘上只会走「重做搬运（前缀仍
+// 与归档一致）或报错」两条路，绝不静默推进 marker。
+const SEAL_JOURNAL_VERSION = 2
+const SEAL_PHASE_MOVING = 'moving'
+const SEAL_PHASE_TRUNCATING = 'truncating'
+const SEAL_PHASE_TRUNCATED = 'truncated'
+const SEAL_PHASES = [SEAL_PHASE_MOVING, SEAL_PHASE_TRUNCATING, SEAL_PHASE_TRUNCATED]
 
 function sealJournalPath (logPath) {
   return logPath + '.seal.json'
@@ -209,21 +236,27 @@ function readSealJournal (logPath) {
     if (typeof j.nextKey !== 'string' || !/^\d{8}-\d{8}$/.test(j.nextKey)) return null
     if (!Number.isSafeInteger(j.bytes) || j.bytes < 0) return null
     if (j.source !== path.basename(logPath)) return null
+    if (!SEAL_PHASES.includes(j.phase)) return null
+    // truncating/truncated 必须带「截断后长度」，否则无法判断现场是否已经截断过。
+    if (j.phase !== SEAL_PHASE_MOVING && (!Number.isSafeInteger(j.size) || j.size < 0)) return null
     return j
   } catch (e) {
     return null
   } finally { if (o) { try { fs.closeSync(o.fd) } catch (e) {} } }
 }
 
-function writeSealJournal (logPath, prevKey, nextKey, idx) {
-  writeAtomic(sealJournalPath(logPath), JSON.stringify({
+function writeSealJournal (logPath, prevKey, nextKey, idx, phase, size) {
+  const j = {
     v: SEAL_JOURNAL_VERSION,
     source: path.basename(logPath),
     prevKey,
     nextKey,
     bytes: idx.bytes,
-    lines: idx.lines
-  }))
+    lines: idx.lines,
+    phase
+  }
+  if (Number.isSafeInteger(size)) j.size = size
+  writeAtomic(sealJournalPath(logPath), JSON.stringify(j))
   fsyncDirBestEffort(path.dirname(logPath))
 }
 
@@ -387,6 +420,24 @@ function rebuildGzIndex (gzPath, prevKey, fileName) {
   } finally { try { fs.closeSync(fd) } catch (e) {} }
 }
 
+// 「搬运完成、截断未确认」现场（journal phase=truncating）的恢复。
+// 判据只用长度：搬运完成、截断未做时文件至少有 idx.bytes 字节的旧周明文（[size, size+idx.bytes)
+// 是搬家前留下的内容），长度必然 > size；截断已落地时长度恰好是 size（之后再追加的 fail-open
+// 写者会让它 > size，那种现场无法区分「已截断 + 新追加」与「截断未做 + 旧周残留」，只能报错
+// 保留原样）。所以：cur == size ⇒ 截断确实已完成，只把 journal 升级为 truncated 再补 marker；
+// 其余长度一律抛错，绝不按 idx.bytes 再搬一次或直接推进 marker。
+function finishPendingTruncate (fdIn, idx, journal, logPath, prevKey, nextKey) {
+  const size = journal.size
+  const cur = fs.fstatSync(fdIn).size
+  if (cur !== size) {
+    throw archiveError(cur < size
+      ? `明文（${cur} 字节）比「搬运完成、待截断」事务记录的长度（${size} 字节）还短，保留明文与旧标记：${logPath}`
+      : `明文（${cur} 字节）比「搬运完成、待截断」事务记录的长度（${size} 字节）长，无法区分「截断已完成 + 新追加」与「截断未做 + 旧周残留」，保留明文与旧标记：${logPath}`)
+  }
+  warnArchive('mismatch', logPath, `⚠️ 日志归档：上次搬运已完成、截断已确认（明文长度与事务记录一致），只补标记：${logPath}`)
+  writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_TRUNCATED, size)
+}
+
 // 切档：把上一周（prevKey）的明文压成「多成员 gz + idx」，截断明文，最后写新周标记（nextKey）。
 // 调用方必须已持有该日志的写锁；崩溃/失败时不推进标记（数据留在明文里，下一轮重试）。
 function sealLog (logPath, cacheDir, prevKey, nextKey) {
@@ -441,8 +492,8 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
     }
     // 明文已空（上次截断成功但标记没写成功）：只剩补标记这一步。先落 journal 再写 marker：
     // 若 marker 再次失败，下一次 sealLog 能凭它确认「截断已完成」，新追加的内容不会被误判成
-    // 「归档与明文对不上」而永久卡住封档。
-    writeSealJournal(logPath, prevKey, nextKey, idx)
+    // 「归档与明文对不上」而永久卡住封档。截断后的明文长度就是 0，相位直接记 truncated。
+    writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_TRUNCATED, 0)
     writeAtomic(weekMarkerPath(logPath), nextKey)
     clearSealJournal(logPath)
     return { path: outPath, lines: idx.lines, bytes: idx.bytes }
@@ -520,27 +571,41 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   // 新内容开头 idx.bytes 字节（还留下半行）。搬家前必须核验前缀；核验不过时只有 journal
   // （上次确实已完成截断）能证明明文是新周内容，否则归档与明文对不上、明文可能是仅存副本，
   // 必须抛错保留 archivePending，绝不能推进 marker 把明文交给 100MB 截尾。
+  // R6：journal 的相位决定「核验不过」时走哪条路——moving（搬运可能只做了一半）绝不当凭证，
+  // truncating 先补完截断，只有 truncated 才允许保留明文并补 marker。
   try {
     const st = fs.fstatSync(fdIn)
     const prefixIsArchive = writable && st.size >= idx.bytes && plaintextPrefixIsArchive(fdIn, outPath, idx)
     if (prefixIsArchive) {
-      // 动明文之前先落事务记录：截断成功而 marker 写失败时，下一次 sealLog 靠它区分
-      // 「明文是新周内容」与「归档/明文对不上」。journal 写失败就不动明文（抛错，下一轮重试）。
-      writeSealJournal(logPath, prevKey, nextKey, idx)
+      // 动明文之前先落「搬运中」事务记录：它只表示「明文可能已被覆盖」，不能证明截断完成。
+      // 搬运/截断各自成功后再依次升级为 truncating / truncated；journal 写失败就不动明文
+      // （抛错，下一轮重试——此时前缀仍与归档一致，重做搬运是幂等的）。
+      writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_MOVING)
       // F1-7：搬运/截断期间仍可能有 fail-open 写者追加（它拿不到写锁）。按快照长度只搬一次再
       // ftruncate 会把快照之后的追加整段删掉——写者返回成功、日志里却没有这一行。helper 会
       // 「搬完再 fstat」，把新增段接着搬，确认已搬位置就是当前 EOF 才截断。
-      moveTailToHeadAndTruncate(fdIn, idx.bytes, logPath)
+      moveRangeAndTruncate(fdIn, idx.bytes, 0, logPath,
+        (dst) => writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_TRUNCATING, dst),
+        (dst) => writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_TRUNCATED, dst))
     } else if (writable && st.size >= idx.bytes) {
-      if (journalMatches) {
-        // 上次已截断（journal 为证），这期间追加的全部是新周内容：不截、不搬，只补 marker。
+      if (journalMatches && journal.phase === SEAL_PHASE_TRUNCATED) {
+        // 上次已截断（truncated 为证），这期间追加的全部是新周内容：不截、不搬，只补 marker。
         warnArchive('mismatch', logPath, `⚠️ 日志归档：明文前缀与归档内容不一致（上次截断已完成），保留全部明文、只推进标记：${logPath}`)
+      } else if (journalMatches && journal.phase === SEAL_PHASE_TRUNCATING) {
+        // 搬运完成、截断未确认：补完截断（或确认已经截断）再补 marker。
+        finishPendingTruncate(fdIn, idx, journal, logPath, prevKey, nextKey)
       } else {
-        throw archiveError(`明文前缀与归档内容不一致，且没有可证明「上次截断已完成」的事务记录，保留明文与旧标记：${logPath}`)
+        throw archiveError(journalMatches
+          ? `上次搬运在「已动明文、尚未截断」的中途失败（事务记录 phase=${journal.phase}），明文可能已被部分覆盖；保留明文与旧标记、不推进 marker：${logPath}`
+          : `明文前缀与归档内容不一致，且没有可证明「上次截断已完成」的事务记录，保留明文与旧标记：${logPath}`)
       }
     } else if (writable) {
       // 明文比归档短：可能上次截断成功但标记没写成功。不做截断（避免删掉未归档的新内容），只补标记。
       warnArchive('short', logPath, `⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
+    } else if (journalMatches && journal.phase !== SEAL_PHASE_TRUNCATED) {
+      // 只读打开（rw 失败）本应只告警跳过，但事务记录说上次搬运/截断没走完：此时推进 marker
+      // 会把半搬移的明文交给 100MB 截尾，宁可报错等人工处理。
+      throw archiveError(`明文不可写且上次搬运未完成（事务记录 phase=${journal.phase}），保留明文与旧标记：${logPath}`)
     } else {
       // 只读打开（rw 失败）无法截断，但数据已在 gz 里；留下告警而不是静默跳过。
       warnArchive('readonly', logPath, `⚠️ 日志归档：明文不可写，跳过截断（数据已归档）：${logPath}`)

@@ -1438,6 +1438,127 @@ const LogArchive = require('./scripts/log-archive')
     const truncWarns24 = warns24.filter((w) => w.includes('截断明文失败') && w.includes(log24))
     assert.strictEqual(truncWarns24.length, 1,
       `同一路径 60s 内连续失败只应告警一次（旧实现每条重试都刷）：${JSON.stringify(truncWarns24)}`)
+
+    // ⑰ R6-2：事务记录必须区分「搬到一半」与「已截断完成」。搬运中途 pwrite 失败（EIO/ENOSPC，
+    // 或持续追加超 MOVE_MAX_ROUNDS）会留下「头部已被追加段覆盖、但没截断」的明文。旧实现动
+    // 明文之前就写 journal、成功后删，相位不明：下一次 sealLog 只核 prevKey/nextKey/bytes 就
+    // WARN「上次截断已完成」并推进 marker，把半搬移的明文当成新周内容（随后 100MB 截尾会把它
+    // 当普通明文裁掉）。修复后 journal 带相位，moving 绝不能作为凭证。
+    const dir27 = make('logarch-f27')
+    fs.mkdirSync(dir27, { recursive: true })
+    const log27 = path.join(dir27, 'run.log')
+    const old27 = Buffer.from(Array.from({ length: 40 }, (_, i) => 'F27 上周第' + i + '行 ' + 'a'.repeat(20)).join('\n') + '\n')
+    fs.writeFileSync(log27, old27)
+    LogArchive.writeMarker(log27, '20261102-20261108')
+    LogArchive.sealLog(log27, dir27, '20261102-20261108', '20261109-20261115')
+    // 复现「gz+idx 已发布、明文未截断」现场，再追加 >1MiB 新周内容（搬运会分多块）
+    fs.writeFileSync(log27, old27)
+    LogArchive.writeMarker(log27, '20261102-20261108')
+    const new27 = Buffer.from(Array.from({ length: 20000 }, (_, i) => 'F27 新周第' + i + '行 ' + 'b'.repeat(30)).join('\n') + '\n')
+    fs.appendFileSync(log27, new27)
+    const before27 = fs.readFileSync(log27)
+    const origWrite27 = fs.writeSync
+    let pwrite27 = 0
+    let err27a = null
+    const origWarn27 = console.warn
+    try {
+      fs.writeSync = function (fd, buf, off, len, pos) {
+        if (arguments.length >= 5 && typeof pos === 'number') {
+          pwrite27 += 1
+          if (pwrite27 === 2) throw Object.assign(new Error('EIO: 注入搬运中断'), { code: 'EIO' })
+        }
+        return origWrite27.apply(fs, arguments)
+      }
+      console.warn = () => {}
+      try { LogArchive.sealLog(log27, dir27, '20261102-20261108', '20261109-20261115') } catch (e) { err27a = e }
+    } finally {
+      fs.writeSync = origWrite27
+      console.warn = origWarn27
+    }
+    assert.ok(err27a && err27a.code === 'EARCHTRUNC', `搬运中断必须抛 EARCHTRUNC（实际 ${err27a && err27a.code}）`)
+    assert.ok(pwrite27 >= 2, `夹具必须真的在搬运第 2 块失败（pwrite 次数 ${pwrite27}）`)
+    const journal27 = JSON.parse(fs.readFileSync(log27 + '.seal.json', 'utf8'))
+    assert.strictEqual(journal27.phase, 'moving', `搬运中断后事务记录必须停在 moving 相位（实际 ${journal27.phase}）`)
+    assert.strictEqual(LogArchive.readMarker(log27), '20261102-20261108', '搬运中断绝不得推进 marker')
+    const mid27 = fs.readFileSync(log27)
+    assert.strictEqual(mid27.length, before27.length, '搬运中断不得截断明文')
+    assert.ok(!mid27.equals(before27), '夹具必须真的造成「头部被追加段覆盖」的半搬移现场')
+    // 第二次（无注入）：phase=moving 不能证明截断完成，必须抛 EARCHIVE、明文/标记/事务记录原样。
+    let err27b = null
+    const origWarn27b = console.warn
+    try {
+      console.warn = () => {}
+      try { LogArchive.sealLog(log27, dir27, '20261102-20261108', '20261109-20261115') } catch (e) { err27b = e }
+    } finally { console.warn = origWarn27b }
+    assert.ok(err27b && err27b.code === 'EARCHIVE', `半搬移现场必须抛 EARCHIVE（实际 ${err27b && err27b.code}）`)
+    assert.ok(err27b.message.includes('moving') && err27b.message.includes('部分覆盖'),
+      `错误必须点明「搬运中途失败、明文可能被部分覆盖」：${err27b.message}`)
+    assert.strictEqual(LogArchive.readMarker(log27), '20261102-20261108', '半搬移现场绝不能推进 marker')
+    assert.ok(fs.readFileSync(log27).equals(mid27), '半搬移现场必须保留明文原样（人工核查的唯一副本）')
+    assert.ok(fs.existsSync(log27 + '.seal.json'), '报错路径不得清掉事务记录（否则下一次更分不清现场）')
+
+    // ⑰b phase=truncating 的恢复：搬运与截断都已完成，只是「升级为 truncated」的事务记录没写成
+    // （崩在 ftruncate 之后、journal 写盘之前）。现场：明文长度恰好等于待截断长度。旧实现只认
+    // 「有 journal = 已截断」，修复后必须能凭长度确认截断已完成，再补 marker。
+    const dir28 = make('logarch-f28')
+    fs.mkdirSync(dir28, { recursive: true })
+    const log28 = path.join(dir28, 'run.log')
+    const old28 = Buffer.from(Array.from({ length: 40 }, (_, i) => 'F28 上周第' + i + '行 ' + 'c'.repeat(20)).join('\n') + '\n')
+    fs.writeFileSync(log28, old28)
+    LogArchive.writeMarker(log28, '20261102-20261108')
+    const first28 = LogArchive.sealLog(log28, dir28, '20261102-20261108', '20261109-20261115')
+    const idx28 = JSON.parse(fs.readFileSync(first28.path + '.idx.json', 'utf8'))
+    const tail28 = Buffer.from(Array.from({ length: 60 }, (_, i) => 'F28 新周第' + i + '行 ' + 'g'.repeat(30)).join('\n') + '\n')
+    assert.ok(tail28.length > old28.length, `夹具：新周明文必须长于归档，才走「前缀核验不通过」分支（${tail28.length} vs ${old28.length}）`)
+    fs.writeFileSync(log28, tail28)
+    LogArchive.writeMarker(log28, '20261102-20261108')
+    fs.writeFileSync(log28 + '.seal.json', JSON.stringify({
+      v: 2,
+      source: 'run.log',
+      prevKey: '20261102-20261108',
+      nextKey: '20261109-20261115',
+      bytes: idx28.bytes,
+      lines: idx28.lines,
+      phase: 'truncating',
+      size: tail28.length
+    }))
+    const second28 = LogArchive.sealLog(log28, dir28, '20261102-20261108', '20261109-20261115')
+    assert.ok(second28, 'truncating 现场必须能补完 marker，不得返回 null')
+    assert.ok(fs.readFileSync(log28).equals(tail28), 'truncating 恢复不得改写明文（截断已完成）')
+    assert.strictEqual(LogArchive.readMarker(log28), '20261109-20261115', '截断已确认后 marker 必须推进')
+    assert.ok(!fs.existsSync(log28 + '.seal.json'), '补完 marker 后事务记录必须清理')
+
+    // ⑰c truncating 但明文比待截断长度长：无法区分「截断已完成 + 新追加」与「截断未做 + 旧周
+    // 残留」，必须报错保留原样，绝不能凭 phase 就推进 marker（那会把旧周残留当成新周内容）。
+    const dir31 = make('logarch-f31')
+    fs.mkdirSync(dir31, { recursive: true })
+    const log31 = path.join(dir31, 'run.log')
+    fs.writeFileSync(log31, old28)
+    LogArchive.writeMarker(log31, '20261102-20261108')
+    const first31 = LogArchive.sealLog(log31, dir31, '20261102-20261108', '20261109-20261115')
+    const idx31 = JSON.parse(fs.readFileSync(first31.path + '.idx.json', 'utf8'))
+    const ambiguous31 = Buffer.concat([tail28, old28])
+    fs.writeFileSync(log31, ambiguous31)
+    LogArchive.writeMarker(log31, '20261102-20261108')
+    fs.writeFileSync(log31 + '.seal.json', JSON.stringify({
+      v: 2,
+      source: 'run.log',
+      prevKey: '20261102-20261108',
+      nextKey: '20261109-20261115',
+      bytes: idx31.bytes,
+      lines: idx31.lines,
+      phase: 'truncating',
+      size: tail28.length
+    }))
+    let err31 = null
+    const origWarn31 = console.warn
+    try {
+      console.warn = () => {}
+      try { LogArchive.sealLog(log31, dir31, '20261102-20261108', '20261109-20261115') } catch (e) { err31 = e }
+    } finally { console.warn = origWarn31 }
+    assert.ok(err31 && err31.code === 'EARCHIVE', `无法判定的 truncating 现场必须抛 EARCHIVE（实际 ${err31 && err31.code}）`)
+    assert.strictEqual(LogArchive.readMarker(log31), '20261102-20261108', '无法判定时绝不能推进 marker')
+    assert.ok(fs.readFileSync(log31).equals(ambiguous31), '无法判定时必须保留明文原样')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
