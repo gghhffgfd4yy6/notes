@@ -110,8 +110,7 @@ function writeAllAtSync (fd, buf, len, pos) {
   }
 }
 
-// 把明文 [from, EOF) 搬到 to（正常路径 to=0；恢复路径 to=「搬完待截断」记录的位置）并截断，
-// 作为「已归档前缀 + 并发追加段」的压缩动作。
+// 把明文 [from, EOF) 搬到文件开头并截断，作为「已归档前缀 + 并发追加段」的压缩动作。
 // fail-open 写者（拿不到锁的进程）可能在 fstat 快照之后继续 append：只按快照长度搬一次再
 // ftruncate 会把快照之后的追加整段删掉（写者以为写成功，日志里却没有这一行）。这里的做法是
 // 「搬完再 fstat」：只要 EOF 比已搬到的位置更远，就继续搬新增段；只有确认已搬位置 == 当前 EOF
@@ -123,10 +122,10 @@ function writeAllAtSync (fd, buf, len, pos) {
 const MOVE_CHUNK_BYTES = 256 * 1024
 const MOVE_MAX_ROUNDS = 16
 
-function moveRangeAndTruncate (fdIn, from, to, logPath, beforeTruncate, afterTruncate) {
+function moveRangeAndTruncate (fdIn, from, logPath, beforeTruncate, afterTruncate) {
   const buf = Buffer.alloc(MOVE_CHUNK_BYTES)
   let src = from
-  let dst = to
+  let dst = 0
   for (let round = 0; ; round++) {
     const size = fs.fstatSync(fdIn).size
     while (src < size) {
@@ -584,7 +583,7 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
       // F1-7：搬运/截断期间仍可能有 fail-open 写者追加（它拿不到写锁）。按快照长度只搬一次再
       // ftruncate 会把快照之后的追加整段删掉——写者返回成功、日志里却没有这一行。helper 会
       // 「搬完再 fstat」，把新增段接着搬，确认已搬位置就是当前 EOF 才截断。
-      moveRangeAndTruncate(fdIn, idx.bytes, 0, logPath,
+      moveRangeAndTruncate(fdIn, idx.bytes, logPath,
         (dst) => writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_TRUNCATING, dst),
         (dst) => writeSealJournal(logPath, prevKey, nextKey, idx, SEAL_PHASE_TRUNCATED, dst))
     } else if (writable && st.size >= idx.bytes) {
