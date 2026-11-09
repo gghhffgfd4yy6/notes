@@ -343,8 +343,13 @@ function createApp ({
               const last = trimmed.charCodeAt(trimmed.length - 1)
               if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1) // 结尾孤立高代理（低代理被切掉）
               const nl = trimmed.indexOf('\n')
-              // 原子写入（tmp + rename）覆盖原文件，避免中断留下半写日志
-              if (this._writeTextAtomic(logPath, nl >= 0 ? trimmed.slice(nl + 1) : trimmed)) {
+              if (nl < 0) {
+                // F1-6：尾部 10MiB 里找不到换行（整份是一条超长行，或换行落在窗口之前）⇒ 放弃本次
+                // 截尾、保留原文件。旧实现直接写回 trimmed，等于把「窗口起点切在行中间」的半行当成
+                // 新文件头：内容被截断、首行还是半条。同时设 60s 退避，避免每次追加都重读 10MiB。
+                this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                console.warn(`⚠️ 日志截尾放弃（尾部 10MiB 无换行，原文件保留，暂停追加 60s）：${logPath}`)
+              } else if (this._writeTextAtomic(logPath, trimmed.slice(nl + 1))) {
                 this._logRotateBackoffUntil = 0
               } else {
                 // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）

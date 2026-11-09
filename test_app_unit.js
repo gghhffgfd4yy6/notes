@@ -803,12 +803,17 @@ check('_writeRunLog size > 1MiB ⇒ 只读尾部 512KiB，按首个换行对齐�
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
-check('_writeRunLog 尾部无换行 ⇒ 整体写回（不得写空）', () => {
+check('_writeRunLog 尾部 10MiB 无换行 ⇒ 放弃截尾、不写半行、原文件保留并告警（F1-6）', () => {
   const tail = 'N'.repeat(100)
   const rec = makeLogFs({ size: 2 * LIMIT, tail })
   const { app, cap } = makeLogApp({ rec })
-  app._writeRunLog('l\n')
-  assert.deepStrictEqual(cap, [[LOG_PATH, tail + '\0'.repeat(KEEP - 100)]])
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => app._writeRunLog('l\n')))
+  assert.deepStrictEqual(cap, [], '不得写回任何内容——写 trimmed 等于把窗口起点的半行当成新文件头（丢一半 + 首行残缺）')
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'], '仍要读尾部尝试截尾')
+  assert.ok(r.msgs.some((m) => m.includes('截尾放弃') && m.includes(LOG_PATH)),
+    `放弃截尾必须 WARN 并点名文件：${JSON.stringify(r.msgs)}`)
+  assert.strictEqual(app._logRotateBackoffUntil, t0 + 60 * 1000, '放弃后必须退避 60s（否则每次追加都重读 10MiB）')
 })
 
 check('_writeRunLog 尾部多个换行 ⇒ 以首个换行为界（slice(nl+1)）', () => {
