@@ -891,12 +891,13 @@ check('_writeRunLog 最后换行在 10MiB 窗口之外 ⇒ 流式重写，不整
   assert.ok(!app._logRotateBackoffByPath.has(LOG_PATH), '成功截尾后必须清除这条日志的退避')
 })
 
-check('_writeRunLog 尾部多个换行 ⇒ 保留最后一个换行之后的完整行', () => {
+check('_writeRunLog 尾部多个换行 ⇒ 从 KEEP 窗口起保留完整行，不只剩最后一行', () => {
+  // 8b3bd07 的回归夹具：日志总以 '\n' 结尾，旧实现取「最后一个换行之后」⇒ 只留最后一行 / 0 字节。
   const rest = 'B'.repeat(100) + '\n' + 'C'.repeat(KEEP - 102)
   const rec = makeLogFs({ size: 2 * LIMIT, tail: '\n' + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(cap, [[LOG_PATH, 'C'.repeat(KEEP - 102)]])
+  assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
 // ----- 截尾定位/重写（Sourcery PRRT_kwDOT8kkjs61Mcxl）：换行在 10MiB 窗口之外 -----

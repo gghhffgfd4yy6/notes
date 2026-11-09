@@ -201,15 +201,16 @@ function createApp ({
       return this._writeTextAtomic(filePath, text)
     },
 
-    // 从 EOF 向前按块找最后一行换行的结束位置（返回「最后换行之后」的字节偏移；没有换行返回 -1）。
-    // 只要文件里存在换行，就一定能在某个块里找到——不会因为「尾部 10MiB 窗口内没有换行」就
-    // 放弃截尾（Sourcery PRRT_kwDOT8kkjs61Mcxl）。4MiB 块避免一次读入整份 100MiB 日志。
-    _logTrimCut (fd, size) {
+    // 定位截尾后的保留段起点：从「size - keep」起**向后**找第一个换行，返回该换行之后的位置
+    // （保留最新 keep 字节、从行首对齐）。KEEP 窗口里一条换行都没有（单条超长行横跨整个窗口）时
+    // 回退到窗口之前最后一个换行之后——保留段会超过 keep，由调用方流式重写；整份文件连一个换行
+    // 都没有才返回 -1（任何位置写回都会得到半行，只能保留原文件并退避）。
+    // 「从 EOF 向前找最后一个换行」是 8b3bd07 的数据丢失回归：run.log 几乎总以 '\n' 结尾，
+    // 那样 cut == size、保留 0 字节，等于每次超限就把整份日志清空（Sourcery PRRT_kwDOT8kkjs61Mcxl
+    // 修的是「超长行不该让日志停在限额之上」，不该反过来丢掉整个文件）。
+    _logTrimCut (fd, size, keep = 10 * 1024 * 1024) {
       const CHUNK = 4 * 1024 * 1024
-      let end = size
-      while (end > 0) {
-        const from = Math.max(0, end - CHUNK)
-        const len = end - from
+      const readChunk = (from, len) => {
         const buf = Buffer.alloc(len)
         let got = 0
         while (got < len) {
@@ -217,7 +218,27 @@ function createApp ({
           if (n <= 0) break
           got += n
         }
-        if (got !== len) return -1
+        return got === len ? buf : null
+      }
+      const start = Math.max(0, size - keep)
+      // 1) 向后：KEEP 窗口里的第一个换行。换行正好是文件最后一个字节时不算——它之后没有内容，
+      //    保留段会是 0 字节；此时必须回退到前一个换行，绝不能把整份日志清空。
+      for (let pos = start; pos < size;) {
+        const len = Math.min(CHUNK, size - pos)
+        const buf = readChunk(pos, len)
+        if (!buf) return -1
+        const i = buf.indexOf(0x0a)
+        if (i >= 0) {
+          if (pos + i + 1 < size) return pos + i + 1
+          break
+        }
+        pos += len
+      }
+      // 2) 向前：窗口之前最后一个换行（超长行只能整行保留，保留段可能 > keep）。
+      for (let end = start; end > 0;) {
+        const from = Math.max(0, end - CHUNK)
+        const buf = readChunk(from, end - from)
+        if (!buf) return -1
         const i = buf.lastIndexOf(0x0a)
         if (i >= 0) return from + i + 1
         end = from
@@ -394,17 +415,20 @@ function createApp ({
           const st = fs.statSync(logPath)
           // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
           // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
-          if (lockFd !== null && !archivePending && st.size > LIMIT) {
+          // 截尾目标是「保留最新 KEEP=10MiB、从换行处对齐」；文件没超过 KEEP 时无需截尾
+          // （XBK_LOG_LIMIT_BYTES 调到 10MiB 以下的测试配置不会把整份日志重写一遍）。
+          const KEEP = 10 * 1024 * 1024
+          if (lockFd !== null && !archivePending && st.size > LIMIT && st.size > KEEP) {
           // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
           // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
-          // v3.407（Sourcery PRRT_kwDOT8kkjs61Mcxl）：旧实现只看「尾部 10MiB」窗口，
+          // v3.405（Sourcery PRRT_kwDOT8kkjs61Mcxl）：旧实现只看「尾部 10MiB」窗口，
           // 窗口里没有换行就整轮放弃；一条跨窗口的超长行会让文件长期停在 LIMIT 之上，
-          // 60s 退避后每追加一行又重复一次。现在从 EOF 向前按块扫描，找到最后一个换行
-          // 再决定截到哪；只有整份文件连一个换行都没有（单条巨行）才放弃并告警。
-            const KEEP = 10 * 1024 * 1024
+          // 60s 退避后每追加一行又重复一次。现在从 size-KEEP 向后找第一个换行，保留其后的
+          // 最新内容；窗口里没有换行才回退到窗口之前的最后一个换行（整行保留、流式重写）；
+          // 只有整份文件连一个换行都没有（单条巨行）才放弃并告警。
             const fd = fs.openSync(logPath, 'r+')
             try {
-              const cut = this._logTrimCut(fd, st.size)
+              const cut = this._logTrimCut(fd, st.size, KEEP)
               const trimmedLen = cut >= 0 ? st.size - cut : -1
               if (cut < 0) {
                 // 整份文件没有任何换行：无法在不写半行的前提下截断，保留原文件并退避。
