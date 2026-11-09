@@ -1184,6 +1184,40 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(kept17.equals(Buffer.concat([extra17, race17])),
       `快照之后追加的行不得被 ftruncate 吞掉（期望 ${extra17.length + race17.length} 字节，实际 ${kept17.length}）`)
     assert.strictEqual(LogArchive.readMarker(log17), '20261109-20261115', '并发追加不影响 marker 推进')
+
+    // ⑩ F1-8：明文前缀的「中间段」被改写时，恢复分支不得只看首/末窗口就按 idx.bytes 截断。
+    // 旧实现只比对首/末 64KiB：中间字节被换掉仍判「前缀是归档」，随后搬家截断把改过的中间段删掉。
+    // 这里造 ≥3 成员档案，改写 idx.bytes/2 处（远离首/末窗口）后重新封档，明文必须原样保留。
+    const dir18 = make('logarch-f18')
+    fs.mkdirSync(dir18, { recursive: true })
+    const log18 = path.join(dir18, 'run.log')
+    const lines18 = Array.from({ length: 60000 }, (_, i) => '2026-11-09 12:00:00 INFO 线报第' + i + '条 中间段核验 ' + String(i).padStart(6, '0'))
+    const src18 = Buffer.from(lines18.join('\n') + '\n')
+    fs.writeFileSync(log18, src18)
+    LogArchive.writeMarker(log18, '20261102-20261108')
+    const sealed18 = LogArchive.sealLog(log18, dir18, '20261102-20261108', '20261109-20261115')
+    const idx18 = JSON.parse(fs.readFileSync(sealed18.path + '.idx.json', 'utf8'))
+    assert.ok(idx18.members.length >= 3, `夹具必须切成 ≥3 个成员（实际 ${idx18.members.length}）`)
+    // 复现「已发布、明文未截断」现场，再改写中间一个字节（避开换行，保持行结构）
+    const mutated18 = Buffer.from(src18)
+    let mid18 = Math.floor(idx18.bytes / 2)
+    while (mid18 > 0 && (mutated18[mid18] === 0x0a || (mutated18[mid18] ^ 0x01) === 0x0a)) mid18 -= 1
+    mutated18[mid18] = mutated18[mid18] ^ 0x01
+    fs.writeFileSync(log18, mutated18)
+    LogArchive.writeMarker(log18, '20261102-20261108')
+    const warns18 = []
+    const origWarn18 = console.warn
+    let err18 = null
+    try {
+      console.warn = (...a) => { warns18.push(a.map(String).join(' ')) }
+      LogArchive.sealLog(log18, dir18, '20261102-20261108', '20261109-20261115')
+    } catch (e) {
+      err18 = e
+    } finally { console.warn = origWarn18 }
+    assert.ok(fs.readFileSync(log18).equals(mutated18),
+      '中间字节被改写时不得按 idx.bytes 搬家/截断（旧实现只比首/末 64KiB，会删掉改过的中间段）')
+    assert.ok(err18 || warns18.some((w) => w.includes('前缀与归档内容不一致')),
+      `必须留下可观测告警或抛错：err=${err18 && err18.message} warns=${JSON.stringify(warns18)}`)
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

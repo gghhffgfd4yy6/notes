@@ -164,9 +164,6 @@ function archiveError (msg) {
   return Object.assign(new Error(msg), { code: 'EARCHIVE' })
 }
 
-const VERIFY_HEAD_BYTES = 64 * 1024 // 恢复分支核对「明文前缀 = 归档内容」用的头/尾窗口
-const VERIFY_TAIL_BYTES = 64 * 1024
-
 // 定点读：读不满（EOF/短读）返回 null，调用方按「核验失败」处理，绝不拿半截数据当证据。
 function readExactAt (fd, pos, len) {
   if (!(len > 0)) return null
@@ -186,38 +183,29 @@ function gunzipMemberAt (fd, m) {
   try { return zlib.gunzipSync(buf) } catch (e) { return null }
 }
 
-// 判定明文 [0, idx.bytes) 是否仍是归档内容（F1-4）。
+// 判定明文 [0, idx.bytes) 是否仍是归档内容（F1-4 / Sourcery PRRT_kwDOT8kkjs61Mcvy）。
 // 只看 st.size >= idx.bytes 不够：F1-3 把 marker 推进挪到截断之后，会有「明文已截到 0、
 // gz+idx 已发布、marker 仍旧周」的现场；这期间追加的新周内容一旦超过 idx.bytes，旧逻辑就会把
 // [idx.bytes, size) 搬到文件头再截断——静默丢掉新内容开头 idx.bytes 字节、留下半行。
-// 这里用边界指纹核验：解压 gz 首成员比对明文开头，解压末成员比对 [idx.bytes - 尾长, idx.bytes)。
-// 不整份解压：封档失败会随每次日志写入重试，「截断持续失败」时整份解压会拖慢主流程。
-// 残余边界：只有新内容与归档的头/尾窗口逐字节相同才会误判（真实日志带时间戳，做不到）；
-// 索引与档案对不上（成员解压失败/总字节不符）一律判「不一致」，走保留明文的保守分支。
+// 这里逐成员解压并与明文对应区间逐字节比对：只比首/末 64KiB 时，中间被改写的字节会被漏过，
+// 随后按 idx.bytes 搬家截断就把「改过的中间段」删掉了。成员按 1MiB 切，单次比对只持有
+// 一个成员（≤ MAX_MEMBER_BYTES），不整份解压到内存。索引与档案对不上（成员解压失败/总字节
+// 不符）一律判「不一致」，走保留明文的保守分支。
 function plaintextPrefixIsArchive (fdIn, gzPath, idx) {
   if (!idx.members || !idx.members.length || !(idx.bytes > 0)) return false
   let o
   try { o = openLog(gzPath, false) } catch (e) { return false }
   try {
-    const firstText = gunzipMemberAt(o.fd, idx.members[0])
-    if (!firstText || !firstText.length) return false
-    const headLen = Math.min(firstText.length, VERIFY_HEAD_BYTES, idx.bytes)
-    const plainHead = readExactAt(fdIn, 0, headLen)
-    if (!plainHead || !plainHead.equals(firstText.subarray(0, headLen))) return false
-
-    let tailText
-    if (idx.members.length === 1) {
-      // 单成员档案：头窗口已经是全文的一部分，总字节必须自洽，否则索引不可信。
-      if (idx.bytes !== firstText.length) return false
-      tailText = firstText
-    } else {
-      tailText = gunzipMemberAt(o.fd, idx.members[idx.members.length - 1])
-      if (!tailText || !tailText.length) return false
+    let off = 0
+    for (const m of idx.members) {
+      const text = gunzipMemberAt(o.fd, m)
+      if (!text || !text.length) return false
+      if (!Number.isSafeInteger(off + text.length) || off + text.length > idx.bytes) return false
+      const plain = readExactAt(fdIn, off, text.length)
+      if (!plain || !plain.equals(text)) return false
+      off += text.length
     }
-    const tailLen = Math.min(tailText.length, VERIFY_TAIL_BYTES, idx.bytes)
-    if (tailLen <= 0) return false
-    const plainTail = readExactAt(fdIn, idx.bytes - tailLen, tailLen)
-    return !!plainTail && plainTail.equals(tailText.subarray(tailText.length - tailLen))
+    return off === idx.bytes
   } catch (e) {
     return false
   } finally { try { fs.closeSync(o.fd) } catch (e) {} }
