@@ -1008,8 +1008,8 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(LogArchive.readGzPage(retry13.path, 1, 100).lines[0], 'F13 第0行', '重试后归档必须仍可读')
 
     // ⑧ 现场的按路径入口集中在观测窗口外：目录与初始明文只准备一次，随后用同一个 r+ fd 贯穿
-    // 长度核验、追加写入与读回。窗口内（'// ⑧ F1-4：' 起）只允许 fstatSync/readSync/writeSync/
-    // closeSync，由 ⑧d 结构回归锁逐字守住（CodeQL js/file-system-race #131/#132 防回潮）。
+    // 长度核验、追加写入与读回。观测窗口（下方 ⑧ F1-4 场景注释起）只允许 fstatSync/readSync/
+    // writeSync/closeSync，由 ⑧d 结构回归锁逐字守住（CodeQL js/file-system-race #131/#132 防回潮）。
     const seedF14 = (dir, data) => {
       fs.mkdirSync(dir, { recursive: true })
       const p = path.join(dir, 'run.log')
@@ -1122,20 +1122,24 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(fs.readFileSync(log11, 'utf8'), '', '多成员档案恢复后明文必须被截断')
     assert.strictEqual(LogArchive.readMarker(log11), '20261116-20261122', '多成员档案恢复后 marker 必须推进')
 
-    // ⑧d CodeQL js/file-system-race 结构回归锁（alert #131/#132）：⑧ 现场的「明文长度」核验必须
-    // 走 fd（openSync → fstatSync(fd) → closeSync），不得回退成「按路径检查、再按路径读/写」。
-    // 回退该修复（把 fd14 那段换回按路径 statSync）时本断言变红 —— 这是本机没有 CodeQL CLI 时
-    // 唯一能守住该数据流不回潮的手段；CodeQL 自身的终局判定由下一个 head 的扫描给出。
+    // ⑧d CodeQL js/file-system-race 结构回归锁（alert #131/#132）：⑧ 现场从「明文长度核验」
+    // 到「读回断言」必须全程用同一个 fd（fstatSync/readSync/writeSync/closeSync），块内不得
+    // 出现任何按路径的 fs.* —— 只要还有 openSync/appendFileSync/readFileSync/writeFileSync/
+    // statSync 之类按路径解析，CodeQL 就会把「按路径检查 → 按路径读/写」重新配成 CWE-367。
+    // 回退本次修复（把 writeSync 换回 appendFileSync、把 fd 读回换回 readFileSync，或用
+    // statSync/openSync 做前置检查）时本断言必红；这是本机没有 CodeQL CLI 时守住该数据流
+    // 不回潮的手段，CodeQL 自身的终局判定仍由下一个 head 的扫描给出。
     const selfSrc14 = fs.readFileSync(__filename, 'utf8')
     const blockStart14 = selfSrc14.indexOf('// ⑧ F1-4：')
     const blockEnd14 = selfSrc14.indexOf('// ⑧b 正路径不回归')
     assert.ok(blockStart14 >= 0 && blockEnd14 > blockStart14, '必须能定位 ⑧ 现场代码块（结构回归锁的观测面）')
     const block14 = selfSrc14.slice(blockStart14, blockEnd14)
     assert.ok(block14.includes('fs.fstatSync('), '⑧ 现场长度核验必须走 fd（fstatSync），否则同源 TOCTOU 会回来')
-    const pathCheckToks14 = ['fs.statSync(', 'fs.lstatSync(', 'fs.existsSync(', 'fs.accessSync(']
-    const pathChecks14 = pathCheckToks14.filter((tok) => block14.includes(tok))
-    assert.deepStrictEqual(pathChecks14, [],
-      `⑧ 现场不得再出现按路径的前置检查（CodeQL js/file-system-race 数据流）：${pathChecks14.join(', ')}`)
+    const allowedFdCalls14 = ['fs.fstatSync(', 'fs.readSync(', 'fs.writeSync(', 'fs.closeSync(']
+    const fsCalls14 = (block14.match(/fs\.[A-Za-z_$][\w$]*\s*\(/g) || []).map((tok) => tok.replace(/\s+/g, ''))
+    const pathCalls14 = [...new Set(fsCalls14.filter((tok) => !allowedFdCalls14.includes(tok)))]
+    assert.deepStrictEqual(pathCalls14, [],
+      `⑧ 现场不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流）：${pathCalls14.join(', ')}`)
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
