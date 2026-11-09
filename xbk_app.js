@@ -151,6 +151,35 @@ function createApp ({
       return isRegularOrMissing(filePath)
     },
 
+    // R1-1：日志周标记（<log>.week）的**唯一**写入口——非阻塞 + 普通文件校验。
+    // 为什么不能直接 writeFileSync：marker 被替换成没有写者的 FIFO 时，同步 open(O_WRONLY) 会
+    // 永久阻塞（无日志、无退出码），整轮运行挂死；读侧改成 O_NONBLOCK 只是让 readMarker 返回空串，
+    // 紧接着的写分支照旧把进程钉住。
+    // 做法：O_NONBLOCK 让 open 对无写者的 FIFO 立刻 ENXIO、对目录/符号链接（O_NOFOLLOW）立刻
+    // ELOOP/ENOTDIR，再用 fstat 复核「打开后的这个 fd 真是普通文件」——FIFO 有读者时 open 会成功，
+    // 只有 fstat 能拦住「把周键写进管道」。
+    // 失败只告警（run.log 照常写，归档下一轮重试），绝不抛穿 _writeRunLog。
+    _writeWeekMarker (markerPath, weekKey) {
+      const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC |
+        fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW
+      let fd = null
+      try {
+        fd = fs.openSync(markerPath, flags, 0o600)
+        const st = fs.fstatSync(fd)
+        if (!st.isFile()) {
+          console.warn(`⚠️ 日志周标记不是普通文件，拒绝写入（归档下一轮重试）：${markerPath}`)
+          return false
+        }
+        fs.writeFileSync(fd, weekKey, { encoding: 'utf8' })
+        return true
+      } catch (e) {
+        console.warn(`⚠️ 日志周标记写入失败（归档下一轮重试）：${markerPath}：${Utils.safeErrorText(e, '未知错误')}`)
+        return false
+      } finally {
+        if (fd !== null) { try { fs.closeSync(fd) } catch (e) { /* fd 已失效时忽略 */ } }
+      }
+    },
+
     // C1-027/CR-03：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
     // **每次访问都要重新求值**——「运行期间父目录被换成指向项目外的符号链接」只在求值那一刻可见。
     // 本 PR 曾把重复求值优化成 run() 里解析一次并钉到 _cacheDirForRun（单轮内 cache.dir 是静态配置），
@@ -339,7 +368,9 @@ function createApp ({
             const weekKey = LogArchive.weekRange(Date.now()).key
             const marker = LogArchive.readMarker(logPath)
             if (!marker) {
-              try { fs.writeFileSync(LogArchive.weekMarkerPath(logPath), weekKey, 'utf8') } catch (e) {}
+              // R1-1：读侧 O_NONBLOCK 只证明「读不阻塞」，写侧仍是裸 writeFileSync ⇒ 无写者的
+              // FIFO 上 open(O_WRONLY) 永久阻塞，整轮照旧挂死。改走非阻塞 + 普通文件校验的写入。
+              this._writeWeekMarker(LogArchive.weekMarkerPath(logPath), weekKey)
             } else if (marker !== weekKey) {
               // 跨周：上一周还在明文里。归档没成功前不许截尾（否则整周数据被 KEEP 覆盖掉）。
               archivePending = true

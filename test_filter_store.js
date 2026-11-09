@@ -1360,6 +1360,64 @@ process.stdout.write(JSON.stringify({ marker, ms: Date.now() - t0 }))
   assert.strictEqual(r.marker, '', 'FIFO 周标记必须按「无标记」处理（不得把它当周键）')
 })
 
+// R1-1：读侧改 O_NONBLOCK 只覆盖了 readMarker；同一分支紧接着的**写**标记才是真正的挂死点
+// （裸 fs.writeFileSync 在无写者 FIFO 上同步 open(O_WRONLY) 永久阻塞）。旧用例只调 readMarker，
+// 完全没走到写分支，所以这条缺陷没有任何覆盖。
+test('F4-2 FIFO 周标记写入：run.log.week 注入 FIFO 后 _writeRunLog 不挂死（写侧，R1-1）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 周标记写入探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('run.log.week')
+  const r = runProbeUnderTimeout(`
+const fs = require('node:fs')
+const path = require('node:path')
+const { App } = require('./xbk_function_v3')
+const dir = process.env.XBK_FIFO_DIR
+App._cacheDir = () => dir
+let warned = ''
+const origWarn = console.warn
+console.warn = (...args) => { warned += args.join(' ') + '\\n' }
+const t0 = Date.now()
+App._writeRunLog('2026-11-10 12:00:00 probe line\\n')
+const ms = Date.now() - t0
+console.warn = origWarn
+const markerPath = path.join(dir, 'run.log.week')
+let markerType = 'missing'
+try { const st = fs.lstatSync(markerPath); markerType = st.isFIFO() ? 'fifo' : (st.isFile() ? 'file' : 'other') } catch (e) {}
+const logPath = path.join(dir, 'run.log')
+const logText = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : ''
+process.stdout.write(JSON.stringify({ ms, markerType, logHasLine: logText.includes('probe line'), warnedHasMarker: /日志周标记/.test(warned) }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 周标记写入必须 2 秒内返回（实耗 ${r.ms}ms）：裸 writeFileSync 会永久阻塞整轮`)
+  assert.strictEqual(r.markerType, 'fifo', `周标记必须仍是那个 FIFO（不得被写穿/改名/替换），实际 ${r.markerType}`)
+  assert.strictEqual(r.logHasLine, true, 'run.log 本体必须照常写入（标记写不了不影响留痕）')
+  assert.strictEqual(r.warnedHasMarker, true, '拒绝写非普通文件周标记必须留一条 console.warn（故障可见，不静默）')
+})
+
+test('F4-2 普通周标记仍照常写入：无标记时第一轮写当前周键（R1-1 回归，不得为修 FIFO 拒写正常文件）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过普通周标记探针：${FIFO_SKIP}`)
+    return
+  }
+  const dir = makeDir()
+  const r = runProbeUnderTimeout(`
+const fs = require('node:fs')
+const path = require('node:path')
+const { App } = require('./xbk_function_v3')
+const { readMarker } = require('./scripts/log-archive')
+const dir = process.env.XBK_FIFO_DIR
+App._cacheDir = () => dir
+App._writeRunLog('2026-11-10 12:00:00 probe line\\n')
+const markerPath = path.join(dir, 'run.log.week')
+const mode = fs.existsSync(markerPath) ? (fs.statSync(markerPath).mode & 0o777) : -1
+process.stdout.write(JSON.stringify({ marker: readMarker(path.join(dir, 'run.log')), mode }))
+`, dir)
+  const { weekRange } = require('./scripts/log-archive')
+  assert.strictEqual(r.marker, weekRange(Date.now()).key, `无标记的首次写入必须落当前周键（实际 ${r.marker}）`)
+  assert.strictEqual(r.mode, 0o600, `周标记必须是 0600（与其它状态文件同口径），实际 ${r.mode.toString(8)}`)
+})
+
 // ===== 路径 helper =====
 
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {
