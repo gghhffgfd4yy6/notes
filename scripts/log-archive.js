@@ -18,9 +18,11 @@
 //     的错位状态把上一周数据交给 100MB 截尾覆盖。
 //   - 上次崩在「发布之后、截断/标记之前」时（gz 在、idx 缺 / gz+idx 都在、标记仍旧）不返回
 //     null：idx 缺则从 gz 重建并补写，然后继续补做截断与标记；重建失败抛明确错误。
-//   - 读完到截断之间若有 fail-open 写者追加，把追加段搬回文件开头再截断，不吞这几行。
-//     搬家前先核验明文 [0, idx.bytes) 仍是归档内容（解压 gz 首/末成员比对边界指纹）：不一致说明
-//     上次已截断、明文里其实全是新周内容（F1-4），此时保留全部明文、只补 marker 并告警，绝不截断。
+//   - 读完到截断之间若有 fail-open 写者追加，把追加段搬回文件开头再截断，不吞这几行；
+//     搬运循环核验 EOF，快照之后的新追加也会被搬走。
+//     搬家前先逐成员核验明文 [0, idx.bytes) 与归档逐字节一致：不一致时，只有 `<log>.seal.json`
+//     事务记录（上次确实已完成截断）能证明明文是新周内容；没有该记录就抛错保留 archivePending，
+//     绝不推进 marker（否则 100MB 截尾会覆盖仅存的明文副本）。
 
 const fs = require('fs')
 const path = require('path')
@@ -164,6 +166,52 @@ function archiveError (msg) {
   return Object.assign(new Error(msg), { code: 'EARCHIVE' })
 }
 
+// 封档事务日志：记录「gz+idx 已发布、正在/已经截断明文」这一步。
+// 为什么需要它（Sourcery PRRT_kwDOT8kkjs61McwB）：截断成功但 .week 写失败时，明文里可能
+// 已经追加了新周内容；下次 sealLog 看到「前缀与归档不一致」必须能区分两种现场——
+//   (a) 上次截断已完成（有 journal）⇒ 明文全是新周内容，保留并推进 marker；
+//   (b) 归档损坏/明文被替换（无 journal）⇒ 无法证明归档就是这份明文的副本，绝不能推进 marker
+//       （否则调用方清掉 archivePending，100MB 截尾会把仅存的明文副本丢掉）。
+// journal 在动明文之前写入、marker 成功之后删除；写到一半崩溃时它仍在，下一次 sealLog 先补齐
+// marker（截断已完成）或重新执行截断（截断未完成，前缀仍与归档一致），两种现场都不会丢数据。
+const SEAL_JOURNAL_VERSION = 1
+
+function sealJournalPath (logPath) {
+  return logPath + '.seal.json'
+}
+
+function readSealJournal (logPath) {
+  let o = null
+  try {
+    o = openLog(sealJournalPath(logPath), false)
+    const j = JSON.parse(fs.readFileSync(o.fd, 'utf8'))
+    if (!j || j.v !== SEAL_JOURNAL_VERSION) return null
+    if (typeof j.prevKey !== 'string' || !/^\d{8}-\d{8}$/.test(j.prevKey)) return null
+    if (typeof j.nextKey !== 'string' || !/^\d{8}-\d{8}$/.test(j.nextKey)) return null
+    if (!Number.isSafeInteger(j.bytes) || j.bytes < 0) return null
+    if (j.source !== path.basename(logPath)) return null
+    return j
+  } catch (e) {
+    return null
+  } finally { if (o) { try { fs.closeSync(o.fd) } catch (e) {} } }
+}
+
+function writeSealJournal (logPath, prevKey, nextKey, idx) {
+  writeAtomic(sealJournalPath(logPath), JSON.stringify({
+    v: SEAL_JOURNAL_VERSION,
+    source: path.basename(logPath),
+    prevKey,
+    nextKey,
+    bytes: idx.bytes,
+    lines: idx.lines
+  }))
+  fsyncDirBestEffort(path.dirname(logPath))
+}
+
+function clearSealJournal (logPath) {
+  try { fs.unlinkSync(sealJournalPath(logPath)) } catch (e) {} // nosemgrep（路径=白名单日志名 + .seal.json）
+}
+
 // 定点读：读不满（EOF/短读）返回 null，调用方按「核验失败」处理，绝不拿半截数据当证据。
 function readExactAt (fd, pos, len) {
   if (!(len > 0)) return null
@@ -304,14 +352,24 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   }
   const fdIn = opened.fd
   const writable = opened.writable
+  // 上一次封档若崩在「截断完成、marker 未写」之间，journal 会留下（见 readSealJournal 注释）。
+  // 只有 prevKey/nextKey/bytes 与本次现场完全一致才算「同一笔事务」，防止陈旧 journal 被误用。
+  const journal = readSealJournal(logPath)
+  const journalMatches = !!idx && !!journal && journal.prevKey === prevKey &&
+    journal.nextKey === nextKey && journal.bytes === idx.bytes
   if (!opened.size) {
     try { fs.closeSync(fdIn) } catch (e) {}
     if (!idx) {
       try { writeAtomic(weekMarkerPath(logPath), nextKey) } catch (e) {}
+      clearSealJournal(logPath)
       return null
     }
-    // 明文已空（上次截断成功但标记没写成功）：只剩补标记这一步。
+    // 明文已空（上次截断成功但标记没写成功）：只剩补标记这一步。先落 journal 再写 marker：
+    // 若 marker 再次失败，下一次 sealLog 能凭它确认「截断已完成」，新追加的内容不会被误判成
+    // 「归档与明文对不上」而永久卡住封档。
+    writeSealJournal(logPath, prevKey, nextKey, idx)
     writeAtomic(weekMarkerPath(logPath), nextKey)
+    clearSealJournal(logPath)
     return { path: outPath, lines: idx.lines, bytes: idx.bytes }
   }
 
@@ -379,20 +437,27 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   // 把 [idx.bytes, size) 搬回文件开头再截断。
   // F1-4：但「size 够大」不等于「明文前缀还是归档内容」——上次截断成功、.week 写失败后，
   // 新周内容会被追加到空文件里；超过 idx.bytes 后再按 [idx.bytes, size) 搬家，就会静默丢掉
-  // 新内容开头 idx.bytes 字节（还留下半行）。搬家前必须核验前缀，核验不过就保留全部明文、
-  // 只补 marker，并留下可观测告警（宁可让旧周内容留在明文里重复一遍，也不能删掉新周数据）。
+  // 新内容开头 idx.bytes 字节（还留下半行）。搬家前必须核验前缀；核验不过时只有 journal
+  // （上次确实已完成截断）能证明明文是新周内容，否则归档与明文对不上、明文可能是仅存副本，
+  // 必须抛错保留 archivePending，绝不能推进 marker 把明文交给 100MB 截尾。
   try {
     const st = fs.fstatSync(fdIn)
     const prefixIsArchive = writable && st.size >= idx.bytes && plaintextPrefixIsArchive(fdIn, outPath, idx)
     if (prefixIsArchive) {
+      // 动明文之前先落事务记录：截断成功而 marker 写失败时，下一次 sealLog 靠它区分
+      // 「明文是新周内容」与「归档/明文对不上」。journal 写失败就不动明文（抛错，下一轮重试）。
+      writeSealJournal(logPath, prevKey, nextKey, idx)
       // F1-7：搬运/截断期间仍可能有 fail-open 写者追加（它拿不到写锁）。按快照长度只搬一次再
       // ftruncate 会把快照之后的追加整段删掉——写者返回成功、日志里却没有这一行。helper 会
       // 「搬完再 fstat」，把新增段接着搬，确认已搬位置就是当前 EOF 才截断。
       moveTailToHeadAndTruncate(fdIn, idx.bytes, logPath)
     } else if (writable && st.size >= idx.bytes) {
-      // 明文不比归档短、前缀却不是归档内容：只可能是上次已截断、这期间又追加了新内容。
-      // 不能截、不能搬：全部明文都是新周数据，只把 marker 补到新周。
-      console.warn(`⚠️ 日志归档：明文前缀与归档内容不一致（疑似上次已截断后又有新内容），保留全部明文、只推进标记：${logPath}`)
+      if (journalMatches) {
+        // 上次已截断（journal 为证），这期间追加的全部是新周内容：不截、不搬，只补 marker。
+        console.warn(`⚠️ 日志归档：明文前缀与归档内容不一致（上次截断已完成），保留全部明文、只推进标记：${logPath}`)
+      } else {
+        throw archiveError(`明文前缀与归档内容不一致，且没有可证明「上次截断已完成」的事务记录，保留明文与旧标记：${logPath}`)
+      }
     } else if (writable) {
       // 明文比归档短：可能上次截断成功但标记没写成功。不做截断（避免删掉未归档的新内容），只补标记。
       console.warn(`⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
@@ -401,6 +466,10 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
       console.warn(`⚠️ 日志归档：明文不可写，跳过截断（数据已归档）：${logPath}`)
     }
   } catch (e) {
+    if (e && e.code === 'EARCHIVE') {
+      console.warn(`⚠️ 日志归档：${e.message}`)
+      throw e
+    }
     console.warn(`⚠️ 日志归档：截断明文失败，保留旧周标记以便下一轮重试：${logPath}（${e.code || e.message}）`)
     throw Object.assign(new Error(`日志归档截断失败：${logPath}（${e.code || e.message}）`), { code: 'EARCHTRUNC', cause: e })
   } finally {
@@ -408,6 +477,7 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   }
 
   writeAtomic(weekMarkerPath(logPath), nextKey)
+  clearSealJournal(logPath)
   return { path: outPath, lines: idx.lines, bytes: idx.bytes }
 }
 

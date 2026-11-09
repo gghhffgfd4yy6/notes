@@ -1218,6 +1218,55 @@ const LogArchive = require('./scripts/log-archive')
       '中间字节被改写时不得按 idx.bytes 搬家/截断（旧实现只比首/末 64KiB，会删掉改过的中间段）')
     assert.ok(err18 || warns18.some((w) => w.includes('前缀与归档内容不一致')),
       `必须留下可观测告警或抛错：err=${err18 && err18.message} warns=${JSON.stringify(warns18)}`)
+
+    // ⑪ F1-9：归档/明文对不上且没有事务记录时，不得推进 marker（否则 archivePending 被清掉，
+    // 100MB 截尾会把仅存的明文副本丢掉）。旧实现只 WARN 然后照常写 .week ⇒ 缺陷。
+    const dir19 = make('logarch-f19')
+    fs.mkdirSync(dir19, { recursive: true })
+    const log19 = path.join(dir19, 'run.log')
+    const old19 = Buffer.from(Array.from({ length: 100 }, (_, i) => 'F19 上周第' + i + '行 ' + 'e'.repeat(12)).join('\n') + '\n')
+    fs.writeFileSync(log19, old19)
+    LogArchive.writeMarker(log19, '20261102-20261108')
+    const sealed19 = LogArchive.sealLog(log19, dir19, '20261102-20261108', '20261109-20261115')
+    // 现场：明文被换成另一份内容（长度不短于归档），marker 退回旧周，没有 journal
+    const replaced19 = Buffer.from(Array.from({ length: 200 }, (_, i) => 'F19 被替换的内容第' + i + '行 ' + 'f'.repeat(12)).join('\n') + '\n')
+    assert.ok(replaced19.length >= sealed19.bytes, '替换内容必须不短于归档，否则会落进「明文更短」分支')
+    fs.writeFileSync(log19, replaced19)
+    LogArchive.writeMarker(log19, '20261102-20261108')
+    assert.ok(!fs.existsSync(log19 + '.seal.json'), '成功封档后不得残留事务记录（本用例要覆盖「无 journal」）')
+    const origWarn19 = console.warn
+    let err19 = null
+    try {
+      console.warn = () => {}
+      LogArchive.sealLog(log19, dir19, '20261102-20261108', '20261109-20261115')
+    } catch (e) { err19 = e } finally { console.warn = origWarn19 }
+    assert.ok(err19 && err19.code === 'EARCHIVE', `归档无法核验时必须抛 EARCHIVE（实际 ${err19 && err19.code}）`)
+    assert.strictEqual(LogArchive.readMarker(log19), '20261102-20261108', '无法核验的归档绝不能推进 marker')
+    assert.ok(fs.readFileSync(log19).equals(replaced19), '无法核验时必须保留明文原样')
+
+    // ⑫ 事务记录生命周期：截断完成而 marker 写失败 ⇒ journal 留下；下一次 sealLog 补完 marker
+    // 后必须清掉。这是 ⑪ 能区分「上次已截断」与「归档对不上」的唯一依据。
+    const dir20 = make('logarch-f20')
+    fs.mkdirSync(dir20, { recursive: true })
+    const log20 = path.join(dir20, 'run.log')
+    fs.writeFileSync(log20, Array.from({ length: 20 }, (_, i) => 'F20 第' + i + '行').join('\n') + '\n')
+    LogArchive.writeMarker(log20, '20261102-20261108')
+    LogArchive.sealLog(log20, dir20, '20261102-20261108', '20261109-20261115')
+    LogArchive.writeMarker(log20, '20261102-20261108')
+    const origRename20 = fs.renameSync
+    let markerErr20 = null
+    try {
+      fs.renameSync = (from, to) => {
+        if (typeof to === 'string' && to.endsWith('.week')) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' })
+        return origRename20.call(fs, from, to)
+      }
+      try { LogArchive.sealLog(log20, dir20, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr20 = e }
+    } finally { fs.renameSync = origRename20 }
+    assert.ok(markerErr20, '注入必须让 marker 写入失败')
+    assert.ok(fs.existsSync(log20 + '.seal.json'), '截断完成、marker 未写时必须留下事务记录')
+    LogArchive.sealLog(log20, dir20, '20261102-20261108', '20261109-20261115')
+    assert.strictEqual(LogArchive.readMarker(log20), '20261109-20261115', '补完 marker 后必须推进')
+    assert.ok(!fs.existsSync(log20 + '.seal.json'), 'marker 成功后必须清掉事务记录')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
