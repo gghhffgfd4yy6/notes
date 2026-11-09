@@ -829,7 +829,27 @@ check('_writeRunLog 整份文件无换行 ⇒ 放弃截尾、不写半行、原�
   assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'], '仍要读尾部尝试截尾')
   assert.ok(r.msgs.some((m) => m.includes('截尾放弃') && m.includes(LOG_PATH)),
     `放弃截尾必须 WARN 并点名文件：${JSON.stringify(r.msgs)}`)
-  assert.strictEqual(app._logRotateBackoffUntil, t0 + 60 * 1000, '放弃后必须退避 60s（否则每次追加都重读 10MiB）')
+  assert.strictEqual(app._logRotateBackoffByPath.get(LOG_PATH), t0 + 60 * 1000, '放弃后必须对这条日志退避 60s（否则每次追加都重读 10MiB）')
+})
+
+check('_writeRunLog 一条日志的截尾退避不影响另一条白名单日志', () => {
+  const rec = makeLogFs({ size: 2 * LIMIT, tail: 'N'.repeat(100) })
+  const origStat = rec.stub.statSync
+  rec.stub.statSync = (p) => {
+    if (p === LOG_PATH) return origStat(p)
+    return { size: 0, mtimeMs: Date.now() }
+  }
+  const { app, rec: calls } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  withFixedNow(t0, () => {
+    app._writeRunLog('a\n') // run.log：整份无换行 ⇒ 只给 run.log 设退避
+    app._writeRunLog('diag\n', 'filter-diagnostics.ndjson')
+  })
+  const diagPath = path.join(CACHE_DIR, 'filter-diagnostics.ndjson')
+  assert.deepStrictEqual(calls.append[calls.append.length - 1], [diagPath, 'diag\n', 'utf8'],
+    'run.log 的退避不得让 filter-diagnostics.ndjson 只回显 stdout（必须照常落盘）')
+  assert.ok(app._logRotateBackoffByPath.has(LOG_PATH), 'run.log 自己的退避必须保留')
+  assert.ok(!app._logRotateBackoffByPath.has(diagPath), '另一条日志不得被写入退避表')
 })
 
 check('_writeRunLog 最后换行在 10MiB 窗口之外 ⇒ 流式重写，不整轮放弃', () => {
@@ -843,7 +863,7 @@ check('_writeRunLog 最后换行在 10MiB 窗口之外 ⇒ 流式重写，不整
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rewrites, [[LOG_PATH, 9 * 1024 * 1024 + 1]], '必须从最后换行之后流式重写')
   assert.deepStrictEqual(cap, [], '保留段超过 KEEP 时不得整段读进内存再原子写')
-  assert.strictEqual(app._logRotateBackoffUntil, 0, '成功截尾后必须清除退避')
+  assert.ok(!app._logRotateBackoffByPath.has(LOG_PATH), '成功截尾后必须清除这条日志的退避')
 })
 
 check('_writeRunLog 尾部多个换行 ⇒ 保留最后一个换行之后的完整行', () => {

@@ -289,7 +289,10 @@ function createApp ({
         }
         // v3.396 审查加固：截尾失败（临时文件写不进/rename 失败，多见于磁盘将满）后 60s 内不再追加，
         // 只回显 stdout——否则每次调用都「先追加、再截尾失败」，超限日志会继续长到把盘吃光。
-        if (this._logRotateBackoffUntil && Date.now() < this._logRotateBackoffUntil) {
+        // v3.408（Sourcery PRRT_kwDOT8kkjs61Mcx6）：退避必须按日志路径分开记。共享一个字段时，
+        // 一条日志截尾放弃会让另一条白名单日志的写入也静默跳过 60s（只回显 stdout）。
+        const rotateBackoffUntil = this._logRotateBackoffByPath.get(logPath) || 0
+        if (rotateBackoffUntil && Date.now() < rotateBackoffUntil) {
           console.log(String(line).replace(/\n$/, ''))
           return
         }
@@ -401,14 +404,14 @@ function createApp ({
               const trimmedLen = cut >= 0 ? st.size - cut : -1
               if (cut < 0) {
                 // 整份文件没有任何换行：无法在不写半行的前提下截断，保留原文件并退避。
-                this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                this._logRotateBackoffByPath.set(logPath, Date.now() + 60 * 1000)
                 console.warn(`⚠️ 日志截尾放弃（整份文件无换行，原文件保留，暂停追加 60s）：${logPath}`)
               } else if (trimmedLen > KEEP) {
                 // 保留段超过 10MiB（最后一个换行在窗口之外）：流式重写，避免把整段读进内存。
                 if (this._rewriteLogFrom(logPath, cut)) {
-                  this._logRotateBackoffUntil = 0
+                  this._logRotateBackoffByPath.delete(logPath)
                 } else {
-                  this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                  this._logRotateBackoffByPath.set(logPath, Date.now() + 60 * 1000)
                   console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
                 }
               } else {
@@ -425,10 +428,10 @@ function createApp ({
                 const last = trimmed.charCodeAt(trimmed.length - 1)
                 if (last >= 0xD800 && last <= 0xDBFF) trimmed = trimmed.slice(0, -1)
                 if (got === trimmedLen && this._writeTextAtomic(logPath, trimmed)) {
-                  this._logRotateBackoffUntil = 0
+                  this._logRotateBackoffByPath.delete(logPath)
                 } else {
                   // 截尾失败：文件仍是超限大小，别再继续追加（入口的 60s 退避会接管）
-                  this._logRotateBackoffUntil = Date.now() + 60 * 1000
+                  this._logRotateBackoffByPath.set(logPath, Date.now() + 60 * 1000)
                   console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
                 }
               }
@@ -458,6 +461,7 @@ function createApp ({
     },
 
     _diskWarningAt: 0,
+    _logRotateBackoffByPath: new Map(),
     _archiveWarnAt: 0,
     _archiveWarnKey: '',
     _alertLastAtByPath: new Map(),
