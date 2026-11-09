@@ -970,6 +970,92 @@ function makeFifoDir (name) {
   return { dir, file }
 }
 
+// ===== F4-3：瞬时读失败（replaced/ioError）重读一次，不折叠成永久降级 =====
+// 用替换 storage.readSafeTextResult 的方式注入——真实竞态（另一进程在 fstat 后 rename）不可
+// 确定复现；每次注入都记录调用次数，用来区分「重读一次」与「直接降级 / 无脑重试多次」。
+function withInjectedReads (statuses, fn) {
+  const storageMod = require('./xbk_storage')
+  const realRead = storageMod.readSafeTextResult
+  const calls = []
+  try {
+    storageMod.readSafeTextResult = (p, maxBytes, options) => {
+      const index = calls.length
+      calls.push({ p: String(p), options })
+      if (index < statuses.length) {
+        const status = statuses[index]
+        return status === 'OK_DELEGATE'
+          ? realRead(p, maxBytes, options)
+          : { status, text: null, error: new Error(`注入 ${status}`) }
+      }
+      return realRead(p, maxBytes, options)
+    }
+    const result = fn()
+    return { result, calls }
+  } finally {
+    storageMod.readSafeTextResult = realRead
+  }
+}
+
+test('F4-3 验收 3：注入 status=replaced → 重读一次成功，degraded=false（50ms 退避）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 3, filter: { pingbibiaoti: '瞬时替换' } })
+  const t0 = Date.now()
+  const { result, calls } = withInjectedReads(['replaced', 'OK_DELEGATE'], () =>
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+  const elapsed = Date.now() - t0
+  const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  assert.strictEqual(ruleReads.length, 2, `replaced 必须恰好重读一次（实际 ${ruleReads.length} 次）`)
+  assert.strictEqual(result.source, 'override', '重读成功后必须正常生效（不得把瞬时失败折叠成降级）')
+  assert.strictEqual(result.degraded, false, '重读成功必须 degraded=false（旧实现这里恒为 true）')
+  assert.strictEqual(result.lastGoodUsed, false, '本轮是正常加载，不得标记 lastGoodUsed')
+  assert.strictEqual(result.filter.pingbibiaoti, '瞬时替换')
+  assert.ok(elapsed >= 45, `重读前必须有 50ms 退避（实测 ${elapsed}ms；无退避会让瞬时写者来不及完成）`)
+  assert.strictEqual(ruleReads[0].options && ruleReads[0].options.openNonBlocking, true, '重读也必须带 openNonBlocking')
+})
+
+test('F4-3 ioError 同口径：重读一次成功即正常生效', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 4, filter: { pingbibiaoti: '瞬时 EIO' } })
+  const { result, calls } = withInjectedReads(['ioError', 'OK_DELEGATE'], () =>
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+  const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  assert.strictEqual(ruleReads.length, 2, `ioError 必须恰好重读一次（实际 ${ruleReads.length} 次）`)
+  assert.strictEqual(result.source, 'override')
+  assert.strictEqual(result.degraded, false, 'ioError 恢复后不得判降级')
+})
+
+test('F4-3 重读仍失败 → 降级且只重试一次（不无限重读、不隔离文件）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 5, filter: { pingbibiaoti: '永远换不到' } })
+  const before = fs.readdirSync(dir).sort()
+  const { result, calls } = withInjectedReads(['replaced', 'replaced'], () =>
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+  const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  assert.strictEqual(ruleReads.length, 2, `只允许重读一次（实际 ${ruleReads.length} 次）：重试风暴会让挂死的文件系统把整轮拖长`)
+  assert.strictEqual(result.source, 'corrupt')
+  assert.strictEqual(result.degraded, true)
+  assert.strictEqual(result.lastGoodUsed, false, '没有 LKG 时回代码默认')
+  assert.match(String(result.error.message), /replaced/, '降级原因必须保留读状态（排障要看得到 replaced/ioError）')
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(), before, '降级不得隔离/改名/新建任何文件（本模块从不移动用户文件）')
+})
+
+test('F4-3 unsafe / tooLarge 是确定性判据：直接降级、不做重读', () => {
+  for (const status of ['unsafe', 'tooLarge']) {
+    resetStoreStateForTests()
+    const dir = makeDir()
+    writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 6, filter: { pingbibiaoti: 'x' } })
+    const { result, calls } = withInjectedReads([status], () =>
+      loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+    const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+    assert.strictEqual(ruleReads.length, 1, `${status} 不得重读（确定性判据，重读只会白等 50ms）：实际 ${ruleReads.length} 次`)
+    assert.strictEqual(result.source, 'corrupt', `${status} 必须降级`)
+    assert.strictEqual(result.lastGoodUsed, false, `${status} 无 LKG 时回代码默认`)
+  }
+})
+
 // ===== F4-1：持久 LKG（新进程降级时沿用上次合法 override）=====
 // 为什么必须开子进程：本套件的 loadFilterRules 调用都在同一进程里，进程内 lastGood 会掩盖
 // 「新进程拿到的是代码默认」这个缺陷本体——控制台 auto-run 每 5 秒 spawn 的正是新进程。

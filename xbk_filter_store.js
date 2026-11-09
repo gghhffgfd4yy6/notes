@@ -639,6 +639,36 @@ function removeLastGood (filePath) {
   }
 }
 
+// ============================================================
+// F4-3：瞬时读失败不得折叠成「规则文件损坏」
+//
+// `replaced`（读后复检发现 dev/ino 或类型变了）与 `ioError`（读瞬间的 EIO/EBUSY 等）都是**瞬时**
+// 并发事实，不是「这份文件永久不可用」：控制台保存用原子 rename，另一进程在 rename 前后的一瞬
+// 就能让读失败。旧实现一律按损坏降级 ⇒ 白丢一轮合法规则、控制台亮红条（还可被当成「已降级」）。
+// 现在：这两类先退避 50ms 重读一次，仍失败才降级；`unsafe`（确定性非普通文件）与 `tooLarge`
+// 不做重读、直接降级，且**不隔离**（本模块从不移动/改名任何文件）。
+// ============================================================
+const TRANSIENT_READ_RETRY_MS = 50
+
+function sleepMs (ms) {
+  // 本模块读路径全同步（loadFilterRules 在 App.run 开头同步调用），不能 await；Atomics.wait 是
+  // Node 主线程可用的同步睡眠，不占 CPU（忙等会让 50ms 退避变成一次 CPU 尖峰）。
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch (e) {
+    const until = Date.now() + ms
+    while (Date.now() < until) { /* 极端环境（无 SharedArrayBuffer）下的忙等兜底 */ }
+  }
+}
+
+function isTransientReadStatus (status) {
+  return status === 'replaced' || status === 'ioError'
+}
+
+function readRulesFile (filePath) {
+  return storage.readSafeTextResult(filePath, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
+}
+
 function corruptResult (defaults, keyword, message, key, lastGoodFile) {
   // 损坏降级：优先本目录的 last-known-good（先进程内缓存，其次持久 LKG 文件——后者是「新进程」场景
   // 的唯一来源）；两者都没有才回代码默认。
@@ -689,7 +719,13 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   // F4-2：openNonBlocking —— 裸 O_RDONLY 打开无写者的 FIFO 会同步阻塞（无日志、无退出码），
   // 控制台每 5 秒 spawn 的单轮进程会永久挂死；O_NONBLOCK 下 open FIFO 立刻 ENXIO ⇒ unsafe，
   // 随后的 fstat 普通文件校验同样拒绝一切非普通文件。下同（applied / LKG 读取）。
-  const read = storage.readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
+  let read = readRulesFile(paths.file)
+  if (isTransientReadStatus(read.status)) {
+    // F4-3：replaced / ioError 是瞬时并发事实（另一进程原子 rename 覆盖文件的那一瞬），
+    // 退避 50ms 重读一次再判降级——否则会白丢一轮合法规则并误报损坏。
+    sleepMs(TRANSIENT_READ_RETRY_MS)
+    read = readRulesFile(paths.file)
+  }
   if (read.status === 'missing') {
     // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废（进程内缓存 + 持久 LKG 一起清）。
     // 否则「删文件 → 之后又出现畸形文件」会把早已废弃的旧规则复活成生效规则（A4）。
@@ -699,7 +735,9 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
     return { ...merged, override: {}, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }
   }
   if (read.status !== 'ok') {
-    // unsafe / replaced / tooLarge / ioError：全部按损坏处理（安全读已保证不泄露非普通文件内容）。
+    // unsafe（open ELOOP / fstat 非普通文件，确定性）与 tooLarge（确定性）不做重读、直接降级，
+    // 且**不隔离**：本模块从不移动/改名任何文件（覆盖文件是用户资产，隔离它等于替用户做决定）；
+    // replaced / ioError 已在上面重读过一次，到这里说明仍未恢复。
     return corruptResult(defaults, keyword, `覆盖文件不可读（${read.status}）`, key, paths.lastgood)
   }
   const modeCheck = enforceOwnerOnlyMode(paths.file)
