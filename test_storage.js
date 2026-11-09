@@ -1337,6 +1337,33 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(!fs.existsSync(out23 + '.tmp'), '陈旧的确定性临时文件必须被清掉')
     assert.strictEqual(LogArchive.readGzPage(out23, 1, 100).lines.length, 40, '新发布归档必须可读')
     assert.strictEqual(LogArchive.readMarker(log23), '20261109-20261115', '封档成功必须推进 marker')
+
+    // ⑯ F1-13：同一路径连续截断失败，sealLog 内部 WARN 必须限频，不能每次重试都刷一条。
+    // 旧实现直接 console.warn，调用方的 60s 限频只管抛出去的那条，内部告警会按行刷屏。
+    const dir24 = make('logarch-f24')
+    fs.mkdirSync(dir24, { recursive: true })
+    const log24 = path.join(dir24, 'run.log')
+    fs.writeFileSync(log24, Array.from({ length: 40 }, (_, i) => 'F24 第' + i + '行').join('\n') + '\n')
+    LogArchive.writeMarker(log24, '20261102-20261108')
+    const warns24 = []
+    const origWarn24 = console.warn
+    const origTrunc24 = fs.ftruncateSync
+    let err24a = null
+    let err24b = null
+    try {
+      fs.ftruncateSync = () => { const e = new Error('EIO: 注入截断失败'); e.code = 'EIO'; throw e }
+      console.warn = (...a) => { warns24.push(a.map(String).join(' ')) }
+      try { LogArchive.sealLog(log24, dir24, '20261102-20261108', '20261109-20261115') } catch (e) { err24a = e }
+      try { LogArchive.sealLog(log24, dir24, '20261102-20261108', '20261109-20261115') } catch (e) { err24b = e }
+    } finally {
+      fs.ftruncateSync = origTrunc24
+      console.warn = origWarn24
+    }
+    assert.ok(err24a && err24a.code === 'EARCHTRUNC', '第一次截断失败必须抛 EARCHTRUNC')
+    assert.ok(err24b && err24b.code === 'EARCHTRUNC', '第二次截断失败必须抛 EARCHTRUNC')
+    const truncWarns24 = warns24.filter((w) => w.includes('截断明文失败') && w.includes(log24))
+    assert.strictEqual(truncWarns24.length, 1,
+      `同一路径 60s 内连续失败只应告警一次（旧实现每条重试都刷）：${JSON.stringify(truncWarns24)}`)
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

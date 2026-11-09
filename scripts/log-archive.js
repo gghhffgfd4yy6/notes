@@ -166,6 +166,25 @@ function archiveError (msg) {
   return Object.assign(new Error(msg), { code: 'EARCHIVE' })
 }
 
+// sealLog 内部告警限频（Sourcery PRRT_kwDOT8kkjs61McyE）：封档失败会随每次日志写入重试，
+// 旧实现每次重试都直接 console.warn，调用方的 60s 限频只覆盖「抛到调用方的那一条」，
+// 内部这些 WARN 会按行刷屏。按「类别 + 日志路径」60s 限频；不同日志/不同原因互不影响。
+const ARCHIVE_WARN_INTERVAL_MS = 60 * 1000
+const archiveWarnAt = new Map()
+
+function warnArchive (kind, logPath, msg) {
+  const key = kind + '|' + logPath
+  const now = Date.now()
+  const last = archiveWarnAt.get(key)
+  if (last !== undefined && now - last < ARCHIVE_WARN_INTERVAL_MS) return false
+  if (archiveWarnAt.size > 64) {
+    for (const [k, at] of archiveWarnAt) if (now - at >= ARCHIVE_WARN_INTERVAL_MS) archiveWarnAt.delete(k)
+  }
+  archiveWarnAt.set(key, now)
+  console.warn(msg)
+  return true
+}
+
 // 封档事务日志：记录「gz+idx 已发布、正在/已经截断明文」这一步。
 // 为什么需要它（Sourcery PRRT_kwDOT8kkjs61McwB）：截断成功但 .week 写失败时，明文里可能
 // 已经追加了新周内容；下次 sealLog 看到「前缀与归档不一致」必须能区分两种现场——
@@ -511,23 +530,23 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
     } else if (writable && st.size >= idx.bytes) {
       if (journalMatches) {
         // 上次已截断（journal 为证），这期间追加的全部是新周内容：不截、不搬，只补 marker。
-        console.warn(`⚠️ 日志归档：明文前缀与归档内容不一致（上次截断已完成），保留全部明文、只推进标记：${logPath}`)
+        warnArchive('mismatch', logPath, `⚠️ 日志归档：明文前缀与归档内容不一致（上次截断已完成），保留全部明文、只推进标记：${logPath}`)
       } else {
         throw archiveError(`明文前缀与归档内容不一致，且没有可证明「上次截断已完成」的事务记录，保留明文与旧标记：${logPath}`)
       }
     } else if (writable) {
       // 明文比归档短：可能上次截断成功但标记没写成功。不做截断（避免删掉未归档的新内容），只补标记。
-      console.warn(`⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
+      warnArchive('short', logPath, `⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
     } else {
       // 只读打开（rw 失败）无法截断，但数据已在 gz 里；留下告警而不是静默跳过。
-      console.warn(`⚠️ 日志归档：明文不可写，跳过截断（数据已归档）：${logPath}`)
+      warnArchive('readonly', logPath, `⚠️ 日志归档：明文不可写，跳过截断（数据已归档）：${logPath}`)
     }
   } catch (e) {
     if (e && e.code === 'EARCHIVE') {
-      console.warn(`⚠️ 日志归档：${e.message}`)
+      warnArchive('verify', logPath, `⚠️ 日志归档：${e.message}`)
       throw e
     }
-    console.warn(`⚠️ 日志归档：截断明文失败，保留旧周标记以便下一轮重试：${logPath}（${e.code || e.message}）`)
+    warnArchive('trunc', logPath, `⚠️ 日志归档：截断明文失败，保留旧周标记以便下一轮重试：${logPath}（${e.code || e.message}）`)
     throw Object.assign(new Error(`日志归档截断失败：${logPath}（${e.code || e.message}）`), { code: 'EARCHTRUNC', cause: e })
   } finally {
     try { fs.closeSync(fdIn) } catch (e) {}
