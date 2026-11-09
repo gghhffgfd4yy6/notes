@@ -1006,6 +1006,80 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(LogArchive.readMarker(log13), '20261109-20261115', '重试成功后 marker 才推进')
     assert.strictEqual(fs.readFileSync(log13, 'utf8'), '', '重试成功后明文必须被截断')
     assert.strictEqual(LogArchive.readGzPage(retry13.path, 1, 100).lines[0], 'F13 第0行', '重试后归档必须仍可读')
+
+    // ⑧ F1-4：截断成功但 .week 写失败（明文=0、gz+idx 已发布、marker 仍旧周）后，新周内容已追加
+    // 且长度超过 idx.bytes —— 旧恢复分支只按 st.size >= idx.bytes 认定「明文前缀还是归档内容」，
+    // 会把 [idx.bytes, size) 搬到文件头再截断：静默丢掉新内容开头 idx.bytes 字节、留下半行，
+    // 随后 marker 照常推进，数据不可恢复且无任何 WARN。
+    const dir14 = make('logarch-f14')
+    fs.mkdirSync(dir14, { recursive: true })
+    const log14 = path.join(dir14, 'run.log')
+    const old14 = Buffer.from(Array.from({ length: 40 }, (_, i) => 'F14 上周第' + i + '行 ' + 'a'.repeat(12)).join('\n') + '\n')
+    fs.writeFileSync(log14, old14)
+    LogArchive.writeMarker(log14, '20261102-20261108')
+    const first14 = LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115')
+    // 复现现场：明文已截到 0、gz+idx 都在、marker 仍是旧周（.week 写入失败）
+    LogArchive.writeMarker(log14, '20261102-20261108')
+    const origRename14 = fs.renameSync
+    let markerErr14 = null
+    try {
+      fs.renameSync = (from, to) => {
+        if (typeof to === 'string' && to.endsWith('.week')) {
+          const e = new Error('EBUSY: 注入 .week 写失败'); e.code = 'EBUSY'; throw e
+        }
+        return origRename14.call(fs, from, to)
+      }
+      try { LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr14 = e }
+    } finally { fs.renameSync = origRename14 }
+    assert.ok(markerErr14 && markerErr14.code === 'EBUSY', '注入必须让 .week 写入失败（复现现场）')
+    assert.strictEqual(fs.statSync(log14).size, 0, '现场必须是「明文已截断到 0」')
+    assert.strictEqual(LogArchive.readMarker(log14), '20261102-20261108', '现场 marker 仍停在旧周')
+    // 新周内容必须比 idx.bytes 长，否则会落进「明文比归档短」分支，掩盖本缺陷
+    const new14 = Buffer.from(Array.from({ length: 90 }, (_, i) => 'F14 新周第' + i + '行 ' + 'b'.repeat(12)).join('\n') + '\n')
+    assert.ok(new14.length > first14.bytes, `新周内容必须超过 idx.bytes（${new14.length} vs ${first14.bytes}）`)
+    fs.appendFileSync(log14, new14)
+    const warns14 = []
+    const origWarn14 = console.warn
+    let second14 = null
+    try {
+      console.warn = (...a) => { warns14.push(a.map(String).join(' ')) }
+      second14 = LogArchive.sealLog(log14, dir14, '20261102-20261108', '20261109-20261115')
+    } finally { console.warn = origWarn14 }
+    assert.ok(second14, '恢复必须补完 marker，不得返回 null')
+    assert.strictEqual(LogArchive.readMarker(log14), '20261109-20261115', 'marker 必须推进到新周')
+    assert.ok(fs.readFileSync(log14).equals(new14), '新周明文一个字节都不能丢（旧实现会丢掉开头 idx.bytes 字节）')
+    assert.ok(warns14.some((w) => w.includes('前缀与归档内容不一致') && w.includes(log14)),
+      `前缀核验失败必须有 WARN（不得静默丢数据）：${JSON.stringify(warns14)}`)
+    const pg14 = LogArchive.readGzPage(first14.path, 1, 100)
+    assert.strictEqual(pg14.lines[0], 'F14 上周第0行 ' + 'a'.repeat(12), '旧归档必须保持可读')
+    assert.strictEqual(pg14.total, 40, '旧归档行数不变')
+
+    // ⑧b 正路径不回归：明文前缀仍是归档内容、只是尾部被 fail-open 写者追加 ⇒ 必须照常搬家并截断
+    const dir15 = make('logarch-f15')
+    fs.mkdirSync(dir15, { recursive: true })
+    const log15 = path.join(dir15, 'run.log')
+    const old15 = Buffer.from(Array.from({ length: 30 }, (_, i) => 'F15 上周第' + i + '行 ' + 'c'.repeat(12)).join('\n') + '\n')
+    fs.writeFileSync(log15, old15)
+    LogArchive.writeMarker(log15, '20261102-20261108')
+    LogArchive.sealLog(log15, dir15, '20261102-20261108', '20261109-20261115')
+    // 制造「已发布、未截断」现场：明文写回原文、marker 退回旧周，再追加两行新周内容
+    fs.writeFileSync(log15, old15)
+    LogArchive.writeMarker(log15, '20261102-20261108')
+    const extra15 = Buffer.from('F15 新周追加行 1\nF15 新周追加行 2\n')
+    fs.appendFileSync(log15, extra15)
+    const second15 = LogArchive.sealLog(log15, dir15, '20261102-20261108', '20261109-20261115')
+    assert.ok(second15, '前缀一致时必须正常补完封档')
+    assert.ok(fs.readFileSync(log15).equals(extra15), '追加段必须被搬到文件头并完整保留（旧行为不能回归）')
+    assert.strictEqual(LogArchive.readMarker(log15), '20261109-20261115', '正路径也必须推进 marker')
+
+    // ⑧c 多成员档案走末成员比对分支：复用 ⑤ 的 4.3MiB 归档，把明文写回、marker 退回旧周，
+    // 重新封档必须核验通过并照常截断（否则多成员归档会静默退化成「永远不截断」）。
+    fs.writeFileSync(log11, src11)
+    LogArchive.writeMarker(log11, '20261109-20261115')
+    const again11 = LogArchive.sealLog(log11, dir11, '20261109-20261115', '20261116-20261122')
+    assert.ok(again11 && again11.lines === 60000, '多成员档案必须能正常补完封档')
+    assert.strictEqual(fs.readFileSync(log11, 'utf8'), '', '多成员档案恢复后明文必须被截断')
+    assert.strictEqual(LogArchive.readMarker(log11), '20261116-20261122', '多成员档案恢复后 marker 必须推进')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

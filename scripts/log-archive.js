@@ -19,6 +19,8 @@
 //   - 上次崩在「发布之后、截断/标记之前」时（gz 在、idx 缺 / gz+idx 都在、标记仍旧）不返回
 //     null：idx 缺则从 gz 重建并补写，然后继续补做截断与标记；重建失败抛明确错误。
 //   - 读完到截断之间若有 fail-open 写者追加，把追加段搬回文件开头再截断，不吞这几行。
+//     搬家前先核验明文 [0, idx.bytes) 仍是归档内容（解压 gz 首/末成员比对边界指纹）：不一致说明
+//     上次已截断、明文里其实全是新周内容（F1-4），此时保留全部明文、只补 marker 并告警，绝不截断。
 
 const fs = require('fs')
 const path = require('path')
@@ -119,6 +121,65 @@ function readMarker (logPath) {
 
 function archiveError (msg) {
   return Object.assign(new Error(msg), { code: 'EARCHIVE' })
+}
+
+const VERIFY_HEAD_BYTES = 64 * 1024 // 恢复分支核对「明文前缀 = 归档内容」用的头/尾窗口
+const VERIFY_TAIL_BYTES = 64 * 1024
+
+// 定点读：读不满（EOF/短读）返回 null，调用方按「核验失败」处理，绝不拿半截数据当证据。
+function readExactAt (fd, pos, len) {
+  if (!(len > 0)) return null
+  const buf = Buffer.alloc(len)
+  let got = 0
+  while (got < len) {
+    const n = fs.readSync(fd, buf, got, len - got, pos + got)
+    if (n <= 0) return null
+    got += n
+  }
+  return buf
+}
+
+function gunzipMemberAt (fd, m) {
+  const buf = readExactAt(fd, m.off, m.len)
+  if (!buf) return null
+  try { return zlib.gunzipSync(buf) } catch (e) { return null }
+}
+
+// 判定明文 [0, idx.bytes) 是否仍是归档内容（F1-4）。
+// 只看 st.size >= idx.bytes 不够：F1-3 把 marker 推进挪到截断之后，会有「明文已截到 0、
+// gz+idx 已发布、marker 仍旧周」的现场；这期间追加的新周内容一旦超过 idx.bytes，旧逻辑就会把
+// [idx.bytes, size) 搬到文件头再截断——静默丢掉新内容开头 idx.bytes 字节、留下半行。
+// 这里用边界指纹核验：解压 gz 首成员比对明文开头，解压末成员比对 [idx.bytes - 尾长, idx.bytes)。
+// 不整份解压：封档失败会随每次日志写入重试，「截断持续失败」时整份解压会拖慢主流程。
+// 残余边界：只有新内容与归档的头/尾窗口逐字节相同才会误判（真实日志带时间戳，做不到）；
+// 索引与档案对不上（成员解压失败/总字节不符）一律判「不一致」，走保留明文的保守分支。
+function plaintextPrefixIsArchive (fdIn, gzPath, idx) {
+  if (!idx.members || !idx.members.length || !(idx.bytes > 0)) return false
+  let o
+  try { o = openLog(gzPath, false) } catch (e) { return false }
+  try {
+    const firstText = gunzipMemberAt(o.fd, idx.members[0])
+    if (!firstText || !firstText.length) return false
+    const headLen = Math.min(firstText.length, VERIFY_HEAD_BYTES, idx.bytes)
+    const plainHead = readExactAt(fdIn, 0, headLen)
+    if (!plainHead || !plainHead.equals(firstText.subarray(0, headLen))) return false
+
+    let tailText
+    if (idx.members.length === 1) {
+      // 单成员档案：头窗口已经是全文的一部分，总字节必须自洽，否则索引不可信。
+      if (idx.bytes !== firstText.length) return false
+      tailText = firstText
+    } else {
+      tailText = gunzipMemberAt(o.fd, idx.members[idx.members.length - 1])
+      if (!tailText || !tailText.length) return false
+    }
+    const tailLen = Math.min(tailText.length, VERIFY_TAIL_BYTES, idx.bytes)
+    if (tailLen <= 0) return false
+    const plainTail = readExactAt(fdIn, idx.bytes - tailLen, tailLen)
+    return !!plainTail && plainTail.equals(tailText.subarray(tailText.length - tailLen))
+  } catch (e) {
+    return false
+  } finally { try { fs.closeSync(o.fd) } catch (e) {} }
 }
 
 function countNewlines (buf) {
@@ -287,10 +348,15 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   // 新周而明文还全是上一周——下一轮直接跳过归档，上一周明文被 100MB 截尾覆盖。截断失败必须
   // 留痕并抛错（调用方保留 archivePending）。读完到截断之间可能有 fail-open 写者追加：
   // 把 [idx.bytes, size) 搬回文件开头再截断。
+  // F1-4：但「size 够大」不等于「明文前缀还是归档内容」——上次截断成功、.week 写失败后，
+  // 新周内容会被追加到空文件里；超过 idx.bytes 后再按 [idx.bytes, size) 搬家，就会静默丢掉
+  // 新内容开头 idx.bytes 字节（还留下半行）。搬家前必须核验前缀，核验不过就保留全部明文、
+  // 只补 marker，并留下可观测告警（宁可让旧周内容留在明文里重复一遍，也不能删掉新周数据）。
   try {
     const st = fs.fstatSync(fdIn)
     let keepLen = 0
-    if (writable && st.size >= idx.bytes) {
+    const prefixIsArchive = writable && st.size >= idx.bytes && plaintextPrefixIsArchive(fdIn, outPath, idx)
+    if (prefixIsArchive) {
       const extra = Buffer.alloc(st.size - idx.bytes)
       let got = 0
       while (got < extra.length) {
@@ -306,6 +372,10 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
       }
       keepLen = off
       fs.ftruncateSync(fdIn, keepLen)
+    } else if (writable && st.size >= idx.bytes) {
+      // 明文不比归档短、前缀却不是归档内容：只可能是上次已截断、这期间又追加了新内容。
+      // 不能截、不能搬：全部明文都是新周数据，只把 marker 补到新周。
+      console.warn(`⚠️ 日志归档：明文前缀与归档内容不一致（疑似上次已截断后又有新内容），保留全部明文、只推进标记：${logPath}`)
     } else if (writable) {
       // 明文比归档短：可能上次截断成功但标记没写成功。不做截断（避免删掉未归档的新内容），只补标记。
       console.warn(`⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
