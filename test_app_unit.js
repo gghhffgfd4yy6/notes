@@ -990,7 +990,8 @@ check('_logTrimCut 跨块回退扫描：最后换行在 10MiB 窗口之外仍返
 
 check('_rewriteLogFrom 流式保留 [from, EOF) 并原子替换原文件', () => {
   const rfs = require('fs')
-  const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trimwrite-'))
+  // SonarCloud javascript:S5443（与 M8-1 同规则）：父目录用 os.tmpdir()，不再取 process.env.TMPDIR。
+  const dir = rfs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-trimwrite-'))
   const p = path.join(dir, 'run.log')
   const cut = 1024 * 1024 + 1
   const head = Buffer.from('A'.repeat(1024 * 1024) + '\n')
