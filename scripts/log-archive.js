@@ -95,6 +95,47 @@ function writeAllSync (fd, buf) {
   }
 }
 
+// 定点写：把 buf[0, len) 写到 fd 的 pos；同样把短写当失败而不是成功。
+function writeAllAtSync (fd, buf, len, pos) {
+  let off = 0
+  while (off < len) {
+    const n = fs.writeSync(fd, buf, off, len - off, pos + off)
+    if (!(n > 0)) throw Object.assign(new Error('short write'), { code: 'ESHORT' })
+    off += n
+  }
+}
+
+// 把明文 [from, EOF) 搬到文件开头并截断，作为「已归档前缀 + 并发追加段」的压缩动作。
+// fail-open 写者（拿不到锁的进程）可能在 fstat 快照之后继续 append：只按快照长度搬一次再
+// ftruncate 会把快照之后的追加整段删掉（写者以为写成功，日志里却没有这一行）。这里的做法是
+// 「搬完再 fstat」：只要 EOF 比已搬到的位置更远，就继续搬新增段；只有确认已搬位置 == 当前 EOF
+// 才允许截断。极端情况下写者持续追加（轮次上限）就抛错、把截断推迟到下一轮——宁可这轮不清空，
+// 也不能吞掉别人已经写成功的行。
+const MOVE_CHUNK_BYTES = 256 * 1024
+const MOVE_MAX_ROUNDS = 16
+
+function moveTailToHeadAndTruncate (fdIn, from, logPath) {
+  const buf = Buffer.alloc(MOVE_CHUNK_BYTES)
+  let src = from
+  let dst = 0
+  for (let round = 0; ; round++) {
+    const size = fs.fstatSync(fdIn).size
+    while (src < size) {
+      const want = Math.min(buf.length, size - src)
+      const n = fs.readSync(fdIn, buf, 0, want, src)
+      if (n <= 0) break
+      writeAllAtSync(fdIn, buf, n, dst)
+      src += n
+      dst += n
+    }
+    if (fs.fstatSync(fdIn).size <= src) break
+    if (round >= MOVE_MAX_ROUNDS) {
+      throw archiveError(`归档搬运期间明文持续追加，推迟到下一轮再截断：${logPath}`)
+    }
+  }
+  fs.ftruncateSync(fdIn, dst)
+}
+
 function writeAtomic (filePath, data) {
   const tmp = filePath + '.' + process.pid + '.' + crypto.randomBytes(4).toString('hex') + '.tmp'
   const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600) // nosemgrep（tmp 由目标路径 + pid + 随机后缀构成）
@@ -354,24 +395,12 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   // 只补 marker，并留下可观测告警（宁可让旧周内容留在明文里重复一遍，也不能删掉新周数据）。
   try {
     const st = fs.fstatSync(fdIn)
-    let keepLen = 0
     const prefixIsArchive = writable && st.size >= idx.bytes && plaintextPrefixIsArchive(fdIn, outPath, idx)
     if (prefixIsArchive) {
-      const extra = Buffer.alloc(st.size - idx.bytes)
-      let got = 0
-      while (got < extra.length) {
-        const n = fs.readSync(fdIn, extra, got, extra.length - got, idx.bytes + got)
-        if (n <= 0) break
-        got += n
-      }
-      let off = 0
-      while (off < got) {
-        const n = fs.writeSync(fdIn, extra, off, got - off, off)
-        if (!(n > 0)) break
-        off += n
-      }
-      keepLen = off
-      fs.ftruncateSync(fdIn, keepLen)
+      // F1-7：搬运/截断期间仍可能有 fail-open 写者追加（它拿不到写锁）。按快照长度只搬一次再
+      // ftruncate 会把快照之后的追加整段删掉——写者返回成功、日志里却没有这一行。helper 会
+      // 「搬完再 fstat」，把新增段接着搬，确认已搬位置就是当前 EOF 才截断。
+      moveTailToHeadAndTruncate(fdIn, idx.bytes, logPath)
     } else if (writable && st.size >= idx.bytes) {
       // 明文不比归档短、前缀却不是归档内容：只可能是上次已截断、这期间又追加了新内容。
       // 不能截、不能搬：全部明文都是新周数据，只把 marker 补到新周。

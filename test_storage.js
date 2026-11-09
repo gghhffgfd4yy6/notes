@@ -1140,6 +1140,50 @@ const LogArchive = require('./scripts/log-archive')
     const pathCalls14 = [...new Set(fsCalls14.filter((tok) => !allowedFdCalls14.includes(tok)))]
     assert.deepStrictEqual(pathCalls14, [],
       `⑧ 现场不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流）：${pathCalls14.join(', ')}`)
+
+    // ⑨ F1-7：搬运期间 fail-open 写者仍在追加 ⇒ 截断不得吞掉快照之后的追加。
+    // 旧实现按 `st.size` 快照只搬一次，随后 ftruncate(keepLen) 会把快照之后 append 的行整段删掉：
+    // 写者返回成功，日志里却没有这一行。这里在 helper 第一次 fstat（快照之后）时真实追加一行，
+    // 断言最终明文 = 原追加段 + 竞态追加行（一个字节都不能少）。
+    const dir17 = make('logarch-f17')
+    fs.mkdirSync(dir17, { recursive: true })
+    const log17 = path.join(dir17, 'run.log')
+    const old17 = Buffer.from(Array.from({ length: 30 }, (_, i) => 'F17 上周第' + i + '行 ' + 'd'.repeat(12)).join('\n') + '\n')
+    fs.writeFileSync(log17, old17)
+    LogArchive.writeMarker(log17, '20261102-20261108')
+    LogArchive.sealLog(log17, dir17, '20261102-20261108', '20261109-20261115')
+    // 复现「gz+idx 已发布、明文还没截断」现场：写回原文、marker 退回旧周
+    fs.writeFileSync(log17, old17)
+    LogArchive.writeMarker(log17, '20261102-20261108')
+    const extra17 = Buffer.from('F17 并发追加 A\nF17 并发追加 B\n')
+    fs.appendFileSync(log17, extra17)
+    const race17 = Buffer.from('F17 快照后竞态追加 C\n')
+    const origOpen17 = fs.openSync
+    const origRead17 = fs.readSync
+    let plainFd17 = -1
+    let plainReads17 = 0
+    let second17 = null
+    try {
+      fs.openSync = function (p, flags, mode) {
+        const fd = origOpen17.call(fs, p, flags, mode)
+        if (p === log17 && typeof flags === 'number' && (flags & fs.constants.O_RDWR)) plainFd17 = fd
+        return fd
+      }
+      fs.readSync = function (fd, buf, off, len, pos) {
+        // 第一次读明文发生在 st 快照之后（前缀核验/搬运）：此刻追加一行，模拟 fail-open 写者。
+        if (fd === plainFd17 && plainReads17++ === 0) fs.appendFileSync(log17, race17)
+        return origRead17.call(fs, fd, buf, off, len, pos)
+      }
+      second17 = LogArchive.sealLog(log17, dir17, '20261102-20261108', '20261109-20261115')
+    } finally {
+      fs.openSync = origOpen17
+      fs.readSync = origRead17
+    }
+    assert.ok(second17, '恢复必须补完封档')
+    const kept17 = fs.readFileSync(log17)
+    assert.ok(kept17.equals(Buffer.concat([extra17, race17])),
+      `快照之后追加的行不得被 ftruncate 吞掉（期望 ${extra17.length + race17.length} 字节，实际 ${kept17.length}）`)
+    assert.strictEqual(LogArchive.readMarker(log17), '20261109-20261115', '并发追加不影响 marker 推进')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
