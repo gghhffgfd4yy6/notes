@@ -1513,14 +1513,15 @@ const LogArchive = require('./scripts/log-archive')
     fs.writeFileSync(log28, tail28)
     LogArchive.writeMarker(log28, '20261102-20261108')
     fs.writeFileSync(log28 + '.seal.json', JSON.stringify({
-      v: 2,
+      v: 3,
       source: 'run.log',
       prevKey: '20261102-20261108',
       nextKey: '20261109-20261115',
       bytes: idx28.bytes,
       lines: idx28.lines,
       phase: 'truncating',
-      size: tail28.length
+      size: tail28.length,
+      before: idx28.bytes + tail28.length
     }))
     const second28 = LogArchive.sealLog(log28, dir28, '20261102-20261108', '20261109-20261115')
     assert.ok(second28, 'truncating 现场必须能补完 marker，不得返回 null')
@@ -1528,8 +1529,10 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(LogArchive.readMarker(log28), '20261109-20261115', '截断已确认后 marker 必须推进')
     assert.ok(!fs.existsSync(log28 + '.seal.json'), '补完 marker 后事务记录必须清理')
 
-    // ⑰c truncating 但明文比待截断长度长：无法区分「截断已完成 + 新追加」与「截断未做 + 旧周
-    // 残留」，必须报错保留原样，绝不能凭 phase 就推进 marker（那会把旧周残留当成新周内容）。
+    // ⑰c truncating、长度恰好等于搬运前长度（before = bytes + size），但 [size, before) 并不是
+    // 搬运遗留的旧前缀尾巴——这正是「截断已落地、之后又追加了与归档等长内容」的形态。长度相同不能
+    // 单独作为「截断未做」的证据（R7 加了内容核验），必须报错保留原样，绝不能凭长度就推进 marker
+    // 或补做 ftruncate（那会删掉刚写入的新内容）。
     const dir31 = make('logarch-f31')
     fs.mkdirSync(dir31, { recursive: true })
     const log31 = path.join(dir31, 'run.log')
@@ -1541,14 +1544,15 @@ const LogArchive = require('./scripts/log-archive')
     fs.writeFileSync(log31, ambiguous31)
     LogArchive.writeMarker(log31, '20261102-20261108')
     fs.writeFileSync(log31 + '.seal.json', JSON.stringify({
-      v: 2,
+      v: 3,
       source: 'run.log',
       prevKey: '20261102-20261108',
       nextKey: '20261109-20261115',
       bytes: idx31.bytes,
       lines: idx31.lines,
       phase: 'truncating',
-      size: tail28.length
+      size: tail28.length,
+      before: idx31.bytes + tail28.length
     }))
     let err31 = null
     const origWarn31 = console.warn
@@ -1559,6 +1563,109 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(err31 && err31.code === 'EARCHIVE', `无法判定的 truncating 现场必须抛 EARCHIVE（实际 ${err31 && err31.code}）`)
     assert.strictEqual(LogArchive.readMarker(log31), '20261102-20261108', '无法判定时绝不能推进 marker')
     assert.ok(fs.readFileSync(log31).equals(ambiguous31), '无法判定时必须保留明文原样')
+
+    // ⑰d R7：搬运完成（dst>0）、ftruncate 失败——持久可达的封档卡死现场。旧实现 journal 停在
+    // truncating 且只认「明文长度 == size」；搬运已完成时长度是 before = idx.bytes + size，于是每轮
+    // sealLog 都判「长度对不上」抛 EARCHIVE：marker 永不推进、archivePending 永久为真、100MB 截尾
+    // 永久禁用（残余风险 2 只登记成毫秒级窗口，实际是持久态）。修复后 journal 记录 before，下一轮
+    // 据长度 + 内容补一次搬运/截断即可恢复；连续注入失败仍必须可重试（EARCHTRUNC）。
+    const dir32 = make('logarch-f32')
+    fs.mkdirSync(dir32, { recursive: true })
+    const log32 = path.join(dir32, 'run.log')
+    const old32 = Buffer.from(Array.from({ length: 40 }, (_, i) => 'F32 上周第' + i + '行 ' + 'a'.repeat(20)).join('\n') + '\n')
+    fs.writeFileSync(log32, old32)
+    LogArchive.writeMarker(log32, '20261102-20261108')
+    const first32 = LogArchive.sealLog(log32, dir32, '20261102-20261108', '20261109-20261115')
+    const idx32 = JSON.parse(fs.readFileSync(first32.path + '.idx.json', 'utf8'))
+    // 复现「gz+idx 已发布、明文未截断」现场，再追加新周内容（dst>0，搬运会覆盖明文头部）
+    fs.writeFileSync(log32, old32)
+    LogArchive.writeMarker(log32, '20261102-20261108')
+    const new32 = Buffer.from(Array.from({ length: 900 }, (_, i) => 'F32 新周第' + i + '行 ' + 'b'.repeat(24)).join('\n') + '\n')
+    fs.appendFileSync(log32, new32)
+    assert.ok(new32.length > 0, '夹具：新周内容必须非空（dst>0，才不是既有 ⑦ 的 dst=0 现场）')
+    const beforeSize32 = old32.length + new32.length
+    const origTrunc32 = fs.ftruncateSync
+    const origWarn32 = console.warn
+    let err32a = null
+    let err32b = null
+    try {
+      fs.ftruncateSync = () => { const e = new Error('EIO: 注入截断失败'); e.code = 'EIO'; throw e }
+      console.warn = () => {}
+      try { LogArchive.sealLog(log32, dir32, '20261102-20261108', '20261109-20261115') } catch (e) { err32a = e }
+      try { LogArchive.sealLog(log32, dir32, '20261102-20261108', '20261109-20261115') } catch (e) { err32b = e }
+    } finally {
+      fs.ftruncateSync = origTrunc32
+      console.warn = origWarn32
+    }
+    assert.ok(err32a && err32a.code === 'EARCHTRUNC', `第一次截断失败必须抛 EARCHTRUNC（实际 ${err32a && err32a.code}）`)
+    const journal32 = JSON.parse(fs.readFileSync(log32 + '.seal.json', 'utf8'))
+    assert.strictEqual(journal32.phase, 'truncating', '搬运完成后事务记录必须停在 truncating')
+    assert.strictEqual(journal32.size, new32.length, `待截断长度必须是搬运后的新周长度（实际 ${journal32.size}）`)
+    assert.strictEqual(journal32.before, idx32.bytes + new32.length,
+      `truncating 必须记录搬运前长度 bytes + size（实际 ${journal32.before}）`)
+    assert.strictEqual(fs.statSync(log32).size, beforeSize32, '搬运不改文件长度；截断失败必须原样保留')
+    assert.strictEqual(LogArchive.readMarker(log32), '20261102-20261108', '截断失败时 marker 绝不能推进')
+    assert.ok(fs.readFileSync(log32).subarray(0, new32.length).equals(new32),
+      '夹具必须真的完成搬运（明文头部已是新周内容）')
+    // 第二轮注入仍失败：必须继续 EARCHTRUNC（保留下一轮重试机会），不得退化成不可恢复的 EARCHIVE
+    assert.ok(err32b && err32b.code === 'EARCHTRUNC', `第二轮截断失败仍须 EARCHTRUNC（实际 ${err32b && err32b.code}）`)
+    assert.strictEqual(LogArchive.readMarker(log32), '20261102-20261108', '两轮失败后 marker 仍不得推进')
+    // 第三轮（无注入）：必须自动补完——截断到 size、推进 marker、清 journal
+    const second32 = LogArchive.sealLog(log32, dir32, '20261102-20261108', '20261109-20261115')
+    assert.ok(second32, '搬运完成、截断失败后的下一轮必须自动补完，不得永久 EARCHIVE')
+    assert.strictEqual(LogArchive.readMarker(log32), '20261109-20261115', '补完截断后 marker 必须推进')
+    assert.ok(!fs.existsSync(log32 + '.seal.json'), '补完后事务记录必须清理')
+    const plain32 = fs.readFileSync(log32)
+    assert.strictEqual(plain32.length, new32.length,
+      `明文长度必须等于搬运后的新周内容（实际 ${plain32.length}；旧周残留必须被截掉）`)
+    assert.ok(plain32.equals(new32), '补完截断后明文必须逐字节等于新周内容')
+    assert.strictEqual(LogArchive.readGzPage(first32.path, 1, 100).lines[0],
+      'F32 上周第0行 ' + 'a'.repeat(20), '恢复不得改写已发布的归档')
+
+    // ⑰e R7 续：真实调用方在封档失败后仍会写下一行日志（xbk_app 先尝试 sealLog、再 append），
+    // 所以下一轮看到的长度是 before + 追加段（远大于 before 的现场在真实运行里几乎不会出现）。
+    // 恢复必须把 [before, cur) 接到新周内容后面再截断：只认 cur === before 等于生产上仍然永久
+    // 卡死；直接 ftruncate(size) 又会吞掉这期间写成功的行。
+    const dir33 = make('logarch-f33')
+    fs.mkdirSync(dir33, { recursive: true })
+    const log33 = path.join(dir33, 'run.log')
+    const old33 = Buffer.from(Array.from({ length: 40 }, (_, i) => 'F33 上周第' + i + '行 ' + 'd'.repeat(20)).join('\n') + '\n')
+    fs.writeFileSync(log33, old33)
+    LogArchive.writeMarker(log33, '20261102-20261108')
+    const first33 = LogArchive.sealLog(log33, dir33, '20261102-20261108', '20261109-20261115')
+    const idx33 = JSON.parse(fs.readFileSync(first33.path + '.idx.json', 'utf8'))
+    fs.writeFileSync(log33, old33)
+    LogArchive.writeMarker(log33, '20261102-20261108')
+    const new33 = Buffer.from(Array.from({ length: 700 }, (_, i) => 'F33 新周第' + i + '行 ' + 'e'.repeat(20)).join('\n') + '\n')
+    fs.appendFileSync(log33, new33)
+    const origTrunc33 = fs.ftruncateSync
+    const origWarn33 = console.warn
+    let err33 = null
+    try {
+      fs.ftruncateSync = () => { const e = new Error('ENOSPC: 注入截断失败'); e.code = 'ENOSPC'; throw e }
+      console.warn = () => {}
+      try { LogArchive.sealLog(log33, dir33, '20261102-20261108', '20261109-20261115') } catch (e) { err33 = e }
+    } finally {
+      fs.ftruncateSync = origTrunc33
+      console.warn = origWarn33
+    }
+    assert.ok(err33 && err33.code === 'EARCHTRUNC', `截断失败必须抛 EARCHTRUNC（实际 ${err33 && err33.code}）`)
+    const journal33 = JSON.parse(fs.readFileSync(log33 + '.seal.json', 'utf8'))
+    assert.strictEqual(journal33.phase, 'truncating', '现场必须是 truncating')
+    assert.strictEqual(journal33.before, idx33.bytes + new33.length, '现场的 before 必须是 bytes + size')
+    // fail-open 追加（真实调用方在失败后继续写日志）：长度变成 before + extra，不再是 before
+    const extra33 = Buffer.from('F33 封档失败后写入的一行 ' + 'f'.repeat(120) + '\n')
+    fs.appendFileSync(log33, extra33)
+    assert.ok(fs.statSync(log33).size > journal33.before, '夹具：恢复前必须有追加，长度大于 before')
+    const second33 = LogArchive.sealLog(log33, dir33, '20261102-20261108', '20261109-20261115')
+    assert.ok(second33, '有 fail-open 追加时也必须自动补完（真实调用方每轮都会先写一行再重试）')
+    assert.strictEqual(LogArchive.readMarker(log33), '20261109-20261115', '补完后 marker 必须推进')
+    assert.ok(!fs.existsSync(log33 + '.seal.json'), '补完后事务记录必须清理')
+    const plain33 = fs.readFileSync(log33)
+    const expected33 = Buffer.concat([new33, extra33])
+    assert.strictEqual(plain33.length, expected33.length,
+      `明文长度必须是「新周内容 + 失败后追加」（实际 ${plain33.length}，期望 ${expected33.length}）`)
+    assert.ok(plain33.equals(expected33), '补完截断必须保留失败后追加的行，且旧周残留被截掉')
 
     // ⑱ R6-3：明文比归档短（st.size < idx.bytes）时 [0, idx.bytes) 区间根本不存在、前缀无法核验。
     // 契约：只有匹配的 .seal.json（phase=truncated，上次确实已完成截断）才保留全部明文、只补
