@@ -971,7 +971,9 @@ check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、�
 // ----- 截尾定位/重写（Sourcery PRRT_kwDOT8kkjs61Mcxl）：换行在 10MiB 窗口之外 -----
 check('_logTrimCut 跨块回退扫描：最后换行在 10MiB 窗口之外仍返回其结束位置', () => {
   const rfs = require('fs')
-  const dir = rfs.mkdtempSync(path.join(process.env.TMPDIR || '/tmp', 'xbk-trimcut-'))
+  // SonarCloud javascript:S5443（与 M8-1 同规则）：父目录用 os.tmpdir()，不再取可被外部改写的
+  // process.env.TMPDIR；前缀 `xbkunit-` 见文件内 C5-025 守卫。
+  const dir = rfs.mkdtempSync(path.join(os.tmpdir(), 'xbkunit-trimcut-'))
   const p = path.join(dir, 'run.log')
   const head = Buffer.from('A'.repeat(1024 * 1024) + '\n')
   const tail = Buffer.from('Z'.repeat(11 * 1024 * 1024))
