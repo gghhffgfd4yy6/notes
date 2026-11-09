@@ -586,7 +586,7 @@ function warnLastGoodWrite (filePath, detail) {
   console.warn(`⚠️ 过滤规则 LKG 写入失败（本轮规则照常生效，但下一个进程降级时只能回代码默认）：${filePath}：${detail}`)
 }
 
-function persistLastGood (filePath, filter, revision) {
+function writeLastGoodFile (filePath, filter, revision) {
   if (typeof filePath !== 'string' || filePath === '') return false
   try {
     const override = overrideFieldsOf(filter)
@@ -708,7 +708,7 @@ function corruptResult (defaults, keyword, message, key, lastGoodFile) {
   }
 }
 
-function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
+function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGood }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
@@ -729,8 +729,10 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   if (read.status === 'missing') {
     // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废（进程内缓存 + 持久 LKG 一起清）。
     // 否则「删文件 → 之后又出现畸形文件」会把早已废弃的旧规则复活成生效规则（A4）。
+    // R1-5：控制台读面（persistLastGood:false）连这一步也不做——删除同样是写盘，而「删文件=恢复默认」
+    // 由运行侧下一轮加载负责；读面代删会让 GET /api/config/filter 变成写操作（SYSTEM_CONTRACT:56 零写盘）。
     lastGoodByDir.delete(key)
-    removeLastGood(paths.lastgood)
+    if (persistLastGood !== false) removeLastGood(paths.lastgood)
     const merged = mergeActiveFilter({ defaults, keyword })
     return { ...merged, override: {}, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }
   }
@@ -751,7 +753,11 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   lastGoodByDir.set(key, { filter: { ...parsed.filter }, revision: parsed.revision })
   // F4-1：同步落盘一份持久 LKG——控制台 auto-run 每 5 秒 spawn 单轮进程，进程内 Map 对新进程等于不存在。
   // 写失败只告警（本轮规则照常生效，降级兜底质量下降），绝不抛穿本轮。
-  persistLastGood(paths.lastgood, parsed.filter, parsed.revision)
+  // R1-5：控制台的 GET 读面（/api/config/filter、/draft）也走本函数，但它是**纯读**端点
+  // （SYSTEM_CONTRACT:27/:56：控制台读取面零写盘）。若在这里无条件落盘，每拍 GET 都会新建/重写
+  // filter-rules.lastgood.json，缓存目录对控制台只读时还会每次刷一条「LKG 写入失败」错误。
+  // 故写入由调用方显式声明：persistLastGood=false 时一个字节都不写（含删除），运行侧保持默认 true。
+  if (persistLastGood !== false) writeLastGoodFile(paths.lastgood, parsed.filter, parsed.revision)
   const merged = mergeActiveFilter({ defaults, keyword, override: parsed.filter })
   return {
     ...merged,
@@ -767,8 +773,10 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
 /**
  * 读取覆盖文件并返回本轮的生效规则（每轮 App.run 开头调用一次）。
  * 任何异常都不得抛穿；文件不存在 → source:'default'、revision:0、filter 为代码默认深拷贝。
- * @param {{cacheDir:string, defaults:Object, keyword:Object,
+ * @param {{cacheDir:string, defaults:Object, keyword:Object, persistLastGood?:boolean,
  *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options
+ *   persistLastGood=false（R1-5）：纯读模式——不写/不删 <缓存目录>/filter-rules.lastgood.json，
+ *   供控制台读面（GET /api/config/filter、GET /api/config/filter/draft）使用；缺省 true（运行侧）。
  *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的五道闸（A1；
  *   其中「整份字节预算」闸不作用于读路径，`fromDisk` 跳过）；
  *   不提供时保持「只做结构校验」的既有契约（console/qinglong 等调用方无需改造）。
@@ -785,7 +793,8 @@ function loadFilterRules (options) {
       cacheDir: opts.cacheDir,
       defaults: opts.defaults,
       keyword: opts.keyword,
-      deps: opts.deps
+      deps: opts.deps,
+      persistLastGood: opts.persistLastGood
     })
   } catch (e) {
     // 兜底：读盘/解析/合并的任何未预期异常都收敛成降级结果（绝不杀整轮 run）。

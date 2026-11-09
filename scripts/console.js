@@ -4139,12 +4139,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
 
   const loadCurrentFilter = () => {
     const defaults = filterDefaults()
-    // 与 App.run 同口径传 deps：手工编辑的覆盖文件若含编译不了的规则，GET 必须报 corrupt
-    // （否则页面全绿、运行侧却在降级，A1 承诺的红条永远不出现）。
+    // 与 App.run 同口径传 deps（手改覆盖文件若含编译不了的规则，GET 必须报 corrupt）；R1-5：控制台读面零写盘，故 persistLastGood:false。
     return FilterStore.loadFilterRules({
       cacheDir: stateDir,
       defaults: defaults.filter,
       keyword: defaults.keyword,
+      persistLastGood: false,
       deps: filterValidationDeps(runtimeFilterDeps())
     })
   }

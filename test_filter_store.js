@@ -1558,6 +1558,109 @@ test('R1-3 静态接线：备份当前一代的读必须显式 openNonBlocking�
     `备份当前一代的读必须带 openNonBlocking:true（FIFO 会永久阻塞）：${line.trim()}`)
 })
 
+// R1-5：持久 LKG 写入挂在 loadFilterRules 的成功路径上，而控制台 GET /api/config/filter（4830）与
+// GET /api/config/filter/draft（4221）都调它 ⇒ 纯读请求会新建/重写 filter-rules.lastgood.json，
+// 违反 SYSTEM_CONTRACT:56「控制台读取面零写盘」（:27 明确该 GET 属读面）。inode 变化是最硬的证据：
+// writeAtomic 走 tmp+rename，每写一次 inode 必换（同一 mtime 毫秒内也能区分）。
+test('I2/R1-5 控制台读面零写盘：persistLastGood:false 的纯读不新建/不改写 LKG（运行侧仍写）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 3, filter: { pingbibiaoti: '读面规则' } })
+  const listing = () => fs.readdirSync(dir).sort()
+
+  const first = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(first.source, 'override', '前置：覆盖文件必须被正常加载')
+  assert.deepStrictEqual(listing(), ['filter-rules.json'],
+    `纯读不得新建 filter-rules.lastgood.json（实际目录：${JSON.stringify(listing())}）`)
+  const rulesBefore = fs.statSync(paths.file)
+  const second = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(second.source, 'override')
+  assert.strictEqual(fs.statSync(paths.file).ino, rulesBefore.ino, '纯读不得重写覆盖文件本身')
+  assert.deepStrictEqual(listing(), ['filter-rules.json'], '第二次纯读同样不得落盘')
+
+  // 运行侧（缺省 persistLastGood=true）必须照旧写：否则新进程降级时没有 LKG 可用（F4-1 回归）
+  const runSide = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(runSide.source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '运行侧成功加载 override 必须落盘持久 LKG')
+  const lkgBefore = fs.statSync(paths.lastgood)
+  const readOnlyAgain = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(readOnlyAgain.source, 'override')
+  const lkgAfter = fs.statSync(paths.lastgood)
+  assert.strictEqual(lkgAfter.ino, lkgBefore.ino, '纯读不得改写已有 LKG（inode 换了就说明又写了一次）')
+  assert.strictEqual(lkgAfter.mtimeMs, lkgBefore.mtimeMs, '纯读不得改写已有 LKG（mtime 必须原样）')
+})
+
+test('I2/R1-5 读面不代删 LKG：覆盖文件缺失时纯读不删 LKG，运行侧默认口径仍删（删文件=恢复默认）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 5, filter: { pingbibiaoti: '旧规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '前置：运行侧已写 LKG')
+
+  fs.rmSync(paths.file)
+  const readOnly = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(readOnly.source, 'default', '覆盖文件缺失 = 代码默认')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true,
+    '控制台读面不得代为删除 LKG（删除也是写盘；「删文件=恢复默认」由运行侧负责）')
+
+  const runSide = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(runSide.source, 'default')
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '运行侧加载到 missing 必须同步删除 LKG')
+})
+
+test('I2/R1-5 真实控制台 GET /api/config/filter：两次纯读后目录 inode/mtime 全不变、无 lastgood（读面零写盘）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 3, filter: { pingbibiaoti: '读面规则' } })
+  const r = runProbeUnderTimeout(`
+const fs = require('node:fs')
+const path = require('node:path')
+const http = require('node:http')
+const { createConsole } = require('./scripts/console')
+const dir = process.env.XBK_FIFO_DIR
+const token = 'probe-token-0123456789'
+const snap = () => fs.readdirSync(dir).sort().map((name) => {
+  const st = fs.lstatSync(path.join(dir, name))
+  return name + ':' + st.ino + ':' + st.mtimeMs
+})
+const { server } = createConsole({ token, stateDir: dir, log: () => {} })
+const get = (port, p) => new Promise((resolve, reject) => {
+  const req = http.get({ host: '127.0.0.1', port, path: p, headers: { Authorization: 'Bearer ' + token } }, (res) => {
+    let body = ''
+    res.setEncoding('utf8')
+    res.on('data', (chunk) => { body += chunk })
+    res.on('end', () => resolve({ status: res.statusCode, body }))
+  })
+  req.on('error', reject)
+})
+server.listen(0, '127.0.0.1', async () => {
+  try {
+    const port = server.address().port
+    const before = snap()
+    const first = await get(port, '/api/config/filter')
+    const mid = snap()
+    const second = await get(port, '/api/config/filter?nonce=2')
+    const after = snap()
+    process.stdout.write(JSON.stringify({
+      statuses: [first.status, second.status],
+      lastGoodUsed: [JSON.parse(first.body).lastGoodUsed, JSON.parse(second.body).lastGoodUsed],
+      before, mid, after
+    }))
+  } finally {
+    server.close(() => process.exit(0))
+  }
+})
+`, dir)
+  assert.deepStrictEqual(r.statuses, [200, 200], `两次 GET 都必须成功（实际 ${JSON.stringify(r.statuses)}）`)
+  assert.deepStrictEqual(r.lastGoodUsed, [false, false], '正常加载轮 lastGoodUsed 必须为 false（运行侧快照缺省）')
+  assert.deepStrictEqual(r.mid, r.before, `第一次纯读不得写盘（前：${JSON.stringify(r.before)} 后：${JSON.stringify(r.mid)}）`)
+  assert.deepStrictEqual(r.after, r.mid, `第二次纯读不得写盘（前：${JSON.stringify(r.mid)} 后：${JSON.stringify(r.after)}）`)
+  assert.ok(!r.after.some(entry => entry.startsWith('filter-rules.lastgood.json:')),
+    `控制台读面不得生成 filter-rules.lastgood.json（实际目录：${JSON.stringify(r.after)}）`)
+})
+
 // ===== 路径 helper =====
 
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {
