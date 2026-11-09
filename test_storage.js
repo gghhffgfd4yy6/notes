@@ -1559,6 +1559,75 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(err31 && err31.code === 'EARCHIVE', `无法判定的 truncating 现场必须抛 EARCHIVE（实际 ${err31 && err31.code}）`)
     assert.strictEqual(LogArchive.readMarker(log31), '20261102-20261108', '无法判定时绝不能推进 marker')
     assert.ok(fs.readFileSync(log31).equals(ambiguous31), '无法判定时必须保留明文原样')
+
+    // ⑱ R6-3：明文比归档短（st.size < idx.bytes）时 [0, idx.bytes) 区间根本不存在、前缀无法核验。
+    // 契约：只有匹配的 .seal.json（phase=truncated，上次确实已完成截断）才保留全部明文、只补
+    // 标记并告警；没有匹配记录必须抛 EARCHIVE、保留明文与旧标记、不推进 marker（明文可能是
+    // 仅存副本）。旧实现只 warnArchive('short') 就继续写 .week，调用方随即清掉 archivePending
+    // 并恢复 100MB 截尾——仅存明文会被裁掉。
+    const dir29 = make('logarch-f29')
+    fs.mkdirSync(dir29, { recursive: true })
+    const log29 = path.join(dir29, 'run.log')
+    const body29 = Buffer.from(Array.from({ length: 200 }, (_, i) => 'F29 上周第' + i + '行 ' + 'e'.repeat(30)).join('\n') + '\n')
+    fs.writeFileSync(log29, body29)
+    LogArchive.writeMarker(log29, '20261102-20261108')
+    LogArchive.sealLog(log29, dir29, '20261102-20261108', '20261109-20261115')
+    const short29 = Buffer.from(Array.from({ length: 20 }, (_, i) => 'F29 更短的新内容第' + i + '行').join('\n') + '\n')
+    fs.writeFileSync(log29, short29)
+    LogArchive.writeMarker(log29, '20261102-20261108')
+    assert.ok(!fs.existsSync(log29 + '.seal.json'), '成功封档后不得残留事务记录（本用例要覆盖「无 journal」）')
+    const origWarn29 = console.warn
+    let err29 = null
+    let res29 = null
+    try {
+      console.warn = () => {}
+      try { res29 = LogArchive.sealLog(log29, dir29, '20261102-20261108', '20261109-20261115') } catch (e) { err29 = e }
+    } finally { console.warn = origWarn29 }
+    assert.strictEqual(res29, null, '明文比归档短且无事务记录时不得返回成功（旧实现只 WARN 就推进标记）')
+    assert.ok(err29 && err29.code === 'EARCHIVE', `必须抛 EARCHIVE（实际 ${err29 && err29.code}）`)
+    assert.ok(err29.message.includes('明文比归档短'), `错误必须点明「明文比归档短」：${err29.message}`)
+    assert.strictEqual(LogArchive.readMarker(log29), '20261102-20261108', '没有事务记录时绝不能推进 marker')
+    assert.ok(fs.readFileSync(log29).equals(short29), '必须保留明文原样（可能是仅存副本）')
+
+    // ⑱b 反过度修复：同样的「明文比归档短」，但这次是「上次截断已完成、marker 没写成功」的真实
+    // 现场（事务记录 phase=truncated、prevKey/nextKey/bytes 全匹配）——必须保留全部明文、只补
+    // 标记并告警，不得抛错（否则封档永久卡死、100MB 截尾永久禁用）。
+    const dir30 = make('logarch-f30')
+    fs.mkdirSync(dir30, { recursive: true })
+    const log30 = path.join(dir30, 'run.log')
+    const body30 = Buffer.from(Array.from({ length: 200 }, (_, i) => 'F30 上周第' + i + '行 ' + 'f'.repeat(30)).join('\n') + '\n')
+    fs.writeFileSync(log30, body30)
+    LogArchive.writeMarker(log30, '20261102-20261108')
+    const origRename30 = fs.renameSync
+    let markerErr30 = null
+    try {
+      fs.renameSync = (from, to) => {
+        if (typeof to === 'string' && to.endsWith('.week')) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' })
+        return origRename30.call(fs, from, to)
+      }
+      try { LogArchive.sealLog(log30, dir30, '20261102-20261108', '20261109-20261115') } catch (e) { markerErr30 = e }
+    } finally { fs.renameSync = origRename30 }
+    assert.ok(markerErr30, '注入必须让 .week 写入失败（复现「截断完成、marker 未写」现场）')
+    const journal30 = JSON.parse(fs.readFileSync(log30 + '.seal.json', 'utf8'))
+    assert.strictEqual(journal30.phase, 'truncated', `截断完成后事务记录必须是 truncated（实际 ${journal30.phase}）`)
+    const short30 = Buffer.from('F30 新周追加的一小段\n')
+    assert.ok(short30.length < body30.length, '追加内容必须比归档短（否则落进「不短于归档」分支）')
+    fs.appendFileSync(log30, short30)
+    const warns30 = []
+    const origWarn30 = console.warn
+    let res30 = null
+    let err30 = null
+    try {
+      console.warn = (...a) => { warns30.push(a.map(String).join(' ')) }
+      try { res30 = LogArchive.sealLog(log30, dir30, '20261102-20261108', '20261109-20261115') } catch (e) { err30 = e }
+    } finally { console.warn = origWarn30 }
+    assert.strictEqual(err30, null, `有匹配事务记录时不得抛错（否则封档永久卡死）：${err30 && err30.message}`)
+    assert.ok(res30, '有匹配事务记录时必须返回成功（只补标记）')
+    assert.strictEqual(LogArchive.readMarker(log30), '20261109-20261115', '补标记后 marker 必须推进')
+    assert.ok(fs.readFileSync(log30).equals(short30), '必须保留全部新周明文（不得截断、不得改写）')
+    assert.ok(warns30.some((w) => w.includes('明文比归档短') && w.includes(log30)),
+      `「明文比归档短」必须告警（不得静默）：${JSON.stringify(warns30)}`)
+    assert.ok(!fs.existsSync(log30 + '.seal.json'), 'marker 成功后事务记录必须清理')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

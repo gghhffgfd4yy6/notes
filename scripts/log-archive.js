@@ -600,8 +600,19 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
           : `明文前缀与归档内容不一致，且没有可证明「上次截断已完成」的事务记录，保留明文与旧标记：${logPath}`)
       }
     } else if (writable) {
-      // 明文比归档短：可能上次截断成功但标记没写成功。不做截断（避免删掉未归档的新内容），只补标记。
-      warnArchive('short', logPath, `⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），跳过截断只推进标记：${logPath}`)
+      // 明文比归档短：[0, idx.bytes) 这个区间根本不存在，已归档前缀无法核验。按契约，只有
+      // 匹配的 journal 且 phase=truncated（上次确实已完成截断、之后追加减短）才能保留全部明文、
+      // 只补标记；否则明文可能是仅存副本，必须抛错保留明文与旧标记、不推进 marker
+      // （旧实现只 warnArchive('short') 就继续写 .week，调用方随即清掉 archivePending 并恢复
+      // 100MB 截尾）。
+      if (journalMatches && journal.phase === SEAL_PHASE_TRUNCATED) {
+        warnArchive('short', logPath, `⚠️ 日志归档：明文比归档短（${st.size} < ${idx.bytes}），事务记录证明上次截断已完成，保留全部明文、只补标记：${logPath}`)
+      } else if (journalMatches && journal.phase === SEAL_PHASE_TRUNCATING) {
+        // 明文短于归档、长度又恰好等于「待截断长度」⇒ 截断确实已落地（截断未做时明文必然更长）。
+        finishPendingTruncate(fdIn, idx, journal, logPath, prevKey, nextKey)
+      } else {
+        throw archiveError(`明文比归档短（${st.size} < ${idx.bytes}），已归档前缀不存在、无法核验，且没有可证明「上次截断已完成」的事务记录，保留明文与旧标记：${logPath}`)
+      }
     } else if (journalMatches && journal.phase !== SEAL_PHASE_TRUNCATED) {
       // 只读打开（rw 失败）本应只告警跳过，但事务记录说上次搬运/截断没走完：此时推进 marker
       // 会把半搬移的明文交给 100MB 截尾，宁可报错等人工处理。
