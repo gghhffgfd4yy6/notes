@@ -162,8 +162,10 @@ function createApp ({
 
     // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
     // unsafe/replaced/tooLarge），并强制大小上限，杜绝异常膨胀文件被整读入内存。
+    // F4-2：openNonBlocking —— report.state / filter.hash / channel-health.state 被替换成 FIFO 时，
+    // 裸 O_RDONLY 会同步阻塞等写者（整轮挂死、无日志无退出码）；O_NONBLOCK 让 open 立刻 ENXIO ⇒ unsafe。
     _readSafeState (filePath) {
-      return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES)
+      return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES, { openNonBlocking: true })
     },
 
     _writeTextAtomic (filePath, text) {
@@ -1631,7 +1633,9 @@ function createApp ({
         const batchTitles = []
         let similarCorrupt = false
         try {
-          const loaded = readSafeTextResult(similarPath, 2 * 1024 * 1024) // 标题 120 字 + 正文 200 字 × 300 条约 400 KB
+          // F4-2：openNonBlocking —— similar-<cache>.json 被替换成 FIFO 时裸 O_RDONLY 会永久阻塞；
+          // 这里与上面几处同口径（O_NONBLOCK + 普通文件校验），FIFO 按不可用处理（空窗口 + 告警）。
+          const loaded = readSafeTextResult(similarPath, 2 * 1024 * 1024, { openNonBlocking: true }) // 标题 120 字 + 正文 200 字 × 300 条约 400 KB
           if (loaded && loaded.status === 'ok' && loaded.text) {
             const parsed = JSON.parse(loaded.text)
             if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')

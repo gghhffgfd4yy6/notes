@@ -933,6 +933,123 @@ test('C9-019 生效快照 filter/keyword 字段按覆盖文件同口径收紧（
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '缺省字段不得被误判为损坏')
 })
 
+// ===== F4-2：FIFO/非普通文件不得挂死（读取必须 O_NONBLOCK + 普通文件校验）=====
+// 为什么必须借子进程 + timeout：同步 open 阻塞的是整个事件循环，同进程内没有任何超时能打断它；
+// 只有外部 `timeout 3` 能证明「进程在 2 秒内自己结束了」——exit=124 就是挂死的证据。
+const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
+const findOnDisk = (candidates) => {
+  for (const candidate of candidates) {
+    try { if (fs.existsSync(candidate)) return candidate } catch (e) { /* 探测失败按不存在 */ }
+  }
+  return ''
+}
+const MKFIFO = findOnDisk(MKFIFO_CANDIDATES)
+const TIMEOUT_BIN = findOnDisk(['/usr/bin/timeout', '/bin/timeout'])
+const FIFO_SKIP = MKFIFO && TIMEOUT_BIN
+  ? null
+  : `缺少 ${MKFIFO ? '' : 'mkfifo'}${MKFIFO && !TIMEOUT_BIN ? 'timeout' : ''}（Linux 宿主必须真跑，不得静默当作已验证）`
+
+// 探针统一约定：stdout 一行 JSON；父进程断言 exit≠124 且耗时 < 2s。
+function runProbeUnderTimeout (script, dir) {
+  const probe = spawnSync(TIMEOUT_BIN, ['3', process.execPath, '-e', script], {
+    encoding: 'utf8',
+    cwd: __dirname,
+    env: { ...process.env, XBK_FIFO_DIR: dir }
+  })
+  const out = `${probe.stdout || ''}${probe.stderr || ''}`
+  assert.notStrictEqual(probe.status, 124,
+    `读取在 FIFO 上挂死（timeout 3 强杀、exit=124）：裸 O_RDONLY / readFileSync 阻塞等写者——${out.slice(-600)}`)
+  assert.strictEqual(probe.status, 0, `探针必须以 0 正常结束：status=${probe.status} signal=${probe.signal} ${out.slice(-600)}`)
+  return JSON.parse(String(probe.stdout).trim().split('\n').pop())
+}
+
+function makeFifoDir (name) {
+  const dir = makeDir()
+  const file = path.join(dir, name)
+  require('node:child_process').execFileSync(MKFIFO, [file])
+  return { dir, file }
+}
+
+test('F4-2 参数层：覆盖文件与生效快照的读取必须传 openNonBlocking（裸 O_RDONLY 会挂死）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const storageMod = require('./xbk_storage')
+  const realRead = storageMod.readSafeTextResult
+  const calls = []
+  try {
+    storageMod.readSafeTextResult = (p, maxBytes, options) => {
+      calls.push({ p: String(p), options })
+      return { status: 'missing', text: null, error: null }
+    }
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+    readAppliedSnapshot(dir)
+  } finally {
+    storageMod.readSafeTextResult = realRead
+  }
+  const rulesRead = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  const appliedRead = calls.filter(c => c.p === filterRulesPaths(dir).applied)
+  assert.strictEqual(rulesRead.length, 1, `覆盖文件读入口必须被走到 1 次：${JSON.stringify(calls.map(c => c.p))}`)
+  assert.strictEqual(appliedRead.length, 1, `生效快照读入口必须被走到 1 次：${JSON.stringify(calls.map(c => c.p))}`)
+  for (const c of [rulesRead[0], appliedRead[0]]) {
+    assert.strictEqual(c.options && c.options.openNonBlocking, true,
+      `readSafeTextResult 必须传 openNonBlocking:true（FIFO 上裸 O_RDONLY 永久阻塞）${c.p}: ${JSON.stringify(c.options)}`)
+  }
+})
+
+test('F4-2 FIFO 覆盖文件：新进程 2 秒内降级为 corrupt（timeout 3 实测 exit≠124）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 覆盖文件探针：${FIFO_SKIP}`)
+    return
+  }
+  resetStoreStateForTests()
+  const { dir } = makeFifoDir('filter-rules.json')
+  const r = runProbeUnderTimeout(`
+const { loadFilterRules } = require('./xbk_filter_store')
+const t0 = Date.now()
+const r = loadFilterRules({ cacheDir: process.env.XBK_FIFO_DIR, defaults: {}, keyword: {} })
+process.stdout.write(JSON.stringify({ source: r.source, degraded: r.degraded, lastGoodUsed: r.lastGoodUsed, message: r.error && r.error.message, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 覆盖文件读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.source, 'corrupt', `FIFO 必须按不可用降级（实际 source=${r.source}）：GIF/管道不得当规则文件读`)
+  assert.strictEqual(r.degraded, true, '降级必须置 degraded=true（运行侧据此不清 _f、不推进 hash）')
+  assert.strictEqual(r.lastGoodUsed, false, '新进程没有 LKG 时必须回代码默认（本案无历史合法文件）')
+  assert.match(String(r.message), /unsafe/, `降级原因必须点名 unsafe（普通文件校验），实际：${r.message}`)
+})
+
+test('F4-2 FIFO 生效快照：readAppliedSnapshot 2 秒内返回 ioError（不挂死控制台读面）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 生效快照探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('filter-rules.applied.json')
+  const r = runProbeUnderTimeout(`
+const { readAppliedSnapshot } = require('./xbk_filter_store')
+const t0 = Date.now()
+const read = readAppliedSnapshot(process.env.XBK_FIFO_DIR)
+process.stdout.write(JSON.stringify({ status: read.status, code: read.error && read.error.code, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 生效快照读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.status, 'ioError', `FIFO 生效快照必须如实判不可读（实际 ${r.status}）`)
+  assert.strictEqual(r.code, 'unsafe', `错误码必须点名 unsafe，实际 ${r.code}`)
+})
+
+test('F4-2 FIFO 周标记 <log>.week：readMarker 2 秒内返回空串（run.log 写入路径不得挂死）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 周标记探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('run.log.week')
+  const r = runProbeUnderTimeout(`
+const path = require('node:path')
+const { readMarker } = require('./scripts/log-archive')
+const t0 = Date.now()
+const marker = readMarker(path.join(process.env.XBK_FIFO_DIR, 'run.log'))
+process.stdout.write(JSON.stringify({ marker, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 周标记读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.marker, '', 'FIFO 周标记必须按「无标记」处理（不得把它当周键）')
+})
+
 // ===== 路径 helper =====
 
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {

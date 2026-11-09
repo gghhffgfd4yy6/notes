@@ -11039,6 +11039,67 @@ console.log('========================================\n');
     }
   })
 
+  // F4-2：状态/哈希文件（report.state / filter.hash / channel-health.state）与被替换的 FIFO
+  // 共用 _readSafeState 这一个入口。裸 O_RDONLY 打开无写者的 FIFO 会永久阻塞（整轮挂死、无日志、
+  // 无退出码），必须 O_NONBLOCK + 普通文件校验。同步 open 阻塞无法在同进程内超时打断，只能靠
+  // 子进程 + `timeout 3` 从外部判定：exit=124 就是挂死的证据。
+  await test('F4-2 _readSafeState：report.state / filter.hash / channel-health.state 为 FIFO 时 2 秒内返回 unsafe（timeout 3 exit≠124）', () => {
+    const cp = require('child_process')
+    const fsmod = require('node:fs')
+    const probeOnDisk = (candidates) => {
+      for (const c of candidates) {
+        try { if (fsmod.existsSync(c)) return c } catch (e) { continue }
+      }
+      return ''
+    }
+    const mkfifo = probeOnDisk(['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo'])
+    const timeoutBin = probeOnDisk(['/usr/bin/timeout', '/bin/timeout'])
+    if (!mkfifo || !timeoutBin) {
+      console.log(`  ⏭️ 跳过 _readSafeState FIFO 探针：缺少 ${mkfifo ? '' : 'mkfifo'}${!timeoutBin ? 'timeout' : ''}（Linux 宿主必须真跑）`)
+      return
+    }
+    const dir = path.join(CACHE, 'fifo_state_probe')
+    cleanupDirInRoot(dir) // 先清掉上次残留：走本文件唯一的递归删除入口（裸 rmSync 会被收敛点自证用例判红）
+    fsmod.mkdirSync(dir, { recursive: true })
+    try {
+      for (const name of ['report.state', 'filter.hash', 'channel-health.state']) cp.execFileSync(mkfifo, [path.join(dir, name)])
+      const probeScript = `
+const path = require('node:path')
+const { App } = require('./xbk_function_v3.js')
+const dir = process.env.XBK_FIFO_DIR
+const names = ['report.state', 'filter.hash', 'channel-health.state']
+const statuses = {}
+const t0 = Date.now()
+for (const name of names) statuses[name] = App._readSafeState(path.join(dir, name)).status
+process.stdout.write(JSON.stringify({ statuses, ms: Date.now() - t0 }))
+`
+      const probe = cp.spawnSync(timeoutBin, ['3', process.execPath, '-e', probeScript], {
+        encoding: 'utf8',
+        cwd: __dirname,
+        env: { ...process.env, XBK_FIFO_DIR: dir, XBK_CACHE_DIR: dir }
+      })
+      const out = `${probe.stdout || ''}${probe.stderr || ''}`
+      assertEqual(probe.status !== 124, true, `状态文件 FIFO 读取挂死（timeout 3 强杀、exit=124）：${out.slice(-600)}`)
+      assertEqual(probe.status, 0, `探针必须以 0 正常结束：status=${probe.status} signal=${probe.signal} ${out.slice(-600)}`)
+      const result = JSON.parse(String(probe.stdout).trim().split('\n').pop())
+      assertEqual(result.ms < 2000, true, `三处状态文件 FIFO 读取必须 2 秒内返回（实耗 ${result.ms}ms）`)
+      for (const name of ['report.state', 'filter.hash', 'channel-health.state']) {
+        assertEqual(result.statuses[name], 'unsafe', `${name} 是 FIFO 时必须判 unsafe（普通文件校验），实际 ${result.statuses[name]}`)
+      }
+    } finally {
+      cleanupDirInRoot(dir)
+    }
+  })
+
+  // similar-<cache>.json 的读取内联在 App.run 里（同一函数中还有网络抓取），无法在不跑整轮的前提下
+  // 做行为级 FIFO 探针；这里按源码锁住「该调用点必须带 openNonBlocking」——回退这一行即变红。
+  await test('F4-2 similar-<cache>.json 读取必须 openNonBlocking（内联路径按源码锁定）', () => {
+    const src = require('node:fs').readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
+    const line = src.split('\n').find(l => l.includes('readSafeTextResult(similarPath'))
+    assertEqual(Boolean(line), true, 'xbk_app.js 里必须仍有 readSafeTextResult(similarPath, …) 这处读取（找不到说明改动把入口改名了，需同步本断言）')
+    assertEqual(line.includes('openNonBlocking: true'), true, `similar-<cache>.json 读取必须传 openNonBlocking:true（FIFO 会挂死整轮）：${line.trim()}`)
+  })
+
   await test('P4 _warnLowDisk 限流内与未配置阈值均静默', () => {
     const saved = { at: V3App._diskWarningAt, cfg: JSON.stringify(Config) }
     const oldWarn = console.warn

@@ -24,7 +24,11 @@
 // ============================================================
 
 const path = require('path')
-const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
+// 读入口经模块对象调用（`storage.readSafeTextResult`）而非解构：F4-3 的「瞬时读失败重读一次」
+// 分支只能靠替换该函数来注入 replaced/ioError（真实竞态不可确定复现），解构会把模块加载时的
+// 引用钉死，测试无法注入。写入口继续解构（没有注入需求）。
+const storage = require('./xbk_storage')
+const { writeAtomic } = storage
 // 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
 const { filterRulesPaths } = require('./scripts/filter-rules-paths')
 
@@ -567,11 +571,14 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
-  // 两道「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
+  // 两条「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
   // + 读后复检 inode，末级是链接直接判 unsafe），收紧走 enforceOwnerOnlyMode（O_NOFOLLOW 打开、
   // 对比 lstat 的 dev/ino、只在已校验的 fd 上 fchmod 并按同一 fd 复检）——任一处被换成链接都不会读到、
   // 更不会 chmod 到链接目标。
-  const read = readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES)
+  // F4-2：openNonBlocking —— 裸 O_RDONLY 打开无写者的 FIFO 会同步阻塞（无日志、无退出码），
+  // 控制台每 5 秒 spawn 的单轮进程会永久挂死；O_NONBLOCK 下 open FIFO 立刻 ENXIO ⇒ unsafe，
+  // 随后的 fstat 普通文件校验同样拒绝一切非普通文件。下同（applied / LKG 读取）。
+  const read = storage.readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
   if (read.status === 'missing') {
     // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废。
     // 否则「删文件 → 之后又出现畸形文件」会把早已废弃的旧规则复活成生效规则（A4）。
@@ -661,7 +668,7 @@ function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, ha
 function readAppliedSnapshot (cacheDir) {
   let read
   try {
-    read = readSafeTextResult(filterRulesPaths(cacheDir).applied, FILTER_RULES_MAX_BYTES)
+    read = storage.readSafeTextResult(filterRulesPaths(cacheDir).applied, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
   } catch (e) {
     return { status: 'ioError', error: { code: 'read_failed', message: safeErrorMessage(e) } }
   }
