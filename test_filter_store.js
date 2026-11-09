@@ -1661,6 +1661,23 @@ server.listen(0, '127.0.0.1', async () => {
     `控制台读面不得生成 filter-rules.lastgood.json（实际目录：${JSON.stringify(r.after)}）`)
 })
 
+// R1-4：README 是**唯一**面向部署者的降级口径说明，没有内容门禁（check-doc-lines 只管行长），
+// 漂移只能靠评审。本题材料里 README 仍写「优先沿用进程内上一次合法规则」——新进程里根本不存在，
+// 正是 F4-1 修掉的缺陷本体。这里把口径钉住：回退成旧措辞即红。
+test('R1-4 文档同步：README 必须写持久 LKG（不得再写「进程内上一次合法规则」）', () => {
+  const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')
+  assert.ok(!readme.includes('优先沿用进程内上一次合法规则'),
+    'README 不得再写「进程内 LKG」：控制台 auto-run 每轮都是新进程，进程内 Map 等于不存在（F4-1）')
+  assert.match(readme, /filter-rules\.lastgood\.json/,
+    'README 必须点名持久 LKG 文件 <缓存目录>/filter-rules.lastgood.json')
+  assert.match(readme, /删掉正式覆盖文件时 LKG 一并删除|删除正式覆盖文件时同步删除 LKG/,
+    'README 必须写清「删覆盖文件 ⇒ LKG 作废」（否则「删文件=恢复默认」会被降级轮复活旧规则破坏）')
+  const appliedLine = readme.split('\n').find(l => l.includes('filter-rules.applied.json` 快照'))
+  assert.ok(appliedLine, 'README 必须仍描述 filter-rules.applied.json 生效快照')
+  assert.ok(appliedLine.includes('lastGoodUsed'),
+    `applied 快照的字段清单必须含 lastGoodUsed（控制台「沿用上次合法规则」唯一口径）：${appliedLine}`)
+})
+
 // ===== 路径 helper =====
 
 test('filterRulesPaths 固定文件名与备份名，备份 revision 防路径穿越', () => {
