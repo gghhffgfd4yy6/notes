@@ -852,7 +852,7 @@ check('_writeRunLog 一条日志的截尾退避不影响另一条白名单日志
   assert.ok(!app._logRotateBackoffByPath.has(diagPath), '另一条日志不得被写入退避表')
 })
 
-check('_writeRunLog 两条日志同周归档失败 ⇒ 各自告警（限频键含路径）', () => {
+check('_writeRunLog 两条日志同周归档失败 ⇒ 各自告警；交替失败不互相刷新限频', () => {
   const LogArchive = require('./scripts/log-archive.js')
   const origReadMarker = LogArchive.readMarker
   const origSeal = LogArchive.sealLog
@@ -862,15 +862,26 @@ check('_writeRunLog 两条日志同周归档失败 ⇒ 各自告警（限频键�
     const rec = makeLogFs()
     const { app } = makeLogApp({ rec })
     const t0 = 1700000000000
+    // 交替各 3 次：单个标量槽位会在两条日志之间来回覆盖，每次都重新告警（6 条）；
+    // 按「日志路径|周键」限频时每条日志只在自己的 60s 窗口里告警一次（2 条）。
     const r = withFixedNow(t0, () => withCapture('warn', () => {
-      app._writeRunLog('a\n')
-      app._writeRunLog('b\n', 'filter-diagnostics.ndjson')
+      for (let i = 0; i < 3; i++) {
+        app._writeRunLog('a\n')
+        app._writeRunLog('b\n', 'filter-diagnostics.ndjson')
+      }
     }))
     const archiveWarns = r.msgs.filter((m) => m.includes('日志归档失败'))
     assert.strictEqual(archiveWarns.length, 2,
-      `两条日志同一周失败必须各告警一次（旧实现只按周键限频，第二条被吞）：${JSON.stringify(r.msgs)}`)
+      `两条日志同一周交替失败必须各告警一次（旧标量槽位会 6 条都告警）：${JSON.stringify(r.msgs)}`)
     assert.ok(archiveWarns[0].includes('run.log'), `第一条必须点名 run.log：${archiveWarns[0]}`)
     assert.ok(archiveWarns[1].includes('filter-diagnostics.ndjson'), `第二条必须点名诊断日志：${archiveWarns[1]}`)
+    // 窗口到期：两条日志各自的键都要重新告警（键独立存储，不会被对方吞掉）
+    const r2 = withFixedNow(t0 + 60 * 1000, () => withCapture('warn', () => {
+      app._writeRunLog('a\n')
+      app._writeRunLog('b\n', 'filter-diagnostics.ndjson')
+    }))
+    assert.strictEqual(r2.msgs.filter((m) => m.includes('日志归档失败')).length, 2,
+      `60s 窗口到期后每条日志都要重新告警：${JSON.stringify(r2.msgs)}`)
   } finally {
     LogArchive.readMarker = origReadMarker
     LogArchive.sealLog = origSeal

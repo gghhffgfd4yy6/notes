@@ -349,16 +349,20 @@ function createApp ({
                 }
               } catch (e) {
                 // 失败要留痕（不递归写日志，避免归档故障放大成日志风暴）：archivePending 保持为真，
-                // 下一轮重试。_writeRunLog 每写一行都会走到这段，故同一周键的失败 60s 内只告警一次，
-                // 否则 stderr 会被同一条错误刷屏（F1-2：故障必须可见，但不能变成日志风暴）。
+                // 下一轮重试。_writeRunLog 每写一行都会走到这段，故「同一日志 + 同一周键」的失败
+                // 60s 内只告警一次，否则 stderr 会被同一条错误刷屏（F1-2：故障必须可见，但不能变成日志风暴）。
                 const now = Date.now()
-                // v3.409（Sourcery PRRT_kwDOT8kkjs61McyA）：限频键必须带日志路径。只按周键限频时，
-                // run.log 先失败会吞掉 filter-diagnostics.ndjson 在同一 60s 内的失败告警，
-                // 运维只看到第一个文件名、不知道第二个归档也坏了。
+                // v3.405（Sourcery PRRT_kwDOT8kkjs61McyA）：限频状态必须按「日志路径|周键」分开记
+                // （与 log-archive.js 的 warnArchive 同口径）。单个标量槽位时，run.log 与
+                // filter-diagnostics.ndjson 交替失败会把槽位来回覆盖，每次写入都重新告警——
+                // 两条日志都坏时 60s 限频完全失效，正是要防的 stderr 刷屏。
                 const warnKey = logPath + '|' + marker
-                if (this._archiveWarnKey !== warnKey || !this._archiveWarnAt || now - this._archiveWarnAt >= 60 * 1000) {
-                  this._archiveWarnKey = warnKey
-                  this._archiveWarnAt = now
+                const lastWarnAt = this._archiveWarnAtByKey.get(warnKey) || 0
+                if (!lastWarnAt || now - lastWarnAt >= 60 * 1000) {
+                  if (this._archiveWarnAtByKey.size > 64) {
+                    for (const [k, at] of this._archiveWarnAtByKey) if (now - at >= 60 * 1000) this._archiveWarnAtByKey.delete(k)
+                  }
+                  this._archiveWarnAtByKey.set(warnKey, now)
                   console.warn(`⚠️ 日志归档失败（下一轮重试，本轮禁用截尾）：${path.basename(logPath)} ${(e && e.message) || (e && e.code) || e}`)
                 }
               }
@@ -490,8 +494,8 @@ function createApp ({
 
     _diskWarningAt: 0,
     _logRotateBackoffByPath: new Map(),
-    _archiveWarnAt: 0,
-    _archiveWarnKey: '',
+    // 归档失败告警的限频状态：键 = 日志路径 + '|' + 周键（每个日志每周各一条 60s 窗口）。
+    _archiveWarnAtByKey: new Map(),
     _alertLastAtByPath: new Map(),
     _reportMemoryStateByPath: new Map(),
 
