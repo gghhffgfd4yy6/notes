@@ -15,6 +15,8 @@
 //     对控制台不可见（listArchives 过滤），避免把半成品当成品读。
 //   - 切档顺序：发布 gz → 发布 idx → 写「新周」标记 → 截断明文。标记写失败就抛错、
 //     不截断：宁可下次重复归档，也不丢上一周的数据。
+//   - 上次崩在「发布之后、截断/标记之前」时（gz 在、idx 缺 / gz+idx 都在、标记仍旧）不返回
+//     null：idx 缺则从 gz 重建并补写，然后继续补做截断与标记；重建失败抛明确错误。
 //   - 读完到截断之间若有 fail-open 写者追加，把追加段搬回文件开头再截断，不吞这几行。
 
 const fs = require('fs')
@@ -114,14 +116,96 @@ function readMarker (logPath) {
   } catch (e) { return '' }
 }
 
-// 切档：把上一周（prevKey）的明文压成「多成员 gz + idx」，写新周标记（nextKey），再截断明文。
-// 调用方必须已持有该日志的写锁；崩溃/失败时绝不先截断（数据留在明文里，下一轮重试）。
+function archiveError (msg) {
+  return Object.assign(new Error(msg), { code: 'EARCHIVE' })
+}
+
+function countNewlines (buf) {
+  let n = 0
+  for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) n += 1
+  return n
+}
+
+// 从 gz 重建索引（F1-2：崩在「gz 已发布、idx 未落」时）。
+// 成员边界靠 inflateRaw 回读「本成员 deflate 流消耗的压缩字节数」：本模块写出的 gzip 头固定 10 字节
+// （flags=0，无 FNAME/FEXTRA 等附加字段），故成员长度 = 10 + deflate + 8（CRC32 + ISIZE）。
+// 头形态/长度/CRC/ISIZE 任一对不上都抛错——恢复路径宁可拒绝，也不能按猜出来的偏移生成一份
+// 会把控制台读坏的索引。
+function rebuildGzIndex (gzPath, prevKey, fileName) {
+  let opened
+  try { opened = openLog(gzPath, false) } catch (e) {
+    throw archiveError(`归档索引缺失且 gz 无法读取：${gzPath}（${e.code || e.message}）`)
+  }
+  let buf
+  try {
+    buf = Buffer.alloc(opened.size)
+    let got = 0
+    while (got < opened.size) {
+      const n = fs.readSync(opened.fd, buf, got, opened.size - got, got)
+      if (n <= 0) break
+      got += n
+    }
+    if (got !== opened.size) throw archiveError(`归档索引缺失且 gz 读不完整：${gzPath}`)
+  } finally { try { fs.closeSync(opened.fd) } catch (e) {} }
+
+  if (!buf.length) throw archiveError(`归档索引缺失且 gz 为空：${gzPath}`)
+  const idx = { key: prevKey, base: baseOf(fileName), source: fileName, members: [], lines: 0, bytes: 0 }
+  let off = 0
+  while (off < buf.length) {
+    if (buf.length - off < 18 || buf[off] !== 0x1f || buf[off + 1] !== 0x8b || buf[off + 2] !== 0x08 || buf[off + 3] !== 0) {
+      throw archiveError(`归档索引缺失且 gz 成员头非法（偏移 ${off}）：${gzPath}`)
+    }
+    let inflated
+    try { inflated = zlib.inflateRawSync(buf.subarray(off + 10), { info: true }) } catch (e) {
+      throw archiveError(`归档索引缺失且 gz 成员无法解压（偏移 ${off}）：${gzPath}（${e.code || e.message}）`)
+    }
+    const deflateLen = inflated.engine && inflated.engine.bytesWritten
+    const len = 10 + deflateLen + 8
+    if (!Number.isSafeInteger(deflateLen) || deflateLen <= 0 || off + len > buf.length) {
+      throw archiveError(`归档索引缺失且 gz 成员长度异常（偏移 ${off}）：${gzPath}`)
+    }
+    const text = inflated.buffer
+    const crcOff = off + 10 + deflateLen
+    if (!text.length || buf.readUInt32LE(crcOff + 4) !== (text.length >>> 0) ||
+        (typeof zlib.crc32 === 'function' && (zlib.crc32(text) >>> 0) !== buf.readUInt32LE(crcOff))) {
+      throw archiveError(`归档索引缺失且 gz 成员校验失败（偏移 ${off}）：${gzPath}`)
+    }
+    const nl = countNewlines(text)
+    const tail = text[text.length - 1] !== 0x0a
+    if (tail && off + len !== buf.length) {
+      throw archiveError(`归档索引缺失且 gz 中间成员无换行结尾（偏移 ${off}）：${gzPath}`)
+    }
+    idx.members.push(tail ? { off, len, lines: nl + 1, tail: true } : { off, len, lines: nl })
+    idx.lines += nl + (tail ? 1 : 0)
+    idx.bytes += text.length
+    off += len
+  }
+  return idx
+}
+
+// 切档：把上一周（prevKey）的明文压成「多成员 gz + idx」，截断明文，最后写新周标记（nextKey）。
+// 调用方必须已持有该日志的写锁；崩溃/失败时不推进标记（数据留在明文里，下一轮重试）。
 function sealLog (logPath, cacheDir, prevKey, nextKey) {
   const dir = archiveDir(cacheDir)
   fs.mkdirSync(dir, { recursive: true }) // nosemgrep（固定子目录）
   const outPath = archivePath(cacheDir, path.basename(logPath), prevKey)
-  // 同名归档已存在（上次崩在「发布后、写标记前」）：不覆盖已有数据，交给下一轮。
-  try { if (fs.existsSync(outPath)) return null } catch (e) {} // nosemgrep（outPath=缓存目录/logs + 白名单周键）
+
+  // F1-2：同名归档已存在时不能直接 return null。上次可能崩在「发布之后、截断/标记之前」，
+  // 直接返回会让 marker 永远停在旧周、调用方的 archivePending 一直为真（100MB 截尾被永久禁用）。
+  // gz 在而 idx 缺 ⇒ 从 gz 重建索引并补写；两者都在 ⇒ 只补做截断与标记。
+  let idx = null
+  if (fs.existsSync(outPath)) { // nosemgrep（outPath=缓存目录/logs + 白名单周键）
+    idx = readGzIndex(outPath)
+    if (!idx) {
+      idx = rebuildGzIndex(outPath, prevKey, path.basename(logPath))
+      try {
+        writeAtomic(outPath + '.idx.json', JSON.stringify(idx))
+      } catch (e) {
+        throw archiveError(`归档索引重建后写盘失败：${outPath}.idx.json（${e.code || e.message}）`)
+      }
+      fsyncDirBestEffort(dir)
+    }
+  }
 
   let opened
   try { opened = openLog(logPath, true) } catch (e) {
@@ -130,77 +214,87 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   const fdIn = opened.fd
   const writable = opened.writable
   if (!opened.size) {
-    try { writeAtomic(weekMarkerPath(logPath), nextKey) } catch (e) {}
     try { fs.closeSync(fdIn) } catch (e) {}
-    return null
+    if (!idx) {
+      try { writeAtomic(weekMarkerPath(logPath), nextKey) } catch (e) {}
+      return null
+    }
+    // 明文已空（上次截断成功但标记没写成功）：只剩补标记这一步。
+    writeAtomic(weekMarkerPath(logPath), nextKey)
+    return { path: outPath, lines: idx.lines, bytes: idx.bytes }
   }
 
-  const tmpPath = outPath + '.tmp'
-  const idx = { key: prevKey, base: baseOf(path.basename(logPath)), source: path.basename(logPath), members: [], lines: 0, bytes: 0 }
-  let fdOut = null
-  let readTo = 0
-  try {
-    fdOut = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600) // nosemgrep（路径=缓存目录 + 白名单周键）
-    const buf = Buffer.alloc(CHUNK_BYTES)
-    let carry = Buffer.alloc(0)
-    let compOff = 0
-    for (;;) {
-      const n = fs.readSync(fdIn, buf, 0, CHUNK_BYTES, readTo)
-      if (n <= 0) break
-      readTo += n
-      const chunk = carry.length ? Buffer.concat([carry, buf.slice(0, n)]) : buf.slice(0, n)
-      let cut = chunk.length
-      const nl = chunk.lastIndexOf(0x0a)
-      if (nl >= 0) cut = nl + 1
-      const take = chunk.slice(0, cut)
-      // F1-1：carry 必须是独立副本。chunk 可能是读缓冲 buf 的零拷贝视图，下一轮
-      // readSync(fdIn, buf, ...) 会覆盖它——Buffer.concat 就会把「新块头部」当成上一块行尾
-      // 拼进来，每次跨块封档在 member0→member1 边界固定坏一行（丢 k 字节 + 重复 k 字节）。
-      carry = Buffer.from(chunk.subarray(cut))
-      if (!take.length) continue
-      const gz = zlib.gzipSync(take, { level: 6 })
-      writeAllSync(fdOut, gz)
-      const lines = take.toString('utf8').split('\n').length - 1
-      idx.members.push({ off: compOff, len: gz.length, lines })
-      idx.lines += lines
-      idx.bytes += take.length
-      compOff += gz.length
+  if (!idx) {
+    const tmpPath = outPath + '.tmp'
+    idx = { key: prevKey, base: baseOf(path.basename(logPath)), source: path.basename(logPath), members: [], lines: 0, bytes: 0 }
+    let fdOut = null
+    try {
+      fdOut = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600) // nosemgrep（路径=缓存目录 + 白名单周键）
+      const buf = Buffer.alloc(CHUNK_BYTES)
+      let carry = Buffer.alloc(0)
+      let compOff = 0
+      let readTo = 0
+      for (;;) {
+        // 读位置必须用 readTo（上一轮整块读到的末尾），不能用 idx.bytes（只累计已归档的 take）：
+        // 两者相差 carry 的长度，混用会把 carry 段重读一遍（行数对、字节数偏大 → 截断错位）。
+        const n = fs.readSync(fdIn, buf, 0, CHUNK_BYTES, readTo)
+        if (n <= 0) break
+        readTo += n
+        const chunk = carry.length ? Buffer.concat([carry, buf.slice(0, n)]) : buf.slice(0, n)
+        let cut = chunk.length
+        const nl = chunk.lastIndexOf(0x0a)
+        if (nl >= 0) cut = nl + 1
+        const take = chunk.slice(0, cut)
+        // F1-1：carry 必须是独立副本。chunk 可能是读缓冲 buf 的零拷贝视图，下一轮
+        // readSync(fdIn, buf, ...) 会覆盖它——Buffer.concat 就会把「新块头部」当成上一块行尾
+        // 拼进来，每次跨块封档在 member0→member1 边界固定坏一行（丢 k 字节 + 重复 k 字节）。
+        carry = Buffer.from(chunk.subarray(cut))
+        if (!take.length) continue
+        const gz = zlib.gzipSync(take, { level: 6 })
+        writeAllSync(fdOut, gz)
+        const lines = take.toString('utf8').split('\n').length - 1
+        idx.members.push({ off: compOff, len: gz.length, lines })
+        idx.lines += lines
+        idx.bytes += take.length
+        compOff += gz.length
+      }
+      if (carry.length) {
+        // 末尾没有换行的那一行也要归档、也要算行数（否则翻页会漏最后一条）。
+        const gz = zlib.gzipSync(carry, { level: 6 })
+        writeAllSync(fdOut, gz)
+        idx.members.push({ off: compOff, len: gz.length, lines: 1, tail: true })
+        idx.lines += 1
+        idx.bytes += carry.length
+        compOff += gz.length
+      }
+      fs.fsyncSync(fdOut)
+    } catch (e) {
+      try { fs.closeSync(fdIn) } catch (err) {}
+      if (fdOut !== null) { try { fs.closeSync(fdOut) } catch (err) {} }
+      try { fs.unlinkSync(tmpPath) } catch (err) {} // nosemgrep（tmpPath 同上，仅清理自己的临时文件）
+      throw e
     }
-    if (carry.length) {
-      // 末尾没有换行的那一行也要归档、也要算行数（否则翻页会漏最后一条）。
-      const gz = zlib.gzipSync(carry, { level: 6 })
-      writeAllSync(fdOut, gz)
-      idx.members.push({ off: compOff, len: gz.length, lines: 1, tail: true })
-      idx.lines += 1
-      idx.bytes += carry.length
-      compOff += gz.length
-    }
-    fs.fsyncSync(fdOut)
-  } catch (e) {
-    try { fs.closeSync(fdIn) } catch (err) {}
-    if (fdOut !== null) { try { fs.closeSync(fdOut) } catch (err) {} }
-    try { fs.unlinkSync(tmpPath) } catch (err) {} // nosemgrep（tmpPath 同上，仅清理自己的临时文件）
-    throw e
-  }
-  try { fs.closeSync(fdOut) } catch (e) {}
+    try { fs.closeSync(fdOut) } catch (e) {}
 
-  // 发布：gz → idx（两者都在才算成品；listArchives 只认带 idx 的 gz）。
-  fs.renameSync(tmpPath, outPath) // nosemgrep（路径=缓存目录 + 白名单周键）
-  writeAtomic(outPath + '.idx.json', JSON.stringify(idx))
-  fsyncDirBestEffort(dir)
+    // 发布：gz → idx（两者都在才算成品；listArchives 只认带 idx 的 gz）。
+    fs.renameSync(tmpPath, outPath) // nosemgrep（路径=缓存目录 + 白名单周键）
+    writeAtomic(outPath + '.idx.json', JSON.stringify(idx))
+    fsyncDirBestEffort(dir)
+  }
 
   // 标记先落到「新周」再截断：标记写失败抛错、明文保持原样（重复归档好过丢数据）。
+  // F1-3 会把它移到截断成功之后（当前提交只修 F1-2 的索引重建）。
   writeAtomic(weekMarkerPath(logPath), nextKey)
 
-  // 读完到截断之间可能有 fail-open 写者追加：把 [readTo, size) 搬回文件开头再截断。
+  // 读完到截断之间可能有 fail-open 写者追加：把 [idx.bytes, size) 搬回文件开头再截断。
   try {
     const st = fs.fstatSync(fdIn)
     let keepLen = 0
-    if (writable && st.size > readTo) {
-      const extra = Buffer.alloc(st.size - readTo)
+    if (writable && st.size >= idx.bytes) {
+      const extra = Buffer.alloc(st.size - idx.bytes)
       let got = 0
       while (got < extra.length) {
-        const n = fs.readSync(fdIn, extra, got, extra.length - got, readTo + got)
+        const n = fs.readSync(fdIn, extra, got, extra.length - got, idx.bytes + got)
         if (n <= 0) break
         got += n
       }
@@ -218,6 +312,7 @@ function sealLog (logPath, cacheDir, prevKey, nextKey) {
   } finally {
     try { fs.closeSync(fdIn) } catch (e) {}
   }
+  writeAtomic(weekMarkerPath(logPath), nextKey)
   return { path: outPath, lines: idx.lines, bytes: idx.bytes }
 }
 
@@ -346,6 +441,10 @@ function readGzIndex (gzPath) {
     o = openLog(gzPath + '.idx.json', false) // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
     const idx = JSON.parse(fs.readFileSync(o.fd, 'utf8'))
     if (!idx || !Array.isArray(idx.members) || !idx.members.length) return null
+    // v3.405：lines/bytes 是切档状态机的输入（bytes 决定明文截断位置），形态异常一律当作
+    // 「没有索引」——恢复路径会从 gz 重建，绝不用一个 NaN/负数去截断明文。
+    if (!Number.isSafeInteger(idx.lines) || idx.lines < 0) return null
+    if (!Number.isSafeInteger(idx.bytes) || idx.bytes < 0) return null
     for (const m of idx.members) {
       if (!Number.isSafeInteger(m.off) || m.off < 0 || !Number.isSafeInteger(m.len) || m.len < 0 || m.len > MAX_MEMBER_BYTES) return null
     }

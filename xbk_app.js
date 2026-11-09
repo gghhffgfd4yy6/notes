@@ -263,8 +263,15 @@ function createApp ({
                   LogArchive.pruneArchives(this._cacheDir(), path.basename(logPath))
                 }
               } catch (e) {
-                // 失败要留痕（不递归写日志，避免归档故障放大成日志风暴）：下周重试。
-                console.warn(`⚠️ 日志归档失败（下周重试）：${path.basename(logPath)} ${(e && e.code) || ''}`)
+                // 失败要留痕（不递归写日志，避免归档故障放大成日志风暴）：archivePending 保持为真，
+                // 下一轮重试。_writeRunLog 每写一行都会走到这段，故同一周键的失败 60s 内只告警一次，
+                // 否则 stderr 会被同一条错误刷屏（F1-2：故障必须可见，但不能变成日志风暴）。
+                const now = Date.now()
+                if (this._archiveWarnKey !== marker || !this._archiveWarnAt || now - this._archiveWarnAt >= 60 * 1000) {
+                  this._archiveWarnKey = marker
+                  this._archiveWarnAt = now
+                  console.warn(`⚠️ 日志归档失败（下一轮重试，本轮禁用截尾）：${path.basename(logPath)} ${(e && e.message) || (e && e.code) || e}`)
+                }
               }
             }
           }
@@ -370,6 +377,8 @@ function createApp ({
     },
 
     _diskWarningAt: 0,
+    _archiveWarnAt: 0,
+    _archiveWarnKey: '',
     _alertLastAtByPath: new Map(),
     _reportMemoryStateByPath: new Map(),
 

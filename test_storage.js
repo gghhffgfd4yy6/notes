@@ -929,6 +929,47 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(sealed11.lines, 60000, '行数必须精确')
     assert.strictEqual(sealed11.bytes, src11.length, '归档字节数必须等于原文长度')
     assert.ok(out11.equals(src11), '解压全部成员拼接必须与原文逐字节相等（F1-1：carry 别名会在成员边界坏一行）')
+
+    // ⑥ F1-2：gz 已发布、idx 丢失（崩在「发布后、写 idx 前」）⇒ 再跑 sealLog 必须从 gz 重建 idx，
+    // 并继续完成截断与 marker 推进，而不是直接 return null 把 archivePending 永久钉死。
+    const dir12 = make('logarch-f12')
+    fs.mkdirSync(dir12, { recursive: true })
+    const log12 = path.join(dir12, 'run.log')
+    const body12 = Buffer.from(Array.from({ length: 3000 }, (_, i) => 'F12 第' + i + '行 中文内容 ' + 'y'.repeat(20)).join('\n') + '\n')
+    fs.writeFileSync(log12, body12)
+    const first12 = LogArchive.sealLog(log12, dir12, '20261102-20261108', '20261109-20261115')
+    const idxBefore12 = JSON.parse(fs.readFileSync(first12.path + '.idx.json', 'utf8'))
+    // 复现崩溃现场：gz 已在，明文还没截断，idx 没写出来，marker 仍停在上一周
+    fs.writeFileSync(log12, body12)
+    LogArchive.writeMarker(log12, '20261102-20261108')
+    fs.unlinkSync(first12.path + '.idx.json')
+    const second12 = LogArchive.sealLog(log12, dir12, '20261102-20261108', '20261109-20261115')
+    assert.ok(second12, 'gz 已存在时必须继续完成封档，不得静默返回 null')
+    assert.strictEqual(second12.lines, 3000)
+    assert.ok(fs.existsSync(first12.path + '.idx.json'), '缺失的 idx 必须被补写')
+    const idxAfter12 = JSON.parse(fs.readFileSync(first12.path + '.idx.json', 'utf8'))
+    assert.deepStrictEqual(idxAfter12.members, idxBefore12.members, '重建的成员表必须与丢失前完全一致')
+    assert.strictEqual(idxAfter12.lines, idxBefore12.lines, '重建的行数必须与丢失前一致')
+    assert.strictEqual(idxAfter12.bytes, body12.length, '重建的字节数必须等于原文长度')
+    assert.strictEqual(fs.readFileSync(log12, 'utf8'), '', '补 idx 后必须继续截断明文（否则 archivePending 永远清不掉）')
+    assert.strictEqual(LogArchive.readMarker(log12), '20261109-20261115', '补 idx 后 marker 必须推进到新周')
+    const pg12 = LogArchive.readGzPage(first12.path, 1, 100)
+    assert.strictEqual(pg12.lines[0], 'F12 第0行 中文内容 ' + 'y'.repeat(20), '重建的索引必须能让控制台正常读档')
+    assert.strictEqual(pg12.total, 3000)
+
+    // ⑥b 无法重建（gz 是空的）⇒ 必须抛带路径的明确错误，不得静默 null
+    const dir12b = make('logarch-f12b')
+    fs.mkdirSync(path.join(dir12b, 'logs'), { recursive: true })
+    const log12b = path.join(dir12b, 'run.log')
+    fs.writeFileSync(log12b, 'F12b 内容\n')
+    LogArchive.writeMarker(log12b, '20261102-20261108')
+    fs.writeFileSync(LogArchive.archivePath(dir12b, 'run.log', '20261102-20261108'), Buffer.alloc(0))
+    let rebuildErr = null
+    try { LogArchive.sealLog(log12b, dir12b, '20261102-20261108', '20261109-20261115') } catch (e) { rebuildErr = e }
+    assert.ok(rebuildErr, '索引无法重建时必须抛错（调用方据此保留 archivePending 并每轮告警）')
+    assert.ok(rebuildErr.message.includes('gz 为空') && rebuildErr.message.includes(dir12b),
+      `错误必须带路径与原因：${rebuildErr.message}`)
+    assert.strictEqual(LogArchive.readMarker(log12b), '20261102-20261108', '重建失败不得推进 marker')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
