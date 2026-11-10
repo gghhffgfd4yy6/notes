@@ -13,7 +13,7 @@ const os = require('os')
 
 // v3.403：日志上限在生产是 100MiB；本套件用桩 fs 造夹具，按 20MiB 注入即可覆盖同一套截尾逻辑
 process.env.XBK_LOG_LIMIT_BYTES = String(20 * 1024 * 1024)
-const { createApp } = require('./xbk_app.js')
+const { createApp, SIMILAR_WINDOW_MAX_BYTES } = require('./xbk_app.js')
 
 let passed = 0
 let failed = 0
@@ -4561,9 +4561,19 @@ check('近似去重：短标题不写入窗口（避免挤掉有效历史）', (
 // 只替换 App 侧的 readSafeTextResult / writeAtomic 来注入并发瞬时读失败与写失败。
 const { readSafeTextResult: realReadSafeTextResult } = require('./xbk_storage')
 
-checkAsync('F3-1 replaced：重读仍失败 ⇒ 空窗口且绝不 rename（内容/mtime 不变）', async () => {
+check('F3-2 窗口读取上限：SIMILAR_WINDOW_MAX_BYTES === SYSTEM_CONTRACT.md 的「读取上限 N KiB」', () => {
+  const contract = require('fs').readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')
+  const m = contract.match(/窗口按推送源落[\s\S]{0,900}?读取上限\s*(\d+)\s*KiB/)
+  assert.ok(m, 'SYSTEM_CONTRACT.md 必须写明近似去重窗口的「读取上限 N KiB」')
+  assert.strictEqual(SIMILAR_WINDOW_MAX_BYTES, Number(m[1]) * 1024,
+    `代码常量 ${SIMILAR_WINDOW_MAX_BYTES} 字节必须等于契约值 ${m[1]} KiB（旧实现代码 2 MiB / 契约 256 KiB 漂移）`)
+})
+
+checkAsync('F3-1 replaced：重读仍失败 ⇒ 空窗口且绝不 rename（内容/mtime 不变），读取上限用常量', async () => {
+  let maxSeen = null
   const stub = (p, max, opts) => {
     if (p.includes('similar-')) {
+      maxSeen = max
       return { status: 'replaced', text: null, error: new Error('文件读取期间被替换') }
     }
     return realReadSafeTextResult(p, max, opts)
@@ -4577,6 +4587,7 @@ checkAsync('F3-1 replaced：重读仍失败 ⇒ 空窗口且绝不 rename（内�
     assert.strictEqual(res.status, 'replaced', `状态必须保留为 replaced：${JSON.stringify(res)}`)
     assert.strictEqual(res.corrupt, false, '`replaced` 是并发瞬时事实，绝不判成可隔离')
     assert.deepStrictEqual(res.entries, [], '重读仍失败时本轮按空窗口处理')
+    assert.strictEqual(maxSeen, SIMILAR_WINDOW_MAX_BYTES, '读取上限必须走常量（512 KiB），不得再写死 2 MiB')
     assert.strictEqual(realFs.readFileSync(simPath, 'utf8'), original, '窗口文件内容必须原样保留')
     assert.strictEqual(realFs.statSync(simPath).mtimeMs, mtimeBefore, '窗口文件 mtime 必须不变（没被写、没被 rename）')
     const backups = realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-'))

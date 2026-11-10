@@ -6,8 +6,10 @@ const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 const Similar = require('./scripts/similar-dedupe.js')
 const LogArchive = require('./scripts/log-archive.js')
 
-// 近似去重窗口读取上限（沿用历史的 2 MiB；与 SYSTEM_CONTRACT.md 的对齐见 F3-2）。
-const SIMILAR_WINDOW_MAX_BYTES = 2 * 1024 * 1024
+// F3-2：近似去重窗口读取上限的**唯一**常量。SYSTEM_CONTRACT.md 的「近似去重」条目必须写同一个数值，
+// 由 test_app_unit.js 直接解析契约文本断言——旧实现代码写死 2 MiB、契约写 256 KiB，两侧漂移无任何门禁。
+// 300 条窗口实测约 400 KB（标题 120 字 + 正文 200 字/条），512 KiB 留出余量。
+const SIMILAR_WINDOW_MAX_BYTES = 512 * 1024
 // F3-1：`replaced` / `ioError` 是并发瞬时事实（另一进程原子 rename 覆盖窗口文件的那一瞬），
 // 退避后重读一次即足；50ms 与 xbk_filter_store.js 的 F4-3（TRANSIENT_READ_RETRY_MS）同口径。
 const SIMILAR_WINDOW_RETRY_MS = 50
