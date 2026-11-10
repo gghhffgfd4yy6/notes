@@ -3173,10 +3173,10 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     fs: realFs,
     path,
     crypto: nodeCrypto,
-    // v3.407：允许用例替换 App 侧的读入口（F3-1 的 replaced/ioError 注入）。
+    // v3.407：允许用例替换 App 侧的读/写入口（F3-1 的 replaced/ioError 注入、F3-4 的写失败注入）。
     // MessageStore 仍用真实 storage，只有被测的 App 方法走替身，避免把缓存主存一起改掉。
     readSafeTextResult: over.readSafeTextResult || readSafeTextResult,
-    writeAtomic,
+    writeAtomic: over.writeAtomic || writeAtomic,
     isRegularOrMissing,
     STATE_TEXT_MAX_BYTES,
     DEFAULT_MAX_SIZE,
@@ -4559,7 +4559,7 @@ check('近似去重：短标题不写入窗口（避免挤掉有效历史）', (
 // ===== v3.407：近似去重窗口隔离判据（F3-1）/ 读取上限一致性（F3-2）/ 隔离件保留上限（F3-3）/ 写失败留痕（F3-4）=====
 // 与上方 v3.397 的纯函数用例不同，这一段用 buildFilterRunHarness 的真实装配（真 createApp + 临时 cacheDir），
 // 只替换 App 侧的 readSafeTextResult / writeAtomic 来注入并发瞬时读失败与写失败。
-const { readSafeTextResult: realReadSafeTextResult } = require('./xbk_storage')
+const { readSafeTextResult: realReadSafeTextResult, writeAtomic: realWriteAtomic } = require('./xbk_storage')
 
 check('F3-2 窗口读取上限：SIMILAR_WINDOW_MAX_BYTES === SYSTEM_CONTRACT.md 的「读取上限 N KiB」', () => {
   const contract = require('fs').readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')
@@ -4665,6 +4665,23 @@ checkAsync('F3-3 隔离件保留上限：12 份 ⇒ 保留最新 10 份（最旧
     assert.ok(!left.includes(names[0]) && !left.includes(names[1]), `删除的必须是最旧两份：${JSON.stringify(left)}`)
     assert.ok(realFs.statSync(dirName).isDirectory(), '目录不得被删')
     assert.ok(realFs.existsSync(oddName), '非数字时间戳的异名文件不得被删')
+  })
+})
+
+checkAsync('F3-4 窗口写失败：run.log 落 WARN 且摘要行带 similardrop=N（不再只有 console.warn）', async () => {
+  await withRunHarness({
+    writeAtomic: (p, text, label) => p.includes('similar-') ? false : realWriteAtomic(p, text, label)
+  }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    h.setItems([makeRunItem('sd-1', '写失败用例标题足够长甲')])
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(summary.pushed, 1, '窗口写失败不得影响本轮推送')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/WARN 近似去重窗口写入失败：1 条窗口记录未落盘/.test(log), `run.log 必须落 WARN：${log.slice(-600)}`)
+    const summaryLine = log.split('\n').find(l => l.includes('total=1') && l.includes('pushed=1'))
+    assert.ok(summaryLine, '必须写摘要行')
+    assert.ok(/similardrop=1/.test(summaryLine), `摘要行必须带 similardrop=1：${summaryLine}`)
+    assert.ok(!realFs.existsSync(simPath), '写失败时窗口文件不应存在（本用例写入全部失败）')
   })
 })
 

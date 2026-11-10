@@ -362,6 +362,17 @@ function createApp ({
       return removed
     },
 
+    // F3-4：窗口落盘失败此前只有 console.warn——cron 场景看不到，摘要也读不出「本轮窗口没落盘」。
+    // 这里补 run.log WARN；调用方按返回 false 把未落盘条数记进摘要行 `similardrop=N`
+    // （N = 本轮窗口条数，即「下次可能重复推送同类标题」的上界）。
+    _writeSimilarWindow (filePath, list) {
+      if (this._writeTextAtomic(filePath, JSON.stringify(list))) return true
+      const drop = Array.isArray(list) ? list.length : 0
+      this._writeRunLog(`${this._localStamp()} WARN 近似去重窗口写入失败：${drop} 条窗口记录未落盘（下次可能重复推送同类标题）${filePath}\n`)
+      console.warn('⚠️ 近似去重缓存写入失败（不影响本轮推送，最坏结果是下次再发一遍同类标题）')
+      return false
+    },
+
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
     _writeState (filePath, state) {
     // v3.179：类型守卫——state 为 undefined/null/非对象时 JSON.stringify 会静默产出
@@ -1809,6 +1820,8 @@ function createApp ({
         let dedupCount = 0
         // v3.397：近似去重（标题相似度 + 10 分钟窗）——拦同一句话改几个字重发，ID/URL/标题精确去重抓不到。
         let similarCount = 0
+        // v3.407（F3-4）：本轮窗口落盘失败的条数，摘要行 similardrop=N 的唯一来源。
+        let similarDrop = 0
         let filteredCount = 0
         let truncatedCount = 0 // v3.145：maxPerRun 截断数计入统计（曾凭空消失）
         const cacheName = MessageStore.getFileName(Config.api.pushUrl)
@@ -2420,9 +2433,7 @@ function createApp ({
             // 隔离失败（false）时不得再写：原件没搬走，覆写等于删掉唯一副本。
             if (isolated !== false && (similarCorrupt || list !== recentTitles)) {
               recentTitles = list
-              if (!this._writeTextAtomic(similarPath, JSON.stringify(list))) {
-                console.warn('⚠️ 近似去重缓存写入失败（不影响本轮推送，最坏结果是下次再发一遍同类标题）')
-              }
+              if (!this._writeSimilarWindow(similarPath, list)) similarDrop = list.length
             }
           } catch (e) {
             console.warn(`⚠️ 近似去重缓存更新失败（不影响本轮推送）：${Utils.safeErrorText(e, '未知错误')}`)
@@ -2494,7 +2505,7 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}${similarCount > 0 ? ` similar=${similarCount}` : ''}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}${similarCount > 0 ? ` similar=${similarCount}` : ''}${similarDrop > 0 ? ` similardrop=${similarDrop}` : ''}\n`)
         // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
         // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
         // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。
