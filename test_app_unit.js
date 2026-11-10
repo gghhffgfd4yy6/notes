@@ -4561,6 +4561,28 @@ check('近似去重：短标题不写入窗口（避免挤掉有效历史）', (
 // 只替换 App 侧的 readSafeTextResult / writeAtomic 来注入并发瞬时读失败与写失败。
 const { readSafeTextResult: realReadSafeTextResult, writeAtomic: realWriteAtomic } = require('./xbk_storage')
 
+// CodeQL js/file-system-race（CWE-367）修法：同一路径「按路径 stat 检查 → 按路径 read 使用」是
+// check-then-use，两次路径解析之间文件可能被 rename 换成另一个 inode；且该查询的 use 集合显式含
+// openSync 本身，所以调用点也不能留按路径的 statSync（那会变成 stat→open 配对，告警只是前移）。
+// 窗口内容与 mtime 必须从**同一个 fd** 取：openSync 一次 → fstatSync 定长/mtime → readSync 循环
+// 读满 → finally closeSync（与 test_storage.js 的 readAllByFd、test_app_unit.js 日志截尾用例同口径）。
+const readTextAndMtimeSync = (fs, p) => {
+  const fd = fs.openSync(p, 'r')
+  try {
+    const st = fs.fstatSync(fd)
+    const buf = Buffer.alloc(st.size)
+    let got = 0
+    while (got < buf.length) {
+      const n = fs.readSync(fd, buf, got, buf.length - got, got)
+      if (n <= 0) break
+      got += n
+    }
+    return { text: buf.toString('utf8', 0, got), mtimeMs: st.mtimeMs }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 check('F3-2 窗口读取上限：SIMILAR_WINDOW_MAX_BYTES === SYSTEM_CONTRACT.md 的「读取上限 N KiB」', () => {
   const contract = require('fs').readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')
   const m = contract.match(/窗口按推送源落[\s\S]{0,900}?读取上限\s*(\d+)\s*KiB/)
@@ -4582,14 +4604,15 @@ checkAsync('F3-1 replaced：重读仍失败 ⇒ 空窗口且绝不 rename（内�
     const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
     const original = JSON.stringify([{ t: '窗口里的有效标题甲', at: Date.now(), c: '', p: '', x: '' }])
     realFs.writeFileSync(simPath, original)
-    const mtimeBefore = realFs.statSync(simPath).mtimeMs
+    const mtimeBefore = readTextAndMtimeSync(realFs, simPath).mtimeMs
     const res = h.App._readSimilarWindow(simPath)
     assert.strictEqual(res.status, 'replaced', `状态必须保留为 replaced：${JSON.stringify(res)}`)
     assert.strictEqual(res.corrupt, false, '`replaced` 是并发瞬时事实，绝不判成可隔离')
     assert.deepStrictEqual(res.entries, [], '重读仍失败时本轮按空窗口处理')
     assert.strictEqual(maxSeen, SIMILAR_WINDOW_MAX_BYTES, '读取上限必须走常量（512 KiB），不得再写死 2 MiB')
-    assert.strictEqual(realFs.readFileSync(simPath, 'utf8'), original, '窗口文件内容必须原样保留')
-    assert.strictEqual(realFs.statSync(simPath).mtimeMs, mtimeBefore, '窗口文件 mtime 必须不变（没被写、没被 rename）')
+    const keptAfterRead = readTextAndMtimeSync(realFs, simPath)
+    assert.strictEqual(keptAfterRead.text, original, '窗口文件内容必须原样保留')
+    assert.strictEqual(keptAfterRead.mtimeMs, mtimeBefore, '窗口文件 mtime 必须不变（没被写、没被 rename）')
     const backups = realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-'))
     assert.deepStrictEqual(backups, [], `不得产生任何 .corrupt-*：${JSON.stringify(backups)}`)
     // 整轮跑一次（无待推条目 ⇒ 窗口无新增，本就不该写盘）：仍不得 rename/改写。
