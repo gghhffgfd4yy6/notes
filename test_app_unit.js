@@ -13,7 +13,7 @@ const os = require('os')
 
 // v3.403：日志上限在生产是 100MiB；本套件用桩 fs 造夹具，按 20MiB 注入即可覆盖同一套截尾逻辑
 process.env.XBK_LOG_LIMIT_BYTES = String(20 * 1024 * 1024)
-const { createApp } = require('./xbk_app.js')
+const { createApp, SIMILAR_WINDOW_MAX_BYTES } = require('./xbk_app.js')
 
 let passed = 0
 let failed = 0
@@ -3173,8 +3173,10 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     fs: realFs,
     path,
     crypto: nodeCrypto,
-    readSafeTextResult,
-    writeAtomic,
+    // v3.407：允许用例替换 App 侧的读/写入口（F3-1 的 replaced/ioError 注入、F3-4 的写失败注入）。
+    // MessageStore 仍用真实 storage，只有被测的 App 方法走替身，避免把缓存主存一起改掉。
+    readSafeTextResult: over.readSafeTextResult || readSafeTextResult,
+    writeAtomic: over.writeAtomic || writeAtomic,
     isRegularOrMissing,
     STATE_TEXT_MAX_BYTES,
     DEFAULT_MAX_SIZE,
@@ -4552,6 +4554,274 @@ check('近似去重：短标题不写入窗口（避免挤掉有效历史）', (
   const list = Similar.appendRecent([], '京东神券100元', now)
   assert.strictEqual(list.length, 0)
   assert.strictEqual(Similar.appendRecent([], '这是一个足够长的测试标题内容', now).length, 1)
+})
+
+// ===== v3.407：近似去重窗口隔离判据（F3-1）/ 读取上限一致性（F3-2）/ 隔离件保留上限（F3-3）/ 写失败留痕（F3-4）=====
+// 与上方 v3.397 的纯函数用例不同，这一段用 buildFilterRunHarness 的真实装配（真 createApp + 临时 cacheDir），
+// 只替换 App 侧的 readSafeTextResult / writeAtomic 来注入并发瞬时读失败与写失败。
+const { readSafeTextResult: realReadSafeTextResult, writeAtomic: realWriteAtomic } = require('./xbk_storage')
+
+// CodeQL js/file-system-race（CWE-367）修法：同一路径「按路径 stat 检查 → 按路径 read 使用」是
+// check-then-use，两次路径解析之间文件可能被 rename 换成另一个 inode；且该查询的 use 集合显式含
+// openSync 本身，所以调用点也不能留按路径的 statSync（那会变成 stat→open 配对，告警只是前移）。
+// 窗口内容与 mtime 必须从**同一个 fd** 取：openSync 一次 → fstatSync 定长/mtime → readSync 循环
+// 读满 → finally closeSync（与 test_storage.js 的 readAllByFd、test_app_unit.js 日志截尾用例同口径）。
+const readTextAndMtimeSync = (fs, p) => {
+  const fd = fs.openSync(p, 'r')
+  try {
+    const st = fs.fstatSync(fd)
+    const buf = Buffer.alloc(st.size)
+    let got = 0
+    while (got < buf.length) {
+      const n = fs.readSync(fd, buf, got, buf.length - got, got)
+      if (n <= 0) break
+      got += n
+    }
+    return { text: buf.toString('utf8', 0, got), mtimeMs: st.mtimeMs }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+check('F3-2 窗口读取上限：SIMILAR_WINDOW_MAX_BYTES === SYSTEM_CONTRACT.md 的「读取上限 N KiB」', () => {
+  const contract = require('fs').readFileSync(path.join(__dirname, 'SYSTEM_CONTRACT.md'), 'utf8')
+  const m = contract.match(/窗口按推送源落[\s\S]{0,900}?读取上限\s*(\d+)\s*KiB/)
+  assert.ok(m, 'SYSTEM_CONTRACT.md 必须写明近似去重窗口的「读取上限 N KiB」')
+  assert.strictEqual(SIMILAR_WINDOW_MAX_BYTES, Number(m[1]) * 1024,
+    `代码常量 ${SIMILAR_WINDOW_MAX_BYTES} 字节必须等于契约值 ${m[1]} KiB（旧实现代码 2 MiB / 契约 256 KiB 漂移）`)
+})
+
+checkAsync('F3-1 replaced：重读仍失败 ⇒ 空窗口且绝不 rename（内容/mtime 不变），读取上限用常量', async () => {
+  let maxSeen = null
+  const stub = (p, max, opts) => {
+    if (p.includes('similar-')) {
+      maxSeen = max
+      return { status: 'replaced', text: null, error: new Error('文件读取期间被替换') }
+    }
+    return realReadSafeTextResult(p, max, opts)
+  }
+  await withRunHarness({ readSafeTextResult: stub }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const original = JSON.stringify([{ t: '窗口里的有效标题甲', at: Date.now(), c: '', p: '', x: '' }])
+    realFs.writeFileSync(simPath, original)
+    const mtimeBefore = readTextAndMtimeSync(realFs, simPath).mtimeMs
+    const res = h.App._readSimilarWindow(simPath)
+    assert.strictEqual(res.status, 'replaced', `状态必须保留为 replaced：${JSON.stringify(res)}`)
+    assert.strictEqual(res.corrupt, false, '`replaced` 是并发瞬时事实，绝不判成可隔离')
+    assert.deepStrictEqual(res.entries, [], '重读仍失败时本轮按空窗口处理')
+    assert.strictEqual(maxSeen, SIMILAR_WINDOW_MAX_BYTES, '读取上限必须走常量（512 KiB），不得再写死 2 MiB')
+    const keptAfterRead = readTextAndMtimeSync(realFs, simPath)
+    assert.strictEqual(keptAfterRead.text, original, '窗口文件内容必须原样保留')
+    assert.strictEqual(keptAfterRead.mtimeMs, mtimeBefore, '窗口文件 mtime 必须不变（没被写、没被 rename）')
+    const backups = realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-'))
+    assert.deepStrictEqual(backups, [], `不得产生任何 .corrupt-*：${JSON.stringify(backups)}`)
+    // 整轮跑一次（无待推条目 ⇒ 窗口无新增，本就不该写盘）：仍不得 rename/改写。
+    h.setItems([])
+    await runWithWarnings(h.App)
+    const keptAfterRun = readTextAndMtimeSync(realFs, simPath)
+    assert.strictEqual(keptAfterRun.text, original, '整轮跑完窗口内容必须不变')
+    assert.strictEqual(keptAfterRun.mtimeMs, mtimeBefore, '整轮跑完窗口 mtime 必须不变')
+    assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-')), [], '整轮不得 rename 窗口')
+  })
+})
+
+checkAsync('F3-1 replaced 后重读成功 ⇒ 正常使用窗口（不丢历史、不隔离、只重读一次）', async () => {
+  let similarCalls = 0
+  const stub = (p, max, opts) => {
+    if (p.includes('similar-')) {
+      similarCalls++
+      if (similarCalls === 1) return { status: 'replaced', text: null, error: new Error('瞬时替换') }
+    }
+    return realReadSafeTextResult(p, max, opts)
+  }
+  await withRunHarness({ readSafeTextResult: stub }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    realFs.writeFileSync(simPath, JSON.stringify([{ t: '窗口里的有效标题甲', at: Date.now(), c: '', p: '', x: '' }]))
+    const res = h.App._readSimilarWindow(simPath)
+    assert.strictEqual(res.corrupt, false)
+    assert.strictEqual(res.entries.length, 1, '重读成功必须正常使用窗口（不得当空窗口）')
+    assert.strictEqual(similarCalls, 2, `只允许重读一次：${similarCalls}`)
+    assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-')), [], '不得产生隔离件')
+  })
+})
+
+checkAsync('F3-1 invalid→ok：首读半写 JSON 解析失败必须重读复核，重读成功即正常使用（不隔离、只重读一次）', async () => {
+  let similarReads = 0
+  const stub = (p, max, opts) => {
+    if (p.includes('similar-')) {
+      similarReads++
+      // 首读模拟「别的进程还写到一半」：状态 ok、text 是半写 JSON ⇒ 解析失败（invalid）。
+      if (similarReads === 1) return { status: 'ok', text: '[{"t":"半写窗口标题' }
+    }
+    return realReadSafeTextResult(p, max, opts)
+  }
+  await withRunHarness({ readSafeTextResult: stub }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const title = '半写窗口重读确认标题甲乙'
+    const original = JSON.stringify([{ t: title, at: Date.now(), c: '', p: '', x: '' }])
+    realFs.writeFileSync(simPath, original)
+    const mtimeBefore = readTextAndMtimeSync(realFs, simPath).mtimeMs
+    h.setItems([makeRunItem('iv-ok-1', title)])
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(similarReads, 2, `首读解析失败必须重读复核一次（实际读 ${similarReads} 次）`)
+    assert.strictEqual(summary.pushed, 0, '窗口里重读到的标题与本轮条目近似 ⇒ 必须判重不推（证明本轮真的用了重读数据）')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    const summaryLine = log.split('\n').find(l => l.includes('total=1') && l.includes('pushed=0'))
+    assert.ok(summaryLine, `必须写本轮摘要行：${log.slice(-400)}`)
+    assert.ok(/ similar=1/.test(summaryLine), `摘要行必须带 similar=1（重读到的窗口数据被用于判重）：${summaryLine}`)
+    assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-')), [],
+      '首读解析失败但重读成功 ⇒ 不得把有效窗口 rename 成 .corrupt-*')
+    const keptAfterRun = readTextAndMtimeSync(realFs, simPath)
+    assert.strictEqual(keptAfterRun.text, original, '本轮无新增推送 ⇒ 窗口内容必须原样保留')
+    assert.strictEqual(keptAfterRun.mtimeMs, mtimeBefore, '窗口 mtime 必须不变（没被写、没被 rename）')
+  })
+})
+
+checkAsync('F3-1 两次都 invalid：重读复核后恰好 1 个 .corrupt-*、窗口重建为 []', async () => {
+  let similarReads = 0
+  const stub = (p, max, opts) => {
+    if (p.includes('similar-')) {
+      similarReads++
+      return { status: 'ok', text: '[{"t":"两次都半写' } // 两次读都是半写 JSON ⇒ 确定性损坏
+    }
+    return realReadSafeTextResult(p, max, opts)
+  }
+  await withRunHarness({ readSafeTextResult: stub }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const prefix = path.basename(simPath) + '.corrupt-'
+    realFs.writeFileSync(simPath, JSON.stringify([{ t: '有效窗口标题甲乙丙丁', at: Date.now(), c: '', p: '', x: '' }]))
+    h.setItems([])
+    await runWithWarnings(h.App)
+    assert.strictEqual(similarReads, 2, `解析失败必须先重读复核（实际读 ${similarReads} 次）`)
+    const backups = realFs.readdirSync(cacheDir).filter(n => n.startsWith(prefix))
+    assert.strictEqual(backups.length, 1, `两次都 invalid 只允许 1 个隔离件：${JSON.stringify(backups)}`)
+    assert.deepStrictEqual(JSON.parse(realFs.readFileSync(simPath, 'utf8')), [], '隔离后必须重建空窗口')
+  })
+})
+
+checkAsync('F3-1/F3-3 非法 JSON：单轮恰好 1 个 .corrupt-*、窗口重建为 []；连续 12 轮 ≤10 份（真实轮末回收）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const prefix = path.basename(simPath) + '.corrupt-'
+    const backups = () => realFs.readdirSync(cacheDir).filter(n => n.startsWith(prefix))
+    h.setItems([])
+    realFs.writeFileSync(simPath, '{ 这不是 JSON')
+    await runWithWarnings(h.App)
+    assert.strictEqual(backups().length, 1, `单轮损坏只允许 1 个隔离件：${JSON.stringify(backups())}`)
+    assert.deepStrictEqual(JSON.parse(realFs.readFileSync(simPath, 'utf8')), [], '损坏窗口必须重建为 []')
+    // 11 + 首轮 = 12 轮真实 run()：隔离件会到 11/12 份，只有轮末真实接线（_isolateSimilarWindow →
+    // _pruneSimilarBackups）在跑才收得住 ≤10 —— 直接调私有方法的用例证明不了接线没被删。
+    for (let i = 0; i < 11; i++) {
+      realFs.writeFileSync(simPath, `{ 坏窗口 ${i}`)
+      await runWithWarnings(h.App)
+    }
+    assert.ok(backups().length <= 10, `连续 12 轮损坏后隔离件必须 ≤10（轮末回收真实生效）：${JSON.stringify(backups())}`)
+    assert.ok(backups().length >= 1, '隔离件必须保留（只隔离、绝不删除）')
+  })
+})
+
+checkAsync('F3-3 隔离件保留上限：12 份 ⇒ 保留最新 10 份（最旧先删），目录/异名文件不碰', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const prefix = path.basename(simPath) + '.corrupt-'
+    const base = Date.now() - 100000
+    const names = []
+    for (let i = 0; i < 12; i++) {
+      const p = `${simPath}.corrupt-${base + i}`
+      realFs.writeFileSync(p, `坏窗口 ${i}`)
+      realFs.utimesSync(p, new Date(base + i), new Date(base + i))
+      names.push(path.basename(p))
+    }
+    const dirName = `${simPath}.corrupt-9999999999999` // 目录：即使名字匹配也不得删
+    realFs.mkdirSync(dirName)
+    const oddName = `${simPath}.corrupt-not-a-stamp` // 非本模块命名口径：不得删
+    realFs.writeFileSync(oddName, 'x')
+    const removed = h.App._pruneSimilarBackups(simPath)
+    assert.strictEqual(removed, 2, '12 份 + 上限 10 ⇒ 必须删掉最旧 2 份')
+    const left = realFs.readdirSync(cacheDir)
+      .filter(n => n.startsWith(prefix) && /^[0-9]+$/.test(n.slice(prefix.length)))
+      .filter(n => realFs.lstatSync(path.join(cacheDir, n)).isFile())
+    assert.strictEqual(left.length, 10, `只允许保留 10 份：${JSON.stringify(left)}`)
+    assert.ok(!left.includes(names[0]) && !left.includes(names[1]), `删除的必须是最旧两份：${JSON.stringify(left)}`)
+    assert.ok(realFs.statSync(dirName).isDirectory(), '目录不得被删')
+    assert.ok(realFs.existsSync(oddName), '非数字时间戳的异名文件不得被删')
+  })
+})
+
+checkAsync('F3-4 窗口写失败：run.log 落 WARN 且摘要行带 similardrop=N（不再只有 console.warn）', async () => {
+  await withRunHarness({
+    writeAtomic: (p, text, label) => p.includes('similar-') ? false : realWriteAtomic(p, text, label)
+  }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    h.setItems([makeRunItem('sd-1', '写失败用例标题足够长甲')])
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(summary.pushed, 1, '窗口写失败不得影响本轮推送')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    assert.ok(/WARN 近似去重窗口写入失败：1 条窗口记录未落盘/.test(log), `run.log 必须落 WARN：${log.slice(-600)}`)
+    const summaryLine = log.split('\n').find(l => l.includes('total=1') && l.includes('pushed=1'))
+    assert.ok(summaryLine, '必须写摘要行')
+    assert.ok(/similardrop=1/.test(summaryLine), `摘要行必须带 similardrop=1：${summaryLine}`)
+    assert.ok(!realFs.existsSync(simPath), '写失败时窗口文件不应存在（本用例写入全部失败）')
+  })
+})
+
+checkAsync('F3-1 两进程并发写窗口 100 次：读取侧不产生 .corrupt-*（replaced 绝不隔离）', async () => {
+  const { spawn } = require('child_process')
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    realFs.writeFileSync(simPath, JSON.stringify([{ t: '并发窗口初始标题甲', at: Date.now(), c: '', p: '', x: '' }]))
+    const storagePath = path.join(__dirname, 'xbk_storage.js')
+    const script = [
+      'const { writeAtomic } = require(process.argv[1])',
+      'const file = process.argv[2]',
+      'const count = Number(process.argv[3])',
+      'const startAt = Number(process.argv[4])',
+      'const cell = new Int32Array(new SharedArrayBuffer(4))',
+      'const wait = (ms) => { try { Atomics.wait(cell, 0, 0, ms) } catch (e) { /* 忙等兜底 */ } }',
+      'wait(Math.max(0, startAt - Date.now()))',
+      'for (let i = 0; i < count; i++) {',
+      "  if (!writeAtomic(file, JSON.stringify([{ t: '并发窗口标题' + i + '号', at: Date.now(), c: '', p: '', x: '' }]), '并发写用例')) process.exit(2)",
+      '  wait(1)',
+      '}',
+      'process.exit(0)'
+    ].join('\n')
+    const startAt = Date.now() + 500
+    // 两个写进程各写 50 次 = 100 次原子 rename；父进程同时反复读，逼出 replaced/ioError。
+    const children = [0, 1].map(() => spawn(process.execPath,
+      ['-e', script, storagePath, simPath, '50', String(startAt)], { cwd: __dirname, stdio: 'ignore' }))
+    // SonarCloud javascript:S9383（R3-4）：`allDone.then(() => { done = true })` 是未 await、无 rejection
+    // handler 的浮动 Promise（rejection 会被静默吞掉）。改为子进程退出计数：每个 exit 记 code/signal 并递减
+    // pending，归零时 resolve；busy-wait 循环直接看 pending（不再依赖浮动 then 翻标志），
+    // `await allDone` 取回与轮询同源的退出结果。
+    const exits = new Array(children.length)
+    let pending = children.length
+    const allDone = new Promise((resolve) => {
+      children.forEach((c, i) => {
+        c.on('exit', (code, signal) => {
+          exits[i] = { code, signal }
+          pending -= 1
+          if (pending === 0) resolve(exits)
+        })
+      })
+    })
+    let corruptSeen = 0
+    let reads = 0
+    for (;;) {
+      if (pending === 0) break
+      const res = h.App._readSimilarWindow(simPath)
+      if (res.corrupt) corruptSeen++
+      reads++
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    const codes = await allDone
+    assert.deepStrictEqual(codes.map(c => c.code), [0, 0], `两个写进程必须正常结束：${JSON.stringify(codes)}`)
+    assert.ok(reads > 0, '读取侧必须真的读过窗口')
+    assert.strictEqual(corruptSeen, 0, '并发替换（replaced/ioError）绝不允许被判成可隔离')
+    const backups = realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-'))
+    assert.deepStrictEqual(backups, [], `并发写不得产生 .corrupt-*：${JSON.stringify(backups)}`)
+    const finalList = JSON.parse(realFs.readFileSync(simPath, 'utf8'))
+    assert.ok(Array.isArray(finalList) && finalList.length === 1, `窗口内容必须始终是合法数组：${JSON.stringify(finalList)}`)
+  })
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====
