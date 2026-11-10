@@ -4660,7 +4660,7 @@ checkAsync('F3-1 invalid→ok：首读半写 JSON 解析失败必须重读复核
     const title = '半写窗口重读确认标题甲乙'
     const original = JSON.stringify([{ t: title, at: Date.now(), c: '', p: '', x: '' }])
     realFs.writeFileSync(simPath, original)
-    const mtimeBefore = realFs.statSync(simPath).mtimeMs
+    const mtimeBefore = readTextAndMtimeSync(realFs, simPath).mtimeMs
     h.setItems([makeRunItem('iv-ok-1', title)])
     const { summary } = await runWithWarnings(h.App)
     assert.strictEqual(similarReads, 2, `首读解析失败必须重读复核一次（实际读 ${similarReads} 次）`)
@@ -4671,8 +4671,9 @@ checkAsync('F3-1 invalid→ok：首读半写 JSON 解析失败必须重读复核
     assert.ok(/ similar=1/.test(summaryLine), `摘要行必须带 similar=1（重读到的窗口数据被用于判重）：${summaryLine}`)
     assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-')), [],
       '首读解析失败但重读成功 ⇒ 不得把有效窗口 rename 成 .corrupt-*')
-    assert.strictEqual(realFs.readFileSync(simPath, 'utf8'), original, '本轮无新增推送 ⇒ 窗口内容必须原样保留')
-    assert.strictEqual(realFs.statSync(simPath).mtimeMs, mtimeBefore, '窗口 mtime 必须不变（没被写、没被 rename）')
+    const keptAfterRun = readTextAndMtimeSync(realFs, simPath)
+    assert.strictEqual(keptAfterRun.text, original, '本轮无新增推送 ⇒ 窗口内容必须原样保留')
+    assert.strictEqual(keptAfterRun.mtimeMs, mtimeBefore, '窗口 mtime 必须不变（没被写、没被 rename）')
   })
 })
 
