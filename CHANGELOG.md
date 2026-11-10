@@ -1284,3 +1284,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **修：瞬时读失败被折叠成永久降级（F4-3）**。`replaced`（读后复检 dev/ino 或类型变化）/`ioError` 是并发瞬时事实（另一进程原子 rename 覆盖文件的那一瞬），旧实现一律按损坏处理、白丢一轮合法规则并亮红条。现在退避 50ms（`Atomics.wait`）重读一次，成功即 `degraded=false`；仍失败才降级且只重读一次；`unsafe`/`tooLarge` 是确定性判据，直接降级、不重读、**不隔离**（不移动/改名任何用户文件）。
 - **修：控制台 lastGoodUsed 口径**。`GET /api/config/filter` 新增 `lastGoodUsed`，只由运行侧 `filter-rules.applied.json` 推导（`source==='corrupt' && lastGoodUsed===true`，`FilterStore.appliedLastGoodUsed`），不用控制台进程自己读文件时的 LKG 冒充运行侧状态；生效快照新增 `lastGoodUsed` 字段，旧快照缺该字段按 false 读（向后兼容）。`console.js` 7350→7353 行，已同步 `mutation.yml` 的 `console-part13` 行段（`check-mutation-ranges` 通过）。
 - **测试**：`test_filter_store.js` 新增新进程 LKG 探针（坏文件沿用上次合法 override、删文件后不复活、applied 不得当 LKG、LKG 被改写/损坏一律拒绝）、真实 `mkfifo` + `timeout 3` 探针（覆盖文件/生效快照/周标记/LKG 读取 `exit≠124` 且 2 秒内降级）、瞬时读状态注入（replaced/ioError 恢复、只重读一次、unsafe/tooLarge 不重读）；`test_filter.js` 新增 `_readSafeState` 三处状态文件 FIFO 探针与 similar 缓存读取参数断言。回退对应修复即变红。
+
+## v3.407
+
+- **修：瞬时读失败被当成损坏并搬走有效窗口（F3-1）**。`replaced`/`ioError` 是并发瞬时事实（另一进程原子 rename 覆盖 `similar-<cache>.json` 的那一瞬），旧实现按「非 ok 且非 missing」一律置位并在轮末无条件 `rename` 成 `.corrupt-<ts>`，会把对方刚写入的有效窗口搬走。现在只有 `unsafe`、`tooLarge`、退避 50ms 重读后仍解析失败/非数组才隔离；`replaced`/`ioError` 重读成功即正常使用，仍失败则本轮按空窗口处理且**绝不 rename**；改名隔离失败时不覆写原件（避免删掉唯一副本）。
+- **修：读取上限契约漂移（F3-2）**。`SYSTEM_CONTRACT.md` 写 256 KiB、代码写死 2 MiB；上限收敛为 `xbk_app.js` 的 `SIMILAR_WINDOW_MAX_BYTES`（512 KiB），契约写同一数值，`test_app_unit.js` 直接解析契约文本断言一致，并断言读取调用实际传入该常量。
+- **修：隔离件无回收（F3-3）**。`similar-*.json.corrupt-<ts>` 此前只增不减；现在与消息缓存 `CORRUPT_BACKUP_KEEP` 同口径，每个窗口最多保留 10 份、最旧先删，且只删普通文件（目录/符号链接/异名文件一律不碰）。
+- **修：窗口写失败只 console.warn（F3-4）**。落盘失败现在同时写 `run.log` WARN（点名未落盘条数与路径），摘要行追加 `similardrop=N`（N = 本轮未落盘的窗口条数，即下次可能重复推送的上界）；推送与退出码口径不变。
+- **测试**：`test_app_unit.js` 新增 7 例（298→305）——replaced 注入（内容/mtime 不变、无 `.corrupt-*`、整轮不 rename）、重读成功、非法 JSON 单轮恰好 1 个隔离件并重建为 `[]`、12 份隔离件裁剪到 10 份、两进程并发写窗口 100 次无隔离件、写失败落 run.log + `similardrop`。`README.md` / `SYSTEM_CONTRACT.md` 同步新判据、512 KiB 上限、保留 10 份与 `similardrop` 口径。
