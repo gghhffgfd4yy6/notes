@@ -4618,8 +4618,9 @@ checkAsync('F3-1 replaced：重读仍失败 ⇒ 空窗口且绝不 rename（内�
     // 整轮跑一次（无待推条目 ⇒ 窗口无新增，本就不该写盘）：仍不得 rename/改写。
     h.setItems([])
     await runWithWarnings(h.App)
-    assert.strictEqual(realFs.readFileSync(simPath, 'utf8'), original, '整轮跑完窗口内容必须不变')
-    assert.strictEqual(realFs.statSync(simPath).mtimeMs, mtimeBefore, '整轮跑完窗口 mtime 必须不变')
+    const keptAfterRun = readTextAndMtimeSync(realFs, simPath)
+    assert.strictEqual(keptAfterRun.text, original, '整轮跑完窗口内容必须不变')
+    assert.strictEqual(keptAfterRun.mtimeMs, mtimeBefore, '整轮跑完窗口 mtime 必须不变')
     assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-')), [], '整轮不得 rename 窗口')
   })
 })
