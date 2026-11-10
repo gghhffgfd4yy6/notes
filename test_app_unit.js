@@ -4621,7 +4621,7 @@ checkAsync('F3-1 replaced 后重读成功 ⇒ 正常使用窗口（不丢历史�
   })
 })
 
-checkAsync('F3-1/F3-3 非法 JSON：单轮恰好 1 个 .corrupt-*、窗口重建为 []；连续 5 轮 ≤10 份', async () => {
+checkAsync('F3-1/F3-3 非法 JSON：单轮恰好 1 个 .corrupt-*、窗口重建为 []；连续 12 轮 ≤10 份（真实轮末回收）', async () => {
   await withRunHarness({}, async (h, cacheDir, realFs) => {
     const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
     const prefix = path.basename(simPath) + '.corrupt-'
@@ -4631,11 +4631,13 @@ checkAsync('F3-1/F3-3 非法 JSON：单轮恰好 1 个 .corrupt-*、窗口重建
     await runWithWarnings(h.App)
     assert.strictEqual(backups().length, 1, `单轮损坏只允许 1 个隔离件：${JSON.stringify(backups())}`)
     assert.deepStrictEqual(JSON.parse(realFs.readFileSync(simPath, 'utf8')), [], '损坏窗口必须重建为 []')
-    for (let i = 0; i < 4; i++) {
+    // 11 + 首轮 = 12 轮真实 run()：隔离件会到 11/12 份，只有轮末真实接线（_isolateSimilarWindow →
+    // _pruneSimilarBackups）在跑才收得住 ≤10 —— 直接调私有方法的用例证明不了接线没被删。
+    for (let i = 0; i < 11; i++) {
       realFs.writeFileSync(simPath, `{ 坏窗口 ${i}`)
       await runWithWarnings(h.App)
     }
-    assert.ok(backups().length <= 10, `连续 5 轮后隔离件必须 ≤10：${JSON.stringify(backups())}`)
+    assert.ok(backups().length <= 10, `连续 12 轮损坏后隔离件必须 ≤10（轮末回收真实生效）：${JSON.stringify(backups())}`)
     assert.ok(backups().length >= 1, '隔离件必须保留（只隔离、绝不删除）')
   })
 })
