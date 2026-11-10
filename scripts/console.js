@@ -3774,14 +3774,22 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           if (auto.fails >= AUTO_MAX_FAILS) {
             // v3.408：不再永久停机。源站抖动/短时断网 20 分钟会一直停到人工点开；
             // 改为 10 秒一轮的降级重试，成功一轮自动恢复原间隔（on 保持 true，重启也继续）。
-            if (!auto.degraded) console.warn(`⚠️ 连续 ${AUTO_MAX_FAILS} 轮失败，转入 10 秒降级重试：${auto.lastError}`)
-            auto.degraded = true
-            auto.lastError = `连续 ${auto.fails} 轮失败，10 秒后重试：${auto.lastError}`
+            if (!auto.degraded) {
+              console.warn(`⚠️ 连续 ${AUTO_MAX_FAILS} 轮失败，转入 10 秒降级重试：${auto.lastError}`)
+              auto.degraded = true
+              auto.lastError = `连续 ${auto.fails} 轮失败，10 秒后重试：${auto.lastError}`
+              // 只在进入降级这一刻落盘（每轮失败都写会把 console-auto.json 变成高频写；
+              // 而重启恢复靠的正是这一刻的持久化）。
+              if (!persistAuto()) console.error('⚠️ 降级态落盘失败（进程内仍按 10 秒重试）')
+            }
           }
         }
       } else {
-        if (auto.degraded) console.log('✅ 自动运行已恢复：源站可用，回到正常间隔')
-        auto.degraded = false
+        if (auto.degraded) {
+          console.log('✅ 自动运行已恢复：源站可用，回到正常间隔')
+          auto.degraded = false
+          persistAuto()
+        }
         auto.fails = 0
         auto.spawnFails = 0
         auto.lastError = ''

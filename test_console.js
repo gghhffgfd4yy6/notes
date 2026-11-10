@@ -8860,6 +8860,8 @@ async function main () {
       assert.ok(consoleSrc.includes('degraded: auto.degraded === true') &&
         consoleSrc.includes('fails: Number.isInteger(auto.fails)'),
       '降级态与失败计数必须随 console-auto.json 跨重启保留')
+      assert.ok((tickAutoBody.match(/persistAuto\(\)/g) || []).length >= 2,
+        '进入/退出降级都必须 persistAuto()，否则字段存在但永不写盘')
       assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
       // 关闭回调里的清理必须「真的在回调体内且未被注释」：先剥注释，再按花括号配对取回调体。
       const closeHandlerCleanup = (srcText) => {
