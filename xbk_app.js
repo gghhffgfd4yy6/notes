@@ -6,6 +6,23 @@ const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 const Similar = require('./scripts/similar-dedupe.js')
 const LogArchive = require('./scripts/log-archive.js')
 
+// 近似去重窗口读取上限（沿用历史的 2 MiB；与 SYSTEM_CONTRACT.md 的对齐见 F3-2）。
+const SIMILAR_WINDOW_MAX_BYTES = 2 * 1024 * 1024
+// F3-1：`replaced` / `ioError` 是并发瞬时事实（另一进程原子 rename 覆盖窗口文件的那一瞬），
+// 退避后重读一次即足；50ms 与 xbk_filter_store.js 的 F4-3（TRANSIENT_READ_RETRY_MS）同口径。
+const SIMILAR_WINDOW_RETRY_MS = 50
+
+// 同步退避（窗口读取在 run() 里是同步路径，不能 await）：Atomics.wait 不占 CPU，
+// 与 xbk_filter_store.js 的 sleepMs 同实现；无 SharedArrayBuffer 的极端环境退化为短忙等。
+function sleepSync (ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch (e) {
+    const until = Date.now() + ms
+    while (Date.now() < until) { /* 忙等兜底 */ }
+  }
+}
+
 function createApp ({
   Config, Utils, Formatter, RuleEngine, FilterEngine, MessageStore, FilterStore, Network, Pusher,
   fs, path, crypto, readSafeTextResult, writeAtomic, isRegularOrMissing,
@@ -244,6 +261,64 @@ function createApp ({
         console.warn(`⚠️ 缓存文件写入异常（已拦截，不冒泡）：${filePath}: ${reason}`)
         return false
       }
+    },
+
+    // F3-1：近似去重窗口（`similar-<cacheName>.json`）的读取判据。返回
+    // `{ status, entries, corrupt, error }`；`corrupt: true` **只**表示「确定性不可恢复、允许隔离」：
+    //   · `unsafe`（open ELOOP / fstat 非普通文件）与 `tooLarge`：确定性判据，但隔离前同样复核一次
+    //     「此刻仍是同一状态」（F1 返工 R1 的「复核自己的前提」）；
+    //   · `invalid`（重读后仍解析失败/非数组）：复核读是硬要求——否则会把别的进程/编辑器写到一半的内容搬走；
+    //   · `replaced` / `ioError`：并发瞬时事实，先退避 50ms 重读一次，成功即正常使用；仍失败则本轮按空窗口
+    //     处理，**绝不 rename**（旧实现按「非 ok 且非 missing」一律置位隔离，会把另一进程刚写入的有效窗口搬走）。
+    _readSimilarWindow (filePath) {
+      const readOnce = () => {
+        const loaded = readSafeTextResult(filePath, SIMILAR_WINDOW_MAX_BYTES, { openNonBlocking: true })
+        if (!loaded || loaded.status !== 'ok') {
+          return { status: (loaded && loaded.status) || 'ioError', error: (loaded && loaded.error) || null }
+        }
+        // 0 字节窗口（进程被杀留下的空文件）不是损坏：按空窗口处理、不解析也不隔离（保持 v3.397 行为）。
+        if (!loaded.text) return { status: 'empty', entries: [], error: null }
+        try {
+          const parsed = JSON.parse(loaded.text)
+          if (!Array.isArray(parsed)) return { status: 'invalid', error: new Error('近似去重缓存不是数组') }
+          return { status: 'ok', entries: parsed, error: null }
+        } catch (e) {
+          return { status: 'invalid', error: e }
+        }
+      }
+      let outcome = readOnce()
+      if (outcome.status === 'replaced' || outcome.status === 'ioError' || outcome.status === 'invalid') {
+        // 瞬时读失败与解析失败都必须重读复核：只有「重读后仍是同一个坏结论」才算确定性损坏。
+        sleepSync(SIMILAR_WINDOW_RETRY_MS)
+        outcome = readOnce()
+      } else if (outcome.status === 'unsafe' || outcome.status === 'tooLarge') {
+        // 隔离前复核：此刻仍非普通文件/仍超限才隔离，否则按瞬时变化处理（不搬走别人的文件）。
+        outcome = readOnce()
+      }
+      if (outcome.status === 'ok') return { status: 'ok', entries: outcome.entries, corrupt: false, error: null }
+      if (outcome.status === 'empty' || outcome.status === 'missing') {
+        return { status: outcome.status, entries: [], corrupt: false, error: null }
+      }
+      const deterministic = outcome.status === 'unsafe' || outcome.status === 'tooLarge' || outcome.status === 'invalid'
+      return { status: outcome.status, entries: [], corrupt: deterministic, error: outcome.error || null }
+    },
+
+    // F3-1/F3-3：把确定性损坏的窗口原件改名隔离（**只隔离、绝不删除**）。返回备份路径；
+    // 原件已不存在返回 ''（可安全重建）；改名失败返回 false —— 调用方不得再覆写，否则会把
+    // 没隔离成功的原件（唯一副本）覆盖掉。
+    _isolateSimilarWindow (filePath) {
+      const backupPath = `${filePath}.corrupt-${Date.now()}`
+      try {
+        fs.renameSync(filePath, backupPath)
+      } catch (e) {
+        if (e && e.code === 'ENOENT') return ''
+        const reason = Utils.safeErrorText(e, '未知错误')
+        console.warn(`⚠️ 近似去重损坏件隔离失败（${reason}），本轮不覆写窗口以保留原件：${filePath}`)
+        this._writeRunLog(`${this._localStamp()} WARN 近似去重损坏件隔离失败：${reason}（本轮不覆写窗口，保留原件）${filePath}\n`)
+        return false
+      }
+      this._writeRunLog(`${this._localStamp()} WARN 近似去重窗口原件已改名隔离：${filePath} → ${backupPath}（重建空窗口）\n`)
+      return backupPath
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
@@ -1701,24 +1776,20 @@ function createApp ({
         const similarNow = Date.now()
         let recentTitles = []
         const batchTitles = []
-        let similarCorrupt = false
-        try {
-          // F4-2：openNonBlocking —— similar-<cache>.json 被替换成 FIFO 时裸 O_RDONLY 会永久阻塞；
-          // 这里与上面几处同口径（O_NONBLOCK + 普通文件校验），FIFO 按不可用处理（空窗口 + 告警）。
-          const loaded = readSafeTextResult(similarPath, 2 * 1024 * 1024, { openNonBlocking: true }) // 标题 120 字 + 正文 200 字 × 300 条约 400 KB
-          if (loaded && loaded.status === 'ok' && loaded.text) {
-            const parsed = JSON.parse(loaded.text)
-            if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')
-            // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
-            // 只要求 c（v3.398 起的行都有）；p/x 缺失按空串处理，升级时不丢最近窗口
-            recentTitles = Similar.pruneRecent(parsed.filter(e => e && typeof e.c === 'string'), similarNow)
-          } else if (loaded && loaded.status !== 'ok' && loaded.status !== 'missing') {
-            similarCorrupt = true
-            console.warn(`⚠️ 近似去重缓存不可用（${loaded.status}），本轮按空窗口处理：${similarPath}`)
-          }
-        } catch (e) {
-          similarCorrupt = true
-          console.warn(`⚠️ 近似去重缓存读取/解析失败，按空窗口处理：${Utils.safeErrorText(e, '未知错误')}`)
+        // F3-1：只有确定性损坏（unsafe / tooLarge / 重读后仍解析失败）才会置位并在轮末隔离；
+        // replaced / ioError 重读后仍失败只按空窗口处理，绝不 rename。
+        const similarWindow = this._readSimilarWindow(similarPath)
+        const similarCorrupt = similarWindow.corrupt
+        if (similarWindow.status !== 'ok' && similarWindow.status !== 'missing' && similarWindow.status !== 'empty') {
+          const detail = similarWindow.status === 'invalid'
+            ? `解析失败：${Utils.safeErrorText(similarWindow.error, '未知错误')}`
+            : `不可用（${similarWindow.status}）`
+          console.warn(`⚠️ 近似去重缓存${detail}，本轮按空窗口处理${similarCorrupt ? '（确定性损坏，轮末隔离原件并重建）' : '（瞬时读失败，保留原文件、绝不隔离）'}：${similarPath}`)
+        }
+        if (similarWindow.status === 'ok') {
+          // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
+          // 只要求 c（v3.398 起的行都有）；p/x 缺失按空串处理，升级时不丢最近窗口
+          recentTitles = Similar.pruneRecent(similarWindow.entries.filter(e => e && typeof e.c === 'string'), similarNow)
         }
         // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
         // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
@@ -2302,10 +2373,10 @@ function createApp ({
             for (const m of items) {
               if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt, Utils.safeText(Utils.safeGet(m, 'content'), ''))
             }
-            if (similarCorrupt) {
-              try { fs.renameSync(similarPath, `${similarPath}.corrupt-${Date.now()}`) } catch (e) { /* 文件可能已不在 */ }
-            }
-            if (list !== recentTitles) {
+            // F3-1：只有确定性损坏件才隔离（瞬时读失败已在读取处排除，绝不 rename）。
+            const isolated = similarCorrupt ? this._isolateSimilarWindow(similarPath) : ''
+            // 隔离失败（false）时不得再写：原件没搬走，覆写等于删掉唯一副本。
+            if (isolated !== false && (similarCorrupt || list !== recentTitles)) {
               recentTitles = list
               if (!this._writeTextAtomic(similarPath, JSON.stringify(list))) {
                 console.warn('⚠️ 近似去重缓存写入失败（不影响本轮推送，最坏结果是下次再发一遍同类标题）')
@@ -2446,4 +2517,4 @@ function createApp ({
   return App
 }
 
-module.exports = { createApp }
+module.exports = { createApp, SIMILAR_WINDOW_MAX_BYTES }
