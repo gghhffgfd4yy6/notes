@@ -291,3 +291,10 @@ exclude_paths:
   # new RegExp(src, flags) 与 RE2 路径；src/flags/路径均为测试常量，
   # 无外部输入。真实断言仍由 npm test / CI quality-gate 全量执行。
   - "test_app_unit.js"
+  # test_similar_dedupe.js 是近似去重回归用例（findSimilarTitle 取命中条目、与 isSimilarTitle
+  # 逐组对账）：夹具时刻 1760000000000 与 LCG 常量 20261110 / 1103515245 / 2147483648(=2^31)
+  # 均为 ≤2^53 的精确 double（Number.isSafeInteger 为 true，toString 回读与原字面量逐字符相同），
+  # 不存在精度损失；PMD InnaccurateNumericLiteral 的「runtime value differs」属误报，
+  # 按本仓 test_console.js 的「16 位以上数字字面量」同类口径排除。
+  # 真实断言仍由 npm test / CI 全量执行。
+  - "test_similar_dedupe.js"

@@ -4844,7 +4844,8 @@ checkAsync('L1-1 拦截明细：一轮拦 1 条 ⇒ similar-blocked.ndjson 恰�
     assert.ok(lines[0].includes('如果出现负数就跑吧'), `明细必须含被拦下的原标题：${lines[0]}`)
     assert.ok(lines[0].includes('负数就跑'), `明细必须含被匹配的窗口标题：${lines[0]}`)
     const rec = JSON.parse(lines[0])
-    assert.deepStrictEqual(Object.keys(rec).sort(), ['at', 'matched', 'mprice', 'price', 'title'],
+    // 显式码元序比较器（Sonar S2871）；刻意不用 localeCompare，避免排序随宿主 locale 变化
+    assert.deepStrictEqual(Object.keys(rec).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), ['at', 'matched', 'mprice', 'price', 'title'],
       `明细字段必须恰好是 at/title/matched/price/mprice（不得夹带正文/HTML/URL）：${lines[0]}`)
     assert.match(rec.at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, `at 必须与 run.log 时间戳同格式：${rec.at}`)
     assert.strictEqual(rec.title, blockedTitle, 'title 必须是原标题')
