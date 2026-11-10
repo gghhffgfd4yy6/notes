@@ -1,4 +1,7 @@
 const { setTimeout: delay } = require('node:timers/promises')
+// R2-1：文件常量只认**本模块** require 的 node:fs。createApp 的 fs 是「按需注入的能力子集」，
+// 单测桩只实现被调用到的方法（默认桩仅 existsSync），不保证带 constants / fstatSync / writeFileSync。
+const nodeFs = require('node:fs')
 const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
 const Similar = require('./scripts/similar-dedupe.js')
 const LogArchive = require('./scripts/log-archive.js')
@@ -151,6 +154,64 @@ function createApp ({
       return isRegularOrMissing(filePath)
     },
 
+    // R1-1：日志周标记（<log>.week）的**唯一**写入口——非阻塞 + 普通文件校验。
+    // 为什么不能直接 writeFileSync：marker 被替换成没有写者的 FIFO 时，同步 open(O_WRONLY) 会
+    // 永久阻塞（无日志、无退出码），整轮运行挂死；读侧改成 O_NONBLOCK 只是让 readMarker 返回空串，
+    // 紧接着的写分支照旧把进程钉住。
+    // 做法：O_NONBLOCK 让 open 对无写者的 FIFO 立刻 ENXIO、对目录/符号链接（O_NOFOLLOW）立刻
+    // ELOOP/ENOTDIR，再用 fstat 复核「打开后的这个 fd 真是普通文件」——FIFO 有读者时 open 会成功，
+    // 只有 fstat 能拦住「把周键写进管道」。
+    // 失败只告警（run.log 照常写，归档下一轮重试），绝不抛穿 _writeRunLog。
+    // R2-1：注入的 fs 是**能力子集**，不是 node:fs 的完整替身。原先在 try 之外读 `fs.constants`，
+    // 桩上一抛 TypeError 就穿出本方法、被 _writeRunLog 最外层 catch 吞掉 ⇒ 整行日志连 append 都没做
+    // （test_app_unit 28 例红）。常量一律取本模块 require 的 node:fs；能力先探测再调用，缺任何一项
+    // 就本轮不写（没有 fstat 就无法排除「把周键写进管道」，宁可下一轮归档时重试）。
+    _writeWeekMarker (markerPath, weekKey) {
+      const capable = ['openSync', 'fstatSync', 'writeFileSync', 'closeSync']
+        .every((name) => typeof fs[name] === 'function')
+      if (!capable) return false
+      const flags = nodeFs.constants.O_WRONLY | nodeFs.constants.O_CREAT | nodeFs.constants.O_TRUNC |
+        nodeFs.constants.O_NONBLOCK | (nodeFs.constants.O_NOFOLLOW || 0)
+      let fd = null
+      let opened = false
+      try {
+        fd = fs.openSync(markerPath, flags, 0o600)
+        opened = true
+        const st = fs.fstatSync(fd)
+        if (!st || typeof st.isFile !== 'function' || !st.isFile()) {
+          this._warnWeekMarkerOnce(markerPath, `⚠️ 日志周标记不是普通文件，拒绝写入（归档下一轮重试）：${markerPath}`)
+          return false
+        }
+        fs.writeFileSync(fd, weekKey, { encoding: 'utf8' })
+        return true
+      } catch (e) {
+        this._warnWeekMarkerOnce(markerPath, `⚠️ 日志周标记写入失败（归档下一轮重试）：${markerPath}：${Utils.safeErrorText(e, '未知错误')}`)
+        return false
+      } finally {
+        // R2-1：只关「本函数确实 open 成功的那个 fd」。openSync 抛错时 fd 保持 null；桩的 openSync
+        // 恒返同一个号数时，无条件 close 会去关别人（例如同一调用链里的锁 fd）。
+        if (opened && fd !== null) { try { fs.closeSync(fd) } catch (e) { /* fd 已失效时忽略 */ } }
+      }
+    },
+
+    // R2-2：周标记写失败告警的 60s 限频——与相邻的归档失败告警（_archiveWarnAtByKey）同一口径。
+    // 为什么必须限频：标记写不进去时 readMarker 恒返回空串，于是**每次** _writeRunLog 都会重试
+    // _writeWeekMarker 并再告警；一轮 19 个调用点、控制台 auto-run 每 5 秒一轮 ⇒ 同一条告警刷屏
+    // （FIFO / 只读缓存目录期间）。故障必须可见，但不能变成日志风暴。键 = 标记路径
+    // （run.log.week 与 filter-diagnostics.ndjson.week 各自独立窗口，互不刷新）。
+    _warnWeekMarkerOnce (markerPath, line) {
+      const now = Date.now()
+      const lastWarnAt = this._weekMarkerWarnAtByKey.get(markerPath) || 0
+      if (lastWarnAt && now - lastWarnAt < 60 * 1000) return false
+      // 与归档告警同样的自清理：键只随「日志路径」增长（白名单日志数量有限），超过 64 条时清掉过期项。
+      if (this._weekMarkerWarnAtByKey.size > 64) {
+        for (const [k, at] of this._weekMarkerWarnAtByKey) if (now - at >= 60 * 1000) this._weekMarkerWarnAtByKey.delete(k)
+      }
+      this._weekMarkerWarnAtByKey.set(markerPath, now)
+      console.warn(line)
+      return true
+    },
+
     // C1-027/CR-03：MessageStore.cacheDir 是带 realpath 校验的 getter（existsSync 逐级回溯 + lstat + realpathSync），
     // **每次访问都要重新求值**——「运行期间父目录被换成指向项目外的符号链接」只在求值那一刻可见。
     // 本 PR 曾把重复求值优化成 run() 里解析一次并钉到 _cacheDirForRun（单轮内 cache.dir 是静态配置），
@@ -162,8 +223,10 @@ function createApp ({
 
     // 状态/哈希文件安全读取：保持 readSafeTextResult 的 status 区分（missing/ioError/
     // unsafe/replaced/tooLarge），并强制大小上限，杜绝异常膨胀文件被整读入内存。
+    // F4-2：openNonBlocking —— report.state / filter.hash / channel-health.state 被替换成 FIFO 时，
+    // 裸 O_RDONLY 会同步阻塞等写者（整轮挂死、无日志无退出码）；O_NONBLOCK 让 open 立刻 ENXIO ⇒ unsafe。
     _readSafeState (filePath) {
-      return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES)
+      return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES, { openNonBlocking: true })
     },
 
     _writeTextAtomic (filePath, text) {
@@ -337,7 +400,9 @@ function createApp ({
             const weekKey = LogArchive.weekRange(Date.now()).key
             const marker = LogArchive.readMarker(logPath)
             if (!marker) {
-              try { fs.writeFileSync(LogArchive.weekMarkerPath(logPath), weekKey, 'utf8') } catch (e) {}
+              // R1-1：读侧 O_NONBLOCK 只证明「读不阻塞」，写侧仍是裸 writeFileSync ⇒ 无写者的
+              // FIFO 上 open(O_WRONLY) 永久阻塞，整轮照旧挂死。改走非阻塞 + 普通文件校验的写入。
+              this._writeWeekMarker(LogArchive.weekMarkerPath(logPath), weekKey)
             } else if (marker !== weekKey) {
               // 跨周：上一周还在明文里。归档没成功前不许截尾（否则整周数据被 KEEP 覆盖掉）。
               archivePending = true
@@ -496,6 +561,8 @@ function createApp ({
     _logRotateBackoffByPath: new Map(),
     // 归档失败告警的限频状态：键 = 日志路径 + '|' + 周键（每个日志每周各一条 60s 窗口）。
     _archiveWarnAtByKey: new Map(),
+    // R2-2：周标记写失败告警的限频状态：键 = 标记路径（每条白名单日志各一条 60s 窗口）。
+    _weekMarkerWarnAtByKey: new Map(),
     _alertLastAtByPath: new Map(),
     _reportMemoryStateByPath: new Map(),
 
@@ -1520,7 +1587,9 @@ function createApp ({
         // 必须放在本轮开头且只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则；
         // active 每轮新建，禁止提升到模块级（否则常驻进程会跨轮陈旧，控制台的修改永不生效）。
         // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
-        // 优先沿用进程内 last-known-good，本进程从未读到合法文件才回代码默认。
+        // 降级顺序是「进程内缓存 → 持久 LKG <缓存目录>/filter-rules.lastgood.json → 代码默认」：
+        // 新进程（控制台 auto-run 每 5 秒 spawn 一轮）没有进程内缓存，仍会先读持久 LKG，
+        // 只有连持久 LKG 也不可用时才回代码默认。
         const active = FilterStore.loadFilterRules({
           cacheDir: this._cacheDir(),
           defaults: Config.filter,
@@ -1600,7 +1669,10 @@ function createApp ({
           keyword: active.keyword,
           revision: active.revision,
           source: active.source,
-          hash: filterHash
+          hash: filterHash,
+          // F4-1：把「本轮是否沿用了持久 LKG」一起写进快照——控制台 GET 只认这个运行侧事实，
+          // 不得用控制台进程自己的 lastGood 冒充。
+          lastGoodUsed: active.lastGoodUsed
         })) {
           console.warn('⚠️ 过滤规则生效快照写入失败（不影响本轮过滤/推送，下一轮会重试）')
           this._writeRunLog(`${this._localStamp()} WARN 过滤规则生效快照写入失败（不影响本轮过滤/推送）\n`)
@@ -1631,7 +1703,9 @@ function createApp ({
         const batchTitles = []
         let similarCorrupt = false
         try {
-          const loaded = readSafeTextResult(similarPath, 2 * 1024 * 1024) // 标题 120 字 + 正文 200 字 × 300 条约 400 KB
+          // F4-2：openNonBlocking —— similar-<cache>.json 被替换成 FIFO 时裸 O_RDONLY 会永久阻塞；
+          // 这里与上面几处同口径（O_NONBLOCK + 普通文件校验），FIFO 按不可用处理（空窗口 + 告警）。
+          const loaded = readSafeTextResult(similarPath, 2 * 1024 * 1024, { openNonBlocking: true }) // 标题 120 字 + 正文 200 字 × 300 条约 400 KB
           if (loaded && loaded.status === 'ok' && loaded.text) {
             const parsed = JSON.parse(loaded.text)
             if (!Array.isArray(parsed)) throw new Error('近似去重缓存不是数组')

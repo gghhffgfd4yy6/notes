@@ -1947,6 +1947,37 @@ async function filterRuleApiTests () {
       '首启复制默认仍应整份写入（baseRevision:0）')
   })
 
+  await aok('过滤规则页: 覆盖文件损坏红条改持久 LKG 叙事，并按运行侧 lastGoodUsed 区分「沿用上次规则 / 回退代码默认」', async () => {
+    const { filterCorruptNotice } = await import('./scripts/console-assets/pure.mjs')
+    // ① 最近一轮降级但沿用了 LKG：规则没变，必须这么说（旧文案只说「已降级」，用户不知道规则还在不在）
+    const used = filterCorruptNotice({ appliedSource: 'corrupt', appliedRevision: 7, lastGoodUsed: true })
+    assert.match(used, /沿用上次合法规则/, `沿用 LKG 时必须点明规则来源：${used}`)
+    assert.match(used, /持久 LKG r7/, `必须点出持久 LKG 与沿用的 revision：${used}`)
+    assert.ok(!used.includes('已回退代码默认'), `沿用了 LKG 就不得说「已回退代码默认」：${used}`)
+    // ② 降级且没有可用 LKG：必须明确「已回退代码默认」（这才是规则被悄悄放宽的情形）
+    const fallback = filterCorruptNotice({ appliedSource: 'corrupt', appliedRevision: 0, lastGoodUsed: false })
+    assert.match(fallback, /没有可用的 LKG，已回退代码默认/, `回退默认必须明确告知：${fallback}`)
+    // ③ 上一轮还正常 ④ 还没有生效快照：都不得冒充「已回退」（降级尚未发生）
+    for (const [label, appliedSource] of [['上一轮正常', 'override'], ['从未跑过', undefined]]) {
+      const pending = filterCorruptNotice({ appliedSource, appliedRevision: appliedSource ? 5 : null, lastGoodUsed: false })
+      assert.ok(!pending.includes('已回退代码默认'), `${label}：降级还没发生，不得声称已回退代码默认：${pending}`)
+      assert.match(pending, /filter-rules\.lastgood\.json/, `${label}：必须点名持久 LKG 文件（真实链路）：${pending}`)
+    }
+
+    // 接线：页面必须调这个纯函数、传运行侧 applied 快照，且旧机制文案彻底消失
+    const src = readConsoleSource()
+    assert.ok(!src.includes('进程内 last-known-good'),
+      '旧机制文案必须删除：控制台 auto-run 每轮都是新进程，进程内 last-known-good 等于不存在')
+    assert.ok(src.includes('lastGoodUsed: data.lastGoodUsed === true'),
+      '红条必须消费 GET /api/config/filter 的 lastGoodUsed（否则界面分不出「沿用」与「回退默认」）')
+    assert.ok(src.includes('filterCorruptNotice({ appliedSource: applied && applied.source'),
+      '红条说明必须按运行侧 applied 快照构造（lastGoodUsed 只认 applied，不用控制台进程自己的 LKG）')
+    assert.ok(/import \{[^}]*filterCorruptNotice[^}]*\} from '\.\/pure\.mjs'/.test(src),
+      'pages.js 必须从 pure.mjs 引入红条说明（别在组件里另写一份）')
+    assert.ok(src.includes('下一次加载起降级'),
+      '尚未降级时标题不得声称「运行侧已降级」（那是把「文件坏了」说成「规则已换」）')
+  })
+
   await aok('过滤规则保存: GET 的 override 只含文件中实际字段；用真实前端候选保存不会删掉其他覆盖项', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)

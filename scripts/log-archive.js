@@ -35,6 +35,9 @@ const fs = require('fs')
 const path = require('path')
 const zlib = require('zlib')
 const crypto = require('crypto')
+// F4-2：周标记（<log>.week）的读取必须走统一安全读入口——裸 readFileSync 遇到被替换成 FIFO 的
+// 标记文件会同步阻塞等写者，而它位于每轮日志写入路径上（整轮挂死、无日志、无退出码）。
+const { readSafeTextResult } = require('../xbk_storage')
 
 const DAY_MS = 24 * 3600 * 1000
 const CST_OFFSET_MS = 8 * 3600 * 1000
@@ -176,10 +179,12 @@ function fsyncDirBestEffort (dir) {
 }
 
 function readMarker (logPath) {
-  try {
-    const v = fs.readFileSync(weekMarkerPath(logPath), 'utf8').trim() // nosemgrep（路径=白名单日志名 + .week）
-    return /^\d{8}-\d{8}$/.test(v) ? v : ''
-  } catch (e) { return '' }
+  // F4-2：marker 也可能是被替换的 FIFO（裸 readFileSync 会永久阻塞等写者）。走安全读入口后：
+  // 非普通文件 ⇒ unsafe、超限 ⇒ tooLarge，一律按「无标记」返回空串（与旧的 catch 语义一致）。
+  const read = readSafeTextResult(weekMarkerPath(logPath), 256, { openNonBlocking: true })
+  if (!read || read.status !== 'ok' || typeof read.text !== 'string') return ''
+  const v = read.text.trim()
+  return /^\d{8}-\d{8}$/.test(v) ? v : ''
 }
 
 function archiveError (msg) {

@@ -18,11 +18,15 @@ const { FILTER_FIELDS } = require('./xbk_utils')
 const {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
+  LASTGOOD_MAX_BYTES,
   filterRulesPaths,
   validateFilterRules,
   mergeActiveFilter,
   loadFilterRules,
+  writeLastGoodFile,
+  readLastGood,
   writeAppliedSnapshot,
+  appliedLastGoodUsed,
   readAppliedSnapshot,
   resetStoreStateForTests
 } = require('./xbk_filter_store')
@@ -931,6 +935,838 @@ test('C9-019 生效快照 filter/keyword 字段按覆盖文件同口径收紧（
   // 对照：未提供的字段视同空（与 parseStoredRules 一致，不强制补齐 11 个），合法快照照旧 ok
   writeRaw(paths.applied, JSON.stringify({ ...base, filter: { pingbibiaoti: 'x' }, keyword: {} }))
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '缺省字段不得被误判为损坏')
+})
+
+// ===== FIFO 探针夹具（F4-2 与 F4-1 的 LKG 读取共用）=====
+// 为什么必须借子进程 + timeout：同步 open 阻塞的是整个事件循环，同进程内没有任何超时能打断它；
+// 只有外部 `timeout 3` 能证明「进程在 2 秒内自己结束了」——exit=124 就是挂死的证据。
+const MKFIFO_CANDIDATES = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo']
+const findOnDisk = (candidates) => {
+  for (const candidate of candidates) {
+    try { if (fs.existsSync(candidate)) return candidate } catch (e) { /* 探测失败按不存在 */ }
+  }
+  return ''
+}
+const MKFIFO = findOnDisk(MKFIFO_CANDIDATES)
+const TIMEOUT_BIN = findOnDisk(['/usr/bin/timeout', '/bin/timeout'])
+const FIFO_SKIP = MKFIFO && TIMEOUT_BIN
+  ? null
+  : `缺少 ${MKFIFO ? '' : 'mkfifo'}${MKFIFO && !TIMEOUT_BIN ? 'timeout' : ''}（Linux 宿主必须真跑，不得静默当作已验证）`
+
+// 探针统一约定：stdout 一行 JSON；父进程断言 exit≠124 且耗时 < 2s。
+function runProbeUnderTimeout (script, dir) {
+  const probe = spawnSync(TIMEOUT_BIN, ['3', process.execPath, '-e', script], {
+    encoding: 'utf8',
+    cwd: __dirname,
+    env: { ...process.env, XBK_FIFO_DIR: dir }
+  })
+  const out = `${probe.stdout || ''}${probe.stderr || ''}`
+  assert.notStrictEqual(probe.status, 124,
+    `读取在 FIFO 上挂死（timeout 3 强杀、exit=124）：裸 O_RDONLY / readFileSync 阻塞等写者——${out.slice(-600)}`)
+  assert.strictEqual(probe.status, 0, `探针必须以 0 正常结束：status=${probe.status} signal=${probe.signal} ${out.slice(-600)}`)
+  return JSON.parse(String(probe.stdout).trim().split('\n').pop())
+}
+
+function makeFifoDir (name) {
+  const dir = makeDir()
+  const file = path.join(dir, name)
+  require('node:child_process').execFileSync(MKFIFO, [file])
+  return { dir, file }
+}
+
+// ===== 控制台口径对齐：lastGoodUsed 只认运行侧 applied.json =====
+test('applied 快照 lastGoodUsed：写入布尔化、读回保持（旧快照缺省按 false 兼容）', () => {
+  const dir = makeDir()
+  assert.strictEqual(writeAppliedSnapshot({
+    cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'corrupt', hash: 'h', lastGoodUsed: true
+  }), true)
+  const read = readAppliedSnapshot(dir)
+  assert.strictEqual(read.status, 'ok')
+  assert.strictEqual(read.snapshot.lastGoodUsed, true, '降级轮必须把 lastGoodUsed=true 落进快照')
+  assert.strictEqual(appliedLastGoodUsed(read.snapshot), true)
+
+  // 不传 lastGoodUsed 的调用方（旧代码/其他入口）落盘为 false，不得写成 undefined
+  assert.strictEqual(writeAppliedSnapshot({ cacheDir: dir, filter: {}, keyword: {}, revision: 1, source: 'override', hash: 'h' }), true)
+  const second = readAppliedSnapshot(dir)
+  assert.strictEqual(second.snapshot.lastGoodUsed, false)
+  assert.deepStrictEqual(readJson(filterRulesPaths(dir).applied), second.snapshot, '落盘内容与读回一致')
+
+  // 旧快照（v3.405 及以前没有该字段）必须照旧 ok、按 false 处理
+  const paths = filterRulesPaths(dir)
+  writeRaw(paths.applied, JSON.stringify({
+    schema: 1, revision: 3, source: 'corrupt', hash: 'h', appliedAt: '2026-11-09T00:00:00.000Z', filter: {}, keyword: {}
+  }))
+  const legacy = readAppliedSnapshot(dir)
+  assert.strictEqual(legacy.status, 'ok', '缺少 lastGoodUsed 的旧快照不得被判损坏')
+  assert.strictEqual(appliedLastGoodUsed(legacy.snapshot), false, '旧快照无该字段 ⇒ 不得声称沿用了 LKG')
+})
+
+test('appliedLastGoodUsed 口径：只有 source=corrupt 且 lastGoodUsed=true 才算沿用 LKG', () => {
+  assert.strictEqual(appliedLastGoodUsed({ source: 'corrupt', lastGoodUsed: true }), true)
+  assert.strictEqual(appliedLastGoodUsed({ source: 'corrupt', lastGoodUsed: false }), false)
+  assert.strictEqual(appliedLastGoodUsed({ source: 'override', lastGoodUsed: true }), false,
+    'override 轮的 lastGoodUsed 无意义（规则已正常加载），不得据此显示「沿用上次」')
+  assert.strictEqual(appliedLastGoodUsed({ source: 'default', lastGoodUsed: true }), false)
+  assert.strictEqual(appliedLastGoodUsed({ source: 'corrupt' }), false, '缺字段按 false')
+  assert.strictEqual(appliedLastGoodUsed(null), false, '没有快照（missing/不可读）按 false')
+  assert.strictEqual(appliedLastGoodUsed([1]), false, '数组不是快照')
+})
+
+test('控制台口径：GET /api/config/filter 的 lastGoodUsed 取自 applied，不用控制台进程自己的 LKG', () => {
+  // 本 item 只允许跑 test_filter_store/test_filter 两个定向套件（console 套件不在其中），
+  // 故这处接线用源码断言锁定：回退成 loaded.lastGoodUsed（控制台进程读文件时的 LKG）即变红。
+  const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+  const line = src.split('\n').find(l => l.includes('lastGoodUsed:'))
+  assert.ok(line, 'GET /api/config/filter 的 payload 必须带 lastGoodUsed 字段（控制台要能展示运行侧降级状态）')
+  assert.ok(line.includes('FilterStore.appliedLastGoodUsed(applied)'),
+    `lastGoodUsed 必须由 applied 快照推导（运行侧口径）：${line.trim()}`)
+  assert.ok(!line.includes('loaded.lastGoodUsed'),
+    `不得用控制台进程自己读文件的 lastGoodUsed 冒充运行侧：${line.trim()}`)
+})
+
+// ===== F4-3：瞬时读失败（replaced/ioError）重读一次，不折叠成永久降级 =====
+// 用替换 storage.readSafeTextResult 的方式注入——真实竞态（另一进程在 fstat 后 rename）不可
+// 确定复现；每次注入都记录调用次数，用来区分「重读一次」与「直接降级 / 无脑重试多次」。
+function withInjectedReads (statuses, fn) {
+  const storageMod = require('./xbk_storage')
+  const realRead = storageMod.readSafeTextResult
+  const calls = []
+  try {
+    storageMod.readSafeTextResult = (p, maxBytes, options) => {
+      const index = calls.length
+      calls.push({ p: String(p), options })
+      if (index < statuses.length) {
+        const status = statuses[index]
+        return status === 'OK_DELEGATE'
+          ? realRead(p, maxBytes, options)
+          : { status, text: null, error: new Error(`注入 ${status}`) }
+      }
+      return realRead(p, maxBytes, options)
+    }
+    const result = fn()
+    return { result, calls }
+  } finally {
+    storageMod.readSafeTextResult = realRead
+  }
+}
+
+test('F4-3 验收 3：注入 status=replaced → 重读一次成功，degraded=false（50ms 退避）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 3, filter: { pingbibiaoti: '瞬时替换' } })
+  const t0 = Date.now()
+  const { result, calls } = withInjectedReads(['replaced', 'OK_DELEGATE'], () =>
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+  const elapsed = Date.now() - t0
+  const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  assert.strictEqual(ruleReads.length, 2, `replaced 必须恰好重读一次（实际 ${ruleReads.length} 次）`)
+  assert.strictEqual(result.source, 'override', '重读成功后必须正常生效（不得把瞬时失败折叠成降级）')
+  assert.strictEqual(result.degraded, false, '重读成功必须 degraded=false（旧实现这里恒为 true）')
+  assert.strictEqual(result.lastGoodUsed, false, '本轮是正常加载，不得标记 lastGoodUsed')
+  assert.strictEqual(result.filter.pingbibiaoti, '瞬时替换')
+  assert.ok(elapsed >= 45, `重读前必须有 50ms 退避（实测 ${elapsed}ms；无退避会让瞬时写者来不及完成）`)
+  assert.strictEqual(ruleReads[0].options && ruleReads[0].options.openNonBlocking, true, '重读也必须带 openNonBlocking')
+})
+
+test('F4-3 ioError 同口径：重读一次成功即正常生效', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 4, filter: { pingbibiaoti: '瞬时 EIO' } })
+  const { result, calls } = withInjectedReads(['ioError', 'OK_DELEGATE'], () =>
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+  const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  assert.strictEqual(ruleReads.length, 2, `ioError 必须恰好重读一次（实际 ${ruleReads.length} 次）`)
+  assert.strictEqual(result.source, 'override')
+  assert.strictEqual(result.degraded, false, 'ioError 恢复后不得判降级')
+})
+
+test('F4-3 重读仍失败 → 降级且只重试一次（不无限重读、不隔离文件）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 5, filter: { pingbibiaoti: '永远换不到' } })
+  const before = fs.readdirSync(dir).sort(byCodeUnit)
+  const { result, calls } = withInjectedReads(['replaced', 'replaced'], () =>
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+  const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  assert.strictEqual(ruleReads.length, 2, `只允许重读一次（实际 ${ruleReads.length} 次）：重试风暴会让挂死的文件系统把整轮拖长`)
+  assert.strictEqual(result.source, 'corrupt')
+  assert.strictEqual(result.degraded, true)
+  assert.strictEqual(result.lastGoodUsed, false, '没有 LKG 时回代码默认')
+  assert.match(String(result.error.message), /replaced/, '降级原因必须保留读状态（排障要看得到 replaced/ioError）')
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(byCodeUnit), before, '降级不得隔离/改名/新建任何文件（本模块从不移动用户文件）')
+})
+
+test('F4-3 unsafe / tooLarge 是确定性判据：直接降级、不做重读', () => {
+  for (const status of ['unsafe', 'tooLarge']) {
+    resetStoreStateForTests()
+    const dir = makeDir()
+    writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 6, filter: { pingbibiaoti: 'x' } })
+    const { result, calls } = withInjectedReads([status], () =>
+      loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
+    const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
+    assert.strictEqual(ruleReads.length, 1, `${status} 不得重读（确定性判据，重读只会白等 50ms）：实际 ${ruleReads.length} 次`)
+    assert.strictEqual(result.source, 'corrupt', `${status} 必须降级`)
+    assert.strictEqual(result.lastGoodUsed, false, `${status} 无 LKG 时回代码默认`)
+  }
+})
+
+// ===== F4-1：持久 LKG（新进程降级时沿用上次合法 override）=====
+// 为什么必须开子进程：本套件的 loadFilterRules 调用都在同一进程里，进程内 lastGood 会掩盖
+// 「新进程拿到的是代码默认」这个缺陷本体——控制台 auto-run 每 5 秒 spawn 的正是新进程。
+const LKG_PROBE = `
+const { loadFilterRules, writeAppliedSnapshot, readAppliedSnapshot } = require('./xbk_filter_store')
+const dir = process.env.XBK_LKG_DIR
+const defaults = JSON.parse(process.env.XBK_LKG_DEFAULTS)
+const r = loadFilterRules({ cacheDir: dir, defaults, keyword: {} })
+writeAppliedSnapshot({ cacheDir: dir, filter: r.filter, keyword: r.keyword, revision: r.revision, source: r.source, hash: 'probe-hash', lastGoodUsed: r.lastGoodUsed })
+const applied = readAppliedSnapshot(dir)
+process.stdout.write(JSON.stringify({
+  source: r.source,
+  degraded: r.degraded,
+  lastGoodUsed: r.lastGoodUsed,
+  revision: r.revision,
+  filter: r.filter,
+  applied: applied.status === 'ok' ? { status: 'ok', source: applied.snapshot.source, lastGoodUsed: applied.snapshot.lastGoodUsed, filter: applied.snapshot.filter } : { status: applied.status }
+}))
+`
+function runLkgProbe (dir) {
+  const probe = spawnSync(process.execPath, ['-e', LKG_PROBE], {
+    encoding: 'utf8',
+    cwd: __dirname,
+    env: { ...process.env, XBK_LKG_DIR: dir, XBK_LKG_DEFAULTS: JSON.stringify(DEFAULTS) }
+  })
+  const out = `${probe.stdout || ''}${probe.stderr || ''}`
+  assert.strictEqual(probe.status, 0, `LKG 探针必须正常结束：${out.slice(-600)}`)
+  return JSON.parse(String(probe.stdout).trim().split('\n').pop())
+}
+
+test('F4-1 成功加载 override 后落盘持久 LKG（0600、{schema,revision,hash,override}）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 7, filter: { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' } })
+  const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(loaded.source, 'override', '前置：覆盖文件必须被正常加载')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '成功加载 override 必须写 filter-rules.lastgood.json（否则新进程没有降级兜底）')
+  assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, 0o600, 'LKG 必须是 0600（含用户规则正文）')
+  const lkg = readJson(paths.lastgood)
+  assert.deepStrictEqual(Object.keys(lkg).sort(byCodeUnit), ['hash', 'override', 'revision', 'schema'], `LKG 形状必须恰为 {schema,revision,hash,override}：${JSON.stringify(Object.keys(lkg))}`)
+  assert.strictEqual(lkg.schema, 1)
+  assert.strictEqual(lkg.revision, 7)
+  assert.match(lkg.hash, /^[0-9a-f]{64}$/, 'hash 必须是内容摘要（sha256 十六进制）')
+  assert.deepStrictEqual(lkg.override, { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' },
+    'override 只含覆盖文件里实际存在的字段原文（不得是「默认 + 覆盖」的合并结果，否则缺字段会被钉死成旧默认）')
+})
+
+test('F4-1 验收 1：写坏覆盖文件后**新进程**沿用上次合法 override（applied.lastGoodUsed=true，逐字段等于上次合并结果）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeJson(file, { schema: 1, revision: 7, filter: { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' } })
+  const good = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(good.source, 'override')
+  const expected = mergeActiveFilter({ defaults: DEFAULTS, keyword: {}, override: { pingbibiaoti: '覆盖标题', pingbineirong: '覆盖内容' } })
+  writeRaw(file, '{ 坏掉的 JSON')
+
+  const fresh = runLkgProbe(dir)
+  assert.strictEqual(fresh.source, 'corrupt', '坏文件必须判 corrupt/degraded（不是静默 override）')
+  assert.strictEqual(fresh.degraded, true)
+  assert.strictEqual(fresh.lastGoodUsed, true, '新进程必须用持久 LKG（旧实现这里恒为 false：进程内 Map 对新进程不存在）')
+  assert.strictEqual(fresh.revision, 7, 'revision 必须沿用上次合法值')
+  for (const field of FILTER_RULE_FIELDS) {
+    assert.strictEqual(fresh.filter[field], expected.filter[field], `字段 ${field} 必须等于「上次合法 override + 代码默认」的合并结果`)
+  }
+  assert.notStrictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti, '绝不能回代码默认（那会悄悄放宽/改变规则）')
+  assert.strictEqual(fresh.applied.status, 'ok', '探针必须写进 applied 快照')
+  assert.strictEqual(fresh.applied.source, 'corrupt', 'applied 快照必须如实记录本轮来源是降级')
+  assert.strictEqual(fresh.applied.lastGoodUsed, true, 'applied.json 必须带 lastGoodUsed=true（控制台口径据此展示）')
+  assert.strictEqual(fresh.applied.filter.pingbibiaoti, expected.filter.pingbibiaoti, 'applied 快照的 filter 必须是本轮真实生效的合并结果')
+})
+
+test('F4-1 验收 2：删除覆盖文件 → LKG 一并失效，畸形文件不得复活旧规则（新进程同样回默认）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 9, filter: { pingbibiaoti: '旧规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '前置：LKG 已写')
+
+  fs.rmSync(paths.file)
+  const defaulted = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(defaulted.source, 'default', '删文件 = 恢复代码默认')
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '删正式覆盖文件必须同步删除 LKG（否则「删文件=恢复默认」不成立）')
+
+  writeRaw(paths.file, '不是 JSON')
+  const fresh = runLkgProbe(dir)
+  assert.strictEqual(fresh.source, 'corrupt')
+  assert.strictEqual(fresh.lastGoodUsed, false, 'LKG 已随删除作废，畸形文件不得把旧规则复活')
+  assert.strictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti)
+  assert.strictEqual(fresh.applied.lastGoodUsed, false, 'applied 快照必须如实记录 lastGoodUsed=false')
+})
+
+test('F4-1 applied.json 不能当 LKG：只有 applied 没有 lastgood 时必须回代码默认', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  // applied 每轮无条件覆盖（连降级轮都写），这里模拟「上一次是 override 轮」留下的快照。
+  writeJson(paths.applied, {
+    schema: 1,
+    revision: 5,
+    source: 'override',
+    hash: 'h',
+    appliedAt: '2026-11-09T00:00:00.000Z',
+    filter: { pingbibiaoti: '从 applied 误用', pingbineirong: '从 applied 误用' },
+    keyword: { zkt_gjc: '' }
+  })
+  writeRaw(paths.file, '{ 坏掉的 JSON')
+  const fresh = runLkgProbe(dir)
+  assert.strictEqual(fresh.source, 'corrupt')
+  assert.strictEqual(fresh.lastGoodUsed, false, '没有 lastgood.json 时不得把 applied.json 当 LKG')
+  assert.strictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti, 'applied 里的规则不得被代入降级轮')
+  assert.strictEqual(fresh.revision, 0, '没有 LKG 时 revision 必须是 0')
+})
+
+test('F4-1 LKG 被改写/损坏（hash 不符、未知字段、非普通文件）一律当没有 LKG', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 4, filter: { pingbibiaoti: '好规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  const original = readJson(paths.lastgood)
+  writeRaw(paths.file, '{ 坏掉的 JSON')
+
+  const cases = [
+    ['hash 不符（内容被改过）', { ...original, hash: 'deadbeef' }],
+    ['override 含未知字段', { ...original, override: { ...original.override, evil: 'x' } }],
+    ['override 值非字符串', { ...original, override: { pingbibiaoti: 42 } }],
+    ['schema 不符', { ...original, schema: 2 }],
+    ['revision 非法', { ...original, revision: -1 }],
+    ['不是对象', [1, 2]]
+  ]
+  for (const [label, payload] of cases) {
+    writeJson(paths.lastgood, payload)
+    const fresh = runLkgProbe(dir)
+    assert.strictEqual(fresh.lastGoodUsed, false, `${label}：不合格的 LKG 必须被拒绝（不得部分采用）`)
+    assert.strictEqual(fresh.filter.pingbibiaoti, DEFAULTS.pingbibiaoti, `${label}：必须回代码默认`)
+  }
+})
+
+test('F4-1 LKG 是 FIFO 时降级轮不得挂死（读取同样 O_NONBLOCK）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO LKG 探针：${FIFO_SKIP}`)
+    return
+  }
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeRaw(filterRulesPaths(dir).file, '{ 坏掉的 JSON')
+  require('node:child_process').execFileSync(MKFIFO, [filterRulesPaths(dir).lastgood])
+  const r = runProbeUnderTimeout(`
+const { loadFilterRules } = require('./xbk_filter_store')
+const t0 = Date.now()
+const r = loadFilterRules({ cacheDir: process.env.XBK_FIFO_DIR, defaults: {}, keyword: {} })
+process.stdout.write(JSON.stringify({ source: r.source, lastGoodUsed: r.lastGoodUsed, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO LKG 读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.source, 'corrupt')
+  assert.strictEqual(r.lastGoodUsed, false, 'FIFO 不是普通文件，必须当「没有 LKG」')
+})
+
+test('F4-1 resetStoreStateForTests 同步清掉持久 LKG（测试隔离前提）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 1, filter: { pingbibiaoti: 'x' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true)
+  resetStoreStateForTests()
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '清空 LKG 必须同时删除落盘文件，否则「全新进程」用例会互相污染')
+})
+
+// ===== F4-1 返工 R3：LKG 包装层的读写口径必须一致（写成功 ≠ 读得回）=====
+// LKG 是覆盖文件的**再包装**：比覆盖文件多出 `"hash":"<64 位十六进制>",`（74 字节）与
+// `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。旧实现读写共用 256 KiB ⇒ 覆盖文件落在
+// (256 KiB-76, 256 KiB] 这段（保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG 必然 > 读上限，
+// readLastGood 判 tooLarge 返回 null，新进程照样回代码默认，而 writeLastGoodFile 还返回 true。
+const RULES_READ_MAX_BYTES = 256 * 1024 // 与 xbk_filter_store.FILTER_RULES_MAX_BYTES 同值（未导出）
+// 把 11 个字段堆到接近上限（单字段上限 16000 码元，中文 3 字节/字；pingbitime 是数字型字段）
+function nearLimitFilter (targetBytes) {
+  const filter = {}
+  for (const field of FILTER_RULE_FIELDS) filter[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  const sizeOf = () => Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 1, filter }), 'utf8')
+  let size = sizeOf()
+  for (let i = FILTER_RULE_FIELDS.length - 2; i >= 0 && size > targetBytes; i--) {
+    const field = FILTER_RULE_FIELDS[i]
+    const chars = filter[field].length
+    const cut = Math.min(chars - 1, Math.ceil((size - targetBytes) / 3))
+    filter[field] = '中'.repeat(chars - cut)
+    size = sizeOf()
+  }
+  return { filter, size }
+}
+
+test('F4-1 R3 覆盖文件贴读上限时持久 LKG 仍必须被**新进程**读回（包装 +76 不得越过读上限）', () => {
+  resetStoreStateForTests()
+  // 两档：①控制台保存闸门允许的最大形状（≤ MAX-32）②手改能到的 MAX。旧实现在两档都写不出可读的 LKG。
+  for (const target of [RULES_READ_MAX_BYTES - 44, RULES_READ_MAX_BYTES]) {
+    const { filter, size } = nearLimitFilter(target)
+    assert.ok(size > RULES_READ_MAX_BYTES - 76 && size <= RULES_READ_MAX_BYTES,
+      `夹具必须落在缺陷窗口 (${RULES_READ_MAX_BYTES - 76}, ${RULES_READ_MAX_BYTES}]：实得 ${size}`)
+    if (size <= RULES_READ_MAX_BYTES - 32) {
+      const gate = validateFilterRules({ schema: FILTER_RULES_SCHEMA, revision: 1, filter }, deps)
+      assert.strictEqual(gate.ok, true,
+        `前置：${size} 字节的覆盖文件必须能过保存闸门（否则只是「本来就存不进去」）：${JSON.stringify(gate.errors)}`)
+    }
+    const dir = makeDir()
+    const paths = filterRulesPaths(dir)
+    writeJson(paths.file, { schema: 1, revision: 1, filter })
+    const loaded = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+    assert.strictEqual(loaded.source, 'override', `${size} 字节的覆盖文件必须被正常加载`)
+    const lkgBytes = fs.statSync(paths.lastgood).size
+    assert.ok(lkgBytes > RULES_READ_MAX_BYTES,
+      `夹具必须让 LKG 越过覆盖文件读上限（LKG ${lkgBytes} 字节，包装 +${lkgBytes - size}）`)
+
+    writeRaw(paths.file, '{ 坏掉的 JSON')
+    const fresh = runLkgProbe(dir)
+    assert.strictEqual(fresh.source, 'corrupt')
+    assert.strictEqual(fresh.lastGoodUsed, true,
+      `${size} 字节覆盖文件的 LKG（${lkgBytes} 字节）必须能被新进程读回——旧实现按 ${RULES_READ_MAX_BYTES} 读判 tooLarge，静默回代码默认`)
+    assert.ok(lkgBytes <= LASTGOOD_MAX_BYTES, `写出的 LKG 必须落在自己的读上限内：${lkgBytes} > ${LASTGOOD_MAX_BYTES}`)
+    assert.strictEqual(fresh.revision, 1, 'revision 必须沿用上次合法值')
+    for (const field of FILTER_RULE_FIELDS) {
+      assert.strictEqual(fresh.filter[field], filter[field], `LKG 恢复的字段 ${field} 必须与上次合法 override 逐字相等`)
+    }
+  }
+})
+
+test('F4-1 R3 写侧同口径：序列化后超过 LKG 读上限 ⇒ 不落盘 + 告警（不得返回 true 骗调用方）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const huge = {}
+  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  const bytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter: huge }), 'utf8')
+  assert.ok(bytes > LASTGOOD_MAX_BYTES, `前置：夹具必须超过 LKG 读上限（${bytes} vs ${LASTGOOD_MAX_BYTES}）`)
+  const warned = []
+  const origWarn = console.warn
+  console.warn = (...args) => { warned.push(args.join(' ')) }
+  let ok
+  try {
+    ok = writeLastGoodFile(paths.lastgood, huge, 3)
+  } finally {
+    console.warn = origWarn
+  }
+  assert.strictEqual(ok, false, '写不进去必须返回 false（否则调用方以为降级兜底已就位）')
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '超过读上限的 LKG 不得落盘（落盘即「写成功但读不回」）')
+  assert.match(warned.join('\n'), /超过 LKG 读上限/, `写侧必须留一条告警，实际：${JSON.stringify(warned)}`)
+})
+
+test('F4-1 R3 读侧仍是有界读：LKG 超过 LASTGOOD_MAX_BYTES ⇒ 当「没有 LKG」（不部分采用）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  // 合法 JSON、形状也合法，只是体积超过 LKG 读上限（模拟包装膨胀或被外部塞了大文件）
+  const override = {}
+  for (const field of FILTER_RULE_FIELDS) override[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  writeRaw(paths.lastgood, JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 1, hash: 'x', override }))
+  assert.ok(fs.statSync(paths.lastgood).size > LASTGOOD_MAX_BYTES)
+  assert.strictEqual(readLastGood(paths.lastgood), null, '超过上限的 LKG 必须当没有（有界读，不得无界整读）')
+})
+
+// ===== F4-2：FIFO/非普通文件不得挂死（读取必须 O_NONBLOCK + 普通文件校验）=====
+test('F4-2 参数层：覆盖文件与生效快照的读取必须传 openNonBlocking（裸 O_RDONLY 会挂死）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const storageMod = require('./xbk_storage')
+  const realRead = storageMod.readSafeTextResult
+  const calls = []
+  try {
+    storageMod.readSafeTextResult = (p, maxBytes, options) => {
+      calls.push({ p: String(p), options })
+      return { status: 'missing', text: null, error: null }
+    }
+    loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+    readAppliedSnapshot(dir)
+  } finally {
+    storageMod.readSafeTextResult = realRead
+  }
+  const rulesRead = calls.filter(c => c.p === filterRulesPaths(dir).file)
+  const appliedRead = calls.filter(c => c.p === filterRulesPaths(dir).applied)
+  assert.strictEqual(rulesRead.length, 1, `覆盖文件读入口必须被走到 1 次：${JSON.stringify(calls.map(c => c.p))}`)
+  assert.strictEqual(appliedRead.length, 1, `生效快照读入口必须被走到 1 次：${JSON.stringify(calls.map(c => c.p))}`)
+  for (const c of [rulesRead[0], appliedRead[0]]) {
+    assert.strictEqual(c.options && c.options.openNonBlocking, true,
+      `readSafeTextResult 必须传 openNonBlocking:true（FIFO 上裸 O_RDONLY 永久阻塞）${c.p}: ${JSON.stringify(c.options)}`)
+  }
+})
+
+test('F4-2 FIFO 覆盖文件：新进程 2 秒内降级为 corrupt（timeout 3 实测 exit≠124）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 覆盖文件探针：${FIFO_SKIP}`)
+    return
+  }
+  resetStoreStateForTests()
+  const { dir } = makeFifoDir('filter-rules.json')
+  const r = runProbeUnderTimeout(`
+const { loadFilterRules } = require('./xbk_filter_store')
+const t0 = Date.now()
+const r = loadFilterRules({ cacheDir: process.env.XBK_FIFO_DIR, defaults: {}, keyword: {} })
+process.stdout.write(JSON.stringify({ source: r.source, degraded: r.degraded, lastGoodUsed: r.lastGoodUsed, message: r.error && r.error.message, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 覆盖文件读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.source, 'corrupt', `FIFO 必须按不可用降级（实际 source=${r.source}）：GIF/管道不得当规则文件读`)
+  assert.strictEqual(r.degraded, true, '降级必须置 degraded=true（运行侧据此不清 _f、不推进 hash）')
+  assert.strictEqual(r.lastGoodUsed, false, '新进程没有 LKG 时必须回代码默认（本案无历史合法文件）')
+  assert.match(String(r.message), /unsafe/, `降级原因必须点名 unsafe（普通文件校验），实际：${r.message}`)
+})
+
+test('F4-2 FIFO 生效快照：readAppliedSnapshot 2 秒内返回 ioError（不挂死控制台读面）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 生效快照探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('filter-rules.applied.json')
+  const r = runProbeUnderTimeout(`
+const { readAppliedSnapshot } = require('./xbk_filter_store')
+const t0 = Date.now()
+const read = readAppliedSnapshot(process.env.XBK_FIFO_DIR)
+process.stdout.write(JSON.stringify({ status: read.status, code: read.error && read.error.code, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 生效快照读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.status, 'ioError', `FIFO 生效快照必须如实判不可读（实际 ${r.status}）`)
+  assert.strictEqual(r.code, 'unsafe', `错误码必须点名 unsafe，实际 ${r.code}`)
+})
+
+test('F4-2 FIFO 周标记 <log>.week：readMarker 2 秒内返回空串（run.log 写入路径不得挂死）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 周标记探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('run.log.week')
+  const r = runProbeUnderTimeout(`
+const path = require('node:path')
+const { readMarker } = require('./scripts/log-archive')
+const t0 = Date.now()
+const marker = readMarker(path.join(process.env.XBK_FIFO_DIR, 'run.log'))
+process.stdout.write(JSON.stringify({ marker, ms: Date.now() - t0 }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 周标记读取必须 2 秒内返回（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.marker, '', 'FIFO 周标记必须按「无标记」处理（不得把它当周键）')
+})
+
+// R1-1：读侧改 O_NONBLOCK 只覆盖了 readMarker；同一分支紧接着的**写**标记才是真正的挂死点
+// （裸 fs.writeFileSync 在无写者 FIFO 上同步 open(O_WRONLY) 永久阻塞）。旧用例只调 readMarker，
+// 完全没走到写分支，所以这条缺陷没有任何覆盖。
+test('F4-2 FIFO 周标记写入：run.log.week 注入 FIFO 后 _writeRunLog 不挂死（写侧，R1-1）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 周标记写入探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('run.log.week')
+  const r = runProbeUnderTimeout(`
+const fs = require('node:fs')
+const path = require('node:path')
+const { App } = require('./xbk_function_v3')
+const dir = process.env.XBK_FIFO_DIR
+App._cacheDir = () => dir
+let warned = ''
+const origWarn = console.warn
+console.warn = (...args) => { warned += args.join(' ') + '\\n' }
+const t0 = Date.now()
+App._writeRunLog('2026-11-10 12:00:00 probe line\\n')
+const ms = Date.now() - t0
+console.warn = origWarn
+const markerPath = path.join(dir, 'run.log.week')
+let markerType = 'missing'
+try { const st = fs.lstatSync(markerPath); markerType = st.isFIFO() ? 'fifo' : (st.isFile() ? 'file' : 'other') } catch (e) {}
+const logPath = path.join(dir, 'run.log')
+const logText = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : ''
+process.stdout.write(JSON.stringify({ ms, markerType, logHasLine: logText.includes('probe line'), warnedHasMarker: /日志周标记/.test(warned) }))
+`, dir)
+  assert.ok(r.ms < 2000, `FIFO 周标记写入必须 2 秒内返回（实耗 ${r.ms}ms）：裸 writeFileSync 会永久阻塞整轮`)
+  assert.strictEqual(r.markerType, 'fifo', `周标记必须仍是那个 FIFO（不得被写穿/改名/替换），实际 ${r.markerType}`)
+  assert.strictEqual(r.logHasLine, true, 'run.log 本体必须照常写入（标记写不了不影响留痕）')
+  assert.strictEqual(r.warnedHasMarker, true, '拒绝写非普通文件周标记必须留一条 console.warn（故障可见，不静默）')
+})
+
+test('F4-2 普通周标记仍照常写入：无标记时第一轮写当前周键（R1-1 回归，不得为修 FIFO 拒写正常文件）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过普通周标记探针：${FIFO_SKIP}`)
+    return
+  }
+  const dir = makeDir()
+  const r = runProbeUnderTimeout(`
+const fs = require('node:fs')
+const path = require('node:path')
+const { App } = require('./xbk_function_v3')
+const { readMarker } = require('./scripts/log-archive')
+const dir = process.env.XBK_FIFO_DIR
+App._cacheDir = () => dir
+App._writeRunLog('2026-11-10 12:00:00 probe line\\n')
+const markerPath = path.join(dir, 'run.log.week')
+const mode = fs.existsSync(markerPath) ? (fs.statSync(markerPath).mode & 0o777) : -1
+process.stdout.write(JSON.stringify({ marker: readMarker(path.join(dir, 'run.log')), mode }))
+`, dir)
+  const { weekRange } = require('./scripts/log-archive')
+  assert.strictEqual(r.marker, weekRange(Date.now()).key, `无标记的首次写入必须落当前周键（实际 ${r.marker}）`)
+  assert.strictEqual(r.mode, 0o600, `周标记必须是 0600（与其它状态文件同口径），实际 ${r.mode.toString(8)}`)
+})
+
+// R1-2：readStatus 里的 report.state / channel-health.state 此前调 readText 时没传 options，
+// 走的是裸 O_RDONLY——FIFO 上没有写者就永久阻塞。控制台 GET /、GET /api/status 与青龙 --status
+// 全走这条路径，一处漏传就是「整个单线程 http server 被钉死」。
+test('F4-2 FIFO 状态文件：report.state / channel-health.state 注入 FIFO 后 readStatus 2 秒内返回 unsafe（R1-2）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 状态文件探针：${FIFO_SKIP}`)
+    return
+  }
+  for (const [name, key] of [['report.state', 'report'], ['channel-health.state', 'channels']]) {
+    const { dir } = makeFifoDir(name)
+    const r = runProbeUnderTimeout(`
+const { readStatus } = require('./scripts/status')
+const t0 = Date.now()
+const out = readStatus(process.env.XBK_FIFO_DIR)
+process.stdout.write(JSON.stringify({ report: out.report.status, channels: out.channels.status, run: out.run.status, ms: Date.now() - t0 }))
+`, dir)
+    assert.ok(r.ms < 2000, `${name} 的 readStatus 必须 2 秒内返回（实耗 ${r.ms}ms）：裸 O_RDONLY 会阻塞等写者`)
+    assert.strictEqual(r[key], 'unsafe', `${name} 必须按非普通文件判 unsafe（实际 ${r[key]}）——不得挂死也不得当空文件读`)
+    assert.strictEqual(r.run, 'missing', '其余部件不受影响（同一目录下没有 run.log）')
+  }
+})
+
+test('F4-2 FIFO 状态文件 + 控制台读面：GET /api/status 与 GET / 都不得挂死（R1-2）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 控制台读面探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('report.state')
+  const r = runProbeUnderTimeout(`
+const http = require('node:http')
+const { createConsole } = require('./scripts/console')
+const token = 'probe-token-0123456789'
+const { server } = createConsole({ token, stateDir: process.env.XBK_FIFO_DIR, log: () => {} })
+const get = (port, p) => new Promise((resolve, reject) => {
+  const req = http.get({ host: '127.0.0.1', port, path: p, headers: { Authorization: 'Bearer ' + token } }, (res) => {
+    let body = ''
+    res.setEncoding('utf8')
+    res.on('data', (chunk) => { body += chunk })
+    res.on('end', () => resolve({ status: res.statusCode, bytes: body.length }))
+  })
+  req.on('error', reject)
+})
+server.listen(0, '127.0.0.1', async () => {
+  try {
+    const port = server.address().port
+    const t0 = Date.now()
+    const api = await get(port, '/api/status')
+    const page = await get(port, '/')
+    process.stdout.write(JSON.stringify({ api, page, ms: Date.now() - t0 }))
+  } finally {
+    server.close(() => process.exit(0))
+  }
+})
+`, dir)
+  assert.ok(r.ms < 2000, `控制台读面必须 2 秒内响应（实耗 ${r.ms}ms）：单线程 server 一挂就是整只控制台不可用`)
+  assert.strictEqual(r.api.status, 200, `GET /api/status 必须正常返回（实际 ${r.api.status}）：读不到不等于挂死`)
+  assert.strictEqual(r.page.status, 200, `GET / 必须正常返回（实际 ${r.page.status}）`)
+})
+
+test('F4-2 FIFO 状态文件 + --status：青龙 --status 2 秒内正常退出并如实报 unsafe（R1-2）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO --status 探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('channel-health.state')
+  const r = runProbeUnderTimeout(`
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+const t0 = Date.now()
+const probe = spawnSync(process.execPath, [path.resolve('qinglong/xbk_push.js'), '--status'], {
+  encoding: 'utf8', env: { ...process.env, XBK_CACHE_DIR: process.env.XBK_FIFO_DIR }, timeout: 2500
+})
+process.stdout.write(JSON.stringify({ code: probe.status, signal: probe.signal, ms: Date.now() - t0, out: String(probe.stdout || '') + String(probe.stderr || '') }))
+`, dir)
+  assert.ok(r.ms < 2000, `--status 必须 2 秒内结束（实耗 ${r.ms}ms）`)
+  assert.strictEqual(r.signal, null, `--status 不得被超时强杀（signal=${r.signal}）`)
+  assert.strictEqual(r.code, 0, `--status 必须正常退出（实际 code=${r.code}）：状态不可读是展示内容，不是命令失败`)
+  assert.match(r.out, /通道健康：不可读（unsafe）/, `--status 必须如实点名 unsafe，实际输出：${String(r.out).slice(-300)}`)
+})
+
+// R1-3：commitFilterOverride 备份「当前一代」时读的正是 filter-rules.json（spec 点名必须非阻塞的文件）。
+// 进入条件是 loaded.source==='override'|'corrupt'，而 FIFO 恰好被判 corrupt ⇒ 保存/回滚/导入三条
+// 写入口会一起在裸 O_RDONLY 上永久阻塞，单线程 http server 整只挂死且没有任何日志。
+test('F4-2 FIFO 覆盖文件 + 写入口：保存 / 回滚 / 备份导入三条入口都不得挂死（R1-3）', () => {
+  if (FIFO_SKIP) {
+    console.log(`  ⏭️ 跳过 FIFO 写入口探针：${FIFO_SKIP}`)
+    return
+  }
+  const { dir } = makeFifoDir('filter-rules.json')
+  const r = runProbeUnderTimeout(`
+const http = require('node:http')
+const { createConsole } = require('./scripts/console')
+const token = 'probe-token-0123456789'
+const { server } = createConsole({ token, stateDir: process.env.XBK_FIFO_DIR, log: () => {} })
+const request = (port, method, p, body) => new Promise((resolve, reject) => {
+  const payload = body === undefined ? '' : JSON.stringify(body)
+  const req = http.request({ host: '127.0.0.1', port, path: p, method, headers: {
+    Authorization: 'Bearer ' + token,
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload)
+  } }, (res) => {
+    let text = ''
+    res.setEncoding('utf8')
+    res.on('data', (chunk) => { text += chunk })
+    res.on('end', () => resolve({ status: res.statusCode, error: JSON.parse(text).error }))
+  })
+  req.on('error', reject)
+  req.end(payload)
+})
+server.listen(0, '127.0.0.1', async () => {
+  try {
+    const port = server.address().port
+    const started = Date.now()
+    const save = await request(port, 'POST', '/api/config/filter', { filter: {}, baseRevision: 0, confirmReplaceCorrupt: true })
+    const saveMs = Date.now() - started
+    const restore = await request(port, 'POST', '/api/config/filter/restore', { confirm: true, to: 'default', baseRevision: 0 })
+    const imported = await request(port, 'POST', '/api/backup/import', { kind: 'xbk-console-backup', schema: 1, data: { filter: { text: JSON.stringify({ schema: 1, revision: 1, filter: { pingbibiaoti: 'x' } }) } } })
+    process.stdout.write(JSON.stringify({ save, saveMs, restore, imported, ms: Date.now() - started }))
+  } finally {
+    server.close(() => process.exit(0))
+  }
+})
+`, dir)
+  assert.ok(r.saveMs < 2000, `POST 保存必须 2 秒内响应（实耗 ${r.saveMs}ms）：FIFO 上裸 O_RDONLY 会永久阻塞整只控制台`)
+  assert.strictEqual(r.save.status, 500, `FIFO 覆盖文件写入必须如实失败（实际 ${r.save.status}）`)
+  assert.strictEqual(r.save.error, 'write_failed', `保存失败码必须是 write_failed（实际 ${r.save.error}）`)
+  assert.strictEqual(r.restore.status, 500, `回滚同样不得挂死，且必须如实失败（实际 ${r.restore.status}）`)
+  assert.strictEqual(r.restore.error, 'write_failed', `回滚失败码必须是 write_failed（实际 ${r.restore.error}）`)
+  assert.ok(r.imported.status >= 400, `备份导入不得报成功（实际 ${r.imported.status}）：filter-rules.json 写不进去`)
+  assert.ok(r.ms < 3000, `三条入口合计必须 3 秒内结束（实耗 ${r.ms}ms）`)
+})
+
+test('R1-3 静态接线：备份当前一代的读必须显式 openNonBlocking（回退成裸读即红）', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
+  const line = src.split('\n').find(l => l.includes('readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES'))
+  assert.ok(line, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）')
+  assert.match(line, /openNonBlocking: true/,
+    `备份当前一代的读必须带 openNonBlocking:true（FIFO 会永久阻塞）：${line.trim()}`)
+})
+
+// R1-5：持久 LKG 写入挂在 loadFilterRules 的成功路径上，而控制台 GET /api/config/filter（4830）与
+// GET /api/config/filter/draft（4221）都调它 ⇒ 纯读请求会新建/重写 filter-rules.lastgood.json，
+// 违反 SYSTEM_CONTRACT:56「控制台读取面零写盘」（:27 明确该 GET 属读面）。inode 变化是最硬的证据：
+// writeAtomic 走 tmp+rename，每写一次 inode 必换（同一 mtime 毫秒内也能区分）。
+test('I2/R1-5 控制台读面零写盘：persistLastGood:false 的纯读不新建/不改写 LKG（运行侧仍写）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 3, filter: { pingbibiaoti: '读面规则' } })
+  const listing = () => fs.readdirSync(dir).sort(byCodeUnit)
+
+  const first = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(first.source, 'override', '前置：覆盖文件必须被正常加载')
+  assert.deepStrictEqual(listing(), ['filter-rules.json'],
+    `纯读不得新建 filter-rules.lastgood.json（实际目录：${JSON.stringify(listing())}）`)
+  const rulesBefore = fs.statSync(paths.file)
+  const second = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(second.source, 'override')
+  assert.strictEqual(fs.statSync(paths.file).ino, rulesBefore.ino, '纯读不得重写覆盖文件本身')
+  assert.deepStrictEqual(listing(), ['filter-rules.json'], '第二次纯读同样不得落盘')
+
+  // 运行侧（缺省 persistLastGood=true）必须照旧写：否则新进程降级时没有 LKG 可用（F4-1 回归）
+  const runSide = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(runSide.source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '运行侧成功加载 override 必须落盘持久 LKG')
+  const lkgBefore = fs.statSync(paths.lastgood)
+  const readOnlyAgain = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(readOnlyAgain.source, 'override')
+  const lkgAfter = fs.statSync(paths.lastgood)
+  assert.strictEqual(lkgAfter.ino, lkgBefore.ino, '纯读不得改写已有 LKG（inode 换了就说明又写了一次）')
+  assert.strictEqual(lkgAfter.mtimeMs, lkgBefore.mtimeMs, '纯读不得改写已有 LKG（mtime 必须原样）')
+})
+
+test('I2/R1-5 读面不代删 LKG：覆盖文件缺失时纯读不删 LKG，运行侧默认口径仍删（删文件=恢复默认）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  writeJson(paths.file, { schema: 1, revision: 5, filter: { pingbibiaoti: '旧规则' } })
+  assert.strictEqual(loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }).source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, '前置：运行侧已写 LKG')
+
+  fs.rmSync(paths.file)
+  const readOnly = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
+  assert.strictEqual(readOnly.source, 'default', '覆盖文件缺失 = 代码默认')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true,
+    '控制台读面不得代为删除 LKG（删除也是写盘；「删文件=恢复默认」由运行侧负责）')
+
+  const runSide = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  assert.strictEqual(runSide.source, 'default')
+  assert.strictEqual(fs.existsSync(paths.lastgood), false, '运行侧加载到 missing 必须同步删除 LKG')
+})
+
+test('I2/R1-5 真实控制台 GET /api/config/filter：两次纯读后目录 inode/mtime 全不变、无 lastgood（读面零写盘）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 3, filter: { pingbibiaoti: '读面规则' } })
+  const r = runProbeUnderTimeout(`
+const fs = require('node:fs')
+const path = require('node:path')
+const http = require('node:http')
+const { createConsole } = require('./scripts/console')
+const dir = process.env.XBK_FIFO_DIR
+const token = 'probe-token-0123456789'
+const snap = () => fs.readdirSync(dir).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).map((name) => {
+  const st = fs.lstatSync(path.join(dir, name))
+  return name + ':' + st.ino + ':' + st.mtimeMs
+})
+const { server } = createConsole({ token, stateDir: dir, log: () => {} })
+const get = (port, p) => new Promise((resolve, reject) => {
+  const req = http.get({ host: '127.0.0.1', port, path: p, headers: { Authorization: 'Bearer ' + token } }, (res) => {
+    let body = ''
+    res.setEncoding('utf8')
+    res.on('data', (chunk) => { body += chunk })
+    res.on('end', () => resolve({ status: res.statusCode, body }))
+  })
+  req.on('error', reject)
+})
+server.listen(0, '127.0.0.1', async () => {
+  try {
+    const port = server.address().port
+    const before = snap()
+    const first = await get(port, '/api/config/filter')
+    const mid = snap()
+    const second = await get(port, '/api/config/filter?nonce=2')
+    const after = snap()
+    process.stdout.write(JSON.stringify({
+      statuses: [first.status, second.status],
+      lastGoodUsed: [JSON.parse(first.body).lastGoodUsed, JSON.parse(second.body).lastGoodUsed],
+      before, mid, after
+    }))
+  } finally {
+    server.close(() => process.exit(0))
+  }
+})
+`, dir)
+  assert.deepStrictEqual(r.statuses, [200, 200], `两次 GET 都必须成功（实际 ${JSON.stringify(r.statuses)}）`)
+  assert.deepStrictEqual(r.lastGoodUsed, [false, false], '正常加载轮 lastGoodUsed 必须为 false（运行侧快照缺省）')
+  assert.deepStrictEqual(r.mid, r.before, `第一次纯读不得写盘（前：${JSON.stringify(r.before)} 后：${JSON.stringify(r.mid)}）`)
+  assert.deepStrictEqual(r.after, r.mid, `第二次纯读不得写盘（前：${JSON.stringify(r.mid)} 后：${JSON.stringify(r.after)}）`)
+  assert.ok(!r.after.some(entry => entry.startsWith('filter-rules.lastgood.json:')),
+    `控制台读面不得生成 filter-rules.lastgood.json（实际目录：${JSON.stringify(r.after)}）`)
+})
+
+// R1-4：README 是**唯一**面向部署者的降级口径说明，没有内容门禁（check-doc-lines 只管行长），
+// 漂移只能靠评审。本题材料里 README 仍写「优先沿用进程内上一次合法规则」——新进程里根本不存在，
+// 正是 F4-1 修掉的缺陷本体。这里把口径钉住：回退成旧措辞即红。
+test('R1-4 文档同步：README 必须写持久 LKG（不得再写「进程内上一次合法规则」）', () => {
+  const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')
+  assert.ok(!readme.includes('优先沿用进程内上一次合法规则'),
+    'README 不得再写「进程内 LKG」：控制台 auto-run 每轮都是新进程，进程内 Map 等于不存在（F4-1）')
+  assert.match(readme, /filter-rules\.lastgood\.json/,
+    'README 必须点名持久 LKG 文件 <缓存目录>/filter-rules.lastgood.json')
+  assert.match(readme, /删掉正式覆盖文件时 LKG 一并删除|删除正式覆盖文件时同步删除 LKG/,
+    'README 必须写清「删覆盖文件 ⇒ LKG 作废」（否则「删文件=恢复默认」会被降级轮复活旧规则破坏）')
+  const appliedLine = readme.split('\n').find(l => l.includes('filter-rules.applied.json` 快照'))
+  assert.ok(appliedLine, 'README 必须仍描述 filter-rules.applied.json 生效快照')
+  assert.ok(appliedLine.includes('lastGoodUsed'),
+    `applied 快照的字段清单必须含 lastGoodUsed（控制台「沿用上次合法规则」唯一口径）：${appliedLine}`)
 })
 
 // ===== 路径 helper =====

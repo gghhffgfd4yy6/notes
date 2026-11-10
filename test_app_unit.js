@@ -433,6 +433,9 @@ function makeLogFs (over = {}) {
     openSync (p, flag) {
       rec.open.push([p, flag])
       if (over.openSync) return over.openSync(p, flag)
+      // R2-1：周标记与 run.log 锁在同一轮里可以是**两个同时打开的 fd**；桩不能让它们映射到同一个
+      // 号数——同号时 _writeWeekMarker 的 finally 看起来像「把锁 fd 多关了一次」，掩盖真正的归属判断。
+      if (String(p).endsWith('.week')) return 9
       return flag === 'r+' ? 8 : 7
     },
     writeSync (fd, data) { rec.write.push([fd, String(data)]); lockText = String(data) },
@@ -714,6 +717,114 @@ check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍�
       assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], `${tag}: 锁文件必须清理（漏删会让后续轮次一直被旧锁挡住）`)
     }
   }
+})
+
+// ----- R2-1：周标记写入只依赖注入 fs 的**能力子集** -----
+// R1-1 的实现直接读注入对象的 constants、无条件调 fstatSync：单测桩（makeLogFs）没有这两样，
+// 读 constants 那一步抛的 TypeError 穿出 _writeWeekMarker 后被 _writeRunLog 最外层 catch 静默吞掉，
+// 于是「每行日志都走无标记分支」的桩环境下所有 append 变成空数组（test_app_unit 28 例红）。
+// 下面两条分别钉住「缺能力不炸」与「能力齐了必须用 node:fs 的真常量 + 只关自己的 fd」。
+check('R2-1 _writeWeekMarker 容忍注入 fs 的能力子集：缺 fstatSync 就不开 fd、不抛、不误报，日志照常追加', () => {
+  const rec = makeLogFs() // 该桩无 constants / fstatSync / writeFileSync，只有 openSync/closeSync/appendFileSync
+  const { app } = makeLogApp({ rec })
+  const r = withCapture('warn', () => app._writeRunLog('x\n'))
+  assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']],
+    '整行日志必须照常落盘（能力缺失若抛穿，append 会变成空数组）')
+  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx']],
+    '能力不足时不得去开周标记：没有 fstat 就无法排除「把周键写进 FIFO/设备」')
+  const markerWarns = r.msgs.filter((m) => m.includes('日志周标记'))
+  assert.deepStrictEqual(markerWarns, [], `能力缺失不是运行故障，不得告警：${JSON.stringify(r.msgs)}`)
+})
+
+check('R2-1 能力齐备 ⇒ 周标记用 node:fs 常量非阻塞写当周键并只关自己的 fd（不是锁 fd）', () => {
+  const nodeFs = require('node:fs')
+  const LogArchive = require('./scripts/log-archive.js')
+  const markerWrites = []
+  const markerFlags = []
+  const rec = makeLogFs({
+    openSync: (p, flag) => {
+      if (p === LOG_PATH + '.week') { markerFlags.push(flag); return 9 }
+      return flag === 'wx' ? 7 : 8
+    }
+  })
+  // 同步补上桩缺失的两项能力：fstat 复核 + 按 fd 写。真实 node:fs 恒有它们，桩只实现被调用到的部分。
+  rec.stub.fstatSync = (fd) => ({ isFile: () => fd === 9 })
+  rec.stub.writeFileSync = (fd, data, opts) => { markerWrites.push([fd, String(data), opts && opts.encoding]) }
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  withFixedNow(t0, () => app._writeRunLog('x\n'))
+  assert.deepStrictEqual(markerWrites, [[9, LogArchive.weekRange(t0).key, 'utf8']],
+    '无标记时必须把当周键写进 <log>.week')
+  assert.strictEqual(markerFlags.length, 1, '只开一次周标记')
+  const flags = markerFlags[0]
+  for (const name of ['O_WRONLY', 'O_CREAT', 'O_TRUNC', 'O_NONBLOCK', 'O_NOFOLLOW']) {
+    const bit = nodeFs.constants[name]
+    assert.strictEqual(flags & bit, bit, `flags 必须含 ${name}（常量只能取 node:fs，不得读注入对象）`)
+  }
+  assert.deepStrictEqual(rec.rec.close, [9, 7],
+    `只关「本函数 open 成功的周标记 fd」与锁 fd 各一次，实际：${JSON.stringify(rec.rec.close)}`)
+})
+
+// ----- R2-2：周标记写失败告警必须 60s 限频（与相邻的归档失败告警同口径） -----
+// 标记写不进去时 readMarker 恒返回空串 ⇒ 每次 _writeRunLog 都重试并再告警；一轮 19 个调用点、
+// 控制台 auto-run 每 5 秒一轮，不限频就是同一条文案刷屏。旧实现每次调用一条 WARN。
+function markerFailFs (err) {
+  const rec = makeLogFs({
+    openSync: (p, flag) => {
+      if (String(p).endsWith('.week')) throw err
+      return flag === 'wx' ? 7 : 8
+    }
+  })
+  // 让桩具备「写标记所需的全部能力」，但 open 一定失败：测的是告警限频，不是能力探测。
+  rec.stub.fstatSync = () => ({ isFile: () => true })
+  rec.stub.writeFileSync = () => {}
+  return rec
+}
+
+check('R2-2 周标记连续写失败 ⇒ 60s 内只 1 条告警，窗口到期后再出第 2 条', () => {
+  const rec = markerFailFs(Object.assign(new Error('marker is a fifo'), { code: 'ENXIO' }))
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => {
+    for (let i = 0; i < 5; i++) app._writeRunLog(`l${i}\n`)
+  }))
+  const warns = r.msgs.filter((m) => m.includes('日志周标记写入失败'))
+  assert.strictEqual(warns.length, 1, `连续 5 次写失败只出 1 条告警（旧实现 5 条）：${JSON.stringify(r.msgs)}`)
+  assert.ok(warns[0].includes('run.log.week'), `告警必须点名标记路径：${warns[0]}`)
+  assert.strictEqual(rec.rec.append.length, 5, '标记写失败不得影响日志本体（每行都要落盘）')
+  const r2 = withFixedNow(t0 + 59999, () => withCapture('warn', () => app._writeRunLog('edge\n')))
+  assert.strictEqual(r2.msgs.filter((m) => m.includes('日志周标记写入失败')).length, 0, '窗口内（差 1ms）不得重复告警')
+  const r3 = withFixedNow(t0 + 60000, () => withCapture('warn', () => app._writeRunLog('again\n')))
+  assert.strictEqual(r3.msgs.filter((m) => m.includes('日志周标记写入失败')).length, 1, '60s 窗口到期后必须再告警一次')
+})
+
+check('R2-2 限频按标记路径分键：两条日志同时写失败各告警一次，交替不互相刷新', () => {
+  const rec = markerFailFs(new Error('EACCES'))
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => {
+    for (let i = 0; i < 3; i++) {
+      app._writeRunLog('a\n')
+      app._writeRunLog('b\n', 'filter-diagnostics.ndjson')
+    }
+  }))
+  const warns = r.msgs.filter((m) => m.includes('日志周标记写入失败'))
+  assert.strictEqual(warns.length, 2, `两条日志各自一条窗口（单槽位会被来回覆盖成 6 条）：${JSON.stringify(r.msgs)}`)
+  assert.ok(warns[0].includes('run.log.week'), `第一条必须点名 run.log.week：${warns[0]}`)
+  assert.ok(warns[1].includes('filter-diagnostics.ndjson.week'), `第二条必须点名诊断日志的标记：${warns[1]}`)
+})
+
+check('R2-2 「不是普通文件」分支同样限频：连续 3 次只 1 条告警', () => {
+  const rec = makeLogFs()
+  rec.stub.fstatSync = () => ({ isFile: () => false })
+  rec.stub.writeFileSync = () => { throw new Error('不应写进非普通文件') }
+  const { app } = makeLogApp({ rec })
+  const t0 = 1700000000000
+  const r = withFixedNow(t0, () => withCapture('warn', () => {
+    for (let i = 0; i < 3; i++) app._writeRunLog('x\n')
+  }))
+  const warns = r.msgs.filter((m) => m.includes('日志周标记不是普通文件'))
+  assert.strictEqual(warns.length, 1, `同一标记的同一故障只留一条：${JSON.stringify(r.msgs)}`)
 })
 
 // ----- _writeRunLog：ERROR 行只截 errMsg 段 -----
@@ -3220,7 +3331,7 @@ checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _
 checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默认、告警 lastGoodUsed=false，仍不清 _f/不推进 hash', async () => {
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
-  FilterStore.resetStoreStateForTests() // 关键：清掉进程内 last-known-good，模拟「本进程从未读到合法文件」
+  FilterStore.resetStoreStateForTests() // 关键：清掉 LKG（进程内缓存 + 持久 lastgood.json），模拟「没有任何合法历史规则」
   const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN

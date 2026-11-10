@@ -24,7 +24,13 @@
 // ============================================================
 
 const path = require('path')
-const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+// 读入口经模块对象调用（`storage.readSafeTextResult`）而非解构：F4-3 的「瞬时读失败重读一次」
+// 分支只能靠替换该函数来注入 replaced/ioError（真实竞态不可确定复现），解构会把模块加载时的
+// 引用钉死，测试无法注入。写入口继续解构（没有注入需求）。
+const storage = require('./xbk_storage')
+const { writeAtomic } = storage
 // 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
 const { filterRulesPaths } = require('./scripts/filter-rules-paths')
 
@@ -50,6 +56,16 @@ const FILTER_RULES_SCHEMA = 1
 // 覆盖文件整体上限 256 KiB：与 console 的 body 上限同源，避免「能保存但读不回」。
 const FILTER_FIELD_MAX_LEN = 16000
 const FILTER_RULES_MAX_BYTES = 256 * 1024
+// 持久 LKG 的读上限（F4-1 返工 R3）：LKG 是覆盖文件的**再包装**——`{schema,revision,hash,override}`
+// 比覆盖文件的 `{schema,revision,filter}` 多出 `"hash":"<64 位十六进制>",`（74 字节）与
+// `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。若读写共用 FILTER_RULES_MAX_BYTES，
+// 则覆盖文件落在 (MAX-76, MAX] 这段（控制台保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG
+// 必然 > MAX ⇒ readSafeTextResult 判 tooLarge ⇒ readLastGood 返回 null ⇒ 新进程降级回代码默认，
+// 而写入侧仍返回 true（「写成功但读不回」，与 C9-012 同类的阈值差几字节缺陷，只是差在包装层）。
+// 故读上限 = 覆盖文件上限 + 包装预算；写入侧（writeLastGoodFile）用同一常量预检，绝不产出读不回的文件。
+// 1024 的余量足够：覆盖文件能读回就 ≤ 256 KiB，包装固定 +76，revision 最多 16 位数字也吃不满。
+const LASTGOOD_WRAPPER_BYTES = 1024
+const LASTGOOD_MAX_BYTES = FILTER_RULES_MAX_BYTES + LASTGOOD_WRAPPER_BYTES
 // pingbitime 天数上限：与 xbk_rules.compileRules / validateConfig 的 PINGBITIME_MAX_DAYS 同值。
 // 超上限的行会被运行期静默丢弃 ⇒ 编译对账必然失败，这里提前给出明确错误码。
 const PINGBITIME_MAX_DAYS = 3650000
@@ -454,6 +470,31 @@ function validateFilterRules (input, deps, options) {
   return { ok: true, value: filter, wideMatch, deduped }
 }
 
+/**
+ * 校验「覆盖字段对象」：白名单字段 + 必须是字符串 + 单字段长度 + 控制字符。
+ * 覆盖文件与持久 LKG 共用同一套口径（LKG 也要按覆盖文件的严格度复验，否则损坏/被改写的
+ * LKG 会把非法规则代入降级轮）。
+ * @returns {{ok:true,filter:Object}|{ok:false,message:string}}
+ */
+function parseOverrideFields (rawFilter) {
+  if (!rawFilter || typeof rawFilter !== 'object' || Array.isArray(rawFilter)) {
+    return { ok: false, message: '必须是对象' }
+  }
+  let keys
+  try { keys = Object.keys(rawFilter) } catch (e) { keys = null }
+  if (keys === null) return { ok: false, message: '不是可枚举对象' }
+  const filter = {}
+  for (const field of keys) {
+    if (!FIELD_SET.has(field)) return { ok: false, message: `含未知字段「${field}」` }
+    const value = safeGet(rawFilter, field)
+    if (typeof value !== 'string') return { ok: false, message: `字段「${field}」必须是字符串` }
+    if (value.length > FILTER_FIELD_MAX_LEN) return { ok: false, message: `字段「${field}」超长` }
+    if (CONTROL_CHAR_RE.test(value)) return { ok: false, message: `字段「${field}」含控制字符` }
+    filter[field] = value
+  }
+  return { ok: true, filter }
+}
+
 function parseStoredRules (text) {
   // 覆盖文件的**结构**校验（与用户输入的五道闸分开）：JSON / schema / revision / 字段白名单 /
   // 字符串 / 长度 / 控制字符。刻意不做正则编译与嵌套量词检查——那需要 RE2，且读路径必须
@@ -471,23 +512,9 @@ function parseStoredRules (text) {
   if (!Number.isSafeInteger(data.revision) || data.revision < 0) {
     return { ok: false, message: '覆盖文件 revision 必须是非负整数' }
   }
-  const rawFilter = data.filter
-  if (!rawFilter || typeof rawFilter !== 'object' || Array.isArray(rawFilter)) {
-    return { ok: false, message: '覆盖文件 filter 必须是对象' }
-  }
-  let keys
-  try { keys = Object.keys(rawFilter) } catch (e) { keys = null }
-  if (keys === null) return { ok: false, message: '覆盖文件 filter 不是可枚举对象' }
-  const filter = {}
-  for (const field of keys) {
-    if (!FIELD_SET.has(field)) return { ok: false, message: `覆盖文件含未知字段「${field}」` }
-    const value = safeGet(rawFilter, field)
-    if (typeof value !== 'string') return { ok: false, message: `覆盖文件字段「${field}」必须是字符串` }
-    if (value.length > FILTER_FIELD_MAX_LEN) return { ok: false, message: `覆盖文件字段「${field}」超长` }
-    if (CONTROL_CHAR_RE.test(value)) return { ok: false, message: `覆盖文件字段「${field}」含控制字符` }
-    filter[field] = value
-  }
-  return { ok: true, filter, revision: data.revision }
+  const fields = parseOverrideFields(data.filter)
+  if (!fields.ok) return { ok: false, message: `覆盖文件 filter ${fields.message}` }
+  return { ok: true, filter: fields.filter, revision: data.revision }
 }
 
 /**
@@ -534,10 +561,149 @@ function deepValidationError (parsed, deps) {
   return `覆盖文件规则深度校验失败（${field || 'filter'}：${detail || '未知原因'}）`
 }
 
-function corruptResult (defaults, keyword, message, key) {
-  // 损坏降级：优先本目录的 last-known-good；只有「本进程从未在该目录成功读过合法文件」才回代码默认。
+// ============================================================
+// F4-1：持久 LKG（filter-rules.lastgood.json）
+//
+// 为什么需要：进程内 `lastGoodByDir` 只能救「同一进程的下一轮」，而控制台 auto-run 每 5 秒
+// spawn 一个**新进程**跑单轮（scripts/console.js）⇒ 新进程的 Map 恒为空，覆盖文件瞬时不可读时
+// `corruptResult` 直接回退**代码默认规则**——规则被悄悄放宽（漏推/误推），控制台却仍显示
+// 「沿用上次合法规则」。把最近一次成功加载的 override 落盘，新进程才能在降级轮沿用它。
+//
+// 与 filter-rules.applied.json 的分工（不能拿它当 LKG）：
+//   · applied 每轮**无条件**覆盖，连降级轮也写，且内容是「默认 + 覆盖」的合并结果；
+//   · lastgood 只在**成功加载 override** 时写，内容是覆盖文件里实际存在的字段原文（与
+//     `override` 同形状），因此恢复出来的合并结果与上次合法轮逐字段相等。
+//
+// 安全口径：写入走 writeAtomic（0600 + 原子 rename）；读取走 readSafeTextResult（O_NONBLOCK +
+// 普通文件 + 上限），且按覆盖文件同口径复验（白名单/schema/revision/字符串/长度/控制字符）并
+// 校验内容哈希——任何一项不符都当「没有 LKG」，绝不放宽规则。
+// ============================================================
+function lastGoodHash (filter, revision) {
+  // 规范化：只取白名单字符串字段（顺序固定），revision 归一到非负安全整数 ⇒ 同一份规则恒定同哈希。
+  const canonical = JSON.stringify({
+    revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : 0,
+    filter: overrideFieldsOf(filter)
+  })
+  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex')
+}
+
+const lastGoodWarned = new Set()
+function warnLastGoodWrite (filePath, detail) {
+  // LKG 写失败不阻断本轮（规则照常生效），但持续失败会让下一个进程失去降级兜底 ⇒ 必须留痕。
+  // 每个路径只告警一次，避免常驻控制台/循环模式按轮刷屏。
+  if (lastGoodWarned.has(filePath)) return
+  lastGoodWarned.add(filePath)
+  console.warn(`⚠️ 过滤规则 LKG 写入失败（本轮规则照常生效，但下一个进程降级时只能回代码默认）：${filePath}：${detail}`)
+}
+
+function writeLastGoodFile (filePath, filter, revision) {
+  if (typeof filePath !== 'string' || filePath === '') return false
+  try {
+    const override = overrideFieldsOf(filter)
+    const payload = {
+      schema: FILTER_RULES_SCHEMA,
+      revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : 0,
+      hash: lastGoodHash(override, revision),
+      override
+    }
+    const text = JSON.stringify(payload)
+    // 写侧与读侧同口径（读上限 LASTGOOD_MAX_BYTES）：超出就**不写**并留痕，绝不落一个「写成功但
+    // readLastGood 永远读不回」的文件。正常形状下这里恒不触发（覆盖文件能读回就 ≤ 上限，包装 +76）；
+    // 它守的是「以后改包装/改上限时不会静默退化」——否则降级兜底会无声失效，writeLastGoodFile 还返回 true。
+    const bytes = Buffer.byteLength(text, 'utf8')
+    if (bytes > LASTGOOD_MAX_BYTES) {
+      warnLastGoodWrite(filePath, `序列化后 ${bytes} 字节超过 LKG 读上限 ${LASTGOOD_MAX_BYTES} 字节（写出去也读不回，本轮不落盘）`)
+      return false
+    }
+    const ok = writeAtomic(filePath, text, '过滤规则 LKG')
+    if (!ok) warnLastGoodWrite(filePath, 'writeAtomic 返回 false')
+    return ok
+  } catch (e) {
+    warnLastGoodWrite(filePath, safeErrorMessage(e))
+    return false
+  }
+}
+
+/**
+ * 读持久 LKG。任何异常/不合格形态一律返回 null（= 没有 LKG），绝不抛错、绝不部分采用。
+ * 读上限用 LASTGOOD_MAX_BYTES（覆盖文件上限 + 包装预算）：拿 FILTER_RULES_MAX_BYTES 读会把
+ * 「自身合法、只是多了包装」的 LKG 判成 tooLarge ⇒ 静默失效（F4-1 返工 R3）。
+ * @returns {{filter:Object, revision:number}|null}
+ */
+function readLastGood (filePath) {
+  if (typeof filePath !== 'string' || filePath === '') return null
+  try {
+    const read = storage.readSafeTextResult(filePath, LASTGOOD_MAX_BYTES, { openNonBlocking: true })
+    if (!read || read.status !== 'ok' || typeof read.text !== 'string') return null
+    let data
+    try { data = JSON.parse(read.text) } catch (e) { return null }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+    if (data.schema !== FILTER_RULES_SCHEMA) return null
+    if (!Number.isSafeInteger(data.revision) || data.revision < 0) return null
+    const fields = parseOverrideFields(data.override)
+    if (!fields.ok) return null
+    if (typeof data.hash !== 'string' || data.hash !== lastGoodHash(fields.filter, data.revision)) return null
+    return { filter: fields.filter, revision: data.revision }
+  } catch (e) {
+    return null
+  }
+}
+
+function removeLastGood (filePath) {
+  if (typeof filePath !== 'string' || filePath === '') return
+  try {
+    fs.rmSync(filePath, { force: true })
+  } catch (e) {
+    // 删不掉只影响「删覆盖文件后旧规则是否会在降级轮复活」这一条兜底语义，不阻断本轮；
+    // 但它是「删文件 = 恢复默认」承诺的破坏项，必须留痕。
+    console.warn(`⚠️ 过滤规则 LKG 清理失败（删除覆盖文件后旧规则仍可能在降级轮被沿用）：${filePath}：${safeErrorMessage(e)}`)
+  }
+}
+
+// ============================================================
+// F4-3：瞬时读失败不得折叠成「规则文件损坏」
+//
+// `replaced`（读后复检发现 dev/ino 或类型变了）与 `ioError`（读瞬间的 EIO/EBUSY 等）都是**瞬时**
+// 并发事实，不是「这份文件永久不可用」：控制台保存用原子 rename，另一进程在 rename 前后的一瞬
+// 就能让读失败。旧实现一律按损坏降级 ⇒ 白丢一轮合法规则、控制台亮红条（还可被当成「已降级」）。
+// 现在：这两类先退避 50ms 重读一次，仍失败才降级；`unsafe`（确定性非普通文件）与 `tooLarge`
+// 不做重读、直接降级，且**不隔离**（本模块从不移动/改名任何文件）。
+// ============================================================
+const TRANSIENT_READ_RETRY_MS = 50
+
+function sleepMs (ms) {
+  // 本模块读路径全同步（loadFilterRules 在 App.run 开头同步调用），不能 await；Atomics.wait 是
+  // Node 主线程可用的同步睡眠，不占 CPU（忙等会让 50ms 退避变成一次 CPU 尖峰）。
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch (e) {
+    const until = Date.now() + ms
+    while (Date.now() < until) { /* 极端环境（无 SharedArrayBuffer）下的忙等兜底 */ }
+  }
+}
+
+function isTransientReadStatus (status) {
+  return status === 'replaced' || status === 'ioError'
+}
+
+function readRulesFile (filePath) {
+  return storage.readSafeTextResult(filePath, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
+}
+
+function corruptResult (defaults, keyword, message, key, lastGoodFile) {
+  // 损坏降级：优先本目录的 last-known-good（先进程内缓存，其次持久 LKG 文件——后者是「新进程」场景
+  // 的唯一来源）；两者都没有才回代码默认。
   // 两种情形都标记 degraded:true + source:'corrupt'，由运行侧做三处告警并跳过 _f 清理/hash 推进。
-  const lastGood = key === undefined ? null : lastGoodByDir.get(key)
+  let lastGood = key === undefined ? null : lastGoodByDir.get(key)
+  if (!lastGood) {
+    const persisted = readLastGood(lastGoodFile)
+    if (persisted) {
+      // 读到的持久 LKG 与成功加载同样可信（同口径复验 + 哈希校验）：顺手回填进程内缓存，
+      // 免得同一进程的后续轮次每轮重读。损坏读绝不会覆盖进程内已有的合法值（上面的 if 已挡住）。
+      lastGood = persisted
+      if (key !== undefined) lastGoodByDir.set(key, { filter: { ...persisted.filter }, revision: persisted.revision })
+    }
+  }
   if (lastGood) {
     const merged = mergeActiveFilter({ defaults, keyword, override: lastGood.filter })
     return {
@@ -563,35 +729,56 @@ function corruptResult (defaults, keyword, message, key) {
   }
 }
 
-function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
+function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGood }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
-  // 两道「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
+  // 两条「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
   // + 读后复检 inode，末级是链接直接判 unsafe），收紧走 enforceOwnerOnlyMode（O_NOFOLLOW 打开、
   // 对比 lstat 的 dev/ino、只在已校验的 fd 上 fchmod 并按同一 fd 复检）——任一处被换成链接都不会读到、
   // 更不会 chmod 到链接目标。
-  const read = readSafeTextResult(paths.file, FILTER_RULES_MAX_BYTES)
+  // F4-2：openNonBlocking —— 裸 O_RDONLY 打开无写者的 FIFO 会同步阻塞（无日志、无退出码），
+  // 控制台每 5 秒 spawn 的单轮进程会永久挂死；O_NONBLOCK 下 open FIFO 立刻 ENXIO ⇒ unsafe，
+  // 随后的 fstat 普通文件校验同样拒绝一切非普通文件。下同（applied / LKG 读取）。
+  let read = readRulesFile(paths.file)
+  if (isTransientReadStatus(read.status)) {
+    // F4-3：replaced / ioError 是瞬时并发事实（另一进程原子 rename 覆盖文件的那一瞬），
+    // 退避 50ms 重读一次再判降级——否则会白丢一轮合法规则并误报损坏。
+    sleepMs(TRANSIENT_READ_RETRY_MS)
+    read = readRulesFile(paths.file)
+  }
   if (read.status === 'missing') {
-    // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废。
+    // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废（进程内缓存 + 持久 LKG 一起清）。
     // 否则「删文件 → 之后又出现畸形文件」会把早已废弃的旧规则复活成生效规则（A4）。
+    // R1-5：控制台读面（persistLastGood:false）连这一步也不做——删除同样是写盘，而「删文件=恢复默认」
+    // 由运行侧下一轮加载负责；读面代删会让 GET /api/config/filter 变成写操作（SYSTEM_CONTRACT:56 零写盘）。
     lastGoodByDir.delete(key)
+    if (persistLastGood !== false) removeLastGood(paths.lastgood)
     const merged = mergeActiveFilter({ defaults, keyword })
     return { ...merged, override: {}, source: 'default', revision: 0, degraded: false, lastGoodUsed: false }
   }
   if (read.status !== 'ok') {
-    // unsafe / replaced / tooLarge / ioError：全部按损坏处理（安全读已保证不泄露非普通文件内容）。
-    return corruptResult(defaults, keyword, `覆盖文件不可读（${read.status}）`, key)
+    // unsafe（open ELOOP / fstat 非普通文件，确定性）与 tooLarge（确定性）不做重读、直接降级，
+    // 且**不隔离**：本模块从不移动/改名任何文件（覆盖文件是用户资产，隔离它等于替用户做决定）；
+    // replaced / ioError 已在上面重读过一次，到这里说明仍未恢复。
+    return corruptResult(defaults, keyword, `覆盖文件不可读（${read.status}）`, key, paths.lastgood)
   }
   const modeCheck = enforceOwnerOnlyMode(paths.file)
-  if (!modeCheck.ok) return corruptResult(defaults, keyword, modeCheck.message, key)
+  if (!modeCheck.ok) return corruptResult(defaults, keyword, modeCheck.message, key, paths.lastgood)
   const parsed = parseStoredRules(read.text)
-  if (!parsed.ok) return corruptResult(defaults, keyword, parsed.message, key)
+  if (!parsed.ok) return corruptResult(defaults, keyword, parsed.message, key, paths.lastgood)
   const deepError = deepValidationError(parsed, deps)
-  if (deepError) return corruptResult(defaults, keyword, deepError, key)
+  if (deepError) return corruptResult(defaults, keyword, deepError, key, paths.lastgood)
 
   // 只有通过（结构 + 可选深度）校验的文件才更新本目录的 last-known-good；损坏读绝不覆盖它。
   lastGoodByDir.set(key, { filter: { ...parsed.filter }, revision: parsed.revision })
+  // F4-1：同步落盘一份持久 LKG——控制台 auto-run 每 5 秒 spawn 单轮进程，进程内 Map 对新进程等于不存在。
+  // 写失败只告警（本轮规则照常生效，降级兜底质量下降），绝不抛穿本轮。
+  // R1-5：控制台的 GET 读面（/api/config/filter、/draft）也走本函数，但它是**纯读**端点
+  // （SYSTEM_CONTRACT:27/:56：控制台读取面零写盘）。若在这里无条件落盘，每拍 GET 都会新建/重写
+  // filter-rules.lastgood.json，缓存目录对控制台只读时还会每次刷一条「LKG 写入失败」错误。
+  // 故写入由调用方显式声明：persistLastGood=false 时一个字节都不写（含删除），运行侧保持默认 true。
+  if (persistLastGood !== false) writeLastGoodFile(paths.lastgood, parsed.filter, parsed.revision)
   const merged = mergeActiveFilter({ defaults, keyword, override: parsed.filter })
   return {
     ...merged,
@@ -607,8 +794,10 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps }) {
 /**
  * 读取覆盖文件并返回本轮的生效规则（每轮 App.run 开头调用一次）。
  * 任何异常都不得抛穿；文件不存在 → source:'default'、revision:0、filter 为代码默认深拷贝。
- * @param {{cacheDir:string, defaults:Object, keyword:Object,
+ * @param {{cacheDir:string, defaults:Object, keyword:Object, persistLastGood?:boolean,
  *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options
+ *   persistLastGood=false（R1-5）：纯读模式——不写/不删 <缓存目录>/filter-rules.lastgood.json，
+ *   供控制台读面（GET /api/config/filter、GET /api/config/filter/draft）使用；缺省 true（运行侧）。
  *   deps 可选：提供且引擎可用时，读路径在结构校验之后再跑 validateFilterRules 的五道闸（A1；
  *   其中「整份字节预算」闸不作用于读路径，`fromDisk` 跳过）；
  *   不提供时保持「只做结构校验」的既有契约（console/qinglong 等调用方无需改造）。
@@ -625,11 +814,14 @@ function loadFilterRules (options) {
       cacheDir: opts.cacheDir,
       defaults: opts.defaults,
       keyword: opts.keyword,
-      deps: opts.deps
+      deps: opts.deps,
+      persistLastGood: opts.persistLastGood
     })
   } catch (e) {
     // 兜底：读盘/解析/合并的任何未预期异常都收敛成降级结果（绝不杀整轮 run）。
-    return corruptResult(opts.defaults, opts.keyword, `覆盖文件读取异常：${safeErrorMessage(e)}`, key)
+    let lkgFile = ''
+    try { lkgFile = filterRulesPaths(opts.cacheDir).lastgood } catch (e2) { lkgFile = '' }
+    return corruptResult(opts.defaults, opts.keyword, `覆盖文件读取异常：${safeErrorMessage(e)}`, key, lkgFile)
   }
 }
 
@@ -638,7 +830,7 @@ function loadFilterRules (options) {
  * 快照是诊断/验收用：证明「本轮实际生效的是哪一版规则」，不参与规则读取。
  * @returns {boolean} 写入是否成功（失败只返回 false，不抛错）
  */
-function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, hash } = {}) {
+function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, hash, lastGoodUsed } = {}) {
   const paths = filterRulesPaths(cacheDir)
   const snapshotFilter = {}
   for (const field of FILTER_RULE_FIELDS) snapshotFilter[field] = safeString(safeGet(filter, field))
@@ -648,10 +840,25 @@ function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, ha
     source: source === 'override' || source === 'corrupt' ? source : 'default',
     hash: safeString(hash),
     appliedAt: new Date().toISOString(),
+    // F4-1：本轮是否沿用了持久 LKG。这是控制台 GET 的唯一口径来源——控制台进程自己的
+    // lastGood 与运行侧无关，不得用它冒充「运行侧这轮用了什么」。
+    lastGoodUsed: lastGoodUsed === true,
     filter: snapshotFilter,
     keyword: normalizeKeyword(keyword, { forSnapshot: true })
   }
   return writeAtomic(paths.applied, JSON.stringify(snapshot), '过滤规则生效快照')
+}
+
+/**
+ * 运行侧口径的 lastGoodUsed：只认**本轮生效快照**（applied.json）。
+ * 控制台进程读文件时自己也会产出 LKG（同一份 filter-rules.lastgood.json），但那是「下一次降级
+ * 可以用什么」，与「上一轮运行实际用了什么」是两件事——GET 不得拿它冒充运行侧状态。
+ * 判据与运行侧写入口径一致：只有 source==='corrupt' 且 lastGoodUsed===true 才算「本轮沿用了 LKG」。
+ * @returns {boolean}
+ */
+function appliedLastGoodUsed (snapshot) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false
+  return snapshot.source === 'corrupt' && snapshot.lastGoodUsed === true
 }
 
 /**
@@ -661,7 +868,7 @@ function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, ha
 function readAppliedSnapshot (cacheDir) {
   let read
   try {
-    read = readSafeTextResult(filterRulesPaths(cacheDir).applied, FILTER_RULES_MAX_BYTES)
+    read = storage.readSafeTextResult(filterRulesPaths(cacheDir).applied, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
   } catch (e) {
     return { status: 'ioError', error: { code: 'read_failed', message: safeErrorMessage(e) } }
   }
@@ -684,6 +891,10 @@ function readAppliedSnapshot (cacheDir) {
   }
   if (typeof snapshot.appliedAt !== 'string' || snapshot.appliedAt === '') {
     return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照缺少 appliedAt' } }
+  }
+  // lastGoodUsed 是 v3.406 起写入的字段：旧快照缺省按 false 读（向后兼容），出现则必须是布尔。
+  if (snapshot.lastGoodUsed !== undefined && typeof snapshot.lastGoodUsed !== 'boolean') {
+    return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 lastGoodUsed 必须是布尔值' } }
   }
   if (!snapshot.filter || typeof snapshot.filter !== 'object' || Array.isArray(snapshot.filter)) {
     return { status: 'invalid', error: { code: 'invalid_schema', message: '生效快照 filter 必须是对象' } }
@@ -716,19 +927,36 @@ function readAppliedSnapshot (cacheDir) {
   return { status: 'ok', snapshot }
 }
 
-// 仅测试：清空进程内 last-known-good（全部 cacheDir 槽位）。生产代码不得调用（每轮 run 由真实读盘决定）。
+// 仅测试：清空进程内 last-known-good（全部 cacheDir 槽位）**并删除对应的持久 LKG**。
+// 生产代码不得调用（每轮 run 由真实读盘决定）。为什么连持久 LKG 一起删：`lastGoodByDir` 的键
+// 就是各目录，测试用本函数模拟「全新进程」；F4-1 之后全新进程仍能从 lastgood.json 恢复，
+// 不删文件会让「清空即无 LKG」的既有用例（以及后续用例的隔离前提）失真。
 function resetStoreStateForTests () {
+  for (const dir of lastGoodByDir.keys()) {
+    const lkgFile = filterRulesPaths(dir).lastgood
+    try {
+      fs.rmSync(lkgFile, { force: true })
+    } catch (e) {
+      console.warn(`⚠️ 测试清空 LKG 失败（可能影响后续用例隔离）：${lkgFile}：${safeErrorMessage(e)}`)
+    }
+  }
   lastGoodByDir.clear()
 }
 
 module.exports = {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
+  // LKG 包装层的读上限（仅测试用：断言「写出的 LKG 必须 ≤ 读上限」这条不变式）
+  LASTGOOD_MAX_BYTES,
   filterRulesPaths,
   validateFilterRules,
   mergeActiveFilter,
   loadFilterRules,
+  // 仅供测试直调（生产代码只经 loadFilterRules / corruptResult 使用）：验证「写侧不得产出读不回的文件」
+  writeLastGoodFile,
+  readLastGood,
   writeAppliedSnapshot,
+  appliedLastGoodUsed,
   readAppliedSnapshot,
   resetStoreStateForTests
 }
