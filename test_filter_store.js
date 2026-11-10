@@ -1084,7 +1084,7 @@ test('F4-3 重读仍失败 → 降级且只重试一次（不无限重读、不�
   resetStoreStateForTests()
   const dir = makeDir()
   writeJson(filterRulesPaths(dir).file, { schema: 1, revision: 5, filter: { pingbibiaoti: '永远换不到' } })
-  const before = fs.readdirSync(dir).sort()
+  const before = fs.readdirSync(dir).sort(byCodeUnit)
   const { result, calls } = withInjectedReads(['replaced', 'replaced'], () =>
     loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} }))
   const ruleReads = calls.filter(c => c.p === filterRulesPaths(dir).file)
@@ -1093,7 +1093,7 @@ test('F4-3 重读仍失败 → 降级且只重试一次（不无限重读、不�
   assert.strictEqual(result.degraded, true)
   assert.strictEqual(result.lastGoodUsed, false, '没有 LKG 时回代码默认')
   assert.match(String(result.error.message), /replaced/, '降级原因必须保留读状态（排障要看得到 replaced/ioError）')
-  assert.deepStrictEqual(fs.readdirSync(dir).sort(), before, '降级不得隔离/改名/新建任何文件（本模块从不移动用户文件）')
+  assert.deepStrictEqual(fs.readdirSync(dir).sort(byCodeUnit), before, '降级不得隔离/改名/新建任何文件（本模块从不移动用户文件）')
 })
 
 test('F4-3 unsafe / tooLarge 是确定性判据：直接降级、不做重读', () => {
@@ -1150,7 +1150,7 @@ test('F4-1 成功加载 override 后落盘持久 LKG（0600、{schema,revision,h
   assert.strictEqual(fs.existsSync(paths.lastgood), true, '成功加载 override 必须写 filter-rules.lastgood.json（否则新进程没有降级兜底）')
   assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, 0o600, 'LKG 必须是 0600（含用户规则正文）')
   const lkg = readJson(paths.lastgood)
-  assert.deepStrictEqual(Object.keys(lkg).sort(), ['hash', 'override', 'revision', 'schema'], `LKG 形状必须恰为 {schema,revision,hash,override}：${JSON.stringify(Object.keys(lkg))}`)
+  assert.deepStrictEqual(Object.keys(lkg).sort(byCodeUnit), ['hash', 'override', 'revision', 'schema'], `LKG 形状必须恰为 {schema,revision,hash,override}：${JSON.stringify(Object.keys(lkg))}`)
   assert.strictEqual(lkg.schema, 1)
   assert.strictEqual(lkg.revision, 7)
   assert.match(lkg.hash, /^[0-9a-f]{64}$/, 'hash 必须是内容摘要（sha256 十六进制）')
@@ -1658,7 +1658,7 @@ test('I2/R1-5 控制台读面零写盘：persistLastGood:false 的纯读不新�
   const dir = makeDir()
   const paths = filterRulesPaths(dir)
   writeJson(paths.file, { schema: 1, revision: 3, filter: { pingbibiaoti: '读面规则' } })
-  const listing = () => fs.readdirSync(dir).sort()
+  const listing = () => fs.readdirSync(dir).sort(byCodeUnit)
 
   const first = loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, persistLastGood: false })
   assert.strictEqual(first.source, 'override', '前置：覆盖文件必须被正常加载')
@@ -1712,7 +1712,7 @@ const http = require('node:http')
 const { createConsole } = require('./scripts/console')
 const dir = process.env.XBK_FIFO_DIR
 const token = 'probe-token-0123456789'
-const snap = () => fs.readdirSync(dir).sort().map((name) => {
+const snap = () => fs.readdirSync(dir).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).map((name) => {
   const st = fs.lstatSync(path.join(dir, name))
   return name + ':' + st.ino + ':' + st.mtimeMs
 })
