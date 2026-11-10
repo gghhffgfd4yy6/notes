@@ -4621,6 +4621,59 @@ checkAsync('F3-1 replaced 后重读成功 ⇒ 正常使用窗口（不丢历史�
   })
 })
 
+checkAsync('F3-1 invalid→ok：首读半写 JSON 解析失败必须重读复核，重读成功即正常使用（不隔离、只重读一次）', async () => {
+  let similarReads = 0
+  const stub = (p, max, opts) => {
+    if (p.includes('similar-')) {
+      similarReads++
+      // 首读模拟「别的进程还写到一半」：状态 ok、text 是半写 JSON ⇒ 解析失败（invalid）。
+      if (similarReads === 1) return { status: 'ok', text: '[{"t":"半写窗口标题' }
+    }
+    return realReadSafeTextResult(p, max, opts)
+  }
+  await withRunHarness({ readSafeTextResult: stub }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const title = '半写窗口重读确认标题甲乙'
+    const original = JSON.stringify([{ t: title, at: Date.now(), c: '', p: '', x: '' }])
+    realFs.writeFileSync(simPath, original)
+    const mtimeBefore = realFs.statSync(simPath).mtimeMs
+    h.setItems([makeRunItem('iv-ok-1', title)])
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(similarReads, 2, `首读解析失败必须重读复核一次（实际读 ${similarReads} 次）`)
+    assert.strictEqual(summary.pushed, 0, '窗口里重读到的标题与本轮条目近似 ⇒ 必须判重不推（证明本轮真的用了重读数据）')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    const summaryLine = log.split('\n').find(l => l.includes('total=1') && l.includes('pushed=0'))
+    assert.ok(summaryLine, `必须写本轮摘要行：${log.slice(-400)}`)
+    assert.ok(/ similar=1/.test(summaryLine), `摘要行必须带 similar=1（重读到的窗口数据被用于判重）：${summaryLine}`)
+    assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.includes('.corrupt-')), [],
+      '首读解析失败但重读成功 ⇒ 不得把有效窗口 rename 成 .corrupt-*')
+    assert.strictEqual(realFs.readFileSync(simPath, 'utf8'), original, '本轮无新增推送 ⇒ 窗口内容必须原样保留')
+    assert.strictEqual(realFs.statSync(simPath).mtimeMs, mtimeBefore, '窗口 mtime 必须不变（没被写、没被 rename）')
+  })
+})
+
+checkAsync('F3-1 两次都 invalid：重读复核后恰好 1 个 .corrupt-*、窗口重建为 []', async () => {
+  let similarReads = 0
+  const stub = (p, max, opts) => {
+    if (p.includes('similar-')) {
+      similarReads++
+      return { status: 'ok', text: '[{"t":"两次都半写' } // 两次读都是半写 JSON ⇒ 确定性损坏
+    }
+    return realReadSafeTextResult(p, max, opts)
+  }
+  await withRunHarness({ readSafeTextResult: stub }, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const prefix = path.basename(simPath) + '.corrupt-'
+    realFs.writeFileSync(simPath, JSON.stringify([{ t: '有效窗口标题甲乙丙丁', at: Date.now(), c: '', p: '', x: '' }]))
+    h.setItems([])
+    await runWithWarnings(h.App)
+    assert.strictEqual(similarReads, 2, `解析失败必须先重读复核（实际读 ${similarReads} 次）`)
+    const backups = realFs.readdirSync(cacheDir).filter(n => n.startsWith(prefix))
+    assert.strictEqual(backups.length, 1, `两次都 invalid 只允许 1 个隔离件：${JSON.stringify(backups)}`)
+    assert.deepStrictEqual(JSON.parse(realFs.readFileSync(simPath, 'utf8')), [], '隔离后必须重建空窗口')
+  })
+})
+
 checkAsync('F3-1/F3-3 非法 JSON：单轮恰好 1 个 .corrupt-*、窗口重建为 []；连续 12 轮 ≤10 份（真实轮末回收）', async () => {
   await withRunHarness({}, async (h, cacheDir, realFs) => {
     const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
