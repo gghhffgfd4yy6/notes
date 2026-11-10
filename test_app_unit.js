@@ -3331,7 +3331,7 @@ checkAsync('FR-2 覆盖文件损坏：沿用进程内 last-known-good，保留 _
 checkAsync('FR-3 首次加载即损坏（无 last-known-good）：回代码默认、告警 lastGoodUsed=false，仍不清 _f/不推进 hash', async () => {
   const realFs = require('fs')
   const FilterStore = require('./xbk_filter_store')
-  FilterStore.resetStoreStateForTests() // 关键：清掉进程内 last-known-good，模拟「本进程从未读到合法文件」
+  FilterStore.resetStoreStateForTests() // 关键：清掉 LKG（进程内缓存 + 持久 lastgood.json），模拟「没有任何合法历史规则」
   const cacheDir = mkTmpFixture('filter-run-')
   const prevEnvDir = process.env.XBK_CACHE_DIR
   const prevDryRun = process.env.XBK_DRY_RUN

@@ -1587,7 +1587,9 @@ function createApp ({
         // 必须放在本轮开头且只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则；
         // active 每轮新建，禁止提升到模块级（否则常驻进程会跨轮陈旧，控制台的修改永不生效）。
         // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
-        // 优先沿用进程内 last-known-good，本进程从未读到合法文件才回代码默认。
+        // 降级顺序是「进程内缓存 → 持久 LKG <缓存目录>/filter-rules.lastgood.json → 代码默认」：
+        // 新进程（控制台 auto-run 每 5 秒 spawn 一轮）没有进程内缓存，仍会先读持久 LKG，
+        // 只有连持久 LKG 也不可用时才回代码默认。
         const active = FilterStore.loadFilterRules({
           cacheDir: this._cacheDir(),
           defaults: Config.filter,
