@@ -4789,13 +4789,25 @@ checkAsync('F3-1 两进程并发写窗口 100 次：读取侧不产生 .corrupt-
     // 两个写进程各写 50 次 = 100 次原子 rename；父进程同时反复读，逼出 replaced/ioError。
     const children = [0, 1].map(() => spawn(process.execPath,
       ['-e', script, storagePath, simPath, '50', String(startAt)], { cwd: __dirname, stdio: 'ignore' }))
-    const allDone = Promise.all(children.map(c => new Promise((resolve) => c.on('exit', (code, signal) => resolve({ code, signal })))))
-    let done = false
+    // SonarCloud javascript:S9383（R3-4）：`allDone.then(() => { done = true })` 是未 await、无 rejection
+    // handler 的浮动 Promise（rejection 会被静默吞掉）。改为子进程退出计数：每个 exit 记 code/signal 并递减
+    // pending，归零时 resolve；busy-wait 循环直接看 pending（不再依赖浮动 then 翻标志），
+    // `await allDone` 取回与轮询同源的退出结果。
+    const exits = new Array(children.length)
+    let pending = children.length
+    const allDone = new Promise((resolve) => {
+      children.forEach((c, i) => {
+        c.on('exit', (code, signal) => {
+          exits[i] = { code, signal }
+          pending -= 1
+          if (pending === 0) resolve(exits)
+        })
+      })
+    })
     let corruptSeen = 0
     let reads = 0
-    allDone.then(() => { done = true })
     for (;;) {
-      if (done) break
+      if (pending === 0) break
       const res = h.App._readSimilarWindow(simPath)
       if (res.corrupt) corruptSeen++
       reads++
