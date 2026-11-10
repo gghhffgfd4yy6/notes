@@ -287,7 +287,13 @@ const CONSOLE_SETTINGS_MAX_BYTES = 64 * 1024
 const AUTO_MIN_S = 3
 const AUTO_MAX_S = 20
 const AUTO_DEFAULT_S = 10
-const AUTO_MAX_FAILS = 3
+const AUTO_MAX_FAILS = 12
+// v3.408：连续失败达到上限后不再永久停机（源站抖动 20 分钟会让推送一直停到人工点开）。
+// 转入降级重试：固定 10 秒一轮，成功一轮即恢复原间隔。达到 12 次的时间取决于当前间隔
+// （默认 10 秒时约 2 分钟，5 秒时约 1 分钟），不是固定 1 分钟。
+const AUTO_RETRY_MS = 10 * 1000
+// 子进程启动失败（ENOENT/EMFILE）每 10 秒重试也起不来，3 次即永久停机。
+const AUTO_MAX_SPAWN_FAILS = 3
 const AUTO_STATE_FILE = 'console-auto.json'
 // 分时段间隔：最多 8 条窗口，窗口内的间隔允许放宽到 600 秒（主间隔仍是 3–20 秒）。
 const AUTO_SCHEDULE_MAX = 8
@@ -653,6 +659,7 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     output: '',
     outputTotalLength: 0,
     cancelled: false,
+    spawnError: false, // v3.408：spawn 异步失败标记（ENOENT/EMFILE），自动调度据此不再无限重试
     // 锁归属（startAction 内登记，exit 可能早于调用方后续赋值：收尾必须能直接释放锁）。
     // lockDir = 锁文件所在目录（控制台 stateDir）；cacheDir = 子进程 run.log 写入目录。
     _stateDir: lockDir || cacheDir,
@@ -717,6 +724,7 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     // 也不能把 run 永久留在「运行中」。close 事件在 spawn error 后仍会触发，
     // 这里只登记原因，收尾交给 close。
     // 绕过 append 直改 output：计数器必须同步加（漏加会让 reset 判据失真，§1.3 理由）。
+    record.spawnError = true
     const note = `\n[console] 子进程启动失败：${err && err.message ? err.message : String(err)}\n`
     record.output += note
     record.outputTotalLength += note.length
@@ -3597,6 +3605,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     nextAt: 0,
     runs: 0,
     fails: 0,
+    degraded: false,
+    spawnFails: 0,
     lastError: '',
     lastRunId: null
   }
@@ -3610,6 +3620,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       if (loadedSchedule.ok) auto.schedule = loadedSchedule.value
       else console.error(`⚠️ 自动运行分时段配置无效，已忽略：${loadedSchedule.error}`)
       if (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) auto.updatedAt = raw.updatedAt
+      // v3.408：降级态与连续失败数一并恢复；只认布尔/非负整数，脏数据按未降级处理。
+      if (raw.degraded === true) auto.degraded = true
+      if (Number.isInteger(raw.fails) && raw.fails >= 0) auto.fails = raw.fails
     }
   } catch (e) {
     if (!e || e.code !== 'ENOENT') {
@@ -3629,6 +3642,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     nextAt: auto.nextAt,
     runs: auto.runs,
     fails: auto.fails,
+    degraded: auto.degraded,
     lastError: auto.lastError,
     lastRunId: auto.lastRunId
   })
@@ -3642,6 +3656,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         on: auto.on,
         interval: auto.interval,
         schedule: auto.schedule.map((r) => ({ start: r.start, end: r.end, interval: r.interval })),
+        // v3.408：降级态必须跨重启保留，否则源站持续故障时重启又要重新撞 12 次才恢复 10 秒重试。
+        degraded: auto.degraded === true,
+        fails: Number.isInteger(auto.fails) ? auto.fails : 0,
         updatedAt: auto.updatedAt
       }), '自动运行状态')) return true
       console.error('⚠️ 自动运行状态落盘失败（进程内仍生效）')
@@ -3661,6 +3678,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   function stopAuto (reason = '') {
     clearAutoTimer()
     auto.on = false
+    auto.degraded = false
+    auto.spawnFails = 0
     auto.nextAt = 0
     auto.lastError = reason
     persistAuto()
@@ -3672,6 +3691,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     const base = eff.interval * 1000
     const delay = eff.untilChangeMs > 0 ? Math.min(base, eff.untilChangeMs) : base
     return Math.max(1000, delay)
+  }
+  // v3.408：降级态下所有排程入口都必须走 10 秒——活动子进程/锁忙/保存设置/导入备份
+  // 这些路径若继续用 autoDelayMs()，会把「10 秒重试」悄悄拖回 5–600 秒。
+  function autoNextDelay () {
+    return auto.degraded ? AUTO_RETRY_MS : autoDelayMs()
   }
   function scheduleAuto (delayMs) {
     clearAutoTimer()
@@ -3688,7 +3712,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (!auto.on || shuttingDown) return
     // 手动/上一次自动运行还没结束：不叠跑，按间隔再试。
     if (autoInFlightId || activeChildren.size > 0) {
-      scheduleAuto(autoDelayMs())
+      scheduleAuto(autoNextDelay())
       return
     }
     const now = Date.now()
@@ -3702,11 +3726,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         auto.lastError = `锁获取失败：${lockVerdict.error && lockVerdict.error.message ? lockVerdict.error.message : lockVerdict.error}`
         console.error(`⚠️ 自动运行锁获取失败（stateDir=${stateDir}）：${auto.lastError}`)
         if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次锁获取失败，已停止`)
-        else scheduleAuto(autoDelayMs())
+        else scheduleAuto(autoNextDelay())
         return
       }
       // 青龙/另一控制台实例持锁：不抢跑，也不计失败。
-      scheduleAuto(autoDelayMs())
+      scheduleAuto(autoNextDelay())
       return
     }
     let record
@@ -3717,7 +3741,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       auto.fails += 1
       auto.lastError = `启动失败：${e && e.message ? e.message : e}`
       if (auto.fails >= AUTO_MAX_FAILS) stopAuto(`连续 ${AUTO_MAX_FAILS} 次启动失败，已停止`)
-      else scheduleAuto(autoDelayMs())
+      else scheduleAuto(autoNextDelay())
       return
     }
     record._lockAt = now
@@ -3731,25 +3755,44 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       autoWaitTimer = null
       if (autoInFlightId !== record.id) return
       autoInFlightId = null
+      // 停止/关闭期间完成的轮次不得把状态改回 degraded（stopAuto 已清空，这里再写就是幽灵态）。
+      if (!auto.on || shuttingDown) return
       const failed = record.exitCode !== 0 || record.timedOut || record.cancelled
       if (failed) {
         auto.fails += 1
         auto.lastError = `最近一轮失败（exit ${record.exitCode}）`
-        if (auto.fails >= AUTO_MAX_FAILS) {
-          stopAuto(`连续 ${AUTO_MAX_FAILS} 轮失败，已停止`)
-          return
+        // 子进程启动失败（spawn ENOENT/EMFILE）是确定性环境错误，不是源站抖动：
+        // 连续 3 次就永久停机，避免每 10 秒无限重试一个根本起不来的进程。
+        if (record.spawnError) {
+          auto.spawnFails += 1
+          if (auto.spawnFails >= AUTO_MAX_SPAWN_FAILS) {
+            stopAuto(`连续 ${AUTO_MAX_SPAWN_FAILS} 次子进程启动失败，已停止`)
+            return
+          }
+        } else {
+          auto.spawnFails = 0
+          if (auto.fails >= AUTO_MAX_FAILS) {
+            // v3.408：不再永久停机。源站抖动/短时断网 20 分钟会一直停到人工点开；
+            // 改为 10 秒一轮的降级重试，成功一轮自动恢复原间隔（on 保持 true，重启也继续）。
+            if (!auto.degraded) console.warn(`⚠️ 连续 ${AUTO_MAX_FAILS} 轮失败，转入 10 秒降级重试：${auto.lastError}`)
+            auto.degraded = true
+            auto.lastError = `连续 ${auto.fails} 轮失败，10 秒后重试：${auto.lastError}`
+          }
         }
       } else {
+        if (auto.degraded) console.log('✅ 自动运行已恢复：源站可用，回到正常间隔')
+        auto.degraded = false
         auto.fails = 0
+        auto.spawnFails = 0
         auto.lastError = ''
       }
-      if (auto.on) scheduleAuto(autoDelayMs())
+      if (auto.on) scheduleAuto(autoNextDelay())
     }, 250)
     if (typeof autoWaitTimer.unref === 'function') autoWaitTimer.unref()
   }
   if (auto.on) {
     auto.startedAt = Date.now()
-    scheduleAuto(autoDelayMs())
+    scheduleAuto(autoNextDelay())
   }
   // 读取持久化重放记录：返回 { entries, problem }。
   // problem = null：正常，或文件根本不存在（首次启动）。非空字符串：**文件在、但读不出来**
@@ -4771,7 +4814,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
             abortImport('auto', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
-          if (auto.on) scheduleAuto(autoDelayMs())
+          if (auto.on) scheduleAuto(autoNextDelay())
           imported.autoInterval = plans.auto.interval
           imported.autoSchedule = auto.schedule.length
         }
@@ -4809,7 +4852,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         // 所有文件都成功后才删草稿：中途失败时草稿仍是导入前那份，便于继续编辑。
         if (plans.filter) clearFilterDraftFile()
         // 间隔已成功落盘，再调整待执行的定时器；自动运行开关本身始终不变。
-        if (plans.auto && auto.on) scheduleAuto(autoDelayMs())
+        if (plans.auto && auto.on) scheduleAuto(autoNextDelay())
         const response = {
           ok: true,
           imported,
@@ -6594,6 +6637,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
               auto.startedAt = Date.now()
               auto.runs = 0
               auto.fails = 0
+              auto.degraded = false
+              auto.spawnFails = 0
               auto.lastError = ''
             }
             if (!persistAuto()) {
@@ -6601,7 +6646,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
               return
             }
             // 有在途轮次时不重排；它结束后按新间隔排下一轮。
-            if (!autoInFlightId) scheduleAuto(autoDelayMs())
+            if (!autoInFlightId) scheduleAuto(autoNextDelay())
           } else {
             auto.interval = interval
             auto.schedule = schedule
