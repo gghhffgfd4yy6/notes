@@ -11091,13 +11091,22 @@ process.stdout.write(JSON.stringify({ statuses, ms: Date.now() - t0 }))
     }
   })
 
-  // similar-<cache>.json 的读取内联在 App.run 里（同一函数中还有网络抓取），无法在不跑整轮的前提下
-  // 做行为级 FIFO 探针；这里按源码锁住「该调用点必须带 openNonBlocking」——回退这一行即变红。
-  await test('F4-2 similar-<cache>.json 读取必须 openNonBlocking（内联路径按源码锁定）', () => {
+  // similar-<cache>.json 的读取经 App._readSimilarWindow（F3-1 从 run() 内联搬出：run() 里还有网络抓取，
+  // 无法在不跑整轮的前提下做行为级 FIFO 探针）；这里按源码锁住「该读取点必须带 openNonBlocking」——
+  // 回退这一行（或把读取挪去别处绕过本函数）即变红。
+  await test('F4-2 similar-<cache>.json 读取必须 openNonBlocking（_readSimilarWindow 读取点按源码锁定）', () => {
     const src = require('node:fs').readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-    const line = src.split('\n').find(l => l.includes('readSafeTextResult(similarPath'))
-    assertEqual(Boolean(line), true, 'xbk_app.js 里必须仍有 readSafeTextResult(similarPath, …) 这处读取（找不到说明改动把入口改名了，需同步本断言）')
+    const start = src.indexOf('_readSimilarWindow (filePath)')
+    assertEqual(start >= 0, true, 'xbk_app.js 里必须仍有 _readSimilarWindow(filePath) 这处读取入口（找不到说明改动把入口改名了，需同步本断言）')
+    const end = src.indexOf('\n    },', start)
+    assertEqual(end > start, true, '必须能定位 _readSimilarWindow 的方法体边界（找不到说明方法结构已变，需同步本断言）')
+    const body = src.slice(start, end)
+    const line = body.split('\n').find(l => l.includes('readSafeTextResult('))
+    assertEqual(Boolean(line), true, '_readSimilarWindow 方法体内必须仍用 readSafeTextResult(…) 读取窗口（找不到说明读取被换成别的入口，需同步本断言）')
     assertEqual(line.includes('openNonBlocking: true'), true, `similar-<cache>.json 读取必须传 openNonBlocking:true（FIFO 会挂死整轮）：${line.trim()}`)
+    // 接线也不许断：窗口路径必须按推送源命名，run() 必须经 _readSimilarWindow 读取（防止读取点被搬走/复制后本断言锁错对象）
+    assertEqual(/similar-\$\{cacheName\}/.test(src), true, '窗口路径必须仍是 similar-<cacheName>（按推送源隔离）')
+    assertEqual(src.includes('this._readSimilarWindow(similarPath)'), true, 'run() 必须经 this._readSimilarWindow(similarPath) 读取窗口')
   })
 
   await test('P4 _warnLowDisk 限流内与未配置阈值均静默', () => {
