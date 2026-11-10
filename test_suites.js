@@ -97,7 +97,7 @@ const SUITES = [
   // C5-083（口径）：desc 此前只列 3 个方法（_isValidReportDate/_loadReportState/_normalizeReportState），
   // 与套件的真实覆盖严重不符 —— 实测 243 例，覆盖报告/状态、日志写入、告警/模板三大簇 + RE2 警告标记
   // 生命周期 + 通道健康降级 + 覆盖文件按轮生效。desc 按簇列出，避免读者把它当成「只测 3 个方法」。
-  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 进程内 243 例：报告/状态簇（_isValidReportDate/_blankReportState/_safeCounter/_normalizeReportState/_loadReportState/_reportToday/_persistReportState）+ 日志写入簇（_writeRunLog/_warnLowDisk/_writeState/_writeTextAtomic/_isRegularOrMissing/_localStamp）+ 告警/模板簇（_enabledFlag/_validateTplConfig/_accumulateReport/_sendCrossDayReport/_updateReport/_sendAlert）+ RE2 警告标记生命周期/通道健康降级/PID 复用/覆盖文件按轮生效 FR-1..3/DR-1 dry-run' },
+  { name: '应用状态与日报单元', file: 'test_app_unit.js', desc: 'xbk_app.js 进程内 310 例：报告/状态簇（_isValidReportDate/_blankReportState/_safeCounter/_normalizeReportState/_loadReportState/_reportToday/_persistReportState）+ 日志写入簇（_writeRunLog/_warnLowDisk/_writeState/_writeTextAtomic/_isRegularOrMissing/_localStamp）+ 告警/模板簇（_enabledFlag/_validateTplConfig/_accumulateReport/_sendCrossDayReport/_updateReport/_sendAlert）+ 近似去重窗口隔离/读取上限/隔离件回收/写失败留痕 + 拦截明细 similar-blocked.ndjson（追加/轮转/摘要 similarlogged）+ RE2 警告标记生命周期/通道健康降级/PID 复用/覆盖文件按轮生效 FR-1..3/DR-1 dry-run' },
   // G11：scripts/audit-gate.js 是 fail-closed 安全门禁（v3.276 续 / PR #194 引入），此前**零测试**
   // ——只在 test.yml:218 被 `node scripts/audit-gate.js` 调用过，仓库里没有任何断言指向它。
   // 于是「豁免只针对 GHSA-CH52-4W7C-C8XP、其余高危一律拦」这条契约无人守护：放宽 ALLOWED_ADVISORIES、
@@ -115,7 +115,11 @@ const SUITES = [
   { name: '通知自检', file: 'test_notify_selfcheck.js', desc: '--notify-test 直跑自检：argv/env 互斥/HITOKOTO 抑制与恢复/单次广播/消息固定形态/退出码 0 与 1/脱敏出口形态（进程内 mock 注入，零真实网络）' },
   // S1-store：过滤规则覆盖文件存储层（xbk_filter_store.js）。纯同步、临时 cacheDir 驱动，
   // 不 require xbk_function_v3、不触碰 Config.filter ⇒ 进单元入口与 TAP 变异测试集。
-  { name: '过滤规则存储', file: 'test_filter_store.js', desc: '覆盖文件校验五道闸（白名单/schema/revision/长度/控制字符、### 行语法、嵌套量词与 RE2、编译对账、整份字节预算；末道只约束保存入参）+ 默认合并/last-known-good 降级/生效快照往返/路径 helper' }
+  { name: '过滤规则存储', file: 'test_filter_store.js', desc: '覆盖文件校验五道闸（白名单/schema/revision/长度/控制字符、### 行语法、嵌套量词与 RE2、编译对账、整份字节预算；末道只约束保存入参）+ 默认合并/last-known-good 降级/生效快照往返/路径 helper' },
+  // v3.410：scripts/similar-dedupe.js 此前没有专属套件（只在 test_app_unit.js 里顺带 6 例），
+  // 而拦截明细 similar-blocked.ndjson 依赖 findSimilarTitle 返回「命中的哪一条」——判定正确但明细
+  // 记错条目的偏差抓不到。本套件直测纯函数（无 IO、无 fs），不设 integration/mutationSkip。
+  { name: '近似去重纯函数', file: 'test_similar_dedupe.js', desc: 'scripts/similar-dedupe.js findSimilarTitle 命中返回整条条目/未命中 null/价格与券档护栏 + isSimilarTitle 与 findSimilarTitle 结论一致（固定种子随机 200 组）' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

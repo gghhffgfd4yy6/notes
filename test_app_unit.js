@@ -4824,6 +4824,132 @@ checkAsync('F3-1 两进程并发写窗口 100 次：读取侧不产生 .corrupt-
   })
 })
 
+// ===== v3.410：近似去重拦截明细（<cacheDir>/similar-blocked.ndjson）=====
+// 背景：近似去重此前只把「这轮拦了几条」写进 run.log（similar=N），没记「拦的是哪两条」，
+// 70 条拦截无法逐条复核是否误拦。这里锁三件事：① 一轮拦 1 条 ⇒ 1 行且含两条标题；
+// ② 下一轮继续追加（不覆盖）；③ 文件 ≥2 MiB 先轮转成 .1 再新建（保留 2 份）。
+// 同时锁「只加日志」：判定与推送结果必须与不带明细时完全一致。
+checkAsync('L1-1 拦截明细：一轮拦 1 条 ⇒ similar-blocked.ndjson 恰好 1 行、含两条标题、摘要行带 similarlogged=1', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const blockedPath = path.join(cacheDir, 'similar-blocked.ndjson')
+    const pushedTitle = '大家各个平台都看看 如果出现负数就跑吧'
+    const blockedTitle = '大家各个平台看看 负数就跑'
+    h.setItems([makeRunItem('sb-1', pushedTitle), makeRunItem('sb-2', blockedTitle)])
+    const { summary } = await runWithWarnings(h.App)
+    assert.deepStrictEqual({ pushed: summary.pushed, dedup: summary.dedup }, { pushed: 1, dedup: 0 },
+      `前置：一条推送、一条被近似去重拦下：${JSON.stringify(summary)}`)
+    const text = realFs.readFileSync(blockedPath, 'utf8')
+    const lines = text.split('\n').filter(Boolean)
+    assert.strictEqual(lines.length, 1, `一轮拦 1 条只允许 1 行：${text}`)
+    assert.ok(lines[0].includes('如果出现负数就跑吧'), `明细必须含被拦下的原标题：${lines[0]}`)
+    assert.ok(lines[0].includes('负数就跑'), `明细必须含被匹配的窗口标题：${lines[0]}`)
+    const rec = JSON.parse(lines[0])
+    // 显式码元序比较器（Sonar S2871）；刻意不用 localeCompare，避免排序随宿主 locale 变化
+    assert.deepStrictEqual(Object.keys(rec).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), ['at', 'matched', 'mprice', 'price', 'title'],
+      `明细字段必须恰好是 at/title/matched/price/mprice（不得夹带正文/HTML/URL）：${lines[0]}`)
+    assert.match(rec.at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, `at 必须与 run.log 时间戳同格式：${rec.at}`)
+    assert.strictEqual(rec.title, blockedTitle, 'title 必须是原标题')
+    assert.strictEqual(rec.matched, Similar.normalizeTitle(pushedTitle), 'matched 必须是窗口里存的归一化标题')
+    assert.strictEqual(rec.price, null, '原标题没写价格 ⇒ price 为 null（不是空串）')
+    assert.strictEqual(rec.mprice, null, '匹配条没写价格 ⇒ mprice 为 null（不是空串）')
+    assert.strictEqual(realFs.statSync(blockedPath).mode & 0o777, 0o600, '明细文件必须是 0600（与缓存文件同口径）')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    const summaryLine = log.split('\n').find(l => l.includes('total=2') && l.includes('pushed=1'))
+    assert.ok(summaryLine, `必须写摘要行：${log.slice(-400)}`)
+    assert.ok(/ similar=1/.test(summaryLine), `摘要行原有 similar=1 不得丢：${summaryLine}`)
+    assert.ok(/ similarlogged=1/.test(summaryLine), `写入 1 条明细后摘要行必须带 similarlogged=1：${summaryLine}`)
+  })
+})
+
+checkAsync('L1-2 拦截明细：下一轮继续追加而非覆盖；无命中的轮次不追加 similarlogged（旧格式兼容）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const blockedPath = path.join(cacheDir, 'similar-blocked.ndjson')
+    h.setItems([makeRunItem('sb-3', '大家各个平台都看看 如果出现负数就跑吧'), makeRunItem('sb-4', '大家各个平台看看 负数就跑')])
+    await runWithWarnings(h.App)
+    assert.strictEqual(realFs.readFileSync(blockedPath, 'utf8').split('\n').filter(Boolean).length, 1, '前置：第一轮 1 行')
+    // 第二轮：完全不同的一对近似标题，必须追加成第 2 行（覆盖会丢掉上一轮的证据）
+    h.setItems([makeRunItem('sb-5', '维达抽纸24包 59.9元 包邮'), makeRunItem('sb-6', '维达抽纸24包 59.9元 包邮 秒杀')])
+    const r2 = await runWithWarnings(h.App)
+    assert.strictEqual(r2.summary.pushed, 1, `前置：第二轮仍只推 1 条：${JSON.stringify(r2.summary)}`)
+    const lines = realFs.readFileSync(blockedPath, 'utf8').split('\n').filter(Boolean)
+    assert.strictEqual(lines.length, 2, `第二轮必须追加（不得覆盖第一轮）：${lines.join(' | ')}`)
+    assert.ok(lines[0].includes('如果出现负数就跑吧'), '第一轮那行必须原样保留')
+    assert.ok(lines[1].includes('维达抽纸24包'), '第二轮必须写入自己的那条')
+    const second = JSON.parse(lines[1])
+    assert.strictEqual(second.price, '59.9', '原标题价格签名必须落进 price')
+    assert.strictEqual(second.mprice, '59.9', '匹配条价格签名必须落进 mprice')
+    // 第三轮：与窗口完全不相似 ⇒ 本轮没有拦截明细，摘要行不得出现 similarlogged（保持旧格式）
+    h.setItems([makeRunItem('sb-7', '伊利高钙奶粉礼盒装30元一罐 61元两罐')])
+    await runWithWarnings(h.App)
+    assert.strictEqual(realFs.readFileSync(blockedPath, 'utf8').split('\n').filter(Boolean).length, 2, '无命中轮次不得写明细')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    const noHitLine = log.split('\n').find(l => l.includes('total=1') && l.includes('pushed=1'))
+    assert.ok(noHitLine, `必须写第三轮摘要行：${log.slice(-400)}`)
+    assert.ok(!/similarlogged=/.test(noHitLine), `0 条明细时不得追加 similarlogged（旧格式兼容）：${noHitLine}`)
+  })
+})
+
+checkAsync('L1-3 拦截明细轮转：文件 ≥2 MiB ⇒ 先 rename 成 .1 再新建（磁盘恒为现行 + .1 两份）', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const blockedPath = path.join(cacheDir, 'similar-blocked.ndjson')
+    const limit = 2 * 1024 * 1024
+    const filler = 'x'.repeat(limit + 4096) // 略超 2 MiB：边界必须按「>= 上限即轮转」判
+    realFs.writeFileSync(blockedPath, filler)
+    h.setItems([makeRunItem('sb-8', '洁婷卫生巾拍6件赠4件总到手10包 19.9元'), makeRunItem('sb-9', '洁婷卫生巾拍6件赠4件总到手10包 19.9元 速抢')])
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(summary.pushed, 1, `前置：轮转不影响推送结果：${JSON.stringify(summary)}`)
+    assert.strictEqual(realFs.readFileSync(`${blockedPath}.1`, 'utf8'), filler, '轮转必须把旧文件整体搬到 .1（内容不变）')
+    const lines = realFs.readFileSync(blockedPath, 'utf8').split('\n').filter(Boolean)
+    assert.strictEqual(lines.length, 1, `轮转后新文件只允许有本轮那 1 行：${lines.join(' | ')}`)
+    assert.strictEqual(JSON.parse(lines[0]).title, '洁婷卫生巾拍6件赠4件总到手10包 19.9元 速抢', '新文件必须是本轮的明细')
+    // 再超限一次：旧的 .1 被覆盖（不产生 .2），仍是两份
+    realFs.writeFileSync(blockedPath, 'y'.repeat(limit + 1))
+    h.setItems([makeRunItem('sb-10', '伊利高钙奶粉礼盒装30元一罐 61元两罐'), makeRunItem('sb-11', '伊利高钙奶粉礼盒装30元一罐 61元两罐 速抢')])
+    await runWithWarnings(h.App)
+    assert.ok(realFs.readFileSync(`${blockedPath}.1`, 'utf8').startsWith('y'), '第二次轮转必须覆盖旧 .1（保留策略 2 份 × 2 MiB）')
+    assert.deepStrictEqual(realFs.readdirSync(cacheDir).filter(n => n.startsWith('similar-blocked.ndjson.')).sort(), ['similar-blocked.ndjson.1'],
+      '只允许存在一份 .1（不得产生 .2/.3）')
+  })
+})
+
+// ===== L1 must_fix：明细日志求值 cacheDir 失败不得把整轮变成运行异常 =====
+// 背景：this._cacheDir() 走 MessageStore.cacheDir getter（existsSync 逐级回溯 + lstat + realpathSync），
+// 缓存目录被换成项目根外符号链接、或四层候选目录全不可用时**直接 throw**。方法体若把这次求值留在
+// try 之外，异常会冒泡到 run() 顶层 catch：写 ERROR 行 + 发「运行异常」告警 + rethrow（退出码非 0），
+// 而这一轮推送其实已经全部成功——与「写失败只 console.warn」的契约相反（同 _writeRunLog 的口径）。
+// 本用例把 _cacheDir 换成抛错实现后跑完整一轮，断言：① 只 console.warn 且带「不影响本轮推送」；
+// ② run() 正常返回、pushed 不变；③ 摘要行不带 similarlogged（失败返回 0，旧格式兼容）；④ run.log 无 ERROR 行。
+checkAsync('L1-4 拦截明细：cacheDir 求值抛错 ⇒ 只 warn、run() 正常返回、摘要行不带 similarlogged 且无 ERROR', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('sb-12', '大家各个平台都看看 如果出现负数就跑吧'), makeRunItem('sb-13', '大家各个平台看看 负数就跑')])
+    const origWrite = h.App._writeSimilarBlockedLog
+    let cacheDirCalls = 0
+    // 只在明细落盘这一次调用里把 _cacheDir 换成抛错实现（run() 其它位置仍要用真实目录），
+    // 直接复刻真实 getter 在「目录被换成根外符号链接」时的行为：当次访问即 throw。
+    h.App._writeSimilarBlockedLog = function (records) {
+      const origCacheDir = this._cacheDir
+      this._cacheDir = () => {
+        cacheDirCalls += 1
+        throw new Error('缓存目录安全检查失败：目录已被替换为符号链接')
+      }
+      try { return origWrite.call(this, records) } finally { this._cacheDir = origCacheDir }
+    }
+    const { summary, warns } = await runWithWarnings(h.App)
+    assert.strictEqual(cacheDirCalls, 1, '前置：明细落盘必须真的求值过一次 _cacheDir（否则没打到故障点）')
+    assert.deepStrictEqual({ pushed: summary.pushed, failed: summary.failed }, { pushed: 1, failed: 0 },
+      `明细落盘失败不得改变推送结果与退出码：${JSON.stringify(summary)}`)
+    assert.ok(warns.some(l => l.includes('近似去重拦截明细写入失败') && l.includes('不影响本轮推送') && l.includes('缓存目录不可用')),
+      `必须只 console.warn 一条「不影响本轮推送」：${JSON.stringify(warns)}`)
+    assert.ok(!realFs.existsSync(path.join(cacheDir, 'similar-blocked.ndjson')), '目录求值失败时不得留下明细文件')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    const summaryLine = log.split('\n').find(l => l.includes('total=2') && l.includes('pushed=1'))
+    assert.ok(summaryLine, `run() 必须正常走完并写摘要行（异常冒泡会 rethrow、这里连摘要都没有）：${log.slice(-400)}`)
+    assert.ok(/ similar=1/.test(summaryLine), `拦截计数 similar=1 不得丢：${summaryLine}`)
+    assert.ok(!/similarlogged=/.test(summaryLine), `明细写失败（返回 0）时不得追加 similarlogged：${summaryLine}`)
+    assert.ok(!log.split('\n').some(l => l.includes(' ERROR ')), `明细写失败不得在 run.log 落 ERROR 行：${log.slice(-400)}`)
+  })
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
