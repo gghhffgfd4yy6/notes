@@ -826,8 +826,39 @@ function loadFilterRules (options) {
 }
 
 /**
+ * 判断「磁盘上的旧快照」与「本轮要写的新快照」的规则内容是否完全一致（appliedAt 不参与）。
+ *
+ * v3.411：为什么需要它——旧实现每轮都生成新 appliedAt 并整份重写 applied.json（约 73 KB），
+ * 而规则通常整月不变（实测 12 轮采样里 10 轮在重写，约 1 GB/天）。规则没变时这份写入是纯浪费。
+ *
+ * 比较必须是纯函数式：filter 只比 FILTER_RULE_FIELDS 白名单、逐字段比字符串，**不依赖对象键顺序**
+ * （快照可能是手改/旧版本写出的，键序不可信）；缺字段按空串比（与 readAppliedSnapshot / parseStoredRules
+ * 的「缺字段视同空」同口径）。
+ * lastGoodUsed 也参与比较：它是控制台读的「本轮是否沿用了上次合法规则」，只把它当非内容字段跳过，
+ * 会让降级→恢复翻转时快照继续宣称「沿用上次」。
+ * @returns {boolean} true = 内容一致，可以跳过写盘
+ */
+function sameAppliedContent (prev, next) {
+  if (!prev || typeof prev !== 'object' || Array.isArray(prev)) return false
+  if (!next || typeof next !== 'object') return false
+  // schema 不必比：readAppliedSnapshot 只让 schema === FILTER_RULES_SCHEMA 的快照到达这里。
+  if (prev.revision !== next.revision) return false
+  if (prev.source !== next.source) return false
+  if (prev.hash !== next.hash) return false
+  if (prev.lastGoodUsed !== next.lastGoodUsed) return false
+  for (const field of FILTER_RULE_FIELDS) {
+    if (safeString(safeGet(prev.filter, field)) !== next.filter[field]) return false
+  }
+  return safeString(safeGet(prev.keyword, 'zkt_gjc')) === next.keyword.zkt_gjc
+}
+
+/**
  * 写生效快照 <cacheDir>/filter-rules.applied.json（0600 由 writeAtomic 保证）。
  * 快照是诊断/验收用：证明「本轮实际生效的是哪一版规则」，不参与规则读取。
+ *
+ * v3.411：规则内容与磁盘上的旧快照完全一致时**不写盘**（保留旧 appliedAt）并返回 true。
+ * 判据只看内容字段（revision/source/hash/filter/keyword + lastGoodUsed），见 sameAppliedContent。
+ * 每轮都读一次旧快照：进程可能多开（控制台 spawn + 常驻运行），进程内缓存会互相看不见，禁止用它绕过读盘。
  * @returns {boolean} 写入是否成功（失败只返回 false，不抛错）
  */
 function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, hash, lastGoodUsed } = {}) {
@@ -846,6 +877,10 @@ function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, ha
     filter: snapshotFilter,
     keyword: normalizeKeyword(keyword, { forSnapshot: true })
   }
+  // 只有 status==='ok'（文件存在、合法 JSON、schema/revision/filter/keyword 全过校验）才可能判定「内容一致」；
+  // missing / invalid / ioError 一律照常重写——损坏的快照要自愈，不能因为「比不出来」就留着。
+  const prev = readAppliedSnapshot(cacheDir)
+  if (prev.status === 'ok' && sameAppliedContent(prev.snapshot, snapshot)) return true
   return writeAtomic(paths.applied, JSON.stringify(snapshot), '过滤规则生效快照')
 }
 

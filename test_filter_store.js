@@ -860,6 +860,122 @@ test('writeAppliedSnapshot 写入 0600 快照，readAppliedSnapshot 可读回', 
   assert.deepStrictEqual(readJson(paths.applied), read.snapshot)
 })
 
+// ===== v3.411：规则内容不变时不重写 applied.json（省掉每轮约 1 GB 的纯浪费写入）=====
+// 「到底有没有写盘」用 inode 判：writeAtomic 是「唯一临时文件 + rename」，真写一次 ⇒ applied 换成新 inode；
+// 而写盘时旧文件仍被占用，临时文件不可能拿到同一个 inode ⇒ 跳过写盘必然表现为 inode 不变。
+// 只比 mtime 不够硬：同一毫秒内重写会让 mtime 看起来没变（这正是旧实现的采样现象之一）。
+const sleepMs = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) }
+
+test('v3.411 生效快照内容不变不写盘：同一份规则连写两次，第二次返回 true 且文件一字不动（appliedAt 不刷新）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const args = {
+    cacheDir: dir,
+    filter: { pingbibiaoti: 'x', pingbineirong: 'y', pingbitime: '7' },
+    keyword: { zkt_gjc: 'k' },
+    revision: 3,
+    source: 'override',
+    hash: 'h1'
+  }
+  assert.strictEqual(writeAppliedSnapshot(args), true, '第一次（文件还不存在）必须真写')
+  const firstText = fs.readFileSync(paths.applied, 'utf8')
+  const firstStat = fs.statSync(paths.applied)
+  sleepMs(5) // 让「若重写」的 appliedAt 必然不同，避免同毫秒造成的假通过
+  assert.strictEqual(writeAppliedSnapshot(args), true, '内容一致时也必须返回 true（调用方不得以为写入失败）')
+  assert.strictEqual(fs.statSync(paths.applied).ino, firstStat.ino, '内容一致不得写盘（inode 变了就说明重写过）')
+  assert.strictEqual(fs.readFileSync(paths.applied, 'utf8'), firstText, '文件内容必须一字不动（含 appliedAt）')
+
+  // 快照是手改/旧版本写的：filter 键序、keyword 键序不同但内容相同 → 仍必须判「内容一致」而不写盘。
+  // 「纯函数式比较」在这里是硬要求：按 JSON 文本或键序比会把这份快照误判成「变了」而白写一轮。
+  writeRaw(paths.applied, JSON.stringify({
+    keyword: { zkt_gjc: 'k' },
+    filter: Object.fromEntries([...FILTER_RULE_FIELDS].reverse().map((field) => [field, args.filter[field] || ''])),
+    lastGoodUsed: false,
+    appliedAt: '2020-01-01T00:00:00.000Z',
+    hash: 'h1',
+    source: 'override',
+    revision: 3,
+    schema: 1
+  }))
+  const reorderedStat = fs.statSync(paths.applied)
+  assert.strictEqual(writeAppliedSnapshot(args), true, '键序不同的等价快照也必须跳过写盘')
+  assert.strictEqual(fs.statSync(paths.applied).ino, reorderedStat.ino, '键序不同不是内容变化：不得重写')
+  assert.strictEqual(readJson(paths.applied).appliedAt, '2020-01-01T00:00:00.000Z', '跳过写盘必须保留磁盘上的旧 appliedAt')
+})
+
+test('v3.411 生效快照内容变化必写盘：revision / filter 字段 / keyword / 恢复默认任一变化都重写且 appliedAt 变新', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const base = {
+    cacheDir: dir,
+    filter: { pingbibiaoti: 'a', pingbineirong: 'b' },
+    keyword: { zkt_gjc: 'k' },
+    revision: 3,
+    source: 'override',
+    hash: 'h1'
+  }
+  assert.strictEqual(writeAppliedSnapshot(base), true)
+  let prev = readJson(paths.applied)
+  // ① revision bump（控制台保存规则 = 覆盖文件 revision +1）
+  sleepMs(5)
+  assert.strictEqual(writeAppliedSnapshot({ ...base, revision: 4 }), true)
+  let now = readJson(paths.applied)
+  assert.strictEqual(now.revision, 4, 'revision 变化必须落盘')
+  assert.ok(Date.parse(now.appliedAt) > Date.parse(prev.appliedAt),
+    `revision 变化必须刷新 appliedAt（旧 ${prev.appliedAt} / 新 ${now.appliedAt}）`)
+  // ② 单个 filter 字段变化（revision/hash 故意不动：判据不能只看 revision）
+  sleepMs(5)
+  prev = now
+  assert.strictEqual(writeAppliedSnapshot({ ...base, revision: 4, filter: { pingbibiaoti: 'a', pingbineirong: 'b2' } }), true)
+  now = readJson(paths.applied)
+  assert.strictEqual(now.filter.pingbineirong, 'b2', '任一 filter 字段变化必须落盘')
+  assert.ok(Date.parse(now.appliedAt) > Date.parse(prev.appliedAt), 'filter 字段变化必须刷新 appliedAt')
+  // ③ keyword.zkt_gjc 变化
+  sleepMs(5)
+  prev = now
+  assert.strictEqual(writeAppliedSnapshot({
+    ...base, revision: 4, filter: { pingbibiaoti: 'a', pingbineirong: 'b2' }, keyword: { zkt_gjc: 'k2' }
+  }), true)
+  now = readJson(paths.applied)
+  assert.strictEqual(now.keyword.zkt_gjc, 'k2', 'keyword 变化必须落盘')
+  assert.ok(Date.parse(now.appliedAt) > Date.parse(prev.appliedAt), 'keyword 变化必须刷新 appliedAt')
+  // ④ 恢复代码默认（source/hash/filter/keyword 一起变）
+  sleepMs(5)
+  prev = now
+  assert.strictEqual(writeAppliedSnapshot({
+    ...base, revision: 0, source: 'default', hash: 'h0', filter: {}, keyword: {}
+  }), true)
+  now = readJson(paths.applied)
+  assert.strictEqual(now.source, 'default', '恢复默认必须落盘')
+  assert.deepStrictEqual(now.filter, Object.fromEntries(FILTER_RULE_FIELDS.map((field) => [field, ''])),
+    '恢复默认必须把 11 个字段都清成空串（不能留下上一轮的规则）')
+  assert.ok(Date.parse(now.appliedAt) > Date.parse(prev.appliedAt), 'source/hash 变化必须刷新 appliedAt')
+})
+
+test('v3.411 旧快照损坏（半截 JSON / schema 不对）→ 仍然重写成功并自愈', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const args = { cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 2, source: 'override', hash: 'h' }
+  // 情形 A：写到一半的 JSON（读回 invalid）——不能因为「比不出内容」就跳过写盘
+  writeRaw(paths.applied, '{"schema":1,"revision":2,"appliedAt":"2026-11-09T00:00:00.000Z","filter":{"pingbibiaoti":"x"')
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'invalid', '前置：旧快照必须是 invalid')
+  assert.strictEqual(writeAppliedSnapshot(args), true, '旧快照损坏时必须重写成功')
+  let read = readAppliedSnapshot(dir)
+  assert.strictEqual(read.status, 'ok', '重写后必须是可读回的合法快照（自愈）')
+  assert.strictEqual(read.snapshot.revision, 2)
+  // 情形 B：合法 JSON 但 schema 不对（读回 invalid）→ 同样重写
+  writeRaw(paths.applied, JSON.stringify({ schema: 99, revision: 2, appliedAt: 'x', filter: {}, keyword: {} }))
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'invalid')
+  assert.strictEqual(writeAppliedSnapshot(args), true)
+  read = readAppliedSnapshot(dir)
+  assert.strictEqual(read.status, 'ok', 'schema 不对的旧快照也必须被重写覆盖')
+  assert.strictEqual(read.snapshot.schema, FILTER_RULES_SCHEMA)
+  // 情形 C：写完一次后再写同样入参 → 这次内容一致，跳过写盘（证明自愈后比较口径仍成立）
+  const afterHeal = fs.statSync(paths.applied)
+  assert.strictEqual(writeAppliedSnapshot(args), true)
+  assert.strictEqual(fs.statSync(paths.applied).ino, afterHeal.ino, '自愈后的等价快照不得再次重写')
+})
+
 // C5-047：writeAppliedSnapshot 的返回值是「快照到底有没有写成」的唯一信号（xbk_app 用它打 warn + run log），
 // 但此前全文件只有一条 `strictEqual(wrote, true)` 正向断言 —— 把实现改成恒 true，整套仍然全绿
 // （本条已用变异探针实测）。下面两条把失败分支钉死：返回 false、不抛、不留半成品。
