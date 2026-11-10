@@ -4640,6 +4640,34 @@ checkAsync('F3-1/F3-3 非法 JSON：单轮恰好 1 个 .corrupt-*、窗口重建
   })
 })
 
+checkAsync('F3-3 隔离件保留上限：12 份 ⇒ 保留最新 10 份（最旧先删），目录/异名文件不碰', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    const simPath = path.join(cacheDir, `similar-${h.cacheName()}`)
+    const prefix = path.basename(simPath) + '.corrupt-'
+    const base = Date.now() - 100000
+    const names = []
+    for (let i = 0; i < 12; i++) {
+      const p = `${simPath}.corrupt-${base + i}`
+      realFs.writeFileSync(p, `坏窗口 ${i}`)
+      realFs.utimesSync(p, new Date(base + i), new Date(base + i))
+      names.push(path.basename(p))
+    }
+    const dirName = `${simPath}.corrupt-9999999999999` // 目录：即使名字匹配也不得删
+    realFs.mkdirSync(dirName)
+    const oddName = `${simPath}.corrupt-not-a-stamp` // 非本模块命名口径：不得删
+    realFs.writeFileSync(oddName, 'x')
+    const removed = h.App._pruneSimilarBackups(simPath)
+    assert.strictEqual(removed, 2, '12 份 + 上限 10 ⇒ 必须删掉最旧 2 份')
+    const left = realFs.readdirSync(cacheDir)
+      .filter(n => n.startsWith(prefix) && /^[0-9]+$/.test(n.slice(prefix.length)))
+      .filter(n => realFs.lstatSync(path.join(cacheDir, n)).isFile())
+    assert.strictEqual(left.length, 10, `只允许保留 10 份：${JSON.stringify(left)}`)
+    assert.ok(!left.includes(names[0]) && !left.includes(names[1]), `删除的必须是最旧两份：${JSON.stringify(left)}`)
+    assert.ok(realFs.statSync(dirName).isDirectory(), '目录不得被删')
+    assert.ok(realFs.existsSync(oddName), '非数字时间戳的异名文件不得被删')
+  })
+})
+
 checkAsync('F3-1 两进程并发写窗口 100 次：读取侧不产生 .corrupt-*（replaced 绝不隔离）', async () => {
   const { spawn } = require('child_process')
   await withRunHarness({}, async (h, cacheDir, realFs) => {

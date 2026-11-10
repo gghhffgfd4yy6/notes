@@ -13,6 +13,9 @@ const SIMILAR_WINDOW_MAX_BYTES = 512 * 1024
 // F3-1：`replaced` / `ioError` 是并发瞬时事实（另一进程原子 rename 覆盖窗口文件的那一瞬），
 // 退避后重读一次即足；50ms 与 xbk_filter_store.js 的 F4-3（TRANSIENT_READ_RETRY_MS）同口径。
 const SIMILAR_WINDOW_RETRY_MS = 50
+// F3-3：近似去重窗口的 `<name>.corrupt-<ts>` 隔离件保留上限。与 xbk_message_store.js 的
+// CORRUPT_BACKUP_KEEP（10，模块内私有）同值：两侧都由 SYSTEM_CONTRACT 的「每个缓存文件最多 10 份」约束。
+const SIMILAR_CORRUPT_BACKUP_KEEP = 10
 
 // 同步退避（窗口读取在 run() 里是同步路径，不能 await）：Atomics.wait 不占 CPU，
 // 与 xbk_filter_store.js 的 sleepMs 同实现；无 SharedArrayBuffer 的极端环境退化为短忙等。
@@ -307,7 +310,7 @@ function createApp ({
 
     // F3-1/F3-3：把确定性损坏的窗口原件改名隔离（**只隔离、绝不删除**）。返回备份路径；
     // 原件已不存在返回 ''（可安全重建）；改名失败返回 false —— 调用方不得再覆写，否则会把
-    // 没隔离成功的原件（唯一副本）覆盖掉。
+    // 没隔离成功的原件（唯一副本）覆盖掉。隔离后按每窗口 SIMILAR_CORRUPT_BACKUP_KEEP 份回收更旧的隔离件。
     _isolateSimilarWindow (filePath) {
       const backupPath = `${filePath}.corrupt-${Date.now()}`
       try {
@@ -320,7 +323,43 @@ function createApp ({
         return false
       }
       this._writeRunLog(`${this._localStamp()} WARN 近似去重窗口原件已改名隔离：${filePath} → ${backupPath}（重建空窗口）\n`)
+      try { this._pruneSimilarBackups(filePath) } catch (e) { /* 保留策略失败不影响本次重建 */ }
       return backupPath
+    },
+
+    // F3-3：`<name>.corrupt-<ts>` 隔离件只增不减 ⇒ 长期反复损坏会把缓存目录撑大。按「每窗口最多
+    // SIMILAR_CORRUPT_BACKUP_KEEP 份、最旧先删」收敛；只认本模块命名口径（后缀必须是纯数字时间戳）
+    // 且只删普通文件，目录/符号链接一律不碰。清理失败不阻断（单份失败跳过，下一轮再来）。
+    _pruneSimilarBackups (filePath) {
+      if (typeof fs.readdirSync !== 'function' || typeof fs.lstatSync !== 'function' || typeof fs.unlinkSync !== 'function') return 0
+      const dir = path.dirname(filePath)
+      const prefix = path.basename(filePath) + '.corrupt-'
+      let names
+      try { names = fs.readdirSync(dir) } catch (e) { return 0 }
+      if (!Array.isArray(names)) return 0
+      const found = []
+      for (const name of names) {
+        if (typeof name !== 'string' || !name.startsWith(prefix)) continue
+        const stamp = name.slice(prefix.length)
+        if (!/^[0-9]+$/.test(stamp)) continue
+        const full = path.join(dir, name)
+        try {
+          const st = fs.lstatSync(full)
+          if (!st || !st.isFile()) continue // 目录/符号链接（可能是别人的东西）一律不碰
+          found.push({ full, stamp: Number(stamp) || 0, mtime: Number(st.mtimeMs) || 0 })
+        } catch (e) { /* 读不到就跳过，不阻断本次隔离 */ }
+      }
+      if (found.length <= SIMILAR_CORRUPT_BACKUP_KEEP) return 0
+      // 新 → 旧；同一毫秒落地的多份（mtime 相同）按文件名里的时间戳倒序兜底，保证「谁算最旧」确定。
+      found.sort((a, b) => (b.mtime - a.mtime) || (b.stamp - a.stamp))
+      let removed = 0
+      for (const victim of found.slice(SIMILAR_CORRUPT_BACKUP_KEEP)) {
+        try { fs.unlinkSync(victim.full); removed++ } catch (e) { /* 单份失败不阻断 */ }
+      }
+      if (removed > 0) {
+        console.warn(`近似去重隔离件超过保留上限（每窗口 ${SIMILAR_CORRUPT_BACKUP_KEEP} 份），已清理最旧 ${removed} 份：${dir}`)
+      }
+      return removed
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
@@ -2376,6 +2415,7 @@ function createApp ({
               if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt, Utils.safeText(Utils.safeGet(m, 'content'), ''))
             }
             // F3-1：只有确定性损坏件才隔离（瞬时读失败已在读取处排除，绝不 rename）。
+            // F3-3：隔离件按每窗口 SIMILAR_CORRUPT_BACKUP_KEEP 份回收（见 _pruneSimilarBackups）。
             const isolated = similarCorrupt ? this._isolateSimilarWindow(similarPath) : ''
             // 隔离失败（false）时不得再写：原件没搬走，覆写等于删掉唯一副本。
             if (isolated !== false && (similarCorrupt || list !== recentTitles)) {
