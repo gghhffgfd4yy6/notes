@@ -79,13 +79,15 @@ function priceSignature (text) {
   return uniq.join(',')
 }
 
-// 是否与时间窗内已推内容近似重复。opts.content 可选：标题不够像时用正文二次确认
-function isSimilarTitle (title, entries, opts = {}) {
+// v3.410：与时间窗内已推内容近似重复时返回**命中的那一条** recent 条目（含 t/p/c/x 等字段），
+// 未命中返回 null。判定逻辑就是原来 isSimilarTitle 的那一份，一个字都没改——新增这个入口只为
+// 「拦了哪两条」留痕（见 xbk_app.js 的 similar-blocked.ndjson），不参与任何判定口径。
+function findSimilarTitle (title, entries, opts = {}) {
   const now = Number.isFinite(opts.now) ? opts.now : Date.now()
   const windowMs = Number.isFinite(opts.windowMs) ? opts.windowMs : WINDOW_MS
   const threshold = Number.isFinite(opts.threshold) ? opts.threshold : THRESHOLD
   const key = normalizeTitle(title)
-  if (!key || key.length < MIN_LEN) return false
+  if (!key || key.length < MIN_LEN) return null
   const keyCoupon = couponRange(title)
   const keyPrice = priceSignature(title)
   const keyContent = normalizeContent(opts.content)
@@ -100,11 +102,17 @@ function isSimilarTitle (title, entries, opts = {}) {
     const otherPrice = typeof e.p === 'string' ? e.p : ''
     if (keyPrice && otherPrice && keyPrice !== otherPrice) continue
     const titleScore = similarity(key, e.t)
-    if (titleScore >= threshold) return true
+    if (titleScore >= threshold) return e
     // 正文二次确认：标题中等相似 + 正文几乎一致（文字游戏式改写，标题相似度会漏）
-    if (keyContent && typeof e.x === 'string' && e.x && titleScore >= CONTENT_TITLE_MIN && similarity(keyContent, e.x) >= CONTENT_THRESHOLD) return true
+    if (keyContent && typeof e.x === 'string' && e.x && titleScore >= CONTENT_TITLE_MIN && similarity(keyContent, e.x) >= CONTENT_THRESHOLD) return e
   }
-  return false
+  return null
+}
+
+// 是否与时间窗内已推内容近似重复。opts.content 可选：标题不够像时用正文二次确认。
+// v3.410：改为 `findSimilarTitle(...) !== null`——同一份匹配逻辑，结论逐字节等价。
+function isSimilarTitle (title, entries, opts = {}) {
+  return findSimilarTitle(title, entries, opts) !== null
 }
 
 // 追加一条已推标题（可选正文），返回新数组（不修改入参）
@@ -136,6 +144,7 @@ module.exports = {
   priceSignature,
   similarity,
   pruneRecent,
+  findSimilarTitle,
   isSimilarTitle,
   appendRecent
 }

@@ -16,6 +16,15 @@ const SIMILAR_WINDOW_RETRY_MS = 50
 // F3-3：近似去重窗口的 `<name>.corrupt-<ts>` 隔离件保留上限。与 xbk_message_store.js 的
 // CORRUPT_BACKUP_KEEP（10，模块内私有）同值：两侧都由 SYSTEM_CONTRACT 的「每个缓存文件最多 10 份」约束。
 const SIMILAR_CORRUPT_BACKUP_KEEP = 10
+// v3.410：近似去重拦截明细（`<cacheDir>/similar-blocked.ndjson`）的三个上限。只做留痕、不参与判定：
+//   · 每轮最多记 SIMILAR_BLOCKED_MAX_RECORDS 条，超出只计数（similarOverflow）不落盘——单轮爆发
+//     （例如窗口被误配成空）不该把明细写成几十 MB；
+//   · 单文件超 SIMILAR_BLOCKED_MAX_BYTES 先 rename 成 `.1`（覆盖旧 .1）再新建 ⇒ 磁盘上至多 2 份
+//     （现行 + `.1`），最坏约 4 MiB；
+//   · 标题只截 160 字：正文/HTML/URL 一律不记（体积与敏感信息）。
+const SIMILAR_BLOCKED_MAX_RECORDS = 200
+const SIMILAR_BLOCKED_MAX_BYTES = 2 * 1024 * 1024
+const SIMILAR_BLOCKED_TITLE_MAX = 160
 
 // 同步退避（窗口读取在 run() 里是同步路径，不能 await）：Atomics.wait 不占 CPU，
 // 与 xbk_filter_store.js 的 sleepMs 同实现；无 SharedArrayBuffer 的极端环境退化为短忙等。
@@ -371,6 +380,61 @@ function createApp ({
       this._writeRunLog(`${this._localStamp()} WARN 近似去重窗口写入失败：${drop} 条窗口记录未落盘（下次可能重复推送同类标题）${filePath}\n`)
       console.warn('⚠️ 近似去重缓存写入失败（不影响本轮推送，最坏结果是下次再发一遍同类标题）')
       return false
+    },
+
+    // v3.410：把本轮的近似去重拦截明细追加到 `<cacheDir>/similar-blocked.ndjson`（每行一条 JSON）。
+    // 只加留痕：任何失败都只 console.warn，返回「实际写入条数」，绝不改变本轮推送结果与退出码。
+    // 写入口径：
+    //   · 目标是符号链接/目录/FIFO 时拒写——缓存目录安全不等于目录内文件安全（与 _isRegularOrMissing
+    //     同口径）；FIFO 尤其致命：appendFileSync 会一直等写者，把整轮钉住；
+    //   · 落盘前 lstat 一次（同时给出文件类型与大小，规格里的「写前 stat」就在这里）：非普通文件
+    //     拒写，≥ SIMILAR_BLOCKED_MAX_BYTES 先把旧件 rename 成 `.1`（覆盖旧 .1）再新建，
+    //     磁盘上恒为「现行 + .1」两份；
+    //   · 逐行 append（mode 0o600）；某行失败即停并告警——不再重试，避免磁盘满时刷 200 条告警。
+    _writeSimilarBlockedLog (records) {
+      if (!Array.isArray(records) || records.length === 0) return 0
+      const dir = this._cacheDir()
+      if (!dir) return 0
+      const file = path.join(dir, 'similar-blocked.ndjson')
+      const capable = ['lstatSync', 'appendFileSync', 'renameSync'].every((name) => typeof fs[name] === 'function')
+      if (!capable) {
+        console.warn('⚠️ 近似去重拦截明细未写入：当前 fs 缺少 appendFileSync/renameSync/lstatSync 能力')
+        return 0
+      }
+      let written = 0
+      try {
+        let size = 0
+        try {
+          const st = fs.lstatSync(file)
+          if (!st || typeof st.isFile !== 'function' || !st.isFile()) {
+            console.warn(`⚠️ 近似去重拦截明细不是普通文件，跳过本轮记录：${file}`)
+            return 0
+          }
+          size = Number(st.size) || 0
+        } catch (e) {
+          if (!e || e.code !== 'ENOENT') throw e
+        }
+        if (size >= SIMILAR_BLOCKED_MAX_BYTES) fs.renameSync(file, `${file}.1`)
+        for (const rec of records) {
+          let line
+          try {
+            line = JSON.stringify(rec) + '\n'
+          } catch (e) {
+            console.warn(`⚠️ 近似去重拦截明细序列化失败（已跳过该条）：${Utils.safeErrorText(e, '未知错误')}`)
+            continue
+          }
+          try {
+            fs.appendFileSync(file, line, { mode: 0o600 })
+            written += 1
+          } catch (e) {
+            console.warn(`⚠️ 近似去重拦截明细写入失败（不影响本轮推送）：${file}：${Utils.safeErrorText(e, '未知错误')}`)
+            break
+          }
+        }
+      } catch (e) {
+        console.warn(`⚠️ 近似去重拦截明细写入失败（不影响本轮推送）：${file}：${Utils.safeErrorText(e, '未知错误')}`)
+      }
+      return written
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
@@ -1820,6 +1884,10 @@ function createApp ({
         let dedupCount = 0
         // v3.397：近似去重（标题相似度 + 10 分钟窗）——拦同一句话改几个字重发，ID/URL/标题精确去重抓不到。
         let similarCount = 0
+        // v3.410：拦截明细（最多 SIMILAR_BLOCKED_MAX_RECORDS 条，超出只计数）。只留痕，不参与判定。
+        const similarBlocked = []
+        let similarOverflow = 0
+        let similarBlockedAt = '' // 本轮本地时间戳（与 run.log 同格式），首次命中才取
         // v3.407（F3-4）：本轮窗口落盘失败的条数，摘要行 similardrop=N 的唯一来源。
         let similarDrop = 0
         let filteredCount = 0
@@ -2033,8 +2101,26 @@ function createApp ({
             // v3.397：与时间窗内已推标题近似重复 → 不再重复推送（仍进 newMessages，按已处理落缓存）
             const titleText = Utils.safeText(Utils.safeGet(item, 'title'), '')
             const contentText = Utils.safeText(Utils.safeGet(item, 'content'), '')
-            if (Similar.isSimilarTitle(titleText, recentTitles.concat(batchTitles), { now: similarNow, content: contentText })) {
+            // v3.410：用 findSimilarTitle 取「和哪一条撞了」——判定与 isSimilarTitle 同一份逻辑
+            // （isSimilarTitle ≡ findSimilarTitle !== null），这里不多做任何判断。
+            const similarHit = Similar.findSimilarTitle(titleText, recentTitles.concat(batchTitles), { now: similarNow, content: contentText })
+            if (similarHit) {
               similarCount++
+              // 拦截明细：只记标题与价格签名（正文/HTML/URL 一律不记）。每轮上限 200 条，
+              // 超出只计数不落盘——明细是排障用的旁证，不能因为一轮爆发写成大文件。
+              if (similarBlocked.length < SIMILAR_BLOCKED_MAX_RECORDS) {
+                if (!similarBlockedAt) similarBlockedAt = this._localStamp()
+                similarBlocked.push({
+                  at: similarBlockedAt,
+                  title: Utils.truncateUtf16(titleText, SIMILAR_BLOCKED_TITLE_MAX),
+                  // 窗口里存的是归一化标题（原文不入窗口，格式不动），matched 只能是它
+                  matched: Utils.truncateUtf16(typeof similarHit.t === 'string' ? similarHit.t : '', SIMILAR_BLOCKED_TITLE_MAX),
+                  price: Similar.priceSignature(titleText) || null,
+                  mprice: typeof similarHit.p === 'string' && similarHit.p !== '' ? similarHit.p : null
+                })
+              } else {
+                similarOverflow += 1
+              }
               newMessages.push(item)
               continue
             }
@@ -2439,6 +2525,13 @@ function createApp ({
             console.warn(`⚠️ 近似去重缓存更新失败（不影响本轮推送）：${Utils.safeErrorText(e, '未知错误')}`)
           }
         }
+        // v3.410：本轮近似去重拦截明细落盘（`similar-blocked.ndjson`）。只加日志：写失败只 console.warn，
+        // 返回实际写入条数供摘要行 `similarlogged=N` 对账；推送结果、缓存、退出码一概不受影响。
+        const similarLogged = this._writeSimilarBlockedLog(similarBlocked)
+        if (similarOverflow > 0) {
+          console.warn(`⚠️ 近似去重拦截明细超过每轮上限 ${SIMILAR_BLOCKED_MAX_RECORDS} 条，另有 ${similarOverflow} 条只计数未记录`)
+        }
+
         await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
 
         // 预取收尾：只观察已完成结果，不等待后台预取，避免它拖慢主流程退出。
@@ -2505,7 +2598,7 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}${similarCount > 0 ? ` similar=${similarCount}` : ''}${similarDrop > 0 ? ` similardrop=${similarDrop}` : ''}\n`)
+        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}${similarCount > 0 ? ` similar=${similarCount}` : ''}${similarLogged > 0 ? ` similarlogged=${similarLogged}` : ''}${similarDrop > 0 ? ` similardrop=${similarDrop}` : ''}\n`)
         // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
         // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
         // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。

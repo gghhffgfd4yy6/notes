@@ -1305,3 +1305,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 
 - **修：降级态只写在内存，重启即丢**。v3.408 的 `persistAuto()` 虽然会写 `degraded`/`fails`，但进入/退出降级时没有调用它；控制台在源站故障期间重启，会按 `degraded=false` 走正常间隔，又要重新撞满 12 次才回到 10 秒重试。现在只在这一刻落盘（进入降级、恢复成功各一次），不逐轮写盘。
 - **测试**：`test_console.js` 增加断言——`tickAuto` 体内必须调用 `persistAuto()`（进入/恢复降级各一处），否则「跨重启保留」只是字段存在、实际永不写盘。
+
+## v3.410
+
+- **新增：近似去重拦截明细**。以前只把「这轮拦了几条」写进 `run.log`（`similar=N`），不记「拦的是哪两条」——2026-11-03 上线到 11-10 一共拦了 70 条，一条也没法复核是不是误拦。现在每次拦截都在缓存目录的 `similar-blocked.ndjson` 追加一行：`at`（与 `run.log` 同格式的时间）、`title`（被拦下的原标题）、`matched`（撞上的那条窗口标题）、`price`/`mprice`（两侧价格签名，没写价格就是 `null`）。标题各截 160 字，正文/HTML/URL 一律不记。
+- **保留策略**：每轮最多记 200 条（再多只计数不落盘）；文件超过 2 MiB 先改名成 `similar-blocked.ndjson.1`（覆盖旧 `.1`）再新建，磁盘上恒为两份、最坏约 4 MiB。明细写失败只告警，推送结果与退出码不受影响。
+- **摘要行**：有明细写入时 `run.log` 摘要行末尾追加 `similarlogged=N`（N = 实际写入条数）；为 0 时不写，旧格式不变。
+- **判定零改动**：阈值、价格/券护栏、10 分钟窗口、标题归一化都没动。`scripts/similar-dedupe.js` 新增 `findSimilarTitle`（返回命中的那条窗口条目，明细靠它回填 `matched`/`mprice`），`isSimilarTitle` 改为 `findSimilarTitle(...) !== null`，同一份匹配逻辑。
+- **测试**：新增 `test_similar_dedupe.js`（5 例：命中返回条目、未命中 `null`、价格不同不命中、券档不同不命中、`isSimilarTitle` 与 `findSimilarTitle` 结论一致的固定种子随机 200 组）；`test_app_unit.js` 新增 3 例（一轮拦 1 条 ⇒ 1 行含两条标题且摘要带 `similarlogged=1`；下一轮追加不覆盖、无命中轮不写该字段；文件 ≥2 MiB 先轮转为 `.1` 且不产生 `.2`）。`README.md` / `SYSTEM_CONTRACT.md` 同步新文件、字段与保留策略。
