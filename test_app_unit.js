@@ -4911,6 +4911,44 @@ checkAsync('L1-3 拦截明细轮转：文件 ≥2 MiB ⇒ 先 rename 成 .1 再�
   })
 })
 
+// ===== L1 must_fix：明细日志求值 cacheDir 失败不得把整轮变成运行异常 =====
+// 背景：this._cacheDir() 走 MessageStore.cacheDir getter（existsSync 逐级回溯 + lstat + realpathSync），
+// 缓存目录被换成项目根外符号链接、或四层候选目录全不可用时**直接 throw**。方法体若把这次求值留在
+// try 之外，异常会冒泡到 run() 顶层 catch：写 ERROR 行 + 发「运行异常」告警 + rethrow（退出码非 0），
+// 而这一轮推送其实已经全部成功——与「写失败只 console.warn」的契约相反（同 _writeRunLog 的口径）。
+// 本用例把 _cacheDir 换成抛错实现后跑完整一轮，断言：① 只 console.warn 且带「不影响本轮推送」；
+// ② run() 正常返回、pushed 不变；③ 摘要行不带 similarlogged（失败返回 0，旧格式兼容）；④ run.log 无 ERROR 行。
+checkAsync('L1-4 拦截明细：cacheDir 求值抛错 ⇒ 只 warn、run() 正常返回、摘要行不带 similarlogged 且无 ERROR', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('sb-12', '大家各个平台都看看 如果出现负数就跑吧'), makeRunItem('sb-13', '大家各个平台看看 负数就跑')])
+    const origWrite = h.App._writeSimilarBlockedLog
+    let cacheDirCalls = 0
+    // 只在明细落盘这一次调用里把 _cacheDir 换成抛错实现（run() 其它位置仍要用真实目录），
+    // 直接复刻真实 getter 在「目录被换成根外符号链接」时的行为：当次访问即 throw。
+    h.App._writeSimilarBlockedLog = function (records) {
+      const origCacheDir = this._cacheDir
+      this._cacheDir = () => {
+        cacheDirCalls += 1
+        throw new Error('缓存目录安全检查失败：目录已被替换为符号链接')
+      }
+      try { return origWrite.call(this, records) } finally { this._cacheDir = origCacheDir }
+    }
+    const { summary, warns } = await runWithWarnings(h.App)
+    assert.strictEqual(cacheDirCalls, 1, '前置：明细落盘必须真的求值过一次 _cacheDir（否则没打到故障点）')
+    assert.deepStrictEqual({ pushed: summary.pushed, failed: summary.failed }, { pushed: 1, failed: 0 },
+      `明细落盘失败不得改变推送结果与退出码：${JSON.stringify(summary)}`)
+    assert.ok(warns.some(l => l.includes('近似去重拦截明细写入失败') && l.includes('不影响本轮推送') && l.includes('缓存目录不可用')),
+      `必须只 console.warn 一条「不影响本轮推送」：${JSON.stringify(warns)}`)
+    assert.ok(!realFs.existsSync(path.join(cacheDir, 'similar-blocked.ndjson')), '目录求值失败时不得留下明细文件')
+    const log = realFs.readFileSync(path.join(cacheDir, 'run.log'), 'utf8')
+    const summaryLine = log.split('\n').find(l => l.includes('total=2') && l.includes('pushed=1'))
+    assert.ok(summaryLine, `run() 必须正常走完并写摘要行（异常冒泡会 rethrow、这里连摘要都没有）：${log.slice(-400)}`)
+    assert.ok(/ similar=1/.test(summaryLine), `拦截计数 similar=1 不得丢：${summaryLine}`)
+    assert.ok(!/similarlogged=/.test(summaryLine), `明细写失败（返回 0）时不得追加 similarlogged：${summaryLine}`)
+    assert.ok(!log.split('\n').some(l => l.includes(' ERROR ')), `明细写失败不得在 run.log 落 ERROR 行：${log.slice(-400)}`)
+  })
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

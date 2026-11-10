@@ -390,19 +390,25 @@ function createApp ({
     //   · 落盘前 lstat 一次（同时给出文件类型与大小，规格里的「写前 stat」就在这里）：非普通文件
     //     拒写，≥ SIMILAR_BLOCKED_MAX_BYTES 先把旧件 rename 成 `.1`（覆盖旧 .1）再新建，
     //     磁盘上恒为「现行 + .1」两份；
-    //   · 逐行 append（mode 0o600）；某行失败即停并告警——不再重试，避免磁盘满时刷 200 条告警。
+    //   · 逐行 append（mode 0o600）；某行失败即停并告警——不再重试，避免磁盘满时刷 200 条告警；
+    //   · **整段（含 this._cacheDir() 求值）都必须包在 try 里**：cacheDir 是带 realpath 校验的 getter，
+    //     目录被换成项目根外符号链接、或四层候选目录全不可用时会直接 throw。裸求值会让异常冒泡到
+    //     run() 顶层 catch ⇒ 落 ERROR 行 + 发「运行异常」告警 + rethrow（退出码非 0），而这一轮推送
+    //     其实已经全部成功——与「写失败只 console.warn」的契约相反（与 _writeRunLog 同口径）。
     _writeSimilarBlockedLog (records) {
       if (!Array.isArray(records) || records.length === 0) return 0
-      const dir = this._cacheDir()
-      if (!dir) return 0
-      const file = path.join(dir, 'similar-blocked.ndjson')
-      const capable = ['lstatSync', 'appendFileSync', 'renameSync'].every((name) => typeof fs[name] === 'function')
-      if (!capable) {
-        console.warn('⚠️ 近似去重拦截明细未写入：当前 fs 缺少 appendFileSync/renameSync/lstatSync 能力')
-        return 0
-      }
+      // file 留空串：目录求值就失败时 catch 里用它区分「还没算出路径」与「路径已知但写失败」。
+      let file = ''
       let written = 0
       try {
+        const dir = this._cacheDir()
+        if (!dir) return 0
+        file = path.join(dir, 'similar-blocked.ndjson')
+        const capable = ['lstatSync', 'appendFileSync', 'renameSync'].every((name) => typeof fs[name] === 'function')
+        if (!capable) {
+          console.warn('⚠️ 近似去重拦截明细未写入：当前 fs 缺少 appendFileSync/renameSync/lstatSync 能力')
+          return 0
+        }
         let size = 0
         try {
           const st = fs.lstatSync(file)
@@ -432,7 +438,10 @@ function createApp ({
           }
         }
       } catch (e) {
-        console.warn(`⚠️ 近似去重拦截明细写入失败（不影响本轮推送）：${file}：${Utils.safeErrorText(e, '未知错误')}`)
+        // 统一失败出口：目录求值/轮转等意外异常只告警一次并返回已写入条数（目录求值失败时恒为 0），
+        // 绝不向 run() 冒泡——推送结果、缓存与退出码都不受影响。
+        const where = file || '缓存目录不可用'
+        console.warn(`⚠️ 近似去重拦截明细写入失败（不影响本轮推送）：${where}：${Utils.safeErrorText(e, '未知错误')}`)
       }
       return written
     },
