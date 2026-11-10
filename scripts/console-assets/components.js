@@ -937,7 +937,7 @@ const AUTO_MAX_S = 20
 // 绝不为了等渠道名把按钮卡住，也绝不在弹窗显示后再换文案（会缩一行）。
 const CONFIRM_NAMES_WAIT_MS = 600
 const AUTO_DEFAULT_S = 10
-const AUTO_MAX_FAILS = 3
+const AUTO_MAX_FAILS = 12
 // 数字输入框统一禁用，只允许用加减按钮调整；按住 450ms 后连续变化，
 // 越按越快（最多 50/次），避免从 10 调到 3600 要点几百下。
 const HOLD_START_MS = 450
@@ -1448,7 +1448,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
           ? html`<${Button} variant="danger" onClick=${stopAuto}>停止<//>`
           : html`<${Button} variant="danger-solid" onClick=${askAuto}>开始<//>`}
       </div>`}
-      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会自动停止。</div>
+      <div class="auto-run-note">每轮结束后等待 ${auto.interval} 秒；可调 ${AUTO_MIN_S}–${AUTO_MAX_S} 秒（输入框已锁，长按加减可快速调整）；由服务器常驻运行，关闭页面、切后台、锁屏都不影响，点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次会转入每 10 秒重试，不会停机${auto.degraded ? '（当前源站异常，正在每 10 秒重试）' : ''}。</div>
       <div class="auto-sched">
         <div class="auto-sched-title">分时段间隔<span class="auto-sched-sub">窗口内按下面的秒数跑，其余时间用上面的 ${auto.interval} 秒；可加多条，跨午夜（如 23:00–07:00）也支持</span></div>
         ${schedDraft.length === 0
@@ -1485,7 +1485,7 @@ function TriggerBar ({ onTriggered, locking, setBusy, auto, runs = [], active = 
       ${pending === 'run'
         ? html`<div>将抓取线报并<b>真实推送</b>到：${channelText}。</div><div class="modal-note">推送发出后无法撤回；只想验证抓取流程请用「试运行」（不推送）。</div>`
         : pending === 'auto'
-          ? html`<div>将每轮结束后等待 <b>${clampAutoSeconds(autoDraft)} 秒</b>，自动再次<b>正式运行</b>（真实推送）到：${channelText}。</div><div class="modal-note">最低 3 秒、最高 20 秒；运行在服务器上，关闭页面/切后台/锁屏都不影响；点「停止」才停；连续失败 3 次会自动停止。</div>`
+          ? html`<div>将每轮结束后等待 <b>${clampAutoSeconds(autoDraft)} 秒</b>，自动再次<b>正式运行</b>（真实推送）到：${channelText}。</div><div class="modal-note">最低 3 秒、最高 20 秒；运行在服务器上，关闭页面/切后台/锁屏都不影响；点「停止」才停；连续失败 ${AUTO_MAX_FAILS} 次后转为每 10 秒重试，不会停机。</div>`
           : html`<div>将向全部渠道发送一条<b>真实测试消息</b>：${channelText}。</div><div class="modal-note">这条消息会出现在你的微信/推送客户端里。</div>`}
     <//>
   </div>`

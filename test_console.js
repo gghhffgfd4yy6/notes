@@ -8841,7 +8841,7 @@ async function main () {
       assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
         '服务器端也必须夹在 3–20 秒')
       const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
-      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 3') && tickAutoBody !== '' &&
+      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 12') && consoleSrc.includes('const AUTO_RETRY_MS = 10 * 1000') && tickAutoBody !== '' &&
         consoleSrc.includes("startAction('run-auto'") &&
         tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
         tickAutoBody.includes('if (!lockVerdict.ok)'),
@@ -8850,6 +8850,16 @@ async function main () {
         '上一轮未结束不得叠跑')
       assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
         '自动开关/间隔必须由服务器持久化，重启可恢复')
+      // v3.408：连续失败不得再永久停机——降级重试必须真的接在失败分支上（只加常量不算）
+      assert.ok(consoleSrc.includes('function autoNextDelay') && tickAutoBody.includes('auto.degraded = true') &&
+        tickAutoBody.includes('auto.degraded = false') && tickAutoBody.includes('scheduleAuto(autoNextDelay())'),
+      '连续失败后必须转入 10 秒降级重试，成功后回到正常间隔')
+      assert.ok(tickAutoBody.includes('record.spawnError') && tickAutoBody.includes('AUTO_MAX_SPAWN_FAILS') &&
+        tickAutoBody.includes('stopAuto'),
+      '子进程启动失败（spawn ENOENT/EMFILE）不得按源站抖动无限重试')
+      assert.ok(consoleSrc.includes('degraded: auto.degraded === true') &&
+        consoleSrc.includes('fails: Number.isInteger(auto.fails)'),
+      '降级态与失败计数必须随 console-auto.json 跨重启保留')
       assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')
       // 关闭回调里的清理必须「真的在回调体内且未被注释」：先剥注释，再按花括号配对取回调体。
       const closeHandlerCleanup = (srcText) => {
