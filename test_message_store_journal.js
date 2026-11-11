@@ -472,6 +472,44 @@ check('J2-04 同批「先插入后更新同一身份」：重启后 readMessages
   }
 })
 
+check('J2-05 重启时 maxSize 调小：读端兜底裁剪必须为被裁活条目补墓碑，has() 不得丢失（与旧实现一致）', () => {
+  // 审查员 must_fix（P1 / v3.415）的回归：读端把「回放后仍在缓存里、未墓碑」的最旧 N 条直接 splice
+  // 掉、却不落墓碑，这些身份既不在内存/快照、也不在 .seen.json ⇒ 之后所有写入都不会再为它们补墓碑
+  // ⇒ has() 永远 false，上游重放即重复推送。旧实现（读路径不裁）下一次写入会按 _persistChanges
+  // 口径裁剪并落墓碑，has() 一直为 true——这就是本用例的对账口径。
+  const NAME = 'push.json'
+  const dir = tmpDir('shrink-maxsize')
+  // 强制纯日志、不合并：快照保持空数组，重启只能靠 journal 回放重建数组（真实回放路径）。
+  const constants = { JOURNAL_DIRECT_MAX_BYTES: 0, JOURNAL_MAX_BYTES: 1 << 30 }
+  const store = makeStore({ dir, maxSize: 7, constants })
+  const fp = store.getFilePath(NAME)
+  const jp = journalPathFor(fp)
+  store.saveBatch([1, 2, 3, 4, 5, 6, 7, 8].map(n => ({ id: 'm' + n, title: 'M' + n })), NAME)
+  assert.deepStrictEqual(store.readMessages(fp).map(m => m.id), ['m2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'],
+    '写入侧先自证：上限 7 写 8 条只裁 m1')
+  // 构造「重启时只能靠日志重建」的现场：快照仍是空数组，m2..m8 只在 journal 里，m1 已落墓碑。
+  assert.strictEqual(JSON.parse(fs.readFileSync(fp, 'utf8') || '[]').length, 0, '快照必须还是空的（读路径必须真的回放 journal）')
+  const lines = fs.readFileSync(jp, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
+  assert.deepStrictEqual(lines[0].put.map(m => m.id), ['m2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'], 'journal 必须承载待回放的 7 条')
+  assert.deepStrictEqual((lines[0].drop || []).map(m => m.id), ['m1'], 'journal 必须记下本批被裁的 m1')
+  // 冷启且上限调小到 5：7 条里最旧的 m2/m3 是未墓碑的活条目，只能由读端兜底裁掉。
+  const reopened = makeStore({ dir, maxSize: 5, constants })
+  const got = reopened.readMessages(fp)
+  assert.deepStrictEqual(got.map(m => m.id), ['m4', 'm5', 'm6', 'm7', 'm8'], '读端仍须按 maxSize 收敛（条数上界不变）')
+  assert.strictEqual(got.length, 5, '读结果条数上界必须 = maxSize')
+  // 修前实测：has(m2)/has(m3) 均为 false（内存/快照/墓碑三处都没有）⇒ 上游重放会再推一次。
+  assert.strictEqual(reopened.has({ id: 'm2' }, NAME), true, '被读端裁掉的活条目 m2 必须由墓碑拦下（修前 false）')
+  assert.strictEqual(reopened.has({ id: 'm3' }, NAME), true, '被读端裁掉的活条目 m3 必须由墓碑拦下（修前 false）')
+  // 随后写入一条新消息（旧实现正是在这一步为被裁身份补墓碑）：判重结论必须保持。
+  reopened.saveBatch([{ id: 'm9', title: 'M9' }], NAME)
+  assert.strictEqual(reopened.has({ id: 'm2' }, NAME), true, 'saveBatch 之后 m2 的判重记忆不得丢失')
+  assert.strictEqual(reopened.has({ id: 'm3' }, NAME), true, 'saveBatch 之后 m3 的判重记忆不得丢失')
+  // 再重启一次（只靠快照 + 日志 + 墓碑重建）结论同样成立
+  const again = makeStore({ dir, maxSize: 5, constants })
+  assert.strictEqual(again.has({ id: 'm2' }, NAME), true, '重启后 m2 的判重记忆不得丢失')
+  assert.strictEqual(again.has({ id: 'm3' }, NAME), true, '重启后 m3 的判重记忆不得丢失')
+})
+
 // ============================================================
 section('3. 崩溃恢复')
 // ============================================================

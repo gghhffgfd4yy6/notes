@@ -1563,9 +1563,14 @@ function createMessageStore ({
      *  为什么不连回放新增的墓碑条目一起裁：那会与 _filterTombstonedPuts 互为兜底，任一层被摘掉
      *  测试都看不出（复活的条目被裁掉、活条目照样保住），缺陷被静默掩盖。两层各守一段：
      *  闸门管「不许复活」，这里管「快照里的陈旧前缀不得占着上限」。
-     *  若裁完快照层仍超出（活条目本身已多于上限：maxSize 被下调，或墓碑键上限淘汰了最旧身份），
-     *  按最旧裁到上限——与旧实现「内存只保留最新 maxSize 条」等价；这些身份在旧实现里同样
-     *  早已丢了墓碑，不是读路径新引入的判重损失。 */
+     *  若裁完快照层仍超出（活条目本身已多于上限：maxSize 被下调，或墓碑键上限淘汰了最旧身份，
+     *  也含「快照已写、墓碑未落盘」的崩溃窗口），剩下的都是**未墓碑的活条目**。它们绝不能凭空消失：
+     *  旧实现的读路径不裁，这些条目原地留在数组里，下一次写入由 _persistChanges 按同一个条数上限
+     *  从头部裁掉并 _tombstoneDropped 落墓碑 ⇒ has() 一直为 true、上游重放不会重复推送。本实现读端
+     *  提前裁到上限，因此必须在移除前按**同一口径**（_tombstoneDropped，内部跳过 `_f`）为这些身份
+     *  补墓碑，判重结论才与旧实现等价；不补就是「内存/快照/.seen.json 三处都没有」的永久丢失。
+     *  墓碑写失败（锁忙/写盘失败/键上限当场淘汰）时 fail-closed：只移除「确认已进墓碑」的条目，
+     *  未确认的留在数组里，宁可本轮超出上限也不静默丢判重记忆（`_f` 按设计不入墓碑，与写路径一致）。 */
     _trimMergedByTombstone (filePath, messages, snapshotLength = messages.length) {
       const maxSize = this._resolveMaxSize()
       let excess = messages.length - maxSize
@@ -1583,11 +1588,29 @@ function createMessageStore ({
         }
       }
       if (excess > 0) {
-        if (!this._journalWarned.has(filePath + '|trim')) {
-          this._journalWarned.add(filePath + '|trim')
-          console.warn(`⚠️ 判重日志回放后仍有 ${messages.length} 条（上限 ${maxSize}）且快照里无墓碑可裁，按最旧裁掉 ${excess} 条：${filePath}`)
+        const before = messages.length
+        // 兜底：活条目本身多于上限。先按写路径同口径落墓碑（失败会自己告警），再只移除身份确实
+        // 已进墓碑的条目——读路径绝不能出现「删掉但没人记得」的身份。
+        const doomed = messages.slice(0, excess)
+        this._tombstoneDropped(filePath, doomed, this._tombstoneKeyCap(maxSize, doomed.length))
+        let removable = 0
+        for (const m of doomed) {
+          const b = Utils.getMessageIdentity(m)
+          // `_f`（从未推送、按设计不入墓碑）与无有效身份（has() 本就恒 false）不承载判重记忆，直接移除；
+          // 其余必须确认已进墓碑，写失败就保留（fail-closed）。
+          if (m && m._f === true) { removable++; continue }
+          if (!b.valid || this._tombstoneSetsHas(filePath, b)) { removable++; continue }
+          break
         }
-        messages.splice(0, excess)
+        if (removable > 0) messages.splice(0, removable)
+        if (removable < excess && !this._journalWarned.has(filePath + '|trimfail')) {
+          this._journalWarned.add(filePath + '|trimfail')
+          console.warn(`⚠️ 判重日志回放后超出上限(${maxSize})，且墓碑写入未确认：保留最旧 ${excess - removable} 条活条目不裁（宁可超出上限也不丢判重记忆；下轮写入会按写路径重试）：${filePath}`)
+        }
+        if (removable > 0 && !this._journalWarned.has(filePath + '|trim')) {
+          this._journalWarned.add(filePath + '|trim')
+          console.warn(`⚠️ 判重日志回放后仍有 ${before} 条（上限 ${maxSize}）且快照里无墓碑可裁，按最旧裁掉 ${removable} 条并落墓碑（与旧实现「下一次写入裁剪并落墓碑」等价）：${filePath}`)
+        }
       }
       return messages
     },
