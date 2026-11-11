@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.416 — 控制台常驻运行进程（跨轮复用模块与判重缓存，省掉每轮冷启动） *******
+//* ******* 线报酷推送脚本 v3.417 — 常驻 worker 的墓碑/快照新鲜度与接线测试修复 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -500,6 +500,9 @@ function resetRunStateForWorker () {
   FilterEngine._resetRunCaches()
   Formatter._resetRunCaches()
   MessageStore._resetRunWarnings()
+  // 可观测复位痕迹（仅测试开启；stdout 是协议通道，必须走 stderr）。test_worker_protocol 用它
+  // 断言每轮真的经过本钩子：删掉上面任意一个调用点/删掉本函数调用点都会让该用例变红。
+  if (process.env.XBK_WORKER_TRACE_RESET === '1') console.error('[worker] reset-run-state')
 }
 
 // 摘要必须能安全序列化（一条异常对象/循环引用不能让整条协议行丢失）。

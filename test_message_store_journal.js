@@ -875,6 +875,93 @@ check('J7-01 defaultMessageSignature：journal 变化必须让签名变化（否
 })
 
 // ============================================================
+section('8. P3 常驻进程：判重快照 / 墓碑的内存新鲜度')
+// ============================================================
+
+const identityMsg = (id) => ({ id, title: 'title-' + id, content: 'content-' + id })
+
+check('J8-01 外部进程向 journal 追加一条 → 同进程 readMessages 能看见（_memoSig 必须含 journal 签名）', () => {
+  const dir = tmpDir('memo-journal-append')
+  const NAME = 'push.json'
+  // 强制走 journal（JOURNAL_DIRECT_MAX_BYTES=0），并放大合并阈值保证本轮不会把 journal 合并掉。
+  const store = makeStore({
+    dir,
+    maxSize: 5000,
+    constants: { JOURNAL_DIRECT_MAX_BYTES: 0, JOURNAL_MAX_BYTES: 64 * 1024 * 1024, JOURNAL_MAX_AGE_MS: 365 * 24 * 3600 * 1000 }
+  })
+  const batch = []
+  for (let i = 0; i < 200; i++) batch.push(identityMsg('base-' + i))
+  assert.strictEqual(store.saveBatch(batch, NAME), true, 'saveBatch 应成功')
+  const fp = store.getFilePath(NAME)
+  const jp = journalPathFor(fp)
+  assert.ok(fs.existsSync(jp) && fs.statSync(jp).size > 0, '200 条必须真的走 journal（否则用例没覆盖主写路径）')
+  assert.strictEqual(store.readMessages(fp).length, 200, '本进程应读到 200 条')
+  // 另一个运行进程只追加 journal（v3.412 起生产主写路径）：push.json 的 ino/size/mtime 完全不变。
+  fs.appendFileSync(jp, JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), put: [identityMsg('external-1')] }) + '\n')
+  const reread = store.readMessages(fp)
+  assert.strictEqual(reread.length, 201, `外部追加 journal 后同进程必须看见（实际 ${reread.length} 条）`)
+  assert.ok(reread.some((m) => m.id === 'external-1'), '必须包含外部进程追加的消息')
+})
+
+check('J8-02 journal 被外部删除/截断/重写 → 内存快照失效并按磁盘重读', () => {
+  const dir = tmpDir('memo-journal-rotate')
+  const NAME = 'push.json'
+  const store = makeStore({
+    dir,
+    maxSize: 5000,
+    constants: { JOURNAL_DIRECT_MAX_BYTES: 0, JOURNAL_MAX_BYTES: 64 * 1024 * 1024, JOURNAL_MAX_AGE_MS: 365 * 24 * 3600 * 1000 }
+  })
+  const batch = []
+  for (let i = 0; i < 200; i++) batch.push(identityMsg('base-' + i))
+  assert.strictEqual(store.saveBatch(batch, NAME), true)
+  const fp = store.getFilePath(NAME)
+  const jp = journalPathFor(fp)
+  assert.strictEqual(store.readMessages(fp).length, 200)
+  // 外部删除（轮转/人工清理）：push.json 仍是空快照 ⇒ 必须按磁盘重读成 0 条，不能继续用内存 200 条。
+  fs.rmSync(jp)
+  assert.strictEqual(store.readMessages(fp).length, 0, 'journal 被外部删除后必须按磁盘重读（push.json 未合并 ⇒ 0 条）')
+  // 外部重写成另一份日志：必须看见新内容、旧内容不再可见。
+  fs.writeFileSync(jp, JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), put: [identityMsg('rotated-1')] }) + '\n')
+  assert.deepStrictEqual(store.readMessages(fp).map((m) => m.id), ['rotated-1'], 'journal 被外部重写后必须按新内容重读')
+  // 外部 truncate 成 0：等价于「日志被清空」，必须回到快照内容（此处 0 条）。
+  fs.truncateSync(jp, 0)
+  assert.strictEqual(store.readMessages(fp).length, 0, 'journal 被外部截断后必须判为不新鲜并重读')
+})
+
+check('J8-03 外部删除 .seen.json 后同进程不再用旧墓碑；外部新增墓碑后同进程能看见', () => {
+  const dir = tmpDir('memo-tombstone')
+  const store = makeStore({ dir, maxSize: 1000 })
+  const fp = path.join(dir, 'push.json')
+  fs.writeFileSync(fp, '[]')
+  const seen = fp + '.seen.json'
+  const writeSeen = (ids) => {
+    // 真实写方是 writeAtomic（rename 换 inode）；这里同样先删再写，覆盖 inode 变化。
+    fs.rmSync(seen, { force: true })
+    fs.writeFileSync(seen, JSON.stringify({ v: 1, id: ids, urlOnly: [], idWithUrl: [], anon: [] }))
+  }
+  writeSeen(['tomb-old'])
+  assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'tomb-old' }), true, '磁盘已有墓碑应命中')
+  // 控制台导入/恢复的动作就是 unlink <push.json>.seen.json（removeStaleTombstoneFile）；
+  // worker 是另一个进程，必须丢掉导入前的内存墓碑，否则本应重推的身份被永久静默漏推。
+  fs.rmSync(seen)
+  assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'tomb-old' }), false,
+    '外部删除 .seen.json 后不得再用旧内存墓碑')
+  // 反向：worker 先缓存空集，外部新增墓碑后必须能看见（否则导入进来的墓碑身份被重推）。
+  writeSeen(['tomb-new'])
+  assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'tomb-new' }), true,
+    '外部新增墓碑后同进程必须能看见')
+  // 外部替换成另一份墓碑：旧身份失效、新身份命中。
+  writeSeen(['tomb-replaced'])
+  assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'tomb-new' }), false, '外部替换墓碑后旧身份必须失效')
+  assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'tomb-replaced' }), true)
+  // 本进程写完墓碑后必须立刻记录最新签名（后续判重直接信任内存，不退化成每轮全量重读）。
+  store._tombstoneDropped(fp, [{ id: 'drop-1' }], 1000)
+  assert.strictEqual(store._tombstoneSig[fp], store._tombstoneFileSig(fp),
+    '本进程写墓碑后记录的签名必须与磁盘一致')
+  assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'drop-1' }), true, '本进程刚写的墓碑必须命中')
+})
+
+// ============================================================
 console.log(`\n判重日志套件：通过 ${pass} / 失败 ${fail}`)
 cleanup()
 if (fail > 0) console.error(`\n❌ ${fail} 项失败`)

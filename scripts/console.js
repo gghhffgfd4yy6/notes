@@ -3455,7 +3455,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, lineDetailFetch, watchNotifier } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, lineDetailFetch, watchNotifier, createWorker = createRunWorker } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -3616,7 +3616,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 首次要跑一轮时才真正起进程（lazy），控制台空转不占一个 node；每个实例一个 worker。
   // 启动即清理上一代控制台遗留的孤儿：控制台被 SIGKILL 时 worker 收不到 exit，只能靠
   // 下一代按 pid 文件 + /proc cmdline 指纹（防 pid 复用误杀）整组收掉。
-  const runWorker = createRunWorker({
+  const runWorker = createWorker({ // 测试可注入 spawn 替身（生产恒为 createRunWorker）
     entryFile: ENTRY_SINGLE,
     root: ROOT,
     stateDir,

@@ -31,7 +31,7 @@ const {
   workerPidFile,
   RUN_WORKER_STOP_GRACE_MS
 } = require('./scripts/console-worker')
-const { startAction, canUseRunWorker } = require('./scripts/console')
+const { startAction, canUseRunWorker, createConsole } = require('./scripts/console')
 
 const cases = []
 function test (name, fn) { cases.push({ name, fn }) }
@@ -154,6 +154,54 @@ function makeFakeSpawn ({ exitCode = 0, output = 'one-shot-ok\n' } = {}) {
       child.emit('exit', exitCode, null)
       child.emit('close', exitCode, null)
     }, 5)
+    return child
+  }
+  impl.calls = calls
+  return impl
+}
+
+// 常驻 worker 的替身（只按协议回一行 JSON）：给「控制台 → worker 接线」用例注入，
+// 避免为了断言接线真的跑一轮抓取/推送。与 makeFakeSpawn 分开：这里模拟的是 --worker 子进程。
+function makeFakeWorkerSpawn () {
+  const calls = []
+  const impl = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts })
+    const child = new EventEmitter()
+    child.pid = 43000 + calls.length
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.stdin = new PassThrough()
+    child.killed = false
+    child.kill = () => { child.killed = true }
+    let buf = ''
+    child.stdin.on('data', (chunk) => {
+      buf += String(chunk)
+      let idx
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx)
+        buf = buf.slice(idx + 1)
+        let msg = null
+        try { msg = JSON.parse(line) } catch (e) { continue }
+        if (!msg || typeof msg !== 'object') continue
+        if (msg.cmd === 'exit') {
+          setTimeout(() => {
+            child.stdout.end()
+            child.stderr.end()
+            child.emit('exit', 0, null)
+            child.emit('close', 0, null)
+          }, 1)
+        } else if (msg.cmd === 'run') {
+          setTimeout(() => {
+            child.stdout.write(JSON.stringify({
+              ok: true,
+              summary: { total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0, cacheSaved: true },
+              exitCode: 0,
+              roundMs: 1
+            }) + '\n')
+          }, 2)
+        }
+      }
+    })
     return child
   }
   impl.calls = calls
@@ -448,6 +496,60 @@ test('隔离：内存判重快照对外部改写失效（常驻进程不能拿�
   const reread = MessageStore.readMessages(file)
   assert.strictEqual(reread.length, 2, `外部改写后应按磁盘重读（实际 ${reread.length} 条）`)
   assert.strictEqual(reread[0].id, 'b1')
+})
+
+// ── F2：关键接线（删掉即整套功能失效，必须有真实路径用例锁住）──────────────
+test('接线：startAction 经 workerForChildren 真实路径选中常驻 worker（runner=worker 且 pid>0）', async () => {
+  const dir = dirOf('wiring-worker')
+  const fakeWorkerSpawn = makeFakeWorkerSpawn()
+  const inst = createConsole({
+    token: 'test-token-for-wiring-0123456789',
+    stateDir: dir,
+    // 只替换 worker 进程的 spawn：createConsole 内部仍走 createRunWorker + workerByChildren.set，
+    // 因此本用例锁的是 scripts/console.js 里那条「控制台 → worker」接线本身。
+    createWorker: (opts) => createRunWorker({ ...opts, spawnImpl: fakeWorkerSpawn })
+  })
+  try {
+    // 有意不传 deps.worker：worker 必须由 createConsole 登记进 workerByChildren 后经
+    // workerForChildren(activeChildren) 取到。删掉 workerByChildren.set 这一行 ⇒ 退回一次性 spawn。
+    const record = startAction('run', Date.now(), inst.activeChildren, dir, 'wiring-lock-token', dir, {
+      spawnImpl: makeFakeSpawn()
+    })
+    assert.strictEqual(record.runner, 'worker',
+      `startAction 必须选中常驻 worker（实际 runner=${record.runner}；接线断了会退回一次性 spawn）`)
+    assert.ok(record._child && record._child.__runWorker === true, '本轮 record 应挂上常驻 worker 的伪 child')
+    await waitFor(() => inst.runWorker.pid > 0, 2000, '常驻 worker 进程应已启动')
+    assert.ok(inst.runWorker.pid > 0, `常驻 worker 必须有 pid（实际 ${inst.runWorker.pid}）`)
+    assert.strictEqual(fakeWorkerSpawn.calls.length, 1, '应真的拉起一次常驻 worker 子进程')
+    assert.match(String(fakeWorkerSpawn.calls[0].args[0]), /xbk_function_v3\.js$/)
+    assert.ok(fakeWorkerSpawn.calls[0].args.includes('--worker'), '常驻进程必须以 --worker 启动')
+    await waitFor(() => record.finishedAt > 0, 3000, '常驻 worker 一轮应结束')
+    assert.strictEqual(record.exitCode, 0)
+  } finally {
+    inst.runWorker.dispose()
+  }
+})
+
+test('接线：--worker 连续两轮都经过 resetRunStateForWorker（每轮复位钩子不可省）', async () => {
+  const dir = dirOf('reset-trace')
+  const worker = startRawWorker(dir, { XBK_WORKER_TRACE_RESET: '1' })
+  const resetCount = () => worker.stderr().split('[worker] reset-run-state').length - 1
+  try {
+    worker.send({ cmd: 'run', args: [] })
+    const first = await worker.next()
+    assert.strictEqual(first.ok, true, `第一轮协议应 ok：${JSON.stringify(first)}`)
+    await waitFor(() => resetCount() >= 1, 2000, '第一轮应留下复位痕迹')
+    assert.strictEqual(resetCount(), 1, `第一轮必须调用一次复位钩子（实际 ${resetCount()} 次）`)
+    worker.send({ cmd: 'run', args: [] })
+    const second = await worker.next()
+    assert.strictEqual(second.ok, true, `第二轮协议应 ok：${JSON.stringify(second)}`)
+    await waitFor(() => resetCount() >= 2, 2000, '第二轮应再留下一次复位痕迹')
+    assert.strictEqual(resetCount(), 2, `第二轮必须再复位一次（累计 ${resetCount()} 次；删掉 resetRunStateForWorker() 调用点会变 0）`)
+    worker.send({ cmd: 'exit' })
+    await withTimeout(worker.exited, 5000, 'exit 后 5s 内退出')
+  } finally {
+    if (worker.child.exitCode === null && worker.child.signalCode === null) worker.kill('SIGKILL')
+  }
 })
 
 // ── 开关 ───────────────────────────────────────────────────────────────────
