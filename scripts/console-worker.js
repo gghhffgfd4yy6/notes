@@ -134,6 +134,17 @@ function createRunWorker ({
   let degradeReason = ''
   let stopping = null
   let closed = false
+  // 「预期停止」原因（关停 / 用户取消）：worker 是被**我们自己**发信号杀掉的，这种死亡既不是
+  // 启动失败（模块加载崩/入口崩），也不是崩溃——必须与 failStart 分清，否则 settle 的 fallback
+  // 分支会当场再拉起一整轮一次性 spawn（用户点「停止」变成立刻重跑；关停期间又起一个新 node
+  // 进程），且每次都给 startFails +1（首轮取消 3 次即永久降级）。
+  // 只记第一次置位的来源（关停先发 exit 再逐个 SIGKILL 伪 child，后者不该把原因改写成「取消」）。
+  // run() 开新一轮时复位：上一轮的预期停止绝不能泄漏到下一轮（那会把真崩溃也当停止吞掉）。
+  let stopExpectation = ''
+
+  function markStopExpected (reason) {
+    if (!stopExpectation) stopExpectation = reason
+  }
 
   function emitLog (message) {
     try { log(message) } catch (e) { /* 日志失败不影响调度 */ }
@@ -212,7 +223,10 @@ function createRunWorker ({
     c.on('error', (err) => {
       const reason = `常驻 worker 启动失败：${err && err.message ? err.message : String(err)}`
       if (pending) {
-        if (inc.completed === 0) settle(failStart(reason))
+        if (inc.completed === 0 && stopExpectation) {
+          // 关停/取消判死的这一轮：按「已停止」结算——不计数、不降级、不给调用方 fallback。
+          settle({ ok: false, error: `${stopExpectation}（${reason}）`, died: true, stopped: true, code: null, signal: null })
+        } else if (inc.completed === 0) settle(failStart(reason))
         else settle({ ok: false, error: reason })
       } else if (inc.completed === 0) {
         failStart(reason)
@@ -223,7 +237,12 @@ function createRunWorker ({
     c.on('exit', (code, signal) => {
       const reason = `常驻 worker 退出（code=${code === null ? 'null' : code}, signal=${signal || 'none'}）`
       if (pending) {
-        if (inc.completed === 0) {
+        if (inc.completed === 0 && stopExpectation) {
+          // 关停/取消把这一轮判死（第一轮还没跑完就被 SIGTERM/SIGKILL）：**不是**启动失败。
+          // 走 failStart 会让调用方 fallback → 再 spawn 一整轮（停止变重跑），这里只如实结算。
+          settle({ ok: false, error: `${stopExpectation}（${reason}）`, died: true, stopped: true, code, signal })
+          emitLog(`ℹ️ ${reason}：本轮按「${stopExpectation}」处理，不重跑、不计启动失败`)
+        } else if (inc.completed === 0) {
           // 刚拉起来就死（模块加载失败/入口崩）：按「启动失败」计数，第 3 次触发降级。
           settle(failStart(reason))
         } else {
@@ -262,6 +281,9 @@ function createRunWorker ({
     if (closed) return Promise.resolve({ fallback: true, error: '常驻 worker 已关闭' })
     if (degraded) return Promise.resolve({ fallback: true, error: degradeReason })
     if (pending) return Promise.resolve({ ok: false, error: '常驻 worker 正在执行上一轮（不允许并发）' })
+    // 新一轮开始：清掉上一轮留下的「预期停止」。这一步必须在上面三道早退之后——早退时仍在飞的
+    // 那一轮要留住自己的预期停止（取消信号可能刚发过）。
+    stopExpectation = ''
     let c
     try { c = ensureChild() } catch (e) {
       return Promise.resolve(failStart(`常驻 worker 启动失败：${e && e.message ? e.message : String(e)}`))
@@ -286,6 +308,8 @@ function createRunWorker ({
     if (stopping) return stopping
     const c = child
     if (!c) return Promise.resolve()
+    // 先置位再发信号：在飞那一轮会被下面的 exit / 调用方的 SIGKILL 判死，那属于「预期停止」。
+    markStopExpected('控制台关停')
     stopping = new Promise((resolve) => {
       let done = false
       const finish = () => { if (done) return; done = true; resolve() }
@@ -317,7 +341,12 @@ function createRunWorker ({
     shutdown,
     dispose,
     cleanupOrphans: () => cleanupOrphanWorker({ pidFile, entryFile, log: emitLog }),
-    cancelRound: (signal = 'SIGTERM') => { if (child) killGroup(child.pid, signal) },
+    cancelRound: (signal = 'SIGTERM') => {
+      // 先置位再发信号（顺序不能反：信号可能立即触发 exit 回调）。
+      markStopExpected('用户取消本轮')
+      if (child) killGroup(child.pid, signal)
+    },
+
     get pid () { return child ? child.pid : 0 },
     get hasChild () { return Boolean(child) },
     get degraded () { return degraded },

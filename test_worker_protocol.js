@@ -442,6 +442,104 @@ test('孤儿清理：属主控制台还活着时不动它（避免误杀另一�
   }
 })
 
+// ── P3 must_fix 回归：关停/取消判死的轮次不得被当成「启动失败」再起一轮 ──────────
+// 生产入口有两条：① console.js 的关停序列（先 runWorker.shutdown() 发 {"cmd":"exit"}，再对
+// activeChildren 逐个 SIGKILL；伪 child.kill → worker.cancelRound → killGroup(-pid)）；
+// ② /api/runs/cancel（置 cancelled/cancelRequestedAt 后 record._child.kill('SIGTERM')）。
+// 两条都走**生产同一路径**：真 createRunWorker + 真 startAction，只把一次性 spawn 换成记录器。
+// 判据要点：spawnImpl 调用次数必须为 0（否则「点停止」变成「立刻重跑一整轮抓取+推送」），
+// startFails 必须仍为 0（首轮上取消 3 次即永久降级为一次性 spawn）。
+function makeDeafStub (name) {
+  // 一个「收下 run 命令但永不回协议行、也不理 exit」的入口：模拟「worker 已跑起来、第一轮还在跑」。
+  return writeStub(name, "'use strict'\nprocess.stdin.resume()\nprocess.stdin.on('data', () => {})\n")
+}
+
+async function startInFlightRound (dir, entry, spawnImpl, lockToken) {
+  const worker = createRunWorker({
+    entryFile: entry,
+    root: TMP,
+    stateDir: dir,
+    timeoutMs: 60000,
+    stopGraceMs: 200,
+    log: () => {}
+  })
+  const children = new Set()
+  const record = startAction('run', Date.now(), children, dir, lockToken, dir, { worker, spawnImpl })
+  await waitFor(() => record.runner === 'worker' && worker.hasChild && worker.pid > 0, 3000,
+    '常驻 worker 应已拉起并在跑这一轮')
+  await sleep(50) // 让 run 命令真的进到子进程（在飞态：pending 已登记、还没回协议行）
+  return { worker, children, record }
+}
+
+test('关停：在飞一轮被 shutdown + SIGKILL 收尾 → 不再 respawn，也不计启动失败', async () => {
+  const dir = dirOf('stop-shutdown')
+  const entry = makeDeafStub('stub-deaf-shutdown.js')
+  const fakeSpawn = makeFakeSpawn()
+  const { worker, children, record } = await startInFlightRound(dir, entry, fakeSpawn, 'lock-shutdown')
+  try {
+    // 与 scripts/console.js 的关停序列逐项同序（:7198 先 shutdown，:7199-7201 再逐个 SIGKILL）
+    const stop = worker.shutdown()
+    for (const child of children) { try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ } }
+    await withTimeout(stop, 5000, 'shutdown 应在宽限内完成')
+    await waitFor(() => record.finishedAt > 0, 3000, '被关停的这一轮必须收尾（finishedAt > 0）')
+    assert.strictEqual(fakeSpawn.calls.length, 0,
+      `关停期间不得再拉起一次性 spawn（实际 ${fakeSpawn.calls.length} 次 ⇒ 关停中又多起了一个 node 进程）`)
+    assert.strictEqual(worker.startFails, 0,
+      `关停不是启动失败（startFails=${worker.startFails}；每次关停 +1 会让首轮上取消 3 次即永久降级）`)
+    assert.strictEqual(worker.degraded, false, '关停不得把 worker 打成降级')
+    assert.strictEqual(record.runner, 'worker', '关停收尾的这一轮不应被改写成 runner=spawn')
+    assert.ok(!record.output.includes('one-shot-ok'), '关停后不该出现一次性运行的输出')
+  } finally {
+    worker.dispose()
+  }
+})
+
+test('取消：在飞一轮被 SIGTERM 判死 → 不再 respawn，startFails 仍为 0', async () => {
+  const dir = dirOf('stop-cancel')
+  const entry = makeDeafStub('stub-deaf-cancel.js')
+  const fakeSpawn = makeFakeSpawn()
+  const { worker, record } = await startInFlightRound(dir, entry, fakeSpawn, 'lock-cancel')
+  try {
+    // 与 /api/runs/cancel 同口径（console.js:7074-7092）
+    record.cancelled = true
+    record.cancelRequestedAt = Date.now()
+    record._child.kill('SIGTERM')
+    await waitFor(() => record.finishedAt > 0, 3000, '被取消的这一轮必须收尾（finishedAt > 0）')
+    assert.strictEqual(fakeSpawn.calls.length, 0,
+      `取消后不得再拉起一次性 spawn（实际 ${fakeSpawn.calls.length} 次 ⇒ 用户点停止变成立刻重跑）`)
+    // 这条是 worker 层修复的判别式：console 层的「已取消就不 spawn」防御只挡 spawn、挡不住
+    // failStart 的 startFails+1（3 次取消即永久降级），所以必须在这里断言计数。
+    assert.strictEqual(worker.startFails, 0,
+      `取消不是启动失败（startFails=${worker.startFails}）`)
+    assert.strictEqual(record.runner, 'worker', '取消收尾的这一轮不应被改写成 runner=spawn')
+  } finally {
+    worker.dispose()
+  }
+})
+
+test('防御：已收到停止请求时 worker 返回 fallback → 不 spawn、按已停止收尾（对照：无停止请求照旧降级 spawn）', async () => {
+  const dir = dirOf('fallback-cancel')
+  const fallingBack = { pid: 0, hasChild: false, run: () => Promise.resolve({ fallback: true, error: '常驻 worker 连续 3 次启动失败' }), cancelRound: () => {} }
+  const fakeSpawn = makeFakeSpawn()
+  const record = startAction('run', Date.now(), new Set(), dir, 'lock-fallback-cancel', dir, { worker: fallingBack, spawnImpl: fakeSpawn })
+  record.cancelled = true
+  record.cancelRequestedAt = Date.now()
+  await waitFor(() => record.finishedAt > 0, 2000, '应直接按已停止收尾')
+  assert.strictEqual(fakeSpawn.calls.length, 0,
+    `已收到停止请求时不得再 spawn（实际 ${fakeSpawn.calls.length} 次 ⇒ worker 恰在点停止前一瞬自行退出时会被重跑）`)
+  assert.strictEqual(record.runner, 'worker', '这一轮从未改走一次性 spawn，runner 应保持 worker')
+  assert.ok(record.output.includes('已收到停止请求'), '应落一条说明进本轮输出')
+
+  // 对照：同一条 fallback、但没有停止请求 ⇒ 既有降级行为必须原样保留（推送不中断）
+  const dir2 = dirOf('fallback-no-cancel')
+  const fakeSpawn2 = makeFakeSpawn()
+  const record2 = startAction('run', Date.now(), new Set(), dir2, 'lock-fallback-plain', dir2, { worker: fallingBack, spawnImpl: fakeSpawn2 })
+  await waitFor(() => fakeSpawn2.calls.length === 1 && record2.finishedAt > 0, 3000,
+    '无停止请求时 fallback 应照旧拉起一次性子进程')
+  assert.strictEqual(record2.runner, 'spawn', '降级路径的 runner 应变成 spawn')
+  assert.strictEqual(record2.exitCode, 0)
+})
+
 // ── 验收 3：跨轮隔离 ───────────────────────────────────────────────────────
 test('隔离：App 的限频/告警去重状态逐项复位', () => {
   const { App } = require('./xbk_function_v3')

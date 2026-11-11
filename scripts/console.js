@@ -766,8 +766,29 @@ function startWorkerAction (record, action, worker, activeChildren, spawnImpl) {
   if (activeChildren) activeChildren.add(pseudo)
   record._child = pseudo
   record.runner = 'worker'
+  // 收尾但不 spawn：只在「已收到停止请求」的 fallback 防御分支用。
+  const finishWithoutSpawn = (reason) => {
+    appendProduced(record, `\n[console] ${reason}\n`)
+    record.exitCode = null
+    record.exitedAt = Date.now()
+    record.closedAt = Date.now()
+    finishRun(record, null)
+    pseudo.emit('exit', record.exitCode, null)
+    pseudo.emit('close', record.exitCode, null)
+    if (activeChildren) activeChildren.delete(pseudo)
+  }
   const settle = (result) => {
     if (result && result.fallback) {
+      // 防御（P3 must_fix）：这一轮已经收到过停止请求时，绝不能再起一整轮一次性 spawn。
+      // worker 恰在用户点「停止」前一瞬自行退出（或关停竞态里被判死）时仍会返回 fallback，
+      // 此时 spawn 等于把「停止」变成「立刻重跑一轮完整抓取+推送」。这里只落一条说明并收尾；
+      // 锁/计时器照常由 finishRun 释放，record 留在同一轮里（不再有子进程可等）。
+      if (record.cancelRequestedAt) {
+        if (activeChildren) activeChildren.delete(pseudo)
+        record._child = null
+        finishWithoutSpawn('已收到停止请求，常驻 worker 启动失败不再重跑，本轮按已停止收尾')
+        return
+      }
       if (activeChildren) activeChildren.delete(pseudo)
       record._child = null
       record.runner = 'spawn'

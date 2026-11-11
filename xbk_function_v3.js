@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.419 — 清 CodeQL 文件竞态 / Sonar 3 条 / Codacy 误报登记 *******
+//* ******* 线报酷推送脚本 v3.420 — 关停/取消不再触发一次性重跑 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
