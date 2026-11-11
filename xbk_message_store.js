@@ -474,6 +474,10 @@ function createMessageStore ({
     _memoryCache: {},
     // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
     _memoCount: 0,
+    // P3（常驻 worker）：内存快照对应的磁盘文件签名（ino:size:mtimeMs）。常驻进程跨轮复用
+    // _memoryCache 省掉每轮 13MB 的解析，但控制台导入/恢复、另一个运行进程写盘都会改文件——
+    // 没有这层校验就会拿着上一轮的旧快照判重（漏推/重推）。命中前一次 statSync（微秒级）足够。
+    _memoSig: {},
     // 身份索引缓存：WeakMap 按“权威内存缓存数组引用”绑定预计算身份索引，批量 has 判重 O(1)，
     // 避免对同一文件反复线性扫描；权威数组每次变更都是新对象引用（_memoSet 全量替换），
     // 数组被 GC 回收时索引随之自动释放，无需手动失效。
@@ -488,6 +492,11 @@ function createMessageStore ({
     // 若未来 pushUrl 数量级增长，需按与 _MEMO_MAX 同口径补键上限（本注释锁定该判定）。
     _tombstones: new Map(),
     _tombstoneLoaded: new Set(),
+    // P3（常驻 worker）：内存墓碑集合对应的磁盘签名（`<cache>.seen.json` 的 ino:size:mtimeMs；
+    // 文件不存在显式记 'missing'）。判重入口按需 stat 一次：外部删除/替换/重写（控制台导入会
+    // unlink .seen.json）就让内存集合失效并按磁盘重读；只有本进程写完墓碑后立即记录最新签名，
+    // 才允许直接信任内存。没有这层校验，常驻 worker 会拿导入前的旧墓碑永久漏推/重推。
+    _tombstoneSig: {},
     // 墓碑最近一次读盘结果（按缓存文件路径）：仅用于区分「确认缺失」与「读取失败」，
     // 决定 _tombstoneLoaded 是否置位（missing/ok 置位，其余保留重试窗口）。
     _tombstoneLoadStatus: {},
@@ -524,6 +533,54 @@ function createMessageStore ({
     _journalSince: {},
     _journalWarned: new Set(),
 
+    /** P3（常驻 worker）：磁盘文件签名（`ino:size:mtimeMs`，不存在记 'missing'、读不到记
+     *  'unknown'）。**必须同时覆盖 push.json 与 `<push.json>.journal.ndjson`**：v3.412 起生产
+     *  规模缓存的新增/更新只追加进 journal，push.json 很少重写——只看快照会让另一个进程追加的
+     *  记录对常驻进程完全不可见（readMessages 命中内存直接返回，不再回放 journal ⇒ 重复推送）。
+     *  journal 被外部删除/轮转/合并（truncate 或重写）同样体现在签名里。 */
+    _memoFileSig (filePath) {
+      const sigOf = (p) => {
+        try {
+          const st = fs.statSync(p)
+          return `${st.ino}:${st.size}:${st.mtimeMs}`
+        } catch (e) {
+          return e && e.code === 'ENOENT' ? 'missing' : 'unknown'
+        }
+      }
+      return `${sigOf(filePath)}|${sigOf(journalPathFor(filePath))}`
+    },
+
+    /** P3（常驻 worker）：内存快照是否仍代表磁盘现状。外部改过（控制台导入/恢复、另一个
+     *  运行进程写入、手工替换）→ 丢弃内存副本并返回 false，让本轮按磁盘重读；push.json 缺失时
+     *  仍返回 true（保留既有「常驻进程用内存快照自动恢复」的保护，不在删除瞬间丢判重记忆）。
+     *  journal 一侧任何变化（追加/删除/截断/重写）都必须判为不新鲜。 */
+    _memoIsFresh (filePath) {
+      const key = typeof filePath === 'string' ? filePath : String(filePath)
+      const recorded = this._memoSig[key]
+      if (typeof recorded !== 'string' || recorded === '') return true
+      const current = this._memoFileSig(key)
+      if (current === recorded) return true
+      // 快照缺失/读不到：沿用既有保护（内存快照权威，不在删除瞬间丢判重记忆）。
+      const currentMain = current.split('|')[0]
+      if (currentMain === 'missing' || currentMain === 'unknown') return true
+      try { delete this._memoryCache[key] } catch (e) { /* 忽略 */ }
+      try { delete this._memoSig[key] } catch (e) { /* 忽略 */ }
+      try { this._verified.delete(key) } catch (e) { /* 忽略 */ }
+      this._memoCount = Object.keys(this._memoryCache).length
+      console.warn(`缓存文件或判重日志已被其它进程改写，丢弃进程内旧快照并按磁盘重读：${key}`)
+      return false
+    },
+
+    /** P3（常驻 worker）：告警去重状态复位（一次性 spawn 每轮都是新进程，这些标记天然为空）。 */
+    _resetRunWarnings () {
+      warnedEnvDir = ''
+      warnedEnvOverride = ''
+      this._journalWarned.clear()
+      this._residualTombstoneWarned.clear()
+      this._memoWarned = false
+      return true
+    },
+
     /** 带上限的内存缓存写入：超限时淘汰最旧键（磁盘不受影响），防理论无限增长；返回是否写入成功 */
     _memoSet (filePath, val) {
     // 键归一化：非字符串键（Symbol/数字等）统一 String 化，保证可被 Object.keys 枚举并参与淘汰，
@@ -545,6 +602,7 @@ function createMessageStore ({
           // 不再被识别为索引键、会被当「最旧键」淘汰（行为翻转）；恢复 \d 语义。
           const oldest = keys.find(k => typeof k === 'string' && !/^(?:0|[1-9]\d*)$/.test(k)) ?? keys[0]
           try { delete this._memoryCache[oldest] } catch (e) { /* 忽略 */ }
+          try { delete this._memoSig[oldest] } catch (e) { /* 忽略 */ }
           // 淘汰后按实际键数校准计数（防御外部直删导致的漂移；新增键由下方统一自增）。
           // P3（审查 2026-08-15）：依赖 delete 一定成功——当前实现 delete 永不抛错（自身属性可配置），
           // 属理论防御；若未来键为不可配置属性，此处计数会与键数脱钩（注释锁定）。
@@ -567,6 +625,7 @@ function createMessageStore ({
       } else {
         this._memoryCache[key] = val
       }
+      this._memoSig[key] = this._memoFileSig(key)
       return true
     },
 
@@ -916,7 +975,10 @@ function createMessageStore ({
 
     readMessages (filePath) {
     // R5-2：hasOwnProperty 读取（'__proto__' 直读会返回 Object.prototype 而非缓存值）
-      if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
+    // P3（常驻 worker）：命中前先校验磁盘签名——外部导入/另一个进程写入后必须按磁盘重读，
+    // 否则常驻进程会拿旧快照判重（漏推/重推）。文件缺失仍走下方既有「自动恢复」保护。
+      if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath) &&
+        this._memoIsFresh(filePath)) {
       // 常驻进程保护：外部误删缓存文件时，内存中的权威快照继续用于判重，
       // 并尝试原子恢复磁盘文件；恢复失败时保留旧快照，不写入空数组。
       // v3.x：按文件记录“已验证”标记——仅首次内存命中未验证时做一次 existsSync+恢复检查，
@@ -1398,6 +1460,7 @@ function createMessageStore ({
         if (hadMemo) this._memoSet(filePath, memoBefore)
         else {
           try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
+          try { delete this._memoSig[filePath] } catch (e) { /* 忽略 */ }
         }
       }
       // P2（审查 2026-08-15）：非数组入参曾退化为「写空数组」——会在未读取磁盘的情况下把去重
@@ -1489,6 +1552,7 @@ function createMessageStore ({
         if (hadMemo) this._memoSet(filePath, memoBefore)
         else {
           try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
+          try { delete this._memoSig[filePath] } catch (e) { /* 忽略 */ }
         }
       }
     },
@@ -1911,7 +1975,19 @@ function createMessageStore ({
    *  故按结果分流：missing（文件确实不存在，读盘已给出确定答案）与读到内容都置位并缓存；
    *  仅 ioError/unsafe/tooLarge 不置位，下次调用重试（_readTombstoneData 已对这些补了告警）。 */
     _loadTombstones (filePath) {
-      if (this._tombstoneLoaded.has(filePath)) return this._tombstones.get(filePath)
+      if (this._tombstoneLoaded.has(filePath)) {
+        const recorded = this._tombstoneSig[filePath]
+        // 没有签名（旧调用方手工置位/历史路径）= 沿用旧行为直接信任；有签名则按需校验磁盘。
+        if (typeof recorded !== 'string' || recorded === '') return this._tombstones.get(filePath)
+        const current = this._tombstoneFileSig(filePath)
+        // stat 读不到（权限/IO）不主动失效，避免每条消息都重试磁盘；能读到且变了才失效。
+        if (current === '' || current === recorded) return this._tombstones.get(filePath)
+        // 外部删除/替换/重写：丢弃内存集合并按磁盘重读（控制台导入/恢复 = unlink .seen.json）。
+        this._tombstones.delete(filePath)
+        this._tombstoneLoaded.delete(filePath)
+        try { delete this._tombstoneLoadStatus[filePath] } catch (e) { /* 忽略 */ }
+        console.warn(`墓碑文件已被其它进程改写，丢弃进程内旧墓碑并按磁盘重读：${filePath}.seen.json`)
+      }
       const ts = { id: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anon: new Map() }
       this._tombstones.set(filePath, ts)
       const data = this._readTombstoneData(filePath)
@@ -1922,16 +1998,34 @@ function createMessageStore ({
         fill(ts.urlOnly, data.urlOnly)
         fill(ts.idWithUrl, data.idWithUrl)
         fill(ts.anon, data.anon)
-        this._tombstoneLoaded.add(filePath)
+        this._markTombstonesLoaded(filePath)
       } else if (this._tombstoneLoadStatus[filePath] === 'missing' ||
         this._tombstoneLoadStatus[filePath] === 'empty' ||
         this._tombstoneLoadStatus[filePath] === 'corrupt') {
         // C3-008：missing（确认不存在）/ empty（0 字节，没有任何身份可复用）/ corrupt（已改名隔离）
         // 都是「磁盘已给出确定答案」，必须置位——旧实现只认 missing，0 字节与损坏文件于是每条消息
         // 都重读一次整份墓碑（上限 8MiB ⇒ N×8MiB 读放大）且每次读失败都再打一条 WARN。
-        this._tombstoneLoaded.add(filePath)
+        this._markTombstonesLoaded(filePath)
       }
       return ts
+    },
+
+    /** P3（常驻 worker）：墓碑文件签名（`.seen.json` 的 ino:size:mtimeMs）；文件不存在显式
+     *  记 'missing'，读不到（权限/IO）记 ''（视为未知，不主动失效）。 */
+    _tombstoneFileSig (filePath) {
+      try {
+        const st = fs.statSync(filePath + '.seen.json')
+        return `${st.ino}:${st.size}:${st.mtimeMs}`
+      } catch (e) {
+        return e && e.code === 'ENOENT' ? 'missing' : ''
+      }
+    },
+
+    /** 记录「内存墓碑集合对应的磁盘签名」：读盘成功/确认缺失、以及本进程原子写完墓碑后调用。
+     *  写完立刻记最新签名 = 后续判重直接信任内存，不必每轮全量重读磁盘。 */
+    _markTombstonesLoaded (filePath) {
+      this._tombstoneLoaded.add(filePath)
+      this._tombstoneSig[filePath] = this._tombstoneFileSig(filePath)
     },
 
     /** 墓碑读取问题告警：每进程每文件每类只打一次（C3-008：旧实现每条消息都 warn）。 */
@@ -2173,9 +2267,10 @@ function createMessageStore ({
       // 静默放弃本次写入，避免基于旧快照的原子替换覆盖抢占者已合并的身份
       if (!this._isTombstoneLockOwner(lockPath, token)) return
       if (!this._saveTombstones(filePath, next)) return
-      // 原子写成功后才提交内存缓存，避免「内存命中、磁盘未落盘」不一致
+      // 原子写成功后才提交内存缓存，避免「内存命中、磁盘未落盘」不一致。
+      // 同时记录刚写完的磁盘签名：后续判重可直接信任内存，不必每轮全量重读（P3 常驻进程）。
       this._tombstones.set(filePath, next)
-      this._tombstoneLoaded.add(filePath)
+      this._markTombstonesLoaded(filePath)
     },
 
     /** 复制墓碑四集合：读改写全程在副本上进行，写盘失败/锁失效时当前缓存不被污染 */

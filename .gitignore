@@ -21,6 +21,9 @@ cleanup_rootfs_junk.sh
 .tmp_parallel_*.json
 # 预览实例的本地缓存目录（起一个 7801 预览时把 run.log 拷进来，绝不入库）
 .tmp-preview/
+# 测试自建的临时产物根（test_worker_protocol.js 的 scratch/xbk-worker-<pid>-<ts> 等）：
+# 用例收尾会自己删，但异常退出/被外部 kill 时可能留残——盖住它，别让残留混进提交。
+scratch/
 
 # 本机技能包安装脚本（用户在容器外自行下载的产物，不参与仓库构建与门禁）
 install-tech-packs.sh

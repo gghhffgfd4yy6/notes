@@ -20,7 +20,9 @@ const fs = require('node:fs')
 const path = require('node:path')
 const zlib = require('node:zlib')
 const { spawn } = require('node:child_process')
+const { EventEmitter } = require('node:events')
 const { StringDecoder } = require('node:string_decoder')
+const { createRunWorker } = require('./console-worker')
 const qrcode = require('qrcode-generator')
 // v3.363：只读快照端点的条件请求（ETag/304）。零传递依赖（etag 自身无依赖），
 // 与「青龙 --omit=dev 只装 dependencies」的部署约束兼容。
@@ -620,6 +622,13 @@ function acquireLock (stateDir, now, token) {
 // 运行中即可读（增量写 record.output）。state 存进程内 Map（重启即空——锁文件在，
 // 重启后第一次触发会因陈旧锁接管或等待，不会双跑）。
 const runs = new Map()
+// 常驻 worker 按「实例的 activeChildren 集合」登记：startAction 只拿得到这个集合
+// （既有签名不动），WeakMap 让 worker 随 createConsole 实例一起被回收。
+const workerByChildren = new WeakMap()
+function workerForChildren (children) {
+  if (!children || typeof children !== 'object') return null
+  return workerByChildren.get(children) || null
+}
 // run ID = 「进程 epoch.单调序列」（Sourcery #229-1：runSeq 重启归零会让重启前的旧
 // cancel/详情请求在序列复用后命中**新**任务——结构性误杀）。epoch 取控制台进程启动
 // 毫秒（同进程内恒定，跨进程几乎必异），Map 键用完整 id 字符串，旧进程的 id 重启后
@@ -645,38 +654,11 @@ function finishRun (record, code, { release = releaseLockFor, now = Date.now } =
   return true
 }
 
-function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockDir) {
-  const action = ACTIONS[actionKey]
-  const id = makeRunId(++runSeq)
-  const entryFile = action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG
-  const record = {
-    id,
-    action: actionKey,
-    label: action.label,
-    startedAt: now,
-    finishedAt: 0,
-    exitedAt: 0, // exit 事件时刻（先于 close：stdout/stderr drain 中已不可取消）
-    closedAt: 0, // close 事件时刻（stdio 全部 drain 完；SSE 只在此后发 done）
-    exitCode: null,
-    timedOut: false,
-    output: '',
-    outputTotalLength: 0,
-    cancelled: false,
-    spawnError: false, // v3.408：spawn 异步失败标记（ENOENT/EMFILE），自动调度据此不再无限重试
-    // 锁归属（startAction 内登记，exit 可能早于调用方后续赋值：收尾必须能直接释放锁）。
-    // lockDir = 锁文件所在目录（控制台 stateDir）；cacheDir = 子进程 run.log 写入目录。
-    _stateDir: lockDir || cacheDir,
-    _lockToken: lockToken
-  }
-  runs.set(id, record)
-  if (runs.size > RUNS_KEEP_MAX) {
-    // 只保留最近 RUNS_KEEP_MAX 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
-    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - RUNS_KEEP_MAX)
-    for (const k of oldest) runs.delete(k)
-  }
-  // 环境继承：剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，
-  // 「正式运行」会被子进程静默降级为 dry-run，承诺的推送不会发生）；剥离
-  // XBK_CONSOLE_TOKEN（子进程及其再拉起的工具、崩溃时的 env dump 都不该带控制台凭证）。
+// 子进程环境（一次性 spawn 与常驻 worker 共用同一份口径）：
+// 剥离 XBK_DRY_RUN（Sourcery High：控制台自身带 XBK_DRY_RUN=1 时，「正式运行」会被子进程
+// 静默降级为 dry-run，承诺的推送不会发生）；剥离 XBK_CONSOLE_TOKEN（子进程及其再拉起的工具、
+// 崩溃时的 env dump 都不该带控制台凭证）。
+function buildChildEnv (cacheDir) {
   const childEnv = { ...process.env }
   delete childEnv.XBK_DRY_RUN
   delete childEnv.XBK_CONSOLE_TOKEN
@@ -684,9 +666,36 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
   // 会回落到仓库生产缓存 → 测试触发的轮次/停止留痕混进生产 run.log；生产侧它与运行侧
   // MessageStore.cacheDir 同源，读写一致）。
   if (cacheDir) childEnv.XBK_CACHE_DIR = cacheDir
+  return childEnv
+}
+
+// 子进程输出进 record.output（环形上限 RUN_LOG_MAX_BYTES，按 UTF-8 字节计）。
+// produced 必须是**已解码**的文本（StringDecoder 处理跨 chunk 多字节，Sourcery Medium）。
+function appendProduced (record, produced) {
+  if (!produced) return
+  let buf = record.output + produced
+  if (Buffer.byteLength(buf, 'utf8') > RUN_LOG_MAX_BYTES) {
+    let drop = Buffer.byteLength(buf, 'utf8') - RUN_LOG_MAX_BYTES
+    while (drop > 0 && buf.length > 0) {
+      drop -= Buffer.byteLength(buf[0], 'utf8')
+      buf = buf.slice(1)
+    }
+  }
+  record.output = buf
+  // 单调总偏移计数器（v3.300 3.1）：统计「生产总量」而非现存长度——环形淘汰（上方头部
+  // 丢码元）只减 output.length 不减计数器，SSE 的 reset 判据 cursor < total − 缓冲长依赖它。
+  record.outputTotalLength += produced.length
+}
+
+// 一次性 spawn 路径（原 startAction 的主体）：拉起一个跑完即退的子进程。
+// 保留为独立函数，是为了让「常驻 worker 连续启动失败 → 退回一次性 spawn」能复用**同一个**
+// record / 同一把锁（推送不中断，看板上也是同一轮）。
+function spawnActionChild (record, action, cacheDir, activeChildren, spawnImpl = spawn) {
+  const entryFile = action.entry === 'single' ? ENTRY_SINGLE : ENTRY_QINGLONG
+  const childEnv = buildChildEnv(cacheDir)
   const child = (() => {
     try {
-      return spawn(process.execPath, [entryFile, ...action.args], {
+      return spawnImpl(process.execPath, [entryFile, ...action.args], {
         cwd: ROOT,
         env: childEnv,
         stdio: ['ignore', 'pipe', 'pipe']
@@ -694,29 +703,13 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     } catch (e) {
       // spawn 同步抛（EMFILE 等资源极端）：runs 里已登记死记录，必须摘除后再抛，
       // 让调用侧 acceptAction 回滚重放帧与锁（Sourcery Medium：Failed spawn leaves trigger locked）。
-      runs.delete(id)
+      runs.delete(record.id)
       throw e
     }
   })()
   if (activeChildren) activeChildren.add(child)
   const decoder = new StringDecoder('utf8')
-  const append = (chunk) => {
-    // StringDecoder 处理跨 chunk 的多字节 UTF-8（Sourcery Medium：逐 chunk toString 产生替换符）。
-    const produced = decoder.write(chunk) // 本 chunk 解码产物（现有 UTF-16 头部丢码元语义保留不动）
-    let buf = record.output + produced
-    // 上限按 UTF-8 字节计（Buffer.byteLength），超限从字节边界近似回退丢头部。
-    if (Buffer.byteLength(buf, 'utf8') > RUN_LOG_MAX_BYTES) {
-      let drop = Buffer.byteLength(buf, 'utf8') - RUN_LOG_MAX_BYTES
-      while (drop > 0 && buf.length > 0) {
-        drop -= Buffer.byteLength(buf[0], 'utf8')
-        buf = buf.slice(1)
-      }
-    }
-    record.output = buf
-    // 单调总偏移计数器（v3.300 3.1）：统计「生产总量」而非现存长度——环形淘汰（上方头部
-    // 丢码元）只减 output.length 不减计数器，SSE 的 reset 判据 cursor < total − 缓冲长依赖它。
-    record.outputTotalLength += produced.length
-  }
+  const append = (chunk) => appendProduced(record, decoder.write(chunk))
   child.stdout.on('data', append)
   child.stderr.on('data', append)
   // 取消句柄：cancel 端点只经这个对象引用发信号（内核按 spawn 时句柄定位，天然免疫
@@ -755,6 +748,112 @@ function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockD
     if (activeChildren) activeChildren.delete(child)
   })
   return record
+}
+
+// 常驻 worker 一轮：每轮一个伪 child（EventEmitter），让既有的 cancel / activeChildren /
+// 关停等待逻辑一行不改地复用到常驻路径上。
+//   · 伪 child.kill() → 给整个 worker 进程组发信号（cancel 语义：这一轮确实被杀了）；
+//   · 伪 child 的 'exit'/'close' 在本轮有结果时按一次性 spawn 的相同顺序发出；
+//   · worker 返回 fallback（连续启动失败/已降级）→ 摘掉伪 child，改走 spawnActionChild，
+//     record / 锁都不换。
+function startWorkerAction (record, action, worker, activeChildren, spawnImpl) {
+  const pseudo = new EventEmitter()
+  pseudo.pid = worker.pid
+  pseudo.__runWorker = true
+  pseudo.kill = (signal) => {
+    try { worker.cancelRound(signal || 'SIGTERM') } catch (e) { /* worker 已退出 */ }
+  }
+  if (activeChildren) activeChildren.add(pseudo)
+  record._child = pseudo
+  record.runner = 'worker'
+  // 收尾但不 spawn：只在「已收到停止请求」的 fallback 防御分支用。
+  const finishWithoutSpawn = (reason) => {
+    appendProduced(record, `\n[console] ${reason}\n`)
+    record.exitCode = null
+    record.exitedAt = Date.now()
+    record.closedAt = Date.now()
+    finishRun(record, null)
+    pseudo.emit('exit', record.exitCode, null)
+    pseudo.emit('close', record.exitCode, null)
+    if (activeChildren) activeChildren.delete(pseudo)
+  }
+  const settle = (result) => {
+    if (result && result.fallback) {
+      // 防御（P3 must_fix）：这一轮已经收到过停止请求时，绝不能再起一整轮一次性 spawn。
+      // worker 恰在用户点「停止」前一瞬自行退出（或关停竞态里被判死）时仍会返回 fallback，
+      // 此时 spawn 等于把「停止」变成「立刻重跑一轮完整抓取+推送」。这里只落一条说明并收尾；
+      // 锁/计时器照常由 finishRun 释放，record 留在同一轮里（不再有子进程可等）。
+      if (record.cancelRequestedAt) {
+        if (activeChildren) activeChildren.delete(pseudo)
+        record._child = null
+        finishWithoutSpawn('已收到停止请求，常驻 worker 启动失败不再重跑，本轮按已停止收尾')
+        return
+      }
+      if (activeChildren) activeChildren.delete(pseudo)
+      record._child = null
+      record.runner = 'spawn'
+      spawnActionChild(record, action, record._cacheDir, activeChildren, spawnImpl)
+      return
+    }
+    if (result && result.timedOut) record.timedOut = true
+    if (result && result.error) appendProduced(record, `\n[console] 常驻 worker：${result.error}\n`)
+    record.exitCode = Number.isInteger(result && result.exitCode) ? result.exitCode : null
+    record.exitedAt = Date.now()
+    record.closedAt = Date.now()
+    finishRun(record, record.exitCode)
+    pseudo.emit('exit', record.exitCode, null)
+    pseudo.emit('close', record.exitCode, null)
+    if (activeChildren) activeChildren.delete(pseudo)
+  }
+  worker.run(action.args, { onOutput: (text) => appendProduced(record, text) }).then(settle).catch((e) => {
+    appendProduced(record, `\n[console] 常驻 worker 调用失败：${e && e.message ? e.message : String(e)}\n`)
+    settle({ ok: false, exitCode: 1 })
+  })
+  return record
+}
+
+// 只有「无参数的单轮正式运行」能走常驻 worker：dry-run / --check 走 qinglong 入口，
+// --notify-test 是早退的自检分支，语义都不是「复用同一个进程跑 App.run()」。
+function canUseRunWorker (action) {
+  if (!action || action.entry !== 'single') return false
+  if (!Array.isArray(action.args) || action.args.length > 0) return false
+  // XBK_RUN_WORKER=0：显式降级开关（排障/对照用），默认开启。
+  return process.env.XBK_RUN_WORKER !== '0'
+}
+
+function startAction (actionKey, now, activeChildren, cacheDir, lockToken, lockDir, deps = {}) {
+  const action = ACTIONS[actionKey]
+  const id = makeRunId(++runSeq)
+  const record = {
+    id,
+    action: actionKey,
+    label: action.label,
+    startedAt: now,
+    finishedAt: 0,
+    exitedAt: 0, // exit 事件时刻（先于 close：stdout/stderr drain 中已不可取消）
+    closedAt: 0, // close 事件时刻（stdio 全部 drain 完；SSE 只在此后发 done）
+    exitCode: null,
+    timedOut: false,
+    output: '',
+    outputTotalLength: 0,
+    cancelled: false,
+    spawnError: false, // v3.408：spawn 异步失败标记（ENOENT/EMFILE），自动调度据此不再无限重试
+    runner: 'spawn', // 'worker' = 常驻进程内跑；'spawn' = 一次性子进程
+    // 锁归属（startAction 内登记，exit 可能早于调用方后续赋值：收尾必须能直接释放锁）。
+    // lockDir = 锁文件所在目录（控制台 stateDir）；cacheDir = 子进程 run.log 写入目录。
+    _stateDir: lockDir || cacheDir,
+    _lockToken: lockToken,
+    _cacheDir: cacheDir
+  }
+  runs.set(id, record)
+  if (runs.size > RUNS_KEEP_MAX) {
+    // 只保留最近 RUNS_KEEP_MAX 条：按 seq 最小的清理（id=epoch.seq，同进程 epoch 恒定，seq 单调递增）。
+    const oldest = [...runs.keys()].sort((a, b) => runs.get(a).startedAt - runs.get(b).startedAt).slice(0, runs.size - RUNS_KEEP_MAX)
+    for (const k of oldest) runs.delete(k)
+  }
+  const worker = deps.worker !== undefined ? deps.worker : workerForChildren(activeChildren)
+  if (worker && canUseRunWorker(action)) return startWorkerAction(record, action, worker, activeChildren, deps.spawnImpl || spawn)
+  return spawnActionChild(record, action, cacheDir, activeChildren, deps.spawnImpl || spawn)
 }
 
 function releaseLockFor (record) {
@@ -3377,7 +3476,7 @@ function buildPushChannelsView () {
   return view
 }
 
-function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, lineDetailFetch, watchNotifier } = {}) {
+function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = console.log, lockToken, messagesFile = 'push.json', runHistoryDir, sseMaxPending, sseStreamTickMs, lineSearchFetch, lineDetailFetch, watchNotifier, createWorker = createRunWorker } = {}) {
   // Sourcery Missing-assets：资产文件缺失时服务照常启动 → 用户拿到可打开但永远白屏的
   // 控制台（JS 引入失败）。启动闸逐个校验白名单资产可读，缺任何一个 fail-closed 拒启。
   // 启动即做一次一致快照：既校验资产可读（缺失即拒启），也把版本号钉死在进程生命周期内
@@ -3534,6 +3633,19 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   const historyDir = () => {
     return runHistoryDir || stateDir
   }
+  // ── 常驻运行进程（P3）────────────────────────────────────────────────────
+  // 首次要跑一轮时才真正起进程（lazy），控制台空转不占一个 node；每个实例一个 worker。
+  // 启动即清理上一代控制台遗留的孤儿：控制台被 SIGKILL 时 worker 收不到 exit，只能靠
+  // 下一代按 pid 文件 + /proc cmdline 指纹（防 pid 复用误杀）整组收掉。
+  const runWorker = createWorker({ // 测试可注入 spawn 替身（生产恒为 createRunWorker）
+    entryFile: ENTRY_SINGLE,
+    root: ROOT,
+    stateDir,
+    env: buildChildEnv(historyDir()),
+    log: (message) => log(message)
+  })
+  runWorker.cleanupOrphans()
+  workerByChildren.set(activeChildren, runWorker)
   // 锁归属 token：调用方传入（main 生成，SIGTERM 释放时须双匹配）；未传则随机。
   // 测试可直接传固定值断言锁内容。
   const ownerToken = typeof lockToken === 'string' && lockToken.length > 0 ? lockToken : crypto.randomBytes(12).toString('hex')
@@ -7070,6 +7182,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     return origClose(cb)
   }
   server.on('close', () => { disposeAuto(); killAll() })
+  // 常驻 worker 随控制台一起收：正常关停已在 shutdown 里发过 exit（等它退），这里是无 server
+  // 优雅路径（测试直接 server.close）的兜底——立即杀，避免留下孤儿。
+  server.on('close', () => runWorker.dispose())
   // 全站 SSE 连接要单独收：server.close() 只挡新连接，在途的 /api/stream 不会自己结束；
   // 不显式清理的话采样定时器与 socket 会留到进程退出（测试里表现为「跑完了不退出」）。
   server.on('close', () => closeAllStreamClients())
@@ -7099,6 +7214,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 客户端 onerror 后按纪律退回 15s 轮询，页面照旧可用。
       closeAllStreamClients()
       console.log(`收到 ${signal}，关闭控制台：终止触发子进程并释放锁…`)
+      // 常驻 worker：先发 {"cmd":"exit"}（正常一轮 < 1s 就会退），5s 不退再 SIGKILL 进程组。
+      // 必须在杀子进程之前/同时发：在途那轮被 pseudo.kill 打断后，worker 仍能读到 exit 正常退出。
+      const workerStop = runWorker.hasChild ? runWorker.shutdown() : Promise.resolve()
       for (const child of activeChildren) {
         try { child.kill('SIGKILL') } catch (e) { /* 已退出 */ }
       }
@@ -7117,13 +7235,27 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const finishShutdown = () => {
         if (finished) return
         finished = true
-        server.close(() => doExit(0))
-        // close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
+        // 等 worker 真正退出再关 HTTP：worker 还在跑时进程直接退出会把它变成孤儿
+        // （它自己不会收到父进程死的信号）。shutdown() 内部已有 5s 强杀兜底，不会无限等。
+        // 关 HTTP 并退出：close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
         // 在途请求给 500ms 完成窗口（本地看板端点毫秒级）后强断，1s 强退兜底——
         // 不排空会让客户端收到 ERR_EMPTY_RESPONSE、挂起的 keep-alive 得不到关闭帧。
-        server.closeIdleConnections()
-        setTimeout(() => { server.closeAllConnections() }, 500).unref()
-        setTimeout(() => doExit(0), 1000).unref()
+        // 成功/失败两条路都走这一个收尾，保证进程一定会退出。
+        const closeServerAndExit = (code) => {
+          server.close(() => doExit(code))
+          server.closeIdleConnections()
+          setTimeout(() => { server.closeAllConnections() }, 500).unref()
+          setTimeout(() => doExit(code), 1000).unref()
+        }
+        Promise.resolve(workerStop)
+          .then(() => closeServerAndExit(0))
+          // worker 停止失败（shutdown 自身抛错/子进程收不掉）：不能把控制台挂在「永不收尾的 await」
+          // 上——以前这里没有拒绝分支，reject 时 server.close()+doExit 永不执行，进程挂住且不退出。
+          // 现在记一条原因后仍走同一有界收尾（5s 强杀兜底不变，不新增无限等待），退出码 1。
+          .catch((err) => {
+            console.error(`worker 停止失败，仍按有界收尾退出：${err && err.message ? err.message : String(err)}`)
+            closeServerAndExit(1)
+          })
       }
       if (pending.length === 0) {
         finishShutdown()
@@ -7170,7 +7302,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   if (typeof watchTimer.unref === 'function') watchTimer.unref()
   server.on('close', () => clearInterval(watchTimer))
 
-  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, streamClients, streamSamplerActive: () => streamSampler !== null, runWatchOnce }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, streamClients, streamSamplerActive: () => streamSampler !== null, runWatchOnce, runWorker }
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
@@ -7260,6 +7392,10 @@ module.exports = {
   consoleStateDir,
   STATIC_ASSETS,
   finishRun,
+  // P3：常驻 worker 路径的单元测试钩子（startAction 的 deps 形参只给测试用，生产调用不传）
+  startAction,
+  spawnActionChild,
+  canUseRunWorker,
   renderUnauthorizedPage,
   isValidToken,
   timingSafeEqualStr,

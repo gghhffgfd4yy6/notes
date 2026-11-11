@@ -15,6 +15,13 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
   // 天然防止脏缓存；同配置对象/同值配置共享一次编译结果。
   _legacyCompileCache: new Map(),
   _LEGACY_COMPILE_CACHE_MAX: 1000,
+  /** P3（常驻 worker）：清空本轮编译缓存。键本身随配置内容变化（不会读到陈旧结果），
+   *  清空只是让跨轮内存占用与「新进程」口径一致——一次性 spawn 每轮都是空缓存。 */
+  _resetRunCaches () {
+    this._whitelistReCache.clear()
+    this._legacyCompileCache.clear()
+    return true
+  },
   /** 编译缓存键：仅按 compileRules 真正消费的字段归一，保证「编译结果相同 ⇒ 键相同」 */
   _legacyCompileKey (rawCfg) {
     const safeStr = (v) => {

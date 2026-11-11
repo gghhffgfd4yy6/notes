@@ -208,6 +208,31 @@
 # 旧快照冒充完整数据」的负向夹具（对应生产侧的非常规文件分支）。另有一段用例由测试自身把
 # XBK_CACHE_DIR 指到同一个临时目录、跑完即还原，不是外部输入；无任何外部输入参与路径构造。
 #
+# ---- P3（v3.419 常驻 worker）：两条整文件误报登记 ----
+# scripts/console-worker.js 是控制台常驻 worker 的生命周期模块（pid 文件读写 + 孤儿清理 + 超时兜底）：
+#   · 唯一被 fs 操作的路径是 workerPidFile(stateDir) = path.join(stateDir, 'console-worker.pid')——
+#     文件名字面量是本文件常量 RUN_WORKER_PID_FILE，stateDir 由 createConsole 显式传入（默认项目根内
+#     固定状态目录 / XBK_CACHE_DIR 解析结果），不来自请求体、URL、查询串或文件内容；
+#   · readPidFile 读到的 JSON 只用于取 pid/ownerPid/startedAt 并逐项 Number.isInteger 归一，
+#     不参与任何路径拼接（不会被拼成新文件名）；writePidFile/removePidFile 的 file 入参在内部只收到
+#     同一个 pidFile，removePidFile 还先按 pid 双匹配确认「没被新 worker 覆盖」；
+#   · 另一处 readFileSync 是 `/proc/${pid}/cmdline`（pid 已过 Number.isInteger + >0 校验），且整段
+#     包在 try/catch 里失败即返回 false（宁可不清理也不误杀）。
+# 故 Codacy/Opengrep 报在 :70（readFileSync pid 文件）/ :85（writeFileSync）/ :91、:104（unlinkSync）
+# 的 4 条「动态构造文件/路径信息」在这条调用链上都不成立，属误报（与 scripts/message-signature.js /
+# scripts/filter-rules-paths.js 的「运行期目录 + 本文件字面量文件名」同一口径）。
+#
+# test_worker_protocol.js 是常驻 worker 的协议/生命周期/跨轮隔离测试（18 项，含真实子进程）：
+#   · 所有 fs 目标 = path.join(ROOT 或 TMP, 测试硬编码文件名)，ROOT = __dirname 常量，
+#     TMP = scratch/xbk-worker-<pid>-<Date.now()>（本文件自建的隔离目录，跑完即删）；
+#     另有 fs.mkdtempSync 生成的临时目录；子进程 env 里显式写死 XBK_CACHE_DIR/TZ，不继承外部缓存路径；
+#   · 用例构造的 pid 文件内容（{ pid, ownerPid, startedAt }）全是测试常量，只为驱动
+#     cleanupOrphanWorker 的「属主已死 / 属主还活 / pid 不匹配」三个分支；
+#   · 唯一那条非字面量正则告警来自测试自建 Utils 的 safeRe 替身 new RegExp(source)——source 是
+#     formatter 的硬编码字面量模式（formatter._resetRunCaches 用例），不是外部输入。
+# 无任何外部净输入参与路径/正则源构造，11 条 path construction（:66/:116/:117/:214/:404/:409/:427/
+# :434/:550/:553/:650）+ 1 条 non-literal RegExp（:474）属误报（与 test_utils.js /
+# test_message_store_journal.js 的既有登记同口径）。真实断言仍由 npm test / CI 全量执行。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
@@ -330,6 +355,14 @@ exclude_paths:
   # 'xbk-status-') 下的字面量三段（'cache-journal'/'push.json'/'push.json.journal.ndjson'）；
   # :124 的 mkdirSync 是刻意构造「journal 不可读」的负向夹具。依据见上方同一注释块。
   - "test_status.js"
+  # P3（v3.419）：常驻 worker 生命周期模块（pid 文件 = stateDir + 本文件字面量
+  # 'console-worker.pid'，stateDir 由控制台显式传入；无外部净输入参与路径构造）。
+  # 4 条 path construction 属误报，依据见上方「P3（v3.419 常驻 worker）」注释块。
+  - "scripts/console-worker.js"
+  # P3（v3.419）：常驻 worker 协议/生命周期测试。fs 目标全为 __dirname / scratch/xbk-worker-<pid>-<ts>
+  # 或 mkdtemp 下的硬编码文件名；非字面量正则是测试自建 safeRe 替身（源为 formatter 字面量模式）。
+  # 11 条 path construction + 1 条 non-literal RegExp 属误报，依据见上方同一注释块。
+  - "test_worker_protocol.js"
   # ---- P1（v3.415）：status 侧安全正则实例（为不整文件排除 scripts/status.js 而拆出）----
   # scripts/status-utils.js 只做一件事：用 xbk_utils 的 createUtils 建控制台/--status 用的轻量
   # Utils 实例（safeRe = (src, flags) => new RegExp(src, flags)），供判重日志回放算身份。

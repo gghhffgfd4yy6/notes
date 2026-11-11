@@ -147,6 +147,11 @@ jobs:
       - name: 青龙常驻测试（test_qinglong_resident.js）
         run: npm run test:qinglong-resident
 
+      # P3：控制台常驻运行进程（xbk_function_v3.js --worker）的协议/崩溃恢复/降级/隔离。
+      # 会 spawn 真实 worker 并跑 dry-run 两轮（不推送），故标记 integration 并在此显式覆盖。
+      - name: 常驻 worker 协议测试（test_worker_protocol.js）
+        run: npm run test:worker-protocol
+
       - name: 青龙诊断测试（test_qinglong_runcheck.js）
         run: npm run test:qinglong-runcheck
 
