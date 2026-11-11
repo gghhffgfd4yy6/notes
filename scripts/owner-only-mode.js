@@ -100,4 +100,27 @@ function enforceOwnerOnlyMode (file) {
   }
 }
 
-module.exports = { enforceOwnerOnlyMode, OWNER_ONLY_MODE, GROUP_OTHER_BITS }
+/**
+ * 只读判断：目标是否已经是 0600 的**稳定普通文件**（不修改任何权限位）。
+ *
+ * 用途：FilterStore 的「快照内容一致就跳过写盘」分支必须确认目标权限仍是 0600。
+ * 旧实现每轮都走 writeAtomic（0600 临时文件 + rename），等于每轮把权限修回 0600；
+ * 跳过写盘后，一份 0644 的 filter-rules.applied.json（缓存目录被整体拷贝/解包、
+ * 备份恢复、用户手工 chmod）会在规则不变期间永久保留，而快照里有用户全部过滤规则正文。
+ * 故只在「本身就是 0600 普通文件」时允许跳过；权限不符 / 末级是符号链接 / 非普通文件 /
+ * stat 失败（ENOENT 等）一律返回 false，由调用方落到 writeAtomic 分支重建（fail-closed）。
+ * 用 lstat 而不是 stat：末级若是链接，跳过写盘等于把链接留在原位；lstat 看到链接自身的
+ * 位宽（通常 0777）必然不匹配，于是走 writeAtomic 的 isRegularOrMissing 拒绝，不跟随链接。
+ * @param {string} file 状态目录内的固定文件（见模块头部的安全事实）
+ * @returns {boolean}
+ */
+function isOwnerOnlyFile (file) {
+  try {
+    const st = fs.lstatSync(file)
+    return st.isFile() && (st.mode & 0o777) === OWNER_ONLY_MODE
+  } catch (e) {
+    return false
+  }
+}
+
+module.exports = { enforceOwnerOnlyMode, isOwnerOnlyFile, OWNER_ONLY_MODE, GROUP_OTHER_BITS }

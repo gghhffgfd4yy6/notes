@@ -66,6 +66,17 @@ const FILTER_RULES_MAX_BYTES = 256 * 1024
 // 1024 的余量足够：覆盖文件能读回就 ≤ 256 KiB，包装固定 +76，revision 最多 16 位数字也吃不满。
 const LASTGOOD_WRAPPER_BYTES = 1024
 const LASTGOOD_MAX_BYTES = FILTER_RULES_MAX_BYTES + LASTGOOD_WRAPPER_BYTES
+// 生效快照（filter-rules.applied.json）的读上限：它是覆盖文件的**超集**，不能直接复用
+// FILTER_RULES_MAX_BYTES。比覆盖文件多出：11 个白名单字段按合并结果**补齐**（覆盖文件缺的字段
+// 也要写成 ""）、`source`/`hash`/`appliedAt`/`lastGoodUsed` 四个诊断字段、以及 `keyword` 包装
+// ——空字段夹具实测 +179 字节（hash 取 64 位十六进制、appliedAt 取完整 ISO 时间）。
+// 若读写共用覆盖文件上限：控制台保存闸门只留 32 字节余量（serializedBytes ≤ MAX-32），覆盖文件
+// 落在 (MAX-179, MAX-32] 时写出的 applied.json 必然 > MAX ⇒ readSafeTextResult 判 tooLarge
+// ⇒ readAppliedSnapshot 恒 ioError ⇒「内容一致跳过写盘」永不生效、控制台永远显示「尚未生效」
+// （与 LKG 的 R3 同一类缺陷：写成功但读不回）。故读上限 = 覆盖文件上限 + 包装预算；
+// 写入侧（writeAppliedSnapshot）用同一常量预检，绝不落一个自己读不回的快照。
+const APPLIED_WRAPPER_BYTES = 1024
+const APPLIED_MAX_BYTES = FILTER_RULES_MAX_BYTES + APPLIED_WRAPPER_BYTES
 // pingbitime 天数上限：与 xbk_rules.compileRules / validateConfig 的 PINGBITIME_MAX_DAYS 同值。
 // 超上限的行会被运行期静默丢弃 ⇒ 编译对账必然失败，这里提前给出明确错误码。
 const PINGBITIME_MAX_DAYS = 3650000
@@ -524,7 +535,7 @@ function parseStoredRules (text) {
  * 实现放在 scripts/owner-only-mode.js：Semgrep 对非字面量路径的 fs 调用一律报
  * path-traversal，单独成模块后可只排除该模块（不整文件排除本模块）。
  */
-const { enforceOwnerOnlyMode } = require('./scripts/owner-only-mode.js')
+const { enforceOwnerOnlyMode, isOwnerOnlyFile } = require('./scripts/owner-only-mode.js')
 
 /**
  * 读路径是否具备「深度校验」条件：需要注入完整 deps 且引擎可用。
@@ -826,8 +837,52 @@ function loadFilterRules (options) {
 }
 
 /**
+ * 判断「磁盘上的旧快照」与「本轮要写的新快照」的规则内容是否完全一致（appliedAt 不参与）。
+ *
+ * v3.411：为什么需要它——旧实现每轮都生成新 appliedAt 并整份重写 applied.json（约 73 KB），
+ * 而规则通常整月不变（实测 12 轮采样里 10 轮在重写，约 1 GB/天）。规则没变时这份写入是纯浪费。
+ *
+ * 比较必须是纯函数式：filter 只比 FILTER_RULE_FIELDS 白名单、逐字段比字符串，**不依赖对象键顺序**
+ * （快照可能是手改/旧版本写出的，键序不可信）；缺字段按空串比（与 readAppliedSnapshot / parseStoredRules
+ * 的「缺字段视同空」同口径）。
+ * lastGoodUsed 也参与比较：它是控制台读的「本轮是否沿用了上次合法规则」，只把它当非内容字段跳过，
+ * 会让降级→恢复翻转时快照继续宣称「沿用上次」。
+ * @returns {boolean} true = 内容一致，可以跳过写盘
+ */
+function sameAppliedContent (prev, next) {
+  if (!prev || typeof prev !== 'object' || Array.isArray(prev)) return false
+  if (!next || typeof next !== 'object') return false
+  // schema 不必比：readAppliedSnapshot 只让 schema === FILTER_RULES_SCHEMA 的快照到达这里。
+  if (prev.revision !== next.revision) return false
+  if (prev.source !== next.source) return false
+  if (prev.hash !== next.hash) return false
+  if (prev.lastGoodUsed !== next.lastGoodUsed) return false
+  for (const field of FILTER_RULE_FIELDS) {
+    if (safeString(safeGet(prev.filter, field)) !== next.filter[field]) return false
+  }
+  return safeString(safeGet(prev.keyword, 'zkt_gjc')) === next.keyword.zkt_gjc
+}
+
+const appliedWarned = new Set()
+function warnAppliedWrite (filePath, detail) {
+  // 生效快照只用于诊断/「已生效」展示，写失败不阻断本轮（规则照常生效）；但「写了却读不回」
+  // 会让控制台永远显示「尚未生效」，属于必须留痕的静默退化。每个路径只告警一次，避免常驻
+  // 控制台/循环模式按轮刷屏。
+  if (appliedWarned.has(filePath)) return
+  appliedWarned.add(filePath)
+  console.warn(`⚠️ 过滤规则生效快照写入失败（本轮规则照常生效，控制台可能一直显示「尚未生效」）：${filePath}：${detail}`)
+}
+
+/**
  * 写生效快照 <cacheDir>/filter-rules.applied.json（0600 由 writeAtomic 保证）。
  * 快照是诊断/验收用：证明「本轮实际生效的是哪一版规则」，不参与规则读取。
+ *
+ * v3.411：规则内容与磁盘上的旧快照完全一致时**不写盘**（保留旧 appliedAt）并返回 true。
+ * 判据只看内容字段（revision/source/hash/filter/keyword + lastGoodUsed），见 sameAppliedContent；
+ * 但跳过前还必须确认目标文件**本身仍是 0600**——旧实现每轮 writeAtomic 等于每轮把权限修回 0600，
+ * 跳过之后一份 0644 快照（缓存目录被整体拷贝/解包、备份恢复、手工 chmod）会永久留着，而快照里
+ * 有用户全部过滤规则正文。权限不符或 stat 失败一律落到写盘分支自愈（见 isOwnerOnlyFile）。
+ * 每轮都读一次旧快照：进程可能多开（控制台 spawn + 常驻运行），进程内缓存会互相看不见，禁止用它绕过读盘。
  * @returns {boolean} 写入是否成功（失败只返回 false，不抛错）
  */
 function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, hash, lastGoodUsed } = {}) {
@@ -846,7 +901,24 @@ function writeAppliedSnapshot ({ cacheDir, filter, keyword, revision, source, ha
     filter: snapshotFilter,
     keyword: normalizeKeyword(keyword, { forSnapshot: true })
   }
-  return writeAtomic(paths.applied, JSON.stringify(snapshot), '过滤规则生效快照')
+  // 只有 status==='ok'（文件存在、合法 JSON、schema/revision/filter/keyword 全过校验）才可能判定「内容一致」；
+  // missing / invalid / ioError 一律照常重写——损坏的快照要自愈，不能因为「比不出来」就留着。
+  // 权限也参与判据：内容一致但目标不是 0600 时不得跳过（理由见函数头注释），直接落到 writeAtomic 重写。
+  const prev = readAppliedSnapshot(cacheDir)
+  if (prev.status === 'ok' && sameAppliedContent(prev.snapshot, snapshot) && isOwnerOnlyFile(paths.applied)) {
+    return true
+  }
+  const text = JSON.stringify(snapshot)
+  // 写侧与读侧同口径（读上限 APPLIED_MAX_BYTES）：超出就**不写**并留痕，绝不落一个自己读不回的快照。
+  // 正常形状下这里不触发（快照只比覆盖文件多约 179 字节包装，而预算是 1024）；它守的是「以后改字段/
+  // 改上限时不会静默退化」——否则 readAppliedSnapshot 恒 ioError、控制台永远显示「尚未生效」，而本函数
+  // 还返回 true（与 LKG 的 R3 同类：写成功但读不回）。
+  const bytes = Buffer.byteLength(text, 'utf8')
+  if (bytes > APPLIED_MAX_BYTES) {
+    warnAppliedWrite(paths.applied, `序列化后 ${bytes} 字节超过生效快照读上限 ${APPLIED_MAX_BYTES} 字节（写出去也读不回，本轮不落盘）`)
+    return false
+  }
+  return writeAtomic(paths.applied, text, '过滤规则生效快照')
 }
 
 /**
@@ -863,12 +935,16 @@ function appliedLastGoodUsed (snapshot) {
 
 /**
  * 读回生效快照。状态机：missing / invalid / ioError / ok（不抛错）。
+ * 读上限用 APPLIED_MAX_BYTES（覆盖文件上限 + 包装预算）：快照是覆盖文件的超集（11 字段补齐 +
+ * source/hash/appliedAt/lastGoodUsed + keyword 包装，实测 +179 字节）。直接拿 FILTER_RULES_MAX_BYTES
+ * 读会把「自身合法、只是多了包装」的快照判成 tooLarge ⇒ 恒 ioError ⇒「内容一致跳过写盘」永不生效、
+ * 控制台永远显示「尚未生效」（F4-1 R3 / LKG 同型缺陷）。写侧用同一常量预检。
  * @returns {{status:'ok',snapshot:Object}|{status:'missing'}|{status:'invalid',error:Object}|{status:'ioError',error:Object}}
  */
 function readAppliedSnapshot (cacheDir) {
   let read
   try {
-    read = storage.readSafeTextResult(filterRulesPaths(cacheDir).applied, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
+    read = storage.readSafeTextResult(filterRulesPaths(cacheDir).applied, APPLIED_MAX_BYTES, { openNonBlocking: true })
   } catch (e) {
     return { status: 'ioError', error: { code: 'read_failed', message: safeErrorMessage(e) } }
   }
@@ -948,6 +1024,8 @@ module.exports = {
   FILTER_RULES_SCHEMA,
   // LKG 包装层的读上限（仅测试用：断言「写出的 LKG 必须 ≤ 读上限」这条不变式）
   LASTGOOD_MAX_BYTES,
+  // 生效快照的读上限（仅测试用：断言「写出的 applied 必须 ≤ 读上限」以及贴上限的覆盖文件仍读得回）
+  APPLIED_MAX_BYTES,
   filterRulesPaths,
   validateFilterRules,
   mergeActiveFilter,
