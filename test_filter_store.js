@@ -958,6 +958,65 @@ test('v3.411 生效快照内容变化必写盘：revision / filter 字段 / keyw
   assert.ok(Date.parse(now.appliedAt) > Date.parse(prev.appliedAt), 'source/hash 变化必须刷新 appliedAt')
 })
 
+// ===== P2 第 2 轮 must_fix：source / hash / lastGoodUsed 三条判据必须各自被单独钉住 =====
+// 为什么单列：降级轮沿用 LKG 时，revision/hash/filter/keyword 都可能与上一个正常轮**逐字相同**，
+// 只有 source（override→corrupt）与 lastGoodUsed（false→true）会变；控制台红条完全靠这两个字段
+// （scripts/console-assets/pages.js 要求 source==='corrupt' && lastGoodUsed===true）。
+// 若把这三条比较当成「非内容字段」删掉，写盘会被误跳过、快照继续宣称「正常」，控制台在真降级时
+// 仍显示「下一次加载起降级」。故这里每条比较各做一步**只改一个字段**的写入：任何一条被删都会
+// 表现为「没写盘」（inode 不变）而当场变红。
+test('v3.411 生效快照 source / hash / lastGoodUsed 各自单独变化都必须写盘（降级轮其余四字段可与上轮逐字相同）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  let args = {
+    cacheDir: dir,
+    filter: { pingbibiaoti: 'a', pingbineirong: 'b' },
+    keyword: { zkt_gjc: 'k' },
+    revision: 3,
+    source: 'override',
+    hash: 'h1',
+    lastGoodUsed: false
+  }
+  assert.strictEqual(writeAppliedSnapshot(args), true, '前置：先落一份「正常轮」快照')
+  // 每一小步只改 changes 里的字段，其余沿用上一步入参——「一次调用只动一个判据」是这条用例的全部意义。
+  const step = (label, changes, verify) => {
+    const prevStat = fs.statSync(paths.applied)
+    const prevAt = readJson(paths.applied).appliedAt
+    sleepMs(5)
+    args = { ...args, ...changes }
+    assert.strictEqual(writeAppliedSnapshot(args), true, `${label}：必须返回 true（调用方不得以为写入失败）`)
+    const now = readJson(paths.applied)
+    assert.notStrictEqual(fs.statSync(paths.applied).ino, prevStat.ino,
+      `${label}：必须真写盘——inode 没变说明被判成「内容一致」跳过了（对应比较被删/失效）`)
+    assert.ok(Date.parse(now.appliedAt) > Date.parse(prevAt),
+      `${label}：appliedAt 必须变新（旧 ${prevAt} / 新 ${now.appliedAt}）`)
+    verify(now)
+  }
+  // ① hash 单独变化：revision/filter/keyword/source/lastGoodUsed 全不动（hash 最容易被当成「只是个指纹」删掉）
+  step('hash 变化', { hash: 'h2' }, (now) => {
+    assert.strictEqual(now.hash, 'h2', 'hash 变化必须落盘')
+  })
+  // ② source 单独变化：正常轮 override → 降级轮 corrupt
+  step('source 变化', { source: 'corrupt' }, (now) => {
+    assert.strictEqual(now.source, 'corrupt', 'source 变化必须落盘（控制台据此判断本轮降级）')
+  })
+  // ③ lastGoodUsed 单独变化：false → true，其余字段一个字都没动（降级轮沿用 LKG 的真实形态）
+  step('lastGoodUsed 变化', { lastGoodUsed: true }, (now) => {
+    assert.strictEqual(now.lastGoodUsed, true, 'lastGoodUsed 变化必须落盘（控制台红条依据之一）')
+    assert.strictEqual(now.revision, 3, '降级轮的 revision 可与上一个正常轮逐字相同')
+    assert.strictEqual(now.hash, 'h2', '降级轮的 hash 可与上一个正常轮逐字相同')
+    assert.strictEqual(now.filter.pingbibiaoti, 'a', '降级轮的 filter 可与上一个正常轮逐字相同')
+    assert.strictEqual(now.filter.pingbineirong, 'b', '降级轮的 filter 可与上一个正常轮逐字相同')
+    assert.strictEqual(now.keyword.zkt_gjc, 'k', '降级轮的 keyword 可与上一个正常轮逐字相同')
+  })
+  // 控制台只认 applied 快照：仅翻转 source/lastGoodUsed 的一次调用后，读回必须得出「沿用了上次合法规则」
+  const read = readAppliedSnapshot(dir)
+  assert.strictEqual(read.status, 'ok')
+  assert.strictEqual(read.snapshot.source, 'corrupt')
+  assert.strictEqual(appliedLastGoodUsed(read.snapshot), true,
+    '仅翻转 source/lastGoodUsed 的降级轮必须被控制台读成「沿用上次合法规则」')
+})
+
 test('v3.411 旧快照损坏（半截 JSON / schema 不对）→ 仍然重写成功并自愈', () => {
   const dir = makeDir()
   const paths = filterRulesPaths(dir)
