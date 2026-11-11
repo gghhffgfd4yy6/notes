@@ -155,30 +155,48 @@ check('J1-01 journalPathFor 与 scripts/message-signature.js 的后缀口径一�
   const src = fs.readFileSync(path.join(__dirname, 'scripts', 'message-signature.js'), 'utf8')
   assert.ok(src.includes(`const JOURNAL_SUFFIX = '${JOURNAL_SUFFIX}'`),
     'message-signature.js 的 JOURNAL_SUFFIX 必须与 xbk_message_store 同值，否则控制台签名漏算日志变化')
-  assert.strictEqual(JOURNAL_VERSION, 1)
+  assert.strictEqual(JOURNAL_VERSION, 2)
   assert.strictEqual(JOURNAL_MAX_BYTES, 8 * 1024 * 1024)
   assert.strictEqual(JOURNAL_MAX_AGE_MS, 6 * 60 * 60 * 1000)
   assert.strictEqual(JOURNAL_READ_MAX_BYTES, 64 * 1024 * 1024)
   assert.ok(JOURNAL_DIRECT_MAX_BYTES > 0 && JOURNAL_DIRECT_MAX_BYTES < JOURNAL_MAX_BYTES)
 })
 
-check('J1-02 parseJournalText：坏行/半行逐行忽略并计数，合法行照常返回，未知版本不猜', () => {
+check('J1-02 parseJournalText：坏行/半行逐行忽略并计数，合法行（v1/v2）照常返回，未知版本不猜，ckpt 之后才回放', () => {
   const ok = JSON.stringify({ v: 1, at: 111, put: [{ id: 'a' }] })
   const text = [
     ok,
     '{"v":1,"at":222,"put":[{"id":"b"', // 半行（崩溃现场）
     'not-json', // 整行坏
-    JSON.stringify({ v: 2, at: 333, put: [{ id: 'c' }] }), // 未知版本
+    JSON.stringify({ v: 3, at: 333, put: [{ id: 'c' }] }), // 未知版本
     JSON.stringify({ v: 1, at: 444, put: [{ id: 'd' }, 'x', null] }), // 非对象元素跳过
+    JSON.stringify({ v: 2, at: 555, put: [{ id: 'e' }], drop: [{ id: 'old' }, 7] }), // v2：drop 里的非对象元素同样跳过
     ''
   ].join('\n')
   const parsed = parseJournalText(text)
-  assert.deepStrictEqual(parsed.puts.map(m => m.id), ['a', 'd'], '只回放合法行里的对象元素')
+  assert.deepStrictEqual(parsed.puts.map(m => m.id), ['a', 'd', 'e'], '只回放合法行里的对象元素')
+  assert.deepStrictEqual(parsed.records.map(r => [r.put.map(m => m.id), r.drop.map(m => m.id)]),
+    [[['a'], []], [['d'], []], [['e'], ['old']]], '记录序列必须保留每行的 put/drop 配对（drop 不能拍平进 put）')
   assert.strictEqual(parsed.badLines, 3, '半行 + 坏 JSON + 未知版本各计一行')
-  assert.strictEqual(parsed.lines, 2)
+  assert.strictEqual(parsed.lines, 3)
   assert.strictEqual(parsed.firstAt, 111, 'firstAt 取首条合法行的 at（合并窗口起点）')
-  assert.deepStrictEqual(parseJournalText(''), { puts: [], lines: 0, badLines: 0, firstAt: null })
-  assert.deepStrictEqual(parseJournalText(null), { puts: [], lines: 0, badLines: 0, firstAt: null })
+  const empty = { records: [], puts: [], lines: 0, badLines: 0, firstAt: null, ckptLines: 0 }
+  assert.deepStrictEqual(parseJournalText(''), empty)
+  assert.deepStrictEqual(parseJournalText(null), empty)
+  // ckpt：它之前的行已全部写进快照（合并成功、truncate 未完成），必须整体丢弃；
+  // firstAt 从最后一个 ckpt 之后重新起算（合并窗口起点不能被旧行拖到 6 小时前）。
+  const withCkpt = [
+    ok,
+    JSON.stringify({ v: 2, at: 900, put: [{ id: 'stale' }] }),
+    JSON.stringify({ v: 2, at: 1000, ckpt: true }),
+    JSON.stringify({ v: 2, at: 1001, put: [{ id: 'fresh' }], drop: [{ id: 'gone' }] })
+  ].join('\n')
+  const p2 = parseJournalText(withCkpt)
+  assert.deepStrictEqual(p2.puts.map(m => m.id), ['fresh'], 'ckpt 之前的行已被快照吸收，不得再回放')
+  assert.strictEqual(p2.firstAt, 1001)
+  assert.strictEqual(p2.ckptLines, 1)
+  // 末尾就是 ckpt（之后没有新行）：回放为空
+  assert.deepStrictEqual(parseJournalText([ok, JSON.stringify({ v: 2, at: 1000, ckpt: true })].join('\n')).puts, [])
 })
 
 // ============================================================
@@ -389,6 +407,71 @@ check('J2-03 墓碑 + 崩溃回放：已落墓碑的裁剪条目不得靠 journa
   }
 })
 
+check('J2-04 同批「先插入后更新同一身份」：重启后 readMessages 必须与重启前逐条深比较一致（顺序+内容，无 _f 与含 _f 两式）', () => {
+  // 审查 B 的 orderFlip 复现：写入顺序 ≠ 内存数组顺序。maxSize=5、journal 不合并 ⇒ 重启只能靠日志
+  // 重建数组；回放对未命中项只能 push 到尾部，若 put 按写入顺序记（r 在前、p' 在后），重启后数组
+  // 变成 [q,r,p']（修前实测），与内存的 [q,p',r] 不同 ⇒ 后续条数裁剪先裁谁也随之改变。
+  // 含 _f 一式再叠一层「先插入 f、再插入 x、最后更新 f」，并且第三批触发条数裁剪（a 被裁）——
+  // 被裁的身份必须进日志 drop，否则回放会把它放回数组。
+  const clock = virtualClock()
+  const NAME = 'push.json'
+  const constants = { JOURNAL_DIRECT_MAX_BYTES: 0, JOURNAL_MAX_BYTES: 1 << 30 } // 不合并：顺序全靠日志自己承载
+  const cases = [
+    {
+      tag: 'plain',
+      maxSize: 5,
+      batches: [
+        [{ id: 'q', title: 'Q' }],
+        [{ id: 'p', title: 'P' }, { id: 'r', title: 'R' }, { id: 'p', title: 'P2' }]
+      ],
+      expectIds: ['q', 'p', 'r'],
+      expectPutL2: ['p', 'r']
+    },
+    {
+      tag: 'filtered',
+      maxSize: 5,
+      batches: [
+        [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }, { id: 'c', title: 'C' }],
+        [{ id: 'f', title: 'F', _f: true }, { id: 'x', title: 'X' }, { id: 'f', title: 'F2', _f: true }],
+        [{ id: 'y', title: 'Y' }] // 6 条 > 上限 5：最旧的 a 被裁（f 是 _f，不落墓碑，只能靠日志 drop）
+      ],
+      expectIds: ['b', 'c', 'f', 'x', 'y'],
+      expectDropL3: ['a']
+    }
+  ]
+  try {
+    for (const c of cases) {
+      const dir = tmpDir('order-' + c.tag)
+      const store = makeStore({ dir, maxSize: c.maxSize, constants })
+      const fp = store.getFilePath(NAME)
+      for (const b of c.batches) { clock.advance(1000); store.saveBatch(b, NAME) }
+      const before = store.readMessages(fp).map(m => Object.assign({}, m))
+      assert.deepStrictEqual(before.map(m => m.id), c.expectIds, `${c.tag}: 写入侧先自证内存顺序`)
+      const lines = fs.readFileSync(journalPathFor(fp), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
+      if (c.expectPutL2) {
+        assert.deepStrictEqual(lines[1].put.map(m => m.id), c.expectPutL2,
+          `${c.tag}: 同批同身份只记一次，且 put 顺序必须 = 内存数组顺序（不能是写入顺序 r,p）`)
+        assert.strictEqual(lines[1].put[0].title, 'P2', `${c.tag}: 同一身份的内容取最后一次写入`)
+      }
+      if (c.expectDropL3) {
+        assert.deepStrictEqual((lines[2].drop || []).map(m => m.id), c.expectDropL3,
+          `${c.tag}: 本批被裁剪的身份必须记进 drop（否则回放会把它放回尾部并挤掉活条目）`)
+      }
+      const reopened = makeStore({ dir, maxSize: c.maxSize, constants })
+      const after = reopened.readMessages(fp)
+      assert.deepStrictEqual(after, before, `${c.tag}: 重启后 readMessages 必须与重启前逐条深比较一致（顺序+内容）`)
+      assert.deepStrictEqual(after.map(m => m.id), before.map(m => m.id), `${c.tag}: 顺序必须逐条一致`)
+      for (const m of before) {
+        assert.strictEqual(reopened.has({ id: m.id, title: m.title }, NAME), true, `${c.tag}: 活条目 ${m.id} 的判重记忆不得丢失`)
+      }
+      // 被裁条目仍由墓碑拦下（_f 从不落墓碑：它只是「没被推送过」，回到上游应能重新评估）
+      if (c.tag === 'filtered') assert.strictEqual(reopened.has({ id: 'a' }, NAME), true, '已推送过的被裁条目仍须判重命中')
+    }
+  } finally {
+    clock.restore()
+  }
+})
+
 // ============================================================
 section('3. 崩溃恢复')
 // ============================================================
@@ -511,10 +594,75 @@ check('J3-06 末尾是完整 JSON 但缺换行（短写）：补换行后两条�
   assert.deepStrictEqual(reopened.readMessages(fp).map(m => m.id), ['a', 'b'])
 })
 
+check('J3-07 _f 记录 + 「快照已写、journal 未截断」窗口：重启读路径必须与旧读路径逐条一致，活条目不得被挤掉', () => {
+  // 审查 B 的 crash-truncate 复现（探针注入 truncate EPERM）：maxSize=3，第一批 [f(_f),a,b] 合并成功、
+  // 但 journal 清不掉；第二批 c 进内存后把 _f 的 f 头裁掉（f 从不落墓碑）⇒ 快照 [a,b,c] + journal 仍含
+  // f 的 put。回放若只按 put 叠加，f 会复活到尾部 → 4 条 > 上限 → 读端从头部挤掉 a（活条目），
+  // 修前 newRead=["b","c","f"]、hasA=false。
+  const clock = virtualClock()
+  const dir = tmpDir('f-crash')
+  const NAME = 'push.json'
+  const fp = path.join(dir, NAME)
+  const jp = journalPathFor(fp)
+  const fsWrap = Object.create(fs)
+  // 只让 journal 的 truncate 失败：模拟「快照已写、清日志失败/进程死在两者之间」
+  fsWrap.truncateSync = (p, ...rest) => {
+    if (String(p) === jp) {
+      const e = new Error('EPERM: injected truncate failure')
+      e.code = 'EPERM'
+      throw e
+    }
+    return fs.truncateSync(p, ...rest)
+  }
+  const constants = { JOURNAL_DIRECT_MAX_BYTES: 0, JOURNAL_MAX_BYTES: 1 }
+  try {
+    const store = makeStore({ dir, maxSize: 3, fsImpl: fsWrap, constants })
+    store.saveBatch([{ id: 'f', title: 'FILTERED', _f: true }, { id: 'a', title: 'A' }, { id: 'b', title: 'B' }], NAME)
+    store.saveBatch([{ id: 'c', title: 'C' }], NAME)
+    // 崩溃现场自证：快照已是裁剪后的 [a,b,c]，journal 因 truncate 失败仍留着 f 的 put
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(fp, 'utf8')).map(m => m.id), ['a', 'b', 'c'], '快照必须已写成裁剪后的内容')
+    const journalText = fs.readFileSync(jp, 'utf8')
+    assert.ok(journalText.includes('"FILTERED"'), 'journal 必须仍含 _f 条目的 put（构造「journal 未截断」窗口）')
+    assert.ok(journalText.includes('"ckpt":true'), 'truncate 失败前必须先追加检查点（否则旧行会被重复回放）')
+    const reopened = makeStore({ dir, maxSize: 3 })
+    const got = reopened.readMessages(fp)
+    const oldView = makeStore({ dir, maxSize: 3, constants: { JOURNAL_READ_ENABLED: false } }).readMessages(fp)
+    assert.deepStrictEqual(got, oldView, '同一磁盘状态下，journal 读路径必须与旧读路径（只看快照）逐条一致')
+    assert.deepStrictEqual(got.map(m => m.id), ['a', 'b', 'c'], '被裁剪的 _f 条目不得复活，活条目顺序不得变')
+    assert.strictEqual(reopened.has({ id: 'a', title: 'A' }, NAME), true, '被挤掉的活条目 a 的判重记忆不得丢失')
+    assert.strictEqual(reopened.has({ id: 'b', title: 'B' }, NAME), true)
+    assert.strictEqual(reopened.has({ id: 'f', title: 'FILTERED', _f: true }, NAME), false, '被裁剪的 _f 条目不得判重命中（上游重发要能重新评估）')
+  } finally {
+    clock.restore()
+  }
+})
+
+check('J3-08 检查点（ckpt）：合并时被裁掉的 _f 记录不得靠 ckpt 之前的旧行复活', () => {
+  // 合并（compaction）自己也会裁剪（条数/字节上限），这些被裁身份没有 drop 行可记；`_f` 又不落墓碑，
+  // 只能靠「ckpt 之前的行已被快照吸收、读端不回放」来挡住。修前 ckpt 行被当坏行、旧 put 照旧回放，
+  // 会把 f 追加到尾部（大 maxSize 下直接多出一条判重记录，小 maxSize 下再挤掉最旧的活条目）。
+  const dir = tmpDir('ckpt')
+  const NAME = 'push.json'
+  const fp = path.join(dir, NAME)
+  const jp = journalPathFor(fp)
+  const snapshot = [{ id: 'b', title: 'B' }, { id: 'c', title: 'C' }, { id: 'd', title: 'D' }]
+  fs.writeFileSync(fp, JSON.stringify(snapshot))
+  const lines = [
+    { v: 2, at: 100, put: [{ id: 'f', title: 'FILTERED', _f: true }, { id: 'b', title: 'B' }, { id: 'c', title: 'C' }, { id: 'd', title: 'D' }] },
+    { v: 2, at: 200, ckpt: true },
+    { v: 2, at: 300, put: [{ id: 'e', title: 'E' }] }
+  ]
+  fs.writeFileSync(jp, lines.map(l => JSON.stringify(l) + '\n').join(''))
+  const reopened = makeStore({ dir, maxSize: 100 })
+  const got = reopened.readMessages(fp)
+  assert.deepStrictEqual(got.map(m => m.id), ['b', 'c', 'd', 'e'], 'ckpt 之前的行（含被合并裁掉的 _f）不得回放，ckpt 之后的新行必须照常回放')
+  assert.strictEqual(reopened.has({ id: 'f', title: 'FILTERED', _f: true }, NAME), false, '被裁的 _f 记录不得复活')
+  assert.strictEqual(reopened.has({ id: 'e', title: 'E' }, NAME), true)
+})
+
 // ============================================================
 section('4. fail-closed：journal 读失败绝不能当成「没有日志」')
 // ============================================================
-
 check('J4-01 journal 路径被目录占位（unsafe）：readMessages 必须返回空集 + 写闸门，不得按空缓存放行', () => {
   const dir = tmpDir('unsafe')
   const NAME = 'push.json'

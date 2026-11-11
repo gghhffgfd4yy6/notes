@@ -37,10 +37,19 @@ const PUSH_SOURCES_MAX_URL_LEN = 2048
 //     （先清 journal 再写快照）在快照写失败时会丢掉整段判重记忆 = 全量重推；
 //   · 回放是幂等的（同一身份只更新、不重复追加），因此「快照已写、journal 未清」的崩溃窗口
 //     重放一次也不会产生重复条目——这是崩溃恢复的正确性前提，禁止往行里塞非幂等语义；
+//   · 每行的 put 必须按**内存数组顺序**记（不是写入顺序）：同批「先插入后更新同一身份」时写入顺序
+//     与数组顺序不同，回放对未命中项只能追加到尾部，顺序错位会改变后续条数裁剪裁掉谁；
+//   · 每行还要记本批被**裁剪**的身份（drop）：裁剪只发生在本批写入之后，且 `_f`（过滤未推）条目
+//     按设计不落墓碑，不记 drop 就会在回放时复活并排到尾部，把快照里的活条目挤出上限；
+//   · 合并成功写快照后先追加一行 ckpt 再 truncate：ckpt 之前的行已全部进快照，读端只回放最后一个
+//     ckpt 之后的行。truncate 失败（或进程死在两者之间）时，旧行不会被重复回放；
 //   · journal 读失败（ioError/unsafe/tooLarge/半读）= fail-closed：置 _readFailed、返回空集，
 //     让调用方跳过本轮推送。绝不能当成「没有 journal」继续——那等于把已推送记录当新消息全量重推。
 const JOURNAL_SUFFIX = '.journal.ndjson'
-const JOURNAL_VERSION = 1
+// v1 = {v,at,put}；v2 = 增加可选 drop（本批被裁剪的身份）与 ckpt（检查点）行。
+// 读端同时接受 v1/v2（本 PR 之前写出的行照旧可回放）；写端只写 v2。
+const JOURNAL_VERSION = 2
+const JOURNAL_VERSION_MIN = 1
 const JOURNAL_MAX_BYTES = 8 * 1024 * 1024
 const JOURNAL_MAX_AGE_MS = 6 * 60 * 60 * 1000
 // journal 读端上限：写端 8 MiB 就触发合并，留 8 倍余量吸收「合并写盘失败后继续追加」的极端情况。
@@ -61,25 +70,51 @@ const JOURNAL_READ_ENABLED = true
 function journalPathFor (filePath) { return filePath + JOURNAL_SUFFIX }
 
 /** 解析 journal 文本（NDJSON）。逐行容忍并忽略半行/坏行（崩溃现场），但绝不整份丢弃：
- *  返回仍可用的 put 列表与坏行数，由调用方决定告警口径。只认 {v:1, at, put:[]}；未知版本按坏行计
- *  （宁可少回放 = 可能多推，也绝不猜测半条记录的身份）。 */
+ *  返回仍可用的**记录序列**（每条记录 = 一行的 put + drop）与坏行数，由调用方决定告警口径。
+ *  只认 v1（{v,at,put}）与 v2（{v,at,put,drop}），未知版本按坏行计（宁可少回放 = 可能多推，
+ *  也绝不猜测半条记录的身份）。
+ *  ckpt 行（{v,at,ckpt:true}）表示「它之前的行已全部写进 push.json」：解析时清空已收集的记录，
+ *  只保留最后一次 ckpt 之后的行——合并成功但 truncate 失败时，旧行不得被重复回放。 */
 function parseJournalText (text) {
-  const out = { puts: [], lines: 0, badLines: 0, firstAt: null }
+  const out = { records: [], puts: [], lines: 0, badLines: 0, firstAt: null, ckptLines: 0 }
   if (typeof text !== 'string' || text === '') return out
   for (const row of text.split('\n')) {
     if (row === '') continue
     let rec = null
     try { rec = JSON.parse(row) } catch (e) { rec = null }
-    if (!rec || typeof rec !== 'object' || Array.isArray(rec) || rec.v !== JOURNAL_VERSION || !Array.isArray(rec.put)) {
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec) ||
+      !(rec.v >= JOURNAL_VERSION_MIN && rec.v <= JOURNAL_VERSION)) {
+      out.badLines++
+      continue
+    }
+    if (rec.ckpt === true) {
+      out.records.length = 0
+      out.puts.length = 0
+      out.firstAt = null
+      out.ckptLines++
+      out.lines++
+      continue
+    }
+    if (!Array.isArray(rec.put)) {
       out.badLines++
       continue
     }
     out.lines++
     if (out.firstAt === null && Number.isFinite(rec.at)) out.firstAt = rec.at
+    const put = []
     for (const m of rec.put) {
       if (!m || typeof m !== 'object' || Array.isArray(m)) continue
-      out.puts.push(m)
+      put.push(m)
     }
+    const drop = []
+    if (Array.isArray(rec.drop)) {
+      for (const m of rec.drop) {
+        if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+        drop.push(m)
+      }
+    }
+    out.records.push({ put, drop })
+    for (const m of put) out.puts.push(m)
   }
   return out
 }
@@ -124,46 +159,104 @@ function removeIdentityFromIndex (idx, ident, i) {
   }
 }
 
-/** 按 _upsert 的语义把 journal 的 put 列表回放进 messages（原地，保持位置）：
- *  身份命中 ⇒ 覆盖该位置（journal 记录的就是当时写入内存的对象，含新 timestamp）；未命中 ⇒ 追加。
- *  命中判定与 _upsert/_findDedupIndex 同源（sameMessageIdentity），候选集合与 _indexHasIdentity 同构；
- *  多个候选时取数组序最靠前的一个（与线性扫描 oracle 一致）。 */
-function applyJournalPuts (messages, puts, Utils) {
-  if (!Array.isArray(messages) || !Array.isArray(puts) || puts.length === 0) return { applied: 0 }
-  const idx = buildIdentityIndex(messages, Utils)
-  let applied = 0
-  for (const m of puts) {
-    const b = Utils.getMessageIdentity(m)
-    if (!b.valid) continue
-    const cands = []
-    const collect = (map, key) => { const set = key ? map.get(key) : null; if (set) for (const i of set) cands.push(i) }
-    if (b.kind === 'id') {
-      collect(idx.idByKey, b.idKey)
-      collect(idx.urlOnly, b.url)
-    } else if (b.kind === 'url') {
-      collect(idx.urlOnly, b.url)
-      collect(idx.idWithUrl, b.url)
-    } else {
-      collect(idx.anonByKey, b.key)
-    }
-    let hit = -1
-    for (const i of cands) {
-      if (!Number.isInteger(i) || i < 0 || i >= messages.length) continue
-      if (hit !== -1 && i >= hit) continue
-      const a = Utils.getMessageIdentity(messages[i])
-      if (Utils.sameMessageIdentity(messages[i], m, a, b)) hit = i
-    }
-    if (hit >= 0) {
-      removeIdentityFromIndex(idx, Utils.getMessageIdentity(messages[hit]), hit)
-      messages[hit] = m
-      addIdentityToIndex(idx, b, hit, Utils)
-    } else {
-      messages.push(m)
-      addIdentityToIndex(idx, b, messages.length - 1, Utils)
-    }
-    applied++
+/** 某身份的候选位置集合：与 _buildIdentityIndex 的四集合同构（id + url 双向 fallback）。
+ *  journal 回放的 put 命中判定与 drop 移除共用这一份，禁止两处各写一套口径。 */
+function journalIdentityCandidates (idx, b) {
+  const cands = []
+  const collect = (map, key) => { const set = key ? map.get(key) : null; if (set) for (const i of set) cands.push(i) }
+  if (b.kind === 'id') {
+    collect(idx.idByKey, b.idKey)
+    collect(idx.urlOnly, b.url)
+  } else if (b.kind === 'url') {
+    collect(idx.urlOnly, b.url)
+    collect(idx.idWithUrl, b.url)
+  } else {
+    collect(idx.anonByKey, b.key)
   }
-  return { applied }
+  return cands
+}
+
+/** 按 _upsert 的语义把 journal 的**记录序列**回放进 messages（原地，保持位置）：
+ *  每条记录 = 一行的 { put:[...], drop:[...] }，按写入顺序逐行应用：
+ *    · put：身份命中 ⇒ 覆盖该位置（journal 记录的就是当时写入内存的对象，含新 timestamp）；未命中 ⇒ 追加。
+ *      行内的 put 已按内存数组顺序排列（见 orderJournalPutsInMemoryOrder），故追加顺序 = 内存顺序。
+ *    · drop：本批被头裁剪掉的身份（含不落墓碑的 `_f` 条目），从数组里摘掉——不摘就会在回放里复活，
+ *      排到尾部后把快照里的活条目挤出上限（判重记忆永久丢失）。
+ *  命中判定与 _upsert/_findDedupIndex 同源（sameMessageIdentity），候选集合与 _indexHasIdentity 同构；
+ *  多个候选时取数组序最靠前的一个（与线性扫描 oracle 一致）。
+ *  drop 只把位置标死、整个回放结束后一次性压实：中途 splice 会让索引里的位置全部失效。 */
+function applyJournalRecords (messages, records, Utils) {
+  const out = { applied: 0, removed: 0 }
+  if (!Array.isArray(messages) || !Array.isArray(records) || records.length === 0) return out
+  const idx = buildIdentityIndex(messages, Utils)
+  const dead = new Set()
+  for (const rec of records) {
+    const puts = rec && Array.isArray(rec.put) ? rec.put : []
+    for (const m of puts) {
+      const b = Utils.getMessageIdentity(m)
+      if (!b.valid) continue
+      let hit = -1
+      for (const i of journalIdentityCandidates(idx, b)) {
+        if (!Number.isInteger(i) || i < 0 || i >= messages.length || dead.has(i)) continue
+        if (hit !== -1 && i >= hit) continue
+        const a = Utils.getMessageIdentity(messages[i])
+        if (Utils.sameMessageIdentity(messages[i], m, a, b)) hit = i
+      }
+      if (hit >= 0) {
+        removeIdentityFromIndex(idx, Utils.getMessageIdentity(messages[hit]), hit)
+        messages[hit] = m
+        addIdentityToIndex(idx, b, hit, Utils)
+      } else {
+        messages.push(m)
+        addIdentityToIndex(idx, b, messages.length - 1, Utils)
+      }
+      out.applied++
+    }
+    const drops = rec && Array.isArray(rec.drop) ? rec.drop : []
+    for (const d of drops) {
+      const b = Utils.getMessageIdentity(d)
+      if (!b.valid) continue
+      for (const i of journalIdentityCandidates(idx, b)) {
+        if (!Number.isInteger(i) || i < 0 || i >= messages.length || dead.has(i)) continue
+        const a = Utils.getMessageIdentity(messages[i])
+        if (!Utils.sameMessageIdentity(messages[i], d, a, b)) continue
+        removeIdentityFromIndex(idx, a, i)
+        dead.add(i)
+        out.removed++
+      }
+    }
+  }
+  if (dead.size > 0) {
+    const kept = messages.filter((m, i) => !dead.has(i))
+    messages.length = 0
+    for (const m of kept) messages.push(m)
+  }
+  return out
+}
+
+/** 单行 puts 的兼容入口（v1 行没有 drop）：等价于「一条只有 put 的记录」。 */
+function applyJournalPuts (messages, puts, Utils) {
+  if (!Array.isArray(puts) || puts.length === 0) return { applied: 0 }
+  const r = applyJournalRecords(messages, [{ put: puts, drop: [] }], Utils)
+  return { applied: r.applied }
+}
+
+/** 把本批实际写入内存的对象整理成 journal 的 put 列表：只保留仍在内存里的（同一批内被后写覆盖掉的
+ *  旧对象丢掉），并按**内存数组顺序**排列（写入顺序 ≠ 数组顺序：同批「先插入 p、再插入 r、最后更新 p」
+ *  的写入顺序是 p,r,p'，内存顺序却是 p',r）。
+ *  回放对未命中项只能追加到尾部 ⇒ put 顺序必须等于数组顺序，否则重启后的数组顺序与重启前不同，
+ *  后续条数裁剪裁掉的对象也随之改变（验收要求 readMessages 逐条深比较一致）。 */
+function orderJournalPutsInMemoryOrder (messages, puts) {
+  if (!Array.isArray(messages) || !Array.isArray(puts) || puts.length === 0) return []
+  const pos = new Map()
+  for (let i = 0; i < messages.length; i++) pos.set(messages[i], i)
+  const picked = new Map()
+  for (const m of puts) {
+    const i = pos.get(m)
+    if (i === undefined || picked.has(m)) continue
+    picked.set(m, i)
+  }
+  return [...picked.entries()].sort((a, b) => a[1] - b[1]).map((e) => e[0])
 }
 
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
@@ -1436,9 +1529,16 @@ function createMessageStore ({
       // 墓碑闸门（P1 fix 1）：条目被裁剪时身份已落墓碑，日志里残留的旧 put 绝不能把它「复活」——
       // 复活的条目排在数组尾部，读端按 maxSize 裁剪时会挤掉快照里仍未墓碑的活条目，那一条的
       // 判重记忆随之丢失（上游重放即重复推送）。口径与 _upsert/saveBatch 的墓碑闸门一致。
+      // 逐行应用（put + drop 必须按写入顺序叠加）：drop 记的是本批被头裁剪的身份，含从不落墓碑的
+      // `_f` 条目——它们只能靠 drop 从回放数组里摘掉，否则会复活并挤掉活条目。
       const snapshotLength = messages.length
-      const replayable = this._filterTombstonedPuts(filePath, parsed.puts)
-      if (replayable.length > 0) applyJournalPuts(messages, replayable, Utils)
+      if (parsed.records.length > 0) {
+        const replay = []
+        for (const rec of parsed.records) {
+          replay.push({ put: this._filterTombstonedPuts(filePath, rec.put), drop: rec.drop })
+        }
+        applyJournalRecords(messages, replay, Utils)
+      }
       this._trimMergedByTombstone(filePath, messages, snapshotLength)
       return messages
     },
@@ -1532,7 +1632,12 @@ function createMessageStore ({
       } catch (e) { return 0 }
     },
 
-    /** 合并收尾：journal 截断为 0。**只在快照写成功后调用**（顺序不可反）。
+    /** 合并收尾：先往日志末尾追加一行「检查点」（它之前的行已全部写进刚落的快照），再把日志截断为 0。
+     *  **只在快照写成功后调用**（顺序不可反）。
+     *  检查点为什么必须在 truncate 之前：truncate 可能失败（权限/只读），进程也可能恰好死在
+     *  「快照已写、日志未清」之间——此时日志里那些已被快照吸收的旧行如果照旧回放，就会把合并时
+     *  按条数/字节裁掉的条目（尤其是不落墓碑的 `_f`）重新放回数组，再次挤掉活条目。读端只回放
+     *  最后一个 ckpt 之后的行，这一窗口因此不再改变判重集合。
      *  非普通文件一律不碰（与 writeAtomic 同口径，防 truncate 跟随符号链接）；0 字节直接算成功。 */
     _resetJournal (filePath) {
       const jPath = journalPathFor(filePath)
@@ -1543,14 +1648,38 @@ function createMessageStore ({
         return false
       }
       if (st.size === 0) { delete this._journalSince[filePath]; return true }
+      this._appendJournalCheckpoint(jPath, st.size)
       try {
         fs.truncateSync(jPath, 0)
       } catch (e) {
-        console.error(`判重日志清空失败（快照已写成功；下轮合并会重试，期间重复回放是幂等的）${jPath}:`, e && e.message)
+        console.error(`判重日志清空失败（快照已写成功；已追加检查点，旧行不会被回放，下轮合并会重试）${jPath}:`, e && e.message)
         return false
       }
       delete this._journalSince[filePath]
       return true
+    },
+
+    /** 追加一行检查点（ckpt）：语义 =「本行之前的 journal 行已全部写进 push.json」。
+     *  末尾是半行（上次 append 被 kill）时先补换行——半行本身解析不出 ckpt，会把检查点一起作废；
+     *  末字节读不出（无法确认）时放弃写检查点并如实告警（truncate 仍会尝试，成功即无残留）。 */
+    _appendJournalCheckpoint (jPath, size) {
+      if (typeof fs.appendFileSync !== 'function') return false
+      let payload = JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), ckpt: true }) + '\n'
+      if (Number.isFinite(size) && size > 0) {
+        const ends = this._journalEndsWithNewline(jPath, size)
+        if (ends === null) {
+          console.error(`判重日志末尾状态无法确认，跳过检查点（若 truncate 也失败，旧行会继续被回放）${jPath}`)
+          return false
+        }
+        if (!ends) payload = '\n' + payload
+      }
+      try {
+        fs.appendFileSync(jPath, payload, { mode: 0o600 })
+        return true
+      } catch (e) {
+        console.error(`判重日志检查点追加失败（快照已写成功；若 truncate 也失败，旧行会继续被回放）${jPath}:`, e && e.message)
+        return false
+      }
     },
 
     /** P1：增量落盘。把本批实际写入的对象（puts，与 messages 元素同一引用）追加进 journal；
@@ -1581,14 +1710,19 @@ function createMessageStore ({
         if (saved && droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
         return saved
       }
-      // 只记「仍在内存里」的对象：同一批内被后来那条覆盖掉的位置不写进日志（回放会把它重新追加成重复条目）
-      const surviving = new Set(messages)
-      const put = []
-      for (const m of puts) if (surviving.has(m)) put.push(m)
+      // 只记「仍在内存里」的对象，并按内存数组顺序排列：同一批内被后来那条覆盖掉的位置不写进日志
+      // （回放会把它重新追加成重复条目），而写入顺序 ≠ 数组顺序（先插入 p、再插入 r、最后更新 p
+      // 的写入顺序是 p,r,p'，内存顺序是 p',r）——回放对未命中项只能追加到尾部，顺序错位会让重启后
+      // readMessages 的数组顺序变化，进而改变后续条数裁剪先裁谁。
+      const put = orderJournalPutsInMemoryOrder(messages, puts)
+      // 本批被头裁剪的身份（含不落墓碑的 `_f`）：必须进日志，否则回放会把它们放回尾部并挤掉活条目。
+      const drop = droppedAll
       let line = ''
-      if (put.length > 0) {
+      if (put.length > 0 || drop.length > 0) {
         try {
-          line = JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), put }) + '\n'
+          line = JSON.stringify(drop.length > 0
+            ? { v: JOURNAL_VERSION, at: Date.now(), put, drop }
+            : { v: JOURNAL_VERSION, at: Date.now(), put }) + '\n'
         } catch (e) {
           console.error(`判重日志序列化失败 ${jPath}（可能含循环引用）:`, e && e.message)
           restoreMemo()
@@ -2688,5 +2822,7 @@ module.exports = {
   JOURNAL_READ_ENABLED,
   journalPathFor,
   parseJournalText,
-  applyJournalPuts
+  applyJournalPuts,
+  applyJournalRecords,
+  orderJournalPutsInMemoryOrder
 }
