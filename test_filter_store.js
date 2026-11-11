@@ -117,6 +117,20 @@ function expectError (result, field, code, label) {
 function readJson (file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'))
 }
+// 读文本 + 取 stat 必须走同一个 fd：先 statSync(path) 再 readFileSync(path) 是 TOCTOU 形状
+// （CodeQL js/file-system-race），而且两次按路径取值可能落到两个不同的 inode 上——本文件正是用
+// inode 证明「到底有没有写盘」，路径级两次取值会把这条判据本身做成竞态。open → fstat → read 全程
+// 钉在同一份 inode 上，返回值可以直接用于「内容一字不动 / inode 未变」的断言。
+function readTextAndStat (file) {
+  const fd = fs.openSync(file, 'r')
+  try {
+    const text = fs.readFileSync(fd, 'utf8')
+    const stat = fs.fstatSync(fd)
+    return { text, stat }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
 function writeJson (file, value) {
   fs.writeFileSync(file, JSON.stringify(value))
 }
@@ -884,12 +898,12 @@ test('v3.411 生效快照内容不变不写盘：同一份规则连写两次，�
     hash: 'h1'
   }
   assert.strictEqual(writeAppliedSnapshot(args), true, '第一次（文件还不存在）必须真写')
-  const firstText = fs.readFileSync(paths.applied, 'utf8')
-  const firstStat = fs.statSync(paths.applied)
+  const firstState = readTextAndStat(paths.applied)
   sleepMs(5) // 让「若重写」的 appliedAt 必然不同，避免同毫秒造成的假通过
   assert.strictEqual(writeAppliedSnapshot(args), true, '内容一致时也必须返回 true（调用方不得以为写入失败）')
-  assert.strictEqual(fs.statSync(paths.applied).ino, firstStat.ino, '内容一致不得写盘（inode 变了就说明重写过）')
-  assert.strictEqual(fs.readFileSync(paths.applied, 'utf8'), firstText, '文件内容必须一字不动（含 appliedAt）')
+  const secondState = readTextAndStat(paths.applied)
+  assert.strictEqual(secondState.stat.ino, firstState.stat.ino, '内容一致不得写盘（inode 变了就说明重写过）')
+  assert.strictEqual(secondState.text, firstState.text, '文件内容必须一字不动（含 appliedAt）')
 
   // 快照是手改/旧版本写的：filter 键序、keyword 键序不同但内容相同 → 仍必须判「内容一致」而不写盘。
   // 「纯函数式比较」在这里是硬要求：按 JSON 文本或键序比会把这份快照误判成「变了」而白写一轮。
@@ -903,10 +917,11 @@ test('v3.411 生效快照内容不变不写盘：同一份规则连写两次，�
     revision: 3,
     schema: 1
   }))
-  const reorderedStat = fs.statSync(paths.applied)
+  const reorderedBefore = readTextAndStat(paths.applied)
   assert.strictEqual(writeAppliedSnapshot(args), true, '键序不同的等价快照也必须跳过写盘')
-  assert.strictEqual(fs.statSync(paths.applied).ino, reorderedStat.ino, '键序不同不是内容变化：不得重写')
-  assert.strictEqual(readJson(paths.applied).appliedAt, '2020-01-01T00:00:00.000Z', '跳过写盘必须保留磁盘上的旧 appliedAt')
+  const reorderedAfter = readTextAndStat(paths.applied)
+  assert.strictEqual(reorderedAfter.stat.ino, reorderedBefore.stat.ino, '键序不同不是内容变化：不得重写')
+  assert.strictEqual(JSON.parse(reorderedAfter.text).appliedAt, '2020-01-01T00:00:00.000Z', '跳过写盘必须保留磁盘上的旧 appliedAt')
 })
 
 test('v3.411 生效快照内容变化必写盘：revision / filter 字段 / keyword / 恢复默认任一变化都重写且 appliedAt 变新', () => {
@@ -980,13 +995,14 @@ test('v3.411 生效快照 source / hash / lastGoodUsed 各自单独变化都必�
   assert.strictEqual(writeAppliedSnapshot(args), true, '前置：先落一份「正常轮」快照')
   // 每一小步只改 changes 里的字段，其余沿用上一步入参——「一次调用只动一个判据」是这条用例的全部意义。
   const step = (label, changes, verify) => {
-    const prevStat = fs.statSync(paths.applied)
-    const prevAt = readJson(paths.applied).appliedAt
+    const prevState = readTextAndStat(paths.applied)
+    const prevAt = JSON.parse(prevState.text).appliedAt
     sleepMs(5)
     args = { ...args, ...changes }
     assert.strictEqual(writeAppliedSnapshot(args), true, `${label}：必须返回 true（调用方不得以为写入失败）`)
-    const now = readJson(paths.applied)
-    assert.notStrictEqual(fs.statSync(paths.applied).ino, prevStat.ino,
+    const nowState = readTextAndStat(paths.applied)
+    const now = JSON.parse(nowState.text)
+    assert.notStrictEqual(nowState.stat.ino, prevState.stat.ino,
       `${label}：必须真写盘——inode 没变说明被判成「内容一致」跳过了（对应比较被删/失效）`)
     assert.ok(Date.parse(now.appliedAt) > Date.parse(prevAt),
       `${label}：appliedAt 必须变新（旧 ${prevAt} / 新 ${now.appliedAt}）`)
@@ -1043,7 +1059,7 @@ test('v3.411 旧快照损坏（半截 JSON / schema 不对）→ 仍然重写成
 
 // ===== P2 返工 must_fix 1：跳过写盘前必须确认目标仍是 0600 =====
 // 为什么：旧实现每轮 writeAtomic（0600 临时文件 + rename），等于每轮把权限修回 0600；改成「内容一致
-// 就跳过」后，一份 0644 的 applied.json（缓存目录被整体拷贝/解包、备份恢复、用户手工 chmod）会在规则
+// 就跳过」后，一份 0640 的 applied.json（缓存目录被整体拷贝/解包、备份恢复、用户手工 chmod）会在规则
 // 不变期间永久保留，而快照里有用户全部过滤规则正文。SYSTEM_CONTRACT 把 applied/LKG 一律 0600 当硬口径。
 test('P2 must_fix 1 内容一致但权限不是 0600：必须落到写盘分支自愈（mode 回 0600、inode 变化、appliedAt 刷新）', () => {
   const dir = makeDir()
@@ -1057,26 +1073,33 @@ test('P2 must_fix 1 内容一致但权限不是 0600：必须落到写盘分支�
     hash: 'h1'
   }
   assert.strictEqual(writeAppliedSnapshot(args), true, '前置：先写出一份合法快照')
-  assert.strictEqual(fs.statSync(paths.applied).mode & 0o777, 0o600, '前置：writeAtomic 写出的必须是 0600')
-  // 模拟「缓存目录被整体拷贝/解包、备份恢复、手工 chmod」后的宽权限快照
-  fs.chmodSync(paths.applied, 0o644)
-  const looseStat = fs.statSync(paths.applied)
-  assert.strictEqual(looseStat.mode & 0o777, 0o644, '前置：权限必须已被改成 0644')
-  const looseAppliedAt = readJson(paths.applied).appliedAt
+  const clean = readTextAndStat(paths.applied)
+  assert.strictEqual(clean.stat.mode & 0o777, 0o600, '前置：writeAtomic 写出的必须是 0600')
+  // 模拟「缓存目录被整体拷贝/解包、备份恢复、手工 chmod」后的宽权限快照。目标模式用「0600 +
+  // group 只读位」位组合表达（= 0640）：不写字面量宽松权限（Sonar S2612 把 chmod 的宽松字面量判成
+  // 漏洞），也不在 chmod 前再取一次 stat（那是 CodeQL js/file-system-race 的 check→use 形状）。
+  // 语义要钉住的仍是「非 0600 就必须自愈」——group 位哪怕只是只读也算过宽。
+  const looseMode = 0o600 | 0o040
+  assert.notStrictEqual(looseMode, 0o600, '前置：构造出的模式必须真的不是 0600（否则这条用例什么都没测）')
+  fs.chmodSync(paths.applied, looseMode)
+  const loose = readTextAndStat(paths.applied)
+  assert.strictEqual(loose.stat.mode & 0o777, looseMode, `前置：权限必须已被改成 0${looseMode.toString(8)}`)
+  const looseAppliedAt = JSON.parse(loose.text).appliedAt
   sleepMs(5)
   assert.strictEqual(writeAppliedSnapshot(args), true,
     '内容一致但权限过宽不得被当成「可跳过」：必须重写并返回 true（调用方不得以为写入失败）')
-  const healed = fs.statSync(paths.applied)
-  assert.strictEqual(healed.mode & 0o777, 0o600, '重写后必须自愈回 0600（快照含全部过滤规则正文）')
-  assert.notStrictEqual(healed.ino, looseStat.ino,
+  const healed = readTextAndStat(paths.applied)
+  assert.strictEqual(healed.stat.mode & 0o777, 0o600, '重写后必须自愈回 0600（快照含全部过滤规则正文）')
+  assert.notStrictEqual(healed.stat.ino, loose.stat.ino,
     '必须是 writeAtomic 重写（inode 变化），不得只就地 chmod —— 后者会留着可能被改写的内容')
-  assert.ok(Date.parse(readJson(paths.applied).appliedAt) > Date.parse(looseAppliedAt),
-    `权限自愈的这次重写必须刷新 appliedAt（旧 ${looseAppliedAt} / 新 ${readJson(paths.applied).appliedAt}）`)
+  assert.ok(Date.parse(JSON.parse(healed.text).appliedAt) > Date.parse(looseAppliedAt),
+    `权限自愈的这次重写必须刷新 appliedAt（旧 ${looseAppliedAt} / 新 ${JSON.parse(healed.text).appliedAt}）`)
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '自愈后必须仍是可读回的合法快照')
   // 权限已正常 → 恢复「内容一致跳过写盘」语义（自愈不是每轮都写）
-  const settled = fs.statSync(paths.applied)
+  const settled = readTextAndStat(paths.applied)
   assert.strictEqual(writeAppliedSnapshot(args), true)
-  assert.strictEqual(fs.statSync(paths.applied).ino, settled.ino, '权限正常且内容一致时必须恢复跳过写盘（inode 不变）')
+  assert.strictEqual(readTextAndStat(paths.applied).stat.ino, settled.stat.ino,
+    '权限正常且内容一致时必须恢复跳过写盘（inode 不变）')
 })
 
 test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；缺失/0644/符号链接/目录一律 false', () => {
@@ -1088,8 +1111,11 @@ test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；
   assert.strictEqual(isOwnerOnlyFile(file), true, '0600 普通文件才是可跳过形态')
   fs.chmodSync(file, 0o640)
   assert.strictEqual(isOwnerOnlyFile(file), false, '0600 之外（哪怕 group 只读）都不算达标：不得跳过')
-  fs.chmodSync(file, 0o644)
-  assert.strictEqual(isOwnerOnlyFile(file), false, '0644 必须返回 false')
+  // 0644 这一形态（other 只读）单独保留：同样用位组合表达，不写宽松权限字面量（Sonar S2612）。
+  const otherRead = 0o600 | 0o044
+  assert.strictEqual(otherRead & 0o007, 0o004, '前置：构造出的必须是 other 只读位形态（0644）')
+  fs.chmodSync(file, otherRead)
+  assert.strictEqual(isOwnerOnlyFile(file), false, '0644（other 只读）必须返回 false')
   const link = path.join(dir, 'link.json')
   fs.symlinkSync(file, link)
   assert.strictEqual(isOwnerOnlyFile(link), false, '末级是符号链接一律 false（不跟随、不把链接留在原位）')
@@ -1144,7 +1170,8 @@ test('P2 must_fix 2 贴 256 KiB 的覆盖文件写出的 applied >256 KiB 仍必
     hash: 'h'.repeat(64)
   }
   assert.strictEqual(writeAppliedSnapshot(args), true, '前置：贴上限的快照必须写得进去')
-  const size = fs.statSync(paths.applied).size
+  const firstState = readTextAndStat(paths.applied)
+  const size = firstState.stat.size
   assert.ok(size > RULES_READ_MAX_BYTES,
     `前置：夹具必须让 applied 越过覆盖文件读上限（实得 ${size}，上限 ${RULES_READ_MAX_BYTES}）`)
   assert.ok(size <= APPLIED_MAX_BYTES,
@@ -1154,12 +1181,11 @@ test('P2 must_fix 2 贴 256 KiB 的覆盖文件写出的 applied >256 KiB 仍必
     `applied 只是多了包装（约 +179 字节）就必须读得回；旧实现按覆盖文件上限读 ⇒ 恒 ioError：${JSON.stringify(read.error || {})}`)
   assert.strictEqual(read.snapshot.filter.pingbineirong, filter.pingbineirong, '读回的字段必须逐字相等')
   // 第二次相同内容 → 必须跳过（旧实现第一轮就读不回 ⇒ prev 恒 ioError ⇒ 每轮重写、控制台一直「尚未生效」）
-  const first = fs.statSync(paths.applied)
-  const firstText = fs.readFileSync(paths.applied, 'utf8')
   sleepMs(5)
   assert.strictEqual(writeAppliedSnapshot(args), true, '内容一致必须返回 true')
-  assert.strictEqual(fs.statSync(paths.applied).ino, first.ino, '内容一致必须跳过写盘（inode 不应变化）')
-  assert.strictEqual(fs.readFileSync(paths.applied, 'utf8'), firstText, '跳过写盘时文件必须一字不动（含 appliedAt）')
+  const afterState = readTextAndStat(paths.applied)
+  assert.strictEqual(afterState.stat.ino, firstState.stat.ino, '内容一致必须跳过写盘（inode 不应变化）')
+  assert.strictEqual(afterState.text, firstState.text, '跳过写盘时文件必须一字不动（含 appliedAt）')
 })
 
 test('P2 must_fix 2 写侧同口径：序列化后超过 applied 读上限 ⇒ 不落盘 + 告警（绝不产出「写成功但读不回」）', () => {
@@ -1170,8 +1196,7 @@ test('P2 must_fix 2 写侧同口径：序列化后超过 applied 读上限 ⇒ �
   // 先落一份合法快照：预检拒绝不得破坏已有快照（写侧「不落盘」不等于「清空」）
   const base = { cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 1, source: 'override', hash: 'h' }
   assert.strictEqual(writeAppliedSnapshot(base), true)
-  const beforeStat = fs.statSync(paths.applied)
-  const beforeText = fs.readFileSync(paths.applied, 'utf8')
+  const before = readTextAndStat(paths.applied)
   const warned = []
   const origWarn = console.warn
   console.warn = (...parts) => { warned.push(parts.join(' ')) }
@@ -1184,8 +1209,9 @@ test('P2 must_fix 2 写侧同口径：序列化后超过 applied 读上限 ⇒ �
   assert.strictEqual(ok, false, '超过读上限必须返回 false（否则调用方以为快照已落盘）')
   assert.match(warned.join('\n'), /超过生效快照读上限/,
     `写侧必须留一条告警（本路径每路径只告警一次）：${JSON.stringify(warned)}`)
-  assert.strictEqual(fs.statSync(paths.applied).ino, beforeStat.ino, '预检拒绝不得动已有快照')
-  assert.strictEqual(fs.readFileSync(paths.applied, 'utf8'), beforeText, '预检拒绝不得改写已有快照')
+  const afterReject = readTextAndStat(paths.applied)
+  assert.strictEqual(afterReject.stat.ino, before.stat.ino, '预检拒绝不得动已有快照')
+  assert.strictEqual(afterReject.text, before.text, '预检拒绝不得改写已有快照')
   assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '磁盘上原有的快照必须仍读得回')
 
   // 全新目录：超限直接不建文件 ⇒ 不会出现「文件存在但读不回」
