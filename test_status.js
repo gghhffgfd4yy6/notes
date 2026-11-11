@@ -4,7 +4,11 @@ const assert = require('assert')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { readStatus, formatStatus } = require('./scripts/status')
+const nodeCrypto = require('crypto')
+const { readStatus, formatStatus, readMessages, readMessageCount, readMergedRawMessages } = require('./scripts/status')
+const { createMessageStore } = require('./xbk_message_store')
+const { createUtils } = require('./xbk_utils')
+const storage = require('./xbk_storage')
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-'))
 const previousCwd = process.cwd()
@@ -91,7 +95,104 @@ try {
   fs.symlinkSync('/etc/passwd', 'run.log')
   assert.strictEqual(readStatus('.').run.status, 'unsafe', '符号链接必须拒绝读取')
 
-  console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级')
+  // ── P1（v3.412）：判重缓存改为「push.json 快照 + journal 增量」后，读路径必须能看见未合并条目 ──
+  fs.unlinkSync('run.log') // 清掉上面的符号链接，后面不再用 run.log
+  const cacheDir = path.join(dir, 'cache-journal')
+  fs.mkdirSync(cacheDir)
+  const cachePath = path.join(cacheDir, 'push.json')
+  const journalPath = path.join(cacheDir, 'push.json.journal.ndjson')
+  fs.writeFileSync(cachePath, JSON.stringify([{ id: 's1', title: '旧标题', timestamp: 't1' }]))
+  fs.appendFileSync(journalPath, JSON.stringify({
+    v: 1,
+    at: 1,
+    put: [{ id: 's1', title: '新标题', timestamp: 't2' }, { id: 's2', title: '新增条', timestamp: 't3' }]
+  }) + '\n')
+  const oldStamp = new Date(Date.now() - 60000)
+  fs.utimesSync(cachePath, oldStamp, oldStamp)
+  fs.utimesSync(journalPath, oldStamp, oldStamp)
+
+  const mergedRead = readMessages(cacheDir, { cache: false })
+  assert.strictEqual(mergedRead.status, 'ok')
+  assert.strictEqual(mergedRead.value.total, 2, 'journal 未合并条目必须计入推送记录')
+  assert.strictEqual(mergedRead.value.items.find(i => i.id === 's1').title, '新标题', 'journal 的更新必须覆盖快照内容')
+  assert.strictEqual(readMessageCount(cacheDir).count, 2, 'readMessageCount 必须与 readMessages 同源（含 journal）')
+
+  // 缓存失效：push.json 一字未动、只有 journal 追加 —— 签名必须变化，否则控制台 60s 内读旧数据
+  assert.strictEqual(readMessages(cacheDir).value.total, 2)
+  fs.appendFileSync(journalPath, JSON.stringify({ v: 1, at: 2, put: [{ id: 's3', title: '第三条', timestamp: 't4' }] }) + '\n')
+  fs.utimesSync(journalPath, oldStamp, oldStamp)
+  assert.strictEqual(readMessages(cacheDir).value.total, 3, 'journal 变化后缓存必须失效并读到新条目')
+
+  // journal 不可读（目录占位）⇒ 整体按不可读返回，绝不拿旧快照冒充完整数据
+  fs.unlinkSync(journalPath)
+  fs.mkdirSync(journalPath)
+  assert.strictEqual(readMessages(cacheDir, { cache: false }).status, 'unsafe', 'journal 读失败必须如实报不可读')
+  fs.rmdirSync(journalPath)
+
+  // ── P1（F4）：日志行带 drop 时，控制台/导出必须与运行侧 readMessages 逐条一致 ──
+  // 背景：journal 每行 = 本批 put + 本批被头裁剪的 drop。只回放 put 会让「本批写入但同批就被裁掉」
+  // 的条目从日志里复活——运行侧（MessageStore，逐行「先写后裁」）读出 c,d，控制台却报 a,b,c,d，
+  // 备份导出同样带回已裁条目，缓存健康页据此误报 nearTrim/overLimit。
+  // 夹具：maxSize=2、JOURNAL_DIRECT_MAX_BYTES=0（强制纯日志，快照保持 []），两批写入第二条日志行带 drop。
+  const dropDir = path.join(dir, 'cache-drop')
+  fs.mkdirSync(dropDir)
+  const prevCacheEnv = process.env.XBK_CACHE_DIR
+  process.env.XBK_CACHE_DIR = dropDir
+  try {
+    const storeUtils = createUtils({ fs, safeRe: (src, flags) => new RegExp(src, flags) })
+    const makeStore = () => createMessageStore({
+      Config: { cache: { maxSize: 2 } },
+      Utils: storeUtils,
+      fs,
+      path,
+      crypto: nodeCrypto,
+      normalize: (o) => o,
+      storage,
+      constants: {
+        DEFAULT_MAX_SIZE: 2,
+        MESSAGE_CACHE_MAX_BYTES: 64 * 1024 * 1024,
+        TOMBSTONE_MAX_KEYS: 64,
+        TOMBSTONE_MAX_BYTES: 8 * 1024 * 1024,
+        TOMBSTONE_LOCK_STALE_MS: 10000,
+        JOURNAL_DIRECT_MAX_BYTES: 0
+      }
+    })
+    const entry = (id) => ({ id, title: `标题-${id}`, content: `正文-${id}`, url: `https://example.test/${id}`, shijianchuo: 1760000000 })
+    const writer = makeStore()
+    writer.saveBatch([entry('a'), entry('b')], 'push.json')
+    writer.saveBatch([entry('c'), entry('d')], 'push.json')
+
+    // 前提断言：快照必须为空、且日志最后一行真的带 drop（否则本用例根本没走到「同批裁剪」这条路径，
+    // 修与不修都会绿——这是本回归唯一的防假绿手段）。
+    const dropFile = path.join(dropDir, 'push.json')
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(dropFile, 'utf8')), [], '前提：快照必须为空（纯日志档）')
+    const dropLines = fs.readFileSync(dropFile + '.journal.ndjson', 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    const droppedIds = dropLines.flatMap((r) => (r.drop || []).map((m) => m.id))
+    assert.deepStrictEqual(droppedIds, ['a', 'b'], '前提：第二条日志行必须记下被裁掉的 a,b')
+
+    // 运行侧读的是「冷」实例：只能靠快照 + 日志重建，不能拿写端内存数组冒充磁盘口径。
+    const reader = makeStore()
+    const storeIds = reader.readMessages(reader.getFilePath('push.json')).map((m) => m.id)
+    assert.deepStrictEqual(storeIds, ['c', 'd'], '运行侧回放按 drop 收敛后只应剩 c,d')
+
+    const statusRead = readMessages(dropDir, { cache: false })
+    assert.strictEqual(statusRead.status, 'ok')
+    assert.deepStrictEqual(statusRead.value.items.map((m) => m.id), storeIds, '控制台条目必须与运行侧 readMessages 逐条一致')
+    assert.strictEqual(statusRead.value.total, storeIds.length, '控制台 total 必须等于运行侧条数')
+    assert.deepStrictEqual(statusRead.value.keys, storeIds, '控制台行键与条目同序（前端展开状态依赖它）')
+    const count = readMessageCount(dropDir)
+    assert.strictEqual(count.count, storeIds.length, 'readMessageCount 必须与运行侧条数一致（缓存健康页的 nearTrim/overLimit 判据）')
+    assert.strictEqual(count.filteredCount, 0)
+    // 备份导出（readMergedRawMessages）走同一个 mergeJournalEntries：不得带回已裁条目。
+    const exported = readMergedRawMessages(dropDir)
+    assert.strictEqual(exported.status, 'ok')
+    assert.deepStrictEqual(exported.items.map((m) => m.id), storeIds, '备份导出不得包含日志里已裁掉的条目')
+  } finally {
+    if (prevCacheEnv === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevCacheEnv
+  }
+
+  console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级；journal 未合并条目可读且缓存随日志失效，drop 行与运行侧条数一致')
 } finally {
   process.chdir(previousCwd)
   fs.rmSync(dir, { recursive: true, force: true })

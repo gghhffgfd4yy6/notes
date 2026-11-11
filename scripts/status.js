@@ -7,6 +7,22 @@ const { defaultMessageSignature } = require('./message-signature')
 // 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
 // （审查 Sourcery PR#227）。实现与 run.log 戳/日报日界同源（xbk_utils.shanghaiDayKey）。
 const { shanghaiDayKey } = require('../xbk_utils')
+// P1：判重缓存的增量日志（journal）口径与回放实现只此一份——运行侧 MessageStore 与这里共用
+// 同一组纯函数，禁止控制台各写一套（两套身份语义一旦分叉，控制台就会把更新显示成重复条目）。
+const {
+  journalPathFor,
+  parseJournalText,
+  applyJournalRecords,
+  JOURNAL_READ_MAX_BYTES
+} = require('../xbk_message_store')
+
+// 身份/判重语义只用于 journal 回放；status 不加载 xbk_function_v3（只读命令不拉整套 App 依赖），
+// 这里用 xbk_utils 的同一份 createUtils 建一个轻量实例（safeRe 用原生 RegExp 即可：身份计算
+// 只用到 validUrl/anonKey/safeGet 等纯函数，不含需要 RE2 防护的用户正则）。
+// 实例本身（含 new RegExp 的 safeRe 工厂）单独放在 scripts/status-utils.js：Codacy 的非字面量
+// 正则告警只登记那个模块，不整文件排除本文件——否则 900 多行生产读路径的告警会一起静默
+// （同 scripts/filter-rules-paths.js 的拆模块口径）。
+const { statusUtils } = require('./status-utils')
 
 const FILES = {
   run: 'run.log',
@@ -805,6 +821,41 @@ function messagesFileName (filename) {
   return base.length > 0 && base !== '.' && base !== '..' ? base : FILES.messages
 }
 
+/** P1：把 `<name>.journal.ndjson` 回放进「快照数组」，返回 { status, entries }。
+ *  journal 缺失/为空 ⇒ 原样返回快照；读失败（unsafe/ioError/tooLarge/半读）⇒ status 透传，
+ *  由调用方按「不可读」呈现——绝不能当成「没有日志」只显示旧快照（那正好是合并窗口内最旧的数据）。
+ *  身份语义与运行侧 MessageStore._mergeJournal 共用 applyJournalRecords（同一份实现），且必须逐行
+ *  叠加 put + drop：drop 记的是该批被头裁剪掉的身份（含从不落墓碑的 `_f`），只回放 put 会把这些
+ *  已裁条目从日志里「复活」，控制台条数、备份导出、nearTrim/overLimit 判定都会与运行侧判重集合
+ *  对不上（运行侧 readMessages 只认 c,d，控制台却报 a,b,c,d）。 */
+function mergeJournalEntries (dir, name, entries) {
+  const jPath = journalPathFor(path.join(dir, name))
+  const jr = readSafeTextResult(jPath, JOURNAL_READ_MAX_BYTES, { openNonBlocking: true })
+  if (jr.status === 'missing') return { status: 'ok', entries, badLines: 0 }
+  if (jr.status !== 'ok' || jr.shortRead === true) {
+    return { status: jr.status === 'ok' ? 'ioError' : jr.status, entries }
+  }
+  if (typeof jr.text !== 'string' || jr.text === '') return { status: 'ok', entries, badLines: 0 }
+  const parsed = parseJournalText(jr.text)
+  if (parsed.records.length > 0) applyJournalRecords(entries, parsed.records, statusUtils)
+  return { status: 'ok', entries, badLines: parsed.badLines }
+}
+
+/** P1：控制台需要「含 _f 的原始条目」（过滤预览）与「导出备份的完整判重集合」时的读入口。
+ *  与 readMessages 共用同一套安全读取 + journal 回放，但不做 _f 过滤/排序/分类。
+ *  返回 { status, items }；items 为 null 表示不可用（status 透传 missing/unsafe/ioError/invalid…）。 */
+function readMergedRawMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages } = {}) {
+  const name = messagesFileName(filename)
+  const read = readText(dir, name, maxBytes)
+  if (read.status !== 'ok') return { status: read.status, items: null }
+  let parsed
+  try { parsed = JSON.parse(read.value) } catch (e) { return { status: 'invalid', items: null } }
+  if (!Array.isArray(parsed)) return { status: 'invalid', items: null }
+  const merged = mergeJournalEntries(dir, name, parsed)
+  if (merged.status !== 'ok') return { status: merged.status, items: null }
+  return { status: 'ok', items: merged.entries }
+}
+
 function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages, cache = true } = {}) {
   // filename 可覆盖：运行侧缓存名由 MessageStore.getFileName(Config.api.pushUrl) 决定（pushUrl 末段
   // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
@@ -824,12 +875,17 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   let parsed
   try { parsed = JSON.parse(read.value) } catch (error) { return result('invalid') }
   if (!Array.isArray(parsed)) return result('invalid')
+  // P1：快照 + journal 回放（运行侧每轮只追加，未合并的增量必须在这里看见——否则控制台最多
+  // 6 小时看不到新推送记录）。journal 读失败按不可读返回，不拿旧快照冒充完整数据。
+  const mergedRead = mergeJournalEntries(dir, name, parsed)
+  if (mergedRead.status !== 'ok') return result(mergedRead.status)
+  const entries = mergedRead.entries
   const pairs = [] // [entry, rowKey] 绑定排序：键取「原始 parsed 下标」（push.json 只追加不重排，
   // 追加序才是稳定身份；用排序后下标会在新条目插入时整体推移，前端展开状态随之错位）
   let skipped = 0
   let filteredCount = 0
-  for (let i = 0; i < parsed.length; i++) {
-    const entry = parsed[i]
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]
     // _f 条目是「被过滤、从未推送」的记录（MessageStore 约定），不是推送历史的一部分——
     // 控制台页面是「已推送记录」，混入会让分类计数与历史失真（审查 Sourcery PR#227）。
     if (entry && typeof entry === 'object' && entry._f === true) { filteredCount += 1; continue }
@@ -855,7 +911,7 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   const categories = [...cateCount.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }))
   // rawTotal = 文件里的条目总数（含 _f）：缓存健康页的「条目数 / 上限」必须按它算，
   // 否则 _f 条目把缓存撑到超限也报不出来（D2-S11）。total 仍是「已推送记录」条数。
-  const value = result('ok', { total: items.length, rawTotal: parsed.length, filteredCount, items, keys, categories, skipped })
+  const value = result('ok', { total: items.length, rawTotal: entries.length, filteredCount, items, keys, categories, skipped })
   if (sig) {
     messagesCache.delete(cacheKey)
     messagesCache.set(cacheKey, { sig, at: Date.now(), value })
@@ -864,4 +920,4 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return value
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey }
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey }

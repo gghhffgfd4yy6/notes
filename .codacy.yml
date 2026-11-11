@@ -185,6 +185,29 @@
 # .github/workflows/*.yml 做字符串断言，另在 mkdtempSync(os.tmpdir() + 固定前缀) 下构造测试夹具，
 # 全部是测试硬编码常量、无外部净输入，静态路径注入告警属误报。
 #
+# ---- P1（v3.415 判重日志）：测试夹具的全量误报登记（Opengrep/Semgrep）----
+# test_message_store_journal.js 是 MessageStore「快照 + 追加日志」的专项测试（21 项）：
+# 本轮 Codacy/Opengrep 报 42 条（pathtraversal ×41 + dos-non-literal-regexp ×1），逐条核对后
+# 全部是测试夹具的静态形态，无一处外部输入参与路径/正则构造：
+#   · 所有 fs 调用的目标 = fs.mkdtempSync(os.tmpdir(), 'xbk-journal-') 下的 `${tag}-${++dirSeq}`
+#     （tag 是本文件字面量、dirSeq 是文件内自增序号），再加字面量 'push.json' 与本文件导入的
+#     JOURNAL_SUFFIX（'.journal.ndjson'）；:44/:51 的 ROOT 与各子目录同样只由这两者拼成；
+#   · :24-25 的 isolateProcessCacheDirEnv() 在**加载期**就清空 XBK_CACHE_DIR（旧值保存供退出还原），
+#     外部部署的环境值进不来，被测 store 的缓存目录只认 tmpDir() 里写死的那一份；
+#   · :653/:749/:827 附近的 fs 代理只做观测（记录 truncate/append 顺序、断言合并顺序不可反），
+#     转发给真实 fs 的路径是 store 自己算出来再传进来的，不引入新的路径来源；
+#   · 唯一那条非字面量正则告警来自测试自建的 Utils（safeRe = new RegExp(src, flags)，同
+#     test_utils.js / test_filter_store.js 的既有登记）：src/flags 全是测试硬编码常量。
+# 该文件 fs 调用的目标没有一处来自环境、CLI、网络或文件内容；Codacy 对本仓没有行内降噪手段，
+# 故按既有口径（test_storage.js / test_check_deps.js 等）整文件排除，真实断言仍由 npm test 全量执行。
+#
+# test_status.js 是 scripts/status.js 的单元测试，本轮 9 条 pathtraversal（:97,100,101,107,108,
+# 118,123,124,126）同为夹具误报：目录 = fs.mkdtempSync(os.tmpdir(), 'xbk-status-')，其下三段
+# 'cache-journal' / 'push.json' / 'push.json.journal.ndjson' 全是字面量；:124 的
+# fs.mkdirSync(journalPath) 是**刻意**用目录占位构造「journal 不可读 ⇒ 必须如实报 unsafe、不得拿
+# 旧快照冒充完整数据」的负向夹具（对应生产侧的非常规文件分支）。另有一段用例由测试自身把
+# XBK_CACHE_DIR 指到同一个临时目录、跑完即还原，不是外部输入；无任何外部输入参与路径构造。
+#
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
@@ -298,3 +321,22 @@ exclude_paths:
   # 按本仓 test_console.js 的「16 位以上数字字面量」同类口径排除。
   # 真实断言仍由 npm test / CI 全量执行。
   - "test_similar_dedupe.js"
+  # P1（v3.415）：判重日志专项测试。全部 fs 目标 = mkdtempSync(os.tmpdir(),'xbk-journal-') 下的
+  # 字面量目录 tag（文件内自增序号）+ 字面量 'push.json' / JOURNAL_SUFFIX；加载期已清空
+  # XBK_CACHE_DIR，环境值进不来；三处 fs 代理只转发 store 自算的路径。42 条误报的逐条依据见
+  # 上方「P1（v3.415 判重日志）」注释块。
+  - "test_message_store_journal.js"
+  # P1（v3.415）：status 读路径测试。9 条 pathtraversal 全部落在 mkdtempSync(os.tmpdir(),
+  # 'xbk-status-') 下的字面量三段（'cache-journal'/'push.json'/'push.json.journal.ndjson'）；
+  # :124 的 mkdirSync 是刻意构造「journal 不可读」的负向夹具。依据见上方同一注释块。
+  - "test_status.js"
+  # ---- P1（v3.415）：status 侧安全正则实例（为不整文件排除 scripts/status.js 而拆出）----
+  # scripts/status-utils.js 只做一件事：用 xbk_utils 的 createUtils 建控制台/--status 用的轻量
+  # Utils 实例（safeRe = (src, flags) => new RegExp(src, flags)），供判重日志回放算身份。
+  # Codacy/Opengrep 的 dos-non-literal-regexp 只看「构造函数参数是变量」，看不到 src 全部是
+  # xbk_utils 的**模块常量**正则源（ENTITY_RE ← 冻结的 ENTITY_MAP、ACTIVE_TAG_ALT ← 冻结的
+  # ACTIVE_TAGS、NAV、'%'/反斜杠/管道），而 push.json / journal 里的 title/content/url 只作
+  # String.replace 的 subject、从不进正则源（逐条追过 xbk_utils 内 24 处 safeRe 调用）。
+  # 拆成 6 行模块只排除它，是为了保住 scripts/status.js 900 多行生产读路径（安全读取/容错解析/
+  # 排序/分类/缓存签名）的 Codacy 覆盖——同 scripts/filter-rules-paths.js 的拆模块口径。
+  - "scripts/status-utils.js"

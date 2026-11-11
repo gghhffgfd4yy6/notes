@@ -95,6 +95,7 @@ const explicitTestFiles = [
   'test_formatter.js',
   'test_rules_extended.js',
   'test_message_store_utils.js',
+  'test_message_store_journal.js',
   'test_sendnotify_pure.js',
   'test_sendnotify_bodylimit.js',
   'test_filter.js',

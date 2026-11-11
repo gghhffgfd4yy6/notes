@@ -229,6 +229,8 @@ const MUTATION_EXEMPT = new Map([
     '同源抽出的**仅 stat+chmod** 权限收紧助手（52 行，入参只来自 FilterStore 的字面量文件名路径）；行为由 filter-store 套件的 0600 收紧用例经调用方覆盖，矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
   ['scripts/message-signature.js',
     '只做一次 statSync + mtime 签名的只读助手（21 行，给默认 push.json 判重缓存用），返回 null 的每条降级分支由 status 套件经 readStatus 覆盖；矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
+  ['scripts/status-utils.js',
+    '为消除 Codacy 的「非字面量 new RegExp」误报，从 scripts/status.js 抽出的 6 行 Utils 实例（createUtils + safeRe 形态），无 fs 调用、不拼路径；它算出的身份结论由 status 套件直测（readMessages 的 journal 回放用例逐条对比运行侧 MessageStore.readMessages）覆盖，矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
   ['scripts/log-archive.js',
     '日志周档的 IO 编排（周界计算/封档/多成员 gzip 分页/保留清理），与 fs 强耦合、变异体多为「读不到就崩」的等价体；行为由 test_storage.js 的周档用例直测（自然周边界/封档行数与清空/第 13 页按行号定位/明文档末页/保留 0 周连 idx 删除）+ 控制台 e2e 手测（list/页码/压缩档第 3 页）覆盖。矩阵暂未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'],
   ['scripts/similar-dedupe.js',
