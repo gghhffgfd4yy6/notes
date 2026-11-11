@@ -5901,10 +5901,14 @@ console.log('========================================\n');
       Pusher: 'object',
       Config: 'object',
       hasNestedQuantifier: 'function',
-      truncateUtf16: 'function'
+      truncateUtf16: 'function',
+      // v3.418：常驻 worker 复位面（resetRunStateForWorker 的逐项摘要 + 测试钩子）。
+      // 可达性门禁（「全部导出被测试引用」）要求每个导出键都在测试源码里出现，故在此登记。
+      resetRunStateForWorker: 'function',
+      workerResetHooks: 'object'
     }
     const keys = Object.keys(expected)
-    assertEqual(keys.length, 34, `导出键数应为34，实际${keys.length}`)
+    assertEqual(keys.length, 36, `导出键数应为36，实际${keys.length}`)
     for (const [k, type] of Object.entries(expected)) {
       assertEqual(k in mod, true, `缺少导出: ${k}`)
       assertEqual(typeof mod[k], type, `导出类型错误: ${k} 应为${type}`)

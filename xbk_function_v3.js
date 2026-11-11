@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.417 — 常驻 worker 的墓碑/快照新鲜度与接线测试修复 *******
+//* ******* 线报酷推送脚本 v3.418 — 常驻进程复位调用点逐项可测 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -494,15 +494,25 @@ async function runNotifyTest (args = process.argv.slice(2)) {
 //   _verified/_readFailed（读写闸门，提前复位会放大误写风险）、xbk_agents 的 DNS 在飞计数
 //   （+1/-1 必须在真实回调里结算，清零会把计数减成负数）。规则本身每轮由 run() 重新
 //   loadFilterRules + compileRules，不依赖任何跨轮缓存。
+// 返回值 { steps } 是**逐项**复位摘要：每一项只由它自己那条复位语句生成（「复位调用」与「该项
+// 摘要」写在同一语句内），所以单独删掉 5 条语句中的任意一条，摘要必缺该项、被复位状态也不会被
+// 清空——test_worker_protocol.js 的逐项用例因此能逐条咬住每个调用点。
+// XBK_WORKER_TRACE_RESET=1 时把同一份摘要写进 stderr（stdout 是协议通道）：
+//   [worker] reset-run-state steps=re2,app,filter,formatter,message-store
+// 真实 --worker 连跑两轮的接线用例逐轮断言五项明细齐全（痕迹行不再是无条件固定字符串）。
 function resetRunStateForWorker () {
-  _re2FallbackWarned = false
-  App._resetRunState()
-  FilterEngine._resetRunCaches()
-  Formatter._resetRunCaches()
-  MessageStore._resetRunWarnings()
-  // 可观测复位痕迹（仅测试开启；stdout 是协议通道，必须走 stderr）。test_worker_protocol 用它
-  // 断言每轮真的经过本钩子：删掉上面任意一个调用点/删掉本函数调用点都会让该用例变红。
-  if (process.env.XBK_WORKER_TRACE_RESET === '1') console.error('[worker] reset-run-state')
+  const steps = []
+  // 登记器的条件读的是**该项复位调用自己的返回值**（不是常量），调用与登记仍留在同一条语句里。
+  const record = (name, done) => { if (done === true) steps.push(name) }
+  // ⚠️ 每条复位调用必须与它自己的 record(...) 留在**同一条语句**里：删掉任一语句时该项从 steps 消失。
+  // 不要改成「先统一复位、再无条件 push 固定清单」——那样删掉调用点也照样全绿（P3 审查 must_fix）。
+  record('re2', (_re2FallbackWarned = false) === false)
+  record('app', App._resetRunState())
+  record('filter', FilterEngine._resetRunCaches())
+  record('formatter', Formatter._resetRunCaches())
+  record('message-store', MessageStore._resetRunWarnings())
+  if (process.env.XBK_WORKER_TRACE_RESET === '1') console.error(`[worker] reset-run-state steps=${steps.join(',')}`)
+  return { steps }
 }
 
 // 摘要必须能安全序列化（一条异常对象/循环引用不能让整条协议行丢失）。
@@ -700,6 +710,18 @@ if (typeof module !== 'undefined' && module.exports) {
     // v3.258：导出 App 供测试直接打内部方法（_enabledFlag 等纯函数）
     App,
     // P4（CodeAnt）：导出 MessageStore 供墓碑身份一致性测试直接验证四类身份 × 各判重入口
-    MessageStore
+    MessageStore,
+    // v3.418（P3 审查 must_fix）：常驻 worker 复位面的最小导出。
+    // resetRunStateForWorker 的返回值是逐项摘要（steps），用例逐项断言五项齐全 + 每项脏状态真被清空；
+    // workerResetHooks 只补外部拿不到的三样：模块级 _re2FallbackWarned 闸门（let，无法从外部置真/
+    // 读取）与它清空的两个单例（Formatter 的单槽 attrSpanCache 在闭包里、FilterEngine 的两个 Map
+    // 只在单例上）。生产路径不读 workerResetHooks。
+    resetRunStateForWorker,
+    workerResetHooks: {
+      setRe2FallbackWarned: (value) => { _re2FallbackWarned = Boolean(value) },
+      isRe2FallbackWarned: () => _re2FallbackWarned,
+      FilterEngine,
+      Formatter
+    }
   }
 }

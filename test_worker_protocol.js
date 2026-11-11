@@ -8,7 +8,8 @@
 //      spawn（同一个 record / 同一把锁，推送不中断）且只告警一次；僵死超时按失败处理；
 //      启动时按 pid 文件清理上一代控制台留下的孤儿 worker；
 //   3) 隔离性：一轮内会写的模块级可变状态逐项复位（App 限频/告警表、过滤编译缓存、
-//      格式化单槽缓存、MessageStore 告警去重），且内存判重快照对外部改写失效；
+//      格式化单槽缓存、MessageStore 告警去重），且复位入口的 5 个内部调用点逐项可咬
+//      （删掉任意一条复位语句 ⇒ 摘要缺项 + 对应脏状态仍在，用例变红）；
 //      worker 第二轮 run.log 的计数与一次性 spawn 同口径。
 //
 // 真实 worker 用 dry-run（XBK_DRY_RUN=1）跑：不推送、不写判重缓存，但走完整抓取/过滤/
@@ -485,6 +486,63 @@ test('隔离：MessageStore 告警去重标记复位', () => {
   assert.strictEqual(MessageStore._memoWarned, false)
 })
 
+// 本用例锁的是 resetRunStateForWorker 的 **5 个内部调用点**（上一轮审查 must_fix：删掉
+// App._resetRunState() 或 MessageStore._resetRunWarnings() 后原有用例仍 17/17 全绿）。
+// 判据有两层，缺一不可：① 逐项摘要齐全（每一项只由它自己那条复位语句 push，删语句=缺项）；
+// ② 每一项的脏状态确实被清空/归零（把「调用」替换成不打紧的空语句也咬得住）。
+test('隔离：resetRunStateForWorker 的 5 个复位调用点逐项可咬（摘要缺项/状态未清即红）', () => {
+  const { App, MessageStore, resetRunStateForWorker, workerResetHooks } = require('./xbk_function_v3')
+  const { FilterEngine, Formatter } = workerResetHooks
+  // ① 不用 mock：直接把单例上的真实状态弄脏（都是 run() 一轮会写的字段）
+  workerResetHooks.setRe2FallbackWarned(true)
+  App._diskWarningAt = 123
+  App._logRotateBackoffByPath.set('/a.log', { at: 1 })
+  App._archiveWarnAtByKey.set('/a.log|2026-45', 1)
+  App._weekMarkerWarnAtByKey.set('/a.log', 1)
+  App._alertLastAtByPath.set('/a', 1)
+  App._reportMemoryStateByPath.set('/r', { at: 1 })
+  App._lastChannelHealthLockFailure = { reason: 'open', code: 'EACCES', message: 'x' }
+  App._lastChannelHealthLockToken = 'deadbeef'
+  MessageStore._journalWarned.add('push.json|badlines')
+  MessageStore._residualTombstoneWarned.add('/x/push.json')
+  MessageStore._memoWarned = true
+  FilterEngine._whitelistReCache.set('k', /k/)
+  FilterEngine._legacyCompileCache.set('k', [])
+  // Formatter 的单槽缓存经公共 API 弄脏：htmlToMarkdown 会把整份 HTML 挂进 attrSpanCache，
+  // 同一份 html 再取区间表命中的就是缓存里那一个 view（复位后必须重建 ⇒ 不是同一个对象）。
+  const html = '<a href="https://example.com/a?b=1" title="t">链接</a><img src="https://example.com/i.png">'
+  Formatter.htmlToMarkdown({ content_html: html })
+  const cachedView = Formatter._quotedAttrSpans(html)
+  assert.strictEqual(Formatter._quotedAttrSpans(html), cachedView,
+    '前置：Formatter 单槽缓存应已填充（同一份 html 命中同一个 view）')
+
+  // ② 只调用这一个导出的复位入口
+  const summary = resetRunStateForWorker()
+
+  // ③ 五项摘要逐项齐全（顺序固定）：删掉任意一条复位语句 ⇒ 该项缺失
+  assert.deepStrictEqual(summary.steps, ['re2', 'app', 'filter', 'formatter', 'message-store'],
+    `五项摘要必须齐全且顺序固定（实际 ${JSON.stringify(summary.steps)}；缺项 = 对应复位调用点没执行）`)
+
+  // ④ 每一项的脏状态必须真的被清空/归零（摘要齐全但没真复位时这里红）
+  assert.strictEqual(workerResetHooks.isRe2FallbackWarned(), false,
+    'RE2 回落闸门必须归零（否则下一轮不再告警）')
+  assert.strictEqual(App._diskWarningAt, 0, 'App._diskWarningAt 必须归零')
+  assert.strictEqual(App._logRotateBackoffByPath.size, 0, 'App._logRotateBackoffByPath 必须清空')
+  assert.strictEqual(App._archiveWarnAtByKey.size, 0, 'App._archiveWarnAtByKey 必须清空')
+  assert.strictEqual(App._weekMarkerWarnAtByKey.size, 0, 'App._weekMarkerWarnAtByKey 必须清空')
+  assert.strictEqual(App._alertLastAtByPath.size, 0, 'App._alertLastAtByPath 必须清空')
+  assert.strictEqual(App._reportMemoryStateByPath.size, 0, 'App._reportMemoryStateByPath 必须清空')
+  assert.strictEqual(App._lastChannelHealthLockFailure, null, '通道健康锁失败态必须归零')
+  assert.strictEqual(App._lastChannelHealthLockToken, null, '通道健康锁令牌必须归零')
+  assert.strictEqual(MessageStore._journalWarned.size, 0, 'MessageStore._journalWarned 必须清空')
+  assert.strictEqual(MessageStore._residualTombstoneWarned.size, 0, 'MessageStore._residualTombstoneWarned 必须清空')
+  assert.strictEqual(MessageStore._memoWarned, false, 'MessageStore._memoWarned 必须归零')
+  assert.strictEqual(FilterEngine._whitelistReCache.size, 0, 'FilterEngine._whitelistReCache 必须清空')
+  assert.strictEqual(FilterEngine._legacyCompileCache.size, 0, 'FilterEngine._legacyCompileCache 必须清空')
+  assert.notStrictEqual(Formatter._quotedAttrSpans(html), cachedView,
+    'Formatter 单槽缓存必须已丢弃（仍返回上一轮的 view = 复位调用点缺失或没清）')
+})
+
 test('隔离：内存判重快照对外部改写失效（常驻进程不能拿旧快照判重）', () => {
   const { MessageStore } = require('./xbk_function_v3')
   const dir = dirOf('memo')
@@ -530,21 +588,31 @@ test('接线：startAction 经 workerForChildren 真实路径选中常驻 worker
   }
 })
 
-test('接线：--worker 连续两轮都经过 resetRunStateForWorker（每轮复位钩子不可省）', async () => {
+test('接线：--worker 连续两轮都经过 resetRunStateForWorker（每轮五项明细齐全）', async () => {
   const dir = dirOf('reset-trace')
   const worker = startRawWorker(dir, { XBK_WORKER_TRACE_RESET: '1' })
-  const resetCount = () => worker.stderr().split('[worker] reset-run-state').length - 1
+  // 痕迹行自带逐项明细：五项必须全在（任一条复位语句被删 ⇒ 该项从 steps 里消失，这里变红）。
+  const EXPECTED_STEPS = 'steps=re2,app,filter,formatter,message-store'
+  const traceLines = () => worker.stderr().split('\n').filter((line) => line.includes('[worker] reset-run-state'))
   try {
     worker.send({ cmd: 'run', args: [] })
     const first = await worker.next()
     assert.strictEqual(first.ok, true, `第一轮协议应 ok：${JSON.stringify(first)}`)
-    await waitFor(() => resetCount() >= 1, 2000, '第一轮应留下复位痕迹')
-    assert.strictEqual(resetCount(), 1, `第一轮必须调用一次复位钩子（实际 ${resetCount()} 次）`)
+    await waitFor(() => traceLines().length >= 1, 2000, '第一轮应留下复位痕迹')
+    const firstLines = traceLines()
+    assert.strictEqual(firstLines.length, 1, `第一轮必须调用一次复位钩子（实际 ${firstLines.length} 次）`)
+    assert.ok(firstLines[0].includes(EXPECTED_STEPS),
+      `第一轮的痕迹必须带五项明细（实际「${firstLines[0].trim()}」；缺项 = 对应复位调用点没执行）`)
     worker.send({ cmd: 'run', args: [] })
     const second = await worker.next()
     assert.strictEqual(second.ok, true, `第二轮协议应 ok：${JSON.stringify(second)}`)
-    await waitFor(() => resetCount() >= 2, 2000, '第二轮应再留下一次复位痕迹')
-    assert.strictEqual(resetCount(), 2, `第二轮必须再复位一次（累计 ${resetCount()} 次；删掉 resetRunStateForWorker() 调用点会变 0）`)
+    await waitFor(() => traceLines().length >= 2, 2000, '第二轮应再留下一次复位痕迹')
+    const lines = traceLines()
+    assert.strictEqual(lines.length, 2, `第二轮必须再复位一次（累计 ${lines.length} 次；删掉 resetRunStateForWorker() 调用点会变 0）`)
+    for (const line of lines) {
+      assert.ok(line.includes(EXPECTED_STEPS),
+        `两轮痕迹都必须带五项明细（实际「${line.trim()}」）`)
+    }
     worker.send({ cmd: 'exit' })
     await withTimeout(worker.exited, 5000, 'exit 后 5s 内退出')
   } finally {
