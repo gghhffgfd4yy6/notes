@@ -25,7 +25,10 @@ const qrcode = require('qrcode-generator')
 // v3.363：只读快照端点的条件请求（ETag/304）。零传递依赖（etag 自身无依赖），
 // 与「青龙 --omit=dev 只装 dependencies」的部署约束兼容。
 const etag = require('etag')
-const { readStatus, formatStatus, readTrends, readMessages, readMessageCount, readRunHistory, isRealDayKey } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, isRealDayKey } = require('./status')
+// P1：判重缓存的增量日志（journal）。控制台自己写 push.json 的路径（导入恢复）必须同步清空它，
+// 否则旧日志回放会把导入前的条目重新掺进来（甚至覆盖导入内容）。
+const { journalPathFor, JOURNAL_SUFFIX } = require('../xbk_message_store')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
@@ -3153,20 +3156,27 @@ function cacheHealthSnapshot (stateDir, messagesFile, limits) {
   const lim = limits || defaultHealthLimits()
   const meta = statSafeMeta(path.join(stateDir, messagesFile))
   const tomb = tombstoneCounts(stateDir, messagesFile)
+  // P1：判重缓存的真实占用 = push.json + 未合并的 journal。只看 push.json 会把「快照 5MB +
+  // 日志 8MB（尚未合并）」报成健康；字节/预警口径统一按两者之和。
+  const jMeta = statSafeMeta(journalPathFor(path.join(stateDir, messagesFile)))
+  const journalBytes = jMeta.status === 'ok' ? jMeta.size : 0
   const bytes = meta.status === 'ok' ? meta.size : null
-  const writeRatio = bytes !== null && lim.writeMaxBytes > 0
-    ? Math.round((bytes / lim.writeMaxBytes) * 10000) / 10000
+  const bytesTotal = bytes === null ? null : bytes + journalBytes
+  const writeRatio = bytesTotal !== null && lim.writeMaxBytes > 0
+    ? Math.round((bytesTotal / lim.writeMaxBytes) * 10000) / 10000
     : null
   return {
     status: meta.status,
     file: messagesFile,
     bytes,
+    journalBytes,
+    bytesTotal,
     mtimeMs: meta.status === 'ok' ? meta.mtimeMs : null,
     limits: lim,
     writeRatio,
     nearTrim: writeRatio !== null && writeRatio >= CACHE_HEALTH_NEAR_RATIO && writeRatio <= 1,
-    overLimit: bytes !== null && bytes > lim.writeMaxBytes,
-    consoleReadable: bytes !== null && bytes <= lim.consoleReadMaxBytes,
+    overLimit: bytesTotal !== null && bytesTotal > lim.writeMaxBytes,
+    consoleReadable: bytesTotal !== null && bytesTotal <= lim.consoleReadMaxBytes,
     tombstone: { status: tomb.status, bytes: tomb.bytes, counts: tomb.counts }
   }
 }
@@ -3228,6 +3238,8 @@ function listStateFiles (stateDir, messagesFile) {
 // `xxx.seen.cleanup.lock.json` 是合法缓存文件，`endsWith('.lock')` 不会误吞它（含 .json 后缀）。
 function classifyStateFile (name, messagesFile) {
   if (name === messagesFile) return 'cache'
+  // P1：判重缓存的增量日志属于「缓存」本体（不是未知文件）
+  if (name === messagesFile + JOURNAL_SUFFIX) return 'cache'
   if (name === `${messagesFile}.seen.json`) return 'tombstone'
   // F4 教训：上游 pushUrl 末段恰为 `xxx.seen.cleanup.lock` 时，缓存名 = `xxx.seen.cleanup.lock.json`
   // ——这是**合法缓存文件**，绝不能因为名字含 .lock 被归进 lock（暗示异常）。
@@ -3990,6 +4002,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     return [
       streamFileStamp(path.join(historyDir(), 'run.log')),
       streamFileStamp(path.join(stateDir, messagesFile)),
+      // P1：推送记录现在落在「快照 + journal」两处，只盯 push.json 会让新推送在合并前不触发刷新
+      streamFileStamp(journalPathFor(path.join(stateDir, messagesFile))),
       streamFileStamp(autoPath),
       runningIds.join(',')
     ].join('|')
@@ -4467,14 +4481,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const data = {}
       const skipped = []
       if (selected.includes('messages')) {
-        const raw = readBackupFile(path.join(stateDir, messagesFile), MESSAGES_MAX_BYTES)
+        // P1：导出必须是「快照 + 未合并 journal」的完整判重集合——只导 push.json 会丢掉最近若干轮
+        // 的推送记录（换机恢复后上游重放会重复推送）。
+        const raw = readMergedRawMessages(stateDir, { filename: messagesFile, maxBytes: MESSAGES_MAX_BYTES })
         if (raw.status === 'ok') {
-          let items = null
-          try { items = JSON.parse(raw.text) } catch (e) { items = null }
+          const items = raw.items
           if (!Array.isArray(items) || !items.every(validBackupMessage)) {
             skipped.push({ key: 'messages', reason: 'invalid_messages' })
           } else {
-            data.messages = { filename: messagesFile, count: countBackupMessages(items), text: raw.text }
+            data.messages = { filename: messagesFile, count: countBackupMessages(items), text: JSON.stringify(items) }
             // 墓碑是判重历史的一部分：不带上它，换一台机器恢复后，上游重放已淘汰的消息会被再推一次。
             // 缺失/超限时不影响主缓存备份，只少这份补充状态。
             const seen = readBackupFile(path.join(stateDir, messagesFile + '.seen.json'), TOMBSTONE_MAX_BYTES)
@@ -4753,9 +4768,13 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         fs.mkdirSync(backupDir, { recursive: true })
         const runLogPath = path.join(historyDir(), 'run.log')
         const seenPath = path.join(stateDir, messagesFile + '.seen.json')
+        // P1：journal 也进备份/回滚目标——导入失败回滚时必须把它一起恢复，否则「快照回滚了、
+        // 日志却被清空」= 回滚后丢掉导入前的增量判重记忆。
+        const journalPath = journalPathFor(path.join(stateDir, messagesFile))
         const targets = [
           [path.join(stateDir, messagesFile), messagesFile],
           [seenPath, messagesFile + '.seen.json'],
+          [journalPath, messagesFile + '.journal.ndjson'],
           [filterPaths.file, 'filter-rules.json'],
           [settingsPath, CONSOLE_SETTINGS_FILE],
           [autoPath, AUTO_STATE_FILE],
@@ -4778,6 +4797,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         if (plans.messages) {
           if (!writeAtomic(path.join(stateDir, messagesFile), plans.messages.text, '推送记录恢复')) {
             abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
+            return
+          }
+          // P1：快照已换新，旧 journal 的 put 回放会把导入前的条目重新掺进来（甚至覆盖导入内容）
+          // ⇒ 必须清空。顺序与运行侧一致：先写快照、成功后再清日志（回滚目标里也有它，失败可还原）。
+          if (!writeAtomic(journalPath, '', '判重日志重置')) {
+            abortImport('messages', 500, { error: 'journal_reset_failed', code: 'journal_reset_failed' })
             return
           }
           // C3-013：备份不含判重历史 → 清掉残留 .seen.json（已入 rollback 备份，响应带 imported.dedupCleared）
@@ -5083,14 +5108,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const limit = Number.isFinite(limitRaw)
         ? Math.min(FILTER_PREVIEW_SAMPLE_MAX, Math.max(1, Math.floor(limitRaw)))
         : FILTER_PREVIEW_SAMPLE_DEFAULT
-      const read = readSafeTextResult(path.join(stateDir, messagesFile), FILTER_PREVIEW_MAX_BYTES, { openNonBlocking: true })
-      let records = null
-      if (read.status === 'ok') {
-        try {
-          const data = JSON.parse(read.text)
-          if (Array.isArray(data)) records = data
-        } catch (e) { records = null }
-      }
+      const read = readMergedRawMessages(stateDir, { filename: messagesFile, maxBytes: FILTER_PREVIEW_MAX_BYTES })
+      const records = read.status === 'ok' ? read.items : null
       // 读不到缓存（缺失/超限/坏 JSON/非数组）不能显示成「0 条影响」——那是把未知说成确定。
       // 200 + available:false，计数一律 null，前端显示「无法读取推送历史，本次不显示补推估算」。
       if (records === null) {

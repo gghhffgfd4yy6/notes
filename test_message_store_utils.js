@@ -2716,7 +2716,13 @@ const FIFO_SKIP = (() => {
 
 check('MS-11 读入口: 主缓存/复核/尾部恢复/墓碑四处 readSafeTextResult 必须一律传 openNonBlocking', () => {
   const calls = []
-  const at = (label) => (p, fsMock, options) => { calls.push({ at: label, p, options }); return null }
+  // P1：readMessages = 快照 + journal 回放，journal 是新增的第五个读入口（同样必须 O_NONBLOCK）；
+  // 这里单独计一档，避免它混进「主缓存」计数后让夹具失去区分力。
+  const isJournal = (p) => String(p).endsWith('.journal.ndjson')
+  const at = (label) => (p, fsMock, options) => {
+    calls.push({ at: isJournal(p) ? 'journal' : label, p, options })
+    return isJournal(p) ? { status: 'missing' } : null
+  }
   // ① 主缓存读取：readMessages 正常路径
   const h1 = makeBatchStore({ name: 'ms11_main.json', files: { [cachePath('ms11_main.json')]: '[]' }, readStatus: at('main') })
   assert.deepStrictEqual(h1.store.readMessages(h1.filePath), [])
@@ -2725,7 +2731,11 @@ check('MS-11 读入口: 主缓存/复核/尾部恢复/墓碑四处 readSafeTextR
   const h2 = makeBatchStore({
     name: 'ms11_bad.json',
     files: { [cachePath('ms11_bad.json')]: '[{' },
-    readStatus: (p, fsMock, options) => { calls.push({ at: n2++ === 0 ? 'main' : 'recheck', p, options }); return null }
+    readStatus: (p, fsMock, options) => {
+      if (isJournal(p)) { calls.push({ at: 'journal', p, options }); return { status: 'missing' } }
+      calls.push({ at: n2++ === 0 ? 'main' : 'recheck', p, options })
+      return null
+    }
   })
   captureConsole('error', () => { h2.store.readMessages(h2.filePath) })
   // ③ tooLarge 的有界尾部恢复：主读 + {tail:true} 尾部读
@@ -2734,6 +2744,7 @@ check('MS-11 读入口: 主缓存/复核/尾部恢复/墓碑四处 readSafeTextR
     files: { [cachePath('ms11_big.json')]: 'y'.repeat(100) },
     constants: { MESSAGE_CACHE_MAX_BYTES: 20 },
     readStatus: (p, fsMock, options) => {
+      if (isJournal(p)) { calls.push({ at: 'journal', p, options }); return { status: 'missing' } }
       const label = options && options.tail === true ? 'tail' : (p.endsWith('.seen.json') ? 'tomb' : 'main')
       calls.push({ at: label, p, options })
       return options && options.tail === true
@@ -2748,6 +2759,8 @@ check('MS-11 读入口: 主缓存/复核/尾部恢复/墓碑四处 readSafeTextR
   // 夹具自证：4 个调用点必须真的走到（否则断言只剩「没走到的那个是绿的」）
   const count = (label) => calls.filter(c => c.at === label).length
   assert.strictEqual(count('main'), 3, `主缓存读入口必须被走到 3 次（三个夹具各一次），实际 ${count('main')}：${JSON.stringify(calls.map(c => c.at))}`)
+  // 只有 h1（快照读取成功）会走到回放：h2/h3 的快照本身不可解析/超限，在隔离与尾部恢复处就返回了。
+  assert.strictEqual(count('journal'), 1, `journal 回放必须发生在快照读取成功之后（仅 h1 走到），实际 ${count('journal')}：${JSON.stringify(calls.map(c => c.at))}`)
   assert.strictEqual(count('recheck'), 1, `隔离前复核入口必须被走到 1 次，实际 ${count('recheck')}：${JSON.stringify(calls.map(c => c.at))}`)
   assert.strictEqual(count('tail'), 1, `尾部恢复入口必须被走到 1 次，实际 ${count('tail')}：${JSON.stringify(calls.map(c => c.at))}`)
   assert.ok(count('tomb') >= 1, `墓碑入口必须被走到，实际 ${count('tomb')}：${JSON.stringify(calls.map(c => c.at))}`)

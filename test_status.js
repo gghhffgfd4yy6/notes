@@ -4,7 +4,7 @@ const assert = require('assert')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { readStatus, formatStatus } = require('./scripts/status')
+const { readStatus, formatStatus, readMessages, readMessageCount } = require('./scripts/status')
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-status-'))
 const previousCwd = process.cwd()
@@ -91,7 +91,41 @@ try {
   fs.symlinkSync('/etc/passwd', 'run.log')
   assert.strictEqual(readStatus('.').run.status, 'unsafe', '符号链接必须拒绝读取')
 
-  console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级')
+  // ── P1（v3.412）：判重缓存改为「push.json 快照 + journal 增量」后，读路径必须能看见未合并条目 ──
+  fs.unlinkSync('run.log') // 清掉上面的符号链接，后面不再用 run.log
+  const cacheDir = path.join(dir, 'cache-journal')
+  fs.mkdirSync(cacheDir)
+  const cachePath = path.join(cacheDir, 'push.json')
+  const journalPath = path.join(cacheDir, 'push.json.journal.ndjson')
+  fs.writeFileSync(cachePath, JSON.stringify([{ id: 's1', title: '旧标题', timestamp: 't1' }]))
+  fs.appendFileSync(journalPath, JSON.stringify({
+    v: 1,
+    at: 1,
+    put: [{ id: 's1', title: '新标题', timestamp: 't2' }, { id: 's2', title: '新增条', timestamp: 't3' }]
+  }) + '\n')
+  const oldStamp = new Date(Date.now() - 60000)
+  fs.utimesSync(cachePath, oldStamp, oldStamp)
+  fs.utimesSync(journalPath, oldStamp, oldStamp)
+
+  const mergedRead = readMessages(cacheDir, { cache: false })
+  assert.strictEqual(mergedRead.status, 'ok')
+  assert.strictEqual(mergedRead.value.total, 2, 'journal 未合并条目必须计入推送记录')
+  assert.strictEqual(mergedRead.value.items.find(i => i.id === 's1').title, '新标题', 'journal 的更新必须覆盖快照内容')
+  assert.strictEqual(readMessageCount(cacheDir).count, 2, 'readMessageCount 必须与 readMessages 同源（含 journal）')
+
+  // 缓存失效：push.json 一字未动、只有 journal 追加 —— 签名必须变化，否则控制台 60s 内读旧数据
+  assert.strictEqual(readMessages(cacheDir).value.total, 2)
+  fs.appendFileSync(journalPath, JSON.stringify({ v: 1, at: 2, put: [{ id: 's3', title: '第三条', timestamp: 't4' }] }) + '\n')
+  fs.utimesSync(journalPath, oldStamp, oldStamp)
+  assert.strictEqual(readMessages(cacheDir).value.total, 3, 'journal 变化后缓存必须失效并读到新条目')
+
+  // journal 不可读（目录占位）⇒ 整体按不可读返回，绝不拿旧快照冒充完整数据
+  fs.unlinkSync(journalPath)
+  fs.mkdirSync(journalPath)
+  assert.strictEqual(readMessages(cacheDir, { cache: false }).status, 'unsafe', 'journal 读失败必须如实报不可读')
+  fs.rmdirSync(journalPath)
+
+  console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级；journal 未合并条目可读且缓存随日志失效')
 } finally {
   process.chdir(previousCwd)
   fs.rmSync(dir, { recursive: true, force: true })

@@ -23,6 +23,141 @@ const PUSH_SOURCES_MAX_BYTES = 64 * 1024
 const PUSH_SOURCES_MAX_ENTRIES = 500
 const PUSH_SOURCES_MAX_URL_LEN = 2048
 
+// ===== P1（v3.412）：判重缓存追加日志（journal）=====
+// 现状：push.json 每轮有新增/变更就整份序列化 + 原子重写（生产 1 万条 / 11.9 MB，按 5 分钟一轮
+// 估算约 150 GB/天写盘）。这里把「本轮实际写入的变更」追加进 `<cache>.journal.ndjson`，只在
+// journal ≥ 8 MiB 或距上次合并 ≥ 6 小时时把内存全量写回 push.json 并清空 journal。
+//
+// 不变式（改本段前必读）：
+//   · push.json 仍是**唯一快照**且格式不变（JSON 数组）——外部工具、备份、人工编辑照旧；
+//   · 读 = 快照 + 回放（与 _upsert 相同的身份/内容语义）+ 按 maxSize 裁剪 ⇒ 与旧实现逐条等价；
+//   · 合并顺序**只能**是「先写快照（writeAtomic 内含 fsync）→ 成功后 truncate journal」。反过来
+//     （先清 journal 再写快照）在快照写失败时会丢掉整段判重记忆 = 全量重推；
+//   · 回放是幂等的（同一身份只更新、不重复追加），因此「快照已写、journal 未清」的崩溃窗口
+//     重放一次也不会产生重复条目——这是崩溃恢复的正确性前提，禁止往行里塞非幂等语义；
+//   · journal 读失败（ioError/unsafe/tooLarge/半读）= fail-closed：置 _readFailed、返回空集，
+//     让调用方跳过本轮推送。绝不能当成「没有 journal」继续——那等于把已推送记录当新消息全量重推。
+const JOURNAL_SUFFIX = '.journal.ndjson'
+const JOURNAL_VERSION = 1
+const JOURNAL_MAX_BYTES = 8 * 1024 * 1024
+const JOURNAL_MAX_AGE_MS = 6 * 60 * 60 * 1000
+// journal 读端上限：写端 8 MiB 就触发合并，留 8 倍余量吸收「合并写盘失败后继续追加」的极端情况。
+// 超过它按 fail-closed 处理（不整读进内存、不假装没有日志）。
+const JOURNAL_READ_MAX_BYTES = 64 * 1024 * 1024
+// 小缓存直写阈值：快照+日志不超过它时，整份重写 push.json 比追加更便宜，且能让 push.json
+// 始终是最新的（外部工具/手工备份只认这个文件）。生产 11.9 MB 远超此值 ⇒ 走 journal。
+// 注入 0 = 关闭直写、强制走 journal（等价性/体积测试用）。
+const JOURNAL_DIRECT_MAX_BYTES = 64 * 1024
+
+/** 判重日志路径：与快照同目录、同基名，固定后缀（外部备份/清理按此口径识别） */
+function journalPathFor (filePath) { return filePath + JOURNAL_SUFFIX }
+
+/** 解析 journal 文本（NDJSON）。逐行容忍并忽略半行/坏行（崩溃现场），但绝不整份丢弃：
+ *  返回仍可用的 put 列表与坏行数，由调用方决定告警口径。只认 {v:1, at, put:[]}；未知版本按坏行计
+ *  （宁可少回放 = 可能多推，也绝不猜测半条记录的身份）。 */
+function parseJournalText (text) {
+  const out = { puts: [], lines: 0, badLines: 0, firstAt: null }
+  if (typeof text !== 'string' || text === '') return out
+  for (const row of text.split('\n')) {
+    if (row === '') continue
+    let rec = null
+    try { rec = JSON.parse(row) } catch (e) { rec = null }
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec) || rec.v !== JOURNAL_VERSION || !Array.isArray(rec.put)) {
+      out.badLines++
+      continue
+    }
+    out.lines++
+    if (out.firstAt === null && Number.isFinite(rec.at)) out.firstAt = rec.at
+    for (const m of rec.put) {
+      if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+      out.puts.push(m)
+    }
+  }
+  return out
+}
+
+/** 与 MessageStore._buildIdentityIndex 同构的模块级实现：store 方法复用本函数，
+ *  journal 回放也要在同一份索引上做「按身份找位置」——两处口径分叉会让回放把更新写成新增。 */
+function buildIdentityIndex (messages, Utils) {
+  const idx = { idByKey: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anonByKey: new Map() }
+  for (let i = 0; i < messages.length; i++) addIdentityToIndex(idx, Utils.getMessageIdentity(messages[i]), i, Utils)
+  return idx
+}
+
+/** 把一条身份按 _buildIdentityIndex 的四个维度登记到索引（id 另带 url 时同时进 idWithUrl）。 */
+function addIdentityToIndex (idx, ident, i, Utils) {
+  if (!ident || !ident.valid) return
+  if (ident.kind === 'id') {
+    Utils.addIndex(idx.idByKey, ident.idKey, i)
+    if (ident.url) Utils.addIndex(idx.idWithUrl, ident.url, i)
+  } else if (ident.kind === 'url') {
+    Utils.addIndex(idx.urlOnly, ident.url, i)
+  } else {
+    Utils.addIndex(idx.anonByKey, ident.key, i)
+  }
+}
+
+/** 从索引里摘掉某位置的登记（回放覆盖同一位置前调用，与 saveBatch 的 removeIdentityIndexes 同构）。 */
+function removeIdentityFromIndex (idx, ident, i) {
+  if (!ident || !ident.valid) return
+  const del = (map, key) => {
+    const set = map.get(key)
+    if (!set) return
+    set.delete(i)
+    if (set.size === 0) map.delete(key)
+  }
+  if (ident.kind === 'id') {
+    del(idx.idByKey, ident.idKey)
+    if (ident.url) del(idx.idWithUrl, ident.url)
+  } else if (ident.kind === 'url') {
+    del(idx.urlOnly, ident.url)
+  } else {
+    del(idx.anonByKey, ident.key)
+  }
+}
+
+/** 按 _upsert 的语义把 journal 的 put 列表回放进 messages（原地，保持位置）：
+ *  身份命中 ⇒ 覆盖该位置（journal 记录的就是当时写入内存的对象，含新 timestamp）；未命中 ⇒ 追加。
+ *  命中判定与 _upsert/_findDedupIndex 同源（sameMessageIdentity），候选集合与 _indexHasIdentity 同构；
+ *  多个候选时取数组序最靠前的一个（与线性扫描 oracle 一致）。 */
+function applyJournalPuts (messages, puts, Utils) {
+  if (!Array.isArray(messages) || !Array.isArray(puts) || puts.length === 0) return { applied: 0 }
+  const idx = buildIdentityIndex(messages, Utils)
+  let applied = 0
+  for (const m of puts) {
+    const b = Utils.getMessageIdentity(m)
+    if (!b.valid) continue
+    const cands = []
+    const collect = (map, key) => { const set = key ? map.get(key) : null; if (set) for (const i of set) cands.push(i) }
+    if (b.kind === 'id') {
+      collect(idx.idByKey, b.idKey)
+      collect(idx.urlOnly, b.url)
+    } else if (b.kind === 'url') {
+      collect(idx.urlOnly, b.url)
+      collect(idx.idWithUrl, b.url)
+    } else {
+      collect(idx.anonByKey, b.key)
+    }
+    let hit = -1
+    for (const i of cands) {
+      if (!Number.isInteger(i) || i < 0 || i >= messages.length) continue
+      if (hit !== -1 && i >= hit) continue
+      const a = Utils.getMessageIdentity(messages[i])
+      if (Utils.sameMessageIdentity(messages[i], m, a, b)) hit = i
+    }
+    if (hit >= 0) {
+      removeIdentityFromIndex(idx, Utils.getMessageIdentity(messages[hit]), hit)
+      messages[hit] = m
+      addIdentityToIndex(idx, b, hit, Utils)
+    } else {
+      messages.push(m)
+      addIdentityToIndex(idx, b, messages.length - 1, Utils)
+    }
+    applied++
+  }
+  return { applied }
+}
+
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
 //   max(TOMBSTONE_MAX_KEYS, maxSize, 本次 dropped 条数)
 // TOMBSTONE_MAX_KEYS 只是下限（不带 maxSize 的路径仍用它兜底），maxSize 是「条数裁剪」最多能丢
@@ -171,6 +306,12 @@ function createMessageStore ({
     TOMBSTONE_MAX_BYTES,
     TOMBSTONE_LOCK_STALE_MS
   } = constants
+  // P1：journal 阈值可由 constants 注入（测试按需缩放）；≤0 表示关闭增量日志、退回旧的整份重写
+  // （等价性测试用它与 journal 路径逐轮对账，生产不传即用模块默认 8 MiB / 6 小时）。
+  const journalMaxBytes = Number.isFinite(constants.JOURNAL_MAX_BYTES) ? constants.JOURNAL_MAX_BYTES : JOURNAL_MAX_BYTES
+  const journalMaxAgeMs = Number.isFinite(constants.JOURNAL_MAX_AGE_MS) ? constants.JOURNAL_MAX_AGE_MS : JOURNAL_MAX_AGE_MS
+  // 小缓存直写阈值（见 JOURNAL_DIRECT_MAX_BYTES 注释）：0 = 一律走 journal
+  const journalDirectMaxBytes = Number.isFinite(constants.JOURNAL_DIRECT_MAX_BYTES) ? constants.JOURNAL_DIRECT_MAX_BYTES : JOURNAL_DIRECT_MAX_BYTES
 
   // XBK_CACHE_DIR 取值规则（审查 #241 M1）：与青龙 `--status`（statusCacheDir）同一套——
   // 只采纳绝对路径；相对路径告警一次并忽略。绝对路径原样采纳（含项目根外路径），因为
@@ -272,6 +413,12 @@ function createMessageStore ({
     // 磁盘已验证标记（按缓存文件路径记录）：内存命中时是否已对该文件做过一次 existsSync+恢复检查。
     // 消除热路径上每次内存命中都同步 stat 的磁盘 IO；saveMessages 直写后清除，使下次命中重新检查。
     _verified: new Set(),
+    // P1：判重日志（journal）状态，按缓存文件路径记录
+    //   _journalSince —— 本轮 journal 里最早一条 put 的时间（≈上次合并时间）。合并阈值里的「距上次
+    //     合并 ≥ 6 小时」用它判定；进程重启后由 readMessages 解析首行恢复，不额外落盘。
+    //   _journalWarned —— 坏行/异常已告警过的 key（每进程每文件每类一次，防每轮刷屏）。
+    _journalSince: {},
+    _journalWarned: new Set(),
 
     /** 带上限的内存缓存写入：超限时淘汰最旧键（磁盘不受影响），防理论无限增长；返回是否写入成功 */
     _memoSet (filePath, val) {
@@ -765,9 +912,13 @@ function createMessageStore ({
         // 注意不能 trim：纯空白文件仍是「有内容但不可解析」，走下面的解析失败 → 隔离重建路径。
         console.error(`缓存文件为 0 字节（文件存在但无任何内容；空缓存等价于缺失，本轮按空缓存处理并将全量重推）${filePath}`)
         try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
-        this._memoSet(filePath, [])
+        // P1：0 字节快照仍要回放 journal——日志里的身份是有效的判重记忆，不能因快照被截断就丢
+        // （丢了 = 上游重放时全量重推）。回放失败按 fail-closed 返回空集。
+        const mergedEmpty = this._mergeJournal(filePath, [])
+        if (mergedEmpty === null) return []
+        this._memoSet(filePath, mergedEmpty)
         try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
-        return []
+        return mergedEmpty
       }
       let data
       try {
@@ -789,12 +940,17 @@ function createMessageStore ({
       // 过滤非对象元素（null/原始值），避免后续 has/save 访问 m.id 崩溃
       // v3.157：排除数组元素（typeof object 含数组——数组元素 m.id 访问异常、判重混乱）
         const clean = data.filter(m => m && typeof m === 'object' && !Array.isArray(m))
+        // P1：快照 + journal 回放（同 _upsert 身份/内容语义，再按 maxSize 裁剪）——读路径必须看见
+        // 尚未合并的增量，否则控制台/判重会读到最长 6 小时的旧数据。
+        // 回放读失败返回 null：保持写闸门、返回空集让调用方跳过本轮（fail-closed，绝不假装没有日志）。
+        const merged = this._mergeJournal(filePath, clean)
+        if (merged === null) return []
         // 成功读取 → 清除该文件读取失败标记
         try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
-        this._memoSet(filePath, clean)
+        this._memoSet(filePath, merged)
         // 磁盘读取成功并记忆化：直接标记已验证，避免下次内存命中再白做一次 stat。
         try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
-        return clean
+        return merged
       }
       // F1（P1）：合法 JSON 但非数组（对象等）同属确定性不可恢复判据——同样隔离原件并重建空缓存，
       // 避免「误判空缓存重复入库」的自锁（旧行为）与「静默销毁判重记录」的反噬（B8 已否决）。
@@ -1098,6 +1254,9 @@ function createMessageStore ({
         return null
       }
       try { delete this._readFailed[filePath] } catch (e) { /* 忽略 */ }
+      // P1：重建写出的是「当时能读到的全部」——旧 journal 里的 put 若再回放到这份重建集上，
+      // 会把已判定为不可读的历史重新掺进来（隔离件的语义就不是「重建」了）。快照已落盘后才清日志。
+      this._resetJournal(filePath)
       this._memoSet(filePath, messages)
       try { this._verified.add(filePath) } catch (e) { /* 忽略 */ }
       // 落墓碑放在写盘成功之后：与 saveMessages 同口径——未真正落盘就登记会把仍在磁盘上的身份
@@ -1201,6 +1360,10 @@ function createMessageStore ({
         restoreMemo()
         return false
       }
+      // P1：快照已经原子落盘（writeAtomic 内含 fsync），此时才能清空 journal。顺序不可反——
+      // 先清 journal 再写快照，一旦快照写失败整段判重记忆就没了（等价于全量重推）。
+      // 清空失败只告警：快照已含全部状态，journal 里重复的 put 回放是幂等的（同一身份只更新）。
+      this._resetJournal(filePath)
       this._memoSet(filePath, toSave)
       // v3.x：磁盘刚被直写，外部删除可能在后续发生；清除“已验证”标记，
       // 使下次 readMessages 内存命中重新做一次 existsSync+恢复检查（保持外部删除恢复测试语义）。
@@ -1210,6 +1373,210 @@ function createMessageStore ({
       // saveBatch 没有入参上限，maxSize=10000 时一批 20001 条会丢 10001 条，只按 maxSize 给容量
       // 就会让 _trimTombstoneMaps 把刚记下的最旧身份当场挤掉，重放即可绕过墓碑再推一次。
       if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
+      return true
+    },
+
+    /** 内存回滚守卫：返回一个「恢复到调用前内存快照」的闭包（落盘失败时用）。
+     *  saveMessages / _persistChanges 共用一个口径——失败绝不能把未持久化的新状态伪装成已保存。 */
+    _memoGuard (filePath) {
+      const hadMemo = Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)
+      const memoBefore = hadMemo ? this._memoryCache[filePath] : undefined
+      return () => {
+        if (hadMemo) this._memoSet(filePath, memoBefore)
+        else {
+          try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
+        }
+      }
+    },
+
+    /** P1：读路径的「快照 + journal 回放」。返回合并后的数组；journal 读取失败返回 null（fail-closed，
+     *  调用方据此置 _readFailed 并返回空集，让本轮跳过推送，而不是把已推送记录当新消息全量重推）。
+     *  坏行/半行只忽略该行并告警一次（崩溃现场的正常形态），绝不整份丢弃。
+     *  合并后按 maxSize 裁掉最旧——快照里可能还留着「内存已裁剪但尚未合并」的前缀条目。 */
+    _mergeJournal (filePath, messages) {
+      const jPath = journalPathFor(filePath)
+      const read = readSafeTextResult(jPath, JOURNAL_READ_MAX_BYTES, { openNonBlocking: true })
+      if (read.status === 'missing') {
+        delete this._journalSince[filePath]
+        return messages
+      }
+      if (read.status !== 'ok' || read.shortRead === true) {
+        const detail = read.error && read.error.message
+          ? read.error.message
+          : (read.shortRead === true ? '读取不完整（文件在读取期间被截短）' : read.status)
+        console.error(`判重日志读取失败，按 fail-closed 处理（本轮不写入、跳过推送；磁盘数据保持原样）${jPath}: ${detail}`)
+        try { this._readFailed[filePath] = true } catch (e) { /* 忽略 */ }
+        return null
+      }
+      if (typeof read.text !== 'string' || read.text === '') {
+        delete this._journalSince[filePath]
+        return messages
+      }
+      const parsed = parseJournalText(read.text)
+      if (parsed.badLines > 0 && !this._journalWarned.has(filePath + '|badlines')) {
+        this._journalWarned.add(filePath + '|badlines')
+        console.warn(`⚠️ 判重日志有 ${parsed.badLines} 行损坏（半行/坏 JSON，多为上次崩溃现场），已忽略这些行并保留其余 ${parsed.puts.length} 条变更：${jPath}`)
+      }
+      if (parsed.firstAt !== null) this._journalSince[filePath] = parsed.firstAt
+      if (parsed.puts.length > 0) applyJournalPuts(messages, parsed.puts, Utils)
+      const maxSize = this._resolveMaxSize()
+      if (messages.length > maxSize) messages.splice(0, messages.length - maxSize)
+      return messages
+    },
+
+    /** journal 元信息：{ exists, regular, size }。读不到一律按「不存在」返回（读路径另有 fail-closed 判定）。 */
+    _journalStat (jPath) {
+      try {
+        const st = fs.lstatSync(jPath)
+        return { exists: true, regular: !!st && typeof st.isFile === 'function' && st.isFile(), size: st && Number.isFinite(st.size) ? st.size : 0 }
+      } catch (e) {
+        return { exists: false, regular: false, size: 0 }
+      }
+    },
+
+    /** 快照文件的字节数（仅用于「快照 + journal 是否逼近读端上限」的体积判断；读不到按 0）。 */
+    _fileBytes (p) {
+      try {
+        const st = fs.statSync(p)
+        return st && typeof st.isFile === 'function' && st.isFile() && Number.isFinite(st.size) ? st.size : 0
+      } catch (e) { return 0 }
+    },
+
+    /** 合并收尾：journal 截断为 0。**只在快照写成功后调用**（顺序不可反）。
+     *  非普通文件一律不碰（与 writeAtomic 同口径，防 truncate 跟随符号链接）；0 字节直接算成功。 */
+    _resetJournal (filePath) {
+      const jPath = journalPathFor(filePath)
+      const st = this._journalStat(jPath)
+      if (!st.exists) { delete this._journalSince[filePath]; return true }
+      if (!st.regular) {
+        console.error(`判重日志不是普通文件，拒绝清空（不影响已落盘快照）${jPath}`)
+        return false
+      }
+      if (st.size === 0) { delete this._journalSince[filePath]; return true }
+      try {
+        fs.truncateSync(jPath, 0)
+      } catch (e) {
+        console.error(`判重日志清空失败（快照已写成功；下轮合并会重试，期间重复回放是幂等的）${jPath}:`, e && e.message)
+        return false
+      }
+      delete this._journalSince[filePath]
+      return true
+    },
+
+    /** P1：增量落盘。把本批实际写入的对象（puts，与 messages 元素同一引用）追加进 journal；
+     *  只有 journal 达到体积/时长阈值、或「快照 + journal」逼近读端上限时才整份写回 push.json。
+     *  返回 false 只代表「本次变更没有持久化」（调用方回滚内存并报错）；合并失败不影响这次追加已成功。 */
+    _persistChanges (filePath, messages, puts) {
+      const restoreMemo = this._memoGuard(filePath)
+      const maxSize = this._resolveMaxSize()
+      // 条数裁剪在这里做（与 saveMessages 同口径），保证内存快照与旧实现逐条一致
+      const droppedAll = []
+      if (messages.length > maxSize) {
+        console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${messages.length - maxSize} 条`)
+        droppedAll.push(...messages.splice(0, messages.length - maxSize))
+      }
+      const jPath = journalPathFor(filePath)
+      const jStat = this._journalStat(jPath)
+      if (jStat.exists && !jStat.regular) {
+        console.error(`判重日志路径不是普通文件，拒绝追加（本次变更未落盘，请人工检查）${jPath}`)
+        restoreMemo()
+        return false
+      }
+      const snapshotBytes = this._fileBytes(filePath)
+      // 退化为「整份原子重写」的三种情形：journal 被关掉（constants 注入 ≤0）、运行环境没有
+      // appendFileSync（测试假 fs）、或快照+日志仍很小（直写更便宜，且 push.json 保持最新）。
+      if (!(journalMaxBytes > 0) || typeof fs.appendFileSync !== 'function' ||
+        (journalDirectMaxBytes > 0 && (snapshotBytes + jStat.size) <= journalDirectMaxBytes)) {
+        const saved = this.saveMessages(filePath, messages)
+        if (saved && droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
+        return saved
+      }
+      // 只记「仍在内存里」的对象：同一批内被后来那条覆盖掉的位置不写进日志（回放会把它重新追加成重复条目）
+      const surviving = new Set(messages)
+      const put = []
+      for (const m of puts) if (surviving.has(m)) put.push(m)
+      let line = ''
+      if (put.length > 0) {
+        try {
+          line = JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), put }) + '\n'
+        } catch (e) {
+          console.error(`判重日志序列化失败 ${jPath}（可能含循环引用）:`, e && e.message)
+          restoreMemo()
+          return false
+        }
+      }
+      // 快照 + journal 逼近读端上限：先整份合并（内含字节上限裁剪），绝不写出「读不回来」的组合
+      if (line && (snapshotBytes + jStat.size + Buffer.byteLength(line, 'utf8') > MESSAGE_CACHE_MAX_BYTES)) {
+        if (!this._compact(filePath, messages)) {
+          restoreMemo()
+          return false
+        }
+        if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
+        return true
+      }
+      if (line) {
+        try {
+          fs.appendFileSync(jPath, line, { mode: 0o600 })
+        } catch (e) {
+          console.error(`判重日志追加失败，本次变更未落盘 ${jPath}:`, e && e.message)
+          restoreMemo()
+          return false
+        }
+        // 空日志 ⇒ 本行就是「上次合并后的第一条」，据此起算 6 小时合并窗口（重启后由首行 at 恢复）
+        if (jStat.size === 0 || !Number.isFinite(this._journalSince[filePath])) this._journalSince[filePath] = Date.now()
+      }
+      this._memoSet(filePath, messages)
+      if (droppedAll.length > 0) this._tombstoneDropped(filePath, droppedAll, this._tombstoneKeyCap(maxSize, droppedAll.length))
+      // 定期合并：达到体积/时长阈值才写快照；失败只记录（本次变更已在 journal 里持久化）
+      this._maybeCompact(filePath, messages)
+      return true
+    },
+
+    /** 定期合并的触发判定：journal ≥ 阈值字节，或距「上次合并后的第一条」≥ 阈值时长。 */
+    _maybeCompact (filePath, messages) {
+      const st = this._journalStat(journalPathFor(filePath))
+      if (!st.exists || !st.regular || st.size === 0) return true
+      const since = this._journalSince[filePath]
+      const aged = Number.isFinite(since) && (Date.now() - since) >= journalMaxAgeMs
+      if (st.size < journalMaxBytes && !aged) return true
+      return this._compact(filePath, messages)
+    },
+
+    /** 把内存全量原子写回 push.json，成功后清空 journal。失败时快照与 journal 都保持原样、下轮重试；
+     *  调用方不得因合并失败而丢弃本次 journal 追加（那才是真的丢判重记忆）。 */
+    _compact (filePath, messages) {
+      const maxSize = this._resolveMaxSize()
+      const toSave = [...messages]
+      const dropped = []
+      if (toSave.length > maxSize) dropped.push(...toSave.splice(0, toSave.length - maxSize))
+      let text
+      try {
+        text = JSON.stringify(toSave)
+      } catch (e) {
+        console.error(`判重缓存合并序列化失败 ${filePath}（可能含循环引用）:`, e && e.message)
+        return false
+      }
+      try {
+        let textBytes = null
+        try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
+        if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
+        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, dropped)
+      } catch (e) {
+        console.error(`判重缓存合并裁剪失败 ${filePath}:`, e && e.message)
+        return false
+      }
+      if (text === null) {
+        console.error(`判重缓存合并失败：单条消息即超过读端上限，保持原快照与日志 ${filePath}`)
+        return false
+      }
+      if (!writeAtomic(filePath, text, '缓存合并')) {
+        console.error(`判重缓存合并写盘失败，保留判重日志下轮重试 ${filePath}`)
+        return false
+      }
+      this._resetJournal(filePath)
+      this._memoSet(filePath, toSave)
+      try { this._verified.delete(filePath) } catch (e) { /* 忽略 */ }
+      if (dropped.length > 0) this._tombstoneDropped(filePath, dropped, this._tombstoneKeyCap(maxSize, dropped.length))
       return true
     },
 
@@ -1609,23 +1976,7 @@ function createMessageStore ({
     /** 预计算某缓存文件的身份索引：与 sameMessageIdentity 的匹配关系同构（见 has），
      仅构建一次并在批量 has 间复用，避免每次全量线性扫描 + 逐条重算身份。 */
     _buildIdentityIndex (messages) {
-      const idx = { idByKey: new Map(), urlOnly: new Map(), idWithUrl: new Map(), anonByKey: new Map() }
-      for (let i = 0; i < messages.length; i++) {
-        const ident = Utils.getMessageIdentity(messages[i])
-        if (!ident.valid) continue
-        if (ident.kind === 'id') {
-        // id 消息：按 idKey 匹配（对 id 查询），也按 url 匹配（对 url 查询的双向 fallback）
-          Utils.addIndex(idx.idByKey, ident.idKey, i)
-          if (ident.url) Utils.addIndex(idx.idWithUrl, ident.url, i)
-        } else if (ident.kind === 'url') {
-        // 纯 url 消息：对 id/url 查询均按 url 匹配
-          Utils.addIndex(idx.urlOnly, ident.url, i)
-        } else {
-        // anon 消息：仅按匿名合成键匹配
-          Utils.addIndex(idx.anonByKey, ident.key, i)
-        }
-      }
-      return idx
+      return buildIdentityIndex(messages, Utils)
     },
 
     /** 基于预计算身份索引的判重查询：精确复刻 sameMessageIdentity(cacheMsg, message) 的匹配关系。
@@ -1855,8 +2206,14 @@ function createMessageStore ({
         return false
       }
       // 内容未变化（判重命中且数据一致）时不重写磁盘、不刷新 timestamp。
+      const beforeLen = messages.length
       if (!this._upsert(messages, message, filename)) return true
-      return this.saveMessages(filePath, messages)
+      // P1：本批实际写入内存的对象（更新 = 原位对象，新增 = 末尾对象）——journal 只记它，
+      // 回放时才能逐字复现内存里的内容与 timestamp。
+      const put = messages.length > beforeLen
+        ? messages[messages.length - 1]
+        : messages[this._findDedupIndex(messages, message)]
+      return this._persistChanges(filePath, messages, put ? [put] : [])
     },
 
     /** 批量写入：一次性 append 多条消息，只触发一次磁盘写入（用于单次运行内的多条新数据）
@@ -1967,6 +2324,9 @@ function createMessageStore ({
       const NOW = () => this._now()
       let changedAny = false
       let updatedCount = 0 // P3：批内逐条日志降频——改为批尾一条汇总（大批次曾刷屏）
+      // P1：本批实际写进内存的对象（journal 的 put 列表）。与 messages 元素同一引用——同一批内
+      // 被后来那条覆盖掉的位置不会进日志（见 _persistChanges 的 surviving 过滤）。
+      const written = []
       for (const message of newMessages) {
       // 元素级校验：非对象元素跳过（避免访问 message.id 崩溃）
         if (!Utils.isValidItem(message)) continue
@@ -2006,20 +2366,24 @@ function createMessageStore ({
           updatedCount++
           changedAny = true
           removeIdentityIndexes(idx)
-          setPosition(idx, { ...Utils.safeObjectCopy(message), timestamp: NOW() })
+          const next = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
+          setPosition(idx, next)
+          written.push(next)
         } else {
         // P4（CodeAnt）：身份已在墓碑（曾被裁剪且已推送过）→ 不重复收录，防重放
           if (this._tombstoneHasIdentity(filePath, message)) continue
           changedAny = true
           // [PERF-C1] 新位置与更新路径共用同一写入入口 setPosition/pushRegistered，
           // identOf 与索引集合不会各写一遍而漂移。
-          pushRegistered({ ...Utils.safeObjectCopy(message), timestamp: NOW() })
+          const next = { ...Utils.safeObjectCopy(message), timestamp: NOW() }
+          pushRegistered(next)
+          written.push(next)
         }
       }
       if (!changedAny) return true
-      // v3.x q9：捕获落盘结果——saveMessages 在序列化/写入失败时返回 false，
-      // 忽略返回值会让落盘失败被静默吞掉，仅保留内存快照。
-      const saved = this.saveMessages(filePath, messages)
+      // v3.x q9：捕获落盘结果——落盘失败时返回 false，忽略返回值会让失败被静默吞掉。
+      // P1：走 journal 增量落盘（只有达到合并阈值才整份重写 push.json）。
+      const saved = this._persistChanges(filePath, messages, written)
       if (!saved) {
       // P3（审查 2026-08-15）：原文案「仅保留内存快照」误导——saveMessages 失败路径实际把内存
       // 快照回滚到写入前状态，本批变更既不落盘也不在内存；改为如实描述。
@@ -2209,5 +2573,15 @@ module.exports = {
   removeStaleTombstoneFile,
   tombstoneKeyCap,
   IDENTITY_INDEX_REF_PROBE_WINDOW,
-  IDENTITY_INDEX_IDENTITY_PROBE_WINDOW
+  IDENTITY_INDEX_IDENTITY_PROBE_WINDOW,
+  // P1：journal 口径（控制台/状态读路径与测试共用同一份实现，禁止各写一遍）
+  JOURNAL_SUFFIX,
+  JOURNAL_VERSION,
+  JOURNAL_MAX_BYTES,
+  JOURNAL_MAX_AGE_MS,
+  JOURNAL_READ_MAX_BYTES,
+  JOURNAL_DIRECT_MAX_BYTES,
+  journalPathFor,
+  parseJournalText,
+  applyJournalPuts
 }
