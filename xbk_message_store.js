@@ -31,6 +31,8 @@ const PUSH_SOURCES_MAX_URL_LEN = 2048
 // 不变式（改本段前必读）：
 //   · push.json 仍是**唯一快照**且格式不变（JSON 数组）——外部工具、备份、人工编辑照旧；
 //   · 读 = 快照 + 回放（与 _upsert 相同的身份/内容语义）+ 按 maxSize 裁剪 ⇒ 与旧实现逐条等价；
+//     回放必须过**墓碑闸门**：已被裁剪并落墓碑的身份不得复活（否则会挤掉快照里未墓碑的活条目，
+//     那一条的判重记忆随之丢失）；裁剪只裁「回放前已在快照里、且身份有墓碑」的陈旧条目，不按数组序无差别 splice；
 //   · 合并顺序**只能**是「先写快照（writeAtomic 内含 fsync）→ 成功后 truncate journal」。反过来
 //     （先清 journal 再写快照）在快照写失败时会丢掉整段判重记忆 = 全量重推；
 //   · 回放是幂等的（同一身份只更新、不重复追加），因此「快照已写、journal 未清」的崩溃窗口
@@ -48,6 +50,12 @@ const JOURNAL_READ_MAX_BYTES = 64 * 1024 * 1024
 // 始终是最新的（外部工具/手工备份只认这个文件）。生产 11.9 MB 远超此值 ⇒ 走 journal。
 // 注入 0 = 关闭直写、强制走 journal（等价性/体积测试用）。
 const JOURNAL_DIRECT_MAX_BYTES = 64 * 1024
+// 读路径是否回放 journal（默认 true）。false = 完全旧语义：readMessages 只读 push.json，
+// 对日志的增量「视而不见」。生产**不得**关闭（关掉后控制台/判重会读到最长 6 小时的旧数据）；
+// 这个开关只服务等价性测试——三档实现各用独立缓存目录后，old 档必须连读路径也不碰日志，
+// 才是与被测实现**不同源**的 oracle（此前三档共用一份 push.json + journal，old 档读的正是
+// journal 档写出的日志，删掉回放/读端裁剪测试照样全绿，等价性实际未被验证）。
+const JOURNAL_READ_ENABLED = true
 
 /** 判重日志路径：与快照同目录、同基名，固定后缀（外部备份/清理按此口径识别） */
 function journalPathFor (filePath) { return filePath + JOURNAL_SUFFIX }
@@ -312,6 +320,9 @@ function createMessageStore ({
   const journalMaxAgeMs = Number.isFinite(constants.JOURNAL_MAX_AGE_MS) ? constants.JOURNAL_MAX_AGE_MS : JOURNAL_MAX_AGE_MS
   // 小缓存直写阈值（见 JOURNAL_DIRECT_MAX_BYTES 注释）：0 = 一律走 journal
   const journalDirectMaxBytes = Number.isFinite(constants.JOURNAL_DIRECT_MAX_BYTES) ? constants.JOURNAL_DIRECT_MAX_BYTES : JOURNAL_DIRECT_MAX_BYTES
+  // 读路径是否回放 journal（见 JOURNAL_READ_ENABLED 注释）：只有显式注入 false 才关闭，
+  // 生产缺省恒为 true——不能让一个「读不到的配置」把回放静默关掉。
+  const journalReadEnabled = constants.JOURNAL_READ_ENABLED !== false
 
   // XBK_CACHE_DIR 取值规则（审查 #241 M1）：与青龙 `--status`（statusCacheDir）同一套——
   // 只采纳绝对路径；相对路径告警一次并忽略。绝对路径原样采纳（含项目根外路径），因为
@@ -1392,8 +1403,12 @@ function createMessageStore ({
     /** P1：读路径的「快照 + journal 回放」。返回合并后的数组；journal 读取失败返回 null（fail-closed，
      *  调用方据此置 _readFailed 并返回空集，让本轮跳过推送，而不是把已推送记录当新消息全量重推）。
      *  坏行/半行只忽略该行并告警一次（崩溃现场的正常形态），绝不整份丢弃。
-     *  合并后按 maxSize 裁掉最旧——快照里可能还留着「内存已裁剪但尚未合并」的前缀条目。 */
+     *  回放后的裁剪只在「有墓碑」的条目上做（见 _trimMergedByTombstone）——快照里可能还留着
+     *  内存已裁剪但尚未合并的旧条目，它们必有墓碑；未墓碑的活条目一律不挤掉。 */
     _mergeJournal (filePath, messages) {
+      // 关掉回放 = 完全旧语义（见 JOURNAL_READ_ENABLED）：等价性测试的 old oracle 用，
+      // 生产恒为开启。放在最前面，连日志的 stat/读盘都不做。
+      if (!journalReadEnabled) return messages
       const jPath = journalPathFor(filePath)
       const read = readSafeTextResult(jPath, JOURNAL_READ_MAX_BYTES, { openNonBlocking: true })
       if (read.status === 'missing') {
@@ -1418,10 +1433,85 @@ function createMessageStore ({
         console.warn(`⚠️ 判重日志有 ${parsed.badLines} 行损坏（半行/坏 JSON，多为上次崩溃现场），已忽略这些行并保留其余 ${parsed.puts.length} 条变更：${jPath}`)
       }
       if (parsed.firstAt !== null) this._journalSince[filePath] = parsed.firstAt
-      if (parsed.puts.length > 0) applyJournalPuts(messages, parsed.puts, Utils)
-      const maxSize = this._resolveMaxSize()
-      if (messages.length > maxSize) messages.splice(0, messages.length - maxSize)
+      // 墓碑闸门（P1 fix 1）：条目被裁剪时身份已落墓碑，日志里残留的旧 put 绝不能把它「复活」——
+      // 复活的条目排在数组尾部，读端按 maxSize 裁剪时会挤掉快照里仍未墓碑的活条目，那一条的
+      // 判重记忆随之丢失（上游重放即重复推送）。口径与 _upsert/saveBatch 的墓碑闸门一致。
+      const snapshotLength = messages.length
+      const replayable = this._filterTombstonedPuts(filePath, parsed.puts)
+      if (replayable.length > 0) applyJournalPuts(messages, replayable, Utils)
+      this._trimMergedByTombstone(filePath, messages, snapshotLength)
       return messages
+    },
+
+    /** 丢掉「身份已在墓碑」的 journal put：那些条目已被裁剪/淘汰且推送过，回放不得复活它们。
+     *  与 _upsert / saveBatch 新消息分支的墓碑闸门同源（_tombstoneSetsHas）；过滤未推（_f）
+     *  记录从不落墓碑，因此 `_f` 条目不受影响。墓碑文件缺失/读不出时按空集（既有语义），
+     *  此时残留 put 会照旧回放——那是「墓碑本身读不到」的既有降级方向（可能多推，不漏推）。 */
+    _filterTombstonedPuts (filePath, puts) {
+      if (!Array.isArray(puts) || puts.length === 0) return []
+      const out = []
+      for (const m of puts) {
+        const b = Utils.getMessageIdentity(m)
+        if (b.valid && this._tombstoneSetsHas(filePath, b)) continue
+        out.push(m)
+      }
+      return out
+    },
+
+    /** 回放后的条数收敛：**只**裁「回放前就在快照里、且身份已墓碑」的条目（= 内存已裁剪、
+     *  快照里还残留的历史条目）——绝不碰回放新增的条目，也绝不挤掉未墓碑的活条目。
+     *  为什么不连回放新增的墓碑条目一起裁：那会与 _filterTombstonedPuts 互为兜底，任一层被摘掉
+     *  测试都看不出（复活的条目被裁掉、活条目照样保住），缺陷被静默掩盖。两层各守一段：
+     *  闸门管「不许复活」，这里管「快照里的陈旧前缀不得占着上限」。
+     *  若裁完快照层仍超出（活条目本身已多于上限：maxSize 被下调，或墓碑键上限淘汰了最旧身份），
+     *  按最旧裁到上限——与旧实现「内存只保留最新 maxSize 条」等价；这些身份在旧实现里同样
+     *  早已丢了墓碑，不是读路径新引入的判重损失。 */
+    _trimMergedByTombstone (filePath, messages, snapshotLength = messages.length) {
+      const maxSize = this._resolveMaxSize()
+      let excess = messages.length - maxSize
+      if (excess <= 0) return messages
+      let limit = Math.min(Number.isInteger(snapshotLength) && snapshotLength > 0 ? snapshotLength : 0, messages.length)
+      let i = 0
+      while (i < limit && excess > 0) {
+        const b = Utils.getMessageIdentity(messages[i])
+        if (b.valid && this._tombstoneSetsHas(filePath, b)) {
+          messages.splice(i, 1)
+          limit--
+          excess--
+        } else {
+          i++
+        }
+      }
+      if (excess > 0) {
+        if (!this._journalWarned.has(filePath + '|trim')) {
+          this._journalWarned.add(filePath + '|trim')
+          console.warn(`⚠️ 判重日志回放后仍有 ${messages.length} 条（上限 ${maxSize}）且快照里无墓碑可裁，按最旧裁掉 ${excess} 条：${filePath}`)
+        }
+        messages.splice(0, excess)
+      }
+      return messages
+    },
+
+    /** 读 journal 最后一个字节，判断结尾是不是 '\n'（读不出返回 null = 判定失败，调用方 fail-closed）。
+     *  上次 append 被 kill/短写会留下没有换行的半行；此时直接 append 会把新记录拼在半行后面，
+     *  parseJournalText 按行解析会把「半行 + 新记录」整行当坏行丢弃 ⇒ 这次正常追加的记录也一起丢
+     *  （saveBatch 报成功、重启后该批不在判重集合，上游重放即重复推送）。
+     *  只 pread 1 字节，不整份读日志（生产日志可达 8 MiB）。 */
+    _journalEndsWithNewline (jPath, size) {
+      const isFn = (n) => typeof fs[n] === 'function'
+      if (!isFn('openSync') || !isFn('readSync') || !isFn('closeSync')) return null
+      let fd = -1
+      try {
+        fd = fs.openSync(jPath, 'r')
+        const buf = Buffer.alloc(1)
+        const n = fs.readSync(fd, buf, 0, 1, size - 1)
+        if (n !== 1) return null
+        return buf[0] === 0x0a
+      } catch (e) {
+        return null
+      } finally {
+        if (fd >= 0) { try { fs.closeSync(fd) } catch (e) { /* 忽略：关闭失败不改变判定 */ } }
+      }
     },
 
     /** journal 元信息：{ exists, regular, size }。读不到一律按「不存在」返回（读路径另有 fail-closed 判定）。 */
@@ -1505,8 +1595,22 @@ function createMessageStore ({
           return false
         }
       }
+      // 末尾半行修复（P1 fix 2）：上次 append 被 kill/短写会留下没有 '\n' 的半行，直接追加会把
+      // 本次记录拼在半行后，按行解析时「半行 + 本次记录」整行作废（saveBatch 却报成功）⇒
+      // 重启后整批不在判重集合，上游重放即重复推送。先读末字节确认；必要时把补的 '\n' 并进
+      // 同一次 append（单次写，不额外制造「补了换行但没写记录」的窗口）。末字节读不出 ⇒ fail-closed。
+      let payload = line
+      if (line && jStat.size > 0) {
+        const endsWithNewline = this._journalEndsWithNewline(jPath, jStat.size)
+        if (endsWithNewline === null) {
+          console.error(`判重日志末尾状态无法确认（末字节读不出），拒绝本次追加以免把新记录拼到半行上 ${jPath}`)
+          restoreMemo()
+          return false
+        }
+        if (!endsWithNewline) payload = '\n' + line
+      }
       // 快照 + journal 逼近读端上限：先整份合并（内含字节上限裁剪），绝不写出「读不回来」的组合
-      if (line && (snapshotBytes + jStat.size + Buffer.byteLength(line, 'utf8') > MESSAGE_CACHE_MAX_BYTES)) {
+      if (line && (snapshotBytes + jStat.size + Buffer.byteLength(payload, 'utf8') > MESSAGE_CACHE_MAX_BYTES)) {
         if (!this._compact(filePath, messages)) {
           restoreMemo()
           return false
@@ -1516,7 +1620,7 @@ function createMessageStore ({
       }
       if (line) {
         try {
-          fs.appendFileSync(jPath, line, { mode: 0o600 })
+          fs.appendFileSync(jPath, payload, { mode: 0o600 })
         } catch (e) {
           console.error(`判重日志追加失败，本次变更未落盘 ${jPath}:`, e && e.message)
           restoreMemo()
@@ -2581,6 +2685,7 @@ module.exports = {
   JOURNAL_MAX_AGE_MS,
   JOURNAL_READ_MAX_BYTES,
   JOURNAL_DIRECT_MAX_BYTES,
+  JOURNAL_READ_ENABLED,
   journalPathFor,
   parseJournalText,
   applyJournalPuts
