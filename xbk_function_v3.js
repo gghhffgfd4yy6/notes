@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.418 — 常驻进程复位调用点逐项可测 *******
+//* ******* 线报酷推送脚本 v3.419 — 清 CodeQL 文件竞态 / Sonar 3 条 / Codacy 误报登记 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -506,7 +506,11 @@ function resetRunStateForWorker () {
   const record = (name, done) => { if (done === true) steps.push(name) }
   // ⚠️ 每条复位调用必须与它自己的 record(...) 留在**同一条语句**里：删掉任一语句时该项从 steps 消失。
   // 不要改成「先统一复位、再无条件 push 固定清单」——那样删掉调用点也照样全绿（P3 审查 must_fix）。
-  record('re2', (_re2FallbackWarned = false) === false)
+  // re2 项：复位动作包进一个函数，登记的值就是该函数**自己读回的运行期状态**（`!变量`，不是常量比较，
+  // Sonar S6638 由此消除）。把函数体里的赋值改成 true，`!true` 为 false ⇒ re2 从 steps 消失、对应
+  // 逐项用例当场变红——「删掉/改坏这条语句 → 该项消失」的可咬性保持不变。
+  const resetRe2FallbackWarned = () => { _re2FallbackWarned = false; return !_re2FallbackWarned }
+  record('re2', resetRe2FallbackWarned())
   record('app', App._resetRunState())
   record('filter', FilterEngine._resetRunCaches())
   record('formatter', Formatter._resetRunCaches())

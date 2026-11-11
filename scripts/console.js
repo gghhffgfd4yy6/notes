@@ -7216,15 +7216,25 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         finished = true
         // 等 worker 真正退出再关 HTTP：worker 还在跑时进程直接退出会把它变成孤儿
         // （它自己不会收到父进程死的信号）。shutdown() 内部已有 5s 强杀兜底，不会无限等。
-        Promise.resolve(workerStop).then(() => {
-          server.close(() => doExit(0))
-          // close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
-          // 在途请求给 500ms 完成窗口（本地看板端点毫秒级）后强断，1s 强退兜底——
-          // 不排空会让客户端收到 ERR_EMPTY_RESPONSE、挂起的 keep-alive 得不到关闭帧。
+        // 关 HTTP 并退出：close 只挡新连接，既有 keep-alive/在途连接要显式收尾：空闲连接立即排空，
+        // 在途请求给 500ms 完成窗口（本地看板端点毫秒级）后强断，1s 强退兜底——
+        // 不排空会让客户端收到 ERR_EMPTY_RESPONSE、挂起的 keep-alive 得不到关闭帧。
+        // 成功/失败两条路都走这一个收尾，保证进程一定会退出。
+        const closeServerAndExit = (code) => {
+          server.close(() => doExit(code))
           server.closeIdleConnections()
           setTimeout(() => { server.closeAllConnections() }, 500).unref()
-          setTimeout(() => doExit(0), 1000).unref()
-        })
+          setTimeout(() => doExit(code), 1000).unref()
+        }
+        Promise.resolve(workerStop)
+          .then(() => closeServerAndExit(0))
+          // worker 停止失败（shutdown 自身抛错/子进程收不掉）：不能把控制台挂在「永不收尾的 await」
+          // 上——以前这里没有拒绝分支，reject 时 server.close()+doExit 永不执行，进程挂住且不退出。
+          // 现在记一条原因后仍走同一有界收尾（5s 强杀兜底不变，不新增无限等待），退出码 1。
+          .catch((err) => {
+            console.error(`worker 停止失败，仍按有界收尾退出：${err && err.message ? err.message : String(err)}`)
+            closeServerAndExit(1)
+          })
       }
       if (pending.length === 0) {
         finishShutdown()

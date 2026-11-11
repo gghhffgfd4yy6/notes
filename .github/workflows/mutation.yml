@@ -231,7 +231,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-727"
+            mutate: "xbk_function_v3.js:1-731"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -313,7 +313,7 @@ jobs:
             src: "scripts/status.js"
             mutate: "scripts/status.js"
             config: "stryker.tap.config.js"
-          # console.js 7425 行（v3.412 判重日志：导入恢复清日志 +6、缓存健康 journalBytes +7、状态文件分类/SSE 指纹 +6；此前 7406 行（v3.409 降级态落盘 +8 行；此前 7398 行（v3.408 自动运行降级重试：常量/快照/失败分支/持久化 +33 行；此前 7353 行（v3.406 过滤规则持久 LKG/非阻塞读：GET 回吐 lastGoodUsed +3 行；此前 7350 行（v3.403 日志周档：/api/logs list+分页 +33 行；此前 7311 行（v3.401 自动运行分时段：常量/校验/调度 +68 行、上一轮日志归档回退后同步；v3.394 上限放宽：body 上限常量 +1 行注释后同步；此前 7151 行：v3.392 保存回吐 diff 变更摘要 +33 行后同步；此前 7118 行：v3.391 保存规则自动去重：响应回吐 filter/deduped +4 行后同步；此前 7114 行：v3.389 关注词标题改用线报实际标题 +3 行后同步；此前 7111 行：C10-057/C10-053 净 -2 行后同步：摘要正则收敛为单一真源、日期回环校验
+          # console.js 7540 行（v3.419 清静态扫描项：worker 停止失败兜底收尾 +10 行；v3.412 判重日志：导入恢复清日志 +6、缓存健康 journalBytes +7、状态文件分类/SSE 指纹 +6；此前 7406 行（v3.409 降级态落盘 +8 行；此前 7398 行（v3.408 自动运行降级重试：常量/快照/失败分支/持久化 +33 行；此前 7353 行（v3.406 过滤规则持久 LKG/非阻塞读：GET 回吐 lastGoodUsed +3 行；此前 7350 行（v3.403 日志周档：/api/logs list+分页 +33 行；此前 7311 行（v3.401 自动运行分时段：常量/校验/调度 +68 行、上一轮日志归档回退后同步；v3.394 上限放宽：body 上限常量 +1 行注释后同步；此前 7151 行：v3.392 保存回吐 diff 变更摘要 +33 行后同步；此前 7118 行：v3.391 保存规则自动去重：响应回吐 filter/deduped +4 行后同步；此前 7114 行：v3.389 关注词标题改用线报实际标题 +3 行后同步；此前 7111 行：C10-057/C10-053 净 -2 行后同步：摘要正则收敛为单一真源、日期回环校验
           # 收敛到 isRealDayKey——两处都是删重复实现。此前本批 +74 行后同步：请求体上限/保留数常量化 +9、
           # 条件 tag 按解码后参数名
           # 剔 token +15、墓碑计数加 (ino,size,mtimeMs) 缓存 +30、过滤摘要折入编译生效维度 +11、导入幂等键
@@ -392,7 +392,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part13
             src: "scripts/console.js"
-            mutate: "scripts/console.js:7151-7530"
+            mutate: "scripts/console.js:7151-7540"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

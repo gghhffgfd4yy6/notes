@@ -119,7 +119,14 @@ function runLogSummaries (dir) {
 
 function parseSummaryLine (line) {
   const out = {}
-  for (const m of String(line).matchAll(/([A-Za-z\u4e00-\u9fa5-]+)=([^\s]+)/g)) out[m[1]] = m[2]
+  // 按空白切分后取每段首个 '='：run.log 摘要是 `key=value` 以空白分隔（value 不含空白，见
+  // scripts/status.js 的 RUN_SUMMARY_LINE_RE），所以按分隔符解析与旧正则等价。
+  // 旧实现 `/([A-Za-z\u4e00-\u9fa5-]+)=([^\s]+)/g` 的两个量词在长串上互相重叠，回溯超线性
+  // （Sonar S8786：实测 16k 字符 235ms、输入每翻倍耗时约 4×）；这里是纯线性扫描。
+  for (const token of String(line).split(/\s+/)) {
+    const eq = token.indexOf('=')
+    if (eq > 0) out[token.slice(0, eq)] = token.slice(eq + 1)
+  }
   return out
 }
 

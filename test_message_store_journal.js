@@ -894,10 +894,19 @@ check('J8-01 外部进程向 journal 追加一条 → 同进程 readMessages 能
   assert.strictEqual(store.saveBatch(batch, NAME), true, 'saveBatch 应成功')
   const fp = store.getFilePath(NAME)
   const jp = journalPathFor(fp)
-  assert.ok(fs.existsSync(jp) && fs.statSync(jp).size > 0, '200 条必须真的走 journal（否则用例没覆盖主写路径）')
-  assert.strictEqual(store.readMessages(fp).length, 200, '本进程应读到 200 条')
-  // 另一个运行进程只追加 journal（v3.412 起生产主写路径）：push.json 的 ino/size/mtime 完全不变。
-  fs.appendFileSync(jp, JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), put: [identityMsg('external-1')] }) + '\n')
+  // CodeQL js/file-system-race：check（size>0）与 use（追加一行）必须落在**同一个 fd** 上，不能
+  // statSync(路径) 之后再 appendFileSync(同一路径)。这里 open 一次拿 fd，fstatSync(fd) 取大小做
+  // 「必须真的走 journal」断言，再用同一个 fd writeSync 追加。open 'a' 会创建空文件，所以 journal
+  // 根本没被创建时 size 仍是 0、断言照旧变红——检出力不丢。
+  const jfd = fs.openSync(jp, 'a')
+  try {
+    assert.ok(fs.fstatSync(jfd).size > 0, '200 条必须真的走 journal（否则用例没覆盖主写路径）')
+    assert.strictEqual(store.readMessages(fp).length, 200, '本进程应读到 200 条')
+    // 另一个运行进程只追加 journal（v3.412 起生产主写路径）：push.json 的 ino/size/mtime 完全不变。
+    fs.writeSync(jfd, JSON.stringify({ v: JOURNAL_VERSION, at: Date.now(), put: [identityMsg('external-1')] }) + '\n')
+  } finally {
+    fs.closeSync(jfd)
+  }
   const reread = store.readMessages(fp)
   assert.strictEqual(reread.length, 201, `外部追加 journal 后同进程必须看见（实际 ${reread.length} 条）`)
   assert.ok(reread.some((m) => m.id === 'external-1'), '必须包含外部进程追加的消息')
