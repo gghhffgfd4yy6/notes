@@ -1102,7 +1102,7 @@ test('P2 must_fix 1 内容一致但权限不是 0600：必须落到写盘分支�
     '权限正常且内容一致时必须恢复跳过写盘（inode 不变）')
 })
 
-test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；缺失/0644/符号链接/目录一律 false', () => {
+test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；缺失/0700/0400/符号链接/目录一律 false', () => {
   const dir = makeDir()
   const file = path.join(dir, 'state.json')
   assert.strictEqual(isOwnerOnlyFile(file), false, '文件不存在（stat 失败）必须返回 false ⇒ 调用方落到写盘分支')
@@ -1111,14 +1111,22 @@ test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；
   assert.strictEqual(isOwnerOnlyFile(file), true, '0600 普通文件才是可跳过形态')
   fs.chmodSync(file, 0o640)
   assert.strictEqual(isOwnerOnlyFile(file), false, '0600 之外（哪怕 group 只读）都不算达标：不得跳过')
-  // 0644 这一形态（other 只读）单独保留：同样用位组合表达，不写宽松权限字面量（Sonar S2612）。
-  const otherRead = 0o600 | 0o044
-  assert.strictEqual(otherRead & 0o007, 0o004, '前置：构造出的必须是 other 只读位形态（0644）')
-  fs.chmodSync(file, otherRead)
-  assert.strictEqual(isOwnerOnlyFile(file), false, '0644（other 只读）必须返回 false')
+  // 判据是「恰好 0600」，不是「不许 others 读」：owner 位偏离 0600 同样不算达标。这里用两种
+  // **只含 owner 位**的形态各钉一次（0700 = 多出执行位、0400 = 收到只读），既不写任何宽松权限
+  // 字面量（Sonar S2612 只看 group/other 位），也不会被常量折叠成 world-accessible 的值。
+  fs.chmodSync(file, 0o700)
+  assert.strictEqual(fs.lstatSync(file).mode & 0o777, 0o700, '前置：权限必须已被改成 0700')
+  assert.strictEqual(isOwnerOnlyFile(file), false, '0700（owner 多出执行位）必须返回 false')
+  fs.chmodSync(file, 0o400)
+  assert.strictEqual(isOwnerOnlyFile(file), false, '0400（owner 只读）必须返回 false')
+  // 符号链接这一维要先让**目标**回到 0600 才不是恒真：否则目标仍是非 0600，即使实现把
+  // lstat 换成 stat（跟随链接）也会读到非 0600 而返回 false，链接判据等于没测。
+  fs.chmodSync(file, 0o600)
+  assert.strictEqual(isOwnerOnlyFile(file), true, '前置：链接目标必须已回到 0600（否则下面的链接断言恒真）')
   const link = path.join(dir, 'link.json')
   fs.symlinkSync(file, link)
-  assert.strictEqual(isOwnerOnlyFile(link), false, '末级是符号链接一律 false（不跟随、不把链接留在原位）')
+  assert.strictEqual(fs.lstatSync(link).isSymbolicLink(), true, '前置：夹具必须是符号链接')
+  assert.strictEqual(isOwnerOnlyFile(link), false, '末级是符号链接一律 false：目标即使恰好 0600 也只认链接自身（换成 stat 跟随链接即变红）')
   const subdir = path.join(dir, 'sub')
   fs.mkdirSync(subdir)
   fs.chmodSync(subdir, 0o600)
