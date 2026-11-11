@@ -19,6 +19,7 @@ const {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
   LASTGOOD_MAX_BYTES,
+  APPLIED_MAX_BYTES,
   filterRulesPaths,
   validateFilterRules,
   mergeActiveFilter,
@@ -31,7 +32,7 @@ const {
   resetStoreStateForTests
 } = require('./xbk_filter_store')
 // C10-019：直调收紧入口的用例需要拿到函数本身（走 loadFilterRules 的集成路径看不到收紧分支）。
-const { enforceOwnerOnlyMode } = require('./scripts/owner-only-mode')
+const { enforceOwnerOnlyMode, isOwnerOnlyFile } = require('./scripts/owner-only-mode')
 
 // 循环依赖防线：本模块不得在加载链上 require 主入口（xbk_function_v3 → xbk_app → FilterStore）。
 assert.strictEqual(
@@ -59,6 +60,11 @@ const deps = { RuleEngine, compileUserRegex, re2Available: true }
 // （见其 :52 注释），用户过滤正则一律编译失败。旧夹具用的是真 `new RegExp`，于是「无 re2」路径
 // 其实从来没被走到：任何 compileOk 都成功，C9-010 那类「唯一可用规则被误拒」的缺陷在测试里不可见。
 const noRe2Deps = { ...deps, re2Available: false, compileUserRegex: () => null }
+
+// 覆盖文件读端上限：与 xbk_filter_store.FILTER_RULES_MAX_BYTES 同值（未导出）。
+// LKG（F4-1 R3）与生效快照（P2 返工）两组用例都要拿它当「包装前的基线」——包装后的文件若仍按
+// 这个上限读就会静默判 tooLarge，故常量提到前面，避免用例受声明顺序影响（TDZ）。
+const RULES_READ_MAX_BYTES = 256 * 1024
 
 // 代码默认层夹具：含非字符串值（pingbilouzhu: 123）与额外非白名单键，用于验证「只取 11 字段 + String 安全化」。
 const DEFAULTS = {
@@ -976,6 +982,173 @@ test('v3.411 旧快照损坏（半截 JSON / schema 不对）→ 仍然重写成
   assert.strictEqual(fs.statSync(paths.applied).ino, afterHeal.ino, '自愈后的等价快照不得再次重写')
 })
 
+// ===== P2 返工 must_fix 1：跳过写盘前必须确认目标仍是 0600 =====
+// 为什么：旧实现每轮 writeAtomic（0600 临时文件 + rename），等于每轮把权限修回 0600；改成「内容一致
+// 就跳过」后，一份 0644 的 applied.json（缓存目录被整体拷贝/解包、备份恢复、用户手工 chmod）会在规则
+// 不变期间永久保留，而快照里有用户全部过滤规则正文。SYSTEM_CONTRACT 把 applied/LKG 一律 0600 当硬口径。
+test('P2 must_fix 1 内容一致但权限不是 0600：必须落到写盘分支自愈（mode 回 0600、inode 变化、appliedAt 刷新）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const args = {
+    cacheDir: dir,
+    filter: { pingbibiaoti: 'x', pingbineirong: 'y' },
+    keyword: { zkt_gjc: 'k' },
+    revision: 3,
+    source: 'override',
+    hash: 'h1'
+  }
+  assert.strictEqual(writeAppliedSnapshot(args), true, '前置：先写出一份合法快照')
+  assert.strictEqual(fs.statSync(paths.applied).mode & 0o777, 0o600, '前置：writeAtomic 写出的必须是 0600')
+  // 模拟「缓存目录被整体拷贝/解包、备份恢复、手工 chmod」后的宽权限快照
+  fs.chmodSync(paths.applied, 0o644)
+  const looseStat = fs.statSync(paths.applied)
+  assert.strictEqual(looseStat.mode & 0o777, 0o644, '前置：权限必须已被改成 0644')
+  const looseAppliedAt = readJson(paths.applied).appliedAt
+  sleepMs(5)
+  assert.strictEqual(writeAppliedSnapshot(args), true,
+    '内容一致但权限过宽不得被当成「可跳过」：必须重写并返回 true（调用方不得以为写入失败）')
+  const healed = fs.statSync(paths.applied)
+  assert.strictEqual(healed.mode & 0o777, 0o600, '重写后必须自愈回 0600（快照含全部过滤规则正文）')
+  assert.notStrictEqual(healed.ino, looseStat.ino,
+    '必须是 writeAtomic 重写（inode 变化），不得只就地 chmod —— 后者会留着可能被改写的内容')
+  assert.ok(Date.parse(readJson(paths.applied).appliedAt) > Date.parse(looseAppliedAt),
+    `权限自愈的这次重写必须刷新 appliedAt（旧 ${looseAppliedAt} / 新 ${readJson(paths.applied).appliedAt}）`)
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '自愈后必须仍是可读回的合法快照')
+  // 权限已正常 → 恢复「内容一致跳过写盘」语义（自愈不是每轮都写）
+  const settled = fs.statSync(paths.applied)
+  assert.strictEqual(writeAppliedSnapshot(args), true)
+  assert.strictEqual(fs.statSync(paths.applied).ino, settled.ino, '权限正常且内容一致时必须恢复跳过写盘（inode 不变）')
+})
+
+test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；缺失/0644/符号链接/目录一律 false', () => {
+  const dir = makeDir()
+  const file = path.join(dir, 'state.json')
+  assert.strictEqual(isOwnerOnlyFile(file), false, '文件不存在（stat 失败）必须返回 false ⇒ 调用方落到写盘分支')
+  writeRaw(file, '{}')
+  fs.chmodSync(file, 0o600)
+  assert.strictEqual(isOwnerOnlyFile(file), true, '0600 普通文件才是可跳过形态')
+  fs.chmodSync(file, 0o640)
+  assert.strictEqual(isOwnerOnlyFile(file), false, '0600 之外（哪怕 group 只读）都不算达标：不得跳过')
+  fs.chmodSync(file, 0o644)
+  assert.strictEqual(isOwnerOnlyFile(file), false, '0644 必须返回 false')
+  const link = path.join(dir, 'link.json')
+  fs.symlinkSync(file, link)
+  assert.strictEqual(isOwnerOnlyFile(link), false, '末级是符号链接一律 false（不跟随、不把链接留在原位）')
+  const subdir = path.join(dir, 'sub')
+  fs.mkdirSync(subdir)
+  fs.chmodSync(subdir, 0o600)
+  assert.strictEqual(isOwnerOnlyFile(subdir), false, '非普通文件（目录即使命中 0600）也不得当成可跳过')
+})
+
+// ===== P2 返工 must_fix 2：applied 是覆盖文件的超集，读上限必须加包装预算 =====
+// 构造「覆盖文件贴 256 KiB 上限」的合并结果：11 个字段里前几个填满，末个按字节回削，使 applied
+// 序列化后落在 (覆盖文件上限, applied 读上限]。旧实现拿 FILTER_RULES_MAX_BYTES 读 ⇒ 恒 ioError。
+function nearLimitAppliedFilter (targetAppliedBytes) {
+  const filter = {}
+  for (const field of FILTER_RULE_FIELDS) filter[field] = ''
+  const probe = () => Buffer.byteLength(JSON.stringify({
+    schema: FILTER_RULES_SCHEMA,
+    revision: 7,
+    source: 'override',
+    hash: 'h'.repeat(64),
+    appliedAt: '2026-11-11T00:00:00.000Z',
+    lastGoodUsed: false,
+    filter,
+    keyword: { zkt_gjc: 'k' }
+  }), 'utf8')
+  for (const field of FILTER_RULE_FIELDS) {
+    if (field === 'pingbitime') continue
+    filter[field] = '中'.repeat(16000)
+    if (probe() >= targetAppliedBytes) {
+      // 回削这个字段，让整份快照落在目标附近（中文 3 字节/字）
+      let chars = filter[field].length
+      while (chars > 0 && probe() > targetAppliedBytes) {
+        chars -= Math.max(1, Math.ceil((probe() - targetAppliedBytes) / 3))
+        filter[field] = '中'.repeat(Math.max(0, chars))
+      }
+      break
+    }
+  }
+  return filter
+}
+
+test('P2 must_fix 2 贴 256 KiB 的覆盖文件写出的 applied >256 KiB 仍必须读回 ok，且第二次相同内容跳过写盘', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const filter = nearLimitAppliedFilter(RULES_READ_MAX_BYTES + 512)
+  const args = {
+    cacheDir: dir,
+    filter,
+    keyword: { zkt_gjc: 'k' },
+    revision: 7,
+    source: 'override',
+    hash: 'h'.repeat(64)
+  }
+  assert.strictEqual(writeAppliedSnapshot(args), true, '前置：贴上限的快照必须写得进去')
+  const size = fs.statSync(paths.applied).size
+  assert.ok(size > RULES_READ_MAX_BYTES,
+    `前置：夹具必须让 applied 越过覆盖文件读上限（实得 ${size}，上限 ${RULES_READ_MAX_BYTES}）`)
+  assert.ok(size <= APPLIED_MAX_BYTES,
+    `写出的 applied 必须落在自己的读上限内（${size} > ${APPLIED_MAX_BYTES}）`)
+  const read = readAppliedSnapshot(dir)
+  assert.strictEqual(read.status, 'ok',
+    `applied 只是多了包装（约 +179 字节）就必须读得回；旧实现按覆盖文件上限读 ⇒ 恒 ioError：${JSON.stringify(read.error || {})}`)
+  assert.strictEqual(read.snapshot.filter.pingbineirong, filter.pingbineirong, '读回的字段必须逐字相等')
+  // 第二次相同内容 → 必须跳过（旧实现第一轮就读不回 ⇒ prev 恒 ioError ⇒ 每轮重写、控制台一直「尚未生效」）
+  const first = fs.statSync(paths.applied)
+  const firstText = fs.readFileSync(paths.applied, 'utf8')
+  sleepMs(5)
+  assert.strictEqual(writeAppliedSnapshot(args), true, '内容一致必须返回 true')
+  assert.strictEqual(fs.statSync(paths.applied).ino, first.ino, '内容一致必须跳过写盘（inode 不应变化）')
+  assert.strictEqual(fs.readFileSync(paths.applied, 'utf8'), firstText, '跳过写盘时文件必须一字不动（含 appliedAt）')
+})
+
+test('P2 must_fix 2 写侧同口径：序列化后超过 applied 读上限 ⇒ 不落盘 + 告警（绝不产出「写成功但读不回」）', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const huge = {}
+  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  // 先落一份合法快照：预检拒绝不得破坏已有快照（写侧「不落盘」不等于「清空」）
+  const base = { cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 1, source: 'override', hash: 'h' }
+  assert.strictEqual(writeAppliedSnapshot(base), true)
+  const beforeStat = fs.statSync(paths.applied)
+  const beforeText = fs.readFileSync(paths.applied, 'utf8')
+  const warned = []
+  const origWarn = console.warn
+  console.warn = (...parts) => { warned.push(parts.join(' ')) }
+  let ok
+  try {
+    ok = writeAppliedSnapshot({ cacheDir: dir, filter: huge, keyword: {}, revision: 1, source: 'override', hash: 'h' })
+  } finally {
+    console.warn = origWarn
+  }
+  assert.strictEqual(ok, false, '超过读上限必须返回 false（否则调用方以为快照已落盘）')
+  assert.match(warned.join('\n'), /超过生效快照读上限/,
+    `写侧必须留一条告警（本路径每路径只告警一次）：${JSON.stringify(warned)}`)
+  assert.strictEqual(fs.statSync(paths.applied).ino, beforeStat.ino, '预检拒绝不得动已有快照')
+  assert.strictEqual(fs.readFileSync(paths.applied, 'utf8'), beforeText, '预检拒绝不得改写已有快照')
+  assert.strictEqual(readAppliedSnapshot(dir).status, 'ok', '磁盘上原有的快照必须仍读得回')
+
+  // 全新目录：超限直接不建文件 ⇒ 不会出现「文件存在但读不回」
+  const freshDir = makeDir()
+  const freshPaths = filterRulesPaths(freshDir)
+  const freshWarned = []
+  console.warn = (...parts) => { freshWarned.push(parts.join(' ')) }
+  let freshOk
+  try {
+    freshOk = writeAppliedSnapshot({
+      cacheDir: freshDir, filter: huge, keyword: {}, revision: 1, source: 'override', hash: 'h'
+    })
+  } finally {
+    console.warn = origWarn
+  }
+  assert.strictEqual(freshOk, false)
+  assert.match(freshWarned.join('\n'), /超过生效快照读上限/,
+    '告警按路径去重：换一个目录仍必须留痕（不得因别的路径已告警就静默）')
+  assert.strictEqual(fs.existsSync(freshPaths.applied), false, '超限时不得留下任何文件')
+  assert.strictEqual(readAppliedSnapshot(freshDir).status, 'missing', '没写出去就必须是 missing，而不是一份读不回的残骸')
+})
+
 // C5-047：writeAppliedSnapshot 的返回值是「快照到底有没有写成」的唯一信号（xbk_app 用它打 warn + run log），
 // 但此前全文件只有一条 `strictEqual(wrote, true)` 正向断言 —— 把实现改成恒 true，整套仍然全绿
 // （本条已用变异探针实测）。下面两条把失败分支钉死：返回 false、不抛、不留半成品。
@@ -1403,7 +1576,6 @@ test('F4-1 resetStoreStateForTests 同步清掉持久 LKG（测试隔离前提�
 // `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。旧实现读写共用 256 KiB ⇒ 覆盖文件落在
 // (256 KiB-76, 256 KiB] 这段（保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG 必然 > 读上限，
 // readLastGood 判 tooLarge 返回 null，新进程照样回代码默认，而 writeLastGoodFile 还返回 true。
-const RULES_READ_MAX_BYTES = 256 * 1024 // 与 xbk_filter_store.FILTER_RULES_MAX_BYTES 同值（未导出）
 // 把 11 个字段堆到接近上限（单字段上限 16000 码元，中文 3 字节/字；pingbitime 是数字型字段）
 function nearLimitFilter (targetBytes) {
   const filter = {}
