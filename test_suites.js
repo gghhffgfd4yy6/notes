@@ -33,6 +33,7 @@ const SUITES = [
   { name: '青龙工具函数', file: 'test_qinglong_utils.js', desc: '退避/刷新计数/间隔/依赖恢复边界/缓存目录' },
   { name: '青龙常驻', file: 'test_qinglong_resident.js', desc: 'refreshConnections DNS/TLS 预热 mock + runResident 正常/permanent/可重试退避', integration: true },
   { name: '青龙诊断', file: 'test_qinglong_runcheck.js', desc: 'runCheck 全部通过/过滤警告/init失败/无通道/无方法 五种返回码', integration: true },
+  { name: '常驻worker协议', file: 'test_worker_protocol.js', desc: '控制台常驻 worker：stdin 协议/崩溃恢复/降级/超时/跨轮隔离', integration: true },
   { name: '状态面板', file: 'test_status.js', desc: '--status 只读聚合运行状态', integration: true },
   { name: '状态报告解析', file: 'test_status_report.js', desc: 'scripts/status.js parseLastRun 多行取最后匹配 + parseDiagnostics 跳过损坏行 + formatStatus 降级' },
   { name: '规则引擎校验', file: 'test_rules.js', desc: 'xbk_rules.js 嵌套量词检测/pingbitime 首尾空白/缺少分隔符' },

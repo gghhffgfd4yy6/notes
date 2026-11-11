@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.415 — 判重日志按内存顺序回放 + 裁剪落日志/墓碑 + 合并检查点 *******
+//* ******* 线报酷推送脚本 v3.416 — 控制台常驻运行进程（跨轮复用模块与判重缓存，省掉每轮冷启动） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -9,6 +9,25 @@
 
 const crypto = require('node:crypto') // SonarCloud S7772：优先 node: 前缀内置模块
 const os = require('node:os') // 内置模块零副作用，不影响「加载链零写盘」（批次④ 4.1：通知自检消息带主机名）
+
+// ============================================================
+// ♻️ 常驻 worker 模式（P3）：`node xbk_function_v3.js --worker`
+// ============================================================
+// 控制台常驻一个本进程，每轮从 stdin 读一行命令、把结果摘要写成一行 JSON 到 stdout。
+// 关键约束：stdout 只走协议（控制台按行解析），业务日志一律改道 stderr——否则
+// console.log 会把 JSON 协议行搅碎，控制台永远等不到结果。改道必须在任何业务代码
+// 打印之前完成，故放在模块顶部（此时还没有任何模块级日志）。
+const WORKER_MODE = require.main === module && process.argv.slice(2).includes('--worker')
+if (WORKER_MODE) {
+  const util = require('node:util')
+  const stderrWrite = process.stderr.write.bind(process.stderr)
+  const toStderr = (...parts) => {
+    try { stderrWrite(util.format(...parts) + '\n') } catch (e) { /* 日志失败不影响本轮 */ }
+  }
+  console.log = toStderr
+  console.info = toStderr
+  console.debug = toStderr
+}
 
 // ============================================================
 // ⏱️ 启动性能诊断（仅 XBK_PROFILE=3 收集，不改变默认行为）
@@ -460,7 +479,119 @@ async function runNotifyTest (args = process.argv.slice(2)) {
   process.exitCode = okChannels.length > 0 ? 0 : 1
 }
 
-if (require.main === module) {
+// ============================================================
+// ♻️ 常驻 worker 入口（P3）
+// ============================================================
+// 每轮开始前把「一次性 spawn 每轮天然从零」的进程内状态复位。逐项（run() 依赖的可变状态）：
+//   · _re2FallbackWarned（本文件）——RE2 回落告警的一次性闸门，复位后与每轮新进程一样可再告警一次；
+//   · App 的限频/告警去重表（_diskWarningAt / _logRotateBackoffByPath / _archiveWarnAtByKey /
+//     _weekMarkerWarnAtByKey / _alertLastAtByPath / _reportMemoryStateByPath / 通道健康锁状态 /
+//     channelRecoverClaimSeq）——见 xbk_app._resetRunState；
+//   · FilterEngine 的两个编译缓存（键随配置内容变化，清空只为与新进程口径一致）；
+//   · Formatter 的单槽 attrSpanCache（避免把上一轮的整份 HTML 挂在常驻进程里）；
+//   · MessageStore 的告警去重标记（warnedEnvDir/warnedEnvOverride/_journalWarned/_residualTombstoneWarned）。
+// **有意不复位**：MessageStore._memoryCache（常驻方案要复用的热数据，另有磁盘签名新鲜度校验）、
+//   _verified/_readFailed（读写闸门，提前复位会放大误写风险）、xbk_agents 的 DNS 在飞计数
+//   （+1/-1 必须在真实回调里结算，清零会把计数减成负数）。规则本身每轮由 run() 重新
+//   loadFilterRules + compileRules，不依赖任何跨轮缓存。
+function resetRunStateForWorker () {
+  _re2FallbackWarned = false
+  App._resetRunState()
+  FilterEngine._resetRunCaches()
+  Formatter._resetRunCaches()
+  MessageStore._resetRunWarnings()
+}
+
+// 摘要必须能安全序列化（一条异常对象/循环引用不能让整条协议行丢失）。
+function safeSummaryForWorker (summary) {
+  try { return JSON.parse(JSON.stringify(summary)) } catch (e) {
+    const picked = {}
+    for (const key of ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'cacheSaved']) {
+      const value = summary ? summary[key] : undefined
+      if (value === null || ['number', 'boolean', 'string'].includes(typeof value)) picked[key] = value
+    }
+    return picked
+  }
+}
+
+async function runWorkerCommand (line) {
+  let command
+  try { command = JSON.parse(line) } catch (e) {
+    return { reply: { ok: false, error: '命令不是合法 JSON' } }
+  }
+  if (!command || typeof command !== 'object' || Array.isArray(command)) {
+    return { reply: { ok: false, error: '命令必须是 JSON 对象' } }
+  }
+  if (command.cmd === 'exit') return { stop: true, status: 0 }
+  if (command.cmd !== 'run') return { reply: { ok: false, error: `未知命令：${String(command.cmd)}` } }
+  const args = Array.isArray(command.args) ? command.args : []
+  if (args.length > 0) {
+    // --dry-run / --notify-test 的入口语义与「无参数单轮」不同（argv/env 分支），
+    // 绝不能在这里静默降级成一次真实运行——fail-closed 交给控制台走一次性 spawn。
+    return { reply: { ok: false, error: '常驻 worker 只支持无参数单轮运行（args 必须为空）' } }
+  }
+  resetRunStateForWorker()
+  const startedAt = Date.now()
+  const prevExitCode = process.exitCode
+  process.exitCode = 0
+  let summary
+  try {
+    summary = await runSingleEntry()
+  } catch (e) {
+    const info = summarizeError(e)
+    process.exitCode = prevExitCode
+    // 与一次性 spawn 一致：抛错即进程以 1 退出（下一轮控制台自动重启 worker）。
+    return { reply: { ok: false, error: info.message || '本轮运行异常' }, stop: true, status: 1 }
+  }
+  const exitCode = process.exitCode === 1 ? 1 : 0
+  process.exitCode = prevExitCode
+  return {
+    reply: { ok: true, summary: safeSummaryForWorker(summary), exitCode, roundMs: Date.now() - startedAt }
+  }
+}
+
+function startWorkerEntry () {
+  const readline = require('node:readline')
+  const out = process.stdout
+  // 控制台被 kill 后管道会 EPIPE：这些错误事件不接就是未捕获异常（会把本轮结果行吞掉）。
+  out.on('error', () => {})
+  process.stdin.on('error', () => {})
+  let rl = null
+  const finish = (status) => {
+    try { if (rl) rl.close() } catch (e) { /* 已关闭 */ }
+    process.exit(status)
+  }
+  const writeLine = (payload) => new Promise((resolve) => {
+    try { out.write(JSON.stringify(payload) + '\n', () => resolve()) } catch (e) { resolve() }
+  })
+  rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+  const queue = []
+  let running = false
+  let inputClosed = false
+  const drain = async () => {
+    if (running) return
+    running = true
+    while (queue.length > 0) {
+      const line = queue.shift()
+      if (String(line).trim() === '') continue
+      const outcome = await runWorkerCommand(line)
+      if (outcome.reply) await writeLine(outcome.reply)
+      if (outcome.stop) {
+        running = false
+        finish(outcome.status || 0)
+        return
+      }
+    }
+    running = false
+    if (inputClosed && queue.length === 0) finish(0) // stdin 关闭即退出
+  }
+  rl.on('line', (line) => { queue.push(line); drain().catch(() => finish(1)) })
+  rl.on('close', () => { inputClosed = true; if (!running) finish(0) })
+}
+
+if (WORKER_MODE) {
+  startWorkerEntry()
+} else if (require.main === module) {
   const cliArgs = process.argv.slice(2)
   // 审查 D2-M2（#232）：旧实现只认精确的 `--notify-test`，`--notify-test=1` 这类近似写法
   // 会静默落进 runSingleEntry() —— 生产上就是真抓取 + 真推送 + 写缓存。改为前缀分发；

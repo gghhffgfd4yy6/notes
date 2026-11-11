@@ -474,6 +474,10 @@ function createMessageStore ({
     _memoryCache: {},
     // 内存缓存实际键数（与 _memoryCache 同步维护，替代热路径上每次新键写都 Object.keys O(n)）
     _memoCount: 0,
+    // P3（常驻 worker）：内存快照对应的磁盘文件签名（ino:size:mtimeMs）。常驻进程跨轮复用
+    // _memoryCache 省掉每轮 13MB 的解析，但控制台导入/恢复、另一个运行进程写盘都会改文件——
+    // 没有这层校验就会拿着上一轮的旧快照判重（漏推/重推）。命中前一次 statSync（微秒级）足够。
+    _memoSig: {},
     // 身份索引缓存：WeakMap 按“权威内存缓存数组引用”绑定预计算身份索引，批量 has 判重 O(1)，
     // 避免对同一文件反复线性扫描；权威数组每次变更都是新对象引用（_memoSet 全量替换），
     // 数组被 GC 回收时索引随之自动释放，无需手动失效。
@@ -524,6 +528,41 @@ function createMessageStore ({
     _journalSince: {},
     _journalWarned: new Set(),
 
+    /** P3（常驻 worker）：磁盘文件签名（ino:size:mtimeMs）；读不到返回 ''。 */
+    _memoFileSig (filePath) {
+      try {
+        const st = fs.statSync(filePath)
+        return `${st.ino}:${st.size}:${st.mtimeMs}`
+      } catch (e) { return '' }
+    },
+
+    /** P3（常驻 worker）：内存快照是否仍代表磁盘现状。外部改过（控制台导入/恢复、另一个
+     *  运行进程写入、手工替换）→ 丢弃内存副本并返回 false，让本轮按磁盘重读；文件缺失时
+     *  仍返回 true（保留既有「常驻进程用内存快照自动恢复」的保护，不在删除瞬间丢判重记忆）。 */
+    _memoIsFresh (filePath) {
+      const key = typeof filePath === 'string' ? filePath : String(filePath)
+      const recorded = this._memoSig[key]
+      if (typeof recorded !== 'string' || recorded === '') return true
+      const current = this._memoFileSig(key)
+      if (current === '' || current === recorded) return true
+      try { delete this._memoryCache[key] } catch (e) { /* 忽略 */ }
+      try { delete this._memoSig[key] } catch (e) { /* 忽略 */ }
+      try { this._verified.delete(key) } catch (e) { /* 忽略 */ }
+      this._memoCount = Object.keys(this._memoryCache).length
+      console.warn(`缓存文件已被其它进程改写，丢弃进程内旧快照并按磁盘重读：${key}`)
+      return false
+    },
+
+    /** P3（常驻 worker）：告警去重状态复位（一次性 spawn 每轮都是新进程，这些标记天然为空）。 */
+    _resetRunWarnings () {
+      warnedEnvDir = ''
+      warnedEnvOverride = ''
+      this._journalWarned.clear()
+      this._residualTombstoneWarned.clear()
+      this._memoWarned = false
+      return true
+    },
+
     /** 带上限的内存缓存写入：超限时淘汰最旧键（磁盘不受影响），防理论无限增长；返回是否写入成功 */
     _memoSet (filePath, val) {
     // 键归一化：非字符串键（Symbol/数字等）统一 String 化，保证可被 Object.keys 枚举并参与淘汰，
@@ -545,6 +584,7 @@ function createMessageStore ({
           // 不再被识别为索引键、会被当「最旧键」淘汰（行为翻转）；恢复 \d 语义。
           const oldest = keys.find(k => typeof k === 'string' && !/^(?:0|[1-9]\d*)$/.test(k)) ?? keys[0]
           try { delete this._memoryCache[oldest] } catch (e) { /* 忽略 */ }
+          try { delete this._memoSig[oldest] } catch (e) { /* 忽略 */ }
           // 淘汰后按实际键数校准计数（防御外部直删导致的漂移；新增键由下方统一自增）。
           // P3（审查 2026-08-15）：依赖 delete 一定成功——当前实现 delete 永不抛错（自身属性可配置），
           // 属理论防御；若未来键为不可配置属性，此处计数会与键数脱钩（注释锁定）。
@@ -567,6 +607,7 @@ function createMessageStore ({
       } else {
         this._memoryCache[key] = val
       }
+      this._memoSig[key] = this._memoFileSig(key)
       return true
     },
 
@@ -916,7 +957,10 @@ function createMessageStore ({
 
     readMessages (filePath) {
     // R5-2：hasOwnProperty 读取（'__proto__' 直读会返回 Object.prototype 而非缓存值）
-      if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath)) {
+    // P3（常驻 worker）：命中前先校验磁盘签名——外部导入/另一个进程写入后必须按磁盘重读，
+    // 否则常驻进程会拿旧快照判重（漏推/重推）。文件缺失仍走下方既有「自动恢复」保护。
+      if (Object.prototype.hasOwnProperty.call(this._memoryCache, filePath) &&
+        this._memoIsFresh(filePath)) {
       // 常驻进程保护：外部误删缓存文件时，内存中的权威快照继续用于判重，
       // 并尝试原子恢复磁盘文件；恢复失败时保留旧快照，不写入空数组。
       // v3.x：按文件记录“已验证”标记——仅首次内存命中未验证时做一次 existsSync+恢复检查，
@@ -1398,6 +1442,7 @@ function createMessageStore ({
         if (hadMemo) this._memoSet(filePath, memoBefore)
         else {
           try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
+          try { delete this._memoSig[filePath] } catch (e) { /* 忽略 */ }
         }
       }
       // P2（审查 2026-08-15）：非数组入参曾退化为「写空数组」——会在未读取磁盘的情况下把去重
@@ -1489,6 +1534,7 @@ function createMessageStore ({
         if (hadMemo) this._memoSet(filePath, memoBefore)
         else {
           try { delete this._memoryCache[filePath] } catch (e) { /* 忽略 */ }
+          try { delete this._memoSig[filePath] } catch (e) { /* 忽略 */ }
         }
       }
     },

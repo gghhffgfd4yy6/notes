@@ -766,6 +766,26 @@ function createApp ({
     _alertLastAtByPath: new Map(),
     _reportMemoryStateByPath: new Map(),
 
+    // P3（常驻 worker）：把「一轮运行会写」的进程内可变状态恢复到新进程的初值。
+    // 一次性 spawn 每轮都是新进程，这些限频/告警去重状态天然从零开始；常驻进程若不清，
+    // 上一轮的告警窗口会压住下一轮（例如低磁盘告警、日志轮转退避、日报内存态）。
+    // ⚠️ 只重置**限频/告警**类状态：判重缓存（MessageStore._memoryCache）与 DNS 在飞计数
+    // 不在此处——前者是常驻方案要复用的热数据（另有文件签名新鲜度校验），后者的 +1/-1
+    // 必须在真实回调里结算，强行清零会把计数减成负数。
+    _resetRunState () {
+      this._diskWarningAt = 0
+      this._logRotateBackoffByPath.clear()
+      this._archiveWarnAtByKey.clear()
+      this._weekMarkerWarnAtByKey.clear()
+      this._alertLastAtByPath.clear()
+      this._reportMemoryStateByPath.clear()
+      this._lastChannelHealthLockFailure = null
+      this._lastChannelHealthLockToken = null
+      // 通道恢复令牌序号：进程内单调，跨轮复用不会影响唯一性，但归零与新进程口径一致。
+      channelRecoverClaimSeq = 0
+      return true
+    },
+
     // 磁盘余量只告警不阻断：statfs 不可用或读取失败时静默跳过。
     // 配置启用开关解析（v3.173 口径，供 _sendAlert/_updateReport 共用，v3.258 提取）：
     // !enabled（数字0/空串）或 'false'/'0' 字符串均关闭；'0' 字符串是 truthy 曾漏；

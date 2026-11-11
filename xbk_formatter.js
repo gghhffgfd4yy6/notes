@@ -52,6 +52,12 @@ function createFormatter ({ Utils, safeRe }) {
   // C10-055：最近一次 _quotedAttrSpans 的结果（同一次转换里 h/a/script/style 三次调用共用；只留一份）
   let attrSpanCache = null
   const Formatter = {
+  /** P3（常驻 worker）：丢弃最近一次 _quotedAttrSpans 的单槽缓存（键是整份 HTML，
+   *  同值可复用；清空只是为了不把上一轮的 100KB 级字符串长期挂在常驻进程里）。 */
+  _resetRunCaches () {
+    attrSpanCache = null
+    return true
+  },
   /** Markdown 收尾：合并连续换行 + 去首尾空白（短路与正常路径共用） */
   _finalizeMd (s) {
     // v3.245 P1：非 string 输入（undefined/null/对象/Symbol）String() 兜底，此前直接

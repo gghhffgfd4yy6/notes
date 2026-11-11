@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.415.0",
+  "version": "3.416.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -30,6 +30,7 @@
     "test:qinglong-utils": "node test_qinglong_utils.js",
     "test:cli": "node test_cli.js",
     "test:qinglong-resident": "node test_qinglong_resident.js",
+    "test:worker-protocol": "node test_worker_protocol.js",
     "test:qinglong-runcheck": "node test_qinglong_runcheck.js",
     "test:status": "node test_status.js",
     "test:check-mutation-ranges": "node test_check_mutation_ranges.js",
