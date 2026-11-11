@@ -1,26 +1,28 @@
 'use strict'
 
 const path = require('node:path')
-const fs = require('node:fs')
 const { readSafeTextResult } = require('../xbk_storage')
 const { defaultMessageSignature } = require('./message-signature')
 // 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧固定按 Asia/Shanghai 写，趋势窗口/输出键
 // 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
 // （审查 Sourcery PR#227）。实现与 run.log 戳/日报日界同源（xbk_utils.shanghaiDayKey）。
-const { shanghaiDayKey, createUtils } = require('../xbk_utils')
+const { shanghaiDayKey } = require('../xbk_utils')
 // P1：判重缓存的增量日志（journal）口径与回放实现只此一份——运行侧 MessageStore 与这里共用
 // 同一组纯函数，禁止控制台各写一套（两套身份语义一旦分叉，控制台就会把更新显示成重复条目）。
 const {
   journalPathFor,
   parseJournalText,
-  applyJournalPuts,
+  applyJournalRecords,
   JOURNAL_READ_MAX_BYTES
 } = require('../xbk_message_store')
 
 // 身份/判重语义只用于 journal 回放；status 不加载 xbk_function_v3（只读命令不拉整套 App 依赖），
 // 这里用 xbk_utils 的同一份 createUtils 建一个轻量实例（safeRe 用原生 RegExp 即可：身份计算
 // 只用到 validUrl/anonKey/safeGet 等纯函数，不含需要 RE2 防护的用户正则）。
-const statusUtils = createUtils({ fs, safeRe: (src, flags) => new RegExp(src, flags) })
+// 实例本身（含 new RegExp 的 safeRe 工厂）单独放在 scripts/status-utils.js：Codacy 的非字面量
+// 正则告警只登记那个模块，不整文件排除本文件——否则 900 多行生产读路径的告警会一起静默
+// （同 scripts/filter-rules-paths.js 的拆模块口径）。
+const { statusUtils } = require('./status-utils')
 
 const FILES = {
   run: 'run.log',
@@ -822,7 +824,10 @@ function messagesFileName (filename) {
 /** P1：把 `<name>.journal.ndjson` 回放进「快照数组」，返回 { status, entries }。
  *  journal 缺失/为空 ⇒ 原样返回快照；读失败（unsafe/ioError/tooLarge/半读）⇒ status 透传，
  *  由调用方按「不可读」呈现——绝不能当成「没有日志」只显示旧快照（那正好是合并窗口内最旧的数据）。
- *  身份语义与运行侧 MessageStore._mergeJournal 共用 applyJournalPuts（同一份实现）。 */
+ *  身份语义与运行侧 MessageStore._mergeJournal 共用 applyJournalRecords（同一份实现），且必须逐行
+ *  叠加 put + drop：drop 记的是该批被头裁剪掉的身份（含从不落墓碑的 `_f`），只回放 put 会把这些
+ *  已裁条目从日志里「复活」，控制台条数、备份导出、nearTrim/overLimit 判定都会与运行侧判重集合
+ *  对不上（运行侧 readMessages 只认 c,d，控制台却报 a,b,c,d）。 */
 function mergeJournalEntries (dir, name, entries) {
   const jPath = journalPathFor(path.join(dir, name))
   const jr = readSafeTextResult(jPath, JOURNAL_READ_MAX_BYTES, { openNonBlocking: true })
@@ -832,7 +837,7 @@ function mergeJournalEntries (dir, name, entries) {
   }
   if (typeof jr.text !== 'string' || jr.text === '') return { status: 'ok', entries, badLines: 0 }
   const parsed = parseJournalText(jr.text)
-  if (parsed.puts.length > 0) applyJournalPuts(entries, parsed.puts, statusUtils)
+  if (parsed.records.length > 0) applyJournalRecords(entries, parsed.records, statusUtils)
   return { status: 'ok', entries, badLines: parsed.badLines }
 }
 
