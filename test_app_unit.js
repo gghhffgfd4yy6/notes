@@ -3153,7 +3153,16 @@ function buildFilterRunHarness (cacheDir, over = {}) {
   })
   let items = []
   const sends = []
-  const Network = { fetchData: async () => items }
+  // R1-r7 #3：callcounter 必须挂在 harness 自己的抓取桩上——旧写法（无条件 return items）让
+  // 「先抓取、后判 busy」的回归完全不可见（B 把 await Network.fetchData() 提到取锁前，套件仍全绿）。
+  const Network = {
+    fetches: 0,
+    async fetchData () {
+      Network.fetches += 1
+      if (over.fetchData) return over.fetchData(items)
+      return items
+    }
+  }
   const Pusher = over.Pusher || {
     send: async (text, desp) => {
       sends.push({ text, desp })
@@ -3201,6 +3210,8 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     Pusher,
     sends,
     baseConfig,
+    // R1-r7 #3：本轮抓取调用次数（busy 轮必须是 0 —— spec 目标 2「第二个进程必须不抓取」）。
+    fetches () { return Network.fetches },
     setItems (next) { items = next },
     cacheName () { return MessageStore.getFileName(Config.api.pushUrl) },
     cacheMessages () { return MessageStore.readMessages(MessageStore.getFilePath(MessageStore.getFileName(Config.api.pushUrl))) }
@@ -5477,9 +5488,17 @@ checkAsync('R1 行为：已有活锁时 App.run 返回 skipped（RUN_BUSY），�
       holder: { pid: process.pid, startedAt: 1760000000000 }
     }, `busy 摘要形状必须与 spec 一致：${JSON.stringify(summary)}`)
     assert.strictEqual(h.sends.length, 0, 'busy 时不得推送任何消息')
+    // R1-r7 #3：spec 目标 2 的第一句就是「第二个进程必须不抓取」。旧用例只断言 sends/三个文件名，
+    // 把 await Network.fetchData() 提到 _acquireRunLock() 之前（先抓取后判 busy）整套仍全绿。
+    assert.strictEqual(h.fetches(), 0,
+      `busy 轮必须一次都不抓取（实测 ${h.fetches()} 次）：抓取不得早于取锁`)
     for (const name of ['run.log', 'report.state', 'filter.hash']) {
       assert.ok(!realFs.existsSync(path.join(cacheDir, name)), `busy 时不得写 ${name}（缓存/日志/状态一律不碰）`)
     }
+    // 目录级「无新增」：白名单只有别人的 run.lock（本目录没有 journal/诊断产物），多一个文件即回归。
+    const leftovers = realFs.readdirSync(cacheDir).sort()
+    assert.deepStrictEqual(leftovers, ['run.lock'],
+      `busy 轮缓存目录只应留下别人的 run.lock（实际 ${JSON.stringify(leftovers)}）`)
     assert.deepStrictEqual(realFs.readFileSync(lockPathOf(cacheDir), 'utf8'), JSON.stringify(holderFrame),
       '别人的锁内容不得被改（更不能被删）')
   } finally {
@@ -5504,6 +5523,68 @@ checkAsync('R1 行为：正常一轮跑完后 run.lock 被释放（finally），
     if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
     else process.env.XBK_CACHE_DIR = prevEnvDir
   }
+})
+
+// R1-r7 #2：spec 约束 5「异常/超时/提前 return 都要释放」此前零守卫——把 finally 里的释放改成
+// 「仅成功路径释放」，旧套件全绿（B 实测 test_app_unit 341/0 + test_app.js C042 都绿）。这条让业务体
+// 内部的抓取步骤真抛错（Pusher.send 的异常被逐条吞成 failed，不会穿透，抓取才是会外抛的步骤），
+// 断言异常路径也走到 finally 的释放，且错误对象没有被误标 runLockReleaseFailed。
+checkAsync('R1 行为：业务步骤抛错时 run.lock 仍被释放（finally），错误对象不标 runLockReleaseFailed', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('runlock-throw-run-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  process.env.XBK_CACHE_DIR = cacheDir
+  const boom = new Error('fetch boom：源站不可用')
+  try {
+    const h = buildFilterRunHarness(cacheDir, { fetchData: () => { throw boom } })
+    h.setItems([makeRunItem('throw-a', '标题甲')])
+    await assert.rejects(() => h.App.run(), (err) => {
+      assert.strictEqual(err, boom, `业务错误必须原样外抛（不得吞掉/包装）：${err && err.message}`)
+      // 释放成功时生产侧不写这个字段（只有 failed 才置 true）⇒ 语义就是 runLockReleaseFailed=false。
+      // 归一成布尔后断言为 false：既守住「不得把正常释放误标成失败」，也不强求生产写一个多余字段。
+      assert.strictEqual(Boolean(err.runLockReleaseFailed), false,
+        `锁已释放 ⇒ 异常对象上 runLockReleaseFailed 必须为 false：${JSON.stringify(err && Object.keys(err))}`)
+      return true
+    })
+    assert.strictEqual(h.fetches(), 1, `前置：本轮确实抓取过（错误发生在持锁的业务体内）：${h.fetches()}`)
+    assert.ok(!realFs.existsSync(lockPathOf(cacheDir)),
+      '异常路径也必须释放 run.lock（回退成「仅成功路径释放」时这里必红）')
+  } finally {
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+  }
+})
+
+// R1-r7 #2（续）：异常 + 释放失败同时发生 —— 两个事实都必须保住：业务错误原样外抛（不被释放失败吞掉），
+// 且错误对象上 runLockReleaseFailed=true 让常驻入口按不可恢复错误停机（否则锁以活 pid 留盘 ⇒ 永久空转）。
+checkAsync('R1 行为：异常路径上释放失败（unlink EACCES）⇒ 错误对象 runLockReleaseFailed=true', async () => {
+  const boom = new Error('fetch boom：源站不可用')
+  await withRunHarness({ fetchData: () => { throw boom } }, async (h, cacheDir, realFs) => {
+    const realUnlink = lockFs.unlinkSync
+    let blockedAt = null
+    lockFs.unlinkSync = function (target) {
+      // 按文件名认锁（不按拼好的绝对路径）：缓存目录可能经 realpath 规范化。
+      if (path.basename(String(target)) === 'run.lock') {
+        blockedAt = String(target)
+        const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+        e.code = 'EACCES'
+        throw e
+      }
+      return realUnlink.call(lockFs, target)
+    }
+    try {
+      await assert.rejects(() => h.App.run(), (err) => {
+        assert.strictEqual(err, boom, '业务错误必须原样外抛（释放失败不得把它吞掉/替换）')
+        assert.strictEqual(err.runLockReleaseFailed, true,
+          `释放失败必须标在错误对象上（常驻入口据此停机）：${JSON.stringify(err && err.message)}`)
+        return true
+      })
+      assert.ok(blockedAt, '前置：释放路径必须真的尝试删过 run.lock（否则没打到故障点）')
+      assert.ok(realFs.existsSync(blockedAt), '前置：锁确实还留在盘上（这正是常驻会被永久饿死的形态）')
+    } finally {
+      lockFs.unlinkSync = realUnlink
+    }
+  })
 })
 
 // R1-r3 #6：释放失败（unlink EACCES/EROFS）时锁会以**本进程 pid** 留在盘上，常驻入口必须先看到

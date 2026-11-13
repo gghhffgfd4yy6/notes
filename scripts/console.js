@@ -7334,7 +7334,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   if (typeof watchTimer.unref === 'function') watchTimer.unref()
   server.on('close', () => clearInterval(watchTimer))
 
-  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, streamClients, streamSamplerActive: () => streamSampler !== null, runWatchOnce, runWorker }
+  return { server, runs, activeChildren, setShuttingDown, ownerToken, wireGracefulShutdown, sseConnections, streamClients, streamSamplerActive: () => streamSampler !== null, runWatchOnce, runWorker, tickAuto } // tickAuto：单测直接驱动自动运行收尾（生产 main 不调用，行为不变）
 }
 
 // ── 启动入口 ───────────────────────────────────────────────────────────────
