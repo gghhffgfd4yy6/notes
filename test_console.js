@@ -97,7 +97,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 }
 
 const {
-  createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
+  createConsole, listenErrorHint, consoleStateDir, finishRun, autoRunOutcome, isValidToken, timingSafeEqualStr,
   acquireLock, acquireLockResult, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -7079,6 +7079,37 @@ async function main () {
       const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
       assert.ok(/child\.on\('exit'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'exit 必须收尾')
       assert.ok(/child\.on\('close'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'close 必须幂等补收尾')
+    }
+  })
+  await aok('R1: 自动运行收尾判定把 RUN_BUSY 跳过单列（不清失败计数/不算恢复），并真的接在 tickAuto 上', () => {
+    const busyLine = '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过'
+    // 一次性 spawn 路径：只能从子进程输出里认（退出码是 0，与真成功同形）。
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: `开始运行…\n${busyLine}\n` }), 'busy',
+      'exit 0 + busy 行 ⇒ busy（旧实现按 exitCode 判成功：清 fails、清 degraded、打「已恢复」）')
+    // 常驻 worker 路径：summary 是机器信号（不依赖文案）。
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: '', summary: { skipped: true, reason: 'RUN_BUSY' } }), 'busy',
+      'worker 回报 summary.skipped ⇒ busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: '本轮成功：推送 3 条' }), 'ok', '正常 exit 0 ⇒ ok')
+    assert.strictEqual(autoRunOutcome({ exitCode: 1, output: busyLine }), 'failed', '非零退出必须记失败，不能被 busy 行盖掉')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: busyLine, timedOut: true }), 'failed', '超时轮不得当 busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: busyLine, cancelled: true }), 'failed', '被取消的轮次不得当 busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: busyLine, spawnError: true }), 'failed', 'spawn 失败不得当 busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: null, output: '' }), 'failed', '没拿到退出码按失败处理（不假装恢复）')
+    // 接线：tickAuto 的收尾必须走 autoRunOutcome 且 busy 单独记账（不清 auto.fails / degraded）。
+    const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      const body = functionBodyOf(consoleSrc, 'tickAuto')
+      assert.ok(body.includes('autoRunOutcome(record)'), 'tickAuto 收尾必须用 autoRunOutcome 判定（只看 exitCode 即回退旧缺陷）')
+      assert.ok(body.includes("outcome === 'busy'") && body.includes('auto.busyRuns'),
+        'busy 必须单列计数（auto.busyRuns），不能进成功分支')
+      const busyIdx = body.indexOf("outcome === 'busy'")
+      const okIdx = body.indexOf('auto.fails = 0', busyIdx)
+      const degradedReset = body.indexOf('auto.degraded = false', busyIdx)
+      assert.ok(busyIdx >= 0 && okIdx > busyIdx && degradedReset > busyIdx,
+        '清 auto.fails/degraded 只能出现在成功分支（busy 分支之后），不得被跳过轮触发')
+    } else {
+      assert.ok(consoleSrc.includes('autoRunOutcome') && consoleSrc.includes('auto.busyRuns'),
+        '变异档必须仍能看到自动运行收尾判定标识符')
     }
   })
   await aok('readRunHistory: CANCEL 取消留痕成独立条目且不污染相邻轮（审查 #229 S7/D1-N3）', () => {

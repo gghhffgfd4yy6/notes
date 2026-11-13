@@ -4574,31 +4574,53 @@ console.log('========================================\n');
   // R1：run 级锁跨进程实测
   // ------------------------------------------------------------
   // 单进程内的 busy 只能证明判据，不能证明**真实互斥**。这里起两个独立的 node 进程，各自
-  // require xbk_app、在同一个起始时刻（共享时间戳忙等对齐）抢同一个 cacheDir 的 run.lock：
-  // 必须恰好一个成功、一个 busy，且 busy 那方报出的 holder.pid 就是成功那方。
-  // 抢到的一方持锁 400ms 再释放（保证输家看到的是「活着的持有者」，而不是「刚释放的空位」）。
+  // require xbk_app、抢同一个 cacheDir 的 run.lock：必须恰好一个成功、一个 busy，且 busy 那方
+  // 报出的 holder.pid 就是成功那方。
+  // R1 返工 #8：**不要再靠时间窗**（旧写法「1500ms 后同时起跑 + 赢家 400ms 后释放」在慢 runner 上
+  // 输家晚到就两个都成功 ⇒ 偶发假红）。现在改成确定性握手：赢家拿到锁后**持锁等**输家把 busy
+  // 标记写出来，输家则在循环里重试直到**真的观测到 busy** 才落标记；赢家见到标记才释放。
+  // 输家的 busy 必然发生在赢家持锁期间，"恰好一个"因此是构造出来的，与调度快慢无关。
   // 不碰网络：子进程只建 App、只调锁，不调 run()。
   await test('R1：两个独立 node 进程同时抢同一 cacheDir 的 run 锁 → 恰好一个成功、一个 busy', async () => {
     const { execFile } = require('child_process')
     const dir = path.join(__dirname, DEFAULT_CACHE_DIR + '_r1_runlock')
+    // 握手标记放缓存目录**之外**（缓存目录只允许出现 run.lock，下面有断言）。
+    const hsDir = dir + '_hs'
     try { removeDirInRoot(dir, __dirname) } catch (e) { /* ignore */ }
+    try { removeDirInRoot(hsDir, __dirname) } catch (e) { /* ignore */ }
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(hsDir, { recursive: true, mode: 0o700 })
     const appPath = path.join(__dirname, 'xbk_app.js')
     const probe = [
+      'const fs = require("node:fs")',
       `const { createApp } = require(${JSON.stringify(appPath)})`,
       'const dir = process.argv[1]',
-      'const startAt = Number(process.argv[2])',
+      'const hsDir = process.argv[2]',
       'const app = createApp({ Config: {}, Utils: {}, MessageStore: { get cacheDir () { return dir } },',
-      '  fs: require("node:fs"), path: require("node:path"), crypto: require("node:crypto") })',
-      'while (Date.now() < startAt) { /* 对齐起跑时刻，让两个进程真的同时抢 */ }',
-      'const got = app._acquireRunLock()',
-      'process.stdout.write("LOCK:" + JSON.stringify({ ok: got.ok === true, busy: got.busy === true, holder: got.holder || null, pid: process.pid }) + "\\n")',
-      'if (got.ok) setTimeout(() => { app._releaseRunLock(got.token); process.exit(0) }, 400)'
+      '  fs, path: require("node:path"), crypto: require("node:crypto") })',
+      'const winFile = hsDir + "/winner"',
+      'const busyFile = hsDir + "/busy"',
+      'const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)',
+      'const deadline = Date.now() + 20000',
+      // 输家不靠「起跑对齐」：抢不到就继续重试，直到观测到 busy（或超时）——慢 runner 也只是多试几轮。
+      'let got = null',
+      'while (!got) {',
+      '  const r = app._acquireRunLock()',
+      '  if (r.ok || r.busy) { got = r; break }',
+      '  if (Date.now() > deadline) break',
+      '  sleep(5)',
+      '}',
+      'if (!got) { process.stderr.write("PROBE_TIMEOUT: 20s 内既没拿到锁也没观测到 busy\\n"); process.exit(2) }',
+      // 先写 winFile 再等：赢家已持锁，输家写到 busyFile 时必然仍被挡在外面。
+      'if (got.ok) { fs.writeFileSync(winFile, String(process.pid)); while (!fs.existsSync(busyFile)) {',
+      '  if (Date.now() > deadline) { process.stderr.write("PROBE_TIMEOUT: 赢家等不到输家的 busy 标记\\n"); process.exit(3) }',
+      '  sleep(5) } app._releaseRunLock(got.token) }',
+      'else fs.writeFileSync(busyFile, "1")',
+      'process.stdout.write("LOCK:" + JSON.stringify({ ok: got.ok === true, busy: got.busy === true, holder: got.holder || null, pid: process.pid }) + "\\n")'
     ].join('\n')
-    const startAt = Date.now() + 1500
     const runProbe = () => new Promise((resolve, reject) => {
-      execFile(process.execPath, ['-e', probe, dir, String(startAt)], { cwd: __dirname, timeout: 30000 }, (err, stdout) => {
-        if (err) { reject(new Error(`锁探针进程失败：${err.message}；stdout=${String(stdout)}`)); return }
+      execFile(process.execPath, ['-e', probe, dir, hsDir], { cwd: __dirname, timeout: 30000 }, (err, stdout, stderr) => {
+        if (err) { reject(new Error(`锁探针进程失败：${err.message}；stdout=${String(stdout)}；stderr=${String(stderr)}`)); return }
         const line = String(stdout).split('\n').find(l => l.startsWith('LOCK:'))
         if (!line) { reject(new Error(`锁探针没有输出 LOCK 行：${String(stdout)}`)); return }
         resolve(JSON.parse(line.slice('LOCK:'.length)))
@@ -4612,10 +4634,16 @@ console.log('========================================\n');
       assertStrictEqual(losers.length, 1, `另一个进程必须是 busy（实际 ${JSON.stringify(results)}）`)
       assertStrictEqual(losers[0].holder && losers[0].holder.pid, winners[0].pid,
         `busy 那方必须报出真实持有者 pid（实际 ${JSON.stringify(losers[0].holder)} vs 成功方 pid=${winners[0].pid}）`)
+      // 握手自证：赢家确实等到过输家的 busy 标记才释放（否则「恰好一个」可能只是没撞上）。
+      assertStrictEqual(fs.readFileSync(path.join(hsDir, 'winner'), 'utf8'), String(winners[0].pid),
+        '赢家必须在持锁期间写下自己的 pid')
+      assertStrictEqual(fs.existsSync(path.join(hsDir, 'busy')), true,
+        '输家必须在赢家持锁期间观测到 busy 并落标记（握手成立）')
       assertStrictEqual(fs.readdirSync(dir).length, 0,
         `两个进程都不许在缓存目录里写锁以外的东西（实际 ${fs.readdirSync(dir).join(',')}）`)
     } finally {
       try { removeDirInRoot(dir, __dirname) } catch (e) { /* ignore */ }
+      try { removeDirInRoot(hsDir, __dirname) } catch (e) { /* ignore */ }
     }
   })
 

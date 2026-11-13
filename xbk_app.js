@@ -165,6 +165,14 @@ function createApp ({
   const RUN_LOCK_TAKEOVER_SUFFIX = '.takeover'
   // 锁帧读取上限：正常帧约 100 字节；超限一律按「内容不可判定」fail-closed（不整读未知大小文件）。
   const RUN_LOCK_MAX_BYTES = 4096
+  // R1 返工 #1：读/删锁一律带 O_NONBLOCK。裸 O_RDONLY 打开**无写者的 FIFO** 会一直阻塞在 open
+  // （等写端），进程在「取锁」这一步永久挂死：没有 run.log、没有退出码、任何告警都发不出来。
+  // 加 O_NONBLOCK 后 FIFO 的 open 立刻返回（ENXIO 只出现在 O_WRONLY 上，这里一并兜底），
+  // fstat 判非普通文件后走已有的 {state:'busy',corrupted:true} fail-closed 分支；普通文件语义不变。
+  const RUN_LOCK_OPEN_FLAGS = nodeFs.constants.O_RDONLY | nodeFs.constants.O_NONBLOCK |
+    (nodeFs.constants.O_NOFOLLOW || 0)
+  // 打开成功但读不出内容（FIFO 无写者时的 EAGAIN 等）：同样按「内容不可判定」收口，不当成 IO 故障抛。
+  const RUN_LOCK_UNREADABLE_CODES = ['ENXIO', 'EAGAIN', 'EWOULDBLOCK']
 
   // 进程启动时钟（Linux /proc/<pid>/stat 第 22 字段 starttime）：**PID 复用判别**的唯一来源。
   // 非 Linux / 读不到 ⇒ null——调用方按「PID 存活即活跃」的保守口径处理（宁可留着也不抢活锁）。
@@ -185,16 +193,46 @@ function createApp ({
     ? crypto.randomBytes(6).toString('hex')
     : process.hrtime.bigint().toString(16)
   const runLockToken = () => `${process.pid}:${runLockProcessStart(process.pid) || '0'}:${runLockRandom()}`
+  /** 锁帧的**唯一**构造点。`startTicks` 与 token 分开存：
+   *   · token 只用于「这把锁是不是我的」的归属比较（释放/接管时按 pid+token 匹配）；
+   *   · 死活判定只认 `pid` + `startTicks`（/proc starttime）。
+   *  为什么必须拆开（R1 返工 #5）：旧实现把 starttime 编进 token，再解析 token 判 PID 复用——于是
+   *  一个构造/损坏的 token（例如随手写成 `1:1:x`）就能把**活锁**判成死主并接管，等于 fail-open。
+   *  现在 token 里的任何内容都不参与死活判定。 */
+  const runLockFrame = (token) => JSON.stringify({
+    pid: process.pid,
+    startedAt: Date.now(),
+    token,
+    startTicks: runLockProcessStart(process.pid) || '0'
+  })
 
-  /** 写锁帧：独占创建（O_EXCL）+ 0o600。内容只是一帧 JSON（pid/startedAt/token），
-   *  没有任何理由让同组/其他用户可读，显式 mode 同时消掉 Sonar/CodeQL 的「过宽权限」判定面。 */
+  // R1 返工 #7：锁操作一律用**本模块** require 的 node:fs，不用注入的能力子集（fs 形参只按需实现
+  // 业务用例用到的方法）。旧实现调用方只注入部分 fs 时，writeRunLockFrame 缺 openSync/linkSync
+  // 会在 App.run() 建锁时直接 TypeError——锁是基础设施，不该依赖业务侧的能力注入面。
+  // fsync 单独兜底：FUSE/部分网络卷对 fsync 返回 ENOTSUP/EINVAL，那是「耐久性不可用」而不是
+  // 「锁建不起来」；旧实现让这类卷每一轮都硬失败（R1 返工 #7 后半）。降级只告警，60s 限频。
+  let runLockFsyncWarnAt = 0
+  const warnRunLockFsyncUnsupported = (err) => {
+    const now = Date.now()
+    if (runLockFsyncWarnAt && now - runLockFsyncWarnAt < 60 * 1000) return
+    runLockFsyncWarnAt = now
+    console.warn(`⚠️ run 锁文件 fsync 不被当前文件系统支持（${(err && err.code) || '未知错误'}）：继续运行（锁仍独占创建，仅掉电耐久性降级）`)
+  }
+
+  /** 写锁帧：独占创建（O_EXCL）+ 0o600。内容只是一帧 JSON，没有任何理由让同组/其他用户可读，
+   *  显式 mode 同时消掉 Sonar/CodeQL 的「过宽权限」判定面。 */
   const writeRunLockFrame = (filePath, frame) => {
-    const fd = fs.openSync(filePath, 'wx', 0o600)
+    const fd = nodeFs.openSync(filePath, 'wx', 0o600)
     try {
-      fs.writeFileSync(fd, frame)
-      fs.fsyncSync(fd)
+      nodeFs.writeFileSync(fd, frame)
+      try {
+        nodeFs.fsyncSync(fd)
+      } catch (e) {
+        if (!e || !['ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOSYS'].includes(e.code)) throw e
+        warnRunLockFsyncUnsupported(e)
+      }
     } finally {
-      try { fs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
+      try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
   }
 
@@ -207,7 +245,7 @@ function createApp ({
     try {
       writeRunLockFrame(tmp, frame)
       try {
-        fs.linkSync(tmp, filePath)
+        nodeFs.linkSync(tmp, filePath)
       } catch (e) {
         // EEXIST = 锁已存在（正常竞争，上抛给调用方判定）；其余不支持 link 的 errno 才回退。
         if (!e || e.code === 'EEXIST') throw e
@@ -215,8 +253,28 @@ function createApp ({
         writeRunLockFrame(filePath, frame)
       }
     } finally {
-      try { fs.unlinkSync(tmp) } catch (e) { /* 已被 link 消费或未建成 */ }
+      try { nodeFs.unlinkSync(tmp) } catch (e) { /* 已被 link 消费或未建成 */ }
     }
+  }
+
+  /** 严格解析锁帧：**不**用 Number() 强转（R1 返工 #5）。
+   *  旧实现 `Number(frame.pid)` 会把 `pid:true` 读成 PID 1、把 `startedAt:'123'` 当合法数字，
+   *  于是一帧手写/损坏的内容就能指认出别的进程，进而把活锁判成可接管。这里只接受
+   *  「number + safe integer + > 0」的 pid/startedAt 与「非空字符串」的 token；
+   *  任何一项不满足 ⇒ null（调用方按内容不可判定 fail-closed）。 */
+  const parseRunLockFrame = (raw) => {
+    let frame = null
+    try { frame = JSON.parse(raw) } catch (e) { return null }
+    if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return null
+    const { pid, startedAt, token } = frame
+    if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null
+    if (typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt) || startedAt <= 0) return null
+    if (typeof token !== 'string' || token.trim() === '') return null
+    // startTicks 只认十进制数字串；形态不对 = 没有证据（不是「复用证据」），死活在下面另判。
+    const ticks = typeof frame.startTicks === 'string' && /^[0-9]+$/.test(frame.startTicks)
+      ? frame.startTicks
+      : null
+    return { pid, startedAt, token, startTicks: ticks }
   }
 
   /** 读一把锁的归属与死活。**只走 fd**（open → fstat → read 共用同一 fd）：
@@ -231,81 +289,87 @@ function createApp ({
   const readRunLockState = (filePath) => {
     let fd = null
     try {
-      fd = fs.openSync(filePath, nodeFs.constants.O_RDONLY | (nodeFs.constants.O_NOFOLLOW || 0))
+      fd = nodeFs.openSync(filePath, RUN_LOCK_OPEN_FLAGS)
     } catch (e) {
-      if (e && e.code === 'ENOENT') return { state: 'missing' }
+      if (!e) throw e
+      if (e.code === 'ENOENT') return { state: 'missing' }
+      // FIFO 没有写者时（某些平台/flag 组合）open 直接 ENXIO/EAGAIN：等不到内容 ⇒ 不可判定。
+      if (RUN_LOCK_UNREADABLE_CODES.includes(e.code)) return { state: 'busy', holder: null, corrupted: true }
       throw e
     }
     try {
-      const st = fs.fstatSync(fd)
+      const st = nodeFs.fstatSync(fd)
       // 锁必须是普通文件：目录/FIFO/设备一律是「不可判定」，按损坏锁 fail-closed。
       if (!st || typeof st.isFile !== 'function' || !st.isFile() || st.size > RUN_LOCK_MAX_BYTES) {
         return { state: 'busy', holder: null, corrupted: true }
       }
-      const raw = fs.readFileSync(fd, 'utf8')
-      let frame = null
-      try { frame = JSON.parse(raw) } catch (e) { frame = null }
-      const pid = frame && Number(frame.pid)
-      const startedAt = frame && Number(frame.startedAt)
-      const token = frame && frame.token
-      const valid = Number.isSafeInteger(pid) && pid > 0 &&
-        Number.isSafeInteger(startedAt) && startedAt > 0 &&
-        typeof token === 'string' && token !== ''
-      // 无 pid/startedAt/token 就无从判断持有者 ⇒ fail-closed（R1 设计约束 3）。
-      if (!valid) return { state: 'busy', holder: null, corrupted: true }
-      const holder = { pid, startedAt }
+      let raw
+      try {
+        raw = nodeFs.readFileSync(fd, 'utf8')
+      } catch (e) {
+        if (e && RUN_LOCK_UNREADABLE_CODES.includes(e.code)) return { state: 'busy', holder: null, corrupted: true }
+        throw e
+      }
+      const frame = parseRunLockFrame(raw)
+      // 无合法 pid/startedAt/token 就无从判断持有者 ⇒ fail-closed（R1 设计约束 3）。
+      if (!frame) return { state: 'busy', holder: null, corrupted: true }
+      const holder = { pid: frame.pid, startedAt: frame.startedAt }
       let alive
       try {
-        process.kill(pid, 0)
+        process.kill(frame.pid, 0)
         alive = true
       } catch (e) {
         alive = Boolean(e) && e.code === 'EPERM' // EPERM = 进程存在但无权限；ESRCH = 已退出
       }
-      if (!alive) return { state: 'stale', holder, token }
+      if (!alive) return { state: 'stale', holder, token: frame.token }
       // 活着就结束判定：**不按 startedAt/mtime 判陈旧**——长时间运行是正常的，抢锁就是双跑。
-      // 只有「PID 还活着但启动时钟对不上」（PID 被复用）才算死主。时钟段为 '0' 表示写入方
-      // 读不到 starttime（非 Linux / 旧帧），那是**没有证据**，不是复用证据 ⇒ 按存活处理。
-      const expectedStart = String(token).split(':')[1] || ''
-      if (/^[1-9][0-9]*$/.test(expectedStart)) {
-        const actualStart = runLockProcessStart(pid)
-        if (actualStart && actualStart !== expectedStart) return { state: 'stale', holder, token }
+      // 只有「pid 还活着但启动时钟对不上」（PID 被复用）才算死主。时钟只认帧里独立的 startTicks；
+      // '0'/缺失表示写入方读不到 starttime（非 Linux / 旧帧），那是**没有证据** ⇒ 按存活处理。
+      if (frame.startTicks && frame.startTicks !== '0') {
+        const actualStart = runLockProcessStart(frame.pid)
+        if (actualStart && actualStart !== frame.startTicks) return { state: 'stale', holder, token: frame.token }
       }
-      return { state: 'busy', holder, token }
+      return { state: 'busy', holder, token: frame.token }
     } finally {
-      try { fs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
+      try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
   }
 
-  /** 按 token 归属释放锁文件：**只删内容仍属于自己的锁**，别人的锁一个字节都不碰
+  /** 按归属释放锁文件（pid + token 双匹配）：**只删内容仍属于自己的锁**，别人的锁一个字节都不碰
    *  （R1 设计约束 4 / 仓库 CodeQL 铁律：禁止按路径无条件 unlink）。
-   *  归属证明 = pid + token 双匹配：token 含进程启动时钟与随机段，同 PID 的另一个持有者
-   *  （或 PID 复用后的新进程）不可能撞上。读取与删除都基于**同一次 fd 读取**的结果。 */
-  const releaseOwnedLockFile = (filePath, token) => {
+   *  R1 返工 #6：归属判定与删除必须基于**同一个 inode**。旧实现先 open/read/close 判归属、再按路径
+   *  unlink，中间锁路径可能被替换成别人的活锁 ⇒ 误删。现在 fd 一直开着，unlink 前用 lstat 复核
+   *  「这个名字现在还指向刚校验过的那个 (dev, ino)」，不一致就返回 false（调用方告警），不盲删。
+   *  `pid` 形参只给「接管死锁」用（按旧持有者的 pid 摘除）；默认本进程。 */
+  const releaseOwnedLockFile = (filePath, token, pid = process.pid) => {
     if (typeof token !== 'string' || token === '') return false
     let fd = null
     try {
-      fd = fs.openSync(filePath, nodeFs.constants.O_RDONLY | (nodeFs.constants.O_NOFOLLOW || 0))
+      fd = nodeFs.openSync(filePath, RUN_LOCK_OPEN_FLAGS)
     } catch (e) {
-      // ENOENT = 锁已不在（无需释放）；EACCES/EIO 等是「打不开」——如实返回 false 让调用方告警。
-      return Boolean(e) && e.code === 'ENOENT'
+      // ENOENT = 锁已不在（无需释放）；FIFO/不可读 = 无法判定归属，一律不删并返回 false。
+      if (!e) return false
+      if (e.code === 'ENOENT') return true
+      return false
     }
-    let owned = false
     try {
-      const raw = fs.readFileSync(fd, 'utf8')
-      let frame = null
-      try { frame = JSON.parse(raw) } catch (e) { frame = null }
-      owned = Boolean(frame) && frame.token === token && Number(frame.pid) === process.pid
-    } catch (e) {
-      owned = false
-    } finally {
-      try { fs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
-    }
-    if (!owned) return false
-    try {
-      fs.unlinkSync(filePath)
+      const st = nodeFs.fstatSync(fd)
+      if (!st || typeof st.isFile !== 'function' || !st.isFile()) return false
+      const frame = parseRunLockFrame(nodeFs.readFileSync(fd, 'utf8'))
+      if (!frame || frame.token !== token || frame.pid !== pid) return false
+      // 按路径 lstat 复核：名字已换成另一个 inode（别人刚建的新锁）⇒ 不删。
+      let now = null
+      try { now = nodeFs.lstatSync(filePath) } catch (e) {
+        if (e && e.code === 'ENOENT') return true
+        return false
+      }
+      if (!now || now.isSymbolicLink() || now.dev !== st.dev || now.ino !== st.ino) return false
+      nodeFs.unlinkSync(filePath)
       return true
     } catch (e) {
       return Boolean(e) && e.code === 'ENOENT'
+    } finally {
+      try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
   }
 
@@ -1865,6 +1929,18 @@ function createApp ({
       }
     },
 
+    /** 锁文件路径的**唯一**真源（R1 返工 #4）：缓存目录 realpath 规范化后再拼 `run.lock`。
+     *  为什么必须规范化：锁的互斥承诺建立在「同一物理目录 ⇒ 同一把锁」上，而配置里给的是字符串——
+     *  同一目录经符号链接/不同拼写访问时，按原字符串拼会得到两条不同的路径，两个进程各建一把锁，
+     *  互斥静默失效。realpath 失败（ENOENT/EACCES/ELOOP…）是**真实 IO 故障**，如实抛出：
+     *  静默退回原路径等于在最需要互斥的故障态里把承诺降级成「看起来有锁」。 */
+    _runLockPath () {
+      const real = typeof nodeFs.realpathSync.native === 'function'
+        ? nodeFs.realpathSync.native(this._cacheDir())
+        : nodeFs.realpathSync(this._cacheDir())
+      return path.join(real, RUN_LOCK_FILE)
+    },
+
     /** run 级单飞锁：获取。成功 `{ ok:true, token }`；有人正在跑 `{ ok:false, busy:true, holder }`；
      *  **真实文件系统错误（EACCES/EROFS/ENOSPC/ENOTDIR…）直接抛**——那是故障，不是 busy
      *  （R1 设计约束 7：不能把权限/磁盘问题伪装成「已有运行」静默跳过）。 */
@@ -1872,12 +1948,13 @@ function createApp ({
       // 锁目录 = 运行时缓存目录（与 run.log/判重缓存同源）。首轮部署目录可能还不存在，而
       // MessageStore.init() 要到 run 主体里才建 ⇒ 锁必须先保证目录在。recursive:true 对已存在
       // 目录是 no-op；不做 existsSync 预检（那才是 check-then-use）。
+      // 一律用本模块的 node:fs：注入的 fs 只是业务侧的能力子集（R1 返工 #7）。
       const dir = this._cacheDir()
-      if (typeof fs.mkdirSync === 'function') fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-      const lockPath = path.join(dir, RUN_LOCK_FILE)
+      nodeFs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const lockPath = this._runLockPath()
       for (let attempt = 0; attempt < 2; attempt++) {
         const token = runLockToken()
-        const frame = JSON.stringify({ pid: process.pid, startedAt: Date.now(), token })
+        const frame = runLockFrame(token)
         try {
           createRunLockFile(lockPath, frame)
           return { ok: true, token }
@@ -1901,10 +1978,14 @@ function createApp ({
     /** 陈旧锁接管：用 `<lock>.takeover` 哨兵（独占创建，帧里带自己的 token）**串行化**。
      *  为什么必须有哨兵：两个进程同时判定「持有者已死」时，若各自替换锁就会双双开跑；
      *  哨兵是唯一原子 CAS——抢不到哨兵的一律按 busy 收口。
-     *  拿到哨兵后**必须重新判定一次**主锁：这中间可能已有别人跑完释放、又有人新建了活锁。 */
+     *  拿到哨兵后**必须重新判定一次**主锁：这中间可能已有别人跑完释放、又有人新建了活锁。
+     *  R1 返工 #3：换代**只用 O_EXCL 创建**，不再「写临时帧 + rename 覆盖」——read 与 rename 之间
+     *  若锁刚好 missing，别的进程可以在这条缝里用 O_EXCL 建好活锁，而 rename 会直接把那把活锁
+     *  盖掉，两个进程同时开跑。现在：missing ⇒ 直接 O_EXCL 竞争（EEXIST 即 busy）；stale ⇒ 先按
+     *  pid+token 原子摘掉**刚才复判到的那一把**旧锁，再 O_EXCL 创建。任何一步竞争失败都收口 busy。 */
     _takeoverStaleRunLock (lockPath, frame, token) {
       const sentinelPath = lockPath + RUN_LOCK_TAKEOVER_SUFFIX
-      const sentinelFrame = JSON.stringify({ pid: process.pid, startedAt: Date.now(), token })
+      const sentinelFrame = runLockFrame(token)
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           createRunLockFile(sentinelPath, sentinelFrame)
@@ -1918,31 +1999,37 @@ function createApp ({
           // 复核发现搬走的是活哨兵必须原样搬回（同 xbk_message_store 的 C3-012 口径）。
           const reclaim = `${sentinelPath}.${process.pid}.${Date.now()}.reclaim`
           try {
-            fs.renameSync(sentinelPath, reclaim)
+            nodeFs.renameSync(sentinelPath, reclaim)
           } catch (e2) {
             if (e2 && e2.code === 'ENOENT') continue
             throw e2
           }
           const reclaimed = readRunLockState(reclaim)
           if (reclaimed.state === 'busy') {
-            try { fs.renameSync(reclaim, sentinelPath) } catch (e3) { /* 搬不回也不删：里面是别人的活令牌 */ }
+            try { nodeFs.renameSync(reclaim, sentinelPath) } catch (e3) { /* 搬不回也不删：里面是别人的活令牌 */ }
             return { ok: false, busy: true, holder: reclaimed.holder || null }
           }
-          try { fs.unlinkSync(reclaim) } catch (e3) { /* 残留回收名由下一轮接管者再回收 */ }
+          try { nodeFs.unlinkSync(reclaim) } catch (e3) { /* 残留回收名由下一轮接管者再回收 */ }
           continue
         }
         try {
           const again = readRunLockState(lockPath)
           // 复判：锁已换主/持有者复活 ⇒ 不接管（这一条是「只判断一次」与双跑之间的唯一屏障）。
           if (again.state === 'busy') return { ok: false, busy: true, holder: again.holder || null }
-          // 仍陈旧（或刚好消失）：原子 rename 换代——释放方不会读到半截帧，旧 inode 上的
-          // 任何后续写入都落不进新锁（与 console 的 takeover 同口径）。
-          const tmp = `${lockPath}.${process.pid}.${Date.now()}.${runLockRandom()}.tmp`
+          if (again.state === 'stale') {
+            // 按刚才复判到的 pid+token 原子摘除旧锁：摘不掉（别人已接管/内容已换）⇒ busy。
+            // 这里绝不能按路径无条件 unlink——那是仓库 CodeQL 铁律，也会误删别人刚建好的活锁。
+            if (!releaseOwnedLockFile(lockPath, again.token, again.holder.pid)) {
+              return { ok: false, busy: true, holder: again.holder || null }
+            }
+          }
+          // missing（或旧锁刚被本进程摘掉）：独占创建。别人在这条缝里抢先建好活锁时
+          // link 返回 EEXIST ⇒ 按 busy 收口，绝不覆盖。
           try {
-            writeRunLockFrame(tmp, frame)
-            fs.renameSync(tmp, lockPath)
-          } finally {
-            try { fs.unlinkSync(tmp) } catch (e) { /* 已被 rename 消费 */ }
+            createRunLockFile(lockPath, frame)
+          } catch (e) {
+            if (e && e.code === 'EEXIST') return { ok: false, busy: true, holder: null }
+            throw e
           }
           return { ok: true, token }
         } finally {
@@ -1955,7 +2042,9 @@ function createApp ({
 
     /** run 级单飞锁：释放。true = 锁已释放（或本就不在）；false = 锁仍留在盘上（已告警）。 */
     _releaseRunLock (token) {
-      return releaseOwnedLockFile(path.join(this._cacheDir(), RUN_LOCK_FILE), token)
+      let lockPath = null
+      try { lockPath = this._runLockPath() } catch (e) { return false }
+      return releaseOwnedLockFile(lockPath, token)
     },
 
     async run () {

@@ -33,7 +33,7 @@ const { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessage
 const { journalPathFor, JOURNAL_SUFFIX } = require('../xbk_message_store')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
-const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp } = require('../xbk_utils')
+const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp, isRunBusyLine } = require('../xbk_utils')
 const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
 const { removeStaleTombstoneFile, tombstoneKeyCap } = require('../xbk_message_store') // C3-013：清残留墓碑 / CR-01：墓碑上限同一规则
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
@@ -669,6 +669,24 @@ function buildChildEnv (cacheDir) {
   return childEnv
 }
 
+// R1 返工 #2：自动运行的收尾判定——'ok' / 'failed' / 'busy'（本轮因另一运行持锁跳过）。
+// 为什么必须单列 busy：run 级锁的 busy 轮按设计退出码 0（不是失败），只看 exitCode 的旧实现会把
+// 「另一个入口正在跑」当成完整成功 ⇒ 清 auto.fails、清 degraded、打印「✅ 自动运行已恢复」。
+// 连续 busy（例如青龙长跑占着锁）于是能把真实的源站故障状态整个抹掉，看板报的却是「已恢复」。
+// 判据来源两路：常驻 worker 直接回报 summary.skipped（机器信号）；一次性 spawn 只能从输出里认
+// 那一行 busy 文案（唯一真源在 xbk_app.formatRunBusyLine，判定在 xbk_utils.isRunBusyLine）。
+function autoRunOutcome (record) {
+  if (!record) return 'failed'
+  if (record.timedOut || record.cancelled || record.spawnError) return 'failed'
+  const summary = record.summary
+  const skipped = Boolean(summary && summary.skipped === true) || isRunBusyLine(record.output)
+  // 只有「退出码 0 + 跳过证据」才是 busy：非零退出必须照旧记失败，不能被一句 busy 行盖掉。
+  if (record.exitCode === 0 && skipped) return 'busy'
+  // 只有「退出码恰好是 0」才算跑完一轮；null（worker 未回报/被外部收尾）按失败处理——
+  // 失败方向是重试，比把未知结果记成「恢复」安全。
+  return record.exitCode === 0 ? 'ok' : 'failed'
+}
+
 // 子进程输出进 record.output（环形上限 RUN_LOG_MAX_BYTES，按 UTF-8 字节计）。
 // produced 必须是**已解码**的文本（StringDecoder 处理跨 chunk 多字节，Sourcery Medium）。
 function appendProduced (record, produced) {
@@ -797,6 +815,9 @@ function startWorkerAction (record, action, worker, activeChildren, spawnImpl) {
     }
     if (result && result.timedOut) record.timedOut = true
     if (result && result.error) appendProduced(record, `\n[console] 常驻 worker：${result.error}\n`)
+    // R1 返工 #2：worker 回报的 summary 是 busy（RUN_BUSY）唯一可靠的机器信号——spawn 路径只能靠
+    // 输出文案认。必须留在 record 上给自动调度判定，不能只让 SSE/看板读一次就丢。
+    if (result && result.summary && typeof result.summary === 'object') record.summary = result.summary
     record.exitCode = Number.isInteger(result && result.exitCode) ? result.exitCode : null
     record.exitedAt = Date.now()
     record.closedAt = Date.now()
@@ -3731,6 +3752,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     fails: 0,
     degraded: false,
     spawnFails: 0,
+    busyRuns: 0, // R1：本轮因另一运行持锁跳过的次数（不算成功也不算失败，仅观测）
+    lastBusyAt: 0,
     lastError: '',
     lastRunId: null
   }
@@ -3767,6 +3790,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     runs: auto.runs,
     fails: auto.fails,
     degraded: auto.degraded,
+    busyRuns: auto.busyRuns,
+    lastBusyAt: auto.lastBusyAt,
     lastError: auto.lastError,
     lastRunId: auto.lastRunId
   })
@@ -3881,8 +3906,15 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       autoInFlightId = null
       // 停止/关闭期间完成的轮次不得把状态改回 degraded（stopAuto 已清空，这里再写就是幽灵态）。
       if (!auto.on || shuttingDown) return
-      const failed = record.exitCode !== 0 || record.timedOut || record.cancelled
-      if (failed) {
+      const outcome = autoRunOutcome(record)
+      if (outcome === 'busy') {
+        // R1 返工 #2：锁竞争跳过（RUN_BUSY）既不是成功也不是源站失败。绝不能走下面的「成功」分支
+        // ——那会清 auto.fails、清 degraded 并打印「已恢复」，让连续 busy（青龙长跑占锁）把真实
+        // 源站故障状态整个抹掉。这里只单独记 busy 次数，失败计数/降级态原样保留。
+        auto.busyRuns = (Number.isInteger(auto.busyRuns) ? auto.busyRuns : 0) + 1
+        auto.lastBusyAt = Date.now()
+        console.warn(`ℹ️ 自动运行本轮因另一运行持锁跳过（RUN_BUSY，第 ${auto.busyRuns} 次）：不算失败也不算恢复，连续失败 ${auto.fails} 轮 / 降级 ${auto.degraded ? '中' : '否'} 保持不变`)
+      } else if (outcome === 'failed') {
         auto.fails += 1
         auto.lastError = `最近一轮失败（exit ${record.exitCode}）`
         // 子进程启动失败（spawn ENOENT/EMFILE）是确定性环境错误，不是源站抖动：
@@ -7392,6 +7424,8 @@ module.exports = {
   consoleStateDir,
   STATIC_ASSETS,
   finishRun,
+  // R1 返工 #2：自动运行收尾判定（ok/failed/busy）——纯函数，供单测直接喂 record
+  autoRunOutcome,
   // P3：常驻 worker 路径的单元测试钩子（startAction 的 deps 形参只给测试用，生产调用不传）
   startAction,
   spawnActionChild,
