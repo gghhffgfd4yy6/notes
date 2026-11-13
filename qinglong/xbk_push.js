@@ -443,7 +443,7 @@ async function runResident (app, controller) {
     // 残留哨兵按陈旧可回收）。
     if (error && error.sentinelReleaseFailed === true) {
       residentExitCode = 1
-      console.error(`本轮接管哨兵释放失败，run.lock.takeover 会以本进程 pid 残留 ⇒ 继续常驻会让后续接管永远被判「已有运行」；停止常驻交由重启器回收：${error && error.message ? error.message : String(error)}`)
+      console.error(`本轮接管哨兵释放失败，run.lock.takeover 会以本进程 pid 残留 ⇒ 继续常驻会让后续接管永远被判「已有运行」；停止常驻交由重启器回收：${error.message ? error.message : String(error)}`)
       controller.abort()
       return
     }
@@ -452,7 +452,7 @@ async function runResident (app, controller) {
     // （summary 路径的锁释放失败在 runOnce 里已经转成 permanent 抛出，这里兜住「跑炸 + 锁残留」的叠加态。）
     if (error && error.runLockReleaseFailed === true) {
       residentExitCode = 1
-      console.error(`本轮 run 锁释放失败，锁会以本进程 pid 残留 ⇒ 继续常驻会永久跳过；停止常驻交由重启器接管：${error && error.message ? error.message : String(error)}`)
+      console.error(`本轮 run 锁释放失败，锁会以本进程 pid 残留 ⇒ 继续常驻会永久跳过；停止常驻交由重启器接管：${error.message ? error.message : String(error)}`)
       controller.abort()
       return
     }

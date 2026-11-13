@@ -2244,7 +2244,7 @@ function createApp ({
         bodyError = e
         throw e
       } finally {
-        let rel = { state: 'failed', error: null }
+        let rel
         try { rel = this._releaseRunLock(lock.token) } catch (e) { rel = { state: 'failed', error: e } }
         // 释放失败不能静默：锁会留到下一轮。本进程仍存活 ⇒ 下一轮会看到「活着的持有者」而跳过；
         // 等本进程退出（或异常终止）后，下一轮才会按「持有进程已死」自动接管，不需要人工删锁。
