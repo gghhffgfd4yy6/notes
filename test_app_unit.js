@@ -3153,12 +3153,30 @@ function buildFilterRunHarness (cacheDir, over = {}) {
   })
   let items = []
   const sends = []
+  // R1-r8 #2：**持锁窗口**观测。fetchData 在 _runLocked 的业务体里，是「锁必须仍被本进程持有」的
+  // 天然观测点；旧用例只在 run() 返回后读盘，把 run() 的释放提前到 _runLocked() 之前（取锁后立刻
+  // 释放，业务全程无锁）仍全绿——单飞实际已失效而所有套件看不见。这里在抓取瞬间记两条独立证据：
+  // ① 盘上 run.lock 仍在；② 此刻再取一次锁必须拿不到（busy）。用例体据此断言。
+  const lockAtFetch = []
   // R1-r7 #3：callcounter 必须挂在 harness 自己的抓取桩上——旧写法（无条件 return items）让
   // 「先抓取、后判 busy」的回归完全不可见（B 把 await Network.fetchData() 提到取锁前，套件仍全绿）。
   const Network = {
     fetches: 0,
     async fetchData () {
       Network.fetches += 1
+      // 观测本身不得改变被测行为：取锁失败是**预期结果**（锁被本轮持有），不是错误；真实异常照实记下。
+      const obs = { lockPresent: false, reacquire: null, error: null }
+      try {
+        obs.lockPresent = realFs.existsSync(App._runLockPath())
+        obs.reacquire = App._acquireRunLock()
+        // 若意外真的拿到了（正是「业务全程无锁」的回归形态），立刻释放：观测不能把一把没人释放的锁
+        // 留在盘上，那会让后续用例集体 RUN_BUSY，把「一条断言红」变成一串无关失败。事实已原样记进
+        // obs.reacquire，用例体据此判红。
+        if (obs.reacquire && obs.reacquire.ok) App._releaseRunLock(obs.reacquire.token)
+      } catch (e) {
+        obs.error = e
+      }
+      lockAtFetch.push(obs)
       if (over.fetchData) return over.fetchData(items)
       return items
     }
@@ -3212,6 +3230,8 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     baseConfig,
     // R1-r7 #3：本轮抓取调用次数（busy 轮必须是 0 —— spec 目标 2「第二个进程必须不抓取」）。
     fetches () { return Network.fetches },
+    // R1-r8 #2：每次抓取瞬间的持锁观测（lockPresent / reacquire / error）。
+    lockAtFetch () { return lockAtFetch },
     setItems (next) { items = next },
     cacheName () { return MessageStore.getFileName(Config.api.pushUrl) },
     cacheMessages () { return MessageStore.readMessages(MessageStore.getFilePath(MessageStore.getFileName(Config.api.pushUrl))) }
@@ -5523,6 +5543,32 @@ checkAsync('R1 行为：正常一轮跑完后 run.lock 被释放（finally），
     if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
     else process.env.XBK_CACHE_DIR = prevEnvDir
   }
+})
+
+// R1-r8 #2：spec 约束「整轮业务都持锁」此前零守卫——把 run() 的释放从 finally 提到 _runLocked()
+// 之前（取锁后立刻释放、业务全程无锁）后，旧套件仍 343/343、test_app --only=R1 仍 3/3 全绿：
+// 现有 5 条 R1 用例都只在 run() 返回后读盘，看不见「持锁窗口」。harness 的 Network.fetchData 在
+// _runLocked 体内，是最自然的观测点，桩里已记下两条独立证据（盘上有 run.lock / 再取一次锁必 busy），
+// 这里逐条断言，并在 run() 结束后断言已释放。
+checkAsync('R1 行为：业务全程持锁——抓取瞬间 run.lock 在盘且再取一次锁必 busy，跑完后已释放', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('hold-a', '标题甲')])
+    const lockPath = path.join(realFs.realpathSync(cacheDir), 'run.lock')
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(summary.pushed, 1, `前置：本轮应真的推了 1 条：${JSON.stringify(summary)}`)
+    const obs = h.lockAtFetch()
+    assert.strictEqual(obs.length, 1,
+      `前置：本轮必须恰好观测到 1 次抓取（没观测到就无从证明持锁）：${JSON.stringify(obs)}`)
+    assert.strictEqual(obs[0].error, null,
+      `抓取瞬间的持锁观测本身不得抛错：${obs[0].error && obs[0].error.message}`)
+    assert.strictEqual(obs[0].lockPresent, true,
+      '抓取发生在业务体内 ⇒ 此刻 run.lock 必须仍在盘上（回退成「取锁后立刻释放」时这里必红）')
+    assert.strictEqual(obs[0].reacquire.ok, false,
+      `锁被本轮持有时再取一次必须拿不到（实测拿到了 ⇒ 业务全程无锁）：${JSON.stringify(obs[0].reacquire)}`)
+    assert.strictEqual(obs[0].reacquire.busy, true,
+      `再取一次的结果必须是 busy（不是别的失败形态）：${JSON.stringify(obs[0].reacquire)}`)
+    assert.ok(!realFs.existsSync(lockPath), 'run() 结束后必须已释放 run.lock（否则下一轮永远 busy）')
+  })
 })
 
 // R1-r7 #2：spec 约束 5「异常/超时/提前 return 都要释放」此前零守卫——把 finally 里的释放改成

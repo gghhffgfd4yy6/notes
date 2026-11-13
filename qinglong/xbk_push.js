@@ -434,6 +434,19 @@ async function runResident (app, controller) {
   }
 
   const handleFailure = async (error) => {
+    // R1-r8 #1：接管陈旧 run 锁的那段临界区抛错、同时哨兵 run.lock.takeover 也没删掉 ——
+    // 那条错误上会带 sentinelReleaseFailed 标记（xbk_app.js 的 _takeoverStaleRunLock finally 里
+    // 「bodyError 存在 ⇒ 标在错误对象上」同口径，SYSTEM_CONTRACT.md 的常驻入口条文 ③）。
+    // 该错误没有 failureKind，会一路走到 classifyOne 被判 retryable ⇒ 指数退避、退出码 0、不 abort；
+    // 而哨兵记着**本进程活 pid** ⇒ 此后所有接管永远 busy ⇒ 常驻永久零推送且看起来一切正常。
+    // 必须与 runLockReleaseFailed 同样按不可恢复停机：置退出码 1，让重启器起新进程（pid 变了，
+    // 残留哨兵按陈旧可回收）。
+    if (error && error.sentinelReleaseFailed === true) {
+      residentExitCode = 1
+      console.error(`本轮接管哨兵释放失败，run.lock.takeover 会以本进程 pid 残留 ⇒ 继续常驻会让后续接管永远被判「已有运行」；停止常驻交由重启器回收：${error && error.message ? error.message : String(error)}`)
+      controller.abort()
+      return
+    }
     // R1-r3 #6：本轮业务抛错、同时锁又没释放 —— 那条错误上会带 runLockReleaseFailed 标记。
     // 必须最优先判 permanent：常驻进程若退避重试，下一轮只会看到「本进程仍持有锁」⇒ 永久 skipped。
     // （summary 路径的锁释放失败在 runOnce 里已经转成 permanent 抛出，这里兜住「跑炸 + 锁残留」的叠加态。）

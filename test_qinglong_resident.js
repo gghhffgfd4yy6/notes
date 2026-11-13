@@ -256,5 +256,54 @@ function makeResidentApp (runFn) {
       `必须留下「接管哨兵释放失败」的失败日志（否则运维只看到一切正常）：${JSON.stringify(sentinelLines)}`)
   }
 
+  // 7. R1-r8 #1：同一族标记的**错误对象形态**。业务正常收尾时哨兵释放失败写在摘要上（第 6 条），
+  //    但接管陈旧锁的那段临界区**自己抛错**时，xbk_app.js 把它标在错误对象上（无 failureKind）——
+  //    该错误逃过 runOnce 的摘要判定，直接进 handleFailure。旧实现只认 summary/error 上的
+  //    runLockReleaseFailed，于是这条标记落到 classifyOne 被判 retryable ⇒ 指数退避、退出码 0、不 abort，
+  //    而 run.lock.takeover 仍以本进程活 pid 留盘 ⇒ 此后所有接管永远 busy ⇒ 永久零推送且看起来正常。
+  //    这里**不预设 abort 定时器**：停机必须由生产代码触发，用例只留看门狗（超时即判红并 abort，
+  //    避免留一个空转的重试循环）。
+  {
+    runCalls = 0
+    const errSentinelLines = []
+    const origLog = console.log
+    const origErr = console.error
+    const appErrSentinel = makeResidentApp(async () => {
+      runCalls++
+      const err = new Error('接管体炸了：摘除陈旧锁后建新锁失败')
+      err.sentinelReleaseFailed = true
+      throw err
+    })
+    const ctrlErrSentinel = new AbortController()
+    console.log = () => {}
+    console.error = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('接管哨兵')) errSentinelLines.push(line)
+    }
+    const ERR_SENTINEL_WATCHDOG_MS = 5000
+    let errSentinelTimer
+    try {
+      await Promise.race([
+        runResident(appErrSentinel, ctrlErrSentinel),
+        new Promise((resolve, reject) => {
+          errSentinelTimer = setTimeout(() => {
+            ctrlErrSentinel.abort()
+            reject(new Error(`runResident 未因错误对象上的 sentinelReleaseFailed 停机（已跑 ${runCalls} 轮，` +
+              `看门狗 ${ERR_SENTINEL_WATCHDOG_MS}ms 到点）：该标记疑似又被判成可重试 ⇒ 常驻永久空转`))
+          }, ERR_SENTINEL_WATCHDOG_MS)
+        })
+      ])
+    } finally {
+      clearTimeout(errSentinelTimer)
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.strictEqual(ctrlErrSentinel.signal.aborted, true,
+      '错误对象带 sentinelReleaseFailed 必须触发 controller.abort()（不能退避续跑）')
+    assert.strictEqual(runCalls, 1, `该标记必须停机，只跑 1 轮（实际 ${runCalls}；>1 说明走了可重试退避）`)
+    assert.ok(errSentinelLines.some(l => l.includes('接管哨兵')),
+      `必须留下「接管哨兵释放失败」的失败日志（否则运维只看到一切正常）：${JSON.stringify(errSentinelLines)}`)
+  }
+
   console.log('test_qinglong_resident OK')
 })().catch((e) => { console.error(e); process.exit(1) })
