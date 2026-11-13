@@ -339,42 +339,74 @@ function createApp ({
    *  （R1 设计约束 4 / 仓库 CodeQL 铁律：禁止按路径无条件 unlink）。
    *  R1 返工 #6：归属判定与删除必须基于**同一个 inode**。旧实现先 open/read/close 判归属、再按路径
    *  unlink，中间锁路径可能被替换成别人的活锁 ⇒ 误删。现在 fd 一直开着，unlink 前用 lstat 复核
-   *  「这个名字现在还指向刚校验过的那个 (dev, ino)」，不一致就返回 false（调用方告警），不盲删。
+   *  「这个名字现在还指向刚校验过的那个 (dev, ino)」，不一致就不删（调用方只告警），不盲删。
    *  `pid` 形参只给「接管死锁」用（按旧持有者的 pid 摘除）；默认本进程。
    *  R1-r3 #3：**判据与处置必须同一条上限**。判据（readRunLockState）早已按 RUN_LOCK_MAX_BYTES
    *  拒绝超限锁，处置这里却用 readFileSync 整读——锁路径被换成大文件（日志、镜像、别的程序
    *  误写）时，释放路径会把它整块读进内存（可能 OOM），而它按定义就不是本进程写的那一帧。
-   *  契约：fstat 报 st.size > RUN_LOCK_MAX_BYTES ⇒ 直接 return false（不读、不删），与判据同口径。 */
+   *  R1-r4 #2/#3：返回值从 bool 改成**三态结果**。旧实现把三类完全不同的情形压成同一个 false：
+   *    ① 盘上已经是别人的锁 / 名字已换成别的 inode（本进程那把锁早已不在盘上——不该删、也不是故障）；
+   *    ② unlink/lstat/open 的真实 IO 故障（EACCES/EROFS/EIO…，锁确实可能还留在盘上）；
+   *    ③ 读不出内容 / 超过 4 KiB（按「不是我的帧」处理）。
+   *  `App.run()` 的 finally 曾把三者一律标成 lockReleaseFailed，常驻入口据此按不可恢复错误停机
+   *  （qinglong/xbk_push.js）：运维按 README 删掉一把看起来卡住的锁、同轮又有入口建了新锁时，
+   *  本进程释放读到别人的帧 ⇒ 误判成「锁没删掉」⇒ 常驻直接退出。故只有 ② 才配叫失败：
+   *    { state: 'released' }        按归属删掉了自己的锁
+   *    { state: 'missing' }         锁已不在盘上（别人删了 / 随缓存目录消失）
+   *    { state: 'foreign' }         盘上这把不是本进程写的那一帧（别人的锁、名字已换、非普通文件、
+   *                                 超 4 KiB）——**不删**，调用方只告警
+   *    { state: 'failed', error }   真实文件系统故障（open/read/lstat/unlink 报错），锁可能仍在盘上
+   *  接管路径（_takeoverStaleRunLock）按 specs/R1.md 约束 7 把 failed 原样抛给入口，绝不折叠成 busy。 */
   const releaseOwnedLockFile = (filePath, token, pid = process.pid) => {
-    if (typeof token !== 'string' || token === '') return false
+    if (typeof token !== 'string' || token === '') return { state: 'foreign' }
     let fd = null
     try {
       fd = nodeFs.openSync(filePath, RUN_LOCK_OPEN_FLAGS)
     } catch (e) {
-      // ENOENT = 锁已不在（无需释放）；FIFO/不可读 = 无法判定归属，一律不删并返回 false。
-      if (!e) return false
-      if (e.code === 'ENOENT') return true
-      return false
+      if (!e) return { state: 'failed', error: null }
+      // ENOENT = 锁已不在（无需释放）。
+      if (e.code === 'ENOENT') return { state: 'missing' }
+      // 名字已不是普通文件（符号链接 O_NOFOLLOW 给 ELOOP、目录给 EISDIR、FIFO 给 ENXIO/EAGAIN）：
+      // 那是「盘上这把不是我的帧」，不是 IO 故障——不删，也不该据此停机。
+      if (e.code === 'ELOOP' || e.code === 'EISDIR' || RUN_LOCK_UNREADABLE_CODES.includes(e.code)) {
+        return { state: 'foreign' }
+      }
+      // EACCES/EROFS/EIO/EMFILE/ENOTDIR…：连归属都读不到，锁可能还在盘上 ⇒ 如实上报故障。
+      return { state: 'failed', error: e }
     }
     try {
       const st = nodeFs.fstatSync(fd)
-      if (!st || typeof st.isFile !== 'function' || !st.isFile()) return false
+      if (!st || typeof st.isFile !== 'function' || !st.isFile()) return { state: 'foreign' }
       // 与 readRunLockState 同一条上限（R1-r3 #3）：超限就不可能是本进程写的那帧（正常约 100 字节），
       // 不整读、不删——否则「锁路径被换成大文件」会把释放路径变成一次无界读。
-      if (st.size > RUN_LOCK_MAX_BYTES) return false
-      const frame = parseRunLockFrame(nodeFs.readFileSync(fd, 'utf8'))
-      if (!frame || frame.token !== token || frame.pid !== pid) return false
+      if (st.size > RUN_LOCK_MAX_BYTES) return { state: 'foreign' }
+      let raw = null
+      try {
+        raw = nodeFs.readFileSync(fd, 'utf8')
+      } catch (e) {
+        // 打不开内容（FIFO 无写者等）= 不是我的帧；其余读错误 = 真故障（锁还在）。
+        if (e && RUN_LOCK_UNREADABLE_CODES.includes(e.code)) return { state: 'foreign' }
+        return { state: 'failed', error: e }
+      }
+      const frame = parseRunLockFrame(raw)
+      if (!frame || frame.token !== token || frame.pid !== pid) return { state: 'foreign' }
       // 按路径 lstat 复核：名字已换成另一个 inode（别人刚建的新锁）⇒ 不删。
       let now = null
       try { now = nodeFs.lstatSync(filePath) } catch (e) {
-        if (e && e.code === 'ENOENT') return true
-        return false
+        if (e && e.code === 'ENOENT') return { state: 'missing' }
+        return { state: 'failed', error: e }
       }
-      if (!now || now.isSymbolicLink() || now.dev !== st.dev || now.ino !== st.ino) return false
-      nodeFs.unlinkSync(filePath)
-      return true
+      if (!now || now.isSymbolicLink() || now.dev !== st.dev || now.ino !== st.ino) return { state: 'foreign' }
+      try {
+        nodeFs.unlinkSync(filePath)
+        return { state: 'released' }
+      } catch (e) {
+        if (e && e.code === 'ENOENT') return { state: 'missing' }
+        return { state: 'failed', error: e }
+      }
     } catch (e) {
-      return Boolean(e) && e.code === 'ENOENT'
+      // fstat 等非预期异常：归属没判完、锁可能还在盘上。
+      return { state: 'failed', error: e }
     } finally {
       try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
@@ -2026,9 +2058,17 @@ function createApp ({
           if (again.state === 'stale') {
             // 按刚才复判到的 pid+token 原子摘除旧锁：摘不掉（别人已接管/内容已换）⇒ busy。
             // 这里绝不能按路径无条件 unlink——那是仓库 CodeQL 铁律，也会误删别人刚建好的活锁。
-            if (!releaseOwnedLockFile(lockPath, again.token, again.holder.pid)) {
+            // R1-r4 #3：**只有「不是我的锁」才收口 busy**。unlink/lstat 的真实失败（EACCES/EROFS/EIO）
+            // 必须原样抛出（specs/R1.md 约束 7）：折叠成 busy 时入口把它当「另一轮在跑」继续等，
+            // 重启后的进程回到同一处又拿回 busy ⇒ 常驻永久空转，只是多了一次重启。
+            const rel = releaseOwnedLockFile(lockPath, again.token, again.holder.pid)
+            if (rel.state === 'failed') {
+              throw rel.error || new Error('接管陈旧 run 锁失败：无法摘除旧锁（文件系统错误）')
+            }
+            if (rel.state === 'foreign') {
               return { ok: false, busy: true, holder: again.holder || null }
             }
+            // released / missing：旧锁已不在盘上，继续下面的独占创建。
           }
           // missing（或旧锁刚被本进程摘掉）：独占创建。别人在这条缝里抢先建好活锁时
           // link 返回 EEXIST ⇒ 按 busy 收口，绝不覆盖。
@@ -2047,10 +2087,16 @@ function createApp ({
       return { ok: false, busy: true, holder: null }
     },
 
-    /** run 级单飞锁：释放。true = 锁已释放（或本就不在）；false = 锁仍留在盘上（已告警）。 */
+    /** run 级单飞锁：释放。返回三态结果（见 releaseOwnedLockFile 的契约）：
+     *  `released` / `missing` 都表示本进程的锁已不占盘；`foreign` = 盘上那把是别人的（不删、只告警）；
+     *  `failed` = 真实 IO 故障（锁可能仍在盘上，常驻入口据此停机）。 */
     _releaseRunLock (token) {
       let lockPath = null
-      try { lockPath = this._runLockPath() } catch (e) { return false }
+      try { lockPath = this._runLockPath() } catch (e) {
+        // 锁路径解析不出来：缓存目录连名字都没了（ENOENT）⇒ 锁随目录一起消失；其余是真故障。
+        if (e && e.code === 'ENOENT') return { state: 'missing' }
+        return { state: 'failed', error: e }
+      }
       return releaseOwnedLockFile(lockPath, token)
     },
 
@@ -2080,8 +2126,8 @@ function createApp ({
         bodyError = e
         throw e
       } finally {
-        let released = false
-        try { released = this._releaseRunLock(lock.token) } catch (e) { released = false }
+        let rel = { state: 'failed', error: null }
+        try { rel = this._releaseRunLock(lock.token) } catch (e) { rel = { state: 'failed', error: e } }
         // 释放失败不能静默：锁会留到下一轮。本进程仍存活 ⇒ 下一轮会看到「活着的持有者」而跳过；
         // 等本进程退出（或异常终止）后，下一轮才会按「持有进程已死」自动接管，不需要人工删锁。
         // R1-r3 #6：一次性入口（cron 直跑 / 控制台的一次性子进程）跑完即退出，残留锁随进程消失
@@ -2090,13 +2136,18 @@ function createApp ({
         // 正常轮 ⇒ 永久空转（既不推送也不报错）。故把「锁没释放」这件事实标进本轮结果
         // （summary.lockReleaseFailed / error.runLockReleaseFailed），由常驻入口按不可恢复错误停机：
         // 退出码非零 → systemd/青龙重启 → 新进程按「持有者已死」接管，而不是静默续跑。
-        if (!released) {
+        // R1-r4 #2：**只有 failed 才是「锁没删掉」**。foreign 是「盘上这把已经是别人的」——本进程那把
+        // 锁早就不在了，下一轮要么正常 busy 要么接管，重启毫无帮助；旧实现把 foreign 也标成失败，
+        // 运维按 README 删锁后同轮又有入口新建锁 ⇒ 常驻直接 exit 1，把「一次误删」升级成「常驻停机」。
+        if (rel.state === 'failed') {
           console.warn('⚠️ run 锁释放失败（缓存目录的 run.lock 仍在）：本进程存活期间下一轮会按「已有运行在跑」跳过，进程退出后自动接管')
           if (bodyError) {
             try { bodyError.runLockReleaseFailed = true } catch (e) { /* 不可写（冻结/代理错误对象）：至少已告警 */ }
           } else if (summary && typeof summary === 'object') {
             summary.lockReleaseFailed = true
           }
+        } else if (rel.state === 'foreign') {
+          console.warn('⚠️ run 锁释放跳过：缓存目录里的 run.lock 已不是本进程写的那一把（未删除；下一轮按持有者死活 busy 或接管，不需要重启）')
         }
       }
       return summary

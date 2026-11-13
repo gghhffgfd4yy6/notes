@@ -5031,13 +5031,14 @@ check('R1 锁：同进程第二次获取（另一个 token）⇒ busy，holder �
   assert.strictEqual(readLockFrame(dir).token, first.token, 'busy 时不得改写别人（上一把）的锁')
 })
 
-check('R1 锁：释放后可在同一进程再次获取；重复释放返回 true（已是无锁态）', () => {
+check('R1 锁：释放后可在同一进程再次获取；重复释放返回 missing（已是无锁态）', () => {
   const dir = mkTmpFixture('runlock-release-')
   const app = makeLockApp(dir)
   const first = app._acquireRunLock()
-  assert.strictEqual(app._releaseRunLock(first.token), true, '释放自己的锁必须成功')
+  assert.deepStrictEqual(app._releaseRunLock(first.token), { state: 'released' }, '释放自己的锁必须成功')
   assert.ok(!lockFs.existsSync(lockPathOf(dir)), '释放后不得残留 run.lock')
-  assert.strictEqual(app._releaseRunLock(first.token), true, '锁已不在时重复释放仍算已释放')
+  assert.deepStrictEqual(app._releaseRunLock(first.token), { state: 'missing' },
+    '锁已不在时重复释放必须是 missing（R1-r4 #2：只有 failed 才代表「锁没删掉」，missing 不该让常驻停机）')
   const again = app._acquireRunLock()
   assert.strictEqual(again.ok, true, `释放后必须能再次获取：${JSON.stringify(again)}`)
   assert.notStrictEqual(again.token, first.token, '每次获取必须是新 token（否则归属判定形同虚设）')
@@ -5179,7 +5180,7 @@ check('R1 锁：锁路径是 FIFO 时不得阻塞（O_NONBLOCK + fstat 判非普
   assert.ok(out.acquireMs < 2000, `FIFO 锁的取锁必须立刻返回（实测 ${out.acquireMs}ms）`)
   assert.strictEqual(out.got.ok, false, `FIFO 不可判定持有者，必须拒绝本轮：${JSON.stringify(out.got)}`)
   assert.strictEqual(out.got.busy, true, '必须按 busy fail-closed（不是抛错、不是接管）')
-  assert.strictEqual(out.rel, false, 'FIFO 无法判定归属：释放必须返回 false')
+  assert.strictEqual(out.rel.state, 'foreign', 'FIFO 不是本进程写的那一帧：释放必须返回 foreign（不删、不停机）')
   assert.ok(out.releaseMs < 2000, `FIFO 锁的释放必须立刻返回（实测 ${out.releaseMs}ms）`)
   assert.ok(lockFs.existsSync(p), 'FIFO 不得被删除（非普通文件只拒绝、不清理）')
 })
@@ -5237,11 +5238,11 @@ check('R1 锁：释放前复核 inode——路径在读完到 unlink 之间被�
   } finally {
     lockFs.lstatSync = realLstat
   }
-  assert.strictEqual(released, false, 'inode 不一致时必须返回 false（调用方据此告警）')
+  assert.strictEqual(released.state, 'foreign', 'inode 不一致时必须返回 foreign（调用方据此告警，且不算释放失败）')
   assert.ok(lockFs.existsSync(p), '别人的锁必须留在盘上（不得盲删）')
   assert.strictEqual(patched, 1, '前置：释放路径必须做过 inode 复核（没查就等于盲删）')
   // 复核恢复正常后仍能正常释放自己那把（证明不是「永远拒绝释放」）。
-  assert.strictEqual(app._releaseRunLock(got.token), true, 'inode 一致时必须能正常释放')
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, 'inode 一致时必须能正常释放')
   assert.ok(!lockFs.existsSync(p), '释放后不得残留 run.lock')
 })
 
@@ -5296,7 +5297,8 @@ check('R1 锁：token 不匹配的释放不删别人的锁（归属判定）', (
   const app = makeLockApp(dir)
   const foreign = { pid: process.pid, startedAt: Date.now(), token: `${process.pid}:0:another-holder` }
   lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(foreign), { mode: 0o600 })
-  assert.strictEqual(app._releaseRunLock('not-my-token'), false, 'token 不匹配必须拒绝释放并返回 false')
+  assert.deepStrictEqual(app._releaseRunLock('not-my-token'), { state: 'foreign' },
+    'token 不匹配必须拒绝释放并返回 foreign（别人的锁：不删、不算失败）')
   assert.ok(lockFs.existsSync(lockPathOf(dir)), '别人的锁必须留在盘上')
   assert.deepStrictEqual(readLockFrame(dir), foreign, '别人的锁内容不得被改写')
 })
@@ -5359,7 +5361,7 @@ check('R1 锁：缓存目录不可用（ENOTDIR / EACCES）必须 fail-loud 抛�
 // R1-r3 #3：释放路径必须与判据同一条大小上限（RUN_LOCK_MAX_BYTES=4096）。
 // 造一把「内容其实是自己的、但体积超限」的锁（合法 JSON + 大段尾部空白，JSON.parse 照样成功）：
 // 无上限的旧实现会整读、认领、删除；新实现必须按「不是我写的那一帧」拒绝（返回 false、不删）。
-check('R1 锁：锁文件超过 4096 字节时释放拒绝整读（返回 false、不删），上限内同一把锁仍能正常释放', () => {
+check('R1 锁：锁文件超过 4096 字节时释放拒绝整读（返回 foreign、不删），上限内同一把锁仍能正常释放', () => {
   const dir = mkTmpFixture('runlock-oversize-release-')
   const app = makeLockApp(dir)
   const got = app._acquireRunLock()
@@ -5368,13 +5370,13 @@ check('R1 锁：锁文件超过 4096 字节时释放拒绝整读（返回 false�
   const oversize = JSON.stringify(frame) + ' '.repeat(8 * 1024)
   assert.ok(Buffer.byteLength(oversize) > 4096, '前置：构造的锁文件必须真的超过 4096 字节')
   lockFs.writeFileSync(lockPathOf(dir), oversize, { mode: 0o600 })
-  assert.strictEqual(app._releaseRunLock(got.token), false,
-    '超限锁文件不得被整读并当成自己的锁删掉（判据 4 KiB、处置也必须 4 KiB）')
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'foreign' },
+    '超限锁文件不得被整读并当成自己的锁删掉（判据 4 KiB、处置也必须 4 KiB）；也不是 failed——它不是我们的帧')
   assert.ok(lockFs.existsSync(lockPathOf(dir)), '超限锁文件必须留在盘上（不删）')
   assert.strictEqual(lockFs.readFileSync(lockPathOf(dir), 'utf8'), oversize, '超限锁内容一个字节都不能改')
-  // 对照：同一帧压回上限内 ⇒ 正常释放。证明上面的 false 是「按上限拒绝」，不是「永远拒绝释放」。
+  // 对照：同一帧压回上限内 ⇒ 正常释放。证明上面的 foreign 是「按上限拒绝」，不是「永远拒绝释放」。
   lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(frame), { mode: 0o600 })
-  assert.strictEqual(app._releaseRunLock(got.token), true, '上限内的同一把锁必须能正常释放')
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '上限内的同一把锁必须能正常释放')
   assert.ok(!lockFs.existsSync(lockPathOf(dir)), '正常释放后不得残留 run.lock')
 })
 
@@ -5386,7 +5388,7 @@ check('R1 锁：只用注入 fs 的能力子集时锁仍能工作（缺 openSync
   const app = makeLockApp(dir, { fs: subsetFs })
   const got = app._acquireRunLock()
   assert.strictEqual(got.ok, true, `只注入部分 fs 也必须能拿锁：${JSON.stringify(got)}`)
-  assert.strictEqual(app._releaseRunLock(got.token), true, '释放同样不得依赖注入的 fs')
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '释放同样不得依赖注入的 fs')
   // fsync 在 FUSE/网络卷上可能返回 ENOTSUP/EINVAL：只降级（warn），不让每一轮都硬失败。
   // R1-r3 #4：只装**一次**桩、用可变状态切换「这轮要抛哪个错误」。旧写法是「恢复 realFsync →
   // 立刻换上新桩」，两次赋值之间没有任何读取 ⇒ CodeQL 报「Useless assignment to property
@@ -5406,7 +5408,7 @@ check('R1 锁：只用注入 fs 的能力子集时锁仍能工作（缺 openSync
     fsyncError = fsyncErrorOf('ENOTSUP')
     const degraded = app._acquireRunLock()
     assert.strictEqual(degraded.ok, true, `fsync 不支持时必须降级继续（锁已独占创建）：${JSON.stringify(degraded)}`)
-    assert.strictEqual(app._releaseRunLock(degraded.token), true, '降级后仍必须能正常释放')
+    assert.deepStrictEqual(app._releaseRunLock(degraded.token), { state: 'released' }, '降级后仍必须能正常释放')
     // ② 反例：ENOTSUP 之外的 fsync 故障（EIO）是真故障，必须原样抛，不得被降级吞掉。
     fsyncError = fsyncErrorOf('EIO')
     assert.throws(() => app._acquireRunLock(), (e) => e && e.code === 'EIO',
@@ -5534,6 +5536,78 @@ checkAsync('R1 行为：释放 run.lock 失败（EACCES）⇒ 摘要带 lockRele
       lockFs.unlinkSync = realUnlink
     }
   })
+})
+
+// R1-r4 #2：**「盘上这把是别人的锁」不等于「释放失败」**。run() 的 finally 旧实现只看 bool，把
+// 三类情形一律标成 lockReleaseFailed：真实 IO 故障、盘上已换主（运维按 README 删掉卡住的锁后同轮
+// 又有入口新建了自己的锁）、名字被换成别的 inode。常驻入口（qinglong/xbk_push.js）据此按
+// permanent 停机 exit 1——本进程那把锁早就不在盘上了，重启解决不了任何问题。这里在「一轮跑到一半
+// 时锁被换主」的真实形态下断言：摘要不带 lockReleaseFailed、有明确告警、别人的锁一个字节都不动。
+checkAsync('R1 行为：本轮结束时盘上的 run.lock 已换主（运维删锁后别人新建）⇒ 不算释放失败，不标 lockReleaseFailed', async () => {
+  const foreign = { pid: process.pid, startedAt: 1700000000000, token: `${process.pid}:0:other-holder` }
+  let lockPath = null
+  let swapped = 0
+  // Pusher.send 在一轮中间被调用：此刻锁仍归本轮所有，正好用来模拟「外部把锁删了/换了一把」。
+  const Pusher = {
+    send: async () => {
+      if (swapped === 0) {
+        swapped += 1
+        lockFs.writeFileSync(lockPath, JSON.stringify(foreign), { mode: 0o600 })
+      }
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  await withRunHarness({ Pusher }, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('rel-foreign-a', '标题甲')])
+    lockPath = path.join(realFs.realpathSync(cacheDir), 'run.lock')
+    const { summary, warns } = await runWithWarnings(h.App)
+    assert.strictEqual(swapped, 1, '前置：本轮必须真的推过一次（换锁发生在轮中）')
+    assert.strictEqual(summary.pushed, 1, `前置：本轮应推送 1 条：${JSON.stringify(summary)}`)
+    assert.strictEqual(summary.lockReleaseFailed, undefined,
+      `盘上已是别人的锁 ⇒ 本进程那把已不在，不得标 lockReleaseFailed（常驻会据此停机）：${JSON.stringify(summary)}`)
+    assert.ok(warns.some(l => l.includes('已不是本进程写的那一把')),
+      `必须留一条「换主」告警（既不停机也不静默）：${JSON.stringify(warns)}`)
+    assert.ok(!warns.some(l => l.includes('run 锁释放失败')), `不得再打「释放失败」：${JSON.stringify(warns)}`)
+    assert.deepStrictEqual(JSON.parse(realFs.readFileSync(lockPath, 'utf8')), foreign,
+      '别人的锁必须原样留在盘上（内容一个字节都不能改）')
+  })
+})
+
+// R1-r4 #3：接管陈旧锁时的**真实文件系统故障**不得折叠成 busy（specs/R1.md 约束 7）。
+// 旧实现把「不是我的锁」与「unlink 报 EACCES/EROFS/EIO」压成同一个 false，接管收口成 busy：入口
+// 把真实故障当「另一轮在跑」继续等，重启后的进程回到同一处又拿回 busy ⇒ 常驻永久空转。
+check('R1 锁：接管陈旧锁时 unlink 报 EACCES 必须原样抛出（不得折叠成 busy）', () => {
+  const dir = mkTmpFixture('runlock-takeover-eacces-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const realUnlink = lockFs.unlinkSync
+  let blockedAt = null
+  lockFs.unlinkSync = function (target) {
+    if (path.basename(String(target)) === 'run.lock') {
+      blockedAt = String(target)
+      const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.call(lockFs, target)
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'EACCES'
+    }, 'unlink 的真实失败必须抛出（折叠成 busy 就等于「权限坏了却永远静默跳过」）')
+  } finally {
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.ok(blockedAt, '前置：接管路径必须真的试过摘除那把陈旧锁')
+  assert.strictEqual(thrown.code, 'EACCES', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8').includes(`${RUN_LOCK_DEAD_PID}:0:dead`), true,
+    '旧锁没被删成，必须原样留在盘上')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '抛错路径也必须回收接管哨兵（不留 .takeover）')
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====
