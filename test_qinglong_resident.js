@@ -187,5 +187,42 @@ function makeResidentApp (runFn) {
     assert.strictEqual(ctrlBusy.signal.aborted, true, '前置：本用例靠自己的定时器停止循环（不是被 permanent 停机）')
   }
 
+  // 5. R1-r3 #6：summary.lockReleaseFailed（unlink EACCES/EROFS ⇒ 锁以本进程 pid 残留）必须走
+  //    permanent 停机路径。继续常驻会让下一轮 run() 永远看到「活着的持有者」⇒ 每轮 skipped 被当成
+  //    正常轮 ⇒ 永久空转（不推送、不告警、不重启）。判据：abort + 只跑 1 轮 + 留下失败日志 +
+  //    不得打成 busy「跳过」提示。
+  {
+    runCalls = 0
+    const leakLines = []
+    const origLog = console.log
+    const origErr = console.error
+    const appLockLeak = makeResidentApp(async () => {
+      runCalls++
+      return { total: 1, pushed: 1, failed: 0, lockReleaseFailed: true }
+    })
+    const ctrlLeak = new AbortController()
+    console.log = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('已有运行在跑')) leakLines.push(line)
+    }
+    console.error = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('run 锁释放失败')) leakLines.push(line)
+    }
+    const leakTimer = setTimeout(() => ctrlLeak.abort(), 400)
+    try {
+      await runResident(appLockLeak, ctrlLeak)
+    } finally {
+      clearTimeout(leakTimer)
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.strictEqual(ctrlLeak.signal.aborted, true, '锁释放失败必须触发 controller.abort()（不能静默续跑）')
+    assert.strictEqual(runCalls, 1, `锁释放失败后必须停止，只跑 1 轮（实际 ${runCalls}）`)
+    assert.ok(leakLines.some(l => l.includes('run 锁释放失败')),
+      `必须留下「锁释放失败」的失败日志（旧实现只有一条 warn 就继续跑）：${JSON.stringify(leakLines)}`)
+    assert.ok(!leakLines.some(l => l.includes('已有运行在跑')), '不得把「锁残留」当成 busy 正常轮')
+  }
+
   console.log('test_qinglong_resident OK')
 })().catch((e) => { console.error(e); process.exit(1) })

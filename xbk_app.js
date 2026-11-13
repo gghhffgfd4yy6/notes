@@ -340,7 +340,11 @@ function createApp ({
    *  R1 返工 #6：归属判定与删除必须基于**同一个 inode**。旧实现先 open/read/close 判归属、再按路径
    *  unlink，中间锁路径可能被替换成别人的活锁 ⇒ 误删。现在 fd 一直开着，unlink 前用 lstat 复核
    *  「这个名字现在还指向刚校验过的那个 (dev, ino)」，不一致就返回 false（调用方告警），不盲删。
-   *  `pid` 形参只给「接管死锁」用（按旧持有者的 pid 摘除）；默认本进程。 */
+   *  `pid` 形参只给「接管死锁」用（按旧持有者的 pid 摘除）；默认本进程。
+   *  R1-r3 #3：**判据与处置必须同一条上限**。判据（readRunLockState）早已按 RUN_LOCK_MAX_BYTES
+   *  拒绝超限锁，处置这里却用 readFileSync 整读——锁路径被换成大文件（日志、镜像、别的程序
+   *  误写）时，释放路径会把它整块读进内存（可能 OOM），而它按定义就不是本进程写的那一帧。
+   *  契约：fstat 报 st.size > RUN_LOCK_MAX_BYTES ⇒ 直接 return false（不读、不删），与判据同口径。 */
   const releaseOwnedLockFile = (filePath, token, pid = process.pid) => {
     if (typeof token !== 'string' || token === '') return false
     let fd = null
@@ -355,6 +359,9 @@ function createApp ({
     try {
       const st = nodeFs.fstatSync(fd)
       if (!st || typeof st.isFile !== 'function' || !st.isFile()) return false
+      // 与 readRunLockState 同一条上限（R1-r3 #3）：超限就不可能是本进程写的那帧（正常约 100 字节），
+      // 不整读、不删——否则「锁路径被换成大文件」会把释放路径变成一次无界读。
+      if (st.size > RUN_LOCK_MAX_BYTES) return false
       const frame = parseRunLockFrame(nodeFs.readFileSync(fd, 'utf8'))
       if (!frame || frame.token !== token || frame.pid !== pid) return false
       // 按路径 lstat 复核：名字已换成另一个 inode（别人刚建的新锁）⇒ 不删。
@@ -2063,17 +2070,36 @@ function createApp ({
           holder: lock.holder || null
         }
       }
+      // 本轮结果先落局部变量、finally 里补「锁没释放」的标记，最后再返回：这样标记与返回走同一个
+      // 对象引用（`return await ...` 写在 try 里时，返回的是 finally 执行前的那个值，容易误判）。
+      let summary = null
+      let bodyError = null
       try {
-        return await this._runLocked()
+        summary = await this._runLocked()
+      } catch (e) {
+        bodyError = e
+        throw e
       } finally {
         let released = false
         try { released = this._releaseRunLock(lock.token) } catch (e) { released = false }
         // 释放失败不能静默：锁会留到下一轮。本进程仍存活 ⇒ 下一轮会看到「活着的持有者」而跳过；
         // 等本进程退出（或异常终止）后，下一轮才会按「持有进程已死」自动接管，不需要人工删锁。
+        // R1-r3 #6：一次性入口（cron 直跑 / 控制台的一次性子进程）跑完即退出，残留锁随进程消失
+        // 自动变成陈旧锁，所以只告警足够；**常驻入口不适用**——它两轮之间不退出，锁会一直以本进程
+        // pid「活着」留在盘上，下一轮 run() 只会判定 busy ⇒ 每轮 skipped，而常驻循环把 skipped 当
+        // 正常轮 ⇒ 永久空转（既不推送也不报错）。故把「锁没释放」这件事实标进本轮结果
+        // （summary.lockReleaseFailed / error.runLockReleaseFailed），由常驻入口按不可恢复错误停机：
+        // 退出码非零 → systemd/青龙重启 → 新进程按「持有者已死」接管，而不是静默续跑。
         if (!released) {
           console.warn('⚠️ run 锁释放失败（缓存目录的 run.lock 仍在）：本进程存活期间下一轮会按「已有运行在跑」跳过，进程退出后自动接管')
+          if (bodyError) {
+            try { bodyError.runLockReleaseFailed = true } catch (e) { /* 不可写（冻结/代理错误对象）：至少已告警 */ }
+          } else if (summary && typeof summary === 'object') {
+            summary.lockReleaseFailed = true
+          }
         }
       }
+      return summary
     },
 
     // 原 run() 主体：锁已在 run() 里拿到并保证 finally 释放，这里只跑业务。

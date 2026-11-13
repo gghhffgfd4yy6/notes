@@ -372,6 +372,48 @@ function functionBodyOf (text, fnName) {
   }
   return ''
 }
+
+// ── R1-r3 #2：按锚点切出**单个分支块**的源码（花括号配平）──
+// 为什么需要它：`indexOf(...) > busyIdx` 这类「谁在后面」的断言证明不了「不在里面」——把
+// `auto.fails = 0` 塞进 busy 分支后，它照样出现在 busyIdx 之后，断言全绿。要守「跳过轮不得
+// 清失败计数/降级态」，必须真的切出 `if (outcome === 'busy') { ... }` 的块内源码再断言不含目标字段。
+// 扫描时跳过字符串/模板字面量与注释：`'{'`、`// }` 这类文本会让朴素配平提前收尾（切出的块变短，
+// 断言退化成「看不见要检查的代码」）。
+function blockAfter (text, marker, from = 0) {
+  const at = text.indexOf(marker, from)
+  if (at < 0) return null
+  const open = text.indexOf('{', at + marker.length - 1)
+  if (open < 0) return null
+  let depth = 0
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '"' || ch === "'" || ch === '`') {
+      for (i++; i < text.length; i++) {
+        if (text[i] === '\\') { i++; continue }
+        if (text[i] === ch) break
+      }
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      const nl = text.indexOf('\n', i)
+      if (nl < 0) return null
+      i = nl
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2)
+      if (end < 0) return null
+      i = end + 1
+      continue
+    }
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return text.slice(open + 1, i)
+    }
+  }
+  return null
+}
 async function aok (name, fn) {
   const label = caseLabel(name)
   reapStaleTimeout(name)
@@ -7102,10 +7144,21 @@ async function main () {
       assert.ok(body.includes('autoRunOutcome(record)'), 'tickAuto 收尾必须用 autoRunOutcome 判定（只看 exitCode 即回退旧缺陷）')
       assert.ok(body.includes("outcome === 'busy'") && body.includes('auto.busyRuns'),
         'busy 必须单列计数（auto.busyRuns），不能进成功分支')
+      // R1-r3 #2：光看「auto.fails = 0 出现在 busyIdx 之后」证明不了它不在 busy 分支里——把两行
+      // 插进 busy 分支后，位置断言照样全绿（实测 okIdx=2283/degradedReset=2306 > busyIdx=1953）。
+      // 这里按花括号切出 busy 分支的块内源码，直接断言里面没有任何清计数/清降级态的赋值。
+      const busyBlock = blockAfter(body, "if (outcome === 'busy')")
       const busyIdx = body.indexOf("outcome === 'busy'")
+      assert.ok(busyBlock && busyBlock.trim().length > 0, '前置：必须能切出 outcome===\'busy\' 分支块')
+      assert.ok(busyBlock.includes('auto.busyRuns'), '前置：切出的块必须就是 busy 分支（含 auto.busyRuns）')
+      assert.ok(!/auto\.fails\s*=[^=]/.test(busyBlock),
+        `busy 分支内不得清 auto.fails（跳过轮不算恢复，否则真实源站故障状态会被抹掉）：${busyBlock}`)
+      assert.ok(!/auto\.degraded\s*=[^=]/.test(busyBlock),
+        `busy 分支内不得改 auto.degraded（同上）：${busyBlock}`)
+      // 正向对照：成功分支仍必须清（防「为了过断言把重置整段删掉」的假修复）。
       const okIdx = body.indexOf('auto.fails = 0', busyIdx)
       const degradedReset = body.indexOf('auto.degraded = false', busyIdx)
-      assert.ok(busyIdx >= 0 && okIdx > busyIdx && degradedReset > busyIdx,
+      assert.ok(okIdx > busyIdx && degradedReset > busyIdx,
         '清 auto.fails/degraded 只能出现在成功分支（busy 分支之后），不得被跳过轮触发')
     } else {
       assert.ok(consoleSrc.includes('autoRunOutcome') && consoleSrc.includes('auto.busyRuns'),
@@ -8849,6 +8902,28 @@ async function main () {
     // 真文件也过一遍：变异沙箱里读到的就是插桩后的 console.js。
     const realSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     assert.ok(functionBodyOf(realSrc, 'tickAuto').length > 500, '真实 console.js 上的 tickAuto 函数体必须取得非空')
+  })
+
+  // ── R1-r3 #2：分支块定位器自测（字符串/注释里的花括号不得让配平提前收尾）──
+  // 切短了比切错了更危险：截断后的块天然「不含」目标字段，负向断言会假绿。故除了「不含 auto.fails」，
+  // 还必须断言「含注释/字符串之后的那行」——证明扫描器真的越过了那些伪花括号。
+  await aok('R1-r3 分支块定位器: 字符串与注释里的花括号不参与配平，切出的恰好是 busy 分支', () => {
+    const src = [
+      "if (outcome === 'busy') {",
+      '  auto.busyRuns += 1',
+      "  console.warn('skip { not a block }')",
+      '  // } 注释里的花括号',
+      '  /* } */ auto.lastBusyAt = 1',
+      '} else {',
+      '  auto.fails = 0',
+      '}'
+    ].join('\n')
+    const block = blockAfter(src, "if (outcome === 'busy')")
+    assert.ok(block && block.includes('auto.busyRuns'), `必须切出 busy 分支：${block}`)
+    assert.ok(block.includes('auto.lastBusyAt'),
+      `字符串/注释里的花括号不得让配平提前收尾（块被截短后负向断言会假绿）：${block}`)
+    assert.ok(!block.includes('auto.fails'), `不得把 else 分支吞进来：${block}`)
+    assert.strictEqual(blockAfter(src, 'if (outcome === \'nope\')'), null, '锚点不存在必须返回 null（不静默返回空串）')
   })
 
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {

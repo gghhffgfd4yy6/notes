@@ -4972,8 +4972,36 @@ function makeLockApp (dir, over = {}) {
 
 const lockPathOf = (dir) => path.join(dir, 'run.lock')
 const readLockFrame = (dir) => JSON.parse(lockFs.readFileSync(lockPathOf(dir), 'utf8'))
-// > 本机 pid_max 常见取值（4194304）的 pid：process.kill 必抛 ESRCH ⇒ 稳定复现「持有进程已死」。
-const RUN_LOCK_DEAD_PID = 4194300
+/** 找一个**本机确定不存在**的 PID（R1-r3 #5）。
+ *  旧写法硬编码 4194300 并假设「它一定没被用」——pid_max 调大过的机器/容器里它可能正好是活进程，
+ *  `process.kill(pid, 0)` 成功 ⇒ 「死进程留下的锁可接管」用例随机假红（且红得没法复现）。
+ *  这里不猜：读 pid_max 定上界，扫 /proc 收集在册 pid，自上而下取第一个既不在册、`kill(pid,0)` 又
+ *  确实返回 ESRCH 的值——两条独立证据都指向「不存在」才用它。极端情况下（/proc 不可用且 kill 行为
+ *  异常）直接抛错而不是退化成一个可疑的硬编码值。 */
+const findDeadPid = () => {
+  let upper = 4194304 // Linux 默认 pid_max；读不到就按它当上界（kill 复核仍然生效）
+  try {
+    const raw = Number(lockFs.readFileSync('/proc/sys/kernel/pid_max', 'utf8').trim())
+    if (Number.isSafeInteger(raw) && raw > 2) upper = raw
+  } catch (e) { /* 非 Linux / 无 /proc：用默认上界 */ }
+  const live = new Set()
+  try {
+    for (const name of lockFs.readdirSync('/proc')) {
+      if (/^[0-9]+$/.test(name)) live.add(Number(name))
+    }
+  } catch (e) { /* 无 /proc：只靠 kill(pid,0) 复核 */ }
+  for (let pid = upper - 1; pid > 1; pid--) {
+    if (live.has(pid)) continue
+    try {
+      process.kill(pid, 0)
+    } catch (e) {
+      if (e && e.code === 'ESRCH') return pid
+      continue // EPERM 等 = 进程其实存在（无权限），换下一个
+    }
+  }
+  throw new Error('找不到确定不存在的 PID：/proc 与 kill(pid,0) 未给出一致结论')
+}
+const RUN_LOCK_DEAD_PID = findDeadPid()
 
 check('R1 锁：空目录首次获取成功（0o600 + pid/startedAt/token），且不残留临时文件', () => {
   const dir = mkTmpFixture('runlock-new-')
@@ -5273,12 +5301,51 @@ check('R1 锁：token 不匹配的释放不删别人的锁（归属判定）', (
   assert.deepStrictEqual(readLockFrame(dir), foreign, '别人的锁内容不得被改写')
 })
 
-check('R1 锁：缓存目录不可写（EACCES）必须 fail-loud 抛出，不得伪装成 busy', () => {
+// R1-r3 #1：这条用例必须同时守住「真实 FS 故障 ⇒ 抛给入口」和「两种身份都成立」。
+// 旧写法只靠 chmod 0o500 制造 EACCES——本仓门禁以 root 跑（pid1 guard，见 RUNBOOK gate 阶段），
+// root 有 CAP_DAC_OVERRIDE，0500 目录照样能 open('wx') ⇒ assert.throws 落空，整条门禁红。
+// 现在分两段：① ENOTDIR 段与身份无关（root 也无法让普通文件充当目录），两种身份都跑；
+// ② EACCES 段仅非 root 有意义（root 下 chmod 拦不住写），root 身份如实标注为何不跑，不整条 skip。
+check('R1 锁：缓存目录不可用（ENOTDIR / EACCES）必须 fail-loud 抛出，不得伪装成 busy', () => {
+  // ① ENOTDIR：缓存目录的**父路径是普通文件**。mkdirSync/openSync 都会得到 ENOTDIR。
+  //    这是真实的内核拒绝（不是注入的桩），root 与非 root 表现一致——CAP_DAC_OVERRIDE 能绕过
+  //    权限位，但不能让一个普通文件变成目录。
+  const notDirRoot = mkTmpFixture('runlock-notdir-')
+  const blocker = path.join(notDirRoot, 'blocker')
+  lockFs.writeFileSync(blocker, 'not a directory')
+  const notDirApp = makeLockApp(path.join(blocker, 'cache'))
+  assert.throws(() => notDirApp._acquireRunLock(), (e) => e && e.code === 'ENOTDIR',
+    '父路径是普通文件时取锁必须抛 ENOTDIR（被折叠成 busy 就等于「目录坏了却每天静默跳过」）')
+
+  // ② EACCES：让 open('wx') 被内核拒绝。
+  //    非 root：目录改成 0o500，DAC 直接生效。
+  //    root：CAP_DAC_OVERRIDE 让 0o500 形同虚设，必须换一个**不由 DAC 决定**的拒绝来源——只读
+  //    伪文件系统（sysfs）。`/sys/kernel` 下 open(O_CREAT) 对 root 也返回 EACCES（只读挂载 + sysfs
+  //    不允许新建节点），失败点仍在「建锁」那一步（createRunLockFile 的 open('wx')），语义与
+  //    chmod 段完全一致。若某个环境里找不到这样的目录，则如实打印说明（ENOTDIR 段仍守着同一条语义）。
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    const roDir = ['/sys/kernel', '/sys/fs/cgroup'].find((cand) => {
+      try {
+        const probe = path.join(cand, `run.lock.probe.${process.pid}.tmp`)
+        const fd = lockFs.openSync(probe, 'wx', 0o600) // 竟然能建：这个候选点不是只读，换下一个
+        try { lockFs.closeSync(fd) } catch (e) { /* 探测 fd 关不掉不影响判定 */ }
+        try { lockFs.unlinkSync(probe) } catch (e) { /* 探测文件删不掉也不影响判定 */ }
+        return false
+      } catch (e) {
+        return Boolean(e) && e.code === 'EACCES'
+      }
+    })
+    if (roDir) {
+      const roApp = makeLockApp(roDir)
+      assert.throws(() => roApp._acquireRunLock(), (e) => e && e.code === 'EACCES',
+        `root 下改用只读伪文件系统（${roDir}）制造 EACCES：写锁的真实故障必须抛给入口`)
+      return
+    }
+    console.log('  ℹ️ 以 root 运行且找不到对 root 也只读的目录：EACCES 段由 ENOTDIR 段代表同一语义')
+    return
+  }
   const dir = mkTmpFixture('runlock-eacces-')
   const app = makeLockApp(dir)
-  // 真实 EACCES：把目录改成只读，建锁（open 'wx'）必然被内核拒绝。
-  // 旧用例靠注入一个 openSync 抛错的 fs 桩——R1 返工 #7 之后锁操作固定用本模块的 node:fs，
-  // 桩 fs 不再参与锁路径（这正是「只注入部分 fs 也不崩」的那条修复），故改打真实权限。
   const mode = lockFs.statSync(dir).mode & 0o777
   lockFs.chmodSync(dir, 0o500)
   try {
@@ -5287,6 +5354,28 @@ check('R1 锁：缓存目录不可写（EACCES）必须 fail-loud 抛出，不�
   } finally {
     lockFs.chmodSync(dir, mode)
   }
+})
+
+// R1-r3 #3：释放路径必须与判据同一条大小上限（RUN_LOCK_MAX_BYTES=4096）。
+// 造一把「内容其实是自己的、但体积超限」的锁（合法 JSON + 大段尾部空白，JSON.parse 照样成功）：
+// 无上限的旧实现会整读、认领、删除；新实现必须按「不是我写的那一帧」拒绝（返回 false、不删）。
+check('R1 锁：锁文件超过 4096 字节时释放拒绝整读（返回 false、不删），上限内同一把锁仍能正常释放', () => {
+  const dir = mkTmpFixture('runlock-oversize-release-')
+  const app = makeLockApp(dir)
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `前置：必须拿到锁：${JSON.stringify(got)}`)
+  const frame = readLockFrame(dir)
+  const oversize = JSON.stringify(frame) + ' '.repeat(8 * 1024)
+  assert.ok(Buffer.byteLength(oversize) > 4096, '前置：构造的锁文件必须真的超过 4096 字节')
+  lockFs.writeFileSync(lockPathOf(dir), oversize, { mode: 0o600 })
+  assert.strictEqual(app._releaseRunLock(got.token), false,
+    '超限锁文件不得被整读并当成自己的锁删掉（判据 4 KiB、处置也必须 4 KiB）')
+  assert.ok(lockFs.existsSync(lockPathOf(dir)), '超限锁文件必须留在盘上（不删）')
+  assert.strictEqual(lockFs.readFileSync(lockPathOf(dir), 'utf8'), oversize, '超限锁内容一个字节都不能改')
+  // 对照：同一帧压回上限内 ⇒ 正常释放。证明上面的 false 是「按上限拒绝」，不是「永远拒绝释放」。
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(frame), { mode: 0o600 })
+  assert.strictEqual(app._releaseRunLock(got.token), true, '上限内的同一把锁必须能正常释放')
+  assert.ok(!lockFs.existsSync(lockPathOf(dir)), '正常释放后不得残留 run.lock')
 })
 
 check('R1 锁：只用注入 fs 的能力子集时锁仍能工作（缺 openSync/linkSync 不得崩），fsync 不支持只降级告警', () => {
@@ -5299,20 +5388,30 @@ check('R1 锁：只用注入 fs 的能力子集时锁仍能工作（缺 openSync
   assert.strictEqual(got.ok, true, `只注入部分 fs 也必须能拿锁：${JSON.stringify(got)}`)
   assert.strictEqual(app._releaseRunLock(got.token), true, '释放同样不得依赖注入的 fs')
   // fsync 在 FUSE/网络卷上可能返回 ENOTSUP/EINVAL：只降级（warn），不让每一轮都硬失败。
+  // R1-r3 #4：只装**一次**桩、用可变状态切换「这轮要抛哪个错误」。旧写法是「恢复 realFsync →
+  // 立刻换上新桩」，两次赋值之间没有任何读取 ⇒ CodeQL 报「Useless assignment to property
+  // fsyncSync」（那段「恢复」其实也没恢复过），而且降级分支是否真被驱动看不出来。现在桩一直
+  // 装到本节结束、finally 一次性恢复原函数，并用 fsyncCalls 计数证明两个分支都真的走到了桩。
   const realFsync = lockFs.fsyncSync
-  lockFs.fsyncSync = () => { const e = new Error('ENOTSUP: fsync not supported'); e.code = 'ENOTSUP'; throw e }
+  let fsyncError = null
+  let fsyncCalls = 0
+  lockFs.fsyncSync = (fd) => {
+    fsyncCalls += 1
+    if (fsyncError) throw fsyncError
+    return realFsync.call(lockFs, fd)
+  }
+  const fsyncErrorOf = (code) => { const e = new Error(`${code}: fsync failed`); e.code = code; return e }
   try {
+    // ① 降级分支：ENOTSUP ⇒ 只 warn，锁仍算建成（fsync 只关乎掉电耐久性）。
+    fsyncError = fsyncErrorOf('ENOTSUP')
     const degraded = app._acquireRunLock()
     assert.strictEqual(degraded.ok, true, `fsync 不支持时必须降级继续（锁已独占创建）：${JSON.stringify(degraded)}`)
     assert.strictEqual(app._releaseRunLock(degraded.token), true, '降级后仍必须能正常释放')
-  } finally {
-    lockFs.fsyncSync = realFsync
-  }
-  // 反例：ENOTSUP 之外的 fsync 故障（EIO）是真故障，必须原样抛，不得被降级吞掉。
-  lockFs.fsyncSync = () => { const e = new Error('EIO: i/o error'); e.code = 'EIO'; throw e }
-  try {
+    // ② 反例：ENOTSUP 之外的 fsync 故障（EIO）是真故障，必须原样抛，不得被降级吞掉。
+    fsyncError = fsyncErrorOf('EIO')
     assert.throws(() => app._acquireRunLock(), (e) => e && e.code === 'EIO',
       'fsync 的真实 IO 错误必须抛出（只对 ENOTSUP/EINVAL 一族降级）')
+    assert.ok(fsyncCalls >= 2, `前置：两个分支都必须真的调用到 fsync（实测 ${fsyncCalls} 次）`)
   } finally {
     lockFs.fsyncSync = realFsync
   }
@@ -5403,6 +5502,38 @@ checkAsync('R1 行为：正常一轮跑完后 run.lock 被释放（finally），
     if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
     else process.env.XBK_CACHE_DIR = prevEnvDir
   }
+})
+
+// R1-r3 #6：释放失败（unlink EACCES/EROFS）时锁会以**本进程 pid** 留在盘上，常驻入口必须先看到
+// 这个事实才能停机。旧实现只 console.warn：常驻进程下一轮 run() 只看到「活着的持有者」⇒ 每轮
+// skipped，而常驻循环把 skipped 当正常轮 ⇒ 永久空转。故 App.run 必须把它写进摘要。
+checkAsync('R1 行为：释放 run.lock 失败（EACCES）⇒ 摘要带 lockReleaseFailed，锁仍留在盘上', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('rel-fail-a', '标题甲')])
+    const realUnlink = lockFs.unlinkSync
+    let blockedAt = null
+    lockFs.unlinkSync = function (target) {
+      // 按文件名认锁（不按拼好的绝对路径）：harness 的缓存目录可能经 realpath 规范化。
+      if (path.basename(String(target)) === 'run.lock') {
+        blockedAt = String(target)
+        const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+        e.code = 'EACCES'
+        throw e
+      }
+      return realUnlink.call(lockFs, target)
+    }
+    try {
+      const { summary, warns } = await runWithWarnings(h.App)
+      assert.ok(blockedAt, '前置：释放路径必须真的尝试删过 run.lock（否则没打到故障点）')
+      assert.strictEqual(summary.lockReleaseFailed, true,
+        `释放失败必须标在摘要上（常驻入口据此走失败路径停机）：${JSON.stringify(summary)}`)
+      assert.strictEqual(summary.pushed, 1, `锁释放失败不得改写本轮推送结果：${JSON.stringify(summary)}`)
+      assert.ok(warns.some(l => l.includes('run 锁释放失败')), `原来那条告警必须保留：${JSON.stringify(warns)}`)
+      assert.ok(realFs.existsSync(blockedAt), '前置：锁确实还留在盘上（这正是常驻会被永久饿死的形态）')
+    } finally {
+      lockFs.unlinkSync = realUnlink
+    }
+  })
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====

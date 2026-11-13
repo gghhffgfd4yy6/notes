@@ -389,6 +389,18 @@ async function runResident (app, controller) {
   consecutiveRetryableFailures = 0
   const runOnce = async () => {
     const summary = await app.run()
+    // R1-r3 #6：锁没释放（unlink EACCES/EROFS…）时锁会以**本进程 pid** 留在盘上直到进程退出，
+    // 下一轮 run() 只会看到「活着的持有者」⇒ 每轮 skipped。若继续按下面的 busy 分支当正常轮，
+    // 常驻任务就永久空转（不推送、不告警、也不重启）。这里必须走失败路径：抛 permanent 错误 ⇒
+    // handleFailure 置 residentExitCode=1 并 abort ⇒ 进程非零退出 ⇒ systemd/青龙重启起新进程，
+    // 新进程按「持有者已死」接管那把残留锁。
+    if (summary && summary.lockReleaseFailed === true) {
+      const error = new Error('run 锁释放失败：run.lock 仍以本进程 pid 留在缓存目录，继续常驻会每轮被判定「已有运行」而永久跳过；按不可恢复错误停机，交由重启器起新进程接管')
+      error.failureKind = 'permanent'
+      error.failureReason = 'RUN_LOCK_RELEASE_FAILED'
+      error.runLockReleaseFailed = true
+      throw error
+    }
     // R1：run 级锁 busy ⇒ 按**正常一轮**处理：清零连续失败计数、不叠加退避、不停机，
     // 下一轮照常轮询（锁一释放自然接上）。当成失败会触发指数退避，busy 期间等于自己把自己
     // 越推越远；当成 permanent 更会直接停掉常驻循环。
@@ -412,6 +424,15 @@ async function runResident (app, controller) {
   }
 
   const handleFailure = async (error) => {
+    // R1-r3 #6：本轮业务抛错、同时锁又没释放 —— 那条错误上会带 runLockReleaseFailed 标记。
+    // 必须最优先判 permanent：常驻进程若退避重试，下一轮只会看到「本进程仍持有锁」⇒ 永久 skipped。
+    // （summary 路径的锁释放失败在 runOnce 里已经转成 permanent 抛出，这里兜住「跑炸 + 锁残留」的叠加态。）
+    if (error && error.runLockReleaseFailed === true) {
+      residentExitCode = 1
+      console.error(`本轮 run 锁释放失败，锁会以本进程 pid 残留 ⇒ 继续常驻会永久跳过；停止常驻交由重启器接管：${error && error.message ? error.message : String(error)}`)
+      controller.abort()
+      return
+    }
     const decision = classifyFailure(error)
     const info = decision.info || summarizeError(error)
     const detail = describeFailure(info, error)
