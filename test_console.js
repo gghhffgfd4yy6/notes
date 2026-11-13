@@ -97,7 +97,7 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 }
 
 const {
-  createConsole, listenErrorHint, consoleStateDir, finishRun, isValidToken, timingSafeEqualStr,
+  createConsole, listenErrorHint, consoleStateDir, finishRun, autoRunOutcome, isValidToken, timingSafeEqualStr,
   acquireLock, acquireLockResult, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -371,6 +371,48 @@ function functionBodyOf (text, fnName) {
     }
   }
   return ''
+}
+
+// ── R1-r3 #2：按锚点切出**单个分支块**的源码（花括号配平）──
+// 为什么需要它：`indexOf(...) > busyIdx` 这类「谁在后面」的断言证明不了「不在里面」——把
+// `auto.fails = 0` 塞进 busy 分支后，它照样出现在 busyIdx 之后，断言全绿。要守「跳过轮不得
+// 清失败计数/降级态」，必须真的切出 `if (outcome === 'busy') { ... }` 的块内源码再断言不含目标字段。
+// 扫描时跳过字符串/模板字面量与注释：`'{'`、`// }` 这类文本会让朴素配平提前收尾（切出的块变短，
+// 断言退化成「看不见要检查的代码」）。
+function blockAfter (text, marker, from = 0) {
+  const at = text.indexOf(marker, from)
+  if (at < 0) return null
+  const open = text.indexOf('{', at + marker.length - 1)
+  if (open < 0) return null
+  let depth = 0
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '"' || ch === "'" || ch === '`') {
+      for (i++; i < text.length; i++) {
+        if (text[i] === '\\') { i++; continue }
+        if (text[i] === ch) break
+      }
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      const nl = text.indexOf('\n', i)
+      if (nl < 0) return null
+      i = nl
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2)
+      if (end < 0) return null
+      i = end + 1
+      continue
+    }
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return text.slice(open + 1, i)
+    }
+  }
+  return null
 }
 async function aok (name, fn) {
   const label = caseLabel(name)
@@ -7081,6 +7123,109 @@ async function main () {
       assert.ok(/child\.on\('close'[\s\S]{0,400}finishRun\(record, code\)/.test(src), 'close 必须幂等补收尾')
     }
   })
+  await aok('R1: 自动运行收尾判定把 RUN_BUSY 跳过单列（不清失败计数/不算恢复），并真的接在 tickAuto 上', () => {
+    const busyLine = '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过'
+    // 一次性 spawn 路径：只能从子进程输出里认（退出码是 0，与真成功同形）。
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: `开始运行…\n${busyLine}\n` }), 'busy',
+      'exit 0 + busy 行 ⇒ busy（旧实现按 exitCode 判成功：清 fails、清 degraded、打「已恢复」）')
+    // 常驻 worker 路径：summary 是机器信号（不依赖文案）。
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: '', summary: { skipped: true, reason: 'RUN_BUSY' } }), 'busy',
+      'worker 回报 summary.skipped ⇒ busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: '本轮成功：推送 3 条' }), 'ok', '正常 exit 0 ⇒ ok')
+    assert.strictEqual(autoRunOutcome({ exitCode: 1, output: busyLine }), 'failed', '非零退出必须记失败，不能被 busy 行盖掉')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: busyLine, timedOut: true }), 'failed', '超时轮不得当 busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: busyLine, cancelled: true }), 'failed', '被取消的轮次不得当 busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: 0, output: busyLine, spawnError: true }), 'failed', 'spawn 失败不得当 busy')
+    assert.strictEqual(autoRunOutcome({ exitCode: null, output: '' }), 'failed', '没拿到退出码按失败处理（不假装恢复）')
+    // 接线：tickAuto 的收尾必须走 autoRunOutcome 且 busy 单独记账（不清 auto.fails / degraded）。
+    const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    if (process.env.XBK_MUTATION_CHILD !== '1') {
+      const body = functionBodyOf(consoleSrc, 'tickAuto')
+      assert.ok(body.includes('autoRunOutcome(record)'), 'tickAuto 收尾必须用 autoRunOutcome 判定（只看 exitCode 即回退旧缺陷）')
+      assert.ok(body.includes("outcome === 'busy'") && body.includes('auto.busyRuns'),
+        'busy 必须单列计数（auto.busyRuns），不能进成功分支')
+      // R1-r3 #2：光看「auto.fails = 0 出现在 busy 段之后」证明不了它不在 busy 分支里——插进
+      // busy 分支块后位置断言照样全绿。这里按花括号切出 busy 分支的块内源码，直接断言里面没有
+      // 任何清计数/清降级态的赋值（比位置断言强：块内任何位置都逃不掉）。
+      const busyBlock = blockAfter(body, "if (outcome === 'busy')")
+      assert.ok(busyBlock && busyBlock.trim().length > 0, '前置：必须能切出 outcome===\'busy\' 分支块')
+      assert.ok(busyBlock.includes('auto.busyRuns'), '前置：切出的块必须就是 busy 分支（含 auto.busyRuns）')
+      assert.ok(!/auto\.fails\s*=[^=]/.test(busyBlock),
+        `busy 分支内不得清 auto.fails（跳过轮不算恢复，否则真实源站故障状态会被抹掉）：${busyBlock}`)
+      assert.ok(!/auto\.degraded\s*=[^=]/.test(busyBlock),
+        `busy 分支内不得改 auto.degraded（同上）：${busyBlock}`)
+      // 正向对照不能靠「这两行的源码位置在 busy 分支之后」：R1-r7 B 把 auto.fails=0 / auto.degraded=false
+      // 整段提到 if/else **之后无条件执行**（v3.422 缺陷原样复活），busyBlock 四条负向断言与
+      // 位置断言照样全绿 —— 源码顺序断言证明不了「只有成功分支才重置」。真正的守卫是紧随其后的
+      // 行为用例「tickAuto busy 轮保持原值 / ok 轮清零」（注入 worker 真跑两轮 + 读 /api/auto）。
+      // 这里只保留「不得把重置整段删掉」的最小锚点（删掉即假修复）。
+      assert.ok(body.includes('auto.fails = 0') && body.includes('auto.degraded = false'),
+        '成功分支必须仍清 auto.fails/degraded（防「为了过断言把重置整段删掉」的假修复）')
+    } else {
+      assert.ok(consoleSrc.includes('autoRunOutcome') && consoleSrc.includes('auto.busyRuns'),
+        '变异档必须仍能看到自动运行收尾判定标识符')
+    }
+  })
+  // R1-r7 #1（B 路审查）：上一条只守住「busy 分支块内没有重置」，但把两行重置提到 if/else 之后
+  // 无条件执行（v3.422 缺陷原样复活）仍全绿。这条**真跑两轮**：注入常驻 worker（第一轮回报
+  // RUN_BUSY 机器信号，第二轮正常 exit 0），经 createConsole 的 tickAuto 驱动真实收尾，
+  // 再从 /api/auto 读 auto 快照 —— busy 轮必须保持 fails/degraded 原值，ok 轮才清零。
+  await aok('R1-r7 行为：tickAuto 的 busy 轮保持 auto.fails/degraded，ok 轮才清零（真跑两轮，不看源码顺序）', async () => {
+    const dir = tmpDir()
+    // 起始态 = 真实源站已连续失败 5 轮并进入 10 秒降级重试（busy 轮不得把它抹成「已恢复」）。
+    fs.writeFileSync(path.join(dir, 'console-auto.json'),
+      JSON.stringify({ on: true, interval: 3, degraded: true, fails: 5, updatedAt: Date.now() }), { mode: 0o600 })
+    const results = [
+      { ok: true, exitCode: 0, summary: { skipped: true, reason: 'RUN_BUSY' } },
+      { ok: true, exitCode: 0 }
+    ]
+    let round = 0
+    const worker = {
+      pid: 0,
+      hasChild: false,
+      cleanupOrphans () {},
+      dispose () {},
+      cancelRound () {},
+      shutdown: async () => {},
+      run: async () => results[Math.min(round++, results.length - 1)]
+    }
+    const inst = createConsole({ token: TOKEN, stateDir: dir, createWorker: () => worker })
+    const port = await listen(inst.server)
+    const autoState = async () => JSON.parse((await request(port, 'GET', '/api/auto', { token: TOKEN })).text).auto
+    // tickAuto 的收尾在 250ms 轮询回调里：等「记账完成」而不是固定 sleep（慢机也不假红）。
+    const waitFor = async (pred, label) => {
+      const deadline = Date.now() + 5000
+      let last = null
+      while (Date.now() < deadline) {
+        last = await autoState()
+        if (pred(last)) return last
+        await new Promise((resolve) => setTimeout(resolve, 40))
+      }
+      assert.fail(`${label} 超时未达成：${JSON.stringify(last)}`)
+    }
+    try {
+      const init = await autoState()
+      assert.strictEqual(init.fails, 5, `前置：起始态必须是连续失败 5 轮：${JSON.stringify(init)}`)
+      assert.strictEqual(init.degraded, true, '前置：起始态必须处于降级重试')
+      inst.tickAuto()
+      const afterBusy = await waitFor((s) => s.runs === 1 && s.busyRuns === 1, 'busy 轮记账')
+      assert.strictEqual(afterBusy.fails, 5,
+        `busy 轮不得清 auto.fails（跳过轮不是恢复）：${JSON.stringify(afterBusy)}`)
+      assert.strictEqual(afterBusy.degraded, true,
+        `busy 轮不得清 auto.degraded（源站故障状态必须保留）：${JSON.stringify(afterBusy)}`)
+      inst.tickAuto()
+      const afterOk = await waitFor((s) => s.runs === 2 && s.fails === 0, 'ok 轮清零')
+      assert.strictEqual(afterOk.degraded, false, `ok 轮必须清降级态（真恢复）：${JSON.stringify(afterOk)}`)
+      assert.strictEqual(afterOk.busyRuns, 1, 'busy 计数只增不减，ok 轮不得重置')
+    } finally {
+      // 关掉自动运行清掉排程 timer：否则 3s/10s 后的重试会在后续用例里再跑一轮。
+      await request(port, 'POST', '/api/auto', {
+        token: TOKEN,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ on: false })
+      }).catch(() => {})
+    }
+  })
   await aok('readRunHistory: CANCEL 取消留痕成独立条目且不污染相邻轮（审查 #229 S7/D1-N3）', () => {
     const { readRunHistory } = require('./scripts/status')
     const dir = tmpDir()
@@ -8818,6 +8963,28 @@ async function main () {
     // 真文件也过一遍：变异沙箱里读到的就是插桩后的 console.js。
     const realSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     assert.ok(functionBodyOf(realSrc, 'tickAuto').length > 500, '真实 console.js 上的 tickAuto 函数体必须取得非空')
+  })
+
+  // ── R1-r3 #2：分支块定位器自测（字符串/注释里的花括号不得让配平提前收尾）──
+  // 切短了比切错了更危险：截断后的块天然「不含」目标字段，负向断言会假绿。故除了「不含 auto.fails」，
+  // 还必须断言「含注释/字符串之后的那行」——证明扫描器真的越过了那些伪花括号。
+  await aok('R1-r3 分支块定位器: 字符串与注释里的花括号不参与配平，切出的恰好是 busy 分支', () => {
+    const src = [
+      "if (outcome === 'busy') {",
+      '  auto.busyRuns += 1',
+      "  console.warn('skip { not a block }')",
+      '  // } 注释里的花括号',
+      '  /* } */ auto.lastBusyAt = 1',
+      '} else {',
+      '  auto.fails = 0',
+      '}'
+    ].join('\n')
+    const block = blockAfter(src, "if (outcome === 'busy')")
+    assert.ok(block && block.includes('auto.busyRuns'), `必须切出 busy 分支：${block}`)
+    assert.ok(block.includes('auto.lastBusyAt'),
+      `字符串/注释里的花括号不得让配平提前收尾（块被截短后负向断言会假绿）：${block}`)
+    assert.ok(!block.includes('auto.fails'), `不得把 else 分支吞进来：${block}`)
+    assert.strictEqual(blockAfter(src, 'if (outcome === \'nope\')'), null, '锚点不存在必须返回 null（不静默返回空串）')
   })
 
   await aok('结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）', () => {

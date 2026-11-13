@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.420 — 关停/取消不再触发一次性重跑 *******
+//* ******* 线报酷推送脚本 v3.427 — 常驻遇接管哨兵残留即停机 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -365,7 +365,7 @@ const FilterStore = profile3Require('xbk_filter_store', () => require('./xbk_fil
 // ============================================================
 // 🚀 App — 主流程层
 // ============================================================
-const { createApp } = profile3Require('xbk_app', () => require('./xbk_app'))
+const { createApp, formatRunBusyLine } = profile3Require('xbk_app', () => require('./xbk_app'))
 const App = createApp({
   Config,
   Utils,
@@ -401,6 +401,13 @@ profile3BootMark('module-load-complete') // 时点：全部本地模块 require 
 
 async function runSingleEntry (app = App) {
   const summary = await app.run()
+  // R1：run 级锁 busy（另一进程正在跑同一缓存目录）**不是失败**——打一行提示、退出码保持 0，
+  // 也不进 classifySummary 的失败分支（它的 failed=0 本就会返回 null，这里显式早退是为了
+  // 让「本轮跳过」在 cron 日志里可读，而不是一片空白）。
+  if (summary && summary.skipped === true) {
+    console.log(formatRunBusyLine(summary))
+    return summary
+  }
   // 单次入口与常驻入口统一失败语义：App.run 保持返回摘要兼容，
   // 但待推送项全部失败时设置非零退出码，不能让调度器误认为成功。
   try {
@@ -523,9 +530,24 @@ function resetRunStateForWorker () {
 function safeSummaryForWorker (summary) {
   try { return JSON.parse(JSON.stringify(summary)) } catch (e) {
     const picked = {}
-    for (const key of ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'cacheSaved']) {
+    // R1-r4 #4：白名单必须含**轮次判据**，不能只有计数：`skipped` 是控制台认「本轮因 RUN_BUSY
+    // 跳过」的唯一机器信号（scripts/console.js 的 autoRunOutcome），`lockReleaseFailed` 是常驻
+    // worker 停机判据。旧白名单只有 total…cacheSaved，兜底一旦触发（summary 里混进循环引用等），
+    // busy 轮被降级成「ok + exitCode 0」——控制台按成功清 auto.fails、清降级态并打印「✅ 自动运行
+    // 已恢复」，正是 v3.422 修掉的那个缺陷重新出现。
+    // R1-r5 #1：`sentinelReleaseFailed`（接管哨兵没删掉）同理是停机判据，兜底时不能丢。
+    for (const key of ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'cacheSaved',
+      'skipped', 'reason', 'lockReleaseFailed', 'sentinelReleaseFailed']) {
       const value = summary ? summary[key] : undefined
       if (value === null || ['number', 'boolean', 'string'].includes(typeof value)) picked[key] = value
+    }
+    // holder 是浅对象（{ pid, startedAt }）：只搬这两个数值，不把任意对象透传进协议行。
+    const holder = summary ? summary.holder : null
+    if (holder && typeof holder === 'object' && Number.isSafeInteger(holder.pid)) {
+      picked.holder = {
+        pid: holder.pid,
+        startedAt: Number.isSafeInteger(holder.startedAt) ? holder.startedAt : null
+      }
     }
     return picked
   }
@@ -562,6 +584,37 @@ async function runWorkerCommand (line) {
   }
   const exitCode = process.exitCode === 1 ? 1 : 0
   process.exitCode = prevExitCode
+  // R1-r4 #1：锁释放失败必须让 worker 退出，与上面 catch 同形状。锁会以**本进程 pid** 留在盘上，
+  // 下一轮 _acquireRunLock() 只看到「持有者还活着（就是自己）」⇒ busy ⇒ runSingleEntry 返回
+  // skipped:true；旧实现仍回 {ok:true, exitCode:0}，控制台按 busy 只加一次 auto.busyRuns 就完了
+  // （不清也不报错、不重启 worker）——永久空转、零推送、零报错，还把原因归给一个并不存在的并发进程。
+  // 现在返回 stop:true + 退出码 1：worker 退出，控制台下一轮拉起新进程，新进程按「持有者已死」
+  // 接管那把残留锁（与 qinglong/xbk_push.js 的 permanent 停机语义一致）。
+  if (summary && summary.lockReleaseFailed === true) {
+    return {
+      reply: {
+        ok: false,
+        error: '本轮 run 锁释放失败：run.lock 仍以本进程 pid 留在缓存目录，继续常驻会每轮被判「已有运行」而永久跳过；按失败退出，由控制台重启新进程接管'
+      },
+      stop: true,
+      status: 1
+    }
+  }
+  // R1-r5 #1：接管哨兵（run.lock.takeover）没删掉同理——它以**本进程活 pid** 留在缓存目录，
+  // 此后该目录下所有入口的接管都会被 readRunLockState 判成 busy（「已有运行在跑（pid=自己）」），
+  // 死锁再也接管不了。App.run 内部会先尝试按「本进程残留」回收，回收不掉才把事实标出来；到这一步
+  // 说明回收也失败了，继续常驻只会永久空转 ⇒ 按失败退出，由控制台重启新进程（pid 变了 ⇒ 哨兵按
+  // 陈旧可回收）。
+  if (summary && summary.sentinelReleaseFailed === true) {
+    return {
+      reply: {
+        ok: false,
+        error: '本轮接管哨兵释放失败：run.lock.takeover 仍以本进程 pid 留在缓存目录，继续常驻会让后续接管永远被判「已有运行」；按失败退出，由控制台重启新进程回收'
+      },
+      stop: true,
+      status: 1
+    }
+  }
   return {
     reply: { ok: true, summary: safeSummaryForWorker(summary), exitCode, roundMs: Date.now() - startedAt }
   }
@@ -574,7 +627,14 @@ function startWorkerEntry () {
   out.on('error', () => {})
   process.stdin.on('error', () => {})
   let rl = null
+  // exit 只能走一次：`rl.close()` 会**同步**触发下面的 'close' 处理器，而那个处理器里也会调
+  // finish(0)。没有这道闸时「失败路径 stop:true + status:1」会被紧随其后的 finish(0) 覆盖成
+  // 退出码 0（实测：加闸前释放锁失败那一轮本该 exit 1、实际 exit 0）——控制台只看协议行，
+  // 所以一直没人发现；但 SYSTEM_CONTRACT.md 承诺的是「常驻入口走失败路径 ⇒ 退出码非零」。
+  let finishing = false
   const finish = (status) => {
+    if (finishing) return
+    finishing = true
     try { if (rl) rl.close() } catch (e) { /* 已关闭 */ }
     process.exit(status)
   }
@@ -721,6 +781,10 @@ if (typeof module !== 'undefined' && module.exports) {
     // 读取）与它清空的两个单例（Formatter 的单槽 attrSpanCache 在闭包里、FilterEngine 的两个 Map
     // 只在单例上）。生产路径不读 workerResetHooks。
     resetRunStateForWorker,
+    // R1-r4 #4：常驻 worker 摘要兜底白名单的**纯函数**导出。协议级用例要验证「JSON.stringify 抛错
+    // 时 skipped/holder/lockReleaseFailed 仍在」，而在进程内全局替换 JSON.stringify 会连协议行
+    // 自身的序列化一起打坏（writeLine 也用它）。生产路径不读这个导出。
+    safeSummaryForWorker,
     workerResetHooks: {
       setRe2FallbackWarned: (value) => { _re2FallbackWarned = Boolean(value) },
       isRe2FallbackWarned: () => _re2FallbackWarned,

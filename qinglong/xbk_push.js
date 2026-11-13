@@ -377,11 +377,48 @@ function describeFailure (info, error) {
   return parts.join('；')
 }
 
+// R1：run 级锁 busy 的提示文案与控制台/直跑入口**同一句**（实现只有一份：xbk_app.formatRunBusyLine）。
+// 必须惰性 require：--status / --check 两条早退路径刻意不加载应用（那会连带 require fuzzball 等
+// 运行期依赖），只有真出现 busy 才需要这句文案。
+function busyRunLine (summary) {
+  return require('../xbk_app').formatRunBusyLine(summary)
+}
+
 async function runResident (app, controller) {
   residentExitCode = 0
   consecutiveRetryableFailures = 0
   const runOnce = async () => {
     const summary = await app.run()
+    // R1-r3 #6：锁没释放（unlink EACCES/EROFS…）时锁会以**本进程 pid** 留在盘上直到进程退出，
+    // 下一轮 run() 只会看到「活着的持有者」⇒ 每轮 skipped。若继续按下面的 busy 分支当正常轮，
+    // 常驻任务就永久空转（不推送、不告警、也不重启）。这里必须走失败路径：抛 permanent 错误 ⇒
+    // handleFailure 置 residentExitCode=1 并 abort ⇒ 进程非零退出 ⇒ systemd/青龙重启起新进程，
+    // 新进程按「持有者已死」接管那把残留锁。
+    if (summary && summary.lockReleaseFailed === true) {
+      const error = new Error('run 锁释放失败：run.lock 仍以本进程 pid 留在缓存目录，继续常驻会每轮被判定「已有运行」而永久跳过；按不可恢复错误停机，交由重启器起新进程接管')
+      error.failureKind = 'permanent'
+      error.failureReason = 'RUN_LOCK_RELEASE_FAILED'
+      error.runLockReleaseFailed = true
+      throw error
+    }
+    // R1-r5 #1：接管哨兵没删掉（run.lock.takeover 以本进程活 pid 残留）与「锁没释放」同一族：
+    // 该目录后续所有入口的接管都会被判 busy ⇒ 永久空转零推送。App.run 已先试过按本进程残留回收，
+    // 走到这里说明回收也失败 ⇒ 按不可恢复错误停机，让重启器起新进程（pid 变了，哨兵按陈旧可回收）。
+    if (summary && summary.sentinelReleaseFailed === true) {
+      const error = new Error('接管哨兵释放失败：run.lock.takeover 仍以本进程 pid 留在缓存目录，继续常驻会让后续接管永远被判「已有运行」；按不可恢复错误停机，交由重启器起新进程回收')
+      error.failureKind = 'permanent'
+      error.failureReason = 'RUN_LOCK_TAKEOVER_RELEASE_FAILED'
+      error.sentinelReleaseFailed = true
+      throw error
+    }
+    // R1：run 级锁 busy ⇒ 按**正常一轮**处理：清零连续失败计数、不叠加退避、不停机，
+    // 下一轮照常轮询（锁一释放自然接上）。当成失败会触发指数退避，busy 期间等于自己把自己
+    // 越推越远；当成 permanent 更会直接停掉常驻循环。
+    if (summary && summary.skipped === true) {
+      consecutiveRetryableFailures = 0
+      console.log(busyRunLine(summary))
+      return summary
+    }
     const resultFailure = classifySummary(summary)
     if (resultFailure) {
       const error = new Error(resultFailure.info && resultFailure.info.message
@@ -397,6 +434,28 @@ async function runResident (app, controller) {
   }
 
   const handleFailure = async (error) => {
+    // R1-r8 #1：接管陈旧 run 锁的那段临界区抛错、同时哨兵 run.lock.takeover 也没删掉 ——
+    // 那条错误上会带 sentinelReleaseFailed 标记（xbk_app.js 的 _takeoverStaleRunLock finally 里
+    // 「bodyError 存在 ⇒ 标在错误对象上」同口径，SYSTEM_CONTRACT.md 的常驻入口条文 ③）。
+    // 该错误没有 failureKind，会一路走到 classifyOne 被判 retryable ⇒ 指数退避、退出码 0、不 abort；
+    // 而哨兵记着**本进程活 pid** ⇒ 此后所有接管永远 busy ⇒ 常驻永久零推送且看起来一切正常。
+    // 必须与 runLockReleaseFailed 同样按不可恢复停机：置退出码 1，让重启器起新进程（pid 变了，
+    // 残留哨兵按陈旧可回收）。
+    if (error && error.sentinelReleaseFailed === true) {
+      residentExitCode = 1
+      console.error(`本轮接管哨兵释放失败，run.lock.takeover 会以本进程 pid 残留 ⇒ 继续常驻会让后续接管永远被判「已有运行」；停止常驻交由重启器回收：${error.message ? error.message : String(error)}`)
+      controller.abort()
+      return
+    }
+    // R1-r3 #6：本轮业务抛错、同时锁又没释放 —— 那条错误上会带 runLockReleaseFailed 标记。
+    // 必须最优先判 permanent：常驻进程若退避重试，下一轮只会看到「本进程仍持有锁」⇒ 永久 skipped。
+    // （summary 路径的锁释放失败在 runOnce 里已经转成 permanent 抛出，这里兜住「跑炸 + 锁残留」的叠加态。）
+    if (error && error.runLockReleaseFailed === true) {
+      residentExitCode = 1
+      console.error(`本轮 run 锁释放失败，锁会以本进程 pid 残留 ⇒ 继续常驻会永久跳过；停止常驻交由重启器接管：${error.message ? error.message : String(error)}`)
+      controller.abort()
+      return
+    }
     const decision = classifyFailure(error)
     const info = decision.info || summarizeError(error)
     const detail = describeFailure(info, error)
@@ -498,6 +557,12 @@ function runStatus () {
 // 结果与退出码，而不是落进永不退出的循环里。
 async function runDryRunOnce (app) {
   const summary = await app.run()
+  // R1：run 级锁 busy ⇒ 不是 dry-run 结果，**不能**接着打印「共 0 条 / 过滤 0 条」（那会让人
+  // 误以为本轮抓到了 0 条），只回同一句 busy 提示，退出码 0（不是失败）。
+  if (summary && summary.skipped === true) {
+    console.log(busyRunLine(summary))
+    return 0
+  }
   const resultFailure = classifySummary(summary)
   if (!resultFailure) {
     const total = Number(summary && summary.total) || 0

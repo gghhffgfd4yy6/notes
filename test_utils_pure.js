@@ -1477,18 +1477,23 @@ const entryProbe = String.raw`
 'use strict'
 const xbk = require('./xbk_function_v3')
 const errs = []
+const outs = []
 console.error = (...a) => { errs.push(a.map(v => String(v)).join(' ')) }
+console.log = (...a) => { outs.push(a.map(v => String(v)).join(' ')) }
 const cases = [['ok', { pushed: 1, failed: 0 }], ['retryable', { failed: 1, pushed: 0 }], ['permanent', { failed: 1, pushed: 0, failures: [{ message: '接口返回数据格式异常' }] }],
   // C9-002：pushed>0 不再等于成功——1 条成功 + 99 条失败、以及缓存落盘失败，都必须置非零退出码
   ['partial', { pushed: 1, failed: 99, cacheSaved: true, failures: [{ code: 'ETIMEDOUT', message: 'timeout' }] }],
-  ['cachefail', { pushed: 1, failed: 0, cacheSaved: false }]]
+  ['cachefail', { pushed: 1, failed: 0, cacheSaved: false }],
+  // R1：run 级锁 busy —— 不是失败：退出码不动，且必须留一行可读的「已有运行」提示
+  ['skipped', { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, skipped: true, reason: 'RUN_BUSY', holder: { pid: 4242, startedAt: 1760000000000 } }]]
 ;(async () => {
   const out = {}
   for (const c of cases) {
     process.exitCode = undefined // 严格模式下 delete process.exitCode 会抛 TypeError
     const before = errs.length
+    const beforeOut = outs.length
     await xbk.runSingleEntry({ run: async () => c[1] })
-    out[c[0]] = { code: process.exitCode === undefined ? 'unset' : process.exitCode, err: errs.slice(before).join(' | ') }
+    out[c[0]] = { code: process.exitCode === undefined ? 'unset' : process.exitCode, err: errs.slice(before).join(' | '), out: outs.slice(beforeOut).join(' | ') }
   }
   process.exitCode = 0
   process.stdout.write('\nPROBE_JSON:' + JSON.stringify(out))
@@ -1690,6 +1695,11 @@ check('runSingleEntry：无失败不动退出码；全失败置 1 且 retryable/
   assert.strictEqual(out.cachefail.code, 1, '缓存落盘失败必须置非零退出码（旧实现 pushed>0 判绿）')
   assert.strictEqual(out.cachefail.err.startsWith('程序运行失败（CACHE_SAVE_FAILED）：可重试'), true,
     `缓存落盘失败必须点名 CACHE_SAVE_FAILED（实际：${out.cachefail.err}）`)
+  // R1：run 级锁 busy（另一进程正在跑）不是失败——退出码不动、不报失败，但必须留一行可读提示。
+  assert.strictEqual(out.skipped.code, 'unset', 'busy（skipped）不得置非零退出码：调度器不该把它当失败')
+  assert.strictEqual(out.skipped.err, '', `busy 不得输出任何失败文案（实际：${out.skipped.err}）`)
+  assert.strictEqual(out.skipped.out, '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过',
+    `busy 必须打印「已有运行」提示（实际：${out.skipped.out}）`)
 })
 
 // ===== 补测 PlanH：hasValidId 的守卫与类型分支（父代理按 instrumenter 逐 id 定位后补齐）=====

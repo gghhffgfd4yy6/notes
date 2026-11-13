@@ -137,6 +137,16 @@ function timingSafeEqualStr (a, b, cryptoImpl) {
   try { return typeof c?.timingSafeEqual === 'function' && c.timingSafeEqual(ba, bb) } catch (e) { return false }
 }
 
+// R1：run 级锁 busy 行的**唯一**形状。文案由 xbk_app.formatRunBusyLine 生成（`已有运行在跑
+// （pid=…, started=…），本轮跳过`），这里只提供判定——控制台自动运行要靠它把「子进程因另一运行
+// 持锁而跳过」与「真的跑完一轮」区分开：两者退出码都是 0，只看 exitCode 会把锁竞争当成恢复
+// （清失败计数、清降级态、打「已恢复」），把真实源站故障一起掩盖掉。
+// test_app_unit 有一条「正则必须匹配 formatRunBusyLine 的真实输出」的漂移门禁。
+const RUN_BUSY_LINE_RE = /已有运行在跑（pid=[^）]*），本轮跳过/
+function isRunBusyLine (text) {
+  return typeof text === 'string' && RUN_BUSY_LINE_RE.test(text)
+}
+
 // 上海时间戳（YYYY-MM-DD HH:mm:ss）：run.log 行首、访问日志共用同一口径。
 // Intl 惰性构造 + 兜底 ISO：ICU 异常不在模块加载期炸 import（控制台 accessStamp 的历史约束）。
 let SHANGHAI_STAMP_FMT = null
@@ -1349,6 +1359,8 @@ module.exports = {
   normalize,
   timingSafeEqualStr,
   shanghaiStamp,
+  isRunBusyLine,
+  RUN_BUSY_LINE_RE,
   shanghaiDayKey,
   DAY_MS,
   TS_BOUND,

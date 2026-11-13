@@ -151,5 +151,159 @@ function makeResidentApp (runFn) {
     else delete process.env.XBK_RETRY_BACKOFF_CAP_MS
   }
 
+  // 4. R1：run 级锁 busy（summary.skipped）⇒ 按正常一轮处理：不算失败、不退避、不停机。
+  //    判据用**轮次密度**：interval=10ms、300ms 窗口内若被当成可重试失败，第一次退避就是 1s
+  //    （retryBackoffMs(1)=1000），只可能跑到 1 轮；正常轮询应跑出十几轮以上。
+  {
+    runCalls = 0
+    const busyLines = []
+    const origLog = console.log
+    // 30 轮会跨过 runLoop 的 refreshEvery=10 ⇒ 必须把 agents/notify 换成桩，否则 refreshConnections
+    // 会真的去预热衷实域名（本套件其余用例都只跑 <10 轮，踩不到这条）。
+    mockDeps(false)
+    const appBusy = makeResidentApp(async () => {
+      runCalls++
+      return { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, skipped: true, reason: 'RUN_BUSY', holder: { pid: 4242, startedAt: 1760000000000 } }
+    })
+    const ctrlBusy = new AbortController()
+    console.log = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('已有运行在跑')) busyLines.push(line)
+    }
+    const busyTimer = setTimeout(() => ctrlBusy.abort(), 400)
+    try {
+      await runResident(appBusy, ctrlBusy)
+    } finally {
+      clearTimeout(busyTimer)
+      console.log = origLog
+      restoreDeps()
+    }
+    // 400ms/10ms 正常应有几十轮；阈值取 5 留足慢机器余量，同时仍能区分「被当失败」——
+    // retryable 第一次退避就是 1000ms（只可能 1 轮）、permanent 更是只跑 1 轮就停机。
+    assert.ok(runCalls >= 5, `busy 轮不得退避/停机：400ms 内应轮询 ≥5 轮（实际 ${runCalls}；被当失败只剩 1 轮）`)
+    assert.ok(busyLines.length >= 5, `每轮 busy 都要留一行提示（实际 ${busyLines.length}）`)
+    assert.strictEqual(busyLines[0], '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过',
+      `busy 文案必须与直跑/控制台入口同一句（实际：${busyLines[0]}）`)
+    assert.strictEqual(ctrlBusy.signal.aborted, true, '前置：本用例靠自己的定时器停止循环（不是被 permanent 停机）')
+  }
+
+  // 5. R1-r3 #6：summary.lockReleaseFailed（unlink EACCES/EROFS ⇒ 锁以本进程 pid 残留）必须走
+  //    permanent 停机路径。继续常驻会让下一轮 run() 永远看到「活着的持有者」⇒ 每轮 skipped 被当成
+  //    正常轮 ⇒ 永久空转（不推送、不告警、不重启）。判据：abort + 只跑 1 轮 + 留下失败日志 +
+  //    不得打成 busy「跳过」提示。
+  {
+    runCalls = 0
+    const leakLines = []
+    const origLog = console.log
+    const origErr = console.error
+    const appLockLeak = makeResidentApp(async () => {
+      runCalls++
+      return { total: 1, pushed: 1, failed: 0, lockReleaseFailed: true }
+    })
+    const ctrlLeak = new AbortController()
+    console.log = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('已有运行在跑')) leakLines.push(line)
+    }
+    console.error = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('run 锁释放失败')) leakLines.push(line)
+    }
+    const leakTimer = setTimeout(() => ctrlLeak.abort(), 400)
+    try {
+      await runResident(appLockLeak, ctrlLeak)
+    } finally {
+      clearTimeout(leakTimer)
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.strictEqual(ctrlLeak.signal.aborted, true, '锁释放失败必须触发 controller.abort()（不能静默续跑）')
+    assert.strictEqual(runCalls, 1, `锁释放失败后必须停止，只跑 1 轮（实际 ${runCalls}）`)
+    assert.ok(leakLines.some(l => l.includes('run 锁释放失败')),
+      `必须留下「锁释放失败」的失败日志（旧实现只有一条 warn 就继续跑）：${JSON.stringify(leakLines)}`)
+    assert.ok(!leakLines.some(l => l.includes('已有运行在跑')), '不得把「锁残留」当成 busy 正常轮')
+  }
+
+  // 6. R1-r5 #1：summary.sentinelReleaseFailed（接管哨兵 run.lock.takeover 以本进程活 pid 残留）与
+  //    lockReleaseFailed 同一族：此后该缓存目录下所有入口的接管都会被判「已有运行（pid=自己）」⇒
+  //    永久空转零推送。必须同样走 permanent 停机路径，不能被当成正常轮继续跑。
+  {
+    runCalls = 0
+    const sentinelLines = []
+    const origLog = console.log
+    const origErr = console.error
+    const appSentinelLeak = makeResidentApp(async () => {
+      runCalls++
+      return { total: 1, pushed: 1, failed: 0, sentinelReleaseFailed: true }
+    })
+    const ctrlSentinel = new AbortController()
+    console.log = () => {}
+    console.error = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('接管哨兵')) sentinelLines.push(line)
+    }
+    const sentinelTimer = setTimeout(() => ctrlSentinel.abort(), 400)
+    try {
+      await runResident(appSentinelLeak, ctrlSentinel)
+    } finally {
+      clearTimeout(sentinelTimer)
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.strictEqual(ctrlSentinel.signal.aborted, true, '哨兵释放失败必须触发 controller.abort()（不能静默续跑）')
+    assert.strictEqual(runCalls, 1, `哨兵释放失败后必须停止，只跑 1 轮（实际 ${runCalls}）`)
+    assert.ok(sentinelLines.some(l => l.includes('接管哨兵')),
+      `必须留下「接管哨兵释放失败」的失败日志（否则运维只看到一切正常）：${JSON.stringify(sentinelLines)}`)
+  }
+
+  // 7. R1-r8 #1：同一族标记的**错误对象形态**。业务正常收尾时哨兵释放失败写在摘要上（第 6 条），
+  //    但接管陈旧锁的那段临界区**自己抛错**时，xbk_app.js 把它标在错误对象上（无 failureKind）——
+  //    该错误逃过 runOnce 的摘要判定，直接进 handleFailure。旧实现只认 summary/error 上的
+  //    runLockReleaseFailed，于是这条标记落到 classifyOne 被判 retryable ⇒ 指数退避、退出码 0、不 abort，
+  //    而 run.lock.takeover 仍以本进程活 pid 留盘 ⇒ 此后所有接管永远 busy ⇒ 永久零推送且看起来正常。
+  //    这里**不预设 abort 定时器**：停机必须由生产代码触发，用例只留看门狗（超时即判红并 abort，
+  //    避免留一个空转的重试循环）。
+  {
+    runCalls = 0
+    const errSentinelLines = []
+    const origLog = console.log
+    const origErr = console.error
+    const appErrSentinel = makeResidentApp(async () => {
+      runCalls++
+      const err = new Error('接管体炸了：摘除陈旧锁后建新锁失败')
+      err.sentinelReleaseFailed = true
+      throw err
+    })
+    const ctrlErrSentinel = new AbortController()
+    console.log = () => {}
+    console.error = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('接管哨兵')) errSentinelLines.push(line)
+    }
+    const ERR_SENTINEL_WATCHDOG_MS = 5000
+    let errSentinelTimer
+    try {
+      await Promise.race([
+        runResident(appErrSentinel, ctrlErrSentinel),
+        new Promise((resolve, reject) => {
+          errSentinelTimer = setTimeout(() => {
+            ctrlErrSentinel.abort()
+            reject(new Error(`runResident 未因错误对象上的 sentinelReleaseFailed 停机（已跑 ${runCalls} 轮，` +
+              `看门狗 ${ERR_SENTINEL_WATCHDOG_MS}ms 到点）：该标记疑似又被判成可重试 ⇒ 常驻永久空转`))
+          }, ERR_SENTINEL_WATCHDOG_MS)
+        })
+      ])
+    } finally {
+      clearTimeout(errSentinelTimer)
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.strictEqual(ctrlErrSentinel.signal.aborted, true,
+      '错误对象带 sentinelReleaseFailed 必须触发 controller.abort()（不能退避续跑）')
+    assert.strictEqual(runCalls, 1, `该标记必须停机，只跑 1 轮（实际 ${runCalls}；>1 说明走了可重试退避）`)
+    assert.ok(errSentinelLines.some(l => l.includes('接管哨兵')),
+      `必须留下「接管哨兵释放失败」的失败日志（否则运维只看到一切正常）：${JSON.stringify(errSentinelLines)}`)
+  }
+
   console.log('test_qinglong_resident OK')
 })().catch((e) => { console.error(e); process.exit(1) })

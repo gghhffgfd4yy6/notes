@@ -3153,7 +3153,34 @@ function buildFilterRunHarness (cacheDir, over = {}) {
   })
   let items = []
   const sends = []
-  const Network = { fetchData: async () => items }
+  // R1-r8 #2：**持锁窗口**观测。fetchData 在 _runLocked 的业务体里，是「锁必须仍被本进程持有」的
+  // 天然观测点；旧用例只在 run() 返回后读盘，把 run() 的释放提前到 _runLocked() 之前（取锁后立刻
+  // 释放，业务全程无锁）仍全绿——单飞实际已失效而所有套件看不见。这里在抓取瞬间记两条独立证据：
+  // ① 盘上 run.lock 仍在；② 此刻再取一次锁必须拿不到（busy）。用例体据此断言。
+  const lockAtFetch = []
+  // R1-r7 #3：callcounter 必须挂在 harness 自己的抓取桩上——旧写法（无条件 return items）让
+  // 「先抓取、后判 busy」的回归完全不可见（B 把 await Network.fetchData() 提到取锁前，套件仍全绿）。
+  const Network = {
+    fetches: 0,
+    async fetchData () {
+      Network.fetches += 1
+      // 观测本身不得改变被测行为：取锁失败是**预期结果**（锁被本轮持有），不是错误；真实异常照实记下。
+      const obs = { lockPresent: false, reacquire: null, error: null }
+      try {
+        obs.lockPresent = realFs.existsSync(App._runLockPath())
+        obs.reacquire = App._acquireRunLock()
+        // 若意外真的拿到了（正是「业务全程无锁」的回归形态），立刻释放：观测不能把一把没人释放的锁
+        // 留在盘上，那会让后续用例集体 RUN_BUSY，把「一条断言红」变成一串无关失败。事实已原样记进
+        // obs.reacquire，用例体据此判红。
+        if (obs.reacquire && obs.reacquire.ok) App._releaseRunLock(obs.reacquire.token)
+      } catch (e) {
+        obs.error = e
+      }
+      lockAtFetch.push(obs)
+      if (over.fetchData) return over.fetchData(items)
+      return items
+    }
+  }
   const Pusher = over.Pusher || {
     send: async (text, desp) => {
       sends.push({ text, desp })
@@ -3201,6 +3228,10 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     Pusher,
     sends,
     baseConfig,
+    // R1-r7 #3：本轮抓取调用次数（busy 轮必须是 0 —— spec 目标 2「第二个进程必须不抓取」）。
+    fetches () { return Network.fetches },
+    // R1-r8 #2：每次抓取瞬间的持锁观测（lockPresent / reacquire / error）。
+    lockAtFetch () { return lockAtFetch },
     setItems (next) { items = next },
     cacheName () { return MessageStore.getFileName(Config.api.pushUrl) },
     cacheMessages () { return MessageStore.readMessages(MessageStore.getFilePath(MessageStore.getFileName(Config.api.pushUrl))) }
@@ -4947,6 +4978,1023 @@ checkAsync('L1-4 拦截明细：cacheDir 求值抛错 ⇒ 只 warn、run() 正�
     assert.ok(/ similar=1/.test(summaryLine), `拦截计数 similar=1 不得丢：${summaryLine}`)
     assert.ok(!/similarlogged=/.test(summaryLine), `明细写失败（返回 0）时不得追加 similarlogged：${summaryLine}`)
     assert.ok(!log.split('\n').some(l => l.includes(' ERROR ')), `明细写失败不得在 run.log 落 ERROR 行：${log.slice(-400)}`)
+  })
+})
+
+// ============================================================================
+// R1：run 级跨进程单飞锁（_acquireRunLock / _releaseRunLock / App.run 早退）
+// ----------------------------------------------------------------------------
+// 验收判据（specs/R1.md）：活着的持有者**即使锁很旧也不抢**；死进程留下的锁可接管；内容不可
+// 判定时 fail-closed 拒绝；释放只认 token；真实文件系统错误必须抛，不得伪装成 busy。
+// 全程用**真实 fs + 临时目录**：锁的全部价值就是跨进程真实互斥，桩 fs 证明不了任何事。
+// ============================================================================
+const lockFs = require('fs')
+
+function makeLockApp (dir, over = {}) {
+  return createApp({
+    Config: {},
+    Utils: {},
+    MessageStore: { get cacheDir () { return dir } },
+    fs: over.fs || lockFs,
+    path,
+    crypto
+  })
+}
+
+const lockPathOf = (dir) => path.join(dir, 'run.lock')
+const readLockFrame = (dir) => JSON.parse(lockFs.readFileSync(lockPathOf(dir), 'utf8'))
+/** 找一个**本机确定不存在**的 PID（R1-r3 #5）。
+ *  旧写法硬编码 4194300 并假设「它一定没被用」——pid_max 调大过的机器/容器里它可能正好是活进程，
+ *  `process.kill(pid, 0)` 成功 ⇒ 「死进程留下的锁可接管」用例随机假红（且红得没法复现）。
+ *  这里不猜：读 pid_max 定上界，扫 /proc 收集在册 pid，自上而下取第一个既不在册、`kill(pid,0)` 又
+ *  确实返回 ESRCH 的值——两条独立证据都指向「不存在」才用它。极端情况下（/proc 不可用且 kill 行为
+ *  异常）直接抛错而不是退化成一个可疑的硬编码值。 */
+const findDeadPid = () => {
+  let upper = 4194304 // Linux 默认 pid_max；读不到就按它当上界（kill 复核仍然生效）
+  try {
+    const raw = Number(lockFs.readFileSync('/proc/sys/kernel/pid_max', 'utf8').trim())
+    if (Number.isSafeInteger(raw) && raw > 2) upper = raw
+  } catch (e) { /* 非 Linux / 无 /proc：用默认上界 */ }
+  const live = new Set()
+  try {
+    for (const name of lockFs.readdirSync('/proc')) {
+      if (/^[0-9]+$/.test(name)) live.add(Number(name))
+    }
+  } catch (e) { /* 无 /proc：只靠 kill(pid,0) 复核 */ }
+  for (let pid = upper - 1; pid > 1; pid--) {
+    if (live.has(pid)) continue
+    try {
+      process.kill(pid, 0)
+    } catch (e) {
+      if (e && e.code === 'ESRCH') return pid
+      continue // EPERM 等 = 进程其实存在（无权限），换下一个
+    }
+  }
+  throw new Error('找不到确定不存在的 PID：/proc 与 kill(pid,0) 未给出一致结论')
+}
+const RUN_LOCK_DEAD_PID = findDeadPid()
+
+check('R1 锁：空目录首次获取成功（0o600 + pid/startedAt/token），且不残留临时文件', () => {
+  const dir = mkTmpFixture('runlock-new-')
+  const app = makeLockApp(dir)
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `空缓存目录必须能拿到锁：${JSON.stringify(got)}`)
+  const st = lockFs.statSync(lockPathOf(dir))
+  assert.strictEqual(st.mode & 0o777, 0o600, '锁文件权限必须是 0o600（同组/其他用户不该读得到）')
+  const frame = readLockFrame(dir)
+  assert.strictEqual(frame.pid, process.pid, '锁帧必须记持有者 pid')
+  assert.ok(Number.isSafeInteger(frame.startedAt) && frame.startedAt > 0, `锁帧必须记合法 startedAt：${JSON.stringify(frame)}`)
+  assert.strictEqual(frame.token, got.token, '锁帧里的 token 必须是本次获取返回的那个')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '不得残留 .tmp/哨兵')
+})
+
+check('R1 锁：同进程第二次获取（另一个 token）⇒ busy，holder 带回 pid/startedAt', () => {
+  const dir = mkTmpFixture('runlock-second-')
+  const app = makeLockApp(dir)
+  const first = app._acquireRunLock()
+  assert.strictEqual(first.ok, true, '前置：第一次必须成功')
+  const second = app._acquireRunLock()
+  assert.strictEqual(second.ok, false, `第二次必须 busy：${JSON.stringify(second)}`)
+  assert.strictEqual(second.busy, true, 'busy 标志必须置位（入口据此打提示而不是当失败）')
+  const frame = readLockFrame(dir)
+  assert.deepStrictEqual(second.holder, { pid: process.pid, startedAt: frame.startedAt },
+    `holder 必须与盘上的锁帧一致：${JSON.stringify(second.holder)}`)
+  assert.strictEqual(readLockFrame(dir).token, first.token, 'busy 时不得改写别人（上一把）的锁')
+})
+
+check('R1 锁：释放后可在同一进程再次获取；重复释放返回 missing（已是无锁态）', () => {
+  const dir = mkTmpFixture('runlock-release-')
+  const app = makeLockApp(dir)
+  const first = app._acquireRunLock()
+  assert.deepStrictEqual(app._releaseRunLock(first.token), { state: 'released' }, '释放自己的锁必须成功')
+  assert.ok(!lockFs.existsSync(lockPathOf(dir)), '释放后不得残留 run.lock')
+  assert.deepStrictEqual(app._releaseRunLock(first.token), { state: 'missing' },
+    '锁已不在时重复释放必须是 missing（R1-r4 #2：只有 failed 才代表「锁没删掉」，missing 不该让常驻停机）')
+  const again = app._acquireRunLock()
+  assert.strictEqual(again.ok, true, `释放后必须能再次获取：${JSON.stringify(again)}`)
+  assert.notStrictEqual(again.token, first.token, '每次获取必须是新 token（否则归属判定形同虚设）')
+})
+
+check('R1 锁：内容损坏 / startedAt 非法 ⇒ busy 且不改写（fail-closed，不静默接管）', () => {
+  const dir = mkTmpFixture('runlock-corrupt-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const broken = [
+    'not-json',
+    '',
+    JSON.stringify({ pid: process.pid, startedAt: 0, token: 't' }),
+    JSON.stringify({ pid: process.pid, startedAt: 'yesterday', token: 't' }),
+    JSON.stringify({ pid: -1, startedAt: Date.now(), token: 't' }),
+    JSON.stringify({ pid: process.pid, startedAt: Date.now() })
+  ]
+  for (const raw of broken) {
+    lockFs.writeFileSync(p, raw, { mode: 0o600 })
+    const got = app._acquireRunLock()
+    assert.strictEqual(got.ok, false, `无法判定持有者的锁必须拒绝：${JSON.stringify(raw)}`)
+    assert.strictEqual(got.busy, true, `必须是 busy（而不是抛错/接管）：${JSON.stringify(raw)}`)
+    assert.strictEqual(got.holder, null, `判定不出持有者时 holder 必须是 null：${JSON.stringify(got.holder)}`)
+    assert.strictEqual(lockFs.readFileSync(p, 'utf8'), raw, '损坏锁内容不得被接管改写')
+  }
+})
+
+check('R1 锁：持有进程已死 ⇒ 可接管，锁帧换成自己的', () => {
+  const dir = mkTmpFixture('runlock-dead-')
+  const app = makeLockApp(dir)
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 3600 * 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `死进程的锁必须能接管（否则崩一次就永久停摆）：${JSON.stringify(got)}`)
+  const frame = readLockFrame(dir)
+  assert.strictEqual(frame.pid, process.pid, '接管后锁帧必须是本进程')
+  assert.strictEqual(frame.token, got.token, '接管后锁帧必须带本次 token')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '接管不得残留回收名/哨兵')
+})
+
+check('R1 锁：持有进程活着 ⇒ 即使 startedAt 非常旧也不接管', () => {
+  const dir = mkTmpFixture('runlock-old-live-')
+  const app = makeLockApp(dir)
+  const old = { pid: process.pid, startedAt: 1, token: `${process.pid}:0:old` }
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(old), { mode: 0o600 })
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, false, `活着的持有者必须被尊重：${JSON.stringify(got)}`)
+  assert.strictEqual(got.busy, true, '必须 busy')
+  assert.deepStrictEqual(got.holder, { pid: process.pid, startedAt: 1 }, 'holder 必须原样带回锁帧信息')
+  assert.deepStrictEqual(readLockFrame(dir), old, '活锁内容一个字都不能改（改了就是双跑）')
+})
+
+check('R1 锁：PID 复用（pid 活着但帧里的启动时钟不符）⇒ 判定为死主并可接管', () => {
+  const dir = mkTmpFixture('runlock-pidreuse-')
+  const app = makeLockApp(dir)
+  // 本进程 pid + 一个不可能等于本进程 starttime 的独立时钟段：模拟「同 pid 的上一个 incarnation」。
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify({
+    pid: process.pid, startedAt: Date.now() - 60 * 1000, token: `${process.pid}:999999999:reused`, startTicks: '999999999'
+  }), { mode: 0o600 })
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `PID 复用留下的锁必须能接管：${JSON.stringify(got)}`)
+  assert.strictEqual(readLockFrame(dir).token, got.token, '接管后锁帧必须是本次 token')
+})
+
+check('R1 锁：token 里的 starttime 段不参与死活判定（构造/损坏的 token 抢不走活锁）', () => {
+  const dir = mkTmpFixture('runlock-token-noforce-')
+  const app = makeLockApp(dir)
+  // 旧实现会解析 token 第二段判 PID 复用，于是这帧「活着 + token 写着不存在的时钟」会被判死主接管
+  // ——一帧手写内容就能抢走活锁（fail-open）。现在死活只看 pid + 帧里独立的 startTicks。
+  const liveButBogusToken = {
+    pid: process.pid,
+    startedAt: Date.now(),
+    token: `${process.pid}:999999999:forged`
+  }
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(liveButBogusToken), { mode: 0o600 })
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, false, `token 里的时钟段不得成为接管活锁的证据：${JSON.stringify(got)}`)
+  assert.strictEqual(got.busy, true, '必须 busy')
+  assert.deepStrictEqual(readLockFrame(dir), liveButBogusToken, '活锁内容一个字都不能改')
+})
+
+check('R1 锁：锁帧字段严格校验——Number() 能强转的脏值一律 fail-closed（pid:true 不得被当成 PID 1）', () => {
+  const dir = mkTmpFixture('runlock-strict-frame-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const now = Date.now()
+  const dirty = [
+    // pid:true → Number(true)=1（旧实现会把锁帧指认成 PID 1）
+    JSON.stringify({ pid: true, startedAt: now, token: 't' }),
+    JSON.stringify({ pid: '1', startedAt: now, token: 't' }),
+    JSON.stringify({ pid: 1.5, startedAt: now, token: 't' }),
+    JSON.stringify({ pid: 0, startedAt: now, token: 't' }),
+    JSON.stringify({ pid: process.pid, startedAt: String(now), token: 't' }),
+    JSON.stringify({ pid: process.pid, startedAt: -1, token: 't' }),
+    JSON.stringify({ pid: process.pid, startedAt: now, token: '' }),
+    JSON.stringify({ pid: process.pid, startedAt: now, token: 12345 }),
+    JSON.stringify({ pid: process.pid, startedAt: now, token: '   ' }),
+    JSON.stringify([1, 2, 3]),
+    'null',
+    '42'
+  ]
+  for (const raw of dirty) {
+    lockFs.writeFileSync(p, raw, { mode: 0o600 })
+    const got = app._acquireRunLock()
+    assert.strictEqual(got.ok, false, `脏锁帧必须拒绝（不得接管）：${raw}`)
+    assert.strictEqual(got.busy, true, `必须是 busy 而不是抛错：${raw}`)
+    assert.strictEqual(got.holder, null, `判定不出持有者时 holder 必须为 null：${raw}`)
+    assert.strictEqual(lockFs.readFileSync(p, 'utf8'), raw, `脏锁帧不得被改写：${raw}`)
+  }
+})
+
+check('R1 锁：锁路径是 FIFO 时不得阻塞（O_NONBLOCK + fstat 判非普通文件 ⇒ busy），释放也不阻塞', () => {
+  const mkfifo = ['/usr/bin/mkfifo', '/bin/mkfifo'].find(p => lockFs.existsSync(p))
+  if (!mkfifo) return skip('R1 锁：FIFO 实测', '本机没有 mkfifo')
+  const dir = mkTmpFixture('runlock-fifo-')
+  const p = lockPathOf(dir)
+  const res = require('child_process').spawnSync(mkfifo, [p], { timeout: 5000 })
+  assert.strictEqual(res.status, 0, `mkfifo 失败：${String(res.stderr)}`)
+  // 必须在**子进程**里跑：旧实现（裸 O_RDONLY）会一直等写端，在进程内跑会把整套件挂死而不是判红。
+  // 子进程 8s 不返回 = 回归（实测旧实现 timeout 8 node ⇒ rc=124）。
+  const probe = [
+    'const fs = require("node:fs")',
+    `const { createApp } = require(${JSON.stringify(path.join(__dirname, 'xbk_app.js'))})`,
+    'const path = require("node:path")',
+    'const dir = process.argv[1]',
+    'const app = createApp({ Config: {}, Utils: {}, MessageStore: { get cacheDir () { return dir } }, fs, path, crypto: require("node:crypto") })',
+    'const t0 = Date.now()',
+    'const got = app._acquireRunLock()',
+    'const acquireMs = Date.now() - t0',
+    'const t1 = Date.now()',
+    'const rel = app._releaseRunLock("whatever")',
+    'process.stdout.write(JSON.stringify({ got, acquireMs, rel, releaseMs: Date.now() - t1 }) + "\\n")'
+  ].join('\n')
+  const run = require('child_process').spawnSync(process.execPath, ['-e', probe, dir], { timeout: 8000, encoding: 'utf8' })
+  assert.strictEqual(run.status, 0,
+    `FIFO 锁不得阻塞取锁/释放：旧实现会永久等写端（实测 rc=124）。实际 status=${run.status} signal=${run.signal} stderr=${String(run.stderr)}`)
+  const out = JSON.parse(String(run.stdout).trim())
+  assert.ok(out.acquireMs < 2000, `FIFO 锁的取锁必须立刻返回（实测 ${out.acquireMs}ms）`)
+  assert.strictEqual(out.got.ok, false, `FIFO 不可判定持有者，必须拒绝本轮：${JSON.stringify(out.got)}`)
+  assert.strictEqual(out.got.busy, true, '必须按 busy fail-closed（不是抛错、不是接管）')
+  assert.strictEqual(out.rel.state, 'foreign', 'FIFO 不是本进程写的那一帧：释放必须返回 foreign（不删、不停机）')
+  assert.ok(out.releaseMs < 2000, `FIFO 锁的释放必须立刻返回（实测 ${out.releaseMs}ms）`)
+  assert.ok(lockFs.existsSync(p), 'FIFO 不得被删除（非普通文件只拒绝、不清理）')
+})
+
+check('R1 锁：缓存目录经符号链接别名访问时，锁路径按 realpath 规范化（同一物理目录只有一把锁）', () => {
+  const root = mkTmpFixture('runlock-alias-')
+  const real = path.join(root, 'real')
+  const alias = path.join(root, 'alias')
+  lockFs.mkdirSync(real, { recursive: true, mode: 0o700 })
+  lockFs.symlinkSync(real, alias, 'dir')
+  const viaAlias = makeLockApp(alias)
+  const viaReal = makeLockApp(real)
+  const links = []
+  const realLink = lockFs.linkSync
+  lockFs.linkSync = (src, dest) => { links.push(String(dest)); return realLink.call(lockFs, src, dest) }
+  try {
+    const first = viaAlias._acquireRunLock()
+    assert.strictEqual(first.ok, true, `别名路径必须能拿到锁：${JSON.stringify(first)}`)
+  } finally {
+    lockFs.linkSync = realLink
+  }
+  // 锁文件必须建在 realpath 之后的目录里（dest 字符串里不能还带别名段）——否则「同一目录两种拼写」
+  // 会各建一把锁，互斥静默失效。
+  assert.ok(links.length > 0, '前置：必须真的走了 link 建锁')
+  for (const dest of links) {
+    assert.ok(!dest.includes(`${path.sep}alias${path.sep}`), `锁路径必须已规范化（不得含别名段）：${dest}`)
+    assert.ok(dest.startsWith(real + path.sep), `锁路径必须落在 realpath 目录下：${dest}（real=${real}）`)
+  }
+  const second = viaReal._acquireRunLock()
+  assert.strictEqual(second.ok, false, `同一物理目录换个拼写必须仍是 busy：${JSON.stringify(second)}`)
+  assert.strictEqual(second.busy, true, '必须 busy')
+  assert.deepStrictEqual(lockFs.readdirSync(real), ['run.lock'], '同一物理目录只能有一把 run.lock')
+})
+
+check('R1 锁：释放前复核 inode——路径在读完到 unlink 之间被换成别人的锁时不得盲删（TOCTOU）', () => {
+  const dir = mkTmpFixture('runlock-toctou-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, '前置：必须拿到锁')
+  const realLstat = lockFs.lstatSync
+  let patched = 0
+  lockFs.lstatSync = function (target, ...rest) {
+    const st = realLstat.call(lockFs, target, ...rest)
+    if (String(target) === p && patched === 0) {
+      patched += 1
+      // 模拟：归属校验通过后、unlink 之前，这个名字已被换成另一个 inode（别人刚建好的活锁）。
+      return { dev: st.dev, ino: st.ino + 1, isSymbolicLink: () => false }
+    }
+    return st
+  }
+  let released
+  try {
+    released = app._releaseRunLock(got.token)
+  } finally {
+    lockFs.lstatSync = realLstat
+  }
+  assert.strictEqual(released.state, 'foreign', 'inode 不一致时必须返回 foreign（调用方据此告警，且不算释放失败）')
+  assert.ok(lockFs.existsSync(p), '别人的锁必须留在盘上（不得盲删）')
+  assert.strictEqual(patched, 1, '前置：释放路径必须做过 inode 复核（没查就等于盲删）')
+  // 复核恢复正常后仍能正常释放自己那把（证明不是「永远拒绝释放」）。
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, 'inode 一致时必须能正常释放')
+  assert.ok(!lockFs.existsSync(p), '释放后不得残留 run.lock')
+})
+
+check('R1 锁：接管只走 O_EXCL——复判到 missing 后被别人抢先建好活锁时按 busy 收口，绝不 rename 覆盖', () => {
+  const dir = mkTmpFixture('runlock-takeover-race-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  // 先放一把死进程的锁，把流程带进「接管」路径。
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const rival = { pid: process.pid, startedAt: Date.now(), token: `${process.pid}:0:rival` }
+  const realLink = lockFs.linkSync
+  const realRename = lockFs.renameSync
+  let attempts = 0
+  let injected = false
+  // 「另一个进程在复判之后、本进程安装新锁之前抢先建好活锁」——按实现实际用的安装原语注入：
+  // 正确实现走 link（O_EXCL，会 EEXIST）；旧实现走 rename（直接覆盖，把活锁盖掉）。
+  const injectRival = (dest) => {
+    if (injected || String(dest) !== p) return
+    injected = true
+    lockFs.writeFileSync(dest, JSON.stringify(rival), { mode: 0o600 })
+  }
+  lockFs.linkSync = function (src, dest) {
+    if (String(dest) === p) {
+      attempts += 1
+      // 第 1 次是入口的独占创建（锁已在 ⇒ 让真实 link 抛 EEXIST）；第 2 次发生在接管里。
+      if (attempts === 2) injectRival(dest)
+    }
+    return realLink.call(lockFs, src, dest)
+  }
+  lockFs.renameSync = function (src, dest) {
+    if (String(dest) === p) injectRival(dest)
+    return realRename.call(lockFs, src, dest)
+  }
+  let got
+  try {
+    got = app._acquireRunLock()
+  } finally {
+    lockFs.linkSync = realLink
+    lockFs.renameSync = realRename
+  }
+  assert.strictEqual(got.ok, false, `被别人抢先时必须 busy，不得覆盖：${JSON.stringify(got)}`)
+  assert.strictEqual(got.busy, true, '必须 busy')
+  assert.deepStrictEqual(readLockFrame(dir), rival, '别人刚建好的活锁必须原样保留（rename 会盖掉它 ⇒ 双跑）')
+  assert.strictEqual(injected, true, '前置：本用例必须真的把对手的活锁插进竞争窗口')
+  assert.strictEqual(attempts, 2, `前置：接管必须用 O_EXCL 重建（实测 link 次数 ${attempts}）`)
+})
+
+check('R1 锁：token 不匹配的释放不删别人的锁（归属判定）', () => {
+  const dir = mkTmpFixture('runlock-foreign-')
+  const app = makeLockApp(dir)
+  const foreign = { pid: process.pid, startedAt: Date.now(), token: `${process.pid}:0:another-holder` }
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(foreign), { mode: 0o600 })
+  assert.deepStrictEqual(app._releaseRunLock('not-my-token'), { state: 'foreign' },
+    'token 不匹配必须拒绝释放并返回 foreign（别人的锁：不删、不算失败）')
+  assert.ok(lockFs.existsSync(lockPathOf(dir)), '别人的锁必须留在盘上')
+  assert.deepStrictEqual(readLockFrame(dir), foreign, '别人的锁内容不得被改写')
+})
+
+// R1-r3 #1：这条用例必须同时守住「真实 FS 故障 ⇒ 抛给入口」和「两种身份都成立」。
+// 旧写法只靠 chmod 0o500 制造 EACCES——本仓门禁以 root 跑（pid1 guard，见 RUNBOOK gate 阶段），
+// root 有 CAP_DAC_OVERRIDE，0500 目录照样能 open('wx') ⇒ assert.throws 落空，整条门禁红。
+// 现在分两段：① ENOTDIR 段与身份无关（root 也无法让普通文件充当目录），两种身份都跑；
+// ② EACCES 段仅非 root 有意义（root 下 chmod 拦不住写），root 身份如实标注为何不跑，不整条 skip。
+check('R1 锁：缓存目录不可用（ENOTDIR / EACCES）必须 fail-loud 抛出，不得伪装成 busy', () => {
+  // ① ENOTDIR：缓存目录的**父路径是普通文件**。mkdirSync/openSync 都会得到 ENOTDIR。
+  //    这是真实的内核拒绝（不是注入的桩），root 与非 root 表现一致——CAP_DAC_OVERRIDE 能绕过
+  //    权限位，但不能让一个普通文件变成目录。
+  const notDirRoot = mkTmpFixture('runlock-notdir-')
+  const blocker = path.join(notDirRoot, 'blocker')
+  lockFs.writeFileSync(blocker, 'not a directory')
+  const notDirApp = makeLockApp(path.join(blocker, 'cache'))
+  assert.throws(() => notDirApp._acquireRunLock(), (e) => e && e.code === 'ENOTDIR',
+    '父路径是普通文件时取锁必须抛 ENOTDIR（被折叠成 busy 就等于「目录坏了却每天静默跳过」）')
+
+  // ② EACCES：让 open('wx') 被内核拒绝。
+  //    非 root：目录改成 0o500，DAC 直接生效。
+  //    root：CAP_DAC_OVERRIDE 让 0o500 形同虚设，必须换一个**不由 DAC 决定**的拒绝来源——只读
+  //    伪文件系统（sysfs）。`/sys/kernel` 下 open(O_CREAT) 对 root 也返回 EACCES（只读挂载 + sysfs
+  //    不允许新建节点），失败点仍在「建锁」那一步（createRunLockFile 的 open('wx')），语义与
+  //    chmod 段完全一致。若某个环境里找不到这样的目录，则如实打印说明（ENOTDIR 段仍守着同一条语义）。
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    const roDir = ['/sys/kernel', '/sys/fs/cgroup'].find((cand) => {
+      try {
+        const probe = path.join(cand, `run.lock.probe.${process.pid}.tmp`)
+        const fd = lockFs.openSync(probe, 'wx', 0o600) // 竟然能建：这个候选点不是只读，换下一个
+        try { lockFs.closeSync(fd) } catch (e) { /* 探测 fd 关不掉不影响判定 */ }
+        try { lockFs.unlinkSync(probe) } catch (e) { /* 探测文件删不掉也不影响判定 */ }
+        return false
+      } catch (e) {
+        return Boolean(e) && e.code === 'EACCES'
+      }
+    })
+    if (roDir) {
+      const roApp = makeLockApp(roDir)
+      assert.throws(() => roApp._acquireRunLock(), (e) => e && e.code === 'EACCES',
+        `root 下改用只读伪文件系统（${roDir}）制造 EACCES：写锁的真实故障必须抛给入口`)
+      return
+    }
+    console.log('  ℹ️ 以 root 运行且找不到对 root 也只读的目录：EACCES 段由 ENOTDIR 段代表同一语义')
+    return
+  }
+  const dir = mkTmpFixture('runlock-eacces-')
+  const app = makeLockApp(dir)
+  const mode = lockFs.statSync(dir).mode & 0o777
+  lockFs.chmodSync(dir, 0o500)
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => e && e.code === 'EACCES',
+      '写锁的真实故障必须抛给入口（被折叠成 busy 就等于「权限坏了却每天静默跳过」）')
+  } finally {
+    lockFs.chmodSync(dir, mode)
+  }
+})
+
+// R1-r3 #3：释放路径必须与判据同一条大小上限（RUN_LOCK_MAX_BYTES=4096）。
+// 造一把「内容其实是自己的、但体积超限」的锁（合法 JSON + 大段尾部空白，JSON.parse 照样成功）：
+// 无上限的旧实现会整读、认领、删除；新实现必须按「不是我写的那一帧」拒绝（返回 false、不删）。
+check('R1 锁：锁文件超过 4096 字节时释放拒绝整读（返回 foreign、不删），上限内同一把锁仍能正常释放', () => {
+  const dir = mkTmpFixture('runlock-oversize-release-')
+  const app = makeLockApp(dir)
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `前置：必须拿到锁：${JSON.stringify(got)}`)
+  const frame = readLockFrame(dir)
+  const oversize = JSON.stringify(frame) + ' '.repeat(8 * 1024)
+  assert.ok(Buffer.byteLength(oversize) > 4096, '前置：构造的锁文件必须真的超过 4096 字节')
+  lockFs.writeFileSync(lockPathOf(dir), oversize, { mode: 0o600 })
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'foreign' },
+    '超限锁文件不得被整读并当成自己的锁删掉（判据 4 KiB、处置也必须 4 KiB）；也不是 failed——它不是我们的帧')
+  assert.ok(lockFs.existsSync(lockPathOf(dir)), '超限锁文件必须留在盘上（不删）')
+  assert.strictEqual(lockFs.readFileSync(lockPathOf(dir), 'utf8'), oversize, '超限锁内容一个字节都不能改')
+  // 对照：同一帧压回上限内 ⇒ 正常释放。证明上面的 foreign 是「按上限拒绝」，不是「永远拒绝释放」。
+  lockFs.writeFileSync(lockPathOf(dir), JSON.stringify(frame), { mode: 0o600 })
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '上限内的同一把锁必须能正常释放')
+  assert.ok(!lockFs.existsSync(lockPathOf(dir)), '正常释放后不得残留 run.lock')
+})
+
+check('R1 锁：只用注入 fs 的能力子集时锁仍能工作（缺 openSync/linkSync 不得崩），fsync 不支持只降级告警', () => {
+  const dir = mkTmpFixture('runlock-subset-fs-')
+  // 旧实现把注入的 fs 当 node:fs 用：writeRunLockFrame 缺 openSync/linkSync 直接 TypeError，
+  // App.run() 在建锁这一步就崩（业务侧的桩 fs 决定基础设施能不能用）。锁必须只依赖本模块的 node:fs。
+  const subsetFs = { existsSync: () => false }
+  const app = makeLockApp(dir, { fs: subsetFs })
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `只注入部分 fs 也必须能拿锁：${JSON.stringify(got)}`)
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '释放同样不得依赖注入的 fs')
+  // fsync 在 FUSE/网络卷上可能返回 ENOTSUP/EINVAL：只降级（warn），不让每一轮都硬失败。
+  // R1-r3 #4：只装**一次**桩、用可变状态切换「这轮要抛哪个错误」。旧写法是「恢复 realFsync →
+  // 立刻换上新桩」，两次赋值之间没有任何读取 ⇒ CodeQL 报「Useless assignment to property
+  // fsyncSync」（那段「恢复」其实也没恢复过），而且降级分支是否真被驱动看不出来。现在桩一直
+  // 装到本节结束、finally 一次性恢复原函数，并用 fsyncCalls 计数证明两个分支都真的走到了桩。
+  const realFsync = lockFs.fsyncSync
+  let fsyncError = null
+  let fsyncCalls = 0
+  lockFs.fsyncSync = (fd) => {
+    fsyncCalls += 1
+    if (fsyncError) throw fsyncError
+    return realFsync.call(lockFs, fd)
+  }
+  const fsyncErrorOf = (code) => { const e = new Error(`${code}: fsync failed`); e.code = code; return e }
+  try {
+    // ① 降级分支：ENOTSUP ⇒ 只 warn，锁仍算建成（fsync 只关乎掉电耐久性）。
+    fsyncError = fsyncErrorOf('ENOTSUP')
+    const degraded = app._acquireRunLock()
+    assert.strictEqual(degraded.ok, true, `fsync 不支持时必须降级继续（锁已独占创建）：${JSON.stringify(degraded)}`)
+    assert.deepStrictEqual(app._releaseRunLock(degraded.token), { state: 'released' }, '降级后仍必须能正常释放')
+    // ② 反例：ENOTSUP 之外的 fsync 故障（EIO）是真故障，必须原样抛，不得被降级吞掉。
+    fsyncError = fsyncErrorOf('EIO')
+    assert.throws(() => app._acquireRunLock(), (e) => e && e.code === 'EIO',
+      'fsync 的真实 IO 错误必须抛出（只对 ENOTSUP/EINVAL 一族降级）')
+    assert.ok(fsyncCalls >= 2, `前置：两个分支都必须真的调用到 fsync（实测 ${fsyncCalls} 次）`)
+  } finally {
+    lockFs.fsyncSync = realFsync
+  }
+  assert.deepStrictEqual(lockFs.readdirSync(dir), [], '失败/降级都不得残留临时文件')
+})
+
+check('R1 文案：busy 行判定必须与 formatRunBusyLine 的真实输出同源（控制台自动运行靠它认跳过）', () => {
+  const { formatRunBusyLine } = require('./xbk_app.js')
+  const Utils = require('./xbk_utils.js')
+  const line = formatRunBusyLine({ holder: { pid: 4242, startedAt: 1760000000000 } })
+  assert.strictEqual(line, '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过', `文案必须保持不变：${line}`)
+  assert.strictEqual(Utils.isRunBusyLine(line), true, 'isRunBusyLine 必须认得 xbk_app 的真实输出（两处漂移即失控）')
+  assert.strictEqual(Utils.isRunBusyLine(`前缀 ${line} 后缀`), true, '整段 stdout 里出现该行也必须能认出来')
+  assert.strictEqual(Utils.isRunBusyLine('已有运行在跑，本轮跳过'), false, '缺 pid 段的普通文本不得误判成 busy')
+  assert.strictEqual(Utils.isRunBusyLine('本轮成功推送 3 条'), false, '正常成功行不得误判成 busy')
+  assert.strictEqual(Utils.isRunBusyLine(''), false, '空串不得误判')
+  assert.strictEqual(Utils.isRunBusyLine(null), false, '非字符串不得误判')
+})
+
+check('R1 锁：接管哨兵——活着则 busy，死透才回收', () => {
+  const dir = mkTmpFixture('runlock-sentinel-')
+  const app = makeLockApp(dir)
+  const lockP = lockPathOf(dir)
+  const sentinelP = lockP + '.takeover'
+  // 主锁是死的（可接管），但哨兵归一个活着的进程：不能抢（它可能正在接管）。
+  lockFs.writeFileSync(lockP, JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now(), token: `${RUN_LOCK_DEAD_PID}:0:d` }), { mode: 0o600 })
+  lockFs.writeFileSync(sentinelP, JSON.stringify({ pid: process.pid, startedAt: Date.now(), token: `${process.pid}:0:live-sentinel` }), { mode: 0o600 })
+  let got = app._acquireRunLock()
+  assert.strictEqual(got.ok, false, `活哨兵在场必须 busy：${JSON.stringify(got)}`)
+  assert.deepStrictEqual(got.holder, { pid: process.pid, startedAt: JSON.parse(lockFs.readFileSync(sentinelP, 'utf8')).startedAt },
+    'holder 应指向正在接管的那个进程')
+  assert.ok(lockFs.existsSync(sentinelP), '活哨兵不得被删除')
+  assert.strictEqual(JSON.parse(lockFs.readFileSync(lockP, 'utf8')).pid, RUN_LOCK_DEAD_PID, '主锁不得被替换')
+  // 哨兵持有者也死了（接管者恰在上一次接管中崩溃）：回收它并完成接管。
+  lockFs.writeFileSync(sentinelP, JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now(), token: `${RUN_LOCK_DEAD_PID}:0:d2` }), { mode: 0o600 })
+  got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `死哨兵必须被回收并接管：${JSON.stringify(got)}`)
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '回收后不得残留哨兵/回收名')
+  assert.strictEqual(readLockFrame(dir).token, got.token, '接管后锁帧必须是本次 token')
+})
+
+checkAsync('R1 行为：已有活锁时 App.run 返回 skipped（RUN_BUSY），不写日志/状态、不推送', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('runlock-busy-run-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  process.env.XBK_CACHE_DIR = cacheDir
+  try {
+    const h = buildFilterRunHarness(cacheDir)
+    h.setItems([makeRunItem('busy-a', '标题甲')])
+    const holderFrame = { pid: process.pid, startedAt: 1760000000000, token: `${process.pid}:0:holder` }
+    realFs.writeFileSync(lockPathOf(cacheDir), JSON.stringify(holderFrame), { mode: 0o600 })
+    const summary = await h.App.run()
+    assert.deepStrictEqual({ ...summary }, {
+      total: 0,
+      dedup: 0,
+      filtered: 0,
+      pushed: 0,
+      failed: 0,
+      skipped: true,
+      reason: 'RUN_BUSY',
+      holder: { pid: process.pid, startedAt: 1760000000000 }
+    }, `busy 摘要形状必须与 spec 一致：${JSON.stringify(summary)}`)
+    assert.strictEqual(h.sends.length, 0, 'busy 时不得推送任何消息')
+    // R1-r7 #3：spec 目标 2 的第一句就是「第二个进程必须不抓取」。旧用例只断言 sends/三个文件名，
+    // 把 await Network.fetchData() 提到 _acquireRunLock() 之前（先抓取后判 busy）整套仍全绿。
+    assert.strictEqual(h.fetches(), 0,
+      `busy 轮必须一次都不抓取（实测 ${h.fetches()} 次）：抓取不得早于取锁`)
+    for (const name of ['run.log', 'report.state', 'filter.hash']) {
+      assert.ok(!realFs.existsSync(path.join(cacheDir, name)), `busy 时不得写 ${name}（缓存/日志/状态一律不碰）`)
+    }
+    // 目录级「无新增」：白名单只有别人的 run.lock（本目录没有 journal/诊断产物），多一个文件即回归。
+    const leftovers = realFs.readdirSync(cacheDir).sort()
+    assert.deepStrictEqual(leftovers, ['run.lock'],
+      `busy 轮缓存目录只应留下别人的 run.lock（实际 ${JSON.stringify(leftovers)}）`)
+    assert.deepStrictEqual(realFs.readFileSync(lockPathOf(cacheDir), 'utf8'), JSON.stringify(holderFrame),
+      '别人的锁内容不得被改（更不能被删）')
+  } finally {
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+  }
+})
+
+checkAsync('R1 行为：正常一轮跑完后 run.lock 被释放（finally），摘要不带 skipped', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('runlock-normal-run-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  process.env.XBK_CACHE_DIR = cacheDir
+  try {
+    const h = buildFilterRunHarness(cacheDir)
+    h.setItems([makeRunItem('ok-a', '标题甲')])
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(summary.skipped, undefined, `正常一轮不得带 skipped：${JSON.stringify(summary)}`)
+    assert.strictEqual(summary.pushed, 1, `前置：本轮应真的推了 1 条：${JSON.stringify(summary)}`)
+    assert.ok(!realFs.existsSync(lockPathOf(cacheDir)), '正常结束必须释放 run.lock（否则下一轮永远 busy）')
+  } finally {
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+  }
+})
+
+// R1-r8 #2：spec 约束「整轮业务都持锁」此前零守卫——把 run() 的释放从 finally 提到 _runLocked()
+// 之前（取锁后立刻释放、业务全程无锁）后，旧套件仍 343/343、test_app --only=R1 仍 3/3 全绿：
+// 现有 5 条 R1 用例都只在 run() 返回后读盘，看不见「持锁窗口」。harness 的 Network.fetchData 在
+// _runLocked 体内，是最自然的观测点，桩里已记下两条独立证据（盘上有 run.lock / 再取一次锁必 busy），
+// 这里逐条断言，并在 run() 结束后断言已释放。
+checkAsync('R1 行为：业务全程持锁——抓取瞬间 run.lock 在盘且再取一次锁必 busy，跑完后已释放', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('hold-a', '标题甲')])
+    const lockPath = path.join(realFs.realpathSync(cacheDir), 'run.lock')
+    const { summary } = await runWithWarnings(h.App)
+    assert.strictEqual(summary.pushed, 1, `前置：本轮应真的推了 1 条：${JSON.stringify(summary)}`)
+    const obs = h.lockAtFetch()
+    assert.strictEqual(obs.length, 1,
+      `前置：本轮必须恰好观测到 1 次抓取（没观测到就无从证明持锁）：${JSON.stringify(obs)}`)
+    assert.strictEqual(obs[0].error, null,
+      `抓取瞬间的持锁观测本身不得抛错：${obs[0].error && obs[0].error.message}`)
+    assert.strictEqual(obs[0].lockPresent, true,
+      '抓取发生在业务体内 ⇒ 此刻 run.lock 必须仍在盘上（回退成「取锁后立刻释放」时这里必红）')
+    assert.strictEqual(obs[0].reacquire.ok, false,
+      `锁被本轮持有时再取一次必须拿不到（实测拿到了 ⇒ 业务全程无锁）：${JSON.stringify(obs[0].reacquire)}`)
+    assert.strictEqual(obs[0].reacquire.busy, true,
+      `再取一次的结果必须是 busy（不是别的失败形态）：${JSON.stringify(obs[0].reacquire)}`)
+    assert.ok(!realFs.existsSync(lockPath), 'run() 结束后必须已释放 run.lock（否则下一轮永远 busy）')
+  })
+})
+
+// R1-r7 #2：spec 约束 5「异常/超时/提前 return 都要释放」此前零守卫——把 finally 里的释放改成
+// 「仅成功路径释放」，旧套件全绿（B 实测 test_app_unit 341/0 + test_app.js C042 都绿）。这条让业务体
+// 内部的抓取步骤真抛错（Pusher.send 的异常被逐条吞成 failed，不会穿透，抓取才是会外抛的步骤），
+// 断言异常路径也走到 finally 的释放，且错误对象没有被误标 runLockReleaseFailed。
+checkAsync('R1 行为：业务步骤抛错时 run.lock 仍被释放（finally），错误对象不标 runLockReleaseFailed', async () => {
+  const realFs = require('fs')
+  const cacheDir = mkTmpFixture('runlock-throw-run-')
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  process.env.XBK_CACHE_DIR = cacheDir
+  const boom = new Error('fetch boom：源站不可用')
+  try {
+    const h = buildFilterRunHarness(cacheDir, { fetchData: () => { throw boom } })
+    h.setItems([makeRunItem('throw-a', '标题甲')])
+    await assert.rejects(() => h.App.run(), (err) => {
+      assert.strictEqual(err, boom, `业务错误必须原样外抛（不得吞掉/包装）：${err && err.message}`)
+      // 释放成功时生产侧不写这个字段（只有 failed 才置 true）⇒ 语义就是 runLockReleaseFailed=false。
+      // 归一成布尔后断言为 false：既守住「不得把正常释放误标成失败」，也不强求生产写一个多余字段。
+      assert.strictEqual(Boolean(err.runLockReleaseFailed), false,
+        `锁已释放 ⇒ 异常对象上 runLockReleaseFailed 必须为 false：${JSON.stringify(err && Object.keys(err))}`)
+      return true
+    })
+    assert.strictEqual(h.fetches(), 1, `前置：本轮确实抓取过（错误发生在持锁的业务体内）：${h.fetches()}`)
+    assert.ok(!realFs.existsSync(lockPathOf(cacheDir)),
+      '异常路径也必须释放 run.lock（回退成「仅成功路径释放」时这里必红）')
+  } finally {
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+  }
+})
+
+// R1-r7 #2（续）：异常 + 释放失败同时发生 —— 两个事实都必须保住：业务错误原样外抛（不被释放失败吞掉），
+// 且错误对象上 runLockReleaseFailed=true 让常驻入口按不可恢复错误停机（否则锁以活 pid 留盘 ⇒ 永久空转）。
+checkAsync('R1 行为：异常路径上释放失败（unlink EACCES）⇒ 错误对象 runLockReleaseFailed=true', async () => {
+  const boom = new Error('fetch boom：源站不可用')
+  await withRunHarness({ fetchData: () => { throw boom } }, async (h, cacheDir, realFs) => {
+    const realUnlink = lockFs.unlinkSync
+    let blockedAt = null
+    lockFs.unlinkSync = function (target) {
+      // 按文件名认锁（不按拼好的绝对路径）：缓存目录可能经 realpath 规范化。
+      if (path.basename(String(target)) === 'run.lock') {
+        blockedAt = String(target)
+        const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+        e.code = 'EACCES'
+        throw e
+      }
+      return realUnlink.call(lockFs, target)
+    }
+    try {
+      await assert.rejects(() => h.App.run(), (err) => {
+        assert.strictEqual(err, boom, '业务错误必须原样外抛（释放失败不得把它吞掉/替换）')
+        assert.strictEqual(err.runLockReleaseFailed, true,
+          `释放失败必须标在错误对象上（常驻入口据此停机）：${JSON.stringify(err && err.message)}`)
+        return true
+      })
+      assert.ok(blockedAt, '前置：释放路径必须真的尝试删过 run.lock（否则没打到故障点）')
+      assert.ok(realFs.existsSync(blockedAt), '前置：锁确实还留在盘上（这正是常驻会被永久饿死的形态）')
+    } finally {
+      lockFs.unlinkSync = realUnlink
+    }
+  })
+})
+
+// R1-r3 #6：释放失败（unlink EACCES/EROFS）时锁会以**本进程 pid** 留在盘上，常驻入口必须先看到
+// 这个事实才能停机。旧实现只 console.warn：常驻进程下一轮 run() 只看到「活着的持有者」⇒ 每轮
+// skipped，而常驻循环把 skipped 当正常轮 ⇒ 永久空转。故 App.run 必须把它写进摘要。
+checkAsync('R1 行为：释放 run.lock 失败（EACCES）⇒ 摘要带 lockReleaseFailed，锁仍留在盘上', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('rel-fail-a', '标题甲')])
+    const realUnlink = lockFs.unlinkSync
+    let blockedAt = null
+    lockFs.unlinkSync = function (target) {
+      // 按文件名认锁（不按拼好的绝对路径）：harness 的缓存目录可能经 realpath 规范化。
+      if (path.basename(String(target)) === 'run.lock') {
+        blockedAt = String(target)
+        const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+        e.code = 'EACCES'
+        throw e
+      }
+      return realUnlink.call(lockFs, target)
+    }
+    try {
+      const { summary, warns } = await runWithWarnings(h.App)
+      assert.ok(blockedAt, '前置：释放路径必须真的尝试删过 run.lock（否则没打到故障点）')
+      assert.strictEqual(summary.lockReleaseFailed, true,
+        `释放失败必须标在摘要上（常驻入口据此走失败路径停机）：${JSON.stringify(summary)}`)
+      assert.strictEqual(summary.pushed, 1, `锁释放失败不得改写本轮推送结果：${JSON.stringify(summary)}`)
+      assert.ok(warns.some(l => l.includes('run 锁释放失败')), `原来那条告警必须保留：${JSON.stringify(warns)}`)
+      assert.ok(realFs.existsSync(blockedAt), '前置：锁确实还留在盘上（这正是常驻会被永久饿死的形态）')
+    } finally {
+      lockFs.unlinkSync = realUnlink
+    }
+  })
+})
+
+// R1-r4 #2：**「盘上这把是别人的锁」不等于「释放失败」**。run() 的 finally 旧实现只看 bool，把
+// 三类情形一律标成 lockReleaseFailed：真实 IO 故障、盘上已换主（运维按 README 删掉卡住的锁后同轮
+// 又有入口新建了自己的锁）、名字被换成别的 inode。常驻入口（qinglong/xbk_push.js）据此按
+// permanent 停机 exit 1——本进程那把锁早就不在盘上了，重启解决不了任何问题。这里在「一轮跑到一半
+// 时锁被换主」的真实形态下断言：摘要不带 lockReleaseFailed、有明确告警、别人的锁一个字节都不动。
+checkAsync('R1 行为：本轮结束时盘上的 run.lock 已换主（运维删锁后别人新建）⇒ 不算释放失败，不标 lockReleaseFailed', async () => {
+  const foreign = { pid: process.pid, startedAt: 1700000000000, token: `${process.pid}:0:other-holder` }
+  let lockPath = null
+  let swapped = 0
+  // Pusher.send 在一轮中间被调用：此刻锁仍归本轮所有，正好用来模拟「外部把锁删了/换了一把」。
+  const Pusher = {
+    send: async () => {
+      if (swapped === 0) {
+        swapped += 1
+        lockFs.writeFileSync(lockPath, JSON.stringify(foreign), { mode: 0o600 })
+      }
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  await withRunHarness({ Pusher }, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('rel-foreign-a', '标题甲')])
+    lockPath = path.join(realFs.realpathSync(cacheDir), 'run.lock')
+    const { summary, warns } = await runWithWarnings(h.App)
+    assert.strictEqual(swapped, 1, '前置：本轮必须真的推过一次（换锁发生在轮中）')
+    assert.strictEqual(summary.pushed, 1, `前置：本轮应推送 1 条：${JSON.stringify(summary)}`)
+    assert.strictEqual(summary.lockReleaseFailed, undefined,
+      `盘上已是别人的锁 ⇒ 本进程那把已不在，不得标 lockReleaseFailed（常驻会据此停机）：${JSON.stringify(summary)}`)
+    assert.ok(warns.some(l => l.includes('已不是本进程写的那一把')),
+      `必须留一条「换主」告警（既不停机也不静默）：${JSON.stringify(warns)}`)
+    assert.ok(!warns.some(l => l.includes('run 锁释放失败')), `不得再打「释放失败」：${JSON.stringify(warns)}`)
+    assert.deepStrictEqual(JSON.parse(realFs.readFileSync(lockPath, 'utf8')), foreign,
+      '别人的锁必须原样留在盘上（内容一个字节都不能改）')
+  })
+})
+
+// R1-r4 #3：接管陈旧锁时的**真实文件系统故障**不得折叠成 busy（specs/R1.md 约束 7）。
+// 旧实现把「不是我的锁」与「unlink 报 EACCES/EROFS/EIO」压成同一个 false，接管收口成 busy：入口
+// 把真实故障当「另一轮在跑」继续等，重启后的进程回到同一处又拿回 busy ⇒ 常驻永久空转。
+check('R1 锁：接管陈旧锁时 unlink 报 EACCES 必须原样抛出（不得折叠成 busy）', () => {
+  const dir = mkTmpFixture('runlock-takeover-eacces-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const realUnlink = lockFs.unlinkSync
+  let blockedAt = null
+  lockFs.unlinkSync = function (target) {
+    if (path.basename(String(target)) === 'run.lock') {
+      blockedAt = String(target)
+      const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.call(lockFs, target)
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'EACCES'
+    }, 'unlink 的真实失败必须抛出（折叠成 busy 就等于「权限坏了却永远静默跳过」）')
+  } finally {
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.ok(blockedAt, '前置：接管路径必须真的试过摘除那把陈旧锁')
+  assert.strictEqual(thrown.code, 'EACCES', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8').includes(`${RUN_LOCK_DEAD_PID}:0:dead`), true,
+    '旧锁没被删成，必须原样留在盘上')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '抛错路径也必须回收接管哨兵（不留 .takeover）')
+})
+
+// R1-r5 #1：接管哨兵（`run.lock.takeover`）的释放结果过去被 finally 整个丢弃——`failed` 时既不告警
+// 也不进本轮结果，哨兵就以**本进程活 pid + 本进程启动时钟**留在缓存目录；此后 readRunLockState 对它
+// 永远返回 busy，该目录下所有入口再也接管不了任何死锁（入口打「已有运行在跑（pid=自己）」、退出码 0、
+// 零告警 ⇒ 永久静默停推）。本用例同时咬两件事，缺任意一半都会红：
+//   ① 失败必须告警 + 标进本轮结果（`_acquireRunLock` 返回值）；
+//   ② 下一轮必须按归属回收自己的残留并完成接管（不是永久 busy）。
+check('R1 锁：接管哨兵释放失败（unlink EACCES）⇒ 告警+标进结果，且下一轮能回收自有残留完成接管', () => {
+  const dir = mkTmpFixture('runlock-sentinel-release-fail-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const sentinelP = p + '.takeover'
+  const deadFrame = (token) => JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token })
+  lockFs.writeFileSync(p, deadFrame(`${RUN_LOCK_DEAD_PID}:0:dead`), { mode: 0o600 })
+  const realUnlink = lockFs.unlinkSync
+  const realWarn = console.warn
+  const warns = []
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  let blocked = 0
+  lockFs.unlinkSync = function (target) {
+    if (path.basename(String(target)) === 'run.lock.takeover') {
+      blocked += 1
+      const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.call(lockFs, target)
+  }
+  let got
+  try {
+    got = app._acquireRunLock()
+  } finally {
+    console.warn = realWarn
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.strictEqual(blocked, 1, '前置：接管路径必须真的试过删掉自己的哨兵（否则没打到故障点）')
+  assert.strictEqual(got.ok, true, `哨兵删不掉不影响本轮持锁（主锁已接管成功）：${JSON.stringify(got)}`)
+  assert.strictEqual(got.sentinelReleaseFailed, true,
+    `哨兵释放失败必须标进本轮结果（旧实现直接丢弃 ⇒ 入口零告警、此后永久 busy）：${JSON.stringify(got)}`)
+  assert.ok(warns.some(l => l.includes('接管哨兵释放失败')), `必须留一条明确告警：${JSON.stringify(warns)}`)
+  assert.ok(lockFs.existsSync(sentinelP), '前置：哨兵确实残留在盘上（这正是「下一次接管永远 busy」的形态）')
+  assert.strictEqual(JSON.parse(lockFs.readFileSync(sentinelP, 'utf8')).pid, process.pid,
+    '残留哨兵必须记着本进程 pid（否则不是「自有残留」这一形态）')
+  // 先证明确实是这个形态挡住了自己：本轮已持主锁，按归属释放后再放一把新的死锁。
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '前置：本轮主锁必须能正常释放')
+  lockFs.writeFileSync(p, deadFrame(`${RUN_LOCK_DEAD_PID}:0:dead2`), { mode: 0o600 })
+  // ② 下一轮必须回收自己的哨兵残留并照常接管（旧实现：永久 busy，holder 是自己）。
+  const again = app._acquireRunLock()
+  assert.strictEqual(again.ok, true,
+    `本进程自己的哨兵残留必须按归属回收后继续接管（不是「已有运行在跑（pid=自己）」永久空转）：${JSON.stringify(again)}`)
+  assert.strictEqual(again.sentinelReleaseFailed, undefined, '这一轮哨兵能正常删除 ⇒ 不得再带失败标记')
+  assert.ok(!lockFs.existsSync(sentinelP), '回收后不得残留 run.lock.takeover')
+  assert.strictEqual(readLockFrame(dir).token, again.token, '接管后锁帧必须是本次 token')
+})
+
+// R1-r5 #2：link 不支持卷的回退分支（`open('wx')` 占名 + 直接写）此前零覆盖。先证明回退分支本身
+// 仍能建锁、且独占语义与主路径一致（第二个入口 EEXIST ⇒ busy，绝不覆盖）。
+check('R1 锁：link 不支持（ENOTSUP）时回退分支仍能建锁并保持独占', () => {
+  const dir = mkTmpFixture('runlock-fallback-ok-')
+  const app = makeLockApp(dir)
+  const realLink = lockFs.linkSync
+  let linkCalls = 0
+  lockFs.linkSync = () => {
+    linkCalls += 1
+    const e = new Error('ENOTSUP: link not supported')
+    e.code = 'ENOTSUP'
+    throw e
+  }
+  let got, second
+  try {
+    got = app._acquireRunLock()
+    second = app._acquireRunLock()
+  } finally {
+    lockFs.linkSync = realLink
+  }
+  assert.ok(linkCalls >= 2, `前置：两次取锁都必须真的走到 link 并失败（实测 ${linkCalls} 次）`)
+  assert.strictEqual(got.ok, true, `回退分支必须能建锁：${JSON.stringify(got)}`)
+  assert.strictEqual(readLockFrame(dir).token, got.token, '回退分支写入的帧必须是本次 token')
+  assert.strictEqual(second.ok, false, `回退分支必须保持独占：${JSON.stringify(second)}`)
+  assert.strictEqual(second.busy, true, '第二次必须是 busy（回退分支 open wx ⇒ EEXIST）')
+  assert.strictEqual(readLockFrame(dir).token, got.token, 'busy 时不得改写已占名的锁')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '回退分支不得残留临时文件')
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '回退分支建的锁必须能正常释放')
+})
+
+// R1-r5 #2：回退分支用 `open('wx')` 先把**正式锁名**占住，写失败（ENOSPC/EIO）就会留下 0 字节或
+// 半帧 run.lock；读取侧对不可判定内容 fail-closed，此后该目录所有入口每轮只打「已有运行在跑」并
+// exit 0（永久静默停推、永不自愈）。必须：写失败 ⇒ 按 (dev,ino) 复核后删掉自己刚占的名字并原样抛出；
+// 随后取锁能成功（不是永久 busy）。
+check('R1 锁：link 不支持的回退分支写失败（ENOSPC）⇒ 删掉半写的锁并抛出，随后能正常取锁', () => {
+  const dir = mkTmpFixture('runlock-fallback-enospc-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const realLink = lockFs.linkSync
+  const realWrite = lockFs.writeFileSync
+  let writeCalls = 0
+  lockFs.linkSync = () => {
+    const e = new Error('ENOTSUP: link not supported')
+    e.code = 'ENOTSUP'
+    throw e
+  }
+  lockFs.writeFileSync = function (target, data, ...rest) {
+    writeCalls += 1
+    // 第 1 次写唯一临时名（必须成功）；第 2 次是回退分支直接写正式锁名 ⇒ 注入 ENOSPC。
+    if (writeCalls === 2) {
+      const e = new Error('ENOSPC: no space left on device, write')
+      e.code = 'ENOSPC'
+      throw e
+    }
+    return realWrite.call(lockFs, target, data, ...rest)
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'ENOSPC'
+    }, '磁盘满必须原样抛给入口（不是伪装成 busy）')
+  } finally {
+    lockFs.linkSync = realLink
+    lockFs.writeFileSync = realWrite
+  }
+  assert.ok(thrown && thrown.code === 'ENOSPC', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.ok(writeCalls >= 2, `前置：必须真的走到回退分支的写入（实测 ${writeCalls} 次写）`)
+  assert.strictEqual(lockFs.existsSync(p), false,
+    '半写的锁必须被删掉：0 字节 run.lock 会被判「内容不可判定 ⇒ busy」，该目录此后永久静默跳过')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), [], '不得残留临时文件或空锁')
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `失败那轮过后必须能正常取锁（不是永久 busy）：${JSON.stringify(got)}`)
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '之后的正常释放不受影响')
+})
+
+// R1-r5 #2：清理半写锁**不能误删别人的锁**——写失败与清理之间，这个名字可能已被别人摘掉并建了
+// 自己的活锁。这里让复核看到不同的 inode（模拟「名字已指向别人的锁」），断言一个字节都不动。
+check('R1 锁：回退分支写失败时锁名已被换成别的 inode ⇒ 不删除（不误删别人的锁）', () => {
+  const dir = mkTmpFixture('runlock-fallback-foreign-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const realLink = lockFs.linkSync
+  const realWrite = lockFs.writeFileSync
+  const realLstat = lockFs.lstatSync
+  let writeCalls = 0
+  let guarded = 0
+  lockFs.linkSync = () => {
+    const e = new Error('ENOTSUP: link not supported')
+    e.code = 'ENOTSUP'
+    throw e
+  }
+  lockFs.writeFileSync = function (target, data, ...rest) {
+    writeCalls += 1
+    if (writeCalls === 2) {
+      const e = new Error('EIO: i/o error, write')
+      e.code = 'EIO'
+      throw e
+    }
+    return realWrite.call(lockFs, target, data, ...rest)
+  }
+  lockFs.lstatSync = function (target, ...rest) {
+    const st = realLstat.call(lockFs, target, ...rest)
+    if (String(target) === p) {
+      guarded += 1
+      return { dev: st.dev, ino: st.ino + 1, isFile: () => true }
+    }
+    return st
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'EIO'
+    }, '写失败必须原样抛出（不是 busy）')
+  } finally {
+    lockFs.linkSync = realLink
+    lockFs.writeFileSync = realWrite
+    lockFs.lstatSync = realLstat
+  }
+  assert.ok(thrown && thrown.code === 'EIO', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.strictEqual(guarded, 1, '前置：清理前必须做过 inode 复核（没查就等于按路径盲删）')
+  assert.ok(lockFs.existsSync(p), '名字已不是刚建的那个 inode ⇒ 不得删除（绝不误删别人的锁）')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '只应留下那个「别人的」锁文件')
+})
+
+// R1-r5 #1：自有残留的回收本身失败（同一处仍在报 EACCES/EIO）时必须原样抛出，不得折叠成 busy。
+// 折叠成 busy 的后果与该缺陷同族：入口当成「另一轮在跑」继续等，下一轮回到同一处又是 busy。
+check('R1 锁：本进程哨兵残留回收失败必须原样抛出（不得折叠成 busy）', () => {
+  if (process.platform !== 'linux') return skip('R1 锁：本进程哨兵残留回收失败', '非 Linux：读不到 /proc/self 启动时钟')
+  const stat = lockFs.readFileSync('/proc/self/stat', 'utf8')
+  const close = stat.lastIndexOf(')')
+  const fields = stat.slice(close + 1).trim().split(/\s+/)
+  const ownStart = fields[19]
+  assert.ok(/^[0-9]+$/.test(ownStart || ''), `前置：必须读得到本进程启动时钟（实测 ${ownStart}）`)
+  const dir = mkTmpFixture('runlock-sentinel-reclaim-fail-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const sentinelP = p + '.takeover'
+  // 直接造出「上一轮释放哨兵失败后」的盘面：哨兵记着本进程 pid + 本进程真实启动时钟。
+  lockFs.writeFileSync(sentinelP, JSON.stringify({
+    pid: process.pid, startedAt: Date.now() - 1000, token: `${process.pid}:${ownStart}:leftover`, startTicks: ownStart
+  }), { mode: 0o600 })
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const realUnlink = lockFs.unlinkSync
+  let blocked = 0
+  lockFs.unlinkSync = function (target) {
+    if (path.basename(String(target)) === 'run.lock.takeover') {
+      blocked += 1
+      const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.call(lockFs, target)
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'EACCES'
+    }, '自有残留回收失败必须抛出（折叠成 busy ⇒ 入口永远等下一轮）')
+  } finally {
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.strictEqual(blocked >= 1, true, `前置：必须真的试过回收那把自有哨兵（实测 ${blocked} 次）`)
+  assert.ok(thrown && thrown.code === 'EACCES', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.ok(lockFs.existsSync(sentinelP), '回收失败时哨兵必须原样留在盘上（不删、不覆盖）')
+})
+
+// R1-r5 #1：标记必须真的进「本轮结果」——常驻入口只看 App.run 的摘要（不看 _acquireRunLock 的返回值）。
+checkAsync('R1 行为：接管哨兵释放失败 ⇒ App.run 本轮摘要带 sentinelReleaseFailed，且照常推完', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('sentinel-fail-a', '标题甲')])
+    const lockPath = path.join(realFs.realpathSync(cacheDir), 'run.lock')
+    realFs.writeFileSync(lockPath, JSON.stringify({
+      pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+    }), { mode: 0o600 })
+    const realUnlink = lockFs.unlinkSync
+    let blocked = 0
+    lockFs.unlinkSync = function (target) {
+      if (path.basename(String(target)) === 'run.lock.takeover') {
+        blocked += 1
+        const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+        e.code = 'EACCES'
+        throw e
+      }
+      return realUnlink.call(lockFs, target)
+    }
+    let round
+    try {
+      round = await runWithWarnings(h.App)
+    } finally {
+      lockFs.unlinkSync = realUnlink
+    }
+    assert.strictEqual(blocked, 1, '前置：本轮必须真的走到「删自己的哨兵」这一步')
+    assert.strictEqual(round.summary.pushed, 1, `前置：本轮应正常推完 1 条：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(round.summary.sentinelReleaseFailed, true,
+      `哨兵释放失败必须写进本轮摘要（常驻入口据此走失败路径）：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(round.summary.lockReleaseFailed, undefined, '这不是 run.lock 释放失败，不得混标')
+    assert.ok(round.warns.some(l => l.includes('接管哨兵释放失败')), `必须留明确告警：${JSON.stringify(round.warns)}`)
+    assert.ok(realFs.existsSync(lockPath + '.takeover'), '前置：哨兵确实残留（下一轮接管会被它挡住）')
+    assert.ok(!realFs.existsSync(lockPath), '主锁必须照常释放')
   })
 })
 

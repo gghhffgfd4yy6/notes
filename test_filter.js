@@ -5934,10 +5934,14 @@ console.log('========================================\n');
       // v3.418：常驻 worker 复位面（resetRunStateForWorker 的逐项摘要 + 测试钩子）。
       // 可达性门禁（「全部导出被测试引用」）要求每个导出键都在测试源码里出现，故在此登记。
       resetRunStateForWorker: 'function',
-      workerResetHooks: 'object'
+      workerResetHooks: 'object',
+      // R1-r4 #4：常驻 worker 摘要兜底白名单的纯函数（协议级用例直接用它验证「序列化失败时
+      // skipped/holder/lockReleaseFailed 仍在」；用例在 test_worker_protocol.js，本门禁只扫
+      // test_filter/test_app/test_notify_selfcheck 三份源码，故按 v3.418 同一惯例在此登记）。
+      safeSummaryForWorker: 'function'
     }
     const keys = Object.keys(expected)
-    assertEqual(keys.length, 36, `导出键数应为36，实际${keys.length}`)
+    assertEqual(keys.length, 37, `导出键数应为37，实际${keys.length}`)
     for (const [k, type] of Object.entries(expected)) {
       assertEqual(k in mod, true, `缺少导出: ${k}`)
       assertEqual(typeof mod[k], type, `导出类型错误: ${k} 应为${type}`)
