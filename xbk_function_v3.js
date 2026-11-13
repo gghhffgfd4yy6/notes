@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.420 — 关停/取消不再触发一次性重跑 *******
+//* ******* 线报酷推送脚本 v3.421 — 加 run 级跨进程锁，防多入口重叠双跑 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -365,7 +365,7 @@ const FilterStore = profile3Require('xbk_filter_store', () => require('./xbk_fil
 // ============================================================
 // 🚀 App — 主流程层
 // ============================================================
-const { createApp } = profile3Require('xbk_app', () => require('./xbk_app'))
+const { createApp, formatRunBusyLine } = profile3Require('xbk_app', () => require('./xbk_app'))
 const App = createApp({
   Config,
   Utils,
@@ -401,6 +401,13 @@ profile3BootMark('module-load-complete') // 时点：全部本地模块 require 
 
 async function runSingleEntry (app = App) {
   const summary = await app.run()
+  // R1：run 级锁 busy（另一进程正在跑同一缓存目录）**不是失败**——打一行提示、退出码保持 0，
+  // 也不进 classifySummary 的失败分支（它的 failed=0 本就会返回 null，这里显式早退是为了
+  // 让「本轮跳过」在 cron 日志里可读，而不是一片空白）。
+  if (summary && summary.skipped === true) {
+    console.log(formatRunBusyLine(summary))
+    return summary
+  }
   // 单次入口与常驻入口统一失败语义：App.run 保持返回摘要兼容，
   // 但待推送项全部失败时设置非零退出码，不能让调度器误认为成功。
   try {

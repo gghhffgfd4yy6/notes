@@ -96,15 +96,23 @@ const runUnitChecks = async () => {
   const dryRun = await captureConsole(async () => {
     const code = await runDryRunOnce({ run: async () => { dryRunCalls += 1; return { total: 3, filtered: 1, pushed: 0, failed: 0 } } })
     const failCode = await runDryRunOnce({ run: async () => ({ total: 1, pushed: 0, failed: 1, failures: [{ code: 'E_NET', statusCode: 503 }] }) })
-    return { code, failCode }
+    // R1：run 级锁 busy ⇒ 0，且**不得**打印「共 0 条」（会被读成「本轮抓取到 0 条」）。
+    const busyCode = await runDryRunOnce({
+      run: async () => ({ total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, skipped: true, reason: 'RUN_BUSY', holder: { pid: 4242, startedAt: 1760000000000 } })
+    })
+    return { code, failCode, busyCode }
   })
   const dryRunCode = dryRun.value.code
   const dryRunFailCode = dryRun.value.failCode
   assert.strictEqual(dryRunCalls, 1, 'dry-run 只能调用 app.run() 一次（一次性执行）')
   assert.strictEqual(dryRunCode, 0, '单轮成功应返回退出码 0')
   assert.strictEqual(dryRunFailCode, 1, '单轮全失败应返回退出码 1')
-  assert.deepStrictEqual(dryRun.logs, ['dry-run 单轮完成：共 3 条，过滤 1 条，未推送、未写成功缓存'],
-    '捕获范围内必须能看到成功轮的完成行（证明捕获确实包住了被测调用，且没漏到宿主 stdout）')
+  assert.strictEqual(dryRun.value.busyCode, 0, 'run 级锁 busy 不是失败：dry-run 必须返回 0')
+  assert.deepStrictEqual(dryRun.logs, [
+    'dry-run 单轮完成：共 3 条，过滤 1 条，未推送、未写成功缓存',
+    '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过'
+  ], '捕获范围内必须能看到成功轮的完成行 + busy 行（后者不得是「共 0 条」）')
+  assert.ok(!dryRun.logs.some(l => l.includes('共 0 条')), 'busy 不得被当成 dry-run 结果去打印「共 0 条」')
   assert.strictEqual(dryRun.errs.length, 1, '失败轮必须经 console.error 报一条根因')
   assert.strictEqual(console.log, NATIVE_CONSOLE.log, 'captureConsole 必须把 console.log 还原到基线（不得泄漏到后续代码）')
 

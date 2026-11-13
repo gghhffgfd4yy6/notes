@@ -4370,14 +4370,17 @@ console.log('========================================\n');
     }
   })
 
-  await test('MessageStore.init mkdirSync 抛错 → finally/warmupCancelled 仍执行（C042）', async () => {
+  // R1：故障注入点从 `fs.mkdirSync` 改到 `MessageStore.init`。run 级单飞锁现在**先于** init 执行，
+  // 且必须保证锁目录存在（它会在同一个 mkdir 上先失败），因此「mkdir 抛错」已经到不了预热之后的
+  // finally；本用例要守的语义（init 失败时 finally 仍取消预热）不变，改成直接让 init 抛。
+  await test('MessageStore.init 抛错 → finally/warmupCancelled 仍执行（C042）', async () => {
     reset()
     setPushUrl('t_c042_init_finally')
     fakeData = []
     const origCacheDir = Config.cache.dir
     const testCacheDir = DEFAULT_CACHE_DIR + '_c042_missing'
     const testDir = path.join(__dirname, testCacheDir)
-    const origMkdirSync = fs.mkdirSync
+    const origInit = xbk.MessageStore.init
     const dnsMod = require('dns')
     const origLookup = dnsMod.lookup
     const origHasWx = notifyMock.hasWxPusherConfigured
@@ -4390,7 +4393,7 @@ console.log('========================================\n');
       if (typeof opts === 'function') { cb = opts }
       cb(null, '127.0.0.1', 4)
     }
-    fs.mkdirSync = () => { throw new Error('mock mkdir fail') }
+    xbk.MessageStore.init = () => { throw new Error('mock init fail') }
     if (origAbort) {
       AbortController.prototype.abort = function () {
         aborted++
@@ -4404,14 +4407,14 @@ console.log('========================================\n');
       threw = true
     } finally {
       Config.cache.dir = origCacheDir
-      fs.mkdirSync = origMkdirSync
+      xbk.MessageStore.init = origInit
       dnsMod.lookup = origLookup
       if (origHasWx === undefined) delete notifyMock.hasWxPusherConfigured
       else notifyMock.hasWxPusherConfigured = origHasWx
       if (origAbort) AbortController.prototype.abort = origAbort
       try { removeDirInRoot(testDir, __dirname) } catch (e) { /* ignore */ }
     }
-    ok(threw, 'mkdirSync 抛错应使 run 抛错')
+    ok(threw, 'MessageStore.init 抛错应使 run 抛错')
     ok(aborted > 0, 'finally 应取消预热（warmupCancelled/abort 执行）')
   })
 
@@ -4565,6 +4568,55 @@ console.log('========================================\n');
       `同源块提取失败（自身 ${mine.length} / test_filter ${other.length} 字符）——锚点注释失效`)
     assertStrictEqual(mine, other,
       'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
+  })
+
+  // ============================================================
+  // R1：run 级锁跨进程实测
+  // ------------------------------------------------------------
+  // 单进程内的 busy 只能证明判据，不能证明**真实互斥**。这里起两个独立的 node 进程，各自
+  // require xbk_app、在同一个起始时刻（共享时间戳忙等对齐）抢同一个 cacheDir 的 run.lock：
+  // 必须恰好一个成功、一个 busy，且 busy 那方报出的 holder.pid 就是成功那方。
+  // 抢到的一方持锁 400ms 再释放（保证输家看到的是「活着的持有者」，而不是「刚释放的空位」）。
+  // 不碰网络：子进程只建 App、只调锁，不调 run()。
+  await test('R1：两个独立 node 进程同时抢同一 cacheDir 的 run 锁 → 恰好一个成功、一个 busy', async () => {
+    const { execFile } = require('child_process')
+    const dir = path.join(__dirname, DEFAULT_CACHE_DIR + '_r1_runlock')
+    try { removeDirInRoot(dir, __dirname) } catch (e) { /* ignore */ }
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const appPath = path.join(__dirname, 'xbk_app.js')
+    const probe = [
+      `const { createApp } = require(${JSON.stringify(appPath)})`,
+      'const dir = process.argv[1]',
+      'const startAt = Number(process.argv[2])',
+      'const app = createApp({ Config: {}, Utils: {}, MessageStore: { get cacheDir () { return dir } },',
+      '  fs: require("node:fs"), path: require("node:path"), crypto: require("node:crypto") })',
+      'while (Date.now() < startAt) { /* 对齐起跑时刻，让两个进程真的同时抢 */ }',
+      'const got = app._acquireRunLock()',
+      'process.stdout.write("LOCK:" + JSON.stringify({ ok: got.ok === true, busy: got.busy === true, holder: got.holder || null, pid: process.pid }) + "\\n")',
+      'if (got.ok) setTimeout(() => { app._releaseRunLock(got.token); process.exit(0) }, 400)'
+    ].join('\n')
+    const startAt = Date.now() + 1500
+    const runProbe = () => new Promise((resolve, reject) => {
+      execFile(process.execPath, ['-e', probe, dir, String(startAt)], { cwd: __dirname, timeout: 30000 }, (err, stdout) => {
+        if (err) { reject(new Error(`锁探针进程失败：${err.message}；stdout=${String(stdout)}`)); return }
+        const line = String(stdout).split('\n').find(l => l.startsWith('LOCK:'))
+        if (!line) { reject(new Error(`锁探针没有输出 LOCK 行：${String(stdout)}`)); return }
+        resolve(JSON.parse(line.slice('LOCK:'.length)))
+      })
+    })
+    try {
+      const results = await Promise.all([runProbe(), runProbe()])
+      const winners = results.filter(r => r.ok)
+      const losers = results.filter(r => r.busy)
+      assertStrictEqual(winners.length, 1, `必须恰好一个进程拿到锁（实际 ${JSON.stringify(results)}）`)
+      assertStrictEqual(losers.length, 1, `另一个进程必须是 busy（实际 ${JSON.stringify(results)}）`)
+      assertStrictEqual(losers[0].holder && losers[0].holder.pid, winners[0].pid,
+        `busy 那方必须报出真实持有者 pid（实际 ${JSON.stringify(losers[0].holder)} vs 成功方 pid=${winners[0].pid}）`)
+      assertStrictEqual(fs.readdirSync(dir).length, 0,
+        `两个进程都不许在缓存目录里写锁以外的东西（实际 ${fs.readdirSync(dir).join(',')}）`)
+    } finally {
+      try { removeDirInRoot(dir, __dirname) } catch (e) { /* ignore */ }
+    }
   })
 
   // ---------- 计数对账（C5-004）----------

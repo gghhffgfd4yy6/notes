@@ -377,11 +377,26 @@ function describeFailure (info, error) {
   return parts.join('；')
 }
 
+// R1：run 级锁 busy 的提示文案与控制台/直跑入口**同一句**（实现只有一份：xbk_app.formatRunBusyLine）。
+// 必须惰性 require：--status / --check 两条早退路径刻意不加载应用（那会连带 require fuzzball 等
+// 运行期依赖），只有真出现 busy 才需要这句文案。
+function busyRunLine (summary) {
+  return require('../xbk_app').formatRunBusyLine(summary)
+}
+
 async function runResident (app, controller) {
   residentExitCode = 0
   consecutiveRetryableFailures = 0
   const runOnce = async () => {
     const summary = await app.run()
+    // R1：run 级锁 busy ⇒ 按**正常一轮**处理：清零连续失败计数、不叠加退避、不停机，
+    // 下一轮照常轮询（锁一释放自然接上）。当成失败会触发指数退避，busy 期间等于自己把自己
+    // 越推越远；当成 permanent 更会直接停掉常驻循环。
+    if (summary && summary.skipped === true) {
+      consecutiveRetryableFailures = 0
+      console.log(busyRunLine(summary))
+      return summary
+    }
     const resultFailure = classifySummary(summary)
     if (resultFailure) {
       const error = new Error(resultFailure.info && resultFailure.info.message
@@ -498,6 +513,12 @@ function runStatus () {
 // 结果与退出码，而不是落进永不退出的循环里。
 async function runDryRunOnce (app) {
   const summary = await app.run()
+  // R1：run 级锁 busy ⇒ 不是 dry-run 结果，**不能**接着打印「共 0 条 / 过滤 0 条」（那会让人
+  // 误以为本轮抓到了 0 条），只回同一句 busy 提示，退出码 0（不是失败）。
+  if (summary && summary.skipped === true) {
+    console.log(busyRunLine(summary))
+    return 0
+  }
   const resultFailure = classifySummary(summary)
   if (!resultFailure) {
     const total = Number(summary && summary.total) || 0

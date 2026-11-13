@@ -151,5 +151,41 @@ function makeResidentApp (runFn) {
     else delete process.env.XBK_RETRY_BACKOFF_CAP_MS
   }
 
+  // 4. R1：run 级锁 busy（summary.skipped）⇒ 按正常一轮处理：不算失败、不退避、不停机。
+  //    判据用**轮次密度**：interval=10ms、300ms 窗口内若被当成可重试失败，第一次退避就是 1s
+  //    （retryBackoffMs(1)=1000），只可能跑到 1 轮；正常轮询应跑出十几轮以上。
+  {
+    runCalls = 0
+    const busyLines = []
+    const origLog = console.log
+    // 30 轮会跨过 runLoop 的 refreshEvery=10 ⇒ 必须把 agents/notify 换成桩，否则 refreshConnections
+    // 会真的去预热衷实域名（本套件其余用例都只跑 <10 轮，踩不到这条）。
+    mockDeps(false)
+    const appBusy = makeResidentApp(async () => {
+      runCalls++
+      return { total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, skipped: true, reason: 'RUN_BUSY', holder: { pid: 4242, startedAt: 1760000000000 } }
+    })
+    const ctrlBusy = new AbortController()
+    console.log = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('已有运行在跑')) busyLines.push(line)
+    }
+    const busyTimer = setTimeout(() => ctrlBusy.abort(), 400)
+    try {
+      await runResident(appBusy, ctrlBusy)
+    } finally {
+      clearTimeout(busyTimer)
+      console.log = origLog
+      restoreDeps()
+    }
+    // 400ms/10ms 正常应有几十轮；阈值取 5 留足慢机器余量，同时仍能区分「被当失败」——
+    // retryable 第一次退避就是 1000ms（只可能 1 轮）、permanent 更是只跑 1 轮就停机。
+    assert.ok(runCalls >= 5, `busy 轮不得退避/停机：400ms 内应轮询 ≥5 轮（实际 ${runCalls}；被当失败只剩 1 轮）`)
+    assert.ok(busyLines.length >= 5, `每轮 busy 都要留一行提示（实际 ${busyLines.length}）`)
+    assert.strictEqual(busyLines[0], '已有运行在跑（pid=4242, started=2025-10-09 16:53:20），本轮跳过',
+      `busy 文案必须与直跑/控制台入口同一句（实际：${busyLines[0]}）`)
+    assert.strictEqual(ctrlBusy.signal.aborted, true, '前置：本用例靠自己的定时器停止循环（不是被 permanent 停机）')
+  }
+
   console.log('test_qinglong_resident OK')
 })().catch((e) => { console.error(e); process.exit(1) })
