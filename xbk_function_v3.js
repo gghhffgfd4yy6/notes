@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.424 — run 锁释放三态：只有真实 IO 故障才停机，控制台常驻 worker 失败即退出 *******
+//* ******* 线报酷推送脚本 v3.425 — 接管哨兵释放失败可见 + link 回退分支不留空锁 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
@@ -535,8 +535,9 @@ function safeSummaryForWorker (summary) {
     // worker 停机判据。旧白名单只有 total…cacheSaved，兜底一旦触发（summary 里混进循环引用等），
     // busy 轮被降级成「ok + exitCode 0」——控制台按成功清 auto.fails、清降级态并打印「✅ 自动运行
     // 已恢复」，正是 v3.422 修掉的那个缺陷重新出现。
+    // R1-r5 #1：`sentinelReleaseFailed`（接管哨兵没删掉）同理是停机判据，兜底时不能丢。
     for (const key of ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'cacheSaved',
-      'skipped', 'reason', 'lockReleaseFailed']) {
+      'skipped', 'reason', 'lockReleaseFailed', 'sentinelReleaseFailed']) {
       const value = summary ? summary[key] : undefined
       if (value === null || ['number', 'boolean', 'string'].includes(typeof value)) picked[key] = value
     }
@@ -594,6 +595,21 @@ async function runWorkerCommand (line) {
       reply: {
         ok: false,
         error: '本轮 run 锁释放失败：run.lock 仍以本进程 pid 留在缓存目录，继续常驻会每轮被判「已有运行」而永久跳过；按失败退出，由控制台重启新进程接管'
+      },
+      stop: true,
+      status: 1
+    }
+  }
+  // R1-r5 #1：接管哨兵（run.lock.takeover）没删掉同理——它以**本进程活 pid** 留在缓存目录，
+  // 此后该目录下所有入口的接管都会被 readRunLockState 判成 busy（「已有运行在跑（pid=自己）」），
+  // 死锁再也接管不了。App.run 内部会先尝试按「本进程残留」回收，回收不掉才把事实标出来；到这一步
+  // 说明回收也失败了，继续常驻只会永久空转 ⇒ 按失败退出，由控制台重启新进程（pid 变了 ⇒ 哨兵按
+  // 陈旧可回收）。
+  if (summary && summary.sentinelReleaseFailed === true) {
+    return {
+      reply: {
+        ok: false,
+        error: '本轮接管哨兵释放失败：run.lock.takeover 仍以本进程 pid 留在缓存目录，继续常驻会让后续接管永远被判「已有运行」；按失败退出，由控制台重启新进程回收'
       },
       stop: true,
       status: 1

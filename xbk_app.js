@@ -219,27 +219,79 @@ function createApp ({
     console.warn(`⚠️ run 锁文件 fsync 不被当前文件系统支持（${(err && err.code) || '未知错误'}）：继续运行（锁仍独占创建，仅掉电耐久性降级）`)
   }
 
+  /** 写一帧到**已打开的 fd**。fsync 不支持只降级告警（耐久性不可用 ≠ 锁建不起来）。 */
+  const writeRunLockFrameToFd = (fd, frame) => {
+    nodeFs.writeFileSync(fd, frame)
+    try {
+      nodeFs.fsyncSync(fd)
+    } catch (e) {
+      if (!e || !['ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOSYS'].includes(e.code)) throw e
+      warnRunLockFsyncUnsupported(e)
+    }
+  }
+
   /** 写锁帧：独占创建（O_EXCL）+ 0o600。内容只是一帧 JSON，没有任何理由让同组/其他用户可读，
-   *  显式 mode 同时消掉 Sonar/CodeQL 的「过宽权限」判定面。 */
+   *  显式 mode 同时消掉 Sonar/CodeQL 的「过宽权限」判定面。
+   *  只用于**唯一临时名**：写失败时调用方（createRunLockFile 的 finally）会删掉半成品，
+   *  读取侧永远看不到这个文件名，所以这里不必自己善后。 */
   const writeRunLockFrame = (filePath, frame) => {
     const fd = nodeFs.openSync(filePath, 'wx', 0o600)
     try {
-      nodeFs.writeFileSync(fd, frame)
-      try {
-        nodeFs.fsyncSync(fd)
-      } catch (e) {
-        if (!e || !['ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'ENOSYS'].includes(e.code)) throw e
-        warnRunLockFsyncUnsupported(e)
-      }
+      writeRunLockFrameToFd(fd, frame)
     } finally {
       try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
   }
 
+  /** 半写锁的善后：**只有名字仍指向刚创建的那个 inode** 才删。
+   *  为什么必须先复核：这条路径上的名字是**正式锁名**，两步之间可能已被别的进程摘掉并建了
+   *  自己的活锁——按路径盲删就是仓库 CodeQL 铁律禁止的「check 之后按路径 unlink」，也是双跑。
+   *  复核不到（lstat 报错/inode 不符/不是普通文件）就什么都不做，锁是否残留交给下一轮读取侧
+   *  如实判定（fail-closed），绝不猜。 */
+  const discardRunLockFile = (filePath, created) => {
+    if (!created || typeof created.dev !== 'number' || typeof created.ino !== 'number') return
+    try {
+      const now = nodeFs.lstatSync(filePath)
+      if (!now || now.dev !== created.dev || now.ino !== created.ino) return
+      nodeFs.unlinkSync(filePath)
+    } catch (e) { /* 复核/清理失败不改写原错误：至少让入口看到真实故障（R1-r5 #2） */ }
+  }
+
+  /** link 不支持时的回退分支：`open('wx')` 独占占名 + 直接写。
+   *  为什么写失败必须删掉刚占的名字（R1-r5 #2）：open 先把名字占住，write 若 ENOSPC/EIO 就留下
+   *  0 字节或半帧锁；读取侧对「内容不可判定」按 fail-closed 判 busy（R1 设计约束 3），于是该缓存
+   *  目录下**所有入口**此后每轮只打印「已有运行在跑」并 exit 0——零推送、零报错、永不自愈。
+   *  故写失败时按 fd 的 (dev,ino) 复核后删掉刚建的那个名字再抛出（见 discardRunLockFile）。
+   *  为什么不改成「tmp 写全再 rename 占名」：rename 是**覆盖**语义，两个进程同时回退时后一个会
+   *  盖掉前一个刚占好的锁（互斥直接失效）；要保留独占占名只能靠 link，而这条分支的前提正是
+   *  「这个卷不支持 link」。残留窗口只剩「open 与 write 之间被 SIGKILL/掉电」，那不是可捕获错误，
+   *  任何占名式的锁都躲不掉（rename 也一样躲不掉被 kill 在写 tmp 之前）。 */
+  const writeRunLockFallback = (filePath, frame) => {
+    let fd = null
+    let created = null
+    let failure = null
+    try {
+      fd = nodeFs.openSync(filePath, 'wx', 0o600)
+      created = nodeFs.fstatSync(fd)
+      writeRunLockFrameToFd(fd, frame)
+    } catch (e) {
+      failure = e
+    } finally {
+      // 先关 fd 再清理：Windows 上「打开中的文件」删不掉，关掉后同一 (dev,ino) 仍可复核。
+      if (fd !== null) { try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ } }
+    }
+    if (!failure) return
+    // 只清理「自己刚占名并写坏」的那一个 inode；EEXIST（名字被占、我们什么都没建）时 created 为
+    // null，这里什么都不做——绝不能碰别人的锁。
+    discardRunLockFile(filePath, created)
+    throw failure
+  }
+
   /** 独占创建锁文件：内容先写进唯一临时名，再 link 占名——与 open(p,'wx') 同为原子独占，但
    *  **不会留下「名字已占、内容还没写」的空锁**。为什么这点必须守：读取侧对无法解析的锁按
    *  fail-closed 处理（R1 设计约束 3），一个 0 字节锁会永久挡住所有入口。
-   *  不支持硬链接的卷（部分网络卷/容器层）回退「独占创建 + 直接写」，同 console 的 writeLockAtomic。 */
+   *  不支持硬链接的卷（部分网络卷/容器层）回退「独占创建 + 直接写」，且该分支**写失败会删掉自己
+   *  刚占的名字再抛**（R1-r5 #2，见 writeRunLockFallback），不会留下空锁。 */
   const createRunLockFile = (filePath, frame) => {
     const tmp = `${filePath}.${process.pid}.${Date.now()}.${runLockRandom()}.tmp`
     try {
@@ -250,7 +302,7 @@ function createApp ({
         // EEXIST = 锁已存在（正常竞争，上抛给调用方判定）；其余不支持 link 的 errno 才回退。
         if (!e || e.code === 'EEXIST') throw e
         if (!['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'ENOSYS', 'EACCES'].includes(e.code)) throw e
-        writeRunLockFrame(filePath, frame)
+        writeRunLockFallback(filePath, frame)
       }
     } finally {
       try { nodeFs.unlinkSync(tmp) } catch (e) { /* 已被 link 消费或未建成 */ }
@@ -282,9 +334,11 @@ function createApp ({
    *  O_NOFOLLOW 顺带拒绝把锁路径做成符号链接去读/接管别处的文件。
    *  返回：
    *    { state: 'missing' }                              锁刚消失（调用方重试独占创建）
-   *    { state: 'stale', holder, token }                 持有进程已死 / PID 已复用 ⇒ 可接管
-   *    { state: 'busy', holder, token }                   持有进程仍活着 ⇒ **即使锁很旧也不抢**
+   *    { state: 'stale', holder, token, startTicks }      持有进程已死 / PID 已复用 ⇒ 可接管
+   *    { state: 'busy', holder, token, startTicks }       持有进程仍活着 ⇒ **即使锁很旧也不抢**
    *    { state: 'busy', holder: null, corrupted: true }  内容不可判定 ⇒ fail-closed（不静默接管）
+   *  `startTicks` 只是把「帧里那条独立时钟证据」一并交回调用方（R1-r5 #1 用它判定「哨兵是不是
+   *  本进程自己的残留」）；死活判定仍只在上面的 kill/时钟比较里做，token 内容依旧不参与。
    *  EACCES/EISDIR/EIO 等**读取错误不折叠成 busy**：那是真实文件系统故障，如实抛出（fail-loud）。 */
   const readRunLockState = (filePath) => {
     let fd = null
@@ -321,15 +375,17 @@ function createApp ({
       } catch (e) {
         alive = Boolean(e) && e.code === 'EPERM' // EPERM = 进程存在但无权限；ESRCH = 已退出
       }
-      if (!alive) return { state: 'stale', holder, token: frame.token }
+      if (!alive) return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
       // 活着就结束判定：**不按 startedAt/mtime 判陈旧**——长时间运行是正常的，抢锁就是双跑。
       // 只有「pid 还活着但启动时钟对不上」（PID 被复用）才算死主。时钟只认帧里独立的 startTicks；
       // '0'/缺失表示写入方读不到 starttime（非 Linux / 旧帧），那是**没有证据** ⇒ 按存活处理。
       if (frame.startTicks && frame.startTicks !== '0') {
         const actualStart = runLockProcessStart(frame.pid)
-        if (actualStart && actualStart !== frame.startTicks) return { state: 'stale', holder, token: frame.token }
+        if (actualStart && actualStart !== frame.startTicks) {
+          return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
+        }
       }
-      return { state: 'busy', holder, token: frame.token }
+      return { state: 'busy', holder, token: frame.token, startTicks: frame.startTicks }
     } finally {
       try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
@@ -1982,7 +2038,9 @@ function createApp ({
 
     /** run 级单飞锁：获取。成功 `{ ok:true, token }`；有人正在跑 `{ ok:false, busy:true, holder }`；
      *  **真实文件系统错误（EACCES/EROFS/ENOSPC/ENOTDIR…）直接抛**——那是故障，不是 busy
-     *  （R1 设计约束 7：不能把权限/磁盘问题伪装成「已有运行」静默跳过）。 */
+     *  （R1 设计约束 7：不能把权限/磁盘问题伪装成「已有运行」静默跳过）。
+     *  `sentinelReleaseFailed: true` = 接管时哨兵没删掉（R1-r5 #1）：主锁仍归本轮，但
+     *  `run.lock.takeover` 以本进程 pid 留在盘上，事实必须交给入口（见 _takeoverStaleRunLock）。 */
     _acquireRunLock () {
       // 锁目录 = 运行时缓存目录（与 run.log/判重缓存同源）。首轮部署目录可能还不存在，而
       // MessageStore.init() 要到 run 主体里才建 ⇒ 锁必须先保证目录在。recursive:true 对已存在
@@ -2007,11 +2065,35 @@ function createApp ({
         // 持有者活着或锁内容不可判定：两种都是 busy（后者 fail-closed）。**不按时间抢**。
         if (judged.state !== 'stale') return { ok: false, busy: true, holder: judged.holder || null }
         const taken = this._takeoverStaleRunLock(lockPath, frame, token)
-        if (taken.ok) return { ok: true, token }
-        return { ok: false, busy: true, holder: taken.holder || judged.holder || null }
+        // 哨兵释放失败必须一路带到入口（R1-r5 #1）：吞在这里等于「主锁拿到了，但下一次接管永远 busy」。
+        const sentinelFailed = taken.sentinelReleaseFailed === true
+        if (taken.ok) {
+          return sentinelFailed ? { ok: true, token, sentinelReleaseFailed: true } : { ok: true, token }
+        }
+        const busy = { ok: false, busy: true, holder: taken.holder || judged.holder || null }
+        if (sentinelFailed) busy.sentinelReleaseFailed = true
+        return busy
       }
       // 两轮都撞上「刚被释放又刚被抢」：按 busy 收口，不在启动路径上无限重试（下一轮再看）。
       return { ok: false, busy: true, holder: null }
+    },
+
+    /** 哨兵是不是**本进程自己**上一轮没删掉的残留（R1-r5 #1）。
+     *  判据两条独立证据：`pid == 本进程` + 帧里的 `startTicks == 本进程真实启动时钟`；token 内容
+     *  一律不参与（R1 返工 #5：构造的 token 不能成为「这把锁是我的」的证据）。
+     *  为什么这件回收是安全的：`_takeoverStaleRunLock` 是同步临界区（无 await、无回调让出），同一
+     *  进程不可能有两个自己在接管；而 pid+启动时钟唯一确定一个进程身份，所以「本进程 pid + 本进程
+     *  启动时钟」的哨兵只可能是自己上一轮释放失败留下的残留，不可能是并发持有者。
+     *  为什么要回收：这种哨兵带着**本进程活 pid**，readRunLockState 对它永远返回 busy ⇒ 该缓存目录
+     *  下所有入口（含本进程下一轮、别的入口）再也接管不了任何死锁，每轮只打「已有运行在跑
+     *  （pid=自己）」并 exit 0——正是本 PR 要消灭的「永久空转零推送」。 */
+    _isOwnSentinelLeftover (judged) {
+      if (!judged || judged.state !== 'busy' || !judged.holder) return false
+      if (judged.holder.pid !== process.pid) return false
+      const ownStart = runLockProcessStart(process.pid)
+      // 读不到自己的启动时钟（非 Linux / /proc 不可用）就没有证据，按「不是我的」处理（fail-closed）。
+      if (!ownStart) return false
+      return judged.startTicks === ownStart
     },
 
     /** 陈旧锁接管：用 `<lock>.takeover` 哨兵（独占创建，帧里带自己的 token）**串行化**。
@@ -2033,7 +2115,17 @@ function createApp ({
           // 已有接管者在场：活着就让它做完（busy）；只有**哨兵持有者已死**才回收。
           const judged = readRunLockState(sentinelPath)
           if (judged.state === 'missing') continue
-          if (judged.state !== 'stale') return { ok: false, busy: true, holder: judged.holder || null }
+          if (judged.state !== 'stale') {
+            // 哨兵若是本进程自己的残留（上一轮释放哨兵失败），按归属回收后重试；否则 busy。
+            if (this._isOwnSentinelLeftover(judged)) {
+              const own = releaseOwnedLockFile(sentinelPath, judged.token)
+              if (own.state === 'failed') {
+                throw own.error || new Error('接管哨兵残留回收失败：无法删除本进程遗留的 run.lock.takeover（文件系统错误）')
+              }
+              if (own.state !== 'foreign') continue // released / missing：重试独占创建
+            }
+            return { ok: false, busy: true, holder: judged.holder || null }
+          }
           // 回收走「rename 成唯一回收名 → 复核」：只有抢到 rename 的那个进程能回收，
           // 复核发现搬走的是活哨兵必须原样搬回（同 xbk_message_store 的 C3-012 口径）。
           const reclaim = `${sentinelPath}.${process.pid}.${Date.now()}.reclaim`
@@ -2051,38 +2143,60 @@ function createApp ({
           try { nodeFs.unlinkSync(reclaim) } catch (e3) { /* 残留回收名由下一轮接管者再回收 */ }
           continue
         }
+        // R1-r5 #1：**哨兵释放结果不能再被 finally 丢掉**。'failed'（EACCES/EIO/EMFILE…）意味着
+        // run.lock.takeover 会以本进程 pid 留在缓存目录；旧实现既不告警也不进结果 ⇒ 入口照旧返回
+        // 成功/跳过，而下一次接管永远 busy（见 _isOwnSentinelLeftover 的注释）。这里把事实既告警又
+        // 标进本轮结果（抛错时标在错误对象上，与 runLockReleaseFailed 同口径），由常驻入口按不可恢复
+        // 错误停机重启——新进程的 pid 对不上，残留哨兵按陈旧可回收。
+        let outcome = null
+        let bodyError = null
         try {
           const again = readRunLockState(lockPath)
           // 复判：锁已换主/持有者复活 ⇒ 不接管（这一条是「只判断一次」与双跑之间的唯一屏障）。
-          if (again.state === 'busy') return { ok: false, busy: true, holder: again.holder || null }
-          if (again.state === 'stale') {
-            // 按刚才复判到的 pid+token 原子摘除旧锁：摘不掉（别人已接管/内容已换）⇒ busy。
-            // 这里绝不能按路径无条件 unlink——那是仓库 CodeQL 铁律，也会误删别人刚建好的活锁。
-            // R1-r4 #3：**只有「不是我的锁」才收口 busy**。unlink/lstat 的真实失败（EACCES/EROFS/EIO）
-            // 必须原样抛出（specs/R1.md 约束 7）：折叠成 busy 时入口把它当「另一轮在跑」继续等，
-            // 重启后的进程回到同一处又拿回 busy ⇒ 常驻永久空转，只是多了一次重启。
-            const rel = releaseOwnedLockFile(lockPath, again.token, again.holder.pid)
-            if (rel.state === 'failed') {
-              throw rel.error || new Error('接管陈旧 run 锁失败：无法摘除旧锁（文件系统错误）')
+          if (again.state === 'busy') {
+            outcome = { ok: false, busy: true, holder: again.holder || null }
+          } else {
+            if (again.state === 'stale') {
+              // 按刚才复判到的 pid+token 原子摘除旧锁：摘不掉（别人已接管/内容已换）⇒ busy。
+              // 这里绝不能按路径无条件 unlink——那是仓库 CodeQL 铁律，也会误删别人刚建好的活锁。
+              // R1-r4 #3：**只有「不是我的锁」才收口 busy**。unlink/lstat 的真实失败（EACCES/EROFS/EIO）
+              // 必须原样抛出（specs/R1.md 约束 7）：折叠成 busy 时入口把它当「另一轮在跑」继续等，
+              // 重启后的进程回到同一处又拿回 busy ⇒ 常驻永久空转，只是多了一次重启。
+              const rel = releaseOwnedLockFile(lockPath, again.token, again.holder.pid)
+              if (rel.state === 'failed') {
+                throw rel.error || new Error('接管陈旧 run 锁失败：无法摘除旧锁（文件系统错误）')
+              }
+              if (rel.state === 'foreign') outcome = { ok: false, busy: true, holder: again.holder || null }
+              // released / missing：旧锁已不在盘上，继续下面的独占创建。
             }
-            if (rel.state === 'foreign') {
-              return { ok: false, busy: true, holder: again.holder || null }
+            if (!outcome) {
+              // missing（或旧锁刚被本进程摘掉）：独占创建。别人在这条缝里抢先建好活锁时
+              // link 返回 EEXIST ⇒ 按 busy 收口，绝不覆盖。
+              try {
+                createRunLockFile(lockPath, frame)
+                outcome = { ok: true, token }
+              } catch (e) {
+                if (e && e.code === 'EEXIST') outcome = { ok: false, busy: true, holder: null }
+                else throw e
+              }
             }
-            // released / missing：旧锁已不在盘上，继续下面的独占创建。
           }
-          // missing（或旧锁刚被本进程摘掉）：独占创建。别人在这条缝里抢先建好活锁时
-          // link 返回 EEXIST ⇒ 按 busy 收口，绝不覆盖。
-          try {
-            createRunLockFile(lockPath, frame)
-          } catch (e) {
-            if (e && e.code === 'EEXIST') return { ok: false, busy: true, holder: null }
-            throw e
-          }
-          return { ok: true, token }
+        } catch (e) {
+          bodyError = e
+          throw e
         } finally {
-          // 只释放自己那把哨兵（pid+token 归属判定，不按路径无条件删）。
-          releaseOwnedLockFile(sentinelPath, token)
+          // 只释放自己那把哨兵（pid+token 归属判定，不按路径无条件删）。返回值必须接住。
+          const sentinelRel = releaseOwnedLockFile(sentinelPath, token)
+          if (sentinelRel.state === 'failed') {
+            console.warn('⚠️ 接管哨兵释放失败（缓存目录的 run.lock.takeover 仍记着本进程 pid）：该目录后续接管会被它挡住；下一轮先按「本进程残留」自动回收，回收不掉则按失败退出交由重启器清理')
+            if (bodyError) {
+              try { bodyError.sentinelReleaseFailed = true } catch (e) { /* 不可写（冻结/代理错误对象）：至少已告警 */ }
+            } else if (outcome) {
+              outcome.sentinelReleaseFailed = true
+            }
+          }
         }
+        return outcome
       }
       return { ok: false, busy: true, holder: null }
     },
@@ -2105,7 +2219,7 @@ function createApp ({
       // skipped 摘要（入口据此打一行提示、退出码 0），并且本轮不写任何缓存/日志/状态。
       const lock = this._acquireRunLock()
       if (!lock.ok) {
-        return {
+        const busy = {
           total: 0,
           dedup: 0,
           filtered: 0,
@@ -2115,6 +2229,10 @@ function createApp ({
           reason: 'RUN_BUSY',
           holder: lock.holder || null
         }
+        // R1-r5 #1：busy 轮也可能带着「哨兵没删掉」这个事实（接管被复判挡回时哨兵已建）。
+        // 入口据此走失败路径，而不是把这一轮当成「另一轮在跑」静默跳过。
+        if (lock.sentinelReleaseFailed) busy.sentinelReleaseFailed = true
+        return busy
       }
       // 本轮结果先落局部变量、finally 里补「锁没释放」的标记，最后再返回：这样标记与返回走同一个
       // 对象引用（`return await ...` 写在 try 里时，返回的是 finally 执行前的那个值，容易误判）。
@@ -2148,6 +2266,16 @@ function createApp ({
           }
         } else if (rel.state === 'foreign') {
           console.warn('⚠️ run 锁释放跳过：缓存目录里的 run.lock 已不是本进程写的那一把（未删除；下一轮按持有者死活 busy 或接管，不需要重启）')
+        }
+        // R1-r5 #1：接管哨兵没删掉（releaseOwnedLockFile 返回 failed）这件事同样不能静默——它会
+        // 以本进程活 pid 留在缓存目录，挡住该目录后续所有入口的接管。标进本轮结果，由常驻入口
+        // 按不可恢复错误停机重启（新进程 pid 对不上，残留哨兵按陈旧可回收）；一次性入口只留告警。
+        if (lock.sentinelReleaseFailed) {
+          if (bodyError) {
+            try { bodyError.sentinelReleaseFailed = true } catch (e) { /* 不可写：至少已告警 */ }
+          } else if (summary && typeof summary === 'object') {
+            summary.sentinelReleaseFailed = true
+          }
         }
       }
       return summary

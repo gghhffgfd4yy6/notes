@@ -5610,6 +5610,267 @@ check('R1 锁：接管陈旧锁时 unlink 报 EACCES 必须原样抛出（不得
   assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '抛错路径也必须回收接管哨兵（不留 .takeover）')
 })
 
+// R1-r5 #1：接管哨兵（`run.lock.takeover`）的释放结果过去被 finally 整个丢弃——`failed` 时既不告警
+// 也不进本轮结果，哨兵就以**本进程活 pid + 本进程启动时钟**留在缓存目录；此后 readRunLockState 对它
+// 永远返回 busy，该目录下所有入口再也接管不了任何死锁（入口打「已有运行在跑（pid=自己）」、退出码 0、
+// 零告警 ⇒ 永久静默停推）。本用例同时咬两件事，缺任意一半都会红：
+//   ① 失败必须告警 + 标进本轮结果（`_acquireRunLock` 返回值）；
+//   ② 下一轮必须按归属回收自己的残留并完成接管（不是永久 busy）。
+check('R1 锁：接管哨兵释放失败（unlink EACCES）⇒ 告警+标进结果，且下一轮能回收自有残留完成接管', () => {
+  const dir = mkTmpFixture('runlock-sentinel-release-fail-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const sentinelP = p + '.takeover'
+  const deadFrame = (token) => JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token })
+  lockFs.writeFileSync(p, deadFrame(`${RUN_LOCK_DEAD_PID}:0:dead`), { mode: 0o600 })
+  const realUnlink = lockFs.unlinkSync
+  const realWarn = console.warn
+  const warns = []
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  let blocked = 0
+  lockFs.unlinkSync = function (target) {
+    if (path.basename(String(target)) === 'run.lock.takeover') {
+      blocked += 1
+      const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.call(lockFs, target)
+  }
+  let got
+  try {
+    got = app._acquireRunLock()
+  } finally {
+    console.warn = realWarn
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.strictEqual(blocked, 1, '前置：接管路径必须真的试过删掉自己的哨兵（否则没打到故障点）')
+  assert.strictEqual(got.ok, true, `哨兵删不掉不影响本轮持锁（主锁已接管成功）：${JSON.stringify(got)}`)
+  assert.strictEqual(got.sentinelReleaseFailed, true,
+    `哨兵释放失败必须标进本轮结果（旧实现直接丢弃 ⇒ 入口零告警、此后永久 busy）：${JSON.stringify(got)}`)
+  assert.ok(warns.some(l => l.includes('接管哨兵释放失败')), `必须留一条明确告警：${JSON.stringify(warns)}`)
+  assert.ok(lockFs.existsSync(sentinelP), '前置：哨兵确实残留在盘上（这正是「下一次接管永远 busy」的形态）')
+  assert.strictEqual(JSON.parse(lockFs.readFileSync(sentinelP, 'utf8')).pid, process.pid,
+    '残留哨兵必须记着本进程 pid（否则不是「自有残留」这一形态）')
+  // 先证明确实是这个形态挡住了自己：本轮已持主锁，按归属释放后再放一把新的死锁。
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '前置：本轮主锁必须能正常释放')
+  lockFs.writeFileSync(p, deadFrame(`${RUN_LOCK_DEAD_PID}:0:dead2`), { mode: 0o600 })
+  // ② 下一轮必须回收自己的哨兵残留并照常接管（旧实现：永久 busy，holder 是自己）。
+  const again = app._acquireRunLock()
+  assert.strictEqual(again.ok, true,
+    `本进程自己的哨兵残留必须按归属回收后继续接管（不是「已有运行在跑（pid=自己）」永久空转）：${JSON.stringify(again)}`)
+  assert.strictEqual(again.sentinelReleaseFailed, undefined, '这一轮哨兵能正常删除 ⇒ 不得再带失败标记')
+  assert.ok(!lockFs.existsSync(sentinelP), '回收后不得残留 run.lock.takeover')
+  assert.strictEqual(readLockFrame(dir).token, again.token, '接管后锁帧必须是本次 token')
+})
+
+// R1-r5 #2：link 不支持卷的回退分支（`open('wx')` 占名 + 直接写）此前零覆盖。先证明回退分支本身
+// 仍能建锁、且独占语义与主路径一致（第二个入口 EEXIST ⇒ busy，绝不覆盖）。
+check('R1 锁：link 不支持（ENOTSUP）时回退分支仍能建锁并保持独占', () => {
+  const dir = mkTmpFixture('runlock-fallback-ok-')
+  const app = makeLockApp(dir)
+  const realLink = lockFs.linkSync
+  let linkCalls = 0
+  lockFs.linkSync = () => {
+    linkCalls += 1
+    const e = new Error('ENOTSUP: link not supported')
+    e.code = 'ENOTSUP'
+    throw e
+  }
+  let got, second
+  try {
+    got = app._acquireRunLock()
+    second = app._acquireRunLock()
+  } finally {
+    lockFs.linkSync = realLink
+  }
+  assert.ok(linkCalls >= 2, `前置：两次取锁都必须真的走到 link 并失败（实测 ${linkCalls} 次）`)
+  assert.strictEqual(got.ok, true, `回退分支必须能建锁：${JSON.stringify(got)}`)
+  assert.strictEqual(readLockFrame(dir).token, got.token, '回退分支写入的帧必须是本次 token')
+  assert.strictEqual(second.ok, false, `回退分支必须保持独占：${JSON.stringify(second)}`)
+  assert.strictEqual(second.busy, true, '第二次必须是 busy（回退分支 open wx ⇒ EEXIST）')
+  assert.strictEqual(readLockFrame(dir).token, got.token, 'busy 时不得改写已占名的锁')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '回退分支不得残留临时文件')
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '回退分支建的锁必须能正常释放')
+})
+
+// R1-r5 #2：回退分支用 `open('wx')` 先把**正式锁名**占住，写失败（ENOSPC/EIO）就会留下 0 字节或
+// 半帧 run.lock；读取侧对不可判定内容 fail-closed，此后该目录所有入口每轮只打「已有运行在跑」并
+// exit 0（永久静默停推、永不自愈）。必须：写失败 ⇒ 按 (dev,ino) 复核后删掉自己刚占的名字并原样抛出；
+// 随后取锁能成功（不是永久 busy）。
+check('R1 锁：link 不支持的回退分支写失败（ENOSPC）⇒ 删掉半写的锁并抛出，随后能正常取锁', () => {
+  const dir = mkTmpFixture('runlock-fallback-enospc-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const realLink = lockFs.linkSync
+  const realWrite = lockFs.writeFileSync
+  let writeCalls = 0
+  lockFs.linkSync = () => {
+    const e = new Error('ENOTSUP: link not supported')
+    e.code = 'ENOTSUP'
+    throw e
+  }
+  lockFs.writeFileSync = function (target, data, ...rest) {
+    writeCalls += 1
+    // 第 1 次写唯一临时名（必须成功）；第 2 次是回退分支直接写正式锁名 ⇒ 注入 ENOSPC。
+    if (writeCalls === 2) {
+      const e = new Error('ENOSPC: no space left on device, write')
+      e.code = 'ENOSPC'
+      throw e
+    }
+    return realWrite.call(lockFs, target, data, ...rest)
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'ENOSPC'
+    }, '磁盘满必须原样抛给入口（不是伪装成 busy）')
+  } finally {
+    lockFs.linkSync = realLink
+    lockFs.writeFileSync = realWrite
+  }
+  assert.ok(thrown && thrown.code === 'ENOSPC', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.ok(writeCalls >= 2, `前置：必须真的走到回退分支的写入（实测 ${writeCalls} 次写）`)
+  assert.strictEqual(lockFs.existsSync(p), false,
+    '半写的锁必须被删掉：0 字节 run.lock 会被判「内容不可判定 ⇒ busy」，该目录此后永久静默跳过')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), [], '不得残留临时文件或空锁')
+  const got = app._acquireRunLock()
+  assert.strictEqual(got.ok, true, `失败那轮过后必须能正常取锁（不是永久 busy）：${JSON.stringify(got)}`)
+  assert.deepStrictEqual(app._releaseRunLock(got.token), { state: 'released' }, '之后的正常释放不受影响')
+})
+
+// R1-r5 #2：清理半写锁**不能误删别人的锁**——写失败与清理之间，这个名字可能已被别人摘掉并建了
+// 自己的活锁。这里让复核看到不同的 inode（模拟「名字已指向别人的锁」），断言一个字节都不动。
+check('R1 锁：回退分支写失败时锁名已被换成别的 inode ⇒ 不删除（不误删别人的锁）', () => {
+  const dir = mkTmpFixture('runlock-fallback-foreign-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const realLink = lockFs.linkSync
+  const realWrite = lockFs.writeFileSync
+  const realLstat = lockFs.lstatSync
+  let writeCalls = 0
+  let guarded = 0
+  lockFs.linkSync = () => {
+    const e = new Error('ENOTSUP: link not supported')
+    e.code = 'ENOTSUP'
+    throw e
+  }
+  lockFs.writeFileSync = function (target, data, ...rest) {
+    writeCalls += 1
+    if (writeCalls === 2) {
+      const e = new Error('EIO: i/o error, write')
+      e.code = 'EIO'
+      throw e
+    }
+    return realWrite.call(lockFs, target, data, ...rest)
+  }
+  lockFs.lstatSync = function (target, ...rest) {
+    const st = realLstat.call(lockFs, target, ...rest)
+    if (String(target) === p) {
+      guarded += 1
+      return { dev: st.dev, ino: st.ino + 1, isFile: () => true }
+    }
+    return st
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'EIO'
+    }, '写失败必须原样抛出（不是 busy）')
+  } finally {
+    lockFs.linkSync = realLink
+    lockFs.writeFileSync = realWrite
+    lockFs.lstatSync = realLstat
+  }
+  assert.ok(thrown && thrown.code === 'EIO', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.strictEqual(guarded, 1, '前置：清理前必须做过 inode 复核（没查就等于按路径盲删）')
+  assert.ok(lockFs.existsSync(p), '名字已不是刚建的那个 inode ⇒ 不得删除（绝不误删别人的锁）')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '只应留下那个「别人的」锁文件')
+})
+
+// R1-r5 #1：自有残留的回收本身失败（同一处仍在报 EACCES/EIO）时必须原样抛出，不得折叠成 busy。
+// 折叠成 busy 的后果与该缺陷同族：入口当成「另一轮在跑」继续等，下一轮回到同一处又是 busy。
+check('R1 锁：本进程哨兵残留回收失败必须原样抛出（不得折叠成 busy）', () => {
+  if (process.platform !== 'linux') return skip('R1 锁：本进程哨兵残留回收失败', '非 Linux：读不到 /proc/self 启动时钟')
+  const stat = lockFs.readFileSync('/proc/self/stat', 'utf8')
+  const close = stat.lastIndexOf(')')
+  const fields = stat.slice(close + 1).trim().split(/\s+/)
+  const ownStart = fields[19]
+  assert.ok(/^[0-9]+$/.test(ownStart || ''), `前置：必须读得到本进程启动时钟（实测 ${ownStart}）`)
+  const dir = mkTmpFixture('runlock-sentinel-reclaim-fail-')
+  const app = makeLockApp(dir)
+  const p = lockPathOf(dir)
+  const sentinelP = p + '.takeover'
+  // 直接造出「上一轮释放哨兵失败后」的盘面：哨兵记着本进程 pid + 本进程真实启动时钟。
+  lockFs.writeFileSync(sentinelP, JSON.stringify({
+    pid: process.pid, startedAt: Date.now() - 1000, token: `${process.pid}:${ownStart}:leftover`, startTicks: ownStart
+  }), { mode: 0o600 })
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const realUnlink = lockFs.unlinkSync
+  let blocked = 0
+  lockFs.unlinkSync = function (target) {
+    if (path.basename(String(target)) === 'run.lock.takeover') {
+      blocked += 1
+      const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.call(lockFs, target)
+  }
+  let thrown = null
+  try {
+    assert.throws(() => app._acquireRunLock(), (e) => {
+      thrown = e
+      return Boolean(e) && e.code === 'EACCES'
+    }, '自有残留回收失败必须抛出（折叠成 busy ⇒ 入口永远等下一轮）')
+  } finally {
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.strictEqual(blocked >= 1, true, `前置：必须真的试过回收那把自有哨兵（实测 ${blocked} 次）`)
+  assert.ok(thrown && thrown.code === 'EACCES', `抛出的必须是原始错误：${thrown && thrown.message}`)
+  assert.ok(lockFs.existsSync(sentinelP), '回收失败时哨兵必须原样留在盘上（不删、不覆盖）')
+})
+
+// R1-r5 #1：标记必须真的进「本轮结果」——常驻入口只看 App.run 的摘要（不看 _acquireRunLock 的返回值）。
+checkAsync('R1 行为：接管哨兵释放失败 ⇒ App.run 本轮摘要带 sentinelReleaseFailed，且照常推完', async () => {
+  await withRunHarness({}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('sentinel-fail-a', '标题甲')])
+    const lockPath = path.join(realFs.realpathSync(cacheDir), 'run.lock')
+    realFs.writeFileSync(lockPath, JSON.stringify({
+      pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+    }), { mode: 0o600 })
+    const realUnlink = lockFs.unlinkSync
+    let blocked = 0
+    lockFs.unlinkSync = function (target) {
+      if (path.basename(String(target)) === 'run.lock.takeover') {
+        blocked += 1
+        const e = new Error(`EACCES: permission denied, unlink '${target}'`)
+        e.code = 'EACCES'
+        throw e
+      }
+      return realUnlink.call(lockFs, target)
+    }
+    let round
+    try {
+      round = await runWithWarnings(h.App)
+    } finally {
+      lockFs.unlinkSync = realUnlink
+    }
+    assert.strictEqual(blocked, 1, '前置：本轮必须真的走到「删自己的哨兵」这一步')
+    assert.strictEqual(round.summary.pushed, 1, `前置：本轮应正常推完 1 条：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(round.summary.sentinelReleaseFailed, true,
+      `哨兵释放失败必须写进本轮摘要（常驻入口据此走失败路径）：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(round.summary.lockReleaseFailed, undefined, '这不是 run.lock 释放失败，不得混标')
+    assert.ok(round.warns.some(l => l.includes('接管哨兵释放失败')), `必须留明确告警：${JSON.stringify(round.warns)}`)
+    assert.ok(realFs.existsSync(lockPath + '.takeover'), '前置：哨兵确实残留（下一轮接管会被它挡住）')
+    assert.ok(!realFs.existsSync(lockPath), '主锁必须照常释放')
+  })
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。

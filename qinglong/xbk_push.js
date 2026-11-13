@@ -401,6 +401,16 @@ async function runResident (app, controller) {
       error.runLockReleaseFailed = true
       throw error
     }
+    // R1-r5 #1：接管哨兵没删掉（run.lock.takeover 以本进程活 pid 残留）与「锁没释放」同一族：
+    // 该目录后续所有入口的接管都会被判 busy ⇒ 永久空转零推送。App.run 已先试过按本进程残留回收，
+    // 走到这里说明回收也失败 ⇒ 按不可恢复错误停机，让重启器起新进程（pid 变了，哨兵按陈旧可回收）。
+    if (summary && summary.sentinelReleaseFailed === true) {
+      const error = new Error('接管哨兵释放失败：run.lock.takeover 仍以本进程 pid 留在缓存目录，继续常驻会让后续接管永远被判「已有运行」；按不可恢复错误停机，交由重启器起新进程回收')
+      error.failureKind = 'permanent'
+      error.failureReason = 'RUN_LOCK_TAKEOVER_RELEASE_FAILED'
+      error.sentinelReleaseFailed = true
+      throw error
+    }
     // R1：run 级锁 busy ⇒ 按**正常一轮**处理：清零连续失败计数、不叠加退避、不停机，
     // 下一轮照常轮询（锁一释放自然接上）。当成失败会触发指数退避，busy 期间等于自己把自己
     // 越推越远；当成 permanent 更会直接停掉常驻循环。

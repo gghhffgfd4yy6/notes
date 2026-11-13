@@ -224,5 +224,37 @@ function makeResidentApp (runFn) {
     assert.ok(!leakLines.some(l => l.includes('已有运行在跑')), '不得把「锁残留」当成 busy 正常轮')
   }
 
+  // 6. R1-r5 #1：summary.sentinelReleaseFailed（接管哨兵 run.lock.takeover 以本进程活 pid 残留）与
+  //    lockReleaseFailed 同一族：此后该缓存目录下所有入口的接管都会被判「已有运行（pid=自己）」⇒
+  //    永久空转零推送。必须同样走 permanent 停机路径，不能被当成正常轮继续跑。
+  {
+    runCalls = 0
+    const sentinelLines = []
+    const origLog = console.log
+    const origErr = console.error
+    const appSentinelLeak = makeResidentApp(async () => {
+      runCalls++
+      return { total: 1, pushed: 1, failed: 0, sentinelReleaseFailed: true }
+    })
+    const ctrlSentinel = new AbortController()
+    console.log = () => {}
+    console.error = (...a) => {
+      const line = a.map(String).join(' ')
+      if (line.includes('接管哨兵')) sentinelLines.push(line)
+    }
+    const sentinelTimer = setTimeout(() => ctrlSentinel.abort(), 400)
+    try {
+      await runResident(appSentinelLeak, ctrlSentinel)
+    } finally {
+      clearTimeout(sentinelTimer)
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.strictEqual(ctrlSentinel.signal.aborted, true, '哨兵释放失败必须触发 controller.abort()（不能静默续跑）')
+    assert.strictEqual(runCalls, 1, `哨兵释放失败后必须停止，只跑 1 轮（实际 ${runCalls}）`)
+    assert.ok(sentinelLines.some(l => l.includes('接管哨兵')),
+      `必须留下「接管哨兵释放失败」的失败日志（否则运维只看到一切正常）：${JSON.stringify(sentinelLines)}`)
+  }
+
   console.log('test_qinglong_resident OK')
 })().catch((e) => { console.error(e); process.exit(1) })

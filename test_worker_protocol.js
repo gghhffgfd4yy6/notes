@@ -340,6 +340,68 @@ test('真实 worker：本轮锁释放失败（unlink EACCES）⇒ 按失败停�
   }
 })
 
+// R1-r5 #1：接管哨兵（run.lock.takeover）删不掉时，哨兵以**本进程活 pid** 留在缓存目录，此后该目录
+// 下所有入口的接管都会被 readRunLockState 判成 busy（「已有运行在跑（pid=自己）」）——死锁再也接管
+// 不了、零推送零报错。旧实现把 finally 里的释放结果整个丢弃，worker 照旧回报 ok/busy。
+// 预载脚本把这一轮变成确定性的「哨兵释放失败」：① 接口抓取返回空数组（不联网）；② 预置一把可接管
+// 的陈旧锁（pid 是本进程、startTicks 写成不可能的 '1' ⇒ 按 PID 复用判死主），把本轮带进接管路径；
+// ③ 删 run.lock.takeover 一律 EACCES（真实进程、真实 unlink 调用，只把内核拒绝换成确定 errno）。
+const SENTINEL_RELEASE_FAIL_PRELOAD = `'use strict'
+const Module = require('node:module')
+const nodePath = require('node:path')
+const fs = require('node:fs')
+const origLoad = Module._load
+Module._load = function (request, parent, isMain) {
+  const exported = origLoad.apply(this, arguments)
+  if (request === './xbk_http' && exported && !exported.__xbkEmptyList) {
+    exported.__xbkEmptyList = true
+    exported.fetchJson = async () => []
+  }
+  return exported
+}
+const dir = process.env.XBK_CACHE_DIR
+if (dir) {
+  fs.writeFileSync(nodePath.join(dir, 'run.lock'), JSON.stringify({
+    pid: process.pid, startedAt: Date.now() - 1000, token: process.pid + ':1:stale', startTicks: '1'
+  }), { mode: 0o600 })
+}
+const realUnlink = fs.unlinkSync
+fs.unlinkSync = function (target) {
+  if (nodePath.basename(String(target)) === 'run.lock.takeover') {
+    const e = new Error('EACCES: permission denied, unlink ' + target)
+    e.code = 'EACCES'
+    throw e
+  }
+  return realUnlink.apply(fs, arguments)
+}
+`
+
+test('真实 worker：接管哨兵释放失败（unlink EACCES）⇒ 按失败停机（ok:false + 退出码 1），不再回报 ok/busy', async () => {
+  const dir = dirOf('sentinel-release-fail')
+  const preload = writeStub('preload-sentinel-release-fail.js', SENTINEL_RELEASE_FAIL_PRELOAD)
+  const worker = startRawWorker(dir, { NODE_OPTIONS: `--require ${preload}` })
+  try {
+    worker.send({ cmd: 'run', args: [] })
+    const reply = await worker.next()
+    assert.strictEqual(reply.ok, false,
+      `哨兵释放失败必须按失败回报（旧实现吞掉释放结果 ⇒ 回 ok + exitCode 0，控制台判 busy、永久空转）：${JSON.stringify(reply)}`)
+    assert.match(String(reply.error), /接管哨兵/, `失败原因必须写明哨兵没删掉：${JSON.stringify(reply)}`)
+    assert.ok(runLogSummaries(dir).length >= 1,
+      '前置：本轮必须真的跑完并写 run.log（否则测的是别的错误路径）')
+    const exited = await withTimeout(worker.exited, 5000, '哨兵释放失败后 worker 必须退出（交控制台重启新进程回收）')
+    assert.strictEqual(exited.code, 1, `worker 必须以非零退出码退出：${JSON.stringify(exited)}`)
+    // 哨兵确实以该 worker 的 pid 留在盘上：这正是「此后每次接管都 busy（pid=自己）」的形态。
+    const sentinel = path.join(dir, 'run.lock.takeover')
+    assert.ok(fs.existsSync(sentinel), '前置：残留哨兵必须留在盘上（否则测的不是「哨兵没删掉」这一形态）')
+    const frame = JSON.parse(fs.readFileSync(sentinel, 'utf8'))
+    assert.strictEqual(frame.pid, worker.child.pid, `残留哨兵必须记着该 worker 的 pid：${JSON.stringify(frame)}`)
+    // 主锁照常释放（哨兵删不掉不影响 run.lock 的释放）。
+    assert.ok(!fs.existsSync(path.join(dir, 'run.lock')), '主锁必须照常释放（哨兵失败不等于主锁失败）')
+  } finally {
+    if (worker.child.exitCode === null && worker.child.signalCode === null) worker.kill('SIGKILL')
+  }
+})
+
 test('接线：控制台拿到「锁释放失败」的 worker 结果 ⇒ 本轮判 failed（不是 ok、也不是 busy）', async () => {
   const dir = dirOf('release-fail-console')
   const preload = writeStub('preload-release-fail-console.js', RELEASE_FAIL_PRELOAD)
@@ -386,7 +448,9 @@ test('协议：摘要无法 JSON.stringify 时，兜底白名单仍保留 busy/�
     skipped: true,
     reason: 'RUN_BUSY',
     holder: { pid: 4242, startedAt: 1760000000000 },
-    lockReleaseFailed: true
+    lockReleaseFailed: true,
+    // R1-r5 #1：接管哨兵没删掉同样是把入口永久堵死的停机判据，兜底时不能丢。
+    sentinelReleaseFailed: true
   }
   busy.self = busy
   assert.throws(() => JSON.stringify(busy), '前置：这份摘要必须真的无法 JSON.stringify（否则走的是正常路径）')
@@ -398,6 +462,8 @@ test('协议：摘要无法 JSON.stringify 时，兜底白名单仍保留 busy/�
     `holder 必须按浅对象保留（busy 文案要用它）：${JSON.stringify(picked)}`)
   assert.strictEqual(picked.lockReleaseFailed, true,
     `lockReleaseFailed 必须保留（常驻 worker 据此停机）：${JSON.stringify(picked)}`)
+  assert.strictEqual(picked.sentinelReleaseFailed, true,
+    `sentinelReleaseFailed 必须保留（接管哨兵残留也据此停机）：${JSON.stringify(picked)}`)
   assert.strictEqual(picked.total, 3, `计数照旧保留：${JSON.stringify(picked)}`)
   // 白名单只搬标量/已知浅对象：其它任意对象（可能带循环引用）不得透传进协议行。
   const noisy = { total: 0, detail: { deep: busy } }
