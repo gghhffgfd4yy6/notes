@@ -400,7 +400,7 @@ function createApp ({
    *  R1-r3 #3：**判据与处置必须同一条上限**。判据（readRunLockState）早已按 RUN_LOCK_MAX_BYTES
    *  拒绝超限锁，处置这里却用 readFileSync 整读——锁路径被换成大文件（日志、镜像、别的程序
    *  误写）时，释放路径会把它整块读进内存（可能 OOM），而它按定义就不是本进程写的那一帧。
-   *  R1-r4 #2/#3：返回值从 bool 改成**三态结果**。旧实现把三类完全不同的情形压成同一个 false：
+   *  R1-r4 #2/#3：返回值从 bool 改成**四态结果**。旧实现把三类完全不同的情形压成同一个 false：
    *    ① 盘上已经是别人的锁 / 名字已换成别的 inode（本进程那把锁早已不在盘上——不该删、也不是故障）；
    *    ② unlink/lstat/open 的真实 IO 故障（EACCES/EROFS/EIO…，锁确实可能还留在盘上）；
    *    ③ 读不出内容 / 超过 4 KiB（按「不是我的帧」处理）。
@@ -2201,7 +2201,7 @@ function createApp ({
       return { ok: false, busy: true, holder: null }
     },
 
-    /** run 级单飞锁：释放。返回三态结果（见 releaseOwnedLockFile 的契约）：
+    /** run 级单飞锁：释放。返回四态结果（见 releaseOwnedLockFile 的契约）：
      *  `released` / `missing` 都表示本进程的锁已不占盘；`foreign` = 盘上那把是别人的（不删、只告警）；
      *  `failed` = 真实 IO 故障（锁可能仍在盘上，常驻入口据此停机）。 */
     _releaseRunLock (token) {
