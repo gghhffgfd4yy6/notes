@@ -82,6 +82,34 @@ const DEFAULTS = {
   bogus: '不是白名单字段'
 }
 
+// ── Stryker 插桩沙箱的源码形状断言闸（T1）─────────────────────────────────
+// 变异运行时 Stryker 把被变异的源文件插桩：表达式包成 stryMutAct_*/stryCov_*，且由它自己的
+// printer 重排版（实测 `readSafeTextResult(paths.file, X, {` → `... , stryMutAct_9fa48("3014")
+// ? {} : (stryCov_9fa48("3014"), {`）。于是「读源文件 + 按源码文本断言」的用例在沙箱里必假红，
+// 与功能无关。命中插桩时**只跳过那几条源码形状断言**并单独计数（不冒充通过），同一用例里的
+// 行为断言照跑；正常运行时守卫恒不命中，原断言照常执行。
+const INSTRUMENTED_SOURCES = (() => {
+  const hit = new Set()
+  for (const rel of ['scripts/console.js']) {
+    let text = ''
+    try {
+      text = fs.readFileSync(path.join(__dirname, rel), 'utf8')
+    } catch (e) {
+      // 读不到按「未插桩」处理：守卫不命中，原断言照常执行并响亮失败（不吞异常）
+      text = ''
+    }
+    if (text.includes('stryMutAct_')) hit.add(rel)
+  }
+  return hit
+})()
+let sourceShapeSkipped = 0
+function skipIfInstrumented (label, rel = 'scripts/console.js') {
+  if (!INSTRUMENTED_SOURCES.has(rel)) return false
+  sourceShapeSkipped++
+  console.log(`  ⏭️ ${label}：Stryker 沙箱内 ${rel} 已插桩，源码形状断言不适用`)
+  return true
+}
+
 let pass = 0
 let fail = 0
 function test (name, fn) {
@@ -1395,6 +1423,7 @@ test('appliedLastGoodUsed 口径：只有 source=corrupt 且 lastGoodUsed=true �
 })
 
 test('控制台口径：GET /api/config/filter 的 lastGoodUsed 取自 applied，不用控制台进程自己的 LKG', () => {
+  if (skipIfInstrumented('控制台 lastGoodUsed 接线（源码形状断言）')) return
   // 本 item 只允许跑 test_filter_store/test_filter 两个定向套件（console 套件不在其中），
   // 故这处接线用源码断言锁定：回退成 loaded.lastGoodUsed（控制台进程读文件时的 LKG）即变红。
   const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
@@ -2023,6 +2052,7 @@ server.listen(0, '127.0.0.1', async () => {
 })
 
 test('R1-3 静态接线：备份当前一代的读必须显式 openNonBlocking（回退成裸读即红）', () => {
+  if (skipIfInstrumented('R1-3 备份当前一代 openNonBlocking（源码形状断言）')) return
   const src = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
   const line = src.split('\n').find(l => l.includes('readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES'))
   assert.ok(line, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）')
@@ -2206,4 +2236,5 @@ if (process.env.XBK_FILTER_STORE_ASYNC_PROBE === '1') {
 }
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
+console.log(`源码形状断言跳过 ${sourceShapeSkipped} 条（Stryker 插桩沙箱）`)
 if (fail === 0) fs.rmSync(tmp, { recursive: true, force: true })

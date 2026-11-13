@@ -238,6 +238,35 @@ function assertEqual (actual, expected, msg) {
   }
 }
 
+// ── Stryker 插桩沙箱的源码形状断言闸（T1）──────────────────────────────────
+// 变异运行时 Stryker 把被变异的源文件插桩（表达式包成 stryMutAct_*/stryCov_*），并用它自己的
+// printer 重排版——实测 xbk_app.js 的 `_readSimilarWindow (filePath) {` 在沙箱里变成
+// `_readSimilarWindow(filePath) {`，`openNonBlocking: true` 变成
+// `openNonBlocking: stryMutAct_… ? false : true`。故「读源文件 + 按源码文本断言」的用例在沙箱里
+// 必假红，与功能无关。命中插桩时只跳过那几条源码形状断言并单独计数（不冒充通过）；正常运行时
+// 守卫恒不命中，原断言照常执行。
+const INSTRUMENTED_SOURCES = (() => {
+  const hit = new Set()
+  for (const rel of ['xbk_app.js']) {
+    let text = ''
+    try {
+      text = require('node:fs').readFileSync(path.join(__dirname, rel), 'utf8')
+    } catch (e) {
+      // 读不到按「未插桩」处理：守卫不命中，原断言照常执行并响亮失败（不吞异常）
+      text = ''
+    }
+    if (text.includes('stryMutAct_')) hit.add(rel)
+  }
+  return hit
+})()
+let sourceShapeSkipped = 0
+function skipIfInstrumented (label, rel = 'xbk_app.js') {
+  if (!INSTRUMENTED_SOURCES.has(rel)) return false
+  sourceShapeSkipped++
+  console.log(`  ⏭️ ${label}：Stryker 沙箱内 ${rel} 已插桩，源码形状断言不适用`)
+  return true
+}
+
 // C4-024：Config.cache.maxSize 的「保存 → 设置 → 还原」样板曾原样重复 16 份（5 处 100、两处 2、
 // 字符串/小数/0 各一处等），每份都手写一遍 try/finally。样板的问题不是长，而是「漏一处就静默泄漏」：
 // 少写 finally 或 finally 里少还原一处，都会把临时上限留给后续用例，且失败现场看不出是谁改的。
@@ -11099,6 +11128,7 @@ process.stdout.write(JSON.stringify({ statuses, ms: Date.now() - t0 }))
   // 无法在不跑整轮的前提下做行为级 FIFO 探针）；这里按源码锁住「该读取点必须带 openNonBlocking」——
   // 回退这一行（或把读取挪去别处绕过本函数）即变红。
   await test('F4-2 similar-<cache>.json 读取必须 openNonBlocking（_readSimilarWindow 读取点按源码锁定）', () => {
+    if (skipIfInstrumented('F4-2 _readSimilarWindow 读取点（源码形状断言）')) return
     const src = require('node:fs').readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
     const start = src.indexOf('_readSimilarWindow (filePath)')
     assertEqual(start >= 0, true, 'xbk_app.js 里必须仍有 _readSimilarWindow(filePath) 这处读取入口（找不到说明改动把入口改名了，需同步本断言）')
@@ -12013,6 +12043,9 @@ process.stdout.write(JSON.stringify({ statuses, ms: Date.now() - t0 }))
     // 删不掉就留痕（不再静默）：分片目录滞留仓库根正是本仓修过的事故，只 warn 不改退出码
     cleanupDirInRoot(CACHE)
   }
+
+  // 源码形状断言在 Stryker 插桩沙箱里被守卫跳过：单独出数，避免「少跑几条」被绿色横幅掩盖
+  console.log(`源码形状断言跳过 ${sourceShapeSkipped} 条（Stryker 插桩沙箱）`)
 
   // 汇总横幅：必须覆盖**全部**顶层用例（原因见上方 cleanupTestCache 前的 C4-001 说明）
   if (failed === 0) {
