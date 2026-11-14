@@ -428,17 +428,34 @@ function makeLogFs (over = {}) {
   // C1-020：锁文件的真实内容（writeSync 写进去的 pid:start 令牌）。释放路径要靠读回它来证明
   // 「锁仍是本进程的」——桩不模拟这一点，令牌校验就永远不会被这些既有用例执行到。
   let lockText = ''
+  // fd → 打开路径：_writeRunLog 改为「openSync('a+') + writeSync + fstatSync/readSync 同一个 fd」后，
+  // 桩靠这张表把日志 fd 上的写入仍按 append 语义记录（[路径, 文本, 'utf8']），
+  // 既有「整行落盘」断言都断言路径与内容，不必跟着实现细节改写。
+  const fdPaths = new Map()
   const stub = {
     existsSync: () => true,
     openSync (p, flag) {
       rec.open.push([p, flag])
-      if (over.openSync) return over.openSync(p, flag)
-      // R2-1：周标记与 run.log 锁在同一轮里可以是**两个同时打开的 fd**；桩不能让它们映射到同一个
-      // 号数——同号时 _writeWeekMarker 的 finally 看起来像「把锁 fd 多关了一次」，掩盖真正的归属判断。
-      if (String(p).endsWith('.week')) return 9
-      return flag === 'r+' ? 8 : 7
+      const fd = over.openSync
+        ? over.openSync(p, flag)
+        : (String(p).endsWith('.week') ? 9 : (flag === 'a+' ? 6 : 7))
+      fdPaths.set(fd, p)
+      return fd
     },
-    writeSync (fd, data) { rec.write.push([fd, String(data)]); lockText = String(data) },
+    writeSync (fd, data) {
+      const target = fdPaths.get(fd)
+      if (typeof target === 'string' && (target.endsWith('.log') || target.endsWith('.ndjson'))) {
+        if (over.appendThrows) throw new Error('append 失败')
+        rec.append.push([target, String(data), 'utf8'])
+        return
+      }
+      rec.write.push([fd, String(data)])
+      lockText = String(data)
+    },
+    fstatSync (fd) {
+      if (over.fstatThrows) throw new Error('fstat 失败')
+      return { size: over.size === undefined ? 0 : over.size, mtimeMs: over.mtimeMs === undefined ? Date.now() : over.mtimeMs, isFile: () => true }
+    },
     readFileSync (p) {
       if (over.readFileSync) return over.readFileSync(p)
       return lockText
@@ -473,7 +490,7 @@ function makeLogFs (over = {}) {
     closeSync (fd) { rec.close.push(fd) },
     unlinkSync (p) { rec.unlink.push(p) }
   }
-  return { rec, stub }
+  return { rec, stub, fdPaths }
 }
 
 function makeUtils (over = {}) {
@@ -626,10 +643,11 @@ check('_writeRunLog 正常追加：默认 run.log、utf8、锁令牌 pid:start�
   const rec = makeLogFs()
   const { app } = makeLogApp({ rec })
   app._writeRunLog('hello\n')
-  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx']])
+  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx'], [LOG_PATH, 'a+']],
+    '日志只开一个追加 fd（a+），不得再按路径开 r+')
   assert.deepStrictEqual(rec.rec.write, [[7, `${process.pid}:42`]])
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'hello\n', 'utf8']])
-  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.close, [6, 7], '先关日志 fd、再关锁 fd')
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
 })
 
@@ -639,11 +657,11 @@ check('_writeRunLog 锁异常（EACCES）⇒ fail-open 仅追加；超限也不�
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('data\n')
   assert.deepStrictEqual(rec.rec.append.map((a) => a[1]), ['data\n'])
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx']) // 不得在无锁时开 r+
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'], '无锁时只开追加 fd，不得开读写截尾 fd')
   assert.strictEqual(rec.rec.read.length, 0)
   assert.strictEqual(cap.length, 0)
   assert.strictEqual(rec.rec.unlink.length, 0)
-  assert.strictEqual(rec.rec.close.length, 0)
+  assert.deepStrictEqual(rec.rec.close, [8], '只关本函数打开的日志 fd，锁没拿到就没有锁 fd 可关')
 })
 
 check('_writeRunLog 陈旧锁且持有进程已退出 ⇒ 抢占 unlink 后重试成功', () => {
@@ -656,7 +674,7 @@ check('_writeRunLog 陈旧锁且持有进程已退出 ⇒ 抢占 unlink 后重�
   app._writeRunLog('a\n')
   assert.strictEqual(rec.rec.unlink.length, 2)
   assert.strictEqual(rec.rec.unlink[0], LOCK_PATH)
-  assert.strictEqual(rec.rec.open.length, 2)
+  assert.strictEqual(rec.rec.open.length, 3) // wx 首试(抛) + wx 重试 + 日志 a+
   assert.strictEqual(rec.rec.append.length, 1)
 })
 
@@ -681,7 +699,7 @@ check('_writeRunLog 新鲜锁（mtime 未超龄）⇒ 查 mtime 后退避重试�
   const { app } = makeLogApp({ rec })
   app._writeRunLog('a\n')
   assert.strictEqual(rec.rec.unlink.length, 1)
-  assert.strictEqual(rec.rec.stat.length, 2)
+  assert.strictEqual(rec.rec.stat.length, 1, '只查锁文件 mtime；日志长度改走 fstat(fd)，不再按路径 stat')
   assert.strictEqual(rec.rec.append.length, 1)
 })
 
@@ -691,11 +709,11 @@ check('_writeRunLog 追加失败 ⇒ 静默吞掉、不截尾，锁仍被清理'
   assert.strictEqual(app._writeRunLog('x\n'), undefined)
   assert.strictEqual(cap.length, 0)
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
-  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.close, [6, 7], '日志 fd 与锁 fd 都必须关闭')
 })
 
-check('_writeRunLog 追加后 statSync 失败 ⇒ 静默，锁清理不跳过', () => {
-  const rec = makeLogFs({ statThrows: true })
+check('_writeRunLog 追加后 fstatSync 失败 ⇒ 静默，锁清理不跳过', () => {
+  const rec = makeLogFs({ fstatThrows: true })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('x\n')
   assert.strictEqual(rec.rec.append.length, 1)
@@ -713,7 +731,7 @@ check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍�
       const { app } = makeLogApp({ rec })
       app._writeRunLog('x\n')
       const tag = `fd=${fd} appendThrows=${appendThrows}`
-      assert.deepStrictEqual(rec.rec.close, [], `${tag}: 不得 close stdio，实际 close：${rec.rec.close.join(',')}`)
+      assert.deepStrictEqual(rec.rec.close, [8], `${tag}: 不得 close stdio（只关本函数打开的日志 fd），实际 close：${rec.rec.close.join(',')}`)
       assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], `${tag}: 锁文件必须清理（漏删会让后续轮次一直被旧锁挡住）`)
     }
   }
@@ -724,14 +742,14 @@ check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍�
 // 读 constants 那一步抛的 TypeError 穿出 _writeWeekMarker 后被 _writeRunLog 最外层 catch 静默吞掉，
 // 于是「每行日志都走无标记分支」的桩环境下所有 append 变成空数组（test_app_unit 28 例红）。
 // 下面两条分别钉住「缺能力不炸」与「能力齐了必须用 node:fs 的真常量 + 只关自己的 fd」。
-check('R2-1 _writeWeekMarker 容忍注入 fs 的能力子集：缺 fstatSync 就不开 fd、不抛、不误报，日志照常追加', () => {
-  const rec = makeLogFs() // 该桩无 constants / fstatSync / writeFileSync，只有 openSync/closeSync/appendFileSync
+check('R2-1 _writeWeekMarker 容忍注入 fs 的能力子集：缺 writeFileSync 就不开 fd、不抛、不误报，日志照常追加', () => {
+  const rec = makeLogFs() // 该桩无 constants / writeFileSync（fstatSync 只服务日志 fd），能力不齐就不开周标记
   const { app } = makeLogApp({ rec })
   const r = withCapture('warn', () => app._writeRunLog('x\n'))
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']],
     '整行日志必须照常落盘（能力缺失若抛穿，append 会变成空数组）')
-  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx']],
-    '能力不足时不得去开周标记：没有 fstat 就无法排除「把周键写进 FIFO/设备」')
+  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx'], [LOG_PATH, 'a+']],
+    '能力不足时不得去开周标记：没有 fstat/writeFileSync 就无法排除「把周键写进 FIFO/设备」')
   const markerWarns = r.msgs.filter((m) => m.includes('日志周标记'))
   assert.deepStrictEqual(markerWarns, [], `能力缺失不是运行故障，不得告警：${JSON.stringify(r.msgs)}`)
 })
@@ -761,8 +779,8 @@ check('R2-1 能力齐备 ⇒ 周标记用 node:fs 常量非阻塞写当周键并
     const bit = nodeFs.constants[name]
     assert.strictEqual(flags & bit, bit, `flags 必须含 ${name}（常量只能取 node:fs，不得读注入对象）`)
   }
-  assert.deepStrictEqual(rec.rec.close, [9, 7],
-    `只关「本函数 open 成功的周标记 fd」与锁 fd 各一次，实际：${JSON.stringify(rec.rec.close)}`)
+  assert.deepStrictEqual(rec.rec.close, [9, 8, 7],
+    `只关「本函数 open 成功的周标记 fd」「日志 fd」与锁 fd 各一次，实际：${JSON.stringify(rec.rec.close)}`)
 })
 
 // ----- R2-2：周标记写失败告警必须 60s 限频（与相邻的归档失败告警同口径） -----
@@ -925,10 +943,10 @@ check('_writeRunLog size > 1MiB ⇒ 从 size-KEEP 扫描换行，只写回保留
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   const lastRead = rec.rec.read[rec.rec.read.length - 1]
-  assert.deepStrictEqual(lastRead, [8, rest.length, 2 * LIMIT - rest.length, rest.length],
+  assert.deepStrictEqual(lastRead, [6, rest.length, 2 * LIMIT - rest.length, rest.length],
     '扫描定位后只读保留段（最后一个换行之后）')
   assert.ok(rec.rec.read.length > 1, '换行在 10MiB 窗口之外时必须先向前扫描')
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
@@ -939,7 +957,7 @@ check('_writeRunLog 整份文件无换行 ⇒ 放弃截尾、不写半行、原�
   const t0 = 1700000000000
   const r = withFixedNow(t0, () => withCapture('warn', () => app._writeRunLog('l\n')))
   assert.deepStrictEqual(cap, [], '不得写回任何内容——写 trimmed 等于把窗口起点的半行当成新文件头（丢一半 + 首行残缺）')
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'], '仍要读尾部尝试截尾')
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'], '仍要读尾部尝试截尾')
   assert.ok(r.msgs.some((m) => m.includes('截尾放弃') && m.includes(LOG_PATH)),
     `放弃截尾必须 WARN 并点名文件：${JSON.stringify(r.msgs)}`)
   assert.strictEqual(app._logRotateBackoffByPath.get(LOG_PATH), t0 + 60 * 1000, '放弃后必须对这条日志退避 60s（否则每次追加都重读 10MiB）')
@@ -947,10 +965,10 @@ check('_writeRunLog 整份文件无换行 ⇒ 放弃截尾、不写半行、原�
 
 check('_writeRunLog 一条日志的截尾退避不影响另一条白名单日志', () => {
   const rec = makeLogFs({ size: 2 * LIMIT, tail: 'N'.repeat(100) })
-  const origStat = rec.stub.statSync
-  rec.stub.statSync = (p) => {
-    if (p === LOG_PATH) return origStat(p)
-    return { size: 0, mtimeMs: Date.now() }
+  const origFstat = rec.stub.fstatSync
+  rec.stub.fstatSync = (fd) => {
+    if (rec.fdPaths.get(fd) === LOG_PATH) return origFstat(fd)
+    return { size: 0, mtimeMs: Date.now(), isFile: () => true }
   }
   const { app, rec: calls } = makeLogApp({ rec })
   const t0 = 1700000000000
@@ -1026,7 +1044,7 @@ check('_writeRunLog 尾部多个换行 ⇒ 保留约 KEEP 字节、从换行处�
   assert.strictEqual(cap[0][0], LOG_PATH)
   // 保留段起点 = 夹具里 '\n' 之后的字节：读位置必须正好跨过那个换行（否则会把半行当新文件头）。
   const lastRead = rec.rec.read[rec.rec.read.length - 1]
-  assert.deepStrictEqual(lastRead, [8, rest.length, 2 * LIMIT - rest.length, rest.length],
+  assert.deepStrictEqual(lastRead, [6, rest.length, 2 * LIMIT - rest.length, rest.length],
     '读起点必须是换行之后的第一个字节（从换行处对齐）')
   assert.ok(kept.length > KEEP - 1024 && kept.length <= KEEP,
     `保留段必须约为 KEEP（实际 ${kept.length}，KEEP=${KEEP}）`)
@@ -1037,7 +1055,7 @@ check('_writeRunLog 尾部多个换行 ⇒ 保留约 KEEP 字节、从换行处�
 })
 
 check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、行首对齐、不丢最新行', () => {
-  // 单测桩的 appendFileSync 只记录不追加，真实场景（写一行让文件以 '\n' 结尾后再截尾）永远不出现：
+  // 单测桩的 writeSync（日志 fd）只记录不追加，真实场景（写一行让文件以 '\n' 结尾后再截尾）永远不出现：
   // 8b3bd07 的错误语义在桩下全绿。这里用真实临时文件走一遍完整路径。
   const rfs = require('fs')
   const { writeAtomic } = require('./xbk_storage.js')
@@ -1156,7 +1174,7 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9), size: 2 * LIMIT, tail: head + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'])
   assert.ok(rec.rec.read.length >= 1, '超限时必须真的去定位保留段')
   assert.deepStrictEqual(rec.rec.read[rec.rec.read.length - 1], [9, rest.length, 2 * LIMIT - rest.length, rest.length])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
@@ -1170,7 +1188,7 @@ check('_writeRunLog 锁 fd 为 0（falsy）时 finally 仍释放：unlink 照做
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.write, [[0, `${process.pid}:42`]])
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], 'fd 0 不得被当成「未取锁」而跳过释放（锁文件会残留）')
-  assert.deepStrictEqual(rec.rec.close, [], 'fd 0 是 stdin，>2 守卫必须拒绝 close')
+  assert.deepStrictEqual(rec.rec.close, [9], 'fd 0 是 stdin，>2 守卫必须拒绝 close（只关日志 fd）')
 })
 
 // ----- _warnLowDisk：阈值 / 只告警不阻断 / 限频 -----
@@ -4277,7 +4295,7 @@ check('C1-011 fail-open 且超过次级上限 ⇒ 不再写盘、行回显 stdou
   assert.deepStrictEqual(rec.rec.append, [], '超过次级上限后不得继续追加（无界增长的根因）')
   assert.deepStrictEqual(logs, ['overflow-line'], '行不得丢：必须回显到 stdout（青龙任务日志可见）')
   assert.strictEqual(rec.rec.read.length, 0, '无锁路径不得做读改写（会冲掉并发追加的行）')
-  assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx'], '不得在无锁时开 r+')
+  assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx', 'a+'], '无锁时只开追加 fd，不得开读写截尾 fd')
   assert.strictEqual(rec.rec.unlink.length, 0)
 })
 
@@ -4530,7 +4548,7 @@ check('C1-020 run.log 锁：锁已被接管（内容不再是本进程令牌）�
   const rec = makeLogFs({ readFileSync: () => '999999:1' })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('x\n')
-  assert.deepStrictEqual(rec.rec.close, [7], '锁 fd 仍必须关闭（否则泄漏 fd）')
+  assert.deepStrictEqual(rec.rec.close, [6, 7], '日志 fd 与锁 fd 仍必须关闭（否则泄漏 fd）')
   assert.deepStrictEqual(rec.rec.unlink, [],
     '锁已不属于本进程时不得删除——删了接管者就会与本进程同时进临界区')
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']], '日志本身仍必须写进去')
@@ -4542,7 +4560,7 @@ check('C1-020 run.log 锁：读锁失败（ENOENT/io）⇒ 不删归属不明的
   const { app } = makeLogApp({ rec })
   assert.strictEqual(app._writeRunLog('x\n'), undefined)
   assert.deepStrictEqual(rec.rec.unlink, [], '读不到内容就无法证明归属，只能不删（残留由 stale 回收）')
-  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.close, [6, 7])
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']])
 })
 

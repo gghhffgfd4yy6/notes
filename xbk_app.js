@@ -1004,31 +1004,36 @@ function createApp ({
           // fail-open（拿不到锁）硬上限：旧实现是 8×LIMIT；LIMIT 放大后 8× 会到 160 MiB，
           // 磁盘余量闸只有 50 MiB，改成 4×（80 MiB）仍然远大于正常窗口。
           const FAIL_OPEN_HARD_LIMIT = 4 * LIMIT
-          if (lockFd === null) {
-            let oversized = false
-            try { oversized = fs.statSync(logPath).size > FAIL_OPEN_HARD_LIMIT } catch (e) { oversized = false }
-            if (oversized) {
-              console.log(out.endsWith('\n') ? out.slice(0, -1) : out)
-              return
+          // CodeQL js/file-system-race #138（CWE-367）：追加、取长度、截尾读回必须落在**同一个 fd** 上。
+          // 旧实现 `appendFileSync(路径) → statSync(路径) → openSync(路径,'r+')` 是 check-by-path →
+          // use-by-path：两次路径解析之间文件可能被换名/替换，截尾读到的就不是刚追加的那个 inode。
+          // 'a+' = O_RDWR|O_APPEND|O_CREAT：写入恒追加到 EOF，同时可读（截尾定位与读回复用这一个 fd）。
+          const fd = fs.openSync(logPath, 'a+')
+          try {
+            if (lockFd === null) {
+              // FAIL_OPEN_HARD_LIMIT 的判定口径不变，长度改从同一个 fd 取（fstat 不解析路径）。
+              let oversized = false
+              try { oversized = fs.fstatSync(fd).size > FAIL_OPEN_HARD_LIMIT } catch (e) { oversized = false }
+              if (oversized) {
+                console.log(out.endsWith('\n') ? out.slice(0, -1) : out)
+                return
+              }
             }
-          }
-          fs.appendFileSync(logPath, out, 'utf8')
-          const st = fs.statSync(logPath)
-          // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
-          // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
-          // 截尾目标是「保留最新 KEEP=10MiB、从换行处对齐」；文件没超过 KEEP 时无需截尾
-          // （XBK_LOG_LIMIT_BYTES 调到 10MiB 以下的测试配置不会把整份日志重写一遍）。
-          const KEEP = 10 * 1024 * 1024
-          if (lockFd !== null && !archivePending && st.size > LIMIT && st.size > KEEP) {
-          // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
-          // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
-          // v3.405（Sourcery PRRT_kwDOT8kkjs61Mcxl）：旧实现只看「尾部 10MiB」窗口，
-          // 窗口里没有换行就整轮放弃；一条跨窗口的超长行会让文件长期停在 LIMIT 之上，
-          // 60s 退避后每追加一行又重复一次。现在从 size-KEEP 向后找第一个换行，保留其后的
-          // 最新内容；窗口里没有换行才回退到窗口之前的最后一个换行（整行保留、流式重写）；
-          // 只有整份文件连一个换行都没有（单条巨行）才放弃并告警。
-            const fd = fs.openSync(logPath, 'r+')
-            try {
+            fs.writeSync(fd, out)
+            const st = fs.fstatSync(fd)
+            // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
+            // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
+            // 截尾目标是「保留最新 KEEP=10MiB、从换行处对齐」；文件没超过 KEEP 时无需截尾
+            // （XBK_LOG_LIMIT_BYTES 调到 10MiB 以下的测试配置不会把整份日志重写一遍）。
+            const KEEP = 10 * 1024 * 1024
+            if (lockFd !== null && !archivePending && st.size > LIMIT && st.size > KEEP) {
+            // v3.246：只读取并保留尾部，替代全量 readFileSync+重写——避免每次超限都做
+            // O(n) 全量读入 + 512KB 重写的读写放大（每次追加超 1MB 反复全读）
+            // v3.405（Sourcery PRRT_kwDOT8kkjs61Mcxl）：旧实现只看「尾部 10MiB」窗口，
+            // 窗口里没有换行就整轮放弃；一条跨窗口的超长行会让文件长期停在 LIMIT 之上，
+            // 60s 退避后每追加一行又重复一次。现在从 size-KEEP 向后找第一个换行，保留其后的
+            // 最新内容；窗口里没有换行才回退到窗口之前的最后一个换行（整行保留、流式重写）；
+            // 只有整份文件连一个换行都没有（单条巨行）才放弃并告警。
               const cut = this._logTrimCut(fd, st.size, KEEP)
               const trimmedLen = cut >= 0 ? st.size - cut : -1
               if (cut < 0) {
@@ -1064,9 +1069,9 @@ function createApp ({
                   console.warn(`⚠️ 日志截尾失败，暂停追加 60s：${logPath}`)
                 }
               }
-            } finally {
-              fs.closeSync(fd)
             }
+          } finally {
+            fs.closeSync(fd)
           }
         } finally {
           if (lockFd !== null) {
