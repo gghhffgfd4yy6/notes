@@ -5768,7 +5768,8 @@ checkAsync('A4/C-027 行为 1：僵尸持有者（/proc state=Z）⇒ 按已退�
   // 且 kill(pid,0) 返回「存活」——这正是旧实现判活的形态）。守护子 shell 在 120s 后自杀，
   // 主进程死掉也不会留下永久残留。
   const CMD = 'sleep 0.1 & echo $!; ( i=0; while [ $i -lt 120 ]; do sleep 1; kill -0 $$ 2>/dev/null || exit 0; i=$((i+1)); done; kill -9 $$ ) & kill -STOP $$'
-  const holder = spawn('sh', ['-c', CMD], { stdio: ['ignore', 'pipe', 'ignore'] })
+  // Sonar S4036：经 PATH 解析的可执行文件名一律绝对路径（'sh' 会被判「PATH 可写」漏洞）。
+  const holder = spawn('/bin/sh', ['-c', CMD], { stdio: ['ignore', 'pipe', 'ignore'] })
   let zombie = null
   try {
     zombie = await new Promise((resolve, reject) => {

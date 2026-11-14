@@ -285,7 +285,9 @@ function listZeroCoverageCandidates () {
     }
   }
   for (const file of ZERO_COVERAGE_FILES) out.push(file)
-  return out.sort()
+  // 显式比较器（Sonar S2871）：无参 sort 按 UTF-16 码元排序，且 Sonar 判为 CRITICAL BUG。
+  // 候选全是小写 ASCII 路径，localeCompare 在任意 locale 下顺序一致（测试钉住了期望顺序）。
+  return out.sort((a, b) => a.localeCompare(b))
 }
 
 // 纯判定函数（导出给 test_check_mutation_ranges.js 直接驱动正反例）：文件集 × 登记表 × 存在性。
