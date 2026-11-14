@@ -34,7 +34,7 @@ const { journalPathFor, JOURNAL_SUFFIX } = require('../xbk_message_store')
 // v3.298 只读扩展的上限真源：xbk_utils 顶层零 require（纯常量+纯函数），控制台可安全引用；
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp, isRunBusyLine } = require('../xbk_utils')
-const { readSafeTextResult, writeAtomic } = require('../xbk_storage')
+const { readSafeTextResult, writeAtomic, statSafeMeta } = require('../xbk_storage')
 const { removeStaleTombstoneFile, tombstoneKeyCap } = require('../xbk_message_store') // C3-013：清残留墓碑 / CR-01：墓碑上限同一规则
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
 // 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
@@ -3171,29 +3171,12 @@ function parseAction (body) {
 // 暴露面论证：所有信息都在同一 token 鉴权之后；文件清单只给名字/大小/mtime（不含内容、
 // 不含路径前缀），敏感度严格低于既有 /api/logs（整份 run.log 正文）。
 
-// 元数据安全探针：逐行镜像 readSafeTextResult 的入口防御（xbk_storage.js 同一 flags 组合
-// O_RDONLY|O_NOFOLLOW）——符号链接 ELOOP 判 unsafe、非普通文件判 unsafe，绝不跟随。
-// 额外带 O_NONBLOCK：裸 O_RDONLY 打开 FIFO 会阻塞等写者（一条恶意替换的命名管道就能
-// 挂死读取端点），非阻塞下 open 立即返回、fstat.isFile() 照样把 FIFO 判 unsafe（对普通
-// 文件 O_NONBLOCK 无语义影响）。
-// 只 stat 不读内容（无读窗口 ⇒ 无 TOCTOU 承重面；观测快照允许毫秒级陈旧）。
-function statSafeMeta (p) {
-  let fd
-  try {
-    fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0))
-    const st = fs.fstatSync(fd)
-    if (!st.isFile()) return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
-    // ino 供 tombstoneCounts 的 (ino,size,mtimeMs) 缓存识别「同一份文件」：仅靠 size+mtime
-    // 抓不到同毫秒同大小的原子替换（inode 会变）。
-    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs), ino: st.ino }
-  } catch (e) {
-    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null, ino: null }
-    if (e && e.code === 'ELOOP') return { status: 'unsafe', size: null, mtimeMs: null, ino: null }
-    return { status: 'ioError', size: null, mtimeMs: null, ino: null }
-  } finally {
-    if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
-  }
-}
+// 元数据安全探针：实现收在 xbk_storage.statSafeMeta（S1：只读打开 / 元数据探测 / 普通文件判定
+// 统一成一份原语，与 readSafeTextResult 共用同一 opener 与同一组 flags）。这里只是**重导出**——
+// 仓库内该实现只能有一份；测试按既有习惯从本模块取它（module.exports 仍带 statSafeMeta）。
+// 语义不变：符号链接 ELOOP 判 unsafe、非普通文件（目录/FIFO/设备）判 unsafe，绝不跟随；
+// O_NONBLOCK 保证 FIFO 立即返回（裸 O_RDONLY 会阻塞等写者，一条恶意替换的命名管道即可挂死
+// 读取端点）；只 stat 不读内容。
 
 // 墓碑键计数：形状 {v:1, id:[...], urlOnly:[...], idWithUrl:[...], anon:[...]}（MessageStore
 // 四类身份键）。只回计数、绝不回显键内容（键是 id/url，敏感度低于已下发的 /api/messages 全文）。

@@ -6,8 +6,13 @@
 // `--status` 此前把默认目录硬编码成 path.join(ROOT, 'xianbaoku_cache')，于是生产会拒绝并回退的目录
 // （被普通文件占位、realpath 逃出根目录、已存在层级不是目录）仍被照读——状态其实写在备用目录时
 // `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块只 require
-// 零依赖的 xbk_utils（纯常量+纯函数），`--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
+// 零外部依赖的 xbk_utils（纯常量+纯函数）与 xbk_storage（只 require fs/path/node:crypto），
+// `--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
 const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
+// S1：根内路径校验（逐级回溯 + lstat 目录 + realpath 仍在根内）的唯一实现在 xbk_storage。
+// 该模块只 require fs/path/node:crypto（零外部依赖），故上面「--status 复用它不需要加载
+// got/re2」的设计不受影响；也不能反过来让 xbk_storage require 本模块（循环依赖）。
+const { isRealPathInside } = require('./xbk_storage')
 
 // C3-005：每个缓存文件最多保留几份 `<name>.corrupt.<stamp>.bak` 隔离备份（最旧先删）。
 // 隔离件的上限就是缓存读端上限（64MiB/份），只增不减会把目录撑大；10 份足够人工取回最近几次现场。
@@ -303,23 +308,10 @@ function resolveCacheDirInRoot ({ fs, path, root, raw, fallback }) {
   // 每次求值先清零：读到的一定是**本次**判定，不可能是上一轮（或上一组配置）的残留
   lastCacheDirFallback = null
   const candidate = path.resolve(root, raw)
-  const realInsideRoot = (p) => {
-    const lexicalInside = p !== root && p.startsWith(root + path.sep)
-    if (!lexicalInside) return false
-    // 逐级回溯到已存在目录，再 realpath 校验；防止项目内符号链接指向项目外部。
-    let probe = p
-    try {
-      while (probe !== root && !fs.existsSync(probe)) probe = path.dirname(probe)
-      // 已存在的路径层级必须是目录；否则 cache.dir 指向普通文件时，
-      // 后续拼接缓存文件会得到 ENOTDIR，而校验却错误放行。
-      if (!fs.lstatSync(probe).isDirectory()) return false
-      const realProbe = fs.realpathSync(probe)
-      const resolved = path.resolve(realProbe, path.relative(probe, p))
-      return resolved !== root && resolved.startsWith(root + path.sep)
-    } catch (e) {
-      return false
-    }
-  }
+  // 根内校验的唯一实现已收进 xbk_storage.isRealPathInside（S1：同一套判据在别处也要用，
+  // 不再内联一份）。本函数只把候选路径交给它，并把调用方注入的 fs/path 一并透传（青龙 --status
+  // 与测试的假 fs 都靠这条注入）。候选顺序、告警文案、抛错条件一律不变。
+  const realInsideRoot = (p) => isRealPathInside(root, p, { fs, path })
   // P2 防御：cache.dir 不能通过 ..、绝对路径或符号链接逃出项目根目录；越界配置回退默认目录。
   if (realInsideRoot(candidate)) return candidate
   const safeFallback = path.resolve(root, fallback)

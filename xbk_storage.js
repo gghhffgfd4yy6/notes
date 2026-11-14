@@ -208,6 +208,77 @@ function resolveMaxBytes (maxBytes, filePath) {
   return null
 }
 
+// ===== 只读打开的统一原语（S1）=====
+// 「以只读方式安全打开一个路径」的 flags 组合只在下面这一处拼：读内容（readSafeTextResult）与
+// 只取元数据（statSafeMeta）共用同一个 opener，不再各写一份 O_NOFOLLOW|O_NONBLOCK。
+//   · O_NOFOLLOW：末级是符号链接时 open 直接 ELOOP，从源头拒绝跟随；平台缺该常量时退化为 0
+//     （由调用方的 fstat 普通文件判定兜底）。
+//   · O_NONBLOCK：路径被换成无写者的 FIFO 时 open 立即返回，而不是永久阻塞同步事件循环；
+//     对普通文件无语义影响。statSafeMeta 恒开（它只探测元数据，没有任何理由阻塞等待），
+//     readSafeTextResult 只在调用方显式要求（options.openNonBlocking）时开——既有调用方语义不变。
+const SAFE_READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+function openSafeReadFd (filePath, options = {}) {
+  const nonBlock = !!(options && options.nonBlock === true)
+  return fs.openSync(filePath, SAFE_READ_FLAGS | (nonBlock ? (fs.constants.O_NONBLOCK || 0) : 0))
+}
+
+// 元数据安全探测（S1 统一原语）：与 readSafeTextResult 同一 opener、同一套普通文件语义，
+// **只 stat 不读内容**（无读窗口 ⇒ 无 TOCTOU 承重面；观测快照允许毫秒级陈旧）。
+// 状态口径（与 scripts/console.js 原先的本地实现逐字一致，调用方按它分支）：
+//   · ok      —— size / mtimeMs / ino 有值。ino 供「同一份文件」识别：只靠 size+mtime
+//                抓不到同毫秒同大小的原子替换（inode 会变）；
+//   · missing —— ENOENT；
+//   · unsafe  —— ELOOP（O_NOFOLLOW 撞上符号链接）或 fstat 不是普通文件（目录/FIFO/设备/socket）；
+//   · ioError —— 其它 open/fstat 失败。
+// missing / unsafe / ioError 三态的 size / mtimeMs / ino 一律 null：**unsafe 绝不泄露目标大小**
+// （符号链接指向的文件有多大属于目标的信息，本原语的定义就是不跟随、不报告）。
+function statSafeMeta (filePath) {
+  const unsafe = { status: 'unsafe', size: null, mtimeMs: null, ino: null }
+  let fd
+  try {
+    fd = openSafeReadFd(filePath, { nonBlock: true })
+    const st = fs.fstatSync(fd)
+    if (!st.isFile()) return { ...unsafe }
+    return { status: 'ok', size: st.size, mtimeMs: Math.round(st.mtimeMs), ino: st.ino }
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { status: 'missing', size: null, mtimeMs: null, ino: null }
+    if (e && e.code === 'ELOOP') return { ...unsafe }
+    return { status: 'ioError', size: null, mtimeMs: null, ino: null }
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
+  }
+}
+
+// 路径包含校验（S1 统一原语）：target 解析后必须**严格**位于 root 之下。
+// 这段判据原先内联在 xbk_message_store.resolveCacheDirInRoot 的 realInsideRoot 里，是唯一实现；
+// 搬到这里供多处复用，语义逐条不变：
+//   1. 词法层：target 不能等于 root、必须以 `root + sep` 开头（拦 `..` 拼出的越界，以及
+//      「root 的兄弟目录」这类前缀相同但不在其下的路径）；
+//   2. 逐级回溯到**已存在**的那一层（新建目录的父级），它必须是目录——cache.dir 指向普通文件时
+//      后续拼接缓存文件会 ENOTDIR，校验不能放行；
+//   3. 对该层 realpath 后拼回 target 的相对尾部，结果仍必须严格在 root 内 ⇒ 拦住「中间层
+//      符号链接指向根外」（待建目录本身还不存在，只能按父级的 realpath 判定）。
+// 任何异常（权限、ELOOP、ENOENT 竞态）→ false：这是安全检查，读不到就当作不安全。
+// deps.fs / deps.path 可注入（默认 node:fs / node:path；测试用假 fs 驱动，不触碰真实盘）。
+// 本模块因此**不 require** xbk_message_store / xbk_app —— 避免循环依赖（两者都依赖本模块）。
+function isRealPathInside (root, target, deps = {}) {
+  const dfs = (deps && deps.fs) || fs
+  const dpath = (deps && deps.path) || path
+  if (typeof root !== 'string' || typeof target !== 'string' || root === '' || target === '') return false
+  const lexicalInside = target !== root && target.startsWith(root + dpath.sep)
+  if (!lexicalInside) return false
+  let probe = target
+  try {
+    while (probe !== root && !dfs.existsSync(probe)) probe = dpath.dirname(probe)
+    if (!dfs.lstatSync(probe).isDirectory()) return false
+    const realProbe = dfs.realpathSync(probe)
+    const resolved = dpath.resolve(realProbe, dpath.relative(probe, target))
+    return resolved !== root && resolved.startsWith(root + dpath.sep)
+  } catch (e) {
+    return false
+  }
+}
+
 // 可选大小上限：maxBytes 为数字且 > 0 时，普通文件超过该字节数即判 tooLarge，避免异常膨胀
 // 文件被整读入内存（状态/哈希等小文件场景）。maxBytes 非数字或 ≤0 时按既有语义处理为「不设限」
 // （但见 resolveMaxBytes：非法值一律告警，不再静默）。
@@ -229,10 +300,9 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
   // 同步事件循环（Sourcery High #228：tombstoneCounts 已过闸仍中招）。O_NONBLOCK 下 open
   // FIFO 立即返回 ENXIO → 归 unsafe；随后 fstat.isFile() 同样拒绝一切非普通文件。
   const nonBlock = !!(options && options.openNonBlocking === true)
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (nonBlock ? (fs.constants.O_NONBLOCK || 0) : 0)
   let fd
   try {
-    fd = fs.openSync(filePath, flags)
+    fd = openSafeReadFd(filePath, { nonBlock })
   } catch (e) {
     if (e && e.code === 'ENOENT') return { status: 'missing', text: null, error: e }
     if (e && e.code === 'ELOOP') return { status: 'unsafe', text: null, error: new Error('非普通文件') }
@@ -261,7 +331,7 @@ function readSafeTextResult (filePath, maxBytes, options = {}) {
     const shortRead = readResult.bytes < stat.size - start
     let reFd
     try {
-      reFd = fs.openSync(filePath, flags)
+      reFd = openSafeReadFd(filePath, { nonBlock })
       const reStat = fs.fstatSync(reFd)
       if (!reStat.isFile() || reStat.dev !== stat.dev || reStat.ino !== stat.ino) {
         // 读窗口内被替换/类型变化：**瞬时**并发竞态（另一进程原子写缓存 / 路径被改），判 replaced。
@@ -314,4 +384,13 @@ function readSafeText (filePath, maxBytes, options) {
   return result.status === 'ok' ? result.text : null
 }
 
-module.exports = { isRegularOrMissing, writeAtomic, writeAtomicIfAbsent, readSafeText, readSafeTextResult }
+module.exports = {
+  isRegularOrMissing,
+  writeAtomic,
+  writeAtomicIfAbsent,
+  readSafeText,
+  readSafeTextResult,
+  // S1：只读打开 / 元数据探测 / 普通文件判定 / 路径包含校验的唯一实现（调用方只 require 这里）
+  statSafeMeta,
+  isRealPathInside
+}
