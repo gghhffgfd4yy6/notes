@@ -667,6 +667,82 @@ function run (ymlText) {
     console.log(`✅ 运行链双向核对断言通过（派生 ${real.chain.length} 个模块；豁免 ${MUTATION_EXEMPT.size} 条、非运行时标注 ${NON_RUNTIME_MUTATE_TARGETS.size} 条）`)
   }
 
+  // ===== B4（D-001 / D-005）：控制台拆分代码的零变异覆盖登记（靶向正反例）=====
+  // 背景：scripts/console-routes.js + scripts/console-handlers/*.js 共 7 个文件既不在 mutation.yml
+  // 矩阵里、也不在运行链上（console.js 本身是「非运行时」标注）⇒ 现有两道校验都看不见它们：
+  // 新增一个 handler 会静默零覆盖，而「扫不到」与「全绿」的输出长得一样。这里直接驱动导出的判定
+  // 函数（合成输入，不改仓库文件），最后用真实仓库证明接线真的生效。
+  {
+    const {
+      auditZeroCoverage, listZeroCoverageCandidates, NON_RUNTIME_ZERO_COVERAGE
+    } = require('./scripts/check-mutation-ranges.js')
+    const registered = NON_RUNTIME_ZERO_COVERAGE
+    const files = ['scripts/console-routes.js', 'scripts/console-handlers/runs.js']
+    const okExists = () => true
+
+    // ① 合法登记 ⇒ 绿（两条出路都算数：已在矩阵里 / 已在表里）
+    const green = auditZeroCoverage({
+      files: [...files, 'scripts/console.js'],
+      mutateTargets: new Set(['scripts/console.js']),
+      registry: registered,
+      exists: okExists
+    })
+    assert.deepStrictEqual(green.errors, [], `合法登记必须零错误，实际 ${JSON.stringify(green.errors)}`)
+    assert.strictEqual(green.stats.candidates, 3, '统计必须如实（候选 3 个）')
+
+    // ② 缺登记 ⇒ 红：新增 handler 不得静默零覆盖
+    const missing = auditZeroCoverage({
+      files: [...files, 'scripts/console-handlers/brand-new.js'],
+      mutateTargets: new Set(),
+      registry: registered,
+      exists: okExists
+    })
+    assert.strictEqual(missing.errors.length, 1, `缺登记必须恰好报 1 条，实际 ${JSON.stringify(missing.errors)}`)
+    assert.ok(missing.errors[0].includes('scripts/console-handlers/brand-new.js') && missing.errors[0].includes('不得静默零覆盖'),
+      `必须点名文件并说明「不得静默零覆盖」：${missing.errors[0]}`)
+
+    // ③ 登记了不存在的文件 ⇒ 红（名单本身不得成为盲区）
+    const stale = auditZeroCoverage({
+      files,
+      mutateTargets: new Set(),
+      registry: new Map([...registered, ['scripts/console-handlers/gone.js', '已删除的 handler']]),
+      exists: (file) => file !== 'scripts/console-handlers/gone.js'
+    })
+    assert.strictEqual(stale.errors.length, 1, `登记过期必须恰好报 1 条，实际 ${JSON.stringify(stale.errors)}`)
+    assert.ok(stale.errors[0].includes('scripts/console-handlers/gone.js') && stale.errors[0].includes('登记已过期'),
+      `必须点名过期条目：${stale.errors[0]}`)
+
+    // ④ 空理由 ⇒ 红；登记后又变成 mutate 目标 ⇒ 红（两种口径互斥，否则同一文件有两份「覆盖状态」）
+    const blank = auditZeroCoverage({ files, mutateTargets: new Set(), registry: new Map([['scripts/console-routes.js', '  ']]), exists: okExists })
+    assert.ok(blank.errors.some((e) => e.includes('理由为空')), `空理由必须判红：${JSON.stringify(blank.errors)}`)
+    const both = auditZeroCoverage({ files, mutateTargets: new Set(['scripts/console-routes.js']), registry: registered, exists: okExists })
+    assert.ok(both.errors.some((e) => e.includes('已是 mutate 目标')), `登记与矩阵口径互斥，必须判红：${JSON.stringify(both.errors)}`)
+
+    // ⑤ 真实仓库：候选集恰好是这 7 个、全部已登记、登记全部存在 ⇒ 零错误
+    const candidates = listZeroCoverageCandidates()
+    const expected = [
+      'scripts/console-handlers/config.js',
+      'scripts/console-handlers/logs.js',
+      'scripts/console-handlers/messages.js',
+      'scripts/console-handlers/runs.js',
+      'scripts/console-handlers/security.js',
+      'scripts/console-handlers/system.js',
+      'scripts/console-routes.js'
+    ]
+    assert.deepStrictEqual(candidates, expected, `候选集必须是「路由表 + 6 个 handler」，实际 ${JSON.stringify(candidates)}`)
+    for (const file of candidates) {
+      assert.ok(registered.has(file), `${file} 必须在 NON_RUNTIME_ZERO_COVERAGE 里有登记（否则真实门禁必红）`)
+    }
+    const real = auditZeroCoverage({
+      files: candidates,
+      mutateTargets: new Set(),
+      registry: registered,
+      exists: (file) => fs.existsSync(path.join(ROOT, file))
+    })
+    assert.deepStrictEqual(real.errors, [], `真实仓库必须零错误，实际 ${JSON.stringify(real.errors)}`)
+    console.log(`✅ 控制台拆分代码零变异覆盖登记断言通过（候选 ${candidates.length} 个文件、登记 ${registered.size} 条）`)
+  }
+
   // ===== 运行链解析：目录形式 `require('./dir')` 必须解析到 dir/index.js（CodeRabbit #362-g2）=====
   // 旧实现把候选拼成 `base + path.join('index.js')`（等价 `base + 'index.js'`），对 `require('./lib')`
   // 得到的是 <root>/libindex.js ⇒ 目录 require 永远解析不到，该分支是死代码：运行链少一个模块，
