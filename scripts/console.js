@@ -41,6 +41,10 @@ const { removeStaleTombstoneFile, tombstoneKeyCap } = require('../xbk_message_st
 const FilterStore = require('../xbk_filter_store')
 const { statusCacheDir } = require('../qinglong/xbk_push')
 
+// D1：控制台 HTTP 路由表。require 链只有 node 内置模块 + 各域 handler（都不反向 require 本文件）
+// ⇒ 无循环依赖；建表在 createConsole 内完成（见 buildRouteContext）。
+const { createConsoleRoutes, matchRoute } = require('./console-routes')
+
 // 控制台版本（package.json 是唯一真源）：/api/sys 与页面 boot JSON 共用一份，别两处各 require——
 // 前端靠「boot 里的版本 ≠ /api/sys 的版本」判断部署后旧标签页需要刷新（v3.332）。
 const APP_VERSION = (() => {
@@ -5887,6 +5891,138 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
   }
 
+  // ── D1 路由拆分：全局鉴权之后（含 2FA 页面闸 / 写面 Bearer-only 复判 / SPA 壳）的 endpoint ──
+  // 全部交给 scripts/console-routes.js 的有序路由表；ingress 顺序与状态码一字未动。
+  // 依赖逐项显式注入，不把 createConsole 的整个作用域塞过去；**可变闭包状态一律走访问器**——
+  // 把值直接塞进 ctx 会让 handler 拿到启动瞬间的快照（关停闸永远 false、刚保存的设置读回旧值）。
+  function buildRouteContext () {
+    return {
+      http: { sendJson, sendJsonConditional, readBody, readJsonObjectBody, logCaught },
+      paths: { stateDir, messagesFile, historyDir, lockPath, settingsPath },
+      state: {
+        token,
+        startedAtMs,
+        runs,
+        accessLog,
+        streamClients,
+        sseConnections,
+        twoFactor,
+        usedTotpSteps,
+        runtimeSettings,
+        auto,
+        isShuttingDown: () => shuttingDown,
+        unauthorizedCount: () => unauthorizedCount,
+        settingsSource: () => settingsSource,
+        setSettingsSource: (value) => { settingsSource = value },
+        lastEnableResult: () => lastEnableResult,
+        setLastEnableResult: (value) => { lastEnableResult = value },
+        deletePendingTwoFactor: (id) => { pendingTwoFactors.delete(id) },
+        // 关闭 2FA：pending 密钥全部作废、短时回执清空、已用时间步清空（原三行赋值的等价收口）。
+        resetTwoFactorRuntime: () => {
+          pendingTwoFactors = new Map()
+          lastEnableResult = null
+          usedTotpSteps.clear()
+        },
+        hasAutoInFlight: () => autoInFlightId !== null
+      },
+      data: {
+        readStatus,
+        readMessages,
+        readTrends,
+        readRunHistory,
+        readWatchState,
+        windowMessages,
+        parseDayKey,
+        filterMessageItems,
+        messageCategoriesOf,
+        clampQueryBytes,
+        exportRowOf,
+        exportStamp,
+        buildMessagesCsv,
+        sourceDomain,
+        cacheHealthSnapshot,
+        cacheHealthEntryCount,
+        listStateFiles,
+        buildConfigView,
+        findSecretLikeField,
+        buildPushChannelsView,
+        writeAtomic,
+        parseSseCursor
+      },
+      actions: {
+        acceptAction,
+        writeAuthVerdict,
+        handleFilterGet,
+        handleFilterDraftGet,
+        handleLineSearch,
+        handleLineWatchWrite,
+        handleBackupExport,
+        handleBackupImport
+      },
+      twofa: {
+        hasPendingTwoFactor,
+        rememberPendingTwoFactor,
+        findPendingTwoFactor,
+        verifySecondFactor,
+        verifyTotpCode,
+        totpStepAt,
+        generateTotpSecret,
+        generateRecoveryCodes,
+        recoveryRecordOf,
+        persistTwoFactorState,
+        revokeTrustedDevices,
+        trustedDeviceCount,
+        loginThrottled,
+        noteLoginFailure,
+        clearLoginFailures,
+        twoFactorCookieHeader,
+        clearTwoFactorCookieHeader,
+        clearDeviceCookieHeader,
+        totpQrDataUrl,
+        filterMediaAllowed
+      },
+      auto: { persistAuto, scheduleAuto, autoNextDelay, stopAuto, autoSnapshot, normalizeAutoSchedule },
+      runs: { streamWrite, streamTeardown, startStreamSampler, sseTick, sseTeardown, sseFlushPending },
+      consts: {
+        PROC_TIMEOUT_MS,
+        CACHE_HEALTH_COUNT_MAX_BYTES,
+        APP_VERSION,
+        TREND_DAYS_ALLOWED,
+        TREND_DAYS_DEFAULT,
+        RUN_HISTORY_LIMIT_DEFAULT,
+        RUN_HISTORY_LIMIT_MAX,
+        LOG_VIEW_MAX_BYTES,
+        MESSAGES_MAX_BYTES,
+        MESSAGES_PAGE_SIZE_MAX,
+        MESSAGES_PAGE_MAX,
+        MESSAGE_DAYS_ALLOWED,
+        EXPORT_FORMATS,
+        EXPORT_MAX_ROWS,
+        LINE_WATCH_MAX_WORDS,
+        CONSOLE_SETTINGS_DEFAULT_S,
+        NOTIFY_REPLAY_MIN_S,
+        NOTIFY_REPLAY_MAX_S,
+        AUTO_MIN_S,
+        AUTO_MAX_S,
+        AUTO_MAX_FAILS,
+        AUTO_SCHEDULE_MAX,
+        AUTO_SCHEDULE_MAX_S,
+        BODY_DEFAULT_MAX_BYTES,
+        TOTP_PERIOD_S,
+        TOTP_DIGITS,
+        TWO_FACTOR_ENABLE_RESULT_TTL_MS,
+        SSE_STREAM_MAX_CONNECTIONS,
+        SSE_STREAM_HEARTBEAT_MS,
+        SSE_MAX_CONNECTIONS,
+        SSE_TICK_MS,
+        CANCEL_GRACE_MS,
+        RUN_ID_RE
+      }
+    }
+  }
+  // 启动即建表：重复/冲突、handler 缺失都在启动期响亮失败（而不是首个请求时 500）。
+  const routes = createConsoleRoutes(buildRouteContext())
+
   // 分发器外层兜底（C2-015）：请求处理里任何**同步**抛错（参数形态、注入依赖、库内部）
   // 此前只有 new URL 一处单独兜住，之后 1100+ 行的分发没有任何外层保护 ⇒ 一句 TypeError
   // 就是进程级 uncaughtException ⇒ 整个看板下线（systemd 重启周期内都不可用）。
@@ -6107,1058 +6243,12 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       res.end(html)
       return
     }
-    if (req.method === 'GET' && url.pathname === '/api/status') {
-      // Sourcery Other-instance-idle：runs 历史是进程内存，另一实例持锁时本进程看不到。
-      // 锁文件在共享 stateDir——把「锁被持有且未超时」附进 status，前端空闲徽章参考。
-      const st = readStatus(stateDir)
-      try {
-        const lp = lockPath(stateDir)
-        // CodeQL js/file-system-race（High）：statSync 后再 readFileSync 存在 TOCTOU——
-        // 两次调用之间锁可能被释放/接管，stat 的 mtime 与 read 的内容来自不同代的锁帧。
-        // 单次 readFileSync，时间与状态全部取自同一帧内容（锁帧/released 帧都写 startedAt）。
-        // 损坏/0 字节锁（D2-S1）不能报成「空闲」：看板显示空闲而按钮一直 409 正是这条
-        // finding。按 mtime 判陈旧：陈旧的损坏锁本次触发会被接管（held:false 且
-        // state:'corrupted-stale'），新鲜的损坏锁仍在阻止触发（held:true）。
-        let lockAge = 0
-        let lockBody = null
-        let corrupted = false
-        try {
-          lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
-          // "null"/标量帧（被外部写坏）同样按损坏处理：下面 lockBody.startedAt 会抛，
-          // 不能让它冒到外层 catch 把 st.lock 留成 undefined。
-          if (!lockBody || typeof lockBody !== 'object') throw new TypeError('lock frame is not an object')
-        } catch (e2) {
-          if (e2 && e2.code === 'ENOENT') {
-            st.lock = { held: false, ageMs: 0, state: 'absent', corrupted: false, takeoverInMs: 0 }
-          } else {
-            corrupted = true
-          }
-        }
-        // 与 acquireLock 同一分类：缺 startedAt / 非正整数的帧也算损坏（否则看板说
-        // 「陈旧可抢」，acquireLock 却对新鲜损坏帧 fail-closed，两处结论相反）。
-        if (lockBody && lockBody.released !== true && !(Number.isSafeInteger(lockBody.startedAt) && lockBody.startedAt > 0)) corrupted = true
-        if (corrupted) {
-          let mtimeAge
-          try { mtimeAge = Math.max(0, Date.now() - fs.statSync(lp).mtimeMs) } catch (e2) { mtimeAge = PROC_TIMEOUT_MS }
-          const held = mtimeAge <= PROC_TIMEOUT_MS
-          st.lock = {
-            held,
-            ageMs: mtimeAge,
-            state: held ? 'corrupted' : 'corrupted-stale',
-            corrupted: true,
-            takeoverInMs: held ? Math.max(0, PROC_TIMEOUT_MS - mtimeAge) : 0
-          }
-        } else if (lockBody) {
-          const startedAt = typeof lockBody.startedAt === 'number' ? lockBody.startedAt : 0
-          const released = lockBody.released === true
-          lockAge = startedAt > 0 ? Math.max(0, Date.now() - startedAt) : PROC_TIMEOUT_MS
-          const held = !released && lockAge < PROC_TIMEOUT_MS
-          st.lock = {
-            held,
-            ageMs: lockAge,
-            state: released ? 'released' : (held ? 'running' : 'stale'),
-            corrupted: false,
-            takeoverInMs: held ? Math.max(0, PROC_TIMEOUT_MS - lockAge) : 0
-          }
-        }
-        // 残留 .takeover 哨兵（上一次接管者崩溃的产物）：陈旧哨兵会阻塞接管，必须让运维
-        // 一眼看到它是「残留」而不是「正在接管」（D2-S5）。
-        try {
-          const sst = fs.statSync(lp + '.takeover')
-          const sAge = Math.max(0, Date.now() - sst.mtimeMs)
-          st.lock.sentinel = { present: true, ageMs: sAge, stale: sAge > PROC_TIMEOUT_MS }
-        } catch (e2) { /* 无哨兵 */ }
-      } catch (e) {
-        if (!st.lock) st.lock = { held: false, ageMs: 0, state: 'unknown', corrupted: false, takeoverInMs: 0 }
-      }
-      sendJson(res, 200, st)
-      return
-    }
-    // GET /api/access-log（v3.300 §3.3）：系统页可查的内存环形访问日志。
-    // 鉴权与其余读取端点一致（上方 authorize 闸已过）。时间正序 = 数组插入序
-    // （push 尾=最新）；slice() 浅拷贝防外部持有内部引用改写（条目对象 push 后
-    // 只读不变，浅拷贝足够——蓝图防线 3「数组本身必须干净」）。unauthorizedCount
-    // 是进程启动以来全部 401 的独立计数（可大于环形窗内条数，不环形截断）。
-    if (req.method === 'GET' && url.pathname === '/api/access-log') {
-      sendJson(res, 200, { items: accessLog.slice(), unauthorizedCount })
-      return
-    }
-    // ── v3.297 控制台扩展：推送记录 / 趋势 / 日志 / 系统 ─────────────────────────
-    // 全部只读（读缓存目录已有文件 + 进程自身信息），不 spawn、不写任何文件；
-    // 鉴权与其余读取端点一致（Bearer / ?token= / Cookie 会话）。
-    if (req.method === 'GET' && url.pathname === '/api/messages') {
-      const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
-      if (read.status !== 'ok') {
-        // missing = 缓存还没建（首轮未跑）；invalid/tooLarge = 数据坏了/过大——
-        // 三态如实下发，前端按 partTone 同口径显示，不伪装成「暂无记录」。
-        // cacheDirHint：本页读 stateDir + messagesCacheName()（与 /api/status、run.log 同源目录，
-        // XBK_CACHE_DIR 可改）；运行侧 Config.cache.dir / pushUrl 指到别处时缓存不在这里——
-        // 把目录与文件名口径都告诉运维（Sourcery PR#227「Custom cache records stay hidden」）。
-        sendJson(res, 200, {
-          status: read.status,
-          total: 0,
-          page: 1,
-          pageSize: 0,
-          items: [],
-          categories: [],
-          cacheDirHint: stateDir,
-          cacheFileHint: messagesFile
-        })
-        return
-      }
-      const q = url.searchParams
-      // 分页参数钳制（URL 是未验证输入）：非法值回退默认，不 400——自用工具宽容输入，
-      // 但永远不会越界（page*size 超大切片会复制数组，钳制后上限 100 * 10001 条仍有界）。
-      let size = Number(q.get('size'))
-      if (!Number.isSafeInteger(size) || size < 1) size = 20
-      if (size > MESSAGES_PAGE_SIZE_MAX) size = MESSAGES_PAGE_SIZE_MAX
-      let page = Number(q.get('page'))
-      if (!Number.isSafeInteger(page) || page < 1) page = 1
-      if (page > MESSAGES_PAGE_MAX) page = MESSAGES_PAGE_MAX
-      // 过滤：分类精确匹配 + 关键词子串（title / content，大小写不敏感的 ASCII 归一）。
-      // 用 includes 而非正则（用户输入直接进正则有 ReDoS 面，本仓正则防护红线）。
-      const cate = typeof q.get('cate') === 'string' ? q.get('cate') : ''
-      // 超长 query 按 UTF-8 字节截断（而非清空）：清空会让前端仍显示原词、结果却未过滤，
-      // 造成「搜了等于没搜」的假象（审查 Sourcery PR#227）。截断后用截断值过滤并回显 queryUsed。
-      // （中文按字符截到字节边界：从尾部丢弃不完整多字节序列。）
-      let query = typeof q.get('q') === 'string' ? q.get('q').trim() : ''
-      query = clampQueryBytes(query)
-      const needle = query.length > 0 ? query.toLowerCase() : ''
-      // 时间窗（v3.307）：白名单外的值一律回「全部」（宽松输入，不 400）。
-      const daysRaw = Number(q.get('days'))
-      const days = MESSAGE_DAYS_ALLOWED.includes(daysRaw) ? daysRaw : 0
-      // v3.326：自定义日期区间优先于「近 N 天」；非法区间静默回落到 days/全部。
-      const win = windowMessages(read.value.items, {
-        days, fromKey: parseDayKey(q.get('from')), toKey: parseDayKey(q.get('to'))
-      })
-      const windowed = win.items
-      const items = filterMessageItems(windowed, cate, needle)
-      // 行键必须按「条目对象」取原始 keys：过滤/时间窗会改变下标，继续用 start+i 会把
-      // 旧行的 rowKey 贴到新行上（展开状态/React key 联动错位）。
-      const keyByItem = new Map(read.value.items.map((m, i) => [m, read.value.keys[i]]))
-      // 下发字段裁剪：content_html 不出（体积大且含外链 img，CSP 下也渲染不了）；
-      // 列表给 title/content 摘要 + 元数据；详情字段由前端展开 content 全文。
-      const total = items.length
-      const start = (page - 1) * size
-      // rowKey：无 id 条目用数组下标合成（与 readMessages 的排序后位置一致——排序稳定，
-      // slice 后下标 = 原数组下标）。前端行键/展开用它，匿名条目不再联动。
-      const pageItems = items.slice(start, start + size).map((m, i) => ({
-        id: typeof m.id === 'number' || typeof m.id === 'string' ? m.id : '',
-        // rowKey：readMessages 按「原始数组下标」合成的稳定行键（与 keys 数组对齐取）。
-        // 排序/分页不改变键；无 id 的匿名条目也不再共用 '' 导致展开联动。
-        rowKey: keyByItem.get(m) !== undefined
-          ? keyByItem.get(m)
-          : String(m.id !== undefined && m.id !== null ? m.id : `idx-${start + i}`),
-        title: typeof m.title === 'string' ? m.title : '',
-        // content 全文下发（前端列表自行截断显示）：列表只有 ≤100 条，截到 500 反而让
-        // 「展开正文」读不到全文（审查 Sourcery PR#227）。
-        content: typeof m.content === 'string' ? m.content : '',
-        datetime: typeof m.datetime === 'string' ? m.datetime : '',
-        shorttime: typeof m.shorttime === 'string' ? m.shorttime : '',
-        shijianchuo: typeof m.shijianchuo === 'number' ? m.shijianchuo : null,
-        cateid: typeof m.cateid === 'string' || typeof m.cateid === 'number' ? String(m.cateid) : '',
-        catename: typeof m.catename === 'string' && m.catename.length > 0 ? m.catename : '(未分类)',
-        price: typeof m.price === 'number' ? m.price : null,
-        url: typeof m.url === 'string' ? m.url : ''
-      }))
-      sendJsonConditional(req, res, {
-        status: 'ok',
-        total,
-        page,
-        pageSize: size,
-        pages: Math.max(1, Math.ceil(total / size)),
-        grandTotal: read.value.total,
-        skipped: read.value.skipped,
-        // queryUsed：超限截断后实际生效的搜索词（前端据此回显，避免「显示原词、结果未过滤」）
-        queryUsed: query,
-        // baseUrl：相对 url 的拼接前缀（= 生产 Config.domain，去尾斜杠），前端不再硬编码
-        baseUrl: sourceDomain(),
-        // 时间窗：0=全部；>0 时 categories 也只统计窗口内条目（筛选器计数要跟手）。
-        // 搜索词同样要参与分类计数：否则「搜某某」后仍显示全量分类条数，点进去是空的
-        // （Sourcery 分类计数忽略搜索）。
-        days: win.days,
-        from: win.from,
-        to: win.to,
-        categories: needle.length > 0
-          ? messageCategoriesOf(filterMessageItems(win.days > 0 || win.from !== '' ? windowed : read.value.items, '', needle))
-          : (win.days > 0 || win.from !== '' ? messageCategoriesOf(windowed) : read.value.categories),
-        items: pageItems
-      })
-      return
-    }
-    // ── v3.370 线报全站搜索 / 关注词（只读代理 + 本机关注词文件）─────────────
-    if (req.method === 'GET' && url.pathname === '/api/line-search') {
-      handleLineSearch(req, res, url).catch((e) => {
-        logCaught('line-search', e)
-        if (!res.headersSent) sendJson(res, 200, { status: 'upstream_error', error: '线报酷搜索暂不可用，稍后再试' })
-      })
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/line-watch') {
-      const stored = readWatchState(stateDir)
-      res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, {
-        status: stored.status,
-        words: stored.words,
-        limit: stored.limit,
-        intervalMin: stored.intervalMin,
-        enabled: stored.enabled,
-        lastCheckAt: stored.lastCheckAt,
-        max: LINE_WATCH_MAX_WORDS
-      })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/api/line-watch') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      handleLineWatchWrite(req, res, url)
-      return
-    }
-    // POST /api/backup/export：把勾选的数据类别打包成一个 JSON 下载。
-    if (req.method === 'POST' && url.pathname === '/api/backup/export') {
-      handleBackupExport(req, res)
-      return
-    }
-    // POST /api/backup/import：读取备份文件里实际存在的类别并恢复（导入不再让用户勾选）。
-    if (req.method === 'POST' && url.pathname === '/api/backup/import') {
-      handleBackupImport(req, res)
-      return
-    }
-    // POST /api/messages/export（v3.300 批次③ 3.2）：推送记录导出下载。body:
-    // format=csv|json&cate=&q=（URLSearchParams；与 /api/runs/detail 同款 POST+body 形态
-    // ——fetch 字面量红线 + 筛选词不落访问日志 URL）。page/size 参数按蓝图签名容忍存在但
-    // 刻意不读取：导出=筛选结果全量（展示分页是另一口径，蓝图明说「不走 page-size 钳制」；
-    // 若按起点偏移切片，「截断到 5000」的 X-Export-Truncated 判据将失去唯一参照）。
-    // 无 shuttingDown 闸（定夺见规划 §2.1）：与 /api/runs/detail 同为纯读 POST，detail 无此闸。
-    if (req.method === 'POST' && url.pathname === '/api/messages/export') {
-      readBody(req)
-        .then(({ body, aborted, over }) => {
-          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
-          const params = new URLSearchParams(body)
-          const format = params.get('format')
-          if (!EXPORT_FORMATS.includes(format)) { sendJson(res, 400, { error: 'format 必须是 csv 或 json' }); return }
-          const cate = typeof params.get('cate') === 'string' ? params.get('cate') : ''
-          const query = clampQueryBytes(typeof params.get('q') === 'string' ? params.get('q').trim() : '')
-          const needle = query.length > 0 ? query.toLowerCase() : ''
-          const daysRaw = Number(params.get('days'))
-          const days = MESSAGE_DAYS_ALLOWED.includes(daysRaw) ? daysRaw : 0
-          const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
-          if (read.status !== 'ok') {
-            // missing/invalid/tooLarge 三态如实下发（与 /api/messages 同形态同哲学）：
-            // 不伪装成空 CSV/空 JSON 让用户导出「成功却没数据」的文件；前端按 Content-Type 识别
-            // 后展示提示而非下载。
-            sendJson(res, 200, { status: read.status, total: 0, items: [], cacheDirHint: stateDir, cacheFileHint: messagesFile })
-            return
-          }
-          const windowedExport = windowMessages(read.value.items, {
-            days, fromKey: parseDayKey(params.get('from')), toKey: parseDayKey(params.get('to'))
-          }).items
-          const filtered = filterMessageItems(windowedExport, cate, needle)
-          const truncated = filtered.length > EXPORT_MAX_ROWS
-          const rows = (truncated ? filtered.slice(0, EXPORT_MAX_ROWS) : filtered).map(exportRowOf)
-          // 截断回显（D2-S9）：列表端点有 queryUsed，导出此前没有——搜索词超过 240 字节被
-          // 静默截断时，用户会以为「导出的是我搜的那个词的结果」。JSON 保持裸数组契约
-          // （不改成 {items,...} 对象），CSV 也不插注释行，统一走响应头：percent-encoded
-          // UTF-8，非 ASCII 安全；未截断也下发，消费方可据此判断词是否被接受。
-          const exportMeta = { 'X-Export-Query-Used': encodeURIComponent(query) }
-          // 文件名 = messages-<YYYYMMDD-HHmm>.<ext>（北京时间）：同一目录里多次导出不再互相
-          // 覆盖，打开就知道是哪一批。名字里只有时间戳，不含查询词/分类——它们可能含 token
-          // 形态字符串，绝不回显进头（蓝图防线）；纯 ASCII 见 exportStamp 注释。
-          const stamp = exportStamp()
-          if (format === 'json') {
-            // 仅截断时下发该头；未截断不下发（缺席=完整，测试断言 undefined）。
-            if (truncated) res.setHeader('X-Export-Truncated', 'true')
-            // 成功导出=直接数组（文档口径「JSON 形态直出数组」，评审 231-M1）：消费方
-            // JSON.parse 即得行数组，无需剥 items。截断信息走 X-Export-Truncated 头，
-            // 不进响应体（形态纯度优先；三态响应才是 {status,...} 对象，前端按
-            // Array.isArray 区分成功/三态——评审 231-H1）。
-            const body = JSON.stringify(rows)
-            res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="messages-${stamp}.json"` }, exportMeta))
-            res.end(body)
-            return
-          }
-          const head = Object.assign({
-            'Content-Type': 'text/csv; charset=utf-8',
-            // 只拼本地生成的时间戳：查询词可能含 token 形态字符串，绝不回显进头（蓝图防线）。
-            'Content-Disposition': `attachment; filename="messages-${stamp}.csv"`
-          }, exportMeta)
-          if (truncated) head['X-Export-Truncated'] = 'true'
-          // BOM EF BB BF：Excel 无 BOM 按本地代码页解析会乱码中文（蓝图硬性要求）。
-          res.writeHead(200, head)
-          res.end(Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(buildMessagesCsv(rows), 'utf8')]))
-        })
-        .catch((e) => { logCaught('messages/export', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/trends') {
-      // 近 N 日运行趋势：run.log 摘要行按日聚合（scripts/status.js readTrends，与 parseLastRun
-      // 同一正则口径）。days 走白名单（14/30/60），非法/缺省/越界一律回默认 14——向后兼容；
-      // readTrends 对 days 无内部钳制，这里的白名单是唯一防线。
-      const rawDays = Number(url.searchParams.get('days'))
-      const days = TREND_DAYS_ALLOWED.includes(rawDays) ? rawDays : TREND_DAYS_DEFAULT
-      // v3.326：自定义区间优先于 days（与推送记录同一口径：非法/颠倒区间静默回落）。
-      const trendFrom = parseDayKey(url.searchParams.get('from'))
-      const trendTo = parseDayKey(url.searchParams.get('to'))
-      const t = readTrends(stateDir, { days, from: trendFrom, to: trendTo })
-      if (t.status !== 'ok') {
-        sendJson(res, 200, { status: t.status, byDay: [], days })
-        return
-      }
-      sendJsonConditional(req, res, {
-        status: 'ok',
-        days: t.value.days,
-        from: t.value.from,
-        to: t.value.to,
-        byDay: t.value.byDay,
-        // today：Asia/Shanghai 日历日（run.log 时间戳口径），前端「今天」高亮用它；
-        // truncated：run.log 超限只统计了尾部（前端副标题如实注明）
-        today: t.value.today,
-        truncated: t.value.truncated === true
-      })
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/run-history') {
-      // 逐轮运行历史（v3.299 批次②）：直接解析 run.log 摘要行（零新文件零写盘——
-      // run.log 是仓内既定的持久逐轮记录，CHANGELOG v3.289 口径）。limit/before 钳制：
-      // URL 是未验证输入，Number + 整数 + 区间钳制，用户输入不进正则。
-      let limit = Number(url.searchParams.get('limit'))
-      if (!Number.isSafeInteger(limit) || limit < 1) limit = RUN_HISTORY_LIMIT_DEFAULT
-      if (limit > RUN_HISTORY_LIMIT_MAX) limit = RUN_HISTORY_LIMIT_MAX
-      // before 游标（审查 D1-S3）：数字 = 旧的行号游标；条目 key 游标 = 8 位十六进制，
-      // 同内容重复行的第 2..n 条带 `-<序号>` 后缀（D2-S4 复核：两条相同摘要行用同一个
-      // key 会让 `before` 命中较新一条 → 翻页反复返回同一页）。其它形态一律当未传。
-      const rawBefore = String(url.searchParams.get('before') || '')
-      let before = 0
-      if (/^[0-9a-f]{8}(?:-\d{1,4})?$/.test(rawBefore)) before = rawBefore
-      else if (/^\d{1,9}$/.test(rawBefore) && Number(rawBefore) > 0) before = Number(rawBefore)
-      // 尾窗指纹（评审 #243-1）：8 位十六进制；其它形态一律当「没带」，不做截断猜测
-      const rawWin = String(url.searchParams.get('win') || '')
-      const windowKey = /^[0-9a-f]{8}$/.test(rawWin) ? rawWin : ''
-      // 「仅运行」：服务端先剔除 CANCEL 留痕再套 limit，避免取消记录挤掉真实轮次。
-      const excludeCancelled = url.searchParams.get('excludeCancelled') === '1'
-      // Sourcery #229-4 / 审查 #241 S1：run.log 的写入方是运行侧 MessageStore.cacheDir
-      // （xbk_app _writeRunLog → MessageStore.cacheDir），不是控制台 stateDir——Config.cache.dir
-      // 指向别处时两个目录分居。读取源与 spawn/停止留痕同走 historyDir()（运行侧真实目录优先）。
-      const h = readRunHistory(historyDir(), { limit, before, windowKey, excludeCancelled })
-      sendJsonConditional(req, res, h)
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/logs') {
-      // 运行日志在线查看：run.log 尾部 1MiB（与 status.js LOG_READ_OPTIONS.tail 同口径）。
-      // 读取源与 /api/run-history、/api/status 同走 historyDir()（D2-S5 复核）：run.log 由
-      // 运行侧 MessageStore.cacheDir 写入，Config.cache.dir/XBK_CACHE_DIR 漂移或嵌入式注入
-      // 时与 stateDir 分居——旧实现读 stateDir/run.log，日志页在那种部署里恒为空。
-      // v3.403：新增 ?list=1（列出当周 + 历史周）与 ?file=&page=&size=（按页读）；
-      // 不带这些参数时保持旧的「尾部 1MiB 全文」口径，老前端与测试不受影响。
-      const LogArchive = require('./log-archive')
-      const dir = historyDir()
-      const pageRaw = url.searchParams.get('page')
-      const fileRaw = url.searchParams.get('file')
-      if (url.searchParams.get('list') === '1') {
-        const cur = []
-        for (const name of ['run.log', 'filter-diagnostics.ndjson']) {
-          let st = null
-          try { st = fs.statSync(path.join(dir, name)) } catch (e) {}
-          if (st) cur.push({ file: name, key: 'current', size: st.size, mtimeMs: st.mtimeMs, kind: 'plain', current: true })
-        }
-        const files = cur.concat(LogArchive.listArchives(dir, 'run.log'), LogArchive.listArchives(dir, 'filter-diagnostics.ndjson'))
-        sendJson(res, 200, { status: 'ok', files })
-        return
-      }
-      if (fileRaw || pageRaw) {
-        const file = String(fileRaw || 'run.log')
-        const ok = file === 'run.log' || file === 'filter-diagnostics.ndjson' ||
-          /^logs\/(run|diag)-\d{8}-\d{8}\.log(\.gz)?$/.test(file)
-        if (!ok) { sendJson(res, 400, { status: 'bad_file', error: '未知日志文件' }); return }
-        const page = Math.max(1, parseInt(pageRaw || '1', 10) || 1)
-        const size = Math.min(500, Math.max(50, parseInt(url.searchParams.get('size') || '200', 10) || 200))
-        const abs = path.join(dir, file)
-        let out = null
-        let exists = false
-        try { exists = fs.existsSync(abs) } catch (e) {}
-        try {
-          out = file.endsWith('.gz') ? LogArchive.readGzPage(abs, page, size) : LogArchive.readPlainPage(abs, page, size)
-        } catch (e) { out = null }
-        if (!out) {
-          // 文件在但读/解压失败 → corrupt（别伪装成 missing 让控制台静默）；确实没有才 missing。
-          sendJson(res, 200, { status: exists ? 'corrupt' : 'missing', file, page, pages: 1, total: 0, lines: [] })
-          return
-        }
-        sendJson(res, 200, { status: 'ok', file, page: out.page, pages: out.pages, total: out.total, size, lines: out.lines })
-        return
-      }
-      const { readSafeTextResult } = require('../xbk_storage')
-      const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true, openNonBlocking: true })
-      if (safe.status === 'missing') {
-        sendJson(res, 200, { status: 'missing', text: '' })
-        return
-      }
-      if (safe.status !== 'ok') {
-        sendJson(res, 200, { status: safe.status, text: '' })
-        return
-      }
-      sendJson(res, 200, { status: 'ok', text: safe.text })
-      return
-    }
-    // ── v3.298 只读扩展端点：缓存健康 / 文件清单 / 配置视图 ─────────────────────
-    // 全部无副作用（不写盘、不 spawn），鉴权与既有读取端点同一全局闸。
-    if (req.method === 'GET' && url.pathname === '/api/cache-health') {
-      const snap = cacheHealthSnapshot(stateDir, messagesFile)
-      // 条目数对照（Sourcery Medium「条目上限无预警」/ D2-S11 / D2-S12）：
-      // ① count 用 rawTotal（含 _f 条目）——_f 一样占缓存额度，旧口径漏计会让超限预警不响；
-      // ② 超过 CACHE_HEALTH_COUNT_MAX_BYTES 不整读（同步 parse 20MB 实测阻塞 232ms），
-      //    如实报 null + tooLarge，不编数；阈值内走 readMessages 的解析缓存。
-      const cnt = cacheHealthEntryCount(stateDir, messagesFile)
-      snap.entryCount = cnt.status === 'ok' ? cnt.count : null
-      snap.entryCountStatus = cnt.status
-      snap.entryCountFiltered = cnt.status === 'ok' ? cnt.filteredCount : null
-      if (cnt.status === 'tooLarge') snap.entryCountHint = `缓存超过 ${Math.round(CACHE_HEALTH_COUNT_MAX_BYTES / (1024 * 1024))}MiB，不在请求路径上整读计数（推送记录页的 grandTotal 仍可查）`
-      sendJsonConditional(req, res, snap)
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/files') {
-      const list = listStateFiles(stateDir, messagesFile)
-      sendJson(res, 200, list)
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/config') {
-      // 脱敏在 buildConfigView 内逐字段白名单完成；这里只做最终保险丝：万一未来白名单
-      // 意外混入凭证形态字段，响应前整体拦一道（fail-closed 降级为不含 runtime 的骨架）。
-      // D2-S13：旧实现拿「大写环境变量名」去匹配小写化后的 JSON，两个形态永不相交，这段
-      // 防线不可达；且降级响应的键名写成 localFileLoaded（前端读 localFilePresent），
-      // 前端把「保险丝触发」误显示成「模块缺失」。现在按键名语义递归扫描 + 统一键名。
-      const view = buildConfigView()
-      const leaked = findSecretLikeField(view)
-      if (leaked) {
-        sendJson(res, 200, {
-          configLoaded: false,
-          runtime: null,
-          pushChannels: { moduleLoaded: false, count: 0, names: [], perChannel: {}, localFilePresent: buildPushChannelsView().localFilePresent },
-          console: { env: {} },
-          redacted: true,
-          redactedField: leaked
-        })
-        return
-      }
-      sendJsonConditional(req, res, view)
-      return
-    }
-    // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer/?token= 均可）。
-    if (req.method === 'GET' && url.pathname === '/api/config/filter') {
-      handleFilterGet(req, res)
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/config/filter/draft') {
-      handleFilterDraftGet(req, res)
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/sys') {
-      // 系统信息：版本四方来源 package.json（与 check-version.js 的唯一真源一致）+
-      // 进程/宿主只读信息。不暴露路径之外的任何环境变量（token 等凭证绝不入响应）。
-      const version = APP_VERSION
-      // v3.331：显式禁缓存。版本对账拿不到「现在的」版本就永远提示不了刷新，
-      // 不能被浏览器/代理的启发式缓存喂旧值（Sourcery #294）。
-      res.setHeader('Cache-Control', 'no-store')
-      let rss = 0
-      try { rss = process.memoryUsage().rss } catch (e) { rss = 0 }
-      sendJson(res, 200, {
-        version,
-        node: process.version,
-        platform: `${process.platform} ${process.arch}`,
-        pid: process.pid,
-        uptimeS: Math.floor(process.uptime()),
-        rssBytes: rss,
-        cacheDir: stateDir,
-        startedAt: startedAtMs
-      })
-      return
-    }
-    // ── v3.357 两步验证（Google Authenticator / TOTP）──────────────────────────
-    // 只保护浏览器页面；API 仍走原访问令牌。配置写面只认 Bearer（与其它写端点同口径）。
-    if (req.method === 'GET' && url.pathname === '/api/2fa/status') {
-      res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, {
-        enabled: twoFactor.enabled,
-        pending: hasPendingTwoFactor(),
-        recoveryRemaining: twoFactor.recovery ? twoFactor.recovery.hashes.length : 0,
-        // 信任设备数（v3.374）：系统页的「退出所有信任设备」按钮靠它显示「现在记住了几台」。
-        trustedDevices: twoFactor.enabled ? trustedDeviceCount() : 0
-      })
-      return
-    }
-    // 退出所有信任设备（v3.374）：写面只认 Bearer（与其它写端点同口径，Cookie-only 401）。
-    // 同时清掉当前浏览器的设备 Cookie——否则页面上「已退出」，这台机器下次仍能免验证进来。
-    if (req.method === 'POST' && url.pathname === '/api/devices/revoke') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      const verdict = writeAuthVerdict(req, url.searchParams, token)
-      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      req.resume() // 不需要 body；显式排空，避免 keep-alive 连接里残留字节污染下一个请求
-      if (!revokeTrustedDevices()) {
-        sendJson(res, 500, { error: 'write_failed', message: '设备列表清空失败，请稍后再试' })
-        return
-      }
-      res.setHeader('Set-Cookie', clearDeviceCookieHeader())
-      res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, { revoked: true, devices: 0 })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/api/2fa/setup') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      const verdict = writeAuthVerdict(req, url.searchParams, token)
-      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      if (twoFactor.enabled) { sendJson(res, 409, { error: 'already_enabled', message: '两步验证已经开启' }); return }
-      // 该端点不读 body（只生成密钥）；显式排空，避免 keep-alive 连接里残留 body
-      // 被下一次请求当成请求行解析。前端仍会发一个空 JSON 对象。
-      req.resume()
-      const secret = generateTotpSecret()
-      const pending = rememberPendingTwoFactor(secret)
-      const label = encodeURIComponent('xbk-push:console')
-      const issuer = encodeURIComponent('xbk-push')
-      const otpauth = `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`
-      res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, { setupId: pending.id, secret, otpauth, qrDataUrl: totpQrDataUrl(otpauth), account: 'xbk-push:console', issuer: 'xbk-push', period: TOTP_PERIOD_S, digits: TOTP_DIGITS })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/api/2fa/enable') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      const verdict = writeAuthVerdict(req, url.searchParams, token)
-      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
-        if (!read.ok) { sendJson(res, read.status, read.body); return }
-        const payload = read.payload
-        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
-        const setupId = typeof payload.setupId === 'string' ? payload.setupId : ''
-        if (twoFactor.enabled) {
-          // 成功响应丢包时允许同一 setupId + 仍有效的验证码重取一次恢复码（短时、只存内存）。
-          const receipt = lastEnableResult
-          const fresh = receipt && Date.now() - receipt.createdAt < TWO_FACTOR_ENABLE_RESULT_TTL_MS
-          if (fresh && setupId !== '' && receipt.setupId === setupId && verifyTotpCode(receipt.secret, code)) {
-            res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
-            res.setHeader('Cache-Control', 'no-store')
-            sendJson(res, 200, { enabled: true, recoveryCodes: receipt.recoveryCodes, recoveryRemaining: receipt.recoveryCodes.length })
-            return
-          }
-          sendJson(res, 409, { error: 'already_enabled', message: '两步验证已经开启' })
-          return
-        }
-        if (loginThrottled(req)) {
-          sendJson(res, 429, { error: 'too_many_attempts', message: '尝试次数过多，请 5 分钟后再试' })
-          return
-        }
-        const pending = findPendingTwoFactor(setupId, code)
-        if (!pending) {
-          sendJson(res, 400, { error: 'setup_required', message: '请先获取新的设置密钥（二维码/密钥）' })
-          return
-        }
-        if (!verifyTotpCode(pending.secret, code)) {
-          noteLoginFailure(req)
-          sendJson(res, 400, { error: 'invalid_code', message: '验证码不对，请确认手机时间准确后重试' })
-          return
-        }
-        const recoveryCodes = generateRecoveryCodes()
-        const recovery = recoveryRecordOf(recoveryCodes)
-        // 重配 2FA = 换了一把新钥匙：先作废旧设备信任，清不掉就整体失败（否则旧 cookie
-        // 仍能绕过新密钥；Sourcery High「Old trusted devices bypass new 2FA」）。
-        if (!revokeTrustedDevices()) {
-          sendJson(res, 500, { error: 'revoke_failed', message: '旧设备信任清理失败，未开启两步验证' })
-          return
-        }
-        if (!persistTwoFactorState(twoFactor.file, pending.secret, recovery)) {
-          sendJson(res, 500, { error: 'write_failed', message: '两步验证配置保存失败' })
-          return
-        }
-        twoFactor.enabled = true
-        twoFactor.secret = pending.secret
-        twoFactor.recovery = recovery
-        twoFactor.createdAt = Date.now()
-        pendingTwoFactors.delete(pending.id)
-        // 开启时用的那一步也记入已用集合：同一码不能在 30 秒内再换一次登录 Cookie。
-        const setupStep = totpStepAt(pending.secret, code)
-        if (setupStep !== null) usedTotpSteps.set(setupStep, (setupStep + 2) * TOTP_PERIOD_S * 1000)
-        lastEnableResult = { setupId: pending.id, secret: pending.secret, recoveryCodes, createdAt: Date.now() }
-        clearLoginFailures(req)
-        res.setHeader('Set-Cookie', twoFactorCookieHeader(req, twoFactor.secret))
-        res.setHeader('Cache-Control', 'no-store')
-        sendJson(res, 200, { enabled: true, recoveryCodes, recoveryRemaining: recoveryCodes.length })
-      }).catch((e) => { logCaught('2fa/enable', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/api/2fa/disable') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      const verdict = writeAuthVerdict(req, url.searchParams, token)
-      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      if (!filterMediaAllowed(req)) { sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' }); return }
-      readJsonObjectBody(req, BODY_DEFAULT_MAX_BYTES).then((read) => {
-        if (!read.ok) { sendJson(res, read.status, read.body); return }
-        const payload = read.payload
-        const code = typeof payload.code === 'string' ? payload.code.trim() : ''
-        if (!twoFactor.enabled) {
-          res.setHeader('Set-Cookie', clearTwoFactorCookieHeader(req))
-          sendJson(res, 200, { enabled: false })
-          return
-        }
-        if (loginThrottled(req)) {
-          sendJson(res, 429, { error: 'too_many_attempts', message: '尝试次数过多，请 5 分钟后再试' })
-          return
-        }
-        // 关闭时要先核验、再删文件；恢复码只在删文件成功后才算消耗（persistRecovery:false）。
-        const check = verifySecondFactor(code, { persistRecovery: false })
-        if (!check.ok) {
-          noteLoginFailure(req)
-          const why = check.error === 'replay'
-            ? '这个验证码已经用过，请等手机上的数字刷新后再试；也可以用恢复码。'
-            : '验证码不对，未关闭'
-          sendJson(res, 400, { error: 'invalid_code', message: why })
-          return
-        }
-        // 先清设备信任、再删配置：清不掉就保持 2FA 开启，避免留下「已关 2FA 但旧设备还能进」的状态。
-        if (!revokeTrustedDevices()) {
-          sendJson(res, 500, { error: 'revoke_failed', message: '信任设备清理失败，未关闭两步验证' })
-          return
-        }
-        try {
-          fs.rmSync(twoFactor.file, { force: true })
-        } catch (e) {
-          sendJson(res, 500, { error: 'remove_failed', message: '两步验证配置删除失败' })
-          return
-        }
-        twoFactor.enabled = false
-        twoFactor.secret = ''
-        twoFactor.recovery = null
-        twoFactor.createdAt = 0
-        pendingTwoFactors = new Map()
-        lastEnableResult = null
-        usedTotpSteps.clear()
-        clearLoginFailures(req)
-        res.setHeader('Set-Cookie', [clearTwoFactorCookieHeader(req), clearDeviceCookieHeader()])
-        sendJson(res, 200, { enabled: false })
-      }).catch((e) => { logCaught('2fa/disable', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    // 服务器端自动正式运行：状态/开关/间隔。GET 走全局鉴权；POST 只认 Bearer（写面防 CSRF）。
-    if (req.method === 'GET' && url.pathname === '/api/auto') {
-      sendJsonConditional(req, res, {
-        auto: autoSnapshot(),
-        min: AUTO_MIN_S,
-        max: AUTO_MAX_S,
-        maxFails: AUTO_MAX_FAILS,
-        scheduleMax: AUTO_SCHEDULE_MAX,
-        scheduleMaxSeconds: AUTO_SCHEDULE_MAX_S
-      })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/api/auto') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      const verdict = writeAuthVerdict(req, url.searchParams, token)
-      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      readJsonObjectBody(req)
-        .then((read) => {
-          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (!read.ok) { sendJson(res, read.status, read.body); return }
-          const payload = read.payload
-          let on = auto.on
-          if (Object.prototype.hasOwnProperty.call(payload, 'on')) {
-            if (typeof payload.on !== 'boolean') { sendJson(res, 400, { error: 'on 必须是布尔值' }); return }
-            on = payload.on
-          }
-          let interval = auto.interval
-          if (Object.prototype.hasOwnProperty.call(payload, 'interval')) {
-            if (typeof payload.interval !== 'number' || !Number.isInteger(payload.interval) ||
-              payload.interval < AUTO_MIN_S || payload.interval > AUTO_MAX_S) {
-              sendJson(res, 400, { error: `interval 必须是 ${AUTO_MIN_S}–${AUTO_MAX_S} 的整数` })
-              return
-            }
-            interval = payload.interval
-          }
-          let schedule = auto.schedule
-          const writesSchedule = Object.prototype.hasOwnProperty.call(payload, 'schedule')
-          if (writesSchedule) {
-            // 乐观并发：两个标签页各改一份再保存时，后提交者不得静默覆盖先提交者的窗口。
-            // 客户端带上读取时的 updatedAt；可选参数，老客户端/脚本不带也能写（兼容）。
-            if (typeof payload.baseUpdatedAt === 'number' && payload.baseUpdatedAt !== auto.updatedAt) {
-              sendJson(res, 409, { error: 'schedule_conflict', message: '另一个标签页刚改过分时段，请刷新后再保存', auto: autoSnapshot() })
-              return
-            }
-            const parsed = normalizeAutoSchedule(payload.schedule)
-            if (!parsed.ok) { sendJson(res, 400, { error: parsed.error }); return }
-            schedule = parsed.value
-          }
-          if (on) {
-            auto.interval = interval
-            auto.schedule = schedule
-            if (!auto.on) {
-              auto.on = true
-              auto.startedAt = Date.now()
-              auto.runs = 0
-              auto.fails = 0
-              auto.degraded = false
-              auto.spawnFails = 0
-              auto.lastError = ''
-            }
-            if (!persistAuto()) {
-              sendJson(res, 500, { error: '自动运行配置落盘失败，请检查缓存目录权限/磁盘' })
-              return
-            }
-            // 有在途轮次时不重排；它结束后按新间隔排下一轮。
-            if (!autoInFlightId) scheduleAuto(autoNextDelay())
-          } else {
-            auto.interval = interval
-            auto.schedule = schedule
-            stopAuto('')
-            if (!persistAuto()) {
-              sendJson(res, 500, { error: '自动运行配置落盘失败，请检查缓存目录权限/磁盘' })
-              return
-            }
-          }
-          sendJson(res, 200, {
-            auto: autoSnapshot(),
-            min: AUTO_MIN_S,
-            max: AUTO_MAX_S,
-            maxFails: AUTO_MAX_FAILS,
-            scheduleMax: AUTO_SCHEDULE_MAX,
-            scheduleMaxSeconds: AUTO_SCHEDULE_MAX_S
-          })
-        })
-        .catch((e) => { logCaught('auto/config', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    // ── v3.340 控制台设置：通知自检的重复提交拦截窗（配置页可读写）──────────────
-    // GET 走全局鉴权（Cookie/Bearer/?token= 均可读）；POST 只认 Bearer + JSON（写面防 CSRF）。
-    // 落盘 <stateDir>/console-settings.json（0600 原子写），内存即时更新 ⇒ 下一次触发判定就生效。
-    if (req.method === 'GET' && url.pathname === '/api/config/console') {
-      // 可变设置不许被任何中间层/浏览器启发式缓存：保存后刷新必须拿到刚写入的值。
-      res.setHeader('Cache-Control', 'no-store')
-      sendJson(res, 200, {
-        schema: 1,
-        revision: runtimeSettings.revision,
-        updatedAt: runtimeSettings.updatedAt,
-        source: settingsSource,
-        settings: { notifyTestReplayWindowS: runtimeSettings.notifyTestReplayWindowS, syncShowDate: runtimeSettings.syncShowDate },
-        defaults: { notifyTestReplayWindowS: CONSOLE_SETTINGS_DEFAULT_S, syncShowDate: true },
-        min: NOTIFY_REPLAY_MIN_S,
-        max: NOTIFY_REPLAY_MAX_S
-      })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/api/config/console') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-      const verdict = writeAuthVerdict(req, url.searchParams, token)
-      if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
-      if (!filterMediaAllowed(req)) {
-        sendJson(res, 415, { error: 'unsupported_media_type', code: 'unsupported_media_type' })
-        return
-      }
-      readJsonObjectBody(req)
-        .then((read) => {
-          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (!read.ok) { sendJson(res, read.status, read.body); return }
-          const payload = read.payload
-          // v3.342：两字段都是可选的「部分更新」，但至少要给一个；给了就必须严格合法——
-          // 字符串 '60' / 1.5 / null / 越界 / 非布尔的显示开关全部拒绝，含糊接受会让
-          // 「保存成功但生效值不是用户以为的那个」变成静默事故。
-          const hasWin = Object.prototype.hasOwnProperty.call(payload, 'notifyTestReplayWindowS')
-          const hasDate = Object.prototype.hasOwnProperty.call(payload, 'syncShowDate')
-          if (!hasWin && !hasDate) {
-            sendJson(res, 400, { error: '至少要提供 notifyTestReplayWindowS 或 syncShowDate 之一' })
-            return
-          }
-          if (hasWin && (typeof payload.notifyTestReplayWindowS !== 'number' ||
-            !Number.isInteger(payload.notifyTestReplayWindowS) ||
-            payload.notifyTestReplayWindowS < NOTIFY_REPLAY_MIN_S ||
-            payload.notifyTestReplayWindowS > NOTIFY_REPLAY_MAX_S)) {
-            sendJson(res, 400, { error: `notifyTestReplayWindowS 必须是 ${NOTIFY_REPLAY_MIN_S}–${NOTIFY_REPLAY_MAX_S} 的整数` })
-            return
-          }
-          if (hasDate && typeof payload.syncShowDate !== 'boolean') {
-            sendJson(res, 400, { error: 'syncShowDate 必须是布尔值' })
-            return
-          }
-          // 可选乐观锁：带了就必须是当前 revision，防两个标签页/两个人在设置页互相覆盖。
-          if (Object.prototype.hasOwnProperty.call(payload, 'baseRevision') &&
-            (typeof payload.baseRevision !== 'number' || !Number.isSafeInteger(payload.baseRevision) ||
-              payload.baseRevision < 0 || payload.baseRevision !== runtimeSettings.revision)) {
-            sendJson(res, 409, { error: 'revision_mismatch', revision: runtimeSettings.revision })
-            return
-          }
-          const nextWin = hasWin ? payload.notifyTestReplayWindowS : runtimeSettings.notifyTestReplayWindowS
-          const nextDate = hasDate ? payload.syncShowDate : runtimeSettings.syncShowDate
-          // 同值保存不推进 revision、不重写文件：否则每点一次「保存」都会把别的标签页/手机上的
-          // baseRevision 作废，它们下一次保存只能吃 409（页面还会显示「已被别处改过」）。
-          if (nextWin === runtimeSettings.notifyTestReplayWindowS && nextDate === runtimeSettings.syncShowDate) {
-            sendJson(res, 200, {
-              ok: true,
-              unchanged: true,
-              revision: runtimeSettings.revision,
-              updatedAt: runtimeSettings.updatedAt,
-              settings: { notifyTestReplayWindowS: runtimeSettings.notifyTestReplayWindowS, syncShowDate: runtimeSettings.syncShowDate }
-            })
-            return
-          }
-          // 落盘成功才改内存：写失败（磁盘/权限）时内存保持旧值，页面不会显示一个
-          // 重启后就消失的「已保存」。
-          const next = {
-            schema: 1,
-            revision: runtimeSettings.revision + 1,
-            updatedAt: Date.now(),
-            notifyTestReplayWindowS: nextWin,
-            syncShowDate: nextDate
-          }
-          if (!writeAtomic(settingsPath, JSON.stringify(next), '控制台设置')) {
-            sendJson(res, 500, { error: '设置保存失败（磁盘/权限）' })
-            return
-          }
-          runtimeSettings.revision = next.revision
-          runtimeSettings.updatedAt = next.updatedAt
-          runtimeSettings.notifyTestReplayWindowS = next.notifyTestReplayWindowS
-          runtimeSettings.syncShowDate = next.syncShowDate
-          settingsSource = 'file'
-          sendJson(res, 200, {
-            ok: true,
-            revision: next.revision,
-            updatedAt: next.updatedAt,
-            settings: { notifyTestReplayWindowS: next.notifyTestReplayWindowS, syncShowDate: next.syncShowDate }
-          })
-        })
-        .catch((e) => { logCaught('console/settings', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    if (req.method === 'POST' && url.pathname === '/trigger') {
-      acceptAction(req, res, {})
-      return
-    }
-    // 批次④ 4.1：通知自检——一次真实推送动作，语义上是「另一种动作」，复用触发全套防线
-    // （鉴权 401 / shuttingDown 503 / 重放窗 60s / 单飞锁），零 body。子进程 =
-    // spawn(node, [ENTRY_SINGLE, '--notify-test'])（entry:'single' 映射，见 ACTIONS 行）。
-    if (req.method === 'POST' && url.pathname === '/api/notify-test') {
-      acceptAction(req, res, { fixedAction: 'notify-test' })
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/api/runs') {
-      const list = [...runs.values()].sort((a, b) => b.startedAt - a.startedAt).map((r) => ({
-        id: r.id,
-        action: r.action,
-        label: r.label,
-        startedAt: r.startedAt,
-        finishedAt: r.finishedAt,
-        exitCode: r.exitCode,
-        timedOut: r.timedOut,
-        cancelled: r.cancelled === true
-      }))
-      sendJsonConditional(req, res, { runs: list })
-      return
-    }
-    // GET /api/stream（v3.374）：全站数据变化通知流。只发「变了」这一个信号
-    // （event: tick + {"at":<ms>}），正文由前端用既有条件请求拉（ETag/304）——一条长连接
-    // 不承载数据，重连也就不需要补帧。鉴权零代码：继承上方全局闸（原生 EventSource 带不了
-    // 自定义头 → Bearer 不可用；GET 收会话 Cookie，?token= 供 API/测试用，与 runs/stream 同口径）。
-    if (req.method === 'GET' && url.pathname === '/api/stream') {
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭' }); return }
-      // 连接数闸：第 21 个立刻 503（不排队、不先建流再断）。
-      if (streamClients.size >= SSE_STREAM_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        // no-store 而不是 no-cache：这条流带鉴权语义，浏览器不得把任何一帧存下来复用。
-        'Cache-Control': 'no-store',
-        'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理按块缓冲（否则 tick 要等代理攒满）
-        Connection: 'keep-alive'
-      })
-      res.flushHeaders()
-      const client = { res, closed: false, timer: null }
-      // 每连接只挂一个心跳定时器（20s 注释帧）；指纹采样是共享的，连接再多也只读一次盘。
-      client.timer = setInterval(() => { streamWrite(client, ': ping\n\n') }, SSE_STREAM_HEARTBEAT_MS)
-      if (typeof client.timer.unref === 'function') client.timer.unref()
-      streamClients.add(client)
-      res.on('close', () => streamTeardown(client))
-      res.on('error', () => streamTeardown(client))
-      startStreamSampler()
-      return
-    }
-    // GET /api/runs/stream（v3.300 批次③ 3.1）：运行中任务输出的 SSE 实时流。
-    // ?id=<epoch.seq>&since=<offset>。鉴权零代码（继承上方全局闸）：原生 EventSource
-    // 不能带自定义头 → Bearer 不可用；GET 收会话 Cookie（authorize 内 GET 分支），前端走
-    // Cookie；API/测试可用 ?token=（浏览器流同款）。端点与前端统一 id= 键名（蓝图口径）。
-    if (req.method === 'GET' && url.pathname === '/api/runs/stream') {
-      // 关停闸：与 /trigger/cancel 同哲学——关停窗口不新开长连接（setShuttingDown 已置位，
-      // 活跃连接由 shutdown 序列广播 done，见 wireGracefulShutdown）。
-      if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭' }); return }
-      const id = url.searchParams.get('id')
-      if (typeof id !== 'string' || id.length === 0) { sendJson(res, 400, { error: '缺少 id（epoch.seq 数字形态）' }); return }
-      if (!RUN_ID_RE.test(id)) { sendJson(res, 400, { error: 'id 必须是 epoch.seq 数字形态' }); return }
-      const record = runs.get(id)
-      if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
-      // 连接数闸：第 9 个 503（蓝图防线 3；Set 登记 + close 必清理在上方连接管理块）。
-      if (sseConnections.size >= SSE_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
-      // since 钳制（蓝图红线：Number + 整数 + 非负）：非法一律钳 0 → 客户端收整段，自愈。
-      // 越界（> outputTotalLength）钳到当前尾部（评审 231-M3）：保留超前游标会让
-      // ssePlanChunk 恒 null，后续真实输出被吞到游标追上为止——客户端错过内容。
-      // 缺省 = 从当前快照尾部开始（绝对偏移 = outputTotalLength，增量只发新数据）。
-      let cursor
-      // Last-Event-ID 优先（v3.363）：EventSource 断线重连会自动带上「最后收到的 id」，
-      // 服务端据此只补缺口；since 只在首次建连/手工探测时使用。两者共用同一套钳制。
-      const lastEventId = req.headers['last-event-id']
-      const resumedByHeader = typeof lastEventId === 'string' && lastEventId.length > 0
-      if (resumedByHeader) {
-        const n = parseSseCursor(lastEventId)
-        cursor = n === null ? 0 : Math.min(n, record.outputTotalLength)
-      } else if (url.searchParams.has('since')) {
-        const n = parseSseCursor(url.searchParams.get('since'))
-        cursor = n === null ? 0 : Math.min(n, record.outputTotalLength)
-      } else {
-        cursor = record.outputTotalLength
-      }
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理缓冲（蓝图口径）
-        Connection: 'keep-alive'
-      })
-      res.flushHeaders()
-      const conn = {
-        id,
-        res,
-        cursor, // 绝对偏移（UTF-16 code units），与 ssePlanChunk 同单位
-        // 重连但游标不可用（非法/0）：客户端手里已有旧内容，只能整段替换——否则会追加重复。
-        forceReset: resumedByHeader && cursor === 0,
-        pending: '', // 背压期间的应用层待发帧串（有序）
-        pendingBytes: 0, // 待发积压（UTF-8 字节），超 ssePendingLimit 硬断
-        paused: false,
-        closed: false,
-        lastPingAt: Date.now(),
-        timer: null
-      }
-      sseConnections.add(conn)
-      conn.timer = setInterval(() => sseTick(conn), SSE_TICK_MS)
-      if (typeof conn.timer.unref === 'function') conn.timer.unref() // 蓝图防线 5
-      res.on('drain', () => { conn.paused = false; sseFlushPending(conn) })
-      res.on('close', () => sseTeardown(conn))
-      res.on('error', () => sseTeardown(conn))
-      sseTick(conn) // 建连即补发一次：since=0 / 落后游标 → 本 tick 出增量或 reset
-      return
-    }
-    // POST /api/runs/detail：详情查询的 POST 形态（body: id=...）。与 GET /api/runs/:id
-    // 等价（同响应体）；提供 POST 形态是因为前端 fetch 的 URL 必须是字面量（Codacy SSRF
-    // 规则不接受任何含变量的 URL 第一参数，GET /:id 形态无法满足），id 改走请求体。
-    // 只读、无副作用，鉴权与 GET 完全一致（Cookie 会话对 POST 无效——G_4Kb 收紧口径不变，
-    // 会话用户由 boot JSON 提供显式 Bearer 凭证）。
-    if (req.method === 'POST' && url.pathname === '/api/runs/detail') {
-      readBody(req)
-        .then(({ body, aborted, over }) => {
-          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
-          const m = /(?:^|&)id=(\d{13,}\.\d{1,10})$/.exec(body)
-          if (!m) { sendJson(res, 400, { error: '缺少合法 id（epoch.seq 数字形态）' }); return }
-          const record = runs.get(m[1])
-          if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
-          sendJson(res, 200, {
-            id: record.id,
-            action: record.action,
-            label: record.label,
-            startedAt: record.startedAt,
-            finishedAt: record.finishedAt,
-            exitCode: record.exitCode,
-            timedOut: record.timedOut,
-            cancelled: record.cancelled === true,
-            output: record.output,
-            // 绝对偏移游标数据源（v3.300 3.1）：环形淘汰后 output.length ≠ 绝对偏移，
-            // 前端初始游标必须用 outputTotalLength（§2 D5）。两详情响应体保持等价。
-            outputTotalLength: record.outputTotalLength
-          })
-        })
-        .catch((e) => { logCaught('runs/detail', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    // POST /api/runs/cancel（v3.299 批次②）：停止运行中的触发任务。body: id=...，
-    // 与 /api/runs/detail 同形态（前端 fetch 首参必须是字面量 URL——Codacy SSRF 规则，
-    // GET /:id/cancel 形态无法满足）。
-    //
-    // 安全设计（评审预审）：
-    // - 杀进程只经 record._child 对象引用（内核句柄绑定 spawn 时进程，免疫 pid 复用）；
-    //   锁帧 pid 是控制台自身，绝不作为 kill 目标。
-    // - 信号纪律：SIGTERM → 3s 宽限（unref 定时器）→ SIGKILL 兜底，与既有超时/关停
-    //   路径同一套「杀→等 close→锁由 close 释放」机器。
-    // - 锁零操作：不 unlink（CodeQL 铁律）、不覆写、不碰 lastAccept——取消后重放窗保留，
-    //   同动作 ≈12min 冷却，阻断「取消后误重推已送达未记录条目」（半推送披露见 README）。
-    // - 幂等：已完成 409；已取消 200 返回现状（防重复按钮发第二次信号）。
-    if (req.method === 'POST' && url.pathname === '/api/runs/cancel') {
-      if (shuttingDown) {
-        sendJson(res, 503, { error: '控制台正在关闭，动作未执行' })
-        return
-      }
-      readBody(req)
-        .then(({ body, aborted, over }) => {
-          // 关停竞态兜底：readBody 期间收到 SIGTERM 时，关停序列即将 SIGKILL 全部子进程，
-          // 这里再发信号会与关停机器打架——拒绝（与 /trigger 同款双查）。
-          if (shuttingDown) { sendJson(res, 503, { error: '控制台正在关闭，动作未执行' }); return }
-          if (aborted || over) { sendJson(res, 400, { error: '请求中断或超限' }); return }
-          // id 形态 = 「epoch.seq」全数字段（Sourcery #229-1）：跨进程结构性失配，
-          // 旧 id 在新进程必然 404，不存在「序列复用误命中」。
-          const m = /(?:^|&)id=(\d{13,}\.\d{1,10})$/.exec(body)
-          if (!m) { sendJson(res, 400, { error: '缺少合法 id（epoch.seq 数字形态）' }); return }
-          const record = runs.get(m[1])
-          if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
-          if (record.cancelled) {
-            // 幂等先于 finishedAt（Sourcery #229-8）：已受理过取消的任务之后无论是否
-            // 已结束，重复 cancel 都返回 200 现状——不因时序在 200/409 间漂移。
-            sendJson(res, 200, { id: record.id, action: record.action, cancelled: true, finishedAt: record.finishedAt || null })
-            return
-          }
-          if (record.exitedAt || record.finishedAt) {
-            // exitedAt（Sourcery #229-10）：exit 事件先于 close（stdout/stderr drain 中）
-            // 的窗口里任务已不可取消——以「进程已退出」为准，而不是等 close 落 finishedAt。
-            sendJson(res, 409, { error: '该任务已结束，无需停止' })
-            return
-          }
-          record.cancelled = true
-          record.cancelRequestedAt = Date.now()
-          // 绕过 append 直改 output：计数器必须同步加（§1.3 理由同上）。
-          const note = '\n[console] 收到停止请求，正在终止子进程…\n'
-          record.output += note
-          record.outputTotalLength += note.length
-          // 审查 #229 S7 / D1-N3：停止留痕进 run.log——被停任务不会有自然收尾的摘要行，
-          // 控制台补一行 **CANCEL** 前缀的取消留痕（上海时区戳与写入侧 _localStamp 同形态）。
-          // readRunHistory 把 CANCEL 行识别成「cancelled 占位条目」，既让这轮在历史里可见，
-          // 又不参与 interrupted 判定（旧实现写 ERROR → 被回填成「下一轮中断」；#241 去掉
-          // 回填后该轮又彻底消失，两种都错）。
-          try {
-            const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
-            const stamp = stampFmt.format(new Date())
-            const stopDir = historyDir()
-            fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} CANCEL 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
-          } catch (e) { /* 留痕失败静默：内存 record.cancelled 已是权威 */ }
-          try {
-            record._child && record._child.kill('SIGTERM')
-          } catch (e) { /* 子进程句柄已失效：close 即将到来，兜底无害 */ }
-          // SIGKILL 兜底：宽限期后 close 仍未来（SIGTERM handler 卡住等）→ 强杀。
-          // 不依赖 kill 返回值（Node 不保证其反映进程状态）：已死进程上再签 SIGKILL
-          // 是无害 no-op，漏签才会让卡死任务挂到 PROC_TIMEOUT_MS。
-          // Sourcery #229-0：close 一到就 clearTimeout——子进程已死后再发的 SIGKILL
-          // 理论上不会命中复用 pid（kill 走句柄不走裸 pid，但句柄在子进程退出后发信号
-          // 本就是无意义动作），清理定时器让事件循环不留 3s 悬挂句。
-          const cancelChild = record._child
-          record._cancelTimer = setTimeout(() => {
-            try { cancelChild.kill('SIGKILL') } catch (e) { /* 已退出 */ }
-          }, CANCEL_GRACE_MS)
-          if (typeof record._cancelTimer.unref === 'function') record._cancelTimer.unref()
-          sendJson(res, 202, { id: record.id, action: record.action, cancelled: true })
-        })
-        .catch((e) => { logCaught('runs/cancel', e); sendJson(res, 500, { error: '读取请求体失败' }) })
-      return
-    }
-    const runMatch = /^\/api\/runs\/(\d{13,}\.\d{1,10})$/.exec(url.pathname)
-    if (req.method === 'GET' && runMatch) {
-      const record = runs.get(runMatch[1])
-      if (!record) { sendJson(res, 404, { error: 'not found（进程重启后历史丢失）' }); return }
-      sendJson(res, 200, {
-        id: record.id,
-        action: record.action,
-        label: record.label,
-        startedAt: record.startedAt,
-        finishedAt: record.finishedAt,
-        exitCode: record.exitCode,
-        timedOut: record.timedOut,
-        cancelled: record.cancelled === true,
-        output: record.output,
-        outputTotalLength: record.outputTotalLength // 与 POST detail 等价（v3.300 3.1）
-      })
+    // ── 路由表（D1）：全局鉴权之后的 endpoint 全部交给有序表 ─────────────────────
+    // ingress 到此结束。表顺序 = 原 if 链顺序（见 scripts/console-routes.js 的 ROUTE_TABLE），
+    // 未命中仍回原来的 404 形态（方法与路径都不匹配时与旧实现逐字一致）。
+    const route = matchRoute(routes, req.method, url.pathname)
+    if (route) {
+      route.handler(req, res, url, route.match)
       return
     }
     sendJson(res, 404, { error: 'not found' })
