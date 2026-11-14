@@ -467,11 +467,12 @@ function timingSafeEqualStr (a, b) {
 // 超长 token 会被静默丢弃导致资产/API 全 401，启动闸直接拒绝（fail-closed）。
 const TOKEN_MAX_LEN = 200
 const TOKEN_VISIBLE_ASCII_RE = /^[\x21-\x7e]+$/
-// `&` `#` `+` 额外禁止（Sourcery Raw-token-URLs）：raw ?token= 打开时浏览器把 & 当参数分隔、
-// # 当锚点、+ 在 URLSearchParams 里解码成空格——含这些字符的 token 让「文档里的 raw URL」
-// 直接失效。对自用工具，禁掉比要求操作者 percent-encode 更可靠。
-// `%` 额外禁止（Sourcery Percent-tokens）：raw ?token= 打开时 URLSearchParams 会对 %XX
-// 做 decodeURIComponent——含合法 percent escape 的 token 会被浏览器改写后与配置值失配 → 401。
+// `&` `#` `+` 额外禁止（Sourcery Raw-token-URLs）：A1 起 raw ?token= 打开已不再是合法
+// 登录路径，但这几条限制**有意保留**——收紧 token 字符集会改变已部署 token 的合法性，
+// 属于运行期配置变更（不在本次安全收紧范围内）。历史理由：raw ?token= 打开时浏览器把 &
+// 当参数分隔、# 当锚点、+ 在 URLSearchParams 里解码成空格。
+// `%` 额外禁止（Sourcery Percent-tokens）：同上，历史理由是 URLSearchParams 会对 %XX
+// 做 decodeURIComponent，含合法 percent escape 的 token 会被改写后与配置值失配。
 const TOKEN_UNSAFE_CHARS_RE = /[;,"\\&#+%]/
 const TOKEN_TRAILING_JUNK_RE = /[\n\r\u2028\u2029]$/
 function isValidToken (token) {
@@ -1260,24 +1261,21 @@ function shouldLogAccess (method, pathname, statusCode) {
   return true
 }
 
-function renderPage (state, query, sessionToken, theme, instanceId = '') {
+function renderPage (state, sessionToken, theme, instanceId = '') {
   // C2-016：旧签名的第二个参数 runsList 从未被使用（`/` 的 HTML 壳不含 run 列表，列表走
   // /api/runs），调用方却每次打开页面都对全部 runs 排一次序。参数已删，排序一并去掉。
   const statusText = formatStatus(state)
   const statusLines = statusText.split('\n').map(escapeHtml)
-  // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 经
-  // 查询参数进入页面后由 JSON 岛交给前端 fetch。仅在本请求本身通过鉴权后才回显
-  // （token 已验证合法，原样传递；不新增任何存储）。
+  // 浏览器流（Sourcery High）：fetch/ESM 也带不了页内凭证之外的上下文，token 由本函数
+  // 注入 JSON 岛交给前端 fetch。仅在本请求本身通过鉴权后才回显（token 已验证合法，原样
+  // 传递；不新增任何存储）。
   // 兼容语义：<noscript> 环境保留纯 HTML 降级（状态文本 + 提示），核心信息不丢。
   // Sourcery G_4Kk：资产 URL 不再拼 tokenSuffix——资产鉴权已由会话 Cookie 覆盖
   // （页面响应下发 xbk_session，同源请求自动携带），URL 里重复凭证只会多日志暴露面。
-  // Sourcery Authenticated-page-boots-bad-credentials：query.get('token') 是未验证输入
-  // （请求可能靠 Cookie/Bearer 通过鉴权、却带了垃圾 ?token=）——boot 必须用「本次请求实际
-  // 通过验证的凭证」（sessionToken，由调用方传入 authorize 的通过值），query token 仅在
-  // 没有 sessionToken 时作为兼容回退。
-  const bootToken = (typeof sessionToken === 'string' && sessionToken.length > 0)
-    ? sessionToken
-    : ((query instanceof URLSearchParams && query.get('token')) ? query.get('token') : '')
+  // A1：boot 凭证只认调用方传入的「本次请求实际通过验证的 token」。页面已不能靠
+  // `?token=` 打开（authorize 不读查询参数），因此这里**没有** query 回退分支——
+  // 未验证的查询串永远不会被写进 JSON 岛。
+  const bootToken = typeof sessionToken === 'string' ? sessionToken : ''
   // JSON 岛（<script type="application/json"> 的文本内容）：script 文本不做 HTML 实体解码，
   // escapeHtml 的 &quot; 会原样留在 JSON 里被前端 parse 成错误 token（Sourcery vwK）。
   // 只需防 </script> 逃逸与注释/CDATA 攻击：把 < 和控制字符转成 \uXXXX JSON 转义
@@ -1336,12 +1334,13 @@ function renderPage (state, query, sessionToken, theme, instanceId = '') {
 }
 
 // ── HTTP 服务 ──────────────────────────────────────────────────────────────
-// 鉴权：Authorization: Bearer *** 或 ?token=***（Sourcery High：浏览器导航、原生表单、
-// meta refresh 都带不了自定义请求头，只有查询参数能让浏览器直接打开看板）。
+// 鉴权（A1 收紧）：只认 `Authorization: Bearer <token>`（命令行/API/前端 fetch）与
+// `POST /login` 成功后下发的 HttpOnly 会话 Cookie（浏览器页面/读面）。
+// `?token=` 查询参数**不再是凭证**——它会进访问日志、浏览器历史与 Referer，旧书签
+// 一律落到登录页，由用户重新输入 token（有意的安全收紧，见 README）。
 // 单用户自用工具，恒定 token 已足够；timingSafeEqual 防时序侧信道。
 // 解析不用正则（CodeQL js/polynomial-redos：`Bearer ` + 大量空白会让 `\s+(.+)$` 回溯）：
 // 手写前缀匹配 + 切片，线性且语义等价（`Bearer ` 后取剩余全部，trim 一次容忍尾随空白）。
-// ⚠️ ?token= 会进访问日志/浏览器历史：README 明确建议只在受信网络或 TLS 代理后使用。
 const BEARER_PREFIX = 'Bearer '
 // RFC 9110：auth-scheme 大小写不敏感——`bearer <token>` 同样合法，客户端按规范
 // 发小写 scheme 不得被 401（v3.296 修正）。仍走手写前缀匹配 + 切片（不引入正则）。
@@ -1896,19 +1895,19 @@ function writeDeviceStore (stateDir, devices, { corruptText = null, readFailed =
   return writeAtomic(file, JSON.stringify({ version: DEVICE_SCHEMA, devices }), '控制台信任设备') === true
 }
 
-function authorize (req, token, urlQuery) {
+function authorize (req, token) {
   const header = req.headers.authorization || ''
   if (typeof header === 'string' && header.slice(0, BEARER_PREFIX.length).toLowerCase() === BEARER_PREFIX_LOWER) {
     const value = header.slice(BEARER_PREFIX.length)
     if (value.length > 0 && timingSafeEqualStr(value.trim(), token)) return true
   }
-  // 浏览器路径：?token=xxx（urlQuery 由调用方传 URLSearchParams；单独接收以便测试）
-  const supplied = urlQuery instanceof URLSearchParams ? urlQuery.get('token') : null
-  if (typeof supplied === 'string' && supplied.length > 0 && timingSafeEqualStr(supplied, token)) return true
+  // `?token=` 查询参数**不是**凭证（A1 安全收紧）：它会留在 Caddy/浏览器/Referer 日志里，
+  // 所以只保留两条正路——上面的 Bearer 头，与下面这条 HttpOnly 会话 Cookie。旧书签
+  // （`/?token=...`）一律按未登录处理，落到登录页由用户重新输入 token。
   // 会话 Cookie 路径（Sourcery G_oJ）：仅用于「读取面」——GET 页面与静态资产。
   // 写动作（POST /trigger）不接受 Cookie：SameSite=Strict 挡不住同站子域/同源注入页
   // 的表单伪造（Sourcery High G_4Kb Forged push actions），POST 保持显式凭证
-  // （Bearer 头或 ?token=，两者都要求请求方真实持有 token）。
+  // （只认 Bearer 头，要求请求方真实持有 token）。
   if (req.method !== 'POST') {
     const cookie = sessionCookieValue(req.headers && req.headers.cookie)
     if (cookie !== null && timingSafeEqualStr(cookie, token)) return true
@@ -1916,15 +1915,17 @@ function authorize (req, token, urlQuery) {
   return false
 }
 
-// 条件 tag 的变体因子：请求路径 + 查询串（去掉 ?token=，其余按字典序）。
+// 条件 tag 的变体因子：请求路径 + 查询串（去掉 token=，其余按字典序）。
 // 为什么必须进 tag：/api/run-history?limit=10 与 ?limit=200 在数据不足时 body 可能逐字相同，
-// 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——它是浏览器兼容路径的
-// 凭证，同一份内容按不同凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+// 共用 tag 会让「10 条的 304」冒充「200 条的响应」。token 不进哈希——同一份内容按不同
+// 凭证访问不该拿到不同 tag（否则条件缓存全失效）。
+// A1：`?token=` 已不是凭证（authorize 不读查询参数），这里仍继续剥离它，纯粹是缓存键
+// 兼容——旧书签/旧客户端带着同一串 token 重放请求时，变体形态与剥离前一致；剥离只影响
+// tag 计算，**不会**让旧链接通过鉴权（鉴权在 ETag 之前已经 401）。
 // 参数名的解码口径与 Utils._isTrackingQueryName 一致（`+` 还原成空格、decodeURIComponent、
-// 解码失败保留原串，且不做大小写折叠——authorize 的 URLSearchParams.get('token') 本身区分
-// 大小写）。authorize 认的 `?token=` 是 **URLSearchParams 解码后**的键，所以 `?%74oken=abc`
-// 同样是有效凭证，必须在这里一起剔掉——否则同一份内容会按 token 的编码写法算出两个 tag，
-// 条件缓存被凭空的变体打散（且 variant 里留着凭证片段）。
+// 解码失败保留原串，且不做大小写折叠）。旧实现认的是 **URLSearchParams 解码后**的键，
+// 所以 `?%74oken=abc` 也必须一起剔掉——否则同一份内容会按 token 的编码写法算出两个 tag，
+// 条件缓存被凭空的变体打散。
 function decodedQueryName (part) {
   const eq = part.indexOf('=')
   const rawName = eq < 0 ? part : part.slice(0, eq)
@@ -2003,7 +2004,7 @@ function applyPageHeaders (res) {
   res.setHeader('Referrer-Policy', 'no-referrer')
 }
 
-// 登录/挑战页统一响应头：禁止 Referer 把带 ?token= 的地址带进代理日志，也禁止缓存。
+// 登录/挑战页统一响应头：no-referrer 不让页面地址（可能含旧书签的查询串）进代理日志，也禁止缓存。
 function sendHtml (res, code, body) {
   applyPageHeaders(res)
   res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -2108,8 +2109,8 @@ function readBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
 // 固定路径端点：GET 读规则 / GET 读草稿 / POST 保存 / POST 预检 / POST 预览 /
 // POST 回滚 / POST 写草稿 / DELETE 删草稿。写端点在全局 authorize 之前分流，且
 // **只认 Authorization 头**（草稿 DELETE 同）：
-//   · 全局闸接受 ?token=，POST 又不收 Cookie——直接复用会让「URL 带 token」与
-//     「仅 Cookie」都落到同一条 401，无法给出规格要求的专属 code。
+//   · 全局闸对 POST 只认 Bearer、对「仅 Cookie」统一回 unauthorized——直接复用会让
+//     「URL 带 token」与「仅 Cookie」都落到同一条 401，无法给出规格要求的专属 code。
 // 规则正文绝不进访问日志/审计：审计只记 action/revision/changedFields 与 prevHash 链。
 // v3.394：与 xbk_filter_store 的 FILTER_RULES_MAX_BYTES 同步 64 KiB → 256 KiB（单字段上限 4000 → 16000）
 const FILTER_BODY_MAX_BYTES = 256 * 1024
@@ -2146,8 +2147,10 @@ const FILTER_WRITE_PATHS = new Set([
   '/api/config/filter/draft'
 ])
 // 改状态端点（C2-002）：这些请求会落盘或起子进程，鉴权必须与过滤写端点同口径（Bearer-only）。
-// 全局 authorize() 对**任意方法**都放行 `?token=`（浏览器开页兼容路径），拿它当写端点的唯一闸
-// 会让「URL 查询串里的凭证」直接可用于写——token 进访问日志/历史/Referer 后就不再是只读暴露。
+// 全局 authorize() 的读面口径（Bearer / 会话 Cookie）对写端点还不够严——写端点必须显式复判，
+// 这样「仅 Cookie」才拿得到具体的 cookie_not_allowed、URL 里的 token 才拿得到
+// query_token_not_allowed（A1 起查询串 token 已彻底不是凭证，保留这个专属 400 是给旧客户端
+// 一条明确的重试指引，而不是含糊的 401）。
 const STATE_CHANGING_PATHS = new Set([
   '/api/backup/import',
   '/trigger',
@@ -2218,8 +2221,9 @@ function filterEngineUnavailable (errors) {
 }
 
 // 写端点鉴权顺序（规格 §4.2）：
-// ① URL 带 token → 400（即使同时带合法 Bearer 也拒绝，避免凭证进日志/历史）；
-// ② Authorization: <scheme> <token> 合法 → 放行；
+// ① URL 带 token → 400（A1：查询串 token 已不是凭证；保留专属错误码，旧客户端能明确知道
+//    该改用 Bearer，且凭证一律不许进 URL——即使同时带合法 Bearer 也拒）；
+// ② Authorization: Bearer <token> 合法 → 放行；
 // ③ 仅会话 Cookie → 401 cookie_not_allowed（Cookie 不能用于写，CSRF 面）；
 // ④ 其余 → 401 unauthorized。
 function writeAuthVerdict (req, urlQuery, token) {
@@ -5031,7 +5035,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }).catch((e) => { logCaught('backup/import', e); sendJson(res, 500, { error: '导入失败' }) })
   }
 
-  // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer / ?token= 均可）。
+  // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer 均可；查询串 token 已不接受）。
   // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
   const handleFilterGet = (req, res) => {
     const loaded = loadCurrentFilter()
@@ -6080,7 +6084,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     // 白名单精确匹配（STATIC_ASSETS）保留：无路径穿越面。
     const asset = req.method === 'GET' ? resolveAssetRoute(url.pathname) : null
     if (asset !== null) {
-      if (!authorize(req, token, url.searchParams)) {
+      if (!authorize(req, token)) {
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
@@ -6089,7 +6093,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     }
     // 登录表单只收 POST body（审查 #224 / Sourcery High）：GET 表单会把 token 带进
     // 地址栏与浏览器历史、Referer 与中间代理日志；POST 校验成功后 303 到干净 `/`，
-    // 只下发 HttpOnly Cookie。直接打开 `?token=` 的分享链接仍兼容（见下方 authorize）。
+    // 只下发 HttpOnly Cookie。A1 起 `?token=` 不再是凭证，旧书签落到登录页重新登录。
     if (req.method === 'POST' && url.pathname === '/login') {
       readBody(req, BODY_LOGIN_FORM_MAX_BYTES).then(({ body, aborted, over }) => {
         if (aborted || over) {
@@ -6155,7 +6159,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       return
     }
     // 两步验证闸（v3.357）：只拦浏览器页面，不拦 API/静态资产。访问令牌正确但还没过
-    // 6 位码时，给登录页的第二步；令牌本身仍留在 hidden 字段随 POST 回传，不新增 URL 暴露。
+    // 6 位码时，给登录页的第二步；令牌本身仍只放在 hidden 字段随 POST 回传（A1：不得
+    // 放进 URL/Referer/可落日志的 query——这里取的是服务端已配置的 token，与本请求
+    // 通过鉴权的凭证同值，不经查询串传入）。
     // v3.374：先看「信任设备」——命中即视为第二因子已过，并补发 2FA 会话 Cookie；
     // 会话 Cookie 过期时也一并续期（设备信任本身就是这台浏览器 90 天的登录凭证）。
     let deviceTrusted = false
@@ -6166,40 +6172,40 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         deviceTrusted = true
         pageCookies.push(twoFactorCookieHeader(req, twoFactor.secret), sessionCookieHeaderFor(req, token))
       } else {
-        if (!authorize(req, token, url.searchParams)) {
+        if (!authorize(req, token)) {
           sendHtml(res, 401, renderUnauthorizedPage())
           return
         }
-        const queryToken = url.searchParams.get('token')
-        const formToken = typeof queryToken === 'string' && timingSafeEqualStr(queryToken, token) ? queryToken : token
-        sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token: formToken }))
+        sendHtml(res, 401, renderUnauthorizedPage({ requireCode: true, token }))
         return
       }
     }
-    // 过滤规则写端点：必须在全局 authorize 之前分流。全局闸对 POST 接受 ?token= 且
-    // 对 Cookie 统一回 unauthorized——只有专属入口才能给出 query_token_not_allowed /
+    // 过滤规则写端点：必须在全局 authorize 之前分流。全局闸对 POST 只认 Bearer、且对
+    // Cookie 统一回 unauthorized——只有专属入口才能给出 query_token_not_allowed /
     // cookie_not_allowed 两个规格要求的 code（写面仅 Bearer）。
     if (req.method === 'POST' && FILTER_WRITE_PATHS.has(url.pathname)) {
       handleFilterWrite(req, res, url)
       return
     }
-    // 删除草稿也走写面鉴权（Bearer-only）：GET 读面仍可 Cookie/?token=。
+    // 删除草稿也走写面鉴权（Bearer-only）：GET 读面仍可 Cookie/Bearer。
     if (req.method === 'DELETE' && url.pathname === '/api/config/filter/draft') {
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
       handleFilterDraftDelete(req, res)
       return
     }
-    // 改状态端点（C2-002）：不再只靠下面的全局 authorize()——它对任意方法都放行 `?token=`。
-    // 这里按写面口径（Bearer-only）复判一次：URL 带 token ⇒ 400 query_token_not_allowed（即使
-    // 同时带合法 Bearer），仅 Cookie ⇒ 401 cookie_not_allowed。复判在任何 readBody / 取锁 /
-    // spawn 之前，所以「被拒 = 零副作用」；只读端点不受影响（仍走全局 authorize 的 GET 口径）。
+    // 改状态端点（C2-002）：不靠下面的全局 authorize()——读面口径（Bearer/Cookie）对写端点
+    // 还不够严，这里按写面口径（Bearer-only）复判一次：URL 带 token ⇒ 400
+    // query_token_not_allowed（即使同时带合法 Bearer；A1 起查询串 token 本就不是凭证，
+    // 这个专属错误码是给旧客户端的明确指引），仅 Cookie ⇒ 401 cookie_not_allowed。复判在任何
+    // readBody / 取锁 / spawn 之前，所以「被拒 = 零副作用」；只读端点不受影响（走全局 authorize）。
     if (req.method === 'POST' && STATE_CHANGING_PATHS.has(url.pathname)) {
       const verdict = writeAuthVerdict(req, url.searchParams, token)
       if (!verdict.ok) { sendJson(res, verdict.status, verdict.body); return }
     }
-    if (!deviceTrusted && !authorize(req, token, url.searchParams)) {
+    if (!deviceTrusted && !authorize(req, token)) {
       // 审查 #224：GET / 未授权时给可自助恢复的登录页，而不是裸 JSON；API/静态资源仍回 JSON。
+      // A1：`?token=` 不再被接受——旧书签同样落到这个登录页。
       if (req.method === 'GET' && url.pathname === '/') {
         sendHtml(res, 401, renderUnauthorizedPage())
         return
@@ -6210,10 +6216,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     if (req.method === 'GET' && url.pathname === '/') {
       // SPA 壳与登录页共用一套页面响应头（applyPageHeaders 单点写入，避免 Referrer-Policy
       // 被两处各写一遍形成重复头）：
-      // · ?token= 打开的页面在发起同源子请求时默认把完整 URL（含 query 里的 token）作为
-      //   Referer 发出，反向代理/访问日志可能落盘；no-referrer 从根上掐断（该页所有子请求
-      //   一律不带 Referer）。启动页本身在浏览器地址栏的历史记录仍含 token，这是 raw-URL
-      //   方案的已知暴露面（README 已提醒可重置）。
+      // · no-referrer 兜底：页面里已无 URL 凭证（A1），但任何同源子请求都不该带 Referer
+      //   出去，代理/第三方日志少一条可关联信息。
       // · HTML 里含本次会话凭证（boot JSON 的 token），绝不能被浏览器缓存：无 Cache-Control
       //   时浏览器启发式缓存会留下旧页面（旧 boot token 为空/过期）——页面照常渲染、GET 靠
       //   Cookie 正常，但点按钮 POST 报 unauthorized（真实故障：2026-10-17 通知自检 401）。
@@ -6224,8 +6228,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // SameSite=Lax（审查 #224：Strict 会让「从聊天点链接」的跨站顶层导航不带 Cookie，
       // 首屏必 401；Lax 对同源子请求照常携带，而写动作 POST /trigger 本就不收 Cookie，
       // 因此不扩大 CSRF 面）、Path=/；token 本身就是会话凭证，无需另发随机值。
-      // Max-Age 1 天（86400 秒，真源是 sessionCookieHeaderFor 的默认值）：自用工具，过期后重新打开
-      // ?token= 链接即续期。
+      // Max-Age 1 天（86400 秒，真源是 sessionCookieHeaderFor 的默认值）：自用工具，过期后
+      // 重新通过登录页输入 token 即续期（A1 起不再有 `?token=` 续期路径）。
       // Sourcery 3x High（Cookie 无 Secure）：本服务部署在明文 HTTP 上（无 TLS 终结点），
       // Secure 属性会让浏览器拒绝在 http:// 上发送/存储 Cookie，控制台直接不可用——
       // 这是部署形态的固有权衡，不是代码缺陷可修；上 HTTPS（反代/自签）后应第一时间
@@ -6234,12 +6238,11 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       res.setHeader('Set-Cookie', pageCookies.length > 0 ? pageCookies : sessionCookieHeaderFor(req, token))
       // HTML 只发 identity：压缩统一由边缘 Caddy 完成（见 sendJson 注释）。
       // no-store / CSP / Referrer-Policy 由 applyPageHeaders 单点写入。
-      const html = renderPage(state, url.searchParams, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
+      const html = renderPage(state, token, themeCookieValue(req.headers && req.headers.cookie), instanceId)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 ?token=）打开页面时，
+      // Sourcery Session-users-cannot-trigger x2：用户经 Cookie 会话（无 Bearer）打开页面时，
       // boot JSON 的 token 为空 → 前端发空 Bearer → POST /trigger 401。把本次请求实际
-      // 使用的凭证（authorize 已通过的 token 值）交给 renderPage 注入 boot，会话用户
-      // 无需再拼 ?token= 即可触发。
+      // 通过鉴权的 token 交给 renderPage 注入 boot，会话用户无需再带任何 URL 凭证即可触发。
       res.end(html)
       return
     }
@@ -6479,7 +6482,7 @@ function main () {
   })
   server.listen(port, host, () => {
     console.log(`xbk-push 控制台已启动：http://${host}:${server.address().port}（缓存目录：${stateDir}）`)
-    console.log(`鉴权：请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>，或浏览器打开 http://${host}:${server.address().port}/?token=<XBK_CONSOLE_TOKEN>；token 未设置或过短则拒绝启动`)
+    console.log(`鉴权：API 用请求头 Authorization: Bearer <XBK_CONSOLE_TOKEN>；浏览器打开 http://${host}:${server.address().port}/ ，在登录框输入同一 token（?token= 查询参数已不再接受）；token 未设置或过短则拒绝启动`)
     if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
       // Sourcery High：非回环绑定 = token 明文过网（HTTP 无 TLS）。此处只告警不强拒——
       // 内网受信环境是 README 认可的用法，但必须让操作者知道风险与缓解手段。

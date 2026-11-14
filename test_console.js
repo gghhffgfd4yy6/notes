@@ -704,7 +704,8 @@ ok('isValidToken: 浏览器不可传输字符拒绝（Sourcery G_ot）', () => {
   assert.strictEqual(isValidToken('a'.repeat(16) + '\n'), false, '尾随 LF 拒绝')
   assert.strictEqual(isValidToken('a'.repeat(16) + '\r'), false, '尾随 CR 拒绝')
   assert.strictEqual(isValidToken('a'.repeat(16) + '\u2028'), false, '尾随 U+2028 拒绝')
-  // Sourcery Raw-token-URLs：& # + 让 raw ?token= 链接失效，启动闸禁掉
+  // Sourcery Raw-token-URLs：& # + 让 raw ?token= 链接失效，启动闸禁掉（A1 起 raw 链接已
+  // 不再是登录路径，但校验有意保留——收窄字符集会改变已部署 token 的合法性）
   assert.strictEqual(isValidToken('a'.repeat(8) + '&'.repeat(8)), false, '& 拒绝（URL 分隔符）')
   assert.strictEqual(isValidToken('a'.repeat(8) + '#'.repeat(8)), false, '# 拒绝（锚点）')
   assert.strictEqual(isValidToken('a'.repeat(8) + '+'.repeat(8)), false, '+ 拒绝（空格解码）')
@@ -989,24 +990,28 @@ ok('escapeHtml: null/undefined → 空串', () => {
   assert.strictEqual(escapeHtml(undefined), '')
 })
 
-ok('authorize: Bearer 前缀匹配 + ?token= 查询参数（浏览器路径）', () => {
+ok('authorize: 只认 Bearer 头与会话 Cookie（?token= 查询参数不再是凭证）', () => {
   const TOKEN2 = 'z'.repeat(32)
-  const mkReq = (headers) => ({ headers: headers || {} })
+  const mkReq = (headers, method) => ({ headers: headers || {}, method: method || 'GET' })
   // Bearer 路径
-  assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2}` }), TOKEN2, null), true)
-  assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2} ` }), TOKEN2, null), true, '尾随空白容忍')
-  assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2, null), false)
+  assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2}` }), TOKEN2), true)
+  assert.strictEqual(authorize(mkReq({ authorization: `Bearer ${TOKEN2} ` }), TOKEN2), true, '尾随空白容忍')
+  assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2), false)
   // RFC 9110：auth-scheme 大小写不敏感（v3.296 修复：小写 scheme 不得 401）
-  assert.strictEqual(authorize(mkReq({ authorization: `bearer ${TOKEN2}` }), TOKEN2, null), true, 'scheme 小写同样放行')
-  assert.strictEqual(authorize(mkReq({ authorization: `BEARER ${TOKEN2}` }), TOKEN2, null), true, 'scheme 大写变体同样放行')
-  assert.strictEqual(authorize(mkReq({ authorization: `bearerx ${TOKEN2}` }), TOKEN2, null), false, '前缀必须带空格边界')
-  assert.strictEqual(authorize(mkReq({}), TOKEN2, null), false)
-  // 查询参数路径（浏览器导航/表单/meta refresh 用）
-  assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), true)
-  assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams('token=wrong')), false)
-  assert.strictEqual(authorize(mkReq({}), TOKEN2, new URLSearchParams('other=1')), false)
-  // 错误 token + 正确查询参数：查询参数可独立放行（浏览器不带请求头）
-  assert.strictEqual(authorize(mkReq({ authorization: 'Bearer wrong' }), TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), true)
+  assert.strictEqual(authorize(mkReq({ authorization: `bearer ${TOKEN2}` }), TOKEN2), true, 'scheme 小写同样放行')
+  assert.strictEqual(authorize(mkReq({ authorization: `BEARER ${TOKEN2}` }), TOKEN2), true, 'scheme 大写变体同样放行')
+  assert.strictEqual(authorize(mkReq({ authorization: `bearerx ${TOKEN2}` }), TOKEN2), false, '前缀必须带空格边界')
+  assert.strictEqual(authorize(mkReq({}), TOKEN2), false)
+  // A1：查询参数**不再是凭证**——签名里已经没有 URLSearchParams 这一路，哪怕调用方多传一个
+  // 带正确 token 的 URLSearchParams（旧调用形态）也不得放行。
+  assert.strictEqual(authorize({ headers: {}, method: 'GET', url: `/?token=${TOKEN2}` }, TOKEN2), false,
+    'URL 里的 token 已不是凭证（旧书签必须落到登录页）')
+  assert.strictEqual(authorize({ headers: {}, method: 'GET' }, TOKEN2, new URLSearchParams(`token=${TOKEN2}`)), false,
+    '多传的 URLSearchParams 参数必须被忽略（不得保留隐式 query 后门）')
+  // 会话 Cookie（只读面）——页面鉴权的唯一非 Bearer 通道
+  assert.strictEqual(authorize(mkReq({ cookie: `xbk_session=${TOKEN2}` }), TOKEN2), true, 'Cookie 会话放行 GET')
+  assert.strictEqual(authorize(mkReq({ cookie: 'xbk_session=wrong' }), TOKEN2), false, '错 Cookie 不放行')
+  assert.strictEqual(authorize(mkReq({ cookie: `xbk_session=${TOKEN2}` }, 'POST'), TOKEN2), false, 'POST 不收 Cookie')
 })
 
 ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与 CSP 引用', () => {
@@ -1014,7 +1019,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   const TOKEN2 = 'q'.repeat(32)
   const dir = tmpDir()
   const state = readStatus(dir) // 空目录 → 全部件「缺失」，formatStatus 合法渲染
-  const withToken = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
+  const withToken = renderPage(state, TOKEN2)
   // JSON 岛注入（v3.285：SPA 壳；fetch 由前端发起，不再有原生表单/meta refresh）
   assert.ok(withToken.includes(`"token":"${TOKEN2}"`), 'JSON 岛带 token')
   assert.ok(withToken.includes('id="xbk-boot"'), 'JSON 岛节点存在')
@@ -1022,7 +1027,7 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.match(withToken, /\/assets\/[0-9a-f]{16}\/app\.css/, '引用样式（带内容版本路径）')
   // v3.376：theme-color 跟主题底色一致，Android 系统栏/地址栏才不会在切页时漏白。
   assert.ok(withToken.includes('<meta name="theme-color" content="#0b0f17">'), 'theme-color 必须是默认主题底色')
-  const lightPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), undefined, 'light')
+  const lightPage = renderPage(state, TOKEN2, 'light')
   assert.ok(lightPage.includes('<meta name="theme-color" content="#f3f5f9">'), 'theme-color 必须跟随主题')
   assert.ok(withToken.includes('Content-Security-Policy'), '带 CSP')
   // Sourcery vww：CSP 不能只断言 meta 名——被削弱的策略（如 default-src *）也含这个字符串。
@@ -1034,9 +1039,9 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   assert.ok(!withToken.includes('http-equiv="refresh"'), '不再 meta refresh 整页刷新')
   // v3.323 主题：首帧必须由服务端把 <html data-theme> 渲染出来（放 body 或只在 JS 里设都不算）。
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(withToken), '默认首帧 data-theme 必须是 deep')
-  const nordPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'nord')
+  const nordPage = renderPage(state, '', 'nord')
   assert.ok(/<html lang="zh-CN" data-theme="nord">/.test(nordPage), '首帧必须跟随传入的主题')
-  const badPage = renderPage(state, new URLSearchParams(`token=${TOKEN2}`), '', 'evil')
+  const badPage = renderPage(state, '', 'evil')
   assert.ok(/<html lang="zh-CN" data-theme="deep">/.test(badPage), '白名单外主题必须回落 deep')
   assert.ok(!/<body[^>]*data-theme/.test(nordPage), 'data-theme 必须在 <html> 上（放到 body 不生效）')
   const noToken = renderPage(state, null)
@@ -1046,14 +1051,14 @@ ok('renderPage: token 经 JSON 岛注入；无 token 时空 token；含资产与
   // Sourcery vwK：特殊字符 token 必须以 \uXXXX JSON 转义进岛（script 文本不做实体解码，
   // HTML 实体会让前端 parse 出错误 token）；JSON.parse 后必须还原为原值。
   const WEIRD = 'a<b>&"\\u2028' + 'z'.repeat(20)
-  const weirdPage = renderPage(state, new URLSearchParams(`token=${encodeURIComponent(WEIRD)}`))
+  const weirdPage = renderPage(state, WEIRD)
   assert.ok(!weirdPage.includes('<b>'), '岛内不得出现裸 <script 片段')
   const m = /<script type="application\/json" id="xbk-boot">([\s\S]*?)<\/script>/.exec(weirdPage)
   assert.ok(m, 'JSON 岛可提取')
   const parsed = JSON.parse(m[1].replace(/\\u003c/g, '<').replace(/\\u003e/g, '>'))
   assert.strictEqual(parsed.token, WEIRD, '岛内 token 经 JSON 解析还原为原值')
   // 常规 token 原样进岛（不引入任何实体）
-  const plain = renderPage(state, new URLSearchParams(`token=${TOKEN2}`))
+  const plain = renderPage(state, TOKEN2)
   assert.ok(plain.includes(`"token":"${TOKEN2}"`), '常规 token 原样回显')
 })
 
@@ -1063,16 +1068,16 @@ ok('authorize 语义由 HTTP 端到端覆盖（前缀匹配，无正则回溯）
 })
 
 // C2-022 回归：条件 tag 的变体因子必须按**解码后**的参数名剔除 token。
-// authorize 的 `?token=` 走 URLSearchParams.get('token')，也就是解码后的键 ⇒ `?%74oken=abc`
-// 同样是有效凭证；conditionalVariant 若按字面量比键名，同一份内容就会按 token 的编码写法
-// 算出两个 ETag，条件缓存被凭空的变体打散（variant 里还留着凭证片段）。这条用例直接对
-// 导出的纯函数断言（不经过 HTTP），回退成字面量比较即红。
+// 旧实现在这里对齐的是「authorize 用 URLSearchParams 解码后的键认凭证」；A1 起 `?token=`
+// 已不再是凭证，剥离只保留给缓存键兼容（旧链接/旧客户端重放时变体形态不变），但**解码后
+// 的键名口径仍必须一致**：`?%74oken=abc` 与 `?token=abc` 要算同一个 tag，否则同一份内容
+// 会按编码写法分裂成两个 ETag。这条用例直接对导出的纯函数断言，回退成字面量比较即红。
 ok('conditionalVariant: 按解码后的参数名剔除 token（%74oken 与裸 URL 同变体；非 token 参数仍区分）', () => {
   const v = (url) => conditionalVariant({ url })
   // ① 修复点：编码写法的 token 与「查询串其余参数」算同一变体。
   assert.strictEqual(v('/api/runs?%74oken=abc&limit=10'), v('/api/runs?limit=10'),
-    '?%74oken= 是有效凭证，必须按 token 剔除，不得让同一内容分裂成两个 tag')
-  assert.strictEqual(v('/api/runs?token=abc&limit=10'), v('/api/runs?limit=10'), '裸 ?token= 口径不变')
+    '?%74oken= 必须按 token 剔除（缓存键兼容），不得让同一内容分裂成两个 tag')
+  assert.strictEqual(v('/api/runs?token=abc&limit=10'), v('/api/runs?limit=10'), '裸 ?token= 同样剥离（缓存键兼容）')
   assert.strictEqual(v('/api/config?%74oken=abc'), '/api/config', '参数全被剔掉时回落无查询串形态')
   // ② 反例：只剔 token 这一个键名——其余参数照旧参与变体（防把过滤写宽成「吞掉整段查询串」）。
   assert.notStrictEqual(v('/api/runs?limit=10'), v('/api/runs?limit=200'), '其余参数不同必须换变体')
@@ -1512,7 +1517,7 @@ async function filterRuleApiTests () {
       const paths = filterPaths(dir)
       fs.writeFileSync(paths.file, JSON.stringify({ schema: 1, revision: 4, filter: { pingbibiaoti: '覆盖词' } }))
       fs.writeFileSync(paths.applied, JSON.stringify({ schema: 1, revision: 3, source: 'override', hash: 'h', appliedAt: '2026-10-18T00:00:00.000Z', filter: {}, keyword: {} }))
-      const over = JSON.parse((await request(port, 'GET', '/api/config/filter?token=' + TOKEN)).text)
+      const over = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
       assert.strictEqual(over.source, 'override')
       assert.strictEqual(over.revision, 4)
       assert.strictEqual(over.filter.pingbibiaoti, '覆盖词')
@@ -3903,9 +3908,12 @@ async function main () {
     const css = await request(port, 'GET', '/assets/app.css')
     assert.strictEqual(css.status, 401, '资产无凭证必须 401')
     const cssTok = await request(port, 'GET', '/assets/app.css', { token: TOKEN })
-    assert.strictEqual(cssTok.status, 200, '?token= 可取资产')
+    assert.strictEqual(cssTok.status, 200, 'Bearer 可取资产')
     assert.match(cssTok.headers['content-type'], /text\/css/)
     assert.ok(cssTok.text.includes('--bg'), 'CSS 内容真实（自定义属性存在）')
+    // A1：查询串里的 token 不再是凭证——资产同样 401（旧链接不能靠 ?token= 拿到静态资产）。
+    const cssQuery = await request(port, 'GET', `/assets/app.css?token=${TOKEN}`)
+    assert.strictEqual(cssQuery.status, 401, '?token= 不再可取资产')
     const cssCookie = await request(port, 'GET', '/assets/app.css', { headers: { cookie: `xbk_session=${TOKEN}` } })
     assert.strictEqual(cssCookie.status, 200, '会话 Cookie 可取资产（ESM 链路径）')
     // v3.302 静态层：gzip 协商 / 304 条件请求 / 版本化长缓存
@@ -4167,7 +4175,7 @@ async function main () {
     }
     assert.ok(closure.length > 0, '闭包不得为空（否则下面的对账恒真）')
     const { readStatus } = require('./scripts/status')
-    const html = renderPage(readStatus(tmpDir()), new URLSearchParams(`token=${TOKEN}`))
+    const html = renderPage(readStatus(tmpDir()), TOKEN)
     // 逐字锁形态：rel/href 之外不得有第二个属性（crossorigin 会换缓存键，预加载就白做了）。
     const hrefsRaw = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map((m) => m[1])
     // v3.375：版本号在路径里（/assets/<16hex>/x.js），模块间的相对 import 才会共享同一前缀。
@@ -4239,18 +4247,57 @@ async function main () {
     assert.deepStrictEqual(missing, [], `这些拆出的函数/常量在 app.js 正文里被用了却没 import：${missing.join(', ')}`)
     assert.ok(imported.has('fmtTime') && imported.has('POLL_MS'), '基础导入必须存在（防止整条 import 被删）')
   })
-  await aok('HTTP: ?token= 查询参数放行（浏览器流：看板、API、表单触发）', async () => {
+  // A1（安全收紧）：`?token=` 不再是登录凭证。旧书签/旧脚本一律按未登录处理，只保留
+  // `Authorization: Bearer` 与 `POST /login` 下发的 HttpOnly 会话 Cookie 两条正路。
+  await aok('HTTP A1: ?token= 不再是凭证（页面/API/编码键均 401）；Bearer 与 Cookie 各自 200；POST /login 后 Cookie 可开页面', async () => {
     const dir = tmpDir()
     const { server } = createConsole({ token: TOKEN, stateDir: dir })
     const port = await listen(server)
-    // 无请求头、仅查询参数 → 200（普通浏览器打开 URL 的形态）
-    const page = await request(port, 'GET', `/?token=${TOKEN}`)
-    assert.strictEqual(page.status, 200, '浏览器打开带 token URL 必须放行')
-    assert.ok(page.text.includes(`"token":"${TOKEN}"`), '返回页 JSON 岛要继续携带 token')
-    const api = await request(port, 'GET', `/api/status?token=${TOKEN}`)
-    assert.strictEqual(api.status, 200, '查询参数对 JSON API 同样放行')
-    const noTok = await request(port, 'GET', '/')
-    assert.strictEqual(noTok.status, 401)
+    try {
+      // ① GET /?token=<正确> → 401 登录页（不是 200 控制台，也不回裸 JSON）
+      const page = await request(port, 'GET', `/?token=${TOKEN}`)
+      assert.strictEqual(page.status, 401, '旧 ?token= 书签必须落到登录页')
+      assert.match(page.headers['content-type'], /text\/html/, '页面出口仍是 HTML 登录页')
+      assert.ok(page.text.includes('需要访问令牌'), '必须渲染登录页（可自助恢复）')
+      assert.ok(!page.text.includes('id="xbk-boot"'), '未登录不得渲染控制台壳（更不得注入 boot token）')
+      assert.ok(!page.text.includes(`"token":"${TOKEN}"`), 'URL 里的 token 不得被回显进页面')
+      // ② GET /api/status?token=<正确> → 401
+      const api = await request(port, 'GET', `/api/status?token=${TOKEN}`)
+      assert.strictEqual(api.status, 401, '查询参数对 JSON API 不再放行')
+      assert.strictEqual(JSON.parse(api.text).error, 'unauthorized')
+      // ③ 编码键名（%74oken）解码后同样不认
+      const encoded = await request(port, 'GET', `/?%74oken=${TOKEN}`)
+      assert.strictEqual(encoded.status, 401, 'URLSearchParams 解码后的 token 键同样不是凭证')
+      // ④ Bearer 正确 → 200（API 与页面）
+      const bearerApi = await request(port, 'GET', '/api/status', { token: TOKEN })
+      assert.strictEqual(bearerApi.status, 200, 'Bearer 仍是 API 正路')
+      const bearerPage = await request(port, 'GET', '/', { token: TOKEN })
+      assert.strictEqual(bearerPage.status, 200, 'Bearer 仍可开页面')
+      // ⑤ Cookie 正确 → 200
+      const cookieApi = await request(port, 'GET', '/api/status', { headers: { cookie: `xbk_session=${TOKEN}` } })
+      assert.strictEqual(cookieApi.status, 200, '会话 Cookie 仍可读 API')
+      const cookiePage = await request(port, 'GET', '/', { headers: { cookie: `xbk_session=${TOKEN}` } })
+      assert.strictEqual(cookiePage.status, 200, '会话 Cookie 仍可开页面')
+      // ⑥ POST /login（表单 body）正确 token → 303 回干净 `/` + Set-Cookie；随后带 Cookie GET / 200
+      const login = await request(port, 'POST', '/login', {
+        body: `token=${encodeURIComponent(TOKEN)}`,
+        headers: { 'content-type': 'application/x-www-form-urlencoded' }
+      })
+      assert.strictEqual(login.status, 303, '登录成功必须 303')
+      assert.strictEqual(login.headers.location, '/', 'Location 必须是干净的 /（不得带 token）')
+      const setCookie = String(login.headers['set-cookie'])
+      assert.ok(setCookie.includes('xbk_session=') && setCookie.includes('HttpOnly'), '登录必须下发 HttpOnly 会话 Cookie')
+      const cookieValue = setCookie.split(';')[0]
+      const afterLogin = await request(port, 'GET', '/', { headers: { cookie: cookieValue } })
+      assert.strictEqual(afterLogin.status, 200, '带登录 Cookie 的 GET / 必须 200')
+      assert.ok(afterLogin.text.includes('id="xbk-boot"'), '登录后的页面是控制台壳')
+      // ⑦ 无凭证仍 401（对照组，防「全放行」式假绿）
+      const anon = await request(port, 'GET', '/')
+      assert.strictEqual(anon.status, 401, '无凭证仍必须 401')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
   await aok('HTTP: /api/status 返回 JSON（status 字段齐全）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
@@ -4363,10 +4410,11 @@ async function main () {
         const cross = await request(port, 'GET', b, { token: TOKEN, headers: { 'if-none-match': ra.headers.etag } })
         assert.strictEqual(cross.status, 200, `${a} 的 tag 不得让 ${b} 回 304`)
       }
-      // ?token= 是浏览器兼容路径的凭证，不得参与 ETag（同一内容按不同凭证访问必须同一 tag）。
+      // A1：`?token=` 已不是凭证，但 conditionalVariant 仍把它从变体里剥离（缓存键兼容）——
+      // 同一内容带/不带旧 token 参数必须算出同一 tag；这里两者都带 Bearer 才鉴权通过。
       const withTok = await request(port, 'GET', `/api/config?token=${TOKEN}`, { token: TOKEN })
       const noTok = await request(port, 'GET', '/api/config', { token: TOKEN })
-      assert.strictEqual(withTok.headers.etag, noTok.headers.etag, '?token= 不得进 ETag（否则条件缓存按凭证分裂）')
+      assert.strictEqual(withTok.headers.etag, noTok.headers.etag, '?token= 不得进 ETag（缓存键兼容：剥离后同一 tag）')
     } finally {
       if (envBackup === undefined) delete process.env.XBK_INTERVAL_MS
       else process.env.XBK_INTERVAL_MS = envBackup
@@ -4723,7 +4771,7 @@ async function main () {
     // Sourcery G_4Ki：畸形 Cookie（非法 % 序列）不得炸请求处理器——按无 Cookie 处理。
     const badCookie = await request(port, 'GET', '/', { headers: { cookie: 'xbk_session=%zz' } })
     assert.strictEqual(badCookie.status, 401, '畸形 Cookie → 401（不抛 URIError）')
-    // Sourcery Session-users-cannot-trigger：Cookie 会话打开 / 且无 ?token= 时 boot JSON
+    // Sourcery Session-users-cannot-trigger：Cookie 会话打开 / 且不带任何 URL 凭证时 boot JSON
     // 必须注入服务端已验证的凭证（否则前端发空 Bearer，触发 401）。
     const sessPage = await request(port, 'GET', '/', { headers: { cookie: `xbk_session=${TOKEN}` } })
     assert.strictEqual(sessPage.status, 200, 'Cookie 会话可开页面')
@@ -4733,7 +4781,7 @@ async function main () {
     const bootData = bootMatch ? JSON.parse(bootMatch[1]) : {}
     assert.strictEqual(bootData.version, require('./package.json').version,
       'boot JSON 必须带当前 package 版本（前端据此判断是否需要提示刷新）')
-    // Sourcery G_4Kb：POST 不接受 Cookie 凭证（写动作须显式 Bearer/?token=）。
+    // Sourcery G_4Kb：POST 不接受 Cookie 凭证（写动作须显式 Bearer）。
     const csrf = await request(port, 'POST', '/trigger', { headers: { cookie: `xbk_session=${TOKEN}` }, body: 'action=check' })
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 必须 401（CSRF 面）')
     // Sourcery Retries-duplicate：重放窗落盘——重启（新 createConsole 实例、同 stateDir）
@@ -4966,9 +5014,10 @@ async function main () {
     assert.strictEqual(csrf.status, 401, 'POST 仅凭 Cookie 401（CSRF 面）')
   })
   // backlog b3 / C2-002：四个改状态端点（备份导入 / 手动触发 / 通知自检 / 停止任务）此前只靠全局
-  // authorize()，而它对任意方法都放行 `?token=`（URL 查询串凭证），与过滤写端点的「写面仅 Bearer」
-  // 不一致。这里把「URL 凭证不得用于写」钉在行为上：400 query_token_not_allowed，且拒绝必须发生在
-  // readBody / 取锁 / spawn 之前（无任何副作用）；同一端点用 Bearer 仍照常进业务层。
+  // authorize()，与过滤写端点的「写面仅 Bearer」不一致。这里把「URL 凭证不得用于写」钉在行为上：
+  // 400 query_token_not_allowed，且拒绝必须发生在 readBody / 取锁 / spawn 之前（无任何副作用）；
+  // 同一端点用 Bearer 仍照常进业务层。A1 起查询串 token 已不是任何端点的凭证，这个专属 400
+  // 是留给旧客户端的明确指引（而不是含糊 401），行为本身不放宽。
   await aok('HTTP: 改状态端点拒绝 URL query token（C2-002）', async () => {
     const dir = tmpDir()
     const { server, runs } = createConsole({ token: TOKEN, stateDir: dir })
@@ -5027,9 +5076,12 @@ async function main () {
       const notifyReplay = await request(port, 'POST', '/api/notify-test', { token: TOKEN, body: '' })
       assert.strictEqual(notifyReplay.status, 409, 'Bearer 应已过鉴权（60s 窗内重放 409）')
       assert.strictEqual(JSON.parse(notifyReplay.text).replayBlocked, true)
-      // 只读端点不能跟着被砍：GET 仍接受 ?token=（浏览器开页/EventSource 用法）。
+      // 只读端点不能跟着被砍成「无凭证」：GET 仍接受 Bearer / 会话 Cookie。
+      const readViaBearer = await request(port, 'GET', '/api/runs', { token: TOKEN })
+      assert.strictEqual(readViaBearer.status, 200, '只读端点仍接受 Bearer')
+      // A1：查询串 token 不再是凭证——读端点带它一律 401（旧链接不能读数据）。
       const readViaQuery = await request(port, 'GET', '/api/runs' + viaQueryUrl)
-      assert.strictEqual(readViaQuery.status, 200, '只读端点仍接受 ?token=')
+      assert.strictEqual(readViaQuery.status, 401, '只读端点不再接受 ?token=')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
@@ -5116,7 +5168,7 @@ async function main () {
       const cookieRead = await request(port, 'GET', '/api/config/console', { headers: { cookie: `xbk_session=${TOKEN}` } })
       assert.strictEqual(cookieRead.status, 200, 'GET 收 Cookie（全局鉴权口径）')
 
-      // ② 写面鉴权/媒体类型：Cookie-only 与 ?token= 都进不来，非 JSON 415。
+      // ② 写面鉴权/媒体类型：Cookie-only 与 query token 都进不来，非 JSON 415。
       const csrf = await request(port, 'POST', '/api/config/console', {
         headers: { cookie: `xbk_session=${TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ notifyTestReplayWindowS: 5 })
@@ -5126,8 +5178,12 @@ async function main () {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ notifyTestReplayWindowS: 5 })
       })
-      assert.strictEqual(queryToken.status, 400, '?token= 写面 400')
-      assert.strictEqual(JSON.parse(queryToken.text).error, 'query_token_not_allowed')
+      // A1 契约变化（有意）：这个端点不在 ingress 的写面白名单（STATE_CHANGING_PATHS）里，
+      // 请求先过全局 authorize()——查询串 token 已不是凭证 ⇒ 它跟「没带凭证」一样 401。
+      // 拒绝仍发生在 readBody/落盘之前（下面 fs.existsSync 断言），行为没有放宽；
+      // ingress 白名单内的写端点（/trigger 等）仍按专属口径回 400 query_token_not_allowed。
+      assert.strictEqual(queryToken.status, 401, '?token= 写面 401（查询串不再是凭证）')
+      assert.strictEqual(JSON.parse(queryToken.text).error, 'unauthorized')
       const nonJson = await postRaw(JSON.stringify({ notifyTestReplayWindowS: 5 }), { 'content-type': 'text/plain' })
       assert.strictEqual(nonJson.status, 415, '非 JSON 415')
       assert.strictEqual(JSON.parse(nonJson.text).error, 'unsupported_media_type')
@@ -5975,7 +6031,7 @@ async function main () {
   await aok('HTTP: GET / 下发 CSP 响应头（回归：frame-ancestors 仅 meta 承载是规范 no-op）', async () => {
     const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
     const port = await listen(server)
-    const res = await request(port, 'GET', `/?token=${TOKEN}`)
+    const res = await request(port, 'GET', '/', { token: TOKEN })
     assert.strictEqual(res.status, 200)
     const csp = res.headers['content-security-policy']
     assert.ok(csp, '必须存在 CSP 响应头')
@@ -11105,6 +11161,14 @@ async function main () {
       assert.strictEqual(res.status, 401, '缺第二因子不得进页面')
       assert.ok(res.text.includes('需要两步验证'), '显示第二因子登录页')
       assert.ok(res.text.includes(`name="token" value="${TOKEN}"`), '访问令牌只放在 hidden 字段回传')
+      // A1：挑战阶段不得把 token 放进 URL/Referer——页面里不允许出现 `?token=` 形态的地址，
+      // 表单必须是 POST /login（token 走 body，不进查询串）。
+      assert.ok(!res.text.includes('?token='), '挑战页不得出现 ?token= 形态的 URL（不落 Referer/日志）')
+      assert.ok(res.text.includes('<form method="post" action="/login">'), '挑战页必须用 POST 表单回传 token + 验证码')
+      // 旧书签形态（?token= + 未过第二因子）同样只是登录页，不得借此跳过挑战。
+      const staleBookmark = await request(port, 'GET', `/?token=${TOKEN}`)
+      assert.strictEqual(staleBookmark.status, 401, '旧 ?token= 链接不得进入挑战页/页面')
+      assert.ok(!staleBookmark.text.includes('name="code"'), '查询串 token 不得直接换取验证码输入页')
       res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN }).toString(), headers: form })
       assert.strictEqual(res.status, 401, '只提交令牌不够')
       assert.ok(res.text.includes('需要两步验证'), '继续要求验证码')
@@ -11115,6 +11179,7 @@ async function main () {
       const fresh = totpCodeAt(setup.secret, Date.now() + 30 * 1000)
       res = await request(port, 'POST', '/login', { body: new URLSearchParams({ token: TOKEN, code: fresh }).toString(), headers: form })
       assert.strictEqual(res.status, 303, '正确验证码登录')
+      assert.strictEqual(res.headers.location, '/', '两步登录成功也回干净的 /（URL 不含 token）')
       const cookies = cookiesOf(res)
       assert.ok(cookies.includes('xbk_session=') && cookies.includes('xbk_2fa='), '同时下发会话与 2FA Cookie')
       res = await request(port, 'GET', '/', { headers: { cookie: cookies } })
@@ -11956,7 +12021,7 @@ async function main () {
       report: { status: 'ok', value: { date: payload, runs: 1 } },
       run: { status: 'ok', value: { at: payload + attr, total: 1, dedup: 0, filtered: 0, pushed: 1, failed: 0, truncated: 0, elapsed: '1s' } },
       channels: { status: 'ok', value: { [payload + attr]: { consecutiveFailures: 2, lastFailureAt: 0, lastAlertAt: 0 } } }
-    }), new URLSearchParams(), 'tok', 'deep')
+    }), 'tok', 'deep')
     assert.ok(!html.includes(payload), `状态字段不得原样输出（日报日期/轮次时间/通道名都是外部数据，noscript 降级页会当场执行）：${payload}`)
     assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '尖括号必须转成实体（renderPage 输出链路，不是源码正则）')
     assert.ok(!html.includes('onmouseover="alert(1)"'), '属性引号必须转义，不得闭合属性')
@@ -11973,7 +12038,7 @@ async function main () {
       diagnostics: { status: 'missing', value: null }
     }
     // query 显式传 undefined：renderPage 曾直接 query.get('token')，非 URLSearchParams 会 TypeError
-    const html = renderPage(bare, undefined, '', 'deep')
+    const html = renderPage(bare, '', 'deep')
     assert.ok(html.startsWith('<!doctype html>'), '首行必须是 doctype（缺了浏览器进怪癖模式）')
     assert.ok(html.trimEnd().endsWith('</html>'), '文档必须闭合（半截 HTML 会让前端首屏永久白屏）')
     assert.ok(html.includes('<div id="app">'), '必须有前端挂载点 #app')
@@ -11988,8 +12053,8 @@ async function main () {
 
   await aok('C5-064 renderPage: theme/token/instanceId 真的进输出（换值即变，非法主题不回显）', () => {
     const { renderPage } = require('./scripts/console')
-    const dark = renderPage(uiState(), new URLSearchParams(), 'tok-AAA', 'nord', 'inst-1')
-    const light = renderPage(uiState(), new URLSearchParams(), 'tok-BBB', 'light', 'inst-2')
+    const dark = renderPage(uiState(), 'tok-AAA', 'nord', 'inst-1')
+    const light = renderPage(uiState(), 'tok-BBB', 'light', 'inst-2')
     assert.notStrictEqual(dark, light, '同一 state 换 theme/token/instance 后 HTML 必须不同（否则这些参数根本没接线）')
     assert.ok(dark.includes('data-theme="nord"') && dark.includes('content="#1a1f27"'), '主题必须同时进 <html data-theme> 与 theme-color')
     assert.ok(light.includes('data-theme="light"') && light.includes('content="#f3f5f9"'), '浅色底色必须跟着换（否则安卓状态栏先闪白）')
@@ -11998,19 +12063,21 @@ async function main () {
     assert.strictEqual(bootIsland(light).token, 'tok-BBB')
     assert.strictEqual(bootIsland(light).instance, 'inst-2')
     // 非法主题不得拼进属性：旧写法是 THEMES.includes ? theme : THEMES[0]，改成直接插值就是属性注入
-    const evil = renderPage(uiState(), new URLSearchParams(), '', 'deep" onload="alert(1)', '')
+    const evil = renderPage(uiState(), '', 'deep" onload="alert(1)', '')
     assert.ok(evil.includes('data-theme="deep"'), '未知主题必须回退到首个主题')
     assert.ok(!evil.includes('onload="alert(1)"'), '非法主题值不得原样进属性')
   })
 
-  await aok('C5-064 renderPage: boot 岛的 JSON 转义与 token 优先级（sessionToken 优先、query 回退）', () => {
+  await aok('C5-064 renderPage: boot 岛只认已验证的 sessionToken（A1：无 query 回退）与 JSON 转义', () => {
     const { renderPage } = require('./scripts/console')
+    // A1：签名已没有 query 参数——旧调用形态多传一个 URLSearchParams（带 token）也不得进 boot。
     const fromQuery = renderPage(uiState(), new URLSearchParams('token=from-query'), '', 'deep')
-    assert.strictEqual(bootIsland(fromQuery).token, 'from-query', 'sessionToken 为空时才回退 query token（兼容语义）')
-    const fromSession = renderPage(uiState(), new URLSearchParams('token=from-query'), 'from-session', 'deep')
-    assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'sessionToken 必须压过未验证的 query token')
+    assert.strictEqual(bootIsland(fromQuery).token, '', '多传的 URLSearchParams 必须被忽略（查询串不再是凭证）')
+    assert.ok(!fromQuery.includes('from-query'), '未验证的 query token 不得出现在页面任何位置')
+    const fromSession = renderPage(uiState(), 'from-session', 'deep')
+    assert.strictEqual(bootIsland(fromSession).token, 'from-session', 'boot token 必须是调用方验证过的凭证')
     // token 里带 </script>：必须按 JSON 字符转义，否则直接闭合 JSON 岛、后面的 HTML 全被当脚本
-    const breakout = renderPage(uiState(), new URLSearchParams(), 'tok</script><img src=x>', 'deep')
+    const breakout = renderPage(uiState(), 'tok</script><img src=x>', 'deep')
     assert.strictEqual((breakout.match(/<\/script>/g) || []).length, 2, '只允许两个合法的 </script>（boot 岛 + 入口模块），token 不得拼出第三个')
     assert.ok(!breakout.includes('<img src=x>'), 'token 里的标签不得原样落地')
     assert.strictEqual(bootIsland(breakout).token, 'tok</script><img src=x>', 'JSON 岛必须能无损还原原 token（前端要用它发请求）')

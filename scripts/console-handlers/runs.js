@@ -41,7 +41,7 @@ function createRunsHandlers (ctx) {
     // GET /api/stream（v3.374）：全站数据变化通知流。只发「变了」这一个信号
     // （event: tick + {"at":<ms>}），正文由前端用既有条件请求拉（ETag/304）——一条长连接
     // 不承载数据，重连也就不需要补帧。鉴权零代码：继承上方全局闸（原生 EventSource 带不了
-    // 自定义头 → Bearer 不可用；GET 收会话 Cookie，?token= 供 API/测试用，与 runs/stream 同口径）。
+    // 自定义头 → Bearer 不可用；GET 收会话 Cookie，API/测试用 Bearer 头，与 runs/stream 同口径）。
     getStream (req, res, url) {
       if (isShuttingDown()) { sendJson(res, 503, { error: '控制台正在关闭' }); return }
       // 连接数闸：第 21 个立刻 503（不排队、不先建流再断）。
@@ -66,7 +66,7 @@ function createRunsHandlers (ctx) {
     // GET /api/runs/stream（v3.300 批次③ 3.1）：运行中任务输出的 SSE 实时流。
     // ?id=<epoch.seq>&since=<offset>。鉴权零代码（继承上方全局闸）：原生 EventSource
     // 不能带自定义头 → Bearer 不可用；GET 收会话 Cookie（authorize 内 GET 分支），前端走
-    // Cookie；API/测试可用 ?token=（浏览器流同款）。端点与前端统一 id= 键名（蓝图口径）。
+    // Cookie；API/测试可用 Bearer 头（浏览器流同款）。端点与前端统一 id= 键名（蓝图口径）。
     getRunsStream (req, res, url) {
       // 关停闸：与 /trigger/cancel 同哲学——关停窗口不新开长连接（setShuttingDown 已置位，
       // 活跃连接由 shutdown 序列广播 done，见 wireGracefulShutdown）。

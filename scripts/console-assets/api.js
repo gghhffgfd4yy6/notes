@@ -9,8 +9,8 @@ import { FETCH_TIMEOUT_MS, BACKUP_FETCH_TIMEOUT_MS, BACKUP_BROWSER_MAX_BYTES, NO
 // 解析后立即移除该节点（用后即焚，token 不常驻 DOM）——解析失败同样要移除：节点里带着明文 token。
 // bootError 把「没有 token」的两种情形分开（C7-034）：'missing' = 页面没注入岛（Cookie 会话 /
 // 老页面，凭证本来就不走这里，不算错误）；'invalid-json' = 注入了但解析不了（页面数据坏了）。
-// 只回空 token 会把后者伪装成「凭证失效」——随后必然出现的 401 让控制台提示「用带 ?token= 的
-// 链接重开」，而真正的原因（注入内容损坏）被埋掉，也没有任何日志可查。
+// 只回空 token 会把后者伪装成「凭证失效」——随后必然出现的 401 让控制台提示「重新登录」，
+// 而真正的原因（注入内容损坏）被埋掉，也没有任何日志可查。
 function readBoot () {
   const el = document.getElementById('xbk-boot')
   if (!el) return { token: '', version: '', instance: '', bootError: 'missing' }
@@ -444,7 +444,7 @@ function apiGetAccessLog () {
 }
 
 // ── v3.310 过滤规则控制面：读面 GET + 四个写面 POST ─────────────────────────
-// 读面沿用现有 api helper（Cookie / Bearer / ?token= 均可）。写面只带
+// 读面沿用现有 api helper（Cookie / Bearer 均可；查询串 token 已不接受）。写面只带
 // `Authorization: Bearer <boot token>`，不带 ?token=（服务端写端点只认 Bearer 头，
 // URL 里带 token 会直接 400 query_token_not_allowed）。
 // 写请求的错误体必须读出来：409 要区分 revision_mismatch / write_busy / store_corrupt，
@@ -459,7 +459,7 @@ async function consumeJsonResult (p) {
   } catch (e) {
     data = null
   }
-  // 与 consumeJson 同口径：401 让 App 停轮询并显示「重新打开带 token 链接」。
+  // 与 consumeJson 同口径：401 让 App 停轮询并显示「重新登录」。
   if (res.status === 401 && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
     window.dispatchEvent(new Event('xbk-auth-expired'))
   }
@@ -486,7 +486,7 @@ function apiGetFilter () {
   }))))
 }
 
-// 服务器草稿：读面沿用 Cookie/?token= 均可的全局鉴权；写/删只认 Bearer。
+// 服务器草稿：读面沿用 Cookie/Bearer 均可的全局鉴权；写/删只认 Bearer。
 function apiGetFilterDraft () {
   const merged = timedRequest({
     headers: { Accept: 'application/json', ...AUTH_HEADER }

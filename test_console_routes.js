@@ -200,13 +200,17 @@ async function main () {
   })
 
   console.log('▶ HTTP：代表性 endpoint 的 method/path/status')
-  await aok('GET /api/status：200 + JSON（读端点经路由表命中）', async () => {
+  await aok('GET /api/status：200 + JSON（读端点经路由表命中；A1 起 ?token= 一律 401）', async () => {
     await withConsole(async ({ port }) => {
-      const r = await request(port, 'GET', `/api/status?token=${TOKEN}`)
+      const r = await request(port, 'GET', '/api/status', { token: TOKEN })
       assert.strictEqual(r.status, 200)
       assert.ok(r.json && typeof r.json === 'object', '必须回 JSON 对象')
       assert.ok('generatedAt' in r.json, 'status 快照必须带 generatedAt（与拆分前同形）')
       assert.strictEqual(r.json.report.status, 'missing', '空缓存目录的 report 段必须是 missing')
+      // A1：查询串里的 token 不再是凭证——路由自己不失守，鉴权闸必须先 401。
+      const query = await request(port, 'GET', `/api/status?token=${TOKEN}`)
+      assert.strictEqual(query.status, 401, '旧 ?token= 链接不得命中读端点')
+      assert.strictEqual(query.json.error, 'unauthorized')
     })
   })
 
@@ -222,28 +226,39 @@ async function main () {
     })
   })
 
-  await aok('POST /api/auto?token=：handler 内写面复判 400（Bearer-only，与 ingress 同口径）', async () => {
+  await aok('POST /api/auto?token=：查询串不再放行（无 Bearer 401）；带 Bearer 时 handler 复判 400（Bearer-only）', async () => {
     await withConsole(async ({ port }) => {
+      // A1：查询串 token 已不是凭证——它不会让请求「过鉴权进 handler」，与无凭证同口径 401。
+      const only = await request(port, 'POST', `/api/auto?token=${TOKEN}`, {
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ on: false })
+      })
+      assert.strictEqual(only.status, 401)
+      assert.strictEqual(only.json.error, 'unauthorized')
+      // 但 handler 里的写面复判没放宽：带合法 Bearer + URL token 仍 400 query_token_not_allowed。
       const r = await request(port, 'POST', `/api/auto?token=${TOKEN}`, {
+        token: TOKEN,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ on: false })
       })
       assert.strictEqual(r.status, 400)
       assert.strictEqual(r.json.error, 'query_token_not_allowed')
-      // 只读 GET 仍接受 ?token=（读写口径不同这一点不许被路由化改掉）
-      const read = await request(port, 'GET', `/api/auto?token=${TOKEN}`)
-      assert.strictEqual(read.status, 200)
-      assert.ok(read.json && read.json.auto, 'GET /api/auto 必须回 auto 快照')
+      // 只读 GET 口径不同：收 Bearer / 会话 Cookie，但查询串 token 已不是凭证（A1）——401。
+      const readBearer = await request(port, 'GET', '/api/auto', { token: TOKEN })
+      assert.strictEqual(readBearer.status, 200)
+      assert.ok(readBearer.json && readBearer.json.auto, 'GET /api/auto 必须回 auto 快照')
+      const readQuery = await request(port, 'GET', `/api/auto?token=${TOKEN}`)
+      assert.strictEqual(readQuery.status, 401, '读端点带 ?token= 同样 401（查询串不再放行）')
     })
   })
 
   await aok('动态路径：GET /api/runs/:id 命中与 404；POST /api/runs/detail 坏 body 400', async () => {
     await withConsole(async ({ port }) => {
-      const miss = await request(port, 'GET', `/api/runs/1700000000000.1?token=${TOKEN}`)
+      const miss = await request(port, 'GET', '/api/runs/1700000000000.1', { token: TOKEN })
       assert.strictEqual(miss.status, 404, '不存在的 run 必须 404')
       assert.match(miss.json.error, /not found/, 'run 不存在与「路由不存在」是两种 404，文案不同')
       // 形态不对的 id 不应命中动态路由 → 落到「路由不存在」的 404
-      const badShape = await request(port, 'GET', `/api/runs/not-an-id?token=${TOKEN}`)
+      const badShape = await request(port, 'GET', '/api/runs/not-an-id', { token: TOKEN })
       assert.strictEqual(badShape.status, 404)
       assert.strictEqual(badShape.json.error, 'not found', 'id 形态不符时不得进 handler（回通用 404）')
       const detail = await request(port, 'POST', '/api/runs/detail', { token: TOKEN, body: 'id=abc' })
@@ -254,13 +269,17 @@ async function main () {
 
   await aok('未匹配：未知路径 / method 不匹配都回原 404 形态（{error:"not found"}）', async () => {
     await withConsole(async ({ port }) => {
-      const unknown = await request(port, 'GET', `/api/definitely-not-a-route?token=${TOKEN}`)
+      const unknown = await request(port, 'GET', '/api/definitely-not-a-route', { token: TOKEN })
       assert.strictEqual(unknown.status, 404)
       assert.deepStrictEqual(unknown.json, { error: 'not found' })
       // /trigger 只有 POST：GET 不得命中（旧实现也是落到 404）
-      const wrongMethod = await request(port, 'GET', `/trigger?token=${TOKEN}`)
+      const wrongMethod = await request(port, 'GET', '/trigger', { token: TOKEN })
       assert.strictEqual(wrongMethod.status, 404)
       assert.deepStrictEqual(wrongMethod.json, { error: 'not found' })
+      // A1：未匹配路径带 ?token= 也不再进路由——鉴权闸先 401（查询串不是凭证）。
+      const unknownQuery = await request(port, 'GET', `/api/definitely-not-a-route?token=${TOKEN}`)
+      assert.strictEqual(unknownQuery.status, 401, '未匹配路径带 ?token= 必须先 401（不得因查询串改变鉴权）')
+      assert.deepStrictEqual(unknownQuery.json, { error: 'unauthorized' })
       // 已存在的路径用错 method 同样 404（不是 405——保持拆分前行为）
       const wrongMethod2 = await request(port, 'POST', '/api/status', { token: TOKEN, body: '' })
       assert.strictEqual(wrongMethod2.status, 404)

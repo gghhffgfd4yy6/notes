@@ -35,7 +35,7 @@ function createConfigHandlers (ctx) {
       }
       sendJsonConditional(req, res, view)
     },
-    // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer/?token= 均可）。
+    // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer 均可）。
     getFilter (req, res, url) {
       handleFilterGet(req, res)
     },
@@ -43,7 +43,7 @@ function createConfigHandlers (ctx) {
       handleFilterDraftGet(req, res)
     },
     // ── v3.340 控制台设置：通知自检的重复提交拦截窗（配置页可读写）──────────────
-    // GET 走全局鉴权（Cookie/Bearer/?token= 均可读）；POST 只认 Bearer + JSON（写面防 CSRF）。
+    // GET 走全局鉴权（Cookie/Bearer 均可读）；POST 只认 Bearer + JSON（写面防 CSRF）。
     // 落盘 <stateDir>/console-settings.json（0600 原子写），内存即时更新 ⇒ 下一次触发判定就生效。
     getConsoleSettings (req, res, url) {
       // 可变设置不许被任何中间层/浏览器启发式缓存：保存后刷新必须拿到刚写入的值。
