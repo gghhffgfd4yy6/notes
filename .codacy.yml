@@ -258,8 +258,13 @@
 #     而且这条断言**必须**读生产源码文本才能成立（要证明「只允许 xbk_state_schema.js 是定义处」），
 #     任何「改成别的读法来绕规则」都会让断言失去意义。真实防线在断言本身：三个文件的源码一旦
 #     重新长出第二份 REPORT_COUNTERS / RUN_SUMMARY_LINE_RE / isValidReportDate，该用例即红。
-#     故按本仓既有口径（scripts/log-archive.js / xbk_storage.js:222 同款）在这三行加行内
-#     `// nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename`。
+#     故按本仓既有口径（scripts/log-archive.js / xbk_storage.js:222 同款）在这三行加行内裸形态
+#     `// nosemgrep（路径 = __dirname + 本文件字面量文件名，非外部输入；真实防线在断言本身）`。
+#     实测口径（本轮踩过，别重犯）：带规则 ID 的精确形态
+#     `// nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename` **未被 Codacy 采纳**——
+#     新 sha 上仍判 3 new issues、annotations 精确落在这三行；裸形态与 xbk_storage.js:222 一致，
+#     已被 Codacy 判绿（Codacy 的 opengrep wrapper 对无 ids 的 nosemgrep 判定 is_ignored，
+#     同 scripts/mutation-report.js:925-927 的口径说明）。
 #   · :94 的 ErrorProne「numeric literal '20260101' will have a different value at runtime」
 #     （行号同按 60b4bfd 计；新树里是 :96）—— 该字面量是 validateReportState({ date: … }) 的
 #     「date 传 number 判非法」用例，20260101 是

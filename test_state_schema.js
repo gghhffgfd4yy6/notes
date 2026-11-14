@@ -435,10 +435,10 @@ check('deriveRunStats：非法计数行与无时间戳历史行不计入聚合',
 check('源码形状：生产侧不再有第二份 schema / 摘要行定义，只允许薄 wrapper', () => {
   // 测试夹具：以下三处目标都是 __dirname + 本仓库内的字面量文件名（xbk_app.js / scripts/status.js /
   // xbk_state_schema.js），不来自环境、CLI、网络或文件内容，非外部输入。形状断言本来就必须读源码
-  // 文本，故按本仓既有口径加行内精确 nosemgrep（同 scripts/log-archive.js 的写法）。
-  const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8') // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
-  const statusSrc = fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8') // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
-  const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
+  // 文本，故按本仓既有口径加行内裸 nosemgrep（同 xbk_storage.js:222 的写法）。
+  const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8') // nosemgrep（路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容；形状断言必须读源码文本，真实防线是断言本身）
+  const statusSrc = fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8') // nosemgrep（路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容；形状断言必须读源码文本，真实防线是断言本身）
+  const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep（路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容；形状断言必须读源码文本，真实防线是断言本身）
   const skip = sourceShapeGuard(appSrc + statusSrc + schemaSrc, '源码形状')
   if (skip) return skip
   const appCode = stripLineComments(appSrc)
