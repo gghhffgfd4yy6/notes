@@ -5946,6 +5946,38 @@ checkAsync('A1/C-009：锁路径是符号链接（O_NOFOLLOW ⇒ ELOOP）⇒ 抛
   assert.strictEqual(lockFs.readFileSync(target, 'utf8'), 'x', '链接目标不得被改写（读锁绝不跟链）')
 })
 
+checkAsync('A1/C-009：接管途中复判主锁变为不可判定 ⇒ 同样抛 RUN_LOCK_UNREADABLE（不得折叠成 busy），旧锁不被替换', async () => {
+  const realFs = require('fs')
+  const dir = mkTmpFixture('runlock-a1-again-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const deadFrame = JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 3600 * 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead` })
+  lockFs.writeFileSync(p, deadFrame, { mode: 0o600 })
+  // 第 1 次「从头读」= _acquireRunLock 判 stale；第 2 次 = 拿到哨兵后的复判（`again`）。
+  // 让复判读到坏内容，覆盖「复判到不可判定也必须响亮失败」这条分支（删掉那行 throw 时本用例必红）。
+  const origReadSync = realFs.readSync
+  let zeroPos = 0
+  realFs.readSync = function (fd, buf, off, len, pos) {
+    if (pos === 0) {
+      zeroPos++
+      if (zeroPos === 2) { buf.write('{oops', 0); return 5 }
+    }
+    return origReadSync.call(realFs, fd, buf, off, len, pos)
+  }
+  try {
+    const { error, warns } = await captureLockWarnAsync(() => app.run())
+    assert.ok(error, '复判到不可判定必须响亮失败（折叠成 busy ⇒ 入口 exit 0、永久零推送）')
+    assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE', `失败原因必须可判定：${error.message}`)
+    assert.strictEqual(error.lockIssue, 'frame_invalid')
+    assert.strictEqual(error.failureKind, 'permanent')
+    assert.ok(warns.some((w) => w.includes('⚠️') && w.includes(p)), `告警必须含 ⚠️ 与锁路径：${JSON.stringify(warns)}`)
+    assert.strictEqual(lockFs.readFileSync(p, 'utf8'), deadFrame, '没拿到可判定的复判结果前，旧锁一个字都不能改')
+    assert.deepStrictEqual(lockFs.readdirSync(dir).sort(), ['run.lock'], '哨兵必须按归属释放（不得残留 run.lock.takeover）')
+  } finally {
+    realFs.readSync = origReadSync
+  }
+})
+
 check('A4/C-027：runLockPidLimit = min(硬上限 4194304, 内核 pid_max)；读不到/脏值回退硬上限', () => {
   const { runLockPidLimit } = require('./xbk_app')
   assert.strictEqual(runLockPidLimit('4194304'), 4194304)
