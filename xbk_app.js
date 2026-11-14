@@ -3,6 +3,21 @@ const { setTimeout: delay } = require('node:timers/promises')
 // 单测桩只实现被调用到的方法（默认桩仅 existsSync），不保证带 constants / fstatSync / writeFileSync。
 const nodeFs = require('node:fs')
 const { timingSafeEqualStr, shanghaiStamp } = require('./xbk_utils')
+// S2：状态 schema 与派生口径的单一真源（report.state / channel-health.state / run.log 摘要行）。
+// 生产侧只做「写盘时机 + 告警文案」，校验/归一化/格式化全部转调本模块——此前 xbk_app 与
+// scripts/status.js 各写一份镜像实现，改一处必漏另一处（同一份 report.state 两边结论相反）。
+const {
+  REPORT_COUNTERS,
+  safeCounter,
+  blankReportState,
+  pickReportCounters,
+  isValidReportDate,
+  validateReportState,
+  reportPendingNeedsReset,
+  normalizeReportState,
+  validateChannelHealth,
+  formatRunSummaryLine
+} = require('./xbk_state_schema')
 const Similar = require('./scripts/similar-dedupe.js')
 const LogArchive = require('./scripts/log-archive.js')
 
@@ -470,23 +485,10 @@ function createApp ({
 
   // C1-028：_writeRunLog 允许写入的**唯一**文件名名单（见该方法头注释）。新增日志只改这里。
   const LOG_FILES = Object.freeze(new Set(['run.log', 'filter-diagnostics.ndjson']))
-  // C1-014：日报/累计计数器的**唯一**名单。新增计数器只改这里——清零、归一化、状态校验、
-  // 跨天结转全部由它派生。旧实现把同一串 7 个名字在 9 处各写一遍（_blankReportState 的字面量、
-  // _normalizeReportState / _loadReportState 的校验循环、_updateReport 的 reportKeys、
-  // 两处 nextState 字面量与 Object.assign 映射…），加字段必漏一处：漏掉 _normalizeReportState
-  // 的那处会静默丢计数（它只搬名单内的键，写盘时新字段直接消失）。
-  const REPORT_COUNTERS = Object.freeze(['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated'])
-  const blankCounters = () => {
-    const counters = {}
-    for (const key of REPORT_COUNTERS) counters[key] = 0
-    return counters
-  }
-  // 与旧 `pending.runs || 0` 同口径：非数/缺字段/0 都归 0（负数不在这里修，走 _safeCounter 归一化）。
-  const pickCounters = (source) => {
-    const counters = {}
-    for (const key of REPORT_COUNTERS) counters[key] = (source && source[key]) || 0
-    return counters
-  }
+  // C1-014 / S2：日报计数器的名单与清零/搬运实现已收进 xbk_state_schema.js（单一真源）。
+  // 本文件只引用 REPORT_COUNTERS（跨天结转的 reportKeys、校验循环已改由 validateReportState 承担），
+  // 不再自带 blankCounters / pickCounters 的镜像实现——旧实现把同一串 7 个名字在 9 处各写一遍，
+  // 加字段必漏一处：漏掉归一化的那处会静默丢计数。
   // FX3：通道恢复告警的「送达认领」租约。Pusher.send 自带 10s 超时（xbk_pusher.js），60s 留 6 倍
   // 余量；认领超租约即视为持有方已崩溃/被挂起，允许后续轮次接管重发（有界可恢复，不永久卡死）。
   const CHANNEL_RECOVER_CLAIM_LEASE_MS = 60000
@@ -1539,41 +1541,27 @@ function createApp ({
     },
 
     // v3.258 提取：日报状态归一化（行为不变，供测试直接打纯函数）
+    // S2：实现收进 xbk_state_schema（生产写入与控制台读取共用同一份口径），这里只留**薄 wrapper**：
+    // 归一化结果与告警条件都来自共享模块，本文件不再有第二份默认值/名单/日期校验。
     _blankReportState () {
-      return Object.assign({ date: '' }, blankCounters())
+      return blankReportState()
     },
+    // _safeCounter 是写侧「尽力取值」口径（缺失/非数/负数/布尔/超界 → 0），与 schema 校验的严格
+    // 口径（isValidCounter，文件里存了非法值即判损坏）是两件事，不要合并。
     _safeCounter (v) {
-      if (typeof v === 'symbol') return 0 // Number(Symbol) 抛 TypeError（子代理审查 commit-12）
-      const n = Number(v)
-      return typeof v !== 'boolean' && Number.isInteger(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0
+      return safeCounter(v)
     },
+    // 保留方法名（单测与历史调用点直接打它）——语义等同共享模块的 isValidReportDate。
     _isValidReportDate (value) {
-      if (value === '') return true
-      if (typeof value !== 'string') return false
-      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-      if (!m) return false
-      const year = Number(m[1]); const month = Number(m[2]); const day = Number(m[3])
-      if (year < 1 || month < 1 || month > 12 || day < 1) return false
-      const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
-      const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-      return day <= days[month - 1]
+      return isValidReportDate(value)
     },
     _normalizeReportState (raw) {
-      const blank = () => this._blankReportState()
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return blank()
-      const st = blank()
-      st.date = typeof raw.date === 'string' ? raw.date : ''
-      for (const k of REPORT_COUNTERS) st[k] = this._safeCounter(raw[k])
-      if (raw.pending && typeof raw.pending === 'object' && !Array.isArray(raw.pending)) {
-        st.pending = blank()
-        for (const k of REPORT_COUNTERS) st.pending[k] = this._safeCounter(raw.pending[k])
-      } else if (raw.pending) {
-      // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，
-      // 保留其占位并大声告警，让下游按 blankState 处理而不崩溃。
+      // pending 存在但非普通对象（状态文件损坏/结构异常）：不能静默丢弃跨天累计，保留其占位并
+      // 大声告警，让下游按 blankState 处理而不崩溃。归一化结果与条件同出 xbk_state_schema。
+      if (reportPendingNeedsReset(raw)) {
         console.warn('⚠️ report.state 的 pending 字段格式异常，已重置为空累计（原值被丢弃）')
-        st.pending = blank()
       }
-      return st
+      return normalizeReportState(raw)
     },
 
     // 运行日报（v3.125）：跨天时发"昨日日报"，当天累加统计；静默不影响主流程
@@ -1606,27 +1594,10 @@ function createApp ({
       if (stateResult.status === 'ok') {
         try {
           const raw = JSON.parse(stateResult.text)
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-            throw new Error('日报状态顶层必须是对象')
-          }
-          if (raw.date !== undefined && !this._isValidReportDate(raw.date)) {
-            throw new Error('日报状态 date 字段无效')
-          }
-          for (const k of REPORT_COUNTERS) {
-            if (raw[k] !== undefined && (!Number.isSafeInteger(raw[k]) || raw[k] < 0)) {
-              throw new Error(`日报状态字段 ${k} 无效`)
-            }
-          }
-          if (raw.pending !== undefined) {
-            if (!raw.pending || typeof raw.pending !== 'object' || Array.isArray(raw.pending)) {
-              throw new Error('日报状态 pending 字段无效')
-            }
-            for (const k of REPORT_COUNTERS) {
-              if (raw.pending[k] !== undefined && (!Number.isSafeInteger(raw.pending[k]) || raw.pending[k] < 0)) {
-                throw new Error(`日报 pending 字段 ${k} 无效`)
-              }
-            }
-          }
+          // S2：整份 schema 校验（顶层/date/七项计数/pending 段）与 --status 的读侧口径是同一份实现
+          // （xbk_state_schema.validateReportState），错误文案逐字保留供排障定位。
+          const checked = validateReportState(raw)
+          if (!checked.ok) throw new Error(checked.error)
           return this._normalizeReportState(raw)
         } catch (e) {
           console.error(`日报累计状态损坏，跳过本次日报更新以保留原文件 ${statePath}: ${Utils.safeErrorText(e, '解析失败')}`)
@@ -1662,7 +1633,7 @@ function createApp ({
       try {
       // 单次青龙入口会在 App.run 返回后退出，必须等待日报发送完成。
         await Pusher.send(reportText, reportBody)
-        const nextState = Object.assign({ date: today }, pickCounters(pendingState.pending))
+        const nextState = Object.assign({ date: today }, pickReportCounters(pendingState.pending))
         const nextSaved = this._persistReportState(statePath, nextState)
         if (nextSaved) console.log('已发送昨日运行日报')
         else console.warn('⚠️ 昨日日报已发送，但最终状态未持久化，重启后可能重复发送')
@@ -1688,7 +1659,7 @@ function createApp ({
             return
           }
           const pending = state.pending
-          const nextState = Object.assign({ date: today }, pickCounters(pending))
+          const nextState = Object.assign({ date: today }, pickReportCounters(pending))
           this._accumulateReport(nextState, summary)
           this._persistReportState(statePath, nextState)
           return
@@ -1844,6 +1815,17 @@ function createApp ({
           try {
             state = JSON.parse(stateResult.text)
             if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('状态顶层必须是对象')
+            // S2：整表校验口径与 --status 同源（xbk_state_schema.validateChannelHealth：空表 ok /
+            // 至少一条合格 ok / 有记录但全坏 invalid）。旧实现只判顶层类型，一张全是坏记录的表会被
+            // 当成可用状态继续叠加，而 --status 同一时刻把它显示成「不可读（invalid）」——同一份文件
+            // 两处结论相反。全坏表按**读失败**处理：与紧邻的「JSON 损坏」分支同方向 fail-closed——
+            // 留一行 error、跳过本轮、原文件逐字节保留。不得改成「按空表重建后覆盖写盘」：整表丢弃会
+            // 连其它通道的记录与 recoverAlertPending/recoverAlertClaim 一起抹掉（恢复告警认领字段须
+            // 原样保留），也与 SYSTEM_CONTRACT「读失败时写侧 fail-closed，不得以空状态覆盖」相抵。
+            if (!validateChannelHealth(state)) {
+              console.error(`通道健康状态校验失败（有记录但均不合格），跳过本轮健康更新以保留原文件 ${statePath}`)
+              return
+            }
           } catch (e) {
             console.error(`通道健康状态损坏，跳过本轮健康更新以保留原文件 ${statePath}`)
             return
@@ -3216,7 +3198,30 @@ function createApp ({
         }
         // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
         // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        this._writeRunLog(`${this._localStamp()} total=${xbkdata.length} dedup=${dedupCount} filtered=${filteredCount} truncated=${truncatedCount} pushed=${successCount} failed=${dryRun ? 0 : items.length - successCount} elapsed=${elapsed}s${dryRun && items.length > successCount ? ` dry-run未推送=${items.length - successCount}` : ''}${skippedNoIdentity > 0 ? ` noidentity=${skippedNoIdentity}` : ''}${badElementCount > 0 ? ` bad=${badElementCount}` : ''}${dryRun ? '' : ` cachesaved=${cacheSaved ? 1 : 0}`}${similarCount > 0 ? ` similar=${similarCount}` : ''}${similarLogged > 0 ? ` similarlogged=${similarLogged}` : ''}${similarDrop > 0 ? ` similardrop=${similarDrop}` : ''}\n`)
+        // S2：这一行与读侧的 RUN_SUMMARY_LINE_RE / parseRunSummaryLine 同出 xbk_state_schema
+        // （formatRunSummaryLine）——此前「写的模板字符串」与「读的正则」是两份，加字段两边各改一次。
+        this._writeRunLog(`${formatRunSummaryLine({
+          stamp: this._localStamp(),
+          counters: {
+            total: xbkdata.length,
+            dedup: dedupCount,
+            filtered: filteredCount,
+            truncated: truncatedCount,
+            pushed: successCount,
+            failed: dryRun ? 0 : items.length - successCount
+          },
+          elapsed: `${elapsed}s`,
+          extras: {
+            dryRun,
+            dryRunUnpushed: items.length - successCount,
+            noidentity: skippedNoIdentity,
+            bad: badElementCount,
+            cachesaved: cacheSaved,
+            similar: similarCount,
+            similarlogged: similarLogged,
+            similardrop: similarDrop
+          }
+        })}\n`)
         // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
         // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
         // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。

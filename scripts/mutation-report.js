@@ -17,7 +17,7 @@ const EXPECTED_SEGMENTS = Object.freeze([
   'sendnotify-part1', 'sendnotify-part2',
   'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps', 'status',
   'console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11', 'console-part12', 'console-part13',
-  'filter-store'
+  'filter-store', 'state-schema'
 ])
 
 // stryker 报告的合法变异状态——权威来源是本仓已安装的 mutation-testing-report-schema 里

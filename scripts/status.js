@@ -7,6 +7,21 @@ const { defaultMessageSignature } = require('./message-signature')
 // 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
 // （审查 Sourcery PR#227）。实现与 run.log 戳/日报日界同源（xbk_utils.shanghaiDayKey）。
 const { shanghaiDayKey } = require('../xbk_utils')
+// S2：状态 schema（report.state / channel-health.state）与 run.log 摘要行的**单一真源**。
+// 本文件此前是生产侧镜像实现的另一半（isValidReportDate / REPORT_COUNTERS / validPendingReport /
+// validReport / RUN_SUMMARY_LINE_RE），两处注释都写着「改任一处必须同步另一处」——那正是漂移源：
+// 口径一旦分叉，同一份 report.state 会在生产侧判「损坏」、在 --status 里显示「正常」。
+// 现在校验/解析/派生统计全部引用 xbk_state_schema，只读命令也不会因此拉起整个 App 依赖
+// （该模块只向下依赖 xbk_utils 的纯函数）。
+const {
+  isValidCounter,
+  validateReportState,
+  isValidChannelHealthEntry,
+  validateChannelHealth,
+  RUN_SUMMARY_LINE_RE,
+  parseRunSummaryLine,
+  deriveRunStats
+} = require('../xbk_state_schema')
 // P1：判重缓存的增量日志（journal）口径与回放实现只此一份——运行侧 MessageStore 与这里共用
 // 同一组纯函数，禁止控制台各写一套（两套身份语义一旦分叉，控制台就会把更新显示成重复条目）。
 const {
@@ -64,75 +79,13 @@ function readText (dir, name, maxBytes = LOG_MAX_BYTES, options) {
   return out
 }
 
-function validCounter (value) {
-  return Number.isSafeInteger(value) && value >= 0
-}
-
-// 日报日期口径：与生产侧 xbk_app._isValidReportDate **语义一致**（审查 SS-04）。生产读路径
-// （_loadReportState）对存在且非法的 date 直接判「状态损坏、跳过本次日报更新」，而 --status 此前
-// 只校验类型，于是 '2026-13-45' 会被当成正常日报展示——同一份文件两处口径相反。此处补齐：
-//   - undefined / '' 合法（生产侧同样接受缺失与空串，_normalizeReportState 归一化为 ''）；
-//   - 存在的值必须是 YYYY-MM-DD 且月/日真实存在（含闰年天数）。
-// 口径以 xbk_app.js 的同名方法为准；两处是镜像实现（scripts/status.js 不引 xbk_app，避免只读命令
-// 拉起整个 App 依赖），修改任一处必须同步另一处。
-function isValidReportDate (value) {
-  if (value === '') return true
-  if (typeof value !== 'string') return false
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!m) return false
-  const year = Number(m[1]); const month = Number(m[2]); const day = Number(m[3])
-  if (year < 1 || month < 1 || month > 12 || day < 1) return false
-  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
-  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-  return day <= days[month - 1]
-}
-
-// 日报状态里的七项计数（与生产侧 xbk_app._loadReportState / _normalizeReportState 的字段清单逐一对应；
-// 两处是镜像实现，改任一处必须同步另一处）。
-const REPORT_COUNTERS = ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
-
-// 日报「本轮待累计」段（pending）的口径：与生产侧 _loadReportState 的 `raw.pending` 分支**逐条对齐**
-// （xbk_app.js 的「日报状态 pending 字段无效」/「日报 pending 字段 … 无效」两处 throw）。生产侧遇到
-// 非法 pending 会判「状态损坏」并跳过本次日报更新，而 --status 此前完全不看 pending——同一份
-// report.state，生产判损坏、这里却显示「日报：正常」，两处口径相反（审查 SS-05）。此处补齐：
-//   - 缺失（undefined）合法：生产侧 _normalizeReportState 归一化为全 0 的 pending；
-//   - 存在时必须是普通对象（非 null、非数组），否则非法；
-//   - 七项计数存在时均为非负安全整数（缺失视为未累计，与 raw 顶层计数同口径）。
-function validPendingReport (value) {
-  if (value === undefined) return true
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  return REPORT_COUNTERS.every(key => value[key] === undefined || validCounter(value[key]))
-}
-
-function validReport (value) {
-  // 与生产侧 xbk_app 读取口径对齐：七项计数只在字段存在时校验非负安全整数，
-  // 缺失视为未累计（生产侧 _normalizeReportState 会归一化为 0），不再整份判 invalid。
-  // CodeRabbit PR #147：date 同样要允许缺失——生产侧 _loadReportState 接受 raw.date === undefined，
-  // _normalizeReportState 归一化为 ''，_updateReport 视其为首轮并补当前日期。此处原先要求
-  // typeof date === 'string'，会把合法的 {"runs":1} 显示成「日报：不可读（invalid）」。
-  // 审查 SS-04：存在的 date 不只校验类型，还按 _isValidReportDate 语义校验真实日期。
-  // 审查 SS-05：pending 段与生产侧同口径校验（见 validPendingReport）——不校验时，生产判损坏的
-  // report.state 会在 --status 里显示成「日报：正常」。
-  return value && (value.date === undefined || isValidReportDate(value.date)) &&
-    REPORT_COUNTERS.every(key => value[key] === undefined || validCounter(value[key])) &&
-    validPendingReport(value.pending)
-}
-
-// 单条通道记录的口径：必须是普通对象且三个计数均为非负安全整数（缺失/类型错即该条损坏）。
-function validChannelEntry (entry) {
-  return entry && typeof entry === 'object' && !Array.isArray(entry) &&
-    validCounter(entry.consecutiveFailures) && validCounter(entry.lastFailureAt) && validCounter(entry.lastAlertAt)
-}
-
-// 逐条容错（审查 SS-02）：旧实现 Object.values(value).every(...) 是「任一条目损坏即整表 invalid」，
-// 一条坏记录会让所有健康通道信息一并消失（--status 只显示「不可读（invalid）」）。现口径：
-//   - 空表（{}）→ ok，展示「暂无记录」；
-//   - 至少有一条合格记录 → ok，formatStatus 逐条过滤并报告被忽略的损坏条数；
-//   - 有记录且无一合格 → invalid（整表确实不可读，不假装「暂无记录」）。
-function validChannels (value) {
-  const entries = Object.values(value)
-  return entries.length === 0 || entries.some(validChannelEntry)
-}
+// report.state / channel-health.state 的读写口径全部来自 xbk_state_schema（S2 单源化）：
+//   · validateReportState —— 顶层对象 / date 真实日期 / 七项计数（缺失视为未累计）/ pending 段；
+//     与生产侧 _loadReportState 的 throw 分支逐条同源，错误文案同出一处；
+//   · validateChannelHealth —— 空表 ok、至少一条合格记录 ok、有记录但全坏 invalid（逐条容错）；
+//   · isValidChannelHealthEntry —— formatStatus 逐条过滤用的单条记录判据。
+// 之前这里各有镜像实现（validReport / validPendingReport / REPORT_COUNTERS / validChannels），
+// 于是同一份文件可能「生产判损坏、这里显示正常」，改一处必漏另一处。
 
 function parseJson (read, validate) {
   if (read.status !== 'ok') return { status: read.status }
@@ -162,14 +115,12 @@ function looksLikeRoundFailure (line) {
   return /(?:^|\s)ERROR(?:\s|$)|运行异常/.test(line)
 }
 
-// run.log 摘要行正则（parseLastRun 只看最后一条；readTrends / readRunHistory / parseRunStats
-// 都按同一逐行形态解析）。dry-run 行（含 dry-run未推送=）计入轮次与获取数，但 pushed 恒为 0，
-// 与真实口径一致；noidentity/cachesaved 等附加字段不参与聚合。
-// C10-057：**唯一**一份摘要正则。分组 1 = 行首完整时间戳（本地 `YYYY-MM-DD HH:MM:SS` 或历史
-// ISO，含其后可能的分段后缀），2..7 = 六项计数，8 = elapsed。需要「日历日」的调用方一律用
-// `m[1].slice(0, 10)` 派生——此前 parseLastRun 内联了第二份正则，且两份的分组 1 语义不同
-// （一份是整段时间戳、一份只有日期），同一位置两个含义，改一处必漏另一处。
-const RUN_SUMMARY_LINE_RE = /^((?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*) )?total=(\d+) dedup=(\d+) filtered=(\d+) truncated=(\d+) pushed=(\d+) failed=(\d+) elapsed=(\S+)/
+// run.log 摘要行正则与解析器：**唯一**定义在 xbk_state_schema（RUN_SUMMARY_LINE_RE /
+// parseRunSummaryLine）。写入侧 xbk_app.js 的 run() 末尾用同一模块的 formatRunSummaryLine 拼行，
+// 「写得进去、读不出来」（加字段只改一边）结构上不再可能。
+// 分组语义：1 = 行首完整时间戳（本地 `YYYY-MM-DD HH:MM:SS` 或历史 ISO，含其后可能的分段后缀）、
+// 2..7 = 六项计数、8 = elapsed；日历日一律取 1 的前 10 位（parseRunSummaryLine 已算好 day）。
+// 轮界归属（失败行 → 摘要行）那部分**留在本文件**（见下），只有摘要行定义与派生统计共享。
 
 // ── 轮界归属（parseLastRun / readRunHistory 共用）────────────────────────────
 // 生产写序（xbk_app.js）：失败行写在所属轮的摘要行**之前**——「推送全部失败」ERROR 后紧跟
@@ -197,13 +148,12 @@ function tsMs (line) {
 }
 
 // 摘要行索引表：0-based 行号 → 摘要时间戳(ms) / null（无时间戳）。
-// 计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）。
+// 计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）——parseRunSummaryLine 已含
+// 「行首锚定 + 六项计数必须是非负安全整数」两道判据（与写入侧同源），故只看它返回 null 与否。
 function summaryIndexOf (lines) {
   const summaryAt = new Map()
   for (let i = 0; i < lines.length; i++) {
-    if (!RUN_SUMMARY_LINE_RE.test(lines[i])) continue
-    const m = RUN_SUMMARY_LINE_RE.exec(lines[i])
-    if (![m[2], m[3], m[4], m[5], m[6], m[7]].map(Number).every(validCounter)) continue
+    if (!parseRunSummaryLine(lines[i])) continue
     summaryAt.set(i, tsMs(lines[i]))
   }
   return summaryAt
@@ -286,15 +236,14 @@ function parseLastRun (read) {
   }
   for (let i = lines.length - 1; i >= 0; i--) {
     // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
-    // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取。
+    // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取；六项计数必须是非负安全整数
+    // （超长数字经 Number 得 Infinity/超界，整行跳过）。这两道判据与写入侧同源
+    // （xbk_state_schema.parseRunSummaryLine），不再在此内联正则与计数校验。
     // 审查 SS-01：时间戳由非捕获组改为捕获组（旧实现只用来锚定，结果里没有任何时间字段，
     // 输出无法判断这一轮是何时跑的、也看不出日志已经很久没更新）。
-    // C10-057：改用模块级 RUN_SUMMARY_LINE_RE（唯一真源），分组 1 就是整段时间戳。
-    const match = RUN_SUMMARY_LINE_RE.exec(lines[i])
-    if (!match) continue
-    // 与 parseDiagnostics 同口径：六项计数必须是非负安全整数（超长数字经 Number 得 Infinity/超界，直接跳过该行）
-    const counters = match.slice(2, 8).map(Number)
-    if (!counters.every(validCounter)) continue
+    const parsed = parseRunSummaryLine(lines[i])
+    if (!parsed) continue
+    const counters = parsed.counters
     // 找到最近一条完整摘要就返回，循环不会进入第二次——归属表可以在这里一次性构建
     // （CodeQL: 旧写法的 !summaryAt 条件恒真，属死分支）。
     const summaryAt = summaryIndexOf(lines)
@@ -309,17 +258,16 @@ function parseLastRun (read) {
       const at = tsOf(lines[j])
       if (at) orphanFailureAt = at
     }
-    const extras = runParseExtras(lines[i])
     return result('ok', {
-      at: match[1] ? match[1].trim() : '',
-      total: counters[0],
-      dedup: counters[1],
-      filtered: counters[2],
-      truncated: counters[3],
-      pushed: counters[4],
-      failed: counters[5],
-      elapsed: match[8],
-      dryRun: extras.dryRun,
+      at: parsed.at,
+      total: counters.total,
+      dedup: counters.dedup,
+      filtered: counters.filtered,
+      truncated: counters.truncated,
+      pushed: counters.pushed,
+      failed: counters.failed,
+      elapsed: parsed.elapsed,
+      dryRun: parsed.extras.dryRun,
       interrupted: classified.interruptedIdx.has(i),
       orphanFailures,
       orphanFailureAt
@@ -329,51 +277,13 @@ function parseLastRun (read) {
 }
 
 // 首屏「今日 / 近 7 天」聚合（v3.307）：与趋势同源同口径（run.log 摘要行 + Asia/Shanghai
-// 日历日），但只下发计数，不在前端重算。today/week 的 successRate = pushed/(pushed+failed)，
+// 日历日），只下发计数，不在前端重算。today/week 的 successRate = pushed/(pushed+failed)，
 // 无尝试时 null（前端显示「—」而不是编一个 100%）。
-// lastFailure 是近 7 天窗口内最近一条 failed>0 的摘要（用于首屏异常横幅的「看日志」跳转）；
-// 窗口外失败不进入 stats，避免首屏长期挂红。
+// S2：聚合实现收进 xbk_state_schema.deriveRunStats（与摘要行解析同一份实现）；本函数只负责
+// 「读结果三态 → 返回形状」的适配，truncated 如实透传日志读取窗口的截断标记。
 function parseRunStats (read, now = Date.now()) {
   if (read.status !== 'ok') return { status: read.status }
-  const todayKey = shanghaiDayKey(now)
-  const weekStartKey = shanghaiDayKey(now - 6 * 86400000)
-  const blank = (date) => ({ date, rounds: 0, total: 0, pushed: 0, failed: 0 })
-  const today = blank(todayKey)
-  const week = { from: weekStartKey, to: todayKey, rounds: 0, total: 0, pushed: 0, failed: 0 }
-  let lastFailure = null
-  for (const line of read.value.split('\n')) {
-    const m = RUN_SUMMARY_LINE_RE.exec(line)
-    if (!m) continue
-    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
-    if (!counters.every(validCounter)) continue
-    // 分组 1 是整段时间戳，日历日取前 10 位（C10-057：与 RUN_SUMMARY_LINE_RE 单一真源配套）
-    const day = m[1] ? m[1].slice(0, 10) : ''
-    // 只统计 [本周起点, 今天]：未来日期（时钟回拨/手写 fixture/坏摘要）会把周汇总和
-    // lastFailure 一起推高（Sourcery 未来摘要污染周统计）。
-    if (!day || day < weekStartKey || day > todayKey) continue
-    week.rounds += 1
-    week.total += counters[0]
-    week.pushed += counters[4]
-    week.failed += counters[5]
-    if (day === todayKey) {
-      today.rounds += 1
-      today.total += counters[0]
-      today.pushed += counters[4]
-      today.failed += counters[5]
-    }
-    if (counters[5] > 0) {
-      lastFailure = { at: line.slice(0, 19).trim(), date: day, failed: counters[5] }
-    }
-  }
-  const rate = (pushed, failed) => (pushed + failed > 0 ? pushed / (pushed + failed) : null)
-  return result('ok', {
-    today: { ...today, successRate: rate(today.pushed, today.failed) },
-    week: { ...week, successRate: rate(week.pushed, week.failed) },
-    lastFailure,
-    // 尾部 1 MiB 窗口外可能还有本日/本周摘要：true 时前端必须标注「仅统计日志尾部」，
-    // 不得把少算的总数当完整数据展示。
-    truncated: read.truncated === true
-  })
+  return result('ok', deriveRunStats(read.value.split('\n'), now, { truncated: read.truncated === true }))
 }
 
 function parseDiagnostics (read) {
@@ -382,18 +292,18 @@ function parseDiagnostics (read) {
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const value = JSON.parse(lines[i])
-      if (value && value.type === 'run' && validCounter(value.total) && validCounter(value.dedup) &&
-        validCounter(value.filtered) && validCounter(value.passed) && validCounter(value.detailCount) &&
+      if (value && value.type === 'run' && isValidCounter(value.total) && isValidCounter(value.dedup) &&
+        isValidCounter(value.filtered) && isValidCounter(value.passed) && isValidCounter(value.detailCount) &&
         value.byReason && typeof value.byReason === 'object' && !Array.isArray(value.byReason) &&
-        Object.values(value.byReason).every(validCounter)) return result('ok', value)
+        Object.values(value.byReason).every(isValidCounter)) return result('ok', value)
     } catch (error) { /* 忽略单条损坏记录，继续查找最近完整汇总 */ }
   }
   return result('invalid')
 }
 
 function readStatus (dir, { now = Date.now() } = {}) {
-  const report = parseJson(readText(dir, FILES.report, 64 * 1024), validReport)
-  const channels = parseJson(readText(dir, FILES.channels, 64 * 1024), validChannels)
+  const report = parseJson(readText(dir, FILES.report, 64 * 1024), (value) => validateReportState(value).ok)
+  const channels = parseJson(readText(dir, FILES.channels, 64 * 1024), validateChannelHealth)
   // report.state / channel-health 是「整份 JSON」，必须整读：超限仍判 tooLarge（读尾部只会得到
   // 半个 JSON，假装可读更危险）。run.log / filter-diagnostics 是追加式日志，取尾部 1 MiB
   // （审查 SS-03）：超限时旧行为让这两个部件整体不可见，而解析本来就是「从最后一行往前找」。
@@ -449,9 +359,9 @@ function formatStatus (status) {
   }
   const channels = status.channels.value
   if (channels) {
-    // 与 validChannels 同口径逐条过滤（审查 SS-02）：损坏条目单独计数并明示，健康通道照常展示。
+    // 与 validateChannelHealth 同口径逐条过滤（审查 SS-02）：损坏条目单独计数并明示，健康通道照常展示。
     const all = Object.entries(channels)
-    const entries = all.filter(([, value]) => validChannelEntry(value))
+    const entries = all.filter(([, value]) => isValidChannelHealthEntry(value))
     const dropped = all.length - entries.length
     const body = entries.length
       ? entries.map(([name, value]) => `${name}：连续失败 ${value.consecutiveFailures} 次`).join('；')
@@ -531,24 +441,24 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   const byDay = new Map()
   const lines = read.value.split('\n')
   for (const line of lines) {
-    const m = RUN_SUMMARY_LINE_RE.exec(line)
-    if (!m) continue
-    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
-    if (!counters.every(validInt)) continue
+    // 与 readRunHistory / parseLastRun 同一解析器（xbk_state_schema.parseRunSummaryLine）：
+    // 行首锚定 + 六项计数必须是非负安全整数，日历日取时间戳前 10 位。
+    const parsed = parseRunSummaryLine(line)
+    if (!parsed) continue
     // 无时间戳的历史行（极旧格式）没有日期键，归不进任何一天——跳过（诚实于「不知道」）。
-    // 分组 1 是整段时间戳，日历日取前 10 位（C10-057：与 RUN_SUMMARY_LINE_RE 单一真源配套）
-    const day = m[1] ? m[1].slice(0, 10) : ''
+    const day = parsed.day
     if (!day) continue
     // 只聚合窗口内：旧日志行不进窗口（避免「总计」被陈旧数据污染）。
     if (day < startKey || day > endKey) continue
+    const counters = parsed.counters
     const agg = byDay.get(day) || { date: day, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 }
     agg.rounds += 1
-    agg.total += counters[0]
-    agg.dedup += counters[1]
-    agg.filtered += counters[2]
-    agg.truncated += counters[3]
-    agg.pushed += counters[4]
-    agg.failed += counters[5]
+    agg.total += counters.total
+    agg.dedup += counters.dedup
+    agg.filtered += counters.filtered
+    agg.truncated += counters.truncated
+    agg.pushed += counters.pushed
+    agg.failed += counters.failed
     byDay.set(day, agg)
   }
   // 输出按日期升序补零：没有记录的日期也给全 0 行，前端画图不用补洞。
@@ -575,30 +485,11 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
 // 数据完整性边界（有意取舍，README 披露）：崩溃轮无摘要行只能标 interrupted；
 // 超 1MiB 后更早轮次已物理轮转丢失（truncated:true 如实标注）。
 
-// 摘要行附加尾组：cachesaved=(0|1) / noidentity=N / dry-run未推送=N（写入侧 xbk_app.js
-// 按条件输出，读取侧全部可选捕获——纯读扩展，写入侧零改动）。
-// Sonar S8786：可选组链 `(?: …)?(?: …)?` 有超线性回溯形态，改用零正则的线性尾部扫描
-// （runParseExtras）：只锚定「最后一个数值 token 边界」，与原正则捕获语义逐分支等价，
-// 且对任意行输入保证 O(行尾段) 单遍。
-function runParseExtras (line) {
-  const tail = line.length > 64 ? line.slice(-64) : line
-  const grab = (tag) => {
-    const at = tail.lastIndexOf(' ' + tag + '=')
-    if (at < 0) return null
-    const start = at + tag.length + 2
-    let end = start
-    while (end < tail.length && tail.charCodeAt(end) >= 48 && tail.charCodeAt(end) <= 57) end++
-    if (end === start) return null
-    return Number(tail.slice(start, end))
-  }
-  const cachesaved = grab('cachesaved')
-  const noidentity = grab('noidentity')
-  const dryRun = tail.indexOf('dry-run未推送=') >= 0 ? grab('dry-run未推送') : null
-  return { cachesaved, noidentity, dryRun }
-}
+// 摘要行附加尾组（cachesaved / noidentity / dry-run未推送 等）的解析在
+// xbk_state_schema.parseRunSummaryExtras（零正则线性尾部扫描，见其注释）。这里直接取
+// parseRunSummaryLine 结果里的 extras，不再各写一份 grab。
 
 // 尾窗指纹（评审 #243-1 / 审查 D1-N6）：before 行号相对「当前 1MiB 尾窗」编号，文件超窗后
-// 新写入会让整个窗口平移，旧游标会指到别的轮次。窗口指纹随响应下发，客户端翻页时带回；
 // 指纹不符 → stale，前端回第 1 页（宁可重看，不跳/不重复）。
 // 旧实现直接哈希首行前 200 字符：空行/空串恒得 811c9dc5（不同的空窗口无法区分），首行第
 // 200 字符之后不同也判不出来。现口径：跳过空行取首个非空行，把「行序 + 长度 + 完整内容」
@@ -678,22 +569,24 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
   const rounds = []
   for (const i of summaryAt.keys()) {
     const line = lines[i]
-    const m = RUN_SUMMARY_LINE_RE.exec(line)
-    const counters = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number)
-    const extras = runParseExtras(line)
+    // summaryAt 只收 parseRunSummaryLine 非 null 的行 ⇒ 这里必非 null（同一解析器，不再二次 exec）。
+    const parsed = parseRunSummaryLine(line)
+    const counters = parsed.counters
     rounds.push({
       i,
-      at: m[1] ? line.slice(0, 19).trim() : '',
-      total: counters[0],
-      dedup: counters[1],
-      filtered: counters[2],
-      truncated: counters[3],
-      pushed: counters[4],
-      failed: counters[5],
-      elapsed: m[8],
-      cachesaved: extras.cachesaved,
-      noidentity: extras.noidentity,
-      dryRun: extras.dryRun,
+      // 运行历史沿用「行首 19 字符」口径（无时间戳 → ''）：与 parseLastRun 的 at（保留历史 ISO
+      // 的分段后缀）不同，这是既有输出形状，不改。
+      at: parsed.at ? line.slice(0, 19).trim() : '',
+      total: counters.total,
+      dedup: counters.dedup,
+      filtered: counters.filtered,
+      truncated: counters.truncated,
+      pushed: counters.pushed,
+      failed: counters.failed,
+      elapsed: parsed.elapsed,
+      cachesaved: parsed.extras.cachesaved,
+      noidentity: parsed.extras.noidentity,
+      dryRun: parsed.extras.dryRun,
       interrupted: interruptedIdx.has(i), // 同秒/相邻失败行已在预扫描归属到本轮
       cancelled: false,
       isPlaceholder: false
@@ -793,7 +686,7 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
 
 // push.json（判重缓存主存 = 已推送消息记录）的轻量读取校验：条目必须是带 id/title 的对象。
 // 这里不做 readStatus 级别的严格 schema 校验——控制台只读展示，畸形条目跳过并计数即可
-// （与 validChannels「逐条容错」同哲学：一条坏记录不能让整份记录不可见）。
+// （与 validateChannelHealth「逐条容错」同哲学：一条坏记录不能让整份记录不可见）。
 function validMessageEntry (m) {
   return m && typeof m === 'object' && !Array.isArray(m) &&
     (typeof m.title === 'string' || typeof m.content === 'string')

@@ -121,7 +121,10 @@ const SUITES = [
   // v3.410：scripts/similar-dedupe.js 此前没有专属套件（只在 test_app_unit.js 里顺带 6 例），
   // 而拦截明细 similar-blocked.ndjson 依赖 findSimilarTitle 返回「命中的哪一条」——判定正确但明细
   // 记错条目的偏差抓不到。本套件直测纯函数（无 IO、无 fs），不设 integration/mutationSkip。
-  { name: '近似去重纯函数', file: 'test_similar_dedupe.js', desc: 'scripts/similar-dedupe.js findSimilarTitle 命中返回整条条目/未命中 null/价格与券档护栏 + isSimilarTitle 与 findSimilarTitle 结论一致（固定种子随机 200 组）' }
+  { name: '近似去重纯函数', file: 'test_similar_dedupe.js', desc: 'scripts/similar-dedupe.js findSimilarTitle 命中返回整条条目/未命中 null/价格与券档护栏 + isSimilarTitle 与 findSimilarTitle 结论一致（固定种子随机 200 组）' },
+  // S2：状态 schema 与派生口径单源化的靶向套件（xbk_state_schema.js 纯函数 + 生产侧「不得再长出
+  // 第二份定义」的源码形状断言）。纯函数、无 IO、无网络 ⇒ 不设 integration/mutationSkip。
+  { name: '状态口径', file: 'test_state_schema.js', desc: 'xbk_state_schema.js：日报日期/七项计数/pending 段校验与归一化、通道逐条容错、摘要行解析/格式化逐字与回环、今日/近7天派生统计；另断言生产文件不得再有第二份名单/正则' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

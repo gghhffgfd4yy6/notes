@@ -247,6 +247,31 @@
 # 路径来源也不是外部净输入：调用方已做 basename 清洗（见本文件头 :15-16）。故 :222 已按本仓既有口径
 # 加行内 `// nosemgrep`（同 scripts/log-archive.js:89 / xbk_message_store.js:1204）；本条目是同一结论的
 # 文字登记，不涉整文件排除，该文件的真实行为仍由 npm test 全量执行。
+#
+# ---- S2（v3.429 状态 schema 单源化）：test_state_schema.js 的两类误报登记 ----
+# test_state_schema.js 是 xbk_state_schema.js 的靶向回归（四组边界 + format→parse 回环 +
+# 「生产文件里不得再长出第二份定义」的源码形状断言）。本轮 Codacy 报 4 条，逐条核对后全部是误报：
+#   · Codacy 报的 :434/:435/:436 三条 pathtraversal-non-literal-fs-filename（行号按被分析的 60b4bfd 计；
+#     本提交在本文件加了说明注释，落地后在新树里是 :439/:440/:441）—— 落在形状断言用例里，目标分别是
+#     fs.readFileSync(path.join(__dirname, 'xbk_app.js' | 'scripts/status.js' | 'xbk_state_schema.js'))。
+#     路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境、CLI、网络、文件内容或请求；
+#     而且这条断言**必须**读生产源码文本才能成立（要证明「只允许 xbk_state_schema.js 是定义处」），
+#     任何「改成别的读法来绕规则」都会让断言失去意义。真实防线在断言本身：三个文件的源码一旦
+#     重新长出第二份 REPORT_COUNTERS / RUN_SUMMARY_LINE_RE / isValidReportDate，该用例即红。
+#     故按本仓既有口径（scripts/log-archive.js / xbk_storage.js:222 同款）在这三行加行内裸形态
+#     `// nosemgrep（路径 = __dirname + 本文件字面量文件名，非外部输入；真实防线在断言本身）`。
+#     实测口径（本轮踩过，别重犯）：带规则 ID 的精确形态
+#     `// nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename` **未被 Codacy 采纳**——
+#     新 sha 上仍判 3 new issues、annotations 精确落在这三行；裸形态与 xbk_storage.js:222 一致，
+#     已被 Codacy 判绿（Codacy 的 opengrep wrapper 对无 ids 的 nosemgrep 判定 is_ignored，
+#     同 scripts/mutation-report.js:925-927 的口径说明）。
+#   · :94 的 ErrorProne「numeric literal '20260101' will have a different value at runtime」
+#     （行号同按 60b4bfd 计；新树里是 :96）—— 该字面量是 validateReportState({ date: … }) 的
+#     「date 传 number 判非法」用例，20260101 是
+#     ≤2^53 的精确整数、不存在精度损失，属 PMD InnaccurateNumericLiteral 对 8 位数字字面量的误报；
+#     已改写成 Number('20260101')（非字面量表达式，断言未放宽），
+#     用例语义不变（仍走 number 分支，改成字符串就测不到了）。
+# 以上均不涉整文件排除、不删断言，真实断言仍由 npm test / CI 全量执行。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
