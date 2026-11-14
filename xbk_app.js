@@ -2264,12 +2264,80 @@ function createApp ({
     },
 
     // 原 run() 主体：锁已在 run() 里拿到并保证 finally 释放，这里只跑业务。
+    // ============================================================
+    // 运行阶段管线（P1）
+    // ============================================================
+    // `_runLocked` 原本是一段 1000+ 行的方法体：配置校验、抓取、去重、过滤、推送、落盘、
+    // 统计挤在同一层作用域里，任何一处改动都要重读全文，评审也无法从签名看出边界。这里拆成
+    // prepare → fetch → ingest → filter → push → finalize 六个具名阶段，`_runLocked` 只负责
+    // 按序编排与错误映射。
+    //
+    // 约束（P1 验收口径）：
+    //   · 阶段之间只通过 `runCtx` 传状态，不把 `this` 当背包；字段归属见 `_createRunContext`。
+    //   · 行为必须与原实现一致：摘要字段、run.log 行格式、通知标题、重试/退避、推送顺序全部
+    //     沿用原逻辑（本提交只搬运，不重写业务）。
+    //   · 早退协议：阶段返回 `false` 表示「本轮到此为止」，此时 `ctx.summary` 已由该阶段写好，
+    //     `_runLocked` 直接返回这个摘要；其余情况继续下一阶段。异常照旧冒泡到 `_runLocked`
+    //     的 catch（写 ERROR 日志、发告警、重抛），与拆开前完全一致。
+    // ============================================================
+
+    // 原 run() 主体：锁已在 run() 里拿到并保证 finally 释放，这里只跑业务（按阶段编排）。
     async _runLocked () {
+      const ctx = this._createRunContext()
+      try {
+        await this._runPrepare(ctx)
+        await this._runFetch(ctx)
+        // ingest 是唯一有「本轮不再继续」的业务早退（缓存读取失败，防重复轰炸）的阶段，
+        // 它在返回 false 前把摘要写进 ctx.summary；这里显式映射，避免 return 穿透到错误的阶段。
+        if (await this._runIngest(ctx) === false) return ctx.summary
+        await this._runFilter(ctx)
+        await this._runPush(ctx)
+        return await this._runFinalize(ctx)
+      } catch (error) {
+      // 非 Error 抛出（如字符串）时兜底，避免 error.message undefined
+        const errMsg = Utils.safeErrorText(error, Utils.safeText(error, '未知错误'))
+        if (error && error.response) {
+          console.log('请求失败，状态码:', error.response.statusCode)
+        } else if (error && error.code === 'ETIMEDOUT') {
+          console.log('请求超时:', errMsg)
+        } else {
+          console.log('请求错误:', errMsg)
+        }
+        ctx.dumpCheckpoints()
+        // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
+        this._writeRunLog(`${this._localStamp()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`)
+        // v3.123：接口异常告警（限频 + 静默，不影响主流程）
+        // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
+        // dry-run 不允许任何通知副作用；失败仍重抛给调用方/调度器。
+        if (!ctx.dryRun) {
+          try { await this._sendAlert(errMsg, 'run-error') } catch (e) { /* 告警失败不阻塞重抛 */ }
+        }
+        throw error // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
+      } finally {
+      // 后台 DNS/TLS 预热不是业务结果，运行结束或失败时取消未完成请求，避免拖住进程退出。
+      // v3.233：flag 兜底 getNotify() 未 resolve 的竞态——controller 尚未创建时主流程已结束，
+      // then 回调稍后凭 flag 跳过启动，防止预热请求拖住退出。
+        ctx.warmup.cancelled = true
+        if (ctx.warmup.controller) ctx.warmup.controller.abort()
+      }
+    },
+
+    // 本轮运行上下文：阶段之间**唯一**的状态载体。字段按阶段归属分组，避免把整个 `this` 传来传去：
+    //   config/rules      —— prepare 读入的配置引用与「本轮生效」的过滤规则/编译产物/哈希；
+    //   fetched           —— fetch 的抓取结果（数组）；
+    //   counters/candidates/newMessages —— ingest/filter 的去重、过滤、候选集与写缓存数据；
+    //   similar/dedupe/diag —— 近似去重窗口、判重缓存名、过滤诊断收集器；
+    //   push/errors       —— 推送结果、错误收集（摘要 failures 的唯一来源）；
+    //   summary           —— 本轮摘要（finalize 或早退阶段写入，_runLocked 原样返回）。
+    // 计时/预热/checkpoint 也挂在这里：它们跨阶段使用，且必须与旧实现共用同一份闭包状态。
+    _createRunContext () {
       const runStart = Date.now()
       const detailedProfile = process.env.XBK_PROFILE === '2' || PROFILE3
       const checkpointProfile = PROFILE3
       const runMarks = []
       let lastRunMarkMs = runStart
+      // 所有阶段共用同一组 checkpoint 闭包：mark 的「相对本轮开始」与 delta 口径必须与旧实现
+      // 逐字一致，故基准只在这里取一次，阶段内不得自行 Date.now() 建基准。
       const checkpoint = (name, extra = '') => {
         if (!checkpointProfile) return
         const now = Date.now()
@@ -2288,999 +2356,1083 @@ function createApp ({
           console.log(`    ${mark.name}: +${Math.round(mark.ms)}ms${delta}`)
         }
       }
-      let fetchMs = null
-      let preprocessMs = null
-      let cacheMs = null
-      let dnsWarmup = null
-      let tlsWarmup = null
-      let dnsWarmupSettled = false
-      let tlsWarmupSettled = false
-      let warmupController = null
-      let warmupCancelled = false // v3.233：主流程先于 getNotify() resolve 结束时置位，防止预热在 run 结束后启动
       const dryRun = process.env.XBK_DRY_RUN === '1'
-      const preview = (text, desp) => {
-        if (!dryRun) return false
-        console.log(`🧪 预览：${text}\n${desp}`)
-        return true
+      return {
+        runStart,
+        dryRun,
+        detailedProfile,
+        checkpointProfile,
+        checkpoint,
+        dumpCheckpoints,
+        // dry-run 预览：只打一行 console，返回 true 让 pushOne 判「预览不算推送成功」
+        preview: (text, desp) => {
+          if (!dryRun) return false
+          console.log(`🧪 预览：${text}\n${desp}`)
+          return true
+        },
+        // 配置引用（本轮只读）：阶段统一经 ctx.config 读取。唯一例外是 pushInterval 的解析——
+        // C1-017 源码闸门按字面量锁定「解析只有一处」，故 _runPush 仍写 Utils.num(Config.timing.pushInterval, 0)。
+        config: Config,
+        // 配置告警的安全字符串化：脏值（Symbol / 异常 valueOf）不能让告警路径再次崩溃
+        safeConfigText: (value) => {
+          try { return String(value) } catch (e) { return '<不可转换值>' }
+        },
+        // 生效过滤规则：active 每轮新建、只读一次；compiled/hash 是同一份 active 的编译产物
+        rules: { active: null, compiled: null, hash: '' },
+        // 计时（抓取/预处理/落盘三段，统计行与 profile 行共用）
+        timings: { fetchMs: null, preprocessMs: null, cacheMs: null },
+        // 通知通道后台预热（DNS/TLS）：主流程不等它，finally 里取消未完成请求
+        warmup: { dns: null, tls: null, dnsSettled: false, tlsSettled: false, controller: null, cancelled: false },
+        // 抓取结果（数组；非数组在 fetch 阶段当场抛错，不会写进这里）
+        fetched: null,
+        // 本轮计数器：与摘要/run.log 字段一一对应，阶段内不得另开同名局部变量
+        counters: { dedup: 0, similar: 0, filtered: 0, truncated: 0, bad: 0, noIdentity: 0, regTime: 0 },
+        // 候选项（过了规则过滤、待推送）与本轮全量新数据（写缓存用）
+        candidates: [],
+        newMessages: [],
+        // 近似去重窗口（标题/内容指纹）+ 拦截明细：读取在 ingest，落盘在 finalize
+        similar: { path: '', now: 0, recent: [], batch: [], blocked: [], overflow: 0, blockedAt: '', drop: 0, corrupt: false, logged: 0 },
+        // 判重缓存名（按推送源派生）：ingest 建索引、finalize 落盘都用它，故跨阶段显式传递
+        dedupe: { cacheName: '' },
+        // 过滤诊断收集器（条数/字节预算、reason 计数、明细数组），由 _createFilterDiagnostics 建
+        diag: null,
+        // 推送：渲染/发送函数、成功键、截断键、逐条结果（摘要 failures 见 errors）
+        push: { keyOf: null, urlOf: null, itemLogText: null, pushOne: null, results: [], pushedKeys: new Set(), truncatedKeys: new Set(), success: 0, startTime: null, notifyModule: null },
+        // 错误收集：summarizeError 的结果（摘要 failures 的唯一来源）
+        errors: [],
+        // 本轮摘要：finalize 或早退阶段写入，_runLocked 原样返回
+        summary: null
       }
-      console.debug('开始获取线报酷数据...')
-      checkpoint('run-start')
-      // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
-      // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
+    },
+
+    // 通知通道预热（DNS/TLS）：与主流程并行，失败一律吞掉、不影响本轮（旧实现同口径）。
+    // 单独成方法而不是塞进 _runPrepare，是因为它持有跨阶段的 controller/cancelled 状态、由
+    // finally 取消：阶段函数只读 ctx.warmup 的结果，不直接碰这个 Promise。
+    _startNotifyWarmup (ctx) {
+      const warmup = ctx.warmup
+      const dryRun = ctx.dryRun
+      const checkpoint = ctx.checkpoint
       const warmupPromise = getNotify().then((notifyModule) => {
       // dry-run 只保留主数据抓取；通知通道的 DNS/TLS 预热也会发起外部连接，必须跳过。
         if (dryRun) {
-          dnsWarmup = { ok: true, skipped: true }
-          tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 }
-          dnsWarmupSettled = true
-          tlsWarmupSettled = true
+          warmup.dns = { ok: true, skipped: true }
+          warmup.tls = { ok: true, skipped: true, okCount: 0, count: 0 }
+          warmup.dnsSettled = true
+          warmup.tlsSettled = true
           checkpoint('warmup-skipped', 'dry-run')
           return null
         }
         const hasWxPusher = Boolean(notifyModule && typeof notifyModule.hasWxPusherConfigured === 'function' &&
                     notifyModule.hasWxPusherConfigured())
         if (!hasWxPusher) {
-          dnsWarmup = { ok: true, skipped: true }
-          tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 }
-          dnsWarmupSettled = true
-          tlsWarmupSettled = true
+          warmup.dns = { ok: true, skipped: true }
+          warmup.tls = { ok: true, skipped: true, okCount: 0, count: 0 }
+          warmup.dnsSettled = true
+          warmup.tlsSettled = true
           checkpoint('warmup-skipped', 'wxpusher=unconfigured')
           return null
         }
         // v3.233：主流程已结束（finally 置位）但 getNotify() 此刻才 resolve——不再启动预热，
         // 否则 controller 刚创建而 run 已退出，无人取消请求会拖住进程。
-        if (warmupCancelled) {
-          dnsWarmup = { ok: true, skipped: true }
-          tlsWarmup = { ok: true, skipped: true, okCount: 0, count: 0 }
-          dnsWarmupSettled = true
-          tlsWarmupSettled = true
+        if (warmup.cancelled) {
+          warmup.dns = { ok: true, skipped: true }
+          warmup.tls = { ok: true, skipped: true, okCount: 0, count: 0 }
+          warmup.dnsSettled = true
+          warmup.tlsSettled = true
           checkpoint('warmup-cancelled', 'run-finished-before-load')
           return null
         }
-        warmupController = typeof AbortController === 'function' ? new AbortController() : null
-        const signal = warmupController ? warmupController.signal : null
+        warmup.controller = typeof AbortController === 'function' ? new AbortController() : null
+        const signal = warmup.controller ? warmup.controller.signal : null
         const dnsWarmupPromise = Promise.resolve(prewarmDns('wxpusher.zjiecode.com', signal))
-          .then((result) => { dnsWarmup = result; dnsWarmupSettled = true; return result })
-          .catch((error) => { dnsWarmup = { ok: false, error: String(error) }; dnsWarmupSettled = true; return dnsWarmup })
+          .then((result) => { warmup.dns = result; warmup.dnsSettled = true; return result })
+          .catch((error) => { warmup.dns = { ok: false, error: String(error) }; warmup.dnsSettled = true; return warmup.dns })
         const prewarmCount = (() => {
           // C1-026：预热发生在拿到数据之前，条目数未知——把单轮上限 maxPerRun 作为「消息总数」输入，
           // 走与并行 worker 同一个 resolveParallelWindow（不再单独夹到 10，连接数才真的与并发窗口一致）。
-          const maxPerRun = Utils.num(Config.push.maxPerRun, 100)
+          const maxPerRun = Utils.num(ctx.config.push.maxPerRun, 100)
           const batch = Number.isInteger(maxPerRun) && maxPerRun > 0 ? maxPerRun : 100
-          return resolveParallelWindow(Config.push.parallelLimit, batch)
+          return resolveParallelWindow(ctx.config.push.parallelLimit, batch)
         })()
         // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
         const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
-          .then((result) => { tlsWarmup = result; tlsWarmupSettled = true; return result })
-          .catch((error) => { tlsWarmup = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; tlsWarmupSettled = true; return tlsWarmup })
+          .then((result) => { warmup.tls = result; warmup.tlsSettled = true; return result })
+          .catch((error) => { warmup.tls = { ok: false, okCount: 0, count: prewarmCount, error: String(error) }; warmup.tlsSettled = true; return warmup.tls })
         checkpoint('warmup-started', `tlsCount=${prewarmCount}`)
         return Promise.all([dnsWarmupPromise, tlsWarmupPromise])
       }).catch((error) => {
-        dnsWarmup = { ok: false, error: String(error) }
-        tlsWarmup = { ok: false, okCount: 0, count: 0, error: String(error) }
-        dnsWarmupSettled = true
-        tlsWarmupSettled = true
+        warmup.dns = { ok: false, error: String(error) }
+        warmup.tls = { ok: false, okCount: 0, count: 0, error: String(error) }
+        warmup.dnsSettled = true
+        warmup.tlsSettled = true
         return null
       })
       // 显式接住后台预热 Promise；主流程不等待它。
       warmupPromise.catch(() => {})
-      try {
-        MessageStore.init()
-        // CR-03：不在此处缓存 cacheDir——init 只保证「此刻」目录可用，后续每行日志/状态文件都要
-        // 重新过 getter 的 lstat+realpath 校验（运行期目录被替换成外部符号链接时必须当场失败）。
-        checkpoint('cache-init')
-        // C1-009：dry-run 也走这条链（内部 dryRun 分支只写 console/run.log，不发告警、不写标记）
-        await this._warnMissingRe2({ dryRun })
-        this._warnLowDisk()
-        checkpoint('disk-check')
+      return warmupPromise
+    },
 
-        // ①′ 每轮读取过滤规则覆盖文件（<cacheDir>/filter-rules.json）——「保存后下一轮生效」的唯一入口。
-        // 必须放在本轮开头且只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则；
-        // active 每轮新建，禁止提升到模块级（否则常驻进程会跨轮陈旧，控制台的修改永不生效）。
-        // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
-        // 降级顺序是「进程内缓存 → 持久 LKG <缓存目录>/filter-rules.lastgood.json → 代码默认」：
-        // 新进程（控制台 auto-run 每 5 秒 spawn 一轮）没有进程内缓存，仍会先读持久 LKG，
-        // 只有连持久 LKG 也不可用时才回代码默认。
-        const active = FilterStore.loadFilterRules({
-          cacheDir: this._cacheDir(),
-          defaults: Config.filter,
-          keyword: Config.keyword,
-          // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
-          // 会被当成 last-known-good，而运行期 compileRules 跳过坏规则后本方法仍推进 filter.hash
-          // 并清 _f ⇒ 被过滤记录补推且无损坏告警。缺 RE2 时 FilterStore 自行跳过深度校验
-          // （读路径仍能读合法文件），故这里传 re2Available 而不是让存储层猜。
-          deps: { RuleEngine, compileUserRegex, re2Available: Boolean(RE2C) }
-        })
-        if (active.degraded) {
-          // 三处告警之一（console.warn / run.log WARN / 控制台红条由 console 侧读 GET source 呈现）。
-          // 降级不放宽规则、不把规则置空，也不进入下方的 filter.hash 比对/_f 清理（见 ③b 的 !active.degraded 闸）。
-          const corruptReason = (active.error && active.error.message) || '未知原因'
-          const corruptCode = (active.error && active.error.code) || 'store_corrupt'
-          console.warn(`⚠️ 过滤规则覆盖文件损坏（source=corrupt, code=${corruptCode}, lastGoodUsed=${active.lastGoodUsed}）：${corruptReason}——本轮沿用${active.lastGoodUsed ? '上一次合法规则' : '代码默认规则'}，不清 _f、不推进 filter.hash`)
-          this._writeRunLog(`${this._localStamp()} WARN 过滤规则覆盖文件损坏：${String(corruptReason).replace(/[\r\n]+/g, ' ')}（source=corrupt, lastGoodUsed=${active.lastGoodUsed}，本轮不清 _f、不推进 filter.hash）\n`)
-        }
+    // 过滤诊断收集器：条数上限 + 单轮字节预算 + 按 reason 计数 + 明细数组。
+    // 抽成独立工厂而不是散在 ingest/filter 里，是因为「谁先被评估谁先占坑」的预算语义跨两个
+    // 阶段（④ 规则过滤与 ⑤ 只看它）：拆开各带一份计数器，被挤掉的条数就会双计（C1-029）。
+    _createFilterDiagnostics (ctx) {
+      const active = ctx.rules.active
+      const filterLogCfg = ctx.config.diagnostics && ctx.config.diagnostics.filterLog
+      const includePassedDiagnostics = this._enabledFlag({ enabled: filterLogCfg && filterLogCfg.includePassed })
+      const maxDiagnosticDetails = (() => {
+        const value = Utils.num(filterLogCfg && filterLogCfg.maxDetailsPerRun, 100)
+        return Number.isInteger(value) && value > 0 ? Math.min(value, 1000) : 100
+      })()
+      // v3.395：诊断明细不再写整份规则文本。`explainFilter` 的 reason.rule 对「### 多行规则」
+      // 是命中行（有价值，原样保留），但对按行写的简单字段是**整段配置**（实测 3374 字符/688 行），
+      // 一条 item 被放大到约 7 KB，1 MiB 日志窗口只够装约 35 分钟。这里在序列化边界折叠：
+      // 短规则原样透传（既有断言与预览语义不变）；超长规则截断并附长度/行数/两个指纹：
+      //   · ruleHash  —— 命中行（reason.rule）的 sha1 前 8 位；
+      //   · fieldHash —— 整个字段配置的 sha1 前 8 位，配合 ruleRev 回查 filter-rules.applied.json
+      //                  / .bak.<rev>.json 的 filter[configKey] 原文（### 命中行也定位得到）。
+      const DIAG_RULE_TEXT_MAX = 120
+      // 单轮明细总字节预算：保证「汇总 + 明细」不会写满 1 MiB 日志、把写在最前的 run 汇总挤掉
+      // （_writeRunLog 超限只保留尾部 512 KiB，旧实现里一轮 1000 条 × 长规则足够触发）。
+      const DIAG_BATCH_MAX_BYTES = 192 * 1024
+      const sha1Short = (text) => {
+        try { return crypto.createHash('sha1').update(text, 'utf8').digest('hex').slice(0, 8) } catch (e) { return '' }
+      }
+      // 行数按规则解析器认的分隔符统计（\r\n / \r / \n / <br>），并忽略结尾空行
+      const ruleLineCount = (text) => {
+        const parts = String(text).split(/\r\n|\r|\n|<br\s*\/?>/i)
+        while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
+        return parts.length
+      }
+      const thinReason = (value) => {
+        if (!value || typeof value !== 'object') return value
+        const raw = typeof value.rule === 'string' ? value.rule : (value.rule == null ? '' : String(value.rule))
+        const fieldText = active && active.filter && value.configKey ? String(active.filter[value.configKey] || '') : ''
+        const out = { ...value }
+        if (active && Number.isInteger(active.revision)) out.ruleRev = active.revision
+        if (raw.length <= DIAG_RULE_TEXT_MAX) return out
+        out.rule = Utils.truncateUtf16(raw, DIAG_RULE_TEXT_MAX)
+        out.ruleLen = raw.length
+        out.ruleLines = ruleLineCount(raw)
+        out.ruleHash = sha1Short(raw)
+        out.fieldHash = sha1Short(fieldText || raw)
+        return out
+      }
+      const thinReasonList = (list) => (Array.isArray(list) ? list.map(thinReason) : list)
+      const diagnosticItem = (item, decision, explanation) => ({
+        type: 'item',
+        at: this._localStamp(),
+        decision,
+        id: Utils.safeText(Utils.safeGet(item, 'id'), ''),
+        title: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'title'), ''), 200),
+        category: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'catename'), ''), 100),
+        reason: thinReason(explanation.reason),
+        protections: thinReasonList(explanation.protections),
+        skipped: thinReasonList(explanation.skipped)
+      })
+      let diagnosticBytes = 0
+      const records = []
+      // 统一入队口：条数上限 + 单轮字节预算，超限返回 false 交给调用方记 detailsDropped
+      const pushDiagnostic = (item, decision, explanation) => {
+        const record = diagnosticItem(item, decision, explanation)
+        let size = 0
+        try { size = Buffer.byteLength(JSON.stringify(record), 'utf8') } catch (e) { size = 0 }
+        if (diagnosticBytes + size > DIAG_BATCH_MAX_BYTES) return false
+        diagnosticBytes += size
+        records.push(record)
+        return true
+      }
+      return {
+        records,
+        drops: { passed: 0, filtered: 0 },
+        passedDropItems: new Set(),
+        reasonCounts: {},
+        explanations: new Map(),
+        includePassed: includePassedDiagnostics,
+        maxDetails: maxDiagnosticDetails,
+        push: pushDiagnostic,
+        thinReason,
+        thinReasonList
+      }
+    },
 
-        // ① 校验配置
-        const warnings = RuleEngine.validateConfig({ ...active.filter, zkt_gjc: active.keyword.zkt_gjc })
-        // CodeRabbit：zkt_gjc 在 keyword 下（validateConfig 只收 filter 配置时该字段恒为 undefined，
-        // 首尾空白/非法正则告警在正常执行时永不触发）——显式传入本轮生效的 keyword 使告警生效
-        for (const w of warnings) console.warn(w)
+    // ① 准备：缓存目录/磁盘自检、读本轮生效的过滤规则、校验配置、编译规则、写生效快照。
+    // 同时启动通知通道后台预热（旧实现在业务体之前就发起，这里顺序不变）。
+    async _runPrepare (ctx) {
+      const { dryRun, checkpoint } = ctx
+      const config = ctx.config
+      console.debug('开始获取线报酷数据...')
+      checkpoint('run-start')
+      // ③ 拉取数据：仅在实际配置 WxPusher 时预解析域名并后台预建 HTTPS 连接。
+      // 预热可被主流程结束时取消，避免“未 await”仍因活动 socket 延长进程退出。
+      this._startNotifyWarmup(ctx)
+      MessageStore.init()
+      // CR-03：不在此处缓存 cacheDir——init 只保证「此刻」目录可用，后续每行日志/状态文件都要
+      // 重新过 getter 的 lstat+realpath 校验（运行期目录被替换成外部符号链接时必须当场失败）。
+      checkpoint('cache-init')
+      // C1-009：dry-run 也走这条链（内部 dryRun 分支只写 console/run.log，不发告警、不写标记）
+      await this._warnMissingRe2({ dryRun })
+      this._warnLowDisk()
+      checkpoint('disk-check')
 
-        // 配置告警显示统一安全字符串化：脏值（Symbol / 异常 valueOf）不能让告警路径再次崩溃。
-        const safeConfigText = (value) => {
-          try { return String(value) } catch (e) { return '<不可转换值>' }
-        }
+      // ①′ 每轮读取过滤规则覆盖文件（<cacheDir>/filter-rules.json）——「保存后下一轮生效」的唯一入口。
+      // 必须放在本轮开头且只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则；
+      // active 每轮新建，禁止提升到模块级（否则常驻进程会跨轮陈旧，控制台的修改永不生效）。
+      // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
+      // 降级顺序是「进程内缓存 → 持久 LKG <缓存目录>/filter-rules.lastgood.json → 代码默认」：
+      // 新进程（控制台 auto-run 每 5 秒 spawn 一轮）没有进程内缓存，仍会先读持久 LKG，
+      // 只有连持久 LKG 也不可用时才回代码默认。
+      const active = FilterStore.loadFilterRules({
+        cacheDir: this._cacheDir(),
+        defaults: config.filter,
+        keyword: config.keyword,
+        // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
+        // 会被当成 last-known-good，而运行期 compileRules 跳过坏规则后本方法仍推进 filter.hash
+        // 并清 _f ⇒ 被过滤记录补推且无损坏告警。缺 RE2 时 FilterStore 自行跳过深度校验
+        // （读路径仍能读合法文件），故这里传 re2Available 而不是让存储层猜。
+        deps: { RuleEngine, compileUserRegex, re2Available: Boolean(RE2C) }
+      })
+      ctx.rules.active = active
+      if (active.degraded) {
+        // 三处告警之一（console.warn / run.log WARN / 控制台红条由 console 侧读 GET source 呈现）。
+        // 降级不放宽规则、不把规则置空，也不进入下方的 filter.hash 比对/_f 清理（见 ③b 的 !active.degraded 闸）。
+        const corruptReason = (active.error && active.error.message) || '未知原因'
+        const corruptCode = (active.error && active.error.code) || 'store_corrupt'
+        console.warn(`⚠️ 过滤规则覆盖文件损坏（source=corrupt, code=${corruptCode}, lastGoodUsed=${active.lastGoodUsed}）：${corruptReason}——本轮沿用${active.lastGoodUsed ? '上一次合法规则' : '代码默认规则'}，不清 _f、不推进 filter.hash`)
+        this._writeRunLog(`${this._localStamp()} WARN 过滤规则覆盖文件损坏：${String(corruptReason).replace(/[\r\n]+/g, ' ')}（source=corrupt, lastGoodUsed=${active.lastGoodUsed}，本轮不清 _f、不推进 filter.hash）\n`)
+      }
 
-        // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
-        // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
-        if (!Number.isInteger(Utils.num(Config.cache.maxSize, -1)) || Utils.num(Config.cache.maxSize, -1) <= 0) {
-          console.warn(`⚠️ 配置「cache.maxSize」为「${safeConfigText(Config.cache.maxSize)}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`)
-        }
+      // ① 校验配置
+      const warnings = RuleEngine.validateConfig({ ...active.filter, zkt_gjc: active.keyword.zkt_gjc })
+      // CodeRabbit：zkt_gjc 在 keyword 下（validateConfig 只收 filter 配置时该字段恒为 undefined，
+      // 首尾空白/非法正则告警在正常执行时永不触发）——显式传入本轮生效的 keyword 使告警生效
+      for (const w of warnings) console.warn(w)
 
-        // 域名校验（v3.73）：非法 URL 会让 fetchData 重试耗尽才报错，配置层提前提示
-        // v3.265：先 trim 再校验——与 baseUrl/pushUrl 的 trimTrailingSlashes(trim()) 使用口径一致，
-        // 避免「带首尾空格的合法 domain」被误报非法（CodeAnt PR24 完整审核）
-        if (typeof Config.domain !== 'string' || !/^https?:\/\//.test(Config.domain.trim())) {
-          console.warn(`⚠️ 配置「domain」为「${safeConfigText(Config.domain)}」不是 http(s):// 开头的合法地址`)
-        }
+      // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
+      // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
+      if (!Number.isInteger(Utils.num(config.cache.maxSize, -1)) || Utils.num(config.cache.maxSize, -1) <= 0) {
+        console.warn(`⚠️ 配置「cache.maxSize」为「${ctx.safeConfigText(config.cache.maxSize)}」不是正整数，已回退默认 ${DEFAULT_MAX_SIZE}`)
+      }
 
-        // 模板校验（v3.80 + v3.159）：v3.258 提取到 _validateTplConfig（口径不变，返回警告数组）
-        for (const w of this._validateTplConfig()) console.warn(w)
+      // 域名校验（v3.73）：非法 URL 会让 fetchData 重试耗尽才报错，配置层提前提示
+      // v3.265：先 trim 再校验——与 baseUrl/pushUrl 的 trimTrailingSlashes(trim()) 使用口径一致，
+      // 避免「带首尾空格的合法 domain」被误报非法（CodeAnt PR24 完整审核）
+      if (typeof config.domain !== 'string' || !/^https?:\/\//.test(config.domain.trim())) {
+        console.warn(`⚠️ 配置「domain」为「${ctx.safeConfigText(config.domain)}」不是 http(s):// 开头的合法地址`)
+      }
 
-        // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
-        // v3.175：校验用 Utils.num 口径——字符串配置（'5000' 环境变量场景）曾误报「不是有效值」
-        // （Number.isFinite('5000')=false，但 Utils.num 已生效——假警告误导用户）
-        const numConfig = [
-          ['api.timeout', Config.api.timeout, (v) => Utils.num(v, -1) > 0],
-          ['api.retry', Config.api.retry, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n >= 0 }],
-          ['timing.pushInterval', Config.timing.pushInterval, (v) => Utils.num(v, -1) >= 0],
-          ['timing.finalWait', Config.timing.finalWait, (v) => Utils.num(v, -1) >= 0],
-          ['push.parallelLimit', Config.push.parallelLimit, (v) => Utils.num(v, -1) >= 0],
-          ['push.maxPerRun', Config.push.maxPerRun, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n > 0 }]
-        ]
-        for (const [name, val, ok] of numConfig) {
-          if (!ok(val)) {
-            let display
-            try { display = String(val) } catch (e) { display = '<不可转换值>' }
-            console.warn(`⚠️ 配置「${name}」为「${display}」不是有效值，已按内部防御逻辑处理（建议修正）`)
-          }
-        }
-        checkpoint('config-validated')
+      // 模板校验（v3.80 + v3.159）：v3.258 提取到 _validateTplConfig（口径不变，返回警告数组）
+      for (const w of this._validateTplConfig()) console.warn(w)
 
-        // ② 预编译规则（只执行一次）
-        const compiledRules = RuleEngine.compileRules(active.filter)
-        checkpoint('rules-compiled')
+      // 运行时数值配置校验（函数层已有防御，配置层补提示——#7 同款精神，v3.64）
+      // v3.175：校验用 Utils.num 口径——字符串配置（'5000' 环境变量场景）曾误报「不是有效值」
+      // （Number.isFinite('5000')=false，但 Utils.num 已生效——假警告误导用户）
+      const numConfig = [
+        ['api.timeout', config.api.timeout, (v) => Utils.num(v, -1) > 0],
+        ['api.retry', config.api.retry, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n >= 0 }],
+        ['timing.pushInterval', config.timing.pushInterval, (v) => Utils.num(v, -1) >= 0],
+        ['timing.finalWait', config.timing.finalWait, (v) => Utils.num(v, -1) >= 0],
+        ['push.parallelLimit', config.push.parallelLimit, (v) => Utils.num(v, -1) >= 0],
+        ['push.maxPerRun', config.push.maxPerRun, (v) => { const n = Utils.num(v, -1); return Number.isInteger(n) && n > 0 }]
+      ]
+      for (const [name, val, ok] of numConfig) {
+        if (!ok(val)) {
+          let display
+          try { display = String(val) } catch (e) { display = '<不可转换值>' }
+          console.warn(`⚠️ 配置「${name}」为「${display}」不是有效值，已按内部防御逻辑处理（建议修正）`)
+        }
+      }
+      checkpoint('config-validated')
 
-        // 生效哈希只算一次：既用于写 applied 快照，也用于 ③b 的 filter.hash 比对（原 1125 处复用本值）。
-        const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
-        // 生效快照：证明「本轮实际用的是哪一版规则」，供控制台显示「已生效 rN」。写失败只告警，绝不抛穿本轮推送。
-        if (!FilterStore.writeAppliedSnapshot({
-          cacheDir: this._cacheDir(),
-          filter: active.filter,
-          keyword: active.keyword,
-          revision: active.revision,
-          source: active.source,
-          hash: filterHash,
-          // F4-1：把「本轮是否沿用了持久 LKG」一起写进快照——控制台 GET 只认这个运行侧事实，
-          // 不得用控制台进程自己的 lastGood 冒充。
-          lastGoodUsed: active.lastGoodUsed
-        })) {
-          console.warn('⚠️ 过滤规则生效快照写入失败（不影响本轮过滤/推送，下一轮会重试）')
-          this._writeRunLog(`${this._localStamp()} WARN 过滤规则生效快照写入失败（不影响本轮过滤/推送）\n`)
-        }
+      // ② 预编译规则（只执行一次）
+      const compiledRules = RuleEngine.compileRules(active.filter)
+      ctx.rules.compiled = compiledRules
+      checkpoint('rules-compiled')
 
-        const fetchStart = Date.now()
-        const xbkdata = await Network.fetchData()
-        fetchMs = Date.now() - fetchStart
-        checkpoint('api-fetch-complete', `items=${Array.isArray(xbkdata) ? xbkdata.length : 'invalid'} fetchMs=${fetchMs}`)
-        checkpoint('dns-warmup-observed', dnsWarmupSettled && dnsWarmup ? `ok=${dnsWarmup.ok} elapsedMs=${dnsWarmup.elapsedMs}` : 'pending')
-        if (!Array.isArray(xbkdata)) {
-        // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
-          throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`)
-        }
+      // 生效哈希只算一次：既用于写 applied 快照，也用于 ③b 的 filter.hash 比对（原 1125 处复用本值）。
+      const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
+      ctx.rules.hash = filterHash
+      // 生效快照：证明「本轮实际用的是哪一版规则」，供控制台显示「已生效 rN」。写失败只告警，绝不抛穿本轮推送。
+      if (!FilterStore.writeAppliedSnapshot({
+        cacheDir: this._cacheDir(),
+        filter: active.filter,
+        keyword: active.keyword,
+        revision: active.revision,
+        source: active.source,
+        hash: filterHash,
+        // F4-1：把「本轮是否沿用了持久 LKG」一起写进快照——控制台 GET 只认这个运行侧事实，
+        // 不得用控制台进程自己的 lastGood 冒充。
+        lastGoodUsed: active.lastGoodUsed
+      })) {
+        console.warn('⚠️ 过滤规则生效快照写入失败（不影响本轮过滤/推送，下一轮会重试）')
+        this._writeRunLog(`${this._localStamp()} WARN 过滤规则生效快照写入失败（不影响本轮过滤/推送）\n`)
+      }
+    },
 
-        // ③b 字段归一化 + ④ 去重/全局过滤（合并为一次遍历，顺序保证：校验→归一化→判重）
-        let items = []
-        let dedupCount = 0
-        // v3.397：近似去重（标题相似度 + 10 分钟窗）——拦同一句话改几个字重发，ID/URL/标题精确去重抓不到。
-        let similarCount = 0
-        // v3.410：拦截明细（最多 SIMILAR_BLOCKED_MAX_RECORDS 条，超出只计数）。只留痕，不参与判定。
-        const similarBlocked = []
-        let similarOverflow = 0
-        let similarBlockedAt = '' // 本轮本地时间戳（与 run.log 同格式），首次命中才取
-        // v3.407（F3-4）：本轮窗口落盘失败的条数，摘要行 similardrop=N 的唯一来源。
-        let similarDrop = 0
-        let filteredCount = 0
-        let truncatedCount = 0 // v3.145：maxPerRun 截断数计入统计（曾凭空消失）
-        const cacheName = MessageStore.getFileName(Config.api.pushUrl)
-        // 与判重缓存同源命名：一个推送源一份窗口，避免不同来源互相压制（也让测试按 pushUrl 天然隔离）
-        const similarPath = path.join(this._cacheDir(), `similar-${cacheName}`)
-        const similarNow = Date.now()
-        let recentTitles = []
-        const batchTitles = []
-        // F3-1：只有确定性损坏（unsafe / tooLarge / 重读后仍解析失败）才会置位并在轮末隔离；
-        // replaced / ioError 重读后仍失败只按空窗口处理，绝不 rename。
-        const similarWindow = this._readSimilarWindow(similarPath)
-        const similarCorrupt = similarWindow.corrupt
-        if (similarWindow.status !== 'ok' && similarWindow.status !== 'missing' && similarWindow.status !== 'empty') {
-          const detail = similarWindow.status === 'invalid'
-            ? `解析失败：${Utils.safeErrorText(similarWindow.error, '未知错误')}`
-            : `不可用（${similarWindow.status}）`
-          console.warn(`⚠️ 近似去重缓存${detail}，本轮按空窗口处理${similarCorrupt ? '（确定性损坏，轮末隔离原件并重建）' : '（瞬时读失败，保留原文件、绝不隔离）'}：${similarPath}`)
-        }
-        if (similarWindow.status === 'ok') {
-          // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
-          // 只要求 c（v3.398 起的行都有）；p/x 缺失按空串处理，升级时不丢最近窗口
-          recentTitles = Similar.pruneRecent(similarWindow.entries.filter(e => e && typeof e.c === 'string'), similarNow)
-        }
-        // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
-        // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
-        // FILTER-01 / RULES-05：哈希除配置字节外还折入「规则实际编译生效」维度
-        // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
-        // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
-        // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
-        // ③b 规则变更 ⇒ 失效「过滤写入」缓存（覆盖文件损坏时的跳过判据在方法内）。**顺序不变式**：
-        // 必须先于下方 MessageStore.readMessages(cacheFilePath) 建判重索引——否则被清掉 _f 的条目
-        // 已经进了 cacheIds/墓碑索引，本轮仍被判重跳过，改宽规则后静默漏推（回归用例 ORD-1 锁住这条）。
-        this._invalidateFilteredCache({ active, cacheName, filterHash, dryRun })
-        const newMessages = []
-        // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
-        // 接口异常返回海量数据（maxPerRun 想防的同一场景）时判重卡死——实测 N=2万/M=1万 → 11.6s，
-        // 外推 N=10万 → ~60s（cron 长时间挂起）。改为循环前一次性构建缓存三索引（O(M)），
-        // 与批内三索引合并判重 → 全程 O(N+M)。三个 Set 与 _findDedupIndex 三条件同构，
-        // 等价性由属性测试证明（800 轮含缓存非空场景，0 失配）
-        const cacheFilePath = MessageStore.getFilePath(cacheName)
-        const cacheMsgs = MessageStore.readMessages(cacheFilePath)
-        // F1（P1）：读侧可能已把「坏/超限缓存」改名隔离并重建（只隔离不删除）。旧行为下这种情形走
-        // 下面的零推送闸门（run.log ERROR + 告警 + 非零退出码），修复后本轮照常推送——若不留痕，
-        // 磁盘上多出的 .corrupt.*.bak 与「未读到的旧身份未落墓碑 ⇒ 可能重推」就成了静默降级。
-        // 摘要/退出码口径刻意不动（APP-03 契约：cacheSaved 只说落盘，隔离不等于本轮失败），
-        // 只补 run.log 一行 WARN + 控制台告警。
-        for (const ev of MessageStore._drainRecoveryEvents()) {
-          this._writeRunLog(`${this._localStamp()} WARN 缓存${ev.label}：原件已改名隔离保留为 ${ev.backupPath}（重建 ${ev.recovered} 条、落墓碑 ${ev.dropped} 条；未读到的旧身份可能重推）\n`)
-          console.warn(`⚠️ 缓存${ev.label}：原件已隔离保留为 ${ev.backupPath}（重建 ${ev.recovered} 条，判错方向 = 可能重推）`)
-        }
-        if (MessageStore._readFailed[cacheFilePath]) {
-          console.error('缓存读取失败，跳过本轮推送以防重复轰炸')
-          // P1（审查 2026-08-15）：此路径曾直接 return undefined——退出码 0 + 零告警 + 零日志，
-          // 缓存持续损坏时 cron 每次「绿色成功」却零推送零告警，静默漏推。与 catch 路径同口径可观测：
-          // 写 run.log ERROR + 告警（测试默认关 alert 不污染推送计数）+ 返回带失败语义的摘要，
-          // 使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码，调度感知失败。
-          this._writeRunLog(`${this._localStamp()} ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）${cacheFilePath}\n`)
-          try { await this._sendAlert(`缓存读取失败，本轮推送已跳过（防重复轰炸）：${cacheFilePath}`, 'cache-read') } catch (e) { /* 告警失败不阻塞 */ }
-          return {
-            total: xbkdata.length,
-            dedup: 0,
-            filtered: 0,
-            truncated: 0,
-            pushed: 0,
-            failed: xbkdata.length,
-            failures: []
-          }
-        }
-        const cacheIds = new Set() // 缓存中有 id 条目的 String(id)
-        const cacheUrls = new Set() // 缓存中所有有 URL 条目的 validUrl
-        const cacheNoIdUrls = new Set() // 缓存中无 id 有 URL 条目的 validUrl
-        const cacheAnonKeys = new Set() // 缓存中无 id/URL 条目的 anonKey
-        for (const m of cacheMsgs) {
-          const identity = Utils.getMessageIdentity(m)
-          if (!identity.valid) continue
-          if (identity.kind === 'id') cacheIds.add(identity.idKey)
-          if (identity.url) {
-            cacheUrls.add(identity.url)
-            if (identity.kind === 'url') cacheNoIdUrls.add(identity.url)
-          }
-          if (identity.kind === 'anon') cacheAnonKeys.add(identity.key)
-        }
-        // P4（CodeAnt）：并入墓碑身份——字节/条数裁剪丢弃的记录身份仍参与判重，防重放重复推送。
-        // 统一走 MessageStore._tombstoneSetsHas（与 has/save/saveBatch 同一判重接口，避免语义漂移）
-        // v3.228：批内与跨运行统一使用 getMessageIdentity；保留 id/url 的双向 fallback，
-        // 另为无标识数据维护 anonKey 集合，避免各入口各自拼接 url:/id: 键。
-        const batchIds = new Set()
-        const batchUrls = new Set()
-        const batchNoIdUrls = new Set()
-        const batchAnonKeys = new Set()
+    // ③ 抓取：只负责网络取数与「返回必须是数组」的契约校验。
+    // 分页/重试/退避参数全在 Network.fetchData 内部（本阶段不复制、不改动）。
+    async _runFetch (ctx) {
+      const fetchStart = Date.now()
+      const xbkdata = await Network.fetchData()
+      ctx.timings.fetchMs = Date.now() - fetchStart
+      ctx.checkpoint('api-fetch-complete', `items=${Array.isArray(xbkdata) ? xbkdata.length : 'invalid'} fetchMs=${ctx.timings.fetchMs}`)
+      ctx.checkpoint('dns-warmup-observed', ctx.warmup.dnsSettled && ctx.warmup.dns ? `ok=${ctx.warmup.dns.ok} elapsedMs=${ctx.warmup.dns.elapsedMs}` : 'pending')
+      if (!Array.isArray(xbkdata)) {
+      // 接口返回格式异常时不盲跑 for 循环，抛错让调度感知
+        throw new Error(`接口返回数据格式异常：期望数组，实际为 ${xbkdata === null ? 'null' : typeof xbkdata}`)
+      }
+      ctx.fetched = xbkdata
+    },
 
-        const filterDiagnostics = []
-        // C1-029：明细预算（maxDetailsPerRun）是先到先得 —— 谁先被评估谁先占坑。旧实现被挤掉的
-        // 明细**不留痕**：detailCount 恰好等于预算，文件里看起来「全记下了」，运维修过滤规则时
-        // 会以为「屏蔽项只有这几条」。这里按 decision 分类记被挤掉的条数，随 run 记录落盘。
-        const diagnosticDrops = { passed: 0, filtered: 0 }
-        // C1-029 返工：⑤「只看它」（zkt_gjc）会在④「通过项」之后再把条目拒掉。一条明细若在④已因
-        // 预算被记进 detailsDropped.passed，到⑤又被拒，就该按**最终决策**改记到 filtered——两个计数器
-        // 各记一次会把「被挤掉条数」算成条目数的两倍（3 条数据能报出 1 条明细 + 4 条被挤掉）。
-        // 这里登记「已按 passed 记过被挤掉」的条目，⑤ 拒掉时改记（passed-- / filtered++）。
-        const passedDropItems = new Set()
-        const filterReasonCounts = {}
-        const filterExplanations = new Map()
-        const filterLogCfg = Config.diagnostics && Config.diagnostics.filterLog
-        const includePassedDiagnostics = this._enabledFlag({ enabled: filterLogCfg && filterLogCfg.includePassed })
-        const maxDiagnosticDetails = (() => {
-          const value = Utils.num(filterLogCfg && filterLogCfg.maxDetailsPerRun, 100)
-          return Number.isInteger(value) && value > 0 ? Math.min(value, 1000) : 100
-        })()
-        // v3.395：诊断明细不再写整份规则文本。`explainFilter` 的 reason.rule 对「### 多行规则」
-        // 是命中行（有价值，原样保留），但对按行写的简单字段是**整段配置**（实测 3374 字符/688 行），
-        // 一条 item 被放大到约 7 KB，1 MiB 日志窗口只够装约 35 分钟。这里在序列化边界折叠：
-        // 短规则原样透传（既有断言与预览语义不变）；超长规则截断并附长度/行数/两个指纹：
-        //   · ruleHash  —— 命中行（reason.rule）的 sha1 前 8 位；
-        //   · fieldHash —— 整个字段配置的 sha1 前 8 位，配合 ruleRev 回查 filter-rules.applied.json
-        //                  / .bak.<rev>.json 的 filter[configKey] 原文（### 命中行也定位得到）。
-        const DIAG_RULE_TEXT_MAX = 120
-        // 单轮明细总字节预算：保证「汇总 + 明细」不会写满 1 MiB 日志、把写在最前的 run 汇总挤掉
-        // （_writeRunLog 超限只保留尾部 512 KiB，旧实现里一轮 1000 条 × 长规则足够触发）。
-        const DIAG_BATCH_MAX_BYTES = 192 * 1024
-        const sha1Short = (text) => {
-          try { return crypto.createHash('sha1').update(text, 'utf8').digest('hex').slice(0, 8) } catch (e) { return '' }
+    // ③b 摄入 + ④ 去重/全局过滤（合并为一次遍历，顺序保证：校验→归一化→判重）。
+    // 读近似去重窗口、读判重缓存、建索引、逐条判重与规则过滤都在这里完成；候选集写入
+    // ctx.candidates，本轮全量新数据（含被过滤/近似重复的）写入 ctx.newMessages 供落盘。
+    //
+    // 早退：判重缓存读取失败时本轮不推送（防重复轰炸）。该分支在旧实现里直接 return 摘要，
+    // 这里显式写 ctx.summary 并返回 false，由 _runLocked 映射——不走 finalize（不写缓存/日报）。
+    async _runIngest (ctx) {
+      const active = ctx.rules.active
+      const counters = ctx.counters
+      const similarState = ctx.similar
+      // 判重缓存名按推送源派生（与判重文件同源）；finalize 落盘也用这一个名字
+      const cacheName = MessageStore.getFileName(ctx.config.api.pushUrl)
+      ctx.dedupe.cacheName = cacheName
+      // 与判重缓存同源命名：一个推送源一份窗口，避免不同来源互相压制（也让测试按 pushUrl 天然隔离）
+      const similarPath = path.join(this._cacheDir(), `similar-${cacheName}`)
+      similarState.path = similarPath
+      similarState.now = Date.now()
+      // F3-1：只有确定性损坏（unsafe / tooLarge / 重读后仍解析失败）才会置位并在轮末隔离；
+      // replaced / ioError 重读后仍失败只按空窗口处理，绝不 rename。
+      const similarWindow = this._readSimilarWindow(similarPath)
+      similarState.corrupt = similarWindow.corrupt
+      if (similarWindow.status !== 'ok' && similarWindow.status !== 'missing' && similarWindow.status !== 'empty') {
+        const detail = similarWindow.status === 'invalid'
+          ? `解析失败：${Utils.safeErrorText(similarWindow.error, '未知错误')}`
+          : `不可用（${similarWindow.status}）`
+        console.warn(`⚠️ 近似去重缓存${detail}，本轮按空窗口处理${similarState.corrupt ? '（确定性损坏，轮末隔离原件并重建）' : '（瞬时读失败，保留原文件、绝不隔离）'}：${similarState.path}`)
+      }
+      if (similarWindow.status === 'ok') {
+        // v3.398 之前的窗口没有档位字段 c，无法判断满减冲突；直接丢弃让窗口自然重建（最坏少拦一次重复）
+        // 只要求 c（v3.398 起的行都有）；p/x 缺失按空串处理，升级时不丢最近窗口
+        similarState.recent = Similar.pruneRecent(similarWindow.entries.filter(e => e && typeof e.c === 'string'), similarState.now)
+      }
+      // v3.159：过滤规则哈希比对——规则变更时失效「过滤写入」缓存（改宽过滤后旧条目重新评估/推送，
+      // 无需手动清缓存；「推送成功」缓存不受影响，防重复推送）
+      // FILTER-01 / RULES-05：哈希除配置字节外还折入「规则实际编译生效」维度
+      // （RuleEngine.compileStateOf(compiledRules)：re2 可用性 + 各字段是否真的编译出规则）。
+      // 否则同一份配置下 re2 缺失/规则被 ReDoS 守卫丢弃时哈希不变，已打 _f 的条目永不重评、
+      // 改宽后静默漏推。该维度随环境稳定，不会每轮清 _f。
+      // ③b 规则变更 ⇒ 失效「过滤写入」缓存（覆盖文件损坏时的跳过判据在方法内）。**顺序不变式**：
+      // 必须先于下方 MessageStore.readMessages(cacheFilePath) 建判重索引——否则被清掉 _f 的条目
+      // 已经进了 cacheIds/墓碑索引，本轮仍被判重跳过，改宽规则后静默漏推（回归用例 ORD-1 锁住这条）。
+      this._invalidateFilteredCache({ active, cacheName, filterHash: ctx.rules.hash, dryRun: ctx.dryRun })
+      // v3.179：缓存索引化——曾逐条 MessageStore.has()（每条 O(M) findIndex，共 O(N×M)）：
+      // 接口异常返回海量数据（maxPerRun 想防的同一场景）时判重卡死——实测 N=2万/M=1万 → 11.6s，
+      // 外推 N=10万 → ~60s（cron 长时间挂起）。改为循环前一次性构建缓存三索引（O(M)），
+      // 与批内三索引合并判重 → 全程 O(N+M)。三个 Set 与 _findDedupIndex 三条件同构，
+      // 等价性由属性测试证明（800 轮含缓存非空场景，0 失配）
+      const cacheFilePath = MessageStore.getFilePath(cacheName)
+      const cacheMsgs = MessageStore.readMessages(cacheFilePath)
+      // F1（P1）：读侧可能已把「坏/超限缓存」改名隔离并重建（只隔离不删除）。旧行为下这种情形走
+      // 下面的零推送闸门（run.log ERROR + 告警 + 非零退出码），修复后本轮照常推送——若不留痕，
+      // 磁盘上多出的 .corrupt.*.bak 与「未读到的旧身份未落墓碑 ⇒ 可能重推」就成了静默降级。
+      // 摘要/退出码口径刻意不动（APP-03 契约：cacheSaved 只说落盘，隔离不等于本轮失败），
+      // 只补 run.log 一行 WARN + 控制台告警。
+      for (const ev of MessageStore._drainRecoveryEvents()) {
+        this._writeRunLog(`${this._localStamp()} WARN 缓存${ev.label}：原件已改名隔离保留为 ${ev.backupPath}（重建 ${ev.recovered} 条、落墓碑 ${ev.dropped} 条；未读到的旧身份可能重推）\n`)
+        console.warn(`⚠️ 缓存${ev.label}：原件已隔离保留为 ${ev.backupPath}（重建 ${ev.recovered} 条，判错方向 = 可能重推）`)
+      }
+      if (MessageStore._readFailed[cacheFilePath]) {
+        console.error('缓存读取失败，跳过本轮推送以防重复轰炸')
+        // P1（审查 2026-08-15）：此路径曾直接 return undefined——退出码 0 + 零告警 + 零日志，
+        // 缓存持续损坏时 cron 每次「绿色成功」却零推送零告警，静默漏推。与 catch 路径同口径可观测：
+        // 写 run.log ERROR + 告警（测试默认关 alert 不污染推送计数）+ 返回带失败语义的摘要，
+        // 使 classifySummary 判可重试失败 → runSingleEntry 置非零退出码，调度感知失败。
+        this._writeRunLog(`${this._localStamp()} ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）${cacheFilePath}\n`)
+        try { await this._sendAlert(`缓存读取失败，本轮推送已跳过（防重复轰炸）：${cacheFilePath}`, 'cache-read') } catch (e) { /* 告警失败不阻塞 */ }
+        ctx.summary = {
+          total: ctx.fetched.length,
+          dedup: 0,
+          filtered: 0,
+          truncated: 0,
+          pushed: 0,
+          failed: ctx.fetched.length,
+          failures: []
         }
-        // 行数按规则解析器认的分隔符统计（\r\n / \r / \n / <br>），并忽略结尾空行
-        const ruleLineCount = (text) => {
-          const parts = String(text).split(/\r\n|\r|\n|<br\s*\/?>/i)
-          while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
-          return parts.length
+        return false
+      }
+      // 缓存中有 id 条目的 String(id) / 所有有 URL 条目的 validUrl / 无 id 有 URL 条目的 validUrl /
+      // 无 id/URL 条目的 anonKey
+      const cacheIds = new Set()
+      const cacheUrls = new Set()
+      const cacheNoIdUrls = new Set()
+      const cacheAnonKeys = new Set()
+      for (const m of cacheMsgs) {
+        const identity = Utils.getMessageIdentity(m)
+        if (!identity.valid) continue
+        if (identity.kind === 'id') cacheIds.add(identity.idKey)
+        if (identity.url) {
+          cacheUrls.add(identity.url)
+          if (identity.kind === 'url') cacheNoIdUrls.add(identity.url)
         }
-        const thinReason = (value) => {
-          if (!value || typeof value !== 'object') return value
-          const raw = typeof value.rule === 'string' ? value.rule : (value.rule == null ? '' : String(value.rule))
-          const fieldText = active && active.filter && value.configKey ? String(active.filter[value.configKey] || '') : ''
-          const out = { ...value }
-          if (active && Number.isInteger(active.revision)) out.ruleRev = active.revision
-          if (raw.length <= DIAG_RULE_TEXT_MAX) return out
-          out.rule = Utils.truncateUtf16(raw, DIAG_RULE_TEXT_MAX)
-          out.ruleLen = raw.length
-          out.ruleLines = ruleLineCount(raw)
-          out.ruleHash = sha1Short(raw)
-          out.fieldHash = sha1Short(fieldText || raw)
-          return out
-        }
-        const thinReasonList = (list) => (Array.isArray(list) ? list.map(thinReason) : list)
-        const diagnosticItem = (item, decision, explanation) => ({
-          type: 'item',
-          at: this._localStamp(),
-          decision,
-          id: Utils.safeText(Utils.safeGet(item, 'id'), ''),
-          title: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'title'), ''), 200),
-          category: Utils.truncateUtf16(Utils.safeText(Utils.safeGet(item, 'catename'), ''), 100),
-          reason: thinReason(explanation.reason),
-          protections: thinReasonList(explanation.protections),
-          skipped: thinReasonList(explanation.skipped)
-        })
-        let diagnosticBytes = 0
-        // 统一入队口：条数上限 + 单轮字节预算，超限返回 false 交给调用方记 detailsDropped
-        const pushDiagnostic = (item, decision, explanation) => {
-          const record = diagnosticItem(item, decision, explanation)
-          let size = 0
-          try { size = Buffer.byteLength(JSON.stringify(record), 'utf8') } catch (e) { size = 0 }
-          if (diagnosticBytes + size > DIAG_BATCH_MAX_BYTES) return false
-          diagnosticBytes += size
-          filterDiagnostics.push(record)
-          return true
-        }
-        let badElementCount = 0 // v3.157：非对象元素单独统计（曾混入 filteredCount，诊断不清）
-        let skippedNoIdentity = 0 // APP-04：isValidItem 通过但 getMessageIdentity 判无效的条目（丢弃正确，但必须可对账）
-        let regTimePresent = 0 // v3.159：louzhuregtime 有值统计（pingbitime 有效性警告用）
-        for (const item of xbkdata) {
-        // 元素级校验：非对象元素跳过（v3.176：不再计入 filteredCount——「过滤屏蔽」专指规则过滤，
-        // 非对象元素有独立「非对象元素」行，曾双计误导诊断）
-          if (!Utils.isValidItem(item)) { badElementCount++; continue }
-          // 字段归一化：通过安全 getter 读取别名字段，避免脏 getter 破坏整批一致性。
-          const categoryName = Utils.safeGet(item, 'catename')
-          const categoryAlias = Utils.safeGet(item, 'category_name')
-          if (!categoryName && categoryAlias) Utils.safeSet(item, 'catename', categoryAlias)
-          const categoryId = Utils.safeGet(item, 'cateid')
-          const categoryIdAlias = Utils.safeGet(item, 'category_id')
-          if (!categoryId && categoryIdAlias) Utils.safeSet(item, 'cateid', categoryIdAlias)
-          const louzhuRegTime = Utils.safeGet(item, 'louzhuregtime')
-          if (louzhuRegTime !== undefined && louzhuRegTime !== null && louzhuRegTime !== '') regTimePresent++
+        if (identity.kind === 'anon') cacheAnonKeys.add(identity.key)
+      }
+      // P4（CodeAnt）：并入墓碑身份——字节/条数裁剪丢弃的记录身份仍参与判重，防重放重复推送。
+      // 统一走 MessageStore._tombstoneSetsHas（与 has/save/saveBatch 同一判重接口，避免语义漂移）
+      // v3.228：批内与跨运行统一使用 getMessageIdentity；保留 id/url 的双向 fallback，
+      // 另为无标识数据维护 anonKey 集合，避免各入口各自拼接 url:/id: 键。
+      const batchIds = new Set()
+      const batchUrls = new Set()
+      const batchNoIdUrls = new Set()
+      const batchAnonKeys = new Set()
+      const diag = this._createFilterDiagnostics(ctx)
+      ctx.diag = diag
+      const xbkdata = ctx.fetched
+      for (const item of xbkdata) {
+      // 元素级校验：非对象元素跳过（v3.176：不再计入 filteredCount——「过滤屏蔽」专指规则过滤，
+      // 非对象元素有独立「非对象元素」行，曾双计误导诊断）
+        if (!Utils.isValidItem(item)) { counters.bad++; continue }
+        // 字段归一化：通过安全 getter 读取别名字段，避免脏 getter 破坏整批一致性。
+        const categoryName = Utils.safeGet(item, 'catename')
+        const categoryAlias = Utils.safeGet(item, 'category_name')
+        if (!categoryName && categoryAlias) Utils.safeSet(item, 'catename', categoryAlias)
+        const categoryId = Utils.safeGet(item, 'cateid')
+        const categoryIdAlias = Utils.safeGet(item, 'category_id')
+        if (!categoryId && categoryIdAlias) Utils.safeSet(item, 'cateid', categoryIdAlias)
+        const louzhuRegTime = Utils.safeGet(item, 'louzhuregtime')
+        if (louzhuRegTime !== undefined && louzhuRegTime !== null && louzhuRegTime !== '') counters.regTime++
 
-          const identity = Utils.getMessageIdentity(item)
-          if (!identity.valid) { skippedNoIdentity++; continue }
-          let dup = false
-          if (identity.kind === 'id') {
-            dup = cacheIds.has(identity.idKey) || (identity.url && cacheNoIdUrls.has(identity.url)) ||
+        const identity = Utils.getMessageIdentity(item)
+        if (!identity.valid) { counters.noIdentity++; continue }
+        let dup = false
+        if (identity.kind === 'id') {
+          dup = cacheIds.has(identity.idKey) || (identity.url && cacheNoIdUrls.has(identity.url)) ||
                        batchIds.has(identity.idKey) || (identity.url && batchNoIdUrls.has(identity.url)) ||
                        MessageStore._tombstoneSetsHas(cacheFilePath, identity)
-          } else if (identity.kind === 'url') {
-            dup = cacheUrls.has(identity.url) || batchUrls.has(identity.url) ||
+        } else if (identity.kind === 'url') {
+          dup = cacheUrls.has(identity.url) || batchUrls.has(identity.url) ||
                        MessageStore._tombstoneSetsHas(cacheFilePath, identity)
-          } else {
-            dup = cacheAnonKeys.has(identity.key) || batchAnonKeys.has(identity.key) ||
+        } else {
+          dup = cacheAnonKeys.has(identity.key) || batchAnonKeys.has(identity.key) ||
                        MessageStore._tombstoneSetsHas(cacheFilePath, identity)
-          }
-          if (dup) { dedupCount++; continue }
-          // 收录进批内索引，字段身份与 MessageStore/saveBatch 完全相同。
-          if (identity.kind === 'id') batchIds.add(identity.idKey)
-          if (identity.url) {
-            batchUrls.add(identity.url)
-            if (identity.kind === 'url') batchNoIdUrls.add(identity.url)
-          }
-          if (identity.kind === 'anon') batchAnonKeys.add(identity.key)
-          const explanation = FilterEngine.explainFilter(item, compiledRules, active.filter)
-          filterExplanations.set(item, explanation)
-          if (explanation.passed) {
-            // v3.397：与时间窗内已推标题近似重复 → 不再重复推送（仍进 newMessages，按已处理落缓存）
-            const titleText = Utils.safeText(Utils.safeGet(item, 'title'), '')
-            const contentText = Utils.safeText(Utils.safeGet(item, 'content'), '')
-            // v3.410：用 findSimilarTitle 取「和哪一条撞了」——判定与 isSimilarTitle 同一份逻辑
-            // （isSimilarTitle ≡ findSimilarTitle !== null），这里不多做任何判断。
-            const similarHit = Similar.findSimilarTitle(titleText, recentTitles.concat(batchTitles), { now: similarNow, content: contentText })
-            if (similarHit) {
-              similarCount++
-              // 拦截明细：只记标题与价格签名（正文/HTML/URL 一律不记）。每轮上限 200 条，
-              // 超出只计数不落盘——明细是排障用的旁证，不能因为一轮爆发写成大文件。
-              if (similarBlocked.length < SIMILAR_BLOCKED_MAX_RECORDS) {
-                if (!similarBlockedAt) similarBlockedAt = this._localStamp()
-                similarBlocked.push({
-                  at: similarBlockedAt,
-                  title: Utils.truncateUtf16(titleText, SIMILAR_BLOCKED_TITLE_MAX),
-                  // 窗口里存的是归一化标题（原文不入窗口，格式不动），matched 只能是它
-                  matched: Utils.truncateUtf16(typeof similarHit.t === 'string' ? similarHit.t : '', SIMILAR_BLOCKED_TITLE_MAX),
-                  price: Similar.priceSignature(titleText) || null,
-                  mprice: typeof similarHit.p === 'string' && similarHit.p !== '' ? similarHit.p : null
-                })
-              } else {
-                similarOverflow += 1
-              }
-              newMessages.push(item)
-              continue
-            }
-            items.push(item)
-            batchTitles.push({ t: Similar.normalizeTitle(titleText), at: similarNow, c: Similar.couponRange(titleText), p: Similar.priceSignature(titleText), x: Similar.normalizeContent(contentText) })
-            if (explanation.protections.length > 0 || explanation.skipped.length > 0 || includePassedDiagnostics) {
-              if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'passed', explanation))) {
-                diagnosticDrops.passed++
-                passedDropItems.add(item) // ⑤ 若随后拒掉，按最终决策改记 filtered
-              }
-            }
-          } else {
-            filteredCount++
-            Utils.safeSet(item, '_f', true) // v3.159：过滤写入标记（规则变更时失效）
-            const reasonKey = `${explanation.reason.stage}.${explanation.reason.kind}.${explanation.reason.configKey}`
-            filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
-            if (!(filterDiagnostics.length < maxDiagnosticDetails && pushDiagnostic(item, 'filtered', explanation))) diagnosticDrops.filtered++
-          }
-          newMessages.push(item)
         }
-
-        // v3.159：接口未提供注册时间字段时 pingbitime 过滤不生效——运行期警告（配置无效不感知）
-        const pbCfg = active.filter && active.filter.pingbitime
-        const pbText = Utils.safeText(pbCfg, '')
-        if (pbCfg !== undefined && pbCfg !== null && pbText.trim() !== '' && xbkdata.length > 0) {
-          const missing = xbkdata.length - regTimePresent
-          if (missing / xbkdata.length > 0.5) {
-            console.warn(`⚠️ 接口返回「louzhuregtime」注册时间字段缺失 ${missing}/${xbkdata.length} 条（>50%）——配置的「pingbitime」过滤基本不会生效（接口可能不提供该字段）`)
-          }
+        if (dup) { counters.dedup++; continue }
+        // 收录进批内索引，字段身份与 MessageStore/saveBatch 完全相同。
+        if (identity.kind === 'id') batchIds.add(identity.idKey)
+        if (identity.url) {
+          batchUrls.add(identity.url)
+          if (identity.kind === 'url') batchNoIdUrls.add(identity.url)
         }
-
-        // ⑤ 只看它过滤（独立白名单函数，keyword 正则预编译一次）
-        const beforeKwd = items.length
-        const kw = active.keyword.zkt_gjc
-        // R11-1：非字符串 zkt_gjc（对象/数字脏配置）→ 警告并跳过过滤（String 化会把 '[object Object]' 当正则，静默怪行为）
-        if (kw !== undefined && kw !== null && typeof kw !== 'string') {
-          console.warn(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof kw}，已忽略只看它过滤`)
-        } else if (kw) {
-          if (String(kw).trim() === '') {
-          // 空白关键词 = 误配置，忽略过滤（避免只推含空格的标题）
-            console.warn('⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤')
-          } else {
-            let kwRe = null
-            if (RuleEngine.hasNestedQuantifier(kw)) {
-              console.warn('⚠️ 配置「zkt_gjc」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），已忽略只看它过滤')
+        if (identity.kind === 'anon') batchAnonKeys.add(identity.key)
+        const explanation = FilterEngine.explainFilter(item, ctx.rules.compiled, active.filter)
+        diag.explanations.set(item, explanation)
+        if (explanation.passed) {
+          // v3.397：与时间窗内已推标题近似重复 → 不再重复推送（仍进 newMessages，按已处理落缓存）
+          const titleText = Utils.safeText(Utils.safeGet(item, 'title'), '')
+          const contentText = Utils.safeText(Utils.safeGet(item, 'content'), '')
+          // v3.410：用 findSimilarTitle 取「和哪一条撞了」——判定与 isSimilarTitle 同一份逻辑
+          // （isSimilarTitle ≡ findSimilarTitle !== null），这里不多做任何判断。
+          const similarHit = Similar.findSimilarTitle(titleText, similarState.recent.concat(similarState.batch), { now: similarState.now, content: contentText })
+          if (similarHit) {
+            counters.similar++
+            // 拦截明细：只记标题与价格签名（正文/HTML/URL 一律不记）。每轮上限 200 条，
+            // 超出只计数不落盘——明细是排障用的旁证，不能因为一轮爆发写成大文件。
+            if (similarState.blocked.length < SIMILAR_BLOCKED_MAX_RECORDS) {
+              if (!similarState.blockedAt) similarState.blockedAt = this._localStamp()
+              similarState.blocked.push({
+                at: similarState.blockedAt,
+                title: Utils.truncateUtf16(titleText, SIMILAR_BLOCKED_TITLE_MAX),
+                // 窗口里存的是归一化标题（原文不入窗口，格式不动），matched 只能是它
+                matched: Utils.truncateUtf16(typeof similarHit.t === 'string' ? similarHit.t : '', SIMILAR_BLOCKED_TITLE_MAX),
+                price: Similar.priceSignature(titleText) || null,
+                mprice: typeof similarHit.p === 'string' && similarHit.p !== '' ? similarHit.p : null
+              })
             } else {
-            // C1-023：编译闸门本身不抛错（内部 catch 后返回 null），失败原因经 onError 回传；旧实现用一个
-            // 空 catch 包住调用，既拿不到唯一失败原因，告警又只剩「无效或环境不支持」——
-            // 「正则写错」与「没装 re2」这两种完全不同的处置在日志里无法区分。
-              let kwReError = null
-              try {
-                kwRe = compileUserRegex(kw, 'i', (e) => { kwReError = e })
-              } catch (e) {
-                kwReError = e // 闸门自身异常（契约外）：同样作为告警原因，不静默吞掉
-              }
-              if (!kwRe) {
-                const reason = Utils.safeErrorText(kwReError, '原因未知').replace(/[\r\n]+/g, ' ').slice(0, 200)
-                console.warn(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式（${reason}），已忽略只看它过滤`)
-              }
+              similarState.overflow += 1
             }
-            if (kwRe) {
-            // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
-            // 内联版曾 0/false 标题一律放行、无 4096 长输入截断、无正则缓存；whitelistFilter 均覆盖：
-            // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、完整输入归一化、正则缓存复用）
-            // CodeRabbit：单次遍历评估 + 标记被拒项（曾 filter+includes 为 O(n²)），行为等价
-              const kept = []
-              for (const it of items) {
-                if (FilterEngine.whitelistFilter(it, 'title', kw)) {
-                  kept.push(it)
-                } else {
-                  Utils.safeSet(it, '_f', true) // v3.159：只看它滤掉的同样标记（规则变更失效）
-                  const whitelistReason = { stage: 'title', kind: 'whitelist', configKey: 'zkt_gjc', rule: kw }
-                  const reasonKey = `${whitelistReason.stage}.${whitelistReason.kind}.${whitelistReason.configKey}`
-                  filterReasonCounts[reasonKey] = (filterReasonCounts[reasonKey] || 0) + 1
-                  if (filterDiagnostics.length < maxDiagnosticDetails) {
-                    const explanation = filterExplanations.get(it) || { protections: [], skipped: [] }
-                    const pushed = pushDiagnostic(it, 'filtered', {
-                      reason: thinReason(whitelistReason),
-                      protections: thinReasonList(explanation.protections),
-                      skipped: thinReasonList(explanation.skipped)
-                    })
-                    if (!pushed) {
-                      if (passedDropItems.delete(it)) diagnosticDrops.passed--
-                      diagnosticDrops.filtered++
-                      continue
-                    }
-                  } else {
-                    // C1-029：该条若在④已按「通过项被挤掉」记过，这里改记 filtered——最终决策是被
-                    // 「只看它」拒掉，两个计数器各记一次会把被挤掉条数算成条目数的两倍。
-                    if (passedDropItems.delete(it)) diagnosticDrops.passed--
-                    diagnosticDrops.filtered++
+            ctx.newMessages.push(item)
+            continue
+          }
+          ctx.candidates.push(item)
+          similarState.batch.push({ t: Similar.normalizeTitle(titleText), at: similarState.now, c: Similar.couponRange(titleText), p: Similar.priceSignature(titleText), x: Similar.normalizeContent(contentText) })
+          if (explanation.protections.length > 0 || explanation.skipped.length > 0 || diag.includePassed) {
+            if (!(diag.records.length < diag.maxDetails && diag.push(item, 'passed', explanation))) {
+              diag.drops.passed++
+              diag.passedDropItems.add(item) // ⑤ 若随后拒掉，按最终决策改记 filtered
+            }
+          }
+        } else {
+          counters.filtered++
+          Utils.safeSet(item, '_f', true) // v3.159：过滤写入标记（规则变更时失效）
+          const reasonKey = `${explanation.reason.stage}.${explanation.reason.kind}.${explanation.reason.configKey}`
+          diag.reasonCounts[reasonKey] = (diag.reasonCounts[reasonKey] || 0) + 1
+          if (!(diag.records.length < diag.maxDetails && diag.push(item, 'filtered', explanation))) diag.drops.filtered++
+        }
+        ctx.newMessages.push(item)
+      }
+    },
+
+    // ⑤ 只看它（zkt_gjc）过滤 + 过滤诊断汇总落盘。
+    // 它是「通过规则过滤之后再按关键词拒掉」的独立步骤，顺序与计数口径（filtered 含这一步）
+    // 与旧实现一致；诊断明细的预算/被挤掉计数复用 ingest 建好的同一个收集器。
+    async _runFilter (ctx) {
+      const active = ctx.rules.active
+      const counters = ctx.counters
+      const diag = ctx.diag
+      let items = ctx.candidates
+
+      // v3.159：接口未提供注册时间字段时 pingbitime 过滤不生效——运行期警告（配置无效不感知）
+      const pbCfg = active.filter && active.filter.pingbitime
+      const pbText = Utils.safeText(pbCfg, '')
+      if (pbCfg !== undefined && pbCfg !== null && pbText.trim() !== '' && ctx.fetched.length > 0) {
+        const missing = ctx.fetched.length - counters.regTime
+        if (missing / ctx.fetched.length > 0.5) {
+          console.warn(`⚠️ 接口返回「louzhuregtime」注册时间字段缺失 ${missing}/${ctx.fetched.length} 条（>50%）——配置的「pingbitime」过滤基本不会生效（接口可能不提供该字段）`)
+        }
+      }
+
+      // ⑤ 只看它过滤（独立白名单函数，keyword 正则预编译一次）
+      const beforeKwd = items.length
+      const kw = active.keyword.zkt_gjc
+      // R11-1：非字符串 zkt_gjc（对象/数字脏配置）→ 警告并跳过过滤（String 化会把 '[object Object]' 当正则，静默怪行为）
+      if (kw !== undefined && kw !== null && typeof kw !== 'string') {
+        console.warn(`⚠️ 配置「zkt_gjc」应为字符串，当前为 ${typeof kw}，已忽略只看它过滤`)
+      } else if (kw) {
+        if (String(kw).trim() === '') {
+        // 空白关键词 = 误配置，忽略过滤（避免只推含空格的标题）
+          console.warn('⚠️ 配置「zkt_gjc」为空白字符，已忽略只看它过滤')
+        } else {
+          let kwRe = null
+          if (RuleEngine.hasNestedQuantifier(kw)) {
+            console.warn('⚠️ 配置「zkt_gjc」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），已忽略只看它过滤')
+          } else {
+          // C1-023：编译闸门本身不抛错（内部 catch 后返回 null），失败原因经 onError 回传；旧实现用一个
+          // 空 catch 包住调用，既拿不到唯一失败原因，告警又只剩「无效或环境不支持」——
+          // 「正则写错」与「没装 re2」这两种完全不同的处置在日志里无法区分。
+            let kwReError = null
+            try {
+              kwRe = compileUserRegex(kw, 'i', (e) => { kwReError = e })
+            } catch (e) {
+              kwReError = e // 闸门自身异常（契约外）：同样作为告警原因，不静默吞掉
+            }
+            if (!kwRe) {
+              const reason = Utils.safeErrorText(kwReError, '原因未知').replace(/[\r\n]+/g, ' ').slice(0, 200)
+              console.warn(`⚠️ 配置「zkt_gjc」包含无效或当前环境不支持的正则表达式（${reason}），已忽略只看它过滤`)
+            }
+          }
+          if (kwRe) {
+          // 只看它过滤：统一走 FilterEngine.whitelistFilter（P2 审查 2026-08-15：消除两套漂移实现——
+          // 内联版曾 0/false 标题一律放行、无 4096 长输入截断、无正则缓存；whitelistFilter 均覆盖：
+          // 仅 undefined/null/空串视为字段缺失，0/false 参与匹配、完整输入归一化、正则缓存复用）
+          // CodeRabbit：单次遍历评估 + 标记被拒项（曾 filter+includes 为 O(n²)），行为等价
+            const kept = []
+            for (const it of items) {
+              if (FilterEngine.whitelistFilter(it, 'title', kw)) {
+                kept.push(it)
+              } else {
+                Utils.safeSet(it, '_f', true) // v3.159：只看它滤掉的同样标记（规则变更失效）
+                const whitelistReason = { stage: 'title', kind: 'whitelist', configKey: 'zkt_gjc', rule: kw }
+                const reasonKey = `${whitelistReason.stage}.${whitelistReason.kind}.${whitelistReason.configKey}`
+                diag.reasonCounts[reasonKey] = (diag.reasonCounts[reasonKey] || 0) + 1
+                if (diag.records.length < diag.maxDetails) {
+                  const explanation = diag.explanations.get(it) || { protections: [], skipped: [] }
+                  const pushed = diag.push(it, 'filtered', {
+                    reason: diag.thinReason(whitelistReason),
+                    protections: diag.thinReasonList(explanation.protections),
+                    skipped: diag.thinReasonList(explanation.skipped)
+                  })
+                  if (!pushed) {
+                    if (diag.passedDropItems.delete(it)) diag.drops.passed--
+                    diag.drops.filtered++
+                    continue
                   }
+                } else {
+                  // C1-029：该条若在④已按「通过项被挤掉」记过，这里改记 filtered——最终决策是被
+                  // 「只看它」拒掉，两个计数器各记一次会把被挤掉条数算成条目数的两倍。
+                  if (diag.passedDropItems.delete(it)) diag.drops.passed--
+                  diag.drops.filtered++
                 }
               }
-              items = kept
             }
-          // 非法正则时 kwRe 为 null：items 不过滤，继续正常推送（避免静默清空）
+            items = kept
           }
+        // 非法正则时 kwRe 为 null：items 不过滤，继续正常推送（避免静默清空）
         }
-        filteredCount += (beforeKwd - items.length)
-        this._writeFilterDiagnostics([
-          {
-            type: 'run',
-            at: this._localStamp(),
-            total: xbkdata.length,
-            dedup: dedupCount,
-            filtered: filteredCount,
-            passed: items.length,
-            // 不能从受 maxDetailsPerRun 截断的明细反算，否则汇总会少计。
-            byReason: filterReasonCounts,
-            detailCount: filterDiagnostics.length,
-            // C1-029：本轮明细预算与「被预算挤掉」的分类条数——被截断必须能从文件里看出来。
-            detailsBudget: maxDiagnosticDetails,
-            detailsDropped: diagnosticDrops
-          },
-          ...filterDiagnostics
-        ])
-        checkpoint('data-processed', `items=${items.length} dedup=${dedupCount} filtered=${filteredCount} bad=${badElementCount}`)
-
-        // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
-        // maxPerRun 必须是正整数；小数先取整可能变成 0（如 0.5），会静默跳过全部推送，非法值统一回退默认
-        const maxPerRun = (() => { const v = Utils.num(Config.push.maxPerRun, -1); return Number.isInteger(v) && v > 0 ? v : 100 })()
-        let truncatedKeys = new Set()
-        if (items.length > maxPerRun) {
-          truncatedCount = items.length - maxPerRun
-          console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`)
-          // v3.239：截断告警推送（复用 alert 限频，防轰炸）——静默丢失曾无感知，手机端可及时发现
-          // v3.240：await 告警（v3.164 曾修复 fire-and-forget 导致告警 HTTP 未送达被杀，子代理审查发现本轮修复回归该模式）
-          // v3.241：文案改为「已暂存待补推」（下轮接口重放时补推，非永久丢弃；子代理审查提示避免误导）
-          // P3（审查 2026-08-15）：再修正——截断条目并未暂存（不入缓存、无任何持久化），仅依赖接口下轮重放，
-          // 「已暂存」仍会误导用户以为已持久化；改为如实描述「待下轮接口重放时补推」
-          if (!dryRun) {
-            try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${truncatedCount} 条待下轮接口重放时补推（防推送风暴）`, 'truncate') } catch (e) { /* 告警失败不阻塞主流程 */ }
-          }
-          // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
-          // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
-          truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.getMessageIdentity(it).key))
-          items = items.slice(0, maxPerRun)
-        }
-
-        // ⑥ 推送（sequential=顺序逐条 / parallel=并行滑动窗口；失败不中断、不写缓存，下次重试）
-        const pushModeForProfile = (() => {
-        // v3.250：Config.push 缺失/未配置 mode 时 String(undefined) 会产出字面量 "undefined"；
-        // 显式回退默认顺序模式，仅用于 push-start 日志（不改变实际推送语义）
-          try { const m = Config.push && Config.push.mode; return (m == null || m === '') ? 'sequential' : String(m) } catch (e) { return '<不可转换值>' }
-        })()
-        checkpoint('push-start', `count=${items.length} mode=${pushModeForProfile}`)
-        const startTime = Date.now()
-        preprocessMs = startTime - runStart - (fetchMs || 0)
-        // v3.250：预计算每条 items 的 identity key 并缓存（含 newMessages 惰性缓存），
-        // keyOf 复用，避免 getMessageIdentity 对同一对象反复重算（pushedKeys/itemsKeys/toCache 均调用）
-        const itemKeyCache = new Map(items.map(it => [it, Utils.getMessageIdentity(it).key]))
-        const keyOf = (it) => {
-          if (!itemKeyCache.has(it)) itemKeyCache.set(it, Utils.getMessageIdentity(it).key)
-          return itemKeyCache.get(it)
-        }
-        // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
-        // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
-        const baseUrl = (typeof Config.domain === 'string') ? trimTrailingSlashes(Config.domain.trim()) : '' // v3.158: trim
-        // url 类型防御：非字符串(null/undefined/对象/数字)视为无链接——避免 .includes 崩溃或 [object Object]
-        // 与 htmlToMarkdown 的 content_html 口径一致（非字符串视为空）
-        const urlOf = (it) => {
-          const u = Utils.safeUrl(it && it.url)
-          if (!u) return ''
-          // 含协议或协议相对(//)不拼前缀；相对路径拼 domain（补斜杠）
-          return (u.includes('://') || u.startsWith('//') ? u : baseUrl + (u.startsWith('/') ? u : '/' + u))
-        }
-        const pushedKeys = new Set()
-        const failureInfos = []
-        const readItemField = (item, field) => {
-          try { return item && item[field] } catch (e) { return undefined }
-        }
-        // v3.250：日志边界——超长字段值（脏数据/整段内容/大对象 JSON）原样入日志会撑爆日志行；
-        // 与推送内容截断同口径，仅限制日志显示长度，不影响实际推送内容
-        const ITEM_LOG_MAX = 100
-        // APP2-07：stdout 回显专用的控制字符清洗（U+0000–U+001F、U+007F → 空格）——青龙任务日志
-        // 按行解析，接口返回的 title/catename 含 \n 或 ANSI ESC 可伪造日志行；推送正文不经此函数
-        // （safeText 不动，推送内容保留换行）。
-        // eslint-disable-next-line no-control-regex -- 控制字符清洗本身就需要匹配控制字符（白名单式替换）
-        const stripLogControl = (text) => text.replace(/[\u0000-\u001F\u007F]/g, ' ')
-        const itemLogText = (item, field, fallback = '') => {
-          const text = Utils.safeText(readItemField(item, field), fallback)
-          const safe = typeof text === 'string' ? stripLogControl(text) : text
-          return typeof safe === 'string' && safe.length > ITEM_LOG_MAX ? Utils.truncateUtf16(safe, ITEM_LOG_MAX) : safe
-        }
-
-        // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
-        const titleTpl = (typeof Config.template.title === 'string' && Config.template.title) ? Config.template.title : '【{分类名}】{标题}'
-        const contentTpl = (typeof Config.template.content === 'string' && Config.template.content) ? Config.template.content : '{Markdown内容}'
-        // 推送截断长度（v3.69 可配置）：非正数/非数字回退默认（负数会让 slice(0,-1) 误截尾字符）
-        const titleMax = (() => { const v = Math.floor(Utils.num(Config.push.titleMax, 100)); return v > 0 ? v : 100 })()
-        const contentMax = (() => { const v = Math.floor(Utils.num(Config.push.contentMax, 3000)); return v > 0 ? v : 3000 })()
-
-        // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
-        // APP-06：渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/sanitizeSurrogates/
-        // truncateUtf16/链接保留 + dry-run preview）与发送段一样受 try 保护——渲染期异常按「单条
-        // 推送失败」处理（警告、不写缓存、下次重试），不再冒泡中止整轮：并行模式 Promise.all 会
-        // 整体 reject，saveBatch 根本不执行，本轮所有新数据都会漏写缓存。
-        const pushOne = async (item, notifyModule) => {
-          let text = ''
-          let desp = ''
-          try {
-            // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
-            // 用 UTF-16 安全截断（不切断 emoji 代理对）
-            // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
-            const pushItem = {
-              ...Utils.safeObjectCopy(item),
-              url: urlOf(item),
-              // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
-              // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
-              title: (() => {
-                const value = readItemField(item, 'title')
-                return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax)
-              })(),
-              content: (() => {
-                const value = readItemField(item, 'content')
-                return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
-              })()
-            }
-            // C1-010：只对「要转 Markdown」的渲染做有界前缀（{Html内容} 原样发 HTML，截前缀会丢内容）。
-            const renderItem = contentTpl.includes('{Html内容}') ? pushItem : this._boundMarkdownHtml(pushItem, contentMax)
-            // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
-            // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
-            text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, renderItem), titleMax)
-            // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
-            // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
-            // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
-            const rawDesp = Formatter.tuisong_replace(contentTpl, renderItem)
-            const rawClean = Utils.sanitizeSurrogates(rawDesp)
-            desp = Utils.truncateUtf16(rawClean, contentMax)
-            // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
-            const safePushUrl = Utils.safeUrl(pushItem.url)
-            if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
-              const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
-              // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
-              // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
-              // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
-              // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
-              if (link.length + 2 < contentMax) {
-                const keep = contentMax - link.length - 2
-                desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
-              }
-            }
-            if (preview(text, desp)) return { item, ok: false, preview: true }
-          } catch (e) {
-            // 非 Error 兜底（R1）：与发送段同口径，内容渲染异常不得中止整轮推送
-            const failure = summarizeError(e)
-            failureInfos.push(failure)
-            console.log(`⚠️ 推送失败（内容渲染异常，不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`)
-            return { item, ok: false, failure }
-          }
-          try {
-            const sent = await Pusher.send(text, desp, notifyModule)
-            pushedKeys.add(keyOf(item))
-            // v3.159：推送成功 → 清除过滤写入标记（否则 _f 随对象写回缓存，下次规则变更又误清）
-            // 标记属性异常不能把已送达消息改判为失败；即使无法删除，后续缓存仍按成功处理。
-            try { delete item._f } catch (e) { /* 非可配置脏属性不影响已成功推送 */ }
-            return { item, ok: true, sent }
-          } catch (e) {
-          // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）
-            const failure = summarizeError(e)
-            failureInfos.push(failure)
-            console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`)
-            return { item, ok: false, failure }
-          }
-        }
-
-        // v3.223：推送模块（含 got）已与接口并行加载，首推前确保完成（接口快时最多等剩余加载时间）
-        // APP2-04（已知缺口，未收紧）：dry-run 仍在此 await getNotify()，且上方预热 Promise 也调用
-        // getNotify()，故 dry-run 依旧依赖推送模块可加载（.then 内只是跳过 DNS/TLS 预热）。改为按需
-        // 加载需同步重排预热 Promise/checkpoint/PROFILE3 摘要（notifyModule 也可能为 null），留待专门变更。
-        const notifyModule = await getNotify()
-        checkpoint('notify-module-loaded')
-
-        let successCount = 0
-        const pushResults = []
-        // C1-017：并行/顺序两条循环的**共用**口径（成功日志、成功计数、补位间隔）收敛到一处。
-        // 旧实现里每个分支各写一遍控制台文案、`successCount` 口径与 `pushInterval` 解析——文案改一处
-        // 就漂移（并行分支曾漏掉 `!r.preview` 的等价改写），间隔语义也容易只改一边。
-        // per-worker 语义保留：并行分支每完成一条（且还有待推条目）等一次间隔，全局速率 =
-        // parallelLimit × interval；顺序分支每条之后都等（含最后一条，与旧行为逐字一致）。
-        const pushInterval = Utils.num(Config.timing.pushInterval, 0)
-        const waitPushSlot = async () => { if (pushInterval > 0) await delay(pushInterval) }
-        // 成功才打日志并计数：preview/失败都不算成功（旧并行分支 `r.ok && !r.preview` 的 !preview 恒真）。
-        const logPushed = (r) => {
-          if (!r || !r.ok) return 0
-          console.log(`发现到新数据：${itemLogText(r.item, 'title', '(无标题)')}【${itemLogText(r.item, 'catename')}】${urlOf(r.item)}`)
-          return 1
-        }
-        // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
-        if (Config.push && Config.push.mode && Config.push.mode !== 'sequential' && Config.push.mode !== 'parallel') {
-          console.warn(`⚠️ 配置「push.mode」值无效：「${safeConfigText(Config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`)
-        }
-        if (Config.push && Config.push.mode === 'parallel') {
-        // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
-        // parallelLimit 防御：夹取口径只在 resolveParallelWindow（取整（0.5 取 0 后回退 1）、0/负数按消息总数、硬性上限 50）。
-          const limit = resolveParallelWindow(Config.push.parallelLimit, items.length)
-          const results = new Array(items.length)
-          let nextIndex = 0
-          const worker = async () => {
-            while (true) {
-              const index = nextIndex++
-              if (index >= items.length) return
-              results[index] = await pushOne(items[index], notifyModule)
-              // 保留可配置的补位间隔（per-worker 语义：每个 worker 完成一条后等 pushInterval 再补下一条，
-              // 并行全局速率 = parallelLimit × interval；已知取舍，量小+重试兜底不改），pushInterval=0 即完成即补。
-              if (nextIndex < items.length) await waitPushSlot()
-            }
-          }
-          await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
-          pushResults.push(...results)
-          // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
-          for (const r of results) successCount += logPushed(r)
-        } else {
-        // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
-          for (const item of items) {
-            const r = await pushOne(item, notifyModule)
-            pushResults.push(r)
-            successCount += logPushed(r)
-            await waitPushSlot()
-          }
-        }
-        checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`)
-        if (PROFILE3 && notifyModule && typeof notifyModule.printWxPusherProfileSummary === 'function') {
-          notifyModule.printWxPusherProfileSummary()
-        }
-
-        // ⑦ 写缓存：只收录「被过滤的数据」+「推送成功的数据」
-        //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）
-        const channelSuccessful = new Set()
-        const channelFailures = []
-        const recordChannelOutcome = (result) => {
-          if (!result) return
-          const sent = result.sent
-          if (sent && Array.isArray(sent.successfulChannels)) {
-            for (const channel of sent.successfulChannels) channelSuccessful.add(channel)
-          }
-          if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
-          if (result.failure) {
-            // APP2-03 / C1-015：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。
-            // 「全部通道失败」在投递层是**抛错**（xbk_sendNotify_slim.js 的 `okCount === 0` ⇒
-            // ALL_CHANNELS_FAILED，错误对象挂 failures=[逐通道失败]），所以这时 sent 恒不存在，
-            // 下面这段 failure.failures 是这类失败**唯一**能进 _updateChannelHealth 通道健康统计的
-            // 入口（sent.failures 那条路走不到）。旧注释称整段「分支不可达」并据此保留了一段
-            // 死分支——按那个论证删代码会把这条在跑的路一起删掉，健康统计从此静默漏记整轮全通道失败。
-            // 真正不可达的只有 successfulChannels 半边：summarizeError 只透出 code/name/statusCode/
-            // providerCode/channel/message/failureKind/failures（不拷贝 successfulChannels），且
-            // okCount===0 路径上该数组恒为空；即便日后透出也**不该**记成功（会把「全部失败」记成
-            // 「部分成功」并污染健康统计）⇒ 该半边已删除，不再保留会被误读为可删死代码的形态。
-            const failedChannels = result.failure.failures
-            if (Array.isArray(failedChannels)) {
-              channelFailures.push(...failedChannels)
-            } else if (result.failure.code === 'ALL_CHANNELS_FAILED') {
-            // 聚合失败的载荷就是 error.failures，摘要里缺失说明摘要链路被改坏：此时健康统计会静默
-            // 漏掉整轮失败（不报警、不累计），必须响亮而不是当作「没有失败通道」吞掉。
-              console.warn('⚠️ 全通道失败的摘要缺少 failures 明细（摘要链路异常），本轮通道健康统计将漏记这些通道')
-            }
-          }
-        }
-        for (const result of pushResults) recordChannelOutcome(result)
-        // 健康观测在成功缓存持久化后执行；其自身失败被完全隔离：绝不改变推送成功语义。
-        const itemsKeys = new Set(items.map(keyOf))
-        // v3.134：排除截断未推的（下次运行推剩余，防静默丢失）
-        const toCache = dryRun
-          ? []
-          : newMessages.filter(m => !truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || pushedKeys.has(keyOf(m))))
-        const cacheStart = Date.now()
-        // APP-03：落盘结果必须可观测——saveBatch 的返回值（xbk_message_store.js 已随 B8 改为
-        // 返回 true/false）此前被丢弃，缓存落盘失败时摘要与退出码仍报成功，运维看不到「本轮
-        // 推送成功但成功记录没落盘」（下次运行会重推）。这里接住失败并写 run.log 告警；
-        // result.cacheSaved 同时进摘要（false 表示本轮缓存未落盘）。
-        // APP-03 返工：不得给 cacheSaved 预设初值——下方 try 的成功分支与 catch 分支都必然赋值
-        // （saveBatch 抛错走 catch → false），预设的 `= true` 是死存储（CodeQL js/useless-assignment-to-local
-        // 实测命中：The initial value of cacheSaved is unused, since it is always overwritten）。
-        // 去掉初值不改语义：两分支覆盖后读取点（下方告警与摘要）拿到的仍是真实落盘结果。
-        let cacheSaved
-        try { cacheSaved = MessageStore.saveBatch(toCache, cacheName) !== false } catch (e) { cacheSaved = false } // 契约：undefined 视为成功（兼容旧实现）
-        cacheMs = Date.now() - cacheStart
-        if (!cacheSaved) {
-          this._writeRunLog(`${this._localStamp()} WARN 缓存落盘失败：本轮 ${toCache.length} 条记录未能写入 ${cacheName}，下次运行将对它们重新判重（可能重复推送）\n`)
-          console.warn(`⚠️ 缓存落盘失败：本轮 ${toCache.length} 条记录未写入缓存文件（下次运行会重新推送）`)
-        }
-        checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${cacheMs}`)
-
-        // v3.397：把本轮推送成功的标题写进近似去重窗口（失败的标题不写，下次还能正常推）
-        if (!dryRun) {
-          try {
-            const savedAt = Date.now() // 写入时刻而非本轮开始时刻：单轮超过 10 分钟时不至于一落盘就过期
-            let list = recentTitles
-            for (const m of items) {
-              if (pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt, Utils.safeText(Utils.safeGet(m, 'content'), ''))
-            }
-            // F3-1：只有确定性损坏件才隔离（瞬时读失败已在读取处排除，绝不 rename）。
-            // F3-3：隔离件按每窗口 SIMILAR_CORRUPT_BACKUP_KEEP 份回收（见 _pruneSimilarBackups）。
-            const isolated = similarCorrupt ? this._isolateSimilarWindow(similarPath) : ''
-            // 隔离失败（false）时不得再写：原件没搬走，覆写等于删掉唯一副本。
-            if (isolated !== false && (similarCorrupt || list !== recentTitles)) {
-              recentTitles = list
-              if (!this._writeSimilarWindow(similarPath, list)) similarDrop = list.length
-            }
-          } catch (e) {
-            console.warn(`⚠️ 近似去重缓存更新失败（不影响本轮推送）：${Utils.safeErrorText(e, '未知错误')}`)
-          }
-        }
-        // v3.410：本轮近似去重拦截明细落盘（`similar-blocked.ndjson`）。只加日志：写失败只 console.warn，
-        // 返回实际写入条数供摘要行 `similarlogged=N` 对账；推送结果、缓存、退出码一概不受影响。
-        const similarLogged = this._writeSimilarBlockedLog(similarBlocked)
-        if (similarOverflow > 0) {
-          console.warn(`⚠️ 近似去重拦截明细超过每轮上限 ${SIMILAR_BLOCKED_MAX_RECORDS} 条，另有 ${similarOverflow} 条只计数未记录`)
-        }
-
-        await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
-
-        // 预取收尾：只观察已完成结果，不等待后台预取，避免它拖慢主流程退出。
-        checkpoint('tls-warmup-observed', tlsWarmupSettled && tlsWarmup
-          ? `ok=${tlsWarmup.ok} okCount=${tlsWarmup.okCount || 0}/${tlsWarmup.count || 0} elapsedMs=${tlsWarmup.elapsedMs}`
-          : 'pending')
-
-        // ⑧ 统计
-        const pushMs = Date.now() - startTime
-        const elapsed = (pushMs / 1000).toFixed(1)
-        console.log('\n══════════ 本次运行 ══════════')
-        console.log(`  获取:     ${xbkdata.length} 条`)
-        console.log(`  去重跳过:  ${dedupCount} 条`)
-        if (similarCount > 0) console.log(`  近似重复:  ${similarCount} 条（10 分钟内标题相似，已跳过）`)
-        console.log(`  过滤屏蔽:  ${filteredCount} 条`)
-        if (truncatedCount > 0) console.log(`  截断待推:  ${truncatedCount} 条（下次运行推送，防推送风暴）`)
-        if (badElementCount > 0) console.log(`  非对象元素: ${badElementCount} 条（接口脏数据，已跳过）`)
-        if (skippedNoIdentity > 0) console.log(`  身份无效:  ${skippedNoIdentity} 条（无 id/有效 url，已跳过）`)
-        // APP2-04：dry-run 从未尝试推送，不能与真实失败共用「N 条失败，下次运行重试」文案
-        // （summary.failed 已显式判 0，日志/终端口径与返回值必须一致）。
-        const pushResultText = dryRun
-          ? (items.length > successCount ? `（dry-run 未推送 ${items.length - successCount} 条）` : '')
-          : (successCount < items.length ? `（${items.length - successCount} 条失败，下次运行重试）` : '')
-        console.log(`  推送:     ${successCount} 条${pushResultText}`)
-        if (!cacheSaved) console.log(`  缓存:     落盘失败（${toCache.length} 条未写入缓存，下次运行会重新推送）`)
-        console.log(`  耗时:     ${elapsed}s`)
-        if (process.env.XBK_PROFILE === '1' || detailedProfile) {
-          const totalMs = Date.now() - runStart
-          console.log(`  [profile] 接口: ${typeof fetchMs === 'number' ? (fetchMs / 1000).toFixed(3) + 's' : 'n/a'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`)
-          if (detailedProfile) {
-            // APP2-05：预热被跳过（skipped）或未采集 elapsedMs 时，曾 (undefined/1000).toFixed(3) → "NaN"；
-            // 有限性判定后回退 n/a，skipped 路径显式输出「跳过」。
-            const warmupElapsed = (w) => Number.isFinite(w && w.elapsedMs) ? `${(w.elapsedMs / 1000).toFixed(3)}s` : 'n/a'
-            const warmupText = dnsWarmup ? `${dnsWarmup.skipped ? '跳过' : (dnsWarmup.ok ? '成功' : '失败')} ${warmupElapsed(dnsWarmup)}${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a'
-            const tlsText = tlsWarmup ? `${tlsWarmup.skipped ? '跳过' : `${tlsWarmup.okCount}/${tlsWarmup.count} 成功`} ${warmupElapsed(tlsWarmup)}` : 'n/a'
-            console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(Config.timing.finalWait, 0) / 1000).toFixed(3)}s`)
-          }
-        }
-        dumpCheckpoints()
-        console.log('══════════════════════════════')
-        await delay(Utils.num(Config.timing.finalWait, 0))
-
-        // v3.163：#9 推送全部失败无告警（v3.123 声称覆盖密钥失效但只实现接口挂）——
-        // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
-        // v3.170：await 告警完成（与 catch 路径 v3.164 同口径）——曾 fire-and-forget，
-        // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
-        // C9-002：失败计数是**消息**级（successCount 来自 pushOne 结果）。旧判据 `successCount === 0`
-        // 只覆盖全灭：1 条成功 + 99 条失败时既不告警也不写 ERROR 行，配上分类器「pushed>0 即成功」
-        // 就是「99 条被静默吞掉」。现在只要还有消息没送达就告警；全失败的文案保持不变
-        // （console/status 的 run.log 解析以「推送全部失败」为锚点），部分失败另写带条数的行。
-        // 合并 b1：本处在两类文案上都带 'push-fail' 告警类别（C1-004），与截断/接口异常等
-        // 其他类别各计各的限频窗口。
-        const failedMessages = items.length - successCount
-        if (!dryRun && items.length > 0 && failedMessages > 0) {
-          const allFailed = successCount === 0
-          try {
-            await this._sendAlert(allFailed
-              ? `推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`
-              : `推送部分失败（成功 ${successCount} 条 / 失败 ${failedMessages} 条）：未送达的消息下轮重试，通道可能部分失效`, 'push-fail')
-          } catch (e) { /* 告警失败不阻塞主流程 */ }
-          this._writeRunLog(`${this._localStamp()} ERROR ${allFailed
-            ? `推送全部失败 ${items.length} 条（通道可能失效）`
-            : `推送部分失败 ${failedMessages}/${items.length} 条（未送达消息下轮重试）`}\n`)
-        }
-        // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
-        // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
-        // S2：这一行与读侧的 RUN_SUMMARY_LINE_RE / parseRunSummaryLine 同出 xbk_state_schema
-        // （formatRunSummaryLine）——此前「写的模板字符串」与「读的正则」是两份，加字段两边各改一次。
-        this._writeRunLog(`${formatRunSummaryLine({
-          stamp: this._localStamp(),
-          counters: {
-            total: xbkdata.length,
-            dedup: dedupCount,
-            filtered: filteredCount,
-            truncated: truncatedCount,
-            pushed: successCount,
-            failed: dryRun ? 0 : items.length - successCount
-          },
-          elapsed: `${elapsed}s`,
-          extras: {
-            dryRun,
-            dryRunUnpushed: items.length - successCount,
-            noidentity: skippedNoIdentity,
-            bad: badElementCount,
-            cachesaved: cacheSaved,
-            similar: similarCount,
-            similarlogged: similarLogged,
-            similardrop: similarDrop
-          }
-        })}\n`)
-        // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
-        // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
-        // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。
-        // 只在「确实抓到了数据、且全部在摄入阶段被丢弃」时告警；空数组、全量去重、全量规则过滤
-        // 都不满足 bad+noidentity === total，因此不会被误报。
-        const droppedAsDirty = xbkdata.length > 0 && items.length === 0 &&
-          (badElementCount + skippedNoIdentity) === xbkdata.length
-        if (droppedAsDirty) {
-          const dirtyDetail = `非法元素 ${badElementCount} 条 / 无有效身份 ${skippedNoIdentity} 条`
-          this._writeRunLog(`${this._localStamp()} WARN 本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目\n`)
-          console.warn(`⚠️ 本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目（接口字段可能已变更）`)
-          if (!dryRun) {
-            try { await this._sendAlert(`本轮抓取 ${xbkdata.length} 条全部为脏数据（${dirtyDetail}），无可推送条目——接口字段可能已变更`, 'dirty-data') } catch (e) { /* 告警失败不阻塞主流程 */ }
-          }
-        }
-
-        // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
-        const summary = {
-          total: xbkdata.length,
-          dedup: dedupCount,
-          filtered: filteredCount,
-          truncated: truncatedCount, // v3.145：截断数（下次推送）
-          pushed: successCount,
-          failed: dryRun ? 0 : items.length - successCount,
-          // APP-03：缓存落盘可观测（false = 本轮成功记录未落盘，下次运行将重推）
-          cacheSaved,
-          failures: failureInfos
-        }
-        if (!dryRun) await this._updateReport(summary)
-
-        // 返回运行摘要（供外部/测试观测，cron 可据此判断）
-        return summary
-      } catch (error) {
-      // 非 Error 抛出（如字符串）时兜底，避免 error.message undefined
-        const errMsg = Utils.safeErrorText(error, Utils.safeText(error, '未知错误'))
-        if (error && error.response) {
-          console.log('请求失败，状态码:', error.response.statusCode)
-        } else if (error && error.code === 'ETIMEDOUT') {
-          console.log('请求超时:', errMsg)
-        } else {
-          console.log('请求错误:', errMsg)
-        }
-        dumpCheckpoints()
-        // 失败也写运行日志（cron 可回溯失败原因；错误信息去换行避免破坏日志行）
-        this._writeRunLog(`${this._localStamp()} ERROR ${String(errMsg).replace(/[\r\n]+/g, ' ')}\n`)
-        // v3.123：接口异常告警（限频 + 静默，不影响主流程）
-        // v3.164：await 告警完成——主入口 process.exit(1) 前需确保告警 HTTP 送达（#10）
-        // dry-run 不允许任何通知副作用；失败仍重抛给调用方/调度器。
-        if (!dryRun) {
-          try { await this._sendAlert(errMsg, 'run-error') } catch (e) { /* 告警失败不阻塞重抛 */ }
-        }
-        throw error // 重新抛出，让外层/调度感知失败（cron 场景 exit code 非 0）
-      } finally {
-      // 后台 DNS/TLS 预热不是业务结果，运行结束或失败时取消未完成请求，避免拖住进程退出。
-      // v3.233：flag 兜底 getNotify() 未 resolve 的竞态——controller 尚未创建时主流程已结束，
-      // then 回调稍后凭 flag 跳过启动，防止预热请求拖住退出。
-        warmupCancelled = true
-        if (warmupController) warmupController.abort()
       }
+      ctx.candidates = items
+      counters.filtered += (beforeKwd - items.length)
+      this._writeFilterDiagnostics([
+        {
+          type: 'run',
+          at: this._localStamp(),
+          total: ctx.fetched.length,
+          dedup: counters.dedup,
+          filtered: counters.filtered,
+          passed: items.length,
+          // 不能从受 maxDetailsPerRun 截断的明细反算，否则汇总会少计。
+          byReason: diag.reasonCounts,
+          detailCount: diag.records.length,
+          // C1-029：本轮明细预算与「被预算挤掉」的分类条数——被截断必须能从文件里看出来。
+          detailsBudget: diag.maxDetails,
+          detailsDropped: diag.drops
+        },
+        ...diag.records
+      ])
+      ctx.checkpoint('data-processed', `items=${items.length} dedup=${counters.dedup} filtered=${counters.filtered} bad=${counters.bad}`)
+    },
+
+    // ⑥ 推送准备：单轮上限截断 + 渲染/发送函数（pushOne）与模板/长度口径。
+    // 与「真正发」分开是因为截断告警要 await，而发送循环按 push.mode 走顺序/并行两条路径；
+    // 两条路径共用同一个 pushOne：成功才写 pushedKeys（落缓存依据），失败只记 ctx.errors。
+    async _preparePush (ctx) {
+      const config = ctx.config
+      const counters = ctx.counters
+      const push = ctx.push
+      const dryRun = ctx.dryRun
+      let items = ctx.candidates
+      // v3.129：单次推送上限（防接口异常返回海量 → 推送风暴/8 分钟运行；正常 ~20 条无影响）
+      // maxPerRun 必须是正整数；小数先取整可能变成 0（如 0.5），会静默跳过全部推送，非法值统一回退默认
+      const maxPerRun = (() => { const v = Utils.num(config.push.maxPerRun, -1); return Number.isInteger(v) && v > 0 ? v : 100 })()
+      if (items.length > maxPerRun) {
+        counters.truncated = items.length - maxPerRun
+        console.warn(`⚠️ 单次待推送 ${items.length} 条超过上限 ${maxPerRun}，只推前 ${maxPerRun} 条（防接口异常推送风暴；调整 Config.push.maxPerRun）`)
+        // v3.239：截断告警推送（复用 alert 限频，防轰炸）——静默丢失曾无感知，手机端可及时发现
+        // v3.240：await 告警（v3.164 曾修复 fire-and-forget 导致告警 HTTP 未送达被杀，子代理审查发现本轮修复回归该模式）
+        // v3.241：文案改为「已暂存待补推」（下轮接口重放时补推，非永久丢弃；子代理审查提示避免误导）
+        // P3（审查 2026-08-15）：再修正——截断条目并未暂存（不入缓存、无任何持久化），仅依赖接口下轮重放，
+        // 「已暂存」仍会误导用户以为已持久化；改为如实描述「待下轮接口重放时补推」
+        if (!dryRun) {
+          try { await this._sendAlert(`⚠️ 线报酷截断：单次待推送 ${items.length} 条超上限 ${maxPerRun}，截断 ${counters.truncated} 条待下轮接口重放时补推（防推送风暴）`, 'truncate') } catch (e) { /* 告警失败不阻塞主流程 */ }
+        }
+        // v3.134：截断掉的不写缓存——否则下次运行去重跳过导致静默丢失（缓存当"已处理"）；下次运行推剩余
+        // keyOf 在 ⑥ 才定义，此处用同口径（id 优先 + url 归一）构造截断 key
+        push.truncatedKeys = new Set(items.slice(maxPerRun).map(it => Utils.getMessageIdentity(it).key))
+        items = items.slice(0, maxPerRun)
+      }
+      ctx.candidates = items
+
+      // ⑥ 推送（sequential=顺序逐条 / parallel=并行滑动窗口；失败不中断、不写缓存，下次重试）
+      const pushModeForProfile = (() => {
+      // v3.250：Config.push 缺失/未配置 mode 时 String(undefined) 会产出字面量 "undefined"；
+      // 显式回退默认顺序模式，仅用于 push-start 日志（不改变实际推送语义）
+        try { const m = config.push && config.push.mode; return (m == null || m === '') ? 'sequential' : String(m) } catch (e) { return '<不可转换值>' }
+      })()
+      ctx.checkpoint('push-start', `count=${items.length} mode=${pushModeForProfile}`)
+      push.startTime = Date.now()
+      ctx.timings.preprocessMs = push.startTime - ctx.runStart - (ctx.timings.fetchMs || 0)
+      // v3.250：预计算每条 items 的 identity key 并缓存（含 newMessages 惰性缓存），
+      // keyOf 复用，避免 getMessageIdentity 对同一对象反复重算（pushedKeys/itemsKeys/toCache 均调用）
+      const itemKeyCache = new Map(items.map(it => [it, Utils.getMessageIdentity(it).key]))
+      const keyOf = (it) => {
+        if (!itemKeyCache.has(it)) itemKeyCache.set(it, Utils.getMessageIdentity(it).key)
+        return itemKeyCache.get(it)
+      }
+      // domain 去尾斜杠后与相对路径统一拼接（避免 'https://x.com//rel' 双斜杠）
+      // R2：非字符串 domain（脏配置）→ 空串 baseUrl（相对路径不拼前缀，避免 .replace 崩溃）
+      const baseUrl = (typeof config.domain === 'string') ? trimTrailingSlashes(config.domain.trim()) : '' // v3.158: trim
+      // url 类型防御：非字符串(null/undefined/对象/数字)视为无链接——避免 .includes 崩溃或 [object Object]
+      // 与 htmlToMarkdown 的 content_html 口径一致（非字符串视为空）
+      const urlOf = (it) => {
+        const u = Utils.safeUrl(it && it.url)
+        if (!u) return ''
+        // 含协议或协议相对(//)不拼前缀；相对路径拼 domain（补斜杠）
+        return (u.includes('://') || u.startsWith('//') ? u : baseUrl + (u.startsWith('/') ? u : '/' + u))
+      }
+      const pushedKeys = push.pushedKeys
+      const failureInfos = ctx.errors
+      const readItemField = (item, field) => {
+        try { return item && item[field] } catch (e) { return undefined }
+      }
+      // v3.250：日志边界——超长字段值（脏数据/整段内容/大对象 JSON）原样入日志会撑爆日志行；
+      // 与推送内容截断同口径，仅限制日志显示长度，不影响实际推送内容
+      const ITEM_LOG_MAX = 100
+      // APP2-07：stdout 回显专用的控制字符清洗（U+0000–U+001F、U+007F → 空格）——青龙任务日志
+      // 按行解析，接口返回的 title/catename 含 \n 或 ANSI ESC 可伪造日志行；推送正文不经此函数
+      // （safeText 不动，推送内容保留换行）。
+      // eslint-disable-next-line no-control-regex -- 控制字符清洗本身就需要匹配控制字符（白名单式替换）
+      const stripLogControl = (text) => text.replace(/[\u0000-\u001F\u007F]/g, ' ')
+      const itemLogText = (item, field, fallback = '') => {
+        const text = Utils.safeText(readItemField(item, field), fallback)
+        const safe = typeof text === 'string' ? stripLogControl(text) : text
+        return typeof safe === 'string' && safe.length > ITEM_LOG_MAX ? Utils.truncateUtf16(safe, ITEM_LOG_MAX) : safe
+      }
+
+      // 推送模板（v3.68 可配置）：非法/缺失回退默认（默认值与历史硬编码完全一致，现有测试锁定）
+      const titleTpl = (typeof config.template.title === 'string' && config.template.title) ? config.template.title : '【{分类名}】{标题}'
+      const contentTpl = (typeof config.template.content === 'string' && config.template.content) ? config.template.content : '{Markdown内容}'
+      // 推送截断长度（v3.69 可配置）：非正数/非数字回退默认（负数会让 slice(0,-1) 误截尾字符）
+      const titleMax = (() => { const v = Math.floor(Utils.num(config.push.titleMax, 100)); return v > 0 ? v : 100 })()
+      const contentMax = (() => { const v = Math.floor(Utils.num(config.push.contentMax, 3000)); return v > 0 ? v : 3000 })()
+      const preview = ctx.preview
+
+      // 单条推送（两种模式共用）：成功返回 {ok:true} 并记录；失败警告且不写缓存(下次重试)
+      // APP-06：渲染段（safeObjectCopy/urlOf/Formatter.tuisong_replace/sanitizeSurrogates/
+      // truncateUtf16/链接保留 + dry-run preview）与发送段一样受 try 保护——渲染期异常按「单条
+      // 推送失败」处理（警告、不写缓存、下次重试），不再冒泡中止整轮：并行模式 Promise.all 会
+      // 整体 reject，saveBatch 根本不执行，本轮所有新数据都会漏写缓存。
+      const pushOne = async (item, notifyModule) => {
+        let text = ''
+        let desp = ''
+        try {
+          // 推送内容截断：避免超长标题/内容被推送 API 拒绝（长度可配置，默认 100/3000）
+          // 用 UTF-16 安全截断（不切断 emoji 代理对）
+          // R9：title/content 非字符串（对象等脏数据）→ 空标题占位/空内容（避免 '[object Object]' 泄漏）
+          const pushItem = {
+            ...Utils.safeObjectCopy(item),
+            url: urlOf(item),
+            // v3.110：孤立代理清洗（encodeURIComponent 对孤立代理抛 URIError → 推送失败）
+            // R9/审查9-C 语义保留：非字符串或空串 title → (无标题) 占位；content 空串置空
+            title: (() => {
+              const value = readItemField(item, 'title')
+              return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' && value !== '' ? value : '(无标题)'), titleMax)
+            })(),
+            content: (() => {
+              const value = readItemField(item, 'content')
+              return Utils.truncateUtf16(Utils.sanitizeSurrogates(typeof value === 'string' ? value : ''), contentMax)
+            })()
+          }
+          // C1-010：只对「要转 Markdown」的渲染做有界前缀（{Html内容} 原样发 HTML，截前缀会丢内容）。
+          const renderItem = contentTpl.includes('{Html内容}') ? pushItem : this._boundMarkdownHtml(pushItem, contentMax)
+          // 标题兜底截断（v3.70）：text 由「分类名+标题」拼接，分类名超长时整体可超 titleMax——
+          // 与 desp 同口径，titleMax 语义统一为「推送标题最终长度上限」
+          text = Utils.truncateUtf16(Formatter.tuisong_replace(titleTpl, renderItem), titleMax)
+          // desp 兜底截断：contentMax 统一作用于推送内容最终长度（v3.69 修复——原只截断 {内容} 字段，
+          // {Markdown内容} 走 content_html 转换从不截断，超长 HTML 会撑爆推送 API）
+          // v3.110：desp 也清洗孤立代理（content_html 可能含脏代理）
+          const rawDesp = Formatter.tuisong_replace(contentTpl, renderItem)
+          const rawClean = Utils.sanitizeSurrogates(rawDesp)
+          desp = Utils.truncateUtf16(rawClean, contentMax)
+          // v3.152：长内容截断曾把尾部"原文链接"截掉（用户看不到链接）——检测并保留
+          const safePushUrl = Utils.safeUrl(pushItem.url)
+          if (rawClean.includes('原文链接') && !desp.includes('原文链接') && safePushUrl) {
+            const link = `原文链接：[${safePushUrl}](<${safePushUrl}>)`
+            // 链接本身超过 contentMax 时不保留（尊重截断配置）；否则内容截短补链接（仍 ≤ contentMax）
+            // v3.177：边界修正——link 接近 contentMax 时 contentMax-link-2 曾 ≤0，truncateUtf16 对非正
+            // max 返回原串 → desp 全量+链接显著超限（系统验证反证 #3）；改为「链接+分隔符完整容纳
+            // 才补」+ keep≥1 保证总长 ≤ contentMax（link+2 == contentMax 时 keep=0 会触发上述缺陷）
+            if (link.length + 2 < contentMax) {
+              const keep = contentMax - link.length - 2
+              desp = Utils.truncateUtf16(desp, keep) + '\n\n' + link
+            }
+          }
+          if (preview(text, desp)) return { item, ok: false, preview: true }
+        } catch (e) {
+          // 非 Error 兜底（R1）：与发送段同口径，内容渲染异常不得中止整轮推送
+          const failure = summarizeError(e)
+          failureInfos.push(failure)
+          console.log(`⚠️ 推送失败（内容渲染异常，不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`)
+          return { item, ok: false, failure }
+        }
+        try {
+          const sent = await Pusher.send(text, desp, notifyModule)
+          pushedKeys.add(keyOf(item))
+          // v3.159：推送成功 → 清除过滤写入标记（否则 _f 随对象写回缓存，下次规则变更又误清）
+          // 标记属性异常不能把已送达消息改判为失败；即使无法删除，后续缓存仍按成功处理。
+          try { delete item._f } catch (e) { /* 非可配置脏属性不影响已成功推送 */ }
+          return { item, ok: true, sent }
+        } catch (e) {
+        // 非 Error 兜底（R1）：notify 抛字符串等非 Error 时避免 e.message undefined（与 v3.31/73/81 口径一致）
+          const failure = summarizeError(e)
+          failureInfos.push(failure)
+          console.log(`⚠️ 推送失败（不写入缓存，下次运行重试）: ${itemLogText(item, 'title', '(无标题)')}【${itemLogText(item, 'catename')}】 ${failure.message || Utils.safeText(e)}`)
+          return { item, ok: false, failure }
+        }
+      }
+      push.keyOf = keyOf
+      push.urlOf = urlOf
+      push.itemLogText = itemLogText
+      push.pushOne = pushOne
+    },
+
+    // ⑥ 推送：等通知模块加载完成，按 push.mode 顺序或并行发送。
+    // 推送顺序、失败不中断、间隔语义（per-worker）全部沿用旧实现；成功日志按数据顺序输出。
+    async _runPush (ctx) {
+      const config = ctx.config
+      const push = ctx.push
+      await this._preparePush(ctx)
+      // 截断在本阶段内完成（_preparePush 会改写 ctx.candidates）——必须在它之后取候选集，
+      // 否则会把已截断的条目也发出去（TR-1 回归用例锁这条）。
+      const items = ctx.candidates
+      // v3.223：推送模块（含 got）已与接口并行加载，首推前确保完成（接口快时最多等剩余加载时间）
+      // APP2-04（已知缺口，未收紧）：dry-run 仍在此 await getNotify()，且上方预热 Promise 也调用
+      // getNotify()，故 dry-run 依旧依赖推送模块可加载（.then 内只是跳过 DNS/TLS 预热）。改为按需
+      // 加载需同步重排预热 Promise/checkpoint/PROFILE3 摘要（notifyModule 也可能为 null），留待专门变更。
+      const notifyModule = await getNotify()
+      ctx.checkpoint('notify-module-loaded')
+
+      let successCount = 0
+      const pushResults = push.results
+      // C1-017：并行/顺序两条循环的**共用**口径（成功日志、成功计数、补位间隔）收敛到一处。
+      // 旧实现里每个分支各写一遍控制台文案、`successCount` 口径与 `pushInterval` 解析——文案改一处
+      // 就漂移（并行分支曾漏掉 `!r.preview` 的等价改写），间隔语义也容易只改一边。
+      // per-worker 语义保留：并行分支每完成一条（且还有待推条目）等一次间隔，全局速率 =
+      // parallelLimit × interval；顺序分支每条之后都等（含最后一条，与旧行为逐字一致）。
+      const pushInterval = Utils.num(Config.timing.pushInterval, 0)
+      const waitPushSlot = async () => { if (pushInterval > 0) await delay(pushInterval) }
+      // 成功才打日志并计数：preview/失败都不算成功（旧并行分支 `r.ok && !r.preview` 的 !preview 恒真）。
+      const logPushed = (r) => {
+        if (!r || !r.ok) return 0
+        console.log(`发现到新数据：${push.itemLogText(r.item, 'title', '(无标题)')}【${push.itemLogText(r.item, 'catename')}】${push.urlOf(r.item)}`)
+        return 1
+      }
+      // push.mode 非法值提示（防静默降级：用户配 'PARALLEL' 等会按顺序执行）
+      if (config.push && config.push.mode && config.push.mode !== 'sequential' && config.push.mode !== 'parallel') {
+        console.warn(`⚠️ 配置「push.mode」值无效：「${ctx.safeConfigText(config.push.mode)}」（应为 sequential/parallel），已按顺序模式执行`)
+      }
+      if (config.push && config.push.mode === 'parallel') {
+      // 并行推送：滑动窗口限并发；任意一条完成后立即补下一条。
+      // parallelLimit 防御：夹取口径只在 resolveParallelWindow（取整（0.5 取 0 后回退 1）、0/负数按消息总数、硬性上限 50）。
+        const limit = resolveParallelWindow(config.push.parallelLimit, items.length)
+        const results = new Array(items.length)
+        let nextIndex = 0
+        const worker = async () => {
+          while (true) {
+            const index = nextIndex++
+            if (index >= items.length) return
+            results[index] = await push.pushOne(items[index], notifyModule)
+            // 保留可配置的补位间隔（per-worker 语义：每个 worker 完成一条后等 pushInterval 再补下一条，
+            // 并行全局速率 = parallelLimit × interval；已知取舍，量小+重试兜底不改），pushInterval=0 即完成即补。
+            if (nextIndex < items.length) await waitPushSlot()
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+        pushResults.push(...results)
+        // 按原顺序输出成功日志（并发完成顺序不定，日志保持数据顺序）
+        for (const r of results) successCount += logPushed(r)
+      } else {
+      // 顺序推送（默认）：逐条 await；仅在显式配置正间隔时等待。
+        for (const item of items) {
+          const r = await push.pushOne(item, notifyModule)
+          pushResults.push(r)
+          successCount += logPushed(r)
+          await waitPushSlot()
+        }
+      }
+      push.success = successCount
+      ctx.checkpoint('push-complete', `success=${successCount} failed=${items.length - successCount}`)
+      if (PROFILE3 && notifyModule && typeof notifyModule.printWxPusherProfileSummary === 'function') {
+        notifyModule.printWxPusherProfileSummary()
+      }
+    },
+
+    // ⑦ 收尾：写缓存（只收录「被过滤的」+「推送成功的」）、近似去重窗口、通道健康、
+    // 统计与 profile、run.log 摘要行、脏数据告警、运行日报，最后返回本轮摘要。
+    async _runFinalize (ctx) {
+      const config = ctx.config
+      const counters = ctx.counters
+      const push = ctx.push
+      const similarState = ctx.similar
+      const items = ctx.candidates
+      const keyOf = push.keyOf
+
+      // ⑦ 写缓存：只收录「被过滤的数据」+「推送成功的数据」
+      //    推送失败的排除在外 → 下次运行重新推送（避免消息永久丢失）
+      const channelSuccessful = new Set()
+      const channelFailures = []
+      const recordChannelOutcome = (result) => {
+        if (!result) return
+        const sent = result.sent
+        if (sent && Array.isArray(sent.successfulChannels)) {
+          for (const channel of sent.successfulChannels) channelSuccessful.add(channel)
+        }
+        if (sent && Array.isArray(sent.failures)) channelFailures.push(...sent.failures)
+        if (result.failure) {
+          // APP2-03 / C1-015：result.failure 的来源是 summarizeError(e)（xbk_failure_policy.js）。
+          // 「全部通道失败」在投递层是**抛错**（xbk_sendNotify_slim.js 的 `okCount === 0` ⇒
+          // ALL_CHANNELS_FAILED，错误对象挂 failures=[逐通道失败]），所以这时 sent 恒不存在，
+          // 下面这段 failure.failures 是这类失败**唯一**能进 _updateChannelHealth 通道健康统计的
+          // 入口（sent.failures 那条路走不到）。旧注释称整段「分支不可达」并据此保留了一段
+          // 死分支——按那个论证删代码会把这条在跑的路一起删掉，健康统计从此静默漏记整轮全通道失败。
+          // 真正不可达的只有 successfulChannels 半边：summarizeError 只透出 code/name/statusCode/
+          // providerCode/channel/message/failureKind/failures（不拷贝 successfulChannels），且
+          // okCount===0 路径上该数组恒为空；即便日后透出也**不该**记成功（会把「全部失败」记成
+          // 「部分成功」并污染健康统计）⇒ 该半边已删除，不再保留会被误读为可删死代码的形态。
+          const failedChannels = result.failure.failures
+          if (Array.isArray(failedChannels)) {
+            channelFailures.push(...failedChannels)
+          } else if (result.failure.code === 'ALL_CHANNELS_FAILED') {
+          // 聚合失败的载荷就是 error.failures，摘要里缺失说明摘要链路被改坏：此时健康统计会静默
+          // 漏掉整轮失败（不报警、不累计），必须响亮而不是当作「没有失败通道」吞掉。
+            console.warn('⚠️ 全通道失败的摘要缺少 failures 明细（摘要链路异常），本轮通道健康统计将漏记这些通道')
+          }
+        }
+      }
+      for (const result of push.results) recordChannelOutcome(result)
+      // 健康观测在成功缓存持久化后执行；其自身失败被完全隔离：绝不改变推送成功语义。
+      const itemsKeys = new Set(items.map(keyOf))
+      // v3.134：排除截断未推的（下次运行推剩余，防静默丢失）
+      const toCache = ctx.dryRun
+        ? []
+        : ctx.newMessages.filter(m => !push.truncatedKeys.has(keyOf(m)) && (!itemsKeys.has(keyOf(m)) || push.pushedKeys.has(keyOf(m))))
+      const cacheStart = Date.now()
+      // APP-03：落盘结果必须可观测——saveBatch 的返回值（xbk_message_store.js 已随 B8 改为
+      // 返回 true/false）此前被丢弃，缓存落盘失败时摘要与退出码仍报成功，运维看不到「本轮
+      // 推送成功但成功记录没落盘」（下次运行会重推）。这里接住失败并写 run.log 告警；
+      // result.cacheSaved 同时进摘要（false 表示本轮缓存未落盘）。
+      // APP-03 返工：不得给 cacheSaved 预设初值——下方 try 的成功分支与 catch 分支都必然赋值
+      // （saveBatch 抛错走 catch → false），预设的 `= true` 是死存储（CodeQL js/useless-assignment-to-local
+      // 实测命中：The initial value of cacheSaved is unused, since it is always overwritten）。
+      // 去掉初值不改语义：两分支覆盖后读取点（下方告警与摘要）拿到的仍是真实落盘结果。
+      let cacheSaved
+      try { cacheSaved = MessageStore.saveBatch(toCache, ctx.dedupe.cacheName) !== false } catch (e) { cacheSaved = false } // 契约：undefined 视为成功（兼容旧实现）
+      ctx.timings.cacheMs = Date.now() - cacheStart
+      if (!cacheSaved) {
+        this._writeRunLog(`${this._localStamp()} WARN 缓存落盘失败：本轮 ${toCache.length} 条记录未能写入 ${ctx.dedupe.cacheName}，下次运行将对它们重新判重（可能重复推送）\n`)
+        console.warn(`⚠️ 缓存落盘失败：本轮 ${toCache.length} 条记录未写入缓存文件（下次运行会重新推送）`)
+      }
+      ctx.checkpoint('cache-write-complete', `cached=${toCache.length} cacheMs=${ctx.timings.cacheMs}`)
+
+      // v3.397：把本轮推送成功的标题写进近似去重窗口（失败的标题不写，下次还能正常推）
+      if (!ctx.dryRun) {
+        try {
+          const savedAt = Date.now() // 写入时刻而非本轮开始时刻：单轮超过 10 分钟时不至于一落盘就过期
+          let list = similarState.recent
+          for (const m of items) {
+            if (push.pushedKeys.has(keyOf(m))) list = Similar.appendRecent(list, Utils.safeText(Utils.safeGet(m, 'title'), ''), savedAt, Utils.safeText(Utils.safeGet(m, 'content'), ''))
+          }
+          // F3-1：只有确定性损坏件才隔离（瞬时读失败已在读取处排除，绝不 rename）。
+          // F3-3：隔离件按每窗口 SIMILAR_CORRUPT_BACKUP_KEEP 份回收（见 _pruneSimilarBackups）。
+          const isolated = similarState.corrupt ? this._isolateSimilarWindow(similarState.path) : ''
+          // 隔离失败（false）时不得再写：原件没搬走，覆写等于删掉唯一副本。
+          if (isolated !== false && (similarState.corrupt || list !== similarState.recent)) {
+            similarState.recent = list
+            if (!this._writeSimilarWindow(similarState.path, list)) similarState.drop = list.length
+          }
+        } catch (e) {
+          console.warn(`⚠️ 近似去重缓存更新失败（不影响本轮推送）：${Utils.safeErrorText(e, '未知错误')}`)
+        }
+      }
+      // v3.410：本轮近似去重拦截明细落盘（`similar-blocked.ndjson`）。只加日志：写失败只 console.warn，
+      // 返回实际写入条数供摘要行 `similarlogged=N` 对账；推送结果、缓存、退出码一概不受影响。
+      similarState.logged = this._writeSimilarBlockedLog(similarState.blocked)
+      if (similarState.overflow > 0) {
+        console.warn(`⚠️ 近似去重拦截明细超过每轮上限 ${SIMILAR_BLOCKED_MAX_RECORDS} 条，另有 ${similarState.overflow} 条只计数未记录`)
+      }
+
+      await this._updateChannelHealth({ successfulChannels: [...channelSuccessful], failures: channelFailures })
+
+      // 预取收尾：只观察已完成结果，不等待后台预取，避免它拖慢主流程退出。
+      ctx.checkpoint('tls-warmup-observed', ctx.warmup.tlsSettled && ctx.warmup.tls
+        ? `ok=${ctx.warmup.tls.ok} okCount=${ctx.warmup.tls.okCount || 0}/${ctx.warmup.tls.count || 0} elapsedMs=${ctx.warmup.tls.elapsedMs}`
+        : 'pending')
+
+      // ⑧ 统计
+      const pushMs = Date.now() - push.startTime
+      const elapsed = (pushMs / 1000).toFixed(1)
+      console.log('\n══════════ 本次运行 ══════════')
+      console.log(`  获取:     ${ctx.fetched.length} 条`)
+      console.log(`  去重跳过:  ${counters.dedup} 条`)
+      if (counters.similar > 0) console.log(`  近似重复:  ${counters.similar} 条（10 分钟内标题相似，已跳过）`)
+      console.log(`  过滤屏蔽:  ${counters.filtered} 条`)
+      if (counters.truncated > 0) console.log(`  截断待推:  ${counters.truncated} 条（下次运行推送，防推送风暴）`)
+      if (counters.bad > 0) console.log(`  非对象元素: ${counters.bad} 条（接口脏数据，已跳过）`)
+      if (counters.noIdentity > 0) console.log(`  身份无效:  ${counters.noIdentity} 条（无 id/有效 url，已跳过）`)
+      // APP2-04：dry-run 从未尝试推送，不能与真实失败共用「N 条失败，下次运行重试」文案
+      // （summary.failed 已显式判 0，日志/终端口径与返回值必须一致）。
+      const pushResultText = ctx.dryRun
+        ? (items.length > push.success ? `（dry-run 未推送 ${items.length - push.success} 条）` : '')
+        : (push.success < items.length ? `（${items.length - push.success} 条失败，下次运行重试）` : '')
+      console.log(`  推送:     ${push.success} 条${pushResultText}`)
+      if (!cacheSaved) console.log(`  缓存:     落盘失败（${toCache.length} 条未写入缓存，下次运行会重新推送）`)
+      console.log(`  耗时:     ${elapsed}s`)
+      if (process.env.XBK_PROFILE === '1' || ctx.detailedProfile) {
+        const totalMs = Date.now() - ctx.runStart
+        console.log(`  [profile] 接口: ${typeof ctx.timings.fetchMs === 'number' ? (ctx.timings.fetchMs / 1000).toFixed(3) + 's' : 'n/a'} | 推送: ${(pushMs / 1000).toFixed(3) + 's'} | 总计: ${(totalMs / 1000).toFixed(3) + 's'}`)
+        if (ctx.detailedProfile) {
+          // APP2-05：预热被跳过（skipped）或未采集 elapsedMs 时，曾 (undefined/1000).toFixed(3) → "NaN"；
+          // 有限性判定后回退 n/a，skipped 路径显式输出「跳过」。
+          const dnsWarmup = ctx.warmup.dns
+          const tlsWarmup = ctx.warmup.tls
+          const warmupElapsed = (w) => Number.isFinite(w && w.elapsedMs) ? `${(w.elapsedMs / 1000).toFixed(3)}s` : 'n/a'
+          const warmupText = dnsWarmup ? `${dnsWarmup.skipped ? '跳过' : (dnsWarmup.ok ? '成功' : '失败')} ${warmupElapsed(dnsWarmup)}${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a'
+          const tlsText = tlsWarmup ? `${tlsWarmup.skipped ? '跳过' : `${tlsWarmup.okCount}/${tlsWarmup.count} 成功`} ${warmupElapsed(tlsWarmup)}` : 'n/a'
+          console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, ctx.timings.preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(ctx.timings.cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(config.timing.finalWait, 0) / 1000).toFixed(3)}s`)
+        }
+      }
+      ctx.dumpCheckpoints()
+      console.log('══════════════════════════════')
+      await delay(Utils.num(config.timing.finalWait, 0))
+
+      // v3.163：#9 推送全部失败无告警（v3.123 声称覆盖密钥失效但只实现接口挂）——
+      // 补告警推送（限频复用 alert.state，防轰炸）+ run.log ERROR 行（cron 翻日志可见）
+      // v3.170：await 告警完成（与 catch 路径 v3.164 同口径）——曾 fire-and-forget，
+      // run() 返回后进程退出时序不确定（虽然内部 .catch 兜底不丢，但行为不一致）
+      // C9-002：失败计数是**消息**级（successCount 来自 pushOne 结果）。旧判据 `successCount === 0`
+      // 只覆盖全灭：1 条成功 + 99 条失败时既不告警也不写 ERROR 行，配上分类器「pushed>0 即成功」
+      // 就是「99 条被静默吞掉」。现在只要还有消息没送达就告警；全失败的文案保持不变
+      // （console/status 的 run.log 解析以「推送全部失败」为锚点），部分失败另写带条数的行。
+      // 合并 b1：本处在两类文案上都带 'push-fail' 告警类别（C1-004），与截断/接口异常等
+      // 其他类别各计各的限频窗口。
+      const failedMessages = items.length - push.success
+      if (!ctx.dryRun && items.length > 0 && failedMessages > 0) {
+        const allFailed = push.success === 0
+        try {
+          await this._sendAlert(allFailed
+            ? `推送全部失败（${items.length} 条）：推送通道可能失效（key/限流/API）`
+            : `推送部分失败（成功 ${push.success} 条 / 失败 ${failedMessages} 条）：未送达的消息下轮重试，通道可能部分失效`, 'push-fail')
+        } catch (e) { /* 告警失败不阻塞主流程 */ }
+        this._writeRunLog(`${this._localStamp()} ERROR ${allFailed
+          ? `推送全部失败 ${items.length} 条（通道可能失效）`
+          : `推送部分失败 ${failedMessages}/${items.length} 条（未送达消息下轮重试）`}\n`)
+      }
+      // 运行摘要持久化到缓存目录 run.log（cron 场景回溯/失败趋势；写失败不影响主流程）
+      // APP2-04：dry-run 的 failed 恒为 0（与 summary 口径一致），未推送条数另记；APP-04：身份无效条目单独可对账。
+      // S2：这一行与读侧的 RUN_SUMMARY_LINE_RE / parseRunSummaryLine 同出 xbk_state_schema
+      // （formatRunSummaryLine）——此前「写的模板字符串」与「读的正则」是两份，加字段两边各改一次。
+      this._writeRunLog(`${formatRunSummaryLine({
+        stamp: this._localStamp(),
+        counters: {
+          total: ctx.fetched.length,
+          dedup: counters.dedup,
+          filtered: counters.filtered,
+          truncated: counters.truncated,
+          pushed: push.success,
+          failed: ctx.dryRun ? 0 : items.length - push.success
+        },
+        elapsed: `${elapsed}s`,
+        extras: {
+          dryRun: ctx.dryRun,
+          dryRunUnpushed: items.length - push.success,
+          noidentity: counters.noIdentity,
+          bad: counters.bad,
+          cachesaved: cacheSaved,
+          similar: counters.similar,
+          similarlogged: similarState.logged,
+          similardrop: similarState.drop
+        }
+      })}\n`)
+      // C1-005：100% 脏数据（全部非法元素 / 全部无有效身份）时 items 为空——pushed=0/failed=0、
+      // 退出码 0，而「failed 只统计已进入推送的条目」与「空数组不告警」两条既定契约都不允许改，
+      // 于是旧实现零告警零留痕：上游改字段名/返回模板页时脚本整天「绿色成功」却一条没推。
+      // 只在「确实抓到了数据、且全部在摄入阶段被丢弃」时告警；空数组、全量去重、全量规则过滤
+      // 都不满足 bad+noidentity === total，因此不会被误报。
+      const droppedAsDirty = ctx.fetched.length > 0 && items.length === 0 &&
+        (counters.bad + counters.noIdentity) === ctx.fetched.length
+      if (droppedAsDirty) {
+        const dirtyDetail = `非法元素 ${counters.bad} 条 / 无有效身份 ${counters.noIdentity} 条`
+        this._writeRunLog(`${this._localStamp()} WARN 本轮抓取 ${ctx.fetched.length} 条全部为脏数据（${dirtyDetail}），无可推送条目\n`)
+        console.warn(`⚠️ 本轮抓取 ${ctx.fetched.length} 条全部为脏数据（${dirtyDetail}），无可推送条目（接口字段可能已变更）`)
+        if (!ctx.dryRun) {
+          try { await this._sendAlert(`本轮抓取 ${ctx.fetched.length} 条全部为脏数据（${dirtyDetail}），无可推送条目——接口字段可能已变更`, 'dirty-data') } catch (e) { /* 告警失败不阻塞主流程 */ }
+        }
+      }
+
+      // v3.125：运行日报（跨天发昨日汇总 + 当天累加；静默）
+      const summary = {
+        total: ctx.fetched.length,
+        dedup: counters.dedup,
+        filtered: counters.filtered,
+        truncated: counters.truncated, // v3.145：截断数（下次推送）
+        pushed: push.success,
+        failed: ctx.dryRun ? 0 : items.length - push.success,
+        // APP-03：缓存落盘可观测（false = 本轮成功记录未落盘，下次运行将重推）
+        cacheSaved,
+        failures: ctx.errors
+      }
+      ctx.summary = summary
+      if (!ctx.dryRun) await this._updateReport(summary)
+
+      // 返回运行摘要（供外部/测试观测，cron 可据此判断）
+      return summary
     }
   }
   return App

@@ -6060,6 +6060,225 @@ checkAsync('R1 行为：接管哨兵释放失败 ⇒ App.run 本轮摘要带 sen
   })
 })
 
+// ============================================================
+// P1：_runLocked 阶段管线（prepare → fetch → ingest → filter → push → finalize）
+//
+// 这些用例锁的是**行为快照**与**编排协议**，不是源码文本：
+//   · 成功一轮：summary 的字段集合/顺序与 run.log 摘要行格式不变；
+//   · 抓取失败：错误对象原样重抛（错误码不变）、只留 ERROR 行与 run-error 告警、不进入推送；
+//   · 判重缓存读取失败：ingest 早退返回失败摘要（failed=total），后续阶段一律不执行；
+//   · 阶段顺序：用注入计数器包住六个阶段方法，断言调用顺序与「同一个 runCtx」；
+//   · 推送部分失败：summary.failed/failures 与 run.log ERROR 行语义不变，且失败条目不写缓存。
+// ============================================================
+const PIPELINE_STAGES = ['_runPrepare', '_runFetch', '_runIngest', '_runFilter', '_runPush', '_runFinalize']
+
+// 阶段调用的观测器：把阶段方法包一层计数器（不改被测逻辑，仍调用原方法）。
+function spyPipelineStages (App) {
+  const calls = []
+  const ctxs = []
+  for (const name of PIPELINE_STAGES) {
+    const orig = App[name]
+    App[name] = async function (ctx) {
+      calls.push(name)
+      ctxs.push(ctx)
+      assert.strictEqual(arguments.length, 1, `${name} 必须只接收 runCtx 一个参数（禁止把整个 App 当背包）`)
+      assert.notStrictEqual(ctx, this, `${name} 不得把 this（App）当运行上下文传入`)
+      return await orig.call(this, ctx)
+    }
+  }
+  return { calls, ctxs }
+}
+
+// 告警类别观测：_sendAlert 在 Config.alert.enabled=false 时会提前返回，故先记录再转调。
+function spyAlerts (App) {
+  const seen = []
+  const orig = App._sendAlert
+  App._sendAlert = async function (errMsg, alertKey = 'alert') {
+    seen.push({ text: errMsg, reason: alertKey })
+    return orig.call(this, errMsg, alertKey)
+  }
+  return seen
+}
+
+function readRunLogLines (realFs, cacheDir) {
+  const file = path.join(cacheDir, 'run.log')
+  return realFs.existsSync(file) ? realFs.readFileSync(file, 'utf8').split('\n').filter(l => l !== '') : []
+}
+
+// 管线用例的公共夹具：临时缓存目录 + 与生产同一批业务模块，只桩掉 Network/Pusher。
+// XBK_CACHE_DIR 是唯一能让 MessageStore 采纳根外临时目录的部署开关（与 FR-* 用例同口径）。
+async function withPipelineFixture (tag, over, fn) {
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = mkTmpFixture(tag)
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir, over)
+  try {
+    return await fn(h, cacheDir, realFs)
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+}
+
+checkAsync('P1-1 阶段管线成功一轮：summary 字段顺序与 run.log 摘要行格式不变', async () => {
+  const { RUN_SUMMARY_LINE_RE, parseRunSummaryLine } = require('./xbk_state_schema')
+  await withPipelineFixture('pipeline-ok-', {}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('p1-a', '正常甲'), makeRunItem('p1-b', '正常乙')])
+    const round = await runWithWarnings(h.App)
+    // 字段集合与插入顺序都是对外契约（JSON.stringify / worker 协议 / 测试快照都按它）
+    assert.deepStrictEqual(Object.keys(round.summary),
+      ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'cacheSaved', 'failures'],
+      `summary 字段集合/顺序必须与拆分前一致：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(
+      {
+        total: round.summary.total,
+        dedup: round.summary.dedup,
+        filtered: round.summary.filtered,
+        truncated: round.summary.truncated,
+        pushed: round.summary.pushed,
+        failed: round.summary.failed,
+        cacheSaved: round.summary.cacheSaved,
+        failures: round.summary.failures
+      },
+      { total: 2, dedup: 0, filtered: 0, truncated: 0, pushed: 2, failed: 0, cacheSaved: true, failures: [] },
+      `成功一轮的摘要值必须不变：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(h.sends.length, 2, '两条都应经 Pusher 发出（顺序推送）')
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id).sort(), ['p1-a', 'p1-b'],
+      '推送成功的条目必须写回缓存（下轮判重）')
+
+    const lines = readRunLogLines(realFs, cacheDir)
+    const summaryLines = lines.filter(l => RUN_SUMMARY_LINE_RE.test(l))
+    assert.strictEqual(summaryLines.length, 1, `本轮必须恰好一行摘要：${JSON.stringify(lines)}`)
+    // 关键行格式：戳 + 六项计数（固定顺序）+ elapsed + 条件尾部（本场景只有 cachesaved）
+    assert.match(summaryLines[0],
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=\d+\.\ds cachesaved=1$/,
+      `run.log 摘要行格式必须不变：${summaryLines[0]}`)
+    const parsed = parseRunSummaryLine(summaryLines[0])
+    assert.ok(parsed, `摘要行必须能被读侧解析：${summaryLines[0]}`)
+    assert.deepStrictEqual(
+      [parsed.counters.total, parsed.counters.dedup, parsed.counters.filtered, parsed.counters.truncated, parsed.counters.pushed, parsed.counters.failed],
+      [2, 0, 0, 0, 2, 0],
+      '读侧解析出的六项计数必须与写入侧一致')
+  })
+})
+
+checkAsync('P1-2 阶段管线抓取失败：错误码原样重抛、只留 ERROR 行与 run-error 告警、不进入推送', async () => {
+  const boom = new Error('抓取爆炸')
+  boom.code = 'ETIMEDOUT'
+  await withPipelineFixture('pipeline-fetchfail-', { fetchData: () => { throw boom } }, async (h, cacheDir, realFs) => {
+    const alerts = spyAlerts(h.App)
+    let caught = null
+    try { await runWithWarnings(h.App) } catch (e) { caught = e }
+    assert.strictEqual(caught, boom, '必须重抛同一个错误对象（错误码/堆栈不得被包装）')
+    assert.strictEqual(caught.code, 'ETIMEDOUT', '错误码必须原样保留')
+    assert.strictEqual(h.sends.length, 0, '抓取失败不得进入推送阶段')
+
+    const lines = readRunLogLines(realFs, cacheDir)
+    const errLines = lines.filter(l => l.includes(' ERROR '))
+    assert.strictEqual(errLines.length, 1, `失败轮只应写一行 ERROR：${JSON.stringify(lines)}`)
+    assert.match(errLines[0], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ERROR 抓取爆炸$/,
+      `ERROR 行格式必须不变：${errLines[0]}`)
+    assert.strictEqual(lines.filter(l => /total=\d+ dedup=/.test(l)).length, 0, '失败轮不得写运行摘要行')
+    assert.deepStrictEqual(alerts, [{ text: '抓取爆炸', reason: 'run-error' }],
+      `必须按 run-error 类别发一次告警：${JSON.stringify(alerts)}`)
+  })
+})
+
+checkAsync('P1-3 阶段管线判重缓存读取失败：ingest 早退返回失败摘要（failed=total），后续阶段不执行', async () => {
+  await withPipelineFixture('pipeline-cachefail-', {}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('p1-c', '正常丙'), makeRunItem('p1-d', '正常丁')])
+    // 让真实 readMessages 跑完后带上「读失败」标记（生产里由 ioError/损坏触发）
+    const origRead = h.MessageStore.readMessages
+    h.MessageStore.readMessages = function (readPath) {
+      const result = origRead.call(this, readPath)
+      this._readFailed[readPath] = true
+      return result
+    }
+    const { calls } = spyPipelineStages(h.App)
+    const alerts = spyAlerts(h.App)
+    const round = await runWithWarnings(h.App)
+
+    // 早退摘要沿用原字段集合（没有 cacheSaved，因为没有走到 finalize）
+    assert.ok(round.summary && typeof round.summary === 'object',
+      `缓存读失败必须返回摘要对象（不得返回 null/undefined）：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(Object.keys(round.summary),
+      ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'failures'],
+      `早退摘要字段必须与拆分前一致：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(round.summary,
+      { total: 2, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 2, failures: [] },
+      `缓存读失败必须给出 failed=total 的摘要（退出码语义由外层分类器派生）：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(calls, ['_runPrepare', '_runFetch', '_runIngest'],
+      `早退后 filter/push/finalize 一律不得执行：${JSON.stringify(calls)}`)
+    assert.strictEqual(h.sends.length, 0, '缓存读失败不得推送')
+    const lines = readRunLogLines(realFs, cacheDir)
+    assert.ok(lines.some(l => /ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）/.test(l)),
+      `run.log 必须留 ERROR 行：${JSON.stringify(lines)}`)
+    assert.strictEqual(lines.filter(l => /total=\d+ dedup=/.test(l)).length, 0, '早退不得写运行摘要行')
+    assert.deepStrictEqual(alerts.map(a => a.reason), ['cache-read'],
+      `必须按 cache-read 类别告警（且只告警一次）：${JSON.stringify(alerts)}`)
+  })
+})
+
+checkAsync('P1-4 阶段管线顺序：六个阶段按序调用且共用同一个 runCtx', async () => {
+  await withPipelineFixture('pipeline-order-', {}, async (h) => {
+    h.setItems([makeRunItem('p1-e', '正常戊')])
+    const { calls, ctxs } = spyPipelineStages(h.App)
+    const round = await runWithWarnings(h.App)
+    assert.deepStrictEqual(calls, PIPELINE_STAGES, `阶段顺序必须固定：${JSON.stringify(calls)}`)
+    assert.ok(ctxs.every(c => c === ctxs[0]), '六个阶段必须共享同一个上下文对象')
+    const ctx = ctxs[0]
+    // runCtx 显式携带状态：配置/规则引用、抓取结果、候选集、推送结果、错误收集、摘要
+    assert.strictEqual(ctx.config, h.Config, '配置引用必须显式挂在 ctx 上')
+    assert.strictEqual(ctx.rules.active.source, 'default', '本轮生效规则引用挂在 ctx.rules')
+    assert.strictEqual(ctx.fetched.length, 1, '抓取结果必须显式挂在 ctx 上')
+    assert.strictEqual(ctx.candidates.length, 1, '候选集必须显式挂在 ctx 上')
+    assert.strictEqual(ctx.push.results.length, 1, '推送结果必须显式挂在 ctx 上')
+    assert.ok(Array.isArray(ctx.errors), '错误收集必须是数组')
+    assert.strictEqual(ctx.summary, round.summary, '摘要由 finalize 写入 ctx 并由 _runLocked 返回')
+  })
+})
+
+checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run.log ERROR 行语义不变，失败条目不写缓存', async () => {
+  const sent = []
+  const Pusher = {
+    send: async (text) => {
+      sent.push(text)
+      if (text.includes('失败乙')) throw new Error('push boom')
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  await withPipelineFixture('pipeline-pushfail-', { Pusher }, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('p1-f', '正常甲'), makeRunItem('p1-g', '失败乙')])
+    const alerts = spyAlerts(h.App)
+    const round = await runWithWarnings(h.App)
+    assert.strictEqual(sent.length, 2, '失败不中断：两条都要尝试推送')
+    assert.deepStrictEqual(
+      { pushed: round.summary.pushed, failed: round.summary.failed },
+      { pushed: 1, failed: 1 },
+      `部分失败摘要必须如实计数：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(round.summary.failures.length, 1, `失败明细必须进摘要：${JSON.stringify(round.summary.failures)}`)
+    assert.ok(String(round.summary.failures[0].message).includes('push boom'),
+      `摘要失败明细必须带根因：${JSON.stringify(round.summary.failures[0])}`)
+    const lines = readRunLogLines(realFs, cacheDir)
+    assert.ok(lines.some(l => /ERROR 推送部分失败 1\/2 条（未送达消息下轮重试）/.test(l)),
+      `run.log 必须留部分失败 ERROR 行：${JSON.stringify(lines)}`)
+    assert.deepStrictEqual(
+      alerts.filter(a => a.reason === 'push-fail').map(a => a.text),
+      ['推送部分失败（成功 1 条 / 失败 1 条）：未送达的消息下轮重试，通道可能部分失效'],
+      `push-fail 告警文案必须不变：${JSON.stringify(alerts)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id), ['p1-f'],
+      '只有推送成功的条目写缓存；失败条目下轮重试（不得当已处理）')
+  })
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
