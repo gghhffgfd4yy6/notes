@@ -428,17 +428,43 @@ function makeLogFs (over = {}) {
   // C1-020：锁文件的真实内容（writeSync 写进去的 pid:start 令牌）。释放路径要靠读回它来证明
   // 「锁仍是本进程的」——桩不模拟这一点，令牌校验就永远不会被这些既有用例执行到。
   let lockText = ''
+  // fd → 打开路径：_writeRunLog 改为「openSync('a+') + writeSync + fstatSync/readSync 同一个 fd」后，
+  // 桩靠这张表把日志 fd 上的写入仍按 append 语义记录（[路径, 文本, 'utf8']），
+  // 既有「整行落盘」断言都断言路径与内容，不必跟着实现细节改写。
+  const fdPaths = new Map()
   const stub = {
     existsSync: () => true,
     openSync (p, flag) {
       rec.open.push([p, flag])
-      if (over.openSync) return over.openSync(p, flag)
-      // R2-1：周标记与 run.log 锁在同一轮里可以是**两个同时打开的 fd**；桩不能让它们映射到同一个
-      // 号数——同号时 _writeWeekMarker 的 finally 看起来像「把锁 fd 多关了一次」，掩盖真正的归属判断。
-      if (String(p).endsWith('.week')) return 9
-      return flag === 'r+' ? 8 : 7
+      const fd = over.openSync
+        ? over.openSync(p, flag)
+        : (String(p).endsWith('.week') ? 9 : (flag === 'a+' ? 6 : 7))
+      fdPaths.set(fd, p)
+      return fd
     },
-    writeSync (fd, data) { rec.write.push([fd, String(data)]); lockText = String(data) },
+    // 日志 fd 上的写入按 (fd, data, off, len) 处理：_writeRunLog 把 out 转 Buffer 后循环写到写满，
+    // 桩必须按字节切片记录并返回本次实际写入量。over.writeSync 可注入短写/零写（回归用例用），
+    // 返回值口径与 fs.writeSync 一致（写入字节数）；锁 fd 的写入仍按原样记成 [fd, 文本]。
+    writeSync (fd, data, off, len) {
+      const target = fdPaths.get(fd)
+      if (typeof target === 'string' && (target.endsWith('.log') || target.endsWith('.ndjson'))) {
+        if (over.appendThrows) throw new Error('append 失败')
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8')
+        const start = off === undefined ? 0 : off
+        const want = len === undefined ? buf.length - start : len
+        const w = over.writeSync ? over.writeSync({ fd, buf, start, want }) : want
+        if (!(w > 0)) return w
+        rec.append.push([target, buf.toString('utf8', start, start + w), 'utf8'])
+        return w
+      }
+      rec.write.push([fd, String(data)])
+      lockText = String(data)
+      return Buffer.byteLength(String(data))
+    },
+    fstatSync (fd) {
+      if (over.fstatThrows) throw new Error('fstat 失败')
+      return { size: over.size === undefined ? 0 : over.size, mtimeMs: over.mtimeMs === undefined ? Date.now() : over.mtimeMs, isFile: () => true }
+    },
     readFileSync (p) {
       if (over.readFileSync) return over.readFileSync(p)
       return lockText
@@ -473,7 +499,7 @@ function makeLogFs (over = {}) {
     closeSync (fd) { rec.close.push(fd) },
     unlinkSync (p) { rec.unlink.push(p) }
   }
-  return { rec, stub }
+  return { rec, stub, fdPaths }
 }
 
 function makeUtils (over = {}) {
@@ -626,11 +652,43 @@ check('_writeRunLog 正常追加：默认 run.log、utf8、锁令牌 pid:start�
   const rec = makeLogFs()
   const { app } = makeLogApp({ rec })
   app._writeRunLog('hello\n')
-  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx']])
+  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx'], [LOG_PATH, 'a+']],
+    '日志只开一个追加 fd（a+），不得再按路径开 r+')
   assert.deepStrictEqual(rec.rec.write, [[7, `${process.pid}:42`]])
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'hello\n', 'utf8']])
-  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.close, [6, 7], '先关日志 fd、再关锁 fd')
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+})
+
+// 回归（P1）：旧实现 appendFileSync 内部循环写到写满；改成单 fd 后若忽略 writeSync 返回值，
+// 短写会静默丢尾部字节、run.log 落半行。下面两条用来钉住「循环写满」与「零写不死循环」。
+check('_writeRunLog 短写（首次只写 3 字节）⇒ 循环补满，拼接后仍是完整行（回退成单次 writeSync 必红）', () => {
+  let calls = 0
+  const rec = makeLogFs({
+    writeSync: ({ want }) => {
+      calls += 1
+      // 第一次只落前 3 个字符，第二次写满剩余：模拟真实 fd 的部分写（短写）
+      return calls === 1 ? Math.min(3, want) : want
+    }
+  })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('hello world\n')
+  assert.strictEqual(calls, 2, `短写后必须再写一次补满（单次 writeSync 实现只有 1 次）：${calls}`)
+  const parts = rec.rec.append.map((a) => a[1])
+  assert.deepStrictEqual(parts, ['hel', 'lo world\n'], '必须按短写返回值分片续写，不得整行重写或丢弃')
+  assert.strictEqual(parts.join(''), 'hello world\n', '拼接后必须是完整行（不能因为短写落半行）')
+  assert.strictEqual(parts.join('').length, 12, '完整行 12 字符，一个字节都不能少')
+})
+
+check('_writeRunLog writeSync 恒返回 0 ⇒ 立即放弃（有限次、不挂死）、不抛给调用方', () => {
+  let calls = 0
+  const rec = makeLogFs({ writeSync: () => { calls += 1; return 0 } })
+  const { app } = makeLogApp({ rec })
+  const r = withCapture('error', () => app._writeRunLog('hello world\n'))
+  assert.strictEqual(r.value, undefined, '外层 catch 必须吞掉（日志写失败不得中断推送）')
+  assert.ok(calls <= 3, `零写必须立刻放弃，实际调用 ${calls} 次（无上限的重试会让进程挂死）`)
+  assert.strictEqual(rec.rec.append.length, 0, '零写不得被记成已落盘')
+  assert.ok(rec.rec.close.includes(6), '日志 fd 仍必须在 finally 里关掉')
 })
 
 check('_writeRunLog 锁异常（EACCES）⇒ fail-open 仅追加；超限也不截尾（不得误当持锁）', () => {
@@ -639,11 +697,11 @@ check('_writeRunLog 锁异常（EACCES）⇒ fail-open 仅追加；超限也不�
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('data\n')
   assert.deepStrictEqual(rec.rec.append.map((a) => a[1]), ['data\n'])
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx']) // 不得在无锁时开 r+
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'], '无锁时只开追加 fd，不得开读写截尾 fd')
   assert.strictEqual(rec.rec.read.length, 0)
   assert.strictEqual(cap.length, 0)
   assert.strictEqual(rec.rec.unlink.length, 0)
-  assert.strictEqual(rec.rec.close.length, 0)
+  assert.deepStrictEqual(rec.rec.close, [8], '只关本函数打开的日志 fd，锁没拿到就没有锁 fd 可关')
 })
 
 check('_writeRunLog 陈旧锁且持有进程已退出 ⇒ 抢占 unlink 后重试成功', () => {
@@ -656,7 +714,7 @@ check('_writeRunLog 陈旧锁且持有进程已退出 ⇒ 抢占 unlink 后重�
   app._writeRunLog('a\n')
   assert.strictEqual(rec.rec.unlink.length, 2)
   assert.strictEqual(rec.rec.unlink[0], LOCK_PATH)
-  assert.strictEqual(rec.rec.open.length, 2)
+  assert.strictEqual(rec.rec.open.length, 3) // wx 首试(抛) + wx 重试 + 日志 a+
   assert.strictEqual(rec.rec.append.length, 1)
 })
 
@@ -681,7 +739,7 @@ check('_writeRunLog 新鲜锁（mtime 未超龄）⇒ 查 mtime 后退避重试�
   const { app } = makeLogApp({ rec })
   app._writeRunLog('a\n')
   assert.strictEqual(rec.rec.unlink.length, 1)
-  assert.strictEqual(rec.rec.stat.length, 2)
+  assert.strictEqual(rec.rec.stat.length, 1, '只查锁文件 mtime；日志长度改走 fstat(fd)，不再按路径 stat')
   assert.strictEqual(rec.rec.append.length, 1)
 })
 
@@ -691,11 +749,11 @@ check('_writeRunLog 追加失败 ⇒ 静默吞掉、不截尾，锁仍被清理'
   assert.strictEqual(app._writeRunLog('x\n'), undefined)
   assert.strictEqual(cap.length, 0)
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
-  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.close, [6, 7], '日志 fd 与锁 fd 都必须关闭')
 })
 
-check('_writeRunLog 追加后 statSync 失败 ⇒ 静默，锁清理不跳过', () => {
-  const rec = makeLogFs({ statThrows: true })
+check('_writeRunLog 追加后 fstatSync 失败 ⇒ 静默，锁清理不跳过', () => {
+  const rec = makeLogFs({ fstatThrows: true })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('x\n')
   assert.strictEqual(rec.rec.append.length, 1)
@@ -713,7 +771,7 @@ check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍�
       const { app } = makeLogApp({ rec })
       app._writeRunLog('x\n')
       const tag = `fd=${fd} appendThrows=${appendThrows}`
-      assert.deepStrictEqual(rec.rec.close, [], `${tag}: 不得 close stdio，实际 close：${rec.rec.close.join(',')}`)
+      assert.deepStrictEqual(rec.rec.close, [8], `${tag}: 不得 close stdio（只关本函数打开的日志 fd），实际 close：${rec.rec.close.join(',')}`)
       assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], `${tag}: 锁文件必须清理（漏删会让后续轮次一直被旧锁挡住）`)
     }
   }
@@ -724,14 +782,14 @@ check('_writeRunLog 锁 fd 落在 stdio（0/1/2）⇒ 不 close，锁文件仍�
 // 读 constants 那一步抛的 TypeError 穿出 _writeWeekMarker 后被 _writeRunLog 最外层 catch 静默吞掉，
 // 于是「每行日志都走无标记分支」的桩环境下所有 append 变成空数组（test_app_unit 28 例红）。
 // 下面两条分别钉住「缺能力不炸」与「能力齐了必须用 node:fs 的真常量 + 只关自己的 fd」。
-check('R2-1 _writeWeekMarker 容忍注入 fs 的能力子集：缺 fstatSync 就不开 fd、不抛、不误报，日志照常追加', () => {
-  const rec = makeLogFs() // 该桩无 constants / fstatSync / writeFileSync，只有 openSync/closeSync/appendFileSync
+check('R2-1 _writeWeekMarker 容忍注入 fs 的能力子集：缺 writeFileSync 就不开 fd、不抛、不误报，日志照常追加', () => {
+  const rec = makeLogFs() // 该桩无 constants / writeFileSync（fstatSync 只服务日志 fd），能力不齐就不开周标记
   const { app } = makeLogApp({ rec })
   const r = withCapture('warn', () => app._writeRunLog('x\n'))
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']],
     '整行日志必须照常落盘（能力缺失若抛穿，append 会变成空数组）')
-  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx']],
-    '能力不足时不得去开周标记：没有 fstat 就无法排除「把周键写进 FIFO/设备」')
+  assert.deepStrictEqual(rec.rec.open, [[LOCK_PATH, 'wx'], [LOG_PATH, 'a+']],
+    '能力不足时不得去开周标记：没有 fstat/writeFileSync 就无法排除「把周键写进 FIFO/设备」')
   const markerWarns = r.msgs.filter((m) => m.includes('日志周标记'))
   assert.deepStrictEqual(markerWarns, [], `能力缺失不是运行故障，不得告警：${JSON.stringify(r.msgs)}`)
 })
@@ -761,8 +819,8 @@ check('R2-1 能力齐备 ⇒ 周标记用 node:fs 常量非阻塞写当周键并
     const bit = nodeFs.constants[name]
     assert.strictEqual(flags & bit, bit, `flags 必须含 ${name}（常量只能取 node:fs，不得读注入对象）`)
   }
-  assert.deepStrictEqual(rec.rec.close, [9, 7],
-    `只关「本函数 open 成功的周标记 fd」与锁 fd 各一次，实际：${JSON.stringify(rec.rec.close)}`)
+  assert.deepStrictEqual(rec.rec.close, [9, 8, 7],
+    `只关「本函数 open 成功的周标记 fd」「日志 fd」与锁 fd 各一次，实际：${JSON.stringify(rec.rec.close)}`)
 })
 
 // ----- R2-2：周标记写失败告警必须 60s 限频（与相邻的归档失败告警同口径） -----
@@ -925,10 +983,10 @@ check('_writeRunLog size > 1MiB ⇒ 从 size-KEEP 扫描换行，只写回保留
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
   const lastRead = rec.rec.read[rec.rec.read.length - 1]
-  assert.deepStrictEqual(lastRead, [8, rest.length, 2 * LIMIT - rest.length, rest.length],
+  assert.deepStrictEqual(lastRead, [6, rest.length, 2 * LIMIT - rest.length, rest.length],
     '扫描定位后只读保留段（最后一个换行之后）')
   assert.ok(rec.rec.read.length > 1, '换行在 10MiB 窗口之外时必须先向前扫描')
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
 })
 
@@ -939,7 +997,7 @@ check('_writeRunLog 整份文件无换行 ⇒ 放弃截尾、不写半行、原�
   const t0 = 1700000000000
   const r = withFixedNow(t0, () => withCapture('warn', () => app._writeRunLog('l\n')))
   assert.deepStrictEqual(cap, [], '不得写回任何内容——写 trimmed 等于把窗口起点的半行当成新文件头（丢一半 + 首行残缺）')
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'], '仍要读尾部尝试截尾')
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'], '仍要读尾部尝试截尾')
   assert.ok(r.msgs.some((m) => m.includes('截尾放弃') && m.includes(LOG_PATH)),
     `放弃截尾必须 WARN 并点名文件：${JSON.stringify(r.msgs)}`)
   assert.strictEqual(app._logRotateBackoffByPath.get(LOG_PATH), t0 + 60 * 1000, '放弃后必须对这条日志退避 60s（否则每次追加都重读 10MiB）')
@@ -947,10 +1005,10 @@ check('_writeRunLog 整份文件无换行 ⇒ 放弃截尾、不写半行、原�
 
 check('_writeRunLog 一条日志的截尾退避不影响另一条白名单日志', () => {
   const rec = makeLogFs({ size: 2 * LIMIT, tail: 'N'.repeat(100) })
-  const origStat = rec.stub.statSync
-  rec.stub.statSync = (p) => {
-    if (p === LOG_PATH) return origStat(p)
-    return { size: 0, mtimeMs: Date.now() }
+  const origFstat = rec.stub.fstatSync
+  rec.stub.fstatSync = (fd) => {
+    if (rec.fdPaths.get(fd) === LOG_PATH) return origFstat(fd)
+    return { size: 0, mtimeMs: Date.now(), isFile: () => true }
   }
   const { app, rec: calls } = makeLogApp({ rec })
   const t0 = 1700000000000
@@ -1026,7 +1084,7 @@ check('_writeRunLog 尾部多个换行 ⇒ 保留约 KEEP 字节、从换行处�
   assert.strictEqual(cap[0][0], LOG_PATH)
   // 保留段起点 = 夹具里 '\n' 之后的字节：读位置必须正好跨过那个换行（否则会把半行当新文件头）。
   const lastRead = rec.rec.read[rec.rec.read.length - 1]
-  assert.deepStrictEqual(lastRead, [8, rest.length, 2 * LIMIT - rest.length, rest.length],
+  assert.deepStrictEqual(lastRead, [6, rest.length, 2 * LIMIT - rest.length, rest.length],
     '读起点必须是换行之后的第一个字节（从换行处对齐）')
   assert.ok(kept.length > KEEP - 1024 && kept.length <= KEEP,
     `保留段必须约为 KEEP（实际 ${kept.length}，KEEP=${KEEP}）`)
@@ -1037,7 +1095,7 @@ check('_writeRunLog 尾部多个换行 ⇒ 保留约 KEEP 字节、从换行处�
 })
 
 check('_writeRunLog 真实文件以 \\n 结尾且超限 ⇒ 保留约 10MiB、行首对齐、不丢最新行', () => {
-  // 单测桩的 appendFileSync 只记录不追加，真实场景（写一行让文件以 '\n' 结尾后再截尾）永远不出现：
+  // 单测桩的 writeSync（日志 fd）只记录不追加，真实场景（写一行让文件以 '\n' 结尾后再截尾）永远不出现：
   // 8b3bd07 的错误语义在桩下全绿。这里用真实临时文件走一遍完整路径。
   const rfs = require('fs')
   const { writeAtomic } = require('./xbk_storage.js')
@@ -1156,7 +1214,7 @@ check('_writeRunLog 锁 fd 为 0 仍是有效锁：超限时照样截尾（>=0 �
   const rec = makeLogFs({ openSync: (p, flag) => (flag === 'wx' ? 0 : 9), size: 2 * LIMIT, tail: head + rest })
   const { app, cap } = makeLogApp({ rec })
   app._writeRunLog('l\n')
-  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'r+'])
+  assert.deepStrictEqual(rec.rec.open.map((o) => o[1]), ['wx', 'a+'])
   assert.ok(rec.rec.read.length >= 1, '超限时必须真的去定位保留段')
   assert.deepStrictEqual(rec.rec.read[rec.rec.read.length - 1], [9, rest.length, 2 * LIMIT - rest.length, rest.length])
   assert.deepStrictEqual(cap, [[LOG_PATH, rest]])
@@ -1170,7 +1228,7 @@ check('_writeRunLog 锁 fd 为 0（falsy）时 finally 仍释放：unlink 照做
   app._writeRunLog('l\n')
   assert.deepStrictEqual(rec.rec.write, [[0, `${process.pid}:42`]])
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH], 'fd 0 不得被当成「未取锁」而跳过释放（锁文件会残留）')
-  assert.deepStrictEqual(rec.rec.close, [], 'fd 0 是 stdin，>2 守卫必须拒绝 close')
+  assert.deepStrictEqual(rec.rec.close, [9], 'fd 0 是 stdin，>2 守卫必须拒绝 close（只关日志 fd）')
 })
 
 // ----- _warnLowDisk：阈值 / 只告警不阻断 / 限频 -----
@@ -4277,7 +4335,7 @@ check('C1-011 fail-open 且超过次级上限 ⇒ 不再写盘、行回显 stdou
   assert.deepStrictEqual(rec.rec.append, [], '超过次级上限后不得继续追加（无界增长的根因）')
   assert.deepStrictEqual(logs, ['overflow-line'], '行不得丢：必须回显到 stdout（青龙任务日志可见）')
   assert.strictEqual(rec.rec.read.length, 0, '无锁路径不得做读改写（会冲掉并发追加的行）')
-  assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx'], '不得在无锁时开 r+')
+  assert.deepStrictEqual(rec.rec.open.map(o => o[1]), ['wx', 'a+'], '无锁时只开追加 fd，不得开读写截尾 fd')
   assert.strictEqual(rec.rec.unlink.length, 0)
 })
 
@@ -4530,7 +4588,7 @@ check('C1-020 run.log 锁：锁已被接管（内容不再是本进程令牌）�
   const rec = makeLogFs({ readFileSync: () => '999999:1' })
   const { app } = makeLogApp({ rec })
   app._writeRunLog('x\n')
-  assert.deepStrictEqual(rec.rec.close, [7], '锁 fd 仍必须关闭（否则泄漏 fd）')
+  assert.deepStrictEqual(rec.rec.close, [6, 7], '日志 fd 与锁 fd 仍必须关闭（否则泄漏 fd）')
   assert.deepStrictEqual(rec.rec.unlink, [],
     '锁已不属于本进程时不得删除——删了接管者就会与本进程同时进临界区')
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']], '日志本身仍必须写进去')
@@ -4542,7 +4600,7 @@ check('C1-020 run.log 锁：读锁失败（ENOENT/io）⇒ 不删归属不明的
   const { app } = makeLogApp({ rec })
   assert.strictEqual(app._writeRunLog('x\n'), undefined)
   assert.deepStrictEqual(rec.rec.unlink, [], '读不到内容就无法证明归属，只能不删（残留由 stale 回收）')
-  assert.deepStrictEqual(rec.rec.close, [7])
+  assert.deepStrictEqual(rec.rec.close, [6, 7])
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'x\n', 'utf8']])
 })
 
@@ -6057,6 +6115,225 @@ checkAsync('R1 行为：接管哨兵释放失败 ⇒ App.run 本轮摘要带 sen
     assert.ok(round.warns.some(l => l.includes('接管哨兵释放失败')), `必须留明确告警：${JSON.stringify(round.warns)}`)
     assert.ok(realFs.existsSync(lockPath + '.takeover'), '前置：哨兵确实残留（下一轮接管会被它挡住）')
     assert.ok(!realFs.existsSync(lockPath), '主锁必须照常释放')
+  })
+})
+
+// ============================================================
+// P1：_runLocked 阶段管线（prepare → fetch → ingest → filter → push → finalize）
+//
+// 这些用例锁的是**行为快照**与**编排协议**，不是源码文本：
+//   · 成功一轮：summary 的字段集合/顺序与 run.log 摘要行格式不变；
+//   · 抓取失败：错误对象原样重抛（错误码不变）、只留 ERROR 行与 run-error 告警、不进入推送；
+//   · 判重缓存读取失败：ingest 早退返回失败摘要（failed=total），后续阶段一律不执行；
+//   · 阶段顺序：用注入计数器包住六个阶段方法，断言调用顺序与「同一个 runCtx」；
+//   · 推送部分失败：summary.failed/failures 与 run.log ERROR 行语义不变，且失败条目不写缓存。
+// ============================================================
+const PIPELINE_STAGES = ['_runPrepare', '_runFetch', '_runIngest', '_runFilter', '_runPush', '_runFinalize']
+
+// 阶段调用的观测器：把阶段方法包一层计数器（不改被测逻辑，仍调用原方法）。
+function spyPipelineStages (App) {
+  const calls = []
+  const ctxs = []
+  for (const name of PIPELINE_STAGES) {
+    const orig = App[name]
+    App[name] = async function (ctx) {
+      calls.push(name)
+      ctxs.push(ctx)
+      assert.strictEqual(arguments.length, 1, `${name} 必须只接收 runCtx 一个参数（禁止把整个 App 当背包）`)
+      assert.notStrictEqual(ctx, this, `${name} 不得把 this（App）当运行上下文传入`)
+      return await orig.call(this, ctx)
+    }
+  }
+  return { calls, ctxs }
+}
+
+// 告警类别观测：_sendAlert 在 Config.alert.enabled=false 时会提前返回，故先记录再转调。
+function spyAlerts (App) {
+  const seen = []
+  const orig = App._sendAlert
+  App._sendAlert = async function (errMsg, alertKey = 'alert') {
+    seen.push({ text: errMsg, reason: alertKey })
+    return orig.call(this, errMsg, alertKey)
+  }
+  return seen
+}
+
+function readRunLogLines (realFs, cacheDir) {
+  const file = path.join(cacheDir, 'run.log')
+  return realFs.existsSync(file) ? realFs.readFileSync(file, 'utf8').split('\n').filter(l => l !== '') : []
+}
+
+// 管线用例的公共夹具：临时缓存目录 + 与生产同一批业务模块，只桩掉 Network/Pusher。
+// XBK_CACHE_DIR 是唯一能让 MessageStore 采纳根外临时目录的部署开关（与 FR-* 用例同口径）。
+async function withPipelineFixture (tag, over, fn) {
+  const realFs = require('fs')
+  const FilterStore = require('./xbk_filter_store')
+  FilterStore.resetStoreStateForTests()
+  const cacheDir = mkTmpFixture(tag)
+  const prevEnvDir = process.env.XBK_CACHE_DIR
+  const prevDryRun = process.env.XBK_DRY_RUN
+  process.env.XBK_CACHE_DIR = cacheDir
+  delete process.env.XBK_DRY_RUN
+  const h = buildFilterRunHarness(cacheDir, over)
+  try {
+    return await fn(h, cacheDir, realFs)
+  } finally {
+    realFs.rmSync(cacheDir, { recursive: true, force: true })
+    if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+    else process.env.XBK_CACHE_DIR = prevEnvDir
+    if (prevDryRun === undefined) delete process.env.XBK_DRY_RUN
+    else process.env.XBK_DRY_RUN = prevDryRun
+  }
+}
+
+checkAsync('P1-1 阶段管线成功一轮：summary 字段顺序与 run.log 摘要行格式不变', async () => {
+  const { RUN_SUMMARY_LINE_RE, parseRunSummaryLine } = require('./xbk_state_schema')
+  await withPipelineFixture('pipeline-ok-', {}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('p1-a', '正常甲'), makeRunItem('p1-b', '正常乙')])
+    const round = await runWithWarnings(h.App)
+    // 字段集合与插入顺序都是对外契约（JSON.stringify / worker 协议 / 测试快照都按它）
+    assert.deepStrictEqual(Object.keys(round.summary),
+      ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'cacheSaved', 'failures'],
+      `summary 字段集合/顺序必须与拆分前一致：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(
+      {
+        total: round.summary.total,
+        dedup: round.summary.dedup,
+        filtered: round.summary.filtered,
+        truncated: round.summary.truncated,
+        pushed: round.summary.pushed,
+        failed: round.summary.failed,
+        cacheSaved: round.summary.cacheSaved,
+        failures: round.summary.failures
+      },
+      { total: 2, dedup: 0, filtered: 0, truncated: 0, pushed: 2, failed: 0, cacheSaved: true, failures: [] },
+      `成功一轮的摘要值必须不变：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(h.sends.length, 2, '两条都应经 Pusher 发出（顺序推送）')
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id).sort(), ['p1-a', 'p1-b'],
+      '推送成功的条目必须写回缓存（下轮判重）')
+
+    const lines = readRunLogLines(realFs, cacheDir)
+    const summaryLines = lines.filter(l => RUN_SUMMARY_LINE_RE.test(l))
+    assert.strictEqual(summaryLines.length, 1, `本轮必须恰好一行摘要：${JSON.stringify(lines)}`)
+    // 关键行格式：戳 + 六项计数（固定顺序）+ elapsed + 条件尾部（本场景只有 cachesaved）
+    assert.match(summaryLines[0],
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=\d+\.\ds cachesaved=1$/,
+      `run.log 摘要行格式必须不变：${summaryLines[0]}`)
+    const parsed = parseRunSummaryLine(summaryLines[0])
+    assert.ok(parsed, `摘要行必须能被读侧解析：${summaryLines[0]}`)
+    assert.deepStrictEqual(
+      [parsed.counters.total, parsed.counters.dedup, parsed.counters.filtered, parsed.counters.truncated, parsed.counters.pushed, parsed.counters.failed],
+      [2, 0, 0, 0, 2, 0],
+      '读侧解析出的六项计数必须与写入侧一致')
+  })
+})
+
+checkAsync('P1-2 阶段管线抓取失败：错误码原样重抛、只留 ERROR 行与 run-error 告警、不进入推送', async () => {
+  const boom = new Error('抓取爆炸')
+  boom.code = 'ETIMEDOUT'
+  await withPipelineFixture('pipeline-fetchfail-', { fetchData: () => { throw boom } }, async (h, cacheDir, realFs) => {
+    const alerts = spyAlerts(h.App)
+    let caught = null
+    try { await runWithWarnings(h.App) } catch (e) { caught = e }
+    assert.strictEqual(caught, boom, '必须重抛同一个错误对象（错误码/堆栈不得被包装）')
+    assert.strictEqual(caught.code, 'ETIMEDOUT', '错误码必须原样保留')
+    assert.strictEqual(h.sends.length, 0, '抓取失败不得进入推送阶段')
+
+    const lines = readRunLogLines(realFs, cacheDir)
+    const errLines = lines.filter(l => l.includes(' ERROR '))
+    assert.strictEqual(errLines.length, 1, `失败轮只应写一行 ERROR：${JSON.stringify(lines)}`)
+    assert.match(errLines[0], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ERROR 抓取爆炸$/,
+      `ERROR 行格式必须不变：${errLines[0]}`)
+    assert.strictEqual(lines.filter(l => /total=\d+ dedup=/.test(l)).length, 0, '失败轮不得写运行摘要行')
+    assert.deepStrictEqual(alerts, [{ text: '抓取爆炸', reason: 'run-error' }],
+      `必须按 run-error 类别发一次告警：${JSON.stringify(alerts)}`)
+  })
+})
+
+checkAsync('P1-3 阶段管线判重缓存读取失败：ingest 早退返回失败摘要（failed=total），后续阶段不执行', async () => {
+  await withPipelineFixture('pipeline-cachefail-', {}, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('p1-c', '正常丙'), makeRunItem('p1-d', '正常丁')])
+    // 让真实 readMessages 跑完后带上「读失败」标记（生产里由 ioError/损坏触发）
+    const origRead = h.MessageStore.readMessages
+    h.MessageStore.readMessages = function (readPath) {
+      const result = origRead.call(this, readPath)
+      this._readFailed[readPath] = true
+      return result
+    }
+    const { calls } = spyPipelineStages(h.App)
+    const alerts = spyAlerts(h.App)
+    const round = await runWithWarnings(h.App)
+
+    // 早退摘要沿用原字段集合（没有 cacheSaved，因为没有走到 finalize）
+    assert.ok(round.summary && typeof round.summary === 'object',
+      `缓存读失败必须返回摘要对象（不得返回 null/undefined）：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(Object.keys(round.summary),
+      ['total', 'dedup', 'filtered', 'truncated', 'pushed', 'failed', 'failures'],
+      `早退摘要字段必须与拆分前一致：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(round.summary,
+      { total: 2, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 2, failures: [] },
+      `缓存读失败必须给出 failed=total 的摘要（退出码语义由外层分类器派生）：${JSON.stringify(round.summary)}`)
+    assert.deepStrictEqual(calls, ['_runPrepare', '_runFetch', '_runIngest'],
+      `早退后 filter/push/finalize 一律不得执行：${JSON.stringify(calls)}`)
+    assert.strictEqual(h.sends.length, 0, '缓存读失败不得推送')
+    const lines = readRunLogLines(realFs, cacheDir)
+    assert.ok(lines.some(l => /ERROR 缓存读取失败，跳过本轮推送（防重复轰炸）/.test(l)),
+      `run.log 必须留 ERROR 行：${JSON.stringify(lines)}`)
+    assert.strictEqual(lines.filter(l => /total=\d+ dedup=/.test(l)).length, 0, '早退不得写运行摘要行')
+    assert.deepStrictEqual(alerts.map(a => a.reason), ['cache-read'],
+      `必须按 cache-read 类别告警（且只告警一次）：${JSON.stringify(alerts)}`)
+  })
+})
+
+checkAsync('P1-4 阶段管线顺序：六个阶段按序调用且共用同一个 runCtx', async () => {
+  await withPipelineFixture('pipeline-order-', {}, async (h) => {
+    h.setItems([makeRunItem('p1-e', '正常戊')])
+    const { calls, ctxs } = spyPipelineStages(h.App)
+    const round = await runWithWarnings(h.App)
+    assert.deepStrictEqual(calls, PIPELINE_STAGES, `阶段顺序必须固定：${JSON.stringify(calls)}`)
+    assert.ok(ctxs.every(c => c === ctxs[0]), '六个阶段必须共享同一个上下文对象')
+    const ctx = ctxs[0]
+    // runCtx 显式携带状态：配置/规则引用、抓取结果、候选集、推送结果、错误收集、摘要
+    assert.strictEqual(ctx.config, h.Config, '配置引用必须显式挂在 ctx 上')
+    assert.strictEqual(ctx.rules.active.source, 'default', '本轮生效规则引用挂在 ctx.rules')
+    assert.strictEqual(ctx.fetched.length, 1, '抓取结果必须显式挂在 ctx 上')
+    assert.strictEqual(ctx.candidates.length, 1, '候选集必须显式挂在 ctx 上')
+    assert.strictEqual(ctx.push.results.length, 1, '推送结果必须显式挂在 ctx 上')
+    assert.ok(Array.isArray(ctx.errors), '错误收集必须是数组')
+    assert.strictEqual(ctx.summary, round.summary, '摘要由 finalize 写入 ctx 并由 _runLocked 返回')
+  })
+})
+
+checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run.log ERROR 行语义不变，失败条目不写缓存', async () => {
+  const sent = []
+  const Pusher = {
+    send: async (text) => {
+      sent.push(text)
+      if (text.includes('失败乙')) throw new Error('push boom')
+      return { successfulChannels: ['stub'], failures: [] }
+    }
+  }
+  await withPipelineFixture('pipeline-pushfail-', { Pusher }, async (h, cacheDir, realFs) => {
+    h.setItems([makeRunItem('p1-f', '正常甲'), makeRunItem('p1-g', '失败乙')])
+    const alerts = spyAlerts(h.App)
+    const round = await runWithWarnings(h.App)
+    assert.strictEqual(sent.length, 2, '失败不中断：两条都要尝试推送')
+    assert.deepStrictEqual(
+      { pushed: round.summary.pushed, failed: round.summary.failed },
+      { pushed: 1, failed: 1 },
+      `部分失败摘要必须如实计数：${JSON.stringify(round.summary)}`)
+    assert.strictEqual(round.summary.failures.length, 1, `失败明细必须进摘要：${JSON.stringify(round.summary.failures)}`)
+    assert.ok(String(round.summary.failures[0].message).includes('push boom'),
+      `摘要失败明细必须带根因：${JSON.stringify(round.summary.failures[0])}`)
+    const lines = readRunLogLines(realFs, cacheDir)
+    assert.ok(lines.some(l => /ERROR 推送部分失败 1\/2 条（未送达消息下轮重试）/.test(l)),
+      `run.log 必须留部分失败 ERROR 行：${JSON.stringify(lines)}`)
+    assert.deepStrictEqual(
+      alerts.filter(a => a.reason === 'push-fail').map(a => a.text),
+      ['推送部分失败（成功 1 条 / 失败 1 条）：未送达的消息下轮重试，通道可能部分失效'],
+      `push-fail 告警文案必须不变：${JSON.stringify(alerts)}`)
+    assert.deepStrictEqual(h.cacheMessages().map(m => m.id), ['p1-f'],
+      '只有推送成功的条目写缓存；失败条目下轮重试（不得当已处理）')
   })
 })
 
