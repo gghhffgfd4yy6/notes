@@ -17,7 +17,7 @@ function createMessagesHandlers (ctx) {
   return {
     // ── v3.297 控制台扩展：推送记录 / 趋势 / 日志 / 系统 ─────────────────────────
     // 全部只读（读缓存目录已有文件 + 进程自身信息），不 spawn、不写任何文件；
-    // 鉴权与其余读取端点一致（Bearer / ?token= / Cookie 会话）。
+    // 鉴权与其余读取端点一致（Bearer / Cookie 会话）。
     getMessages (req, res, url) {
       const read = readMessages(stateDir, { maxBytes: MESSAGES_MAX_BYTES, filename: messagesFile })
       if (read.status !== 'ok') {

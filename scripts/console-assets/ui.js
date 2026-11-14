@@ -1248,7 +1248,7 @@ function App () {
         <strong>${bootBroken ? '页面启动数据损坏，控制台已停止自动刷新' : '凭证已失效，控制台已停止自动刷新'}</strong>
         <span class="alert-sub">${bootBroken
           ? html`页面注入的 xbk-boot JSON 岛解析失败（<strong>不是凭证问题</strong>）：刷新页面重新注入；仍失败请检查服务端 renderPage 的注入内容。`
-          : html`请用带 <code>?token=</code> 的完整链接重新打开；若链接已过期，从部署环境重新获取 XBK_CONSOLE_TOKEN。`}</span>
+          : html`会话已过期：点「重新登录」在登录框输入 <code>XBK_CONSOLE_TOKEN</code>（<code>?token=</code> 链接已不再自动登录，这是有意的安全收紧）；若令牌已更换，从部署环境重新获取。`}</span>
       </div>
       <a class="alert-action" href="/">重新登录</a>
     </div>`}
