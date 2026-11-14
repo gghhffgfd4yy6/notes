@@ -1465,3 +1465,17 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **「今日 / 近 7 天」首屏统计与运行趋势走同一个解析器**：原先四处各自 `exec` 同一正则并各自做计数校验，现在统一到 `parseRunSummaryLine` / `deriveRunStats`；未来日期过滤、`lastFailure`、`truncated` 标注语义不变。轮界归属（失败行归哪一轮、崩溃占位行）仍留在 `scripts/status.js`，不进共享模块。
 - **测试**：新增 `test_state_schema.js`（41 例）覆盖闰年与非法月日、`pending` 非对象/内部非法计数的文案、通道表「空表 / 一条好一条坏 / 全坏」、摘要行「带/不带时间戳、非法计数、ERROR 行含 `total=` 不得误命中」、`formatRunSummaryLine` 三种形态的逐字输出与 format→parse 回环、今日/近 7 天边界与未来日期过滤；另加源码形状断言（生产文件里不得再出现第二份名单/正则/日期校验）。`test_app_unit.js` 里「计数器名单单一来源」的源码断言随之改为「字面量只允许在 `xbk_state_schema.js` 一处、`xbk_app.js` 零字面量」。
 - **兼容**：除下列一条外一律不变——`report.state` / `channel-health.state` 的磁盘格式、`run.log` 的写入格式、`--status` / `formatStatus` 的全部文案与返回形状、旧文件与缺失字段的行为均无变化；本轮只搬实现，不改口径。唯一的行为变化在「通道健康表里**所有**记录都损坏」（有记录但逐条全不合格）时：生产侧此前把坏记录当可用状态继续叠加写入，现在按**读失败** fail-closed——留一行 error 告警、跳过本轮健康更新、原文件逐字节保留（不以空表覆盖，恢复告警的 pending/claim 字段因此原样留在盘上），与同函数上方「JSON 损坏」分支、以及 `--status` 判 `invalid` 的口径一致；正常文件与「一条坏一条好」的混合表不受影响。
+
+## v3.430
+
+- **控制台的路由拆开了，接口行为没变**。网页控制台那个 1,271 行的请求分发函数（`dispatchRequest`）原先是一长串「方法 + 路径」的 if 判断，改一个接口要在上千行里找位置。现在拆成三层：**薄入口**（只留访问日志、畸形 URL 防御、静态资源、`POST /login`、两步验证页面闸、写端点的 Bearer-only 复判、全局鉴权与页面壳——这些是安全边界，顺序和状态码一字未动）→ **有序路由表**（新文件 `scripts/console-routes.js`，35 条路由，顺序即命中顺序，建表时对「同方法 + 同路径」重复直接报错）→ **按领域拆开的处理函数**（新目录 `scripts/console-handlers/`：system、logs、messages、config、security、runs 六个文件，每个 ≤300 行）。`dispatchRequest` 从 1,271 行降到 225 行。
+- **依赖是显式传进去的**：路由表拿到的 `ctx` 逐项列出 handler 需要的东西（HTTP 出口、目录、常量、动作函数、2FA/自动运行/SSE 的 helper）；关停闸、控制台设置、2FA 回执这些会变的状态一律走访问器，handler 不会读到启动瞬间的旧值。
+- **测试**：新增 `test_console_routes.js`（13 例）——路由清单与拆分前的 endpoint 一一对应且顺序一致（不是比对源码文本）、重复/冲突/坏条目必须抛错、`matchRoute` 的匹配语义（方法先比、精确路径、正则、先命中先返回、未命中 null），以及真实 HTTP 行为：`GET /api/status` 200、`POST /trigger?token=` 与 `POST /api/auto?token=` 必须 400 `query_token_not_allowed`（写面只认 Bearer）、`GET /api/runs/:id` 与坏 id 形态的两种 404、未知路径/方法不匹配仍是 `{"error":"not found"}`、无凭证仍 401。
+- **兼容**：所有端点的路径、方法、状态码、响应体、Cookie/CSRF/2FA 逻辑、`?token=` 的现有行为、访问日志口径、SSE 连接闸全部不变；这一轮只搬实现与增加启动期自检。`scripts/console.js` 净减 910 行（7578 → 6668），变异矩阵的 `console-part11..13` 行段已按新行数重排（`5835-6110` / `6111-6390` / `6391-6668`），`check-mutation-ranges` 通过。
+
+## v3.431
+
+- **本轮没有任何行为变化**：只是把上一版拆分后新出现的 8 条静态扫描告警（Codacy）逐条处置掉——接口、状态码、响应体、日志读取口径、锁与哨兵判定、磁盘格式、测试断言一律不动。
+- **6 条「动态构造文件/路径」告警的处理方式是加「已知安全」的行内抑制注释，不是改代码**：`scripts/console-handlers/` 的 `logs.js`（列当前日志文件、按名分页读日志）、`runs.js`（停止任务时补写一行 CANCEL 留痕）、`system.js`（读运行锁、取锁文件时间、查残留 `.takeover` 哨兵）三处的路径，全部由「运行侧缓存目录（`historyDir()` / `stateDir` 这类启动期常量）+ 仓内写死的文件名」拼成，**没有任何一段来自 HTTP 请求**；其中「按名读日志」那条还有既有白名单护着（只认两个固定日志名与周档文件名正则，其它形态直接 400），白名单与断言都没有放宽。
+- **2 条测试夹具告警按既有办法整文件排除**：`test_console_routes.js` 里的 `if (token !== '')` 只是判「这次请求带不带 Authorization」的空串哨兵（token 由用例自己写死，不是秘密、也没有可泄露的时序旁路）；`new RegExp(RUN_DETAIL_PATH.source)` 的正则源是路由表模块里的字面量常量，而这条用例正是要证明「同一 pattern 的两种写法必须判为重复路由」。两处都写进 `.codacy.yml` 的排除清单并附逐条理由，真实断言照旧由全量测试执行。
+- **测试**：定向套件全绿——`test_console_routes` 13 通过 / 0 失败、`test_console` 375 通过 / 0 失败，与上一版基线逐条一致（本轮没删、没放宽任何断言）。

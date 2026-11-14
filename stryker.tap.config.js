@@ -125,7 +125,9 @@ const explicitTestFiles = [
   // v3.410：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
   'test_similar_dedupe.js',
   // S2：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
-  'test_state_schema.js'
+  'test_state_schema.js',
+  // D1：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
+  'test_console_routes.js'
 ]
 
 function listDiff (expected, actual) {

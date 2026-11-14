@@ -124,7 +124,12 @@ const SUITES = [
   { name: '近似去重纯函数', file: 'test_similar_dedupe.js', desc: 'scripts/similar-dedupe.js findSimilarTitle 命中返回整条条目/未命中 null/价格与券档护栏 + isSimilarTitle 与 findSimilarTitle 结论一致（固定种子随机 200 组）' },
   // S2：状态 schema 与派生口径单源化的靶向套件（xbk_state_schema.js 纯函数 + 生产侧「不得再长出
   // 第二份定义」的源码形状断言）。纯函数、无 IO、无网络 ⇒ 不设 integration/mutationSkip。
-  { name: '状态口径', file: 'test_state_schema.js', desc: 'xbk_state_schema.js：日报日期/七项计数/pending 段校验与归一化、通道逐条容错、摘要行解析/格式化逐字与回环、今日/近7天派生统计；另断言生产文件不得再有第二份名单/正则' }
+  { name: '状态口径', file: 'test_state_schema.js', desc: 'xbk_state_schema.js：日报日期/七项计数/pending 段校验与归一化、通道逐条容错、摘要行解析/格式化逐字与回环、今日/近7天派生统计；另断言生产文件不得再有第二份名单/正则' },
+  // D1：`dispatchRequest` 拆成「薄 ingress + scripts/console-routes.js 有序路由表 + scripts/console-handlers/*
+  // 按域 handler」。本套件断言**路由清单与真实 HTTP 行为**（清单一一对应/顺序、重复检测、matchRoute 语义、
+  // 代表性端点的 method/path/status、写端点 Bearer-only 拒绝、未匹配仍 404），不靠 console.js 源码文本。
+  // 纯进程内 + 本机 HTTP 回环（每例自建实例、退出即关服务器），不设 integration / mutationSkip。
+  { name: '控制台路由表', file: 'test_console_routes.js', desc: 'scripts/console-routes.js：路由清单与拆分前 endpoint 一一对应（含顺序）/无重复与冲突/坏条目抛错 + matchRoute 语义（method 先比、精确与正则、先命中先返回、未命中 null）+ HTTP 行为（status/写面 query token 400/动态 runs:id 404/未匹配 404/无凭证 401）' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

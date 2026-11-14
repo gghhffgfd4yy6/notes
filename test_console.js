@@ -65,6 +65,28 @@ function readConsoleSource () {
     })
     .join('\n')
 }
+// 后端源码清单（D1 路由拆分）：`dispatchRequest` 拆成「薄 ingress + scripts/console-routes.js 有序路由表 +
+// scripts/console-handlers/*.js 按域 handler」之后，某段实现文本落在哪个文件不再固定。源码形态断言按
+// 同一份清单拼接（顺序固定），搬文件不再假红；负面断言（`!includes`）的扫描面随之变大，只会更严。
+const CONSOLE_SERVER_FILES = [
+  'scripts/console.js',
+  'scripts/console-routes.js',
+  'scripts/console-handlers/system.js',
+  'scripts/console-handlers/logs.js',
+  'scripts/console-handlers/messages.js',
+  'scripts/console-handlers/config.js',
+  'scripts/console-handlers/security.js',
+  'scripts/console-handlers/runs.js'
+]
+function readConsoleServerSource () {
+  return CONSOLE_SERVER_FILES
+    .map((rel) => {
+      const text = fs.readFileSync(path.join(__dirname, rel), 'utf8')
+      assert.ok(text.length > 0, `后端模块 ${rel} 不得为空（readConsoleServerSource 会静默少拼一段）`)
+      return text
+    })
+    .join('\n')
+}
 // 竞态安全读取器（生产 xbk_storage）：测试里对「刚写完/刚 rename 过的路径」的断言读取
 // 统一走它（O_NOFOLLOW + fstat 复检 + 读后复检），规避 CodeQL js/file-system-race 对
 // 「写路径 → 按路径 open」的 check-then-use 判红。
@@ -7022,7 +7044,7 @@ async function main () {
     assert.strictEqual(r2.items[1].interrupted, true, '紧邻本页最旧摘要的失败行必须回填')
   })
   await aok('测试隔离: 子进程缓存目录与停止留痕都钉到本实例 stateDir', () => {
-    const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    const src = readConsoleServerSource()
     // 现场证据：生产 run.log 里出现只存在于测试 fixture 的 id 1750000000000.9，且每轮都被标
     // 「中断」——测试实例的取消/停止留痕写进了仓库缓存，子进程也继承了缺省缓存目录。
     // 变异沙箱里 console.js 是插桩后的机器生成代码（语句被 stryMutAct_* 条件包裹），
@@ -10841,8 +10863,8 @@ async function main () {
   await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
     if (skipIfInstrumented('v3.332')) return
     const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
-    const server = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
+    const server = readConsoleServerSource()
     // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
     // 变异沙箱里 console.js 会被插桩：对象字面量与实参列表都被 stryMutAct_* 包裹，整句原文不再存在
     // ⇒ 这些「源码串」红线只在原始源文件上有意义，插桩环境必须跳过（行为断言照跑）。

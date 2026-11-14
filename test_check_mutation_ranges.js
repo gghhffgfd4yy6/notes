@@ -31,7 +31,7 @@ const SPECIAL_SEGMENTS = {
 }
 // 拆段边界固定（与 mutation.yml 真实矩阵一致），终点随文件增长自动跟随。
 // 值为边界数组：N 个边界 ⇒ N+1 段（单边界即两段拆法）。
-const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [563, 1126, 1689, 2252, 2815, 3675, 4370, 4800, 5200, 5800, 6500, 7150] }
+const SPLIT_BOUNDARY_RANGES = { 'xbk_sendNotify_slim.js': [750], 'scripts/console.js': [650, 1334, 1984, 2634, 3284, 3709, 4404, 4834, 5234, 5834, 6110, 6390] }
 
 // 构造包含所有生产文件的 yml，行段可按文件覆盖
 function buildYml (overrides = {}) {

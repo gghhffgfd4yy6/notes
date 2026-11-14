@@ -272,6 +272,19 @@
 #     已改写成 Number('20260101')（非字面量表达式，断言未放宽），
 #     用例语义不变（仍走 number 分支，改成字符串就测不到了）。
 # 以上均不涉整文件排除、不删断言，真实断言仍由 npm test / CI 全量执行。
+#
+# ---- D1（v3.431 路由拆分后）：test_console_routes.js 的两条静态误报登记 ----
+# test_console_routes.js 是 scripts/console-routes.js（D1 有序路由表）的靶向套件，本轮 Codacy 报 2 条：
+#   · :94「String comparison timing attack」（Security）——HTTP 夹具 request() 里 `if (token !== '')`
+#     只是判「本次请求带不带 Authorization」的空串哨兵：token 由用例自己写死（TOKEN 常量）或显式传 '',
+#     判定发生在发出请求之前，不涉及任何秘密，也没有可泄露的时序旁路；生产侧的令牌比较走
+#     scripts/console.js 的 timingSafeEqualStr，与这一行无关。
+#   · :159「dos-non-literal-regexp」（Security）——`new RegExp(RUN_DETAIL_PATH.source)` 的正则源是
+#     scripts/console-routes.js 的模块常量 RUN_DETAIL_PATH（字面量正则，表征运行 id 形态），不来自
+#     环境、CLI、网络或文件内容；该用例要证明的正是「同一 pattern 的两种写法必须判为重复路由」，
+#     改成字面量就测不到这条契约。
+# 两条都没有外部输入参与比较/正则源构造，按既有口径（test_utils.js / test_filter_store.js 的 safeRe
+# 与 test_storage.js 的夹具同一处理）整文件排除；真实断言仍由 npm test / CI 全量执行。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
@@ -412,3 +425,7 @@ exclude_paths:
   # 拆成 6 行模块只排除它，是为了保住 scripts/status.js 900 多行生产读路径（安全读取/容错解析/
   # 排序/分类/缓存签名）的 Codacy 覆盖——同 scripts/filter-rules-paths.js 的拆模块口径。
   - "scripts/status-utils.js"
+  # D1（v3.431）：路由表靶向套件。2 条误报——:94 的 token 空串哨兵比较（不涉及秘密）、
+  # :159 的 new RegExp(模块常量正则源)。逐条依据见上方「D1（v3.431 路由拆分后）」注释块；
+  # 不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
+  - "test_console_routes.js"
