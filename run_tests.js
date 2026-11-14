@@ -5,104 +5,42 @@
 // 退出码：0 = 全部通过，非 0 = 有失败（CI/调度可感知）
 // 每套件硬超时：默认 600s（可经 XBK_TEST_TIMEOUT 覆盖），超时按失败处理并整组 SIGKILL 强杀——
 // 套件挂死时入口仍能收敛出结论与退出码，不会永久阻塞（RT-03）；套件派生的后代由整组杀伤一并清掉（F6）。
+// 公共层（v3.435）：主机干净度 guard 加载 / 套件子进程 env 准备 / 终端显示宽度 / 正整数环境变量 /
+// 进程组杀伤统一在 scripts/test-harness.js 一处实现。本文件只保留**串行全量**编排（并发单元入口见
+// run_unit_tests.js），两边不再各维护一份底层实现（口径漂移曾让一条路径上的门禁被静默关掉）。
 // ============================================================
 const { spawn } = require('child_process')
+const path = require('path')
+const {
+  displayWidth,
+  padEndWidth,
+  positiveIntEnv,
+  prepareSuiteEnv,
+  loadHostCleanGuard,
+  killSuiteGroup
+} = require('./scripts/test-harness')
 
 // v3.283 主机干净度前置检查：孤儿测试桩 / 被 reparent 到 1 的孤儿套件 / 过期 /tmp/xbk-* 沙箱会把墙钟
 // 基准拖红（实测 300ms 跑出 878ms），脏机器不启动。缺脚本时**响亮跳过**——最小工作树（如
-// test_ci_skip_suites.js 的 RT-08 夹具只复制 run_tests.js）不得因此崩；其它异常照常抛出，不吞。
-// C10-028：容错只覆盖「**本模块自身**不存在」。旧实现直接 require 并只判 e.code === 'MODULE_NOT_FOUND'，
-// 于是 scripts/check-host-clean.js 存在、但它内部的某个依赖缺失（树损坏 / 将来给它加相对依赖）也被读成
-// 「未找到 scripts/check-host-clean.js，跳过」→ 主机干净度门禁被静默关掉。现在先用 require.resolve
-// 预判本模块能否解析：解析不到才算最小工作树（响亮跳过）；解析成功后的 require 异常（含其内部
-// MODULE_NOT_FOUND）一律照常抛出，绝不再伪装成「脚本不存在」。
-const HOST_CLEAN_MODULE = './scripts/check-host-clean.js'
-let hostClean = null
-let hostCleanMissing = false
-try {
-  require.resolve(HOST_CLEAN_MODULE)
-} catch (e) {
-  if (e.code !== 'MODULE_NOT_FOUND') throw e
-  hostCleanMissing = true
-  console.log('⚠️ 未找到 scripts/check-host-clean.js，跳过主机干净度前置检查（不影响本次运行）')
-}
-if (!hostCleanMissing) hostClean = require(HOST_CLEAN_MODULE)
+// test_ci_skip_suites.js 的 RT-08 夹具只复制入口）不得因此崩；其它异常照常抛出，不吞。
+// C10-028 的容错口径（只放过「本模块自身不存在」、先 resolve 预判再 require）随实现一起收敛到
+// scripts/test-harness.js 的 loadHostCleanGuard（该处注释给出完整理由）。
+const { hostClean } = loadHostCleanGuard()
 if (hostClean && hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
-const path = require('path')
+
 const { checkDependencies } = require('./scripts/check-deps')
 
 const { SUITES } = require('./test_suites')
 
-// C3-002（backlog）：套件子进程一律用**剥离了 XBK_CACHE_DIR 的 env**。
-// 为什么必须显式传 env：spawn 不传 env 时子进程继承 shell 环境，而生产 cacheDir getter 让
-// XBK_CACHE_DIR 无条件压过 Config.cache.dir（SYSTEM_CONTRACT 契约，语义正确），于是「在 export 过
-// 该变量的机器上跑测试」会把夹具写进**部署缓存目录**、覆盖真实 push.json 判重主存。
+// C3-002（backlog）：套件子进程一律用**剥离了 XBK_CACHE_DIR 的 env**（实现见 scripts/test-harness.js
+// 的 prepareSuiteEnv）。为什么必须显式传 env：spawn 不传 env 时子进程继承 shell 环境，而生产 cacheDir
+// getter 让 XBK_CACHE_DIR 无条件压过 Config.cache.dir（SYSTEM_CONTRACT 契约，语义正确），于是「在
+// export 过该变量的机器上跑测试」会把夹具写进**部署缓存目录**、覆盖真实 push.json 判重主存。
 // 只改测试侧：生产 getter 一字不动，环境变量在你自己的 shell 里照旧生效。
-// ⚠️ 最小工作树夹具（test_ci_skip_suites.js 的 RT-08 只复制 run_tests.js + 假 test_suites/check-deps）
-// 里没有 scripts/ 目录：与 scripts/check-host-clean.js 同口径——缺模块时**响亮**跳过并退回同一实现的
-// 内联版本（绝不静默放行，否则夹具里的隔离语义与真实入口不一致）。
-const FALLBACK_STRIP_CACHE_DIR_ENV = (env = process.env) => {
-  const next = { ...(env || {}) }
-  const raw = typeof next.XBK_CACHE_DIR === 'string' ? next.XBK_CACHE_DIR : ''
-  delete next.XBK_CACHE_DIR
-  return { env: next, cleared: raw }
-}
-let stripCacheDirEnv = FALLBACK_STRIP_CACHE_DIR_ENV
-try {
-  stripCacheDirEnv = require('./scripts/test-env-isolation').stripCacheDirEnv || FALLBACK_STRIP_CACHE_DIR_ENV
-} catch (e) {
-  if (e.code !== 'MODULE_NOT_FOUND') throw e
-  console.log('⚠️ 未找到 scripts/test-env-isolation.js，入口按同一口径内联剥离 XBK_CACHE_DIR（最小工作树夹具）')
-}
-const SUITE_ENV_INFO = stripCacheDirEnv(process.env)
-const SUITE_ENV = SUITE_ENV_INFO.env
-if (SUITE_ENV_INFO.cleared) {
-  console.warn(`⚠️ 已从本入口派生的测试子进程环境中清除 XBK_CACHE_DIR（${SUITE_ENV_INFO.cleared}）：测试只用 Config.cache.dir 的私有目录，避免写入部署缓存（backlog C3-002）`)
-}
+const SUITE_ENV = prepareSuiteEnv(process.env).env
 
-// 汇总表按终端显示宽度对齐（与 run_unit_tests.js 同口径）：String.prototype.padEnd 按 UTF-16 码元计数，
-// 中文每字占 2 列、文件名长度不一，直接 padEnd 会让列错位；此处按实测最大显示宽度补齐。
-const WIDE_RE = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/
-function displayWidth (str) {
-  let width = 0
-  for (const ch of str) width += WIDE_RE.test(ch) ? 2 : 1
-  return width
-}
-function padEndWidth (str, width) {
-  return str + ' '.repeat(Math.max(0, width - displayWidth(str)))
-}
-
-// 环境变量正整数解析（与 run_unit_tests.js / run_mutation.js 的 positiveIntEnv 同口径）：
-// 非法值（NaN / 负数 / 非整数 / 空串）一律告警并回退默认，绝不静默按非法值运行。
-function positiveIntEnv (name, fallback) {
-  const raw = process.env[name]
-  if (raw === undefined || raw === '') return fallback
-  const value = Number(raw)
-  if (!Number.isInteger(value) || value < 1) {
-    console.warn(`⚠️  环境变量 ${name}=${raw} 非法（应为正整数），已回退默认值 ${fallback}`)
-    return fallback
-  }
-  return value
-}
-
-// 套件整组杀伤（F6 / C10-044）：套件以 detached:true 启动（setsid），pid 即进程组 id → kill(-pid)
-// 连同套件派生的后代一起清掉。
-// 为什么必须有这一步：只 kill 直接子进程（修复前）时，套件 fork 出的孙进程（与 test_app_p.js 的
-// 并行调度同形：fork + stdio 继承 fd1）存活并继续持有继承的 stdout/stderr。入口自身被管道捕获时
-// （CI runner 收输出、spawnSync('pipe')、其它入口以 stdio:'pipe' 拉起本入口）管道的 close 会被推迟到
-// 孤儿后代退出才发生——实测父进程要等 30s 兜底才返回；且孤儿继续跑（占 CPU / 端口 / 临时目录，
-// 污染后续套件）。这与 run_mutation.js:324 的 killTree 是同一 bug 类、同一修法（见该处注释）。
-// 组不存在（子进程未及 setsid / 已被回收 → ESRCH）或无权限（EPERM）时静默退回：不抛错、不改结算口径
-// ——超时仍按失败处理、退出码仍为 1、汇总三数字不变（fail-closed 语义）。
-function killSuiteGroup (pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false
-  try {
-    process.kill(-pid, 'SIGKILL')
-    return true
-  } catch (e) {
-    return false
-  }
-}
+// 汇总表按终端显示宽度对齐（displayWidth / padEndWidth 在 scripts/test-harness.js）：String.prototype.padEnd
+// 按 UTF-16 码元计数，中文每字占 2 列、文件名长度不一，直接 padEnd 会让列错位；此处按实测最大显示宽度补齐。
 
 // 当前在跑的套件进程组 id（C10-044）：套件运行在 detached 新进程组里，Ctrl-C / CI 取消只会打到本入口，
 // 没有任何 handler 时孤儿套件继续跑（实测：心跳文件在入口退出后仍增长）。

@@ -56,6 +56,8 @@ function makeRunTestsSandbox ({ dependencies, devDependencies, presentDeps = [] 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'run-tests-sandbox-'))
   fs.mkdirSync(path.join(dir, 'scripts'))
   fs.copyFileSync(path.join(__dirname, 'scripts', 'check-deps.js'), path.join(dir, 'scripts', 'check-deps.js'))
+  // v3.435：run_tests.js 的公共层在 scripts/test-harness.js（同 check-deps 一样是入口的依赖）
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'test-harness.js'), path.join(dir, 'scripts', 'test-harness.js'))
   fs.copyFileSync(path.join(__dirname, 'run_tests.js'), path.join(dir, 'run_tests.js'))
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'sandbox', version: '1.0.0', dependencies, devDependencies }))
   for (const name of presentDeps) {

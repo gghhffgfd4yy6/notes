@@ -67,6 +67,11 @@ const SUITES = [
   { name: 'CI跳过清单对账', file: 'test_ci_skip_suites.js', desc: 'SKIP_SUITES ↔ test.yml 显式步骤双向一致 + 入口过滤/summary 行为 + test_app.js --only 过滤契约' },
   { name: '注册表对账', file: 'test_suite_registry.js', desc: '根目录 test_*.js ↔ SUITES 双向一致（漏注册/幽灵条目/白名单陈旧）' },
   { name: '主机干净度接线', file: 'test_host_clean_gates.js', desc: 'check:host-clean 入口 guard（run_tests + run_unit_tests）+ 子进程跳过/过期沙箱/reparent 判据不回退 + 挂死夹具 90s 有界自杀' },
+  // v3.435：测试入口公共层（scripts/test-harness.js）的专项套件。两个入口此前各有一份逐字相同的
+  // 底层实现；收敛之后「又偷偷长回一份」不会有任何行为断言变红（两份一致时跑什么都是绿的），
+  // 故本套件同时锁纯逻辑与源码形状。普通单元套件（不 integration / 不 mutationSkip）：纯同步、
+  // 无网络、无子进程，沙箱内可跑。
+  { name: '测试入口公共层', file: 'test_test_harness.js', desc: 'scripts/test-harness.js：displayWidth/padEndWidth（中文 2 列）、positiveIntEnv 非法值告警回退、prepareSuiteEnv 只删 XBK_CACHE_DIR、guard 加载（missing 不抛/内部依赖缺失照常抛）、killSuiteGroup 非法 pid；另断言两个入口只 require 一份公共层、不再各自定义' },
   // mutationSkip（v3.280）：本套件断言 .githooks/pre-commit、pre-push 与 test.yml 的接线内容，
   // 而变异沙箱（copyProject）不复制 .githooks/ ⇒ 沙箱内必 ENOENT 假红（同 test_install_hooks 的
   // 登记先例）。CI 覆盖由 test.yml 的显式步骤「静态扫描接线断言」承担。

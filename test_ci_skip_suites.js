@@ -1208,6 +1208,11 @@ function makeRunTestsSandbox (suites, files = {}) {
   fs.copyFileSync(path.join(__dirname, 'run_tests.js'), path.join(dir, 'run_tests.js'))
   fs.mkdirSync(path.join(dir, 'scripts'))
   fs.writeFileSync(path.join(dir, 'scripts', 'check-deps.js'), 'module.exports = { checkDependencies: () => true }\n')
+  // v3.435：入口的公共层（显示宽度 / 套件 env / 正整数 env / 进程组杀伤 / 主机干净度 guard 加载）
+  // 收敛到 scripts/test-harness.js —— 夹具复制了入口就必须同时复制它的依赖（与 check-deps.js 同理）。
+  // 不复制 scripts/check-host-clean.js 与 scripts/test-env-isolation.js：那两条「响亮跳过 / 内联回退」
+  // 分支正是本夹具要覆盖的最小工作树形态。
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'test-harness.js'), path.join(dir, 'scripts', 'test-harness.js'))
   fs.writeFileSync(path.join(dir, 'test_suites.js'), `module.exports = { SUITES: ${JSON.stringify(suites)} }\n`)
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
   return dir
@@ -1831,6 +1836,11 @@ assert.strictEqual(zombieFixtureState.skipped, !zombieFixtureSupported(),
 function makeUnitTestsSandbox (suites, files = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-unit-tests-'))
   fs.copyFileSync(path.join(__dirname, 'run_unit_tests.js'), path.join(dir, 'run_unit_tests.js'))
+  // v3.435：入口的公共层收敛到 scripts/test-harness.js，夹具复制入口时必须一并复制它（同 check-deps）。
+  // 刻意不复制 scripts/check-host-clean.js / scripts/test-env-isolation.js：入口在这两处的
+  // 「响亮跳过 / 内联回退」分支正是沙箱形态要覆盖的路径。
+  fs.mkdirSync(path.join(dir, 'scripts'))
+  fs.copyFileSync(path.join(__dirname, 'scripts', 'test-harness.js'), path.join(dir, 'scripts', 'test-harness.js'))
   fs.writeFileSync(path.join(dir, 'test_suites.js'), `module.exports = { SUITES: ${JSON.stringify(suites)} }\n`)
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
   return dir

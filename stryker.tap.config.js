@@ -111,6 +111,8 @@ const explicitTestFiles = [
   'test_ci_skip_suites.js',
   'test_suite_registry.js',
   'test_host_clean_gates.js',
+  // v3.435：与 test_suites.js 的注册顺序一致（紧随 test_host_clean_gates.js：同属「测试入口接线」族）。
+  'test_test_harness.js',
   'test_tag_validator.js',
   'test_check_version.js',
   'test_app_unit.js',
