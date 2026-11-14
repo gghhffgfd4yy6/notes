@@ -147,13 +147,20 @@ check('接线：npm 脚本在册 + 三个测试入口都挂了 guard', () => {
     const src = read(entry)
     assert.match(src, /^if \(hostClean && hostClean\.shouldAbortForDirtyHost\(process\.env\)\) process\.exit\(1\)$/m,
       entry + ' 缺入口 guard：脏机器上跑出的红会被当成契约失败（v3.282 那轮 48/49 正是如此）')
-    // 容错必须是「只放过 MODULE_NOT_FOUND」：最小工作树（RT-08 夹具只复制 run_tests.js）不得崩，
-    // 但吞掉一切异常会让真故障伪装成「已检查且干净」。
-    assert.match(src, /if \(e\.code !== 'MODULE_NOT_FOUND'\) throw e/,
-      entry + ' 的 require 容错必须只吞 MODULE_NOT_FOUND，其它异常照常抛出')
-    assert.match(src, /console\.log\('⚠️ 未找到 scripts\/check-host-clean\.js/,
-      entry + ' 跳过时必须响亮打印，不得静默通过')
+    // v3.435：guard 的**加载**（require.resolve 预判 + 响亮跳过）收敛到 scripts/test-harness.js；
+    // 入口必须真的调它——「删掉 require 只留注释」同样等于门禁失效。
+    assert.match(src, /const \{ hostClean \} = loadHostCleanGuard\(\)/,
+      entry + ' 必须经公共层 loadHostCleanGuard 加载门禁（v3.435 起公共层只有一份）')
+    assert.ok(!/require\.resolve\(/.test(src),
+      entry + ' 不得再自己写一份 resolve 预判：加载口径已收敛到 scripts/test-harness.js')
   }
+  // 容错必须是「只放过 MODULE_NOT_FOUND」：最小工作树（夹具只复制入口与公共层）不得崩，
+  // 但吞掉一切异常会让真故障伪装成「已检查且干净」。
+  const harnessSrc = read('scripts/test-harness.js')
+  assert.match(harnessSrc, /if \(e\.code !== 'MODULE_NOT_FOUND'\) throw e/,
+    '公共层的加载容错必须只吞 MODULE_NOT_FOUND，其它异常照常抛出')
+  assert.match(harnessSrc, /'⚠️ 未找到 scripts\/check-host-clean\.js，跳过主机干净度前置检查（不影响本次运行）'/,
+    '公共层跳过时必须响亮打印（缺省 logger 即 console.log），不得静默通过')
   const direct = read('test_filter.js')
   assert.match(direct, /^if \(hostClean\.shouldAbortForDirtyHost\(process\.env\)\) process\.exit\(1\)$/m,
     '直接执行 test_filter.js（CI/pre-push）也必须先经过主机干净度检查')
@@ -183,6 +190,9 @@ check('require 容错只吞「本模块不存在」，模块内部依赖缺失�
     fs.mkdirSync(path.join(dir, 'scripts'))
     // 补齐入口自身的最小依赖，让它能跑到可观察的节点（脚本本体只复制入口文件）
     fs.writeFileSync(path.join(dir, c.entry), read(c.entry))
+    // v3.435：入口的公共层在 scripts/test-harness.js（与 check-deps 同属入口依赖）。刻意不复制
+    // check-host-clean.js —— 「无门禁」分支才是本夹具要覆盖的最小工作树形态（坏门禁由下面显式写入）。
+    fs.copyFileSync(path.join(__dirname, 'scripts', 'test-harness.js'), path.join(dir, 'scripts', 'test-harness.js'))
     fs.writeFileSync(path.join(dir, 'test_suites.js'), "'use strict'\nmodule.exports = { SUITES: [] }\n")
     for (const [rel, body] of Object.entries(c.extra)) fs.writeFileSync(path.join(dir, rel), body)
     if (withBrokenGate) {
@@ -222,17 +232,17 @@ check('require 容错只吞「本模块不存在」，模块内部依赖缺失�
         fs.rmSync(dir, { recursive: true, force: true })
       }
     }
-    // ③ 生产路径不得回退：先 require.resolve 预判，resolve 成功后的 require 异常照常抛
-    const src = read(c.entry)
-    // 可匹配形态：`try {` 换行后紧跟 `require.resolve(HOST_CLEAN_MODULE)`（中间允许空行）。
+    // ③ 生产路径不得回退：先 resolve 预判，resolve 成功后的加载异常照常抛（v3.435 起实现在公共层）
+    const harnessSrc = read('scripts/test-harness.js')
+    // 可匹配形态：`try {` 换行后紧跟 `req.resolve('./check-host-clean.js')`（中间允许空行）。
     // 旧写法 `\s*\n\s*` 里 `\s` 也能吃换行，两侧抢同一段空白 ⇒ 超线性回切（S5852）。
     // 把「行尾空白」限定成 [ \t]（不含换行）后，`\n` 只能由字面量吃掉，判定退化为一次线性扫描；
-    // 「先 require.resolve、再 require」这条判据本身一字未变——坏形态反例（直接 require 进 catch）
+    // 「先 resolve、再加载」这条判据本身一字未变——坏形态反例（直接 require 进 catch）
     // 由紧随其后的负断言继续兜住。
-    assert.match(src, /try \{[ \t]*\n\s*require\.resolve\(HOST_CLEAN_MODULE\)/,
-      `${c.entry} 必须先 require.resolve 本模块、再 require 它（否则任何 MODULE_NOT_FOUND 又会被当成「脚本不存在」）`)
-    assert.ok(!/hostClean = require\('\.\/scripts\/check-host-clean\.js'\)\s*\n\}\s*catch/.test(src),
-      `${c.entry} 不得把 require 直接放在只判 e.code 的 catch 里（C10-028 的原形）`)
+    assert.match(harnessSrc, /try \{[ \t]*\n\s*req\.resolve\('\.\/check-host-clean\.js'\)/,
+      `${c.entry} 的公共层必须先 resolve 本模块、再加载它（否则任何 MODULE_NOT_FOUND 又会被当成「脚本不存在」）`)
+    assert.ok(!/hostClean = require\('\.\/check-host-clean\.js'\)\s*\n\}\s*catch/.test(harnessSrc),
+      '公共层不得把加载直接放在只判 e.code 的 catch 里（C10-028 的原形）')
   }
 })
 

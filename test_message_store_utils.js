@@ -3026,9 +3026,15 @@ check('C3-002: stripCacheDirEnv 必须剥离 XBK_CACHE_DIR 且不改动入参（
 })
 
 check('C3-002: 两个测试入口都必须把剥离后的 env 传给子进程（接线内容断言）', () => {
+  // v3.435：剥离实现只在公共层一处（scripts/test-harness.js 的 prepareSuiteEnv），入口不得再各自
+  // require 一次隔离模块——两份实现会静默漂移。公共层内的相对路径是 './test-env-isolation'。
+  const harnessSrc = REAL_FS.readFileSync(path.join(__dirname, 'scripts', 'test-harness.js'), 'utf8')
+  assert.ok(harnessSrc.includes("require('./test-env-isolation')"),
+    `公共层必须复用 ${ENV_ISOLATION}（唯一实现；内联回退只覆盖最小工作树）`)
   for (const entry of ['run_tests.js', 'run_unit_tests.js']) {
     const src = REAL_FS.readFileSync(path.join(__dirname, entry), 'utf8')
-    assert.ok(src.includes(`require('${ENV_ISOLATION}')`), `${entry} 必须 require ${ENV_ISOLATION}`)
+    assert.ok(/const SUITE_ENV = prepareSuiteEnv\(process\.env\)\.env/.test(src),
+      `${entry} 必须经公共层 prepareSuiteEnv 准备套件 env（不得各自复制一份剥离逻辑）`)
     assert.ok(/env:\s*SUITE_ENV/.test(src),
       `${entry} 必须把 SUITE_ENV 传给子进程（否则 shell 里的 XBK_CACHE_DIR 照旧泄漏进每个套件）`)
   }
