@@ -219,7 +219,7 @@ function resolveMaxBytes (maxBytes, filePath) {
 const SAFE_READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
 function openSafeReadFd (filePath, options = {}) {
   const nonBlock = !!(options && options.nonBlock === true)
-  return fs.openSync(filePath, SAFE_READ_FLAGS | (nonBlock ? (fs.constants.O_NONBLOCK || 0) : 0))
+  return fs.openSync(filePath, SAFE_READ_FLAGS | (nonBlock ? (fs.constants.O_NONBLOCK || 0) : 0)) // nosemgrep（filePath 由调用方传入——本函数按定义就是「以只读方式安全打开任意路径」的唯一原语，路径必然是变量、写不成字面量；运行期防护在 SAFE_READ_FLAGS 的 O_NOFOLLOW（末级符号链接直接 ELOOP）与调用方的 fstatSync().isFile() 普通文件断言，属静态数据流误报）
 }
 
 // 元数据安全探测（S1 统一原语）：与 readSafeTextResult 同一 opener、同一套普通文件语义，
