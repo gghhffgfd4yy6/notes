@@ -15,11 +15,22 @@ const S = require('./xbk_state_schema')
 
 let passed = 0
 let failed = 0
+// 跳过单独计数（评审 M1）：此前 check() 不看返回值，guard 返回 'SKIP …' 时一条断言都没跑却照样
+// passed += 1 —— 在 Stryker 插桩沙箱里 B2 因此长期假绿。跳过必须单列、打印、并与声明数对账。
+let skipped = 0
 const failures = []
+const skips = []
+// 声明用例数：新增/删除用例时必须同步（结算数不符 ⇒ 直接红，避免「不执行的用例被记成通过」）。
+const DECLARED_CASES = 42
 
 function check (name, fn) {
   try {
-    fn()
+    const r = fn()
+    if (typeof r === 'string' && r.startsWith('SKIP')) {
+      skipped += 1
+      skips.push(r)
+      return
+    }
     passed += 1
   } catch (e) {
     failed += 1
@@ -482,6 +493,10 @@ check('源码形状：run.log 摘要行只能由 formatRunSummaryLine({…}) 生
   if (skip) return skip
   assert.ok(appSrc.includes('formatRunSummaryLine({'),
     'xbk_app.js 必须调用共享的 formatRunSummaryLine({…}) 生成摘要行（换回内联模板即变红：写/读会出现两份格式串）')
+  // 正向锚点再加一道：实参块必须真的把 `counters` 交进去（`formatRunSummaryLine({})` 空参也算「有调用」，
+  // 那样写侧根本没把计数传给格式化函数，摘要会静默退化）。
+  assert.ok(/formatRunSummaryLine\(\{\s*stamp:[^}]*counters:/.test(appSrc),
+    'formatRunSummaryLine 的实参必须同时给 stamp 与 counters（空参/漏 counters 会让摘要计数静默丢失）')
   // 旧内联模板的**唯一字面量锚点**：同一个模板串里同时出现 `total=${` 与 `dedup=${`。
   // 已 grep 确认该形态在 xbk_app.js 里为 0 处（`dedup=${` 单独出现在一条 checkpoint 诊断行，不含 total=，
   // 故不会被误伤），合法出现点只有 xbk_state_schema.formatRunSummaryLine。
@@ -493,13 +508,24 @@ check('源码形状：run.log 摘要行只能由 formatRunSummaryLine({…}) 生
     '前置：负断言锚点必须能抓住旧内联模板（否则负断言恒真、等于没有）')
   assert.strictEqual(INLINE_SUMMARY.test(appSrc), false,
     'xbk_app.js 不得再内联 run.log 摘要模板（换回内联模板必须变红：写侧两份格式串会让读侧静默解析不到）')
+  // 更宽的第二道（评审 nit）：不依赖「同一模板串内同现」。`total=` 在 xbk_app.js 里必须 0 处——
+  // 把模板拆成两行、或用字符串拼接写 `' total=' + total`，上面那条正则都抓不到，这条能抓住。
+  const totalAssignments = (appSrc.match(/(?:^|[^A-Za-z0-9_])total=/g) || []).length
+  assert.strictEqual(totalAssignments, 0,
+    `xbk_app.js 里不得出现任何 total= 字面（当前 ${totalAssignments} 处）：摘要的 total 只能由 formatRunSummaryLine 渲染`)
   // 反向对照：共享模块自己当然必须保留那个模板（防止有人为了过上面两条把格式化整段删掉）。
   const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep（同上：字面量路径 + 形状断言）
   assert.ok(INLINE_SUMMARY.test(schemaSrc),
     'xbk_state_schema.formatRunSummaryLine 必须仍保有摘要模板（删掉它等于让 run.log 摘要消失）')
 })
 
-console.log(`\n=== 结果：${passed} 通过 / ${failed} 失败 ===`)
+const settled = passed + failed + skipped
+if (settled !== DECLARED_CASES) {
+  failures.push(`用例结算对账失败：声明 ${DECLARED_CASES} 例，实际结算 ${settled} 例（通过 ${passed} / 失败 ${failed} / 跳过 ${skipped}）`)
+  failed += 1
+}
+console.log(`\n=== 结果：${passed} 通过 / ${failed} 失败${skipped ? ` / ${skipped} 跳过` : ''}（声明 ${DECLARED_CASES} 例） ===`)
+for (const s of skips) console.log(`  ⏭️  ${s}`)
 if (failed > 0) {
   for (const f of failures) console.log(`  ❌ ${f}`)
 }

@@ -5688,6 +5688,25 @@ checkAsync('A1/C-009：非 JSON run.lock（\'{oops\'）⇒ 同样抛 RUN_LOCK_UN
   assert.strictEqual(lockFs.readFileSync(p, 'utf8'), '{oops', '不可判定的锁内容一个字都不能改')
 })
 
+checkAsync('A1/C-009：超 4 KiB 的**合法** JSON 帧 ⇒ 抛 RUN_LOCK_UNREADABLE / lockIssue=too_large（只超限不脏帧）', async () => {
+  const dir = mkTmpFixture('runlock-a1-toolarge-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  // 字段全部合法（pid 是死的真 pid、token/startedAt 都有），只有体积超上限：删掉 size 检查时必须变红，
+  // 否则「>4 KiB 一律抛」这一格就是删了也没人知道（评审 M3）。
+  const fat = JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now(), token: 'x:0:y', startTicks: '0', pad: 'a'.repeat(5000) })
+  assert.ok(Buffer.byteLength(fat) > 4096, `前置：样本必须真的超 4 KiB（${Buffer.byteLength(fat)}）`)
+  lockFs.writeFileSync(p, fat, { mode: 0o600 })
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '超大锁必须响亮失败（不得整读、不得判死接管）')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE', `失败原因必须是「不可判定」：${error.message}`)
+  assert.strictEqual(error.lockIssue, 'too_large', `归因必须是 too_large：${error.lockIssue}`)
+  assert.strictEqual(error.lockPath, p)
+  assert.ok(warns.some((w) => w.includes('⚠️') && w.includes('too_large')), `告警必须带 ⚠️ 与原因：${JSON.stringify(warns)}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8'), fat, '超大锁内容一个字都不能改')
+  assert.deepStrictEqual(lockFs.readdirSync(dir).sort(), ['run.lock'], '失败轮不得新增任何文件')
+})
+
 checkAsync('A2/C-040：0 字节 run.lock.takeover ⇒ 抛 RUN_LOCK_SENTINEL_UNREADABLE，消息点名哨兵与「删 run.lock 无效」，主锁不被替换', async () => {
   const dir = mkTmpFixture('runlock-a2-sentinel-')
   const app = makeLockApp(dir)
@@ -5715,6 +5734,8 @@ checkAsync('A2/C-040：0 字节 run.lock.takeover ⇒ 抛 RUN_LOCK_SENTINEL_UNRE
 })
 
 check('A3/C-057：回收本进程残留哨兵失败（unlink EACCES）⇒ 错误带 sentinelReleaseFailed，告警含 ⚠️ 与哨兵路径', () => {
+  // 哨兵帧要带本进程真实启动时钟（/proc/<pid>/stat）才被判成「本进程残留」；非 Linux 没有这个文件。
+  if (process.platform !== 'linux') return skip('A3/C-057：本进程哨兵残留回收失败', '非 Linux：读不到 /proc/self 启动时钟')
   const dir = mkTmpFixture('runlock-a3-own-sentinel-')
   const app = makeLockApp(dir)
   const p = lockPathReal(dir)
@@ -5761,6 +5782,8 @@ check('A3/C-057：回收本进程残留哨兵失败（unlink EACCES）⇒ 错误
 })
 
 checkAsync('A4/C-027 行为 1：僵尸持有者（/proc state=Z）⇒ 按已退出接管，告警含「僵尸」与该 pid', async () => {
+  // 僵尸判定读 /proc/<pid>/stat（Linux 专有）；macOS 上这条用例必然假红。
+  if (process.platform !== 'linux') return skip('A4/C-027 行为 1：僵尸持有者', '非 Linux：读不到 /proc/<pid>/stat 状态')
   const { spawn } = require('child_process')
   const realFs = require('fs')
   // 真造一个僵尸：让 **sh** 当父进程（Node 会自动 wait 回收自己的子进程，拿不到 Z），
@@ -5843,7 +5866,8 @@ checkAsync('A4/C-027 行为 2：pid 超 pid_max（1e15）⇒ 抛 RUN_LOCK_UNREAD
   const dir = mkTmpFixture('runlock-a4-pidmax-')
   const app = makeLockApp(dir)
   const p = lockPathReal(dir)
-  // 旧实现：kill(1e15,0) 直接 ESRCH ⇒ 判死主 ⇒ 接管（一帧手写内容就能抢锁，fail-open）。
+  // 旧实现：kill(1e15,0) 抛 ERR_INVALID_ARG_TYPE（Node 22 实测；不是 ESRCH），而死的判定是
+  // `alive = e.code === 'EPERM'`——任何非 EPERM 错误都被当成「已死」⇒ 判死主 ⇒ 接管（fail-open）。
   const alien = { pid: 1e15, startedAt: Date.now(), token: 'x:0:y', startTicks: '0' }
   lockFs.writeFileSync(p, JSON.stringify(alien), { mode: 0o600 })
   const { error, warns } = await captureLockWarnAsync(() => app.run())
@@ -6687,7 +6711,7 @@ checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run
   const pending = asyncChecks.slice()
   for (const [name, fn] of pending) {
     try {
-      await fn()
+      if (await fn() === 'skip') continue
       passed++
     } catch (e) {
       failed++
