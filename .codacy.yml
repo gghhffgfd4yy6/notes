@@ -233,6 +233,20 @@
 # 无任何外部净输入参与路径/正则源构造，11 条 path construction（:66/:116/:117/:214/:404/:409/:427/
 # :434/:550/:553/:650）+ 1 条 non-literal RegExp（:474）属误报（与 test_utils.js /
 # test_message_store_journal.js 的既有登记同口径）。真实断言仍由 npm test / CI 全量执行。
+#
+# xbk_storage.js 是统一安全文件入口（生产运行时：状态/日志/消息缓存的读写原语）：
+# 本轮 Codacy/Opengrep 报在 :222 `fs.openSync(filePath, …)` 的 1 条「动态构造文件/路径信息」属误报——
+# 该行是 openSafeReadFd()，按设计就是「以只读方式安全打开调用方给出的任意路径」的**全仓唯一原语**，
+# filePath 按定义必然是变量（该规则只放行字符串字面量首参，任何「改写」都只是把原语拆回各调用点、
+# 把同一个动态路径散成更多处，不会降低真实风险）。真实防护在运行期而不在静态形状：
+#   · :219 `SAFE_READ_FLAGS = O_RDONLY | O_NOFOLLOW`——末级是符号链接时 :222 的 open 直接 ELOOP，
+#     从源头不跟随（平台缺该常量时退化为 0，由下面的 fstat 判定兜底）；
+#   · 读内容：:305 打开 → :313 `fs.fstatSync(fd)` + :314 `!stat.isFile()` 判 unsafe（目录/FIFO/设备一律
+#     拒绝），读完 :334 再打开一次复检 dev+ino（:336），读窗口内路径被换掉也不会被当成同一份文件；
+#   · 只取元数据：:239 打开 → :240 `fstatSync` + :241 `isFile()`，unsafe 态不泄露 size（见 :236）。
+# 路径来源也不是外部净输入：调用方已做 basename 清洗（见本文件头 :15-16）。故 :222 已按本仓既有口径
+# 加行内 `// nosemgrep`（同 scripts/log-archive.js:89 / xbk_message_store.js:1204）；本条目是同一结论的
+# 文字登记，不涉整文件排除，该文件的真实行为仍由 npm test 全量执行。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性

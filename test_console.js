@@ -7456,7 +7456,7 @@ async function main () {
     assert.strictEqual(r.items[0].pushed, 100)
   })
   // ── v3.298 只读扩展：配置视图 / 缓存健康 / 文件清单 / 趋势天数 ─────────────────
-  await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失）', () => {
+  await aok('只读纯函数: statSafeMeta 三态（常规文件 / 符号链接 / 缺失 / 目录）', () => {
     const dir = tmpDir()
     const fp = path.join(dir, 'a.json')
     fs.writeFileSync(fp, '{"x":1}')
@@ -7464,6 +7464,13 @@ async function main () {
     assert.strictEqual(okMeta.status, 'ok')
     assert.strictEqual(okMeta.size, 7)
     assert.ok(Number.isFinite(okMeta.mtimeMs), 'mtime 必须下发')
+    // S1：控制台不再自带一份实现——这里导出的必须**就是** xbk_storage 的那个函数对象。
+    // 回退成「控制台本地再写一份」时行为可以一模一样（本用例其余断言照样绿），只有这条会红。
+    assert.strictEqual(statSafeMeta, require('./xbk_storage').statSafeMeta,
+      'statSafeMeta 只能有一份实现（控制台必须重导出 xbk_storage 的，不得本地再写）')
+    assert.strictEqual(okMeta.ino, fs.statSync(fp).ino, 'ino 必须来自 fstat（tombstoneCounts 靠它识别同一份文件）')
+    // 目录不是普通文件 ⇒ unsafe，且不得泄露目录自身的大小
+    assert.deepStrictEqual(statSafeMeta(dir), { status: 'unsafe', size: null, mtimeMs: null, ino: null })
     // 符号链接：绝不跟随（O_NOFOLLOW 口径）——链接指向哪里都判 unsafe
     fs.symlinkSync(fp, path.join(dir, 'link.json'))
     assert.strictEqual(statSafeMeta(path.join(dir, 'link.json')).status, 'unsafe')

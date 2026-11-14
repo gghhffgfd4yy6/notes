@@ -10,7 +10,9 @@ const {
   writeAtomic,
   writeAtomicIfAbsent,
   readSafeText,
-  readSafeTextResult
+  readSafeTextResult,
+  statSafeMeta,
+  isRealPathInside
 } = require('./xbk_storage')
 const LogArchive = require('./scripts/log-archive')
 
@@ -1798,6 +1800,159 @@ const LogArchive = require('./scripts/log-archive')
     assert.ok(warns30.some((w) => w.includes('明文比归档短') && w.includes(log30)),
       `「明文比归档短」必须告警（不得静默）：${JSON.stringify(warns30)}`)
     assert.ok(!fs.existsSync(log30 + '.seal.json'), 'marker 成功后事务记录必须清理')
+  }
+
+  // ===== S1：安全原语统一（statSafeMeta / isRealPathInside）=====
+  // 这两个原语原本各有一份：statSafeMeta 在 scripts/console.js（本地实现），根内路径校验内联在
+  // xbk_message_store.resolveCacheDirInRoot 的 realInsideRoot 里。S1 把它们收进 xbk_storage，
+  // 与 readSafeTextResult 共用同一个只读 opener。用例分两层：
+  //   · 行为层：状态口径（ok / missing / unsafe / ioError）与「不安全路径绝不泄露目标元数据」；
+  //   · 结构层：唯一实现（console 导出的必须是 xbk_storage 的同一个函数对象；message store 里
+  //     不得再出现内联 realpath 判据）——回退成「本地再写一份」时行为可以一模一样，只有结构断言会红。
+  {
+    const s1Dir = make('s1')
+    fs.mkdirSync(s1Dir, { recursive: true })
+
+    // ① 普通文件：ok，size / mtimeMs / ino 与真实 stat 同口径（mtimeMs 取整，ino 来自 fstat）
+    const s1File = path.join(s1Dir, 'meta.json')
+    fs.writeFileSync(s1File, '{"a":1}')
+    const s1Real = fs.statSync(s1File)
+    const s1Ok = statSafeMeta(s1File)
+    assert.strictEqual(s1Ok.status, 'ok', '普通文件必须判 ok')
+    assert.strictEqual(s1Ok.size, s1Real.size, 'size 必须来自 fstat')
+    assert.strictEqual(s1Ok.mtimeMs, Math.round(s1Real.mtimeMs), 'mtimeMs 必须取整（与 console 原实现一致）')
+    assert.strictEqual(s1Ok.ino, s1Real.ino, 'ino 必须下发（tombstoneCounts 的 (ino,size,mtimeMs) 缓存靠它）')
+
+    // ② 缺失：missing，三个元数据全 null
+    assert.deepStrictEqual(statSafeMeta(path.join(s1Dir, 'ghost.json')),
+      { status: 'missing', size: null, mtimeMs: null, ino: null }, '缺失必须判 missing 且元数据全 null')
+
+    // ③ 目录：fstat 非普通文件 ⇒ unsafe，且不泄露目录自身大小
+    const s1Sub = path.join(s1Dir, 'sub')
+    fs.mkdirSync(s1Sub)
+    assert.deepStrictEqual(statSafeMeta(s1Sub),
+      { status: 'unsafe', size: null, mtimeMs: null, ino: null }, '目录不是普通文件 ⇒ unsafe')
+
+    // ④ 符号链接：O_NOFOLLOW 的 ELOOP ⇒ unsafe，且**绝不泄露目标大小/inode**（目标是大文件）
+    const s1Big = path.join(s1Dir, 'big.bin')
+    fs.writeFileSync(s1Big, Buffer.alloc(4096, 7))
+    let s1Linked = false
+    try { fs.symlinkSync(s1Big, path.join(s1Dir, 'link.json')); s1Linked = true } catch (e) { console.log('（环境性跳过：本机沙箱不允许建符号链接）') }
+    if (s1Linked) {
+      assert.deepStrictEqual(statSafeMeta(path.join(s1Dir, 'link.json')),
+        { status: 'unsafe', size: null, mtimeMs: null, ino: null },
+        '符号链接必须判 unsafe，且不得泄露目标的大小（目标 4096 字节）与 inode')
+    }
+
+    // ⑤ FIFO：fstat 非普通文件 ⇒ unsafe，且 open 必须立即返回（O_NONBLOCK；裸 O_RDONLY 会永远等写者）
+    // mkfifo 只有 coreutils 提供（Node 22 无 mkfifoSync），按绝对路径探测，缺失只跳过这一小段。
+    const s1Mkfifo = ['/usr/bin/mkfifo', '/bin/mkfifo', '/usr/local/bin/mkfifo'].find((bin) => {
+      try { fs.accessSync(bin, fs.constants.X_OK); return true } catch (e) { return false }
+    })
+    if (!s1Mkfifo) {
+      skipEnv('statSafeMeta FIFO 用例：本机没有 mkfifo（已探测 /usr/bin、/bin、/usr/local/bin）')
+    } else {
+      const s1Fifo = path.join(s1Dir, 'pipe')
+      let s1MadeFifo = false
+      try {
+        require('node:child_process').execFileSync(s1Mkfifo, [s1Fifo], { stdio: 'ignore' })
+        s1MadeFifo = true
+      } catch (e) {
+        skipEnv('statSafeMeta FIFO 用例：mkfifo 执行失败（' + e.message + '）')
+      }
+      if (s1MadeFifo) {
+        const s1T0 = Date.now()
+        const s1FifoMeta = statSafeMeta(s1Fifo)
+        const s1Dt = Date.now() - s1T0
+        assert.deepStrictEqual(s1FifoMeta, { status: 'unsafe', size: null, mtimeMs: null, ino: null },
+          'FIFO 不是普通文件 ⇒ unsafe')
+        assert.ok(s1Dt < 2000, `FIFO 打开必须立即返回（O_NONBLOCK），实际耗时 ${s1Dt}ms`)
+        // readSafeTextResult 的 openNonBlocking 也走同一 opener：FIFO 同样不得阻塞
+        const s1T1 = Date.now()
+        assert.strictEqual(readSafeTextResult(s1Fifo, undefined, { openNonBlocking: true }).status, 'unsafe',
+          'readSafeTextResult(openNonBlocking) 对 FIFO 同样判 unsafe')
+        assert.ok(Date.now() - s1T1 < 2000, 'readSafeTextResult 打开 FIFO 不得阻塞')
+      }
+    }
+
+    // ⑥ readSafeTextResult 的 status 口径不得因共用 opener 而变（replaced 由上面的 mr 段覆盖）
+    assert.deepStrictEqual([
+      readSafeTextResult(path.join(s1Dir, 'ghost.json')).status,
+      readSafeTextResult(s1Sub).status,
+      readSafeTextResult(s1File, 2).status,
+      readSafeTextResult(s1File).status
+    ], ['missing', 'unsafe', 'tooLarge', 'ok'], 'readSafeTextResult 的四态必须原样保留')
+
+    // ⑦ isRealPathInside：根内真目录 true；root 自身 / 兄弟前缀 / `..` 越界 false
+    const s1Root = path.join(s1Dir, 'root')
+    const s1Inside = path.join(s1Root, 'inside')
+    fs.mkdirSync(s1Inside, { recursive: true })
+    assert.strictEqual(isRealPathInside(s1Root, s1Inside), true, 'root 内的真目录必须放行')
+    assert.strictEqual(isRealPathInside(s1Root, s1Root), false, 'root 自身不算「严格在 root 之下」')
+    assert.strictEqual(isRealPathInside(s1Root, path.join(s1Dir, 'root-sibling')), false,
+      '前缀相同但不在 root 之下的兄弟目录必须拒绝')
+    assert.strictEqual(isRealPathInside(s1Root, path.resolve(s1Root, '..', 'escaped')), false,
+      '`..` 拼出的越界路径必须拒绝（词法层）')
+    // 目标不存在：按**父级**的 realpath 判定（父级是 root 内的真目录 ⇒ 放行）
+    assert.strictEqual(isRealPathInside(s1Root, path.join(s1Root, 'not', 'yet', 'dir')), true,
+      '待建目录只能按已存在父级判定，父级在根内 ⇒ 放行')
+    // 已存在层级不是目录（普通文件占位）：后续拼接缓存文件会 ENOTDIR ⇒ 必须拒绝
+    fs.writeFileSync(path.join(s1Root, 'occupied'), 'x')
+    assert.strictEqual(isRealPathInside(s1Root, path.join(s1Root, 'occupied', 'cache')), false,
+      '已存在层级是普通文件 ⇒ 拒绝（否则 later path.join 得到 ENOTDIR 且校验放行了）')
+    // 中间层符号链接指向 root 外：即使目标（经由链接）真实存在，realpath 后也必须判 false
+    const s1Outside = path.join(s1Dir, 'outside')
+    fs.mkdirSync(path.join(s1Outside, 'sub'), { recursive: true })
+    let s1MadeLink = false
+    try { fs.symlinkSync(s1Outside, path.join(s1Root, 'out-link')); s1MadeLink = true } catch (e) { /* 见下方 skip */ }
+    if (s1MadeLink) {
+      assert.strictEqual(isRealPathInside(s1Root, path.join(s1Root, 'out-link', 'sub')), false,
+        '中间层符号链接指向 root 外 ⇒ realpath 判定必须拒绝')
+      assert.strictEqual(isRealPathInside(s1Root, path.join(s1Root, 'out-link', 'ghost')), false,
+        '符号链接本身 lstat 不是目录 ⇒ 拒绝')
+    } else {
+      skipEnv('isRealPathInside 中间层符号链接用例：本机沙箱不允许建符号链接')
+    }
+
+    // ⑧ 注入 fake fs（与 test_message_store_utils 的缓存目录用例同一手法）：不触碰真实盘也能驱动
+    const s1FakeRoot = path.join(path.sep, 'fake-s1-root')
+    const s1FakeEntries = {
+      [s1FakeRoot]: 'dir',
+      [path.join(s1FakeRoot, 'inside')]: 'dir',
+      [path.join(s1FakeRoot, 'link-out')]: { kind: 'symlink', real: path.join(path.sep, 'outside-s1') },
+      [path.join(s1FakeRoot, 'link-out', 'sub')]: { kind: 'dir', real: path.join(path.sep, 'outside-s1', 'sub') },
+      [path.join(s1FakeRoot, 'plainfile')]: 'file'
+    }
+    const s1FakeFs = {
+      existsSync: (p) => Object.prototype.hasOwnProperty.call(s1FakeEntries, p),
+      lstatSync: (p) => {
+        const e = s1FakeEntries[p]
+        return { isDirectory: () => e === 'dir' || (!!e && typeof e === 'object' && e.kind === 'dir') }
+      },
+      realpathSync: (p) => {
+        const e = s1FakeEntries[p]
+        return e && typeof e === 'object' && e.real ? e.real : p
+      }
+    }
+    assert.strictEqual(isRealPathInside(s1FakeRoot, path.join(s1FakeRoot, 'inside'), { fs: s1FakeFs, path }), true,
+      '假 fs：根内已存在目录放行')
+    assert.strictEqual(isRealPathInside(s1FakeRoot, path.join(s1FakeRoot, 'new', 'deep'), { fs: s1FakeFs, path }), true,
+      '假 fs：目标不存在时按父级 realpath 放行')
+    assert.strictEqual(isRealPathInside(s1FakeRoot, path.join(s1FakeRoot, 'link-out', 'sub'), { fs: s1FakeFs, path }), false,
+      '假 fs：中间层链接 realpath 到根外 ⇒ 拒绝')
+    assert.strictEqual(isRealPathInside(s1FakeRoot, path.join(s1FakeRoot, 'plainfile', 'x'), { fs: s1FakeFs, path }), false,
+      '假 fs：已存在层是普通文件 ⇒ 拒绝')
+    assert.strictEqual(isRealPathInside(s1FakeRoot, path.join(s1FakeRoot, 'inside'), {
+      fs: { existsSync: () => { throw new Error('EACCES') }, lstatSync: () => ({ isDirectory: () => true }), realpathSync: (p) => p },
+      path
+    }), false, '任何异常都必须收敛成 false（安全检查读不到就当不安全）')
+
+    // ⑨ 结构层：xbk_message_store 不得再内联 realpath 包含校验（唯一实现在 xbk_storage）
+    const s1StoreSrc = fs.readFileSync(path.join(__dirname, 'xbk_message_store.js'), 'utf8')
+    assert.ok(!s1StoreSrc.includes('realpathSync'),
+      'xbk_message_store 不得再内联 realpathSync——根内校验必须调用 xbk_storage.isRealPathInside')
+    assert.ok(s1StoreSrc.includes('isRealPathInside(root, p'),
+      'resolveCacheDirInRoot 的 realInsideRoot 必须直接委托给 xbk_storage.isRealPathInside')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件
