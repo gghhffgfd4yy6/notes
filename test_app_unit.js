@@ -442,15 +442,24 @@ function makeLogFs (over = {}) {
       fdPaths.set(fd, p)
       return fd
     },
-    writeSync (fd, data) {
+    // 日志 fd 上的写入按 (fd, data, off, len) 处理：_writeRunLog 把 out 转 Buffer 后循环写到写满，
+    // 桩必须按字节切片记录并返回本次实际写入量。over.writeSync 可注入短写/零写（回归用例用），
+    // 返回值口径与 fs.writeSync 一致（写入字节数）；锁 fd 的写入仍按原样记成 [fd, 文本]。
+    writeSync (fd, data, off, len) {
       const target = fdPaths.get(fd)
       if (typeof target === 'string' && (target.endsWith('.log') || target.endsWith('.ndjson'))) {
         if (over.appendThrows) throw new Error('append 失败')
-        rec.append.push([target, String(data), 'utf8'])
-        return
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8')
+        const start = off === undefined ? 0 : off
+        const want = len === undefined ? buf.length - start : len
+        const w = over.writeSync ? over.writeSync({ fd, buf, start, want }) : want
+        if (!(w > 0)) return w
+        rec.append.push([target, buf.toString('utf8', start, start + w), 'utf8'])
+        return w
       }
       rec.write.push([fd, String(data)])
       lockText = String(data)
+      return Buffer.byteLength(String(data))
     },
     fstatSync (fd) {
       if (over.fstatThrows) throw new Error('fstat 失败')
@@ -649,6 +658,37 @@ check('_writeRunLog 正常追加：默认 run.log、utf8、锁令牌 pid:start�
   assert.deepStrictEqual(rec.rec.append, [[LOG_PATH, 'hello\n', 'utf8']])
   assert.deepStrictEqual(rec.rec.close, [6, 7], '先关日志 fd、再关锁 fd')
   assert.deepStrictEqual(rec.rec.unlink, [LOCK_PATH])
+})
+
+// 回归（P1）：旧实现 appendFileSync 内部循环写到写满；改成单 fd 后若忽略 writeSync 返回值，
+// 短写会静默丢尾部字节、run.log 落半行。下面两条用来钉住「循环写满」与「零写不死循环」。
+check('_writeRunLog 短写（首次只写 3 字节）⇒ 循环补满，拼接后仍是完整行（回退成单次 writeSync 必红）', () => {
+  let calls = 0
+  const rec = makeLogFs({
+    writeSync: ({ want }) => {
+      calls += 1
+      // 第一次只落前 3 个字符，第二次写满剩余：模拟真实 fd 的部分写（短写）
+      return calls === 1 ? Math.min(3, want) : want
+    }
+  })
+  const { app } = makeLogApp({ rec })
+  app._writeRunLog('hello world\n')
+  assert.strictEqual(calls, 2, `短写后必须再写一次补满（单次 writeSync 实现只有 1 次）：${calls}`)
+  const parts = rec.rec.append.map((a) => a[1])
+  assert.deepStrictEqual(parts, ['hel', 'lo world\n'], '必须按短写返回值分片续写，不得整行重写或丢弃')
+  assert.strictEqual(parts.join(''), 'hello world\n', '拼接后必须是完整行（不能因为短写落半行）')
+  assert.strictEqual(parts.join('').length, 12, '完整行 12 字符，一个字节都不能少')
+})
+
+check('_writeRunLog writeSync 恒返回 0 ⇒ 立即放弃（有限次、不挂死）、不抛给调用方', () => {
+  let calls = 0
+  const rec = makeLogFs({ writeSync: () => { calls += 1; return 0 } })
+  const { app } = makeLogApp({ rec })
+  const r = withCapture('error', () => app._writeRunLog('hello world\n'))
+  assert.strictEqual(r.value, undefined, '外层 catch 必须吞掉（日志写失败不得中断推送）')
+  assert.ok(calls <= 3, `零写必须立刻放弃，实际调用 ${calls} 次（无上限的重试会让进程挂死）`)
+  assert.strictEqual(rec.rec.append.length, 0, '零写不得被记成已落盘')
+  assert.ok(rec.rec.close.includes(6), '日志 fd 仍必须在 finally 里关掉')
 })
 
 check('_writeRunLog 锁异常（EACCES）⇒ fail-open 仅追加；超限也不截尾（不得误当持锁）', () => {

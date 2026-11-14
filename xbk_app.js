@@ -1019,7 +1019,15 @@ function createApp ({
                 return
               }
             }
-            fs.writeSync(fd, out)
+            // 短写兜底：旧实现 appendFileSync 内部是「循环写到写满」，改成单 fd 后必须自己补循环，
+            // 否则 writeSync 的返回值被忽略 ⇒ 落半行、尾部字节静默丢失。判据与 _rewriteLogFrom 同一写法。
+            const buf = Buffer.from(out, 'utf8')
+            let off = 0
+            while (off < buf.length) {
+              const w = fs.writeSync(fd, buf, off, buf.length - off)
+              if (!(w > 0)) throw new Error('short write')
+              off += w
+            }
             const st = fs.fstatSync(fd)
             // v3.257：截尾（读改写）仅在有锁时执行——锁失败/超时 fail-open 分支只追加，
             // 与注释口径一致（无锁的读改写会在跨进程竞态下冲掉并发追加的行）。
