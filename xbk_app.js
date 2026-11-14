@@ -64,9 +64,23 @@ function formatRunBusyLine (summary) {
   if (Number.isSafeInteger(startedNum) && startedNum > 0) {
     try { started = shanghaiStamp(new Date(startedNum)) } catch (e) { started = '未知' }
   }
-  // 锁内容不可判定（损坏/被换成非普通文件）时 holder 为 null：这条提示会显示「pid=未知」，
-  // 与「确实有人在跑但读不出身份」同一句话——两种都必须让人工介入去看 run.lock。
+  // 「内容不可判定」已不再靠这条提示（A1 起直接抛 RUN_LOCK_UNREADABLE 并自带路径）；holder 为 null
+  // 只剩「持有者活着但帧里没带身份」这一种历史形态，仍显示「pid=未知」。
   return `已有运行在跑（pid=${pid}, started=${started}），本轮跳过`
+}
+
+// A4（C-027）：帧里 pid 的**硬上限**（Linux pid_max 的最大量级）。超上限的 pid 不可能是真实进程，
+// 属「帧非法」（内容不可判定），绝不能当成「持有者已死」去接管。
+// 为什么还要叠加内核 /proc/sys/kernel/pid_max：容器/pid namespace 里 pid_max 可能远小于 4194304
+// （如 32768），此时「帧里 pid=3000000」同样不可能是真实进程；只按硬上限判，会把它交给 kill() 得
+// ESRCH ⇒ 判死 ⇒ 接管（fail-open，与 A4 要堵的是同一个洞）。
+const RUN_LOCK_PID_MAX = 4194304
+/** 帧 pid 的有效上限 = min(硬上限, 内核 pid_max)。纯函数（导出给单测）；入参是 /proc 原文或已解析值，
+ *  读不到/脏值（null、''、0、非整数）一律回退硬上限——宁可不误判，不可把活锁判死。 */
+function runLockPidLimit (kernelPidMax) {
+  const v = Number(kernelPidMax)
+  const bound = Number.isSafeInteger(v) && v > 0 ? v : RUN_LOCK_PID_MAX
+  return Math.min(RUN_LOCK_PID_MAX, bound)
 }
 
 function createApp ({
@@ -180,10 +194,9 @@ function createApp ({
   const RUN_LOCK_TAKEOVER_SUFFIX = '.takeover'
   // 锁帧读取上限：正常帧约 100 字节；超限一律按「内容不可判定」fail-closed（不整读未知大小文件）。
   const RUN_LOCK_MAX_BYTES = 4096
-  // A4（C-027）：Linux 的 pid_max 上限（默认 4194304，可调大但不会超这个量级）。帧里的 pid 超过它
-  // 就不可能是真实进程——那是**帧非法**（内容不可判定），不是「持有者已死」。旧实现直接把它交给
-  // kill(pid,0)：内核回 ESRCH ⇒ 判死 ⇒ 接管，于是一帧手写/损坏的内容就能抢走目录里的锁（fail-open）。
-  const RUN_LOCK_PID_MAX = 4194304
+  // A4（C-027）：帧 pid 的有效上限见模块级 RUN_LOCK_PID_MAX / runLockPidLimit（硬上限 + 内核 pid_max）。
+  const RUN_LOCK_EMPTY_RETRY = 3
+  const RUN_LOCK_EMPTY_RETRY_MS = 15
   // R1 返工 #1：读/删锁一律带 O_NONBLOCK。裸 O_RDONLY 打开**无写者的 FIFO** 会一直阻塞在 open
   // （等写端），进程在「取锁」这一步永久挂死：没有 run.log、没有退出码、任何告警都发不出来。
   // 加 O_NONBLOCK 后 FIFO 的 open 立刻返回（ENXIO 只出现在 O_WRONLY 上，这里一并兜底），
@@ -221,6 +234,32 @@ function createApp ({
       return state && /^[A-Za-z]$/.test(state) ? state : null
     } catch (e) { return null }
   }
+  // 内核 pid_max（每 App 实例缓存一次；pid_max 在进程生命周期内不会变）。读不到 ⇒ 回退硬上限。
+  let runLockPidBoundCache
+  const runLockPidBound = () => {
+    if (runLockPidBoundCache === undefined) {
+      let raw = null
+      try { raw = nodeFs.readFileSync('/proc/sys/kernel/pid_max', 'utf8') } catch (e) { raw = null }
+      runLockPidBoundCache = runLockPidLimit(raw)
+    }
+    return runLockPidBoundCache
+  }
+  // 创建窗口重试用的是模块级 sleepSync（Atomics.wait；极端环境退化忙等）——取锁是同步临界区，
+  // 不能引入 await 点，否则别的轮次会挤进来。
+  /** 从**已打开的 fd** 按 position 0 读全文（最多 RUN_LOCK_MAX_BYTES）。
+   *  为什么不用 readFileSync(fd)：它只读「当前位置」，重试的第二次会读到空串；
+   *  为什么不用 st.size 分配：文件可能在两次读之间从 0 字节长成完整帧（创建窗口）。 */
+  const readLockContent = (fd) => {
+    const buf = Buffer.alloc(RUN_LOCK_MAX_BYTES)
+    let off = 0
+    while (off < buf.length) {
+      const n = nodeFs.readSync(fd, buf, off, buf.length - off, off)
+      if (!n) break
+      off += n
+    }
+    return buf.subarray(0, off).toString('utf8')
+  }
+
   // 随机段只求唯一性、不求不可预测性（token 不是凭据）；crypto 不可用时回退高分辨时钟。
   const runLockRandom = () => (crypto && typeof crypto.randomBytes === 'function')
     ? crypto.randomBytes(6).toString('hex')
@@ -355,7 +394,7 @@ function createApp ({
     if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return null
     const { pid, startedAt, token } = frame
     if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null
-    if (pid > RUN_LOCK_PID_MAX) return null
+    if (pid > runLockPidBound()) return null
     if (typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt) || startedAt <= 0) return null
     if (typeof token !== 'string' || token.trim() === '') return null
     // startTicks 只认十进制数字串；形态不对 = 没有证据（不是「复用证据」），死活在下面另判。
@@ -391,6 +430,11 @@ function createApp ({
       if (RUN_LOCK_UNREADABLE_CODES.includes(e.code)) {
         return { state: 'busy', holder: null, corrupted: true, reason: 'unreadable_open' }
       }
+      // O_NOFOLLOW 撞上符号链接（锁路径被人换成了链接）：ELOOP 同样「不是普通文件、读不出归属」，
+      // 必须按不可判定收口并把 lockPath 带进错误——裸 ELOOP 只会让入口看到一句 errno，没有处置路径。
+      if (e.code === 'ELOOP') {
+        return { state: 'busy', holder: null, corrupted: true, reason: 'not_regular_file' }
+      }
       throw e
     }
     try {
@@ -405,15 +449,25 @@ function createApp ({
         return { state: 'busy', holder: null, corrupted: true, reason: 'too_large' }
       }
       let raw
+      let frame = null
       try {
-        raw = nodeFs.readFileSync(fd, 'utf8')
+        raw = readLockContent(fd)
+        frame = parseRunLockFrame(raw)
+        // 创建窗口（评审 MF-1）：link 不支持的回退分支是「open('wx') 占名 → 再写帧」，两步之间并发
+        // 读者会看到 0 字节锁。A1 之前那被折叠成 busy（无害）；现在会被判成永久失败并劝人删锁——
+        // 那是在删一把**正在被创建**的活锁。故只在「读到 0 字节」时做有界重试（3×15ms）：写侧总在
+        // 几毫秒内写完，而真损坏的锁（一直为空/半帧）重试完仍按不可判定收口，不改变 A1 的响亮失败。
+        for (let i = 0; !frame && raw === '' && i < RUN_LOCK_EMPTY_RETRY; i++) {
+          sleepSync(RUN_LOCK_EMPTY_RETRY_MS)
+          raw = readLockContent(fd)
+          frame = parseRunLockFrame(raw)
+        }
       } catch (e) {
         if (e && RUN_LOCK_UNREADABLE_CODES.includes(e.code)) {
           return { state: 'busy', holder: null, corrupted: true, reason: 'unreadable_read' }
         }
         throw e
       }
-      const frame = parseRunLockFrame(raw)
       // 无合法 pid/startedAt/token 就无从判断持有者 ⇒ 不可判定（R1 设计约束 3 + A4 的 pid 上限）。
       if (!frame) return { state: 'busy', holder: null, corrupted: true, reason: 'frame_invalid' }
       const holder = { pid: frame.pid, startedAt: frame.startedAt }
@@ -429,7 +483,7 @@ function createApp ({
       // 已经跑不完任何一轮——判活就是永久 busy（零推送且看起来正常）。只认 /proc 的 'Z'；
       // 读不到状态（非 Linux）时**没有证据**，保持原口径（按存活处理）。
       if (runLockProcessState(frame.pid) === 'Z') {
-        console.warn(`⚠️ run 锁持有进程是僵尸（pid=${frame.pid}），按已退出接管：${filePath}`)
+        console.warn(`⚠️ run 锁持有进程是僵尸（pid=${frame.pid}），按已退出处理（随后尝试接管）：${filePath}`)
         return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
       }
       // 活着就结束判定：**不按 startedAt/mtime 判陈旧**——长时间运行是正常的，抢锁就是双跑。
@@ -3556,4 +3610,4 @@ function createApp ({
   return App
 }
 
-module.exports = { createApp, SIMILAR_WINDOW_MAX_BYTES, formatRunBusyLine }
+module.exports = { createApp, SIMILAR_WINDOW_MAX_BYTES, formatRunBusyLine, runLockPidLimit }

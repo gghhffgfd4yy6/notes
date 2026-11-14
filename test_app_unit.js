@@ -5896,6 +5896,67 @@ checkAsync('R1 行为：已有活锁时 App.run 返回 skipped（RUN_BUSY），�
   }
 })
 
+checkAsync('A1/C-009 补强：0 字节锁在创建窗口内被写完 ⇒ 有界重试后按真 busy 收口（不得判损坏、不得劝人删活锁）', async () => {
+  const realFs = require('fs')
+  const dir = mkTmpFixture('runlock-a1-window-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  lockFs.writeFileSync(p, '', { mode: 0o600 })
+  const frame = JSON.stringify({
+    pid: process.pid, startedAt: Date.now(), token: `${process.pid}:0:window`, startTicks: procStartOf(process.pid) || '0'
+  })
+  // 确定性模拟「link 不支持的回退分支」的两步窗口（open('wx') 占名 → 再写帧）：第一次读空，
+  // 同时写侧把帧写完；之后正常读。不能用 setTimeout 造窗口——取锁是同步临界区，定时器根本没机会跑。
+  const origReadSync = realFs.readSync
+  let armed = true
+  realFs.readSync = function (fd, buf, off, len, pos) {
+    if (armed) {
+      armed = false
+      realFs.writeFileSync(p, frame)
+      return 0
+    }
+    return origReadSync.call(realFs, fd, buf, off, len, pos)
+  }
+  try {
+    const summary = await app.run()
+    assert.strictEqual(summary.skipped, true,
+      '窗口内写完的活锁必须按 busy 跳过（判成 RUN_LOCK_UNREADABLE 会劝人删一把正在被创建的活锁）')
+    assert.strictEqual(summary.reason, 'RUN_BUSY')
+    assert.deepStrictEqual(summary.holder, { pid: process.pid, startedAt: JSON.parse(frame).startedAt },
+      '重试后必须认出真实持有者（不是 holder:null 的降级 busy）')
+  } finally {
+    realFs.readSync = origReadSync
+  }
+})
+
+checkAsync('A1/C-009：锁路径是符号链接（O_NOFOLLOW ⇒ ELOOP）⇒ 抛 RUN_LOCK_UNREADABLE（带 lockPath），不得抛裸 errno', async () => {
+  const dir = mkTmpFixture('runlock-a1-symlink-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const target = path.join(dir, 'not-a-lock.txt')
+  lockFs.writeFileSync(target, 'x')
+  lockFs.symlinkSync(target, p)
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '符号链接锁必须响亮失败（O_NOFOLLOW 拒绝跟链）')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE',
+    `裸 ELOOP 只会让入口看到一句 errno、没有处置路径：${error.message}`)
+  assert.strictEqual(error.lockIssue, 'not_regular_file', `归因必须可判定：${error.lockIssue}`)
+  assert.strictEqual(error.lockPath, p, '错误必须点名要删的那把锁')
+  assert.ok(warns.some((w) => w.includes('⚠️') && w.includes(p)), `告警必须含 ⚠️ 与锁路径：${JSON.stringify(warns)}`)
+  assert.strictEqual(lockFs.readFileSync(target, 'utf8'), 'x', '链接目标不得被改写（读锁绝不跟链）')
+})
+
+check('A4/C-027：runLockPidLimit = min(硬上限 4194304, 内核 pid_max)；读不到/脏值回退硬上限', () => {
+  const { runLockPidLimit } = require('./xbk_app')
+  assert.strictEqual(runLockPidLimit('4194304'), 4194304)
+  assert.strictEqual(runLockPidLimit('32768'), 32768,
+    '容器/pid namespace 的 pid_max 可能只有 32768：此时 pid=3e6 的帧必须判帧非法（否则 kill 判 ESRCH ⇒ 接管，fail-open）')
+  assert.strictEqual(runLockPidLimit('9999999'), 4194304, '内核值大于硬上限时按硬上限收口')
+  for (const bad of [null, undefined, '', 0, -1, 'abc', 1.5, NaN]) {
+    assert.strictEqual(runLockPidLimit(bad), 4194304, `脏值 ${String(bad)} 必须回退硬上限（宁可不误判活锁）`)
+  }
+})
+
 checkAsync('R1 行为：正常一轮跑完后 run.lock 被释放（finally），摘要不带 skipped', async () => {
   const realFs = require('fs')
   const cacheDir = mkTmpFixture('runlock-normal-run-')

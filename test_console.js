@@ -7692,7 +7692,13 @@ async function main () {
       const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
       const args = blockAfter(consoleSrc, 'createConsole({')
       assert.ok(args && args.trim().length > 0, '前置：scripts/console.js 必须存在 createConsole({…}) 调用（切不出实参块说明调用被挪走/改名）')
-      assert.ok(args.includes('messagesFile: messagesCacheName()'),
+      // 先剥掉注释（块注释 + 行注释）再断言：`args` 是整块原文，一句
+      // `/* messagesFile: messagesCacheName() */` 或 `// …` 就能骗过裸 includes（评审指出的
+      // 「可直接绕过」），而生产接线其实写死成了别的值。
+      const codeOnly = args
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
+      assert.ok(/messagesFile:\s*messagesCacheName\(\)/.test(codeOnly),
         `createConsole 的实参块必须把 messagesFile 接到 messagesCacheName()（写死 'push.json' 必须变红）：${args}`)
     } finally {
       if (pushUrlDesc) Object.defineProperty(app.Config.api, 'pushUrl', pushUrlDesc)
