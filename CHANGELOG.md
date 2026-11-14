@@ -1508,3 +1508,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **兜底分支保留**：最小工作树（沙箱夹具只复制入口与公共层）缺 `scripts/check-host-clean.js` 时响亮跳过、缺 `scripts/test-env-isolation.js` 时按同一口径内联剥离 `XBK_CACHE_DIR`——两条路径都仍在入口实际运行时被覆盖。
 - **测试**：新增 `test_test_harness.js`（18 例）覆盖导出的纯逻辑（显示宽度/正整数 env/套件 env 剥离/guard 加载的 missing 与「内部依赖缺失照常抛」/非法 pid 的 `killSuiteGroup`），并按源码形状锁死「两个入口只 require 一份、不再各自定义」，防止两份实现再次悄悄长回来。测试夹具（`test_ci_skip_suites.js` 的入口沙箱、`test_host_clean_gates.js` 的 guard 夹具、`test_check_deps.js` 的 RT-08 沙箱）同步复制公共层文件；`stryker.tap.config.js` 的显式 `testFiles` 清单按注册顺序补上新套件。
 - **不改生产代码**：`xbk_*.js`、`scripts/console.js` 与 `.github/workflows/**` 一字未动，变异矩阵行段无需重排。
+
+## v3.436
+
+- **功能一行没变，这一版只让代码扫描的三条红色告警消失**：上一版新增的 `test_test_harness.js` 被代码扫描（Codacy）报了 3 条「动态构造文件/路径」。这个文件要读仓库里的源码做形状断言，还要在自己新建的临时目录里写几个测试用的小文件——扫描器只看「路径不是写死的字面量」就报警。
+- **逐条核对后是误报**：这 3 处的目标路径只由两种东西拼成——仓库目录（`__dirname`）加写在测试里的固定文件名，或者测试自己新建的临时目录加固定文件名（`check-host-clean.js` / `other-name.js`）；后者写完就在 `finally` 里删掉。没有任何一段路径来自环境变量、命令行参数、网络或读到的文件内容。这三条用例本身也不能改用「字面量路径」：它们要验证的正是「门禁模块内部依赖缺失时必须报错、不能被当成脚本不存在」和「文件名不是 check-host-clean.js 时必须拒绝加载」。
+- **处置方式与本仓其它测试同一口径**：把 `test_test_harness.js` 写进 `.codacy.yml` 的排除清单，并在同一文件里附上逐条依据（哪一行、路径由什么拼成、为什么必须这么写）。**没有删除、也没有放宽任何断言**，这批测试照旧由 `npm test` 与 CI 全量执行。
+- **用户可见的变化**：没有。推送脚本、控制台、命令行与缓存格式和 v3.435 完全一致；变的只是 PR 上那 3 条扫描告警不再出现。

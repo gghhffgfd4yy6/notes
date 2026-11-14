@@ -285,6 +285,22 @@
 #     改成字面量就测不到这条契约。
 # 两条都没有外部输入参与比较/正则源构造，按既有口径（test_utils.js / test_filter_store.js 的 safeRe
 # 与 test_storage.js 的夹具同一处理）整文件排除；真实断言仍由 npm test / CI 全量执行。
+#
+# ---- H1（v3.436 测试入口公共层）：test_test_harness.js 的三条静态路径告警登记 ----
+# test_test_harness.js 是 scripts/test-harness.js 的靶向套件（v3.435 新增）。本轮 Codacy/Opengrep 报
+# 3 条，全部是同一条规则（pathtraversal-non-literal-fs-filename，「动态构造文件/路径信息」）的误报：
+#   · :32 `const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')` —— p 的调用形态只有两种：
+#     字面量 'scripts/test-harness.js'（:251/:274），以及 ENTRIES 数组（:239，元素为字面量 'run_tests.js' /
+#     'run_unit_tests.js'）的循环元素（:258/:278）；路径 = 模块常量 __dirname + 本文件字面量文件名。
+#   · :202 `fs.writeFileSync(path.join(dir, 'check-host-clean.js'), …)` —— dir 来自上一行
+#     fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-harness-guard-broken-'))，文件名字面量，写入内容是测试硬编码
+#     字符串；这条用例要证明的正是「门禁模块自身存在但内部依赖缺失时必须照常抛出，不得伪装成脚本不存在」
+#     （C10-028），换成别的写法就测不到该分支。
+#   · :218 同形：mkdtempSync(os.tmpdir(), 'xbk-harness-guard-name-') + 字面量 'other-name.js'，用于证明
+#     「注入路径的文件名不是 check-host-clean.js 时必须响亮拒绝」（否则会静默加载另一个文件）。
+# 三个临时目录均在 finally 里 rmSync 删除；无任何外部净输入（环境、CLI、网络、文件内容）参与路径构造。
+# 故按本仓既有口径（test_host_clean_gates.js / test_storage.js / test_message_store_journal.js /
+# test_status.js 同一处理）整文件排除；不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
@@ -429,3 +445,8 @@ exclude_paths:
   # :159 的 new RegExp(模块常量正则源)。逐条依据见上方「D1（v3.431 路由拆分后）」注释块；
   # 不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
   - "test_console_routes.js"
+  # H1（v3.436）：测试入口公共层的靶向套件。3 条 pathtraversal-non-literal-fs-filename 属误报——
+  # :32 read() 的目标 = __dirname + 本文件字面量文件名（ENTRIES 为字面量数组）；
+  # :202/:218 的目标 = mkdtempSync 私有目录 + 字面量文件名。逐条依据见上方「H1（v3.436 测试入口公共层）」
+  # 注释块；不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
+  - "test_test_harness.js"
