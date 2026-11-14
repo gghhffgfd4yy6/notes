@@ -7652,17 +7652,36 @@ async function main () {
     assert.ok(/messagesFileName\(/.test(consoleCacheName), '控制台必须委托 status.messagesFileName')
     assert.ok(/fileNameForUrl\(/.test(statusCacheName), '--status 必须委托 xbk_message_store.fileNameForUrl')
     assert.ok(!/split\(|\.replace\(/.test(statusCacheName), '--status 不得再自己拆/洗 pushUrl 末段')
-    // 生产调用形态（不传参）：控制台读运行配置里的同一个 pushUrl，结论必须与运行侧取该 URL 完全一致。
+    // 生产调用形态（不传参）：控制台读运行配置里的 pushUrl，结论必须与运行侧取该 URL 完全一致。
+    // 默认 getter 恒为 `<domain>/plus/json/push.json`，两边末段恒是 push.json ⇒ 直接拿它对比是
+    // 恒真断言：无参分支退回自带派生、甚至写死 return 'push.json' 都照样绿。这里先把
+    // Config.api.pushUrl 临时覆盖成「旧实现与生产实现会分叉」的值——'https://x/path/' 旧实现
+    // 无视入参按 Config 自行拆末段得 'push.json'，生产口径 fileNameForUrl 得 'default.json'——
+    // 这样无参分支一退化，下面的断言必红。
+    // pushUrl 是对象字面量 getter（configurable）：必须保存描述符原样还原，delete 会永久移除 getter。
     // 真实 getFileName 会把来源记录写进缓存目录 ⇒ 用临时目录顶掉 XBK_CACHE_DIR，跑完还原。
     const prevCacheDir = process.env.XBK_CACHE_DIR
     const isolateDir = tmpDir()
+    let app
+    let pushUrlDesc
     try {
       process.env.XBK_CACHE_DIR = isolateDir
-      const app = require('./xbk_function_v3')
-      assert.strictEqual(messagesCacheName(), app.MessageStore.getFileName(app.Config.api.pushUrl),
+      app = require('./xbk_function_v3')
+      pushUrlDesc = Object.getOwnPropertyDescriptor(app.Config.api, 'pushUrl')
+      assert.ok(pushUrlDesc && typeof pushUrlDesc.get === 'function' && pushUrlDesc.configurable !== false,
+        'Config.api.pushUrl 必须是可配置 getter（否则无法在不污染进程的前提下降级/伪造）')
+      Object.defineProperty(app.Config.api, 'pushUrl', { value: 'https://x/path/', configurable: true, writable: true })
+      // 三方同源：无参分支实际读的是覆盖后的 Config 值，产物必须是生产口径的 default.json。
+      assert.strictEqual(messagesCacheName(), 'default.json',
+        'messagesCacheName() 必须按运行配置的 pushUrl 派生（尾部 / 的生产口径是 default.json）')
+      assert.strictEqual(messagesCacheName(), app.MessageStore.getFileName('https://x/path/'),
         'createConsole({ messagesFile: messagesCacheName() }) 必须等于运行侧 getFileName(Config.api.pushUrl)')
-      assert.strictEqual(messagesCacheName(), messagesFileName(app.Config.api.pushUrl))
+      assert.strictEqual(messagesCacheName(), messagesFileName('https://x/path/'))
+      // 反向锚点：旧实现（无视入参、按 Config 自己拆末段）与退化实现（写死）对这个值都返回 push.json。
+      assert.notStrictEqual(messagesCacheName(), 'push.json',
+        '无参分支不得退回自带派生/写死 push.json（旧实现对这个值就返回 push.json）')
     } finally {
+      if (pushUrlDesc) Object.defineProperty(app.Config.api, 'pushUrl', pushUrlDesc)
       if (prevCacheDir === undefined) delete process.env.XBK_CACHE_DIR
       else process.env.XBK_CACHE_DIR = prevCacheDir
     }
