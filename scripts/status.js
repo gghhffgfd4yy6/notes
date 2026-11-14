@@ -28,7 +28,9 @@ const {
   journalPathFor,
   parseJournalText,
   applyJournalRecords,
-  JOURNAL_READ_MAX_BYTES
+  JOURNAL_READ_MAX_BYTES,
+  // M1：判重缓存文件名的唯一实现（pushUrl → 文件名），与控制台/生产 MessageStore 同一份
+  fileNameForUrl
 } = require('../xbk_message_store')
 
 // 身份/判重语义只用于 journal 回放；status 不加载 xbk_function_v3（只读命令不拉整套 App 依赖），
@@ -706,11 +708,21 @@ const MESSAGES_CACHE_MIN_AGE_MS = 100
 const MESSAGES_CACHE_MAX = 4
 const messagesCache = new Map()
 
-// 缓存文件名来自 Config.api.pushUrl 的末段（运行时派生）。落盘前只允许纯文件名：
-// 去掉任何目录成分，既防 ../ 穿越，也让 Codacy 的 dynamic path 规则看到显式 basename。
-function messagesFileName (filename) {
-  if (typeof filename !== 'string' || filename.length === 0) return FILES.messages
-  const base = path.basename(filename)
+// 缓存文件名：pushUrl → 判重缓存文件名的**唯一实现**在 xbk_message_store.fileNameForUrl（生产
+// MessageStore.getFileName 走同一份）。控制台与 --status 都从这里取，任何一侧都不得再自己拆
+// pushUrl 末段——两处口径一旦分叉，控制台就会读 A 文件、运行侧写 B 文件，推送记录看起来「消失」
+// （自定义 pushUrl 的部署此前正是这样读错缓存）。纯计算：不读盘、不触发 MessageStore 的撞名告警。
+function messagesFileName (pushUrl) {
+  return fileNameForUrl(pushUrl, statusUtils)
+}
+
+// 落盘前只允许纯文件名（readMessages 的 filename 选项可来自配置/备份等外部输入）：去掉任何目录
+// 成分，既防 ../ 穿越，也让 Codacy 的 dynamic path 规则看到显式 basename。
+// 注意它**不是** pushUrl 派生（不得再实现一遍那套清洗/后缀规则）——派生只走上面的 messagesFileName；
+// 这里只做「已算好的名字 → 安全文件名」的最后一道整形，故像 'url_.json' 这类合法产物不会被再改一次。
+function safeMessageFileName (name) {
+  if (typeof name !== 'string' || name.length === 0) return FILES.messages
+  const base = path.basename(name)
   return base.length > 0 && base !== '.' && base !== '..' ? base : FILES.messages
 }
 
@@ -738,7 +750,7 @@ function mergeJournalEntries (dir, name, entries) {
  *  与 readMessages 共用同一套安全读取 + journal 回放，但不做 _f 过滤/排序/分类。
  *  返回 { status, items }；items 为 null 表示不可用（status 透传 missing/unsafe/ioError/invalid…）。 */
 function readMergedRawMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages } = {}) {
-  const name = messagesFileName(filename)
+  const name = safeMessageFileName(filename)
   const read = readText(dir, name, maxBytes)
   if (read.status !== 'ok') return { status: read.status, items: null }
   let parsed
@@ -752,9 +764,10 @@ function readMergedRawMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = F
 function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.messages, cache = true } = {}) {
   // filename 可覆盖：运行侧缓存名由 MessageStore.getFileName(Config.api.pushUrl) 决定（pushUrl 末段
   // 去查询串后 + .json）。控制台默认读 push.json（默认配置的产物）；自定义了 pushUrl basename 的部署
-  // 显式传 filename（console main 里从同名口径推导），不让「文件改名」静默变成「记录消失」。
+  // 显式传 filename（console main 里用 messagesFileName 按同一实现推导），不让「文件改名」静默变成
+  // 「记录消失」。
   // cache=false：需要「此刻磁盘内容」的调用方（测试/诊断）显式绕过缓存。
-  const name = messagesFileName(filename)
+  const name = safeMessageFileName(filename)
   const cacheKey = `${dir}\u0000${name}\u0000${maxBytes}`
   const sig = cache && name === FILES.messages
     ? defaultMessageSignature(dir, maxBytes, MESSAGES_CACHE_MIN_AGE_MS)
@@ -813,4 +826,4 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return value
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey }
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey, messagesFileName }

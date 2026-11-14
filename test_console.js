@@ -120,6 +120,8 @@ if (process.env.XBK_MUTATION_CHILD === '1' && process.env.GITHUB_ACTIONS === 'tr
 
 const {
   createConsole, listenErrorHint, consoleStateDir, finishRun, autoRunOutcome, isValidToken, timingSafeEqualStr,
+  // M1：控制台读的判重缓存文件名（与运行侧 getFileName 同一实现）——对拍用例用
+  messagesCacheName,
   acquireLock, acquireLockResult, releaseLockFor, lockPath,
   parseAction, escapeHtml, authorize, renderPage, ACTIONS, TOKEN_MIN_LEN, PROC_TIMEOUT_MS,
   statSafeMeta, tombstoneCounts, cacheHealthSnapshot, listStateFiles, classifyStateFile,
@@ -7587,6 +7589,83 @@ async function main () {
     assert.strictEqual(classifyStateFile('run.log', 'push.json'), 'log')
     assert.strictEqual(classifyStateFile('filter-diagnostics.ndjson', 'push.json'), 'log')
     assert.strictEqual(classifyStateFile('custom-push.json', 'custom-push.json'), 'cache', '自定义 pushUrl basename 同口径')
+  })
+  // M1：控制台读的判重缓存文件名必须与运行侧**写入**的文件名逐字相同。
+  // 此前 scripts/console.js 自己拆 pushUrl 末段（scripts/status.js 另有一套），边界口径与生产
+  // MessageStore.getFileName 不一致 ⇒ 自定义 pushUrl 的部署控制台读 A 文件、运行侧写 B 文件，
+  // 推送记录永远读空。这条用例把三方钉在一起：控制台 messagesCacheName / --status messagesFileName
+  // / 生产 MessageStore.getFileName（同一 createMessageStore 工厂 + 同一 Utils 建桩，避免
+  // getFileName 的撞名诊断往真实缓存目录写 push-sources.json）。
+  // 边界清单来自 M1 验收：空串 / undefined / null / 数字 / 布尔 / 默认 default.json / push.json /
+  // 带 query/hash / 前导点 / Windows 保留字符 / 控制字符 / 纯点串 / 尾部斜杠 + 两个自定义 pushUrl。
+  await aok('M1 对拍: messagesCacheName / messagesFileName / MessageStore.getFileName 文件名同源（含边界与自定义 pushUrl）', () => {
+    const { createMessageStore } = require('./xbk_message_store')
+    const { createUtils } = require('./xbk_utils')
+    const { messagesFileName } = require('./scripts/status')
+    const prodUtils = createUtils({ fs, safeRe: (src, flags) => new RegExp(src, flags) })
+    const prodStore = createMessageStore({
+      Config: { cache: { maxSize: 10000 } },
+      Utils: prodUtils,
+      // 桩 fs/storage：cacheDir 能求值、push-sources.json 的读写一律走异常兜底（纯诊断），不落盘
+      fs: { existsSync: () => true, lstatSync: () => ({ isDirectory: () => true }), realpathSync: (p) => p },
+      path,
+      crypto: { randomUUID: () => 'uuid' },
+      normalize: () => {},
+      storage: {},
+      constants: {}
+    })
+    const cases = [
+      ['https://new.ixbk.net/plus/json/push.json', 'push.json'], // 默认部署（Config.api.pushUrl 产物）
+      ['https://x/custom-push.json', 'custom-push.json'], // 自定义 pushUrl ①
+      ['https://x/data/line-reports', 'line-reports.json'], // 自定义 pushUrl ②（无扩展名要补 .json）
+      ['https://x/default.json', 'default.json'],
+      ['https://x/push.json', 'push.json'],
+      ['https://x/a.json?foo=bar#frag', 'a.json'], // query/hash 必须先截断
+      ['https://x/path/', 'default.json'], // 尾部 /
+      ['https://x/..', 'default.json'], // 纯点串
+      ['https://x/.hidden', 'url_.hidden.json'], // 前导点 → url_ 前缀（防隐藏文件）
+      ['https://x/url_.json', 'url_url_.json'], // F7：不与上一行的 'url_.json' 撞名
+      ['https://x/url_', 'url_url_#.json'], // F7 残留：不与 'url_.json' 撞名
+      ['https://x/a:b*c?.json', 'a_b_c.json'], // Windows 保留字符 → _
+      ['https://x/a\u0001b.json', 'ab.json'], // 控制字符被过滤
+      ['https://x/\u0001\u0002', 'default.json'], // 清洗后空串 → default
+      ['', 'default.json'],
+      [undefined, 'default.json'],
+      [null, 'default.json'],
+      [true, 'default.json'],
+      [123, null] // bad_ 前缀（anonKey 逐字比对即可，不写死哈希）
+    ]
+    for (const [url, expected] of cases) {
+      const label = `${typeof url}:${String(url)}`
+      const byStore = prodStore.getFileName(url)
+      assert.strictEqual(messagesFileName(url), byStore, `--status 与生产文件名必须逐字相同（${label}）`)
+      assert.strictEqual(messagesCacheName(url), byStore, `控制台与生产文件名必须逐字相同（${label}）`)
+      if (expected !== null) assert.strictEqual(byStore, expected, `生产口径产物变了（${label}）`)
+    }
+    assert.ok(/^bad_\d+_/.test(prodStore.getFileName(123)), '数字 url 必须是可区分的 bad_ 前缀名（两处各写一份时这里会退化成 default.json）')
+    // 结构断言（M1 验收 grep 的自动化版本）：两处都不得再保留「自己拆 pushUrl 末段」的实现。
+    const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8'))
+    const statusSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8'))
+    const consoleCacheName = sliceBetween(consoleSrc, 'function messagesCacheName (', '\n}\n', 'console messagesCacheName 函数体')
+    const statusCacheName = sliceBetween(statusSrc, 'function messagesFileName (', '\n}\n', 'status messagesFileName 函数体')
+    assert.ok(!/split\(|\.replace\(/.test(consoleCacheName), '控制台不得再自己拆/洗 pushUrl 末段（只允许委托 status.messagesFileName）')
+    assert.ok(/messagesFileName\(/.test(consoleCacheName), '控制台必须委托 status.messagesFileName')
+    assert.ok(/fileNameForUrl\(/.test(statusCacheName), '--status 必须委托 xbk_message_store.fileNameForUrl')
+    assert.ok(!/split\(|\.replace\(/.test(statusCacheName), '--status 不得再自己拆/洗 pushUrl 末段')
+    // 生产调用形态（不传参）：控制台读运行配置里的同一个 pushUrl，结论必须与运行侧取该 URL 完全一致。
+    // 真实 getFileName 会把来源记录写进缓存目录 ⇒ 用临时目录顶掉 XBK_CACHE_DIR，跑完还原。
+    const prevCacheDir = process.env.XBK_CACHE_DIR
+    const isolateDir = tmpDir()
+    try {
+      process.env.XBK_CACHE_DIR = isolateDir
+      const app = require('./xbk_function_v3')
+      assert.strictEqual(messagesCacheName(), app.MessageStore.getFileName(app.Config.api.pushUrl),
+        'createConsole({ messagesFile: messagesCacheName() }) 必须等于运行侧 getFileName(Config.api.pushUrl)')
+      assert.strictEqual(messagesCacheName(), messagesFileName(app.Config.api.pushUrl))
+    } finally {
+      if (prevCacheDir === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prevCacheDir
+    }
   })
   await aok('只读纯函数: listStateFiles（名称无路径 / symlink 显性暴露不跟随 / 截断）', () => {
     const dir = tmpDir()
