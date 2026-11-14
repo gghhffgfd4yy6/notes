@@ -320,7 +320,9 @@ jobs:
             src: "xbk_state_schema.js"
             mutate: "xbk_state_schema.js"
             config: "stryker.tap.config.js"
-          # console.js 6671 行（v3.433 A1：移除 `?token=` 查询参数认证，净 +3 行 ⇒ 尾部 part13 扩到 6671；
+          # console.js 6677 行（v3.434 M1：`messagesCacheName` 改为复用 MessageStore 的文件名实现
+          # （删掉自己拆 pushUrl 末段的那份），净 +6 行 ⇒ 尾部 part13 扩到 6677；part1..12 行段数字不变。
+          # 此前 6671 行（v3.433 A1：移除 `?token=` 查询参数认证，净 +3 行 ⇒ 尾部 part13 扩到 6671；
           # part1..12 行段数字不变。此前 6668 行（v3.430 D1 路由拆分：dispatchRequest 1271→225 行，全局鉴权之后的 endpoint 实现
           # 整体搬进 scripts/console-routes.js（有序路由表）+ scripts/console-handlers/*.js（按域 handler），
           # 本文件净 -910 行 ⇒ 尾部 part11..13 按新行数重排为 5835-6110 / 6111-6390 / 6391-6668；part1..10
@@ -403,7 +405,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part13
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6391-6671"
+            mutate: "scripts/console.js:6391-6677"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

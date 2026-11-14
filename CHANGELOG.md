@@ -1493,3 +1493,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **配套**：页面 boot 只注入本次请求已验证的凭证，不再从查询串取 token；条件请求的 ETag 变体仍继续剥离 `?token=`，但那只是缓存键兼容——鉴权一律先 401，剥离不构成任何放行路径。README、SYSTEM_CONTRACT 与控制台页内提示同步改为「打开页面 → 输入令牌 → 提交登录」。
 - **升级提示**：旧的 `?token=` 书签需要重新登录一次；若这种链接曾发到聊天、截图或工单里，建议顺便轮换 `XBK_CONSOLE_TOKEN`。
 - **测试**：新增/改写 6 组断言（`GET /?token=<正确>` 与 `GET /api/status?token=<正确>` 均 401、`?%74oken=` 同样不认、Bearer 与会话 Cookie 各自 200、`POST /login` 正确令牌 → 303 + Set-Cookie 后带 Cookie 可开页面、2FA 两步流程的 URL 不含 token），原「`?token=` 放行」用例改为新契约，未删任何测试。
+
+## v3.434
+
+- **控制台不会再读错推送缓存文件（对用户可见的变化：自定义了推送地址的部署，推送记录不再「消失」）**：控制台原先自己按「取推送地址最后一段 → 去查询串/hash → 洗保留字符 → 补 `.json`」拼缓存文件名，运行侧写盘却是另一套规则（空串、`undefined`、数字/布尔、前导点、Windows 保留字符、控制字符、纯点串、尾部 `/` 这些边界的处理都不一样）。两边一旦不一致，控制台读的就是运行侧从不写入的文件——页面显示「还没有推送记录」，实际判重缓存一直在正常增长。现在「推送地址 → 缓存文件名」全仓只有一份实现（`xbk_message_store.js` 的 `fileNameForUrl`）：运行侧 `MessageStore.getFileName`、控制台 `messagesCacheName()`、`--status` 的 `messagesFileName()` 全部调它，同一组地址下逐字同名。
+- **取名规则与数据格式一字未改**：缓存文件名怎么取、`push.json` 与 journal 的格式、判重身份、推送内容、控制台接口字段全部不变——这轮只是把「三处各写一份的取名规则」收成一份，**不会重命名或迁移任何现有缓存文件**，升级后已有的判重记录照旧生效。
+- **测试**：新增三方对拍用例（默认部署的 `push.json`、`default.json`、两个自定义推送地址，以及带 query/hash、前导点、Windows 保留字符、控制字符、纯点串、尾部 `/`、空串 / `undefined` / `null` / 数字 / 布尔），逐条断言控制台、`--status` 与运行侧 `MessageStore.getFileName` 的产物完全相同；另加「`getFileName` 必须委托唯一实现」「控制台的生产调用形态等于运行侧取 `Config.api.pushUrl`」两条结构断言，以及 `readMessages(filename)` 的目录穿越防护回归。定向套件全绿。
+- **变异矩阵**：`scripts/console.js` 净 +6 行（6671 → 6677），`console-part13` 行段同步为 `6391-6677`，`check-mutation-ranges` 通过。

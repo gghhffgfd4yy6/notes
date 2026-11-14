@@ -27,7 +27,7 @@ const qrcode = require('qrcode-generator')
 // v3.363：只读快照端点的条件请求（ETag/304）。零传递依赖（etag 自身无依赖），
 // 与「青龙 --omit=dev 只装 dependencies」的部署约束兼容。
 const etag = require('etag')
-const { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, isRealDayKey } = require('./status')
+const { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, isRealDayKey, messagesFileName } = require('./status')
 // P1：判重缓存的增量日志（journal）。控制台自己写 push.json 的路径（导入恢复）必须同步清空它，
 // 否则旧日志回放会把导入前的条目重新掺进来（甚至覆盖导入内容）。
 const { journalPathFor, JOURNAL_SUFFIX } = require('../xbk_message_store')
@@ -51,11 +51,11 @@ const APP_VERSION = (() => {
   try { return String(require('../package.json').version || '') } catch (e) { return '' }
 })()
 
-// 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同口径——pushUrl 末段
-// 去查询串/hash 后清洗保留字符，非 http(s) 前缀的 url 走 bad_/default 特例（这里只关心正常形态）。
-// 惰性 require 运行配置（与 qinglong/xbk_push.loadApp 同款 try/catch）：加载失败/未配置 → 'push.json'
-// （默认 domain 的 pushUrl 末段就是 push.json）。自定义 pushUrl basename 的部署不再静默读错文件
-// （Sourcery PR#227「Custom cache file is not shown」）。
+// 推送缓存文件名：与生产 MessageStore.getFileName(Config.api.pushUrl) 同源——不再自己拆 pushUrl
+// 末段（M1：那份派生算法只允许在 xbk_message_store.fileNameForUrl 一处存在）。此前控制台自己清洗
+// 末段，边界（空串/undefined/数字/前导点/控制字符/纯点串/尾部斜杠…）与生产侧不一致 ⇒ 自定义
+// pushUrl 的部署控制台读 A 文件、运行侧写 B 文件，推送记录永远读空（Sourcery PR#227 同一症状的
+// 真因）。
 // 站内基准域名：生产侧相对 url 用 Config.domain resolve（xbk_app urlOf 同口径）。默认
 // https://new.ixbk.net（xbk_function_v3 Config 默认值）；读取失败回退默认值，前端不再硬编码错 host
 // （Sourcery PR#227「Relative links use wrong host」）。
@@ -89,15 +89,19 @@ function consoleStateDir () {
   return runtimeCacheDir() || statusCacheDir()
 }
 
-function messagesCacheName () {
+// 判重缓存文件名（控制台读的就是运行侧写的那份）。
+// 不传参 = 生产路径：从运行配置惰性取 Config.api.pushUrl 再交给同一实现（status.messagesFileName →
+// xbk_message_store.fileNameForUrl）；配置加载失败时回退 'push.json'（默认部署 pushUrl 末段就是它），
+// 与运行侧 getFileName 的任何产物都不冲突。
+// 显式传参（含 undefined/数字等边界）只用于对拍测试与诊断——用 arguments.length 判「传没传」，
+// 不能用默认参数：那样 undefined 会被当成「没传」，边界用例就没法钉住「按生产口径该是 default.json」。
+function messagesCacheName (pushUrl) {
+  if (arguments.length > 0) return messagesFileName(pushUrl)
   try {
     const app = require('../xbk_function_v3')
-    const pushUrl = app && app.Config && app.Config.api && app.Config.api.pushUrl
-    if (typeof pushUrl !== 'string' || pushUrl.length === 0) return 'push.json'
-    let name = pushUrl.split('/').pop().split(/[?#]/)[0] || 'default'
-    if (/^\.+$/.test(name)) name = 'default'
-    name = name.replace(/[\\/:*?"<>|]/g, '_')
-    return /\.json$/.test(name) ? name : `${name}.json`
+    const api = app && app.Config && app.Config.api
+    if (!api) return 'push.json'
+    return messagesFileName(api.pushUrl)
   } catch (e) {
     return 'push.json'
   }
@@ -6498,6 +6502,8 @@ module.exports = {
   createConsole,
   listenErrorHint,
   consoleStateDir,
+  // M1：控制台读的判重缓存文件名（pushUrl → 文件名，与运行侧 getFileName 同一实现）——对拍测试入口
+  messagesCacheName,
   STATIC_ASSETS,
   finishRun,
   // R1 返工 #2：自动运行收尾判定（ok/failed/busy）——纯函数，供单测直接喂 record

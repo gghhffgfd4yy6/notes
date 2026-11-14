@@ -6,7 +6,7 @@
 const assert = require('node:assert')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
-const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW } = require('./xbk_message_store')
+const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW, fileNameForUrl } = require('./xbk_message_store')
 
 // C3-002（backlog）：夹具加载期先清掉外部部署开关 XBK_CACHE_DIR。
 // 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
@@ -197,6 +197,25 @@ check('getFileName: 控制字符被过滤', () => {
 check('getFileName: 末段全为控制字符回退 default', () => {
   const r = store.getFileName('https://example.com/\u0001\u0002\u0003')
   assert.strictEqual(r, 'default.json', '末段全为控制字符应回退 default')
+})
+
+// M1：文件名派生只允许一份实现。store.getFileName 必须就是模块级 fileNameForUrl 的结果（控制台
+// scripts/console.js 与 scripts/status.js 都走这一份），否则「控制台读 A 文件、运行侧写 B 文件」。
+check('M1: getFileName 委托模块级 fileNameForUrl（单一实现，不得各处各派一份）', () => {
+  const urls = [
+    'https://example.com/path/to/data.json', 'https://example.com/data.json?foo=bar#h', '', undefined,
+    null, 123, true, 'https://example.com/path/', 'https://example.com/..', 'https://example.com/.hidden',
+    'https://example.com/url_', 'https://example.com/url_.json', 'https://example.com/default.json',
+    'https://example.com/a:b*c?.json', 'https://example.com/a\u0001b.json'
+  ]
+  for (const url of urls) {
+    assert.strictEqual(store.getFileName(url), fileNameForUrl(url, mockUtils),
+      `getFileName 必须委托唯一实现（同一输入须逐字同名）：${typeof url}:${String(url)}`)
+  }
+  // 纯函数两档：注入 Utils 才能对坏源做可区分命名；未注入时保守回退 default.json（绝不猜一份与
+  // 生产不同的哈希名，否则调用方会去读一个永不存在的文件）。
+  assert.ok(fileNameForUrl(123, mockUtils).startsWith('bad_3_'), '注入 Utils 时数字 url 走 bad_ 命名')
+  assert.strictEqual(fileNameForUrl(123), 'default.json', '未注入 Utils 时退回 default.json')
 })
 
 // ===== _evictTombstonesToSize / _saveTombstones（qodo #147-4 墓碑淘汰死循环守卫）=====

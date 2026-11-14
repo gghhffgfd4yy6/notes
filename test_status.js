@@ -192,6 +192,62 @@ try {
     else process.env.XBK_CACHE_DIR = prevCacheEnv
   }
 
+  // ── M1：pushUrl → 缓存文件名只允许一份实现（控制台/--status 读的必须就是运行侧写的那份）──
+  // 生产 MessageStore.getFileName 带撞名诊断（会往缓存目录写 push-sources.json），故用临时目录
+  // 顶掉 XBK_CACHE_DIR 建一个真 store 对拍；控制台侧的同表对拍在 test_console.js（三方逐字比对）。
+  {
+    const { messagesFileName } = require('./scripts/status')
+    const nameDir = path.join(dir, 'cache-name')
+    fs.mkdirSync(nameDir)
+    const prevCacheEnv = process.env.XBK_CACHE_DIR
+    process.env.XBK_CACHE_DIR = nameDir
+    try {
+      const prodStore = createMessageStore({
+        Config: { cache: { maxSize: 10 } },
+        Utils: createUtils({ fs, safeRe: (src, flags) => new RegExp(src, flags) }),
+        fs,
+        path,
+        crypto: nodeCrypto,
+        normalize: (o) => o,
+        storage,
+        constants: {}
+      })
+      const urls = [
+        'https://new.ixbk.net/plus/json/push.json', // 默认部署
+        'https://x/custom-push.json', // 自定义 pushUrl ①
+        'https://x/data/line-reports', // 自定义 pushUrl ②
+        'https://x/default.json',
+        'https://x/a.json?foo=bar#frag',
+        'https://x/path/',
+        'https://x/..',
+        'https://x/.hidden',
+        'https://x/url_',
+        'https://x/a:b*c?.json',
+        'https://x/a\u0001b.json',
+        '',
+        undefined,
+        null,
+        true,
+        123
+      ]
+      // 同一组 URL 会撞出重复的 default.json（'https://x/path/' 与 'https://x/default.json'），
+      // getFileName 的撞名诊断会打印告警——那是它的职责，这里只需要文件名，静音即可。
+      const quiet = (fn) => { const w = console.warn; console.warn = () => {}; try { return fn() } finally { console.warn = w } }
+      for (const url of urls) {
+        assert.strictEqual(messagesFileName(url), quiet(() => prodStore.getFileName(url)),
+          `--status 派生必须与运行侧 getFileName 逐字相同：${typeof url}:${String(url)}`)
+      }
+    } finally {
+      if (prevCacheEnv === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prevCacheEnv
+    }
+    // 读取侧仍只认纯文件名（traversal 防护没被这次重构带走）：filename 带目录成分时整形回 basename。
+    fs.writeFileSync(path.join(dir, 'push.json'), JSON.stringify([{ id: 'only', title: '标题' }]))
+    const guarded = readMessages(dir, { cache: false, filename: '../push.json' })
+    assert.strictEqual(guarded.status, 'ok', '带目录成分的 filename 必须整形为纯文件名后再读')
+    assert.strictEqual(guarded.value.total, 1)
+  }
+
   console.log('✅ --status 聚合并展示运行状态，损坏/缺失/符号链接文件安全降级；journal 未合并条目可读且缓存随日志失效，drop 行与运行侧条数一致')
 } finally {
   process.chdir(previousCwd)

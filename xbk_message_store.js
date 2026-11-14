@@ -379,6 +379,69 @@ const IDENTITY_INDEX_IDENTITY_PROBE_WINDOW = 2
 // 数组都落在这里），代价上界 8 个位置；更大的数组才退回固定窗口（代价与 n 无关，有界自愈）。
 const IDENTITY_INDEX_PROBE_FULL_MAX = 8
 
+// ===== 缓存文件名（pushUrl → 纯文件名）：全仓唯一实现 =====
+// 生产 MessageStore.getFileName、控制台 scripts/console.js、scripts/status.js 三处都调这里。
+// 各写一份派生算法必然分叉——控制台按自己的规则拼 A 文件、运行侧按生产规则写 B 文件，自定义了
+// pushUrl 的部署就会在控制台看到「推送记录为空」（真 bug，不只是显示问题）。
+// 纯计算：不读盘、不告警、无副作用；撞名诊断仍留在 MessageStore.getFileName（C3-007）。
+// Utils 只用于「非字符串 url」的 bad_ 分支：anonKey 是纯字符串哈希（只经几个字面量正则做 replace），
+// 与 safeRe 用 re2 还是原生 RegExp 无关 ⇒ 各调用点传各自的 utils 实例也得到逐字相同的名字。
+// 未注入 anonKey 时该分支退回 default.json——绝不猜一份与生产不同的哈希名，否则控制台会去读一个
+// 永不存在的文件。
+function fileNameForUrl (url, Utils) {
+  // 防御（R1）：非字符串 url → 可区分坏源(数字/布尔)哈希命名；无信息(空串/对象)保持 default.json
+  // v3.157：数字/布尔 String 化可区分（123 vs 456），曾与空串/对象共用 default.json 互相误判重
+  if (typeof url !== 'string') {
+    let badStr
+    try { badStr = String(url) } catch (e) { return 'default.json' }
+    if (!badStr || badStr === '[object Object]' || badStr === 'undefined' || badStr === 'null' || badStr === 'true' || badStr === 'false') return 'default.json'
+    if (!Utils || typeof Utils.anonKey !== 'function') return 'default.json'
+    // v3.249：bad_ 名内嵌坏源字节长 + anonKey(64位) 双重区分——单纯哈希不同坏源存在理论碰撞
+    // 会产出同名缓存互相覆盖（P3）；anonKey 已由 32 位升级为两路 djb2 拼接(64位)，再附字节长
+    // 进一步把碰撞面收窄到「同长+同哈希」，并让文件名自描述便于排查。开销仅数个字节，
+    // getFileName 产物后续经 getFilePath 200 字节截断，不影响路径安全不变量。
+    return 'bad_' + Buffer.byteLength(badStr, 'utf8') + '_' + Utils.anonKey(badStr) + '.json'
+  }
+  if (!url) return 'default.json'
+  const parts = url.split('/')
+  let name = parts[parts.length - 1].split(/[?#]/)[0] // 去掉查询参数与 hash
+  if (!name || /^\.+$/.test(name)) name = 'default' // 空/纯点串兜底，避免 '..' → '...json'
+  name = name.replace(/[\\/:*?"<>|]/g, '_') // 清洗文件系统保留字符（P3：补 ? 与 getFilePath 口径对齐）
+  name = name.replace(/[\u0000-\u001f]/g, '') // 过滤控制字符
+  if (!name) name = 'default' // 清洗后复检空串：末段全为控制字符时避免生成隐藏文件 '.json'
+  // P3（审查 2026-09-15）：末段字面以点开头（如 URL 末段 '.json'/'.hidden'）不命中上方
+  // 兜底分支，会经 getFilePath 在缓存目录生成隐藏文件（文件名以点开头，ls 不可见、运维
+  // 排查易漏）。补前缀 'url_' 落地防护；这只改变这些 URL 的缓存文件名，不改判重语义
+  // （判重身份来自消息内容/URL 本身，与缓存文件名无关），已存在的隐藏文件由启动清理
+  // 的残留回收与下一次写入自然迁移。
+  // F7 回归（R4/V6）：只给「以点开头」的名字加前缀会与该前缀自身的合法名字撞名——
+  // getFileName('https://x/.json') 与 getFileName('https://x/url_.json') 都是 'url_.json'
+  // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。改为按来源分派到两个不相交的像集。
+  //
+  // F7 残留（R6/W2）：上一版把两类合并成同一条「前置 url_」再补 .json 后缀，于是
+  //   getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'
+  //   getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不再追加）→ **仍然撞名**。
+  //   根因是「补 .json 后缀」与「前置 url_」两次改写叠加后像集相交。修法：
+  //     · '.'-来源 → 'url_' + 名字（原有隐藏文件防护，产物恒以 'url_.' 开头）；
+  //     · 'url_'-来源且**已带 .json** → 'url_' + 名字（保持既有产物 'url_url_.json' 不被改动）；
+  //     · 'url_'-来源且未带 .json → 追加分隔符 '#' 再补后缀（'url_url_#.json'）。
+  //   单射依据：'url_'-来源（无论哪种）产物恒以 'url_url_' 开头，与 '.'-来源的 'url_.' 不相交，
+  //   也与「不以 url_ 开头」的普通名字不相交；'#' **不可能出现在清洗后的末段里**——本函数先把
+  //   末段按 /[?#]/ 截断，故 'url_x#.json' 这类名字不可能再作为来源参与映射，'url_x' 与
+  //   'url_x.json' 这两个来源因此不再互相覆盖（'url_url_x#.json' ≠ 'url_url_x.json'）。
+  //   注：'a' 与 'a.json' 这一类「仅差 .json 后缀」的粗化是**既有且被断言钉住**的口径
+  //   （test_filter「abc → abc.json」「a.json → a.json」），不在本次改动范围。
+  if (name.startsWith('.')) {
+    name = 'url_' + name
+  } else if (name.startsWith('url_') && !name.endsWith('.json')) {
+    name = 'url_' + name + '#'
+  } else if (name.startsWith('url_')) {
+    name = 'url_' + name
+  }
+  if (!name.endsWith('.json')) name += '.json'
+  return name
+}
+
 // 💾 MessageStore — 缓存管理层（由 xbk_function_v3.js 的组合根 createMessageStore 注入，生产每轮读写缓存都走它）
 // 依赖全部由组合根注入；不反向 require 主入口，不复制共享单例。
 function createMessageStore ({
@@ -2824,58 +2887,11 @@ function createMessageStore ({
       } catch (e) { record.dirty = true }
     },
 
-    /** getFileName 的纯计算部分（C3-007 抽出：碰撞检测要看**最终**文件名，故必须单点返回）。 */
+    /** getFileName 的纯计算部分（C3-007 抽出：碰撞检测要看**最终**文件名，故必须单点返回）。
+     *  实现只有一处：模块级 fileNameForUrl（控制台 / --status 同一份），这里只补本实例注入的 Utils
+     *  （非字符串 url 的 bad_ 命名要 anonKey）。 */
     _fileNameFor (url) {
-    // 防御（R1）：非字符串 url → 可区分坏源(数字/布尔)哈希命名；无信息(空串/对象)保持 default.json
-    // v3.157：数字/布尔 String 化可区分（123 vs 456），曾与空串/对象共用 default.json 互相误判重
-      if (typeof url !== 'string') {
-        let badStr
-        try { badStr = String(url) } catch (e) { return 'default.json' }
-        if (!badStr || badStr === '[object Object]' || badStr === 'undefined' || badStr === 'null' || badStr === 'true' || badStr === 'false') return 'default.json'
-        // v3.249：bad_ 名内嵌坏源字节长 + anonKey(64位) 双重区分——单纯哈希不同坏源存在理论碰撞
-        // 会产出同名缓存互相覆盖（P3）；anonKey 已由 32 位升级为两路 djb2 拼接(64位)，再附字节长
-        // 进一步把碰撞面收窄到「同长+同哈希」，并让文件名自描述便于排查。开销仅数个字节，
-        // getFileName 产物后续经 getFilePath 200 字节截断，不影响路径安全不变量。
-        return 'bad_' + Buffer.byteLength(badStr, 'utf8') + '_' + Utils.anonKey(badStr) + '.json'
-      }
-      if (!url) return 'default.json'
-      const parts = url.split('/')
-      let name = parts[parts.length - 1].split(/[?#]/)[0] // 去掉查询参数与 hash
-      if (!name || /^\.+$/.test(name)) name = 'default' // 空/纯点串兜底，避免 '..' → '...json'
-      name = name.replace(/[\\/:*?"<>|]/g, '_') // 清洗文件系统保留字符（P3：补 ? 与 getFilePath 口径对齐）
-      name = name.replace(/[\u0000-\u001f]/g, '') // 过滤控制字符
-      if (!name) name = 'default' // 清洗后复检空串：末段全为控制字符时避免生成隐藏文件 '.json'
-      // P3（审查 2026-09-15）：末段字面以点开头（如 URL 末段 '.json'/'.hidden'）不命中上方
-      // 兜底分支，会经 getFilePath 在缓存目录生成隐藏文件（文件名以点开头，ls 不可见、运维
-      // 排查易漏）。补前缀 'url_' 落地防护；这只改变这些 URL 的缓存文件名，不改判重语义
-      // （判重身份来自消息内容/URL 本身，与缓存文件名无关），已存在的隐藏文件由启动清理
-      // 的残留回收与下一次写入自然迁移。
-      // F7 回归（R4/V6）：只给「以点开头」的名字加前缀会与该前缀自身的合法名字撞名——
-      // getFileName('https://x/.json') 与 getFileName('https://x/url_.json') 都是 'url_.json'
-      // → 两个不同 pushUrl 共用同一缓存文件（互相覆盖判重记录）。改为按来源分派到两个不相交的像集。
-      //
-      // F7 残留（R6/W2）：上一版把两类合并成同一条「前置 url_」再补 .json 后缀，于是
-      //   getFileName('https://x/url_') → 'url_url_' → 'url_url_.json'
-      //   getFileName('https://x/url_.json') → 'url_url_.json'（已带后缀不再追加）→ **仍然撞名**。
-      //   根因是「补 .json 后缀」与「前置 url_」两次改写叠加后像集相交。修法：
-      //     · '.'-来源 → 'url_' + 名字（原有隐藏文件防护，产物恒以 'url_.' 开头）；
-      //     · 'url_'-来源且**已带 .json** → 'url_' + 名字（保持既有产物 'url_url_.json' 不被改动）；
-      //     · 'url_'-来源且未带 .json → 追加分隔符 '#' 再补后缀（'url_url_#.json'）。
-      //   单射依据：'url_'-来源（无论哪种）产物恒以 'url_url_' 开头，与 '.'-来源的 'url_.' 不相交，
-      //   也与「不以 url_ 开头」的普通名字不相交；'#' **不可能出现在清洗后的末段里**——本函数先把
-      //   末段按 /[?#]/ 截断，故 'url_x#.json' 这类名字不可能再作为来源参与映射，'url_x' 与
-      //   'url_x.json' 这两个来源因此不再互相覆盖（'url_url_x#.json' ≠ 'url_url_x.json'）。
-      //   注：'a' 与 'a.json' 这一类「仅差 .json 后缀」的粗化是**既有且被断言钉住**的口径
-      //   （test_filter「abc → abc.json」「a.json → a.json」），不在本次改动范围。
-      if (name.startsWith('.')) {
-        name = 'url_' + name
-      } else if (name.startsWith('url_') && !name.endsWith('.json')) {
-        name = 'url_' + name + '#'
-      } else if (name.startsWith('url_')) {
-        name = 'url_' + name
-      }
-      if (!name.endsWith('.json')) name += '.json'
-      return name
+      return fileNameForUrl(url, Utils)
     }
   }
 
@@ -2920,6 +2936,8 @@ module.exports = {
   resolveCacheDirInRoot,
   removeStaleTombstoneFile,
   tombstoneKeyCap,
+  // 缓存文件名（pushUrl → 纯文件名）唯一实现：生产 getFileName / 控制台 / --status 共用（M1）
+  fileNameForUrl,
   IDENTITY_INDEX_REF_PROBE_WINDOW,
   IDENTITY_INDEX_IDENTITY_PROBE_WINDOW,
   // P1：journal 口径（控制台/状态读路径与测试共用同一份实现，禁止各写一遍）
