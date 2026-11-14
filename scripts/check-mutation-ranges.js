@@ -246,6 +246,81 @@ const NON_RUNTIME_MUTATE_TARGETS = new Map([
     '独立 CLI（网页控制台）：由用户/调度器以 `node scripts/console.js` 启动，不经运行入口 require 或 spawn，静态闭包看不到；它仍是生产模块，故保留 mutate 目标']
 ])
 
+// 零变异覆盖登记（B4 / D-001 · D-005）：控制台拆分出来的路由表 + 6 个 handler 都**不在**
+// mutation.yml 矩阵里，也**不在**运行链上——`scripts/console.js` 本身是 NON_RUNTIME_MUTATE_TARGETS
+// （独立 CLI，不进运行入口的 require 闭包），所以这些拆分文件连「被 console.js require」都看不出来。
+// 因此它们既不能塞进 MUTATION_EXEMPT（那张表的第 ③ 条校验只认「在运行链上」的模块，塞进去会被判
+// 「豁免已过期」），也不该假装有覆盖。做法＝显式登记 + 两条硬校验：
+//   ① `scripts/console-handlers/` 下每个 `.js` 与 `scripts/console-routes.js` 必须
+//      「在 mutate 目标里」或「在本表里」——**新增文件不得静默零覆盖**；
+//   ② 本表里的路径必须真实存在——文件删了/改名了，登记必须跟着删（否则名单本身变成新盲区）。
+const CONSOLE_SPLIT_REASON = '控制台是独立 CLI（`node scripts/console.js` 启动）、不进运行链的 require 闭包；行为由 test_console_routes.js（路由表 + handler 直测）与 test_console.js（e2e / 结构红线 / 只读纯函数）直测；mutation.yml 矩阵未拆该段 ⇒ 显式登记为零变异覆盖的已知缺口'
+const NON_RUNTIME_ZERO_COVERAGE = new Map([
+  ['scripts/console-routes.js', `控制台路由表（140 行，把 /api/* 映射到 handlers）：${CONSOLE_SPLIT_REASON}`],
+  ['scripts/console-handlers/config.js', `控制台 /api/config 处理器：${CONSOLE_SPLIT_REASON}`],
+  ['scripts/console-handlers/logs.js', `控制台 /api/logs 处理器：${CONSOLE_SPLIT_REASON}`],
+  ['scripts/console-handlers/messages.js', `控制台 /api/messages 处理器：${CONSOLE_SPLIT_REASON}`],
+  ['scripts/console-handlers/runs.js', `控制台 /api/runs 处理器：${CONSOLE_SPLIT_REASON}`],
+  ['scripts/console-handlers/security.js', `控制台鉴权/安全处理器：${CONSOLE_SPLIT_REASON}`],
+  ['scripts/console-handlers/system.js', `控制台 /api/system 处理器：${CONSOLE_SPLIT_REASON}`]
+])
+
+// 必须「在 mutate 目标里或已登记」的候选集：整个 handlers 目录 + 路由表文件。
+// 新加 handler 时无需改这里（目录扫描），但必须在 NON_RUNTIME_ZERO_COVERAGE 补登记，否则判红。
+const ZERO_COVERAGE_DIRS = ['scripts/console-handlers']
+const ZERO_COVERAGE_FILES = ['scripts/console-routes.js']
+function listZeroCoverageCandidates () {
+  const out = []
+  for (const dir of ZERO_COVERAGE_DIRS) {
+    let entries = []
+    try {
+      entries = fs.readdirSync(path.join(root, dir), { withFileTypes: true }) // nosemgrep（仓库内固定目录，非用户输入）
+    } catch (err) {
+      // 目录消失不是「没有候选」，而是判据本身失效：交给调用方按不可判定处理。
+      throw new Error(`零变异覆盖候选目录不可读：${dir}（${err.code || err.message}）`)
+    }
+    for (const ent of entries) {
+      if (!ent.isFile() || !/\.js$/.test(ent.name)) continue
+      out.push(`${dir}/${ent.name}`)
+    }
+  }
+  for (const file of ZERO_COVERAGE_FILES) out.push(file)
+  // 显式比较器（Sonar S2871）：无参 sort 按 UTF-16 码元排序，且 Sonar 判为 CRITICAL BUG。
+  // 候选全是小写 ASCII 路径，localeCompare 在任意 locale 下顺序一致（测试钉住了期望顺序）。
+  return out.sort((a, b) => a.localeCompare(b))
+}
+
+// 纯判定函数（导出给 test_check_mutation_ranges.js 直接驱动正反例）：文件集 × 登记表 × 存在性。
+function auditZeroCoverage ({ files, mutateTargets, registry, exists }) {
+  const errors = []
+  const targetSet = mutateTargets instanceof Set ? mutateTargets : new Set(mutateTargets || [])
+  const reg = registry instanceof Map ? registry : new Map(Object.entries(registry || {}))
+  const existsFn = typeof exists === 'function' ? exists : () => true
+  const list = Array.isArray(files) ? files : []
+  // ① 候选文件必须二选一（mutate 目标 / 登记），登记必须有理由
+  for (const file of list) {
+    if (targetSet.has(file)) continue
+    if (reg.has(file)) {
+      if (!String(reg.get(file) || '').trim()) {
+        errors.push(`零变异覆盖登记 ${file} 的理由为空：必须写明「为什么矩阵没拆这一段、行为由哪些套件直测」，空理由等于静默豁免`)
+      }
+      continue
+    }
+    errors.push(`控制台拆分文件 ${file} 既不是 mutation.yml 的 mutate 目标、也不在 NON_RUNTIME_ZERO_COVERAGE 里：` +
+      '新增文件不得静默零覆盖（列入 mutate 目标，或在表里写明「为何零覆盖 + 由哪些套件直测」）')
+  }
+  // ② 登记不得过期：路径必须真实存在，且不能同时又变成 mutate 目标（两种口径互斥）
+  for (const file of reg.keys()) {
+    if (targetSet.has(file)) {
+      errors.push(`NON_RUNTIME_ZERO_COVERAGE 的 ${file} 已是 mutate 目标：登记已过期（该文件已被矩阵覆盖），请删除该条`)
+    }
+    if (!existsFn(file)) {
+      errors.push(`NON_RUNTIME_ZERO_COVERAGE 的 ${file} 不存在：登记已过期（文件已删除/改名），请删除该条`)
+    }
+  }
+  return { errors, stats: { candidates: list.length, registered: reg.size } }
+}
+
 // 纯判定函数（导出给 test_check_mutation_ranges.js 直接驱动靶向反例）：两个方向 + 过期条目 + 空理由。
 function auditRuntimeChain ({ chain, mutateTargets, exempt, nonRuntime }) {
   const errors = []
@@ -454,6 +529,32 @@ if (MUTATION_EXEMPT.size) {
   console.log(`ℹ️ 运行链显式豁免（零变异覆盖、需逐条评审）：${[...MUTATION_EXEMPT.keys()].join(', ')}`)
 }
 
+// 校验 0.65（B4 / D-001·D-005）：控制台拆分代码的零变异覆盖登记。
+// 这一条与上面的运行链核对**互补**：上面管「运行链上的模块有没有覆盖/豁免」，这里管
+// 「不进运行链、也不在矩阵里的控制台拆分文件有没有被显式登记」——两处都不管就是静默零覆盖。
+// 候选集不可读时 fail-closed（抛错即判红）：扫不到 ≠ 全绿。
+let zeroCoverageAudit = null
+try {
+  zeroCoverageAudit = auditZeroCoverage({
+    files: listZeroCoverageCandidates(),
+    mutateTargets,
+    registry: NON_RUNTIME_ZERO_COVERAGE,
+    exists: (file) => fs.existsSync(path.resolve(root, file)) // nosemgrep（仓库内相对路径，来自本文件登记表）
+  })
+} catch (err) {
+  console.error(`❌ 控制台拆分代码的零变异覆盖登记无法校验：${err.message}`)
+  failed = true
+}
+if (zeroCoverageAudit) {
+  for (const message of zeroCoverageAudit.errors) {
+    console.error(`❌ ${message}`)
+    failed = true
+  }
+  if (!zeroCoverageAudit.errors.length) {
+    console.log(`ℹ️ 控制台拆分代码零变异覆盖登记：候选 ${zeroCoverageAudit.stats.candidates} 个文件，登记 ${zeroCoverageAudit.stats.registered} 条（新增 handlers 必须补登记）`)
+  }
+}
+
 // 校验 0：matrix include 每项必须有 name、src 与其 mutate 目标同文件（解析见文件顶部）。
 // 背景：src 只被 actions/cache 的 hashFiles 指纹使用（mutation.yml），写错或整行删掉都不会让 CI 报错，
 // 只会让该段的缓存指纹失真（缓存串段 / 永不过期）；缺 name 的条目则会让缓存 key 变成 stryker-undefined-*。
@@ -592,8 +693,13 @@ module.exports = {
   deriveRuntimeChain,
   auditRuntimeChain,
   auditMatrixParsers,
+  listZeroCoverageCandidates,
+  auditZeroCoverage,
   MUTATION_EXEMPT,
-  NON_RUNTIME_MUTATE_TARGETS
+  NON_RUNTIME_MUTATE_TARGETS,
+  NON_RUNTIME_ZERO_COVERAGE,
+  ZERO_COVERAGE_DIRS,
+  ZERO_COVERAGE_FILES
 }
 
 if (configGlob.length) {

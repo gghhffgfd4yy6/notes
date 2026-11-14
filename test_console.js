@@ -7686,6 +7686,20 @@ async function main () {
         '无参分支不得退回旧派生算法（旧实现对这个值返回 .hidden.json）')
       assert.notStrictEqual(messagesCacheName(), 'push.json',
         '无参分支不得写死 push.json')
+      // B3（E-010）：**生产接线**断言。上面几条只证明 messagesCacheName() 自己的返回值对，
+      // 证明不了它被接进了 createConsole：把实参写成 'push.json' 时上面全绿，而控制台读的
+      // 缓存文件从此与运行侧写的不是同一个（页面上「没有消息」，无任何报错）。
+      const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
+      const args = blockAfter(consoleSrc, 'createConsole({')
+      assert.ok(args && args.trim().length > 0, '前置：scripts/console.js 必须存在 createConsole({…}) 调用（切不出实参块说明调用被挪走/改名）')
+      // 先剥掉注释（块注释 + 行注释）再断言：`args` 是整块原文，一句
+      // `/* messagesFile: messagesCacheName() */` 或 `// …` 就能骗过裸 includes（评审指出的
+      // 「可直接绕过」），而生产接线其实写死成了别的值。
+      const codeOnly = args
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
+      assert.ok(/messagesFile:\s*messagesCacheName\(\)/.test(codeOnly),
+        `createConsole 的实参块必须把 messagesFile 接到 messagesCacheName()（写死 'push.json' 必须变红）：${args}`)
     } finally {
       if (pushUrlDesc) Object.defineProperty(app.Config.api, 'pushUrl', pushUrlDesc)
       if (prevCacheDir === undefined) delete process.env.XBK_CACHE_DIR

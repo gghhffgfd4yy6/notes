@@ -5195,7 +5195,41 @@ check('R1 锁：释放后可在同一进程再次获取；重复释放返回 mis
   assert.notStrictEqual(again.token, first.token, '每次获取必须是新 token（否则归属判定形同虚设）')
 })
 
-check('R1 锁：内容损坏 / startedAt 非法 ⇒ busy 且不改写（fail-closed，不静默接管）', () => {
+// A 组（v3.437）：「内容不可判定」不再是 busy——它必须响亮失败（permanent），
+// 否则入口打印「已有运行在跑（pid=未知）」并 exit 0，常驻把它当正常轮 ⇒ 永久静默零推送。
+// 下面两个助手让用例既能断言告警原文（⚠️ / 路径 / 删除），又不把老用例的告警刷进套件输出。
+function captureLockWarn (fn) {
+  const realWarn = console.warn
+  const warns = []
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  try {
+    return { value: fn(), warns }
+  } catch (error) {
+    return { error, warns }
+  } finally {
+    console.warn = realWarn
+  }
+}
+async function captureLockWarnAsync (fn) {
+  const realWarn = console.warn
+  const warns = []
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')) }
+  try {
+    return { value: await fn(), warns }
+  } catch (error) {
+    return { error, warns }
+  } finally {
+    console.warn = realWarn
+  }
+}
+const lockPathReal = (dir) => path.join(lockFs.realpathSync(dir), 'run.lock')
+const procStartOf = (pid) => {
+  const stat = lockFs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+  const fields = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)
+  return fields[19]
+}
+
+check('R1 锁：内容损坏 / startedAt 非法 ⇒ 抛 RUN_LOCK_UNREADABLE（不可判定 ≠ 另一轮在跑）且不改写', () => {
   const dir = mkTmpFixture('runlock-corrupt-')
   const app = makeLockApp(dir)
   const p = lockPathOf(dir)
@@ -5209,10 +5243,12 @@ check('R1 锁：内容损坏 / startedAt 非法 ⇒ busy 且不改写（fail-clo
   ]
   for (const raw of broken) {
     lockFs.writeFileSync(p, raw, { mode: 0o600 })
-    const got = app._acquireRunLock()
-    assert.strictEqual(got.ok, false, `无法判定持有者的锁必须拒绝：${JSON.stringify(raw)}`)
-    assert.strictEqual(got.busy, true, `必须是 busy（而不是抛错/接管）：${JSON.stringify(raw)}`)
-    assert.strictEqual(got.holder, null, `判定不出持有者时 holder 必须是 null：${JSON.stringify(got.holder)}`)
+    const { error: thrown } = captureLockWarn(() => app._acquireRunLock())
+    assert.ok(thrown, `无法判定持有者的锁必须响亮失败（旧实现返回 busy ⇒ 入口 exit 0、永久零推送）：${JSON.stringify(raw)}`)
+    assert.strictEqual(thrown.failureReason, 'RUN_LOCK_UNREADABLE', `必须标 RUN_LOCK_UNREADABLE：${JSON.stringify(raw)}`)
+    assert.strictEqual(thrown.failureKind, 'permanent', '常驻入口按 permanent 停机（退避重试救不回来）')
+    assert.strictEqual(thrown.lockUnreadable, true, 'lockUnreadable 必须为 true（程序化判据）')
+    assert.strictEqual(thrown.busy, undefined, `不得再把「不可判定」说成 busy：${JSON.stringify(thrown)}`)
     assert.strictEqual(lockFs.readFileSync(p, 'utf8'), raw, '损坏锁内容不得被接管改写')
   }
 })
@@ -5272,7 +5308,7 @@ check('R1 锁：token 里的 starttime 段不参与死活判定（构造/损坏�
   assert.deepStrictEqual(readLockFrame(dir), liveButBogusToken, '活锁内容一个字都不能改')
 })
 
-check('R1 锁：锁帧字段严格校验——Number() 能强转的脏值一律 fail-closed（pid:true 不得被当成 PID 1）', () => {
+check('R1 锁：锁帧字段严格校验——Number() 能强转的脏值一律抛 RUN_LOCK_UNREADABLE（pid:true 不得被当成 PID 1）', () => {
   const dir = mkTmpFixture('runlock-strict-frame-')
   const app = makeLockApp(dir)
   const p = lockPathOf(dir)
@@ -5294,15 +5330,15 @@ check('R1 锁：锁帧字段严格校验——Number() 能强转的脏值一律 
   ]
   for (const raw of dirty) {
     lockFs.writeFileSync(p, raw, { mode: 0o600 })
-    const got = app._acquireRunLock()
-    assert.strictEqual(got.ok, false, `脏锁帧必须拒绝（不得接管）：${raw}`)
-    assert.strictEqual(got.busy, true, `必须是 busy 而不是抛错：${raw}`)
-    assert.strictEqual(got.holder, null, `判定不出持有者时 holder 必须为 null：${raw}`)
+    const { error: thrown } = captureLockWarn(() => app._acquireRunLock())
+    assert.ok(thrown, `脏锁帧必须响亮失败（不得接管）：${raw}`)
+    assert.strictEqual(thrown.failureReason, 'RUN_LOCK_UNREADABLE', `必须是「不可判定」而不是 busy：${raw}`)
+    assert.strictEqual(thrown.lockIssue, 'frame_invalid', `归因必须是 frame_invalid：${raw}`)
     assert.strictEqual(lockFs.readFileSync(p, 'utf8'), raw, `脏锁帧不得被改写：${raw}`)
   }
 })
 
-check('R1 锁：锁路径是 FIFO 时不得阻塞（O_NONBLOCK + fstat 判非普通文件 ⇒ busy），释放也不阻塞', () => {
+check('R1 锁：锁路径是 FIFO 时不得阻塞（O_NONBLOCK + fstat 判非普通文件 ⇒ 抛 RUN_LOCK_UNREADABLE），释放也不阻塞', () => {
   const mkfifo = ['/usr/bin/mkfifo', '/bin/mkfifo'].find(p => lockFs.existsSync(p))
   if (!mkfifo) return skip('R1 锁：FIFO 实测', '本机没有 mkfifo')
   const dir = mkTmpFixture('runlock-fifo-')
@@ -5311,6 +5347,8 @@ check('R1 锁：锁路径是 FIFO 时不得阻塞（O_NONBLOCK + fstat 判非普
   assert.strictEqual(res.status, 0, `mkfifo 失败：${String(res.stderr)}`)
   // 必须在**子进程**里跑：旧实现（裸 O_RDONLY）会一直等写端，在进程内跑会把整套件挂死而不是判红。
   // 子进程 8s 不返回 = 回归（实测旧实现 timeout 8 node ⇒ rc=124）。
+  // v3.437：FIFO 属「不是普通文件」⇒ 不可判定 ⇒ 取锁抛 RUN_LOCK_UNREADABLE（不再是 busy），
+  // 故探针要把错误形态一起带回来。
   const probe = [
     'const fs = require("node:fs")',
     `const { createApp } = require(${JSON.stringify(path.join(__dirname, 'xbk_app.js'))})`,
@@ -5318,19 +5356,23 @@ check('R1 锁：锁路径是 FIFO 时不得阻塞（O_NONBLOCK + fstat 判非普
     'const dir = process.argv[1]',
     'const app = createApp({ Config: {}, Utils: {}, MessageStore: { get cacheDir () { return dir } }, fs, path, crypto: require("node:crypto") })',
     'const t0 = Date.now()',
-    'const got = app._acquireRunLock()',
+    'let got = null',
+    'let err = null',
+    'try { got = app._acquireRunLock() } catch (e) { err = { failureReason: e.failureReason, lockIssue: e.lockIssue, lockUnreadable: e.lockUnreadable, message: e.message } }',
     'const acquireMs = Date.now() - t0',
     'const t1 = Date.now()',
     'const rel = app._releaseRunLock("whatever")',
-    'process.stdout.write(JSON.stringify({ got, acquireMs, rel, releaseMs: Date.now() - t1 }) + "\\n")'
+    'process.stdout.write(JSON.stringify({ got, err, acquireMs, rel, releaseMs: Date.now() - t1 }) + "\\n")'
   ].join('\n')
   const run = require('child_process').spawnSync(process.execPath, ['-e', probe, dir], { timeout: 8000, encoding: 'utf8' })
   assert.strictEqual(run.status, 0,
     `FIFO 锁不得阻塞取锁/释放：旧实现会永久等写端（实测 rc=124）。实际 status=${run.status} signal=${run.signal} stderr=${String(run.stderr)}`)
   const out = JSON.parse(String(run.stdout).trim())
   assert.ok(out.acquireMs < 2000, `FIFO 锁的取锁必须立刻返回（实测 ${out.acquireMs}ms）`)
-  assert.strictEqual(out.got.ok, false, `FIFO 不可判定持有者，必须拒绝本轮：${JSON.stringify(out.got)}`)
-  assert.strictEqual(out.got.busy, true, '必须按 busy fail-closed（不是抛错、不是接管）')
+  assert.ok(out.err, `FIFO 不可判定持有者，必须响亮失败：${JSON.stringify(out)}`)
+  assert.strictEqual(out.err.failureReason, 'RUN_LOCK_UNREADABLE', '必须是「不可判定」这一条（不是 busy）')
+  assert.strictEqual(out.err.lockIssue, 'not_regular_file', `归因必须是 not_regular_file：${JSON.stringify(out.err)}`)
+  assert.strictEqual(out.err.lockUnreadable, true, 'lockUnreadable 必须为 true')
   assert.strictEqual(out.rel.state, 'foreign', 'FIFO 不是本进程写的那一帧：释放必须返回 foreign（不删、不停机）')
   assert.ok(out.releaseMs < 2000, `FIFO 锁的释放必须立刻返回（实测 ${out.releaseMs}ms）`)
   assert.ok(lockFs.existsSync(p), 'FIFO 不得被删除（非普通文件只拒绝、不清理）')
@@ -5606,6 +5648,213 @@ check('R1 锁：接管哨兵——活着则 busy，死透才回收', () => {
   assert.strictEqual(readLockFrame(dir).token, got.token, '接管后锁帧必须是本次 token')
 })
 
+// ============================================================================
+// A 组（v3.437）：锁「不可判定」必须响亮失败 + 僵尸/非法 pid 两个方向收口
+// ----------------------------------------------------------------------------
+// 共同验收口径：**故意把锁文件弄坏 ⇒ 必须出现告警**，且必须是 permanent（常驻停机交人工），
+// 绝不能退化回「已有运行在跑（pid=未知）」+ exit 0（那正是永久静默零推送的形态）。
+// ============================================================================
+checkAsync('A1/C-009：0 字节 run.lock ⇒ app.run() 抛 RUN_LOCK_UNREADABLE，告警含 ⚠️/绝对路径/「删除」，缓存目录零新增', async () => {
+  const dir = mkTmpFixture('runlock-a1-empty-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  lockFs.writeFileSync(p, '', { mode: 0o600 })
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '0 字节 run.lock 必须让 app.run() 失败（旧实现返回 skipped:true ⇒ 入口 exit 0、永久静默零推送）')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE', `失败原因必须可判定：${error.message}`)
+  assert.strictEqual(error.lockUnreadable, true, 'lockUnreadable 必须为 true')
+  assert.strictEqual(error.failureKind, 'permanent', '常驻入口必须按 permanent 停机（退避重试永远救不回来）')
+  assert.strictEqual(error.lockPath, p, '错误必须点名要删的那把锁（绝对路径）')
+  const hit = warns.filter((w) => w.includes('⚠️') && w.includes(p) && w.includes('删除'))
+  assert.ok(hit.length >= 1,
+    `必须至少一条告警同时含 ⚠️、该 run.lock 绝对路径与「删除」指令（实测 ${JSON.stringify(warns)}）`)
+  assert.ok(!warns.some((w) => w.includes('已有运行在跑')),
+    `不可判定不得再打印 busy 文案（那会把故障伪装成「另一轮在跑」）：${JSON.stringify(warns)}`)
+  assert.deepStrictEqual(lockFs.readdirSync(dir).sort(), ['run.lock'],
+    '失败轮不得写 run.log / 状态文件（沿用 busy 用例的目录白名单口径：只应有那把坏锁）')
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8'), '', '坏锁内容不得被改写（无证据就不动它）')
+})
+
+checkAsync('A1/C-009：非 JSON run.lock（\'{oops\'）⇒ 同样抛 RUN_LOCK_UNREADABLE（不判死、不接管）', async () => {
+  const dir = mkTmpFixture('runlock-a1-json-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  lockFs.writeFileSync(p, '{oops', { mode: 0o600 })
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '非 JSON 锁帧必须响亮失败')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE')
+  assert.strictEqual(error.lockIssue, 'frame_invalid', `归因必须是 frame_invalid：${error.lockIssue}`)
+  assert.ok(warns.some((w) => w.includes('⚠️') && w.includes(p)), `告警必须含 ⚠️ 与锁路径：${JSON.stringify(warns)}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8'), '{oops', '不可判定的锁内容一个字都不能改')
+})
+
+checkAsync('A2/C-040：0 字节 run.lock.takeover ⇒ 抛 RUN_LOCK_SENTINEL_UNREADABLE，消息点名哨兵与「删 run.lock 无效」，主锁不被替换', async () => {
+  const dir = mkTmpFixture('runlock-a2-sentinel-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const sentinelP = p + '.takeover'
+  const deadFrame = { pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 3600 * 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead` }
+  lockFs.writeFileSync(p, JSON.stringify(deadFrame), { mode: 0o600 })
+  lockFs.writeFileSync(sentinelP, '', { mode: 0o600 })
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '哨兵不可判定必须让本轮失败（旧实现 busy ⇒ exit 0、该目录永久零推送）')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_SENTINEL_UNREADABLE',
+    `失败原因必须与主锁可区分（处置动作不同）：${error.message}`)
+  assert.strictEqual(error.sentinelUnreadable, true, 'sentinelUnreadable 必须为 true')
+  assert.strictEqual(error.failureKind, 'permanent', '常驻入口必须按 permanent 停机')
+  assert.ok(error.message.includes('run.lock.takeover'), `错误消息必须点名哨兵文件：${error.message}`)
+  assert.ok(error.message.includes(sentinelP), `错误消息必须给出哨兵的绝对路径：${error.message}`)
+  assert.ok(/删 run\.lock 无效/.test(error.message),
+    `错误消息必须说清「删 run.lock 无效」（挡路的是哨兵）：${error.message}`)
+  const hit = warns.filter((w) => w.includes('⚠️') && w.includes('run.lock.takeover'))
+  assert.ok(hit.length >= 1, `必须至少一条告警含 ⚠️ 与 run.lock.takeover：${JSON.stringify(warns)}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8'), JSON.stringify(deadFrame),
+    '主锁不得被替换（拿不到可判定的哨兵就不许动主锁）')
+  assert.strictEqual(JSON.parse(lockFs.readFileSync(p, 'utf8')).pid, RUN_LOCK_DEAD_PID, '主锁 pid 必须原样')
+  assert.strictEqual(lockFs.readFileSync(sentinelP, 'utf8'), '', '不可判定的哨兵不得被改写/回收')
+})
+
+check('A3/C-057：回收本进程残留哨兵失败（unlink EACCES）⇒ 错误带 sentinelReleaseFailed，告警含 ⚠️ 与哨兵路径', () => {
+  const dir = mkTmpFixture('runlock-a3-own-sentinel-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const sentinelP = p + '.takeover'
+  const ownStart = procStartOf(process.pid)
+  // 主锁：死进程（把流程带进接管路径）。哨兵：**本进程自己**上一轮没删掉的残留（pid + 真实启动时钟）。
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead`
+  }), { mode: 0o600 })
+  const ownSentinel = { pid: process.pid, startedAt: Date.now() - 1000, token: `${process.pid}:${ownStart}:own`, startTicks: ownStart }
+  lockFs.writeFileSync(sentinelP, JSON.stringify(ownSentinel), { mode: 0o600 })
+  // 注入点：只让「删 run.lock.takeover」失败（真实 unlink 调用，只把内核拒绝换成确定 errno）。
+  // 与 test_worker_protocol.js 的 release-fail 预载脚本同一手法：node:fs 与 test 里的 fs 是**同一个
+  // 模块对象**，xbk_app 的 nodeFs 方法在调用时取属性 ⇒ 猴补真的生效（不需要 chmod，root 身份下也成立）。
+  const realUnlink = lockFs.unlinkSync
+  let unlinkAttempts = 0
+  lockFs.unlinkSync = function (target) {
+    if (String(target) === sentinelP) {
+      unlinkAttempts += 1
+      const e = new Error(`EACCES: permission denied, unlink ${target}`)
+      e.code = 'EACCES'
+      throw e
+    }
+    return realUnlink.apply(lockFs, arguments)
+  }
+  let thrown = null
+  let warns = []
+  try {
+    const res = captureLockWarn(() => app._acquireRunLock())
+    thrown = res.error
+    warns = res.warns
+  } finally {
+    lockFs.unlinkSync = realUnlink
+  }
+  assert.ok(thrown, '回收本进程残留哨兵失败必须抛错（不得静默返回 busy）')
+  assert.strictEqual(thrown.sentinelReleaseFailed, true,
+    `错误必须带 sentinelReleaseFailed（与 finally 里的口径一致，常驻据此停机）：${thrown.message}`)
+  assert.ok(warns.some((w) => w.includes('⚠️') && w.includes(sentinelP)),
+    `必须至少一条告警含 ⚠️ 与哨兵路径：${JSON.stringify(warns)}`)
+  assert.strictEqual(unlinkAttempts, 1, `前置：必须真的走到「删哨兵」这一步（实测 unlink 尝试 ${unlinkAttempts} 次）`)
+  assert.ok(lockFs.existsSync(sentinelP), '前置：哨兵必须仍在盘上（证明是「删不掉」而不是「已删掉」）')
+  assert.strictEqual(JSON.parse(lockFs.readFileSync(p, 'utf8')).pid, RUN_LOCK_DEAD_PID,
+    '主锁不得被接管（接管在回收哨兵之后才发生）')
+})
+
+checkAsync('A4/C-027 行为 1：僵尸持有者（/proc state=Z）⇒ 按已退出接管，告警含「僵尸」与该 pid', async () => {
+  const { spawn } = require('child_process')
+  const realFs = require('fs')
+  // 真造一个僵尸：让 **sh** 当父进程（Node 会自动 wait 回收自己的子进程，拿不到 Z），
+  // 它 fork 出 `sleep 0.1` 后立刻 SIGSTOP 自己 ⇒ 子进程退出后无人 wait ⇒ 真僵尸（state=Z，
+  // 且 kill(pid,0) 返回「存活」——这正是旧实现判活的形态）。守护子 shell 在 120s 后自杀，
+  // 主进程死掉也不会留下永久残留。
+  const CMD = 'sleep 0.1 & echo $!; ( i=0; while [ $i -lt 120 ]; do sleep 1; kill -0 $$ 2>/dev/null || exit 0; i=$((i+1)); done; kill -9 $$ ) & kill -STOP $$'
+  // Sonar S4036：经 PATH 解析的可执行文件名一律绝对路径（'sh' 会被判「PATH 可写」漏洞）。
+  const holder = spawn('/bin/sh', ['-c', CMD], { stdio: ['ignore', 'pipe', 'ignore'] })
+  let zombie = null
+  try {
+    zombie = await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 8000
+      let buf = ''
+      const bail = (e) => { try { holder.kill('SIGKILL') } catch (e2) { /* 已退出 */ } reject(e) }
+      holder.on('error', bail)
+      holder.stdout.on('data', (d) => {
+        buf += String(d)
+        const m = buf.match(/^(\d+)/)
+        if (!m) return
+        const pid = Number(m[1])
+        const poll = () => {
+          let st = null
+          try { st = lockFs.readFileSync(`/proc/${pid}/stat`, 'utf8') } catch (e) { st = null }
+          const state = st ? st.slice(st.lastIndexOf(')') + 1).trim()[0] : `ERR:${st === null ? 'gone' : '?'}`
+          if (state === 'Z') return resolve({ pid, startTicks: procStartOf(pid) })
+          if (Date.now() > deadline) return bail(new Error(`子进程没有变成僵尸（pid=${pid} state=${state}）`))
+          setTimeout(poll, 20)
+        }
+        poll()
+      })
+    })
+    // 僵尸在 /proc 里「活着」：这正是旧实现判活并永久 busy 的机器事实（前置断言）。
+    assert.doesNotThrow(() => process.kill(zombie.pid, 0), '前置：僵尸必须让 kill(pid,0) 返回成功')
+
+    const cacheDir = mkTmpFixture('runlock-a4-zombie-')
+    const prevEnvDir = process.env.XBK_CACHE_DIR
+    process.env.XBK_CACHE_DIR = cacheDir
+    try {
+      // 锁帧带着僵尸的真实 pid + 真实 starttime ⇒ 启动时钟一致（排除 PID 复用），只能靠 Z 判死。
+      realFs.writeFileSync(path.join(realFs.realpathSync(cacheDir), 'run.lock'), JSON.stringify({
+        pid: zombie.pid, startedAt: Date.now() - 60 * 1000, token: `${zombie.pid}:${zombie.startTicks}:z`, startTicks: zombie.startTicks
+      }), { mode: 0o600 })
+      const h = buildFilterRunHarness(cacheDir)
+      h.setItems([makeRunItem('zombie-a', '标题僵尸')])
+      const { value: summary, warns } = await captureLockWarnAsync(() => h.App.run())
+      assert.ok(summary && summary.skipped !== true,
+        `僵尸持有者必须按已退出接管（旧实现判活 ⇒ skipped:true + exit 0、永久零推送）：${JSON.stringify(summary)}`)
+      // 接管成功的机器证据：run() 结束时锁已释放，故在**抓取瞬间**看持锁者是谁（harness 已有观测点）。
+      const obs = h.lockAtFetch()
+      assert.ok(obs.length >= 1, '前置：本轮必须真的走到抓取（被判 skipped 时一次都不抓）')
+      assert.strictEqual(obs[0].lockPresent, true, '抓取瞬间 run.lock 必须在盘（本轮已接管并持有）')
+      assert.strictEqual(obs[0].reacquire && obs[0].reacquire.busy, true,
+        `此刻再取锁必须 busy（说明持锁者是本进程）：${JSON.stringify(obs[0])}`)
+      assert.strictEqual(obs[0].reacquire.holder && obs[0].reacquire.holder.pid, process.pid,
+        '持锁者必须是本进程（僵尸被按已退出处理 ⇒ 锁帧换成我们的 pid）')
+      const hit = warns.filter((w) => w.includes('僵尸') && w.includes(String(zombie.pid)))
+      assert.ok(hit.length >= 1, `必须至少一条告警含「僵尸」与该 pid（实测 ${JSON.stringify(warns)}）`)
+      assert.ok(hit.some((w) => w.includes('⚠️')), `僵尸告警必须带 ⚠️：${JSON.stringify(hit)}`)
+    } finally {
+      if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
+      else process.env.XBK_CACHE_DIR = prevEnvDir
+    }
+  } finally {
+    try { holder.kill('SIGKILL') } catch (e) { /* 已退出 */ }
+    // 收尾：杀掉父 shell 后僵尸会被 init 立即回收（残留哨兵/锁随夹具目录删除）。
+    if (zombie) {
+      const deadline = Date.now() + 3000
+      while (Date.now() < deadline) {
+        let gone = false
+        try { lockFs.readFileSync(`/proc/${zombie.pid}/stat`, 'utf8') } catch (e) { gone = true }
+        if (gone) break
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+    }
+  }
+})
+
+checkAsync('A4/C-027 行为 2：pid 超 pid_max（1e15）⇒ 抛 RUN_LOCK_UNREADABLE，不得判死接管（主锁不被替换）', async () => {
+  const dir = mkTmpFixture('runlock-a4-pidmax-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  // 旧实现：kill(1e15,0) 直接 ESRCH ⇒ 判死主 ⇒ 接管（一帧手写内容就能抢锁，fail-open）。
+  const alien = { pid: 1e15, startedAt: Date.now(), token: 'x:0:y', startTicks: '0' }
+  lockFs.writeFileSync(p, JSON.stringify(alien), { mode: 0o600 })
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '超上限 pid 的锁帧必须响亮失败（不得判死接管）')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE', `失败原因必须是「不可判定」：${error.message}`)
+  assert.strictEqual(error.lockIssue, 'frame_invalid', `归因必须是 frame_invalid（pid 超 pid_max 是帧非法）：${error.lockIssue}`)
+  assert.ok(warns.some((w) => w.includes('⚠️')), `必须至少一条 ⚠️ 告警：${JSON.stringify(warns)}`)
+  assert.deepStrictEqual(readLockFrame(dir), alien, '主锁不得被替换（pid 仍必须是 1e15）')
+  assert.strictEqual(readLockFrame(dir).pid, 1e15, '主锁 pid 必须原样保留 1e15')
+})
+
 checkAsync('R1 行为：已有活锁时 App.run 返回 skipped（RUN_BUSY），不写日志/状态、不推送', async () => {
   const realFs = require('fs')
   const cacheDir = mkTmpFixture('runlock-busy-run-')
@@ -5644,6 +5893,99 @@ checkAsync('R1 行为：已有活锁时 App.run 返回 skipped（RUN_BUSY），�
   } finally {
     if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
     else process.env.XBK_CACHE_DIR = prevEnvDir
+  }
+})
+
+checkAsync('A1/C-009 补强：0 字节锁在创建窗口内被写完 ⇒ 有界重试后按真 busy 收口（不得判损坏、不得劝人删活锁）', async () => {
+  const realFs = require('fs')
+  const dir = mkTmpFixture('runlock-a1-window-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  lockFs.writeFileSync(p, '', { mode: 0o600 })
+  const frame = JSON.stringify({
+    pid: process.pid, startedAt: Date.now(), token: `${process.pid}:0:window`, startTicks: procStartOf(process.pid) || '0'
+  })
+  // 确定性模拟「link 不支持的回退分支」的两步窗口（open('wx') 占名 → 再写帧）：第一次读空，
+  // 同时写侧把帧写完；之后正常读。不能用 setTimeout 造窗口——取锁是同步临界区，定时器根本没机会跑。
+  const origReadSync = realFs.readSync
+  let armed = true
+  realFs.readSync = function (fd, buf, off, len, pos) {
+    if (armed) {
+      armed = false
+      realFs.writeFileSync(p, frame)
+      return 0
+    }
+    return origReadSync.call(realFs, fd, buf, off, len, pos)
+  }
+  try {
+    const summary = await app.run()
+    assert.strictEqual(summary.skipped, true,
+      '窗口内写完的活锁必须按 busy 跳过（判成 RUN_LOCK_UNREADABLE 会劝人删一把正在被创建的活锁）')
+    assert.strictEqual(summary.reason, 'RUN_BUSY')
+    assert.deepStrictEqual(summary.holder, { pid: process.pid, startedAt: JSON.parse(frame).startedAt },
+      '重试后必须认出真实持有者（不是 holder:null 的降级 busy）')
+  } finally {
+    realFs.readSync = origReadSync
+  }
+})
+
+checkAsync('A1/C-009：锁路径是符号链接（O_NOFOLLOW ⇒ ELOOP）⇒ 抛 RUN_LOCK_UNREADABLE（带 lockPath），不得抛裸 errno', async () => {
+  const dir = mkTmpFixture('runlock-a1-symlink-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const target = path.join(dir, 'not-a-lock.txt')
+  lockFs.writeFileSync(target, 'x')
+  lockFs.symlinkSync(target, p)
+  const { error, warns } = await captureLockWarnAsync(() => app.run())
+  assert.ok(error, '符号链接锁必须响亮失败（O_NOFOLLOW 拒绝跟链）')
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE',
+    `裸 ELOOP 只会让入口看到一句 errno、没有处置路径：${error.message}`)
+  assert.strictEqual(error.lockIssue, 'not_regular_file', `归因必须可判定：${error.lockIssue}`)
+  assert.strictEqual(error.lockPath, p, '错误必须点名要删的那把锁')
+  assert.ok(warns.some((w) => w.includes('⚠️') && w.includes(p)), `告警必须含 ⚠️ 与锁路径：${JSON.stringify(warns)}`)
+  assert.strictEqual(lockFs.readFileSync(target, 'utf8'), 'x', '链接目标不得被改写（读锁绝不跟链）')
+})
+
+checkAsync('A1/C-009：接管途中复判主锁变为不可判定 ⇒ 同样抛 RUN_LOCK_UNREADABLE（不得折叠成 busy），旧锁不被替换', async () => {
+  const realFs = require('fs')
+  const dir = mkTmpFixture('runlock-a1-again-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const deadFrame = JSON.stringify({ pid: RUN_LOCK_DEAD_PID, startedAt: Date.now() - 3600 * 1000, token: `${RUN_LOCK_DEAD_PID}:0:dead` })
+  lockFs.writeFileSync(p, deadFrame, { mode: 0o600 })
+  // 第 1 次「从头读」= _acquireRunLock 判 stale；第 2 次 = 拿到哨兵后的复判（`again`）。
+  // 让复判读到坏内容，覆盖「复判到不可判定也必须响亮失败」这条分支（删掉那行 throw 时本用例必红）。
+  const origReadSync = realFs.readSync
+  let zeroPos = 0
+  realFs.readSync = function (fd, buf, off, len, pos) {
+    if (pos === 0) {
+      zeroPos++
+      if (zeroPos === 2) { buf.write('{oops', 0); return 5 }
+    }
+    return origReadSync.call(realFs, fd, buf, off, len, pos)
+  }
+  try {
+    const { error, warns } = await captureLockWarnAsync(() => app.run())
+    assert.ok(error, '复判到不可判定必须响亮失败（折叠成 busy ⇒ 入口 exit 0、永久零推送）')
+    assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE', `失败原因必须可判定：${error.message}`)
+    assert.strictEqual(error.lockIssue, 'frame_invalid')
+    assert.strictEqual(error.failureKind, 'permanent')
+    assert.ok(warns.some((w) => w.includes('⚠️') && w.includes(p)), `告警必须含 ⚠️ 与锁路径：${JSON.stringify(warns)}`)
+    assert.strictEqual(lockFs.readFileSync(p, 'utf8'), deadFrame, '没拿到可判定的复判结果前，旧锁一个字都不能改')
+    assert.deepStrictEqual(lockFs.readdirSync(dir).sort(), ['run.lock'], '哨兵必须按归属释放（不得残留 run.lock.takeover）')
+  } finally {
+    realFs.readSync = origReadSync
+  }
+})
+
+check('A4/C-027：runLockPidLimit = min(硬上限 4194304, 内核 pid_max)；读不到/脏值回退硬上限', () => {
+  const { runLockPidLimit } = require('./xbk_app')
+  assert.strictEqual(runLockPidLimit('4194304'), 4194304)
+  assert.strictEqual(runLockPidLimit('32768'), 32768,
+    '容器/pid namespace 的 pid_max 可能只有 32768：此时 pid=3e6 的帧必须判帧非法（否则 kill 判 ESRCH ⇒ 接管，fail-open）')
+  assert.strictEqual(runLockPidLimit('9999999'), 4194304, '内核值大于硬上限时按硬上限收口')
+  for (const bad of [null, undefined, '', 0, -1, 'abc', 1.5, NaN]) {
+    assert.strictEqual(runLockPidLimit(bad), 4194304, `脏值 ${String(bad)} 必须回退硬上限（宁可不误判活锁）`)
   }
 })
 

@@ -64,9 +64,23 @@ function formatRunBusyLine (summary) {
   if (Number.isSafeInteger(startedNum) && startedNum > 0) {
     try { started = shanghaiStamp(new Date(startedNum)) } catch (e) { started = '未知' }
   }
-  // 锁内容不可判定（损坏/被换成非普通文件）时 holder 为 null：这条提示会显示「pid=未知」，
-  // 与「确实有人在跑但读不出身份」同一句话——两种都必须让人工介入去看 run.lock。
+  // 「内容不可判定」已不再靠这条提示（A1 起直接抛 RUN_LOCK_UNREADABLE 并自带路径）；holder 为 null
+  // 只剩「持有者活着但帧里没带身份」这一种历史形态，仍显示「pid=未知」。
   return `已有运行在跑（pid=${pid}, started=${started}），本轮跳过`
+}
+
+// A4（C-027）：帧里 pid 的**硬上限**（Linux pid_max 的最大量级）。超上限的 pid 不可能是真实进程，
+// 属「帧非法」（内容不可判定），绝不能当成「持有者已死」去接管。
+// 为什么还要叠加内核 /proc/sys/kernel/pid_max：容器/pid namespace 里 pid_max 可能远小于 4194304
+// （如 32768），此时「帧里 pid=3000000」同样不可能是真实进程；只按硬上限判，会把它交给 kill() 得
+// ESRCH ⇒ 判死 ⇒ 接管（fail-open，与 A4 要堵的是同一个洞）。
+const RUN_LOCK_PID_MAX = 4194304
+/** 帧 pid 的有效上限 = min(硬上限, 内核 pid_max)。纯函数（导出给单测）；入参是 /proc 原文或已解析值，
+ *  读不到/脏值（null、''、0、非整数）一律回退硬上限——宁可不误判，不可把活锁判死。 */
+function runLockPidLimit (kernelPidMax) {
+  const v = Number(kernelPidMax)
+  const bound = Number.isSafeInteger(v) && v > 0 ? v : RUN_LOCK_PID_MAX
+  return Math.min(RUN_LOCK_PID_MAX, bound)
 }
 
 function createApp ({
@@ -180,6 +194,9 @@ function createApp ({
   const RUN_LOCK_TAKEOVER_SUFFIX = '.takeover'
   // 锁帧读取上限：正常帧约 100 字节；超限一律按「内容不可判定」fail-closed（不整读未知大小文件）。
   const RUN_LOCK_MAX_BYTES = 4096
+  // A4（C-027）：帧 pid 的有效上限见模块级 RUN_LOCK_PID_MAX / runLockPidLimit（硬上限 + 内核 pid_max）。
+  const RUN_LOCK_EMPTY_RETRY = 3
+  const RUN_LOCK_EMPTY_RETRY_MS = 15
   // R1 返工 #1：读/删锁一律带 O_NONBLOCK。裸 O_RDONLY 打开**无写者的 FIFO** 会一直阻塞在 open
   // （等写端），进程在「取锁」这一步永久挂死：没有 run.log、没有退出码、任何告警都发不出来。
   // 加 O_NONBLOCK 后 FIFO 的 open 立刻返回（ENXIO 只出现在 O_WRONLY 上，这里一并兜底），
@@ -203,6 +220,46 @@ function createApp ({
       return /^[0-9]+$/.test(fields[19] || '') ? fields[19] : null
     } catch (e) { return null }
   }
+  /** 进程状态字符（/proc/<pid>/stat 第 3 字段：R/S/D/Z/T…）。**只用于僵尸判定**（A4/C-027）：
+   *  `kill(pid, 0)` 对僵尸返回「存活」——僵尸已经退出、只剩待回收的 task 结构，永远跑不完一轮，
+   *  按「活着」尊重它就会让该缓存目录永久 busy（每轮只打「已有运行在跑（pid=…）」后 exit 0）。
+   *  读不到（非 Linux / 已消失 / 权限）时返回 null：那是**没有证据**，交给调用方按原口径处理。 */
+  const runLockProcessState = (pid) => {
+    if (process.platform !== 'linux') return null
+    try {
+      const stat = nodeFs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const close = stat.lastIndexOf(')')
+      if (close < 0) return null
+      const state = stat.slice(close + 1).trim()[0]
+      return state && /^[A-Za-z]$/.test(state) ? state : null
+    } catch (e) { return null }
+  }
+  // 内核 pid_max（每 App 实例缓存一次；pid_max 在进程生命周期内不会变）。读不到 ⇒ 回退硬上限。
+  let runLockPidBoundCache
+  const runLockPidBound = () => {
+    if (runLockPidBoundCache === undefined) {
+      let raw = null
+      try { raw = nodeFs.readFileSync('/proc/sys/kernel/pid_max', 'utf8') } catch (e) { raw = null }
+      runLockPidBoundCache = runLockPidLimit(raw)
+    }
+    return runLockPidBoundCache
+  }
+  // 创建窗口重试用的是模块级 sleepSync（Atomics.wait；极端环境退化忙等）——取锁是同步临界区，
+  // 不能引入 await 点，否则别的轮次会挤进来。
+  /** 从**已打开的 fd** 按 position 0 读全文（最多 RUN_LOCK_MAX_BYTES）。
+   *  为什么不用 readFileSync(fd)：它只读「当前位置」，重试的第二次会读到空串；
+   *  为什么不用 st.size 分配：文件可能在两次读之间从 0 字节长成完整帧（创建窗口）。 */
+  const readLockContent = (fd) => {
+    const buf = Buffer.alloc(RUN_LOCK_MAX_BYTES)
+    let off = 0
+    while (off < buf.length) {
+      const n = nodeFs.readSync(fd, buf, off, buf.length - off, off)
+      if (!n) break
+      off += n
+    }
+    return buf.subarray(0, off).toString('utf8')
+  }
+
   // 随机段只求唯一性、不求不可预测性（token 不是凭据）；crypto 不可用时回退高分辨时钟。
   const runLockRandom = () => (crypto && typeof crypto.randomBytes === 'function')
     ? crypto.randomBytes(6).toString('hex')
@@ -328,13 +385,16 @@ function createApp ({
    *  旧实现 `Number(frame.pid)` 会把 `pid:true` 读成 PID 1、把 `startedAt:'123'` 当合法数字，
    *  于是一帧手写/损坏的内容就能指认出别的进程，进而把活锁判成可接管。这里只接受
    *  「number + safe integer + > 0」的 pid/startedAt 与「非空字符串」的 token；
-   *  任何一项不满足 ⇒ null（调用方按内容不可判定 fail-closed）。 */
+   *  任何一项不满足 ⇒ null（调用方按内容不可判定 fail-closed）。
+   *  A4（C-027）：pid 还必须 ≤ RUN_LOCK_PID_MAX——超上限的 pid 不可能是真实进程，属**帧非法**
+   *  （不可判定），绝不能当成「持有者已死」去接管（那是 fail-open）。 */
   const parseRunLockFrame = (raw) => {
     let frame = null
     try { frame = JSON.parse(raw) } catch (e) { return null }
     if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return null
     const { pid, startedAt, token } = frame
     if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null
+    if (pid > runLockPidBound()) return null
     if (typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt) || startedAt <= 0) return null
     if (typeof token !== 'string' || token.trim() === '') return null
     // startTicks 只认十进制数字串；形态不对 = 没有证据（不是「复用证据」），死活在下面另判。
@@ -351,7 +411,11 @@ function createApp ({
    *    { state: 'missing' }                              锁刚消失（调用方重试独占创建）
    *    { state: 'stale', holder, token, startTicks }      持有进程已死 / PID 已复用 ⇒ 可接管
    *    { state: 'busy', holder, token, startTicks }       持有进程仍活着 ⇒ **即使锁很旧也不抢**
-   *    { state: 'busy', holder: null, corrupted: true }  内容不可判定 ⇒ fail-closed（不静默接管）
+   *    { state: 'busy', holder: null, corrupted: true, reason }  内容不可判定 ⇒ 调用方必须**响亮失败**
+   *  A1（C-009）：`reason` 是「不可判定」的**唯一归因来源**（`not_regular_file` / `too_large` /
+   *  `frame_invalid` / `unreadable_open` / `unreadable_read`），错误消息与 `error.lockIssue` 都取自它。
+   *  这条契约的关键变化：不可判定**不再等于 busy**——旧实现把它折叠成「另一轮在跑」，入口 exit 0，
+   *  常驻当正常轮 ⇒ 永久静默零推送。判定谁该抛是调用方的事（`_acquireRunLock`）。
    *  `startTicks` 只是把「帧里那条独立时钟证据」一并交回调用方（R1-r5 #1 用它判定「哨兵是不是
    *  本进程自己的残留」）；死活判定仍只在上面的 kill/时钟比较里做，token 内容依旧不参与。
    *  EACCES/EISDIR/EIO 等**读取错误不折叠成 busy**：那是真实文件系统故障，如实抛出（fail-loud）。 */
@@ -363,25 +427,49 @@ function createApp ({
       if (!e) throw e
       if (e.code === 'ENOENT') return { state: 'missing' }
       // FIFO 没有写者时（某些平台/flag 组合）open 直接 ENXIO/EAGAIN：等不到内容 ⇒ 不可判定。
-      if (RUN_LOCK_UNREADABLE_CODES.includes(e.code)) return { state: 'busy', holder: null, corrupted: true }
+      if (RUN_LOCK_UNREADABLE_CODES.includes(e.code)) {
+        return { state: 'busy', holder: null, corrupted: true, reason: 'unreadable_open' }
+      }
+      // O_NOFOLLOW 撞上符号链接（锁路径被人换成了链接）：ELOOP 同样「不是普通文件、读不出归属」，
+      // 必须按不可判定收口并把 lockPath 带进错误——裸 ELOOP 只会让入口看到一句 errno，没有处置路径。
+      if (e.code === 'ELOOP') {
+        return { state: 'busy', holder: null, corrupted: true, reason: 'not_regular_file' }
+      }
       throw e
     }
     try {
       const st = nodeFs.fstatSync(fd)
-      // 锁必须是普通文件：目录/FIFO/设备一律是「不可判定」，按损坏锁 fail-closed。
-      if (!st || typeof st.isFile !== 'function' || !st.isFile() || st.size > RUN_LOCK_MAX_BYTES) {
-        return { state: 'busy', holder: null, corrupted: true }
+      // 锁必须是普通文件：目录/FIFO/设备一律是「不可判定」，按损坏锁收口。
+      if (!st || typeof st.isFile !== 'function' || !st.isFile()) {
+        return { state: 'busy', holder: null, corrupted: true, reason: 'not_regular_file' }
+      }
+      // 超限同样不可判定：正常帧约 100 字节，4 KiB 以上的内容不可能是本模块写的那一帧
+      // （锁路径被换成日志/镜像/别的程序误写），也不该整读进内存。
+      if (st.size > RUN_LOCK_MAX_BYTES) {
+        return { state: 'busy', holder: null, corrupted: true, reason: 'too_large' }
       }
       let raw
+      let frame = null
       try {
-        raw = nodeFs.readFileSync(fd, 'utf8')
+        raw = readLockContent(fd)
+        frame = parseRunLockFrame(raw)
+        // 创建窗口（评审 MF-1）：link 不支持的回退分支是「open('wx') 占名 → 再写帧」，两步之间并发
+        // 读者会看到 0 字节锁。A1 之前那被折叠成 busy（无害）；现在会被判成永久失败并劝人删锁——
+        // 那是在删一把**正在被创建**的活锁。故只在「读到 0 字节」时做有界重试（3×15ms）：写侧总在
+        // 几毫秒内写完，而真损坏的锁（一直为空/半帧）重试完仍按不可判定收口，不改变 A1 的响亮失败。
+        for (let i = 0; !frame && raw === '' && i < RUN_LOCK_EMPTY_RETRY; i++) {
+          sleepSync(RUN_LOCK_EMPTY_RETRY_MS)
+          raw = readLockContent(fd)
+          frame = parseRunLockFrame(raw)
+        }
       } catch (e) {
-        if (e && RUN_LOCK_UNREADABLE_CODES.includes(e.code)) return { state: 'busy', holder: null, corrupted: true }
+        if (e && RUN_LOCK_UNREADABLE_CODES.includes(e.code)) {
+          return { state: 'busy', holder: null, corrupted: true, reason: 'unreadable_read' }
+        }
         throw e
       }
-      const frame = parseRunLockFrame(raw)
-      // 无合法 pid/startedAt/token 就无从判断持有者 ⇒ fail-closed（R1 设计约束 3）。
-      if (!frame) return { state: 'busy', holder: null, corrupted: true }
+      // 无合法 pid/startedAt/token 就无从判断持有者 ⇒ 不可判定（R1 设计约束 3 + A4 的 pid 上限）。
+      if (!frame) return { state: 'busy', holder: null, corrupted: true, reason: 'frame_invalid' }
       const holder = { pid: frame.pid, startedAt: frame.startedAt }
       let alive
       try {
@@ -391,6 +479,13 @@ function createApp ({
         alive = Boolean(e) && e.code === 'EPERM' // EPERM = 进程存在但无权限；ESRCH = 已退出
       }
       if (!alive) return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
+      // A4（C-027）行为 1：僵尸持有者必须按已退出处理。`kill(pid, 0)` 对僵尸返回成功，而僵尸
+      // 已经跑不完任何一轮——判活就是永久 busy（零推送且看起来正常）。只认 /proc 的 'Z'；
+      // 读不到状态（非 Linux）时**没有证据**，保持原口径（按存活处理）。
+      if (runLockProcessState(frame.pid) === 'Z') {
+        console.warn(`⚠️ run 锁持有进程是僵尸（pid=${frame.pid}），按已退出处理（随后尝试接管）：${filePath}`)
+        return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
+      }
       // 活着就结束判定：**不按 startedAt/mtime 判陈旧**——长时间运行是正常的，抢锁就是双跑。
       // 只有「pid 还活着但启动时钟对不上」（PID 被复用）才算死主。时钟只认帧里独立的 startTicks；
       // '0'/缺失表示写入方读不到 starttime（非 Linux / 旧帧），那是**没有证据** ⇒ 按存活处理。
@@ -404,6 +499,41 @@ function createApp ({
     } finally {
       try { nodeFs.closeSync(fd) } catch (e) { /* fd 已失效 */ }
     }
+  }
+
+  /** A1（C-009）：「run 锁内容不可判定」的**唯一**错误构造点。
+   *  为什么必须抛而不是返回 busy：入口把 busy 当「另一轮在跑」⇒ 打印「已有运行在跑（pid=未知）」
+   *  并 **exit 0**，常驻把它当正常轮 ⇒ 永久静默零推送（既不推也不报错，还不自愈）。这条路只能靠
+   *  人工介入删锁，所以必须带上 failureKind=permanent（常驻据此停机而不是指数退避重试）与
+   *  明确的处置指令（删哪个文件）。
+   *  `console.warn('⚠️ ' + message)` 在抛出前无条件打一条：即使调用方只把错误写进日志/吞掉异常，
+   *  运维也能在 stdout 上看到告警（`lockUnreadable` / `lockPath` / `lockIssue` 供程序化判定）。 */
+  const runLockUnreadableError = (lockPath, reason) => {
+    const e = new Error(`run 锁内容不可判定（${reason}）：无法确认是否有另一轮在跑；这不是「另一轮在跑」。请检查并删除 ${lockPath}（不修好会持续零推送）`)
+    e.failureKind = 'permanent'
+    e.failureReason = 'RUN_LOCK_UNREADABLE'
+    e.lockUnreadable = true
+    e.lockPath = lockPath
+    e.lockIssue = reason
+    console.warn('⚠️ ' + e.message)
+    return e
+  }
+
+  /** A2（C-040）：接管哨兵（`run.lock.takeover`）内容不可判定。
+   *  与主锁分开一条 failureReason 是刻意的：处置动作完全不同——**删 run.lock 不解决问题**，
+   *  挡路的是哨兵本身（它带着一个不可判定的持有者身份，`_takeoverStaleRunLock` 既不能当活哨兵
+   *  尊重，也不能当死哨兵回收）。所以消息必须同时点名哨兵路径与「删 run.lock 无效」。 */
+  const runLockSentinelUnreadableError = (sentinelPath, reason) => {
+    const e = new Error(`run 锁接管哨兵内容不可判定（${reason}）：无法确认是否有另一轮正在接管这把陈旧锁；这不是「另一轮在跑」。删 run.lock 无效——挡路的是 run.lock.takeover（${sentinelPath}），请检查并删除它（不修好会持续零推送）`)
+    e.failureKind = 'permanent'
+    e.failureReason = 'RUN_LOCK_SENTINEL_UNREADABLE'
+    e.lockUnreadable = true
+    e.sentinelUnreadable = true
+    e.lockPath = sentinelPath
+    e.sentinelPath = sentinelPath
+    e.lockIssue = reason
+    console.warn('⚠️ ' + e.message)
+    return e
   }
 
   /** 按归属释放锁文件（pid + token 双匹配）：**只删内容仍属于自己的锁**，别人的锁一个字节都不碰
@@ -2034,6 +2164,9 @@ function createApp ({
     /** run 级单飞锁：获取。成功 `{ ok:true, token }`；有人正在跑 `{ ok:false, busy:true, holder }`；
      *  **真实文件系统错误（EACCES/EROFS/ENOSPC/ENOTDIR…）直接抛**——那是故障，不是 busy
      *  （R1 设计约束 7：不能把权限/磁盘问题伪装成「已有运行」静默跳过）。
+     *  **内容不可判定也抛**（A1/A2）：`failureKind='permanent'` + `failureReason` 为
+     *  `RUN_LOCK_UNREADABLE`（主锁）/ `RUN_LOCK_SENTINEL_UNREADABLE`（接管哨兵），并自带 `lockPath`
+     *  与处置指令——这类状态只能人工删文件，静默跳过就是永久零推送。
      *  `sentinelReleaseFailed: true` = 接管时哨兵没删掉（R1-r5 #1）：主锁仍归本轮，但
      *  `run.lock.takeover` 以本进程 pid 留在盘上，事实必须交给入口（见 _takeoverStaleRunLock）。 */
     _acquireRunLock () {
@@ -2057,9 +2190,17 @@ function createApp ({
         const judged = readRunLockState(lockPath)
         // 锁在两次尝试之间被释放：重试一次独占创建（不判陈旧、不接管）。
         if (judged.state === 'missing') continue
-        // 持有者活着或锁内容不可判定：两种都是 busy（后者 fail-closed）。**不按时间抢**。
+        // A1（C-009）：**内容不可判定 ≠ 有人正在跑**。旧实现把两者都折叠成 busy ⇒ 入口打印
+        // 「已有运行在跑（pid=未知）」并 exit 0，常驻把它当正常轮 ⇒ 永久静默零推送。这里必须响亮
+        // 失败（permanent + RUN_LOCK_UNREADABLE），把「删哪个文件」直接写进错误消息。真正的 busy 不变。
+        if (judged.corrupted) throw runLockUnreadableError(lockPath, judged.reason || 'frame_invalid')
+        // 持有者活着：busy。**不按时间抢**。
         if (judged.state !== 'stale') return { ok: false, busy: true, holder: judged.holder || null }
         const taken = this._takeoverStaleRunLock(lockPath, frame, token)
+        // A2（C-040）：接管哨兵内容不可判定同样响亮失败——它不是「另一轮在跑」，删 run.lock 也不解决。
+        if (taken.sentinelUnreadable) {
+          throw runLockSentinelUnreadableError(taken.sentinelPath || (lockPath + RUN_LOCK_TAKEOVER_SUFFIX), taken.reason)
+        }
         // 哨兵释放失败必须一路带到入口（R1-r5 #1）：吞在这里等于「主锁拿到了，但下一次接管永远 busy」。
         const sentinelFailed = taken.sentinelReleaseFailed === true
         if (taken.ok) {
@@ -2111,11 +2252,24 @@ function createApp ({
           const judged = readRunLockState(sentinelPath)
           if (judged.state === 'missing') continue
           if (judged.state !== 'stale') {
+            // A2（C-040）：哨兵内容不可判定 ⇒ 既不能当「活着的接管者」尊重（它可能早就死了），
+            // 也不能当「死哨兵」回收（回收要 rename 成唯一名再复核，前提是能判定归属）。
+            // 旧实现折叠成 busy ⇒ 入口 exit 0、该目录永久零推送，而运维按提示删 run.lock 毫无作用：
+            // 挡路的是 run.lock.takeover。这里把事实带回 _acquireRunLock，由它抛永久失败。
+            if (judged.corrupted) {
+              return { ok: false, sentinelUnreadable: true, sentinelPath, reason: judged.reason || 'frame_invalid' }
+            }
             // 哨兵若是本进程自己的残留（上一轮释放哨兵失败），按归属回收后重试；否则 busy。
             if (this._isOwnSentinelLeftover(judged)) {
               const own = releaseOwnedLockFile(sentinelPath, judged.token)
               if (own.state === 'failed') {
-                throw own.error || new Error('接管哨兵残留回收失败：无法删除本进程遗留的 run.lock.takeover（文件系统错误）')
+                const err = own.error || new Error('接管哨兵残留回收失败：无法删除本进程遗留的 run.lock.takeover（文件系统错误）')
+                // A3（C-057）：与 finally 里的口径一致——这个错误必须带 sentinelReleaseFailed，
+                // 让常驻入口按 permanent 停机（qinglong/xbk_push.js 的既有分支），而不是退避重试。
+                // 旧实现抛的是裸错误：常驻按可重试处理，而哨兵带着本进程活 pid 永远挡路 ⇒ 永久 skipped。
+                try { err.sentinelReleaseFailed = true } catch (e) { /* 不可写（冻结/代理错误对象）：至少已告警 */ }
+                console.warn(`⚠️ 接管哨兵残留回收失败（${sentinelPath}）：删不掉本进程遗留的 run.lock.takeover，该目录后续接管会一直被它挡住；删 run.lock 无效（挡路的是哨兵）`)
+                throw err
               }
               if (own.state !== 'foreign') continue // released / missing：重试独占创建
             }
@@ -2147,6 +2301,9 @@ function createApp ({
         let bodyError = null
         try {
           const again = readRunLockState(lockPath)
+          // A1 同口径：复判到「内容不可判定」同样是**永久失败**——折叠成 busy 就又回到
+          // 「入口 exit 0、常驻当正常轮、永久零推送」。哨兵会在下面的 finally 里按归属释放。
+          if (again.corrupted) throw runLockUnreadableError(lockPath, again.reason || 'frame_invalid')
           // 复判：锁已换主/持有者复活 ⇒ 不接管（这一条是「只判断一次」与双跑之间的唯一屏障）。
           if (again.state === 'busy') {
             outcome = { ok: false, busy: true, holder: again.holder || null }
@@ -2212,6 +2369,8 @@ function createApp ({
     async run () {
       // R1：**先拿锁再碰任何** run.log / filter.hash / 缓存 / 网络。busy 不是失败：返回
       // skipped 摘要（入口据此打一行提示、退出码 0），并且本轮不写任何缓存/日志/状态。
+      // A1/A2：只有**真正的 busy（持有者活着）**会走到下面的 skipped 分支——锁内容不可判定在
+      // _acquireRunLock 里就抛 permanent 错误了（绝不能再被折叠成「另一轮在跑」）。
       const lock = this._acquireRunLock()
       if (!lock.ok) {
         const busy = {
@@ -3451,4 +3610,4 @@ function createApp ({
   return App
 }
 
-module.exports = { createApp, SIMILAR_WINDOW_MAX_BYTES, formatRunBusyLine }
+module.exports = { createApp, SIMILAR_WINDOW_MAX_BYTES, formatRunBusyLine, runLockPidLimit }

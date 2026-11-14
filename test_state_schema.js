@@ -471,6 +471,34 @@ check('共享模块导出齐全（缺一个就会让某个调用方退回本地�
   assert.strictEqual(Object.isFrozen(S.REPORT_COUNTERS), true, '名单必须冻结（防止调用方原地改写）')
 })
 
+// ===== B2（S-018 / S-031）：run.log 摘要行**单源**的正反双向断言 =====
+// 只做正向（源码里有 formatRunSummaryLine）挡不住真回归：旁边再长出一份内联模板时，正向照样绿，
+// 而写侧两份格式串一旦漂移，读侧（RUN_SUMMARY_LINE_RE / parseRunSummaryLine）就解析不到新字段——
+// 表现是「控制台趋势少一天/少一轮」，没有任何报错。故负断言与正断言必须成对存在。
+check('源码形状：run.log 摘要行只能由 formatRunSummaryLine({…}) 生成（内联模板回潮必须变红）', () => {
+  // 路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容（同上方源码形状用例口径）。
+  const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8') // nosemgrep（形状断言必须读源码文本；路径为字面量，非外部输入）
+  const skip = sourceShapeGuard(appSrc, 'run.log 摘要行单源')
+  if (skip) return skip
+  assert.ok(appSrc.includes('formatRunSummaryLine({'),
+    'xbk_app.js 必须调用共享的 formatRunSummaryLine({…}) 生成摘要行（换回内联模板即变红：写/读会出现两份格式串）')
+  // 旧内联模板的**唯一字面量锚点**：同一个模板串里同时出现 `total=${` 与 `dedup=${`。
+  // 已 grep 确认该形态在 xbk_app.js 里为 0 处（`dedup=${` 单独出现在一条 checkpoint 诊断行，不含 total=，
+  // 故不会被误伤），合法出现点只有 xbk_state_schema.formatRunSummaryLine。
+  const INLINE_SUMMARY = /`[^`\n]*total=\$\{[^`\n]*dedup=\$\{/
+  // 样本必须**逐字**等于旧模板：`${` 在这里是字面量而非插值。
+  // eslint-disable-next-line no-template-curly-in-string -- 负断言的前置样本就是旧内联模板的字面量文本
+  const oldInlineSample = '`${stamp} total=${counters.total} dedup=${counters.dedup} filtered=${counters.filtered}`'
+  assert.ok(INLINE_SUMMARY.test(oldInlineSample),
+    '前置：负断言锚点必须能抓住旧内联模板（否则负断言恒真、等于没有）')
+  assert.strictEqual(INLINE_SUMMARY.test(appSrc), false,
+    'xbk_app.js 不得再内联 run.log 摘要模板（换回内联模板必须变红：写侧两份格式串会让读侧静默解析不到）')
+  // 反向对照：共享模块自己当然必须保留那个模板（防止有人为了过上面两条把格式化整段删掉）。
+  const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep（同上：字面量路径 + 形状断言）
+  assert.ok(INLINE_SUMMARY.test(schemaSrc),
+    'xbk_state_schema.formatRunSummaryLine 必须仍保有摘要模板（删掉它等于让 run.log 摘要消失）')
+})
+
 console.log(`\n=== 结果：${passed} 通过 / ${failed} 失败 ===`)
 if (failed > 0) {
   for (const f of failures) console.log(`  ❌ ${f}`)
