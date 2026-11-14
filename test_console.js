@@ -7642,7 +7642,7 @@ async function main () {
       assert.strictEqual(messagesCacheName(url), byStore, `控制台与生产文件名必须逐字相同（${label}）`)
       if (expected !== null) assert.strictEqual(byStore, expected, `生产口径产物变了（${label}）`)
     }
-    assert.ok(/^bad_\d+_/.test(prodStore.getFileName(123)), '数字 url 必须是可区分的 bad_ 前缀名（两处各写一份时这里会退化成 default.json）')
+    assert.ok(/^bad_\d+_/.test(prodStore.getFileName(123)), '数字 url 必须是可区分的 bad_ 前缀名（旧实现各写一份时对非字符串入参直接返回 push.json，丢掉 bad_ 前缀的可区分性）')
     // 结构断言（M1 验收 grep 的自动化版本）：两处都不得再保留「自己拆 pushUrl 末段」的实现。
     const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8'))
     const statusSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8'))
@@ -7655,9 +7655,12 @@ async function main () {
     // 生产调用形态（不传参）：控制台读运行配置里的 pushUrl，结论必须与运行侧取该 URL 完全一致。
     // 默认 getter 恒为 `<domain>/plus/json/push.json`，两边末段恒是 push.json ⇒ 直接拿它对比是
     // 恒真断言：无参分支退回自带派生、甚至写死 return 'push.json' 都照样绿。这里先把
-    // Config.api.pushUrl 临时覆盖成「旧实现与生产实现会分叉」的值——'https://x/path/' 旧实现
-    // 无视入参按 Config 自行拆末段得 'push.json'，生产口径 fileNameForUrl 得 'default.json'——
-    // 这样无参分支一退化，下面的断言必红。
+    // Config.api.pushUrl 临时覆盖成四种实现两两分叉的值 'https://x/.hidden'：
+    //   · 生产 fileNameForUrl（末段以点开头 → 前缀 url_ 再补 .json）→ 'url_.hidden.json'（期望值）
+    //   · 旧实现（c96846c:scripts/console.js:93-104，自己拆末段）→ '.hidden.json'
+    //   · 丢参 / 读到 undefined（fileNameForUrl 非字符串）→ 'default.json'
+    //   · 写死 → 'push.json'
+    // 这样无参分支一退化（退回旧派生 / 丢参 / 写死），下面的 anchor 必红。
     // pushUrl 是对象字面量 getter（configurable）：必须保存描述符原样还原，delete 会永久移除 getter。
     // 真实 getFileName 会把来源记录写进缓存目录 ⇒ 用临时目录顶掉 XBK_CACHE_DIR，跑完还原。
     const prevCacheDir = process.env.XBK_CACHE_DIR
@@ -7670,16 +7673,19 @@ async function main () {
       pushUrlDesc = Object.getOwnPropertyDescriptor(app.Config.api, 'pushUrl')
       assert.ok(pushUrlDesc && typeof pushUrlDesc.get === 'function' && pushUrlDesc.configurable !== false,
         'Config.api.pushUrl 必须是可配置 getter（否则无法在不污染进程的前提下降级/伪造）')
-      Object.defineProperty(app.Config.api, 'pushUrl', { value: 'https://x/path/', configurable: true, writable: true })
-      // 三方同源：无参分支实际读的是覆盖后的 Config 值，产物必须是生产口径的 default.json。
-      assert.strictEqual(messagesCacheName(), 'default.json',
-        'messagesCacheName() 必须按运行配置的 pushUrl 派生（尾部 / 的生产口径是 default.json）')
-      assert.strictEqual(messagesCacheName(), app.MessageStore.getFileName('https://x/path/'),
+      Object.defineProperty(app.Config.api, 'pushUrl', { value: 'https://x/.hidden', configurable: true, writable: true })
+      // 三方同源：无参分支实际读的是覆盖后的 Config 值，产物必须是生产口径的 url_.hidden.json。
+      assert.strictEqual(messagesCacheName(), 'url_.hidden.json',
+        'messagesCacheName() 必须按运行配置的 pushUrl 派生（前导点末段的生产口径是 url_.hidden.json）')
+      assert.strictEqual(messagesCacheName(), app.MessageStore.getFileName('https://x/.hidden'),
         'createConsole({ messagesFile: messagesCacheName() }) 必须等于运行侧 getFileName(Config.api.pushUrl)')
-      assert.strictEqual(messagesCacheName(), messagesFileName('https://x/path/'))
-      // 反向锚点：旧实现（无视入参、按 Config 自己拆末段）与退化实现（写死）对这个值都返回 push.json。
+      assert.strictEqual(messagesCacheName(), messagesFileName('https://x/.hidden'))
+      // 反向锚点：旧实现（无视入参、按 Config 自己拆末段）对这个值返回 '.hidden.json'；
+      // 丢参/undefined 返回 'default.json'；写死返回 'push.json'。三者都与期望值不同。
+      assert.notStrictEqual(messagesCacheName(), '.hidden.json',
+        '无参分支不得退回旧派生算法（旧实现对这个值返回 .hidden.json）')
       assert.notStrictEqual(messagesCacheName(), 'push.json',
-        '无参分支不得退回自带派生/写死 push.json（旧实现对这个值就返回 push.json）')
+        '无参分支不得写死 push.json')
     } finally {
       if (pushUrlDesc) Object.defineProperty(app.Config.api, 'pushUrl', pushUrlDesc)
       if (prevCacheDir === undefined) delete process.env.XBK_CACHE_DIR
