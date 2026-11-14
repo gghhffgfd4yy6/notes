@@ -1334,7 +1334,7 @@ check('生产默认分段完整时允许生成日报', () => {
     'sendnotify-part1', 'sendnotify-part2',
     'failure-policy', 'storage', 'agents', 'http', 'loop', 'qinglong-push', 'check-deps', 'status',
     'console-part1', 'console-part2', 'console-part3', 'console-part4', 'console-part5', 'console-part6', 'console-part7', 'console-part8', 'console-part9', 'console-part10', 'console-part11', 'console-part12', 'console-part13',
-    'filter-store'
+    'filter-store', 'state-schema'
   ].map(seg => ({ seg }))
   assert.deepStrictEqual(validateSegments(results), results)
 })

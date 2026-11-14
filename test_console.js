@@ -481,7 +481,7 @@ let skipped = 0
 // 这与功能无关（同一次 dry run 里行为用例全绿），跳过后单独计入 skipped，不冒充通过。
 const INSTRUMENTED_SOURCES = (() => {
   const hit = new Set()
-  for (const rel of ['scripts/console.js', 'scripts/status.js']) {
+  for (const rel of ['scripts/console.js', 'scripts/status.js', 'xbk_state_schema.js']) {
     try {
       if (fs.readFileSync(require('node:path').join(__dirname, rel), 'utf8').includes('stryMutAct_')) hit.add(rel)
     } catch (e) { /* 文件缺失按未插桩处理，交给原断言响亮报错 */ }
@@ -3542,10 +3542,15 @@ async function reworkRegressionTests () {
   })
 
   await aok('结构红线: 摘要正则只有一份（C10-057）', () => {
-    if (skipIfInstrumented('C10-057', 'scripts/status.js')) return
+    if (skipIfInstrumented('C10-057', 'scripts/status.js') || skipIfInstrumented('C10-057', 'xbk_state_schema.js')) return
+    // S2：正则定义搬进 xbk_state_schema.js（生产写入的 formatRunSummaryLine 与这里的解析同一份），
+    // status.js 里一个都不许留 —— 两处各写一份正是 C10-057 当初要治的漂移。
+    const schemaCode = codeOf(fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8'))
     const code = codeOf(fs.readFileSync(path.join(__dirname, 'scripts', 'status.js'), 'utf8'))
-    assert.strictEqual((code.match(/total=\(\\d\+\) dedup=/g) || []).length, 1,
-      '摘要行正则只能有一处定义（parseLastRun 再内联一份就是回退了修复：两份的分组形态还会各自漂）')
+    assert.strictEqual((schemaCode.match(/total=\(\\d\+\) dedup=/g) || []).length, 1,
+      '摘要行正则只能有一处定义（xbk_state_schema 是唯一真源）')
+    assert.strictEqual((code.match(/total=\(\\d\+\) dedup=/g) || []).length, 0,
+      'status.js 不得再内联摘要正则（解析统一走 parseRunSummaryLine）')
     const { RUN_SUMMARY_LINE_RE } = require('./scripts/status')
     const m = RUN_SUMMARY_LINE_RE.exec('2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1.0s')
     assert.ok(m, '摘要行必须能被这一份正则命中')

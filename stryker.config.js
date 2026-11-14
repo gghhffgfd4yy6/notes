@@ -45,6 +45,9 @@ module.exports = {
     'xbk_filter_store.js',
     'xbk_loop.js',
     'xbk_failure_policy.js',
+    // S2：状态 schema 与派生口径的单一真源（report.state / channel-health.state / run.log 摘要行）。
+    // 被 xbk_app.js 与 scripts/status.js 双向 require ⇒ 运行链上，必须列入 mutate 目标。
+    'xbk_state_schema.js',
     'qinglong/xbk_push.js',
     'scripts/check-deps.js',
     // scripts/status.js 是运行时生产模块：被 qinglong/xbk_push.js 顶层无条件 require
