@@ -1818,9 +1818,14 @@ function createApp ({
             // S2：整表校验口径与 --status 同源（xbk_state_schema.validateChannelHealth：空表 ok /
             // 至少一条合格 ok / 有记录但全坏 invalid）。旧实现只判顶层类型，一张全是坏记录的表会被
             // 当成可用状态继续叠加，而 --status 同一时刻把它显示成「不可读（invalid）」——同一份文件
-            // 两处结论相反。全坏表按空表重建（不跳过写入 ⇒ 下一轮自愈；坏记录本就被读侧逐条忽略，
-            // 不丢任何可用信息）。
-            if (!validateChannelHealth(state)) state = {}
+            // 两处结论相反。全坏表按**读失败**处理：与紧邻的「JSON 损坏」分支同方向 fail-closed——
+            // 留一行 error、跳过本轮、原文件逐字节保留。不得改成「按空表重建后覆盖写盘」：整表丢弃会
+            // 连其它通道的记录与 recoverAlertPending/recoverAlertClaim 一起抹掉（恢复告警认领字段须
+            // 原样保留），也与 SYSTEM_CONTRACT「读失败时写侧 fail-closed，不得以空状态覆盖」相抵。
+            if (!validateChannelHealth(state)) {
+              console.error(`通道健康状态校验失败（有记录但均不合格），跳过本轮健康更新以保留原文件 ${statePath}`)
+              return
+            }
           } catch (e) {
             console.error(`通道健康状态损坏，跳过本轮健康更新以保留原文件 ${statePath}`)
             return

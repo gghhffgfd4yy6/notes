@@ -2853,6 +2853,59 @@ checkAsync('健康更新: 状态文件损坏时跳过本轮以保留原文件', 
   assert.strictEqual(mfs.readFileSync(healthPath), 'not-json{{', '损坏状态必须原样保留（不得覆盖）')
 })
 
+// S2 唯一的行为收紧：整表「有记录但无一合格」= 读侧判 invalid 的同一份文件。生产侧必须与
+// 紧邻的「JSON 损坏」分支同方向 fail-closed——跳过本轮、原文件逐字节保留；**不得**按空表重建
+// 后覆盖写盘（整表丢弃会抹掉其它通道的记录与 recoverAlertPending/recoverAlertClaim，且与
+// SYSTEM_CONTRACT「读失败时写侧 fail-closed，不得以空状态覆盖」相抵）。
+// 回退即红：把生产侧改回 `if (!validateChannelHealth(state)) state = {}`，本用例第一条断言必红。
+checkAsync('健康更新: 全坏表按读失败 fail-closed——跳过本轮、原文件逐字节保留（不重建、不丢恢复认领）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, threshold: 1 })
+  // 全坏：唯一记录的 consecutiveFailures 是字符串 ⇒ 该条不合格 ⇒ 整表 invalid；
+  // 但它同时带着待发送的恢复认领字段，重建路径会把它们一起抹掉。
+  const corrupt = JSON.stringify({
+    pushdeer: { consecutiveFailures: '2', lastFailureAt: 1, lastAlertAt: 5, lastRecoveredAt: 7, recoverAlertPending: true, recoverAlertClaim: 'tok-1' }
+  })
+  mfs.writeFileSync(healthPath, corrupt)
+  const before = mfs.readFileSync(healthPath)
+  const origError = console.error
+  const errs = []
+  console.error = (...a) => errs.push(a.map(String).join(' '))
+  try {
+    await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  } finally {
+    console.error = origError
+  }
+  assert.strictEqual(mfs.readFileSync(healthPath), before,
+    '全坏表必须原样保留（不得以空表重建后覆盖；恢复告警认领字段不得被丢弃）')
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '跳过路径必须释放锁（finally 语义）')
+  assert.ok(errs.some(s => s.includes('跳过本轮健康更新')), `必须留一行 error 告警（不得静默跳过），实际：${JSON.stringify(errs)}`)
+  // 反向对照：同一份坏记录改成「一条合格记录」后同配置必须照常写入（证明上面的不变来自整表判据，
+  // 而不是用例把写入路径整个卡死了）。
+  const mfs2 = makeMemFs()
+  const app2 = makeHealthApp2({ fs: mfs2, threshold: 1 })
+  mfs2.writeFileSync(healthPath, JSON.stringify({ ok: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 } }))
+  await app2._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  const after2 = JSON.parse(mfs2.readFileSync(healthPath))
+  assert.strictEqual(after2.pushdeer && after2.pushdeer.consecutiveFailures, 1, '合格表必须照常更新（fail-closed 只针对全坏表）')
+})
+
+// 边界：一条好一条坏 = 整表可读（validateChannelHealth 的逐条容错），生产侧必须继续写入并原样
+// 保留未被本轮触及的坏记录——防止把「全坏才跳过」误收紧成「有任何坏记录就整轮跳过」。
+checkAsync('健康更新: 一条好一条坏仍按可用表继续写入（全坏 fail-closed 不得误伤混合表）', async () => {
+  const mfs = makeMemFs()
+  const app = makeHealthApp2({ fs: mfs, threshold: 3 })
+  mfs.writeFileSync(healthPath, JSON.stringify({
+    good: { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 },
+    bad: { consecutiveFailures: 'x' }
+  }))
+  await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 1, '混合表必须照常累计（不得整轮跳过）')
+  assert.deepStrictEqual(state.good, { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0 }, '合格记录必须原样保留')
+  assert.deepStrictEqual(state.bad, { consecutiveFailures: 'x' }, '未被本轮触及的坏记录按逐条容错原样保留（读侧逐条过滤）')
+})
+
 checkAsync('健康更新: 锁被他人持有时跳过本轮且不动状态文件', async () => {
   const mfs = makeMemFs()
   const app = makeHealthApp2({ fs: mfs, alive: () => true })
