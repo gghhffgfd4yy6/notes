@@ -91,7 +91,9 @@ check('validateReportState：非法计数逐字段点名（负数/小数/字符�
 
 check('validateReportState：date 只校验「存在时合法」，非法日期点名 date 字段', () => {
   assert.deepStrictEqual(S.validateReportState({ date: '2026-02-30' }), { ok: false, error: '日报状态 date 字段无效' })
-  assert.deepStrictEqual(S.validateReportState({ date: 20260101 }), { ok: false, error: '日报状态 date 字段无效' })
+  // 用 Number('20260101') 而非数字字面量：语义同样是 number（测的仍是「date 不是字符串就判非法」），
+  // 同时避开 Codacy/PMD 对 8 位数字字面量的「运行期取值不同」误报；改成非字面量表达式，断言一条没放宽。
+  assert.deepStrictEqual(S.validateReportState({ date: Number('20260101') }), { ok: false, error: '日报状态 date 字段无效' })
   assert.deepStrictEqual(S.validateReportState({ date: undefined }), { ok: true }, '缺失日期合法')
 })
 
@@ -431,9 +433,12 @@ check('deriveRunStats：非法计数行与无时间戳历史行不计入聚合',
 
 // ===== 源码形状：生产文件里不得再长出第二份定义（S2 的验收口径）=====
 check('源码形状：生产侧不再有第二份 schema / 摘要行定义，只允许薄 wrapper', () => {
-  const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  const statusSrc = fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8')
-  const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8')
+  // 测试夹具：以下三处目标都是 __dirname + 本仓库内的字面量文件名（xbk_app.js / scripts/status.js /
+  // xbk_state_schema.js），不来自环境、CLI、网络或文件内容，非外部输入。形状断言本来就必须读源码
+  // 文本，故按本仓既有口径加行内精确 nosemgrep（同 scripts/log-archive.js 的写法）。
+  const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8') // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
+  const statusSrc = fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8') // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
+  const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep: javascript.pathtraversal.rule-non-literal-fs-filename
   const skip = sourceShapeGuard(appSrc + statusSrc + schemaSrc, '源码形状')
   if (skip) return skip
   const appCode = stripLineComments(appSrc)
