@@ -1472,3 +1472,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **依赖是显式传进去的**：路由表拿到的 `ctx` 逐项列出 handler 需要的东西（HTTP 出口、目录、常量、动作函数、2FA/自动运行/SSE 的 helper）；关停闸、控制台设置、2FA 回执这些会变的状态一律走访问器，handler 不会读到启动瞬间的旧值。
 - **测试**：新增 `test_console_routes.js`（13 例）——路由清单与拆分前的 endpoint 一一对应且顺序一致（不是比对源码文本）、重复/冲突/坏条目必须抛错、`matchRoute` 的匹配语义（方法先比、精确路径、正则、先命中先返回、未命中 null），以及真实 HTTP 行为：`GET /api/status` 200、`POST /trigger?token=` 与 `POST /api/auto?token=` 必须 400 `query_token_not_allowed`（写面只认 Bearer）、`GET /api/runs/:id` 与坏 id 形态的两种 404、未知路径/方法不匹配仍是 `{"error":"not found"}`、无凭证仍 401。
 - **兼容**：所有端点的路径、方法、状态码、响应体、Cookie/CSRF/2FA 逻辑、`?token=` 的现有行为、访问日志口径、SSE 连接闸全部不变；这一轮只搬实现与增加启动期自检。`scripts/console.js` 净减 910 行（7578 → 6668），变异矩阵的 `console-part11..13` 行段已按新行数重排（`5835-6110` / `6111-6390` / `6391-6668`），`check-mutation-ranges` 通过。
+
+## v3.431
+
+- **本轮没有任何行为变化**：只是把上一版拆分后新出现的 8 条静态扫描告警（Codacy）逐条处置掉——接口、状态码、响应体、日志读取口径、锁与哨兵判定、磁盘格式、测试断言一律不动。
+- **6 条「动态构造文件/路径」告警的处理方式是加「已知安全」的行内抑制注释，不是改代码**：`scripts/console-handlers/` 的 `logs.js`（列当前日志文件、按名分页读日志）、`runs.js`（停止任务时补写一行 CANCEL 留痕）、`system.js`（读运行锁、取锁文件时间、查残留 `.takeover` 哨兵）三处的路径，全部由「运行侧缓存目录（`historyDir()` / `stateDir` 这类启动期常量）+ 仓内写死的文件名」拼成，**没有任何一段来自 HTTP 请求**；其中「按名读日志」那条还有既有白名单护着（只认两个固定日志名与周档文件名正则，其它形态直接 400），白名单与断言都没有放宽。
+- **2 条测试夹具告警按既有办法整文件排除**：`test_console_routes.js` 里的 `if (token !== '')` 只是判「这次请求带不带 Authorization」的空串哨兵（token 由用例自己写死，不是秘密、也没有可泄露的时序旁路）；`new RegExp(RUN_DETAIL_PATH.source)` 的正则源是路由表模块里的字面量常量，而这条用例正是要证明「同一 pattern 的两种写法必须判为重复路由」。两处都写进 `.codacy.yml` 的排除清单并附逐条理由，真实断言照旧由全量测试执行。
+- **测试**：定向套件全绿——`test_console_routes` 13 通过 / 0 失败、`test_console` 375 通过 / 0 失败，与上一版基线逐条一致（本轮没删、没放宽任何断言）。

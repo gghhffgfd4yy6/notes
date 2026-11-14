@@ -26,8 +26,13 @@ function createSystemHandlers (ctx) {
         let lockAge = 0
         let lockBody = null
         let corrupted = false
+        // Codacy/Opengrep pathtraversal（本文件三处：下面的 readFileSync(lp)、statSync(lp)、
+        // statSync(lp + '.takeover')）：该规则只放行字符串字面量首参，而 lp 必然是变量——它是
+        // lockPath(stateDir)，stateDir 由启动方显式传入（默认项目根内的固定状态目录 / XBK_CACHE_DIR
+        // 解析结果），锁文件名与哨兵后缀都是本仓字面量，路径里没有任何请求派生片段（请求只决定
+        // 「读不读」，不参与拼路径）。故三行各加行内裸 `// nosemgrep`，口径同 xbk_storage.js:17。
         try {
-          lockBody = JSON.parse(fs.readFileSync(lp, 'utf8'))
+          lockBody = JSON.parse(fs.readFileSync(lp, 'utf8')) // nosemgrep（lp = lockPath(stateDir)：stateDir 为启动方传入的常量目录、锁文件名为本仓字面量，不来自请求）
           // "null"/标量帧（被外部写坏）同样按损坏处理：下面 lockBody.startedAt 会抛，
           // 不能让它冒到外层 catch 把 st.lock 留成 undefined。
           if (!lockBody || typeof lockBody !== 'object') throw new TypeError('lock frame is not an object')
@@ -43,7 +48,7 @@ function createSystemHandlers (ctx) {
         if (lockBody && lockBody.released !== true && !(Number.isSafeInteger(lockBody.startedAt) && lockBody.startedAt > 0)) corrupted = true
         if (corrupted) {
           let mtimeAge
-          try { mtimeAge = Math.max(0, Date.now() - fs.statSync(lp).mtimeMs) } catch (e2) { mtimeAge = PROC_TIMEOUT_MS }
+          try { mtimeAge = Math.max(0, Date.now() - fs.statSync(lp).mtimeMs) } catch (e2) { mtimeAge = PROC_TIMEOUT_MS } // nosemgrep（lp 同上：lockPath(stateDir) 常量派生，不来自请求；此处只取 mtime）
           const held = mtimeAge <= PROC_TIMEOUT_MS
           st.lock = {
             held,
@@ -68,7 +73,7 @@ function createSystemHandlers (ctx) {
         // 残留 .takeover 哨兵（上一次接管者崩溃的产物）：陈旧哨兵会阻塞接管，必须让运维
         // 一眼看到它是「残留」而不是「正在接管」（D2-S5）。
         try {
-          const sst = fs.statSync(lp + '.takeover')
+          const sst = fs.statSync(lp + '.takeover') // nosemgrep（lp 同上 + 本文件字面量哨兵后缀，路径非请求派生）
           const sAge = Math.max(0, Date.now() - sst.mtimeMs)
           st.lock.sentinel = { present: true, ageMs: sAge, stale: sAge > PROC_TIMEOUT_MS }
         } catch (e2) { /* 无哨兵 */ }

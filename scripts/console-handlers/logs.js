@@ -28,7 +28,10 @@ function createLogsHandlers (ctx) {
         const cur = []
         for (const name of ['run.log', 'filter-diagnostics.ndjson']) {
           let st = null
-          try { st = fs.statSync(path.join(dir, name)) } catch (e) {}
+          // Codacy/Opengrep 的 pathtraversal 规则只放行字符串字面量首参，故本行加行内裸
+          // `// nosemgrep`（本仓既有口径，见 xbk_storage.js:17）：name 取自本函数上方写死的
+          // 两个日志文件名，dir = historyDir()（运行侧缓存目录，非请求派生），二者都不来自请求。
+          try { st = fs.statSync(path.join(dir, name)) } catch (e) {} // nosemgrep（name 取自本函数上方写死的两个日志文件名，dir = historyDir() 常量派生，均不来自请求）
           if (st) cur.push({ file: name, key: 'current', size: st.size, mtimeMs: st.mtimeMs, kind: 'plain', current: true })
         }
         const files = cur.concat(LogArchive.listArchives(dir, 'run.log'), LogArchive.listArchives(dir, 'filter-diagnostics.ndjson'))
@@ -42,10 +45,12 @@ function createLogsHandlers (ctx) {
         if (!ok) { sendJson(res, 400, { status: 'bad_file', error: '未知日志文件' }); return }
         const page = Math.max(1, parseInt(pageRaw || '1', 10) || 1)
         const size = Math.min(500, Math.max(50, parseInt(url.searchParams.get('size') || '200', 10) || 200))
-        const abs = path.join(dir, file)
+        // 本行的 file 已由上方日志名白名单 + 周档正则拦住（非法值直接 400），白名单就是这条
+        // 路径的防护，断言不放松；dir = historyDir() 常量派生。故加行内裸 `// nosemgrep`。
+        const abs = path.join(dir, file) // nosemgrep（file 已由上方日志名白名单 + 周档正则校验，非法值走 400；dir = historyDir() 常量派生）
         let out = null
         let exists = false
-        try { exists = fs.existsSync(abs) } catch (e) {}
+        try { exists = fs.existsSync(abs) } catch (e) {} // nosemgrep（abs 即上一行的 path.join(dir, file)，同一份日志名白名单校验；dir = historyDir() 常量派生）
         try {
           out = file.endsWith('.gz') ? LogArchive.readGzPage(abs, page, size) : LogArchive.readPlainPage(abs, page, size)
         } catch (e) { out = null }

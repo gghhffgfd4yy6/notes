@@ -210,7 +210,9 @@ function createRunsHandlers (ctx) {
             const stampFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
             const stamp = stampFmt.format(new Date())
             const stopDir = historyDir()
-            fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} CANCEL 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8')
+            // Codacy/Opengrep pathtraversal：stopDir 是运行侧缓存目录（非请求派生），文件名是本行
+            // 字面量，路径里没有任何用户输入——按本仓既有口径加行内裸 `// nosemgrep`（同 xbk_storage.js）。
+            fs.appendFileSync(path.join(stopDir, 'run.log'), `${stamp} CANCEL 控制台停止：任务 #${record.id}（${record.action}）于运行中被停止（SIGTERM）\n`, 'utf8') // nosemgrep（stopDir = historyDir() 常量派生，文件名为本行字面量，不来自请求）
           } catch (e) { /* 留痕失败静默：内存 record.cancelled 已是权威 */ }
           try {
             record._child && record._child.kill('SIGTERM')
