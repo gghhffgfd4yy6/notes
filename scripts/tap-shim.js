@@ -117,38 +117,14 @@ process.stdout.write = function (chunk, encoding, callback) {
   return process.stderr.write(chunk, encoding, callback)
 }
 
-// 3) 诊断（仅 CI dry run）：把每个测试文件自己的输出另存一份。
+// 3) 诊断（仅 CI dry run）：把每个测试文件自己的输出另存一份（实现见 scripts/tap-shim-diag.js）。
 //    动机（2026-11-15 实测）：tap-runner 只吐「test_app_unit.js # exit code 1」，不转发子进程输出
 //    ⇒ 19 个 TAP 段在 dry run 阶段批量红，日志里看不到是哪条断言。注入 XBK_TAP_LOG_DIR 时启用；
 //    未注入（本地直跑）不落任何文件、不改变任何判定口径。
-if (process.env.XBK_TAP_LOG_DIR) {
-  const origErrWrite = process.stderr.write.bind(process.stderr)
-  let logTarget = null
+if (process.env.XBK_TAP_LOG_DIR && testFileName) {
   try {
-    const dir = process.env.XBK_TAP_LOG_DIR
-    fs.mkdirSync(dir, { recursive: true })
-    logTarget = path.join(dir, (testFileName || 'unknown').replace(/[^\w.-]/g, '_') + '.log')
-  } catch (err) {
-    logTarget = null // 落盘失败不升级为判据：诊断缺失不等于测试失败
-  }
-  if (logTarget) {
-    const origWriteSync = fs.writeSync
-    const tee = (data) => {
-      try {
-        fs.appendFileSync(logTarget, typeof data === 'string' ? data : Buffer.from(data))
-      } catch { /* 写诊断失败不影响转发 */ }
-    }
-    process.stderr.write = function (chunk, encoding, callback) {
-      tee(chunk)
-      return origErrWrite(chunk, encoding, callback)
-    }
-    // 本仓 harness 大量用 `fs.writeSync(1|2, …)` 直写 fd（不经 process.stdout.write），
-    // 只包 stream 会漏掉这些行——2026-11-15 实测：日志文件建出来了但一条 ❌ 都没有。
-    fs.writeSync = function (fd, data, ...rest) {
-      if (fd === 1 || fd === 2) tee(data)
-      return origWriteSync.call(fs, fd, data, ...rest)
-    }
-  }
+    require('./tap-shim-diag').installTee(process.env.XBK_TAP_LOG_DIR, testFileName)
+  } catch { /* 诊断装不上不影响测试判定 */ }
 }
 
 // 2) 跳过判定：与 run_unit_tests.js 的 UNIT_SUITES 过滤严格同源。
