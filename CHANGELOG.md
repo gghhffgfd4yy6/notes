@@ -1550,3 +1550,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **dry run 预检**：`prepare-re2` 末尾新增 `scripts/mutation-preflight.sh`（`--dryRunOnly`，分钟级）。矩阵开跑前先单独跑一遍初始测试运行；红了就停在这里，不再让 30+ 条腿齐红、也不浪费机时。放在既有 job 内而不是新建 job：不新增 `prepare-re2` 的消费者，保持不变式「mutation.yml 只有一行活动 `run: npx stryker run`」。
 - **失败可定位**：`scripts/tap-shim.js` 新增 `XBK_TAP_LOG_DIR`（注入才启用）逐文件落 stdout/stderr，含 `fs.writeSync(1|2, …)` 直写；预检/矩阵失败时打印逐文件 ❌ 行。此前只有「exit code 1」一行，无从定位是哪条断言。
 - **版本**：3.439.0 → **3.440.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.441
+
+- **console 段 dry run 误红的同类根因（v3.440 只修了第一处）**：`test_console.js` 的「M1 对拍」在断言末尾有两处**源码形状**检查（按锚点 `function messagesCacheName (` 切 `scripts/console.js`、`function messagesFileName (` 切 `scripts/status.js`），没走已有的插桩闸 `INSTRUMENTED_SOURCES`。console-part* 段把 `scripts/console.js` 插桩后锚点消失 ⇒ 13 个 console 段全部在 dry run 红。修法：结构断言部分按 `INSTRUMENTED_SOURCES`（console 或 status 任一被插桩即跳过，`skipped++` 如实记账），行为对拍断言照跑。
+- **预检可指向任意目标**：`mutation.yml` 的 `workflow_dispatch` 新增 `preflight_mutate` 输入（默认空 = `xbk_state_schema.js`），配合 `scripts/mutation-preflight.sh` 的 `XBK_PREFLIGHT_MUTATE`，可以先单独验证「某一段的 dry run」再决定是否跑整张矩阵（本次修 console 段就是这么验的）。
+- **版本**：3.440.0 → **3.441.0**。

@@ -37,6 +37,11 @@ on:
         required: false
         default: ''
         type: string
+      preflight_mutate:
+        description: '可选：dry run 预检的 mutate 目标（默认 xbk_state_schema.js）。只想验证某一段的 dry run 时传它的目标文件，例如 scripts/console.js'
+        required: false
+        default: ''
+        type: string
       killed_baseline_tolerance:
         description: '可选：killed 下降容忍值（非负整数，留空 = 0）；仅在给了 killed_baseline_run 时才有意义'
         required: false
@@ -160,6 +165,7 @@ jobs:
       - name: dry run 预检（TAP 档全量测试文件）
         run: bash scripts/mutation-preflight.sh
         env:
+          XBK_PREFLIGHT_MUTATE: ${{ inputs.preflight_mutate }}
           PERF_MS: 3000
           SKIP_SUITES: ''
           XBK_MUTATION_CHILD: '1'
