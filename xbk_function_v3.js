@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.457 — S0 工具层：收 r15 六处检测面缺口（assert.doesNotMatch / 容器字段解构 / matchAll / JSON.stringify 不是 sanitizer / helper 锚点形参 / v3.455 算式更正），基线 3135 → 3190 逐项归因重冻（只动测试面与 scripts/，生产逻辑一行未改） *******
+//* ******* 线报酷推送脚本 v3.458 — S0 静态分析面清零：scripts/probe-format-coupling.js 的 17 条 Codacy warning 按「只加注解 / 等价改写」逐条消掉（非字面量 fs 补裸 eslint-disable-next-line / 变量下标改 .at() / 两条 YAML 正则加注解 / 用法串去尖括号），探针判定语义与扰动面一字未改，白名单基线 3190 原地不动（只动 scripts/ 与文档，生产逻辑一行未改） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
