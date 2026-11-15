@@ -200,12 +200,12 @@ jobs:
         if: failure()
         run: |
           tail -n 60 stryker.log || true
+          echo "--- tap-logs 目录 ---"
+          ls -la "$RUNNER_TEMP/tap-logs" 2>&1 | head -n 12 || true
           for f in "$RUNNER_TEMP"/tap-logs/*.log; do
             [ -f "$f" ] || continue
-            bad=$(grep -acE '❌|AssertionError|Error:' "$f" || true)
-            [ "$bad" = "0" ] && continue
-            echo "=== $f（命中 $bad 行）==="
-            grep -aE '❌|AssertionError|Error:' "$f" | head -n 40
+            echo "=== $f（$(wc -l < "$f") 行）==="
+            grep -aE '❌|AssertionError|Error:|失败' "$f" | head -n 40 || true
           done
 
   mutation:
@@ -721,12 +721,11 @@ jobs:
         run: |
           tail -n 120 stryker.log || true
           echo '--- tap 逐文件诊断日志（XBK_TAP_LOG_DIR）---'
+          ls -la "$RUNNER_TEMP/tap-logs" 2>&1 | head -n 12 || true
           for f in "$RUNNER_TEMP"/tap-logs/*.log; do
             [ -f "$f" ] || continue
-            bad=$(grep -acE '❌|AssertionError|Error:' "$f" || true)
-            [ "$bad" = "0" ] && continue
-            echo "=== $f（命中 $bad 行）==="
-            grep -aE '❌|AssertionError|Error:' "$f" | head -n 20
+            echo "=== $f（$(wc -l < "$f") 行）==="
+            grep -aE '❌|AssertionError|Error:|失败' "$f" | head -n 20 || true
           done
           echo '--- test_console.js 诊断日志 ---'
           for f in "${TMPDIR:-/tmp}"/xbk-test-console-*/log; do
