@@ -1272,6 +1272,15 @@ function analyzeModule (code, file, options = {}) {
     }
     list.push(edge.expr)
   }
+  // 记忆化（性能，判据不变）：containerMark(expr, depth) 的返回值只取决于 (expr 解析出的 binding, depth)
+  // —— Identifier 分支里除了 `idBinding.get(expr)` 取 binding 之外不读 expr 自身，而 depth 严格递增
+  // （递归只走深度 + 1）⇒ 同一 (binding, depth) 最多被求值一次，记忆不改变任何一次调用的结果。
+  // 原实现无记忆：每个 Identifier 的每个定义点都把整棵子树重开一遍，深度上限 6 下最坏是「定义数^6」次
+  // 重复展开（CPU profile 里 containerMark 与其内联匿名函数占 91.9% 采样；真实仓库闸门 3.4s → 23.3s，
+  // 套件 500s 并连带 test_run_mutation_cli 的 evaluate 沙箱超时）。记忆后每个 binding 最多 7 个槽位 ⇒ 线性。
+  // containerFns 是唯一会生长的输入（下面的 round 循环里 add），故每次 add 换代作废，绝不拿旧结论。
+  let containerGen = 0
+  const containerMemo = new Map() // binding → { gen, at: [≤7] }；at[depth] = true/false，undefined = 未求值
   const containerMark = (expr, depth) => {
     if (!expr || depth > 6) return false
     if (expr.type === 'ObjectExpression') {
@@ -1279,8 +1288,17 @@ function analyzeModule (code, file, options = {}) {
     }
     if (expr.type === 'Identifier') {
       const binding = idBinding.get(expr)
-      const defs = binding && exprsOf.get(binding)
-      return !!(defs && defs.some((def) => containerMark(def, depth + 1)))
+      if (!binding) return false
+      let slot = containerMemo.get(binding)
+      if (!slot || slot.gen !== containerGen) {
+        slot = { gen: containerGen, at: [] }
+        containerMemo.set(binding, slot)
+      }
+      if (slot.at[depth] !== undefined) return slot.at[depth]
+      const defs = exprsOf.get(binding)
+      const marked = !!(defs && defs.some((def) => containerMark(def, depth + 1)))
+      slot.at[depth] = marked
+      return marked
     }
     if (expr.type === 'CallExpression') {
       const target = callTargets.get(expr)
@@ -1299,6 +1317,7 @@ function analyzeModule (code, file, options = {}) {
       if (!site.fn || containerFns.has(site.fn)) continue
       if (containerMark(site.expr, 0)) {
         containerFns.add(site.fn)
+        containerGen++ // 记忆里唯一会失效的输入：新增容器函数后，之前判「不是容器」的调用点可能翻真
         grew = true
       }
     }

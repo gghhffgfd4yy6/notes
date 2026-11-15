@@ -359,7 +359,10 @@ function scanTextAssets (code, { insertAt = '{};', protectParens = true } = {}) 
     if (c === '"' || c === "'") { quote = c; continue }
     if (protectParens && c === '(') { paren++; continue }
     if (protectParens && c === ')') { paren = Math.max(0, paren - 1); continue }
-    if (paren > 0 || (quote || inComment)) continue
+    // 到这里的 `quote` / `inComment` 恒为假：上面两条分支（inComment / quote）已经 continue 掉了。
+    // 旧写法 `if (paren > 0 || (quote || inComment)) continue` 里的后两项是死分支（CodeQL 报
+    // always-evaluates-to-false ×3），删掉后控制流不变，只留真正的括号保护。
+    if (paren > 0) continue
     if (insertAt.includes(c)) insertions.push(i)
   }
   if (quote || inComment) lineSet.add(line) // 未闭合（不该发生）：末行也按受保护处理，宁可少扰动
