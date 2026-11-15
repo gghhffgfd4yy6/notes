@@ -149,8 +149,67 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  mutation:
+  # dry run 预检（2026-11-15 新增）：矩阵开跑前先用**真实配置**跑一次「初始测试运行」。
+  # 为什么必须前置：dry run 里任何一个测试文件红，全部 TAP 段都会在 2–3 分钟里集体红，
+  # 而 tap-runner 只打印「<文件> # exit code 1」、不转发子进程输出 ⇒ 2026-11-15 那次 19 段齐红，
+  # 从日志里看不出是哪条断言（同一 commit 重跑仍是同一句）。预检把这件事单独跑一遍：
+  # 失败时打印逐文件 ❌ 行（tap-shim 的 XBK_TAP_LOG_DIR），矩阵不再启动，3 分钟内给出可定位的红。
+  preflight:
     needs: [decide-run, prepare-re2]
+    if: needs.decide-run.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts
+
+      - name: 下载 re2 原生模块
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: re2-node24-linux-x64
+          path: node_modules/re2/build/Release
+
+      - name: 验证 re2 原生模块
+        run: |
+          node -e "const RE2 = require('re2'); const re = new RE2('^ok$'); if (!re.test('ok')) process.exit(1); console.log('re2 native module loaded')"
+
+      # --dryRunOnly：只做初始测试运行、不产生任何变异体 ⇒ 分钟级。
+      # --mutate 只是给 stryker 一个合法目标：dry run 跑的是 tap.testFiles 的**全部**文件，
+      #   与矩阵里实际变异的文件无关；这里选纯函数、无 IO 的 xbk_state_schema.js。
+      - name: dry run 预检（TAP 档全量测试文件）
+        run: npx stryker run stryker.tap.config.js --mutate "xbk_state_schema.js" --dryRunOnly --concurrency 8 --fileLogLevel info
+        env:
+          PERF_MS: 3000
+          SKIP_SUITES: ''
+          XBK_MUTATION_CHILD: '1'
+          XBK_TAP_LOG_DIR: ${{ runner.temp }}/tap-logs
+
+      - name: 预检失败时打印逐文件 ❌ 行
+        if: failure()
+        run: |
+          tail -n 60 stryker.log || true
+          for f in "$RUNNER_TEMP"/tap-logs/*.log; do
+            [ -f "$f" ] || continue
+            bad=$(grep -acE '❌|AssertionError|Error:' "$f" || true)
+            [ "$bad" = "0" ] && continue
+            echo "=== $f（命中 $bad 行）==="
+            grep -aE '❌|AssertionError|Error:' "$f" | head -n 40
+          done
+
+  mutation:
+    needs: [decide-run, prepare-re2, preflight]
     if: needs.decide-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     # REV-CI（PR #156 返工，Qodo Medium / Reliability）：360 分钟 = GitHub 平台的 6 小时硬上限，
@@ -637,6 +696,9 @@ jobs:
           # 也不进 artifact（reports/mutation/）⇒ 崩溃段不会因为多出这个文件而让上传步的
           # if-no-files-found: error 失效。摘掉本行 = 摘要看不到任何记录 ⇒ 每个 TAP 段判红（fail-closed）。
           XBK_TAP_POINTS_LOG: ${{ runner.temp }}/tap-points.jsonl
+          # 诊断（2026-11-15）：tap-shim 在该目录逐文件落 stdout/stderr，失败时由诊断步摘 ❌ 行。
+          # 不注入 ⇒ shim 不落文件、行为与旧版逐字节相同。
+          XBK_TAP_LOG_DIR: ${{ runner.temp }}/tap-logs
 
       # --timeoutMS（逐段覆盖单次等待上限）：取矩阵的 `timeout_ms`，缺省 300000（= stryker.config.js 的值）。
       #   为什么走 CLI 而不是改配置文件：stryker core 的 config-reader 是 deepMerge(options, cliOptions)
@@ -658,6 +720,14 @@ jobs:
         if: failure()
         run: |
           tail -n 120 stryker.log || true
+          echo '--- tap 逐文件诊断日志（XBK_TAP_LOG_DIR）---'
+          for f in "$RUNNER_TEMP"/tap-logs/*.log; do
+            [ -f "$f" ] || continue
+            bad=$(grep -acE '❌|AssertionError|Error:' "$f" || true)
+            [ "$bad" = "0" ] && continue
+            echo "=== $f（命中 $bad 行）==="
+            grep -aE '❌|AssertionError|Error:' "$f" | head -n 20
+          done
           echo '--- test_console.js 诊断日志 ---'
           for f in "${TMPDIR:-/tmp}"/xbk-test-console-*/log; do
             [ -f "$f" ] || continue
