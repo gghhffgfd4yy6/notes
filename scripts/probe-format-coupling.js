@@ -42,6 +42,7 @@
  *      PROBE_TIMEOUT_MS=900000 可调单条测试上限（默认 15 分钟，超时按 coupled 计，fail-closed）。
  */
 const { spawnSync } = require('node:child_process')
+const { randomBytes } = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -462,7 +463,9 @@ function firstFailureLine (output) {
 
 function runTest (file) {
   const started = Date.now()
-  const traceFile = path.join(path.dirname(shim()), 'trace-' + process.pid + '-' + Math.random().toString(36).slice(2) + '.log')
+  // 轨迹文件名必须不可预测且进程内唯一：旧实现用 `Math.random().toString(36)`（Codacy 的弱随机告警），
+  // 换成 CSPRNG 的 6 字节随机（48 位 + pid，同目录下不会撞名）。文件名只用于本进程写读删，不含敏感数据。
+  const traceFile = path.join(path.dirname(shim()), 'trace-' + process.pid + '-' + randomBytes(6).toString('hex') + '.log')
   const nodeOptions = [process.env.NODE_OPTIONS, '--require', '"' + shim() + '"'].filter(Boolean).join(' ')
   const r = spawnSync(process.execPath, [file], {
     cwd: ROOT,
@@ -509,7 +512,7 @@ function classify (traced) {
 function main () {
   let tests = process.argv.slice(2).filter((a) => !a.startsWith('-'))
   const explicit = tests.length > 0
-  if (!explicit) tests = DEFAULT_TESTS.filter((t) => fs.existsSync(path.join(ROOT, t)))
+  if (!explicit) tests = DEFAULT_TESTS.filter((t) => fs.existsSync(path.join(ROOT, t))) // nosemgrep（理由：DEFAULT_TESTS 是本文件硬编码常量名单、ROOT 是 __dirname 常量，只做存在性检查不写盘）
   if (!tests.length) {
     die(2, '用法：node scripts/probe-format-coupling.js <test_a.js> [test_b.js …]\n' +
       '  把扰动面（.js/.mjs/.cjs/.json/.yml/.yaml/.css/.html）重排后逐条跑测试；重排后仍绿的记为 format-clean，\n' +

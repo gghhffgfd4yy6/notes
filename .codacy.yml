@@ -313,6 +313,13 @@
 #      **该行**带裸形态 `// nosemgrep（理由）`（与 xbk_storage.js:222 / test_state_schema.js 同一口径；
 #      Codacy 的 opengrep wrapper 对无 ids 的 nosemgrep 判定 is_ignored，带规则 ID 的精确形态反而不被采纳）。
 #      逐行理由写在代码里，将来改路径来源时会立刻看到「这里为什么可以放行」。
+#   ③ **ESLint 系告警另有其注释**（v3.447）：Codacy 同时用 eslint-plugin-security 报同一类「非字面量 fs
+#      路径」，而 nosemgrep 是 opengrep 的语法、对 ESLint 无效（test_source_model.js 那行此前只有
+#      nosemgrep，因此仍被报）。这类行按 ESLint 语法登记：test_source_model.js 的隔离工作区写盘加**裸**
+#      `// eslint-disable-next-line`——刻意不写规则名，因为本仓 standard 17 未装 eslint-plugin-security，
+#      指名规则会让 `npm run lint` 报 "Definition for rule … was not found" 并整体判红（实测）。仍只作用
+#      于单行，且不删/不放宽任何断言。另一条同源告警（`model[name]` 的 Generic Object Injection Sink）已
+#      改代码消除（`new Map(Object.entries(model))` + `Map#get`），没有靠豁免压掉。
 #
 # 为什么这些告警是结构性的（不是缺陷）：三个文件的路径来源分别是
 #   · scripts/check-source-text-asserts.js：ROOT=__dirname 常量 + readdirSync 枚举出的 test_*.js /

@@ -457,7 +457,11 @@ const qualityBlock = jobBlock(testYml, 'quality')
 const policyBlock = jobBlock(testYml, 'policy')
 const qualityGateBlock = jobBlock(testYml, 'quality-gate')
 const coverageBlock = jobBlock(testYml, 'coverage')
-const policyChecks = ['check:ci-static', 'test:ci-static-gates', 'check:doc-lines', 'test:doc-line-gates']
+const policyChecks = ['check:ci-static', 'check:doc-lines', 'test:doc-line-gates']
+// v3.447：`test:ci-static-gates` 从上面这份名单里移除了——它不再是 policy 步骤，而是 quality 步骤
+// （见本函数末尾的两条正向锁）。policyChecks 的语义是「零依赖 job 里必须单次执行的策略闸」，而该接线
+// 套件自 S0 r4 起 import test_support/source_model.js（顶层 require('acorn') + loadYaml 需 js-yaml），
+// 留在名单里就逼着 workflow 在零依赖的 policy 挂一个必 MODULE_NOT_FOUND 的步骤（v3.446 CI 实测）。
 function assertPolicyStepsUnconditional (policyJobText, qualityJobText) {
   const policySteps = parseWorkflowSteps(policyJobText)
   const policyScripts = policySteps.flatMap(step => step.scripts)
@@ -471,8 +475,40 @@ function assertPolicyStepsUnconditional (policyJobText, qualityJobText) {
     assert.strictEqual(matchingSteps[0].conditional, false,
       `${script} 对应的 policy step 禁止 step-level if 条件`)
   }
+  // 正向锁（v3.447）：接线套件必须挂在 quality，且 policy 里恰好 0 次。
+  // 只把它从 policyChecks 删掉是不够的——那样「两边都没挂」也会全绿，等于把这条 CI 覆盖对账静默丢了；
+  // 反过来「挪回 policy」则会让零依赖 job 里 require(acorn) 直接 MODULE_NOT_FOUND（v3.446 的 CI 失败原样）。
+  assert.strictEqual(qualityScripts.filter(s => s === 'test:ci-static-gates').length, 1,
+    'test:ci-static-gates 必须在 quality job 恰好执行一次：该套件 require test_support/source_model.js' +
+    '（顶层 acorn）与 js-yaml（只在 devDeps 树里），policy 是刻意零依赖 job（从不 npm ci）' +
+    '⇒ 放到 policy 必 MODULE_NOT_FOUND')
+  assert.strictEqual(policyScripts.filter(s => s === 'test:ci-static-gates').length, 0,
+    'test:ci-static-gates 不得出现在 policy job：该套件需要 devDeps（acorn + js-yaml），' +
+    'policy 零依赖必 MODULE_NOT_FOUND')
 }
 assertPolicyStepsUnconditional(policyBlock, qualityBlock)
+// 反例（v3.447）：上面两条锁必须各自可被单点破坏驱动为红，否则它们只是「写了个数字」。
+//   ① 从 quality 摘掉该步骤 ⇒ 覆盖率对账静默消失（这条是删掉 policyChecks 条目后唯一还盯着它的门）；
+//   ② 把它挪回 policy（两边都有）⇒ 零依赖 job 里的 MODULE_NOT_FOUND 回潮。
+{
+  const staticGatesStepBlock = '      - name: 静态扫描接线断言（test_ci_static_gates.js）\n' +
+    '        run: npm run test:ci-static-gates\n'
+  const qualityWithoutStaticGates = qualityBlock.replace(staticGatesStepBlock, '')
+  assert.notStrictEqual(qualityWithoutStaticGates, qualityBlock,
+    '反例夹具必须真的从 quality 摘掉该步骤（没命中则本反例形同虚设）')
+  assert.throws(() => assertPolicyStepsUnconditional(policyBlock, qualityWithoutStaticGates),
+    /test:ci-static-gates 必须在 quality job 恰好执行一次/,
+    '从 quality 摘掉 test:ci-static-gates 必须让正向锁判红（否则 CI 覆盖可以静默消失）')
+  const policyWithStaticGates = policyBlock.replace(
+    '      - name: 文档行长闸门（1200 字符/行）',
+    '      - name: 静态扫描接线断言（test_ci_static_gates.js）\n' +
+    '        run: npm run test:ci-static-gates\n\n' +
+    '      - name: 文档行长闸门（1200 字符/行）')
+  assert.notStrictEqual(policyWithStaticGates, policyBlock, '反例夹具必须真的把该步骤注入 policy')
+  assert.throws(() => assertPolicyStepsUnconditional(policyWithStaticGates, qualityBlock),
+    /不得出现在 policy job/,
+    '把 test:ci-static-gates 挪回 policy 必须判红（零依赖 job 里 require(acorn) 会 MODULE_NOT_FOUND）')
+}
 assert.ok(!yamlOnly(policyBlock).some(line => /^[ \t]*(?:strategy|matrix):/.test(line)),
   'policy job 不得声明 strategy/matrix，策略门禁只执行一次')
 assert.match(qualityBlock, /^\s{4}strategy:\s*$/m, 'quality 的 Node 测试矩阵必须保留')
@@ -634,7 +670,8 @@ if (process.argv.includes('--quality-coe-contract-only')) {
 
 const policyStepNames = [
   ['check:ci-static', '静态扫描闸门（shellcheck + zizmor）'],
-  ['test:ci-static-gates', '静态扫描接线断言（test_ci_static_gates.js）'],
+  // v3.447：`test:ci-static-gates` 不在本名单——它已移到 quality job（见 assertPolicyStepsUnconditional
+  // 末尾的正向锁与两条反例）。留在名单里会让这条 if:false 反例夹具找不到目标步骤而假红。
   ['check:doc-lines', '文档行长闸门（1200 字符/行）'],
   ['test:doc-line-gates', '文档行长接线断言（test_doc_line_gates.js）']
 ]

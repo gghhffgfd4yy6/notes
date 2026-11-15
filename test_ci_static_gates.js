@@ -7,9 +7,11 @@
 //
 // 接线事实（与 test_suites.js 的注册项一致）：本套件标了 `mutationSkip: true`（变异沙箱不复制
 // `.githooks/`，沙箱内必 ENOENT 假红）⇒ run_unit_tests.js 的 `!s.mutationSkip` 过滤会把它排除在
-// 「全量单元测试」兜底之外，CI 覆盖**只**来自 test.yml policy job 的显式步骤
-// `npm run test:ci-static-gates`（这层对账由 test_ci_skip_suites.js 的「SKIP_SUITES ↔ 显式步骤」
-// 守着）；**摘掉那个显式步骤，下一次 CI 必红在这里**。
+// 「全量单元测试」兜底之外，CI 覆盖**只**来自 test.yml **quality job** 的显式步骤
+// `npm run test:ci-static-gates`（v3.447 从 policy 挪过来：本套件 import test_support/source_model.js，
+// 顶层 require('acorn') + loadYaml 需 js-yaml，而 policy 是刻意零依赖 job ⇒ 挂那边必 MODULE_NOT_FOUND）。
+// 这层对账由 test_ci_skip_suites.js 的 assertPolicyStepsUnconditional 正向锁守着——quality 里恰好
+// 一次、policy 里恰好零次，两个方向各有一条反例夹具；**摘掉那个显式步骤，下一次 CI 必红在这里**。
 //
 // 纯字符串/fs 断言，不 spawn 子进程：本机与变异沙箱都能跑，也不受宿主 process.execPath 形态影响。
 // C5-013 起额外 require 判据模块（scripts/check-ci-static.js）本身：只读、无副作用、不 spawn，

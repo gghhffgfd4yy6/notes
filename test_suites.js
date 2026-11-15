@@ -74,7 +74,9 @@ const SUITES = [
   { name: '测试入口公共层', file: 'test_test_harness.js', desc: 'scripts/test-harness.js：displayWidth/padEndWidth（中文 2 列）、positiveIntEnv 非法值告警回退、prepareSuiteEnv 只删 XBK_CACHE_DIR、guard 加载（missing 不抛/内部依赖缺失照常抛）、killSuiteGroup 非法 pid；另断言两个入口只 require 一份公共层、不再各自定义' },
   // mutationSkip（v3.280）：本套件断言 .githooks/pre-commit、pre-push 与 test.yml 的接线内容，
   // 而变异沙箱（copyProject）不复制 .githooks/ ⇒ 沙箱内必 ENOENT 假红（同 test_install_hooks 的
-  // 登记先例）。CI 覆盖由 test.yml 的显式步骤「静态扫描接线断言」承担。
+  // 登记先例）。CI 覆盖由 test.yml **quality job** 的显式步骤「静态扫描接线断言」承担
+  // （v3.447 从 policy 挪来：本套件 import test_support/source_model.js，需 acorn + js-yaml，
+  // 而 policy 刻意零依赖；两个 job 的挂载由 test_ci_skip_suites.js 的正向锁对账）。
   { name: '静态扫描接线', file: 'test_ci_static_gates.js', desc: 'check:ci-static 三处接线（check 链 / pre-commit 第4道 / test.yml 步骤）内容断言 + 首轮扫描修复不回退', mutationSkip: true },
   // mutationSkip（v3.281）：同 test_ci_static_gates 的理由——本套件断言 `.githooks/pre-commit` 与
   // `test.yml` 的接线内容，而变异沙箱不复制 `.githooks/` ⇒ 沙箱内必 ENOENT 假红。

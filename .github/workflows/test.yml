@@ -93,6 +93,18 @@ jobs:
       - name: 源码文本断言闸门（禁止新增读源码文本断言）
         run: npm run check:assert-style
 
+      # v3.447：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样显式列步骤
+      # ——否则脱门；摘除静态扫描步骤、check 链或 pre-commit 门链，本步骤变红）。
+      # 为何在 quality 而不在 policy（与上面 check:assert-style 同一根因）：本套件自 S0 r4 起 import
+      # test_support/source_model.js —— 顶层 require('acorn')（dependencies），loadYaml 还需 js-yaml
+      # （只在本 job 的 devDeps 树里）。policy 是刻意零依赖的静态闸 job（只装 shellcheck/zizmor，从不
+      # npm ci），挂那边必 MODULE_NOT_FOUND（v3.446 的 CI 实测：`Cannot find module 'acorn'`，栈在
+      # test_ci_static_gates.js → test_support/source_model.js:23），quality-gate 连带红。本 job 的
+      # `npm ci` 已经装好两者。**policy 里不得残留该步骤**，由 test_ci_skip_suites.js
+      # 的 assertPolicyStepsUnconditional 正向锁住（quality 恰好一次 / policy 恰好零次）。
+      - name: 静态扫描接线断言（test_ci_static_gates.js）
+        run: npm run test:ci-static-gates
+
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 
@@ -280,10 +292,10 @@ jobs:
           pipx install zizmor==1.30.1
           npm run check:ci-static
 
-      # v3.280：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样
-      # 显式列步骤——否则脱门；摘除上面步骤或 pre-commit 门链，本步骤变红）。
-      - name: 静态扫描接线断言（test_ci_static_gates.js）
-        run: npm run test:ci-static-gates
+      # v3.280 的「静态扫描接线断言（test_ci_static_gates.js）」步骤自 v3.447 起**不在这里**：
+      # 该套件 import test_support/source_model.js（顶层 require('acorn') + loadYaml 需 js-yaml），
+      # 而本 job 刻意零依赖（只装 shellcheck/zizmor，从不 npm ci）⇒ 挂这里必 MODULE_NOT_FOUND。
+      # 它已移到 quality job（`npm ci` 之后），并由 test_ci_skip_suites.js 正向锁住「这里为 0」。
 
       # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
       # 三处接线（check 链 / pre-commit / 这里）缺一即成摆设。
