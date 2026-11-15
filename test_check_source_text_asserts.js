@@ -480,13 +480,13 @@ check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进�
     new Set(['literal:LIT', 'dynamic:<dynamic>']), 'kind 必须区分 literal 与 dynamic')
   assert.ok(inv.items.every((item) => item.file === 'test_inv.js' && Number.isInteger(item.line) && item.line > 0),
     '每条必须带 file / line：' + JSON.stringify(inv.items))
-  assert.ok(!fs.existsSync(path.join(dir, 'inventory.json')), '默认不得往仓库目录里写清单')
+  assert.ok(!fs.existsSync(path.join(dir, 'inventory.json')), '默认不得往仓库目录里写清单') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'inventory.json'，无外部净输入）
   // 仓库内路径一律拒绝（fail-closed），且拒绝时不留文件。
   const inside = path.join(dir, 'inventory.json')
   const refused = runChecker(dir, '--inventory', inside)
   assert.strictEqual(refused.status, 2, '写进仓库目录必须 exit 2：' + refused.out)
   assert.ok(/不得落在仓库目录内/.test(refused.out), '必须说清拒绝原因：' + refused.out)
-  assert.ok(!fs.existsSync(inside), '拒绝时不得留下文件')
+  assert.ok(!fs.existsSync(inside), '拒绝时不得留下文件') // nosemgrep（inside = 隔离工作区路径，同上无外部净输入）
 })
 
 check('--write-allowlist：重生成与冻结文件逐字节一致，且清单不进仓库（⑧）', () => {

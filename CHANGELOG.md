@@ -1627,3 +1627,8 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **测试（改 4 条、加 8 条，25 检查全绿）**：反例逐条实测——① 新增一条源码文本断言 → 红并点名 `file:line`；② 某文件条数超基线 → 红且点名该文件（未超基线的文件不得被点名）；③ 新文件出现断言 → 红（`基线 0 / 实测 N / +N（基线里没有这个文件）`）；④ `total.all` 改错、`by_file` 改小却不改 `total` → 都 exit 2 并同时报实测条数；⑤ 条数下降 → 绿且按文件报 shortfall；⑥ literal 提成常量后条数仍是 1（重新冻结：`literal 1 → 0`、`dynamic 0 → 1`），整条删掉才报下降 1（`<dynamic>` 不得从检测面消失）；⑦ `--inventory` 写到仓库外、`items` 条数 = 实测、`kind` 分清 literal/dynamic、写仓库内路径 exit 2 且不留文件；⑧ `--write-allowlist` 两次重生成逐字节一致、`items` 不再出现在仓内、仓内基线 schema 2 且按文件覆盖完整。旧用例里依赖 `count`/`items` 形状的三处（计数漂移 exit 2、`compareMultiset` 返回形状、多重集「实测 N 次 / 允许 M 次」文案）同步改成按文件计数口径。
 - **兼容**：文件名与路径不变——`run_mutation.js:303` 仍把 `scripts/source-text-assert.allowlist.json` 复制进变异沙箱，`test_run_mutation_internal.js:291` 仍断言它存在。
 - **版本**：3.447.0 → **3.448.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.449
+
+- **S0 工具层**：`test_check_source_text_asserts.js` 的 `--inventory` 两处动态路径断言（`:483` 缺省清单不落仓库目录、`:489` 拒绝时不留文件）补裸 `// nosemgrep（理由）` 标注——Codacy/Semgrep「The application dynamically constructs file or path information」误报，断言逻辑一行未改、无行为变化。
+- **版本**：3.448.0 → **3.449.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
