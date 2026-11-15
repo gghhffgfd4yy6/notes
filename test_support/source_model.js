@@ -270,10 +270,10 @@ function shellTokens (line) {
     const open = line[start + 1]
     const close = open === '(' ? ')' : '}'
     let depth = 0
-    let i = start + 1
+    let cursor = start + 1
     let inner = null
-    for (; i < line.length; i++) {
-      const c = line[i]
+    for (; cursor < line.length; cursor++) {
+      const c = line[cursor]
       if (inner) {
         if (c === inner) inner = null
         continue
@@ -285,46 +285,58 @@ function shellTokens (line) {
       if (c === open) depth++
       else if (c === close) {
         depth--
-        if (depth === 0) return [line.slice(start, i + 1), i + 1]
+        if (depth === 0) return [line.slice(start, cursor + 1), cursor + 1]
       }
     }
     throw new Error('source_model.parseShell: 未闭合的 ' + line.slice(start, start + 2) + ' …（' + line + '）')
   }
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]
+  // 显式游标（不是 for 计数器）：`$((…))` 与 `\x` 转义要整段跳过，游标由本循环自己推进
+  // （Sonar S2310：循环变量不得在循环体内被改写）。
+  let cursor = 0
+  while (cursor < line.length) {
+    const c = line[cursor]
     if (quote === "'") {
       if (c === "'") quote = null
       else buf += c
+      cursor++
       continue
     }
     if (quote === '"') {
       if (c === '"') quote = null
-      else if (c === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1])) buf += line[++i]
-      else buf += c
+      else if (c === '\\' && cursor + 1 < line.length && '"\\$`'.includes(line[cursor + 1])) {
+        buf += line[cursor + 1]
+        cursor++
+      } else buf += c
+      cursor++
       continue
     }
-    if (c === '$' && (line[i + 1] === '(' || line[i + 1] === '{')) {
-      const [text, next] = dollarExpr(i)
+    if (c === '$' && (line[cursor + 1] === '(' || line[cursor + 1] === '{')) {
+      const [text, next] = dollarExpr(cursor)
       buf += text
       inToken = true
-      i = next - 1
+      cursor = next
       continue
     }
     if (c === '#') {
       // 词首的 # 起注释（`a#b` 里的 # 是普通字符，与 shell 语义一致）
       if (!inToken) break
       buf += c
+      cursor++
       continue
     }
     if (c === "'" || c === '"') {
       quote = c
       inToken = true
+      cursor++
       continue
     }
     if (c === '\\') {
-      if (i + 1 < line.length) buf += line[++i]
-      else buf += c
+      if (cursor + 1 < line.length) {
+        buf += line[cursor + 1]
+        cursor++
+      } else buf += c
       inToken = true
+      cursor++
       continue
     }
     if (/\s/.test(c)) {
@@ -333,6 +345,7 @@ function shellTokens (line) {
         buf = ''
         inToken = false
       }
+      cursor++
       continue
     }
     if (';&|<>()'.includes(c)) {
@@ -341,17 +354,19 @@ function shellTokens (line) {
         buf = ''
         inToken = false
       }
-      const two = line.slice(i, i + 2)
+      const two = line.slice(cursor, cursor + 2)
       if (['&&', '||', '|&', '>>', '<<', '>&'].includes(two)) {
         tokens.push(two)
-        i++
+        cursor += 2
       } else {
         tokens.push(c)
+        cursor++
       }
       continue
     }
     buf += c
     inToken = true
+    cursor++
   }
   if (quote) throw new Error('source_model.parseShell: 未闭合的引号：' + line)
   if (inToken) tokens.push(buf)

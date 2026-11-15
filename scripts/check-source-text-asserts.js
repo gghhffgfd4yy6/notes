@@ -21,10 +21,37 @@ const ROOT = path.join(__dirname, '..')
 const ALLOW_FILE = path.join(__dirname, 'source-text-assert.allowlist.json')
 const ALLOW_REL = path.relative(ROOT, ALLOW_FILE)
 
-// 「源码文本」变量：来自 readFileSync / codeOf / 剥注释后的字符串
-const READ = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:[A-Za-z_$][\w$.]*\s*=\s*)?(?:[^;\n]*readFileSync|codeOf|codeOnly|stripComments?)\s*\(/g
+// 「源码文本」变量：来自 readFileSync / codeOf / 剥注释后的字符串。
+// 拆成两步（先认声明，再看等号之后的同一段右值里有没有读取调用）而不是一条
+// `(?:[^;\n]*readFileSync|codeOf|…)` 的大正则：后者在「整行都没有读取调用」时要对 `[^;\n]*`
+// 逐位置回溯，回溯面随行宽线性增长（Sonar S8786 超线性回溯，每个 test_*.js 的每一行都要过一遍）。
+const READ_DECL = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/g
+const READ_CALL = /(?:readFileSync|codeOf|codeOnly|stripComments?)\s*\(/
 const LIT_CALL = /\.(includes|indexOf|startsWith|match)\(\s*(['"])((?:\\.|(?!\2).){1,200})\2/g
 const METHODS = 'includes|indexOf|startsWith|match'
+
+// 正则元字符的完整转义（`.` `*` `+` `?` `^` `$` `{` `}` `(` `)` `|` `[` `]` `\`）。
+// 只把 `$` 转义是不完整净化：名字里出现别的元字符会改变 new RegExp 的含义（CodeQL js/incomplete-sanitization）。
+// 标识符来源仍是白名单里的 `[A-Za-z_$][\w$]*`，这里只把它当数据按「任意字符串」处理。
+const REGEX_META = /[.*+?^${}()|[\]\\]/g
+const escapeRegExp = (s) => s.replace(REGEX_META, '\\$&')
+
+// 等号之后的右值：同一行内直到 `;` 或换行（与旧模式 `[^;\n]*` 的扫描面一致）。
+// 用显式游标而不是 `src.slice(from).search(...)`——后者每认一个声明就整段复制一次，大文件上是 O(n²)。
+function rightValueAt (src, from) {
+  let end = from
+  while (end < src.length && src[end] !== '\n' && src[end] !== ';') end++
+  return src.slice(from, end)
+}
+
+// 逐声明判定：右值里出现读取调用才算「源码文本变量」。
+function sourceReadVars (src) {
+  const vars = new Set()
+  for (const m of src.matchAll(READ_DECL)) {
+    if (READ_CALL.test(rightValueAt(src, m.index + m[0].length))) vars.add(m[1])
+  }
+  return vars
+}
 
 function die (code, message) {
   console.error(message)
@@ -35,14 +62,12 @@ function die (code, message) {
 // 命中记 (file, line, literal)；白名单按 (file, literal) 比对，故行号平移（加注释、插用例）不算新增。
 function scanFile (file) {
   const src = fs.readFileSync(path.join(ROOT, file), 'utf8')
-  const vars = new Set()
+  const vars = sourceReadVars(src)
   let m
-  READ.lastIndex = 0
-  while ((m = READ.exec(src)) !== null) vars.add(m[1])
   if (!vars.size) return []
   const hits = []
   vars.forEach((v) => {
-    const re = new RegExp('\\b' + v.replace(/[$]/g, '\\$') + '\\s*\\.\\s*(' + METHODS + ')\\(\\s*([\'"])((?:\\\\.|(?!\\2).){1,200})\\2', 'g')
+    const re = new RegExp('\\b' + escapeRegExp(v) + '\\s*\\.\\s*(' + METHODS + ')\\(\\s*([\'"])((?:\\\\.|(?!\\2).){1,200})\\2', 'g')
     while ((m = re.exec(src)) !== null) {
       hits.push({ file, line: src.slice(0, m.index).split('\n').length, literal: m[3] })
     }

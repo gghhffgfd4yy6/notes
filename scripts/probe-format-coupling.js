@@ -84,8 +84,28 @@ function reformat (code, file) {
   return parts.join('')
 }
 
+// Sonar S4036：按名 spawnSync('git', …) 让子进程经 PATH 解析可执行文件，静态分析判为依赖未受控的
+// 查找路径。本仓既有口径（scripts/check-ci-static.js 的 resolveTool、test_install_hooks.js 的 git 解析）
+// 是先用纯 JS 扫 PATH 得到绝对路径、再以该绝对路径 spawn——这里同款处理，不挂 NOSONAR 压制。
+// 解析不到返回 null（调用方按「读不到 git status」原有语义降级：只靠退出码判断还原）。
+function resolveExecutable (name) {
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name)
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      if (fs.statSync(candidate).isFile()) return candidate
+    } catch {
+      // 该候选目录不存在或不可执行：继续下一段 PATH 目录
+    }
+  }
+  return null
+}
+
 function gitStatus () {
-  const r = spawnSync('git', ['status', '--short', '--untracked-files=all'], { cwd: ROOT, encoding: 'utf8' })
+  const git = resolveExecutable('git')
+  if (!git) return null
+  const r = spawnSync(git, ['status', '--short', '--untracked-files=all'], { cwd: ROOT, encoding: 'utf8' })
   if (r.error || r.status !== 0) return null
   return r.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean)
 }
@@ -125,6 +145,13 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 // emoji 变体带 U+FE0F 选择符，写进字符类会被 standard 的 no-misleading-character-class 判红。
 const SUCCESS_PREFIXES = ['✅', '🎉', 'ℹ️']
 
+// 失败行的提示词。三条各自独立的字面量正则，而不是一条 `^❌|\bError\b|not ok` 的交替式：
+// 那种写法把 `^` 只绑在第一个分支上、优先级不显式（Sonar S5850）；但也不能简单写成
+// `^(?:❌|\bError\b|not ok)`——那会把「Error」收窄成只能出现在行首（丢掉 `Uncaught Error: …`、
+// `exit code 1: Error: …` 这类真实失败行），与改动前的匹配面不一致。拆成三条后语义与旧式逐字相同。
+const FAILURE_HINTS = [/^❌/, /\bError\b/, /not ok/]
+const isFailureLine = (line) => FAILURE_HINTS.some((re) => re.test(line))
+
 function firstFailureLine (output) {
   // 只保留「不是成功行」的行：套件里的 ✅ / 🎉 行常常也含「失败」字样（例如用例名），
   // 直接按关键词全局搜会抓到一条绿行当失败原因（本工具的第一版就这么错过）。
@@ -132,7 +159,7 @@ function firstFailureLine (output) {
     .map((l) => l.trim())
     .filter((l) => l && !SUCCESS_PREFIXES.some((p) => l.startsWith(p)))
   const hit = lines.find((l) => /AssertionError/.test(l)) ||
-    lines.find((l) => /^❌|\bError\b|not ok/.test(l)) ||
+    lines.find(isFailureLine) ||
     lines[lines.length - 1] ||
     ''
   return hit.slice(0, 160)

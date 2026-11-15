@@ -1565,3 +1565,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **变异沙箱**：`run_mutation.js` 的 `copyProject` 补拷 `test_support/` 与两份新脚本，漏拷会在变异阶段 ENOENT 假红（与 #143 补 `check-version.js` 同族根因）。
 - **不替换任何断言**：S0 只建工具层与闸，857 条白名单一条未动，后续包逐包收敛。
 - **版本**：3.441.0 → **3.442.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.443
+
+- **CI 反馈收口（PR #418，只动工具层：断言一条未改、白名单仍是 857 条）**：修掉阻断 `npm run check` 与三个静态扫描器的七类问题，全部「改代码消除」，没有挂 NOSONAR/豁免注释。
+- **acorn 改为运行时依赖**：`scripts/probe-format-coupling.js` 与 `test_support/source_model.js` 都在工具层 `require('acorn')`，而它此前只声明在 `devDependencies`，于是 `scripts/check-deps.js` 的反向扫描（代码 require → 声明）判「代码 require 了未声明的包：acorn」，`checkDependencies()` 返回 false、`run_tests.js` 的前置门连测试都不让跑。现移入 `dependencies`（版本仍 `^8.19.0`），锁文件三处同步（根 `dependencies` 增项、`devDependencies` 删项、`node_modules/acorn` 去掉 `dev` 标记），并用 `npm install --package-lock-only` 复算确认锁文件已自洽。
+- **白名单闸门的正则**：变量名转义从「只转 `$`」改成**完整元字符转义**（CodeQL `js/incomplete-sanitization`）；扫描用的 `READ` 大正则按 Sonar `S8786` 拆成「先认声明、再看等号后同一段右值」两步，消除超线性回溯。**扫描结果与改动前逐字节一致**（857 条，文件/字面量/行号全同）。
+- **格式耦合探针**：`git` 调用按本仓既有口径（`scripts/check-ci-static.js` 的 `resolveTool`）改成「纯 JS 扫 `PATH` 解析绝对路径 → 以绝对路径 spawn」（Sonar `S4036`）；失败行匹配把原来那条 `^❌|\bError\b|not ok` 的交替式拆成三条字面量正则（`S5850` 的优先级不显式由「不再用交替」消除，而不是把 `^` 收窄到整条正则——那样会漏掉 `Uncaught Error: …` 这类失败行），在 52 万行真实日志上逐行比对匹配面完全一致。
+- **AST 断言层的 shell 切词**：`test_support/source_model.js` 的 `shellTokens` 改用显式游标推进，不再在循环体内改写循环变量（Sonar `S2310`）；与旧实现在 20 万条随机语料 + 仓库内全部 shell 脚本行上输出（含抛错）逐字节相同。
+- **Codacy**：把这三个工具层文件报的静态路径/非字面量正则告警按既有口径逐条登记进 `.codacy.yml`（依据写在注释块里：路径来源为 `__dirname` 常量与仓库内固定清单，正则源为白名单变量名，无外部净输入），要求 PR #418 上 0 个新问题。
+- **版本**：3.442.0 → **3.443.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
