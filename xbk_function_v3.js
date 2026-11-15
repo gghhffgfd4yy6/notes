@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.460 — S0 收 r18 四处缺口：本地函数调用点污染按实参（不再全文件并集）、嵌套一层 reader 对象导出登记、白名单增长机械校验（git 参照 + growth 登记 / CI fail-closed）、inventory 陈旧快照降级不猜行号；只动测试/scripts/.github/文档，白名单 3190 → 3131（−59，逐文件已归因） *******
+//* ******* 线报酷推送脚本 v3.461 — S0 收 r19 六条 CI 失败项：CHANGELOG 正序归位（v3.460 段搬到文末）、git 改纯 JS 扫 PATH 解析绝对路径（解析不到按参照不可得降级 / CI fail-closed）、inventory 降级只打固定文案（不插值 env 与文件内容）、陈旧快照改 mkdtemp 私有目录（0700）、动态路径 fs 调用补裸 eslint-disable；只动测试/scripts/文档，白名单 3131 原地 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

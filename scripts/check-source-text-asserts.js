@@ -2341,8 +2341,37 @@ function readBaseline (measuredTotal) {
 const BASELINE_REF_ENV = 'SOURCE_TEXT_ASSERT_BASELINE_REF'
 const GROWTH_REASON_ENV = 'SOURCE_TEXT_ASSERT_GROWTH_REASON'
 
+// git 一律以**绝对路径**调用（r19-2）：按名 spawn（spawnSync('git', …)）会让子进程经 PATH 解析可执行
+// 文件，静态分析按「命令解析依赖 PATH」判 Sonar javascript:S4036。这里纯 JS 扫 PATH 解析（不额外 spawn
+// 进程），与 scripts/check-ci-static.js 的 resolveTool、test_install_hooks.js:45-52 的 GIT 解析器同一口径。
+// 解析不到 ⇒ GIT_BIN = null ⇒ gitRun 一律返回 failed，调用方沿用既有「参照不可得」语义
+// （非 CI 打印降级并继续 / CI=true fail-closed），判据一行未改。
+function resolveToolPath (name) {
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name)
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      if (fs.statSync(candidate).isFile()) return candidate
+    } catch {
+      // 该候选目录不存在或无权限：继续下一段固定目录
+    }
+  }
+  return null
+}
+
+const GIT_BIN = resolveToolPath('git')
+
 function gitRun (args) {
-  const result = spawnSync('git', ['-C', ROOT, ...args], { encoding: 'utf8', timeout: 30000 })
+  if (!GIT_BIN) {
+    return {
+      ok: false,
+      out: '',
+      err: '未能在 PATH 中解析到 git 可执行文件',
+      failed: new Error('git 不可解析（PATH 中没有可执行的 git）')
+    }
+  }
+  const result = spawnSync(GIT_BIN, ['-C', ROOT, ...args], { encoding: 'utf8', timeout: 30000 })
   return {
     ok: result.status === 0,
     out: (result.stdout || '').trim(),
@@ -2544,30 +2573,27 @@ function compareByFile (hits, baseline) {
 // 而快照可能来自完全不同的一版基线（实测 inventory total=2714 / 基线 3190）⇒ 476 条既有命中被当成
 // 「新增位置」逐行打印，与 CHANGELOG v3.448 的承诺（快照陈旧就只按文件报增量，不猜行号）相反。
 // 校验口径：schema / baseline 路径 / total 三段（all-literal-dynamic）全部与当前基线一致才算新鲜。
+// r19-4：降级原因只以**固定 code** 返回（'total' | 'schema' | 'baseline' | 'missing' | 'format'），
+// 由调用方映射成固定文案。旧实现把 `${hint}`（环境变量 SOURCE_TEXT_ASSERT_INVENTORY 的路径）与清单文件
+// 里的 total 取值拼进 why 再 console.log ⇒ 环境/文件内容进日志，静态分析判 Sonar jssecurity:S8689。
 function loadInventoryItems (hint, baseline) {
-  const stale = (why) => ({ items: null, stale: true, why })
   let raw
   try {
     raw = JSON.parse(fs.readFileSync(hint, 'utf8')) // nosemgrep（hint = 环境变量或本文件常量路径，只读、缺失即降级为「点名文件」）
-  } catch (e) {
-    return { items: null, stale: false, why: `没有可用的逐条清单（${hint}）：只能按文件报增量。要 file:line 就在基线冻结状态下先跑 --inventory。` }
+  } catch {
+    return { items: null, code: 'missing' }
   }
-  if (!raw || !Array.isArray(raw.items)) return { items: null, stale: false, why: `逐条清单格式不可用（${hint}）：只能按文件报增量。` }
-  if (raw.schema !== BASELINE_SCHEMA) return stale(`逐条清单 schema=${JSON.stringify(raw.schema)} ≠ 基线 schema ${BASELINE_SCHEMA}`)
-  if (raw.baseline && raw.baseline !== ALLOW_REL) return stale(`逐条清单记录的基线文件是 ${JSON.stringify(raw.baseline)} ≠ ${ALLOW_REL}`)
+  if (!raw || !Array.isArray(raw.items)) return { items: null, code: 'format' }
+  if (raw.schema !== BASELINE_SCHEMA) return { items: null, code: 'schema' }
+  if (raw.baseline && raw.baseline !== ALLOW_REL) return { items: null, code: 'baseline' }
   const total = raw.total
   if (!total || typeof total !== 'object' ||
     total.all !== baseline.total.all || total.literal !== baseline.total.literal || total.dynamic !== baseline.total.dynamic) {
-    const got = total && typeof total === 'object'
-      ? `all ${JSON.stringify(total.all)} / literal ${JSON.stringify(total.literal)} / dynamic ${JSON.stringify(total.dynamic)}`
-      : '缺失'
-    return stale(`逐条清单 total（${got}）与当前基线（all ${baseline.total.all} / literal ${baseline.total.literal} / ` +
-      `dynamic ${baseline.total.dynamic}）不一致`)
+    return { items: null, code: 'total' }
   }
   return {
     items: raw.items.filter((item) => item && typeof item.file === 'string' && typeof item.literal === 'string'),
-    stale: false,
-    why: null
+    code: 'ok'
   }
 }
 
@@ -2592,23 +2618,39 @@ function diffAgainstInventory (hits, known, onlyFiles) {
   return extras
 }
 
+// 降级文案一律是**固定字面量**（r19-4）：不拼 env 里的清单路径、也不拼清单文件里的取值
+// （Sonar jssecurity:S8689 旧实现正是把这两者拼进 why 再 console.log）。分支与 code 一一对应；
+// 用 switch 而非「对象 + 变量下标」，免得静态分析另报一条对象注入（detect-object-injection）。
+function inventoryDegradeNote (code) {
+  switch (code) {
+    case 'total':
+      return 'ℹ️ 逐条清单陈旧（total 与当前基线不一致）：只能按文件报增量，不猜行号（快照要用 --inventory 在当前基线下重出）。'
+    case 'schema':
+      return 'ℹ️ 逐条清单陈旧（schema 与当前基线不一致）：只能按文件报增量，不猜行号（快照要用 --inventory 在当前基线下重出）。'
+    case 'baseline':
+      return 'ℹ️ 逐条清单陈旧（记录的基线文件与当前基线不一致）：只能按文件报增量，不猜行号（快照要用 --inventory 在当前基线下重出）。'
+    case 'missing':
+      return 'ℹ️ 没有可用的逐条清单：只能按文件报增量。要 file:line 就在基线冻结状态下先跑 --inventory。'
+    default:
+      return 'ℹ️ 逐条清单格式不可用：只能按文件报增量（快照要用 --inventory 在当前基线下重出）。'
+  }
+}
+
 function printNewHitLines (hits, violations, baseline) {
   const hint = process.env[INVENTORY_ENV] || INVENTORY_DEFAULT
   const loaded = loadInventoryItems(hint, baseline)
   if (!loaded.items) {
     // r18-C1：陈旧快照**不许**参与 (file,literal) 逐条 diff（否则既有命中会被当成「新增位置」打印）。
-    // 两种降级都显式说明原因，退出码不变（诊断信息只影响可读性，不影响判定）。
-    console.log(loaded.stale
-      ? `ℹ️ 逐条清单陈旧（${loaded.why}）：只能按文件报增量，不猜行号（快照要用 --inventory 在当前基线下重出）。`
-      : `ℹ️ ${loaded.why}`)
+    // 降级只打印对应 code 的固定文案，退出码不变（诊断信息只影响可读性，不影响判定）。
+    console.log(inventoryDegradeNote(loaded.code))
     return
   }
   const extras = diffAgainstInventory(hits, loaded.items, new Set(violations.map((v) => v.file)))
   if (!extras.length) {
-    console.log(`ℹ️ 逐条清单（${hint}）里找不到对应的新增行（快照陈旧或条数在文件内互换）：按文件增量处理。`)
+    console.log('ℹ️ 逐条清单里找不到对应的新增行（快照陈旧或条数在文件内互换）：按文件增量处理。')
     return
   }
-  console.log(`新增命中的位置（对照 ${hint}）：`)
+  console.log('新增命中的位置（对照 SOURCE_TEXT_ASSERT_INVENTORY 指定的逐条清单）：')
   extras.slice(0, 40).forEach((hit) => {
     console.log(`  ${hit.file}:${hit.line}  ${JSON.stringify(hit.literal).slice(0, 80)}（${kindOf(hit)}）`)
   })

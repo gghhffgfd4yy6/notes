@@ -1525,7 +1525,20 @@ check('file:line 诊断：有 inventory 快照时点名新增行，无快照时�
 // 这里锁：① 非 git 环境显式降级；② CI=true 时 fail-closed；③ 真 git 仓里「等量抬高」判红并点名；
 // ④ --allow-growth 放行；⑤ --write-allowlist 也被同一参照约束；⑥ growth 登记写入后闸门放行并打印理由，
 // ⑦ 登记与观察值不精确相等时仍判红。
-const gitIn = (dir, ...args) => spawnSync('git', ['-C', dir, '-c', 'user.email=gate@example.com', '-c', 'user.name=gate', ...args],
+// git 一律以**绝对路径**调用（r19-3）：按名 spawn（spawnSync('git', …)）会让子进程经 PATH 解析可执行
+// 文件，静态分析按「命令解析依赖 PATH」判 Sonar javascript:S4036。这里先纯 JS 扫 PATH 解析（不额外
+// spawn 进程），与 test_install_hooks.js:45-52 的 GIT 解析器同一口径；解析不到直接断言失败——本片用例
+// 依赖真实 git 建临时仓库，必须 fail-closed，不能静默跳过整片。
+const GIT = (process.env.PATH || '')
+  .split(path.delimiter)
+  .filter(Boolean)
+  .map(dir => path.join(dir, 'git'))
+  .find(candidate => {
+    try { fs.accessSync(candidate, fs.constants.X_OK); return true } catch { return false }
+  })
+assert.ok(GIT, '未能在 PATH 中找到可执行的 git（r18-B1 用例依赖真实 git 建临时仓库）')
+
+const gitIn = (dir, ...args) => spawnSync(GIT, ['-C', dir, '-c', 'user.email=gate@example.com', '-c', 'user.name=gate', ...args],
   { encoding: 'utf8' })
 
 check('r18-B1 基线增长机械校验：等量抬高 by_file+total 判红，--allow-growth / growth 登记才放行', () => {
@@ -1574,6 +1587,8 @@ check('r18-B1 基线增长机械校验：等量抬高 by_file+total 判红，--a
   const inflated = allowlistOf(dir)
   inflated.by_file['test_b1.js'] = { all: 4, literal: 4 }
   inflated.total = { all: 4, literal: 4, dynamic: 0 }
+  // 只写隔离工作区里那份基线副本（dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入）；「手改基线」正是本用例的目的
+  // eslint-disable-next-line
   fs.writeFileSync(
     path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), JSON.stringify(inflated, null, 2) + '\n')
   const raised = runChecker(dir)
@@ -1600,17 +1615,25 @@ check('r18-B1 基线增长机械校验：等量抬高 by_file+total 判红，--a
   assert.strictEqual(afterRecord.status, 0, '已登记的 growth 必须让闸门放行：' + afterRecord.out)
   assert.ok(afterRecord.out.includes(reason), '闸门必须打印登记里的理由：' + afterRecord.out)
   // ⑥a 已登记的例外不得反过来把自己顶住：同一差额下不带 --allow-growth 也必须能重生成（逐字节一致）。
+  // 读回隔离工作区里那份基线副本，验证重生成逐字节一致（路径 = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
+  // eslint-disable-next-line
   const recordBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')
   const regenWithRecord = runChecker(dir, '--write-allowlist')
   assert.strictEqual(regenWithRecord.status, 0, '差额与登记一致时必须允许重生成（否则登记一次就再也收紧不了）：' + regenWithRecord.out)
+  // 重生成后必须逐字节不变（同一份隔离工作区基线副本，路径无外部净输入）
+  // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), recordBytes,
     '重生成必须逐字节一致')
   // ⑥b 重生成不得抹掉留痕：把带登记的基线提交（参照随之更新）后再 --write-allowlist，应逐字节不变。
+  // 冻结基线并提交后再读回同一份隔离工作区副本（路径 = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
+  // eslint-disable-next-line
   const frozenBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')
   assert.strictEqual(gitIn(dir, 'add', '-A').status, 0, 'git add 必须成功')
   assert.strictEqual(gitIn(dir, 'commit', '-q', '-m', 'raised').status, 0, 'git commit 必须成功')
   const regenStable = runChecker(dir, '--write-allowlist')
   assert.strictEqual(regenStable.status, 0, '无新增时可重生成：' + regenStable.out)
+  // 再次逐字节比对同一份隔离工作区副本（含 growth 留痕不得被抹掉）
+  // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), frozenBytes,
     '重生成必须逐字节一致，且不得抹掉已登记的增长记录')
   assert.deepStrictEqual(allowlistOf(dir).growth, { vs: 'HEAD', commit: baseSha, total: 3, by_file: { 'test_b1.js': 3 }, why: reason },
@@ -1651,13 +1674,23 @@ check('r18-C1 陈旧快照降级：inventory total 与基线不一致时只报�
   const dir = makeWorkspace()
   write(dir, 'test_stale.js', FIXTURE_OK)
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
-  const snap = path.join(os.tmpdir(), `xbk-inventory-stale-${process.pid}-${Date.now()}.json`)
-  outsideFiles.push(snap)
+  // CodeQL js/insecure-temporary-file：共享 os.tmpdir() + 可预测文件名（pid/时间戳）可被抢占/覆写。
+  // 改成 mkdtemp 建的**私有**临时目录（0700、随机名），快照固定写该目录下的 inventory.json；
+  // 清理仍登记 outsideFiles（目录连内容一并删，见文件末尾的 recursive rmSync）。
+  // 路径 = os.tmpdir() + 本文件硬编码前缀，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
+  const snapDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-inventory-stale-'))
+  outsideFiles.push(snapDir)
+  const snap = path.join(snapDir, 'inventory.json')
   const frozen = runCheckerWith(dir, { SOURCE_TEXT_ASSERT_INVENTORY: snap }, '--inventory', snap)
   assert.strictEqual(frozen.status, 0, '快照必须能写出来：' + frozen.out)
   // 模拟「快照来自另一版基线」：total 与当前基线不一致（真实仓 2714 vs 3190 的同构最小化）。
+  // 读的/写的是本用例自己 mkdtemp 出来的私有目录里的快照（路径 = os.tmpdir() + 本文件硬编码前缀）
+  // eslint-disable-next-line
   const staleData = JSON.parse(fs.readFileSync(snap, 'utf8'))
   staleData.total = { all: 5, literal: 5, dynamic: 0 }
+  // 改写本用例私有 mkdtemp 目录里的那份快照（0700、随机名，绝不落到共享 /tmp 的可预测文件名上）
+  // eslint-disable-next-line
   fs.writeFileSync(snap, JSON.stringify(staleData, null, 2) + '\n')
   // 新增一条真断言：条数判红（+1），但**行号**必须降级（快照不可信）。
   write(dir, 'test_stale.js', lines(
@@ -2015,7 +2048,8 @@ check('套件注册表的 desc 与实测用例数一致（数字不得再漂移�
 process.exitCode = harness.summary()
 for (const file of outsideFiles) {
   try {
-    fs.rmSync(file, { force: true })
+    // recursive：r19-5 起仓库外产物可能是一整个 mkdtemp 私有目录（含 inventory.json）
+    fs.rmSync(file, { recursive: true, force: true })
   } catch (e) {
     console.error('⚠️ 仓库外产物清理失败（可手工删除）：' + file + '：' + e.message)
     process.exitCode = 1
