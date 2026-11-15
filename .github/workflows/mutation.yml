@@ -189,7 +189,7 @@ jobs:
       # --mutate 只是给 stryker 一个合法目标：dry run 跑的是 tap.testFiles 的**全部**文件，
       #   与矩阵里实际变异的文件无关；这里选纯函数、无 IO 的 xbk_state_schema.js。
       - name: dry run 预检（TAP 档全量测试文件）
-        run: npx stryker run stryker.tap.config.js --mutate "xbk_state_schema.js" --dryRunOnly --concurrency 8
+        run: npx stryker run stryker.tap.config.js --mutate "xbk_state_schema.js" --dryRunOnly --concurrency 2
         env:
           PERF_MS: 3000
           SKIP_SUITES: ''
