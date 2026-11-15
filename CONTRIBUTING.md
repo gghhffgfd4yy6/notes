@@ -23,14 +23,14 @@
     - **孤儿测试桩**（`stub_heartbeat` / `test_stub_tree`）与**孤儿套件进程**：特征只说明「它是测试夹具」，不说明它是残留——两者的孤儿判据都是**父进程已没**（`ppid===1`，或 ppid 不在进程表里）。只看特征会把另一条终端正在跑的活动桩报成孤儿，让第二个运行拒绝启动。
     - **过期 `<os.tmpdir()>/xbk-*` 沙箱**（Linux 即 `/tmp`）：活跃时间取「目录自身 + 它的**直接子项**里最新的 mtime」，因为目录自身 mtime 只在增删/改名条目时前进（本机实测：往已有文件追加一次，目录 mtime 一秒没动）；先筛出过期候选，没有候选时不扫描所有进程 cwd；有候选时只要任何活进程把该沙箱当 cwd（`run_mutation.js` 的 `spawn({cwd: dir})` 正是这形态）就直接豁免——判红会打印 `rm -rf`，误判活动沙箱等于劝人删掉正在跑的运行。若 cwd 保护信号不可扫描则 fail-closed，不生成清理建议；错误输出只含 PID、errno、proc 状态和 UID 等诊断元数据，不含 cwd 路径或命令行。阈值 30 分钟由 `--stale-min` 可调、由断言钉住；普通文件和符号链接不进入清理建议。
     - 跳过条件（`XBK_MUTATION_CHILD=1`）、上述判据与入口接线由 `test_host_clean_gates.js` 锁死；独立跑用 `npm run check:host-clean`。
-  - Android/Termux 宿主：`execPath` 指向 `linker64` ⇒ 子进程断言必炸；缺 `re2` ⇒ `test:filter` 失真 ⇒ 只有 lint / 版本闸门 / 变异行段 / 静态扫描 / 文档行长这五道不 spawn 子进程的闸门可当判据。
+  - Android/Termux 宿主：`execPath` 指向 `linker64` ⇒ 子进程断言必炸；缺 `re2` ⇒ `test:filter` 失真 ⇒ 只有 lint / 版本闸门 / 变异行段 / 静态扫描 / 源码文本断言 / 文档行长这六道不 spawn 子进程的闸门可当判据。
   - 两条共同的红线：**不要把本机全绿当作契约已验证**（CI 才是跨环境判据），也**不要用「本机跑不了」免除本机验证**。
 
 ## 本地钩子
 
 `npm run hooks:install` 注册 `.githooks`：
 
-- **`pre-commit`** —— 五道快检：lint / 版本闸门 / 变异行段校验 / 静态扫描（v3.280 起第 4 道）/ 文档行长（v3.281 起第 5 道）。本机实测 lint 约 22s、其余各 <1s。
+- **`pre-commit`** —— 六道快检：lint / 版本闸门 / 变异行段校验 / 静态扫描（v3.280 起第 4 道）/ 源码文本断言（v3.444 起第 5 道，`npm run check:assert-style`）/ 文档行长（v3.281 加，现第 6 道）。本机实测 lint 约 22s、其余各 <1s（源码文本断言是纯 acorn 扫描，约 3s）。
 - **`pre-push`** —— 跑 `npm run test:filter`（约 60s，推送前拦截）。校验对象是**被推提交的内容**：工作树不干净（含未跟踪文件；被 ignore 的不算）或推的不是当前 HEAD 时，改在临时 worktree 里检出那个提交再跑；隔离环境建不起来则 fail-closed——绝不拿当前工作树的结果冒充被推提交。
 - **`commit-msg`** —— 见上节的首行格式与长度限制。
 
@@ -45,7 +45,7 @@ npm 不会自动注册仓库钩子，克隆后**必须显式装一次**；装完
 
 ## 文档行长闸门（v3.281）
 
-- `npm run check:doc-lines` 让任何被扫描的 markdown 出现 **>1200 字符**的单行即红；三处接线同一阈值（`npm run check` / pre-commit 第 5 道 / CI `policy` job 显式步骤），接线由 `test_doc_line_gates.js` 用内容断言锁死（含「阈值必须恰为 1200」「`.github` 不得进跳过名单」「扫描面不得漏掉任何一份 prose」）。
+- `npm run check:doc-lines` 让任何被扫描的 markdown 出现 **>1200 字符**的单行即红；三处接线同一阈值（`npm run check` / pre-commit 第 6 道 / CI `policy` job 显式步骤），接线由 `test_doc_line_gates.js` 用内容断言锁死（含「阈值必须恰为 1200」「`.github` 不得进跳过名单」「扫描面不得漏掉任何一份 prose」）。
 - **没有例外名单**：超了就按语义拆成子弹/表格，改完跑 `npm run check:doc-lines` 自查；把阈值调大 = 闸门形同虚设，那条断言会先红。
 - 为什么值得做一道门禁：巨行的代价不是难看，而是评审放弃逐字核对 + diff 一行改动等于整行重写；AGENTS 曾长到单行 8132 字符、CHANGELOG 4788，v3.280 才重切完，没有这道闸门它就会自然长回去。
 

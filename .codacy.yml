@@ -325,13 +325,22 @@
 #   · scripts/check-source-text-asserts.js：ROOT=__dirname 常量 + readdirSync 枚举出的 test_*.js /
 #     test_support 文件；白名单文件在脚本旁边（常量）。读的是本仓测试源码，只有人工 --write-allowlist 才写盘；
 #   · scripts/probe-format-coupling.js：ROOT=__dirname 常量 + 扰动面枚举（仓内 .js/.mjs/.cjs/.json/
-#     .yml/.yaml/.css/.html，测试面除外）+ 命令行给出的 test_*.js 名单；写回的是**刚刚读出的原文备份**
+#     .yml/.yaml/.css/.html 与 shell（.sh/.bash/.githooks 钩子），含 .github/** 与 .githooks/**，测试面除外）
+#     + 命令行给出的 test_*.js 名单；写回的是**刚刚读出的原文备份**
 #     （try/finally 还原，退出前打印「已还原 N 个文件」并与 git status 对账）；
 #   · test_support/source_model.js：调用方给出的仓库**相对**路径，内部按 ROOT 拼接后只读，不写盘不联网。
-# 三者的「遍历/重排/还原/读指定文件」都是本职行为。输入口径要分开说清楚（v3.446 更正）：
-# checker 与 source_model **没有**环境变量或 CLI 输入；探针只用 `PATH` 定位 `git`（Sonar S4036 的命中点，
-# 已改成「纯 JS 扫 PATH 得绝对路径、再以绝对路径 spawn」）、只用命令行给出的测试名单去读本仓测试文件
-# ——两者都不是外部不可信输入（PATH 由运行者环境决定、名单由运行者手工给出）。
+# 三者的「遍历/重排/还原/读指定文件」都是本职行为。输入口径要分开说清楚（v3.450 更正 r8-5：
+# 旧句写「checker 与 source_model 没有环境变量或 CLI 输入」，与代码相反）：
+#   · checker **有** env `SOURCE_TEXT_ASSERT_INVENTORY` 与 CLI `--inventory [path]` / `--inventory=<path>` /
+#     `--write-allowlist`（v3.448 起）。它们只决定**逐条清单写到哪里**，不决定扫描面、也不改变读到的内容：
+#     `--inventory` 的目标经 path.resolve 后过 assertOutsideRepo（落在仓库目录内一律 exit 2 拒绝），写出的是
+#     本进程刚扫出来的清单；`--write-allowlist` 写的是脚本旁边那个常量路径的紧凑基线。两者都不接受外部
+#     内容作为输入（不读 stdin、不联网、不按入参拼 require）；
+#   · source_model 无 env / CLI 输入（调用方给仓库相对路径，内部按 ROOT 拼接后只读、不写盘不联网）；
+#   · 探针只用 `PATH` 定位 `git`（Sonar S4036 的命中点，已改成「纯 JS 扫 PATH 得绝对路径、再以绝对路径
+#     spawn」）、只用命令行给出的测试名单去读本仓测试文件；env 只有 `PROBE_TIMEOUT_MS`（单条测试上限）与
+#     `PROBE_FORCE_UNPARSEABLE`（自测用故障注入，只接受仓库内相对路径，只影响「重排后无法解析」那条分支）。
+#     都不是外部不可信输入（PATH 由运行者环境决定、名单由运行者手工给出）。
 # 不删/不放宽任何断言；三个文件的真实行为仍由 npm test / CI 全量执行，闸门自身的用例在
 # test_check_source_text_asserts.js（正向必红 / 反向必绿各一组）。
 exclude_paths:

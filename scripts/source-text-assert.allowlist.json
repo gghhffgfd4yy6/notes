@@ -1,7 +1,7 @@
 {
-  "note": "紧凑基线（schema 2）：只冻结「文件 → 条数」，逐条清单不随仓库走（node scripts/check-source-text-asserts.js --inventory 出仓）。判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，receiver 确实绑定到源码文本但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 动态 RegExp）——把字面量提成常量不得让整条断言从检测面上消失。已知取舍：按文件计数看不到同一文件内 literal 之间的互换（N 条换 N 条仍绿），只有 --inventory 的 diff 能看到。重生成：node scripts/check-source-text-asserts.js --write-allowlist（改基线才用，正常不要跑；round-trip 逐字节稳定）。",
+  "note": "紧凑基线（schema 2）：只冻结「文件 → 条数」，逐条清单不随仓库走（node scripts/check-source-text-asserts.js --inventory 出仓）。扫描面：仓库根 test_*.js + test_support/** + test/**（test/ 是既有辅助代码目录，不是用例目录）；被 require 的本地模块（test_support / test / scripts 等）按其导出函数的「形参 → 字符串比对」摘要，在调用点按实参入账（跨文件 helper 不再漏检）。判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，receiver 确实绑定到源码文本但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 动态 RegExp）——把字面量提成常量不得让整条断言从检测面上消失。已知取舍：按文件计数看不到同一文件内 literal 之间的互换（N 条换 N 条仍绿），只有 --inventory 的 diff 能看到。重生成：node scripts/check-source-text-asserts.js --write-allowlist（改基线才用，正常不要跑；round-trip 逐字节稳定）。",
   "schema": 2,
-  "total": { "all": 2714, "literal": 2575, "dynamic": 139 },
+  "total": { "all": 2721, "literal": 2581, "dynamic": 140 },
   "by_file": {
     "test_agents.js": { "all": 1, "literal": 1 },
     "test_analyze_artifacts.js": { "all": 1, "literal": 1 },
@@ -24,8 +24,8 @@
     "test_message_store_journal.js": { "all": 6, "literal": 5 },
     "test_message_store_utils.js": { "all": 4, "literal": 4 },
     "test_mutation_ranges.js": { "all": 9, "literal": 8 },
-    "test_mutation_report.js": { "all": 2, "literal": 1 },
-    "test_mutation_report_cli.js": { "all": 74, "literal": 67 },
+    "test_mutation_report.js": { "all": 7, "literal": 5 },
+    "test_mutation_report_cli.js": { "all": 76, "literal": 69 },
     "test_network.js": { "all": 1, "literal": 1 },
     "test_notify.js": { "all": 5, "literal": 4 },
     "test_notify_selfcheck.js": { "all": 16, "literal": 11 },

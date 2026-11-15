@@ -29,7 +29,7 @@ const CHECKER = path.join(ROOT, 'scripts', 'check-source-text-asserts.js')
 const PROBE = path.join(ROOT, 'scripts', 'probe-format-coupling.js')
 // 字面量相对路径 require（Codacy/Opengrep「非字面量 require」）：与本文件其它 require 同口径，
 // 解析结果与 require(CHECKER) 完全相同——CHECKER/PROBE 两个常量仍留给 copyFileSync / spawn 用。
-const { analyzeSource, compareByFile } = require('./scripts/check-source-text-asserts.js')
+const { analyzeSource, compareByFile, listScanFiles } = require('./scripts/check-source-text-asserts.js')
 
 // 与 test_ci_static_gates.js / test_doc_line_gates.js 同一套 harness 形态：每条检查独立捕获，
 // passed/failed 双计数，末尾统一汇总并置非零退出码（harness 自身也有用例，见文件末尾）。
@@ -231,7 +231,37 @@ const POSITIVE = [
       'assert.ok(NEEDLES.some((n) => src.includes(n)))',
       'for (const lit of NEEDLES) assert.ok(src.includes(lit))',
       "const MAP = { k: 'K' }",
-      'assert.ok(src.includes(MAP.k))'), ['<dynamic>', '<dynamic>', '<dynamic>']]
+      'assert.ok(src.includes(MAP.k))'), ['<dynamic>', '<dynamic>', '<dynamic>']],
+  // ── r8-1（计算成员 / .bind / .call / .apply / 方括号读取：与 `src.includes('X')` 语义完全等价的七种写法） ──
+  ['计算成员（src["includes"](…)）：一个方括号就能绕过旧判定',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.ok(src['includes']('BRACKET'))"), ['BRACKET']],
+  ['计算成员模板键（src[`includes`](…)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'assert.ok(src[`includes`](\'BRACKET_TMPL\'))'), ['BRACKET_TMPL']],
+  ['.bind 后的别名调用（const inc = src.includes.bind(src); inc(…)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'const inc = src.includes.bind(src)',
+      "assert.ok(inc('BOUND'))"), ['BOUND']],
+  ['String.prototype.includes.call(src, …)',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.ok(String.prototype.includes.call(src, 'PROTO_CALL'))"), ['PROTO_CALL']],
+  ['[].includes.call(src, …)（数组原型方法当字符串比对用）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.ok([].includes.call(src, 'ARRAY_CALL'))"), ['ARRAY_CALL']],
+  ['String.prototype.includes.apply(src, [ … ])',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.ok(String.prototype.includes.apply(src, ['APPLIED']))"), ['APPLIED']],
+  ['方括号读源码（fs["readFileSync"](…)）——读取面本身也能被方括号绕过',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs['readFileSync']('a.js', 'utf8')",
+      "assert.ok(src.includes('FS_BRACKET'))"), ['FS_BRACKET']]
 ]
 
 // ── B. 反向：receiver 不是源码文本就必须不命中（否则误报会把基线灌满） ──────
@@ -241,6 +271,14 @@ const NEGATIVE = [
       "async function request () { return { text: 'xbk-push 控制台' } }",
       'const res = await request()',
       "assert.ok(res.text.includes('xbk-push 控制台'))"), []],
+  ['字符串字面量做 thisArg 的 .call（String.prototype.includes.call(\'abc\',\'b\')：receiver 不是源码文本）',
+    lines("const assert = require('node:assert')",
+      "assert.ok(String.prototype.includes.call('abc', 'b'))"), []],
+  ['动态计算键（obj[k](…)）：键不是字面量，不猜也不入账',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const k = 'includes'",
+      'assert.ok(src[k](\'DYN_KEY\'))'), []],
   ['同名局部变量只在自己的作用域里生效（另一函数的 text 形参不得被污染）',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "function a () { const text = fs.readFileSync('a.js', 'utf8'); return text.length }",
@@ -257,8 +295,8 @@ const NEGATIVE = [
       "assert.ok(arr.includes('x'))"), []]
 ]
 
-// ── A/B 执行：24 个正向形态 + 4 个反向形态 ─────────────────────────────────
-check('检测面：24 种「读源码文本」写法逐个命中（含旧实现漏检的 23 种：r4-1 的 7 种绕过写法 + 字面量表/映射表）', () => {
+// ── A/B 执行：31 个正向形态 + 6 个反向形态 ─────────────────────────────────
+check('检测面：31 种「读源码文本」写法逐个命中（含旧实现漏检的：r4-1 的 7 种绕过写法 + r8-1 的 7 种等价形态 + 字面量表/映射表）', () => {
   const missed = POSITIVE.filter(([, code, expected]) => {
     const got = analyzeSource(code, 'positive.js').map((hit) => hit.literal)
     return JSON.stringify(got) !== JSON.stringify(expected)
@@ -275,6 +313,13 @@ check('反向：receiver 不是源码文本时一律不命中（res.text / 遮�
   assert.deepStrictEqual(wrong, [], '以下形态被误判成源码文本断言（会把基线灌满噪声）：\n' + wrong.join('\n'))
 })
 
+// 退出码用例的公共夹具（放在这里是因为下面的扫描面用例也用它）。
+const FIXTURE_OK = [
+  "const fs = require('node:fs')",
+  "const src = fs.readFileSync('a.js', 'utf8')",
+  "module.exports = () => src.includes('FIRST')"
+].join('\n') + '\n'
+
 check('扫描面包含 test_support/**/*.js（旧实现只看仓库根 test_*.js）', () => {
   const dir = makeWorkspace()
   write(dir, 'test_root.js', lines("const assert = require('node:assert')", 'assert.ok(1 === 1)'))
@@ -289,12 +334,84 @@ check('扫描面包含 test_support/**/*.js（旧实现只看仓库根 test_*.js
   assert.ok(result.out.includes('test_support/helper.js'), '必须点名 test_support/helper.js：' + result.out)
 })
 
+// ── r8-3：`test/` 是仓库既有的**辅助代码**目录，必须与 test_support/ 同权在扫描面内 ─────────
+// 反例（评审实测）：把一条「读源码文本 + 比对」整段搬进 test/ 下的 helper 再 require，该文件的条数
+// 下降（shortfall 合法）而断言一条没少 —— 白名单可以这样一路降到 0 且每步都 ✅。
+check('扫描面包含 test/**（既有辅助代码目录，不是测试用例目录）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test/move_src.js', lines(
+    "const fs = require('node:fs')",
+    'module.exports.assertInTestDir = function (file, assert) {',
+    "  const src = fs.readFileSync(file, 'utf8')",
+    "  assert.ok(src.includes('IN_TEST_DIR'))",
+    '}'
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, 'test/ 里的命中必须判红：' + result.out)
+  assert.ok(result.out.includes('test/move_src.js'), '必须点名 test/move_src.js：' + result.out)
+  // 仓内真扫描面也把 test/ 的既有文件包进来（目录存在即可断言，不依赖条数）。
+  const scan = listScanFiles()
+  const existing = fs.readdirSync(path.join(ROOT, 'test')).filter((name) => name.endsWith('.js')).map((name) => 'test/' + name)
+  assert.ok(existing.length > 0, '仓库 test/ 目录下应有既有 .js 辅助文件')
+  for (const rel of existing) assert.ok(scan.includes(rel), `扫描面必须包含 ${rel}：${scan.length} 个文件里没有它`)
+})
+
+// ── r8-2：跨文件 helper 的污染传播 ─────────────────────────────────────────
+// 反例（评审实测）：`test_support/hastext.js` 导出 `hasText(s, n) { return s.includes(n) }`，
+// 测试 `assert.ok(hasText(src, 'X'))` —— 形参污染不跨 require 边界，两个文件各自 0 命中、exit 0。
+check('跨文件 helper：断言搬进 test_support 导出函数后仍被抓（形参污染跨 require 传播）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_use.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'module.exports = () => src.length > 0'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入（此时 0 条）')
+  // helper 与调用点一起出现：命中必须落回调用点所在文件。
+  write(dir, 'test_support/hastext.js', lines(
+    'function hasText (s, n) { return s.includes(n) }',
+    'module.exports = { hasText }'
+  ))
+  write(dir, 'test_use.js', lines(
+    "const fs = require('node:fs')",
+    "const { hasText } = require('./test_support/hastext.js')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => hasText(src, 'CROSSFILE')"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '跨 require 边界的 helper 必须仍判红：' + result.out)
+  assert.ok(/test_use\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out), '命中必须记在调用点文件上：' + result.out)
+  // 反向：helper 收不到源码文本（实参是普通字符串）时不得凭空记一条。
+  write(dir, 'test_use.js', lines(
+    "const { hasText } = require('./test_support/hastext.js')",
+    "module.exports = () => hasText('hello', 'ell')"
+  ))
+  const plain = runChecker(dir)
+  assert.strictEqual(plain.status, 0, '实参不是源码文本时不得记命中：' + plain.out)
+})
+
+check('跨文件 helper：锚点在 helper 体内（hasText 固定锚点）与命名空间 require 都认', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  write(dir, 'test_support/anchor.js', lines(
+    'function hasBuildMarker (s) { return s.includes(\'function buildCacheShard (\') }',
+    'module.exports = { hasBuildMarker }'
+  ))
+  write(dir, 'test_ns.js', lines(
+    "const fs = require('node:fs')",
+    "const helpers = require('./test_support/anchor.js')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'module.exports = () => helpers.hasBuildMarker(src)'
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '体内字面量锚点也必须入账：' + result.out)
+  assert.ok(/test_ns\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out), '必须点名 test_ns.js：' + result.out)
+})
+
 // ── 退出码语义（F1 / F3 / 形状校验 / 少数提示） ─────────────────────────────
-const FIXTURE_OK = [
-  "const fs = require('node:fs')",
-  "const src = fs.readFileSync('a.js', 'utf8')",
-  "module.exports = () => src.includes('FIRST')"
-].join('\n') + '\n'
 
 check('退出码 1：新增一处行内直读即红，并按文件报增量（F1 回归）', () => {
   const dir = makeWorkspace()
@@ -739,6 +856,59 @@ check('探针：读到扰动面之外的资产必须 format-uncertified + exit 2
   assert.ok(/format-uncertified/.test(result.out), '必须判 format-uncertified（不是 format-clean）：' + result.out)
   assert.ok(/assets\/doc\.md/.test(result.out), '必须点名不在扰动面的文件：' + result.out)
   assert.ok(/not-covered/.test(result.out), '必须显式说 not-covered：' + result.out)
+})
+
+// ── r8-4：点目录必须进扰动面（.github/** 与 .githooks/** 是仓库源码） ────────────
+// 反例（评审实测）：旧 walk() 对 `entry.name.startsWith('.')` 直接 continue，于是读 workflow / 钩子
+// 做「整行 / 键级」断言的测试既不在扰动面、也不在 reference 快照里 —— 一律判 format-clean（假绿）。
+check('探针：.github/** 与 .githooks/** 在扰动面内（读它们的逐字断言不得假绿）', () => {
+  const dir = probeWorkspace()
+  write(dir, '.github/workflows/w.yml', 'name: t\njobs:\n  quality:\n    runs-on: ubuntu-latest\n')
+  write(dir, '.githooks/pre-commit', '#!/bin/bash\nset -e\nrun_gate "lint" "提示" npm run lint\n')
+  write(dir, 'test_dot.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    "const wf = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'w.yml'), 'utf8')",
+    "assert.ok(wf.includes('\\n  quality:\\n'), 'quality job 的键必须逐字存在')",
+    "const hook = fs.readFileSync(path.join(__dirname, '.githooks', 'pre-commit'), 'utf8')",
+    "assert.ok(hook.includes('\\nrun_gate \"lint\" \"提示\"'), '钩子里的 run_gate 行必须逐字存在')"
+  ))
+  const result = runProbe(dir, 'test_dot.js')
+  // 判 coupled（exit 1）而不是 not-covered（exit 2）：说明它们真的进了扰动面，而不是只进快照。
+  assert.strictEqual(result.status, 1, '.github/.githooks 的逐字断言必须判 coupled：' + result.out)
+  assert.ok(/test_dot\.js\s+format-coupled/.test(result.out), '必须判 format-coupled：' + result.out)
+  // 还原必须干净（点目录里的文件也在备份/还原范围内）。
+  assert.strictEqual(fs.readFileSync(path.join(dir, '.githooks/pre-commit'), 'utf8'), // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的钩子路径，无外部净输入）
+    '#!/bin/bash\nset -e\nrun_gate "lint" "提示" npm run lint\n', '钩子必须逐字节还原')
+})
+
+check('shell 扰动只改空白：shebang / heredoc 正文逐字保留，非空白内容不变', () => {
+  const { mutate } = require('./scripts/probe-format-coupling.js')
+  const src = lines(
+    '#!/bin/bash',
+    'set -e',
+    'run_gate "lint" "提示" npm run lint',
+    "cat <<'EOF'",
+    '  原样 保留 # 不是注释',
+    'EOF',
+    'if [ "$a" = b ]; then',
+    '  echo "a  b"',
+    'fi'
+  )
+  const out = mutate(src, '.githooks/pre-commit')
+  assert.notStrictEqual(out, src, 'shell 扰动必须真的改变文本')
+  const before = src.split('\n')
+  const after = out.split('\n')
+  assert.strictEqual(after.length, before.length, '扰动不得增删行')
+  for (let i = 0; i < before.length; i++) {
+    assert.strictEqual(before[i].replace(/\s+/g, ''), after[i].replace(/\s+/g, ''),
+      `第 ${i + 1} 行只允许空白变化：${JSON.stringify(before[i])} → ${JSON.stringify(after[i])}`)
+  }
+  assert.strictEqual(after[0], before[0], 'shebang 必须逐字保留（`#!` 必须是文件头两个字节）')
+  assert.strictEqual(after[4], before[4], 'heredoc 正文是数据，必须逐字保留')
+  assert.ok(out.includes('run_gate  "lint"'), '第一个 token 间空白必须加倍（行尾补空格拦不住「命令 + 参数」锚点）')
+  assert.ok(out.includes('echo  "a  b"'), '引号内的空白不得被改')
 })
 
 check('探针：fail-closed 分支（重排后无法解析）必须还原已写盘的文件并打印「已还原 N 个文件」（r4-3）', () => {

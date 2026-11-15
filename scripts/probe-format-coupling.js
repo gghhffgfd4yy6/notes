@@ -21,6 +21,11 @@
  *     `scripts/check-deps.js` 的反向扫描会判「代码 require 了未声明的包」（不为一个探针加运行时依赖）。
  *   - `.css`：字符串/注释/括号内（`url(…)` 的数据串）不动，`;`/`{`/`}` 两侧插空格 + 重缩进。
  *   - `.html` / `.htm`：只重缩进，`<pre>/<textarea>/<script>/<style>` 块内跳过。
+ *   - shell（`.sh` / `.bash` / `.githooks/*` 的无扩展名钩子）：每个非空行把**第一个引号外的空白**
+ *     扩成两个（shell 按空白串切词，语义不变；注释行、续行、heredoc 正文、shebang 跳过）。
+ *   - 点目录：`.github/**`、`.githooks/**` 是仓库源码，进扰动面与快照（r8-4：早先按
+ *     `entry.name.startsWith('.')` 一刀切跳过，于是读 workflow / 钩子的逐字断言永远判 format-clean）；
+ *     只有 `SKIP_DIRS` 里逐个登记的目录（node_modules / .git / .stryker-tmp / …）才跳过。
  *   扰动不了的文件（解析失败、格式不支持）**不静默放过**：被测试读到就判 not-covered（exit 2）。
  *   测试文件自身（`test_*.js` / `test/**` / `test_support/**`）不在扰动面：那一层由
  *   `scripts/check-source-text-asserts.js` 的扫描面管辖（探针只管生产/资产；扰动测试文件自身会让
@@ -52,8 +57,18 @@ const acorn = require('acorn')
 const ROOT = path.join(__dirname, '..')
 const LEX_OPTS = { ecmaVersion: 'latest', allowHashBang: true, locations: true }
 const TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS) || 15 * 60 * 1000
-const SKIP_DIRS = new Set(['node_modules', '.git', '.stryker-tmp', '.nyc_output', 'coverage', 'reports', 'scratch'])
+// 目录跳过名单**逐个登记**，不按「点开头」一刀切（r8-4）：早先 `entry.name.startsWith('.')` 把
+// `.github/**` 与 `.githooks/**` 一起跳掉了 ⇒ 它们既不在扰动面也不在快照，测试读它们一律判
+// format-clean（假绿）。现在点目录默认**纳入**，只有下面这些确认「不是仓库源码」的才跳过。
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', '.stryker-tmp', '.nyc_output', 'coverage', 'reports', 'scratch',
+  '.local', '.ai', '.tools', '.cache', '.venv', '.idea', '.vscode'
+])
 const JS_EXT = new Set(['.js', '.mjs', '.cjs'])
+const SHELL_EXT = new Set(['.sh', '.bash'])
+// 无扩展名但确实是脚本的目录（钩子）：`.githooks/pre-commit` 这类文件没有扩展名，光按扩展名认会
+// 把它们排除在扰动面之外——它们的排版断言就永远探不到。
+const SHELL_DIRS = ['.githooks/']
 const EXT_KIND = new Map([
   ['.json', 'json'], ['.yml', 'yaml'], ['.yaml', 'yaml'], ['.css', 'css'], ['.html', 'html'], ['.htm', 'html']
 ])
@@ -72,9 +87,14 @@ function die (code, message) {
 // 扰动面之外、按「解析失败 / 格式不支持」拒绝扰动的文件：不是错误，但被读到就必须 not-covered。
 class NotPerturbable extends Error {}
 
-const kindOf = (rel) => JS_EXT.has(path.extname(rel).toLowerCase())
-  ? 'js'
-  : (EXT_KIND.get(path.extname(rel).toLowerCase()) || null)
+const kindOf = (rel) => {
+  const ext = path.extname(rel).toLowerCase()
+  if (JS_EXT.has(ext)) return 'js'
+  if (EXT_KIND.has(ext)) return EXT_KIND.get(ext)
+  if (SHELL_EXT.has(ext)) return 'shell'
+  if (SHELL_DIRS.some((prefix) => rel.startsWith(prefix) && ext === '')) return 'shell'
+  return null
+}
 
 // 测试面：由 scripts/check-source-text-asserts.js 的扫描面管辖，探针不扰动也不对它下 not-covered 结论。
 const isTestSurface = (rel) => /^test_.*\.js$/.test(rel) || rel.startsWith('test/') || rel.startsWith('test_support/')
@@ -85,7 +105,9 @@ function walk (dir, out = []) {
   for (const entry of fs.readdirSync(abs, { withFileTypes: true })) { // nosemgrep（同上：只遍历本仓）
     const rel = dir ? dir + '/' + entry.name : entry.name
     if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue
+      // 显式名单（r8-4）：`.github/**`、`.githooks/**` 是仓库源码，必须进扰动面与快照；
+      // 只有 SKIP_DIRS 里这些确认不是源码的目录才跳过。
+      if (SKIP_DIRS.has(entry.name)) continue
       walk(rel, out)
     } else if (entry.isFile()) {
       out.push(rel)
@@ -234,6 +256,64 @@ function perturbYaml (code, rel) {
   return mutated
 }
 
+// Shell（`.sh` / `.bash` / `.githooks/*` 的钩子）：行内空白扰动。
+// 语义不变的理由：shell 只在**引号外**按「空白串」切词，一个空格与两个空格是同一个分隔符；
+// 注释行整行跳过（注释正文不是可执行语义）。
+// 为什么动「第一个 token 间空白」而不是行尾补空格：`run_gate "lint"` 这类锚点是「命令 + 第一个参数」，
+// 行尾空格不会让它失配（那是假绿）；行内空白会。整行没有可动的空白（`fi`、`esac`）时补行尾空格，
+// 那同样不改语义。
+// 跳过：shebang（必须是文件头两个字节）、续行（`\` 结尾）、heredoc 正文（是数据，不是代码）。
+function mutateShellLine (line, isShebang) {
+  if (isShebang || line.trim() === '') return line
+  if (line.trimEnd().endsWith('\\')) return line
+  let quote = null
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (quote) {
+      if (c === '\\' && quote === '"') {
+        i++
+        continue
+      }
+      if (c === quote) quote = null
+      continue
+    }
+    if (c === '\\') {
+      i++
+      continue
+    }
+    if (c === '\'' || c === '"') {
+      quote = c
+      continue
+    }
+    // `#` 在词首才是注释起点：注释整行原样保留（改注释正文没有探测价值，却会让 diff 变脏）。
+    if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line
+    if (/\s/.test(c) && i > 0 && !/\s/.test(line[i - 1])) return line.slice(0, i) + ' ' + line.slice(i)
+  }
+  return line + ' '
+}
+
+function perturbShell (code, rel) {
+  const lines = code.split('\n')
+  const out = []
+  let heredoc = null
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]
+    if (heredoc) {
+      out.push(line)
+      const body = heredoc.stripTabs ? line.replace(/^\t+/, '') : line
+      if (body === heredoc.word) heredoc = null
+      continue
+    }
+    out.push(mutateShellLine(line, index === 0 && code.startsWith('#!')))
+    // `<<'EOF'` / `<<-EOF`：正文原样保留到结束标记那一行（含）。
+    const marker = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(line)
+    if (marker) heredoc = { word: marker[3], stripTabs: marker[1] === '-' }
+  }
+  const mutated = out.join('\n')
+  if (mutated === code) throw new NotPerturbable(`${rel}: shell 里没有可扰动的空白行`)
+  return mutated
+}
+
 // 「行首插入两格」式空白扰动：protected 里的行原样保留（跨行字符串/注释/代码块的内容行）。
 function reindent (code, protectedLinesSet) {
   return code.split('\n').map((line, index) =>
@@ -315,6 +395,7 @@ function mutate (code, rel) {
     case 'yaml': return perturbYaml(code, rel)
     case 'css': return perturbCss(code, rel)
     case 'html': return perturbHtml(code, rel)
+    case 'shell': return perturbShell(code, rel)
     default: throw new NotPerturbable(`${rel}: 不在扰动面（${path.extname(rel) || '无扩展名'}）`)
   }
 }
@@ -515,7 +596,7 @@ function main () {
   if (!explicit) tests = DEFAULT_TESTS.filter((t) => fs.existsSync(path.join(ROOT, t))) // nosemgrep（理由：DEFAULT_TESTS 是本文件硬编码常量名单、ROOT 是 __dirname 常量，只做存在性检查不写盘）
   if (!tests.length) {
     die(2, '用法：node scripts/probe-format-coupling.js <test_a.js> [test_b.js …]\n' +
-      '  把扰动面（.js/.mjs/.cjs/.json/.yml/.yaml/.css/.html）重排后逐条跑测试；重排后仍绿的记为 format-clean，\n' +
+      '  把扰动面（.js/.mjs/.cjs/.json/.yml/.yaml/.css/.html/shell）重排后逐条跑测试；重排后仍绿的记为 format-clean，\n' +
       '  读到扰动面之外的文件记为 format-uncertified（exit 2）。不带参数时跑内置自检集：' + DEFAULT_TESTS.join(' '))
   }
   const missing = tests.filter((t) => !fs.existsSync(path.join(ROOT, t))) // nosemgrep（t 只来自命令行给出的测试文件名，用于存在性检查；不写盘）
@@ -531,7 +612,7 @@ function main () {
   const results = []
   let fatal = null
   let restoreFailures = []
-  console.log(`扰动面：候选 ${files.length} 个（.js/.mjs/.cjs + .json/.yml/.yaml/.css/.html，测试面除外）`)
+  console.log(`扰动面：候选 ${files.length} 个（.js/.mjs/.cjs + .json/.yml/.yaml/.css/.html + shell（.sh/.bash/.githooks 钩子），测试面除外）`)
   try {
     for (const rel of files) {
       const original = backups.get(rel)
@@ -562,7 +643,7 @@ function main () {
     console.log(`已扰动 ${written.size} 个文件` +
       `（无需扰动 ${covered.size - written.size} 个，无法安全扰动 ${notPerturbable.size} 个 → 若被读到判 not-covered）\n`)
     if (written.size) {
-      console.log('扰动方式：js/mjs/cjs = 词法边界插空格 + 重缩进；json = 紧凑单行；yaml = 块映射键后加空格（块标量内不动）；' +
+      console.log('扰动方式：js/mjs/cjs = 词法边界插空格 + 重缩进；json = 紧凑单行；yaml = 块映射键后加空格（块标量内不动）；shell = 行内空白加倍；' +
         'css = 字符串/注释/括号外插空格 + 重缩进；html = 重缩进\n')
     }
     for (const test of tests) {

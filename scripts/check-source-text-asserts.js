@@ -16,6 +16,8 @@
  *   - 命中（只认 receiver **确实绑定到源码文本**的调用）：
  *         `<src>.includes|startsWith|endsWith|indexOf|lastIndexOf|search|match(<任意实参>)`、
  *         `<任意正则>.test(<src>)`、`assert.match(<src>, <任意实参>)`。
+ *     方括号字面量键、`.bind` 后的别名、`String.prototype.includes.call/apply(<src>, …)`、
+ *     `[].includes.call(<src>, …)` 与点号写法**同一口径**（r8-1：只差一个字符的写法不能成为绕过路径）。
  *     锚点 = 字符串字面量 / 无插值模板字符串 / 正则字面量（记为 `/src/flags`）；
  *     **锚点不是可冻结字面量**（变量、字面量表、带插值模板、helper 形参、动态 `RegExp`）时记
  *     `<dynamic>` 哨兵——它同样计入基线。这一点是本闸的命门：判据只看「receiver 是否绑定到源码文本 +
@@ -28,7 +30,8 @@
  *   - **不看名字看绑定**：`res.text.includes(…)` 的 receiver 是成员表达式（`res` 不是源码文本），
  *     不算命中；同名局部变量只在它自己的作用域里算（`const text = readFileSync(…)` 不会污染
  *     整个文件里的 `text`）。这是旧实现（文件级变量名集合 + 正则）44 条误判的根因。
- *   - 扫描面：仓库根 `test_*.js` + `test_support/**\/*.js`。
+ *   - 扫描面：仓库根 `test_*.js` + `test_support/**\/*.js` + `test/**\/*.js`（`test/` 是既有辅助代码目录）。
+ *     跨文件：被 require 的本地模块按「导出函数的形参 → 字符串比对」摘要，在**调用点**按实参入账（r8-2）。
  *
  * 白名单（v3.448 起是**紧凑基线** schema 2）：`scripts/source-text-assert.allowlist.json` 只冻结
  * 「文件 → 条数」，逐条清单（file/line/literal/kind）**不随仓库走**——用 `--inventory` 写到仓库外
@@ -97,26 +100,42 @@ function parseAst (code, file) {
   throw new Error(`无法解析 ${file}（${why.join('；')}）`)
 }
 
-// 不带计算键的成员链：`fs.readFileSync` → 'fs.readFileSync'；`a['b']` 这类动态键返回 null（不猜）。
+// 成员的属性名：`a.b` 与 `a['b']` / `a[`b`]` 都算 b（**字面量键**）；`a[k]` 这类动态键返回 null（不猜）。
+// 为什么必须认字面量键：`src['includes']('X')` 只多一个方括号，与 `src.includes('X')` 语义完全相同——
+// 早先的 `!callee.computed` 判定把它整条漏掉，等于给「改一个字符」发通行证（r8-1）。
+function propertyName (node) {
+  if (!node || node.type !== 'MemberExpression') return null
+  if (!node.computed) return node.property.type === 'Identifier' ? node.property.name : null
+  const key = node.property
+  if (key.type === 'Literal' && typeof key.value === 'string') return key.value
+  if (key.type === 'TemplateLiteral' && key.expressions.length === 0 && key.quasis.length === 1) {
+    const cooked = key.quasis[0].value.cooked
+    return typeof cooked === 'string' ? cooked : null
+  }
+  return null
+}
+
+// 成员链：`fs.readFileSync` → 'fs.readFileSync'；`a['b']` 与 `a.b` 同口径；动态键返回 null（不猜）。
 function memberPath (node) {
   if (!node) return null
   if (node.type === 'Identifier') return node.name
   if (node.type === 'ThisExpression') return 'this'
-  if (node.type !== 'MemberExpression' || node.computed) return null
+  if (node.type !== 'MemberExpression') return null
+  const name = propertyName(node)
+  if (!name) return null
   const object = memberPath(node.object)
-  if (!object || node.property.type !== 'Identifier') return null
-  return object + '.' + node.property.name
+  if (!object) return null
+  return object + '.' + name
 }
 
-// 被调名的**尾段**：`readFileSync` / `fs.readFileSync` / `require('fs').readFileSync` 都归一成
-// readFileSync。第三种形态的 object 是 CallExpression（memberPath 走不通），但语义上它仍是
-// 「在某个 fs 对象上调 readFileSync」——按名字认即可（旧实现同样按名字认）。
+// 被调名的**尾段**：`readFileSync` / `fs.readFileSync` / `fs['readFileSync']` /
+// `require('fs').readFileSync` 都归一成 readFileSync。第三种形态的 object 是 CallExpression
+// （memberPath 走不通），但语义上它仍是「在某个 fs 对象上调 readFileSync」——按名字认即可
+// （旧实现同样按名字认）；方括号字面量键同口径（r8-1，否则 `fs['readFileSync']` 又是一条零成本绕过）。
 function calleeTailName (callee) {
   if (!callee) return null
   if (callee.type === 'Identifier') return callee.name
-  if (callee.type === 'MemberExpression' && !callee.computed && callee.property.type === 'Identifier') {
-    return callee.property.name
-  }
+  if (callee.type === 'MemberExpression') return propertyName(callee)
   return null
 }
 
@@ -325,15 +344,20 @@ function hoistLexical (statements, scope) {
 }
 
 /*
- * 分析一份源码，返回命中列表 `[{ file, line, literal }]`。
+ * 分析一份源码，返回 `{ hits, exports }`（`analyzeSource()` 是只取 hits 的包装）。
  *
  * 三轮：
  *   A. 遍历建作用域/绑定，把所有「表达式 → 绑定」的传播边记成原始 AST 节点（此时还不算污染，
  *      因为顺序在前面的引用可能指向后面才声明的绑定）；
  *   B. 用 idBinding（每个 Identifier → 它的 binding）把边解析成 {hasSource, deps}；
  *   C. 单调不动点：绑定只会 false → true，所以必然收敛；收敛后逐条判定候选命中的 receiver。
+ *
+ * `options.moduleSummary`（r8-2 的跨文件 helper）：把**所有形参按已污染处理**，并把每条命中的
+ * 「receiver 来自第几个形参 / 锚点来自第几个形参」记下来，连同 `module.exports` 的函数表一起返回。
+ * 调用方（ModuleIndex）拿它当 helper 摘要，在**调用点**用实参重建候选——污染因此跨 require 边界传播。
+ * `options.modules`：本地模块摘要表（懒加载，见 createModuleIndex）。
  */
-function analyzeSource (code, file) {
+function analyzeModule (code, file, options = {}) {
   const ast = parseAst(code, file)
   const idBinding = new Map() // Identifier 节点 → binding
   const bindings = []
@@ -341,6 +365,10 @@ function analyzeSource (code, file) {
   const candidates = [] // { line, literal, receiverKind, node, fn }
   const rets = new Map() // function 节点 → 返回值伪绑定
   const paramBindings = new Map() // function 节点 → [{ binding }]
+  const fnParent = new Map() // 函数节点 → 外层函数节点（嵌套回调里的命中要归到导出的那个函数上）
+  const imports = new Map() // 本地名 → { moduleFile, exportName }（只收本地 .js 模块）
+  const exportSites = [] // { name, value } —— `module.exports = …` / `exports.x = …` 的右值
+  const moduleSummary = !!options.moduleSummary
 
   const retBinding = (fn) => {
     let binding = rets.get(fn)
@@ -368,25 +396,190 @@ function analyzeSource (code, file) {
 
   // 被调名 → 返回源码文本的本地函数（绑定解析，不只看名字）：
   //   `f()`（函数声明 / `const f = () => …`）、`H.read()`（对象字面量方法）、
-  //   `new R().read()`（类方法）、`R.prototype.read()`（原型方法）。
+  //   `new R().read()`（类方法）、`R.prototype.read()`（原型方法）。方括号字面量键同口径。
   const resolveCalleeFn = (callee, scope) => {
     if (!callee) return null
     if (callee.type === 'Identifier') {
       const binding = scope.lookup(callee.name)
       return binding && binding.fn ? binding.fn : null
     }
-    if (callee.type !== 'MemberExpression' || callee.computed || callee.property.type !== 'Identifier') return null
+    if (callee.type !== 'MemberExpression') return null
+    const methodName = propertyName(callee)
+    if (!methodName) return null
     const owner = callee.object
     let binding = null
     if (owner.type === 'Identifier') {
       binding = scope.lookup(owner.name)
     } else if (owner.type === 'NewExpression' && owner.callee.type === 'Identifier') {
       binding = scope.lookup(owner.callee.name)
-    } else if (owner.type === 'MemberExpression' && !owner.computed && owner.property.type === 'Identifier' &&
-      owner.property.name === 'prototype' && owner.object.type === 'Identifier') {
+    } else if (owner.type === 'MemberExpression' && propertyName(owner) === 'prototype' && owner.object.type === 'Identifier') {
       binding = scope.lookup(owner.object.name)
     }
-    return binding ? methodOf(binding, callee.property.name) : null
+    return binding ? methodOf(binding, methodName) : null
+  }
+
+  // 字符串比对方法的**引用**（r8-1）：`src.includes` / `src['includes']` / `String.prototype.includes` /
+  // `[].includes` / 以及被 `.bind` 或别名接住后的绑定名。
+  //   { method, receiver, bound }：bound = 已经 `.bind(receiver)`，可直接当函数调。
+  const methodRefOf = (expr, scope) => {
+    if (!expr) return null
+    if (expr.type === 'Identifier') {
+      const binding = scope.lookup(expr.name)
+      return binding && binding.methodRef ? binding.methodRef : null
+    }
+    if (expr.type !== 'MemberExpression') return null
+    const name = propertyName(expr)
+    if (!name || !(STRING_METHODS.has(name) || name === 'test')) return null
+    return { method: name, receiver: expr.object, bound: false }
+  }
+
+  // `const inc = src.includes.bind(src)` / `src['includes'].bind(src)` / 直接引用。
+  const boundMethodRef = (expr, scope) => {
+    if (!expr) return null
+    if (expr.type === 'CallExpression' && propertyName(expr.callee) === 'bind') {
+      const ref = methodRefOf(expr.callee.object, scope)
+      if (!ref) return null
+      const receiver = expr.arguments[0] || ref.receiver
+      return receiver ? { method: ref.method, receiver, bound: true } : null
+    }
+    const ref = methodRefOf(expr, scope)
+    return ref ? { ...ref, bound: false } : null
+  }
+
+  // 调用的「字符串比对」语义，三种等价形态统一成 { method, receiver, args }：
+  //   ① `src.includes(x)` / `src['includes'](x)`             —— receiver = 被读的对象
+  //   ② `X.call(thisArg, x)` / `X.apply(thisArg, [x])`      —— X 是 ① 的成员或别名，thisArg 即真 receiver
+  //      （`String.prototype.includes.call(src,'X')`、`[].includes.call(src,'X')`、`RegExp.prototype.test.call(RE, src)`）
+  //   ③ `const inc = src.includes.bind(src); inc('X')`       —— 已绑定的别名直接调用
+  const stringComparisonCall = (node, scope) => {
+    const callee = node.callee
+    const name = propertyName(callee)
+    if (name && STRING_METHODS.has(name)) return { method: name, receiver: callee.object, args: node.arguments }
+    if (name === 'test') return { method: 'test', receiver: callee.object, args: node.arguments }
+    if (name === 'call' || name === 'apply') {
+      const ref = methodRefOf(callee.object, scope)
+      const thisArg = node.arguments[0]
+      if (!ref || !thisArg) return null
+      let args
+      if (name === 'call') {
+        args = node.arguments.slice(1)
+      } else {
+        // `.apply(thisArg, [a, b])` 只认数组字面量：变量表无法静态对应到形参位置。
+        const list = node.arguments[1]
+        if (!list || list.type !== 'ArrayExpression') return null
+        args = list.elements
+      }
+      return { method: ref.method, receiver: thisArg, args }
+    }
+    if (callee.type === 'Identifier') {
+      const binding = scope.lookup(callee.name)
+      const ref = binding && binding.methodRef
+      if (ref && ref.bound && ref.receiver) return { method: ref.method, receiver: ref.receiver, args: node.arguments }
+    }
+    return null
+  }
+
+  // ── 跨文件 helper（r8-2） ──────────────────────────────────────────────
+  // 形参来源：binding 的污染来自哪个函数的第几个形参。只在 `options.moduleSummary` 时维护
+  // （正常扫描不付这份代价）。不动点里与污染一起传播，因为摘要要按「第几个形参」重建调用点候选。
+  const addOrigin = (binding, fn, index) => {
+    if (!binding.paramOrigins) binding.paramOrigins = new Map()
+    let set = binding.paramOrigins.get(fn)
+    if (!set) {
+      set = new Set()
+      binding.paramOrigins.set(fn, set)
+    }
+    set.add(index)
+  }
+
+  const unionOrigins = (target, source) => {
+    let changed = false
+    for (const [fn, set] of source) {
+      if (!target.paramOrigins) target.paramOrigins = new Map()
+      let own = target.paramOrigins.get(fn)
+      if (!own) {
+        own = new Set()
+        target.paramOrigins.set(fn, own)
+      }
+      for (const index of set) {
+        if (!own.has(index)) {
+          own.add(index)
+          changed = true
+        }
+      }
+    }
+    return changed
+  }
+
+  const mergeOrigins = (sources) => {
+    let out = null
+    for (const binding of sources) {
+      if (!binding.paramOrigins) continue
+      if (!out) out = new Map()
+      for (const [fn, set] of binding.paramOrigins) {
+        let own = out.get(fn)
+        if (!own) {
+          own = new Set()
+          out.set(fn, own)
+        }
+        for (const index of set) own.add(index)
+      }
+    }
+    return out
+  }
+
+  const paramOriginOf = (node) => {
+    if (!node || node.type !== 'Identifier') return null
+    const binding = idBinding.get(node)
+    return binding && binding.paramOrigin ? binding.paramOrigin : null
+  }
+
+  // `const { hasText } = require('./test_support/hastext.js')` → imports 记「本地名 → 模块 + 导出名」；
+  // `const mod = require('./x')` → importName '*'（调用点按 `mod.fn(…)` 的成员名取导出名）。
+  const linkRequire = (init, id) => {
+    if (!options.modules || !init) return
+    if (init.type !== 'CallExpression' || calleeTailName(init.callee) !== 'require') return
+    const specifier = literalValue(init.arguments[0])
+    const moduleFile = typeof specifier === 'string' ? options.modules.resolve(specifier, file) : null
+    if (!moduleFile) return
+    if (id.type === 'ObjectPattern') {
+      for (const prop of id.properties) {
+        const name = keyName(prop)
+        const local = prop.value && prop.value.type === 'Identifier' ? prop.value.name : null
+        if (name && local) imports.set(local, { moduleFile, exportName: name })
+      }
+      return
+    }
+    if (id.type === 'Identifier') imports.set(id.name, { moduleFile, exportName: '*' })
+  }
+
+  // 调用点 → 本地模块的导出名（`hasText(…)` / `mod.hasText(…)`）；非本地模块调用返回 null。
+  const moduleTargetOf = (callee) => {
+    if (!callee) return null
+    if (callee.type === 'Identifier') {
+      const entry = imports.get(callee.name)
+      return entry && entry.exportName !== '*' ? entry : null
+    }
+    if (callee.type !== 'MemberExpression' || callee.object.type !== 'Identifier') return null
+    const entry = imports.get(callee.object.name)
+    const name = propertyName(callee)
+    if (!entry || entry.exportName !== '*' || !name) return null
+    return { moduleFile: entry.moduleFile, exportName: name }
+  }
+
+  // `module.exports = …` / `exports.x = …` 的登记（walk 之后解析成「导出名 → 函数节点」）。
+  const collectExport = (node) => {
+    const left = node.left
+    if (!left || left.type !== 'MemberExpression') return
+    const full = memberPath(left)
+    if (!full) return
+    if (full === 'module.exports') {
+      exportSites.push({ name: null, value: node.right })
+    } else if (full.startsWith('module.exports.')) {
+      exportSites.push({ name: full.slice('module.exports.'.length), value: node.right })
+    } else if (full.startsWith('exports.') && !full.slice('exports.'.length).includes('.')) {
+      exportSites.push({ name: full.slice('exports.'.length), value: node.right })
+    }
   }
 
   // 形参绑定（含解构/默认值/rest）：实参污染 → 形参污染。
@@ -490,10 +683,10 @@ function analyzeSource (code, file) {
 
   const walkList = (list, scope) => { for (const child of list) walk(child, scope) }
 
-  const addCandidate = (node, receiverNode, literal, fn, method) => {
+  const addCandidate = (node, receiverNode, literal, fn, method, anchorNode) => {
     // 锚点不可冻结时记 <dynamic>，**不跳过**：跳过等于给「把字面量提成常量」发通行证。
     const anchor = typeof literal === 'string' ? literal : DYNAMIC_ANCHOR
-    candidates.push({ node, receiverNode, literal: anchor, fn, method, line: node.loc ? node.loc.start.line : 0 })
+    candidates.push({ node, receiverNode, literal: anchor, fn, method, anchorNode, line: node.loc ? node.loc.start.line : 0 })
   }
 
   // 调用点记录（walk 结束后统一做绑定解析）：被调名 → 本地函数（对象方法 / 类方法 / 函数声明）。
@@ -508,18 +701,8 @@ function analyzeSource (code, file) {
   const handleCall = (node, scope) => {
     callSites.push({ node, callee: node.callee, scope })
     const callee = node.callee
-    if (callee.type === 'MemberExpression' && !callee.computed && callee.property.type === 'Identifier') {
-      const method = callee.property.name
-      if (STRING_METHODS.has(method)) {
-        // **不看实参形态**：receiver 是源码文本 + 这是字符串比对方法 ⇒ 命中（锚点能冻结就冻结，
-        // 不能就记 <dynamic>）。`src.includes(NEEDLE)` / `line.includes(name)` 一律在册。
-        addCandidate(node, callee.object, literalAnchor(node.arguments[0]), currentFn, method)
-      } else if (method === 'test') {
-        // `/re/.test(src)`：正则字面量在 receiver 侧、源码文本在实参侧。
-        // 正则**不是**字面量（变量/形参/new RegExp）时锚点不可冻结，但被比对的仍是源码文本 ⇒ <dynamic>。
-        const literal = isRegexLiteral(callee.object) ? literalValue(callee.object) : undefined
-        addCandidate(node, node.arguments[0], literal, currentFn, 'regexp.test')
-      }
+    const method = propertyName(callee)
+    if (method) {
       if (MUTATOR_METHODS.has(method) && node.arguments.length) {
         // `tokens.push(buf)` / `arr.unshift(x)`：容器被写入源码文本 ⇒ 容器按污染处理。
         const holder = callee.object.type === 'Identifier' ? scope.lookup(callee.object.name) : null
@@ -531,16 +714,50 @@ function analyzeSource (code, file) {
         if (callback) deferredElementEdges.push({ fn: callback, receiver: callee.object })
       }
     }
+    // 字符串比对：直接成员 / `.call`·`.apply` 转发 / `.bind` 后的别名，三种形态同一口径（r8-1）。
+    // **不看实参形态**：receiver 是源码文本 + 这是字符串比对方法 ⇒ 命中（锚点能冻结就冻结，
+    // 不能就记 <dynamic>）。`src.includes(NEEDLE)` / `src['includes']('X')` / `line.includes(name)` 一律在册。
+    const compare = stringComparisonCall(node, scope)
+    if (compare) {
+      if (compare.method === 'test') {
+        // 正则字面量在 receiver 侧、源码文本在实参侧。正则**不是**字面量（变量/形参/new RegExp）时
+        // 锚点不可冻结，但被比对的仍是源码文本 ⇒ <dynamic>。
+        const literal = isRegexLiteral(compare.receiver) ? literalValue(compare.receiver) : undefined
+        addCandidate(node, compare.args[0], literal, currentFn, 'regexp.test', compare.args[0])
+      } else {
+        addCandidate(node, compare.receiver, literalAnchor(compare.args[0]), currentFn, compare.method, compare.args[0])
+      }
+    }
     // `assert.match(<src>, <任意>)`：断言库形态的文本比对，与 `src.match(…)` 等价。
     // 第二参不是正则字面量（变量/形参）时同样记 <dynamic>——被测的仍是源码文本。
-    const calleeName = memberPath(callee)
-    if (calleeName === 'assert.match' && node.arguments.length >= 2) {
-      addCandidate(node, node.arguments[0], literalAnchor(node.arguments[1]), currentFn, 'assert.match')
+    if (memberPath(callee) === 'assert.match' && node.arguments.length >= 2) {
+      addCandidate(node, node.arguments[0], literalAnchor(node.arguments[1]), currentFn, 'assert.match', node.arguments[1])
+    }
+    // 跨文件 helper（r8-2）：本地模块导出的函数里「形参 → 字符串比对」，在**调用点**按实参重建候选。
+    // 例：`test_support/hastext.js` 的 `function hasText (s, n) { return s.includes(n) }` ⇒ 摘要
+    // `{receiverParam:0, anchorParam:1}` ⇒ `hasText(src, 'X')` 在这里记一条锚点 'X' 的命中。
+    if (options.modules && imports.size) {
+      const target = moduleTargetOf(callee)
+      if (target) {
+        const entries = options.modules.summaryFor(target.moduleFile, target.exportName)
+        for (const entry of entries || []) {
+          const receiver = node.arguments[entry.receiverParam]
+          if (!receiver) continue
+          const label = 'module-helper:' + target.exportName
+          if (entry.anchorLiteral !== undefined) {
+            addCandidate(node, receiver, entry.anchorLiteral, currentFn, label)
+            continue
+          }
+          const anchorNode = entry.anchorParam === null || entry.anchorParam === undefined ? null : node.arguments[entry.anchorParam]
+          addCandidate(node, receiver, literalAnchor(anchorNode), currentFn, label, anchorNode)
+        }
+      }
     }
   }
 
   const handleFunction = (node, scope) => {
     const outer = currentFn
+    fnParent.set(node, outer)
     // 函数声明要先登记「这个名字是函数」：调用点靠 binding.fn 找形参，不登记就永远追不到
     // `function check(src) { src.includes(…) }` 这一跳。
     if (node.type === 'FunctionDeclaration' && node.id) scope.declare(node.id.name).fn = node
@@ -549,6 +766,16 @@ function analyzeSource (code, file) {
     // 形参先声明（体里的引用要能解析到它们）
     const schema = node.params.map((param) => declarePattern(param, fnScope, 'param', []))
     paramBindings.set(node, schema)
+    // 模块摘要模式（r8-2）：形参按「已污染」处理，并记住它的来源（函数 + 形参序号）。
+    if (moduleSummary) {
+      schema.forEach((list, index) => {
+        list.forEach((binding) => {
+          binding.tainted = true
+          binding.paramOrigin = { fn: node, index }
+          addOrigin(binding, node, index)
+        })
+      })
+    }
     hoistVars(node.body, fnScope)
     currentFn = node
     if (node.body.type === 'BlockStatement') {
@@ -616,6 +843,11 @@ function analyzeSource (code, file) {
           // 绑定解析的三条「指向」：读源码函数的别名（const read = fs.readFileSync）、
           // 对象字面量的方法表（const H = { read: f => … }）、`new R()` 的类（方法表按原型链回溯）。
           if (init && isSourceReaderRef(init)) targets.forEach((binding) => { binding.sourceCall = true })
+          // `const inc = src.includes.bind(src)` / `const inc = src['includes']`：别名也认（r8-1）。
+          const methodRef = init ? boundMethodRef(init, scope) : null
+          if (methodRef) targets.forEach((binding) => { binding.methodRef = methodRef })
+          // `const { hasText } = require('./test_support/hastext.js')`：登记本地模块导出（r8-2）。
+          linkRequire(init, decl.id)
           if (init && init.type === 'ObjectExpression') {
             targets.forEach((binding) => attachObjectMethods(init, binding))
           }
@@ -651,6 +883,9 @@ function analyzeSource (code, file) {
         // 赋值的绑定解析（与 VariableDeclaration 同口径）：`read = fs.readFileSync`、
         // `H = { read: … }`、`H.read = f => …`。
         if (isSourceReaderRef(node.right)) targets.forEach((binding) => { binding.sourceCall = true })
+        const methodRef = boundMethodRef(node.right, scope)
+        if (methodRef) targets.forEach((binding) => { binding.methodRef = methodRef })
+        if (moduleSummary) collectExport(node)
         if (node.right.type === 'ObjectExpression') targets.forEach((binding) => attachObjectMethods(node.right, binding))
         // 只给**本文件定义的对象字面量/类**登记方法（`methods` 已存在才收）：`fs.writeSync = fn`
         // 这类对 require 进来的模块对象打桩不得改变「fs 有什么方法」的认知——否则桩函数的形参
@@ -773,16 +1008,25 @@ function analyzeSource (code, file) {
   }
 
   // ── C. 单调不动点 ────────────────────────────────────────────────────
+  // 污染：binding 只会 false → true；形参来源（模块摘要模式）同样是单调并集 ⇒ 必然收敛。
   let changed = true
   while (changed) {
     changed = false
     for (const binding of bindings) {
-      if (binding.tainted) continue
-      for (const dep of binding.defs) {
-        if (dep.hasSource || [...dep.deps].some((other) => other.tainted)) {
-          binding.tainted = true
-          changed = true
-          break
+      if (!binding.tainted) {
+        for (const dep of binding.defs) {
+          if (dep.hasSource || [...dep.deps].some((other) => other.tainted)) {
+            binding.tainted = true
+            changed = true
+            break
+          }
+        }
+      }
+      if (moduleSummary) {
+        for (const dep of binding.defs) {
+          for (const other of dep.deps) {
+            if (other.paramOrigins && unionOrigins(binding, other.paramOrigins)) changed = true
+          }
         }
       }
     }
@@ -806,47 +1050,206 @@ function analyzeSource (code, file) {
     collectDeps(candidate.receiverNode, deps)
     const tainted = deps.hasSource || [...deps.deps].some((binding) => binding.tainted)
     if (!tainted) continue
-    hits.push({ file: candidate.file || '', line: candidate.line, literal: candidate.literal, method: candidate.method })
+    const hit = { file, line: candidate.line, literal: candidate.literal, method: candidate.method }
+    if (moduleSummary) {
+      // 摘要只描述「形参 → 字符串比对」这一条路：receiver 必须来自形参，锚点要么是形参、要么是体内字面量。
+      hit.fn = candidate.fn
+      hit.paramOrigins = mergeOrigins(deps.deps)
+      hit.anchorOrigin = paramOriginOf(candidate.anchorNode)
+      hit.anchorLiteral = candidate.anchorNode ? literalValue(candidate.anchorNode) : undefined
+    }
+    hits.push(hit)
   }
-  hits.forEach((hit) => { hit.file = file })
   hits.sort((a, b) => (a.line - b.line) || (a.literal < b.literal ? -1 : a.literal > b.literal ? 1 : 0))
-  return hits
+
+  // 导出函数表 + 每个导出函数的「形参 → 字符串比对」摘要（只有 moduleSummary 模式才需要）。
+  const exportsMap = new Map() // 导出名 → 函数节点（'*' = `module.exports = fn`）
+  const byFn = new Map() // 函数节点 → [{ receiverParam, anchorParam?, anchorLiteral? }]
+  if (moduleSummary) {
+    const fnOf = (node) => {
+      if (!node) return null
+      if (isFunctionNode(node)) return node
+      if (node.type === 'Identifier') {
+        const binding = idBinding.get(node)
+        return binding && binding.fn ? binding.fn : null
+      }
+      return null
+    }
+    for (const site of exportSites) {
+      if (site.name) {
+        const fn = fnOf(site.value)
+        if (fn) exportsMap.set(site.name, fn)
+        continue
+      }
+      if (site.value && site.value.type === 'ObjectExpression') {
+        for (const prop of site.value.properties) {
+          if (!prop || prop.type !== 'Property') continue
+          const name = keyName(prop)
+          const fn = fnOf(prop.value)
+          if (name && fn) exportsMap.set(name, fn)
+        }
+        continue
+      }
+      const fn = fnOf(site.value)
+      if (fn) exportsMap.set('*', fn)
+    }
+    const exportedFns = new Set(exportsMap.values())
+    for (const hit of hits) {
+      // 命中可能落在嵌套回调里（`s.split('\n').some(l => l.includes(n))`）：往最近的导出函数上爬，
+      // 形参序号按**那个函数**的口径取——回调自己的形参不是调用点能对应的东西。
+      let fn = hit.fn
+      let guard = 0
+      while (fn && !exportedFns.has(fn) && guard++ < 64) fn = fnParent.get(fn)
+      if (!fn) continue
+      const indexes = hit.paramOrigins && hit.paramOrigins.get(fn)
+      if (!indexes || indexes.size !== 1) continue
+      const receiverParam = [...indexes][0]
+      let entry
+      if (hit.anchorOrigin && hit.anchorOrigin.fn === fn) {
+        entry = { receiverParam, anchorParam: hit.anchorOrigin.index }
+      } else if (typeof hit.anchorLiteral === 'string') {
+        entry = { receiverParam, anchorLiteral: hit.anchorLiteral }
+      } else {
+        entry = { receiverParam, anchorParam: null }
+      }
+      let list = byFn.get(fn)
+      if (!list) {
+        list = []
+        byFn.set(fn, list)
+      }
+      const same = (other) => other.receiverParam === entry.receiverParam &&
+        other.anchorParam === entry.anchorParam && other.anchorLiteral === entry.anchorLiteral
+      if (!list.some(same)) list.push(entry)
+    }
+  }
+  return { hits, exports: exportsMap, byFn }
+}
+
+// 单文件入口（用例与外部调用用）：只要命中列表。
+function analyzeSource (code, file, options) {
+  return analyzeModule(code, file, options).hits
 }
 
 // ── 扫描面 ──────────────────────────────────────────────────────────────
+// 仓库根 `test_*.js` + `test_support/**` + `test/**`。
+// **`test/` 必须在内**（r8-3）：该目录是仓库既有的**辅助代码**（`test/_yaml.js`、`test/_vm-sandbox.js`），
+// 不是测试用例目录；把它排除在外时，只要把「读源码文本 + 比对」整段搬进 test/ 下的 helper 再 require，
+// 该文件的条数就下降（shortfall 合法）、断言却一条没少——白名单可以这样一路降到 0 且每步都 ✅。
 function listScanFiles () {
-  const rootTests = fs.readdirSync(ROOT, { withFileTypes: true }) // nosemgrep（路径 = ROOT（__dirname 常量）+ readdirSync 枚举出的 test_*.js / test_support 文件，无外部输入）
+  const rootTests = fs.readdirSync(ROOT, { withFileTypes: true }) // nosemgrep（路径 = ROOT（__dirname 常量）+ readdirSync 枚举出的 test_*.js / test_support / test 文件，无外部输入）
     .filter((entry) => entry.isFile() && /^test_.*\.js$/.test(entry.name))
     .map((entry) => entry.name)
   const support = []
   const walkDir = (relative) => {
     const abs = path.join(ROOT, relative)
     if (!fs.existsSync(abs)) return // nosemgrep（同上：abs 由 ROOT（__dirname 常量）+ 仓库内相对目录拼成）
-    for (const entry of fs.readdirSync(abs, { withFileTypes: true })) { // nosemgrep（同上：只遍历仓库内的 test_support 目录）
+    for (const entry of fs.readdirSync(abs, { withFileTypes: true })) { // nosemgrep（同上：只遍历仓库内的 test_support / test 目录）
       const rel = relative + '/' + entry.name
       if (entry.isDirectory()) walkDir(rel)
       else if (entry.isFile() && entry.name.endsWith('.js')) support.push(rel)
     }
   }
   walkDir('test_support')
+  walkDir('test')
   return [...rootTests, ...support].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+}
+
+/* ── 本地模块摘要表（r8-2：跨文件 helper 的污染传播） ─────────────────────
+ * 为什么需要：`function hasText (s, n) { return s.includes(n) }` 放在 test_support/（或 scripts/、test/）
+ * 里导出，测试调用 `hasText(src, 'X')` 时形参污染从不跨 require 边界传播 ⇒ 两个文件各自 0 命中、
+ * 闸门 exit 0，而断言一条没少（评审实测）。这里把「被 require 的本地模块」按**形参已污染**的假设
+ * 分析一遍，得到「导出函数 → 第几个形参做 receiver / 锚点来自第几个形参」的摘要；调用点再用实参
+ * 重建候选，污染因此跨文件传播。
+ *
+ * 解析范围：只认相对路径 require（`./x`、`../x`），并**排除生产模块**（`xbk_*.js` 是被测系统，
+ * 不是测试 helper）与 vendor/产物目录（console-assets / node_modules / qinglong / deploy / reports）。
+ * 其余本地 .js/.cjs/.mjs 一律解析——包括仓库根的 helper（否则「把断言搬进根目录 foo.js」又是一条绕过）。
+ */
+const JS_FILE_RE = /\.(?:js|cjs|mjs)$/
+const CROSS_FILE_SKIP = [
+  /^xbk_[^/]*\.js$/,
+  /^scripts\/console-assets\//,
+  /^node_modules\//,
+  /^qinglong\//,
+  /^deploy\//,
+  /^reports\//,
+  /^coverage\//
+]
+
+function resolveLocalModule (specifier, fromFile) {
+  if (typeof specifier !== 'string' || !specifier.startsWith('.')) return null
+  const base = path.resolve(path.dirname(path.join(ROOT, fromFile)), specifier)
+  const candidates = [base, base + '.js', base + '.cjs', base + '.mjs', path.join(base, 'index.js')]
+  const abs = candidates.find((candidate) => {
+    try {
+      return fs.statSync(candidate).isFile() // nosemgrep（candidate 由 ROOT（__dirname 常量）+ 仓库内相对 require 拼成，只做存在性检查）
+    } catch {
+      return false
+    }
+  })
+  if (!abs) return null
+  if (!abs.startsWith(ROOT + path.sep)) return null
+  const rel = path.relative(ROOT, abs).split(path.sep).join('/')
+  if (!JS_FILE_RE.test(rel)) return null
+  if (CROSS_FILE_SKIP.some((re) => re.test(rel))) return null
+  return rel
+}
+
+function createModuleIndex () {
+  const cache = new Map() // 相对路径 → { exports, byFn } | null
+  const loading = new Set()
+  const failures = []
+  const api = {
+    resolve: resolveLocalModule,
+    summaryFor (rel, exportName) {
+      const info = ensure(rel)
+      if (!info) return null
+      const fn = info.exports.get(exportName)
+      if (!fn) return null
+      return info.byFn.get(fn) || null
+    },
+    failures: () => failures.slice()
+  }
+  function ensure (rel) {
+    if (cache.has(rel)) return cache.get(rel)
+    // 循环 require：拿不到完整摘要就返回 null（下游只会少记，不会凭空多记）——本仓本地 helper 无环。
+    if (loading.has(rel)) return null
+    loading.add(rel)
+    let info = null
+    try {
+      const code = fs.readFileSync(path.join(ROOT, rel), 'utf8') // nosemgrep（rel 只来自 resolveLocalModule 的仓库内相对路径枚举）
+      const analysis = analyzeModule(code, rel, { moduleSummary: true, modules: api })
+      info = { exports: analysis.exports, byFn: analysis.byFn }
+    } catch (e) {
+      failures.push(`${rel}: ${e.message}`)
+    } finally {
+      loading.delete(rel)
+    }
+    cache.set(rel, info)
+    return info
+  }
+  return api
 }
 
 function scanAll () {
   const hits = []
+  const modules = createModuleIndex()
   for (const file of listScanFiles()) {
     let code
     try {
-      code = fs.readFileSync(path.join(ROOT, file), 'utf8') // nosemgrep（file 只来自本文件的扫描面枚举（仓库根 test_*.js / test_support），不来自环境或入参）
+      code = fs.readFileSync(path.join(ROOT, file), 'utf8') // nosemgrep（file 只来自本文件的扫描面枚举（仓库根 test_*.js / test_support / test），不来自环境或入参）
     } catch (e) {
       die(2, '扫描失败 ' + file + ': ' + e.message)
     }
     try {
-      hits.push(...analyzeSource(code, file))
+      hits.push(...analyzeModule(code, file, { modules }).hits)
     } catch (e) {
       die(2, '扫描失败 ' + file + ': ' + e.message)
     }
   }
+  // 被 require 的本地 helper 解析不了 ⇒ 摘要缺失，污染跨文件传播就会出现静默漏洞：响亮 exit 2。
+  const failures = modules.failures()
+  if (failures.length) die(2, '本地 helper 无法解析（跨文件 helper 会漏检，fail-closed）：' + failures.join('；'))
   return hits
 }
 
@@ -864,6 +1267,8 @@ const INVENTORY_ENV = 'SOURCE_TEXT_ASSERT_INVENTORY'
 // 默认落在仓库外：逐条清单是 2714 行的一次性取证材料，进仓库等于把刚删掉的东西又加回来。
 const INVENTORY_DEFAULT = path.join(os.homedir(), 'ledgers', 'pipelines', 'assertshape-20261115', 'inventory.json')
 const BASELINE_NOTE = '紧凑基线（schema 2）：只冻结「文件 → 条数」，逐条清单不随仓库走（node scripts/check-source-text-asserts.js --inventory 出仓）。' +
+  '扫描面：仓库根 test_*.js + test_support/** + test/**（test/ 是既有辅助代码目录，不是用例目录）；' +
+  '被 require 的本地模块（test_support / test / scripts 等）按其导出函数的「形参 → 字符串比对」摘要，在调用点按实参入账（跨文件 helper 不再漏检）。' +
   '判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；' +
   'total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。' +
   'literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，' +

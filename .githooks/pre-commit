@@ -54,11 +54,13 @@ run_gate () {
 }
 
 # ── C10-042：本次提交涉及的文件不得同时带未暂存改动 ─────────────────────────────────
-# 五道门禁全部读**工作树**（standard 遍历、check-version 读 package.json/CHANGELOG、check-doc-lines
-# 读盘、check-mutation-ranges 读 mutation.yml、check:ci-static 读 .githooks/*），没有一道看 index；
-# 而 git 提交的是 index。`git add -p` 部分暂存、或 add 之后又改了盘上内容时，「被验证的内容 ≠ 被提交
-# 的内容」——五道门禁全绿只说明工作树绿，那个提交本身没被验证过（旧实现对此一声不吭）。
-# 不改成「从 index 导出临时树再跑」：五道门禁都是相对路径读盘，导出临时树要复制整条工具链
+# 六道门禁全部读**工作树**（standard 遍历、check-version 读 package.json/CHANGELOG、check-mutation-ranges
+# 读 mutation.yml、check:ci-static 读 .githooks/* 与 .github/workflows/*、check:assert-style 读
+# test_*.js / test_support/** / test/** 与 scripts/source-text-assert.allowlist.json、check-doc-lines
+# 读全仓 *.md），没有一道看 index；而 git 提交的是 index。`git add -p` 部分暂存、或 add 之后又改了盘上
+# 内容时，「被验证的内容 ≠ 被提交的内容」——六道门禁全绿只说明工作树绿，那个提交本身没被验证过
+# （旧实现对此一声不吭）。
+# 不改成「从 index 导出临时树再跑」：六道门禁都是相对路径读盘，导出临时树要复制整条工具链
 # （node_modules、shellcheck/zizmor、mutation.yml 的相对定位），成本与误报都远高于收益。取成本最低的
 # fail-closed：只拒绝「本次提交涉及、且仍有未暂存改动」的文件——即
 # `git diff --cached --name-only`（index vs HEAD：本次提交涉及哪些文件）与
