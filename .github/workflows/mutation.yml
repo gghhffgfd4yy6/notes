@@ -149,6 +149,33 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # dry run 预检（2026-11-15）：矩阵开跑前，用**真实配置**跑一次「初始测试运行」。
+      # 为什么必须前置：dry run 里任何一个测试文件红，全部 TAP 段都会在 2–3 分钟内集体红，
+      # 而 tap-runner 只打印「<文件> # exit code 1」、不转发子进程输出 ⇒ 2026-11-15 那次 19 段齐红，
+      # 从日志里看不出是哪条断言。放在本 job（已经装好依赖 + re2 就在这里构建）而不新建 job：
+      # 不新增 prepare-re2 的消费者，也就不会改动 test_ci_skip_suites 的结构断言。
+      # --dryRunOnly：只做初始测试运行、不产生变异体 ⇒ 分钟级；--mutate 只是给 stryker 一个合法目标
+      # （dry run 跑的是 tap.testFiles 的**全部**文件，与矩阵里实际变异的文件无关）。
+      # 并行度取 2：该步只跑一遍、不需要吞吐；8 路并发下多个 watchdog 敏感的套件会互相拖慢。
+      - name: dry run 预检（TAP 档全量测试文件）
+        run: bash scripts/mutation-preflight.sh
+        env:
+          PERF_MS: 3000
+          SKIP_SUITES: ''
+          XBK_MUTATION_CHILD: '1'
+          XBK_TAP_LOG_DIR: ${{ runner.temp }}/tap-logs
+
+      - name: 预检失败时打印逐文件 ❌ 行
+        if: failure()
+        run: |
+          tail -n 60 stryker.log || true
+          ls -la "$RUNNER_TEMP/tap-logs" 2>&1 | head -n 12 || true
+          for f in "$RUNNER_TEMP"/tap-logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f（$(wc -l < "$f") 行）==="
+            grep -aE '❌|AssertionError|Error:|失败' "$f" | head -n 40 || true
+          done
+
   mutation:
     needs: [decide-run, prepare-re2]
     if: needs.decide-run.outputs.should_run == 'true'
@@ -637,6 +664,9 @@ jobs:
           # 也不进 artifact（reports/mutation/）⇒ 崩溃段不会因为多出这个文件而让上传步的
           # if-no-files-found: error 失效。摘掉本行 = 摘要看不到任何记录 ⇒ 每个 TAP 段判红（fail-closed）。
           XBK_TAP_POINTS_LOG: ${{ runner.temp }}/tap-points.jsonl
+          # 诊断（2026-11-15）：tap-shim 在该目录逐文件落 stdout/stderr，失败时由诊断步摘 ❌ 行。
+          # 不注入 ⇒ shim 不落文件、行为与旧版逐字节相同。
+          XBK_TAP_LOG_DIR: ${{ runner.temp }}/tap-logs
 
       # --timeoutMS（逐段覆盖单次等待上限）：取矩阵的 `timeout_ms`，缺省 300000（= stryker.config.js 的值）。
       #   为什么走 CLI 而不是改配置文件：stryker core 的 config-reader 是 deepMerge(options, cliOptions)
@@ -658,6 +688,13 @@ jobs:
         if: failure()
         run: |
           tail -n 120 stryker.log || true
+          echo '--- tap 逐文件诊断日志（XBK_TAP_LOG_DIR）---'
+          ls -la "$RUNNER_TEMP/tap-logs" 2>&1 | head -n 12 || true
+          for f in "$RUNNER_TEMP"/tap-logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f（$(wc -l < "$f") 行）==="
+            grep -aE '❌|AssertionError|Error:|失败' "$f" | head -n 20 || true
+          done
           echo '--- test_console.js 诊断日志 ---'
           for f in "${TMPDIR:-/tmp}"/xbk-test-console-*/log; do
             [ -f "$f" ] || continue

@@ -4205,7 +4205,13 @@ checkAsync('CD-1 cacheDir 每次访问都重新校验：运行中目录被换成
 check('C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用', () => {
   const fs = require('fs')
   const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  const sandboxSkip = sourceShapeGuard(src, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用')
+  // 沙箱判据必须同时看**被断言的那个文件**：变异跑某一段时只插桩该段目标，
+  // 本用例读的 xbk_state_schema.js 在 `--mutate xbk_state_schema.js` 之外段里是**未插桩**的、
+  // 在它自己那段里是**插桩**的（插桩会把名单字面量再复制一份）⇒ 只看 xbk_app.js 会在
+  // 「app 未插桩、schema 已插桩」的段里误红（2026-11-15 实测：19 个 TAP 段全部在 dry run 齐红）。
+  const schemaRaw = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8')
+  const sandboxSkip = sourceShapeGuard(src, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用') ||
+    sourceShapeGuard(schemaRaw, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用')
   if (sandboxSkip) return sandboxSkip
   const readCode = (file) => fs.readFileSync(path.join(__dirname, file), 'utf8')
     .split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n') // 注释里复述名单不算实现重复

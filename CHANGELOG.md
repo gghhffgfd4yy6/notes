@@ -1543,3 +1543,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **文档**：`SYSTEM_CONTRACT.md` 的死活条目登记「`kill(pid,0)` 抛非 ESRCH 一律按存活处理、绝不据此接管」；`README.md` 的「括号里就是错误对象的 `lockIssue`」改为指向 `SYSTEM_CONTRACT.md`（原文指向并不存在的下文）；`CHANGELOG` v3.438 条目删掉一句声称登记了某个**本 PR 未改动文件**的描述，该条目只保留实际改过的文件。
 - **新增用例**：`test_app_unit.js` +5 条（364 → 369 例，其中 1 条为恒跳过的 async 记账探针）；`test_state_schema.js` +2 条（42 → 44 例，其中 1 条为恒跳过的记账探针）。
 - **版本**：3.438.0 → **3.439.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.440
+
+- **变异矩阵停摆的根因（2026-11-15 实测）**：`test_app_unit.js` 的 C1-014「计数器名单单一来源」在 dry run 里误红——沙箱判据只看 `xbk_app.js` 是否插桩，而该用例真正断言的是 `xbk_state_schema.js`；当变异段目标是 schema 时它被插桩、字面量被复制一份 ⇒ 断言数到 2。任何一个测试文件在 dry run 红，全部 TAP 段都会在 2–3 分钟内集体红（tap-runner 只打印「<文件> # exit code 1」）。修法：沙箱判据同时检查被断言的那个文件（不放松断言本身，非沙箱下语义不变）。
+- **dry run 预检**：`prepare-re2` 末尾新增 `scripts/mutation-preflight.sh`（`--dryRunOnly`，分钟级）。矩阵开跑前先单独跑一遍初始测试运行；红了就停在这里，不再让 30+ 条腿齐红、也不浪费机时。放在既有 job 内而不是新建 job：不新增 `prepare-re2` 的消费者，保持不变式「mutation.yml 只有一行活动 `run: npx stryker run`」。
+- **失败可定位**：`scripts/tap-shim.js` 新增 `XBK_TAP_LOG_DIR`（注入才启用）逐文件落 stdout/stderr，含 `fs.writeSync(1|2, …)` 直写；预检/矩阵失败时打印逐文件 ❌ 行。此前只有「exit code 1」一行，无从定位是哪条断言。
+- **版本**：3.439.0 → **3.440.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。

@@ -450,3 +450,9 @@ exclude_paths:
   # :202/:218 的目标 = mkdtempSync 私有目录 + 字面量文件名。逐条依据见上方「H1（v3.436 测试入口公共层）」
   # 注释块；不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
   - "test_test_harness.js"
+  # v3.440：tap-shim 的诊断落盘模块。2 条 pathtraversal-non-literal-fs-filename 属误报——
+  # 目标路径 = XBK_TAP_LOG_DIR（CI 注入的 runner.temp 私有目录）+ 被测文件名按 [^\w.-] 白名单归一，
+  # 不经用户输入、不写仓库、不写缓存目录；未注入该变量时整个模块不加载。
+  # 拆成独立文件就是为了只登记这一层（tap-shim 本体的 TAP 投点/跳过判定/退出码仍受 Codacy 覆盖），
+  # 同 scripts/status-utils.js 的拆模块口径；不删/不放宽任何断言。
+  - "scripts/tap-shim-diag.js"
