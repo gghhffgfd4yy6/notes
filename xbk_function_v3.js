@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.456 — S0 工具层：修 containerMark 的指数级重复展开（同一棵树的闸门 23.2s → 4.5s，判据与基线 3135 条一字未动）并消掉本闸自身的新告警（不构造动态 RegExp、删探针死分支、DYN 拼法不再产生字面尖括号）（只动测试面与 scripts/，生产逻辑一行未改） *******
+//* ******* 线报酷推送脚本 v3.457 — S0 工具层：收 r15 六处检测面缺口（assert.doesNotMatch / 容器字段解构 / matchAll / JSON.stringify 不是 sanitizer / helper 锚点形参 / v3.455 算式更正），基线 3135 → 3190 逐项归因重冻（只动测试面与 scripts/，生产逻辑一行未改） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

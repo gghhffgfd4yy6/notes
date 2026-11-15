@@ -14,8 +14,15 @@
  *   - 传播：赋值/重赋值、变量声明、函数实参→形参、`split()` 后的行数组、`.map/.filter/.find/…`
  *         回调形参、`for…of` 循环变量、解构、模板字符串、`+` 拼接、成员取值。
  *   - 命中（只认 receiver **确实绑定到源码文本**的调用）：
- *         `<src>.includes|startsWith|endsWith|indexOf|lastIndexOf|search|match(<任意实参>)`、
- *         `<任意正则>.test(<src>)`、`assert.match(<src>, <任意实参>)`。
+ *         `<src>.includes|startsWith|endsWith|indexOf|lastIndexOf|search|match|matchAll(<任意实参>)`、
+ *         `<任意正则>.test(<src>)`、`assert.match(<src>, <任意>)`、`assert.doesNotMatch(<src>, <任意>)`。
+ *     r15 补齐的五处（每一处都实测过「换成这个写法 ⇒ 0 命中、exit 0」）：
+ *         ① `assert.doesNotMatch` 与 `assert.match` 同口径——否定式不是另一种断言，是同一件事的写法；
+ *         ② `matchAll` 与 `match` 同口径（`src.match(/X/)` 入账、`src.matchAll(/X/g)` 不入账 ⇒ 加个 All 就绕过）；
+ *         ③ `JSON.stringify` **不是** sanitizer（只转义、不改写内容），字符串化后的子串比对仍是逐字耦合；
+ *         ④ `const { codeOnly } = loadModel(f)` 的解构字段与 `loadModel(f).codeOnly` 同口径（只认 code/codeOnly）；
+ *         ⑤ helper 的「锚点形参」：`function hasFileText (file, anchor) { return readFileSync(file).includes(anchor) }`
+ *            的每个调用点按锚点实参入账（否则 N 条字面量断言改写成 N 次调用会 N → 1，闸门只报 shortfall）。
  *     运算符 / 断言函数形态（r12-1：旧检测面只认调用表达式，这一整族永远数不到）：
  *         `<src行> === | == | !== | != <字面量>`（`lines[10] === '…'`）、
  *         `assert.strictEqual|notStrictEqual|deepStrictEqual|notDeepStrictEqual|equal|notEqual|deepEqual|notDeepEqual(<src>, <字面量>)`
@@ -84,7 +91,9 @@ const ALLOW_REL = path.relative(ROOT, ALLOW_FILE)
 // `const { readFileSync } = require('fs')` 都归一到 readFileSync。
 const SOURCE_CALLS = new Set(['readFileSync', 'readFile', 'codeOf', 'codeOnly', 'stripComments', 'stripComment'])
 // receiver 是源码文本、参数是字面量 ⇒ 文本比对的字符串方法。
-const STRING_METHODS = new Set(['includes', 'startsWith', 'endsWith', 'indexOf', 'lastIndexOf', 'search', 'match'])
+// `matchAll` 与 `match` 是同一件事的两种写法（r15-3）：`src.match(/X/)` 入账而 `src.matchAll(/X/g)` 不入账，
+// 等于「加一个 All 就多一条零成本绕过路径」——实测同一份断言换成 matchAll 后该文件记 0 条、闸门 exit 0。
+const STRING_METHODS = new Set(['includes', 'startsWith', 'endsWith', 'indexOf', 'lastIndexOf', 'search', 'match', 'matchAll'])
 // 比较运算符：`lines[10] === '…'` 与 `src.includes('…')` 是同一件事（源码文本 vs 字面量的逐字耦合），
 // 只是没有方法调用可抓——旧检测面只认调用表达式，这一整族（含 .trim()/.slice() 之后比对）永远数不到。
 const COMPARISON_OPERATORS = new Set(['==', '===', '!=', '!=='])
@@ -104,7 +113,11 @@ const ELEMENT_CALLBACK_METHODS = new Set(['map', 'flatMap', 'forEach', 'filter',
 // 返回值不再是「源码文本」的调用：JSON/YAML 解析成对象、path 拼路径、fs 列目录/取元数据。
 // 不在这里截断，配置类断言（`JSON.parse(readFileSync(...))` 之后比字段）会被当成文本断言计进基线。
 const SANITIZER_PATHS = new Set([
-  'JSON.parse', 'JSON.stringify',
+  // r15-4：`JSON.stringify` **不在**这里。它只转义、不改写内容——`JSON.stringify(readFileSync(f,'utf8'))`
+  // 的返回值仍然是同一段源码文本（多几个引号/反斜杠），对它做的子串比对依旧是逐字耦合。
+  // 把它当 sanitizer 的后果是实测整条 0 命中、闸门 exit 0，而探针对同一条断言判 format-coupled
+  // （两个仪器对同一件事给出相反结论）。真正产出**结构化数据**的 `JSON.parse` 仍在下面。
+  'JSON.parse',
   // 解析成结构化对象后就不是「源码文本」了：`acorn.parse(src)` 的结果是 AST（`node.type === 'Literal'`
   // 这类结构判断必须放行，否则整个解析器/闸门自身会被算成上百条文本断言——实测 112 条全在
   // check-source-text-asserts.js 自己的 AST 判断上）。
@@ -480,6 +493,9 @@ function analyzeModule (code, file, options = {}) {
   // `const m = loadModel(f)` 这类「把容器结果接住」的赋值：walk 之后才知道 loadModel 是不是容器
   // （callTargets / 跨模块摘要都在 walk 之后才可用），先记下来再回填 binding.container。
   const containerSites = [] // { target, init }
+  // `const { codeOnly } = loadModel(f)`（r15-2）：解构出来的**字段名**本身就是容器字段 ⇒ 该绑定就是源码文本。
+  // 与 containerSites 同理只能在 walk 之后判（要问 isContainerResultCall），这里先记形状与声明处作用域。
+  const destructureSites = [] // { pattern, init, scope }
   // 每个 return 语句的返回表达式（r13-3）：容器函数=返回「含 code / codeOnly 字段的对象」的函数，
   // 要在 phase B 之前算好（否则 `const s = loadModel(f).codeOnly` 再套一层的写法仍然漏）。
   const returnSites = [] // { fn, expr }
@@ -506,6 +522,31 @@ function analyzeModule (code, file, options = {}) {
 
   const track = (target, expr) => {
     if (target && expr) edges.push({ target, expr })
+  }
+
+  // 解构模式里每个被声明的 binding（`{ codeOnly }` / `{ codeOnly: only }` / `{ codeOnly = '' }`），
+  // 按声明处的作用域查回来（declarePattern 只负责声明，不回传「名字 → binding」）。
+  const patternBindings = (node, scope, out = []) => {
+    if (!node) return out
+    switch (node.type) {
+      case 'Identifier': {
+        const binding = scope.lookup(node.name)
+        if (binding) out.push(binding)
+        return out
+      }
+      case 'ObjectPattern':
+        for (const prop of node.properties) patternBindings(prop.value || prop.argument, scope, out)
+        return out
+      case 'ArrayPattern':
+        for (const element of node.elements) patternBindings(element, scope, out)
+        return out
+      case 'AssignmentPattern':
+        return patternBindings(node.left, scope, out)
+      case 'RestElement':
+        return patternBindings(node.argument, scope, out)
+      default:
+        return out
+    }
   }
 
   // 方法表回溯：`new R()` 的实例绑定 → 类绑定 → 类体方法表（一跳到顶，不做复杂原型分析）。
@@ -892,10 +933,21 @@ function analyzeModule (code, file, options = {}) {
 
   const walkList = (list, scope) => { for (const child of list) walk(child, scope) }
 
-  const addCandidate = (node, receiverNode, literal, fn, method, anchorNode) => {
+  // `direct = true`：这次调用**本身就是比对点**（r15-5：helper 自己读源码文本、锚点走形参），
+  // 调用点没有 receiver 可查污染，命中落在调用表达式上。
+  const addCandidate = (node, receiverNode, literal, fn, method, anchorNode, direct) => {
     // 锚点不可冻结时记 <dynamic>，**不跳过**：跳过等于给「把字面量提成常量」发通行证。
     const anchor = typeof literal === 'string' ? literal : DYNAMIC_ANCHOR
-    candidates.push({ node, receiverNode, literal: anchor, fn, method, anchorNode, line: node.loc ? node.loc.start.line : 0 })
+    candidates.push({
+      node,
+      receiverNode,
+      literal: anchor,
+      fn,
+      method,
+      anchorNode,
+      direct: !!direct,
+      line: node.loc ? node.loc.start.line : 0
+    })
   }
 
   // 调用点记录（walk 结束后统一做绑定解析）：被调名 → 本地函数（对象方法 / 类方法 / 函数声明）。
@@ -958,10 +1010,19 @@ function analyzeModule (code, file, options = {}) {
         addCandidate(node, compare.receiver, literalAnchor(compare.args[0]), currentFn, compare.method, compare.args[0])
       }
     }
-    // `assert.match(<src>, <任意>)`：断言库形态的文本比对，与 `src.match(…)` 等价。
-    // 第二参不是正则字面量（变量/形参）时同样记 <dynamic>——被测的仍是源码文本。
-    if (memberPath(callee) === 'assert.match' && node.arguments.length >= 2) {
-      addCandidate(node, node.arguments[0], literalAnchor(node.arguments[1]), currentFn, 'assert.match', node.arguments[1])
+    // `assert.match(<src>, <任意>)` / `assert.doesNotMatch(<src>, <任意>)`：断言库形态的文本比对，
+    // 与 `src.match(…)` 等价。第二参不是正则字面量（变量/形参）时同样记 <dynamic>——被测的仍是源码文本。
+    // r15-1：否定式必须与肯定式同口径。`assert.ok(!src.includes('X'))` 记 1 条 / exit 1，改写成
+    // `assert.doesNotMatch(src, /X/)`（Node 断言库做同一件事的惯用写法）后若不认，该文件就记 0 条 / exit 0
+    // ——等于给「换个断言函数名」发通行证。
+    // 解构出来的 `doesNotMatch(…)` 与 `assert.doesNotMatch(…)` 同口径（与等值族认 `strictEqual(…)` 一致）。
+    const assertTextPath = memberPath(callee)
+    const isAssertTextCall = assertTextPath === 'assert.match' || assertTextPath === 'assert.doesNotMatch' ||
+      (callee.type === 'Identifier' && callee.name === 'doesNotMatch')
+    if (isAssertTextCall && node.arguments.length >= 2) {
+      addCandidate(node, node.arguments[0], literalAnchor(node.arguments[1]), currentFn,
+        assertTextPath === 'assert.match' || assertTextPath === 'assert.doesNotMatch' ? assertTextPath : 'doesNotMatch',
+        node.arguments[1])
     }
     // 跨文件 helper（r8-2）：本地模块导出的函数里「形参 → 字符串比对」，在**调用点**按实参重建候选。
     // 例：`test_support/hastext.js` 的 `function hasText (s, n) { return s.includes(n) }` ⇒ 摘要
@@ -975,9 +1036,19 @@ function analyzeModule (code, file, options = {}) {
         const summary = options.modules.summaryFor(target.moduleFile, target.exportName)
         if (summary && summary.returnsSource) externalSourceCalls.add(node)
         for (const entry of (summary && summary.entries) || []) {
+          const label = 'module-helper:' + target.exportName
+          // r15-5：`receiverParam === null` ⇒ 这个 helper **自己**读源码文本、锚点来自形参
+          // （`function hasFileText (file, anchor) { return readFileSync(file,'utf8').includes(anchor) }`）。
+          // 调用点没有 receiver 可查，比对就发生在「这次调用」上：按锚点实参逐调用点入账。
+          if (entry.receiverParam === null) {
+            const anchorNode = entry.anchorParam === null || entry.anchorParam === undefined
+              ? null
+              : node.arguments[entry.anchorParam]
+            addCandidate(node, null, literalAnchor(anchorNode), currentFn, label, anchorNode, true)
+            continue
+          }
           const receiver = node.arguments[entry.receiverParam]
           if (!receiver) continue
-          const label = 'module-helper:' + target.exportName
           if (entry.anchorLiteral !== undefined) {
             addCandidate(node, receiver, entry.anchorLiteral, currentFn, label)
             continue
@@ -1008,13 +1079,17 @@ function analyzeModule (code, file, options = {}) {
     // 形参永不携带 fromSource（见 Scope.declare 的说明）：调用点传进来的源码文本属于 tainted 那一维，
     // 不属于「这个函数自己读了文件」。
     schema.forEach((list) => list.forEach((binding) => { binding.isParam = true }))
-    // 模块摘要模式（r8-2）：形参按「已污染」处理，并记住它的来源（函数 + 形参序号）。
+    // 形参来源（函数 + 形参序号）：模块摘要靠它把「第几个形参做 anchor」写进摘要（r8-2）；
+    // 同文件 helper 的锚点形参识别（r15-5）也靠它 —— 故**无条件**登记，不再只在 moduleSummary 下建。
+    schema.forEach((list, index) => {
+      list.forEach((binding) => { binding.paramOrigin = { fn: node, index } })
+    })
+    // 模块摘要模式（r8-2）：形参再按「已污染」处理。
     if (moduleSummary) {
-      schema.forEach((list, index) => {
+      schema.forEach((list) => {
         list.forEach((binding) => {
           binding.tainted = true
-          binding.paramOrigin = { fn: node, index }
-          addOrigin(binding, node, index)
+          addOrigin(binding, node, binding.paramOrigin.index)
         })
       })
     }
@@ -1102,6 +1177,8 @@ function analyzeModule (code, file, options = {}) {
           // `const m = loadModel(f)`：walk 之后才知道 loadModel 是不是「源码文本容器」（r13-3）。
           if (init && init.type === 'CallExpression') {
             targets.forEach((binding) => containerSites.push({ target: binding, init }))
+            // `const { codeOnly } = loadModel(f)`：解构字段名在容器字段名单里 ⇒ 这个绑定就是源码文本（r15-2）。
+            if (decl.id.type === 'ObjectPattern') destructureSites.push({ pattern: decl.id, init, scope })
           }
           targets.forEach((binding) => track(binding, init))
           walk(decl.id, scope)
@@ -1326,6 +1403,20 @@ function analyzeModule (code, file, options = {}) {
   for (const site of containerSites) {
     if (isContainerResultCall(site.init)) site.target.container = true
   }
+  // 解构出来的容器字段（r15-2）：`const { codeOnly } = loadModel(f)` 与 `loadModel(f).codeOnly` 同一口径。
+  // 只按**字段名**认（code / codeOnly），别的字段（file / ast / tokens / lineCount）不受影响——
+  // 这也是它与「把整个 init 当污染」的差别：后者会把 `const { file } = loadModel(f); file.startsWith('/')`
+  // 这类路径断言算成源码文本断言。
+  for (const site of destructureSites) {
+    if (!isContainerResultCall(site.init)) continue
+    for (const prop of site.pattern.properties) {
+      if (!prop || prop.type !== 'Property' || !CONTAINER_TEXT_MEMBERS.has(keyName(prop))) continue
+      for (const binding of patternBindings(prop.value, site.scope)) {
+        binding.tainted = true
+        binding.fromSource = true
+      }
+    }
+  }
 
   // ── B. 边 → {hasSource, deps} ────────────────────────────────────────
   for (const edge of edges) {
@@ -1399,17 +1490,27 @@ function analyzeModule (code, file, options = {}) {
   }
   const pushHit = (candidate, deps) => {
     const hit = { file, line: candidate.line, literal: candidate.literal, method: candidate.method }
+    // receiver 是不是**这个文件自己读出来的**源码文本（`readFileSync(f).includes(…)`，或先接成变量再比：
+    // `const s = readFileSync(f); s.includes(…)`）。与「形参传进来的文本」区分开（形参永远不置 fromSource），
+    // r15-5 的锚点形参摘要只认这一路。
+    hit.receiverFromSource = deps.hasSource || [...deps.deps].some((binding) => binding.fromSource)
+    // 锚点来自哪个函数的第几个形参（r15-5）：同文件调用点重建与跨文件摘要都要用，故不再只在摘要模式下记。
+    hit.anchorOrigin = paramOriginOf(candidate.anchorNode)
+    hit.fn = candidate.fn
     if (moduleSummary) {
       // 摘要只描述「形参 → 字符串比对」这一条路：receiver 必须来自形参，锚点要么是形参、要么是体内字面量。
-      hit.fn = candidate.fn
       hit.paramOrigins = mergeOrigins(deps.deps)
-      hit.anchorOrigin = paramOriginOf(candidate.anchorNode)
       hit.anchorLiteral = candidate.anchorNode ? literalValue(candidate.anchorNode) : undefined
     }
     hits.push(hit)
   }
   for (const candidate of candidates) {
     if (candidate.fn && readers.has(candidate.fn) && isDelimiterLiteral(candidate.literal)) continue
+    // direct 候选（r15-5）：比对发生在调用点本身，没有 receiver 可查污染。
+    if (candidate.direct) {
+      pushHit(candidate, newDeps())
+      continue
+    }
     const taint = taintOf(candidate.receiverNode)
     if (!taint.tainted) continue
     pushHit(candidate, taint.deps)
@@ -1453,6 +1554,44 @@ function analyzeModule (code, file, options = {}) {
       anchorNode: left.tainted ? pair.right : pair.left
     }, taintedSide.deps)
   }
+  // 同文件 helper 的「锚点形参」（r15-5）：`function hasFileText (file, anchor) { return readFileSync(file,'utf8').includes(anchor) }`
+  // 的比对点记在 helper 体内（receiver 是读出来的文本、锚点来自形参）。若只记体内那一条，N 条
+  // `src.includes('X')` 改写成 N 次 `hasFileText(f, 'X')` 会让条数 N→1，闸门只报 shortfall 并 exit 0
+  // （评审实测 3 → 1）。这里把「(helper, 锚点形参序号)」找出来，在本文件的**每个调用点**按实参重建一条。
+  // 只认「receiver 自己读出来的」这一路：receiver 也走形参的 helper（hasText(s, n)）已由跨文件摘要覆盖。
+  const anchoredParams = new Map() // 函数节点 → Set(锚点形参序号)
+  for (const hit of hits) {
+    if (!hit.receiverFromSource || !hit.anchorOrigin) continue
+    // 命中的锚点可能在外层函数的形参上（回调里的命中往上爬一层），一层层找到持有该形参的函数。
+    let owner = hit.fn
+    let guard = 0
+    while (owner && owner !== hit.anchorOrigin.fn && guard++ < 64) owner = fnParent.get(owner)
+    if (!owner) continue
+    // receiver 也来自形参的 helper（hasText(s, n)）由跨文件摘要覆盖，这里只认「自己读文件」那一路。
+    if (hit.paramOrigins && hit.paramOrigins.get(owner)) continue
+    if (!anchoredParams.has(owner)) anchoredParams.set(owner, new Set())
+    anchoredParams.get(owner).add(hit.anchorOrigin.index)
+  }
+  if (anchoredParams.size) {
+    for (const site of callSites) {
+      const target = callTargets.get(site.node)
+      const indexes = target && anchoredParams.get(target)
+      if (!indexes) continue
+      const name = target.id ? target.id.name : '(helper)'
+      for (const index of indexes) {
+        const anchorNode = site.node.arguments[index]
+        const literal = literalAnchor(anchorNode)
+        hits.push({
+          file,
+          line: site.node.loc ? site.node.loc.start.line : 0,
+          literal: typeof literal === 'string' ? literal : DYNAMIC_ANCHOR,
+          method: 'local-helper:' + name,
+          receiverFromSource: false,
+          anchorOrigin: null
+        })
+      }
+    }
+  }
   hits.sort((a, b) => (a.line - b.line) || (a.literal < b.literal ? -1 : a.literal > b.literal ? 1 : 0))
 
   // 导出函数表 + 每个导出函数的「形参 → 字符串比对」摘要（只有 moduleSummary 模式才需要）。
@@ -1495,15 +1634,30 @@ function analyzeModule (code, file, options = {}) {
       while (fn && !exportedFns.has(fn) && guard++ < 64) fn = fnParent.get(fn)
       if (!fn) continue
       const indexes = hit.paramOrigins && hit.paramOrigins.get(fn)
-      if (!indexes || indexes.size !== 1) continue
-      const receiverParam = [...indexes][0]
-      let entry
-      if (hit.anchorOrigin && hit.anchorOrigin.fn === fn) {
-        entry = { receiverParam, anchorParam: hit.anchorOrigin.index }
-      } else if (typeof hit.anchorLiteral === 'string') {
-        entry = { receiverParam, anchorLiteral: hit.anchorLiteral }
+      let receiverParam
+      if (indexes) {
+        // receiver 来自形参：一个命中只能来自一个形参（多于一个是「两个形参混用」，摘要无法对应）。
+        if (indexes.size !== 1) continue
+        receiverParam = [...indexes][0]
+      } else if (hit.receiverFromSource && hit.anchorOrigin && hit.anchorOrigin.fn === fn) {
+        // r15-5：helper 自己读源码文本、锚点走形参（`function hasFileText (file, anchor) { …includes(anchor) }`）。
+        // 没有 receiver 形参 ⇒ receiverParam 记 null，调用点按「锚点实参」逐次入账。没有这一维，
+        // N 条字面量断言改写成 N 次调用后只剩体内 1 条 <dynamic>（3 → 1）而闸门只报 shortfall、exit 0。
+        receiverParam = null
       } else {
-        entry = { receiverParam, anchorParam: null }
+        continue
+      }
+      let entry
+      if (receiverParam !== null) {
+        if (hit.anchorOrigin && hit.anchorOrigin.fn === fn) {
+          entry = { receiverParam, anchorParam: hit.anchorOrigin.index }
+        } else if (typeof hit.anchorLiteral === 'string') {
+          entry = { receiverParam, anchorLiteral: hit.anchorLiteral }
+        } else {
+          entry = { receiverParam, anchorParam: null }
+        }
+      } else {
+        entry = { receiverParam: null, anchorParam: hit.anchorOrigin.index }
       }
       let list = byFn.get(fn)
       if (!list) {
@@ -1700,8 +1854,8 @@ const INVENTORY_ENV = 'SOURCE_TEXT_ASSERT_INVENTORY'
 const INVENTORY_DEFAULT = path.join(os.homedir(), 'ledgers', 'pipelines', 'assertshape-20261115', 'inventory.json')
 const BASELINE_NOTE = '紧凑基线（schema 2）：只冻结「文件 → 条数」，逐条清单不随仓库走（node scripts/check-source-text-asserts.js --inventory 出仓）。' +
   '扫描面：整棵仓库的 .js/.cjs/.mjs，减去显式跳过名单 REPO_SKIP（node_modules / .git / .stryker-tmp / .nyc_output / coverage / reports / .local / .ai / .tools / xianbaoku_cache* / scripts/console-assets 等 vendor 产物 / 被测系统本身 xbk_*.js、qinglong/、deploy/）；新目录默认在扫描面内。' +
-  '跨文件 helper：被 require 的本地模块按「导出函数形参 → 字符串比对」摘要在调用点按实参入账；`module.exports = fn`（默认导出）与「自身读源码文本的 helper」（readSrc(f).includes(…)）同口径。' +
-  '命中形态：字符串方法（includes/startsWith/…/match）、正则 test、assert.match、比较运算符（==/===/!=/!==）与 assert.strictEqual 家族的「源码文本 vs 字面量」逐字比对；量纲断言（.length / typeof）不计。' +
+  '跨文件 helper：被 require 的本地模块按「导出函数形参 → 字符串比对」摘要在调用点按实参入账；`module.exports = fn`（默认导出）与「自身读源码文本的 helper」（readSrc(f).includes(…)）同口径；helper 自己读源码文本而锚点走形参时（hasFileText(f, anchor)）按锚点实参逐调用点入账。' +
+  '命中形态：字符串方法（includes/startsWith/…/match/matchAll）、正则 test、assert.match / assert.doesNotMatch、比较运算符（==/===/!=/!==）与 assert.strictEqual 家族的「源码文本 vs 字面量」逐字比对；量纲断言（.length / typeof）不计；JSON.stringify 不是 sanitizer（只转义不改写内容）。' +
   '判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；' +
   'total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。' +
   'literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，' +

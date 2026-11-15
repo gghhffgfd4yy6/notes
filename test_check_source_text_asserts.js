@@ -361,7 +361,29 @@ const POSITIVE = [
       '  return { code: code }',
       '}',
       "const m = loadModel('a.js')",
-      "assert.ok(m.code.includes('CONTAINER_BOUND'))"), ['CONTAINER_BOUND']]
+      "assert.ok(m.code.includes('CONTAINER_BOUND'))"), ['CONTAINER_BOUND']],
+  // ── r15（第 15 轮评审的五处检测面缺口：每一条都先实测「换成这个写法 ⇒ 0 命中、exit 0」） ─────────
+  ['assert.doesNotMatch(src, /re/)（否定式与 assert.ok(!src.includes(…)) 同口径，r15-1）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'assert.doesNotMatch(src, /NEGATED_ANCHOR/)'), ['/NEGATED_ANCHOR/']],
+  ['src.matchAll(/re/g)（与 src.match 同一件事，只是多了一个 All，r15-3）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'assert.ok(src.matchAll(/GLOBAL_ANCHOR/g))'), ['/GLOBAL_ANCHOR/g']],
+  ['JSON.stringify(src).includes(…)（只转义不改写内容，不是 sanitizer，r15-4）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "assert.ok(JSON.stringify(fs.readFileSync('a.js', 'utf8')).includes('JSON_ANCHOR'))"), ['JSON_ANCHOR']],
+  ['const { codeOnly } = loadModel(f)（解构容器字段与 loadModel(f).codeOnly 同口径，r15-2）',
+    lines("const assert = require('node:assert')",
+      "function loadModel (f) { return { code: 'x', codeOnly: 'x' } }",
+      "const { codeOnly } = loadModel('a.js')",
+      "assert.ok(codeOnly.includes('DESTRUCTURED_FIELD'))"), ['DESTRUCTURED_FIELD']],
+  ['helper 锚点形参（function hasFileText (file, anchor) { …includes(anchor) } 的每个调用点，r15-5）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "function hasFileText (file, anchor) { return fs.readFileSync(file, 'utf8').includes(anchor) }",
+      "assert.ok(hasFileText('a.js', 'LANE_A'))",
+      "assert.ok(hasFileText('a.js', 'LANE_B'))"), [DYN, 'LANE_A', 'LANE_B']]
 ]
 
 // ── B. 反向：receiver 不是源码文本就必须不命中（否则误报会把基线灌满） ──────
@@ -425,7 +447,21 @@ const NEGATIVE = [
       '}',
       "const l = parseShell('pre-commit')",
       "assert.strictEqual(l.tokens[0], 'run_gate')",
-      "assert.ok(l.tokens.includes('check:assert-style'))"), []]
+      "assert.ok(l.tokens.includes('check:assert-style'))"), []],
+  // ── r15 的反向：补齐检测面不得把「不是逐字比对」的写法一起算进来 ─────────────────
+  ['matchAll 用在普通字符串上（receiver 不是源码文本，r15-3）',
+    lines("const assert = require('node:assert')",
+      "const s = 'hello world'",
+      'assert.ok(s.matchAll(/hello/g))'), []],
+  ['解构容器的非文本字段（const { file } = loadModel(f); file.startsWith(…) 不是逐字比对，r15-2）',
+    lines("const assert = require('node:assert')",
+      "function loadModel (f) { return { code: 'x', codeOnly: 'x' } }",
+      "const { file } = loadModel('a.js')",
+      "assert.ok(file.startsWith('/tmp'))"), []],
+  ['真 sanitizer 仍放行：yaml.load 之后比字段（r15-4 只摘掉 JSON.stringify，不许顺手废掉解析器）',
+    lines("const fs = require('node:fs')", "const yaml = require('js-yaml')",
+      "const cfg = yaml.load(fs.readFileSync('config.yml', 'utf8'))",
+      "assert.ok(cfg.segments.includes('build'))"), []]
 ]
 
 // ── A/B 执行：正向形态数 = POSITIVE.length，反向形态数 = NEGATIVE.length ────────────
@@ -729,6 +765,202 @@ check('跨文件：parseShell 的 token 级断言不计入源码文本断言（r
   ))
   const text = runChecker(dir)
   assert.strictEqual(text.status, 1, '同一文件里的源码文本断言必须仍然判红：' + text.out)
+})
+
+// ── r15-1：否定式断言（assert.doesNotMatch）不得让条数归零 ────────────────────
+// 反例（评审实测）：`assert.ok(!src.includes('X'))` 记 1 条 exit 1；改写成 `assert.doesNotMatch(src, /X/)`
+// （Node 断言库做同一件事的惯用写法）后该文件记 0 条、闸门 exit 0。整族否定式等于免费通行证。
+check('r15-1 否定式：assert.ok(!includes) 改写成 assert.doesNotMatch 后条数不降、仍判红', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_seed.js', FIXTURE_OK)
+  write(dir, 'test_neg.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "assert.ok(!src.includes('LANE_NEG'))"
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  assert.strictEqual(allowlistOf(dir).by_file['test_neg.js'].all, 1, '基线必须记 1 条')
+  // 等价改写：同一个断言换成 doesNotMatch 形态。
+  write(dir, 'test_neg.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'assert.doesNotMatch(src, /LANE_NEG/)'
+  ))
+  const same = runChecker(dir)
+  assert.strictEqual(same.status, 0, '条数不降不得判红：' + same.out)
+  assert.ok(/test_neg\.js\s+1（literal 1 \/ dynamic 0）/.test(same.out), '改写后必须仍是 1 条 literal：' + same.out)
+  // 再补一条（第 2 条 doesNotMatch）必须判红：证明它不是「恒定记 1 条」。
+  write(dir, 'test_neg.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'assert.doesNotMatch(src, /LANE_NEG/)',
+    'assert.doesNotMatch(src, /LANE_NEG_2/)'
+  ))
+  const grew = runChecker(dir)
+  assert.strictEqual(grew.status, 1, '第二条否定式断言必须判红（逐条计数，不是恒记 1）：' + grew.out)
+  assert.ok(/test_neg\.js\s+基线 1 \/ 实测 2 \/ \+1/.test(grew.out), '必须点名该文件 +1：' + grew.out)
+})
+
+// ── r15-2：容器字段解构（const { codeOnly } = loadModel(f)）──────────────────
+// 反例（评审实测）：`loadModel(f).codeOnly.includes('X')` 记 1 条，而 `const { codeOnly } = loadModel(f)`
+// 之后 `codeOnly.includes('X')` 记 0 条——把同一份源码文本换个接法就能让白名单归零。
+// 跨文件形态是真实缺口：同文件里参数污染会顺带污染解构绑定，跨文件摘要把返回值只标成「容器」。
+check('r15-2 容器解构：const { codeOnly } = loadModel(f) 与 loadModel(f).codeOnly 同口径', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_seed.js', FIXTURE_OK)
+  write(dir, 'test_support/model.js', lines(
+    "const fs = require('node:fs')",
+    'function buildModel (file, code) { return { file, code, codeOnly: code } }',
+    'function loadModel (f) {',
+    "  const code = fs.readFileSync(f, 'utf8')",
+    '  return buildModel(f, code)',
+    '}',
+    'module.exports = { loadModel }'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_member.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadModel } = require('./test_support/model.js')",
+    "assert.ok(loadModel('a.js').codeOnly.includes('MEMBER_FIELD'))"
+  ))
+  const member = runChecker(dir)
+  assert.strictEqual(member.status, 1, '成员访问形态必须判红（对照）：' + member.out)
+  write(dir, 'test_destr.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadModel } = require('./test_support/model.js')",
+    "const { codeOnly } = loadModel('a.js')",
+    "assert.ok(codeOnly.includes('DESTRUCTURED_FIELD'))"
+  ))
+  const destructured = runChecker(dir)
+  assert.strictEqual(destructured.status, 1, '解构形态必须同样判红：' + destructured.out)
+  assert.ok(/test_destr\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(destructured.out),
+    '强制命中记在解构的调用点文件上：' + destructured.out)
+  // 反向：解构出来的不是容器文本字段（file）就必须仍记 0——只按字段名认，不把整个 init 当污染。
+  write(dir, 'test_other_field.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadModel } = require('./test_support/model.js')",
+    "const { file } = loadModel('a.js')",
+    "assert.ok(file.startsWith('/tmp'))"
+  ))
+  const other = runChecker(dir)
+  assert.ok(!other.out.includes('test_other_field.js'), '非文本字段不得记命中：' + other.out)
+})
+
+// ── r15-3：matchAll 与 match 同口径（检测面变宽，不是「新写断言」）────────────────
+check('r15-3 matchAll：src.matchAll(/re/g) 与 src.match(/re/) 同口径入账', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_seed.js', FIXTURE_OK)
+  write(dir, 'test_match.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'assert.ok(src.match(/FUNC_ANCHOR/))'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  assert.strictEqual(allowlistOf(dir).by_file['test_match.js'].all, 1, 'match 形态记 1 条')
+  write(dir, 'test_matchall.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'assert.ok(src.matchAll(/FUNC_ANCHOR/g))'
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, 'matchAll 形态必须判红：' + result.out)
+  assert.ok(/test_matchall\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out), '必须点名 matchAll 文件：' + result.out)
+})
+
+// ── r15-4：JSON.stringify 不是 sanitizer（只转义、不改写内容）──────────────────
+check('r15-4 JSON.stringify：字符串化后的源码文本仍是源码文本（真解析器仍放行）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_seed.js', FIXTURE_OK)
+  write(dir, 'test_support/yaml.js', lines(
+    "const yaml = require('js-yaml')",
+    "const fs = require('node:fs')",
+    "module.exports.loadYaml = (f) => yaml.load(fs.readFileSync(f, 'utf8'))"
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_stringify.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "assert.ok(JSON.stringify(fs.readFileSync('a.js', 'utf8')).includes('JSON_ANCHOR'))"
+  ))
+  const gate = runChecker(dir)
+  assert.strictEqual(gate.status, 1, 'JSON.stringify 之后的子串比对必须判红：' + gate.out)
+  assert.ok(/test_stringify\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(gate.out), '必须点名该文件：' + gate.out)
+  // 同一个探针必须对同一条断言判 format-coupled——修前闸门 exit 0 而探针判 coupled（口径相反）。
+  const probe = runProbe(dir, 'test_stringify.js')
+  assert.strictEqual(probe.status, 1, '探针必须判 format-coupled：' + probe.out)
+  assert.ok(/test_stringify\.js\s+format-coupled/.test(probe.out), '探针输出必须点名 format-coupled：' + probe.out)
+  // 反向：解析器产出的是结构化数据，字段比较照旧放行（不许把 sanitizer 整族废掉）。
+  write(dir, 'test_sanitized.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadYaml } = require('./test_support/yaml.js')",
+    "const cfg = loadYaml('config.yml')",
+    "assert.ok(cfg.segments.includes('build'))"
+  ))
+  const sanitized = runChecker(dir)
+  assert.strictEqual(sanitized.status, 1, '（此时仍只因 test_stringify.js 判红）' + sanitized.out)
+  assert.ok(!sanitized.out.includes('test_sanitized.js'), 'yaml.load 之后的字段比较不得记命中：' + sanitized.out)
+})
+
+// ── r15-5：helper 的「锚点形参」——N 次调用必须记 N 条（不是 3 → 1） ─────────────
+// 反例（评审实测）：`function hasFileText (file, anchor) { return readFileSync(file,'utf8').includes(anchor) }`
+// + 3 次调用，条数从 3 降到 1（只剩 helper 体内那条 <dynamic>），闸门只报 shortfall 并 exit 0。
+check('r15-5 helper 锚点形参：3 条字面量断言改写成 helper + 3 次调用后仍逐调用点入账', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_anchor.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "assert.ok(src.includes('LANE_1'))",
+    "assert.ok(src.includes('LANE_2'))",
+    "assert.ok(src.includes('LANE_3'))"
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  assert.strictEqual(allowlistOf(dir).by_file['test_anchor.js'].all, 3, '基线必须记 3 条')
+  const rewrite = (n) => lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    // 先接成变量再比（receiver 是标识符、fromSource 传播这一路）：锚点形参必须照样认出来。
+    "function hasFileText (file, anchor) { const s = fs.readFileSync(file, 'utf8'); return s.includes(anchor) }",
+    ...Array.from({ length: n }, (_, i) => `assert.ok(hasFileText('a.js', 'LANE_${i + 1}'))`)
+  )
+  write(dir, 'test_anchor.js', rewrite(3))
+  const three = runChecker(dir)
+  assert.ok(/test_anchor\.js \d+（literal 3 /.test(three.out),
+    '3 次调用必须逐调用点记 3 条 literal（不得 3 → 1）：' + three.out)
+  // 逐条计数的证明：再加 3 次调用，literal 必须变 6（不是「每个 helper 恒记 1」）。
+  write(dir, 'test_anchor.js', rewrite(6))
+  const six = runChecker(dir)
+  assert.ok(/test_anchor\.js \d+（literal 6 /.test(six.out),
+    '6 次调用必须记 6 条 literal：' + six.out)
+  assert.strictEqual(six.status, 1, '相对基线 3 必须判红：' + six.out)
+  // 6 次调用 + helper 体内那条 <dynamic> = 7；基线 3 ⇒ +4（逐调用点计数，不是恒定值）。
+  assert.ok(/test_anchor\.js\s+基线 3 \/ 实测 7 \/ \+4/.test(six.out), '必须按增量点名（6 次调用 + 1 条体内）：' + six.out)
+})
+
+// ── r15-5 跨文件形态：helper 在 test_support/，锚点走形参，调用点逐个入账 ──────────
+check('r15-5 跨文件 helper 锚点形参：require 过来的 hasFileText(f, anchor) 逐调用点入账', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_seed.js', FIXTURE_OK)
+  write(dir, 'test_support/hasfile.js', lines(
+    "const fs = require('node:fs')",
+    "function hasFileText (file, anchor) { return fs.readFileSync(file, 'utf8').includes(anchor) }",
+    'module.exports = { hasFileText }'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_use_file_helper.js', lines(
+    "const assert = require('node:assert')",
+    "const { hasFileText } = require('./test_support/hasfile.js')",
+    "assert.ok(hasFileText('a.js', 'CROSS_LANE_1'))",
+    "assert.ok(hasFileText('a.js', 'CROSS_LANE_2'))",
+    "assert.ok(hasFileText('a.js', 'CROSS_LANE_3'))"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '跨文件锚点形参必须判红：' + result.out)
+  assert.ok(/test_use_file_helper\.js\s+基线 0 \/ 实测 3 \/ \+3/.test(result.out),
+    '必须逐调用点记 3 条（不是 0，也不是 1）：' + result.out)
 })
 
 // ── r12-4：扫描面 = 整棵仓库（显式跳过名单），任意新目录默认在内 ────────────────
