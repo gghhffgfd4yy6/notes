@@ -14,9 +14,17 @@
  *   - 传播：赋值/重赋值、变量声明、函数实参→形参、`split()` 后的行数组、`.map/.filter/.find/…`
  *         回调形参、`for…of` 循环变量、解构、模板字符串、`+` 拼接、成员取值。
  *   - 命中（只认 receiver **确实绑定到源码文本**的调用）：
- *         `<src>.includes|startsWith|endsWith|indexOf|lastIndexOf|search|match(<字面量>)`、
- *         `<字面量正则>.test(<src>)`、`assert.match(<src>, <字面量正则>)`。
- *     字面量 = 字符串字面量 / 无插值模板字符串 / 正则字面量（记为 `/src/flags`）。
+ *         `<src>.includes|startsWith|endsWith|indexOf|lastIndexOf|search|match(<任意实参>)`、
+ *         `<任意正则>.test(<src>)`、`assert.match(<src>, <任意实参>)`。
+ *     锚点 = 字符串字面量 / 无插值模板字符串 / 正则字面量（记为 `/src/flags`）；
+ *     **锚点不是可冻结字面量**（变量、字面量表、带插值模板、helper 形参、动态 `RegExp`）时记
+ *     `<dynamic>` 哨兵——它同样计入基线。这一点是本闸的命门：判据只看「receiver 是否绑定到源码文本 +
+ *     是否在做字符串比对」，**不看实参形态**。否则「把字面量提成常量」就是一条零成本绕过路径
+ *     （4 轮评审实测：旧判据下 6 种写法全 exit 0，且仓库现有 109 处真实比对完全在基线外）。
+ *   - 被调名做**绑定解析**，不只按名字认：`const read = fs.readFileSync; read(f).includes('X')` 里
+ *     `read` 的初值是成员链尾名 `readFileSync` ⇒ 它读的是源码文本。同理对象方法
+ *     （`const H = { read: f => readFileSync(f) }; H.read(f).includes('X')`）与类方法
+ *     （`new R().read(f).includes('X')`）按「返回值污染 + obj.m()/new C().m()」计入。
  *   - **不看名字看绑定**：`res.text.includes(…)` 的 receiver 是成员表达式（`res` 不是源码文本），
  *     不算命中；同名局部变量只在它自己的作用域里算（`const text = readFileSync(…)` 不会污染
  *     整个文件里的 `text`）。这是旧实现（文件级变量名集合 + 正则）44 条误判的根因。
@@ -54,6 +62,9 @@ const SANITIZER_PATHS = new Set([
   'Number', 'Boolean', 'parseInt', 'parseFloat', 'Object.keys', 'Object.values', 'Object.entries'
 ])
 const SKIP_KEYS = new Set(['type', 'start', 'end', 'loc', 'range', 'regex', 'raw'])
+// 不可冻结的锚点（实参是变量/表/带插值模板/helper 形参/动态 RegExp）。它必须**计入**基线：
+// 「把字面量提成常量」曾让整条断言从检测面上消失（评审实测 6 种写法全 exit 0）。
+const DYNAMIC_ANCHOR = '<dynamic>'
 
 function parseAst (code, file) {
   const opts = { ecmaVersion: 'latest', allowHashBang: true, locations: true }
@@ -91,6 +102,36 @@ function calleeTailName (callee) {
     return callee.property.name
   }
   return null
+}
+
+// 「这个名字指向源码读取函数」——用于**绑定解析**（`const read = fs.readFileSync`）。
+// 与 calleeTailName 的区别：这里输入的是右值表达式（别名声明的初值），不是调用点的 callee。
+const isSourceReaderRef = (node) => {
+  if (!node) return false
+  if (node.type === 'Identifier') return SOURCE_CALLS.has(node.name)
+  return node.type === 'MemberExpression' && SOURCE_CALLS.has(calleeTailName(node))
+}
+
+// 对象字面量 / 类体的键名（`read`、'read'、[0] 里的字面量键）。
+function keyName (node) {
+  if (!node) return null
+  if (!node.computed && node.key && node.key.type === 'Identifier') return node.key.name
+  const key = node.key
+  if (key && key.type === 'Literal' && (typeof key.value === 'string' || typeof key.value === 'number')) {
+    return String(key.value)
+  }
+  return null
+}
+
+// 对象字面量的方法表：`{ read: f => … }` / `{ read (f) { … } }`（简写方法）。
+// 与类体方法表同一个用途：`H.read(f).includes('X')` 的返回值污染靠它追。
+function attachObjectMethods (objectExpr, binding) {
+  if (!binding.methods) binding.methods = new Map()
+  for (const prop of objectExpr.properties) {
+    if (!prop || prop.type !== 'Property' || !isFunctionNode(prop.value)) continue
+    const name = keyName(prop)
+    if (name) binding.methods.set(name, prop.value)
+  }
 }
 
 // 会往容器里塞内容的原地方法：塞进去的是源码文本 ⇒ 容器整体按污染处理。
@@ -182,7 +223,10 @@ class Scope {
   declare (name) {
     let binding = this.bindings.get(name)
     if (!binding) {
-      binding = { name, tainted: false, defs: [], fn: null }
+      // methods：对象字面量/类体的方法表（`H.read` / `new R().read` 的绑定解析指向这里）；
+      // instanceOf：`const r = new R()` 的类绑定，方法表按原型链回溯；
+      // sourceCall：`const read = fs.readFileSync` 这类别名（初值是读取函数）。
+      binding = { name, tainted: false, defs: [], fn: null, methods: null, instanceOf: null, sourceCall: false }
       this.bindings.set(name, binding)
       this.registry.push(binding)
     }
@@ -296,6 +340,39 @@ function analyzeSource (code, file) {
     if (target && expr) edges.push({ target, expr })
   }
 
+  // 方法表回溯：`new R()` 的实例绑定 → 类绑定 → 类体方法表（一跳到顶，不做复杂原型分析）。
+  const methodOf = (binding, name) => {
+    let cursor = binding
+    for (let hop = 0; cursor && hop < 8; hop++) {
+      if (cursor.methods && cursor.methods.has(name)) return cursor.methods.get(name)
+      cursor = cursor.instanceOf
+    }
+    return null
+  }
+
+  // 被调名 → 返回源码文本的本地函数（绑定解析，不只看名字）：
+  //   `f()`（函数声明 / `const f = () => …`）、`H.read()`（对象字面量方法）、
+  //   `new R().read()`（类方法）、`R.prototype.read()`（原型方法）。
+  const resolveCalleeFn = (callee, scope) => {
+    if (!callee) return null
+    if (callee.type === 'Identifier') {
+      const binding = scope.lookup(callee.name)
+      return binding && binding.fn ? binding.fn : null
+    }
+    if (callee.type !== 'MemberExpression' || callee.computed || callee.property.type !== 'Identifier') return null
+    const owner = callee.object
+    let binding = null
+    if (owner.type === 'Identifier') {
+      binding = scope.lookup(owner.name)
+    } else if (owner.type === 'NewExpression' && owner.callee.type === 'Identifier') {
+      binding = scope.lookup(owner.callee.name)
+    } else if (owner.type === 'MemberExpression' && !owner.computed && owner.property.type === 'Identifier' &&
+      owner.property.name === 'prototype' && owner.object.type === 'Identifier') {
+      binding = scope.lookup(owner.object.name)
+    }
+    return binding ? methodOf(binding, callee.property.name) : null
+  }
+
   // 形参绑定（含解构/默认值/rest）：实参污染 → 形参污染。
   // 只能在函数节点被 walker 访问过之后调用（那时形参已在函数作用域里声明好），
   // 因此调用点的边一律进 deferred，walk 结束后再统一解析。
@@ -333,9 +410,17 @@ function analyzeSource (code, file) {
       case 'NewExpression': {
         const callee = node.callee
         const calleeName = memberPath(callee)
+        // 读源码文本：`readFileSync(…)` / `fs.readFileSync(…)` / 别名 `read = fs.readFileSync` 后 `read(…)`。
         if (node.type === 'CallExpression' && SOURCE_CALLS.has(calleeTailName(callee))) {
           out.hasSource = true
           return out
+        }
+        if (node.type === 'CallExpression' && callee.type === 'Identifier') {
+          const alias = idBinding.get(callee)
+          if (alias && alias.sourceCall) {
+            out.hasSource = true
+            return out
+          }
         }
         if (calleeName && SANITIZER_PATHS.has(calleeName)) return out
         if (node.type === 'CallExpression' && callee.type === 'MemberExpression' && !callee.computed &&
@@ -345,10 +430,10 @@ function analyzeSource (code, file) {
           const callback = node.arguments.find(isFunctionNode)
           if (callback) out.deps.add(retBinding(callback))
         }
-        if (node.type === 'CallExpression' && callee.type === 'Identifier') {
-          const binding = idBinding.get(callee)
-          if (binding && binding.fn) out.deps.add(retBinding(binding.fn))
-        }
+        // 返回源码文本的本地函数（函数声明 / 对象方法 / 类方法）：`H.read(f).includes(…)`、
+        // `new R().read(f).includes(…)` 这一跳靠 callTargets（walk 后做的绑定解析）。
+        const target = callTargets.get(node)
+        if (target) out.deps.add(retBinding(target))
         collectDeps(callee, out)
         node.arguments.forEach((argument) => collectDeps(argument, out))
         return out
@@ -390,25 +475,34 @@ function analyzeSource (code, file) {
   const walkList = (list, scope) => { for (const child of list) walk(child, scope) }
 
   const addCandidate = (node, receiverNode, literal, fn, method) => {
-    if (typeof literal !== 'string') return
-    candidates.push({ node, receiverNode, literal, fn, method, line: node.loc ? node.loc.start.line : 0 })
+    // 锚点不可冻结时记 <dynamic>，**不跳过**：跳过等于给「把字面量提成常量」发通行证。
+    const anchor = typeof literal === 'string' ? literal : DYNAMIC_ANCHOR
+    candidates.push({ node, receiverNode, literal: anchor, fn, method, line: node.loc ? node.loc.start.line : 0 })
   }
 
-  // 调用点记录（walk 结束后统一解析成边）：实参→形参、数组元素→回调形参。
+  // 调用点记录（walk 结束后统一做绑定解析）：被调名 → 本地函数（对象方法 / 类方法 / 函数声明）。
+  // 解析必须在 walk 之后：类体方法表在遍历到类声明时才建立，而 `const read = fs.readFileSync`
+  // 这类别名的初值也要等 VariableDeclaration 走过。
+  const callSites = [] // { node, callee, scope }
+  const callTargets = new Map() // CallExpression 节点 → 返回源码文本的本地函数（或 null）
+  // 调用点记录（walk 结束后统一解析成边）：实参→形参。
   const deferredArgEdges = [] // { fn, args }
   const deferredElementEdges = [] // { fn, receiver }
 
   const handleCall = (node, scope) => {
+    callSites.push({ node, callee: node.callee, scope })
     const callee = node.callee
     if (callee.type === 'MemberExpression' && !callee.computed && callee.property.type === 'Identifier') {
       const method = callee.property.name
       if (STRING_METHODS.has(method)) {
-        const literal = literalAnchor(node.arguments[0])
-        if (literal !== undefined) addCandidate(node, callee.object, literal, currentFn, method)
-      } else if (method === 'test' && isRegexLiteral(callee.object)) {
+        // **不看实参形态**：receiver 是源码文本 + 这是字符串比对方法 ⇒ 命中（锚点能冻结就冻结，
+        // 不能就记 <dynamic>）。`src.includes(NEEDLE)` / `line.includes(name)` 一律在册。
+        addCandidate(node, callee.object, literalAnchor(node.arguments[0]), currentFn, method)
+      } else if (method === 'test') {
         // `/re/.test(src)`：正则字面量在 receiver 侧、源码文本在实参侧。
-        const literal = literalValue(callee.object)
-        if (literal !== undefined) addCandidate(node, node.arguments[0], literal, currentFn, 'regexp.test')
+        // 正则**不是**字面量（变量/形参/new RegExp）时锚点不可冻结，但被比对的仍是源码文本 ⇒ <dynamic>。
+        const literal = isRegexLiteral(callee.object) ? literalValue(callee.object) : undefined
+        addCandidate(node, node.arguments[0], literal, currentFn, 'regexp.test')
       }
       if (MUTATOR_METHODS.has(method) && node.arguments.length) {
         // `tokens.push(buf)` / `arr.unshift(x)`：容器被写入源码文本 ⇒ 容器按污染处理。
@@ -421,17 +515,11 @@ function analyzeSource (code, file) {
         if (callback) deferredElementEdges.push({ fn: callback, receiver: callee.object })
       }
     }
-    // `assert.match(<src>, /re/)`：断言库形态的文本比对，与 `src.match(/re/)` 等价。
+    // `assert.match(<src>, <任意>)`：断言库形态的文本比对，与 `src.match(…)` 等价。
+    // 第二参不是正则字面量（变量/形参）时同样记 <dynamic>——被测的仍是源码文本。
     const calleeName = memberPath(callee)
-    if (calleeName === 'assert.match' && node.arguments.length >= 2 && isRegexLiteral(node.arguments[1])) {
-      const literal = literalAnchor(node.arguments[1])
-      if (literal !== undefined) addCandidate(node, node.arguments[0], literal, currentFn, 'assert.match')
-    }
-    // 本地函数调用：实参 → 形参（`function check(src) { src.includes(...) }` 这种 helper 靠它）。
-    // 这里必须用作用域直接查名：handleCall 在子节点 walk 之前跑，callee 的 idBinding 还没登记。
-    if (callee.type === 'Identifier') {
-      const binding = scope.lookup(callee.name)
-      if (binding && binding.fn) deferredArgEdges.push({ fn: binding.fn, args: node.arguments })
+    if (calleeName === 'assert.match' && node.arguments.length >= 2) {
+      addCandidate(node, node.arguments[0], literalAnchor(node.arguments[1]), currentFn, 'assert.match')
     }
   }
 
@@ -484,7 +572,20 @@ function analyzeSource (code, file) {
       case 'ClassDeclaration':
       case 'ClassExpression': {
         const classScope = new Scope(scope, false, bindings)
-        if (node.id) classScope.declare(node.id.name)
+        // 方法表挂在**外层**作用域的类绑定上（`new R()` 在类体外，拿不到类内那层影子绑定）。
+        // `hoistLexical` 已把类名声明进当前块，这里复用同一个 binding（没有才声明）。
+        const classBinding = node.id ? (scope.lookup(node.id.name) || scope.declare(node.id.name)) : null
+        if (classBinding) {
+          if (!classBinding.methods) classBinding.methods = new Map()
+          for (const member of node.body.body) {
+            if ((member.type === 'MethodDefinition' || member.type === 'PropertyDefinition') &&
+              isFunctionNode(member.value)) {
+              const name = keyName(member)
+              if (name) classBinding.methods.set(name, member.value)
+            }
+          }
+          classScope.bindings.set(node.id.name, classBinding)
+        }
         if (node.superClass) walk(node.superClass, classScope)
         walk(node.body, classScope)
         return
@@ -495,6 +596,16 @@ function analyzeSource (code, file) {
           const init = decl.init
           if (init && isFunctionNode(init)) {
             targets.forEach((binding) => { binding.fn = init })
+          }
+          // 绑定解析的三条「指向」：读源码函数的别名（const read = fs.readFileSync）、
+          // 对象字面量的方法表（const H = { read: f => … }）、`new R()` 的类（方法表按原型链回溯）。
+          if (init && isSourceReaderRef(init)) targets.forEach((binding) => { binding.sourceCall = true })
+          if (init && init.type === 'ObjectExpression') {
+            targets.forEach((binding) => attachObjectMethods(init, binding))
+          }
+          if (init && init.type === 'NewExpression' && init.callee.type === 'Identifier') {
+            const classBinding = scope.lookup(init.callee.name)
+            if (classBinding) targets.forEach((binding) => { binding.instanceOf = classBinding })
           }
           targets.forEach((binding) => track(binding, init))
           walk(decl.id, scope)
@@ -521,6 +632,18 @@ function analyzeSource (code, file) {
         }
         const targets = resolveTargets(node.left)
         targets.forEach((binding) => track(binding, node.right))
+        // 赋值的绑定解析（与 VariableDeclaration 同口径）：`read = fs.readFileSync`、
+        // `H = { read: … }`、`H.read = f => …`。
+        if (isSourceReaderRef(node.right)) targets.forEach((binding) => { binding.sourceCall = true })
+        if (node.right.type === 'ObjectExpression') targets.forEach((binding) => attachObjectMethods(node.right, binding))
+        // 只给**本文件定义的对象字面量/类**登记方法（`methods` 已存在才收）：`fs.writeSync = fn`
+        // 这类对 require 进来的模块对象打桩不得改变「fs 有什么方法」的认知——否则桩函数的形参
+        // 会被别处 `fs.writeSync(fd, 数据)` 的实参污染，造出「data.includes(...) 是源码文本断言」的假命中。
+        if (node.left.type === 'MemberExpression' && !node.left.computed &&
+          node.left.object.type === 'Identifier' && isFunctionNode(node.right)) {
+          const holder = scope.lookup(node.left.object.name)
+          if (holder && holder.methods) holder.methods.set(node.left.property.name, node.right)
+        }
         if (targets.length === 0 && node.left.type === 'MemberExpression') {
           // `arr[i] = tainted` / `obj.text = tainted`：容器被写入源码文本 ⇒ 容器整体按污染处理
           // （`shellTokens` 里 `tokens.push(buf)` 这类「逐字符搭出文本容器」的函数靠这一跳才认得出来）。
@@ -603,6 +726,14 @@ function analyzeSource (code, file) {
   }
 
   walk(ast, null)
+
+  // 调用点的绑定解析必须在 walk 之后：方法表（类体/对象字面量）与别名初值（const read = fs.readFileSync）
+  // 都是遍历过程中登记到 binding 上的。解析结果同时用于「实参 → 形参」边与 collectDeps 的返回值污染。
+  for (const site of callSites) {
+    const fn = resolveCalleeFn(site.callee, site.scope)
+    callTargets.set(site.node, fn)
+    if (fn) deferredArgEdges.push({ fn, args: site.node.arguments })
+  }
 
   // 调用点的边必须等 walk 结束（形参已在各自函数作用域里声明）再解析。
   for (const deferred of deferredArgEdges) {
@@ -791,7 +922,10 @@ function compareMultiset (hits, allow) {
 
 function writeAllowlist (hits) {
   const body = JSON.stringify({
-    note: '冻结清单（多重集：同一 (文件,字面量) 出现 N 次就记 N 条）：只减不增。新增源码文本断言一律红（scripts/check-source-text-asserts.js）。',
+    note: '冻结清单（多重集：同一 (文件,字面量) 出现 N 次就记 N 条）：只减不增。新增源码文本断言一律红（scripts/check-source-text-asserts.js）。' +
+      'literal 是能从 AST 冻结的锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；' +
+      '<dynamic> = receiver 确实绑定到源码文本、但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 非正则字面量的 X.test(...)），' +
+      '它同样是「读源码文本」的证据，因此同样计入基数——把字面量提成常量不得让整条断言从检测面上消失。',
     count: hits.length,
     items: hits.map((hit) => ({ file: hit.file, line: hit.line, literal: hit.literal }))
   }, null, 2) + '\n'

@@ -140,7 +140,12 @@ const SUITES = [
   // 故把每个形态做成「正向必红 / 反向必绿」。全部在 mkdtemp 隔离工作区里跑（复制闸脚本 + 软链
   // node_modules，跑完 rmSync），不读 .githooks、不碰真实白名单 ⇒ 沙箱内可运行（不设 mutationSkip）。
   // 成本是约 20 次子进程（每个夹具 0.1-0.3s），照 test_check_version.js 的子进程夹具先例。
-  { name: '源码文本断言闸', file: 'test_check_source_text_asserts.js', desc: 'check-source-text-asserts.js：17 种写法必红（行内直读/helper 链/模板/正则 test 与 match/多跳/重赋值/形参/split 行/codeOf 套壳/解构）+ 4 类非源码文本必绿（res.text/遮蔽/JSON.parse/普通串）+ 多重集超次数/计数漂移 exit 2/少条提示 + 探针 paren 锚点必 coupled 与逐字节还原' }
+  { name: '源码文本断言闸', file: 'test_check_source_text_asserts.js', desc: 'check-source-text-asserts.js：17 种写法必红（行内直读/helper 链/模板/正则 test 与 match/多跳/重赋值/形参/split 行/codeOf 套壳/解构）+ 4 类非源码文本必绿（res.text/遮蔽/JSON.parse/普通串）+ 多重集超次数/计数漂移 exit 2/少条提示 + 探针 paren 锚点必 coupled 与逐字节还原' },
+  // S0（v3.446，r4 评审 must_fix r4-4）：工具层自身的用例。此前 test_support/source_model.js 零断言——
+  // 它是后续每个包做结构断言的唯一入口，而 `assert.ok(!hasFunction(f, '旧实现'))` 这类否定断言在 model
+  // 退化时会**静默变绿**（与 S0 要治的失效同源）。夹具全在 mkdtemp 里写、跑完 rmSync，不读仓库源码
+  // ⇒ 不设 integration / mutationSkip（沙箱内可运行）。
+  { name: '源码结构视图', file: 'test_source_model.js', desc: 'test_support/source_model.js：loadModel 八件套/缓存 + 注释与字符串不算（含集合规模下界）+ funcs 六类（声明/箭头/表达式/类方法/静态/对象方法）+ calls 与 members（成员链/计算成员/动态键）+ exports 的 CJS 三态与 ESM 四态 + codeOnly 去注释保字符串 + parseShell 引号/$(…)/注释/元字符/未闭合抛错 + loadYaml 按字段取值 + 坏语法必抛 + 12 个导出面' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

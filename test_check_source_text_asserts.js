@@ -81,18 +81,24 @@ function write (dir, rel, text) {
   return abs
 }
 
-function run (dir, script, args) {
+function run (dir, script, args, env) {
+  // 环境隔离：不继承外层可能存在的 PROBE_FORCE_UNPARSEABLE / NODE_OPTIONS（探针自己会注入垫片），
+  // 否则某条用例的故障注入会漏到别的用例里。
+  const base = { ...process.env, TZ: 'UTC' }
+  delete base.PROBE_FORCE_UNPARSEABLE
+  delete base.NODE_OPTIONS
   const result = spawnSync(process.execPath, [path.join('scripts', script), ...args], {
     cwd: dir,
     encoding: 'utf8',
     timeout: 120000,
-    env: { ...process.env, TZ: 'UTC' }
+    env: { ...base, ...(env || {}) }
   })
   return { status: result.status, out: (result.stdout || '') + (result.stderr || '') }
 }
 
 const runChecker = (dir, ...args) => run(dir, 'check-source-text-asserts.js', args)
 const runProbe = (dir, ...args) => run(dir, 'probe-format-coupling.js', args)
+const runProbeWith = (dir, env, ...args) => run(dir, 'probe-format-coupling.js', args, env)
 const allowlistOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')) // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
 const lines = (...parts) => parts.join('\n') + '\n'
 
@@ -103,6 +109,10 @@ const byString = (x, y) => String(x).localeCompare(String(y))
 
 // ── A. 检测面：每个漏检形态单独一条（正向必红） ────────────────────────────
 // 期望值 = 命中字面量数组（顺序按行号）。`file` 参数只用于错误信息，与分析结果无关。
+// 最后 7 条是 r4 评审 must_fix r4-1 实测过的「免费绕过路径」：旧判据要求「实参是直接字面量 + 被调名精确
+// 匹配」，于是把锚点提成常量/正则变量、给 reader 起别名、用成员/类方法 helper 包一层，整条断言就从检测面
+// 上消失了（评审实测 6 种写法全部 exit 0）。现在判据只看「receiver 绑定到源码文本 + 在做字符串比对」，
+// 锚点不可冻结时记 <dynamic>（同样计入基线）。
 const POSITIVE = [
   ['行内直读（无任何变量声明：旧实现 !vars.size 直接跳过整份文件）',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
@@ -174,7 +184,44 @@ const POSITIVE = [
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "const src = fs.readFileSync('a.js', 'utf8')",
       "assert.ok(src.includes('DUP'))",
-      "assert.ok(src.includes('DUP'))"), ['DUP', 'DUP']]
+      "assert.ok(src.includes('DUP'))"), ['DUP', 'DUP']],
+  // ── r4-1（6 种「免费绕过」写法） ──────────────────────────────────────
+  ['字面量提成常量（const NEEDLE = …; src.includes(NEEDLE)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const NEEDLE = 'function buildCacheShard ('",
+      'assert.ok(src.includes(NEEDLE))'), ['<dynamic>']],
+  ['正则提成常量（const RE = /…/; RE.test(src)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'const SHARD_RE = /CACHE_SHARD_ID_RE\\s*=/',
+      'assert.ok(SHARD_RE.test(src))'), ['<dynamic>']],
+  ['reader 别名（const read = fs.readFileSync; read(f).includes(…)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'const read = fs.readFileSync',
+      "assert.ok(read('a.js', 'utf8').includes('ALIAS'))"), ['ALIAS']],
+  ['对象方法 helper（const H = { read: f => readFileSync(f) }; H.read(f).includes(…)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const H = { read: (f) => fs.readFileSync(f, 'utf8') }",
+      "assert.ok(H.read('a.js').includes('OBJMETHOD'))"), ['OBJMETHOD']],
+  ['类方法 helper（class R { read (f) { return readFileSync(f) } }; new R().read(f).includes(…)）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'class R { read (f) { return fs.readFileSync(f, \'utf8\') } }',
+      "assert.ok(new R().read('a.js').includes('CLASSMETHOD'))"), ['CLASSMETHOD']],
+  ['正则经形参传入 helper（function has (re, text) { re.test(text) }）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'const RE = /X/',
+      'function has (re, text) { return re.test(text) }',
+      'assert.ok(has(RE, src))'), ['<dynamic>']],
+  ['字面量表 / 映射表（NEEDLES.some(n => src.includes(n))、for…of、MAP.k）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const NEEDLES = ['a', 'b']",
+      'assert.ok(NEEDLES.some((n) => src.includes(n)))',
+      'for (const lit of NEEDLES) assert.ok(src.includes(lit))',
+      "const MAP = { k: 'K' }",
+      'assert.ok(src.includes(MAP.k))'), ['<dynamic>', '<dynamic>', '<dynamic>']]
 ]
 
 // ── B. 反向：receiver 不是源码文本就必须不命中（否则误报会把基线灌满） ──────
@@ -200,8 +247,8 @@ const NEGATIVE = [
       "assert.ok(arr.includes('x'))"), []]
 ]
 
-// ── A/B 执行：17 个正向形态 + 4 个反向形态 ─────────────────────────────────
-check('检测面：17 种「读源码文本」写法逐个命中（含旧实现漏检的 16 种）', () => {
+// ── A/B 执行：24 个正向形态 + 4 个反向形态 ─────────────────────────────────
+check('检测面：24 种「读源码文本」写法逐个命中（含旧实现漏检的 23 种：r4-1 的 7 种绕过写法 + 字面量表/映射表）', () => {
   const missed = POSITIVE.filter(([, code, expected]) => {
     const got = analyzeSource(code, 'positive.js').map((hit) => hit.literal)
     return JSON.stringify(got) !== JSON.stringify(expected)
@@ -445,6 +492,95 @@ check('reformat：`(`、`)`、`,`、`{`、`}` 边界都被扰动，且跨行模�
   // 跨行模板的内容行（第 2、3 行）行首两个空格是字符串内容，不得被重缩进成 4 个空格。
   assert.ok(out.includes('`第一行\n  第二行 '), '跨行模板的中间行不得被重缩进（那是运行期数据）：' + shown)
   assert.ok(out.includes('\n  第三行`'), '跨行模板的末行不得被重缩进：' + shown)
+})
+
+// ── D. 扰动面（r4-2 / r4-3） ───────────────────────────────────────────────
+// 评审实测的假绿：探针只扰动 `.js`，于是把 `.css`/`.mjs`/`.yml`/`.json` 当源码文本读并逐字断言的测试
+// 永远判 format-clean，而 RUNBOOK 把「probe 绿」当作「不再绑文本格式」的机械判据——两个仪器互相矛盾。
+// 下面每个用例都是评审给的复现形态：修前 format-clean exit 0，修后必须 coupled 或 not-covered。
+const ASSET_WORKSPACE = {
+  'assets/app.css': '.btn { color : #fff ; padding: 0 4px }\n.card{color:#000}\n',
+  'assets/pure.mjs': 'export function add (a, b) { return a + b }\n',
+  'assets/w.yml': 'name: t\njobs:\n  quality:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: [22]\n',
+  'assets/doc.md': '# doc\n\nhello world\n'
+}
+
+function assetWorkspace () {
+  const dir = makeWorkspace()
+  for (const [rel, text] of Object.entries(ASSET_WORKSPACE)) write(dir, rel, text)
+  return dir
+}
+
+check('探针：读 .css 逐字断言必须判 format-coupled（r4-2：旧探针只扰动 .js，恒假绿）', () => {
+  const dir = assetWorkspace()
+  write(dir, 'test_css.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    "const css = fs.readFileSync(path.join(__dirname, 'assets/app.css'), 'utf8')",
+    "assert.ok(css.includes('.btn { color : #fff ; padding: 0 4px }'), 'CSS 逐字断言')"
+  ))
+  const result = runProbe(dir, 'test_css.js')
+  assert.strictEqual(result.status, 1, '.css 的逐字断言必须判 coupled（exit 1）：' + result.out)
+  assert.ok(/test_css\.js\s+format-coupled/.test(result.out), '必须判 format-coupled：' + result.out)
+})
+
+check('探针：读 .mjs / .yml 逐字断言必须判 format-coupled（r4-2：ESM 与 YAML 都要在扰动面内）', () => {
+  const mjsDir = assetWorkspace()
+  write(mjsDir, 'test_mjs.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    "const src = fs.readFileSync(path.join(__dirname, 'assets/pure.mjs'), 'utf8')",
+    "assert.ok(src.includes('export function add (a, b) { return a + b }'), 'ESM 逐字断言')"
+  ))
+  const mjs = runProbe(mjsDir, 'test_mjs.js')
+  assert.strictEqual(mjs.status, 1, '.mjs 的逐字断言必须判 coupled：' + mjs.out)
+  assert.ok(/test_mjs\.js\s+format-coupled/.test(mjs.out), '必须判 format-coupled：' + mjs.out)
+
+  const ymlDir = assetWorkspace()
+  write(ymlDir, 'test_yml.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    "const yml = fs.readFileSync(path.join(__dirname, 'assets/w.yml'), 'utf8')",
+    "assert.ok(yml.includes('runs-on: ubuntu-latest'), 'value 级文本断言')",
+    "assert.ok(yml.includes('strategy:'), 'key 级文本断言')"
+  ))
+  const yml = runProbe(ymlDir, 'test_yml.js')
+  assert.strictEqual(yml.status, 1, '.yml 的逐字断言必须判 coupled（key: 与 key: value 两级都要失配）：' + yml.out)
+  assert.ok(/test_yml\.js\s+format-coupled/.test(yml.out), '必须判 format-coupled：' + yml.out)
+})
+
+check('探针：读到扰动面之外的资产必须 format-uncertified + exit 2（禁止静默 format-clean）', () => {
+  const dir = assetWorkspace()
+  write(dir, 'test_md.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const path = require('node:path')",
+    "const doc = fs.readFileSync(path.join(__dirname, 'assets/doc.md'), 'utf8')",
+    "assert.ok(doc.includes('hello world'), 'md 文本断言（不在扰动面）')"
+  ))
+  const result = runProbe(dir, 'test_md.js')
+  assert.strictEqual(result.status, 2, 'not-covered 必须 exit 2（fail-closed）：' + result.out)
+  assert.ok(/format-uncertified/.test(result.out), '必须判 format-uncertified（不是 format-clean）：' + result.out)
+  assert.ok(/assets\/doc\.md/.test(result.out), '必须点名不在扰动面的文件：' + result.out)
+  assert.ok(/not-covered/.test(result.out), '必须显式说 not-covered：' + result.out)
+})
+
+check('探针：fail-closed 分支（重排后无法解析）必须还原已写盘的文件并打印「已还原 N 个文件」（r4-3）', () => {
+  const dir = makeWorkspace()
+  // 两个 JS：a.js 先写盘，zz.js 触发「无法解析」⇒ 必须把 a.js 还原成原文（旧实现 process.exit 跳过 finally）。
+  write(dir, 'a.js', 'function a (x) { return x }\nmodule.exports = { a }\n')
+  write(dir, 'zz.js', 'function zz (y) { return y }\nmodule.exports = { zz }\n')
+  write(dir, 'test_clean2.js', lines("const assert = require('node:assert')", 'assert.strictEqual(1 + 1, 2)', "console.log('clean ok')"))
+  const before = fs.readFileSync(path.join(dir, 'a.js'), 'utf8') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'a.js'，无外部净输入）
+  const result = runProbeWith(dir, { PROBE_FORCE_UNPARSEABLE: 'zz.js' }, 'test_clean2.js')
+  assert.strictEqual(result.status, 2, '探针自身 bug 必须 exit 2（不产出 coupled 结论）：' + result.out)
+  assert.ok(/已还原 [1-9][0-9]* 个文件/.test(result.out), '必须打印「已还原 N 个文件」（旧实现一个字都不提）：' + result.out)
+  assert.ok(/重排后无法解析 zz\.js/.test(result.out), '必须点名触发分支的文件：' + result.out)
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'a.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，验证 fail-closed 路径是否还原）
+    'fail-closed 分支必须把先前已写盘的 a.js 逐字节还原（旧实现在这里整份留在重排态）')
 })
 
 check('harness 自身：一条检查抛错只记失败，后续照跑、汇总为 1', () => {

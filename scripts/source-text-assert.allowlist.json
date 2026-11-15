@@ -1,6 +1,6 @@
 {
-  "note": "冻结清单（多重集：同一 (文件,字面量) 出现 N 次就记 N 条）：只减不增。新增源码文本断言一律红（scripts/check-source-text-asserts.js）。",
-  "count": 2575,
+  "note": "冻结清单（多重集：同一 (文件,字面量) 出现 N 次就记 N 条）：只减不增。新增源码文本断言一律红（scripts/check-source-text-asserts.js）。literal 是能从 AST 冻结的锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；<dynamic> = receiver 确实绑定到源码文本、但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 非正则字面量的 X.test(...)），它同样是「读源码文本」的证据，因此同样计入基数——把字面量提成常量不得让整条断言从检测面上消失。",
+  "count": 2714,
   "items": [
     {
       "file": "test_agents.js",
@@ -31,6 +31,11 @@
       "file": "test_app.js",
       "line": 717,
       "literal": "noidentity=1"
+    },
+    {
+      "file": "test_app.js",
+      "line": 741,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_app.js",
@@ -71,6 +76,16 @@
       "file": "test_app.js",
       "line": 1802,
       "literal": "pushed=1"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2813,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2818,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_app.js",
@@ -141,6 +156,11 @@
       "file": "test_app_unit.js",
       "line": 52,
       "literal": "stryMutAct_"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 2683,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_app_unit.js",
@@ -459,6 +479,11 @@
     },
     {
       "file": "test_app_unit.js",
+      "line": 6332,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_app_unit.js",
       "line": 6522,
       "literal": ")"
     },
@@ -466,6 +491,11 @@
       "file": "test_app_unit.js",
       "line": 6525,
       "literal": "/^[0-9]+$/"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 6693,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_app_unit.js",
@@ -501,6 +531,11 @@
       "file": "test_app_unit.js",
       "line": 6806,
       "literal": "/ERROR 推送部分失败 1\\/2 条（未送达消息下轮重试）/"
+    },
+    {
+      "file": "test_check_deps.js",
+      "line": 556,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_check_mutation_ranges.js",
@@ -559,6 +594,11 @@
     },
     {
       "file": "test_check_mutation_ranges.js",
+      "line": 160,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_check_mutation_ranges.js",
       "line": 167,
       "literal": "路径越出仓库根目录"
     },
@@ -599,6 +639,11 @@
     },
     {
       "file": "test_check_mutation_ranges.js",
+      "line": 430,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_check_mutation_ranges.js",
       "line": 452,
       "literal": "MUTATION_WORKFLOW_TEXT 注入文本校验"
     },
@@ -620,12 +665,22 @@
     {
       "file": "test_check_mutation_ranges.js",
       "line": 479,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_check_mutation_ranges.js",
+      "line": 479,
       "literal": "mutate"
     },
     {
       "file": "test_check_mutation_ranges.js",
       "line": 486,
       "literal": "matrix name 重复"
+    },
+    {
+      "file": "test_check_mutation_ranges.js",
+      "line": 487,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_check_mutation_ranges.js",
@@ -784,6 +839,11 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 238,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 275,
       "literal": "/^- +(?:name|uses|run|if):/"
     },
@@ -799,13 +859,28 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 283,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 296,
       "literal": "if:"
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 299,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 301,
       "literal": "run:"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 307,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -819,8 +894,23 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 358,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 363,
       "literal": "      - name: "
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 391,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 419,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -836,6 +926,16 @@
       "file": "test_ci_skip_suites.js",
       "line": 452,
       "literal": "/^\\s{2}[A-Za-z0-9_-]+:\\s*$/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 468,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 469,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -941,6 +1041,11 @@
       "file": "test_ci_skip_suites.js",
       "line": 562,
       "literal": "test:unit"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 573,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1059,6 +1164,11 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 1195,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 1378,
       "literal": "/^X\\d+$/"
     },
@@ -1104,8 +1214,18 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 2130,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 2132,
       "literal": "/^[ \\t]*stryker-\\$\\{\\{ matrix\\.name \\}\\}-cfg-/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2133,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1119,8 +1239,18 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 2144,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 2146,
       "literal": "/^[ \\t]*key:\\s/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2147,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1160,12 +1290,22 @@
     {
       "file": "test_ci_skip_suites.js",
       "line": 2194,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2194,
       "literal": "scripts/tap-shim.js"
     },
     {
       "file": "test_ci_skip_suites.js",
       "line": 2196,
       "literal": "/^[ \\t]*stryker-\\$\\{\\{ matrix\\.name \\}\\}-cfg-/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2197,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1185,12 +1325,22 @@
     {
       "file": "test_ci_skip_suites.js",
       "line": 2214,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2214,
       "literal": "scripts/tap-shim.js"
     },
     {
       "file": "test_ci_skip_suites.js",
       "line": 2216,
       "literal": "/^[ \\t]*key:\\s/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2217,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1209,8 +1359,18 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 2235,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 2237,
       "literal": "/^[ \\t]*key:\\s/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2238,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1244,6 +1404,11 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 2309,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 2314,
       "literal": "reports/mutation/mutation.json"
     },
@@ -1269,6 +1434,11 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 2351,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 2354,
       "literal": "/^\\s*path:/"
     },
@@ -1276,6 +1446,11 @@
       "file": "test_ci_skip_suites.js",
       "line": 2359,
       "literal": "/^\\s*if-no-files-found:/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2368,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1291,6 +1466,11 @@
       "file": "test_ci_skip_suites.js",
       "line": 2377,
       "literal": "/--segment\\s+\"?\\$\\{\\{\\s*matrix\\.name\\s*\\}\\}\"?/"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2394,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_ci_skip_suites.js",
@@ -1464,6 +1644,11 @@
     },
     {
       "file": "test_ci_skip_suites.js",
+      "line": 2983,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
       "line": 2997,
       "literal": "stryker-$"
     },
@@ -1478,73 +1663,98 @@
       "literal": "/timeoutMS:\\s*300000/"
     },
     {
+      "file": "test_ci_skip_suites.js",
+      "line": 3053,
+      "literal": "<dynamic>"
+    },
+    {
       "file": "test_ci_static_gates.js",
-      "line": 85,
+      "line": 28,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_static_gates.js",
+      "line": 29,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_static_gates.js",
+      "line": 88,
       "literal": "npm run check:ci-static"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 165,
+      "line": 96,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_static_gates.js",
+      "line": 98,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_ci_static_gates.js",
+      "line": 200,
       "literal": "    permissions:"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 171,
+      "line": 206,
       "literal": "/^ {6}\\S/"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 174,
+      "line": 209,
       "literal": "contents: read"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 183,
+      "line": 218,
       "literal": "shellcheck disable=SC2034"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 236,
+      "line": 271,
       "literal": "if (toolAvailable('shellcheck')) {"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 237,
+      "line": 272,
       "literal": "const sc = runShellcheck()"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 238,
+      "line": 273,
       "literal": "if (toolAvailable('zizmor')) {"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 239,
+      "line": 274,
       "literal": "const z = runZizmor()"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 240,
+      "line": 275,
       "literal": "return red ? 1 : 0"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 253,
+      "line": 288,
       "literal": "decideEmptyScan(sc.scanned) === 'fail'"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 254,
+      "line": 289,
       "literal": "'✅ shellcheck：' + sc.scanned + ' 个钩子文件，0 发现'"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 258,
+      "line": 293,
       "literal": "'❌ shellcheck：扫描面为空"
     },
     {
       "file": "test_ci_static_gates.js",
-      "line": 261,
+      "line": 296,
       "literal": "if (why) return { ok: false, reason: why, findings: [] }"
     },
     {
@@ -1566,6 +1776,26 @@
       "file": "test_cli.js",
       "line": 36,
       "literal": "/if\\s*\\(\\s*hasArg\\(\\s*['\"]--dry-run['\"]\\s*\\)\\s*\\)[\\s\\S]*ensureDependencies\\s*\\(\\s*\\)[\\s\\S]*const\\s+app\\s*=\\s*loadApp\\s*\\(\\s*\\)/"
+    },
+    {
+      "file": "test_console.js",
+      "line": 22,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 24,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 31,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 407,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -1656,6 +1886,11 @@
       "file": "test_console.js",
       "line": 2130,
       "literal": "审计敏感词"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2131,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -2006,6 +2241,26 @@
       "file": "test_console.js",
       "line": 2929,
       "literal": "\n}\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2930,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2931,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2932,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2933,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -2734,8 +2989,18 @@
     },
     {
       "file": "test_console.js",
+      "line": 8381,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 8384,
       "literal": "if (dirtyRef.current) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8387,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -2921,6 +3186,11 @@
       "file": "test_console.js",
       "line": 8598,
       "literal": "/@media \\(prefers-reduced-motion: reduce\\)[\\s\\S]*?\\.drawer[\\s\\S]*?animation:\\s*none/"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8603,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -3389,6 +3659,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 8764,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 8766,
       "literal": "/filter:\\s*brightness\\(\\.85\\)/"
     },
@@ -3444,6 +3719,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 8799,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 8802,
       "literal": "/<\\$\\{RunsPanel\\} runs=\\$\\{runs\\}/"
     },
@@ -3464,6 +3744,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 8814,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 8815,
       "literal": "/lines: \\[(.*)\\]/"
     },
@@ -3481,6 +3766,11 @@
       "file": "test_console.js",
       "line": 8825,
       "literal": "const hint = err ? '读取失败' : '正在读取…'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8829,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -4229,6 +4519,21 @@
     },
     {
       "file": "test_console.js",
+      "line": 9065,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9076,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9078,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 9080,
       "literal": "const [visited, setVisited] = useState(() => new Set(["
     },
@@ -4406,6 +4711,11 @@
       "file": "test_console.js",
       "line": 9124,
       "literal": "if (active) load()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9126,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -5844,6 +6154,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 9785,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 9787,
       "literal": "/--accent-solid:/"
     },
@@ -5936,6 +6251,11 @@
       "file": "test_console.js",
       "line": 9806,
       "literal": ".badge-ok::before"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9809,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -6904,6 +7224,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 10138,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 10139,
       "literal": "/mask-image:\\s*linear-gradient\\(to right,\\s*#000/"
     },
@@ -6941,6 +7266,11 @@
       "file": "test_console.js",
       "line": 10146,
       "literal": "el.scrollIntoView({ inline: 'nearest', block: 'nearest', preventScroll: true })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10157,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -7269,6 +7599,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 10268,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 10269,
       "literal": "/\\.runs-scroll \\.runs-table th:last-child,[\\s\\S]{0,200}?background:\\s*var\\(--panel\\)/"
     },
@@ -7346,6 +7681,11 @@
       "file": "test_console.js",
       "line": 10288,
       "literal": "<colgroup>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10290,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -7634,8 +7974,28 @@
     },
     {
       "file": "test_console.js",
+      "line": 10395,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 10396,
       "literal": "const info = sys || {}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10397,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10397,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10397,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -8094,6 +8454,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 10550,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 10552,
       "literal": "if (loading) return"
     },
@@ -8171,6 +8536,11 @@
       "file": "test_console.js",
       "line": 10564,
       "literal": "load().catch"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10570,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -8531,6 +8901,16 @@
       "file": "test_console.js",
       "line": 10680,
       "literal": "<div class=\"runs-scroll\" ref=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10691,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10692,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -9844,6 +10224,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 11041,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 11042,
       "literal": "<$"
     },
@@ -10369,6 +10754,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 11331,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 11477,
       "literal": "process.on('uncaughtException'"
     },
@@ -10376,6 +10766,11 @@
       "file": "test_console.js",
       "line": 11478,
       "literal": "/uncaughtException[\\s\\S]{0,600}process\\.exit\\(1\\)/"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11505,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -10576,6 +10971,11 @@
       "file": "test_console.js",
       "line": 11787,
       "literal": "// ── 组件：运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11793,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -10791,6 +11191,11 @@
       "file": "test_console.js",
       "line": 11906,
       "literal": "setCancelAsk(r.id)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11909,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -11014,6 +11419,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 12048,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 12050,
       "literal": "disabled=$"
     },
@@ -11111,6 +11521,16 @@
       "file": "test_console.js",
       "line": 12242,
       "literal": "/data\\.limits\\./"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12244,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12246,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -11324,6 +11744,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 12335,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 12338,
       "literal": "label: '导入失败'"
     },
@@ -11424,6 +11849,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 12396,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 12414,
       "literal": "/inset:\\s*0/"
     },
@@ -11439,6 +11869,21 @@
     },
     {
       "file": "test_console.js",
+      "line": 12442,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12443,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12444,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 12455,
       "literal": "- 抽屉（v3.378"
     },
@@ -11451,6 +11896,11 @@
       "file": "test_console.js",
       "line": 12463,
       "literal": "压暗"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12464,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_console.js",
@@ -11554,6 +12004,11 @@
     },
     {
       "file": "test_console.js",
+      "line": 12600,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_console.js",
       "line": 12607,
       "literal": "if (document.hidden) return"
     },
@@ -11649,8 +12104,28 @@
     },
     {
       "file": "test_doc_line_gates.js",
+      "line": 25,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_doc_line_gates.js",
+      "line": 26,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_doc_line_gates.js",
       "line": 84,
       "literal": "npm run check:doc-lines"
+    },
+    {
+      "file": "test_doc_line_gates.js",
+      "line": 88,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_doc_line_gates.js",
+      "line": 88,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_doc_line_gates.js",
@@ -11709,6 +12184,16 @@
     },
     {
       "file": "test_filter.js",
+      "line": 6747,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 6772,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_filter.js",
       "line": 6801,
       "literal": "*"
     },
@@ -11721,6 +12206,11 @@
       "file": "test_filter.js",
       "line": 6801,
       "literal": "//"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 6802,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_filter.js",
@@ -11746,6 +12236,11 @@
       "file": "test_filter.js",
       "line": 7796,
       "literal": "/^\\s*(\\/\\/|\\*|\\/\\*)/"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 10426,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_filter.js",
@@ -11779,8 +12274,18 @@
     },
     {
       "file": "test_filter.js",
+      "line": 11848,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_filter.js",
       "line": 11852,
       "literal": "/hostClean\\.shouldAbortForDirtyHost\\(/"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 11856,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_filter.js",
@@ -11809,6 +12314,11 @@
     },
     {
       "file": "test_filter.js",
+      "line": 11931,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_filter.js",
       "line": 11935,
       "literal": "async function withCacheMaxSize"
     },
@@ -11819,8 +12329,18 @@
     },
     {
       "file": "test_filter.js",
+      "line": 12023,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_filter.js",
       "line": 12028,
       "literal": "/^\\s*\\/\\/ =+ (\\d+)[a-z]?\\. (.+?) =+$/"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 12031,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_filter_store.js",
@@ -11999,6 +12519,11 @@
     },
     {
       "file": "test_http.js",
+      "line": 498,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_http.js",
       "line": 514,
       "literal": "/try \\{ await fetchJson[^\\n]*\\} catch \\(e\\) \\{ rejected = e \\}/g"
     },
@@ -12059,6 +12584,11 @@
     },
     {
       "file": "test_local_mutation_guard.js",
+      "line": 34,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_local_mutation_guard.js",
       "line": 49,
       "literal": "/^npm run test:mutation(?:\\s|$)/"
     },
@@ -12091,6 +12621,11 @@
       "file": "test_local_mutation_guard.js",
       "line": 149,
       "literal": "/本机禁止跑变异评估/"
+    },
+    {
+      "file": "test_message_store_journal.js",
+      "line": 156,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_message_store_journal.js",
@@ -12149,6 +12684,11 @@
     },
     {
       "file": "test_mutation_ranges.js",
+      "line": 51,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_mutation_ranges.js",
       "line": 57,
       "literal": "/src\\(xbk_util\\.js\\)/"
     },
@@ -12176,6 +12716,11 @@
       "file": "test_mutation_ranges.js",
       "line": 77,
       "literal": "/stryker\\.config\\.js 的 mutate 含矩阵未覆盖的文件/"
+    },
+    {
+      "file": "test_mutation_report.js",
+      "line": 1755,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_mutation_report.js",
@@ -12369,6 +12914,11 @@
     },
     {
       "file": "test_mutation_report_cli.js",
+      "line": 953,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
       "line": 959,
       "literal": "/^ {2}mutation:\\s*$/"
     },
@@ -12464,6 +13014,11 @@
     },
     {
       "file": "test_mutation_report_cli.js",
+      "line": 1060,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
       "line": 1073,
       "literal": "id:"
     },
@@ -12481,6 +13036,16 @@
       "file": "test_mutation_report_cli.js",
       "line": 1091,
       "literal": "--cache-hit"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
+      "line": 1109,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
+      "line": 1109,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_mutation_report_cli.js",
@@ -12509,6 +13074,16 @@
     },
     {
       "file": "test_mutation_report_cli.js",
+      "line": 1191,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
+      "line": 1261,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
       "line": 1266,
       "literal": "since="
     },
@@ -12516,6 +13091,11 @@
       "file": "test_mutation_report_cli.js",
       "line": 1269,
       "literal": "/issues/950/comments"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
+      "line": 1270,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_network.js",
@@ -12536,6 +13116,11 @@
       "file": "test_notify.js",
       "line": 1753,
       "literal": "//"
+    },
+    {
+      "file": "test_notify.js",
+      "line": 1754,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_notify.js",
@@ -12574,6 +13159,21 @@
     },
     {
       "file": "test_notify_selfcheck.js",
+      "line": 43,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 401,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 403,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
       "line": 405,
       "literal": "/JSON\\.stringify\\s*\\(/"
     },
@@ -12581,6 +13181,11 @@
       "file": "test_notify_selfcheck.js",
       "line": 406,
       "literal": "/console\\.(log|warn|info|debug)\\s*\\(/"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 409,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_notify_selfcheck.js",
@@ -12596,6 +13201,11 @@
       "file": "test_notify_selfcheck.js",
       "line": 438,
       "literal": "JSON.stringify(e)"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 440,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_qinglong_utils.js",
@@ -12639,6 +13249,11 @@
     },
     {
       "file": "test_sendnotify_pure.js",
+      "line": 757,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_sendnotify_pure.js",
       "line": 780,
       "literal": "tMal<=ratioBudget(10,"
     },
@@ -12654,8 +13269,28 @@
     },
     {
       "file": "test_sendnotify_pure.js",
+      "line": 2836,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_sendnotify_pure.js",
       "line": 2862,
       "literal": "installTransport("
+    },
+    {
+      "file": "test_sendnotify_pure.js",
+      "line": 2870,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_sendnotify_utils.js",
+      "line": 139,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_sendnotify_utils.js",
+      "line": 147,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_sendnotify_utils.js",
@@ -12744,8 +13379,18 @@
     },
     {
       "file": "test_state_schema.js",
+      "line": 510,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_state_schema.js",
       "line": 514,
       "literal": "/(?:^|[^A-Za-z0-9_])total=/g"
+    },
+    {
+      "file": "test_state_schema.js",
+      "line": 519,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_storage.js",
@@ -12779,6 +13424,11 @@
     },
     {
       "file": "test_suite_registry.js",
+      "line": 123,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_suite_registry.js",
       "line": 125,
       "literal": "module.exports"
     },
@@ -12796,6 +13446,11 @@
       "file": "test_suite_registry.js",
       "line": 129,
       "literal": "module.exports"
+    },
+    {
+      "file": "test_suites.js",
+      "line": 183,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_support/source_model.js",
@@ -12824,6 +13479,21 @@
     },
     {
       "file": "test_tag_validator.js",
+      "line": 83,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_tag_validator.js",
+      "line": 95,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_tag_validator.js",
+      "line": 115,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_tag_validator.js",
       "line": 271,
       "literal": "name: "
     },
@@ -12844,8 +13514,23 @@
     },
     {
       "file": "test_tag_validator.js",
+      "line": 340,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_tag_validator.js",
       "line": 342,
       "literal": "- "
+    },
+    {
+      "file": "test_tag_validator.js",
+      "line": 369,
+      "literal": "<dynamic>"
+    },
+    {
+      "file": "test_tag_validator.js",
+      "line": 370,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_tag_validator.js",
@@ -12856,6 +13541,11 @@
       "file": "test_test_harness.js",
       "line": 259,
       "literal": "require('./scripts/test-harness')"
+    },
+    {
+      "file": "test_test_harness.js",
+      "line": 262,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_test_harness.js",
@@ -12871,6 +13561,11 @@
       "file": "test_test_harness.js",
       "line": 269,
       "literal": "/env:\\s*SUITE_ENV/"
+    },
+    {
+      "file": "test_test_harness.js",
+      "line": 278,
+      "literal": "<dynamic>"
     },
     {
       "file": "test_worker_protocol.js",
