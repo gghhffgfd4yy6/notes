@@ -30,14 +30,30 @@
  *     整个文件里的 `text`）。这是旧实现（文件级变量名集合 + 正则）44 条误判的根因。
  *   - 扫描面：仓库根 `test_*.js` + `test_support/**\/*.js`。
  *
- * 白名单：`scripts/source-text-assert.allowlist.json`，**多重集语义**——按 (文件, 字面量) 计数比对，
- * 实测命中数 > 允许数即 exit 1 并点名；实测少于允许数只提示（说明有断言被替换掉，是好事）。
- * 顶层 `count` 必须等于 `items.length`，否则 exit 2（防手删条目不改计数，那会让闸门静默放宽）。
- * 白名单由 `node scripts/check-source-text-asserts.js --write-allowlist` 生成（改基线才用，正常不要跑）。
+ * 白名单（v3.448 起是**紧凑基线** schema 2）：`scripts/source-text-assert.allowlist.json` 只冻结
+ * 「文件 → 条数」，逐条清单（file/line/literal/kind）**不随仓库走**——用 `--inventory` 写到仓库外
+ * （默认 `~/ledgers/pipelines/assertshape-20261115/inventory.json`，可用 `--inventory <path>` /
+ * `--inventory=<path>` / 环境变量 `SOURCE_TEXT_ASSERT_INVENTORY` 覆盖；写仓库目录内一律 exit 2 拒绝）。
  *
- * 退出码：0 无新增 / 1 有新增（同一 (文件,字面量) 超出允许次数也算新增）/ 2 白名单形状非法或扫描失败。
+ * 判定（只看条数，不看字面量）：某文件实测条数 > 基线 → exit 1，点名 文件 / 基线 / 实测 / 增量；
+ * 基线里没有的文件实测有条目 → exit 1（新文件，按基线 0 算）；条数下降允许，按文件报 shortfall。
+ * 输出里把 literal（静态可冻结锚点：字符串字面量 / 无插值模板 / 正则字面量）与 dynamic（`<dynamic>`）
+ * 两个口径分开报，但它们**不参与放行判定**——锚点从字面量提成常量不是「新增断言」。
+ *
+ * 退出码：0 无新增 / 1 有新增（某文件超基线 / 新文件）/ 2 基线自相矛盾（total ≠ by_file 之和、
+ * literal+dynamic ≠ all、条目形状非法）、扫描失败、或 --inventory 目标落在仓库内。
+ *
+ * 已知取舍（compact 化的代价，必须知道）：按文件计数**看不到同一文件内 literal 之间的互换**——
+ * 把一处锚点从 `'A'` 改成 `'B'`（条数不变）不会红，只有 `--inventory` 快照的 diff 才看得到。
+ * 计数拦的是**增量**，锚点质量靠评审看 diff。
+ *
+ * 用法：
+ *   node scripts/check-source-text-asserts.js                   # 门禁：对紧凑基线（exit 0/1/2）
+ *   node scripts/check-source-text-asserts.js --inventory [p]   # 逐条清单出仓（默认见上，拒绝仓库内）
+ *   node scripts/check-source-text-asserts.js --write-allowlist # 重生成紧凑基线（改基线才用；逐字节稳定）
  */
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const acorn = require('acorn')
 
@@ -839,99 +855,303 @@ function die (code, message) {
   process.exit(code)
 }
 
-// ── 白名单（多重集） ────────────────────────────────────────────────────
-const keyOf = (item) => item.file + '\u0000' + item.literal
+// ── 紧凑基线（schema 2）+ 逐条清单出仓 ─────────────────────────────────────
+// v3.448：白名单从「逐条清单（items，13.5k 行 / 312 KB）」改成「按文件计数（~45 行）」。原因：逐条清单是
+// 仓库体积与 diff 噪声的主要来源，而放行判定真正需要的只有「某文件现在有几个」。逐条清单仍有价值（定位
+// 新增断言的 file:line），但它是**取证材料**，用 --inventory 写到仓库外，不随仓库走。
+const BASELINE_SCHEMA = 2
+const INVENTORY_ENV = 'SOURCE_TEXT_ASSERT_INVENTORY'
+// 默认落在仓库外：逐条清单是 2714 行的一次性取证材料，进仓库等于把刚删掉的东西又加回来。
+const INVENTORY_DEFAULT = path.join(os.homedir(), 'ledgers', 'pipelines', 'assertshape-20261115', 'inventory.json')
+const BASELINE_NOTE = '紧凑基线（schema 2）：只冻结「文件 → 条数」，逐条清单不随仓库走（node scripts/check-source-text-asserts.js --inventory 出仓）。' +
+  '判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；' +
+  'total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。' +
+  'literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，' +
+  'receiver 确实绑定到源码文本但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 动态 RegExp）——把字面量提成常量不得让整条断言从检测面上消失。' +
+  '已知取舍：按文件计数看不到同一文件内 literal 之间的互换（N 条换 N 条仍绿），只有 --inventory 的 diff 能看到。' +
+  '重生成：node scripts/check-source-text-asserts.js --write-allowlist（改基线才用，正常不要跑；round-trip 逐字节稳定）。'
+const INVENTORY_NOTE = '逐条清单（仓库外取证材料，与 scripts/source-text-assert.allowlist.json 的紧凑基线同源）：' +
+  'kind=literal 是静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags），kind=dynamic 是 <dynamic>' +
+  '（receiver 绑定到源码文本、但锚点无法静态冻结）。total/by_file 必须与紧凑基线一致：它是「新增哪一行」的唯一依据。'
 
-function byFile (items) {
-  const counts = new Map()
-  for (const item of items) counts.set(item.file, (counts.get(item.file) || 0) + 1)
-  return [...counts.entries()].sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+const kindOf = (hit) => (hit.literal === DYNAMIC_ANCHOR ? 'dynamic' : 'literal')
+
+// 码元序比较器（Sonar S2871/S2879：`sort()` 不带比较器是 BUG 级告警；localeCompare 会随宿主 locale 漂移）。
+function byFileName (a, b) {
+  if (a === b) return 0
+  return a < b ? -1 : 1
 }
 
-function printByFile (title, items) {
+// 按文件汇总：all = 条数（放行判定只看这个），literal = 可冻结锚点条数，dynamic = all - literal。
+// items 保留原始命中（file/line/literal），供 --inventory 与 file:line 诊断用。
+function summarize (items) {
+  const perFile = new Map()
+  for (const item of items) {
+    let entry = perFile.get(item.file)
+    if (!entry) {
+      entry = { all: 0, literal: 0, dynamic: 0, items: [] }
+      perFile.set(item.file, entry)
+    }
+    entry.all++
+    if (kindOf(item) === 'literal') entry.literal++
+    else entry.dynamic++
+    entry.items.push(item)
+  }
+  return perFile
+}
+
+function totalsOf (perFile) {
+  const totals = { all: 0, literal: 0, dynamic: 0 }
+  for (const entry of perFile.values()) {
+    totals.all += entry.all
+    totals.literal += entry.literal
+    totals.dynamic += entry.dynamic
+  }
+  return totals
+}
+
+const sortedByFile = (perFile) => [...perFile.entries()].sort((a, b) => byFileName(a[0], b[0]))
+
+function printByFile (title, perFile, withSplit) {
   console.log(title)
-  const rows = byFile(items)
+  const rows = [...perFile.entries()].sort((a, b) => (b[1].all - a[1].all) || byFileName(a[0], b[0]))
   if (!rows.length) {
     console.log('  （无）')
     return
   }
-  rows.forEach(([file, count]) => console.log(`  ${file} ${count}`))
+  for (const [file, entry] of rows) {
+    const split = withSplit ? `（literal ${entry.literal} / dynamic ${entry.dynamic}）` : ''
+    console.log(`  ${file} ${entry.all}${split}`)
+  }
 }
 
-function assertAllowlistShape (raw) {
-  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.items)) {
-    die(2, `❌ 白名单形状非法（${ALLOW_REL}）：缺少 items 数组`)
+// 紧凑基线的序列化：一个文件一行（JSON.stringify(…, null, 2) 会把每条展开成 4 行，落不进 ~50 行）。
+// 顺序固定（note / schema / total / by_file，by_file 按文件名码元序）⇒ --write-allowlist 的 round-trip
+// 与冻结文件**逐字节**一致，手改与重生成不会来回跳。
+function renderBaseline (hits) {
+  const perFile = summarize(hits)
+  const totals = totalsOf(perFile)
+  const rows = sortedByFile(perFile).map(([file, entry]) =>
+    `    ${JSON.stringify(file)}: { "all": ${entry.all}, "literal": ${entry.literal} }`)
+  const tail = rows.length ? [rows.join(',\n'), '  }'] : ['  }']
+  return [
+    '{',
+    `  "note": ${JSON.stringify(BASELINE_NOTE)},`,
+    `  "schema": ${BASELINE_SCHEMA},`,
+    `  "total": { "all": ${totals.all}, "literal": ${totals.literal}, "dynamic": ${totals.dynamic} },`,
+    '  "by_file": {',
+    ...tail,
+    '}'
+  ].join('\n') + '\n'
+}
+
+const isCount = (value) => Number.isInteger(value) && value >= 0
+
+// 基线自相矛盾一律 exit 2（fail-closed）：既不按 total 也不按 by_file 放行。
+// 这里把「实测」也写进报错——手改 total 却不改 by_file 时，两个数字会同时出现在一行里，
+// 一眼能看出是基线坏了而不是代码坏了。
+function assertBaselineShape (raw, measuredTotal) {
+  const bad = (why) => die(2, `❌ 基线自相矛盾（${ALLOW_REL}）：${why}。` +
+    `当前实测 ${measuredTotal} 条。修法：node scripts/check-source-text-asserts.js --write-allowlist 重生成` +
+    '（逐条清单用 --inventory 出仓）。')
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('顶层必须是对象')
+  if (raw.schema !== BASELINE_SCHEMA) {
+    bad(`schema 必须是 ${BASELINE_SCHEMA}，实得 ${JSON.stringify(raw.schema)}（逐条清单形状已废弃，清单请用 --inventory 出仓）`)
   }
-  if (!Number.isInteger(raw.count)) {
-    die(2, `❌ 白名单形状非法（${ALLOW_REL}）：count 必须是整数，实得 ${JSON.stringify(raw.count)}`)
+  const total = raw.total
+  if (!total || typeof total !== 'object' || Array.isArray(total)) bad('缺少 total 对象')
+  for (const key of ['all', 'literal', 'dynamic']) {
+    if (!isCount(total[key])) bad(`total.${key} 必须是非负整数，实得 ${JSON.stringify(total[key])}`)
   }
-  // count 与 items.length 不一致说明有人手删/手改条目而没同步计数——此时闸门口径已不可信，
-  // 既不按 count 也不按 items 放行，直接 exit 2（fail-closed）。
-  if (raw.count !== raw.items.length) {
-    die(2, `❌ 白名单计数漂移（${ALLOW_REL}）：count=${raw.count}，items.length=${raw.items.length}。` +
-      '删条目必须同时改 count（或重跑 --write-allowlist）。')
-  }
-  raw.items.forEach((item, i) => {
-    if (!item || typeof item.file !== 'string' || typeof item.literal !== 'string') {
-      die(2, `❌ 白名单第 ${i + 1} 条形状非法（${ALLOW_REL}）：需要 {file, literal} 两个字符串字段`)
+  const files = raw.by_file
+  if (!files || typeof files !== 'object' || Array.isArray(files)) bad('缺少 by_file 对象')
+  let sumAll = 0
+  let sumLiteral = 0
+  for (const [file, entry] of Object.entries(files)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) bad(`by_file["${file}"] 必须是 {all, literal} 对象`)
+    if (!isCount(entry.all) || !isCount(entry.literal)) {
+      bad(`by_file["${file}"] 的 all / literal 必须是非负整数，实得 ${JSON.stringify(entry)}`)
     }
-  })
+    if (entry.literal > entry.all) bad(`by_file["${file}"] 的 literal(${entry.literal}) > all(${entry.all})`)
+    sumAll += entry.all
+    sumLiteral += entry.literal
+  }
+  if (sumAll !== total.all) bad(`total.all=${total.all}，但 by_file 各 all 之和=${sumAll}`)
+  if (sumLiteral !== total.literal) bad(`total.literal=${total.literal}，但 by_file 各 literal 之和=${sumLiteral}`)
+  if (total.literal + total.dynamic !== total.all) {
+    bad(`total.literal(${total.literal}) + total.dynamic(${total.dynamic}) ≠ total.all(${total.all})`)
+  }
   return raw
 }
 
-function readAllowlist () {
+function readBaseline (measuredTotal) {
   let raw
   try {
-    raw = JSON.parse(fs.readFileSync(ALLOW_FILE, 'utf8')) // nosemgrep（ALLOW_FILE = __dirname 常量 + 固定文件名，白名单就在脚本旁边）
+    raw = JSON.parse(fs.readFileSync(ALLOW_FILE, 'utf8')) // nosemgrep（ALLOW_FILE = __dirname 常量 + 固定文件名，基线就在脚本旁边）
   } catch (e) {
-    die(2, `❌ 白名单不可读或不是合法 JSON（${ALLOW_REL}）：${e.message}`)
+    die(2, `❌ 基线不可读或不是合法 JSON（${ALLOW_REL}）：${e.message}`)
   }
-  return assertAllowlistShape(raw)
+  return assertBaselineShape(raw, measuredTotal)
 }
 
-// 多重集比对：逐 (文件,字面量) 数次数。同一字面量在同一个文件里出现两次、白名单只冻结一次
-// ⇒ 多出来的那一次就是**新增**（旧实现用 Set 比对，重复出现一律放行）。
-function compareMultiset (hits, allow) {
-  const allowedCount = new Map()
-  for (const item of allow.items) allowedCount.set(keyOf(item), (allowedCount.get(keyOf(item)) || 0) + 1)
-  const measured = new Map() // key → { file, literal, lines: [], count }
-  for (const hit of hits) {
-    const key = keyOf(hit)
-    let entry = measured.get(key)
-    if (!entry) {
-      entry = { file: hit.file, literal: hit.literal, lines: [], count: 0 }
-      measured.set(key, entry)
-    }
-    entry.count++
-    entry.lines.push(hit.line)
-  }
+// 按文件计数比对（v3.448）：只看 all。
+//   实测 > 基线        ⇒ violation（exit 1，点名文件 / 基线 / 实测 / 增量）
+//   基线里没有该文件    ⇒ violation（新文件，基线按 0 算）
+//   实测 < 基线        ⇒ shortfall（绿：断言被替换/删除，允许，并按文件报下降量）
+// literal 与 dynamic 的分列只用于报告，不参与判定（锚点从字面量提成常量不是「新增断言」）。
+function compareByFile (hits, baseline) {
+  const measured = summarize(hits)
+  const baselineFiles = baseline.by_file
+  const files = new Set([...Object.keys(baselineFiles), ...measured.keys()])
   const violations = []
   const shortfalls = []
-  for (const [key, entry] of measured) {
-    const allowed = allowedCount.get(key) || 0
-    if (entry.count > allowed) violations.push({ ...entry, allowed, extra: entry.count - allowed })
-    else if (entry.count < allowed) shortfalls.push({ ...entry, allowed, missing: allowed - entry.count })
+  for (const file of [...files].sort(byFileName)) {
+    const hasBaseline = Object.prototype.hasOwnProperty.call(baselineFiles, file)
+    const allowed = hasBaseline ? baselineFiles[file] : null
+    const got = measured.get(file) || { all: 0, literal: 0, dynamic: 0, items: [] }
+    if (!allowed) {
+      if (got.all === 0) continue
+      violations.push({
+        file,
+        isNewFile: true,
+        baseline: 0,
+        measured: got.all,
+        extra: got.all,
+        literal: got.literal,
+        baselineLiteral: 0,
+        entries: got.items
+      })
+      continue
+    }
+    if (got.all > allowed.all) {
+      violations.push({
+        file,
+        isNewFile: false,
+        baseline: allowed.all,
+        measured: got.all,
+        extra: got.all - allowed.all,
+        literal: got.literal,
+        baselineLiteral: allowed.literal,
+        entries: got.items
+      })
+    } else if (got.all < allowed.all) {
+      shortfalls.push({
+        file,
+        baseline: allowed.all,
+        measured: got.all,
+        missing: allowed.all - got.all,
+        literal: got.literal,
+        baselineLiteral: allowed.literal
+      })
+    }
   }
-  for (const [key, allowed] of allowedCount) {
-    if (measured.has(key)) continue
-    const sample = allow.items.find((item) => keyOf(item) === key)
-    shortfalls.push({ file: sample.file, literal: sample.literal, lines: [], count: 0, allowed, missing: allowed })
+  return { violations, shortfalls, measured, measuredTotals: totalsOf(measured) }
+}
+
+// 逐条清单（file:line）只可能来自仓库外的 inventory：紧凑基线没有行号，所以「新增哪一行」要么由
+// --inventory 的旧快照 diff 得出，要么只能点名文件 + 增量。inventory 缺失/陈旧一律不改变退出码。
+function loadInventoryItems (hint) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(hint, 'utf8')) // nosemgrep（hint = 环境变量或本文件常量路径，只读、缺失即降级为「点名文件」）
+    if (!raw || !Array.isArray(raw.items)) return null
+    return raw.items.filter((item) => item && typeof item.file === 'string' && typeof item.literal === 'string')
+  } catch (e) {
+    return null
   }
-  return { violations, shortfalls, allowTotal: allow.items.length }
+}
+
+// 多重集扣减：inventory 里记过的 (file,literal) 出现 N 次就不再算「新增」，剩下的才是新断言。
+function diffAgainstInventory (hits, known, onlyFiles) {
+  const budget = new Map()
+  for (const item of known) {
+    const key = item.file + '\u0000' + item.literal
+    budget.set(key, (budget.get(key) || 0) + 1)
+  }
+  const extras = []
+  for (const hit of hits) {
+    if (onlyFiles && !onlyFiles.has(hit.file)) continue
+    const key = hit.file + '\u0000' + hit.literal
+    const left = budget.get(key) || 0
+    if (left > 0) {
+      budget.set(key, left - 1)
+      continue
+    }
+    extras.push(hit)
+  }
+  return extras
+}
+
+function printNewHitLines (hits, violations) {
+  const hint = process.env[INVENTORY_ENV] || INVENTORY_DEFAULT
+  const known = loadInventoryItems(hint)
+  if (!known) {
+    console.log(`ℹ️ 没有可用的逐条清单（${hint}）：只能按文件报增量。要 file:line 就在基线冻结状态下先跑 --inventory。`)
+    return
+  }
+  const extras = diffAgainstInventory(hits, known, new Set(violations.map((v) => v.file)))
+  if (!extras.length) {
+    console.log(`ℹ️ 逐条清单（${hint}）里找不到对应的新增行（快照陈旧或条数在文件内互换）：按文件增量处理。`)
+    return
+  }
+  console.log(`新增命中的位置（对照 ${hint}）：`)
+  extras.slice(0, 40).forEach((hit) => {
+    console.log(`  ${hit.file}:${hit.line}  ${JSON.stringify(hit.literal).slice(0, 80)}（${kindOf(hit)}）`)
+  })
+  if (extras.length > 40) console.log(`  …还有 ${extras.length - 40} 处未列出`)
+}
+
+// --inventory 的目标路径：--inventory <path> / --inventory=<path> / 环境变量 / 默认（仓库外）。
+function inventoryTarget () {
+  const inline = process.argv.find((arg) => arg.startsWith('--inventory='))
+  if (inline) return inline.slice('--inventory='.length)
+  const index = process.argv.indexOf('--inventory')
+  if (index >= 0) {
+    const next = process.argv[index + 1]
+    if (next && !next.startsWith('--')) return next
+  }
+  return process.env[INVENTORY_ENV] || INVENTORY_DEFAULT
+}
+
+// 逐条清单**绝不进仓库**：它是 2714 行的取证材料，进仓库等于把刚刚删掉的东西换个名字加回来。
+function assertOutsideRepo (abs, flag) {
+  const rel = path.relative(ROOT, abs)
+  const inside = rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+  if (inside) {
+    die(2, `❌ ${flag} 的目标不得落在仓库目录内（${ROOT}）：${abs}。逐条清单是仓库外产物，禁止写进仓库。`)
+  }
+}
+
+function writeInventory (hits, target) {
+  const abs = path.resolve(target)
+  assertOutsideRepo(abs, '--inventory')
+  const perFile = summarize(hits)
+  const totals = totalsOf(perFile)
+  const byFile = {}
+  for (const [file, entry] of sortedByFile(perFile)) byFile[file] = { all: entry.all, literal: entry.literal, dynamic: entry.dynamic }
+  const body = {
+    note: INVENTORY_NOTE,
+    schema: BASELINE_SCHEMA,
+    baseline: ALLOW_REL,
+    total: totals,
+    by_file: byFile,
+    items: hits.map((hit) => ({ file: hit.file, line: hit.line, literal: hit.literal, kind: kindOf(hit) }))
+  }
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true }) // nosemgrep（abs 已过 assertOutsideRepo：仓库目录一律拒绝，这里只建仓库外的取证目录）
+    fs.writeFileSync(abs, JSON.stringify(body, null, 2) + '\n') // nosemgrep（同上：目标是仓库外的逐条清单，路径由 --inventory 或常量默认给出）
+  } catch (e) {
+    die(2, `❌ 逐条清单写盘失败（${abs}）：${e.message}`)
+  }
+  console.log(`已写入逐条清单 ${totals.all} 条（literal ${totals.literal} / dynamic ${totals.dynamic}，${perFile.size} 个文件）→ ${abs}`)
+  printByFile('按文件分布：', perFile)
 }
 
 function writeAllowlist (hits) {
-  const body = JSON.stringify({
-    note: '冻结清单（多重集：同一 (文件,字面量) 出现 N 次就记 N 条）：只减不增。新增源码文本断言一律红（scripts/check-source-text-asserts.js）。' +
-      'literal 是能从 AST 冻结的锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；' +
-      '<dynamic> = receiver 确实绑定到源码文本、但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 非正则字面量的 X.test(...)），' +
-      '它同样是「读源码文本」的证据，因此同样计入基数——把字面量提成常量不得让整条断言从检测面上消失。',
-    count: hits.length,
-    items: hits.map((hit) => ({ file: hit.file, line: hit.line, literal: hit.literal }))
-  }, null, 2) + '\n'
-  fs.writeFileSync(ALLOW_FILE, body) // nosemgrep（同上一行：写回的是 --write-allowlist 生成的白名单，路径为 __dirname 常量）
-  console.log(`已写入白名单 ${hits.length} 条 → ${ALLOW_REL}`)
-  printByFile('按文件分布：', hits)
+  const body = renderBaseline(hits)
+  const totals = totalsOf(summarize(hits))
+  fs.writeFileSync(ALLOW_FILE, body) // nosemgrep（写回的是 --write-allowlist 生成的紧凑基线，路径为 __dirname 常量）
+  console.log(`已写入紧凑基线 ${totals.all} 条（literal ${totals.literal} / dynamic ${totals.dynamic}，按文件计数）→ ${ALLOW_REL}`)
+  printByFile('按文件分布：', summarize(hits))
 }
 
 function main () {
@@ -940,31 +1160,67 @@ function main () {
     writeAllowlist(hits)
     return
   }
-  const allow = readAllowlist()
-  const { violations, shortfalls, allowTotal } = compareMultiset(hits, allow)
-  console.log(`源码文本断言：实测 ${hits.length} 条 / 白名单冻结 ${allowTotal} 条（多重集按 (文件,字面量) 计数）`)
+  if (process.argv.some((arg) => arg === '--inventory' || arg.startsWith('--inventory='))) {
+    writeInventory(hits, inventoryTarget())
+    return
+  }
+  const baseline = readBaseline(hits.length)
+  const { violations, shortfalls, measured, measuredTotals } = compareByFile(hits, baseline)
+  console.log(`源码文本断言：实测 ${measuredTotals.all} 条（literal ${measuredTotals.literal} / dynamic ${measuredTotals.dynamic}）` +
+    ` / 基线 ${baseline.total.all} 条（literal ${baseline.total.literal} / dynamic ${baseline.total.dynamic}，` +
+    `${Object.keys(baseline.by_file).length} 个文件，按文件计数 schema ${BASELINE_SCHEMA}）`)
   if (violations.length) {
     const extra = violations.reduce((sum, v) => sum + v.extra, 0)
-    printByFile('白名单外命中（按文件，含超出次数的部分）：', violations.flatMap((v) =>
-      Array.from({ length: v.extra }, () => ({ file: v.file, literal: v.literal }))))
-    console.error(`❌ 新增 ${extra} 处源码文本断言（禁止）：`)
-    violations.slice(0, 40).forEach((v) => {
-      console.error(`  ${v.file}:${v.lines.join(',')}  ${JSON.stringify(v.literal).slice(0, 80)}  实测 ${v.count} 次 / 允许 ${v.allowed} 次`)
-    })
-    if (violations.length > 40) console.error(`  …还有 ${violations.length - 40} 组未列出`)
+    printByFile('超基线的文件（实测命中）：', new Map(violations.map((v) => [v.file, measured.get(v.file)])), true)
+    console.error(`❌ 新增 ${extra} 处源码文本断言（按文件计数，禁止）：`)
+    for (const v of violations) {
+      const tag = v.isNewFile ? '（基线里没有这个文件）' : ''
+      console.error(`  ${v.file}  基线 ${v.baseline} / 实测 ${v.measured} / +${v.extra}${tag}`)
+    }
+    printNewHitLines(hits, violations)
     console.error('改成行为断言 / AST 断言（test_support/source_model.js）/ 配置解析断言，见 AGENTS.md「断言形态」')
     process.exit(1)
   }
-  printByFile('按文件分布（实测命中）：', hits)
+  printByFile('按文件分布（实测命中）：', measured, true)
+  // literal 口径变化：条数没变但锚点从字面量变成 <dynamic>（或反之）。不判红——它不是「新增断言」，
+  // 但会削弱「这个锚点能不能逐字核对」，所以明写出来，别让它静默发生。
+  const drift = []
+  for (const [file, entry] of sortedByFile(measured)) {
+    const allowed = Object.prototype.hasOwnProperty.call(baseline.by_file, file) ? baseline.by_file[file] : null
+    if (allowed && entry.all === allowed.all && entry.literal !== allowed.literal) drift.push([file, allowed.literal, entry.literal])
+  }
+  if (drift.length) {
+    console.log('ℹ️ literal 口径变化（条数不变，不判红）：')
+    drift.forEach(([file, before, now]) => console.log(`  ${file}  基线 literal ${before} / 实测 literal ${now}`))
+  }
   if (shortfalls.length) {
     const missing = shortfalls.reduce((sum, s) => sum + s.missing, 0)
-    console.log(`ℹ️ 实测比白名单少 ${missing} 条（已有断言被替换/删除，或同一字面量出现次数减少）——` +
-      '这是好事，可删掉多余条目并同步 count。')
-    shortfalls.slice(0, 20).forEach((s) => console.log(`  ${s.file}  ${JSON.stringify(s.literal).slice(0, 60)}  实测 ${s.count} / 允许 ${s.allowed}`))
+    console.log(`ℹ️ 实测比基线少 ${missing} 条（已有断言被替换/删除，按文件计数允许）：`)
+    shortfalls.forEach((s) => console.log(`  ${s.file}  基线 ${s.baseline} / 实测 ${s.measured} / -${s.missing}`))
+    console.log('   重跑 --write-allowlist 可把基线收紧到实测值（只减不增，收紧跟得上）。')
   }
-  console.log('✅ 未新增源码文本断言')
+  // fail-closed 兜底：total 与实测的差额必须由上面的逐文件增量/下降**完全**解释。算术上不可达
+  // （所有文件都在并集里），留着是为了「基线/比对逻辑被改坏」时响亮而不是静默放行。
+  const unexplained = (baseline.total.all - measuredTotals.all) -
+    (shortfalls.reduce((sum, s) => sum + s.missing, 0) - violations.reduce((sum, v) => sum + v.extra, 0))
+  if (unexplained !== 0) {
+    die(2, `❌ 基线 total.all=${baseline.total.all} 与实测 ${measuredTotals.all} 的差额无法逐文件归因（残差 ${unexplained}）：` +
+      '基线已不可信，重跑 --write-allowlist。')
+  }
+  console.log('✅ 未新增源码文本断言（按文件计数）')
 }
 
-module.exports = { analyzeSource, compareMultiset, listScanFiles, literalValue, SOURCE_CALLS }
+module.exports = {
+  analyzeSource,
+  compareByFile,
+  listScanFiles,
+  literalValue,
+  renderBaseline,
+  summarize,
+  kindOf,
+  SOURCE_CALLS,
+  DYNAMIC_ANCHOR,
+  BASELINE_SCHEMA
+}
 
 if (require.main === module) main()

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.447 — 零依赖 policy 不再跑接线套件（挪到 quality + 正反锁）+ Codacy 四条（S0） *******
+//* ******* 线报酷推送脚本 v3.448 — 白名单改紧凑基线（按文件计数）+ 逐条清单出仓 --inventory（S0） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

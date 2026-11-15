@@ -5,8 +5,16 @@
 // 为什么必须单独有一套：这道闸是「禁止测试里新增读源码文本断言」的门禁，闸门本身的漏检不会让任何东西变红
 // ——旧实现（文件级变量名集合 + 正则）就是这样：`if (!vars.size) return []` 让整份「无声明、行内直读」的
 // 文件被跳过，helper 链 / 模板字符串 / `/re/.test(src)` / `src.match(/re/)` / 多跳赋值 / 重赋值 / 函数参数
-// / split 后的行 / `codeOf(var)` 套壳全部不命中，而输出仍然好看（857/857 全绿）。
+// / split 后的行 / `codeOf(var)` 套壳全部不命中，而输出仍然好看（旧基线的全覆盖对账全绿）。
 // 下面每条用例都对着一个**已实测过的漏检形态**：正向必红，反向（不是源码文本的 receiver）必绿。
+//
+// v3.448：白名单从「逐条清单」改成**按文件计数的紧凑基线**（schema 2），逐条清单用 `--inventory` 出仓。
+// 判定只剩一条：某文件实测条数 > 基线 → 红。因此本文件的用例覆盖两个层面的反例：
+//   · 检测面（analyzeSource）——哪些写法算「读源码文本」，与基线形状无关；
+//   · 基线层（compareByFile / CLI）——超基线、新文件、下降只报 shortfall、基线自相矛盾 exit 2、
+//     literal→<dynamic> 仍计入条数、--inventory 出仓与仓内拒绝、--write-allowlist 逐字节 round-trip。
+// 已知取舍写在这里，别指望用例能看见它：按文件计数**看不到同一文件内 literal 之间的互换**
+// （把 `'A'` 改成 `'B'`，条数不变 ⇒ 绿）。这是 compact 化的代价，锚点质量只能靠评审看 diff。
 //
 // 全部在 `fs.mkdtempSync(os.tmpdir(), 'xbk-assertgate-')` 建的隔离工作区里跑：复制闸脚本进去、给
 // node_modules 软链、夹具全都写在那里面，跑完 rmSync 删掉——不在仓库根留任何垃圾，也不碰真实白名单。
@@ -21,7 +29,7 @@ const CHECKER = path.join(ROOT, 'scripts', 'check-source-text-asserts.js')
 const PROBE = path.join(ROOT, 'scripts', 'probe-format-coupling.js')
 // 字面量相对路径 require（Codacy/Opengrep「非字面量 require」）：与本文件其它 require 同口径，
 // 解析结果与 require(CHECKER) 完全相同——CHECKER/PROBE 两个常量仍留给 copyFileSync / spawn 用。
-const { analyzeSource, compareMultiset } = require('./scripts/check-source-text-asserts.js')
+const { analyzeSource, compareByFile } = require('./scripts/check-source-text-asserts.js')
 
 // 与 test_ci_static_gates.js / test_doc_line_gates.js 同一套 harness 形态：每条检查独立捕获，
 // passed/failed 双计数，末尾统一汇总并置非零退出码（harness 自身也有用例，见文件末尾）。
@@ -61,6 +69,8 @@ const check = harness.check
 
 // ── 隔离工作区 ────────────────────────────────────────────────────────────
 const workspaces = []
+// 仓库外的一次性产物（--inventory 的逐条清单）：用例自己建、跑完自己删，不在 /tmp 留垃圾。
+const outsideFiles = []
 
 function makeWorkspace () {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-assertgate-'))
@@ -82,11 +92,14 @@ function write (dir, rel, text) {
 }
 
 function run (dir, script, args, env) {
-  // 环境隔离：不继承外层可能存在的 PROBE_FORCE_UNPARSEABLE / NODE_OPTIONS（探针自己会注入垫片），
-  // 否则某条用例的故障注入会漏到别的用例里。
+  // 环境隔离：不继承外层可能存在的 PROBE_FORCE_UNPARSEABLE / NODE_OPTIONS / SOURCE_TEXT_ASSERT_INVENTORY
+  // （探针自己会注入垫片，inventory 快照必须由用例如实指定），否则某条用例的故障注入会漏到别的用例里。
   const base = { ...process.env, TZ: 'UTC' }
   delete base.PROBE_FORCE_UNPARSEABLE
   delete base.NODE_OPTIONS
+  // 逐条清单诊断源默认指向工作区里的**不存在**文件：不读宿主机的 ~/ledgers，用例才是自洽的
+  // （要测 file:line 诊断就显式建快照，见「file:line 诊断」那条）。
+  base.SOURCE_TEXT_ASSERT_INVENTORY = path.join(dir, '.inventory.absent.json')
   const result = spawnSync(process.execPath, [path.join('scripts', script), ...args], {
     cwd: dir,
     encoding: 'utf8',
@@ -97,15 +110,12 @@ function run (dir, script, args, env) {
 }
 
 const runChecker = (dir, ...args) => run(dir, 'check-source-text-asserts.js', args)
+const runCheckerWith = (dir, env, ...args) => run(dir, 'check-source-text-asserts.js', args, env)
 const runProbe = (dir, ...args) => run(dir, 'probe-format-coupling.js', args)
 const runProbeWith = (dir, env, ...args) => run(dir, 'probe-format-coupling.js', args, env)
+// 紧凑基线（schema 2）：{note, schema, total:{all,literal,dynamic}, by_file:{file:{all,literal}}}。
 const allowlistOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')) // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
 const lines = (...parts) => parts.join('\n') + '\n'
-
-// 排序口径（SonarCloud S2871）：`sort()` 不带比较器＝按 String 化后的默认字典序，是 BUG 级告警。
-// 这里显式给一个比较器，且**左右两侧共用同一个**——比的是「多重集对账的结果」，两侧口径必须一致，
-// 否则同样的两条数据会因排序不同而假红（这两条元组的首字符就不同，比较结果与默认排序一致）。
-const byString = (x, y) => String(x).localeCompare(String(y))
 
 // ── A. 检测面：每个漏检形态单独一条（正向必红） ────────────────────────────
 // 期望值 = 命中字面量数组（顺序按行号）。`file` 参数只用于错误信息，与分析结果无关。
@@ -286,7 +296,7 @@ const FIXTURE_OK = [
   "module.exports = () => src.includes('FIRST')"
 ].join('\n') + '\n'
 
-check('退出码 1：新增一处行内直读即红，并点名 file:line 与字面量（F1 回归）', () => {
+check('退出码 1：新增一处行内直读即红，并按文件报增量（F1 回归）', () => {
   const dir = makeWorkspace()
   write(dir, 'test_base.js', FIXTURE_OK)
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
@@ -299,46 +309,83 @@ check('退出码 1：新增一处行内直读即红，并点名 file:line 与字
   ))
   const result = runChecker(dir)
   assert.strictEqual(result.status, 1, '新增行内直读必须 exit 1：' + result.out)
-  assert.ok(/test_inline\.js:3\b/.test(result.out), '必须点名 test_inline.js:3：' + result.out)
-  assert.ok(result.out.includes('INLINE_NEW'), '必须点名新增字面量：' + result.out)
+  assert.ok(/test_inline\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out),
+    '必须点名 文件 / 基线 / 实测 / 增量：' + result.out)
+  assert.ok(/❌ 新增 1 处源码文本断言/.test(result.out), '必须报新增总数：' + result.out)
 })
 
-check('退出码 1：同一 (文件,字面量) 出现次数超过白名单即红（多重集，F3 回归）', () => {
+check('退出码 1：某文件条数超基线即红，且只点名超基线的那个文件（②）', () => {
   const dir = makeWorkspace()
-  write(dir, 'test_dup.js', lines(
+  write(dir, 'test_a.js', lines(
     "const fs = require('node:fs')",
     "const src = fs.readFileSync('a.js', 'utf8')",
-    "module.exports = () => src.includes('DUP')"
+    "module.exports = () => src.includes('ONE')"
+  ))
+  write(dir, 'test_b.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('b.js', 'utf8')",
+    "module.exports = () => src.includes('TWO')"
   ))
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
-  const frozen = allowlistOf(dir)
-  assert.strictEqual(frozen.count, 1, '基线应冻结 1 条')
-  assert.strictEqual(runChecker(dir).status, 0, '一条对一条必须绿')
-  // 同一文件再写一次同一字面量：Set 语义会放行（旧实现），多重集必须判红。
-  write(dir, 'test_dup.js', lines(
+  assert.deepStrictEqual(allowlistOf(dir).by_file, { 'test_a.js': { all: 1, literal: 1 }, 'test_b.js': { all: 1, literal: 1 } },
+    '基线必须按文件冻结条数')
+  // 同一文件里再写一条（不同字面量）：条数 1 → 2。
+  write(dir, 'test_b.js', lines(
     "const fs = require('node:fs')",
-    "const src = fs.readFileSync('a.js', 'utf8')",
-    "module.exports = () => src.includes('DUP') && src.includes('DUP')"
+    "const src = fs.readFileSync('b.js', 'utf8')",
+    "module.exports = () => src.includes('TWO') && src.includes('TWO_B')"
   ))
   const result = runChecker(dir)
-  assert.strictEqual(result.status, 1, '同一字面量重复出现必须 exit 1（旧实现 2 / 1 仍绿）：' + result.out)
-  assert.ok(/实测 2 次 \/ 允许 1 次/.test(result.out), '必须点名「实测 2 次 / 允许 1 次」：' + result.out)
+  assert.strictEqual(result.status, 1, '某文件条数超基线必须 exit 1：' + result.out)
+  assert.ok(/test_b\.js\s+基线 1 \/ 实测 2 \/ \+1/.test(result.out),
+    '必须点名 文件 / 基线 / 实测 / 增量：' + result.out)
+  assert.ok(!/test_a\.js\s+基线/.test(result.out), '未超基线的文件不得被点名：' + result.out)
 })
 
-check('退出码 2：白名单 count 与 items.length 漂移（手删条目不改计数）', () => {
+check('退出码 1：基线里没有的文件出现断言即红（新文件按基线 0 算，③）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  write(dir, 'test_brand_new.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => src.includes('NEW_A') && src.includes('NEW_B')"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '新文件出现断言必须 exit 1：' + result.out)
+  assert.ok(/test_brand_new\.js\s+基线 0 \/ 实测 2 \/ \+2（基线里没有这个文件）/.test(result.out),
+    '必须点名新文件并按基线 0 算：' + result.out)
+})
+
+check('退出码 2：total 与 by_file 不自洽（手改 total 不改计数）', () => {
   const dir = makeWorkspace()
   write(dir, 'test_base.js', FIXTURE_OK)
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
   const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（file = mkdtemp 结果 + 本文件硬编码的 scripts/…json，无外部净输入）
-  data.count += 1
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上：写回隔离工作区里的白名单副本，不碰真实仓库）
+  data.total.all += 1
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上：写回隔离工作区里的基线副本，不碰真实仓库）
   const result = runChecker(dir)
-  assert.strictEqual(result.status, 2, '形状非法必须 exit 2：' + result.out)
-  assert.ok(/计数漂移/.test(result.out), '必须提示计数漂移：' + result.out)
+  assert.strictEqual(result.status, 2, '基线自相矛盾必须 exit 2：' + result.out)
+  assert.ok(/自相矛盾/.test(result.out), '必须提示基线自相矛盾：' + result.out)
+  assert.ok(/total\.all=2，但 by_file 各 all 之和=1/.test(result.out), '必须点名两边的数字：' + result.out)
+  assert.ok(/当前实测 1 条/.test(result.out), '必须同时报实测条数：' + result.out)
 })
 
-check('实测少于白名单只提示、不判红，且文案不得出现负数', () => {
+check('退出码 2：手改某文件条数却不改 total（差额必须逐文件归因）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
+  const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（同上：隔离工作区里的基线副本）
+  data.by_file['test_base.js'] = { all: 0, literal: 0 }
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上）
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 2, 'by_file 之和与 total 不符必须 exit 2（不能当成「某文件超基线」放行）：' + result.out)
+  assert.ok(/by_file 各 all 之和=0/.test(result.out), '必须点名 by_file 之和：' + result.out)
+})
+
+check('条数下降只报 shortfall、不判红，文案不得出现负数（⑤）', () => {
   const dir = makeWorkspace()
   write(dir, 'test_base.js', FIXTURE_OK)
   write(dir, 'test_drop.js', lines(
@@ -347,10 +394,12 @@ check('实测少于白名单只提示、不判红，且文案不得出现负数'
     "module.exports = () => src.includes('DROPPED')"
   ))
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  // 断言被替换掉（实测 1 → 0）：允许，但必须按文件报下降量。
   write(dir, 'test_drop.js', lines("const assert = require('node:assert')", 'assert.ok(1 === 1)'))
   const result = runChecker(dir)
   assert.strictEqual(result.status, 0, '实测变少不能判红：' + result.out)
-  assert.ok(/实测比白名单少 1 条/.test(result.out), '必须提示「实测比白名单少 1 条」：' + result.out)
+  assert.ok(/实测比基线少 1 条/.test(result.out), '必须提示下降总量：' + result.out)
+  assert.ok(/test_drop\.js\s+基线 1 \/ 实测 0 \/ -1/.test(result.out), '必须按文件报下降量：' + result.out)
   assert.ok(!/多 -\d+ 条/.test(result.out), '不得出现「比实测多 -N 条」这类负数文案：' + result.out)
 })
 
@@ -362,14 +411,138 @@ check('退出码 2：测试文件解析失败必须 fail-closed（不得静默�
   assert.ok(/扫描失败 test_broken\.js/.test(result.out), '必须点名解析失败的文件：' + result.out)
 })
 
-check('compareMultiset：超出/不足/缺失三种关系都按「次数」算', () => {
-  const measured = [['a.js', 'X'], ['a.js', 'X'], ['a.js', 'Y'], ['b.js', 'Z']].map(([file, literal]) => ({ file, literal }))
-  const allowed = { items: [['a.js', 'X'], ['b.js', 'Z'], ['b.js', 'Z'], ['c.js', 'W']].map(([file, literal]) => ({ file, literal })) }
-  const { violations, shortfalls } = compareMultiset(measured, allowed)
-  assert.deepStrictEqual(violations.map((v) => [v.file, v.literal, v.count, v.allowed]),
-    [['a.js', 'X', 2, 1], ['a.js', 'Y', 1, 0]], '实测 > 允许即违规（含「允许 0」的新增）')
-  assert.deepStrictEqual(shortfalls.map((m) => [m.file, m.literal, m.count, m.allowed]).sort(byString),
-    [['b.js', 'Z', 1, 2], ['c.js', 'W', 0, 1]].sort(byString), '实测 < 允许只记「少了」，不违规')
+check('compareByFile：超基线 / 新文件 / 下降三种关系都按「文件条数」算', () => {
+  const measured = [
+    { file: 'a.js', literal: 'X' }, { file: 'a.js', literal: 'X' }, { file: 'a.js', literal: 'Y' },
+    { file: 'b.js', literal: 'Z' }, { file: 'c.js', literal: 'W' }
+  ]
+  const baseline = {
+    schema: 2,
+    total: { all: 4, literal: 4, dynamic: 0 },
+    by_file: { 'a.js': { all: 1, literal: 1 }, 'b.js': { all: 3, literal: 3 } }
+  }
+  const { violations, shortfalls } = compareByFile(measured, baseline)
+  assert.deepStrictEqual(violations.map((v) => [v.file, v.baseline, v.measured, v.extra]),
+    [['a.js', 1, 3, 2], ['c.js', 0, 1, 1]], '实测 > 基线即违规（基线里没有的文件按 0 算）')
+  assert.deepStrictEqual(shortfalls.map((s) => [s.file, s.baseline, s.measured, s.missing]),
+    [['b.js', 3, 1, 2]], '实测 < 基线只记 shortfall，不违规')
+})
+
+check('literal → <dynamic>：锚点提成常量后条数不变，且仍计入基线（⑥）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_dyn.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => src.includes('NEEDLE_LIT')"
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 1, dynamic: 0 }, '冻结时是 1 条 literal')
+  // 把锚点提成常量：还是同一条断言，锚点从字面量变 <dynamic>。
+  write(dir, 'test_dyn.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "const NEEDLE = 'NEEDLE_LIT'",
+    'module.exports = () => src.includes(NEEDLE)'
+  ))
+  const kept = runChecker(dir)
+  assert.strictEqual(kept.status, 0, '提常量不是「新增断言」：' + kept.out)
+  assert.ok(/literal 口径变化/.test(kept.out), 'literal 口径变化必须报出来（不判红）：' + kept.out)
+  // 重新冻结：条数仍是 1，literal → 0；dynamic 必须是 1（这就是「提常量不得让它消失」）。
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 0, dynamic: 1 }, '<dynamic> 必须计入条数')
+  // 反向证明它真的被数：整条断言删掉 ⇒ 少 1 条（而不是「本来就不在册」）。
+  write(dir, 'test_dyn.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    'module.exports = () => src.length > 0'
+  ))
+  const gone = runChecker(dir)
+  assert.strictEqual(gone.status, 0, gone.out)
+  assert.ok(/实测比基线少 1 条/.test(gone.out), '<dynamic> 必须计在条数里：' + gone.out)
+})
+
+check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进仓库（⑦）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_inv.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "const NEEDLE = 'DYN'",
+    "module.exports = () => src.includes('LIT') && src.includes(NEEDLE)"
+  ))
+  const target = path.join(os.tmpdir(), `xbk-inventory-${process.pid}-${Date.now()}.json`)
+  outsideFiles.push(target)
+  const result = runChecker(dir, '--inventory', target)
+  assert.strictEqual(result.status, 0, '--inventory 必须能写到仓库外：' + result.out)
+  const inv = JSON.parse(fs.readFileSync(target, 'utf8')) // nosemgrep（target = os.tmpdir() + 进程号，测试自己建的仓库外文件）
+  assert.strictEqual(inv.items.length, 2, '逐条清单条数必须等于实测')
+  assert.deepStrictEqual(inv.total, { all: 2, literal: 1, dynamic: 1 }, 'literal / dynamic 必须分列')
+  assert.deepStrictEqual(new Set(inv.items.map((item) => item.kind + ':' + item.literal)),
+    new Set(['literal:LIT', 'dynamic:<dynamic>']), 'kind 必须区分 literal 与 dynamic')
+  assert.ok(inv.items.every((item) => item.file === 'test_inv.js' && Number.isInteger(item.line) && item.line > 0),
+    '每条必须带 file / line：' + JSON.stringify(inv.items))
+  assert.ok(!fs.existsSync(path.join(dir, 'inventory.json')), '默认不得往仓库目录里写清单')
+  // 仓库内路径一律拒绝（fail-closed），且拒绝时不留文件。
+  const inside = path.join(dir, 'inventory.json')
+  const refused = runChecker(dir, '--inventory', inside)
+  assert.strictEqual(refused.status, 2, '写进仓库目录必须 exit 2：' + refused.out)
+  assert.ok(/不得落在仓库目录内/.test(refused.out), '必须说清拒绝原因：' + refused.out)
+  assert.ok(!fs.existsSync(inside), '拒绝时不得留下文件')
+})
+
+check('--write-allowlist：重生成与冻结文件逐字节一致，且清单不进仓库（⑧）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_rt_a.js', FIXTURE_OK)
+  write(dir, 'test_rt_b.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('b.js', 'utf8')",
+    "const NEEDLE = 'B_DYN'",
+    "module.exports = () => src.includes('B_LIT') && src.includes(NEEDLE)"
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
+  const first = fs.readFileSync(file, 'utf8') // nosemgrep（file = 隔离工作区里的基线，比对 round-trip 用）
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), first, '两次重生成必须逐字节一致') // nosemgrep（同上）
+  const data = JSON.parse(first)
+  assert.strictEqual(data.schema, 2, '形状必须是 schema 2')
+  assert.strictEqual(data.items, undefined, '逐条清单不得进仓库（用 --inventory 出仓）')
+  assert.deepStrictEqual(data.total, { all: 3, literal: 2, dynamic: 1 }, 'total 必须按 literal / dynamic 分列')
+  assert.deepStrictEqual(data.by_file['test_rt_a.js'], { all: 1, literal: 1 })
+  assert.deepStrictEqual(data.by_file['test_rt_b.js'], { all: 2, literal: 1 })
+  assert.strictEqual(data.total.all, data.by_file['test_rt_a.js'].all + data.by_file['test_rt_b.js'].all,
+    'total.all 必须等于 by_file 各 all 之和')
+  assert.ok(first.split('\n').length <= 12, '紧凑形状：一个文件一行（夹具 2 文件 ⇒ ≤12 行）：' + first.split('\n').length)
+  // 仓内真基线也必须是紧凑形状（这条不依赖条数，删断言不会让它红）。
+  const real = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')) // nosemgrep（ROOT = __dirname 常量，读的是本仓基线）
+  assert.strictEqual(real.schema, 2, '仓内基线必须是 schema 2')
+  assert.strictEqual(real.items, undefined, '仓内基线不得带逐条清单')
+  assert.ok(Object.keys(real.by_file).length >= 30, '按文件覆盖必须完整：' + Object.keys(real.by_file).length)
+  assert.strictEqual(real.total.all, real.total.literal + real.total.dynamic, 'total 三段必须自洽')
+})
+
+check('file:line 诊断：有 inventory 快照时点名新增行，无快照时降级为文件+增量', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_diag.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  const snap = path.join(os.tmpdir(), `xbk-inventory-snap-${process.pid}-${Date.now()}.json`)
+  outsideFiles.push(snap)
+  const frozen = runCheckerWith(dir, { SOURCE_TEXT_ASSERT_INVENTORY: snap }, '--inventory', snap)
+  assert.strictEqual(frozen.status, 0, '快照必须能写出来：' + frozen.out)
+  write(dir, 'test_diag.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => src.includes('FIRST')",
+    "assert.ok(src.includes('ADDED'))"
+  ))
+  const result = runCheckerWith(dir, { SOURCE_TEXT_ASSERT_INVENTORY: snap })
+  assert.strictEqual(result.status, 1, '新增断言必须 exit 1：' + result.out)
+  assert.ok(/test_diag\.js:4\b/.test(result.out), '有快照时必须点名新增行 file:line：' + result.out)
+  assert.ok(result.out.includes('ADDED'), '必须点名新增字面量：' + result.out)
+  // 没快照：只按文件报增量，并显式说明为什么没有行号。
+  const blind = runChecker(dir)
+  assert.strictEqual(blind.status, 1, blind.out)
+  assert.ok(/没有可用的逐条清单/.test(blind.out), '无快照时必须显式说明降级：' + blind.out)
+  assert.ok(/test_diag\.js\s+基线 1 \/ 实测 2 \/ \+1/.test(blind.out), '降级后仍须点名文件+增量：' + blind.out)
 })
 
 check('回归：拼接锚点 / 块内重赋值 / `return false` 兜底不得把真断言判没', () => {
@@ -600,6 +773,14 @@ check('harness 自身：一条检查抛错只记失败，后续照跑、汇总�
 
 // 汇总后再清场：即使某条检查抛错，临时工作区也一定要删掉（不在 /tmp 与仓库根留垃圾）。
 process.exitCode = harness.summary()
+for (const file of outsideFiles) {
+  try {
+    fs.rmSync(file, { force: true })
+  } catch (e) {
+    console.error('⚠️ 仓库外产物清理失败（可手工删除）：' + file + '：' + e.message)
+    process.exitCode = 1
+  }
+}
 for (const dir of workspaces) {
   try {
     fs.rmSync(dir, { recursive: true, force: true })
