@@ -132,11 +132,21 @@ if (process.env.XBK_TAP_LOG_DIR) {
     logTarget = null // 落盘失败不升级为判据：诊断缺失不等于测试失败
   }
   if (logTarget) {
-    process.stderr.write = function (chunk, encoding, callback) {
+    const origWriteSync = fs.writeSync
+    const tee = (data) => {
       try {
-        fs.appendFileSync(logTarget, typeof chunk === 'string' ? chunk : Buffer.from(chunk))
+        fs.appendFileSync(logTarget, typeof data === 'string' ? data : Buffer.from(data))
       } catch { /* 写诊断失败不影响转发 */ }
+    }
+    process.stderr.write = function (chunk, encoding, callback) {
+      tee(chunk)
       return origErrWrite(chunk, encoding, callback)
+    }
+    // 本仓 harness 大量用 `fs.writeSync(1|2, …)` 直写 fd（不经 process.stdout.write），
+    // 只包 stream 会漏掉这些行——2026-11-15 实测：日志文件建出来了但一条 ❌ 都没有。
+    fs.writeSync = function (fd, data, ...rest) {
+      if (fd === 1 || fd === 2) tee(data)
+      return origWriteSync.call(fs, fd, data, ...rest)
     }
   }
 }
