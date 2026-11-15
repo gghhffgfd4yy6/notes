@@ -1589,7 +1589,7 @@ check('r18-B1 基线增长机械校验：等量抬高 by_file+total 判红，--a
   inflated.total = { all: 4, literal: 4, dynamic: 0 }
   // 只写隔离工作区里那份基线副本（dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入）；「手改基线」正是本用例的目的
   // eslint-disable-next-line
-  fs.writeFileSync(
+  fs.writeFileSync( // nosemgrep（只写隔离工作区里那份基线副本：dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入；故意抬高基线是本用例的输入，语义未改）
     path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), JSON.stringify(inflated, null, 2) + '\n')
   const raised = runChecker(dir)
   assert.strictEqual(raised.status, 1, '基线相对参照被抬高必须 exit 1（旧实现这里 exit 0）：' + raised.out)
@@ -1617,24 +1617,24 @@ check('r18-B1 基线增长机械校验：等量抬高 by_file+total 判红，--a
   // ⑥a 已登记的例外不得反过来把自己顶住：同一差额下不带 --allow-growth 也必须能重生成（逐字节一致）。
   // 读回隔离工作区里那份基线副本，验证重生成逐字节一致（路径 = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
   // eslint-disable-next-line
-  const recordBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')
+  const recordBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8') // nosemgrep（读隔离工作区里的基线副本：dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入；仅比对字节，语义未改）
   const regenWithRecord = runChecker(dir, '--write-allowlist')
   assert.strictEqual(regenWithRecord.status, 0, '差额与登记一致时必须允许重生成（否则登记一次就再也收紧不了）：' + regenWithRecord.out)
   // 重生成后必须逐字节不变（同一份隔离工作区基线副本，路径无外部净输入）
   // eslint-disable-next-line
-  assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), recordBytes,
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), recordBytes, // nosemgrep（同上：重生成后逐字节比对隔离工作区里的基线副本，路径无外部净输入，语义未改）
     '重生成必须逐字节一致')
   // ⑥b 重生成不得抹掉留痕：把带登记的基线提交（参照随之更新）后再 --write-allowlist，应逐字节不变。
   // 冻结基线并提交后再读回同一份隔离工作区副本（路径 = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
   // eslint-disable-next-line
-  const frozenBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')
+  const frozenBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8') // nosemgrep（同上：冻结基线后读回同一份隔离工作区副本，路径无外部净输入，语义未改）
   assert.strictEqual(gitIn(dir, 'add', '-A').status, 0, 'git add 必须成功')
   assert.strictEqual(gitIn(dir, 'commit', '-q', '-m', 'raised').status, 0, 'git commit 必须成功')
   const regenStable = runChecker(dir, '--write-allowlist')
   assert.strictEqual(regenStable.status, 0, '无新增时可重生成：' + regenStable.out)
   // 再次逐字节比对同一份隔离工作区副本（含 growth 留痕不得被抹掉）
   // eslint-disable-next-line
-  assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), frozenBytes,
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), frozenBytes, // nosemgrep（同上：再次逐字节比对，含 growth 留痕不得被抹掉，语义未改）
     '重生成必须逐字节一致，且不得抹掉已登记的增长记录')
   assert.deepStrictEqual(allowlistOf(dir).growth, { vs: 'HEAD', commit: baseSha, total: 3, by_file: { 'test_b1.js': 3 }, why: reason },
     '增长记录必须原样保留')
@@ -1687,11 +1687,11 @@ check('r18-C1 陈旧快照降级：inventory total 与基线不一致时只报�
   // 模拟「快照来自另一版基线」：total 与当前基线不一致（真实仓 2714 vs 3190 的同构最小化）。
   // 读的/写的是本用例自己 mkdtemp 出来的私有目录里的快照（路径 = os.tmpdir() + 本文件硬编码前缀）
   // eslint-disable-next-line
-  const staleData = JSON.parse(fs.readFileSync(snap, 'utf8'))
+  const staleData = JSON.parse(fs.readFileSync(snap, 'utf8')) // nosemgrep（snap = 本用例 mkdtemp 私有目录 + 本文件硬编码的 inventory.json，无外部净输入；只读取以模拟陈旧快照，语义未改）
   staleData.total = { all: 5, literal: 5, dynamic: 0 }
   // 改写本用例私有 mkdtemp 目录里的那份快照（0700、随机名，绝不落到共享 /tmp 的可预测文件名上）
   // eslint-disable-next-line
-  fs.writeFileSync(snap, JSON.stringify(staleData, null, 2) + '\n')
+  fs.writeFileSync(snap, JSON.stringify(staleData, null, 2) + '\n') // nosemgrep（同上：只改写私有 mkdtemp 目录里的快照，0700 随机名，绝不落到共享 /tmp，语义未改）
   // 新增一条真断言：条数判红（+1），但**行号**必须降级（快照不可信）。
   write(dir, 'test_stale.js', lines(
     "const fs = require('node:fs')",

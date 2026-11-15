@@ -1754,3 +1754,10 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **动态路径 fs 调用（r19-6，Codacy action_required 7 new issues）**：`test_check_source_text_asserts.js` 的 7 处 `fs.writeFileSync/readFileSync(path.join(dir, …))` 逐处补「上一行中文理由 + 独占一行的**裸** `// eslint-disable-next-line`」（与 v3.458 `scripts/probe-format-coupling.js` 同款；本机 standard 不带该插件，写具名规则会 `Definition for rule … was not found` 整体判红）。r19-5 新增的 `mkdtempSync` 同形，一并补一条。
   - **验证**：`TZ=UTC node scripts/check-source-text-asserts.js` exit 0（实测 3131 = 基线 3131，literal 2855 / dynamic 276，54 个文件，逐文件零差额，增长参照核对打印「未增长」）；`test_check_source_text_asserts.js` 52/52；`TZ=UTC node test_filter.js` 942/942；`node check-version.js` 四方一致；`npx standard` 改动文件 exit 0；`test_suites.js` 的 desc 数字无需变动（本轮无新增检查）。
   - **版本**：3.460.0 → **3.461.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.462
+
+- **S0 收 r20 Codacy 七条 Semgrep 告警（只补注解，断言逻辑与判定语义一行未改；白名单 3131 原地不动）**：PR #418 唯一红项是 Codacy Static Code Analysis，7 条 failure 级注解全部指向 `test_check_source_text_asserts.js` 的动态路径 fs 调用；上一轮（r19-6）补的独占一行裸 `// eslint-disable-next-line` 属 ESLint 系（`security/detect-non-literal-fs-filename`），本仓 Codacy 同时跑 Semgrep/opengrep，其规则只认**行尾** `// nosemgrep`，故两套注解必须并存。
+  - **改动（7 行，全部只加行尾注释）**：1592（`fs.writeFileSync(`，多行调用首行，注解落在命中行行尾、参数行原地未挪）、1620 / 1625 / 1630 / 1637（`path.join(dir, 'scripts', 'source-text-assert.allowlist.json')`，`dir` = `mkdtemp` 隔离工作区 + 本文件硬编码段）、1690 / 1694（`snap` = 本用例 `mkdtemp` 私有目录 0700 随机名 + 硬编码 `inventory.json`）；逐条理由写明「路径来源、无外部净输入、语义未改」，既有的中文理由行与 `// eslint-disable-next-line` 一行未动。
+  - **验证**：`TZ=UTC node test_check_source_text_asserts.js` 52/52；`node scripts/check-source-text-asserts.js` exit 0（3131 = 3131，literal 2855 / dynamic 276，54 个文件）；`node check-version.js` 四方一致；`npx standard test_check_source_text_asserts.js` exit 0；`grep -c nosemgrep` 24 → 31。
+  - **版本**：3.461.0 → **3.462.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。

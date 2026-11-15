@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.461 — S0 收 r19 六条 CI 失败项：CHANGELOG 正序归位（v3.460 段搬到文末）、git 改纯 JS 扫 PATH 解析绝对路径（解析不到按参照不可得降级 / CI fail-closed）、inventory 降级只打固定文案（不插值 env 与文件内容）、陈旧快照改 mkdtemp 私有目录（0700）、动态路径 fs 调用补裸 eslint-disable；只动测试/scripts/文档，白名单 3131 原地 *******
+//* ******* 线报酷推送脚本 v3.462 — S0 收 r20 Codacy 七条 Semgrep 告警：上一轮给动态路径 fs 调用补的是 ESLint 系裸 eslint-disable（security/detect-non-literal-fs-filename），本仓 Codacy 同时跑 Semgrep/opengrep，其规则只认行尾 nosemgrep；故在 7 处（1592/1620/1625/1630/1637/1690/1694）行尾各补一条 nosemgrep + 中文理由，两套注解并存、断言逻辑与判定语义一行未改；只动测试/CHANGELOG/版本号，白名单 3131 原地 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
