@@ -274,6 +274,13 @@ jobs:
       - name: 静态扫描接线断言（test_ci_static_gates.js）
         run: npm run test:ci-static-gates
 
+      # v3.444 源码文本断言闸门：禁止测试里新增「读源码文本」的断言（`src.includes('…')` 之类）。
+      # 三处接线（npm run check 链 / pre-commit 第 5 道 / 这里）缺一即成摆设，缺任一处由
+      # test_ci_static_gates.js 的「check:assert-style 三处接线」用例判红。
+      # 排在静态扫描之后、单元测试之前：AST 扫描是全仓 test_*.js（本机约 3s），秒级门禁先失败。
+      - name: 源码文本断言闸门（禁止新增读源码文本断言）
+        run: npm run check:assert-style
+
       # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
       # 三处接线（check 链 / pre-commit / 这里）缺一即成摆设。
       - name: 文档行长闸门（1200 字符/行）

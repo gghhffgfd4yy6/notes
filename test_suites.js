@@ -134,7 +134,13 @@ const SUITES = [
   // 按域 handler」。本套件断言**路由清单与真实 HTTP 行为**（清单一一对应/顺序、重复检测、matchRoute 语义、
   // 代表性端点的 method/path/status、写端点 Bearer-only 拒绝、未匹配仍 404），不靠 console.js 源码文本。
   // 纯进程内 + 本机 HTTP 回环（每例自建实例、退出即关服务器），不设 integration / mutationSkip。
-  { name: '控制台路由表', file: 'test_console_routes.js', desc: 'scripts/console-routes.js：路由清单与拆分前 endpoint 一一对应（含顺序）/无重复与冲突/坏条目抛错 + matchRoute 语义（method 先比、精确与正则、先命中先返回、未命中 null）+ HTTP 行为（status/写面 query token 400/动态 runs:id 404/未匹配 404/无凭证 401）' }
+  { name: '控制台路由表', file: 'test_console_routes.js', desc: 'scripts/console-routes.js：路由清单与拆分前 endpoint 一一对应（含顺序）/无重复与冲突/坏条目抛错 + matchRoute 语义（method 先比、精确与正则、先命中先返回、未命中 null）+ HTTP 行为（status/写面 query token 400/动态 runs:id 404/未匹配 404/无凭证 401）' },
+  // S0（v3.444）：反回归闸**自身**的用例。闸门漏检不会让任何东西变红（旧实现 857/857 全绿却漏掉
+  // helper 链 / 模板 / `/re/.test` / 多跳 / 重赋值 / 函数参数 / split 行 / codeOf 套壳 等 16 种写法），
+  // 故把每个形态做成「正向必红 / 反向必绿」。全部在 mkdtemp 隔离工作区里跑（复制闸脚本 + 软链
+  // node_modules，跑完 rmSync），不读 .githooks、不碰真实白名单 ⇒ 沙箱内可运行（不设 mutationSkip）。
+  // 成本是约 20 次子进程（每个夹具 0.1-0.3s），照 test_check_version.js 的子进程夹具先例。
+  { name: '源码文本断言闸', file: 'test_check_source_text_asserts.js', desc: 'check-source-text-asserts.js：17 种写法必红（行内直读/helper 链/模板/正则 test 与 match/多跳/重赋值/形参/split 行/codeOf 套壳/解构）+ 4 类非源码文本必绿（res.text/遮蔽/JSON.parse/普通串）+ 多重集超次数/计数漂移 exit 2/少条提示 + 探针 paren 锚点必 coupled 与逐字节还原' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

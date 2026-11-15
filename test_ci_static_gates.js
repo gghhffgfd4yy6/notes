@@ -111,8 +111,53 @@ check('test.yml：CI 步骤存在、shellcheck 有兜底安装、zizmor 钉版�
     'CI 步骤必须走与本地同一条 npm 链，禁止 CI 侧自拼扫描命令造成口径分叉')
 })
 
+// ── check:assert-style（v3.444）三处接线判定 ───────────────────────────────────────────
+// 与 check:ci-static / check:doc-lines 同族：闸门本体从 `npm run check` 链、pre-commit、test.yml 任一处
+// 被摘掉，都不会让任何东西变红——「删一行接线」本身不是失败。故这里把「三处都在」做成可被反例驱动的
+// 纯函数（不在函数里读盘），再用合成输入逐个删一处证明它真的会红。
+//
+// 判据一律「拆行 + 行首锚定 + 正则」，不用 includes：既避开「注释里提到命令也算接线」的假绿，
+// 也让这份判定自身不产生新的「读源码文本」断言（本仓 scripts/check-source-text-asserts.js 的口径）。
+function assertAssertStyleWiring (pkg, hook, yml) {
+  assert.strictEqual(pkg.scripts['check:assert-style'], 'node scripts/check-source-text-asserts.js',
+    'check:assert-style 脚本名必须指向 scripts/check-source-text-asserts.js')
+  assert.ok(pkg.scripts.check.includes('npm run check:assert-style'),
+    'npm run check 链必须包含 check:assert-style——从链上摘除 = 本地门禁静默失效')
+  assert.ok(pkg.scripts.check.indexOf('check:assert-style') < pkg.scripts.check.indexOf('npm test'),
+    '源码文本断言闸门必须排在 npm test 之前（秒级门禁先失败）')
+  assert.strictEqual(linesThat(hook, /^run_gate "源码文本断言闸门".*npm run check:assert-style$/).length, 1,
+    'pre-commit 必须有且只有一道「源码文本断言闸门」run_gate——缺它 = 提交时刻不再拦截新增的源码文本断言')
+  assert.ok(lineThat(yml, /^- name: 源码文本断言闸门（禁止新增读源码文本断言）$/),
+    'test.yml 缺闸门步骤 = PR 流水线不再跑它（test.yml 是唯一在 PR 上跑并阻断合并的作业）')
+  assert.strictEqual(linesThat(yml, /^run: npm run check:assert-style$/).length, 1,
+    'test.yml 的该步骤必须走与本地同一条 npm 链（npm run check:assert-style）')
+}
+
+check('check:assert-style 三处接线：check 链 / pre-commit / test.yml 缺任一处即红（v3.444）', () => {
+  const pkg = JSON.parse(read('package.json'))
+  const hook = read('.githooks/pre-commit')
+  const yml = read('.github/workflows/test.yml')
+  assertAssertStyleWiring(pkg, hook, yml)
+  // 反例（三处各删一处，必须逐个红）：只断言「文件里出现过这个词」的写法在删掉接线后仍然绿，
+  // 这三个反例就是这条用例不是那种写法的证据。
+  const chainBroken = JSON.parse(read('package.json'))
+  chainBroken.scripts.check = chainBroken.scripts.check.split(' && ').filter((step) => step !== 'npm run check:assert-style').join(' && ')
+  assert.throws(() => assertAssertStyleWiring(chainBroken, hook, yml), /check 链必须包含 check:assert-style/,
+    'check 链摘掉 check:assert-style 后必须判红')
+  const hookBroken = hook.replace(/^run_gate "源码文本断言闸门".*$/gm, '')
+  assert.throws(() => assertAssertStyleWiring(pkg, hookBroken, yml), /pre-commit 必须有且只有一道/,
+    'pre-commit 摘掉该 run_gate 后必须判红')
+  const ymlBroken = yml.split('\n').filter((line) => line.trim() !== 'run: npm run check:assert-style').join('\n')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, ymlBroken), /test\.yml/,
+    'test.yml 摘掉该步骤的 run 行后必须判红')
+  // 顺序反例：闸门排到 npm test 之后就失去了「先失败」的意义（矩阵作业要先跑一遍全量测试才红）。
+  const orderBroken = JSON.parse(read('package.json'))
+  orderBroken.scripts.check = 'npm test && npm run check:assert-style'
+  assert.throws(() => assertAssertStyleWiring(orderBroken, hook, yml), /排在 npm test 之前/,
+    '把闸门排到 npm test 之后必须判红')
+})
+
 check('scorecard.yml：analysis job 的 job 级 permissions 必须显式保留 contents: read（C10-047）', () => {
-  // job 级 `permissions:` 会**整体覆盖** workflow 级：未列出的作用域一律置 none。scorecard.yml 的
   // workflow 级那句 contents: read 对 analysis job 不起作用——job 级只写了 security-events / id-token，
   // 于是 contents=none，actions/checkout 拿不到仓库、Scorecard 分析跑在空目录上（绿色假象）。
   // 断言因此必须落在 job 块内的 permissions 段，而不是只看文件里出现过 contents: read。

@@ -36,7 +36,7 @@ function resolvePath (file) {
 }
 
 function readSource (file) {
-  return fs.readFileSync(resolvePath(file), 'utf8')
+  return fs.readFileSync(resolvePath(file), 'utf8') // nosemgrep（resolvePath 把调用方给出的仓库相对路径按 ROOT（__dirname 常量）拼接后只读）
 }
 
 // 通用遍历：只认 `.type` 是字符串的节点，跳过 loc/range 之类非节点字段（不引入 acorn-walk 依赖）。
@@ -222,7 +222,7 @@ function loadModel (file) {
   const abs = resolvePath(file)
   const hit = cache.get(abs)
   if (hit) return hit
-  const code = fs.readFileSync(abs, 'utf8')
+  const code = fs.readFileSync(abs, 'utf8') // nosemgrep（同上：abs 由 resolvePath 归一后的仓库内路径）
   const model = buildModel(abs, code)
   cache.set(abs, model)
   return model
@@ -374,7 +374,7 @@ function shellTokens (line) {
 }
 
 function parseShell (file) {
-  return fs.readFileSync(resolvePath(file), 'utf8')
+  return fs.readFileSync(resolvePath(file), 'utf8') // nosemgrep（同上：parseShell 只读仓库内脚本）
     .split(/\r?\n/)
     .map((line, i) => ({ line: i + 1, tokens: shellTokens(line) }))
 }

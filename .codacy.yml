@@ -302,36 +302,27 @@
 # 故按本仓既有口径（test_host_clean_gates.js / test_storage.js / test_message_store_journal.js /
 # test_status.js 同一处理）整文件排除；不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
 #
-# ---- S0（v3.443 反回归闸工具层）：源码文本断言闸门 / 格式耦合探针 / AST 层 ----
-# scripts/check-source-text-asserts.js 是「测试里禁止新增读源码文本断言」的白名单闸门（本地/CI 工具，
-# 不进入生产运行时）：它的本职工作就是读仓库根目录下的 test_*.js 与自己的白名单 JSON——路径 =
-# __dirname 常量 + fs.readdirSync(ROOT) 枚举出的 test_*.js 文件名（按 /^test_.*\.js$/ 过滤），
-# 或本文件旁边的常量文件名；没有任何外部净输入（环境、CLI、网络、文件内容）参与路径构造。它只读测试
-# 源码，只有人工执行 --write-allowlist（改基线）时才写白名单。故 5 处「动态构造文件/路径信息」告警
-# （:64 readFileSync / :86 readdirSync / :139 readFileSync / :152 writeFileSync，行号按本提交计）属误报。
-# 同文件 :70 的「RegExp 构造函数传非字面量」是同一类误报的另一面：正则源 = `\b` + 白名单条目里的变量名
-# （由 `[A-Za-z_$][\w$]*` 捕获）+ METHODS 常量（includes|indexOf|startsWith|match），变量名先经
-# escapeRegExp 做**完整元字符转义**（本轮修掉 CodeQL js/incomplete-sanitization：此前只转 `$`）；
-# 语义上必须动态构造——每多一个白名单变量就多一条同名正则，改成字面量就扫不到它了。
-# 另：本文件原先那条 `(?:[^;\n]*readFileSync|codeOf|…)` 大正则已按 Sonar S8786 拆成「声明识别 +
-# 右值判定」两步（消除超线性回溯），扫描结果与白名单 857 条逐字节一致——所以这里的排除只针对上面
-# 这几类静态路径/非字面量正则误报，不是压掉真问题。
+# ---- S0（v3.443 反回归闸工具层；v3.444 撤掉整文件排除，改为行级登记）----
+# ⚠️ 本块**不再整文件排除**这三个文件：v3.443 曾把它们整份放进 exclude_paths，那是比 NOSONAR 更宽的
+# 消音（整个文件的所有规则、所有行都不再被分析，而 CHANGELOG 当时写的是「没挂豁免」），已按评审意见撤掉。
+# 现在的处理分两层：
+#   ① **能改代码消除的就改**：唯一一条「RegExp 构造函数传非字面量」告警已随 v3.444 的 AST 重写消失
+#      （检测面不再用 `new RegExp(变量名)` 逐变量拼正则，改为 acorn AST + 作用域感知的数据流）。没有遗留的
+#      动态正则，也没有再用 escapeRegExp 这类字符串净化。
+#   ② **结构性误报只留行级**：三个文件里每一处「动态构造文件/路径信息」（opengrep/pathtraversal）都在
+#      **该行**带裸形态 `// nosemgrep（理由）`（与 xbk_storage.js:222 / test_state_schema.js 同一口径；
+#      Codacy 的 opengrep wrapper 对无 ids 的 nosemgrep 判定 is_ignored，带规则 ID 的精确形态反而不被采纳）。
+#      逐行理由写在代码里，将来改路径来源时会立刻看到「这里为什么可以放行」。
 #
-# scripts/probe-format-coupling.js 是格式耦合探针（本地/CI 工具）：按设计要遍历并临时改写生产 JS
-# （根目录 *.js 去 test_* + scripts/ + qinglong/，用 acorn 词法在 `,`/`(` 后插空格，跑完 try/finally
-# 还原），故 7 处「动态构造文件/路径信息」告警（:37 existsSync / :38 readdirSync / :53 readdirSync /
-# :123 writeFileSync / :187 existsSync / :194 readFileSync / :204 writeFileSync，行号按本提交计）在这条
-# 调用链上都不成立：路径 = ROOT（__dirname 常量）+ readdirSync 枚举结果或调用方给出的 test_*.js 名单；
-# 写回的是**刚刚读出的原文备份**，不接受任何外部净输入——遍历/重排/还原正是该探针的本职工作。
-# 同文件对 git 的调用已按本仓既有口径（scripts/check-ci-static.js 的 resolveTool、test_install_hooks.js
-# 的 git 解析）改成「纯 JS 扫 PATH 解析绝对路径 → 以绝对路径 spawn」（Sonar S4036 由改代码消除，未挂 NOSONAR）。
-#
-# test_support/source_model.js 是后续包共用的 AST/配置/Shell 断言层（只被 test_*.js 与 scripts/ 工具
-# require，不进生产运行时）：readSource/loadModel/parseShell 的入参 file 是调用方（测试与工具脚本）给出的
-# 仓库相对路径，内部按 ROOT（__dirname 常量）拼接后只读——断言「某生产文件里有该函数/该调用」就必须读
-# 那个文件，路径来源不是外部输入；3 处告警（:39 / :225 / :377，后两处与本提交前的 :225 同形）属误报。
-# 该文件不写盘、不联网、不解析不可信路径。
-# 以上均为工具层/测试支撑层的结构性误报登记：不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
+# 为什么这些告警是结构性的（不是缺陷）：三个文件的路径来源分别是
+#   · scripts/check-source-text-asserts.js：ROOT=__dirname 常量 + readdirSync 枚举出的 test_*.js /
+#     test_support 文件；白名单文件在脚本旁边（常量）。读的是本仓测试源码，只有人工 --write-allowlist 才写盘；
+#   · scripts/probe-format-coupling.js：ROOT=__dirname 常量 + 生产文件枚举（根目录 *.js 去 test_*、
+#     scripts/、qinglong/）+ 命令行给出的 test_*.js 名单；写回的是**刚刚读出的原文备份**（finally 还原）；
+#   · test_support/source_model.js：调用方给出的仓库**相对**路径，内部按 ROOT 拼接后只读，不写盘不联网。
+# 三者的「遍历/重排/还原/读指定文件」都是本职行为，没有环境变量、CLI 参数、网络或文件内容参与路径构造。
+# 不删/不放宽任何断言；三个文件的真实行为仍由 npm test / CI 全量执行，闸门自身的用例在
+# test_check_source_text_asserts.js（正向必红 / 反向必绿各一组）。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
@@ -487,11 +478,7 @@ exclude_paths:
   # 拆成独立文件就是为了只登记这一层（tap-shim 本体的 TAP 投点/跳过判定/退出码仍受 Codacy 覆盖），
   # 同 scripts/status-utils.js 的拆模块口径；不删/不放宽任何断言。
   - "scripts/tap-shim-diag.js"
-  # S0（v3.443）：反回归闸工具层（源码文本断言闸门 / 格式耦合探针 / AST 断言层）。
-  # 三条同源静态告警属结构性误报：路径来源是 __dirname 常量、仓库内固定的 test_*.js / 生产 JS 清单
-  # 与调用方给出的测试名单（无外部净输入）；:70 的非字面量 RegExp 源是白名单变量名 + 常量方法名，
-  # 且已做完整元字符转义。逐条清单与依据见上方「S0（v3.443 反回归闸工具层）」注释块；
-  # 不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
-  - "scripts/check-source-text-asserts.js"
-  - "scripts/probe-format-coupling.js"
-  - "test_support/source_model.js"
+  # S0（v3.443 → v3.444）：反回归闸工具层**已从这里撤出**——整文件排除是比 NOSONAR 更宽的消音
+  # （整个文件所有规则都不再分析），与 CHANGELOG 的自述不符。三个文件回到 Codacy 覆盖之下：
+  # 动态 RegExp 告警已由 AST 重写改代码消除，剩余的 pathtraversal 结构性误报按**行级**
+  # `// nosemgrep（理由）` 登记在各自代码行上（依据见上方「S0（v3.443 反回归闸工具层；v3.444 …）」块）。
