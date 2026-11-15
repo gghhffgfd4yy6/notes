@@ -93,14 +93,14 @@ function makeWorkspace () {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-assertgate-'))
   workspaces.push(dir)
   // 路径 = mkdtemp 工作区 + 本文件硬编码的 'scripts'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true }) // nosemgrep（路径 = mkdtemp 结果 + 本文件硬编码的 'scripts'，无外部净输入）
   // 闸门脚本整份复制：ROOT 由 __dirname/.. 推出 ⇒ 副本把工作区当成仓库根，绝不碰真实仓库。
   fs.copyFileSync(CHECKER, path.join(dir, 'scripts', 'check-source-text-asserts.js'))
   fs.copyFileSync(PROBE, path.join(dir, 'scripts', 'probe-format-coupling.js'))
   // acorn 从仓库的 node_modules 借（与工作树的软链同一做法），不装任何依赖。
   // ROOT = __dirname 常量，dir = mkdtemp 结果，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir') // nosemgrep（ROOT = __dirname 常量，dir = mkdtemp 结果，无外部净输入）
   return dir
 }
@@ -108,10 +108,10 @@ function makeWorkspace () {
 function write (dir, rel, text) {
   const abs = path.join(dir, rel)
   // abs = mkdtemp 工作区 + 本文件硬编码的相对路径，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   fs.mkdirSync(path.dirname(abs), { recursive: true }) // nosemgrep（abs = mkdtemp 工作区 + 本文件硬编码的相对路径，无外部净输入）
   // 同上：只写隔离工作区里的夹具，跑完 rmSync（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   fs.writeFileSync(abs, text) // nosemgrep（同上：只写隔离工作区里的夹具，跑完 rmSync）
   return abs
 }
@@ -122,6 +122,12 @@ function run (dir, script, args, env) {
   const base = { ...process.env, TZ: 'UTC' }
   delete base.PROBE_FORCE_UNPARSEABLE
   delete base.NODE_OPTIONS
+  // r18-B1：闸门在 CI=true 且拿不到 git 参照时 fail-closed。夹具工作区**不是** git 仓，
+  // 若继承宿主机的 CI，整片用例会被这条（正确的）守卫打红 —— 隔离掉它，
+  // 「CI=true 必须 fail-closed」由专门的那条用例显式注入 CI=true 来证明。
+  delete base.CI
+  delete base.SOURCE_TEXT_ASSERT_BASELINE_REF
+  delete base.SOURCE_TEXT_ASSERT_GROWTH_REASON
   // 逐条清单诊断源默认指向工作区里的**不存在**文件：不读宿主机的 ~/ledgers，用例才是自洽的
   // （要测 file:line 诊断就显式建快照，见「file:line 诊断」那条）。
   base.SOURCE_TEXT_ASSERT_INVENTORY = path.join(dir, '.inventory.absent.json')
@@ -399,7 +405,16 @@ const POSITIVE = [
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "function hasFileText (file, anchor) { return fs.readFileSync(file, 'utf8').includes(anchor) }",
       "assert.ok(hasFileText('a.js', 'LANE_A'))",
-      "assert.ok(hasFileText('a.js', 'LANE_B'))"), [DYN, 'LANE_A', 'LANE_B']]
+      "assert.ok(hasFileText('a.js', 'LANE_B'))"), [DYN, 'LANE_A', 'LANE_B']],
+  // ── r18-A1：同一本地函数在**不同调用点**传/不传源码文本时，只有传进去的那次入账 ──────
+  // 旧实现把形参污染做成全文件所有调用点共用的 binding ⇒ 这处 `pick(readFileSync(…))` 会让
+  // 另外两次 `pick([])` 也记成 dynamic（幽灵命中）。期望值刻意只列 1 条。
+  ['同一本地函数按调用点实参入账（pick(readFileSync(…)) 记 1 条，pick([]) 的两次调用不记，r18-A1）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'function pick (items) { return (items || []).filter((x) => x.pid) }',
+      "assert.deepStrictEqual(pick(fs.readFileSync('a.js', 'utf8')), [])",
+      'assert.deepStrictEqual(pick([]), [])',
+      'assert.deepStrictEqual(pick([]), [])'), [DYN]]
 ]
 
 // ── B. 反向：receiver 不是源码文本就必须不命中（否则误报会把基线灌满） ──────
@@ -487,7 +502,14 @@ const NEGATIVE = [
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       'const readSource = fs.readFileSync.bind(fs)',
       "const n = readSource('a.js', 'utf8').length",
-      'assert.ok(n > 0)'), []]
+      'assert.ok(n > 0)'), []],
+  // r18-A1 的反向：同一本地函数在不同调用点传/不传源码文本——按**本次实参**判定，
+  // `pick([])` 与期望值两侧都是字面量，旧实现（形参污染 = 全文件并集）把它记成 dynamic。
+  ['同一本地函数的纯字面量调用点（pick([]) 两侧都是字面量，r18-A1 反向：并集污染不得外溢到无污染调用点）',
+    lines("const assert = require('node:assert')",
+      'function pick (items) { return (items || []).filter((x) => x.pid) }',
+      'assert.deepStrictEqual(pick([]), [])',
+      'assert.deepStrictEqual(pick([]), [])'), []]
 ]
 
 // ── A/B 执行：正向形态数 = POSITIVE.length，反向形态数 = NEGATIVE.length ────────────
@@ -1049,6 +1071,115 @@ check('r17-A 读取别名：解构重命名与 .bind 都判红，改回裸 inclu
     '两个别名文件都不得出现在命中清单里：' + counts.out)
 })
 
+// ── r18-A1：本地函数调用点按**本次实参**入账（不是全文件并集）─────────────────────
+// 反例（评审实测，隔离副本）：`function pick(items){return (items||[]).filter(x=>x.pid)}` 只要有**一处**
+// `pick(readFileSync(…))`，旧实现就让 `pick([])` 的两次调用也按「返回源码文本」计（形参污染是所有调用点
+// 共用的流不敏感并集）⇒ 3 处方言里 2 处是幽灵命中；真实仓 scripts/check-host-clean.js:414
+// `assert.deepStrictEqual(findOrphanSuites([], 1, []), [])` 两侧全字面量也被计 dynamic。
+// 同一机制的假绿：先按 3 条幽灵命中冻结基线，再把传源码文本的调用点换成 2 条真断言 ⇒ 2 = 基线 2 ⇒ exit 0。
+// 这里锁三层：检测面（纯字面量 0 条 / 混合 1 条）、CLI 假绿回归（换真断言必须 +1 判红）、以及真实仓那行形状。
+check('r18-A1 调用点污染按实参：pick([]) 不计数，传源码文本那次才计数（幽灵命中不得抵消失新增）', () => {
+  const pickSrc = 'function pick (items) { return (items || []).filter((x) => x.pid) }'
+  const pure = lines(
+    "const assert = require('node:assert')",
+    pickSrc,
+    'assert.deepStrictEqual(pick([]), [])',
+    'assert.deepStrictEqual(pick([]), [])'
+  )
+  assert.deepStrictEqual(analyzeSource(pure, 'a1_pure.js'), [],
+    '两侧都是字面量的 pick([]) 不得计数（旧实现记 2 条 dynamic）')
+  const homed = lines(
+    "const assert = require('node:assert')",
+    'function findOrphanSuites (a, b, c) { return (a || []).filter((x) => x.pid) }',
+    'assert.deepStrictEqual(findOrphanSuites([], 1, []), [])'
+  )
+  assert.deepStrictEqual(analyzeSource(homed, 'a1_homed.js'), [],
+    '真实仓 scripts/check-host-clean.js:414 的同类形状不得计数（旧实现记 1 条 dynamic）')
+  // 混合形态：只有把源码文本传进去的那次是源码文本断言（另外两次仍是纯字面量）。
+  const dir = makeWorkspace()
+  const mixed = (anchorCalls) => lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    pickSrc,
+    ...anchorCalls
+  )
+  write(dir, 'test_a1.js', mixed([
+    "assert.deepStrictEqual(pick(fs.readFileSync('a.js', 'utf8')), [])",
+    'assert.deepStrictEqual(pick([]), [])',
+    'assert.deepStrictEqual(pick([]), [])'
+  ]))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 0, dynamic: 1 },
+    '混合夹具只能冻结 1 条（旧实现会冻 3 条：另外两条是幽灵命中）')
+  // 假绿回归：把「传源码文本」的调用点换成两条**真实**源码文本断言 ⇒ 实测 2 > 基线 1 ⇒ 必须判红。
+  // （旧实现：基线 3、实测 2 ⇒ shortfall ⇒ ✅ exit 0，两条新断言被两条幽灵命中抵消。）
+  write(dir, 'test_a1.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "assert.ok(src.includes('REAL_ONE'))",
+    "assert.ok(src.includes('REAL_TWO'))"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '两条新真断言必须判红（旧实现被幽灵命中抵消成 exit 0）：' + result.out)
+  assert.ok(/test_a1\.js\s+基线 1 \/ 实测 2 \/ \+1/.test(result.out), '必须点名 +1：' + result.out)
+})
+
+// ── r18-A2：导出值是**嵌套一层的对象**时，其中的函数也要进摘要 ───────────────────
+// 反例（评审实测）：`exports.reader = { read: function (f) { return fs.readFileSync(f, 'utf8') } }`
+// + `viaObj.reader.read(f).includes('X')` ⇒ 实测 0 条、exit 0；把同一段读源码搬进 helper 只多套一层对象
+// 就整族失明。修法：对象字面量导出递归登记（深度上限 + 环检测），成员链按点分路径取导出名。
+check('r18-A2 嵌套导出：exports.reader.read(…) 与 reader 具名导入都判红，深层对象同样登记', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  const readerModule = lines(
+    "const fs = require('node:fs')",
+    "exports.reader = { read: function (f) { return fs.readFileSync(f, 'utf8') } }"
+  )
+  write(dir, 'test_support/obj.js', readerModule)
+  write(dir, 'test_nested.js', lines(
+    "const viaObj = require('./test_support/obj')",
+    "const assert = require('node:assert')",
+    "assert.ok(viaObj.reader.read('xbk_app.js').includes('CF4'))"
+  ))
+  const nested = runChecker(dir)
+  assert.strictEqual(nested.status, 1, '嵌套一层的 reader 对象必须判红（旧实现 0 命中、exit 0）：' + nested.out)
+  assert.ok(/test_nested\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(nested.out), '必须点名调用点文件：' + nested.out)
+  // 具名导入（`const { reader } = require(…)`）走另一条解析分支（exportName + '.' + 余下路径）。
+  write(dir, 'test_named.js', lines(
+    "const { reader } = require('./test_support/obj')",
+    "const assert = require('node:assert')",
+    "assert.ok(reader.read('xbk_app.js').includes('CF4_NAMED'))"
+  ))
+  const named = runChecker(dir)
+  assert.strictEqual(named.status, 1, '具名导入的嵌套对象也必须判红：' + named.out)
+  assert.ok(/test_named\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(named.out), '必须点名 test_named.js：' + named.out)
+  // 递归：多套一层（exports.a.b.read）同样登记。
+  write(dir, 'test_support/deep.js', lines(
+    "const fs = require('node:fs')",
+    "exports.a = { b: { read: (f) => fs.readFileSync(f, 'utf8') } }"
+  ))
+  write(dir, 'test_deep.js', lines(
+    "const deep = require('./test_support/deep')",
+    "const assert = require('node:assert')",
+    "assert.ok(deep.a.b.read('xbk_app.js').includes('CF4_DEEP'))"
+  ))
+  const deep = runChecker(dir)
+  assert.strictEqual(deep.status, 1, '两层嵌套的对象导出也必须登记：' + deep.out)
+  assert.ok(/test_deep\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(deep.out), '必须点名 test_deep.js：' + deep.out)
+  // 反向：嵌套对象里的方法不读文件（只整形入参）⇒ 不得凭空记命中。
+  write(dir, 'test_support/obj.js', lines('exports.reader = { read: function (f) { return String(f).trim() } }'))
+  write(dir, 'test_nested.js', lines(
+    "const viaObj = require('./test_support/obj')",
+    "const assert = require('node:assert')",
+    "assert.ok(viaObj.reader.read('xbk_app.js').includes('NOT_SOURCE'))"
+  ))
+  write(dir, 'test_named.js', lines("const assert = require('node:assert')", 'assert.ok(1 === 1)'))
+  write(dir, 'test_deep.js', lines("const assert = require('node:assert')", 'assert.ok(2 === 2)'))
+  const plain = runChecker(dir)
+  assert.strictEqual(plain.status, 0, '不读文件的嵌套方法不得被当成源码文本：' + plain.out)
+})
 // ── r12-4：扫描面 = 整棵仓库（显式跳过名单），任意新目录默认在内 ────────────────
 // 反例（评审实测）：把「读源码 + 比对」整段搬进 helpers/，调用点只传锚点 —— helper 不在扫描面、
 // 摘要因形参来源为空也不产条目，两处同时失明，闸门 exit 0 并提示「重跑 --write-allowlist 可收紧基线」。
@@ -1155,11 +1286,11 @@ check('退出码 2：total 与 by_file 不自洽（手改 total 不改计数）'
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
   // file = mkdtemp 工作区 + 本文件硬编码的 scripts/…json，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（file = mkdtemp 结果 + 本文件硬编码的 scripts/…json，无外部净输入）
   data.total.all += 1
   // 同上：写回隔离工作区里的基线副本，不碰真实仓库（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上：写回隔离工作区里的基线副本，不碰真实仓库）
   const result = runChecker(dir)
   assert.strictEqual(result.status, 2, '基线自相矛盾必须 exit 2：' + result.out)
@@ -1174,11 +1305,11 @@ check('退出码 2：手改某文件条数却不改 total（差额必须逐文�
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
   // 同上：隔离工作区里的基线副本，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（同上：隔离工作区里的基线副本）
   data.by_file['test_base.js'] = { all: 0, literal: 0 }
   // 同上：写回隔离工作区里的基线副本（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上）
   const result = runChecker(dir)
   assert.strictEqual(result.status, 2, 'by_file 之和与 total 不符必须 exit 2（不能当成「某文件超基线」放行）：' + result.out)
@@ -1274,7 +1405,7 @@ check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进�
   const result = runChecker(dir, '--inventory', target)
   assert.strictEqual(result.status, 0, '--inventory 必须能写到仓库外：' + result.out)
   // target = os.tmpdir() + 进程号，测试自己建的仓库外文件，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   const inv = JSON.parse(fs.readFileSync(target, 'utf8')) // nosemgrep（target = os.tmpdir() + 进程号，测试自己建的仓库外文件）
   assert.strictEqual(inv.items.length, 2, '逐条清单条数必须等于实测')
   assert.deepStrictEqual(inv.total, { all: 2, literal: 1, dynamic: 1 }, 'literal / dynamic 必须分列')
@@ -1283,7 +1414,7 @@ check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进�
   assert.ok(inv.items.every((item) => item.file === 'test_inv.js' && Number.isInteger(item.line) && item.line > 0),
     '每条必须带 file / line：' + JSON.stringify(inv.items))
   // dir = mkdtemp 结果 + 本文件硬编码的 'inventory.json'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   assert.ok(!fs.existsSync(path.join(dir, 'inventory.json')), '默认不得往仓库目录里写清单') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'inventory.json'，无外部净输入）
   // 仓库内路径一律拒绝（fail-closed），且拒绝时不留文件。
   const inside = path.join(dir, 'inventory.json')
@@ -1291,7 +1422,7 @@ check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进�
   assert.strictEqual(refused.status, 2, '写进仓库目录必须 exit 2：' + refused.out)
   assert.ok(/不得落在仓库目录内/.test(refused.out), '必须说清拒绝原因：' + refused.out)
   // inside = 隔离工作区路径，同上无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   assert.ok(!fs.existsSync(inside), '拒绝时不得留下文件') // nosemgrep（inside = 隔离工作区路径，同上无外部净输入）
 })
 
@@ -1307,11 +1438,11 @@ check('--write-allowlist：重生成与冻结文件逐字节一致，且清单�
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
   // file = 隔离工作区里的基线，比对 round-trip 用，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   const first = fs.readFileSync(file, 'utf8') // nosemgrep（file = 隔离工作区里的基线，比对 round-trip 用）
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   // file = 上一处已读的隔离工作区基线，round-trip 比对用，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   assert.strictEqual(fs.readFileSync(file, 'utf8'), first, '两次重生成必须逐字节一致') // nosemgrep（同上）
   const data = JSON.parse(first)
   assert.strictEqual(data.schema, 2, '形状必须是 schema 2')
@@ -1387,6 +1518,163 @@ check('file:line 诊断：有 inventory 快照时点名新增行，无快照时�
   assert.ok(/test_diag\.js\s+基线 1 \/ 实测 2 \/ \+1/.test(blind.out), '降级后仍须点名文件+增量：' + blind.out)
 })
 
+// ── r18-B1：白名单「只减不增」必须是**机械**判据（不是人工看 JSON diff）────────────
+// 反例（评审实测，scratch 副本）：往 test_console.js 加 3 条真断言 ⇒ exit 1；随后只改一行 JSON
+// （by_file[test_console].all/.literal += 3、total.all/.literal += 3，内部自洽）⇒ 再跑同一命令
+// 「✅ 未新增源码文本断言」exit 0。闸门全文没有一次 git 调用 ⇒ 基线历史无从核对。
+// 这里锁：① 非 git 环境显式降级；② CI=true 时 fail-closed；③ 真 git 仓里「等量抬高」判红并点名；
+// ④ --allow-growth 放行；⑤ --write-allowlist 也被同一参照约束；⑥ growth 登记写入后闸门放行并打印理由，
+// ⑦ 登记与观察值不精确相等时仍判红。
+const gitIn = (dir, ...args) => spawnSync('git', ['-C', dir, '-c', 'user.email=gate@example.com', '-c', 'user.name=gate', ...args],
+  { encoding: 'utf8' })
+
+check('r18-B1 基线增长机械校验：等量抬高 by_file+total 判红，--allow-growth / growth 登记才放行', () => {
+  // ① 非 git 环境：明确说明「无法核对」，行为不变（不因拿不到参照就判红）。
+  const plain = makeWorkspace()
+  write(plain, 'test_plain.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(plain, '--write-allowlist').status, 0, '基线应能写入')
+  const noGit = runChecker(plain)
+  assert.strictEqual(noGit.status, 0, '非 git 环境必须继续（exit 0）：' + noGit.out)
+  assert.ok(noGit.out.includes('无法核对基线增长（非 git 环境）'),
+    '非 git 环境必须显式说明无法核对基线增长：' + noGit.out)
+  // ② 同一环境注入 CI=true ⇒ fail-closed（拿到不参照就不许放行）。
+  const ci = runCheckerWith(plain, { CI: 'true' })
+  assert.strictEqual(ci.status, 2, 'CI=true 且无参照必须 fail-closed（exit 2）：' + ci.out)
+  assert.ok(/fail-closed/.test(ci.out), '必须说明 fail-closed 的原因：' + ci.out)
+
+  // ②b 参照提交里**没有基线文件**（首个引入基线的 PR）：不是配置错误，不能 fail-closed——
+  //     否则「第一次提交基线」这件事永远过不了 CI。必须显式说明并跳过增长核对。
+  const firstPr = makeWorkspace()
+  write(firstPr, 'test_first.js', FIXTURE_OK)
+  assert.strictEqual(gitIn(firstPr, 'init', '-q', '-b', 'gate-base').status, 0, 'git init 必须成功')
+  assert.strictEqual(gitIn(firstPr, 'add', '-A').status, 0, 'git add 必须成功')
+  assert.strictEqual(gitIn(firstPr, 'commit', '-q', '-m', 'no baseline yet').status, 0, 'git commit 必须成功')
+  const firstSha = gitIn(firstPr, 'rev-parse', 'HEAD').stdout.trim()
+  assert.strictEqual(runChecker(firstPr, '--write-allowlist', '--baseline-ref', firstSha).status, 0, '首次冻结应放行')
+  const firstRun = runCheckerWith(firstPr, { CI: 'true' }, '--baseline-ref', firstSha)
+  assert.strictEqual(firstRun.status, 0, '参照里没有基线文件时不得 fail-closed：' + firstRun.out)
+  assert.ok(/没有可比的历史/.test(firstRun.out), '必须显式说明跳过增长核对的原因：' + firstRun.out)
+  // 反例：参照写成不存在的 sha ⇒ 那是真配置错误，必须 exit 2（不能当成「没有历史」混过去）。
+  const bogus = runCheckerWith(firstPr, { CI: 'true' }, '--baseline-ref', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')
+  assert.strictEqual(bogus.status, 2, '不可解析的显式参照必须 exit 2：' + bogus.out)
+
+  // ③ 真 git 仓：冻结基线 → 提交 → 加 3 条真断言 + 手改基线等量抬高。
+  const dir = makeWorkspace()
+  write(dir, 'test_b1.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '首次冻结应放行')
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 1, dynamic: 0 }, '先冻结 1 条')
+  assert.strictEqual(gitIn(dir, 'init', '-q', '-b', 'gate-base').status, 0, 'git init 必须成功（用例依赖真 git 仓）')
+  assert.strictEqual(gitIn(dir, 'add', '-A').status, 0, 'git add 必须成功')
+  assert.strictEqual(gitIn(dir, 'commit', '-q', '-m', 'base').status, 0, 'git commit 必须成功')
+  write(dir, 'test_b1.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => src.includes('GROW_A') && src.includes('GROW_B') && src.includes('GROW_C') && src.includes('GROW_D')"
+  ))
+  const inflated = allowlistOf(dir)
+  inflated.by_file['test_b1.js'] = { all: 4, literal: 4 }
+  inflated.total = { all: 4, literal: 4, dynamic: 0 }
+  fs.writeFileSync(
+    path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), JSON.stringify(inflated, null, 2) + '\n')
+  const raised = runChecker(dir)
+  assert.strictEqual(raised.status, 1, '基线相对参照被抬高必须 exit 1（旧实现这里 exit 0）：' + raised.out)
+  assert.ok(/基线相对参照 HEAD 被抬高 3 条/.test(raised.out), '必须点名抬高总量与参照：' + raised.out)
+  assert.ok(/test_b1\.js\s+参照 1 \/ 当前 4 \/ \+3/.test(raised.out), '必须逐文件点名差额：' + raised.out)
+  // ④ 显式 --allow-growth 才放行（并在输出里留痕）。
+  const allowed = runChecker(dir, '--allow-growth')
+  assert.strictEqual(allowed.status, 0, '--allow-growth 必须放行：' + allowed.out)
+  assert.ok(/已按 --allow-growth 接受/.test(allowed.out), '放行必须留痕：' + allowed.out)
+  // ⑤ --write-allowlist 也受同一参照约束：手改基线之后重生成，on-disk 差额为 0 但参照差额是 3。
+  const regen = runChecker(dir, '--write-allowlist')
+  assert.strictEqual(regen.status, 1, '--write-allowlist 必须也被 git 参照拦住：' + regen.out)
+  assert.ok(/相对参照 HEAD 还多 3 条/.test(regen.out), '必须说明是相对参照的增长：' + regen.out)
+  // ⑥ 带理由的 --allow-growth 重生成：增长登记进基线，闸门随后放行并打印理由。
+  const reason = 'r18-B1 用例：人为抬高基线以验证 growth 登记'
+  const written = runChecker(dir, '--write-allowlist', '--allow-growth', '--reason', reason)
+  assert.strictEqual(written.status, 0, '带 --reason 的重生成必须放行：' + written.out)
+  const baseSha = gitIn(dir, 'rev-parse', 'HEAD').stdout.trim()
+  assert.deepStrictEqual(allowlistOf(dir).growth,
+    { vs: 'HEAD', commit: baseSha, total: 3, by_file: { 'test_b1.js': 3 }, why: reason },
+    '增长必须连同理由与**参照提交**登记进基线')
+  const afterRecord = runChecker(dir)
+  assert.strictEqual(afterRecord.status, 0, '已登记的 growth 必须让闸门放行：' + afterRecord.out)
+  assert.ok(afterRecord.out.includes(reason), '闸门必须打印登记里的理由：' + afterRecord.out)
+  // ⑥a 已登记的例外不得反过来把自己顶住：同一差额下不带 --allow-growth 也必须能重生成（逐字节一致）。
+  const recordBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')
+  const regenWithRecord = runChecker(dir, '--write-allowlist')
+  assert.strictEqual(regenWithRecord.status, 0, '差额与登记一致时必须允许重生成（否则登记一次就再也收紧不了）：' + regenWithRecord.out)
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), recordBytes,
+    '重生成必须逐字节一致')
+  // ⑥b 重生成不得抹掉留痕：把带登记的基线提交（参照随之更新）后再 --write-allowlist，应逐字节不变。
+  const frozenBytes = fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')
+  assert.strictEqual(gitIn(dir, 'add', '-A').status, 0, 'git add 必须成功')
+  assert.strictEqual(gitIn(dir, 'commit', '-q', '-m', 'raised').status, 0, 'git commit 必须成功')
+  const regenStable = runChecker(dir, '--write-allowlist')
+  assert.strictEqual(regenStable.status, 0, '无新增时可重生成：' + regenStable.out)
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'), frozenBytes,
+    '重生成必须逐字节一致，且不得抹掉已登记的增长记录')
+  assert.deepStrictEqual(allowlistOf(dir).growth, { vs: 'HEAD', commit: baseSha, total: 3, by_file: { 'test_b1.js': 3 }, why: reason },
+    '增长记录必须原样保留')
+  // ⑦ 登记与观察值不精确相等 ⇒ 仍判红（「等价开关」不是一张长期通行证）：
+  //    参照（上一次提交）是 4 条，再把基线抬到 5 条、而登记写的是 +3 ⇒ 观察到的 +1 对不上登记。
+  const tampered = allowlistOf(dir)
+  tampered.by_file['test_b1.js'] = { all: 5, literal: 5 }
+  tampered.total = { all: 5, literal: 5, dynamic: 0 }
+  fs.writeFileSync(
+    path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), JSON.stringify(tampered, null, 2) + '\n')
+  const mismatch = runChecker(dir)
+  assert.strictEqual(mismatch.status, 1, 'growth 登记与观察值不等必须判红：' + mismatch.out)
+  assert.ok(/被抬高 1 条/.test(mismatch.out), '必须按**观察到的**增量点名（不是登记里的数字）：' + mismatch.out)
+  assert.ok(/test_b1\.js\s+参照 4 \/ 当前 5 \/ \+1/.test(mismatch.out), '必须逐文件点名差额：' + mismatch.out)
+  // ⑧ 登记钉在写入时的参照提交上：差额、文件、理由全部对得上，只有 commit 指向别处 ⇒ 仍判红。
+  //    没有这条，一条「+1 某文件」的旧登记会被日后任何同形状的增长反复复用（永久通行证）。
+  const reused = allowlistOf(dir)
+  reused.growth = {
+    vs: 'HEAD',
+    commit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    total: 1,
+    by_file: { 'test_b1.js': 1 },
+    why: reason
+  }
+  fs.writeFileSync(
+    path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), JSON.stringify(reused, null, 2) + '\n')
+  const stale = runChecker(dir)
+  assert.strictEqual(stale.status, 1, '登记指向别的参照提交时必须判红（否则旧例外可被复用）：' + stale.out)
+  assert.ok(/被抬高 1 条/.test(stale.out), '必须按观察值点名：' + stale.out)
+})
+
+// ── r18-C1：陈旧 inventory 快照不得参与 (file,literal) 逐条 diff ─────────────────
+// 反例（评审实测）：inventory.json 的 total 是 2714、仓库基线是 3190，用这份快照做 diff 时
+// 476 条**既有**命中都被当成「新增命中的位置」逐行打印（+1 的差额列出 2 处），
+// 与 CHANGELOG v3.448「快照缺失或陈旧就显式说明只能按文件报增量，不猜行号」相反。
+check('r18-C1 陈旧快照降级：inventory total 与基线不一致时只报文件增量、不打印 extras', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_stale.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  const snap = path.join(os.tmpdir(), `xbk-inventory-stale-${process.pid}-${Date.now()}.json`)
+  outsideFiles.push(snap)
+  const frozen = runCheckerWith(dir, { SOURCE_TEXT_ASSERT_INVENTORY: snap }, '--inventory', snap)
+  assert.strictEqual(frozen.status, 0, '快照必须能写出来：' + frozen.out)
+  // 模拟「快照来自另一版基线」：total 与当前基线不一致（真实仓 2714 vs 3190 的同构最小化）。
+  const staleData = JSON.parse(fs.readFileSync(snap, 'utf8'))
+  staleData.total = { all: 5, literal: 5, dynamic: 0 }
+  fs.writeFileSync(snap, JSON.stringify(staleData, null, 2) + '\n')
+  // 新增一条真断言：条数判红（+1），但**行号**必须降级（快照不可信）。
+  write(dir, 'test_stale.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => src.includes('FIRST')",
+    "assert.ok(src.includes('ADDED'))"
+  ))
+  const result = runCheckerWith(dir, { SOURCE_TEXT_ASSERT_INVENTORY: snap })
+  assert.strictEqual(result.status, 1, '新增断言必须仍判红（诊断降级不改退出码）：' + result.out)
+  assert.ok(/逐条清单陈旧/.test(result.out), '必须显式说明快照陈旧：' + result.out)
+  assert.ok(/total.*不一致|不一致/.test(result.out), '必须点出 total 不一致：' + result.out)
+  assert.ok(/test_stale\.js\s+基线 1 \/ 实测 2 \/ \+1/.test(result.out), '仍须按文件报增量：' + result.out)
+  assert.ok(!/test_stale\.js:\d/.test(result.out), '陈旧快照不得被用来打印「新增命中的位置」：' + result.out)
+})
+
+// ── 回归：拼接锚点 / 块内重赋值 / `return false` 兜底不得把真断言判没 ────────────
 check('回归：拼接锚点 / 块内重赋值 / `return false` 兜底不得把真断言判没', () => {
   // ① `src.includes('A' + x)`：锚点是字符串前缀（旧闸门同口径），不得因为「不是单一字面量」整条消失。
   const concat = analyzeSource(lines(
@@ -1480,11 +1768,11 @@ check('探针：跑完必须逐字节还原生产文件（重排不得留在工�
   const dir = probeWorkspace()
   write(dir, 'test_clean.js', CLEAN_TEST)
   // dir = mkdtemp 结果 + 本文件硬编码的 'prod.js'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   const before = fs.readFileSync(path.join(dir, 'prod.js'), 'utf8') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'prod.js'，无外部净输入）
   assert.strictEqual(runProbe(dir, 'test_clean.js').status, 0)
   // 同上：读隔离工作区里的夹具，比对探针是否逐字节还原（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   assert.strictEqual(fs.readFileSync(path.join(dir, 'prod.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，比对探针是否逐字节还原）
     '探针必须把 prod.js 还原成原文（try/finally + 备份）')
 })
@@ -1609,7 +1897,7 @@ check('探针：.github/** 与 .githooks/** 在扰动面内（读它们的逐字
   assert.ok(/test_dot\.js\s+format-coupled/.test(result.out), '必须判 format-coupled：' + result.out)
   // 还原必须干净（点目录里的文件也在备份/还原范围内）。
   // dir = mkdtemp 结果 + 本文件硬编码的钩子路径，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   assert.strictEqual(fs.readFileSync(path.join(dir, '.githooks/pre-commit'), 'utf8'), // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的钩子路径，无外部净输入）
     '#!/bin/bash\nset -e\nrun_gate "lint" "提示" npm run lint\n', '钩子必须逐字节还原')
 })
@@ -1649,14 +1937,14 @@ check('探针：fail-closed 分支（重排后无法解析）必须还原已写�
   write(dir, 'zz.js', 'function zz (y) { return y }\nmodule.exports = { zz }\n')
   write(dir, 'test_clean2.js', lines("const assert = require('node:assert')", 'assert.strictEqual(1 + 1, 2)', "console.log('clean ok')"))
   // dir = mkdtemp 结果 + 本文件硬编码的 'a.js'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   const before = fs.readFileSync(path.join(dir, 'a.js'), 'utf8') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'a.js'，无外部净输入）
   const result = runProbeWith(dir, { PROBE_FORCE_UNPARSEABLE: 'zz.js' }, 'test_clean2.js')
   assert.strictEqual(result.status, 2, '探针自身 bug 必须 exit 2（不产出 coupled 结论）：' + result.out)
   assert.ok(/已还原 [1-9][0-9]* 个文件/.test(result.out), '必须打印「已还原 N 个文件」（旧实现一个字都不提）：' + result.out)
   assert.ok(/重排后无法解析 zz\.js/.test(result.out), '必须点名触发分支的文件：' + result.out)
   // 同上：读隔离工作区里的夹具，验证 fail-closed 路径是否还原（ESLint 侧为何是裸注释：见上方豁免说明）
-  // eslint-disable-next-line
+
   assert.strictEqual(fs.readFileSync(path.join(dir, 'a.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，验证 fail-closed 路径是否还原）
     'fail-closed 分支必须把先前已写盘的 a.js 逐字节还原（旧实现在这里整份留在重排态）')
 })

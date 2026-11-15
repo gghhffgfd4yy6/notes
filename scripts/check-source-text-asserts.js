@@ -81,6 +81,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const acorn = require('acorn')
 
 const ROOT = path.join(__dirname, '..')
@@ -764,12 +765,15 @@ function analyzeModule (code, file, options = {}) {
     if (entry && entry.exportName === '*' && name) imports.set(id.name, { moduleFile: entry.moduleFile, exportName: name })
   }
 
-  // 调用点 → 本地模块的导出名（`hasText(…)` / `mod.hasText(…)`）；非本地模块调用返回 null。
+  // 调用点 → 本地模块的导出名（`hasText(…)` / `mod.hasText(…)` / `mod.reader.read(…)`）；非本地模块返回 null。
   // r12-2：`const hasText = require('./x')` 时 importName 是 '*'（命名空间 require）——但**没有任何成员
   // 访问**就叫，说明模块本身被当函数用，即 `module.exports = fn`（默认导出）。旧实现在这里直接 return null，
   // 于是 exportsMap 把 `module.exports = fn` 记在 '*' 下却**从不被查**（:1094 的条目成了死数据）。
   // 两种形态都交给 summaryFor：它按导出名取函数，导出名不存在（`module.exports = { … }` 的命名空间
   // 被当函数调）时自然返回 null，不会凭空记命中。
+  // r18-A2：成员链按**点分路径**取导出名。旧实现只认 `mod.fn(…)`（callee.object 必须恰好是 Identifier），
+  // 于是 `viaObj.reader.read(f)` 这种「导出值是嵌套一层的对象」整条失明（0 命中、exit 0），
+  // 而把同一段读源码 + 比对搬进 `exports.reader = { read: fn }` 只需多套一层对象。
   const moduleTargetOf = (callee) => {
     if (!callee) return null
     // 行内 require（r13-2）：`require('./h').readSrc(…)` 与默认导出的 `require('./x')(src, 'X')`
@@ -784,16 +788,32 @@ function analyzeModule (code, file, options = {}) {
       }
       return null
     }
-    if (callee.type === 'Identifier') {
-      const entry = imports.get(callee.name)
-      if (!entry) return null
-      return { moduleFile: entry.moduleFile, exportName: entry.exportName }
+    // 成员链拆成「根 + 路径段」：`viaObj.reader.read` → root=viaObj / ['reader','read']。
+    const segments = []
+    let cursor = callee
+    while (cursor && cursor.type === 'MemberExpression') {
+      const name = propertyName(cursor)
+      if (!name) return null
+      segments.unshift(name)
+      cursor = cursor.object
     }
-    if (callee.type !== 'MemberExpression' || callee.object.type !== 'Identifier') return null
-    const entry = imports.get(callee.object.name)
-    const name = propertyName(callee)
-    if (!entry || entry.exportName !== '*' || !name) return null
-    return { moduleFile: entry.moduleFile, exportName: name }
+    if (!cursor) return null
+    if (cursor.type === 'CallExpression' && calleeTailName(cursor.callee) === 'require' && options.modules) {
+      // `require('./h').a.b(…)`：行内 require 的多级成员（r18-A2）。
+      const specifier = literalValue(cursor.arguments[0])
+      const moduleFile = typeof specifier === 'string' ? options.modules.resolve(specifier, file) : null
+      if (!moduleFile) return null
+      return { moduleFile, exportName: segments.length ? segments.join('.') : '*' }
+    }
+    if (cursor.type !== 'Identifier') return null
+    const entry = imports.get(cursor.name)
+    if (!entry) return null
+    if (!segments.length) return { moduleFile: entry.moduleFile, exportName: entry.exportName }
+    const path = segments.join('.')
+    // 命名空间 require：路径就是导出名；具名导出（`const { reader } = require(…)`）：
+    // 导出名是「已绑定的导出 + 余下路径」（`reader.read`）。
+    const exportName = entry.exportName === '*' ? path : entry.exportName + '.' + path
+    return { moduleFile: entry.moduleFile, exportName }
   }
 
   // 这个表达式的值是不是「源码文本容器」（r13-3）：`loadModel(f)` 这种返回 `{ code, codeOnly, … }`
@@ -900,7 +920,14 @@ function analyzeModule (code, file, options = {}) {
         // 「任一实参污染 ⇒ 结果污染」。
         const target = callTargets.get(node)
         if (target) {
-          out.deps.add(retBinding(target))
+          // r18-A1：**调用点实参驱动**，不用「全局并集」。旧实现在这里 `out.deps.add(retBinding(target))`，
+          // 而形参污染是所有调用点共用的流不敏感并集 ⇒ 文件里只要有一处把源码文本传给该函数，此后
+          // 同函数**所有**调用的返回值都被当成源码文本：既假红（`pick([])` 与期望值都是字面量却被计
+          // dynamic），也假红到能抵消失新增（3 条幽灵命中抵消 2 条真断言 ⇒ 净增 -1 ⇒ ✅ exit 0）。
+          // 现在把调用登记成 `calls`（返回值的污染 = 函数自身的返回摘要 + 本次实参逐个代入形参），
+          // 由 phase C 的不动点按调用点求值；跨文件摘要模式仍用 ret 绑定（那一模式要的就是「形参已污染」）。
+          if (moduleSummary) out.deps.add(retBinding(target))
+          else out.calls.push({ target, args: node.arguments })
         } else {
           node.arguments.forEach((argument) => collectDeps(argument, out))
         }
@@ -946,7 +973,7 @@ function analyzeModule (code, file, options = {}) {
     }
   }
 
-  const newDeps = () => ({ hasSource: false, deps: new Set() })
+  const newDeps = () => ({ hasSource: false, deps: new Set(), calls: [] })
 
   // ── 遍历（作用域感知） ────────────────────────────────────────────────
   let currentFn = null
@@ -978,6 +1005,10 @@ function analyzeModule (code, file, options = {}) {
   // 调用点记录（walk 结束后统一解析成边）：实参→形参。
   const deferredArgEdges = [] // { fn, args }
   const deferredElementEdges = [] // { fn, receiver }
+  // r18-A1：实参→形参这条边必须能被「纯净摘要」区分出来（它是跨调用点的并集，不能进函数摘要）。
+  const trackCallArg = (target, expr) => {
+    if (target && expr) edges.push({ target, expr, fromCallArg: true })
+  }
 
   // 比较/等值断言的登记（r12-1）：`<src> === '<字面量>'`、`assert.strictEqual(<src>, '<字面量>')`。
   // 恰好一侧是「可冻结的字面量侧」、另一侧**确实绑定到源码文本** ⇒ 一条命中（锚点 = 字面量侧）。
@@ -1351,7 +1382,7 @@ function analyzeModule (code, file, options = {}) {
     schema.forEach((list, index) => {
       const argument = deferred.args[index]
       if (!argument) return
-      list.forEach((target) => track(target, argument))
+      list.forEach((target) => trackCallArg(target, argument))
     })
   }
   for (const deferred of deferredElementEdges) {
@@ -1445,7 +1476,240 @@ function analyzeModule (code, file, options = {}) {
     const deps = newDeps()
     collectDeps(edge.expr, deps)
     if (!isBooleanExpr(edge.expr)) deps.textual = true
+    // r18-A1：「实参→形参」这条边是跨调用点的并集，纯净摘要（B2）必须能把它认出来并跳过。
+    if (edge.fromCallArg) deps.fromCallArg = true
     edge.target.defs.push(deps)
+  }
+
+  // ── B2. 函数返回值摘要（r18-A1：调用点按实参代入，不用跨调用点的并集）──────────
+  // 问题（评审实测）：`function pick (items) { return (items || []).filter(…) }` 里只要有一处
+  // `pick(fs.readFileSync(…))`，旧实现就让 `pick([])` 的两次调用也按「返回源码文本」计——形参污染是
+  // 所有调用点共用的流不敏感并集。后果双向：纯字面量比较被计成 dynamic（假红，真实仓
+  // scripts/check-host-clean.js:414 就是这类），而 3 条幽灵命中又能抵消 2 条真新增断言（假绿）。
+  // 修法：给每个绑定算两个「与调用点无关」的纯净量——
+  //   · pureSrc     —— 与形参无关的污染（函数自己读文件 / 依赖外部已污染绑定）；
+  //   · pureOrigins —— 污染来自「哪个函数的第几个形参」，调用点再按**本次实参**逐个代入。
+  // 关键：这一遍**不把实参边推进形参**（形参只作为纯来源标记），因此天然按函数而不是按调用点聚合。
+  // 跨文件摘要模式（moduleSummary）保持原样：那一模式要的就是「形参已污染」，实参重建在调用点做。
+  const pushOrigin = (map, fn, index) => {
+    let set = map.get(fn)
+    if (!set) {
+      set = new Set()
+      map.set(fn, set)
+    }
+    if (set.has(index)) return false
+    set.add(index)
+    return true
+  }
+  const emptyPure = () => ({ src: false, origins: new Map() })
+  const mergePure = (into, from) => {
+    let changed = false
+    if (from.src && !into.src) {
+      into.src = true
+      changed = true
+    }
+    for (const [fn, set] of from.origins) {
+      for (const index of set) if (pushOrigin(into.origins, fn, index)) changed = true
+    }
+    return changed
+  }
+  // 表达式的纯净值（深度上限 6：递归函数 / 装饰性套壳不该把这条分析拖成环）。
+  const pureValueOf = (node, depth) => {
+    const out = emptyPure()
+    if (!node || typeof node !== 'object' || typeof node.type !== 'string' || depth > 6) return out
+    switch (node.type) {
+      case 'Identifier': {
+        const binding = idBinding.get(node)
+        if (!binding) return out
+        if (binding.isParam && binding.paramOrigin) {
+          pushOrigin(out.origins, binding.paramOrigin.fn, binding.paramOrigin.index)
+          return out
+        }
+        out.src = !!binding.pureSrc
+        for (const [fn, set] of binding.pureOrigins || new Map()) {
+          for (const index of set) pushOrigin(out.origins, fn, index)
+        }
+        return out
+      }
+      case 'Literal':
+      case 'ThisExpression':
+      case 'Super':
+      case 'MetaProperty':
+      case 'FunctionExpression':
+      case 'ArrowFunctionExpression':
+      case 'FunctionDeclaration':
+        return out
+      case 'CallExpression':
+      case 'NewExpression': {
+        const callee = node.callee
+        if (node.type === 'CallExpression' && SOURCE_CALLS.has(calleeTailName(callee))) {
+          out.src = true
+          return out
+        }
+        if (node.type === 'CallExpression' && callee.type === 'Identifier') {
+          const alias = idBinding.get(callee)
+          if (alias && alias.sourceCall) {
+            out.src = true
+            return out
+          }
+        }
+        if (options.modules && externalSourceCalls.has(node)) {
+          out.src = true
+          return out
+        }
+        if (node.type === 'CallExpression' && STRUCTURED_CALLS.has(calleeTailName(callee))) return out
+        const calleeName = memberPath(callee)
+        if (calleeName && SANITIZER_PATHS.has(calleeName)) return out
+        const target = callTargets.get(node)
+        if (target) {
+          const ret = retBinding(target)
+          out.src = !!ret.pureSrc
+          for (const [fn, set] of ret.pureOrigins || new Map()) {
+            for (const index of set) {
+              // 本函数自己的形参 ⇒ 代入这次调用对应位置的实参；外层形参（闭包）原样保留。
+              if (fn === target) mergePure(out, pureValueOf(node.arguments[index], depth + 1))
+              else pushOrigin(out.origins, fn, index)
+            }
+          }
+          return out
+        }
+        // 未知函数（外部 API）：实参与 receiver 的污染都会流到返回值（与 collectDeps 同口径）。
+        node.arguments.forEach((argument) => mergePure(out, pureValueOf(argument, depth + 1)))
+        mergePure(out, pureValueOf(callee, depth + 1))
+        return out
+      }
+      case 'MemberExpression': {
+        if (CONTAINER_TEXT_MEMBERS.has(propertyName(node)) &&
+          (isContainerResultCall(node.object) ||
+            (node.object.type === 'Identifier' && idBinding.get(node.object) && idBinding.get(node.object).container))) {
+          out.src = true
+          return out
+        }
+        return pureValueOf(node.object, depth + 1)
+      }
+      case 'ObjectExpression':
+        node.properties.forEach((prop) => mergePure(out, pureValueOf(prop.value || prop.argument, depth + 1)))
+        return out
+      case 'ArrayExpression':
+      case 'SequenceExpression':
+        (node.elements || node.expressions).forEach((child) => mergePure(out, pureValueOf(child, depth + 1)))
+        return out
+      case 'TemplateLiteral':
+        node.expressions.forEach((child) => mergePure(out, pureValueOf(child, depth + 1)))
+        return out
+      case 'TaggedTemplateExpression':
+        mergePure(out, pureValueOf(node.tag, depth + 1))
+        mergePure(out, pureValueOf(node.quasi, depth + 1))
+        return out
+      case 'BinaryExpression':
+        // 非 `+` 的比较/算术产出布尔/数字，不是文本载体。
+        if (node.operator !== '+') return out
+        mergePure(out, pureValueOf(node.left, depth + 1))
+        mergePure(out, pureValueOf(node.right, depth + 1))
+        return out
+      case 'LogicalExpression':
+      case 'ConditionalExpression':
+        for (const key of ['left', 'right', 'consequent', 'alternate']) {
+          if (node[key]) mergePure(out, pureValueOf(node[key], depth + 1))
+        }
+        return out
+      case 'AssignmentExpression':
+        mergePure(out, pureValueOf(node.right, depth + 1))
+        return out
+      default: {
+        for (const key of Object.keys(node)) {
+          if (SKIP_KEYS.has(key)) continue
+          const child = node[key]
+          if (child && typeof child === 'object' && typeof child.type === 'string') {
+            mergePure(out, pureValueOf(child, depth + 1))
+          }
+        }
+        return out
+      }
+    }
+  }
+  if (!moduleSummary) {
+    for (const binding of bindings) {
+      binding.pureSrc = false
+      binding.pureOrigins = new Map()
+    }
+    for (const binding of bindings) {
+      // 形参的「静态来源标记」只在它**没有函数体内的来源**时使用（r18-A1）：
+      // 回调形参（`lines.map(line => …)`）的来源是元素边（体内），若同时保留「回调的第 0 个形参」
+      // 这个静态标记，调用点就会去查该回调形参在整体不动点里的污染——那是跨调用点的并集，
+      // 正是本轮要消掉的东西（实测 `pick([])` 仍被计成源码文本）。
+      if (!binding.isParam || !binding.paramOrigin) continue
+      if (binding.defs.some((dep) => !dep.fromCallArg)) continue
+      pushOrigin(binding.pureOrigins, binding.paramOrigin.fn, binding.paramOrigin.index)
+    }
+    let pureChanged = true
+    let pureRounds = 0
+    while (pureChanged && pureRounds++ < 12) {
+      pureChanged = false
+      for (const binding of bindings) {
+        const next = emptyPure()
+        for (const dep of binding.defs) {
+          // 实参→形参的边是跨调用点的并集（r18-A1 的根因），纯净摘要必须跳过它：
+          // 形参的纯净值只由「静态来源标记」与函数体内的边（元素回调、赋值等）决定。
+          if (dep.fromCallArg) continue
+          if (dep.hasSource) next.src = true
+          for (const other of dep.deps) {
+            if (other.pureSrc) next.src = true
+            for (const [fn, set] of other.pureOrigins || []) {
+              for (const index of set) pushOrigin(next.origins, fn, index)
+            }
+          }
+          for (const call of dep.calls) {
+            const ret = retBinding(call.target)
+            if (ret.pureSrc) next.src = true
+            for (const [fn, set] of ret.pureOrigins || []) {
+              for (const index of set) {
+                if (fn !== call.target) {
+                  pushOrigin(next.origins, fn, index)
+                  continue
+                }
+                const argument = pureValueOf(call.args[index], 1)
+                if (argument.src) next.src = true
+                for (const [afn, aset] of argument.origins) {
+                  for (const ai of aset) pushOrigin(next.origins, afn, ai)
+                }
+              }
+            }
+          }
+        }
+        if (next.src && !binding.pureSrc) {
+          binding.pureSrc = true
+          pureChanged = true
+        }
+        for (const [fn, set] of next.origins) {
+          for (const index of set) if (pushOrigin(binding.pureOrigins, fn, index)) pureChanged = true
+        }
+      }
+    }
+  }
+  // 调用点求值：返回值是否带源码文本 = 函数自身的 pureSrc + 本次实参代入被污染的形参。
+  const exprTainted = (node) => {
+    const deps = newDeps()
+    collectDeps(node, deps)
+    return deps.hasSource || [...deps.deps].some((binding) => binding.tainted) || deps.calls.some(callTainted)
+  }
+  const callTainted = (call) => {
+    const ret = retBinding(call.target)
+    if (ret.pureSrc) return true
+    for (const [fn, set] of ret.pureOrigins || new Map()) {
+      for (const index of set) {
+        if (fn === call.target) {
+          const argument = call.args[index]
+          if (argument && exprTainted(argument)) return true
+          continue
+        }
+        // 闭包形态：返回值的污染来自外层函数的形参——只能按该形参绑定在整体不动点里的污染判。
+        const schema = paramBindings.get(fn)
+        const list = schema && schema[index]
+        if (list && list.some((binding) => binding.tainted)) return true
+      }
+    }
+    return false
   }
 
   // ── C. 单调不动点 ────────────────────────────────────────────────────
@@ -1456,7 +1720,7 @@ function analyzeModule (code, file, options = {}) {
     for (const binding of bindings) {
       if (!binding.tainted) {
         for (const dep of binding.defs) {
-          if (dep.hasSource || [...dep.deps].some((other) => other.tainted)) {
+          if (dep.hasSource || [...dep.deps].some((other) => other.tainted) || dep.calls.some(callTainted)) {
             binding.tainted = true
             changed = true
             break
@@ -1468,7 +1732,8 @@ function analyzeModule (code, file, options = {}) {
       // 形参本身不参与（isParam）：它们只能从调用点拿到文本，不代表「这个函数自己读了文件」。
       if (!binding.fromSource && !binding.isParam) {
         for (const dep of binding.defs) {
-          if (dep.hasSource || [...dep.deps].some((other) => other.fromSource)) {
+          if (dep.hasSource || [...dep.deps].some((other) => other.fromSource) ||
+            dep.calls.some((call) => retBinding(call.target).fromSource)) {
             binding.fromSource = true
             changed = true
             break
@@ -1508,14 +1773,15 @@ function analyzeModule (code, file, options = {}) {
   const taintOf = (node) => {
     const deps = newDeps()
     collectDeps(node, deps)
-    return { deps, tainted: deps.hasSource || [...deps.deps].some((binding) => binding.tainted) }
+    return { deps, tainted: deps.hasSource || [...deps.deps].some((binding) => binding.tainted) || deps.calls.some(callTainted) }
   }
   const pushHit = (candidate, deps) => {
     const hit = { file, line: candidate.line, literal: candidate.literal, method: candidate.method }
     // receiver 是不是**这个文件自己读出来的**源码文本（`readFileSync(f).includes(…)`，或先接成变量再比：
     // `const s = readFileSync(f); s.includes(…)`）。与「形参传进来的文本」区分开（形参永远不置 fromSource），
     // r15-5 的锚点形参摘要只认这一路。
-    hit.receiverFromSource = deps.hasSource || [...deps.deps].some((binding) => binding.fromSource)
+    hit.receiverFromSource = deps.hasSource || [...deps.deps].some((binding) => binding.fromSource) ||
+      deps.calls.some((call) => retBinding(call.target).fromSource)
     // 锚点来自哪个函数的第几个形参（r15-5）：同文件调用点重建与跨文件摘要都要用，故不再只在摘要模式下记。
     hit.anchorOrigin = paramOriginOf(candidate.anchorNode)
     hit.fn = candidate.fn
@@ -1629,19 +1895,36 @@ function analyzeModule (code, file, options = {}) {
       }
       return null
     }
+    // 对象字面量递归登记（r18-A2）：`{ reader: { read: fn } }` ⇒ 导出名 `reader.read`。
+    // 深度上限 4 + 环检测（同一对象字面量节点只展开一次），够覆盖「多套一层对象」的洗白路径，
+    // 又不会被自引用形状拖住。非 Property（spread / 计算键）一律跳过——取不到名字就不猜。
+    const registerExportObject = (target, prefix, node, depth, seen) => {
+      if (!node || node.type !== 'ObjectExpression' || depth > 4 || seen.has(node)) return
+      seen.add(node)
+      for (const prop of node.properties) {
+        if (!prop || prop.type !== 'Property') continue
+        const name = keyName(prop)
+        if (!name) continue
+        registerExportValue(target, prefix ? prefix + '.' + name : name, prop.value, depth, seen)
+      }
+    }
+    const registerExportValue = (target, name, value, depth, seen) => {
+      const fn = fnOf(value)
+      if (fn) {
+        target.set(name, fn)
+        return
+      }
+      if (value && value.type === 'ObjectExpression') registerExportObject(target, name, value, depth + 1, seen)
+    }
     for (const site of exportSites) {
       if (site.name) {
-        const fn = fnOf(site.value)
-        if (fn) exportsMap.set(site.name, fn)
+        // `exports.x = …` / `module.exports.x = …`：值是函数就直接登记；值是对象字面量就**递归**登记
+        // 其中的函数值（r18-A2：`exports.reader = { read: fn }` 旧实现整条不登记 ⇒ 调用点 0 命中）。
+        registerExportValue(exportsMap, site.name, site.value, 0, new Set())
         continue
       }
       if (site.value && site.value.type === 'ObjectExpression') {
-        for (const prop of site.value.properties) {
-          if (!prop || prop.type !== 'Property') continue
-          const name = keyName(prop)
-          const fn = fnOf(prop.value)
-          if (name && fn) exportsMap.set(name, fn)
-        }
+        registerExportObject(exportsMap, '', site.value, 0, new Set())
         continue
       }
       const fn = fnOf(site.value)
@@ -1880,6 +2163,10 @@ const BASELINE_NOTE = '紧凑基线（schema 2）：只冻结「文件 → 条�
   '命中形态：字符串方法（includes/startsWith/…/match/matchAll）、正则 test、assert.match / assert.doesNotMatch、比较运算符（==/===/!=/!==）与 assert.strictEqual 家族的「源码文本 vs 字面量」逐字比对；量纲断言（.length / typeof）不计；JSON.stringify 不是 sanitizer（只转义不改写内容）。' +
   '判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；' +
   'total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。' +
+  '基线增长核对（r18-B1）：闸门从 git 参照版本（--baseline-ref / SOURCE_TEXT_ASSERT_BASELINE_REF，默认 origin/main→HEAD）' +
+  '读同一份基线并逐文件与 total 比较，任何增长（含「by_file 与 total 等量抬高」）→ exit 1 并点名；' +
+  '放行只有两条显式通道：基线里的 growth 登记（--write-allowlist --allow-growth --reason "…" 写入，理由随基线留痕）或命令行 --allow-growth。' +
+  '非 git 环境（参照不可得）打印「无法核对基线增长（非 git 环境）」并继续，CI=true 时 fail-closed（exit 2）。' +
   'literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，' +
   'receiver 确实绑定到源码文本但锚点无法静态冻结（变量 / 常量表 / helper 形参 / 动态 RegExp）——把字面量提成常量不得让整条断言从检测面上消失。' +
   '已知取舍：按文件计数看不到同一文件内 literal 之间的互换（N 条换 N 条仍绿），只有 --inventory 的 diff 能看到。' +
@@ -1943,21 +2230,33 @@ function printByFile (title, perFile, withSplit) {
 // 紧凑基线的序列化：一个文件一行（JSON.stringify(…, null, 2) 会把每条展开成 4 行，落不进 ~50 行）。
 // 顺序固定（note / schema / total / by_file，by_file 按文件名码元序）⇒ --write-allowlist 的 round-trip
 // 与冻结文件**逐字节**一致，手改与重生成不会来回跳。
-function renderBaseline (hits) {
+function renderBaseline (hits, growth) {
   const perFile = summarize(hits)
   const totals = totalsOf(perFile)
   const rows = sortedByFile(perFile).map(([file, entry]) =>
     `    ${JSON.stringify(file)}: { "all": ${entry.all}, "literal": ${entry.literal} }`)
-  const tail = rows.length ? [rows.join(',\n'), '  }'] : ['  }']
-  return [
+  const body = [
     '{',
     `  "note": ${JSON.stringify(BASELINE_NOTE)},`,
     `  "schema": ${BASELINE_SCHEMA},`,
     `  "total": { "all": ${totals.all}, "literal": ${totals.literal}, "dynamic": ${totals.dynamic} },`,
     '  "by_file": {',
-    ...tail,
-    '}'
-  ].join('\n') + '\n'
+    ...(rows.length ? [rows.join(',\n')] : []),
+    growth ? '  },' : '  }'
+  ]
+  if (growth) body.push(`  "growth": ${renderGrowthRecord(growth)}`)
+  body.push('}')
+  return body.join('\n') + '\n'
+}
+
+// growth 登记的单行序列化（键序固定：vs / total / by_file / why；by_file 按键名码元序）。
+// 它是「白名单只减不增」的例外留痕：闸门按**精确相等**核对（见 growthAcceptedByRecord），
+// 因此多报少报都判红，改它必须是一次可见的 diff。
+function renderGrowthRecord (growth) {
+  const files = Object.keys(growth.by_file).sort(byFileName)
+    .map((file) => `${JSON.stringify(file)}: ${growth.by_file[file]}`)
+  return `{ "vs": ${JSON.stringify(growth.vs)}, "commit": ${JSON.stringify(growth.commit)}, ` +
+    `"total": ${growth.total}, "by_file": { ${files.join(', ')} }, "why": ${JSON.stringify(growth.why)} }`
 }
 
 const isCount = (value) => Number.isInteger(value) && value >= 0
@@ -1996,6 +2295,27 @@ function assertBaselineShape (raw, measuredTotal) {
   if (total.literal + total.dynamic !== total.all) {
     bad(`total.literal(${total.literal}) + total.dynamic(${total.dynamic}) ≠ total.all(${total.all})`)
   }
+  // growth 是「只减不增」的**显式例外留痕**（r18-B1），形状必须自洽，否则同样 exit 2：
+  // 一份好心的登记如果内部不平，闸门就会按错误的差额放行。
+  if (raw.growth !== undefined) {
+    const growth = raw.growth
+    if (!growth || typeof growth !== 'object' || Array.isArray(growth)) bad('growth 必须是对象')
+    if (!isCount(growth.total)) bad(`growth.total 必须是非负整数，实得 ${JSON.stringify(growth.total)}`)
+    if (!growth.by_file || typeof growth.by_file !== 'object' || Array.isArray(growth.by_file)) {
+      bad('growth.by_file 必须是 {文件: 增量} 对象')
+    }
+    let sumGrowth = 0
+    for (const [file, delta] of Object.entries(growth.by_file)) {
+      if (!isCount(delta)) bad(`growth.by_file["${file}"] 必须是非负整数，实得 ${JSON.stringify(delta)}`)
+      sumGrowth += delta
+    }
+    if (sumGrowth !== growth.total) bad(`growth.total=${growth.total}，但 growth.by_file 之和=${sumGrowth}`)
+    if (typeof growth.why !== 'string' || !growth.why.trim()) bad('growth.why 必须是非空理由（例外必须留痕）')
+    // r18-B1：登记的参照提交必填——没有它，这条例外会被日后任何「同形状」的增长复用。
+    if (typeof growth.commit !== 'string' || !/^[0-9a-f]{7,40}$/.test(growth.commit)) {
+      bad('growth.commit 必须是参照提交的 sha（写入时的 --baseline-ref 解析结果）——缺它就等于一张永久通行证')
+    }
+  }
   return raw
 }
 
@@ -2007,6 +2327,161 @@ function readBaseline (measuredTotal) {
     die(2, `❌ 基线不可读或不是合法 JSON（${ALLOW_REL}）：${e.message}`)
   }
   return assertBaselineShape(raw, measuredTotal)
+}
+
+// ── 基线增长核对（r18-B1）──────────────────────────────────────────────
+// 为什么必须有：闸门原先只比 on-disk 基线，而基线就在同一个提交里 ⇒「手改 by_file + total 等量抬高
+// 4 个数字」与「往测试里加 3 条真实断言」一起提交时，条数差额被抹平，闸门打印 ✅ exit 0
+// （评审实测）。条数判据本身没有任何「历史」概念，只有 git 里的参照版本能提供。
+// 参照：--baseline-ref / 环境变量 → origin/main → origin/master → main → master → HEAD。
+//   · 前几项是「PR 基线版本」（CI 里由 workflow 传入 pull_request.base.sha，见 test.yml）；
+//   · 都没有时退到 HEAD：本 PR 首次引入基线文件（origin/main 里没有它）时的兜底——
+//     此时仍能抓到「工作树手改基线」这一路，而整个 PR 的相对增长由合并后的 PR 基线约束。
+// 不可得时的行为必须显式：非 CI 打印「无法核对基线增长（非 git 环境）」并继续；CI=true 时 fail-closed。
+const BASELINE_REF_ENV = 'SOURCE_TEXT_ASSERT_BASELINE_REF'
+const GROWTH_REASON_ENV = 'SOURCE_TEXT_ASSERT_GROWTH_REASON'
+
+function gitRun (args) {
+  const result = spawnSync('git', ['-C', ROOT, ...args], { encoding: 'utf8', timeout: 30000 })
+  return {
+    ok: result.status === 0,
+    out: (result.stdout || '').trim(),
+    err: (result.stderr || '').trim(),
+    failed: result.error || null
+  }
+}
+
+function baselineRefFromArgv () {
+  const inline = process.argv.find((arg) => arg.startsWith('--baseline-ref='))
+  if (inline) return inline.slice('--baseline-ref='.length)
+  const index = process.argv.indexOf('--baseline-ref')
+  if (index >= 0) {
+    const next = process.argv[index + 1]
+    if (next && !next.startsWith('--')) return next
+  }
+  return ''
+}
+
+// 参照基线：{ ok:true, label, raw } | { ok:false, kind, reason }。形状不合法（schema 1 / 缺 by_file）
+// 的版本按「这一项不可用」处理并继续找下一项——参照坏了不能读成「零增长」。
+function resolveReferenceBaseline () {
+  const explicit = baselineRefFromArgv() || process.env[BASELINE_REF_ENV] || ''
+  if (!gitRun(['rev-parse', '--git-dir']).ok) {
+    return { ok: false, kind: 'no-git', reason: '非 git 环境' }
+  }
+  const candidates = explicit ? [explicit] : ['origin/main', 'origin/master', 'main', 'master', 'HEAD']
+  const problems = []
+  let missingFile = null
+  for (const candidate of candidates) {
+    if (!gitRun(['rev-parse', '--verify', '--quiet', candidate + '^{commit}']).ok) {
+      problems.push(`${candidate} 不可解析`)
+      continue
+    }
+    const shown = gitRun(['show', candidate + ':' + ALLOW_REL])
+    if (!shown.ok) {
+      problems.push(`${candidate} 里没有 ${ALLOW_REL}`)
+      // 显式指定的参照存在、但那个提交还没有基线文件 ⇒ 这不是配置错误（首个引入基线的 PR 就是这样），
+      // 而是「没有可比的历史」。单独归类：不当成 explicit-missing 去 fail-closed，也不当成零增长。
+      if (explicit && candidate === explicit) missingFile = candidate
+      continue
+    }
+    let raw = null
+    try {
+      raw = JSON.parse(shown.out)
+    } catch {
+      raw = null
+    }
+    if (!raw || raw.schema !== BASELINE_SCHEMA || !raw.total || typeof raw.total.all !== 'number' ||
+      !raw.by_file || typeof raw.by_file !== 'object' || Array.isArray(raw.by_file)) {
+      problems.push(`${candidate} 的基线形状不可用（需要 schema ${BASELINE_SCHEMA} + total/by_file）`)
+      continue
+    }
+    const commit = gitRun(['rev-parse', '--verify', '--quiet', candidate + '^{commit}']).out
+    return { ok: true, label: candidate, commit, raw }
+  }
+  if (missingFile) {
+    return {
+      ok: false,
+      kind: 'no-baseline-in-ref',
+      reason: `参照 ${missingFile} 里没有 ${ALLOW_REL}（首个引入基线的 PR）`
+    }
+  }
+  return {
+    ok: false,
+    kind: explicit ? 'explicit-missing' : 'no-ref',
+    reason: explicit ? `指定的参照 ${explicit} 不可用（${problems.join('；')}）` : problems.join('；')
+  }
+}
+
+// 逐文件增长（只报 delta > 0）。参照里没有的文件按 0 算 ⇒ 新文件有任何条目都算增长。
+function growthAgainstReference (baseline, reference) {
+  const before = reference.by_file || {}
+  const after = baseline.by_file || {}
+  const files = new Set([...Object.keys(before), ...Object.keys(after)])
+  const rows = []
+  for (const file of [...files].sort(byFileName)) {
+    const oldCount = Object.prototype.hasOwnProperty.call(before, file) ? before[file].all : 0
+    const newCount = Object.prototype.hasOwnProperty.call(after, file) ? after[file].all : 0
+    if (newCount > oldCount) rows.push({ file, before: oldCount, after: newCount, delta: newCount - oldCount })
+  }
+  const total = rows.reduce((sum, row) => sum + row.delta, 0)
+  const totalBefore = reference.total.all
+  const totalAfter = baseline.total.all
+  return { rows, total, totalBefore, totalAfter, totalDelta: totalAfter - totalBefore }
+}
+
+// 基线里的 growth 登记是否**精确**覆盖本次观察到的增长（多报/少报/漏文件都不算）：
+// 「等价开关」必须显式到每个文件与每个增量，改它一定是一次可见的 diff。
+function growthAcceptedByRecord (record, growth, commit) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return false
+  // r18-B1：登记钉在**写入时的参照提交**上。否则一条「+1 console.js」的旧登记会被日后任何
+  // 同形状的增长反复复用（= 一张永久通行证），正是「只减不增」要堵的那种后门。
+  if (typeof record.commit !== 'string' || !record.commit || record.commit !== commit) return false
+  if (!isCount(record.total) || record.total !== growth.total) return false
+  const declared = record.by_file && typeof record.by_file === 'object' && !Array.isArray(record.by_file) ? record.by_file : {}
+  const declaredFiles = Object.keys(declared).filter((file) => declared[file] > 0)
+  if (declaredFiles.length !== growth.rows.length) return false
+  return growth.rows.every((row) => declared[row.file] === row.delta)
+}
+
+// 闸门路径：相对参照不得增长；增长只有 --allow-growth 或基线里的 growth 登记能放行。
+function verifyGrowthAgainstReference (baseline) {
+  const allowGrowth = process.argv.includes('--allow-growth')
+  const reference = resolveReferenceBaseline()
+  if (!reference.ok) {
+    if (reference.kind === 'explicit-missing') die(2, `❌ ${reference.reason}。显式指定的参照不可用不能当成「零增长」。`)
+    // 参照提交里根本没有基线文件（首个引入基线的 PR）⇒ 没有可比的历史，也不该在 CI 上 fail-closed：
+    // 那会让「第一次提交基线」这件事永远无法通过 CI。仍然显式说明，不静默。
+    if (reference.kind === 'no-baseline-in-ref') {
+      console.log(`ℹ️ 无法核对基线增长（${reference.reason}）：没有可比的历史，本次跳过增长核对。`)
+      return
+    }
+    if (process.env.CI === 'true') {
+      die(2, `❌ 无法核对基线增长（${reference.reason}）：CI 上 fail-closed——` +
+        '拿不到 PR 基线版本就不能证明基线没有被抬高（本次判定退出，不按 on-disk 基线放行）。')
+    }
+    console.log(`ℹ️ 无法核对基线增长（${reference.reason}）：只按当前基线判定；CI 上该分支 fail-closed（exit 2）。`)
+    return
+  }
+  const growth = growthAgainstReference(baseline, reference.raw)
+  if (!growth.rows.length) {
+    console.log(`✓ 基线相对参照 ${reference.label} 未增长（逐文件与 total 一致：${growth.totalAfter} 条）`)
+    return
+  }
+  if (growthAcceptedByRecord(baseline.growth, growth, reference.commit)) {
+    console.log(`ℹ️ 基线相对参照 ${reference.label} 增长 ${growth.total} 条，已由基线里的 growth 登记显式接受：${baseline.growth.why}`)
+    growth.rows.forEach((row) => console.log(`  ${row.file}  ${row.before} → ${row.after}（+${row.delta}）`))
+    return
+  }
+  if (allowGrowth) {
+    console.log(`ℹ️ 已按 --allow-growth 接受基线相对 ${reference.label} 的增长 ${growth.total} 条（必须逐文件归因写进 CHANGELOG）。`)
+    return
+  }
+  console.error(`❌ 基线相对参照 ${reference.label} 被抬高 ${growth.total} 条（白名单「只减不增」，含「by_file 与 total 等量抬高」）：`)
+  growth.rows.forEach((row) => console.error(`  ${row.file}  参照 ${row.before} / 当前 ${row.after} / +${row.delta}`))
+  console.error('修法：新增断言改成行为/AST/配置断言；确属仪器变宽就 ' +
+    'node scripts/check-source-text-asserts.js --write-allowlist --allow-growth --reason "…" 重生成（增长会随基线留痕）。')
+  process.exit(1)
 }
 
 // 按文件计数比对（v3.448）：只看 all。
@@ -2064,14 +2539,35 @@ function compareByFile (hits, baseline) {
 }
 
 // 逐条清单（file:line）只可能来自仓库外的 inventory：紧凑基线没有行号，所以「新增哪一行」要么由
-// --inventory 的旧快照 diff 得出，要么只能点名文件 + 增量。inventory 缺失/陈旧一律不改变退出码。
-function loadInventoryItems (hint) {
+// --inventory 的旧快照 diff 得出，要么只能点名文件 + 增量。
+// r18-C1：**用快照做 (file,literal) 逐条 diff 之前必须校验陈旧**。旧实现无条件拿快照当「已知命中」，
+// 而快照可能来自完全不同的一版基线（实测 inventory total=2714 / 基线 3190）⇒ 476 条既有命中被当成
+// 「新增位置」逐行打印，与 CHANGELOG v3.448 的承诺（快照陈旧就只按文件报增量，不猜行号）相反。
+// 校验口径：schema / baseline 路径 / total 三段（all-literal-dynamic）全部与当前基线一致才算新鲜。
+function loadInventoryItems (hint, baseline) {
+  const stale = (why) => ({ items: null, stale: true, why })
+  let raw
   try {
-    const raw = JSON.parse(fs.readFileSync(hint, 'utf8')) // nosemgrep（hint = 环境变量或本文件常量路径，只读、缺失即降级为「点名文件」）
-    if (!raw || !Array.isArray(raw.items)) return null
-    return raw.items.filter((item) => item && typeof item.file === 'string' && typeof item.literal === 'string')
+    raw = JSON.parse(fs.readFileSync(hint, 'utf8')) // nosemgrep（hint = 环境变量或本文件常量路径，只读、缺失即降级为「点名文件」）
   } catch (e) {
-    return null
+    return { items: null, stale: false, why: `没有可用的逐条清单（${hint}）：只能按文件报增量。要 file:line 就在基线冻结状态下先跑 --inventory。` }
+  }
+  if (!raw || !Array.isArray(raw.items)) return { items: null, stale: false, why: `逐条清单格式不可用（${hint}）：只能按文件报增量。` }
+  if (raw.schema !== BASELINE_SCHEMA) return stale(`逐条清单 schema=${JSON.stringify(raw.schema)} ≠ 基线 schema ${BASELINE_SCHEMA}`)
+  if (raw.baseline && raw.baseline !== ALLOW_REL) return stale(`逐条清单记录的基线文件是 ${JSON.stringify(raw.baseline)} ≠ ${ALLOW_REL}`)
+  const total = raw.total
+  if (!total || typeof total !== 'object' ||
+    total.all !== baseline.total.all || total.literal !== baseline.total.literal || total.dynamic !== baseline.total.dynamic) {
+    const got = total && typeof total === 'object'
+      ? `all ${JSON.stringify(total.all)} / literal ${JSON.stringify(total.literal)} / dynamic ${JSON.stringify(total.dynamic)}`
+      : '缺失'
+    return stale(`逐条清单 total（${got}）与当前基线（all ${baseline.total.all} / literal ${baseline.total.literal} / ` +
+      `dynamic ${baseline.total.dynamic}）不一致`)
+  }
+  return {
+    items: raw.items.filter((item) => item && typeof item.file === 'string' && typeof item.literal === 'string'),
+    stale: false,
+    why: null
   }
 }
 
@@ -2096,14 +2592,18 @@ function diffAgainstInventory (hits, known, onlyFiles) {
   return extras
 }
 
-function printNewHitLines (hits, violations) {
+function printNewHitLines (hits, violations, baseline) {
   const hint = process.env[INVENTORY_ENV] || INVENTORY_DEFAULT
-  const known = loadInventoryItems(hint)
-  if (!known) {
-    console.log(`ℹ️ 没有可用的逐条清单（${hint}）：只能按文件报增量。要 file:line 就在基线冻结状态下先跑 --inventory。`)
+  const loaded = loadInventoryItems(hint, baseline)
+  if (!loaded.items) {
+    // r18-C1：陈旧快照**不许**参与 (file,literal) 逐条 diff（否则既有命中会被当成「新增位置」打印）。
+    // 两种降级都显式说明原因，退出码不变（诊断信息只影响可读性，不影响判定）。
+    console.log(loaded.stale
+      ? `ℹ️ 逐条清单陈旧（${loaded.why}）：只能按文件报增量，不猜行号（快照要用 --inventory 在当前基线下重出）。`
+      : `ℹ️ ${loaded.why}`)
     return
   }
-  const extras = diffAgainstInventory(hits, known, new Set(violations.map((v) => v.file)))
+  const extras = diffAgainstInventory(hits, loaded.items, new Set(violations.map((v) => v.file)))
   if (!extras.length) {
     console.log(`ℹ️ 逐条清单（${hint}）里找不到对应的新增行（快照陈旧或条数在文件内互换）：按文件增量处理。`)
     return
@@ -2194,33 +2694,90 @@ function writeAllowlist (hits) {
   const totals = totalsOf(perFile)
   const previous = readBaselineForCompare()
   const allowGrowth = process.argv.includes('--allow-growth')
+  // r18-B1：重生成路径同样受「只减不增」约束——而且必须比 **git 参照**，不能只比 on-disk 基线
+  // （先手改基线再重生成，旧实现看到的是「零差额」，等于把抬高洗成正常重生成）。
+  const byFileShape = {}
+  for (const [file, entry] of perFile) byFileShape[file] = { all: entry.all, literal: entry.literal }
+  const reference = resolveReferenceBaseline()
+  const refGrowth = reference.ok
+    ? growthAgainstReference({ total: totals, by_file: byFileShape }, reference.raw)
+    : { rows: [], total: 0, totalBefore: 0, totalAfter: totals.all, totalDelta: 0 }
+  if (!reference.ok && reference.kind === 'no-baseline-in-ref') {
+    console.log(`ℹ️ 无法核对基线增长（${reference.reason}）：没有可比的历史，本次按新基线写入。`)
+  }
+  let recordOk = false
   if (!previous.raw) {
     console.log(`ℹ️ ${previous.why}：本次写入将成为新基线。`)
   } else {
     const diff = diffByFile(perFile, previous.raw)
     const grown = diff.filter((row) => row.delta > 0)
     const totalDelta = totals.all - previous.raw.total.all
+    recordOk = growthAcceptedByRecord(previous.raw.growth, refGrowth, reference.commit)
     if (diff.length) {
       console.log(`旧基线 ${previous.raw.total.all} 条 → 实测 ${totals.all} 条（${totalDelta >= 0 ? '+' : ''}${totalDelta}），逐文件差额：`)
       diff.forEach((row) => console.log(`  ${row.file}  ${row.before} → ${row.now}（${row.delta >= 0 ? '+' : ''}${row.delta}）`))
     } else {
       console.log(`旧基线 ${previous.raw.total.all} 条 = 实测 ${totals.all} 条，逐文件无差额。`)
     }
-    // 「只减不增」的唯一机械入口：没有 --allow-growth 时，任何 total 或单文件增长都必须拒绝写盘。
+    // 「只减不增」的机械入口：没有 --allow-growth 时，任何 total 或单文件增长都必须拒绝写盘。
     // 旧实现直接写盘并 return 0 ⇒ 「新增断言后跑一次 --write-allowlist」就是一条全绿通道（评审实测）。
-    if ((totalDelta > 0 || grown.length) && !allowGrowth) {
+    // 现在两条判据同时生效：on-disk 旧基线 + git 参照（后者堵住「先手改基线再重生成」）。
+    // 例外：参照差额与基线里**已登记**的 growth 恰好一致时照常写盘（否则一旦登记过增长，
+    // 日后再收紧基线都会被这条判据顶住——登记的意义就是「这次增长是被审阅过的」）。
+    if ((totalDelta > 0 || grown.length || (refGrowth.rows.length && !recordOk)) && !allowGrowth) {
       console.error(`❌ 拒绝写盘：本次重生成会抬高基线（total ${totalDelta >= 0 ? '+' : ''}${totalDelta}` +
-        `${grown.length ? `，${grown.length} 个文件增长` : ''}）。基线「只减不增」，` +
-        '新增断言先改成行为/AST/配置断言；确实要抬高（例如仪器变宽）就显式加 --allow-growth 并把它写进 CHANGELOG。')
+        `${grown.length ? `，${grown.length} 个文件增长` : ''}` +
+        `${refGrowth.rows.length ? `；相对参照 ${reference.label} 还多 ${refGrowth.total} 条` : ''}）。` +
+        '基线「只减不增」，新增断言先改成行为/AST/配置断言；确实要抬高（例如仪器变宽）就显式加 --allow-growth 并把它写进 CHANGELOG。')
       grown.forEach((row) => console.error(`  ${row.file}  基线 ${row.before} / 实测 ${row.now} / +${row.delta}`))
+      refGrowth.rows
+        .filter((row) => !grown.some((g) => g.file === row.file))
+        .forEach((row) => console.error(`  ${row.file}  参照 ${row.before} / 实测 ${row.after} / +${row.delta}（on-disk 基线已被改低）`))
       process.exit(1)
     }
-    if (allowGrowth && (totalDelta > 0 || grown.length)) console.log('ℹ️ 已按 --allow-growth 接受上面的增长（必须在 CHANGELOG 里逐文件归因）。')
+    if (allowGrowth && (totalDelta > 0 || grown.length || refGrowth.rows.length)) {
+      console.log('ℹ️ 已按 --allow-growth 接受上面的增长（必须在 CHANGELOG 里逐文件归因）。')
+    }
   }
-  const body = renderBaseline(hits)
+  // 增长登记（r18-B1）：只在「相对 git 参照确有增长」且已 --allow-growth 时写入，理由必填。
+  let growth = null
+  if (refGrowth.rows.length && recordOk) {
+    // 参照差额 = 已登记的例外：原样保留这份留痕，不重新要理由。
+    growth = previous.raw.growth
+    console.log(`ℹ️ 保留已登记的增长记录（相对 ${growth.vs} +${growth.total}）：与参照的差额一致。`)
+  } else if (refGrowth.rows.length && allowGrowth) {
+    const why = (process.env[GROWTH_REASON_ENV] || growthReasonFromArgv() || '').trim()
+    if (!why) {
+      die(2, `❌ 相对参照 ${reference.label} 增长 ${refGrowth.total} 条，但没有给理由：` +
+        '用 --reason "…"（或 SOURCE_TEXT_ASSERT_GROWTH_REASON）说明为什么必须抬高基线（会随基线写进仓库）。')
+    }
+    growth = { vs: reference.label, commit: reference.commit, total: refGrowth.total, by_file: {}, why }
+    for (const row of refGrowth.rows) growth.by_file[row.file] = row.delta
+  } else if (!refGrowth.rows.length && previous.raw && previous.raw.growth) {
+    // 本次没有新的增长可登记时，把已有登记原样带过去：重生成是「收紧基线」的日常操作，
+    // 不该顺手抹掉上一轮的例外留痕（它只在「观察到的增长恰好等于登记」时才放行）。
+    growth = previous.raw.growth
+    console.log(`ℹ️ 保留已登记的增长记录（相对 ${growth.vs} +${growth.total}）：本次没有新的增长可登记。`)
+  }
+  const body = renderBaseline(hits, growth)
   fs.writeFileSync(ALLOW_FILE, body) // nosemgrep（写回的是 --write-allowlist 生成的紧凑基线，路径为 __dirname 常量）
   console.log(`已写入紧凑基线 ${totals.all} 条（literal ${totals.literal} / dynamic ${totals.dynamic}，按文件计数）→ ${ALLOW_REL}`)
+  if (growth) {
+    console.log(`已登记基线增长 ${growth.total} 条（相对 ${growth.vs}，理由：${growth.why}）：`)
+    Object.keys(growth.by_file).sort(byFileName).forEach((file) => console.log(`  ${file}  +${growth.by_file[file]}`))
+  }
   printByFile('按文件分布：', perFile)
+}
+
+function growthReasonFromArgv () {
+  const inline = process.argv.find((arg) => arg.startsWith('--reason='))
+  if (inline) return inline.slice('--reason='.length)
+  const index = process.argv.indexOf('--reason')
+  if (index >= 0) {
+    const next = process.argv[index + 1]
+    if (next && !next.startsWith('--')) return next
+  }
+  return ''
 }
 
 function main () {
@@ -2234,6 +2791,9 @@ function main () {
     return
   }
   const baseline = readBaseline(hits.length)
+  // r18-B1：先核对「基线相对 git 参照没有增长」——它比逐文件条数判据更早，因为抬高基线的提交
+  // 会让后面的条数比较看起来一切正常。
+  verifyGrowthAgainstReference(baseline)
   const { violations, shortfalls, measured, measuredTotals } = compareByFile(hits, baseline)
   console.log(`源码文本断言：实测 ${measuredTotals.all} 条（literal ${measuredTotals.literal} / dynamic ${measuredTotals.dynamic}）` +
     ` / 基线 ${baseline.total.all} 条（literal ${baseline.total.literal} / dynamic ${baseline.total.dynamic}，` +
@@ -2246,7 +2806,7 @@ function main () {
       const tag = v.isNewFile ? '（基线里没有这个文件）' : ''
       console.error(`  ${v.file}  基线 ${v.baseline} / 实测 ${v.measured} / +${v.extra}${tag}`)
     }
-    printNewHitLines(hits, violations)
+    printNewHitLines(hits, violations, baseline)
     console.error('改成行为断言 / AST 断言（test_support/source_model.js）/ 配置解析断言，见 SYSTEM_CONTRACT.md「源码文本断言（check:assert-style）」')
     process.exit(1)
   }

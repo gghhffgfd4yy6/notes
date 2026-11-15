@@ -52,6 +52,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；测试 job 不需要 git 凭据
+          # r18-B1：源码文本断言闸门要用「参照版本的 allowlist」核对基线没有被抬高（只减不增的机械判据）。
+          # 浅克隆（默认 depth=1）在本 job 里**不够**：参照是 base 分支的提交，与 HEAD 可能隔任意多层，
+          # 且 merge-base 需要历史；取不到参照时闸门在 CI（CI=true）上 fail-closed ⇒ 必须整取历史。
+          fetch-depth: 0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
@@ -92,6 +96,11 @@ jobs:
       # 位置：Lint / 版本一致性之后、单元测试之前——秒级门禁先失败，不必等全量单测跑完才红。
       - name: 源码文本断言闸门（禁止新增读源码文本断言）
         run: npm run check:assert-style
+        env:
+          # r18-B1：基线「只减不增」的参照。PR 上是 base 分支，push 到 main 时就是 main 自身；
+          # 用 env 而不是往 run 里拼参数：步骤的 run 串必须与本地同一条 npm 链（test_ci_static_gates.js 锁着）。
+          # 取不到这个 ref 时闸门在 CI=true 下 fail-closed（宁可红，不许静默跳过增长核对）。
+          SOURCE_TEXT_ASSERT_BASELINE_REF: origin/${{ github.base_ref || 'main' }}
 
       # v3.447：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样显式列步骤
       # ——否则脱门；摘除静态扫描步骤、check 链或 pre-commit 门链，本步骤变红）。

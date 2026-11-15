@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.459 — S0 收 r17 四处缺口：读取函数别名的解构重命名/.bind 认不出、check:assert-style 步骤可被 step 级 if/continue-on-error 条件化、SYSTEM_CONTRACT 的 check 链漏项与道数错位、闸门判红文案指向不存在的章节；只动测试/scripts/文档，白名单 3190 原地不动 *******
+//* ******* 线报酷推送脚本 v3.460 — S0 收 r18 四处缺口：本地函数调用点污染按实参（不再全文件并集）、嵌套一层 reader 对象导出登记、白名单增长机械校验（git 参照 + growth 登记 / CI fail-closed）、inventory 陈旧快照降级不猜行号；只动测试/scripts/.github/文档，白名单 3190 → 3131（−59，逐文件已归因） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
