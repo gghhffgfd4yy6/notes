@@ -1,0 +1,4291 @@
+{
+  "note": "冻结清单：只减不增。新增源码文本断言一律红。",
+  "count": 857,
+  "items": [
+    {
+      "file": "test_app.js",
+      "line": 655,
+      "literal": "dry-run未推送=2"
+    },
+    {
+      "file": "test_app.js",
+      "line": 717,
+      "literal": "noidentity=1"
+    },
+    {
+      "file": "test_app.js",
+      "line": 1751,
+      "literal": "pushed=2"
+    },
+    {
+      "file": "test_app.js",
+      "line": 1769,
+      "literal": "ERROR"
+    },
+    {
+      "file": "test_app.js",
+      "line": 1785,
+      "literal": "ERROR"
+    },
+    {
+      "file": "test_app.js",
+      "line": 1802,
+      "literal": "pushed=1"
+    },
+    {
+      "file": "test_app.js",
+      "line": 743,
+      "literal": "[vundefined]"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2077,
+      "literal": "push boom string"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2078,
+      "literal": "undefined"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2113,
+      "literal": "plain string error"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2114,
+      "literal": "undefined"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2181,
+      "literal": "1/2"
+    },
+    {
+      "file": "test_app.js",
+      "line": 2182,
+      "literal": "Infinity"
+    },
+    {
+      "file": "test_app.js",
+      "line": 3824,
+      "literal": "WARN 缓存落盘失败"
+    },
+    {
+      "file": "test_app.js",
+      "line": 3825,
+      "literal": "cachesaved=0"
+    },
+    {
+      "file": "test_app.js",
+      "line": 3946,
+      "literal": "ERROR"
+    },
+    {
+      "file": "test_app.js",
+      "line": 3947,
+      "literal": "推送全部失败"
+    },
+    {
+      "file": "test_app.js",
+      "line": 3977,
+      "literal": "推送部分失败"
+    },
+    {
+      "file": "test_app.js",
+      "line": 4218,
+      "literal": "WARN 缓存JSON 解析失败隔离重建"
+    },
+    {
+      "file": "test_app.js",
+      "line": 4218,
+      "literal": "缓存JSON 解析失败隔离重建"
+    },
+    {
+      "file": "test_app.js",
+      "line": 4220,
+      "literal": ".corrupt."
+    },
+    {
+      "file": "test_app.js",
+      "line": 4555,
+      "literal": "const CACHE_SHARD_ID_RE ="
+    },
+    {
+      "file": "test_app.js",
+      "line": 4556,
+      "literal": "function buildCacheShard (rawId, root, pathMod) {"
+    },
+    {
+      "file": "test_app.js",
+      "line": 3042,
+      "literal": "存活持有者期间追加"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 3938,
+      "literal": "运行异常"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 3963,
+      "literal": "运行异常"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 3991,
+      "literal": "运行异常"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 6789,
+      "literal": "失败乙"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 3676,
+      "literal": "dry-1"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 52,
+      "literal": "stryMutAct_"
+    },
+    {
+      "file": "test_app_unit.js",
+      "line": 4082,
+      "literal": "run1-b"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 481,
+      "literal": "\\npermissions:\\n  contents: read\\n"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 2073,
+      "literal": "npx stryker run"
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 1134,
+      "literal": "pid="
+    },
+    {
+      "file": "test_ci_skip_suites.js",
+      "line": 1813,
+      "literal": "zombie_helper.js"
+    },
+    {
+      "file": "test_console.js",
+      "line": 387,
+      "literal": "{"
+    },
+    {
+      "file": "test_console.js",
+      "line": 409,
+      "literal": "{"
+    },
+    {
+      "file": "test_console.js",
+      "line": 422,
+      "literal": "\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 428,
+      "literal": "*/"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2617,
+      "literal": "pingbifenlei"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3168,
+      "literal": "暂时读不了"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3888,
+      "literal": "xbk-push 控制台"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3889,
+      "literal": "id=\"app\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 3890,
+      "literal": "id=\"xbk-boot\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 3892,
+      "literal": "试运行"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3893,
+      "literal": "环境检查"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3894,
+      "literal": "正式运行一轮"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3903,
+      "literal": "缺失"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3915,
+      "literal": "--bg"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3988,
+      "literal": "需要访问令牌"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3990,
+      "literal": "<form method=\"post\" action=\"/login\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4005,
+      "literal": "{\"error\":\"unauthorized\"}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4007,
+      "literal": "/assets/app.css?token="
+    },
+    {
+      "file": "test_console.js",
+      "line": 4008,
+      "literal": "/assets/app.js?token="
+    },
+    {
+      "file": "test_console.js",
+      "line": 4013,
+      "literal": "from './htm-preact.module.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4014,
+      "literal": "from './pure.mjs'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4015,
+      "literal": "render("
+    },
+    {
+      "file": "test_console.js",
+      "line": 4019,
+      "literal": "export function filterLogLines"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4028,
+      "literal": "class=\"boot-fallback\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 4029,
+      "literal": "页面没加载出来"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4263,
+      "literal": "需要访问令牌"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4264,
+      "literal": "id=\"xbk-boot\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 4295,
+      "literal": "id=\"xbk-boot\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 6002,
+      "literal": "total=20"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6003,
+      "literal": "HEAD-MARKER"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6004,
+      "literal": "STATE-DIR-ONLY-MARKER"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6138,
+      "literal": "fail-closed"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7929,
+      "literal": "XBK_CONSOLE"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11280,
+      "literal": "已经用过"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11294,
+      "literal": "需要两步验证"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11298,
+      "literal": "?token="
+    },
+    {
+      "file": "test_console.js",
+      "line": 11299,
+      "literal": "<form method=\"post\" action=\"/login\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11303,
+      "literal": "name=\"code\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 11306,
+      "literal": "需要两步验证"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11309,
+      "literal": "验证码不对"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11405,
+      "literal": "需要访问令牌"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11413,
+      "literal": "尝试次数过多"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11414,
+      "literal": "需要访问令牌"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11415,
+      "literal": "name=\"code\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 11590,
+      "literal": "name=\"remember\" value=\"1\" checked"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11612,
+      "literal": "xbk-boot"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11638,
+      "literal": "需要访问令牌"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11668,
+      "literal": "需要访问令牌"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2004,
+      "literal": "const buildSaveCandidate = useCallback("
+    },
+    {
+      "file": "test_console.js",
+      "line": 2006,
+      "literal": "\\n  )"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2016,
+      "literal": "setOverride(filterOverrideFrom(filter))"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2017,
+      "literal": "apiPostFilterSave({ schema: 1, baseRevision: 0, filter: { ...base } })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2040,
+      "literal": "进程内 last-known-good"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2042,
+      "literal": "lastGoodUsed: data.lastGoodUsed === true"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2044,
+      "literal": "filterCorruptNotice({ appliedSource: applied && applied.source"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2048,
+      "literal": "下一次加载起降级"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2823,
+      "literal": "function BackupBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2824,
+      "literal": "function TwoFactorBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2843,
+      "literal": "function BackupBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2844,
+      "literal": "function TwoFactorBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2863,
+      "literal": "const text = await res.text()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2864,
+      "literal": "BACKUP_BROWSER_MAX_BYTES = 32 * 1024 * 1024"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2865,
+      "literal": "BACKUP_FILE_MAX_BYTES = 48 * 1024 * 1024"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2867,
+      "literal": "function apiPostBackupExport"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2867,
+      "literal": "function apiPostBackupImport"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2914,
+      "literal": "function ConfirmDialog"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2915,
+      "literal": "function LeaveGuardDialog"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2920,
+      "literal": "function useDialogChrome"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2922,
+      "literal": "\\n}\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2929,
+      "literal": "\\n}\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3740,
+      "literal": "function Missing"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3740,
+      "literal": "function B"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3746,
+      "literal": "trigger-busy"
+    },
+    {
+      "file": "test_console.js",
+      "line": 4810,
+      "literal": "const ACTIONS = "
+    },
+    {
+      "file": "test_console.js",
+      "line": 4811,
+      "literal": "const entryFile = "
+    },
+    {
+      "file": "test_console.js",
+      "line": 7111,
+      "literal": "childEnv.XBK_CACHE_DIR = cacheDir"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7114,
+      "literal": "const stopDir = historyDir()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7115,
+      "literal": "const historyDir = () => {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7116,
+      "literal": "const stopDir = runtimeCacheDir() || stateDir"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7117,
+      "literal": "CANCEL 控制台停止：任务 #"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7118,
+      "literal": "ERROR 控制台停止：任务 #"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8225,
+      "literal": "***"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8271,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8272,
+      "literal": "// ── 组件：逐轮运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8288,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8289,
+      "literal": "// ── 组件：逐轮运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8329,
+      "literal": "function fmtTime"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8330,
+      "literal": "function fmtNum"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8339,
+      "literal": "function CategoryPicker ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 8340,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8341,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8349,
+      "literal": "function buildCateTree"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8350,
+      "literal": "function flatCateLeaves"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8353,
+      "literal": "setPath(o.node.path)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8354,
+      "literal": "path.length === 0 ? [{ key"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8361,
+      "literal": "if (tab !== 'overview' && tab !== 'logs') return () => clearInterval(timerRef.current)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8363,
+      "literal": "if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8365,
+      "literal": "if (!active || justActivated || !(pollTick > 0) || busyRef.current) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8377,
+      "literal": "function "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8378,
+      "literal": "\\nfunction "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8384,
+      "literal": "if (dirtyRef.current) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8390,
+      "literal": "function usePollReload"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8391,
+      "literal": "// 面板侧：当前页签激活时订阅全局下拉刷新"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8398,
+      "literal": "function FilterRules ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 8399,
+      "literal": "function ChannelList ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 8402,
+      "literal": "function ConfigPanel "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8403,
+      "literal": "function App "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8410,
+      "literal": "function FilterRules "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8411,
+      "literal": "function ChannelList "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8416,
+      "literal": "function ConfigPanel "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8576,
+      "literal": "function Drawer ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 8578,
+      "literal": "\\n}\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8605,
+      "literal": "{"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8643,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8643,
+      "literal": "// 运行日志："
+    },
+    {
+      "file": "test_console.js",
+      "line": 8684,
+      "literal": "function ConfirmDialog"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8685,
+      "literal": "if (action === 'run' || action === 'notify-test') askConfirm(action)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8687,
+      "literal": "cls: 'btn-danger-solid'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8688,
+      "literal": "role=\"dialog\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 8688,
+      "literal": "aria-modal=\"true\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 8691,
+      "literal": "el.showModal()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8691,
+      "literal": "if (el.open) el.close()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8694,
+      "literal": "defaultFocus"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8694,
+      "literal": "fallbackRef.current"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8694,
+      "literal": "fallbackRef: cancelRef"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8696,
+      "literal": "function AlertBanner"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8697,
+      "literal": "state.stats.status === 'ok'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8698,
+      "literal": "成功率"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8699,
+      "literal": "label: '今天'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8699,
+      "literal": "label: '近 7 天'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8700,
+      "literal": "initialMode"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8700,
+      "literal": "initialQuery"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8701,
+      "literal": "window.addEventListener('hashchange'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8702,
+      "literal": "document.title ="
+    },
+    {
+      "file": "test_console.js",
+      "line": 8703,
+      "literal": "function AutoRefreshText ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 8705,
+      "literal": "filterRunItems"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8706,
+      "literal": "首轮前正常"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8722,
+      "literal": "const askConfirm = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8723,
+      "literal": "const channelText"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8735,
+      "literal": "function TriggerBar"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8735,
+      "literal": "// ── 组件：运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8795,
+      "literal": "${!authExpired && visited.has('overview') && html`<section class=\\\"page\\\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 8796,
+      "literal": "${!authExpired && visited.has('messages')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8865,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8865,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8869,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8869,
+      "literal": "// ── 组件：逐轮运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8874,
+      "literal": "const runTick = useCallback("
+    },
+    {
+      "file": "test_console.js",
+      "line": 8875,
+      "literal": "const runTickRef = useRef(runTick)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8877,
+      "literal": "const interval = pollIntervalFor({ sseUp"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8878,
+      "literal": "}, [refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8888,
+      "literal": "const scrollMemRef = useRef({})"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8888,
+      "literal": "// 标签栏是单行横滚"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8889,
+      "literal": "const doSwitchTab = "
+    },
+    {
+      "file": "test_console.js",
+      "line": 8889,
+      "literal": "const openLog = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8905,
+      "literal": "const renderTab = (next) =>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8905,
+      "literal": "renderTabRef.current = renderTab"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8934,
+      "literal": "const syncFor = useMemo"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8934,
+      "literal": "// 系统页由两个面板组成"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8938,
+      "literal": "const markSysReady"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8938,
+      "literal": "const onSysReady"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8945,
+      "literal": "window.addEventListener('hashchange'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8948,
+      "literal": "const openLog ="
+    },
+    {
+      "file": "test_console.js",
+      "line": 8948,
+      "literal": "const pollMs ="
+    },
+    {
+      "file": "test_console.js",
+      "line": 8950,
+      "literal": "const loadSeqRef = useRef(0)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8951,
+      "literal": "if (seq !== loadSeqRef.current || !mountedRef.current) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8953,
+      "literal": "useEffect(() => { setPanelSync(null) }, [tab])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8955,
+      "literal": "const at = lastSync ? fmtBarTime(lastSync, showDate) : '—'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8959,
+      "literal": "if (typeof onSync === 'function' && configAt && filterAt) onSync(Math.max(configAt, filterAt))"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8961,
+      "literal": "function ConfigPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8961,
+      "literal": "// ── 过滤规则（v3.310）"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8963,
+      "literal": "if (sysReady && accessReady && typeof onReady"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8964,
+      "literal": "onReady=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8964,
+      "literal": "onReady=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8966,
+      "literal": "prepareScrollRef.current(next)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8967,
+      "literal": "window.history.scrollRestoration = 'manual'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8968,
+      "literal": "prepareScrollRef.current('logs', { forceTop: true })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8969,
+      "literal": "onClick=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8972,
+      "literal": "setLogJump(null)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8988,
+      "literal": "<span class=\"name\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8995,
+      "literal": "<span class=\"sync-meta\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8999,
+      "literal": "class=\"sync\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 9000,
+      "literal": "</div>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9001,
+      "literal": "class=\"sync-fail\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 9002,
+      "literal": "</header>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9013,
+      "literal": "tabsRef"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9013,
+      "literal": "querySelector('.tab-btn.active')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9015,
+      "literal": "window.addEventListener('resize', adjust)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9015,
+      "literal": "new window.ResizeObserver(adjust)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9017,
+      "literal": "function CacheHealthPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9017,
+      "literal": "// 推送记录："
+    },
+    {
+      "file": "test_console.js",
+      "line": 9080,
+      "literal": "const [visited, setVisited] = useState(() => new Set(["
+    },
+    {
+      "file": "test_console.js",
+      "line": 9082,
+      "literal": "const next = new Set(visitedRef.current)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9083,
+      "literal": "visitedRef.current = next"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9083,
+      "literal": "setVisited(next)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9085,
+      "literal": "visitedRef.current.add(key)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9086,
+      "literal": "next.add(key)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9087,
+      "literal": "for (const t of TABS) markVisited(t.key)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9089,
+      "literal": "markVisited(next)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9089,
+      "literal": "markVisited('logs')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9092,
+      "literal": "if (!firstVisit)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9092,
+      "literal": "window.scrollTo(0, Math.min(y, maxScroll))"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9094,
+      "literal": "if (firstVisit && target > 0) holdScroll(target)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9096,
+      "literal": "if (logJumpPendingRef.current) {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9096,
+      "literal": "const y = pendingScrollRef.current"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9102,
+      "literal": "autoRefresh && tab === 'overview' ? pollMs : 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9103,
+      "literal": "autoRefresh && tab === 'logs' ? pollMs : 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9104,
+      "literal": "autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9105,
+      "literal": "if (!autoOn || tab !== 'overview') return undefined"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9106,
+      "literal": "paused=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9107,
+      "literal": "if (openId === null || !active) return undefined"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9115,
+      "literal": "<$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9116,
+      "literal": "active=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9117,
+      "literal": "<$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9118,
+      "literal": "<$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9119,
+      "literal": "active=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9120,
+      "literal": "<$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9121,
+      "literal": "<$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9122,
+      "literal": "<$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9123,
+      "literal": "function FilterRulesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9123,
+      "literal": "function App ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9126,
+      "literal": "function "
+    },
+    {
+      "file": "test_console.js",
+      "line": 9135,
+      "literal": "function usePanelAutoLoad"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9135,
+      "literal": "// ── 下拉刷新"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9145,
+      "literal": "return once('files', () =>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9145,
+      "literal": "return once('filter', () =>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9147,
+      "literal": "function once (key, fn)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9147,
+      "literal": "function apiGetFiles"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9157,
+      "literal": "const [titleId] = useState(() => `confirm-title-$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9158,
+      "literal": "aria-labelledby=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9158,
+      "literal": "id=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9216,
+      "literal": "const AUTO_MIN_S = 3"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9216,
+      "literal": "const AUTO_MAX_S = 20"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9218,
+      "literal": "Math.min(AUTO_MAX_S"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9218,
+      "literal": "Math.max(AUTO_MIN_S"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9311,
+      "literal": "function TriggerBar"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9311,
+      "literal": "// ── 组件：运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9324,
+      "literal": "const startAuto ="
+    },
+    {
+      "file": "test_console.js",
+      "line": 9324,
+      "literal": "// v3.297 标签页状态"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9329,
+      "literal": "function apiGetAuto"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9329,
+      "literal": "fetch('/api/auto'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9337,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9337,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9337,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9345,
+      "literal": "function CategoryPicker"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9345,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9345,
+      "literal": "function CategoryPicker"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9348,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9348,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9348,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9358,
+      "literal": "const partial"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9359,
+      "literal": "r.left < base && r.right > base"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9362,
+      "literal": "const scrollRef = useRef(null)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9367,
+      "literal": "const schedule = () => { if (raf === 0)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9367,
+      "literal": "const schedule = () => { if (raf === 0)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9370,
+      "literal": "new window.ResizeObserver"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9372,
+      "literal": "formPauseUntilRef.current"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9373,
+      "literal": "const ae = document.activeElement"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9375,
+      "literal": "if (!(pollMs > 0)) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9376,
+      "literal": "if (!openActive) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9378,
+      "literal": "runsState"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9378,
+      "literal": "触发历史加载中"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9397,
+      "literal": "function MiniSelect ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 9398,
+      "literal": "// 指标卡"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9422,
+      "literal": "from './floating-ui.module.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9424,
+      "literal": "ariaLabel=\"回滚目标\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 9425,
+      "literal": "fr-select"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9432,
+      "literal": "function CategoryPicker ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 9433,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9526,
+      "literal": "function BackToTop ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9527,
+      "literal": "function App () {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9531,
+      "literal": "html`<"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9736,
+      "literal": "runViewTransition("
+    },
+    {
+      "file": "test_console.js",
+      "line": 9741,
+      "literal": "renderTab(next)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9741,
+      "literal": "renderTabRef.current(next)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9743,
+      "literal": "if (!root || viaTransition) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9834,
+      "literal": "function Hint ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 9835,
+      "literal": "function Card ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 9836,
+      "literal": "class=\"hint"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9902,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9902,
+      "literal": "// 运行日志："
+    },
+    {
+      "file": "test_console.js",
+      "line": 9909,
+      "literal": "const MSG_HIT_MAX = 200"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9933,
+      "literal": "if (dialog.kind === 'save')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9934,
+      "literal": "if (dialog.kind === 'corrupt')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9969,
+      "literal": "const closeDialog = () => {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9971,
+      "literal": "\\n  }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9978,
+      "literal": "function LeaveGuardDialog"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9979,
+      "literal": "// ── 组件：右侧抽屉"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9995,
+      "literal": "visited.has('logs')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9995,
+      "literal": "visited.has('config')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10003,
+      "literal": "class="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10004,
+      "literal": "class=\"log-virt\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 10004,
+      "literal": "style="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10009,
+      "literal": "splitHits(line, kw)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10010,
+      "literal": "html`<mark key="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10016,
+      "literal": "const LOG_HIGHLIGHT_MAX = 3000"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10017,
+      "literal": "const heavy = ranged.length > LOG_HIGHLIGHT_MAX"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10019,
+      "literal": "count: heavy ? 0 : ranged.length"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10020,
+      "literal": "enabled: !heavy"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10021,
+      "literal": "if (!heavy) {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10021,
+      "literal": "virtItems.map((it) =>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10023,
+      "literal": "ranged.map((line, i) =>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10024,
+      "literal": "已关闭高亮"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10027,
+      "literal": "useLayoutEffect(() => virt._didMount(), [])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10027,
+      "literal": "virt._willUpdate()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10029,
+      "literal": "ref="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10030,
+      "literal": "import { Virtualizer, elementScroll, observeElementOffset, observeElementRect } from './virtual-core.module.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10032,
+      "literal": "const VIRT_ADAPTER = { observeElementRect, observeElementOffset, scrollToFn: elementScroll }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10035,
+      "literal": "筛选下 · 显示 "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10037,
+      "literal": "在全部日志中搜索"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10037,
+      "literal": "onClick="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10039,
+      "literal": "在「"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10040,
+      "literal": "const searchAllLogs = () => {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10040,
+      "literal": "// 只渲染可视窗口"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10042,
+      "literal": "分类可重叠"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10048,
+      "literal": "const openLog = useCallback((jump) => {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10049,
+      "literal": "}, [markVisited])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10059,
+      "literal": "logJumpSeqRef.current++"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10061,
+      "literal": "function usePanelLoader"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10061,
+      "literal": "function usePanelAutoLoad"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10063,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10063,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10072,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10072,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10081,
+      "literal": "function AlertBanner"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10081,
+      "literal": "// ── 组件：状态卡片区"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10090,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10090,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10093,
+      "literal": "const openLog = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10094,
+      "literal": "}, [markVisited])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10097,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10097,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10102,
+      "literal": "focusAt=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10103,
+      "literal": "focusDate=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10112,
+      "literal": "const bottomAfter = line.getBoundingClientRect().bottom - (y - startY)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10113,
+      "literal": "y += bottomAfter - (vh - 12)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10143,
+      "literal": "data-edge="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10144,
+      "literal": "bar.scrollWidth - bar.clientWidth"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10145,
+      "literal": "left && right ? 'both' : left ? 'left' : right ? 'right' : ''"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10146,
+      "literal": "el.scrollIntoView({ inline: 'nearest', block: 'nearest', preventScroll: true })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10160,
+      "literal": "from './motion.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10161,
+      "literal": "from './motion-lib.module.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10175,
+      "literal": "auto-animate"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10178,
+      "literal": "data-mk=$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10196,
+      "literal": "{ transform: false, duration: MOTION.fast }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10198,
+      "literal": "useRevealWhen(ref, !busy && cards.length > 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10209,
+      "literal": "import flatpickr from './flatpickr.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10211,
+      "literal": "mode: 'range'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10211,
+      "literal": "disableMobile: true"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10212,
+      "literal": "dates.length !== 2"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10213,
+      "literal": "str.split(' to ')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10214,
+      "literal": "maxDate: todayKeyShanghai()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10215,
+      "literal": "showMonths: 1"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10216,
+      "literal": "monthSelectorType: 'static'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10219,
+      "literal": "fp-year-step"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10227,
+      "literal": "function attachMonthHoldRepeat"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10227,
+      "literal": "onReady (_sel, _str, inst) { attachMonthHoldRepeat(inst) }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10229,
+      "literal": "flatpickr-disabled"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10243,
+      "literal": "type=\"date\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 10277,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10277,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10278,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10278,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10287,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10287,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10302,
+      "literal": "// ── 触发结果行"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10302,
+      "literal": "// ── 组件：运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10308,
+      "literal": "setLastTrigger({ id: runId"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10309,
+      "literal": "runs="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10318,
+      "literal": "setLastTrigger({ id: String(e.replayRunId)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10326,
+      "literal": "Object.prototype.hasOwnProperty.call"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10329,
+      "literal": "function filterDraftAgeText"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10330,
+      "literal": "fmtAge(Date.now() - Number(saved.savedAt))"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10334,
+      "literal": "function copyViaTextarea"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10335,
+      "literal": "function TwoFactorBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10347,
+      "literal": "const copyText = async (text) => {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10348,
+      "literal": "const secretGroups ="
+    },
+    {
+      "file": "test_console.js",
+      "line": 10356,
+      "literal": "function BackupBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10357,
+      "literal": "function TwoFactorBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10391,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10391,
+      "literal": "function FilesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10427,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10427,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10437,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10437,
+      "literal": "function FilesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10459,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10459,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10480,
+      "literal": "function FilterRulesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10480,
+      "literal": "function App ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10506,
+      "literal": "function listLandTarget"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10508,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10515,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10515,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10516,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10516,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10597,
+      "literal": "function usePanelLoader"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10597,
+      "literal": "function usePanelAutoLoad"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10607,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10607,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10633,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10633,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10649,
+      "literal": "function CategoryPicker"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10649,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10654,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10654,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10671,
+      "literal": "window.addEventListener('touchmove', mark"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10700,
+      "literal": "function fmtBarTime (ts, withDate)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10708,
+      "literal": "const syncAt = tab === 'overview' ? lastSync : panelSync"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10710,
+      "literal": "fmtBarTime(lastSync, showDate)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10715,
+      "literal": "点一下可看完整日期"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10715,
+      "literal": "点一下仍可看完整日期"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10724,
+      "literal": "setInterval(() => setNowMs(() => Date.now()), 500)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10727,
+      "literal": "body.settings.syncShowDate"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10729,
+      "literal": "typeof body.settings.syncShowDate !== \\'boolean\\'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10730,
+      "literal": "if (rev < uiSettingsRevRef.current) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10734,
+      "literal": "function ConsoleSettingsBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10735,
+      "literal": "// 系统信息：版本"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10756,
+      "literal": "function TapTip ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 10757,
+      "literal": "// 提示行："
+    },
+    {
+      "file": "test_console.js",
+      "line": 10785,
+      "literal": "数据截至："
+    },
+    {
+      "file": "test_console.js",
+      "line": 10785,
+      "literal": "fmtWeekday(syncAt)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10791,
+      "literal": "def.kind === \\'days\\'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10792,
+      "literal": ": html`<textarea"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10796,
+      "literal": "支持「分类###天数」多行写法"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10802,
+      "literal": "function TriggerBar"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10802,
+      "literal": "// ── 组件：运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10803,
+      "literal": "function ConsoleSettingsBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10804,
+      "literal": "// 系统信息：版本"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10810,
+      "literal": "function useHoldRepeat"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10810,
+      "literal": "HOLD_START_MS"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10810,
+      "literal": "HOLD_REPEAT_MS"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10825,
+      "literal": "function apiGetConsoleSettings ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10826,
+      "literal": "function apiPostConsoleSettings (body)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10833,
+      "literal": "async function triggerNotifyTest"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10833,
+      "literal": "function Badge ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 10839,
+      "literal": "typeof dupMsg === \\'function\\' ? dupMsg(data) : dupMsg"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10848,
+      "literal": "function ConsoleSettingsBlock"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10849,
+      "literal": "// 系统信息：版本"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10864,
+      "literal": "function ConfigPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10865,
+      "literal": "// ── 过滤规则（v3.310）"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10870,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10871,
+      "literal": "\\nfunction "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10882,
+      "literal": "const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10883,
+      "literal": "FILTER_DRAFT_SAVE_DELAY = 500"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10884,
+      "literal": "FILTER_DRAFT_SERVER_DELAY = 1500"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10885,
+      "literal": "localStorage.setItem(FILTER_DRAFT_KEY"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10886,
+      "literal": "localStorage.removeItem(FILTER_DRAFT_KEY)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10887,
+      "literal": "window.addEventListener('pagehide'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10888,
+      "literal": "document.addEventListener('visibilitychange'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10889,
+      "literal": "apiGetFilterDraft"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10890,
+      "literal": "apiPostFilterDraft"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10891,
+      "literal": "apiDeleteFilterDraft"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10892,
+      "literal": "filterDraftFromServer"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10893,
+      "literal": "clearServerDraft()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10894,
+      "literal": "已恢复上次未保存的草稿"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10895,
+      "literal": "草稿已自动保存"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10896,
+      "literal": "setTimeout(saveDraftNow, FILTER_DRAFT_SAVE_DELAY)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10897,
+      "literal": "draftPushChainRef"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10898,
+      "literal": "await draftPushChainRef.current"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10899,
+      "literal": "setInterval(() => { if (dirtyRef.current) pushDraftNow().catch(() => {}) }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10900,
+      "literal": "reloadNow"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10905,
+      "literal": "function LeaveGuardDialog"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10906,
+      "literal": "点「不保存并离开」会丢掉这些修改"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10907,
+      "literal": "现在离开，这些修改会丢"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10908,
+      "literal": "保存并继续"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10909,
+      "literal": "beginGuardSave"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10910,
+      "literal": "const beginGuardSave"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10910,
+      "literal": "submitSave({ filter: candidate"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10911,
+      "literal": "settleSaveResult(true)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10912,
+      "literal": "leaveSavingRef"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10913,
+      "literal": "const closeLeaveRequest = "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10913,
+      "literal": "// 「查看日志」跳转"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10919,
+      "literal": "window.addEventListener('beforeunload'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10920,
+      "literal": "const onBeforeUnload = "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10920,
+      "literal": "window.addEventListener('beforeunload'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10923,
+      "literal": "window.addEventListener('popstate'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10924,
+      "literal": "__xbkFilterGuard"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10925,
+      "literal": "source: 'tab'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10925,
+      "literal": "source: 'hash'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10925,
+      "literal": "source: 'history'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10927,
+      "literal": "onLeaveRequestRef.current"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10928,
+      "literal": "guardRef"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10929,
+      "literal": "const switchTab = "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10929,
+      "literal": "const openLog = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10932,
+      "literal": "放弃草稿并回滚"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10933,
+      "literal": "复制代码默认会把这些修改覆盖掉"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10944,
+      "literal": "function usePullToRefresh"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10945,
+      "literal": "window.addEventListener('touchstart', onStart, { passive: true })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10946,
+      "literal": "window.addEventListener('touchcancel', onCancel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10947,
+      "literal": "const onCancel = () => { stop(); idle() }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10948,
+      "literal": "if (!t || t.length !== 1) { r.lock = true; stop(); idle(); return }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10949,
+      "literal": "const PULL_TRIGGER = 56"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10949,
+      "literal": "dy * 0.5"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10951,
+      "literal": "const inScrolled = (touch)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10951,
+      "literal": "const onStart = (e)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10954,
+      "literal": "'下拉刷新'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10954,
+      "literal": "'松开刷新'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10954,
+      "literal": "'正在刷新…'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10955,
+      "literal": "function PullRefreshStatus"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10956,
+      "literal": "PullRefreshBar"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10956,
+      "literal": "class=\"ptr "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10958,
+      "literal": "class=\"sync\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 10958,
+      "literal": "class=\"sync\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 10960,
+      "literal": "syncRef.current.scrollLeft = 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10963,
+      "literal": "function "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10964,
+      "literal": "\\nfunction "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10968,
+      "literal": "function FilterRulesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10968,
+      "literal": "\\nfunction "
+    },
+    {
+      "file": "test_console.js",
+      "line": 10968,
+      "literal": "function FilterRulesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10973,
+      "literal": "Promise.allSettled([load(), loadAccess(), loadSettings()])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10974,
+      "literal": "idleWaitersRef"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10975,
+      "literal": "window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10976,
+      "literal": "if (detail.waits.length === 0) return false"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10977,
+      "literal": "Promise.resolve().then(onRefresh).then(settle"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10978,
+      "literal": "refreshSplit(force ? { force: true } : undefined)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10978,
+      "literal": "refreshActive({ force: true })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10979,
+      "literal": "Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10981,
+      "literal": "const VISIBLE_REFRESH_GAP_MS = 2000"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10982,
+      "literal": "// 回到前台：隐藏期间所有轮询都停了"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10982,
+      "literal": "const pull = usePullToRefresh"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10986,
+      "literal": "const refreshActive = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10986,
+      "literal": "const pullRefresh = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10993,
+      "literal": "if (seq > autoLandedRef.current"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10996,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10996,
+      "literal": "function ConfigPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10998,
+      "literal": "function CacheHealthPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10998,
+      "literal": "function FilesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11001,
+      "literal": "function usePullToRefresh"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11001,
+      "literal": "function PullRefreshStatus"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11002,
+      "literal": "const pullRefresh = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11002,
+      "literal": "const pull = usePullToRefresh"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11008,
+      "literal": "function useSlowFlag (on, delay = 600)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11010,
+      "literal": "function useSlowFlag"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11010,
+      "literal": "// 趋势天数选择器固定选项"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11013,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11013,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11033,
+      "literal": "function PanelSkeleton ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 11037,
+      "literal": "function loadErrorText"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11037,
+      "literal": "function usePanelLoader"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11042,
+      "literal": "class=\"retry-btn\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 11044,
+      "literal": "刷新中…' : '刷新'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11046,
+      "literal": "slowLoading && html`<span class=\"fr-status-muted\">刷新中…</span>`"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11070,
+      "literal": "version: typeof data.version === 'string' ? data.version : ''"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11071,
+      "literal": "const VERSION_CHECK_MS = 60000"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11073,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11073,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11086,
+      "literal": "if (stopped || document.visibilityState === 'hidden') return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11087,
+      "literal": "const bootVersion = BOOT.version"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11088,
+      "literal": "if (!bootVersion || authExpired) return undefined"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11089,
+      "literal": "}, [authExpired])"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11090,
+      "literal": "if (stopped || mine < done) return"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11091,
+      "literal": "setNewVersion(v !== '' && v !== bootVersion ? v : '')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11094,
+      "literal": "probeVersion ? { cache: \\'no-store\\' } : {}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11095,
+      "literal": "fetch(probeVersion ? '/api/sys?probe=version' : '/api/sys', merged)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11098,
+      "literal": "$"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11100,
+      "literal": "控制台已更新到 "
+    },
+    {
+      "file": "test_console.js",
+      "line": 11101,
+      "literal": "onClick="
+    },
+    {
+      "file": "test_console.js",
+      "line": 11102,
+      "literal": "const bootVersion = BOOT.version"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11103,
+      "literal": "}, [authExpired]"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11113,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11113,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11159,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11160,
+      "literal": "// v3.342：控制台设置块"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11750,
+      "literal": "res.status === 304"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11752,
+      "literal": "addConditional(merged, \\'runs\\')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11753,
+      "literal": "addConditional(merged, \\'auto\\')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11754,
+      "literal": "addConditional(merged, condKey)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11756,
+      "literal": "COND_CACHE_MAX = 16"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11756,
+      "literal": "rememberConditional("
+    },
+    {
+      "file": "test_console.js",
+      "line": 11759,
+      "literal": "conditionalRequest("
+    },
+    {
+      "file": "test_console.js",
+      "line": 11762,
+      "literal": "typeof retry === \\'function\\'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11763,
+      "literal": "const again = attempt(false)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11765,
+      "literal": "function apiGetMessages"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11765,
+      "literal": "function apiGetTrends"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11767,
+      "literal": "streamErrors <= 3"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11768,
+      "literal": "const SNAP_KEY"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11769,
+      "literal": "const THEMES = ["
+    },
+    {
+      "file": "test_console.js",
+      "line": 11773,
+      "literal": "instance: typeof data.instance === 'string'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11786,
+      "literal": "function TriggerBar"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11787,
+      "literal": "// ── 组件：运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11836,
+      "literal": "function Hint ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 11837,
+      "literal": "function Reveal ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 11861,
+      "literal": "function DateRange ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 11862,
+      "literal": "// 按区间过滤"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11887,
+      "literal": "function bindEscClose"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11889,
+      "literal": "\\n}\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11898,
+      "literal": "function RunsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11899,
+      "literal": "// ── 组件：逐轮运行历史"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11925,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11926,
+      "literal": "function SysPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11945,
+      "literal": "function MessagesPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11946,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11972,
+      "literal": "function SearchPanel "
+    },
+    {
+      "file": "test_console.js",
+      "line": 11973,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11985,
+      "literal": "function RunHistoryPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11986,
+      "literal": "// ── 组件：整体"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12036,
+      "literal": "function SearchPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12036,
+      "literal": "function LogsPanel"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12254,
+      "literal": "function msgFilterKey"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12254,
+      "literal": "function buildMessagesHash"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12388,
+      "literal": "加载失败："
+    },
+    {
+      "file": "test_console.js",
+      "line": 12388,
+      "literal": "loadErrorText(e)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12467,
+      "literal": "与列表并排做对照"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12468,
+      "literal": "列表留在背后做对照"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12469,
+      "literal": "但被遮罩压暗、不算并排对照"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12470,
+      "literal": "桌面从右侧占 520px，手机铺满整屏"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12628,
+      "literal": "apiSearchLines, AUTH_HEADER, timedRequest"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2412,
+      "literal": "\"action\":\"save\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 6395,
+      "literal": "🐮"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2009,
+      "literal": "buildSaveCandidateOf(override, dirtyFields, draft, FILTER_FIELD_NAMES)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2884,
+      "literal": "res.ok"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2884,
+      "literal": "backupImportProblem(res)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2886,
+      "literal": "backupImportProblem(res)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2888,
+      "literal": "setPending(null)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3210,
+      "literal": "十月稻田五常香米5kg 20.85元"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3211,
+      "literal": "/haodan/7305598.html"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3262,
+      "literal": "价格：¥15"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3263,
+      "literal": "少部分地区有货"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3265,
+      "literal": "原文链接：https://x/1"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3297,
+      "literal": "/haodan/7303544.html"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3298,
+      "literal": "/haodan/7305598.html"
+    },
+    {
+      "file": "test_console.js",
+      "line": 3406,
+      "literal": "原文链接："
+    },
+    {
+      "file": "test_console.js",
+      "line": 3407,
+      "literal": "收藏文章"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7229,
+      "literal": "autoRunOutcome(record)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7230,
+      "literal": "outcome === 'busy'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7230,
+      "literal": "auto.busyRuns"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7247,
+      "literal": "auto.fails = 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7247,
+      "literal": "auto.degraded = false"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9270,
+      "literal": "disposeAuto()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9270,
+      "literal": "killAll()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10450,
+      "literal": "暂无访问记录"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10451,
+      "literal": "<table class=\"sys-table\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10452,
+      "literal": "读取中…"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10965,
+      "literal": "usePullRefresh("
+    },
+    {
+      "file": "test_console.js",
+      "line": 12073,
+      "literal": "tone:"
+    },
+    {
+      "file": "test_console.js",
+      "line": 1434,
+      "literal": "\\n\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2130,
+      "literal": "审计敏感词"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6501,
+      "literal": "event: done"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6503,
+      "literal": "event: done"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6694,
+      "literal": "event: done"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2586,
+      "literal": "生效 rev "
+    },
+    {
+      "file": "test_console.js",
+      "line": 2587,
+      "literal": "下一轮生效"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9747,
+      "literal": "export function runViewTransition"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9748,
+      "literal": "// 配置页「过滤规则」块的数据口径"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2880,
+      "literal": "const doImport = async () =>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2881,
+      "literal": "return html`<div class=\"cfg-block backup-block\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9258,
+      "literal": "server.on('close'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9260,
+      "literal": "=>"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9261,
+      "literal": "{"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12381,
+      "literal": "logBgFailure(\\'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7250,
+      "literal": "autoRunOutcome"
+    },
+    {
+      "file": "test_console.js",
+      "line": 7250,
+      "literal": "auto.busyRuns"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9230,
+      "literal": "const AUTO_MIN_S = 3"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9230,
+      "literal": "const AUTO_MAX_S = 20"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9233,
+      "literal": "const AUTO_MAX_FAILS = 12"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9233,
+      "literal": "const AUTO_RETRY_MS = 10 * 1000"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9234,
+      "literal": "startAction('run-auto'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9238,
+      "literal": "activeChildren.size > 0"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9238,
+      "literal": "autoInFlightId"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9240,
+      "literal": "AUTO_STATE_FILE"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9240,
+      "literal": "persistAuto"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9243,
+      "literal": "function autoNextDelay"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9249,
+      "literal": "degraded: auto.degraded === true"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9250,
+      "literal": "fails: Number.isInteger(auto.fails)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9254,
+      "literal": "AUTO_MAX_MS"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9291,
+      "literal": "AUTO_MIN_S"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9291,
+      "literal": "AUTO_MAX_S"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9292,
+      "literal": "clampAutoSeconds"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9294,
+      "literal": "AUTO_MAX_FAILS"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9304,
+      "literal": "AUTO_STATE_FILE"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9304,
+      "literal": "persistAuto"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9306,
+      "literal": "AUTO_MAX_MS"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9307,
+      "literal": "disposeAuto"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9307,
+      "literal": "killAll"
+    },
+    {
+      "file": "test_console.js",
+      "line": 1437,
+      "literal": ":"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6976,
+      "literal": "  // 全站 SSE 通知（v3.374）"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6976,
+      "literal": "  // 轮询节奏（Sourcery vvJ）"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6983,
+      "literal": "  // 轮询节奏（Sourcery vvJ）"
+    },
+    {
+      "file": "test_console.js",
+      "line": 6983,
+      "literal": "  // hash 路由"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11727,
+      "literal": "class ErrorBoundary extends Component"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11729,
+      "literal": "function App ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11737,
+      "literal": "export { App, ErrorBoundary }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11742,
+      "literal": "getDerivedStateFromError"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11811,
+      "literal": "const refreshAuto = useCallback"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11812,
+      "literal": "// 下拉刷新"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8746,
+      "literal": "@layer base"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8746,
+      "literal": "@layer components"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8760,
+      "literal": "@media (hover: none)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8762,
+      "literal": "\\n  }"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9003,
+      "literal": ".sync-fail {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9331,
+      "literal": ".auto-run"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9331,
+      "literal": ".auto-input"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9331,
+      "literal": ".auto-step"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9469,
+      "literal": "/* 分类筛选：手机端贴底弹层"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9700,
+      "literal": "::view-transition-old(root)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9700,
+      "literal": "::view-transition-new(root)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9728,
+      "literal": "@media (prefers-reduced-motion: reduce)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9728,
+      "literal": "::view-transition-old(root)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9806,
+      "literal": ".badge-ok::before"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10121,
+      "literal": ".logline-focus"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10123,
+      "literal": ".log-focus"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10123,
+      "literal": ".log-focus-time"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10747,
+      "literal": ".set-toggle input[type=\"checkbox\"]"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10748,
+      "literal": "accent-color: var(--accent)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10775,
+      "literal": ".tap-tip-pop {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10775,
+      "literal": "}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10775,
+      "literal": ".tap-tip-pop {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10778,
+      "literal": ".tap-tip {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10778,
+      "literal": "}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10778,
+      "literal": ".tap-tip {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10780,
+      "literal": ".tap-tip-date .sync-sec"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10818,
+      "literal": "touch-action: none"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10818,
+      "literal": ".auto-input:disabled"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11082,
+      "literal": ".ver-check {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11082,
+      "literal": ".ver-check.ok {"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11149,
+      "literal": ".log-chip[aria-busy=\"true\"]"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11149,
+      "literal": ".log-chip-n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11745,
+      "literal": ".err-boundary-detail"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12079,
+      "literal": ".hint-warn"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12398,
+      "literal": "{"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8654,
+      "literal": ".msg-content"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8655,
+      "literal": ".msg-caret"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8840,
+      "literal": "function StatusCards"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8840,
+      "literal": "// ── 组件：触发按钮"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12076,
+      "literal": "function Hint ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 12076,
+      "literal": "// 入场包装"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12103,
+      "literal": "function StatusCards"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12103,
+      "literal": "// ── 组件：触发按钮"
+    },
+    {
+      "file": "test_console.js",
+      "line": 8849,
+      "literal": "// 标题状态点"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12589,
+      "literal": "const TABS = TAB_KEYS.map((key) => ({ key, label: TAB_LABELS[key] }))"
+    },
+    {
+      "file": "test_console.js",
+      "line": 12645,
+      "literal": "${quietErrs.length > 0 && html`<div class=\"sync-fail sync-fail-quiet\" role=\"status\">"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9056,
+      "literal": "上限 48MB"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9486,
+      "literal": "function stickyPad ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9487,
+      "literal": "\\n}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9501,
+      "literal": "function scrollIntoBox (el, box)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9503,
+      "literal": "\\n}"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9508,
+      "literal": "scrollDeltaInto } from './pure.mjs'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9510,
+      "literal": "function MiniSelect ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 9511,
+      "literal": "// 指标卡"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9755,
+      "literal": "startViewTransition"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11739,
+      "literal": "import { App, ErrorBoundary } from './ui.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11740,
+      "literal": "render(html`<"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2571,
+      "literal": "无法读取推送历史，本次不显示补推估算"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2572,
+      "literal": "preview.available === false"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2573,
+      "literal": "confirm: true,\\n        baseRevision"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2574,
+      "literal": "kind: 'restore', to: restoreTo, baseRevision: revision"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2575,
+      "literal": "恢复代码默认（删除覆盖文件）"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2576,
+      "literal": "写入空覆盖文件"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2579,
+      "literal": "effectiveFilterRows"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2581,
+      "literal": "const filterRows = r ? effectiveFilterRows(r.filter, effFilter) : []"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2582,
+      "literal": "const effLive = effErr ? null : eff"
+    },
+    {
+      "file": "test_console.js",
+      "line": 2583,
+      "literal": "rows="
+    },
+    {
+      "file": "test_console.js",
+      "line": 2584,
+      "literal": "class=\"rule-src\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 7052,
+      "literal": "function MiniSelect ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 7071,
+      "literal": "function AutoRefreshText ("
+    },
+    {
+      "file": "test_console.js",
+      "line": 7072,
+      "literal": "setNowMs(Date.now())"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9774,
+      "literal": "morphFrom(src, r)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9792,
+      "literal": "setAttribute('data-theme', key)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9793,
+      "literal": "document.cookie = THEME_COOKIE + '=' + key"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9794,
+      "literal": "切换主题（当前 "
+    },
+    {
+      "file": "test_console.js",
+      "line": 9794,
+      "literal": "title="
+    },
+    {
+      "file": "test_console.js",
+      "line": 9795,
+      "literal": "const shared = readThemeCookie() || currentThemeKey()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9799,
+      "literal": "function Card ({ title, badge, main, children })"
+    },
+    {
+      "file": "test_console.js",
+      "line": 9800,
+      "literal": "class=\"card-num\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 9800,
+      "literal": "class=\"card-unit\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 9813,
+      "literal": "const THEMES = ["
+    },
+    {
+      "file": "test_console.js",
+      "line": 9813,
+      "literal": "function App ()"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10206,
+      "literal": "'/assets/flatpickr.js'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10206,
+      "literal": "'/assets/flatpickr.css'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10208,
+      "literal": "<link rel=\"stylesheet\" href=\""
+    },
+    {
+      "file": "test_console.js",
+      "line": 10163,
+      "literal": "prefers-reduced-motion: reduce"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10169,
+      "literal": "motionAllowed(reduced && reduced.matches)"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10172,
+      "literal": "export function enter"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10172,
+      "literal": "export function reveal"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10175,
+      "literal": "auto-animate"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10180,
+      "literal": "removeProperty('transform')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10180,
+      "literal": "removeProperty('opacity')"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11954,
+      "literal": "export function useFlipList"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11956,
+      "literal": "\\n}\\n"
+    },
+    {
+      "file": "test_console.js",
+      "line": 10327,
+      "literal": "Object.prototype.hasOwnProperty.call"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11477,
+      "literal": "process.on('uncaughtException'"
+    },
+    {
+      "file": "test_console.js",
+      "line": 11883,
+      "literal": "calendarContainer.tabIndex=-1"
+    },
+    {
+      "file": "test_console.js",
+      "line": 510,
+      "literal": "stryMutAct_"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 3744,
+      "literal": "const CACHE_SHARD_ID_RE ="
+    },
+    {
+      "file": "test_filter.js",
+      "line": 3745,
+      "literal": "function buildCacheShard (rawId, root, pathMod) {"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 3217,
+      "literal": "a###1"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 3218,
+      "literal": "b###2"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 5686,
+      "literal": "a###1"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 5687,
+      "literal": "b###2"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 11137,
+      "literal": "_readSimilarWindow (filePath)"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 11139,
+      "literal": "\\n    },"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 11147,
+      "literal": "this._readSimilarWindow(similarPath)"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 6801,
+      "literal": "//"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 6801,
+      "literal": "*"
+    },
+    {
+      "file": "test_filter.js",
+      "line": 6801,
+      "literal": "/*"
+    },
+    {
+      "file": "test_filter_store.js",
+      "line": 101,
+      "literal": "stryMutAct_"
+    },
+    {
+      "file": "test_filter_store.js",
+      "line": 1891,
+      "literal": "probe line"
+    },
+    {
+      "file": "test_filter_store.js",
+      "line": 2171,
+      "literal": "优先沿用进程内上一次合法规则"
+    },
+    {
+      "file": "test_local_mutation_guard.js",
+      "line": 111,
+      "literal": "--mutate"
+    },
+    {
+      "file": "test_local_mutation_guard.js",
+      "line": 115,
+      "literal": "--mutate"
+    },
+    {
+      "file": "test_local_mutation_guard.js",
+      "line": 121,
+      "literal": "mutation-run-guard"
+    },
+    {
+      "file": "test_message_store_journal.js",
+      "line": 663,
+      "literal": "\"FILTERED\""
+    },
+    {
+      "file": "test_message_store_journal.js",
+      "line": 664,
+      "literal": "\"ckpt\":true"
+    },
+    {
+      "file": "test_message_store_journal.js",
+      "line": 786,
+      "literal": "\"b\""
+    },
+    {
+      "file": "test_message_store_journal.js",
+      "line": 394,
+      "literal": "\"a\""
+    },
+    {
+      "file": "test_message_store_utils.js",
+      "line": 3032,
+      "literal": "require('./test-env-isolation')"
+    },
+    {
+      "file": "test_mutation_report_cli.js",
+      "line": 500,
+      "literal": "github.run_started_at"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 24,
+      "literal": "require.main === module"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 26,
+      "literal": "'--notify-test'"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 27,
+      "literal": "runNotifyTest(cliArgs)"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 28,
+      "literal": "runSingleEntry().catch"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 33,
+      "literal": "a.startsWith('--notify-test=')"
+    },
+    {
+      "file": "test_notify_selfcheck.js",
+      "line": 34,
+      "literal": "未识别参数"
+    },
+    {
+      "file": "test_qinglong_utils.js",
+      "line": 132,
+      "literal": "runDryRunOnce(app)"
+    },
+    {
+      "file": "test_qinglong_utils.js",
+      "line": 141,
+      "literal": "runResident(app"
+    },
+    {
+      "file": "test_run_mutation_cli.js",
+      "line": 348,
+      "literal": "g"
+    },
+    {
+      "file": "test_state_schema.js",
+      "line": 495,
+      "literal": "formatRunSummaryLine({"
+    },
+    {
+      "file": "test_storage.js",
+      "line": 1196,
+      "literal": "// ⑧ F1-4："
+    },
+    {
+      "file": "test_storage.js",
+      "line": 1197,
+      "literal": "// ⑧b 正路径不回归"
+    },
+    {
+      "file": "test_storage.js",
+      "line": 1952,
+      "literal": "realpathSync"
+    },
+    {
+      "file": "test_storage.js",
+      "line": 1954,
+      "literal": "isRealPathInside(root, p"
+    },
+    {
+      "file": "test_worker_protocol.js",
+      "line": 117,
+      "literal": "total="
+    }
+  ]
+}

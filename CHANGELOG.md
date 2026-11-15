@@ -1556,3 +1556,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **console 段 dry run 误红的同类根因（v3.440 只修了第一处）**：`test_console.js` 的「M1 对拍」在断言末尾有两处**源码形状**检查（按锚点 `function messagesCacheName (` 切 `scripts/console.js`、`function messagesFileName (` 切 `scripts/status.js`），没走已有的插桩闸 `INSTRUMENTED_SOURCES`。console-part* 段把 `scripts/console.js` 插桩后锚点消失 ⇒ 13 个 console 段全部在 dry run 红。修法：结构断言部分按 `INSTRUMENTED_SOURCES`（console 或 status 任一被插桩即跳过，`skipped++` 如实记账），行为对拍断言照跑。
 - **预检可指向任意目标**：`mutation.yml` 的 `workflow_dispatch` 新增 `preflight_mutate` 输入（默认空 = `xbk_state_schema.js`），配合 `scripts/mutation-preflight.sh` 的 `XBK_PREFLIGHT_MUTATE`，可以先单独验证「某一段的 dry run」再决定是否跑整张矩阵（本次修 console 段就是这么验的）。
 - **版本**：3.440.0 → **3.441.0**。
+
+## v3.442
+
+- **反回归闸（`scripts/check-source-text-asserts.js`）**：扫全部 `test_*.js` 里「变量来自 `readFileSync`/`codeOf` → 对该变量调 `includes`/`indexOf`/`startsWith`/`match(字面量)`」的断言点，与 `scripts/source-text-assert.allowlist.json` 比对，**新增即 exit 1 并点名 `文件:行`**。白名单冻结当前实测 **857 处**（只减不增）；文件头 `count` 必须等于 `items.length`，不等则 **exit 2**（防手删条目却不改计数，让闸门静默放宽）。统计输出按文件分组（形如 `test_console.js 783`），便于每个包处理完核对下降数。接进 `npm run check`（`check:assert-style`，紧跟 `check:ci-static` 之后），**不进 `npm test`**——变异沙箱里白名单会误伤。
+- **AST 断言层（`test_support/source_model.js`，新目录）**：用仓库已有的 acorn（不新装依赖）提供 `loadModel` / `calls` / `members` / `funcs` / `exports` / `codeOnly` / `hasCall` / `hasMember` / `hasFunction` / `hasExport` / `loadYaml` / `parseShell`，让后续包把「读源码文本再 `includes`」换成语义等价的**结构断言**（有该函数 / 有该调用 / 有该 export）或**配置解析断言**。解析失败一律抛错、绝不静默返回空集合（空集合会让这类断言全绿）；model 按文件缓存。
+- **格式耦合探针（`scripts/probe-format-coupling.js`）**：把生产 JS（根 `*.js` 排除 `test_*` + `scripts/` + `qinglong/`）按「每个 `,` 与 `(` 之后插一个空格」重排（用 acorn 词法定位，语义不变，字符串/模板/正则/注释内不动），逐个跑传入测试并打印 `format-clean` / `format-coupled`；除 `try/finally` 外还接管 `SIGINT`/`SIGTERM`/`SIGHUP` 还原，跑完与运行前的 `git status --short` 比对，出现新增改动即 **exit 3** 并点名文件。它把 RUNBOOK「验收机械判据」里那条「重排后仍绿」变成可执行判据。
+- **变异沙箱**：`run_mutation.js` 的 `copyProject` 补拷 `test_support/` 与两份新脚本，漏拷会在变异阶段 ENOENT 假红（与 #143 补 `check-version.js` 同族根因）。
+- **不替换任何断言**：S0 只建工具层与闸，857 条白名单一条未动，后续包逐包收敛。
+- **版本**：3.441.0 → **3.442.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。

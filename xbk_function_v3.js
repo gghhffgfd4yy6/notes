@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.441 — run 锁：kill 非 ESRCH 一律判活（EPERM/EINVAL 不接管）、pid 上界边界与僵尸告警去重补可证伪用例、跳过记账落断言 *******
+//* ******* 线报酷推送脚本 v3.442 — 测试工具层：源码文本断言反回归闸 + acorn AST 断言层 + 格式耦合探针（S0） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

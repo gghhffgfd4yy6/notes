@@ -285,6 +285,10 @@ const check = async (name, fn) => { await fn(); pass++; console.log(`  ✅ ${nam
       // 进而使 test_run_mutation_cli.js 的「沙箱内单元测试应整体通过」断言失败（沙箱整体红）
       assert.ok(fs.existsSync(path.join(projDir, 'check-version.js')), 'check-version.js 应复制（test_check_version.js 顶层 require 它）')
       assert.ok(fs.existsSync(path.join(projDir, '.github/workflows/test.yml')), '.github/workflows/test.yml 应复制（test_ci_skip_suites.js 读取它与显式步骤对账）')
+      // S0 回归：AST 断言层与源码文本断言闸的输入必须进沙箱——漏拷 test_support/ 会让后续包的结构断言
+      // MODULE_NOT_FOUND、漏拷白名单会让闸脚本 ENOENT，两种都是「沙箱内套件整体红」的假红。
+      assert.ok(fs.existsSync(path.join(projDir, 'test_support/source_model.js')), 'test_support/source_model.js 应复制（后续包的 AST 断言 require 它）')
+      assert.ok(fs.existsSync(path.join(projDir, 'scripts/source-text-assert.allowlist.json')), '白名单应复制（check-source-text-asserts.js 读取它）')
       // 回归：C7-052 结构红线在 test_console.js 里直接读 README.md/SYSTEM_CONTRACT.md，
       // 漏拷 → 沙箱 ENOENT → 基线整体红 → 8066 个变异体全记 survived（门禁假红）
       for (const doc of ['README.md', 'AGENTS.md', 'SYSTEM_CONTRACT.md', 'CONTRIBUTING.md', 'SECURITY.md']) {

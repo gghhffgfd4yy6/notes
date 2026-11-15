@@ -297,6 +297,10 @@ function copyProject (dir, files) {
   const testFiles = entries.filter(f => /^test_.*\.js$/.test(f))
   const srcFiles = entries.filter(f => /^xbk_.*\.js$/.test(f))
   const extraTop = ['run_unit_tests.js', 'test_suites.js', 'run_tests.js', 'run_mutation.js', 'package.json', 'CHANGELOG.md', 'check-version.js', 'stryker.config.js', 'stryker.tap.config.js',
+    // 源码文本断言反回归闸（S0）的三件输入：闸脚本、格式耦合探针、冻结白名单。
+    // scripts/ 本身整目录复制已覆盖它们，这里再显式列入 `required` 是**有意冗余**：一旦这些文件被删/改名，
+    // copyProject 会响亮 throw，而不是让沙箱里「闸门不见了」和「闸门全绿」长得一模一样（fail-closed）。
+    'scripts/check-source-text-asserts.js', 'scripts/probe-format-coupling.js', 'scripts/source-text-assert.allowlist.json',
     // 文档类必选：test_console.js 的 C7-052 结构红线直接 readFileSync README.md/SYSTEM_CONTRACT.md，
     // test_doc_line_gates.js 与 test_ci_skip_suites.js 也对账这几份 prose 文档的行数/存在性。
     // 漏拷的后果与 #143 同类：沙箱 ENOENT → 套件红 → evaluate 恒 fail（8066 个变异体全被记 survived，门禁假红）。
@@ -322,9 +326,11 @@ function copyProject (dir, files) {
   // （test_ci_skip_suites.js 要读 test.yml 与 mutation.yml 对账，缺一个就 ENOENT 误判失败，同 #120/#122 口径）
   // test/ 是测试共享 helper 目录（test/_yaml.js）：test_mutation_report.js 与 test_mutation_report_cli.js
   // 顶层 require('./test/_yaml')，不拷则沙箱内 MODULE_NOT_FOUND → 套件整体红 → 每个变异体被误判 killed（C5-044）。
-  // 四者同为必选（D3）：此前的 if (fs.existsSync) 是静默可选，目录一旦丢失同样留下 evaluate 恒 fail 的
+  // test_support/ 是 S0 的 AST 断言层（test_support/source_model.js）：后续包的结构断言统一 require 它，
+  // 沙箱里没有它同样 MODULE_NOT_FOUND → 套件整体红（与 C5-044 同族根因）。
+  // 五者同为必选（D3）：此前的 if (fs.existsSync) 是静默可选，目录一旦丢失同样留下 evaluate 恒 fail 的
   // 不响亮回归，与文件清单的必选口径不一致——现改为缺失即 throw。
-  for (const sub of ['scripts', 'qinglong', '.github', 'test']) {
+  for (const sub of ['scripts', 'qinglong', '.github', 'test', 'test_support']) {
     const srcDir = path.join(ROOT, sub)
     if (!fs.existsSync(srcDir)) throw new Error(`copyProject 缺少必要目录: ${sub}`)
     fs.cpSync(srcDir, path.join(dir, sub), { recursive: true })
