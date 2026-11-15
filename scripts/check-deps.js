@@ -67,13 +67,18 @@ function dependencyFailureReason (error) {
 // 此前只做正方向（声明 → 实例）：declared 清单每一项都探测装没装。反方向没人看：代码里
 // `require('foo')` 忘了写 dependencies 时，装过 foo 的机器（或 foo 恰好是某依赖的传递依赖）
 // 全绿，换一台精简安装的机器才炸，且报错点离改动很远。
-// 扫描面 = 随仓库分发的运行时文件（根目录 xbk_*.js / scripts/*.js / qinglong/*.js）；
-// test_*.js 与 run_*.js 不在其列：它们裸 require 的是 devDependencies（fast-check 等），
-// 口径不同，混在一起只会逼出例外名单。
+// 扫描面 = 随仓库分发的运行时文件（根目录 xbk_*.js / scripts/*.js / qinglong/*.js）+ 测试侧工具目录
+// test_support/（r12-6）。test_*.js 与 run_*.js 不在其列：它们裸 require 的是 devDependencies
+// （fast-check 等），口径不同，混在一起只会逼出例外名单。
+// 第三列 dev = 该目录允许用 devDependencies 里的包（测试面），未写按运行时算。
 const RUNTIME_SOURCE_DIRS = Object.freeze([
   ['.', (name) => name.startsWith('xbk_')],
   ['scripts', () => true],
-  ['qinglong', () => true]
+  ['qinglong', () => true],
+  // r12-6：test_support/ 也随仓库走、也 require 第三方包（source_model.js 的 js-yaml）。它此前不在扫描面
+  // ⇒ 只作为传递依赖装上的包被 require 也没人管（实测 js-yaml 4.3.2 只是 @stryker-mutator/core 的传递
+  // 依赖，package.json 三处都没声明，而本脚本常年 exit 0）。测试面允许 devDependencies，故 dev = true。
+  ['test_support', () => true, true]
 ])
 
 // 剥掉注释再找 require：注释里写一句 `require('x')` 不算（C5-020 的教训——判据被注释里的
@@ -93,7 +98,7 @@ function stripJsComments (source) {
 
 function runtimeSourceFiles (root) {
   const files = []
-  for (const [dir, keep] of RUNTIME_SOURCE_DIRS) {
+  for (const [dir, keep, devAllowed] of RUNTIME_SOURCE_DIRS) {
     let entries
     try {
       entries = fs.readdirSync(path.join(root, dir), { withFileTypes: true }) // nosemgrep（root 是模块常量，dir 是上面的字面量表）
@@ -102,7 +107,7 @@ function runtimeSourceFiles (root) {
     }
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith('.js') || !keep(entry.name)) continue
-      files.push(dir === '.' ? entry.name : `${dir}/${entry.name}`)
+      files.push({ rel: dir === '.' ? entry.name : `${dir}/${entry.name}`, devAllowed: devAllowed === true })
     }
   }
   return files
@@ -119,16 +124,20 @@ function packageNameOf (specifier) {
 }
 
 // 返回 [{ name, file }]：代码 require 了、但 package.json 的运行时清单里没有的包。
+// 测试侧目录（RUNTIME_SOURCE_DIRS 里 dev = true 的，如 test_support/）允许用 devDependencies：
+// 它们不随运行时发布，只在测试/工具链里跑（r12-6）。
 function scanUndeclaredRequires (pkg, { root = ROOT } = {}) {
-  const declared = new Set([
+  const runtimeDeclared = new Set([
     ...Object.keys((pkg && pkg.dependencies) || {}),
     ...Object.keys((pkg && pkg.optionalDependencies) || {})
   ])
+  const devDeclared = new Set(Object.keys((pkg && pkg.devDependencies) || {}))
   const undeclared = []
   // 清单读不到/为空时不动手：那种情况由正方向的降级分支（内置 got/re2 + 告警）负责，
   // 这里再扫一遍只会把「清单缺失」放大成一片「所有 require 都未声明」的假红。
-  if (declared.size === 0) return undeclared
-  for (const rel of runtimeSourceFiles(root)) {
+  if (runtimeDeclared.size === 0) return undeclared
+  for (const { rel, devAllowed } of runtimeSourceFiles(root)) {
+    const declared = devAllowed ? new Set([...runtimeDeclared, ...devDeclared]) : runtimeDeclared
     const source = stripJsComments(fs.readFileSync(path.join(root, rel), 'utf8')) // nosemgrep（rel 来自 readdir，不是用户输入）
     const re = /require\s*\(\s*(['"])([^'"]+)\1\s*\)/g
     let match
@@ -351,7 +360,7 @@ function checkDependencies ({ resolve = require.resolve, load = loadFromRoot, ma
   if (undeclared.length > 0) {
     console.error(`❌ 代码 require 了未声明的包：${[...new Set(undeclared.map(u => u.name))].join(', ')}`)
     for (const u of undeclared) console.error(`  - ${u.name}（${u.file}）`)
-    console.error('请在 package.json 的 dependencies（或 optionalDependencies）里声明，或删掉这条 require：')
+    console.error('请在 package.json 的 dependencies（testsupport 等测试面可用 devDependencies）里声明，或删掉这条 require：')
     console.error('  require 到未声明包时，本机只是碰巧通过传递依赖装上了，换一台精简安装的机器才会炸')
   }
   if (broken.length > 0) {

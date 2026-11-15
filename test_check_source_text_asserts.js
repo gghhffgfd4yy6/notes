@@ -286,7 +286,31 @@ const POSITIVE = [
   ['方括号读源码（fs["readFileSync"](…)）——读取面本身也能被方括号绕过',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "const src = fs['readFileSync']('a.js', 'utf8')",
-      "assert.ok(src.includes('FS_BRACKET'))"), ['FS_BRACKET']]
+      "assert.ok(src.includes('FS_BRACKET'))"), ['FS_BRACKET']],
+  // ── r12-1（运算符 / 等值断言族：旧检测面只认调用表达式，这一整族永远数不到） ─────────
+  ['比较运算符：lines[10] === \'…\'（行级逐字比对，没有方法调用可抓）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const lines = src.split('\\n')",
+      "assert.ok(lines[10] === 'const CACHE_SHARD_ID_RE =')"), ['const CACHE_SHARD_ID_RE =']],
+  ['assert.strictEqual(lines[10], \'…\')（等值断言形态，与 === 同口径）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'const lines = src.split(\'\\n\')',
+      "assert.strictEqual(lines[11], 'ASSERT_EQ')"), ['ASSERT_EQ']],
+  ['.slice() 之后 !==（先切片再逐字比对）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.ok(src.slice(0, 12) !== 'SLICED_TEXT')"), ['SLICED_TEXT']],
+  ['.trim() 之后 assert.strictEqual（整形后仍绑文本）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.strictEqual(src.trim(), 'TRIMMED')"), ['TRIMMED']],
+  ['assert.deepStrictEqual(行切片, [字面量…])（字面量数组取首个字符串做锚点）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const head = src.split('\\n').slice(0, 2)",
+      "assert.deepStrictEqual(head, ['LINE_A', 'LINE_B'])"), ['LINE_A']]
 ]
 
 // ── B. 反向：receiver 不是源码文本就必须不命中（否则误报会把基线灌满） ──────
@@ -317,11 +341,26 @@ const NEGATIVE = [
       "const s = 'hello world'",
       "const arr = ['x', 'y']",
       "assert.ok(s.includes('hello'))",
-      "assert.ok(arr.includes('x'))"), []]
+      "assert.ok(arr.includes('x'))"), []],
+  // r12-1 的反向：运算符/等值形态**只有一侧绑源码文本时才成立**——量纲断言与纯字面量比较必须放行，
+  // 否则全仓的行数断言（`src.split('\\n').length === 42`）会把基线灌成噪声。
+  ['量纲断言不计：src.length === 3 / typeof src === \'string\' / 行数 strictEqual',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      'assert.ok(src.length === 3)',
+      "assert.strictEqual(src.split('\\n').length, 42)",
+      "assert.strictEqual(typeof src, 'string')"), []],
+  ['两侧都是字面量 / 未绑源码文本的字符串比较不计',
+    lines("const assert = require('node:assert')",
+      "const plain = 'hello'",
+      "assert.strictEqual('abc', 'abc')",
+      "assert.strictEqual(plain, 'hello')"), []]
 ]
 
-// ── A/B 执行：31 个正向形态 + 6 个反向形态 ─────────────────────────────────
-check('检测面：31 种「读源码文本」写法逐个命中（含旧实现漏检的：r4-1 的 7 种绕过写法 + r8-1 的 7 种等价形态 + 字面量表/映射表）', () => {
+// ── A/B 执行：正向形态数 = POSITIVE.length，反向形态数 = NEGATIVE.length ────────────
+// 标签里的数字**由数组长度算**，不手写：套件说明（test_suites.js 的 desc）与注释里手写的
+// 「17 种 / 16 种」曾经三处互相矛盾（r12-5），这里不再留第二个可漂移的副本。
+check(`检测面：${POSITIVE.length} 种「读源码文本」写法逐个命中（含旧实现漏检的：r4-1 的绕过写法 + r8-1 的等价形态 + r12-1 的运算符/等值断言族）`, () => {
   const missed = POSITIVE.filter(([, code, expected]) => {
     const got = analyzeSource(code, 'positive.js').map((hit) => hit.literal)
     return JSON.stringify(got) !== JSON.stringify(expected)
@@ -332,7 +371,7 @@ check('检测面：31 种「读源码文本」写法逐个命中（含旧实现�
   assert.deepStrictEqual(missed, [], '以下形态没被识别（漏检 = 这条闸门对这些写法形同不存在）：\n' + missed.join('\n'))
 })
 
-check('反向：receiver 不是源码文本时一律不命中（res.text / 遮蔽 / JSON.parse / 普通字符串）', () => {
+check(`反向：${NEGATIVE.length} 类非源码文本 / 量纲形态一律不命中（res.text / 遮蔽 / JSON.parse / 普通串 / .length / typeof）`, () => {
   const wrong = NEGATIVE.filter(([, code]) => analyzeSource(code, 'negative.js').length > 0)
     .map(([label, code]) => `${label}: ${JSON.stringify(analyzeSource(code, 'negative.js').map((h) => h.literal))}`)
   assert.deepStrictEqual(wrong, [], '以下形态被误判成源码文本断言（会把基线灌满噪声）：\n' + wrong.join('\n'))
@@ -436,8 +475,109 @@ check('跨文件 helper：锚点在 helper 体内（hasText 固定锚点）与�
   assert.ok(/test_ns\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out), '必须点名 test_ns.js：' + result.out)
 })
 
-// ── 退出码语义（F1 / F3 / 形状校验 / 少数提示） ─────────────────────────────
+// ── r12-2：`module.exports = fn`（默认导出）的跨文件摘要 ─────────────────────
+// 反例（评审实测）：「一个文件一个 helper」写成默认导出时，`moduleTargetOf` 对 exportName === '*' 直接
+// return null，而 exportsMap 恰好把 `module.exports = fn` 记在 '*' 下 —— 收集了从不使用。调用点
+// `hasText(src, 'X')` 因此 0 命中、exit 0；改成 `module.exports = { hasText }` 立刻 exit 1。
+check('跨文件 helper：module.exports = fn（默认导出）与命名导出同口径（r12-2）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_support/hastext.js', lines('module.exports = function hasText (s, n) { return s.includes(n) }'))
+  write(dir, 'test_use_default.js', lines(
+    "const fs = require('node:fs')",
+    "const hasText = require('./test_support/hastext.js')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => hasText(src, 'DEFAULT_EXPORT')"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '默认导出的 helper 必须仍判红：' + result.out)
+  assert.ok(/test_use_default\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out),
+    '命中必须记在调用点文件上：' + result.out)
+  // 反向：同一文件改成命名导出后，`hasText(…)` 是「把模块对象当函数调」——不得凭空记一条命中。
+  write(dir, 'test_support/hastext.js', lines(
+    'function hasText (s, n) { return s.includes(n) }',
+    'module.exports = { hasText }'
+  ))
+  const namespace = runChecker(dir)
+  assert.strictEqual(namespace.status, 0, '模块对象被当函数调时不得记命中：' + namespace.out)
+})
 
+// ── r12-3：自身读源码文本的 helper（返回源码，不是 receiver 来自实参） ─────────
+// 反例（评审实测）：`readSrc(f) { return fs.readFileSync(f, 'utf8') }` 放进 test_support/，断言写
+// `assert.ok(readSrc('xbk_function_v3.js').includes('X'))`——两个文件都在扫描面内却都 0 命中，
+// 新增任意多条永远绿。摘要必须记住「这个导出自己会读源码文本」，调用点按 readFileSync 同口径处理。
+check('跨文件 helper：自身读源码文本的 helper（readSrc(f).includes(…)）跨 require 传播（r12-3）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_support/reader.js', lines(
+    "const fs = require('node:fs')",
+    "function readSrc (f) { return fs.readFileSync(f, 'utf8') }",
+    'module.exports = { readSrc }'
+  ))
+  write(dir, 'test_use_reader.js', lines(
+    "const assert = require('node:assert')",
+    "const { readSrc } = require('./test_support/reader.js')",
+    "assert.ok(readSrc('xbk_function_v3.js').includes('RETURN_SOURCE'))"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '返回源码文本的 helper 必须判红：' + result.out)
+  assert.ok(/test_use_reader\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(result.out),
+    '命中必须记在调用点文件上：' + result.out)
+  // 反向：只做文本整形、自己不读文件的 helper（wrap(s){return s.trim()}）收到普通字符串时不得记命中。
+  write(dir, 'test_support/reader.js', lines(
+    'function wrap (s) { return s.trim() }',
+    'module.exports = { wrap }'
+  ))
+  write(dir, 'test_use_reader.js', lines(
+    "const assert = require('node:assert')",
+    "const { wrap } = require('./test_support/reader.js')",
+    "assert.ok(wrap('hello').includes('hell'))"
+  ))
+  const plain = runChecker(dir)
+  assert.strictEqual(plain.status, 0, '不自己读文件的整形 helper 不得被当成源码文本：' + plain.out)
+})
+
+// ── r12-4：扫描面 = 整棵仓库（显式跳过名单），任意新目录默认在内 ────────────────
+// 反例（评审实测）：把「读源码 + 比对」整段搬进 helpers/，调用点只传锚点 —— helper 不在扫描面、
+// 摘要因形参来源为空也不产条目，两处同时失明，闸门 exit 0 并提示「重跑 --write-allowlist 可收紧基线」。
+check('扫描面：任意新目录（helpers/）默认在内——把「读源码 + 比对」整段搬走也判红（r12-4）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'helpers/source_check.js', lines(
+    "const fs = require('node:fs')",
+    'module.exports.assertHas = function (file, needle, assert) {',
+    "  const src = fs.readFileSync(file, 'utf8')",
+    '  assert.ok(src.includes(needle))',
+    '}'
+  ))
+  write(dir, 'test_use_helpers.js', lines(
+    "const assert = require('node:assert')",
+    "const { assertHas } = require('./helpers/source_check.js')",
+    "assertHas('xbk_function_v3.js', 'HELPER_DIR_ANCHOR', assert)"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, 'helpers/ 里的 helper 必须判红：' + result.out)
+  assert.ok(result.out.includes('helpers/source_check.js'), '必须点名 helpers/source_check.js：' + result.out)
+})
+
+check('扫描面：整棵仓库（scripts/、根 run_*.js 在内），依赖 / 产物 / 被测系统在显式跳过名单里', () => {
+  const scan = listScanFiles()
+  for (const rel of ['scripts/check-deps.js', 'run_mutation.js', 'check-version.js', 'test_support/source_model.js']) {
+    assert.ok(scan.includes(rel), `扫描面必须包含 ${rel}（封闭白名单已废弃）：${scan.length} 个文件里没有它`)
+  }
+  // 显式跳过名单：依赖 / 版本库 / 产物 / 缓存 / vendor bundle / 被测系统本身（见脚本头 REPO_SKIP）。
+  const forbidden = scan.filter((rel) =>
+    /^(?:xbk_[^/]*\.(?:js|cjs|mjs)|qinglong\/|deploy\/|scripts\/console-assets\/)/.test(rel) ||
+    /(^|\/)(?:node_modules|\.git|\.stryker-tmp|\.nyc_output|coverage|reports|\.local|\.ai|\.tools)\//.test(rel) ||
+    /(^|\/)xianbaoku_cache[^/]*\//.test(rel))
+  assert.deepStrictEqual(forbidden.slice(0, 10), [], '跳过名单里的路径不得进扫描面：' + forbidden.slice(0, 10).join(', '))
+  assert.ok(scan.length > 100, '扫描面应是整棵仓库（实测 140+ 个 .js），实得 ' + scan.length)
+})
+
+// ── 退出码语义（F1 / F3 / 形状校验 / 少数提示） ─────────────────────────────
 check('退出码 1：新增一处行内直读即红，并按文件报增量（F1 回归）', () => {
   const dir = makeWorkspace()
   write(dir, 'test_base.js', FIXTURE_OK)
@@ -992,6 +1132,22 @@ check('harness 自身：一条检查抛错只记失败，后续照跑、汇总�
   assert.strictEqual(probe.passed, 2, 'passed 只算真正跑完的检查')
   assert.strictEqual(probe.summary(), 1, '有失败时汇总必须返回 1')
   assert.ok(logged.some((l) => l.includes('2 通过 / 1 失败')), '汇总必须同时报通过与失败数')
+})
+
+// ── 套件说明不得漂移（r12-5） ───────────────────────────────────────────────
+// 注册表的 desc 是 run_tests 打印给开发者的唯一入口文档，也是「这道闸覆盖什么」的唯一说明。
+// 它曾停在 v3.444 的「17 种写法 / 4 类必绿 / 多重集超次数」，而实际早已是 31+ / 6 且判据换成按文件计数，
+// 同段注释里还写着第三个数字（16 种）——三处互相矛盾。这里让数字**跟着代码对账**：
+// 改 POSITIVE / NEGATIVE / 增删一条检查而不同步改 desc，这条用例立刻红。
+check('套件注册表的 desc 与实测用例数一致（数字不得再漂移：旧文案 17/16/31 三处互相矛盾）', () => {
+  const { SUITES } = require('./test_suites.js')
+  const entry = SUITES.find((suite) => suite.file === 'test_check_source_text_asserts.js')
+  assert.ok(entry, '注册表里必须有本套件')
+  // 本条检查自身也要计入总数：之前跑过的 + 本条 = 全套检查数。
+  const total = harness.passed + harness.failures.length + 1
+  for (const expected of [`${total} 条检查`, `${POSITIVE.length} 种`, `${NEGATIVE.length} 类`]) {
+    assert.ok(entry.desc.includes(expected), `desc 必须写明「${expected}」（实测用例数变了就同步改 test_suites.js）：${entry.desc}`)
+  }
 })
 
 // 汇总后再清场：即使某条检查抛错，临时工作区也一定要删掉（不在 /tmp 与仓库根留垃圾）。

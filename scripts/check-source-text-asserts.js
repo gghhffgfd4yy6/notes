@@ -16,6 +16,13 @@
  *   - 命中（只认 receiver **确实绑定到源码文本**的调用）：
  *         `<src>.includes|startsWith|endsWith|indexOf|lastIndexOf|search|match(<任意实参>)`、
  *         `<任意正则>.test(<src>)`、`assert.match(<src>, <任意实参>)`。
+ *     运算符 / 断言函数形态（r12-1：旧检测面只认调用表达式，这一整族永远数不到）：
+ *         `<src行> === | == | !== | != <字面量>`（`lines[10] === '…'`）、
+ *         `assert.strictEqual|notStrictEqual|deepStrictEqual|notDeepStrictEqual|equal|notEqual|deepEqual|notDeepEqual(<src>, <字面量>)`
+ *         （含 `.trim()` / `.slice()` 之后比对；字面量侧可以是字符串/无插值模板或**字面量数组**）。
+ *         判据与上面同源：只有一侧**确实绑定到源码文本**、另一侧是可冻结字面量（数组取首个字符串，
+ *         取不到记 `<dynamic>`）才记一条；`src.length === 3` / `typeof src === 'string'` 是量纲断言，
+ *         **不**计入（否则行数断言会把基线灌满噪声）。
  *     方括号字面量键、`.bind` 后的别名、`String.prototype.includes.call/apply(<src>, …)`、
  *     `[].includes.call(<src>, …)` 与点号写法**同一口径**（r8-1：只差一个字符的写法不能成为绕过路径）。
  *     锚点 = 字符串字面量 / 无插值模板字符串 / 正则字面量（记为 `/src/flags`）；
@@ -30,8 +37,12 @@
  *   - **不看名字看绑定**：`res.text.includes(…)` 的 receiver 是成员表达式（`res` 不是源码文本），
  *     不算命中；同名局部变量只在它自己的作用域里算（`const text = readFileSync(…)` 不会污染
  *     整个文件里的 `text`）。这是旧实现（文件级变量名集合 + 正则）44 条误判的根因。
- *   - 扫描面：仓库根 `test_*.js` + `test_support/**\/*.js` + `test/**\/*.js`（`test/` 是既有辅助代码目录）。
- *     跨文件：被 require 的本地模块按「导出函数的形参 → 字符串比对」摘要，在**调用点**按实参入账（r8-2）。
+ *   - 扫描面：**整棵仓库**的 `.js/.cjs/.mjs`（r12-4：旧实现是「根 test_*.js + test_support/** + test/**」
+ *     的封闭白名单，把「读源码 + 比对」整段搬进 helpers/ 就整段豁免）。豁免只有一个**显式**名单
+ *     `REPO_SKIP`（依赖/产物/vendor/被测系统本身），新目录默认被扫描——没有第二份隐式白名单。
+ *     跨文件：被 require 的本地模块按「导出函数的形参 → 字符串比对」摘要，在**调用点**按实参入账；
+ *     `module.exports = fn`（默认导出）与「自身读源码文本的 helper」（`readSrc(f).includes('X')`）同口径
+ *     （r12-2 / r12-3）。
  *
  * 白名单（v3.448 起是**紧凑基线** schema 2）：`scripts/source-text-assert.allowlist.json` 只冻结
  * 「文件 → 条数」，逐条清单（file/line/literal/kind）**不随仓库走**——用 `--inventory` 写到仓库外
@@ -69,12 +80,28 @@ const ALLOW_REL = path.relative(ROOT, ALLOW_FILE)
 const SOURCE_CALLS = new Set(['readFileSync', 'readFile', 'codeOf', 'codeOnly', 'stripComments', 'stripComment'])
 // receiver 是源码文本、参数是字面量 ⇒ 文本比对的字符串方法。
 const STRING_METHODS = new Set(['includes', 'startsWith', 'endsWith', 'indexOf', 'lastIndexOf', 'search', 'match'])
+// 比较运算符：`lines[10] === '…'` 与 `src.includes('…')` 是同一件事（源码文本 vs 字面量的逐字耦合），
+// 只是没有方法调用可抓——旧检测面只认调用表达式，这一整族（含 .trim()/.slice() 之后比对）永远数不到。
+const COMPARISON_OPERATORS = new Set(['==', '===', '!=', '!=='])
+// 断言库的等值比较：与 `===` 同口径。
+const EQUALITY_CALLS = new Set([
+  'strictEqual', 'notStrictEqual', 'deepStrictEqual', 'notDeepStrictEqual',
+  'equal', 'notEqual', 'deepEqual', 'notDeepEqual'
+])
+// 「量纲」取值：`src.length === 3` 是行数断言，不是逐字比对。不排除它会把全仓的行数断言灌进基线。
+const NON_TEXT_MEMBERS = new Set(['length', 'size', 'byteLength'])
 // 这些方法在源码文本数组上的回调形参是「一行源码」——回调第一形参跟着 receiver 一起污染。
 const ELEMENT_CALLBACK_METHODS = new Set(['map', 'flatMap', 'forEach', 'filter', 'find', 'findIndex', 'some', 'every', 'sort', 'reduce'])
 // 返回值不再是「源码文本」的调用：JSON/YAML 解析成对象、path 拼路径、fs 列目录/取元数据。
 // 不在这里截断，配置类断言（`JSON.parse(readFileSync(...))` 之后比字段）会被当成文本断言计进基线。
 const SANITIZER_PATHS = new Set([
   'JSON.parse', 'JSON.stringify',
+  // 解析成结构化对象后就不是「源码文本」了：`acorn.parse(src)` 的结果是 AST（`node.type === 'Literal'`
+  // 这类结构判断必须放行，否则整个解析器/闸门自身会被算成上百条文本断言——实测 112 条全在
+  // check-source-text-asserts.js 自己的 AST 判断上）。
+  'acorn.parse', 'acorn.parseExpressionAt',
+  // 配置解析（RUNBOOK 四式的第 ② 式：解析后断言字段，不比对源码行）：YAML 解析结果同样是结构化数据。
+  'yaml.load', 'yaml.loadAll', 'yaml.parse', 'YAML.parse', 'jsyaml.load',
   'path.join', 'path.resolve', 'path.relative', 'path.dirname', 'path.basename', 'path.extname',
   'path.normalize', 'path.isAbsolute', 'path.parse', 'path.sep',
   'fs.readdirSync', 'fs.realpathSync', 'fs.statSync', 'fs.lstatSync', 'fs.existsSync',
@@ -238,6 +265,34 @@ function literalAnchor (node) {
 
 const isRegexLiteral = (node) => !!node && node.type === 'Literal' && !!node.regex
 
+// 比较/等值断言的「字面量侧」锚点（r12-1）。返回 undefined = 这一侧不是可冻结的字面量（不是命中形态）。
+//   · 字符串字面量 / 无插值模板 / 正则字面量 → 锚点原文；
+//   · `+` 拼接 → 最左字面量（与 includes 同口径）；
+//   · 字面量数组（`assert.deepStrictEqual(lines.slice(0, 2), ['A', 'B'])`）→ 首个字符串元素，
+//     取不到记 <dynamic>（数组本身仍是字面量侧，不许因为「锚点不好取」整条消失）。
+function literalSideAnchor (node) {
+  const direct = literalAnchor(node)
+  if (direct !== undefined) return direct
+  // 带插值的模板字符串（`` `| ${label} | 5 | …` ``）：仍是「字面量侧」——它把字面量片段钉在源码文本上，
+  // 只是锚点不能整条冻结 ⇒ 记 <dynamic>（与 `src.includes(`…${x}`)` 同口径，不许因为「取不到锚点」整条消失）。
+  if (node && node.type === 'TemplateLiteral') return DYNAMIC_ANCHOR
+  if (!node || node.type !== 'ArrayExpression') return undefined
+  for (const element of node.elements) {
+    const value = literalValue(element)
+    if (typeof value === 'string') return value
+  }
+  return DYNAMIC_ANCHOR
+}
+
+// 参与比较的那一侧**表达的是文本**吗？`src.length === 3`（行数）与 `typeof src === 'string'`（类型）
+// 都是量纲断言：它们对「源码写了什么」零约束，计进来只会让基线变成噪声。
+function isTextualOperand (node) {
+  if (!node) return false
+  if (node.type === 'MemberExpression' && NON_TEXT_MEMBERS.has(propertyName(node))) return false
+  if (node.type === 'UnaryExpression' && node.operator === 'typeof') return false
+  return true
+}
+
 // 名字作用域：`functionScope` 供 `var` 提升；`declare` 幂等（重复声明取同一个 binding）。
 // `registry` 是全局绑定表（不动点在这一份上迭代），新建绑定必须同时进 registry——否则该绑定
 // 永远不会被求值，成为静默的漏检。
@@ -260,8 +315,13 @@ class Scope {
     if (!binding) {
       // methods：对象字面量/类体的方法表（`H.read` / `new R().read` 的绑定解析指向这里）；
       // instanceOf：`const r = new R()` 的类绑定，方法表按原型链回溯；
-      // sourceCall：`const read = fs.readFileSync` 这类别名（初值是读取函数）。
-      binding = { name, tainted: false, defs: [], fn: null, methods: null, instanceOf: null, sourceCall: false }
+      // sourceCall：`const read = fs.readFileSync` 这类别名（初值是读取函数）；
+      // fromSource：污染**来自读文件**（而不是从形参传入）。r12-3 的跨文件判定用它：
+      //   `readSrc(f) { return fs.readFileSync(f) }` 的返回值是源码文本，`wrap(s) { return s.trim() }`
+      //   的返回值只是「传进来的文本」——后者不能当成「这个 helper 自己会读源码」。形参本身**永不**
+      //   带 fromSource（isParam）：否则某个调用点传了源码文本，就会让整个函数被当成「自己读文件的 helper」
+      //   （实测：mutation-report.js 里 escCell/formatReuseCell 这类纯格式化函数因此全被误判）。
+      binding = { name, tainted: false, fromSource: false, isParam: false, defs: [], fn: null, methods: null, instanceOf: null, sourceCall: false }
       this.bindings.set(name, binding)
       this.registry.push(binding)
     }
@@ -368,12 +428,15 @@ function analyzeModule (code, file, options = {}) {
   const fnParent = new Map() // 函数节点 → 外层函数节点（嵌套回调里的命中要归到导出的那个函数上）
   const imports = new Map() // 本地名 → { moduleFile, exportName }（只收本地 .js 模块）
   const exportSites = [] // { name, value } —— `module.exports = …` / `exports.x = …` 的右值
+  // 跨文件「返回源码文本」的调用点（r12-3）：`readSrc(f)` 的返回值是源码文本 ⇒ 它出现在 receiver 位置
+  // 时必须与 `readFileSync(…)` 同口径地污染下游。节点由 handleCall 在调用点登记，collectDeps 认它。
+  const externalSourceCalls = new Set()
   const moduleSummary = !!options.moduleSummary
 
   const retBinding = (fn) => {
     let binding = rets.get(fn)
     if (!binding) {
-      binding = { name: '(return)', tainted: false, defs: [], fn: null }
+      binding = { name: '(return)', tainted: false, fromSource: false, defs: [], fn: null }
       rets.set(fn, binding)
       bindings.push(binding)
     }
@@ -554,11 +617,17 @@ function analyzeModule (code, file, options = {}) {
   }
 
   // 调用点 → 本地模块的导出名（`hasText(…)` / `mod.hasText(…)`）；非本地模块调用返回 null。
+  // r12-2：`const hasText = require('./x')` 时 importName 是 '*'（命名空间 require）——但**没有任何成员
+  // 访问**就叫，说明模块本身被当函数用，即 `module.exports = fn`（默认导出）。旧实现在这里直接 return null，
+  // 于是 exportsMap 把 `module.exports = fn` 记在 '*' 下却**从不被查**（:1094 的条目成了死数据）。
+  // 两种形态都交给 summaryFor：它按导出名取函数，导出名不存在（`module.exports = { … }` 的命名空间
+  // 被当函数调）时自然返回 null，不会凭空记命中。
   const moduleTargetOf = (callee) => {
     if (!callee) return null
     if (callee.type === 'Identifier') {
       const entry = imports.get(callee.name)
-      return entry && entry.exportName !== '*' ? entry : null
+      if (!entry) return null
+      return { moduleFile: entry.moduleFile, exportName: entry.exportName }
     }
     if (callee.type !== 'MemberExpression' || callee.object.type !== 'Identifier') return null
     const entry = imports.get(callee.object.name)
@@ -631,6 +700,12 @@ function analyzeModule (code, file, options = {}) {
             return out
           }
         }
+        // 跨文件「返回源码文本」的 helper（r12-3）：`readSrc(f)` 与 `fs.readFileSync(f)` 同口径。
+        // 没有这一跳时，把读文件抽成 helper 就能让 `readSrc(f).includes('X')` 两处都 0 命中。
+        if (options.modules && externalSourceCalls.has(node)) {
+          out.hasSource = true
+          return out
+        }
         if (calleeName && SANITIZER_PATHS.has(calleeName)) return out
         if (node.type === 'CallExpression' && callee.type === 'MemberExpression' && !callee.computed &&
           ELEMENT_CALLBACK_METHODS.has(callee.property.name)) {
@@ -641,10 +716,17 @@ function analyzeModule (code, file, options = {}) {
         }
         // 返回源码文本的本地函数（函数声明 / 对象方法 / 类方法）：`H.read(f).includes(…)`、
         // `new R().read(f).includes(…)` 这一跳靠 callTargets（walk 后做的绑定解析）。
+        // 已知本地函数时，**返回值是否污染由它的返回绑定决定**——不能因为实参是源码文本就把结果
+        // 也当成源码文本：`parseAst(code)` 返回的是 AST（否则 `node.type === 'Literal'` 这类结构判断
+        // 全被判成文本断言，闸门自身实测就有 112 条这种噪声）。未知函数（外部 API）才退化成
+        // 「任一实参污染 ⇒ 结果污染」。
         const target = callTargets.get(node)
-        if (target) out.deps.add(retBinding(target))
+        if (target) {
+          out.deps.add(retBinding(target))
+        } else {
+          node.arguments.forEach((argument) => collectDeps(argument, out))
+        }
         collectDeps(callee, out)
-        node.arguments.forEach((argument) => collectDeps(argument, out))
         return out
       }
       case 'MemberExpression':
@@ -698,6 +780,21 @@ function analyzeModule (code, file, options = {}) {
   const deferredArgEdges = [] // { fn, args }
   const deferredElementEdges = [] // { fn, receiver }
 
+  // 比较/等值断言的登记（r12-1）：`<src> === '<字面量>'`、`assert.strictEqual(<src>, '<字面量>')`。
+  // 恰好一侧是「可冻结的字面量侧」、另一侧**确实绑定到源码文本** ⇒ 一条命中（锚点 = 字面量侧）。
+  // 两侧都是字面量 / 两侧都不是字面量 / 另一侧是量纲取值（.length、typeof）⇒ 不记。
+  const noteEquality = (node, left, right, method) => {
+    const leftAnchor = literalSideAnchor(left)
+    const rightAnchor = literalSideAnchor(right)
+    if (leftAnchor === undefined && rightAnchor === undefined) return
+    if (leftAnchor !== undefined && rightAnchor !== undefined) return
+    const anchor = leftAnchor !== undefined ? leftAnchor : rightAnchor
+    const operand = leftAnchor !== undefined ? right : left
+    const anchorNode = leftAnchor !== undefined ? left : right
+    if (!isTextualOperand(operand)) return
+    addCandidate(node, operand, anchor, currentFn, method, anchorNode)
+  }
+
   const handleCall = (node, scope) => {
     callSites.push({ node, callee: node.callee, scope })
     const callee = node.callee
@@ -736,11 +833,14 @@ function analyzeModule (code, file, options = {}) {
     // 跨文件 helper（r8-2）：本地模块导出的函数里「形参 → 字符串比对」，在**调用点**按实参重建候选。
     // 例：`test_support/hastext.js` 的 `function hasText (s, n) { return s.includes(n) }` ⇒ 摘要
     // `{receiverParam:0, anchorParam:1}` ⇒ `hasText(src, 'X')` 在这里记一条锚点 'X' 的命中。
+    // r12-3：摘要同时带「这个导出**自己**会读源码文本」（returnsSource）——`readSrc(f)` 这种 helper
+    // 的返回值必须与 readFileSync 同口径，否则 `readSrc(f).includes('X')` 两个文件都不入账。
     if (options.modules && imports.size) {
       const target = moduleTargetOf(callee)
       if (target) {
-        const entries = options.modules.summaryFor(target.moduleFile, target.exportName)
-        for (const entry of entries || []) {
+        const summary = options.modules.summaryFor(target.moduleFile, target.exportName)
+        if (summary && summary.returnsSource) externalSourceCalls.add(node)
+        for (const entry of (summary && summary.entries) || []) {
           const receiver = node.arguments[entry.receiverParam]
           if (!receiver) continue
           const label = 'module-helper:' + target.exportName
@@ -752,6 +852,11 @@ function analyzeModule (code, file, options = {}) {
           addCandidate(node, receiver, literalAnchor(anchorNode), currentFn, label, anchorNode)
         }
       }
+    }
+    // 等值断言（r12-1）：`assert.strictEqual(<src行>, '…')` 与 `lines[i] === '…'` 同一口径。
+    // 只认调用名在 EQUALITY_CALLS 里的形态（`assert.xxx` / 解构出来的 `xxx`），实参两两比较。
+    if (EQUALITY_CALLS.has(calleeTailName(callee)) && node.arguments.length >= 2) {
+      noteEquality(node, node.arguments[0], node.arguments[1], 'assert.' + calleeTailName(callee))
     }
   }
 
@@ -766,6 +871,9 @@ function analyzeModule (code, file, options = {}) {
     // 形参先声明（体里的引用要能解析到它们）
     const schema = node.params.map((param) => declarePattern(param, fnScope, 'param', []))
     paramBindings.set(node, schema)
+    // 形参永不携带 fromSource（见 Scope.declare 的说明）：调用点传进来的源码文本属于 tainted 那一维，
+    // 不属于「这个函数自己读了文件」。
+    schema.forEach((list) => list.forEach((binding) => { binding.isParam = true }))
     // 模块摘要模式（r8-2）：形参按「已污染」处理，并记住它的来源（函数 + 形参序号）。
     if (moduleSummary) {
       schema.forEach((list, index) => {
@@ -912,6 +1020,12 @@ function analyzeModule (code, file, options = {}) {
         walk(node.callee, scope)
         walkList(node.arguments, scope)
         return
+      case 'BinaryExpression':
+        // `lines[10] === '…'` / `src.slice(a, b) !== '…'`：运算符形态的逐字比对（r12-1）。
+        if (COMPARISON_OPERATORS.has(node.operator)) noteEquality(node, node.left, node.right, node.operator)
+        walk(node.left, scope)
+        walk(node.right, scope)
+        return
       case 'ReturnStatement':
         if (currentFn && node.argument) track(retBinding(currentFn), node.argument)
         walk(node.argument, scope)
@@ -1022,6 +1136,18 @@ function analyzeModule (code, file, options = {}) {
           }
         }
       }
+      // 「污染来自读文件」（r12-3）：与 tainted 分开传播，因为模块摘要模式下**形参也已污染**，
+      // 只用 tainted 会把 `wrap(s) { return s.trim() }` 也判成「自己会读源码的 helper」。
+      // 形参本身不参与（isParam）：它们只能从调用点拿到文本，不代表「这个函数自己读了文件」。
+      if (!binding.fromSource && !binding.isParam) {
+        for (const dep of binding.defs) {
+          if (dep.hasSource || [...dep.deps].some((other) => other.fromSource)) {
+            binding.fromSource = true
+            changed = true
+            break
+          }
+        }
+      }
       if (moduleSummary) {
         for (const dep of binding.defs) {
           for (const other of dep.deps) {
@@ -1040,6 +1166,14 @@ function analyzeModule (code, file, options = {}) {
   const readers = new Set()
   for (const [fn, binding] of rets) {
     if (binding.tainted && binding.defs.some((dep) => dep.textual)) readers.add(fn)
+  }
+  // 「**自己**会读源码文本」的函数（r12-3）：返回值污染源自读文件（fromSource）且返回的是文本。
+  // 与 readers 的差别：readers 也包含「形参传进来的文本」这一路（切块 helper 的分隔符豁免要用它），
+  // 而跨文件推断必须更严——否则 `wrap(s) { return s.trim() }` 会被误判成「这个 helper 会读源码」，
+  // 于是 `wrap('普通字符串').includes('x')` 平白多一条命中。
+  const sourceReturners = new Set()
+  for (const [fn, binding] of rets) {
+    if (binding.fromSource && binding.defs.some((dep) => dep.textual)) sourceReturners.add(fn)
   }
   const isDelimiterLiteral = (literal) => !/[A-Za-z0-9\u4e00-\u9fff]/.test(literal)
 
@@ -1122,7 +1256,7 @@ function analyzeModule (code, file, options = {}) {
       if (!list.some(same)) list.push(entry)
     }
   }
-  return { hits, exports: exportsMap, byFn }
+  return { hits, exports: exportsMap, byFn, sourceReturners }
 }
 
 // 单文件入口（用例与外部调用用）：只要命中列表。
@@ -1130,28 +1264,62 @@ function analyzeSource (code, file, options) {
   return analyzeModule(code, file, options).hits
 }
 
-// ── 扫描面 ──────────────────────────────────────────────────────────────
-// 仓库根 `test_*.js` + `test_support/**` + `test/**`。
-// **`test/` 必须在内**（r8-3）：该目录是仓库既有的**辅助代码**（`test/_yaml.js`、`test/_vm-sandbox.js`），
-// 不是测试用例目录；把它排除在外时，只要把「读源码文本 + 比对」整段搬进 test/ 下的 helper 再 require，
-// 该文件的条数就下降（shortfall 合法）、断言却一条没少——白名单可以这样一路降到 0 且每步都 ✅。
+/* ── 扫描面 + 显式跳过名单 ──────────────────────────────────────────────
+ * r12-4：扫描面曾是**封闭白名单**（根 test_*.js + test_support/** + test/**），r8-3 只补了 test/。
+ * 把「读源码文本 + 比对」整段搬进 helpers/（或 scripts/）的 helper，调用点只传锚点，就两处同时失明：
+ * helper 不在扫描面、摘要因形参来源为空也不产条目 ⇒ 闸门 exit 0 并提示「重跑 --write-allowlist 收紧基线」，
+ * 白名单能一路降到 0 而每步 ✅。这与 r8-3 判 must_fix 的洗白路径只差一个目录名。
+ *
+ * 现在：扫描面 = **整棵仓库**的 .js/.cjs/.mjs，减去下面这一份**显式**名单。新目录（helpers/、lib/、任何
+ * 未命名的目录）默认在扫描面内——不存在第二份隐式白名单。跳过项及理由：
+ *   · 依赖 / 版本库 / 产物 / 缓存：node_modules、.git、.stryker-tmp、.nyc_output、coverage、reports、
+ *     .local、.ai、.tools、xianbaoku_cache*（运行期缓存目录，名字带进程号）；
+ *   · vendor 打包产物：scripts/console-assets/（第三方库的单文件 bundle，standard 同样忽略）；
+ *   · **被测系统本身**：根 xbk_*.js、qinglong/、deploy/。它们不是断言，是业务逻辑；实测把
+ *     xbk_failure_policy.js(12) / xbk_app.js(2) / xbk_message_store.js(2) 计进来，等于把「读缓存/日志后
+ *     做字符串判定」这类正常生产写法冻进基线，之后任何生产改动都会被这道**测试面**闸门误红。
+ *     跨文件 helper 的解析（CROSS_FILE_SKIP 时代起）用的就是同一份名单——扫描面与摘要面口径一致。
+ */
+const JS_FILE_RE = /\.(?:js|cjs|mjs)$/
+const REPO_SKIP = [
+  /(^|\/)(?:node_modules|\.git|\.stryker-tmp|\.nyc_output|coverage|reports|\.local|\.ai|\.tools)\//,
+  /(^|\/)xianbaoku_cache[^/]*\//,
+  /^xbk_[^/]*\.(?:js|cjs|mjs)$/,
+  /^qinglong\//,
+  /^deploy\//,
+  /^scripts\/console-assets\//
+]
+
+// 路径（仓库相对、'/' 分隔）是否在显式跳过名单里。目录判断传 `rel + '/'`，这样 `foo/node_modules/`
+// 这类嵌套依赖目录同样被跳过（正则的 `(^|/)` 分支就是为它写的）。
+const isSkippedPath = (rel) => REPO_SKIP.some((re) => re.test(rel))
+
 function listScanFiles () {
-  const rootTests = fs.readdirSync(ROOT, { withFileTypes: true }) // nosemgrep（路径 = ROOT（__dirname 常量）+ readdirSync 枚举出的 test_*.js / test_support / test 文件，无外部输入）
-    .filter((entry) => entry.isFile() && /^test_.*\.js$/.test(entry.name))
-    .map((entry) => entry.name)
-  const support = []
+  const files = []
   const walkDir = (relative) => {
-    const abs = path.join(ROOT, relative)
-    if (!fs.existsSync(abs)) return // nosemgrep（同上：abs 由 ROOT（__dirname 常量）+ 仓库内相对目录拼成）
-    for (const entry of fs.readdirSync(abs, { withFileTypes: true })) { // nosemgrep（同上：只遍历仓库内的 test_support / test 目录）
-      const rel = relative + '/' + entry.name
-      if (entry.isDirectory()) walkDir(rel)
-      else if (entry.isFile() && entry.name.endsWith('.js')) support.push(rel)
+    const abs = relative ? path.join(ROOT, relative) : ROOT
+    let entries
+    try {
+      entries = fs.readdirSync(abs, { withFileTypes: true }) // nosemgrep（abs = ROOT（__dirname 常量）+ 仓库内相对目录，无外部输入）
+    } catch (e) {
+      // r12-4：目录读不下去必须响亮（exit 2）——「少扫一个目录」与「全部干净」输出长得一样。
+      die(2, `扫描失败：目录读不了 ${relative || '.'}：${e.message}`)
+    }
+    for (const entry of entries) {
+      const rel = relative ? relative + '/' + entry.name : entry.name
+      if (entry.isDirectory()) {
+        if (!isSkippedPath(rel + '/')) walkDir(rel)
+        continue
+      }
+      // 符号链接一律不跟（node_modules 在工作树里就是软链，跟进去等于扫依赖树）。
+      if (!entry.isFile() || !JS_FILE_RE.test(entry.name)) continue
+      if (isSkippedPath(rel)) continue
+      files.push(rel)
     }
   }
-  walkDir('test_support')
-  walkDir('test')
-  return [...rootTests, ...support].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  walkDir('')
+  if (!files.length) die(2, '扫描失败：扫描面为 0 个文件（ROOT 不对？）——这不能读作「没有源码文本断言」')
+  return files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
 /* ── 本地模块摘要表（r8-2：跨文件 helper 的污染传播） ─────────────────────
@@ -1161,20 +1329,11 @@ function listScanFiles () {
  * 分析一遍，得到「导出函数 → 第几个形参做 receiver / 锚点来自第几个形参」的摘要；调用点再用实参
  * 重建候选，污染因此跨文件传播。
  *
- * 解析范围：只认相对路径 require（`./x`、`../x`），并**排除生产模块**（`xbk_*.js` 是被测系统，
- * 不是测试 helper）与 vendor/产物目录（console-assets / node_modules / qinglong / deploy / reports）。
- * 其余本地 .js/.cjs/.mjs 一律解析——包括仓库根的 helper（否则「把断言搬进根目录 foo.js」又是一条绕过）。
+ * 解析范围：只认相对路径 require（`./x`、`../x`），并按与扫描面**同一份**显式跳过名单（REPO_SKIP）
+ * 排除生产模块（xbk_*.js 是被测系统，不是测试 helper）与 vendor/产物目录。
+ * 其余本地 .js/.cjs/.mjs 一律解析——包括仓库根的 helper 与**任意新目录**（否则「把断言搬进
+ * helpers/foo.js」又是一条绕过；r12-4）。
  */
-const JS_FILE_RE = /\.(?:js|cjs|mjs)$/
-const CROSS_FILE_SKIP = [
-  /^xbk_[^/]*\.js$/,
-  /^scripts\/console-assets\//,
-  /^node_modules\//,
-  /^qinglong\//,
-  /^deploy\//,
-  /^reports\//,
-  /^coverage\//
-]
 
 function resolveLocalModule (specifier, fromFile) {
   if (typeof specifier !== 'string' || !specifier.startsWith('.')) return null
@@ -1191,22 +1350,26 @@ function resolveLocalModule (specifier, fromFile) {
   if (!abs.startsWith(ROOT + path.sep)) return null
   const rel = path.relative(ROOT, abs).split(path.sep).join('/')
   if (!JS_FILE_RE.test(rel)) return null
-  if (CROSS_FILE_SKIP.some((re) => re.test(rel))) return null
+  if (isSkippedPath(rel)) return null
   return rel
 }
 
 function createModuleIndex () {
-  const cache = new Map() // 相对路径 → { exports, byFn } | null
+  const cache = new Map() // 相对路径 → { exports, byFn, sourceReturners } | null
   const loading = new Set()
   const failures = []
   const api = {
     resolve: resolveLocalModule,
+    // 返回 { entries, returnsSource }（r12-3）：
+    //   entries       = 「第几个形参做 receiver / 锚点来自第几个形参」的摘要（r8-2）
+    //   returnsSource = 这个导出**自己会读源码文本**（`readSrc(f) { return readFileSync(f) }`），
+    //                   调用点据此把 `readSrc(f)` 的返回值当源码文本。
     summaryFor (rel, exportName) {
       const info = ensure(rel)
       if (!info) return null
       const fn = info.exports.get(exportName)
       if (!fn) return null
-      return info.byFn.get(fn) || null
+      return { entries: info.byFn.get(fn) || [], returnsSource: info.sourceReturners.has(fn) }
     },
     failures: () => failures.slice()
   }
@@ -1219,7 +1382,7 @@ function createModuleIndex () {
     try {
       const code = fs.readFileSync(path.join(ROOT, rel), 'utf8') // nosemgrep（rel 只来自 resolveLocalModule 的仓库内相对路径枚举）
       const analysis = analyzeModule(code, rel, { moduleSummary: true, modules: api })
-      info = { exports: analysis.exports, byFn: analysis.byFn }
+      info = { exports: analysis.exports, byFn: analysis.byFn, sourceReturners: analysis.sourceReturners }
     } catch (e) {
       failures.push(`${rel}: ${e.message}`)
     } finally {
@@ -1237,7 +1400,7 @@ function scanAll () {
   for (const file of listScanFiles()) {
     let code
     try {
-      code = fs.readFileSync(path.join(ROOT, file), 'utf8') // nosemgrep（file 只来自本文件的扫描面枚举（仓库根 test_*.js / test_support / test），不来自环境或入参）
+      code = fs.readFileSync(path.join(ROOT, file), 'utf8') // nosemgrep（file 只来自本文件的扫描面枚举（整棵仓库减 REPO_SKIP），不来自环境或入参）
     } catch (e) {
       die(2, '扫描失败 ' + file + ': ' + e.message)
     }
@@ -1267,8 +1430,9 @@ const INVENTORY_ENV = 'SOURCE_TEXT_ASSERT_INVENTORY'
 // 默认落在仓库外：逐条清单是 2714 行的一次性取证材料，进仓库等于把刚删掉的东西又加回来。
 const INVENTORY_DEFAULT = path.join(os.homedir(), 'ledgers', 'pipelines', 'assertshape-20261115', 'inventory.json')
 const BASELINE_NOTE = '紧凑基线（schema 2）：只冻结「文件 → 条数」，逐条清单不随仓库走（node scripts/check-source-text-asserts.js --inventory 出仓）。' +
-  '扫描面：仓库根 test_*.js + test_support/** + test/**（test/ 是既有辅助代码目录，不是用例目录）；' +
-  '被 require 的本地模块（test_support / test / scripts 等）按其导出函数的「形参 → 字符串比对」摘要，在调用点按实参入账（跨文件 helper 不再漏检）。' +
+  '扫描面：整棵仓库的 .js/.cjs/.mjs，减去显式跳过名单 REPO_SKIP（node_modules / .git / .stryker-tmp / .nyc_output / coverage / reports / .local / .ai / .tools / xianbaoku_cache* / scripts/console-assets 等 vendor 产物 / 被测系统本身 xbk_*.js、qinglong/、deploy/）；新目录默认在扫描面内。' +
+  '跨文件 helper：被 require 的本地模块按「导出函数形参 → 字符串比对」摘要在调用点按实参入账；`module.exports = fn`（默认导出）与「自身读源码文本的 helper」（readSrc(f).includes(…)）同口径。' +
+  '命中形态：字符串方法（includes/startsWith/…/match）、正则 test、assert.match、比较运算符（==/===/!=/!==）与 assert.strictEqual 家族的「源码文本 vs 字面量」逐字比对；量纲断言（.length / typeof）不计。' +
   '判定：某文件实测条数 > 基线 → exit 1 并点名 文件/基线/实测/增量；基线里没有的文件实测有条目 → exit 1；条数下降允许并按文件报 shortfall；' +
   'total 与 by_file 不自洽、或差额无法逐文件归因 → exit 2。' +
   'literal = 静态可冻结锚点（字符串字面量 / 无插值模板 / 正则字面量，正则记成 /src/flags）；dynamic = <dynamic>，' +
