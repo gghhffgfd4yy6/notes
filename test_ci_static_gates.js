@@ -152,6 +152,14 @@ function assertAssertStyleWiring (pkg, hookLines, workflow) {
     'test.yml 的 quality job 必须有且只有一步「源码文本断言闸门」——缺它 = PR 流水线不再跑它')
   assert.strictEqual(gateSteps[0].run, 'npm run check:assert-style',
     'test.yml 的该步骤必须走与本地同一条 npm 链（npm run check:assert-style）')
+  // 步骤存在 ≠ 会执行（r17-B）：step 级 `if:` 让它只在特定事件跑（`if: false` 则永不跑），
+  // `continue-on-error: true` 则让失败不阻断 job——两种写法下「删步骤 / 摘链」的反例全绿，本闸静默失效。
+  // 兄弟闸 check:ci-static / check:doc-lines 在 policy job 里由 assertPolicyStepsUnconditional 免费得到
+  // 这层保护；v3.445 把本闸挪到 quality 时没一起搬过来，故这里显式补齐（与 test:unit 兜底同口径）。
+  assert.strictEqual(gateSteps[0].if, undefined,
+    'test.yml 的源码文本断言闸门不得带 step 级 if: 条件——只在某些事件/恒假条件下跑等于该步骤从未存在')
+  assert.strictEqual(gateSteps[0]['continue-on-error'], undefined,
+    'test.yml 的源码文本断言闸门不得设 continue-on-error: true——失败不阻断 job = 闸门永不拦人')
   const policySteps = (workflow.jobs.policy && workflow.jobs.policy.steps) || []
   assert.strictEqual(policySteps.filter((s) => s && s.run === 'npm run check:assert-style').length, 0,
     'policy job 不得再挂该闸门：policy 刻意零依赖（不 npm ci），require(\'acorn\') 必 MODULE_NOT_FOUND')
@@ -192,6 +200,28 @@ check('check:assert-style 三处接线：check 链 / pre-commit / test.yml 缺�
   orderBroken.scripts.check = 'npm test && npm run check:assert-style'
   assert.throws(() => assertAssertStyleWiring(orderBroken, hook, wf), /排在 npm test 之前/,
     '把闸门排到 npm test 之后必须判红')
+  // 条件化反例（r17-B）：只判「存在 / 名字 / run 串」时，给该步骤注入 step 级条件或
+  // continue-on-error 后三种写法全部照绿（CI 上这道闸永不执行或永不阻断）。逐个必须红。
+  const conditionalStep = (mutate) => {
+    const broken = JSON.parse(JSON.stringify(wf))
+    const step = broken.jobs.quality.steps.find((s) => s && s.run === 'npm run check:assert-style')
+    mutate(step)
+    return broken
+  }
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
+    // 逐段拼接：该字符串含 GitHub 表达式语法（`${`），直接写字面量会触发 standard 的
+    // no-template-curly-in-string（这不是模板字符串）。
+    s.if = '$' + '{{ github.event_name == ' + "'push'" + ' }}'
+  })), /不得带 step 级 if/,
+  '给该步骤加 step 级 if 条件必须判红（PR 事件上就整道闸不跑）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
+    s.if = false
+  })), /不得带 step 级 if/,
+  '给该步骤加 if: false 必须判红（恒假 = 该步骤从未存在）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
+    s['continue-on-error'] = true
+  })), /不得设 continue-on-error/,
+  '给该步骤加 continue-on-error: true 必须判红（失败不阻断 job = 闸门永不拦人）')
 })
 
 check('scorecard.yml：analysis job 的 job 级 permissions 必须显式保留 contents: read（C10-047）', () => {

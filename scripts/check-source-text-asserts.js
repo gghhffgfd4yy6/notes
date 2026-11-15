@@ -204,7 +204,14 @@ function calleeTailName (callee) {
 const isSourceReaderRef = (node) => {
   if (!node) return false
   if (node.type === 'Identifier') return SOURCE_CALLS.has(node.name)
-  return node.type === 'MemberExpression' && SOURCE_CALLS.has(calleeTailName(node))
+  if (node.type === 'MemberExpression') return SOURCE_CALLS.has(calleeTailName(node))
+  // `.bind` 接住后的别名（r17-A）：`const readSource = fs.readFileSync.bind(fs)`。
+  // 旧实现只认 Identifier / MemberExpression，这一整族（含 `readFileSync.bind(null)`）不是「读源码」，
+  // 于是 `readSource(...)` 的返回值从不污染，后续 `src.includes('X')` 一条都数不到。
+  if (node.type === 'CallExpression') {
+    return propertyName(node.callee) === 'bind' && isSourceReaderRef(node.callee.object)
+  }
+  return false
 }
 
 // 对象字面量 / 类体的键名（`read`、'read'、[0] 里的字面量键）。
@@ -546,6 +553,19 @@ function analyzeModule (code, file, options = {}) {
         return patternBindings(node.argument, scope, out)
       default:
         return out
+    }
+  }
+
+  // 解构声明的「按属性名认读取函数」（r17-A）：`const { readFileSync: readSource } = require('node:fs')`
+  // 把读取函数**重命名**后，本地名（readSource）与读取函数不同名，`calleeTailName` 按名字认不出来
+  // ⇒ 必须按**键名**把 sourceCall 打到对应的本地绑定上。只按 keyName 判（不追 require 的模块对象）：
+  // 与闸门既有的「按尾段名认 fs.readFileSync」同一口径，宁可多记（fail-closed），不放过写完就失明的族。
+  const markDestructuredSourceReaders = (pattern, scope) => {
+    for (const prop of pattern.properties) {
+      if (!prop || prop.type !== 'Property') continue
+      const key = keyName(prop)
+      if (!key || !SOURCE_CALLS.has(key)) continue
+      patternBindings(prop.value, scope).forEach((binding) => { binding.sourceCall = true })
     }
   }
 
@@ -1160,6 +1180,8 @@ function analyzeModule (code, file, options = {}) {
           // 绑定解析的三条「指向」：读源码函数的别名（const read = fs.readFileSync）、
           // 对象字面量的方法表（const H = { read: f => … }）、`new R()` 的类（方法表按原型链回溯）。
           if (init && isSourceReaderRef(init)) targets.forEach((binding) => { binding.sourceCall = true })
+          // `const { readFileSync: readSource } = require('node:fs')`：解构重命名（r17-A）。
+          if (init && decl.id.type === 'ObjectPattern') markDestructuredSourceReaders(decl.id, scope)
           // `const inc = src.includes.bind(src)` / `const inc = src['includes']`：别名也认（r8-1）。
           const methodRef = init ? boundMethodRef(init, scope) : null
           if (methodRef) targets.forEach((binding) => { binding.methodRef = methodRef })
@@ -2225,7 +2247,7 @@ function main () {
       console.error(`  ${v.file}  基线 ${v.baseline} / 实测 ${v.measured} / +${v.extra}${tag}`)
     }
     printNewHitLines(hits, violations)
-    console.error('改成行为断言 / AST 断言（test_support/source_model.js）/ 配置解析断言，见 AGENTS.md「断言形态」')
+    console.error('改成行为断言 / AST 断言（test_support/source_model.js）/ 配置解析断言，见 SYSTEM_CONTRACT.md「源码文本断言（check:assert-style）」')
     process.exit(1)
   }
   printByFile('按文件分布（实测命中）：', measured, true)

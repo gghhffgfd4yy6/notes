@@ -1718,3 +1718,14 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **白名单**：3190 → **3190**（literal 2900 / dynamic 290，54 个文件）——本次没有触碰任何断言，`test_check_source_text_asserts.js` 47/47 全绿。
   - **验证**：`TZ=UTC node scripts/probe-format-coupling.js` exit 0 且还原后 `git status` 0 项；`npx standard scripts/probe-format-coupling.js` exit 0。
   - **版本**：3.457.0 → **3.458.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.459
+
+- **S0 收 r17 四处缺口（只动测试面、`scripts/` 与文档，生产逻辑一行未改；白名单 3190 原地不动 = literal 2900 / dynamic 290、54 个文件）**：第 17 轮评审的 4 条 must_fix 逐条按「修前实测漏检 → 修后实测判红 → 补正向必红/反向必绿用例」落地，证据均为隔离副本/临时工作区里跑真闸门与真套件得到的实跑输出，没有一处靠放宽判据或改基线换绿。
+  - **读取函数的别名解析（r17-A）**：`const { readFileSync: readSource } = require('node:fs')`（解构重命名）与 `const readSource = fs.readFileSync.bind(fs)`（`.bind`）两种写法旧实现各 **0 命中、exit 0**（只把 `readFileSync` 改个本地名），而对照的裸 `includes` exit 1。修法：`isSourceReaderRef` 增加 `CallExpression && propertyName(callee) === 'bind'` 递归判定；`VariableDeclaration` 对 `ObjectPattern` 按 `keyName ∈ SOURCE_CALLS` 给对应本地绑定打 `sourceCall`（与 `linkRequire` 的 `ObjectPattern` 分支同一处）。修后两份夹具各 exit 1 并点名 `fixture_alias_a.js:5` / `fixture_alias_b.js:6`；真实仓实测仍 **3190 条**（没有既有断言因此首次可见，白名单零差额）。
+  - **`check:assert-style` 步骤可被条件化（r17-B）**：`assertAssertStyleWiring` 原先只判「步骤存在 / 名字 / run 串」，给 `test.yml` 该步骤加 `if: ${{ … }}`、`if: false` 或 `continue-on-error: true` 后套件全绿（CI 上这道闸永不执行/永不阻断）。现在补 `gateSteps[0].if === undefined` 与 `gateSteps[0]['continue-on-error'] === undefined` 两条断言，并各配一条 `assert.throws` 反例；实测三种注入逐条判红、未注入 `test_ci_static_gates` 12/12 全绿。
+  - **契约文档漏项（r17-C）**：`SYSTEM_CONTRACT.md` 的「修改检查」把 `npm run check` 链写成六项（漏 `check:assert-style`）、句末道数错位（文档行长实为第 6 道）。已补「源码文本断言（`check:assert-style`）」并把道数改为「v3.280 起第 4 道、v3.281 起第 6 道」，与 `package.json` 的 check 链及 `.githooks/pre-commit` 的实际顺序对齐。
+  - **判红文案指向不存在的章节（r17-D）**：旧文案写「见 AGENTS.md「断言形态」」，而 AGENTS.md 没有该节（两次上报仍未修）。本轮按修法的第二选项落地：在 `SYSTEM_CONTRACT.md` 新增「源码文本断言（check:assert-style）」一节（判据 / 白名单只减不增 / 三种替代写法 / `--inventory` 出仓与 `--write-allowlist` 需 `--allow-growth` 的契约），并让闸门判红文案指向该节；AGENTS.md 是受保护的 agent 指令文件、本轮不写入。
+  - **测试（47 → 48 检查）**：`test_check_source_text_asserts.js` 新增 r17-A 检查（解构重命名与 `.bind` 各自判红并点名、改回裸 `includes` 仍红、只取量纲时不入账）；POSITIVE 46 → **49 种**（两种别名形态 + 裸 includes 对照），NEGATIVE 13 → **15 类**（别名只取行数/长度）；`test_suites.js` 的 desc 数字同步对账。
+  - **验证**：`TZ=UTC node scripts/check-source-text-asserts.js` exit 0（3190 条，逐文件无变化）；`test_check_source_text_asserts.js` 48/48、`test_ci_static_gates.js` 12/12、`test_doc_line_gates.js` 10/10、`test_suite_registry.js` 全绿；`scripts/probe-format-coupling.js` 全 format-clean（99 个文件已还原、`git status` 与运行前一致）；`check-version.js` 四方一致；`npm run check:doc-lines` 7 个文件最长 1185 字符；`npx standard` 改动文件 exit 0。`test_ci_skip_suites.js` 前 9 条接线断言绿，随后在本机既有环境缺口处失败（`test_check_deps.js` 的 re2 engines 元数据断言；HEAD 版副本同位置同样失败，非本轮回归）。
+  - **版本**：3.458.0 → **3.459.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。

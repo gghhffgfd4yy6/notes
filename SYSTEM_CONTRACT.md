@@ -97,7 +97,7 @@
 
 ## 修改检查
 
-- 改判重、缓存、过滤、推送、网络、配置或文件存储：补针对性测试并运行 `npm run check`（= lint → 版本闸门 → 变异行段校验 → 静态扫描 → 文档行长 → `npm test`，v3.280 起第 4 道、v3.281 起第 5 道）。
+- 改判重、缓存、过滤、推送、网络、配置或文件存储：补针对性测试并运行 `npm run check`（= lint → 版本闸门 → 变异行段校验 → 静态扫描 → 源码文本断言（`check:assert-style`）→ 文档行长 → `npm test`；pre-commit 同序，v3.280 起第 4 道、v3.281 起第 6 道）。
 - 改 `.githooks/*` 或 `.github/workflows/*`：必跑 `npm run check:ci-static`（`shellcheck` 扫全部钩子 + `zizmor` 扫全部 workflow，medium 及以上计红；zizmor JSON 解析不出来按「不可判定=红」fail-closed）。这两类文件**默认全量被扫描、没有豁免**；三处接线（`npm run check`、pre-commit 第 4 道、CI policy job 步骤）由 `test_ci_static_gates.js` 用内容断言锁死。CI 把 zizmor 钉在 `==1.30.1`，升级须两处同步。
 - 改单元/变异测试的执行方式：`run_unit_tests.js` 自 v3.278 起以**并发池**跑单元套件（默认并发 8，`XBK_UNIT_CONCURRENCY` 可调），但 `XBK_MUTATION_CHILD=1`（stryker 与 `run_mutation.js` 的变异评估沙箱）时**必须保持串行 1**——并发会让 `test_filter.js` 的 `PERF_MS` 性能断言口径漂移，把本应 Killed 的变异体误记成 Survived/Killed（分数失真）。并发与串行的逐套件判定结果必须一致，汇总/失败归因/`GITHUB_STEP_SUMMARY` 口径不变。
 - 变异 runner 的挂死判据是**连续静默 + 总上限**双轨：`run_mutation.js` 中 stdout 或 stderr 每收到数据都会重置 `MUTATION_IDLE_MS`（默认 180s）静默计时器；持续无输出达到该值才触发 kill，总上限 `MUTATION_TIMEOUT`（默认 600s；**必须严格大于静默线**，否则静默线永不先到）仍是硬兜底，不能因为抬高静默线而删除。两条线最终都由子进程 `close` 的真实退出结果结算，慢但持续输出的测试不得被误判为 timeout。 **本地入口 fail-closed**（用户指示 2026-10-16/17）：`npm run test:mutation`（`scripts/local-mutation-guard.js`）与 `node run_mutation.js` 默认拒绝执行并 exit 1，仅 `XBK_ALLOW_LOCAL_MUTATION=1` 显式放行；变异分数与存活清单的判据只在 CI。
@@ -114,3 +114,12 @@
 - 改版本：同步主文件头**首行**、`CHANGELOG.md`（最新取版本号**最大值**，不按文件位置）、`package.json`（补丁段必须为 `.0`）、`package-lock.json` 的**两个**根版本字段（顶层 `version` 与 `packages[""].version`）——现为**四方一致**，任一缺失或形态异常即 fail-closed，不允许「字段读不到就跳过」绕过门禁（`node check-version.js` 闸门）。
 - 改行为/配置/契约：同步更新 `README.md`、本文件与 `CHANGELOG.md`（涉及贡献/安全口径时一并改 `CONTRIBUTING.md` / `SECURITY.md`），避免文档与实现漂移。**现状要说清**：文档同步**没有内容门禁**——`check-version.js` 只校验 `CHANGELOG.md` 的最新版本标题与另外三方一致，不看内容是否描述本次改动；`README.md` / 本文件的同步完全靠约定与评审。因此 PR 说明必须点明「动了哪些文档 / 为什么不需要动」，评审逐条核对。
 - 破坏性 Git 操作先备份；密钥与本地配置绝不提交。
+
+## 源码文本断言（check:assert-style）
+
+`npm run check:assert-style`（`scripts/check-source-text-asserts.js`）是 v3.444 起的第 5 道快检：禁止在测试/辅助代码里**新增**「读源码文本 + 逐字比对」的断言。
+
+- 判据：把 `readFileSync` / `readFile` / `codeOf` / `codeOnly` / `stripComments` 的返回值（含解构重命名、`.bind` 别名与跨文件 helper 的返回值）拿去和字面量做逐字比对（`includes` / `indexOf` / `match` / `matchAll` / `===` / `assert.strictEqual` 等）即计一条；`JSON.parse` / `yaml.load` / `parseShell` 等**解析成结构化数据**后再断言字段不计。按**文件条数**对 `scripts/source-text-assert.allowlist.json` 判红：实测 > 基线、或基线外文件出现命中 ⇒ exit 1；条数下降只报 shortfall，不判红。
+- 白名单**只减不增**：不得为让闸门变绿去加白名单条目或放宽现有断言；检测面变宽导致既有断言首次可见时，必须先逐文件归因再决定（替代写法见 RUNBOOK「四式」与下一条）。
+- 三种替代写法：① **AST 结构断言**——`test_support/source_model.js` 的 `loadModel()` 断言「有该函数 / 该调用 / 该 export」，不比对文本片段；② **解析配置后断言字段**——`YAML.parse` / `JSON.parse` / `parseShell` 先解析成对象再断言字段与取值；③ **行为断言**——构造输入触发真实路径，断言输出/副作用（首选但最贵）。删除断言须证明「在任何破坏下都不会红」并在 PR 写明验证方法。
+- 工具契约：`--inventory <path>` 把逐条清单写到**仓库外**（默认 `~/ledgers/pipelines/assertshape-20261115/inventory.json`；目标落在仓库内即 exit 2）；`--write-allowlist` 只允许收紧（重生成与冻结文件逐字节一致），条数**增长**必须显式加 `--allow-growth` 并打印逐文件差额，否则拒绝写入。逐条清单绝不进仓库。

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.458 — S0 静态分析面清零：scripts/probe-format-coupling.js 的 17 条 Codacy warning 按「只加注解 / 等价改写」逐条消掉（非字面量 fs 补裸 eslint-disable-next-line / 变量下标改 .at() / 两条 YAML 正则加注解 / 用法串去尖括号），探针判定语义与扰动面一字未改，白名单基线 3190 原地不动（只动 scripts/ 与文档，生产逻辑一行未改） *******
+//* ******* 线报酷推送脚本 v3.459 — S0 收 r17 四处缺口：读取函数别名的解构重命名/.bind 认不出、check:assert-style 步骤可被 step 级 if/continue-on-error 条件化、SYSTEM_CONTRACT 的 check 链漏项与道数错位、闸门判红文案指向不存在的章节；只动测试/scripts/文档，白名单 3190 原地不动 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

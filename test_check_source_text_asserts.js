@@ -225,6 +225,22 @@ const POSITIVE = [
     lines("const { readFileSync } = require('node:fs')", "const assert = require('node:assert')",
       "const text = readFileSync('a.js', 'utf8')",
       "assert.ok(text.includes('DESTRUCTURE'))"), ['DESTRUCTURE']],
+  // ── r17-A（读取函数的别名解析：解构重命名 / .bind 两种写法旧实现 0 命中、exit 0） ─────────
+  // 旧实现只按「本地名恰好与读取函数同名」认出读取器（calleeTailName），把 `readFileSync` 改名成
+  // `readSource` 或经 `.bind(fs)` 接住后，`readSource(...)` 的返回值从不污染 ⇒ 整族失明。
+  ['解构重命名（const { readFileSync: readSource } = require(\'node:fs\')，r17-A）',
+    lines("const { readFileSync: readSource } = require('node:fs')", "const assert = require('node:assert')",
+      "const src = readSource('a.js', 'utf8')",
+      "assert.ok(src.includes('DESTRUCTURE_RENAME'))"), ['DESTRUCTURE_RENAME']],
+  ['.bind 后的读取别名（const readSource = fs.readFileSync.bind(fs)，r17-A）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'const readSource = fs.readFileSync.bind(fs)',
+      "const src = readSource('a.js', 'utf8')",
+      "assert.ok(src.includes('BOUND_READER'))"), ['BOUND_READER']],
+  ['r17-A 反例：同一夹具改回裸 includes 仍命中（别名不是检测面的必要条件）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "assert.ok(src.includes('BARE_CONTROL'))"), ['BARE_CONTROL']],
   ['helper 里读文件再 return（function load() { const s = readFileSync(); return s }）',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "function load () { const s = fs.readFileSync('a.js', 'utf8'); return s }",
@@ -461,7 +477,17 @@ const NEGATIVE = [
   ['真 sanitizer 仍放行：yaml.load 之后比字段（r15-4 只摘掉 JSON.stringify，不许顺手废掉解析器）',
     lines("const fs = require('node:fs')", "const yaml = require('js-yaml')",
       "const cfg = yaml.load(fs.readFileSync('config.yml', 'utf8'))",
-      "assert.ok(cfg.segments.includes('build'))"), []]
+      "assert.ok(cfg.segments.includes('build'))"), []],
+  // r17-A 的反向：别名只用来取量纲（行数/长度）时不是逐字比对——检测面变宽不得把行数断言灌进基线。
+  ['解构重命名的读取器只取行数（readSource(f).split(…).length，r17-A 反向）',
+    lines("const { readFileSync: readSource } = require('node:fs')", "const assert = require('node:assert')",
+      "const lines = readSource('a.js', 'utf8').split('\\n')",
+      'assert.ok(lines.length > 3)'), []],
+  ['.bind 读取别名只取长度（readSource(f).length，r17-A 反向）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'const readSource = fs.readFileSync.bind(fs)',
+      "const n = readSource('a.js', 'utf8').length",
+      'assert.ok(n > 0)'), []]
 ]
 
 // ── A/B 执行：正向形态数 = POSITIVE.length，反向形态数 = NEGATIVE.length ────────────
@@ -961,6 +987,66 @@ check('r15-5 跨文件 helper 锚点形参：require 过来的 hasFileText(f, an
   assert.strictEqual(result.status, 1, '跨文件锚点形参必须判红：' + result.out)
   assert.ok(/test_use_file_helper\.js\s+基线 0 \/ 实测 3 \/ \+3/.test(result.out),
     '必须逐调用点记 3 条（不是 0，也不是 1）：' + result.out)
+})
+
+// ── r17-A：读取函数的别名解析（解构重命名 / .bind）────────────────────────────
+// 反例（评审实测，隔离副本）：`const { readFileSync: readSource } = require('node:fs')` 与
+// `const readSource = fs.readFileSync.bind(fs)` 两种写法各建一份夹具，`node scripts/check-source-text-asserts.js`
+// 都输出「✅ 未新增源码文本断言」、exit 0；只把 `: readSource` 加上就让整族失明。对照组（裸 includes）exit 1。
+// 这里锁三层：两种别名形态各自判红并点名；改回裸 includes 仍判红（别名不是检测面的必要条件）；
+// 只取量纲时不入账（检测面变宽不得把行数断言灌进基线）。
+check('r17-A 读取别名：解构重命名与 .bind 都判红，改回裸 includes 仍红', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_seed.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  const bare = (anchor) => lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    `assert.ok(src.includes('${anchor}'))`
+  )
+  write(dir, 'test_alias_destr.js', lines(
+    "const { readFileSync: readSource } = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const src = readSource('a.js', 'utf8')",
+    "assert.ok(src.includes('DESTRUCTURE_RENAME'))"
+  ))
+  write(dir, 'test_alias_bind.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    'const readSource = fs.readFileSync.bind(fs)',
+    "const src = readSource('a.js', 'utf8')",
+    "assert.ok(src.includes('BOUND_READER'))"
+  ))
+  const aliased = runChecker(dir)
+  assert.strictEqual(aliased.status, 1, '两种读取别名都必须判红（旧实现两种都 exit 0）：' + aliased.out)
+  assert.ok(/test_alias_destr\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(aliased.out), '必须点名解构重命名文件：' + aliased.out)
+  assert.ok(/test_alias_bind\.js\s+基线 0 \/ 实测 1 \/ \+1/.test(aliased.out), '必须点名 .bind 文件：' + aliased.out)
+  // 反例：把两种夹具都改回裸 includes，断言一条没少 ⇒ 仍判红（不得因为别名被移除而「变绿」）。
+  write(dir, 'test_alias_destr.js', bare('DESTRUCTURE_RENAME'))
+  write(dir, 'test_alias_bind.js', bare('BOUND_READER'))
+  const reverted = runChecker(dir)
+  assert.strictEqual(reverted.status, 1, '改回裸 includes 后仍必须判红：' + reverted.out)
+  assert.ok(reverted.out.includes('test_alias_destr.js') && reverted.out.includes('test_alias_bind.js'),
+    '两个文件都必须仍在超基线清单里：' + reverted.out)
+  // 反向：别名只用来取行数 / 长度，不是逐字比对 ⇒ 不得入账（否则检测面一放宽就灌基线）。
+  write(dir, 'test_alias_destr.js', lines(
+    "const { readFileSync: readSource } = require('node:fs')",
+    "const assert = require('node:assert')",
+    "const lines = readSource('a.js', 'utf8').split('\\n')",
+    'assert.ok(lines.length > 3)'
+  ))
+  write(dir, 'test_alias_bind.js', lines(
+    "const fs = require('node:fs')",
+    "const assert = require('node:assert')",
+    'const readSource = fs.readFileSync.bind(fs)',
+    "const n = readSource('a.js', 'utf8').length",
+    'assert.ok(n > 0)'
+  ))
+  const counts = runChecker(dir)
+  assert.strictEqual(counts.status, 0, '量纲断言不得入账：' + counts.out)
+  assert.ok(!counts.out.includes('test_alias_destr.js') && !counts.out.includes('test_alias_bind.js'),
+    '两个别名文件都不得出现在命中清单里：' + counts.out)
 })
 
 // ── r12-4：扫描面 = 整棵仓库（显式跳过名单），任意新目录默认在内 ────────────────
