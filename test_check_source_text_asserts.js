@@ -660,6 +660,8 @@ check('--write-allowlist：重生成与冻结文件逐字节一致，且清单�
   // eslint-disable-next-line
   const first = fs.readFileSync(file, 'utf8') // nosemgrep（file = 隔离工作区里的基线，比对 round-trip 用）
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
+  // file = 上一处已读的隔离工作区基线，round-trip 比对用，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(file, 'utf8'), first, '两次重生成必须逐字节一致') // nosemgrep（同上）
   const data = JSON.parse(first)
   assert.strictEqual(data.schema, 2, '形状必须是 schema 2')
@@ -795,8 +797,12 @@ check('探针：不读源码文本的测试必须判 format-clean（收紧扰动
 check('探针：跑完必须逐字节还原生产文件（重排不得留在工作树里）', () => {
   const dir = probeWorkspace()
   write(dir, 'test_clean.js', CLEAN_TEST)
+  // dir = mkdtemp 结果 + 本文件硬编码的 'prod.js'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   const before = fs.readFileSync(path.join(dir, 'prod.js'), 'utf8') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'prod.js'，无外部净输入）
   assert.strictEqual(runProbe(dir, 'test_clean.js').status, 0)
+  // 同上：读隔离工作区里的夹具，比对探针是否逐字节还原（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(path.join(dir, 'prod.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，比对探针是否逐字节还原）
     '探针必须把 prod.js 还原成原文（try/finally + 备份）')
 })
@@ -920,6 +926,8 @@ check('探针：.github/** 与 .githooks/** 在扰动面内（读它们的逐字
   assert.strictEqual(result.status, 1, '.github/.githooks 的逐字断言必须判 coupled：' + result.out)
   assert.ok(/test_dot\.js\s+format-coupled/.test(result.out), '必须判 format-coupled：' + result.out)
   // 还原必须干净（点目录里的文件也在备份/还原范围内）。
+  // dir = mkdtemp 结果 + 本文件硬编码的钩子路径，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(path.join(dir, '.githooks/pre-commit'), 'utf8'), // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的钩子路径，无外部净输入）
     '#!/bin/bash\nset -e\nrun_gate "lint" "提示" npm run lint\n', '钩子必须逐字节还原')
 })
@@ -943,8 +951,8 @@ check('shell 扰动只改空白：shebang / heredoc 正文逐字保留，非空�
   const after = out.split('\n')
   assert.strictEqual(after.length, before.length, '扰动不得增删行')
   for (let i = 0; i < before.length; i++) {
-    assert.strictEqual(before[i].replace(/\s+/g, ''), after[i].replace(/\s+/g, ''),
-      `第 ${i + 1} 行只允许空白变化：${JSON.stringify(before[i])} → ${JSON.stringify(after[i])}`)
+    assert.strictEqual(before.at(i).replace(/\s+/g, ''), after.at(i).replace(/\s+/g, ''),
+      `第 ${i + 1} 行只允许空白变化：${JSON.stringify(before.at(i))} → ${JSON.stringify(after.at(i))}`)
   }
   assert.strictEqual(after[0], before[0], 'shebang 必须逐字保留（`#!` 必须是文件头两个字节）')
   assert.strictEqual(after[4], before[4], 'heredoc 正文是数据，必须逐字保留')
@@ -958,11 +966,15 @@ check('探针：fail-closed 分支（重排后无法解析）必须还原已写�
   write(dir, 'a.js', 'function a (x) { return x }\nmodule.exports = { a }\n')
   write(dir, 'zz.js', 'function zz (y) { return y }\nmodule.exports = { zz }\n')
   write(dir, 'test_clean2.js', lines("const assert = require('node:assert')", 'assert.strictEqual(1 + 1, 2)', "console.log('clean ok')"))
+  // dir = mkdtemp 结果 + 本文件硬编码的 'a.js'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   const before = fs.readFileSync(path.join(dir, 'a.js'), 'utf8') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'a.js'，无外部净输入）
   const result = runProbeWith(dir, { PROBE_FORCE_UNPARSEABLE: 'zz.js' }, 'test_clean2.js')
   assert.strictEqual(result.status, 2, '探针自身 bug 必须 exit 2（不产出 coupled 结论）：' + result.out)
   assert.ok(/已还原 [1-9][0-9]* 个文件/.test(result.out), '必须打印「已还原 N 个文件」（旧实现一个字都不提）：' + result.out)
   assert.ok(/重排后无法解析 zz\.js/.test(result.out), '必须点名触发分支的文件：' + result.out)
+  // 同上：读隔离工作区里的夹具，验证 fail-closed 路径是否还原（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(path.join(dir, 'a.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，验证 fail-closed 路径是否还原）
     'fail-closed 分支必须把先前已写盘的 a.js 逐字节还原（旧实现在这里整份留在重排态）')
 })
