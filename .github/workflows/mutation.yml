@@ -205,7 +205,8 @@ jobs:
           for f in "$RUNNER_TEMP"/tap-logs/*.log; do
             [ -f "$f" ] || continue
             echo "=== $f（$(wc -l < "$f") 行）==="
-            grep -aE '❌|AssertionError|Error:|失败' "$f" | head -n 40 || true
+            grep -aE '❌|AssertionError|Error:|失败' "$f" | head -n 20 || true
+            tail -n 12 "$f" || true
           done
 
   mutation:
