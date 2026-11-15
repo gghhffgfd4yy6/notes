@@ -331,8 +331,9 @@ function createApp ({
 
   /** link 不支持时的回退分支：`open('wx')` 独占占名 + 直接写。
    *  为什么写失败必须删掉刚占的名字（R1-r5 #2）：open 先把名字占住，write 若 ENOSPC/EIO 就留下
-   *  0 字节或半帧锁；读取侧对「内容不可判定」按 fail-closed 判 busy（R1 设计约束 3），于是该缓存
-   *  目录下**所有入口**此后每轮只打印「已有运行在跑」并 exit 0——零推送、零报错、永不自愈。
+   *  0 字节或半帧锁；读取侧对「内容不可判定」按 fail-closed **判永久失败**（v3.437 起；旧实现折叠
+   *  成 busy），于是该缓存目录下**所有入口**此后每一轮都失败停机，直到人工删掉那把锁——不再静默
+   *  零推送。占名与写帧之间被并发读者看到 0 字节的窗口，读取侧用 3×15ms 有界重试吸收。
    *  故写失败时按 fd 的 (dev,ino) 复核后删掉刚建的那个名字再抛出（见 discardRunLockFile）。
    *  为什么不改成「tmp 写全再 rename 占名」：rename 是**覆盖**语义，两个进程同时回退时后一个会
    *  盖掉前一个刚占好的锁（互斥直接失效）；要保留独占占名只能靠 link，而这条分支的前提正是
@@ -386,15 +387,18 @@ function createApp ({
    *  于是一帧手写/损坏的内容就能指认出别的进程，进而把活锁判成可接管。这里只接受
    *  「number + safe integer + > 0」的 pid/startedAt 与「非空字符串」的 token；
    *  任何一项不满足 ⇒ null（调用方按内容不可判定 fail-closed）。
-   *  A4（C-027）：pid 还必须 ≤ RUN_LOCK_PID_MAX——超上限的 pid 不可能是真实进程，属**帧非法**
-   *  （不可判定），绝不能当成「持有者已死」去接管（那是 fail-open）。 */
+   *  A4（C-027）：pid 还必须 < `min(4194304, /proc/sys/kernel/pid_max)`（实际判据见 runLockPidBound /
+   *  runLockPidLimit，常量 RUN_LOCK_PID_MAX 只是硬上限）。pid_max 是**排他上界**（有效 pid 只能小于
+   *  它），pid **等于或超过**上界都不可能是真实进程，属**帧非法**（不可判定）；绝不能当成
+   *  「持有者已死」去接管（那是 fail-open）。 */
   const parseRunLockFrame = (raw) => {
     let frame = null
     try { frame = JSON.parse(raw) } catch (e) { return null }
     if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return null
     const { pid, startedAt, token } = frame
     if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return null
-    if (pid > runLockPidBound()) return null
+    // Linux 的 pid_max 是**排他上界**（有效 pid 只能小于它），故用 >=：pid 恰好等于上界同样不可能是真进程。
+    if (pid >= runLockPidBound()) return null
     if (typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt) || startedAt <= 0) return null
     if (typeof token !== 'string' || token.trim() === '') return null
     // startTicks 只认十进制数字串；形态不对 = 没有证据（不是「复用证据」），死活在下面另判。
@@ -419,7 +423,10 @@ function createApp ({
    *  `startTicks` 只是把「帧里那条独立时钟证据」一并交回调用方（R1-r5 #1 用它判定「哨兵是不是
    *  本进程自己的残留」）；死活判定仍只在上面的 kill/时钟比较里做，token 内容依旧不参与。
    *  EACCES/EISDIR/EIO 等**读取错误不折叠成 busy**：那是真实文件系统故障，如实抛出（fail-loud）。 */
-  const readRunLockState = (filePath) => {
+  const readRunLockState = (filePath, opts) => {
+    // quietZombie：接管路径会**再读一次**同一把锁（复判 `again`），僵尸告警只由第一次判定打一条；
+    // 否则一轮接管会打两条一模一样的 ⚠️（评审 nit：运维会以为出了两次问题）。
+    const quietZombie = Boolean(opts) && opts.quietZombie === true
     let fd = null
     try {
       fd = nodeFs.openSync(filePath, RUN_LOCK_OPEN_FLAGS)
@@ -476,14 +483,16 @@ function createApp ({
         process.kill(frame.pid, 0)
         alive = true
       } catch (e) {
-        alive = Boolean(e) && e.code === 'EPERM' // EPERM = 进程存在但无权限；ESRCH = 已退出
+        // ESRCH = 已退出；EPERM = 存在但无权限（唯一能确定「活着」的错误）。其它错误（EINVAL 等）
+        // 既不能证明活着、也不能证明死了 ⇒ 按「活着」保守处理（fail-closed，绝不再因畸形 pid 抢锁）。
+        alive = Boolean(e) && e.code !== 'ESRCH'
       }
       if (!alive) return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
       // A4（C-027）行为 1：僵尸持有者必须按已退出处理。`kill(pid, 0)` 对僵尸返回成功，而僵尸
       // 已经跑不完任何一轮——判活就是永久 busy（零推送且看起来正常）。只认 /proc 的 'Z'；
       // 读不到状态（非 Linux）时**没有证据**，保持原口径（按存活处理）。
       if (runLockProcessState(frame.pid) === 'Z') {
-        console.warn(`⚠️ run 锁持有进程是僵尸（pid=${frame.pid}），按已退出处理（随后尝试接管）：${filePath}`)
+        if (!quietZombie) console.warn(`⚠️ run 锁持有进程是僵尸（pid=${frame.pid}），按已退出处理（随后尝试接管）：${filePath}`)
         return { state: 'stale', holder, token: frame.token, startTicks: frame.startTicks }
       }
       // 活着就结束判定：**不按 startedAt/mtime 判陈旧**——长时间运行是正常的，抢锁就是双跑。
@@ -2300,7 +2309,7 @@ function createApp ({
         let outcome = null
         let bodyError = null
         try {
-          const again = readRunLockState(lockPath)
+          const again = readRunLockState(lockPath, { quietZombie: true })
           // A1 同口径：复判到「内容不可判定」同样是**永久失败**——折叠成 busy 就又回到
           // 「入口 exit 0、常驻当正常轮、永久零推送」。哨兵会在下面的 finally 里按归属释放。
           if (again.corrupted) throw runLockUnreadableError(lockPath, again.reason || 'frame_invalid')
