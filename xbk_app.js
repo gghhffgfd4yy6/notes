@@ -387,8 +387,10 @@ function createApp ({
    *  于是一帧手写/损坏的内容就能指认出别的进程，进而把活锁判成可接管。这里只接受
    *  「number + safe integer + > 0」的 pid/startedAt 与「非空字符串」的 token；
    *  任何一项不满足 ⇒ null（调用方按内容不可判定 fail-closed）。
-   *  A4（C-027）：pid 还必须 ≤ RUN_LOCK_PID_MAX——超上限的 pid 不可能是真实进程，属**帧非法**
-   *  （不可判定），绝不能当成「持有者已死」去接管（那是 fail-open）。 */
+   *  A4（C-027）：pid 还必须 < `min(4194304, /proc/sys/kernel/pid_max)`（实际判据见 runLockPidBound /
+   *  runLockPidLimit，常量 RUN_LOCK_PID_MAX 只是硬上限）。pid_max 是**排他上界**（有效 pid 只能小于
+   *  它），pid **等于或超过**上界都不可能是真实进程，属**帧非法**（不可判定）；绝不能当成
+   *  「持有者已死」去接管（那是 fail-open）。 */
   const parseRunLockFrame = (raw) => {
     let frame = null
     try { frame = JSON.parse(raw) } catch (e) { return null }

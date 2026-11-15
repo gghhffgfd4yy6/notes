@@ -13,7 +13,7 @@ const os = require('os')
 
 // v3.403：日志上限在生产是 100MiB；本套件用桩 fs 造夹具，按 20MiB 注入即可覆盖同一套截尾逻辑
 process.env.XBK_LOG_LIMIT_BYTES = String(20 * 1024 * 1024)
-const { createApp, SIMILAR_WINDOW_MAX_BYTES } = require('./xbk_app.js')
+const { createApp, SIMILAR_WINDOW_MAX_BYTES, runLockPidLimit } = require('./xbk_app.js')
 
 let passed = 0
 let failed = 0
@@ -5279,6 +5279,84 @@ check('R1 锁：持有进程活着 ⇒ 即使 startedAt 非常旧也不接管', 
   assert.deepStrictEqual(readLockFrame(dir), old, '活锁内容一个字都不能改（改了就是双跑）')
 })
 
+// A5/F2（评审二轮 M1.3 未闭环）：`kill(pid,0)` 的 errno 判定必须有**可证伪**覆盖。
+// 旧判定 `alive = e.code === 'EPERM'` 只认 EPERM：`EINVAL` / `ERR_INVALID_ARG_TYPE` 等一律被当成
+// 「已死」⇒ 一帧畸形 pid 就能抢走活锁（fail-open）。三条用例分别钉 EPERM（判活）、EINVAL（判活）、
+// ESRCH（判死可接管）；把 alive 回退成 `e.code === 'EPERM'` 时**只有 EINVAL 那条会红**——EPERM 在旧
+// 判定下同样是 busy，单靠它锁不住行为，这也是必须补这条的原因。
+// 桩只拦 KILL_PROBE_PID 这一个 pid，其余 kill 原样转发；每条用例 finally 里还原。
+const killProbePidMax = (() => {
+  try { return lockFs.readFileSync('/proc/sys/kernel/pid_max', 'utf8') } catch (e) { return null }
+})()
+// 取「合法 pid 的最大值」（上界是排他上界）而不是写死 4000001：容器/pid namespace 里 pid_max 可能只有
+// 32768，写死的值会先被 parseRunLockFrame 判成帧非法，用例就测不到 errno 判定这条路径。
+const KILL_PROBE_PID = runLockPidLimit(killProbePidMax) - 1
+const withKillError = (pid, code, fn) => {
+  const origKill = process.kill
+  process.kill = function (target, sig) {
+    if (Number(target) === Number(pid)) {
+      const e = new Error(`kill probe ${code}`)
+      e.code = code
+      throw e
+    }
+    return origKill.call(process, target, sig)
+  }
+  try { return fn() } finally { process.kill = origKill }
+}
+/** 非 ESRCH 的 errno ⇒ 判活：`_acquireRunLock` busy、`run()` skipped、锁内容原样、无接管哨兵。 */
+async function assertKillErrnoKeepsLockAlive (code) {
+  const dir = mkTmpFixture(`runlock-kill-${code.toLowerCase()}-`)
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  const holder = { pid: KILL_PROBE_PID, startedAt: Date.now() - 3600 * 1000, token: `${KILL_PROBE_PID}:0:live` }
+  const raw = JSON.stringify(holder)
+  lockFs.writeFileSync(p, raw, { mode: 0o600 })
+  let got = null
+  let runPromise = null
+  withKillError(KILL_PROBE_PID, code, () => {
+    got = app._acquireRunLock()
+    // async 函数体在首个 await 之前是同步执行的，`run()` 的取锁调用就发生在这里 ⇒ 用的是桩。
+    runPromise = app.run()
+    return null
+  })
+  const summary = await runPromise
+  assert.strictEqual(got.ok, false,
+    `kill 抛 ${code} 既证明不了活着也证明不了死了 ⇒ 必须按存活处理、不得接管：${JSON.stringify(got)}`)
+  assert.strictEqual(got.busy, true, `${code} 必须收口 busy（入口据此打「已有运行在跑」并 exit 0）`)
+  assert.deepStrictEqual(got.holder, { pid: KILL_PROBE_PID, startedAt: holder.startedAt },
+    `${code} 判活时必须原样带回持锁者：${JSON.stringify(got.holder)}`)
+  assert.strictEqual(summary.skipped, true, `kill 抛 ${code} 时本轮必须 skipped：${JSON.stringify(summary)}`)
+  assert.strictEqual(summary.reason, 'RUN_BUSY', `skipped 原因必须仍是 RUN_BUSY：${JSON.stringify(summary)}`)
+  assert.deepStrictEqual(summary.holder, { pid: KILL_PROBE_PID, startedAt: holder.startedAt },
+    `${code} 时 skipped 摘要必须带回 holder：${JSON.stringify(summary.holder)}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8'), raw, `kill 抛 ${code} 判活时锁内容一个字都不能改`)
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'],
+    `kill 抛 ${code} 判活时不得建 run.lock.takeover 哨兵（建了就是已经开始接管）：${JSON.stringify(lockFs.readdirSync(dir))}`)
+}
+
+checkAsync('A5/F2：kill(pid,0) 抛 EPERM ⇒ 判活（busy/skipped）、锁内容原样、不建接管哨兵', async () => {
+  await assertKillErrnoKeepsLockAlive('EPERM')
+})
+
+checkAsync('A5/F2：kill(pid,0) 抛 EINVAL（非 EPERM/ESRCH）⇒ 同样判活不接管（回退成 `=== EPERM` 本条必红）', async () => {
+  await assertKillErrnoKeepsLockAlive('EINVAL')
+})
+
+check('A5/F2：kill(pid,0) 抛 ESRCH ⇒ 判死可接管（正例：证明上面两条的「判活」不是一律不接管）', () => {
+  const dir = mkTmpFixture('runlock-kill-esrch-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  lockFs.writeFileSync(p, JSON.stringify({
+    pid: KILL_PROBE_PID, startedAt: Date.now() - 3600 * 1000, token: `${KILL_PROBE_PID}:0:dead`
+  }), { mode: 0o600 })
+  const got = withKillError(KILL_PROBE_PID, 'ESRCH', () => app._acquireRunLock())
+  assert.strictEqual(got.ok, true, `ESRCH = 持有者已退出 ⇒ 必须能接管：${JSON.stringify(got)}`)
+  const frame = readLockFrame(dir)
+  assert.strictEqual(frame.pid, process.pid, '接管后锁帧必须换成本进程')
+  assert.strictEqual(frame.token, got.token, '接管后锁帧必须带本次 token')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '接管不得残留哨兵/回收名')
+})
+
 check('R1 锁：PID 复用（pid 活着但帧里的启动时钟不符）⇒ 判定为死主并可接管', () => {
   const dir = mkTmpFixture('runlock-pidreuse-')
   const app = makeLockApp(dir)
@@ -5841,7 +5919,10 @@ checkAsync('A4/C-027 行为 1：僵尸持有者（/proc state=Z）⇒ 按已退�
       assert.strictEqual(obs[0].reacquire.holder && obs[0].reacquire.holder.pid, process.pid,
         '持锁者必须是本进程（僵尸被按已退出处理 ⇒ 锁帧换成我们的 pid）')
       const hit = warns.filter((w) => w.includes('僵尸') && w.includes(String(zombie.pid)))
-      assert.ok(hit.length >= 1, `必须至少一条告警含「僵尸」与该 pid（实测 ${JSON.stringify(warns)}）`)
+      // 条数必须**恰好 1**（评审二轮 F6）：接管路径会再读一次同一把锁（复判 again），旧实现那里没带
+      // quietZombie ⇒ 一轮接管打两条一模一样的 ⚠️。`>= 1` 对多打一条完全无感；strictEqual 1 才锁得住。
+      assert.strictEqual(hit.length, 1,
+        `一轮接管里 ⚠️ 僵尸告警必须恰好 1 条（复判那次的 quietZombie 失效就会变 2；实测 ${hit.length}：${JSON.stringify(warns)}）`)
       assert.ok(hit.some((w) => w.includes('⚠️')), `僵尸告警必须带 ⚠️：${JSON.stringify(hit)}`)
     } finally {
       if (prevEnvDir === undefined) delete process.env.XBK_CACHE_DIR
@@ -5877,6 +5958,30 @@ checkAsync('A4/C-027 行为 2：pid 超 pid_max（1e15）⇒ 抛 RUN_LOCK_UNREAD
   assert.ok(warns.some((w) => w.includes('⚠️')), `必须至少一条 ⚠️ 告警：${JSON.stringify(warns)}`)
   assert.deepStrictEqual(readLockFrame(dir), alien, '主锁不得被替换（pid 仍必须是 1e15）')
   assert.strictEqual(readLockFrame(dir).pid, 1e15, '主锁 pid 必须原样保留 1e15')
+})
+
+check('A4/C-027 行为 2：pid **恰好等于**上界 min(4194304, 内核 pid_max) ⇒ 判帧非法（pid_max 是排他上界）', () => {
+  const dir = mkTmpFixture('runlock-a4-pidmax-eq-')
+  const app = makeLockApp(dir)
+  const p = lockPathReal(dir)
+  // 取与实现完全相同的上界来源。pid_max 是**排他**上界（合法 pid 最大是 pid_max-1），所以 pid 等于上界
+  // 同样不可能是真进程；`kill(bound,0)` 返回 ESRCH ⇒ 旧写法（`>`）会把它判成死主并接管成功。
+  // 直接打 `_acquireRunLock()`（取锁判定的唯一入口）：把 `>=` 改回 `>` 时这里不抛错而是返回 ok:true，
+  // 本条立刻变红（走 `app.run()` 会先接管、再在业务体里因为桩缺 Utils.safeText 报无关错误，红得不清楚）。
+  const bound = runLockPidLimit((() => {
+    try { return lockFs.readFileSync('/proc/sys/kernel/pid_max', 'utf8') } catch (e) { return null }
+  })())
+  assert.ok(Number.isSafeInteger(bound) && bound > 2, `前置：上界必须可判定（实测 ${bound}）`)
+  const edge = { pid: bound, startedAt: Date.now(), token: 'x:0:y', startTicks: '0' }
+  const raw = JSON.stringify(edge)
+  lockFs.writeFileSync(p, raw, { mode: 0o600 })
+  const { error, warns } = captureLockWarn(() => app._acquireRunLock())
+  assert.ok(error, `pid 恰好等于上界（${bound}）同样是帧非法：必须抛错、不得判死接管（旧写法会接管成功）`)
+  assert.strictEqual(error.failureReason, 'RUN_LOCK_UNREADABLE', `失败原因必须是「不可判定」：${error.message}`)
+  assert.strictEqual(error.lockIssue, 'frame_invalid', `归因必须是 frame_invalid：${error.lockIssue}`)
+  assert.ok(warns.some((w) => w.includes('⚠️')), `必须至少一条 ⚠️ 告警：${JSON.stringify(warns)}`)
+  assert.strictEqual(lockFs.readFileSync(p, 'utf8'), raw, '边界帧不得被接管改写')
+  assert.deepStrictEqual(lockFs.readdirSync(dir), ['run.lock'], '不得建 run.lock.takeover 哨兵')
 })
 
 checkAsync('R1 行为：已有活锁时 App.run 返回 skipped（RUN_BUSY），不写日志/状态、不推送', async () => {
@@ -6704,19 +6809,47 @@ checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====
+// F3 自检探针：恒返回 'skip' 的 async 用例。drain 的 skip 分支（`if (await fn() === 'skip') continue`）
+// 必须被断言锁住——探针被计成 passed 时下面的自检与声明数对账同时变红。
+const ASYNC_SKIP_PROBE = '自检探针（async drain 恒 skip）'
+checkAsync(ASYNC_SKIP_PROBE, async () => skip(ASYNC_SKIP_PROBE, '自检探针：本条按设计恒跳过'))
 // C5-004：drain 原先夹在文件中间，靠「for…of 读活数组 + 循环体 await 让出」才顺带跑到后面注册的
 // 用例——drain 一旦前移、或注册前出现真正的异步等待，那些用例会静默不跑且没有计数对账。
 // 现在：① 移到文件末尾；② 先快照 asyncChecks 再跑；③ 对账「声明数 === 结算数」。
 ;(async () => {
   const pending = asyncChecks.slice()
+  // 逐条记录 (passed/skipped/failed) 增量：F3 的自检要据此证明「跳过既没进 passed、也没漏进 skipped」。
+  const deltas = new Map()
   for (const [name, fn] of pending) {
+    const before = { passed, skipped, failed }
+    let outcome = 'pass'
     try {
-      if (await fn() === 'skip') continue
-      passed++
+      if (await fn() === 'skip') outcome = 'skip'
+      else passed++
     } catch (e) {
+      outcome = 'fail'
       failed++
       failures.push(`${name} :: ${e.message}`)
     }
+    deltas.set(name, {
+      outcome,
+      passed: passed - before.passed,
+      skipped: skipped - before.skipped,
+      failed: failed - before.failed
+    })
+  }
+  // 自检（评审二轮 F3）：async 跳过必须「passed 不增 / skipped+1 / 原文留档」。
+  // 回退 drain 的 `continue` ⇒ 探针 passed+1（skip() 又已让 skipped+1）⇒ 本条立刻红。
+  try {
+    const probe = deltas.get(ASYNC_SKIP_PROBE)
+    assert.ok(probe, `前置：async 探针必须真的被执行（${ASYNC_SKIP_PROBE}）`)
+    assert.strictEqual(probe.outcome, 'skip', `async 探针必须走 skip 分支（实测 ${probe.outcome}）`)
+    assert.strictEqual(probe.passed, 0, `async 跳过不得让 passed +1（实测 +${probe.passed}）`)
+    assert.strictEqual(probe.skipped, 1, `async 跳过必须让 skipped 恰好 +1（实测 +${probe.skipped}）`)
+    assert.strictEqual(probe.failed, 0, 'async 跳过不得计入 failed')
+  } catch (e) {
+    failed++
+    failures.push(`自检：async drain 的 skip 记账 :: ${e.message}`)
   }
   console.log(`通过 ${passed} / 失败 ${failed}${skipped ? ` / 跳过 ${skipped}` : ''}（声明 ${declared} 例）`)
   if (skipped) {

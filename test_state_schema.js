@@ -21,7 +21,8 @@ let skipped = 0
 const failures = []
 const skips = []
 // 声明用例数：新增/删除用例时必须同步（结算数不符 ⇒ 直接红，避免「不执行的用例被记成通过」）。
-const DECLARED_CASES = 42
+// 42 条原有用例 + 2 条自检（恒 SKIP 探针 + 跳过记账自检，见文件末尾）。
+const DECLARED_CASES = 44
 
 function check (name, fn) {
   try {
@@ -517,6 +518,27 @@ check('源码形状：run.log 摘要行只能由 formatRunSummaryLine({…}) 生
   const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep（同上：字面量路径 + 形状断言）
   assert.ok(INLINE_SUMMARY.test(schemaSrc),
     'xbk_state_schema.formatRunSummaryLine 必须仍保有摘要模板（删掉它等于让 run.log 摘要消失）')
+})
+
+// ===== 自检（评审二轮 F3）：check() 的 SKIP 分支必须被用例锁住 =====
+// 现状（本轮修）：`check()` 认出 `SKIP …` 只是改了实现——没有任何断言锁住「跳过 ⇒ passed 不增、
+// skipped+1」，而 DECLARED_CASES 对账也抓不到：跳过被计成通过时 skipped 恒 0、结算数依然对得上。
+// 下面用一个**恒返回 SKIP** 的探针 + 一条读计数的自检把记账钉死：把 check() 回退成 `fn(); passed++`，
+// 自检立刻红（passed 多 1、skipped 少 1），探针原文也不在 skips 里。
+const skipProbeMsg = 'SKIP 自检探针（本条按设计恒跳过）：用于锁住 check() 的跳过记账'
+const beforeProbe = { passed, failed, skipped }
+check('自检探针（恒 SKIP）', () => skipProbeMsg)
+check('自检：check() 的 SKIP 分支——跳过不计 passed、skipped 恰好 +1、原文留档、结算与声明数对账', () => {
+  assert.strictEqual(passed, beforeProbe.passed,
+    `跳过不得计入 passed（探针前 ${beforeProbe.passed}，现在 ${passed}）`)
+  assert.strictEqual(failed, beforeProbe.failed, '跳过不得计入 failed')
+  assert.strictEqual(skipped, beforeProbe.skipped + 1,
+    `跳过必须计入 skipped 且恰好 +1（探针前 ${beforeProbe.skipped}，现在 ${skipped}）`)
+  assert.strictEqual(skips[skips.length - 1], skipProbeMsg, '跳过必须把 SKIP 原文留档（逐条打印与定位都靠它）')
+  // 本条自检尚在运行（函数返回后才计数），故结算数 +1 必须正好等于声明数——把「不执行的用例被当成
+  // 通过」这一类漏算一并钉在 DECLARED_CASES 上。
+  assert.strictEqual(passed + failed + skipped + 1, DECLARED_CASES,
+    `结算对账：声明 ${DECLARED_CASES} 例，实际结算 ${passed + failed + skipped} 例 + 本条 = ${passed + failed + skipped + 1}`)
 })
 
 const settled = passed + failed + skipped

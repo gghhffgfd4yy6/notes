@@ -1534,5 +1534,12 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 ## v3.438
 
 - **评审二轮（三路独立审查剩下的 must_fix，PR #414 合并后补）**：① `test_state_schema.js` 的 `check()` 不看返回值——`sourceShapeGuard` 返回 `SKIP …` 时一条断言都没跑却照样计「通过」，在 Stryker 插桩沙箱里 B2 长期假绿；现在跳过单独计数、逐条打印，并与 `DECLARED_CASES` 对账（结算数不符直接红）。② A1 的 `too_large` 分支补用例（5 KiB **合法** JSON 帧 ⇒ `lockIssue='too_large'`、锁内容一字不改、失败轮零新增文件）：此前删掉 size 检查整套件仍全绿。③ `kill()` 判定改为「只有 ESRCH 算已死」——旧 `alive = e.code === 'EPERM'` 把任何非 EPERM 错误（如超界 pid 的 `ERR_INVALID_ARG_TYPE`）都当已死，是 A4 之外的另一个 fail-open。④ 僵尸告警去重（接管路径复判不再重复打同一条 ⚠️）；pid 上限边界改 `>=`（Linux `pid_max` 是排他上界）。⑤ 测试跨平台：依赖 `/proc` 的 A3 / A4-1 在非 Linux 上显式跳过，异步 drain 同样认 `skip`（不再把跳过记成通过）。
-- **文档口径修正**：`README` 不再让用户找并不存在的「失败原因」字段（改为看告警括号里的 `lockIssue`，并说明哨兵文案多「接管哨兵」字样）；`CHANGELOG` v3.437 的 A3 旧危害改成「同进程每轮按可重试退避、其它入口读到一律 busy」（原文写成 skipped 不准确）；`xbk_app.js` 回退分支注释同步为「不可判定 ⇒ 永久失败停机」；`SYSTEM_CONTRACT` 的 busy 措辞与 `pid ≥ pid_max` 口径收紧；`AGENTS.md` 登记 B4 新增的「控制台拆分零覆盖」校验。
+- **文档口径修正**：`README` 不再让用户找并不存在的「失败原因」字段（改为看告警括号里的 `lockIssue`，并说明哨兵文案多「接管哨兵」字样）；`CHANGELOG` v3.437 的 A3 旧危害改成「同进程每轮按可重试退避、其它入口读到一律 busy」（原文写成 skipped 不准确）；`xbk_app.js` 回退分支注释同步为「不可判定 ⇒ 永久失败停机」；`SYSTEM_CONTRACT` 的 busy 措辞与 `pid ≥ pid_max` 口径收紧。
 - **新增用例**：`test_app_unit.js` +1 条（363 → 364）；`test_state_schema.js` 42 例不变（跳过不再计通过，且与声明数对账）。
+
+## v3.439
+
+- **评审二轮 must_fix 收尾（PR #415）：两处行为改动补「回退即红」的可证伪覆盖**：① 判活口径——`kill(pid,0)` 抛**非 ESRCH** 的任何错误（`EPERM` / `EINVAL` / `ERR_INVALID_ARG_TYPE` …）一律按存活 fail-closed、绝不据此接管；`test_app_unit.js` 补 EPERM / EINVAL / ESRCH 三条（桩 `process.kill`，`finally` 还原），把 `alive` 回退成 `e.code === 'EPERM'` 时 EINVAL 那条必红。② pid 上限边界——补「pid **恰好等于** `min(4194304, 内核 pid_max)`」帧用例（判 `frame_invalid` / `RUN_LOCK_UNREADABLE`、不接管、锁内容不变），把 `>=` 改回 `>` 即红。③ 僵尸告警去重收紧为「一轮接管里恰好 1 条」（`strictEqual(1)`：复判那次不带 `quietZombie` 就会变 2）。④ 跳过记账——`test_state_schema.js` 补恒 `SKIP` 探针 + 计数自检（`passed` 不增 / `skipped` 恰好 +1 / 原文留档 / 与声明数对账），`test_app_unit.js` 的 async drain 同口径补逐条增量自检；两处回退成「跳过计成通过」都会红。⑤ `parseRunLockFrame` 头注释改为现口径：pid 必须 **<** `min(4194304, /proc/sys/kernel/pid_max)`，等于或超过即 `frame_invalid`（旧注释还写着「≤ RUN_LOCK_PID_MAX」，与实现及常量名都不符）。
+- **文档**：`SYSTEM_CONTRACT.md` 的死活条目登记「`kill(pid,0)` 抛非 ESRCH 一律按存活处理、绝不据此接管」；`README.md` 的「括号里就是错误对象的 `lockIssue`」改为指向 `SYSTEM_CONTRACT.md`（原文指向并不存在的下文）；`CHANGELOG` v3.438 条目删掉一句声称登记了某个**本 PR 未改动文件**的描述，该条目只保留实际改过的文件。
+- **新增用例**：`test_app_unit.js` +5 条（364 → 369 例，其中 1 条为恒跳过的 async 记账探针）；`test_state_schema.js` +2 条（42 → 44 例，其中 1 条为恒跳过的记账探针）。
+- **版本**：3.438.0 → **3.439.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
