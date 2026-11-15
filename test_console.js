@@ -7644,14 +7644,22 @@ async function main () {
     }
     assert.ok(/^bad_\d+_/.test(prodStore.getFileName(123)), '数字 url 必须是可区分的 bad_ 前缀名（旧实现各写一份时对非字符串入参直接返回 push.json，丢掉 bad_ 前缀的可区分性）')
     // 结构断言（M1 验收 grep 的自动化版本）：两处都不得再保留「自己拆 pushUrl 末段」的实现。
-    const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8'))
-    const statusSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8'))
-    const consoleCacheName = sliceBetween(consoleSrc, 'function messagesCacheName (', '\n}\n', 'console messagesCacheName 函数体')
-    const statusCacheName = sliceBetween(statusSrc, 'function messagesFileName (', '\n}\n', 'status messagesFileName 函数体')
-    assert.ok(!/split\(|\.replace\(/.test(consoleCacheName), '控制台不得再自己拆/洗 pushUrl 末段（只允许委托 status.messagesFileName）')
-    assert.ok(/messagesFileName\(/.test(consoleCacheName), '控制台必须委托 status.messagesFileName')
-    assert.ok(/fileNameForUrl\(/.test(statusCacheName), '--status 必须委托 xbk_message_store.fileNameForUrl')
-    assert.ok(!/split\(|\.replace\(/.test(statusCacheName), '--status 不得再自己拆/洗 pushUrl 末段')
+    // 插桩闸：这两个文件在对应变异段里会被 Stryker 改写（锚点 `function messagesCacheName (` 随之
+    // 失真）⇒ 源码形状断言在该段不适用。行为断言（上面的 messagesFileName/getFileName 逐字对拍）
+    // 不受影响，仍照跑。判据与 INSTRUMENTED_SOURCES 同源，不另造第二份检测。
+    if (INSTRUMENTED_SOURCES.has('scripts/console.js') || INSTRUMENTED_SOURCES.has('scripts/status.js')) {
+      skipped++
+      console.log('  ⏭️ M1 结构断言（console/status 不得自己拆 pushUrl）：Stryker 沙箱内源码已插桩，源码形状断言不适用')
+    } else {
+      const consoleSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8'))
+      const statusSrc = codeOf(fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8'))
+      const consoleCacheName = sliceBetween(consoleSrc, 'function messagesCacheName (', '\n}\n', 'console messagesCacheName 函数体')
+      const statusCacheName = sliceBetween(statusSrc, 'function messagesFileName (', '\n}\n', 'status messagesFileName 函数体')
+      assert.ok(!/split\(|\.replace\(/.test(consoleCacheName), '控制台不得再自己拆/洗 pushUrl 末段（只允许委托 status.messagesFileName）')
+      assert.ok(/messagesFileName\(/.test(consoleCacheName), '控制台必须委托 status.messagesFileName')
+      assert.ok(/fileNameForUrl\(/.test(statusCacheName), '--status 必须委托 xbk_message_store.fileNameForUrl')
+      assert.ok(!/split\(|\.replace\(/.test(statusCacheName), '--status 不得再自己拆/洗 pushUrl 末段')
+    }
     // 生产调用形态（不传参）：控制台读运行配置里的 pushUrl，结论必须与运行侧取该 URL 完全一致。
     // 默认 getter 恒为 `<domain>/plus/json/push.json`，两边末段恒是 push.json ⇒ 直接拿它对比是
     // 恒真断言：无参分支退回自带派生、甚至写死 return 'push.json' 都照样绿。这里先把

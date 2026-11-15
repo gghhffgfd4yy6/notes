@@ -16,4 +16,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-exec npx stryker run stryker.tap.config.js --mutate "xbk_state_schema.js" --dryRunOnly --concurrency 2
+
+# 目标文件可覆盖：某些套件只在「它的目标文件被插桩」时才暴露源码形状断言失真
+# （例：console-part* 段插桩 scripts/console.js）。workflow_dispatch 的 preflight_mutate 传入即可
+# 单独验证某一段的 dry run，不必跑整张矩阵。
+TARGET="${XBK_PREFLIGHT_MUTATE:-xbk_state_schema.js}"
+echo "preflight mutate target: $TARGET"
+exec npx stryker run stryker.tap.config.js --mutate "$TARGET" --dryRunOnly --concurrency 2
