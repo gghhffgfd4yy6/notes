@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.444 — 反回归闸按 AST 作用域重写检测面 + 接进 PR/pre-commit 门禁（S0） *******
+//* ******* 线报酷推送脚本 v3.445 — CI 反馈收口：源码文本断言闸门挪到 quality job + S2871 比较器 + Codacy 行级豁免（S0） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

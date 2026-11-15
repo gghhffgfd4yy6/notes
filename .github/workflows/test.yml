@@ -82,6 +82,17 @@ jobs:
       - name: 版本一致性闸门（文件头 ↔ CHANGELOG ↔ package.json）
         run: node check-version.js
 
+      # v3.444 源码文本断言闸门（v3.445 从 policy 挪到本 job）：禁止测试里新增「读源码文本」的断言（`src.includes('…')` 之类）。
+      # 三处接线（npm run check 链 / pre-commit 第 5 道 / 这里）缺一即成摆设，缺任一处由
+      # test_ci_static_gates.js 的「check:assert-style 三处接线」用例判红。
+      # 为何在 quality 而不在 policy：该闸用 acorn 解析 test_*.js（scripts/check-source-text-asserts.js），
+      # 而 policy 是**刻意零依赖**的静态闸 job（只装 shellcheck/zizmor，从不跑 npm ci）——放在那里必然
+      # MODULE_NOT_FOUND；本 job 的 npm ci 已经把 acorn（dependencies）装好了，不必为一个 3s 闸门
+      # 再给 policy 加一条安装路径。
+      # 位置：Lint / 版本一致性之后、单元测试之前——秒级门禁先失败，不必等全量单测跑完才红。
+      - name: 源码文本断言闸门（禁止新增读源码文本断言）
+        run: npm run check:assert-style
+
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
 
@@ -273,13 +284,6 @@ jobs:
       # 显式列步骤——否则脱门；摘除上面步骤或 pre-commit 门链，本步骤变红）。
       - name: 静态扫描接线断言（test_ci_static_gates.js）
         run: npm run test:ci-static-gates
-
-      # v3.444 源码文本断言闸门：禁止测试里新增「读源码文本」的断言（`src.includes('…')` 之类）。
-      # 三处接线（npm run check 链 / pre-commit 第 5 道 / 这里）缺一即成摆设，缺任一处由
-      # test_ci_static_gates.js 的「check:assert-style 三处接线」用例判红。
-      # 排在静态扫描之后、单元测试之前：AST 扫描是全仓 test_*.js（本机约 3s），秒级门禁先失败。
-      - name: 源码文本断言闸门（禁止新增读源码文本断言）
-        run: npm run check:assert-style
 
       # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
       # 三处接线（check 链 / pre-commit / 这里）缺一即成摆设。

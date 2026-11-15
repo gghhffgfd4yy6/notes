@@ -19,7 +19,9 @@ const { spawnSync } = require('node:child_process')
 const ROOT = path.resolve(__dirname)
 const CHECKER = path.join(ROOT, 'scripts', 'check-source-text-asserts.js')
 const PROBE = path.join(ROOT, 'scripts', 'probe-format-coupling.js')
-const { analyzeSource, compareMultiset } = require(CHECKER)
+// 字面量相对路径 require（Codacy/Opengrep「非字面量 require」）：与本文件其它 require 同口径，
+// 解析结果与 require(CHECKER) 完全相同——CHECKER/PROBE 两个常量仍留给 copyFileSync / spawn 用。
+const { analyzeSource, compareMultiset } = require('./scripts/check-source-text-asserts.js')
 
 // 与 test_ci_static_gates.js / test_doc_line_gates.js 同一套 harness 形态：每条检查独立捕获，
 // passed/failed 双计数，末尾统一汇总并置非零退出码（harness 自身也有用例，见文件末尾）。
@@ -63,19 +65,19 @@ const workspaces = []
 function makeWorkspace () {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-assertgate-'))
   workspaces.push(dir)
-  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true })
+  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true }) // nosemgrep（路径 = mkdtemp 结果 + 本文件硬编码的 'scripts'，无外部净输入）
   // 闸门脚本整份复制：ROOT 由 __dirname/.. 推出 ⇒ 副本把工作区当成仓库根，绝不碰真实仓库。
   fs.copyFileSync(CHECKER, path.join(dir, 'scripts', 'check-source-text-asserts.js'))
   fs.copyFileSync(PROBE, path.join(dir, 'scripts', 'probe-format-coupling.js'))
   // acorn 从仓库的 node_modules 借（与工作树的软链同一做法），不装任何依赖。
-  fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir')
+  fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir') // nosemgrep（ROOT = __dirname 常量，dir = mkdtemp 结果，无外部净输入）
   return dir
 }
 
 function write (dir, rel, text) {
   const abs = path.join(dir, rel)
-  fs.mkdirSync(path.dirname(abs), { recursive: true })
-  fs.writeFileSync(abs, text)
+  fs.mkdirSync(path.dirname(abs), { recursive: true }) // nosemgrep（abs = mkdtemp 工作区 + 本文件硬编码的相对路径，无外部净输入）
+  fs.writeFileSync(abs, text) // nosemgrep（同上：只写隔离工作区里的夹具，跑完 rmSync）
   return abs
 }
 
@@ -91,8 +93,13 @@ function run (dir, script, args) {
 
 const runChecker = (dir, ...args) => run(dir, 'check-source-text-asserts.js', args)
 const runProbe = (dir, ...args) => run(dir, 'probe-format-coupling.js', args)
-const allowlistOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8'))
+const allowlistOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')) // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
 const lines = (...parts) => parts.join('\n') + '\n'
+
+// 排序口径（SonarCloud S2871）：`sort()` 不带比较器＝按 String 化后的默认字典序，是 BUG 级告警。
+// 这里显式给一个比较器，且**左右两侧共用同一个**——比的是「多重集对账的结果」，两侧口径必须一致，
+// 否则同样的两条数据会因排序不同而假红（这两条元组的首字符就不同，比较结果与默认排序一致）。
+const byString = (x, y) => String(x).localeCompare(String(y))
 
 // ── A. 检测面：每个漏检形态单独一条（正向必红） ────────────────────────────
 // 期望值 = 命中字面量数组（顺序按行号）。`file` 参数只用于错误信息，与分析结果无关。
@@ -276,9 +283,9 @@ check('退出码 2：白名单 count 与 items.length 漂移（手删条目不�
   write(dir, 'test_base.js', FIXTURE_OK)
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
-  const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（file = mkdtemp 结果 + 本文件硬编码的 scripts/…json，无外部净输入）
   data.count += 1
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n')
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上：写回隔离工作区里的白名单副本，不碰真实仓库）
   const result = runChecker(dir)
   assert.strictEqual(result.status, 2, '形状非法必须 exit 2：' + result.out)
   assert.ok(/计数漂移/.test(result.out), '必须提示计数漂移：' + result.out)
@@ -314,8 +321,8 @@ check('compareMultiset：超出/不足/缺失三种关系都按「次数」算',
   const { violations, shortfalls } = compareMultiset(measured, allowed)
   assert.deepStrictEqual(violations.map((v) => [v.file, v.literal, v.count, v.allowed]),
     [['a.js', 'X', 2, 1], ['a.js', 'Y', 1, 0]], '实测 > 允许即违规（含「允许 0」的新增）')
-  assert.deepStrictEqual(shortfalls.map((m) => [m.file, m.literal, m.count, m.allowed]).sort(),
-    [['b.js', 'Z', 1, 2], ['c.js', 'W', 0, 1]].sort(), '实测 < 允许只记「少了」，不违规')
+  assert.deepStrictEqual(shortfalls.map((m) => [m.file, m.literal, m.count, m.allowed]).sort(byString),
+    [['b.js', 'Z', 1, 2], ['c.js', 'W', 0, 1]].sort(byString), '实测 < 允许只记「少了」，不违规')
 })
 
 check('回归：拼接锚点 / 块内重赋值 / `return false` 兜底不得把真断言判没', () => {
@@ -410,14 +417,14 @@ check('探针：不读源码文本的测试必须判 format-clean（收紧扰动
 check('探针：跑完必须逐字节还原生产文件（重排不得留在工作树里）', () => {
   const dir = probeWorkspace()
   write(dir, 'test_clean.js', CLEAN_TEST)
-  const before = fs.readFileSync(path.join(dir, 'prod.js'), 'utf8')
+  const before = fs.readFileSync(path.join(dir, 'prod.js'), 'utf8') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'prod.js'，无外部净输入）
   assert.strictEqual(runProbe(dir, 'test_clean.js').status, 0)
-  assert.strictEqual(fs.readFileSync(path.join(dir, 'prod.js'), 'utf8'), before,
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'prod.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，比对探针是否逐字节还原）
     '探针必须把 prod.js 还原成原文（try/finally + 备份）')
 })
 
 check('reformat：`(`、`)`、`,`、`{`、`}` 边界都被扰动，且跨行模板内容不被改坏', () => {
-  const { reformat } = require(PROBE)
+  const { reformat } = require('./scripts/probe-format-coupling.js')
   const code = lines(
     'function f (a, b) {',
     '  return a && b',

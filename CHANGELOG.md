@@ -1586,3 +1586,11 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **Codacy 不再整文件消音**：撤掉 `.codacy.yml` 对 `check-source-text-asserts.js` / `probe-format-coupling.js` / `source_model.js` 的整文件排除（比 NOSONAR 更宽），唯一那条「RegExp 构造函数传非字面量」已随 AST 重写**改代码消除**（不再用 `new RegExp(变量名)` 拼正则），其余 pathtraversal 结构性误报按**行级** `// nosemgrep（理由）` 登记在各自代码行上。
 - **闸门自身的用例**：新增 `test_check_source_text_asserts.js`（15 条检查，全部在 `mkdtemp` 隔离工作区里跑、跑完 `rmSync`）：17 种写法必红、4 类非源码文本必绿、3 条回归（拼接锚点/块内重赋值/切块 helper）、多重集超次数、计数漂移 exit 2、少条只提示、扫描面含 `test_support/`、探针 paren 锚点必 coupled、探针逐字节还原、重排的边界扰动与模板内容不被改坏；`package.json` 加 `test:check-assert-style`（**不**接进 `npm test` 主链，沙箱里白名单会误伤）。
 - **版本**：3.443.0 → **3.444.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.445
+
+- **CI 反馈收口（PR #418 第 3 轮；只动 workflow / 测试用例 / 版本，一条断言都没放宽，白名单仍是 2575 条）**：三条外部检查的失败面各有独立根因，分别用「挪 job」「补比较器」「行级豁免」消掉。
+- **policy 缺 acorn ⇒ 闸门挪到 quality**：`npm run check:assert-style` 要 `require('acorn')` 解析测试文件，而 policy 是**刻意零依赖**的静态闸 job（只装 shellcheck/zizmor，从不 `npm ci`），v3.444 把它接进 policy 后该步骤直接 `MODULE_NOT_FOUND`、`quality-gate` 连带红。现整块（步骤名与 `run:` 行原样不动）移到 quality job 的「版本一致性闸门」之后、「单元测试（test_filter.js）」之前——quality 的 `npm ci` 已经把 acorn 装好，不必为一个 3s 闸门在 policy 里再开一条安装路径。`test_ci_static_gates.js` 的「三处接线」判据仍要求 test.yml 里**恰好一行**该 `run:` 行且步骤名逐字一致，换 job 不影响这批断言（它们判的是「接上了没有」，不是「接在哪个 job」）。
+- **SonarCloud `javascript:S2871`（BUG，new_reliability_rating=D）**：`test_check_source_text_asserts.js` 的多重集对账用例里，实测侧 `shortfalls…sort()` 与期望值侧 `.sort()` 都没带比较器（默认按 String 化后的字典序排）。改成两侧共用 `const byString = (x, y) => String(x).localeCompare(String(y))`——两侧必须同一口径，只改一侧会让 `deepStrictEqual` 因排序不同而假红。
+- **Codacy / Opengrep 11 条（全在 `test_check_source_text_asserts.js`）**：2 条「非字面量 require」**改代码消除**（`require(CHECKER)` / `require(PROBE)` → 字面量相对路径 `./scripts/…`，解析结果完全相同；`CHECKER`/`PROBE` 两个常量仍留给 `copyFileSync` 与 `spawn` 用）；9 条「动态构造路径」沿用 v3.444 对三个工具层文件的同一口径，逐行加裸形态 `// nosemgrep（理由）`——路径 = `mkdtemp` 结果 / `ROOT`（`__dirname`）常量 + 本文件硬编码段，无外部净输入。**没有**往 `.codacy.yml` 的 `exclude_paths` 加整文件排除（比 NOSONAR 更宽，上一轮评审已明确反对）。
+- **版本**：3.444.0 → **3.445.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
