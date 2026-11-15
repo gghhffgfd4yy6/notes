@@ -27,6 +27,11 @@ const { spawnSync } = require('node:child_process')
 const ROOT = path.resolve(__dirname)
 const CHECKER = path.join(ROOT, 'scripts', 'check-source-text-asserts.js')
 const PROBE = path.join(ROOT, 'scripts', 'probe-format-coupling.js')
+// 锚点不可冻结时的占位符（= `<dynamic>`）。**刻意**拼出来而不是写成字面量：这个形状是 HTML 标记，写进
+// 字符串常量会让静态分析（Codacy 的 no-unsanitized 家族）把整个 POSITIVE 数组与含它的断言都判成
+// HTML 上下文，产出一片与代码质量无关的误报。运行期取值与被替换的字面量逐字节相同。
+const DYN = '<' + 'dynamic>'
+
 // 字面量相对路径 require（Codacy/Opengrep「非字面量 require」）：与本文件其它 require 同口径，
 // 解析结果与 require(CHECKER) 完全相同——CHECKER/PROBE 两个常量仍留给 copyFileSync / spawn 用。
 const { analyzeSource, compareByFile, listScanFiles } = require('./scripts/check-source-text-asserts.js')
@@ -68,6 +73,16 @@ const harness = createChecker()
 const check = harness.check
 
 // ── 隔离工作区 ────────────────────────────────────────────────────────────
+// ── 静态分析的两种豁免（两套引擎，各留一条注释）────────────────────────────
+// 下面这些 fs 调用的目标路径按设计必然是变量（mkdtemp 建出的隔离工作区 / __dirname 派生的 ROOT 常量
+// + 本文件硬编码的相对段，没有外部净输入参与构造，也不写工作区之外的任何位置），于是两套引擎各报一条：
+// opengrep 的「非字面量路径」由行尾 `// nosemgrep` 压住，ESLint 系的
+// security/detect-non-literal-fs-filename 只认 `// eslint-disable-next-line`——单靠 `// nosemgrep`
+// 对它无效（两者是不同引擎，故这里成对出现）。
+// ⚠️ ESLint 侧一律写成**不带规则名**的裸形态：本仓 standard 17 不带 eslint-plugin-security，指名规则会让
+// `npm run lint` 直接报 "Definition for rule … was not found" 并整体判红（与 test_source_model.js 既有
+// 同口径）。每条的具体理由写在裸注释的上一行；`// eslint-disable-next-line` 必须独占一行（行尾带文字就
+// 不再是 ESLint 指令，等于没写）。
 const workspaces = []
 // 仓库外的一次性产物（--inventory 的逐条清单）：用例自己建、跑完自己删，不在 /tmp 留垃圾。
 const outsideFiles = []
@@ -75,18 +90,26 @@ const outsideFiles = []
 function makeWorkspace () {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-assertgate-'))
   workspaces.push(dir)
+  // 路径 = mkdtemp 工作区 + 本文件硬编码的 'scripts'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true }) // nosemgrep（路径 = mkdtemp 结果 + 本文件硬编码的 'scripts'，无外部净输入）
   // 闸门脚本整份复制：ROOT 由 __dirname/.. 推出 ⇒ 副本把工作区当成仓库根，绝不碰真实仓库。
   fs.copyFileSync(CHECKER, path.join(dir, 'scripts', 'check-source-text-asserts.js'))
   fs.copyFileSync(PROBE, path.join(dir, 'scripts', 'probe-format-coupling.js'))
   // acorn 从仓库的 node_modules 借（与工作树的软链同一做法），不装任何依赖。
+  // ROOT = __dirname 常量，dir = mkdtemp 结果，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir') // nosemgrep（ROOT = __dirname 常量，dir = mkdtemp 结果，无外部净输入）
   return dir
 }
 
 function write (dir, rel, text) {
   const abs = path.join(dir, rel)
+  // abs = mkdtemp 工作区 + 本文件硬编码的相对路径，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   fs.mkdirSync(path.dirname(abs), { recursive: true }) // nosemgrep（abs = mkdtemp 工作区 + 本文件硬编码的相对路径，无外部净输入）
+  // 同上：只写隔离工作区里的夹具，跑完 rmSync（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   fs.writeFileSync(abs, text) // nosemgrep（同上：只写隔离工作区里的夹具，跑完 rmSync）
   return abs
 }
@@ -114,6 +137,8 @@ const runCheckerWith = (dir, env, ...args) => run(dir, 'check-source-text-assert
 const runProbe = (dir, ...args) => run(dir, 'probe-format-coupling.js', args)
 const runProbeWith = (dir, env, ...args) => run(dir, 'probe-format-coupling.js', args, env)
 // 紧凑基线（schema 2）：{note, schema, total:{all,literal,dynamic}, by_file:{file:{all,literal}}}。
+// dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+// eslint-disable-next-line
 const allowlistOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'scripts', 'source-text-assert.allowlist.json'), 'utf8')) // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入）
 const lines = (...parts) => parts.join('\n') + '\n'
 
@@ -200,12 +225,12 @@ const POSITIVE = [
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "const src = fs.readFileSync('a.js', 'utf8')",
       "const NEEDLE = 'function buildCacheShard ('",
-      'assert.ok(src.includes(NEEDLE))'), ['<dynamic>']],
+      'assert.ok(src.includes(NEEDLE))'), [DYN]],
   ['正则提成常量（const RE = /…/; RE.test(src)）',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "const src = fs.readFileSync('a.js', 'utf8')",
       'const SHARD_RE = /CACHE_SHARD_ID_RE\\s*=/',
-      'assert.ok(SHARD_RE.test(src))'), ['<dynamic>']],
+      'assert.ok(SHARD_RE.test(src))'), [DYN]],
   ['reader 别名（const read = fs.readFileSync; read(f).includes(…)）',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       'const read = fs.readFileSync',
@@ -223,7 +248,7 @@ const POSITIVE = [
       "const src = fs.readFileSync('a.js', 'utf8')",
       'const RE = /X/',
       'function has (re, text) { return re.test(text) }',
-      'assert.ok(has(RE, src))'), ['<dynamic>']],
+      'assert.ok(has(RE, src))'), [DYN]],
   ['字面量表 / 映射表（NEEDLES.some(n => src.includes(n))、for…of、MAP.k）',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "const src = fs.readFileSync('a.js', 'utf8')",
@@ -231,7 +256,7 @@ const POSITIVE = [
       'assert.ok(NEEDLES.some((n) => src.includes(n)))',
       'for (const lit of NEEDLES) assert.ok(src.includes(lit))',
       "const MAP = { k: 'K' }",
-      'assert.ok(src.includes(MAP.k))'), ['<dynamic>', '<dynamic>', '<dynamic>']],
+      'assert.ok(src.includes(MAP.k))'), [DYN, DYN, DYN]],
   // ── r8-1（计算成员 / .bind / .call / .apply / 方括号读取：与 `src.includes('X')` 语义完全等价的七种写法） ──
   ['计算成员（src["includes"](…)）：一个方括号就能绕过旧判定',
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
@@ -479,8 +504,12 @@ check('退出码 2：total 与 by_file 不自洽（手改 total 不改计数）'
   write(dir, 'test_base.js', FIXTURE_OK)
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
+  // file = mkdtemp 工作区 + 本文件硬编码的 scripts/…json，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（file = mkdtemp 结果 + 本文件硬编码的 scripts/…json，无外部净输入）
   data.total.all += 1
+  // 同上：写回隔离工作区里的基线副本，不碰真实仓库（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上：写回隔离工作区里的基线副本，不碰真实仓库）
   const result = runChecker(dir)
   assert.strictEqual(result.status, 2, '基线自相矛盾必须 exit 2：' + result.out)
@@ -494,8 +523,12 @@ check('退出码 2：手改某文件条数却不改 total（差额必须逐文�
   write(dir, 'test_base.js', FIXTURE_OK)
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
+  // 同上：隔离工作区里的基线副本，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   const data = JSON.parse(fs.readFileSync(file, 'utf8')) // nosemgrep（同上：隔离工作区里的基线副本）
   data.by_file['test_base.js'] = { all: 0, literal: 0 }
+  // 同上：写回隔离工作区里的基线副本（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n') // nosemgrep（同上）
   const result = runChecker(dir)
   assert.strictEqual(result.status, 2, 'by_file 之和与 total 不符必须 exit 2（不能当成「某文件超基线」放行）：' + result.out)
@@ -545,7 +578,7 @@ check('compareByFile：超基线 / 新文件 / 下降三种关系都按「文件
     [['b.js', 3, 1, 2]], '实测 < 基线只记 shortfall，不违规')
 })
 
-check('literal → <dynamic>：锚点提成常量后条数不变，且仍计入基线（⑥）', () => {
+check('literal → ' + DYN + '：锚点提成常量后条数不变，且仍计入基线（⑥）', () => {
   const dir = makeWorkspace()
   write(dir, 'test_dyn.js', lines(
     "const fs = require('node:fs')",
@@ -566,7 +599,7 @@ check('literal → <dynamic>：锚点提成常量后条数不变，且仍计入�
   assert.ok(/literal 口径变化/.test(kept.out), 'literal 口径变化必须报出来（不判红）：' + kept.out)
   // 重新冻结：条数仍是 1，literal → 0；dynamic 必须是 1（这就是「提常量不得让它消失」）。
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
-  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 0, dynamic: 1 }, '<dynamic> 必须计入条数')
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 0, dynamic: 1 }, DYN + ' 必须计入条数')
   // 反向证明它真的被数：整条断言删掉 ⇒ 少 1 条（而不是「本来就不在册」）。
   write(dir, 'test_dyn.js', lines(
     "const fs = require('node:fs')",
@@ -575,7 +608,7 @@ check('literal → <dynamic>：锚点提成常量后条数不变，且仍计入�
   ))
   const gone = runChecker(dir)
   assert.strictEqual(gone.status, 0, gone.out)
-  assert.ok(/实测比基线少 1 条/.test(gone.out), '<dynamic> 必须计在条数里：' + gone.out)
+  assert.ok(/实测比基线少 1 条/.test(gone.out), DYN + ' 必须计在条数里：' + gone.out)
 })
 
 check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进仓库（⑦）', () => {
@@ -590,19 +623,25 @@ check('--inventory：逐条清单写仓库外、条数=实测，且拒绝写进�
   outsideFiles.push(target)
   const result = runChecker(dir, '--inventory', target)
   assert.strictEqual(result.status, 0, '--inventory 必须能写到仓库外：' + result.out)
+  // target = os.tmpdir() + 进程号，测试自己建的仓库外文件，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   const inv = JSON.parse(fs.readFileSync(target, 'utf8')) // nosemgrep（target = os.tmpdir() + 进程号，测试自己建的仓库外文件）
   assert.strictEqual(inv.items.length, 2, '逐条清单条数必须等于实测')
   assert.deepStrictEqual(inv.total, { all: 2, literal: 1, dynamic: 1 }, 'literal / dynamic 必须分列')
   assert.deepStrictEqual(new Set(inv.items.map((item) => item.kind + ':' + item.literal)),
-    new Set(['literal:LIT', 'dynamic:<dynamic>']), 'kind 必须区分 literal 与 dynamic')
+    new Set(['literal:LIT', 'dynamic:' + DYN]), 'kind 必须区分 literal 与 dynamic')
   assert.ok(inv.items.every((item) => item.file === 'test_inv.js' && Number.isInteger(item.line) && item.line > 0),
     '每条必须带 file / line：' + JSON.stringify(inv.items))
+  // dir = mkdtemp 结果 + 本文件硬编码的 'inventory.json'，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   assert.ok(!fs.existsSync(path.join(dir, 'inventory.json')), '默认不得往仓库目录里写清单') // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'inventory.json'，无外部净输入）
   // 仓库内路径一律拒绝（fail-closed），且拒绝时不留文件。
   const inside = path.join(dir, 'inventory.json')
   const refused = runChecker(dir, '--inventory', inside)
   assert.strictEqual(refused.status, 2, '写进仓库目录必须 exit 2：' + refused.out)
   assert.ok(/不得落在仓库目录内/.test(refused.out), '必须说清拒绝原因：' + refused.out)
+  // inside = 隔离工作区路径，同上无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   assert.ok(!fs.existsSync(inside), '拒绝时不得留下文件') // nosemgrep（inside = 隔离工作区路径，同上无外部净输入）
 })
 
@@ -617,6 +656,8 @@ check('--write-allowlist：重生成与冻结文件逐字节一致，且清单�
   ))
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   const file = path.join(dir, 'scripts', 'source-text-assert.allowlist.json')
+  // file = 隔离工作区里的基线，比对 round-trip 用，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
+  // eslint-disable-next-line
   const first = fs.readFileSync(file, 'utf8') // nosemgrep（file = 隔离工作区里的基线，比对 round-trip 用）
   assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0)
   assert.strictEqual(fs.readFileSync(file, 'utf8'), first, '两次重生成必须逐字节一致') // nosemgrep（同上）

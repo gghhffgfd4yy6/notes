@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.451 — S0 工具层：扫描面 readdirSync 补 nosemgrep 豁免（断言逻辑未改，无行为变化） *******
+//* ******* 线报酷推送脚本 v3.452 — S0 工具层：HTML 形状字面量改为运行期拼接 + ESLint 系规则豁免（断言逻辑未改，无行为变化） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
