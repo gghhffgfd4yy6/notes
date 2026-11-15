@@ -7697,6 +7697,12 @@ async function main () {
       // B3（E-010）：**生产接线**断言。上面几条只证明 messagesCacheName() 自己的返回值对，
       // 证明不了它被接进了 createConsole：把实参写成 'push.json' 时上面全绿，而控制台读的
       // 缓存文件从此与运行侧写的不是同一个（页面上「没有消息」，无任何报错）。
+      // 插桩闸：console-part* 段会把 scripts/console.js 改写，`messagesFile: messagesCacheName()`
+      // 这类实参形状在插桩后不再逐字成立（同 START 锚点失真的那类）。非沙箱（test.yml / 本地）
+      // 仍逐字执行这条接线断言。
+      if (skipIfInstrumented('M1 生产接线（createConsole 实参块必须接 messagesCacheName()）', 'scripts/console.js')) {
+        return
+      }
       const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
       const args = blockAfter(consoleSrc, 'createConsole({')
       assert.ok(args && args.trim().length > 0, '前置：scripts/console.js 必须存在 createConsole({…}) 调用（切不出实参块说明调用被挪走/改名）')
