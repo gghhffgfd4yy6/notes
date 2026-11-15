@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.450 — S0 工具层：反回归闸补三种等价写法 + 跨文件 helper + test/ 扫描面，探针纳入点目录 *******
+//* ******* 线报酷推送脚本 v3.451 — S0 工具层：扫描面 readdirSync 补 nosemgrep 豁免（断言逻辑未改，无行为变化） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

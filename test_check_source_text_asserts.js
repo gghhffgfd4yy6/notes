@@ -353,7 +353,7 @@ check('扫描面包含 test/**（既有辅助代码目录，不是测试用例�
   assert.ok(result.out.includes('test/move_src.js'), '必须点名 test/move_src.js：' + result.out)
   // 仓内真扫描面也把 test/ 的既有文件包进来（目录存在即可断言，不依赖条数）。
   const scan = listScanFiles()
-  const existing = fs.readdirSync(path.join(ROOT, 'test')).filter((name) => name.endsWith('.js')).map((name) => 'test/' + name)
+  const existing = fs.readdirSync(path.join(ROOT, 'test')).filter((name) => name.endsWith('.js')).map((name) => 'test/' + name) // nosemgrep（ROOT = __dirname 常量 + 本文件硬编码的 'test'，无外部净输入）
   assert.ok(existing.length > 0, '仓库 test/ 目录下应有既有 .js 辅助文件')
   for (const rel of existing) assert.ok(scan.includes(rel), `扫描面必须包含 ${rel}：${scan.length} 个文件里没有它`)
 })

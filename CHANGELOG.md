@@ -1643,3 +1643,8 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **白名单口径（schema 2，按文件计数）**：`total.all` 2714 → **2721**（literal 2575 → 2581、dynamic 139 → 140），仍 38 个文件。增的 7 条**不是新断言**，而是 `test/_yaml.js` 的三个导出 helper 第一次可见后被计入调用点：`runBodyOf` 的 `line.trim().startsWith('#')` / `search(/\S/)` 与 `tableRowOf` 的表头比对等，分布在 `test_mutation_report.js` 2 → 7（+5）与 `test_mutation_report_cli.js` 74 → 76（+2）。`test/` 纳入扫描面本身带来 **0** 条（两个既有 helper 在不传源码文本时无命中）。
 - **测试（+5 检查，30 全绿）**：`test_check_source_text_asserts.js` 25 → **30** 检查。正向形态 24 → **31**（新增 r8-1 的 7 种等价写法），反向 4 → **6**（`.call` 的 thisArg 是字面量、动态计算键）；新增「扫描面包含 test/**」「跨文件 helper 被抓（含命名空间 require + 体内字面量锚点）」「探针：.github/.githooks 在扰动面内」「shell 扰动只改空白（shebang / heredoc 正文逐字保留）」。全部在 `mkdtempSync` 隔离工作区里跑，跑完自清。
 - **版本**：3.449.0 → **3.450.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.451
+
+- **S0 工具层（Codacy/Semgrep 误报收口）**：`test_check_source_text_asserts.js:356` 的扫描面断言 `fs.readdirSync(path.join(ROOT, 'test'))` 行尾补裸 `// nosemgrep（ROOT = __dirname 常量 + 本文件硬编码的 'test'，无外部净输入）`，与同文件另外 20 处同口径。该行触发 Semgrep「The application dynamically constructs file or path information」failure 级告警，实际路径只由模块常量与字面量拼成，不受外部输入影响。断言逻辑一行未改、无行为变化；`.codacy.yml` 与其他代码均未动。
+- **版本**：3.450.0 → **3.451.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
