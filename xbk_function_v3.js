@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.454 — S0 工具层：反回归闸补 4 类检测面缺口（运算符/等值断言、默认导出 helper、返回源码 helper、整棵仓库扫描面）并声明 js-yaml（只动测试面与 scripts/，生产逻辑一行未改） *******
+//* ******* 线报酷推送脚本 v3.455 — S0 工具层：反回归闸收 7 个可绕缺口（等值族两侧非字面量、三种 require 绑定、loadModel 容器字段、parseShell token、--write-allowlist 无门禁、探针扰动面无下限）并按新口径重冻基线（只动测试面与 scripts/，生产逻辑一行未改） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

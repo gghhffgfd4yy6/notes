@@ -17,8 +17,8 @@
  *   - `.json`：`JSON.parse` → `JSON.stringify`（紧凑单行），并回读深比较确认数据完全一致。
  *   - `.yml` / `.yaml`：块映射行的键后加一个空格（`runs-on:` → `runs-on :`；YAML 语义上键与冒号之间的
  *     空白被丢弃，数据不变），块标量（`|`/`>`）内部原样保留。读 YAML 文本的 `includes('key: …')`
- *     因此必然失配。**不做** parse→dump：那要 `require('js-yaml')`，而本仓只把它当传递依赖，
- *     `scripts/check-deps.js` 的反向扫描会判「代码 require 了未声明的包」（不为一个探针加运行时依赖）。
+ *     因此必然失配。**不做** parse→dump：那要 `require('js-yaml')`，而探针不为自己加运行时依赖
+ *     （js-yaml 自 v3.454 起已在 `devDependencies` 里声明，但探针仍是纯文本重排，不需要它）。
  *   - `.css`：字符串/注释/括号内（`url(…)` 的数据串）不动，`;`/`{`/`}` 两侧插空格 + 重缩进。
  *   - `.html` / `.htm`：只重缩进，`<pre>/<textarea>/<script>/<style>` 块内跳过。
  *   - shell（`.sh` / `.bash` / `.githooks/*` 的无扩展名钩子）：每个非空行把**第一个引号外的空白**
@@ -41,6 +41,10 @@
  *
  * 退出码：0 全部 format-clean / 1 存在 format-coupled / 2 用法错误、词法错误、或存在 not-covered
  *        （含「重排后无法解析」这条探针自身 bug 的 fail-closed）/ 3 还原失败（工作树有新增改动）。
+ *
+ * 扰动面下限（r13-7，fail-closed）：候选数为 0、低于 `MIN_CANDIDATES`（默认 20，可用 `--min-candidates=N`
+ * 显式放宽）、或实际写盘 0 个文件 ⇒ exit 2。理由：`walk()`/`SKIP_DIRS` 回归导致「扰动面塌缩」时，
+ * 输出与「所有测试都不耦合格式」逐字相同，而 RUNBOOK 把探针绿当机械判据——这是唯一能把两者分开的地方。
  *
  * 用法：node scripts/probe-format-coupling.js test_console.js test_utils_pure.js
  *      不带参数：跑内置自检集（DEFAULT_TESTS，两个不读仓内文本的套件）——探针自身可用即 exit 0。
@@ -78,6 +82,11 @@ const EXT_KIND = new Map([
 const FORCE_UNPARSEABLE = new Set((process.env.PROBE_FORCE_UNPARSEABLE || '').split(',').filter(Boolean))
 // 无参自检集：两个不读仓内文本的套件（只依赖自己写的临时夹具），用来证明「探针本身能跑通且不误判」。
 const DEFAULT_TESTS = ['test_utils_pure.js', 'test_source_model.js']
+// 扰动面下限（r13-7）：「walk()/SKIP_DIRS 回归 ⇒ 候选 0 个」与「全部不耦合」在输出上长得一样，
+// 而 RUNBOOK 把「probe 绿」当机械判据。所以候选数低于下限、或实际写盘 0 个文件，一律 exit 2。
+// 真仓是数百个候选；用例在 mkdtemp 里造的夹具工作区只有 2-5 个文件，用 `--min-candidates=N` 显式放宽
+// （「我知道这个面很小」是个必须写出来的声明，不是默认值）。
+const MIN_CANDIDATES = 20
 
 function die (code, message) {
   console.error(message)
@@ -590,8 +599,25 @@ function classify (traced) {
   return { coveredHits, outOfScope, notCovered }
 }
 
+// `--min-candidates=N` / `--min-candidates N`：夹具工作区显式放宽扰动面下限（默认 MIN_CANDIDATES）。
+// 非法值（负数 / 非整数）fail-closed：写错参数的探针不该安静地按默认值跑。
+function minCandidates () {
+  const inline = process.argv.find((arg) => arg.startsWith('--min-candidates='))
+  const index = process.argv.indexOf('--min-candidates')
+  const raw = inline
+    ? inline.slice('--min-candidates='.length)
+    : (index >= 0 ? process.argv[index + 1] : undefined)
+  if (raw === undefined) return MIN_CANDIDATES
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 0) die(2, `--min-candidates 必须是非负整数，实得 ${JSON.stringify(raw)}`)
+  return value
+}
+
 function main () {
   let tests = process.argv.slice(2).filter((a) => !a.startsWith('-'))
+  // `--min-candidates N` 的 N 不是测试文件（避免把 0 当成测试名跑起来）。
+  const minIndex = process.argv.indexOf('--min-candidates')
+  if (minIndex >= 0) tests = tests.filter((t) => t !== process.argv[minIndex + 1])
   const explicit = tests.length > 0
   if (!explicit) tests = DEFAULT_TESTS.filter((t) => fs.existsSync(path.join(ROOT, t))) // nosemgrep（理由：DEFAULT_TESTS 是本文件硬编码常量名单、ROOT 是 __dirname 常量，只做存在性检查不写盘）
   if (!tests.length) {
@@ -607,6 +633,16 @@ function main () {
 
   for (const rel of snapshotFiles()) reference.add(rel)
   const files = perturbableFiles()
+  // 扰动面塌缩一律 fail-closed（r13-7）：「候选 0 个」与「全部不耦合」输出长得一样，不能靠人眼区分。
+  if (!files.length) {
+    die(2, '❌ 扰动面为 0 个候选：walk()/SKIP_DIRS 回归了？这不能读作「所有测试都不耦合格式」。' +
+      '（夹具工作区请用 --min-candidates=N 显式放宽下限）')
+  }
+  const floor = minCandidates()
+  if (files.length < floor) {
+    die(2, `❌ 扰动面只有 ${files.length} 个候选（下限 ${floor}）：扰动太少时「全部 format-clean」不是证据。` +
+      '真仓请先修 walk()/SKIP_DIRS；夹具工作区用 --min-candidates=N 显式放宽。')
+  }
   for (const rel of files) backups.set(rel, fs.readFileSync(path.join(ROOT, rel), 'utf8')) // nosemgrep（rel 来自扰动面枚举，读取的是本仓文件（探针必须先读原文才能还原））
 
   const results = []
@@ -642,10 +678,12 @@ function main () {
     }
     console.log(`已扰动 ${written.size} 个文件` +
       `（无需扰动 ${covered.size - written.size} 个，无法安全扰动 ${notPerturbable.size} 个 → 若被读到判 not-covered）\n`)
-    if (written.size) {
-      console.log('扰动方式：js/mjs/cjs = 词法边界插空格 + 重缩进；json = 紧凑单行；yaml = 块映射键后加空格（块标量内不动）；shell = 行内空白加倍；' +
-        'css = 字符串/注释/括号外插空格 + 重缩进；html = 重缩进\n')
+    // 一个文件都没写盘 ⇒ 后面每条测试都会「因为重排无关而绿」，这个结论没有证据（r13-7 fail-closed）。
+    if (!written.size) {
+      throw new Error('❌ 扰动面写了 0 个文件：没有任何文件被重排，「全部 format-clean」不能读作不耦合（fail-closed）')
     }
+    console.log('扰动方式：js/mjs/cjs = 词法边界插空格 + 重缩进；json = 紧凑单行；yaml = 块映射键后加空格（块标量内不动）；shell = 行内空白加倍；' +
+      'css = 字符串/注释/括号外插空格 + 重缩进；html = 重缩进\n')
     for (const test of tests) {
       const r = runTest(test)
       const { coveredHits, outOfScope, notCovered } = classify(r.traced)

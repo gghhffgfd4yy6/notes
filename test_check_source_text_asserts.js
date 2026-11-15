@@ -134,8 +134,20 @@ function run (dir, script, args, env) {
 
 const runChecker = (dir, ...args) => run(dir, 'check-source-text-asserts.js', args)
 const runCheckerWith = (dir, env, ...args) => run(dir, 'check-source-text-asserts.js', args, env)
-const runProbe = (dir, ...args) => run(dir, 'probe-format-coupling.js', args)
-const runProbeWith = (dir, env, ...args) => run(dir, 'probe-format-coupling.js', args, env)
+const runProbe = (dir, ...args) => run(dir, 'probe-format-coupling.js', [...args, '--min-candidates=0'])
+const runProbeWith = (dir, env, ...args) => run(dir, 'probe-format-coupling.js', [...args, '--min-candidates=0'], env)
+// 夹具工作区只有 2-5 个文件，必须显式放宽扰动面下限（r13-7）；不带这个开关的探针会按真仓口径 exit 2。
+// 「扰动面塌缩」的用例专门走 runProbeStrict（不带开关），见下面的 r13-7 用例。
+const runProbeStrict = (dir, ...args) => run(dir, 'probe-format-coupling.js', args)
+// 少数用例要把探针放到 SKIP_DIRS 里的目录下（`.tools/**`）：这样仓内没有任何可扰动文件，
+// 才能测「写盘 0 个文件」这条 fail-closed 分支（探针自己也是 .js 候选，放 scripts/ 下就必然被扰动）。
+const runProbeAt = (dir, rel, ...args) => {
+  const base = { ...process.env, TZ: 'UTC' }
+  delete base.PROBE_FORCE_UNPARSEABLE
+  delete base.NODE_OPTIONS
+  const result = spawnSync(process.execPath, [rel, ...args], { cwd: dir, encoding: 'utf8', timeout: 120000, env: base })
+  return { status: result.status, out: (result.stdout || '') + (result.stderr || '') }
+}
 // 紧凑基线（schema 2）：{note, schema, total:{all,literal,dynamic}, by_file:{file:{all,literal}}}。
 // dir = mkdtemp 结果 + 本文件硬编码段，无外部净输入（ESLint 侧为何是裸注释：见上方豁免说明）
 // eslint-disable-next-line
@@ -310,7 +322,42 @@ const POSITIVE = [
     lines("const fs = require('node:fs')", "const assert = require('node:assert')",
       "const src = fs.readFileSync('a.js', 'utf8')",
       "const head = src.split('\\n').slice(0, 2)",
-      "assert.deepStrictEqual(head, ['LINE_A', 'LINE_B'])"), ['LINE_A']]
+      "assert.deepStrictEqual(head, ['LINE_A', 'LINE_B'])"), ['LINE_A']],
+  // ── r13-1（等值族的「提成常量」绕过：锚点不在同一行时记 <dynamic>，不许整条消失） ──────────
+  ['assert.strictEqual(lines[10], EXPECTED)（锚点提成 const：另一侧不是字面量 ⇒ <dynamic>）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const lines = src.split('\\n')",
+      "const EXPECTED = '  const REV = 42'",
+      'assert.strictEqual(lines[10], EXPECTED)'), [DYN]],
+  ['lines[11] === EXPECTED（运算符形态的同一件事）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const lines = src.split('\\n')",
+      "const EXPECTED = '  const REV = 42'",
+      'assert.ok(lines[11] === EXPECTED)'), [DYN]],
+  ['assert.deepStrictEqual(head, EXPECTED_LINES)（常量数组做锚点）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const EXPECTED_LINES = ['LINE_A', 'LINE_B']",
+      "const head = src.split('\\n').slice(0, 2)",
+      'assert.deepStrictEqual(head, EXPECTED_LINES)'), [DYN]],
+  // ── r13-3（loadModel 的 code / codeOnly 字段就是源码文本：容器不是洗白通道） ──────────────
+  ['loadModel(f).codeOnly.includes(…)（容器字段 = 源码文本，与 codeOnly(f) 同口径）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'function loadModel (f) {',
+      "  const code = fs.readFileSync(f, 'utf8')",
+      '  return { code, codeOnly: code }',
+      '}',
+      "assert.ok(loadModel('a.js').codeOnly.includes('CONTAINER_INLINE'))"), ['CONTAINER_INLINE']],
+  ['const m = loadModel(f); m.code.includes(…)（把容器接住再取字段）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'function loadModel (f) {',
+      "  const code = fs.readFileSync(f, 'utf8')",
+      '  return { code: code }',
+      '}',
+      "const m = loadModel('a.js')",
+      "assert.ok(m.code.includes('CONTAINER_BOUND'))"), ['CONTAINER_BOUND']]
 ]
 
 // ── B. 反向：receiver 不是源码文本就必须不命中（否则误报会把基线灌满） ──────
@@ -354,7 +401,27 @@ const NEGATIVE = [
     lines("const assert = require('node:assert')",
       "const plain = 'hello'",
       "assert.strictEqual('abc', 'abc')",
-      "assert.strictEqual(plain, 'hello')"), []]
+      "assert.strictEqual(plain, 'hello')"), []],
+  // r13-1 的另一侧：数字/下标/枚举比较不是逐字比对（否则 `!== -1` 这一族会把基线灌满）。
+  ['下标 / 计数 / 量纲比较不计：idx !== -1、map.get(k) === 数字常量',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      "const src = fs.readFileSync('a.js', 'utf8')",
+      "const lines = src.split('\\n')",
+      'const idx = lines.length - 1',
+      'assert.ok(idx !== -1)',
+      'const TIMEOUTS = new Map()',
+      'const DEFAULT_TIMEOUT_MS = 300000',
+      "assert.strictEqual(TIMEOUTS.get('seg'), DEFAULT_TIMEOUT_MS)"), []],
+  // r13-4：parseShell 的 tokens 是**解析后的结构化数据**，不是源码排版——token 级断言不算源码文本断言。
+  // 不这样登记，按 spec 用 parseShell 换掉文本断言的包会看到条数不降反升，而探针对同一条断言判 format-clean。
+  ['parseShell 的 tokens 是结构化数据（token 级等值断言不计，r13-4）',
+    lines("const fs = require('node:fs')", "const assert = require('node:assert')",
+      'function parseShell (f) {',
+      "  return fs.readFileSync(f, 'utf8').split('\\n').map((line) => ({ line, tokens: line.split(' ') }))",
+      '}',
+      "const l = parseShell('pre-commit')",
+      "assert.strictEqual(l.tokens[0], 'run_gate')",
+      "assert.ok(l.tokens.includes('check:assert-style'))"), []]
 ]
 
 // ── A/B 执行：正向形态数 = POSITIVE.length，反向形态数 = NEGATIVE.length ────────────
@@ -537,6 +604,124 @@ check('跨文件 helper：自身读源码文本的 helper（readSrc(f).includes(
   ))
   const plain = runChecker(dir)
   assert.strictEqual(plain.status, 0, '不自己读文件的整形 helper 不得被当成源码文本：' + plain.out)
+})
+
+// ── r13-2：require 绑定的三种等价写法（成员取值 / 成员别名 / 行内 require） ──────────
+// 反例（评审实测，基线 1 条）：三种写法全部 0 命中、exit 0 —— 只有 `const { x } = require('./h')`
+// 与 `const m = require('./h')` + `m.x(…)` 两种形态被 linkRequire / moduleTargetOf 认。
+// 它们不是构造出来的形态：仓内已有 `require('./scripts/mutation-report.js').EXPECTED_SEGMENTS` 这类写法。
+check('跨文件 helper：三种等价 require 绑定写法都入账（成员取值 / 成员别名 / 行内 require，r13-2）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  write(dir, 'h.js', lines(
+    "const fs = require('node:fs')",
+    "function readSrc (f) { return fs.readFileSync(f, 'utf8') }",
+    'function hasText (s, n) { return s.includes(n) }',
+    'module.exports = { readSrc, hasText }'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  // ① `const readSrc = require('./h.js').readSrc`：init 是 MemberExpression（旧实现要求 CallExpression）
+  write(dir, 'test_member.js', lines(
+    "const assert = require('node:assert')",
+    "const readSrc = require('./h.js').readSrc",
+    "assert.ok(readSrc('x.js').includes('MEMBER_BIND'))"
+  ))
+  // ② `const fn = h.hasText`：成员别名（旧实现没有任何别名登记）
+  write(dir, 'test_alias.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const h = require('./h.js')",
+    "const src = fs.readFileSync('x.js', 'utf8')",
+    'const fn = h.hasText',
+    "assert.ok(fn(src, 'ALIASED_BIND'))"
+  ))
+  // ③ 行内 `require('./h.js').readSrc(…)`：callee.object 是 CallExpression（旧实现只认 Identifier）
+  write(dir, 'test_inline.js', lines(
+    "const assert = require('node:assert')",
+    "assert.ok(require('./h.js').readSrc('x.js').includes('INLINE_BIND'))"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '三种绑定写法都必须判红：' + result.out)
+  for (const file of ['test_member.js', 'test_alias.js', 'test_inline.js']) {
+    assert.ok(new RegExp(file.replace(/\./g, '\\.') + '\\s+基线 0 / 实测 1 / \\+1').test(result.out),
+      `${file} 必须记 1 条命中：` + result.out)
+  }
+})
+
+// ── r13-3：容器的 code / codeOnly 字段就是源码文本（loadModel 不是洗白通道） ──────────
+// 反例（评审实测）：`codeOnly(f).includes('X')` 计 1 条，而 `loadModel(f).codeOnly.includes('X')` 与
+// `const m = loadModel(f); m.code.includes('X')` 都计 0 条 —— 同一段源码文本、同一种子串比对，
+// 只多一层容器壳就能让白名单归零，而 spec §2 又把 codeOnly 列为 loadModel 的字段。
+check('跨文件：loadModel(f).codeOnly / m.code 的成员访问按源码文本入账（r13-3）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  write(dir, 'test_support/model.js', lines(
+    "const fs = require('node:fs')",
+    'function buildModel (file, code) { return { file, code, codeOnly: code } }',
+    "function loadModel (f) { return buildModel(f, fs.readFileSync(f, 'utf8')) }",
+    'module.exports = { loadModel }'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_container_inline.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadModel } = require('./test_support/model.js')",
+    "assert.ok(loadModel('x.js').codeOnly.includes('CONTAINER_INLINE'))"
+  ))
+  write(dir, 'test_container_bound.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadModel } = require('./test_support/model.js')",
+    "const m = loadModel('x.js')",
+    "assert.ok(m.code.includes('CONTAINER_BOUND'))"
+  ))
+  // 再套一层：先把字段接到变量上（`const s = m.codeOnly`），也必须继续污染。
+  write(dir, 'test_container_alias.js', lines(
+    "const assert = require('node:assert')",
+    "const { loadModel } = require('./test_support/model.js')",
+    "const m = loadModel('x.js')",
+    'const text = m.codeOnly',
+    "assert.ok(text.includes('CONTAINER_ALIAS'))"
+  ))
+  const result = runChecker(dir)
+  assert.strictEqual(result.status, 1, '容器字段必须按源码文本入账：' + result.out)
+  for (const file of ['test_container_inline.js', 'test_container_bound.js', 'test_container_alias.js']) {
+    assert.ok(new RegExp(file.replace(/\./g, '\\.') + '\\s+基线 0 / 实测 1 / \\+1').test(result.out),
+      `${file} 必须记 1 条命中：` + result.out)
+  }
+})
+
+// ── r13-4：parseShell 的 tokens 是结构化数据（按 spec 用它换文本断言时条数必须降，不是升） ──
+// 反例（评审实测）：test_ci_static_gates.js 新写的接线断言与 test_source_model.js 的 parseShell 用例
+// 共 13 条被当成「源码文本断言」冻进基线，而探针对同一条断言判 format-clean —— 两个仪器结论相反。
+check('跨文件：parseShell 的 token 级断言不计入源码文本断言（r13-4）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_base.js', FIXTURE_OK)
+  write(dir, 'test_support/shell.js', lines(
+    "const fs = require('node:fs')",
+    'function parseShell (f) {',
+    "  return fs.readFileSync(f, 'utf8').split('\\n').map((line) => ({ line, tokens: line.split(' ') }))",
+    '}',
+    'module.exports = { parseShell }'
+  ))
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '基线应能写入')
+  write(dir, 'test_shell_tokens.js', lines(
+    "const assert = require('node:assert')",
+    "const { parseShell } = require('./test_support/shell.js')",
+    "const l = parseShell('pre-commit')",
+    "assert.strictEqual(l.tokens[0], 'run_gate')",
+    "assert.ok(l.tokens.includes('check:assert-style'))",
+    "assert.deepStrictEqual(l.tokens, ['run_gate', 'npm', 'run', 'lint'])"
+  ))
+  const tokens = runChecker(dir)
+  assert.strictEqual(tokens.status, 0, 'token 级断言不得计入（否则按 spec 换写法时条数不降反升）：' + tokens.out)
+  // 反向证明闸门仍然活着：同一个文件里加一条真正的源码文本断言，必须判红。
+  write(dir, 'test_shell_text.js', lines(
+    "const assert = require('node:assert')",
+    "const fs = require('node:fs')",
+    "const hook = fs.readFileSync('pre-commit', 'utf8')",
+    "assert.ok(hook.includes('run_gate'))"
+  ))
+  const text = runChecker(dir)
+  assert.strictEqual(text.status, 1, '同一文件里的源码文本断言必须仍然判红：' + text.out)
 })
 
 // ── r12-4：扫描面 = 整棵仓库（显式跳过名单），任意新目录默认在内 ────────────────
@@ -818,6 +1003,38 @@ check('--write-allowlist：重生成与冻结文件逐字节一致，且清单�
   assert.strictEqual(real.items, undefined, '仓内基线不得带逐条清单')
   assert.ok(Object.keys(real.by_file).length >= 30, '按文件覆盖必须完整：' + Object.keys(real.by_file).length)
   assert.strictEqual(real.total.all, real.total.literal + real.total.dynamic, 'total 三段必须自洽')
+})
+
+// ── r13-6：--write-allowlist 必须与旧基线比较，增长一律拒绝写盘 ────────────────────
+// 反例（评审实测）：旧实现重扫后直接写盘并 return 0，于是「新增断言后跑一次 --write-allowlist」就是
+// 一条全绿通道（连 literal drift 都不报），「只减不增」只剩人工看 JSON diff。
+check('--write-allowlist：增长被拒（须显式 --allow-growth，并打印逐文件差额，r13-6）', () => {
+  const dir = makeWorkspace()
+  write(dir, 'test_grow.js', FIXTURE_OK)
+  assert.strictEqual(runChecker(dir, '--write-allowlist').status, 0, '首次生成基线必须放行')
+  const frozen = allowlistOf(dir)
+  assert.deepStrictEqual(frozen.total, { all: 1, literal: 1, dynamic: 0 }, '夹具先冻结 1 条')
+  // 加一条同形态的断言：基线必须拒绝抬高。
+  write(dir, 'test_grow.js', lines(
+    "const fs = require('node:fs')",
+    "const src = fs.readFileSync('a.js', 'utf8')",
+    "module.exports = () => src.includes('FIRST') && src.includes('GROWN')"
+  ))
+  const refused = runChecker(dir, '--write-allowlist')
+  assert.strictEqual(refused.status, 1, '增长必须 exit 1（旧实现直接写盘并 exit 0）：' + refused.out)
+  assert.ok(/拒绝写盘/.test(refused.out), '必须说清拒绝原因：' + refused.out)
+  assert.ok(/test_grow\.js\s+1 → 2（\+1）/.test(refused.out), '必须打印逐文件差额：' + refused.out)
+  assert.deepStrictEqual(allowlistOf(dir).total, frozen.total, '被拒时基线一个字节都不能改（total 仍 1）')
+  // 显式 --allow-growth 才写盘，并且要把增长说出来。
+  const allowed = runChecker(dir, '--write-allowlist', '--allow-growth')
+  assert.strictEqual(allowed.status, 0, '--allow-growth 必须放行：' + allowed.out)
+  assert.ok(/--allow-growth/.test(allowed.out), '接受增长必须留痕：' + allowed.out)
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 2, literal: 2, dynamic: 0 }, '放行后基线应为 2 条')
+  // 收紧（下降）不需要开关：基线只减不增，收紧跟得上。
+  write(dir, 'test_grow.js', FIXTURE_OK)
+  const shrunk = runChecker(dir, '--write-allowlist')
+  assert.strictEqual(shrunk.status, 0, '条数下降必须直接放行：' + shrunk.out)
+  assert.deepStrictEqual(allowlistOf(dir).total, { all: 1, literal: 1, dynamic: 0 }, '下降后基线收紧到 1 条')
 })
 
 check('file:line 诊断：有 inventory 快照时点名新增行，无快照时降级为文件+增量', () => {
@@ -1117,6 +1334,37 @@ check('探针：fail-closed 分支（重排后无法解析）必须还原已写�
   // eslint-disable-next-line
   assert.strictEqual(fs.readFileSync(path.join(dir, 'a.js'), 'utf8'), before, // nosemgrep（同上：读隔离工作区里的夹具，验证 fail-closed 路径是否还原）
     'fail-closed 分支必须把先前已写盘的 a.js 逐字节还原（旧实现在这里整份留在重排态）')
+})
+
+check('探针：扰动面塌缩必须 exit 2（候选 < 下限 / 写盘 0 个，r13-7）', () => {
+  // 「walk()/SKIP_DIRS 回归 ⇒ 候选 0 个」与「所有测试都不耦合」在输出上逐字相同 —— 这是唯一能分开的地方。
+  const dir = probeWorkspace()
+  write(dir, 'test_clean.js', CLEAN_TEST)
+  const collapsed = runProbeStrict(dir, 'test_clean.js')
+  assert.strictEqual(collapsed.status, 2, '夹具只有 3 个候选（< 默认下限 20）⇒ 必须 exit 2：' + collapsed.out)
+  assert.ok(/下限 20/.test(collapsed.out) && /扰动面只有 [0-9]+ 个候选/.test(collapsed.out),
+    '必须点明候选数与下限：' + collapsed.out)
+  // 写盘 0 个文件（唯一候选重排后与原文逐字相同）⇒ 同样 fail-closed，不能靠「没有文件被改」判 clean。
+  // 探针自己也是 .js 候选，所以把它放进 SKIP_DIRS 的目录（.tools/），并把 scripts/ 清空——
+  // 这样 flat.json 是唯一候选，而紧凑 JSON 重排后与原文相同 ⇒ written.size 恒为 0。
+  const flat = makeWorkspace()
+  write(flat, 'flat.json', '{"a":1}\n')
+  write(flat, 'test_clean3.js', CLEAN_TEST)
+  write(flat, '.tools/probe.js', fs.readFileSync(PROBE, 'utf8')) // nosemgrep（PROBE = __dirname 常量，读的是本仓探针源码；只写进隔离工作区）
+  fs.rmSync(path.join(flat, 'scripts'), { recursive: true, force: true })
+  const nothing = runProbeAt(flat, path.join('.tools', 'probe.js'), 'test_clean3.js', '--min-candidates=0')
+  assert.strictEqual(nothing.status, 2, '写盘 0 个文件必须 exit 2：' + nothing.out)
+  assert.ok(/写了 0 个文件/.test(nothing.out), '必须说清是「一个文件都没重排」：' + nothing.out)
+})
+
+check('探针：真实仓扰动面 ≥ 20 个候选且含 .js/.yml/shell（下限不是空话）', () => {
+  const { perturbableFiles, kindOf } = require('./scripts/probe-format-coupling.js')
+  const files = perturbableFiles()
+  assert.ok(files.length >= 20, '真仓扰动面必须 ≥ 20 个候选（实得 ' + files.length + '）')
+  const kinds = new Set(files.map((rel) => kindOf(rel)))
+  for (const kind of ['js', 'yaml', 'shell']) {
+    assert.ok(kinds.has(kind), `扰动面必须含 ${kind}（实得 ${[...kinds].join(', ')}）：少了它那类资产的排版断言就探不到`)
+  }
 })
 
 check('harness 自身：一条检查抛错只记失败，后续照跑、汇总为 1', () => {

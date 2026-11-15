@@ -332,7 +332,9 @@
 # 三者的「遍历/重排/还原/读指定文件」都是本职行为。输入口径要分开说清楚（v3.450 更正 r8-5：
 # 旧句写「checker 与 source_model 没有环境变量或 CLI 输入」，与代码相反）：
 #   · checker **有** env `SOURCE_TEXT_ASSERT_INVENTORY` 与 CLI `--inventory [path]` / `--inventory=<path>` /
-#     `--write-allowlist`（v3.448 起）。它们只决定**逐条清单写到哪里**，不决定扫描面、也不改变读到的内容：
+#     `--write-allowlist` / `--allow-growth`（后者只在显式声明「仪器变宽」时用：写盘前先与旧基线逐文件
+#     比较，任何 total 或单文件增长一律 exit 1 拒绝写盘，见 v3.455 的 r13-6）。它们只决定**逐条清单写到
+#     哪里**，不决定扫描面、也不改变读到的内容：
 #     `--inventory` 的目标经 path.resolve 后过 assertOutsideRepo（落在仓库目录内一律 exit 2 拒绝），写出的是
 #     本进程刚扫出来的清单；`--write-allowlist` 写的是脚本旁边那个常量路径的紧凑基线。两者都不接受外部
 #     内容作为输入（不读 stdin、不联网、不按入参拼 require）；
