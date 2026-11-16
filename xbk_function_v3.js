@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.463 — S0 收尾（范围裁到核心）：基线口径从「生产源码锚点」改成「测试文件 → 断言条数」（schema 3：total 629 = by_file 36 个文件之和，旧口径 3131 = literal 2855 + dynamic 276）；闸门扫描面收窄到测试面（test_*.js / test/** / test_support/**，不扫 scripts/ 与生产 .js），检测面裁到 5 种形状（直接字面量 / 变量锚点与比较 / 模板插值 / reader 别名 / helper 返回源码），其余复杂数据流写进文件头 known-uncovered 清单；测试用例 52 → 12 条、被测脚本 2897 → 477 行、探针 797 → 343 行。只动测试/工具层/文档与版本，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.464 — S0 r21：assert 闸的基线读写结构性消除 TOCTOU——删掉 fs.existsSync(ALLOW_FILE) 探测（check-then-use 是 CodeQL js/file-system-race 的根因，也是 Semgrep「动态构造路径」告警点），改一次 readFileSync + ENOENT ⇒ null；写盘改同目录临时文件（常量前缀 + pid + crypto 随机后缀）+ fs.renameSync 原子替换，失败清理临时文件。增长拒绝语义逐点不变（有旧基线才比 total/by_file，--allow-growth 才放行，拒绝时不落盘，白名单 629/629 原地不动）。只动工具层与版本，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

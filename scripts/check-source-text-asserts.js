@@ -39,6 +39,8 @@
  *
  * 已知取舍：按文件计数看不到同一文件内两条断言互换（N 条换 N 条仍绿）；锚点质量靠评审看 diff。
  * 基线只能靠 `--write-allowlist` 重生成，任何 total / 单文件增长都被拒绝写盘（除非显式 --allow-growth）。
+ * 读基线只走一次 `readFileSync`（缺文件 = ENOENT ⇒ 没有旧基线），写盘走「同目录临时文件 + rename 原子替换」：
+ * 先 `existsSync` 探测再读/写同一路径是 check-then-use（CodeQL js/file-system-race / TOCTOU），不得回退成探测式。
  *
  * ⚠️ known-uncovered（本闸**不**覆盖，不得误以为已守）——已从实现中删除的数据流，逐条给反例：
  *   1. `.call/.apply/.bind` 改 receiver：`fs.readFileSync.call(null, f).includes('X')`、
@@ -72,6 +74,7 @@
  */
 const fs = require('node:fs')
 const path = require('node:path')
+const crypto = require('node:crypto')
 const acorn = require('acorn')
 
 const ROOT = path.join(__dirname, '..')
@@ -389,10 +392,19 @@ function scanAll () {
 /* ── 基线 ────────────────────────────────────────────────────────────────── */
 const isCount = (value) => Number.isInteger(value) && value >= 0
 
-function readBaseline () {
+function readBaselineOrNull () {
+  let text
+  try {
+    text = fs.readFileSync(ALLOW_FILE, 'utf8') // nosemgrep（ALLOW_FILE = __dirname 常量）
+  } catch (e) {
+    // 文件不存在不是错误（首次生成基线）：ENOENT 就是「没有旧基线」这一事实本身。
+    // 先 fs.existsSync 再读/写同一路径是 check-then-use（CodeQL js/file-system-race），故不再探测。
+    if (e.code === 'ENOENT') return null
+    die(2, `基线读不了 ${path.relative(ROOT, ALLOW_FILE)}：${e.message}`)
+  }
   let raw
   try {
-    raw = JSON.parse(fs.readFileSync(ALLOW_FILE, 'utf8')) // nosemgrep（ALLOW_FILE = __dirname 常量）
+    raw = JSON.parse(text)
   } catch (e) {
     die(2, `基线读不了 ${path.relative(ROOT, ALLOW_FILE)}：${e.message}`)
   }
@@ -405,6 +417,37 @@ function readBaseline () {
   }
   if (sum !== raw.total) die(2, `基线自相矛盾：total=${raw.total}，by_file 各值之和=${sum}——两者必须相等（只改一个数字等于放宽基线）`)
   return raw
+}
+
+// 门禁路径必须真有基线：不存在即 exit 2（旧实现由 readFileSync 的 ENOENT 走到同一退出码）。
+function readBaseline () {
+  const baseline = readBaselineOrNull()
+  if (!baseline) die(2, `基线不存在 ${path.relative(ROOT, ALLOW_FILE)}：请先运行 --write-allowlist 生成`)
+  return baseline
+}
+
+// 原子写盘：与 ALLOW_FILE 同目录（同一文件系统，rename 才是原子的）的临时文件写好后再 rename 替换。
+// 直接 fs.writeFileSync(ALLOW_FILE) 既与前面的存在性探测构成 check-then-use，中途失败还会留下半份基线。
+// 临时名 = 常量前缀 + 本进程 pid + crypto 随机后缀（Math.random 属弱随机，Codacy 判为不安全）。
+function writeBaselineAtomic (baseline) {
+  const tmp = path.join(path.dirname(ALLOW_FILE),
+    `.${path.basename(ALLOW_FILE)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`)
+  const body = JSON.stringify(baseline, null, 2) + '\n'
+  try {
+    // tmp = ALLOW_FILE 同目录 + pid + 随机后缀，无外部净输入；'wx' 不覆盖已有文件，mode 固定 0o644（库内 100644，免被 umask 改成组可写）
+    // eslint-disable-next-line
+    fs.writeFileSync(tmp, body, { flag: 'wx', mode: 0o644 }) // nosemgrep（tmp = ALLOW_FILE 同目录 + pid + 随机后缀）
+    // 目标 = __dirname 常量、源 = 同目录刚写好的临时文件：rename 原子替换，读者永远看不到半份基线
+    // eslint-disable-next-line
+    fs.renameSync(tmp, ALLOW_FILE) // nosemgrep（目标 = __dirname 常量）
+  } catch (e) {
+    // 清理 best-effort：临时文件已被 rename 掉或删不掉都不覆盖主错误，原基线保持未改动
+    try {
+      // eslint-disable-next-line
+      fs.unlinkSync(tmp) // nosemgrep（tmp = 本次调用自己拼出的临时名）
+    } catch (cleanupErr) { /* 无残留可清或清理失败：主错误照响 */ }
+    die(2, `基线写盘失败（原文件未改动）：${e.message}`)
+  }
 }
 
 const perFile = (hits) => {
@@ -457,8 +500,9 @@ function main () {
   if (argv.includes('--write-allowlist')) {
     const next = renderBaseline(hits)
     const allowGrowth = argv.includes('--allow-growth')
-    if (fs.existsSync(ALLOW_FILE)) {
-      const previous = readBaseline()
+    // 没有旧基线（文件不存在）⇒ 跳过增长拒绝、直接写盘：与旧的 existsSync=false 分支逐点等价
+    const previous = readBaselineOrNull()
+    if (previous) {
       const grown = []
       if (next.total > previous.total) grown.push(`total ${previous.total} → ${next.total}`)
       for (const [file, count] of Object.entries(next.by_file)) {
@@ -470,7 +514,7 @@ function main () {
           '\n  确实要抬高基线请显式加 --allow-growth，并在 CHANGELOG 里逐文件归因。')
       }
     }
-    fs.writeFileSync(ALLOW_FILE, JSON.stringify(next, null, 2) + '\n') // nosemgrep（ALLOW_FILE = __dirname 常量）
+    writeBaselineAtomic(next)
     console.log(`已写入基线：total=${next.total}（${Object.keys(next.by_file).length} 个文件）`)
     printByFile('按文件：', perFile(hits))
     return
