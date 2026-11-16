@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.464 — S0 r21：assert 闸的基线读写结构性消除 TOCTOU——删掉 fs.existsSync(ALLOW_FILE) 探测（check-then-use 是 CodeQL js/file-system-race 的根因，也是 Semgrep「动态构造路径」告警点），改一次 readFileSync + ENOENT ⇒ null；写盘改同目录临时文件（常量前缀 + pid + crypto 随机后缀）+ fs.renameSync 原子替换，失败清理临时文件。增长拒绝语义逐点不变（有旧基线才比 total/by_file，--allow-growth 才放行，拒绝时不落盘，白名单 629/629 原地不动）。只动工具层与版本，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.465 — S0 r22 十条 must_fix：闸门检测面补齐（异步 await/回调读取、const read = fs.readFileSync 成员别名、解构 strictEqual 族、map/filter/flatMap 链式 reader、同文件 helper 形参、loadModel(...).code），恢复「基线只减不增」的 git 参照校验（--baseline-ref / --allow-growth --reason 留痕、参照不可得时 CI fail-closed），--write-allowlist 不再对旧 schema / 坏 JSON 自锁；白名单 629 → 2080 是仪器变宽后既有断言首次可见（逐文件差额见 CHANGELOG），一条断言未新增未放宽。只动测试面、工具层与文档，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

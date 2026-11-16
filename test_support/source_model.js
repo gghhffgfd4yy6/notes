@@ -7,8 +7,9 @@
  * 误红（2026-11-15 mutation 13 段集体误红），而注释里出现同样字面量时又永远为真。断言应该问
  * 「有这个函数吗 / 调用了这个成员吗 / 导出了它吗」，而不是「这段文本出现过吗」。
  *
- * 依赖：仓库已有的 acorn（devDependencies 里的 `acorn`，沙箱里由 copyProject 的 node_modules 软链提供），
- * **不新装依赖**。
+ * 依赖（与 package.json 一致）：`acorn` 已在 **dependencies**（`^8.19.0`，随生产安装；沙箱里由 node_modules
+ * 软链提供，不新装）；`js-yaml` 已在 **devDependencies** 声明（`^4.3.2`，`scripts/check-deps.js` 的
+ * test_support/ 扫描按「已声明」放行）。本层不引入任何未在 package.json 声明的依赖。
  *
  * 设计约束（勿放宽）：
  *   - AST 解析失败**抛错**，绝不静默返回空集合——空集合会让「有该函数」这类断言全绿，等于把
@@ -242,8 +243,8 @@ const hasMember = (file, name) => loadModel(file).members.has(name)
 const hasFunction = (file, name) => loadModel(file).funcs.has(name)
 const hasExport = (file, name) => loadModel(file).exports.has(name)
 
-// YAML：仓库里没有直接声明 js-yaml（它作为 stryker 依赖树的一部分装在 node_modules 里，禁止新装），
-// 因此按「存在就用、缺失就明确报错」解析，不静默降级成文本匹配。
+// YAML：`js-yaml` 已在 package.json 的 devDependencies 声明（`^4.3.2`，`scripts/check-deps.js` 的
+// test_support/ 扫描按「已声明」放行），因此直接按依赖使用、不新装；缺失时明确报错，不静默降级成文本匹配。
 // 安全性：js-yaml 4 的 load() 只走 DEFAULT_SCHEMA（!!js/function 一类的构造器已移除），不做代码执行，
 // 这里解析的是本仓自己的 workflow/config 文件，与 Python 的 yaml.load 语义无关。
 function loadYaml (file) {

@@ -142,10 +142,11 @@ const SUITES = [
   // 故把每个形态做成「正向必红 / 反向必绿」。全部在 mkdtemp 隔离工作区里跑（复制闸脚本 + 软链
   // node_modules，跑完 rmSync），不读 .githooks、不碰真实白名单 ⇒ 沙箱内可运行（不设 mutationSkip）。
   // 成本是约 30 次子进程（每个夹具 0.1-0.3s），照 test_check_version.js 的子进程夹具先例。
-  // r12-5：desc 与这里的注释必须与**实测用例数**一致（旧文案停在 v3.444 的「17 种」，而判据早已从
+  // r12-5 / r22-C4：desc 与这里的注释必须与**实测**一致（旧文案停在 v3.444 的「17 种」，而判据早已从
   // 「多重集超次数」改成「按文件计数」，三处数字互不一致）。数字由 test_check_source_text_asserts.js
-  // 末尾的「套件说明不得漂移」用例对账——改用例数会同时要求改这一行。
-  { name: '源码文本断言闸', file: 'test_check_source_text_asserts.js', desc: 'check-source-text-asserts.js（12 检查）：5 种形状各一条正向必红（①直接字面量 / ②变量锚点与比较运算符·strictEqual 族 / ③模板插值 / ④reader 别名（arrow 与解构重命名）/ ⑤helper 返回源码），每条都断言 exit 1、点名「文件 基线0/实测1/+1」并标出形状与命中行，删掉后恢复 exit 0；反向必绿（AST 结构断言·配置解析·行为断言不入账、scripts/ 与生产 .js 不在扫描面）；基线段（--write-allowlist 增长拒绝且不改盘、显式 --allow-growth 才写、total≠sum(by_file) exit 2、新文件按 0 算、下降只报 shortfall）；端到端（真实仓库 exit 0、打印 基线 total 与 实测 total、基线无生产文件）' },
+  // 的「套件说明不得漂移」用例**机械对账**：该用例 require 本文件、取这一条的 desc，比对「（N 检查）」
+  // 与每个形状的实测条数——改用例数而不同步改 desc，那一条立即红。
+  { name: '源码文本断言闸', file: 'test_check_source_text_asserts.js', desc: 'check-source-text-asserts.js（24 检查）：5 种形状各一条正向必红（①直接字面量 +1 / ②变量锚点/比较 +3 / ③模板插值 +1 / ④reader 别名 +4 / ⑤helper 源码/形参 +1），断言 exit 1、点名「文件 基线0/实测N/+N」（N 随形状不同）并标出形状与命中行，删掉后恢复 exit 0；数据流边界（异步 await 与回调读取、同文件 helper 形参、map/join 链式 reader、loadModel().code、解构 strictEqual 别名）；反向必绿（AST 结构断言·配置解析·行为断言不入账、scripts/ 与生产 .js 不在扫描面）；基线段（增长拒绝且不改盘、--allow-growth 须配 --reason 且写进 growth 段留痕、total≠sum(by_file) exit 2、新文件按 0 算、下降只报 shortfall、无旧基线直接写盘、写盘失败清 .tmp 且原文件不动、必须 rename 不得 writeFileSync(基线)、旧 schema/损坏 JSON 可重生成而门禁仍 exit 2）；参照不可得（CI=true 且无 git ⇒ exit 2、本机只打印原因）；端到端（真实仓库 exit 0、打印 基线 total 与 实测 total、基线无生产文件）' },
   // S0（v3.446，r4 评审 must_fix r4-4）：工具层自身的用例。此前 test_support/source_model.js 零断言——
   // 它是后续每个包做结构断言的唯一入口，而 `assert.ok(!hasFunction(f, '旧实现'))` 这类否定断言在 model
   // 退化时会**静默变绿**（与 S0 要治的失效同源）。夹具全在 mkdtemp 里写、跑完 rmSync，不读仓库源码
