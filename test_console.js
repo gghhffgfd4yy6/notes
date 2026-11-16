@@ -99,7 +99,7 @@ const { loadModel } = require('./test_support/source_model')
 const { parseText, findFirst, findAll, callSites, memberPath, objectKeyNames, importBindings } = require('./test_support/ast_query')
 const markup = require('./test_support/markup')
 
-const CONSOLE_ASSET_DIR = path.join('scripts', 'console-assets')
+const CONSOLE_ASSET_DIR = path.join(__dirname, 'scripts', 'console-assets')
 
 // 7 个前端模块**各自**建模：它们都 import 同名符号（FETCH_TIMEOUT_MS 等），拼成一份再按
 // module 解析会因重复声明直接失败的——旧 readConsoleSource() 的文本拼接不能喂给 AST。
@@ -7896,10 +7896,19 @@ async function main () {
     const autoRefreshNode = markup.functionNodeOf(loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js')), 'AutoRefreshText')
     assert.ok(autoRefreshNode, 'components.js 里必须有 AutoRefreshText')
     const nowMsCalls = (node) => findAll(node, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setNowMs')
-    const nowCallsOutside = consoleAssetModels()
-      .flatMap((model) => nowMsCalls(model).filter((call) => call.start < autoRefreshNode.start || call.end > autoRefreshNode.end))
-    assert.deepStrictEqual(nowCallsOutside.map((call) => call.loc.start.line), [],
-      '秒级时钟只能存在于 AutoRefreshText 内（App 不得保留每秒 nowMs 状态）')
+    // 只在 components.js 里、且只在 AutoRefreshText 的函数区间内允许 setNowMs。AutoRefreshText 来自
+    // components.js，拿它的字符偏移去过滤别的模块（ui.js / pages.js…）没有意义——别的文件里落在同一
+    // 数字区间的越界调用会被静默放过。按文件分组后，其它模块出现任何 setNowMs 一律算越界。
+    const autoRefreshFile = path.resolve(CONSOLE_ASSET_DIR, 'components.js')
+    const nowCallsOutside = consoleAssetModels().flatMap((model) => {
+      const calls = nowMsCalls(model)
+      const allowed = path.resolve(model.file) === autoRefreshFile
+        ? calls.filter((call) => call.start >= autoRefreshNode.start && call.end <= autoRefreshNode.end)
+        : []
+      return calls.filter((call) => !allowed.includes(call)).map((call) => `${path.basename(model.file)}:${call.loc.start.line}`)
+    })
+    assert.deepStrictEqual(nowCallsOutside, [],
+      '秒级时钟只能存在于 components.js 的 AutoRefreshText 内（其它组件/模块不得保留每秒 nowMs 状态）')
     assert.ok(nowMsCalls(autoRefreshNode).length > 0, 'AutoRefreshText 必须靠 setNowMs 驱动秒级刷新')
     assert.deepStrictEqual(nowMsCalls(autoRefreshNode)
       .filter((call) => call.arguments[0] && call.arguments[0].type !== 'ArrowFunctionExpression' &&
@@ -9691,6 +9700,14 @@ async function main () {
     assert.ok(cssDeclValuesOf(cssRules, '.drawer-backdrop::before', 'animation')
       .some((value) => value.split(/\s+/)[0] === 'drawer-backdrop-in'),
     '遮罩要由 ::before 自己淡入，不然底色是硬跳')
+    // v3.381 手机「闪一下」的两条锁（只断动画名守不住）：静态 opacity 必须是 0，否则动画起手前
+    // 那一帧算出来是 1（先画一帧全黑遮罩再跳回 0 淡入）；动画必须 forwards，否则播完跳回静态 0。
+    // 静态基线只在不在 @media 里的规则上取（减少动效那条把 opacity 覆盖成 1，属另一判据）。
+    assert.ok(cssBaseDeclValuesOf(cssRules, '.drawer-backdrop::before', 'opacity').includes('0'),
+      '遮罩静态 opacity 必须是 0（否则动画起手前会先黑一帧，看着像闪）')
+    const backdropBeforeAnim = cssBaseDeclValuesOf(cssRules, '.drawer-backdrop::before', 'animation')
+    assert.ok(backdropBeforeAnim.length > 0 && backdropBeforeAnim.every((value) => value.split(/\s+/).includes('forwards')),
+      '遮罩淡入必须 forwards（否则播完跳回静态 0，遮罩瞬间消失）')
     const backdropIn = kfRule('drawer-backdrop-in', 'from').concat(kfRule('drawer-backdrop-in', 'to'))
     assert.deepStrictEqual(backdropIn.map((rule) => [rule.selector, rule.decls.get('opacity')]),
       [['from', '0'], ['to', '1']], '遮罩关键帧必须真的从 0 到 1')
@@ -9729,6 +9746,11 @@ async function main () {
     // 行内展开的旧实现整体退场：DOM class、aria-expanded、展开态 state 都不许留。
     assert.deepStrictEqual(els.flatMap((el) => markup.classNames(el)).filter((name) => name === 'msg-content' || name === 'msg-caret'),
       [], '不得再渲染行内展开的 .msg-content / .msg-caret')
+    // 样式面同样要退场：只断渲染元素的 class 挡不住「DOM 删了、CSS 留着」的样式回潮
+    // （残留规则会继续命中将来复用的同名 class）。按规则解析后断「没有任何规则的选择器含这两个类」。
+    const msgCssResidue = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+      .filter((rule) => /\.msg-(content|caret)(?![\w-])/.test(rule.selector)).map((rule) => rule.selector)
+    assert.deepStrictEqual(msgCssResidue, [], '行内正文的 .msg-content / .msg-caret 样式必须一起删掉')
     assert.deepStrictEqual(els.filter((el) => markup.attrOf(el, 'aria-expanded')).map((el) => el.name), [],
       '行内展开的 aria-expanded 必须退场（弹出的是对话框，不是展开行）')
     const titleBtn = els.find((el) => markup.attrText(el, 'aria-haspopup') === 'dialog')
@@ -9787,6 +9809,18 @@ async function main () {
     const components = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
     const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     const ui = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    // 正式运行会真实推送：动作表里 key=run 的按钮必须是红色危险态（btn-danger-solid），
+    // 改成普通主按钮会让「不可逆操作」看起来和试运行一样安全。
+    const actionDefs = findFirst(components, (n) => n.type === 'VariableDeclarator' && n.id.name === 'ACTION_DEFS')
+    assert.ok(actionDefs && actionDefs.init.type === 'ArrayExpression', '必须能解析动作表 ACTION_DEFS')
+    const actionFields = actionDefs.init.elements.filter((el) => el.type === 'ObjectExpression').map((obj) => {
+      const fields = {}
+      for (const prop of obj.properties) fields[prop.key.name || prop.key.value] = prop.value.value
+      return fields
+    })
+    const runAction = actionFields.find((fields) => fields.key === 'run')
+    assert.ok(runAction, '动作表里必须有 key=run（正式运行一轮）')
+    assert.strictEqual(runAction.cls, 'btn-danger-solid', '正式运行必须是红色危险按钮（btn-danger-solid）')
     // 危险动作必须有确认弹窗，且是原生 <dialog> 的语义（v3.384 起顶层/焦点陷阱交给浏览器）。
     assert.ok(markup.functionNodeOf(components, 'ConfirmDialog'), '危险动作必须有确认弹窗（ConfirmDialog）')
     const confirmEls = elementsInFunction(components, 'ConfirmDialog')
@@ -9905,8 +9939,14 @@ async function main () {
     const rules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
     // 安卓 Chrome / WebView 默认在被点元素上画一块不跟随圆角的蓝方块（每次点击闪一下），
     // 这层由内核绘制，只有 -webkit-tap-highlight-color 能关；写进组件层会因优先级被内核覆盖。
-    assert.deepStrictEqual(cssDeclValuesOf(rules, 'html', '-webkit-tap-highlight-color'), ['transparent'],
+    // 判据分两层：值必须是 transparent，且这条规则必须落在 @layer base 里——写进组件层
+    // （或顶层未分层）会因层优先级被内核默认值盖掉，等于没关。
+    const htmlTapRules = cssRulesFor(rules, 'html').filter((rule) => rule.decls.has('-webkit-tap-highlight-color'))
+    assert.deepStrictEqual(htmlTapRules.map((rule) => rule.decls.get('-webkit-tap-highlight-color')), ['transparent'],
       '基础层必须在 html 上关闭点按高亮（可继承兜底）')
+    assert.deepStrictEqual(htmlTapRules.filter((rule) => !rule.at.some((at) => at.startsWith('@layer base')))
+      .map((rule) => rule.at.join(' > ') || '(未分层)'), [],
+    'html 的点按高亮必须写在 @layer base 里（写进组件层会被内核默认值覆盖）')
     // 交互元素须显式关闭（内核不继承该属性）：一条规则列出 button / a / [role="button"] 都覆盖。
     const declared = rules.filter((rule) => rule.decls.get('-webkit-tap-highlight-color') === 'transparent')
     const covers = declared.some((rule) => {
