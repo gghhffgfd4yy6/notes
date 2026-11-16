@@ -151,7 +151,7 @@ const SUITES = [
   // 它是后续每个包做结构断言的唯一入口，而 `assert.ok(!hasFunction(f, '旧实现'))` 这类否定断言在 model
   // 退化时会**静默变绿**（与 S0 要治的失效同源）。夹具全在 mkdtemp 里写、跑完 rmSync，不读仓库源码
   // ⇒ 不设 integration / mutationSkip（沙箱内可运行）。
-  { name: '源码结构视图', file: 'test_source_model.js', desc: 'test_support/source_model.js：loadModel 八件套/缓存 + 注释与字符串不算（含集合规模下界）+ funcs 六类（声明/箭头/表达式/类方法/静态/对象方法）+ calls 与 members（成员链/计算成员/动态键）+ exports 的 CJS 三态与 ESM 四态 + codeOnly 去注释保字符串 + parseShell 引号/$(…)/注释/元字符/未闭合抛错 + loadYaml 按字段取值 + 坏语法必抛 + 12 个公共导出面（另 2 个内部件 shellTokens/_cache 单列，导出集合与登记表逐项相等——新增导出未登记即红）' }
+  { name: '源码结构视图', file: 'test_source_model.js', desc: 'test_support/source_model.js：loadModel 八件套/缓存 + 注释与字符串不算（含集合规模下界）+ funcs 六类（声明/箭头/表达式/类方法/静态/对象方法）+ calls 与 members（成员链/计算成员/动态键）+ exports 的 CJS 三态与 ESM 四态 + codeOnly 去注释保字符串 + parseShell 引号/$(…)/注释/元字符/未闭合抛错 + loadYaml 按字段取值 + 坏语法必抛 + 12 个公共导出面（另 2 个内部件 shellTokens/_cache 单列，导出集合与登记表逐项相等——新增导出未登记即红）；另含 test_support/markup.js 自测（12 条：嵌套/属性静态值与表达式绑定/void 与自闭合/raw text/注释与 doctype 丢弃/htm 组件标签与无名闭合/未闭合宽进/expandTemplates 最外层展开/hasClass 整类名相等与 attrOf 缺失返回 null/入参 TypeError）' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

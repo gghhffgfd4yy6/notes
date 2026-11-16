@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.483 — C1：测试占位 base 由 http 改 https，消 SonarCloud S5332 安全告警（test_console.js 资产 URL 断言语义不变）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.484 — C1 r2：修评审 4 条 must_fix（v3.482 段 probe 条数 40→93、98+26=124 对账、shortfall 拆成两次运行；补 test_support/markup.js 12 条自测）；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

@@ -15,12 +15,21 @@
 // 本文件已入账 5 条——`m.code === CJS_FIXTURE` 那类「相等比较」1 条 + `m.codeOnly.includes(…)` 4 条
 // （`by_file: { "test_source_model.js": 5 }`）。所以「这里不比任何源码文本」是错的：写 code/codeOnly
 // 的逐字比对同样要按基数额度算，多写一条就会让闸门 exit 1。
+//
+// v3.484（C1 r2 评审 must_fix 4）：本套件同时是 `test_support/markup.js`（标记结构视图，460 行）的
+// 自测面——第 12 节的 12 条用例覆盖元素/属性/文本、void 与自闭合、raw text、htm 组件标签与 `</>`
+// 无名闭合、注释/doctype 丢弃、未闭合宽进、expandTemplates 最外层展开、classNames/hasClass 整类名
+// 相等、expressionsIn 顺序、attrOf 缺失返回 null、入参 TypeError。markup.js 只吃 AST 节点或调用方
+// 给的**运行期**文本（不读源码文件），夹具是本文件里的字符串常量 ⇒ 这 12 条**不新增**源码文本断言，
+// 本文件在基线里仍是 5 条（闸门实测 total 不变即证）。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
 const model = require('./test_support/source_model.js')
+const astQuery = require('./test_support/ast_query.js')
+const markup = require('./test_support/markup.js')
 
 // 与 test_ci_static_gates.js / test_check_source_text_asserts.js 同一套 harness 形态：
 // 每条检查独立捕获，passed/failed 双计数，末尾统一汇总并置非零退出码（一条抛错不中断后续检查）。
@@ -307,6 +316,156 @@ check('对外 API：12 个公共导出面齐全、2 个内部件单列，导出�
     [...api.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
     [...API_FACE, ...INTERNALS].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
     '导出集合必须恰为「12 个公共面 + 2 个内部件」：新增导出要同时登记到本用例与 test_suites.js 的 desc')
+})
+
+// ── 12. test_support/markup.js（标记结构视图）自测 ───────────────────────
+// 这一层是 C1 把「读源码文本」换成结构断言的公共入口（模板/HTML → 元素·属性·绑定·文本），此前
+// **零用例**，而文件头把契约挂在「自带的基本不变式」上——仓内并不存在那份不变式。判据形态与上面
+// source_model 的用例一致：每条语义配「必须这样」与「不得那样」，让解析器退化（栈不退、属性类型混用、
+// 前缀匹配放宽）至少红一条。夹具全部是字符串常量 / 现场 acorn 解析出的 AST，不读仓库源码。
+// 夹具里的 `%{x}` 就是模板源码里的 `${x}`：standard 的 `no-template-curly-in-string` 会对普通字符串
+// 字面量里的 `${` 判红（这里本意不是模板字符串），故统一用 %{ 占位再换回——与 test_console.js
+// 「把 $ 拼出来」同一口径，不靠 eslint-disable 压规则。
+const tplSrc = (text) => text.split('%{').join('$' + '{')
+
+const tplOf = (source) => {
+  const node = astQuery.findFirst(astQuery.parseText(tplSrc(source)), (n) => n.type === 'TaggedTemplateExpression')
+  assert.ok(node, '夹具必须是可解析的 html`` 模板：' + source)
+  return node
+}
+
+check('markup：嵌套元素与兄弟不串层（div>span 且 </div> 后的 p 落回 root）', () => {
+  const root = markup.markupOfText('<div class="box"><span>in</span></div><p>out</p>')
+  assert.deepStrictEqual(root.children.map((c) => c.type + ':' + (c.name || c.value)), ['element:div', 'element:p'],
+    'div 与 p 必须是同一层的兄弟（栈没退干净会把 p 塞进 div）')
+  const div = markup.elementsNamed(root, 'div')[0]
+  assert.deepStrictEqual(div.children.map((c) => c.name || c.type), ['span'], 'span 必须在 div 内、且是唯一子元素')
+  assert.strictEqual(markup.textOf(markup.elementsNamed(div, 'span')[0]), 'in')
+  assert.strictEqual(markup.textOf(markup.elementsNamed(root, 'p')[0]), 'out')
+})
+
+check('markup 属性：静态值取 attrText、表达式取 attrExpr、裸值/布尔值/展开逐项对', () => {
+  const root = markup.markupOf(tplOf('const x = html`<div data-open=%{open} class="rule src" hidden %{props} data-id=abc>x</div>`'))
+  const div = markup.elementsNamed(root, 'div')[0]
+  assert.strictEqual(markup.attrText(div, 'class'), 'rule src', '静态属性按原文取值')
+  assert.deepStrictEqual(markup.classNames(div), ['rule', 'src'], 'class 按空白切分')
+  assert.strictEqual(markup.attrText(div, 'data-open'), null, '表达式绑定的属性不得返回静态文本（那是接线不是文案）')
+  assert.strictEqual(markup.attrExpr(div, 'data-open').name, 'open', 'attrExpr 必须给出绑定的表达式节点')
+  assert.strictEqual(markup.attrText(div, 'hidden'), '', '无值属性取空串（不与「缺失」混为一谈）')
+  assert.strictEqual(markup.attrText(div, 'data-id'), 'abc', '无引号裸值也要读出来')
+  assert.deepStrictEqual(div.attrs.filter((a) => a.spread === true).map((a) => a.name), [''],
+    '模板里的 props 插值必须记成一条 spread，不得当成具名属性')
+  assert.strictEqual(markup.attrOf(div, 'data-open').name, 'data-open', 'attrOf 大小写不敏感地取到属性对象')
+  for (const name of ['nope', 'data-missing']) {
+    assert.strictEqual(markup.attrOf(div, name), null, `attrOf(${name}) 缺失必须返回 null`)
+    assert.strictEqual(markup.attrText(div, name), null, `attrText(${name}) 缺失必须返回 null`)
+    assert.strictEqual(markup.attrExpr(div, name), null, `attrExpr(${name}) 缺失必须返回 null`)
+  }
+})
+
+check('markup：hasClass 是整类名相等（前缀/子串不算）+ textOf 折叠空白、rawTextOf 保行', () => {
+  const el = markup.elementsNamed(markup.markupOfText('<div class="rule-src  card">t</div>'), 'div')[0]
+  assert.strictEqual(markup.hasClass(el, 'rule-src'), true, '整类名必须命中')
+  assert.strictEqual(markup.hasClass(el, 'card'), true)
+  assert.strictEqual(markup.hasClass(el, 'rule'), false, '前缀匹配不算命中（放宽成前缀匹配会让「类名被换掉」静默变绿）')
+  assert.strictEqual(markup.hasClass(el, 'src'), false, '子串匹配同样不算命中')
+  assert.deepStrictEqual(markup.classNames(el), ['rule-src', 'card'])
+  const pre = markup.markupOfText('<pre>a\n  b</pre>')
+  assert.strictEqual(markup.rawTextOf(pre), 'a\n  b', 'rawTextOf 必须保留换行与缩进（行级断言要用）')
+  assert.strictEqual(markup.textOf(pre), 'a b', 'textOf 必须折叠空白')
+})
+
+check('markup：void 与自闭合不吞后续兄弟（input/br 之后仍是同级）', () => {
+  const root = markup.markupOfText('<div><input type="text"><p>after</p><br>tail</div>')
+  const div = markup.elementsNamed(root, 'div')[0]
+  assert.deepStrictEqual(div.children.map((c) => c.type === 'element' ? c.name : '#' + c.value),
+    ['input', 'p', 'br', '#tail'], 'void 标签不得把后续内容收成子节点，文本 tail 必须留在 div 内')
+  assert.strictEqual(markup.textOf(markup.elementsNamed(div, 'p')[0]), 'after')
+  const selfClosed = markup.elementsNamed(markup.markupOfText('<div><span/>after</div>'), 'span')[0]
+  assert.deepStrictEqual(selfClosed.children, [], '<span/> 必须自闭合（after 不得成为它的子节点）')
+})
+
+check('markup raw text：title/textarea 内容按原文收，不被当成标签解析', () => {
+  const root = markup.markupOfText('<div><title>数据 & 备份</title><textarea>{x: 1}</textarea><p>k</p></div>')
+  assert.deepStrictEqual(markup.elementsNamed(root, 'title')[0].children.map((c) => c.type + ':' + c.value),
+    ['text:数据 & 备份'], 'title 内容整段是文本（`&` 不得触发实体/标签解析）')
+  assert.strictEqual(markup.rawTextOf(markup.elementsNamed(root, 'textarea')[0]), '{x: 1}')
+  assert.strictEqual(markup.elementsNamed(root, 'p').length, 1,
+    'raw text 没吃掉结束标签时 p 会被套进 title/textarea 里（数量断言当场红）')
+})
+
+check('markup：注释与 doctype 丢弃、< 当文本、多余结束标签忽略（都不抛错）', () => {
+  const root = markup.markupOfText('<!doctype html><div><!-- 注释里的 <span> 不算 --><span>x</span></div>')
+  assert.deepStrictEqual(root.children.map((c) => c.type + ':' + c.name), ['element:div'],
+    'doctype 不得变成名为 !doctype 的节点')
+  assert.deepStrictEqual(markup.allElements(root).map((el) => el.name), ['div', 'span'], '注释内容不得变成元素')
+  assert.strictEqual(markup.textOf(markup.elementsNamed(root, 'div')[0]), 'x')
+  assert.strictEqual(markup.textOf(markup.markupOfText('<p>a < b</p>')), 'a < b', '`<` 后不是标签名时按文本处理')
+  const stray = markup.markupOfText('<div>a</div></div><p>b</p>')
+  assert.deepStrictEqual(stray.children.map((c) => c.type + ':' + c.name), ['element:div', 'element:p'],
+    '多余的结束标签必须被忽略，不得把 p 弄丢或塞进 div')
+})
+
+check('markup：htm 组件标签名取自表达式，</> 关最内层（兄弟落回外层）', () => {
+  const root = markup.markupOf(tplOf('const x = html`<%{Drawer} title="抽屉"><p>in</p></><span>out</span>`'))
+  const drawer = markup.allElements(root)[0]
+  assert.strictEqual(drawer.name, 'Drawer', '组件名必须取自表达式，不是模板文本')
+  assert.strictEqual(markup.attrText(drawer, 'title'), '抽屉')
+  assert.deepStrictEqual(root.children.map((c) => c.type + ':' + (c.name || c.value)), ['element:Drawer', 'element:span'],
+    '</> 必须关掉最内层（若当成「忽略」，span 会被收进 Drawer，抽屉内外就分不清了）')
+  const nested = markup.markupOf(tplOf('const x = html`<%{UI.Drawer}><b>x</b></>`'))
+  assert.strictEqual(markup.allElements(nested)[0].name, 'UI.Drawer', '成员路径形式的组件名必须逐级拼出来')
+})
+
+check('markup：未闭合/模板末尾截断宽进不抛错，已解析部分仍成树', () => {
+  let root
+  assert.doesNotThrow(() => { root = markup.markupOfText('<div><span>x') }, '未闭合标签不得抛错（宽进）')
+  assert.deepStrictEqual(markup.allElements(root).map((el) => el.name), ['div', 'span'], '未闭合时已开标签仍必须在树上')
+  assert.strictEqual(markup.textOf(root), 'x')
+  const truncated = markup.markupOf(tplOf('const x = html`<div><span>x`'))
+  assert.deepStrictEqual(markup.allElements(truncated).map((el) => el.name), ['div', 'span'])
+  assert.strictEqual(markup.textOf(truncated), 'x', '模板末尾未闭合时，最后一段文本不得丢')
+})
+
+check('markup expandTemplates：默认不展开、展开后嵌套模板就地成元素且不重复计数', () => {
+  const src = 'const x = html`<ul>%{cond && html`<li>a</li>`}%{list.map((i) => html`<li>%{i}</li>`)}</ul>`'
+  const off = markup.markupOf(tplOf(src))
+  assert.deepStrictEqual(markup.allElements(off).map((el) => el.name), ['ul'], '默认只看本层：嵌套模板是 expr 节点，不是元素')
+  assert.deepStrictEqual(markup.expressionsIn(markup.elementsNamed(off, 'ul')[0]).map((n) => n.type),
+    ['LogicalExpression', 'CallExpression'])
+  const on = markup.markupOf(tplOf(src), { expandTemplates: true })
+  assert.strictEqual(markup.elementsNamed(on, 'li').length, 2, '展开后两个分支各产出一个 li（一个不许少、也不许重复计数）')
+  assert.strictEqual(markup.textOf(markup.elementsNamed(on, 'li')[0]), 'a', '展开出的元素文本必须能读')
+  assert.strictEqual(markup.expressionsIn(markup.elementsNamed(on, 'li')[1])[0].name, 'i', '展开后 li 里的绑定仍指向原表达式')
+})
+
+check('markup：expressionsIn 按出现顺序只给绑定表达式（静态文本不参与）', () => {
+  const root = markup.markupOf(tplOf('const x = html`<div>%{a}文字%{b.c()}<span>%{d}</span></div>`'))
+  const div = markup.elementsNamed(root, 'div')[0]
+  assert.deepStrictEqual(markup.expressionsIn(div).map((n) => n.type + (n.name ? ':' + n.name : '')),
+    ['Identifier:a', 'CallExpression', 'Identifier:d'], '绑定表达式必须按出现顺序（含裸调用），静态文本不得混进来')
+  assert.deepStrictEqual(div.children.map((c) => c.type), ['expr', 'text', 'expr', 'element'], '文本与表达式各自成节点')
+})
+
+check('markup：templateOfFunction / functionNodeOf / templatesIn 找到与找不到的边界', () => {
+  const ast = astQuery.parseText('function BackupBlock () { return html`<div class="backup"><p>x</p></div>` }\nfunction Empty () { return 1 }')
+  const tpl = markup.templateOfFunction(ast, 'BackupBlock')
+  assert.ok(tpl, '函数体内的 html`` 模板必须找得到')
+  assert.strictEqual(markup.textOf(markup.allElements(markup.markupOf(tpl))[0]), 'x')
+  assert.strictEqual(markup.functionNodeOf(ast, 'NotThere'), null, '函数不存在必须返回 null（调用方据此断言「必须存在」）')
+  assert.strictEqual(markup.templateOfFunction(ast, 'NotThere'), null)
+  assert.strictEqual(markup.templateOfFunction(ast, 'Empty'), null, '函数里没有模板必须返回 null')
+  assert.strictEqual(markup.templatesIn(ast).length, 1, 'templatesIn 按出现顺序给全部模板')
+})
+
+check('markup：入参契约 TypeError（非模板节点 / 非字符串文本）', () => {
+  assert.throws(() => markup.segmentsOfTemplate({ type: 'Identifier', name: 'x' }),
+    /markup: 需要 TaggedTemplateExpression 或 TemplateLiteral 节点/,
+    '非模板节点必须响亮抛 TypeError（静默返回空树＝断言在空集合上假绿）')
+  assert.throws(() => markup.segmentsOfTemplate(null), /markup: 需要 TaggedTemplateExpression 或 TemplateLiteral 节点/)
+  assert.throws(() => markup.markupOfText(42), /markup: 文本必须是字符串/)
+  const bare = markup.markupOf(astQuery.findFirst(astQuery.parseText('const x = `<b>y</b>`'), (n) => n.type === 'TemplateLiteral'))
+  assert.strictEqual(markup.elementsNamed(bare, 'b')[0].children[0].value, 'y', '裸 TemplateLiteral（无 html 标签）同样可解析')
 })
 
 // 汇总后再清场：即使某条检查抛错，临时工作区也一定要删掉（不在 /tmp 留垃圾）。
