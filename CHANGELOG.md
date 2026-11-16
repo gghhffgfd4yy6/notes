@@ -1956,15 +1956,15 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
     1. `test_notify_selfcheck.js:24` `require.main === module` → AST：按 `if (require.main === module)` 的 `IfStatement` 节点定位守卫（`memberPath` 比对 `require.main`），分发链取 guard 块最后一条语句。
     2. `:26` `'--notify-test'` → 同一块：`notifyArg` 的 `cliArgs.find` 回调里必须出现 `Literal` 字面量 `--notify-test`（`findAll` 认节点，不认文本）。
     3. `:27` `runNotifyTest(cliArgs)` → `callSites(arms[0].consequent,'runNotifyTest')`，且第一个实参必须是标识符 `cliArgs`（原样转发）。
-    4. `:28` `runSingleEntry().catch` → `runSingleEntry` 在 guard 内**恰调用一次**且落在最后 `else` 支（早退语义由分支结构表达，不再比三个下标的大小）。
+    4. `:28` `runSingleEntry().catch` → `runSingleEntry` 在 guard 内**恰调用一次**且落在最后 `else` 支，**并且那次调用必须是某个 `.catch(...)` 的被调对象**、`.catch` 实参必须是函数（旧 `indexOf` 断言同时守的两条判据；本版初稿只数了整条 guard 的次数，v3.480 r1 补回逐条结构断言——实测裸 `runSingleEntry()` 与「挪进 notify 分支」当时都不红）。
     5. `:33` `a.startsWith('--notify-test=')` → `hasCallWithLiteral(picker,'a.startsWith',0,'--notify-test=')`。
     6. `:34` `未识别参数` → 从该分支 `console.error` 的 `TemplateLiteral` quasis 取文案后 `assert.match(/未识别参数/)`：文案必须真的进用户可见的报错调用，注释里的同名字样不算证据。
     7. `test_message_store_journal.js:394` `"a"` → 解析 journal NDJSON 记录后 `journalPuts(...).some(put => put.id === 'a')`。
     8. `:663` `"FILTERED"` → 解析后 `put.id === 'f' && put.title === 'FILTERED'`（标题字段而不是行内子串）。
     9. `:664` `"ckpt":true` → 解析后 `rec.ckpt === true`。
     10. `:786` `"b"` → 解析后 `put.id === 'b'`。
-    11. `test_storage.js:1196` `// ⑧ F1-4：` → ⑧d 结构回归锁改为 AST 定位：`TryStatement` 且 `block` 里有 `fs.fstatSync`、`finalizer` 里有 `fs.closeSync` 的那一段（不再按注释文本切段）。
-    12. `:1197` `// ⑧b 正路径不回归` → 同上，注释锚点整批退场。
+    11. `test_storage.js:1196` `// ⑧ F1-4：` → ⑧d 结构回归锁改为 AST 定位：先认 fd 段（`block` 里有 `fs.fstatSync`、`finalizer` 里有 `fs.closeSync` 的 `TryStatement`），扫描面取它所属 block 里「⑧ F1-4 起点语句（`dir14` 声明）→ ⑧b 起点语句（`dir15` 声明）」之间的**完整语句序列**（不再按注释文本切段；本版初稿曾收窄成 try 子树，v3.480 r1 恢复）。
+    12. `:1197` `// ⑧b 正路径不回归` → 同上，注释锚点整批退场（窗口终点改由 `dir15` 这条场景起点语句表达）。
     13. `:1952` `realpathSync` → `callSites(storeModel,'realpathSync' | 'fs.realpathSync')` 必须为 0（`xbk_message_store` 不得内联 realpath 包含校验）。
     14. `:1954` `isRealPathInside(root, p` → `hasCallWithIdentifier(...,0,'root') && hasCallWithIdentifier(...,1,'p')`：实参顺序写反也变红（旧写法只认字面顺序文本）。
     15. `test_local_mutation_guard.js:111` `--mutate` → 行为断言：真触发 `scripts/mutation-run-guard.js` 的拒绝路径，读**运行期** stderr/stdout 里的放行示例。
@@ -1993,3 +1993,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **闸门**：`node scripts/check-source-text-asserts.js` **exit 0** —— `基线 total=2289（35 个文件），实测 total=2289（扫描 68 个测试面文件）`、`✓ 基线相对参照 origin/main 未增长（逐文件与 total 一致：2289 条）`、`✅ 扫描面内未新增源码文本断言（逐文件计数均未超基线）`。未使用 `--write-allowlist` / `--allow-growth`，也没有靠改数字过关：`by_file` 是按 `renderBaseline` 同一实现对实测重算后**只降不增**写回的。
   - **lint**：`npx standard test_notify_selfcheck.js test_message_store_journal.js test_storage.js test_local_mutation_guard.js test_qinglong_utils.js test_message_store_utils.js test_mutation_report_cli.js test_run_mutation_cli.js test_state_schema.js test_worker_protocol.js test_support/ast_query.js` exit 0。
   - **版本**：3.478.0 → **3.479.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
+
+## v3.480
+
+- **S3 fix r1：两条 review must_fix（断言被放宽；只动测试面与版本四方，生产逻辑一行未改——`xbk_function_v3.js` 只动顶部 banner 那一行）**：
+  - **R1-1 `test_notify_selfcheck.js` 入口分发断言恢复两条判据**：旧断言 `indexOf('runSingleEntry().catch') > indexOf('runNotifyTest(cliArgs)')` 同时守住「完整入口落在最后 `else` 支」与「该调用挂 `.catch`」。上一版只剩 `callSites(guardedBlock,'runSingleEntry').length === 1`（整条 guard 的次数），两个破坏都不红：把 `xbk_function_v3.js:702` 的 `runSingleEntry().catch(e => {…})` 换成裸 `runSingleEntry()`（错误变成 unhandled rejection，绕开 `summarizeError` 脱敏出口）仍 9/9 绿；把调用挪进 `notify` 分支、最后 `else` 留空也仍绿。现改为逐条结构断言：① `arms[last].consequent` 内 `runSingleEntry` 恰 1 次；② 整条 guard 恰 1 次（别处不得有第二份入口）；③ 那次调用的**节点对象**必须是某个 `.catch(…)` `MemberExpression` 的被调对象（与同文件 `chainedNotify` 判法对称），且 `.catch` 实参必须是函数。断言消息与本文件 v3.479 第 4 条的表述已同步为这一实现。
+  - **R1-2 `test_storage.js` ⑧d 扫描面恢复**：上一版把 CodeQL `js/file-system-race` 回归锁的扫描面从「`// ⑧ F1-4：` → `// ⑧b 正路径不回归`」的注释窗口收窄成「`fs.fstatSync` 开段、`finally` 里 `fs.closeSync` 收尾的那一个 `TryStatement` 子树」，窗口内 try 之外新增的按路径 `fs.*` 不再入账，同段注释里「或用 `statSync`/`openSync` 做前置检查」这句保证也被删。实测在 `const fd14 = openF14(log14)` 之前插一行 `const _probeSize14 = fs.statSync(log14).size`（正是原注释点名的回退形态）→ 上一版 `test_storage` 仍绿 rc0（`git show HEAD:test_storage.js` 复跑同一注入确认），旧断言必红。现在按 AST 把扫描面恢复为**完整语句序列**：取该 fd 段所属 block，用 `dir14` / `dir15` 两条场景起点声明定位「⑧ F1-4 起点语句 → ⑧b 起点语句」之间的全部语句（现场准备、注入、fd 读写、读回断言），逐条扫其中的 `fs.*` 调用并只放行 `fstatSync/readSync/writeSync/closeSync`；另加一条扫描面自检（fd 段必须落在这串语句中间），退化成「只剩 try 自身」时先红。注释里恢复「或用 statSync/openSync 做前置检查」这句保证。全程 AST 语句集合，不做文本切片，闸门基线未增长。
+  - **反向验证（本机实测，全部 TZ=UTC；每次破坏后都还原并复跑确认绿，`git diff --quiet xbk_function_v3.js` CLEAN）**：① 裸 `runSingleEntry()` → `test_notify_selfcheck` rc1，红在 `AssertionError: runSingleEntry(...) 的返回必须挂 .catch(...)（否则入口失败会变成 unhandled rejection、绕开 summarizeError 脱敏出口）`（`0 !== 1`）；② 调用挪进 notify 分支 + 最后 else 留空 → rc1，红在 `runSingleEntry 完整入口必须在最后 else 支恰调用一次（早退语义：其它分支一律不得进完整入口）`（`0 !== 1`）；③ `test_storage.js:1115` 前插 `const _probeSize14 = fs.statSync(log14).size` → rc1，红在 `⑧ 现场（完整语句序列）不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流；含 statSync/openSync 前置检查）：第 1115 行：fs.statSync`（actual `['第 1115 行：fs.statSync']` / expected `[]`）。还原后分别复跑得 `🎉 通知自检通过 9/9`、`test_storage OK`。
+  - **验证**：`TZ=UTC node test_notify_selfcheck.js` → `🎉 通知自检通过 9/9`；`TZ=UTC node test_storage.js` → `test_storage OK`；`node scripts/probe-format-coupling.js test_notify_selfcheck.js` / `test_storage.js` 均 `format-clean exit=0`（各扰动并还原 75 个生产文件，`还原校验：git status --short 与运行前一致`）；`node scripts/check-source-text-asserts.js` **exit 0** —— `基线 total=2289（35 个文件），实测 total=2289（扫描 68 个测试面文件）`，`✓ 基线相对参照 origin/main 未增长`。
+  - **lint**：`npx standard test_notify_selfcheck.js test_storage.js` exit 0。
+  - **版本**：3.479.0 → **3.480.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。

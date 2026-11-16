@@ -23,7 +23,8 @@ const {
 //   ① if (notifyArg) { runNotifyTest(cliArgs).catch(…) }                       ← 自检最先分发
 //   ② else if (cliArgs.some(a => …)) { console.error(未识别参数…); exitCode = 1 } ← fail-closed
 //   ③ else { runSingleEntry().catch(…) }                                        ← 完整入口只在最后一支
-// 「runSingleEntry 只在最后一支」就是旧的早退语义，但由分支结构而不是下标表达。
+// 「runSingleEntry 只在最后一支、且该调用挂 .catch」就是旧断言（`indexOf('runSingleEntry().catch')` 的
+// 相对位置）守的两件事，现在由分支结构 + 调用链形态表达，而不是比下标。
 const entryModel = loadModel('xbk_function_v3.js')
 const mainGuard = findFirst(entryModel, (node) =>
   node.type === 'IfStatement' && node.test.type === 'BinaryExpression' && node.test.operator === '===' &&
@@ -67,10 +68,28 @@ assert.ok(mainGuard, 'xbk_function_v3.js 必须有 if (require.main === module) 
     : ''
   assert.match(errText, /未识别参数/, `错误文案必须点名「未识别参数」（实际：${errText}）`)
 
-  // ③ 完整入口只在 else 分支，且整条 guard 里只出现一次
-  assert.strictEqual(arms[arms.length - 1].test, null, '分发链最后必须是 else（完整入口）')
+  // ③ 完整入口只在最后 else 支，且该调用必须挂 .catch
+  // 旧断言是 `indexOf('runSingleEntry().catch') > indexOf('runNotifyTest(cliArgs)')`——它同时守住两件事：
+  // 「完整入口落在最后 else 支」与「调用挂 .catch」。只数「guard 里有 1 次 runSingleEntry」会同时丢掉这两条：
+  // 改成裸 `runSingleEntry()`（错误变 unhandled rejection、绕开 summarizeError 脱敏出口）仍绿；
+  // 把它挪进 notify 分支、最后 else 留空也仍绿。故这里逐条表达：else 支内恰 1 次、整条 guard 恰 1 次
+  // （= 别处没有第二份入口）、且那次调用正是某个 `.catch(…)` 的被调对象（与上面 chainedNotify 判法对称）。
+  const entryArm = arms[arms.length - 1]
+  assert.strictEqual(entryArm.test, null, '分发链最后必须是 else（完整入口）')
+  const entryCalls = callSites(entryArm.consequent, 'runSingleEntry')
+  assert.strictEqual(entryCalls.length, 1,
+    'runSingleEntry 完整入口必须在最后 else 支恰调用一次（早退语义：其它分支一律不得进完整入口）')
   assert.strictEqual(callSites(guardedBlock, 'runSingleEntry').length, 1,
-    'runSingleEntry 完整入口必须且只能在 else 分支调用一次（早退语义）')
+    'runSingleEntry 在整条 guard 里只能出现一次（挪进 notify 分支 / 复制第二份都算破坏早退语义）')
+  const chainedEntry = findAll(entryArm.consequent, (node) =>
+    node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+    node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
+    node.callee.object === entryCalls[0])
+  assert.strictEqual(chainedEntry.length, 1,
+    'runSingleEntry(...) 的返回必须挂 .catch(...)（否则入口失败会变成 unhandled rejection、绕开 summarizeError 脱敏出口）')
+  const entryHandler = chainedEntry[0].arguments[0]
+  assert.ok(entryHandler && (entryHandler.type === 'ArrowFunctionExpression' || entryHandler.type === 'FunctionExpression'),
+    '.catch 的实参必须是函数（失败处理逻辑不得被内联丢弃）')
 
   // --notify-test=1 这类近似写法必须前缀分发到自检（审查 D2-M2 / #232）
   const notifyArgDecl = findAll(guardedBlock, (node) => node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'notifyArg')

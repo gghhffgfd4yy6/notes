@@ -1073,8 +1073,8 @@ const { findAll, memberPath, callSites, hasCallWithIdentifier } = require('./tes
     assert.strictEqual(LogArchive.readGzPage(retry13.path, 1, 100).lines[0], 'F13 第0行', '重试后归档必须仍可读')
 
     // ⑧ 现场的按路径入口集中在观测窗口外：目录与初始明文只准备一次，随后用同一个 r+ fd 贯穿
-    // 长度核验、追加写入与读回。观测窗口（下方 ⑧ F1-4 场景注释起）只允许 fstatSync/readSync/
-    // writeSync/closeSync，由 ⑧d 结构回归锁逐字守住（CodeQL js/file-system-race #131/#132 防回潮）。
+    // 长度核验、追加写入与读回。观测窗口（下方 ⑧ F1-4 场景起、⑧b 起之前）只允许 fstatSync/readSync/
+    // writeSync/closeSync，由 ⑧d 结构回归锁按完整语句序列逐条守住（CodeQL js/file-system-race #131/#132 防回潮）。
     const seedF14 = (dir, data) => {
       fs.mkdirSync(dir, { recursive: true })
       const p = path.join(dir, 'run.log')
@@ -1189,32 +1189,56 @@ const { findAll, memberPath, callSites, hasCallWithIdentifier } = require('./tes
 
     // ⑧d CodeQL js/file-system-race 结构回归锁（alert #131/#132）：⑧ 现场的 fd 校验段从「明文长度
     // 核验」到「读回断言」必须全程用同一个 fd（fstatSync/readSync/writeSync/closeSync），段内不得
-    // 出现任何按路径的 fs.* —— 只要还有 appendFileSync/readFileSync/writeFileSync/statSync 之类按
-    // 路径解析，CodeQL 就会把「按路径检查 → 按路径读/写」重新配成 CWE-367。
+    // 出现任何按路径的 fs.* —— 只要还有 appendFileSync/readFileSync/writeFileSync，或用 statSync/openSync
+    // 做前置检查，CodeQL 就会把「按路径检查 → 按路径读/写」重新配成 CWE-367。
     // 回退本次修复（把 writeSync 换回 appendFileSync、把 fd 读回换回 readFileSync）时本断言必红；
     // 这是本机没有 CodeQL CLI 时守住该数据流不回潮的手段，CodeQL 自身的终局判定仍由下一个 head 的扫描给出。
-    // S3：判据从「按注释切一段源码文本再正则扫 fs.*(」改成「按 AST 取那段 try（块里有 fstatSync、
-    // finally 有 closeSync）再扫它的 fs 调用」——注释改写/格式化不再影响结论，往注释里抄一句
-    // fs.fstatSync( 也不再让它恒真（旧写法两头都错：假红于排版、假绿于注释）。
-    const fdSections14 = findAll(loadModel(__filename), (node) =>
-      node.type === 'TryStatement' && !!node.finalizer &&
-      callSites(node.block, 'fs.fstatSync').length > 0 && callSites(node.finalizer, 'fs.closeSync').length > 0)
-    assert.ok(fdSections14.length >= 1,
-      '必须能定位 ⑧ 现场的 fd 校验段（fstatSync 开段、finally closeSync 收尾）')
+    // S3：判据从「按注释切一段源码文本再正则扫 fs.*(」改成「按 AST 取 ⑧ 场景的**完整语句序列**再扫其中的
+    // fs 调用」——窗口是「⑧ F1-4 起点语句 → ⑧b 起点语句」之间的全部语句（现场准备、注入、fd 读写、读回
+    // 断言都在内），不是只取那个 try 子树：只扫 try 会把窗口里 try 之外新增的按路径 fs.* 静默放过，而
+    // 原注释窗口正是覆盖这几条的。注释改写/格式化不再影响结论，往注释里抄一句 fs.fstatSync( 也不再让它恒真。
+    const model14 = loadModel(__filename)
+    const declaresName14 = (stmt, name) => stmt.type === 'VariableDeclaration' &&
+      stmt.declarations.some((d) => d.id.type === 'Identifier' && d.id.name === name)
+    // 候选 fd 段：block 里有 fstatSync、finally 里有 closeSync 的 try（与旧定位同一判据，readAllByFd 等
+    // helper 也是这个形状），再用「外层 block 里同时有 dir14 / dir15 两条场景起点声明」挑出 ⑧ 现场那个。
+    const fdScenes14 = []
+    findAll(model14, (node, ancestors) => {
+      const isFdSection = node.type === 'TryStatement' && !!node.finalizer &&
+        callSites(node.block, 'fs.fstatSync').length > 0 && callSites(node.finalizer, 'fs.closeSync').length > 0
+      if (!isFdSection) return
+      const outer = ancestors[ancestors.length - 1]
+      const body = outer && outer.type === 'BlockStatement' ? outer.body : []
+      const startIdx = body.findIndex((stmt) => declaresName14(stmt, 'dir14'))
+      const endIdx = body.findIndex((stmt) => declaresName14(stmt, 'dir15'))
+      const tryIdx = body.indexOf(node)
+      if (startIdx < 0 || endIdx <= startIdx || tryIdx <= startIdx || tryIdx >= endIdx) return
+      fdScenes14.push({ body, startIdx, endIdx, tryIdx })
+    })
+    assert.strictEqual(fdScenes14.length, 1,
+      '必须能唯一定位 ⑧ F1-4 现场的 fd 校验段（dir14 起、dir15 止之间，fstatSync 开段 / finally closeSync 收尾）')
+    const scene14 = fdScenes14[0]
+    const sectionStmts14 = scene14.body.slice(scene14.startIdx, scene14.endIdx)
+    // 扫描面自检：fd 段必须落在这串语句的中间 —— 前有现场准备、后有读回断言。若哪天退化成「只剩 try
+    // 自身」，这条会先红，而不是让覆盖面积悄悄缩小。
+    assert.ok(scene14.tryIdx > scene14.startIdx && scene14.tryIdx < scene14.endIdx - 1,
+      `⑧d 扫描面必须是 ⑧ 场景的完整语句序列（实际 ${sectionStmts14.length} 条，fd 段在第 ${scene14.tryIdx - scene14.startIdx + 1} 条）`)
     const allowedFdCalls14 = new Set(['fs.fstatSync', 'fs.readSync', 'fs.writeSync', 'fs.closeSync'])
     const offenders14 = []
     const fdCallNames14 = new Set()
-    for (const section of fdSections14) {
-      const names = findAll(section, (node) =>
-        node.type === 'CallExpression' && /^fs\.[A-Za-z_$][\w$]*$/.test(String(memberPath(node.callee))))
-        .map((call) => memberPath(call.callee))
-      for (const name of names) {
+    for (const stmt of sectionStmts14) {
+      for (const call of findAll(stmt, (node) => {
+        if (node.type !== 'CallExpression') return false
+        const name = memberPath(node.callee)
+        return typeof name === 'string' && name.startsWith('fs.')
+      })) {
+        const name = memberPath(call.callee)
         fdCallNames14.add(name)
-        if (!allowedFdCalls14.has(name)) offenders14.push(`第 ${section.loc.start.line} 行起的 fd 段：${name}`)
+        if (!allowedFdCalls14.has(name)) offenders14.push(`第 ${call.loc.start.line} 行：${name}`)
       }
     }
     assert.deepStrictEqual(offenders14, [],
-      `⑧ 现场不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流）：${offenders14.join(', ')}`)
+      `⑧ 现场（完整语句序列）不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流；含 statSync/openSync 前置检查）：${offenders14.join(', ')}`)
     assert.ok(fdCallNames14.has('fs.fstatSync'),
       '⑧ 现场长度核验必须走 fd（fstatSync），否则同源 TOCTOU 会回来')
     assert.ok(fdCallNames14.has('fs.writeSync') && fdCallNames14.has('fs.readSync'),
