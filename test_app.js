@@ -4580,7 +4580,9 @@ console.log('========================================\n');
   //   ① 删除入口 removeDirInRoot 拒绝仓库根之外的路径（fail-closed）；
   //   ② 本文件除 removeDirInRoot 内部与**声明的豁免**（:3737 局部 removePath，其目标含仓库外
   //     夹具）外，不得再有裸的递归 rmSync；
-  //   ③ 与 test_filter.js 的同源 helper 代码块 normalize 后必须逐字符相同（防两边漂移）。
+  //   ③ 与 test_filter.js 的同源 helper 代码块必须**结构**相同（防两边漂移）：按名字取 CACHE_SHARD_ID_RE /
+  //      CACHE_SHARD_ID_MAX / sanitizeIsolationId / buildCacheShard 四处声明，比较去掉 loc/range 的 AST
+  //      ——只格式化或只改注释不算漂移，改一处不同改另一处才算。
   await test('Qodo #158: 删除入口收敛 + 与 test_filter.js 同源块未漂移', async () => {
     let threw = false
     try { removeDirInRoot(path.join(__dirname, '..'), __dirname) } catch (e) { threw = true }

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.475 — S1：把 test_app.js / test_app_unit.js 那批「读源码文本」断言换成可靠断言——run.log 摘要行改走生产的 parseRunSummaryLine 断言 counters/extras 字段，ERROR/WARN 行按 level+message 断言，fail-open 追加按逐行内容断言，test_app.js 与 test_filter.js 的同源块改按 AST 结构比对，Stryker 插桩判据改按「被调名集合」，C1-013/014/017/025/010 的「只剩一份实现」改按 AST 计数；两套件 TZ=UTC 全绿且 probe-format-coupling 双双 format-clean，白名单 2404 → 2363（test_app.js 29 → 17、test_app_unit.js 74 → 45），生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.476 — S1 文档补正：v3.475 那条「未处理」登记失真（31 条按锚点逐条重算后为已改 21 / 未改 10，未改清单列全、含 run.log 运行期输出的 [vundefined] 一条）、fail-open 与同源块 AST 两处文案改成与代码一致，并写清白名单 -41（test_app.js 29 → 17、test_app_unit.js 74 → 45）与 31 条清单的口径差异；只动 CHANGELOG 文案与 test_app.js 的一处不变式注释，断言代码、scripts/、test_support/ 与生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
