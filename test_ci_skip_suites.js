@@ -13,6 +13,9 @@ const os = require('node:os')
 const path = require('node:path')
 const { SUITES } = require('./test_suites')
 const { resolveTool } = require('./scripts/check-ci-static')
+// S2：workflow 断言改成「解析 YAML 后比字段」——不再把 `\npermissions:\n  contents: read\n` 这类
+// 排版片段当判据。loadYaml 走 js-yaml（devDeps；本套件在 quality job 的 npm ci 之后运行）。
+const { loadYaml } = require('./test_support/source_model')
 
 // 仓库根固定路径：本套件以仓库根为 cwd 运行（CI 的 npm run test:unit、copyProject 沙箱、stryker 沙箱
 // 都在仓库/沙箱根启动），故统一用字面量相对路径——不动态拼路径，静态分析也就没有误报空间。
@@ -514,7 +517,9 @@ assert.ok(!yamlOnly(policyBlock).some(line => /^[ \t]*(?:strategy|matrix):/.test
 assert.match(qualityBlock, /^\s{4}strategy:\s*$/m, 'quality 的 Node 测试矩阵必须保留')
 assert.match(qualityBlock, /^\s{6}matrix:\s*$/m, 'quality 的 matrix 配置必须保留')
 assert.ok(!/^\s{4}permissions:/m.test(qualityBlock), 'quality 测试 job 权限不得改变')
-assert.ok(testYml.includes('\npermissions:\n  contents: read\n'),
+// 工作流级 permissions 走 YAML 解析后比字段：原来的 `testYml.includes('\npermissions:\n  contents: read\n')`
+// 只认这一种排版（键序/缩进/引号一变就假红），且注释里写一遍也能满足。
+assert.deepStrictEqual(loadYaml('.github/workflows/test.yml').permissions, { contents: 'read' },
   '工作流级 permissions 必须保持 contents: read')
 assert.match(qualityGateBlock, /^\s{4}permissions:\s+\{\}$/m, 'quality-gate 必须声明 job 级 permissions: {}')
 assert.match(qualityGateBlock, /^\s{4}needs:\s+\[quality, policy\]$/m,
@@ -1847,7 +1852,10 @@ if (!zombieFixtureSupported()) {
     // 只杀 cmdline 确实是本夹具 helper 的进程，防 pid 复用误杀。
     try {
       const hp = Number(fs.readFileSync(path.join(zombieDir, 'helper.pid'), 'utf8').trim())
-      if (hp > 0 && fs.readFileSync('/proc/' + hp + '/cmdline', 'utf8').includes('zombie_helper.js')) {
+      // /proc/<pid>/cmdline 是 NUL 分隔的 argv：解析成参数数组后按 basename 精确比对脚本名，
+      // 不在整段文本里找子串——否则 `node -e "...zombie_helper.js..."` 这类别的进程也可能被误杀。
+      const argv = hp > 0 ? fs.readFileSync('/proc/' + hp + '/cmdline', 'utf8').split('\u0000').filter(Boolean) : []
+      if (argv.some(arg => path.basename(arg) === 'zombie_helper.js')) {
         try { process.kill(hp, 'SIGCONT') } catch (e) { /* 已退出 */ }
         try { process.kill(hp, 'SIGKILL') } catch (e) { /* 已退出 */ }
       }
@@ -2106,11 +2114,21 @@ for (const [signal, expectedCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
   }
 }
 
-// 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加
-const strykerIdx = mutationYml.indexOf('npx stryker run')
-assert.ok(strykerIdx > 0, 'mutation.yml 应包含 stryker 运行步骤')
-assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHILD:\s*'1'/,
-  'mutation.yml 的变异测试 step 必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）')
+// 3d CI 变异任务走 stryker（不经 run_mutation.js 的 spawn），必须由 step env 抑制 summary 追加。
+// 判据落在解析后的 YAML 字段上：找出「run 以 `npx stryker run` 开头」的每个 step，断言它的 env 里
+// XBK_MUTATION_CHILD === '1'——不再按文本 indexOf 切 1500 字符再正则匹配（排版/注释都会影响那种判据）。
+const mutationDoc = loadYaml('.github/workflows/mutation.yml')
+const isStrykerStep = (step) => !!step && typeof step.run === 'string' && step.run.trim().startsWith('npx stryker run')
+const mutationJob = Object.values(mutationDoc.jobs)
+  .find(job => job && Array.isArray(job.steps) && job.steps.some(isStrykerStep))
+assert.ok(mutationJob, 'mutation.yml 应包含 stryker 运行步骤（run: npx stryker run …）')
+const strykerSteps = mutationJob.steps.filter(isStrykerStep)
+for (const step of strykerSteps) {
+  assert.strictEqual(step.env && step.env.XBK_MUTATION_CHILD, '1',
+    `mutation.yml 的每个 stryker step 都必须设 XBK_MUTATION_CHILD=1（否则重复整表 append，几百次即撞 1MiB 上限）：${step.name}`)
+}
+// 步骤顺序（(4) 用）：同一条解析后的 step 清单里判序，不再拿文本偏移比大小。
+const mutationStepAt = (pred) => mutationJob.steps.findIndex(pred)
 
 // 3e 变异 job 的三条 CI 硬约束：① 缓存 key/restore-keys 必须是**回退后**的形态（PR #156 的「测试指纹
 //    强制全量」改动已于 2026-09-19 回退，用户拍板）；② 剥离步不得再碰 reports/inc-*.json；
@@ -2413,7 +2431,11 @@ assert.match(mutationYml.slice(strykerIdx, strykerIdx + 1500), /XBK_MUTATION_CHI
       '守卫必须经生产 CLI `node scripts/mutation-guard.js` 调用，不得内联脚本（内联逻辑会与用例/文档漂移）')
     assert.ok(/--segment\s+"?\$\{\{\s*matrix\.name\s*\}\}"?/.test(guardText),
       '守卫必须带 --segment "$' + '{' + '{ matrix.name }}"：失败输出要能直接指出是哪一段')
-    assert.ok(guardAt > strykerIdx && guardAt < uploadAt,
+    // 顺序按解析后的 step 清单判（同一条 mutationJob.steps），不再拿三处文本偏移比大小。
+    const strykerAt = mutationStepAt(isStrykerStep)
+    const guardStepAt = mutationStepAt(step => typeof step.name === 'string' && step.name.startsWith('变异报告 fail-closed 守卫'))
+    const uploadStepAt = mutationStepAt(step => typeof step.name === 'string' && step.name.startsWith('上传变异报告'))
+    assert.ok(strykerAt >= 0 && guardStepAt > strykerAt && uploadStepAt > guardStepAt,
       '守卫必须位于 stryker step 之后、上传 artifact 之前（stryker 之前无报告可判；上传之后失败已无意义）')
   }
   // (5) statusReason 在上传前被剥离 ⇒ artifact 里的机器报告再也解释不了「这个变异体为什么存活/报错」；

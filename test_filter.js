@@ -16,6 +16,8 @@ const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
 const { extractTestSummary } = require('./run_mutation.js')
 const path = require('path')
+// S2：结构断言走 S0 工具层（解析后的 AST / AST 视图），不再把「源码文本里有没有这个片段」当断言。
+const { loadModel } = require('./test_support/source_model')
 // 生产默认缓存目录名（在下方隔离覆盖**之前**从生产模块捕获）：契约用例据此断言，
 // 保证「生产把默认目录改掉」仍然会红（不是拿被覆盖后的值自证）。
 const PROD_DEFAULT_CACHE_DIR = Config.cache.dir
@@ -238,6 +240,49 @@ function assertEqual (actual, expected, msg) {
   }
 }
 
+// ── AST 结构断言的两个本地 helper（S2）────────────────────────────────────
+// 本文件原有若干用例「读生产源码文本 + 比片段」：格式化/lint 重排就假红，注释里出现同样字面量
+// 又恒真。改成问结构——有这个函数吗 / 这次调用传了哪些字段 / 这个模板以什么开头。
+// source_model 只给「有/没有」的集合（hasFunction/hasCall），要定位**具体节点**（看实参、看字段值）
+// 仍得自己遍历一次 AST；遍历与取名规则集中在这里，避免每个用例各写一份。
+function isFunctionNode (node) {
+  return !!node && (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression' ||
+    node.type === 'ArrowFunctionExpression')
+}
+
+function keyName (node) {
+  if (!node) return null
+  if (node.type === 'Identifier') return node.name
+  if (node.type === 'Literal') return String(node.value)
+  return null
+}
+
+// visit(node, ancestors)：ancestors 是由外到内的函数节点栈（找「调用发生在哪个函数里」用）。
+function walkNodes (node, visit, ancestors = []) {
+  if (!node || typeof node.type !== 'string') return
+  visit(node, ancestors)
+  const next = isFunctionNode(node) ? ancestors.concat(node) : ancestors
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === 'range') continue
+    const value = node[key]
+    if (Array.isArray(value)) value.forEach((child) => walkNodes(child, visit, next))
+    else if (value && typeof value.type === 'string') walkNodes(value, visit, next)
+  }
+}
+
+// 按名字取函数节点：函数声明 / `const f = () => {}` / 类方法与对象方法（MethodDefinition、Property）。
+function findFunctionNode (ast, name) {
+  let found = null
+  walkNodes(ast, (node) => {
+    if (found) return
+    if (node.type === 'FunctionDeclaration' && node.id && node.id.name === name) found = node
+    else if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === name &&
+      isFunctionNode(node.init)) found = node.init
+    else if (isFunctionNode(node.value) && keyName(node.key) === name) found = node.value
+  })
+  return found
+}
+
 // ── Stryker 插桩沙箱的源码形状断言闸（T1）──────────────────────────────────
 // 变异运行时 Stryker 把被变异的源文件插桩（表达式包成 stryMutAct_*/stryCov_*），并用它自己的
 // printer 重排版——实测 xbk_app.js 的 `_readSimilarWindow (filePath) {` 在沙箱里变成
@@ -245,17 +290,19 @@ function assertEqual (actual, expected, msg) {
 // `openNonBlocking: stryMutAct_… ? false : true`。故「读源文件 + 按源码文本断言」的用例在沙箱里
 // 必假红，与功能无关。命中插桩时只跳过那几条源码形状断言并单独计数（不冒充通过）；正常运行时
 // 守卫恒不命中，原断言照常执行。
+// 判据用 AST：插桩后的表达式就是 `stryMutAct_<hash>(…)` 这族**调用**，看调用名即可——比比对源码
+// 文本更准（注释/字符串里出现同样字面量不会误判成已插桩）。
 const INSTRUMENTED_SOURCES = (() => {
   const hit = new Set()
   for (const rel of ['xbk_app.js']) {
-    let text = ''
+    let calls = []
     try {
-      text = require('node:fs').readFileSync(path.join(__dirname, rel), 'utf8')
+      calls = Array.from(loadModel(rel).calls)
     } catch (e) {
-      // 读不到按「未插桩」处理：守卫不命中，原断言照常执行并响亮失败（不吞异常）
-      text = ''
+      // 读不到/解析不了按「未插桩」处理：守卫不命中，原断言照常执行并响亮失败（不吞异常）
+      calls = []
     }
-    if (text.includes('stryMutAct_')) hit.add(rel)
+    if (calls.some((name) => name.startsWith('stryMutAct_'))) hit.add(rel)
   }
   return hit
 })()
@@ -3212,14 +3259,12 @@ console.log('========================================\n');
   console.log('\n📂 39. _splitLines 解析')
 
   await test('_splitLines 有### → 返回行数组（v3.22审查12：支持单\n）', () => {
-    const lines = _splitLines('a###1\n\nb###2')
-    // 单 \n 也作为分隔符（\n\n 会拆出空行）
-    assertEqual(lines.includes('a###1'), true, 'lines.includes(\'a###1\') 应等于 true')
-    assertEqual(lines.includes('b###2'), true, 'lines.includes(\'b###2\') 应等于 true')
+    // 行为断言：直接钉住分割结果的**整个数组**（含 \n\n 拆出的空行）。旧写法只查两个元素
+    // 「出现过」，多出/重排的垃圾行照样绿。
+    assert.deepStrictEqual(_splitLines('a###1\n\nb###2'), ['a###1', '', 'b###2'],
+      '单 \\n 也作为分隔符（\\n\\n 必须拆出空行）')
     // 单 \n 分隔
-    const lines2 = _splitLines('a###1\nb###2')
-    assertEqual(lines2.includes('a###1'), true, 'lines2.includes(\'a###1\') 应等于 true')
-    assertEqual(lines2.includes('b###2'), true, 'lines2.includes(\'b###2\') 应等于 true')
+    assert.deepStrictEqual(_splitLines('a###1\nb###2'), ['a###1', 'b###2'], '单 \\n 分隔应拆成两行')
   })
 
   await test('_splitLines 无### → 返回null', () => {
@@ -3719,7 +3764,6 @@ console.log('========================================\n');
   // 合法输入照常分片（白名单不得把正常 ID 一起挡掉；worker1/纯数字是 test_app_p.js 与调度器口径）
   await test('Qodo #158: 合法 XBK_PARALLEL_ID 仍照常分片（白名单不误伤）', () => {
     const pathMod = require('path')
-    const fs = require('fs')
     for (const good of ['worker1', '12345', 'RUN_1_0', 'a-b_c-9', 'x'.repeat(CACHE_SHARD_ID_MAX)]) {
       const shard = buildCacheShard(good, __dirname, pathMod)
       assert.equal(shard.id, good, `合法 ID ${good} 不应被改写`)
@@ -3733,28 +3777,29 @@ console.log('========================================\n');
     const pidShard = buildCacheShard(undefined, __dirname, pathMod)
     assert.equal(pidShard.dirName, `xianbaoku_cache_p${process.pid}`, '未设置时取进程 pid')
     // 反向防漂移：test_app.js 里有一份**同源**的 sanitizeIsolationId/buildCacheShard 段（该文件
-    // 由 test.yml 显式步骤覆盖，不在 SUITES 里）。两边各自断言对方的同源段逐字符一致——只在一侧
-    // 加检查的话，改动 test_filter.js 而不同改 test_app.js 就没人拦。口径：先剥注释，从**行首**锚点
-    // 切到 buildCacheShard 之后的第一个顶层声明，再去空行/行首尾空白后比对。
-    const stripComments = (src) => src
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .split('\n').filter(line => !/^\s*\//.test(line)).join('\n')
-    const extractBlock = (src) => {
-      const clean = stripComments(src)
-      const a = clean.indexOf('const CACHE_SHARD_ID_RE =')
-      const b = clean.indexOf('function buildCacheShard (rawId, root, pathMod) {')
-      if (a < 0 || b < 0) return ''
-      const m = /\n(function |const |\(async )/.exec(clean.slice(b))
-      if (!m) return clean.slice(a)
-      return clean.slice(a, b + m.index + 1)
+    // 由 test.yml 显式步骤覆盖，不在 SUITES 里）。两边各自断言对方的同源段**结构**一致——只在一侧
+    // 加检查的话，改动 test_filter.js 而不同改 test_app.js 就没人拦。口径：按名字取
+    // CACHE_SHARD_ID_RE / CACHE_SHARD_ID_MAX / sanitizeIsolationId / buildCacheShard 四处声明，
+    // 比较去掉 loc/range 的 AST——只格式化或只改注释不算漂移，改一处不同改另一处才算（test_app.js
+    // 侧有同一份判据，两边互为对方的锚）。
+    const structuralBlock = (file) => {
+      const ast = loadModel(file).ast
+      const wanted = ['CACHE_SHARD_ID_RE', 'CACHE_SHARD_ID_MAX', 'sanitizeIsolationId', 'buildCacheShard']
+      const found = new Map()
+      for (const node of ast.body) {
+        if (node.type === 'FunctionDeclaration' && node.id) found.set(node.id.name, node)
+        else if (node.type === 'VariableDeclaration') {
+          for (const decl of node.declarations) if (decl.id.type === 'Identifier') found.set(decl.id.name, decl)
+        }
+      }
+      const missing = wanted.filter(name => !found.has(name))
+      assert.deepStrictEqual(missing, [],
+        `${file} 缺少同源块的声明（锚点失效，需同步本断言）：${missing.join(', ')}`)
+      return JSON.stringify(wanted.map(name => found.get(name)), (key, value) =>
+        (key === 'loc' || key === 'start' || key === 'end' || key === 'range' ? undefined : value))
     }
-    const normalize = (text) => text.split('\n').map(line => line.trim()).filter(Boolean).join('\n')
-    const mine = normalize(extractBlock(fs.readFileSync(__filename, 'utf8')))
-    const other = normalize(extractBlock(fs.readFileSync(pathMod.join(__dirname, 'test_app.js'), 'utf8')))
-    assert.ok(mine.length > 200 && other.length > 200,
-      `同源块提取失败（自身 ${mine.length} / test_app ${other.length} 字符）——锚点注释失效`)
-    assert.strictEqual(mine, other,
-      'test_filter.js 与 test_app.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
+    assert.strictEqual(structuralBlock(__filename), structuralBlock(pathMod.join(__dirname, 'test_app.js')),
+      'test_filter.js 与 test_app.js 的 sanitizeIsolationId/buildCacheShard 块必须结构相同（改一处必须同改另一处）')
   })
 
   // 收敛点自证：任何整体递归删除都必须经过 removeDirInRoot，且它拒绝仓库根之外的路径
@@ -5682,9 +5727,7 @@ console.log('========================================\n');
   })
 
   await test('_splitLines 单\r 分隔（#84）', () => {
-    const lines = _splitLines('a###1\rb###2')
-    assertEqual(lines.includes('a###1'), true, 'lines.includes(\'a###1\') 应等于 true')
-    assertEqual(lines.includes('b###2'), true, 'lines.includes(\'b###2\') 应等于 true')
+    assert.deepStrictEqual(_splitLines('a###1\rb###2'), ['a###1', 'b###2'], '单 \\r 也必须作为分隔符（#84）')
   })
 
   await test('pingbitime 小数 → 警告（#95）', () => {
@@ -6778,29 +6821,46 @@ console.log('========================================\n');
   console.log('\n📂 95. 断言鉴别力')
 
   // C5-019：字面恒真断言（assertEqual(true,true) / assert.ok(true) / assert(true)）永远不会失败——
-  // 把「不会红」当断言，只给报告凑断言数。这里做源码级零容忍：新增一处即红。
-  // needle 一律由常量拼接：字面量直接写进门禁源码会自己命中自己（同 C4-004 的 seed 门禁手法）。
+  // 把「不会红」当断言，只给报告凑断言数。这里做**结构**级零容忍：解析成 AST 后认「实参就是字面
+  // true 的调用」，新增一处即红。
+  // 为什么不再按行扫文本：`code.startsWith('//')` 那套「注释行跳过」本身就是读源码文本（还会把
+  // `/* … */ assert.ok(true)` 这种同行块注释后的代码误跳过）；AST 里注释根本不在树上，判定不需要它。
   await test('C5-019: 恒真断言零容忍（字面 true 断言一律不许）', () => {
-    const fsx = require('fs')
+    const acorn = require('acorn')
     const TRUE_LIT = 'true'
-    const patterns = [
-      new RegExp(`assertEqual\\(\\s*${TRUE_LIT}\\s*,\\s*${TRUE_LIT}\\s*[,)]`),
-      new RegExp(`assert\\.(?:ok|strictEqual)\\(\\s*${TRUE_LIT}\\s*[,)]`),
-      new RegExp(`assert\\(\\s*${TRUE_LIT}\\s*\\)`)
-    ]
+    // 只看调用形态：assertEqual 要求第一、第二实参都是字面 true（`assertEqual(true, x)` 是正常的
+    // 真值断言，不在禁令内）；assert.ok / assert.strictEqual / assert(...) 只看第一实参。
+    const callName = (callee) => {
+      if (!callee) return null
+      if (callee.type === 'Identifier') return callee.name
+      if (callee.type === 'MemberExpression' && !callee.computed && callee.property.type === 'Identifier' &&
+        callee.object.type === 'Identifier') return `${callee.object.name}.${callee.property.name}`
+      return null
+    }
+    const isTrueLiteral = (node) => !!node && node.type === 'Literal' && node.value === true
+    const literalTrueCalls = (ast) => {
+      const found = []
+      walkNodes(ast, (node) => {
+        if (node.type !== 'CallExpression') return
+        const name = callName(node.callee)
+        const args = node.arguments
+        const bothTrue = name === 'assertEqual' && isTrueLiteral(args[0]) && isTrueLiteral(args[1])
+        const firstTrue = (name === 'assert.ok' || name === 'assert.strictEqual' || name === 'assert') &&
+          isTrueLiteral(args[0])
+        if (bothTrue || firstTrue) found.push(node)
+      })
+      return found
+    }
     // 判据自检：三种形态都必须被认出，否则门禁本身退化成「恒绿」
     for (const sample of [`assertEqual(${TRUE_LIT}, ${TRUE_LIT})`, `assert.ok(${TRUE_LIT})`, `assert(${TRUE_LIT})`]) {
-      assertEqual(patterns.some(re => re.test(sample)), true, `判据必须认出恒真断言形态：${sample}`)
+      assertEqual(literalTrueCalls(acorn.parse(sample, { ecmaVersion: 'latest' })).length, 1,
+        `判据必须认出恒真断言形态：${sample}`)
     }
     const hits = []
     for (const f of ['test_filter.js', 'test_doc_line_gates.js']) {
-      const lines = fsx.readFileSync(path.join(__dirname, f), 'utf8').split('\n')
-      lines.forEach((line, i) => {
-        const code = line.trim()
-        // 注释里提到该形态不算（说明文字要能解释为什么禁止它）
-        if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return
-        for (const re of patterns) if (re.test(line)) hits.push(`${f}:${i + 1}`)
-      })
+      for (const call of literalTrueCalls(loadModel(path.join(__dirname, f)).ast)) {
+        hits.push(`${f}:${call.loc.start.line}`)
+      }
     }
     assert.deepStrictEqual(hits, [],
       '字面恒真断言零鉴别力（永远不会红），改成 assert.doesNotThrow / 真值断言：' + hits.join(', '))
@@ -11129,22 +11189,52 @@ process.stdout.write(JSON.stringify({ statuses, ms: Date.now() - t0 }))
   })
 
   // similar-<cache>.json 的读取经 App._readSimilarWindow（F3-1 从 run() 内联搬出：run() 里还有网络抓取，
-  // 无法在不跑整轮的前提下做行为级 FIFO 探针）；这里按源码锁住「该读取点必须带 openNonBlocking」——
-  // 回退这一行（或把读取挪去别处绕过本函数）即变红。
-  await test('F4-2 similar-<cache>.json 读取必须 openNonBlocking（_readSimilarWindow 读取点按源码锁定）', () => {
-    if (skipIfInstrumented('F4-2 _readSimilarWindow 读取点（源码形状断言）')) return
-    const src = require('node:fs').readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-    const start = src.indexOf('_readSimilarWindow (filePath)')
-    assertEqual(start >= 0, true, 'xbk_app.js 里必须仍有 _readSimilarWindow(filePath) 这处读取入口（找不到说明改动把入口改名了，需同步本断言）')
-    const end = src.indexOf('\n    },', start)
-    assertEqual(end > start, true, '必须能定位 _readSimilarWindow 的方法体边界（找不到说明方法结构已变，需同步本断言）')
-    const body = src.slice(start, end)
-    const line = body.split('\n').find(l => l.includes('readSafeTextResult('))
-    assertEqual(Boolean(line), true, '_readSimilarWindow 方法体内必须仍用 readSafeTextResult(…) 读取窗口（找不到说明读取被换成别的入口，需同步本断言）')
-    assertEqual(line.includes('openNonBlocking: true'), true, `similar-<cache>.json 读取必须传 openNonBlocking:true（FIFO 会挂死整轮）：${line.trim()}`)
-    // 接线也不许断：窗口路径必须按推送源命名，run() 必须经 _readSimilarWindow 读取（防止读取点被搬走/复制后本断言锁错对象）
-    assertEqual(/similar-\$\{cacheName\}/.test(src), true, '窗口路径必须仍是 similar-<cacheName>（按推送源隔离）')
-    assertEqual(src.includes('this._readSimilarWindow(similarPath)'), true, 'run() 必须经 this._readSimilarWindow(similarPath) 读取窗口')
+  // 无法在不跑整轮的前提下做行为级 FIFO 探针）；这里按**结构**锁住「该读取点必须带 openNonBlocking」——
+  // 回退这一行（或把读取挪去别处绕过本函数）即变红：AST 上定位 _readSimilarWindow 的方法体、其中对
+  // readSafeTextResult 的调用、该调用第三实参里 openNonBlocking 的取值，以及读取点的接线（唯一调用点
+  // + 实参就是 run 里那个 `similar-${cacheName}` 路径）。
+  await test('F4-2 similar-<cache>.json 读取必须 openNonBlocking（_readSimilarWindow 读取点按结构锁定）', () => {
+    if (skipIfInstrumented('F4-2 _readSimilarWindow 读取点（源码结构断言）')) return
+    const app = loadModel(path.join(__dirname, 'xbk_app.js'))
+    const readerFn = findFunctionNode(app.ast, '_readSimilarWindow')
+    assert.ok(readerFn, 'xbk_app.js 里必须仍有 _readSimilarWindow 方法（找不到说明入口改名了，需同步本断言）')
+    let readCall = null
+    walkNodes(readerFn, (node) => {
+      if (readCall || node.type !== 'CallExpression') return
+      if (node.callee.type === 'Identifier' && node.callee.name === 'readSafeTextResult') readCall = node
+    })
+    assert.ok(readCall,
+      '_readSimilarWindow 方法体内必须仍用 readSafeTextResult(…) 读取窗口（找不到说明读取被换成别的入口，需同步本断言）')
+    const options = readCall.arguments[2]
+    const flag = options && options.type === 'ObjectExpression'
+      ? options.properties.find((prop) => prop.type === 'Property' && keyName(prop.key) === 'openNonBlocking')
+      : null
+    assert.equal(!!flag && flag.value.type === 'Literal' && flag.value.value === true, true,
+      `similar-<cache>.json 读取必须传 openNonBlocking:true（FIFO 会挂死整轮）：第 3 实参=${options ? JSON.stringify(options.type) : '缺失'}`)
+    // 接线也不许断：窗口路径必须按推送源命名，且读取点必须经 this._readSimilarWindow(<该路径>)——
+    // 全模块只允许一处调用点，防止读取点被搬走/复制后本断言锁错对象。
+    const sites = []
+    walkNodes(app.ast, (node, ancestors) => {
+      if (node.type !== 'CallExpression') return
+      const callee = node.callee
+      if (callee.type === 'MemberExpression' && !callee.computed && callee.object.type === 'ThisExpression' &&
+        callee.property.name === '_readSimilarWindow') sites.push({ node, ancestors })
+    })
+    assert.equal(sites.length, 1, `xbk_app.js 里 this._readSimilarWindow(...) 必须恰好一处调用点（实得 ${sites.length} 处）`)
+    const site = sites[0].node
+    const arg = site.arguments.length === 1 ? site.arguments[0] : null
+    assert.equal(!!arg && arg.type === 'Identifier', true, '读取点必须把「窗口路径变量」传进去（实参不是单个标识符）')
+    const owner = sites[0].ancestors.slice().reverse().find(isFunctionNode)
+    let init = null
+    walkNodes(owner, (node) => {
+      if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === arg.name) init = node.init
+    })
+    const templates = []
+    walkNodes(init, (node) => { if (node.type === 'TemplateLiteral') templates.push(node) })
+    const windowPath = templates.find((tpl) => tpl.quasis[0].value.cooked === 'similar-' &&
+      tpl.expressions.length === 1 && tpl.expressions[0].type === 'Identifier' &&
+      tpl.expressions[0].name === 'cacheName')
+    assert.ok(windowPath, `窗口路径必须仍是 \`similar-\${cacheName}\`（按推送源隔离；实得 ${init ? init.type : '未找到声明'}）`)
   })
 
   await test('P4 _warnLowDisk 限流内与未配置阈值均静默', () => {
