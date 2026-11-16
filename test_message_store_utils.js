@@ -7,6 +7,8 @@ const assert = require('node:assert')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { createMessageStore, IDENTITY_INDEX_REF_PROBE_WINDOW, IDENTITY_INDEX_IDENTITY_PROBE_WINDOW, fileNameForUrl } = require('./xbk_message_store')
+const { loadModel } = require('./test_support/source_model')
+const { findAll, memberPath, requireEdge } = require('./test_support/ast_query')
 
 // C3-002（backlog）：夹具加载期先清掉外部部署开关 XBK_CACHE_DIR。
 // 生产 cacheDir getter 让它无条件压过 Config.cache.dir（SYSTEM_CONTRACT 三方同源契约，语义正确），
@@ -3028,14 +3030,30 @@ check('C3-002: stripCacheDirEnv 必须剥离 XBK_CACHE_DIR 且不改动入参（
 check('C3-002: 两个测试入口都必须把剥离后的 env 传给子进程（接线内容断言）', () => {
   // v3.435：剥离实现只在公共层一处（scripts/test-harness.js 的 prepareSuiteEnv），入口不得再各自
   // require 一次隔离模块——两份实现会静默漂移。公共层内的相对路径是 './test-env-isolation'。
-  const harnessSrc = REAL_FS.readFileSync(path.join(__dirname, 'scripts', 'test-harness.js'), 'utf8')
-  assert.ok(harnessSrc.includes("require('./test-env-isolation')"),
+  // S3：模块依赖关系走 AST 的 require 边（注释里写一句 require('./test-env-isolation') 不再算数，
+  // 把 require 改成别的路径或删掉则必红）。
+  const harnessModel = loadModel('scripts/test-harness.js')
+  assert.ok(requireEdge(harnessModel, './test-env-isolation'),
     `公共层必须复用 ${ENV_ISOLATION}（唯一实现；内联回退只覆盖最小工作树）`)
   for (const entry of ['run_tests.js', 'run_unit_tests.js']) {
-    const src = REAL_FS.readFileSync(path.join(__dirname, entry), 'utf8')
-    assert.ok(/const SUITE_ENV = prepareSuiteEnv\(process\.env\)\.env/.test(src),
-      `${entry} 必须经公共层 prepareSuiteEnv 准备套件 env（不得各自复制一份剥离逻辑）`)
-    assert.ok(/env:\s*SUITE_ENV/.test(src),
+    // S3：两条接线判据都改成 AST——
+    //   ① `const SUITE_ENV = prepareSuiteEnv(process.env).env` 必须是**这一条声明**（公共层唯一实现），
+    //   ② 该 SUITE_ENV 必须作为选项对象的 `env` 属性传给子进程。
+    // 旧写法用正则读源码文本：格式化（`prepareSuiteEnv (process.env).env`）就假红，注释里写一遍就假绿。
+    const entryModel = loadModel(entry)
+    const suiteEnvDecl = findAll(entryModel, (node) =>
+      node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'SUITE_ENV' &&
+      node.init && node.init.type === 'MemberExpression' && !node.init.computed &&
+      node.init.property.type === 'Identifier' && node.init.property.name === 'env' &&
+      node.init.object.type === 'CallExpression' && memberPath(node.init.object.callee) === 'prepareSuiteEnv' &&
+      node.init.object.arguments.length === 1 && memberPath(node.init.object.arguments[0]) === 'process.env')
+    assert.strictEqual(suiteEnvDecl.length, 1,
+      `${entry} 必须经公共层 prepareSuiteEnv(process.env).env 准备套件 env（不得各自复制一份剥离逻辑）`)
+    const envForwarded = findAll(entryModel, (node) =>
+      node.type === 'Property' && !node.computed &&
+      ((node.key.type === 'Identifier' && node.key.name === 'env') || (node.key.type === 'Literal' && node.key.value === 'env')) &&
+      node.value.type === 'Identifier' && node.value.name === 'SUITE_ENV')
+    assert.ok(envForwarded.length >= 1,
       `${entry} 必须把 SUITE_ENV 传给子进程（否则 shell 里的 XBK_CACHE_DIR 照旧泄漏进每个套件）`)
   }
 })

@@ -344,10 +344,12 @@ const { runTests, evaluate, main, DEFAULT_FILES, mutantFingerprint, collectMutan
       assert.strictEqual(result.status, 'timeout', '挂住的直接子进程应按超时结算')
       // 首心跳由直接子进程同步写：这一步是确定性的（不依赖孙进程启动速度）
       assert.ok(fs.existsSync(marker), '直接子进程必须留下首心跳（同步写入，不依赖孙进程启动速度）')
-      const content = fs.readFileSync(marker, 'utf8')
-      assert.ok(content.includes('g'),
-        `孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代），实际内容=${JSON.stringify(content)}`)
+      // S3（原 348 行 `content.includes('g')`）：孙进程心跳只写 'g' 一个字符，首心跳 'P' 固定占 1 字节
+      // ⇒ 文件大小 > 1 就是「孙进程至少写了一次心跳」的等价判据。判据走**副作用（文件长度）**而不是
+      // 读回文本比字符：字符内容不是被测契约，夹具真的派生出后代才是。
       const size1 = fs.statSync(marker).size
+      assert.ok(size1 > 1,
+        `孙进程应至少写入一次心跳（否则本回归没有判据：夹具未真正派生后代），实际 ${size1} 字节`)
       await new Promise(resolve => setTimeout(resolve, 600))
       const size2 = fs.statSync(marker).size
       assert.strictEqual(size2, size1,

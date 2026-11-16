@@ -114,7 +114,11 @@ function startRawWorker (cacheDir, extraEnv = {}) {
 function runLogSummaries (dir) {
   const file = path.join(dir, 'run.log')
   if (!fs.existsSync(file)) return []
-  return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.includes('total='))
+  // S3：判据从 `.includes('total=')`（在日志文本里找子串）改成「解析成字段后看有没有 total 键」——
+  // 解析器就是下面 parseSummaryLine（run.log 的 key=value 口径），与读侧 scripts/status.js 同一套语义；
+  // 值里带 'total=' 的诊断行、或空格写法差异都不会再误判。
+  return fs.readFileSync(file, 'utf8').split('\n')
+    .filter((line) => Object.prototype.hasOwnProperty.call(parseSummaryLine(line), 'total'))
 }
 
 function parseSummaryLine (line) {

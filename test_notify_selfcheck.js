@@ -9,91 +9,112 @@
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
+const { loadModel } = require('./test_support/source_model')
+const {
+  findAll, findFirst, ifChain, memberPath, callSites, hasCallWithLiteral, hasCallWithIdentifier, parseText
+} = require('./test_support/ast_query')
 
-// ── S1 前置：源码序断言（结构铁律唯一防线，先于任何行为用例）──
-// 手法仿 test_qinglong_utils.js 接线断言：indexOf 定位 + 顺序比较。
-// 插桩安全注意（Stryker 沙箱实测教训）：
-//   ① if (require.main === module) 的 if( 前缀会被改写成 stryMutAct 三元（字面串消失），
-//      但 require.main === module 表达式文本始终保留 ⇒ 定位用表达式本身；
-//   ② 插桩使代码膨胀 ~2x 且产生大量 '} else {' ⇒ 禁用窗口切片和花括号锚点；
-//   ③ 锚点必须全文唯一：'--notify-test' 旗标（1 处）、runNotifyTest(cliArgs)（1 处）、
-//      runSingleEntry().catch（完整入口唯一调用，1 处）。
-// 铁律语义 = runNotifyTest 分发在 runSingleEntry 完整入口之前（早退分支不被吞掉）。
-const entrySrc = fs.readFileSync(path.join(__dirname, 'xbk_function_v3.js'), 'utf8')
+// ── S1 前置：入口分发结构断言（AST 结构，S3 替换源码文本序断言）──
+// 旧写法在 xbk_function_v3.js 的源码文本里 indexOf('require.main === module') /
+// "'--notify-test'" / 'runNotifyTest(cliArgs)' / 'runSingleEntry().catch'，再比这些下标的相对大小。
+// 两个问题：① 结论取决于文本顺序，与「早退分支不被吞掉」只是碰巧同构——注释里抄一遍这些片段，
+// 或把分发提成函数换个写法，断言给的答案就和真实结构无关；② 格式化/插桩改变下标，假红。
+// 现在直接读 if (require.main === module) 的 AST，分发链必须依次是
+//   ① if (notifyArg) { runNotifyTest(cliArgs).catch(…) }                       ← 自检最先分发
+//   ② else if (cliArgs.some(a => …)) { console.error(未识别参数…); exitCode = 1 } ← fail-closed
+//   ③ else { runSingleEntry().catch(…) }                                        ← 完整入口只在最后一支
+// 「runSingleEntry 只在最后一支」就是旧的早退语义，但由分支结构而不是下标表达。
+const entryModel = loadModel('xbk_function_v3.js')
+const mainGuard = findFirst(entryModel, (node) =>
+  node.type === 'IfStatement' && node.test.type === 'BinaryExpression' && node.test.operator === '===' &&
+  memberPath(node.test.left) === 'require.main' && node.test.right.type === 'Identifier' && node.test.right.name === 'module')
+assert.ok(mainGuard, 'xbk_function_v3.js 必须有 if (require.main === module) 直跑入口')
 {
-  const guardIdx = entrySrc.indexOf('require.main === module')
-  assert.ok(guardIdx > 0, 'main guard 必须存在')
-  const iFlag = entrySrc.indexOf("'--notify-test'", guardIdx)
-  const iCall = entrySrc.indexOf('runNotifyTest(cliArgs)', guardIdx)
-  const iRun = entrySrc.indexOf('runSingleEntry().catch', guardIdx)
-  assert.ok(iFlag > guardIdx, 'guard 内必须有 --notify-test 分发')
-  assert.ok(iCall > iFlag, 'guard 内必须调用 runNotifyTest')
-  assert.ok(iRun > iCall, 'runSingleEntry 完整入口必须在 notify-test 分支之后（早退语义）')
-  // 审查 D2-M2（#232）：近似写法必须走自检，未知 -- 参数必须 fail-closed（不得静默跑一轮）。
-  assert.ok(entrySrc.includes("a.startsWith('--notify-test=')"), '--notify-test=1 必须前缀分发到自检')
-  assert.ok(entrySrc.includes('未识别参数'), '未知 -- 参数必须显式报错而不是进入 runSingleEntry')
+  // 分发链 = guard 块的最后一条语句（前面是 cliArgs / notifyArg 的准备语句）。
+  const guardedBlock = mainGuard.consequent
+  const dispatch = guardedBlock.body[guardedBlock.body.length - 1]
+  assert.strictEqual(dispatch.type, 'IfStatement', 'guard 内必须有 if/else 分发链（否则直跑入口没有分流）')
+  const arms = ifChain(dispatch)
+  assert.ok(arms.length >= 3, `分发链至少三支（notify-test / 未识别参数 / 完整入口），实际 ${arms.length}`)
+
+  // ① 自检分支：第一支、条件读 notifyArg、体内 runNotifyTest(cliArgs) 的返回必须挂 .catch
+  assert.strictEqual(arms[0].test.type, 'Identifier', '第一支必须以 notifyArg 为条件（notify-test 必须最先分发）')
+  assert.strictEqual(arms[0].test.name, 'notifyArg')
+  const notifyCall = callSites(arms[0].consequent, 'runNotifyTest')[0]
+  assert.ok(notifyCall, 'notify-test 分支必须调用 runNotifyTest（不得静默进完整入口）')
+  assert.ok(notifyCall.arguments.length === 1 && notifyCall.arguments[0].type === 'Identifier' && notifyCall.arguments[0].name === 'cliArgs',
+    'runNotifyTest 必须收到 cliArgs（原样转发未消费的参数）')
+  const chainedNotify = findAll(arms[0].consequent, (node) =>
+    node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+    node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
+    node.callee.object.type === 'CallExpression' && memberPath(node.callee.object.callee) === 'runNotifyTest')
+  assert.strictEqual(chainedNotify.length, 1, 'runNotifyTest 的返回必须挂 .catch（否则自检失败会变成 unhandled rejection）')
+
+  // ② 未知 -- 参数：fail-closed（报错 + exitCode=1），且绝不得踏进任何入口
+  const unknownArm = arms.find((arm) => arm.test && callSites(arm.test, 'cliArgs.some').length > 0)
+  assert.ok(unknownArm, '分发链必须有「未知 -- 参数」分支（否则拼错的参数会静默跑一轮）')
+  const setsFailure = unknownArm.consequent.body.some((stmt) =>
+    stmt.type === 'ExpressionStatement' && stmt.expression.type === 'AssignmentExpression' &&
+    memberPath(stmt.expression.left) === 'process.exitCode' && stmt.expression.right.type === 'Literal' && stmt.expression.right.value === 1)
+  assert.ok(setsFailure, '未识别参数分支必须把 process.exitCode 设为 1（fail-closed）')
+  assert.strictEqual(callSites(unknownArm.consequent, 'runSingleEntry').length, 0, '未识别参数分支绝不得进完整入口')
+  assert.strictEqual(callSites(unknownArm.consequent, 'runNotifyTest').length, 0, '未识别参数分支不得被当成自检')
+  // 用户可见文案：从该分支的 console.error 取模板串（不是全文件文本匹配——注释里的同名字样不算证据）
+  const errCall = callSites(unknownArm.consequent, 'console.error')[0]
+  assert.ok(errCall, '未识别参数分支必须经 console.error 报错（不得静默退 1）')
+  const errText = errCall.arguments[0] && errCall.arguments[0].type === 'TemplateLiteral'
+    ? errCall.arguments[0].quasis.map((q) => q.value.cooked).join('…')
+    : ''
+  assert.match(errText, /未识别参数/, `错误文案必须点名「未识别参数」（实际：${errText}）`)
+
+  // ③ 完整入口只在 else 分支，且整条 guard 里只出现一次
+  assert.strictEqual(arms[arms.length - 1].test, null, '分发链最后必须是 else（完整入口）')
+  assert.strictEqual(callSites(guardedBlock, 'runSingleEntry').length, 1,
+    'runSingleEntry 完整入口必须且只能在 else 分支调用一次（早退语义）')
+
+  // --notify-test=1 这类近似写法必须前缀分发到自检（审查 D2-M2 / #232）
+  const notifyArgDecl = findAll(guardedBlock, (node) => node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'notifyArg')
+  assert.strictEqual(notifyArgDecl.length, 1, '分发链必须先把 notify-test 参数挑出来（notifyArg）')
+  const picker = notifyArgDecl[0].init
+  assert.strictEqual(picker.type, 'CallExpression', 'notifyArg 必须由一次查找得到')
+  assert.strictEqual(memberPath(picker.callee), 'cliArgs.find', 'notifyArg 必须从 cliArgs 里挑（find）')
+  assert.ok(hasCallWithLiteral(picker, 'a.startsWith', 0, '--notify-test='),
+    '--notify-test=1 必须前缀分发到自检（否则近似写法会静默落进完整入口）')
+  assert.ok(findAll(picker, (node) => node.type === 'Literal' && node.value === '--notify-test').length >= 1,
+    '精确写法 --notify-test 也必须由同一处挑出来')
 }
 
-// ── C5-038：源码结构断言的取段与负断言工具 ─────────────────────────────────
-// 旧实现用 `slice(guardIdx, guardIdx + 4000)`：4000 是试出来的魔数，处理器再加长 200 字符
-// summarizeError 就滑出窗口（假红），而窗口外新增的 `console.log(e)` 又完全不被检查（假绿）。
-// 这里按花括号配对取 .catch 处理器体，并在同一趟扫描里剥掉注释（守则注释里本来就写着
-// 「禁止 console.log(e)」，不剥会让负断言被注释满足）。
-function guardHandlerBodyOf (source, anchor) {
-  const at = source.indexOf(anchor)
-  assert.ok(at > -1, `锚点缺失：${anchor}`)
-  const open = source.indexOf('{', at)
-  assert.ok(open > at, `锚点后必须有块起始：${anchor}`)
-  let depth = 0
-  let out = ''
-  let i = open
-  while (i < source.length) {
-    const ch = source[i]
-    if (ch === '/' && source[i + 1] === '/') {
-      const nl = source.indexOf('\n', i)
-      if (nl < 0) break
-      out += '\n'
-      i = nl + 1
-      continue
-    }
-    if (ch === '/' && source[i + 1] === '*') {
-      const end = source.indexOf('*/', i + 2)
-      assert.ok(end > 0, `块注释未闭合：${anchor}`)
-      out += ' '
-      i = end + 2
-      continue
-    }
-    // 字符串/模板串整体跳过：里面的花括号与 // 不参与配对（模板里的 ${} 自成平衡）
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const start = i
-      i++
-      while (i < source.length) {
-        if (source[i] === '\\') { i += 2; continue }
-        if (source[i] === ch) { i++; break }
-        i++
-      }
-      out += source.slice(start, i)
-      continue
-    }
-    if (ch === '{') {
-      depth++
-      if (depth === 1) { i++; continue } // 外层花括号不进返回值
-    } else if (ch === '}') {
-      depth--
-      if (depth === 0) return out
-    }
-    out += ch
-    i++
-  }
-  assert.fail(`块未闭合：${anchor}`)
+// ── S8：guard catch 处理器的结构视图（S3 替换源码文本取段）──────────────────
+// 旧实现从源码文本里按锚点 + 花括号配对切一段字符串，再用正则判「有没有 summarizeError(e) /
+// 有没有 console.log(e)」：锚点 `runNotifyTest(cliArgs).catch(` 在纯格式重排后变成
+// `runNotifyTest (cliArgs).catch (` ⇒ 整条用例假红（probe-format-coupling 实测），而往注释里抄一遍
+// 锚点与禁用样例又能让它假绿（剥注释那套逻辑只对切出来的段生效，锚点本身仍可被注释命中）。
+// 现在整段改成 AST：定位 `.catch(...)` 调用点、取处理器节点、在**处理器子树**里查调用与实参，
+// 注释与排版一律不参与判定；判据仍然按形参名字走（与形参叫 e 还是 err 无关）。
+const RAW_ERROR_SINKS = /^(?:console\.\w+|JSON\.stringify|String|util\.inspect|inspect)$/
+
+// 取 `runNotifyTest(…).catch(<handler>)` 的处理器节点（全文件必须恰一处）。
+function notifyCatchHandlerOf (source) {
+  const chained = findAll(source, (node) =>
+    node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+    node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
+    node.callee.object.type === 'CallExpression' && memberPath(node.callee.object.callee) === 'runNotifyTest')
+  assert.strictEqual(chained.length, 1, `guard 必须恰有一处 runNotifyTest(…).catch(…)（实际 ${chained.length} 处）`)
+  const handler = chained[0].arguments[0]
+  assert.ok(handler && (handler.type === 'ArrowFunctionExpression' || handler.type === 'FunctionExpression'),
+    'catch 的实参必须是函数（失败处理逻辑不得被内联丢弃）')
+  assert.strictEqual(handler.params.length, 1, 'catch 处理器必须带一个具名实参（下面的判据按它的名字走）')
+  assert.strictEqual(handler.params[0].type, 'Identifier', 'catch 处理器的实参必须是裸标识符')
+  return { handler, param: handler.params[0].name }
 }
-// 「把原始 error 直接交给打印/序列化」的参数名无关判据：console.error(e) / console.warn(e) /
-// JSON.stringify(e) / String(e) / util.inspect(e) 全部命中——旧断言只认字面量 `e` 与
-// `console.log(e)`，改成 `err` + `console.warn` 就绕过去了。
-function rawErrorUsePattern (name) {
-  return new RegExp(`(?:console\\.\\w+|JSON\\.stringify|String|util\\.inspect|inspect)\\s*\\(\\s*${name}\\s*[,)]`)
+
+// 「把原始 error 直接交给打印/序列化」：console.X(e) / JSON.stringify(e) / String(e) /
+// util.inspect(e) / inspect(e)。判据看**调用实参是不是处理器形参**，与形参叫什么无关。
+function rawErrorUsesIn (handler, param) {
+  return findAll(handler, (node) =>
+    node.type === 'CallExpression' && RAW_ERROR_SINKS.test(String(memberPath(node.callee))) &&
+    node.arguments.some((arg) => arg.type === 'Identifier' && arg.name === param))
 }
-const GUARD_CATCH_ANCHOR = 'runNotifyTest(cliArgs).catch('
 
 // ── 进程内装配：got mock → 真 slim（带 mock）→ 主模块（getNotify 命中缓存）──
 const gotPath = require.resolve('got')
@@ -387,31 +408,35 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
     }
   })
 
-  // S8 脱敏红线：guard catch 块结构断言（summarizeError 在、原始 error 不得进打印/序列化）。
-  // C5-038：取段改花括号配对（不再用试出来的 4000 字符窗口），负断言按处理器实参名判定，
-  // 不再只认字面量 `e` / `console.log(e)`。行为侧的脱敏红线由 S6 的真 guard spawn 兜底
-  // （凭证/ANSI/OSC 零出现）——两条一起才能同时挡住「改文案」与「换个函数名打印」。
+  // S8 脱敏红线：guard catch 的**结构断言**（summarizeError 在、原始 error 不得进打印/序列化）。
+  // 行为侧的脱敏红线由 S6 的真 guard spawn 兜底（凭证/ANSI/OSC 零出现）——
+  // 两条一起才能同时挡住「改文案」与「换个函数名打印」。
   await test('脱敏红线: guard catch 走 summarizeError、原始 error 不得进打印/序列化', () => {
-    const body = guardHandlerBodyOf(entrySrc, GUARD_CATCH_ANCHOR)
-    assert.ok(body.length > 200, `必须真的取到 guard catch 处理器体（实际 ${body.length} 字节）`)
-    // 实参名从锚点之后取：文件更早的地方还有别的 .catch(...)，不能全文件找第一个。
-    // 形态：`.catch(e =>` / `.catch( (err =>`（多余空白可省）。旧写法 `\s*\(?\s*` 中间夹一个可省的 `(`，
-    // 两侧量词在纯空白串上可以任意切分 ⇒ 超线性回切（S5852）。把 `(` 与它后面的空白捆成一组的可选前缀
-    // 后，每个空白的归属唯一（`(` 不可能是空白），匹配语言与旧写法完全相同（探针里穷举短串比对过）。
-    const caught = /\.catch\(\s*(?:\(\s*)?([A-Za-z_$][\w$]*)\s*=>/.exec(entrySrc.slice(entrySrc.indexOf(GUARD_CATCH_ANCHOR)))
-    assert.ok(caught, 'guard catch 必须带具名实参（取段与负断言都依赖它）')
-    assert.ok(body.includes(`summarizeError(${caught[1]})`),
-      `guard catch 必须过 summarizeError(${caught[1]})`)
-    assert.ok(!/JSON\.stringify\s*\(/.test(body), 'guard catch 禁止任何 JSON.stringify（error.options/response 带凭证）')
-    assert.ok(!/console\.(log|warn|info|debug)\s*\(/.test(body),
-      'guard catch 只能走 console.error（错误流）——console.log 会把 stdout 当成正常输出，且没有对象打印的正当理由')
-    const raw = rawErrorUsePattern(caught[1])
-    assert.ok(!raw.test(body), `guard catch 不得把原始 error 直接交给打印/序列化（命中 ${raw}）`)
+    const { handler, param } = notifyCatchHandlerOf(entryModel)
+    const body = handler.body
+    const statements = body.type === 'BlockStatement' ? body.body : [body]
+    assert.ok(statements.length > 1, `必须真的取到 guard catch 处理器体（实际 ${statements.length} 条语句）`)
+    assert.ok(hasCallWithIdentifier(body, 'summarizeError', 0, param),
+      `guard catch 必须过 summarizeError(${param})`)
+    // 负断言一：catch 里只允许 console.error（错误流）。console.log/warn/info/debug 会把 stdout
+    // 当成正常输出，且没有对象打印的正当理由——按**被调名集合**判，不按文本片段判。
+    const consoleSinks = [...new Set(findAll(body, (node) =>
+      node.type === 'CallExpression' && /^console\.\w+$/.test(String(memberPath(node.callee))))
+      .map((call) => memberPath(call.callee)))]
+    assert.deepStrictEqual(consoleSinks.filter((name) => name !== 'console.error'), [],
+      'guard catch 只能走 console.error（错误流）——console.log 会把 stdout 当成正常输出')
+    // 负断言二：任何 JSON.stringify 都不许进 catch（error.options/response 可能带 URL query 凭证）。
+    assert.strictEqual(callSites(body, 'JSON.stringify').length, 0,
+      'guard catch 禁止任何 JSON.stringify（error.options/response 带凭证）')
+    // 负断言三：原始 error 不得直接交给打印/序列化入口（形参改名绕不过去）。
+    assert.deepStrictEqual(rawErrorUsesIn(body, param).map((call) => memberPath(call.callee)), [],
+      `guard catch 不得把原始 error 直接交给打印/序列化（形参 ${param}）`)
   })
 
-  // 守住上面那条断言自己：它的取段与负断言必须对「真实维护动作」成立，否则红线随时静默失效。
-  // 两个夹具都是不对仓库做任何改动的合成源码（照原实现抄的骨架）。
-  await test('脱敏红线: 结构断言自身——花括号配对不吃窗口、负断言不认参数名', () => {
+  // 守住上面那条断言自己：判据必须对「真实维护动作」成立，否则红线随时静默失效。
+  // 两个夹具都是不对仓库做任何改动的合成源码（照原实现抄的骨架），用同一套 acorn 解析器喂给
+  // 同一组判定函数——测的是判据本身，不是夹具的排版。
+  await test('脱敏红线: 结构断言自身——处理器变长不吃窗口、负断言不认参数名', () => {
     const base = [
       'if (require.main === module) {',
       '  runNotifyTest(cliArgs).catch(e => {',
@@ -421,23 +446,28 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
       '  })',
       '}'
     ].join('\n')
-    // ① 处理器加长（200 行诊断输出）：调用点被推到旧实现的 4000 字符窗口之外。
-    //    旧断言在这里会假红「找不到 summarizeError(e)」，新取段不受影响。
+    const baseCase = notifyCatchHandlerOf(parseText(base, '夹具/base'))
+    assert.strictEqual(baseCase.param, 'e', '夹具：形参名必须来自 AST（不是猜的）')
+    assert.ok(hasCallWithIdentifier(baseCase.handler.body, 'summarizeError', 0, 'e'),
+      '夹具：合法处理器必须能取到 summarizeError(e)')
+    assert.deepStrictEqual(rawErrorUsesIn(baseCase.handler.body, 'e'), [], '夹具：合法出口不得被误判成原始 error 泄漏')
+    // ① 处理器加长 200 行诊断输出：旧实现按 4000 字符窗口取段会假红「找不到 summarizeError」。
     const padding = Array.from({ length: 200 }, (_, i) => `    console.error('  · 诊断 ${i}')`).join('\n')
     const padded = base.replace('    const info = summarizeError(e)', `${padding}\n    const info = summarizeError(e)`)
-    const offset = padded.indexOf('summarizeError(e)') - padded.indexOf('require.main === module')
-    assert.ok(offset > 4000, `夹具必须真的把调用点推到 4000 之外（实际 ${offset}）`)
-    assert.ok(guardHandlerBodyOf(padded, GUARD_CATCH_ANCHOR).includes('summarizeError(e)'),
+    assert.ok(padded.length - base.length > 4000,
+      `夹具必须真的把处理器撑长 4000 字符以上（实际 +${padded.length - base.length}）`)
+    const paddedCase = notifyCatchHandlerOf(parseText(padded, '夹具/padded'))
+    assert.ok(hasCallWithIdentifier(paddedCase.handler.body, 'summarizeError', 0, 'e'),
       '处理器变长后仍必须取到 summarizeError —— 旧实现的魔数窗口在这里假红')
     // ② 参数改名 + 换打印函数：旧的两条词法负断言（JSON.stringify(e) / console.log(e)）都放行。
     const renamed = base
       .replace('.catch(e => {', '.catch(err => {')
       .replace('summarizeError(e)', 'summarizeError(err)')
       .replace('    console.error(`通知自检失败', '    console.warn(JSON.stringify(err))\n    console.error(`通知自检失败')
-    const renamedBody = guardHandlerBodyOf(renamed, GUARD_CATCH_ANCHOR)
-    assert.ok(!renamedBody.includes('JSON.stringify(e)') && !/console\.log\(e\)/.test(renamedBody),
-      '夹具必须绕过旧的两条词法负断言（否则这条自查没有意义）')
-    assert.ok(rawErrorUsePattern('err').test(renamedBody),
+    const renamedCase = notifyCatchHandlerOf(parseText(renamed, '夹具/renamed'))
+    assert.strictEqual(renamedCase.param, 'err', '夹具：形参改名后判据必须跟着形参名走')
+    assert.deepStrictEqual(rawErrorUsesIn(renamedCase.handler.body, 'err').map((call) => memberPath(call.callee)),
+      ['JSON.stringify'],
       '参数改名 + console.warn(JSON.stringify(err)) 必须被参数名无关的负断言抓住')
   })
 

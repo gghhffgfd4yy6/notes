@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.478 — S2 断言整形：test_filter / test_filter_store / test_ci_skip_suites 的「读源码文本」断言按四式换掉（AST 结构断言 / 解析配置后断字段 / 行为断言），白名单 2363 → 2339（test_filter.js 31 → 18、test_filter_store.js 7 → 0、test_ci_skip_suites.js 107 → 103）；只动测试面与版本四方，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.479 — S3 断言整形：test_notify_selfcheck / test_message_store_journal / test_storage / test_local_mutation_guard / test_qinglong_utils / test_message_store_utils / test_mutation_report_cli / test_run_mutation_cli / test_state_schema / test_worker_protocol 的「读源码文本」断言按四式换掉（AST 结构断言 / 解析配置后断字段 / 行为断言 / 删除），白名单 2339 → 2289（本包 10 个文件 124 → 74）；只动测试面与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

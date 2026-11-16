@@ -15,6 +15,8 @@ const {
   isRealPathInside
 } = require('./xbk_storage')
 const LogArchive = require('./scripts/log-archive')
+const { loadModel } = require('./test_support/source_model')
+const { findAll, memberPath, callSites, hasCallWithIdentifier } = require('./test_support/ast_query')
 
 ;(async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-storage-'))
@@ -1185,24 +1187,38 @@ const LogArchive = require('./scripts/log-archive')
     assert.strictEqual(fs.readFileSync(log11, 'utf8'), '', '多成员档案恢复后明文必须被截断')
     assert.strictEqual(LogArchive.readMarker(log11), '20261116-20261122', '多成员档案恢复后 marker 必须推进')
 
-    // ⑧d CodeQL js/file-system-race 结构回归锁（alert #131/#132）：⑧ 现场从「明文长度核验」
-    // 到「读回断言」必须全程用同一个 fd（fstatSync/readSync/writeSync/closeSync），块内不得
-    // 出现任何按路径的 fs.* —— 只要还有 openSync/appendFileSync/readFileSync/writeFileSync/
-    // statSync 之类按路径解析，CodeQL 就会把「按路径检查 → 按路径读/写」重新配成 CWE-367。
-    // 回退本次修复（把 writeSync 换回 appendFileSync、把 fd 读回换回 readFileSync，或用
-    // statSync/openSync 做前置检查）时本断言必红；这是本机没有 CodeQL CLI 时守住该数据流
-    // 不回潮的手段，CodeQL 自身的终局判定仍由下一个 head 的扫描给出。
-    const selfSrc14 = fs.readFileSync(__filename, 'utf8')
-    const blockStart14 = selfSrc14.indexOf('// ⑧ F1-4：')
-    const blockEnd14 = selfSrc14.indexOf('// ⑧b 正路径不回归')
-    assert.ok(blockStart14 >= 0 && blockEnd14 > blockStart14, '必须能定位 ⑧ 现场代码块（结构回归锁的观测面）')
-    const block14 = selfSrc14.slice(blockStart14, blockEnd14)
-    assert.ok(block14.includes('fs.fstatSync('), '⑧ 现场长度核验必须走 fd（fstatSync），否则同源 TOCTOU 会回来')
-    const allowedFdCalls14 = ['fs.fstatSync(', 'fs.readSync(', 'fs.writeSync(', 'fs.closeSync(']
-    const fsCalls14 = (block14.match(/fs\.[A-Za-z_$][\w$]*\s*\(/g) || []).map((tok) => tok.replace(/\s+/g, ''))
-    const pathCalls14 = [...new Set(fsCalls14.filter((tok) => !allowedFdCalls14.includes(tok)))]
-    assert.deepStrictEqual(pathCalls14, [],
-      `⑧ 现场不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流）：${pathCalls14.join(', ')}`)
+    // ⑧d CodeQL js/file-system-race 结构回归锁（alert #131/#132）：⑧ 现场的 fd 校验段从「明文长度
+    // 核验」到「读回断言」必须全程用同一个 fd（fstatSync/readSync/writeSync/closeSync），段内不得
+    // 出现任何按路径的 fs.* —— 只要还有 appendFileSync/readFileSync/writeFileSync/statSync 之类按
+    // 路径解析，CodeQL 就会把「按路径检查 → 按路径读/写」重新配成 CWE-367。
+    // 回退本次修复（把 writeSync 换回 appendFileSync、把 fd 读回换回 readFileSync）时本断言必红；
+    // 这是本机没有 CodeQL CLI 时守住该数据流不回潮的手段，CodeQL 自身的终局判定仍由下一个 head 的扫描给出。
+    // S3：判据从「按注释切一段源码文本再正则扫 fs.*(」改成「按 AST 取那段 try（块里有 fstatSync、
+    // finally 有 closeSync）再扫它的 fs 调用」——注释改写/格式化不再影响结论，往注释里抄一句
+    // fs.fstatSync( 也不再让它恒真（旧写法两头都错：假红于排版、假绿于注释）。
+    const fdSections14 = findAll(loadModel(__filename), (node) =>
+      node.type === 'TryStatement' && !!node.finalizer &&
+      callSites(node.block, 'fs.fstatSync').length > 0 && callSites(node.finalizer, 'fs.closeSync').length > 0)
+    assert.ok(fdSections14.length >= 1,
+      '必须能定位 ⑧ 现场的 fd 校验段（fstatSync 开段、finally closeSync 收尾）')
+    const allowedFdCalls14 = new Set(['fs.fstatSync', 'fs.readSync', 'fs.writeSync', 'fs.closeSync'])
+    const offenders14 = []
+    const fdCallNames14 = new Set()
+    for (const section of fdSections14) {
+      const names = findAll(section, (node) =>
+        node.type === 'CallExpression' && /^fs\.[A-Za-z_$][\w$]*$/.test(String(memberPath(node.callee))))
+        .map((call) => memberPath(call.callee))
+      for (const name of names) {
+        fdCallNames14.add(name)
+        if (!allowedFdCalls14.has(name)) offenders14.push(`第 ${section.loc.start.line} 行起的 fd 段：${name}`)
+      }
+    }
+    assert.deepStrictEqual(offenders14, [],
+      `⑧ 现场不得出现任何按路径的 fs.*（CodeQL js/file-system-race 数据流）：${offenders14.join(', ')}`)
+    assert.ok(fdCallNames14.has('fs.fstatSync'),
+      '⑧ 现场长度核验必须走 fd（fstatSync），否则同源 TOCTOU 会回来')
+    assert.ok(fdCallNames14.has('fs.writeSync') && fdCallNames14.has('fs.readSync'),
+      '⑧ 现场必须仍经 writeSync / readSync 走同一个 fd（换回 appendFileSync / readFileSync 即变红）')
 
     // ⑨ F1-7：搬运期间 fail-open 写者仍在追加 ⇒ 截断不得吞掉快照之后的追加。
     // 旧实现按 `st.size` 快照只搬一次，随后 ftruncate(keepLen) 会把快照之后 append 的行整段删掉：
@@ -1947,12 +1963,16 @@ const LogArchive = require('./scripts/log-archive')
       path
     }), false, '任何异常都必须收敛成 false（安全检查读不到就当不安全）')
 
-    // ⑨ 结构层：xbk_message_store 不得再内联 realpath 包含校验（唯一实现在 xbk_storage）
-    const s1StoreSrc = fs.readFileSync(path.join(__dirname, 'xbk_message_store.js'), 'utf8')
-    assert.ok(!s1StoreSrc.includes('realpathSync'),
+    // ⑨ 结构层：xbk_message_store 不得再内联 realpath 包含校验（唯一实现在 xbk_storage）。
+    // S3：判据走 AST——「有没有 realpathSync 这个调用」与「isRealPathInside 的第 1、2 个实参是不是
+    // root / p」，注释与格式化都改变不了结论（旧写法在注释里写一句 realpathSync 就红，而把实参顺序
+    // 写反成 isRealPathInside(p, root) 时又照样绿）。
+    const storeModel = loadModel('xbk_message_store.js')
+    const realpathCalls = [...callSites(storeModel, 'realpathSync'), ...callSites(storeModel, 'fs.realpathSync')]
+    assert.strictEqual(realpathCalls.length, 0,
       'xbk_message_store 不得再内联 realpathSync——根内校验必须调用 xbk_storage.isRealPathInside')
-    assert.ok(s1StoreSrc.includes('isRealPathInside(root, p'),
-      'resolveCacheDirInRoot 的 realInsideRoot 必须直接委托给 xbk_storage.isRealPathInside')
+    assert.ok(hasCallWithIdentifier(storeModel, 'isRealPathInside', 0, 'root') && hasCallWithIdentifier(storeModel, 'isRealPathInside', 1, 'p'),
+      'resolveCacheDirInRoot 的 realInsideRoot 必须直接委托给 xbk_storage.isRealPathInside(root, p, …)')
   }
 
   // 清理：临时目录递归删除即可覆盖所有测试文件

@@ -12,6 +12,8 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const S = require('./xbk_state_schema')
+const { loadModel, hasFunction } = require('./test_support/source_model')
+const { findAll, declaresVariable, memberPath, requireEdge, callSites, objectKeyNames } = require('./test_support/ast_query')
 
 let passed = 0
 let failed = 0
@@ -44,7 +46,12 @@ function sourceShapeGuard (src, name) {
   return src.indexOf('stryMutAct_') !== -1 ? `SKIP ${name}（Stryker 沙箱内源码已插桩）` : null
 }
 
-const stripLineComments = (src) => src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+// 同一判据的 AST 版本（S3）：插桩会在源码里插入 `stryMutAct_*` / `stryCov_*` 标记调用，
+// 字符串字面量也会被改写成三元式 ⇒ 依赖「字面量形状」的 AST 断言在沙箱内不适用。
+// 这里不读源码文本，直接看 AST 里有没有插桩标记标识符。
+function instrumentedModel (model) {
+  return findAll(model, (node) => node.type === 'Identifier' && node.name.startsWith('stryMutAct_')).length > 0
+}
 
 const BLANK = { date: '', runs: 0, total: 0, dedup: 0, filtered: 0, pushed: 0, failed: 0, truncated: 0 }
 // 派生统计的固定时钟：上海 2026-09-05 10:00 ⇒ 今日键 2026-09-05、7 天窗口起点 2026-08-30。
@@ -445,34 +452,62 @@ check('deriveRunStats：非法计数行与无时间戳历史行不计入聚合',
 
 // ===== 源码形状：生产文件里不得再长出第二份定义（S2 的验收口径）=====
 check('源码形状：生产侧不再有第二份 schema / 摘要行定义，只允许薄 wrapper', () => {
-  // 测试夹具：以下三处目标都是 __dirname + 本仓库内的字面量文件名（xbk_app.js / scripts/status.js /
-  // xbk_state_schema.js），不来自环境、CLI、网络或文件内容，非外部输入。形状断言本来就必须读源码
-  // 文本，故按本仓既有口径加行内裸 nosemgrep（同 xbk_storage.js:222 的写法）。
-  const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8') // nosemgrep（路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容；形状断言必须读源码文本，真实防线是断言本身）
-  const statusSrc = fs.readFileSync(path.join(__dirname, 'scripts/status.js'), 'utf8') // nosemgrep（路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容；形状断言必须读源码文本，真实防线是断言本身）
-  const schemaSrc = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8') // nosemgrep（路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容；形状断言必须读源码文本，真实防线是断言本身）
-  const skip = sourceShapeGuard(appSrc + statusSrc + schemaSrc, '源码形状')
-  if (skip) return skip
-  const appCode = stripLineComments(appSrc)
-  const statusCode = stripLineComments(statusSrc)
-  const schemaCode = stripLineComments(schemaSrc)
-  // 名单：字面量只在共享模块出现一次
-  assert.strictEqual((schemaCode.match(/'runs', 'total'/g) || []).length, 1, '计数名单字面量只能在 xbk_state_schema')
-  for (const [name, code] of [['xbk_app.js', appCode], ['scripts/status.js', statusCode]]) {
-    assert.strictEqual((code.match(/'runs', 'total'/g) || []).length, 0, `${name} 不得再写字面量计数名单`)
-    assert.strictEqual(/const\s+REPORT_COUNTERS\s*=/.test(code), false, `${name} 不得再定义 REPORT_COUNTERS`)
-    assert.strictEqual(/const\s+RUN_SUMMARY_LINE_RE\s*=/.test(code), false, `${name} 不得再定义 RUN_SUMMARY_LINE_RE`)
+  // S3：整块从「剥注释 + 正则扫源码文本」改成 AST 结构断言。旧写法在纯格式重排后就假红
+  // （`'runs' , 'total'` / `function validReport (`），而把定义写进注释里又完全不设防
+  // （stripLineComments 只剥行首 `//` 的整行注释）。现在判据落在「数组字面量的元素 / 声明名 /
+  // 函数声明 / require 边 / 方法体形状」上，注释与排版都不参与判定。
+  const appModel = loadModel('xbk_app.js')
+  const statusModel = loadModel('scripts/status.js')
+  const schemaModel = loadModel('xbk_state_schema.js')
+  // 签名即 S2 的「单源」判据：共享模块必须在场（3 个文件缺一个 ⇒ 结论无意义）
+  for (const [name, model] of [['xbk_app.js', appModel], ['scripts/status.js', statusModel], ['xbk_state_schema.js', schemaModel]]) {
+    assert.ok(model.ast, `${name} 必须可解析（AST 形状断言的前提）`)
+  }
+  const skipped = [appModel, statusModel, schemaModel].some(instrumentedModel) ? 'SKIP 源码形状（Stryker 沙箱内源码已插桩）' : null
+  if (skipped) return skipped
+  // 计数名单 = 含 'runs' 与 'total' 两个字符串元素的数组字面量
+  const counterListArrays = (model) => findAll(model, (node) =>
+    node.type === 'ArrayExpression' && node.elements.length > 0 &&
+    node.elements.every((el) => el && el.type === 'Literal' && typeof el.value === 'string') &&
+    node.elements.some((el) => el.value === 'runs') && node.elements.some((el) => el.value === 'total'))
+  // 日期正则的指纹（相邻两个 `(\d{2})` 捕获组夹一个 '-'）与闰年天数表同属 isValidReportDate 的实现体
+  const dateRegexes = (model) => findAll(model, (node) =>
+    node.type === 'Literal' && !!node.regex && node.regex.pattern.includes('(\\d{2})-(\\d{2})'))
+  const leapTables = (model) => findAll(model, (node) =>
+    node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'days' &&
+    node.init && node.init.type === 'ArrayExpression' && node.init.elements.length > 3 &&
+    node.init.elements[0] && node.init.elements[0].type === 'Literal' && node.init.elements[0].value === 31)
+  // 名单：字面量与实现体只在共享模块出现一次
+  assert.strictEqual(counterListArrays(schemaModel).length, 1, '计数名单字面量只能在 xbk_state_schema')
+  assert.strictEqual(dateRegexes(schemaModel).length, 1, '日期正则只能留在 xbk_state_schema（isValidReportDate 的实现体）')
+  assert.strictEqual(leapTables(schemaModel).length, 1, '闰年天数表只能留在 xbk_state_schema')
+  for (const [name, model] of [['xbk_app.js', appModel], ['scripts/status.js', statusModel]]) {
+    assert.strictEqual(counterListArrays(model).length, 0, `${name} 不得再写字面量计数名单`)
+    assert.strictEqual(declaresVariable(model, 'REPORT_COUNTERS'), false, `${name} 不得再定义 REPORT_COUNTERS`)
+    assert.strictEqual(declaresVariable(model, 'RUN_SUMMARY_LINE_RE'), false, `${name} 不得再定义 RUN_SUMMARY_LINE_RE`)
     // 日期正则（year-month-day + 闰年天数表）只允许在共享模块：它是 isValidReportDate 的实现体
-    assert.strictEqual(/-\(\\d\{2\}\)-\(\\d\{2\}\)/.test(code), false, `${name} 不得再内联日期正则`)
-    assert.strictEqual(/const days = \[31, leap/.test(code), false, `${name} 不得再内联闰年天数表`)
-    assert.strictEqual(/function\s+validReport\s*\(/.test(code), false, `${name} 不得再定义 validReport`)
-    assert.strictEqual(/function\s+validPendingReport\s*\(/.test(code), false, `${name} 不得再定义 validPendingReport`)
-    assert.strictEqual(/function\s+validChannels\s*\(/.test(code), false, `${name} 不得再定义 validChannels`)
+    assert.strictEqual(dateRegexes(model).length, 0, `${name} 不得再内联日期正则`)
+    assert.strictEqual(leapTables(model).length, 0, `${name} 不得再内联闰年天数表`)
+    for (const fn of ['validReport', 'validPendingReport', 'validChannels']) {
+      assert.strictEqual(hasFunction(name, fn), false, `${name} 不得再定义 ${fn}`)
+    }
   }
   // 薄 wrapper 仍存（单测/历史调用点直接打它），但必须转调共享函数
-  assert.ok(/_isValidReportDate \(value\) \{\s*return isValidReportDate\(value\)/.test(appCode), 'xbk_app._isValidReportDate 必须是转调共享函数的薄 wrapper')
-  assert.ok(/require\('\.\/xbk_state_schema'\)/.test(appSrc), 'xbk_app 必须从共享模块引入')
-  assert.ok(/require\('\.\.\/xbk_state_schema'\)/.test(statusSrc), 'scripts/status 必须从共享模块引入')
+  const wrapper = findAll(appModel, (node) => node.type === 'Property' && !node.computed &&
+    ((node.key.type === 'Identifier' && node.key.name === '_isValidReportDate') ||
+      (node.key.type === 'Literal' && node.key.value === '_isValidReportDate')))
+  assert.strictEqual(wrapper.length, 1, 'xbk_app._isValidReportDate 必须是转调共享函数的薄 wrapper（单测仍直接打它）')
+  const wrapperFn = wrapper[0].value
+  assert.ok(wrapperFn && wrapperFn.type === 'FunctionExpression', '_isValidReportDate 必须是方法（不得改成别名直接赋值）')
+  const wrapperParam = wrapperFn.params[0] && wrapperFn.params[0].name
+  const wrapperBody = wrapperFn.body.body
+  const wrapperTail = wrapperBody[wrapperBody.length - 1]
+  const wrapperIsThin = wrapperBody.length === 1 && !!wrapperParam && wrapperTail.type === 'ReturnStatement' &&
+    wrapperTail.argument.type === 'CallExpression' && memberPath(wrapperTail.argument.callee) === 'isValidReportDate' &&
+    !!wrapperTail.argument.arguments[0] && wrapperTail.argument.arguments[0].name === wrapperParam
+  assert.ok(wrapperIsThin, 'xbk_app._isValidReportDate 必须只是 `return isValidReportDate(value)`（不得内联第二份实现）')
+  assert.ok(requireEdge(appModel, './xbk_state_schema'), 'xbk_app 必须从共享模块引入')
+  assert.ok(requireEdge(statusModel, '../xbk_state_schema'), 'scripts/status 必须从共享模块引入')
 })
 
 check('共享模块导出齐全（缺一个就会让某个调用方退回本地实现）', () => {
@@ -490,13 +525,24 @@ check('共享模块导出齐全（缺一个就会让某个调用方退回本地�
 check('源码形状：run.log 摘要行只能由 formatRunSummaryLine({…}) 生成（内联模板回潮必须变红）', () => {
   // 路径 = 模块常量 __dirname + 本文件字面量文件名，不来自环境/CLI/网络/文件内容（同上方源码形状用例口径）。
   const appSrc = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8') // nosemgrep（形状断言必须读源码文本；路径为字面量，非外部输入）
+  // 本用例下面仍有两条读文本的负断言（内联模板 / total= 字面），故保留沙箱跳过；上面这两条正向
+  // 断言已改成 AST 结构断言，插桩改变不了它们（Stryker 只加节点，不改调用与对象键）。
   const skip = sourceShapeGuard(appSrc, 'run.log 摘要行单源')
   if (skip) return skip
-  assert.ok(appSrc.includes('formatRunSummaryLine({'),
+  const appModel = loadModel('xbk_app.js')
+  const summaryCalls = callSites(appModel, 'formatRunSummaryLine')
+  assert.ok(summaryCalls.length > 0,
     'xbk_app.js 必须调用共享的 formatRunSummaryLine({…}) 生成摘要行（换回内联模板即变红：写/读会出现两份格式串）')
   // 正向锚点再加一道：实参块必须真的把 `counters` 交进去（`formatRunSummaryLine({})` 空参也算「有调用」，
   // 那样写侧根本没把计数传给格式化函数，摘要会静默退化）。
-  assert.ok(/formatRunSummaryLine\(\{\s*stamp:[^}]*counters:/.test(appSrc),
+  // S3：判据从「源码里找 'formatRunSummaryLine({' + 正则匹配 stamp…counters 的顺序」改成
+  // 「AST 上取第一个实参对象的键名集合」——键序无关（正则版按书写顺序匹配，交换字段就假红），
+  // 注释里的同名片段也不能冒充调用。
+  const summaryWithCounters = summaryCalls.filter((call) => {
+    const keys = objectKeyNames(call.arguments[0]) || []
+    return keys.includes('stamp') && keys.includes('counters')
+  })
+  assert.ok(summaryWithCounters.length > 0,
     'formatRunSummaryLine 的实参必须同时给 stamp 与 counters（空参/漏 counters 会让摘要计数静默丢失）')
   // 旧内联模板的**唯一字面量锚点**：同一个模板串里同时出现 `total=${` 与 `dedup=${`。
   // 已 grep 确认该形态在 xbk_app.js 里为 0 处（`dedup=${` 单独出现在一条 checkpoint 诊断行，不含 total=，

@@ -74,6 +74,27 @@ function check (name, fn) {
 }
 function section (title) { console.log(`\n${title}`) }
 
+/**
+ * 读 journal 文件并按 NDJSON 解析成记录（S3：解析后断言字段，不比对文本片段）。
+ * journal 行是 `{v, at, put:[…]}` / `{v, at, drop:[…]}` / `{v, at, ckpt:true}`；崩溃现场本来就可能
+ * 留半行或坏行，这里逐行 JSON.parse、解析不出的行跳过（与生产 parseJournalText 的容错口径一致）。
+ * 旧写法直接 `.includes('"a"')`：注释/编码差异、字段顺序变化、甚至只把 id 写成字符串都能命中，
+ * 却答不出「a 这条 put 到底在不在」。
+ */
+function readJournalRecords (file) {
+  const records = []
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    const text = line.trim()
+    if (!text) continue
+    try { records.push(JSON.parse(text)) } catch (e) { /* 半行/坏行：崩溃现场的正常残留 */ }
+  }
+  return records
+}
+/** 所有 put 条目（跨行扁平化）：断言「某身份是否还留在 journal 里」。 */
+function journalPuts (records) {
+  return records.flatMap((rec) => (Array.isArray(rec.put) ? rec.put : []))
+}
+
 /** 临时静音（随机等价性/体积用例每轮都有告警，不静音会把失败信息冲掉） */
 function quietly (fn) {
   const { log, warn, error } = console
@@ -391,7 +412,7 @@ check('J2-03 墓碑 + 崩溃回放：已落墓碑的裁剪条目不得靠 journa
       { id: 'b', title: 'B' }, { id: 'c', title: 'C' }, { id: 'd', title: 'D' },
       { id: 'e', title: 'E' }, { id: 'f', title: 'F' }
     ]))
-    assert.ok(fs.readFileSync(jp, 'utf8').includes('"a"'), 'journal 必须仍含被裁剪条目 a 的 put（构造崩溃窗口）')
+    assert.ok(journalPuts(readJournalRecords(jp)).some((put) => put.id === 'a'), 'journal 必须仍含被裁剪条目 a 的 put（构造崩溃窗口）')
     const reopened = makeStore({ dir, maxSize, constants })
     const got = reopened.readMessages(fp)
     assert.deepStrictEqual(got.map(m => m.id), ['b', 'c', 'd', 'e', 'f'], '墓碑身份不得复活，且未墓碑的活条目不得被挤掉')
@@ -659,9 +680,9 @@ check('J3-07 _f 记录 + 「快照已写、journal 未截断」窗口：重启�
     store.saveBatch([{ id: 'c', title: 'C' }], NAME)
     // 崩溃现场自证：快照已是裁剪后的 [a,b,c]，journal 因 truncate 失败仍留着 f 的 put
     assert.deepStrictEqual(JSON.parse(fs.readFileSync(fp, 'utf8')).map(m => m.id), ['a', 'b', 'c'], '快照必须已写成裁剪后的内容')
-    const journalText = fs.readFileSync(jp, 'utf8')
-    assert.ok(journalText.includes('"FILTERED"'), 'journal 必须仍含 _f 条目的 put（构造「journal 未截断」窗口）')
-    assert.ok(journalText.includes('"ckpt":true'), 'truncate 失败前必须先追加检查点（否则旧行会被重复回放）')
+    const journalRecords = readJournalRecords(jp)
+    assert.ok(journalPuts(journalRecords).some((put) => put.id === 'f' && put.title === 'FILTERED'), 'journal 必须仍含 _f 条目的 put（构造「journal 未截断」窗口）')
+    assert.ok(journalRecords.some((rec) => rec.ckpt === true), 'truncate 失败前必须先追加检查点（否则旧行会被重复回放）')
     const reopened = makeStore({ dir, maxSize: 3 })
     const got = reopened.readMessages(fp)
     const oldView = makeStore({ dir, maxSize: 3, constants: { JOURNAL_READ_ENABLED: false } }).readMessages(fp)
@@ -782,8 +803,7 @@ check('J5-02 合并写失败：保留 journal 原样、下次重试，且本次�
   let ok
   try { ok = store.saveBatch([{ id: 'b', title: 'B' }], NAME) } finally { console.error = origError }
   assert.strictEqual(ok, true, '合并失败不得让「已追加成功」的批次报失败')
-  const journalText = fs.readFileSync(jp, 'utf8')
-  assert.ok(journalText.includes('"b"'), '合并失败后日志必须原样保留（下轮重试）')
+  assert.ok(journalPuts(readJournalRecords(jp)).some((put) => put.id === 'b'), '合并失败后日志必须原样保留（下轮重试）')
   assert.ok(errs.some(e => e.includes('合并写盘失败')), `合并失败必须留痕（实际：${JSON.stringify(errs)}）`)
   // 下轮重试成功：日志清空、快照含两条
   store.saveBatch([{ id: 'c', title: 'C' }], NAME)

@@ -1948,3 +1948,48 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **验证（本机实测，全部 TZ=UTC）**：`node test_filter_store.js` **98 通过 / 0 失败**（源码形状断言跳过 0 条）；`node test_filter.js` **942/942 全部通过**；`node scripts/probe-format-coupling.js test_filter_store.js` **✅ format-clean**（扰动 75 个生产文件、`已还原 75 个文件`，还原校验与运行前 `git status --short` 一致）；`node scripts/check-source-text-asserts.js` **exit 0**（`基线 total=2339（38 个文件），实测 total=2339（扫描 67 个测试面文件）`，`✓ 基线相对参照 origin/main 未增长`）；`node check-version.js` 四方一致（v3.478）；`npx standard test_filter.js test_filter_store.js` exit 0。
   - **反向验证（R1-4 全文口径）**：把「优先沿用进程内上一次合法规则」追加到 README 的 applied 快照条目（`:170`，含 `filter-rules.applied.json` 的那条 bullet）→ `node test_filter_store.js` **97 通过 / 1 失败**，红在 `❌ R1-4 文档同步：README 必须写持久 LKG…: README 全文（253 个非空行）不得再写「进程内 LKG」…`，diff 的 actual 正是该 applied 条目；`git checkout -- README.md` 还原后 **98 通过 / 0 失败**，`git status --short` 只剩本包 5 个文件。
   - **版本**：3.477.0 → **3.478.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.479
+
+- **S3：10 个测试文件的「读源码文本」断言换成可靠断言（白名单 2339 → 2289，本包 10 个文件 124 → 74；只动测试面 / `test_support/` 与版本四方，生产逻辑一行未改——`xbk_function_v3.js` 只动顶部 banner 那一行）**：
+  - **清单 24 条：全部已改（0 条未改 / 0 条 blocked）**。逐条去向（旧锚点 → 新口径）：
+    1. `test_notify_selfcheck.js:24` `require.main === module` → AST：按 `if (require.main === module)` 的 `IfStatement` 节点定位守卫（`memberPath` 比对 `require.main`），分发链取 guard 块最后一条语句。
+    2. `:26` `'--notify-test'` → 同一块：`notifyArg` 的 `cliArgs.find` 回调里必须出现 `Literal` 字面量 `--notify-test`（`findAll` 认节点，不认文本）。
+    3. `:27` `runNotifyTest(cliArgs)` → `callSites(arms[0].consequent,'runNotifyTest')`，且第一个实参必须是标识符 `cliArgs`（原样转发）。
+    4. `:28` `runSingleEntry().catch` → `runSingleEntry` 在 guard 内**恰调用一次**且落在最后 `else` 支（早退语义由分支结构表达，不再比三个下标的大小）。
+    5. `:33` `a.startsWith('--notify-test=')` → `hasCallWithLiteral(picker,'a.startsWith',0,'--notify-test=')`。
+    6. `:34` `未识别参数` → 从该分支 `console.error` 的 `TemplateLiteral` quasis 取文案后 `assert.match(/未识别参数/)`：文案必须真的进用户可见的报错调用，注释里的同名字样不算证据。
+    7. `test_message_store_journal.js:394` `"a"` → 解析 journal NDJSON 记录后 `journalPuts(...).some(put => put.id === 'a')`。
+    8. `:663` `"FILTERED"` → 解析后 `put.id === 'f' && put.title === 'FILTERED'`（标题字段而不是行内子串）。
+    9. `:664` `"ckpt":true` → 解析后 `rec.ckpt === true`。
+    10. `:786` `"b"` → 解析后 `put.id === 'b'`。
+    11. `test_storage.js:1196` `// ⑧ F1-4：` → ⑧d 结构回归锁改为 AST 定位：`TryStatement` 且 `block` 里有 `fs.fstatSync`、`finalizer` 里有 `fs.closeSync` 的那一段（不再按注释文本切段）。
+    12. `:1197` `// ⑧b 正路径不回归` → 同上，注释锚点整批退场。
+    13. `:1952` `realpathSync` → `callSites(storeModel,'realpathSync' | 'fs.realpathSync')` 必须为 0（`xbk_message_store` 不得内联 realpath 包含校验）。
+    14. `:1954` `isRealPathInside(root, p` → `hasCallWithIdentifier(...,0,'root') && hasCallWithIdentifier(...,1,'p')`：实参顺序写反也变红（旧写法只认字面顺序文本）。
+    15. `test_local_mutation_guard.js:111` `--mutate` → 行为断言：真触发 `scripts/mutation-run-guard.js` 的拒绝路径，读**运行期** stderr/stdout 里的放行示例。
+    16. `:115` `--mutate` → 同上，并保留负断言「不得给出无段选择的全量放行示例」，判据同样落在运行期输出上。
+    17. `:121` `mutation-run-guard` → 行为断言：逐个 `require('./stryker.config.js' / './stryker.tap.config.js')`，挂载了闸门的配置必须在加载期抛且打印禁令。
+    18. `test_qinglong_utils.js:132` `runDryRunOnce(app)` → AST：`--dry-run` 分支必须调用 `runDryRunOnce(app)`，且分支末尾 `return`。
+    19. `:141` `runResident(app` → AST：同一 `main()` 内仍有 `runResident(app, …)`，`return` 早退不得丢。
+    20. `test_message_store_utils.js:3032` `require('./test-env-isolation')` → AST 依赖边 `requireEdge(scripts/test-harness.js,'./test-env-isolation')`。
+    21. `test_mutation_report_cli.js:500` `github.run_started_at` → `loadYaml('.github/workflows/mutation.yml')` 后**遍历所有字符串值**，该表达式必须为 0 处（YAML 注释里的同名字样不再误判——见该文件 `:516` 的历史注释 `run_started_at 2026-09-23…`）。
+    22. `test_run_mutation_cli.js:348` `content.includes('g')` → 副作用断言：孙进程心跳只写 `'g'` 一个字符、首心跳 `'P'` 固定 1 字节 ⇒ 断 `statSync(marker).size > 1` 且 600ms 后字节数不变（不再把心跳文件读成文本找单个字符）。
+    23. `test_state_schema.js:495` `formatRunSummaryLine({` → `callSites(appModel,'formatRunSummaryLine')` + `objectKeyNames(第一个实参)` 必须同时含 `stamp` 与 `counters`（键序无关；空参/漏 counters 变红）。
+    24. `test_worker_protocol.js:117` `total=` → 用 `parseSummaryLine` 把 run.log 行解析成字段后断存在 `total` 键（与读侧 `scripts/status.js` 同一套 key=value 语义）。
+  - **清单外同批换掉的 26 个比对点（`probe-format-coupling` 转绿的必要条件，同块/同用例）**：
+    - `test_notify_selfcheck.js` 12 条 —— S8 脱敏红线整套从「锚点 + 花括号配对 + 4000 字符窗口 + 词法负断言」换成 AST：定位 `runNotifyTest(...).catch(handler)`、在**处理器子树**里查 `summarizeError(形参)`、`console.*` 被调名集合只允许 `console.error`、`JSON.stringify` 计数为 0、原始 error 实参交给打印/序列化入口即红；两条夹具自检改用 `parseText` 喂同一套判据（处理器撑长 4000+ 字符仍取得到；形参改名 + `console.warn(JSON.stringify(err))` 必须被参数名无关的判据抓住）。
+    - `test_state_schema.js` 6 条 —— 源码形状块：计数名单数组字面量、日期正则指纹、闰年天数表、`validReport/validPendingReport/validChannels` 三个函数名、`_isValidReportDate` 薄 wrapper 形状（方法体恰一条 `return isValidReportDate(形参)`）、两条 `require` 边；插桩判定也从读源码文本的 `stryMutAct_` 改成 AST 标识符前缀。
+    - `test_storage.js` 2 条 —— ⑧d 段内的 `fs.fstatSync(` 与 `/fs\.[A-Za-z_$][\w$]*\s*\(/g`（改成对 `memberPath` 集合取差集）。
+    - `test_local_mutation_guard.js` 2 条 —— `/XBK_ALLOW_LOCAL_MUTATION=1 npx stryker run/`（对运行期输出）与 `/process\.argv\.slice\(2\)/`（改成 AST：`spawnSync` 实参里必须展开 `process.argv.slice(2)`）。
+    - `test_qinglong_utils.js` 2 条 —— `'return'`、`'runResident('`（并入上面 18/19 的 AST 判据）。
+    - `test_message_store_utils.js` 2 条 —— `/const SUITE_ENV = prepareSuiteEnv\(process\.env\)\.env/`、`/env:\s*SUITE_ENV/` → AST：`SUITE_ENV` 的 `VariableDeclarator` init 必须是 `prepareSuiteEnv(process.env).env`，且该标识符作为 `env` 属性传给子进程。
+  - **新增测试支撑件**：`test_support/ast_query.js`（新文件）——在 `source_model.loadModel()` 之上补「结构 + 实参」级查询：`findAll/findFirst/walk/ifChain/memberPath/callSites/hasCallTo/hasCallWithIdentifier/hasCallWithLiteral/declaresVariable/objectKeyNames/requireEdge/parseText`。`loadModel` 只给 `calls/members/funcs/exports` 四个**名字集合**，表达不了「调用实参是什么」「成员路径是什么」「函数体里有没有某个调用」，故集中一层，避免每个测试各写一套遍历。
+  - **白名单口径（数字可核，逐条 diff 实测）**：累计 `2339 → 2289`，`by_file` 38 → 35 个文件；本包 10 个文件合计 **124 → 74（-50）**。逐文件前后：`test_notify_selfcheck.js 18 → 0`、`test_message_store_journal.js 6 → 2`、`test_storage.js 24 → 18`、`test_local_mutation_guard.js 10 → 5`、`test_qinglong_utils.js 4 → 0`、`test_message_store_utils.js 11 → 8`、`test_mutation_report_cli.js 32 → 31`、`test_run_mutation_cli.js 7 → 6`、`test_state_schema.js 11 → 4`、`test_worker_protocol.js 1 → 0`。**-50 的构成**：24 条清单**每条恰对应 1 个入账比对点**（合计 -24）+ 清单外同批 26 条（-26），与上面对 `HEAD` 版本逐个 `analyzeFile` 的 diff 结果一一对得上（不是估算、也不是「24 条 = 降幅」那种对不上的算式）。三个降到 0 的文件（`test_notify_selfcheck.js` / `test_qinglong_utils.js` / `test_worker_protocol.js`）随之移出 `by_file`——与 `--write-allowlist` 的 `renderBaseline` 语义一致（0 条的文件本就不入基线），不是「删白名单了事」；基线文件仍在扫描面内（若整份消失，闸门会按 `missing` 报 exit 1）。
+  - **新增可见条数：0**。10 个文件的 `added` 集合里只有**行号位移的同一锚点**（anchor 逐字相同，例如 `test_storage.js:68 → :70` 的 `"content-1"`），没有任何新形状入账。
+  - **验证（本机实测，全部 TZ=UTC，10 个文件 rc 全为 0）**：`test_notify_selfcheck.js` → `🎉 通知自检通过 9/9`；`test_message_store_journal.js` → `🎉 全部通过`；`test_storage.js` → `test_storage OK`；`test_local_mutation_guard.js` → `本地变异禁令套件：通过 10 / 失败 0`；`test_qinglong_utils.js` → `test_qinglong_utils OK (entry contract)`；`test_message_store_utils.js` → `🎉 test_message_store_utils.js 通过 148/148 项，全部通过`；`test_mutation_report_cli.js` → `test_mutation_report_cli OK`；`test_run_mutation_cli.js` → `test_run_mutation_cli OK`；`test_state_schema.js` → `=== 结果：43 通过 / 0 失败 / 1 跳过（声明 44 例） ===`（那条 SKIP 是「自检探针：本条按设计恒跳过」）；`test_worker_protocol.js` → `25/25 用例通过`。
+  - **`probe-format-coupling`（同一批 10 个文件）**：`扰动面：生产 JS 候选 75 个` / `已扰动 75 个文件` / `已还原 75 个文件` / `还原校验：git status --short 与运行前一致（12 项）`；结果 **9 个 format-clean / 1 个 format-coupled**。剩下那个是 `test_run_mutation_cli.js`，且**基线 `origin/main` 上同样红**（在 `git archive origin/main` 的导出树里跑同一条 probe：`test_run_mutation_cli.js format-coupled exit=1 222.4s`，同一条 AssertionError、同一段 output 尾巴），不是本包引入。根因（实测）：它的场景 1 在 `copyProject` 沙箱里跑**全量单元套件**并硬断言 `status === 'pass'`，仓库里只要还有任一 format-coupled 套件这条就红；本轮把该场景输出落盘逐行核对，红的 5 个套件是 `test_mutation_report.js`（C10-052 逐字副本比对）、`test_test_harness.js`（run_tests 入口 guard 接线）、`test_host_clean_gates.js`、`test_console.js`、`test_check_source_text_asserts.js`——**都不在本包的 10 个文件里**，属后续包的清账面。该文件自身的其余 8 个场景在扰动下全绿。
+  - **反向验证（三次，覆盖三种替换式；生产侧破坏 → 新断言红 → 恢复后绿）**：① AST 结构 —— `xbk_app.js` 的薄 wrapper `_isValidReportDate (value) { return isValidReportDate(value) }` 换成内联 `/^(\d{4})-(\d{2})-(\d{2})$/.test(String(value))`，`node test_state_schema.js` 红在 `❌ 源码形状：生产侧不再有第二份 schema / 摘要行定义，只允许薄 wrapper :: xbk_app.js 不得再内联日期正则`（`1 !== 0`），`git diff --quiet xbk_app.js` 确认还原后 `43 通过 / 0 失败 / 1 跳过`。② 解析配置 —— `.github/workflows/mutation.yml` 的 env 块加一行 `RUN_STARTED_AT: ${{ github.run_started_at }}`，`node test_mutation_report_cli.js` 红在 `AssertionError`（`actual: [ '${{ github.run_started_at }}' ]` / `expected: []`），还原后 `test_mutation_report_cli OK`。③ 行为 —— `scripts/mutation-run-guard.js` 的运行期放行示例去掉 `-- --mutate "<文件:行段>"`，`node test_local_mutation_guard.js` 红在 `❌ 配置期闸门打印的放行姿势带段选择（不退化成 19 个文件全量）: 配置期闸门的放行示例必须带 --mutate 段选择`（通过 9 / 失败 1），还原后 `通过 10 / 失败 0`。三处破坏均已用 `git diff --quiet <file>` 确认为 CLEAN。
+  - **闸门**：`node scripts/check-source-text-asserts.js` **exit 0** —— `基线 total=2289（35 个文件），实测 total=2289（扫描 68 个测试面文件）`、`✓ 基线相对参照 origin/main 未增长（逐文件与 total 一致：2289 条）`、`✅ 扫描面内未新增源码文本断言（逐文件计数均未超基线）`。未使用 `--write-allowlist` / `--allow-growth`，也没有靠改数字过关：`by_file` 是按 `renderBaseline` 同一实现对实测重算后**只降不增**写回的。
+  - **lint**：`npx standard test_notify_selfcheck.js test_message_store_journal.js test_storage.js test_local_mutation_guard.js test_qinglong_utils.js test_message_store_utils.js test_mutation_report_cli.js test_run_mutation_cli.js test_state_schema.js test_worker_protocol.js test_support/ast_query.js` exit 0。
+  - **版本**：3.478.0 → **3.479.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
