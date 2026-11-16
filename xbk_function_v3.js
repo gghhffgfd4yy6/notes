@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.471 — S0 r28：反回归闸收七条评审意见（正则 receiver 不只字面量：RE.test/RE.exec/new RegExp(…)/helper 形参收到正则都入账；恒等字符串化 String()/||/??/String.raw/JSON.stringify 穿透而 JSON.parse 后的字段比对仍放行；面外告警排序补靶向用例；known-uncovered 第 8 条与三份文档的表述按实现改写；导出面集合边界锁死）；白名单 2386 → 2404 是「尺子变准」（18 条既有断言首次可见，测试断言本体一条未改），生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.472 — S0 r29：清三条静态告警（Sonar S2871：导出集合边界的两处 sort 补显式字符串比较器，码元序不变、逐元素全等有实测；Codacy 动态正则：test_stringify 入账明细改成逐行子串扫描，强度不变且反向可红；Codacy 非字面量 fs 路径：10 处补裸 eslint-disable-next-line 与中文理由，行尾 nosemgrep 保留）；白名单 2404 原地不动，测试断言本体一条未改、生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

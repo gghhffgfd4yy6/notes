@@ -301,7 +301,11 @@ check('对外 API：12 个公共导出面齐全、2 个内部件单列，导出�
   const missing = API_FACE.filter((name) => typeof api.get(name) !== 'function')
   assert.deepStrictEqual(missing, [], '缺导出（或不是函数）：' + missing.join(', '))
   // 集合边界：新增一个导出而不登记，这条当场红（否则 API 面会随实现悄悄漂移）。
-  assert.deepStrictEqual([...api.keys()].sort(), [...API_FACE, ...INTERNALS].sort(),
+  // 两处 sort 显式带比较器（SonarCloud S2871：默认排序不表达意图）。该比较器与默认排序同为
+  // UTF-16 码元序，排序结果逐元素不变；刻意不用 localeCompare —— 那是按语言规则重排，会改变比对面。
+  assert.deepStrictEqual(
+    [...api.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    [...API_FACE, ...INTERNALS].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
     '导出集合必须恰为「12 个公共面 + 2 个内部件」：新增导出要同时登记到本用例与 test_suites.js 的 desc')
 })
 

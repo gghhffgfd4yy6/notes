@@ -79,10 +79,14 @@ function makeWorkspace () {
   // dir = mkdtempSync 在 os.tmpdir() 下新建的本进程独占目录，无外部净输入
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-assertgate-')) // nosemgrep（os.tmpdir() + 本文件硬编码前缀，本进程独占随机目录）
   workspaces.push(dir)
+  // 目标路径 = mkdtemp 结果 + 本文件硬编码的 'scripts'：必然由变量拼成，但无外部净输入参与。
+  // eslint-disable-next-line
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true }) // nosemgrep（dir = mkdtemp 结果 + 本文件硬编码的 'scripts'）
   // 闸门脚本整份复制：ROOT 由 __dirname/.. 推出 ⇒ 副本把工作区当成仓库根，绝不碰真实仓库。
   fs.copyFileSync(GATE, path.join(dir, 'scripts', 'check-source-text-asserts.js')) // nosemgrep（源 = 本仓常量路径，目标 = mkdtemp 工作区 + 硬编码段）
-  // 闸门 require('acorn')：软链到本仓 node_modules，不装依赖。
+  // 闸门 require('acorn')：软链到本仓 node_modules，不装依赖；两端分别是本仓 ROOT 常量与 mkdtemp
+  // 工作区（+ 本文件硬编码的 'node_modules'），没有外部净输入参与路径构造。
+  // eslint-disable-next-line
   fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir') // nosemgrep（两端都是本仓/本进程常量路径）
   return dir
 }
@@ -97,13 +101,21 @@ function removeWorkspaces () {
 
 function writeFile (ws, rel, content) {
   const abs = path.join(ws, rel)
+  // abs = mkdtemp 工作区 + 本文件硬编码的夹具相对路径；rel 只在本文件内以字面量传入（见各用例调用点）。
+  // eslint-disable-next-line
   fs.mkdirSync(path.dirname(abs), { recursive: true }) // nosemgrep（abs 由 mkdtemp 工作区 + 本文件硬编码相对路径拼成）
+  // 同上：abs 是隔离工作区内的夹具路径，content 是本文件内构造的夹具文本。
+  // eslint-disable-next-line
   fs.writeFileSync(abs, content) // nosemgrep（同上一行：工作区内的夹具文件）
 }
 
+// abs 只由调用点传入 mkdtemp 工作区内的基线文件路径；JSON.parse 后按字段断言，不比对源码文本。
+// eslint-disable-next-line
 const readJson = (abs) => JSON.parse(fs.readFileSync(abs, 'utf8')) // nosemgrep（abs = mkdtemp 工作区内的基线文件；JSON.parse 后只取字段）
 
 function writeBaseline (ws, data) {
+  // ws = mkdtemp 结果、ALLOW_REL 是本文件顶部的硬编码相对路径常量：拼出来的只有工作区内的基线文件。
+  // eslint-disable-next-line
   fs.writeFileSync(path.join(ws, ALLOW_REL), JSON.stringify(data, null, 2) + '\n') // nosemgrep（ws = mkdtemp 结果 + 硬编码相对路径）
 }
 
@@ -648,7 +660,11 @@ const RENAME_FAIL_PRELOAD = [
   ''
 ].join('\n')
 
+// ws 只由调用点传入 mkdtemp 工作区；只列该工作区 scripts/ 下的文件名，不读内容。
+// eslint-disable-next-line
 const listTmp = (ws) => fs.readdirSync(path.join(ws, 'scripts')).filter((name) => name.endsWith('.tmp')) // nosemgrep（ws = mkdtemp 工作区；只列目录名）
+// abs 只由调用点传入工作区内的基线文件路径；这里只对它做哈希，不解析内容。
+// eslint-disable-next-line
 const sha256 = (abs) => require('node:crypto').createHash('sha256').update(fs.readFileSync(abs)).digest('hex') // nosemgrep（abs = 工作区内的基线文件）
 
 check('无旧基线时 --write-allowlist 直接写盘（ENOENT 分支不得退化成拒绝）', () => {
@@ -690,6 +706,8 @@ check('原子替换：必须 rename(tmp → 基线)，不得回退成 writeFileS
     SPY_LOG: log
   })
   assert.strictEqual(r.code, 0, `写盘必须成功，实得 ${r.code}\n${r.out}${r.err}`)
+  // log 是 mkdtemp 工作区内的探针输出路径；JSON.parse 后按字段断言，不比对源码文本。
+  // eslint-disable-next-line
   const ops = JSON.parse(fs.readFileSync(log, 'utf8')) // nosemgrep（log = mkdtemp 工作区内的探针输出）
   assert.ok(Array.isArray(ops) && ops.length > 0, `探针必须记到 fs 调用，实得：${JSON.stringify(ops)}`)
   assert.ok(ops.some((o) => o.op === 'renameSync' && o.dest === allow),
@@ -1081,6 +1099,8 @@ check('基线文件不在扫描面：mv test_console.js 到 scripts/ 必须 exit
   const before = runGate(ws)
   assert.strictEqual(before.code, 0, `搬走之前必须绿，实得 ${before.code}\n${before.out}${before.err}`)
   // 搬出扫描面（scripts/ 不入账）：基线里那 1 条整份脱保，必须响亮。
+  // 两端都是 mkdtemp 工作区 + 本文件硬编码文件名：搬动只发生在隔离目录内部。
+  // eslint-disable-next-line
   fs.renameSync(path.join(ws, 'test_console.js'), path.join(ws, 'scripts', 'console_copy.js')) // nosemgrep（两端都在 mkdtemp 工作区内）
   const moved = runGate(ws)
   assert.strictEqual(moved.code, 1,
@@ -1182,7 +1202,12 @@ check('恒等字符串化穿透明细：String/toString/模板/||/??/String.raw/
   assert.ok(red.err.includes('test_stringify.js  基线 0 / 实测 7 / +7'),
     `7 种写法各 1 条，实得：\n${red.err}`)
   for (const [line, anchor] of [[5, 'STRING_ID'], [6, 'OR_FALLBACK'], [7, 'NULLISH_FALLBACK'], [8, 'TO_STRING'], [9, 'TEMPLATE_ID'], [10, 'STRING_RAW'], [11, 'JSON_STRINGIFY']]) {
-    assert.match(red.err, new RegExp(`test_stringify\\.js:${line} .*${anchor}`), `${anchor} 必须入账，实得：\n${red.err}`)
+    // 逐行子串扫描而不是动态构造正则（Codacy：RegExp with non literal argument）：同一条输出行必须
+    // 既点名 `test_stringify.js:<行号>`、又含该锚点，两件事同时成立才算入账 —— 与原来
+    // `test_stringify\.js:<行号> .*<锚点>` 的强度相同，且锚点不会被当成正则元字符解释。
+    assert.ok(
+      red.err.split('\n').some((l) => l.includes(`test_stringify.js:${line}`) && l.includes(anchor)),
+      `${anchor} 必须入账（输出里须有一行同时点名 test_stringify.js:${line} 与该锚点），实得：\n${red.err}`)
   }
   // 反向：非源码值（`String(42)` / `(null || '')`）与「解析成结构化数据后断言字段」不得入账
   // ——后者是本批的目标形态（② 式），故意放行。
