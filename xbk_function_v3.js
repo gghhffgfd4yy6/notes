@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.481 — S3 fix r2：补 Stryker 插桩守卫（test_notify_selfcheck 入口分发结构块、test_qinglong_utils 的 --dry-run 接线断言在插桩源码上必红——if 条件被包成 ConditionalExpression、hasArg 的字面量实参被包成三元式 ⇒ 沙箱 initial test run 整段中止；现按 test_state_schema.js 的 instrumentedModel 口径用 AST 标识符判定后显式 SKIP，普通运行判据逐条不变），并恢复被删的 PR #154 变异沙箱兼容说明；只动测试面与版本四方，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.482 — C1：test_console.js 第 1 段 98 处「读源码文本」断言换成结构/行为判据（AST 结构、标记结构、解析后字段、真实响应体；注释不再能冒充实现），源码文本断言基线 2289→2165、test_console.js 1918→1794（只减不增），生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
