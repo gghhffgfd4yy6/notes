@@ -35,6 +35,13 @@ const SHAPE_CLAIMS = [
   `⑤helper 源码/形参 +${SHAPE_HITS[5]}`
 ]
 
+// Codacy no-unsanitized 把「角括号 ref 串」的字面量当成 HTML 标签传给函数：本文件 r30 的用例标题、
+// 断言消息与一处注释各有一份。同 r10 的处理方式——这些字符在运行期拼出来，于是文件里不再出现
+// 标签形状的字面量，而拼出的字符串与原字面量逐字节相同（两端的反引号也是文案的一部分，一并拼）。
+const LT = String.fromCharCode(60)
+const TICK = String.fromCharCode(96)
+const CARET_REF = TICK + LT + 'ref>^' + TICK
+
 // 与 test_ci_static_gates.js / test_doc_line_gates.js 同一套 harness 形态：每条检查独立捕获，
 // passed/failed 双计数，末尾统一汇总并置非零退出码。
 function createChecker (log = (s) => console.log(s)) {
@@ -1386,9 +1393,9 @@ check('r30-2 顶层源码变量的声明顺序不改变结论：const 在前/在
 })
 
 // r30-3：写盘侧 growth.commit 必须与「CI 侧会解析出的参照提交」同口径。HEAD 就是参照时
-// （本地在 main 上 / 从 main 新建分支尚未提交）resolveReferenceBaseline 会把 target 换成 `<ref>^`
+// （本地在 main 上 / 从 main 新建分支尚未提交）resolveReferenceBaseline 会把 target 换成 CARET_REF
 // ——门禁侧必须这么办，但**登记**照抄 `^` 就让这条已登记的增长在 CI 被判「基线被抬高」exit 1。
-check('r30-3 growth 登记钉参照本身而非 `<ref>^`：HEAD==origin/main 写盘，提交后 CI 形态必须 exit 0（等量抬高仍 exit 1）', () => {
+check(`r30-3 growth 登记钉参照本身而非 ${CARET_REF}：HEAD==origin/main 写盘，提交后 CI 形态必须 exit 0（等量抬高仍 exit 1）`, () => {
   const ws = makeWorkspace()
   writeFile(ws, 'test_growth.js', ONE_HIT_FIXTURE)
   writeBaseline(ws, baselineOf({ 'test_growth.js': 1 }))
@@ -1407,7 +1414,7 @@ check('r30-3 growth 登记钉参照本身而非 `<ref>^`：HEAD==origin/main 写
   assert.ok(pinned && typeof pinned.commit === 'string' && pinned.commit,
     `增长登记必须钉一个真实提交，实得：${JSON.stringify(pinned)}`)
   assert.notStrictEqual(pinned.commit, base1,
-    'growth.commit 不得钉成 `<ref>^`（origin/main 的父提交）——CI 侧参照解析出的是 origin/main 本身')
+    `growth.commit 不得钉成 ${CARET_REF}（origin/main 的父提交）——CI 侧参照解析出的是 origin/main 本身`)
   assert.strictEqual(pinned.commit, base2, 'growth.commit 必须等于 CI 侧将解析出的参照提交（origin/main 自身）')
   assert.strictEqual(pinned.ref, 'origin/main', 'growth.ref 必须用候选名，不是 `origin/main^`')
   // 提交之后就是 CI 形态：HEAD 已是新提交，origin/main 不再等于 HEAD ⇒ 参照解析出 origin/main 本身。

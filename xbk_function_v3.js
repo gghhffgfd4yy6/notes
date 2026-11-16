@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.473 — S0 r30：堵反回归闸的两个绕过口（① 多实参字符串化 JSON.stringify(src,null,2)/String(src,"") 此前按单参守卫 0 命中；② 顶层源码变量声明顺序——const 写在其后时 function 里的 includes 0 命中 exit 0）＋ growth 登记改钉参照候选本身（不再钉 `<ref>^`，否则提交后 CI 判定「基线被抬高」）＋ 自测行号边界；白名单 2404 原地不动（扫描面内 0 增量，面外告警 23→24 条），测试断言本体一条未改、生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.474 — S0 r31：收两条 Codacy no-unsanitized 文案误报（同一根因：用例标题传给 check()、断言消息传给 assert.notStrictEqual() 时，文案里那串「角括号 ref 引用」被当成 HTML 标签）——照 r10 先例改为运行期拼接（String.fromCharCode(60) / String.fromCharCode(96) + 字面量），于是文件内不再出现标签形状的字面量，而拼出的标题与消息与原值逐字节相同；断言逻辑与判据未动、scripts/ 与 .codacy.yml 未动、生产逻辑一行未改，白名单 2404 原地不动（扫描面内 0 增量） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
