@@ -10,6 +10,10 @@
  * 扫描面（v3.463 收窄）：**只扫测试面**——仓库根 `test_*.js`、`test/**`、`test_support/**` 的
  * .js/.cjs/.mjs。scripts/ 与生产 .js 不在扫描面：那是被测系统，把「读缓存/日志后做字符串判定」冻进
  * 基线会让任何生产改动都误红，也与「测试断言」这个口径不是一回事。
+ * 成功文案因此只声称「**扫描面内**未新增」，并在下一行点名扫描面与 scripts/ 不在面内；被测试面
+ * require 的面外文件若含源码文本比对，会以「⚠️ 扫描面外未入账」逐条点名（只告警、不判红、不进基线）
+ * ——「没在扫描面里看见」不得读成「没有」（r26-B1：把断言写进 scripts/test-helpers.js 实测 0 增量
+ * exit 0 并打印过一句无条件的 ✅）。
  *
  * 检测面（5 种形状，形状 = 源码文本怎么走到比对点）：
  *   ① 直接：`assert.ok(src.includes('字面量'))`——receiver 由 `readFileSync`/`codeOf`/… 得到
@@ -29,12 +33,22 @@
  *      `const checkYml = (t) => { assert.ok(t.includes('X')) }` 之后 `checkYml(src)`——形参在调用点
  *      收到源码文本，函数体里的比对点按其调用点入账（形参名不参与判定，看的是实参的数据流）。
  *      **声明顺序不影响**：function 声明在 JS 里是提升的，调用点写在声明之前（断言在文件头、helper
- *      在文件尾）同样入账——三遍遍历共享 funcs/helpers 两张表并跨遍累积（r25-A：旧实现三遍各自
- *      `newScope(null)`，这种写法整条链静默 0 命中、闸门照绿）。
+ *      在文件尾）同样入账——准备遍**共享 funcs/helpers 两张表并跑到收敛**（见下），记录遍再跑一次
+ *      （r25-A：旧实现三遍各自 `newScope(null)`，这种写法整条链静默 0 命中、闸门照绿）。
  *      形参与返回值两条路在这里**交汇**：helper 的返回值若由收到源码文本的形参切片/拼接而来
  *      （`function jobBlock (workflowText) { return workflowText.split('\n').slice(a, b).join('\n') }`
  *      之后 `jobBlock(src).includes('…')`），调用点同样入账——只对着外层作用域判返回值时形参不可见，
  *      这类 helper 会整条链漏掉（r25-A 在 test_ci_skip_suites.js:360 的真实复现即此）。
+ *      准备遍**跑到收敛**（r26-A2）：每遍只增不减、事实总量不再变化即停（上界 6 遍只是防跑飞）。
+ *      固定 2 遍时两跳 pass-through helper 会断链——内层 helper 的形参种子要等外层 helper 的函数体
+ *      被遍历时才产生，而外层 helper 的判定在同一遍里已先做过 ⇒ `assert.ok(jobBlock(src).includes('X'))`
+ *      写在两个 function 之前实测 0 命中 exit 0，而单跳或声明在前都是 +1 exit 1（同一份事实因声明
+ *      顺序得到两种结论）。收敛只让这两类**既有**事实传播到位，不放宽任何判据。
+ *      **逐元素回调**（r26-A1）同属这条数据流：receiver 是源码文本派生的数组时（`src.split('\n')`、
+ *      上游 map 的结果），`some/forEach/find/findIndex/every/filter/map/flatMap/reduce` 的**元素形参**
+ *      就是源码文本的一个元素——`lines.some((l) => l.includes('X'))` 与 `src.includes('X')` 同一口径
+ *      （旧实现只判 receiver ⇒ 整条 0 命中）；`reduce` 的首形参是累加器（由元素累积而来）同样登记。
+ *      普通字面量数组（`['a','b'].some((n) => …)`）上的同名回调不计。
  *   异步读取整条链同样在检测面内：`const s = await fs.promises.readFile(f, 'utf8')` 后 `s.includes('…')`
  *   （AwaitExpression / ChainExpression 往下追一层），以及回调式
  *   `fs.readFile(f, 'utf8', (e, data) => assert.ok(data.includes('…')))`（readFile 的回调签名是
@@ -59,7 +73,11 @@
  *   `{ "schema": 3, "total": N, "by_file": { "test_console.js": 1763, … } }`
  * ——「每个测试文件还剩多少条断言要改」。锚点/行号只是**内部定位信息**，命中时用于打印行，不进基线。
  * 判据：某文件实测条数 > 基线 → exit 1 并点名「文件 / 基线 / 实测 / 增量」；基线里没有的文件实测
- * 有条目 → exit 1（新文件按 0 算）；条数下降允许（按文件报 shortfall，供每个包对账）。
+ * 有条目 → exit 1（新文件按 0 算）；条数下降允许（按文件报 shortfall，供每个包对账）；
+ * **基线里的每个文件都必须还在本次扫描面清单里**，否则 exit 1 点名「基线文件不在扫描面」——
+ * 某个已入账文件整份消失 / 被 mv 出扫描面时只走 shortfall 会让它整份脱保而闸门照绿
+ * （r26-B2 实测：3/3 条脱保仍打印「ℹ️ 基线下降」+「✅ 未新增」exit 0）。重命名 / 删除必须显式
+ * `--write-allowlist`（增长仍走 `--allow-growth`）。
  * `total` 必须等于 `by_file` 各值之和，否则 exit 2（手改一个数字而不改另一个，是唯一能静默放宽
  * 基线的写法，必须在读入时就拒掉）。
  *
@@ -110,6 +128,10 @@
  *      另一文件——形参传播只认本文件里、形参是裸标识符、且调用点实参已判定为源码文本的情形
  *      （两级链最多一次回溯；更深的传递只按已见的一级入账）。
  *   9. 非 .js 测试夹具 / 运行时拼出来的文件名：扫描面按目录与扩展名枚举，运行期生成的测试文件不入账。
+ *  10. `for (const line of lines)` 逐元素绑定 / 解构的元素形参：只认数组方法（some/forEach/…）的
+ *      **裸标识符**形参，for-of 与下标循环的绑定不入账（`for (const l of src.split('\n')) { if
+ *      (l.includes('X')) … }` 记 0 条）；回调形参写成解构（`lines.forEach(([, line]) => …)`）同样
+ *      不入账——与第 8 条同一取舍（形参传播只认裸标识符）。
  *
  * 与 plan 的 857 的差额（不编数，逐项如实）：857 是 v3.442 起草时那版**文件级正则**的实测值
  * （变量名按整文件认，只认 includes/indexOf/startsWith/match），本口径是作用域感知的 AST 判定且含
@@ -117,7 +139,7 @@
  * 链式 reader（map/filter/flatMap）与同文件 helper 形参接进检测面后，test_console.js 从 374 涨到
  * 真实值（旧口径把 fixture/lock/日志的 .includes 也算进同名变量），**这不是债变多，是尺子变准**。
  *
- * 退出码：0 无新增 / 1 有新增（某文件超基线、新文件、或基线相对参照被抬高）/
+ * 退出码：0 无新增 / 1 有新增（某文件超基线、新文件、基线相对参照被抬高、或基线文件已不在扫描面）/
  *         2 基线读不出、基线自相矛盾、扫描失败、参照不可得（CI 或显式给出）或用法错误。
  *
  * 用法：
@@ -166,6 +188,14 @@ const CHAIN_METHODS = new Set([
 ])
 // 元素级链式方法：`FILES.map((f) => readFileSync(f, 'utf8'))` 的源码文本性来自回调的返回值。
 const ARRAY_CHAIN_METHODS = new Set(['map', 'filter', 'flatMap'])
+// 逐元素回调：receiver 是**源码文本派生的数组**（`src.split('\n')`、上游 map 的结果）时，回调的
+// 元素形参就是源码文本的一个元素 —— `lines.some((l) => l.includes('X'))` 与 `src.includes('X')`
+// 是同一件事。只看 receiver 会让整条记 0 条（r26-A1：`readFileSync→split→some(l=>l.includes)`
+// 实测 0 增量 exit 0，而同一断言写成 `s.includes` 就 +1 exit 1；本仓既有形态
+// test_ci_skip_suites.js 的 `guardLines.some((l) => l.includes(…))`）。
+// reduce 的首形参是**累加器**：它由源码文本元素累积而来，同样按源码文本登记（否则
+// `lines.reduce((acc, l) => acc.includes('X'), '')` 照样漏）。
+const ELEMENT_CALLBACK_METHODS = new Set(['some', 'forEach', 'find', 'findIndex', 'every', 'filter', 'map', 'flatMap', 'reduce'])
 // 不可冻结的锚点（变量 / 表 / 带插值模板 / 动态 RegExp）。它必须**计入**：把字面量提成常量
 // 不得让整条断言从检测面上消失（否则是一条零成本绕过路径）。
 const DYNAMIC = '<dynamic>'
@@ -191,6 +221,16 @@ function parseAst (code, file) {
   } catch (e) {
     // 解析失败必须响亮（exit 2）：静默返回空集合会让该文件的断言全部「消失」而闸门照绿。
     die(2, `扫描失败：无法解析 ${file}：${e.message}`)
+  }
+}
+
+// 非致命的解析（只给「扫描面外告警」用）：解析不了返回 null ⇒ 跳过该候选。
+// 扫描面**内**的文件仍走 parseAst 的 fail-closed（读不懂就是闸门坏了）。
+function parseAstOrNull (code) {
+  try {
+    return acorn.parse(code, { ecmaVersion: 'latest', allowHashBang: true, locations: true })
+  } catch {
+    return null
   }
 }
 
@@ -230,7 +270,11 @@ const isTemplateWithExpr = (node) => !!node && node.type === 'TemplateLiteral' &
  *           funcs:<名字→函数节点（供调用点污染）> }
  */
 function analyzeFile (code, file) {
-  const ast = parseAst(code, file)
+  return analyzeAst(parseAst(code, file), file)
+}
+
+// AST 已经是解析结果（scanAll 里 parse 一次供「命中的数据流分析」与「相对 require 枚举」共用）。
+function analyzeAst (ast, file) {
   const hits = []
   // 同文件 helper 的形参污染：fnNode → 在调用点收到「源码文本」实参的形参名集合。
   // 为什么要跨遍收集：调用点可能在函数声明之前（提升），一遍走完才知道全部实参。
@@ -490,6 +534,23 @@ function analyzeFile (code, file) {
     return data.type === 'Identifier' ? { cb, data } : null
   }
 
+  // 逐元素回调（r26-A1）：receiver 是源码文本派生的数组 ⇒ 回调的元素形参是源码文本的一个元素。
+  //   · `src.split('\n')` / 上游 `map` 的结果都已被 isSource 判成源码文本，这里只判 receiver；
+  //   · some/forEach/find/findIndex/every/filter/map/flatMap 的元素形参是 params[0]；
+  //   · reduce 是 (acc, element)：两个都登记（累加器由元素累积而来，按源码文本算）。
+  // 只登记**裸标识符形参**：解构形参（`([, line]) => …`）落在 known-uncovered 8。
+  function elementCallback (node, scope) {
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression' || node.callee.computed) return null
+    const tail = calleeTail(node.callee)
+    if (!tail || !ELEMENT_CALLBACK_METHODS.has(tail)) return null
+    if (!isSource(node.callee.object, scope)) return null
+    const cb = node.arguments.find((arg) => isFunction(arg))
+    if (!cb) return null
+    const wanted = tail === 'reduce' ? [cb.params[0], cb.params[1]] : [cb.params[0]]
+    const names = wanted.filter((param) => !!param && param.type === 'Identifier').map((param) => param.name)
+    return names.length ? { cb, names } : null
+  }
+
   // 函数自身作用域 + 形参污染：调用点已证明某个形参收到源码文本 ⇒ 在该作用域里把形参登记为源码文本
   // （`const checkYml = (t) => t.includes('X')` 再 `checkYml(src)` 必须入账）。
   function functionScope (fn, scope) {
@@ -530,12 +591,32 @@ function analyzeFile (code, file) {
 
     const callback = sourceCallback(node)
     if (callback) {
+      // receiver 也要走一遍：早退分支不会进入通用递归，漏掉它会让 `readSrc(f).split(…, cb)` 的
+      // receiver 里的比对点整条消失（这里 receiver 是调用表达式，可能自带命中）。
+      visit(node.callee.object, scope)
       node.arguments.forEach((arg) => { if (arg !== callback.cb) visit(arg, scope) })
       const inner = newScope(scope)
       inner.vars.add(callback.data.name)
       inner.paramSources.add(callback.data.name)
       if (callback.cb.body.type === 'BlockStatement') callback.cb.body.body.forEach((stmt) => visit(stmt, inner))
       else visit(callback.cb.body, inner)
+      return
+    }
+
+    // 逐元素回调（r26-A1）：`lines.some((l) => l.includes('X'))` —— lines 由 readFileSync→split 派生时，
+    // 回调形参 l 是源码文本的一个元素，函数体里的比对点按 ⑤ 入账（与 `src.includes('X')` 同一件事）。
+    // 与 sourceCallback 同样的早退形态：receiver 用外层作用域走一遍，回调体用「形参被种入」的内层作用域。
+    const element = elementCallback(node, scope)
+    if (element) {
+      visit(node.callee.object, scope)
+      node.arguments.forEach((arg) => { if (arg !== element.cb) visit(arg, scope) })
+      const inner = newScope(scope)
+      for (const name of element.names) {
+        inner.vars.add(name)
+        inner.paramSources.add(name)
+      }
+      if (element.cb.body.type === 'BlockStatement') element.cb.body.body.forEach((stmt) => visit(stmt, inner))
+      else visit(element.cb.body, inner)
       return
     }
 
@@ -613,13 +694,29 @@ function analyzeFile (code, file) {
     }
   }
 
-  // 三遍：① 收集调用点污染；② 带上①的种子再收集一遍（helper 链两级）；③ 记录命中。
-  // 前两遍不记录，只为让「形参收到源码文本」这个事实先于记录成立（调用点可能在定义之前）。
-  // funcs/helpers 三遍共用（见 scopeFor）：否则「调用点在前、function 声明在后」这种提升写法在
-  // 记录遍仍看到空表 —— r25-A 实测 total=0 / exit 0。
-  for (let pass = 0; pass < 2; pass++) {
+  // 准备遍跑到**收敛**（只增不减），最后再记录命中：
+  //   · 每遍只新增事实（sourceParams 里的形参名、funcs/helpers 的登记），从不删除 ⇒ 单调收敛；
+  //   · 本遍结束时的「事实总量」与上一遍相同 ⇒ 已到固定点，停（下界 1 遍、上界 6 遍）；
+  //   · 上界只是防跑飞，不是判据：两跳 pass-through helper + 任意声明顺序实测 3 遍到位（r26-A2）。
+  // 为什么必须收敛而不是固定 2 遍：内层 helper 的形参种子要等外层 helper 的函数体被遍历时才产生，
+  // 而外层 helper 的判定在同一遍里已先做过 ⇒ 两跳链在内层断掉，记录遍仍然看不见（实测
+  // `jobBlock(src) → sliceBlock(text)` + 调用点写在两个 function 之前 = 0 命中 exit 0，而单跳或
+  // 声明在前都是 +1 exit 1——同一份事实因为声明顺序得到两种结论，与文件头「声明顺序不影响」相反）。
+  // 收敛不放松任何判据：它只让「形参收到源码文本 / 某函数返回源码文本」这两类**既有**事实传播到位。
+  const MAX_PREPARE_PASSES = 6
+  const factsSize = () => {
+    let size = 0
+    for (const params of sourceParams.values()) size += params.size
+    for (const facts of hoistFacts.values()) size += facts.funcs.size + facts.helpers.size
+    return size
+  }
+  let observed = -1
+  for (let pass = 0; pass < MAX_PREPARE_PASSES; pass++) {
     const scope = scopeFor(ast, null)
     ast.body.forEach((stmt) => visit(stmt, scope))
+    const size = factsSize()
+    if (size === observed) break
+    observed = size
   }
   recording = true
   const root = scopeFor(ast, null)
@@ -630,6 +727,10 @@ function analyzeFile (code, file) {
 /* ── 扫描面：只扫测试面 ──────────────────────────────────────────────────── */
 const SCAN_SKIP = new Set(['node_modules', '.git', '.stryker-tmp', '.nyc_output', 'coverage', 'reports'])
 const SCAN_DIRS = ['test', 'test_support']
+// 成功文案与告警都必须点名扫描面：`scripts/` 下的公共层（scripts/test-harness.js 这类被测试
+// require 的 helper）不在面内，那里的断言**不入账、也不拦**。只说「未新增」而不限定「扫描面内」
+// 是过度表述——r26-B1 的反例就是把断言写进 scripts/test-helpers.js：0 增量 exit 0 并打印 ✅。
+const SCAN_FACE_NOTE = '扫描面 = 仓库根 test_*.js + test/** + test_support/**；scripts/ 与生产 .js 不在扫描面内'
 
 function listTestFiles () {
   const files = []
@@ -657,11 +758,85 @@ function listTestFiles () {
 
 function scanAll () {
   const hits = []
-  for (const rel of listTestFiles()) {
+  const requires = []
+  const files = listTestFiles()
+  for (const rel of files) {
     const code = fs.readFileSync(path.join(ROOT, rel), 'utf8') // nosemgrep（rel 来自本文件枚举出的测试面）
-    hits.push(...analyzeFile(code, rel))
+    const ast = parseAst(code, rel)
+    hits.push(...analyzeAst(ast, rel))
+    // 同一棵 AST 里顺手收集相对 require：供「断言落在扫描面外」的告警用（只读，不影响判定）。
+    for (const spec of relativeRequires(ast)) requires.push({ from: rel, spec })
   }
-  return hits
+  return { files, hits, requires }
+}
+
+/* ── 扫描面外告警（r26-B1）：只告警、不判红、不进基线 ─────────────────────── */
+// 相对 require 的字面量：`require('./scripts/x')` / `require("./test_support/y")`。
+function relativeRequires (ast) {
+  const specs = new Set()
+  const walk = (node) => {
+    if (!node || typeof node.type !== 'string') return
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'require' &&
+      node.arguments.length === 1 && node.arguments[0].type === 'Literal' &&
+      typeof node.arguments[0].value === 'string' && node.arguments[0].value.startsWith('.')) {
+      specs.add(node.arguments[0].value)
+    }
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end') continue
+      const child = node[key]
+      if (Array.isArray(child)) child.forEach(walk)
+      else if (child && typeof child.type === 'string') walk(child)
+    }
+  }
+  walk(ast)
+  return specs
+}
+
+// require('./x') → 仓内相对路径（.js/.cjs/.mjs/index.js 四种候选，与 node 的解析顺序近似）。
+// 只认 JS 扩展名：`require('./package.json')` 这类 JSON/资源 require 不是断言载体，
+// 交给 analyzeFile 解析会当场 die(2)——告警路径不得让闸门崩。
+// 解析不到（包名 / 目录 require / 仓外路径）返回 null：告警宁可少报也不猜。
+function resolveLocalModule (fromRel, spec) {
+  const base = path.resolve(ROOT, path.dirname(fromRel), spec)
+  for (const suffix of ['', '.js', '.cjs', '.mjs', '/index.js']) {
+    const candidate = base + suffix
+    const rel = path.relative(ROOT, candidate).split(path.sep).join('/')
+    if (!rel || rel.startsWith('..') || !JS_FILE_RE.test(rel)) continue
+    try {
+      if (fs.statSync(candidate).isFile()) return rel // nosemgrep（candidate = ROOT + 扫描面内文件的相对 require 字面量）
+    } catch { /* 该候选不存在：试下一个后缀 */ }
+  }
+  return null
+}
+
+// 扫描面外的候选文件：被测试面相对 require、且不在扫描面内。对每个候选跑同一个数据流分析，
+// 命中数 > 0 就返回一行（文件 / 条数 / 谁 require 的）。解析不了的候选跳过（告警不能反过来打死闸门）。
+function outOfFaceSuspects (files, requires) {
+  const face = new Set(files)
+  const fromByTarget = new Map()
+  for (const { from, spec } of requires) {
+    const target = resolveLocalModule(from, spec)
+    if (!target || face.has(target)) continue
+    if (!fromByTarget.has(target)) fromByTarget.set(target, new Set())
+    fromByTarget.get(target).add(from)
+  }
+  const rows = []
+  const grouped = new Map([...fromByTarget].map(([file, set]) => [file, [...set].sort()]))
+  for (const [rel, froms] of sortedByFile(grouped)) {
+    let hits
+    try {
+      // rel = 本文件枚举出来的仓内相对路径
+      const code = fs.readFileSync(path.join(ROOT, rel), 'utf8') // nosemgrep（rel 来自仓内相对 require 的解析结果）
+      // 解析失败只跳过、**不** die(2)：告警路径上「这个面外文件解析不了」不该把门禁打死。
+      const ast = parseAstOrNull(code)
+      if (!ast) continue
+      hits = analyzeAst(ast, rel)
+    } catch {
+      continue // 读不了：告警跳过（这条路径不得让闸门本身崩）
+    }
+    if (hits.length) rows.push({ file: rel, hits: hits.length, from: froms, helper: rel.startsWith('scripts/') })
+  }
+  return rows
 }
 
 /* ── 基线 ────────────────────────────────────────────────────────────────── */
@@ -1045,19 +1220,30 @@ function printByFile (title, map) {
   for (const [file, count] of sortedByFile(map)) console.log(`  ${file}\t${count}`)
 }
 
-function compare (hits, baseline) {
+// 判据：① 某文件实测 > 基线 ⇒ 违规；② 条数下降 ⇒ shortfall（本批逐包收敛的对账口径）；
+// ③ **基线里的文件必须还在扫描面里**（r26-B2）：某个已入账文件整份消失 / 被 mv 出扫描面时，
+// 只走 shortfall 会打印「ℹ️ 基线下降」+「✅ 未新增」（r26 实测：整份脱保仍全绿）——
+// 「删白名单了事」的机械形态。重命名 / 删除必须显式 `--write-allowlist`。
+// 第三项只在给出 scannedFiles 时才判（默认不判，保持既有调用方的语义）。
+function compare (hits, baseline, scannedFiles = null) {
   const measured = perFile(hits)
+  const face = scannedFiles ? new Set(scannedFiles) : null
   const violations = []
   for (const [file, count] of sortedByFile(measured)) {
     const allowed = isCount(baseline.by_file[file]) ? baseline.by_file[file] : 0
     if (count > allowed) violations.push({ file, allowed, count, delta: count - allowed })
   }
   const shortfalls = []
+  const missing = []
   for (const [file, allowed] of sortedByFile(new Map(Object.entries(baseline.by_file)))) {
     const count = measured.get(file) || 0
+    if (face && !face.has(file)) {
+      missing.push({ file, allowed })
+      continue
+    }
     if (count < allowed) shortfalls.push({ file, allowed, count, delta: allowed - count })
   }
-  return { measured, violations, shortfalls }
+  return { measured, violations, shortfalls, missing }
 }
 
 function renderBaseline (hits) {
@@ -1101,7 +1287,8 @@ function parseArgv (argv) {
 
 function main () {
   const flags = parseArgv(process.argv.slice(2))
-  const hits = scanAll()
+  const scan = scanAll()
+  const hits = scan.hits
 
   if (flags.write) {
     const next = renderBaseline(hits)
@@ -1146,10 +1333,18 @@ function main () {
 
   const baseline = readBaseline()
   console.log(`源码文本断言：基线 total=${baseline.total}（${Object.keys(baseline.by_file).length} 个文件）` +
-    `，实测 total=${hits.length}（扫描 ${listTestFiles().length} 个测试面文件）`)
+    `，实测 total=${hits.length}（扫描 ${scan.files.length} 个测试面文件）`)
   const measured = perFile(hits)
   verifyGrowthAgainstReference(baseline, flags, measured)
-  const { violations, shortfalls } = compare(hits, baseline)
+  const { violations, shortfalls, missing } = compare(hits, baseline, scan.files)
+  // 基线里的文件不在扫描面（r26-B2）：整份脱保，必须响亮，不得混进「基线下降」里当正常收敛。
+  if (missing.length) {
+    console.error(`❌ 基线文件不在扫描面（${missing.reduce((n, m) => n + m.allowed, 0)} 条整份脱保）：`)
+    for (const row of missing) console.error(`  ${row.file}  基线 ${row.allowed} 条，但本次扫描面里没有这个文件`)
+    console.error(`${SCAN_FACE_NOTE}。文件被删除 / 改名 / 搬出扫描面时必须显式重生成基线：` +
+      'node scripts/check-source-text-asserts.js --write-allowlist（增长走 --allow-growth，下降随基线 diff 留痕）。')
+    process.exit(1)
+  }
   if (violations.length) {
     console.error(`❌ 新增 ${violations.reduce((n, v) => n + v.delta, 0)} 条源码文本断言（禁止）：`)
     for (const v of violations) console.error(`  ${v.file}  基线 ${v.allowed} / 实测 ${v.count} / +${v.delta}`)
@@ -1167,8 +1362,22 @@ function main () {
     process.exit(1)
   }
   if (shortfalls.length) printByFile('ℹ️ 基线下降（本批已处理，逐文件 shortfall）：', new Map(shortfalls.map((s) => [s.file, s.delta])))
-  if (measured.size === 0) console.log('（测试面里没有命中任何源码文本断言）')
-  console.log('✅ 未新增源码文本断言（逐文件计数均未超基线）')
+  if (measured.size === 0) console.log('（扫描面内没有命中任何源码文本断言）')
+  // 扫描面外告警（r26-B1）：把断言写进 scripts/ 下被 test_*.js require 的 helper 时，闸门看不见——
+  // 但「没在扫描面里看见」不能读成「没有」。这里逐条点名（只告警，不判红、不进基线）。
+  const outside = outOfFaceSuspects(scan.files, scan.requires)
+  if (outside.length) {
+    console.log(`⚠️ 扫描面外未入账：${outside.reduce((n, row) => n + row.hits, 0)} 条源码文本比对落在` +
+      '「被测试面 require、但不在扫描面内」的文件里（不入账、也不拦）：')
+    for (const row of outside.slice(0, 10)) {
+      const kind = row.helper ? '测试公共层' : '非测试公共层（生产/运行器）'
+      console.log(`  ${row.file}  ${row.hits} 条（${kind}；被 ${row.from.join('、')} require）`)
+    }
+    if (outside.length > 10) console.log(`  ……另有 ${outside.length - 10} 个文件不在上面列出`)
+  }
+  // 成功文案只声称「扫描面内」：扫描面是测试面，scripts/ 下的公共层不在面内（上面已逐条点名）。
+  console.log('✅ 扫描面内未新增源码文本断言（逐文件计数均未超基线）')
+  console.log(`   ${SCAN_FACE_NOTE}${outside.length ? '；上面列出的面外比对不入账（scripts/ 下的测试公共层要写断言请放回测试面）' : '（本轮面外候选里 0 条）'}。`)
 }
 
 module.exports = { analyzeFile, compare, renderBaseline, listTestFiles, SHAPE_LABEL, DYNAMIC }

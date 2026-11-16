@@ -919,6 +919,184 @@ check('--write-allowlist 能从旧 schema / 损坏 JSON 重生成；门禁路径
   assert.strictEqual(strict.code, 2, `门禁读不出旧基线必须 exit 2，实得 ${strict.code}\n${strict.out}${strict.err}`)
 })
 
+/* ── r26：逐元素回调 / 两跳收敛 / 扫描面表述 / 基线文件脱保 ───────────────── */
+
+// r26-A1：`readFileSync → split → lines.some(l => l.includes('X'))` 与 `src.includes('X')` 是同一件事。
+// 旧实现只判 receiver，逐元素回调的形参从未被登记 ⇒ 整条 0 命中 exit 0（同一断言改写直写就 +1）。
+check('逐元素回调：lines.some/forEach/find/findIndex/every/filter/map/flatMap/reduce 的元素形参都必须入账', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_element.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'const lines = src.split("\\n")',
+    'const names = ["a", "b"]',
+    'assert.ok(lines.some((l) => l.includes("E_SOME")))',
+    'lines.forEach((l) => assert.ok(l.startsWith("E_FOR_EACH")))',
+    'assert.ok(lines.find((l) => l === "E_FIND"))',
+    'assert.ok(lines.findIndex((l) => l.includes("E_FIND_INDEX")) >= 0)',
+    'assert.ok(lines.every((l) => l.includes("E_EVERY")))',
+    'assert.ok(lines.filter((l) => l.includes("E_FILTER")).length === 1)',
+    'assert.ok(lines.map((l) => l.includes("E_MAP")).length === 1)',
+    'assert.ok(lines.flatMap((l) => [l.includes("E_FLAT_MAP")]).length === 1)',
+    'assert.ok(lines.reduce((acc, l) => acc.includes("E_REDUCE"), ""))',
+    'assert.ok(names.some((n) => n.includes("NOT_A_SOURCE_ARRAY")))',
+    ''
+  ].join('\n'))
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const r = runGate(ws)
+  assert.strictEqual(r.code, 1,
+    `逐元素回调必须 exit 1（旧实现 0 命中、exit 0），实得 ${r.code}\n${r.out}${r.err}`)
+  // 9 条：some / forEach / find / findIndex / every / filter / map / flatMap / reduce（acc 与元素各算一条路，
+  // 但 reduce 这一行只比对 acc 一次 ⇒ 1 条）。`names` 不是源码文本派生的数组 ⇒ 最后一行不计。
+  assert.ok(r.err.includes('test_element.js  基线 0 / 实测 9 / +9'),
+    `9 条逐元素回调（非源码数组上的 some 不计），实得：\n${r.err}`)
+  assert.match(r.err, /test_element\.js:7 .*E_SOME.*（⑤helper 源码\/形参）/, `some 回调必须入账，实得：\n${r.err}`)
+  assert.match(r.err, /test_element\.js:8 .*E_FOR_EACH/, `forEach 回调必须入账，实得：\n${r.err}`)
+  assert.match(r.err, /test_element\.js:15 .*E_REDUCE/, `reduce 的累加器形参必须按源码文本入账，实得：\n${r.err}`)
+  assert.ok(!r.err.includes('NOT_A_SOURCE_ARRAY'), `不是源码文本派生的数组不得入账，实得：\n${r.err}`)
+})
+
+// r26-A2：两跳 pass-through helper + 调用点写在两个 function 声明之前。旧实现只跑 2 遍准备遍，
+// 内层 helper 的形参种子要等外层函数体被遍历时才产生，而外层 helper 的判定在同一遍已先做过 ⇒ 链断、
+// 0 命中 exit 0（单跳或声明在前都是 +1 exit 1：同一份事实因为声明顺序得到两种结论）。
+check('两跳 helper + 声明提升：调用在前 / 声明在前 / 三跳结论一致（收敛到固定点，不放宽判据）', () => {
+  const ws = makeWorkspace()
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const callFirst = [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'assert.ok(jobBlock(src).includes("TWO_LEVEL_MARK"))',
+    'function sliceBlock (text) { return text.split("\\n").slice(0, 3).join("\\n") }',
+    'function jobBlock (text) { return sliceBlock(text) }',
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_two_level.js', callFirst)
+  const red = runGate(ws)
+  assert.strictEqual(red.code, 1,
+    `两跳 + 调用点在前必须 exit 1（旧实现 0 命中、exit 0），实得 ${red.code}\n${red.out}${red.err}`)
+  assert.ok(red.err.includes('test_two_level.js  基线 0 / 实测 1 / +1'), `必须点名该文件 +1，实得：\n${red.err}`)
+  assert.match(red.err, /test_two_level\.js:5 .*（⑤helper 源码\/形参）/, `必须标出形状⑤与命中行，实得：\n${red.err}`)
+  // 对照组：把两个 function 声明移到调用点之前，结论必须完全相同（声明顺序不是判据）。
+  writeFile(ws, 'test_two_level.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'function sliceBlock (text) { return text.split("\\n").slice(0, 3).join("\\n") }',
+    'function jobBlock (text) { return sliceBlock(text) }',
+    'assert.ok(jobBlock(src).includes("TWO_LEVEL_MARK"))',
+    ''
+  ].join('\n'))
+  const declFirst = runGate(ws)
+  assert.strictEqual(declFirst.code, 1, `声明在前同样必须红，实得 ${declFirst.code}\n${declFirst.out}${declFirst.err}`)
+  assert.ok(declFirst.err.includes('test_two_level.js  基线 0 / 实测 1 / +1'), `声明在前必须同样 +1，实得：\n${declFirst.err}`)
+  // 三跳：收敛不是「只多一遍」的补丁，链更长时同样成立。
+  writeFile(ws, 'test_two_level.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'assert.ok(thirdHop(src).includes("THREE_LEVEL_MARK"))',
+    'function sliceBlock (text) { return text.split("\\n").slice(0, 3).join("\\n") }',
+    'function jobBlock (text) { return sliceBlock(text) }',
+    'function thirdHop (text) { return jobBlock(text) }',
+    ''
+  ].join('\n'))
+  const third = runGate(ws)
+  assert.strictEqual(third.code, 1, `三跳 + 调用在前必须 exit 1，实得 ${third.code}\n${third.out}${third.err}`)
+  assert.ok(third.err.includes('test_two_level.js  基线 0 / 实测 1 / +1'), `三跳必须 +1，实得：\n${third.err}`)
+  // 反向：同样两跳，但实参不是源码文本 ⇒ 不得入账（收敛只让既有事实传播到位，不新造事实）。
+  writeFile(ws, 'test_two_level.js', [
+    '"use strict"',
+    'const assert = require("node:assert")',
+    'assert.ok(jobBlock("不是文件内容").includes("TWO_LEVEL_MARK"))',
+    'function sliceBlock (text) { return text.split("\\n").slice(0, 3).join("\\n") }',
+    'function jobBlock (text) { return sliceBlock(text) }',
+    ''
+  ].join('\n'))
+  const green = runGate(ws)
+  assert.strictEqual(green.code, 0, `实参不是源码文本时两跳链也不得入账，实得：\n${green.out}${green.err}`)
+})
+
+// r26-B1：扫描面只到测试面，`scripts/` 下被 test_*.js require 的公共层不在面内。成功文案必须限定
+// 「扫描面内」并点名 scripts/ 不在面内；面外候选里的比对要逐条点名（旧实现只印一句无条件的 ✅）。
+check('扫描面表述：scripts/ helper 里的断言必须告警且成功文案限定「扫描面内」（不得裸 ✅）', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'scripts/test-helpers.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'function assertHasMarker () {',
+    '  const src = fs.readFileSync("scripts/console.js", "utf8")',
+    '  assert.ok(src.includes("OUT_OF_FACE_MARK"))',
+    '}',
+    'module.exports = { assertHasMarker }',
+    ''
+  ].join('\n'))
+  writeFile(ws, 'test_cli.js', '"use strict"\nrequire("./scripts/test-helpers").assertHasMarker()\n')
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const r = runGate(ws)
+  // 不入账仍然是 exit 0（扫描面是既定取舍），但输出必须说清「面外」：
+  assert.strictEqual(r.code, 0, `扫描面外的 helper 不入账（exit 0），实得 ${r.code}\n${r.out}${r.err}`)
+  assert.ok(r.out.includes('扫描面'), `成功文案必须点名扫描面，实得：\n${r.out}`)
+  assert.ok(r.out.includes('scripts/ 与生产 .js 不在扫描面内'), `必须点名 scripts/ 不在面内，实得：\n${r.out}`)
+  assert.ok(r.out.includes('scripts/test-helpers.js'), `面外候选里的断言必须逐条点名，实得：\n${r.out}`)
+  // 不得出现裸 ✅：每一行 ✅ 都必须带「扫描面」限定语。
+  for (const line of r.out.split('\n')) {
+    if (!line.includes('✅')) continue
+    assert.ok(line.includes('扫描面'), `不得出现不带「扫描面」限定语的 ✅，实得该行：${line}`)
+  }
+  // 对照组：同一条断言写进 test_cli.js 本体（扫描面内）⇒ 必须红并点名。
+  writeFile(ws, 'test_cli.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'assert.ok(src.includes("IN_FACE_MARK"))',
+    ''
+  ].join('\n'))
+  const inFace = runGate(ws)
+  assert.strictEqual(inFace.code, 1, `扫描面内必须红，实得 ${inFace.code}\n${inFace.out}${inFace.err}`)
+  assert.ok(inFace.err.includes('test_cli.js  基线 0 / 实测 1 / +1'), `必须点名扫描面内的文件，实得：\n${inFace.err}`)
+})
+
+// r26-B2：基线里的每个 key 必须与本次扫描面文件清单对一遍。某个已入账文件整份消失 / 被 mv 出扫描面时，
+// 旧实现只走 shortfall：打印「ℹ️ 基线下降」+「✅ 未新增」exit 0 ——「删白名单了事」的机械形态。
+check('基线文件不在扫描面：mv test_console.js 到 scripts/ 必须 exit 1 并点名（重命名须显式 --write-allowlist）', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_console.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'assert.ok(src.includes("MOVED_OUT_MARK"))',
+    ''
+  ].join('\n'))
+  writeFile(ws, 'test_status.js', '"use strict"\nassert.strictEqual(1, 1)\n')
+  writeBaseline(ws, { schema: 3, total: 1, by_file: { 'test_console.js': 1 } })
+  const before = runGate(ws)
+  assert.strictEqual(before.code, 0, `搬走之前必须绿，实得 ${before.code}\n${before.out}${before.err}`)
+  // 搬出扫描面（scripts/ 不入账）：基线里那 1 条整份脱保，必须响亮。
+  fs.renameSync(path.join(ws, 'test_console.js'), path.join(ws, 'scripts', 'console_copy.js')) // nosemgrep（两端都在 mkdtemp 工作区内）
+  const moved = runGate(ws)
+  assert.strictEqual(moved.code, 1,
+    `基线文件搬出扫描面必须 exit 1（旧实现走 shortfall 打印 ✅ exit 0），实得 ${moved.code}\n${moved.out}${moved.err}`)
+  assert.ok(moved.err.includes('基线文件不在扫描面'), `必须点名「基线文件不在扫描面」，实得：\n${moved.err}`)
+  assert.ok(moved.err.includes('test_console.js  基线 1 条'), `必须点名那个文件，实得：\n${moved.err}`)
+  assert.ok(!moved.out.includes('ℹ️ 基线下降'), `不得把它混进「基线下降」，实得：\n${moved.out}`)
+  // 显式重生成是唯一放行路径：走 --write-allowlist 之后该文件从基线消失，闸门恢复绿。
+  const rewrite = runGate(ws, ['--write-allowlist'])
+  assert.strictEqual(rewrite.code, 0, `显式 --write-allowlist 必须能接受这次重命名，实得：\n${rewrite.out}${rewrite.err}`)
+  const written = readJson(path.join(ws, ALLOW_REL))
+  assert.ok(!Object.prototype.hasOwnProperty.call(written.by_file, 'test_console.js'),
+    `显式重生成后旧文件名必须从基线消失，实得：${JSON.stringify(written.by_file)}`)
+  assert.strictEqual(runGate(ws).code, 0, '按重命名后的基线重跑必须绿')
+})
+
 /* ── 端到端自检：真实仓库 ───────────────────────────────────────────────── */
 
 check('端到端：真实仓库闸门 exit 0，且打印的 total 与 sum(by_file) 一致', () => {
