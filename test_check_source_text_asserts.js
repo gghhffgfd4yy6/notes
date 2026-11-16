@@ -805,6 +805,15 @@ const ONE_HIT_FIXTURE = [
   ''
 ].join('\n')
 
+// r30-3 的夹具：同一份读取，2 条比对点（用来把「基线从 1 抬到 2」写成一次真实的增长）。
+const TWO_HIT_FIXTURE = [
+  '"use strict"',
+  'const s = require("node:fs").readFileSync("scripts/console.js", "utf8")',
+  "assert.ok(s.includes('SELF_ANCHOR'))",
+  "assert.ok(s.includes('SECOND_ANCHOR'))",
+  ''
+].join('\n')
+
 check('参照不得是 HEAD 自身：main 指向被判定提交时改用它的父提交，手改 by_file+total 等量抬高必须 exit 1', () => {
   const ws = makeWorkspace()
   writeFile(ws, 'test_selfref.js', ONE_HIT_FIXTURE)
@@ -1175,6 +1184,22 @@ check('正则 receiver 不只字面量：RE.test / RE.exec / new RegExp(…).tes
   assert.strictEqual(green.code, 0, `非正则 receiver / 非源码实参不得入账，实得：\n${green.out}${green.err}`)
 })
 
+// 输出行里的行号引用必须带边界（r30-4）：`test_x.js:5` 不得匹配 `test_x.js:50`——裸 `includes` 会把
+// 末位的 0 吃掉，断言因此比正则形态弱一档。纯字符串比较（indexOf + 看后一位），**不**构造动态
+// RegExp（Codacy / Semgrep 对 `new RegExp(非字面量)` 判 blocking）。返回第一个「后一位不是数字」的
+// 出现位置；没有这种出现则 -1。行尾（charAt 越界返回 ''）算边界。
+function lineRefAt (text, file, line) {
+  const token = `${file}:${line}`
+  let from = 0
+  for (;;) {
+    const at = text.indexOf(token, from)
+    if (at < 0) return -1
+    const next = text.charAt(at + token.length)
+    if (next < '0' || next > '9') return at
+    from = at + 1
+  }
+}
+
 // r28-2：恒等字符串化必须穿透。给每条断言套一层 `String()` / `|| ''` 就能停在基线以下，是零成本
 // 换皮通道（实测 `String(src).includes` 与 `(src||'').includes` 各 0 命中 exit 0，而
 // `src.toString().includes` 计入 ⇒ 同一族写法两种结论）。`JSON.stringify(src)` 同属这一族
@@ -1203,10 +1228,10 @@ check('恒等字符串化穿透明细：String/toString/模板/||/??/String.raw/
     `7 种写法各 1 条，实得：\n${red.err}`)
   for (const [line, anchor] of [[5, 'STRING_ID'], [6, 'OR_FALLBACK'], [7, 'NULLISH_FALLBACK'], [8, 'TO_STRING'], [9, 'TEMPLATE_ID'], [10, 'STRING_RAW'], [11, 'JSON_STRINGIFY']]) {
     // 逐行子串扫描而不是动态构造正则（Codacy：RegExp with non literal argument）：同一条输出行必须
-    // 既点名 `test_stringify.js:<行号>`、又含该锚点，两件事同时成立才算入账 —— 与原来
-    // `test_stringify\.js:<行号> .*<锚点>` 的强度相同，且锚点不会被当成正则元字符解释。
+    // 既点名 `test_stringify.js:<行号>`、又含该锚点，两件事同时成立才算入账。行号走 lineRefAt
+    // ——`test_stringify.js:5` 不得匹配 `:50`（r30-4 的边界，裸 includes 会放宽一档）。
     assert.ok(
-      red.err.split('\n').some((l) => l.includes(`test_stringify.js:${line}`) && l.includes(anchor)),
+      red.err.split('\n').some((l) => lineRefAt(l, 'test_stringify.js', line) >= 0 && l.includes(anchor)),
       `${anchor} 必须入账（输出里须有一行同时点名 test_stringify.js:${line} 与该锚点），实得：\n${red.err}`)
   }
   // 反向：非源码值（`String(42)` / `(null || '')`）与「解析成结构化数据后断言字段」不得入账
@@ -1264,6 +1289,171 @@ check('面外告警排序稳定：行与「被谁 require」都按 UTF-16 码元
   assert.deepStrictEqual(codeUnit, ['test_Zebra.js', 'test_apple.js'], '码元序：Z(90) 在 a(97) 之前')
   assert.deepStrictEqual(locale, ['test_apple.js', 'test_Zebra.js'],
     'localeCompare 必须给出相反顺序（夹具的区分力就来自这里；若本机 ICU 变了，请换一组夹具名）')
+})
+
+/* ── r30：检测器绕过口（多实参字符串化 / 声明顺序 / 行号边界 / growth 钉提交） ── */
+
+// r30-1：`JSON.stringify(src, null, 2)` / `String(src, '')` 与单参形态输出**逐字节相同**（多余实参被
+// 忽略），旧实现的 `arguments.length === 1` 因此是纯绕过口：实测四形态只计入单参两条（total=2），
+// 另两条 0 命中；把基线冻结在这两条上，再加多参形态 ⇒ 实测仍 2 ⇒ exit 0（白名单「合法」下降）。
+check('r30-1 多实参字符串化与单参同值：JSON.stringify(src,null,2) / String(src,"") 必须入账，非源码实参仍 0 条', () => {
+  const ws = makeWorkspace()
+  // 第 5 行是负对照要用的结构化数据：`JSON.stringify(parsedConfig)` 是多参形态也不得入账。
+  const head = [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'const parsedConfig = { name: "xbk-push" }',
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_multiarg.js', head)
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  assert.strictEqual(runGate(ws).code, 0, '只有读取与常量声明时不得入账')
+  const forms = [
+    'assert.ok(JSON.stringify(src).includes("MA_ONE"))', // 6
+    'assert.ok(JSON.stringify(src, null, 2).includes("MA_THREE"))', // 7
+    'assert.ok(String(src).includes("MA_STRING_ONE"))', // 8
+    'assert.ok(String(src, "").includes("MA_STRING_TWO"))', // 9
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_multiarg.js', head + forms)
+  const red = runGate(ws)
+  assert.strictEqual(red.code, 1,
+    `单参与多参形态都必须 exit 1（旧实现只计单参 ⇒ 实测 2），实得 ${red.code}\n${red.out}${red.err}`)
+  assert.ok(red.err.includes('test_multiarg.js  基线 0 / 实测 4 / +4'),
+    `四形态各 1 条共 4 条，实得：\n${red.err}`)
+  for (const [line, anchor] of [[6, 'MA_ONE'], [7, 'MA_THREE'], [8, 'MA_STRING_ONE'], [9, 'MA_STRING_TWO']]) {
+    assert.ok(red.err.split('\n').some((l) => lineRefAt(l, 'test_multiarg.js', line) >= 0 && l.includes(anchor)),
+      `${anchor} 必须入账（输出里须有一行同时点名 test_multiarg.js:${line} 与该锚点），实得：\n${red.err}`)
+  }
+  // 反向：非源码实参（结构化数据 / 数字）在多参形态下同样不计——长度守卫对正确性并不必要，
+  // 真正把 `JSON.stringify(parsedConfig)` 挡在外面的是 isSource(第一个实参)。
+  writeFile(ws, 'test_multiarg.js', head + [
+    'assert.ok(JSON.stringify(parsedConfig, null, 2).includes("MA_CONFIG"))',
+    'assert.ok(String(42, 10).includes("MA_NUMBER"))',
+    ''
+  ].join('\n'))
+  const green = runGate(ws)
+  assert.strictEqual(green.code, 0, `非源码实参不得入账（多参形态同样），实得：\n${green.out}${green.err}`)
+  // 反例（本条的靶心）：**只写多参形态**的夹具必须 exit 1。修前这两个形态 0 命中 ⇒ exit 0，
+  // 所以这条断言是 `arguments.length >= 1` 的机械守卫，回退成 `=== 1` 立刻红。
+  writeFile(ws, 'test_multiarg.js', head + [
+    'assert.ok(JSON.stringify(src, null, 2).includes("MA_ONLY_THREE"))',
+    'assert.ok(String(src, "").includes("MA_ONLY_TWO"))',
+    ''
+  ].join('\n'))
+  const onlyMulti = runGate(ws)
+  assert.strictEqual(onlyMulti.code, 1,
+    `只写多参形态也必须 exit 1（旧实现 0 命中 ⇒ exit 0），实得 ${onlyMulti.code}\n${onlyMulti.out}${onlyMulti.err}`)
+  assert.ok(onlyMulti.err.includes('test_multiarg.js  基线 0 / 实测 2 / +2'),
+    `只写多参形态必须计 2 条，实得：\n${onlyMulti.err}`)
+})
+
+// r30-2：顶层源码变量的**声明顺序**不得改变结论。旧实现里 vars 只在当遍按语句顺序累积 ⇒ 同一份事实
+// （`const src = readFileSync(…)` 是源码文本）在 function 声明之后才可见：`function checkSource(){…
+// src.includes('V3')}` 写在 const 之前实测 0 命中 exit 0，写在之后 +1 exit 1；返回源码的 helper 同理
+// （V5）。现在「直接读取的变量」与 funcs/helpers 同性质（facts.sourceVars，跨遍单调收敛）。
+check('r30-2 顶层源码变量的声明顺序不改变结论：const 在前/在后、返回源码的 helper 同理，非源码常量仍 0 条', () => {
+  const ws = makeWorkspace()
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const head = '"use strict"\nconst fs = require("node:fs")\nconst assert = require("node:assert")\n'
+  const read = 'const src = fs.readFileSync("scripts/console.js", "utf8")\n'
+  // 同一份事实的四种写法：唯一的区别是「声明在前还是在后」。每条都必须恰好 1 条命中。
+  const variants = [
+    ['V2（const 在前）', head + read + 'function checkSource () {\n  assert.ok(src.includes("ORDER_V2"))\n}\ncheckSource()\n'],
+    ['V3（function 在前）', head + 'function checkSource () {\n  assert.ok(src.includes("ORDER_V3"))\n}\n' + read + 'checkSource()\n'],
+    ['V5（返回源码的 helper 在前）', head + 'function getSource () { return src }\nassert.ok(getSource().includes("ORDER_V5"))\n' + read],
+    ['V5b（返回源码的 helper 在后）', head + read + 'function getSource () { return src }\nassert.ok(getSource().includes("ORDER_V5B"))\n']
+  ]
+  for (const [label, body] of variants) {
+    writeFile(ws, 'test_order.js', body)
+    const r = runGate(ws)
+    assert.strictEqual(r.code, 1,
+      `${label} 必须 exit 1（同一份事实不得因声明顺序变成 0 命中），实得 ${r.code}\n${r.out}${r.err}`)
+    assert.ok(r.err.includes('test_order.js  基线 0 / 实测 1 / +1'),
+      `${label} 必须恰好 1 条，实得：\n${r.err}`)
+  }
+  // 负对照：普通字符串常量不是「读源码得来」的，声明顺序同样不改变结论（两种顺序都 0 条）。
+  for (const body of [
+    head + 'const PLAIN = "这不是源码"\nfunction checkPlain () {\n  assert.ok(PLAIN.includes("ORDER_NEG"))\n}\ncheckPlain()\n',
+    head + 'function checkPlain () {\n  assert.ok(PLAIN.includes("ORDER_NEG"))\n}\nconst PLAIN = "这不是源码"\ncheckPlain()\n'
+  ]) {
+    writeFile(ws, 'test_order.js', body)
+    const green = runGate(ws)
+    assert.strictEqual(green.code, 0, `非源码常量不得入账（与声明顺序无关），实得：\n${green.out}${green.err}`)
+  }
+})
+
+// r30-3：写盘侧 growth.commit 必须与「CI 侧会解析出的参照提交」同口径。HEAD 就是参照时
+// （本地在 main 上 / 从 main 新建分支尚未提交）resolveReferenceBaseline 会把 target 换成 `<ref>^`
+// ——门禁侧必须这么办，但**登记**照抄 `^` 就让这条已登记的增长在 CI 被判「基线被抬高」exit 1。
+check('r30-3 growth 登记钉参照本身而非 `<ref>^`：HEAD==origin/main 写盘，提交后 CI 形态必须 exit 0（等量抬高仍 exit 1）', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_growth.js', ONE_HIT_FIXTURE)
+  writeBaseline(ws, baselineOf({ 'test_growth.js': 1 }))
+  initGitRepo(ws)
+  commitAll(ws, 'base1')
+  const base1 = gitIn(ws, ['rev-parse', 'HEAD'])
+  writeFile(ws, 'notes.txt', 'unrelated\n')
+  commitAll(ws, 'base2')
+  const base2 = gitIn(ws, ['rev-parse', 'HEAD'])
+  // origin/main 指向 base2（含基线的提交），HEAD 也停在 base2 ⇒ 写盘时「参照 == 被判定提交」。
+  gitIn(ws, ['update-ref', 'refs/remotes/origin/main', base2])
+  writeFile(ws, 'test_growth.js', TWO_HIT_FIXTURE)
+  const write = runGate(ws, ['--write-allowlist', '--allow-growth', '--reason', 'r30 对照组：仪器变宽'])
+  assert.strictEqual(write.code, 0, `写盘必须 exit 0，实得 ${write.code}\n${write.out}${write.err}`)
+  const pinned = readJson(path.join(ws, ALLOW_REL)).growth
+  assert.ok(pinned && typeof pinned.commit === 'string' && pinned.commit,
+    `增长登记必须钉一个真实提交，实得：${JSON.stringify(pinned)}`)
+  assert.notStrictEqual(pinned.commit, base1,
+    'growth.commit 不得钉成 `<ref>^`（origin/main 的父提交）——CI 侧参照解析出的是 origin/main 本身')
+  assert.strictEqual(pinned.commit, base2, 'growth.commit 必须等于 CI 侧将解析出的参照提交（origin/main 自身）')
+  assert.strictEqual(pinned.ref, 'origin/main', 'growth.ref 必须用候选名，不是 `origin/main^`')
+  // 提交之后就是 CI 形态：HEAD 已是新提交，origin/main 不再等于 HEAD ⇒ 参照解析出 origin/main 本身。
+  commitAll(ws, 'base3')
+  const ci = runGate(ws, [], { CI: 'true', SOURCE_TEXT_ASSERT_BASELINE_REF: 'origin/main' })
+  assert.strictEqual(ci.code, 0,
+    `已登记的增长在 CI 形态必须被接受（exit 0），实得 ${ci.code}\n${ci.out}${ci.err}`)
+  assert.ok(ci.out.includes('已由基线里的 growth 登记显式接受'),
+    `必须打印 growth 登记被接受，实得：\n${ci.out}`)
+  // 反向：把增量等量抬高（by_file 与 total 一起 +1，断言一条不动）仍必须 exit 1——登记不是永久通行证。
+  const raised = readJson(path.join(ws, ALLOW_REL))
+  raised.by_file['test_growth.js'] += 1
+  raised.total += 1
+  writeBaseline(ws, raised)
+  commitAll(ws, 'base4')
+  const ci2 = runGate(ws, [], { CI: 'true', SOURCE_TEXT_ASSERT_BASELINE_REF: 'origin/main' })
+  assert.strictEqual(ci2.code, 1,
+    `等量抬高必须 exit 1（登记只覆盖它自己那笔增量），实得 ${ci2.code}\n${ci2.out}${ci2.err}`)
+  assert.ok(ci2.err.includes('被抬高'), `必须点名「基线被抬高」，实得：\n${ci2.err}`)
+})
+
+// r30-4：入账明细的行号必须带边界。r29 把正则形态改成 split+includes 时把 `test_stringify.js:5`
+// 放宽成也能匹配 `:50`（实测输出里只有 :50 时，按 :5 判定返回 true）——断言因此比 r28 弱一档。
+check('r30-4 行号边界：输出里只有 `:50` 时不得被判成 `:5`（纯字符串比较，不构造动态正则）', () => {
+  const ws = makeWorkspace()
+  const lines = [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")'
+  ]
+  // 比对点必须正好落在第 50 行：本用例的区分力就来自「5 是 50 的前缀」。
+  while (lines.length < 49) lines.push('')
+  lines.push('assert.ok(String(src).includes("AT_LINE_50"))')
+  assert.strictEqual(lines.length, 50, '夹具必须让比对点落在第 50 行')
+  writeFile(ws, 'test_line50.js', lines.join('\n') + '\n')
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const r = runGate(ws)
+  assert.strictEqual(r.code, 1, `第 50 行的断言必须 exit 1，实得 ${r.code}\n${r.out}${r.err}`)
+  assert.ok(lineRefAt(r.err, 'test_line50.js', 50) >= 0,
+    `必须点名 test_line50.js:50，实得：\n${r.err}`)
+  // 区分力断言：旧的裸子串判定必须能被这条输出骗到（否则本用例抓不住那个退化）。
+  assert.ok(r.err.split('\n').some((l) => l.includes('test_line50.js:5')),
+    `裸子串判定必须能匹配到 :50（本用例的区分力来自这里），实得：\n${r.err}`)
+  assert.strictEqual(lineRefAt(r.err, 'test_line50.js', 5), -1,
+    `:50 不得被判成 :5，实得：\n${r.err}`)
 })
 
 /* ── 端到端自检：真实仓库 ───────────────────────────────────────────────── */

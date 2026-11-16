@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.472 — S0 r29：清三条静态告警（Sonar S2871：导出集合边界的两处 sort 补显式字符串比较器，码元序不变、逐元素全等有实测；Codacy 动态正则：test_stringify 入账明细改成逐行子串扫描，强度不变且反向可红；Codacy 非字面量 fs 路径：10 处补裸 eslint-disable-next-line 与中文理由，行尾 nosemgrep 保留）；白名单 2404 原地不动，测试断言本体一条未改、生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.473 — S0 r30：堵反回归闸的两个绕过口（① 多实参字符串化 JSON.stringify(src,null,2)/String(src,"") 此前按单参守卫 0 命中；② 顶层源码变量声明顺序——const 写在其后时 function 里的 includes 0 命中 exit 0）＋ growth 登记改钉参照候选本身（不再钉 `<ref>^`，否则提交后 CI 判定「基线被抬高」）＋ 自测行号边界；白名单 2404 原地不动（扫描面内 0 增量，面外告警 23→24 条），测试断言本体一条未改、生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

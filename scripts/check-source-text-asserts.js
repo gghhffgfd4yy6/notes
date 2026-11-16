@@ -35,6 +35,11 @@
  *      **声明顺序不影响**：function 声明在 JS 里是提升的，调用点写在声明之前（断言在文件头、helper
  *      在文件尾）同样入账——准备遍**共享 funcs/helpers 两张表并跑到收敛**（见下），记录遍再跑一次
  *      （r25-A：旧实现三遍各自 `newScope(null)`，这种写法整条链静默 0 命中、闸门照绿）。
+ *      **顶层源码变量同属这条**（r30-2）：`const src = readFileSync(…)` 与 funcs/helpers 一样是
+ *      函数级事实（`facts.sourceVars`，跨遍单调收敛）⇒ `function check(){ src.includes('X') }` 写在
+ *      声明之前/之后结论相同（旧实现按语句顺序累积 vars：声明在前 +1 exit 1、声明在后 0 命中 exit 0）。
+ *      只收「初值**直接**来自读取点」的名字：派生值（`src.split('\n')`、模板拼接）不进集合，
+ *      否则范围随派生写法失控，且整体保留 vars 会因外层同名变量泄漏多计（r26 实测 +13）。
  *      形参与返回值两条路在这里**交汇**：helper 的返回值若由收到源码文本的形参切片/拼接而来
  *      （`function jobBlock (workflowText) { return workflowText.split('\n').slice(a, b).join('\n') }`
  *      之后 `jobBlock(src).includes('…')`），调用点同样入账——只对着外层作用域判返回值时形参不可见，
@@ -66,6 +71,9 @@
  *   `JSON.stringify(src)` 都仍是同一段源码文本（序列化只做转义，锚点照旧逐字可匹配）——只认裸标识符时，
  *   给每条断言套一层 `String()` 就能让计数停在基线以下（实测 `String(src).includes` /
  *   `(src||'').includes` 各 0 命中 exit 0，而 `src.toString().includes` 计入 ⇒ 同一族写法两种结论）。
+ *   **实参个数不设上限**（r30-1）：对字符串实参多余参数被忽略，`JSON.stringify(src, null, 2)` /
+ *   `String(src, '')` 与单参形态输出逐字节相同，只认单参等于「多写一个实参就绕过」——判据落在
+ *   第一个实参是不是源码文本（`JSON.stringify(parsedConfig)` 这类仍不计）。
  *   `JSON.parse(src)` 之后是结构化数据，不计（见 known-uncovered 5）。
  *   `loadModel(f).code` / `loadModel(f).codeOnly`（及其等价 `model.code` / `model.codeOnly`、
  *   `const { code } = …` / `const { codeOnly } = …`）**两个字段都计入**：它们都是读进来的源码原文
@@ -101,6 +109,11 @@
  * 基线**只减不增**是机械校验的，不靠评审自觉：
  *   · 写盘侧：任何 total / 单文件增长都被拒绝写盘，除非显式 `--allow-growth --reason "…"`
  *     ——理由必填，并写进基线的 `growth` 段（钉参照提交 sha + 逐文件增量）与 CI 日志。
+ *     钉的必须是**参照候选自身**的提交，不是门禁侧那份「HEAD 就是参照 ⇒ 改用 `<ref>^`」的替身
+ *     （r30-3）：提交之后 CI 的 HEAD 已是新提交，origin/main 不再等于 HEAD，参照解析出的是
+ *     origin/main 本身，而 `growthAcceptedByRecord` 要求 `record.commit` 与它逐字相等——照抄 `^`
+ *     会让这条已登记的增长在 CI 被判「基线被抬高」exit 1。参照不可得时仍写 `commit: null`
+ *     （首次引入语义，不伪造 sha）。
  *   · 运行侧：`verifyGrowthAgainstReference` 把**当前基线**与 git 参照版本逐文件 + total 比一遍，
  *     手改 JSON 把 by_file 与 total 等量抬高会在这里 exit 1。参照 = `--baseline-ref` /
  *     `SOURCE_TEXT_ASSERT_BASELINE_REF`（显式给出时是**唯一**候选）→ origin/main → origin/master → main
@@ -329,14 +342,17 @@ function analyzeAst (ast, file) {
   // function 声明是**提升**的，调用点可以写在声明之前（断言在文件头、helper 在文件尾是本仓常见写法），
   // 旧实现三遍各自 `newScope(null)` ⇒ 记录遍在调用点处看到的 helper/funcs 表仍为空，整条 ⑤ 链条
   // 静默 0 命中、闸门照绿（r25-A 实测 total=0 / exit 0）。
-  // 只保留这两张表、**不**保留 vars/models：它们在遍与遍之间累积会把后文声明的外层同名变量泄漏给
+  // 只保留这三张表、**不**保留 vars/models：它们在遍与遍之间累积会把后文声明的外层同名变量泄漏给
   // 前文的函数体（实测 test_ci_skip_suites.js 的局部 `lines` 撞上顶层 `lines`，凭空多计 13 条），
-  // 那是尺子漂移不是事实；funcs/helpers 是纯函数级事实，跨遍只会单调收敛。
+  // 那是尺子漂移不是事实；funcs/helpers/sourceVars 是纯函数级事实，跨遍只会单调收敛。
+  // sourceVars（r30-2）= 初值**直接来自源码读取**的变量名（见 directSourceRead），让「源码变量」与
+  // funcs/helpers 同性质 ⇒ `const src = readFileSync(…)` 写在 function 之前还是之后结论相同。
+  // 它比整体保留 vars 窄得多：派生值（`src.split('\n')` 之类）不进集合，范围不会随派生链写法失控。
   const hoistFacts = new Map()
   const factsFor = (owner) => {
     let facts = hoistFacts.get(owner)
     if (!facts) {
-      facts = { funcs: new Map(), helpers: new Set() }
+      facts = { funcs: new Map(), helpers: new Set(), sourceVars: new Set() }
       hoistFacts.set(owner, facts)
     }
     return facts
@@ -346,6 +362,10 @@ function analyzeAst (ast, file) {
     const scope = newScope(parent)
     scope.funcs = facts.funcs
     scope.helpers = facts.helpers
+    // 源码变量以**副本**种进 vars：遍内新登记的仍走 scope.vars（当遍可见），只有 directSourceRead
+    // 认定的名字才回写 facts.sourceVars（下一遍起跨声明顺序可见）。vars 不整体保留，理由见上。
+    scope.vars = new Set(facts.sourceVars)
+    scope.facts = facts
     return scope
   }
 
@@ -394,12 +414,15 @@ function analyzeAst (ast, file) {
         // `JSON.stringify(src)` 同理不得放行：序列化只做转义（引号/反斜杠/控制字符），锚点文本仍逐字
         // 可匹配 ⇒ 它是可用的换皮通道（与 `codeOnly` 同性质：视图变了、内容还是原文）。实参不是源码
         // 文本时（`JSON.stringify(parsedConfig)`）不计——那是结构化数据的序列化，不是读源码。
+        // **实参个数不设上限**（r30-1）：对字符串实参而言多余参数被忽略，`JSON.stringify(s, null, 2)`
+        // 与 `String(s, '')` 的输出与单参形态**逐字节相同** ⇒ 只认单参等于「多写一个实参就绕过」。
+        // 正确性由紧随其后的 isSource(node.arguments[0]) 保证：非源码实参在多参形态下同样不计。
         if (callee.type === 'MemberExpression' && !callee.computed && callee.property.type === 'Identifier' &&
           callee.property.name === 'stringify' && callee.object.type === 'Identifier' &&
-          callee.object.name === 'JSON' && node.arguments.length === 1) {
+          callee.object.name === 'JSON' && node.arguments.length >= 1) {
           return isSource(node.arguments[0], scope)
         }
-        if (callee.type === 'Identifier' && callee.name === 'String' && node.arguments.length === 1) {
+        if (callee.type === 'Identifier' && callee.name === 'String' && node.arguments.length >= 1) {
           return isSource(node.arguments[0], scope)
         }
         if (tail && !callee.computed) {
@@ -420,6 +443,24 @@ function analyzeAst (ast, file) {
       default:
         return false
     }
+  }
+
+  // 「初值直接来自源码读取」的声明（r30-2）：`const src = fs.readFileSync(…)`、`await` / 可选链包一层、
+  // `const code = loadModel(f).code`、以及同形的赋值（`src = readFileSync(…)`）。只认**直接读取**：
+  // 派生值（`src.split('\n')`、模板拼接、`JSON.stringify(src)` …）不进这个集合——派生形态有无穷多种，
+  // 收进来等于把检测面交给派生链的写法；r26 实测「整体保留 vars」还会因外层同名变量泄漏凭空多计 13 条。
+  function directSourceRead (node, scope) {
+    if (!node) return false
+    if (node.type === 'AwaitExpression') return directSourceRead(node.argument, scope)
+    if (node.type === 'ChainExpression') return directSourceRead(node.expression, scope)
+    if (node.type === 'MemberExpression') {
+      return !node.computed && node.property.type === 'Identifier' && MODEL_CODE_FIELDS.has(node.property.name) &&
+        (isModelCall(node.object) || (node.object.type === 'Identifier' && inScope(scope, 'models', node.object.name)))
+    }
+    if (node.type !== 'CallExpression') return false
+    if (node.callee.type === 'Identifier' && inScope(scope, 'readers', node.callee.name)) return true
+    const tail = calleeTail(node.callee)
+    return !!tail && SOURCE_CALLS.has(tail)
   }
 
   // 函数体内的局部源码变量：`const text = fs.readFileSync(…)`、`const b = a`。
@@ -741,6 +782,11 @@ function analyzeAst (ast, file) {
         // 成员赋值与裸标识符是同一件事，只登记后者会让照文件头写的人 0 命中。
         else if (init.type === 'MemberExpression' && !init.computed && init.property.type === 'Identifier' &&
           SOURCE_CALLS.has(init.property.name)) scope.readers.add(id.name)
+        // 直接读取的变量同时是**函数级事实**（r30-2）：回写 facts.sourceVars，下一遍起在声明之前也可见。
+        if (directSourceRead(init, scope)) {
+          scope.vars.add(id.name)
+          if (scope.facts) scope.facts.sourceVars.add(id.name)
+        }
         // `const RE = /X/` / `const RE = new RegExp('X')`：正则常量（r28-1）。不登记的话
         // `RE.test(src)` 与 `/X/.test(src)` 是两种结论，改个写法就能绕过闸门。
         if (isRegex(init, scope)) scope.regexes.add(id.name)
@@ -766,6 +812,12 @@ function analyzeAst (ast, file) {
       visit(node.right, scope)
       visit(node.left, scope)
       if (node.left.type === 'Identifier' && isSource(node.right, scope)) scope.vars.add(node.left.name)
+      // 同 VariableDeclarator：`let src; … src = readFileSync(…)` 与声明式是同一条事实（r30-2），
+      // 否则「先赋值、再在函数里用」同样是声明顺序决定的结论。
+      if (node.left.type === 'Identifier' && directSourceRead(node.right, scope)) {
+        scope.vars.add(node.left.name)
+        if (scope.facts) scope.facts.sourceVars.add(node.left.name)
+      }
       if (node.left.type === 'Identifier' && isRegex(node.right, scope)) scope.regexes.add(node.left.name)
       return
     }
@@ -785,13 +837,14 @@ function analyzeAst (ast, file) {
   // 而外层 helper 的判定在同一遍里已先做过 ⇒ 两跳链在内层断掉，记录遍仍然看不见（实测
   // `jobBlock(src) → sliceBlock(text)` + 调用点写在两个 function 之前 = 0 命中 exit 0，而单跳或
   // 声明在前都是 +1 exit 1——同一份事实因为声明顺序得到两种结论，与文件头「声明顺序不影响」相反）。
-  // 收敛不放松任何判据：它只让「形参收到源码文本 / 某函数返回源码文本」这两类**既有**事实传播到位。
+  // 收敛不放松任何判据：它只让「形参收到源码文本 / 某函数返回源码文本 / 某名字是直接读取的源码变量」
+  // 这三类**既有**事实传播到位（r30-2 的第三类与 funcs/helpers 同一性质：都是函数级事实）。
   const MAX_PREPARE_PASSES = 6
   const factsSize = () => {
     let size = 0
     for (const params of sourceParams.values()) size += params.size
     for (const params of regexParams.values()) size += params.size
-    for (const facts of hoistFacts.values()) size += facts.funcs.size + facts.helpers.size
+    for (const facts of hoistFacts.values()) size += facts.funcs.size + facts.helpers.size + facts.sourceVars.size
     return size
   }
   let observed = -1
@@ -1090,6 +1143,9 @@ function resolveReferenceBaseline (flags) {
       continue
     }
     let target = { sha: rev.out, label: candidate, note: '' }
+    // 候选**自身**指向的提交（不做下面那条「改用父提交」替换）：写盘侧登记 growth.commit 用。
+    // 见 main() 里 pinReferenceCommit 的注释——CI 侧解析参照时 HEAD 已是新提交，参照就是候选本身。
+    const refSha = rev.out
     if (headCommit && rev.out === headCommit) {
       // 候选 = 被判定的提交本身（本地在 main 上、CI push 到 main）：基线自比自恒绿，不能当参照。
       // 换用它的父提交这条真实 base 引用；根提交 / 浅克隆取不到 ⇒ 这一项按参照不可得处理。
@@ -1132,7 +1188,7 @@ function resolveReferenceBaseline (flags) {
       problems.push(`${candidate} 的基线形状不可用`)
       continue
     }
-    return { ok: true, label: target.label, commit: target.sha, raw, note: target.note }
+    return { ok: true, label: target.label, commit: target.sha, refSha, refName: candidate, raw, note: target.note }
   }
   const reason = problems.join('；') || '没有可用的参照候选'
   if (explicit) {
@@ -1389,12 +1445,20 @@ function main () {
         die(2, '--allow-growth 必须同时给出 --reason "…"：基线增长是把债记回去的动作，理由要随基线与 CI 日志留痕。')
       }
       const reference = resolveReferenceBaseline(flags)
+      // 登记钉哪个提交（r30-3）：必须与「CI 侧会解析出的参照提交」同口径。
+      // 写盘时若 HEAD 就是参照（本地在 main 上 / 从 main 新建分支尚未提交），resolveReferenceBaseline
+      // 会把 target 换成 `<ref>^`——门禁侧必须这么办（基线自比自恒绿）。但**登记**照抄 `^` 就错了：
+      // 提交之后 CI 的 HEAD 已是新提交，origin/main 不再等于 HEAD，参照解析出的是 origin/main 本身，
+      // growthAcceptedByRecord 又要求 record.commit 与它逐字相等 ⇒ 这条已登记的增长在 CI 被判
+      // 「基线被抬高」exit 1，且错误文案把人引向手改基线。所以钉候选自身的提交（refSha），标签用候选名。
+      // 参照不可得时仍登记 commit: null（firstBootstrap 语义，不伪造 sha）。
+      const pinReferenceCommit = reference.ok ? (reference.refSha || reference.commit) : null
       const byFile = {}
       growth.rows.forEach((row) => { byFile[row.file] = row.delta })
       next.growth = {
         why: flags.reason,
-        commit: reference.ok ? reference.commit : null,
-        ref: reference.ok ? reference.label : null,
+        commit: pinReferenceCommit,
+        ref: reference.ok ? (reference.refName || reference.label) : null,
         at: new Date().toISOString(),
         total: growth.totalDelta,
         by_file: byFile
