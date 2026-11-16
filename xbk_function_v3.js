@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.478 — S2 断言整形：test_filter / test_filter_store / test_ci_skip_suites 的「读源码文本」断言按四式换掉（AST 结构断言 / 解析配置后断字段 / 行为断言），白名单 2363 → 2339（test_filter.js 31 → 18、test_filter_store.js 7 → 0、test_ci_skip_suites.js 107 → 103）；只动测试面与版本四方，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.481 — S3 fix r2：补 Stryker 插桩守卫（test_notify_selfcheck 入口分发结构块、test_qinglong_utils 的 --dry-run 接线断言在插桩源码上必红——if 条件被包成 ConditionalExpression、hasArg 的字面量实参被包成三元式 ⇒ 沙箱 initial test run 整段中止；现按 test_state_schema.js 的 instrumentedModel 口径用 AST 标识符判定后显式 SKIP，普通运行判据逐条不变），并恢复被删的 PR #154 变异沙箱兼容说明；只动测试面与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

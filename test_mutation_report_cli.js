@@ -8,6 +8,24 @@ const path = require('node:path')
 const { execFileSync, spawnSync } = require('node:child_process')
 // YAML `run: |` 正文提取的唯一实现（C5-044：原先两份副本的规则已经分叉，见 test/_yaml.js 头注释）。
 const { runBodyOf } = require('./test/_yaml')
+const { loadYaml } = require('./test_support/source_model')
+
+// 遍历解析后的 YAML 数据，收集所有字符串（键名也收：无效表达式落在键上同样是接线错误）。
+// S3：mutation.yml 里「某个无效上下文引用是否彻底消失」这类判据走这里——解析后的数据与排版无关，
+// 而「在 YAML 文本里找子串」既会被注释里的同名字样骗过，也会被换行/缩进变化误伤。
+function yamlStrings (value, out = [], seen = new Set()) {
+  if (typeof value === 'string') {
+    out.push(value)
+    return out
+  }
+  if (!value || typeof value !== 'object' || seen.has(value)) return out
+  seen.add(value)
+  for (const key of Object.keys(value)) {
+    out.push(key)
+    yamlStrings(value[key], out, seen)
+  }
+  return out
+}
 
 const SCRIPT = path.join(__dirname, 'scripts', 'mutation-report.js')
 
@@ -497,7 +515,10 @@ function schemaReport (seg, mutants) {
 {
   const yml = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'mutation.yml'), 'utf8')
   // ③ 反例：无效表达式必须彻底消失（残留任一处都会把空值重新注入、或误导后来者照抄）
-  assert.ok(!yml.includes('github.run_started_at'),
+  // S3：判据改成「解析 YAML 后遍历所有字符串」——排版、注释、引号写法都改变不了结论，
+  // 而任何一层（job / step / env / run）里残留该表达式都仍然会被点名。
+  const badRefs = yamlStrings(loadYaml('.github/workflows/mutation.yml')).filter((text) => text.includes('github.run_started_at'))
+  assert.deepStrictEqual(badRefs, [],
     'mutation.yml 不得再出现 github.run_started_at：github 上下文没有该属性，求值为空串 ⇒ 第③层静默失效')
 
   // 只定位 report job（`  report:` … 下一个顶层 job 或文件末）：mutation job 里也有同名/近似步骤名
