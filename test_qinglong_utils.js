@@ -14,7 +14,14 @@ const {
   SUPPORTED_NODE_RANGES
 } = require('./qinglong/xbk_push')
 const { loadModel } = require('./test_support/source_model')
-const { findFirst, callSites, hasCallWithLiteral } = require('./test_support/ast_query')
+const { findFirst, findAll, callSites, hasCallWithLiteral } = require('./test_support/ast_query')
+
+// Stryker 插桩判定（与 test_state_schema.js 的 instrumentedModel 同口径）：AST 里出现 `stryMutAct_*`
+// 标识符即说明这份源码已被插桩。只看标识符节点、不读源码文本——本套件的接线断言刚换成 AST，
+// 用 indexOf('stryMutAct_') 读原文等于把判据退回文本层（闸门也会记一条源码文本断言）。
+function instrumentedModel (model) {
+  return findAll(model, (node) => node.type === 'Identifier' && node.name.startsWith('stryMutAct_')).length > 0
+}
 
 // console 三路的**唯二**允许改写点（C5-063）：基线在这里取一次，捕获函数必须在 finally 里还原到基线。
 // 旧写法在两个并发的顶层 IIFE 里各改一次 console，前半段的静音正好罩住后半段的同步前缀 ⇒ 后半段的
@@ -124,28 +131,45 @@ const runUnitChecks = async () => {
   // 旧写法在 qinglong/xbk_push.js 的源码文本里 indexOf('runDryRunOnce(app)') / indexOf('runResident(')
   // 再比下标：注释里抄一遍这两个片段就能骗过，插桩在语句间插入代码又会改变下标（历史三次假红都出在这里）。
   // 现在直接读 main() 的 AST：分支条件、调用点与 return 位置全由节点关系表达，排版无关。
+  //
+  // **变异沙箱兼容（PR #154 三次实测订正，S3 按 AST 实现复核）**：Stryker 插桩会在源码里插入
+  // `stryMutAct_*` / `stryCov_*` 标记，**并改写字符串字面量本身**。历史上三版文本写法因此在沙箱内全假红：
+  //   ① 不能要求 `if (` 与条件紧邻（插桩把条件包成 `if (stryMutAct_… ? … : …)`，第一版写法沙箱必红）；
+  //   ② 也**不能设任何字符距离上限**（语句之间被插入任意长度辅助代码，第二版 `oneShotIdx - guardIdx < 600` 必超限）；
+  //   ③ 更不能断言任何**带引号的字面量邻接**：StringLiteral 变异器把 `'--dry-run'` 改写成
+  //      `(stryMutAct_… ? "" : (stryCov_…, '--dry-run'))`，`hasArg('--dry-run')` 这种原文序列不复存在。
+  // AST 版绕开了 ①②（节点关系与排版、字符距离无关），但第 ③ 条在 AST 层同样成立：本段判据要求
+  // `hasArg` 的**第 1 实参是 Literal**，沙箱里它变成 ConditionalExpression（实测
+  // `hasArg(stryMutAct_9fa48("816") ? "" : (stryCov_9fa48("816"), '--dry-run'))`）⇒ 判据在插桩源码上
+  // 必然不成立。也就是「AST 节点关系仍稳定，但依赖 Literal 形状的判据在沙箱内不适用」，故显式 SKIP。
+  // 不把判据放宽成「任意实参」来换绿：普通运行的覆盖必须逐条判到位（放宽等于删断言）。
   const pushModel = loadModel('qinglong/xbk_push.js')
-  const pushMain = findFirst(pushModel, (node) => node.type === 'FunctionDeclaration' && node.id && node.id.name === 'main')
-  assert.ok(pushMain, 'qinglong/xbk_push.js 必须有 main()')
-  const mainStatements = pushMain.body.body
-  const oneShotIdx = mainStatements.findIndex((stmt) =>
-    stmt.type === 'IfStatement' && hasCallWithLiteral(stmt.test, 'hasArg', 0, '--dry-run') &&
-    callSites(stmt.consequent, 'runDryRunOnce').length > 0)
-  assert.ok(oneShotIdx >= 0, '--dry-run 分支必须调用一次性 runDryRunOnce(app)（不得落入常驻循环）')
-  const oneShotBranch = mainStatements[oneShotIdx]
-  const oneShotCall = callSites(oneShotBranch.consequent, 'runDryRunOnce')[0]
-  assert.ok(oneShotCall.arguments.length === 1 && oneShotCall.arguments[0].type === 'Identifier' && oneShotCall.arguments[0].name === 'app',
-    'runDryRunOnce 必须收到 app（同一次装配的应用实例）')
-  const branchBody = oneShotBranch.consequent.body
-  assert.strictEqual(branchBody[branchBody.length - 1].type, 'ReturnStatement',
-    'runDryRunOnce(app) 之后必须在分支结束处 return（不得落入常驻循环）')
-  assert.strictEqual(callSites(oneShotBranch.consequent, 'runResident').length, 0,
-    '--dry-run 分支内绝不得调用 runResident（一次性语义）')
-  const residentIdx = mainStatements.findIndex((stmt) => callSites(stmt, 'runResident').length > 0)
-  assert.ok(residentIdx > oneShotIdx, '常驻路径 runResident(app, …) 必须仍然存在，且在 --dry-run 分支之后')
-  const residentCall = callSites(mainStatements[residentIdx], 'runResident')[0]
-  assert.ok(residentCall.arguments[0] && residentCall.arguments[0].type === 'Identifier' && residentCall.arguments[0].name === 'app',
-    'runResident 必须收到 app（常驻路径必须仍然存在，防"删掉常驻"式假修复）')
+  if (instrumentedModel(pushModel)) {
+    // 只跳过这一段接线结构断言：本函数其余断言（QX-02 行为、nodeVersionWarning、status 缓存…）照常跑。
+    console.log('SKIP 接线断言（AST 结构，S3）（Stryker 沙箱内源码已插桩）')
+  } else {
+    const pushMain = findFirst(pushModel, (node) => node.type === 'FunctionDeclaration' && node.id && node.id.name === 'main')
+    assert.ok(pushMain, 'qinglong/xbk_push.js 必须有 main()')
+    const mainStatements = pushMain.body.body
+    const oneShotIdx = mainStatements.findIndex((stmt) =>
+      stmt.type === 'IfStatement' && hasCallWithLiteral(stmt.test, 'hasArg', 0, '--dry-run') &&
+      callSites(stmt.consequent, 'runDryRunOnce').length > 0)
+    assert.ok(oneShotIdx >= 0, '--dry-run 分支必须调用一次性 runDryRunOnce(app)（不得落入常驻循环）')
+    const oneShotBranch = mainStatements[oneShotIdx]
+    const oneShotCall = callSites(oneShotBranch.consequent, 'runDryRunOnce')[0]
+    assert.ok(oneShotCall.arguments.length === 1 && oneShotCall.arguments[0].type === 'Identifier' && oneShotCall.arguments[0].name === 'app',
+      'runDryRunOnce 必须收到 app（同一次装配的应用实例）')
+    const branchBody = oneShotBranch.consequent.body
+    assert.strictEqual(branchBody[branchBody.length - 1].type, 'ReturnStatement',
+      'runDryRunOnce(app) 之后必须在分支结束处 return（不得落入常驻循环）')
+    assert.strictEqual(callSites(oneShotBranch.consequent, 'runResident').length, 0,
+      '--dry-run 分支内绝不得调用 runResident（一次性语义）')
+    const residentIdx = mainStatements.findIndex((stmt) => callSites(stmt, 'runResident').length > 0)
+    assert.ok(residentIdx > oneShotIdx, '常驻路径 runResident(app, …) 必须仍然存在，且在 --dry-run 分支之后')
+    const residentCall = callSites(mainStatements[residentIdx], 'runResident')[0]
+    assert.ok(residentCall.arguments[0] && residentCall.arguments[0].type === 'Identifier' && residentCall.arguments[0].name === 'app',
+      'runResident 必须收到 app（常驻路径必须仍然存在，防"删掉常驻"式假修复）')
+  }
 
   // ===== QX-06：完整 re2 engines 范围的 Node 版本告警 =====
   assert.strictEqual(nodeVersionWarning('22.22.2'), null, '22.x engines 下界不应告警')

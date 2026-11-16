@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.480 — S3 fix r1：收紧两条被审查判为「放宽」的断言（test_notify_selfcheck：完整入口必须在分发链最后 else 支恰调用一次、且该调用挂 .catch——恢复旧 indexOf 断言同时守的两条判据；test_storage：⑧d CodeQL js/file-system-race 回归锁的扫描面从 try 子树恢复为「⑧ 场景起点语句 → ⑧b 起点语句」的完整语句序列，含 statSync/openSync 前置检查回退形态）；只动测试面与版本四方，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.481 — S3 fix r2：补 Stryker 插桩守卫（test_notify_selfcheck 入口分发结构块、test_qinglong_utils 的 --dry-run 接线断言在插桩源码上必红——if 条件被包成 ConditionalExpression、hasArg 的字面量实参被包成三元式 ⇒ 沙箱 initial test run 整段中止；现按 test_state_schema.js 的 instrumentedModel 口径用 AST 标识符判定后显式 SKIP，普通运行判据逐条不变），并恢复被删的 PR #154 变异沙箱兼容说明；只动测试面与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

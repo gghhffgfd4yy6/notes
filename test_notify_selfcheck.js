@@ -14,6 +14,13 @@ const {
   findAll, findFirst, ifChain, memberPath, callSites, hasCallWithLiteral, hasCallWithIdentifier, parseText
 } = require('./test_support/ast_query')
 
+// Stryker 插桩判定（与 test_state_schema.js 的 instrumentedModel 同口径）：AST 里出现 `stryMutAct_*`
+// 标识符即说明这份源码已被插桩。判据只看**标识符节点**，不读源码文本——本文件刚把文本断言换成 AST，
+// 再用 indexOf('stryMutAct_') 读原文等于开倒车（闸门也会记一条源码文本断言）。
+function instrumentedModel (model) {
+  return findAll(model, (node) => node.type === 'Identifier' && node.name.startsWith('stryMutAct_')).length > 0
+}
+
 // ── S1 前置：入口分发结构断言（AST 结构，S3 替换源码文本序断言）──
 // 旧写法在 xbk_function_v3.js 的源码文本里 indexOf('require.main === module') /
 // "'--notify-test'" / 'runNotifyTest(cliArgs)' / 'runSingleEntry().catch'，再比这些下标的相对大小。
@@ -25,82 +32,95 @@ const {
 //   ③ else { runSingleEntry().catch(…) }                                        ← 完整入口只在最后一支
 // 「runSingleEntry 只在最后一支、且该调用挂 .catch」就是旧断言（`indexOf('runSingleEntry().catch')` 的
 // 相对位置）守的两件事，现在由分支结构 + 调用链形态表达，而不是比下标。
+
+// **变异沙箱兼容（S3 round2）**：Stryker 会把 `if (require.main === module)` 的 test 整条包成
+// ConditionalExpression（实测 `} else if (stryMutAct_9fa48("570") ? require.main !== module :
+// stryMutAct_… ? true : (stryCov_…, require.main === module)) {`），下面的 findFirst 要求
+// `test.type === 'BinaryExpression'` ⇒ mainGuard === null、首条 assert.ok 直接抛错 ⇒ 本文件 9 条
+// 行为用例一条都跑不到（沙箱 initial test run 红、整段中止）。这是「源码形状判据 vs 插桩形态」的
+// 固有冲突，不是生产逻辑问题：插桩时整块跳过并打印一行 SKIP，普通运行的判据逐条不变（一行未改）。
+// 入口语义的行为面由同文件 S6/S6b 的真 main-guard spawn 用例与 test_cli.js 兜底。
 const entryModel = loadModel('xbk_function_v3.js')
-const mainGuard = findFirst(entryModel, (node) =>
-  node.type === 'IfStatement' && node.test.type === 'BinaryExpression' && node.test.operator === '===' &&
-  memberPath(node.test.left) === 'require.main' && node.test.right.type === 'Identifier' && node.test.right.name === 'module')
-assert.ok(mainGuard, 'xbk_function_v3.js 必须有 if (require.main === module) 直跑入口')
-{
-  // 分发链 = guard 块的最后一条语句（前面是 cliArgs / notifyArg 的准备语句）。
-  const guardedBlock = mainGuard.consequent
-  const dispatch = guardedBlock.body[guardedBlock.body.length - 1]
-  assert.strictEqual(dispatch.type, 'IfStatement', 'guard 内必须有 if/else 分发链（否则直跑入口没有分流）')
-  const arms = ifChain(dispatch)
-  assert.ok(arms.length >= 3, `分发链至少三支（notify-test / 未识别参数 / 完整入口），实际 ${arms.length}`)
+if (instrumentedModel(entryModel)) {
+  // 只跳过这一块源码形状断言：下面 9 条行为用例照常跑（它们在插桩前本就跑得到）。
+  console.log('SKIP 入口分发结构断言（Stryker 沙箱内源码已插桩）')
+} else {
+  const mainGuard = findFirst(entryModel, (node) =>
+    node.type === 'IfStatement' && node.test.type === 'BinaryExpression' && node.test.operator === '===' &&
+    memberPath(node.test.left) === 'require.main' && node.test.right.type === 'Identifier' && node.test.right.name === 'module')
+  assert.ok(mainGuard, 'xbk_function_v3.js 必须有 if (require.main === module) 直跑入口')
+  {
+    // 分发链 = guard 块的最后一条语句（前面是 cliArgs / notifyArg 的准备语句）。
+    const guardedBlock = mainGuard.consequent
+    const dispatch = guardedBlock.body[guardedBlock.body.length - 1]
+    assert.strictEqual(dispatch.type, 'IfStatement', 'guard 内必须有 if/else 分发链（否则直跑入口没有分流）')
+    const arms = ifChain(dispatch)
+    assert.ok(arms.length >= 3, `分发链至少三支（notify-test / 未识别参数 / 完整入口），实际 ${arms.length}`)
 
-  // ① 自检分支：第一支、条件读 notifyArg、体内 runNotifyTest(cliArgs) 的返回必须挂 .catch
-  assert.strictEqual(arms[0].test.type, 'Identifier', '第一支必须以 notifyArg 为条件（notify-test 必须最先分发）')
-  assert.strictEqual(arms[0].test.name, 'notifyArg')
-  const notifyCall = callSites(arms[0].consequent, 'runNotifyTest')[0]
-  assert.ok(notifyCall, 'notify-test 分支必须调用 runNotifyTest（不得静默进完整入口）')
-  assert.ok(notifyCall.arguments.length === 1 && notifyCall.arguments[0].type === 'Identifier' && notifyCall.arguments[0].name === 'cliArgs',
-    'runNotifyTest 必须收到 cliArgs（原样转发未消费的参数）')
-  const chainedNotify = findAll(arms[0].consequent, (node) =>
-    node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
-    node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
-    node.callee.object.type === 'CallExpression' && memberPath(node.callee.object.callee) === 'runNotifyTest')
-  assert.strictEqual(chainedNotify.length, 1, 'runNotifyTest 的返回必须挂 .catch（否则自检失败会变成 unhandled rejection）')
+    // ① 自检分支：第一支、条件读 notifyArg、体内 runNotifyTest(cliArgs) 的返回必须挂 .catch
+    assert.strictEqual(arms[0].test.type, 'Identifier', '第一支必须以 notifyArg 为条件（notify-test 必须最先分发）')
+    assert.strictEqual(arms[0].test.name, 'notifyArg')
+    const notifyCall = callSites(arms[0].consequent, 'runNotifyTest')[0]
+    assert.ok(notifyCall, 'notify-test 分支必须调用 runNotifyTest（不得静默进完整入口）')
+    assert.ok(notifyCall.arguments.length === 1 && notifyCall.arguments[0].type === 'Identifier' && notifyCall.arguments[0].name === 'cliArgs',
+      'runNotifyTest 必须收到 cliArgs（原样转发未消费的参数）')
+    const chainedNotify = findAll(arms[0].consequent, (node) =>
+      node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+      node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
+      node.callee.object.type === 'CallExpression' && memberPath(node.callee.object.callee) === 'runNotifyTest')
+    assert.strictEqual(chainedNotify.length, 1, 'runNotifyTest 的返回必须挂 .catch（否则自检失败会变成 unhandled rejection）')
 
-  // ② 未知 -- 参数：fail-closed（报错 + exitCode=1），且绝不得踏进任何入口
-  const unknownArm = arms.find((arm) => arm.test && callSites(arm.test, 'cliArgs.some').length > 0)
-  assert.ok(unknownArm, '分发链必须有「未知 -- 参数」分支（否则拼错的参数会静默跑一轮）')
-  const setsFailure = unknownArm.consequent.body.some((stmt) =>
-    stmt.type === 'ExpressionStatement' && stmt.expression.type === 'AssignmentExpression' &&
-    memberPath(stmt.expression.left) === 'process.exitCode' && stmt.expression.right.type === 'Literal' && stmt.expression.right.value === 1)
-  assert.ok(setsFailure, '未识别参数分支必须把 process.exitCode 设为 1（fail-closed）')
-  assert.strictEqual(callSites(unknownArm.consequent, 'runSingleEntry').length, 0, '未识别参数分支绝不得进完整入口')
-  assert.strictEqual(callSites(unknownArm.consequent, 'runNotifyTest').length, 0, '未识别参数分支不得被当成自检')
-  // 用户可见文案：从该分支的 console.error 取模板串（不是全文件文本匹配——注释里的同名字样不算证据）
-  const errCall = callSites(unknownArm.consequent, 'console.error')[0]
-  assert.ok(errCall, '未识别参数分支必须经 console.error 报错（不得静默退 1）')
-  const errText = errCall.arguments[0] && errCall.arguments[0].type === 'TemplateLiteral'
-    ? errCall.arguments[0].quasis.map((q) => q.value.cooked).join('…')
-    : ''
-  assert.match(errText, /未识别参数/, `错误文案必须点名「未识别参数」（实际：${errText}）`)
+    // ② 未知 -- 参数：fail-closed（报错 + exitCode=1），且绝不得踏进任何入口
+    const unknownArm = arms.find((arm) => arm.test && callSites(arm.test, 'cliArgs.some').length > 0)
+    assert.ok(unknownArm, '分发链必须有「未知 -- 参数」分支（否则拼错的参数会静默跑一轮）')
+    const setsFailure = unknownArm.consequent.body.some((stmt) =>
+      stmt.type === 'ExpressionStatement' && stmt.expression.type === 'AssignmentExpression' &&
+      memberPath(stmt.expression.left) === 'process.exitCode' && stmt.expression.right.type === 'Literal' && stmt.expression.right.value === 1)
+    assert.ok(setsFailure, '未识别参数分支必须把 process.exitCode 设为 1（fail-closed）')
+    assert.strictEqual(callSites(unknownArm.consequent, 'runSingleEntry').length, 0, '未识别参数分支绝不得进完整入口')
+    assert.strictEqual(callSites(unknownArm.consequent, 'runNotifyTest').length, 0, '未识别参数分支不得被当成自检')
+    // 用户可见文案：从该分支的 console.error 取模板串（不是全文件文本匹配——注释里的同名字样不算证据）
+    const errCall = callSites(unknownArm.consequent, 'console.error')[0]
+    assert.ok(errCall, '未识别参数分支必须经 console.error 报错（不得静默退 1）')
+    const errText = errCall.arguments[0] && errCall.arguments[0].type === 'TemplateLiteral'
+      ? errCall.arguments[0].quasis.map((q) => q.value.cooked).join('…')
+      : ''
+    assert.match(errText, /未识别参数/, `错误文案必须点名「未识别参数」（实际：${errText}）`)
 
-  // ③ 完整入口只在最后 else 支，且该调用必须挂 .catch
-  // 旧断言是 `indexOf('runSingleEntry().catch') > indexOf('runNotifyTest(cliArgs)')`——它同时守住两件事：
-  // 「完整入口落在最后 else 支」与「调用挂 .catch」。只数「guard 里有 1 次 runSingleEntry」会同时丢掉这两条：
-  // 改成裸 `runSingleEntry()`（错误变 unhandled rejection、绕开 summarizeError 脱敏出口）仍绿；
-  // 把它挪进 notify 分支、最后 else 留空也仍绿。故这里逐条表达：else 支内恰 1 次、整条 guard 恰 1 次
-  // （= 别处没有第二份入口）、且那次调用正是某个 `.catch(…)` 的被调对象（与上面 chainedNotify 判法对称）。
-  const entryArm = arms[arms.length - 1]
-  assert.strictEqual(entryArm.test, null, '分发链最后必须是 else（完整入口）')
-  const entryCalls = callSites(entryArm.consequent, 'runSingleEntry')
-  assert.strictEqual(entryCalls.length, 1,
-    'runSingleEntry 完整入口必须在最后 else 支恰调用一次（早退语义：其它分支一律不得进完整入口）')
-  assert.strictEqual(callSites(guardedBlock, 'runSingleEntry').length, 1,
-    'runSingleEntry 在整条 guard 里只能出现一次（挪进 notify 分支 / 复制第二份都算破坏早退语义）')
-  const chainedEntry = findAll(entryArm.consequent, (node) =>
-    node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
-    node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
-    node.callee.object === entryCalls[0])
-  assert.strictEqual(chainedEntry.length, 1,
-    'runSingleEntry(...) 的返回必须挂 .catch(...)（否则入口失败会变成 unhandled rejection、绕开 summarizeError 脱敏出口）')
-  const entryHandler = chainedEntry[0].arguments[0]
-  assert.ok(entryHandler && (entryHandler.type === 'ArrowFunctionExpression' || entryHandler.type === 'FunctionExpression'),
-    '.catch 的实参必须是函数（失败处理逻辑不得被内联丢弃）')
+    // ③ 完整入口只在最后 else 支，且该调用必须挂 .catch
+    // 旧断言是 `indexOf('runSingleEntry().catch') > indexOf('runNotifyTest(cliArgs)')`——它同时守住两件事：
+    // 「完整入口落在最后 else 支」与「调用挂 .catch」。只数「guard 里有 1 次 runSingleEntry」会同时丢掉这两条：
+    // 改成裸 `runSingleEntry()`（错误变 unhandled rejection、绕开 summarizeError 脱敏出口）仍绿；
+    // 把它挪进 notify 分支、最后 else 留空也仍绿。故这里逐条表达：else 支内恰 1 次、整条 guard 恰 1 次
+    // （= 别处没有第二份入口）、且那次调用正是某个 `.catch(…)` 的被调对象（与上面 chainedNotify 判法对称）。
+    const entryArm = arms[arms.length - 1]
+    assert.strictEqual(entryArm.test, null, '分发链最后必须是 else（完整入口）')
+    const entryCalls = callSites(entryArm.consequent, 'runSingleEntry')
+    assert.strictEqual(entryCalls.length, 1,
+      'runSingleEntry 完整入口必须在最后 else 支恰调用一次（早退语义：其它分支一律不得进完整入口）')
+    assert.strictEqual(callSites(guardedBlock, 'runSingleEntry').length, 1,
+      'runSingleEntry 在整条 guard 里只能出现一次（挪进 notify 分支 / 复制第二份都算破坏早退语义）')
+    const chainedEntry = findAll(entryArm.consequent, (node) =>
+      node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+      node.callee.property.type === 'Identifier' && node.callee.property.name === 'catch' &&
+      node.callee.object === entryCalls[0])
+    assert.strictEqual(chainedEntry.length, 1,
+      'runSingleEntry(...) 的返回必须挂 .catch(...)（否则入口失败会变成 unhandled rejection、绕开 summarizeError 脱敏出口）')
+    const entryHandler = chainedEntry[0].arguments[0]
+    assert.ok(entryHandler && (entryHandler.type === 'ArrowFunctionExpression' || entryHandler.type === 'FunctionExpression'),
+      '.catch 的实参必须是函数（失败处理逻辑不得被内联丢弃）')
 
-  // --notify-test=1 这类近似写法必须前缀分发到自检（审查 D2-M2 / #232）
-  const notifyArgDecl = findAll(guardedBlock, (node) => node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'notifyArg')
-  assert.strictEqual(notifyArgDecl.length, 1, '分发链必须先把 notify-test 参数挑出来（notifyArg）')
-  const picker = notifyArgDecl[0].init
-  assert.strictEqual(picker.type, 'CallExpression', 'notifyArg 必须由一次查找得到')
-  assert.strictEqual(memberPath(picker.callee), 'cliArgs.find', 'notifyArg 必须从 cliArgs 里挑（find）')
-  assert.ok(hasCallWithLiteral(picker, 'a.startsWith', 0, '--notify-test='),
-    '--notify-test=1 必须前缀分发到自检（否则近似写法会静默落进完整入口）')
-  assert.ok(findAll(picker, (node) => node.type === 'Literal' && node.value === '--notify-test').length >= 1,
-    '精确写法 --notify-test 也必须由同一处挑出来')
+    // --notify-test=1 这类近似写法必须前缀分发到自检（审查 D2-M2 / #232）
+    const notifyArgDecl = findAll(guardedBlock, (node) => node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === 'notifyArg')
+    assert.strictEqual(notifyArgDecl.length, 1, '分发链必须先把 notify-test 参数挑出来（notifyArg）')
+    const picker = notifyArgDecl[0].init
+    assert.strictEqual(picker.type, 'CallExpression', 'notifyArg 必须由一次查找得到')
+    assert.strictEqual(memberPath(picker.callee), 'cliArgs.find', 'notifyArg 必须从 cliArgs 里挑（find）')
+    assert.ok(hasCallWithLiteral(picker, 'a.startsWith', 0, '--notify-test='),
+      '--notify-test=1 必须前缀分发到自检（否则近似写法会静默落进完整入口）')
+    assert.ok(findAll(picker, (node) => node.type === 'Literal' && node.value === '--notify-test').length >= 1,
+      '精确写法 --notify-test 也必须由同一处挑出来')
+  }
 }
 
 // ── S8：guard catch 处理器的结构视图（S3 替换源码文本取段）──────────────────
@@ -434,7 +454,15 @@ require.cache[slimPath] = { id: slimPath, filename: slimPath, loaded: true, expo
     const { handler, param } = notifyCatchHandlerOf(entryModel)
     const body = handler.body
     const statements = body.type === 'BlockStatement' ? body.body : [body]
-    assert.ok(statements.length > 1, `必须真的取到 guard catch 处理器体（实际 ${statements.length} 条语句）`)
+    // 「真的取到处理器体」的完整性自检。Stryker 插桩会把整个处理器体包成一条
+    // `if (stryMutAct_…) {} else { …原始语句… }`（实测语句数 1）⇒ 「语句数 > 1」在沙箱内按定义不成立。
+    // 解包这一层只在**确认插桩时**生效（AST 标识符判定，见 instrumentedModel），解包后仍要求原始语句 > 1；
+    // 普通运行 statements 原样使用，判据逐字节不变。三条负断言照旧在整棵 body 上跑（包装层不引入
+    // console.*/JSON.stringify，实参也不是形参本身）。
+    const instrumentedWrapper = instrumentedModel(entryModel) && statements.length === 1 &&
+      statements[0].type === 'IfStatement' && statements[0].alternate && statements[0].alternate.type === 'BlockStatement'
+    const handlerStatements = instrumentedWrapper ? statements[0].alternate.body : statements
+    assert.ok(handlerStatements.length > 1, `必须真的取到 guard catch 处理器体（实际 ${handlerStatements.length} 条语句）`)
     assert.ok(hasCallWithIdentifier(body, 'summarizeError', 0, param),
       `guard catch 必须过 summarizeError(${param})`)
     // 负断言一：catch 里只允许 console.error（错误流）。console.log/warn/info/debug 会把 stdout
