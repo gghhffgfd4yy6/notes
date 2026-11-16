@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.476 — S1 文档补正：v3.475 那条「未处理」登记失真（31 条按锚点逐条重算后为已改 21 / 未改 10，未改清单列全、含 run.log 运行期输出的 [vundefined] 一条）、fail-open 与同源块 AST 两处文案改成与代码一致，并写清白名单 -41（test_app.js 29 → 17、test_app_unit.js 74 → 45）与 31 条清单的口径差异；只动 CHANGELOG 文案与 test_app.js 的一处不变式注释，断言代码、scripts/、test_support/ 与生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.477 — S2 断言整形：test_filter / test_filter_store / test_ci_skip_suites 的「读源码文本」断言按四式换掉（AST 结构断言 / 解析配置后断字段 / 行为断言），白名单 2363 → 2339（test_filter.js 31 → 18、test_filter_store.js 7 → 0、test_ci_skip_suites.js 107 → 103）；只动测试面与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

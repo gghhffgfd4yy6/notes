@@ -12,6 +12,38 @@ const fs = require('node:fs')
 const os = require('node:os')
 const { spawnSync } = require('node:child_process')
 const path = require('node:path')
+// S2：结构断言走 S0 工具层（AST 视图），不再把「源码文本里有没有这个片段」当断言。
+const { loadModel } = require('./test_support/source_model')
+
+// 本文件按 AST 定位的两个小工具（找「这个对象字段的值是什么」「这次调用传了哪些实参」）：
+// 原先那两条用例在 scripts/console.js 里 find 一行再比片段，格式化/lint 重排就假红。
+function walkAst (node, visit) {
+  if (!node || typeof node.type !== 'string') return
+  visit(node)
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === 'range') continue
+    const value = node[key]
+    if (Array.isArray(value)) value.forEach((child) => walkAst(child, visit))
+    else if (value && typeof value.type === 'string') walkAst(value, visit)
+  }
+}
+
+function keyName (node) {
+  if (!node) return null
+  if (node.type === 'Identifier') return node.name
+  if (node.type === 'Literal') return String(node.value)
+  return null
+}
+
+// `paths.file` / `FilterStore.appliedLastGoodUsed` 这类静态成员路径（裸标识符原样返回）；
+// 计算成员与其它形态返回 null。
+function memberPathOf (node) {
+  if (!node) return null
+  if (node.type === 'Identifier') return node.name
+  if (node.type !== 'MemberExpression' || node.computed) return null
+  const base = node.object.type === 'Identifier' ? node.object.name : memberPathOf(node.object)
+  return base ? base + '.' + keyName(node.property) : null
+}
 
 const { createRuleEngine } = require('./xbk_rules')
 const { FILTER_FIELDS } = require('./xbk_utils')
@@ -88,17 +120,19 @@ const DEFAULTS = {
 // ? {} : (stryCov_9fa48("3014"), {`）。于是「读源文件 + 按源码文本断言」的用例在沙箱里必假红，
 // 与功能无关。命中插桩时**只跳过那几条源码形状断言**并单独计数（不冒充通过），同一用例里的
 // 行为断言照跑；正常运行时守卫恒不命中，原断言照常执行。
+// 判据用 AST：插桩后的表达式就是 `stryMutAct_<hash>(…)` 这族**调用**，看调用名即可——比比对源码
+// 文本更准（注释/字符串里出现同样字面量不会误判成已插桩）。
 const INSTRUMENTED_SOURCES = (() => {
   const hit = new Set()
   for (const rel of ['scripts/console.js']) {
-    let text = ''
+    let calls = []
     try {
-      text = fs.readFileSync(path.join(__dirname, rel), 'utf8')
+      calls = Array.from(loadModel(rel).calls)
     } catch (e) {
-      // 读不到按「未插桩」处理：守卫不命中，原断言照常执行并响亮失败（不吞异常）
-      text = ''
+      // 读不到/解析不了按「未插桩」处理：守卫不命中，原断言照常执行并响亮失败（不吞异常）
+      calls = []
     }
-    if (text.includes('stryMutAct_')) hit.add(rel)
+    if (calls.some((name) => name.startsWith('stryMutAct_'))) hit.add(rel)
   }
   return hit
 })()
@@ -1423,16 +1457,25 @@ test('appliedLastGoodUsed 口径：只有 source=corrupt 且 lastGoodUsed=true �
 })
 
 test('控制台口径：GET /api/config/filter 的 lastGoodUsed 取自 applied，不用控制台进程自己的 LKG', () => {
-  if (skipIfInstrumented('控制台 lastGoodUsed 接线（源码形状断言）')) return
+  if (skipIfInstrumented('控制台 lastGoodUsed 接线（源码结构断言）')) return
   // 本 item 只允许跑 test_filter_store/test_filter 两个定向套件（console 套件不在其中），
-  // 故这处接线用源码断言锁定：回退成 loaded.lastGoodUsed（控制台进程读文件时的 LKG）即变红。
-  const src = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
-  const line = src.split('\n').find(l => l.includes('lastGoodUsed:'))
-  assert.ok(line, 'GET /api/config/filter 的 payload 必须带 lastGoodUsed 字段（控制台要能展示运行侧降级状态）')
-  assert.ok(line.includes('FilterStore.appliedLastGoodUsed(applied)'),
-    `lastGoodUsed 必须由 applied 快照推导（运行侧口径）：${line.trim()}`)
-  assert.ok(!line.includes('loaded.lastGoodUsed'),
-    `不得用控制台进程自己读文件的 lastGoodUsed 冒充运行侧：${line.trim()}`)
+  // 故这处接线用**结构**锁定：console.js 里 `lastGoodUsed:` 这个对象字段的值必须是
+  // FilterStore.appliedLastGoodUsed(applied)——回退成 loaded.lastGoodUsed 即变红。
+  const model = loadModel('scripts/console.js')
+  const fields = []
+  walkAst(model.ast, (node) => {
+    if (node.type === 'Property' && !node.computed && keyName(node.key) === 'lastGoodUsed') fields.push(node.value)
+  })
+  assert.ok(fields.length > 0,
+    'GET /api/config/filter 的 payload 必须带 lastGoodUsed 字段（控制台要能展示运行侧降级状态）')
+  const derived = fields.filter((value) => value.type === 'CallExpression' &&
+    memberPathOf(value.callee) === 'FilterStore.appliedLastGoodUsed' &&
+    value.arguments.length === 1 && value.arguments[0].type === 'Identifier' &&
+    value.arguments[0].name === 'applied')
+  assert.strictEqual(derived.length, fields.length,
+    `lastGoodUsed 必须由 applied 快照推导（运行侧口径）：实得 ${fields.map((v) => memberPathOf(v.callee) || v.type).join(', ')}`)
+  const usesLocalLkg = fields.some((value) => memberPathOf(value) === 'loaded.lastGoodUsed')
+  assert.ok(!usesLocalLkg, '不得用控制台进程自己读文件的 lastGoodUsed 冒充运行侧')
 })
 
 // ===== F4-3：瞬时读失败（replaced/ioError）重读一次，不折叠成永久降级 =====
@@ -1887,12 +1930,14 @@ const markerPath = path.join(dir, 'run.log.week')
 let markerType = 'missing'
 try { const st = fs.lstatSync(markerPath); markerType = st.isFIFO() ? 'fifo' : (st.isFile() ? 'file' : 'other') } catch (e) {}
 const logPath = path.join(dir, 'run.log')
-const logText = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : ''
-process.stdout.write(JSON.stringify({ ms, markerType, logHasLine: logText.includes('probe line'), warnedHasMarker: /日志周标记/.test(warned) }))
+// 把 run.log 解析成「逐行记录」再报出去：父进程断言整行内容，而不是在整段文本里找一个子串。
+const logLines = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').split('\\n').filter(Boolean) : []
+process.stdout.write(JSON.stringify({ ms, markerType, logLines, warnedHasMarker: /日志周标记/.test(warned) }))
 `, dir)
   assert.ok(r.ms < 2000, `FIFO 周标记写入必须 2 秒内返回（实耗 ${r.ms}ms）：裸 writeFileSync 会永久阻塞整轮`)
   assert.strictEqual(r.markerType, 'fifo', `周标记必须仍是那个 FIFO（不得被写穿/改名/替换），实际 ${r.markerType}`)
-  assert.strictEqual(r.logHasLine, true, 'run.log 本体必须照常写入（标记写不了不影响留痕）')
+  assert.deepStrictEqual(r.logLines, ['2026-11-10 12:00:00 probe line'],
+    'run.log 本体必须照常写入（标记写不了不影响留痕）：探针写的那一行必须逐字落进日志')
   assert.strictEqual(r.warnedHasMarker, true, '拒绝写非普通文件周标记必须留一条 console.warn（故障可见，不静默）')
 })
 
@@ -2052,12 +2097,27 @@ server.listen(0, '127.0.0.1', async () => {
 })
 
 test('R1-3 静态接线：备份当前一代的读必须显式 openNonBlocking（回退成裸读即红）', () => {
-  if (skipIfInstrumented('R1-3 备份当前一代 openNonBlocking（源码形状断言）')) return
-  const src = fs.readFileSync(path.join(__dirname, 'scripts/console.js'), 'utf8')
-  const line = src.split('\n').find(l => l.includes('readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES'))
-  assert.ok(line, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）')
-  assert.match(line, /openNonBlocking: true/,
-    `备份当前一代的读必须带 openNonBlocking:true（FIFO 会永久阻塞）：${line.trim()}`)
+  if (skipIfInstrumented('R1-3 备份当前一代 openNonBlocking（源码结构断言）')) return
+  // 结构断言：定位「读当前覆盖文件原文」的那次调用（readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES, …)），
+  // 再断言它的第三实参里 openNonBlocking === true——比在源码行上正则更准（换行/缩进/其它 readSafeTextResult 都不影响）。
+  const model = loadModel('scripts/console.js')
+  const reads = []
+  walkAst(model.ast, (node) => {
+    if (node.type !== 'CallExpression' || node.arguments.length < 3) return
+    if (memberPathOf(node.callee) !== 'readSafeTextResult') return
+    if (memberPathOf(node.arguments[0]) !== 'paths.file') return
+    if (memberPathOf(node.arguments[1]) !== 'FILTER_BODY_MAX_BYTES') return
+    reads.push(node)
+  })
+  assert.ok(reads.length > 0, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）')
+  for (const read of reads) {
+    const options = read.arguments[2]
+    const flag = options && options.type === 'ObjectExpression'
+      ? options.properties.find((prop) => prop.type === 'Property' && keyName(prop.key) === 'openNonBlocking')
+      : null
+    assert.ok(flag && flag.value.type === 'Literal' && flag.value.value === true,
+      '备份当前一代的读必须带 openNonBlocking:true（FIFO 会永久阻塞）')
+  }
 })
 
 // R1-5：持久 LKG 写入挂在 loadFilterRules 的成功路径上，而控制台 GET /api/config/filter（4830）与
@@ -2166,18 +2226,47 @@ server.listen(0, '127.0.0.1', async () => {
 // R1-4：README 是**唯一**面向部署者的降级口径说明，没有内容门禁（check-doc-lines 只管行长），
 // 漂移只能靠评审。本题材料里 README 仍写「优先沿用进程内上一次合法规则」——新进程里根本不存在，
 // 正是 F4-1 修掉的缺陷本体。这里把口径钉住：回退成旧措辞即红。
+// 断言不比对整份 README 文本：先把文档解析成「小节 → 条目」两级结构，再断言**具体条目**的字段
+// （哪一条在描述 LKG、它是否退回旧机制、删覆盖文件与 LKG 的关系、applied 快照的字段清单）。
+// 这样重排/折行/调整段落顺序不会误红，而要守的「LKG 这条口径」也定位到了具体条目。
+const readmeBullets = (text) => {
+  const items = []
+  let section = ''
+  let current = null
+  for (const raw of text.split(/\r?\n/)) {
+    const heading = /^(#{2,4})\s+(.*)$/.exec(raw)
+    if (heading) {
+      section = heading[2].trim()
+      current = null
+      continue
+    }
+    const bullet = /^\s*[-*]\s+(.*)$/.exec(raw)
+    if (bullet) {
+      current = { section, text: bullet[1].trim() }
+      items.push(current)
+      continue
+    }
+    if (!raw.trim()) {
+      current = null
+      continue
+    }
+    // 条目会折行：续行并回同一条，避免「一句话被换行切开」影响判定
+    if (current) current.text += ' ' + raw.trim()
+  }
+  return items
+}
 test('R1-4 文档同步：README 必须写持久 LKG（不得再写「进程内上一次合法规则」）', () => {
-  const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')
-  assert.ok(!readme.includes('优先沿用进程内上一次合法规则'),
-    'README 不得再写「进程内 LKG」：控制台 auto-run 每轮都是新进程，进程内 Map 等于不存在（F4-1）')
-  assert.match(readme, /filter-rules\.lastgood\.json/,
-    'README 必须点名持久 LKG 文件 <缓存目录>/filter-rules.lastgood.json')
-  assert.match(readme, /删掉正式覆盖文件时 LKG 一并删除|删除正式覆盖文件时同步删除 LKG/,
+  const items = readmeBullets(fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8'))
+  const lkg = items.find(item => item.text.includes('filter-rules.lastgood.json'))
+  assert.ok(lkg, 'README 必须点名持久 LKG 文件 <缓存目录>/filter-rules.lastgood.json')
+  assert.ok(!lkg.text.includes('优先沿用进程内上一次合法规则'),
+    'README 的 LKG 条目不得再写「进程内 LKG」：控制台 auto-run 每轮都是新进程，进程内 Map 等于不存在（F4-1）')
+  assert.match(lkg.text, /删掉正式覆盖文件时 LKG 一并删除|删除正式覆盖文件时同步删除 LKG/,
     'README 必须写清「删覆盖文件 ⇒ LKG 作废」（否则「删文件=恢复默认」会被降级轮复活旧规则破坏）')
-  const appliedLine = readme.split('\n').find(l => l.includes('filter-rules.applied.json` 快照'))
-  assert.ok(appliedLine, 'README 必须仍描述 filter-rules.applied.json 生效快照')
-  assert.ok(appliedLine.includes('lastGoodUsed'),
-    `applied 快照的字段清单必须含 lastGoodUsed（控制台「沿用上次合法规则」唯一口径）：${appliedLine}`)
+  const applied = items.find(item => item.text.includes('filter-rules.applied.json') && item.text.includes('快照'))
+  assert.ok(applied, 'README 必须仍描述 filter-rules.applied.json 生效快照')
+  assert.ok(applied.text.includes('lastGoodUsed'),
+    `applied 快照的字段清单必须含 lastGoodUsed（控制台「沿用上次合法规则」唯一口径）：${applied.text.slice(0, 200)}`)
 })
 
 // ===== 路径 helper =====
