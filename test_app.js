@@ -95,6 +95,12 @@ const xbk = require('./xbk_function_v3.js')
 const { Config } = xbk
 const fs = require('fs')
 const path = require('path')
+// run.log 摘要行的解析口径**唯一来源**：生产写入侧是 xbk_state_schema.formatRunSummaryLine，
+// 读侧是同一个模块的 parseRunSummaryLine（RUN_SUMMARY_LINE_RE）。断言字段而不是在整行里找子串——
+// includes('pushed=2') 在 pushed=20 / xpushed=2 时同样为真，格式漂移也只能靠人肉发现。
+const { parseRunSummaryLine } = require('./xbk_state_schema')
+// 源码结构视图（S0 工具层）：需要断言「有这个声明/结构相同」时用它，而不是读源码文本做 indexOf 切片
+const { loadModel } = require('./test_support/source_model')
 
 // v3.172：并行 worker 独立缓存目录——多进程共享同一缓存目录曾致沙箱 overlayfs IO 竞态(ENOENT)，
 // 每个 worker 用 xianbaoku_cache_p<N> 彻底隔离（缓存/run.log/state 全独立，无竞态）。
@@ -340,6 +346,39 @@ async function expectRunThrows () {
 // 「改错误文案要同步两处」，也让调用面被拆成两半、grep 一个名字看不全（C5-082）。现合并为一个。
 function assertStrictEqual (actual, expected, msg) {
   if (actual !== expected) throw new Error(msg || `期望=${expected}, 实际=${actual}`)
+}
+
+// run.log 的结构化读法（替代「在整行文本里 includes 子串」）：
+//   · 摘要行一律交给生产的 parseRunSummaryLine 解析（与写入侧 formatRunSummaryLine 同源），
+//     断言 counters/extras 的字段值；
+//   · 其余行按 `<stamp> <LEVEL> <message>` 切字段（_writeRunLog 的固定口径：戳是上海本地时间，
+//     含一个空格），断言 level 与 message，而不是整行子串。
+// 这里读的是**被测进程写出来的日志**（运行期输出，不是生产源码文本），所以它属于行为断言。
+function parseRunLogRows (text) {
+  const rows = []
+  for (const line of String(text).split('\n')) {
+    const raw = line.trim()
+    if (!raw) continue
+    const parts = raw.split(' ')
+    // 第 3 段是纯大写单词时才是 LEVEL（摘要行那里是 `total=…`）
+    const hasLevel = /^[A-Z]+$/.test(parts[2] || '')
+    rows.push({
+      raw,
+      stamp: parts.slice(0, 2).join(' '),
+      level: hasLevel ? parts[2] : '',
+      message: parts.slice(hasLevel ? 3 : 2).join(' ')
+    })
+  }
+  return rows
+}
+
+// 最后一条合格摘要行（解析失败的行返回 null，由调用方断言）
+function lastRunSummary (rows) {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const parsed = parseRunSummaryLine(rows[i].raw)
+    if (parsed) return parsed
+  }
+  return null
 }
 
 // 命名约定（C5-084）——同一语义只允许一种名字，否则 grep 一种模式找不全：
@@ -651,8 +690,9 @@ console.log('========================================\n');
         `终端应显示未推送条数: ${logs.filter(l => l.includes('推送:')).join(' | ')}`)
       ok(!logs.some(line => line.includes('条失败，下次运行重试')), 'dry-run 不得共用真实失败文案')
       const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-      ok(/\sfailed=0\s/.test(` ${lastLine} `), `dry-run run.log 的 failed 应为 0: ${lastLine}`)
-      ok(lastLine.includes('dry-run未推送=2'), `run.log 应另记未推送条数: ${lastLine}`)
+      const summaryLine = parseRunSummaryLine(lastLine)
+      ok(summaryLine && summaryLine.counters.failed === 0, `dry-run run.log 的 failed 应为 0: ${lastLine}`)
+      ok(summaryLine && summaryLine.extras.dryRun === 2, `run.log 应另记未推送条数（dry-run未推送=2）: ${lastLine}`)
     } finally {
       console.log = origLog
       if (origDryRun === undefined) delete process.env.XBK_DRY_RUN
@@ -714,7 +754,8 @@ console.log('========================================\n');
       ok(logs.some(line => line.includes('身份无效:') && line.includes('1 条')),
         `终端应单独统计身份无效条目: ${logs.filter(l => l.includes('身份无效')).join(' | ')}`)
       const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-      ok(lastLine.includes('noidentity=1'), `run.log 应记录 noidentity=1: ${lastLine}`)
+      const noidentitySummary = parseRunSummaryLine(lastLine)
+      ok(noidentitySummary && noidentitySummary.extras.noidentity === 1, `run.log 应记录 noidentity=1: ${lastLine}`)
     } finally {
       console.log = origLog
       try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
@@ -1748,7 +1789,8 @@ console.log('========================================\n');
     const lastLine = content.trim().split('\n').pop()
     ok(/total=\d+ dedup=\d+ filtered=\d+ truncated=\d+ pushed=\d+ failed=\d+ elapsed=[\d.]+s/.test(lastLine),
         `日志行应含完整摘要字段（含 elapsed/truncated），实际: ${lastLine}`)
-    ok(lastLine.includes('pushed=2'), `应记录推送 2 条，实际: ${lastLine}`)
+    const runSummary = parseRunSummaryLine(lastLine)
+    ok(runSummary && runSummary.counters.pushed === 2, `应记录推送 2 条，实际: ${lastLine}`)
     // 测试产生的日志行不污染真实运行日志（测试专用，删掉）
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
@@ -1765,8 +1807,8 @@ console.log('========================================\n');
     ok(threw, '4xx 应使 run 抛错')
     const logPath = path.join(CACHE_DIR, 'run.log')
     ok(fs.existsSync(logPath), 'run.log 应已创建')
-    const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-    ok(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine}`)
+    const lastRow = parseRunLogRows(fs.readFileSync(logPath, 'utf8')).pop()
+    ok(lastRow && lastRow.level === 'ERROR', `应记录 ERROR 行，实际: ${lastRow && lastRow.raw}`)
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
 
@@ -1781,9 +1823,9 @@ console.log('========================================\n');
     ok(threw, '超长错误应使 run 抛错')
     const logPath = path.join(CACHE_DIR, 'run.log')
     ok(fs.existsSync(logPath), 'run.log 应已创建')
-    const lastLine = fs.readFileSync(logPath, 'utf8').trim().split('\n').pop()
-    ok(lastLine.includes('ERROR'), `应记录 ERROR 行，实际: ${lastLine.slice(0, 80)}`)
-    ok(lastLine.length < 1024, `超长 error.message 日志行应 <1KB，实际 ${lastLine.length}`)
+    const lastRow = parseRunLogRows(fs.readFileSync(logPath, 'utf8')).pop()
+    ok(lastRow && lastRow.level === 'ERROR', `应记录 ERROR 行，实际: ${lastRow ? lastRow.raw.slice(0, 80) : '(无日志行)'}`)
+    ok(lastRow && lastRow.raw.length < 1024, `超长 error.message 日志行应 <1KB，实际 ${lastRow ? lastRow.raw.length : 0}`)
     try { fs.unlinkSync(logPath) } catch (e) { /* 忽略 */ }
   })
 
@@ -1799,7 +1841,8 @@ console.log('========================================\n');
       const content = fs.readFileSync(logPath, 'utf8')
       const lastLine = content.trim().split('\n').pop()
       ok(/total=\d+/.test(lastLine), `fail-open 下日志仍应追加摘要行，实际: ${lastLine}`)
-      ok(lastLine.includes('pushed=1'), `应记录推送 1 条，实际: ${lastLine}`)
+      const failOpenSummary = parseRunSummaryLine(lastLine)
+      ok(failOpenSummary && failOpenSummary.counters.pushed === 1, `应记录推送 1 条，实际: ${lastLine}`)
       // 外部创建的锁文件不应被误删（非本次调用创建的锁）
       ok(fs.existsSync(logPath + '.lock'), '外部锁文件不应被删除')
     } finally {
@@ -3039,7 +3082,10 @@ console.log('========================================\n');
       fs.utimesSync(lockPath, aged, aged)
       xbk.App._writeRunLog('存活持有者期间追加\n')
       ok(fs.existsSync(lockPath), '持有进程仍存活时不得抢占 run.log 锁')
-      ok(fs.readFileSync(logPath, 'utf8').includes('存活持有者期间追加'), '拿不到锁也应 fail-open 追加日志')
+      // 断言**逐行内容**而不是整段包含：fail-open 只能追加，不得截尾、不得多写
+      const failOpenLines = fs.readFileSync(logPath, 'utf8').split('\n').map(l => l.trim()).filter(Boolean)
+      assertStrictEqual(failOpenLines.length, 2, `fail-open 只应追加一行（不截尾、不多写）: ${JSON.stringify(failOpenLines)}`)
+      assertStrictEqual(failOpenLines[1], '存活持有者期间追加', '拿不到锁也应 fail-open 追加日志')
       // 2) 超龄锁 + 持有进程已退出 → 回收并在结束后释放
       fs.writeFileSync(lockPath, '999999999')
       fs.utimesSync(lockPath, aged, aged)
@@ -3820,9 +3866,11 @@ console.log('========================================\n');
       const summary = await xbk.run()
       ok(summary.cacheSaved === false, `落盘失败时 summary.cacheSaved 必须为 false，实际 ${JSON.stringify(summary.cacheSaved)}`)
       ok(warns.some(w => w.includes('缓存落盘失败')), `落盘失败应告警，实际告警: ${warns.join(' | ')}`)
-      const log = fs.readFileSync(runLogPath, 'utf8')
-      ok(log.includes('WARN 缓存落盘失败'), `run.log 应含落盘失败 WARN 行: ${log.split('\n').slice(-3).join(' | ')}`)
-      ok(log.includes('cachesaved=0'), 'run.log 摘要行应含 cachesaved=0')
+      const logRows = parseRunLogRows(fs.readFileSync(runLogPath, 'utf8'))
+      const warnRow = logRows.find(r => r.level === 'WARN' && r.message.startsWith('缓存落盘失败'))
+      ok(warnRow, `run.log 应含落盘失败 WARN 行: ${logRows.slice(-3).map(r => r.raw).join(' | ')}`)
+      const cacheFailSummary = lastRunSummary(logRows)
+      ok(cacheFailSummary && cacheFailSummary.extras.cachesaved === 0, 'run.log 摘要行应含 cachesaved=0')
     } finally {
       xbk.MessageStore.saveBatch = origSaveBatch
       console.warn = origWarn
@@ -3942,9 +3990,10 @@ console.log('========================================\n');
       ok(Array.isArray(summary.failures) && summary.failures.length === 1 &&
             summary.failures[0].message.includes('push boom'),
             `推送全失败摘要应保留结构化失败原因: ${JSON.stringify(summary)}`)
-      const log = require('fs').readFileSync(logPath, 'utf8')
-      ok(log.includes('ERROR'), `推送全失败应写 ERROR 行: ${log.slice(-100)}`)
-      ok(log.includes('推送全部失败'), 'ERROR 行应标明推送全部失败')
+      const logRows = parseRunLogRows(require('fs').readFileSync(logPath, 'utf8'))
+      const errorRow = logRows.find(r => r.level === 'ERROR')
+      ok(errorRow, `推送全失败应写 ERROR 行: ${logRows.slice(-2).map(r => r.raw).join(' | ')}`)
+      ok(errorRow && errorRow.message.startsWith('推送全部失败'), 'ERROR 行应标明推送全部失败')
       // v3.170：成功路径 _sendAlert 也 await——告警应在 run 返回前完成
       ok(pushCalls.some(c => c.text && String(c.text).includes('运行异常')),
         '告警应在 run 返回前完成（v3.170 await；曾 fire-and-forget 时序不定）')
@@ -3973,8 +4022,10 @@ console.log('========================================\n');
       const summary = await xbk.run()
       assertStrictEqual(summary.pushed, 1, `部分失败摘要 pushed 应为 1，实际 ${JSON.stringify(summary)}`)
       assertStrictEqual(summary.failed, 1, `部分失败摘要 failed 应为 1，实际 ${JSON.stringify(summary)}`)
-      const log = require('fs').readFileSync(logPath, 'utf8')
-      ok(log.includes('推送部分失败'), `部分失败应写 ERROR 行: ${log.slice(-200)}`)
+      const logRows = parseRunLogRows(require('fs').readFileSync(logPath, 'utf8'))
+      const errorRow = logRows.find(r => r.level === 'ERROR')
+      ok(errorRow && errorRow.message.startsWith('推送部分失败'),
+        `部分失败应写 ERROR 行: ${logRows.slice(-2).map(r => r.raw).join(' | ')}`)
       ok(pushCalls.some(c => String(c.desp || '').includes('推送部分失败')),
         `部分失败必须触发告警（成功/失败条数可读）: ${JSON.stringify(pushCalls.map(c => c.desp))}`)
       // 分类器同口径：degraded 判定（非 null）——单次入口据此置非零退出码
@@ -4214,10 +4265,12 @@ console.log('========================================\n');
         `原路径必须重建为合法缓存并记录本轮推送: ${fs.readFileSync(cachePath, 'utf8').slice(0, 200)}`)
     ok(summary?.pushed === 1, `隔离后本轮推送成功语义不变，实际 ${JSON.stringify(summary)}`)
     // 隔离事件必须进 run.log（否则「整轮零推送 + ERROR + 告警」这条旧信号消失后就成了静默降级）
-    const log = fs.readFileSync(path.join(CACHE_DIR, 'run.log'), 'utf8')
-    ok(log.includes('WARN 缓存JSON 解析失败隔离重建') || log.includes('缓存JSON 解析失败隔离重建'),
-        `run.log 必须留痕隔离事件: ${log.split('\n').slice(-4).join(' | ')}`)
-    ok(log.includes('.corrupt.'), `run.log 必须点名备份路径: ${log.split('\n').slice(-4).join(' | ')}`)
+    const logRows = parseRunLogRows(fs.readFileSync(path.join(CACHE_DIR, 'run.log'), 'utf8'))
+    const isolateRow = logRows.find(r => r.level === 'WARN' && r.message.startsWith('缓存JSON 解析失败隔离重建'))
+    ok(isolateRow, `run.log 必须留痕隔离事件: ${logRows.slice(-4).map(r => r.raw).join(' | ')}`)
+    // 必须点名**这次实际**产生的备份文件（而不是任意含 .corrupt. 的行）：备份名对不上就说明留痕指向别处
+    ok(isolateRow && isolateRow.message.includes(baks[0]),
+      `run.log 必须点名备份路径 ${baks[0]}: ${isolateRow && isolateRow.raw}`)
     wipeBaks()
   })
 
@@ -4547,27 +4600,26 @@ console.log('========================================\n');
     assertStrictEqual(rawRecursiveRm.length, 4,
       `递归删除只能收敛到 removeDirInRoot + 1 处声明豁免 + 本用例哨兵（实得 ${rawRecursiveRm.length} 处）`)
 
-    // 两侧同源块逐字符比对（normalize：去整行注释、去空行、去行尾空白、行首空白）
-    // 提取口径：先剥注释（否则 indexOf 可能命中注释里形如代码的锚点串），再从**行首**锚点切到
-    // buildCacheShard 之后的第一个顶层声明。不能切到首个空行——函数体内也有空行（实测会截到 152 字符）。
-    const extractBlock = (src) => {
-      const clean = stripComments(src)
-      const a = clean.indexOf('const CACHE_SHARD_ID_RE =')
-      const b = clean.indexOf('function buildCacheShard (rawId, root, pathMod) {')
-      if (a < 0 || b < 0) return ''
-      const tail = clean.slice(b)
-      const m = /\n(function |const |\(async )/.exec(tail)
-      if (!m) return clean.slice(a)
-      return clean.slice(a, b + m.index + 1)
+    // 两侧同源块必须**结构**相同（不许各改一处就漂移）：按名字取同名声明（正则常量 / 上限 /
+    // sanitizeIsolationId / buildCacheShard），比较去掉 loc/range 的 AST。逐字符比对会把「只格式化 /
+    // 只改注释」判成漂移（假红），而这里要守的不变式是「改一处必须同改另一处」——AST 相同才是它。
+    const structuralBlock = (file) => {
+      const ast = loadModel(file).ast
+      const wanted = ['CACHE_SHARD_ID_RE', 'CACHE_SHARD_ID_MAX', 'sanitizeIsolationId', 'buildCacheShard']
+      const found = new Map()
+      for (const node of ast.body) {
+        if (node.type === 'FunctionDeclaration' && node.id) found.set(node.id.name, node)
+        else if (node.type === 'VariableDeclaration') {
+          for (const decl of node.declarations) if (decl.id.type === 'Identifier') found.set(decl.id.name, decl)
+        }
+      }
+      const missing = wanted.filter(name => !found.has(name))
+      assertStrictEqual(missing.length, 0, `${file} 缺少同源块的声明: ${missing.join(', ')}`)
+      return JSON.stringify(wanted.map(name => found.get(name)), (key, value) =>
+        (key === 'loc' || key === 'start' || key === 'end' || key === 'range' ? undefined : value))
     }
-    const normalize = (text) => text
-      .split('\n').map(line => line.trim()).filter(Boolean).join('\n')
-    const mine = normalize(extractBlock(fs.readFileSync(__filename, 'utf8')))
-    const other = normalize(extractBlock(fs.readFileSync(path.join(__dirname, 'test_filter.js'), 'utf8')))
-    ok(mine.length > 200 && other.length > 200,
-      `同源块提取失败（自身 ${mine.length} / test_filter ${other.length} 字符）——锚点注释失效`)
-    assertStrictEqual(mine, other,
-      'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须逐字符相同（改一处必须同改另一处）')
+    assertStrictEqual(structuralBlock(__filename), structuralBlock(path.join(__dirname, 'test_filter.js')),
+      'test_app.js 与 test_filter.js 的 sanitizeIsolationId/buildCacheShard 块必须结构相同（改一处必须同改另一处）')
   })
 
   // ============================================================

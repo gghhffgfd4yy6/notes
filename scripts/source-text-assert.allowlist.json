@@ -1,13 +1,13 @@
 {
   "note": "紧凑基线（schema 3）：只冻结「测试文件 → 源码文本断言条数」。口径见 scripts/check-source-text-asserts.js 文件头；新增即 exit 1，只减不增。锚点与行号是内部定位信息，不进基线。",
   "schema": 3,
-  "total": 2404,
+  "total": 2363,
   "by_file": {
     "test_agents.js": 1,
     "test_analyze_artifacts.js": 1,
-    "test_app.js": 29,
+    "test_app.js": 17,
     "test_app_p.js": 1,
-    "test_app_unit.js": 74,
+    "test_app_unit.js": 45,
     "test_check_deps.js": 1,
     "test_check_mutation_ranges.js": 2,
     "test_ci_skip_suites.js": 107,
