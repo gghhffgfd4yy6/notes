@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.469 — S0 r26：收五条 must_fix（①逐元素回调 lines.some(l=>l.includes) 整条漏检 ②两跳 pass-through helper + 声明提升仍 0 命中 ③「未新增」文案未限定扫描面且面外 helper 无告警 ④基线文件搬出扫描面整份脱保仍全绿 ⑤CHANGELOG v3.468 的归因算式与逐文件对账不符）；只改 scripts/、测试面与文档，生产逻辑一行未改；白名单 2238 → 2386 全部是逐元素回调的首次可见（首次可见 +148 / 消失 −0） *******
+//* ******* 线报酷推送脚本 v3.470 — S0 r27：只补 scripts/check-source-text-asserts.js 里 outOfFaceSuspects() 的字符串比较器（[...set].sort() → .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))，与同文件既有三处同口径），修 SonarCloud javascript:S2871；默认 sort 对字符串本就是 UTF-16 码元序，判定语义逐元素等价（8 组样本实测全等 + 写错即不同的对照组），白名单 2386 未动，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

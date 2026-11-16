@@ -821,7 +821,7 @@ function outOfFaceSuspects (files, requires) {
     fromByTarget.get(target).add(from)
   }
   const rows = []
-  const grouped = new Map([...fromByTarget].map(([file, set]) => [file, [...set].sort()]))
+  const grouped = new Map([...fromByTarget].map(([file, set]) => [file, [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))]))
   for (const [rel, froms] of sortedByFile(grouped)) {
     let hits
     try {
