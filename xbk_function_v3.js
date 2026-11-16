@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.462 — S0 收 r20 Codacy 七条 Semgrep 告警：上一轮给动态路径 fs 调用补的是 ESLint 系裸 eslint-disable（security/detect-non-literal-fs-filename），本仓 Codacy 同时跑 Semgrep/opengrep，其规则只认行尾 nosemgrep；故在 7 处（1592/1620/1625/1630/1637/1690/1694）行尾各补一条 nosemgrep + 中文理由，两套注解并存、断言逻辑与判定语义一行未改；只动测试/CHANGELOG/版本号，白名单 3131 原地 *******
+//* ******* 线报酷推送脚本 v3.463 — S0 收尾（范围裁到核心）：基线口径从「生产源码锚点」改成「测试文件 → 断言条数」（schema 3：total 629 = by_file 36 个文件之和，旧口径 3131 = literal 2855 + dynamic 276）；闸门扫描面收窄到测试面（test_*.js / test/** / test_support/**，不扫 scripts/ 与生产 .js），检测面裁到 5 种形状（直接字面量 / 变量锚点与比较 / 模板插值 / reader 别名 / helper 返回源码），其余复杂数据流写进文件头 known-uncovered 清单；测试用例 52 → 12 条、被测脚本 2897 → 477 行、探针 797 → 343 行。只动测试/工具层/文档与版本，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

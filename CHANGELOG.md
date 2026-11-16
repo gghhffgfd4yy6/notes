@@ -1761,3 +1761,15 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **改动（7 行，全部只加行尾注释）**：1592（`fs.writeFileSync(`，多行调用首行，注解落在命中行行尾、参数行原地未挪）、1620 / 1625 / 1630 / 1637（`path.join(dir, 'scripts', 'source-text-assert.allowlist.json')`，`dir` = `mkdtemp` 隔离工作区 + 本文件硬编码段）、1690 / 1694（`snap` = 本用例 `mkdtemp` 私有目录 0700 随机名 + 硬编码 `inventory.json`）；逐条理由写明「路径来源、无外部净输入、语义未改」，既有的中文理由行与 `// eslint-disable-next-line` 一行未动。
   - **验证**：`TZ=UTC node test_check_source_text_asserts.js` 52/52；`node scripts/check-source-text-asserts.js` exit 0（3131 = 3131，literal 2855 / dynamic 276，54 个文件）；`node check-version.js` 四方一致；`npx standard test_check_source_text_asserts.js` exit 0；`grep -c nosemgrep` 24 → 31。
   - **版本**：3.461.0 → **3.462.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.463
+
+- **S0 收尾：范围裁到核心（只动测试 / 工具层 / 文档 / 版本；生产逻辑一行未改）**。上一版把 S0 做成了「穷尽所有绕过写法」的闸门：被测脚本 2897 行、自测 2065 行、探针 797 行，相对 `origin/main` 7095 行增量、20 轮评审仍在长——owner 判定范围失控，要求砍到核心。
+- **基线口径换单位：从「生产源码锚点」改成「测试文件 → 断言条数」**。`scripts/source-text-assert.allowlist.json` 变成 schema 3 的 `{ schema, total, by_file }`：**total 629 = by_file 36 个测试文件之和**（旧口径是 schema 2 的 3131 = literal 2855 + dynamic 276、54 个文件，anchor 全仓）。`total` 与 `by_file` 之和不等即 exit 2；闸门运行时同时打印「基线 total」与「实测 total」。锚点与行号只作内部定位信息（命中时打印行），**不进基线**。
+- **扫描面收窄到测试面**：根 `test_*.js` + `test/**` + `test_support/**` 的 `.js/.cjs/.mjs`，共 67 个文件；`scripts/` 与生产 `.js` 不再入账（那是被测系统，把「读缓存/日志后做字符串判定」冻进基线会让任何生产改动都误红）。
+- **检测面裁到 5 种形状**：① 直接 `assert.ok(src.includes('字面量'))`；② 变量实参 / 比较运算符 / `assert.strictEqual` 等值族；③ 模板插值；④ reader 别名（arrow 与解构重命名）；⑤ 本地 helper 返回源码文本的调用点。其余复杂数据流（`.call/.apply/.bind`、计算成员、跨文件 helper、嵌套导出对象、`JSON.stringify`、`parseShell` tokens、split 下标、inventory 陈旧校验、git 参照增长核对）已删除，并逐条写进 `scripts/check-source-text-asserts.js` 文件头的 **known-uncovered** 清单（形状说明 + 反例），明确不覆盖、不得当作已守。
+- **与 plan 的 857 不可换算（如实记下）**：plan 里的 857（`test_console.js 783`）是 v3.442 起草时那版**文件级正则**（变量名按整文件认，`text`/`src`/`out` 也命中 fixture/lock 内容）的实测值；本口径是作用域感知的 AST 判定，同一份测试面实测 629。逐文件差额（如 `test_console.js` 783 → 374、`test_app.js` 24 → 24、`test_filter.js` 12 → 11、`test_ci_static_gates.js` 0 → 8）来自两把不同的尺子，不是「债变少/变多」，**不得**据此声称完成度。
+- **自测从 52 条裁到 12 条**（`test_check_source_text_asserts.js` 2065 → 353 行）：5 种形状各一条正向必红（断言 exit 1、点名「文件 基线0/实测1/+1」、标出形状与命中行，删掉后恢复 exit 0）+ 反向必绿（AST/配置/行为断言不入账、`scripts/` 与生产 `.js` 不在扫描面）+ 基线段（增长拒绝且不改盘、显式 `--allow-growth` 才写、`total≠sum` exit 2、新文件按 0 算、下降只报 shortfall）+ 端到端（真实仓库 exit 0 且打印 total）。
+- **探针精简到 JS 生产面**（797 → 348 行）：保留真实词法重排（`(`/`)`/`,`/`{`/`}` 两侧插空格 + 重缩进）、`try/finally` + 信号还原、`git status --short` 对账（新增改动 exit 3）、扰动面下限 fail-closed；删掉 yaml/json/css/html/shell 扰动与读取轨迹垫片——非 JS 资产由本闸按「读文本断言条数」守，探针只回答生产 JS 这一问（文件头写明）。
+- **验证**：`node scripts/check-source-text-asserts.js` exit 0 并打印 `基线 total=629 … 实测 total=629`；`TZ=UTC node test_check_source_text_asserts.js` 12/12；`node scripts/probe-format-coupling.js test_check_source_text_asserts.js` exit 0（扰动 75 个生产文件，format-clean，还原校验一致）；`TZ=UTC node test_ci_static_gates.js` 12/12；`TZ=UTC node test_source_model.js` 13/13；`node check-version.js` 四方一致；`npx standard` 改动文件 exit 0。
+- **版本**：3.462.0 → **3.463.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。

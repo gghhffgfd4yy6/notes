@@ -52,10 +52,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；测试 job 不需要 git 凭据
-          # r18-B1：源码文本断言闸门要用「参照版本的 allowlist」核对基线没有被抬高（只减不增的机械判据）。
-          # 浅克隆（默认 depth=1）在本 job 里**不够**：参照是 base 分支的提交，与 HEAD 可能隔任意多层，
-          # 且 merge-base 需要历史；取不到参照时闸门在 CI（CI=true）上 fail-closed ⇒ 必须整取历史。
-          fetch-depth: 0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
@@ -86,21 +82,13 @@ jobs:
       - name: 版本一致性闸门（文件头 ↔ CHANGELOG ↔ package.json）
         run: node check-version.js
 
-      # v3.444 源码文本断言闸门（v3.445 从 policy 挪到本 job）：禁止测试里新增「读源码文本」的断言（`src.includes('…')` 之类）。
-      # 三处接线（npm run check 链 / pre-commit 第 5 道 / 这里）缺一即成摆设，缺任一处由
-      # test_ci_static_gates.js 的「check:assert-style 三处接线」用例判红。
-      # 为何在 quality 而不在 policy：该闸用 acorn 解析 test_*.js（scripts/check-source-text-asserts.js），
-      # 而 policy 是**刻意零依赖**的静态闸 job（只装 shellcheck/zizmor，从不跑 npm ci）——放在那里必然
-      # MODULE_NOT_FOUND；本 job 的 npm ci 已经把 acorn（dependencies）装好了，不必为一个 3s 闸门
-      # 再给 policy 加一条安装路径。
-      # 位置：Lint / 版本一致性之后、单元测试之前——秒级门禁先失败，不必等全量单测跑完才红。
+      # v3.444 源码文本断言闸门（v3.445 从 policy 挪到本 job）：禁止测试里新增「读源码文本」的断言。
+      # 三处接线（npm run check 链 / pre-commit 第 5 道 / 这里）缺一即成摆设，由 test_ci_static_gates.js
+      # 的「check:assert-style 三处接线」用例判红。
+      # 为何在 quality 而不在 policy：该闸用 acorn 解析测试面 .js，而 policy 是**刻意零依赖**的静态闸 job
+      # （只装 shellcheck/zizmor，从不跑 npm ci）——放在那里必然 MODULE_NOT_FOUND；本 job 的 npm ci 已装好 acorn。
       - name: 源码文本断言闸门（禁止新增读源码文本断言）
         run: npm run check:assert-style
-        env:
-          # r18-B1：基线「只减不增」的参照。PR 上是 base 分支，push 到 main 时就是 main 自身；
-          # 用 env 而不是往 run 里拼参数：步骤的 run 串必须与本地同一条 npm 链（test_ci_static_gates.js 锁着）。
-          # 取不到这个 ref 时闸门在 CI=true 下 fail-closed（宁可红，不许静默跳过增长核对）。
-          SOURCE_TEXT_ASSERT_BASELINE_REF: origin/${{ github.base_ref || 'main' }}
 
       # v3.447：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样显式列步骤
       # ——否则脱门；摘除静态扫描步骤、check 链或 pre-commit 门链，本步骤变红）。

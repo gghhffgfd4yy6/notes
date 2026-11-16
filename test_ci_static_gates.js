@@ -121,14 +121,9 @@ check('test.yml：CI 步骤存在、shellcheck 有兜底安装、zizmor 钉版�
 // 被摘掉，都不会让任何东西变红——「删一行接线」本身不是失败。故这里把「三处都在」做成可被反例驱动的
 // 纯函数（不在函数里读盘），再用合成输入逐个删一处证明它真的会红。
 //
-// r4 评审（B 的 must_fix + C 的 should_fix）指出：v3.444 的三条接线断言读的是 `.githooks/pre-commit`
-// 与 `test.yml` 的**源码文本**（正则经 lineThat/linesThat 的形参传入，连闸门自己都数不到），而且只判
-// 「文件里有没有这行」、不判它在哪个 job——v3.445 的「从 policy 挪到 quality」正是靠 CI 的
-// MODULE_NOT_FOUND 才被发现的。现在改成**结构断言**：
-//   · `.githooks/pre-commit` → source_model.parseShell 的 tokens（引号感知切词，不当文本比对，
-//     注释/缩进/行序调整都不再误红）；
-//   · `.github/workflows/test.yml` → source_model.loadYaml 解析后断言 job / step 字段，
-//     并锁住「在 quality job，且 policy job 里没有」——policy 是零依赖 job，粘到那边必 MODULE_NOT_FOUND。
+// 判据是**结构断言**（不是源码文本）：`.githooks/pre-commit` 走 source_model.parseShell 的 tokens
+// （引号感知切词，注释/缩进/行序调整都不误红），`test.yml` 走 loadYaml 解析后断言 job / step 字段，
+// 并锁住「在 quality job、policy 里没有」——policy 零依赖，粘过去必 MODULE_NOT_FOUND。
 function assertAssertStyleWiring (pkg, hookLines, workflow) {
   assert.strictEqual(pkg.scripts['check:assert-style'], 'node scripts/check-source-text-asserts.js',
     'check:assert-style 脚本名必须指向 scripts/check-source-text-asserts.js')
@@ -160,18 +155,6 @@ function assertAssertStyleWiring (pkg, hookLines, workflow) {
     'test.yml 的源码文本断言闸门不得带 step 级 if: 条件——只在某些事件/恒假条件下跑等于该步骤从未存在')
   assert.strictEqual(gateSteps[0]['continue-on-error'], undefined,
     'test.yml 的源码文本断言闸门不得设 continue-on-error: true——失败不阻断 job = 闸门永不拦人')
-  // r18-B1：基线增长核对的参照必须由 CI 显式交给闸门。没有它时闸门只能拿 HEAD 当参照
-  // （= 自己提交里的基线），「手改 by_file + total 等量抬高」在 CI 上永远对不上任何历史 ⇒ 形同虚设。
-  const gateEnv = gateSteps[0].env || {}
-  // 期望值逐段拼接：直接写会触发 standard 的 no-template-curly-in-string（这不是模板字符串）。
-  const wantRef = ['origin/$', '{', "{ github.base_ref || 'main' }}"].join('')
-  assert.strictEqual(gateEnv.SOURCE_TEXT_ASSERT_BASELINE_REF, wantRef,
-    'test.yml 的该步骤必须用 env 交出基线的参照 ref（env 而非 run 参数：run 串被锁成与本地同一条 npm 链）')
-  // 参照要能解析，就得有历史：checkout 默认 depth=1 取不到 base 分支的提交。
-  const checkouts = steps.filter((s) => s && typeof s.uses === 'string' && s.uses.startsWith('actions/checkout@'))
-  assert.strictEqual(checkouts.length, 1, 'quality job 必须恰好有一个 actions/checkout 步骤')
-  assert.strictEqual(String((checkouts[0].with || {})['fetch-depth']), '0',
-    'quality job 的 checkout 必须 fetch-depth: 0——基线参照是 base 分支的提交，浅克隆取不到（CI=true 时闸门会 fail-closed）')
   const policySteps = (workflow.jobs.policy && workflow.jobs.policy.steps) || []
   assert.strictEqual(policySteps.filter((s) => s && s.run === 'npm run check:assert-style').length, 0,
     'policy job 不得再挂该闸门：policy 刻意零依赖（不 npm ci），require(\'acorn\') 必 MODULE_NOT_FOUND')
@@ -234,23 +217,6 @@ check('check:assert-style 三处接线：check 链 / pre-commit / test.yml 缺�
     s['continue-on-error'] = true
   })), /不得设 continue-on-error/,
   '给该步骤加 continue-on-error: true 必须判红（失败不阻断 job = 闸门永不拦人）')
-  // r18-B1 的反例：去掉 env 里的参照 ref / 把 checkout 退回浅克隆，两种写法下「增长核对」在 CI 上
-  // 都退化成拿自己提交里的基线当参照（等于没有），但整条接线用例在旧断言下依然全绿——故各一条反例。
-  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
-    delete s.env
-  })), /必须用 env 交出基线的参照 ref/,
-  '摘掉该步骤的 SOURCE_TEXT_ASSERT_BASELINE_REF 必须判红')
-  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
-    s.env.SOURCE_TEXT_ASSERT_BASELINE_REF = 'HEAD'
-  })), /必须用 env 交出基线的参照 ref/,
-  '把参照改成 HEAD 必须判红（HEAD 就是本次提交自己，等于没有参照）')
-  assert.throws(() => assertAssertStyleWiring(pkg, hook, (() => {
-    const broken = JSON.parse(JSON.stringify(wf))
-    const checkout = broken.jobs.quality.steps.find((s) => s && typeof s.uses === 'string' && s.uses.startsWith('actions/checkout@'))
-    checkout.with['fetch-depth'] = 1
-    return broken
-  })()), /必须 fetch-depth: 0/,
-  'checkout 退回浅克隆（depth=1）必须判红：取不到 base 分支的提交，CI 上闸门直接 fail-closed')
 })
 
 check('scorecard.yml：analysis job 的 job 级 permissions 必须显式保留 contents: read（C10-047）', () => {
