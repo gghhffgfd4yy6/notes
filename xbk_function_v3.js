@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.467 — S0 r24：只修 SonarCloud javascript:S2871——scripts/check-source-text-asserts.js 的 baselineExactDiffs 里 [...files].sort() 补上与该文件 :594 / :979 同口径的字符串比较器 (a, b) => (a < b ? -1 : a > b ? 1 : 0)（默认 sort() 的比较口径本就是 UTF-16 码元序，补上后排序结果逐字相同）；判定语义、白名单 2080（37 个文件）与全部输出一律不变。只动一行工具代码与版本记录，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.468 — S0 r25：收两条 must_fix（①function 声明提升时 ⑤helper 链条整条静默 0 命中、闸门照绿 ②helper 返回值由源码形参切片而来时整族漏检 ③容器字段 .codeOnly 未纳入检测面）；只改 scripts/check-source-text-asserts.js、自测、test_suites.js 与文档，生产逻辑一行未改；白名单 2080 → 2238 全部是既有断言的首次可见（「尺子变准」，断言本体一条未改） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

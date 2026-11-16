@@ -249,6 +249,76 @@ check('形状⑤ helper 返回源码：本地函数返回值被判定为源码�
     /test_helper\.js:6 .*（⑤helper 源码\/形参）/, SHAPE_HITS[5])
 })
 
+// r25-A：function 声明是提升的，调用点可以写在声明之前（断言在文件头、helper 在文件尾是本仓常见写法）。
+// 旧实现三遍各自 newScope(null) ⇒ 记录遍在调用点处 helper/funcs 表仍为空 ⇒ 整条 ⑤ 链条静默 0 命中、
+// 闸门照绿（实测 total=0 / exit 0）。这条用例把两种顺序、两条路（返回值 / 形参）都钉住。
+check('形状⑤ 声明提升：调用点在 function 声明之前（返回值与形参两条路）同样必须红，顺序不改变结论', () => {
+  const ws = makeWorkspace()
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const callFirst = [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'assert.ok(laterDeclared("scripts/console.js").includes("HOIST_RETURN_ANCHOR"))',
+    'function laterDeclared (f) {',
+    '  return fs.readFileSync(f, "utf8")',
+    '}',
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_hoist.js', callFirst)
+  const red = runGate(ws)
+  assert.strictEqual(red.code, 1,
+    `调用点写在声明之前必须 exit 1（旧实现 0 命中、exit 0），实得 ${red.code}\n${red.out}${red.err}`)
+  assert.ok(red.err.includes('test_hoist.js  基线 0 / 实测 1 / +1'),
+    `必须点名该文件 +1，实得：\n${red.err}`)
+  assert.match(red.err, /test_hoist\.js:4 .*（⑤helper 源码\/形参）/,
+    `必须标出形状⑤与命中行，实得：\n${red.err}`)
+  // 对照组：把 function 声明换到调用点之前，结论必须完全相同（顺序不是判据）。
+  const declFirst = [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'function laterDeclared (f) {',
+    '  return fs.readFileSync(f, "utf8")',
+    '}',
+    'assert.ok(laterDeclared("scripts/console.js").includes("HOIST_RETURN_ANCHOR"))',
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_hoist.js', declFirst)
+  const redControl = runGate(ws)
+  assert.strictEqual(redControl.code, 1, `声明在前同样必须红，实得 ${redControl.code}\n${redControl.out}${redControl.err}`)
+  assert.ok(redControl.err.includes('test_hoist.js  基线 0 / 实测 1 / +1'), `声明在前必须同样 +1，实得：\n${redControl.err}`)
+  // 形参路：调用点在前、声明在后；命中点在函数体的比对处（第 7 行）。
+  writeFile(ws, 'test_hoist.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'checkLate(src)',
+    'function checkLate (t) {',
+    '  assert.ok(t.includes("PARAM_HOIST_ANCHOR"))',
+    '}',
+    ''
+  ].join('\n'))
+  const redParam = runGate(ws)
+  assert.strictEqual(redParam.code, 1,
+    `形参收到源码文本 + 声明在后必须 exit 1（旧实现在调用点处 resolveFunc 为 null，0 命中），实得 ${redParam.code}\n${redParam.out}${redParam.err}`)
+  assert.ok(redParam.err.includes('test_hoist.js  基线 0 / 实测 1 / +1'), `形参路必须 +1，实得：\n${redParam.err}`)
+  assert.match(redParam.err, /test_hoist\.js:7 .*（⑤helper 源码\/形参）/, `形参命中必须标成 ⑤，实得：\n${redParam.err}`)
+  // 反向：同样的提升顺序，但实参不是源码文本 ⇒ 不得入账（否则任何后置函数都会被误计）。
+  writeFile(ws, 'test_hoist.js', [
+    '"use strict"',
+    'const assert = require("node:assert")',
+    'checkLate("不是文件内容")',
+    'function checkLate (t) {',
+    '  assert.ok(t.includes("PARAM_HOIST_ANCHOR"))',
+    '}',
+    ''
+  ].join('\n'))
+  const green = runGate(ws)
+  assert.strictEqual(green.code, 0, `实参不是源码文本时不得入账（提升顺序不改变这一点），实得：\n${green.out}${green.err}`)
+})
+
 /* ── 数据流边界：异步读取 / 形参 / 链式 reader / loadModel.code ─────────── */
 
 check('异步读取链：await fs.promises.readFile(…) 与回调式 fs.readFile(…, (e, data) => …) 都必须入账', () => {
@@ -350,6 +420,55 @@ check('loadModel(f).code / model.code / const { code } = … 必须计入（不�
   assert.strictEqual(r.code, 1, `model.code 就是源码原文，必须 exit 1，实得 ${r.code}\n${r.out}${r.err}`)
   assert.ok(r.err.includes('test_model_code.js  基线 0 / 实测 3 / +3'),
     `三处写法各 1 条（funcs.has 是结构断言、不计），实得：\n${r.err}`)
+})
+
+// r25-C：`.codeOnly` 与 `.code` 同性质（只去注释、折叠空白，仍是读进来的原文）。旧实现只认 `.code`
+// ⇒ 把 `src.includes(...)` 改写成 `loadModel(f).codeOnly.includes(...)` 会让该文件条数合法降到 0，
+// 白名单能在断言一条未改的情况下归零（契约见脚本文件头与 SYSTEM_CONTRACT.md）。
+check('容器字段 codeOnly：loadModel(f).codeOnly / model.codeOnly / const { codeOnly } = … 都必须计入', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_model_codeonly.js', [
+    '"use strict"',
+    'const assert = require("node:assert")',
+    'const { loadModel } = require("./test_support/source_model")',
+    'assert.ok(loadModel("scripts/console.js").codeOnly.includes("CHAIN_CODEONLY"))',
+    'const model = loadModel("scripts/console.js")',
+    'assert.ok(model.codeOnly.includes("MEMBER_CODEONLY"))',
+    'const { codeOnly } = loadModel("scripts/console.js")',
+    'assert.ok(codeOnly.includes("DESTRUCTURED_CODEONLY"))',
+    'assert.ok(model.funcs.has("messagesCacheName"))',
+    ''
+  ].join('\n'))
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const r = runGate(ws)
+  assert.strictEqual(r.code, 1, `codeOnly 就是源码原文，必须 exit 1（旧实现 0 命中），实得 ${r.code}\n${r.out}${r.err}`)
+  assert.ok(r.err.includes('test_model_codeonly.js  基线 0 / 实测 3 / +3'),
+    `三种写法各 1 条（funcs.has 是结构断言、不计），实得：\n${r.err}`)
+  assert.match(r.err, /test_model_codeonly\.js:4 .*CHAIN_CODEONLY/, `loadModel(f).codeOnly 必须入账，实得：\n${r.err}`)
+  assert.match(r.err, /test_model_codeonly\.js:6 .*MEMBER_CODEONLY/, `model.codeOnly 必须入账，实得：\n${r.err}`)
+  assert.match(r.err, /test_model_codeonly\.js:8 .*DESTRUCTURED_CODEONLY/, `解构 codeOnly 必须入账，实得：\n${r.err}`)
+  // 单条隔离副本：必须就是 1 条（这是「改写成容器字段 ⇒ 白名单归零」这条路的最小复现）。
+  writeFile(ws, 'test_model_codeonly.js', [
+    '"use strict"',
+    'const assert = require("node:assert")',
+    'const { loadModel } = require("./test_support/source_model")',
+    'assert.ok(loadModel("x.js").codeOnly.includes("A"))',
+    ''
+  ].join('\n'))
+  const one = runGate(ws)
+  assert.strictEqual(one.code, 1, `单条 codeOnly 断言必须 exit 1，实得 ${one.code}\n${one.out}${one.err}`)
+  assert.ok(one.err.includes('test_model_codeonly.js  基线 0 / 实测 1 / +1'),
+    `必须 exactly 1 条（多算/少算都是口径漂移），实得：\n${one.err}`)
+  // 反向：`.codeOnly` 落在**非** loadModel 视图对象上（普通对象字段）不得入账——否则任何同名属性都被误计。
+  writeFile(ws, 'test_model_codeonly.js', [
+    '"use strict"',
+    'const assert = require("node:assert")',
+    'const other = { codeOnly: "x" }',
+    'assert.ok(other.codeOnly.includes("NOT_A_MODEL"))',
+    ''
+  ].join('\n'))
+  const green = runGate(ws)
+  assert.strictEqual(green.code, 0, `非 loadModel 视图对象的 .codeOnly 不得入账，实得：\n${green.out}${green.err}`)
 })
 
 check('解构出来的等值断言函数：const { strictEqual } / 重命名 eq 都必须入账', () => {

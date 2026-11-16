@@ -28,13 +28,22 @@
  *      （map/filter/flatMap 的回调返回源码文本 ⇒ 整条链是源码文本），以及**同文件 helper 的形参**：
  *      `const checkYml = (t) => { assert.ok(t.includes('X')) }` 之后 `checkYml(src)`——形参在调用点
  *      收到源码文本，函数体里的比对点按其调用点入账（形参名不参与判定，看的是实参的数据流）。
+ *      **声明顺序不影响**：function 声明在 JS 里是提升的，调用点写在声明之前（断言在文件头、helper
+ *      在文件尾）同样入账——三遍遍历共享 funcs/helpers 两张表并跨遍累积（r25-A：旧实现三遍各自
+ *      `newScope(null)`，这种写法整条链静默 0 命中、闸门照绿）。
+ *      形参与返回值两条路在这里**交汇**：helper 的返回值若由收到源码文本的形参切片/拼接而来
+ *      （`function jobBlock (workflowText) { return workflowText.split('\n').slice(a, b).join('\n') }`
+ *      之后 `jobBlock(src).includes('…')`），调用点同样入账——只对着外层作用域判返回值时形参不可见，
+ *      这类 helper 会整条链漏掉（r25-A 在 test_ci_skip_suites.js:360 的真实复现即此）。
  *   异步读取整条链同样在检测面内：`const s = await fs.promises.readFile(f, 'utf8')` 后 `s.includes('…')`
  *   （AwaitExpression / ChainExpression 往下追一层），以及回调式
  *   `fs.readFile(f, 'utf8', (e, data) => assert.ok(data.includes('…')))`（readFile 的回调签名是
  *   (err, data)，末位形参登记为源码文本）。
- *   `loadModel(f).code`（及其等价 `model.code`、`const { code } = loadModel(f)`）**计入**：
- *   `model.code` 就是读进来的源码原文（`codeOnly` 只去注释），与 `parseShell(...).tokens` 这类
- *   解析产物性质不同——否则把 `src.includes` 改写成容器字段就能让白名单合法归零。
+ *   `loadModel(f).code` / `loadModel(f).codeOnly`（及其等价 `model.code` / `model.codeOnly`、
+ *   `const { code } = …` / `const { codeOnly } = …`）**两个字段都计入**：它们都是读进来的源码原文
+ *   （`codeOnly` 只去注释、折叠空白），与 `parseShell(...).tokens` 这类解析产物性质不同——否则把
+ *   `src.includes` 改写成容器字段就能让白名单合法归零（r25-C：旧实现只认 `.code`，仓内既有的
+ *   `m.codeOnly.includes(…)` 因此全记 0 条）。
  *   比对 API 仍是同一族：includes/startsWith/endsWith/indexOf/lastIndexOf/search/match/matchAll、
  *   `/re/.test(src)`、`assert.match/doesNotMatch(src, …)`、`==/===/!=/!==` 与 assert 等值比较族。
  *   量纲断言（`.length` / `typeof`）不计；`JSON.parse` / `acorn.parse` / `yaml.load` 之后是结构化
@@ -94,7 +103,7 @@
  *   5. 字符串化后再比：`JSON.stringify(src).includes('X')`——`JSON.stringify` 被当作产出非文本，
  *      `JSON.parse(src)` 之后的字段比对同理（后者是本批的目标形态，故意放行）。
  *   6. 解析成 token/结构后再比：`parseShell(f).tokens[0] === 'run_gate'`——容器字段是解析产物，
- *      不算源码文本（`loadModel(f).code` 例外：它就是原文，已计入，见上）。
+ *      不算源码文本（`loadModel(f).code` / `.codeOnly` 例外：它们就是原文，已计入，见上）。
  *   7. split 之后按下标取值：`src.split('\n')[3] === 'x'`——下标成员表达式没有 receiver 绑定，
  *      不入账（`src.split('\n').includes('x')` 这类整体比对仍计入）。
  *   8. 解构形参 / 传给二期函数：`function f ({ text }) { … }`、`const g = (t) => h(t)` 里 h 定义在
@@ -133,6 +142,10 @@ const BASELINE_REF_ENV = 'SOURCE_TEXT_ASSERT_BASELINE_REF'
 const SOURCE_CALLS = new Set(['readFileSync', 'readFile', 'codeOf', 'codeOnly', 'stripComments', 'stripComment'])
 // 解析源码文本得到的视图对象：`loadModel(f).code` 就是读进来的原文（codeOnly 只去注释），必须计入。
 const MODEL_CALLS = new Set(['loadModel'])
+// 视图对象上「就是源码原文」的字段：`.code` 与 `.codeOnly` 都是（codeOnly 只去注释、折叠空白）。
+// 只认 code 会让 `src.includes` → `loadModel(f).codeOnly.includes` 的改写在断言一条未改的情况下
+// 把该文件计数合法降到 0（白名单可归零 ⇒ 闸门形同不存在）。
+const MODEL_CODE_FIELDS = new Set(['code', 'codeOnly'])
 // receiver 是源码文本 ⇒ 文本比对的字符串方法（matchAll 与 match 同口径）。
 const STRING_METHODS = new Set(['includes', 'startsWith', 'endsWith', 'indexOf', 'lastIndexOf', 'search', 'match', 'matchAll'])
 // 等值比较族：与 `===` 同口径（`assert.strictEqual(src, '…')` 是同一件事的写法）。
@@ -221,6 +234,8 @@ function analyzeFile (code, file) {
   const hits = []
   // 同文件 helper 的形参污染：fnNode → 在调用点收到「源码文本」实参的形参名集合。
   // 为什么要跨遍收集：调用点可能在函数声明之前（提升），一遍走完才知道全部实参。
+  // 跨遍收集只有在 funcs/helpers 也跨遍保留时才成立（见 scopeFor）：每遍重建这两张表的话，
+  // 记录遍在调用点处仍然查不到函数节点，这条链就静默断掉（r25-A）。
   const sourceParams = new Map()
   let recording = false
   const newScope = (parent) => ({
@@ -241,6 +256,29 @@ function analyzeFile (code, file) {
     for (let s = scope; s; s = s.parent) if (s.funcs.has(name)) return s.funcs.get(name)
     return null
   }
+  // 作用域按 AST 节点分身份，三遍遍历只在 owner（Program / 函数节点）之间**保留 funcs/helpers 两张表**：
+  // function 声明是**提升**的，调用点可以写在声明之前（断言在文件头、helper 在文件尾是本仓常见写法），
+  // 旧实现三遍各自 `newScope(null)` ⇒ 记录遍在调用点处看到的 helper/funcs 表仍为空，整条 ⑤ 链条
+  // 静默 0 命中、闸门照绿（r25-A 实测 total=0 / exit 0）。
+  // 只保留这两张表、**不**保留 vars/models：它们在遍与遍之间累积会把后文声明的外层同名变量泄漏给
+  // 前文的函数体（实测 test_ci_skip_suites.js 的局部 `lines` 撞上顶层 `lines`，凭空多计 13 条），
+  // 那是尺子漂移不是事实；funcs/helpers 是纯函数级事实，跨遍只会单调收敛。
+  const hoistFacts = new Map()
+  const factsFor = (owner) => {
+    let facts = hoistFacts.get(owner)
+    if (!facts) {
+      facts = { funcs: new Map(), helpers: new Set() }
+      hoistFacts.set(owner, facts)
+    }
+    return facts
+  }
+  const scopeFor = (owner, parent) => {
+    const facts = factsFor(owner)
+    const scope = newScope(parent)
+    scope.funcs = facts.funcs
+    scope.helpers = facts.helpers
+    return scope
+  }
 
   function isSource (node, scope) {
     if (!node) return false
@@ -259,8 +297,9 @@ function analyzeFile (code, file) {
         return isSource(node.expression, scope)
       case 'MemberExpression':
         // `loadModel(f).code` / `model.code`：code 字段就是读进来的原文（不是解析产物），
-        // 计入才能堵住「把 includes 改写成容器字段 ⇒ 白名单合法下降」这条路。
-        if (!node.computed && node.property.type === 'Identifier' && node.property.name === 'code') {
+        // 计入才能堵住「把 includes 改写成容器字段 ⇒ 白名单合法下降」这条路。`.codeOnly` 同口径
+        // （只去注释、折叠空白，仍是原文）——漏掉它，改写容器字段就能让该文件计数归零（r25-C）。
+        if (!node.computed && node.property.type === 'Identifier' && MODEL_CODE_FIELDS.has(node.property.name)) {
           return isModelCall(node.object) || (node.object.type === 'Identifier' && inScope(scope, 'models', node.object.name))
         }
         return false
@@ -384,12 +423,18 @@ function analyzeFile (code, file) {
     return 2
   }
 
+  // 形参（由调用点种入的源码文本）判定：两侧都是形参时，「同源」取决于调用点，不能按「两侧同类」放过。
+  const isParamSource = (node, scope) => !!node && node.type === 'Identifier' && inScope(scope, 'paramSources', node.name)
+
   // 命中判定：receiver 绑定到源码文本 + 在做字符串比对。返回 { anchor, shape } 或 null。
   function classify (node, scope) {
     if (node.type === 'BinaryExpression' && COMPARISONS.has(node.operator)) {
       const leftSource = isSource(node.left, scope)
       const rightSource = isSource(node.right, scope)
-      if (leftSource === rightSource) return null // 两侧同类：关系比较，不是排版锚点
+      // 两侧同类 ⇒ 关系比较，不是排版锚点。**例外**：两侧都是形参时，它们是否同源取决于调用点
+      // （共享 helper 里一个调用点传两段源码，就会让其余调用点的断言全部静默消失——实测
+      // test_app.js 的 assertStrictEqual(actual, expected)）。这种按「可能同源」计入，多算方向安全。
+      if (leftSource === rightSource && !(leftSource && isParamSource(node.left, scope) && isParamSource(node.right, scope))) return null
       if (leftSource && isNonText(node.right)) return null
       const anchorNode = leftSource ? node.right : node.left
       return { anchor: anchorOf(anchorNode), shape: shapeOf(anchorNode, null, scope) }
@@ -422,7 +467,9 @@ function analyzeFile (code, file) {
     if (equality && node.arguments.length >= 2) {
       const a = isSource(node.arguments[0], scope)
       const b = isSource(node.arguments[1], scope)
-      if (a === b) return null
+      // 同 BinaryExpression：两侧都是形参时按「可能同源」计入（调用点决定，不能按两侧同类放过）。
+      const bothParams = a && isParamSource(node.arguments[0], scope) && isParamSource(node.arguments[1], scope)
+      if (a === b && !bothParams) return null
       if (a && isNonText(node.arguments[1])) return null
       const anchorNode = a ? node.arguments[1] : node.arguments[0]
       return { anchor: anchorOf(anchorNode), shape: shapeOf(anchorNode, null, scope) }
@@ -443,13 +490,10 @@ function analyzeFile (code, file) {
     return data.type === 'Identifier' ? { cb, data } : null
   }
 
-  function visitFunction (fn, scope) {
-    const inner = newScope(scope)
-    // 函数声明提升到声明它的那个作用域（供调用点污染与 helper 判定用）。
-    if (fn.id && fn.type === 'FunctionDeclaration') scope.funcs.set(fn.id.name, fn)
-    if (fn.id && fn.type === 'FunctionDeclaration' && returnsSource(fn, scope)) scope.helpers.add(fn.id.name)
-    // 形参污染：调用点已证明某个形参收到源码文本 ⇒ 在函数作用域里把该形参登记为源码文本
-    // （`const checkYml = (t) => t.includes('X')` 再 `checkYml(src)` 必须入账）。
+  // 函数自身作用域 + 形参污染：调用点已证明某个形参收到源码文本 ⇒ 在该作用域里把形参登记为源码文本
+  // （`const checkYml = (t) => t.includes('X')` 再 `checkYml(src)` 必须入账）。
+  function functionScope (fn, scope) {
+    const inner = scopeFor(fn, scope)
     const seeded = sourceParams.get(fn)
     if (seeded) {
       for (const param of fn.params) {
@@ -459,6 +503,18 @@ function analyzeFile (code, file) {
         }
       }
     }
+    return inner
+  }
+
+  function visitFunction (fn, scope, prepared) {
+    const inner = prepared || functionScope(fn, scope)
+    // 函数声明提升到声明它的那个作用域（供调用点污染与 helper 判定用）。
+    if (fn.id && fn.type === 'FunctionDeclaration') scope.funcs.set(fn.id.name, fn)
+    // helper 判定必须建立在**已种入形参**的作用域上：`function slice (text) { return text.split('\n')
+    // .slice(0, 2).join('\n') }` 的返回值是不是源码文本，取决于调用点传了什么（本仓 jobBlock /
+    // stepBlockForName 都是这种「切片后返回」的 helper）。拿外层作用域判定时形参不可见 ⇒ 调用点
+    // 整条链 0 命中（r25-A 在 test_ci_skip_suites.js:360 的真实复现就是这条）。
+    if (fn.id && fn.type === 'FunctionDeclaration' && returnsSource(fn, inner)) scope.helpers.add(fn.id.name)
     if (fn.body.type === 'BlockStatement') fn.body.body.forEach((stmt) => visit(stmt, inner))
     else visit(fn.body, inner)
   }
@@ -505,12 +561,15 @@ function analyzeFile (code, file) {
       }
       if (isFunction(init)) {
         // ④/⑤：按返回值判定，不看名字。表达式体箭头（`() => fs.readFileSync(…)`）是 reader 别名，
-        // 块体函数（`function f () { return fs.readFileSync(…) }`）是 helper。
-        if (id.type === 'Identifier' && returnsSource(init, scope)) {
+        // 块体函数（`function f () { return fs.readFileSync(…) }`）是 helper。形参同 visitFunction：
+        // 先种入「调用点已证明收到源码文本」的形参，再判返回值——`const slice = (text) =>
+        // text.split('\n').slice(0, 2).join('\n')` 与 function 声明是同一件事。
+        const inner = functionScope(init, scope)
+        if (id.type === 'Identifier' && returnsSource(init, inner)) {
           (init.body.type === 'BlockStatement' ? scope.helpers : scope.readers).add(id.name)
         }
         if (id.type === 'Identifier') scope.funcs.set(id.name, init)
-        visitFunction(init, scope)
+        visitFunction(init, scope, inner)
         return
       }
       visit(init, scope)
@@ -525,14 +584,14 @@ function analyzeFile (code, file) {
       } else if (id.type === 'ObjectPattern') {
         // `const { readFileSync: read } = require('fs')`：简单解构重命名 → reader 别名；
         // `const { strictEqual: eq } = require('node:assert/strict')` → 等值断言别名；
-        // `const { code } = loadModel(f)` → code 就是源码原文。
+        // `const { code } = loadModel(f)` / `const { codeOnly } = loadModel(f)` → 都是源码原文。
         for (const prop of id.properties) {
           const from = prop.key && (prop.key.name || prop.key.value)
           const to = prop.value && prop.value.type === 'Identifier' ? prop.value.name : from
           if (!to) continue
           if (SOURCE_CALLS.has(from)) scope.readers.add(to)
           if (EQUALITY_CALLS.has(from)) scope.equalities.add(to)
-          if (isModelCall(init) && from === 'code') scope.vars.add(to)
+          if (isModelCall(init) && MODEL_CODE_FIELDS.has(from)) scope.vars.add(to)
         }
         visit(id, scope)
       } else {
@@ -556,12 +615,14 @@ function analyzeFile (code, file) {
 
   // 三遍：① 收集调用点污染；② 带上①的种子再收集一遍（helper 链两级）；③ 记录命中。
   // 前两遍不记录，只为让「形参收到源码文本」这个事实先于记录成立（调用点可能在定义之前）。
+  // funcs/helpers 三遍共用（见 scopeFor）：否则「调用点在前、function 声明在后」这种提升写法在
+  // 记录遍仍看到空表 —— r25-A 实测 total=0 / exit 0。
   for (let pass = 0; pass < 2; pass++) {
-    const scope = newScope(null)
+    const scope = scopeFor(ast, null)
     ast.body.forEach((stmt) => visit(stmt, scope))
   }
   recording = true
-  const root = newScope(null)
+  const root = scopeFor(ast, null)
   ast.body.forEach((stmt) => visit(stmt, root))
   return hits
 }
