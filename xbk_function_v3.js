@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.488 — C2 r1：恢复被删的 .msg-content/.msg-caret 与遮罩 opacity:0+forwards 判据、补回「正式运行红色危险按钮」与 @layer base 约束、修 nowCallsOutside 跨文件偏移与 CONSOLE_ASSET_DIR 的 cwd 依赖；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.489 — C2 r2：只修文档与版本——v3.487 段的检查器引文改为实跑逐字（origin/main 不带 ^）并补上 ⚠️ 扫描面外 24 条这一块，exprLabel/matchesCompare 的归属改记为 test_console.js 本地 helper；生产与测试逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
