@@ -52,6 +52,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；测试 job 不需要 git 凭据
+          # r23-B2：源码文本断言闸门要拿「参照提交里的基线」核对只减不增（见下方 check:assert-style 步骤）。
+          # 默认 depth=1 是**浅克隆**：参照是 base 分支的提交，与 HEAD 可能隔任意多层；push 到 main 时还要取
+          # HEAD 之前的提交（参照 == HEAD 时闸门绝不自比自，改用它之前的提交）。取不到参照时闸门在 CI
+          # （CI=true）上 fail-closed ⇒ 必须整取历史。
+          fetch-depth: 0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
@@ -89,6 +94,13 @@ jobs:
       # （只装 shellcheck/zizmor，从不跑 npm ci）——放在那里必然 MODULE_NOT_FOUND；本 job 的 npm ci 已装好 acorn。
       - name: 源码文本断言闸门（禁止新增读源码文本断言）
         run: npm run check:assert-style
+        env:
+          # r23-B2：基线「只减不增」的增长参照。PR 上是 base 分支，push 到 main 时是 main 自身
+          # （解析到被判定提交本身时闸门改用它的父提交，绝不自比自）；取不到参照、或参照树里没有基线
+          # 文件且不属于可证明的「首次引入」（本变更新增该文件 + 基线逐文件==实测）时，CI 上 fail-closed
+          # （exit 2），故上面 checkout 必须 fetch-depth: 0。
+          # 经 env 注入而不是往 run 里拼参数：步骤的 run 串必须与本地同一条 npm 链（test_ci_static_gates.js 锁着）。
+          SOURCE_TEXT_ASSERT_BASELINE_REF: origin/${{ github.base_ref || 'main' }}
 
       # v3.447：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样显式列步骤
       # ——否则脱门；摘除静态扫描步骤、check 链或 pre-commit 门链，本步骤变红）。

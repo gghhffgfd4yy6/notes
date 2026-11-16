@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.465 — S0 r22 十条 must_fix：闸门检测面补齐（异步 await/回调读取、const read = fs.readFileSync 成员别名、解构 strictEqual 族、map/filter/flatMap 链式 reader、同文件 helper 形参、loadModel(...).code），恢复「基线只减不增」的 git 参照校验（--baseline-ref / --allow-growth --reason 留痕、参照不可得时 CI fail-closed），--write-allowlist 不再对旧 schema / 坏 JSON 自锁；白名单 629 → 2080 是仪器变宽后既有断言首次可见（逐文件差额见 CHANGELOG），一条断言未新增未放宽。只动测试面、工具层与文档，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.466 — S0 r23 两条 must_fix：增长核对的参照不得是 HEAD 自身（候选链去掉 HEAD，候选指到被判定提交时改用它的父提交；参照不可得 / 参照树无基线文件时 CI fail-closed exit 2、本机打印「无法核对增长」且绝不出现 ✓；显式参照不可用一律 exit 2），CI 侧恢复 fetch-depth: 0 与 SOURCE_TEXT_ASSERT_BASELINE_REF=origin/<base> 并由 test_ci_static_gates.js 的接线断言与四条靶向反例锁死；自测 24 → 28 检查（全部真实 git 隔离仓库）。只动测试面、工具层、workflow 与文档，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

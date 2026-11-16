@@ -155,6 +155,24 @@ function assertAssertStyleWiring (pkg, hookLines, workflow) {
     'test.yml 的源码文本断言闸门不得带 step 级 if: 条件——只在某些事件/恒假条件下跑等于该步骤从未存在')
   assert.strictEqual(gateSteps[0]['continue-on-error'], undefined,
     'test.yml 的源码文本断言闸门不得设 continue-on-error: true——失败不阻断 job = 闸门永不拦人')
+  // 增长参照接线（r23-B2）：步骤存在 ≠ 能核对。基线「只减不增」要把当前基线与**参照提交里的基线**逐文件
+  // 比一遍，而 quality job 默认是浅克隆（depth=1）——参照（base 分支提交 / HEAD 之前那个提交）取不到时
+  // 闸门在 CI（CI=true）上 fail-closed（exit 2）或退回「无法核对增长」，两种都不是「已核对」。缺任一项，
+  // 被拦的「手改 by_file 与 total 等量抬高」就重新变成假绿，故这里把两项一起锁死：
+  //   · checkout 必须 fetch-depth: 0（整取历史）；
+  //   · 该步骤必须经 env 注入 SOURCE_TEXT_ASSERT_BASELINE_REF = origin/${{ github.base_ref || 'main' }}
+  //     （PR 上是 base 分支，push 到 main 时由闸门改用它之前的提交），不得内联进 run（run 串要与本地
+  //     同一条 npm 链），也不得写成 HEAD（那就是被判定提交本身 ⇒ 基线自比自恒绿）。
+  const checkout = steps.find((s) => s && typeof s.uses === 'string' && s.uses.startsWith('actions/checkout@'))
+  assert.ok(checkout, 'quality job 必须有 actions/checkout 步骤（增长核对要读参照提交里的基线）')
+  assert.strictEqual(checkout.with && checkout.with['fetch-depth'], 0,
+    'quality job 的 checkout 必须 fetch-depth: 0——浅克隆取不到 base 分支 / 父提交，闸门在 CI 上 fail-closed（exit 2）')
+  // 逐段拼接：期望值含 GitHub 表达式语法（`${{`），直接写字面量会触发 standard 的 no-template-curly-in-string。
+  const BASELINE_REF_EXPECTED = 'origin/$' + '{{ github.base_ref || ' + "'main' }}"
+  assert.strictEqual(gateSteps[0].env && gateSteps[0].env.SOURCE_TEXT_ASSERT_BASELINE_REF, BASELINE_REF_EXPECTED,
+    `该步骤必须经 env 注入增长参照 SOURCE_TEXT_ASSERT_BASELINE_REF=${BASELINE_REF_EXPECTED}（PR 上是 base 分支）`)
+  assert.ok(!String(gateSteps[0].run).includes('baseline-ref'),
+    'REF 不得内联进 run：步骤 run 串必须与本地同一条 npm 链（npm run check:assert-style）')
   const policySteps = (workflow.jobs.policy && workflow.jobs.policy.steps) || []
   assert.strictEqual(policySteps.filter((s) => s && s.run === 'npm run check:assert-style').length, 0,
     'policy job 不得再挂该闸门：policy 刻意零依赖（不 npm ci），require(\'acorn\') 必 MODULE_NOT_FOUND')
@@ -217,6 +235,33 @@ check('check:assert-style 三处接线：check 链 / pre-commit / test.yml 缺�
     s['continue-on-error'] = true
   })), /不得设 continue-on-error/,
   '给该步骤加 continue-on-error: true 必须判红（失败不阻断 job = 闸门永不拦人）')
+  // 增长参照的两条靶向反例（r23-B2）：这两项各自被摘掉时，增长核对都会退回「没参照」——
+  // 前者在 CI 上 exit 2（闸门常红），后者让「手改 by_file 与 total 等量抬高」重新假绿。逐个必须红。
+  const dropCheckoutKey = (key) => {
+    const broken = JSON.parse(JSON.stringify(wf))
+    const co = broken.jobs.quality.steps.find((s) => s && typeof s.uses === 'string' && s.uses.startsWith('actions/checkout@'))
+    delete co.with[key]
+    return broken
+  }
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropCheckoutKey('fetch-depth')), /fetch-depth: 0/,
+    '摘掉 checkout 的 fetch-depth: 0 必须判红（浅克隆取不到参照 ⇒ CI 上 fail-closed）')
+  const dropRefEnv = (mutate) => {
+    const broken = JSON.parse(JSON.stringify(wf))
+    const step = broken.jobs.quality.steps.find((s) => s && s.run === 'npm run check:assert-style')
+    if (mutate) mutate(step)
+    else delete step.env
+    return broken
+  }
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropRefEnv()), /必须经 env 注入增长参照/,
+    '摘掉 env 的 SOURCE_TEXT_ASSERT_BASELINE_REF 必须判红（没有参照 = 增长核对静默失效）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropRefEnv((s) => {
+    s.env.SOURCE_TEXT_ASSERT_BASELINE_REF = 'HEAD'
+  })), /必须经 env 注入增长参照/,
+  '把参照写成 HEAD 必须判红（HEAD 就是被判定提交本身，基线自比自恒绿——r23-A1/B1/C1 的原缺陷）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropRefEnv((s) => {
+    s.run = 'npm run check:assert-style --baseline-ref origin/main'
+  })), /必须走与本地同一条 npm 链/,
+  '把参照内联进 run 必须判红（run 串与本地链分叉，参照接线再也不会被同一套断言看见）')
 })
 
 check('scorecard.yml：analysis job 的 job 级 permissions 必须显式保留 contents: read（C10-047）', () => {

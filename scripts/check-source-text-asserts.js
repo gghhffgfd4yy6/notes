@@ -61,9 +61,20 @@
  *     ——理由必填，并写进基线的 `growth` 段（钉参照提交 sha + 逐文件增量）与 CI 日志。
  *   · 运行侧：`verifyGrowthAgainstReference` 把**当前基线**与 git 参照版本逐文件 + total 比一遍，
  *     手改 JSON 把 by_file 与 total 等量抬高会在这里 exit 1。参照 = `--baseline-ref` /
- *     `SOURCE_TEXT_ASSERT_BASELINE_REF` → origin/main → origin/master → main → master → HEAD；
- *     拿不到参照时**非 CI 打印原因后跳过，CI（`CI=true/1/…`）fail-closed exit 2**——
- *     「读不到」不得读成「没有增长」。参照提交里还没有基线文件（首个引入基线的 PR）才允许跳过。
+ *     `SOURCE_TEXT_ASSERT_BASELINE_REF`（显式给出时是**唯一**候选）→ origin/main → origin/master → main
+ *     → master；**HEAD 永不作参照**——它就是被判定的提交本身，基线自比自会恒打印「✓ 未增长」，
+ *     手改 by_file 与 total 等量抬高在 CI 形态（detached 单提交、没有 base 引用）下就完全不拦。
+ *     候选解析出来的提交若**恰好就是 HEAD**（本地在 main 上、CI push 到 main），改用它**之前的提交**
+ *     （`<ref>^`）这条真实 base 引用；取不到父提交（根提交 / 浅克隆）时按「参照不可得」处理。
+ *   · 参照不可得（无 git / 候选都解析不出 / 参照树里没有基线文件 / 候选就是 HEAD 且无父提交）时：
+ *     **CI（`CI=true/1/…`）fail-closed exit 2**；非 CI 打印「无法核对增长」后按 on-disk 基线继续，
+ *     **绝不打印 ✓**（「读不到」不得读成「没有增长」）。显式给出的参照不可用一律 exit 2（本机也不降级）；
+ *     `--allow-growth` 是唯一的人工放行路径，且输出里同样不出现 ✓。
+ *     **唯一例外 = 可证明的「首次引入基线」**（`firstBaselineBootstrap`）：参照树里没有这份文件**且**
+ *     `git diff --diff-filter=A <参照> HEAD` 证明是**本变更新增**了它**且** on-disk 基线逐文件与实测
+ *     **完全一致**（不留预授权额度）⇒ 打印「无法核对增长（首次引入）」并放行（CI 亦然，仍不打印 ✓）。
+ *     少了任何一条即回到 fail-closed——这条例外的窗口只有「基线文件本身还没进 base 分支」那一次，
+ *     基线进 main 之后所有 PR / push 都走正常参照核对。
  *   · 读基线只走一次 `readFileSync`（缺文件 = ENOENT ⇒ 没有旧基线），写盘走「同目录临时文件 + rename
  *     原子替换」：先 `existsSync` 探测再读/写同一路径是 check-then-use（CodeQL js/file-system-race /
  *     TOCTOU），不得回退成探测式。代价是一处已登记的行为变化：`chmod 444` 的基线旧实现 EACCES
@@ -98,7 +109,7 @@
  * 真实值（旧口径把 fixture/lock/日志的 .includes 也算进同名变量），**这不是债变多，是尺子变准**。
  *
  * 退出码：0 无新增 / 1 有新增（某文件超基线、新文件、或基线相对参照被抬高）/
- *         2 基线读不出、基线自相矛盾、扫描失败、参照不可得（CI）或用法错误。
+ *         2 基线读不出、基线自相矛盾、扫描失败、参照不可得（CI 或显式给出）或用法错误。
  *
  * 用法：
  *   node scripts/check-source-text-asserts.js                    # 门禁（exit 0/1/2）
@@ -726,27 +737,60 @@ function isCiEnv (value) {
   return true
 }
 
-// 参照基线：{ ok:true, label, commit, raw } | { ok:false, kind, reason }。
+// 参照候选链：**不含 HEAD**。HEAD 就是被判定的提交本身，拿它当参照等于基线自比自，恒打印
+// 「✓ 未增长」——r22-B2 要拦的「手改 by_file 与 total 等量抬高」在 CI 形态（detached 单提交、
+// 没有 base 引用）下因此完全不拦。候选指到 HEAD 时另走「改用父提交」那条路（见下）。
+const DEFAULT_REF_CANDIDATES = ['origin/main', 'origin/master', 'main', 'master']
+const shortSha = (sha) => String(sha || '').slice(0, 12)
+
+// 参照基线：{ ok:true, label, commit, raw, note } | { ok:false, kind, explicit, reason }。
 // 形状不合法（schema≠3 / 缺 by_file）的版本按「这一项不可用」处理并继续找下一项——参照坏了不能读成零增长。
+//
+// 三条硬规则（r23-A1/B1/C1）：
+//   ① 参照**不得**是被判定的提交本身：候选解析出来等于 HEAD 时改用它之前的提交（`<ref>^`，真实 base 引用）；
+//      取不到父提交（根提交 / 浅克隆）⇒ 按「参照不可得」处理，绝不退回自比自。
+//   ② 参照树里**没有基线文件**而当前树有 ⇒ 不是「没有可比的历史」，而是「无法核对」：CI fail-closed exit 2。
+//   ③ 显式给出（--baseline-ref / SOURCE_TEXT_ASSERT_BASELINE_REF）时它是**唯一**候选，不可用即 exit 2。
 function resolveReferenceBaseline (flags) {
   const explicit = flags.baselineRef || process.env[BASELINE_REF_ENV] || ''
   if (!gitRun(['rev-parse', '--git-dir']).ok) {
-    return { ok: false, kind: 'no-git', reason: '非 git 环境（git 不可用或仓库根不是 work tree）' }
+    return { ok: false, kind: 'no-git', explicit: !!explicit, reason: '非 git 环境（git 不可用或仓库根不是 work tree）' }
   }
-  const candidates = explicit ? [explicit] : ['origin/main', 'origin/master', 'main', 'master', 'HEAD']
+  const head = gitRun(['rev-parse', '--verify', '--quiet', 'HEAD'])
+  const headCommit = head.ok ? head.out : ''
+  const candidates = explicit ? [explicit] : DEFAULT_REF_CANDIDATES
   const problems = []
-  let missingFile = false
+  let sawMissingFile = false
+  let sawSelf = false
+  let missingAt = null
   for (const candidate of candidates) {
     const rev = gitRun(['rev-parse', '--verify', '--quiet', candidate + '^{commit}'])
     if (!rev.ok) {
       problems.push(`${candidate} 不可解析`)
       continue
     }
-    const shown = gitRun(['show', candidate + ':' + ALLOW_REL])
+    let target = { sha: rev.out, label: candidate, note: '' }
+    if (headCommit && rev.out === headCommit) {
+      // 候选 = 被判定的提交本身（本地在 main 上、CI push 到 main）：基线自比自恒绿，不能当参照。
+      // 换用它的父提交这条真实 base 引用；根提交 / 浅克隆取不到 ⇒ 这一项按参照不可得处理。
+      const parent = gitRun(['rev-parse', '--verify', '--quiet', candidate + '^'])
+      if (!parent.ok || parent.out === headCommit) {
+        sawSelf = true
+        problems.push(`${candidate}（${shortSha(rev.out)}）就是被判定提交本身且取不到它之前的提交，不能当参照`)
+        continue
+      }
+      target = {
+        sha: parent.out,
+        label: candidate + '^',
+        note: `${candidate} 指向被判定的提交本身（${shortSha(rev.out)}），参照改用它的父提交 ${shortSha(parent.out)}` +
+          '（基线自比自恒绿，不能当参照）'
+      }
+    }
+    const shown = gitRun(['show', target.sha + ':' + ALLOW_REL])
     if (!shown.ok) {
-      problems.push(`${candidate} 里没有 ${ALLOW_REL}`)
-      // 显式指定且那个提交还没有基线文件 ⇒ 首个引入基线的 PR，属「没有可比的历史」而非配置错误。
-      if (explicit && candidate === explicit) missingFile = true
+      sawMissingFile = true
+      if (!missingAt) missingAt = { sha: target.sha, label: target.label }
+      problems.push(`${target.label}（${shortSha(target.sha)}）里没有 ${ALLOW_REL}`)
       continue
     }
     let raw = null
@@ -758,20 +802,39 @@ function resolveReferenceBaseline (flags) {
     if (!raw || raw.schema !== SCHEMA || !isCount(raw.total) || !raw.by_file ||
       typeof raw.by_file !== 'object' || Array.isArray(raw.by_file)) {
       if (explicit && candidate === explicit) {
-        return { ok: false, kind: 'explicit-missing', reason: `指定的参照 ${explicit} 的基线形状不可用（需要 schema ${SCHEMA} + total/by_file）` }
+        return {
+          ok: false,
+          kind: 'explicit-missing',
+          explicit: true,
+          reason: `指定的参照 ${explicit} 的基线形状不可用（需要 schema ${SCHEMA} + total/by_file）`
+        }
       }
       problems.push(`${candidate} 的基线形状不可用`)
       continue
     }
-    return { ok: true, label: candidate, commit: rev.out, raw }
+    return { ok: true, label: target.label, commit: target.sha, raw, note: target.note }
   }
-  if (missingFile) {
-    return { ok: false, kind: 'no-baseline-in-ref', reason: `参照 ${explicit} 里没有 ${ALLOW_REL}（首个引入基线的 PR）` }
+  const reason = problems.join('；') || '没有可用的参照候选'
+  if (explicit) {
+    // 显式参照**可解析、只是树里还没有基线文件**：与默认候选同一语义（唯一的例外是「可证明的首次引入」，
+    // 由 firstBaselineBootstrap 判定）。其余（ref 拼错 / 形状坏）一律 explicit-missing，本机也不降级。
+    if (sawMissingFile && missingAt) {
+      return { ok: false, kind: 'no-baseline-in-ref', explicit: true, reason, refCommit: missingAt.sha, refLabel: missingAt.label }
+    }
+    return { ok: false, kind: 'explicit-missing', explicit: true, reason: `指定的参照 ${explicit} 不可用（${reason}）` }
   }
+  // 三态分开，fail-closed 的文案必须能直接指向修法：
+  //   no-baseline-in-ref = 参照树里没有基线文件（base 分支还没有这份文件）
+  //   self-reference     = 候选就是被判定提交本身，且拿不到它之前的提交
+  //   no-ref             = 一个候选都解析不出来
+  const kind = sawMissingFile ? 'no-baseline-in-ref' : sawSelf ? 'self-reference' : 'no-ref'
   return {
     ok: false,
-    kind: explicit ? 'explicit-missing' : 'no-ref',
-    reason: explicit ? `指定的参照 ${explicit} 不可用（${problems.join('；')}）` : problems.join('；')
+    kind,
+    explicit: false,
+    reason,
+    refCommit: missingAt ? missingAt.sha : '',
+    refLabel: missingAt ? missingAt.label : ''
   }
 }
 
@@ -806,23 +869,86 @@ function growthAcceptedByRecord (record, growth, commit) {
 
 // 门禁路径：相对参照不得增长；增长只有基线里的 growth 登记（--write-allowlist --allow-growth --reason
 // 写下的那份）或运行期的 --allow-growth 能放行，两者都必须在输出里留痕。
-function verifyGrowthAgainstReference (baseline, flags) {
+// 参照不可得时**绝不打印 ✓**：CI 上 exit 2（fail-closed），本机打印「无法核对增长」后按 on-disk 基线继续。
+// 显式参照不可用（拼错 / 没 fetch / 形状坏 / 就是被判定提交本身）一律 exit 2，本机也不降级。
+function baselineAddedSince (commit) {
+  if (!commit) return { ok: false, reason: '参照提交未知' }
+  const diff = gitRun(['diff', '--name-status', '--diff-filter=A', commit, 'HEAD', '--', ALLOW_REL])
+  if (!diff.ok) return { ok: false, reason: `git diff ${shortSha(commit)}..HEAD 不可用（${diff.reason}）` }
+  const lines = diff.out.split('\n').map((line) => line.trim()).filter(Boolean)
+  const added = lines.some((line) => {
+    const [status, ...rest] = line.split('\t')
+    return status === 'A' && rest.join('\t') === ALLOW_REL
+  })
+  return added ? { ok: true } : { ok: false, reason: `本变更没有新增 ${ALLOW_REL}（git diff --diff-filter=A 无该项）` }
+}
+
+// 基线与实测的逐文件差额（两个方向都算）：首次引入时要求**完全一致**，不留任何预授权额度。
+function baselineExactDiffs (baseline, measured) {
+  const files = new Set([...Object.keys(baseline.by_file), ...measured.keys()])
+  const rows = []
+  for (const file of [...files].sort()) {
+    const allowed = isCount(baseline.by_file[file]) ? baseline.by_file[file] : 0
+    const count = measured.get(file) || 0
+    if (allowed !== count) rows.push({ file, allowed, count })
+  }
+  return rows
+}
+
+// 「首次引入基线」的可证明形态（参照树里没有基线文件时唯一允许放行的情形）：
+//   ① 本变更相对参照**新增**了这份文件（参照里根本没有它 ⇒ 不存在「把已有基线抬高」这件事）；
+//   ② on-disk 基线逐文件与本次实测**完全一致**（既无超基线的增长，也没有高于实测的预授权额度）。
+// 把「没有历史可比」换成一条当场可核的更强判据；两条缺一即按参照不可得处理（CI fail-closed）。
+function firstBaselineBootstrap (reference, baseline, measured) {
+  if (reference.kind !== 'no-baseline-in-ref') return { ok: false, reason: '不属于「参照树里没有基线文件」' }
+  const added = baselineAddedSince(reference.refCommit)
+  if (!added.ok) return added
+  const diffs = baselineExactDiffs(baseline, measured)
+  if (diffs.length) {
+    return {
+      ok: false,
+      reason: '基线逐文件与实测不一致（' + diffs.slice(0, 5).map((d) => `${d.file} 基线 ${d.allowed} / 实测 ${d.count}`).join('；') +
+        '）——首次引入时基线必须等于实测，不得预留额度'
+    }
+  }
+  return { ok: true, total: baseline.total }
+}
+
+function verifyGrowthAgainstReference (baseline, flags, measured) {
   const reference = resolveReferenceBaseline(flags)
   if (!reference.ok) {
-    if (reference.kind === 'explicit-missing') {
-      die(2, `❌ ${reference.reason}。显式指定的参照不可用不能当成「零增长」。`)
-    }
+    let reason = reference.reason
     if (reference.kind === 'no-baseline-in-ref') {
-      console.log(`ℹ️ 无法核对基线增长（${reference.reason}）：没有可比的历史，本次跳过增长核对。`)
+      const boot = firstBaselineBootstrap(reference, baseline, measured || new Map())
+      if (boot.ok) {
+        console.log(`ℹ️ 无法核对增长（${reason}）：参照树里没有这份基线、本变更新增了它 = 首次引入，没有可比的历史；` +
+          `已按「基线逐文件与实测完全一致」核对（total=${boot.total}），不声称「未增长」。`)
+        return
+      }
+      reason = `${reason}；也不能按「首次引入」放行：${boot.reason}`
+    }
+    if (reference.explicit) {
+      die(2, `❌ 无法核对增长（${reason}）。显式指定的参照不可用不能当成「零增长」：` +
+        `请指向一个含 ${ALLOW_REL}、且不是被判定提交本身的提交（--baseline-ref / ${BASELINE_REF_ENV}）。`)
+    }
+    // --allow-growth 是人工确认并留痕的放行路径（与写盘侧同一开关）：仍然放行，但输出里不得出现 ✓ 未增长。
+    if (flags.allowGrowth) {
+      console.log(`⚠️ 无法核对增长（${reason}）：已按 --allow-growth 接受，` +
+        '本次「未增长」未经参照核对（须逐文件归因写进 CHANGELOG）。')
       return
     }
     if (isCiEnv(process.env.CI)) {
-      die(2, `❌ 无法核对基线增长（${reference.reason}）：CI 上 fail-closed——` +
-        '拿不到参照版本就不能证明基线没有被抬高（本次判定退出，不按 on-disk 基线放行）。')
+      die(2, `❌ 无法核对增长（${reason}）：CI 上 fail-closed——` +
+        '拿不到参照版本（或参照树里没有基线文件、参照就是被判定提交本身）就不能证明基线没有被抬高，' +
+        '本次判定直接退出，不按 on-disk 基线放行。修法：quality job 的 checkout 取全历史' +
+        `（fetch-depth: 0）并把 ${BASELINE_REF_ENV} 指向含基线的真实 base 提交（origin/<base>，` +
+        '且不得等于本次被判定提交）。')
     }
-    console.log(`ℹ️ 无法核对基线增长（${reference.reason}）：只按当前基线判定；CI 上该分支 fail-closed（exit 2）。`)
+    console.log(`ℹ️ 无法核对增长（${reason}）：只按当前基线判定，` +
+      '本次「未增长」未经参照核对；CI 上该分支 fail-closed（exit 2）。')
     return
   }
+  if (reference.note) console.log(`ℹ️ ${reference.note}`)
   const growth = growthAgainst(baseline, reference.raw)
   if (!growth.rows.length) {
     console.log(`✓ 基线相对参照 ${reference.label} 未增长（逐文件与 total 一致：${growth.totalAfter} 条）`)
@@ -960,8 +1086,9 @@ function main () {
   const baseline = readBaseline()
   console.log(`源码文本断言：基线 total=${baseline.total}（${Object.keys(baseline.by_file).length} 个文件）` +
     `，实测 total=${hits.length}（扫描 ${listTestFiles().length} 个测试面文件）`)
-  verifyGrowthAgainstReference(baseline, flags)
-  const { measured, violations, shortfalls } = compare(hits, baseline)
+  const measured = perFile(hits)
+  verifyGrowthAgainstReference(baseline, flags, measured)
+  const { violations, shortfalls } = compare(hits, baseline)
   if (violations.length) {
     console.error(`❌ 新增 ${violations.reduce((n, v) => n + v.delta, 0)} 条源码文本断言（禁止）：`)
     for (const v of violations) console.error(`  ${v.file}  基线 ${v.allowed} / 实测 ${v.count} / +${v.delta}`)

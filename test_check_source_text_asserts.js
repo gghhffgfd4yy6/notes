@@ -116,7 +116,9 @@ function runGate (ws, args = [], env = {}) {
     cwd: ws,
     encoding: 'utf8',
     timeout: 120000,
-    env: { ...process.env, TZ: 'UTC', CI: '', ...env }
+    // SOURCE_TEXT_ASSERT_BASELINE_REF 也清空：宿主（或 CI）导出的参照不得漏进夹具——
+    // 那几个「参照不可得 / 参照树无基线文件」用例的全部意义就是没有可用参照。
+    env: { ...process.env, TZ: 'UTC', CI: '', SOURCE_TEXT_ASSERT_BASELINE_REF: '', ...env }
   })
   if (r.error) throw r.error
   return { code: r.status, out: r.stdout || '', err: r.stderr || '' }
@@ -584,11 +586,193 @@ check('参照不可得 + CI=true 必须 fail-closed exit 2（「读不到」不�
   // 本机（非 CI）在无 git 的目录里只打印原因并继续——夹具目录没有 .git 是构造出来的事实，不是「零增长」。
   const local = runGate(ws)
   assert.strictEqual(local.code, 0, `本机无 git 应打印原因后继续，实得 ${local.code}\n${local.out}${local.err}`)
-  assert.ok(local.out.includes('无法核对基线增长'), `本机必须打印原因（不静默跳过），实得：\n${local.out}`)
+  assert.ok(local.out.includes('无法核对增长'), `本机必须打印原因（不静默跳过），实得：\n${local.out}`)
+  assert.ok(!local.out.includes('✓ 基线相对参照'), `本机不得把「读不到参照」印成 ✓ 未增长，实得：\n${local.out}`)
   // CI 上拿不到参照 = 不能证明基线没被抬高 ⇒ 必须退出，不按 on-disk 基线放行。
   const ci = runGate(ws, [], { CI: 'true' })
   assert.strictEqual(ci.code, 2, `CI 无参照必须 exit 2，实得 ${ci.code}\n${ci.out}${ci.err}`)
   assert.ok(ci.err.includes('CI 上 fail-closed'), `必须说清 fail-closed 的理由，实得：\n${ci.err}`)
+})
+
+/* ── 参照接线（r23-A1/B1/C1）：HEAD 不得当参照；参照不可得 / 无基线文件时不得判「未增长」 ────── */
+
+// 下面四条要建**真实 git 仓库**（detached 单提交 / 有 base 引用 / 参照树缺基线文件 / 显式参照不可用）。
+// git 一律以**绝对路径**调用：按名 spawn 会让子进程经 PATH 解析可执行文件（Sonar S4036），与
+// test_install_hooks.js 的 GIT 常量同口径。解析不到直接 fail-closed——这几条不能静默跳过。
+const GIT = (process.env.PATH || '')
+  .split(path.delimiter)
+  .filter(Boolean)
+  .map((dir) => path.join(dir, 'git'))
+  .find((candidate) => {
+    try { fs.accessSync(candidate, fs.constants.X_OK); return true } catch { return false }
+  })
+assert.ok(GIT, 'PATH 里找不到可执行的 git——参照核对的三态用例依赖真实 git，不得静默跳过')
+
+// 沙箱化 git 环境：HOME/XDG 指向用例私有目录、禁用全局与系统 gitconfig（开发机上的 core.hooksPath /
+// gpgsign / commit.template 会泄漏进夹具），并清掉调用方的 GIT_DIR 等变量（否则临时仓库的 git 操作
+// 会被导向本仓）。提交身份用固定 env 给出，不写任何配置文件。
+function gitEnv (ws) {
+  const env = {
+    ...process.env,
+    HOME: ws,
+    XDG_CONFIG_HOME: ws,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_AUTHOR_NAME: 'xbk-assertgate',
+    GIT_AUTHOR_EMAIL: 'assertgate@example.invalid',
+    GIT_COMMITTER_NAME: 'xbk-assertgate',
+    GIT_COMMITTER_EMAIL: 'assertgate@example.invalid'
+  }
+  delete env.GIT_DIR
+  delete env.GIT_WORK_TREE
+  delete env.GIT_INDEX_FILE
+  return env
+}
+
+function gitIn (ws, args) {
+  const r = spawnSync(GIT, ['-C', ws, '-c', 'commit.gpgsign=false', '-c', 'tag.gpgsign=false', ...args], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: gitEnv(ws)
+  })
+  if (r.error) throw r.error
+  assert.strictEqual(r.status, 0, `git ${args.join(' ')} 必须成功，实得 exit ${r.status}：${r.stderr}`)
+  return (r.stdout || '').trim()
+}
+
+// 默认分支固定叫 main（不依赖宿主的 init.defaultBranch）：init 后再挑 HEAD，任何 git ≥2.28 都成立。
+function initGitRepo (ws) {
+  writeFile(ws, '.gitignore', 'node_modules\n')
+  gitIn(ws, ['init', '-q'])
+  gitIn(ws, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+}
+
+function commitAll (ws, message) {
+  gitIn(ws, ['add', '-A', '--', '.'])
+  gitIn(ws, ['commit', '-q', '-m', message])
+}
+
+// 基线的自洽形状（total = by_file 之和）：「by_file 与 total 等量 +1」正是 r22-B2 要拦的形态——
+// 两个数一起改才自洽，所以夹具必须成对抬。
+const baselineOf = (byFile) => ({
+  schema: 3,
+  total: Object.values(byFile).reduce((sum, n) => sum + n, 0),
+  by_file: byFile
+})
+
+// 每个参照用例的夹具：恰好 1 条源码文本断言（`s.includes('…')`，形状①）。
+const ONE_HIT_FIXTURE = [
+  '"use strict"',
+  'const s = require("node:fs").readFileSync("scripts/console.js", "utf8")',
+  "assert.ok(s.includes('SELF_ANCHOR'))",
+  ''
+].join('\n')
+
+check('参照不得是 HEAD 自身：main 指向被判定提交时改用它的父提交，手改 by_file+total 等量抬高必须 exit 1', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_selfref.js', ONE_HIT_FIXTURE)
+  writeBaseline(ws, baselineOf({ 'test_selfref.js': 1 }))
+  initGitRepo(ws)
+  commitAll(ws, 'base')
+  // r22-B2 的真实攻击形态：手改 by_file 与 total 各 +1，**和新断言一起提交**（内容自洽、on-disk 看不出来）。
+  writeBaseline(ws, baselineOf({ 'test_selfref.js': 2 }))
+  commitAll(ws, 'raise baseline')
+  gitIn(ws, ['checkout', '-q', '--detach'])
+  // CI 形态：main 仍指向被判定提交本身 ⇒ 旧实现拿 HEAD 自比自，打印 ✓ 未增长 exit 0。
+  const r = runGate(ws, [], { CI: 'true' })
+  assert.strictEqual(r.code, 1, `参照 == 被判定提交时必须改用父提交并抓到 +1，实得 exit ${r.code}\n${r.out}${r.err}`)
+  assert.ok(r.err.includes('test_selfref.js  参照 1 / 当前 2 / +1'), `必须逐文件点名增量，实得：\n${r.err}`)
+  assert.ok(r.out.includes('参照改用它的父提交'), `必须说明参照不是 HEAD 本身（改用父提交），实得：\n${r.out}`)
+  assert.ok(!r.out.includes('✓ 基线相对参照 main 未增长'), `绝不许把「参照 == 自己」读成未增长，实得：\n${r.out}`)
+})
+
+check('参照不可得（detached、没有任何 base 引用）：CI exit 2，本机打印「无法核对增长」且不得出现 ✓', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_noref.js', ONE_HIT_FIXTURE)
+  writeBaseline(ws, baselineOf({ 'test_noref.js': 1 }))
+  initGitRepo(ws)
+  commitAll(ws, 'base')
+  writeBaseline(ws, baselineOf({ 'test_noref.js': 2 }))
+  commitAll(ws, 'raise baseline')
+  gitIn(ws, ['checkout', '-q', '--detach'])
+  gitIn(ws, ['branch', '-D', 'main'])
+  const ci = runGate(ws, [], { CI: 'true' })
+  assert.strictEqual(ci.code, 2, `CI 形态没有任何参照必须 exit 2（旧实现退回 HEAD 自比自 exit 0），实得 ${ci.code}\n${ci.out}${ci.err}`)
+  assert.ok(ci.err.includes('无法核对增长'), `CI 必须说清「无法核对增长」，实得：\n${ci.err}`)
+  assert.ok(ci.err.includes('CI 上 fail-closed'), `CI 必须说清 fail-closed，实得：\n${ci.err}`)
+  assert.ok(!ci.out.includes('✓ 基线相对参照'), `CI 上不得打印 ✓ 未增长，实得：\n${ci.out}`)
+  const local = runGate(ws)
+  assert.strictEqual(local.code, 0, `本机无参照按 on-disk 基线继续（exit 0），实得 ${local.code}\n${local.out}${local.err}`)
+  assert.ok(local.out.includes('无法核对增长'), `本机必须打印「无法核对增长」而不是 ✓，实得：\n${local.out}`)
+  assert.ok(!local.out.includes('✓ 基线相对参照'), `本机不得把「没有参照」读成「未增长」，实得：\n${local.out}`)
+})
+
+check('参照树里没有基线文件：只有「本变更新增 + 基线与实测完全一致」的首次引入放行，等量抬高仍 exit 2', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_newbase.js', ONE_HIT_FIXTURE)
+  initGitRepo(ws)
+  commitAll(ws, 'base without baseline') // base 分支：这份文件还不存在
+  gitIn(ws, ['update-ref', 'refs/remotes/origin/main', 'HEAD'])
+  gitIn(ws, ['checkout', '-q', '-b', 'pr'])
+  writeBaseline(ws, baselineOf({ 'test_newbase.js': 1 }))
+  writeFile(ws, 'README.md', 'doc\n')
+  commitAll(ws, 'introduce baseline')
+  // ① 可证明的首次引入（新增该文件 + 基线逐文件 == 实测）：CI 也必须放行，否则基线永远进不了 base 分支；
+  //    但输出只能说「无法核对增长（首次引入）」，绝不能声称 ✓ 未增长。
+  const ci = runGate(ws, [], { CI: 'true' })
+  assert.strictEqual(ci.code, 0, `可证明的首次引入在 CI 上必须放行（基线文件本身还没进 base 分支），实得 ${ci.code}\n${ci.out}${ci.err}`)
+  assert.ok(ci.out.includes('无法核对增长'), `必须说清「无法核对增长」，实得：\n${ci.out}`)
+  assert.ok(ci.out.includes('首次引入'), `必须说清这是首次引入、没有可比历史，实得：\n${ci.out}`)
+  assert.ok(ci.out.includes('基线逐文件与实测完全一致'), `必须说清按哪条更强判据核对的，实得：\n${ci.out}`)
+  assert.ok(!ci.out.includes('✓ 基线相对参照'), `CI 上不得打印 ✓ 未增长，实得：\n${ci.out}`)
+  // ② 同一夹具手改 by_file 与 total 等量抬高 1 条（≠ 实测）⇒ 不得借「首次引入」放行：CI exit 2。
+  writeBaseline(ws, baselineOf({ 'test_newbase.js': 2 }))
+  commitAll(ws, 'raise baseline')
+  const raised = runGate(ws, [], { CI: 'true' })
+  assert.strictEqual(raised.code, 2, `首次引入时基线 ≠ 实测（等量抬高）必须 CI exit 2，实得 ${raised.code}\n${raised.out}${raised.err}`)
+  assert.ok(raised.err.includes('基线逐文件与实测不一致'), `必须点名「基线 ≠ 实测」而不是笼统报参照不可得，实得：\n${raised.err}`)
+  assert.ok(raised.err.includes('test_newbase.js 基线 2 / 实测 1'), `必须逐文件点名差额，实得：\n${raised.err}`)
+  // ③ 本机（非 CI）：同一抬高态只降级为「无法核对增长」，仍不得打印 ✓。
+  const local = runGate(ws)
+  assert.strictEqual(local.code, 0, `本机应降级为只按当前基线判定（exit 0），实得 ${local.code}\n${local.out}${local.err}`)
+  assert.ok(local.out.includes('无法核对增长'), `本机必须打印「无法核对增长」，实得：\n${local.out}`)
+  assert.ok(!local.out.includes('✓ 基线相对参照'), `本机不得打印 ✓ 未增长，实得：\n${local.out}`)
+  // ④ 保留既有的人工放行路径：--allow-growth 仍然放行，但同样只能打印 ⚠️（不留 ✓）。
+  const accepted = runGate(ws, ['--allow-growth'])
+  assert.strictEqual(accepted.code, 0, `--allow-growth 必须仍可放行，实得 ${accepted.code}\n${accepted.out}${accepted.err}`)
+  assert.ok(accepted.out.includes('已按 --allow-growth 接受'), `必须留痕（说清是人工接受），实得：\n${accepted.out}`)
+  assert.ok(!accepted.out.includes('✓ 基线相对参照'), `--allow-growth 放行时同样不得打印 ✓ 未增长，实得：\n${accepted.out}`)
+})
+
+check('显式参照不可用一律 exit 2（本机也不降级）；可用时真的核对增长', () => {
+  const ws = makeWorkspace()
+  writeFile(ws, 'test_explicit.js', ONE_HIT_FIXTURE)
+  writeBaseline(ws, baselineOf({ 'test_explicit.js': 1 }))
+  initGitRepo(ws)
+  commitAll(ws, 'base')
+  // ① 拼错的 ref：本机也必须 exit 2——显式参照不可用不是「没有可比的历史」。
+  const bogusFlag = runGate(ws, ['--baseline-ref', 'origin/does-not-exist'])
+  assert.strictEqual(bogusFlag.code, 2, `拼错的 --baseline-ref 本机也必须 exit 2，实得 ${bogusFlag.code}\n${bogusFlag.out}${bogusFlag.err}`)
+  assert.ok(bogusFlag.err.includes('显式指定的参照不可用'), `必须点名显式参照不可用，实得：\n${bogusFlag.err}`)
+  // ② 同一个错误经 env 给出（CI 的注入路径），结论必须一致。
+  const bogusEnv = runGate(ws, [], { SOURCE_TEXT_ASSERT_BASELINE_REF: 'origin/does-not-exist' })
+  assert.strictEqual(bogusEnv.code, 2, `env 注入的坏参照同样必须 exit 2，实得 ${bogusEnv.code}\n${bogusEnv.out}${bogusEnv.err}`)
+  // ③ 参照就是被判定提交本身、且根提交没有父提交 ⇒ 同样 exit 2，绝不退回自比自。
+  const selfRef = runGate(ws, ['--baseline-ref', 'HEAD'])
+  assert.strictEqual(selfRef.code, 2, `单提交仓库里 --baseline-ref HEAD 不得自比自，实得 ${selfRef.code}\n${selfRef.out}${selfRef.err}`)
+  assert.ok(selfRef.err.includes('就是被判定提交本身'), `必须说清参照 == 被判定提交本身，实得：\n${selfRef.err}`)
+  // ④ 可用时必须真的核对（否则「接上了」只是接了个字符串）：参照 = main（上一个提交），未抬高 ⇒ ✓ 未增长。
+  gitIn(ws, ['checkout', '-q', '-b', 'pr'])
+  writeFile(ws, 'README.md', 'doc\n')
+  commitAll(ws, 'second commit')
+  const green = runGate(ws, [], { SOURCE_TEXT_ASSERT_BASELINE_REF: 'main' })
+  assert.strictEqual(green.code, 0, `可用参照且未增长必须 exit 0，实得 ${green.code}\n${green.out}${green.err}`)
+  assert.ok(green.out.includes('✓ 基线相对参照 main 未增长'), `必须真的打印「✓ 未增长」（说明参照可用），实得：\n${green.out}`)
+  // ⑤ 同一参照下把 on-disk 基线等量抬高 1 条 ⇒ exit 1 并逐文件点名。
+  writeBaseline(ws, baselineOf({ 'test_explicit.js': 2 }))
+  const raised = runGate(ws, [], { SOURCE_TEXT_ASSERT_BASELINE_REF: 'main' })
+  assert.strictEqual(raised.code, 1, `参照可用时等量抬高必须 exit 1，实得 ${raised.code}\n${raised.out}${raised.err}`)
+  assert.ok(raised.err.includes('test_explicit.js  参照 1 / 当前 2 / +1'), `必须逐文件点名增量，实得：\n${raised.err}`)
 })
 
 /* ── 重生成路径不得自锁（r22-C1）───────────────────────────────────────── */
