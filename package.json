@@ -1,6 +1,6 @@
 {
   "name": "xbk-push",
-  "version": "3.441.0",
+  "version": "3.474.0",
   "description": "线报酷推送脚本——规则过滤 + 多通道推送 + 去重缓存 + 运行日志 + 完整测试体系",
   "main": "xbk_function_v3.js",
   "scripts": {
@@ -38,19 +38,22 @@
     "test:install-hooks": "node test_install_hooks.js",
     "test:ci-static-gates": "node test_ci_static_gates.js",
     "test:doc-line-gates": "node test_doc_line_gates.js",
+    "test:check-assert-style": "node test_check_source_text_asserts.js",
     "test:mutation": "node scripts/local-mutation-guard.js",
     "test:mutation-ranges": "node scripts/check-mutation-ranges.js",
     "test:coverage": "c8 --reporter=text --reporter=lcov --reporter=json-summary --exclude='test_*.js' --exclude='run_tests.js' node run_tests.js",
     "check:ci-static": "node scripts/check-ci-static.js",
+    "check:assert-style": "node scripts/check-source-text-asserts.js",
     "check:doc-lines": "node scripts/check-doc-lines.js",
     "check:host-clean": "node scripts/check-host-clean.js",
-    "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm run check:ci-static && npm run check:doc-lines && npm test",
+    "check": "npm run lint && node check-version.js && node scripts/check-mutation-ranges.js && npm run check:ci-static && npm run check:assert-style && npm run check:doc-lines && npm test",
     "verify": "npm run check",
     "hooks:install": "node scripts/install-hooks.js",
     "hooks:verify": "node scripts/install-hooks.js --verify",
     "console": "node scripts/console.js"
   },
   "dependencies": {
+    "acorn": "^8.19.0",
     "etag": "^1.8.1",
     "fuzzball": "^2.2.6",
     "got": "11.8.6",
@@ -76,9 +79,9 @@
   "devDependencies": {
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/tap-runner": "^10.1.1",
-    "acorn": "^8.19.0",
     "c8": "^12.0.0",
     "fast-check": "^4.10.2",
+    "js-yaml": "^4.3.2",
     "standard": "^17.1.2"
   },
   "allowScripts": {

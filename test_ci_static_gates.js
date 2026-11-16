@@ -7,9 +7,11 @@
 //
 // 接线事实（与 test_suites.js 的注册项一致）：本套件标了 `mutationSkip: true`（变异沙箱不复制
 // `.githooks/`，沙箱内必 ENOENT 假红）⇒ run_unit_tests.js 的 `!s.mutationSkip` 过滤会把它排除在
-// 「全量单元测试」兜底之外，CI 覆盖**只**来自 test.yml policy job 的显式步骤
-// `npm run test:ci-static-gates`（这层对账由 test_ci_skip_suites.js 的「SKIP_SUITES ↔ 显式步骤」
-// 守着）；**摘掉那个显式步骤，下一次 CI 必红在这里**。
+// 「全量单元测试」兜底之外，CI 覆盖**只**来自 test.yml **quality job** 的显式步骤
+// `npm run test:ci-static-gates`（v3.447 从 policy 挪过来：本套件 import test_support/source_model.js，
+// 顶层 require('acorn') + loadYaml 需 js-yaml，而 policy 是刻意零依赖 job ⇒ 挂那边必 MODULE_NOT_FOUND）。
+// 这层对账由 test_ci_skip_suites.js 的 assertPolicyStepsUnconditional 正向锁守着——quality 里恰好
+// 一次、policy 里恰好零次，两个方向各有一条反例夹具；**摘掉那个显式步骤，下一次 CI 必红在这里**。
 //
 // 纯字符串/fs 断言，不 spawn 子进程：本机与变异沙箱都能跑，也不受宿主 process.execPath 形态影响。
 // C5-013 起额外 require 判据模块（scripts/check-ci-static.js）本身：只读、无副作用、不 spawn，
@@ -18,6 +20,9 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
 const gate = require('./scripts/check-ci-static.js')
+// 结构视图：hook 走 parseShell 的 tokens、workflow 走 loadYaml 解析后的 job/step 字段
+// （r4-5：接线断言不再比对源码行文本，改由 test_support/source_model.js 提供的结构视图判定）。
+const { parseShell, loadYaml } = require('./test_support/source_model.js')
 
 const read = (p) => fs.readFileSync(path.join(__dirname, p), 'utf8')
 // 行匹配一律「拆成行 + 去缩进后精确判定」，不用 /^\s*…$/m：静态分析把「\s* + 行尾锚 + 可能很长的行」
@@ -111,8 +116,155 @@ check('test.yml：CI 步骤存在、shellcheck 有兜底安装、zizmor 钉版�
     'CI 步骤必须走与本地同一条 npm 链，禁止 CI 侧自拼扫描命令造成口径分叉')
 })
 
+// ── check:assert-style（v3.444）三处接线判定 ───────────────────────────────────────────
+// 与 check:ci-static / check:doc-lines 同族：闸门本体从 `npm run check` 链、pre-commit、test.yml 任一处
+// 被摘掉，都不会让任何东西变红——「删一行接线」本身不是失败。故这里把「三处都在」做成可被反例驱动的
+// 纯函数（不在函数里读盘），再用合成输入逐个删一处证明它真的会红。
+//
+// 判据是**结构断言**（不是源码文本）：`.githooks/pre-commit` 走 source_model.parseShell 的 tokens
+// （引号感知切词，注释/缩进/行序调整都不误红），`test.yml` 走 loadYaml 解析后断言 job / step 字段，
+// 并锁住「在 quality job、policy 里没有」——policy 零依赖，粘过去必 MODULE_NOT_FOUND。
+function assertAssertStyleWiring (pkg, hookLines, workflow) {
+  assert.strictEqual(pkg.scripts['check:assert-style'], 'node scripts/check-source-text-asserts.js',
+    'check:assert-style 脚本名必须指向 scripts/check-source-text-asserts.js')
+  assert.ok(pkg.scripts.check.includes('npm run check:assert-style'),
+    'npm run check 链必须包含 check:assert-style——从链上摘除 = 本地门禁静默失效')
+  assert.ok(pkg.scripts.check.indexOf('check:assert-style') < pkg.scripts.check.indexOf('npm test'),
+    '源码文本断言闸门必须排在 npm test 之前（秒级门禁先失败）')
+  // pre-commit：按 tokens 判（`run_gate` + 标签 + `npm run check:assert-style`），有且只有一道。
+  const hookGates = hookLines.filter((l) => l.tokens[0] === 'run_gate' && l.tokens.includes('check:assert-style'))
+  assert.strictEqual(hookGates.length, 1,
+    'pre-commit 必须有且只有一道「源码文本断言闸门」run_gate——缺它 = 提交时刻不再拦截新增的源码文本断言')
+  assert.deepStrictEqual(hookGates[0].tokens.slice(0, 2), ['run_gate', '源码文本断言闸门'],
+    'pre-commit 该道 run_gate 的标签必须是「源码文本断言闸门」')
+  assert.deepStrictEqual(hookGates[0].tokens.slice(-3), ['npm', 'run', 'check:assert-style'],
+    'pre-commit 该道 run_gate 必须走与本地同一条 npm 链（npm run check:assert-style）')
+  // test.yml：步骤必须在 quality job，且只有一步；policy（零依赖、从不 npm ci）里不得有。
+  const steps = workflow && workflow.jobs && workflow.jobs.quality && workflow.jobs.quality.steps
+  assert.ok(Array.isArray(steps), 'test.yml 必须有一个带 steps 的 quality job（v3.445 起闸门挂在这里）')
+  const gateSteps = steps.filter((s) => s && s.name === '源码文本断言闸门（禁止新增读源码文本断言）')
+  assert.strictEqual(gateSteps.length, 1,
+    'test.yml 的 quality job 必须有且只有一步「源码文本断言闸门」——缺它 = PR 流水线不再跑它')
+  assert.strictEqual(gateSteps[0].run, 'npm run check:assert-style',
+    'test.yml 的该步骤必须走与本地同一条 npm 链（npm run check:assert-style）')
+  // 步骤存在 ≠ 会执行（r17-B）：step 级 `if:` 让它只在特定事件跑（`if: false` 则永不跑），
+  // `continue-on-error: true` 则让失败不阻断 job——两种写法下「删步骤 / 摘链」的反例全绿，本闸静默失效。
+  // 兄弟闸 check:ci-static / check:doc-lines 在 policy job 里由 assertPolicyStepsUnconditional 免费得到
+  // 这层保护；v3.445 把本闸挪到 quality 时没一起搬过来，故这里显式补齐（与 test:unit 兜底同口径）。
+  assert.strictEqual(gateSteps[0].if, undefined,
+    'test.yml 的源码文本断言闸门不得带 step 级 if: 条件——只在某些事件/恒假条件下跑等于该步骤从未存在')
+  assert.strictEqual(gateSteps[0]['continue-on-error'], undefined,
+    'test.yml 的源码文本断言闸门不得设 continue-on-error: true——失败不阻断 job = 闸门永不拦人')
+  // 增长参照接线（r23-B2）：步骤存在 ≠ 能核对。基线「只减不增」要把当前基线与**参照提交里的基线**逐文件
+  // 比一遍，而 quality job 默认是浅克隆（depth=1）——参照（base 分支提交 / HEAD 之前那个提交）取不到时
+  // 闸门在 CI（CI=true）上 fail-closed（exit 2）或退回「无法核对增长」，两种都不是「已核对」。缺任一项，
+  // 被拦的「手改 by_file 与 total 等量抬高」就重新变成假绿，故这里把两项一起锁死：
+  //   · checkout 必须 fetch-depth: 0（整取历史）；
+  //   · 该步骤必须经 env 注入 SOURCE_TEXT_ASSERT_BASELINE_REF = origin/${{ github.base_ref || 'main' }}
+  //     （PR 上是 base 分支，push 到 main 时由闸门改用它之前的提交），不得内联进 run（run 串要与本地
+  //     同一条 npm 链），也不得写成 HEAD（那就是被判定提交本身 ⇒ 基线自比自恒绿）。
+  const checkout = steps.find((s) => s && typeof s.uses === 'string' && s.uses.startsWith('actions/checkout@'))
+  assert.ok(checkout, 'quality job 必须有 actions/checkout 步骤（增长核对要读参照提交里的基线）')
+  assert.strictEqual(checkout.with && checkout.with['fetch-depth'], 0,
+    'quality job 的 checkout 必须 fetch-depth: 0——浅克隆取不到 base 分支 / 父提交，闸门在 CI 上 fail-closed（exit 2）')
+  // 逐段拼接：期望值含 GitHub 表达式语法（`${{`），直接写字面量会触发 standard 的 no-template-curly-in-string。
+  const BASELINE_REF_EXPECTED = 'origin/$' + '{{ github.base_ref || ' + "'main' }}"
+  assert.strictEqual(gateSteps[0].env && gateSteps[0].env.SOURCE_TEXT_ASSERT_BASELINE_REF, BASELINE_REF_EXPECTED,
+    `该步骤必须经 env 注入增长参照 SOURCE_TEXT_ASSERT_BASELINE_REF=${BASELINE_REF_EXPECTED}（PR 上是 base 分支）`)
+  assert.ok(!String(gateSteps[0].run).includes('baseline-ref'),
+    'REF 不得内联进 run：步骤 run 串必须与本地同一条 npm 链（npm run check:assert-style）')
+  const policySteps = (workflow.jobs.policy && workflow.jobs.policy.steps) || []
+  assert.strictEqual(policySteps.filter((s) => s && s.run === 'npm run check:assert-style').length, 0,
+    'policy job 不得再挂该闸门：policy 刻意零依赖（不 npm ci），require(\'acorn\') 必 MODULE_NOT_FOUND')
+}
+
+check('check:assert-style 三处接线：check 链 / pre-commit / test.yml 缺任一处即红（v3.444）', () => {
+  const pkg = JSON.parse(read('package.json'))
+  // 结构视图：hook 走 parseShell 的 tokens，workflow 走 loadYaml 的 job/step 字段（不比对源码行文本）。
+  const hook = parseShell('.githooks/pre-commit')
+  const wf = loadYaml('.github/workflows/test.yml')
+  assertAssertStyleWiring(pkg, hook, wf)
+  // 反例（三处各删一处，必须逐个红）：只断言「文件里出现过这个词」的写法在删掉接线后仍然绿，
+  // 这几个反例就是这条用例不是那种写法的证据。
+  const chainBroken = JSON.parse(read('package.json'))
+  chainBroken.scripts.check = chainBroken.scripts.check.split(' && ').filter((step) => step !== 'npm run check:assert-style').join(' && ')
+  assert.throws(() => assertAssertStyleWiring(chainBroken, hook, wf), /check 链必须包含 check:assert-style/,
+    'check 链摘掉 check:assert-style 后必须判红')
+  const hookBroken = hook.filter((l) => !(l.tokens[0] === 'run_gate' && l.tokens.includes('check:assert-style')))
+  assert.throws(() => assertAssertStyleWiring(pkg, hookBroken, wf), /pre-commit 必须有且只有一道/,
+    'pre-commit 摘掉该 run_gate 后必须判红')
+  const wfBroken = JSON.parse(JSON.stringify(wf))
+  wfBroken.jobs.quality.steps = wfBroken.jobs.quality.steps.filter((s) => s.run !== 'npm run check:assert-style')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, wfBroken), /quality job 必须有且只有一步/,
+    'test.yml 摘掉该步骤后必须判红')
+  // job 反例（C 的 should_fix）：只判「接上了没有」时，把步骤挪到零依赖的 policy 仍然绿——这里必须红。
+  // 两个方向各一条：① 同一道闸门同时挂到 policy ⇒ policy 守卫红；② 从 quality 挪走 ⇒ quality 守卫红。
+  const wfDup = JSON.parse(JSON.stringify(wf))
+  const gateStep = wfDup.jobs.quality.steps.filter((s) => s.run === 'npm run check:assert-style')
+  wfDup.jobs.policy.steps = [...(wfDup.jobs.policy.steps || []), ...gateStep]
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, wfDup), /policy job 不得再挂该闸门/,
+    '把闸门同时挂到 policy job 必须判红（零依赖 job 里 require(acorn) 会 MODULE_NOT_FOUND）')
+  const wfMoved = JSON.parse(JSON.stringify(wfDup))
+  wfMoved.jobs.quality.steps = wfMoved.jobs.quality.steps.filter((s) => s.run !== 'npm run check:assert-style')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, wfMoved), /quality job 必须有且只有一步/,
+    '把闸门从 quality 挪走（挪到 policy 也不能算接上）必须判红')
+  // 顺序反例：闸门排到 npm test 之后就失去了「先失败」的意义（矩阵作业要先跑一遍全量测试才红）。
+  const orderBroken = JSON.parse(read('package.json'))
+  orderBroken.scripts.check = 'npm test && npm run check:assert-style'
+  assert.throws(() => assertAssertStyleWiring(orderBroken, hook, wf), /排在 npm test 之前/,
+    '把闸门排到 npm test 之后必须判红')
+  // 条件化反例（r17-B）：只判「存在 / 名字 / run 串」时，给该步骤注入 step 级条件或
+  // continue-on-error 后三种写法全部照绿（CI 上这道闸永不执行或永不阻断）。逐个必须红。
+  const conditionalStep = (mutate) => {
+    const broken = JSON.parse(JSON.stringify(wf))
+    const step = broken.jobs.quality.steps.find((s) => s && s.run === 'npm run check:assert-style')
+    mutate(step)
+    return broken
+  }
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
+    // 逐段拼接：该字符串含 GitHub 表达式语法（`${`），直接写字面量会触发 standard 的
+    // no-template-curly-in-string（这不是模板字符串）。
+    s.if = '$' + '{{ github.event_name == ' + "'push'" + ' }}'
+  })), /不得带 step 级 if/,
+  '给该步骤加 step 级 if 条件必须判红（PR 事件上就整道闸不跑）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
+    s.if = false
+  })), /不得带 step 级 if/,
+  '给该步骤加 if: false 必须判红（恒假 = 该步骤从未存在）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, conditionalStep((s) => {
+    s['continue-on-error'] = true
+  })), /不得设 continue-on-error/,
+  '给该步骤加 continue-on-error: true 必须判红（失败不阻断 job = 闸门永不拦人）')
+  // 增长参照的两条靶向反例（r23-B2）：这两项各自被摘掉时，增长核对都会退回「没参照」——
+  // 前者在 CI 上 exit 2（闸门常红），后者让「手改 by_file 与 total 等量抬高」重新假绿。逐个必须红。
+  const dropCheckoutKey = (key) => {
+    const broken = JSON.parse(JSON.stringify(wf))
+    const co = broken.jobs.quality.steps.find((s) => s && typeof s.uses === 'string' && s.uses.startsWith('actions/checkout@'))
+    delete co.with[key]
+    return broken
+  }
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropCheckoutKey('fetch-depth')), /fetch-depth: 0/,
+    '摘掉 checkout 的 fetch-depth: 0 必须判红（浅克隆取不到参照 ⇒ CI 上 fail-closed）')
+  const dropRefEnv = (mutate) => {
+    const broken = JSON.parse(JSON.stringify(wf))
+    const step = broken.jobs.quality.steps.find((s) => s && s.run === 'npm run check:assert-style')
+    if (mutate) mutate(step)
+    else delete step.env
+    return broken
+  }
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropRefEnv()), /必须经 env 注入增长参照/,
+    '摘掉 env 的 SOURCE_TEXT_ASSERT_BASELINE_REF 必须判红（没有参照 = 增长核对静默失效）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropRefEnv((s) => {
+    s.env.SOURCE_TEXT_ASSERT_BASELINE_REF = 'HEAD'
+  })), /必须经 env 注入增长参照/,
+  '把参照写成 HEAD 必须判红（HEAD 就是被判定提交本身，基线自比自恒绿——r23-A1/B1/C1 的原缺陷）')
+  assert.throws(() => assertAssertStyleWiring(pkg, hook, dropRefEnv((s) => {
+    s.run = 'npm run check:assert-style --baseline-ref origin/main'
+  })), /必须走与本地同一条 npm 链/,
+  '把参照内联进 run 必须判红（run 串与本地链分叉，参照接线再也不会被同一套断言看见）')
+})
+
 check('scorecard.yml：analysis job 的 job 级 permissions 必须显式保留 contents: read（C10-047）', () => {
-  // job 级 `permissions:` 会**整体覆盖** workflow 级：未列出的作用域一律置 none。scorecard.yml 的
   // workflow 级那句 contents: read 对 analysis job 不起作用——job 级只写了 security-events / id-token，
   // 于是 contents=none，actions/checkout 拿不到仓库、Scorecard 分析跑在空目录上（绿色假象）。
   // 断言因此必须落在 job 块内的 permissions 段，而不是只看文件里出现过 contents: read。

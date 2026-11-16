@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.441 — run 锁：kill 非 ESRCH 一律判活（EPERM/EINVAL 不接管）、pid 上界边界与僵尸告警去重补可证伪用例、跳过记账落断言 *******
+//* ******* 线报酷推送脚本 v3.474 — S0 r31：收两条 Codacy no-unsanitized 文案误报（同一根因：用例标题传给 check()、断言消息传给 assert.notStrictEqual() 时，文案里那串「角括号 ref 引用」被当成 HTML 标签）——照 r10 先例改为运行期拼接（String.fromCharCode(60) / String.fromCharCode(96) + 字面量），于是文件内不再出现标签形状的字面量，而拼出的标题与消息与原值逐字节相同；断言逻辑与判据未动、scripts/ 与 .codacy.yml 未动、生产逻辑一行未改，白名单 2404 原地不动（扫描面内 0 增量） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

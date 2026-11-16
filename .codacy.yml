@@ -301,6 +301,18 @@
 # 三个临时目录均在 finally 里 rmSync 删除；无任何外部净输入（环境、CLI、网络、文件内容）参与路径构造。
 # 故按本仓既有口径（test_host_clean_gates.js / test_storage.js / test_message_store_journal.js /
 # test_status.js 同一处理）整文件排除；不删/不放宽任何断言，真实断言仍由 npm test / CI 全量执行。
+#
+# ---- S0 反回归闸工具层：不整文件排除，只做行级登记 ----
+# 三个文件（scripts/check-source-text-asserts.js / scripts/probe-format-coupling.js /
+# test_support/source_model.js）**不在** exclude_paths 里：整文件排除是比 NOSONAR 更宽的消音（整个文件
+# 的所有规则都不再分析）。它们的 pathtraversal 结构性告警逐行带 `// nosemgrep（理由）`（opengrep 侧）与
+# 裸形态 `// eslint-disable-next-line`（ESLint 侧；standard 17 未装 eslint-plugin-security，指名规则会
+# 让 npm run lint 整体判红）。
+# 为什么是结构性的：路径来源都是「ROOT = __dirname 常量 + 仓内常量目录/命令行给出的测试名单」——
+#   · checker：ROOT + 枚举出的测试面 .js，只读；基线文件在脚本旁边（常量），只有人工 --write-allowlist 才写盘；
+#   · 探针：ROOT + 生产 JS 枚举（测试面除外）读原文，写回的是刚读出的备份（try/finally 还原 + git status 对账）；
+#   · source_model：调用方给的仓库相对路径，按 ROOT 拼接后只读，不写盘不联网。
+# 没有任何外部净输入（环境变量只用于 --allow-growth 判定与探针超时）参与路径构造；不删/不放宽任何断言。
 exclude_paths:
   # v3.285：console-assets/htm-preact.module.js 是 preact+htm standalone 上游产物
   # （为免构建直接入库的 vendor 单文件），内部的 innerHTML/document.write/动态属性
@@ -456,3 +468,7 @@ exclude_paths:
   # 拆成独立文件就是为了只登记这一层（tap-shim 本体的 TAP 投点/跳过判定/退出码仍受 Codacy 覆盖），
   # 同 scripts/status-utils.js 的拆模块口径；不删/不放宽任何断言。
   - "scripts/tap-shim-diag.js"
+  # S0（v3.443 → v3.444）：反回归闸工具层**已从这里撤出**——整文件排除是比 NOSONAR 更宽的消音
+  # （整个文件所有规则都不再分析），与 CHANGELOG 的自述不符。三个文件回到 Codacy 覆盖之下：
+  # 动态 RegExp 告警已由 AST 重写改代码消除，剩余的 pathtraversal 结构性误报按**行级**
+  # `// nosemgrep（理由）` 登记在各自代码行上（依据见上方「S0（v3.443 反回归闸工具层；v3.444 …）」块）。

@@ -74,12 +74,14 @@ const SUITES = [
   { name: '测试入口公共层', file: 'test_test_harness.js', desc: 'scripts/test-harness.js：displayWidth/padEndWidth（中文 2 列）、positiveIntEnv 非法值告警回退、prepareSuiteEnv 只删 XBK_CACHE_DIR、guard 加载（missing 不抛/内部依赖缺失照常抛）、killSuiteGroup 非法 pid；另断言两个入口只 require 一份公共层、不再各自定义' },
   // mutationSkip（v3.280）：本套件断言 .githooks/pre-commit、pre-push 与 test.yml 的接线内容，
   // 而变异沙箱（copyProject）不复制 .githooks/ ⇒ 沙箱内必 ENOENT 假红（同 test_install_hooks 的
-  // 登记先例）。CI 覆盖由 test.yml 的显式步骤「静态扫描接线断言」承担。
+  // 登记先例）。CI 覆盖由 test.yml **quality job** 的显式步骤「静态扫描接线断言」承担
+  // （v3.447 从 policy 挪来：本套件 import test_support/source_model.js，需 acorn + js-yaml，
+  // 而 policy 刻意零依赖；两个 job 的挂载由 test_ci_skip_suites.js 的正向锁对账）。
   { name: '静态扫描接线', file: 'test_ci_static_gates.js', desc: 'check:ci-static 三处接线（check 链 / pre-commit 第4道 / test.yml 步骤）内容断言 + 首轮扫描修复不回退', mutationSkip: true },
   // mutationSkip（v3.281）：同 test_ci_static_gates 的理由——本套件断言 `.githooks/pre-commit` 与
   // `test.yml` 的接线内容，而变异沙箱不复制 `.githooks/` ⇒ 沙箱内必 ENOENT 假红。
   // CI 覆盖由 test.yml 的显式步骤「文档行长接线断言」承担。
-  { name: '文档行长接线', file: 'test_doc_line_gates.js', desc: 'check:doc-lines 三处接线（check 链 / pre-commit 第5道 / test.yml 步骤）内容断言 + 阈值与空扫描面 fail-closed 口径不回退', mutationSkip: true },
+  { name: '文档行长接线', file: 'test_doc_line_gates.js', desc: 'check:doc-lines 三处接线（check 链 / pre-commit 第6道 / test.yml 步骤）内容断言 + 阈值与空扫描面 fail-closed 口径不回退', mutationSkip: true },
   // mutationSkip（PR #156 起）：本套件的 pre-push 端到端用例要读**仓库的** `.githooks/pre-push`
   // 并真跑 npm + git worktree，而变异沙箱（run_mutation.copyProject）只复制 scripts/qinglong/.github
   // 与各 test_*.js/xbk_*.js，不复制 `.githooks/` ⇒ 在沙箱内必然 ENOENT，使「沙箱内单元测试应整体通过」
@@ -134,7 +136,22 @@ const SUITES = [
   // 按域 handler」。本套件断言**路由清单与真实 HTTP 行为**（清单一一对应/顺序、重复检测、matchRoute 语义、
   // 代表性端点的 method/path/status、写端点 Bearer-only 拒绝、未匹配仍 404），不靠 console.js 源码文本。
   // 纯进程内 + 本机 HTTP 回环（每例自建实例、退出即关服务器），不设 integration / mutationSkip。
-  { name: '控制台路由表', file: 'test_console_routes.js', desc: 'scripts/console-routes.js：路由清单与拆分前 endpoint 一一对应（含顺序）/无重复与冲突/坏条目抛错 + matchRoute 语义（method 先比、精确与正则、先命中先返回、未命中 null）+ HTTP 行为（status/写面 query token 400/动态 runs:id 404/未匹配 404/无凭证 401）' }
+  { name: '控制台路由表', file: 'test_console_routes.js', desc: 'scripts/console-routes.js：路由清单与拆分前 endpoint 一一对应（含顺序）/无重复与冲突/坏条目抛错 + matchRoute 语义（method 先比、精确与正则、先命中先返回、未命中 null）+ HTTP 行为（status/写面 query token 400/动态 runs:id 404/未匹配 404/无凭证 401）' },
+  // S0（v3.444）：反回归闸**自身**的用例。闸门漏检不会让任何东西变红（旧实现 857/857 全绿却漏掉
+  // helper 链 / 模板 / `/re/.test` / 多跳 / 重赋值 / 函数参数 / split 行 / codeOf 套壳 等写法），
+  // 故把每个形态做成「正向必红 / 反向必绿」。全部在 mkdtemp 隔离工作区里跑（复制闸脚本 + 软链
+  // node_modules，跑完 rmSync），不读 .githooks、不碰真实白名单 ⇒ 沙箱内可运行（不设 mutationSkip）。
+  // 成本是约 30 次子进程（每个夹具 0.1-0.3s），照 test_check_version.js 的子进程夹具先例。
+  // r12-5 / r22-C4：desc 与这里的注释必须与**实测**一致（旧文案停在 v3.444 的「17 种」，而判据早已从
+  // 「多重集超次数」改成「按文件计数」，三处数字互不一致）。数字由 test_check_source_text_asserts.js
+  // 的「套件说明不得漂移」用例**机械对账**：该用例 require 本文件、取这一条的 desc，比对「（N 检查）」
+  // 与每个形状的实测条数——改用例数而不同步改 desc，那一条立即红。
+  { name: '源码文本断言闸', file: 'test_check_source_text_asserts.js', desc: 'check-source-text-asserts.js（41 检查）：5 种形状各一条正向必红（①直接字面量 +1 / ②变量锚点/比较 +3 / ③模板插值 +1 / ④reader 别名 +4 / ⑤helper 源码/形参 +1），断言 exit 1、点名「文件 基线0/实测N/+N」（N 随形状不同）并标出形状与命中行，删掉后恢复 exit 0；数据流边界（异步 await 与回调读取、同文件 helper 形参、map/join 链式 reader、loadModel().code 与 .codeOnly、解构 strictEqual 别名、函数声明提升——调用点在 function 声明之前（返回值/形参两条路）与声明在前的对照组都必须红，实参非源码文本时仍绿）；反向必绿（AST 结构断言·配置解析·行为断言不入账、scripts/ 与生产 .js 不在扫描面）；基线段（增长拒绝且不改盘、--allow-growth 须配 --reason 且写进 growth 段留痕、total≠sum(by_file) exit 2、新文件按 0 算、下降只报 shortfall、无旧基线直接写盘、写盘失败清 .tmp 且原文件不动、必须 rename 不得 writeFileSync(基线)、旧 schema/损坏 JSON 可重生成而门禁仍 exit 2）；参照接线（无 git / 无任何 base 引用 ⇒ CI exit 2、本机打印「无法核对增长」；HEAD 不得当参照——main 指向被判定提交时改用它的父提交，手改 by_file+total 等量抬高在 CI 形态必须 exit 1 并逐文件点名；参照树里没有基线文件 ⇒ 可证明的首次引入（git 证明本变更新增 + 基线逐文件==实测）放行且只说「无法核对增长」、同夹具等量抬高仍 CI exit 2；本机降级且 --allow-growth 也不打印 ✓；显式参照不可用（--baseline-ref / SOURCE_TEXT_ASSERT_BASELINE_REF）一律 exit 2、可用时真的核对增长）；端到端（真实仓库 exit 0、打印 基线 total 与 实测 total、基线无生产文件）；r26 检测面与判据（逐元素回调 some/forEach/find/findIndex/every/filter/map/flatMap/reduce 的元素形参与 reduce 累加器入账、非源码数组不计；两跳/三跳 pass-through helper 在调用点写在声明之前也入账、声明在前与单跳对照组同值、实参非源码仍绿；扫描面表述——scripts/ 下被 require 的 helper 逐条告警且成功文案限定「扫描面内」、每行 ✅ 都必须带「扫描面」；基线文件搬出扫描面 ⇒ exit 1 点名「基线文件不在扫描面」、显式 --write-allowlist 才放行）；r28 检测面与排序（正则 receiver 不只字面量——RE.test / RE.exec / new RegExp(…).test / 经 helper 形参收到正则都必须入账，非正则 receiver 与非源码实参不误报；String / toString / 模板插值 / `||` / `??` / String.raw / `JSON.stringify(源码文本)` 穿透，String(非源码值) 与 JSON.parse 后的字段比对不误报；面外告警的行序与「被谁 require」都按 UTF-16 码元序（夹具名在码元序与 localeCompare 下结论相反，区分力本身也写成断言——任一比较器换成 localeCompare 即红）；r30 绕过口（多实参字符串化——JSON.stringify(src,null,2) / String(src, "") 与单参形态同值必须入账、只写多参形态的夹具必须 exit 1、非源码实参在多参形态下仍 0 条；顶层源码变量的声明顺序不改变结论——const 在前/在后与「返回源码的 helper」两种顺序都必须红、普通字符串常量两种顺序都绿；growth 登记钉参照本身而非 `<ref>^`——HEAD==origin/main 时写盘，提交后 CI 形态必须接受该登记、把增量等量抬高仍 exit 1；入账明细的行号边界——输出里只有 `:50` 时不得判成 `:5`，且断言裸子串判定确实会被骗到）' },
+  // S0（v3.446，r4 评审 must_fix r4-4）：工具层自身的用例。此前 test_support/source_model.js 零断言——
+  // 它是后续每个包做结构断言的唯一入口，而 `assert.ok(!hasFunction(f, '旧实现'))` 这类否定断言在 model
+  // 退化时会**静默变绿**（与 S0 要治的失效同源）。夹具全在 mkdtemp 里写、跑完 rmSync，不读仓库源码
+  // ⇒ 不设 integration / mutationSkip（沙箱内可运行）。
+  { name: '源码结构视图', file: 'test_source_model.js', desc: 'test_support/source_model.js：loadModel 八件套/缓存 + 注释与字符串不算（含集合规模下界）+ funcs 六类（声明/箭头/表达式/类方法/静态/对象方法）+ calls 与 members（成员链/计算成员/动态键）+ exports 的 CJS 三态与 ESM 四态 + codeOnly 去注释保字符串 + parseShell 引号/$(…)/注释/元字符/未闭合抛错 + loadYaml 按字段取值 + 坏语法必抛 + 12 个公共导出面（另 2 个内部件 shellTokens/_cache 单列，导出集合与登记表逐项相等——新增导出未登记即红）' }
 ]
 
 // 注册表自身的加载期形状校验：本文件被 run_tests.js / run_unit_tests.js / run_mutation.js 与

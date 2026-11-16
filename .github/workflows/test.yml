@@ -52,6 +52,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false   # 不把 GITHUB_TOKEN 写进 .git/config（zizmor artipacked）；测试 job 不需要 git 凭据
+          # r23-B2：源码文本断言闸门要拿「参照提交里的基线」核对只减不增（见下方 check:assert-style 步骤）。
+          # 默认 depth=1 是**浅克隆**：参照是 base 分支的提交，与 HEAD 可能隔任意多层；push 到 main 时还要取
+          # HEAD 之前的提交（参照 == HEAD 时闸门绝不自比自，改用它之前的提交）。取不到参照时闸门在 CI
+          # （CI=true）上 fail-closed ⇒ 必须整取历史。
+          fetch-depth: 0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
@@ -81,6 +86,33 @@ jobs:
 
       - name: 版本一致性闸门（文件头 ↔ CHANGELOG ↔ package.json）
         run: node check-version.js
+
+      # v3.444 源码文本断言闸门（v3.445 从 policy 挪到本 job）：禁止测试里新增「读源码文本」的断言。
+      # 三处接线（npm run check 链 / pre-commit 第 5 道 / 这里）缺一即成摆设，由 test_ci_static_gates.js
+      # 的「check:assert-style 三处接线」用例判红。
+      # 为何在 quality 而不在 policy：该闸用 acorn 解析测试面 .js，而 policy 是**刻意零依赖**的静态闸 job
+      # （只装 shellcheck/zizmor，从不跑 npm ci）——放在那里必然 MODULE_NOT_FOUND；本 job 的 npm ci 已装好 acorn。
+      - name: 源码文本断言闸门（禁止新增读源码文本断言）
+        run: npm run check:assert-style
+        env:
+          # r23-B2：基线「只减不增」的增长参照。PR 上是 base 分支，push 到 main 时是 main 自身
+          # （解析到被判定提交本身时闸门改用它的父提交，绝不自比自）；取不到参照、或参照树里没有基线
+          # 文件且不属于可证明的「首次引入」（本变更新增该文件 + 基线逐文件==实测）时，CI 上 fail-closed
+          # （exit 2），故上面 checkout 必须 fetch-depth: 0。
+          # 经 env 注入而不是往 run 里拼参数：步骤的 run 串必须与本地同一条 npm 链（test_ci_static_gates.js 锁着）。
+          SOURCE_TEXT_ASSERT_BASELINE_REF: origin/${{ github.base_ref || 'main' }}
+
+      # v3.447：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样显式列步骤
+      # ——否则脱门；摘除静态扫描步骤、check 链或 pre-commit 门链，本步骤变红）。
+      # 为何在 quality 而不在 policy（与上面 check:assert-style 同一根因）：本套件自 S0 r4 起 import
+      # test_support/source_model.js —— 顶层 require('acorn')（dependencies），loadYaml 还需 js-yaml
+      # （只在本 job 的 devDeps 树里）。policy 是刻意零依赖的静态闸 job（只装 shellcheck/zizmor，从不
+      # npm ci），挂那边必 MODULE_NOT_FOUND（v3.446 的 CI 实测：`Cannot find module 'acorn'`，栈在
+      # test_ci_static_gates.js → test_support/source_model.js:23），quality-gate 连带红。本 job 的
+      # `npm ci` 已经装好两者。**policy 里不得残留该步骤**，由 test_ci_skip_suites.js
+      # 的 assertPolicyStepsUnconditional 正向锁住（quality 恰好一次 / policy 恰好零次）。
+      - name: 静态扫描接线断言（test_ci_static_gates.js）
+        run: npm run test:ci-static-gates
 
       - name: 单元测试（test_filter.js，含 101 章版本校验）
         run: npm run test:filter
@@ -269,10 +301,10 @@ jobs:
           pipx install zizmor==1.30.1
           npm run check:ci-static
 
-      # v3.280：接线断言套件（test_suites.js 标 mutationSkip，故必须像 test:install-hooks 一样
-      # 显式列步骤——否则脱门；摘除上面步骤或 pre-commit 门链，本步骤变红）。
-      - name: 静态扫描接线断言（test_ci_static_gates.js）
-        run: npm run test:ci-static-gates
+      # v3.280 的「静态扫描接线断言（test_ci_static_gates.js）」步骤自 v3.447 起**不在这里**：
+      # 该套件 import test_support/source_model.js（顶层 require('acorn') + loadYaml 需 js-yaml），
+      # 而本 job 刻意零依赖（只装 shellcheck/zizmor，从不 npm ci）⇒ 挂这里必 MODULE_NOT_FOUND。
+      # 它已移到 quality job（`npm ci` 之后），并由 test_ci_skip_suites.js 正向锁住「这里为 0」。
 
       # v3.281 文档行长闸门：任何 markdown 单行 > 1200 字符即红（prose 防回长，见 scripts/check-doc-lines.js）。
       # 三处接线（check 链 / pre-commit / 这里）缺一即成摆设。

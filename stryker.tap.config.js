@@ -129,7 +129,11 @@ const explicitTestFiles = [
   // S2：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
   'test_state_schema.js',
   // D1：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
-  'test_console_routes.js'
+  'test_console_routes.js',
+  // S0：与 test_suites.js 的注册顺序一致 —— 追加在末尾（本套件非 integration/mutationSkip）。
+  'test_check_source_text_asserts.js',
+  // S0（v3.446，r4-4）：工具层自身的用例，同样追加在末尾（非 integration/mutationSkip）。
+  'test_source_model.js'
 ]
 
 function listDiff (expected, actual) {
