@@ -1816,3 +1816,8 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **验证（本机实测，全部 TZ=UTC）**：`node scripts/check-source-text-asserts.js` exit 0（`基线 total=2080（37 个文件），实测 total=2080（扫描 67 个测试面文件）`——本仓 `origin/main` 目前还没有这份基线文件，故按「首次引入基线」打印 `ℹ️ 无法核对增长（…本变更新增了它 = 首次引入…已按「基线逐文件与实测完全一致」核对（total=2080））` 而不是 ✓）；`node test_check_source_text_asserts.js` 28/28；`node test_ci_static_gates.js` 12/12；`node check-version.js` 四方一致；`npm run check:doc-lines` 全绿（7 个文件、最长 1185 字符）；`npx standard` 改动文件 exit 0。
   - **落地约束（如实登记）**：基线文件本身在**本 PR** 里（`origin/main` 没有它），因此本 PR 的 CI 走「首次引入」这条例外：参照树里没有该文件、`--diff-filter=A` 证明是本变更新增、且基线逐文件等于实测（2080）⇒ 打印「无法核对增长（首次引入）」并放行；**同一 PR 里再抬高等量数字（≠ 实测）仍会 exit 2**。合并进 main 之后，所有 PR / push 的参照（`origin/<base>` 或 `origin/main^`）都含这份文件，走正常「✓/❌ 相对参照」核对，例外的窗口自动关闭。
   - **版本**：3.465.0 → **3.466.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。
+
+## v3.467
+
+- **只修 SonarCloud javascript:S2871（`scripts/check-source-text-asserts.js` 的 `baselineExactDiffs` 里 `[...files].sort()` 未传比较器）**：补上与同文件 :594 / :979 完全同口径的字符串比较器 `(a, b) => (a < b ? -1 : a > b ? 1 : 0)`——默认 `sort()` 的比较口径本就是 UTF-16 码元序，补上后排序结果逐元素相同，因此判定语义不变；白名单 2080（37 个文件）与全部输出一律未动，只改这一行工具代码。
+  - **版本**：3.466.0 → **3.467.0**（主文件头 / CHANGELOG / `package.json` / `package-lock.json` 两处）。

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.466 — S0 r23 两条 must_fix：增长核对的参照不得是 HEAD 自身（候选链去掉 HEAD，候选指到被判定提交时改用它的父提交；参照不可得 / 参照树无基线文件时 CI fail-closed exit 2、本机打印「无法核对增长」且绝不出现 ✓；显式参照不可用一律 exit 2），CI 侧恢复 fetch-depth: 0 与 SOURCE_TEXT_ASSERT_BASELINE_REF=origin/<base> 并由 test_ci_static_gates.js 的接线断言与四条靶向反例锁死；自测 24 → 28 检查（全部真实 git 隔离仓库）。只动测试面、工具层、workflow 与文档，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.467 — S0 r24：只修 SonarCloud javascript:S2871——scripts/check-source-text-asserts.js 的 baselineExactDiffs 里 [...files].sort() 补上与该文件 :594 / :979 同口径的字符串比较器 (a, b) => (a < b ? -1 : a > b ? 1 : 0)（默认 sort() 的比较口径本就是 UTF-16 码元序，补上后排序结果逐字相同）；判定语义、白名单 2080（37 个文件）与全部输出一律不变。只动一行工具代码与版本记录，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

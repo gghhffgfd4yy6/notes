@@ -887,7 +887,7 @@ function baselineAddedSince (commit) {
 function baselineExactDiffs (baseline, measured) {
   const files = new Set([...Object.keys(baseline.by_file), ...measured.keys()])
   const rows = []
-  for (const file of [...files].sort()) {
+  for (const file of [...files].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
     const allowed = isCount(baseline.by_file[file]) ? baseline.by_file[file] : 0
     const count = measured.get(file) || 0
     if (allowed !== count) rows.push({ file, allowed, count })
