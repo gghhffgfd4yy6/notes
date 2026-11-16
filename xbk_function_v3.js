@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.484 — C1 r2：修评审 4 条 must_fix（v3.482 段 probe 条数 40→93、98+26=124 对账、shortfall 拆成两次运行；补 test_support/markup.js 12 条自测）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.485 — C1 r3：消 Codacy xss/no-mixed-html 的 20 条新增误报（markup 自测夹具改 « 占位 + LT/htmlOf 运行期换回，喂给 markup/astQuery 的字符串逐字节不变）；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
