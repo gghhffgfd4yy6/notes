@@ -2232,7 +2232,9 @@ async function filterRuleApiTests () {
     // 负向的「旧文案必须消失」看**字符串字面量/模板静态段**（注释不在 AST 里，注释里的
     // 同句不能再冒充实现——旧 `!src.includes('进程内 last-known-good')` 恰恰会被注释满足）。
     const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
-    const copies = stringValuesOf(pages)
+    // 扫描面 = 全部 7 个前端模块的字符串字面量/模板静态段：文案可能被搬去 components/ui/app，
+    // 只扫 pages.js 时把旧话术写回别的模块不会变红（r4-B：原扫描面被收窄成单模块）。
+    const copies = consoleAssetModels().flatMap((model) => stringValuesOf(model))
     assert.deepStrictEqual(copies.filter((text) => text.includes('进程内 last-known-good')), [],
       '旧机制文案必须删除：控制台 auto-run 每轮都是新进程，进程内 last-known-good 等于不存在')
     const noticeCalls = callSites(pages, 'filterCorruptNotice')
@@ -2842,7 +2844,9 @@ async function filterRuleApiTests () {
     assert.strictEqual(memberPath(dialogProps.get('to')), 'restoreTo', '弹窗必须带上要回滚到的目标（restoreTo）')
     assert.strictEqual(memberPath(dialogProps.get('baseRevision')), 'revision', '弹窗必须快照页面加载时的 revision')
     // ⑤ 选项文案：恢复默认已改成「写空覆盖文件」，旧的「删除覆盖文件」说法必须彻底消失。
-    const copies = stringValuesOf(pages)
+    // 同 r4-B：负向文案扫描面必须覆盖全部 7 个前端模块（旧的「删除覆盖文件」说法写回
+    // components/ui/app 同样要红），不是只查 pages.js 的字面量。
+    const copies = consoleAssetModels().flatMap((model) => stringValuesOf(model))
     assert.deepStrictEqual(copies.filter((text) => text.includes('恢复代码默认（删除覆盖文件）')), [],
       '恢复默认不再删文件，选项文案必须同步（旧说法只允许出现在注释里也不允许）')
     const restoreOption = findAll(pages, (n) => n.type === 'ObjectExpression' &&

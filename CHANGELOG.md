@@ -2062,3 +2062,23 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **运行期字符串逐字节相同（用 acorn 一次性核对，脚本不入库）**：取 `git show HEAD:test_source_model.js` 与新版同一批实参，按文件里的**真实声明**递归求值（`Literal` / 无插值 `TemplateLiteral` / `+` / `htmlOf` / `LT` = `String.fromCharCode(60)` / `tplOf` → `tplSrc`），再比 sha256：第 12 节 **21 条**喂给 `markup`/`astQuery` 的字符串（含 `tplOf`、`parseText` 的内层源码串）**21/21 逐字节相同**；`check()` 标题 25 条中 22 条相同、3 条按上面口径改词；`assert.*` **122 条调用一条不少**，逐条实参比对只有 3 处差异且全部是消息文案，期望值（含 `'a < b'` 这类含裸小于号的期望串）逐字节相同。
   - **验证（TZ=UTC，本工作树实跑）**：`node test_source_model.js` → `✅ test_source_model 全部通过（25 检查）` rc0；`node test_console.js` → `控制台套件：通过 376 / 失败 0` rc0；`node scripts/probe-format-coupling.js` 绿；`node scripts/check-source-text-asserts.js` exit 0 → `基线 total=2165（35 个文件），实测 total=2165`、`test_source_model.js` 仍 5 条（白名单条数与改前逐字节相同，未用 `--write-allowlist`／`--allow-growth`）；`npx standard test_source_model.js` exit 0；`node check-version.js` → v3.485 四方一致；`node scripts/check-doc-lines.js` 绿。
   - **版本**：3.484.0 → **3.485.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
+
+## v3.486
+
+- **C1 r4：修 must_fix「两处负向旧文案断言的扫描面从 7 模块全文收窄成 `pages.js` 单模块」（只动测试面 + 版本四方，生产逻辑一行未改）**：
+  - **问题**：`test_console.js` 第 1 段两处负向断言（`旧机制文案必须删除` 与选项文案 `恢复代码默认（删除覆盖文件）`）的扫描输入，从 `readConsoleSource()`（constants/format/api/components/pages/ui/app 七模块拼全文）换成了 `stringValuesOf(loadModel(pages.js))` —— 只扫 `pages.js` 的字符串字面量。于是把旧文案重新写回 `ui.js` / `components.js` / `app.js` 的字面量不再变红，S0 判据② 被放宽。
+  - **改法（两处同改，改前 `:2235` / `:2845`，改后 `:2237` / `:2849`）**：`const copies = stringValuesOf(pages)` → `const copies = consoleAssetModels().flatMap((model) => stringValuesOf(model))`。`consoleAssetModels()` 覆盖 `CONSOLE_MODULE_FILES` 全部 **7** 个模块（constants/format/api/components/pages/ui/app，见 `test_console.js:49-57`）；`loadModel` 有进程内缓存，重复取不重复解析。**收紧口径保留**：只扫「字符串字面量 + 模板静态段」，注释不在 AST 里 ⇒ 不把注释算实现（这是相对旧 `readConsoleSource()` 文本拼接的改进，没有退回文本扫描）。
+  - **反向验证（真跑；两次破坏都只改工作树、未提交，事后 `git checkout --` 还原）**：
+    - 破坏 1：`scripts/console-assets/ui.js` 顶部插入 `const LEGACY_LKG_COPY = '进程内 last-known-good'` → `TZ=UTC node test_console.js` **exit 1**，`控制台套件：通过 375 / 失败 1`，红点原文 `❌ 过滤规则页: 覆盖文件损坏红条改持久 LKG 叙事，并按运行侧 lastGoodUsed 区分「沿用上次规则 / 回退代码默认」: 旧机制文案必须删除：控制台 auto-run 每轮都是新进程，进程内 last-known-good 等于不存在`，`(actual=["进程内 last-known-good"] expected=[])`。
+    - 破坏 2：同位置插入 `const LEGACY_RESTORE_COPY = '恢复代码默认（删除覆盖文件）'` → **exit 1**，红点原文 `❌ 过滤规则页对接: 预览不可读文案 + 回滚带 baseRevision（结构红线）: 恢复默认不再删文件，选项文案必须同步（旧说法只允许出现在注释里也不允许）`，`(actual=["恢复代码默认（删除覆盖文件）"] expected=[])`。
+    - **对照（证明旧写法确实漏抓）**：保留 `ui.js` 的破坏 1，把 `test_console.js` 退回 HEAD 的旧写法（只扫 `pages.js`）→ `控制台套件：通过 376 / 失败 0`，**exit 0** —— 旧断言对这种破坏完全无感，即本次修的正是这条漏抓路径。
+    - **扫描面确实是 7 模块**：把同一句破坏放进 `components.js`（而非 `pages.js`）→ 同样红在 `旧机制文案必须删除`，`(actual=["进程内 last-known-good"] expected=[])`。
+    - **注释不算实现**：把旧文案放进 `ui.js` 的注释行（`// 进程内 last-known-good 恢复代码默认（删除覆盖文件）`）→ 仍 `控制台套件：通过 376 / 失败 0`，exit 0（AST 里没有注释）。
+    - 恢复：`git checkout -- scripts/console-assets/ui.js`（`git status` 只剩 `test_console.js`）→ `TZ=UTC node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0，27.9s。
+  - **机械判据（TZ=UTC，本工作树实跑）**：
+    - `node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0，27.9s（改前同样 376 / 0，28.7s）。
+    - `node scripts/check-source-text-asserts.js` → **exit 0**：`源码文本断言：基线 total=2165（35 个文件），实测 total=2165（扫描 69 个测试面文件）`、`✓ 基线相对参照 origin/main 未增长（逐文件与 total 一致：2165 条）`、`✅ 扫描面内未新增源码文本断言（逐文件计数均未超基线）`。逐文件计数 `test_console.js` 改前改后均为 **1794**、全仓 **2165 → 2165**（本改动只改 `stringValuesOf` 的输入集合，不产生新的源码文本比对 ⇒ 条数不变；未用 `--write-allowlist`／`--allow-growth`）。
+    - `npx standard test_console.js` → exit 0（无输出）。
+    - `node scripts/probe-format-coupling.js test_console.js` → **exit 1**，耗时 39.9s，`汇总：format-coupled 1 / format-clean 0`，唯一明细 `↳ ❌ 分页/横滑控件: 运行历史与推送记录都有每页条数，趋势与历史表可横向滑动: 运行历史每页条数须为 10/20/50/100 (actual=false expected=true)`，落在 `test_console.js:7700` 的 `/const RUN_PAGE_SIZES = \[10, 20, 50, 100\]/` 正则上 —— 该行在旧行 **≥7697**（第 2 段及以后），**不在本包 C1 的第 1 段**，属既有遗留，本改动未新增耦合：改前基线跑同一命令为 **同一份输出**（exit 1、同一明细行、28.4s）。`已还原 75 个文件`、`还原校验：git status --short 与运行前一致`。
+    - `node check-version.js` → v3.486 四方一致；`node scripts/check-doc-lines.js` 绿。
+  - **版本**：3.485.0 → **3.486.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。

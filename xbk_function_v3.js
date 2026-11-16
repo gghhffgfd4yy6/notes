@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.485 — C1 r3：消 Codacy xss/no-mixed-html 的 20 条新增误报（markup 自测夹具改 « 占位 + LT/htmlOf 运行期换回，喂给 markup/astQuery 的字符串逐字节不变）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.486 — C1 r4：两处负向旧文案断言的扫描面改回全部 7 个前端模块（字符串字面量 + 模板静态段），不再只扫 pages.js；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
