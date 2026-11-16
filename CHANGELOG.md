@@ -2033,3 +2033,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **闸门（TZ=UTC）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`；`node scripts/check-source-text-asserts.js` exit 0（`基线 total=2165` / `实测 total=2165`，`test_console.js` 124 条 shortfall）；`npx standard test_console.js test_support/*.js` exit 0；`node check-version.js` v3.482 四方一致。
   - **`probe-format-coupling.js test_console.js` 现状（未绿，原因不在本段）**：扰动 75 个生产 JS 后仍红 40 条用例，逐条回填旧行号后**全部落在旧行 ≥7048（第 2 段及以后）**，本段 387–6976 零命中（用 `scripts/probe-format-coupling.js` 的同一份扰动逻辑跑全量失败清单核对）。本段自身在扰动下全绿。
   - **版本**：3.481.0 → **3.482.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
+
+## v3.483
+
+- **C1 收尾：修 SonarCloud S5332（测试占位 base 由 http 改 https，断言语义不变）**：`test_console.js` 里「资产 URL 不得带 token 查询参数」那条断言用 `new URL(url, 'http://x')` 解析相对 URL，扫描器把明文 http 占位 base 记为不安全协议（PR #422 新增行，quality gate 唯一失败条件）。改成 `'https://x'`：base 只用于把相对路径解析成绝对 URL，页面资产本身就是 `/assets/…` 这类相对路径，解析结果与原写法逐项相同，筛选条件与失败文案一字未改；未用 NOSONAR/注释压制，生产逻辑一行未改。同批核对本 PR 全部新增行（`git diff origin/main...HEAD` 过滤 `http://`），仅此 1 处占位 base。
+- **验证（TZ=UTC）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0；`node scripts/check-source-text-asserts.js` exit 0（基线 total=2165 / 实测 total=2165，逐文件未超基线）；`npx standard test_console.js` exit 0；`node check-version.js` → v3.483 四方一致。
+- **版本**：3.482.0 → **3.483.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。

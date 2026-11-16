@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.482 — C1：test_console.js 第 1 段 98 处「读源码文本」断言换成结构/行为判据（AST 结构、标记结构、解析后字段、真实响应体；注释不再能冒充实现），源码文本断言基线 2289→2165、test_console.js 1918→1794（只减不增），生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.483 — C1：测试占位 base 由 http 改 https，消 SonarCloud S5332 安全告警（test_console.js 资产 URL 断言语义不变）；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

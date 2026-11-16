@@ -4564,7 +4564,7 @@ async function main () {
       .map((el) => markup.attrText(el, 'href') || markup.attrText(el, 'src'))
       .filter((url) => typeof url === 'string' && url !== '')
     assert.ok(assetUrls.length > 0, '页面必须引用资产（否则下面那条恒真）')
-    assert.deepStrictEqual(assetUrls.filter((url) => new URL(url, 'http://x').searchParams.has('token')), [],
+    assert.deepStrictEqual(assetUrls.filter((url) => new URL(url, 'https://x').searchParams.has('token')), [],
       '资产 URL 不得带 token 查询参数（Cookie 通道已覆盖）')
     const js = await request(port, 'GET', '/assets/app.js', { token: TOKEN })
     assert.strictEqual(js.status, 200)
