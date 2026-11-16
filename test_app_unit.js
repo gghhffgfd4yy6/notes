@@ -10,6 +10,8 @@ const assert = require('assert')
 const path = require('path')
 const crypto = require('crypto')
 const os = require('os')
+// 源码结构视图（S0 工具层）：源码形状/插桩判据一律走 AST，不读源码文本做子串/切片
+const { loadModel } = require('./test_support/source_model')
 
 // v3.403：日志上限在生产是 100MiB；本套件用桩 fs 造夹具，按 20MiB 注入即可覆盖同一套截尾逻辑
 process.env.XBK_LOG_LIMIT_BYTES = String(20 * 1024 * 1024)
@@ -48,8 +50,70 @@ function check (name, fn) {
 // 源码形状断言（数命中次数、比对片段）在那里必然失真：实测 'runs', 'total' 1→0、
 // fs.openSync(lockPath, 'wx') 2→0（run 41253679046 的 dry run 红）。
 // 这类断言守护的是「实现只剩一份」，属评审期红线，只在未插桩的运行（本地 / 单测 / 门禁）里有意义。
-function sourceShapeGuard (src, name) {
-  return src.indexOf('stryMutAct_') !== -1 ? skip(name, 'Stryker 沙箱内源码已插桩，源码形状断言不适用') : null
+//
+// 判据走 AST 的**被调名集合**（test_support/source_model 的 loadModel().calls），不再读源码文本找
+// 'stryMutAct_' 子串：格式化、注释里出现同名字样都不再影响这个判定，而「有插桩调用」本身仍是
+// 结构事实（插桩把表达式包成一次调用，名字带 stryMutAct_/stryCov_ 前缀）。
+function sourceShapeGuard (file, name) {
+  const instrumented = [...loadModel(file).calls].some(call =>
+    call.startsWith('stryMutAct_') || call.startsWith('stryCov_'))
+  return instrumented ? skip(name, 'Stryker 沙箱内源码已插桩，源码形状断言不适用') : null
+}
+
+// ── 源码形状断言的 AST 基座（S0 起一律数结构，不数文本）────────────────────
+// 下面几条用例守的是「只剩一份实现 / 调用点只有 N 处 / 某个名字不得再出现」这类**结构**不变式。
+// 用正则在源码文本里数形态会被排版影响（probe-format-coupling：`(` 后多一个空格就全红），
+// 而注释里写一遍同样的片段又会假绿。判据换成 AST 上的被调名 / 标识符 / 字面量 / 赋值形态。
+function walkAst (node, visit) {
+  if (!node || typeof node !== 'object' || typeof node.type !== 'string') return
+  visit(node)
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === 'range') continue
+    const value = node[key]
+    if (Array.isArray(value)) value.forEach(child => walkAst(child, visit))
+    else if (value && typeof value === 'object') walkAst(value, visit)
+  }
+}
+
+// 收集满足条件的节点（顺序 = 源码顺序）
+function collectNodes (node, predicate) {
+  const found = []
+  walkAst(node, candidate => { if (predicate(candidate)) found.push(candidate) })
+  return found
+}
+
+const isIdentifier = (node, name) => !!node && node.type === 'Identifier' && node.name === name
+
+// 成员路径（a.b.c / this.a）：只认非计算成员，其它形态返回 null（表达不了就不猜）
+function memberPathOf (node) {
+  if (!node) return null
+  if (node.type === 'Identifier') return node.name
+  if (node.type === 'ThisExpression') return 'this'
+  if (node.type !== 'MemberExpression' || node.computed || node.property.type !== 'Identifier') return null
+  const base = memberPathOf(node.object)
+  return base ? base + '.' + node.property.name : null
+}
+
+const isCallTo = (node, path) => !!node && node.type === 'CallExpression' && memberPathOf(node.callee) === path
+
+// 字面量取值：字符串/数字/布尔字面量、无插值模板、以及模板里的静态片段（`'wx'`、`0o600`、`{Html内容}`）
+function literalValueOf (node) {
+  if (!node) return undefined
+  if (node.type === 'Literal') return node.value
+  if (node.type === 'TemplateElement') return node.value.cooked
+  if (node.type === 'TemplateLiteral' && node.expressions.length === 0) return node.quasis.map(q => q.value.cooked).join('')
+  return undefined
+}
+
+// 对象字面量/类字段里的静态键名
+const propertyKeyOf = (prop) => (prop && prop.key ? (prop.key.name !== undefined ? prop.key.name : prop.key.value) : undefined)
+
+// 按名字取对象字面量里的方法（_updateChannelHealth 这类）；找不到返回 null，由调用方断言（不静默当 0）
+function findMethodFunction (ast, name) {
+  const hits = collectNodes(ast, node =>
+    (node.type === 'Property' || node.type === 'MethodDefinition') && propertyKeyOf(node) === name && node.value &&
+    (node.value.type === 'FunctionExpression' || node.value.type === 'ArrowFunctionExpression'))
+  return hits.length ? hits[0].value : null
 }
 
 // 桩：fs / readSafeTextResult 全部由本文件控制，不触碰真实缓存目录
@@ -3673,7 +3737,8 @@ checkAsync('C1-021 dry-run 不得清 _f / 写回缓存 / 推进 filter.hash（�
       h.setItems([makeRunItem('dry-3', '乙条三')])
       await runWithWarnings(h.App)
       const idsAfterSecondReal = JSON.parse(realFs.readFileSync(cachePath, 'utf8')).map((m) => m.id)
-      assert.strictEqual(idsAfterSecondReal.includes('dry-1'), false,
+      // 复用的是 JSON.parse 之后的结构化 id 列表（不是源码/日志文本），用 Set 做成员判定
+      assert.strictEqual(new Set(idsAfterSecondReal).has('dry-1'), false,
         `真跑必须把旧 _f 条目移出缓存（否则改宽规则后永不重评）：${JSON.stringify(idsAfterSecondReal)}`)
       assert.notStrictEqual(realFs.readFileSync(hashPath, 'utf8'), hashAfterReal, '真跑必须推进 filter.hash')
     } finally {
@@ -4078,9 +4143,10 @@ checkAsync('RUN-1 推送失败不写缓存：失败条目不得进缓存（含�
     const idsAfterFail = h.cacheMessages().map(m => m && m.id)
     assert.deepStrictEqual(idsAfterFail, ['run1-a'],
       `推送失败的条目绝不能被写进缓存（写进去 ⇒ 下轮被当已推送去重 ⇒ 永久漏推）：实际 ${JSON.stringify(idsAfterFail)}`)
-    // 字节级复核：读取层可能因形状/键名差异掩盖问题，缓存文件里也不得出现失败条目。
-    assert.ok(!realFs.readFileSync(cachePath, 'utf8').includes('run1-b'),
-      '缓存文件字节里不得出现失败条目 id（推送失败不写缓存）')
+    // 结构化复核：直接读缓存文件并解析成对象数组（不经过 MessageStore 的读取层），失败条目不得出现在里面
+    const rawCacheEntries = JSON.parse(realFs.readFileSync(cachePath, 'utf8'))
+    assert.deepStrictEqual(rawCacheEntries.filter(m => m && m.id === 'run1-b'), [],
+      '缓存文件里不得出现失败条目 id（推送失败不写缓存）')
 
     // 第二轮：通道恢复。失败条目必须被重推（若上轮被误写进缓存，这里会因去重而 pushed=0）。
     failTitle = null
@@ -4203,32 +4269,38 @@ checkAsync('CD-1 cacheDir 每次访问都重新校验：运行中目录被换成
 //   ① 字面量只允许在 xbk_state_schema 出现一次（新增计数器改这里）；
 //   ② xbk_app.js 里**零**字面量（若又冒出一份，就等于绕过共享模块自己搬字段——正是旧 bug 的形态）。
 check('C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用', () => {
-  const fs = require('fs')
-  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  // 沙箱判据必须同时看**被断言的那个文件**：变异跑某一段时只插桩该段目标，
-  // 本用例读的 xbk_state_schema.js 在 `--mutate xbk_state_schema.js` 之外段里是**未插桩**的、
-  // 在它自己那段里是**插桩**的（插桩会把名单字面量再复制一份）⇒ 只看 xbk_app.js 会在
-  // 「app 未插桩、schema 已插桩」的段里误红（2026-11-15 实测：19 个 TAP 段全部在 dry run 齐红）。
-  const schemaRaw = fs.readFileSync(path.join(__dirname, 'xbk_state_schema.js'), 'utf8')
-  const sandboxSkip = sourceShapeGuard(src, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用') ||
-    sourceShapeGuard(schemaRaw, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用')
+  const appFile = path.join(__dirname, 'xbk_app.js')
+  const schemaFile = path.join(__dirname, 'xbk_state_schema.js')
+  const sandboxSkip = sourceShapeGuard(appFile, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用') ||
+    sourceShapeGuard(schemaFile, 'C1-014 计数器名单单一来源：字面量只在 xbk_state_schema 一处，生产侧只引用')
   if (sandboxSkip) return sandboxSkip
-  const readCode = (file) => fs.readFileSync(path.join(__dirname, file), 'utf8')
-    .split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n') // 注释里复述名单不算实现重复
-  const code = readCode('xbk_app.js')
-  const schemaCode = readCode('xbk_state_schema.js')
-  assert.strictEqual((schemaCode.match(/'runs', 'total'/g) || []).length, 1,
-    '计数器名单字面量必须只剩 xbk_state_schema 的常量这一处（加字段必漏的根因就是它多份）')
-  assert.strictEqual((code.match(/'runs', 'total'/g) || []).length, 0,
+  // 「名单字面量」= 恰好是这 7 个名字（顺序一致）的数组字面量。只允许在 schema 出现一次（REPORT_COUNTERS 声明），
+  // app 里零次。数的是 AST 上的数组元素字面量，不受排版影响：`'runs',  'total'` 这种多一个空格不再假红。
+  const COUNTER_LIST = ['runs', 'total', 'dedup', 'filtered', 'pushed', 'failed', 'truncated']
+  const isNameArray = (node) => node.type === 'ArrayExpression' && node.elements.length === COUNTER_LIST.length &&
+    node.elements.every((el, i) => !!el && literalValueOf(el) === COUNTER_LIST[i])
+  const appAst = loadModel(appFile).ast
+  const schemaAst = loadModel(schemaFile).ast
+  const schemaArrays = collectNodes(schemaAst, isNameArray)
+  assert.strictEqual(schemaArrays.length, 1,
+    `计数器名单字面量必须只剩 xbk_state_schema 的常量这一处（加字段必漏的根因就是它多份），实测 ${schemaArrays.length} 处`)
+  assert.strictEqual(collectNodes(appAst, isNameArray).length, 0,
     'xbk_app.js 不得再写字面量名单（S2 后单一来源是 xbk_state_schema.js）')
-  const refs = code.match(/REPORT_COUNTERS/g) || []
+  const refs = collectNodes(appAst, node => isIdentifier(node, 'REPORT_COUNTERS'))
   assert.ok(refs.length >= 2, `跨天结转等仍必须引用共享名单，实际引用 ${refs.length} 处`)
-  assert.strictEqual(/require\('\.\/xbk_state_schema'\)/.test(code), true, 'xbk_app 必须从共享模块引入名单')
-  const schemaRefs = schemaCode.match(/REPORT_COUNTERS/g) || []
+  // 引入方式：require('./xbk_state_schema') 必须存在（被判定的调用形态，不是文本片段）
+  const requires = collectNodes(appAst, node =>
+    node.type === 'CallExpression' && isIdentifier(node.callee, 'require') && literalValueOf(node.arguments[0]) === './xbk_state_schema')
+  assert.strictEqual(requires.length, 1, `xbk_app 必须从共享模块引入名单（require('./xbk_state_schema') 恰好 1 处，实际 ${requires.length} 处）`)
+  const schemaRefs = collectNodes(schemaAst, node => isIdentifier(node, 'REPORT_COUNTERS'))
   assert.ok(schemaRefs.length >= 5, `清零/归一化/校验/结转都必须引用 REPORT_COUNTERS，实际引用 ${schemaRefs.length} 处`)
-  assert.strictEqual(/runs:\s*0,\s*total:\s*0/.test(code), false,
+  // 手写七字段零值字面量（{ runs: 0, total: 0, … }）不得再出现：AST 上数「同时含 runs:0 与 total:0 的对象」
+  const isZeroSummaryObject = (node) => node.type === 'ObjectExpression' &&
+    node.properties.some(p => propertyKeyOf(p) === 'runs' && p.value && literalValueOf(p.value) === 0) &&
+    node.properties.some(p => propertyKeyOf(p) === 'total' && p.value && literalValueOf(p.value) === 0)
+  assert.strictEqual(collectNodes(appAst, isZeroSummaryObject).length, 0,
     '不得再出现手写七字段零值字面量（新增计数器时它会漏掉）')
-  assert.strictEqual(/runs:\s*0,\s*total:\s*0/.test(schemaCode), false,
+  assert.strictEqual(collectNodes(schemaAst, isZeroSummaryObject).length, 0,
     '共享模块里也不得手写七字段零值字面量')
 })
 
@@ -4308,16 +4380,23 @@ checkAsync('C1-009 用户主动关闭告警（_sendAlert 返回 undefined 且 al
 // 审计条目：两条循环各自实现日志、成功计数、补位间隔。这里锁住「只剩一份实现」——回退修复后
 // 成功日志文案与 pushInterval 解析会各自回到两份，计数立刻变红。
 check('C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份', () => {
-  const fs = require('fs')
-  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  const sandboxSkip = sourceShapeGuard(src, 'C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份')
+  const appFile = path.join(__dirname, 'xbk_app.js')
+  const sandboxSkip = sourceShapeGuard(appFile, 'C1-017 推送循环共用口径：成功日志文案与 pushInterval 解析各只有一份')
   if (sandboxSkip) return sandboxSkip
-  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
-  const logHits = code.match(/发现到新数据：/g) || []
-  assert.strictEqual(logHits.length, 1, `成功日志文案必须只有一处（logPushed），实际 ${logHits.length} 处`)
-  const intervalHits = code.match(/Utils\.num\(Config\.timing\.pushInterval, 0\)/g) || []
-  assert.strictEqual(intervalHits.length, 1, `pushInterval 解析必须只有一处，实际 ${intervalHits.length} 处`)
-  const countHits = code.match(/successCount \+= logPushed\(r\)/g) || []
+  const ast = loadModel(appFile).ast
+  // 成功日志文案：含「发现到新数据：」的字面量/模板片段只允许出现一处（logPushed 里）
+  const logTexts = collectNodes(ast, node => {
+    const value = literalValueOf(node)
+    return typeof value === 'string' && value.includes('发现到新数据：')
+  })
+  assert.strictEqual(logTexts.length, 1, `成功日志文案必须只有一处（logPushed），实际 ${logTexts.length} 处`)
+  // pushInterval 解析：Utils.num(Config.timing.pushInterval, 0) 只允许一处（两条循环共用这个口径）
+  const intervalCalls = collectNodes(ast, node => isCallTo(node, 'Utils.num') &&
+    memberPathOf(node.arguments[0]) === 'Config.timing.pushInterval' && literalValueOf(node.arguments[1]) === 0)
+  assert.strictEqual(intervalCalls.length, 1, `pushInterval 解析必须只有一处，实际 ${intervalCalls.length} 处`)
+  // 成功计数：并行/顺序两条循环都必须经同一个 logPushed 累加 ⇒ `successCount += logPushed(...)` 恰好 2 处
+  const countHits = collectNodes(ast, node => node.type === 'AssignmentExpression' && node.operator === '+=' &&
+    isIdentifier(node.left, 'successCount') && isCallTo(node.right, 'logPushed'))
   assert.strictEqual(countHits.length, 2, `并行/顺序都必须经同一 logPushed 计数，实际 ${countHits.length} 处`)
 })
 
@@ -4366,48 +4445,70 @@ check('C1-011 次级上限是 fail-open 专属：拿到锁时超 1MiB 仍按锁�
 // （通道健康把 10000 写死）。这里锁住「只剩一份实现」：回退后 openSync('wx') 会回到 4 处、
 // LOCK_STALE_MS 会回到 2 份定义，计数立刻变红。语义差异（重试 vs 单次）由调用方选择保留。
 check('C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份', () => {
-  const fs = require('fs')
-  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  const sandboxSkip = sourceShapeGuard(src, 'C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份')
+  const appFile = path.join(__dirname, 'xbk_app.js')
+  const sandboxSkip = sourceShapeGuard(appFile, 'C1-013 三处 O_EXCL 锁共用同一实现：wx 打开点只剩首试+回收重开两处，锁常数只有一份')
   if (sandboxSkip) return sandboxSkip
-  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
+  const ast = loadModel(appFile).ast
   // 0o600 是 CodeQL js/insecure-temporary-file 收口后的口径：锁文件只含 pid:starttime，
-  // 显式收紧 mode。这里钉两个数：wx 打开点总数（首试 + 回收后重开 = 2）与其中显式带 0o600
-  // 的条数（= 2）。只统计「带 mode」那一条不够——再插一处两参 openSync 时它会照样通过，
+  // 显式收紧 mode。这里钉两个数：wx 打开点总数（首试 + 回收后重开 = 2）与其中显式带 0o600 的
+  // 条数（= 2）。只统计「带 mode」那一条不够——再插一处两参 openSync 时它会照样通过，
   // 而 CodeQL 报的正是那种形态。
-  const wxOpenPoints = code.match(/fs\.openSync\(lockPath, 'wx'/g) || []
-  const wxOpenPointsWithMode = code.match(/fs\.openSync\(lockPath, 'wx', 0o600\)/g) || []
+  // 判据是 AST 上的调用形态（fs.openSync(lockPath, 'wx'[, mode])），不是源码文本里的括号排版。
+  const wxOpenPoints = collectNodes(ast, node => isCallTo(node, 'fs.openSync') &&
+    isIdentifier(node.arguments[0], 'lockPath') && literalValueOf(node.arguments[1]) === 'wx')
   assert.strictEqual(wxOpenPoints.length, 2,
     '锁的 wx 打开点必须只有 tryLockOnce 里的两处（首试 + 回收后重开），实际 ' + wxOpenPoints.length + ' 处')
+  const wxOpenPointsWithMode = wxOpenPoints.filter(node => literalValueOf(node.arguments[2]) === 0o600)
   assert.strictEqual(wxOpenPointsWithMode.length, 2,
     '两处 wx 打开点都必须显式带 0o600（CodeQL isSecureMode 要求 mode 低 6 位为 0），实际 ' +
       wxOpenPointsWithMode.length + ' 处带 mode')
-  assert.strictEqual((code.match(/LOCK_STALE_MS/g) || []).length, 2,
+  assert.strictEqual(collectNodes(ast, node => isIdentifier(node, 'LOCK_STALE_MS')).length, 2,
     'LOCK_STALE_MS 必须只有「定义 + 使用」各一处（原先三份实现各写一份）')
-  assert.strictEqual(/mtimeMs > 10000/.test(code), false, '不得再出现写死的 10000（通道健康那份的漂移形态）')
-  assert.strictEqual((code.match(/_isTombstoneLockProcessAlive\(lockPath\)/g) || []).length, 1,
-    '持有进程存活复核必须只有一处')
-  assert.ok(/const acquireLockWithRetry = \(lockPath\) =>/.test(code), '重试口径必须来自同一个获取函数')
+  const hardcodedStale = collectNodes(ast, node => {
+    if (node.type !== 'BinaryExpression' || node.operator !== '>') return false
+    const left = memberPathOf(node.left)
+    const isMtime = left === 'mtimeMs' || (typeof left === 'string' && left.endsWith('.mtimeMs'))
+    return isMtime && literalValueOf(node.right) === 10000
+  })
+  assert.strictEqual(hardcodedStale.length, 0, '不得再出现写死的 10000（通道健康那份的漂移形态）')
+  assert.strictEqual(collectNodes(ast, node =>
+    isCallTo(node, 'MessageStore._isTombstoneLockProcessAlive') && isIdentifier(node.arguments[0], 'lockPath')).length, 1,
+  '持有进程存活复核必须只有一处')
+  const acquireFns = collectNodes(ast, node => node.type === 'VariableDeclarator' && isIdentifier(node.id, 'acquireLockWithRetry') &&
+    node.init && (node.init.type === 'ArrowFunctionExpression' || node.init.type === 'FunctionExpression') &&
+    node.init.params.length === 1 && isIdentifier(node.init.params[0], 'lockPath'))
+  assert.strictEqual(acquireFns.length, 1, '重试口径必须来自同一个获取函数 acquireLockWithRetry(lockPath)')
 })
 
 // ===== C1-025：_updateChannelHealth 里两种「failures」不再同名互相遮蔽 =====
 // 审计条目：外层是失败对象数组（outcome.failures），内层是按通道累计的连续失败次数，相隔十余行
 // 却同名——读代码时容易把数组当计数（或反之）。这里锁住两个名字：回退重命名后内层断言立刻变红。
 check('C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）', () => {
-  const fs = require('fs')
-  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  const sandboxSkip = sourceShapeGuard(src, 'C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）')
+  const appFile = path.join(__dirname, 'xbk_app.js')
+  const sandboxSkip = sourceShapeGuard(appFile, 'C1-025 通道健康：失败对象数组与连续失败次数不同名（内层不得遮蔽外层）')
   if (sandboxSkip) return sandboxSkip
-  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
-  const body = code.slice(code.indexOf('async _updateChannelHealth'))
-  assert.ok(/const failureList = Array\.isArray\(outcome && outcome\.failures\)/.test(body),
+  const health = findMethodFunction(loadModel(appFile).ast, '_updateChannelHealth')
+  assert.ok(health, '_updateChannelHealth 必须存在（否则本用例的前置不成立）')
+  const declsOf = (name) => collectNodes(health, node => node.type === 'VariableDeclarator' && isIdentifier(node.id, name))
+  // 外层：const failureList = Array.isArray(outcome && outcome.failures) ? … : []
+  const isFailureListInit = (node) => {
+    const init = node.init
+    const test = init && init.type === 'ConditionalExpression' ? init.test : init
+    return !!test && isCallTo(test, 'Array.isArray') && test.arguments.length === 1 &&
+      test.arguments[0].type === 'LogicalExpression' && test.arguments[0].operator === '&&' &&
+      isIdentifier(test.arguments[0].left, 'outcome') && memberPathOf(test.arguments[0].right) === 'outcome.failures'
+  }
+  assert.strictEqual(declsOf('failureList').filter(isFailureListInit).length, 1,
     '外层失败对象数组必须命名为 failureList（不得与次数同名）')
-  assert.ok(/const failCount = this\._safeCounter\(entry\.consecutiveFailures\)/.test(body),
-    '内层连续失败次数必须命名为 failCount')
-  assert.strictEqual(/const failures = this\._safeCounter\(entry\.consecutiveFailures\)/.test(body), false,
-    '内层不得再用 failures 遮蔽外层的失败对象数组')
-  assert.strictEqual(/consecutiveFailures: failures\b/.test(body), false,
-    '计数落盘不得再引用被遮蔽的 failures')
+  // 内层：const failCount = this._safeCounter(entry.consecutiveFailures)
+  const failCountDecls = declsOf('failCount').filter(node =>
+    isCallTo(node.init, 'this._safeCounter') && memberPathOf(node.init.arguments[0]) === 'entry.consecutiveFailures')
+  assert.strictEqual(failCountDecls.length, 1, '内层连续失败次数必须命名为 failCount')
+  // 遮蔽形态必须彻底消失：同名变量与落盘字段都不许再引用 failures
+  assert.strictEqual(declsOf('failures').length, 0, '内层不得再用 failures 遮蔽外层的失败对象数组')
+  assert.strictEqual(collectNodes(health, node =>
+    (node.type === 'Property' || node.type === 'PropertyDefinition') && propertyKeyOf(node) === 'consecutiveFailures' &&
+    isIdentifier(node.value, 'failures')).length, 0, '计数落盘不得再引用被遮蔽的 failures')
 })
 
 checkAsync('C1-013 收敛后语义不变：通道健康锁仍单次尝试（EACCES 立即 -1 且带 errno 原因）', async () => {
@@ -4533,13 +4634,16 @@ check('C1-010 窗口化只在安全时启用：短 HTML / 产物不足 / 无 htm
 })
 
 check('C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）', () => {
-  const fs = require('fs')
-  const src = fs.readFileSync(path.join(__dirname, 'xbk_app.js'), 'utf8')
-  const sandboxSkip = sourceShapeGuard(src, 'C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）')
+  const appFile = path.join(__dirname, 'xbk_app.js')
+  const sandboxSkip = sourceShapeGuard(appFile, 'C1-010 {Html内容} 模板不得走 Markdown 窗口（那一路原样发 HTML，截前缀会丢内容）')
   if (sandboxSkip) return sandboxSkip
-  const code = src.split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n')
-  assert.ok(/contentTpl\.includes\('\{Html内容\}'\) \? pushItem : this\._boundMarkdownHtml\(pushItem, contentMax\)/.test(code),
-    'pushOne 必须按模板是否含 {Html内容} 分流')
+  // pushOne 必须按「模板是否含 {Html内容}」分流：contentTpl.includes('{Html内容}') ? pushItem : this._boundMarkdownHtml(pushItem, contentMax)
+  const branching = collectNodes(loadModel(appFile).ast, node => node.type === 'ConditionalExpression' &&
+    isCallTo(node.test, 'contentTpl.includes') && literalValueOf(node.test.arguments[0]) === '{Html内容}' &&
+    isIdentifier(node.consequent, 'pushItem') && isCallTo(node.alternate, 'this._boundMarkdownHtml') &&
+    isIdentifier(node.alternate.arguments[0], 'pushItem') && isIdentifier(node.alternate.arguments[1], 'contentMax'))
+  assert.strictEqual(branching.length, 1,
+    `pushOne 必须按模板是否含 {Html内容} 分流（含则原样发 HTML，不走 Markdown 窗口），实际 ${branching.length} 处`)
 })
 
 // C1-010 返工（评审 must_fix）：探针长度不得把 htmlToMarkdown 追加的「原文链接」尾巴算进正文余量。
@@ -6783,14 +6887,20 @@ checkAsync('P1-4 阶段管线顺序：六个阶段按序调用且共用同一个
 
 checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run.log ERROR 行语义不变，失败条目不写缓存', async () => {
   const sent = []
+  // 单条失败按**调用序号**制造（第 2 条 = p1-g），不按标题子串匹配：失败的是哪一条由下面的缓存断言
+  // 钉死（只剩 p1-f），顺序一旦漂移会立刻红，不会静默变成「第二条恰好成功」。
+  // 顺序模式让序号与 items 顺序一一对应（并行模式下两个 worker 的 send 时序不保证）。
+  let sendCount = 0
   const Pusher = {
     send: async (text) => {
       sent.push(text)
-      if (text.includes('失败乙')) throw new Error('push boom')
+      sendCount += 1
+      if (sendCount === 2) throw new Error('push boom')
       return { successfulChannels: ['stub'], failures: [] }
     }
   }
   await withPipelineFixture('pipeline-pushfail-', { Pusher }, async (h, cacheDir, realFs) => {
+    h.Config.push.mode = 'sequential'
     h.setItems([makeRunItem('p1-f', '正常甲'), makeRunItem('p1-g', '失败乙')])
     const alerts = spyAlerts(h.App)
     const round = await runWithWarnings(h.App)
