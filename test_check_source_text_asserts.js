@@ -1097,6 +1097,150 @@ check('基线文件不在扫描面：mv test_console.js 到 scripts/ 必须 exit
   assert.strictEqual(runGate(ws).code, 0, '按重命名后的基线重跑必须绿')
 })
 
+/* ── r28：正则 receiver / 恒等字符串化 / 面外告警排序 ───────────────────── */
+
+// r28-1：`.test` / `.exec` 的 receiver 只认字面量时，「把正则提成常量」或「经 helper 形参传进来」
+// 就能让整条断言从检测面消失——实测 `const RE=/X/; RE.test(src)` 0 命中 exit 0，而同一句写成
+// `/X/.test(src)` 就 +1 exit 1（同一件事两种结论）。本仓 12 处 `lineThat(...)` 调用点正是
+// 「正则经形参传入」这条真实形态（helper 定义里 `re.test(l)`，l 是拆分后的源码行）。
+check('正则 receiver 不只字面量：RE.test / RE.exec / new RegExp(…).test / 经 helper 形参传入都必须入账，非正则与字面量实参不误报', () => {
+  const ws = makeWorkspace()
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const head = [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'const RE = /function loadConfig/', // 5：正则常量
+    'const RE_CTOR = new RegExp("loadConfig")', // 6：构造出来的正则
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_regex.js', head)
+  const green0 = runGate(ws)
+  assert.strictEqual(green0.code, 0, `只有声明时不得入账，实得 ${green0.code}\n${green0.out}${green0.err}`)
+  // 逐条加：常量 test / 构造 test / 常量 exec / 字面量 test（对照组，旧实现已有）/ 形参 test。
+  const counted = [
+    'assert.ok(RE.test(src))', // 7
+    'assert.ok(RE_CTOR.test(src))', // 8
+    'assert.ok(RE.exec(src))', // 9
+    'assert.ok(/function loadConfig/.test(src))', // 10 对照组
+    'const lineThat = (text, re) => text.split("\\n").map((l) => l.trim()).find((l) => re.test(l))', // 11
+    'assert.ok(lineThat(src, /^function loadConfig/))', // 12
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_regex.js', head + counted)
+  const red = runGate(ws)
+  assert.strictEqual(red.code, 1,
+    `正则变量 / new RegExp / exec / 形参四条路都必须 exit 1（旧实现只认字面量 ⇒ 0 命中），实得 ${red.code}\n${red.out}${red.err}`)
+  assert.ok(red.err.includes('test_regex.js  基线 0 / 实测 5 / +5'),
+    `5 条（常量 test / 构造 test / 常量 exec / 字面量 test / helper 形参 … 共 5 个比对点），实得：\n${red.err}`)
+  assert.match(red.err, /test_regex\.js:7 .*（②变量锚点\/比较）/, `RE.test(src) 必须入账，实得：\n${red.err}`)
+  assert.match(red.err, /test_regex\.js:9 .*（②变量锚点\/比较）/, `RE.exec(src) 必须入账，实得：\n${red.err}`)
+  assert.match(red.err, /test_regex\.js:11 .*（②变量锚点\/比较）/, `helper 形参收到正则时 re.test(l) 必须入账，实得：\n${red.err}`)
+  assert.match(red.err, /test_regex\.js:10 .*（①直接字面量）/, `字面量对照组同样入账（老行为不得回退），实得：\n${red.err}`)
+  // 反向：receiver 不是正则、或实参不是源码文本 ⇒ 不得入账（否则任何 `.test(` 都会被误计）。
+  writeFile(ws, 'test_regex.js', [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'const src = fs.readFileSync("scripts/console.js", "utf8")',
+    'const RE = /function loadConfig/',
+    'const notRegex = { test: () => true }',
+    'assert.ok(notRegex.test(src))', // receiver 不是正则
+    'assert.ok(RE.test("不是文件内容"))', // 实参不是源码文本
+    'assert.ok(/function loadConfig/.test("不是文件内容"))',
+    ''
+  ].join('\n'))
+  const green = runGate(ws)
+  assert.strictEqual(green.code, 0, `非正则 receiver / 非源码实参不得入账，实得：\n${green.out}${green.err}`)
+})
+
+// r28-2：恒等字符串化必须穿透。给每条断言套一层 `String()` / `|| ''` 就能停在基线以下，是零成本
+// 换皮通道（实测 `String(src).includes` 与 `(src||'').includes` 各 0 命中 exit 0，而
+// `src.toString().includes` 计入 ⇒ 同一族写法两种结论）。`JSON.stringify(src)` 同属这一族
+// （序列化只做转义、锚点照旧逐字可匹配），故也计入；只有 `JSON.parse` 之后的结构化数据仍放行。
+check('恒等字符串化穿透明细：String/toString/模板/||/??/String.raw/JSON.stringify 都入账，非源码值不误报', () => {
+  const ws = makeWorkspace()
+  const direct = '"use strict"\nconst fs = require("node:fs")\nconst assert = require("node:assert")\nconst src = fs.readFileSync("scripts/console.js", "utf8")\n'
+  writeFile(ws, 'test_stringify.js', direct)
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  assert.strictEqual(runGate(ws).code, 0, '只有读取语句时不得入账')
+  const counted = [
+    'assert.ok(String(src).includes("STRING_ID"))', // 5
+    'assert.ok((src || "").includes("OR_FALLBACK"))', // 6
+    'assert.ok((src ?? "").includes("NULLISH_FALLBACK"))', // 7
+    'assert.ok(src.toString().includes("TO_STRING"))', // 8
+    'assert.ok(`' + '${' + 'src}' + '`.includes("TEMPLATE_ID"))', // 9
+    'assert.ok(String.raw`' + '${' + 'src}' + '`.includes("STRING_RAW"))', // 10
+    'assert.ok(JSON.stringify(src).includes("JSON_STRINGIFY"))', // 11
+    ''
+  ].join('\n')
+  writeFile(ws, 'test_stringify.js', direct + counted)
+  const red = runGate(ws)
+  assert.strictEqual(red.code, 1,
+    `七种字符串化都必须 exit 1（旧实现只认 toString / 模板 ⇒ 5 条漏检），实得 ${red.code}\n${red.out}${red.err}`)
+  assert.ok(red.err.includes('test_stringify.js  基线 0 / 实测 7 / +7'),
+    `7 种写法各 1 条，实得：\n${red.err}`)
+  for (const [line, anchor] of [[5, 'STRING_ID'], [6, 'OR_FALLBACK'], [7, 'NULLISH_FALLBACK'], [8, 'TO_STRING'], [9, 'TEMPLATE_ID'], [10, 'STRING_RAW'], [11, 'JSON_STRINGIFY']]) {
+    assert.match(red.err, new RegExp(`test_stringify\\.js:${line} .*${anchor}`), `${anchor} 必须入账，实得：\n${red.err}`)
+  }
+  // 反向：非源码值（`String(42)` / `(null || '')`）与「解析成结构化数据后断言字段」不得入账
+  // ——后者是本批的目标形态（② 式），故意放行。
+  writeFile(ws, 'test_stringify.js', direct + [
+    'assert.ok(String(42).includes("NUMBER"))',
+    'assert.ok((null || "").includes("PLAIN_FALLBACK"))',
+    'assert.strictEqual(JSON.parse(src).name, "xbk-push")',
+    ''
+  ].join('\n'))
+  const green = runGate(ws)
+  assert.strictEqual(green.code, 0, `非源码值与结构化数据断言不得入账，实得：\n${green.out}${green.err}`)
+})
+
+// r28-3：`outOfFaceSuspects()` 的两处排序比较器（行集合 sortedByFile + 「被谁 require」的 [...set].sort）
+// 此前零用例守护——v3.470 那一行（Sonar S2871 要求显式比较器）换成 localeCompare 后本套件仍 34/34 全绿，
+// 等价性证据只存在于一次性 scratch 探针。这里用「码元序与语言序结论不同」的文件名把两种比较器区分开：
+// 'Z'(90) < 'a'(97) ⇒ 码元序 Zebra 在前；localeCompare 按基字母 a < z ⇒ apple 在前。
+// 断言直接对着**闸门的真实输出**（不是对着闸门源码做字符串替换）：这样本用例在
+// `probe-format-coupling` 的生产源码重排下仍然成立（把 oracle 钉在输出上，不钉在实现文本上）。
+check('面外告警排序稳定：行与「被谁 require」都按 UTF-16 码元序（localeCompare 会给出相反顺序）', () => {
+  const ws = makeWorkspace()
+  const helper = (mark) => [
+    '"use strict"',
+    'const fs = require("node:fs")',
+    'const assert = require("node:assert")',
+    'function check () {',
+    `  assert.ok(fs.readFileSync("scripts/console.js", "utf8").includes("${mark}"))`,
+    '}',
+    'module.exports = { check }',
+    ''
+  ].join('\n')
+  writeFile(ws, 'scripts/Zebra.js', helper('ZEBRA_OUT_OF_FACE'))
+  writeFile(ws, 'scripts/apple.js', helper('APPLE_OUT_OF_FACE'))
+  const bothRequires = '"use strict"\nrequire("./scripts/Zebra").check()\nrequire("./scripts/apple").check()\n'
+  writeFile(ws, 'test_Zebra.js', bothRequires)
+  writeFile(ws, 'test_apple.js', bothRequires)
+  writeBaseline(ws, { schema: 3, total: 0, by_file: {} })
+  const r = runGate(ws)
+  assert.strictEqual(r.code, 0, `面外候选只告警、不判红，实得 ${r.code}\n${r.out}${r.err}`)
+  const zebraRow = '  scripts/Zebra.js  1 条（测试公共层；被 test_Zebra.js、test_apple.js require）'
+  const appleRow = '  scripts/apple.js  1 条（测试公共层；被 test_Zebra.js、test_apple.js require）'
+  const zebraAt = r.out.indexOf(zebraRow)
+  const appleAt = r.out.indexOf(appleRow)
+  assert.ok(zebraAt >= 0, `必须逐行点名 scripts/Zebra.js 且「被谁 require」按码元序，实得：\n${r.out}`)
+  assert.ok(appleAt >= 0, `必须逐行点名 scripts/apple.js 且「被谁 require」按码元序，实得：\n${r.out}`)
+  assert.ok(zebraAt < appleAt,
+    `行顺序必须按 UTF-16 码元序（'Z'=90 < 'a'=97 ⇒ Zebra 在前），实得：\n${r.out}`)
+  // 这条用例的区分力来自夹具名本身：同一组名字换 localeCompare 会得到**相反**顺序，所以把闸门里
+  // 任一比较器改成 localeCompare 都会让上面两条断言红（实测：临时把 [...set].sort 的比较器换成
+  // String(a).localeCompare(String(b)) ⇒ 本套件 36/37，本用例红；还原后 37/37）。把它写成断言，
+  // 免得后来人把夹具名改成「两种比较器同结论」的取值而让用例静默失去区分力。
+  const codeUnit = [...['test_Zebra.js', 'test_apple.js']].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const locale = [...['test_Zebra.js', 'test_apple.js']].sort((a, b) => String(a).localeCompare(String(b)))
+  assert.deepStrictEqual(codeUnit, ['test_Zebra.js', 'test_apple.js'], '码元序：Z(90) 在 a(97) 之前')
+  assert.deepStrictEqual(locale, ['test_apple.js', 'test_Zebra.js'],
+    'localeCompare 必须给出相反顺序（夹具的区分力就来自这里；若本机 ICU 变了，请换一组夹具名）')
+})
+
 /* ── 端到端自检：真实仓库 ───────────────────────────────────────────────── */
 
 check('端到端：真实仓库闸门 exit 0，且打印的 total 与 sum(by_file) 一致', () => {

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.470 — S0 r27：只补 scripts/check-source-text-asserts.js 里 outOfFaceSuspects() 的字符串比较器（[...set].sort() → .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))，与同文件既有三处同口径），修 SonarCloud javascript:S2871；默认 sort 对字符串本就是 UTF-16 码元序，判定语义逐元素等价（8 组样本实测全等 + 写错即不同的对照组），白名单 2386 未动，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.471 — S0 r28：反回归闸收七条评审意见（正则 receiver 不只字面量：RE.test/RE.exec/new RegExp(…)/helper 形参收到正则都入账；恒等字符串化 String()/||/??/String.raw/JSON.stringify 穿透而 JSON.parse 后的字段比对仍放行；面外告警排序补靶向用例；known-uncovered 第 8 条与三份文档的表述按实现改写；导出面集合边界锁死）；白名单 2386 → 2404 是「尺子变准」（18 条既有断言首次可见，测试断言本体一条未改），生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

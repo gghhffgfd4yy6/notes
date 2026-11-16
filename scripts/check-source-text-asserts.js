@@ -53,13 +53,28 @@
  *   （AwaitExpression / ChainExpression 往下追一层），以及回调式
  *   `fs.readFile(f, 'utf8', (e, data) => assert.ok(data.includes('…')))`（readFile 的回调签名是
  *   (err, data)，末位形参登记为源码文本）。
+ *   正则 receiver 不止字面量（r28-1）：`.test(x)` / `.exec(x)` 的 receiver 可以是**绑定到正则字面量或
+ *   `new RegExp(…)` 的变量**，也包括「helper 形参在调用点收到正则字面量」这条路——
+ *   `const lineThat = (text, re) => text.split('\n').find((l) => re.test(l))` 之后
+ *   `lineThat(yml, /^…$/)` 里 `re.test(l)` 与 `/^…$/.test(yml)` 是同一件事（本仓 `lineThat` / `linesThat`
+ *   共 12 处调用点即此形态；计数单位是**比对点**，两个 helper 定义各 1 条 ⇒ 这两个文件各 +2）。
+ *   只认字面量时，把正则提成常量、或经 helper 形参传进来，整条断言就从检测面上消失
+ *   （实测 `const RE = /X/; RE.test(src)` 0 命中、闸门照绿 ✅ exit 0，而同一句写成 `/X/.test(src)`
+ *   就 +1 exit 1）——与「变量锚点必须计入」是同一个理由。
+ *   恒等字符串化要穿透（r28-2）：`String(src).includes('…')`、`(src || '').includes('…')`、
+ *   `(src ?? '').includes('…')`、`src.toString().includes('…')`、`` `${src}` `` 插值、`String.raw` 标签模板、
+ *   `JSON.stringify(src)` 都仍是同一段源码文本（序列化只做转义，锚点照旧逐字可匹配）——只认裸标识符时，
+ *   给每条断言套一层 `String()` 就能让计数停在基线以下（实测 `String(src).includes` /
+ *   `(src||'').includes` 各 0 命中 exit 0，而 `src.toString().includes` 计入 ⇒ 同一族写法两种结论）。
+ *   `JSON.parse(src)` 之后是结构化数据，不计（见 known-uncovered 5）。
  *   `loadModel(f).code` / `loadModel(f).codeOnly`（及其等价 `model.code` / `model.codeOnly`、
  *   `const { code } = …` / `const { codeOnly } = …`）**两个字段都计入**：它们都是读进来的源码原文
  *   （`codeOnly` 只去注释、折叠空白），与 `parseShell(...).tokens` 这类解析产物性质不同——否则把
  *   `src.includes` 改写成容器字段就能让白名单合法归零（r25-C：旧实现只认 `.code`，仓内既有的
  *   `m.codeOnly.includes(…)` 因此全记 0 条）。
  *   比对 API 仍是同一族：includes/startsWith/endsWith/indexOf/lastIndexOf/search/match/matchAll、
- *   `/re/.test(src)`、`assert.match/doesNotMatch(src, …)`、`==/===/!=/!==` 与 assert 等值比较族。
+ *   `re.test(src)` / `re.exec(src)`（re 是字面量、`new RegExp(…)` 或绑定到它们/经形参传入的变量）、
+ *   `assert.match/doesNotMatch(src, …)`、`==/===/!=/!==` 与 assert 等值比较族。
  *   量纲断言（`.length` / `typeof`）不计；`JSON.parse` / `acorn.parse` / `yaml.load` 之后是结构化
  *   数据，不计（RUNBOOK 第 ② 式正是要它们）。
  *   读的是**哪个文件**不区分（生产源码 / 测试夹具 / 临时文件一律算）：静态上无法可靠区分路径，宁可多算
@@ -118,15 +133,20 @@
  *      `readSrc(f).includes('X')`——只在**本文件**建 helper/形参表，跨 require 边界不传播。
  *   4. 嵌套导出对象 / 类方法：`module.exports = { util: { read: (f) => readFileSync(f) } }` 的
  *      `h.util.read(f).includes('X')`；`new Reader().text(f).includes('X')`——两者都不入账。
- *   5. 字符串化后再比：`JSON.stringify(src).includes('X')`——`JSON.stringify` 被当作产出非文本，
- *      `JSON.parse(src)` 之后的字段比对同理（后者是本批的目标形态，故意放行）。
+ *   5. `JSON.parse(src)` 之后的字段比对：解析成结构化数据再断言字段不计（本批的目标形态，故意放行）。
+ *      **字符串化不属于这一条**：`String(src)` / `src.toString()` / 模板插值 / `(src || '')` / `String.raw`
+ *      / `JSON.stringify(src)` 都是「内容还是原文、只是换了视图」，全部计入检测面（r28-2）。
  *   6. 解析成 token/结构后再比：`parseShell(f).tokens[0] === 'run_gate'`——容器字段是解析产物，
  *      不算源码文本（`loadModel(f).code` / `.codeOnly` 例外：它们就是原文，已计入，见上）。
  *   7. split 之后按下标取值：`src.split('\n')[3] === 'x'`——下标成员表达式没有 receiver 绑定，
  *      不入账（`src.split('\n').includes('x')` 这类整体比对仍计入）。
- *   8. 解构形参 / 传给二期函数：`function f ({ text }) { … }`、`const g = (t) => h(t)` 里 h 定义在
- *      另一文件——形参传播只认本文件里、形参是裸标识符、且调用点实参已判定为源码文本的情形
- *      （两级链最多一次回溯；更深的传递只按已见的一级入账）。
+ *   8. 解构形参 / 跨文件传递：`function f ({ text }) { … }`、`const g = (t) => h(t)` 里 h 定义在
+ *      另一文件——形参传播只认**本文件**里、形参是裸标识符、且调用点实参已判定为源码文本的情形。
+ *      **本文件内的链跑到固定点**（准备遍只增不减，事实总量不再变化即停；上界 6 遍只是防跑飞）：
+ *      两跳 / 三跳 pass-through helper 在任意声明顺序下都入账（见 `MAX_PREPARE_PASSES` 与
+ *      test_check_source_text_asserts.js 的「两跳 helper + 声明提升」用例）。真正的边界是
+ *      **跨文件**（require 进来的 helper 不传播）、**解构形参**与**解构的元素形参**——不是「只回溯
+ *      一级」。
  *   9. 非 .js 测试夹具 / 运行时拼出来的文件名：扫描面按目录与扩展名枚举，运行期生成的测试文件不入账。
  *  10. `for (const line of lines)` 逐元素绑定 / 解构的元素形参：只认数组方法（some/forEach/…）的
  *      **裸标识符**形参，for-of 与下标循环的绑定不入账（`for (const l of src.split('\n')) { if
@@ -281,6 +301,10 @@ function analyzeAst (ast, file) {
   // 跨遍收集只有在 funcs/helpers 也跨遍保留时才成立（见 scopeFor）：每遍重建这两张表的话，
   // 记录遍在调用点处仍然查不到函数节点，这条链就静默断掉（r25-A）。
   const sourceParams = new Map()
+  // 同文件 helper 的正则形参污染（r28-1）：fnNode → 在调用点收到「正则字面量 / new RegExp(…)」的形参名。
+  // `const lineThat = (text, re) => …find((l) => re.test(l))` 之后 `lineThat(yml, /^…$/)` 是仓内既有写法：
+  // 只认字面量 receiver 时 `.test(l)` 整条不可见（同一句写 `/…/.test(yml)` 就 +1）。
+  const regexParams = new Map()
   let recording = false
   const newScope = (parent) => ({
     parent,
@@ -290,6 +314,7 @@ function analyzeAst (ast, file) {
     equalities: new Set(),
     models: new Set(),
     paramSources: new Set(),
+    regexes: new Set(),
     funcs: new Map()
   })
   const inScope = (scope, kind, name) => {
@@ -331,8 +356,20 @@ function analyzeAst (ast, file) {
         return inScope(scope, 'vars', node.name)
       case 'TemplateLiteral':
         return node.expressions.some((e) => isSource(e, scope))
+      // `String.raw` 标签模板：raw 字符串由模板的插值拼成，插值里是源码文本时它仍是源码文本
+      // （r28-2 的「视语义」——只在插值这一条路上穿透，字面量的 raw 文本不是读文件得来的）。
+      case 'TaggedTemplateExpression':
+        return node.tag.type === 'MemberExpression' && !node.tag.computed &&
+          node.tag.object.type === 'Identifier' && node.tag.object.name === 'String' &&
+          node.tag.property.type === 'Identifier' && node.tag.property.name === 'raw' &&
+          node.quasi.expressions.some((e) => isSource(e, scope))
       case 'BinaryExpression':
         return node.operator === '+' && (isSource(node.left, scope) || isSource(node.right, scope))
+      // `(src || '')` / `(src ?? '')`：逻辑兜底不改变「这段字符串来自哪个读取点」，取到源码文本时它
+      // 就是源码文本。漏这一条，只要给每条断言套一层 `|| ''` 就能停在基线以下（r28-2 实测 0 命中）。
+      case 'LogicalExpression':
+        return (node.operator === '||' || node.operator === '??') &&
+          (isSource(node.left, scope) || isSource(node.right, scope))
       // await 只是把 promise 拆包：`const s = await fs.promises.readFile(…)` 之后 s 仍是源码文本。
       // 缺这一条会让整条异步读取链在 AwaitExpression 处断流（实测 0 命中、exit 0）。
       case 'AwaitExpression':
@@ -352,6 +389,18 @@ function analyzeAst (ast, file) {
         const tail = calleeTail(callee)
         if (callee.type === 'Identifier') {
           if (inScope(scope, 'helpers', callee.name) || inScope(scope, 'readers', callee.name)) return true
+        }
+        // `String(src)` 是恒等字符串化：实参是源码文本，结果就是同一段文本（r28-2）。
+        // `JSON.stringify(src)` 同理不得放行：序列化只做转义（引号/反斜杠/控制字符），锚点文本仍逐字
+        // 可匹配 ⇒ 它是可用的换皮通道（与 `codeOnly` 同性质：视图变了、内容还是原文）。实参不是源码
+        // 文本时（`JSON.stringify(parsedConfig)`）不计——那是结构化数据的序列化，不是读源码。
+        if (callee.type === 'MemberExpression' && !callee.computed && callee.property.type === 'Identifier' &&
+          callee.property.name === 'stringify' && callee.object.type === 'Identifier' &&
+          callee.object.name === 'JSON' && node.arguments.length === 1) {
+          return isSource(node.arguments[0], scope)
+        }
+        if (callee.type === 'Identifier' && callee.name === 'String' && node.arguments.length === 1) {
+          return isSource(node.arguments[0], scope)
         }
         if (tail && !callee.computed) {
           // `fs.readFileSync` / 解构后的 `readFileSync` 都按尾名认。
@@ -387,6 +436,7 @@ function analyzeAst (ast, file) {
       equalities: new Set(),
       models: new Set(),
       paramSources: new Set(),
+      regexes: new Set(),
       funcs: new Map()
     })
     for (let round = 0; round < 2; round++) {
@@ -456,6 +506,19 @@ function analyzeAst (ast, file) {
     return null
   }
 
+  // receiver 是不是正则：字面量、`new RegExp(…)` / `RegExp(…)`，以及**绑定到它们的变量**——含
+  // 「helper 形参在调用点收到正则字面量」那条（regexParams 种入 scope.regexes）。
+  // 只认字面量会让「把正则提成常量」成为零成本绕过路径（r28-1：`const RE = /X/; RE.test(src)`
+  // 实测 0 命中 exit 0，而同一句写 `/X/.test(src)` 就 +1 exit 1）。
+  function isRegex (node, scope) {
+    if (!node) return false
+    if (node.type === 'Literal') return !!node.regex
+    if (node.type === 'Identifier') return inScope(scope, 'regexes', node.name)
+    if ((node.type === 'NewExpression' || node.type === 'CallExpression') &&
+      node.callee.type === 'Identifier' && node.callee.name === 'RegExp') return true
+    return false
+  }
+
   // 形状判定：锚点形态优先（③ 模板插值 / ① 字面量 / ② 变量），再看 receiver 怎么来的（④ 别名 / ⑤ helper）。
   function shapeOf (argNode, receiver, scope) {
     if (isTemplateWithExpr(argNode)) return 3
@@ -492,10 +555,13 @@ function analyzeAst (ast, file) {
       const arg = node.arguments[0]
       return { anchor: anchorOf(arg), shape: shapeOf(arg, callee.object, scope) }
     }
-    // 正则 test：`/re/.test(src)`（receiver 是正则、实参才是源码文本）。
-    if (member && name === 'test' && callee.object.type === 'Literal' && callee.object.regex &&
+    // 正则 test / exec：`/re/.test(src)`，以及 receiver 是**绑定到正则的变量**（含经 helper 形参传入）
+    // 的 `RE.test(src)` / `RE.exec(src)`。receiver 只认字面量时，把正则提成常量或经形参传递就能让
+    // 整条断言从检测面消失（r28-1：实测 0 命中 exit 0，而同一句写字面量就 +1 exit 1）。
+    if (member && (name === 'test' || name === 'exec') && isRegex(callee.object, scope) &&
       node.arguments.some((a) => isSource(a, scope))) {
-      return { anchor: anchorOf(callee.object), shape: 1 }
+      const literal = callee.object.type === 'Literal'
+      return { anchor: anchorOf(callee.object), shape: literal ? 1 : 2 }
     }
     // assert.match / assert.doesNotMatch：与 includes 同口径。
     if (member && (name === 'match' || name === 'doesNotMatch') && node.arguments[0] && isSource(node.arguments[0], scope)) {
@@ -564,6 +630,12 @@ function analyzeAst (ast, file) {
         }
       }
     }
+    const seededRegex = regexParams.get(fn)
+    if (seededRegex) {
+      for (const param of fn.params) {
+        if (param.type === 'Identifier' && seededRegex.has(param.name)) inner.regexes.add(param.name)
+      }
+    }
     return inner
   }
 
@@ -627,9 +699,16 @@ function analyzeAst (ast, file) {
       if (fn && fn.params.length) {
         node.arguments.forEach((arg, index) => {
           const param = fn.params[index]
-          if (!param || param.type !== 'Identifier' || !isSource(arg, scope)) return
-          if (!sourceParams.has(fn)) sourceParams.set(fn, new Set())
-          sourceParams.get(fn).add(param.name)
+          if (!param || param.type !== 'Identifier') return
+          if (isSource(arg, scope)) {
+            if (!sourceParams.has(fn)) sourceParams.set(fn, new Set())
+            sourceParams.get(fn).add(param.name)
+          }
+          // 正则形参同理（r28-1）：`lineThat(yml, /^…$/)` 之后 helper 里的 `re.test(l)` 才看得见。
+          if (isRegex(arg, scope)) {
+            if (!regexParams.has(fn)) regexParams.set(fn, new Set())
+            regexParams.get(fn).add(param.name)
+          }
         })
       }
     }
@@ -662,6 +741,9 @@ function analyzeAst (ast, file) {
         // 成员赋值与裸标识符是同一件事，只登记后者会让照文件头写的人 0 命中。
         else if (init.type === 'MemberExpression' && !init.computed && init.property.type === 'Identifier' &&
           SOURCE_CALLS.has(init.property.name)) scope.readers.add(id.name)
+        // `const RE = /X/` / `const RE = new RegExp('X')`：正则常量（r28-1）。不登记的话
+        // `RE.test(src)` 与 `/X/.test(src)` 是两种结论，改个写法就能绕过闸门。
+        if (isRegex(init, scope)) scope.regexes.add(id.name)
       } else if (id.type === 'ObjectPattern') {
         // `const { readFileSync: read } = require('fs')`：简单解构重命名 → reader 别名；
         // `const { strictEqual: eq } = require('node:assert/strict')` → 等值断言别名；
@@ -684,6 +766,7 @@ function analyzeAst (ast, file) {
       visit(node.right, scope)
       visit(node.left, scope)
       if (node.left.type === 'Identifier' && isSource(node.right, scope)) scope.vars.add(node.left.name)
+      if (node.left.type === 'Identifier' && isRegex(node.right, scope)) scope.regexes.add(node.left.name)
       return
     }
     for (const key of Object.keys(node)) {
@@ -707,6 +790,7 @@ function analyzeAst (ast, file) {
   const factsSize = () => {
     let size = 0
     for (const params of sourceParams.values()) size += params.size
+    for (const params of regexParams.values()) size += params.size
     for (const facts of hoistFacts.values()) size += facts.funcs.size + facts.helpers.size
     return size
   }

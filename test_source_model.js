@@ -10,8 +10,11 @@
 // 「必须存在 / 必须不存在」，并额外断言集合规模下界（空集合 = 退化，必须红）。
 //
 // 全部夹具写在 `fs.mkdtempSync(os.tmpdir(), 'xbk-srcmodel-')` 里，跑完 rmSync 删掉：不读仓库源码、
-// 不碰真实文件，因此本套件在变异沙箱里也能跑（不设 mutationSkip），也不触发
-// scripts/check-source-text-asserts.js（这里不比任何源码文本，只比解析后的集合与字段）。
+// 不碰真实文件，因此本套件在变异沙箱里也能跑（不设 mutationSkip）。
+// **但本套件仍受 scripts/check-source-text-asserts.js 管辖**（根 `test_*.js` 在扫描面内）：基线里
+// 本文件已入账 5 条——`m.code === CJS_FIXTURE` 那类「相等比较」1 条 + `m.codeOnly.includes(…)` 4 条
+// （`by_file: { "test_source_model.js": 5 }`）。所以「这里不比任何源码文本」是错的：写 code/codeOnly
+// 的逐字比对同样要按基数额度算，多写一条就会让闸门 exit 1。
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -287,13 +290,19 @@ check('解析失败必抛：坏语法抛 source_model: 无法解析（返回空�
 })
 
 // ── 11. 对外 API 面（缺一个 = 后续包的断言 import 不到） ──────────────────
-check('对外 API：12 个符号都导出且类型正确', () => {
-  const fns = ['loadModel', 'calls', 'members', 'funcs', 'exports', 'codeOnly', 'hasCall', 'hasMember', 'hasFunction', 'hasExport', 'loadYaml', 'parseShell']
+// 12 个公共导出面 + 2 个内部件（shellTokens / _cache，见 test_support/source_model.js 的注释）。
+// 集合边界必须锁死：只断言「12 个存在」时，新增/删除一个导出不会有任何用例变红（r28-7）。
+const API_FACE = ['loadModel', 'calls', 'members', 'funcs', 'exports', 'codeOnly', 'hasCall', 'hasMember', 'hasFunction', 'hasExport', 'loadYaml', 'parseShell']
+const INTERNALS = ['shellTokens', '_cache']
+check('对外 API：12 个公共导出面齐全、2 个内部件单列，导出集合与登记表逐项相等', () => {
   // 用 Map 而不是 `model[name]`：动态属性名访问会被 Codacy 的 Generic Object Injection Sink 判红，
   // 而这里需要的只是「按名字取导出值」——Map 的键查找没有原型链、也没有注入面，语义更窄。
   const api = new Map(Object.entries(model))
-  const missing = fns.filter((name) => typeof api.get(name) !== 'function')
+  const missing = API_FACE.filter((name) => typeof api.get(name) !== 'function')
   assert.deepStrictEqual(missing, [], '缺导出（或不是函数）：' + missing.join(', '))
+  // 集合边界：新增一个导出而不登记，这条当场红（否则 API 面会随实现悄悄漂移）。
+  assert.deepStrictEqual([...api.keys()].sort(), [...API_FACE, ...INTERNALS].sort(),
+    '导出集合必须恰为「12 个公共面 + 2 个内部件」：新增导出要同时登记到本用例与 test_suites.js 的 desc')
 })
 
 // 汇总后再清场：即使某条检查抛错，临时工作区也一定要删掉（不在 /tmp 留垃圾）。
