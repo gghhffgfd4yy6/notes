@@ -129,6 +129,25 @@ function declaresVariable (source, name) {
   return findAll(source, (node) => node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === name).length > 0
 }
 
+// ESM import 边：`import { a as b, c } from './x.mjs'` → Map{ 本地名 → 被导入名 }。
+// 用途：替代「源码里有 `import {[^}]*a as b[^}]*} from './x.mjs'`」这类正则——正则会随
+// 排序/换行/多一个符号假红，也拦不住「import 了但没用」与「用了但没 import」。
+// 默认导入记作本地名 → 'default'，命名空间导入（`* as ns`）记作 → '*'。
+function importBindings (source, spec) {
+  const out = new Map()
+  const declarations = findAll(source, (node) => node.type === 'ImportDeclaration' && node.source && node.source.value === spec)
+  for (const decl of declarations) {
+    for (const item of decl.specifiers) {
+      const local = item.local ? item.local.name : null
+      if (!local) continue
+      if (item.type === 'ImportDefaultSpecifier') out.set(local, 'default')
+      else if (item.type === 'ImportNamespaceSpecifier') out.set(local, '*')
+      else out.set(local, item.imported ? (item.imported.name || item.imported.value) : local)
+    }
+  }
+  return out
+}
+
 // if / else if / … / else 逐支展开：[{ test, consequent }]，末尾 else 的 test 为 null。
 function ifChain (node) {
   const arms = []
@@ -165,6 +184,7 @@ module.exports = {
   hasCallWithIdentifier,
   requireEdge,
   declaresVariable,
+  importBindings,
   ifChain,
   objectKeyNames
 }
