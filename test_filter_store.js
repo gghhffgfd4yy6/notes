@@ -2226,9 +2226,10 @@ server.listen(0, '127.0.0.1', async () => {
 // R1-4：README 是**唯一**面向部署者的降级口径说明，没有内容门禁（check-doc-lines 只管行长），
 // 漂移只能靠评审。本题材料里 README 仍写「优先沿用进程内上一次合法规则」——新进程里根本不存在，
 // 正是 F4-1 修掉的缺陷本体。这里把口径钉住：回退成旧措辞即红。
-// 断言不比对整份 README 文本：先把文档解析成「小节 → 条目」两级结构，再断言**具体条目**的字段
-// （哪一条在描述 LKG、它是否退回旧机制、删覆盖文件与 LKG 的关系、applied 快照的字段清单）。
-// 这样重排/折行/调整段落顺序不会误红，而要守的「LKG 这条口径」也定位到了具体条目。
+// 两层断言各自守一件事：
+//   ① 旧措辞的否定判定是**全文**口径——整份 README 的每一条非空行（标题 / 条目 / 普通段落）都不得再出现，
+//      写进 applied 快照条目或别的小节同样变红（r1 曾把它收窄成只查 LKG 那一条 bullet，属放宽，已回退）；
+//   ② 字段契约按「小节 → 条目」两级结构定位到具体条目（LKG 条目、applied 条目），重排/折行不影响。
 const readmeBullets = (text) => {
   const items = []
   let section = ''
@@ -2255,12 +2256,26 @@ const readmeBullets = (text) => {
   }
   return items
 }
+// 全文口径的「非空行清单」：标题 / 条目 / 普通段落都在内，空行丢弃（空行不可能包含要查的短语）。
+// 否定判定要覆盖整份文档而不是某一条 bullet；按行解析后逐行判定，覆盖范围与 `!readme.includes(…)`
+// 相同（短语被折行切断时两者同样失效，这是该负向契约的既有边界）。
+const readmeLines = (text) => {
+  const lines = []
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line) lines.push(line)
+  }
+  return lines
+}
 test('R1-4 文档同步：README 必须写持久 LKG（不得再写「进程内上一次合法规则」）', () => {
-  const items = readmeBullets(fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8'))
+  const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8')
+  const lines = readmeLines(readme)
+  const offending = lines.filter((line) => line.includes('优先沿用进程内上一次合法规则'))
+  assert.deepStrictEqual(offending, [],
+    `README 全文（${lines.length} 个非空行）不得再写「进程内 LKG」：控制台 auto-run 每轮都是新进程，进程内 Map 等于不存在（F4-1）`)
+  const items = readmeBullets(readme)
   const lkg = items.find(item => item.text.includes('filter-rules.lastgood.json'))
   assert.ok(lkg, 'README 必须点名持久 LKG 文件 <缓存目录>/filter-rules.lastgood.json')
-  assert.ok(!lkg.text.includes('优先沿用进程内上一次合法规则'),
-    'README 的 LKG 条目不得再写「进程内 LKG」：控制台 auto-run 每轮都是新进程，进程内 Map 等于不存在（F4-1）')
   assert.match(lkg.text, /删掉正式覆盖文件时 LKG 一并删除|删除正式覆盖文件时同步删除 LKG/,
     'README 必须写清「删覆盖文件 ⇒ LKG 作废」（否则「删文件=恢复默认」会被降级轮复活旧规则破坏）')
   const applied = items.find(item => item.text.includes('filter-rules.applied.json') && item.text.includes('快照'))
