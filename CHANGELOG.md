@@ -2185,22 +2185,6 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - `npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.492`；`node scripts/check-doc-lines.js` → 通过。
   - **版本**：3.491.0 → **3.492.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
 
-## v3.494
-
-- **assertshape C4 第 1 轮评审修复：4 条判据在「换成 AST」时悄悄失去咬合力（恒真 / 比错字段 / 只数调用次数 / 只扫外层模板），第 5 条是版本 banner 与本文件的账目自相矛盾；只动 `test_console.js`、本文件与版本四方，生产逻辑一行未改**：
-  - **① 按钮插值类名（r1-A/B，`test_console.js:11965-11980`）**：v3.493 的写法是 `staticAttrs.filter((v) => tokensOf(v).includes('btn') && v.includes('${'))`，**恒真**——markup 把 `class="foo btn ${x}"` 拆成「文本 `'foo btn '` + 一条 spread 表达式属性」（`readAttrs` 读到引号内的插值就停），文本值永远不含 `${`。现在按元素 `attrs` 序列判：该 `class` 属性是文本形态、文本里 `btn` 是**独立类名**、且**紧后一条是 spread/expr 条目**（即这个 class 带插值），命中即 `deepStrictEqual([], …)`。前置类名、顺序不同都命中。
-  - **② CategoryPicker 的 style 负判据（r1-A，`:11402-11415`）**：旧判据 `exprLabel(styleExpr).startsWith('narrow')` 对 `ConditionalExpression` 只拿到类型名 `'ConditionalExpression'`，`style=${narrow ? … : …}` 这个正是要拦的形状永远判不出来。现在在 style 属性表达式的**子树**里查标识符引用（`narrow` / `place`）：三元、逻辑、字符串拼接、写进成员路径都逃不掉；`attrExpr` 对文本形态返回 `null` 已显式短路。
-  - **③ BackToTop 的 scrollBehavior 实参（r1-B，`:11564-11569`）**：旧判据退化成 `callSites(backFn, 'backToTopBehavior').length >= 1`，`backToTopBehavior(false, …)` 仍绿（reduced-motion 用户被强行平滑滚动、老 Safari 判定被短路）。现在保留「至少一处调用」，并断言**第一个实参** `callArgLabels(call)[0] === 'reduce'`。
-  - **④ 保存复核分支的两条负面红线（r1-A，`:12098-12118`）**：负面扫描原先只看外层模板（`expandTemplates: false`），条件块里的嵌套模板（``${cond && html`…`}``）与属性位模板（``footer=${html`…`}``）完全看不见——该分支正文几乎全是这类条件块，「两套确认语义不得并存」等于被废掉。现在负面扫描面 = 展开解析（`saveDeepEls`）∪ `saveTpl` 子树里每个嵌套模板各自展开解析的元素并集，按「标签名 + 属性名/文本值/表达式起始位置」去重（两棵树共用同一批 AST 节点，键稳定）。只扩这两条负面判据（ConfirmDialog 计数 0 / `attrOf(el,'onConfirm')` 计数 0），其余 `saveEls` 判据保持原样。
-  - **⑤ 账目口径与版本**：主文件头 banner 原写「式4 删除 0 条」，与本 commit 事实不符（实删 1 条 `tickAutoBody.length > 500` 自检）；v3.493 段的「92 + 6 + 0 + 1」又与「98 条清单项」并列（合计 99）。现在口径统一为：**98 条清单项 = 式1 92 + 式2 6（式3 0）；另删 1 条清单外的自检断言，故式4 合计 1 条、不计入 98**。v3.493 段的分布句与本段同步改写，banner 一并改。
-  - **反向验证（4 个破坏各自独立：改生产文件 → `TZ=UTC node test_console.js` → `git checkout -- <file>` 还原；每次还原后 `git status --short` 均只剩 `test_console.js` 一项）**：
-    - ① `scripts/console-assets/components.js:22` `class="badge ${cls}"` → `class="badge btn ${cls}"` → `❌ 结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）: 按钮基础类不得手写在带插值的 class 属性里（含前置类名）`，`375 / 1`；还原后 `376 / 0`。
-    - ② `scripts/console-assets/pages.js:1547` 的 `.cate-search` input 加 `style=${narrow ? 'display:none' : undefined}` → `❌ 结构红线: CategoryPicker 定位交给 floating-ui（翻上/夹取/压高；窄屏仍是 CSS 贴底模态）: 坐标/可见性不得写在 vdom 的 style 字符串里（轮询重渲染会整条覆盖）`，`375 / 1`；还原后 `376 / 0`。
-    - ③ `scripts/console-assets/ui.js:46` `backToTopBehavior(reduce, …)` → `backToTopBehavior(false, …)` → `❌ 结构红线: 回到顶部（固定层 / 触控尺寸 / 可访问名 / 平滑滚动）: 滚动方式必须走纯函数判定（reduced-motion / 老 Safari） (actual=false expected=true)`，`375 / 1`；还原后 `376 / 0`。
-    - ④ `scripts/console-assets/pages.js:5201`（save 分支 Drawer 子节点首位）插 ``${wide.length > 2 && html`<${ConfirmDialog} open=${true} onConfirm=${() => {}} onCancel=${() => {}} />`}`` → `❌ 结构红线: 过滤规则保存复核走右侧抽屉（表单留在背后对照），离开拦截仍是短弹窗: 保存复核分支不得再出现 ConfirmDialog`，`375 / 1`；同位置改插 ``${wide.length > 2 && html`<${Button} onConfirm=${() => {}} />`}``（只带 `onConfirm` 属性、不换标签）→ 同一用例 `❌ …: 抽屉不用弹窗的 onConfirm 形态（否则两套确认语义并存）`，`375 / 1`；两次还原后均 `376 / 0`。
-  - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`；`node scripts/check-source-text-asserts.js` → exit 0，`基线 total=1397（35 个文件），实测 total=1397（扫描 69 个测试面文件）`（本轮 0 条源码文本断言，白名单不变）；`node scripts/probe-format-coupling.js test_console.js` → exit 1，首红仍是 C4 段之外的 v3.317 日志页块（既有遗留，与 C4 无关）；`npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.494`。
-  - **版本**：3.493.0 → **3.494.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 根元数据两处）。
-
 ## v3.493
 
 - **assertshape C4：`test_console.js` 第 4 段（原 9250–9978）98 条源码文本断言全部换成 AST / 解析后字段断言；只动 `test_console.js`、白名单、本文件与版本四方，生产逻辑一行未改**：
@@ -2216,3 +2200,19 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0，**34.85s**；`node scripts/probe-format-coupling.js test_console.js` → **exit 1**，首红已从 v3.492 记录的 `persistAuto` 前移到 `结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）`（`test_console.js:12124`，锚点 `visited.has('logs')` + `<${LogsPanel}`）——该块属**下一段（原 9978 之后）**，不在本包 98 条内；本包全部被改块在整份生产源码重排后均通过（首红位于本包最后一个被改块之后），与「C4 段不再绑文本」一致。
   - `npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.493`。
   - **版本**：3.492.0 → **3.493.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
+
+## v3.494
+
+- **assertshape C4 第 1 轮评审修复：4 条判据在「换成 AST」时悄悄失去咬合力（恒真 / 比错字段 / 只数调用次数 / 只扫外层模板），第 5 条是版本 banner 与本文件的账目自相矛盾；只动 `test_console.js`、本文件与版本四方，生产逻辑一行未改**：
+  - **① 按钮插值类名（r1-A/B，`test_console.js:11965-11980`）**：v3.493 的写法是 `staticAttrs.filter((v) => tokensOf(v).includes('btn') && v.includes('${'))`，**恒真**——markup 把 `class="foo btn ${x}"` 拆成「文本 `'foo btn '` + 一条 spread 表达式属性」（`readAttrs` 读到引号内的插值就停），文本值永远不含 `${`。现在按元素 `attrs` 序列判：该 `class` 属性是文本形态、文本里 `btn` 是**独立类名**、且**紧后一条是 spread/expr 条目**（即这个 class 带插值），命中即 `deepStrictEqual([], …)`。前置类名、顺序不同都命中。
+  - **② CategoryPicker 的 style 负判据（r1-A，`:11402-11415`）**：旧判据 `exprLabel(styleExpr).startsWith('narrow')` 对 `ConditionalExpression` 只拿到类型名 `'ConditionalExpression'`，`style=${narrow ? … : …}` 这个正是要拦的形状永远判不出来。现在在 style 属性表达式的**子树**里查标识符引用（`narrow` / `place`）：三元、逻辑、字符串拼接、写进成员路径都逃不掉；`attrExpr` 对文本形态返回 `null` 已显式短路。
+  - **③ BackToTop 的 scrollBehavior 实参（r1-B，`:11564-11569`）**：旧判据退化成 `callSites(backFn, 'backToTopBehavior').length >= 1`，`backToTopBehavior(false, …)` 仍绿（reduced-motion 用户被强行平滑滚动、老 Safari 判定被短路）。现在保留「至少一处调用」，并断言**第一个实参** `callArgLabels(call)[0] === 'reduce'`。
+  - **④ 保存复核分支的两条负面红线（r1-A，`:12098-12118`）**：负面扫描原先只看外层模板（`expandTemplates: false`），条件块里的嵌套模板（``${cond && html`…`}``）与属性位模板（``footer=${html`…`}``）完全看不见——该分支正文几乎全是这类条件块，「两套确认语义不得并存」等于被废掉。现在负面扫描面 = 展开解析（`saveDeepEls`）∪ `saveTpl` 子树里每个嵌套模板各自展开解析的元素并集，按「标签名 + 属性名/文本值/表达式起始位置」去重（两棵树共用同一批 AST 节点，键稳定）。只扩这两条负面判据（ConfirmDialog 计数 0 / `attrOf(el,'onConfirm')` 计数 0），其余 `saveEls` 判据保持原样。
+  - **⑤ 账目口径与版本**：主文件头 banner 原写「式4 删除 0 条」，与本 commit 事实不符（实删 1 条 `tickAutoBody.length > 500` 自检）；v3.493 段的「92 + 6 + 0 + 1」又与「98 条清单项」并列（合计 99）。现在口径统一为：**98 条清单项 = 式1 92 + 式2 6（式3 0）；另删 1 条清单外的自检断言，故式4 合计 1 条、不计入 98**。v3.493 段的分布句与本段同步改写，banner 一并改。
+  - **反向验证（4 个破坏各自独立：改生产文件 → `TZ=UTC node test_console.js` → `git checkout -- <file>` 还原；每次还原后 `git status --short` 均只剩 `test_console.js` 一项）**：
+    - ① `scripts/console-assets/components.js:22` `class="badge ${cls}"` → `class="badge btn ${cls}"` → `❌ 结构红线: 提示行/指标卡走 Hint/Card 原语（换组件库只改一层）: 按钮基础类不得手写在带插值的 class 属性里（含前置类名）`，`375 / 1`；还原后 `376 / 0`。
+    - ② `scripts/console-assets/pages.js:1547` 的 `.cate-search` input 加 `style=${narrow ? 'display:none' : undefined}` → `❌ 结构红线: CategoryPicker 定位交给 floating-ui（翻上/夹取/压高；窄屏仍是 CSS 贴底模态）: 坐标/可见性不得写在 vdom 的 style 字符串里（轮询重渲染会整条覆盖）`，`375 / 1`；还原后 `376 / 0`。
+    - ③ `scripts/console-assets/ui.js:46` `backToTopBehavior(reduce, …)` → `backToTopBehavior(false, …)` → `❌ 结构红线: 回到顶部（固定层 / 触控尺寸 / 可访问名 / 平滑滚动）: 滚动方式必须走纯函数判定（reduced-motion / 老 Safari） (actual=false expected=true)`，`375 / 1`；还原后 `376 / 0`。
+    - ④ `scripts/console-assets/pages.js:5201`（save 分支 Drawer 子节点首位）插 ``${wide.length > 2 && html`<${ConfirmDialog} open=${true} onConfirm=${() => {}} onCancel=${() => {}} />`}`` → `❌ 结构红线: 过滤规则保存复核走右侧抽屉（表单留在背后对照），离开拦截仍是短弹窗: 保存复核分支不得再出现 ConfirmDialog`，`375 / 1`；同位置改插 ``${wide.length > 2 && html`<${Button} onConfirm=${() => {}} />`}``（只带 `onConfirm` 属性、不换标签）→ 同一用例 `❌ …: 抽屉不用弹窗的 onConfirm 形态（否则两套确认语义并存）`，`375 / 1`；两次还原后均 `376 / 0`。
+  - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`；`node scripts/check-source-text-asserts.js` → exit 0，`基线 total=1397（35 个文件），实测 total=1397（扫描 69 个测试面文件）`（本轮 0 条源码文本断言，白名单不变）；`node scripts/probe-format-coupling.js test_console.js` → exit 1，首红仍是 C4 段之外的 v3.317 日志页块（既有遗留，与 C4 无关）；`npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.494`。
+  - **版本**：3.493.0 → **3.494.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 根元数据两处）。
