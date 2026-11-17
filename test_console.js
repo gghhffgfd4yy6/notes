@@ -13134,7 +13134,13 @@ async function main () {
     // B. 结算口径：按 202 返回的 run id 在 runs 里找，不新增轮询。
     const liveDecl = findFirst(barFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'live')
-    assert.ok(liveDecl && callArgLabels(liveDecl.init).join(',') === 'lastTrigger,lastRun',
+    // 只钉实参不钉被调名等于空转一半：`live = runOutcome(lastTrigger, lastRun)` 的实参完全相同，
+    // 但 runOutcome 只吃一个 run（收到的却是 trigger 对象），结算口径已经换人。所以「由哪个函数
+    // 结算」与实参一起判——结果行只能由 triggerResultLine 算出（assertshape C5 r4）。
+    const liveCall = liveDecl && liveDecl.init && liveDecl.init.type === 'CallExpression' ? liveDecl.init : null
+    const liveCallee = liveCall ? memberPath(liveCall.callee) : null
+    const liveArgs = liveCall ? callArgLabels(liveCall).join(',') : null
+    assert.ok(liveCallee === 'triggerResultLine' && liveArgs === 'lastTrigger,lastRun',
       '结果必须由被触发那条 run 结算（triggerResultLine(lastTrigger, lastRun)）')
     const lastRunDecl = findFirst(barFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'lastRun')
