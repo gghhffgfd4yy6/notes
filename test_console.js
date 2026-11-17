@@ -11400,9 +11400,16 @@ async function main () {
       (memberPath(n.callee) || '').endsWith('getBoundingClientRect')).length, 0,
     '不得再自己量按钮矩形（方向与夹取交给中间件）')
     const cateEls = elementsInFunction(pagesModel, 'CategoryPicker')
+    // style 绑定的表达式子树里**引用**了坐标/可见性判定就算违规（r1 审查 ②）：旧口径比
+    // exprLabel(styleExpr).startsWith('narrow')，而 exprLabel 对 ConditionalExpression 只返回
+    // 类型名 'ConditionalExpression'，`style=${narrow ? 'display:none' : ''}` 这个正是要拦的形状
+    // 永远判不出来。现在按子树里的标识符引用判（narrow / place），三元、逻辑、字符串拼接都逃不掉。
+    const STYLE_FORBIDDEN_REFS = ['narrow', 'place']
     assert.deepStrictEqual(cateEls.filter((el) => {
       const styleExpr = markup.attrExpr(el, 'style')
-      return styleExpr && exprLabel(styleExpr).startsWith('narrow')
+      if (!styleExpr) return false
+      const refs = findAll(styleExpr, (n) => n.type === 'Identifier' && STYLE_FORBIDDEN_REFS.includes(n.name))
+      return refs.length > 0
     }).map((el) => el.name), [], '坐标/可见性不得写在 vdom 的 style 字符串里（轮询重渲染会整条覆盖）')
     // 首帧隐身、坐标回来才显示；重开要归零，否则会先按上一轮坐标可见一帧。
     assert.ok(cateEls.some((el) => {
@@ -11554,8 +11561,11 @@ async function main () {
       findAll(backFn, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
         (memberPath(n.left) || '').endsWith('.scrollTop') && n.right.type === 'Literal' && n.right.value === 0).length >= 1,
     '日志框是内层滚动容器：点击必须把它也回到第一行')
-    assert.ok(callSites(backFn, 'backToTopBehavior').length >= 1,
-      '滚动方式必须走纯函数判定（reduced-motion / 老 Safari）')
+    // 第一个实参必须是 reduce（r1 审查 ③）：只数调用次数时 `backToTopBehavior(false, …)` 仍绿，
+    // 而 reduced-motion 用户会被强行做平滑滚动（老 Safari 判定同理被短路）。
+    assert.ok(callSites(backFn, 'backToTopBehavior')
+      .some((call) => callArgLabels(call)[0] === 'reduce'),
+    '滚动方式必须走纯函数判定（reduced-motion / 老 Safari）')
     const backEls = elementsInFunction(uiModel, 'BackToTop')
     assert.strictEqual(elementsWithAttrText(backEls, 'aria-label', '回到顶部').length, 1, '按钮必须有可访问名')
     assert.ok(backEls.some((el) => sameShapeOf(markup.attrExpr(el, 'tabindex'), "show ? '0' : '-1'")),
@@ -11953,9 +11963,18 @@ async function main () {
     assert.strictEqual(classExprs.filter((node) => exprHasToken(node, 'card')).length, 0,
       'card 只允许出现在 Card 原语里')
     // 双引号/单引号属性里嵌插值（class="btn ${...}"、class="foo btn ${...}"）不落入上面的
-    // class=${...} 扫描；旧红线因此放过了首屏 4 个主按钮（审查 #240），直到 C 批改走 Button 原语。
+    // class=${...} 扫描（r1 审查 ①）：markup 把这种属性拆成「文本 'foo btn ' + 一条 spread 表达式
+    // 属性」，文本值永远不含 '${'，在 attrText 上找 '${' 等于恒真。改成在 attrs 序列上判：
+    // 该 class 属性的**紧后一条是 spread/expr 条目**就是带插值，文本里 btn 是独立类名即命中。
     // 按「btn 是独立类名」判定，前置类名/顺序不同也要命中。
-    assert.deepStrictEqual(staticAttrs.filter((value) => tokensOf(value).includes('btn') && value.includes('${')), [],
+    const interpolatedClassAttrs = allEls.filter((el) => (el.attrs || []).some((attr, idx) => {
+      if (!attr.name || attr.name.toLowerCase() !== 'class') return false
+      if (!attr.value || attr.value.kind !== 'text') return false
+      if (!tokensOf(attr.value.value).includes('btn')) return false
+      const next = (el.attrs || [])[idx + 1]
+      return Boolean(next && next.spread)
+    }))
+    assert.deepStrictEqual(interpolatedClassAttrs.map((el) => el.name), [],
       '按钮基础类不得手写在带插值的 class 属性里（含前置类名）')
     // 表达式值 class=${'btn ' + a.cls}：Button 原语自身允许 1 处，别处再写就是绕过原语。
     assert.strictEqual(classExprs.filter((node) => exprHasToken(node, 'btn')).length, 1,
@@ -12077,12 +12096,24 @@ async function main () {
     assert.ok(saveTpl, '保存复核分支必须有模板（判据对象，否则下面几条恒真）')
     const saveEls = markup.allElements(markup.markupOf(saveTpl, { expandTemplates: false }))
     // 条件渲染块（${wide.length > 0 && html`…`}）只有在展开模板后才成为元素，单独用一棵深树查。
+    // 属性位模板（footer=${html`…`}）markup 不展开（它只展开子节点位置的表达式），所以再对
+    // saveTpl 子树里每个嵌套模板各跑一遍展开解析，把属性位里的元素也并进负面扫描面（r1 审查 ④）。
+    // 去重键用「标签名 + 属性名/文本值/表达式起始位置」：两棵树共用同一批 AST 节点，键稳定。
     const saveDeepEls = markup.allElements(markup.markupOf(saveTpl, { expandTemplates: true }))
+    const scanKeyOf = (el) => el.name + '\u0000' + (el.attrs || []).map((attr) =>
+      attr.name + '=' + (attr.value && attr.value.kind === 'text'
+        ? attr.value.value
+        : 'expr@' + String(attr.value && attr.value.node && attr.value.node.start))).join('|')
+    const saveScanEls = [...new Map([
+      ...saveDeepEls,
+      ...findAll(saveTpl, (n) => n.type === 'TaggedTemplateExpression' && n !== saveTpl)
+        .flatMap((tpl) => markup.allElements(markup.markupOf(tpl, { expandTemplates: true })))
+    ].map((el) => [scanKeyOf(el), el])).values()]
     const drawerEl = saveEls.find((el) => el.name === 'Drawer')
     assert.ok(drawerEl, '保存前复核必须用右侧抽屉（居中弹窗会挡死背后表单，没法对照）')
-    assert.strictEqual(saveEls.filter((el) => el.name === 'ConfirmDialog').length, 0,
+    assert.strictEqual(saveScanEls.filter((el) => el.name === 'ConfirmDialog').length, 0,
       '保存复核分支不得再出现 ConfirmDialog')
-    assert.strictEqual(saveEls.filter((el) => markup.attrOf(el, 'onConfirm')).length, 0,
+    assert.strictEqual(saveScanEls.filter((el) => markup.attrOf(el, 'onConfirm')).length, 0,
       '抽屉不用弹窗的 onConfirm 形态（否则两套确认语义并存）')
     assert.strictEqual(markup.attrText(drawerEl, 'title'), '确认保存过滤规则', '抽屉标题保持「确认保存过滤规则」')
     assert.ok(sameShapeOf(markup.attrExpr(drawerEl, 'width'), 'wide.length > 0 ? 640 : 560'),
