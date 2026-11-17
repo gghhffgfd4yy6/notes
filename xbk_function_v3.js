@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.502 — assertshape C6 第 2 轮评审修复：14 处 if 门判据补 consequent 早退 / 门内调用（landRef 旗门、宽度门 return null、loading 与 y===null 早退、值守卫、10s 重试 pushDraftNow 必须在门内），并校正 D6 版本注释反向验证记录；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.503 — assertshape C6 第 3 轮评审修复：值守卫/早退门判「门内真的做了事」（CategoryPicker onChange 在门内、revision 判序与同值门必须 return）、调用判据带实参（callLabel）、日志失败占位补 div.log-empty + role=status、v3.501 段 D6 反向验证记录改回 v3.502；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

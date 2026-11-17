@@ -624,6 +624,25 @@ function precededByHoldAnchor (node, ancestors) {
 function callArgLabels (call) {
   return call && Array.isArray(call.arguments) ? call.arguments.map((arg) => exprLabel(arg)) : null
 }
+// 实参标签：在 exprLabel 之上补一个字面对象分支（`{ from: '', to: '' }` → `{ from: "", to: "" }`）。
+// exprLabel 对 ObjectExpression 只回类型名，`setRange({})` 与 `setRange({ from: '', to: '' })` 会同标签
+// ——「改 preset 必须先清掉自定义区间」这条判据就靠对象的键与值守住（assertshape C6 r3-B）。
+function argLabel (arg) {
+  if (!arg) return ''
+  if (arg.type === 'ObjectExpression') {
+    return '{ ' + arg.properties.map((prop) => `${prop.key && prop.key.name ? prop.key.name : '?'}: ${argLabel(prop.value)}`).join(', ') + ' }'
+  }
+  // 嵌套调用也要带实参：exprLabel 对 CallExpression 只给 `Number()`，`Number(v)` 与 `Number(raw)` 同标签。
+  if (arg.type === 'CallExpression') return callLabel(arg)
+  return exprLabel(arg)
+}
+// 调用的完整标签（被调名 + 逐参）：判「这次调用传了什么」。exprLabel 对 CallExpression 只输出
+// `callee()` 把实参丢掉，`setQuery(q)` 与 `setQuery('')`、`setPage(1)` 与 `setPage(2)` 同标签 ⇒
+// 「门里必须回第 1 页 / 必须用新词」这类判据会全绿放行（assertshape C6 r3-B）。
+function callLabel (call) {
+  if (!call || call.type !== 'CallExpression') return exprLabel(call)
+  return `${exprLabel(call.callee)}(${call.arguments.map(argLabel).join(', ')})`
+}
 // 运行日志摘要行（`2026-10-15 12:16:21 total=20 dedup=0 …`）→ { 字段: 值 }。
 // /api/logs 下发的是行文本，按 `k=v` 解析成字段再断值，比在整行里找 'total=20' 稳
 // （后者在 total=200 时同样命中）。
@@ -13462,10 +13481,10 @@ async function main () {
     const doExportDecl = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'doExport')
     assert.ok(doExportDecl && doExportDecl.init.type === 'ArrowFunctionExpression', '必须有 doExport')
     const body = doExportDecl.init.body.body
-    const secureAt = body.findIndex((stmt) => stmt.type === 'IfStatement' &&
-      exprLabel(stmt.test) === '!window.isSecureContext || !window.crypto || !window.crypto.subtle')
+    // 门必须真的早退：只按条件定位下标的话，`if (…) { void 0 }` 掏空后导出请求照发（明文出网）。
+    const secureAt = body.findIndex(earlyExits('!window.isSecureContext || !window.crypto || !window.crypto.subtle'))
     const apiAt = body.findIndex((stmt) => callSites(stmt, 'apiPostBackupExport').length > 0)
-    assert.ok(secureAt > -1, '导出必须先检查 isSecureContext / WebCrypto（条件式要判整条 test）')
+    assert.ok(secureAt > -1, '导出必须先检查 isSecureContext / WebCrypto（条件式要判整条 test，且门必须 return）')
     assert.ok(apiAt > -1, '导出必须请求 /api/backup/export')
     assert.ok(secureAt < apiAt,
       `必须先检查安全上下文再请求明文（isSecureContext 在第 ${secureAt} 条语句，导出请求在第 ${apiAt} 条）`)
@@ -13690,6 +13709,9 @@ async function main () {
       '成功路径不得触发定位/滚动')
     assert.strictEqual(stringValuesOf(okBranch.consequent).filter((value) => value.includes('aria-invalid')).length, 0,
       '成功路径不得出现 aria-invalid 定位')
+    // 成功分支还必须放行等待中的切页/后退：分支被掏空（`if (res.ok) { }`）时旧判据仍然全绿。
+    assert.deepStrictEqual(callSites(okBranch.consequent, 'settleSaveResult').map(callLabel), ['settleSaveResult(true)'],
+      '保存成功必须放行等待中的切页/后退（成功分支掏空 = 保存成功也不放行）')
     // 加载失败路径（load 的 catch）同样不得置旗。
     const loadDecl = findFirst(fr, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'load')
     assert.ok(loadDecl, '必须有 load')
@@ -13792,11 +13814,10 @@ async function main () {
     // 响应未回时必须保留旗子（跨过 loading）。
     assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('loading')).length, 1,
       '响应未回时必须保留旗子（跨过 loading，且必须真的 return）')
-    const settleGuards = findAll(msgEffect.arguments[0], (n) => n.type === 'IfStatement' &&
-      findAll(n.test, (m) => sameShapeOf(m, 'data === armedDataRef.current')).length === 1)
-    assert.strictEqual(settleGuards.length, 1, '必须等这次响应落地（data 换过）再落点')
-    assert.ok(sameShapeOf(settleGuards[0].test, 'data === armedDataRef.current && !err'),
-      '「数据未变」提前返回必须同时要求没有错误（丢掉 !err 会让失败响应永不落地、旗子悬挂）')
+    // 「这次响应真的落地」门：data 换过**且没有错误**才落点，并且必须当场 return。
+    // 只判 test 形状时把 consequent 掏空，旧数据的回包会清旗并滚走（清旗之后的 scrollTo 照跑）。
+    assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('data === armedDataRef.current && !err')).length, 1,
+      '必须等这次响应落地（data 换过且没有错误）再落点，门必须真的 return（丢掉 !err 会让失败响应永不落地、旗子悬挂）')
     // 消费即清旗：listLandTarget 返回 null 时不得重试。
     const msgStmts = msgEffect.arguments[0].body.body
     const clearAt = msgStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
@@ -13825,27 +13846,37 @@ async function main () {
     assert.strictEqual(callSites(histRefresh, 'load').length, 1, '逐轮历史纯刷新仍要真的重拉当前页')
     // 主动路径逐个点名（含顺序）：armLand 必须是处理器里的第一条语句。按控件定位，不按名字猜。
     const msgEls = elementsInFunction(pagesModel, 'MessagesPanel')
-    const handlerOf = (el, why) => {
+    const handlerStmts = (el, why) => {
       assert.ok(el, why)
       const onChange = markup.attrExpr(el, 'onChange')
       assert.ok(onChange && onChange.type === 'ArrowFunctionExpression' && onChange.body.type === 'BlockStatement',
         `${why}：onChange 必须是一段处理器`)
-      return onChange.body.body.map((stmt) => exprLabel(stmt.expression))
+      return onChange.body.body
     }
+    // 处理器按顺序做了哪些调用：必须带实参。旧写法只取 callee 名（`setPage()`），把实参全丢掉 ⇒
+    // 把 setPage(1) 改成 setPage(2)、setQuery(q) 改成 setQuery('') 都全绿（assertshape C6 r3-B）。
+    const handlerOf = (el, why) => handlerStmts(el, why)
+      .filter((stmt) => stmt.type === 'ExpressionStatement')
+      .map((stmt) => callLabel(stmt.expression))
     const sizeSelect = msgEls.find((el) => el.name === 'MiniSelect' && markup.attrText(el, 'ariaLabel') === '每页显示条数')
     assert.deepStrictEqual(handlerOf(sizeSelect, '推送记录必须有「每页显示条数」选择器'),
-      ['armLand()', 'setSize()', 'setPage()'], '推送记录改每页必须先置落点旗，再换页')
-    assert.ok(sameShapeOf(markup.attrExpr(sizeSelect, 'onChange').body.body[1].expression.arguments[0], 'Number(v)'),
-      '改每页必须把 select 的字符串值转成数字（否则 "10" 会原样进 state）')
+      ['armLand()', 'setSize(Number(v))', 'setPage(1)'], '推送记录改每页必须先置落点旗，再把字符串值转数字、回第 1 页')
     const catePicker = msgEls.find((el) => el.name === 'CategoryPicker')
     assert.deepStrictEqual(handlerOf(catePicker, '推送记录必须有分类选择器'),
-      ['armLand()', 'setCate()', 'setPage()'], '推送记录改分类必须先置落点旗，再换页')
-    assert.deepStrictEqual(callArgLabels(markup.attrExpr(catePicker, 'onChange').body.body[1].expression), ['v'],
-      '改分类必须把选中的分类名传下去')
+      ['armLand()', 'setCate(v)', 'setPage(1)'], '推送记录改分类必须先置落点旗，再把选中的分类名传下去、回第 1 页')
+    // preset 时间窗（MiniSelect）：先挡「自定义区间」这个非天数选项，再置旗、清自定义区间、换天数、回第 1 页。
+    const rangeSelect = msgEls.find((el) => el.name === 'MiniSelect' && markup.attrText(el, 'ariaLabel') === '时间范围')
+    const rangeStmts = handlerStmts(rangeSelect, '推送记录必须有「时间范围」选择器')
+    assert.strictEqual(rangeStmts.length, 5, '时间范围处理器必须是「挡自定义区间 → 置旗 → 清区间 → 换天数 → 回第 1 页」五步')
+    assert.ok(earlyExits('v === "__range"')(rangeStmts[0]),
+      '选自定义区间时只切到日期按钮，不得当场重拉（门必须真的 return）')
+    assert.deepStrictEqual(rangeStmts.slice(1).map((stmt) => callLabel(stmt.expression)),
+      ['armLand()', 'setRange({ from: "", to: "" })', 'setDays(Number(v))', 'setPage(1)'],
+      '改 preset 必须先置落点旗、清掉自定义区间（否则区间与 preset 同时生效）、换天数、回第 1 页')
     const rangePicker = msgEls.find((el) => el.name === 'DateRange')
     assert.deepStrictEqual(handlerOf(rangePicker, '推送记录必须有时间范围选择器'),
-      ['armLand()', 'setRange()', 'setDays()', 'setPage()'],
-      '推送记录改时间必须先置落点旗、换区间、清 preset、回第 1 页（自定义区间与 preset 互斥）')
+      ['armLand()', 'setRange(r)', 'setDays(0)', 'setPage(1)'],
+      '推送记录改自定义区间必须先置落点旗、换区间、清 preset、回第 1 页（自定义区间与 preset 互斥）')
     // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
     const changeMode = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeMode')
     assert.ok(changeMode, '必须有 changeMode')
@@ -13915,11 +13946,11 @@ async function main () {
     assert.ok(effect, '推送记录必须有落点 effect')
     const stmts = effect.arguments[0].body.body
     const idxOf = (pred) => stmts.findIndex(pred)
-    const settleGuardAt = idxOf((s) => s.type === 'IfStatement' && sameShapeOf(s.test, '!(settleTick > armedSettleRef.current)'))
-    const seqGuardAt = idxOf((s) => s.type === 'IfStatement' && sameShapeOf(s.test, '!(loadSeqRef.current > armedSeqRef.current)'))
+    const settleGuardAt = idxOf(earlyExits('!(settleTick > armedSettleRef.current)'))
+    const seqGuardAt = idxOf(earlyExits('!(loadSeqRef.current > armedSeqRef.current)'))
     const clearAt = idxOf((s) => s.type === 'ExpressionStatement' && s.expression.type === 'AssignmentExpression' &&
       exprLabel(s.expression.left) === 'landRef.current')
-    const errAt = idxOf((s) => s.type === 'IfStatement' && sameShapeOf(s.test, 'err'))
+    const errAt = idxOf(earlyExits('err'))
     const scrollAt = idxOf((s) => callSites(s, 'window.scrollTo').length > 0)
     // ① 代数没前进 ⇒ 先 return（保留旗子），不得提前清旗。
     assert.ok(settleGuardAt > -1 && settleGuardAt < clearAt,
@@ -13946,16 +13977,28 @@ async function main () {
     const picker = markup.functionNodeOf(pagesModel, 'CategoryPicker')
     const choose = findFirst(picker, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'choose')
     assert.ok(choose, 'CategoryPicker 必须有 choose 处理器')
-    assert.strictEqual(findAll(choose, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'name !== value')).length, 1,
-      'CategoryPicker 必须有值守卫（同值不 onChange）')
-    assert.deepStrictEqual(callSites(choose, 'onChange').map((call) => callArgLabels(call).join(',')), ['name'],
-      '值真的变了才回调 onChange(name)')
+    const valueGuard = findAll(choose, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'name !== value'))[0]
+    assert.ok(valueGuard, 'CategoryPicker 必须有值守卫（同值不 onChange）')
+    // 判据必须落在「onChange 在门里」：只判「有一个 name !== value 的 if」的话，把回调挪到门外
+    // （`if (name !== value) { void 0 }` + 下一行 `onChange(name)`）照样全绿 —— 点当前分类也会回调，
+    // 父层 armLand()/setCate()/setPage(1) 照跑（白置落点旗、回第 1 页）。旧断言逐字钉住门内那一句。
+    assert.deepStrictEqual(callSites(valueGuard.consequent, 'onChange').map(callLabel), ['onChange(name)'],
+      '值守卫的门里必须调 onChange(name)（挪到门外等于没有守卫：点当前分类也会回调）')
+    assert.strictEqual(callSites(choose, 'onChange').length, 1,
+      'onChange 只能有这一处调用（门外再补一次 = 同值也回调）')
     // ⑥ 日志首次加载失败也要同高占位：错误路径不得让 520px 日志框整体消失。
     const logsFn = markup.functionNodeOf(pagesModel, 'LogsPanel')
     const errTpls = templateIn(logsFn, '日志读取失败')
     assert.strictEqual(errTpls.length, 1, 'err && !data 时必须渲染「日志读取失败」占位')
     assert.deepStrictEqual(renderGuardsOf(logsFn, errTpls[0]), ['err && !data'],
       '失败占位只在 err && !data 时渲染（.log-empty 同高）')
+    // 容器本身就是 520px 定高盒：只判文案的话，`class="log-empty"` 改名或 role 丢掉都不会红
+    // （旧断言 `html\`<div class="log-empty" role="status">日志读取失败` 两样都钉住）。
+    const errBox = markup.markupOf(errTpls[0]).children.find((child) => child.type === 'element')
+    assert.ok(errBox && errBox.name === 'div' && markup.hasClass(errBox, 'log-empty'),
+      '失败占位必须是 div.log-empty（520px 定高在这个盒子上，改名让高度反向塌）')
+    assert.strictEqual(markup.attrText(errBox, 'role'), 'status',
+      '失败占位必须 role=status（读屏要把「读取失败」播出来）')
     // ⑦ chip 计数 5em 定宽：1MiB 全是换行也有 7 位，6 位计数不重排。
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.log-chip-n', 'min-width'), ['5em'],
       '.log-chip-n min-width 必须 5em（旧的 2.4em / 3.2em 会让计数换挡时重排）')
@@ -13966,9 +14009,9 @@ async function main () {
     assert.ok(blockEndsWithReturn(wordGuard.consequent),
       'refreshNow 词变化分支必须以 return 收尾（否则 armLand 之后会接着用旧词再刷一次）')
     assert.deepStrictEqual(wordGuard.consequent.body.filter((stmt) => stmt.type === 'ExpressionStatement')
-      .map((stmt) => exprLabel(stmt.expression)),
-    ['armLand()', 'setQuery()', 'setPage()'],
-    '词变化时必须先置落点旗、改词、回第 1 页（顺序不能换）')
+      .map((stmt) => callLabel(stmt.expression)),
+    ['armLand()', 'setQuery(q)', 'setPage(1)'],
+    '词变化时必须先置落点旗、把新词写下去、回第 1 页（顺序不能换；换实参 = 用旧词重刷/停在第 2 页）')
     // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
     assert.strictEqual(findAll(effect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
       '消费前必须检测用户是否自己滚走（门必须真的 return）')
@@ -14102,8 +14145,8 @@ async function main () {
       'App 必须从设置读面取 syncShowDate（读面直接回 body，不是 { data }）')
     assert.ok(findAll(apply, (n) => sameShapeOf(n, "typeof body.settings.syncShowDate !== 'boolean'")).length >= 1,
       '只认布尔，读失败保持默认')
-    assert.strictEqual(findAll(apply, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'rev < uiSettingsRevRef.current')).length, 1,
-      '旧读响应不得覆盖新值（按 revision 判序）')
+    assert.strictEqual(findAll(apply, earlyExits('rev < uiSettingsRevRef.current')).length, 1,
+      '旧读响应不得覆盖新值（按 revision 判序：门必须真的 return，只判条件等于没判序）')
     const sysEl = appEls.find((el) => el.name === 'SysPanel')
     assert.ok(sysEl && exprLabel(markup.attrExpr(sysEl, 'onSettingsSaved')) === 'reloadUiSettings',
       '系统页必须把「保存后重拉」接上（onSettingsSaved = reloadUiSettings）')
@@ -14119,8 +14162,8 @@ async function main () {
     const toggleProps = new Map(togglePost.arguments[0].properties.map((prop) => [prop.key.name, prop.value]))
     assert.deepStrictEqual([exprLabel(toggleProps.get('syncShowDate')), exprLabel(toggleProps.get('baseRevision'))],
       ['next', 'settingsLive.revision'], '开关保存必须传下一状态与当前 revision（乐观锁）')
-    assert.strictEqual(findAll(toggle, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'next === showDate')).length, 1,
-      '同值不得发请求（勾回来不算一次修改）')
+    assert.strictEqual(findAll(toggle, earlyExits('next === showDate')).length, 1,
+      '同值不得发请求（勾回来不算一次修改：门必须真的 return）')
     assert.strictEqual(findAll(block, (n) => n.type === 'ConditionalExpression' &&
       sameShapeOf(n.test, "settingsLive && settingsLive.settings && typeof settingsLive.settings.syncShowDate === 'boolean'")).length, 1,
     '读面必须校验布尔类型（读到脏值不得当成开关值）')
@@ -14168,14 +14211,20 @@ async function main () {
     assert.strictEqual(markup.attrText(box, 'tabindex'), '0', '触发区必须可键盘聚焦（tabindex=0）')
     const keyDown = markup.attrExpr(box, 'onKeyDown')
     assert.ok(keyDown, '必须有键盘处理')
-    assert.strictEqual(findAll(keyDown, (n) => n.type === 'IfStatement' &&
-      sameShapeOf(n.test, "e.key === 'Enter' || e.key === ' '")).length, 1, '键盘 Enter/Space 也必须能展开')
+    // 门里必须真的 toggle：只数「有这条 if」时，把 consequent 掏空（`{ void 0 }`）键盘就废了却全绿。
+    const enterGuards = findAll(keyDown, (n) => n.type === 'IfStatement' &&
+      sameShapeOf(n.test, "e.key === 'Enter' || e.key === ' '"))
+    assert.strictEqual(enterGuards.length, 1, '键盘 Enter/Space 也必须能展开')
+    assert.strictEqual(callSites(enterGuards[0].consequent, 'toggle').length, 1,
+      '键盘 Enter/Space 必须真的展开（门里掏空 = 键盘用户打不开）')
     const pointerdowns = callSites(tap, 'document.addEventListener').filter((call) => callArgLabels(call)[0] === '"pointerdown"')
     assert.strictEqual(pointerdowns.length, 1, '点页面任意其它地方必须收回（document 指针按下）')
     assert.deepStrictEqual(callArgLabels(pointerdowns[0]), ['"pointerdown"', 'onDown', 'true'],
       '必须是捕获阶段（第三个实参 true），否则内层 stopPropagation 会让它收不回来')
-    assert.strictEqual(findAll(tap, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "e.key === 'Escape'")).length, 1,
-      'Esc 必须能收回')
+    const escGuards = findAll(tap, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "e.key === 'Escape'"))
+    assert.strictEqual(escGuards.length, 1, 'Esc 必须能收回')
+    assert.deepStrictEqual(callSites(escGuards[0].consequent, 'setOpen').map(callLabel), ['setOpen(false)'],
+      'Esc 必须真的收起弹层（门里掏空 = Esc 无效）')
     // ③ 弹层坐标交给 computePosition（strategy: fixed），方向/夹取走 offset+flip+shift。
     const compute = callSites(tap, 'computePosition')[0]
     assert.ok(compute, '弹层坐标必须交给 computePosition（不再自己量触发区）')
@@ -14229,8 +14278,8 @@ async function main () {
     assert.strictEqual(tipTpl.type, 'TemplateLiteral', 'tip 文案必须是字符串模板（属性值不是 html``）')
     assert.ok(String(tipTpl.quasis.map((quasi) => quasi.value.raw).join('')).includes('数据截至：'),
       '状态行没接 TapTip 的完整时间（tip 文案必须点名「数据截至：」）')
-    assert.deepStrictEqual(tipTpl.expressions.filter((expr) => expr.type === 'CallExpression').map(exprLabel),
-      ['fmtLocalTime()', 'fmtWeekday()'], 'tip 里必须是完整时间 + 星期（fmtLocalTime / fmtWeekday）')
+    assert.deepStrictEqual(tipTpl.expressions.filter((expr) => expr.type === 'CallExpression').map(callLabel),
+      ['fmtLocalTime(syncAt)', 'fmtWeekday(syncAt)'], 'tip 里必须是完整时间 + 星期，且都用同一个 syncAt（旧断言钉住 fmtWeekday(syncAt)）')
   })
 
   // ── 屏蔽注册天数用多行输入框 ─────────────────────────────────────────────────
