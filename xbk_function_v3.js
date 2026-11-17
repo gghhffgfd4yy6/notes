@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.497 — assertshape C5 第 2 轮：8 条 must_fix 逐条补回真判据（openLog 守卫/切页语句顺序、syncTabEdge 三态条件、data-mk 取值、fp-year-step 三面负向扫描 + cursor:default + 年份箭头隐藏、setLogJump 逐键取值、Object.hasOwn 扫描面纳入 pure.mjs、focusDismissed 读取侧），9 次反向破坏各自变红；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.498 — assertshape C5 第 3 轮：7 条 must_fix 补回丢失判据（openLog 必须 return 预取 Promise、enter 尺寸类样式负向写入、选中态同规则 border-color、onErr 守卫右操作数 from、focusOnly 的 alternate=base、flatpickr 扫描面恢复 7 模块、行级 class 逐段变量绑定），7 次反向破坏各自只红 1 条；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

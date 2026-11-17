@@ -12255,9 +12255,23 @@ async function main () {
         parts.strings.includes(' logline-focus')
     })
     assert.ok(lineEl, '日志必须逐行渲染并按级别着色（class 由 logline / 级别后缀 / 定位后缀三段拼出）')
-    const lineClassParts = exprPartsOf(markup.attrExpr(lineEl, 'class'))
-    assert.deepStrictEqual(['tone', 'isFocus'].filter((name) => !lineClassParts.names.includes(name)), [],
-      '行级着色与定位高亮必须由 tone / isFocus 真实驱动')
+    // 逐段判绑定（r3 补回；旧写法比的是整句拼装）：只判三段字面量都在、tone/isFocus 都出现过时，
+    // 把 `' logline-' + tone` 写成 `' logline-' + isFocus` 仍然全绿——行级配色会全按定位色走。
+    // 这里拆成 [前缀, 级别段, 定位段]，逐段按 exprLabel 比对「哪一段由哪个变量喂」。
+    const lineClassExpr = markup.attrExpr(lineEl, 'class')
+    const classSegments = []
+    let classCursor = lineClassExpr
+    while (classCursor && classCursor.type === 'BinaryExpression' && classCursor.operator === '+') {
+      classSegments.unshift(classCursor.right)
+      classCursor = classCursor.left
+    }
+    classSegments.unshift(classCursor)
+    const segmentLabel = (node) => node && node.type === 'ConditionalExpression'
+      ? `${exprLabel(node.test)} ? ${exprLabel(node.consequent)} : ${exprLabel(node.alternate)}`
+      : exprLabel(node)
+    assert.deepStrictEqual(classSegments.map(segmentLabel),
+      ['"logline"', 'tone ? " logline-" + tone : ""', 'isFocus ? " logline-focus" : ""'],
+      '行级着色/定位高亮必须逐段绑对变量（第二段后缀喂 tone、第三段的判据必须是 isFocus）')
     const virtEl = logsEls.find((el) => markup.hasClass(el, 'log-virt'))
     assert.ok(virtEl, '日志行必须挂在虚拟容器里（.log-virt）')
     const virtStyle = markup.attrExpr(virtEl, 'style')
@@ -12394,10 +12408,21 @@ async function main () {
       'openLog 的依赖必须只有 markVisited（多一个会重建回调、重复预取）')
     assert.strictEqual(callSites(openLogDecl.init, 'apiGetLogs').length, 1, '跳转必须先取一次日志快照')
     // 「先取后切」的结构判据：setTab 必须在 apiGetLogs().then(成功回调) 里，而不是发起请求后就切。
-    const thenCalls = findAll(openLogDecl.init, (n) => n.type === 'CallExpression' &&
+    const isPrefetchThen = (n) => n.type === 'CallExpression' &&
       n.callee.type === 'MemberExpression' && !n.callee.computed && n.callee.property.name === 'then' &&
-      n.callee.object.type === 'CallExpression' && memberPath(n.callee.object.callee) === 'apiGetLogs')
+      n.callee.object.type === 'CallExpression' && memberPath(n.callee.object.callee) === 'apiGetLogs'
+    const thenCalls = findAll(openLogDecl.init, isPrefetchThen)
     assert.strictEqual(thenCalls.length, 1, '必须把预取 Promise 返回并等它落定（apiGetLogs().then(…)）')
+    // 返回值判据（r3 补回）：只判 then 调用存在时，把 `return apiGetLogs().then(…)` 降级成裸调用
+    // 仍然全绿——调用方 components.js / pages.js 的 `Promise.resolve(onOpenLog(…)).then(…)`
+    // 会立刻拿到 undefined，失败分支永不触发、.finally 提前打掉 setBusy。必须按 AST 判「有
+    // ReturnStatement，且它的实参就是那处 apiGetLogs().then(…) 调用」。
+    const returnedPrefetch = findAll(openLogDecl.init, (n) => n.type === 'ReturnStatement' &&
+      n.argument && isPrefetchThen(n.argument))
+    assert.strictEqual(returnedPrefetch.length, 1,
+      '预取的 Promise 必须被 return（否则调用方拿不到结果：失败分支不触发、.finally 提前打掉 setBusy）')
+    assert.strictEqual(returnedPrefetch[0].argument, thenCalls[0],
+      'return 的必须是同一处 apiGetLogs().then(…) 调用（不能另起一次预取）')
     const [onOk, onErr] = thenCalls[0].arguments
     assert.ok(onOk && onOk.type === 'ArrowFunctionExpression' && onErr && onErr.type === 'ArrowFunctionExpression',
       '预取成功 / 失败两条回调都必须显式处理')
@@ -12421,6 +12446,12 @@ async function main () {
       findAll(onErr, (n) => n.type === 'BinaryExpression' && n.operator === '!==' &&
         memberPath(n.left) === 'tabRef.current').length >= 1,
     '迟到的失败也必须按切页作废（不能在新页面弹旧错误）')
+    // 右操作数判据（r3 补回）：只钉左操作数是 tabRef.current 时，把 `tabRef.current !== from`
+    // 改成 `!== 'x'` 仍然全绿——守卫恒为真，切页作废形同虚设。右操作数必须是进入时捕获的 from。
+    const errTabGuards = findAll(onErr, (n) => n.type === 'BinaryExpression' && n.operator === '!==' &&
+      memberPath(n.left) === 'tabRef.current')
+    assert.ok(errTabGuards.every((n) => exprLabel(n.right) === 'from'),
+      `切页守卫必须与进入时捕获的页签 from 比（不是常量/别的变量；实际 ${errTabGuards.map((n) => exprLabel(n.right)).join(' / ') || '无守卫'}）`)
     assert.ok(findAll(uiModel, (n) => n.type === 'UpdateExpression' && n.operator === '++' &&
       memberPath(n.argument) === 'logJumpSeqRef.current').length >= 2,
     '主动切页/后退必须作废在飞的日志跳转（hashchange 与 switchTab 两处都递增代次）')
@@ -12609,9 +12640,14 @@ async function main () {
       memberPath(n.consequent.expression.left) === 'y' &&
       sameShapeOf(n.consequent.expression.right, 'bottomAfter - (vh - 12)')).length, 1,
     '小屏必须把页面多滚一点，保证高亮行完整可见（if (bottomAfter > vh - 12) y += bottomAfter - (vh - 12)）')
-    assert.strictEqual(findAll(logsFn, (n) => n.type === 'ConditionalExpression' && exprLabel(n.test) === 'focusOnly' &&
+    const focusFilters = findAll(logsFn, (n) => n.type === 'ConditionalExpression' && exprLabel(n.test) === 'focusOnly')
+    assert.strictEqual(focusFilters.filter((n) =>
       sameShapeOf(n.consequent, 'base.filter((l) => l.startsWith(focusAt))')).length, 1,
     '「只看这一轮」必须按行首过滤（不能把正文提到时间戳的行也带进来）')
+    // alternate 判据（r3 补回）：只钉 consequent 时，把 `: base` 改成 `: []` 仍然全绿——
+    // 用户一清掉定位条件（focusOnly 变 false）日志页就整页空白。旧写法比的是整句三元。
+    assert.deepStrictEqual(focusFilters.map((n) => exprLabel(n.alternate)), ['base'],
+      '「只看这一轮」之外必须回落到完整 base（写成 [] 会让清掉定位后日志全空）')
     assert.strictEqual(findAll(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'focusHeavy').length, 1, '>3000 行必须有 focusHeavy 护栏')
     assert.ok(logsStrings.some((value) => value.includes('整行高亮已关闭')), '>3000 行必须明说高亮关闭')
@@ -12735,6 +12771,26 @@ async function main () {
       String(memberPath(n.left) || '').startsWith('frames.')).map((n) => memberPath(n.left))
     assert.deepStrictEqual(frameKeys.sort(), ['frames.opacity', 'frames.transform'],
       '入场帧只允许 opacity / transform（改 height/top 会把页面带着一起跳）')
+    // 负向判据（r3 补回）：enter 不得改尺寸类内联样式。旧写法是在 `export function enter` →
+    // `export function reveal` 的源码切片上找 height|width|maxHeight 子串；现在按 AST 判
+    // 「有没有写 *.style.<尺寸>」（赋值或 el.style.setProperty('height', …)）——加一句
+    // `el.style.height = '120px'` 会命中，注释里提一句 height 不会误红。尺寸类属性会触发布局，
+    // 入场动画只许走合成层（opacity / transform）。
+    const styleSizeWritePath = (value) =>
+      /(^|\.)style\.(height|width|maxHeight|maxWidth|minHeight|minWidth)$/.test(String(value || ''))
+    const sizePropName = (node) => node && node.type === 'Literal' &&
+      ['height', 'width', 'maxHeight', 'maxWidth', 'minHeight', 'minWidth'].includes(String(node.value))
+    const sizeStyleWrites = findAll(enterFn, (n) => {
+      if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression') {
+        return styleSizeWritePath(memberPath(n.left))
+      }
+      return n.type === 'CallExpression' && memberPath(n.callee) === 'el.style.setProperty' && sizePropName(n.arguments[0])
+    })
+    const sizeWriteLabel = (n) => n.type === 'AssignmentExpression'
+      ? memberPath(n.left)
+      : `el.style.setProperty(${exprLabel(n.arguments[0])})`
+    assert.deepStrictEqual(sizeStyleWrites.map(sizeWriteLabel), [],
+      'enter 不得改尺寸类属性（height/width/maxHeight… 会引入布局跳动，入场只许 opacity/transform）')
     const opacityFrames = findAll(enterFn, (n) => n.type === 'AssignmentExpression' &&
       memberPath(n.left) === 'frames.opacity')
     assert.ok(opacityFrames.length >= 1 && opacityFrames.every((n) => sameShapeOf(n.right, '[0, 1]')),
@@ -12846,8 +12902,14 @@ async function main () {
       link.before.includes('rel="stylesheet"') && link.after.startsWith('/flatpickr.css"')),
     'flatpickr 的 CSS 必须在页面 head 以 rel=stylesheet 引入，且走带版本号的 assetBaseUrl')
     // B. 配置：只允许一处初始化；区间模式、禁原生弹层、单月、静态月份选择器、上限按上海日。
-    const fpCalls = callSites(componentsModel, 'flatpickr')
+    // 扫描面 = 全部前端模块（旧写法扫的就是拼接后的 7 个模块）：只看 components.js 时，
+    // 在 ui.js 末尾再加一处 flatpickr() 初始化仍然只数到 1，多份状态的问题被漏掉。
+    const fpCalls = consoleAssetModels().flatMap((model) => callSites(model, 'flatpickr'))
     assert.strictEqual(fpCalls.length, 1, 'flatpickr 只允许在 DateRange 里初始化一次（多处初始化 = 多份状态）')
+    const dateRangeFn = markup.functionNodeOf(componentsModel, 'DateRange')
+    assert.ok(dateRangeFn, 'components.js 必须实现 DateRange（区间筛选的唯一入口）')
+    assert.strictEqual(callSites(dateRangeFn, 'flatpickr').length, 1,
+      '唯一那次初始化必须在 DateRange 里（否则区间状态与触发按钮脱节）')
     assert.ok(callArgLabels(fpCalls[0])[0] === 'el', '初始化必须绑在 DateRange 的真实 input 上')
     const fpOptions = new Map(fpCalls[0].arguments[1].properties
       .filter((prop) => prop.type === 'Property').map((prop) => [prop.key.name, prop.value]))
@@ -12928,6 +12990,14 @@ async function main () {
       '前端不得再产出 fp-year-step 类名（字符串字面量 / 模板静态段里都不许有）')
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-current-month input.cur-year', 'cursor'),
       ['default'], '年份输入框必须 cursor: default（静态展示，不可编辑）')
+    // 选中态三件套必须在**同一条规则**里同时成立（旧写法比的是连写的
+    // `background: transparent; border-color: transparent; color: var(--on-accent)`）。
+    // 只判 background / color 时，删掉 border-color 会留下一圈方形描边，仍然全绿。
+    const selectedSkin = cssRulesFor(cssRules, '.flatpickr-calendar .flatpickr-day.selected')
+      .map((rule) => ['background', 'border-color', 'color']
+        .map((prop) => `${prop}=${rule.decls.get(prop)}`).join(' '))
+    assert.ok(selectedSkin.includes('background=transparent border-color=transparent color=var(--on-accent)'),
+      `选中态不能留方形底色（同一条规则必须 background/border-color 透明 + color on-accent；实际 ${selectedSkin.join(' | ') || '无匹配规则'}）`)
     const selectedDecls = cssDeclValuesOf(cssRules, '.flatpickr-calendar .flatpickr-day.selected', 'background')
     assert.deepStrictEqual(selectedDecls, ['transparent'], '选中态背景必须透明（圆点由 ::before 画）')
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-calendar .flatpickr-day.selected', 'color'),
