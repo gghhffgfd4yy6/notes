@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.489 — C2 r2：只修文档与版本——v3.487 段的检查器引文改为实跑逐字（origin/main 不带 ^）并补上 ⚠️ 扫描面外 24 条这一块，exprLabel/matchesCompare 的归属改记为 test_console.js 本地 helper；生产与测试逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.490 — C2 r3：三条 must_fix 补极性/运算符——单飞闸按 AST 逐项判 !active / justActivated / !(pollTick > 0) / busyRef.current，bad 判定必须 broken 打头的 || 链，seed 必须 seedRef.current !== null && seedRef.current.id === openId；只动 test_console.js 与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

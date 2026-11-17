@@ -357,6 +357,23 @@ function exprLabel (node) {
   if (node.type === 'CallExpression') return `${exprLabel(node.callee)}()`
   return node.type
 }
+// 逻辑链的操作数（只拆同一运算符的一层：`a || b || c` → [a, b, c]；遇到别的运算符就停下，
+// 剩下的交给 exprLabel 判）。判「某一支到底是什么」比逐层 node.type 硬编直白，也不会像
+// 「收集全部 Identifier 名字」那样把运算符与极性一起丢掉。
+function logicalBranches (node, operator) {
+  if (!node || node.type !== 'LogicalExpression' || node.operator !== operator) return [node]
+  return logicalBranches(node.left, operator).concat(logicalBranches(node.right, operator))
+}
+// 极性敏感的标签：exprLabel 的一元分支不写括号，`!(pollTick > 0)` 与 `!pollTick > 0` 同形，
+// 判「取反了没有」时必须把取反的实参括起来，否则 !x 与 x 分不开。
+function polarLabel (node) {
+  if (!node) return ''
+  if (node.type !== 'UnaryExpression') return exprLabel(node)
+  const inner = exprLabel(node.argument)
+  return node.argument.type === 'Identifier' || node.argument.type === 'Literal'
+    ? node.operator + inner
+    : `${node.operator}(${inner})`
+}
 // 运行日志摘要行（`2026-10-15 12:16:21 total=20 dedup=0 …`）→ { 字段: 值 }。
 // /api/logs 下发的是行文本，按 `k=v` 解析成字段再断值，比在整行里找 'total=20' 稳
 // （后者在 total=200 时同样命中）。
@@ -9298,9 +9315,14 @@ async function main () {
     const seedDecl = findFirst(runsPanel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'seed' && n.init && n.init.type === 'ConditionalExpression')
     assert.ok(seedDecl, 'effect 必须从 seedRef 取一次 seed（且只取一次）')
-    assert.ok(/(?:^|[^.\w])seedRef\.current\.id$/.test(exprLabel(seedDecl.init.test)) ||
-      exprLabel(seedDecl.init.test).includes('seedRef.current.id'),
-    `seed 只能吃同一 openId 的预取（实际判定 ${exprLabel(seedDecl.init.test)}）`)
+    // 逐项判运算符与极性：只看「标签里出现过 seedRef.current.id」时，`===` 改成 `!==` 同样绿 ⇒
+    // 别的 openId 的详情会被当成本轮 seed 吃掉（旧文本断言原本逐字钉住这条判定）。
+    const seedTest = seedDecl.init.test
+    assert.strictEqual(seedTest.type, 'LogicalExpression', 'seed 必须同时看「预取非空」与「同一 openId」')
+    assert.strictEqual(seedTest.operator, '&&', 'seed 的两个条件必须同时成立（|| 会吃进别的 openId 的详情）')
+    assert.deepStrictEqual(logicalBranches(seedTest, '&&').map(exprLabel),
+      ['seedRef.current !== null', 'seedRef.current.id === openId'],
+      `seed 只能吃同一 openId 的预取（实际判定 ${exprLabel(seedTest)}）`)
     const seedBranches = findAll(runsPanel, (n) => n.type === 'IfStatement' &&
       ['seed === null', 'seed !== null'].includes(exprLabel(n.test)))
     assert.strictEqual(seedBranches.length, 2, 'seed 分支必须恰好两条：null 才轮询、非 null 走 SSE 快照')
@@ -9393,11 +9415,27 @@ async function main () {
     const singleFlight = findAll(pollReload, (n) => n.type === 'IfStatement' && n.consequent.type === 'ReturnStatement' &&
       n.consequent.argument === null)
     assert.strictEqual(singleFlight.length, 1, 'usePollReload 必须有唯一的裸 return 单飞退出')
-    const guardNames = new Set(findAll(singleFlight[0].test, (n) => n.type === 'Identifier').map((n) => n.name))
-    assert.deepStrictEqual(['active', 'justActivated', 'pollTick', 'busyRef'].filter((name) => !guardNames.has(name)), [],
-      `单飞闸必须同时看 active / justActivated / pollTick / busyRef（实际 ${[...guardNames].join('/')}）`)
-    assert.strictEqual(findAll(singleFlight[0].test, (n) => n.type === 'BinaryExpression' && n.operator === '>' &&
-      exprLabel(n.left) === 'pollTick').length, 1, '第一拍（pollTick===0）必须跳过')
+    // 单飞闸的四个分支必须逐项判极性与运算符：只收集 Identifier 名字时，`!active` 与 `active`、
+    // `!(pollTick > 0)` 与 `pollTick > 0` 产出同一个名字集合 ⇒ 取反与各项极性都不再被检查，
+    // 把闸门改成「页签激活就直接 return」也会绿。
+    const guard = singleFlight[0].test
+    assert.strictEqual(guard.type, 'LogicalExpression', '单飞闸必须是逻辑组合，不能只看单个标识符')
+    assert.strictEqual(guard.operator, '||', '单飞闸的顶层必须是 ||（任一条件成立就跳过这一拍）')
+    const guardBranches = logicalBranches(guard, '||')
+    const isNegated = (node, inner) => Boolean(node) && node.type === 'UnaryExpression' && node.operator === '!' &&
+      exprLabel(node.argument) === inner
+    for (const [why, hit] of [
+      ['active 必须取反（裸 active 会变成「页签激活就直接 return」）', guardBranches.some((n) => isNegated(n, 'active'))],
+      ['justActivated 必须直接参与判定（首访那一拍不得重复拉）',
+        guardBranches.some((n) => n.type === 'Identifier' && n.name === 'justActivated')],
+      ['第一拍（pollTick === 0）必须跳过，且 pollTick > 0 必须整体取反',
+        guardBranches.some((n) => isNegated(n, 'pollTick > 0'))],
+      ['busyRef.current 必须直接参与判定（上一拍未回就跳过）',
+        guardBranches.some((n) => n.type === 'MemberExpression' && memberPath(n) === 'busyRef.current')]
+    ]) assert.ok(hit, why)
+    assert.deepStrictEqual(guardBranches.map(polarLabel).sort(),
+      ['!(pollTick > 0)', '!active', 'busyRef.current', 'justActivated'],
+      `单飞闸必须恰好是 !active / justActivated / !(pollTick > 0) / busyRef.current（实际 ${polarLabel(guard)}）`)
     assert.ok(callSites(pollReload, 'fnRef.current').length >= 1, '单飞闸必须真的调用传进来的 loader')
     // 轮询 effect 必须随 tab / 暂停开关 / 凭证失效 / SSE 在线态变化重跑。
     const pollEffect = callSites(app, 'useEffect').find((call) => call.arguments[1] &&
@@ -10126,9 +10164,16 @@ async function main () {
       .map((call) => exprLabel(call.arguments[0]))
     assert.deepStrictEqual(dotBroken.sort(), ['state && state.report', 'state && state.run'],
       '标题状态点必须把 run/report 损坏算成异常（否则标题点还是绿色）')
-    // bad 判定必须并入 broken（否则损坏仍显示健康绿）。
-    assert.ok(findAll(uiApp, (n) => n.type === 'LogicalExpression' && exprLabel(n.left) === 'broken').length >= 1,
-      '标题状态点的 bad 判定必须并入 broken')
+    // bad 判定必须由 `broken || …` 算出来：只要求「存在一处左操作数是 broken 的逻辑表达式」时，
+    // 把 || 收窄成 && 同样绿 ⇒ 损坏重新落回「健康绿」。
+    const badDecl = findAll(uiApp, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'bad')
+    assert.strictEqual(badDecl.length, 1, '标题状态点必须有唯一的 bad 判定')
+    const badInit = badDecl[0].init
+    assert.ok(badInit && badInit.type === 'LogicalExpression', 'bad 必须由逻辑组合算出（不能只看 stats 或 run 单边）')
+    assert.strictEqual(badInit.operator, '||', 'bad 的各路异常必须并列（&& 会把损坏从「异常」里摘掉）')
+    assert.deepStrictEqual(logicalBranches(badInit, '||').map(exprLabel).slice(0, 1), ['broken'],
+      `bad 的第一支必须是裸 broken（取反 / 挪到后面都会让损坏不算异常，实际 ${exprLabel(badInit)}）`)
     // 统一的「部件损坏」判定是行为断言：直接调它。
     const pure = await import('./scripts/console-assets/pure.mjs')
     assert.strictEqual(typeof pure.partBroken, 'function', '必须有统一的「部件损坏」判定')
