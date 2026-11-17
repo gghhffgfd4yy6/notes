@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.496 — 文档行长：v3.495 段「十个块的重点改法」一条 bullet 单行 3322 字符（阈值 1200）按语义拆成 ①–⑩ 十条子 bullet，正文逐字守恒；阈值与 scripts/check-doc-lines.js 未动，生产逻辑与测试一行未改 *******
+//* ******* 线报酷推送脚本 v3.497 — assertshape C5 第 2 轮：8 条 must_fix 逐条补回真判据（openLog 守卫/切页语句顺序、syncTabEdge 三态条件、data-mk 取值、fp-year-step 三面负向扫描 + cursor:default + 年份箭头隐藏、setLogJump 逐键取值、Object.hasOwn 扫描面纳入 pure.mjs、focusDismissed 读取侧），9 次反向破坏各自变红；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

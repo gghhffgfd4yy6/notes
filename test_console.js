@@ -12401,11 +12401,21 @@ async function main () {
     const [onOk, onErr] = thenCalls[0].arguments
     assert.ok(onOk && onOk.type === 'ArrowFunctionExpression' && onErr && onErr.type === 'ArrowFunctionExpression',
       '预取成功 / 失败两条回调都必须显式处理')
-    assert.strictEqual(findAll(onOk, (n) => n.type === 'BinaryExpression' && n.operator === '!==' &&
-      exprLabel(n.left) === 'seq' && memberPath(n.right) === 'logJumpSeqRef.current').length, 1,
-    '切页前必须先过代次守卫（seq !== logJumpSeqRef.current）')
+    const guardOf = (root) => findAll(root, (n) => n.type === 'BinaryExpression' && n.operator === '!==' &&
+      exprLabel(n.left) === 'seq' && memberPath(n.right) === 'logJumpSeqRef.current')
+    assert.strictEqual(guardOf(onOk).length, 1, '切页前必须先过代次守卫（seq !== logJumpSeqRef.current）')
     assert.deepStrictEqual(callSites(onOk, 'setTab').map((call) => callArgLabels(call).join(',')), ['"logs"'],
       'setTab(\'logs\') 必须在预取成功之后（不能在发起请求时切页）')
+    // 顺序判据（不是「两句话都在」）：守卫那条**语句**必须排在含 setTab 的那条**语句**之前。
+    // 只断各自存在时，把 setTab('logs') 提到守卫之前（迟到的预取会把已切走的用户拽回日志页）仍然全绿；
+    // 旧写法是在 openLog 切片上比 indexOf(setTab) 与 indexOf(守卫) 的先后。
+    assert.strictEqual(onOk.body.type, 'BlockStatement', '预取成功回调必须是语句块（顺序判据要有语句表）')
+    const guardAt = onOk.body.body.findIndex((stmt) => guardOf(stmt).length > 0)
+    const setTabAt = onOk.body.body.findIndex((stmt) => callSites(stmt, 'setTab').length > 0)
+    assert.ok(guardAt > -1, '代次守卫必须自己占一条语句（否则语句下标为 -1，顺序判据失效）')
+    assert.ok(setTabAt > -1, 'setTab(\'logs\') 必须自己占一条语句（否则语句下标为 -1，顺序判据失效）')
+    assert.ok(guardAt < setTabAt,
+      `切页必须排在代次守卫之后（守卫是第 ${guardAt} 条语句，setTab 是第 ${setTabAt} 条）`)
     assert.ok(findAll(onErr, (n) => n.type === 'BinaryExpression' && n.operator === '!==' &&
       memberPath(n.right) === 'logJumpSeqRef.current').length >= 1 &&
       findAll(onErr, (n) => n.type === 'BinaryExpression' && n.operator === '!==' &&
@@ -12419,6 +12429,15 @@ async function main () {
     assert.ok(setLogJumpArg, '快照必须随 logJump 交给日志面板')
     assert.deepStrictEqual(objectKeyNames(setLogJumpArg), ['q', 'mode', 'focus', 'n', 'data'],
       'logJump 快照必须带 q / mode / focus / 代次 n / data（首帧定稿的全部输入）')
+    // 取值判据（不是只钉键名 / 顺序）：data 必须是预取结果 d（写成 null 就回到「先 paint 空壳」），
+    // n 必须是本次代次 seq（写成常量会让作废机制失效）。旧写法比的是整句
+    // `setLogJump({ q, mode, focus, n: seq, data: d })`。
+    const jumpSnapshot = new Map(setLogJumpArg.properties
+      .filter((prop) => prop.type === 'Property' && prop.key && prop.key.name)
+      .map((prop) => [prop.key.name, exprLabel(prop.value)]))
+    assert.deepStrictEqual([...jumpSnapshot.entries()],
+      [['q', 'q'], ['mode', 'mode'], ['focus', 'focus'], ['n', 'seq'], ['data', 'd']],
+      'logJump 快照必须逐键传对值（q=q / mode=mode / focus=focus / n=seq / data=d）')
     // usePanelLoader：快照是初始 data，不是先 paint 空壳再拉。
     const loaderFn = markup.functionNodeOf(pagesModel, 'usePanelLoader')
     assert.ok(loaderFn, '必须有 usePanelLoader（面板加载状态机）')
@@ -12542,6 +12561,15 @@ async function main () {
     '切查询前必须清 focusDoneRef（否则轮询会反复把用户拽回）')
     assert.ok(findAll(logsFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setFocusDismissed' &&
       callArgLabels(n).join(',') === 'true').length >= 1, '切分类/手改搜索词后定位条必须保持收起')
+    // 读取侧判据：setter 被调用还不够，渲染条件必须真的消费 focusDismissed。
+    // 旧写法同判 `setFocusDismissed(true)` 与 `focusDismissed ||` 两个合取项；只数 setter 调用点时，
+    // 把 `focusDismissed ||` 从 focusMode 的三元 test 里删掉（定位条不再收起）仍然全绿。
+    const focusModeDecl = findFirst(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'focusMode')
+    assert.ok(focusModeDecl && focusModeDecl.init.type === 'ConditionalExpression',
+      '定位条显隐必须由一处 focusMode 三元决定（渲染条件要有可判对象）')
+    assert.ok(logicalBranches(focusModeDecl.init.test, '||').some((n) => exprLabel(n) === 'focusDismissed'),
+      'focusMode 的隐藏条件必须读 focusDismissed（切分类/手改搜索词后保持收起）')
     // ⑤ 整行高亮与滚动定位：只做一次、居中、切页不动画。
     assert.ok(findAll(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'isFocus').some((decl) => sameShapeOf(decl.init, "focusAt !== '' && line.startsWith(focusAt)")),
@@ -12635,11 +12663,22 @@ async function main () {
       n.id.name === 'max')
     assert.ok(maxDecl && sameShapeOf(maxDecl.init, 'bar.scrollWidth - bar.clientWidth'),
       '溢出量必须真的量（bar.scrollWidth - bar.clientWidth）')
-    assert.strictEqual(findAll(syncDecl.init, (n) => n.type === 'ConditionalExpression' &&
+    const edgeTernaries = findAll(syncDecl.init, (n) => n.type === 'ConditionalExpression' &&
       n.consequent.type === 'Literal' && n.consequent.value === 'both' &&
       n.alternate.type === 'ConditionalExpression' && n.alternate.consequent.value === 'left' &&
-      n.alternate.alternate.consequent.value === 'right').length, 1,
-    '三态必须按 left/right 两个方向组合（both / left / right / 空）')
+      n.alternate.alternate.consequent.value === 'right')
+    assert.strictEqual(edgeTernaries.length, 1,
+      '三态必须按 left/right 两个方向组合（both / left / right / 空）')
+    // 条件侧判据：只钉三个 consequent 字面量时，把条件里的 left/right 对调（滑到右端却挂左缘遮罩）
+    // 仍然全绿。旧写法比的是整句 `left && right ? 'both' : left ? 'left' : right ? 'right' : ''`。
+    assert.deepStrictEqual([
+      exprLabel(edgeTernaries[0].test),
+      exprLabel(edgeTernaries[0].alternate.test),
+      exprLabel(edgeTernaries[0].alternate.alternate.test)
+    ], ['left && right', 'left', 'right'],
+    '三态的条件必须分别是 left && right / left / right（对调会把左右遮罩挂反）')
+    assert.strictEqual(exprLabel(edgeTernaries[0].alternate.alternate.alternate), '""',
+      '两端都不溢出时 data-edge 必须落到空串（否则恒定渐隐）')
     // D. 当前页签滚入视野：scrollIntoView(inline:nearest)，不手改 scrollLeft。
     const scrollCalls = callSites(app, 'el.scrollIntoView')
     assert.strictEqual(scrollCalls.length, 1, '当前页签必须用 scrollIntoView 滚进可视区')
@@ -12721,6 +12760,11 @@ async function main () {
       .flatMap((model) => templateRootsOf(model).flatMap((root) => markup.allElements(root)))
       .filter((el) => markup.attrOf(el, 'data-mk') !== null)
     assert.ok(mkEls.length >= 1, `列表条目必须挂 data-mk（实际 ${mkEls.length} 处）`)
+    // 取值判据：data-mk 必须绑稳定的行键 m.rowKey。只判「有 data-mk 属性」时，改成 `${i}`
+    // （下标随翻页错位，FLIP 按错位的键配对动画）仍然全绿；旧写法是 `src.includes('data-mk=${m.rowKey}')`。
+    const mkLabels = mkEls.map((el) => exprLabel(markup.attrExpr(el, 'data-mk')))
+    assert.ok(mkLabels.every((label) => label === 'm.rowKey'),
+      `data-mk 必须绑稳定行键 m.rowKey（下标会随翻页错位；实际 ${mkLabels.join(' / ')}）`)
     // G. 收尾清理 + 抖动时长：内联 transform/opacity 必须摘掉，摘类必须晚于 1.2s 动画。
     assert.deepStrictEqual(callSites(motionModel, 'el.style.removeProperty')
       .map((call) => callArgLabels(call)[0]).sort(), ['"opacity"', '"transform"'],
@@ -12864,6 +12908,26 @@ async function main () {
       '日历底色必须跟随面板（否则深色主题里是白底）')
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-current-month .numInputWrapper', 'pointer-events'),
       ['none'], '年份输入框必须禁指针（手机滑动最容易误触它弹键盘）')
+    // 「头部只保留 ‹ › 两个箭头」+「年份静态展示」两条红线（r2 补回，先前只删不补）：
+    //   ① 年份微调箭头必须被 CSS 隐藏（再露出来就是四个箭头挤一起）；
+    //   ② 任何资产都不得再出现 fp-year-step 这个年份步进类；
+    //   ③ 年份输入框的 cursor 必须是 default（text/pointer 会让手指一碰就弹键盘）。
+    // 判据全部落在结构上：①③ 走解析后的 CSS 规则字段（旧写法是对整份 CSS 做正则），
+    // ② 三个结构面都查（解析后的 CSS 选择器 / 模板元素上的 class / AST 字符串字面量与模板静态段），
+    // 不再读源码文本——注释里提一句顶替不了实现，格式化也不影响结论。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-current-month .numInputWrapper .arrowUp', 'display'),
+      ['none'], '年份微调上箭头必须隐藏（头部只留 ‹ › 两个箭头）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-current-month .numInputWrapper .arrowDown', 'display'),
+      ['none'], '年份微调下箭头必须隐藏（头部只留 ‹ › 两个箭头）')
+    assert.deepStrictEqual(cssRules
+      .filter((rule) => rule.selector.split(',').some((part) => /\.fp-year-step\b/.test(part.trim())))
+      .map((rule) => rule.selector), [], '不得再引入年份步进类 .fp-year-step（四个箭头挤一起）')
+    assert.deepStrictEqual(consoleAssetElements().filter((el) => markup.hasClass(el, 'fp-year-step')).map((el) => el.name),
+      [], '模板里不得再挂 fp-year-step（月份步进按钮必须消失）')
+    assert.deepStrictEqual(consoleAssetStrings().filter((value) => value.includes('fp-year-step')), [],
+      '前端不得再产出 fp-year-step 类名（字符串字面量 / 模板静态段里都不许有）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-current-month input.cur-year', 'cursor'),
+      ['default'], '年份输入框必须 cursor: default（静态展示，不可编辑）')
     const selectedDecls = cssDeclValuesOf(cssRules, '.flatpickr-calendar .flatpickr-day.selected', 'background')
     assert.deepStrictEqual(selectedDecls, ['transparent'], '选中态背景必须透明（圆点由 ::before 画）')
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.flatpickr-calendar .flatpickr-day.selected', 'color'),
@@ -13067,12 +13131,15 @@ async function main () {
     const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     const pureModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pure.mjs'))
     // A. 负向：资产里不再有 Object.prototype.hasOwnProperty.call（改成 Object.hasOwn）。
-    //    扫描面 = 7 个页面模块（vendored bundle 不算自家源码，flatpickr/motion-lib 里的无所谓）。
-    const legacy = consoleAssetModels().flatMap((model) => findAll(model, (n) =>
+    //    扫描面 = 7 个页面模块 + pure.mjs（vendored bundle 不算自家源码，flatpickr/motion-lib 里的无所谓）。
+    //    r2 修正：先前只扫 consoleAssetModels()，pure.mjs（自家源码，旧断言 `!pure.includes(…)` 明确管它）
+    //    整条负向判据消失——在 pure.mjs 里写回 hasOwnProperty 仍然全绿。
+    const ownSourceModels = consoleAssetModels().concat(pureModel)
+    const legacy = ownSourceModels.flatMap((model) => findAll(model, (n) =>
       n.type === 'MemberExpression' && memberPath(n) === 'Object.prototype.hasOwnProperty'))
     assert.deepStrictEqual(legacy.map((node) => node.loc.start.line), [],
       '自家资产一律用 Object.hasOwn，不再手写 Object.prototype.hasOwnProperty.call')
-    const legacyCalls = consoleAssetModels().flatMap((model) => findAll(model, (n) =>
+    const legacyCalls = ownSourceModels.flatMap((model) => findAll(model, (n) =>
       n.type === 'CallExpression' && n.callee.type === 'MemberExpression' &&
       memberPath(n.callee.object) === 'Object.prototype.hasOwnProperty'))
     assert.deepStrictEqual(legacyCalls.map((node) => node.loc.start.line), [], '不得再有 .call(obj, key) 形态的 hasOwnProperty')
