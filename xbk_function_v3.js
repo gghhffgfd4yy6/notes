@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.501 — assertshape C6 第 1 轮评审修复：6 条放宽判据（手机输入 .log-search / 落点旗门 / 0 命中 .log-empty / 脏标记门 / 纯刷新重拉 / 行尾注释 token）全部收紧，账目按最终 HEAD 实量校正；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.502 — assertshape C6 第 2 轮评审修复：14 处 if 门判据补 consequent 早退 / 门内调用（landRef 旗门、宽度门 return null、loading 与 y===null 早退、值守卫、10s 重试 pushDraftNow 必须在门内），并校正 D6 版本注释反向验证记录；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

@@ -584,6 +584,26 @@ function assertIfConditionIn (root, condition, why) {
   const hits = findAll(root, (n) => n.type === 'IfStatement' && shapeSignatureOf(n.test) === want)
   assert.strictEqual(hits.length, 1, `${why}（条件必须是 ${condition}，实际命中 ${hits.length} 处）`)
 }
+// 「早退门」判据（assertshape C6 r2）：光判 `if (…)` 存在不算数 —— 把 consequent 掏空
+// （`if (!landRef.current) { /* noop */ }`）后受保护的代码照跑，旧判据全绿。
+// consequent 必须是 `return`，或一段**以 return 收尾**的块（refreshNow / changeMode 这种
+// 「门里先做事、最后早退」）；需要时再钉住返回的字面量（宽度门要的是 `return null`）。
+function earlyExits (testShape, returnValue) {
+  return (node) => {
+    if (node.type !== 'IfStatement' || !sameShapeOf(node.test, testShape)) return false
+    const last = node.consequent.type === 'BlockStatement'
+      ? node.consequent.body[node.consequent.body.length - 1]
+      : node.consequent
+    if (!last || last.type !== 'ReturnStatement') return false
+    if (returnValue === undefined) return true
+    return Boolean(last.argument) && last.argument.type === 'Literal' && last.argument.value === returnValue
+  }
+}
+// 块门是否以 return 收尾（refreshNow 的 `if (q !== query) { armLand(); …; return }`）。
+function blockEndsWithReturn (consequent) {
+  return Boolean(consequent) && consequent.type === 'BlockStatement' && consequent.body.length > 0 &&
+    consequent.body[consequent.body.length - 1].type === 'ReturnStatement'
+}
 // 「同一个块里，这条 scrollTo 之前有没有 holdAnchor()」：切页还原的两步顺序必须写死在同一个块里
 // —— 先关滚动锚定再落位（中间可以夹 releaseScrollHold / 取最大滚动位置这类语句），否则锚定会在
 // 背后把 scrollY 补一截。旧写法是「块文本里 holdAnchor 的 indexOf 小于 scrollTo 的 indexOf」。
@@ -13698,9 +13718,10 @@ async function main () {
       '上限必须按可滚动高度算')
     const returns = findAll(helper, (n) => n.type === 'ReturnStatement' && n.argument)
     assert.ok(returns.some((n) => sameShapeOf(n.argument, 'Math.max(0, Math.min(top, max))')), '助手内必须有 Math.min 收口（不能算出文档外的目标）')
-    assert.ok(returns.some((n) => n.argument.type === 'Literal' && n.argument.value === null), '面板 hidden/rect 为 0 时必须返回 null')
-    assert.strictEqual(findAll(helper, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!(rect.height > 0)')).length, 1,
-      '面板 hidden/rect 为 0 时不得执行（!(rect.height > 0) 必须显式挡一道）')
+    // 宽度门必须自己 `return null`：只判「有个 if (!(rect.height > 0))」的话，把门掏空
+    // （改成 `{ /* noop */ }`）照样全绿，于是 hidden 面板会算出一个落点把页面拽走。
+    assert.strictEqual(findAll(helper, earlyExits('!(rect.height > 0)', null)).length, 1,
+      '面板 hidden/rect 为 0 时必须 `return null`（门要真的早退，不得只有条件）')
     for (const [name, file, eventKey, setCall] of [
       ['推送记录', 'MessagesPanel', 'page', 'setPage'],
       ['逐轮历史', 'RunHistoryPanel', 'current', 'setPageNo']
@@ -13710,7 +13731,8 @@ async function main () {
       const goPage = declInit(seg, 'goPage')
       const guards = findAll(goPage, (n) => n.type === 'IfStatement')
       assert.strictEqual(guards.length, 1, `${name}分页必须有且只有一个同页守卫`)
-      assert.ok(sameShapeOf(guards[0].test, `n === ${eventKey}`), `${name}目标页 = 当前页时不得置旗（旗子会悬挂）`)
+      assert.ok(sameShapeOf(guards[0].test, `n === ${eventKey}`) && guards[0].consequent.type === 'ReturnStatement',
+        `${name}目标页 = 当前页时不得置旗（必须先判 n === ${eventKey} 并当场 return；掏空的守卫等于没守卫）`)
       assert.strictEqual(callSites(goPage, 'armLand').length, 1, `${name}分页必须经 armLand 落点`)
       assert.deepStrictEqual(callSites(goPage, setCall).map((call) => callArgLabels(call).join(',')), ['n'], `${name}分页必须真的换页`)
       // 分页按钮只能走 goPage：直接 setPage 会绕过落点（四个按钮逐个判，不是数个数）。
@@ -13739,10 +13761,10 @@ async function main () {
       assert.ok(declaresVariable(seg, 'listRef') && declaresVariable(seg, 'landRef'), `${name}必须有列表 ref 与落点旗`)
       // 「只在置旗后落点」的门必须在调用之前：删掉它，每次 data/loading 变化都会把页面拽回列表顶。
       const landStmts = land.arguments[0].body.body
-      const gateAt = landStmts.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!landRef.current'))
+      const gateAt = landStmts.findIndex(earlyExits('!landRef.current'))
       const landCallAt = landStmts.findIndex((stmt) => callSites(stmt, 'listLandTarget').length > 0)
-      assert.strictEqual(landStmts.filter((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!landRef.current')).length, 1,
-        `${name}落点 effect 必须有且只有一道「未置旗即返回」的门（!landRef.current）`)
+      assert.strictEqual(landStmts.filter(earlyExits('!landRef.current')).length, 1,
+        `${name}落点 effect 必须有且只有一道「未置旗即返回」的门（!landRef.current 之后必须当场 return）`)
       assert.ok(gateAt > -1 && landCallAt > -1 && gateAt < landCallAt,
         `${name}落点门必须在 listLandTarget 之前（未置旗不得搬滚动位置）`)
       // 裸置旗只允许出现在 armLand 内：其余路径一律调用 armLand。
@@ -13757,8 +13779,8 @@ async function main () {
       assert.strictEqual(callSites(armLand, 'stickyPad').length, 1, `${name}门必须按 .tabs 实测高度算（与 listLandTarget 同口径）`)
       assert.strictEqual(findAll(armLand, (n) => sameShapeOf(n, 'rect.top + window.scrollY - stickyPad()')).length, 1,
         `${name}门必须用同一份 stickyPad 口径`)
-      assert.strictEqual(findAll(armLand, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!(rect.height > 0)')).length, 1,
-        `${name}面板隐藏/rect 为 0 时不得置旗`)
+      assert.strictEqual(findAll(armLand, earlyExits('!(rect.height > 0)')).length, 1,
+        `${name}面板隐藏/rect 为 0 时不得置旗（门必须真的早退）`)
     }
     // 推送记录：落点 effect 的依赖必须完整（漏 days ⇒ 第 1 页改时间范围不落；漏 loading ⇒ 未回就消费旗子）。
     const msg = markup.functionNodeOf(pagesModel, 'MessagesPanel')
@@ -13768,8 +13790,8 @@ async function main () {
       ['data', 'loading', 'err', 'settleTick', 'page', 'size', 'cate', 'days', 'query'],
       '推送记录落点依赖必须完整（data/loading/err/settleTick/page/size/cate/days/query）')
     // 响应未回时必须保留旗子（跨过 loading）。
-    assert.strictEqual(findAll(msgEffect.arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'loading')).length, 1,
-      '响应未回时必须保留旗子（跨过 loading）')
+    assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('loading')).length, 1,
+      '响应未回时必须保留旗子（跨过 loading，且必须真的 return）')
     const settleGuards = findAll(msgEffect.arguments[0], (n) => n.type === 'IfStatement' &&
       findAll(n.test, (m) => sameShapeOf(m, 'data === armedDataRef.current')).length === 1)
     assert.strictEqual(settleGuards.length, 1, '必须等这次响应落地（data 换过）再落点')
@@ -13779,7 +13801,7 @@ async function main () {
     const msgStmts = msgEffect.arguments[0].body.body
     const clearAt = msgStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
       stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current')
-    const nullAt = msgStmts.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'y === null'))
+    const nullAt = msgStmts.findIndex(earlyExits('y === null'))
     assert.ok(clearAt > -1 && nullAt > -1 && clearAt < nullAt, '消费即清旗：listLandTarget 返回 null 时不得重试')
     // 逐轮历史同样：清旗在 y === null 之前。
     const hist = markup.functionNodeOf(pagesModel, 'RunHistoryPanel')
@@ -13788,7 +13810,7 @@ async function main () {
     const histStmts = histEffect.arguments[0].body.body
     const hClearAt = histStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
       stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current')
-    const hNullAt = histStmts.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'y === null'))
+    const hNullAt = histStmts.findIndex(earlyExits('y === null'))
     assert.ok(hClearAt > -1 && hNullAt > -1 && hClearAt < hNullAt, '逐轮历史消费即清旗：返回 null 不重试')
     // 旗只由主动路径置：纯 refreshNow / refresh() 不搬滚动位置。
     const refreshNow = findFirst(msg, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refreshNow')
@@ -13827,8 +13849,8 @@ async function main () {
     // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
     const changeMode = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeMode')
     assert.ok(changeMode, '必须有 changeMode')
-    const modeGuards = findAll(changeMode, (n) => n.type === 'IfStatement' && n.test).map((n) => exprLabel(n.test))
-    assert.ok(modeGuards.includes('m === mode'), '已选中的 chip 不得再置旗（必须先判 m === mode）')
+    assert.strictEqual(findAll(changeMode, earlyExits('m === mode')).length, 1,
+      '已选中的 chip 不得再置旗（必须先判 m === mode 并早退）')
     // chip 的 class 是拼出来的（'log-chip' + 选中态），按 role=group 的容器 + 按钮定位，不按 class 找。
     const chipGroup = elementsInFunction(pagesModel, 'RunHistoryPanel')
       .find((el) => markup.attrText(el, 'aria-label') === '逐轮筛选')
@@ -13846,12 +13868,11 @@ async function main () {
       !ancestorsOf(hist, n).some((node) => node.type === 'VariableDeclarator' && node.id.name === 'armLand')).length, 0,
     'chip 不得裸置旗（置旗只有 armLand 一条路径，各档位都要带值守卫）')
     const changeDay = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeDay')
-    assert.ok(changeDay && findAll(changeDay, (n) => n.type === 'IfStatement' &&
-      sameShapeOf(n.test, 'v.from === runRange.from && v.to === runRange.to')).length === 1,
-    '区间没变不得置旗（值守卫必须在 armLand 之前）')
+    assert.ok(changeDay && findAll(changeDay, earlyExits('v.from === runRange.from && v.to === runRange.to')).length === 1,
+      '区间没变不得置旗（值守卫必须当场 return，且必须在 armLand 之前）')
     const changeSize = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeSize')
-    assert.ok(changeSize && findAll(changeSize, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'n === size')).length === 1,
-      '每页条数没变不得置旗')
+    assert.ok(changeSize && findAll(changeSize, earlyExits('n === size')).length === 1,
+      '每页条数没变不得置旗（值守卫必须当场 return）')
     // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点）。
     assert.strictEqual(findAll(msg, (n) => n.type === 'MemberExpression' && memberPath(n) === 'document.activeElement').length, 0,
       '搜索落点不得再看 activeElement（那道门让主路径不可达）')
@@ -13942,13 +13963,15 @@ async function main () {
     const refreshNow = findFirst(msg, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refreshNow')
     const wordGuard = findAll(refreshNow, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'q !== query'))[0]
     assert.ok(wordGuard, 'refreshNow 必须先判「搜索词真的变了」（q !== query）')
+    assert.ok(blockEndsWithReturn(wordGuard.consequent),
+      'refreshNow 词变化分支必须以 return 收尾（否则 armLand 之后会接着用旧词再刷一次）')
     assert.deepStrictEqual(wordGuard.consequent.body.filter((stmt) => stmt.type === 'ExpressionStatement')
       .map((stmt) => exprLabel(stmt.expression)),
     ['armLand()', 'setQuery()', 'setPage()'],
     '词变化时必须先置落点旗、改词、回第 1 页（顺序不能换）')
     // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
-    assert.strictEqual(findAll(effect.arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'userMovedRef.current')).length, 1,
-      '消费前必须检测用户是否自己滚走')
+    assert.strictEqual(findAll(effect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
+      '消费前必须检测用户是否自己滚走（门必须真的 return）')
     for (const [name, panel] of [['推送记录', msg], ['逐轮历史', markup.functionNodeOf(pagesModel, 'RunHistoryPanel')]]) {
       assert.deepStrictEqual(callSites(panel, 'useLandScrollCancel').map((call) => callArgLabels(call).join(',')),
         ['landRef,userMovedRef'], `${name}必须接入用户滚动取消 hook（同一个）`)
@@ -13970,8 +13993,8 @@ async function main () {
     assert.deepStrictEqual(['asyncLandRef', 'sawLoadingRef'].filter((name) =>
       findAll(histEffect.arguments[0], (n) => n.type === 'Identifier' && n.name === name).length > 0), [],
     '落点不得再等「重拉结算」：切档已原子化')
-    assert.strictEqual(findAll(histEffect.arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'userMovedRef.current')).length, 1,
-      '逐轮历史也要防用户自己滚走')
+    assert.strictEqual(findAll(histEffect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
+      '逐轮历史也要防用户自己滚走（门必须真的 return）')
     // 空结果时 .runs-scroll 也必须挂载（listRef 不能丢）：容器只受 status 门约束。
     const runsTpls = templateIn(hist, 'class="runs-scroll"')
     assert.strictEqual(runsTpls.length, 1, '逐轮历史必须有 .runs-scroll 容器')
@@ -14473,8 +14496,12 @@ async function main () {
     const retryTimer = findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.setInterval' &&
       callSites(n.arguments[0], 'pushDraftNow').length === 1 && exprLabel(n.arguments[1]) === '10000')
     assert.strictEqual(retryTimer.length, 1, '服务器上传失败后必须定期重试（每 10 秒一次）')
-    assert.strictEqual(findAll(retryTimer[0].arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'dirtyRef.current')).length, 1,
-      '10 秒重试必须只在脏时才补推（否则保存/放弃后又被 PUT 回服务器）')
+    // 判据必须落在「push 在门内」：另一条判据只要求回调里有 1 个 if (dirtyRef.current)，
+    // 把 push 挪到门外（`if (dirtyRef.current) saveDraftNow(); pushDraftNow()…`）PUT 就变无条件 ——
+    // 正是这条红线要防的「保存/放弃后又被 PUT 回服务器」，而旧判据全绿。
+    assert.strictEqual(findAll(retryTimer[0].arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'dirtyRef.current') &&
+      callSites(n.consequent, 'pushDraftNow').length === 1).length, 1,
+    '10 秒重试必须只在脏时才补推（pushDraftNow 必须在 if (dirtyRef.current) 门内，否则保存/放弃后又被 PUT 回服务器）')
     assert.strictEqual(callSites(panel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"online"').length, 1,
       '离线回来后要补推一次（online）')
     // 用户可见：恢复提示与「草稿已自动保存」。

@@ -2335,7 +2335,7 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **④ 10 秒重试定时器必须有脏标记门**：`window.setInterval(…, 10000)` 的回调里 `if (dirtyRef.current)` 恰好 1 条；去掉后保存/放弃过的草稿 10 秒后又被 PUT 回服务器。
   - **⑤ 逐轮历史 `refresh` 补「真的重拉」**：`callSites(refresh, 'load').length === 1`；清空函数体后刷新按钮变空操作也全绿。
   - **⑥ 版本注释红线回到「所有注释 token」**：`commentTextsOf` 改用 acorn `onComment` 收集行注释 + 块注释（含代码行 `//` 之后的部分），字符串 / 正则字面量不计；CSS 仍按 `/* … */` 切。
-- **账目（最终 HEAD 实量，可复现）**：C6 段 16 块 `assert.` 调用 **386**（acorn 计数；本轮 381 → 386，新增 5 个调用点），四式分布 **式1 359 / 式2 22 / 式3 5 / 式4 0**（合计 386）；`git diff --numstat origin/main...HEAD -- test_console.js` = **1202 / 514**，`git diff --shortstat origin/main...HEAD` = **6 files changed, 1247 insertions(+), 520 deletions(-)**；C6 段新增测试侧助手 **8 个**：`cssRuleListOf` / `ancestorsOf` / `templateIn` / `elementsOfTemplate` / `renderGuardsOf` / `conditionalAttrOf` / `evalPureFunctions` / `commentTextsOf`（`cssDeclListOf` 全仓不存在，已从账目删除），并 `import` `declaresVariable`。
+- **账目（v3.501 提交 `110558f` 实量，可复现；下一版 v3.502 改判据后数字另计）**：C6 段 16 块 `assert.` 调用 **386**（acorn 计数；本轮 381 → 386，新增 5 个调用点），四式分布 **式1 359 / 式2 22 / 式3 5 / 式4 0**（合计 386）；`git diff --numstat origin/main...HEAD -- test_console.js` = **1202 / 514**，`git diff --shortstat origin/main...HEAD` = **6 files changed, 1247 insertions(+), 520 deletions(-)**；C6 段新增测试侧助手 **8 个**：`cssRuleListOf` / `ancestorsOf` / `templateIn` / `elementsOfTemplate` / `renderGuardsOf` / `conditionalAttrOf` / `evalPureFunctions` / `commentTextsOf`（`cssDeclListOf` 全仓不存在，已从账目删除），并 `import` `declaresVariable`。
 - **probe 既有遗留红点坐标（HEAD 实测）**：块起点 `test_console.js:14501`、失败断言 `:14508`（`结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）`，属下一段 C7，与本包编辑区无关）。
 - **反向验证（一次性副本 `C6r1fix-1…6`：`git archive HEAD` 解出 + 拷入本轮 `test_console.js` + `node_modules` 软链；生产文件改前存 `.pristine`、改后 `cmp` 逐字节还原，6 条全部 `identical`，还原后复跑 `376 / 0` exit 0）**：
   - D1 `app.css:1498` `.msg-search, .log-search { … }` 只留 `.msg-search` → `375 / 1`，红点 `❌ 结构红线: v3.317 小项…: 手机输入框 .log-search 必须 16px（防 iOS 聚焦缩放）`。
@@ -2343,6 +2343,26 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - D3 `pages.js:3142` 0 命中外层 `class="log-empty"` → `log-empty-x` → `375 / 1`，红点 `…日志框定高…: 0 命中的外层容器必须是 .log-empty…`。
   - D4 `pages.js:4715` 去掉 `if (dirtyRef.current) ` → `375 / 1`，红点 `…过滤草稿自动保存/恢复…: 10 秒重试必须只在脏时才补推…`。
   - D5 `pages.js:531` `refresh` 去掉 `load().catch(() => {})` → `375 / 1`，红点 `…分页/搜索落点…: 逐轮历史纯刷新仍要真的重拉当前页`。
-  - D6 `app.js:33` 行尾追加 ` // v3.501` → `375 / 1`，红点 `…落点失败清旗…: app.js 注释不得写 v3.501…`；阳性对照：同一文件插入 `const NOT_A_COMMENT = '// v3.501'`（字符串字面量）→ `376 / 0` 不误红。
+  - D6 `app.js:33` 行尾追加 ` // v3.503`（= bump 后 3.502.0 的下一版；r1 记的 `v3.501` 在 bump 到 3.501.0 后已与「当前版」撞车，按记录复跑是绿的）→ `375 / 1`，红点 `…落点失败清旗…: app.js 注释不得写 v3.503…`；阳性对照：同一文件插入 `const NOT_A_COMMENT = '// v3.503'`（字符串字面量，不在注释里）→ `376 / 0` 不误红。
 - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0；`node scripts/check-source-text-asserts.js` → exit 0，`基线 total=915（35 个文件），实测 total=915`，`test_console.js` 544（未增）；`node scripts/probe-format-coupling.js test_console.js` → exit 1，首红同上（块 `14501` / 断言 `14508`，既有 deferral）；`node check-version.js` → `✅ 版本四方一致：v3.501`；`npx standard test_console.js xbk_function_v3.js` → exit 0。
 - **版本**：3.500.0 → **3.501.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 顶层与 `packages[""]` 两处）。
+
+## v3.502
+
+- **assertshape C6 第 2 轮评审修复：3 条 must_fix（守卫可被「空心化」/ 10s 重试的 push 未判在门内 / D6 反向验证记录随 bump 失效）——只改 `test_console.js`、本文件与版本四方，`scripts/console-assets/**` 生产逻辑一行未改**：
+  - **① 14 处 `if` 门补「consequent 真的早退」**：新增测试侧助手 `earlyExits(testShape, returnValue)`（consequent 必须是 `return`，或一段**以 `return` 收尾**的块；需要时钉住返回的字面量），替换掉原来只判 `if (test)` 存在 / 语句下标的写法。覆盖 `!landRef.current` 旗门（两个面板）、`listLandTarget` 的 `!(rect.height > 0)` → `return null`（钉 `argument.value === null`）、`armLand` 的同一条宽度门、goPage 同页守卫、`if (loading) return`、`if (y === null) return`（两个面板）、`changeMode` 的 `m === mode`、`changeDay` / `changeSize` 值守卫、两个面板的 `userMovedRef.current` 守卫；`refreshNow` 的 `q !== query` 门用 `blockEndsWithReturn` 判「块以 return 收尾」。把任一门掏空成 `if (…) { /* noop */ }` 当场变红（r1 全绿）。
+  - **② 10 秒重试的 push 必须落在门内**：r1 拆成两条互不相干的判据（回调里有 1 次 `pushDraftNow` + 另有 1 个 `if (dirtyRef.current)`），于是 `if (dirtyRef.current) saveDraftNow(); pushDraftNow().catch(() => {})` 这种解耦形态下 PUT 变无条件而判据全绿。现改为一条：`callSites(ifNode.consequent, 'pushDraftNow').length === 1`（门内恰好一次）。
+  - **③ D6 反向验证记录按 bump 后的下一版重算**：判定值由 `package.json` 推（`nextVer = v${major}.${minor + 1}`），r1 是在 3.500.0 上量的 `v3.501`，bump 到 3.501.0 后 `v3.501` 成了当前版 ⇒ 记录不可复现（照记录做破坏是绿的）。记录改为 `v3.503`（= 本轮 3.502.0 的下一版），破坏与阳性对照都按新字面量复跑。
+- **反向验证（一次性副本 `C6r2fix-1`：`git archive HEAD` 解出 + 拷入本轮 `test_console.js` 与 bump 后的 `package.json` + `node_modules` 软链；生产文件改前存 `.pristine`、跑完逐字节 `cmp` 还原，10 条全部 identical；还原后复跑 `376 / 0` exit 0）**：
+  - D1 `pages.js:368` 宽度门 `return null` → `return` → `375 / 1`，红点 `…分页/搜索落点…: 面板 hidden/rect 为 0 时必须 return null（门要真的早退，不得只有条件）`。
+  - D2 `pages.js:601/1863` 两行 `if (!landRef.current) return` 掏空成 `{ /* noop */ }` → `375 / 1`，红点 `…分页/搜索落点…: 推送记录落点 effect 必须有且只有一道「未置旗即返回」的门（!landRef.current 之后必须当场 return）`。
+  - D3 `pages.js:1864` 的 `if (loading) return` 掏空成 `{ /* noop */ }` → `375 / 1`，红点 `…分页/搜索落点…: 响应未回时必须保留旗子（跨过 loading，且必须真的 return）`；605/1864 同时掏空 → `374 / 2`（另一条是 C7-018 `加载在飞时必须保留旗子`，同一道门的下游）。
+  - D4 `pages.js:4715` 定时器改成 `{ pushDraftNow().catch(() => {}); if (dirtyRef.current) {} }`（push 在门外）→ `375 / 1`，红点 `…过滤草稿自动保存/恢复…: 10 秒重试必须只在脏时才补推（pushDraftNow 必须在 if (dirtyRef.current) 门内…）`。
+  - D5 同处解耦形态 `{ if (dirtyRef.current) saveDraftNow(); pushDraftNow().catch(() => {}) }`（= must_fix ② 报的形态）→ `375 / 1`，红点与 D4 同一条。
+  - D6 `pages.js:611/1874` 的 `if (y === null) return` 掏空 → `374 / 2`，红点 `…消费即清旗：listLandTarget 返回 null 时不得重试`（另一条是 C7-018 `消费即清旗：返回 null 不重试`）。
+  - D7 `app.js:33` 行尾追加 ` // v3.503`（= 3.502.0 的下一版）→ `375 / 1`，红点 `…落点失败清旗…: app.js 注释不得写 v3.503…`。
+  - D8 阳性对照①：同一行尾追加 ` // v3.502`（当前版，也是 r1 记录里的字面量）→ `376 / 0`，实测证明 r1 的 D6 记录在 bump 后确实失效。
+  - D9 阳性对照②：插入 `const NOT_A_COMMENT = '// v3.503'`（字符串字面量，不在注释里）→ `376 / 0` 不误红。
+- **账目（本提交 vs `origin/main` 实量，可复现）**：`git diff --numstat origin/main...HEAD -- test_console.js` = **1229 / 514**，`git diff --shortstat origin/main...HEAD` = **6 files changed, 1294 insertions(+), 520 deletions(-)**；`test_console.js` 的 `assert.` 调用点 **4365 → 4365**（本轮是替换判据而非新增：宽度门/值守卫共用 `earlyExits`，refreshNow 补 1 条、helper 的「任意 return null」并进宽度门后删 1 条，净 0）。
+- **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0；`node scripts/check-source-text-asserts.js` → exit 0，`基线 total=915（35 个文件），实测 total=915`，`test_console.js` 544（未增）；`node scripts/probe-format-coupling.js test_console.js` → exit 1，首红在 C7 块（块 `14528` / 断言 `14535`，既有遗留 deferral，未改生产凑绿）；`node check-version.js` → `✅ 版本四方一致：v3.502`；`npx standard test_console.js` → exit 0；`node scripts/check-doc-lines.js` → exit 0（7 个文件，最长 1195 字符）。
+- **版本**：3.501.0 → **3.502.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 顶层与 `packages[""]` 两处）。
