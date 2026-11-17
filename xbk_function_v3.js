@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.494 — C4 第 1 轮评审修复：4 条「换成 AST 后失去咬合力」的判据（按钮插值类名恒真 / CategoryPicker style 条件判不出 / scrollBehavior 实参不判 / 嵌套 ConfirmDialog 负面扫描只扫外层）逐条恢复，另修账目口径——98 条清单项 = 式1 92 + 式2 6（式3 0）；另删 1 条清单外的自检断言 tickAutoBody.length > 500，故式4 删除合计 1 条；白名单 test_console.js 1026、total 1397（本轮 0 新增）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.499 — assertshape C5 第 4 轮：1 条 must_fix 把「结算」断言钉到被调函数（TriggerBar 的 live 必须由 triggerResultLine 算出、再与被调实参 lastTrigger/lastRun 一起判，换成只吃一个 run 的 runOutcome 即红），反向破坏只红 1 条、纯格式重排不误红；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
