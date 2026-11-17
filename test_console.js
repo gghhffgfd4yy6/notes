@@ -294,26 +294,37 @@ function evalPureFunctions (file, names, extra = {}) {
   const context = vm.createContext({ Date, Math, Number, String, Object, Array, JSON, ...extra })
   return vm.runInContext(`${sources.join('\n')}\n;({ ${names.join(', ')} })`, context)
 }
-// 文件里的注释行（判「注释里提前写了下一版版本号」这类事）：只收整行注释，
-// 不碰字符串字面量（`'// x'` 不会被当成注释），也不做整文件正则。
+// 文件里的注释 token（判「注释里提前写了下一版版本号」这类事）：JS 用 acorn 的 onComment
+// 收集**所有**注释——行尾 `code // …` 的后半段也算，字符串 / 正则字面量里的 `//` 不算
+// （逐行剥 `//` 会把 `'https://x'` 当成注释起点，也会漏掉代码行尾的注释；整文件正则同病）。
+// CSS 没有行注释，按 /* … */ 取。
 function commentTextsOf (file) {
-  const out = []
-  let inBlock = false
-  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-    const text = line.trim()
-    if (inBlock) {
-      out.push(text)
-      if (text.includes('*/')) inBlock = false
-      continue
-    }
-    if (text.startsWith('/*')) {
-      out.push(text)
-      if (!text.includes('*/')) inBlock = true
-      continue
-    }
-    if (text.startsWith('//')) out.push(text)
+  const text = fs.readFileSync(file, 'utf8')
+  // CSS 没有行注释：按 /* … */ 切（split/push 不是文本比对，闸门不把它记成源码文本断言）。
+  if (!file.endsWith('.js')) {
+    const out = []
+    for (const chunk of text.split('/*').slice(1)) out.push(chunk.split('*/')[0])
+    return out
   }
-  return out
+  const parse = (sourceType) => {
+    const out = []
+    acorn.parse(text, {
+      ecmaVersion: 'latest',
+      sourceType,
+      allowHashBang: true,
+      onComment: (block, body) => out.push(body)
+    })
+    return out
+  }
+  try {
+    return parse('script') // 前端资产是 ESM，source_model 也是先 script 再 module
+  } catch (scriptErr) {
+    try {
+      return parse('module')
+    } catch (moduleErr) {
+      throw new Error(`commentTextsOf: ${path.basename(file)} 无法解析（script: ${scriptErr.message}；module: ${moduleErr.message}）`)
+    }
+  }
 }
 
 // 属性表达式（或任意表达式）的「拼装零件」：字符串字面量（含模板静态段）与标识符引用。
@@ -13461,10 +13472,16 @@ async function main () {
     // 点击区 ≥44px 但视觉字号不变（只抬行盒）。
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.msg-link', 'min-height'), ['44px'], '原文链接点击区 ≥44px')
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.msg-link', 'font-size'), ['var(--fs-xs)'], '视觉字号不变（只抬行盒）')
-    const phoneSearch = cssRulesFor(cssRules, '.msg-search').filter((rule) => rule.at.includes('@media (max-width: 640px)'))
-    assert.deepStrictEqual(phoneSearch.map((rule) => rule.decls.get('font-size')), ['16px'],
-      '手机输入框必须 16px（防 iOS 聚焦缩放）')
-    assert.deepStrictEqual(phoneSearch.map((rule) => rule.decls.get('min-height')), ['40px'], '手机输入框高度 ≥40px')
+    // 搜索框有两个（消息页 .msg-search / 日志页 .log-search）：只判其中一个，另一个退回
+    // <16px 时 iOS 聚焦照样整页缩放。两条选择器各判一遍，共享同一条媒体规则也能过。
+    const phoneSearchOf = (selector) => cssRulesFor(cssRules, selector)
+      .filter((rule) => rule.at.includes('@media (max-width: 640px)'))
+    for (const selector of ['.msg-search', '.log-search']) {
+      assert.deepStrictEqual(phoneSearchOf(selector).map((rule) => rule.decls.get('font-size')), ['16px'],
+        `手机输入框 ${selector} 必须 16px（防 iOS 聚焦缩放）`)
+      assert.deepStrictEqual(phoneSearchOf(selector).map((rule) => rule.decls.get('min-height')), ['40px'],
+        `手机输入框 ${selector} 高度 ≥40px`)
+    }
   })
 
   // ── 系统信息首帧同形占位（7 行无条件渲染）────────────────────────────────────
@@ -13540,6 +13557,9 @@ async function main () {
     // 0 命中按区间筛完的 ranged 判定（不是 filtered），且仍用 .log-empty。
     const emptyTpls = templateIn(logsFn, 'class="log-empty-text"')
     assert.strictEqual(emptyTpls.length, 1, '0 命中必须也用 .log-empty（带 log-empty-text）')
+    const emptyEl = markup.markupOf(emptyTpls[0]).children.find((child) => child.type === 'element')
+    assert.ok(emptyEl && markup.hasClass(emptyEl, 'log-empty'),
+      '0 命中的外层容器必须是 .log-empty（520px 定高在这个盒子上，换名会让日志框反向塌）')
     assert.deepStrictEqual(renderGuardsOf(logsFn, emptyTpls[0]), ['viewReady', 'ranged.length === 0'],
       '0 命中必须按区间筛完的 ranged 判定（换成 filtered 会让「筛完为空」与「日志为空」混在一起）')
   })
@@ -13717,6 +13737,14 @@ async function main () {
       assert.deepStrictEqual(callSites(land.arguments[0], 'listLandTarget').map((call) => callArgLabels(call).join(',')), ['listRef.current'],
         `${name}落点必须落在列表容器上（listRef.current）`)
       assert.ok(declaresVariable(seg, 'listRef') && declaresVariable(seg, 'landRef'), `${name}必须有列表 ref 与落点旗`)
+      // 「只在置旗后落点」的门必须在调用之前：删掉它，每次 data/loading 变化都会把页面拽回列表顶。
+      const landStmts = land.arguments[0].body.body
+      const gateAt = landStmts.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!landRef.current'))
+      const landCallAt = landStmts.findIndex((stmt) => callSites(stmt, 'listLandTarget').length > 0)
+      assert.strictEqual(landStmts.filter((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!landRef.current')).length, 1,
+        `${name}落点 effect 必须有且只有一道「未置旗即返回」的门（!landRef.current）`)
+      assert.ok(gateAt > -1 && landCallAt > -1 && gateAt < landCallAt,
+        `${name}落点门必须在 listLandTarget 之前（未置旗不得搬滚动位置）`)
       // 裸置旗只允许出现在 armLand 内：其余路径一律调用 armLand。
       const bareSet = findAll(seg, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'landRef.current' &&
         n.right.type === 'Literal' && n.right.value === true)
@@ -13772,6 +13800,7 @@ async function main () {
     assert.ok(histRefresh, '逐轮历史必须有 refresh')
     assert.strictEqual(findAll(histRefresh, (n) => n.type === 'Identifier' && n.name === 'landRef').length, 0,
       '逐轮历史刷新不得搬滚动位置')
+    assert.strictEqual(callSites(histRefresh, 'load').length, 1, '逐轮历史纯刷新仍要真的重拉当前页')
     // 主动路径逐个点名（含顺序）：armLand 必须是处理器里的第一条语句。按控件定位，不按名字猜。
     const msgEls = elementsInFunction(pagesModel, 'MessagesPanel')
     const handlerOf = (el, why) => {
@@ -14441,9 +14470,11 @@ async function main () {
     assert.strictEqual(callSites(serverTimer[0].arguments[0], 'pushDraftNow').length, 1,
       '服务器草稿定时器必须真的上传（只 setTimeout 不 push 等于没同步）')
     // 服务器写失败要定期重试（网络没断但服务器 502/超时时 online 事件永不触发）。
-    assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.setInterval' &&
-      callSites(n.arguments[0], 'pushDraftNow').length === 1 && exprLabel(n.arguments[1]) === '10000').length, 1,
-    '服务器上传失败后必须定期重试（每 10 秒一次）')
+    const retryTimer = findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.setInterval' &&
+      callSites(n.arguments[0], 'pushDraftNow').length === 1 && exprLabel(n.arguments[1]) === '10000')
+    assert.strictEqual(retryTimer.length, 1, '服务器上传失败后必须定期重试（每 10 秒一次）')
+    assert.strictEqual(findAll(retryTimer[0].arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'dirtyRef.current')).length, 1,
+      '10 秒重试必须只在脏时才补推（否则保存/放弃后又被 PUT 回服务器）')
     assert.strictEqual(callSites(panel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"online"').length, 1,
       '离线回来后要补推一次（online）')
     // 用户可见：恢复提示与「草稿已自动保存」。
