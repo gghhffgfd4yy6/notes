@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.491 — C3 r3：test_console.js 第 3 段 98 条源码文本断言改成 AST 结构断言 / 解析后字段断言（片段按「类型+运算符+标识符+字面量+子节点」逐字段比对，注释不参与、极性不丢），白名单 test_console.js 1517→1311、total 1888→1682；只动测试与版本四方，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.492 — C3 r1 评审修复：补回 6 条 must_fix 判据（CacheHealthPanel 的 paused 表达式形状 / 切页出口实参必须 next / 垫高后 holdAnchor() 紧跟 scrollTo(0, y) / 落位不得进 rAF 回调且早于任何 rAF / releaseAnchorSoon() 调用点 / 版本与说明），白名单 test_console.js 1311、total 1682 不变（新判据全读 AST）；只动测试与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

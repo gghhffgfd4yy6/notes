@@ -442,6 +442,12 @@ function precededByHoldAnchor (node, ancestors) {
   }
   return false
 }
+// 调用的实参标签（逐参数 exprLabel）：判「这次调用传的是哪个实参」，不是「调了几次」。
+// 只数次数的写法里 `setTab('overview')` / `prepareScroll(tab)` 照样全绿 —— 页签与滚动记忆
+// 会一起错位（assertshape C3 r1-B）。
+function callArgLabels (call) {
+  return call && Array.isArray(call.arguments) ? call.arguments.map((arg) => exprLabel(arg)) : null
+}
 // 运行日志摘要行（`2026-10-15 12:16:21 total=20 dedup=0 …`）→ { 字段: 值 }。
 // /api/logs 下发的是行文本，按 `k=v` 解析成字段再断值，比在整行里找 'total=20' 稳
 // （后者在 total=200 时同样命中）。
@@ -10349,6 +10355,10 @@ async function main () {
     assert.strictEqual(switchRenders.length, 1, '切页只走一次 renderTab')
     assert.ok(switchPrepares[0].start < switchRenders[0].start,
       '必须先 prepareScroll 再触发重渲染（重渲染收口在 renderTab，setTab 在它内部）')
+    // 实参必须是目标页签本身（r1-B）：只数调用次数的写法里 `prepareScroll(tab)` /
+    // `renderTab('overview')` 这类「换了实参」的破坏仍然全绿，而滚动记忆会记到别的页上。
+    assert.deepStrictEqual([callArgLabels(switchPrepares[0]), callArgLabels(switchRenders[0])], [['next'], ['next']],
+      '切页必须把目标页签 next 交给 prepareScroll / renderTab（传常量或换成 tab 都会记错页 / 垫错页）')
 
     const renderTab = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'renderTab')
@@ -10363,6 +10373,8 @@ async function main () {
     const renderSetTab = callSites(renderBody, 'setTab')
     assert.ok(renderShowSync.length === 1 && renderSetTab.length === 1 && renderShowSync[0].start < renderSetTab[0].start,
       '页签点击必须同步切到目标页缓存时间（重渲染出口里先换「数据截至」再换页）')
+    assert.deepStrictEqual([callArgLabels(renderShowSync[0]), callArgLabels(renderSetTab[0])], [['next'], ['next']],
+      '渲染出口的 showSyncFor / setTab 必须都吃同一个 next（写死页签会把「数据截至」钉在别的页）')
 
     // 滚动还原的 layout effect（唯一一条随 tab / logJump 重跑的）。
     const scrollEffect = callSites(app, 'useLayoutEffect').find((call) => {
@@ -10404,6 +10416,40 @@ async function main () {
       n.expression.type === 'CallExpression' && memberPath(n.expression.callee) === 'holdAnchor')
     assert.ok(holdAnchorStmt && holdAnchorStmt.start < clockStart.start,
       '垫高生效后必须先关锚定、再同步还原，最后才起 t0（顺序颠倒会先塌再跳）')
+    // 垫高已生效那一处的判据必须钉在**语句序列**上（r1-A）：这条 effect 里另有 logJump 分支与
+    // check() 里的 scrollTo(0, y)，只断「effect 某处有 window.scrollTo(0, y)」，把顶层这整段
+    // `holdAnchor(); window.scrollTo(0, y)` 删掉仍然全绿（实测 376/0）——落位判据等于没有。
+    // 顶层语句里「holdAnchor() 紧跟 window.scrollTo(0, y)」只有这一处（其余 holdAnchor 都在分支块内）。
+    const effectStatements = effectBody.body
+    assert.strictEqual(effectBody.type, 'BlockStatement', 'layout effect 必须是块体（判据按顶层语句序列）')
+    const callExprOf = (stmt) => stmt && stmt.type === 'ExpressionStatement' &&
+      stmt.expression && stmt.expression.type === 'CallExpression'
+      ? stmt.expression
+      : null
+    const topAnchorAt = effectStatements.findIndex((stmt) => {
+      const call = callExprOf(stmt)
+      return !!call && memberPath(call.callee) === 'holdAnchor'
+    })
+    const restoreCall = topAnchorAt >= 0 ? callExprOf(effectStatements[topAnchorAt + 1]) : null
+    const restoreLabels = restoreCall && memberPath(restoreCall.callee) === 'window.scrollTo'
+      ? callArgLabels(restoreCall).join(',')
+      : null
+    // 同步还原不得等 rAF（r1-B）：旧断言用「scrollTo 位置 < 首个 requestAnimationFrame」钉这件事，
+    // 新判据丢了这个子句 ⇒ 把还原包进 requestAnimationFrame(() => …) 仍然全绿（实测 376/0），
+    // 而等一帧的画法会先露出塌陷后的 0。两条一起判：①任何 scrollTo 都不得落在 rAF 回调里；
+    // ②还原点在 effect 内所有 rAF 调用之前（没有 rAF 时这一条自然成立，不把 rAF 兜底本身钉死）。
+    const rafCalls = findAll(effectBody, (n) => n.type === 'CallExpression' &&
+      memberPath(n.callee) === 'window.requestAnimationFrame')
+    assert.deepStrictEqual(findAll(effectBody, (n, ancestors) => n.type === 'CallExpression' &&
+      memberPath(n.callee) === 'window.scrollTo' &&
+      ancestors.some((a) => a.type === 'CallExpression' && memberPath(a.callee) === 'window.requestAnimationFrame'))
+      .map((n) => n.loc.start.line),
+    [], '切页落位不得包进 requestAnimationFrame 回调（等一帧 = 先露出塌陷后的 0）')
+    assert.ok(!restoreCall || rafCalls.length === 0 || restoreCall.start < rafCalls[0].start,
+      '同步还原必须早于 effect 里的任何 rAF 调用（等一帧的画法会先露出塌陷后的 0）')
+    assert.ok(topAnchorAt >= 0, '垫高生效后必须先关锚定（effect 顶层必须有 holdAnchor() 调用）')
+    assert.ok(restoreLabels === '0,y',
+      '垫高生效后必须紧跟一句同步还原 window.scrollTo(0, y)（删掉 / 挪走 / 换成别的落位都不算还原）')
     // 这条 effect 里每一处落位都必须是「上一句 holdAnchor()」（中间可夹 releaseScrollHold()）：
     // 逐处判顺序，而不是只看两处 block.indexOf 的大小关系。
     assert.deepStrictEqual(findAll(effectBody, (n, ancestors) => n.type === 'CallExpression' &&
@@ -10425,6 +10471,19 @@ async function main () {
     assert.ok(callSites(releaseAnchorSoon, 'window.setTimeout').some((call) =>
       call.arguments[1] && call.arguments[1].value === 1000),
     '锚定恢复窗口必须是 1s，不能立刻恢复')
+    // 「只关不恢复」也是回归（r1-A）：上面两条只证明 releaseAnchorSoon 的定义还在，
+    // 两处 `releaseAnchorSoon()` 调用全删掉仍然全绿 ⇒ 切页后 overflow-anchor 永远是 none。
+    // 判据分两层：①App 里至少还有一处调用；②这处调用落在切页路径上
+    // （prepareScroll → releaseScrollHold；只留 effect 里已保活分支那一处不足以兜住首访路径）。
+    const releaseAnchorCalls = callSites(app, 'releaseAnchorSoon')
+    assert.ok(releaseAnchorCalls.length >= 1,
+      '切页后必须还原 scroll anchoring：releaseAnchorSoon() 至少仍有一处调用（定义还在不算）')
+    const releaseScrollHold = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'releaseScrollHold')
+    assert.ok(releaseScrollHold, 'App 必须有 releaseScrollHold（切页统一释放垫高 / 恢复锚定）')
+    assert.ok(callSites(releaseScrollHold, 'releaseAnchorSoon').length +
+      callSites(prepareScroll, 'releaseAnchorSoon').length >= 1,
+    '切页路径（prepareScroll → releaseScrollHold）必须调 releaseAnchorSoon，否则首访切页后锚定永远关着')
     assertShapeIn(effectBody, 'hold.timer = window.setTimeout(check, 9000)',
       '加载失败必须有 9s 兜底释放，不能永久垫高')
     const holdAnchor = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
@@ -10476,6 +10535,8 @@ async function main () {
     const hashRenders = callSites(onHash, 'renderTabRef.current')
     assert.ok(hashPrepares.length === 1 && hashRenders.length === 1 && hashPrepares[0].start < hashRenders[0].start,
       '后退/前进必须走同一个渲染出口（showSyncFor / markVisited / setTab 收口在 renderTab，不得各写一份）')
+    assert.deepStrictEqual([callArgLabels(hashPrepares[0]), callArgLabels(hashRenders[0])], [['next'], ['next']],
+      '后退/前进必须把 onHash 解析出的 next 交给 prepareScrollRef / renderTabRef（写死页签会跳到别的页）')
 
     const openLog = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'openLog')
@@ -10712,6 +10773,17 @@ async function main () {
     assertShapeIn(ui, "autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0", '日志页隐藏后日志轮询必须停')
     assertShapeIn(ui, "if (!autoOn || tab !== 'overview') return undefined", '概览隐藏后倒计时时钟必须停')
     assertShapeIn(pages, 'if (openId === null || !active) return undefined', '隐藏页的运行详情必须断开 SSE/轮询')
+    // 缓存健康的分钟轮询也必须随「概览隐藏」停（r1-A）：判据是 paused 的**表达式形状**，不是
+    // 「App 传了这个 prop」——写死 false / 只看 autoRefresh 都会让概览隐藏后仍每分钟拉
+    // /api/cache-health。旧断言以 `paused=$` 文本为锚，换成 AST 后整条消失（HEAD 上删掉这个
+    // prop 仍 376/0），这里补回结构判据；active 一并判，切回概览才有静默补拉。
+    const cacheHealthEls = templateRootsOf(app).flatMap((root) => markup.allElements(root))
+      .filter((el) => el.name === 'CacheHealthPanel')
+    assert.strictEqual(cacheHealthEls.length, 1, 'App 必须恰好渲染一处 CacheHealthPanel')
+    assert.ok(sameShapeOf(markup.attrExpr(cacheHealthEls[0], 'paused'), "!autoRefresh || tab !== 'overview'"),
+      '概览隐藏（或自动刷新关闭）时必须暂停缓存健康轮询（paused 不能写死，也不能只判其中一半）')
+    assert.ok(sameShapeOf(markup.attrExpr(cacheHealthEls[0], 'active'), "tab === 'overview'"),
+      '缓存健康必须拿到 active=overview（切回概览时静默补拉一次）')
     // 隐藏页不只不轮询，也不该生成工具条 DOM（L4）：保活面板切走后，date-btn / auto-run-row
     // 会以 hidden 副本留在别的页面里，点击区与可检索文本都被污染。
     const gatedTemplates = (name) => consoleAssetModels().flatMap((model) => findAll(model, (node) =>
