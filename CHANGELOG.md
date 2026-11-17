@@ -2184,3 +2184,19 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - `node scripts/probe-format-coupling.js test_console.js` → **exit 1**，`format-coupled 1 / format-clean 0`（扰动 75 个生产 JS，`还原校验：git status --short 与运行前一致（0 项）`＝提交后重跑、工作树干净）。唯一红点是既有遗留、与 C3 无关：`↳ ❌ 结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）: 进入/退出降级都必须 persistAuto()，否则字段存在但永不写盘`——该用例排在本轮编辑的两个用例（`结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新` 与 `结构红线: 页签保活…`）之后，说明 6 条新判据在**整份生产源码重排后**仍全部通过（0 条新增 coupled），与 v3.491 记录的首红逐字相同。
   - `npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.492`；`node scripts/check-doc-lines.js` → 通过。
   - **版本**：3.491.0 → **3.492.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
+
+## v3.493
+
+- **assertshape C4：`test_console.js` 第 4 段（原 9250–9978）98 条源码文本断言全部换成 AST / 解析后字段断言；只动 `test_console.js`、白名单、本文件与版本四方，生产逻辑一行未改**：
+  - **分布**：式1（AST 结构断言，`loadModel` / `findAll` / `callSites` / `sameShapeOf` / `markup` 模板元素）**92 条**；式2（CSS 解析成规则后断言字段，`cssRulesOf` / `cssRulesFor` / `cssDeclValuesOf`）**6 条**（`/* 分类筛选：手机端贴底弹层` 注释锚、`::view-transition-old/new(root)` ×2、`@media (prefers-reduced-motion: reduce)`、`.badge-ok::before`）；式3（行为）**0 条**（本段无可行为化的判据）；式4（删除）**1 条**（`tickAutoBody.length > 500` 自检：它只服务于已被换掉的三条正文断言，`tickAutoBody` 全文再无第二个引用；它守护的「tickAuto 必须可定位」已由同块 `assert.ok(tickAuto, …)` 承担，故删掉后任何破坏仍会由 AST 判据变红——实测删除前后均 `376 / 0`）。
+  - **被替换的坏形态**：`src.includes('…')`、`src.slice(src.indexOf('function X'), src.indexOf('function Y'))`、`functionBodyOf` + 正则、`(body.match(/persistAuto\(\)/g) || []).length`。这些都在读**排版**：格式化器把 `(` 前后插空格、把 `if (x) {` 折行后锚点即 miss（`persistAuto ( )` 匹配 0 即此类）。现在定位走 AST 节点，判据走节点形状 / 调用点 / 模板属性表达式。
+  - **重点条目**：`persistAuto` 由「正文正则计数 ≥ 2」改为 `callSites(tickAuto, 'persistAuto').length >= 2`，失败时打印实际处数；`AUTO_MAX_MS` / `AUTO_MAX_FAILS` 等负判据改判 AST 标识符与字面量（注释里的同名字串不再误报）；`TriggerBar` / `MiniSelect` / `CategoryPicker` / `RunsPanel` / `BackToTop` / `Hint` / `Card` / `LeaveGuardDialog` 的类名契约改判模板元素与属性表达式（`markup.hasClass` / `attrExpr` / `sameShapeOf`），不再切七模块拼接文本。
+  - **白名单（只减不增）**：`total 1682 → 1397`，`test_console.js 1311 → 1026`（本段 98 条按块替换，同块内另有未逐条登记的文本断言一并换掉，故实降 285）；`node scripts/check-source-text-asserts.js` exit 0，实测 `基线 total=1397（35 个文件），实测 total=1397`。
+  - **反向验证（4 个破坏，覆盖式1/式2/式3；破坏只在生产文件，还原后 `git status --short` 对被测文件为空）**：
+    - 式1（调用点计数）删掉 `scripts/console.js` tickAuto 里第二处 `persistAuto()` → `❌ 结构红线: 自动正式运行…：进入/退出降级都必须 persistAuto()，否则字段存在但永不写盘（实际 1 处）`，`375 / 1`；还原后 `376 / 0`。
+    - 式2（模板元素）`pages.js` 两处 `class="runs-scroll"` → `class="runs-scrollx"` → `❌ 结构红线: 控制台 UX 稳定性…：触发历史表必须包 .runs-scroll（带 ref 供行入场）`，`373 / 3`；还原后 `376 / 0`。
+    - 式2（CSS 解析字段）`app.css` `.mini-pop { position: fixed }` → `absolute` → `❌ 结构红线: MiniSelect…：.mini-pop 必须 fixed 定位（与 strategy:fixed 对应） (actual=false expected=true)`，`375 / 1`；还原后 `376 / 0`。
+    - 式3（纯函数行为）`pure.mjs` `Math.max(0.16, Math.min(1, …))` → `Math.max(0.1, …)` → `❌ 行为: morphFrom…：The expression evaluated to a falsy value`，`375 / 1`；还原后 `376 / 0`。（第一次只改注释里的 `0.16` 时全绿——正是本轮要消灭的「注释也算数 / 注释不算数」那类歧义。）
+  - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0，**34.85s**；`node scripts/probe-format-coupling.js test_console.js` → **exit 1**，首红已从 v3.492 记录的 `persistAuto` 前移到 `结构红线: v3.317 日志页（顺序 / 行级渲染 / <mark> / 护栏 / 空态出口 / 高度）`（`test_console.js:12124`，锚点 `visited.has('logs')` + `<${LogsPanel}`）——该块属**下一段（原 9978 之后）**，不在本包 98 条内；本包全部被改块在整份生产源码重排后均通过（首红位于本包最后一个被改块之后），与「C4 段不再绑文本」一致。
+  - `npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.493`。
+  - **版本**：3.492.0 → **3.493.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
