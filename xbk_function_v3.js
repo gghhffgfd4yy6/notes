@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.494 — C4 第 1 轮评审修复：4 条「换成 AST 后失去咬合力」的判据（按钮插值类名恒真 / CategoryPicker style 条件判不出 / scrollBehavior 实参不判 / 嵌套 ConfirmDialog 负面扫描只扫外层）逐条恢复，另修账目口径——98 条清单项 = 式1 92 + 式2 6（式3 0）；另删 1 条清单外的自检断言 tickAutoBody.length > 500，故式4 删除合计 1 条；白名单 test_console.js 1026、total 1397（本轮 0 新增）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.495 — C5：test_console.js 第 5 段（原 9979–10327）98 条「读源码文本」断言逐条换成 AST 结构判据 / CSS 规则解析后断字段（式1 95 + 式2 3；式3 0；式4 0）；同块内另有 131 条未逐条登记的文本断言一并换掉，白名单 test_console.js 1026→797、total 1397→1168；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
