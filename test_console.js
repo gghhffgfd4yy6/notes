@@ -643,6 +643,15 @@ function callLabel (call) {
   if (!call || call.type !== 'CallExpression') return exprLabel(call)
   return `${exprLabel(call.callee)}(${call.arguments.map(argLabel).join(', ')})`
 }
+// 语句表 → 调用标签：**先逐条断言「是调用语句」，再比带实参的标签**。先
+// `filter((stmt) => stmt.type === 'ExpressionStatement')` 再比标签，会把处理器体里插入的
+// `if (v === '10') return` / `return` / `const x = 1` 静默丢掉，标签序列仍是原样 ⇒ 套件全绿
+// （assertshape C6 r4-B）。凡「按顺序比调用」的判据都走这里，不许先过滤。
+function callSeqOf (stmts, why) {
+  stmts.forEach((stmt, i) => assert.ok(stmt.type === 'ExpressionStatement' && stmt.expression.type === 'CallExpression',
+    `${why}：第 ${i + 1} 条必须是调用（actual=${stmt.type}${stmt.type === 'ExpressionStatement' ? '/' + stmt.expression.type : ''}）——插入 return / if / 声明会改变真实行为，不得被过滤掉`))
+  return stmts.map((stmt) => callLabel(stmt.expression))
+}
 // 运行日志摘要行（`2026-10-15 12:16:21 total=20 dedup=0 …`）→ { 字段: 值 }。
 // /api/logs 下发的是行文本，按 `k=v` 解析成字段再断值，比在整行里找 'total=20' 稳
 // （后者在 total=200 时同样命中）。
@@ -13818,6 +13827,12 @@ async function main () {
     // 只判 test 形状时把 consequent 掏空，旧数据的回包会清旗并滚走（清旗之后的 scrollTo 照跑）。
     assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('data === armedDataRef.current && !err')).length, 1,
       '必须等这次响应落地（data 换过且没有错误）再落点，门必须真的 return（丢掉 !err 会让失败响应永不落地、旗子悬挂）')
+    // 负面判据（origin/main 原有）：只判 data 引用的门不得再出现。放回一道裸门
+    // `if (data === armedDataRef.current) return` 后，失败响应（data 引用不变、只有 err 变）从这道门
+    // 提前返回 ⇒ 清旗不可达、旗子悬挂，下一次成功把用户拽到列表顶。只判「有 && !err 的门」时，
+    // 裸门与合并门可以同时存在，旧断言能抓、新断言放行（assertshape C6 r4-A）。
+    assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('data === armedDataRef.current')).length, 0,
+      '不得再单靠 data 引用判断落地（失败时 data 不变 ⇒ 清旗不可达）')
     // 消费即清旗：listLandTarget 返回 null 时不得重试。
     const msgStmts = msgEffect.arguments[0].body.body
     const clearAt = msgStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
@@ -13853,11 +13868,10 @@ async function main () {
         `${why}：onChange 必须是一段处理器`)
       return onChange.body.body
     }
-    // 处理器按顺序做了哪些调用：必须带实参。旧写法只取 callee 名（`setPage()`），把实参全丢掉 ⇒
-    // 把 setPage(1) 改成 setPage(2)、setQuery(q) 改成 setQuery('') 都全绿（assertshape C6 r3-B）。
-    const handlerOf = (el, why) => handlerStmts(el, why)
-      .filter((stmt) => stmt.type === 'ExpressionStatement')
-      .map((stmt) => callLabel(stmt.expression))
+    // 处理器按顺序做了哪些调用：必须带实参，且**一条语句都不许被过滤掉**（callSeqOf 先断形态）。
+    // 只比 callee 名时 setPage(1) 改成 setPage(2) 全绿（C6 r3-B）；先 filter(ExpressionStatement)
+    // 再比标签时，插入 `if (v === '10') return` 这类语句会被静默丢掉（C6 r4-B）。
+    const handlerOf = (el, why) => callSeqOf(handlerStmts(el, why), why)
     const sizeSelect = msgEls.find((el) => el.name === 'MiniSelect' && markup.attrText(el, 'ariaLabel') === '每页显示条数')
     assert.deepStrictEqual(handlerOf(sizeSelect, '推送记录必须有「每页显示条数」选择器'),
       ['armLand()', 'setSize(Number(v))', 'setPage(1)'], '推送记录改每页必须先置落点旗，再把字符串值转数字、回第 1 页')
@@ -13870,7 +13884,7 @@ async function main () {
     assert.strictEqual(rangeStmts.length, 5, '时间范围处理器必须是「挡自定义区间 → 置旗 → 清区间 → 换天数 → 回第 1 页」五步')
     assert.ok(earlyExits('v === "__range"')(rangeStmts[0]),
       '选自定义区间时只切到日期按钮，不得当场重拉（门必须真的 return）')
-    assert.deepStrictEqual(rangeStmts.slice(1).map((stmt) => callLabel(stmt.expression)),
+    assert.deepStrictEqual(callSeqOf(rangeStmts.slice(1), '时间范围处理器'),
       ['armLand()', 'setRange({ from: "", to: "" })', 'setDays(Number(v))', 'setPage(1)'],
       '改 preset 必须先置落点旗、清掉自定义区间（否则区间与 preset 同时生效）、换天数、回第 1 页')
     const rangePicker = msgEls.find((el) => el.name === 'DateRange')
@@ -14008,10 +14022,14 @@ async function main () {
     assert.ok(wordGuard, 'refreshNow 必须先判「搜索词真的变了」（q !== query）')
     assert.ok(blockEndsWithReturn(wordGuard.consequent),
       'refreshNow 词变化分支必须以 return 收尾（否则 armLand 之后会接着用旧词再刷一次）')
-    assert.deepStrictEqual(wordGuard.consequent.body.filter((stmt) => stmt.type === 'ExpressionStatement')
-      .map((stmt) => callLabel(stmt.expression)),
-    ['armLand()', 'setQuery(q)', 'setPage(1)'],
-    '词变化时必须先置落点旗、把新词写下去、回第 1 页（顺序不能换；换实参 = 用旧词重刷/停在第 2 页）')
+    // 语句数与形态先钉死：三步调用 + return。只 filter(ExpressionStatement) 再比标签时，中间插入
+    // `if (!q) return` 会被静默丢掉、标签序列原样 ⇒ 词没变也 armLand（C6 r4-B）。
+    assert.deepStrictEqual(wordGuard.consequent.body.map((stmt) => stmt.type),
+      ['ExpressionStatement', 'ExpressionStatement', 'ExpressionStatement', 'ReturnStatement'],
+      'refreshNow 词变化分支只许「armLand → setQuery → setPage → return」四条语句（插入别的语句会改变真实行为，不得被过滤掉）')
+    assert.deepStrictEqual(callSeqOf(wordGuard.consequent.body.slice(0, -1), 'refreshNow 词变化分支'),
+      ['armLand()', 'setQuery(q)', 'setPage(1)'],
+      '词变化时必须先置落点旗、把新词写下去、回第 1 页（顺序不能换；换实参 = 用旧词重刷/停在第 2 页）')
     // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
     assert.strictEqual(findAll(effect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
       '消费前必须检测用户是否自己滚走（门必须真的 return）')
@@ -14090,11 +14108,15 @@ async function main () {
     const appEls = elementsInFunction(uiModel, 'App')
     const statusEls = appEls.filter((el) => el.name === 'AutoRefreshText')
     assert.strictEqual(statusEls.length, 1, '状态行必须只有一个 AutoRefreshText（不再每页各写一套）')
-    assert.deepStrictEqual(statusEls[0].attrs.filter((attr) => attr.value.kind === 'expr')
-      .map((attr) => attr.name + '=' + exprLabel(attr.value.node)),
-    ['nextAt=nextAt', 'pollMs=pollMs', 'lastSync=syncAt', 'showDate=showDate',
-      'paused=!autoRefresh || authExpired', 'live=livePolling'],
-    '状态行必须统一传参（时间/年月日/暂停或凭证失效/是否轮询）')
+    // 先断「filter 没丢属性」：状态行只允许这 6 个表达式属性；多塞一个字符串属性（或漏判的一个 prop）
+    // 会被 filter 静默丢掉、标签序列仍原样（C6 r4-C）。
+    const statusAttrs = statusEls[0].attrs
+    assert.strictEqual(statusAttrs.filter((attr) => attr.value.kind === 'expr').length, statusAttrs.length,
+      '状态行只许表达式属性（非表达式属性会被 filter 静默丢掉，等于没判）')
+    assert.deepStrictEqual(statusAttrs.map((attr) => attr.name + '=' + exprLabel(attr.value.node)),
+      ['nextAt=nextAt', 'pollMs=pollMs', 'lastSync=syncAt', 'showDate=showDate',
+        'paused=!autoRefresh || authExpired', 'live=livePolling'],
+      '状态行必须统一传参（时间/年月日/暂停或凭证失效/是否轮询）')
     const art = markup.functionNodeOf(componentsModel, 'AutoRefreshText')
     assert.deepStrictEqual(callSites(art, 'fmtBarTime').map((call) => callArgLabels(call).join(',')), ['lastSync,showDate'],
       '组件内必须走 fmtBarTime（时间与年月日开关一起传）')
@@ -14278,8 +14300,11 @@ async function main () {
     assert.strictEqual(tipTpl.type, 'TemplateLiteral', 'tip 文案必须是字符串模板（属性值不是 html``）')
     assert.ok(String(tipTpl.quasis.map((quasi) => quasi.value.raw).join('')).includes('数据截至：'),
       '状态行没接 TapTip 的完整时间（tip 文案必须点名「数据截至：」）')
-    assert.deepStrictEqual(tipTpl.expressions.filter((expr) => expr.type === 'CallExpression').map(callLabel),
-      ['fmtLocalTime(syncAt)', 'fmtWeekday(syncAt)'], 'tip 里必须是完整时间 + 星期，且都用同一个 syncAt（旧断言钉住 fmtWeekday(syncAt)）')
+    // 逐格比对且不丢格：filter(CallExpression) 会把插入的裸标识符/字面量静默丢掉、标签序列仍是原样；
+    // 这里改用「调用带实参、其余按 exprLabel」的全量标签，TZ_LABEL 那一格也逐格钉住（C6 r4-C）。
+    assert.deepStrictEqual(tipTpl.expressions.map((expr) => expr.type === 'CallExpression' ? callLabel(expr) : exprLabel(expr)),
+      ['fmtLocalTime(syncAt)', 'fmtWeekday(syncAt)', 'TZ_LABEL'],
+      'tip 里必须是「完整时间 + 星期 + 时区」三格，且时间/星期都用同一个 syncAt（旧断言钉住 fmtWeekday(syncAt)）')
   })
 
   // ── 屏蔽注册天数用多行输入框 ─────────────────────────────────────────────────
@@ -14405,7 +14430,7 @@ async function main () {
     // triggerVia 必须同时支持字符串与函数两种 dupMsg（/trigger 仍传字符串）。
     const via = markup.functionNodeOf(apiModel, 'triggerVia')
     assert.strictEqual(findAll(via, (n) => n.type === 'ConditionalExpression' &&
-      sameShapeOf(n.test, "typeof dupMsg === 'function'") && exprLabel(n.consequent) === 'dupMsg()' &&
+      sameShapeOf(n.test, "typeof dupMsg === 'function'") && callLabel(n.consequent) === 'dupMsg(data)' &&
       exprLabel(n.alternate) === 'dupMsg').length, 1,
     'triggerVia 必须支持函数式 dupMsg（保留字符串形态给 /trigger）')
     assert.deepStrictEqual(callSites(markup.functionNodeOf(apiModel, 'trigger'), 'triggerVia')
@@ -14413,7 +14438,11 @@ async function main () {
     '/trigger 必须继续传字符串文案（函数形态只给需要按响应算秒数的端点）')
     // 提示必须真的由这次 dupMsg 的结果构造 Error（只留着表达式不算修好）。
     const msgDecl = findAll(via, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'msg')[0]
-    assert.ok(msgDecl && msgDecl.init.type === 'ConditionalExpression', '拦截文案必须由 dupMsg(data) 算出')
+    // 三元类型对不够：`? dupMsg() : dupMsg` 也满足「是三元」——实参一丢，通知自检拿不到响应里的
+    // replayWindowS（秒数恒落回默认 60），故这里连 consequent 的实参一起断（assertshape C6 r4-A）。
+    assert.ok(msgDecl && msgDecl.init.type === 'ConditionalExpression' &&
+      sameShapeOf(msgDecl.init.consequent, 'dupMsg(data)') && exprLabel(msgDecl.init.alternate) === 'dupMsg',
+    '拦截文案必须由 dupMsg(data) 算出（函数式分支必须把响应传进去，且字符串形态原样留着）')
     assert.strictEqual(findAll(via, (n) => n.type === 'NewExpression' && memberPath(n.callee) === 'Error' &&
       exprLabel(n.arguments[0]) === 'msg').length, 1, '拦截提示必须用 msg 构造 Error（不能留一段不参与构造的死代码）')
     // ③ 设置块：保存带乐观锁、成功文案如实、客户端边界走常量。

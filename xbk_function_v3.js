@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.503 — assertshape C6 第 3 轮评审修复：值守卫/早退门判「门内真的做了事」（CategoryPicker onChange 在门内、revision 判序与同值门必须 return）、调用判据带实参（callLabel）、日志失败占位补 div.log-empty + role=status、v3.501 段 D6 反向验证记录改回 v3.502；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.504 — assertshape C6 第 4 轮评审修复：dupMsg 三元的实参入判据、补回裸 data 负面子句、处理器语句不被 filter 丢掉（callSeqOf）、v3.503 段账目基线改回 origin/main；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
