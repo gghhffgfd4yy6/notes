@@ -374,6 +374,74 @@ function polarLabel (node) {
     ? node.operator + inner
     : `${node.operator}(${inner})`
 }
+
+// ── 结构形状断言（assertshape C3）──────────────────────────────────────────────
+// 「这段代码确实以这个形状存在」：把期望片段解析成 AST，再与目标子树里的同名节点按
+// 「节点类型 + 运算符 + 标识符名 + 字面量值 + 子节点」逐字段比对（位置 / 空白 / 注释 / raw 不参与）。
+// 这不是 src.includes 的换皮，三处判据都更严：
+//   ① 注释里的同一句不在 AST 里 ⇒ 满足不了判据（旧写法注释复述即绿）；
+//   ② 片段必须完整命中一个节点 ⇒ 截断的子串（`x = y` 撞上 `x = y + 1`）不成立；
+//   ③ 运算符与极性（&& / || / ! / === / const-kind）都是节点字段，比对时一起比 ——
+//      旧写法里 `a || b` 收窄成 `a && b`、`!x` 去掉取反、`const` 改成 `let` 都能过。
+// 用在「整句/整段表达式」这种逐字段取节点会很啰嗦的地方；判定语义本身仍是结构相等，不是文本子串。
+const SHAPE_SKIP_KEYS = new Set(['start', 'end', 'loc', 'range', 'raw', 'comments', 'leadingComments', 'trailingComments'])
+function shapeSignatureOf (node) {
+  if (node === null) return 'null'
+  if (Array.isArray(node)) return '[' + node.map(shapeSignatureOf).join(',') + ']'
+  if (typeof node !== 'object') return JSON.stringify(node === undefined ? null : node)
+  if (typeof node.type !== 'string') return JSON.stringify(node)
+  const parts = []
+  for (const key of Object.keys(node).sort()) {
+    if (key === 'type' || SHAPE_SKIP_KEYS.has(key) || node[key] === undefined) continue
+    parts.push(key + ':' + shapeSignatureOf(node[key]))
+  }
+  return node.type + '(' + parts.join(',') + ')'
+}
+// 片段 → 语句表（借 STATEMENT_WRAP 让「表达式 / 语句 / 声明」都能解析）。
+function wrappedStatementsOf (snippet) {
+  const ast = parseStatementsOf(snippet)
+  return ast.body[0].expression.callee.body.body
+}
+// 片段 → 单个节点：表达式取表达式本身（`a = b` 取赋值），声明/语句取语句。
+function shapeNodeOf (snippet) {
+  const statements = wrappedStatementsOf(snippet)
+  assert.strictEqual(statements.length, 1, `结构片段必须恰好一条语句：${snippet}`)
+  return statements[0].type === 'ExpressionStatement' ? statements[0].expression : statements[0]
+}
+function shapeCountIn (root, snippet) {
+  const want = shapeNodeOf(snippet)
+  const wantSignature = shapeSignatureOf(want)
+  return findAll(root, (node) => node.type === want.type && shapeSignatureOf(node) === wantSignature).length
+}
+function assertShapeIn (root, snippet, why) {
+  assert.ok(shapeCountIn(root, snippet) > 0, `${why}（缺结构：${snippet}）`)
+}
+function assertNoShapeIn (root, snippet, why) {
+  assert.strictEqual(shapeCountIn(root, snippet), 0, `${why}（不得出现：${snippet}）`)
+}
+function sameShapeOf (node, snippet) {
+  return Boolean(node) && shapeSignatureOf(node) === shapeSignatureOf(shapeNodeOf(snippet))
+}
+// `if (…)` 的条件判据：语句没有 body 时（`if (a || b)` 单独一段不是合法语句）用条件表达式本身比对。
+function assertIfConditionIn (root, condition, why) {
+  const want = shapeSignatureOf(shapeNodeOf(condition))
+  const hits = findAll(root, (n) => n.type === 'IfStatement' && shapeSignatureOf(n.test) === want)
+  assert.strictEqual(hits.length, 1, `${why}（条件必须是 ${condition}，实际命中 ${hits.length} 处）`)
+}
+// 「同一个块里，这条 scrollTo 之前有没有 holdAnchor()」：切页还原的两步顺序必须写死在同一个块里
+// —— 先关滚动锚定再落位（中间可以夹 releaseScrollHold / 取最大滚动位置这类语句），否则锚定会在
+// 背后把 scrollY 补一截。旧写法是「块文本里 holdAnchor 的 indexOf 小于 scrollTo 的 indexOf」。
+function precededByHoldAnchor (node, ancestors) {
+  const statement = ancestors[ancestors.length - 1]
+  const block = ancestors[ancestors.length - 2]
+  if (!block || block.type !== 'BlockStatement' || !Array.isArray(block.body)) return false
+  for (let i = block.body.indexOf(statement) - 1; i >= 0; i--) {
+    const prev = block.body[i]
+    const call = prev.type === 'ExpressionStatement' ? prev.expression : null
+    if (call && call.type === 'CallExpression' && memberPath(call.callee) === 'holdAnchor') return true
+  }
+  return false
+}
 // 运行日志摘要行（`2026-10-15 12:16:21 total=20 dedup=0 …`）→ { 字段: 值 }。
 // /api/logs 下发的是行文本，按 `k=v` 解析成字段再断值，比在整行里找 'total=20' 稳
 // （后者在 total=200 时同样命中）。
@@ -10218,287 +10286,525 @@ async function main () {
   })
 
   await aok('结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新', () => {
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    assert.ok(/\.tabs\s*\{[^}]*position:\s*sticky/.test(css), '标签页必须吸顶')
-    const src = readConsoleSource()
-    assert.ok(!/window\.scrollTo\(0, 0\) \}, \[tab/.test(src), '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
-    const scrollBlock = src.slice(src.indexOf('const scrollMemRef = useRef({})'), src.indexOf('// 标签栏是单行横滚'))
-    const switchBlock = src.slice(src.indexOf('const doSwitchTab = '), src.indexOf('const openLog = useCallback'))
-    assert.ok(scrollBlock.includes('scrollMemRef.current[from] = y'),
-      '切页前必须记住出发页的滚动位置')
-    assert.ok(scrollBlock.includes("const target = forceTop ? 0 : (typeof mem === 'number' ? mem : y)"),
-      '第一次进入的页签必须沿用当前视口位置，不得被拽回顶部')
-    const prepBlock = scrollBlock.slice(scrollBlock.indexOf('const prepareScroll = '), scrollBlock.indexOf('const prepareScrollRef'))
-    assert.ok(prepBlock.includes('pendingScrollRef.current = target'),
-      '切页必须把目标位置交给 pendingScrollRef')
-    assert.ok(prepBlock.includes('if (firstVisit && target > 0) holdScroll(target)'),
-      '切页前必须先垫高文档，避免首访卸载/挂载之间塌陷')
-    assert.ok(prepBlock.includes('const firstVisit = !enteredRef.current.has(next)'),
-      '必须先判断目标页是否真正点开过（预挂载不算），再决定是否垫高')
-    const prepPos = switchBlock.indexOf('prepareScroll(next)')
-    const renderPos = switchBlock.indexOf('renderTab(next)')
-    assert.ok(prepPos > -1 && renderPos > -1 && prepPos < renderPos,
-      '必须先 prepareScroll 再触发重渲染（重渲染收口在 renderTab，setTab 在它内部）')
-    const renderBlock = src.slice(src.indexOf('const renderTab = (next) =>'), src.indexOf('renderTabRef.current = renderTab'))
-    assert.ok(renderBlock.includes('setTab(next)') && !renderBlock.includes('prepareScroll'),
-      '切页渲染出口只负责换页（滚动记忆/垫高必须留在包外，先记位置再换）')
-    const syncPos = scrollBlock.indexOf('window.scrollTo(0, y)')
-    const rafPos = scrollBlock.indexOf('requestAnimationFrame')
-    assert.ok(syncPos > -1 && (rafPos === -1 || syncPos < rafPos),
-      '同步还原必须在 layout effect 内、且早于任何 rAF')
-    assert.ok(scrollBlock.includes('logJumpPendingRef.current = false'), '日志跳转必须一次性消费')
-    assert.ok(scrollBlock.includes('scrollMemRef.current[tab] = y'), '日志跳转必须重写日志页记忆（有 focus 落到定位条，无 focus 回顶）')
-    assert.ok(scrollBlock.includes('new window.ResizeObserver(() => check())'), '内容增长必须用 ResizeObserver 等到撑起来')
-    assert.ok(scrollBlock.includes('releaseAnchorSoon()') && scrollBlock.includes("overflowAnchor = 'none'"),
-      '切页后必须暂时关掉 scroll anchoring，防止每次切换 +26px 漂移')
-    const anchorHelper = scrollBlock.slice(scrollBlock.indexOf('const releaseAnchorSoon'), scrollBlock.indexOf('const releaseScrollHold'))
-    assert.ok(anchorHelper.includes('}, 1000)'), '锚定恢复窗口必须是 1s，不能立刻恢复')
-    const restoreBlock = scrollBlock.slice(scrollBlock.indexOf('// 垫高已生效'), scrollBlock.indexOf('const t0 = performance.now()'))
-    assert.ok(restoreBlock.includes('holdAnchor()') && restoreBlock.indexOf('holdAnchor()') < restoreBlock.indexOf('window.scrollTo(0, y)'),
-      '切页还原必须先关锚定再 scrollTo')
-    const zeroBlock = scrollBlock.slice(scrollBlock.indexOf('if (y <= 0)'), scrollBlock.indexOf('// 垫高已生效'))
-    assert.ok(zeroBlock.includes('holdAnchor()') && zeroBlock.indexOf('holdAnchor()') < zeroBlock.indexOf('window.scrollTo(0, 0)'),
-      '回顶分支也必须先关锚定')
-    assert.ok(scrollBlock.includes('if (ready || settled || performance.now() - t0 > 9000)'),
-      '只有内容已撑起、面板落定或 9s 超时才允许收口')
-    assert.ok(scrollBlock.includes('if (settled && !hold.user && !ready && bottom > 0)'),
-      '目标页更矮时只在用户未接管时落到最大位置')
-    assert.ok(scrollBlock.includes('window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))'),
-      '落位必须用页面最大滚动位置，不能回 0')
-    assert.ok(scrollBlock.includes('hold.check(true)') && scrollBlock.includes('panelReadyAt >= hold.startedAtMono'),
-      '目标面板加载完成后必须让垫高就地收口（单调时钟，不受系统时钟回拨影响）')
-    assert.ok(scrollBlock.includes('setTimeout(check, 9000)'), '加载失败必须有 9s 兜底释放，不能永久垫高')
-    const syncBlock = src.slice(src.indexOf('const syncFor = useMemo'), src.indexOf('// 系统页由两个面板组成'))
-    assert.ok(syncBlock.includes('syncMemRef.current[key] = ts') && syncBlock.includes('setPanelSync(ts)') &&
-      syncBlock.includes('setPanelReadyAt(performance.now())') && syncBlock.includes('if (tabRef.current === key)'),
-    '成功回调必须同时缓存本页时间、更新当前页显示、写单调 ready 标记')
-    const sysBlock = src.slice(src.indexOf('const markSysReady'), src.indexOf('const onSysReady'))
-    assert.ok(sysBlock.includes('syncMemRef.current.sys = ts') && sysBlock.includes('setPanelReadyAt(performance.now())'),
-      '系统页两个面板都完成时必须缓存 sys 时间并写 ready 标记')
-    assert.ok(renderBlock.includes('showSyncFor(next)') &&
-      renderBlock.indexOf('showSyncFor(next)') < renderBlock.indexOf('setTab(next)'),
-    '页签点击必须同步切到目标页缓存时间（重渲染出口里先换「数据截至」再换页）')
-    const hashStart = src.lastIndexOf('const onHash =')
-    const hashSyncBlock = src.slice(hashStart, src.indexOf("window.addEventListener('hashchange'", hashStart))
-    assert.ok(hashSyncBlock.includes('renderTabRef.current(next)'),
-      '后退/前进必须走同一个渲染出口（showSyncFor / markVisited / setTab 收口在 renderTab，不得各写一份）')
-    const openLogSyncBlock = src.slice(src.indexOf('const openLog ='), src.indexOf('const pollMs ='))
-    assert.ok(openLogSyncBlock.includes("showSyncFor('logs')"), '查看日志必须切到 logs 的缓存时间')
-    assert.ok(src.includes('const loadSeqRef = useRef(0)') &&
-      src.includes('if (seq !== loadSeqRef.current || !mountedRef.current) return'),
-    '过滤规则页必须做竞态/卸载守卫，旧响应不能刷新时间戳')
-    assert.ok(!src.includes('useEffect(() => { setPanelSync(null) }, [tab])'),
-      '换页不得清空时间，否则每次切页都会闪一下手动刷新')
-    assert.ok(src.includes("const at = lastSync ? fmtBarTime(lastSync, showDate) : '—'"),
-      '第一次进入未加载时必须用「—」占位，不能整行换成手动刷新')
-    // v3.342：设置块搬到系统页后，配置页恢复成 config + filter 两条 loader；
-    // 设置读面在系统页，和系统信息、访问日志一起等落定。
-    assert.ok(src.includes("if (typeof onSync === 'function' && configAt && filterAt) onSync(Math.max(configAt, filterAt))"),
-      '配置页必须等 config/filter 两个 loader 落定')
-    const cfgOnly = src.slice(src.indexOf('function ConfigPanel'), src.indexOf('// ── 过滤规则（v3.310）'))
-    assert.ok(!cfgOnly.includes('apiGetConsoleSettings'), '配置页不得再挂设置读面（v3.342 已搬到系统页）')
-    assert.ok(src.includes('if (sysReady && accessReady && typeof onReady'), '系统页 loader 都落定才算完成')
-    assert.ok(src.includes('onReady=$' + '{onSysReady}') && src.includes('onReady=$' + '{onFilesReady}'),
-      '系统页与文件清单都要向滚动层报完成')
-    assert.ok(src.includes('prepareScrollRef.current(next)'), 'hash 后退/前进必须走同一套滚动还原')
-    assert.ok(src.includes("window.history.scrollRestoration = 'manual'"), '后退/前进必须关掉浏览器默认的滚动恢复')
-    assert.ok(src.includes("prepareScrollRef.current('logs', { forceTop: true })"), '查看日志必须强制回顶')
-    assert.ok(src.includes('onClick=$' + '{() => switchTab(t.key)}'), '标签点击必须直接走 switchTab')
-    // v3.318：点「运行日志」页签不能清 logJump 触发重挂载——重挂载会先画 90px 空壳，
-    // 把下面的「触发历史」顶进视口闪一下。数据与筛选由保活面板自己保留。
-    assert.ok(!src.includes('setLogJump(null)'), '点「运行日志」页签不得清 logJump 重挂载（会闪空壳）')
-    // 手机端 6 个页签在 640 断点下会折成两行（吸顶 108px）；必须改成单行横滚，
-    // 否则吸顶区翻倍、正文被挤掉。桌面保持 wrap，不引入滚动容器吞滚轮。
-    const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
-    assert.ok(/\.tabs\s*\{[^}]*flex-wrap:\s*nowrap/.test(phone) && /\.tabs\s*\{[^}]*overflow-x:\s*auto/.test(phone),
-      '手机断点标签栏必须单行横滚（nowrap + overflow-x）')
-    assert.ok(/\.tab-btn\s*\{[^}]*flex:\s*0 0 auto/.test(phone), '手机断点标签按钮不得被压缩换行')
-    const lastPhoneRule = (re) => {
-      const all = [...phone.matchAll(re)]
-      return all.length ? all[all.length - 1][1] : ''
-    }
-    const topbarPhone = lastPhoneRule(/\.topbar\s*\{([^}]*)\}/g)
-    const syncPhone = lastPhoneRule(/\.sync\s*\{([^}]*)\}/g)
-    assert.ok(/flex-direction:\s*column/.test(topbarPhone),
+    const cssText = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const rules = cssRulesOf(cssText)
+    // 手机断点（≤640）的规则按「解析后的 @media 归属」筛，不再用正则抠整块 CSS 文本。
+    const phoneRulesOf = (selector) => cssRulesFor(rules, selector)
+      .filter((rule) => rule.at.some((at) => at === '@media (max-width: 640px)'))
+    assert.ok(cssDeclValuesOf(rules, '.tabs', 'position').includes('sticky'), '标签页必须吸顶')
+    // 手机端 6 个页签折成两行会把吸顶区从 52px 撑到 108px、挤掉正文；必须单行横滚。
+    assert.ok(phoneRulesOf('.tabs').some((rule) => rule.decls.get('flex-wrap') === 'nowrap'),
+      '手机断点标签栏必须单行横滚（flex-wrap: nowrap）')
+    assert.ok(phoneRulesOf('.tabs').some((rule) => rule.decls.get('overflow-x') === 'auto'),
+      '手机断点标签栏必须单行横滚（overflow-x: auto）')
+    assert.ok(phoneRulesOf('.tab-btn').some((rule) => rule.decls.get('flex') === '0 0 auto'),
+      '手机断点标签按钮不得被压缩换行')
+    // 后置规则不能把方向改回 row：层叠取最后一条，与浏览器一致。
+    const topbarPhone = phoneRulesOf('.topbar')
+    assert.ok(topbarPhone.length > 0, '手机断点必须有 .topbar 规则')
+    assert.strictEqual(topbarPhone[topbarPhone.length - 1].decls.get('flex-direction'), 'column',
       '最后一条手机 .topbar 规则必须是 column，后置规则不能把它改回 row')
+
+    const ui = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const components = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const app = markup.functionNodeOf(ui, 'App')
+    assert.ok(app, 'ui.js 必须有 App')
+    // 切页不得无条件强制回顶：只随 tab 重跑的 effect（切页入场）体内不得出现 scrollTo(0, 0)。
+    // 旧写法用 /window\.scrollTo\(0, 0\) \}, \[tab/ 匹配「调用 + 依赖数组」的相邻文本，
+    // 现在按 AST 找那条 effect 再看它体内有没有这个调用——中间夹注释/换行都不影响结论。
+    const tabDepsEffects = ['useEffect', 'useLayoutEffect'].flatMap((hook) => callSites(app, hook)).filter((call) => {
+      const deps = call.arguments[1]
+      return deps && deps.type === 'ArrayExpression' && deps.elements.map((el) => exprLabel(el)).join(',') === 'tab'
+    })
+    assert.ok(tabDepsEffects.length >= 1, '必须有只随 tab 重跑的 effect（切页入场）')
+    for (const effect of tabDepsEffects) {
+      assert.deepStrictEqual(callSites(effect, 'window.scrollTo')
+        .map((call) => call.arguments.map((arg) => exprLabel(arg)).join(',')).filter((args) => args === '0,0'),
+      [], '切页不得无条件强制回顶（长页深处会被整页拽回顶部）')
+    }
+
+    // 滚动记忆 / 垫高 / 还原都在 prepareScroll 与那条 layout effect 里：按声明名与语句形状定位，
+    // 不再按 `const scrollMemRef = useRef({})` / `// 标签栏是单行横滚` 之类的文本锚点切片。
+    const prepareScroll = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'prepareScroll')
+    assert.ok(prepareScroll && prepareScroll.init.type === 'ArrowFunctionExpression', 'App 必须有 prepareScroll 箭头函数')
+    assertShapeIn(prepareScroll, 'if (from && from !== next) scrollMemRef.current[from] = y',
+      '切页前必须记住出发页的滚动位置（且只记真正离开的那一页）')
+    assertShapeIn(prepareScroll, 'const target = forceTop ? 0 : (typeof mem === "number" ? mem : y)',
+      '第一次进入的页签必须沿用当前视口位置，不得被拽回顶部')
+    assertShapeIn(prepareScroll, 'pendingScrollRef.current = target',
+      '切页必须把目标位置交给 pendingScrollRef')
+    assertShapeIn(prepareScroll, 'const firstVisit = !enteredRef.current.has(next)',
+      '必须先判断目标页是否真正点开过（预挂载不算），再决定是否垫高')
+    assertShapeIn(prepareScroll, 'if (firstVisit && target > 0) holdScroll(target)',
+      '切页前必须先垫高文档，避免首访卸载/挂载之间塌陷')
+
+    const doSwitchTab = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'doSwitchTab')
+    assert.ok(doSwitchTab, 'App 必须有 doSwitchTab')
+    const switchPrepares = callSites(doSwitchTab, 'prepareScroll')
+    const switchRenders = callSites(doSwitchTab, 'renderTab')
+    assert.strictEqual(switchPrepares.length, 1, '切页只走一次 prepareScroll')
+    assert.strictEqual(switchRenders.length, 1, '切页只走一次 renderTab')
+    assert.ok(switchPrepares[0].start < switchRenders[0].start,
+      '必须先 prepareScroll 再触发重渲染（重渲染收口在 renderTab，setTab 在它内部）')
+
+    const renderTab = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'renderTab')
+    assert.ok(renderTab && renderTab.init.type === 'ArrowFunctionExpression', 'App 必须有 renderTab')
+    const renderBody = renderTab.init.body
+    assert.strictEqual(callSites(renderBody, 'setTab').length, 1, '切页渲染出口必须换页（setTab 只有一处）')
+    // 滚动记忆/垫高必须留在包外：渲染出口里不得出现 prepareScroll*。
+    assert.deepStrictEqual(findAll(renderBody, (n) => n.type === 'CallExpression' &&
+      ['prepareScroll', 'prepareScrollRef.current'].includes(memberPath(n.callee))).length, 0,
+    '切页渲染出口只负责换页（滚动记忆/垫高必须留在包外，先记位置再换）')
+    const renderShowSync = callSites(renderBody, 'showSyncFor')
+    const renderSetTab = callSites(renderBody, 'setTab')
+    assert.ok(renderShowSync.length === 1 && renderSetTab.length === 1 && renderShowSync[0].start < renderSetTab[0].start,
+      '页签点击必须同步切到目标页缓存时间（重渲染出口里先换「数据截至」再换页）')
+
+    // 滚动还原的 layout effect（唯一一条随 tab / logJump 重跑的）。
+    const scrollEffect = callSites(app, 'useLayoutEffect').find((call) => {
+      const deps = call.arguments[1]
+      return deps && deps.type === 'ArrayExpression' && deps.elements.map((el) => exprLabel(el)).join(',') === 'tab,logJump'
+    })
+    assert.ok(scrollEffect, '必须有随 tab / logJump 重跑的滚动还原 layout effect')
+    const effectBody = scrollEffect.arguments[0].body
+    assertShapeIn(effectBody, 'window.scrollTo(0, y)', '切页必须由 layout effect 同步还原（绘制前落位）')
+    // logJump 分支：一次性消费 + 落到定位条；消费后必须清掉 pending 引用（否则下次切页消费 stale 0）。
+    const jumpBranch = findFirst(effectBody, (n) => n.type === 'IfStatement' &&
+      exprLabel(n.test) === 'logJumpPendingRef.current')
+    assert.ok(jumpBranch, 'layout effect 必须有 logJump 分支')
+    assertShapeIn(jumpBranch, 'logJumpPendingRef.current = false', '日志跳转必须一次性消费')
+    assertShapeIn(jumpBranch, 'pendingScrollRef.current = null',
+      'logJump 分支必须清掉 pending 位置（否则之后切页会消费这个 stale 0）')
+    assertShapeIn(jumpBranch, 'pendingFirstVisitRef.current = false', 'logJump 分支必须清掉首访标记')
+    assertShapeIn(jumpBranch, 'scrollMemRef.current[tab] = y',
+      '日志跳转必须重写日志页记忆（有 focus 落到定位条，无 focus 回顶）')
+    // 回顶分支：先关锚定再 scrollTo(0, 0)。
+    const zeroBranch = findFirst(effectBody, (n) => n.type === 'IfStatement' && exprLabel(n.test) === 'y <= 0')
+    assert.ok(zeroBranch, '必须有 y <= 0 的回顶分支')
+    const zeroAnchor = findFirst(zeroBranch, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'holdAnchor')
+    const zeroScroll = findFirst(zeroBranch, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.scrollTo')
+    assert.ok(zeroAnchor && zeroScroll && zeroAnchor.start < zeroScroll.start, '回顶分支也必须先关锚定')
+    // 已保活页：整棵 DOM 还在，直接落到记忆位置（比内容矮时落到最大滚动位置）。
+    const idleBranch = findFirst(effectBody, (n) => n.type === 'IfStatement' && exprLabel(n.test) === '!firstVisit')
+    assert.ok(idleBranch, '必须按 firstVisit 区分「已保活页直接落位」')
+    assertShapeIn(idleBranch,
+      'const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight)',
+      '落位上限必须是页面最大滚动位置')
+    assertShapeIn(idleBranch, 'window.scrollTo(0, Math.min(y, maxScroll))',
+      '已保活页必须在 layout effect 里直接调用 scrollTo 落到记忆位置')
+    // 垫高已生效：先关锚定再同步还原，并且就在 t0 计时之前（同步，不能等 rAF）。
+    const clockStart = findFirst(effectBody, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 't0' && n.init && n.init.type === 'CallExpression' && memberPath(n.init.callee) === 'performance.now')
+    assert.ok(clockStart, '垫高后必须取 t0 作为 9s 兜底计时起点')
+    const holdAnchorStmt = findFirst(effectBody, (n) => n.type === 'ExpressionStatement' &&
+      n.expression.type === 'CallExpression' && memberPath(n.expression.callee) === 'holdAnchor')
+    assert.ok(holdAnchorStmt && holdAnchorStmt.start < clockStart.start,
+      '垫高生效后必须先关锚定、再同步还原，最后才起 t0（顺序颠倒会先塌再跳）')
+    // 这条 effect 里每一处落位都必须是「上一句 holdAnchor()」（中间可夹 releaseScrollHold()）：
+    // 逐处判顺序，而不是只看两处 block.indexOf 的大小关系。
+    assert.deepStrictEqual(findAll(effectBody, (n, ancestors) => n.type === 'CallExpression' &&
+      memberPath(n.callee) === 'window.scrollTo' &&
+      !ancestors.some((a) => a.type === 'ArrowFunctionExpression' || a.type === 'FunctionExpression') &&
+      !precededByHoldAnchor(n, ancestors)).map((n) => n.loc.start.line),
+    [], '切页还原必须先关锚定再 scrollTo（每一处落位都要）')
+    assertIfConditionIn(effectBody, 'ready || settled || performance.now() - t0 > 9000',
+      '只有内容已撑起、面板落定或 9s 超时才允许收口')
+    assertIfConditionIn(effectBody, 'settled && !hold.user && !ready && bottom > 0',
+      '目标页更矮时只在用户未接管时落到最大位置')
+    assertShapeIn(effectBody,
+      'window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight))',
+      '落位必须用页面最大滚动位置，不能回 0')
+    assertShapeIn(effectBody, 'new window.ResizeObserver(() => check())', '内容增长必须用 ResizeObserver 等到撑起来')
+    const releaseAnchorSoon = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'releaseAnchorSoon')
+    assert.ok(releaseAnchorSoon, 'App 必须有 releaseAnchorSoon（切页后延时恢复锚定）')
+    assert.ok(callSites(releaseAnchorSoon, 'window.setTimeout').some((call) =>
+      call.arguments[1] && call.arguments[1].value === 1000),
+    '锚定恢复窗口必须是 1s，不能立刻恢复')
+    assertShapeIn(effectBody, 'hold.timer = window.setTimeout(check, 9000)',
+      '加载失败必须有 9s 兜底释放，不能永久垫高')
+    const holdAnchor = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'holdAnchor')
+    assert.ok(holdAnchor, 'App 必须有 holdAnchor（切页还原前先关锚定）')
+    assertShapeIn(holdAnchor, 'document.documentElement.style.overflowAnchor = "none"',
+      '切页后必须暂时关掉 scroll anchoring，防止每次切换 +26px 漂移')
+    // 目标面板报「加载完成」后，目标页更矮时就地收口（只认切页后写入的单调 ready 标记）。
+    const readyEffect = callSites(app, 'useEffect').find((call) => {
+      const deps = call.arguments[1]
+      return deps && deps.type === 'ArrayExpression' && deps.elements.map((el) => exprLabel(el)).join(',') === 'panelReadyAt'
+    })
+    assert.ok(readyEffect, '必须有随 panelReadyAt 重跑的收口 effect')
+    assertShapeIn(readyEffect, 'if (hold && panelReadyAt >= hold.startedAtMono) hold.check(true)',
+      '目标面板加载完成后必须让垫高就地收口（单调时钟，不受系统时钟回拨影响）')
+
+    // 每个页签的「数据截至」：成功回调必须同时缓存本页时间、更新当前页显示、写单调 ready 标记。
+    const syncFor = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'syncFor')
+    assert.ok(syncFor && syncFor.init.type === 'CallExpression' && memberPath(syncFor.init.callee) === 'useMemo',
+      'syncFor 必须由 useMemo 构造（每个面板只接受自己这一页的完成回调）')
+    assertShapeIn(syncFor, 'if (typeof ts === "number") syncMemRef.current[key] = ts',
+      '成功回调必须缓存本页时间（非数字时间不缓存）')
+    const syncGuard = findFirst(syncFor, (n) => n.type === 'IfStatement' && exprLabel(n.test) === 'tabRef.current === key')
+    assert.ok(syncGuard, '成功回调只许更新「自己这一页」的显示时间（if (tabRef.current === key)）')
+    assertShapeIn(syncGuard, 'setPanelSync(ts)', '成功回调必须更新当前页显示时间')
+    assertShapeIn(syncGuard, 'setPanelReadyAt(performance.now())', '成功回调必须写单调 ready 标记')
+    const syncReturn = findFirst(syncFor, (n) => n.type === 'ReturnStatement' &&
+      n.argument && n.argument.type === 'ObjectExpression')
+    assert.deepStrictEqual(objectKeyNames(syncReturn.argument), ['messages', 'search', 'logs', 'config', 'filter'],
+      '五个面板各自一个 sync 回调（缺谁的缓存时间就永远显示占位）')
+    const markSysReady = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'markSysReady')
+    assert.ok(markSysReady, 'App 必须有 markSysReady（系统页由两个面板组成）')
+    assertShapeIn(markSysReady, 'if (sysReadyRef.current.size < 2) return', '系统页两个面板都落定才算完成')
+    assertShapeIn(markSysReady, 'syncMemRef.current.sys = ts', '系统页两个面板都完成时必须缓存 sys 时间')
+    assertShapeIn(markSysReady, 'setPanelReadyAt(performance.now())', '系统页完成时必须写 ready 标记')
+
+    // hash 前进/后退走同一个出口：先还原滚动，再经 renderTab 换页（不各写一份）。
+    const hashEffect = callSites(app, 'useEffect').find((call) => callSites(call, 'window.addEventListener')
+      .some((add) => add.arguments[0] && add.arguments[0].value === 'hashchange'))
+    assert.ok(hashEffect, '必须有 hashchange 监听 effect（前进/后退跟着切页）')
+    assertShapeIn(hashEffect, 'window.history.scrollRestoration = "manual"',
+      '后退/前进必须关掉浏览器默认的滚动恢复')
+    const onHash = findFirst(hashEffect, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'onHash')
+    assert.ok(onHash, 'hashchange 必须收口到 onHash')
+    const hashPrepares = callSites(onHash, 'prepareScrollRef.current')
+    const hashRenders = callSites(onHash, 'renderTabRef.current')
+    assert.ok(hashPrepares.length === 1 && hashRenders.length === 1 && hashPrepares[0].start < hashRenders[0].start,
+      '后退/前进必须走同一个渲染出口（showSyncFor / markVisited / setTab 收口在 renderTab，不得各写一份）')
+
+    const openLog = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'openLog')
+    assert.ok(openLog, 'App 必须有 openLog')
+    assertShapeIn(openLog, 'prepareScrollRef.current("logs", { forceTop: true })', '查看日志必须强制回顶')
+    assertShapeIn(openLog, 'showSyncFor("logs")', '查看日志必须切到 logs 的缓存时间')
+
+    // 过滤规则页的竞态/卸载守卫（loadSeqRef 领号；旧响应直接丢）。
+    const filterPanel = markup.functionNodeOf(pages, 'FilterRulesPanel')
+    assert.ok(filterPanel, 'pages.js 必须有 FilterRulesPanel')
+    assertShapeIn(filterPanel, 'const loadSeqRef = useRef(0)', '过滤规则页必须给每次请求领号')
+    assertShapeIn(filterPanel, 'if (seq !== loadSeqRef.current || !mountedRef.current) return',
+      '过滤规则页必须做竞态/卸载守卫，旧响应不能刷新时间戳')
+    // 换页不得清空时间（否则每次切页都会闪一下手动刷新）：任何只随 tab 重跑的 effect 都不许碰 setPanelSync。
+    assert.deepStrictEqual(['useEffect', 'useLayoutEffect'].flatMap((hook) => callSites(ui, hook)).filter((call) => {
+      const deps = call.arguments[1]
+      return deps && deps.type === 'ArrayExpression' && deps.elements.map((el) => exprLabel(el)).join(',') === 'tab'
+    }).filter((call) => callSites(call, 'setPanelSync').length > 0).length, 0,
+    '换页不得清空时间，否则每次切页都会闪一下手动刷新')
+    assertShapeIn(components, "const at = lastSync ? fmtBarTime(lastSync, showDate) : '—'",
+      '第一次进入未加载时必须用「—」占位，不能整行换成手动刷新')
+
+    // v3.342：设置块搬到系统页后，配置页恢复成 config + filter 两条 loader；设置读面只在系统页。
+    const configPanel = markup.functionNodeOf(pages, 'ConfigPanel')
+    assert.ok(configPanel, 'pages.js 必须有 ConfigPanel')
+    assertShapeIn(configPanel,
+      'if (typeof onSync === "function" && configAt && filterAt) onSync(Math.max(configAt, filterAt))',
+      '配置页必须等 config/filter 两个 loader 落定')
+    assert.deepStrictEqual(callSites(configPanel, 'apiGetConsoleSettings').length, 0,
+      '配置页不得再挂设置读面（v3.342 已搬到系统页）')
+    const sysPanel = markup.functionNodeOf(pages, 'SysPanel')
+    assert.ok(sysPanel, 'pages.js 必须有 SysPanel')
+    assertShapeIn(sysPanel, 'if (sysReady && accessReady && typeof onReady === "function") onReady()',
+      '系统页 loader 都落定才算完成')
+
+    // 系统页与文件清单都要向滚动层报完成（两个面板 + 各自的 ready 回调）。
+    const appElements = templateRootsOf(app).flatMap((root) => markup.allElements(root))
+    const sysEl = appElements.find((el) => el.name === 'SysPanel')
+    const filesEl = appElements.find((el) => el.name === 'FilesPanel')
+    assert.ok(sameShapeOf(markup.attrExpr(sysEl, 'onReady'), 'onSysReady'),
+      '系统页与文件清单都要向滚动层报完成（SysPanel.onReady 必须是 onSysReady）')
+    assert.ok(sameShapeOf(markup.attrExpr(filesEl, 'onReady'), 'onFilesReady'),
+      '系统页与文件清单都要向滚动层报完成（FilesPanel.onReady 必须是 onFilesReady）')
+    assert.ok(appElements.some((el) => el.name === 'button' &&
+      sameShapeOf(markup.attrExpr(el, 'onClick'), '() => switchTab(t.key)')),
+    '标签点击必须直接走 switchTab')
+    // v3.318：点「运行日志」页签不能清 logJump 触发重挂载——重挂载会先画 90px 空壳。
+    assert.deepStrictEqual(callSites(ui, 'setLogJump').filter((call) =>
+      call.arguments.length === 1 && call.arguments[0].type === 'Literal' && call.arguments[0].value === null).length, 0,
+    '点「运行日志」页签不得清 logJump 重挂载（会闪空壳）')
+
     // v3.338：顶栏不再有品牌行（名字只留在浏览器标签上），只剩一行状态/刷新信息。
-    assert.ok(!src.includes('<span class="name">') && !/\.brand\s*\{/.test(css),
+    assert.deepStrictEqual(consoleAssetElements().filter((el) => markup.hasClass(el, 'name')).map((el) => el.name), [],
       '页面里不得再渲染控制台名字（品牌行已去掉）')
-    const metaRule = (css.match(/\.sync-meta\s*\{[^}]*\}/) || [''])[0]
-    // 省略号三件套缺一不可：只写 text-overflow 而没有 overflow:hidden/nowrap 时，
-    // 文本会换行或被裁掉而不是出省略号（Sourcery #301）。
-    const metaOk = /text-overflow:\s*ellipsis/.test(metaRule) && /overflow:\s*hidden/.test(metaRule) &&
-      /white-space:\s*nowrap/.test(metaRule)
-    assert.ok(src.includes('<span class="sync-meta">') && metaOk,
-      'sync-meta 必须 ellipsis + overflow:hidden + nowrap，长文案才真的收省略号')
-    // 失败整句必须在 .sync 之外（同步容器里的第一个 </div> 之后、</header> 之前）：
-    // 只看 class 是否存在的话，挪回行内照样绿（Sourcery #301）。
-    const syncOpen = src.indexOf('class="sync"')
-    const syncClose = src.indexOf('</div>', syncOpen)
-    const failAt = src.indexOf('class="sync-fail"')
-    const headerEnd = src.indexOf('</header>', syncOpen)
-    assert.ok(css.includes('.sync-fail {') && failAt > syncClose && failAt < headerEnd,
-      '刷新失败必须渲染在 .sync 之外、header 之内（挤在行内会被省略号吃掉）')
-    // 按钮不能被压缩或换行：窄屏时让位的是中间文本，不是「暂停」。
-    const toggleRule = (css.match(/\.sync-toggle\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/flex:\s*0 0 auto/.test(toggleRule) && /white-space:\s*nowrap/.test(toggleRule),
-      'sync-toggle 必须 flex:0 0 auto + nowrap，否则窄屏会被压缩换行')
-    assert.ok(/white-space:\s*nowrap/.test(syncPhone) && /min-height:\s*24px/.test(syncPhone),
-      '手机端 sync 必须单行 + 固定行高，文字长短不能改高度')
-    assert.ok(/class="sync"[^>]*tabindex="0"/.test(src),
+    assert.strictEqual(cssRulesFor(rules, '.brand').length, 0, '品牌行已去掉，.brand 样式不得再留')
+
+    // sync-meta 的省略号三件套缺一不可（只写 text-overflow 时文本会换行或被裁掉）。
+    const metaRules = cssRulesFor(rules, '.sync-meta')
+    assert.strictEqual(metaRules.length, 1, '.sync-meta 必须只有一条规则')
+    assert.deepStrictEqual([metaRules[0].decls.get('text-overflow'), metaRules[0].decls.get('overflow'),
+      metaRules[0].decls.get('white-space')], ['ellipsis', 'hidden', 'nowrap'],
+    'sync-meta 必须 ellipsis + overflow:hidden + nowrap，长文案才真的收省略号')
+    assert.ok(consoleAssetElements().some((el) => el.name === 'span' && markup.hasClass(el, 'sync-meta')),
+      'sync-meta 必须真的渲染出来（样式与元素不能只剩一边）')
+    // 失败整句必须在 .sync 之外、header 之内（挤在行内会被省略号吃掉）。
+    const headerEl = templateRootsOf(app).flatMap((root) => markup.allElements(root))
+      .find((el) => el.name === 'header')
+    assert.ok(headerEl, 'App 必须渲染 header（顶栏）')
+    const syncBox = markup.allElements(headerEl).find((el) => markup.hasClass(el, 'sync'))
+    const failBox = markup.allElements(headerEl).find((el) => markup.hasClass(el, 'sync-fail'))
+    assert.ok(syncBox && failBox, '.sync 与 .sync-fail 都必须渲染在 header 里')
+    assert.deepStrictEqual(markup.allElements(syncBox).filter((el) => markup.hasClass(el, 'sync-fail')).length, 0,
+      '刷新失败必须渲染在 .sync 之外（挤在行内会被省略号吃掉）')
+    assert.strictEqual(cssRulesFor(rules, '.sync-fail').length, 1, '刷新失败必须有独立样式（.sync-fail）')
+    // 窄屏时让位的是中间文本，不是「暂停」：按钮不能被压缩或换行。
+    assert.ok(cssDeclValuesOf(rules, '.sync-toggle', 'flex').includes('0 0 auto'),
+      'sync-toggle 必须 flex:0 0 auto，否则窄屏会被压缩换行')
+    assert.ok(cssDeclValuesOf(rules, '.sync-toggle', 'white-space').includes('nowrap'),
+      'sync-toggle 必须 nowrap，否则窄屏会被压缩换行')
+    assert.ok(phoneRulesOf('.sync').some((rule) => rule.decls.get('white-space') === 'nowrap' &&
+      rule.decls.get('min-height') === '24px'),
+    '手机端 sync 必须单行 + 固定行高，文字长短不能改高度')
+    assert.strictEqual(markup.attrText(syncBox, 'tabindex'), '0',
       '手机端 sync 必须可聚焦，长错误才能用键盘横向滚动查看')
-    assert.ok(src.includes('tabsRef') && src.includes("querySelector('.tab-btn.active')"),
-      '切页后必须把当前页签滚进可视区（横滚后靠右页签不能停在视野外）')
-    assert.ok(src.includes("window.addEventListener('resize', adjust)") && src.includes('new window.ResizeObserver(adjust)'),
-      '窗口/标签栏尺寸变化后必须重新把当前页签滚进可视区（旋转屏不能停在裁剪边外）')
-    const cache = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('// 推送记录：'))
-    assert.ok(cache.includes('60000'), '缓存健康必须每分钟刷新')
-    assert.ok(!cache.includes("addEventListener('visibilitychange'"), '切回前台补拉交给 App 统一路径，面板不得再自己挂（会重复请求）')
+
+    // 切页后必须把当前页签滚进可视区（横滚后靠右页签不能停在视野外）。
+    const tabBarEffect = callSites(app, 'useLayoutEffect').find((call) =>
+      findAll(call, (n) => n.type === 'MemberExpression' && memberPath(n) === 'tabsRef.current').length >= 1 &&
+      callSites(call, 'bar.querySelector').length >= 1)
+    assert.ok(tabBarEffect, '切页后必须把当前页签滚进可视区（读 tabsRef + 查当前页签）')
+    assert.ok(callSites(tabBarEffect, 'bar.querySelector').some((call) =>
+      call.arguments[0] && call.arguments[0].value === '.tab-btn.active'),
+    '切页后必须查到当前页签（querySelector(".tab-btn.active")）')
+    assert.ok(callSites(tabBarEffect, 'window.addEventListener').some((add) =>
+      add.arguments[0] && add.arguments[0].value === 'resize'),
+    '窗口尺寸变化后必须重新把当前页签滚进可视区（resize）')
+    assert.ok(findAll(tabBarEffect, (n) => n.type === 'NewExpression' &&
+      memberPath(n.callee) === 'window.ResizeObserver').length >= 1,
+    '标签栏尺寸变化后必须重新把当前页签滚进可视区（new window.ResizeObserver）')
+
+    // 缓存健康必须每分钟刷新一次；切回前台补拉交给 App 统一路径（面板自己再挂会重复请求）。
+    const cachePanel = markup.functionNodeOf(pages, 'CacheHealthPanel')
+    assert.ok(cachePanel, 'pages.js 必须有 CacheHealthPanel')
+    const minuteTimers = callSites(cachePanel, 'setInterval')
+    assert.strictEqual(minuteTimers.length, 1, '缓存健康必须只有一处分钟轮询定时器')
+    assert.deepStrictEqual(minuteTimers[0].arguments.slice(1).map((arg) => arg.value), [60000],
+      '缓存健康必须每分钟刷新（定时器间隔是字面量 60000）')
+    assert.deepStrictEqual(callSites(cachePanel, 'document.addEventListener').filter((call) =>
+      call.arguments[0] && call.arguments[0].value === 'visibilitychange').length, 0,
+    '切回前台补拉交给 App 统一路径，面板不得再自己挂（会重复请求）')
   })
 
   // C7-049（评审 must_fix）：注释里复述同一个数会替既有断言兜底 —— 把定时器改成别的数，
   // 上面那条 `cache.includes('60000')` 仍然绿，「缓存健康必须每分钟刷新」从此没有判据。
   // 该字面量只许出现在代码里；回退掉源码注释的修复即红。
+  // C7-049（评审 must_fix）：注释里复述同一个数会替既有断言兜底 —— 把定时器改成别的数，上面那条
+  // 「缓存健康必须每分钟刷新」仍然绿。改成 AST 判据后注释天然不参与：字面量只以「数值节点」的形式
+  // 进 AST，注释里复述多少个 60000 都数不进来，因此这里只断「代码里恰好一处，且就是定时器的间隔」。
   await aok('结构红线: 缓存健康字面量只许在代码里，注释不得复述（回退修复即红）', () => {
-    const src = readConsoleSource()
-    const cache = sliceBetween(src, 'function CacheHealthPanel', '// 推送记录：', 'CacheHealthPanel 片段')
-    const rawHits = (cache.match(/60000/g) || []).length
-    const codeHits = (codeOf(cache).match(/60000/g) || []).length
-    assert.strictEqual(codeHits, 1, '缓存健康必须保留每分钟一次的裸数字定时器（既有断言按字面量锁它）')
-    assert.strictEqual(rawHits, codeHits, '该字面量只能出现在代码里，注释复述会削弱既有断言的判据')
+    const cache = markup.functionNodeOf(loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js')), 'CacheHealthPanel')
+    assert.ok(cache, 'pages.js 必须有 CacheHealthPanel')
+    const minuteLiteral = findAll(cache, (n) => n.type === 'Literal' && n.value === 60000)
+    assert.strictEqual(minuteLiteral.length, 1, '缓存健康必须保留每分钟一次的裸数字定时器（既有断言按字面量锁它）')
+    assert.deepStrictEqual(callSites(cache, 'setInterval')
+      .filter((call) => call.arguments[1] && call.arguments[1].start === minuteLiteral[0].start).length, 1,
+    '该字面量只能出现在这个定时器的间隔实参上（注释复述不算实现，挪到别处也锁不住刷新节奏）')
   })
 
   // C7-035/C7-047/C7-049（评审 must_fix）：这三条修复此前只有未入库的 scratch 探针兜底 ——
   // 把 main 的 pages.js/app.css/constants.js 覆盖回来跑既有套件仍是 330/0，回归只能靠人工复核。
   // 下面每条独立成例：回退对应修复必须逐条变红，否则「修好了」就只是一句自述。
+  // C7-035/C7-047/C7-049（评审 must_fix）：这三条修复此前只有未入库的 scratch 探针兜底 ——
+  // 把 main 的 pages.js/app.css/constants.js 覆盖回来跑既有套件仍是 330/0，回归只能靠人工复核。
+  // 下面每条独立成例：回退对应修复必须逐条变红，否则「修好了」就只是一句自述。
   await aok('结构红线: 保存设置的失败提示必须按 tone 拼 is-ok/is-bad（回退修复即红）', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    assert.ok(codeOf(src).includes("'ls-cfg-msg' + (cfgMsgTone ? ' is-' + cfgMsgTone : '')"),
+    const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    assertShapeIn(pages, "'ls-cfg-msg' + (cfgMsgTone ? ' is-' + cfgMsgTone : '')",
       '保存设置的提示必须按 tone 拼 is-ok/is-bad，写死成功绿会让失败与「已保存」同色')
-    const base = (css.match(/\.ls-cfg-msg\s*\{[^}]*\}/) || [''])[0]
-    const okRule = (css.match(/\.ls-cfg-msg\.is-ok\s*\{[^}]*\}/) || [''])[0]
-    const badRule = (css.match(/\.ls-cfg-msg\.is-bad\s*\{[^}]*\}/) || [''])[0]
+    const rules = cssRulesOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8'))
     // 基类必须中性：基类还吃 --ok-fg 的话，三态类再全也挡不住「失败也是绿」。
-    assert.ok(/color:\s*var\(--text-dim\)/.test(base), '.ls-cfg-msg 基类必须是中性的 --text-dim')
-    assert.ok(/color:\s*var\(--ok-fg\)/.test(okRule), '.ls-cfg-msg.is-ok 必须用 --ok-fg')
-    assert.ok(/color:\s*var\(--bad-fg\)/.test(badRule), '.ls-cfg-msg.is-bad 必须用 --bad-fg（失败提示不得再是成功绿）')
+    assert.deepStrictEqual(cssDeclValuesOf(rules, '.ls-cfg-msg', 'color'), ['var(--text-dim)'],
+      '.ls-cfg-msg 基类必须是中性的 --text-dim')
+    assert.deepStrictEqual(cssDeclValuesOf(rules, '.ls-cfg-msg.is-ok', 'color'), ['var(--ok-fg)'],
+      '.ls-cfg-msg.is-ok 必须用 --ok-fg')
+    assert.deepStrictEqual(cssDeclValuesOf(rules, '.ls-cfg-msg.is-bad', 'color'), ['var(--bad-fg)'],
+      '.ls-cfg-msg.is-bad 必须用 --bad-fg（失败提示不得再是成功绿）')
   })
 
   await aok('结构红线: 备份超限文案必须由 BACKUP_FILE_MAX_BYTES 拼出（回退修复即红）', () => {
-    const pagesSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
-    assert.ok(codeOf(pagesSrc).includes('fmtBytes(BACKUP_FILE_MAX_BYTES)'),
+    const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    assertShapeIn(pages, 'fmtBytes(BACKUP_FILE_MAX_BYTES)',
       '备份超限文案必须用 fmtBytes(BACKUP_FILE_MAX_BYTES) 拼出，写死数字后改常量会让提示说谎')
-    // 含注释全文件扫：注释里复述同一个数，同样会让「文案与常量脱钩」无人发现。
-    assert.ok(!pagesSrc.includes('上限 48MB'), 'pages.js 全文不得再出现写死的「上限 48MB」')
+    // 写死的「上限 48MB」不得再出现在任何会渲染出去的字面量 / 模板静态段里：注释既不能让上一条变绿
+    // （AST 里没有注释），也不会被渲染出去，因此这条与旧的「含注释全文件扫」结论一致。
+    assert.deepStrictEqual(stringValuesOf(pages).filter((text) => text.includes('上限 48MB')), [],
+      'pages.js 全文不得再出现写死的「上限 48MB」')
   })
 
   await aok('结构红线: 面板时长必须引用 constants 命名常量（回退修复即红）', () => {
     // 只认 pages.js：constants.js 本来就带定义与导出，拼整份源码会把「没人引用」也判成绿。
-    const pagesSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'pages.js'), 'utf8')
-    const pageCode = codeOf(pagesSrc)
-    const names = ['SNAP_INFLIGHT_MS', 'PANEL_FRESH_MS', 'SAVED_HINT_MS', 'VERSION_TIP_MS', 'OBJECT_URL_REVOKE_MS']
-    for (const name of names) {
-      const hits = (pageCode.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length
-      // import 一行 + 至少一处使用 = 2；只剩 1 次说明常量被重新写回裸数字。
-      assert.ok(hits >= 2, `pages.js 必须在 import 之外引用 ${name}，裸数字回潮即红`)
+    const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const constants = importBindings(pages, './constants.js')
+    for (const name of ['SNAP_INFLIGHT_MS', 'PANEL_FRESH_MS', 'SAVED_HINT_MS', 'VERSION_TIP_MS', 'OBJECT_URL_REVOKE_MS']) {
+      assert.ok(constants.has(name), `pages.js 必须从 constants.js 引入 ${name}`)
+      // import 一行 + 至少一处使用；只剩 import 说明常量被重新写回裸数字。
+      const references = findAll(pages, (n, ancestors) => n.type === 'Identifier' && n.name === name &&
+        !ancestors.some((a) => a.type === 'ImportDeclaration'))
+      assert.ok(references.length >= 1, `pages.js 必须在 import 之外引用 ${name}，裸数字回潮即红`)
     }
   })
 
   await aok('结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    // 六个页签都按 visited 保活：第一次进入才挂载，之后只切 hidden。
+    const ui = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const api = loadModel(path.join(CONSOLE_ASSET_DIR, 'api.js'))
+    const components = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const app = markup.functionNodeOf(ui, 'App')
+    assert.ok(app, 'ui.js 必须有 App')
+    // 六个页签都按 visited 保活：第一次进入才挂载，之后只切 hidden。判据落在「section.page 的
+    // 模板被哪条 visited.has(key) 门住、hidden 绑的是哪个比较」上，不再比对源码里的模板文本。
+    const keptSections = []
+    findAll(app, (node, ancestors) => {
+      if (node.type !== 'TaggedTemplateExpression') return
+      const section = markup.allElements(markup.markupOf(node))
+        .find((el) => el.name === 'section' && markup.hasClass(el, 'page'))
+      if (!section) return
+      const gates = ancestors.filter((ancestor) => ancestor.type === 'LogicalExpression')
+        .flatMap((ancestor) => callSites(ancestor, 'visited.has'))
+        .map((call) => call.arguments[0] && call.arguments[0].value)
+      keptSections.push({ section, gates })
+    })
     for (const key of ['overview', 'messages', 'logs', 'config', 'filter', 'sys']) {
-      assert.ok(src.includes(`visited.has('${key}')`), `${key} 页必须按 visited 保活渲染`)
-      const open = "visited.has('" + key + "') && html`<section class=\"page\" hidden=$" + "{tab !== '" + key + "'}>"
-      assert.ok(src.includes(open), `${key} 页的 hidden 必须比较自己的 tab，不能拿别的页签顶替`)
+      const hit = keptSections.filter((page) => page.gates.includes(key))
+      assert.strictEqual(hit.length, 1, `${key} 页必须按 visited 保活渲染（缺门 ⇒ 首帧就挂载/随时可能卸载）`)
+      assert.ok(sameShapeOf(markup.attrExpr(hit[0].section, 'hidden'), `tab !== '${key}'`),
+        `${key} 页的 hidden 必须比较自己的 tab，不能拿别的页签顶替`)
     }
-    assert.ok(src.includes('const [visited, setVisited] = useState(() => new Set(['),
-      '必须记录已挂载的页签集合')
-    assert.ok(src.includes('const next = new Set(visitedRef.current)') &&
-      src.includes('visitedRef.current = next') && src.includes('setVisited(next)'),
-    'markVisited 必须先复制 Set，再同时替换 ref 与 state（不能原地改 state 持有的 Set）')
-    assert.ok(!src.includes('visitedRef.current.add(key)'), '不得原地修改 state 持有的 Set')
-    assert.ok(src.includes('next.add(key)'), 'markVisited 必须把传入的 key 加进副本（不能写死别的页签）')
-    assert.ok(src.includes('for (const t of TABS) markVisited(t.key)'),
+    assert.ok(keptSections.length >= 6, '六个页签都必须有保活壳（section.page）')
+    // markVisited 必须先复制 Set，再同时替换 ref 与 state（不能原地改 state 持有的 Set）。
+    const visitedState = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'ArrayPattern' &&
+      n.id.elements.map((el) => el && el.name).join(',') === 'visited,setVisited')
+    assert.ok(visitedState && visitedState.init.type === 'CallExpression' && memberPath(visitedState.init.callee) === 'useState',
+      '必须记录已挂载的页签集合（const [visited, setVisited] = useState…）')
+    const markVisited = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      n.id.name === 'markVisited')
+    assert.ok(markVisited, 'App 必须有 markVisited')
+    assertShapeIn(markVisited, 'const next = new Set(visitedRef.current)', 'markVisited 必须先复制 Set')
+    assertShapeIn(markVisited, 'next.add(key)', 'markVisited 必须把传入的 key 加进副本（不能写死别的页签）')
+    assertShapeIn(markVisited, 'visitedRef.current = next', 'markVisited 必须替换 ref')
+    assertShapeIn(markVisited, 'setVisited(next)', 'markVisited 必须同时替换 state')
+    assertNoShapeIn(markVisited, 'visitedRef.current.add(key)', '不得原地修改 state 持有的 Set')
+    assertShapeIn(app, 'for (const t of TABS) markVisited(t.key)',
       '首屏后必须预挂载全部页签，刷新后第一次点击不闪加载占位')
-    assert.ok(src.includes('markVisited(next)') && src.includes("markVisited('logs')"),
-      '点击页签 / 查看日志 / hash 前进后退都必须登记保活')
-    // 已保活页直接落位；首访才垫高。
-    assert.ok(src.includes('if (!firstVisit)') && src.includes('window.scrollTo(0, Math.min(y, maxScroll))'),
+    assertShapeIn(app, 'markVisited(next)', '点击页签 / hash 前进后退都必须登记保活')
+    assertShapeIn(app, "markVisited('logs')", '查看日志也必须登记保活')
+    // 已保活页直接落位；首访才垫高（同一组判定在滚动还原里，重复断一次守住它的存在）。
+    const scrollEffect = callSites(app, 'useLayoutEffect').find((call) => {
+      const deps = call.arguments[1]
+      return deps && deps.type === 'ArrayExpression' && deps.elements.map((el) => exprLabel(el)).join(',') === 'tab,logJump'
+    })
+    assert.ok(scrollEffect, '必须有随 tab / logJump 重跑的滚动还原 layout effect')
+    assertShapeIn(scrollEffect, 'window.scrollTo(0, Math.min(y, maxScroll))',
       '已保活页必须在 layout effect 里直接调用 scrollTo 落到记忆位置')
-    assert.ok(src.includes('if (firstVisit && target > 0) holdScroll(target)'),
-      '只有首访才垫高文档')
-    const jumpBranch = src.slice(src.indexOf('if (logJumpPendingRef.current) {'), src.indexOf('const y = pendingScrollRef.current'))
-    assert.ok(jumpBranch.includes('pendingScrollRef.current = null') &&
-      jumpBranch.includes('pendingFirstVisitRef.current = false') &&
-      jumpBranch.includes('window.scrollTo(0, y)'),
-    'logJump 分支必须清掉 pending 引用，再落到定位条/顶部')
+    assertShapeIn(app, 'if (firstVisit && target > 0) holdScroll(target)', '只有首访才垫高文档')
+    const jumpBranch = findFirst(scrollEffect, (n) => n.type === 'IfStatement' &&
+      exprLabel(n.test) === 'logJumpPendingRef.current')
+    assert.ok(jumpBranch, 'layout effect 必须有 logJump 分支')
+    assertShapeIn(jumpBranch, 'pendingScrollRef.current = null', 'logJump 分支必须清掉 pending 位置')
+    assertShapeIn(jumpBranch, 'pendingFirstVisitRef.current = false', 'logJump 分支必须清掉首访标记')
+    assertShapeIn(jumpBranch, 'window.scrollTo(0, y)', 'logJump 分支必须落到定位条/顶部')
     // 隐藏页不轮询、不跟着倒计时重渲染、不保持 SSE。
-    assert.ok(src.includes("autoRefresh && tab === 'overview' ? pollMs : 0"), '概览隐藏后触发历史必须停轮询')
-    assert.ok(src.includes("autoRefresh && tab === 'logs' ? pollMs : 0"), '日志页隐藏后触发历史必须停轮询')
-    assert.ok(src.includes("autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0"), '日志页隐藏后日志轮询必须停')
-    assert.ok(src.includes("if (!autoOn || tab !== 'overview') return undefined"), '概览隐藏后倒计时时钟必须停')
-    assert.ok(src.includes('paused=$' + "{!autoRefresh || tab !== 'overview'}"), '概览隐藏后缓存健康分钟轮询必须停')
-    assert.ok(src.includes('if (openId === null || !active) return undefined'), '隐藏页的运行详情必须断开 SSE/轮询')
-    // 隐藏页不只不轮询，也不该生成工具条 DOM（L4）：保活面板切走后，
-    // date-btn / auto-run-row 会以 hidden 副本留在别的页面里，点击区与可检索文本都被污染。
-    assert.strictEqual((src.match(/active && html`<\$\{DateRange\}/g) || []).length, 4,
+    assertShapeIn(ui, "autoRefresh && tab === 'overview' ? pollMs : 0", '概览隐藏后触发历史必须停轮询')
+    assertShapeIn(ui, "autoRefresh && tab === 'logs' ? pollMs : 0", '日志页隐藏后触发历史必须停轮询')
+    assertShapeIn(ui, "autoRefresh && tab === 'logs' && locking ? POLL_BUSY_MS : 0", '日志页隐藏后日志轮询必须停')
+    assertShapeIn(ui, "if (!autoOn || tab !== 'overview') return undefined", '概览隐藏后倒计时时钟必须停')
+    assertShapeIn(pages, 'if (openId === null || !active) return undefined', '隐藏页的运行详情必须断开 SSE/轮询')
+    // 隐藏页不只不轮询，也不该生成工具条 DOM（L4）：保活面板切走后，date-btn / auto-run-row
+    // 会以 hidden 副本留在别的页面里，点击区与可检索文本都被污染。
+    const gatedTemplates = (name) => consoleAssetModels().flatMap((model) => findAll(model, (node) =>
+      node.type === 'LogicalExpression' &&
+      node.operator === '&&' && node.left.type === 'Identifier' && node.left.name === 'active' &&
+      node.right.type === 'TaggedTemplateExpression' &&
+      markup.allElements(markup.markupOf(node.right)).some((el) => el.name === name)))
+    assert.strictEqual(gatedTemplates('DateRange').length, 4,
       '四处 DateRange 都必须按 active 条件渲染（非活动面板不生成 date-btn）')
-    assert.strictEqual((src.match(/active && html`<div class="auto-run-row">/g) || []).length, 2,
-      '两处 auto-run-row（概览自动运行 / 系统页拦截窗）都必须按 active 条件渲染')
-    // 只读页切回静默刷新；带草稿的过滤规则页不得重拉覆盖。
-    assert.ok(src.includes('<$' + '{MessagesPanel} active=$' + "{tab === 'messages'}"), '推送记录页切回时必须静默刷新')
-    assert.ok(src.includes('active=$' + "{tab === 'logs'}"), '日志页切回时必须静默刷新')
-    assert.ok(src.includes('<$' + '{ConfigPanel} active=$' + "{tab === 'config'}"), '配置页切回时必须静默刷新')
-    assert.ok(src.includes('<$' + '{TrendsPanel} active=$' + "{tab === 'overview'}"), '趋势切回必须刷新')
-    assert.ok(src.includes('active=$' + "{tab === 'overview'} />"), '逐轮历史切回必须刷新')
-    assert.ok(src.includes('<$' + '{SysPanel} onReady=$' + '{onSysReady} active=$' + "{tab === 'sys'}"), '系统页切回必须刷新')
-    assert.ok(src.includes('<$' + '{FilesPanel} onReady=$' + '{onFilesReady} active=$' + "{tab === 'sys'}"), '文件清单切回必须刷新')
-    assert.ok(src.includes('<$' + '{FilterRulesPanel} onSync=$' + '{syncFor.filter} active=$' + "{tab === 'filter'}"), '过滤规则页必须拿到 active，首次打开补拉、之后切回不重拉')
-    const filterSeg = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('function App ()'))
-    assert.ok(!filterSeg.includes('if (active) load()'), '过滤规则页不得在切回时重拉')
+    assert.strictEqual(gatedTemplates('div').filter((node) => markup.allElements(markup.markupOf(node.right))
+      .some((el) => markup.hasClass(el, 'auto-run-row'))).length, 2,
+    '两处 auto-run-row（概览自动运行 / 系统页拦截窗）都必须按 active 条件渲染')
+    // 每个面板必须真的拿到 active（切回静默刷新），并且 SysPanel/FilesPanel 还要报 ready。
+    const appEls = templateRootsOf(app).flatMap((root) => markup.allElements(root))
+    const panelOf = (name) => appEls.find((el) => el.name === name)
+    for (const [panel, key] of [['MessagesPanel', 'messages'], ['LogsPanel', 'logs'], ['ConfigPanel', 'config'],
+      ['TrendsPanel', 'overview'], ['RunHistoryPanel', 'overview'], ['SysPanel', 'sys'], ['FilesPanel', 'sys'],
+      ['FilterRulesPanel', 'filter']]) {
+      const el = panelOf(panel)
+      assert.ok(el, `App 必须渲染 ${panel}`)
+      assert.ok(sameShapeOf(markup.attrExpr(el, 'active'), `tab === '${key}'`),
+        `${panel} 必须拿到 active=${key}（切回时静默刷新）`)
+    }
+    assert.ok(sameShapeOf(markup.attrExpr(panelOf('SysPanel'), 'onReady'), 'onSysReady'),
+      '系统页必须向滚动层报完成')
+    assert.ok(sameShapeOf(markup.attrExpr(panelOf('FilesPanel'), 'onReady'), 'onFilesReady'),
+      '文件清单必须向滚动层报完成')
+    assert.strictEqual(exprLabel(markup.attrExpr(panelOf('FilterRulesPanel'), 'onSync')), 'syncFor.filter',
+      '过滤规则页必须拿到自己的 onSync（首次打开补拉、之后切回不重拉）')
+    const filterPanel = markup.functionNodeOf(pages, 'FilterRulesPanel')
+    assertNoShapeIn(filterPanel, 'if (active) load()', '过滤规则页不得在切回时重拉')
     // 各面板自己必须真的消费 active（父组件传了 prop 但子组件不 reload 也算失败）。
-    const seg = (name, next) => src.slice(src.indexOf('function ' + name), src.indexOf(next))
-    assert.ok(seg('MessagesPanel', 'function LogsPanel').includes('usePanelAutoLoad(active, load)'), '推送记录必须首访预加载 + 切回刷新')
-    assert.ok(seg('LogsPanel', 'function SysPanel').includes('load(true).catch'), '日志切回必须排队补拉（busy 时不能丢）')
-    assert.ok(seg('ConfigPanel', 'function FilterRulesPanel').includes('usePanelAutoLoad(active, refresh)'), '配置必须首访预加载 + 切回刷新')
-    assert.ok(seg('TrendsPanel', 'function CacheHealthPanel').includes('usePanelAutoLoad(active, load)'), '趋势必须首访预加载 + 切回刷新')
-    assert.ok(seg('RunHistoryPanel', 'function usePanelLoader').includes('usePanelAutoLoad(active, load)'), '逐轮历史必须首访预加载 + 切回刷新')
-    assert.ok(seg('SysPanel', 'function FilesPanel').includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
-      '系统页必须等系统信息 + 访问日志 + 设置三条都结算后才报完成')
-    assert.ok(seg('FilesPanel', 'function FilterRules').includes('usePanelAutoLoad(active, load)'), '文件清单必须首访预加载 + 切回刷新')
-    const autoLoad = src.slice(src.indexOf('function usePanelAutoLoad'), src.indexOf('// ── 下拉刷新'))
-    assert.ok(autoLoad.includes('if (!active) return') && !autoLoad.includes('!active && !first'),
-      '首访懒加载：未点开的页签不得发请求（旧版 !active && !first 会在挂载时预取）')
-    assert.ok(autoLoad.includes('becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))'),
-      '切回仍在 3s 内 / 上一发在飞时不得重复发（Sourcery #272 同口径）')
-    assert.ok(seg('LogsPanel', 'function SysPanel').includes('const firstReveal = preloadedRef.current && active && !revealedRef.current'),
+    const fnOf = (name) => {
+      const node = markup.functionNodeOf(pages, name)
+      assert.ok(node, `pages.js 必须有 ${name}`)
+      return node
+    }
+    for (const panel of ['MessagesPanel', 'TrendsPanel', 'RunHistoryPanel', 'FilesPanel']) {
+      assertShapeIn(fnOf(panel), 'usePanelAutoLoad(active, load)', `${panel} 必须首访预加载 + 切回刷新`)
+    }
+    assertShapeIn(fnOf('ConfigPanel'), 'usePanelAutoLoad(active, refresh)', '配置必须首访预加载 + 切回刷新')
+    const logsPanel = fnOf('LogsPanel')
+    assertShapeIn(logsPanel, 'load(true).catch(() => {})', '日志切回必须排队补拉（busy 时不能丢）')
+    assertShapeIn(logsPanel, 'const firstReveal = preloadedRef.current && active && !revealedRef.current',
       '日志首访也要预加载，离开后不拉')
-    assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('filesLoader.load().catch'),
-      '缓存健康切回必须连右列文件清单一起补拉')
-    assert.ok(seg('CacheHealthPanel', '// 推送记录：').includes('if (wasPaused) {'), '缓存健康从暂停/隐藏恢复时必须立即补拉一次')
-    assert.ok(src.includes("return once('files', () =>") && src.includes("return once('filter', () =>"),
-      '三个面板同时要 /api/files（配置页/过滤规则页同时要过滤规则）时必须共享同一个在飞请求')
-    const onceFn = src.slice(src.indexOf('function once (key, fn)'), src.indexOf('function apiGetFiles'))
-    assert.ok(onceFn.includes('IN_FLIGHT.delete(key)') && onceFn.includes('p.then(clear, clear)'),
-      'once 必须在 settle 后清键（「请求结束即清」，不是 TTL 缓存）')
-    assert.ok(!onceFn.includes('setTimeout'), 'once 不得加 TTL/定时清理（那就变成缓存了）')
-    assert.ok(seg('FilesPanel', 'function FilterRules').includes('loadTick'),
-      '文件清单重拉完成也必须重报 ready，头部时间才会更新')
+    assertShapeIn(fnOf('SysPanel'), 'Promise.allSettled([load(), loadAccess(), loadSettings()])',
+      '系统页必须等系统信息 + 访问日志 + 设置三条都结算后才报完成')
+    const filesPanel = fnOf('FilesPanel')
+    assert.ok(findAll(filesPanel, (n) => n.type === 'Identifier' && n.name === 'loadTick').length >= 2,
+      '文件清单重拉完成也必须重报 ready，头部时间才会更新（loadTick）')
+    // 首访懒加载 + 3s 内不重复发（Sourcery #272 同口径）。
+    const autoLoad = fnOf('usePanelAutoLoad')
+    assertShapeIn(autoLoad, 'if (!active) return', '首访懒加载：未点开的页签不得发请求')
+    assertNoShapeIn(autoLoad, '!active && !first', '首访懒加载：旧版 !active && !first 会在挂载时预取')
+    assertIfConditionIn(autoLoad,
+      'becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))',
+      '切回仍在 3s 内 / 上一发在飞时不得重复发')
+    const cachePanel = fnOf('CacheHealthPanel')
+    assertShapeIn(cachePanel, 'filesLoader.load().catch(() => {})', '缓存健康切回必须连右列文件清单一起补拉')
+    assertIfConditionIn(cachePanel, 'wasPaused', '缓存健康从暂停/隐藏恢复时必须立即补拉一次')
+    // 三个面板同时要 /api/files（配置页/过滤规则页同时要过滤规则）时必须共享同一个在飞请求。
+    assert.strictEqual(callSites(api, 'once').filter((call) => call.arguments[0] &&
+      ['files', 'filter'].includes(call.arguments[0].value)).length, 2,
+    'apiGetFiles / apiGetFilter 必须走 once 的在飞去重')
+    const onceFn = findFirst(api, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'once')
+    assert.ok(onceFn, 'api.js 必须有 once(key, fn)')
+    assertShapeIn(onceFn, 'IN_FLIGHT.delete(key)', 'once 必须在 settle 后清键（「请求结束即清」，不是 TTL 缓存）')
+    assertShapeIn(onceFn, 'p.then(clear, clear)', 'once 必须在 settle 后清键（成功/失败都要清）')
+    assert.deepStrictEqual(callSites(onceFn, 'setTimeout').length, 0, 'once 不得加 TTL/定时清理（那就变成缓存了）')
     // 保活带来的两个交互坑：分类弹层要主动关（否则 body overflow:hidden 卡住新页面）；
     // 多个保留页面的确认弹窗不能共用固定 id。
-    assert.ok(seg('CategoryPicker', 'function MessagesPanel').includes('if (!pageActive && open) setOpen(false)'),
+    assertIfConditionIn(fnOf('CategoryPicker'), '!pageActive && open',
       '分类弹层必须在切走时主动关闭，释放 body 滚动锁')
-    assert.ok(src.includes('const [titleId] = useState(() => `confirm-title-$' + '{++dialogSeq}`') &&
-      src.includes('aria-labelledby=$' + '{titleId}') && src.includes('id=$' + '{titleId}'),
-    '确认弹窗标题 id 必须逐实例唯一')
-    assert.ok(/\.page\[hidden\]\s*\{\s*display:\s*none/.test(css), '隐藏页面必须真正 display:none，不能占布局')
-    assert.ok(/\.wrap\s*\{[^}]*display:\s*flex[^}]*min-height:\s*100dvh/.test(css),
-      '页脚贴底必须用列布局，不能靠写死的 100vh 减常量')
-    assert.ok(/\.page\s*\{\s*flex:\s*1 0 auto/.test(css), '当前页必须吃掉剩余高度')
-    assert.ok(!/\.page\s*\{[^}]*min-height:/.test(css), '不得再用固定减值的 min-height（短页会多出滚动）')
+    assertShapeIn(fnOf('CategoryPicker'), 'if (!pageActive && open) setOpen(false)', '分类弹层切走时要真的收起')
+    const confirmFn = findFirst(components, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'ConfirmDialog')
+    assert.ok(confirmFn, 'components.js 必须有 ConfirmDialog')
+    assertShapeIn(confirmFn, 'const [titleId] = useState(() => `confirm-title-$' + '{++dialogSeq}`)',
+      '确认弹窗标题 id 必须逐实例唯一')
+    const dialogEls = templateRootsOf(confirmFn).flatMap((root) => markup.allElements(root))
+    assert.ok(dialogEls.some((el) => exprLabel(markup.attrExpr(el, 'aria-labelledby')) === 'titleId') &&
+      dialogEls.some((el) => exprLabel(markup.attrExpr(el, 'id')) === 'titleId'),
+    '确认弹窗标题 id 必须逐实例唯一（aria-labelledby 与 id 必须绑同一个 titleId）')
+    // 隐藏页不占布局，页脚靠列布局贴底（不能写死 100vh 减常量）。
+    const rules = cssRulesOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8'))
+    assert.deepStrictEqual(cssDeclValuesOf(rules, '.page[hidden]', 'display'), ['none'],
+      '隐藏页面必须真正 display:none，不能占布局')
+    const wrapRule = cssRulesFor(rules, '.wrap')
+    assert.ok(wrapRule.some((rule) => rule.decls.get('display') === 'flex' &&
+      rule.decls.get('min-height') === '100dvh'),
+    '页脚贴底必须用列布局，不能靠写死的 100vh 减常量')
+    assert.deepStrictEqual(cssDeclValuesOf(rules, '.page', 'flex'), ['1 0 auto'], '当前页必须吃掉剩余高度')
+    assert.deepStrictEqual(cssRulesFor(rules, '.page').filter((rule) => rule.decls.has('min-height')).length, 0,
+      '不得再用固定减值的 min-height（短页会多出滚动）')
   })
 
   // ── C5-033 返工：函数体定位器自测 ──
@@ -10516,7 +10822,8 @@ async function main () {
     assert.ok(fromSpaced.length > 500, '带空格形态必须取到 >500 字节的函数体')
     assert.ok(fromTight.length > 500, `无空格形态（插桩后）必须取到 >500 字节，实取 ${fromTight.length}`)
     assert.strictEqual(fromTight, fromSpaced, '两种形态必须取到同一条函数体')
-    assert.ok(fromTight.includes('lockVerdict'), '取到的必须是函数体内容，不是签名')
+    assert.deepStrictEqual([fromTight, fromSpaced], ['\n' + body, '\n' + body],
+      '取到的必须是函数体内容，不是签名（两种签名形态逐字相同）')
     // 旧写法（定点串）在无空格形态上必然 miss：这就是「取 0 字节 → 恒抛」的根因。
     assert.strictEqual(tight.indexOf('function tickAuto ('), -1, '旧定点串在插桩后源码上必然 miss')
     // 真文件也过一遍：变异沙箱里读到的就是插桩后的 console.js。
@@ -10539,10 +10846,11 @@ async function main () {
       '}'
     ].join('\n')
     const block = ifArmBodyOf(src, { left: 'outcome', operator: '===', value: 'busy' })
-    assert.ok(block && block.includes('auto.busyRuns'), `必须取出 busy 分支：${block}`)
-    assert.ok(block.includes('auto.lastBusyAt'),
-      `字符串/注释里的花括号不得让分支截短（块被截短后负向断言会假绿）：${block}`)
-    assert.ok(!block.includes('auto.fails'), `不得把 else 分支吞进来：${block}`)
+    // 判据从「三处子串各有/各无」改成「整块与 fixture 的 busy 分支逐字相等」：截断（丢 lastBusyAt）、
+    // 吞 else（多出 auto.fails）、取错分支（少 busyRuns）三种破坏都当场变红，且不必再猜子串。
+    assert.strictEqual(block, '\n' + ['  auto.busyRuns += 1', "  console.warn('skip { not a block }')",
+      '  // } 注释里的花括号', '  /* } */ auto.lastBusyAt = 1'].join('\n') + '\n',
+    `取出的必须恰好是 busy 分支（字符串/注释里的花括号不得让它截短或吞掉 else）：${block}`)
     assert.strictEqual(ifArmBodyOf(src, { left: 'outcome', operator: '===', value: 'nope' }), null,
       '判定不存在必须返回 null（不静默返回空串）')
   })
@@ -10551,10 +10859,14 @@ async function main () {
     if (skipIfInstrumented('run-auto')) return
     const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    assert.ok(src.includes('const AUTO_MIN_S = 3') && src.includes('const AUTO_MAX_S = 20'),
-      '自动间隔必须夹在 3–20 秒')
-    assert.ok(src.includes('Math.min(AUTO_MAX_S') && src.includes('Math.max(AUTO_MIN_S'),
-      '保存/启动前必须统一 clamp 到 3–20')
+    // 前端侧：常量与夹紧函数在 components.js（AST 定位，不再在七模块拼接文本里找子串）。
+    const components = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    assertShapeIn(components, 'const AUTO_MIN_S = 3', '自动间隔必须夹在 3–20 秒（前端常量）')
+    assertShapeIn(components, 'const AUTO_MAX_S = 20', '自动间隔必须夹在 3–20 秒（前端常量）')
+    const clampUi = findFirst(components, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'clampAutoSeconds')
+    assert.ok(clampUi, 'components.js 必须有 clampAutoSeconds')
+    assertShapeIn(clampUi, 'Math.min(AUTO_MAX_S, Math.max(AUTO_MIN_S, n))',
+      '保存/启动前必须统一 clamp 到 3–20（先 max 下界再 min 上界）')
     const consoleSrc = fs.readFileSync(path.join(__dirname, 'scripts', 'console.js'), 'utf8')
     // 锚点必须落在 tickAuto 体内（按花括号配对取函数体）：`acquireLockResult(stateDir`
     // 还出现在布尔包装 acquireLock 与手动触发里，抓全文件等于恒真——把 tickAuto 的锁换成
@@ -10565,28 +10877,51 @@ async function main () {
     // 变异沙箱里 console.js 是机器生成代码（语句被 stryMutAct_* 条件包裹 + 覆盖率计数），
     // 所有源码串断言只对原始源文件有意义——与「测试隔离」红线同一口径，交 Test workflow 兜底。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
-      assert.ok(consoleSrc.includes('const AUTO_MIN_S = 3') && consoleSrc.includes('const AUTO_MAX_S = 20'),
-        '服务器端也必须夹在 3–20 秒')
+      // 服务器侧：同样按 AST 断（注释里的同句满足不了判据，格式化也不影响）。
       const tickAutoBody = functionBodyOf(consoleSrc, 'tickAuto')
-      assert.ok(consoleSrc.includes('const AUTO_MAX_FAILS = 12') && consoleSrc.includes('const AUTO_RETRY_MS = 10 * 1000') && tickAutoBody !== '' &&
-        consoleSrc.includes("startAction('run-auto'") &&
-        tickAutoBody.includes('acquireLockResult(stateDir, now, runToken)') &&
-        tickAutoBody.includes('if (!lockVerdict.ok)'),
-      '自动调度必须在服务器进程内跑 run-auto，并在 tickAuto 体内先取单飞锁（锚点落在函数体内）')
-      assert.ok(consoleSrc.includes('activeChildren.size > 0') && consoleSrc.includes('autoInFlightId'),
-        '上一轮未结束不得叠跑')
-      assert.ok(consoleSrc.includes('AUTO_STATE_FILE') && consoleSrc.includes('persistAuto'),
-        '自动开关/间隔必须由服务器持久化，重启可恢复')
+      assert.ok(tickAutoBody.length > 500, 'tickAuto 函数体必须取得到（下面的落盘次数断言要有对象）')
+      const server = loadModel(path.join(__dirname, 'scripts', 'console.js'))
+      assertShapeIn(server, 'const AUTO_MIN_S = 3', '服务器端也必须夹在 3–20 秒')
+      assertShapeIn(server, 'const AUTO_MAX_S = 20', '服务器端也必须夹在 3–20 秒')
+      assertShapeIn(server, 'const AUTO_MAX_FAILS = 12', '连续失败阈值必须是 12 轮（与文案一致）')
+      assertShapeIn(server, 'const AUTO_RETRY_MS = 10 * 1000', '降级重试间隔必须是 10 秒')
+      // 锚点必须落在 tickAuto 体内：`acquireLockResult(stateDir` 还出现在布尔包装 acquireLock 与手动触发里，
+      // 抓全文件等于恒真（C2-006 返工实测）。AST 里 tickAuto 就是那个函数声明，作用域天然精确。
+      const tickAuto = findFirst(server, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'tickAuto')
+      assert.ok(tickAuto, 'console.js 必须有 tickAuto（服务器端自动调度）')
+      assert.ok(callSites(tickAuto, 'startAction').some((call) => call.arguments[0] && call.arguments[0].value === 'run-auto'),
+        '自动调度必须在服务器进程内跑 run-auto（tickAuto 体内实参必须是 run-auto）')
+      assertShapeIn(tickAuto, 'const lockVerdict = acquireLockResult(stateDir, now, runToken)',
+        'tickAuto 体内必须先取单飞锁（锚点落在函数体内）')
+      assertIfConditionIn(tickAuto, '!lockVerdict.ok', '锁没拿到时必须走失败/让路分支（不得当成功往下跑）')
+      assertIfConditionIn(tickAuto, 'autoInFlightId || activeChildren.size > 0',
+        '上一轮未结束不得叠跑（autoInFlightId 或 activeChildren 非空就重排）')
+      assertShapeIn(server, "const AUTO_STATE_FILE = 'console-auto.json'", '自动开关/间隔必须由服务器持久化（状态文件名）')
+      const persistAuto = findFirst(server, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+        n.id.name === 'persistAuto')
+      assert.ok(persistAuto, '自动开关/间隔必须由服务器持久化（persistAuto）')
+      assert.ok(callSites(persistAuto, 'writeAtomic').length >= 1, '自动状态落盘必须走 writeAtomic（崩溃不留半截 JSON）')
       // v3.408：连续失败不得再永久停机——降级重试必须真的接在失败分支上（只加常量不算）
-      assert.ok(consoleSrc.includes('function autoNextDelay') && tickAutoBody.includes('auto.degraded = true') &&
-        tickAutoBody.includes('auto.degraded = false') && tickAutoBody.includes('scheduleAuto(autoNextDelay())'),
-      '连续失败后必须转入 10 秒降级重试，成功后回到正常间隔')
-      assert.ok(tickAutoBody.includes('record.spawnError') && tickAutoBody.includes('AUTO_MAX_SPAWN_FAILS') &&
-        tickAutoBody.includes('stopAuto'),
-      '子进程启动失败（spawn ENOENT/EMFILE）不得按源站抖动无限重试')
-      assert.ok(consoleSrc.includes('degraded: auto.degraded === true') &&
-        consoleSrc.includes('fails: Number.isInteger(auto.fails)'),
-      '降级态与失败计数必须随 console-auto.json 跨重启保留')
+      assert.ok(findFirst(server, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'autoNextDelay'),
+        '必须有 autoNextDelay（降级 10 秒 / 正常间隔的唯一出口）')
+      assertShapeIn(tickAuto, 'auto.degraded = true', '连续失败后必须转入降级重试')
+      assertShapeIn(tickAuto, 'auto.degraded = false', '成功后必须回到正常间隔（清降级态）')
+      assert.ok(callSites(tickAuto, 'scheduleAuto').filter((call) => call.arguments[0] &&
+        call.arguments[0].type === 'CallExpression' && memberPath(call.arguments[0].callee) === 'autoNextDelay').length >= 2,
+      '连续失败后必须转入 10 秒降级重试，成功后回到正常间隔（重排必须走 autoNextDelay）')
+      assertIfConditionIn(tickAuto, 'record.spawnError', '子进程启动失败必须单独判定（spawn ENOENT/EMFILE）')
+      assert.ok(findAll(tickAuto, (n) => n.type === 'Identifier' && n.name === 'AUTO_MAX_SPAWN_FAILS').length >= 1,
+        '子进程启动失败（spawn ENOENT/EMFILE）不得按源站抖动无限重试（连续次数要受上限约束）')
+      assert.ok(callSites(tickAuto, 'stopAuto').length >= 1,
+        '子进程启动失败（spawn ENOENT/EMFILE）不得按源站抖动无限重试（到上限必须停机）')
+      // 跨重启保留：落盘 payload 里必须带 degraded（严格 === true）与 fails（数值校验）。
+      const autoPayload = findAll(persistAuto, (n) => n.type === 'ObjectExpression' &&
+        (objectKeyNames(n) || []).includes('degraded'))
+      assert.strictEqual(autoPayload.length, 1, '降级态必须随 console-auto.json 跨重启保留（落盘对象只有一处）')
+      assertShapeIn(autoPayload[0], 'auto.degraded === true',
+        '降级态必须随 console-auto.json 跨重启保留（严格 === true，不写 1 / 字符串）')
+      assertShapeIn(autoPayload[0], 'Number.isInteger(auto.fails)',
+        '失败计数必须随 console-auto.json 跨重启保留（按整数校验）')
       assert.ok((tickAutoBody.match(/persistAuto\(\)/g) || []).length >= 2,
         '进入/退出降级都必须 persistAuto()，否则字段存在但永不写盘')
       assert.ok(consoleSrc.includes('AUTO_MAX_MS') === false, '不得再有 10 分钟总时长上限')

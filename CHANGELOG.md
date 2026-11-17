@@ -2150,3 +2150,18 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **`node scripts/check-source-text-asserts.js` → exit 0**：`基线 total=1888（35 个文件），实测 total=1888（扫描 69 个测试面文件）`、`✓ 基线相对参照 origin/main 未增长（逐文件与 total 一致：1888 条）`、`✅ 扫描面内未新增源码文本断言（逐文件计数均未超基线）`；白名单 **前 1888 → 后 1888**（`test_console.js` 1517 → 1517）——本轮只把 AST 断言**收紧**（新增判据全部读 AST、不读源码文本），条数不变、也未新增。
   - `npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.490`；`node scripts/check-doc-lines.js` → `✅ 文档行长全部通过`。
   - **版本**：3.489.0 → **3.490.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
+
+## v3.491
+
+- **assertshape C3：`test_console.js` 第 3 段（98 条清单项）源码文本断言全部改成 AST 结构断言 / 解析后字段断言；只动 `test_console.js`、白名单与版本四方，生产逻辑一行未改**：
+  - **判据换法（四式）**：把「读七模块拼接文本找子串」换成 `test_support/source_model.js` 的 AST——新增 `shapeSignatureOf` / `assertShapeIn` / `assertNoShapeIn` / `assertIfConditionIn` / `sameShapeOf` 五个助手（放在 `polarLabel` 之后），把期望片段解析成节点后按「节点类型 + 运算符 + 标识符名 + 字面量值 + 子节点」逐字段比对（位置/空白/注释/raw 不参与）。CSS 侧走已有的 `cssRulesOf` 解析结果比 `decls`（含 `@media` 归属），模板侧走 `test_support/markup.js` 的 `attrExpr` / `allElements` 比属性表达式形状，`console.js` 侧同样按 AST 定位 `tickAuto` / `persistAuto` 再断体内结构。分布：式①AST 结构断言约九成（含 `console.js` 与模板属性）、式②解析后字段断言 8 处（`app.css` 规则与色值）、式③fixture 行为断言 2 处（两个「文本定位器自测」改成与 fixture 逐字相等）、式④删除 0 处。
+  - **比旧写法更严的三点（也说明为什么不是 `includes` 换皮）**：①注释里复述同一句不再能替判据兜底——`codeOf` 剥注释、正则抠整块文本都做不到（`60000` 那条旧写法正是被注释复述绕过的），AST 里注释根本不参与；②片段必须**完整命中一个节点**，`x = y` 不会撞上 `x = y + 1`；③运算符与极性是节点字段（`&&` vs `||`、`!` 取反、`===`、`const` kind、`Math.min`/`Math.max` 的先后）——旧写法把整段文本缩成子串时会丢掉的正是这些。
+  - **典型替换**：切页还原从「整块文本含 `holdAnchor()` 且含 `window.scrollTo(0, y)`」改成「同一 `BlockStatement` 里按语句顺序 `holdAnchor()` 在 `scrollTo` 之前」（顺带守住了「嵌套在 `check()` 里的 `scrollTo` 不算」）；`syncFor` 从「文本含 `syncMemRef.current[key] = ts`」改成「`useMemo` 的返回对象键恰为 `messages/search/logs/config/filter` 且守卫条件是 `tabRef.current === key`」；页签保活从「六个 `visited.has('<key>')` + six `hidden=${tab !== '<key>'}` 子串都在」改成「每个 `section.page` 的 `hidden` 属性表达式形状是 `tab !== '<key>'`，且该模板的 `visited.has('<key>')` 门在祖先逻辑与链上」，`tab === '<key>'` 顶替、缺门都会红；`console.js` 侧把「全文含 `acquireLockResult(stateDir`」收到 `tickAuto` 函数体内（全文版本被布尔包装 `acquireLock` 满足，等于恒真）。
+  - **反向验证（3 条各破坏一次 → 跑整套件 → 按文件还原并 md5 比对；3/3 变红且文案对得上）**：
+    - ① `ui.js:466` `if (from && from !== next)` 的 `&&` 改成 `||`（运算符破坏）→ `❌ 结构红线: 标签页吸顶、切页回顶、缓存每分钟刷新: 切页前必须记住出发页的滚动位置（且只记真正离开的那一页）（缺结构：if (from && from !== next) scrollMemRef.current[from] = y）`，`375 / 1`（exit 1）；还原后 `376 / 0`（exit 0）。
+    - ② `app.css:1083` `.ls-cfg-msg.is-bad` 的 `var(--bad-fg)` 改成 `var(--ok-fg)`（解析后字段破坏）→ `❌ 结构红线: 保存设置的失败提示必须按 tone 拼 is-ok/is-bad（回退修复即红）: .ls-cfg-msg.is-bad 必须用 --bad-fg（失败提示不得再是成功绿）`，`375 / 1`（exit 1）；还原后 `376 / 0`。
+    - ③ `ui.js:1264` `hidden=${tab !== 'overview'}` 改成 `tab === 'overview'`（模板属性极性破坏）→ `❌ 结构红线: 页签保活（切回已访问页签不重挂载、不塌陷、不重新占位）: overview 页的 hidden 必须比较自己的 tab，不能拿别的页签顶替`（同时 C4 段的文本断言也红，`374 / 2`，exit 1）；还原后 `376 / 0`。
+  - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0，**31.2s**（改前同为 376 / 0）；`node scripts/probe-format-coupling.js test_console.js` → **exit 1**，`format-coupled 1 / format-clean 0`，首红 `↳ ❌ 结构红线: 自动正式运行（3–20s / 数字框 / 加减 / 保存 / 停止）: 进入/退出降级都必须 persistAuto()，否则字段存在但永不写盘` 在 **L10925**，而本轮最后一个 hunk 到 **L10924** 为止（`git diff -U0` 新侧 `@@ -10581,9 +10905,20 @@`），即该红点在编辑区之外、属 C4 清单里那条 `persistAuto()` 计数，如实记为遗留。
+  - **`node scripts/check-source-text-asserts.js` → exit 0**：白名单 **前 1888 → 后 1682**（`test_console.js` **1517 → 1311**，−206 个比对点），只改了 `total` 与 `test_console.js` 两行，其它文件计数一字未动。
+  - `npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.491`；`node scripts/check-doc-lines.js` → 通过。
+  - **版本**：3.490.0 → **3.491.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 两处）。
