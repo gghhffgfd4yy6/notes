@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.499 — assertshape C5 第 4 轮：1 条 must_fix 把「结算」断言钉到被调函数（TriggerBar 的 live 必须由 triggerResultLine 算出、再与被调实参 lastTrigger/lastRun 一起判，换成只吃一个 run 的 runOutcome 即红），反向破坏只红 1 条、纯格式重排不误红；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.500 — assertshape C6：test_console.js 第 6 段 98 条「读源码文本」断言整段换成结构断言（判 callee + 实参、渲染门、语句下标、解析后的 CSS 声明），并新增「把生产纯函数取出来真跑」的行为断言；16 块逐块对照、式4 删除 0；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

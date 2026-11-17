@@ -96,7 +96,7 @@ function readConsoleServerSource () {
 //   ③ 运行期产出（HTTP 响应、审计文件、锁文件、SSE 字节流、日志尾读）→ 先解析再断字段/行。
 // 共同点：注释里的同句不能冒充实现（旧的 src.includes 会被注释满足），格式化也不影响结论。
 const { loadModel } = require('./test_support/source_model')
-const { parseText, findFirst, findAll, callSites, memberPath, objectKeyNames, importBindings } = require('./test_support/ast_query')
+const { parseText, findFirst, findAll, callSites, memberPath, objectKeyNames, importBindings, declaresVariable } = require('./test_support/ast_query')
 const markup = require('./test_support/markup')
 
 const CONSOLE_ASSET_DIR = path.join(__dirname, 'scripts', 'console-assets')
@@ -201,6 +201,119 @@ function cssBaseDeclValuesOf (rules, selector, prop) {
   return cssRulesFor(rules, selector)
     .filter((rule) => !rule.at.some((at) => at.startsWith('@media')))
     .map((rule) => rule.decls.get(prop)).filter((value) => value !== undefined)
+}
+// 同名属性声明两次（`min-height: 62vh` 再 `min-height: min(62dvh, 520px)`）时 Map 只留最后一个，
+// 而「两档都在」正是这类兜底判据的全部内容。同样扫规则体，但保留**声明列表**。
+function cssRuleListOf (text) {
+  const rules = []
+  const stripped = String(text).replace(/\/\*[\s\S]*?\*\//g, '')
+  const declsOf = (body) => body.split(';').map((decl) => {
+    const colon = decl.indexOf(':')
+    if (colon < 0) return null
+    const name = decl.slice(0, colon).trim()
+    return name === '' ? null : [name, decl.slice(colon + 1).trim()]
+  }).filter((entry) => entry !== null)
+  const walk = (chunk, parents) => {
+    let i = 0
+    for (;;) {
+      const open = chunk.indexOf('{', i)
+      if (open < 0) return
+      const semi = chunk.indexOf(';', i)
+      if (semi >= 0 && semi < open) { i = semi + 1; continue }
+      const selector = chunk.slice(i, open).trim()
+      let depth = 1
+      let j = open + 1
+      while (j < chunk.length && depth > 0) {
+        if (chunk[j] === '{') depth++
+        else if (chunk[j] === '}') depth--
+        if (depth === 0) break
+        j++
+      }
+      const body = chunk.slice(open + 1, j)
+      if (selector.startsWith('@')) walk(body, parents.concat(selector))
+      else rules.push({ selector, decls: declsOf(body), at: parents.slice() })
+      i = j + 1
+    }
+  }
+  walk(stripped, [])
+  return rules
+}
+// 节点在 root 里的祖先链（由外到内）。判「这段模板被哪些条件包住」必须看链，不能只判节点自己。
+function ancestorsOf (root, target) {
+  let chain = []
+  findAll(root, (node, ancestors) => {
+    if (node === target && chain.length === 0) chain = ancestors.slice()
+    return false
+  })
+  return chain
+}
+// 函数内静态段含 fragment 的 html`` 模板（嵌套模板一并返回：分支里的元素也要能定位）。
+function templateIn (node, fragment) {
+  return markup.templatesIn(node).filter((tpl) => tpl.quasi.quasis.map((quasi) => quasi.value.raw).join('').includes(fragment))
+}
+function elementsOfTemplate (tpl) {
+  return markup.allElements(markup.markupOf(tpl, { expandTemplates: true }))
+}
+// 模板的「渲染门」：`x && html`…`` / `cond ? html`…` : …` / `if (cond) return html`…``。
+// 返回外层→内层的判定标签；空数组 = 无条件渲染。旧文本断言判「有没有某个子串」，
+// 这里判「这段模板到底在不在条件里」——把 `cond && ` 删掉/换个条件都会变红。
+function renderGuardsOf (root, tpl) {
+  const chain = ancestorsOf(root, tpl).concat(tpl)
+  const guards = []
+  for (let i = 0; i < chain.length - 1; i++) {
+    const node = chain[i]
+    const child = chain[i + 1]
+    if (node.type === 'LogicalExpression' && node.operator === '&&' && child === node.right) guards.push(exprLabel(node.left))
+    else if (node.type === 'ConditionalExpression') guards.push(exprLabel(node.test))
+    else if (node.type === 'IfStatement' && child === node.consequent) guards.push(exprLabel(node.test))
+    else if (node.type === 'IfStatement' && child === node.alternate) guards.push(`!(${exprLabel(node.test)})`)
+  }
+  return guards
+}
+// 属性表达式里的条件式：markup 给到的可能是条件式本身，也可能外面还包着一层模板/逻辑。
+// 判「test 与两支分别是什么」必须先真的拿到那个 ConditionalExpression。
+function conditionalAttrOf (el, name) {
+  const expr = markup.attrExpr(el, name)
+  if (!expr) return null
+  if (expr.type === 'ConditionalExpression') return expr
+  return findFirst(expr, (node) => node.type === 'ConditionalExpression')
+}
+// 行为断言：把生产模块里的**纯函数**取出来在一个只有标准对象的上下文里真跑。
+// 断言的是「算出什么」，不是「源码里写了什么」——`slice(11)` 改成 `slice(12)` 这类
+// 只差一位的改法，AST 断言只能按形状拦住，行为断言直接看输出。上下文里刻意没有
+// DOM/fetch/require：纯函数能跑起来本身就说明它真的没碰宿主环境。
+function evalPureFunctions (file, names, extra = {}) {
+  const vm = require('node:vm')
+  const text = fs.readFileSync(file, 'utf8')
+  const model = loadModel(file)
+  const sources = names.map((name) => {
+    const node = findFirst(model, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === name)
+    assert.ok(node, `${path.basename(file)} 里必须有 ${name}（行为断言的执行对象）`)
+    return text.slice(node.start, node.end)
+  })
+  const context = vm.createContext({ Date, Math, Number, String, Object, Array, JSON, ...extra })
+  return vm.runInContext(`${sources.join('\n')}\n;({ ${names.join(', ')} })`, context)
+}
+// 文件里的注释行（判「注释里提前写了下一版版本号」这类事）：只收整行注释，
+// 不碰字符串字面量（`'// x'` 不会被当成注释），也不做整文件正则。
+function commentTextsOf (file) {
+  const out = []
+  let inBlock = false
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    const text = line.trim()
+    if (inBlock) {
+      out.push(text)
+      if (text.includes('*/')) inBlock = false
+      continue
+    }
+    if (text.startsWith('/*')) {
+      out.push(text)
+      if (!text.includes('*/')) inBlock = true
+      continue
+    }
+    if (text.startsWith('//')) out.push(text)
+  }
+  return out
 }
 
 // 属性表达式（或任意表达式）的「拼装零件」：字符串字面量（含模板静态段）与标识符引用。
@@ -13239,577 +13352,1121 @@ async function main () {
     // E. fmtAge 是纯函数（export 出去、可被两处共用）。
     assert.ok(pureModel.exports.has('fmtAge'), 'fmtAge 必须由 pure.mjs 导出（服务端与前端同口径）')
   })
+  // ── 复制兜底：textarea + execCommand（非安全上下文唯一可用路径）────────────────
   await aok('结构红线: v3.385 复制兜底（非安全上下文 / 剪贴板被拒时仍能复制）', () => {
-    const src = readConsoleSource()
-    const at = src.indexOf('function copyViaTextarea')
-    const end = src.indexOf('function TwoFactorBlock', at)
-    assert.ok(at > -1 && end > at, '应能定位 copyViaTextarea')
-    const seg = src.slice(at, end)
-    // 触发条件：navigator.clipboard 只在安全上下文存在，http://局域网 IP 下必须是 undefined。
-    assert.ok(seg.includes("document.createElement('textarea')") && seg.includes("document.execCommand('copy')"),
-      '必须用 textarea + execCommand 兜底（非安全上下文唯一可用路径）')
-    assert.ok(seg.includes("el.setAttribute('readonly', '')"), 'textarea 必须只读（否则 iOS 弹键盘）')
-    assert.ok(seg.includes('el.setSelectionRange(0, String(text).length)'),
-      'iOS Safari 只认 setSelectionRange（单靠 select() 复制出来是空串）')
-    assert.ok(/finally\s*\{[\s\S]{0,80}parentNode\.removeChild\(el\)/.test(seg), 'textarea 必须在 finally 里摘掉（不留节点）')
-    assert.ok(seg.includes("typeof document.execCommand === 'function'"), 'execCommand 必须能力探测（旧 WebView 可能没有）')
-    // 调用侧：先异步剪贴板，失败/不可用再降级；两条都失败才报错并给手动提示。
-    const copyAt = src.indexOf('const copyText = async (text) => {')
-    const copySeg = src.slice(copyAt, src.indexOf('const secretGroups =', copyAt))
-    assert.ok(copyAt > -1 && copySeg.includes("navigator.clipboard && typeof navigator.clipboard.writeText === 'function'"),
-      '优先走 navigator.clipboard（安全上下文下的正常路径）')
-    assert.ok(copySeg.includes('if (err === null || copyViaTextarea(text))'), '异步接口被拒时必须降级到 execCommand（不是直接报错）')
-    assert.ok(copySeg.includes('请手动选中密钥复制'), '两条都失败时必须保留手动复制提示')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const copyFn = markup.functionNodeOf(pagesModel, 'copyViaTextarea')
+    assert.ok(copyFn, '必须能定位 copyViaTextarea（复制兜底的本体）')
+    // 载体：document.createElement('textarea')，且返回值就是后面 el.* 指向的那个节点。
+    const elDecl = findFirst(copyFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'el')
+    assert.ok(elDecl && elDecl.init.type === 'CallExpression' && memberPath(elDecl.init.callee) === 'document.createElement' &&
+      callArgLabels(elDecl.init).join(',') === '"textarea"',
+    '必须用 textarea 承载复制（document.createElement(\'textarea\')：非安全上下文唯一可用路径）')
+    // 必须挂进 body，否则 select() 选不中。
+    assert.deepStrictEqual(callSites(copyFn, 'document.body.appendChild').map((call) => callArgLabels(call).join(',')), ['el'],
+      'textarea 必须挂进 body（不挂进去 select() 选不中）')
+    // 只读：iOS 不弹键盘。
+    assert.deepStrictEqual(callSites(copyFn, 'el.setAttribute').map(callArgLabels), [['"readonly"', '""']],
+      'textarea 必须只读（否则 iOS 弹键盘）')
+    // iOS Safari 只认 setSelectionRange，且必须选满整段。
+    const rangeCalls = callSites(copyFn, 'el.setSelectionRange')
+    assert.strictEqual(rangeCalls.length, 1, '必须调 setSelectionRange（单靠 select() 复制出来是空串）')
+    assert.strictEqual(exprLabel(rangeCalls[0].arguments[0]), '0', 'setSelectionRange 起点必须是 0')
+    assert.ok(sameShapeOf(rangeCalls[0].arguments[1], 'String(text).length'),
+      'setSelectionRange 必须选满整段（0 → String(text).length）')
+    // 能力探测与真调用在同一句：旧 WebView 没有 execCommand 时不能直接炸。
+    const okAssigns = findAll(copyFn, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'ok')
+    assert.ok(okAssigns.some((node) => sameShapeOf(node.right, "typeof document.execCommand === 'function' && document.execCommand('copy')")),
+      'execCommand 必须能力探测后再调 copy（缺探测会让旧 WebView 抛异常）')
+    // 摘节点必须在 finally：异常路径也不留 DOM 节点。
+    const tryStmt = findFirst(copyFn, (n) => n.type === 'TryStatement')
+    assert.ok(tryStmt && tryStmt.finalizer, '必须有 try/finally（异常路径也要摘节点）')
+    assert.deepStrictEqual(callSites(tryStmt.finalizer, 'el.parentNode.removeChild').map((call) => callArgLabels(call).join(',')), ['el'],
+      'textarea 必须在 finally 里摘掉（不留节点）')
+    // 调用侧：先异步剪贴板，被拒/不可用再降级；两条都失败才报错并给手动提示。
+    const block = markup.functionNodeOf(pagesModel, 'TwoFactorBlock')
+    const copyTextDecl = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'copyText')
+    assert.ok(copyTextDecl && copyTextDecl.init.type === 'ArrowFunctionExpression' && copyTextDecl.init.async === true,
+      'copyText 必须是 TwoFactorBlock 里的异步函数（复制入口）')
+    const copyText = copyTextDecl.init
+    const clipboardGuard = findAll(copyText, (n) => n.type === 'IfStatement')
+      .find((n) => sameShapeOf(n.test, "navigator.clipboard && typeof navigator.clipboard.writeText === 'function'"))
+    assert.ok(clipboardGuard, '优先走 navigator.clipboard（安全上下文下的正常路径）')
+    assert.deepStrictEqual(callSites(clipboardGuard.consequent, 'navigator.clipboard.writeText').map((call) => callArgLabels(call).join(',')), ['text'],
+      '剪贴板分支必须真的写入 text（只判断能力不发请求等于没复制）')
+    const fallback = findAll(copyText, (n) => n.type === 'IfStatement')
+      .find((n) => sameShapeOf(n.test, 'err === null || copyViaTextarea(text)'))
+    assert.ok(fallback, '异步接口被拒时必须降级到 execCommand（err === null || copyViaTextarea(text)），不得直接报错')
+    assert.deepStrictEqual(callSites(fallback.consequent, 'setNote').map((call) => callArgLabels(call).join(',')), ['"已复制到剪贴板。"'],
+      '降级成功后必须给出「已复制」反馈（失败与成功不得同屏）')
+    assert.ok(stringValuesOf(copyText).some((value) => value.includes('请手动选中密钥复制')),
+      '两条都失败时必须保留手动复制提示')
+    // 复制入口上方那一段：密钥必须按 4 位分组显示（否则一长串字符没法手抄）。
+    assert.strictEqual(findAll(block, (n) => n.type === 'Literal' && n.regex && n.regex.pattern === '(.{4})').length, 1,
+      '密钥必须按 4 位分组显示（分组正则只能有一处）')
+    const secretDecl = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'secretGroups')
+    assert.ok(secretDecl && secretDecl.init.type === 'ConditionalExpression', '必须有 secretGroups（分组后的密钥文本）')
+    const secretRendered = elementsInFunction(pagesModel, 'TwoFactorBlock')
+      .flatMap((el) => markup.expressionsIn(el)).map(exprLabel).filter((label) => label === 'secretGroups')
+    assert.ok(secretRendered.length >= 1,
+      '分组后的密钥必须真的渲染到页面上（只算不显示等于没做）')
   })
+
+  // ── 备份块：Drawer 承载 + HTTPS 校验顺序 + 导入幂等键 ──────────────────────────
   await aok('结构红线: 备份块用 Drawer 承载 + HTTPS 校验 + 导入幂等键', () => {
-    const src = readConsoleSource()
-    const at = src.indexOf('function BackupBlock')
-    const end = src.indexOf('function TwoFactorBlock', at)
-    const seg = src.slice(at, end)
-    const ph = (name) => '$' + '{' + name + '}'
-    assert.ok(at > -1 && end > at, '应能定位 BackupBlock')
-    const drawerAt = seg.indexOf('<' + ph('Drawer') + ' open=' + ph('open'))
-    assert.ok(drawerAt > -1, '备份块必须用 Drawer 承载（不再自绘 modal 层）')
-    assert.ok(seg.includes('width=' + ph('520')), '抽屉宽必须是 520')
-    assert.ok(seg.includes('busy=' + ph("busy !== '' || !!pending")) && seg.includes('onClose=' + ph('closeDrawer')),
-      '导入进行中必须 busy（抽屉关不掉）')
-    // HTTPS 校验仍在，且排在请求导出接口之前：HTTP 下不得先向服务器要明文。
-    const doExportAt = seg.indexOf('const doExport =')
-    const secureAt = seg.indexOf('window.isSecureContext', doExportAt)
-    const apiAt = seg.indexOf('apiPostBackupExport(categories)', doExportAt)
-    assert.ok(doExportAt > -1 && secureAt > doExportAt && apiAt > secureAt,
-      '导出必须先检查 isSecureContext/WebCrypto，再请求明文')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const block = markup.functionNodeOf(pagesModel, 'BackupBlock')
+    assert.ok(block, '必须能定位 BackupBlock')
+    const drawer = elementsInFunction(pagesModel, 'BackupBlock').find((el) => el.name === 'Drawer')
+    assert.ok(drawer, '备份块必须用 Drawer 承载（不再自绘 modal 层）')
+    assert.strictEqual(exprLabel(markup.attrExpr(drawer, 'open')), 'open', '抽屉开合必须由 open state 驱动')
+    assert.strictEqual(markup.attrText(drawer, 'title'), '数据备份与恢复', '抽屉标题必须是「数据备份与恢复」')
+    assert.strictEqual(exprLabel(markup.attrExpr(drawer, 'width')), '520', '抽屉宽必须是 520')
+    assert.strictEqual(exprLabel(markup.attrExpr(drawer, 'onClose')), 'closeDrawer',
+      '关闭必须走 closeDrawer（它负责在 busy 时拒关并清掉本次密码）')
+    // 导入进行中必须 busy：busy 三态与「待确认」任一成立都算。
+    assert.strictEqual(polarLabel(markup.attrExpr(drawer, 'busy')), 'busy !== "" || !!pending',
+      '导入进行中必须 busy（抽屉关不掉；pending 待确认也算）')
+    // HTTPS 校验必须在请求导出接口之前：HTTP 下不得先向服务器要明文。
+    const doExportDecl = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'doExport')
+    assert.ok(doExportDecl && doExportDecl.init.type === 'ArrowFunctionExpression', '必须有 doExport')
+    const body = doExportDecl.init.body.body
+    const secureAt = body.findIndex((stmt) => stmt.type === 'IfStatement' &&
+      exprLabel(stmt.test) === '!window.isSecureContext || !window.crypto || !window.crypto.subtle')
+    const apiAt = body.findIndex((stmt) => callSites(stmt, 'apiPostBackupExport').length > 0)
+    assert.ok(secureAt > -1, '导出必须先检查 isSecureContext / WebCrypto（条件式要判整条 test）')
+    assert.ok(apiAt > -1, '导出必须请求 /api/backup/export')
+    assert.ok(secureAt < apiAt,
+      `必须先检查安全上下文再请求明文（isSecureContext 在第 ${secureAt} 条语句，导出请求在第 ${apiAt} 条）`)
     // 导入幂等键：明文与加密两条路径各生成一次，确认时把同一个 key 原样传给服务端。
-    assert.strictEqual((seg.match(/key: newBackupImportKey\(\)/g) || []).length, 2,
-      '明文与加密两条路径都要为这次导入生成幂等键')
-    assert.ok(seg.includes('apiPostBackupImport(pending.bundle, pending.key)'), '导入必须带上同一个幂等键')
+    const pendingObjs = callSites(block, 'setPending').map((call) => call.arguments[0])
+      .filter((arg) => arg && arg.type === 'ObjectExpression')
+    assert.strictEqual(pendingObjs.length, 2, '明文与加密两条导入路径各要 setPending 一次')
+    const keyPropOf = (obj) => obj.properties.find((prop) => prop.key && prop.key.name === 'key')
+    assert.ok(pendingObjs.every((obj) => keyPropOf(obj) && sameShapeOf(keyPropOf(obj).value, 'newBackupImportKey()')),
+      '两条路径都要为这次导入生成幂等键（key: newBackupImportKey()）')
+    assert.deepStrictEqual(pendingObjs.map((obj) => {
+      const prop = obj.properties.find((entry) => entry.key && entry.key.name === 'encrypted')
+      return prop && prop.value.type === 'Literal' ? prop.value.value : null
+    }), [false, true], '两条路径必须各自标记 encrypted（明文 false / 加密 true）')
+    const importCalls = callSites(block, 'apiPostBackupImport')
+    assert.strictEqual(importCalls.length, 1, '导入必须调 apiPostBackupImport 一次')
+    assert.deepStrictEqual(callArgLabels(importCalls[0]), ['pending.bundle', 'pending.key'],
+      '导入必须带上同一个幂等键（pending.bundle + pending.key）')
   })
 
+  // ── CSS：原文链接 44px / 手机输入框 16px（落在解析后的规则声明上）──────────────
   await aok('结构红线: v3.317 小项（msg-link 44px / 手机输入 16px）', () => {
-    const css = fs.readFileSync(path.join(__dirname, 'scripts/console-assets/app.css'), 'utf8')
-    const linkCss = (css.match(/\.msg-link\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/min-height:\s*44px/.test(linkCss), '原文链接点击区 ≥44px')
-    assert.ok(/font-size:\s*var\(--fs-xs\)/.test(linkCss), '视觉字号不变（只抬行盒）')
-    const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
-    assert.ok(/\.msg-search, \.log-search\s*\{[^}]*font-size:\s*16px/.test(phone), '手机输入框必须 16px（防 iOS 聚焦缩放）')
-    assert.ok(/\.msg-search, \.log-search\s*\{[^}]*min-height:\s*40px/.test(phone), '手机输入框高度 ≥40px')
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    // 点击区 ≥44px 但视觉字号不变（只抬行盒）。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.msg-link', 'min-height'), ['44px'], '原文链接点击区 ≥44px')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.msg-link', 'font-size'), ['var(--fs-xs)'], '视觉字号不变（只抬行盒）')
+    const phoneSearch = cssRulesFor(cssRules, '.msg-search').filter((rule) => rule.at.includes('@media (max-width: 640px)'))
+    assert.deepStrictEqual(phoneSearch.map((rule) => rule.decls.get('font-size')), ['16px'],
+      '手机输入框必须 16px（防 iOS 聚焦缩放）')
+    assert.deepStrictEqual(phoneSearch.map((rule) => rule.decls.get('min-height')), ['40px'], '手机输入框高度 ≥40px')
   })
 
-  // ── v3.320 首帧形状与落点（sys 同形占位 / 日志定高 / 校验失败定位 / 分页落点）──────
+  // ── 系统信息首帧同形占位（7 行无条件渲染）────────────────────────────────────
   await aok('结构红线: v3.320 系统信息首帧同形占位（7 行无条件渲染）', () => {
-    const src = readConsoleSource()
-    const sys = src.slice(src.indexOf('function SysPanel'), src.indexOf('function FilesPanel'))
-    const ref = (name) => '$' + '{' + name // 只取到 `${` 前缀（补上 } 就匹配不到源码里的换行/后续表达式）
-    // 旧版整块挂在 `${sys && …}` 后面：冷启动首帧只有面板头 + 提示（223px），数据到达后
-    // 两张表一次性填满（551px），下半页整体被推走。容器不得再拍 min-height 冒充占位。
-    assert.ok(!sys.includes(ref('sys && html`<div class="sys-grid">')), 'sys-grid 不得再挂在 sys && 条件后面')
-    assert.ok(sys.includes('const info = sys || {}'), '首帧必须用 sys || {} 取值（无数据也渲染）')
-    assert.ok(!sys.includes(ref('sys.version')) && !sys.includes(ref('sys.node')) && !sys.includes(ref('sys.pid')),
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    const sysFn = markup.functionNodeOf(pagesModel, 'SysPanel')
+    assert.ok(sysFn, '必须能定位 SysPanel')
+    // 首帧：数据到达前也把两张表画出来（sys-grid 不受任何条件约束）。
+    const gridTpls = templateIn(sysFn, 'class="sys-grid"')
+    assert.strictEqual(gridTpls.length, 1, '系统信息表必须恰好一段模板（.sys-grid）')
+    assert.deepStrictEqual(renderGuardsOf(sysFn, gridTpls[0]), [],
+      'sys-grid 必须无条件渲染（旧版整块挂在 sys && 后面：冷启动首帧只有面板头，数据到达后下半页被推走）')
+    // 取值一律走 info：sys 为 null 时取 sys.node 会直接抛。
+    const infoDecl = findFirst(sysFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'info')
+    assert.ok(infoDecl && sameShapeOf(infoDecl.init, 'sys || {}'), '首帧必须用 sys || {} 取值（无数据也渲染）')
+    assert.deepStrictEqual(findAll(sysFn, (n) => n.type === 'MemberExpression' && String(memberPath(n) || '').startsWith('sys.')).map((n) => memberPath(n)), [],
       '字段必须一律走 info（sys 为 null 时取 sys.node 会直接抛）')
-    assert.ok(sys.includes("info.node || '—'") && sys.includes("info.platform || '—'") && sys.includes("info.cacheDir || '—'"),
-      '缺值必须显式落到 —（不能渲染 undefined）')
-    assert.ok(sys.includes("info.pid == null ? '—' : info.pid"), 'pid 必须按 == null 判（0 也算有效值）')
-    assert.strictEqual((sys.match(/<tr>/g) || []).length, 7, '首帧必须固定 7 行（3+4），行数就是占位高度')
-    assert.ok(!/\.sys-grid\s*\{[^}]*min-height/.test(fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')),
+    for (const shape of ["info.node || '—'", "info.platform || '—'", "info.cacheDir || '—'"]) {
+      assert.ok(findAll(sysFn, (n) => sameShapeOf(n, shape)).length >= 1, `缺值必须显式落到 —：${shape}`)
+    }
+    assert.strictEqual(findAll(sysFn, (n) => sameShapeOf(n, "info.pid == null ? '—' : info.pid")).length, 1,
+      'pid 必须按 == null 判（0 也算有效值）')
+    // 固定 7 行（3+4）：行数就是占位高度，任何一行被条件包住都会让首帧矮一截。
+    const grid = elementsInFunction(pagesModel, 'SysPanel').find((el) => el.name === 'div' && markup.hasClass(el, 'sys-grid'))
+    assert.ok(grid, '必须能定位 .sys-grid 元素')
+    assert.strictEqual(markup.elementsNamed(grid, 'tr').length, 7, '首帧必须固定 7 行（3+4），行数就是占位高度')
+    // 容器不得拍 min-height 冒充占位。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.sys-grid', 'min-height'), [],
       '不许给 .sys-grid 拍 min-height（行高本身就是占位）')
-    // 错误 Hint 仍在表上方：数据失败时先看到原因，再看到空表。
-    const errAt = sys.indexOf('tone="error"')
-    const gridAt = sys.indexOf('class="sys-grid"')
-    assert.ok(errAt >= 0 && gridAt >= 0 && errAt < gridAt, '错误 Hint 必须存在且仍在表上方')
+    // 错误 Hint 在表上方：数据失败时先看到原因，再看到空表。
+    const els = elementsInFunction(pagesModel, 'SysPanel')
+    const errHintAt = els.findIndex((el) => el.name === 'Hint' && markup.attrText(el, 'tone') === 'error')
+    const gridAt = els.findIndex((el) => el.name === 'div' && markup.hasClass(el, 'sys-grid'))
+    assert.ok(errHintAt > -1 && gridAt > -1 && errHintAt < gridAt, '错误 Hint 必须存在且仍在表上方')
   })
 
+  // ── 日志框定高（读取中/空态与日志框同高）─────────────────────────────────────
   await aok('结构红线: v3.320 日志框定高（读取中/空态与日志框同高）', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    const px = (s, prop) => { const m = new RegExp(prop + ':\\s*(\\d+)px').exec(s); return m ? m[1] : '' }
-    // 既有契约（v3.317）照旧逐字成立：max-height 字面量不得改。
-    const desk = (css.match(/\.logpre-main\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/max-height:\s*520px/.test(desk), '桌面日志框 max-height 必须仍是 520px')
-    assert.ok(/min-height:\s*520px/.test(desk), '桌面日志框必须有同值 min-height（首帧/空态同形）')
-    const empty = (css.match(/\.log-empty\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(empty.length > 0, '.log-empty 必须存在')
-    assert.strictEqual(px(empty, 'min-height'), px(desk, 'max-height'), '.log-empty 的 min-height 必须与日志框同值')
-    // 手机断点：vh 兜底 + dvh 两档，两条都要有（旧版只有 max-height）。
-    const phone = (css.match(/@media \(max-width: 640px\) \{[\s\S]*?\n {2}\}/) || [''])[0]
-    assert.ok(/\.logpre-main\s*\{[^}]*min-height:\s*62vh; min-height:\s*min\(62dvh, 520px\)/.test(phone),
-      '手机日志框必须补 min-height: 62vh 再 min(62dvh, 520px)')
-    assert.ok(/\.log-empty\s*\{[^}]*min-height:\s*min\(62dvh, 520px\)/.test(phone), '手机空态与日志框同值')
-    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
-    assert.ok(logs.includes('!data && !err && html`<div class="log-empty"'), '首帧必须渲染读取中占位')
-    assert.ok(logs.includes('读取中'), '占位文案必须说明在读（不能空白）')
-    assert.ok(!logs.includes('html`<div class="empty">日志'), '日志未生成/不可读不得用 .empty（高度会反向塌）')
-    assert.ok(/ranged\.length === 0\s*\?\s*html`<div class="log-empty"/.test(logs), '0 命中必须也用 .log-empty（按区间筛完的 ranged 判定，不是 filtered）')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    // 桌面：max-height 与 min-height 同值（首帧/空态与有数据时同形）。
+    assert.deepStrictEqual(cssBaseDeclValuesOf(cssRules, '.logpre-main', 'max-height'), ['520px'],
+      '桌面日志框 max-height 必须仍是 520px')
+    const deskMax = cssBaseDeclValuesOf(cssRules, '.logpre-main', 'max-height')
+    assert.deepStrictEqual(cssBaseDeclValuesOf(cssRules, '.logpre-main', 'min-height'), deskMax,
+      '桌面日志框必须有同值 min-height（首帧/空态同形）')
+    // 空态与日志框同值：从解析后的声明取值比对，不是比两段正则文本。
+    assert.deepStrictEqual(cssBaseDeclValuesOf(cssRules, '.log-empty', 'min-height'), deskMax,
+      '.log-empty 的 min-height 必须与日志框 max-height 同值')
+    // 手机断点：vh 兜底 + dvh 两档都要有（同名属性声明两次，Map 会吞掉前一次 ⇒ 看声明列表）。
+    const cssRaw = cssRuleListOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    const phoneRaw = (selector) => cssRulesFor(cssRaw, selector)
+      .filter((rule) => rule.at.some((at) => at.includes('@media (max-width: 640px)')))
+    for (const selector of ['.logpre-main', '.log-empty']) {
+      assert.deepStrictEqual(phoneRaw(selector).flatMap((rule) => rule.decls.filter((decl) => decl[0] === 'min-height')
+        .map((decl) => decl[1])), ['62vh', 'min(62dvh, 520px)'],
+      `${selector} 手机端必须补 min-height: 62vh 再 min(62dvh, 520px)（两档都要在）`)
+    }
+    // 首帧占位：只在「没有数据也没有错误」时渲染，文案说明在读。
+    const logsFn = markup.functionNodeOf(pagesModel, 'LogsPanel')
+    const loadingTpls = templateIn(logsFn, '日志读取中…')
+    assert.strictEqual(loadingTpls.length, 1, '首帧必须渲染读取中占位')
+    assert.deepStrictEqual(renderGuardsOf(logsFn, loadingTpls[0]), ['!data && !err'],
+      '读取中占位只在 !data && !err 时渲染（有数据/有错误时另有分支）')
+    const loadingEl = markup.markupOf(loadingTpls[0]).children.find((child) => child.type === 'element')
+    assert.ok(loadingEl && markup.hasClass(loadingEl, 'log-empty') && markup.attrText(loadingEl, 'role') === 'status',
+      '读取中占位必须是 .log-empty + role=status（与日志框同高、读屏能播）')
+    // 日志未生成/不可读不得用 .empty：那个盒子没有定高，高度会反向塌。
+    assert.deepStrictEqual(elementsInFunction(pagesModel, 'LogsPanel')
+      .filter((el) => markup.hasClass(el, 'empty') && String(markup.textOf(el)).includes('日志')).length, 0,
+    '日志未生成/不可读不得用 .empty（高度会反向塌）')
+    // 0 命中按区间筛完的 ranged 判定（不是 filtered），且仍用 .log-empty。
+    const emptyTpls = templateIn(logsFn, 'class="log-empty-text"')
+    assert.strictEqual(emptyTpls.length, 1, '0 命中必须也用 .log-empty（带 log-empty-text）')
+    assert.deepStrictEqual(renderGuardsOf(logsFn, emptyTpls[0]), ['viewReady', 'ranged.length === 0'],
+      '0 命中必须按区间筛完的 ranged 判定（换成 filtered 会让「筛完为空」与「日志为空」混在一起）')
   })
 
-  // ── v3.321 首屏剩余 pop：系统页 access-log 的 44px、日志页工具条的 153px ──────────
+  // ── 系统页 access-log 无条件占位 ─────────────────────────────────────────────
   await aok('结构红线: v3.321 系统页 access-log 无条件占位（+44px 不再由加载引入）', () => {
-    const src = readConsoleSource()
-    const sys = src.slice(src.indexOf('function SysPanel'), src.indexOf('function FilesPanel'))
-    assert.ok(sys.length > 0, '必须能定位 SysPanel')
-    // 旧版：${logTail.length > 0 && html`<details class="access-log">…} 与 ${access && …暂无访问记录…}
-    // 两条条件 ⇒ 数据未到首帧没有 summary 那 44px，加载后才长出来（panel 487→551）。
-    assert.ok(/^[ \t]*<details class="access-log">$/m.test(sys),
-      'access-log 必须无条件渲染：源码里要有一行裸的 <details class="access-log">')
-    assert.ok(!sys.includes('logTail.length > 0 &&'), 'access-log 不得再被 logTail.length > 0 && 包住')
-    assert.ok(!sys.includes('access && access.items &&'), 'access-log 不得再被 access && 包住')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const sysFn = markup.functionNodeOf(pagesModel, 'SysPanel')
+    // v3.320 的两种挂法（logTail.length > 0 && / access && access.items &&）都让首帧缺 summary 那 44px，
+    // 数据到达后才长出来（panel 487→551）。判据落在「这段模板有没有渲染门」上，两种写法一起覆盖。
+    const detailsTpls = templateIn(sysFn, 'class="access-log"')
+    assert.strictEqual(detailsTpls.length, 1, 'access-log 必须恰好一段模板')
+    assert.deepStrictEqual(renderGuardsOf(sysFn, detailsTpls[0]), [],
+      'access-log 必须无条件渲染（不得再被 logTail.length > 0 && 或 access && access.items && 包住）')
+    const details = elementsInFunction(pagesModel, 'SysPanel').find((el) => el.name === 'details' && markup.hasClass(el, 'access-log'))
+    assert.ok(details, 'access-log 必须是一个 <details>')
+    assert.strictEqual(markup.attrOf(details, 'open'), null, '不得默认展开（展开重新引入首屏高度）')
     // 空态与表格都移进 details：默认折叠不占高度，展开才长。
-    const inner = sys.slice(sys.indexOf('<details class="access-log">'))
-    const close = inner.indexOf('</details>')
-    assert.ok(close > 0, 'details 必须闭合')
-    const body = inner.slice(0, close)
-    assert.ok(body.includes('暂无访问记录'), '空态必须在 details 内部（留在折叠线以上会重新引入高度）')
-    assert.ok(body.includes('<table class="sys-table">'), '访问表格必须在 details 内部')
-    assert.ok(body.includes('读取中…'), 'access 未回来时 details 内要说明在读（不能空着）')
-    assert.ok(!/<details class="access-log" open/.test(sys), '不得默认展开（展开重新引入首屏高度）')
+    const innerEls = markup.allElements(details)
+    const emptyEls = innerEls.filter((el) => markup.hasClass(el, 'empty'))
+    assert.strictEqual(emptyEls.length, 2, 'details 里必须有「读取中」与「暂无记录」两个空态（留在折叠线以上会重新引入高度）')
+    assert.ok(emptyEls.some((el) => markup.attrText(el, 'role') === 'status'), 'access 未回来时 details 内要说明在读（不能空着）')
+    const emptyStrings = emptyEls.flatMap((el) => markup.expressionsIn(el).flatMap((expr) => stringValuesOf(expr)))
+    assert.ok(emptyStrings.some((value) => value.includes('暂无访问记录')), '空态文案必须在 details 内的表达式里（不是折叠线以上的另一段）')
+    assert.ok(emptyEls.some((el) => String(markup.textOf(el)).includes('读取中')), '未就绪的读提示必须是真的静态文案')
+    assert.strictEqual(markup.elementsNamed(details, 'table').filter((el) => markup.hasClass(el, 'sys-table')).length, 1,
+      '访问表格必须在 details 内部')
   })
 
+  // ── 日志页工具条/计数行在加载态就渲染 ────────────────────────────────────────
   await aok('结构红线: v3.321 日志页工具条/计数行在加载态就渲染（+153px 不再由加载引入）', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
-    assert.ok(logs.length > 0, '必须能定位 LogsPanel')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    const logsFn = markup.functionNodeOf(pagesModel, 'LogsPanel')
+    const els = elementsInFunction(pagesModel, 'LogsPanel')
     // 旧版整块（定位条 + chips + 计数 + 日志框）都在 ok 分支的 <div> 里 ⇒ 数据到达才出现。
-    assert.ok(!logs.includes("data && data.status === 'ok' && html`<div>"), 'ok 分支的包装 div 必须拆掉')
-    assert.ok(/^[ \t]*<div class="log-tools">$/m.test(logs), '.log-tools 必须无条件渲染（不能挂在条件 && 后面）')
-    assert.ok(/^[ \t]*<div class="log-count">\$\{countText\}<\/div>$/m.test(logs), '.log-count 必须无条件渲染')
-    // 顺序：工具条 + 计数在占位日志框之前，首帧就占住 134+19。
-    assert.ok(logs.indexOf('<div class="log-tools">') < logs.indexOf('!data && !err && html`<div class="log-empty"'),
+    const toolsTpls = templateIn(logsFn, '<div class="log-tools">')
+    assert.strictEqual(toolsTpls.length, 1, '工具条必须恰好一段模板（.log-tools）')
+    assert.deepStrictEqual(renderGuardsOf(logsFn, toolsTpls[0]), [],
+      '.log-tools 必须无条件渲染（不能挂在条件 && 后面，也不能挂在 ok 分支的包装 div 里）')
+    const countTpls = templateIn(logsFn, '<div class="log-count">')
+    assert.strictEqual(countTpls.length, 1, '计数行必须恰好一段模板（.log-count）')
+    assert.deepStrictEqual(renderGuardsOf(logsFn, countTpls[0]), [], '.log-count 必须无条件渲染（不能挂条件）')
+    const countEl = els.find((el) => markup.hasClass(el, 'log-count'))
+    assert.ok(countEl, '必须能定位 .log-count 元素')
+    assert.deepStrictEqual(markup.expressionsIn(countEl).map(exprLabel), ['countText'],
+      '计数行只渲染一句 countText（文案由它按加载态决定）')
+    // 顺序：工具条在加载占位之前，首帧就占住 134+19。
+    const toolsAt = els.findIndex((el) => markup.hasClass(el, 'log-tools') && markup.classNames(el).length === 1)
+    const placeholderAt = els.findIndex((el) => markup.hasClass(el, 'log-empty') && String(markup.textOf(el)).includes('日志读取中'))
+    assert.ok(toolsAt > -1 && placeholderAt > -1 && toolsAt < placeholderAt,
       '工具条必须排在加载占位之前（否则首帧仍只有占位框）')
     // 加载态文案：计数行「读取中…」，chips 计数 —（同一组标签，宽度由 CSS 钉住）。
-    assert.ok(logs.includes("'读取中…'"), '加载态计数行必须说明在读')
-    assert.ok(logs.includes("logReady ? n : '—'"), 'chips 计数在数据未到时必须用 —（同一组标签）')
-    assert.ok(logs.includes("const logReady = !!(data && data.status === 'ok')"), '必须显式判定数据是否 ok')
+    const countTextDecl = findFirst(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'countText')
+    assert.ok(countTextDecl && sameShapeOf(countTextDecl.init, "viewReady ? countLine : ((data || err) ? '—' : '读取中…')"),
+      '加载态计数行必须说明在读（无数据→读取中…，有数据但未就绪→—）')
+    const chipCount = els.filter((el) => markup.hasClass(el, 'log-chip-n'))
+    assert.strictEqual(chipCount.length, 1, 'chips 计数必须是同一组标签里的一个 span')
+    const chipExprs = markup.expressionsIn(chipCount[0])
+    assert.strictEqual(chipExprs.length, 1, 'chips 计数只渲染一个表达式')
+    assert.ok(sameShapeOf(chipExprs[0], "logReady ? n : '—'"),
+      'chips 计数在数据未到时必须用 —（同一组标签，宽度由 CSS 钉住）')
+    const logReadyDecl = findFirst(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'logReady')
+    assert.ok(logReadyDecl && sameShapeOf(logReadyDecl.init, "!!(data && data.status === 'ok')"), '必须显式判定数据是否 ok')
     // — → 269 的宽度差在 362px 下会把 chip 行挤重排，工具条高度就跟着跳。
-    const nCss = (css.match(/\.log-chip-n\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/display:\s*inline-block/.test(nCss) && /min-width:\s*[\d.]+em/.test(nCss) && /text-align:\s*right/.test(nCss),
-      '.log-chip-n 必须 inline-block + em 定宽 + 右对齐（否则计数从 — 变 269 会重排）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.log-chip-n', 'display'), ['inline-block'], '.log-chip-n 必须 inline-block')
+    assert.ok(/^[\d.]+em$/.test(String(cssDeclValuesOf(cssRules, '.log-chip-n', 'min-width')[0] || '')),
+      '.log-chip-n 必须 em 定宽（否则计数从 — 变 269 会重排）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.log-chip-n', 'text-align'), ['right'], '.log-chip-n 必须右对齐')
   })
 
+  // ── 过滤规则校验失败定位 ─────────────────────────────────────────────────────
   await aok('结构红线: v3.320 过滤规则校验失败定位（只失败且有字段错误时滚到首个错误行）', () => {
-    const src = readConsoleSource()
-    const fr = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('function App ()'))
-    const effects = [...fr.matchAll(/useLayoutEffect\(\(\) => \{[\s\S]*?\n {2}\}, \[[^\]]*\]\)/g)].map((m) => m[0])
-    const reveal = effects.find((e) => e.includes('[aria-invalid="true"]'))
-    assert.ok(reveal, '失败路径必须有 [aria-invalid="true"] 定位')
-    assert.ok(reveal.includes('focus({ preventScroll: true })'),
-      '必须先聚焦且 preventScroll（否则浏览器自己先滚一次，位置和手工算的打架）')
-    assert.ok(reveal.includes('const pad = stickyPad()'),
-      '落点必须按 .tabs 实测高度算（吸顶页签会盖住错误行；口径收在共用 stickyPad）')
-    assert.ok(reveal.includes('- pad'), '页签下沿要留出 stickyPad 的 8px')
-    assert.ok(/window\.scrollTo\(0, Math\.max\(0, Math\.min\(top, max\)\)\)/.test(reveal), '落点必须夹进可滚动范围')
-    assert.ok(fr.includes('revealFieldRef.current = errors.length > 0'), '只有确有字段错误的失败才置旗')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const fr = markup.functionNodeOf(pagesModel, 'FilterRulesPanel')
+    assert.ok(fr, '必须能定位 FilterRulesPanel')
+    // 定位 effect：useLayoutEffect 里查 [aria-invalid="true"]。
+    const reveal = callSites(fr, 'useLayoutEffect').find((call) =>
+      callSites(call.arguments[0], 'document.querySelector')
+        .some((query) => callArgLabels(query).join(',') === '"[aria-invalid=\\"true\\"]"'))
+    assert.ok(reveal, '失败路径必须有 [aria-invalid="true"] 定位（useLayoutEffect 里）')
+    // 先聚焦且 preventScroll：否则浏览器自己先滚一次，位置和手工算的打架。
+    const focusCalls = callSites(reveal.arguments[0], 'el.focus')
+    assert.strictEqual(focusCalls.length, 1, '必须先聚焦首个错误字段')
+    const focusOpt = focusCalls[0].arguments[0]
+    assert.ok(focusOpt && focusOpt.type === 'ObjectExpression' &&
+      focusOpt.properties.some((prop) => prop.key && prop.key.name === 'preventScroll' && prop.value.value === true),
+    '聚焦必须 preventScroll（否则浏览器自己先滚一次，位置和手工算的打架）')
+    // 落点按 .tabs 实测高度算（吸顶页签会盖住错误行）。
+    const padDecl = findFirst(reveal.arguments[0], (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'pad')
+    assert.ok(padDecl && sameShapeOf(padDecl.init, 'stickyPad()'), '落点必须按 .tabs 实测高度算（口径收在共用 stickyPad）')
+    assert.strictEqual(findAll(reveal.arguments[0], (n) => sameShapeOf(n, 'el.getBoundingClientRect().top + window.scrollY - pad')).length, 1,
+      '页签下沿要留出 stickyPad 的留白（top + scrollY - pad）')
+    // 落点夹进可滚动范围。
+    assert.strictEqual(findAll(reveal.arguments[0], (n) => sameShapeOf(n, 'window.scrollTo(0, Math.max(0, Math.min(top, max)))')).length, 1,
+      '落点必须夹进可滚动范围（Math.max(0, Math.min(top, max))）')
+    // 只有「确有字段错误」的失败才置旗：errors.length > 0（消费时先清旗）。
+    const revealAssigns = findAll(fr, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'revealFieldRef.current')
+      .map((n) => exprLabel(n.right)).sort()
+    assert.deepStrictEqual(revealAssigns, ['errors.length > 0', 'false'].sort(),
+      '只有确有字段错误的失败才置旗（errors.length > 0），消费时必须先清旗')
     // 成功路径：res.ok 分支里既不得置旗，也不得出现 aria-invalid 定位。
-    const okAt = fr.indexOf('if (res.ok) {')
-    const okPath = fr.slice(okAt, fr.indexOf('const code = showFailure(res', okAt))
-    assert.ok(okAt > 0 && okPath.length > 0 && !okPath.includes('revealFieldRef') && !okPath.includes('[aria-invalid'),
+    const submitSave = findFirst(fr, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'submitSave')
+    assert.ok(submitSave, '必须有 submitSave')
+    const okBranch = findAll(submitSave, (n) => n.type === 'IfStatement' && exprLabel(n.test) === 'res.ok')[0]
+    assert.ok(okBranch, 'submitSave 必须有 res.ok 分支')
+    assert.strictEqual(findAll(okBranch.consequent, (n) => n.type === 'Identifier' && n.name === 'revealFieldRef').length, 0,
       '成功路径不得触发定位/滚动')
+    assert.strictEqual(stringValuesOf(okBranch.consequent).filter((value) => value.includes('aria-invalid')).length, 0,
+      '成功路径不得出现 aria-invalid 定位')
     // 加载失败路径（load 的 catch）同样不得置旗。
-    const loadAt = fr.indexOf('const load = useCallback')
-    const loadPath = fr.slice(loadAt, fr.indexOf('useEffect(() => { load().catch', loadAt))
-    assert.ok(loadAt > 0 && loadPath.length > 0 && !loadPath.includes('revealFieldRef'), '加载失败路径不得触发定位/滚动')
-    assert.ok(!/transition:|animation:/.test(reveal), '定位不得加动画（错位时动画等于二次跳动）')
+    const loadDecl = findFirst(fr, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'load')
+    assert.ok(loadDecl, '必须有 load')
+    assert.strictEqual(findAll(loadDecl, (n) => n.type === 'Identifier' && n.name === 'revealFieldRef').length, 0,
+      '加载失败路径不得触发定位/滚动')
+    // 定位不得加动画（错位时动画等于二次跳动）：scrollTo 只给两个实参，effect 里不出现平滑滚动。
+    const scrollCall = findAll(reveal.arguments[0], (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.scrollTo')[0]
+    assert.strictEqual(scrollCall.arguments.length, 2, 'scrollTo 只能给 (0, y)：第三个实参（behavior）会让定位动起来')
+    assert.strictEqual(callSites(reveal.arguments[0], 'scrollIntoView').length, 0, '定位不得走 scrollIntoView（默认带滚动动画）')
   })
 
+  // ── 分页/搜索落点（共用助手 / 只主动路径 / 分页统一 goPage）───────────────────
   await aok('结构红线: v3.320 分页/搜索落点（共用助手 / 只主动路径 / 分页统一 goPage）', () => {
-    const src = readConsoleSource()
-    // 助手：读 .tabs 下沿 + 8，目标夹进 document.scrollHeight - innerHeight，面板隐藏时不滚。
-    const helperAt = src.indexOf('function listLandTarget')
-    assert.ok(helperAt > 0, '必须有一个共用的落点助手（两个面板同一口径）')
-    const helper = src.slice(helperAt, src.indexOf('function RunHistoryPanel', helperAt))
-    assert.ok(helper.includes('const pad = stickyPad()'), '落点 = 顶栏 + 页签高度 + 8（口径收在共用 stickyPad）')
-    assert.ok(helper.includes('rect.top + window.scrollY - pad'), '落点必须减掉页签留白（吸顶页签会盖住首行）')
-    assert.ok(helper.includes('Math.min(top, max)'), '助手内必须有 Math.min 收口（不能算出文档外的目标）')
-    assert.ok(helper.includes('document.documentElement.scrollHeight - window.innerHeight'), '上限必须按可滚动高度算')
-    assert.ok(helper.includes('if (!(rect.height > 0)) return null'), '面板 hidden/rect 为 0 时不得执行')
-    const pagerOf = (seg) => { const s = seg.slice(seg.indexOf('<div class="pager">')); return s.slice(0, s.indexOf('</div>')) }
-    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
-    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
-    // 取一个具名函数体（到 2 空格缩进的闭合花括号）：断言只看该函数内部，不被邻居带过。
-    const fnOf = (seg, name) => {
-      const at = seg.indexOf('const ' + name + ' = ')
-      assert.ok(at > 0, '缺少 ' + name)
-      return seg.slice(at, seg.indexOf('\n  }', at) + 4)
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const helper = markup.functionNodeOf(pagesModel, 'listLandTarget')
+    assert.ok(helper, '必须有一个共用的落点助手（两个面板同一口径）')
+    const declInit = (root, name) => {
+      const decl = findFirst(root, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === name)
+      assert.ok(decl, `缺少 ${name}`)
+      return decl.init
     }
-    for (const [name, seg] of [['推送记录', msg], ['逐轮历史', hist]]) {
-      const goPageFn = fnOf(seg, 'goPage')
-      assert.ok(/if \(n === (?:page|current)\) return/.test(goPageFn), name + '目标页 = 当前页时不得置旗（旗子会悬挂）')
-      assert.ok(goPageFn.includes('armLand()') && /setPage(?:No)?\(n\)/.test(goPageFn), name + '分页必须经 armLand 落点并真的换页')
-      const pager = pagerOf(seg)
-      assert.ok(pager.length > 0, name + '必须有分页器')
-      assert.ok(!pager.includes('setPage('), name + '分页按钮不得再直接 setPage（会绕过落点）')
-      assert.strictEqual((pager.match(/goPage\(/g) || []).length, 4, name + '四个分页按钮都要走 goPage')
-      assert.ok(/useLayoutEffect\(\(\) => \{\s*if \(!landRef\.current\) return[\s\S]*?listLandTarget\(listRef\.current\)/.test(seg),
-        name + '落点必须在 useLayoutEffect（paint 前）执行')
-      assert.ok(seg.includes('listRef') && seg.includes('landRef'), name + '必须有列表 ref 与落点旗')
-      // 裸置旗只允许出现在 armLand 内：分页/筛选/搜索共用同一道「已滚进列表」门。
-      assert.strictEqual((seg.match(/landRef\.current = true/g) || []).length, 1,
-        name + '置旗必须只在 armLand 内（其余路径一律调用 armLand）')
-      const arm = fnOf(seg, 'armLand')
-      assert.ok(/window\.scrollY > listTop/.test(arm), name + '必须有「已滚进列表」门（停在顶部改筛选不得拽列表）')
-      assert.ok(arm.includes('window.scrollY - stickyPad()'),
-        name + '门必须按 .tabs 实测高度算（与 listLandTarget 同口径，共用 stickyPad）')
-      assert.ok(arm.includes('if (!(rect.height > 0)) return'), name + '面板隐藏/rect 为 0 时不得置旗')
+    assert.ok(sameShapeOf(declInit(helper, 'rect'), 'el.getBoundingClientRect()'), '落点助手必须先量列表矩形')
+    assert.ok(sameShapeOf(declInit(helper, 'pad'), 'stickyPad()'), '落点 = 顶栏 + 页签高度 + 8（口径收在共用 stickyPad）')
+    assert.ok(sameShapeOf(declInit(helper, 'top'), 'rect.top + window.scrollY - pad'), '落点必须减掉页签留白（吸顶页签会盖住首行）')
+    assert.ok(sameShapeOf(declInit(helper, 'max'), 'Math.max(0, document.documentElement.scrollHeight - window.innerHeight)'),
+      '上限必须按可滚动高度算')
+    const returns = findAll(helper, (n) => n.type === 'ReturnStatement' && n.argument)
+    assert.ok(returns.some((n) => sameShapeOf(n.argument, 'Math.max(0, Math.min(top, max))')), '助手内必须有 Math.min 收口（不能算出文档外的目标）')
+    assert.ok(returns.some((n) => n.argument.type === 'Literal' && n.argument.value === null), '面板 hidden/rect 为 0 时必须返回 null')
+    assert.strictEqual(findAll(helper, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!(rect.height > 0)')).length, 1,
+      '面板 hidden/rect 为 0 时不得执行（!(rect.height > 0) 必须显式挡一道）')
+    for (const [name, file, eventKey, setCall] of [
+      ['推送记录', 'MessagesPanel', 'page', 'setPage'],
+      ['逐轮历史', 'RunHistoryPanel', 'current', 'setPageNo']
+    ]) {
+      const seg = markup.functionNodeOf(pagesModel, file)
+      assert.ok(seg, `必须能定位 ${file}`)
+      const goPage = declInit(seg, 'goPage')
+      const guards = findAll(goPage, (n) => n.type === 'IfStatement')
+      assert.strictEqual(guards.length, 1, `${name}分页必须有且只有一个同页守卫`)
+      assert.ok(sameShapeOf(guards[0].test, `n === ${eventKey}`), `${name}目标页 = 当前页时不得置旗（旗子会悬挂）`)
+      assert.strictEqual(callSites(goPage, 'armLand').length, 1, `${name}分页必须经 armLand 落点`)
+      assert.deepStrictEqual(callSites(goPage, setCall).map((call) => callArgLabels(call).join(',')), ['n'], `${name}分页必须真的换页`)
+      // 分页按钮只能走 goPage：直接 setPage 会绕过落点（四个按钮逐个判，不是数个数）。
+      const pagerTpls = templateIn(seg, '<div class="pager">')
+      assert.strictEqual(pagerTpls.length, 1, `${name}必须有分页器（.pager）`)
+      const buttons = elementsOfTemplate(pagerTpls[0]).filter((el) => el.name === 'Button')
+      assert.strictEqual(buttons.length, 4, `${name}分页器必须有四个按钮`)
+      assert.deepStrictEqual(buttons.map((el) => {
+        const onClick = markup.attrExpr(el, 'onClick')
+        return onClick && onClick.type === 'ArrowFunctionExpression' ? callSites(onClick, 'goPage').length : -1
+      }), [1, 1, 1, 1], `${name}四个分页按钮都要走 goPage（不得直接 setPage）`)
+      assert.deepStrictEqual(buttons.map((el) => {
+        const onClick = markup.attrExpr(el, 'onClick')
+        return onClick && onClick.type === 'ArrowFunctionExpression'
+          ? callSites(onClick, 'setPage').length + callSites(onClick, 'setPageNo').length
+          : 1
+      }), [0, 0, 0, 0], `${name}四个分页按钮都不得直接改页码（绕过落点旗）`)
+      // 禁用态必须带 loading：连点第二个请求会顶掉第一个的响应。
+      assert.ok(buttons.every((el) => String(exprLabel(markup.attrExpr(el, 'disabled'))).endsWith('|| loading')),
+        `${name}四个分页按钮都必须 || loading（防连点）`)
+      // 落点必须在 paint 前执行（useLayoutEffect），且对象是列表容器的 ref。
+      const land = callSites(seg, 'useLayoutEffect').find((call) => callSites(call.arguments[0], 'listLandTarget').length > 0)
+      assert.ok(land, `${name}落点必须在 useLayoutEffect（paint 前）执行`)
+      assert.deepStrictEqual(callSites(land.arguments[0], 'listLandTarget').map((call) => callArgLabels(call).join(',')), ['listRef.current'],
+        `${name}落点必须落在列表容器上（listRef.current）`)
+      assert.ok(declaresVariable(seg, 'listRef') && declaresVariable(seg, 'landRef'), `${name}必须有列表 ref 与落点旗`)
+      // 裸置旗只允许出现在 armLand 内：其余路径一律调用 armLand。
+      const bareSet = findAll(seg, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'landRef.current' &&
+        n.right.type === 'Literal' && n.right.value === true)
+      assert.strictEqual(bareSet.length, 1, `${name}置旗必须只在 armLand 内（其余路径一律调用 armLand）`)
+      const armLand = declInit(seg, 'armLand')
+      assert.strictEqual(findAll(armLand, (n) => n === bareSet[0]).length, 1, `${name}裸置旗必须在 armLand 里`)
+      // 「已滚进列表」门：停在顶部改筛选不得拽列表。
+      assert.strictEqual(findAll(armLand, (n) => sameShapeOf(n, 'window.scrollY > listTop')).length, 1,
+        `${name}必须有「已滚进列表」门（停在顶部改筛选不得拽列表）`)
+      assert.strictEqual(callSites(armLand, 'stickyPad').length, 1, `${name}门必须按 .tabs 实测高度算（与 listLandTarget 同口径）`)
+      assert.strictEqual(findAll(armLand, (n) => sameShapeOf(n, 'rect.top + window.scrollY - stickyPad()')).length, 1,
+        `${name}门必须用同一份 stickyPad 口径`)
+      assert.strictEqual(findAll(armLand, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!(rect.height > 0)')).length, 1,
+        `${name}面板隐藏/rect 为 0 时不得置旗`)
     }
-    // ① 依赖必须同时含 days 与 loading：漏 days ⇒ 第 1 页改时间范围不落（page 不变、effect 不跑）；
-    //    漏 loading ⇒ 响应未回就消费旗子（新页更短时被浏览器二次夹取）。
-    const msgEffectAt = msg.indexOf('useLayoutEffect(() => {')
-    const msgDepsAt = msg.indexOf('}, [', msgEffectAt)
-    const msgEffect = msg.slice(msgEffectAt, msgDepsAt)
-    const msgDeps = msg.slice(msgDepsAt, msg.indexOf('\n', msgDepsAt))
-    for (const dep of ['data', 'loading', 'page', 'size', 'cate', 'days', 'query']) {
-      assert.ok(new RegExp('(\\[|, )' + dep + '(, |\\])').test(msgDeps), '推送记录落点依赖必须包含 ' + dep)
+    // 推送记录：落点 effect 的依赖必须完整（漏 days ⇒ 第 1 页改时间范围不落；漏 loading ⇒ 未回就消费旗子）。
+    const msg = markup.functionNodeOf(pagesModel, 'MessagesPanel')
+    const msgEffect = callSites(msg, 'useLayoutEffect').find((call) => callSites(call.arguments[0], 'listLandTarget').length > 0)
+    assert.ok(msgEffect, '推送记录必须有落点 effect')
+    assert.deepStrictEqual(msgEffect.arguments[1].elements.map(exprLabel),
+      ['data', 'loading', 'err', 'settleTick', 'page', 'size', 'cate', 'days', 'query'],
+      '推送记录落点依赖必须完整（data/loading/err/settleTick/page/size/cate/days/query）')
+    // 响应未回时必须保留旗子（跨过 loading）。
+    assert.strictEqual(findAll(msgEffect.arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'loading')).length, 1,
+      '响应未回时必须保留旗子（跨过 loading）')
+    const settleGuards = findAll(msgEffect.arguments[0], (n) => n.type === 'IfStatement' &&
+      findAll(n.test, (m) => sameShapeOf(m, 'data === armedDataRef.current')).length === 1)
+    assert.strictEqual(settleGuards.length, 1, '必须等这次响应落地（data 换过）再落点')
+    assert.ok(sameShapeOf(settleGuards[0].test, 'data === armedDataRef.current && !err'),
+      '「数据未变」提前返回必须同时要求没有错误（丢掉 !err 会让失败响应永不落地、旗子悬挂）')
+    // 消费即清旗：listLandTarget 返回 null 时不得重试。
+    const msgStmts = msgEffect.arguments[0].body.body
+    const clearAt = msgStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
+      stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current')
+    const nullAt = msgStmts.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'y === null'))
+    assert.ok(clearAt > -1 && nullAt > -1 && clearAt < nullAt, '消费即清旗：listLandTarget 返回 null 时不得重试')
+    // 逐轮历史同样：清旗在 y === null 之前。
+    const hist = markup.functionNodeOf(pagesModel, 'RunHistoryPanel')
+    const histEffect = callSites(hist, 'useLayoutEffect').find((call) => callSites(call.arguments[0], 'listLandTarget').length > 0)
+    assert.ok(histEffect, '逐轮历史必须有落点 effect')
+    const histStmts = histEffect.arguments[0].body.body
+    const hClearAt = histStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
+      stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current')
+    const hNullAt = histStmts.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'y === null'))
+    assert.ok(hClearAt > -1 && hNullAt > -1 && hClearAt < hNullAt, '逐轮历史消费即清旗：返回 null 不重试')
+    // 旗只由主动路径置：纯 refreshNow / refresh() 不搬滚动位置。
+    const refreshNow = findFirst(msg, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refreshNow')
+    assert.ok(refreshNow, '必须有 refreshNow')
+    assert.strictEqual(findAll(refreshNow, (n) => n.type === 'Identifier' && n.name === 'landRef').length, 0,
+      '推送记录纯刷新不得搬滚动位置')
+    assert.strictEqual(callSites(refreshNow, 'load').length, 1, '纯刷新仍要真的重拉当前页')
+    const histRefresh = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refresh')
+    assert.ok(histRefresh, '逐轮历史必须有 refresh')
+    assert.strictEqual(findAll(histRefresh, (n) => n.type === 'Identifier' && n.name === 'landRef').length, 0,
+      '逐轮历史刷新不得搬滚动位置')
+    // 主动路径逐个点名（含顺序）：armLand 必须是处理器里的第一条语句。按控件定位，不按名字猜。
+    const msgEls = elementsInFunction(pagesModel, 'MessagesPanel')
+    const handlerOf = (el, why) => {
+      assert.ok(el, why)
+      const onChange = markup.attrExpr(el, 'onChange')
+      assert.ok(onChange && onChange.type === 'ArrowFunctionExpression' && onChange.body.type === 'BlockStatement',
+        `${why}：onChange 必须是一段处理器`)
+      return onChange.body.body.map((stmt) => exprLabel(stmt.expression))
     }
-    assert.ok(msgEffect.includes('if (loading) return'), '响应未回时必须保留旗子（跨过 loading）')
-    assert.ok(msgEffect.includes('data === armedDataRef.current'), '必须等这次响应落地（data 换过）再落点')
-    assert.ok(msgEffect.indexOf('landRef.current = false') < msgEffect.indexOf('if (y === null) return'),
-      '消费即清旗：listLandTarget 返回 null 时不得重试')
-    const histEffectAt = hist.indexOf('useLayoutEffect(() => {')
-    const histEffect = hist.slice(histEffectAt, hist.indexOf('}, [pageNo', histEffectAt))
-    assert.ok(histEffect.indexOf('landRef.current = false') < histEffect.indexOf('if (y === null) return'),
-      '逐轮历史消费即清旗：返回 null 不重试')
-    // 旗只由主动路径置：纯 load()/自动刷新不搬滚动位置。
-    const msgRefresh = msg.slice(msg.indexOf('const refreshNow = () => {'), msg.indexOf('const [exporting'))
-    assert.ok(msgRefresh.includes('load().catch') && !msgRefresh.includes('landRef'), '推送记录纯刷新不得搬滚动位置')
-    const histRefresh = hist.slice(hist.indexOf('const refresh = () =>'), hist.indexOf('const changeDay'))
-    assert.ok(histRefresh.includes('load().catch') && !histRefresh.includes('landRef'), '逐轮历史刷新不得搬滚动位置')
-    // 主动路径逐个点名：改每页 / 改分类 / 改时间都走同一个带门的 armLand。
-    // v3.326：时间窗处理器多了「先清区间」一步（自定义区间与 preset 互斥），
-    // 红线只要求「主动筛选必须先置落点旗」，不再锁死单行拼接形态。
-    for (const frag of ['armLand(); setSize(Number(v)); setPage(1)', 'armLand(); setCate(v); setPage(1)',
-      'armLand()\n          setRange({ from: \'\', to: \'\' })\n          setDays(Number(v))\n          setPage(1)']) {
-      assert.ok(msg.includes(frag), '推送记录主动筛选必须置落点旗：' + frag)
-    }
+    const sizeSelect = msgEls.find((el) => el.name === 'MiniSelect' && markup.attrText(el, 'ariaLabel') === '每页显示条数')
+    assert.deepStrictEqual(handlerOf(sizeSelect, '推送记录必须有「每页显示条数」选择器'),
+      ['armLand()', 'setSize()', 'setPage()'], '推送记录改每页必须先置落点旗，再换页')
+    assert.ok(sameShapeOf(markup.attrExpr(sizeSelect, 'onChange').body.body[1].expression.arguments[0], 'Number(v)'),
+      '改每页必须把 select 的字符串值转成数字（否则 "10" 会原样进 state）')
+    const catePicker = msgEls.find((el) => el.name === 'CategoryPicker')
+    assert.deepStrictEqual(handlerOf(catePicker, '推送记录必须有分类选择器'),
+      ['armLand()', 'setCate()', 'setPage()'], '推送记录改分类必须先置落点旗，再换页')
+    assert.deepStrictEqual(callArgLabels(markup.attrExpr(catePicker, 'onChange').body.body[1].expression), ['v'],
+      '改分类必须把选中的分类名传下去')
+    const rangePicker = msgEls.find((el) => el.name === 'DateRange')
+    assert.deepStrictEqual(handlerOf(rangePicker, '推送记录必须有时间范围选择器'),
+      ['armLand()', 'setRange()', 'setDays()', 'setPage()'],
+      '推送记录改时间必须先置落点旗、换区间、清 preset、回第 1 页（自定义区间与 preset 互斥）')
     // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
-    const cmStart = hist.indexOf('const changeMode = (m) => {')
-    const cmHead = hist.slice(cmStart, hist.indexOf('armLand()', cmStart))
-    assert.ok(cmHead.includes('if (m === mode) {') && cmHead.includes('return'), '已选中的 chip 不得再置旗')
-    assert.strictEqual((hist.match(/changeMode\('/g) || []).length, 3, '三个 chip 都必须走 changeMode')
-    assert.ok(!/onClick=\$\{\(\) => \{ landRef\.current = true/.test(hist), 'chip 不得裸置旗')
-    assert.ok(/const changeDay = \(v\) => \{[\s\S]{0,160}?if \(v\.from === runRange\.from && v\.to === runRange\.to\) return/.test(hist), '区间没变不得置旗')
-    assert.ok(/const changeSize = \(n\) => \{\s*if \(n === size\) return/.test(hist), '每页条数没变不得置旗')
-    // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点），
-    //    只在词真的变了时置旗；「已滚进列表」门保留在 armLand 里。
-    assert.ok(!msg.includes('document.activeElement'), '搜索落点不得再看 activeElement（那道门让主路径不可达）')
-    const debounceAt = msg.indexOf('const t = setTimeout')
-    const debounce = msg.slice(debounceAt, msg.indexOf('}, 300)', debounceAt))
-    assert.ok(debounce.includes('next !== queryRef.current') && debounce.includes('armLand()'),
-      '搜索落点必须在防抖里按「词真的变了」置旗')
+    const changeMode = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeMode')
+    assert.ok(changeMode, '必须有 changeMode')
+    const modeGuards = findAll(changeMode, (n) => n.type === 'IfStatement' && n.test).map((n) => exprLabel(n.test))
+    assert.ok(modeGuards.includes('m === mode'), '已选中的 chip 不得再置旗（必须先判 m === mode）')
+    // chip 的 class 是拼出来的（'log-chip' + 选中态），按 role=group 的容器 + 按钮定位，不按 class 找。
+    const chipGroup = elementsInFunction(pagesModel, 'RunHistoryPanel')
+      .find((el) => markup.attrText(el, 'aria-label') === '逐轮筛选')
+    assert.ok(chipGroup, '逐轮历史必须有 chip 容器（role=group aria-label=逐轮筛选）')
+    assert.strictEqual(markup.attrText(chipGroup, 'role'), 'group', 'chip 容器必须是可访问分组')
+    const chips = markup.elementsNamed(chipGroup, 'button')
+    assert.strictEqual(chips.length, 3, '逐轮历史必须有三个 chip')
+    assert.deepStrictEqual(chips.map((el) => {
+      const onClick = markup.attrExpr(el, 'onClick')
+      const calls = onClick && onClick.type === 'ArrowFunctionExpression' ? callSites(onClick, 'changeMode') : []
+      return calls.length === 1 && calls[0].arguments[0] ? calls[0].arguments[0].value : null
+    }), ['all', 'runs', 'issue'], '三个 chip 都必须走 changeMode，且各传自己的档位（全部/仅运行/只看异常）')
+    assert.strictEqual(findAll(hist, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'landRef.current' &&
+      n.right.type === 'Literal' && n.right.value === true &&
+      !ancestorsOf(hist, n).some((node) => node.type === 'VariableDeclarator' && node.id.name === 'armLand')).length, 0,
+    'chip 不得裸置旗（置旗只有 armLand 一条路径，各档位都要带值守卫）')
+    const changeDay = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeDay')
+    assert.ok(changeDay && findAll(changeDay, (n) => n.type === 'IfStatement' &&
+      sameShapeOf(n.test, 'v.from === runRange.from && v.to === runRange.to')).length === 1,
+    '区间没变不得置旗（值守卫必须在 armLand 之前）')
+    const changeSize = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeSize')
+    assert.ok(changeSize && findAll(changeSize, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'n === size')).length === 1,
+      '每页条数没变不得置旗')
+    // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点）。
+    assert.strictEqual(findAll(msg, (n) => n.type === 'MemberExpression' && memberPath(n) === 'document.activeElement').length, 0,
+      '搜索落点不得再看 activeElement（那道门让主路径不可达）')
+    const debounce = findAll(msg, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setTimeout' &&
+      exprLabel(n.arguments[1]) === '300')[0]
+    assert.ok(debounce, '搜索落点必须在 300ms 防抖里置旗')
+    assert.strictEqual(findAll(debounce.arguments[0], (n) => sameShapeOf(n, 'next !== queryRef.current')).length, 1,
+      '搜索落点必须在防抖里按「词真的变了」置旗（next !== queryRef.current）')
+    assert.strictEqual(callSites(debounce.arguments[0], 'armLand').length, 1, '词真的变了才 armLand')
   })
 
-  // ── v3.320 终评 must-fix：失败路径的落点旗清不掉（settle 代数）+ 5 个便宜修复 ──────
+  // ── 落点失败清旗（结算代数 / 失败不滚）+ 分页/占位细节 ───────────────────────
   await aok('结构红线: v3.320 落点失败清旗（结算代数 / 失败不滚）与分页/占位细节', () => {
-    // v3.364：app.js 拆分后源码会分散到多个模块，结构断言统一读拼接并集。
-    const read = (f) => f === 'app.js'
-      ? readConsoleSource()
-      : fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', f), 'utf8')
-    const src = read('app.js')
-    const css = read('app.css')
-    const loader = src.slice(src.indexOf('function usePanelLoader'), src.indexOf('function usePanelAutoLoad'))
-    // 失败时 hook 只写 err、不动 data：只比 data 引用会永远等不到「这次响应落地」，
-    // 所以必须有一个成功/失败都会推进的结算代数。
-    assert.ok(/const \[settleTick, setSettleTick\] = useState\(0\)/.test(loader), 'usePanelLoader 必须有结算代数 state')
-    const catchBlock = loader.slice(loader.indexOf('} catch (e) {'), loader.indexOf('} finally {'))
-    assert.ok(catchBlock.length > 0 && !catchBlock.includes('setData('), '失败分支不得改 data（故 data 引用不能当落地信号）')
-    assert.ok(/setSettleTick\(\(t\) => t \+ 1\)[ \t]*\n[ \t]*setLoading\(false\)/.test(loader),
-      '成功与失败都要推进结算代数，且与 setLoading(false) 同批（不多一次渲染）')
-    assert.ok(/return \{ data, err, load, loading, settleTick \}/.test(loader), '结算代数必须暴露给调用方')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    const loader = markup.functionNodeOf(pagesModel, 'usePanelLoader')
+    assert.ok(loader, '必须能定位 usePanelLoader')
+    // 结算代数：失败只写 err、不动 data ⇒ 只比 data 引用会永远等不到「这次响应落地」。
+    const settleState = findAll(loader, (n) => n.type === 'VariableDeclarator' && n.id.type === 'ArrayPattern' &&
+      n.id.elements.map((el) => el && el.name).join(',') === 'settleTick,setSettleTick')
+    assert.strictEqual(settleState.length, 1, 'usePanelLoader 必须有结算代数 state（[settleTick, setSettleTick]）')
+    assert.ok(settleState[0].init.type === 'CallExpression' && memberPath(settleState[0].init.callee) === 'useState' &&
+      exprLabel(settleState[0].init.arguments[0]) === '0', '结算代数必须从 0 起算')
+    const catchClause = findFirst(loader, (n) => n.type === 'CatchClause')
+    assert.ok(catchClause, 'usePanelLoader 必须有 catch 分支')
+    assert.strictEqual(callSites(catchClause, 'setData').length, 0, '失败分支不得改 data（故 data 引用不能当落地信号）')
+    // 成功与失败都要推进代数，且与 setLoading(false) 同批（不多一次渲染）。
+    const finalizer = findFirst(loader, (n) => n.type === 'TryStatement').finalizer
+    assert.ok(finalizer, 'usePanelLoader 必须有 finally（成败都要结算）')
+    const settleStmts = findAll(finalizer, (n) => n.type === 'IfStatement')[0].consequent.body
+    assert.strictEqual(settleStmts.length, 2, 'finally 里只做两件事：推进代数 + 收 loading')
+    assert.ok(sameShapeOf(settleStmts[0].expression, 'setSettleTick((t) => t + 1)'), '成功与失败都要推进结算代数')
+    assert.ok(sameShapeOf(settleStmts[1].expression, 'setLoading(false)'), '同批收 loading（不多一次渲染）')
+    const returned = findAll(loader, (n) => n.type === 'ReturnStatement' && n.argument && n.argument.type === 'ObjectExpression')
+    assert.ok(returned.length === 1 && objectKeyNames(returned[0].argument).join(',') === 'data,err,load,loading,settleTick',
+      '结算代数必须暴露给调用方（return { data, err, load, loading, settleTick }）')
 
-    const msg = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
-    const effectAt = msg.indexOf('useLayoutEffect(() => {')
-    const depsAt = msg.indexOf('}, [', effectAt)
-    const effect = msg.slice(effectAt, depsAt)
-    const deps = msg.slice(depsAt, msg.indexOf('\n', depsAt))
-    // ① 只改 err 不换 data 时也算一次「结算」：依赖漏 settleTick ⇒ 失败后 effect 不跑、旗子留着。
-    assert.ok(/(\[|, )settleTick(, |\])/.test(deps), '落点 effect 依赖必须包含 settleTick')
-    // ② 置旗时记代数；消费要求代数前进（未结算 ⇒ 保留旗子）。
-    const armAt = msg.indexOf('const armLand = ')
-    const arm = msg.slice(armAt, msg.indexOf('\n  }', armAt) + 4)
-    assert.ok(arm.includes('armedSettleRef.current = settleTick'), '置旗时必须记下当时的结算代数')
-    assert.ok(effect.includes('settleTick > armedSettleRef.current'), '消费必须以结算代数前进为条件')
-    assert.ok(effect.indexOf('settleTick > armedSettleRef.current') < effect.indexOf('landRef.current = false'),
-      '代数未前进时必须先 return（保留旗子），不得提前清旗')
-    assert.ok(arm.includes('armedSeqRef.current = loadSeqRef.current') && effect.includes('loadSeqRef.current > armedSeqRef.current'),
-      '置旗前就在飞的旧请求先回包不得抢消费（按请求号再挡一道）')
-    // ③ 失败：清旗要在消费块里（err 判断之前），且 err 判断必须在 scrollTo 之前 ⇒ 只清旗不滚。
-    assert.ok(effect.indexOf('landRef.current = false') < effect.indexOf('if (err) return'),
-      '失败分支也必须清旗（否则跨过失败留到下一次成功，把用户拽到列表顶）')
-    assert.ok(effect.indexOf('if (err) return') < effect.indexOf('window.scrollTo'),
-      '失败分支不得滚动：err 判断必须在 scrollTo 之前')
-    assert.ok(!/if \(data === armedDataRef\.current\) return/.test(effect),
-      '不得再单靠 data 引用判断落地（失败时 data 不变 ⇒ 清旗不可达）')
-
-    // ④ 两处分页四个按钮都要 || loading：连点第二个请求会顶掉第一个的响应。
-    const pagerOf = (seg) => { const s = seg.slice(seg.indexOf('<div class="pager">')); return s.slice(0, s.indexOf('</div>')) }
-    const hist = src.slice(src.indexOf('function RunHistoryPanel'), src.indexOf('// ── 组件：整体'))
-    for (const [name, seg] of [['推送记录', msg], ['逐轮历史', hist]]) {
-      const pager = pagerOf(seg)
-      assert.ok(pager.length > 0, name + '必须有分页器')
-      assert.strictEqual((pager.match(/\|\| loading/g) || []).length, 4, name + '四个分页按钮都必须 || loading（防连点）')
-    }
-
-    // ④b 分页禁用态只轻压透明度：全局 .45 在浅色主题下会把整块洗白，翻页时
-    // 左两个按钮像凭空出现（v3.339 手机截图）。只看生效的规则：注释里留着
-    // `.pager .btn:disabled{opacity:.7}` 不能让断言假绿（Sourcery PR #302）。
-    const cssLive = css.replace(/\/\*[\s\S]*?\*\//g, '')
-    const pagerDisabled = (cssLive.match(/\.pager \.btn:disabled\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/opacity:\s*0?\.70?\s*;/.test(pagerDisabled), '分页禁用态透明度必须 .7（保留底色/边框轮廓）')
-    assert.ok(!/opacity:\s*0?\.45\s*;/.test(pagerDisabled), '分页禁用态不得回退到全局 .45')
-
+    const msg = markup.functionNodeOf(pagesModel, 'MessagesPanel')
+    const effect = callSites(msg, 'useLayoutEffect').find((call) => callSites(call.arguments[0], 'listLandTarget').length > 0)
+    assert.ok(effect, '推送记录必须有落点 effect')
+    const stmts = effect.arguments[0].body.body
+    const idxOf = (pred) => stmts.findIndex(pred)
+    const settleGuardAt = idxOf((s) => s.type === 'IfStatement' && sameShapeOf(s.test, '!(settleTick > armedSettleRef.current)'))
+    const seqGuardAt = idxOf((s) => s.type === 'IfStatement' && sameShapeOf(s.test, '!(loadSeqRef.current > armedSeqRef.current)'))
+    const clearAt = idxOf((s) => s.type === 'ExpressionStatement' && s.expression.type === 'AssignmentExpression' &&
+      exprLabel(s.expression.left) === 'landRef.current')
+    const errAt = idxOf((s) => s.type === 'IfStatement' && sameShapeOf(s.test, 'err'))
+    const scrollAt = idxOf((s) => callSites(s, 'window.scrollTo').length > 0)
+    // ① 代数没前进 ⇒ 先 return（保留旗子），不得提前清旗。
+    assert.ok(settleGuardAt > -1 && settleGuardAt < clearAt,
+      `代数未前进时必须先 return（保留旗子）：守卫第 ${settleGuardAt} 条，清旗第 ${clearAt} 条`)
+    // ② 结算的是置旗前的旧请求 ⇒ 同样不能落点。
+    assert.ok(seqGuardAt > -1 && seqGuardAt < clearAt,
+      `置旗前就在飞的旧请求回包不得抢消费：守卫第 ${seqGuardAt} 条，清旗第 ${clearAt} 条`)
+    // ③ 失败也清旗（否则跨过失败留到下一次成功，把用户拽到列表顶），且失败不滚。
+    assert.ok(clearAt > -1 && errAt > clearAt && scrollAt > errAt,
+      `失败分支必须先清旗再 return，滚动必须排在 err 判断之后（清旗 ${clearAt} / err ${errAt} / scroll ${scrollAt}）`)
+    // 置旗时记下代数与请求号；并复位用户滚动标记。
+    const armLand = findFirst(msg, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'armLand')
+    assert.ok(armLand, '必须有 armLand')
+    assert.strictEqual(findAll(armLand, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n, 'armedSettleRef.current = settleTick')).length, 1,
+      '置旗时必须记下当时的结算代数')
+    assert.strictEqual(findAll(armLand, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n, 'armedSeqRef.current = loadSeqRef.current')).length, 1,
+      '置旗时也要记下请求号（按请求号再挡一道）')
+    assert.strictEqual(findAll(armLand, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n, 'userMovedRef.current = false')).length, 1,
+      '置旗时必须复位用户滚动标记')
+    // ④ 分页禁用态只轻压透明度：全局 .45 在浅色主题下会把整块洗白。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.pager .btn:disabled', 'opacity'), ['.7'],
+      '分页禁用态透明度必须 .7（保留底色/边框轮廓；.45 会把左两个按钮洗成「凭空出现」）')
     // ⑤ 分类弹层选中当前值不回调（同 MiniSelect 的值守卫）。
-    const cateSeg = src.slice(src.indexOf('function CategoryPicker'), src.indexOf('function MessagesPanel'))
-    const chooseFn = cateSeg.slice(cateSeg.indexOf('const choose = (name) => {'), cateSeg.indexOf('const pick = (o) =>'))
-    assert.ok(chooseFn.includes('if (name !== value) onChange(name)'), 'CategoryPicker 必须有值守卫（同值不 onChange）')
-
+    const picker = markup.functionNodeOf(pagesModel, 'CategoryPicker')
+    const choose = findFirst(picker, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'choose')
+    assert.ok(choose, 'CategoryPicker 必须有 choose 处理器')
+    assert.strictEqual(findAll(choose, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'name !== value')).length, 1,
+      'CategoryPicker 必须有值守卫（同值不 onChange）')
+    assert.deepStrictEqual(callSites(choose, 'onChange').map((call) => callArgLabels(call).join(',')), ['name'],
+      '值真的变了才回调 onChange(name)')
     // ⑥ 日志首次加载失败也要同高占位：错误路径不得让 520px 日志框整体消失。
-    const logs = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function SysPanel'))
-    assert.ok(/err && !data && html`<div class="log-empty" role="status">日志读取失败/.test(logs),
-      'err && !data 时必须渲染「日志读取失败」占位（.log-empty 同高）')
-
-    // ⑦ chip 计数 6 位不重排（1MiB 全是换行也有 7 位，5em 留余量）。
-    const nCss = (css.match(/\.log-chip-n\s*\{[^}]*\}/) || [''])[0]
-    assert.ok(/min-width:\s*5em/.test(nCss), '.log-chip-n min-width 必须 5em（6 位计数不重排）')
-    assert.ok(!/min-width:\s*(2\.4|3\.2)em/.test(nCss), '旧的 2.4em / 3.2em 必须改掉')
-
+    const logsFn = markup.functionNodeOf(pagesModel, 'LogsPanel')
+    const errTpls = templateIn(logsFn, '日志读取失败')
+    assert.strictEqual(errTpls.length, 1, 'err && !data 时必须渲染「日志读取失败」占位')
+    assert.deepStrictEqual(renderGuardsOf(logsFn, errTpls[0]), ['err && !data'],
+      '失败占位只在 err && !data 时渲染（.log-empty 同高）')
+    // ⑦ chip 计数 5em 定宽：1MiB 全是换行也有 7 位，6 位计数不重排。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.log-chip-n', 'min-width'), ['5em'],
+      '.log-chip-n min-width 必须 5em（旧的 2.4em / 3.2em 会让计数换挡时重排）')
     // ⑧ 回车/刷新直接生效搜索词时也要置旗（否则防抖随后看到词已生效，主路径漏落点）。
-    assert.ok(msg.includes('if (q !== query) { armLand(); setQuery(q); setPage(1); return }'),
-      'refreshNow 在词变化时必须 armLand（回车/刷新也要落点）')
-
+    const refreshNow = findFirst(msg, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refreshNow')
+    const wordGuard = findAll(refreshNow, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'q !== query'))[0]
+    assert.ok(wordGuard, 'refreshNow 必须先判「搜索词真的变了」（q !== query）')
+    assert.deepStrictEqual(wordGuard.consequent.body.filter((stmt) => stmt.type === 'ExpressionStatement')
+      .map((stmt) => exprLabel(stmt.expression)),
+    ['armLand()', 'setQuery()', 'setPage()'],
+    '词变化时必须先置落点旗、改词、回第 1 页（顺序不能换）')
     // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
-    assert.ok(arm.includes('userMovedRef.current = false'), '置旗时必须复位用户滚动标记')
-    assert.ok(effect.includes('if (userMovedRef.current) return'), '消费前必须检测用户是否自己滚走')
-    assert.ok(msg.includes('useLandScrollCancel(landRef, userMovedRef)'), '必须接入用户滚动取消 hook')
-    assert.ok(src.includes("window.addEventListener('touchmove', mark"), 'hook 里必须有 touchmove/wheel 监听')
-
-    // ⑩ 逐轮历史切模式是原子的：有快照同批换；没快照不得先换选中态/列表。
-    // 空结果也要保留 listRef（否则无法落点）。
-    const hEffectAt = hist.indexOf('useLayoutEffect(() => {')
-    const hEffect = hist.slice(hEffectAt, hist.indexOf('}, [', hEffectAt))
-    assert.ok(!hEffect.includes('asyncLandRef') && !hEffect.includes('sawLoadingRef'), '落点不得再等「重拉结算」：切档已原子化')
-    assert.ok(hEffect.includes('if (userMovedRef.current) return'), '逐轮历史也要防用户自己滚走')
-    assert.ok(hist.includes('useLandScrollCancel(landRef, userMovedRef)'), '逐轮历史也要接入同一个取消 hook')
-    assert.ok(hist.includes('<div class="runs-scroll" ref=$' + '{listRef}>') && !hist.includes('$' + '{shown.length > 0 && html`<div class="runs-scroll"'), '空结果时 .runs-scroll 也必须挂载（listRef 不能丢）')
-
-    // 版本已 bump 到 3.386：注释里不得提前写下一版 v3.387。
-    // 旧写法把版本号写死成 v3.361，之后 24 个版本没人跟着改 ⇒ 这条红线早已失效（注释里真写
-    // v3.387 也不会被拦）。改为按 package.json 的当前版本推导「下一版」，bump 后自动跟上。
-    // 注意这条只拦「资源注释里提前写下个版本」；四处版本号（主文件头/CHANGELOG/package.json/
-    // package-lock 两处）的一致性由 check-version.js 负责（CI 与 pre-commit 都跑，npm test 不含）。
-    // 版本号形如 3.386.0：本仓每次发版 +1 的是中段（3.386 → 3.387.0），且注释里习惯只写到中段
-    // （旧红线写的就是 v3.361）。故按「vMAJOR.下一中段」匹配，v3.387 与 v3.387.0 两种写法都能拦。
+    assert.strictEqual(findAll(effect.arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'userMovedRef.current')).length, 1,
+      '消费前必须检测用户是否自己滚走')
+    for (const [name, panel] of [['推送记录', msg], ['逐轮历史', markup.functionNodeOf(pagesModel, 'RunHistoryPanel')]]) {
+      assert.deepStrictEqual(callSites(panel, 'useLandScrollCancel').map((call) => callArgLabels(call).join(',')),
+        ['landRef,userMovedRef'], `${name}必须接入用户滚动取消 hook（同一个）`)
+    }
+    const cancelHook = markup.functionNodeOf(pagesModel, 'useLandScrollCancel')
+    assert.ok(cancelHook, '必须有 useLandScrollCancel（滚动撤销的唯一定义）')
+    for (const event of ['wheel', 'touchmove']) {
+      const listeners = callSites(cancelHook, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === `"${event}"`)
+      assert.strictEqual(listeners.length, 1, `hook 必须监听 ${event}（浏览器夹取/锚定不会触发这些事件，所以只认用户自己滚）`)
+      const passive = listeners[0].arguments[2]
+      assert.ok(passive && passive.type === 'ObjectExpression' &&
+        passive.properties.some((prop) => prop.key.name === 'passive' && prop.value.value === true),
+      `${event} 必须 passive（滚动监听不能阻塞手势）`)
+      assert.strictEqual(callArgLabels(listeners[0])[1], 'mark', `${event} 必须挂同一个 mark（只标记用户自己滚动）`)
+    }
+    // ⑩ 逐轮历史切模式是原子的：落点不得再等「重拉结算」。
+    const hist = markup.functionNodeOf(pagesModel, 'RunHistoryPanel')
+    const histEffect = callSites(hist, 'useLayoutEffect').find((call) => callSites(call.arguments[0], 'listLandTarget').length > 0)
+    assert.deepStrictEqual(['asyncLandRef', 'sawLoadingRef'].filter((name) =>
+      findAll(histEffect.arguments[0], (n) => n.type === 'Identifier' && n.name === name).length > 0), [],
+    '落点不得再等「重拉结算」：切档已原子化')
+    assert.strictEqual(findAll(histEffect.arguments[0], (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'userMovedRef.current')).length, 1,
+      '逐轮历史也要防用户自己滚走')
+    // 空结果时 .runs-scroll 也必须挂载（listRef 不能丢）：容器只受 status 门约束。
+    const runsTpls = templateIn(hist, 'class="runs-scroll"')
+    assert.strictEqual(runsTpls.length, 1, '逐轮历史必须有 .runs-scroll 容器')
+    assert.deepStrictEqual(renderGuardsOf(hist, runsTpls[0]), ['data && data.status === "ok"'],
+      '空结果时 .runs-scroll 也必须挂载（不得再被 shown.length > 0 包住，否则 listRef 丢失、无法落点）')
+    const runsEl = elementsInFunction(pagesModel, 'RunHistoryPanel').find((el) => markup.hasClass(el, 'runs-scroll'))
+    assert.ok(runsEl && exprLabel(markup.attrExpr(runsEl, 'ref')) === 'listRef', '.runs-scroll 必须挂 listRef')
+    // 版本已 bump：资源注释里不得提前写「下一版」（注释不在 AST 里，只能把注释解析成数组再比）。
     const cur = String(require('./package.json').version).split('.').map(Number)
     const nextVer = `v${cur[0]}.${cur[1] + 1}`
-    assert.ok(!src.includes(nextVer), `app.js 注释不得写 ${nextVer}（版本未 bump）`)
-    assert.ok(!css.includes(nextVer), `app.css 注释不得写 ${nextVer}（版本未 bump）`)
+    for (const file of CONSOLE_MODULE_FILES.concat('app.css')) {
+      assert.deepStrictEqual(commentTextsOf(path.join(CONSOLE_ASSET_DIR, file)).filter((text) => text.includes(nextVer)), [],
+        `${file} 注释不得写 ${nextVer}（版本未 bump；四处版本号一致性由 check-version.js 管）`)
+    }
   })
 
+  // ── 顶栏时间可关年月日（设置块已搬到系统页）──────────────────────────────────
   await aok('结构红线: v3.342 顶栏时间可关年月日（设置块已搬到系统页）', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
+    const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
 
     // ① 格式化：关掉时只留 时:分:秒；「—」不能被切坏。
-    const barAt = src.indexOf('function fmtBarTime (ts, withDate)')
-    assert.ok(barAt > 0, '缺少 fmtBarTime')
-    const barSrc = src.slice(barAt, barAt + 400)
-    assert.ok(barSrc.includes("if (s === '—' || withDate !== false) return s"), '默认带日期，「—」原样返回')
-    assert.ok(barSrc.includes('return s.slice(11)'), '关掉年月日时必须截掉日期部分')
-
-    // ② v3.346：状态行只有一个来源——AutoRefreshText 统一输出「自动刷新 Ns · 数据截至 · 时间」，
-    //    App 只负责汇总时间来源（syncAt）和 live/paused，不再每页各写一套。
-    assert.ok(src.includes("const syncAt = tab === 'overview' ? lastSync : panelSync"), '时间来源必须在一处汇总')
-    assert.ok(/lastSync=\$\{syncAt\} showDate=\$\{showDate\} paused=\$\{!autoRefresh \|\| authExpired\} live=\$\{livePolling\}/.test(src), '状态行必须统一传参（时间/年月日/暂停或凭证失效/是否轮询）')
-    assert.ok(src.includes('fmtBarTime(lastSync, showDate)'), '组件内必须走 fmtBarTime')
-    // v3.343：气泡和年月日同步——关掉年月日时 tip 必须为空（TapTip 退化成纯文本）。
-    assert.ok(/tip=\$\{showDate && syncAt \?/.test(src), '气泡必须跟着 showDate 一起关')
-    // v3.353：日期开着时用文字提醒可点看完整日期；关掉日期时不能承诺可点。
-    assert.ok(/hint=\$\{showDate && syncAt \? '点看' : ''\}/.test(src), '日期开着时必须有可点提醒')
-    assert.ok(!src.includes('点一下可看完整日期') && !src.includes('点一下仍可看完整日期'), '关掉日期时不得承诺点一下可看完整日期')
-
+    const bar = markup.functionNodeOf(componentsModel, 'fmtBarTime')
+    assert.ok(bar, '缺少 fmtBarTime')
+    const barInit = bar.body.body[0].declarations[0]
+    assert.ok(barInit.id.name === 's' && sameShapeOf(barInit.init, 'fmtLocalTime(ts)'),
+      'fmtBarTime 必须复用 fmtLocalTime（时刻口径只有一份）')
+    const barGuard = bar.body.body.find((stmt) => stmt.type === 'IfStatement')
+    assert.ok(barGuard && sameShapeOf(barGuard.test, "s === '—' || withDate !== false"),
+      '默认带日期，「—」原样返回（截 s.slice(11) 会把占位符切成空串）')
+    assert.strictEqual(exprLabel(barGuard.consequent.argument), 's', '默认带日期时原样返回（不截断）')
+    const barTail = bar.body.body.filter((stmt) => stmt.type === 'ReturnStatement').pop()
+    assert.ok(sameShapeOf(barTail.argument, 's.slice(11)'), '关掉年月日时必须截掉日期部分')
+    // ①b 行为：真跑 fmtBarTime（时间口径用生产里的 fmtTime/fmtLocalTime，不是自造的桩）。
+    const barFns = evalPureFunctions(path.join(CONSOLE_ASSET_DIR, 'format.js'), ['fmtTime', 'fmtLocalTime'])
+    const barTime = evalPureFunctions(path.join(CONSOLE_ASSET_DIR, 'components.js'), ['fmtBarTime'], barFns).fmtBarTime
+    const ts = Date.UTC(2026, 0, 2, 3, 4, 5) // +08 ⇒ 2026-01-02 11:04:05
+    assert.strictEqual(barTime(ts), '2026-01-02 11:04:05', '默认必须带年月日（顶栏完整时间）')
+    assert.strictEqual(barTime(ts, true), '2026-01-02 11:04:05', '显式 true 与默认一致')
+    assert.strictEqual(barTime(ts, false), '11:04:05', '关掉年月日时只留 时:分:秒（不是空串、不是半截）')
+    assert.strictEqual(barTime(0, false), '—', '没有时间戳时必须是占位符（截 s.slice(11) 会得到空串）')
+    assert.strictEqual(barTime(null, false), '—', 'null 同样落到占位符（不能抛、不能切出空串）')
+    // ② 状态行只有一个来源：AutoRefreshText 统一输出「自动刷新 Ns · 数据截至 · 时间」。
+    const app = markup.functionNodeOf(uiModel, 'App')
+    const syncAtDecl = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'syncAt')
+    assert.ok(syncAtDecl && sameShapeOf(syncAtDecl.init, "tab === 'overview' ? lastSync : panelSync"),
+      '时间来源必须在一处汇总（概览页用概览的，其它页用当前页的）')
+    const appEls = elementsInFunction(uiModel, 'App')
+    const statusEls = appEls.filter((el) => el.name === 'AutoRefreshText')
+    assert.strictEqual(statusEls.length, 1, '状态行必须只有一个 AutoRefreshText（不再每页各写一套）')
+    assert.deepStrictEqual(statusEls[0].attrs.filter((attr) => attr.value.kind === 'expr')
+      .map((attr) => attr.name + '=' + exprLabel(attr.value.node)),
+    ['nextAt=nextAt', 'pollMs=pollMs', 'lastSync=syncAt', 'showDate=showDate',
+      'paused=!autoRefresh || authExpired', 'live=livePolling'],
+    '状态行必须统一传参（时间/年月日/暂停或凭证失效/是否轮询）')
+    const art = markup.functionNodeOf(componentsModel, 'AutoRefreshText')
+    assert.deepStrictEqual(callSites(art, 'fmtBarTime').map((call) => callArgLabels(call).join(',')), ['lastSync,showDate'],
+      '组件内必须走 fmtBarTime（时间与年月日开关一起传）')
+    // v3.343/v3.353：气泡与年月日同步——关掉年月日时 tip 为空（TapTip 退化成纯文本），也不承诺可点。
+    const tipEl = appEls.find((el) => el.name === 'TapTip')
+    assert.ok(tipEl, '状态行必须复用同一个 TapTip')
+    const tipExpr = conditionalAttrOf(tipEl, 'tip')
+    assert.ok(tipExpr && sameShapeOf(tipExpr.test, 'showDate && syncAt'),
+      '气泡必须跟着 showDate 一起关（tip = showDate && syncAt ? … : \'\')')
+    assert.strictEqual(exprLabel(tipExpr.alternate), '""', '关掉日期时 tip 必须为空串（不弹空气泡）')
+    const hintExpr = conditionalAttrOf(tipEl, 'hint')
+    assert.ok(hintExpr && sameShapeOf(hintExpr.test, 'showDate && syncAt') &&
+      exprLabel(hintExpr.consequent) === '"点看"' && exprLabel(hintExpr.alternate) === '""',
+    "日期开着时才可点提醒（hint = showDate && syncAt ? '点看' : ''）")
+    assert.deepStrictEqual(consoleAssetStrings().filter((value) =>
+      value.includes('点一下可看完整日期') || value.includes('点一下仍可看完整日期')), [],
+    '关掉日期时不得承诺点一下可看完整日期（旧文案必须彻底消失）')
     // ②b v3.344：暂停不是概览专属——其它页也要能暂停/继续。
-    //     v3.346：文案收敛到组件里，暂停只换开头两个字，后半句不变。
-    assert.ok(!/\$\{tab === 'overview' && html`<button type="button" class="sync-toggle"/.test(src), '暂停按钮不得再限定在概览页')
-    assert.ok(/\$\{remain\} 秒后刷新 · <span class="sync-label">数据截至 \$\{TZ_LABEL\} <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '运行态文案必须统一')
-    assert.ok(/已暂停 · <span class="sync-label">数据截至 \$\{TZ_LABEL\} <\/span>\$\{atMain\}<span class="sync-sec">\$\{atSec\}<\/span>/.test(src), '暂停态只换开头，后半句保持同一形态')
-    // v3.347：秒级时钟必须比 1s 快。1s 时钟与 mark() 不同相时，倒数会 5 4 3 2 → 5 跳过 1s
-    // （真机录屏实证），所以这里钉住 500ms，防止有人「优化」回 1000。
-    assert.ok(src.includes('setInterval(() => setNowMs(() => Date.now()), 500)'), '倒计时时钟必须是 500ms（1s 会跳秒）')
-
-    // ③ App 启动时读设置（顶栏在面板之外，必须自己拿一份；保存后靠 onSaved 重拉）。
-    assert.ok(src.includes('body.settings.syncShowDate'), 'App 必须从设置读面取 syncShowDate（读面直接回 body，不是 {data}）')
-    // v3.349：解析搬进 applyUiSettings（读面按 revision 丢弃乱序响应），只认布尔这条语义不变。
-    assert.ok(src.includes('typeof body.settings.syncShowDate !== \'boolean\''), '只认布尔，读失败保持默认')
-    assert.ok(src.includes('if (rev < uiSettingsRevRef.current) return'), '旧读响应不得覆盖新值（按 revision 判序）')
-    assert.ok(/onSettingsSaved=\$\{reloadUiSettings\}/.test(src), '系统页必须把「保存后重拉」接上')
-
+    const toggleTpls = templateIn(app, 'sync-toggle')
+    assert.ok(toggleTpls.length >= 1, '顶栏必须有暂停/继续按钮')
+    for (const tpl of toggleTpls) {
+      assert.deepStrictEqual(renderGuardsOf(app, tpl), [],
+        '暂停按钮不得再限定在概览页（不得挂在 tab === \'overview\' 后面）')
+    }
+    // 运行态/暂停态文案：只有开头不同，后半句同一形态（同一组标签、同一个顺序）。
+    const artTpls = markup.templatesIn(art)
+    const pausedTpl = artTpls.find((tpl) => String(tpl.quasi.quasis[0].value.raw).startsWith('已暂停 · '))
+    const runningTpl = artTpls.find((tpl) => tpl.quasi.expressions.length === 4 &&
+      exprLabel(tpl.quasi.expressions[0]) === 'remain' && exprLabel(tpl.quasi.expressions[3]) === 'atSec')
+    assert.ok(pausedTpl && runningTpl, '暂停态与运行态必须各有一段文案模板')
+    assert.deepStrictEqual(pausedTpl.quasi.expressions.map(exprLabel), ['TZ_LABEL', 'atMain', 'atSec'],
+      '暂停态后半句必须是「数据截至 + 时分 + 秒」三格')
+    assert.deepStrictEqual(runningTpl.quasi.expressions.map(exprLabel), ['remain', 'TZ_LABEL', 'atMain', 'atSec'],
+      '运行态必须是「剩余秒 + 数据截至 + 时分 + 秒」四格（顺序不能换）')
+    const shapeOf = (tpl) => markup.markupOf(tpl).children.filter((child) => child.type === 'element')
+      .map((el) => el.name + '.' + markup.classNames(el).join('.'))
+    assert.deepStrictEqual(shapeOf(pausedTpl), shapeOf(runningTpl),
+      '暂停态只换开头，后半句必须保持同一形态（标签/class 全一致，否则切换时整行重排）')
+    // v3.347：秒级时钟必须比 1s 快（1s 与 mark() 不同相时倒数会 5 4 3 2 → 5 跳过 1s）。
+    const intervals = callSites(art, 'setInterval')
+    assert.strictEqual(intervals.length, 1, '必须只有一处秒级时钟（重复起定时器会叠加渲染）')
+    assert.ok(sameShapeOf(intervals[0].arguments[0], '() => setNowMs(() => Date.now())') &&
+      exprLabel(intervals[0].arguments[1]) === '500', '倒计时时钟必须是 500ms（1s 会跳秒）')
+    // ③ App 启动时读设置（顶栏在面板之外，必须自己拿一份；保存后靠 onSettingsSaved 重拉）。
+    const apply = findFirst(app, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'applyUiSettings')
+    assert.ok(apply, '必须有 applyUiSettings（读面的唯一解析点）')
+    assert.ok(findAll(apply, (n) => n.type === 'MemberExpression' && memberPath(n) === 'body.settings.syncShowDate').length >= 1,
+      'App 必须从设置读面取 syncShowDate（读面直接回 body，不是 { data }）')
+    assert.ok(findAll(apply, (n) => sameShapeOf(n, "typeof body.settings.syncShowDate !== 'boolean'")).length >= 1,
+      '只认布尔，读失败保持默认')
+    assert.strictEqual(findAll(apply, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'rev < uiSettingsRevRef.current')).length, 1,
+      '旧读响应不得覆盖新值（按 revision 判序）')
+    const sysEl = appEls.find((el) => el.name === 'SysPanel')
+    assert.ok(sysEl && exprLabel(markup.attrExpr(sysEl, 'onSettingsSaved')) === 'reloadUiSettings',
+      '系统页必须把「保存后重拉」接上（onSettingsSaved = reloadUiSettings）')
     // ④ 设置块：勾选即保存、非布尔不发、失败重读；读面由系统页统一持有。
-    const blkAt = src.indexOf('function ConsoleSettingsBlock')
-    const blkEnd = src.indexOf('// 系统信息：版本', blkAt)
-    assert.ok(blkAt > 0 && blkEnd > blkAt, 'ConsoleSettingsBlock 切片锚点必须存在且有序')
-    const blk = src.slice(blkAt, blkEnd)
-    assert.ok(blk.includes('apiPostConsoleSettings({ syncShowDate: next, baseRevision: settingsLive.revision })'),
-      '开关保存必须只提交 syncShowDate + baseRevision')
-    assert.ok(blk.includes("typeof settingsLive.settings.syncShowDate === 'boolean'"), '读面必须校验布尔类型')
-    assert.ok(blk.includes('type="checkbox"') && blk.includes('显示年月日'), '缺少「显示年月日」勾选框')
-    assert.ok(blk.includes('dateSavingRef.current'), '开关也必须防连点')
-    assert.ok(blk.includes("payload.error === 'revision_mismatch'"), '开关保存 409 要按冲突提示并重读')
-    assert.ok(!blk.includes('usePanelLoader(apiGetConsoleSettings'), '读面应由系统页统一持有（下拉刷新要等它落定）')
-
+    const block = markup.functionNodeOf(pagesModel, 'ConsoleSettingsBlock')
+    assert.ok(block, '必须能定位 ConsoleSettingsBlock')
+    const toggle = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'toggleShowDate')
+    assert.ok(toggle, '必须有 toggleShowDate（勾一下就保存）')
+    const togglePost = callSites(toggle, 'apiPostConsoleSettings')[0]
+    assert.ok(togglePost && togglePost.arguments[0].type === 'ObjectExpression' &&
+      objectKeyNames(togglePost.arguments[0]).join(',') === 'syncShowDate,baseRevision',
+    '开关保存必须只提交 syncShowDate + baseRevision')
+    const toggleProps = new Map(togglePost.arguments[0].properties.map((prop) => [prop.key.name, prop.value]))
+    assert.deepStrictEqual([exprLabel(toggleProps.get('syncShowDate')), exprLabel(toggleProps.get('baseRevision'))],
+      ['next', 'settingsLive.revision'], '开关保存必须传下一状态与当前 revision（乐观锁）')
+    assert.strictEqual(findAll(toggle, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'next === showDate')).length, 1,
+      '同值不得发请求（勾回来不算一次修改）')
+    assert.strictEqual(findAll(block, (n) => n.type === 'ConditionalExpression' &&
+      sameShapeOf(n.test, "settingsLive && settingsLive.settings && typeof settingsLive.settings.syncShowDate === 'boolean'")).length, 1,
+    '读面必须校验布尔类型（读到脏值不得当成开关值）')
+    const dateSavingRefGuard = findAll(toggle, (n) => n.type === 'MemberExpression' && memberPath(n) === 'dateSavingRef.current')
+    assert.ok(dateSavingRefGuard.length >= 2, '开关必须防连点（dateSavingRef in-flight 守卫）')
+    const mismatchTests = findAll(block, (n) => n.type === 'BinaryExpression' && n.operator === '===' &&
+      exprLabel(n.left) === 'payload.error' && exprLabel(n.right) === '"revision_mismatch"')
+    assert.strictEqual(mismatchTests.length, 2, '两条写面（拦截窗 / 年月日开关）都要按 revision_mismatch 分支处理')
+    assert.ok(mismatchTests.some((n) => ancestorsOf(block, n).some((node) => node.type === 'VariableDeclarator' &&
+      node.id.type === 'Identifier' && node.id.name === 'toggleShowDate')), '开关保存 409 必须按冲突提示并重读')
+    const checkbox = elementsInFunction(pagesModel, 'ConsoleSettingsBlock')
+      .find((el) => el.name === 'input' && markup.attrText(el, 'type') === 'checkbox')
+    assert.ok(checkbox, '缺少「显示年月日」勾选框（必须是 input[type=checkbox]）')
+    assert.strictEqual(exprLabel(markup.attrExpr(checkbox, 'checked')), 'showDate === true',
+      '勾选状态必须跟随读面（不是本地 state）')
+    assert.deepStrictEqual(callSites(markup.attrExpr(checkbox, 'onChange'), 'toggleShowDate').map((call) => callArgLabels(call).join(',')),
+      ['e.target.checked'], 'onChange 必须把勾选状态交给 toggleShowDate')
+    const toggleLabel = elementsInFunction(pagesModel, 'ConsoleSettingsBlock')
+      .find((el) => el.name === 'label' && markup.hasClass(el, 'set-toggle'))
+    assert.ok(toggleLabel && String(markup.textOf(toggleLabel)).includes('显示年月日'), '缺少「显示年月日」文案')
+    assert.strictEqual(callSites(block, 'usePanelLoader').length, 0, '读面应由系统页统一持有（下拉刷新要等它落定）')
     // ⑤ 样式：勾选框要跟着主题走（原生控件太大/太白会破坏深色页面）。
-    assert.ok(css.includes('.set-toggle input[type="checkbox"]'), '缺少勾选框样式')
-    assert.ok(css.includes('accent-color: var(--accent)'), '勾选框必须用主题强调色')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.set-toggle input[type="checkbox"]', 'accent-color'), ['var(--accent)'],
+      '勾选框必须用主题强调色')
   })
 
+  // ── 顶栏时间点按弹出完整时间（前端）──────────────────────────────────────────
   await aok('结构红线: v3.341 顶栏时间点按弹出完整时间（前端）', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-
-    // ① 组件本身：可点、可键盘、可访问；tip 为空时退化成纯文本（「自动刷新已暂停」不该能点开）。
-    const tipAt = src.indexOf('function TapTip (')
-    const tipEnd = src.indexOf('// 提示行：', tipAt)
-    assert.ok(tipAt > 0 && tipEnd > tipAt, '缺少 TapTip 组件（或切片锚点漂移）')
-    const tipSrc = src.slice(tipAt, tipEnd)
-    assert.ok(tipSrc.includes('if (!tip) return html'), 'tip 为空时必须退化成纯文本')
-    assert.ok(tipSrc.includes('children}'), 'tip 为空时返回 children 本身')
-    assert.ok(tipSrc.includes('role="button"') && tipSrc.includes('aria-expanded='), '触发区必须有 button 语义与 aria-expanded')
-    assert.ok(/e\.key === 'Enter' \|\| e\.key === ' '/.test(tipSrc), '键盘 Enter/Space 也必须能展开')
-    assert.ok(tipSrc.includes("document.addEventListener('pointerdown', onDown, true)"),
-      '点页面任意其它地方必须收回（document 捕获 pointerdown）')
-    assert.ok(/e\.key === 'Escape'/.test(tipSrc), 'Esc 必须能收回')
-    assert.ok(tipSrc.includes('computePosition(box, pop, {') && tipSrc.includes("strategy: 'fixed'"),
-      '弹层坐标必须交给 computePosition（strategy: fixed）')
-    assert.ok(tipSrc.includes('middleware: [offset(8), flip(), shift({ padding: 8 })]'),
-      '弹层方向/夹取必须走 offset(8) + flip + shift(padding 8)')
-    assert.ok(tipSrc.includes('window.innerWidth - 24'), '宽度仍须按视口收窄（200～360，不超视口 24px）')
-    assert.ok(!tipSrc.includes('getBoundingClientRect()'), '不得再自己量触发区算 top/left（定位已收给库）')
-
-    // ② 弹层必须 fixed：.sync 是 overflow:hidden，绝对定位会被裁掉（等于没弹）。
-    const popCss = css.slice(css.indexOf('.tap-tip-pop {'), css.indexOf('}', css.indexOf('.tap-tip-pop {')))
-    assert.ok(popCss.includes('position: fixed'), '.tap-tip-pop 必须 fixed 定位（祖先 .sync 会裁掉绝对定位）')
-    assert.ok(popCss.includes('overflow-wrap: anywhere'), '完整时间必须能换行，不能又被省略号吃掉')
-    const tapCss = css.slice(css.indexOf('.tap-tip {'), css.indexOf('}', css.indexOf('.tap-tip {')))
-    assert.ok(!tapCss.includes('border-bottom'), '顶栏时间下方不得再画虚线（v3.353 改为文案提醒）')
-    assert.ok(css.includes('.tap-tip-date .sync-sec'), '手机日期开着时收起秒，关掉时保留秒')
-    assert.ok(/@media \(max-width: 640px\) \{[\s\S]*?\.sync-label \{ display: none; \}[\s\S]*?\.tap-tip-date \.sync-sec \{ display: none; \}/.test(css), '手机断点必须真的隐藏「数据截至」和日期开时的秒')
-    assert.ok(/class=\$\{showDate \? 'tap-tip tap-tip-date' : 'tap-tip'\}/.test(src), 'TapTip 必须知道日期是否开着')
-
-    // ③ 状态行只有一处 TapTip：所有页共用（v3.346 收成一个组件），tip 里是完整时间 + 星期。
-    assert.ok(src.includes('数据截至：') && src.includes('fmtWeekday(syncAt)'), '状态行没接 TapTip 的完整时间')
-    assert.ok((src.match(/<\$\{TapTip\}/g) || []).length >= 1, '状态行必须复用同一个 TapTip')
+    const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    const tap = markup.functionNodeOf(componentsModel, 'TapTip')
+    assert.ok(tap, '缺少 TapTip 组件')
+    const els = elementsInFunction(componentsModel, 'TapTip')
+    // ① tip 为空时退化成纯文本（「自动刷新已暂停」不该能点开）。
+    const early = findAll(tap, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!tip'))
+      .find((n) => n.consequent.type === 'ReturnStatement')
+    assert.ok(early, 'tip 为空时必须提前 return（不得渲染成可点元素）')
+    assert.deepStrictEqual(markup.expressionsIn(markup.markupOf(early.consequent.argument)).map(exprLabel), ['children'],
+      'tip 为空时必须原样返回 children（退化成纯文本）')
+    // ② 触发区：button 语义 + aria-expanded + 键盘可开。
+    const box = els.find((el) => markup.attrText(el, 'role') === 'button')
+    assert.ok(box, '触发区必须有 button 语义')
+    assert.ok(markup.attrOf(box, 'aria-expanded') !== null, '触发区必须报 aria-expanded')
+    assert.strictEqual(markup.attrText(box, 'tabindex'), '0', '触发区必须可键盘聚焦（tabindex=0）')
+    const keyDown = markup.attrExpr(box, 'onKeyDown')
+    assert.ok(keyDown, '必须有键盘处理')
+    assert.strictEqual(findAll(keyDown, (n) => n.type === 'IfStatement' &&
+      sameShapeOf(n.test, "e.key === 'Enter' || e.key === ' '")).length, 1, '键盘 Enter/Space 也必须能展开')
+    const pointerdowns = callSites(tap, 'document.addEventListener').filter((call) => callArgLabels(call)[0] === '"pointerdown"')
+    assert.strictEqual(pointerdowns.length, 1, '点页面任意其它地方必须收回（document 指针按下）')
+    assert.deepStrictEqual(callArgLabels(pointerdowns[0]), ['"pointerdown"', 'onDown', 'true'],
+      '必须是捕获阶段（第三个实参 true），否则内层 stopPropagation 会让它收不回来')
+    assert.strictEqual(findAll(tap, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "e.key === 'Escape'")).length, 1,
+      'Esc 必须能收回')
+    // ③ 弹层坐标交给 computePosition（strategy: fixed），方向/夹取走 offset+flip+shift。
+    const compute = callSites(tap, 'computePosition')[0]
+    assert.ok(compute, '弹层坐标必须交给 computePosition（不再自己量触发区）')
+    assert.strictEqual(compute.arguments.length, 3, 'computePosition(reference, floating, options) 三个实参')
+    assert.deepStrictEqual(callArgLabels(compute).slice(0, 2), ['box', 'pop'],
+      '必须量触发区与弹层两个节点（box / pop）')
+    const opts = compute.arguments[2]
+    assert.ok(opts && opts.type === 'ObjectExpression', 'computePosition 的选项必须是对象字面量')
+    const optOf = (name) => opts.properties.find((prop) => prop.key && prop.key.name === name)
+    assert.strictEqual(exprLabel(optOf('strategy').value), '"fixed"',
+      '弹层必须 fixed 定位（祖先 .sync 是 overflow:hidden，绝对定位会被裁掉）')
+    assert.strictEqual(exprLabel(optOf('placement').value), '"bottom-start"', '弹层必须挂在触发区下方左对齐')
+    const middleware = optOf('middleware').value
+    assert.ok(middleware && middleware.type === 'ArrayExpression' && middleware.elements.length === 3,
+      'middleware 必须恰好三段：offset + flip + shift')
+    assert.deepStrictEqual(middleware.elements.map((el) => memberPath(el.callee)), ['offset', 'flip', 'shift'],
+      '中间件顺序必须是 offset(8) → flip() → shift(padding 8)（换序会让贴边行为变）')
+    assert.deepStrictEqual(callArgLabels(middleware.elements[0]), ['8'], 'offset 必须是 8px（贴合 .sync 的 8px 间距）')
+    const shiftPad = middleware.elements[2].arguments[0]
+    assert.ok(shiftPad && shiftPad.type === 'ObjectExpression' &&
+      shiftPad.properties.some((prop) => prop.key.name === 'padding' && prop.value.value === 8),
+    'shift 必须留 8px 视口内边距（贴边时不被切）')
+    // 宽度仍按视口收窄（200～360，不超视口 24px）。
+    assert.strictEqual(findAll(tap, (n) => sameShapeOf(n, 'Math.min(360, Math.max(200, window.innerWidth - 24))')).length, 1,
+      '宽度仍须按视口收窄（200～360，不超视口 24px）')
+    assert.strictEqual(callSites(tap, 'getBoundingClientRect').length, 0,
+      '不得再自己量触发区算 top/left（定位已收给库）')
+    // ④ 弹层必须 fixed（.sync 是 overflow:hidden，绝对定位会被裁掉）；完整时间必须能换行。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.tap-tip-pop', 'position'), ['fixed'],
+      '.tap-tip-pop 必须 fixed 定位（祖先 .sync 会裁掉绝对定位）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.tap-tip-pop', 'overflow-wrap'), ['anywhere'],
+      '完整时间必须能换行，不能又被省略号吃掉')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.tap-tip', 'border-bottom'), [],
+      '顶栏时间下方不得再画虚线（v3.353 改为文案提醒）')
+    // ⑤ 手机断点：收起「数据截至」；日期开着时连秒也收起（关掉时保留秒）。
+    const phone = (selector) => cssRulesFor(cssRules, selector)
+      .filter((rule) => rule.at.some((at) => at.includes('@media (max-width: 640px)')))
+    assert.deepStrictEqual(phone('.sync-label').map((rule) => rule.decls.get('display')), ['none'],
+      '手机断点必须隐藏「数据截至」')
+    assert.deepStrictEqual(phone('.tap-tip-date .sync-sec').map((rule) => rule.decls.get('display')), ['none'],
+      '手机日期开着时收起秒（关掉日期时保留秒）')
+    // ⑥ TapTip 必须知道日期是否开着：class 由 showDate 决定。
+    assert.ok(sameShapeOf(markup.attrExpr(box, 'class'), "showDate ? 'tap-tip tap-tip-date' : 'tap-tip'"),
+      'TapTip 必须知道日期是否开着（class 由 showDate 决定）')
+    // ⑦ 状态行只有一处 TapTip，tip 里是完整时间 + 星期。
+    const appEls = elementsInFunction(uiModel, 'App')
+    assert.strictEqual(appEls.filter((el) => el.name === 'TapTip').length, 1, '状态行必须复用同一个 TapTip（不得每页各弹一个）')
+    const tipCond = conditionalAttrOf(appEls.find((el) => el.name === 'TapTip'), 'tip')
+    assert.ok(tipCond, '状态行的 TapTip 必须带 tip（否则气泡是空的）')
+    const tipTpl = tipCond.consequent
+    assert.strictEqual(tipTpl.type, 'TemplateLiteral', 'tip 文案必须是字符串模板（属性值不是 html``）')
+    assert.ok(String(tipTpl.quasis.map((quasi) => quasi.value.raw).join('')).includes('数据截至：'),
+      '状态行没接 TapTip 的完整时间（tip 文案必须点名「数据截至：」）')
+    assert.deepStrictEqual(tipTpl.expressions.filter((expr) => expr.type === 'CallExpression').map(exprLabel),
+      ['fmtLocalTime()', 'fmtWeekday()'], 'tip 里必须是完整时间 + 星期（fmtLocalTime / fmtWeekday）')
   })
 
+  // ── 屏蔽注册天数用多行输入框 ─────────────────────────────────────────────────
   await aok('结构红线: 屏蔽注册天数用多行输入框', () => {
-    const src = readConsoleSource()
-    const daysAt = src.indexOf('def.kind === \'days\'')
-    const daysEnd = src.indexOf(': html`<textarea', daysAt)
-    const daysBlock = daysAt >= 0 && daysEnd > daysAt ? src.slice(daysAt, daysEnd) : ''
-    assert.ok(daysBlock.includes('<textarea') && daysBlock.includes('fr-input-days'), '天数分支必须渲染 textarea（不能只留 class）')
-    assert.ok(!daysBlock.includes('<input'), '天数分支不得退回单行 input')
-    assert.ok(src.includes('支持「分类###天数」多行写法'), '提示必须保留多行写法')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const field = markup.functionNodeOf(pagesModel, 'FilterField')
+    assert.ok(field, '必须能定位 FilterField')
+    // 两个分支都必须是 textarea：input 会退回单行，「分类###天数」写不下。
+    const kindBranch = findAll(field, (n) => n.type === 'ConditionalExpression' && sameShapeOf(n.test, "def.kind === 'days'"))
+    assert.strictEqual(kindBranch.length, 1, '必须按 def.kind 选输入控件（days 分支唯一）')
+    const controlOf = (tpl) => markup.allElements(markup.markupOf(tpl))[0]
+    const daysEl = controlOf(kindBranch[0].consequent)
+    assert.strictEqual(daysEl.name, 'textarea', '天数分支必须渲染 textarea（不能只留 class）')
+    assert.ok(markup.hasClass(daysEl, 'fr-input-days'), '天数分支必须带 fr-input-days')
+    assert.ok(markup.hasClass(daysEl, 'fr-input'), '天数分支必须复用 .fr-input 样式')
+    assert.strictEqual(controlOf(kindBranch[0].alternate).name, 'textarea',
+      '非天数分支同样是多行框（规则值都可能多行）')
+    assert.deepStrictEqual(elementsInFunction(pagesModel, 'FilterField').filter((el) => el.name === 'input').map((el) => el.name), [],
+      '字段控件不得退回单行 input（多行规则会写不下）')
+    // 提示必须保留「分类###天数」多行写法：提示文案挂在字段定义上。
+    const daysField = findAll(pagesModel, (n) => n.type === 'ObjectExpression' &&
+      n.properties.some((prop) => prop.key && prop.key.name === 'kind' && exprLabel(prop.value) === '"days"') &&
+      n.properties.some((prop) => prop.key && prop.key.name === 'hint'))
+    assert.ok(daysField.length >= 1, '必须有 kind: days 的字段定义（多行天数）')
+    const hintOf = (obj) => obj.properties.find((prop) => prop.key && prop.key.name === 'hint').value.value
+    assert.ok(daysField.some((obj) => String(hintOf(obj)).includes('支持「分类###天数」多行写法')),
+      '提示必须保留多行写法（用户靠这句话知道可以一行一条）')
+    assert.strictEqual(findAll(pagesModel, (n) => n.type === 'ObjectExpression' &&
+      n.properties.some((prop) => prop.key && prop.key.name === 'name' && prop.value.value === 'pingbitime')).length, 1,
+    'pingbitime 必须仍有字段定义（改名会让规则永远填不进去）')
   })
 
+  // ── 数字框锁定，长按加减连续调整 ─────────────────────────────────────────────
   await aok('结构红线: 数字框锁定，长按加减连续调整', () => {
-    const src = readConsoleSource()
-    const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    const trigger = src.slice(src.indexOf('function TriggerBar'), src.indexOf('// ── 组件：运行历史'))
-    const cfgStart = src.indexOf('function ConsoleSettingsBlock')
-    const cfgEnd = src.indexOf('// 系统信息：版本', cfgStart)
-    const cfgBlock = src.slice(cfgStart, cfgEnd)
-    assert.ok(/class="auto-input"[\s\S]{0,260}?disabled=\$\{true\}/.test(trigger), '自动运行间隔输入框必须锁定')
-    assert.ok(/class="auto-input"[\s\S]{0,260}?disabled=\$\{true\}/.test(cfgBlock), '通知自检拦截窗输入框必须锁定')
-    assert.ok(!/class="auto-input"[\s\S]{0,260}?onInput=/.test(trigger), '自动运行间隔不得再接受键入')
-    assert.ok(!/class="auto-input"[\s\S]{0,260}?onInput=/.test(cfgBlock), '通知自检拦截窗不得再接受键入')
-    assert.ok(src.includes('function useHoldRepeat') && src.includes('HOLD_START_MS') && src.includes('HOLD_REPEAT_MS'),
-      '必须复用长按连续调整 hook')
-    assert.ok(trigger.includes('onPointerDown=$' + '{holdAuto.start(-1)}') && trigger.includes('onPointerDown=$' + '{holdAuto.start(1)}'),
-      '自动运行加减必须接长按')
-    assert.ok(cfgBlock.includes('onPointerDown=$' + '{holdWin.start(-1)}') && cfgBlock.includes('onPointerDown=$' + '{holdWin.start(1)}'),
-      '通知自检加减必须接长按')
-    assert.ok(trigger.includes('setAutoDraft((prev) =>') && cfgBlock.includes('setWinDraft((prev) =>'),
-      '快速长按必须用函数式更新，避免连续增量丢失')
-    assert.ok(css.includes('touch-action: none') && css.includes('.auto-input:disabled'),
-      '长按按钮要禁用触摸手势，禁用输入框要保持可读')
+    const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const cssRules = cssRulesOf(fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css'), 'utf8'))
+    // 两个数字框（自动运行间隔 / 通知自检拦截窗）都必须锁定：disabled 恒 true 且没有 onInput。
+    for (const [name, model] of [['TriggerBar', componentsModel], ['ConsoleSettingsBlock', pagesModel]]) {
+      const input = elementsInFunction(model, name).find((el) => el.name === 'input' && markup.hasClass(el, 'auto-input'))
+      assert.ok(input, `${name} 必须有 .auto-input 数字框`)
+      assert.strictEqual(exprLabel(markup.attrExpr(input, 'disabled')), 'true', `${name} 的数字框必须锁定（disabled 恒 true）`)
+      assert.strictEqual(markup.attrOf(input, 'onInput'), null, `${name} 的数字框不得再接受键入（没有 onInput）`)
+      assert.strictEqual(markup.attrText(input, 'inputmode'), 'numeric', `${name} 的数字框仍是数字键盘（可读、可聚焦）`)
+      const stepButtons = elementsInFunction(model, name).filter((el) => el.name === 'button' && markup.hasClass(el, 'auto-step'))
+      assert.strictEqual(stepButtons.length, 2, `${name} 必须恰好两个步进按钮（− / +）`)
+      for (const button of stepButtons) {
+        assert.ok(markup.attrExpr(button, 'onPointerUp') && markup.attrExpr(button, 'onPointerCancel') &&
+          markup.attrExpr(button, 'onContextMenu'), `${name} 的长按按钮必须同时接 stop 与 contextMenu（否则松手不停、长按弹菜单）`)
+      }
+    }
+    // 调整只有「−/+」这一条路径：两次步进都要接长按 hook（start(±1)）。
+    const holdCallsOf = (name, model) => elementsInFunction(model, name)
+      .filter((el) => el.name === 'button' && markup.hasClass(el, 'auto-step'))
+      .map((el) => {
+        const onDown = markup.attrExpr(el, 'onPointerDown')
+        return memberPath(onDown.callee) + ':' + callArgLabels(onDown).join(',')
+      })
+    assert.deepStrictEqual(holdCallsOf('TriggerBar', componentsModel).map((label) => label.replace('holdAuto', 'hold')),
+      ['hold.start:-1', 'hold.start:1'], '自动运行加减必须接长按（holdAuto.start(±1)）')
+    assert.deepStrictEqual(holdCallsOf('ConsoleSettingsBlock', pagesModel).map((label) => label.replace('holdWin', 'hold')),
+      ['hold.start:-1', 'hold.start:1'], '通知自检加减必须接长按（holdWin.start(±1)）')
+    // 长按 hook：常量与两段定时器都在（450ms 起，110ms 一档）。
+    const holdDecl = findFirst(componentsModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'useHoldRepeat')
+    assert.ok(holdDecl, '必须复用长按连续调整 hook（useHoldRepeat）')
+    const constOf = (name) => {
+      const decl = findFirst(componentsModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === name)
+      return decl && decl.init.type === 'Literal' ? decl.init.value : null
+    }
+    assert.deepStrictEqual([constOf('HOLD_START_MS'), constOf('HOLD_REPEAT_MS')], [450, 110],
+      '长按起手 450ms、重复 110ms（改这两个数就是改手感）')
+    assert.strictEqual(findAll(holdDecl, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setTimeout' &&
+      exprLabel(n.arguments[1]) === 'HOLD_START_MS').length, 1, '起手定时器必须用 HOLD_START_MS')
+    assert.strictEqual(findAll(holdDecl, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setTimeout' &&
+      exprLabel(n.arguments[1]) === 'HOLD_REPEAT_MS').length, 1, '连续步进定时器必须用 HOLD_REPEAT_MS')
+    // 快速长按必须用函数式更新，避免连续增量丢失。
+    for (const [name, model, setter] of [['TriggerBar', componentsModel, 'setAutoDraft'], ['ConsoleSettingsBlock', pagesModel, 'setWinDraft']]) {
+      const calls = callSites(markup.functionNodeOf(model, name), setter)
+        .filter((call) => call.arguments[0] && call.arguments[0].type === 'ArrowFunctionExpression')
+      assert.ok(calls.length >= 1, `${name} 必须用函数式更新（${setter}((prev) => …)），否则连续增量会丢`)
+      assert.strictEqual(calls[0].arguments[0].params[0].name, 'prev', `${name} 的 ${setter} 必须以 prev 为基础累加`)
+    }
+    // 样式：长按按钮禁用触摸手势（滚动不误触），禁用输入框保持可读。
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.auto-step', 'touch-action'), ['none'],
+      '长按按钮要禁用触摸手势（否则按住时页面跟着滚）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.auto-input:disabled', 'opacity'), ['1'],
+      '禁用输入框要保持可读（压透明度会让数值看不清）')
   })
 
+  // ── 配置页可改通知自检拦截窗（前端）──────────────────────────────────────────
   await aok('结构红线: v3.340 配置页可改通知自检拦截窗（前端）', () => {
-    const src = readConsoleSource()
+    const apiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'api.js'))
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     // ① API 层：两条读/写端点都用纯字面量 URL（Codacy SSRF 启发式的唯一全绿形态）。
-    assert.ok(src.includes('function apiGetConsoleSettings ()'), '缺少设置读面 apiGetConsoleSettings')
-    assert.ok(src.includes('function apiPostConsoleSettings (body)'), '缺少设置写面 apiPostConsoleSettings')
-    assert.strictEqual((src.match(/fetch\('\/api\/config\/console'/g) || []).length, 2,
-      'GET/POST 必须各一条字面量 fetch(/api/config/console)')
-
+    for (const [name, method, reader] of [['apiGetConsoleSettings', null, 'consumeJson'],
+      ['apiPostConsoleSettings', 'POST', 'consumeJsonResult']]) {
+      const fn = markup.functionNodeOf(apiModel, name)
+      assert.ok(fn, `缺少设置端点 ${name}`)
+      const fetches = callSites(fn, 'fetch')
+      assert.strictEqual(fetches.length, 1, `${name} 必须只有一处 fetch`)
+      assert.deepStrictEqual(callArgLabels(fetches[0])[0], '"/api/config/console"',
+        `${name} 的 URL 必须是纯字面量 /api/config/console`)
+      assert.strictEqual(callSites(fn, reader).length, 1, `${name} 必须用 ${reader} 收口响应`)
+      assert.strictEqual(callSites(fn, 'timedRequest').length, 1, `${name} 必须经 timedRequest（超时与其它端点同口径）`)
+      if (method !== null) {
+        assert.strictEqual(findAll(fn, (n) => n.type === 'Property' && n.key && n.key.name === 'method' &&
+          n.value.value === method).length, 1, `写面必须是 ${method}`)
+      }
+    }
     // ② 拦截提示的秒数来自服务端响应（拦截窗可配置，写死 60 会说谎）。
-    // 必须剥注释再匹配：原先直接 includes 时，把客户端改成写死 60、只在注释里留一句
-    // 「应取 data.replayWindowS」也能全绿（回潮实验 A6 实测）。
-    const notifySegRaw = src.slice(src.indexOf('async function triggerNotifyTest'), src.indexOf('function Badge ('))
-    const notifySeg = notifySegRaw.replace(/\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-    assert.ok(notifySeg.includes('data.replayWindowS'), 'triggerNotifyTest 必须用响应里的 replayWindowS')
-    assert.ok(notifySeg.includes('Number.isInteger(data.replayWindowS)') &&
-      notifySeg.includes(': NOTIFY_WINDOW_DEFAULT_S'), '缺失时才回退默认值（三元两支都必须在）')
-    assert.ok(!/60 秒内无需重复/.test(notifySeg), '不得再写死「60 秒内无需重复」')
-    assert.ok(src.includes('typeof dupMsg === \'function\' ? dupMsg(data) : dupMsg'),
-      'triggerVia 必须支持函数式 dupMsg（保留字符串形态给 /trigger）')
-    // 只留着表达式不算修好：拦截文案必须真的由 dupMsg(data) 构造（Sourcery #303 M11）。
-    assert.ok(/const msg = typeof dupMsg === 'function' \? dupMsg\(data\) : dupMsg[\s\S]{0,160}new Error\(msg\)/.test(src),
-      '拦截提示必须用 dupMsg(data) 的结果构造 Error，不能留一段不参与构造的死代码')
-
-    // ③ 设置块（v3.342 从配置页搬到系统页）：保存带乐观锁、成功文案不吹「已生效」。
-    // 切片锚点必须真存在：锚点丢了 indexOf 返回 -1，slice 会退化成「文件余下全部」，
-    // 后面所有 includes 变成全文匹配、永久假绿。
-    const setStart = src.indexOf('function ConsoleSettingsBlock')
-    const setEnd = src.indexOf('// 系统信息：版本', setStart)
-    assert.ok(setStart >= 0 && setEnd > setStart, 'ConsoleSettingsBlock 切片锚点必须存在且有序')
-    const cfgBlock = src.slice(setStart, setEnd)
-    assert.ok(cfgBlock.includes('baseRevision: settingsLive.revision'), '保存必须带 baseRevision（乐观锁）')
-    assert.ok(cfgBlock.includes('notifyTestReplayWindowS'), '保存体字段名必须是 notifyTestReplayWindowS')
-    assert.ok(cfgBlock.includes('已保存 · 立即生效'), '保存成功文案为「已保存 · 立即生效」')
-    assert.ok(cfgBlock.includes('NOTIFY_WINDOW_MAX_S') && cfgBlock.includes('NOTIFY_WINDOW_MIN_S'),
-      '客户端校验边界必须走常量（与服务端 0–3600 同口径）')
-    assert.ok(/class="auto-input"[\s\S]{0,400}?disabled=\$\{winCurrent === null \|\| winSaving\}/.test(cfgBlock),
-      '读面失败/保存中时草稿框必须禁用（不得渲染旧值）')
-    assert.ok(cfgBlock.includes("'读取中…'"), '首帧必须显示「读取中」，不得把未加载伪装成读取失败')
-    assert.ok(cfgBlock.includes('winSavingRef.current'), '保存必须防连点（in-flight 守卫）')
-    assert.ok(cfgBlock.includes("payload.error === 'revision_mismatch'") && cfgBlock.includes('setWinDirty(false)'),
-      '409 后必须重读并复位脏标记（否则草稿再也不会跟随刷新）')
+    const notify = markup.functionNodeOf(apiModel, 'triggerNotifyTest')
+    assert.ok(notify, '缺少 triggerNotifyTest')
+    const viaCall = callSites(notify, 'triggerVia')[0]
+    assert.ok(viaCall, '通知自检必须走 triggerVia（与 /trigger 同一套失败语义）')
+    const dupMsg = viaCall.arguments[2]
+    assert.ok(dupMsg && dupMsg.type === 'ArrowFunctionExpression', '通知自检必须传函数式 dupMsg（秒数要按响应算）')
+    assert.ok(findAll(dupMsg, (n) => sameShapeOf(n, 'Number.isInteger(data.replayWindowS)')).length >= 1,
+      'triggerNotifyTest 必须用响应里的 replayWindowS')
+    assert.ok(findAll(dupMsg, (n) => n.type === 'Identifier' && n.name === 'NOTIFY_WINDOW_DEFAULT_S').length >= 1,
+      '缺失时才回退默认值（NOTIFY_WINDOW_DEFAULT_S）')
+    assert.deepStrictEqual(stringValuesOf(dupMsg).filter((value) => value.includes('60 秒内无需重复')), [],
+      '不得再写死「60 秒内无需重复」（窗长可配置，写死就是谎话）')
+    // triggerVia 必须同时支持字符串与函数两种 dupMsg（/trigger 仍传字符串）。
+    const via = markup.functionNodeOf(apiModel, 'triggerVia')
+    assert.strictEqual(findAll(via, (n) => n.type === 'ConditionalExpression' &&
+      sameShapeOf(n.test, "typeof dupMsg === 'function'") && exprLabel(n.consequent) === 'dupMsg()' &&
+      exprLabel(n.alternate) === 'dupMsg').length, 1,
+    'triggerVia 必须支持函数式 dupMsg（保留字符串形态给 /trigger）')
+    assert.deepStrictEqual(callSites(markup.functionNodeOf(apiModel, 'trigger'), 'triggerVia')
+      .map((call) => call.arguments[2] && call.arguments[2].type), ['Literal'],
+    '/trigger 必须继续传字符串文案（函数形态只给需要按响应算秒数的端点）')
+    // 提示必须真的由这次 dupMsg 的结果构造 Error（只留着表达式不算修好）。
+    const msgDecl = findAll(via, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'msg')[0]
+    assert.ok(msgDecl && msgDecl.init.type === 'ConditionalExpression', '拦截文案必须由 dupMsg(data) 算出')
+    assert.strictEqual(findAll(via, (n) => n.type === 'NewExpression' && memberPath(n.callee) === 'Error' &&
+      exprLabel(n.arguments[0]) === 'msg').length, 1, '拦截提示必须用 msg 构造 Error（不能留一段不参与构造的死代码）')
+    // ③ 设置块：保存带乐观锁、成功文案如实、客户端边界走常量。
+    const block = markup.functionNodeOf(pagesModel, 'ConsoleSettingsBlock')
+    assert.ok(block, '必须能定位 ConsoleSettingsBlock')
+    const saveWin = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'saveWin')
+    assert.ok(saveWin, '必须有 saveWin')
+    const winPost = callSites(saveWin, 'apiPostConsoleSettings')[0]
+    assert.ok(winPost && winPost.arguments[0].type === 'ObjectExpression' &&
+      objectKeyNames(winPost.arguments[0]).join(',') === 'notifyTestReplayWindowS,baseRevision',
+    '保存体必须恰好是 notifyTestReplayWindowS + baseRevision（多一个字段就会把别处的改动一起写死）')
+    const winProps = new Map(winPost.arguments[0].properties.map((prop) => [prop.key.name, prop.value]))
+    assert.ok(sameShapeOf(winProps.get('baseRevision'), 'winBaseRevRef.current === null ? settingsLive.revision : winBaseRevRef.current'),
+      '保存必须提交「开始编辑那一刻」的 revision（钉住编辑起点才收得到 409）')
+    const dirtyResets = findAll(saveWin, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setWinDirty' &&
+      callArgLabels(n).join(',') === 'false')
+    assert.strictEqual(dirtyResets.length, 2, '保存成功与 409 都要复位脏标记（否则草稿再也不会跟随刷新）')
+    const mismatchBranch = findAll(saveWin, (n) => n.type === 'IfStatement' && exprLabel(n.test) ===
+      'payload.error === "revision_mismatch"')[0]
+    assert.ok(mismatchBranch, '409 必须按 revision_mismatch 分支处理')
+    assert.strictEqual(findAll(mismatchBranch.consequent, (n) => n.type === 'CallExpression' &&
+      memberPath(n.callee) === 'setWinDirty' && callArgLabels(n).join(',') === 'false').length, 1,
+    '409 分支里必须复位脏标记（否则本页草稿再也不跟刷新）')
+    assert.ok(mismatchBranch && callSites(mismatchBranch.consequent, 'loadSettings').length === 1,
+      '409 后必须重新读一次（让用户看清当前值）')
+    assert.ok(stringValuesOf(block).some((value) => value.includes('已保存 · 立即生效')), '保存成功文案为「已保存 · 立即生效」')
+    assert.ok(findAll(block, (n) => n.type === 'Identifier' && ['NOTIFY_WINDOW_MAX_S', 'NOTIFY_WINDOW_MIN_S'].includes(n.name)).length >= 4,
+      '客户端夹取边界必须走常量（与服务端 0–3600 同口径）')
+    const winInput = elementsInFunction(pagesModel, 'ConsoleSettingsBlock')
+      .find((el) => el.name === 'input' && markup.hasClass(el, 'auto-input'))
+    assert.ok(winInput && sameShapeOf(markup.attrExpr(winInput, 'disabled'), 'true'),
+      '读面失败/保存中也不放开键入（数字框永久锁定）')
+    assert.ok(sameShapeOf(markup.attrExpr(winInput, 'value'), "winCurrent === null ? '' : winDraft"),
+      '数字框只显示草稿（读面失败时显示空，不得显示旧值）')
+    const winButtons = elementsInFunction(pagesModel, 'ConsoleSettingsBlock')
+      .filter((el) => el.name === 'button' && markup.hasClass(el, 'auto-step'))
+    assert.deepStrictEqual(winButtons.map((el) => exprLabel(markup.attrExpr(el, 'disabled'))),
+      ['winCurrent === null || winSaving', 'winCurrent === null || winSaving'],
+      '读面失败/保存中时 ± 必须禁用')
+    assert.ok(stringValuesOf(block).some((value) => value.includes('读取中…')),
+      '首帧必须显示「读取中」，不得把未加载伪装成读取失败')
+    assert.ok(declaresVariable(block, 'winSavingRef'), '保存必须防连点（in-flight 守卫 winSavingRef）')
+    assert.strictEqual(findAll(block, (n) => n.type === 'BinaryExpression' && n.operator === '===' &&
+      exprLabel(n.left) === 'payload.error' && exprLabel(n.right) === '"revision_mismatch"').length, 2,
+    '两条写面都必须按 revision_mismatch 分支处理')
     // 搬迁后的归属：配置页不再挂设置读面；系统页持有读面并在下拉/刷新里等它落定。
-    const cfgStart = src.indexOf('function ConfigPanel')
-    const cfgEnd = src.indexOf('// ── 过滤规则（v3.310）')
-    assert.ok(cfgStart >= 0 && cfgEnd > cfgStart, 'ConfigPanel 切片锚点必须存在且有序')
-    const cfg = src.slice(cfgStart, cfgEnd)
-    assert.ok(!cfg.includes('apiGetConsoleSettings'), '配置页不得再挂设置读面（v3.342 已搬到系统页）')
-    assert.ok(cfg.includes('Promise.allSettled([load(), loadEff()])'), '配置页刷新只拉自己两条')
-    const sysAt = src.indexOf('function SysPanel')
-    const sysEnd = src.indexOf('\nfunction ', sysAt + 10)
-    assert.ok(sysAt >= 0 && sysEnd > sysAt, 'SysPanel 切片锚点必须存在且有序')
-    const sysBlk = src.slice(sysAt, sysEnd)
-    assert.ok(sysBlk.includes('usePanelLoader(apiGetConsoleSettings'), '系统页必须持有设置读面')
-    assert.ok(sysBlk.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'),
-      '系统页刷新必须等三条都落定（下拉指示条不得提前收起）')
-    assert.ok(/<\$\{ConsoleSettingsBlock\} settings=\$\{settings\}/.test(sysBlk), '系统页必须渲染设置块并下传读面')
+    const cfg = markup.functionNodeOf(pagesModel, 'ConfigPanel')
+    assert.ok(cfg, '必须能定位 ConfigPanel')
+    assert.strictEqual(callSites(cfg, 'apiGetConsoleSettings').length, 0, '配置页不得再挂设置读面（v3.342 已搬到系统页）')
+    assert.strictEqual(findAll(cfg, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'Promise.allSettled' &&
+      sameShapeOf(n.arguments[0], '[load(), loadEff()]')).length, 1, '配置页刷新只拉自己两条（load + loadEff）')
+    const sys = markup.functionNodeOf(pagesModel, 'SysPanel')
+    assert.ok(callSites(sys, 'usePanelLoader').map((call) => callArgLabels(call).join(',')).includes('apiGetConsoleSettings'),
+      '系统页必须持有设置读面')
+    assert.strictEqual(findAll(sys, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'Promise.allSettled' &&
+      sameShapeOf(n.arguments[0], '[load(), loadAccess(), loadSettings()]')).length, 2,
+    '系统页刷新必须等三条都落定（下拉指示条不得提前收起）')
+    const sysSettingsEl = elementsInFunction(pagesModel, 'SysPanel').find((el) => el.name === 'ConsoleSettingsBlock')
+    assert.ok(sysSettingsEl, '系统页必须渲染设置块')
+    assert.strictEqual(exprLabel(markup.attrExpr(sysSettingsEl, 'settings')), 'settings', '设置块必须下传读面（settings）')
+    assert.strictEqual(exprLabel(markup.attrExpr(sysSettingsEl, 'onSaved')), 'onSettingsSaved', '设置块的保存回调必须回到系统页')
   })
 
+  // ── 过滤草稿自动保存/恢复（关标签/杀后台也能捡回来）──────────────────────────
   await aok('结构红线: 过滤草稿自动保存/恢复（关标签/杀后台也能捡回来）', () => {
-    const src = readConsoleSource()
-    assert.ok(src.includes("const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'"), '必须在 localStorage 存一份过滤草稿')
-    assert.ok(src.includes('FILTER_DRAFT_SAVE_DELAY = 500'), '草稿不能等 5 分钟才存，否则杀后台会丢最后几分钟')
-    assert.ok(src.includes('FILTER_DRAFT_SERVER_DELAY = 1500'), '服务器草稿必须比本机慢一点，避免每敲一键就写盘')
-    assert.ok(src.includes('localStorage.setItem(FILTER_DRAFT_KEY'), '草稿写入必须用 localStorage（sessionStorage 关标签就没）')
-    assert.ok(src.includes('localStorage.removeItem(FILTER_DRAFT_KEY)'), '保存/放弃/回滚后必须清草稿')
-    assert.ok(src.includes("window.addEventListener('pagehide'"), '关标签/切走时必须立刻补存')
-    assert.ok(src.includes("document.addEventListener('visibilitychange'"), '切到后台时必须立刻补存')
-    assert.ok(src.includes('apiGetFilterDraft'), '打开过滤页必须同时读服务器草稿')
-    assert.ok(src.includes('apiPostFilterDraft'), '本机草稿要同步到服务器')
-    assert.ok(src.includes('apiDeleteFilterDraft'), '保存/放弃/回滚后必须删服务器草稿')
-    assert.ok(src.includes('filterDraftFromServer'), '服务器草稿响应必须校验后再恢复')
-    assert.ok(src.includes('clearServerDraft()'), '清草稿必须同时清服务器那份')
-    assert.ok(src.includes('已恢复上次未保存的草稿'), '下次打开过滤页必须自动恢复草稿并提示')
-    assert.ok(src.includes('草稿已自动保存'), '页面必须让用户看到草稿已经存了')
-    assert.ok(src.includes('setTimeout(saveDraftNow, FILTER_DRAFT_SAVE_DELAY)'), '本机草稿定时器必须真的使用 500ms 常量，不能只留常量')
-    assert.ok(src.includes('draftPushChainRef'), '草稿 PUT 必须串行，旧请求不能晚到覆盖新内容')
-    assert.ok(src.includes('await draftPushChainRef.current'), '清服务器草稿前必须等所有排队 PUT 落地')
-    assert.ok(src.includes('setInterval(() => { if (dirtyRef.current) pushDraftNow().catch(() => {}) }'), '服务器上传失败后必须定期重试')
-    assert.ok(src.includes('reloadNow'), '确认放弃并重新加载时必须先清草稿，否则会恢复回来')
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const constValue = (name) => {
+      const decl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === name)
+      return decl && decl.init.type === 'Literal' ? decl.init.value : null
+    }
+    // 存储口径：localStorage（sessionStorage 关标签就没）+ 两个延时常量。
+    assert.strictEqual(constValue('FILTER_DRAFT_KEY'), 'xbk_filter_draft_v1', '必须在 localStorage 存一份过滤草稿')
+    assert.strictEqual(constValue('FILTER_DRAFT_SAVE_DELAY'), 500, '草稿不能等 5 分钟才存，否则杀后台会丢最后几分钟')
+    assert.strictEqual(constValue('FILTER_DRAFT_SERVER_DELAY'), 1500, '服务器草稿必须比本机慢一点，避免每敲一键就写盘')
+    const write = markup.functionNodeOf(pagesModel, 'writeFilterDraft')
+    const clear = markup.functionNodeOf(pagesModel, 'clearFilterDraft')
+    assert.ok(write && clear, '必须有 writeFilterDraft / clearFilterDraft')
+    const setItem = callSites(write, 'window.localStorage.setItem')
+    assert.strictEqual(setItem.length, 1, '草稿写入必须走 localStorage.setItem')
+    assert.deepStrictEqual(callArgLabels(setItem[0])[0], 'FILTER_DRAFT_KEY',
+      '草稿必须以 FILTER_DRAFT_KEY 为键写入（换 sessionStorage 等于关标签就没）')
+    const payload = setItem[0].arguments[1]
+    assert.ok(payload && payload.type === 'CallExpression' && memberPath(payload.callee) === 'JSON.stringify',
+      '草稿必须序列化后写入（写 [object Object] 等于没存）')
+    assert.deepStrictEqual(objectKeyNames(payload.arguments[0]), ['schema', 'filter', 'baseRevision', 'savedAt'],
+      '草稿体必须带 schema/filter/baseRevision/savedAt（缺 savedAt 就无法判过期）')
+    assert.deepStrictEqual(callSites(clear, 'window.localStorage.removeItem').map((call) => callArgLabels(call).join(',')),
+      ['FILTER_DRAFT_KEY'], '保存/放弃/回滚后必须清草稿')
+    // 读取面：服务器草稿与规则并行拉；坏的响应不覆盖页面。
+    const panel = markup.functionNodeOf(pagesModel, 'FilterRulesPanel')
+    const loadDecl = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'load')
+    assert.ok(loadDecl && callSites(loadDecl, 'apiGetFilterDraft').length === 1, '打开过滤页必须同时读服务器草稿')
+    const applyLoaded = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'applyLoaded')
+    assert.ok(applyLoaded && callSites(applyLoaded, 'filterDraftFromServer').map((call) => callArgLabels(call).join(',')).includes('serverDraft'),
+      '服务器草稿响应必须校验后再恢复（filterDraftFromServer）')
+    // 本机草稿要同步到服务器（串行 PUT），清草稿要等链落地再 DELETE。
+    const pushDecl = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'pushDraftNow')
+    assert.ok(pushDecl && callSites(pushDecl, 'apiPostFilterDraft').length === 1, '本机草稿要同步到服务器')
+    assert.ok(findAll(pushDecl, (n) => n.type === 'MemberExpression' && memberPath(n) === 'draftPushChainRef.current').length >= 2 &&
+      findAll(pushDecl, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'draftPushChainRef.current').length === 1,
+    '草稿 PUT 必须串行（旧请求不能晚到覆盖新内容）')
+    const clearServer = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'clearServerDraft')
+    assert.ok(clearServer, '必须有 clearServerDraft')
+    assert.strictEqual(callSites(clearServer, 'apiDeleteFilterDraft').length, 1, '清草稿必须同时清服务器那份')
+    assert.strictEqual(findAll(clearServer, (n) => n.type === 'AwaitExpression' && n.argument.type === 'CallExpression' &&
+      exprLabel(n.argument.callee.object) === 'draftPushChainRef.current').length, 1,
+    '清服务器草稿前必须等所有排队 PUT 落地（await draftPushChainRef.current…）')
+    // 关标签/切后台立刻补一发：pagehide + visibilitychange（不等 500ms 定时器）。
+    assert.strictEqual(callSites(panel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"pagehide"').length, 1,
+      '关标签/切走时必须立刻补存（window pagehide）')
+    assert.strictEqual(callSites(panel, 'document.addEventListener').filter((call) => callArgLabels(call)[0] === '"visibilitychange"').length, 1,
+      '切到后台时必须立刻补存（document visibilitychange）')
+    const flushDecl = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'flush')
+    assert.ok(flushDecl, 'pagehide 必须挂一个 flush（先写本机草稿再补发服务器草稿）')
+    assert.deepStrictEqual(callSites(flushDecl.init, 'pushDraftNow')
+      .map((call) => (call.arguments[0] && call.arguments[0].type === 'ObjectExpression' ? objectKeyNames(call.arguments[0]).join(',') : '')),
+    ['keepalive'], '关标签补发必须带 keepalive（页面已经要走了，普通请求会被取消）')
+    assert.strictEqual(callSites(flushDecl.init, 'saveDraftNow').length, 1, 'flush 里必须先写本机草稿（服务器写不进也不丢）')
+    // 定时器必须真的用常量（只留常量不算）。
+    assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.setTimeout' &&
+      callArgLabels(n)[0] === 'saveDraftNow' && exprLabel(n.arguments[1]) === 'FILTER_DRAFT_SAVE_DELAY').length, 1,
+    '本机草稿定时器必须真的使用 500ms 常量，不能只留常量')
+    const serverTimer = findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.setTimeout' &&
+      exprLabel(n.arguments[1]) === 'FILTER_DRAFT_SERVER_DELAY')
+    assert.strictEqual(serverTimer.length, 1, '服务器草稿必须按 FILTER_DRAFT_SERVER_DELAY 延时（比本机慢一点）')
+    assert.strictEqual(callSites(serverTimer[0].arguments[0], 'pushDraftNow').length, 1,
+      '服务器草稿定时器必须真的上传（只 setTimeout 不 push 等于没同步）')
+    // 服务器写失败要定期重试（网络没断但服务器 502/超时时 online 事件永不触发）。
+    assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'window.setInterval' &&
+      callSites(n.arguments[0], 'pushDraftNow').length === 1 && exprLabel(n.arguments[1]) === '10000').length, 1,
+    '服务器上传失败后必须定期重试（每 10 秒一次）')
+    assert.strictEqual(callSites(panel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"online"').length, 1,
+      '离线回来后要补推一次（online）')
+    // 用户可见：恢复提示与「草稿已自动保存」。
+    assert.ok(stringValuesOf(applyLoaded).some((value) => value.includes('已恢复上次未保存的草稿')),
+      '下次打开过滤页必须自动恢复草稿并提示')
+    assert.ok(stringValuesOf(panel).some((value) => value.includes('草稿已自动保存')), '页面必须让用户看到草稿已经存了')
+    // 放弃并重新加载：先清草稿（本机 + 服务器）再 load，否则会恢复回来。
+    const reload = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'reloadNow')
+    assert.ok(reload, '必须有 reloadNow（确认放弃并重新加载）')
+    const reloadBody = reload.init.body.body
+    const localClearAt = reloadBody.findIndex((stmt) => callSites(stmt, 'clearFilterDraft').length > 0)
+    const serverClearAt = reloadBody.findIndex((stmt) => callSites(stmt, 'clearServerDraft').length > 0)
+    const reloadAt = reloadBody.findIndex((stmt) => callSites(stmt, 'load').length > 0)
+    assert.ok(localClearAt > -1 && serverClearAt > -1 && reloadAt > -1 && localClearAt < serverClearAt && serverClearAt < reloadAt,
+      `确认放弃必须先清本机草稿、再清服务器草稿、最后才 load（本机 ${localClearAt} / 服务器 ${serverClearAt} / load ${reloadAt}）`)
+    // 离开前的拦截：脏草稿时必须写本机草稿并阻止卸载（否则刷新即丢）。
+    const beforeUnload = callSites(panel, 'window.addEventListener').find((call) => callArgLabels(call)[0] === '"beforeunload"')
+    assert.ok(beforeUnload, '脏草稿时必须挂 beforeunload（刷新/关页要先落盘）')
+    assert.strictEqual(beforeUnload.arguments[1].name, 'onBeforeUnload', 'beforeunload 必须挂命名处理器（便于逐条判）')
+    const onUnload = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onBeforeUnload')
+    assert.ok(onUnload && callSites(onUnload.init, 'saveDraftNow').length === 1, 'beforeunload 里必须先把草稿写进 localStorage')
+    assert.ok(onUnload && callSites(onUnload.init, 'pushDraftNow').length === 1, 'beforeunload 里也必须补发服务器草稿（keepalive）')
   })
-
   await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
     const src = readConsoleSource()
     assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/保存并继续”三选一弹窗')
