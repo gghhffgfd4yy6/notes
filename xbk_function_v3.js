@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.492 — C3 r1 评审修复：补回 6 条 must_fix 判据（CacheHealthPanel 的 paused 表达式形状 / 切页出口实参必须 next / 垫高后 holdAnchor() 紧跟 scrollTo(0, y) / 落位不得进 rAF 回调且早于任何 rAF / releaseAnchorSoon() 调用点 / 版本与说明），白名单 test_console.js 1311、total 1682 不变（新判据全读 AST）；只动测试与版本四方，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.494 — C4 第 1 轮评审修复：4 条「换成 AST 后失去咬合力」的判据（按钮插值类名恒真 / CategoryPicker style 条件判不出 / scrollBehavior 实参不判 / 嵌套 ConfirmDialog 负面扫描只扫外层）逐条恢复，另修账目口径——98 条清单项 = 式1 92 + 式2 6（式3 0）；另删 1 条清单外的自检断言 tickAutoBody.length > 500，故式4 删除合计 1 条；白名单 test_console.js 1026、total 1397（本轮 0 新增）；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
