@@ -599,6 +599,15 @@ function earlyExits (testShape, returnValue) {
     return Boolean(last.argument) && last.argument.type === 'Literal' && last.argument.value === returnValue
   }
 }
+// 门的位置判据（assertshape C6 r5-B）：earlyExits 只回答「有没有一道真的 return 的门」，
+// 不回答它排在受保护的副作用之前还是之后——把门挪到 armLand()/清旗/请求之后，门形同虚设
+// 而旧判据全绿。这里取**函数体顶层语句下标**：门必须排在第一处受保护调用之前。
+function assertGateBefore (stmts, gateShape, protectedPred, why) {
+  const gateAt = stmts.findIndex(earlyExits(gateShape))
+  const protectedAt = stmts.findIndex(protectedPred)
+  assert.ok(gateAt > -1 && protectedAt > -1 && gateAt < protectedAt,
+    `${why}（门在第 ${gateAt} 条语句，受保护副作用在第 ${protectedAt} 条；门挪到后面/副作用插到门前等于没守卫）`)
+}
 // 块门是否以 return 收尾（refreshNow 的 `if (q !== query) { armLand(); …; return }`）。
 function blockEndsWithReturn (consequent) {
   return Boolean(consequent) && consequent.type === 'BlockStatement' && consequent.body.length > 0 &&
@@ -13812,6 +13821,11 @@ async function main () {
         `${name}门必须用同一份 stickyPad 口径`)
       assert.strictEqual(findAll(armLand, earlyExits('!(rect.height > 0)')).length, 1,
         `${name}面板隐藏/rect 为 0 时不得置旗（门必须真的早退）`)
+      // 这道门必须排在裸置旗之前：挪到 `landRef.current = true` 之后就挡不住 hidden 面板置旗，
+      // 下一次消费会把页面拽走（assertshape C6 r5-B）。
+      assertGateBefore(armLand.body.body, '!(rect.height > 0)',
+        (stmt) => findAll(stmt, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'landRef.current').length > 0,
+        `${name}面板隐藏/rect 为 0 的门必须在置旗之前`)
     }
     // 推送记录：落点 effect 的依赖必须完整（漏 days ⇒ 第 1 页改时间范围不落；漏 loading ⇒ 未回就消费旗子）。
     const msg = markup.functionNodeOf(pagesModel, 'MessagesPanel')
@@ -13835,10 +13849,17 @@ async function main () {
       '不得再单靠 data 引用判断落地（失败时 data 不变 ⇒ 清旗不可达）')
     // 消费即清旗：listLandTarget 返回 null 时不得重试。
     const msgStmts = msgEffect.arguments[0].body.body
-    const clearAt = msgStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
-      stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current')
+    const isClearStmt = (stmt) => stmt.type === 'ExpressionStatement' &&
+      stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current'
+    const clearAt = msgStmts.findIndex(isClearStmt)
     const nullAt = msgStmts.findIndex(earlyExits('y === null'))
     assert.ok(clearAt > -1 && nullAt > -1 && clearAt < nullAt, '消费即清旗：listLandTarget 返回 null 时不得重试')
+    // 两道「还不能落点」的门必须排在清旗之前：挪到清旗之后，旗子在响应未回/旧数据时就被消费掉，
+    // 数据真正落地后不再落点（assertshape C6 r5-B）。
+    assertGateBefore(msgStmts, 'loading', isClearStmt,
+      '响应未回时必须保留旗子（loading 门必须在清旗之前）')
+    assertGateBefore(msgStmts, 'data === armedDataRef.current && !err', isClearStmt,
+      '必须等这次响应落地再清旗（data + !err 门必须在清旗之前）')
     // 逐轮历史同样：清旗在 y === null 之前。
     const hist = markup.functionNodeOf(pagesModel, 'RunHistoryPanel')
     const histEffect = callSites(hist, 'useLayoutEffect').find((call) => callSites(call.arguments[0], 'listLandTarget').length > 0)
@@ -13892,10 +13913,18 @@ async function main () {
       ['armLand()', 'setRange(r)', 'setDays(0)', 'setPage(1)'],
       '推送记录改自定义区间必须先置落点旗、换区间、清 preset、回第 1 页（自定义区间与 preset 互斥）')
     // ④ 逐轮历史只在值真变化时置旗：已选中的 chip / 同一天 / 同一页都不得留旗。
+    // 这组值守卫必须排在 armLand() 之前：只判「有这道门且 return」时，把 armLand() 插到函数开头
+    // （点已选中的 chip / 当前每页条数也置旗）照样全绿，下一次结算把用户从列表中间拽回顶部
+    // （assertshape C6 r5-B）。
     const changeMode = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeMode')
     assert.ok(changeMode, '必须有 changeMode')
-    assert.strictEqual(findAll(changeMode, earlyExits('m === mode')).length, 1,
+    const changeModeFn = changeMode.init
+    assert.ok(changeModeFn && changeModeFn.body && changeModeFn.body.type === 'BlockStatement', 'changeMode 必须是函数')
+    const changeModeStmts = changeModeFn.body.body
+    assert.strictEqual(changeModeStmts.filter(earlyExits('m === mode')).length, 1,
       '已选中的 chip 不得再置旗（必须先判 m === mode 并早退）')
+    assertGateBefore(changeModeStmts, 'm === mode', (stmt) => callSites(stmt, 'armLand').length > 0,
+      '已选中的 chip 不得再置旗（m === mode 门必须在 armLand 之前）')
     // chip 的 class 是拼出来的（'log-chip' + 选中态），按 role=group 的容器 + 按钮定位，不按 class 找。
     const chipGroup = elementsInFunction(pagesModel, 'RunHistoryPanel')
       .find((el) => markup.attrText(el, 'aria-label') === '逐轮筛选')
@@ -13915,9 +13944,17 @@ async function main () {
     const changeDay = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeDay')
     assert.ok(changeDay && findAll(changeDay, earlyExits('v.from === runRange.from && v.to === runRange.to')).length === 1,
       '区间没变不得置旗（值守卫必须当场 return，且必须在 armLand 之前）')
+    assertGateBefore(changeDay.init.body.body, 'v.from === runRange.from && v.to === runRange.to',
+      (stmt) => callSites(stmt, 'armLand').length > 0,
+      '区间没变不得置旗（值守卫必须在 armLand 之前）')
     const changeSize = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeSize')
     assert.ok(changeSize && findAll(changeSize, earlyExits('n === size')).length === 1,
       '每页条数没变不得置旗（值守卫必须当场 return）')
+    const changeSizeStmts = changeSize.init.body.body
+    assert.strictEqual(changeSizeStmts.filter(earlyExits('n === size')).length, 1,
+      '每页条数没变不得置旗（值守卫必须在函数体顶层当场 return）')
+    assertGateBefore(changeSizeStmts, 'n === size', (stmt) => callSites(stmt, 'armLand').length > 0,
+      '每页条数没变不得置旗（n === size 门必须在 armLand 之前）')
     // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点）。
     assert.strictEqual(findAll(msg, (n) => n.type === 'MemberExpression' && memberPath(n) === 'document.activeElement').length, 0,
       '搜索落点不得再看 activeElement（那道门让主路径不可达）')
@@ -14033,6 +14070,10 @@ async function main () {
     // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
     assert.strictEqual(findAll(effect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
       '消费前必须检测用户是否自己滚走（门必须真的 return）')
+    // 门必须排在 scrollTo 之前：挪到滚动之后，用户自己滚走也照样被拽回列表顶（assertshape C6 r5-B）。
+    assertGateBefore(effect.arguments[0].body.body, 'userMovedRef.current',
+      (stmt) => callSites(stmt, 'window.scrollTo').length > 0,
+      '消费前必须检测用户是否自己滚走（门必须在 scrollTo 之前）')
     for (const [name, panel] of [['推送记录', msg], ['逐轮历史', markup.functionNodeOf(pagesModel, 'RunHistoryPanel')]]) {
       assert.deepStrictEqual(callSites(panel, 'useLandScrollCancel').map((call) => callArgLabels(call).join(',')),
         ['landRef,userMovedRef'], `${name}必须接入用户滚动取消 hook（同一个）`)
@@ -14056,6 +14097,9 @@ async function main () {
     '落点不得再等「重拉结算」：切档已原子化')
     assert.strictEqual(findAll(histEffect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
       '逐轮历史也要防用户自己滚走（门必须真的 return）')
+    assertGateBefore(histEffect.arguments[0].body.body, 'userMovedRef.current',
+      (stmt) => callSites(stmt, 'window.scrollTo').length > 0,
+      '逐轮历史防用户自己滚走的门必须在 scrollTo 之前')
     // 空结果时 .runs-scroll 也必须挂载（listRef 不能丢）：容器只受 status 门约束。
     const runsTpls = templateIn(hist, 'class="runs-scroll"')
     assert.strictEqual(runsTpls.length, 1, '逐轮历史必须有 .runs-scroll 容器')
@@ -14169,6 +14213,12 @@ async function main () {
       '只认布尔，读失败保持默认')
     assert.strictEqual(findAll(apply, earlyExits('rev < uiSettingsRevRef.current')).length, 1,
       '旧读响应不得覆盖新值（按 revision 判序：门必须真的 return，只判条件等于没判序）')
+    // 门必须排在写 revision / setShowDate 之前：挪到写之后就挡不住旧响应覆盖新值（assertshape C6 r5-B）。
+    const applyFn = apply.init.type === 'CallExpression' ? apply.init.arguments[0] : apply.init
+    assert.ok(applyFn && applyFn.body && applyFn.body.type === 'BlockStatement', 'applyUiSettings 必须是函数')
+    assertGateBefore(applyFn.body.body, 'rev < uiSettingsRevRef.current',
+      (stmt) => findAll(stmt, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'uiSettingsRevRef.current').length > 0,
+      '旧读响应不得覆盖新值（revision 门必须在写 revision/setShowDate 之前）')
     const sysEl = appEls.find((el) => el.name === 'SysPanel')
     assert.ok(sysEl && exprLabel(markup.attrExpr(sysEl, 'onSettingsSaved')) === 'reloadUiSettings',
       '系统页必须把「保存后重拉」接上（onSettingsSaved = reloadUiSettings）')
@@ -14186,6 +14236,10 @@ async function main () {
       ['next', 'settingsLive.revision'], '开关保存必须传下一状态与当前 revision（乐观锁）')
     assert.strictEqual(findAll(toggle, earlyExits('next === showDate')).length, 1,
       '同值不得发请求（勾回来不算一次修改：门必须真的 return）')
+    // 门必须排在保存请求之前：挪到请求之后，勾回同值也会发一次写请求并重置 revision（assertshape C6 r5-B）。
+    assertGateBefore(toggle.init.body.body, 'next === showDate',
+      (stmt) => callSites(stmt, 'apiPostConsoleSettings').length > 0,
+      '同值不得发请求（next === showDate 门必须在 apiPostConsoleSettings 之前）')
     assert.strictEqual(findAll(block, (n) => n.type === 'ConditionalExpression' &&
       sameShapeOf(n.test, "settingsLive && settingsLive.settings && typeof settingsLive.settings.syncShowDate === 'boolean'")).length, 1,
     '读面必须校验布尔类型（读到脏值不得当成开关值）')
@@ -14265,6 +14319,9 @@ async function main () {
     assert.deepStrictEqual(middleware.elements.map((el) => memberPath(el.callee)), ['offset', 'flip', 'shift'],
       '中间件顺序必须是 offset(8) → flip() → shift(padding 8)（换序会让贴边行为变）')
     assert.deepStrictEqual(callArgLabels(middleware.elements[0]), ['8'], 'offset 必须是 8px（贴合 .sync 的 8px 间距）')
+    // flip 的实参也要判：只比 callee 名时 `flip({ padding: 0, fallbackPlacements: [] })` 照样全绿，
+    // 但兜底换向被关掉，贴边弹层不再翻到另一侧、会被裁（assertshape C6 r5-B）。
+    assert.deepStrictEqual(callArgLabels(middleware.elements[1]), [], 'flip 不得带实参（关掉兜底换向会让贴边弹层被裁）')
     const shiftPad = middleware.elements[2].arguments[0]
     assert.ok(shiftPad && shiftPad.type === 'ObjectExpression' &&
       shiftPad.properties.some((prop) => prop.key.name === 'padding' && prop.value.value === 8),

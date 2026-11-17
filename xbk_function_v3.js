@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.504 — assertshape C6 第 4 轮评审修复：dupMsg 三元的实参入判据、补回裸 data 负面子句、处理器语句不被 filter 丢掉（callSeqOf）、v3.503 段账目基线改回 origin/main；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.505 — assertshape C6 第 5 轮评审修复：changeMode/changeSize 的值守卫与 armLand() 先后入判据、flip() 实参入判据，并横扫 C6 段 21 处 earlyExits 判据（补 10 处门序）；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
