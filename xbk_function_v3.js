@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.486 — C1 r4：两处负向旧文案断言的扫描面改回全部 7 个前端模块（字符串字面量 + 模板静态段），不再只扫 pages.js；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.490 — C2 r3：三条 must_fix 补极性/运算符——单飞闸按 AST 逐项判 !active / justActivated / !(pollTick > 0) / busyRef.current，bad 判定必须 broken 打头的 || 链，seed 必须 seedRef.current !== null && seedRef.current.id === openId；只动 test_console.js 与版本四方，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
