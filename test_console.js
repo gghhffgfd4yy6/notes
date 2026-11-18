@@ -15115,16 +15115,29 @@ async function main () {
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
     // 负面判据按成员路径结尾比：任何 receiver（document / window / window.document）都不能挂，
     // 全等 'document.addEventListener' 会让 `window.addEventListener('visibilitychange', …)` 整类逃逸。
-    // 扫描面必须覆盖旧 slice 覆盖的全部 5 个面板（LogsPanel/SysPanel/FilesPanel、CacheHealthPanel/MessagesPanel）：
-    // 只扫 2 个面板会让「其它面板重新自带 visibilitychange 补拉」从必红变全绿（C7 r3-B）。
-    // RunsPanel / FilterRulesPanel 的合法监听不在其内。
-    for (const name of ['LogsPanel', 'CacheHealthPanel', 'MessagesPanel', 'SysPanel', 'FilesPanel']) {
-      const panel = markup.functionNodeOf(pagesModel, name)
-      assert.ok(panel, `${name} 必须存在`)
-      assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPathEndsWith(n.callee, 'addEventListener') &&
-        callArgLabels(n)[0] === '"visibilitychange"').length, 0,
-      `${name} 不得再自己挂 visibilitychange（任意 receiver 都算：会与回前台补拉重复请求）`)
-    }
+    // 扫描面必须与 origin/main 的旧断言等价：旧断言是两段 `src.slice` ——
+    // `function LogsPanel`→`function ConfigPanel` 与 `function CacheHealthPanel`→`function FilesPanel`，
+    // 覆盖的是两段区间内的**全部顶层函数**（本树实测 35 个 FunctionDeclaration / 14 个函数体内含
+    // html`` 模板），不是 5 个有名字的面板。只扫几个名字会让「别的面板
+    // 重新自带 visibilitychange 补拉」从必红变全绿（C7 r3-B：v3.513 的 5 名字循环仍窄）。
+    // 按 start 偏移取区间（FunctionDeclaration.start 就是 `function` 关键字位置，与旧
+    // `src.indexOf('function X')` 同坐标），并集去重后逐个函数扫：
+    //   · 锚点先断言存在——ConfigPanel / FilesPanel 被改名时区间会退化成空，判据静默变绿；
+    //   · 区间内函数数 ≥30——防扫描面被静默掏空（删函数 / 搬函数都会在这里红）。
+    const panelAnchors = ['LogsPanel', 'ConfigPanel', 'CacheHealthPanel', 'FilesPanel'].map((name) => {
+      const node = markup.functionNodeOf(pagesModel, name)
+      assert.ok(node, `${name} 必须存在（可见性补拉判据的区间锚点，改名会让扫描面退化成空）`)
+      return node.start
+    })
+    const [logsAt, configAt, cacheAt, filesAt] = panelAnchors
+    const panelFns = pagesModel.ast.body.filter((n) => n.type === 'FunctionDeclaration' && n.id &&
+      ((n.start >= logsAt && n.start < configAt) || (n.start >= cacheAt && n.start < filesAt)))
+    assert.ok(panelFns.length >= 30,
+      `不得自带 visibilitychange 的扫描面必须覆盖旧 slice 的全部顶层函数（实测 35 个，至少 30）；actual=${panelFns.length}`)
+    const visListeners = panelFns.filter((fn) => findAll(fn, (n) => n.type === 'CallExpression' &&
+      memberPathEndsWith(n.callee, 'addEventListener') && callArgLabels(n)[0] === '"visibilitychange"').length > 0)
+    assert.deepStrictEqual(visListeners.map((fn) => fn.id.name), [],
+      '这些函数不得再自己挂 visibilitychange（任意 receiver 都算：会与回前台补拉重复请求）')
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
     // 判据按成员路径**结尾**比：仓库自己的整页重载写法一律带 receiver（`window.location.reload()`，
     // app.js:29 / ui.js:157,1243 / pages.js:3918），全等 'location.reload' 会把这些全部放行。

@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.513 — assertshape C7 第 3 轮评审修复：2 条 must_fix（面板 visibilitychange 负面判据从 5 个面板缩到 2 个、下拉刷新「不得整页重载」漏扫回前台补拉 effect）+ 同形状横扫（C7 段 8 个负面断言调用点 / 3 处旧扫描面收窄）；只改测试面 test_console.js，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.514 — assertshape C7 第 4 轮评审修复：2 条 must_fix（① 面板「不得自带 visibilitychange」负面判据从 5 个面板名改为按 start 偏移的 AST 区间——旧断言两段 src.slice 并集实测 35 个顶层函数 / 14 个含 html 模板，锚点存在 + 区间函数数 ≥30 + 违规函数名列表；② v3.513 账目修正——旧扫描面不是 5 个面板、numstat 标明 commit、行号按新树复算）+ 同形状横扫（C7 段 8 个负面断言调用点 / 15 处旧 slice 定位逐条定性）；只改测试面 test_console.js 与本文 / 版本，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
