@@ -15007,8 +15007,11 @@ async function main () {
     assert.strictEqual(exprLabel(markup.attrExpr(statusEls[0], 'state')), 'pull.state',
       '刷新状态必须来自 pull.state（本地 state 会与手势脱节）')
     // 窄屏 .sync 被横向滑走时，下拉必须把它滚回最左（且只在手势进行中）。
+    // 判据对象必须是 consequent 本身（C8 r4-A 横扫）：判「consequent 里出现这条赋值」时，
+    // 把 consequent 块化成 `{ return; … }` 也能命中——死代码放行。故要求它就是一条表达式语句。
     assert.strictEqual(findAll(appFn, (n) => n.type === 'IfStatement' &&
       sameShapeOf(n.test, "pull.state !== 'idle' && syncRef.current") &&
+      n.consequent.type === 'ExpressionStatement' &&
       findAll(n.consequent, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'syncRef.current.scrollLeft' &&
         m.right.type === 'Literal' && m.right.value === 0).length === 1).length, 1,
     '窄屏 .sync 被横向滑走时，下拉必须把它滚回最左（否则状态看不见）')
@@ -15131,7 +15134,9 @@ async function main () {
     assert.strictEqual(findAll(recoveryBody, (n) => n.type === 'CallExpression' && callLabel(n) === 'refreshActive({ respectFormPause: true })').length, 1,
       '回前台补拉要走统一路径，且避开表单交互')
     // 刷新成功必须推进时间戳，失败不得推进（写在 refreshActive 内）。
+    // 同上（C8 r4-A 横扫）：consequent 必须就是这条赋值，不是「块里出现过」。
     assert.strictEqual(findAll(refreshActiveBody, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'ok') &&
+      n.consequent.type === 'ExpressionStatement' &&
       findAll(n.consequent, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'lastRefreshRef.current' &&
         callSites(m.right, 'Date.now').length === 1).length === 1).length, 1,
     '刷新成功必须推进时间戳（if (ok) lastRefreshRef.current = Date.now()）')
@@ -15143,12 +15148,12 @@ async function main () {
     // C7-006：「最后收到」序号守卫——旧响应不得覆盖新状态。
     const seqGate = findAll(appFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'seq > autoLandedRef.current'))
     assert.strictEqual(seqGate.length, 1, '自动运行状态响应要带序号守卫（按「最后收到」判序）')
-    assert.strictEqual(findAll(seqGate[0].consequent, (n) => n.type === 'AssignmentExpression' &&
-      exprLabel(n.left) === 'autoLandedRef.current' && sameShapeOf(n.right, 'seq')).length, 1,
-    '守卫里必须先把 autoLandedRef 推进到本条序号')
-    assert.strictEqual(findAll(seqGate[0].consequent, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setAutoState' &&
-      callArgLabels(n).join(',') === 'data.auto').length, 1,
-    '只有通过序号守卫的响应才能改 autoState（旧响应不得覆盖新状态）')
+    // 判据是整块语句序列（C8 r4-A 横扫）：只判「块内出现过这两条」时，块首插一条 return 就把
+    // 推进与 setAutoState 一起变成死代码（响应永远不落地）而套件仍绿；旧断言是逐字
+    // `if (seq > autoLandedRef.current) { autoLandedRef.current = seq; if (data && data.auto) setAutoState(data.auto) }`。
+    assert.deepStrictEqual(seqGate[0].consequent.body.map(stmtLineOf),
+      ['autoLandedRef.current = seq', 'if (data && data.auto) setAutoState()'],
+      '守卫里必须先推进 autoLandedRef 再改 autoState：两步同块、次序固定（旧响应不得覆盖新状态）')
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
     // 负面判据按成员路径结尾比：任何 receiver（document / window / window.document）都不能挂，
     // 全等 'document.addEventListener' 会让 `window.addEventListener('visibilitychange', …)` 整类逃逸。
@@ -15355,8 +15360,11 @@ async function main () {
       '同步闸必须是 checkVersion 的第一条语句（state 要等重渲染，闸晚一步就会连发）')
     const mismatch = findAll(checkVersionDecl.init, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "v !== '' && v !== BOOT.version"))
     assert.strictEqual(mismatch.length, 1, '检查更新必须比页面启动版本，不能比服务端自报')
-    assert.strictEqual(findAll(mismatch[0].consequent, (n) => n.type === 'CallExpression' && callLabel(n) === 'setVerState("stale")').length, 1,
-      '版本不同必须先进入 stale 态（按钮文案要能显示「正在刷新…」）')
+    // 「必须先进入 stale 态」要判到次序（C8 r4-A 横扫）：只判块内存在的版本里，块首插一条 return
+    // 就让按钮永远停在「检查中…」；整块三步 = 先 stale → 排期 reload → 早退不放开闸。
+    assert.deepStrictEqual(mismatch[0].consequent.body.map(stmtLineOf),
+      ['setVerState("stale")', 'verTimerRef.current = setTimeout()', 'return'],
+      '版本不同必须先进入 stale 态、再排期 reload、并早退不放开闸（三步次序不许换）')
     assert.strictEqual(findAll(mismatch[0].consequent, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setTimeout' &&
       n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
       findAll(n.arguments[0], (m) => m.type === 'CallExpression' && memberPath(m.callee) === 'window.location.reload').length === 1 &&
@@ -15656,6 +15664,11 @@ async function main () {
     const onRailKey = memberFn('onRailKey')
     const edgeGate = findAll(onRailKey, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "e.key === 'Home' || e.key === 'End'"))
     assert.strictEqual(edgeGate.length, 1, "快滚条必须支持 Home/End（e.key === 'Home' || e.key === 'End'）")
+    // 整块序列（C8 r4-A 横扫）：只判「块里出现过这条赋值」时，块首插一条 return 就让 Home/End
+    // 静默失效（按键没反应）而套件仍绿。consequent 是 2 条语句：preventDefault → 落位。
+    assert.deepStrictEqual(edgeGate[0].consequent.body.map(stmtLineOf),
+      ['e.preventDefault()', 'el.scrollTop = ConditionalExpression'],
+      'Home/End 分支必须「先 preventDefault 再落位 scrollTop」两步、次序不许换（三元两支由下一条判据钉）')
     assert.strictEqual(findAll(edgeGate[0].consequent, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n.left, 'el.scrollTop') &&
       sameShapeOf(n.right, "e.key === 'Home' ? 0 : el.scrollHeight")).length, 1,
     'Home 必须到顶、End 必须到底（scrollTop 的三元两支都要对）')
@@ -16348,6 +16361,17 @@ async function main () {
     assert.deepStrictEqual(findAll(notModifiedBody, (n) => n.type === 'ThrowStatement').map((n) =>
       stringValuesOf(n.argument).join('')).filter((text) => text.includes('304')), ['HTTP 304（无本地副本）'],
     '只有「没有缓存条又没有重试通道」才允许抛 304 错误（文案必须说清是无本地副本）')
+    // 三段同块不等于三段按序执行（C8 r4-A 横扫）：把 throw 挪到最前面时三处断言都还在，
+    // 304 却直接变成「加载失败」；这里按语句角色钉次序 = 先取缓存条 → 复用 → 重试 → 最后才抛错。
+    const notModifiedRoles = notModifiedBody.body.map((stmt) => {
+      if (stmt.type === 'ThrowStatement') return 'throw'
+      if (stmt.type === 'VariableDeclaration') return 'take-hit'
+      if (findAll(stmt, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'hit && (!sentTag || hit.tag === sentTag)')).length > 0) return 'reuse'
+      if (findAll(stmt, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "typeof retry === 'function'")).length > 0) return 'retry'
+      return 'other'
+    })
+    assert.deepStrictEqual(notModifiedRoles, ['take-hit', 'reuse', 'retry', 'throw'],
+      '304 分支必须「先复用缓存条、再重试一次、都不行才抛错」：三段次序不许换（throw 挪到前面等于永不重取）')
     // 各端点的注入点（键一起钉）。runs / auto / messages 是手写 attempt，其余走 conditionalRequest。
     const runsFn = fnNamed(apiModel, 'apiGetRuns')
     assert.strictEqual(injectionOf(runsFn, "'runs'").length, 1, '/api/runs 必须接入条件请求（键 runs）')
@@ -16511,9 +16535,11 @@ async function main () {
       '判据不得再是「最后发出」的 seq（慢网下每一发都被判废，一次状态也落不下来）')
     const landedGate = findAll(refreshFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'seq > autoLandedRef.current'))
     assert.strictEqual(landedGate.length, 1, '判据必须是「最后收到」：if (seq > autoLandedRef.current) 才写状态')
-    assert.strictEqual(findAll(landedGate[0].consequent, (n) => n.type === 'AssignmentExpression' &&
-      sameShapeOf(n, 'autoLandedRef.current = seq')).length, 1,
-    '落地后必须记住已收到的号（autoLandedRef.current = seq，旧响应仍不得覆盖新状态）')
+    // 同一块的整段序列也要钉（C8 r4-A 横扫）：只判「块内出现过这条赋值」时，块首插一条
+    // return 就让它变成死代码（这一发永远不落地、autoState 永远停在旧值）而套件仍绿。
+    assert.deepStrictEqual(landedGate[0].consequent.body.map(stmtLineOf),
+      ['autoLandedRef.current = seq', 'if (data && data.auto) setAutoState()'],
+      '落地后必须先记住已收到的号、再改状态：整块两步且次序固定（旧响应仍不得覆盖新状态）')
     // 落定必须放开在飞标记（成功/失败两条路都要放，否则一次失败后状态永久冻住）。
     const releaseArms = findAll(refreshFn, (n) => n.type === 'AssignmentExpression' &&
       sameShapeOf(n, 'autoFlightRef.current = null') && ancestorsOf(refreshFn, n).some((ancestor) =>
@@ -16691,7 +16717,7 @@ async function main () {
     assert.ok(staleDecl && sameShapeOf(staleDecl.init, '!loading && (!data || Date.now() - dataAtRef.current > 5000)'),
       '补拉判据必须是「没在飞 且（没数据 或 快照超过 5s）」——阈值改成 0 会让点击瞬间再发一发把预加载顶掉')
     const staleLoad = findAll(logsFn, (n) => n.type === 'IfStatement' && n.test.type === 'Identifier' && n.test.name === 'stale' &&
-      callSites(n.consequent, 'load').length === 1)
+      n.consequent.type === 'ExpressionStatement' && callSites(n.consequent, 'load').length === 1)
     assert.strictEqual(staleLoad.length, 1, '首次点开且手里没有新鲜快照时必须真的发一发（if (stale) load(true)）')
     assert.deepStrictEqual(callSites(staleLoad[0].consequent, 'load').map((call) => callArgLabels(call)), [['true']],
       '补拉必须 load(true)（强制刷新）：load() 会把这次刷新直接丢弃')
@@ -17214,11 +17240,16 @@ async function main () {
         '两支都必须明说「下面仍是上一组筛选的」（换措辞可以，归属必须说出口）')
     }
     // query 的既有归属回写不能为了这次改动被删：服务端截断后的 queryUsed 只在「本次响应属于当前 query」时回写。
-    assert.ok(findAll(fetchFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'seq === loadSeqRef.current') &&
-      (n.consequent.type === 'BlockStatement' ? n.consequent.body : [n.consequent]).some((stmt) =>
-        stmt.type === 'ExpressionStatement' && stmt.expression.type === 'AssignmentExpression' &&
-        memberPath(stmt.expression.left) === 'loadedQueryRef.current' && exprLabel(stmt.expression.right) === 'requested')).length === 1,
-    'query 归属回写必须保留（if (seq === loadSeqRef.current) loadedQueryRef.current = requested）')
+    // 判据是**语句序列**而不是「块内出现过这条赋值」（C8 r4-A）：只判存在时在赋值前插一句
+    // `if (requested) return d` 就把它变成死代码（新词永远不回写、queryUsed 永远不生效）而套件全绿；
+    // 旧断言是逐字 `if (seq === loadSeqRef.current) loadedQueryRef.current = requested`（consequent 就是这条赋值）。
+    const queryWriteGates = findAll(fetchFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'seq === loadSeqRef.current'))
+    assert.strictEqual(queryWriteGates.length, 1,
+      'query 归属回写必须唯一（if (seq === loadSeqRef.current) loadedQueryRef.current = requested）')
+    assert.deepStrictEqual(
+      (queryWriteGates[0].consequent.type === 'BlockStatement' ? queryWriteGates[0].consequent.body : [queryWriteGates[0].consequent]).map(stmtLineOf),
+      ['loadedQueryRef.current = requested'],
+      'consequent 必须就是这条赋值本身（块内多一条 return / 早退即等于从不回写；只判「块内存在」会把死代码放行）')
   })
 
   await aok('结构红线: C7-037 「退出所有信任设备」先确认再发（后果写进正文，切页即收口）', () => {
@@ -17329,10 +17360,11 @@ async function main () {
       '失败横幅必须是「<label>：<错误>」口径（用户看到的「导入失败：…」不变）')
     assert.strictEqual(exprLabel(errTpl.expressions[0]), 'label', '横幅前缀必须取动作自己的 label')
     const tryStmt = findFirst(helper, (n) => n.type === 'TryStatement')
-    assert.ok(tryStmt && tryStmt.finalizer && tryStmt.finalizer.body.some((stmt) => stmt.type === 'ExpressionStatement' &&
-      stmt.expression.type === 'CallExpression' && exprLabel(stmt.expression.callee) === 'setBusy' &&
-      callArgLabels(stmt.expression).join() === '""'),
-    '复位必须挂在 finally（异常路径也要把 busy 清掉，否则按钮永久禁用）')
+    assert.ok(tryStmt && tryStmt.finalizer, '复位必须挂在 finally（异常路径也要把 busy 清掉，否则按钮永久禁用）')
+    // 整块序列（C8 r4-A 横扫）：只判「finally 块内出现过 setBusy('')」时，在它前面插一条 return
+    // 就让复位永不执行（一次失败后按钮永久禁用）而套件仍绿。
+    assert.deepStrictEqual(tryStmt.finalizer.body.map(stmtLineOf), ['setBusy("")'],
+      'finally 只能有这一条复位（复位被任何早退挡在后面等于没有复位）')
     // 六个动作都必须走它（顺序：解密 / 导入 / 生成设置密钥 / 确认开启 / 关闭 / 退出设备）。
     const busyCalls = consoleAssetModels().flatMap((model) => callSites(model, 'runBusyAction'))
     assert.strictEqual(busyCalls.length, 6, `六个动作必须都走公共骨架，实际 ${busyCalls.length} 处`)
