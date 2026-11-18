@@ -16443,9 +16443,14 @@ async function main () {
       sameShapeOf(n.test, 'prev && typeof startedAt === \'number\' && prev.at > startedAt') &&
       n.consequent.type === 'ReturnStatement' && n.consequent.argument === null).length, 1,
     '多标签页：旧响应不得覆盖更新快照（if (prev && … && prev.at > startedAt) return）')
-    assert.strictEqual(findAll(writeSnapFn, (n) => n.type === 'MemberExpression' && memberPath(n) === 'BOOT.token').length +
-      findAll(readSnapFn, (n) => n.type === 'MemberExpression' && memberPath(n) === 'BOOT.token').length, 0,
-    '快照不得包含 token（读/写两侧都不得引用 BOOT.token）')
+    // 负面判据的扫描面必须是整个快照块（C8 r3-B）：旧断言扫 SNAP_KEY → THEMES 之间的源码片段；
+    // r1 收窄成 readSnapshot / writeSnapshot 两个函数体后，块里新增第三个写入点（把 token 真的
+    // 写进 SNAP_KEY）照样绿。这里按 AST 节点区间取同一段面：区间内任何 `BOOT.token` 与任何
+    // 名为 token 的标识符都算违规（新增函数 / 改走解构都逃不掉）。
+    const snapTokenSites = findAll(uiModel, (n) => n.start >= snapKeyDecl.start && n.start < themesDecl.start &&
+      ((n.type === 'MemberExpression' && memberPath(n) === 'BOOT.token') || (n.type === 'Identifier' && n.name === 'token')))
+    assert.strictEqual(snapTokenSites.length, 0,
+      `快照不得包含 token：SNAP_KEY → THEMES 之间的整段（读 / 写 / 任何新增写入点）都不得引用 token（实际命中 ${snapTokenSites.map((n) => 'ui.js:' + n.loc.start.line).join(', ')}）`)
     // readBoot 必须解析 instance（否则命名空间永远回落 default，换实例会串旧数据）。
     assert.strictEqual(findAll(apiModel, (n) => n.type === 'Property' && !n.computed && n.key.name === 'instance' &&
       sameShapeOf(n.value, "typeof data.instance === 'string' ? data.instance : ''")).length, 1,
@@ -16656,17 +16661,26 @@ async function main () {
     const logsFn = findFirst(pagesModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'LogsPanel')
     assert.ok(logsFn, 'pages.js 里必须有 LogsPanel（日志页签的宿主）')
     // 冷启动时日志尾部可能满 1 MiB：隐藏页签里拉下来再整串 split/计数都是白付的（首屏零预取）。
-    const preloadGate = findAll(logsFn, (n) => n.type === 'IfStatement' &&
-      sameShapeOf(n.test, '!active && !preloadedRef.current'))
+    // 扫描面 = 承载这两道门的整个 useEffect，判据 = 「第二道门（含）之前一条 load 都没有」
+    // （C8 r3-B）：旧断言是两处 gate 之间的源码切片，r1 只查第一道门 consequent 里的 load，
+    // 把 load() 插在两道门之间（隐藏页签也发 1 MiB）仍然绿。
+    const logsEffect = findAll(logsFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
+      n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
+      n.arguments[0].body.type === 'BlockStatement' &&
+      n.arguments[0].body.body.some((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!active && !preloadedRef.current')))
+    assert.strictEqual(logsEffect.length, 1, '日志首挂门必须在 LogsPanel 的一个 useEffect 里（判据对象）')
+    const preloadEffectBody = logsEffect[0].arguments[0].body.body
+    const preloadGate = preloadEffectBody.filter((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!active && !preloadedRef.current'))
     assert.strictEqual(preloadGate.length, 1, '日志首挂（尚未点开）必须先短路：if (!active && !preloadedRef.current)')
     assert.deepStrictEqual(preloadGate[0].consequent.body.map(stmtLineOf),
       ['preloadedRef.current = true', 'revealedRef.current = false', 'return undefined'],
       '首挂只登记「首访已挂载」并返回，不得发请求')
-    assert.strictEqual(callSites(preloadGate[0].consequent, 'load').length, 0,
-      '隐藏页签不得发日志请求（首屏零预取）')
-    assert.strictEqual(findAll(logsFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!active && preloadedRef.current') &&
-      n.consequent.type === 'ReturnStatement' && n.consequent.argument && exprLabel(n.consequent.argument) === 'undefined').length, 1,
-    '之后再次离开也必须直接返回（if (!active && preloadedRef.current) return undefined）')
+    const secondGateAt = preloadEffectBody.findIndex((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, '!active && preloadedRef.current') &&
+      stmt.consequent.type === 'ReturnStatement' && stmt.consequent.argument && exprLabel(stmt.consequent.argument) === 'undefined')
+    assert.ok(secondGateAt > preloadEffectBody.indexOf(preloadGate[0]),
+      '之后再次离开也必须直接返回（if (!active && preloadedRef.current) return undefined），且排在首挂门之后')
+    assert.strictEqual(preloadEffectBody.slice(0, secondGateAt + 1).flatMap((stmt) => callSites(stmt, 'load')).length, 0,
+      '隐藏页签不得发日志请求（首屏零预取）：第二道早退门（含）之前的一条都不许是 load（门与门之间插入也算）')
     // 懒加载不是不加载：第一次点开必须仍走 firstReveal 的补拉，否则日志页永远空白。
     const firstReveal = findFirst(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'firstReveal')
@@ -17175,9 +17189,17 @@ async function main () {
       n.id.name === 'filtersStale')
     assert.ok(staleDecl && sameShapeOf(staleDecl.init, "!!(data && data.status === 'ok' && data.filterKey !== filtersKey)"),
       'filtersStale 必须同时判「有数据 / status=ok / 指纹不一致」三段（少一段就会把旧数据当新结果）')
-    assert.deepStrictEqual(callSites(pagesModel, 'msgFilterKey').map((call) => objectKeyNames(call.arguments[0]) && objectKeyNames(call.arguments[0]).join(',')),
+    // 两个调用点（请求侧 / 渲染侧）必须键值都对（C8 r3-A 横扫）：只钉键时渲染侧把 `from`
+    // 换成 `from: ''`（或拿别的状态凑）仍绿，自己跟自己永远不一致——旧断言是逐字
+    // `msgFilterKey({ q: query, cate, page, size, days, from: range.from, to: range.to })`。
+    const filterKeyArgs = callSites(pagesModel, 'msgFilterKey').map((call) => call.arguments[0])
+    assert.deepStrictEqual(filterKeyArgs.map((arg) => objectKeyNames(arg) && objectKeyNames(arg).join(',')),
       ['q,cate,page,size,days,from,to', 'q,cate,page,size,days,from,to'],
       'msgFilterKey 的两个调用点（请求侧 / 渲染侧）必须用同一组七项，否则自己跟自己永远不一致')
+    assert.deepStrictEqual(filterKeyArgs.map((arg) => arg.properties.map((prop) => exprLabel(prop.value))), [
+      ['query', 'cate', 'page', 'size', 'days', 'range.from', 'range.to'],
+      ['query', 'cate', 'page', 'size', 'days', 'range.from', 'range.to']
+    ], '两侧的指纹取值也必须同一组（q=query / from=range.from / to=range.to）：键同值不同同样永远 stale')
     // 旧数据占屏时必须明说归属（否则换分类/翻页后旧条目看起来就是新筛选的结果）。
     const staleEls = elementsInFunction(pagesModel, 'MessagesPanel').filter((el) =>
       classNamesOf(el).has('msg-count') && classNamesOf(el).has('msg-loading') && markup.attrText(el, 'role') === 'status')
@@ -17225,18 +17247,22 @@ async function main () {
     // 离开系统页必须清掉待确认（否则回页面时弹窗自己弹出来）。
     // 扫描根必须是 TwoFactorBlock（旧断言是 TwoFactorBlock 切片，横扫同 C8 r1-A③ 形状）：
     // 在整份 pages.js 里找一个「长成这样」的 effect，搬到别的组件也照样命中。
+    // 顺序也要判（C8 r3-A）：旧断言是 guardAt + seg.slice(guardAt, guardAt+80).includes(...)，
+    // 只判「门与清理都在同一个 effect 里」时把两句对调（先清、后早退）仍然绿——那样 active
+    // 变 false 的那一帧先清、随后门又放行，回页面时弹窗会自己弹出来。
     const twoFaFn = markup.functionNodeOf(pagesModel, 'TwoFactorBlock')
     assert.ok(twoFaFn, 'pages.js 必须有 TwoFactorBlock（待确认 effect 的宿主）')
     const revokeClearEffect = findAll(twoFaFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
       n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
       n.arguments[0].body.type === 'BlockStatement' &&
-      n.arguments[0].body.body.some((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'active') &&
-        stmt.consequent.type === 'ReturnStatement' && !stmt.consequent.argument) &&
       n.arguments[0].body.body.some((stmt) => stmt.type === 'ExpressionStatement' &&
         stmt.expression.type === 'CallExpression' && exprLabel(stmt.expression.callee) === 'setRevokeAsk' &&
         callArgLabels(stmt.expression).join() === 'false'))
     assert.strictEqual(revokeClearEffect.length, 1,
-      '离开系统页必须清掉待确认（if (active) return; setRevokeAsk(false) 同一处 effect）')
+      '离开系统页必须清掉待确认（setRevokeAsk(false) 只应在 TwoFactorBlock 的收口 effect 里一处）')
+    assert.deepStrictEqual(revokeClearEffect[0].arguments[0].body.body.map(stmtLineOf),
+      ['if (active) return', 'setRevokeAsk(false)'],
+      '切页收口必须「先早退门、后清待确认」两步（if (active) return; setRevokeAsk(false)）：顺序反了等于离开时没清，回页面弹窗自己弹出来')
   })
 
   await aok('结构红线: C7-036 「取消关注」先确认再发，删完焦点落回关注词区', () => {
@@ -17273,18 +17299,20 @@ async function main () {
     assert.strictEqual(exprLabel(markup.attrExpr(watchBox, 'tabIndex')), '-1', '关注词容器必须 tabIndex=-1（否则 .focus() 无效）')
     // 离开搜索页必须清掉待确认（否则切回来弹窗自己出现）。
     // 扫描根必须是 SearchPanel（旧断言是 SearchPanel 切片，横扫同 C8 r1-A③ 形状）。
+    // 顺序也要判（C8 r3-A，同 C7-037）：门在清理之前，否则 active 翻 false 的同一帧又放行。
     const searchPanelFn = markup.functionNodeOf(pagesModel, 'SearchPanel')
     assert.ok(searchPanelFn, 'pages.js 必须有 SearchPanel（待确认 effect 的宿主）')
     const removeClearEffect = findAll(searchPanelFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
       n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
       n.arguments[0].body.type === 'BlockStatement' &&
-      n.arguments[0].body.body.some((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'active') &&
-        stmt.consequent.type === 'ReturnStatement' && !stmt.consequent.argument) &&
       n.arguments[0].body.body.some((stmt) => stmt.type === 'ExpressionStatement' &&
         stmt.expression.type === 'CallExpression' && exprLabel(stmt.expression.callee) === 'setAskRemove' &&
         callArgLabels(stmt.expression).join() === 'null'))
     assert.strictEqual(removeClearEffect.length, 1,
-      '离开搜索页必须清掉待确认（if (active) return; setAskRemove(null) 同一处 effect）')
+      '离开搜索页必须清掉待确认（setAskRemove(null) 只应在 SearchPanel 的收口 effect 里一处）')
+    assert.deepStrictEqual(removeClearEffect[0].arguments[0].body.body.map(stmtLineOf),
+      ['if (active) return', 'setAskRemove(null)'],
+      '切页收口必须「先早退门、后清待确认」两步（if (active) return; setAskRemove(null)）：顺序反了等于离开时没清，切回来弹窗自己出现')
   })
 
   await aok('结构红线: C7-020 六个异步动作共用一份 busy 状态机（清错→busy→catch→finally）', () => {
@@ -17358,10 +17386,16 @@ async function main () {
     'usePanelAutoLoad 不得自己置 pendingRef（单飞闸只在 runAutoLoad 里）')
     const hookCalls = callSites(hook, 'runAutoLoad')
     assert.strictEqual(hookCalls.length, 1, 'usePanelAutoLoad 必须走公共骨架（不得再手抄一遍 Promise 链）')
-    assert.deepStrictEqual(objectKeyNames(hookCalls[0].arguments[0]), ['pendingRef', 'loadedAtRef', 'load', 'queue', 'force'],
-      '公共骨架的入参必须恰好 { pendingRef, loadedAtRef, load, queue, force }')
-    assert.strictEqual(exprLabel(hookCalls[0].arguments[0].properties.find((prop) => prop.key.name === 'force').value),
-      'loadChanged', 'force 必须绑定 loadChanged（换 loader 必须强制发一发）')
+    // 键与值都要钉（C8 r3-A）：只钉键名时把 `load` 换成 `() => Promise.resolve()` 的空壳
+    // （面板第一次点开永不加载）照样绿；旧断言是逐字 `runAutoLoad({ pendingRef, loadedAtRef,
+    // load, queue, force: loadChanged })`，值也在判据里。
+    assert.deepStrictEqual(hookCalls[0].arguments[0].properties.map((prop) => [prop.key && prop.key.name, argLabel(prop.value)]), [
+      ['pendingRef', 'pendingRef'],
+      ['loadedAtRef', 'loadedAtRef'],
+      ['load', 'load'],
+      ['queue', 'queue'],
+      ['force', 'loadChanged']
+    ], '公共骨架的入参必须逐项对：{ pendingRef, loadedAtRef, load（调用方传进来的那个 loader）, queue, force: loadChanged }（键对、值也要对）')
     assert.ok(findAll(hook, (n) => n.type === 'IfStatement' &&
       sameShapeOf(n.test, 'becameActive && (pendingRef.current || (loadedAtRef.current && Date.now() - loadedAtRef.current < 3000))')).length === 1,
     'hook 的 3s 判据被 test_console.js 逐字锁定，不得为了「统一」改成常量')
@@ -17373,16 +17407,26 @@ async function main () {
     const sysFn = markup.functionNodeOf(pagesModel, 'SysPanel')
     const sysCalls = callSites(sysFn, 'runAutoLoad')
     assert.strictEqual(sysCalls.length, 1, 'SysPanel 的首访/切回加载必须走公共骨架')
-    assert.ok(callSites(sysFn, 'Promise.allSettled').some((call) =>
-      call.arguments[0].elements.map(exprLabel).join(',') === 'load(),loadAccess(),loadSettings()'),
-    '系统页仍要等系统信息 + 访问日志 + 设置三条都结算（Promise.allSettled([...])）')
     const sysArg = sysCalls[0].arguments[0]
-    assert.deepStrictEqual(objectKeyNames(sysArg), ['pendingRef', 'loadedAtRef', 'load', 'onSettled'],
-      'SysPanel 的骨架入参必须是 { pendingRef, loadedAtRef, load(三段合并), onSettled }')
+    // 键与值都要钉（C8 r3-A 横扫：本条与 C7-019 的 hook 侧同形状；旧断言是
+    // `sys.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])')` 与
+    // `onSettled: () => setReadyTick((v) => v + 1)` 两句逐字文本，值本来就在判据里）。
+    assert.deepStrictEqual(sysArg.properties.map((prop) => [prop.key && prop.key.name,
+      prop.value.type === 'Identifier' ? prop.value.name : prop.value.type]), [
+      ['pendingRef', 'pendingRef'],
+      ['loadedAtRef', 'loadedAtRef'],
+      ['load', 'ArrowFunctionExpression'],
+      ['onSettled', 'ArrowFunctionExpression']
+    ], 'SysPanel 的骨架入参必须逐项对：{ pendingRef, loadedAtRef, load(三段合并), onSettled }（键对、值也要对）')
+    const loadProp = sysArg.properties.find((prop) => prop.key.name === 'load')
+    assert.deepStrictEqual(callSites(loadProp.value, 'Promise.allSettled').map((call) => call.arguments[0].elements.map(exprLabel).join(',')),
+      ['load(),loadAccess(),loadSettings()'],
+      'load 必须是「系统信息 + 访问日志 + 设置」三段一起结算的那个箭头（换成空壳 = 系统页永不加载）')
     const settledProp = sysArg.properties.find((prop) => prop.key.name === 'onSettled')
-    assert.ok(settledProp && settledProp.value.type === 'ArrowFunctionExpression' &&
-      callSites(settledProp.value, 'setReadyTick').length === 1,
-    '结算后必须通知 ready（onSettled: () => setReadyTick((v) => v + 1)）')
+    const readyCalls = callSites(settledProp.value, 'setReadyTick')
+    assert.strictEqual(readyCalls.length, 1, '结算后必须通知 ready（onSettled 里恰好一处 setReadyTick）')
+    assert.ok(sameShapeOf(readyCalls[0].arguments[0], '(v) => v + 1'),
+      'ready 计数必须走函数式自增 setReadyTick((v) => v + 1)（读旧值再加会丢拍）')
     assert.strictEqual(findAll(sysFn, (n) => n.type === 'AssignmentExpression' &&
       memberPath(n.left) === 'pendingRef.current').length, 0,
     'SysPanel 不得再手写单飞闸（C7-019 的重复骨架就来自这一份）')
