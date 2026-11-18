@@ -109,6 +109,46 @@ function stringValuesOf (model) {
   return out
 }
 
+// ── 成员键名解析（assertshape C8 r8）────────────────────────────────────────────
+// `{ k: … }` / `{ 'k': … }` / `{ ['k']: … }` / `const K = 'k'; { [K]: … }` 挂的是**同一个键**。
+// 只读 `key.name` 的判据里，后三类会让「不得出现这个键」整类放行（preact 边界的
+// getDerivedStateFromError 写成计算键就全绿，r8 的 M1），也会让「必须有这个键」在等价改写后误红。
+// 解不出的动态键返回 null（调用方按「不命中」处理）——这是有意登记的边界，不假装覆盖。
+function literalTextOf (node) {
+  if (!node) return null
+  if (node.type === 'Literal' && typeof node.value === 'string') return node.value
+  if (node.type === 'TemplateLiteral' && node.expressions.length === 0) {
+    return node.quasis[0].value.cooked == null ? node.quasis[0].value.raw : node.quasis[0].value.cooked
+  }
+  return null
+}
+// 模块内的字符串常量表（`const K = '…'` / 无插值模板）：解 `[K]` 形式的计算键用。按模块建表，
+// 不跨模块共享——同名常量在两个模块里可以是不同的值。
+function stringConstTableOf (model) {
+  const table = new Map()
+  findAll(model, (n) => {
+    if (n.type !== 'VariableDeclarator' || n.id.type !== 'Identifier' || !n.init) return
+    const text = literalTextOf(n.init)
+    if (text !== null) table.set(n.id.name, text)
+  })
+  return table
+}
+// Property / MethodDefinition / PropertyDefinition / ObjectMethod 的键名；consts 省略时只认
+// 标识符与字面量（含计算字面量 `['k']`）。`key: 3` 这种非字符串字面量返回 null。
+function memberKeyOf (member, consts) {
+  const key = member && member.key
+  if (!key) return null
+  if (key.type === 'Identifier') {
+    if (!member.computed) return key.name
+    return consts && consts.has(key.name) ? consts.get(key.name) : null
+  }
+  return literalTextOf(key)
+}
+// 判「这个成员挂的是不是这个键」：Property / MethodDefinition / PropertyDefinition 通用。
+function memberNamed (name, consts) {
+  return (node) => memberKeyOf(node, consts) === name
+}
+
 // 子树里**最外层**的 html`` 模板：markup.templatesIn 会连嵌套模板一起返回，而外层模板的
 // 就地展开已经带上内层元素——两处都算会把同一元素数两遍，「必须有且只有一个」的判据随之失真。
 function outermostTemplatesIn (node) {
@@ -13623,11 +13663,11 @@ async function main () {
     const pendingObjs = callSites(block, 'setPending').map((call) => call.arguments[0])
       .filter((arg) => arg && arg.type === 'ObjectExpression')
     assert.strictEqual(pendingObjs.length, 2, '明文与加密两条导入路径各要 setPending 一次')
-    const keyPropOf = (obj) => obj.properties.find((prop) => prop.key && prop.key.name === 'key')
+    const keyPropOf = (obj) => obj.properties.find(memberNamed('key'))
     assert.ok(pendingObjs.every((obj) => keyPropOf(obj) && sameShapeOf(keyPropOf(obj).value, 'newBackupImportKey()')),
       '两条路径都要为这次导入生成幂等键（key: newBackupImportKey()）')
     assert.deepStrictEqual(pendingObjs.map((obj) => {
-      const prop = obj.properties.find((entry) => entry.key && entry.key.name === 'encrypted')
+      const prop = obj.properties.find(memberNamed('encrypted'))
       return prop && prop.value.type === 'Literal' ? prop.value.value : null
     }), [false, true], '两条路径必须各自标记 encrypted（明文 false / 加密 true）')
     const importCalls = callSites(block, 'apiPostBackupImport')
@@ -13816,7 +13856,7 @@ async function main () {
     assert.strictEqual(focusCalls.length, 1, '必须先聚焦首个错误字段')
     const focusOpt = focusCalls[0].arguments[0]
     assert.ok(focusOpt && focusOpt.type === 'ObjectExpression' &&
-      focusOpt.properties.some((prop) => prop.key && prop.key.name === 'preventScroll' && prop.value.value === true),
+      focusOpt.properties.some((prop) => memberNamed('preventScroll')(prop) && prop.value.value === true),
     '聚焦必须 preventScroll（否则浏览器自己先滚一次，位置和手工算的打架）')
     // 落点按 .tabs 实测高度算（吸顶页签会盖住错误行）。
     const padDecl = findFirst(reveal.arguments[0], (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'pad')
@@ -14210,7 +14250,7 @@ async function main () {
       assert.strictEqual(listeners.length, 1, `hook 必须监听 ${event}（浏览器夹取/锚定不会触发这些事件，所以只认用户自己滚）`)
       const passive = listeners[0].arguments[2]
       assert.ok(passive && passive.type === 'ObjectExpression' &&
-        passive.properties.some((prop) => prop.key.name === 'passive' && prop.value.value === true),
+        passive.properties.some((prop) => memberNamed('passive')(prop) && prop.value.value === true),
       `${event} 必须 passive（滚动监听不能阻塞手势）`)
       assert.strictEqual(callArgLabels(listeners[0])[1], 'mark', `${event} 必须挂同一个 mark（只标记用户自己滚动）`)
     }
@@ -14367,7 +14407,7 @@ async function main () {
     assert.ok(togglePost && togglePost.arguments[0].type === 'ObjectExpression' &&
       objectKeyNames(togglePost.arguments[0]).join(',') === 'syncShowDate,baseRevision',
     '开关保存必须只提交 syncShowDate + baseRevision')
-    const toggleProps = new Map(togglePost.arguments[0].properties.map((prop) => [prop.key.name, prop.value]))
+    const toggleProps = new Map(togglePost.arguments[0].properties.map((prop) => [memberKeyOf(prop), prop.value]))
     assert.deepStrictEqual([exprLabel(toggleProps.get('syncShowDate')), exprLabel(toggleProps.get('baseRevision'))],
       ['next', 'settingsLive.revision'], '开关保存必须传下一状态与当前 revision（乐观锁）')
     assert.strictEqual(findAll(toggle, bareReturn('next === showDate')).length, 1,
@@ -14457,7 +14497,7 @@ async function main () {
       '必须量触发区与弹层两个节点（box / pop）')
     const opts = compute.arguments[2]
     assert.ok(opts && opts.type === 'ObjectExpression', 'computePosition 的选项必须是对象字面量')
-    const optOf = (name) => opts.properties.find((prop) => prop.key && prop.key.name === name)
+    const optOf = (name) => opts.properties.find(memberNamed(name))
     assert.strictEqual(exprLabel(optOf('strategy').value), '"fixed"',
       '弹层必须 fixed 定位（祖先 .sync 是 overflow:hidden，绝对定位会被裁掉）')
     assert.strictEqual(exprLabel(optOf('placement').value), '"bottom-start"', '弹层必须挂在触发区下方左对齐')
@@ -14472,7 +14512,7 @@ async function main () {
     assert.deepStrictEqual(callArgLabels(middleware.elements[1]), [], 'flip 不得带实参（关掉兜底换向会让贴边弹层被裁）')
     const shiftPad = middleware.elements[2].arguments[0]
     assert.ok(shiftPad && shiftPad.type === 'ObjectExpression' &&
-      shiftPad.properties.some((prop) => prop.key.name === 'padding' && prop.value.value === 8),
+      shiftPad.properties.some((prop) => memberNamed('padding')(prop) && prop.value.value === 8),
     'shift 必须留 8px 视口内边距（贴边时不被切）')
     // 宽度仍按视口收窄（200～360，不超视口 24px）。
     assert.strictEqual(findAll(tap, (n) => sameShapeOf(n, 'Math.min(360, Math.max(200, window.innerWidth - 24))')).length, 1,
@@ -14531,14 +14571,14 @@ async function main () {
       '字段控件不得退回单行 input（多行规则会写不下）')
     // 提示必须保留「分类###天数」多行写法：提示文案挂在字段定义上。
     const daysField = findAll(pagesModel, (n) => n.type === 'ObjectExpression' &&
-      n.properties.some((prop) => prop.key && prop.key.name === 'kind' && exprLabel(prop.value) === '"days"') &&
-      n.properties.some((prop) => prop.key && prop.key.name === 'hint'))
+      n.properties.some((prop) => memberNamed('kind')(prop) && exprLabel(prop.value) === '"days"') &&
+      n.properties.some(memberNamed('hint')))
     assert.ok(daysField.length >= 1, '必须有 kind: days 的字段定义（多行天数）')
-    const hintOf = (obj) => obj.properties.find((prop) => prop.key && prop.key.name === 'hint').value.value
+    const hintOf = (obj) => obj.properties.find(memberNamed('hint')).value.value
     assert.ok(daysField.some((obj) => String(hintOf(obj)).includes('支持「分类###天数」多行写法')),
       '提示必须保留多行写法（用户靠这句话知道可以一行一条）')
     assert.strictEqual(findAll(pagesModel, (n) => n.type === 'ObjectExpression' &&
-      n.properties.some((prop) => prop.key && prop.key.name === 'name' && prop.value.value === 'pingbitime')).length, 1,
+      n.properties.some((prop) => memberNamed('name')(prop) && prop.value.value === 'pingbitime')).length, 1,
     'pingbitime 必须仍有字段定义（改名会让规则永远填不进去）')
   })
 
@@ -14615,7 +14655,7 @@ async function main () {
       assert.strictEqual(callSites(fn, reader).length, 1, `${name} 必须用 ${reader} 收口响应`)
       assert.strictEqual(callSites(fn, 'timedRequest').length, 1, `${name} 必须经 timedRequest（超时与其它端点同口径）`)
       if (method !== null) {
-        assert.strictEqual(findAll(fn, (n) => n.type === 'Property' && n.key && n.key.name === 'method' &&
+        assert.strictEqual(findAll(fn, (n) => n.type === 'Property' && memberNamed('method')(n) &&
           n.value.value === method).length, 1, `写面必须是 ${method}`)
       }
     }
@@ -14659,7 +14699,7 @@ async function main () {
     assert.ok(winPost && winPost.arguments[0].type === 'ObjectExpression' &&
       objectKeyNames(winPost.arguments[0]).join(',') === 'notifyTestReplayWindowS,baseRevision',
     '保存体必须恰好是 notifyTestReplayWindowS + baseRevision（多一个字段就会把别处的改动一起写死）')
-    const winProps = new Map(winPost.arguments[0].properties.map((prop) => [prop.key.name, prop.value]))
+    const winProps = new Map(winPost.arguments[0].properties.map((prop) => [memberKeyOf(prop), prop.value]))
     assert.ok(sameShapeOf(winProps.get('baseRevision'), 'winBaseRevRef.current === null ? settingsLive.revision : winBaseRevRef.current'),
       '保存必须提交「开始编辑那一刻」的 revision（钉住编辑起点才收得到 409）')
     const dirtyResets = findAll(saveWin, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setWinDirty' &&
@@ -14859,7 +14899,7 @@ async function main () {
     assert.strictEqual(guardSaveCalls.length, 1, '保存并继续必须直接调用 submitSave，不能再弹第二次确认')
     const guardSaveArg = guardSaveCalls[0].arguments[0]
     const guardFilterProp = guardSaveArg && guardSaveArg.type === 'ObjectExpression'
-      ? guardSaveArg.properties.find((prop) => prop.key && prop.key.name === 'filter')
+      ? guardSaveArg.properties.find(memberNamed('filter'))
       : null
     assert.strictEqual(guardFilterProp && exprLabel(guardFilterProp.value), 'candidate',
       '保存并继续必须把当前草稿（candidate）直接交给 submitSave（重新走 beginSave 会多问一遍）')
@@ -14936,7 +14976,7 @@ async function main () {
     // sentinel：过滤页脏草稿时 pushState({__xbkFilterGuard:true})，App 真正切走时 replaceState 成 false。
     const sentinelCallsOf = (model, method, value) => findAll(model, (n) => n.type === 'CallExpression' &&
       memberPath(n.callee) === `window.history.${method}` && n.arguments[0] && n.arguments[0].type === 'ObjectExpression' &&
-      n.arguments[0].properties.some((prop) => prop.key && prop.key.name === '__xbkFilterGuard' &&
+      n.arguments[0].properties.some((prop) => memberNamed('__xbkFilterGuard')(prop) &&
         prop.value.type === 'Literal' && prop.value.value === value))
     assert.strictEqual(sentinelCallsOf(pagesModel, 'pushState', true).length, 2,
       '脏草稿必须在历史里压 sentinel（首次与取消后补压各一处，否则左滑直接退走）')
@@ -14944,7 +14984,7 @@ async function main () {
       '真正切走时必须把 sentinel 清成 false（否则后退会回到已无草稿的过滤页旧记录）')
     // 三种来源（tab / hash / history）都要把 source 交给同一个拦截弹窗——只判名字出现在源码里不算。
     const leaveReqObjectsOf = (root, value) => findAll(root, (n) => n.type === 'ObjectExpression' &&
-      n.properties.some((prop) => prop.key && prop.key.name === 'source' && prop.value.type === 'Literal' && prop.value.value === value))
+      n.properties.some((prop) => memberNamed('source')(prop) && prop.value.type === 'Literal' && prop.value.value === value))
     const switchTabOwner = uiDecl('switchTab')
     const hashOwner = findFirst(uiModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onHash')
     assert.ok(hashOwner, '必须有 onHash（hash 变化也要能回到拦截弹窗）')
@@ -15405,10 +15445,10 @@ async function main () {
         n.arguments[0] && n.arguments[0].type === 'ObjectExpression' &&
         objectKeyNames(n.arguments[0]).join(',') === 'token,version,instance')
       assert.strictEqual(bootJson.length, 1, 'boot JSON 必须注入 token/version/instance 三个字段')
-      assert.strictEqual(exprLabel(bootJson[0].arguments[0].properties.find((prop) => prop.key && prop.key.name === 'version').value), 'APP_VERSION',
+      assert.strictEqual(exprLabel(bootJson[0].arguments[0].properties.find(memberNamed('version')).value), 'APP_VERSION',
         'boot JSON 的 version 必须复用 APP_VERSION（前端据此判断旧页面）')
       const getSys = findFirst(systemModel, (n) => (n.type === 'ObjectMethod' || n.type === 'Property') &&
-        n.key && n.key.name === 'getSys')
+        memberKeyOf(n) === 'getSys')
       assert.ok(getSys && (getSys.type === 'ObjectMethod' || getSys.value), '/api/sys 必须由 system handler 的 getSys 提供')
       assert.ok(findFirst(getSys, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'version' &&
         sameShapeOf(n.init, 'APP_VERSION')), '/api/sys 必须复用同一版本来源（const version = APP_VERSION）')
@@ -15430,9 +15470,9 @@ async function main () {
     const bootFn = markup.functionNodeOf(apiModel, 'readBoot')
     assert.ok(bootFn, '必须能定位 readBoot')
     const bootReturn = findAll(bootFn, (n) => n.type === 'ReturnStatement' && n.argument && n.argument.type === 'ObjectExpression')
-      .find((ret) => ret.argument.properties.some((prop) => prop.key && prop.key.name === 'version' &&
+      .find((ret) => ret.argument.properties.some((prop) => memberNamed('version')(prop) &&
         prop.value.type === 'ConditionalExpression'))
-    const versionProp = bootReturn && bootReturn.argument.properties.find((prop) => prop.key && prop.key.name === 'version')
+    const versionProp = bootReturn && bootReturn.argument.properties.find(memberNamed('version'))
     assert.ok(versionProp && versionProp.value.type === 'ConditionalExpression', 'readBoot 必须解析 version（三元兜底）')
     assert.ok(sameShapeOf(versionProp.value, "typeof data.version === 'string' ? data.version : ''"),
       'readBoot 的 version 必须 typeof 判定后回落空串（三部分都钉）')
@@ -15557,6 +15597,7 @@ async function main () {
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
     const cssRules = cssRulesOf(css)
     const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const pagesConsts = stringConstTableOf(pagesModel) // 否定判据要解得出 `const K = '…'; { [K]: … }`
     const rhFn = findFirst(pagesModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'RunHistoryPanel')
     assert.ok(rhFn, 'pages.js 里必须有 RunHistoryPanel（切档判据的对象）')
     // 两档共用一次请求：runs/all 两份快照都来自同一次 apiGetRunHistory（不按档位分别请求）。
@@ -15570,10 +15611,9 @@ async function main () {
     const runHistoryCalls = callSites(rhFn, 'apiGetRunHistory')
     assert.deepStrictEqual(runHistoryCalls.map((call) => argLabel(call.arguments[0])), ['{ limit: RUN_FETCH_LIMIT }'],
       '一份全量窗口必须同时喂 runs/all 两档（只发一次，实参必须只有 limit）')
-    assert.strictEqual(findAll(rhFn, (n) => n.type === 'Property' && !n.computed &&
-      ((n.key.type === 'Identifier' && n.key.name === 'excludeCancelled') ||
-        (n.key.type === 'Literal' && n.key.value === 'excludeCancelled'))).length, 0,
-    '不得再发 excludeCancelled 请求（取消留痕改由前端剔除）')
+    assert.strictEqual(findAll(rhFn, (n) => n.type === 'Property' &&
+      memberKeyOf(n, pagesConsts) === 'excludeCancelled').length, 0,
+    '不得再发 excludeCancelled 请求（取消留痕改由前端剔除；字符串 / 计算键同样是这个键）')
     const changeDecl = findFirst(rhFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeMode')
     assert.ok(changeDecl && changeDecl.init.type === 'ArrowFunctionExpression', 'RunHistoryPanel 必须有 changeMode（切档入口）')
     const changeMode = changeDecl.init
@@ -15742,7 +15782,7 @@ async function main () {
     const dragAssigns = findAll(onRailDown, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n.left, 'dragRef.current'))
     assert.strictEqual(dragAssigns.length, 1, '按下必须记下这次拖拽（dragRef.current = {…}，只有一处）')
     assert.deepStrictEqual(objectKeyNames(dragAssigns[0].right), ['id', 'grab'], '抓取记录必须带 id 与 grab 两个字段')
-    const grabPropOf = (key) => dragAssigns[0].right.properties.find((prop) => prop.key && prop.key.name === key)
+    const grabPropOf = (key) => dragAssigns[0].right.properties.find(memberNamed(key))
     assert.strictEqual(exprLabel(grabPropOf('id').value), 'e.pointerId', '拖拽必须绑定按下的那根指针（e.pointerId）')
     assert.ok(sameShapeOf(grabPropOf('grab').value, 'onThumb ? e.clientY - thumbTop : h / 2'),
       '抓取偏移必须保留（按在拇指上保持偏移、按在空白处从拇指中点起算，两支都要对）')
@@ -16359,6 +16399,7 @@ async function main () {
 
   await aok('结构红线: v3.385 渲染错误边界（class + componentDidCatch / 入口包裹 / 错误面板）', () => {
     const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const uiConsts = stringConstTableOf(uiModel) // `static [K] () {}` 的计算常量键要解得出 K 的值
     const appModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'app.js'))
     const cssRules = cssRulesOf(fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8'))
     // 边界只能是 class 组件（hooks 兜不住渲染期异常），且 preact 10 的边界走 componentDidCatch。
@@ -16366,7 +16407,7 @@ async function main () {
     assert.ok(boundaryCls, 'ui.js 必须有 class ErrorBoundary（渲染错误边界）')
     assert.strictEqual(exprLabel(boundaryCls.superClass), 'Component',
       'ErrorBoundary 必须 extends Component（函数组件/hooks 兜不住渲染期异常）')
-    const methodsOf = (name) => boundaryCls.body.body.filter((m) => m.type === 'MethodDefinition' && m.key && m.key.name === name)
+    const methodsOf = (name) => boundaryCls.body.body.filter((m) => m.type === 'MethodDefinition' && memberKeyOf(m, uiConsts) === name)
     const cdc = methodsOf('componentDidCatch')
     assert.strictEqual(cdc.length, 1, '必须实现 componentDidCatch（preact 10 的错误边界入口）')
     assert.deepStrictEqual(cdc[0].value.params.map(exprLabel), ['e'], 'componentDidCatch 必须收到异常对象')
@@ -16421,9 +16462,14 @@ async function main () {
     assert.deepStrictEqual(mountTop[0].children.filter((child) => child.type === 'element').map((el) => el.name), ['App'],
       'ErrorBoundary 里必须是 App（顺序：边界 → App，反过来无效）')
     // 不混用 getDerivedStateFromError（preact 10 边界走 componentDidCatch，混用两套状态会分叉）。
-    assert.strictEqual(findAll(uiModel, (n) => (n.type === 'MethodDefinition' || n.type === 'Identifier') &&
-      (n.key ? n.key.name === 'getDerivedStateFromError' : n.name === 'getDerivedStateFromError')).length, 0,
-    '不混用 getDerivedStateFromError（preact 10 边界走 componentDidCatch）')
+    // 判据落在**解析后的键名**上：`static getDerivedStateFromError ()` / `static ['getDerivedStateFromError'] ()` /
+    // `const GDSE = 'getDerivedStateFromError'; static [GDSE] ()` / 对象字面量的同名键都算混用
+    // ——只读 `key.name` 时后三类整类放行（assertshape C8 r8 M1）。
+    assert.strictEqual(findAll(uiModel, (n) =>
+      (n.type === 'Identifier' && n.name === 'getDerivedStateFromError') ||
+      ((n.type === 'MethodDefinition' || n.type === 'PropertyDefinition' || n.type === 'Property') &&
+        memberKeyOf(n, uiConsts) === 'getDerivedStateFromError')).length, 0,
+    '不混用 getDerivedStateFromError（preact 10 边界走 componentDidCatch；字符串键 / 计算常量键同样算）')
     // 错误面板必须真有样式（裸文本会顶在左上角）。
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.err-boundary', 'max-width'), ['34rem'],
       '错误面板必须有 .err-boundary 容器样式（max-width 限制行宽）')
@@ -16432,6 +16478,7 @@ async function main () {
   })
   await aok('结构红线: v3.363 数据面（条件请求 / SSE 续传 / 首屏快照）', async () => {
     const apiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'api.js'))
+    const apiConsts = stringConstTableOf(apiModel) // 「恰好一条 instance」要连计算常量键一起数
     const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
     const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     const fnNamed = (model, name) => {
@@ -16559,7 +16606,7 @@ async function main () {
     const snapPayload = snapWrite[0].arguments[1]
     assert.deepStrictEqual(objectKeyNames(snapPayload.arguments[0]), ['v', 'at', 'status', 'runs'],
       '快照内容只能是 { v, at, status, runs }（多一个字段就可能把凭证写进 localStorage）')
-    assert.ok(sameShapeOf(snapPayload.arguments[0].properties.find((prop) => prop.key.name === 'runs').value,
+    assert.ok(sameShapeOf(snapPayload.arguments[0].properties.find(memberNamed('runs')).value,
       'Array.isArray(runs) ? runs.slice(0, 12) : []'),
     '快照最多存 12 条历史（localStorage 有 5MB 上限；两支都要对）')
     assert.strictEqual(findAll(writeSnapFn, (n) => n.type === 'IfStatement' &&
@@ -16575,7 +16622,7 @@ async function main () {
     assert.strictEqual(snapTokenSites.length, 0,
       `快照不得包含 token：SNAP_KEY → THEMES 之间的整段（读 / 写 / 任何新增写入点）都不得引用 token（实际命中 ${snapTokenSites.map((n) => 'ui.js:' + n.loc.start.line).join(', ')}）`)
     // readBoot 必须解析 instance（否则命名空间永远回落 default，换实例会串旧数据）。
-    assert.strictEqual(findAll(apiModel, (n) => n.type === 'Property' && !n.computed && n.key.name === 'instance' &&
+    assert.strictEqual(findAll(apiModel, (n) => n.type === 'Property' && memberNamed('instance', apiConsts)(n) &&
       sameShapeOf(n.value, "typeof data.instance === 'string' ? data.instance : ''")).length, 1,
     'readBoot 必须解析 instance（typeof 判定后回落空串，两支都要对——否则命名空间永远回落 default）')
   })
@@ -16697,6 +16744,7 @@ async function main () {
 
   await aok('结构红线: C7-008 日历可键盘进入（open() 后聚焦 calendarContainer / 选完还焦点）', () => {
     const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const componentsConsts = stringConstTableOf(componentsModel) // 「恰好一条 onChange」要连计算常量键一起数
     const dateFn = findFirst(componentsModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'DateRange')
     assert.ok(dateFn, 'components.js 里必须有 DateRange（日历唯一的宿主）')
     // flatpickr 的 keydown 只挂在 _input 与 calendarContainer 上，而从 .date-btn 打开时焦点
@@ -16713,7 +16761,7 @@ async function main () {
     assert.ok(openAt < focusAt, `必须先 open() 再 focus（open@${openAt} / focus@${focusAt}）：未打开时容器还是 display:none，focus 会被直接丢弃`)
     // 选完两格日历会自己 close()：焦点必须回到触发按钮，且必须在 close() 之前
     // —— 否则落在已经 display:none 的容器里，等于键盘焦点丢失（修好「进得去」却把「出得来」弄丢）。
-    const onChangeProp = findAll(dateFn, (n) => n.type === 'Property' && !n.computed && n.key.name === 'onChange' &&
+    const onChangeProp = findAll(dateFn, (n) => n.type === 'Property' && memberNamed('onChange', componentsConsts)(n) &&
       n.value.type === 'FunctionExpression')
     assert.strictEqual(onChangeProp.length, 1, 'flatpickr 配置里必须有 onChange(dates)（判据对象）')
     const onChangeBody = onChangeProp[0].value.body.body
@@ -16974,7 +17022,7 @@ async function main () {
       '结果区必须走 searchBodyView 的判定（组件里另拼分支就是这次整块卸载的来源）')
     assert.deepStrictEqual(objectKeyNames(viewDecl.init.arguments[0]), ['q', 'live', 'prev', 'loading', 'err'],
       'searchBodyView 的入参必须是 { q, live, prev, loading, err }（少 prev 就退回「没有上一份结果」）')
-    assert.strictEqual(exprLabel(viewDecl.init.arguments[0].properties.find((p) => p.key.name === 'prev').value),
+    assert.strictEqual(exprLabel(viewDecl.init.arguments[0].properties.find(memberNamed('prev')).value),
       'lastShownRef.current', 'prev 必须取「上次画出来的结果」（lastShownRef.current），不能直接拿 live')
     // 必须另存一份「上次画出来的结果」用于占位（live 的归属语义不变）。
     const lastShown = findFirst(searchFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
@@ -17057,10 +17105,10 @@ async function main () {
     noticeObjects.forEach((arg, i) => {
       assert.deepStrictEqual(objectKeyNames(arg), ['tone', 'text'],
         `第 ${i + 1} 处 setNotice 必须恰好写 tone 与 text（实际 ${objectKeyNames(arg)}）`)
-      const toneProp = arg.properties.find((prop) => prop.key && prop.key.name === 'tone')
+      const toneProp = arg.properties.find(memberNamed('tone'))
       assert.ok(toneProp && toneProp.value.type === 'Literal' && ['ok', 'warn', 'error'].includes(toneProp.value.value),
         `第 ${i + 1} 处 setNotice 的 tone 必须是 ok/warn/error 字面量（换成变量就退回中性提示）`)
-      const textProp = arg.properties.find((prop) => prop.key && prop.key.name === 'text')
+      const textProp = arg.properties.find(memberNamed('text'))
       const textBranches = !textProp
         ? []
         : (textProp.value.type === 'ConditionalExpression' ? [textProp.value.consequent, textProp.value.alternate] : [textProp.value])
@@ -17292,7 +17340,7 @@ async function main () {
     // 指纹必须覆盖全部会改变结果集的筛选；旧实现只记 query（loadedQueryRef），分类/页码/时间窗全漏。
     const keyFn = markup.functionNodeOf(pagesModel, 'msgFilterKey')
     assert.ok(keyFn, 'pages.js 必须有 msgFilterKey（筛选指纹的唯一实现）')
-    assert.deepStrictEqual(((keyFn.params[0] && keyFn.params[0].properties) || []).map((prop) => prop.key.name),
+    assert.deepStrictEqual(((keyFn.params[0] && keyFn.params[0].properties) || []).map((prop) => memberKeyOf(prop)),
       ['q', 'cate', 'page', 'size', 'days', 'from', 'to'],
       '筛选指纹必须吃 q/cate/page/size/days/from/to 七项（少一项就会把不同筛选当成同一组）')
     const keyReturn = findFirst(keyFn, (n) => n.type === 'ReturnStatement')
@@ -17323,7 +17371,7 @@ async function main () {
     // 响应必须带上本次筛选指纹（服务端字段原样保留）。
     const keySpreads = findAll(fetchFn, (n) => n.type === 'ConditionalExpression' && n.consequent.type === 'ObjectExpression' &&
       n.consequent.properties.some((prop) => prop.type === 'SpreadElement' && exprLabel(prop.argument) === 'd') &&
-      n.consequent.properties.some((prop) => prop.type === 'Property' && prop.key.name === 'filterKey' &&
+      n.consequent.properties.some((prop) => prop.type === 'Property' && memberNamed('filterKey')(prop) &&
         exprLabel(prop.value) === 'key'))
     assert.strictEqual(keySpreads.length, 1, '响应必须带上本次筛选指纹（{ ...d, filterKey: key }，服务端字段原样保留）')
     // 渲染必须比对响应指纹与当前筛选：不一致就是上一组的数据。
@@ -17495,7 +17543,7 @@ async function main () {
     assert.strictEqual(busyCalls.length, 6, `六个动作必须都走公共骨架，实际 ${busyCalls.length} 处`)
     const tags = busyCalls.map((call) => {
       const arg = call.arguments[0]
-      const prop = arg && arg.type === 'ObjectExpression' && arg.properties.find((p) => p.type === 'Property' && p.key.name === 'tag')
+      const prop = arg && arg.type === 'ObjectExpression' && arg.properties.find((p) => p.type === 'Property' && memberNamed('tag')(p))
       return prop && prop.value.type === 'Literal' ? prop.value.value : null
     })
     assert.deepStrictEqual(tags, ['unlock', 'import', 'setup', 'enable', 'disable', 'revoke'],
@@ -17506,7 +17554,7 @@ async function main () {
       call.arguments[0].type === 'Literal' && call.arguments[0].value !== '').length, 1,
     'BackupBlock 只应有 doExport 一处自写 setBusy(tag)（其余走 runBusyAction）')
     assert.deepStrictEqual(callSites(backupFn, 'runBusyAction').map((call) => call.arguments[0])
-      .map((arg) => arg.properties.find((prop) => prop.type === 'Property' && prop.key.name === 'tag').value.value),
+      .map((arg) => arg.properties.find((prop) => prop.type === 'Property' && memberNamed('tag')(prop)).value.value),
     ['unlock', 'import'], '解密/导入必须各自带 busy 标签走公共骨架')
     // TwoFactorBlock 的四个动作必须全部走公共骨架（不得再手写 setBusy(tag)/try/finally）。
     const twoFaFn = markup.functionNodeOf(pagesModel, 'TwoFactorBlock')
@@ -17516,7 +17564,7 @@ async function main () {
     // 失败横幅的文案口径不变（「导入失败：」这类前缀必须还在）。
     const backupLabels = callSites(backupFn, 'runBusyAction').map((call) => {
       const arg = call.arguments[0]
-      const prop = arg && arg.type === 'ObjectExpression' && arg.properties.find((p) => p.type === 'Property' && p.key.name === 'label')
+      const prop = arg && arg.type === 'ObjectExpression' && arg.properties.find((p) => p.type === 'Property' && memberNamed('label')(p))
       return prop && prop.value.type === 'Literal' ? prop.value.value : null
     })
     assert.deepStrictEqual(backupLabels, ['解密失败', '导入失败'], '失败横幅前缀必须保留（用户看到的「导入失败：…」不变）')
@@ -17548,7 +17596,7 @@ async function main () {
     // 键与值都要钉（C8 r3-A）：只钉键名时把 `load` 换成 `() => Promise.resolve()` 的空壳
     // （面板第一次点开永不加载）照样绿；旧断言是逐字 `runAutoLoad({ pendingRef, loadedAtRef,
     // load, queue, force: loadChanged })`，值也在判据里。
-    assert.deepStrictEqual(hookCalls[0].arguments[0].properties.map((prop) => [prop.key && prop.key.name, argLabel(prop.value)]), [
+    assert.deepStrictEqual(hookCalls[0].arguments[0].properties.map((prop) => [memberKeyOf(prop), argLabel(prop.value)]), [
       ['pendingRef', 'pendingRef'],
       ['loadedAtRef', 'loadedAtRef'],
       ['load', 'load'],
@@ -17570,18 +17618,18 @@ async function main () {
     // 键与值都要钉（C8 r3-A 横扫：本条与 C7-019 的 hook 侧同形状；旧断言是
     // `sys.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])')` 与
     // `onSettled: () => setReadyTick((v) => v + 1)` 两句逐字文本，值本来就在判据里）。
-    assert.deepStrictEqual(sysArg.properties.map((prop) => [prop.key && prop.key.name,
+    assert.deepStrictEqual(sysArg.properties.map((prop) => [memberKeyOf(prop),
       prop.value.type === 'Identifier' ? prop.value.name : prop.value.type]), [
       ['pendingRef', 'pendingRef'],
       ['loadedAtRef', 'loadedAtRef'],
       ['load', 'ArrowFunctionExpression'],
       ['onSettled', 'ArrowFunctionExpression']
     ], 'SysPanel 的骨架入参必须逐项对：{ pendingRef, loadedAtRef, load(三段合并), onSettled }（键对、值也要对）')
-    const loadProp = sysArg.properties.find((prop) => prop.key.name === 'load')
+    const loadProp = sysArg.properties.find(memberNamed('load'))
     assert.deepStrictEqual(callSites(loadProp.value, 'Promise.allSettled').map((call) => call.arguments[0].elements.map(exprLabel).join(',')),
       ['load(),loadAccess(),loadSettings()'],
       'load 必须是「系统信息 + 访问日志 + 设置」三段一起结算的那个箭头（换成空壳 = 系统页永不加载）')
-    const settledProp = sysArg.properties.find((prop) => prop.key.name === 'onSettled')
+    const settledProp = sysArg.properties.find(memberNamed('onSettled'))
     const readyCalls = callSites(settledProp.value, 'setReadyTick')
     assert.strictEqual(readyCalls.length, 1, '结算后必须通知 ready（onSettled 里恰好一处 setReadyTick）')
     assert.ok(sameShapeOf(readyCalls[0].arguments[0], '(v) => v + 1'),
@@ -17720,11 +17768,14 @@ async function main () {
       assert.ok(NEGATED.test(seg.replace(/\n/g, '')), `${label} 必须写明不能并排对照（措辞可变，口径必须是否定）`)
     }
     // ④ 旧的两条字面量与「版本号只留一处溯源」原样保留（回退到旧措辞时它们仍会先报错）。
-    // 判据落在**注释节点**上（commentTextsOf），代码里的字符串字面量不再能满足或违反这组口径。
+    // 负面判据的扫描面 = **注释语料 ∪ 全部前端模块的字符串字面量 / 模板静态段**：旧断言扫的是
+    // 7 个模块的整份源码（注释 + 代码 + 字符串），只扫注释会把「把旧措辞写进 aria-label / UI 文案」
+    // 整类放行（assertshape C8 r8 M2）。正向两条仍只看注释语料——那是注释口径，不是代码文案。
     const commentCorpus = CONSOLE_MODULE_FILES
       .flatMap((file) => commentTextsOf(path.join(CONSOLE_ASSET_DIR, file))).join('\n')
-    assert.ok(!commentCorpus.includes('与列表并排做对照'), '注释不得声称抽屉与列表并排对照（遮罩把列表压暗了）')
-    assert.ok(!commentCorpus.includes('列表留在背后做对照'), '注释不得声称列表在背后「做对照」')
+    const negativeCorpus = commentCorpus + '\n' + consoleAssetStrings().join('\n')
+    assert.ok(!negativeCorpus.includes('与列表并排做对照'), '注释与代码字符串都不得声称抽屉与列表并排对照（遮罩把列表压暗了）')
+    assert.ok(!negativeCorpus.includes('列表留在背后做对照'), '注释与代码字符串都不得声称列表在背后「做对照」')
     assert.ok(commentCorpus.includes('但被遮罩压暗、不算并排对照'), '抽屉注释必须写明遮罩压暗、不是并排对照')
     assert.ok(commentCorpus.includes('桌面从右侧占 520px，手机铺满整屏'), '抽屉注释必须写明桌面 520px / 手机铺满')
     // 版本号只作「这条规矩哪来的」溯源，不得当成变更日志的分行清单：抽屉这一段不许再堆 v3.xxx 行。
@@ -17937,9 +17988,10 @@ async function main () {
     const pagesModel = allModels.find((model) => path.basename(model.file) === 'pages.js')
     assert.ok(apiModel && pagesModel, '必须能定位 api.js / pages.js（鉴权头的唯一定义与导出下载端点的宿主）')
     // 鉴权头只能有一处定义：全部前端模块里 Authorization 属性必须恰好 1 个。
-    const authProps = allModels.flatMap((model) => findAll(model, (n) => n.type === 'Property' &&
-      ((n.key.type === 'Identifier' && n.key.name === 'Authorization') ||
-       (n.key.type === 'Literal' && n.key.value === 'Authorization'))))
+    const authProps = allModels.flatMap((model) => {
+      const consts = stringConstTableOf(model) // 按模块建表：`{ ['Authorization']: … }` / `{ [K]: … }` 都是同一处
+      return findAll(model, (n) => n.type === 'Property' && memberKeyOf(n, consts) === 'Authorization')
+    })
     assert.strictEqual(authProps.length, 1,
       `鉴权头必须只写一处（实际 ${authProps.length} 处）：改前缀/加头时漏一处就是「这个端点 401、别的正常」`)
     const authDecl = findFirst(apiModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
@@ -17992,7 +18044,7 @@ async function main () {
       '回前台补拉必须以 noteQuiet(\'回前台补拉失败\', state === \'failed\') / (…, true) 收尾：跳过不得告警、真失败必须留')
     // 空 catch 一律不许：`.catch(() => {})` 的箭头体是空块（留痕、失败都无从谈起）。
     const emptyCatches = findAll(uiModel, (n) => n.type === 'CallExpression' && n.callee.type === 'MemberExpression' &&
-      !n.callee.computed && n.callee.property.name === 'catch' && n.arguments[0] &&
+      memberPathEndsWith(n.callee, 'catch') && n.arguments[0] &&
       n.arguments[0].type === 'ArrowFunctionExpression' && n.arguments[0].body.type === 'BlockStatement' &&
       n.arguments[0].body.body.length === 0)
     assert.strictEqual(emptyCatches.length, 0, 'ui.js 不得再有空 catch（失败必须留痕，哪怕只写 console.warn）')
