@@ -629,6 +629,14 @@ function callLabel (call) {
   if (!call || call.type !== 'CallExpression') return exprLabel(call)
   return `${exprLabel(call.callee)}(${call.arguments.map(argLabel).join(', ')})`
 }
+// 成员路径以某个尾巴结尾（`window.location.reload` 与 `location.reload` 同族，`mylocation.reload` 不算）。
+// 负面判据（「这里不得出现某调用」）不能用全等：生产里 `window.location.reload()` / `window.location.href=…`
+// 带 receiver 前缀，`memberPath === 'location.reload'` 会把整类写法放行——旧文本正则
+// `/location\.reload|location\.href\s*=/` 前缀不影响命中（assertshape C7 r2-A/B）。
+function memberPathEndsWith (node, tail) {
+  const path = memberPath(node)
+  return path === tail || (typeof path === 'string' && path.endsWith('.' + tail))
+}
 // 语句表 → 调用标签：**先逐条断言「是调用语句」，再比带实参的标签**。先
 // `filter((stmt) => stmt.type === 'ExpressionStatement')` 再比标签，会把处理器体里插入的
 // `if (v === '10') return` / `return` / `const x = 1` 静默丢掉，标签序列仍是原样 ⇒ 套件全绿
@@ -15105,19 +15113,23 @@ async function main () {
       callArgLabels(n).join(',') === 'data.auto').length, 1,
     '只有通过序号守卫的响应才能改 autoState（旧响应不得覆盖新状态）')
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
+    // 负面判据按成员路径结尾比：任何 receiver（document / window / window.document）都不能挂，
+    // 全等 'document.addEventListener' 会让 `window.addEventListener('visibilitychange', …)` 整类逃逸。
     for (const name of ['LogsPanel', 'CacheHealthPanel']) {
       const panel = markup.functionNodeOf(pagesModel, name)
       assert.ok(panel, `${name} 必须存在`)
-      assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'document.addEventListener' &&
+      assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPathEndsWith(n.callee, 'addEventListener') &&
         callArgLabels(n)[0] === '"visibilitychange"').length, 0,
-      `${name} 不得再自己挂 visibilitychange（会与回前台补拉重复请求）`)
+      `${name} 不得再自己挂 visibilitychange（任意 receiver 都算：会与回前台补拉重复请求）`)
     }
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
-    const reloadSitesOf = (root) => findAll(root, (n) => (n.type === 'MemberExpression' && memberPath(n) === 'location.reload') ||
-      (n.type === 'AssignmentExpression' && exprLabel(n.left) === 'location.href'))
+    // 判据按成员路径**结尾**比：仓库自己的整页重载写法一律带 receiver（`window.location.reload()`，
+    // app.js:29 / ui.js:157,1243 / pages.js:3918），全等 'location.reload' 会把这些全部放行。
+    const reloadSitesOf = (root) => findAll(root, (n) => (n.type === 'MemberExpression' && memberPathEndsWith(n, 'location.reload')) ||
+      (n.type === 'AssignmentExpression' && memberPathEndsWith(n.left, 'location.href')))
     assert.strictEqual(reloadSitesOf(pullHook).length + reloadSitesOf(statusComp).length +
       reloadSitesOf(pullRefreshDecl).length + reloadSitesOf(refreshActiveDecl).length, 0,
-    '下拉刷新不得整页重载（location.reload / location.href 赋值）')
+    '下拉刷新不得整页重载（任意 receiver 的 location.reload / location.href 赋值）')
 
     // 结构红线: 快速刷新不得闪文案（v3.333）
     // 本地缓存命中时 loading 只存在 17ms（实测 512→529），「· 更新中…」和「刷新中…」
@@ -15165,9 +15177,12 @@ async function main () {
       between[0].expression.right.value === true, '守护与 load 之间只允许置 busyRef = true')
     const msgBusySpan = findAll(msgFn, (n) => n.type === 'ConditionalExpression' && sameShapeOf(n.test, 'slowLoading'))
     assert.strictEqual(msgBusySpan.length, 1, '「更新中…」后缀只能由 slowLoading 控制，不能用 loading')
-    assert.deepStrictEqual(markup.allElements(markup.markupOf(msgBusySpan[0].consequent, { expandTemplates: true }))
-      .map((el) => el.name + '.' + markup.classNames(el).join('.')), ['span.msg-loading'],
-    '「更新中…」必须是 .msg-loading 的 span')
+    const msgBusyEls = markup.allElements(markup.markupOf(msgBusySpan[0].consequent, { expandTemplates: true }))
+    assert.deepStrictEqual(msgBusyEls.map((el) => el.name + '.' + markup.classNames(el).join('.')), ['span.msg-loading'],
+      '「更新中…」必须是 .msg-loading 的 span')
+    // 类名保留、文案删掉 = 用户看不到「更新中」提示，套件却全绿（C7 r2-A）——比照同块 frSpan 判文案。
+    assert.strictEqual(markup.textOf(msgBusyEls[0]), '· 更新中…',
+      '「匹配 N 条」的后缀文案必须是「· 更新中…」（只留 span.msg-loading 空壳不算）')
     assert.ok(msgBusySpan[0].alternate.type === 'Literal' && msgBusySpan[0].alternate.value === '',
       '非慢加载时不得渲染任何后缀（alternate 必须是空串）')
     // 首屏骨架（L4）：第一份数据回来前画占位；只在「还没有 data」时出现——自动刷新/切回
@@ -15199,9 +15214,15 @@ async function main () {
       .find((el) => el.name === 'button' && markup.hasClass(el, 'retry-btn'))
     assert.ok(retryBtn, 'LoadError 必须给 .retry-btn 重试按钮')
     assert.strictEqual(exprLabel(markup.attrExpr(retryBtn, 'onClick')), 'onRetry', '重试必须复用面板自己的 load()（onRetry）')
-    assert.strictEqual(findAll(msgFn, (n) => n.type === 'ConditionalExpression' && sameShapeOf(n.test, 'loading') &&
-      stringValuesOf(n.consequent).some((value) => value.includes('刷新中…'))).length, 0,
-    '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
+    // 刷新按钮文案的负面判据：扫描面 = 全部 7 个前端模块（与旧 `!src.includes("刷新中…' : '刷新'")` 同面）。
+    // 只扫 MessagesPanel、且条件必须恰为 loading 时，其它面板（RunHistoryPanel 等）按 loading/busy/slowLoading
+    // 改文案、或换个条件名，都从「必红」变成「全绿」（C7 r2-A/B 实测 pages.js:657 即全绿）。
+    const refreshLabelTernaries = consoleAssetModels().flatMap((model) =>
+      findAll(model, (n) => n.type === 'ConditionalExpression' &&
+        stringValuesOf(n.consequent).concat(stringValuesOf(n.alternate)).some((value) => value.includes('刷新中…')))
+        .map((n) => `${path.basename(model.file)}:${n.loc.start.line}`))
+    assert.deepStrictEqual(refreshLabelTernaries, [],
+      '刷新按钮不得改文案：宽度变化会把导出按钮挤一下（任意面板、任意条件的「刷新中…」三元都算）')
     const frStatus = findAll(filterFn, (n) => n.type === 'LogicalExpression' && n.operator === '&&' &&
       sameShapeOf(n.left, 'slowLoading') && n.right.type === 'TaggedTemplateExpression')
     assert.strictEqual(frStatus.length, 1, '过滤规则的「刷新中…」同样只能慢加载才显示')
