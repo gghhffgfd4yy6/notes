@@ -15115,7 +15115,10 @@ async function main () {
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
     // 负面判据按成员路径结尾比：任何 receiver（document / window / window.document）都不能挂，
     // 全等 'document.addEventListener' 会让 `window.addEventListener('visibilitychange', …)` 整类逃逸。
-    for (const name of ['LogsPanel', 'CacheHealthPanel']) {
+    // 扫描面必须覆盖旧 slice 覆盖的全部 5 个面板（LogsPanel/SysPanel/FilesPanel、CacheHealthPanel/MessagesPanel）：
+    // 只扫 2 个面板会让「其它面板重新自带 visibilitychange 补拉」从必红变全绿（C7 r3-B）。
+    // RunsPanel / FilterRulesPanel 的合法监听不在其内。
+    for (const name of ['LogsPanel', 'CacheHealthPanel', 'MessagesPanel', 'SysPanel', 'FilesPanel']) {
       const panel = markup.functionNodeOf(pagesModel, name)
       assert.ok(panel, `${name} 必须存在`)
       assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPathEndsWith(n.callee, 'addEventListener') &&
@@ -15128,7 +15131,8 @@ async function main () {
     const reloadSitesOf = (root) => findAll(root, (n) => (n.type === 'MemberExpression' && memberPathEndsWith(n, 'location.reload')) ||
       (n.type === 'AssignmentExpression' && memberPathEndsWith(n.left, 'location.href')))
     assert.strictEqual(reloadSitesOf(pullHook).length + reloadSitesOf(statusComp).length +
-      reloadSitesOf(pullRefreshDecl).length + reloadSitesOf(refreshActiveDecl).length, 0,
+      reloadSitesOf(pullRefreshDecl).length + reloadSitesOf(refreshActiveDecl).length +
+      reloadSitesOf(recoveryEffect[0].arguments[0]).length, 0,
     '下拉刷新不得整页重载（任意 receiver 的 location.reload / location.href 赋值）')
 
     // 结构红线: 快速刷新不得闪文案（v3.333）

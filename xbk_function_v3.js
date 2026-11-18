@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.512 — assertshape C7 第 2 轮评审修复：3 条 must_fix（「匹配 N 条」后缀文案未判、下拉刷新「不得整页重载」被收窄到裸 location.reload/location.href、刷新按钮文案的负面断言只扫 MessagesPanel）+ 同形状横扫（C7 段 48 处成员路径全等判据 / 13 处模板判据 / 7 处负面断言）；只改测试面 test_console.js，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.513 — assertshape C7 第 3 轮评审修复：2 条 must_fix（面板 visibilitychange 负面判据从 5 个面板缩到 2 个、下拉刷新「不得整页重载」漏扫回前台补拉 effect）+ 同形状横扫（C7 段 8 个负面断言调用点 / 3 处旧扫描面收窄）；只改测试面 test_console.js，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
