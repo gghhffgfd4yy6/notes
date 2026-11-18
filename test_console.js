@@ -665,6 +665,15 @@ function memberPathEndsWith (node, tail) {
   const path = memberPath(node)
   return path === tail || (typeof path === 'string' && path.endsWith('.' + tail))
 }
+// 「整页重载」的全部写法（负面判据的唯一口径，assertshape C8 r2-B）：
+//   · `location.reload` 成员表达式——任意 receiver（window / document / window.document），
+//     且**不要求被调用**：`window.setTimeout(window.location.reload, 60000)` 把函数当值传出去
+//     同样是 60s 后整页重载（只判 CallExpression 的写法会把它整类放行）；
+//   · `location.href = …` 赋值（另一种整页跳转）。
+function reloadSitesOf (root) {
+  return findAll(root, (n) => (n.type === 'MemberExpression' && memberPathEndsWith(n, 'location.reload')) ||
+    (n.type === 'AssignmentExpression' && memberPathEndsWith(n.left, 'location.href')))
+}
 // 语句表 → 调用标签：**先逐条断言「是调用语句」，再比带实参的标签**。先
 // `filter((stmt) => stmt.type === 'ExpressionStatement')` 再比标签，会把处理器体里插入的
 // `if (v === '10') return` / `return` / `const x = 1` 静默丢掉，标签序列仍是原样 ⇒ 套件全绿
@@ -15169,8 +15178,6 @@ async function main () {
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
     // 判据按成员路径**结尾**比：仓库自己的整页重载写法一律带 receiver（`window.location.reload()`，
     // app.js:29 / ui.js:157,1243 / pages.js:3918），全等 'location.reload' 会把这些全部放行。
-    const reloadSitesOf = (root) => findAll(root, (n) => (n.type === 'MemberExpression' && memberPathEndsWith(n, 'location.reload')) ||
-      (n.type === 'AssignmentExpression' && memberPathEndsWith(n.left, 'location.href')))
     assert.strictEqual(reloadSitesOf(pullHook).length + reloadSitesOf(statusComp).length +
       reloadSitesOf(pullRefreshDecl).length + reloadSitesOf(refreshActiveDecl).length +
       reloadSitesOf(recoveryEffect[0].arguments[0]).length, 0,
@@ -15439,8 +15446,8 @@ async function main () {
     assert.ok(reloadArrow && reloadArrow.type === 'ArrowFunctionExpression', '刷新必须绑在 onClick 上（不得在渲染期直接 reload）')
     assert.deepStrictEqual(findAll(reloadArrow, (n) => n.type === 'CallExpression').map((call) => memberPath(call.callee)),
       ['window.location.reload'], '点击动作只能是 window.location.reload()（多一次调用就是副作用）')
-    assert.strictEqual(findAll(effectFn, (n) => n.type === 'CallExpression' && memberPathEndsWith(n.callee, 'location.reload')).length, 0,
-      '对账 effect 里不得自动 reload（会打断输入）')
+    assert.strictEqual(reloadSitesOf(effectFn).length, 0,
+      '对账 effect 里不得自动 reload（会打断输入）：location.reload 作为值传给 setTimeout 也算，location.href 赋值同样算')
     // 样式走主题变量，且用强调色而不是报错色（按规则声明取值判，不再拿正则扫 CSS 文本）。
     assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.alert-banner.nudge', 'background'), ['var(--accent-soft)'],
       '新版本横幅必须走强调色变量（不与「凭证失效」红条混淆）')
@@ -15515,8 +15522,24 @@ async function main () {
       '本分支必须再叠日期区间（inDayRange）')
     assert.strictEqual(exprLabel(filteredDecl.init.arguments[0].params[0]), 'r', '日期区间的输入必须是本档行（r）')
     // 没快照：选中态与列表都不先动，请求回来再一次性 setData + setMode。
-    const pendingAt = changeMode.body.body.findIndex((stmt) => callSites(stmt, 'setPendingMode').length > 0)
+    // 顺序判据（assertshape C8 r2-A：旧写法比的是 pendingTail 上两处 indexOf 的先后）：
+    // 「请求回来前不得先换选中态」不能只判 setPendingMode 存在——在 setPendingMode(m) 与
+    // fetchSnap(key) 之间插一条 setMode(m) 正是旧版修掉的回归，只判存在时全绿。
+    const pendingAt = changeMode.body.body.findIndex((stmt) =>
+      callSites(stmt, 'setPendingMode').some((call) => callArgLabels(call).join(',') === 'm'))
     assert.ok(pendingAt > -1, '必须有无快照的等待分支（setPendingMode(m)）')
+    const fetchSnapAt = changeMode.body.body.findIndex((stmt) => callSites(stmt, 'fetchSnap').length > 0)
+    assert.ok(fetchSnapAt > pendingAt,
+      `无快照分支必须先置等待态再发请求（setPendingMode@${pendingAt} / fetchSnap@${fetchSnapAt}）`)
+    const earlyModeCalls = changeMode.body.body.slice(pendingAt + 1, fetchSnapAt)
+      .flatMap((stmt) => callSites(stmt, 'setMode'))
+    assert.deepStrictEqual(earlyModeCalls.map(callLabel), [],
+      `无快照时不得先换选中态（等请求回来再换）：setPendingMode(m) 与 fetchSnap 之间不得出现 setMode（实际 ${earlyModeCalls.map(callLabel).join(' / ') || '无'}）`)
+    // 顶层裸调 setMode 同样算「先换选中态」（插在 setPendingMode 之前也在判据里）：选中态只允许在
+    // 快照分支与 then 回调里换。
+    assert.deepStrictEqual(changeMode.body.body.filter((stmt) => stmt.type === 'ExpressionStatement' &&
+      stmt.expression.type === 'CallExpression' && memberPath(stmt.expression.callee) === 'setMode').map(stmtLineOf), [],
+    'changeMode 顶层不得直接 setMode（选中态只在快照分支 / 请求回来的回调里换）')
     const pendingTimer = callSites(changeMode, 'window.setTimeout')
     assert.strictEqual(pendingTimer.length, 1, '忙碌提示必须只有一处延迟（迟延用字面量 150）')
     assert.strictEqual(pendingTimer[0].arguments[1].type, 'Literal', 'setTimeout 的延时必须是字面量（不是变量/字符串）')
@@ -16341,8 +16364,16 @@ async function main () {
     assert.strictEqual(findAll(attemptFn, (n) => n.type === 'ConditionalExpression' &&
       sameShapeOf(n, 'conditional ? addConditional(merged, condKey) : null')).length, 1,
     'messages 的条件头注入点必须仍在 attempt 里（键 condKey）')
-    assert.ok(attemptFn.body.body.some((stmt) => callSites(stmt, 'addConditional').length > 0),
-      'messages 必须先注入条件头再发请求（注入必须在 attempt 体内，不能挪到 fetch 之后）')
+    // 先后判据（assertshape C8 r2-A：旧写法是 msgFn 上 addConditional 与 fetch( 两处 indexOf 相比）：
+    // 只判「attempt 体里有 addConditional」时，把它挪到 fetch 之后仍然全绿——而 fetch 在调用时就
+    // 快照 headers，先 fetch 后注入等于永远不发条件头。
+    const attemptStmts = attemptFn.body.body
+    const injectAt = attemptStmts.findIndex((stmt) => callSites(stmt, 'addConditional').length > 0)
+    const msgFetchAt = attemptStmts.findIndex((stmt) => callSites(stmt, 'fetch').length > 0)
+    assert.ok(injectAt > -1 && msgFetchAt > -1 && injectAt < msgFetchAt,
+      `messages 必须先注入 If-None-Match 再 fetch（注入@${injectAt} / fetch@${msgFetchAt}）`)
+    assert.deepStrictEqual(callSites(attemptStmts[injectAt], 'addConditional').map((call) => callArgLabels(call).join(',')),
+      ['merged,condKey'], '注入调用的实参必须是 (merged, condKey)（键错会共用缓存条、串数据）')
     // /api/status 不得走条件请求（generatedAt/锁龄每拍在变，发了也永远不命中）。
     assert.strictEqual(findAll(apiModel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'addConditional' &&
       n.arguments[1] && n.arguments[1].type === 'Literal' && n.arguments[1].value === 'status').length, 0,
@@ -16650,6 +16681,13 @@ async function main () {
     assert.strictEqual(staleLoad.length, 1, '首次点开且手里没有新鲜快照时必须真的发一发（if (stale) load(true)）')
     assert.deepStrictEqual(callSites(staleLoad[0].consequent, 'load').map((call) => callArgLabels(call)), [['true']],
       '补拉必须 load(true)（强制刷新）：load() 会把这次刷新直接丢弃')
+    // 失败处理也必须在判据里（横扫：只数 load 调用/实参抓不到这个破坏）：补拉是 `load(true).catch(...)`，
+    // 去掉 catch 就是 unhandled rejection——首访失败时日志页停在旧快照且没有任何提示。
+    const staleCatch = findAll(staleLoad[0].consequent, (n) => n.type === 'CallExpression' &&
+      n.callee.type === 'MemberExpression' && !n.callee.computed && n.callee.property.name === 'catch' &&
+      n.callee.object.type === 'CallExpression' && memberPath(n.callee.object.callee) === 'load' &&
+      callArgLabels(n.callee.object).join(',') === 'true')
+    assert.strictEqual(staleCatch.length, 1, '补拉必须挂 catch（load(true).catch(…)；首访失败不得变成 unhandled rejection）')
   })
 
   await aok('结构红线: C7-014 列表 FLIP 带 deps（不再每次渲染都量布局 / 重播入场）', () => {
@@ -17185,7 +17223,11 @@ async function main () {
       assert.ok(revokeText.includes(phrase), `后果必须写在弹窗正文里（缺「${phrase}」；只留在按钮 title 等于没写）`)
     }
     // 离开系统页必须清掉待确认（否则回页面时弹窗自己弹出来）。
-    const revokeClearEffect = findAll(pagesModel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
+    // 扫描根必须是 TwoFactorBlock（旧断言是 TwoFactorBlock 切片，横扫同 C8 r1-A③ 形状）：
+    // 在整份 pages.js 里找一个「长成这样」的 effect，搬到别的组件也照样命中。
+    const twoFaFn = markup.functionNodeOf(pagesModel, 'TwoFactorBlock')
+    assert.ok(twoFaFn, 'pages.js 必须有 TwoFactorBlock（待确认 effect 的宿主）')
+    const revokeClearEffect = findAll(twoFaFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
       n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
       n.arguments[0].body.type === 'BlockStatement' &&
       n.arguments[0].body.body.some((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'active') &&
@@ -17230,7 +17272,10 @@ async function main () {
     assert.strictEqual(exprLabel(markup.attrExpr(watchBox, 'ref')), 'watchBoxRef', '关注词容器必须挂 ref=watchBoxRef')
     assert.strictEqual(exprLabel(markup.attrExpr(watchBox, 'tabIndex')), '-1', '关注词容器必须 tabIndex=-1（否则 .focus() 无效）')
     // 离开搜索页必须清掉待确认（否则切回来弹窗自己出现）。
-    const removeClearEffect = findAll(pagesModel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
+    // 扫描根必须是 SearchPanel（旧断言是 SearchPanel 切片，横扫同 C8 r1-A③ 形状）。
+    const searchPanelFn = markup.functionNodeOf(pagesModel, 'SearchPanel')
+    assert.ok(searchPanelFn, 'pages.js 必须有 SearchPanel（待确认 effect 的宿主）')
+    const removeClearEffect = findAll(searchPanelFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
       n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
       n.arguments[0].body.type === 'BlockStatement' &&
       n.arguments[0].body.body.some((stmt) => stmt.type === 'IfStatement' && sameShapeOf(stmt.test, 'active') &&
@@ -17341,8 +17386,12 @@ async function main () {
     assert.strictEqual(findAll(sysFn, (n) => n.type === 'AssignmentExpression' &&
       memberPath(n.left) === 'pendingRef.current').length, 0,
     'SysPanel 不得再手写单飞闸（C7-019 的重复骨架就来自这一份）')
-    const freshConstants = findAll(pagesModel, (n) => n.type === 'Identifier' && n.name === 'PANEL_FRESH_MS')
-    assert.ok(freshConstants.length >= 1, 'SysPanel 的新鲜度阈值必须引用 constants 的命名常量（PANEL_FRESH_MS）')
+    // 扫描根必须是 SysPanel（旧断言是 SysPanel 切片，assertshape C8 r2-A）：`findAll(pagesModel, …)`
+    // 会把 pages.js:5 的 import specifier 算进去（acorn 的 ImportSpecifier.imported / local 都是
+    // Identifier），于是「把阈值换回裸数字 3000」仍然命中 import 行、判据恒真。
+    const freshConstants = findAll(sysFn, (n) => n.type === 'Identifier' && n.name === 'PANEL_FRESH_MS')
+    assert.strictEqual(freshConstants.length, 1,
+      `SysPanel 的新鲜度阈值必须引用 constants 的命名常量（PANEL_FRESH_MS 在 SysPanel 内恰好 1 处；换回裸数字 3000 即红，实际 ${freshConstants.length} 处）`)
   })
 
   await aok('结构红线: C7-045 后台失败不许静默（裸 catch 改成带作用域的留痕）', () => {
@@ -17496,7 +17545,10 @@ async function main () {
     assert.strictEqual(exprLabel(markup.attrExpr(bodyEl, 'id')), 'bodyId',
       'aria-describedby 必须指向正文节点自己的 id（否则引用悬空，等同于没写）')
     // id 不得额外领号：titleId 的形态被既有用例逐字钉住，bodyId 复用同一序号。
-    const bodyIdDecl = findFirst(componentsModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'ArrayPattern' &&
+    // 扫描根必须是 ConfirmDialog（旧断言是 ConfirmDialog 切片，横扫同 C8 r1-A③ 形状）。
+    const confirmFn = markup.functionNodeOf(componentsModel, 'ConfirmDialog')
+    assert.ok(confirmFn, 'components.js 必须有 ConfirmDialog（bodyId 的宿主）')
+    const bodyIdDecl = findFirst(confirmFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'ArrayPattern' &&
       n.id.elements.length === 1 && n.id.elements[0].name === 'bodyId')
     assert.ok(bodyIdDecl && bodyIdDecl.init.type === 'CallExpression' && exprLabel(bodyIdDecl.init.callee) === 'useState',
       'bodyId 必须由 useState 生成（每实例唯一）')

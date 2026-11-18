@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.515 — assertshape C8（test_console.js 第 8 段）：97 条「读源码文本」断言按四式替换（AST 节点作用域 / 解析 CSS 断声明值 / 行为；式④ 删除 0 条），并顺带把同文件相邻 9 个块一并换掉；readConsoleSource() 切片与 src.includes 已无代码调用、格式耦合探针首次整文件全绿；白名单 total 757 → 427（test_console.js 386 → 56）；只改测试面 test_console.js、白名单与本文 / 版本，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.516 — assertshape C8 返工（r1 三路审查 5 条 must_fix）：4 条判据收紧（changeMode 顶层 setPendingMode→fetchSnap 之间禁 setMode / messages 的 addConditional 必须早于 fetch / SysPanel 的 PANEL_FRESH_MS 扫描根收为组件 / 对账 effect 的负面判据改看 location.reload 成员表达式而非仅调用）+ 段内同形状横扫（4 处扫描根收口到组件节点、C7-012 补 .catch 判据、reloadSitesOf 提为公共件）；CHANGELOG v3.515 的「相邻 9 个块」改正为 28 个 C7-* 块（27 id）+ 6 个非 C7 块；白名单 total 427 → 427（test_console.js 56 → 56）；只改测试面 test_console.js 与本文 / 版本，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
