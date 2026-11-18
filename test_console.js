@@ -633,9 +633,24 @@ function callLabel (call) {
   if (!call || call.type !== 'CallExpression') return exprLabel(call)
   return `${exprLabel(call.callee)}(${call.arguments.map(argLabel).join(', ')})`
 }
+// 表达式「取值」标签（声明初值 / 赋值右值）：exprLabel 对 CallExpression 只给 `callee()`、对
+// UpdateExpression 只给类型名，于是 `const seq = ++autoSeqRef.current` 与 `const seq = ++autoLandedRef.current`
+// 同标签（`seq = UpdateExpression`）、`setTimeout(fn, 600)` 与 `setTimeout(fn, 6000)` 同标签
+// （`setTimeout()`）——「领的号从哪来 / 排期多久」这类值判据整类放行（assertshape C8 r6-A：
+// 把 ui.js:927 的自增对象换掉 ⇒ seq 与 `seq > autoLandedRef.current` 不同源、落地判据永假，旧标签仍全绿）。
+// 调用走 callLabel（逐参，含对象 / 嵌套调用），自增自减带对象与前后缀运算符（`++x` ≠ `x++` ≠ `x`）。
+function valueLabel (node) {
+  if (!node) return ''
+  if (node.type === 'CallExpression') return callLabel(node)
+  if (node.type === 'UpdateExpression') {
+    return node.prefix ? node.operator + exprLabel(node.argument) : exprLabel(node.argument) + node.operator
+  }
+  return exprLabel(node)
+}
 // 语句的「一行摘要」：调用带实参、赋值带左右值、声明带初值、早退门带条件。判「几条语句的先后与取值」
 // 用它比标签序列，不按源码文本比——插入一条 return、把回写挪到守卫之前都会改变这份序列
-// （assertshape C8）。
+// （assertshape C8）。「取值」一律走 valueLabel：声明初值与赋值右值是 Call / Update 时也带对象
+// （旧写法对这两支只给 `callee()` / 类型名，见 valueLabel 的注释）。
 function stmtLineOf (stmt) {
   // 返回值的调用也必须带实参：exprLabel 对 CallExpression 只给 `callee()`，`return mutate(x)`
   // 与 `return mutate(null)` 同标签（同一类丢实参缺陷，assertshape C8 r5）。
@@ -658,13 +673,13 @@ function stmtLineOf (stmt) {
   }
   if (stmt.type === 'ExpressionStatement' && stmt.expression.type === 'CallExpression') return callLabel(stmt.expression)
   if (stmt.type === 'ExpressionStatement' && stmt.expression.type === 'AssignmentExpression') {
-    return exprLabel(stmt.expression.left) + ' = ' + exprLabel(stmt.expression.right)
+    return exprLabel(stmt.expression.left) + ' = ' + valueLabel(stmt.expression.right)
   }
   if (stmt.type === 'ExpressionStatement' && stmt.expression.type === 'UpdateExpression') {
-    return exprLabel(stmt.expression.argument) + ' ' + (stmt.expression.prefix ? '' : '') + stmt.expression.operator
+    return valueLabel(stmt.expression)
   }
   if (stmt.type === 'VariableDeclaration') {
-    return stmt.declarations.map((d) => exprLabel(d.id) + ' = ' + exprLabel(d.init)).join('; ')
+    return stmt.declarations.map((d) => exprLabel(d.id) + ' = ' + valueLabel(d.init)).join('; ')
   }
   return stmt.type
 }
@@ -15374,7 +15389,7 @@ async function main () {
     // 「必须先进入 stale 态」要判到次序（C8 r4-A 横扫）：只判块内存在的版本里，块首插一条 return
     // 就让按钮永远停在「检查中…」；整块三步 = 先 stale → 排期 reload → 早退不放开闸。
     assert.deepStrictEqual(mismatch[0].consequent.body.map(stmtLineOf),
-      ['setVerState("stale")', 'verTimerRef.current = setTimeout()', 'return'],
+      ['setVerState("stale")', 'verTimerRef.current = setTimeout(ArrowFunctionExpression, 600)', 'return'],
       '版本不同必须先进入 stale 态、再排期 reload、并早退不放开闸（三步次序不许换）')
     assert.strictEqual(findAll(mismatch[0].consequent, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setTimeout' &&
       n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
@@ -16512,7 +16527,7 @@ async function main () {
       n.arguments[1].elements.map(exprLabel).join(',') === 'active')
     assert.strictEqual(closeEffect.length, 1, '必须有 [active] 的收口 effect（离开当前页时主动关弹窗）')
     assert.deepStrictEqual(closeEffect[0].arguments[0].body.body.map(stmtLineOf),
-      ['if (active) return', 'confirmSeqRef.current ++', 'setPending(null)'],
+      ['if (active) return', 'confirmSeqRef.current++', 'setPending(null)'],
       '切页收口必须「早退门 → 作废在飞 askConfirm → 清 pending」三步（只 dialog.close() 会留下卡死的 pending）')
     // TriggerBar 必须真的拿到「当前页」标记（否则上面的门控恒真，等于没修）。
     const barUses = elementsInFunction(uiModel, 'App').filter((el) => el.name === 'TriggerBar')
@@ -16538,7 +16553,10 @@ async function main () {
     const lines = refreshFn.body.body.map(stmtLineOf)
     const flightGateAt = lines.indexOf('if (autoFlightRef.current) return autoFlightRef.current')
     assert.ok(flightGateAt > -1, '在飞时必须复用同一发（if (autoFlightRef.current) return autoFlightRef.current）')
-    const seqAt = lines.findIndex((line) => line === 'seq = UpdateExpression')
+    // 领的号必须来自 autoSeqRef 本身（不是别的 ref）：标签带自增对象，把 `++autoSeqRef.current`
+    // 换成 `++autoLandedRef.current` 就与下面的 `seq > autoLandedRef.current` 不同源 ⇒ 落地判据
+    // 永假、autoState 永不到手（C8 r6-A 的破坏正是这一处；旧标签只给 `seq = UpdateExpression`，放行）。
+    const seqAt = lines.findIndex((line) => line === 'seq = ++autoSeqRef.current')
     assert.ok(seqAt > flightGateAt,
       `在飞保护必须早于领新号（门@${flightGateAt} / 领号@${seqAt}）：晚一步号照样每拍自增，上一发还是被判废`)
     // 判据必须是「最后收到」而不是「最后发出」：没有更新的响应落地过，就允许这一发写状态。
@@ -16821,7 +16839,7 @@ async function main () {
       'if (pendingMode !== null) return',
       'landRef.current = false',
       'if (userMovedRef.current) return',
-      'y = listLandTarget()',
+      'y = listLandTarget(listRef.current)',
       'if (y === null) return',
       'window.scrollTo(0, y)'
     ], '落点必须「旗子 → 加载在飞 → 等目标档 → 清旗 → 用户滚过就放弃 → 取落点 → 无落点不滚 → 滚」八步且次序不许换')
