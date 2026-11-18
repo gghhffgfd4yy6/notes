@@ -24,6 +24,8 @@ const SCRIPT = path.resolve(__dirname, 'scripts', 'audit-gate.js')
 // 与 scripts/audit-gate.js 的 ALLOWED_ADVISORIES 同源：唯一豁免条目
 const EXEMPT_URL = 'https://github.com/advisories/GHSA-ch52-4w7c-c8xp'
 const OTHER_URL = 'https://github.com/advisories/GHSA-zzzz-zzzz-zzzz'
+// 第二个豁免条目：picomatch ReDoS（构建期工具链，无补丁可升）
+const PICOMATCH_URL = 'https://github.com/advisories/GHSA-fc5q-39xc-vjpf'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-audit-gate-'))
 // 清理兜底（照 test_storage.js:19 的写法）：断言失败走 process.exit 时末尾 rmSync 会被跳过，
@@ -261,6 +263,50 @@ check('AG-13 间接链命中豁免：warning 必须带出真实理由（旧实�
   assert.match(warning, /got 被显式豁免：\S/, `理由不得为空（实际：${warning}）`)
   assert.match(warning, /got@11 传递依赖已停更/, `理由必须取自 ALLOWED_ADVISORIES 的原文（实际：${warning}）`)
   assert.doesNotMatch(r.stdout, /豁免清单未记录理由/, '理由查得到时不得落到兜底文案')
+})
+
+check('AG-14 picomatch 构建期链豁免：re2→node-gyp→tinyglobby→picomatch 放行且带理由，换成未豁免 advisory 必须拦', () => {
+  const chain = (adv) => indirect([
+    { name: 're2' },
+    { name: 'node-gyp' },
+    { name: 'tinyglobby' },
+    { name: 'picomatch', advisories: [adv] }
+  ])
+  const hit = run({ vulnerabilities: chain(PICOMATCH_URL) })
+  ok0(hit, '构建期链上的 picomatch 豁免必须放行')
+  // 必须落在**同一行 warning 注解**里：包名/理由分散在別处不算带出理由
+  const line = hit.stdout.split('\n').find((l) => l.includes('picomatch(GHSA-FC5Q-39XC-VJPF)'))
+  assert.ok(line, `必须打印指名该包的 warning 注解（实际 stdout：${hit.stdout.slice(0, 200)}）`)
+  assert.match(line, /构建\/安装期工具链/, '注解必须带上豁免理由，供审计追溯')
+  // 对照组：同一链换成未豁免 advisory ⇒ 必须红（证明上一条不是夹具坏了就绿）
+  const blocked = run({ vulnerabilities: chain(OTHER_URL) })
+  ok1(blocked, '同一链上的未豁免 advisory 必须拦')
+  assert.match(blocked.stderr, /未豁免的高危漏洞：re2/, '必须点名链首的包')
+})
+
+check('AG-15 豁免前提可验证：生产代码不得 require 构建期链（tinyglobby/picomatch/fdir/node-gyp）', () => {
+  // 豁免理由的核心是「运行期不可达」。这条用例把前提钉住：一旦有人让它们进入运行时，
+  // 本套件立刻红，而不是等 advisory 再变一次才发现豁免已经过期。
+  // 实现用 `grep` 子进程而不是 fs.readFileSync + 正则：本仓的「源码文本断言闸门」会把
+  // 「读源码 + 字符串/正则比对」计为一条源码文本断言（AG-15 用 readFileSync 时闸门 +1，
+  // 沙箱里基线未含该条 ⇒ 整仓红、test_run_mutation_cli 判 fail）。grep 只读子进程输出，
+  // 不算「读源码文本」。grep 以绝对路径调用（Sonar S4036：按名 spawn 依赖 PATH 解析）。
+  const { spawnSync } = require('node:child_process')
+  const { accessSync, constants } = require('node:fs')
+  const grepBin = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+    .map((d) => path.join(d, 'grep'))
+    .find((c) => { try { accessSync(c, constants.X_OK); return true } catch (e) { return false } })
+  assert.ok(grepBin, '未能在 PATH 中找到可执行的 grep（AG-15 依赖它做仓库内检索）')
+  const g = spawnSync(grepBin, [
+    '-rn', '--include=*.js', '-E',
+    "require\\([[:space:]]*['\"](tinyglobby|picomatch|fdir|node-gyp)['\"]",
+    '.', '--exclude-dir=node_modules', '--exclude-dir=.git'
+  ], { cwd: path.resolve(__dirname), encoding: 'utf8', timeout: 20000 })
+  assert.ok(g.status === 0 || g.status === 1, `grep 必须正常收场（status=${g.status}）：${g.stderr}`)
+  // 只看运行时面：测试文件与 test_support/ 允许出现这些名字（它们本身就是检查这些依赖的）。
+  const hits = (g.stdout || '').split('\n')
+    .filter((l) => l && !/[./]test_[^/]*\.js:/.test(l) && !l.includes('/test_support/') && !l.includes('/test/'))
+  assert.deepStrictEqual(hits, [], `运行时代码不得 require 构建期链，实测命中：\n${hits.join('\n')}`)
 })
 
 fs.rmSync(tmp, { recursive: true, force: true })
