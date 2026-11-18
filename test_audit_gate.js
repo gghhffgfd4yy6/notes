@@ -274,12 +274,26 @@ check('AG-14 picomatch 构建期链豁免：re2→node-gyp→tinyglobby→picoma
   ])
   const hit = run({ vulnerabilities: chain(PICOMATCH_URL) })
   ok0(hit, '构建期链上的 picomatch 豁免必须放行')
-  assert.match(hit.stdout, /picomatch\(GHSA-FC5Q-39XC-VJPF\) 被显式豁免/, '注解必须指名包名与 GHSA')
-  assert.match(hit.stdout, /构建\/安装期工具链/, '注解必须带上豁免理由，供审计追溯')
+  // 必须落在**同一行 warning 注解**里：包名/理由分散在別处不算带出理由
+  const line = hit.stdout.split('\n').find((l) => l.includes('picomatch(GHSA-FC5Q-39XC-VJPF)'))
+  assert.ok(line, `必须打印指名该包的 warning 注解（实际 stdout：${hit.stdout.slice(0, 200)}）`)
+  assert.match(line, /构建\/安装期工具链/, '注解必须带上豁免理由，供审计追溯')
   // 对照组：同一链换成未豁免 advisory ⇒ 必须红（证明上一条不是夹具坏了就绿）
   const blocked = run({ vulnerabilities: chain(OTHER_URL) })
   ok1(blocked, '同一链上的未豁免 advisory 必须拦')
   assert.match(blocked.stderr, /未豁免的高危漏洞：re2/, '必须点名链首的包')
+})
+
+check('AG-15 豁免前提可验证：生产代码不得 require 构建期链（tinyglobby/picomatch/fdir/node-gyp）', () => {
+  // 豁免理由的核心是「运行期不可达」。这条用例把前提钉住：一旦有人让它们进入运行时，
+  // 本套件立刻红，而不是等 advisory 再变一次才发现豁免已经过期。
+  const { spawnSync } = require('node:child_process')
+  const g = spawnSync('git', ['grep', '-n', '-E',
+    "require\\(['\"](tinyglobby|picomatch|fdir|node-gyp)['\"]",
+    '--', '*.js', ':!test_*.js', ':!test/**', ':!test_support/**'],
+  { cwd: path.resolve(__dirname), encoding: 'utf8', timeout: 20000 })
+  assert.ok(g.status === 0 || g.status === 1, `git grep 必须正常收场（status=${g.status}）：${g.stderr}`)
+  assert.strictEqual((g.stdout || '').trim(), '', `运行时代码不得 require 构建期链，实测命中：\n${g.stdout}`)
 })
 
 fs.rmSync(tmp, { recursive: true, force: true })

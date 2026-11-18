@@ -11,6 +11,7 @@
 
 - 推送通道的密钥与 URL 经 `maskKey`/`maskUrl` 脱敏，通道异常摘要与一言获取失败经 `safeErr` 脱敏（按已配置密钥表替换 + 截断 200 字符）后再落日志；其余诊断（本地文件、依赖等）按原样记录错误 `message`，不做统一脱敏。
 - 推送密钥只存放于本地 `push_config.local.js`（已被 `.gitignore` 忽略，不入库）或青龙环境变量；CI 不使用推送密钥，仅使用 Actions 自动签发的 `GITHUB_TOKEN`（最小权限）。
+- 依赖审计的**显式豁免**集中登记在 `scripts/audit-gate.js` 的 `ALLOWED_ADVISORIES`（advisory GHSA id → 理由）。命中豁免时以 GitHub Actions `::warning` 注解逐包显形、不静默放行；每条豁免都必须写明「为何不可达 / 何时复查」，并由 `test_audit_gate.js` 钉住其前提（例如豁免理由是「仅构建期链」时，AG-15 会校验生产代码没有 require 该链）。
 - 依赖更新由 Dependabot 自动开 PR（`.github/dependabot.yml`）；安全门禁由 PR 上的 Dependency Review（`fail-on-severity: high`）、CodeQL、`npm audit --audit-level=high --omit=dev` 与 `quality-gate` 负责，**人工审查后合并——当前未配置自动合并**。
 - 工作流 YAML 与 Git 钩子本身也纳入扫描（v3.280）：`npm run check:ci-static` 用 `zizmor` 扫 `.github/workflows/` 全部（**medium 及以上计红**）、`shellcheck` 扫 `.githooks/*` 全部，作为 Test 工作流 `policy` job 的显式步骤跑，并由 `quality-gate` 汇总；zizmor 输出解析不出来按「不可判定 = 红」fail-closed，缺扫描器时 CI 同样判红（本机则显眼提示并跳过，绝不假装扫描过）。
 
