@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.500 — 安全审计豁免 picomatch ReDoS（GHSA-fc5q-39xc-vjpf）：affected <=4.0.7 且 registry 最新即 4.0.7、无补丁可升；该包只经 re2→node-gyp→tinyglobby 构建期链进入（仓库运行时 require 零命中），经仓库所有者确认后加显式豁免 + 带理由 warning 显形，并写清复查条件。只动 scripts/audit-gate.js、test_audit_gate.js、版本四方与 CHANGELOG，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.509 — assertshape C6 第 8 轮评审修复：负面文案断言的扫描面从手写的 3 个模块（components/pages/ui）收回全部 7 个前端模块（consoleAssetStrings()，与旧 readConsoleSource() 同面，motion.js 本就不在拼接清单里），并把「上限 48MB」那条单模块负向判据一并扩到全模块；同批横扫本包段负面判据，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
