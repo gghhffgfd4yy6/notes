@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.506 — assertshape C6 第 5 轮评审修复：changeMode/changeSize 的值守卫与 armLand() 先后入判据、flip() 实参入判据，并横扫 C6 段 21 处 earlyExits 判据（补 10 处门序）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.507 — assertshape C6 第 6 轮评审修复：in-flight 守卫（winSavingRef/dateSavingRef/leaveSavingRef）改判 .current 的读写点与 finally 复位、顶栏/日志计数/结果行文案静态段逐字钉住，并横扫 C6 段同形状判据；生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

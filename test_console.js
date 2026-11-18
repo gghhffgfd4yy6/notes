@@ -12520,6 +12520,11 @@ async function main () {
     assert.strictEqual(heavyLineTpl.length, 1, '关掉高亮必须在计数行写明（不能让人以为搜不到）')
     assert.deepStrictEqual(heavyLineTpl[0].expressions.map(exprLabel), ['LOG_HIGHLIGHT_MAX'],
       '关掉高亮的文案必须带上真实阈值（LOG_HIGHLIGHT_MAX）')
+    // v3.507（assertshape C6 r6-B 横扫）：只判「某段里有『已关闭高亮』」等于放行整句其余静态段
+    // （「行数过多（>」改成别的、删掉括号都能过）。这里把 quasis 全文逐字钉住。
+    assert.deepStrictEqual(heavyLineTpl[0].quasis.map((quasi) => quasi.value.cooked),
+      ['行数过多（>', '），已关闭高亮'],
+      '关掉高亮的整句文案必须逐字钉住（括号、顿号与「已关闭高亮」一起入判）')
     const preEl = logsEls.find((el) => el.name === 'pre' && markup.attrText(el, 'id') === 'log-pre')
     assert.ok(preEl, '日志框必须是 pre#log-pre（等宽、可整块复制）')
     assert.ok(markup.expressionsIn(preEl).some((expr) => sameShapeOf(expr, 'heavy ? shownText : lineNodes')),
@@ -12558,6 +12563,11 @@ async function main () {
     assert.strictEqual(countTpl.length, 1, '筛选非 all 时计数行必须点名筛选')
     assert.deepStrictEqual(countTpl[0].expressions.map(exprLabel), ['modeLabel', 'ranged.length', 'lines.length'],
       '计数行必须用 ranged / lines 两个真实行数（v3.326 起按含日期区间的 ranged 计数）')
+    // v3.507（assertshape C6 r6-B 横扫）：定位用的 includes('筛选下 · 显示 ') 只是锚点，
+    // 其余静态段（「在「」「 / 」「 行」）不入判 ⇒ 改这几个字仍全绿。整句 quasis 逐字钉住。
+    assert.deepStrictEqual(countTpl[0].quasis.map((quasi) => quasi.value.cooked),
+      ['在「', '」筛选下 · 显示 ', ' / ', ' 行'],
+      '计数行整句文案必须逐字钉住（「在「」「筛选下 · 显示 」「 / 」「 行」都是用户可见文案）')
     const searchBtn = logsEls.find((el) => el.name === 'button' && String(markup.textOf(el)).includes('在全部日志中搜索'))
     assert.ok(searchBtn, '空态必须给「在全部日志中搜索」按钮')
     assert.strictEqual(exprLabel(markup.attrExpr(searchBtn, 'onClick')), 'searchAllLogs',
@@ -12566,6 +12576,14 @@ async function main () {
       n.quasis.map((quasi) => String(quasi.value.raw)).join('\u0001').includes('」筛选下没有匹配的日志行'))
     assert.strictEqual(emptyTpl.length, 1, '空态文案必须点名当前筛选')
     assert.strictEqual(exprLabel(emptyTpl[0].expressions[0]), 'modeLabel', '空态文案里的筛选名必须来自 modeLabel')
+    // v3.507（assertshape C6 r6-B 横扫）：同上——锚点句之外的空态整句与关键词子模板都要逐字入判。
+    assert.deepStrictEqual(emptyTpl[0].quasis.map((quasi) => quasi.value.cooked),
+      ['在「', '」筛选下没有匹配的日志行', ''],
+      '空态整句必须逐字钉住（「在「」「」筛选下没有匹配的日志行」是用户看到的唯一解释）')
+    const emptyKwTpl = findFirst(emptyTpl[0], (n) => n.type === 'TemplateLiteral' && n !== emptyTpl[0])
+    assert.ok(emptyKwTpl, '空态必须带「关键词」子句（否则搜了词却看到一句通用文案）')
+    assert.deepStrictEqual(emptyKwTpl.quasis.map((quasi) => quasi.value.cooked), ['（关键词「', '」）'],
+      '关键词子句必须逐字钉住（「（关键词「」「」）」不能悄悄改）')
     const searchAllDecl = findFirst(logsFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
       n.id.name === 'searchAllLogs')
     assert.ok(searchAllDecl, '空态出口 searchAllLogs 必须存在')
@@ -13366,6 +13384,13 @@ async function main () {
     assert.ok(outcomeFn && findAll(outcomeFn, (n) => n.type === 'TemplateLiteral' &&
       n.quasis.map((quasi) => String(quasi.value.raw)).join('\u0001').includes('失败（退出码 ')).length === 1,
     '失败必须给出退出码（不只换颜色）')
+    // v3.507（assertshape C6 r6-B 横扫）：includes 只证明「失败（退出码 」这几个字还在，
+    // 收尾的「）」与整句其余静态段不入判 ⇒ 整句 quasis 逐字钉住。
+    const failOutcomeTpl = findAll(outcomeFn, (n) => n.type === 'TemplateLiteral' &&
+      n.quasis.some((quasi) => String(quasi.value.cooked).includes('失败（退出码 ')))
+    assert.strictEqual(failOutcomeTpl.length, 1, '失败文案必须只有一处定义')
+    assert.deepStrictEqual(failOutcomeTpl[0].quasis.map((quasi) => quasi.value.cooked), ['失败（退出码 ', '）'],
+      '失败文案整句必须逐字钉住（退出的括号也是用户可见文案）')
     assert.ok(findAll(outcomeFn, (n) => n.type === 'Literal' && n.value === '成功').length >= 1,
       '成功/失败/停止/超时 必须是不同文案（不是同一句变色）')
     // E. 不位移：.trigger-result 预留高度；错误走固定 toast。
@@ -14195,6 +14220,17 @@ async function main () {
       '暂停态后半句必须是「数据截至 + 时分 + 秒」三格')
     assert.deepStrictEqual(runningTpl.quasi.expressions.map(exprLabel), ['remain', 'TZ_LABEL', 'atMain', 'atSec'],
       '运行态必须是「剩余秒 + 数据截至 + 时分 + 秒」四格（顺序不能换）')
+    // v3.507（assertshape C6 r6-B）：静态文案必须逐段入判。
+    // 旧写法只判插值序列与「已暂停 · 」前缀：把「秒后刷新 · 」改成「秒后刷新！（」、把「数据截至」改成
+    // 「数据时间」，静态段整段不入判而套件全绿。这里把两段模板的 quasis 全文逐字钉住（AST 字面量值，
+    // 不读源码排版）：分隔符「 · 」、尾随空格与标签文案一并入判，改一个字就红。
+    const staticSegmentsOf = (tpl) => tpl.quasi.quasis.map((quasi) => quasi.value.cooked)
+    assert.deepStrictEqual(staticSegmentsOf(pausedTpl),
+      ['已暂停 · <span class="sync-label">数据截至 ', ' </span>', '<span class="sync-sec">', '</span>'],
+      '暂停态整句文案必须逐字钉住（改一个字/删一个分隔符都是文案回归）')
+    assert.deepStrictEqual(staticSegmentsOf(runningTpl),
+      ['', ' 秒后刷新 · <span class="sync-label">数据截至 ', ' </span>', '<span class="sync-sec">', '</span>'],
+      '运行态整句文案必须逐字钉住（「秒后刷新 · 」与「数据截至 」都在判据里，不只是插值顺序）')
     const shapeOf = (tpl) => markup.markupOf(tpl).children.filter((child) => child.type === 'element')
       .map((el) => el.name + '.' + markup.classNames(el).join('.'))
     assert.deepStrictEqual(shapeOf(pausedTpl), shapeOf(runningTpl),
@@ -14243,8 +14279,20 @@ async function main () {
     assert.strictEqual(findAll(block, (n) => n.type === 'ConditionalExpression' &&
       sameShapeOf(n.test, "settingsLive && settingsLive.settings && typeof settingsLive.settings.syncShowDate === 'boolean'")).length, 1,
     '读面必须校验布尔类型（读到脏值不得当成开关值）')
-    const dateSavingRefGuard = findAll(toggle, (n) => n.type === 'MemberExpression' && memberPath(n) === 'dateSavingRef.current')
-    assert.ok(dateSavingRefGuard.length >= 2, '开关必须防连点（dateSavingRef in-flight 守卫）')
+    // v3.507（assertshape C6 r6-A 横扫）：只数 .current 出现次数不算判据——删掉入口门后
+    // 写 true + 写 false 仍是 2 处，套件照绿。这里按 AST 判「门 / 写 true / 写 false / finally 复位」。
+    assert.strictEqual(findAll(toggle, earlyExits('dateSavingRef.current')).length, 1,
+      '开关入口必须先判 in-flight 旗（连点两次会发两次开关写请求：门必须真的 return）')
+    const dateSavingWrites = (value) => findAll(toggle, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'dateSavingRef.current' && n.right.type === 'Literal' && n.right.value === value)
+    assert.strictEqual(dateSavingWrites(true).length, 1, '发请求前必须把 in-flight 旗写 true（只读不写 = 门永远开着）')
+    assert.strictEqual(dateSavingWrites(false).length, 1, '收尾必须把 in-flight 旗写 false（漏写则一次失败后永久锁死）')
+    assert.ok(dateSavingWrites(true)[0] && dateSavingWrites(true)[0].start < togglePost.start,
+      '写 true 必须排在写请求之前（先占位再发，否则守卫窗口内仍可双发）')
+    const dateFinally = findFirst(toggle, (n) => n.type === 'TryStatement' && n.finalizer)
+    assert.ok(dateFinally && findAll(dateFinally.finalizer, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'dateSavingRef.current').length === 1,
+    '复位必须在 finally 里（await 抛错也要解锁，写在 try 尾部等于失败一次就永久锁死）')
     const mismatchTests = findAll(block, (n) => n.type === 'BinaryExpression' && n.operator === '===' &&
       exprLabel(n.left) === 'payload.error' && exprLabel(n.right) === '"revision_mismatch"')
     assert.strictEqual(mismatchTests.length, 2, '两条写面（拦截窗 / 年月日开关）都要按 revision_mismatch 分支处理')
@@ -14541,7 +14589,28 @@ async function main () {
       '读面失败/保存中时 ± 必须禁用')
     assert.ok(stringValuesOf(block).some((value) => value.includes('读取中…')),
       '首帧必须显示「读取中」，不得把未加载伪装成读取失败')
-    assert.ok(declaresVariable(block, 'winSavingRef'), '保存必须防连点（in-flight 守卫 winSavingRef）')
+    // v3.507（assertshape C6 r6-A）：in-flight 守卫必须判 .current 的读写点，不能只判「名字有声明」。
+    // 旧写法 declaresVariable(block,'winSavingRef') 只证明 useRef 那一行还在：把 adjustWin/saveWin 里的
+    // 4 处守卫（门 / 门 / =true / =false）删净后，双击保存仍会各带同一 baseRevision 发两次 POST
+    // （第二次必 409，页面同时出现「已保存」与「设置已被别处改过」）而套件全绿。
+    const adjustWin = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'adjustWin')
+    assert.ok(adjustWin && saveWin.init && saveWin.init.body && saveWin.init.body.type === 'BlockStatement',
+      '必须能定位 adjustWin 与带块体的 saveWin')
+    assert.strictEqual(findAll(adjustWin, earlyExits('winCurrent === null || winSavingRef.current')).length, 1,
+      '± 步进必须先用 in-flight 旗挡一道（保存中长按连加不得改草稿：门必须真的 return）')
+    assert.strictEqual(findAll(saveWin, earlyExits('winSavingRef.current')).length, 1,
+      '保存入口必须先判 in-flight 旗（连点两次各带同一 baseRevision 发两发，第二次必 409）')
+    const winSavingWrites = (value) => findAll(saveWin, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'winSavingRef.current' && n.right.type === 'Literal' && n.right.value === value)
+    assert.strictEqual(winSavingWrites(true).length, 1, '发请求前必须把 in-flight 旗写 true（只读不写 = 门永远开着）')
+    assert.strictEqual(winSavingWrites(false).length, 1, '收尾必须把 in-flight 旗写 false（漏写则一次失败后永久锁死）')
+    assert.ok(winSavingWrites(true)[0] && winSavingWrites(true)[0].start < winPost.start,
+      '写 true 必须排在写请求之前（先占位再发，否则守卫窗口内仍可双发）')
+    const winFinally = findFirst(saveWin, (n) => n.type === 'TryStatement' && n.finalizer)
+    assert.ok(winFinally, '保存必须用 try/finally 包住（否则 await 抛错就再也不会复位）')
+    assert.strictEqual(findAll(winFinally.finalizer, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'winSavingRef.current' && n.right.type === 'Literal' && n.right.value === false).length, 1,
+    '复位必须在 finally 里（异常/早退也要解锁：写在 try 尾部等于失败一次就永久锁死）')
     assert.strictEqual(findAll(block, (n) => n.type === 'BinaryExpression' && n.operator === '===' &&
       exprLabel(n.left) === 'payload.error' && exprLabel(n.right) === '"revision_mismatch"').length, 2,
     '两条写面都必须按 revision_mismatch 分支处理')
@@ -14669,10 +14738,21 @@ async function main () {
     assert.ok(src.includes('beginGuardSave'), '保存并继续必须等待真正保存成功后再继续原操作')
     assert.ok(src.includes('const beginGuardSave') && src.includes('submitSave({ filter: candidate'), '保存并继续必须直接调用保存，不能再弹第二次确认')
     assert.ok(src.includes('settleSaveResult(true)'), '只有保存成功才能放行原来的切页/后退')
-    assert.ok(src.includes('leaveSavingRef'), '保存并继续落盘期间必须锁住新的切页/后退请求')
+    // v3.507（assertshape C6 r6-A 横扫）：名字出现不等于守卫在——只判 src.includes('leaveSavingRef')
+    // 时，删掉三处 gate 只留 useRef 声明照样绿；同理「文本里有 = true / = false」也不管复位在不在
+    // finally。这里按 AST 判 .current 的门与读写点（三处早退 + finally 复位）。
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    assert.strictEqual(findAll(uiModel, earlyExits('leaveSavingRef.current')).length, 3,
+      '保存并继续落盘期间必须三处早退：拦新请求 / hash 路由 / switchTab（少一处就有一条路能在落盘中被切走）')
+    const leaveSavingWrites = (value) => findAll(uiModel, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'leaveSavingRef.current' && n.right.type === 'Literal' && n.right.value === value)
+    assert.strictEqual(leaveSavingWrites(true).length, 1, '落盘开始必须把 in-flight 旗写 true（只声明不置位 = 三处门永远开着）')
+    assert.strictEqual(leaveSavingWrites(false).length, 1, '落盘结束必须写 false（漏写则一次失败后永久锁死切页/后退）')
+    const leaveFinally = findFirst(uiModel, (n) => n.type === 'TryStatement' && n.finalizer &&
+      findAll(n.finalizer, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'leaveSavingRef.current').length === 1)
+    assert.ok(leaveFinally, '复位必须在 finally 里（guard.save() 抛错也要解锁）')
     const leaveSave = src.slice(src.indexOf('const closeLeaveRequest = '), src.indexOf('// 「查看日志」跳转'))
     assert.ok(/await guard\.save\(\)/.test(leaveSave), '保存按钮必须等 guard.save() 的结果')
-    assert.ok(leaveSave.includes('leaveSavingRef.current = true') && leaveSave.includes('leaveSavingRef.current = false'), '保存并继续必须锁住整段落盘过程')
     assert.ok(leaveSave.includes('doSwitchTab(req.target, true)'), '保存成功后必须继续用户原来要去的页签（并替换 sentinel）')
     assert.ok(leaveSave.indexOf('if (!saved)') >= 0 && leaveSave.indexOf('if (!saved)') < leaveSave.indexOf('doSwitchTab(req.target, true)'),
       '保存失败/取消必须先 return，不能先跳页')
@@ -14684,10 +14764,26 @@ async function main () {
     assert.ok(src.includes('__xbkFilterGuard'), '脏草稿必须在历史里压 sentinel，否则左滑直接退走')
     assert.ok(src.includes("source: 'tab'") && src.includes("source: 'hash'") && src.includes("source: 'history'"),
       '切页、hash 变化、浏览器后退三种来源都要能回到同一个拦截弹窗')
-    assert.ok(src.includes('onLeaveRequestRef.current'), 'popstate 回调必须用 ref 读最新值，不能被旧闭包吃掉')
-    assert.ok(src.includes('guardRef'), 'App 必须拿到过滤页的脏状态/保存/放弃动作')
+    // v3.507（横扫 ①）：`src.includes('onLeaveRequestRef.current')` 与 `src.includes('guardRef')`
+    // 只判名字出现（后者连 `filterGuardRef` 的子串都能满足）——删掉读写点、只留声明/属性名照样绿。
+    // 按 AST 判：popstate 的命名处理器必须真的从 ref 读最新回调；guardRef 必须绑同一个 filterGuardRef。
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const popstateCall = callSites(pagesModel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"popstate"')
+    assert.strictEqual(popstateCall.length, 1, '手机左滑/后退必须挂一处 popstate')
+    const onPopDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onPop')
+    assert.ok(onPopDecl && exprLabel(popstateCall[0].arguments[1]) === 'onPop', 'popstate 必须挂命名处理器 onPop（便于逐条判）')
+    assert.ok(findAll(onPopDecl, (n) => n.type === 'MemberExpression' && memberPath(n) === 'onLeaveRequestRef.current').length >= 1,
+      'popstate 回调必须用 ref 读最新值（只留声明会被旧闭包吃掉）')
+    assert.ok(declaresVariable(uiModel, 'filterGuardRef'), 'App 必须持有过滤页的脏状态/保存/放弃 ref')
+    const guardTpls = templateIn(uiModel, 'guardRef=')
+    const guardWired = guardTpls.flatMap((tpl) => markup.allElements(markup.markupOf(tpl, { expandTemplates: true })))
+      .filter((el) => markup.attrExpr(el, 'guardRef'))
+    assert.strictEqual(guardWired.length, 1, '必须把 guardRef 交给过滤页（唯一一处）')
+    assert.strictEqual(exprLabel(markup.attrExpr(guardWired[0], 'guardRef')), 'filterGuardRef',
+      'guardRef 属性必须绑 App 的 filterGuardRef（换一份 ref 就拿不到脏状态）')
+    assert.ok(findAll(uiModel, (n) => n.type === 'MemberExpression' && memberPath(n) === 'filterGuardRef.current').length >= 2,
+      'App 必须真的从 filterGuardRef.current 读脏状态（只声明 = 永远拿到 null）')
     const app = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
-    assert.ok(app.includes('if (leaveSavingRef.current) return'), '保存并继续落盘期间 switchTab 必须直接返回，不能只挂一个变量')
     assert.ok(/guard && guard\.dirty/.test(app), '切页前必须检查过滤页脏状态')
     assert.ok(src.includes('放弃草稿并回滚'), '回滚会覆盖草稿时必须把按钮文案说清楚')
     assert.ok(src.includes('复制代码默认会把这些修改覆盖掉'), '复制默认会覆盖草稿时必须先确认')
