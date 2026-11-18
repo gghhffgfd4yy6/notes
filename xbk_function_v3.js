@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.509 — assertshape C6 第 8 轮评审修复：负面文案断言的扫描面从手写的 3 个模块（components/pages/ui）收回全部 7 个前端模块（consoleAssetStrings()，与旧 readConsoleSource() 同面，motion.js 本就不在拼接清单里），并把「上限 48MB」那条单模块负向判据一并扩到全模块；同批横扫本包段负面判据，生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.510 — assertshape C7：test_console.js 第 7 段 98 条「读源码文本」断言全部改为 AST 结构 / 解析后字段 / 行为断言（128 处命中清零；生产逻辑一行未改） *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

@@ -66,29 +66,6 @@ function readConsoleSource () {
     })
     .join('\n')
 }
-// 后端源码清单（D1 路由拆分）：`dispatchRequest` 拆成「薄 ingress + scripts/console-routes.js 有序路由表 +
-// scripts/console-handlers/*.js 按域 handler」之后，某段实现文本落在哪个文件不再固定。源码形态断言按
-// 同一份清单拼接（顺序固定），搬文件不再假红；负面断言（`!includes`）的扫描面随之变大，只会更严。
-const CONSOLE_SERVER_FILES = [
-  'scripts/console.js',
-  'scripts/console-routes.js',
-  'scripts/console-handlers/system.js',
-  'scripts/console-handlers/logs.js',
-  'scripts/console-handlers/messages.js',
-  'scripts/console-handlers/config.js',
-  'scripts/console-handlers/security.js',
-  'scripts/console-handlers/runs.js'
-]
-function readConsoleServerSource () {
-  return CONSOLE_SERVER_FILES
-    .map((rel) => {
-      const text = fs.readFileSync(path.join(__dirname, rel), 'utf8')
-      assert.ok(text.length > 0, `后端模块 ${rel} 不得为空（readConsoleServerSource 会静默少拼一段）`)
-      return text
-    })
-    .join('\n')
-}
-
 // ── 结构断言层（assertshape C1）──────────────────────────────────────────────
 // 本文件里「读源码文本再 includes」的断言守的是三件不同的事，各用对应的判据，都不再比对源码字符串：
 //   ① 接线（谁调用谁 / 实参是什么 / 导出了什么）→ AST（source_model + ast_query）；
@@ -14731,7 +14708,6 @@ async function main () {
     assert.ok(onUnload && callSites(onUnload.init, 'pushDraftNow').length === 1, 'beforeunload 里也必须补发服务器草稿（keepalive）')
   })
   await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
-    const src = readConsoleSource()
     const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
     const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
@@ -14826,9 +14802,25 @@ async function main () {
       n.right.type === 'Literal' && n.right.value === '').length, 1,
     "beforeunload 必须设 e.returnValue = ''（只挂监听拦不住卸载）")
     // popstate 的挂载与处理器由下面的 popstateCall / onPopDecl（AST，唯一一处）判。
-    assert.ok(src.includes('__xbkFilterGuard'), '脏草稿必须在历史里压 sentinel，否则左滑直接退走')
-    assert.ok(src.includes("source: 'tab'") && src.includes("source: 'hash'") && src.includes("source: 'history'"),
-      '切页、hash 变化、浏览器后退三种来源都要能回到同一个拦截弹窗')
+    // sentinel：过滤页脏草稿时 pushState({__xbkFilterGuard:true})，App 真正切走时 replaceState 成 false。
+    const sentinelCallsOf = (model, method, value) => findAll(model, (n) => n.type === 'CallExpression' &&
+      memberPath(n.callee) === `window.history.${method}` && n.arguments[0] && n.arguments[0].type === 'ObjectExpression' &&
+      n.arguments[0].properties.some((prop) => prop.key && prop.key.name === '__xbkFilterGuard' &&
+        prop.value.type === 'Literal' && prop.value.value === value))
+    assert.strictEqual(sentinelCallsOf(pagesModel, 'pushState', true).length, 2,
+      '脏草稿必须在历史里压 sentinel（首次与取消后补压各一处，否则左滑直接退走）')
+    assert.strictEqual(sentinelCallsOf(uiModel, 'replaceState', false).length, 1,
+      '真正切走时必须把 sentinel 清成 false（否则后退会回到已无草稿的过滤页旧记录）')
+    // 三种来源（tab / hash / history）都要把 source 交给同一个拦截弹窗——只判名字出现在源码里不算。
+    const leaveReqObjectsOf = (root, value) => findAll(root, (n) => n.type === 'ObjectExpression' &&
+      n.properties.some((prop) => prop.key && prop.key.name === 'source' && prop.value.type === 'Literal' && prop.value.value === value))
+    const switchTabOwner = uiDecl('switchTab')
+    const hashOwner = findFirst(uiModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onHash')
+    assert.ok(hashOwner, '必须有 onHash（hash 变化也要能回到拦截弹窗）')
+    assert.deepStrictEqual(callSites(switchTabOwner, 'setLeaveRequest').map((call) => argLabel(call.arguments[0])),
+      ['{ target: next, source: "tab" }'], '切页必须把 source: tab 交给拦截弹窗（含 target）')
+    assert.deepStrictEqual(leaveReqObjectsOf(hashOwner, 'hash').map(objectKeyNames), [['target', 'source']],
+      'hash 变化必须把 source: hash 交给拦截弹窗（含 target）')
     // v3.507（横扫 ①）：`src.includes('onLeaveRequestRef.current')` 与 `src.includes('guardRef')`
     // 只判名字出现（后者连 `filterGuardRef` 的子串都能满足）——删掉读写点、只留声明/属性名照样绿。
     // 按 AST 判：popstate 的命名处理器必须真的从 ref 读最新回调；guardRef 必须绑同一个 filterGuardRef。
@@ -14836,6 +14828,8 @@ async function main () {
     assert.strictEqual(popstateCall.length, 1, '手机左滑/后退必须挂一处 popstate')
     const onPopDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onPop')
     assert.ok(onPopDecl && exprLabel(popstateCall[0].arguments[1]) === 'onPop', 'popstate 必须挂命名处理器 onPop（便于逐条判）')
+    assert.deepStrictEqual(callSites(onPopDecl, 'onLeaveRequestRef.current').map((call) => argLabel(call.arguments[0])),
+      ['{ source: "history" }'], 'popstate 必须把 source: history 交给拦截弹窗（没有 target：继续走浏览器后退）')
     assert.ok(findAll(onPopDecl, (n) => n.type === 'MemberExpression' && memberPath(n) === 'onLeaveRequestRef.current').length >= 1,
       'popstate 回调必须用 ref 读最新值（只留声明会被旧闭包吃掉）')
     assert.ok(declaresVariable(uiModel, 'filterGuardRef'), 'App 必须持有过滤页的脏状态/保存/放弃 ref')
@@ -14851,164 +14845,482 @@ async function main () {
     const switchTabDecl = uiDecl('switchTab')
     assert.ok(switchTabDecl && findAll(switchTabDecl, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'guard && guard.dirty')).length === 1,
       '切页前必须检查过滤页脏状态（switchTab 里必须有 if (guard && guard.dirty) 门）')
-    assert.ok(src.includes('放弃草稿并回滚'), '回滚会覆盖草稿时必须把按钮文案说清楚')
-    assert.ok(src.includes('复制代码默认会把这些修改覆盖掉'), '复制默认会覆盖草稿时必须先确认')
+    const restoreDialog = elementsInFunction(pagesModel, 'FilterRulesPanel')
+      .find((el) => el.name === 'ConfirmDialog' && markup.attrText(el, 'title') === '确认回滚过滤规则')
+    assert.ok(restoreDialog, '回滚会覆盖草稿时必须先确认（确认回滚弹窗）')
+    assert.ok(sameShapeOf(markup.attrExpr(restoreDialog, 'confirmLabel'),
+      "busy === 'restore' ? '回滚中…' : dirtyFields.length > 0 ? '放弃草稿并回滚' : '确认回滚'"),
+    '回滚按钮文案必须按 busy / 脏草稿三态映射（含「放弃草稿并回滚」）')
+    const copyDialog = elementsInFunction(pagesModel, 'FilterRulesPanel')
+      .find((el) => el.name === 'ConfirmDialog' && markup.attrText(el, 'title') === '复制默认规则会覆盖草稿')
+    assert.ok(copyDialog, '复制默认会覆盖草稿时必须先确认（复制默认规则弹窗）')
+    assert.ok(markup.textOf(copyDialog).includes('复制代码默认会把这些修改覆盖掉'),
+      '复制默认会覆盖草稿时必须在弹窗里说清楚（文案绑在弹窗内）')
   })
 
   await aok('结构红线: v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）', () => {
-    const src = readConsoleSource()
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', 'app.css'), 'utf8')
-    // 只看真正的规则：注释里提到 overscroll-behavior-y 不算（否则删了声明测试照样绿）。
-    const cssLive = css.replace(/\/\*[\s\S]*?\*\//g, '')
+    const cssRules = cssRulesOf(css)
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    const appFn = findFirst(uiModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'App')
+    assert.ok(appFn, '必须能定位 App（下拉刷新的 App 侧接线都在它里面）')
+    const pullHook = markup.functionNodeOf(pagesModel, 'usePullToRefresh')
+    assert.ok(pullHook, '缺少下拉手势 hook（usePullToRefresh）')
+    const statusComp = markup.functionNodeOf(pagesModel, 'PullRefreshStatus')
+    assert.ok(statusComp, '缺少顶栏行内状态组件（PullRefreshStatus）')
+    const varInitOf = (root, name) => {
+      const decl = findFirst(root, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === name)
+      return decl && decl.init
+    }
     // ① 必须关掉内核原生下拉刷新：它就是「整页重载」的入口，不关掉后面做多少都是白搭。
-    assert.ok(/html,\s*body\s*\{[^}]*overscroll-behavior-y:\s*contain/.test(cssLive), '必须用 overscroll-behavior-y: contain 关掉 Chrome 原生下拉刷新')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, 'html', 'overscroll-behavior-y'), ['contain'],
+      '必须用 overscroll-behavior-y: contain 关掉 Chrome 原生下拉刷新')
     // ② 手势：被动监听；多指中断与 touchcancel 只复位不刷新。
-    assert.ok(src.includes('function usePullToRefresh'), '缺少下拉手势 hook')
-    assert.ok(src.includes("window.addEventListener('touchstart', onStart, { passive: true })"), 'touchstart 必须 passive')
-    assert.ok(src.includes("window.addEventListener('touchcancel', onCancel"), 'touchcancel 必须走 onCancel，不能当松手')
-    assert.ok(src.includes('const onCancel = () => { stop(); idle() }'), 'touchcancel 必须只停跟踪并复位，不触发刷新')
-    assert.ok(src.includes('if (!t || t.length !== 1) { r.lock = true; stop(); idle(); return }'), '多指按下必须作废本次手势')
-    assert.ok(src.includes('const PULL_TRIGGER = 56') && src.includes('dy * 0.5'), '阈值/阻尼必须固定（56px、0.5 倍）')
+    const windowListeners = callSites(pullHook, 'window.addEventListener')
+    const listenerOf = (event) => windowListeners.filter((call) => callArgLabels(call)[0] === `"${event}"`)
+    const touchStart = listenerOf('touchstart')
+    assert.strictEqual(touchStart.length, 1, 'touchstart 必须挂一处')
+    assert.deepStrictEqual(touchStart[0].arguments.map(argLabel), ['"touchstart"', 'onStart', '{ passive: true }'],
+      'touchstart 必须走 onStart 且 passive（否则滚动被阻塞）')
+    const touchCancel = listenerOf('touchcancel')
+    assert.strictEqual(touchCancel.length, 1, 'touchcancel 必须走 onCancel，不能当松手')
+    assert.deepStrictEqual(touchCancel[0].arguments.map(argLabel), ['"touchcancel"', 'onCancel', '{ passive: true }'],
+      'touchcancel 必须走 onCancel（当松手会误触发刷新）')
+    const onCancelInit = varInitOf(pullHook, 'onCancel')
+    assert.ok(onCancelInit && onCancelInit.type === 'ArrowFunctionExpression', 'touchcancel 必须挂命名处理器 onCancel')
+    assert.deepStrictEqual(callSeqOf(onCancelInit.body.body, 'onCancel 必须只停跟踪并复位'), ['stop()', 'idle()'],
+      'touchcancel 必须只停跟踪并复位，不触发刷新')
+    const multiTouch = findAll(pullHook, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!t || t.length !== 1'))
+    assert.strictEqual(multiTouch.length, 1, '多指按下必须有一条判定作废本次手势')
+    const multiBody = multiTouch[0].consequent.type === 'BlockStatement' ? multiTouch[0].consequent.body : []
+    assert.strictEqual(multiBody.length, 4, '多指门必须 lock + stop + idle + return 四步（掏空 = 多指下拉会误刷新）')
+    assert.ok(multiBody[0].type === 'ExpressionStatement' && multiBody[0].expression.type === 'AssignmentExpression' &&
+      exprLabel(multiBody[0].expression.left) === 'r.lock' && multiBody[0].expression.right.type === 'Literal' &&
+      multiBody[0].expression.right.value === true, '多指门必须先把 r.lock 置 true（否则后续 move 继续跟踪）')
+    assert.deepStrictEqual(callSeqOf(multiBody.slice(1, 3), '多指门必须停跟踪并复位'), ['stop()', 'idle()'])
+    assert.strictEqual(multiBody[3].type, 'ReturnStatement', '多指门必须 return（不得继续算位移）')
+    // 阈值/阻尼：56px 与 0.5 倍是手感契约，两处位移折算都必须按 0.5。
+    const pullTriggerInit = varInitOf(pagesModel, 'PULL_TRIGGER')
+    assert.ok(pullTriggerInit && pullTriggerInit.type === 'Literal' && pullTriggerInit.value === 56,
+      '松手阈值必须固定 56px')
+    assert.strictEqual(findAll(pullHook, (n) => sameShapeOf(n, 'dy * 0.5')).length, 1, '下拉位移必须按 0.5 倍阻尼折算')
+    assert.strictEqual(findAll(pullHook, (n) => sameShapeOf(n, 'r.dy * 0.5')).length, 1, '松手判定必须按同一份 0.5 倍位移')
     // ③ 内部已滚动的容器不算下拉：判定体必须真的看 scrollTop 与 overflowY。
-    const inScrolled = src.slice(src.indexOf('const inScrolled = (touch)'), src.indexOf('const onStart = (e)'))
-    assert.ok(inScrolled.includes('scrollTop > 0') && inScrolled.includes('overflowY'), 'inScrolled 必须检查 scrollTop 与 overflowY，不能空转 return false')
-    // ④ 三态文案写在顶栏「数据截至」这一行；不允许再用浮层盖住标题（v3.331 真机反馈）。
-    assert.ok(src.includes("'下拉刷新'") && src.includes("'松开刷新'") && src.includes("'正在刷新…'"), '必须有三态文案')
-    assert.ok(src.includes('function PullRefreshStatus'), '缺少顶栏行内状态组件')
-    assert.ok(!src.includes('PullRefreshBar') && !src.includes('class="ptr '), '不得再用浮层指示条')
-    assert.ok(!/\.ptr\s*\{[^}]*position:\s*fixed/.test(cssLive), '指示条不得 fixed 浮在标题上')
-    const syncRow = src.slice(src.indexOf('class="sync"'), src.indexOf('class="sync"') + 700)
-    assert.ok(/<\$\{PullRefreshStatus\} state=\$\{pull\.state\} \/>/.test(syncRow), '刷新状态必须渲染在 .sync 行内，且 state 必须来自 pull.state')
-    assert.ok(src.includes('syncRef.current.scrollLeft = 0'), '窄屏 .sync 被横向滑走时，下拉必须把它滚回最左，否则状态看不见')
-    // ⑤ 每个页签面板都要接到同一次下拉刷新（数量不够或张冠李戴都要拦住）。
+    const inScrolledInit = varInitOf(pullHook, 'inScrolled')
+    assert.ok(inScrolledInit && inScrolledInit.type === 'ArrowFunctionExpression' && inScrolledInit.params.length === 1 &&
+      inScrolledInit.params[0].name === 'touch', '必须有 inScrolled(touch) 判定')
+    assert.strictEqual(findAll(inScrolledInit, (n) => sameShapeOf(n, 'el.scrollTop > 0')).length, 1,
+      'inScrolled 必须真的判 scrollTop > 0（空转 return false 不算）')
+    assert.strictEqual(findAll(inScrolledInit, (n) => n.type === 'MemberExpression' && !n.computed && n.property.name === 'overflowY').length, 1,
+      'inScrolled 必须读 overflowY（只判 scrollTop 会把横滑容器当整页下拉）')
+    assert.strictEqual(findAll(inScrolledInit, (n) => n.type === 'CallExpression' && n.callee.type === 'MemberExpression' &&
+      n.callee.property.name === 'test' && n.arguments[0] && n.arguments[0].type === 'MemberExpression' &&
+      n.arguments[0].property.name === 'overflowY' && n.arguments[0].object.type === 'CallExpression' &&
+      exprLabel(n.arguments[0].object.callee) === 'window.getComputedStyle').length, 1,
+    'inScrolled 必须真的判 window.getComputedStyle(el).overflowY 是否 auto/scroll（正则必须喂给 overflowY）')
+    // 松手收口：刷新必须在微任务里开跑，失败也要 settle(true) 收起指示条；没面板接手立刻收起。
+    const onEndInit = varInitOf(pullHook, 'onEnd')
+    assert.ok(onEndInit && onEndInit.type === 'ArrowFunctionExpression' && onEndInit.body.type === 'BlockStatement',
+      '必须有 onEnd 处理器（松手判定与收口都在这里）')
+    const settleDecl = findFirst(onEndInit, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'settle')
+    assert.ok(settleDecl && settleDecl.init.type === 'ArrowFunctionExpression', '松手必须收在 settle(did) 里')
+    const holdCalc = findFirst(settleDecl, (n) => n.type === 'ConditionalExpression' && sameShapeOf(n.test, 'did === false'))
+    assert.ok(holdCalc && sameShapeOf(holdCalc.consequent, '0') && exprLabel(holdCalc.alternate).startsWith('Math.max('),
+      '没有面板接手（did === false）时 hold 必须为 0：条件与两支都要对，否则指示条会假装刷新')
+    const microRun = findAll(onEndInit, (n) => n.type === 'CallExpression' && n.callee.type === 'MemberExpression' &&
+      n.callee.property.name === 'then' && n.arguments.length === 2 &&
+      exprLabel(n.arguments[0]) === 'settle' && n.arguments[1].type === 'ArrowFunctionExpression' &&
+      n.arguments[1].body.type === 'CallExpression' && callLabel(n.arguments[1].body) === 'settle(true)')
+    assert.strictEqual(microRun.length, 1, '刷新必须落回 settle（异常分支也要 settle(true)，否则指示条永远转）')
+    assert.ok(microRun[0].callee.object.type === 'CallExpression' &&
+      microRun[0].callee.object.callee.property.name === 'then' &&
+      callArgLabels(microRun[0].callee.object).join(',') === 'onRefresh',
+    '刷新必须在微任务里由 onRefresh 承接（先让 busy 这一帧画出来）')
+    const onStartInit = varInitOf(pullHook, 'onStart')
+    assert.ok(onStartInit && onStartInit.type === 'ArrowFunctionExpression' && onStartInit.params.length === 1 &&
+      onStartInit.params[0].name === 'e', '必须有 onStart(e) 处理器')
+    // ④ 三态文案按 state 映射（test / consequent / alternate 三段都钉）。
+    const labelInit = varInitOf(statusComp, 'label')
+    assert.ok(labelInit && labelInit.type === 'ConditionalExpression', 'PullRefreshStatus 必须按 state 算文案')
+    assert.ok(sameShapeOf(labelInit, "state === 'busy' ? '正在刷新…' : state === 'ready' ? '松开刷新' : '下拉刷新'"),
+      '必须有三态文案：busy=正在刷新… / ready=松开刷新 / idle=下拉刷新')
+    // 不得再用浮层指示条：组件、静态 class 与 .ptr 规则三面都不许回来。
+    assert.ok(!consoleAssetElements().some((el) => el.name === 'PullRefreshBar') &&
+      !consoleAssetStrings().some((value) => value.includes('PullRefreshBar')) &&
+      !consoleAssetModels().some((model) => findAll(model, (n) => n.type === 'Identifier' && n.name === 'PullRefreshBar').length > 0),
+    '不得再用浮层指示条（PullRefreshBar：元素、字符串、标识符三面都不得出现）')
+    assert.deepStrictEqual(consoleAssetElements().flatMap((el) => markup.classNames(el)).filter((cls) => cls === 'ptr'), [],
+      '不得再用浮层指示条（静态 class 里不得有 ptr 指示条）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.ptr', 'position'), [], '指示条不得 fixed 浮在标题上（.ptr 不得有定位声明）')
+    // 刷新状态必须渲染在顶栏 .sync 行内，state 必须来自 pull.state。
+    const syncEl = elementsInFunction(uiModel, 'App').find((el) => markup.hasClass(el, 'sync') && markup.attrText(el, 'role') === 'group')
+    assert.ok(syncEl, '顶栏必须有 .sync 状态行')
+    const statusEls = markup.elementsNamed(syncEl, 'PullRefreshStatus')
+    assert.strictEqual(statusEls.length, 1, '刷新状态必须在 .sync 行内渲染且只有一处')
+    assert.strictEqual(exprLabel(markup.attrExpr(statusEls[0], 'state')), 'pull.state',
+      '刷新状态必须来自 pull.state（本地 state 会与手势脱节）')
+    // 窄屏 .sync 被横向滑走时，下拉必须把它滚回最左（且只在手势进行中）。
+    assert.strictEqual(findAll(appFn, (n) => n.type === 'IfStatement' &&
+      sameShapeOf(n.test, "pull.state !== 'idle' && syncRef.current") &&
+      findAll(n.consequent, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'syncRef.current.scrollLeft' &&
+        m.right.type === 'Literal' && m.right.value === 0).length === 1).length, 1,
+    '窄屏 .sync 被横向滑走时，下拉必须把它滚回最左（否则状态看不见）')
+    // ⑤ 每个页签面板都要接到同一次下拉刷新（函数体内必须真的调用 usePullRefresh，名字出现不算）。
     for (const name of ['RunHistoryPanel', 'TrendsPanel', 'CacheHealthPanel', 'MessagesPanel', 'LogsPanel', 'ConfigPanel', 'FilesPanel', 'SysPanel', 'FilterRulesPanel']) {
-      const at = src.indexOf('function ' + name + ' (')
-      const body = src.slice(at, src.indexOf('\nfunction ', at + 10))
-      assert.ok(at > 0 && body.includes('usePullRefresh('), `${name} 必须注册下拉刷新`)
+      const panel = markup.functionNodeOf(pagesModel, name)
+      assert.ok(panel, `${name} 必须存在（改名会让下拉刷新接线丢失）`)
+      const calls = callSites(panel, 'usePullRefresh')
+      assert.strictEqual(calls.length, 1, `${name} 必须恰有一处 usePullRefresh 注册`)
+      assert.strictEqual(calls[0].arguments.length, 2, `${name} 的 usePullRefresh 必须同时给 active 与 loader`)
+      if (name !== 'FilterRulesPanel') {
+        assert.strictEqual(exprLabel(calls[0].arguments[0]), 'active', `${name} 的 usePullRefresh 第一参必须是本面板的 active`)
+      }
+      assert.ok(['Identifier', 'ArrowFunctionExpression'].includes(calls[0].arguments[1].type) &&
+        exprLabel(calls[0].arguments[1]) !== 'active', `${name} 的第二参必须是加载回调，不能把 active 又传一遍`)
     }
     // ⑥ 过滤规则：有未保存改动时不注册，且请求在飞期间变脏要丢弃响应。
-    const filter = src.slice(src.indexOf('function FilterRulesPanel'), src.indexOf('\nfunction ', src.indexOf('function FilterRulesPanel') + 10))
-    assert.ok(filter.includes('usePullRefresh(active && dirtyFields.length === 0, load)'), '过滤规则页有未保存改动时不得刷新')
-    assert.ok(filter.includes('dirtyRef.current = dirtyFields.length > 0') || filter.includes('dirtyRef.current = dirty'), 'dirtyRef 必须随草稿状态更新')
-    assert.ok(filter.includes('if (dirtyRef.current) return'), '响应回来时草稿已变脏必须丢弃，不能覆盖用户改动')
+    const filterFn = markup.functionNodeOf(pagesModel, 'FilterRulesPanel')
+    assert.deepStrictEqual(callSites(filterFn, 'usePullRefresh').map(callLabel),
+      ['usePullRefresh(active && dirtyFields.length === 0, load)'],
+      '过滤规则页有未保存改动时不得刷新（active 门必须带 dirtyFields 判定）')
+    const dirtyWrite = findAll(filterFn, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'dirtyRef.current' &&
+      (sameShapeOf(n.right, 'dirty') || sameShapeOf(n.right, 'dirtyFields.length > 0')))
+    assert.strictEqual(dirtyWrite.length, 1, 'dirtyRef 必须随草稿状态更新（派生写点唯一）')
+    assert.ok(sameShapeOf(dirtyWrite[0].right, 'dirty') || sameShapeOf(dirtyWrite[0].right, 'dirtyFields.length > 0'),
+      'dirtyRef 必须由 dirty/dirtyFields 派生（写死常量会让丢弃判据失灵）')
+    const filterLoad = findFirst(filterFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'load')
+    assert.ok(filterLoad && filterLoad.init.type === 'CallExpression' && memberPath(filterLoad.init.callee) === 'useCallback',
+      'FilterRulesPanel 必须有 load（useCallback 包一层，依赖草稿状态）')
+    const fetchTry = findFirst(filterLoad, (n) => n.type === 'TryStatement' && n.block)
+    assert.ok(fetchTry, 'load 必须包在 try 里（失败路径才收得到）')
+    const dirtyGate = fetchTry.block.body.find((m) => m.type === 'IfStatement' && sameShapeOf(m.test, 'dirtyRef.current') &&
+      m.consequent.type === 'ReturnStatement' && m.consequent.argument === null)
+    assert.ok(dirtyGate, '草稿已变脏时必须裸 return（if (dirtyRef.current) return），不能带着返回值继续写')
+    assertGateBefore(fetchTry.block.body, 'dirtyRef.current', (stmt) => callSites(stmt, 'applyLoaded').length > 0,
+      '响应回来时草稿已变脏必须丢弃：if (dirtyRef.current) return 必须排在 applyLoaded 之前')
     // ⑦ 指示条要等所有 loader 落定；排队/在飞的请求不能被提前结算。
-    assert.ok(src.includes('Promise.allSettled([load(), loadAccess(), loadSettings()])'), 'SysPanel.refresh 必须交出三个 loader 的 promise（v3.342 设置块搬到系统页）')
-    assert.ok(src.includes('idleWaitersRef'), 'LogsPanel 排队路径必须等「在飞 + 补跑」结束再 resolve')
-    assert.ok(src.includes('window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail }))'), 'App 必须广播下拉刷新事件')
-    assert.ok(src.includes('if (detail.waits.length === 0) return false'), '当前页没有面板接手时不得发全局请求，也不假装刷新')
-    assert.ok(src.includes('Promise.resolve().then(onRefresh).then(settle'), '无面板接手时要立刻收起指示条（did === false）')
-    assert.ok(src.includes('refreshSplit(force ? { force: true } : undefined)') && src.includes('refreshActive({ force: true })'), '下拉必须绕过表单交互暂停（回前台补拉不绕）')
-    assert.ok(src.includes('Promise.allSettled([refreshSplit(force ? { force: true } : undefined), refreshAuto(), ...detail.waits])'), '必须等主轮询与所有面板一起落定')
+    const sysFn = markup.functionNodeOf(pagesModel, 'SysPanel')
+    assert.ok(sysFn, '必须能定位 SysPanel')
+    const refreshAllInit = varInitOf(sysFn, 'refreshAll')
+    assert.ok(refreshAllInit && refreshAllInit.type === 'ArrowFunctionExpression', 'SysPanel 必须有 refreshAll')
+    const settled = callSites(refreshAllInit, 'Promise.allSettled')
+    assert.strictEqual(settled.length, 1, 'SysPanel.refresh 必须只用一处 Promise.allSettled 收口')
+    const waitsArr = settled[0].arguments[0]
+    assert.ok(waitsArr && waitsArr.type === 'ArrayExpression', 'Promise.allSettled 必须收一份 loader 数组')
+    assert.deepStrictEqual(waitsArr.elements.map((el) => callLabel(el)), ['load()', 'loadAccess()', 'loadSettings()'],
+      '必须同时等规则/访问日志/设置三个 loader 落定（少一个指示条就会提前收起）')
+    // LogsPanel 排队路径：在飞 + 补跑都要等，finally 里排空 waiter。
+    const logsFn = markup.functionNodeOf(pagesModel, 'LogsPanel')
+    assert.ok(logsFn, '必须能定位 LogsPanel')
+    assert.ok(declaresVariable(logsFn, 'idleWaitersRef'), 'LogsPanel 必须持有 idleWaitersRef')
+    const waiterPush = findAll(logsFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'idleWaitersRef.current.push')
+    assert.strictEqual(waiterPush.length, 1, '排队路径必须把 resolve 登记到 idleWaitersRef（只留变量名不算）')
+    assert.deepStrictEqual(callArgLabels(waiterPush[0]), ['resolve'], '登记的必须是这条排队请求的 resolve')
+    const drainBody = (n) => n.body.type === 'BlockStatement' ? n.body.body : [n.body]
+    assert.strictEqual(findAll(logsFn, (n) => n.type === 'ForOfStatement' && exprLabel(n.right) === 'waiters' &&
+      drainBody(n).length === 1 && drainBody(n)[0].type === 'ExpressionStatement' &&
+      callLabel(drainBody(n)[0].expression) === 'done()').length, 1,
+    'finally 里必须逐个唤醒 waiter（在飞 + 补跑都结束才 resolve）')
+    // ⑧ App：广播事件、无面板接手立即收起、主轮询与面板一起落定。
+    const dispatchCalls = callSites(appFn, 'window.dispatchEvent')
+    assert.strictEqual(dispatchCalls.length, 1, 'App 必须恰有一处广播下拉事件')
+    const pullEvent = dispatchCalls[0].arguments[0]
+    assert.ok(pullEvent && pullEvent.type === 'NewExpression' && memberPath(pullEvent.callee) === 'CustomEvent', '必须广播 CustomEvent')
+    assert.strictEqual(exprLabel(pullEvent.arguments[0]), 'PULL_EVENT', '事件名必须用 PULL_EVENT 常量')
+    assert.deepStrictEqual(objectKeyNames(pullEvent.arguments[1]), ['detail'], '事件必须带 detail（waits 通过它收集）')
+    const refreshActiveDecl = findFirst(appFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refreshActive')
+    assert.ok(refreshActiveDecl && refreshActiveDecl.init.type === 'CallExpression' && memberPath(refreshActiveDecl.init.callee) === 'useCallback',
+      'App 必须持有 refreshActive')
+    const refreshActiveBody = refreshActiveDecl.init.arguments[0]
+    assert.ok(refreshActiveBody && refreshActiveBody.type === 'ArrowFunctionExpression' && refreshActiveBody.body.type === 'BlockStatement',
+      'refreshActive 必须是 async 箭头函数（指示条要等它落定）')
+    assert.strictEqual(findAll(refreshActiveBody, (n) => earlyExits('detail.waits.length === 0', false)(n)).length, 1,
+      '当前页没有面板接手时不得发全局请求，也不假装刷新（必须 return false）')
+    assertGateBefore(refreshActiveBody.body.body, 'detail.waits.length === 0',
+      (stmt) => callSites(stmt, 'Promise.allSettled').length > 0,
+      '无面板接手的门必须排在全局请求之前（门挪到请求后等于没守）')
+    const allSettled = callSites(refreshActiveBody, 'Promise.allSettled')
+    assert.strictEqual(allSettled.length, 1, 'refreshActive 必须只发一处 Promise.allSettled')
+    const waitArr = allSettled[0].arguments[0]
+    assert.ok(waitArr && waitArr.type === 'ArrayExpression' && waitArr.elements.length === 3,
+      '必须同时等主轮询/自动运行状态/所有面板')
+    const splitCall = waitArr.elements[0]
+    assert.ok(splitCall && splitCall.type === 'CallExpression' && exprLabel(splitCall.callee) === 'refreshSplit' &&
+      splitCall.arguments.length === 1 && sameShapeOf(splitCall.arguments[0], 'force ? { force: true } : undefined'),
+    '下拉必须绕过表单交互暂停（refreshSplit(force ? { force: true } : undefined)：条件与两支都要对）')
+    assert.strictEqual(callLabel(waitArr.elements[1]), 'refreshAuto()', '必须等自动运行状态')
+    assert.ok(waitArr.elements[2].type === 'SpreadElement' && exprLabel(waitArr.elements[2].argument) === 'detail.waits',
+      '必须把各面板的 waits 一起等')
+    // 三元三部分：条件 + 两支都钉（只钉两支会让 force 判定被对调逃逸）。
+    assert.strictEqual(findAll(refreshActiveBody, (n) => n.type === 'ConditionalExpression' &&
+      sameShapeOf(n, 'force ? { force: true } : undefined')).length, 1,
+    'force 三元必须 force ? { force: true } : undefined（条件/两支都要对）')
+    const pullRefreshDecl = findFirst(appFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'pullRefresh')
+    assert.ok(pullRefreshDecl && findAll(pullRefreshDecl, (n) => n.type === 'CallExpression' && callLabel(n) === 'refreshActive({ force: true })').length === 1,
+      '下拉刷新必须走 refreshActive({ force: true })（绕过表单交互暂停）')
     // ⑦ 长时间切后台再回来要静默补拉（不是每次切回来都拉，也不整页重载）。
-    assert.ok(src.includes('const VISIBLE_REFRESH_GAP_MS = 2000'), '回前台补拉必须有「刚刷完就切回来就跳过」的阈值')
-    const recovery = src.slice(src.indexOf('// 回到前台：隐藏期间所有轮询都停了'), src.indexOf('const pull = usePullToRefresh'))
-    assert.ok(recovery.includes("document.addEventListener('visibilitychange', onVis)"), '回前台补拉必须真的挂上 visibilitychange 监听（只有回调函数不算）')
-    assert.ok(recovery.includes('if (Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS) return'), '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
-    assert.ok(recovery.includes('refreshActive({ respectFormPause: true })'), '回前台补拉要走统一路径，且避开表单交互')
-    const refreshActiveBody = src.slice(src.indexOf('const refreshActive = useCallback'), src.indexOf('const pullRefresh = useCallback'))
-    assert.ok(refreshActiveBody.includes('lastRefreshRef.current = Date.now()'), '刷新成功必须推进时间戳（写在 refreshActive 内，别处的不算）')
-    assert.ok(refreshActiveBody.includes('if (ok) lastRefreshRef.current'), '失败的刷新不得推进时间戳，否则 30s 内不会再补')
-    assert.ok(refreshActiveBody.includes('formPauseUntilRef.current'), '回前台补拉必须在表单交互期间直接放弃')
-    // C7-006：判据从「最后发出」（seq === autoSeqRef.current）改成「最后收到」——慢网（RTT
-    // 超过 2s 一拍）下前者会把每一发都判废，autoState 一次也落不下来。旧响应仍不得覆盖新
-    // 状态：守卫语义不变，只是换成「没有更大号的响应已落地才允许写」。
-    assert.ok(src.includes('if (seq > autoLandedRef.current'),
-      '自动运行状态响应要带序号守卫（按「最后收到」判序），旧响应不得覆盖新状态')
+    const visibleGap = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'VISIBLE_REFRESH_GAP_MS')
+    assert.ok(visibleGap && visibleGap.init.type === 'Literal' && visibleGap.init.value === 2000,
+      '回前台补拉必须有「刚刷完就切回来就跳过」的阈值（2000ms）')
+    const recoveryEffect = findAll(appFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
+      n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
+      findAll(n.arguments[0], (m) => m.type === 'CallExpression' && memberPath(m.callee) === 'refreshActive' &&
+        m.arguments.map(argLabel).includes('{ respectFormPause: true }')).length === 1)
+    assert.strictEqual(recoveryEffect.length, 1, '必须有回前台补拉的 effect')
+    const recoveryBody = recoveryEffect[0].arguments[0]
+    assert.strictEqual(findAll(recoveryBody, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'document.addEventListener' &&
+      callArgLabels(n).join(',') === '"visibilitychange",onVis').length, 1,
+    '回前台补拉必须真的挂上 visibilitychange 监听（只有回调函数不算）')
+    const onVisInit = varInitOf(recoveryBody, 'onVis')
+    assert.ok(onVisInit && onVisInit.type === 'ArrowFunctionExpression', 'visibilitychange 必须挂命名处理器 onVis')
+    assert.strictEqual(findAll(onVisInit, (n) => earlyExits('document.hidden')(n)).length, 1, '页面仍隐藏时不得发请求')
+    assert.strictEqual(findAll(onVisInit, (n) => earlyExits('Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS')(n) &&
+      n.consequent.type === 'ReturnStatement' && n.consequent.argument === null).length, 1,
+    '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
+    assertGateBefore(onVisInit.body.body, 'Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS',
+      (stmt) => callSites(stmt, 'refreshActive').length > 0,
+      '间隔门必须排在 refreshActive 之前（门挪到请求后等于每次切回都发）')
+    assert.strictEqual(findAll(recoveryBody, (n) => n.type === 'CallExpression' && callLabel(n) === 'refreshActive({ respectFormPause: true })').length, 1,
+      '回前台补拉要走统一路径，且避开表单交互')
+    // 刷新成功必须推进时间戳，失败不得推进（写在 refreshActive 内）。
+    assert.strictEqual(findAll(refreshActiveBody, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'ok') &&
+      findAll(n.consequent, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'lastRefreshRef.current' &&
+        callSites(m.right, 'Date.now').length === 1).length === 1).length, 1,
+    '刷新成功必须推进时间戳（if (ok) lastRefreshRef.current = Date.now()）')
+    const pauseGate = findAll(refreshActiveBody, (n) => earlyExits('opts.respectFormPause && Date.now() < formPauseUntilRef.current', false)(n))
+    assert.strictEqual(pauseGate.length, 1, '回前台补拉必须在表单交互期间直接放弃（if (opts.respectFormPause && 未到期) return false）')
+    const dispatchAt = refreshActiveBody.body.body.findIndex((stmt) => callSites(stmt, 'window.dispatchEvent').length > 0)
+    assert.ok(pauseGate[0] && refreshActiveBody.body.body.indexOf(pauseGate[0]) < dispatchAt,
+      '表单暂停门必须排在广播事件之前（门挪到后面，面板已经收到事件并开始拉数据）')
+    // C7-006：「最后收到」序号守卫——旧响应不得覆盖新状态。
+    const seqGate = findAll(appFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'seq > autoLandedRef.current'))
+    assert.strictEqual(seqGate.length, 1, '自动运行状态响应要带序号守卫（按「最后收到」判序）')
+    assert.strictEqual(findAll(seqGate[0].consequent, (n) => n.type === 'AssignmentExpression' &&
+      exprLabel(n.left) === 'autoLandedRef.current' && sameShapeOf(n.right, 'seq')).length, 1,
+    '守卫里必须先把 autoLandedRef 推进到本条序号')
+    assert.strictEqual(findAll(seqGate[0].consequent, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setAutoState' &&
+      callArgLabels(n).join(',') === 'data.auto').length, 1,
+    '只有通过序号守卫的响应才能改 autoState（旧响应不得覆盖新状态）')
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
-    const logsPanel = src.slice(src.indexOf('function LogsPanel'), src.indexOf('function ConfigPanel'))
-    assert.ok(!/addEventListener\('visibilitychange'/.test(logsPanel), '日志页不得再自己挂 visibilitychange（会与回前台补拉重复请求）')
-    const cachePanel = src.slice(src.indexOf('function CacheHealthPanel'), src.indexOf('function FilesPanel'))
-    assert.ok(!/addEventListener\('visibilitychange'/.test(cachePanel), '缓存健康不得再自己挂 visibilitychange（会与回前台补拉重复请求）')
+    for (const name of ['LogsPanel', 'CacheHealthPanel']) {
+      const panel = markup.functionNodeOf(pagesModel, name)
+      assert.ok(panel, `${name} 必须存在`)
+      assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'document.addEventListener' &&
+        callArgLabels(n)[0] === '"visibilitychange"').length, 0,
+      `${name} 不得再自己挂 visibilitychange（会与回前台补拉重复请求）`)
+    }
     // ⑧ 整条下拉路径（手势 + App 回调）都不得整页重载。
-    const gesture = src.slice(src.indexOf('function usePullToRefresh'), src.indexOf('function PullRefreshStatus'))
-    const appPull = src.slice(src.indexOf('const pullRefresh = useCallback'), src.indexOf('const pull = usePullToRefresh'))
-    assert.ok(!/location\.reload|location\.href\s*=/.test(gesture + appPull), '下拉刷新不得整页重载')
+    const reloadSitesOf = (root) => findAll(root, (n) => (n.type === 'MemberExpression' && memberPath(n) === 'location.reload') ||
+      (n.type === 'AssignmentExpression' && exprLabel(n.left) === 'location.href'))
+    assert.strictEqual(reloadSitesOf(pullHook).length + reloadSitesOf(statusComp).length +
+      reloadSitesOf(pullRefreshDecl).length + reloadSitesOf(refreshActiveDecl).length, 0,
+    '下拉刷新不得整页重载（location.reload / location.href 赋值）')
 
     // 结构红线: 快速刷新不得闪文案（v3.333）
     // 本地缓存命中时 loading 只存在 17ms（实测 512→529），「· 更新中…」和「刷新中…」
     // 跟着出现又消失就是一闪；只允许慢加载（>600ms）才显示。
-    assert.ok(src.includes('function useSlowFlag (on, delay = 600)'),
-      '必须有 useSlowFlag：loading 只闪十几毫秒时不得切文案')
-    const slowHook = src.slice(src.indexOf('function useSlowFlag'), src.indexOf('// 趋势天数选择器固定选项'))
-    assert.ok(slowHook.includes('if (!on) { setSlow(false); return undefined }'), 'useSlowFlag 关闭时必须立刻复位')
-    assert.ok(slowHook.includes('return slow && on'), 'useSlowFlag 必须在 on=false 的当帧就返回 false（完成后不得多渲染一帧提示）')
-    const msgPanel = src.slice(src.indexOf('function MessagesPanel'), src.indexOf('function LogsPanel'))
-    assert.ok(/ariaBusy=\$\{loading \? 'true' : 'false'\}/.test(src), '刷新按钮的 busy 必须真的传到 <button>（Button 转发 ariaBusy）')
-    const btnAt = msgPanel.indexOf('<$' + '{Button} variant="ghost" disabled=')
-    const msgRefreshBtn = msgPanel.slice(btnAt, msgPanel.indexOf('刷新<//>', btnAt))
-    assert.ok(msgRefreshBtn.length > 40, '必须能定位到刷新按钮的 JSX')
-    assert.ok(!msgRefreshBtn.includes('disabled=$' + '{loading}'), '刷新按钮不得因 loading 变灰：15ms 的 0.45 透明度就是一帧闪')
-    assert.ok(msgRefreshBtn.includes('disabled=$' + '{slowLoading}'), '只在慢加载时禁用刷新按钮')
-    const msgRefresh = msgPanel.slice(msgPanel.indexOf('const refreshNow = () => {'), msgPanel.indexOf('const [exporting', msgPanel.indexOf('const refreshNow = () => {')))
-    const guardAt = msgRefresh.indexOf('if (loading || busyRef.current) return')
-    const loadAt = msgRefresh.indexOf('load().catch')
-    assert.ok(guardAt > -1, '刷新必须有 in-flight 守护（覆盖自动/下拉刷新）')
-    assert.ok(loadAt > guardAt, '守护之后必须真的走到 load()，不能提前 return 成空操作')
-    assert.ok(!/return/.test(msgRefresh.slice(guardAt + 36, loadAt)), '守护之后到 load 之间不得再提前 return')
-    assert.ok(/aria-busy=\$\{ariaBusy\}/.test(src), 'Button 必须把 ariaBusy 渲染成原生 aria-busy')
-    assert.ok(msgPanel.includes('const slowLoading = useSlowFlag(loading)'),
-      '推送记录必须用 slowLoading 决定「更新中…」')
-    assert.ok(msgPanel.includes('slowLoading ? html`<span class="msg-loading"> · 更新中…</span>`'),
-      '「匹配 N 条」的后缀只能由 slowLoading 控制，不能用 loading')
+    const slowHookFn = markup.functionNodeOf(pagesModel, 'useSlowFlag')
+    assert.ok(slowHookFn, '必须有 useSlowFlag：loading 只闪十几毫秒时不得切文案')
+    assert.deepStrictEqual(slowHookFn.params.map((p) => (p.type === 'AssignmentPattern' ? `${p.left.name}=${exprLabel(p.right)}` : p.name)),
+      ['on', 'delay=600'], 'useSlowFlag 必须是 (on, delay = 600)（600ms 是慢加载门槛）')
+    const slowOff = findAll(slowHookFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!on') &&
+      n.consequent.type === 'BlockStatement' && n.consequent.body.length === 2 &&
+      n.consequent.body[0].type === 'ExpressionStatement' && callLabel(n.consequent.body[0].expression) === 'setSlow(false)' &&
+      n.consequent.body[1].type === 'ReturnStatement' && n.consequent.body[1].argument &&
+      n.consequent.body[1].argument.type === 'Identifier' && n.consequent.body[1].argument.name === 'undefined')
+    assert.strictEqual(slowOff.length, 1, 'useSlowFlag 关闭时必须立刻复位（if (!on) { setSlow(false); return undefined }）')
+    assert.strictEqual(findAll(slowHookFn, (n) => n.type === 'ReturnStatement' && sameShapeOf(n.argument, 'slow && on')).length, 1,
+      'useSlowFlag 必须在 on=false 的当帧就返回 false（完成后不得多渲染一帧提示）')
+    const msgFn = markup.functionNodeOf(pagesModel, 'MessagesPanel')
+    assert.ok(msgFn, '必须能定位 MessagesPanel')
+    assert.strictEqual(findAll(msgFn, (n) => n.type === 'CallExpression' && callLabel(n) === 'useSlowFlag(loading)').length, 1,
+      '推送记录必须用 slowLoading 决定「更新中…」（useSlowFlag(loading)）')
+    const msgEls = elementsInFunction(pagesModel, 'MessagesPanel')
+    const refreshBtn = msgEls.find((el) => el.name === 'Button' && markup.textOf(el) === '刷新' && markup.attrExpr(el, 'ariaBusy'))
+    assert.ok(refreshBtn, '推送记录必须有刷新按钮（静态文案「刷新」，不得改文案挤动导出按钮）')
+    assert.strictEqual(exprLabel(markup.attrExpr(refreshBtn, 'disabled')), 'slowLoading',
+      '刷新按钮只能在慢加载时禁用（绑 loading 会一帧闪）')
+    assert.ok(sameShapeOf(markup.attrExpr(refreshBtn, 'ariaBusy'), "loading ? 'true' : 'false'"),
+      '刷新按钮的 busy 必须真的传到 <button>（ariaBusy 绑 loading 三元，三部分都要对）')
+    const buttonEl = markup.allElements(markup.markupOf(markup.templateOfFunction(componentsModel, 'Button'), { expandTemplates: true }))[0]
+    assert.strictEqual(exprLabel(markup.attrExpr(buttonEl, 'aria-busy')), 'ariaBusy',
+      'Button 必须把 ariaBusy 渲染成原生 aria-busy')
+    const refreshNowInit = varInitOf(msgFn, 'refreshNow')
+    assert.ok(refreshNowInit && refreshNowInit.type === 'ArrowFunctionExpression' && refreshNowInit.body.type === 'BlockStatement',
+      '推送记录必须有 refreshNow 处理器')
+    assert.strictEqual(findAll(refreshNowInit, (n) => earlyExits('loading || busyRef.current')(n)).length, 1,
+      '刷新必须有 in-flight 守护（覆盖自动/下拉刷新）')
+    assertGateBefore(refreshNowInit.body.body, 'loading || busyRef.current',
+      (stmt) => callSites(stmt, 'load').length > 0,
+      '守护之后必须真的走到 load()，不能提前 return 成空操作')
+    const gateAt = refreshNowInit.body.body.findIndex(earlyExits('loading || busyRef.current'))
+    const loadAt = refreshNowInit.body.body.findIndex((stmt) => callSites(stmt, 'load').length > 0)
+    const between = refreshNowInit.body.body.slice(gateAt + 1, loadAt)
+    assert.strictEqual(between.length, 1, '守护之后到 load 之间不得再插入别的语句（多一个 return 就把刷新变成空操作）')
+    assert.ok(between[0].type === 'ExpressionStatement' && between[0].expression.type === 'AssignmentExpression' &&
+      exprLabel(between[0].expression.left) === 'busyRef.current' && between[0].expression.right.type === 'Literal' &&
+      between[0].expression.right.value === true, '守护与 load 之间只允许置 busyRef = true')
+    const msgBusySpan = findAll(msgFn, (n) => n.type === 'ConditionalExpression' && sameShapeOf(n.test, 'slowLoading'))
+    assert.strictEqual(msgBusySpan.length, 1, '「更新中…」后缀只能由 slowLoading 控制，不能用 loading')
+    assert.deepStrictEqual(markup.allElements(markup.markupOf(msgBusySpan[0].consequent, { expandTemplates: true }))
+      .map((el) => el.name + '.' + markup.classNames(el).join('.')), ['span.msg-loading'],
+    '「更新中…」必须是 .msg-loading 的 span')
+    assert.ok(msgBusySpan[0].alternate.type === 'Literal' && msgBusySpan[0].alternate.value === '',
+      '非慢加载时不得渲染任何后缀（alternate 必须是空串）')
     // 首屏骨架（L4）：第一份数据回来前画占位；只在「还没有 data」时出现——自动刷新/切回
     // 已有数据的面板不得反复闪骨架。
-    assert.ok(src.includes('function PanelSkeleton ('), '必须有可复用的首屏骨架组件')
-    assert.ok(msgPanel.includes('loading && !data && html`<') && msgPanel.includes('PanelSkeleton'),
-      '首屏骨架必须由 loading && !data 门控（自动刷新不闪）')
+    assert.ok(markup.functionNodeOf(componentsModel, 'PanelSkeleton'), '必须有可复用的首屏骨架组件（PanelSkeleton）')
+    assert.strictEqual(findAll(msgFn, (n) => n.type === 'LogicalExpression' && n.operator === '&&' &&
+      sameShapeOf(n.left, 'loading && !data') && n.right.type === 'TaggedTemplateExpression' &&
+      findAll(n.right, (m) => m.type === 'Identifier' && m.name === 'PanelSkeleton').length === 1).length, 1,
+    '首屏骨架必须由 loading && !data 门控（自动刷新不闪）')
     // 加载失败（L4）：英文异常映射成中文原因，并给重试按钮（class retry-btn）。
-    const errMap = src.slice(src.indexOf('function loadErrorText'), src.indexOf('function usePanelLoader'))
-    assert.ok(errMap.includes('网络请求失败') && errMap.includes('服务器错误'),
-      'Failed to fetch 要映射成「网络请求失败」，5xx 映射成「服务器错误」')
-    const loadErrLine = 'setErr(`加载失败：' + '$' + '{loadErrorText(e)}`)'
-    assert.ok(src.includes(loadErrLine), 'loader 的 err 必须经 loadErrorText 映射，不得直接甩 e.message')
-    assert.ok(msgPanel.includes('<$' + '{LoadError}') && src.includes('class="retry-btn"'),
-      '推送记录加载失败必须给重试按钮（class retry-btn），且复用面板自己的 load()')
-    assert.ok(!src.includes("刷新中…' : '刷新'"),
-      '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
-    assert.ok(src.includes('slowLoading && html`<span class="fr-status-muted">刷新中…</span>`'),
-      '过滤规则的「刷新中…」同样只能慢加载才显示')
+    // 行为断言（式③）：直接执行生产里的纯函数，不看文案怎么拼。
+    const { loadErrorText } = evalPureFunctions(path.join(CONSOLE_ASSET_DIR, 'pages.js'), ['loadErrorText'],
+      { isTimeoutError: () => false })
+    assert.ok(loadErrorText(new Error('Failed to fetch')).includes('网络请求失败'),
+      'Failed to fetch 必须映射成「网络请求失败」')
+    assert.ok(loadErrorText(new Error('HTTP 502')).includes('服务器错误'),
+      '5xx 必须映射成「服务器错误」')
+    const loaderFn = markup.functionNodeOf(pagesModel, 'usePanelLoader')
+    assert.ok(loaderFn, '必须能定位 usePanelLoader（各面板共用的加载器）')
+    const loadErrCall = findAll(loaderFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setErr' &&
+      n.arguments[0] && n.arguments[0].type === 'TemplateLiteral' && n.arguments[0].expressions.length === 1)
+    assert.strictEqual(loadErrCall.length, 1, 'loader 的 err 必须经 loadErrorText 映射，不得直接甩 e.message')
+    assert.strictEqual(loadErrCall[0].arguments[0].quasis[0].value.raw, '加载失败：')
+    assert.deepStrictEqual(loadErrCall[0].arguments[0].expressions.map((expr) => callLabel(expr)), ['loadErrorText(e)'],
+      '失败文案必须把异常交给 loadErrorText（不是 e.message 原样拼）')
+    const loadErrEl = msgEls.find((el) => el.name === 'LoadError')
+    assert.ok(loadErrEl, '推送记录加载失败必须给重试按钮（复用 LoadError）')
+    const retryBtn = markup.allElements(markup.markupOf(markup.templateOfFunction(componentsModel, 'LoadError'), { expandTemplates: true }))
+      .find((el) => el.name === 'button' && markup.hasClass(el, 'retry-btn'))
+    assert.ok(retryBtn, 'LoadError 必须给 .retry-btn 重试按钮')
+    assert.strictEqual(exprLabel(markup.attrExpr(retryBtn, 'onClick')), 'onRetry', '重试必须复用面板自己的 load()（onRetry）')
+    assert.strictEqual(findAll(msgFn, (n) => n.type === 'ConditionalExpression' && sameShapeOf(n.test, 'loading') &&
+      stringValuesOf(n.consequent).some((value) => value.includes('刷新中…'))).length, 0,
+    '刷新按钮不得改文案：宽度变化会把导出按钮挤一下')
+    const frStatus = findAll(filterFn, (n) => n.type === 'LogicalExpression' && n.operator === '&&' &&
+      sameShapeOf(n.left, 'slowLoading') && n.right.type === 'TaggedTemplateExpression')
+    assert.strictEqual(frStatus.length, 1, '过滤规则的「刷新中…」同样只能慢加载才显示')
+    const frSpan = markup.allElements(markup.markupOf(frStatus[0].right, { expandTemplates: true }))
+    assert.deepStrictEqual(frSpan.map((el) => el.name + '.' + markup.classNames(el).join('.')), ['span.fr-status-muted'])
+    assert.strictEqual(markup.textOf(frSpan[0]), '刷新中…', '过滤规则慢加载文案必须是「刷新中…」')
   })
 
   // ── v3.332 部署后旧标签页提示 ─────────────────────────────────────────
   await aok('结构红线: v3.332 新版本提示（boot 版本 / 60s 对账 / 只提示不自动刷新）', () => {
     if (skipIfInstrumented('v3.332')) return
-    const src = readConsoleSource()
+    const src = readConsoleSource() // C8 段（乱序守卫 / 横幅文案）仍按源码定位；C7 段已改 AST
     const css = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets/app.css'), 'utf8')
-    const server = readConsoleServerSource()
+    const cssRules = cssRulesOf(css)
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const apiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'api.js'))
+    const constantsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'constants.js'))
     // 版本只有一份来源：boot JSON 与 /api/sys 共用 APP_VERSION，别再各自 require package.json。
     // 变异沙箱里 console.js 会被插桩：对象字面量与实参列表都被 stryMutAct_* 包裹，整句原文不再存在
     // ⇒ 这些「源码串」红线只在原始源文件上有意义，插桩环境必须跳过（行为断言照跑）。
     if (process.env.XBK_MUTATION_CHILD !== '1') {
-      assert.ok(server.includes('const APP_VERSION = (() => {'), '版本必须抽成单一 APP_VERSION')
-      assert.ok(server.includes('JSON.stringify({ token: bootToken, version: APP_VERSION, instance: instanceId })'),
-        'boot JSON 必须注入版本（前端据此判断自己是不是旧页面）与实例 id（快照命名空间）')
-      assert.ok(server.includes('const version = APP_VERSION'), '/api/sys 必须复用同一版本来源')
-      // 探针不能被缓存、不能挤掉访问日志，异常请求照记。
-      assert.ok(server.includes("res.setHeader('Cache-Control', 'no-store')"), '/api/sys 必须显式 no-store')
-      assert.ok(server.includes("url.searchParams.get('probe') === 'version'"), '探针必须可识别（probe=version）')
-      assert.ok(server.includes('if (!versionProbe && (url ? shouldLogAccess('), '探针 200 不入访问日志，401 等照记')
+      const consoleModel = loadModel(path.join(__dirname, 'scripts', 'console.js'))
+      const systemModel = loadModel(path.join(__dirname, 'scripts', 'console-handlers', 'system.js'))
+      const appVersionDecl = findFirst(consoleModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'APP_VERSION')
+      assert.ok(appVersionDecl && appVersionDecl.init.type === 'CallExpression' && appVersionDecl.init.callee.type === 'ArrowFunctionExpression',
+        '版本必须抽成单一 APP_VERSION（IIFE，唯一真源 package.json）')
+      assert.strictEqual(findAll(appVersionDecl.init, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'require' &&
+        n.arguments[0] && n.arguments[0].value === '../package.json').length, 1,
+      'APP_VERSION 必须从 package.json 读（不得另抄一份版本号）')
+      const bootJson = findAll(consoleModel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'JSON.stringify' &&
+        n.arguments[0] && n.arguments[0].type === 'ObjectExpression' &&
+        objectKeyNames(n.arguments[0]).join(',') === 'token,version,instance')
+      assert.strictEqual(bootJson.length, 1, 'boot JSON 必须注入 token/version/instance 三个字段')
+      assert.strictEqual(exprLabel(bootJson[0].arguments[0].properties.find((prop) => prop.key && prop.key.name === 'version').value), 'APP_VERSION',
+        'boot JSON 的 version 必须复用 APP_VERSION（前端据此判断旧页面）')
+      const getSys = findFirst(systemModel, (n) => (n.type === 'ObjectMethod' || n.type === 'Property') &&
+        n.key && n.key.name === 'getSys')
+      assert.ok(getSys && (getSys.type === 'ObjectMethod' || getSys.value), '/api/sys 必须由 system handler 的 getSys 提供')
+      assert.ok(findFirst(getSys, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'version' &&
+        sameShapeOf(n.init, 'APP_VERSION')), '/api/sys 必须复用同一版本来源（const version = APP_VERSION）')
+      assert.strictEqual(findAll(getSys, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'res.setHeader' &&
+        callArgLabels(n).join(',') === '"Cache-Control","no-store"').length, 1,
+      '/api/sys 必须显式 no-store（否则代理喂旧版本）')
+      assert.strictEqual(findAll(consoleModel, (n) => n.type === 'BinaryExpression' && n.operator === '===' &&
+        sameShapeOf(n.left, "url.searchParams.get('probe')") && n.right.type === 'Literal' && n.right.value === 'version').length, 1,
+      '探针必须可识别（probe=version）')
+      const probeLogGate = findAll(consoleModel, (n) => n.type === 'IfStatement' &&
+        sameShapeOf(n.test, '!versionProbe && (url ? shouldLogAccess(req.method, url.pathname, status) : true)'))
+      assert.strictEqual(probeLogGate.length, 1, '探针 200 不入访问日志，401 等照记（if (!versionProbe && …)）')
+      const accessPushes = callSites(probeLogGate[0].consequent, 'accessLog.push')
+      assert.strictEqual(accessPushes.length, 1, '访问日志必须落在「不是探针」的门内')
+      assert.strictEqual(accessPushes[0].arguments.length, 1, '每条访问日志必须写一条记录（一个对象参数）')
+      assert.strictEqual(accessPushes[0].arguments[0].type, 'ObjectExpression', '访问日志记录必须是对象字面量')
     }
     // 前端：读出 boot 版本，60s 对一次 /api/sys，只有不一致才提示。
-    assert.ok(src.includes("version: typeof data.version === 'string' ? data.version : ''"), 'readBoot 必须解析 version')
-    assert.ok(src.includes('const VERSION_CHECK_MS = 60000'), '对账间隔必须是 60s')
+    const bootFn = markup.functionNodeOf(apiModel, 'readBoot')
+    assert.ok(bootFn, '必须能定位 readBoot')
+    const bootReturn = findAll(bootFn, (n) => n.type === 'ReturnStatement' && n.argument && n.argument.type === 'ObjectExpression')
+      .find((ret) => ret.argument.properties.some((prop) => prop.key && prop.key.name === 'version' &&
+        prop.value.type === 'ConditionalExpression'))
+    const versionProp = bootReturn && bootReturn.argument.properties.find((prop) => prop.key && prop.key.name === 'version')
+    assert.ok(versionProp && versionProp.value.type === 'ConditionalExpression', 'readBoot 必须解析 version（三元兜底）')
+    assert.ok(sameShapeOf(versionProp.value, "typeof data.version === 'string' ? data.version : ''"),
+      'readBoot 的 version 必须 typeof 判定后回落空串（三部分都钉）')
+    const versionMs = findFirst(constantsModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'VERSION_CHECK_MS')
+    assert.ok(versionMs && versionMs.init.type === 'Literal' && versionMs.init.value === 60000, '对账间隔必须是 60s')
     // v3.335：系统页「检查更新」——页内下拉只换数据，旧页需要一个就地换脚本的入口。
-    const sysPanel = src.slice(src.indexOf('function SysPanel'), src.indexOf('function SysPanel') + 20000)
-    assert.ok(sysPanel.includes('apiGetSys({ probeVersion: true })'), '检查更新必须走 no-store 版本探针')
-    assert.ok(sysPanel.includes("v !== '' && v !== BOOT.version"), '检查更新必须比页面启动版本，不能比服务端自报')
-    assert.ok(/if \(v !== '' && v !== BOOT\.version\) \{[\s\S]{0,500}window\.location\.reload\(\)/.test(sysPanel),
-      'reload 必须落在「版本不同」这个分支里，不能无条件刷新')
-    assert.ok(sysPanel.includes('if (verBusyRef.current || verState === \'stale\') return'),
-      '同一 tick 连点只能发一次探针，且已排期刷新时再点不得取消那次 reload')
-    assert.ok(sysPanel.includes(": '检查更新'"), '空闲态按钮文案必须是「检查更新」')
-    assert.ok(sysPanel.includes("verState === 'latest' ? '✓ 已是最新' : verState === 'stale' ? '正在刷新…' : verState === 'error' ? '检查失败'"), '按钮文案必须按 latest/stale/error 正确映射（顺序写错不得通过）')
-    assert.ok(css.includes('.ver-check {') && css.includes('.ver-check.ok {'), '检查更新的按钮/成功态样式必须真的在 css 里')
-    assert.ok(sysPanel.includes('<span class="ver-line">'), '版本行必须用 .ver-line 容器排布')
-    assert.ok(/\.ver-check \{[^}]*white-space: nowrap/.test(css), '按钮文案不得按字换行')
-    assert.ok(sysPanel.includes("'✓ 已是最新'"), '状态写在按钮自己身上（不额外挂一枚胶囊）')
-    assert.ok(src.includes("if (stopped || document.visibilityState === 'hidden') return"), '页面隐藏时不得持续打接口')
-    assert.ok(src.includes('const bootVersion = BOOT.version'), '对账基准必须是页面启动版本')
-    assert.ok(src.includes('if (!bootVersion || authExpired) return undefined'), '凭证失效后必须停表（401 会刷日志）')
-    assert.ok(src.includes('}, [authExpired])'), 'authExpired 必须能重启/停掉对账')
+    const sysFn = markup.functionNodeOf(pagesModel, 'SysPanel')
+    assert.ok(sysFn, '必须能定位 SysPanel')
+    const checkVersionDecl = findFirst(sysFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'checkVersion')
+    assert.ok(checkVersionDecl && checkVersionDecl.init.type === 'ArrowFunctionExpression', 'SysPanel 必须有 checkVersion')
+    assert.deepStrictEqual(callSites(checkVersionDecl.init, 'apiGetSys').map((call) => argLabel(call.arguments[0])), ['{ probeVersion: true }'],
+      '检查更新必须走 no-store 版本探针（apiGetSys({ probeVersion: true })）')
+    const probeGate = findAll(checkVersionDecl.init, (n) => earlyExits("verBusyRef.current || verState === 'stale'")(n) &&
+      n.consequent.type === 'ReturnStatement' && n.consequent.argument === null)
+    assert.strictEqual(probeGate.length, 1, '同一 tick 连点只能发一次探针，且已排期刷新时再点不得取消那次 reload')
+    assert.strictEqual(checkVersionDecl.init.body.body.indexOf(probeGate[0]), 0,
+      '同步闸必须是 checkVersion 的第一条语句（state 要等重渲染，闸晚一步就会连发）')
+    const mismatch = findAll(checkVersionDecl.init, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "v !== '' && v !== BOOT.version"))
+    assert.strictEqual(mismatch.length, 1, '检查更新必须比页面启动版本，不能比服务端自报')
+    assert.strictEqual(findAll(mismatch[0].consequent, (n) => n.type === 'CallExpression' && callLabel(n) === 'setVerState("stale")').length, 1,
+      '版本不同必须先进入 stale 态（按钮文案要能显示「正在刷新…」）')
+    assert.strictEqual(findAll(mismatch[0].consequent, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setTimeout' &&
+      n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
+      findAll(n.arguments[0], (m) => m.type === 'CallExpression' && memberPath(m.callee) === 'window.location.reload').length === 1 &&
+      exprLabel(n.arguments[1]) === '600').length, 1,
+    'reload 必须落在「版本不同」这个分支里（setTimeout 里由用户可见的 stale 态触发），不能无条件刷新')
+    assert.strictEqual(findAll(sysFn, (n) => sameShapeOf(n,
+      "verState === 'checking' ? '检查中…' : verState === 'latest' ? '✓ 已是最新' : verState === 'stale' ? '正在刷新…' : verState === 'error' ? '检查失败' : '检查更新'")).length, 1,
+    '按钮文案必须按 checking/latest/stale/error/空闲 正确映射（顺序写错不得通过）')
+    assert.deepStrictEqual(cssDeclValuesOf(cssRules, '.ver-check', 'white-space'), ['nowrap'], '按钮文案不得按字换行')
+    assert.ok(cssDeclValuesOf(cssRules, '.ver-check.ok', 'color').length > 0, '检查更新的成功态样式必须真的在 css 里')
+    assert.strictEqual(elementsInFunction(pagesModel, 'SysPanel').filter((el) => el.name === 'span' && markup.hasClass(el, 'ver-line')).length, 1,
+      '版本行必须用 .ver-line 容器排布（唯一一处）')
+    // 版本对账 effect：bootVersion 基准、authExpired 停表、隐藏页不打接口。
+    const appFn = findFirst(uiModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'App')
+    assert.ok(appFn, '必须能定位 App')
+    const versionEffects = findAll(appFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
+      n.arguments[0] && n.arguments[0].type === 'ArrowFunctionExpression' &&
+      findAll(n.arguments[0], (m) => m.type === 'VariableDeclarator' && m.id.type === 'Identifier' && m.id.name === 'bootVersion').length === 1)
+    assert.strictEqual(versionEffects.length, 1, '必须有版本对账 effect（bootVersion 基准）')
+    const effectFn = versionEffects[0].arguments[0]
+    assert.deepStrictEqual(versionEffects[0].arguments[1] && versionEffects[0].arguments[1].elements.map(exprLabel), ['authExpired'],
+      'authExpired 必须能重启/停掉对账（依赖数组必须是 [authExpired]）')
+    const bootVersionDecl = findFirst(effectFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'bootVersion')
+    assert.ok(bootVersionDecl && sameShapeOf(bootVersionDecl.init, 'BOOT.version'), '对账基准必须是页面启动版本（BOOT.version）')
+    const authStop = findAll(effectFn, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!bootVersion || authExpired') &&
+      n.consequent.type === 'ReturnStatement' && n.consequent.argument && n.consequent.argument.type === 'Identifier' &&
+      n.consequent.argument.name === 'undefined')
+    assert.strictEqual(authStop.length, 1, '凭证失效后必须停表（if (!bootVersion || authExpired) return undefined）')
+    assertGateBefore(effectFn.body.body, '!bootVersion || authExpired', (stmt) => callSites(stmt, 'setInterval').length > 0,
+      '停表门必须排在 setInterval 之前（门挪到建表后等于没停）')
+    const checkDecl = findFirst(effectFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'check')
+    assert.ok(checkDecl && checkDecl.init.type === 'ArrowFunctionExpression', '版本探针必须有命名 check 回调')
+    const hiddenGate = findAll(checkDecl.init, (n) => earlyExits("stopped || document.visibilityState === 'hidden'")(n) &&
+      n.consequent.type === 'ReturnStatement' && n.consequent.argument === null)
+    assert.strictEqual(hiddenGate.length, 1, '页面隐藏时不得持续打接口')
+    assert.strictEqual(checkDecl.init.body.body.indexOf(hiddenGate[0]), 0, '隐藏门必须是 check 的第一条语句（否则隐藏期已经发了请求）')
     assert.ok(src.includes('if (stopped || mine < done) return'), '乱序响应必须丢弃（旧判定不得覆盖新判定）')
     assert.ok(src.includes("setNewVersion(v !== '' && v !== bootVersion ? v : '')"),
       '版本重新对齐（含回滚）必须收起提示，不得留过期横幅')
