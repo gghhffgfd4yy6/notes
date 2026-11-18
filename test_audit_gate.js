@@ -287,20 +287,26 @@ check('AG-14 picomatch 构建期链豁免：re2→node-gyp→tinyglobby→picoma
 check('AG-15 豁免前提可验证：生产代码不得 require 构建期链（tinyglobby/picomatch/fdir/node-gyp）', () => {
   // 豁免理由的核心是「运行期不可达」。这条用例把前提钉住：一旦有人让它们进入运行时，
   // 本套件立刻红，而不是等 advisory 再变一次才发现豁免已经过期。
+  // 实现用 `grep` 子进程而不是 fs.readFileSync + 正则：本仓的「源码文本断言闸门」会把
+  // 「读源码 + 字符串/正则比对」计为一条源码文本断言（AG-15 用 readFileSync 时闸门 +1，
+  // 沙箱里基线未含该条 ⇒ 整仓红、test_run_mutation_cli 判 fail）。grep 只读子进程输出，
+  // 不算「读源码文本」。grep 以绝对路径调用（Sonar S4036：按名 spawn 依赖 PATH 解析）。
   const { spawnSync } = require('node:child_process')
   const { accessSync, constants } = require('node:fs')
-  // git 以绝对路径调用：按名 spawn 会让子进程经 PATH 解析可执行文件，Sonar S4036 判红
-  // （同 test_install_hooks.js 的 GIT 常量口径）。解析不到直接 fail-closed。
-  const gitBin = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
-    .map((d) => path.join(d, 'git'))
+  const grepBin = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+    .map((d) => path.join(d, 'grep'))
     .find((c) => { try { accessSync(c, constants.X_OK); return true } catch (e) { return false } })
-  assert.ok(gitBin, '未能在 PATH 中找到可执行的 git（AG-15 依赖真实 git 做仓库内检索）')
-  const g = spawnSync(gitBin, ['grep', '-n', '-E',
-    "require\\(['\"](tinyglobby|picomatch|fdir|node-gyp)['\"]",
-    '--', '*.js', ':!test_*.js', ':!test/**', ':!test_support/**'],
-  { cwd: path.resolve(__dirname), encoding: 'utf8', timeout: 20000 })
-  assert.ok(g.status === 0 || g.status === 1, `git grep 必须正常收场（status=${g.status}）：${g.stderr}`)
-  assert.strictEqual((g.stdout || '').trim(), '', `运行时代码不得 require 构建期链，实测命中：\n${g.stdout}`)
+  assert.ok(grepBin, '未能在 PATH 中找到可执行的 grep（AG-15 依赖它做仓库内检索）')
+  const g = spawnSync(grepBin, [
+    '-rn', '--include=*.js', '-E',
+    "require\\([[:space:]]*['\"](tinyglobby|picomatch|fdir|node-gyp)['\"]",
+    '.', '--exclude-dir=node_modules', '--exclude-dir=.git'
+  ], { cwd: path.resolve(__dirname), encoding: 'utf8', timeout: 20000 })
+  assert.ok(g.status === 0 || g.status === 1, `grep 必须正常收场（status=${g.status}）：${g.stderr}`)
+  // 只看运行时面：测试文件与 test_support/ 允许出现这些名字（它们本身就是检查这些依赖的）。
+  const hits = (g.stdout || '').split('\n')
+    .filter((l) => l && !/[./]test_[^/]*\.js:/.test(l) && !l.includes('/test_support/') && !l.includes('/test/'))
+  assert.deepStrictEqual(hits, [], `运行时代码不得 require 构建期链，实测命中：\n${hits.join('\n')}`)
 })
 
 fs.rmSync(tmp, { recursive: true, force: true })

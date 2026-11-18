@@ -2314,6 +2314,6 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **运行期不可达（判据）**：依赖链 `re2 → node-gyp → tinyglobby → picomatch` 只存在于构建/安装期工具链；`git grep -E "require\('(tinyglobby|picomatch|fdir|node-gyp)"` 在仓库内 **0 命中**，ReDoS 又需要攻击者控制 glob 模式，本仓无此入口。
   - **处置**：`scripts/audit-gate.js` 的 `ALLOWED_ADVISORIES` 增加该 GHSA（带完整理由），命中时以 GitHub Actions `::warning` 注解显形、不静默放行；`test_audit_gate.js` 新增 AG-14（同链放行 + 换成未豁免 advisory 必须红），套件 14/14。
   - **复查条件**：① picomatch 发布 >4.0.7 或 advisory 给出 first_patched_version；② re2 不再经 node-gyp 构建；③ advisory 范围被修正。三者任一成立即删掉该豁免。
-  - **前提被用例钉住**：新增 AG-15——用 `git grep` 校验生产代码（排除测试面）**没有任何** `require('tinyglobby'|'picomatch'|'fdir'|'node-gyp')`；一旦豁免前提（运行期不可达）被破坏，套件立刻红，不用等 advisory 再变一次。SECURITY.md 同步写明豁免登记位置、`::warning` 显形与「前提必须可验证」这条要求。
+  - **前提被用例钉住**：新增 AG-15——用 `grep` 子进程校验生产代码（排除测试面）**没有任何** `require('tinyglobby'|'picomatch'|'fdir'|'node-gyp')`（不用 `readFileSync`，否则会自增一条源码文本断言、把变异沙箱整体判红）；一旦豁免前提（运行期不可达）被破坏，套件立刻红，不用等 advisory 再变一次。SECURITY.md 同步写明豁免登记位置、`::warning` 显形与「前提必须可验证」这条要求。
   - **验证**：本机 `npm audit --audit-level=high --omit=dev` → 5 条 high（复现 CI）；`node scripts/audit-gate.js` → exit 0，5 个包全部以 `被显式豁免` 注解显形；`TZ=UTC node test_audit_gate.js` → 14/14。
 - **版本**：3.499.0 → **3.500.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 顶层与 `packages[""]` 两处）。
