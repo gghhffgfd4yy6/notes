@@ -2307,3 +2307,13 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **账目（最终代码事实）**：1 条 must_fix = 式1 1（AST 结构断言）；该块 `assert` 调用数 **1 → 1**（未删未增，只把同一句的判据从「实参」扩到「被调名 + 实参」），`git diff HEAD -- test_console.js` 为 **-1 / +7** 行（净 +6：3 行注释 + `liveCall` / `liveCallee` / `liveArgs` 三个中间量，避免 `standard` 对跨行二元表达式报 indent）；式4 删除 **0**、无 `skip`、白名单未变。
 - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `控制台套件：通过 376 / 失败 0`，exit 0；`node scripts/check-source-text-asserts.js` → exit 0，`基线 total=1168（35 个文件），实测 total=1168`，`test_console.js` 白名单 **797**（未增未减）；`node scripts/probe-format-coupling.js test_console.js` → **exit 1**，首红 `结构红线: v3.385 复制兜底（非安全上下文 / 剪贴板被拒时仍能复制）: 必须用 textarea + execCommand 兜底（非安全上下文唯一可用路径）`，块起始 `test_console.js:13242`（判据行 `13249`——HEAD 为 `13236`/`13243`，本轮 +6 行偏移），该块属**下一段（C6）既有遗留**，判据仍是 `seg.includes(...)`，与本包无关；`npx standard test_console.js xbk_function_v3.js` → exit 0；`node check-version.js` → `✅ 版本四方一致：v3.499`。
 - **版本**：3.498.0 → **3.499.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 顶层与 `packages[""]` 两处）。
+
+## v3.500
+
+- **安全审计豁免：picomatch ReDoS（GHSA-fc5q-39xc-vjpf）**——`npm audit --audit-level=high` 报 5 条 high（fdir / node-gyp / picomatch / re2 / tinyglobby），全部同源于 picomatch `<=4.0.7`；registry 最新版即 4.0.7、GitHub 侧 `first_patched_version` 为 null ⇒ **无补丁可升**，等上游会让所有 PR 停摆。
+  - **运行期不可达（判据）**：依赖链 `re2 → node-gyp → tinyglobby → picomatch` 只存在于构建/安装期工具链；`git grep -E "require\('(tinyglobby|picomatch|fdir|node-gyp)"` 在仓库内 **0 命中**，ReDoS 又需要攻击者控制 glob 模式，本仓无此入口。
+  - **处置**：`scripts/audit-gate.js` 的 `ALLOWED_ADVISORIES` 增加该 GHSA（带完整理由），命中时以 GitHub Actions `::warning` 注解显形、不静默放行；`test_audit_gate.js` 新增 AG-14（同链放行 + 换成未豁免 advisory 必须红），套件 14/14。
+  - **复查条件**：① picomatch 发布 >4.0.7 或 advisory 给出 first_patched_version；② re2 不再经 node-gyp 构建；③ advisory 范围被修正。三者任一成立即删掉该豁免。
+  - **前提被用例钉住**：新增 AG-15——用 `grep` 子进程校验生产代码（排除测试面）**没有任何** `require('tinyglobby'|'picomatch'|'fdir'|'node-gyp')`（不用 `readFileSync`，否则会自增一条源码文本断言、把变异沙箱整体判红）；一旦豁免前提（运行期不可达）被破坏，套件立刻红，不用等 advisory 再变一次。SECURITY.md 同步写明豁免登记位置、`::warning` 显形与「前提必须可验证」这条要求。
+  - **验证**：本机 `npm audit --audit-level=high --omit=dev` → 5 条 high（复现 CI）；`node scripts/audit-gate.js` → exit 0，5 个包全部以 `被显式豁免` 注解显形；`TZ=UTC node test_audit_gate.js` → 14/14。
+- **版本**：3.499.0 → **3.500.0**（主文件头 banner / 本文件 / `package.json` / `package-lock.json` 顶层与 `packages[""]` 两处）。
