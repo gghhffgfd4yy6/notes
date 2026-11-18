@@ -288,7 +288,14 @@ check('AG-15 豁免前提可验证：生产代码不得 require 构建期链（t
   // 豁免理由的核心是「运行期不可达」。这条用例把前提钉住：一旦有人让它们进入运行时，
   // 本套件立刻红，而不是等 advisory 再变一次才发现豁免已经过期。
   const { spawnSync } = require('node:child_process')
-  const g = spawnSync('git', ['grep', '-n', '-E',
+  const { accessSync, constants } = require('node:fs')
+  // git 以绝对路径调用：按名 spawn 会让子进程经 PATH 解析可执行文件，Sonar S4036 判红
+  // （同 test_install_hooks.js 的 GIT 常量口径）。解析不到直接 fail-closed。
+  const gitBin = (process.env.PATH || '').split(path.delimiter).filter(Boolean)
+    .map((d) => path.join(d, 'git'))
+    .find((c) => { try { accessSync(c, constants.X_OK); return true } catch (e) { return false } })
+  assert.ok(gitBin, '未能在 PATH 中找到可执行的 git（AG-15 依赖真实 git 做仓库内检索）')
+  const g = spawnSync(gitBin, ['grep', '-n', '-E',
     "require\\(['\"](tinyglobby|picomatch|fdir|node-gyp)['\"]",
     '--', '*.js', ':!test_*.js', ':!test/**', ':!test_support/**'],
   { cwd: path.resolve(__dirname), encoding: 'utf8', timeout: 20000 })
