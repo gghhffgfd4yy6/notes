@@ -637,13 +637,24 @@ function callLabel (call) {
 // 用它比标签序列，不按源码文本比——插入一条 return、把回写挪到守卫之前都会改变这份序列
 // （assertshape C8）。
 function stmtLineOf (stmt) {
-  if (stmt.type === 'ReturnStatement') return 'return' + (stmt.argument ? ' ' + exprLabel(stmt.argument) : '')
+  // 返回值的调用也必须带实参：exprLabel 对 CallExpression 只给 `callee()`，`return mutate(x)`
+  // 与 `return mutate(null)` 同标签（同一类丢实参缺陷，assertshape C8 r5）。
+  if (stmt.type === 'ReturnStatement') {
+    if (!stmt.argument) return 'return'
+    return 'return ' + (stmt.argument.type === 'CallExpression' ? callLabel(stmt.argument) : exprLabel(stmt.argument))
+  }
+  // if + 单条调用：必须用 callLabel 带上实参。旧写法只取被调名 `exprLabel(callee)` 再拼一对空括号，
+  // 于是 `if (data && data.auto) setAutoState(data.auto)` 改成 `setAutoState(null)`
+  // （轮询成功后把自动运行配置清空）仍与判据同标签 ⇒ 套件全绿放行（assertshape C8 r5，
+  // r4 用本助手替换 C7-006 的 callArgLabels 值判据时引入的回归）。
   if (stmt.type === 'IfStatement' && stmt.consequent.type === 'ExpressionStatement' &&
       stmt.consequent.expression.type === 'CallExpression' && !stmt.alternate) {
-    return 'if (' + exprLabel(stmt.test) + ') ' + exprLabel(stmt.consequent.expression.callee) + '()'
+    return 'if (' + exprLabel(stmt.test) + ') ' + callLabel(stmt.consequent.expression)
   }
   if (stmt.type === 'IfStatement' && stmt.consequent.type === 'ReturnStatement') {
-    return 'if (' + exprLabel(stmt.test) + ') return' + (stmt.consequent.argument ? ' ' + exprLabel(stmt.consequent.argument) : '')
+    const arg = stmt.consequent.argument
+    const value = !arg ? '' : ' ' + (arg.type === 'CallExpression' ? callLabel(arg) : exprLabel(arg))
+    return 'if (' + exprLabel(stmt.test) + ') return' + value
   }
   if (stmt.type === 'ExpressionStatement' && stmt.expression.type === 'CallExpression') return callLabel(stmt.expression)
   if (stmt.type === 'ExpressionStatement' && stmt.expression.type === 'AssignmentExpression') {
@@ -15152,7 +15163,7 @@ async function main () {
     // 推进与 setAutoState 一起变成死代码（响应永远不落地）而套件仍绿；旧断言是逐字
     // `if (seq > autoLandedRef.current) { autoLandedRef.current = seq; if (data && data.auto) setAutoState(data.auto) }`。
     assert.deepStrictEqual(seqGate[0].consequent.body.map(stmtLineOf),
-      ['autoLandedRef.current = seq', 'if (data && data.auto) setAutoState()'],
+      ['autoLandedRef.current = seq', 'if (data && data.auto) setAutoState(data.auto)'],
       '守卫里必须先推进 autoLandedRef 再改 autoState：两步同块、次序固定（旧响应不得覆盖新状态）')
     // 面板不得再自带 visibilitychange 补拉：会和 App 的回前台补拉重复请求。
     // 负面判据按成员路径结尾比：任何 receiver（document / window / window.document）都不能挂，
@@ -16538,7 +16549,7 @@ async function main () {
     // 同一块的整段序列也要钉（C8 r4-A 横扫）：只判「块内出现过这条赋值」时，块首插一条
     // return 就让它变成死代码（这一发永远不落地、autoState 永远停在旧值）而套件仍绿。
     assert.deepStrictEqual(landedGate[0].consequent.body.map(stmtLineOf),
-      ['autoLandedRef.current = seq', 'if (data && data.auto) setAutoState()'],
+      ['autoLandedRef.current = seq', 'if (data && data.auto) setAutoState(data.auto)'],
       '落地后必须先记住已收到的号、再改状态：整块两步且次序固定（旧响应仍不得覆盖新状态）')
     // 落定必须放开在飞标记（成功/失败两条路都要放，否则一次失败后状态永久冻住）。
     const releaseArms = findAll(refreshFn, (n) => n.type === 'AssignmentExpression' &&
