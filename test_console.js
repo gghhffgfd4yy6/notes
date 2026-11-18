@@ -10902,10 +10902,11 @@ async function main () {
     const pages = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     assertShapeIn(pages, 'fmtBytes(BACKUP_FILE_MAX_BYTES)',
       '备份超限文案必须用 fmtBytes(BACKUP_FILE_MAX_BYTES) 拼出，写死数字后改常量会让提示说谎')
-    // 写死的「上限 48MB」不得再出现在任何会渲染出去的字面量 / 模板静态段里：注释既不能让上一条变绿
-    // （AST 里没有注释），也不会被渲染出去，因此这条与旧的「含注释全文件扫」结论一致。
-    assert.deepStrictEqual(stringValuesOf(pages).filter((text) => text.includes('上限 48MB')), [],
-      'pages.js 全文不得再出现写死的「上限 48MB」')
+    // 写死的「上限 48MB」不得再出现在任何会渲染出去的字面量 / 模板静态段里：扫描面 = 全部 7 个前端模块
+    // （consoleAssetStrings()，旧的 `!pagesSrc.includes(…)` 只扫 pages.js，搬去别的模块就漏）。注释既不能
+    // 让上一条变绿（AST 里没有注释），也不会被渲染出去。
+    assert.deepStrictEqual(consoleAssetStrings().filter((text) => text.includes('上限 48MB')), [],
+      '任何前端模块都不得再写死「上限 48MB」（数值只能由 BACKUP_FILE_MAX_BYTES 拼出）')
   })
 
   await aok('结构红线: 面板时长必须引用 constants 命名常量（回退修复即红）', () => {
@@ -14747,9 +14748,10 @@ async function main () {
       '弹窗必须同时接 busy 与取消 / 保存并继续 / 不保存并离开三个回调（缺一个就有按钮点了不响应）')
     assert.ok(stringValuesOf(dialog).some((value) => value.includes('点「不保存并离开」会丢掉这些修改')),
       '弹窗必须说清楚只有丢弃按钮才会丢修改，不能把自动草稿说成必丢')
-    assert.ok(!stringValuesOf(componentsModel).concat(stringValuesOf(pagesModel), stringValuesOf(uiModel))
-      .some((value) => value.includes('现在离开，这些修改会丢')),
-    '有自动草稿时不得再写“现在离开就会丢”')
+    // 扫描面 = 全部 7 个前端模块的字符串字面量 / 模板静态段（与旧 `!src.includes(…)` 同面）：
+    // 手写 components/pages/ui 三个 model 时，把这句话写回 constants/format/api/app 不会变红（r8-B）。
+    assert.ok(!consoleAssetStrings().some((value) => value.includes('现在离开，这些修改会丢')),
+      '有自动草稿时不得再写“现在离开就会丢”')
     assert.ok(stringValuesOf(dialog).some((value) => value.includes('保存并继续')), '离开拦截里的保存按钮要明确告诉用户保存后会继续')
     const guardSaveDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'beginGuardSave')
     assert.ok(guardSaveDecl, '保存并继续必须等待真正保存成功后再继续原操作（beginGuardSave）')

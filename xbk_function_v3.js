@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.508 — assertshape C6 第 7 轮评审修复：leaveSavingRef 的写 true/写 false 与 finally 复位收进 closeLeaveRequest 子树、三处早退门按 requestFilterLeave/onHash/switchTab 逐函数判，并将本块残留的 24 条读源码文本判据改判 AST（弹窗入参/文案、beginGuardSave→submitSave 链路、res.ok 才 resolve(true)、beforeunload/popstate、switchTab 脏状态门）；生产逻辑一行未改 *******
+//* ******* 线报酷推送脚本 v3.509 — assertshape C6 第 8 轮评审修复：负面文案断言的扫描面从手写的 3 个模块（components/pages/ui）收回全部 7 个前端模块（consoleAssetStrings()，与旧 readConsoleSource() 同面，motion.js 本就不在拼接清单里），并把「上限 48MB」那条单模块负向判据一并扩到全模块；同批横扫本包段负面判据，生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 

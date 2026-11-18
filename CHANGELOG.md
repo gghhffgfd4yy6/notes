@@ -2457,3 +2457,19 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 - **反向验证（一次性副本：`git archive HEAD` 解出 + `node_modules` 软链，全程 TZ=UTC）**：① 移动写 true → 新套件 `375 / 1`、exit 1（红点见上），同一破坏下 `git show HEAD:test_console.js` 的旧套件 `376 / 0`；② 把 `submitSave({ filter: candidate` 改成 `filter: draft` → 红在 `保存并继续必须把当前草稿（candidate）直接交给 submitSave`（证明改判后的 AST 判据不是空转）；③ 每次还原后 `cmp` 与原文逐字节一致，复跑 `376 / 0`、exit 0。
 - **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `通过 376 / 失败 0`；`node scripts/check-source-text-asserts.js` → exit 0（基线 total=885 / 实测 total=885，`test_console.js` 514/514 逐文件一致，只减不增；本轮已把基线从 909 同步下调到 885）；`node check-version.js` → 版本四方一致；`npx standard test_console.js xbk_function_v3.js` → exit 0。`node scripts/probe-format-coupling.js test_console.js` → **exit 1**：本块原本的红点（`保存并继续必须直接调用保存，不能再弹第二次确认`，`src.includes('submitSave({ filter: candidate')`）已消除，红点前移到下一段 `v3.330 页面内下拉刷新`（`touchstart 必须 passive`，块起点 `test_console.js:14856`、失败断言 `:14865`，属 C7 段，既有 deferral——v3.505 的 CHANGELOG 记过同族的「下一段 C7」红点）。
 - **版本**：3.507.0 → **3.508.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。
+
+## v3.509
+
+- **assertshape C6 第 8 轮评审修复（只改测试面 `test_console.js`；生产逻辑一行未改）**：唯一 must_fix 是「负面断言被放宽」。
+  - **问题**：`结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）` 里「现在离开，这些修改会丢」的缺席判据，旧写法是 `!readConsoleSource().includes(…)`（拼全部 7 个前端模块）；上一轮改 AST 时手写成 `stringValuesOf(componentsModel).concat(stringValuesOf(pagesModel), stringValuesOf(uiModel))`，扫描面从 7 个模块缩到 3 个。
+  - **后果（可复现）**：把这句话作为字符串字面量写进 `constants.js` / `format.js` / `api.js` / `app.js` 任意一个，套件仍 `376 / 0` 全绿 —— 真实用户可见的文案回归漏网（r8-B 实测）。
+  - **修法**：改用同文件已有的 `consoleAssetStrings()`（`test_console.js:175`，7 个模块的字符串字面量 / 模板静态段），扫描面与旧 `readConsoleSource()` 相同（`motion.js` 本来就不在 `readConsoleSource()` 的拼接清单里；注释不入判据是上一轮已定的 AST 语义）。`componentsModel` / `pagesModel` / `uiModel` 在本块其它断言里仍在用，声明未删。
+  - **反向验证（本工作树实跑，TZ=UTC）**：向 `scripts/console-assets/constants.js` 末尾追加 `const __NEG_PROBE = '现在离开，这些修改会丢'` → `通过 375 / 失败 1`、exit 1，红点 `结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）: 有自动草稿时不得再写“现在离开就会丢” (actual=false expected=true)`；`git checkout -- scripts/console-assets/constants.js` 恢复后 `通过 376 / 失败 0`、exit 0。
+- **同形状横扫（判据：负面「某句话 / 某个字面量必须消失」的断言，扫描面是手写的模块子集，而不是 `consoleAssetStrings()`）**：全文件 15 条，本包段命中 2 条、都改。
+  - ① 上面那条（3 模块 → 7 模块）。
+  - ② `结构红线: 备份超限文案必须由 BACKUP_FILE_MAX_BYTES 拼出（回退修复即红）` 的「上限 48MB」原为 `stringValuesOf(pages)`（单模块），已扩到 `consoleAssetStrings()`（`test_console.js:10908`）。实测：把该字面量写进 `ui.js` → 旧判据 `376 / 0` 全绿，新判据 `375 / 1`、红在 `任何前端模块都不得再写死「上限 48MB」（数值只能由 BACKUP_FILE_MAX_BYTES 拼出）`；恢复后绿。
+  - 另 8 条本就扫全 7 模块（`test_console.js:2660`、`3272`、`9432`、`10202`、`11561`、`13002`、`13189`、`14204`），不动。3 条是「只扫某个子树 / 某种取值」的另一种形状（`9796` 组件子树、`13754` 分支子树、`14534` 的 `dupMsg` 参数子树 —— 后两者即 r7-B 登记的 14204 / 14533 同族，保持 should_fix）。1 条扫的是测试夹具 AST（`4680`）。1 条在后端段（`8276` 的 `[runsModel, consoleModel]`，本包之外，未改、登记）。
+- **账目（可复算）**：源码文本断言白名单 **885 → 885**（两条都只是扩大扫描面，没有新增或删除源码文本断言；`test_console.js` 514/514 逐文件一致）；`assert.*` 调用点 **4416 → 4416**（无增删）；`git diff --numstat -- test_console.js` = **9 / 7**。
+- **闸门（TZ=UTC，本工作树实跑）**：`node test_console.js` → `通过 376 / 失败 0`；`node scripts/check-source-text-asserts.js` → exit 0（基线 total=885 / 实测 total=885）；`node check-version.js` → 版本四方一致；`npx standard test_console.js xbk_function_v3.js` → exit 0。
+- **格式耦合探针**：`node scripts/probe-format-coupling.js test_console.js` → exit 1，红点与上一轮逐字相同（`v3.330 页面内下拉刷新（不重载、立即响应、数据回来一次换）: touchstart 必须 passive`，属 C7 段的既有 deferral）。改动前后各跑一次：同一红点、同样扰动 75 个生产文件、还原校验一致 —— 本轮没有新增格式耦合。
+- **版本**：3.508.0 → **3.509.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。
