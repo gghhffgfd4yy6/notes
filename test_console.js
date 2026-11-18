@@ -569,6 +569,8 @@ function assertIfConditionIn (root, condition, why) {
 // （`if (!landRef.current) { /* noop */ }`）后受保护的代码照跑，旧判据全绿。
 // consequent 必须是 `return`，或一段**以 return 收尾**的块（refreshNow / changeMode 这种
 // 「门里先做事、最后早退」）；需要时再钉住返回的字面量（宽度门要的是 `return null`）。
+// ⚠️ 裸门**不要**用它：block 分支对「先做任何事、最后 return」一视同仁（C8 r7 的 C7-013 /
+// C7-019 就是这样被放行的）。裸门用 bareReturn，确实要在门内做事的块门用 blockExit。
 function earlyExits (testShape, returnValue) {
   return (node) => {
     if (node.type !== 'IfStatement' || !sameShapeOf(node.test, testShape)) return false
@@ -580,11 +582,40 @@ function earlyExits (testShape, returnValue) {
     return Boolean(last.argument) && last.argument.type === 'Literal' && last.argument.value === returnValue
   }
 }
-// 门的位置判据（assertshape C6 r5-B）：earlyExits 只回答「有没有一道真的 return 的门」，
-// 不回答它排在受保护的副作用之前还是之后——把门挪到 armLand()/清旗/请求之后，门形同虚设
-// 而旧判据全绿。这里取**函数体顶层语句下标**：门必须排在第一处受保护调用之前。
-function assertGateBefore (stmts, gateShape, protectedPred, why) {
-  const gateAt = stmts.findIndex(earlyExits(gateShape))
+// 「门就是那条 return」的精确判据（assertshape C8 r7）：earlyExits 为「门里先做事、最后早退」留的
+// block 分支把 `if (x) { sideEffect(); return }` 与 `if (x) return` 判成同一件事 ⇒ 门内可以夹带副作用
+// —— 隐藏页每拍照跑（C7-013）、单飞闸每拍自清（C7-019）都是这样绕过旧判据的。裸门一律用它：
+// consequent 必须**就是** ReturnStatement（哪怕只包一层 `{ return }` 也不命中）。
+function bareReturn (testShape, returnValue) {
+  return (node) => {
+    if (node.type !== 'IfStatement' || !sameShapeOf(node.test, testShape)) return false
+    if (node.consequent.type !== 'ReturnStatement') return false
+    if (returnValue === undefined) return true
+    return Boolean(node.consequent.argument) && node.consequent.argument.type === 'Literal' &&
+      node.consequent.argument.value === returnValue
+  }
+}
+// 「门里先做事、最后早退」的块门（同一轮横扫面）：确实要在门内做事的写法（doExport 先 setErr、
+// changeMode 先撤在飞的等待、onHash 先把地址改回 #/filter）只放行**逐条指定**的块体 —— preds 的
+// 条数必须等于块体条数-1、逐条命中，末尾必须是无实参 return。多夹一条（`{ refreshSplit(); return }`）
+// 不命中；这条把「块门」限定成白名单，而不是「任何以 return 收尾的块」。
+function blockExit (testShape, preds) {
+  return (node) => {
+    if (node.type !== 'IfStatement' || !sameShapeOf(node.test, testShape)) return false
+    if (node.consequent.type !== 'BlockStatement') return false
+    const body = node.consequent.body
+    if (body.length !== preds.length + 1) return false
+    const last = body[body.length - 1]
+    if (last.type !== 'ReturnStatement' || last.argument !== null) return false
+    return body.slice(0, -1).every((stmt, i) => preds[i](stmt))
+  }
+}
+// 门的位置判据（assertshape C6 r5-B / C8 r7）：只回答「有没有一道真的 return 的门」不够，
+// 还要回答它排在受保护的副作用之前还是之后——把门挪到 armLand()/清旗/请求之后，门形同虚设。
+// 取**函数体顶层语句下标**：门必须排在第一处受保护调用之前。gatePred 传 bareReturn / blockExit
+// 的产物（与同块的存在性判据同一口径），不再单收一个形状串——形状串只能落回早期 earlyExits。
+function assertGateBefore (stmts, gatePred, protectedPred, why) {
+  const gateAt = stmts.findIndex(gatePred)
   const protectedAt = stmts.findIndex(protectedPred)
   assert.ok(gateAt > -1 && protectedAt > -1 && gateAt < protectedAt,
     `${why}（门在第 ${gateAt} 条语句，受保护副作用在第 ${protectedAt} 条；门挪到后面/副作用插到门前等于没守卫）`)
@@ -13574,7 +13605,15 @@ async function main () {
     assert.ok(doExportDecl && doExportDecl.init.type === 'ArrowFunctionExpression', '必须有 doExport')
     const body = doExportDecl.init.body.body
     // 门必须真的早退：只按条件定位下标的话，`if (…) { void 0 }` 掏空后导出请求照发（明文出网）。
-    const secureAt = body.findIndex(earlyExits('!window.isSecureContext || !window.crypto || !window.crypto.subtle'))
+    // 门内要先 setErr（提示文案）再 return：块门也必须逐条指定，不能只要求「以 return 收尾」
+    // —— 否则门里可以顺手把导出请求发出去，而下面的「导出请求在后面」只能看到顶层语句（C8 r7 横扫）。
+    const secureGate = blockExit('!window.isSecureContext || !window.crypto || !window.crypto.subtle', [
+      (stmt) => stmt.type === 'ExpressionStatement' && stmt.expression.type === 'CallExpression' &&
+        memberPath(stmt.expression.callee) === 'setErr' && stmt.expression.arguments.length === 1 &&
+        stmt.expression.arguments[0].type === 'Literal' && typeof stmt.expression.arguments[0].value === 'string' &&
+        stmt.expression.arguments[0].value !== ''
+    ])
+    const secureAt = body.findIndex(secureGate)
     const apiAt = body.findIndex((stmt) => callSites(stmt, 'apiPostBackupExport').length > 0)
     assert.ok(secureAt > -1, '导出必须先检查 isSecureContext / WebCrypto（条件式要判整条 test，且门必须 return）')
     assert.ok(apiAt > -1, '导出必须请求 /api/backup/export')
@@ -13834,7 +13873,7 @@ async function main () {
     assert.ok(returns.some((n) => sameShapeOf(n.argument, 'Math.max(0, Math.min(top, max))')), '助手内必须有 Math.min 收口（不能算出文档外的目标）')
     // 宽度门必须自己 `return null`：只判「有个 if (!(rect.height > 0))」的话，把门掏空
     // （改成 `{ /* noop */ }`）照样全绿，于是 hidden 面板会算出一个落点把页面拽走。
-    assert.strictEqual(findAll(helper, earlyExits('!(rect.height > 0)', null)).length, 1,
+    assert.strictEqual(findAll(helper, bareReturn('!(rect.height > 0)', null)).length, 1,
       '面板 hidden/rect 为 0 时必须 `return null`（门要真的早退，不得只有条件）')
     for (const [name, file, eventKey, setCall] of [
       ['推送记录', 'MessagesPanel', 'page', 'setPage'],
@@ -13875,9 +13914,9 @@ async function main () {
       assert.ok(declaresVariable(seg, 'listRef') && declaresVariable(seg, 'landRef'), `${name}必须有列表 ref 与落点旗`)
       // 「只在置旗后落点」的门必须在调用之前：删掉它，每次 data/loading 变化都会把页面拽回列表顶。
       const landStmts = land.arguments[0].body.body
-      const gateAt = landStmts.findIndex(earlyExits('!landRef.current'))
+      const gateAt = landStmts.findIndex(bareReturn('!landRef.current'))
       const landCallAt = landStmts.findIndex((stmt) => callSites(stmt, 'listLandTarget').length > 0)
-      assert.strictEqual(landStmts.filter(earlyExits('!landRef.current')).length, 1,
+      assert.strictEqual(landStmts.filter(bareReturn('!landRef.current')).length, 1,
         `${name}落点 effect 必须有且只有一道「未置旗即返回」的门（!landRef.current 之后必须当场 return）`)
       assert.ok(gateAt > -1 && landCallAt > -1 && gateAt < landCallAt,
         `${name}落点门必须在 listLandTarget 之前（未置旗不得搬滚动位置）`)
@@ -13893,11 +13932,11 @@ async function main () {
       assert.strictEqual(callSites(armLand, 'stickyPad').length, 1, `${name}门必须按 .tabs 实测高度算（与 listLandTarget 同口径）`)
       assert.strictEqual(findAll(armLand, (n) => sameShapeOf(n, 'rect.top + window.scrollY - stickyPad()')).length, 1,
         `${name}门必须用同一份 stickyPad 口径`)
-      assert.strictEqual(findAll(armLand, earlyExits('!(rect.height > 0)')).length, 1,
+      assert.strictEqual(findAll(armLand, bareReturn('!(rect.height > 0)')).length, 1,
         `${name}面板隐藏/rect 为 0 时不得置旗（门必须真的早退）`)
       // 这道门必须排在裸置旗之前：挪到 `landRef.current = true` 之后就挡不住 hidden 面板置旗，
       // 下一次消费会把页面拽走（assertshape C6 r5-B）。
-      assertGateBefore(armLand.body.body, '!(rect.height > 0)',
+      assertGateBefore(armLand.body.body, bareReturn('!(rect.height > 0)'),
         (stmt) => findAll(stmt, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'landRef.current').length > 0,
         `${name}面板隐藏/rect 为 0 的门必须在置旗之前`)
     }
@@ -13909,16 +13948,19 @@ async function main () {
       ['data', 'loading', 'err', 'settleTick', 'page', 'size', 'cate', 'days', 'query'],
       '推送记录落点依赖必须完整（data/loading/err/settleTick/page/size/cate/days/query）')
     // 响应未回时必须保留旗子（跨过 loading）。
-    assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('loading')).length, 1,
+    assert.strictEqual(findAll(msgEffect.arguments[0], bareReturn('loading')).length, 1,
       '响应未回时必须保留旗子（跨过 loading，且必须真的 return）')
     // 「这次响应真的落地」门：data 换过**且没有错误**才落点，并且必须当场 return。
     // 只判 test 形状时把 consequent 掏空，旧数据的回包会清旗并滚走（清旗之后的 scrollTo 照跑）。
-    assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('data === armedDataRef.current && !err')).length, 1,
+    assert.strictEqual(findAll(msgEffect.arguments[0], bareReturn('data === armedDataRef.current && !err')).length, 1,
       '必须等这次响应落地（data 换过且没有错误）再落点，门必须真的 return（丢掉 !err 会让失败响应永不落地、旗子悬挂）')
     // 负面判据（origin/main 原有）：只判 data 引用的门不得再出现。放回一道裸门
     // `if (data === armedDataRef.current) return` 后，失败响应（data 引用不变、只有 err 变）从这道门
     // 提前返回 ⇒ 清旗不可达、旗子悬挂，下一次成功把用户拽到列表顶。只判「有 && !err 的门」时，
     // 裸门与合并门可以同时存在，旧断言能抓、新断言放行（assertshape C6 r4-A）。
+    // 负面判据**故意**用 block 口径（earlyExits）：门里夹带副作用再 return 同样是「单靠 data 引用
+    // 判断落地」的违规，放宽成裸 return 反而会漏掉 `{ …; return }` 那一支（C8 r7：负面判据要比
+    // 正面判据更宽，不能一起收紧）。
     assert.strictEqual(findAll(msgEffect.arguments[0], earlyExits('data === armedDataRef.current')).length, 0,
       '不得再单靠 data 引用判断落地（失败时 data 不变 ⇒ 清旗不可达）')
     // 消费即清旗：listLandTarget 返回 null 时不得重试。
@@ -13926,13 +13968,13 @@ async function main () {
     const isClearStmt = (stmt) => stmt.type === 'ExpressionStatement' &&
       stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current'
     const clearAt = msgStmts.findIndex(isClearStmt)
-    const nullAt = msgStmts.findIndex(earlyExits('y === null'))
+    const nullAt = msgStmts.findIndex(bareReturn('y === null'))
     assert.ok(clearAt > -1 && nullAt > -1 && clearAt < nullAt, '消费即清旗：listLandTarget 返回 null 时不得重试')
     // 两道「还不能落点」的门必须排在清旗之前：挪到清旗之后，旗子在响应未回/旧数据时就被消费掉，
     // 数据真正落地后不再落点（assertshape C6 r5-B）。
-    assertGateBefore(msgStmts, 'loading', isClearStmt,
+    assertGateBefore(msgStmts, bareReturn('loading'), isClearStmt,
       '响应未回时必须保留旗子（loading 门必须在清旗之前）')
-    assertGateBefore(msgStmts, 'data === armedDataRef.current && !err', isClearStmt,
+    assertGateBefore(msgStmts, bareReturn('data === armedDataRef.current && !err'), isClearStmt,
       '必须等这次响应落地再清旗（data + !err 门必须在清旗之前）')
     // 逐轮历史同样：清旗在 y === null 之前。
     const hist = markup.functionNodeOf(pagesModel, 'RunHistoryPanel')
@@ -13941,7 +13983,7 @@ async function main () {
     const histStmts = histEffect.arguments[0].body.body
     const hClearAt = histStmts.findIndex((stmt) => stmt.type === 'ExpressionStatement' &&
       stmt.expression.type === 'AssignmentExpression' && exprLabel(stmt.expression.left) === 'landRef.current')
-    const hNullAt = histStmts.findIndex(earlyExits('y === null'))
+    const hNullAt = histStmts.findIndex(bareReturn('y === null'))
     assert.ok(hClearAt > -1 && hNullAt > -1 && hClearAt < hNullAt, '逐轮历史消费即清旗：返回 null 不重试')
     // 旗只由主动路径置：纯 refreshNow / refresh() 不搬滚动位置。
     const refreshNow = findFirst(msg, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'refreshNow')
@@ -13977,7 +14019,7 @@ async function main () {
     const rangeSelect = msgEls.find((el) => el.name === 'MiniSelect' && markup.attrText(el, 'ariaLabel') === '时间范围')
     const rangeStmts = handlerStmts(rangeSelect, '推送记录必须有「时间范围」选择器')
     assert.strictEqual(rangeStmts.length, 5, '时间范围处理器必须是「挡自定义区间 → 置旗 → 清区间 → 换天数 → 回第 1 页」五步')
-    assert.ok(earlyExits('v === "__range"')(rangeStmts[0]),
+    assert.ok(bareReturn('v === "__range"')(rangeStmts[0]),
       '选自定义区间时只切到日期按钮，不得当场重拉（门必须真的 return）')
     assert.deepStrictEqual(callSeqOf(rangeStmts.slice(1), '时间范围处理器'),
       ['armLand()', 'setRange({ from: "", to: "" })', 'setDays(Number(v))', 'setPage(1)'],
@@ -13995,9 +14037,18 @@ async function main () {
     const changeModeFn = changeMode.init
     assert.ok(changeModeFn && changeModeFn.body && changeModeFn.body.type === 'BlockStatement', 'changeMode 必须是函数')
     const changeModeStmts = changeModeFn.body.body
-    assert.strictEqual(changeModeStmts.filter(earlyExits('m === mode')).length, 1,
-      '已选中的 chip 不得再置旗（必须先判 m === mode 并早退）')
-    assertGateBefore(changeModeStmts, 'm === mode', (stmt) => callSites(stmt, 'armLand').length > 0,
+    // 点回当前档、且没有在等快照：门内要先撤掉在飞的等待（四步）再 return，块门逐条指定 ——
+    // 多夹带一条（`{ load(); clearTimeout…; return }`）即不命中（C8 r7 横扫）。
+    const modeGate = blockExit('m === mode', [
+      (stmt) => stmtLineOf(stmt) === 'if (pendingMode === null) return',
+      (stmt) => stmtLineOf(stmt) === 'clearTimeout(pendingTimerRef.current)',
+      (stmt) => stmtLineOf(stmt) === 'pendingSeqRef.current++',
+      (stmt) => stmtLineOf(stmt) === 'setPendingMode(null)',
+      (stmt) => stmtLineOf(stmt) === 'setPendingBusy(false)'
+    ])
+    assert.strictEqual(changeModeStmts.filter(modeGate).length, 1,
+      '已选中的 chip 不得再置旗（必须先判 m === mode 并早退；门内只允许「撤在飞等待」四步）')
+    assertGateBefore(changeModeStmts, modeGate, (stmt) => callSites(stmt, 'armLand').length > 0,
       '已选中的 chip 不得再置旗（m === mode 门必须在 armLand 之前）')
     // chip 的 class 是拼出来的（'log-chip' + 选中态），按 role=group 的容器 + 按钮定位，不按 class 找。
     const chipGroup = elementsInFunction(pagesModel, 'RunHistoryPanel')
@@ -14016,18 +14067,18 @@ async function main () {
       !ancestorsOf(hist, n).some((node) => node.type === 'VariableDeclarator' && node.id.name === 'armLand')).length, 0,
     'chip 不得裸置旗（置旗只有 armLand 一条路径，各档位都要带值守卫）')
     const changeDay = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeDay')
-    assert.ok(changeDay && findAll(changeDay, earlyExits('v.from === runRange.from && v.to === runRange.to')).length === 1,
+    assert.ok(changeDay && findAll(changeDay, bareReturn('v.from === runRange.from && v.to === runRange.to')).length === 1,
       '区间没变不得置旗（值守卫必须当场 return，且必须在 armLand 之前）')
-    assertGateBefore(changeDay.init.body.body, 'v.from === runRange.from && v.to === runRange.to',
+    assertGateBefore(changeDay.init.body.body, bareReturn('v.from === runRange.from && v.to === runRange.to'),
       (stmt) => callSites(stmt, 'armLand').length > 0,
       '区间没变不得置旗（值守卫必须在 armLand 之前）')
     const changeSize = findFirst(hist, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'changeSize')
-    assert.ok(changeSize && findAll(changeSize, earlyExits('n === size')).length === 1,
+    assert.ok(changeSize && findAll(changeSize, bareReturn('n === size')).length === 1,
       '每页条数没变不得置旗（值守卫必须当场 return）')
     const changeSizeStmts = changeSize.init.body.body
-    assert.strictEqual(changeSizeStmts.filter(earlyExits('n === size')).length, 1,
+    assert.strictEqual(changeSizeStmts.filter(bareReturn('n === size')).length, 1,
       '每页条数没变不得置旗（值守卫必须在函数体顶层当场 return）')
-    assertGateBefore(changeSizeStmts, 'n === size', (stmt) => callSites(stmt, 'armLand').length > 0,
+    assertGateBefore(changeSizeStmts, bareReturn('n === size'), (stmt) => callSites(stmt, 'armLand').length > 0,
       '每页条数没变不得置旗（n === size 门必须在 armLand 之前）')
     // ③ 搜索落点：不得再看 activeElement（防抖触发时焦点必然还在输入框 ⇒ 主路径永不落点）。
     assert.strictEqual(findAll(msg, (n) => n.type === 'MemberExpression' && memberPath(n) === 'document.activeElement').length, 0,
@@ -14071,11 +14122,11 @@ async function main () {
     assert.ok(effect, '推送记录必须有落点 effect')
     const stmts = effect.arguments[0].body.body
     const idxOf = (pred) => stmts.findIndex(pred)
-    const settleGuardAt = idxOf(earlyExits('!(settleTick > armedSettleRef.current)'))
-    const seqGuardAt = idxOf(earlyExits('!(loadSeqRef.current > armedSeqRef.current)'))
+    const settleGuardAt = idxOf(bareReturn('!(settleTick > armedSettleRef.current)'))
+    const seqGuardAt = idxOf(bareReturn('!(loadSeqRef.current > armedSeqRef.current)'))
     const clearAt = idxOf((s) => s.type === 'ExpressionStatement' && s.expression.type === 'AssignmentExpression' &&
       exprLabel(s.expression.left) === 'landRef.current')
-    const errAt = idxOf(earlyExits('err'))
+    const errAt = idxOf(bareReturn('err'))
     const scrollAt = idxOf((s) => callSites(s, 'window.scrollTo').length > 0)
     // ① 代数没前进 ⇒ 先 return（保留旗子），不得提前清旗。
     assert.ok(settleGuardAt > -1 && settleGuardAt < clearAt,
@@ -14142,10 +14193,10 @@ async function main () {
       ['armLand()', 'setQuery(q)', 'setPage(1)'],
       '词变化时必须先置落点旗、把新词写下去、回第 1 页（顺序不能换；换实参 = 用旧词重刷/停在第 2 页）')
     // ⑨ 请求飞行期间用户自己滚动时撤销落点（浏览器夹取/锚定不算）。
-    assert.strictEqual(findAll(effect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
+    assert.strictEqual(findAll(effect.arguments[0], bareReturn('userMovedRef.current')).length, 1,
       '消费前必须检测用户是否自己滚走（门必须真的 return）')
     // 门必须排在 scrollTo 之前：挪到滚动之后，用户自己滚走也照样被拽回列表顶（assertshape C6 r5-B）。
-    assertGateBefore(effect.arguments[0].body.body, 'userMovedRef.current',
+    assertGateBefore(effect.arguments[0].body.body, bareReturn('userMovedRef.current'),
       (stmt) => callSites(stmt, 'window.scrollTo').length > 0,
       '消费前必须检测用户是否自己滚走（门必须在 scrollTo 之前）')
     for (const [name, panel] of [['推送记录', msg], ['逐轮历史', markup.functionNodeOf(pagesModel, 'RunHistoryPanel')]]) {
@@ -14169,9 +14220,9 @@ async function main () {
     assert.deepStrictEqual(['asyncLandRef', 'sawLoadingRef'].filter((name) =>
       findAll(histEffect.arguments[0], (n) => n.type === 'Identifier' && n.name === name).length > 0), [],
     '落点不得再等「重拉结算」：切档已原子化')
-    assert.strictEqual(findAll(histEffect.arguments[0], earlyExits('userMovedRef.current')).length, 1,
+    assert.strictEqual(findAll(histEffect.arguments[0], bareReturn('userMovedRef.current')).length, 1,
       '逐轮历史也要防用户自己滚走（门必须真的 return）')
-    assertGateBefore(histEffect.arguments[0].body.body, 'userMovedRef.current',
+    assertGateBefore(histEffect.arguments[0].body.body, bareReturn('userMovedRef.current'),
       (stmt) => callSites(stmt, 'window.scrollTo').length > 0,
       '逐轮历史防用户自己滚走的门必须在 scrollTo 之前')
     // 空结果时 .runs-scroll 也必须挂载（listRef 不能丢）：容器只受 status 门约束。
@@ -14296,12 +14347,12 @@ async function main () {
       'App 必须从设置读面取 syncShowDate（读面直接回 body，不是 { data }）')
     assert.ok(findAll(apply, (n) => sameShapeOf(n, "typeof body.settings.syncShowDate !== 'boolean'")).length >= 1,
       '只认布尔，读失败保持默认')
-    assert.strictEqual(findAll(apply, earlyExits('rev < uiSettingsRevRef.current')).length, 1,
+    assert.strictEqual(findAll(apply, bareReturn('rev < uiSettingsRevRef.current')).length, 1,
       '旧读响应不得覆盖新值（按 revision 判序：门必须真的 return，只判条件等于没判序）')
     // 门必须排在写 revision / setShowDate 之前：挪到写之后就挡不住旧响应覆盖新值（assertshape C6 r5-B）。
     const applyFn = apply.init.type === 'CallExpression' ? apply.init.arguments[0] : apply.init
     assert.ok(applyFn && applyFn.body && applyFn.body.type === 'BlockStatement', 'applyUiSettings 必须是函数')
-    assertGateBefore(applyFn.body.body, 'rev < uiSettingsRevRef.current',
+    assertGateBefore(applyFn.body.body, bareReturn('rev < uiSettingsRevRef.current'),
       (stmt) => findAll(stmt, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'uiSettingsRevRef.current').length > 0,
       '旧读响应不得覆盖新值（revision 门必须在写 revision/setShowDate 之前）')
     const sysEl = appEls.find((el) => el.name === 'SysPanel')
@@ -14319,10 +14370,10 @@ async function main () {
     const toggleProps = new Map(togglePost.arguments[0].properties.map((prop) => [prop.key.name, prop.value]))
     assert.deepStrictEqual([exprLabel(toggleProps.get('syncShowDate')), exprLabel(toggleProps.get('baseRevision'))],
       ['next', 'settingsLive.revision'], '开关保存必须传下一状态与当前 revision（乐观锁）')
-    assert.strictEqual(findAll(toggle, earlyExits('next === showDate')).length, 1,
+    assert.strictEqual(findAll(toggle, bareReturn('next === showDate')).length, 1,
       '同值不得发请求（勾回来不算一次修改：门必须真的 return）')
     // 门必须排在保存请求之前：挪到请求之后，勾回同值也会发一次写请求并重置 revision（assertshape C6 r5-B）。
-    assertGateBefore(toggle.init.body.body, 'next === showDate',
+    assertGateBefore(toggle.init.body.body, bareReturn('next === showDate'),
       (stmt) => callSites(stmt, 'apiPostConsoleSettings').length > 0,
       '同值不得发请求（next === showDate 门必须在 apiPostConsoleSettings 之前）')
     assert.strictEqual(findAll(block, (n) => n.type === 'ConditionalExpression' &&
@@ -14330,7 +14381,7 @@ async function main () {
     '读面必须校验布尔类型（读到脏值不得当成开关值）')
     // v3.507（assertshape C6 r6-A 横扫）：只数 .current 出现次数不算判据——删掉入口门后
     // 写 true + 写 false 仍是 2 处，套件照绿。这里按 AST 判「门 / 写 true / 写 false / finally 复位」。
-    assert.strictEqual(findAll(toggle, earlyExits('dateSavingRef.current')).length, 1,
+    assert.strictEqual(findAll(toggle, bareReturn('dateSavingRef.current')).length, 1,
       '开关入口必须先判 in-flight 旗（连点两次会发两次开关写请求：门必须真的 return）')
     const dateSavingWrites = (value) => findAll(toggle, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
       exprLabel(n.left) === 'dateSavingRef.current' && n.right.type === 'Literal' && n.right.value === value)
@@ -14645,9 +14696,9 @@ async function main () {
     const adjustWin = findFirst(block, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'adjustWin')
     assert.ok(adjustWin && saveWin.init && saveWin.init.body && saveWin.init.body.type === 'BlockStatement',
       '必须能定位 adjustWin 与带块体的 saveWin')
-    assert.strictEqual(findAll(adjustWin, earlyExits('winCurrent === null || winSavingRef.current')).length, 1,
+    assert.strictEqual(findAll(adjustWin, bareReturn('winCurrent === null || winSavingRef.current')).length, 1,
       '± 步进必须先用 in-flight 旗挡一道（保存中长按连加不得改草稿：门必须真的 return）')
-    assert.strictEqual(findAll(saveWin, earlyExits('winSavingRef.current')).length, 1,
+    assert.strictEqual(findAll(saveWin, bareReturn('winSavingRef.current')).length, 1,
       '保存入口必须先判 in-flight 旗（连点两次各带同一 baseRevision 发两发，第二次必 409）')
     const winSavingWrites = (value) => findAll(saveWin, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
       exprLabel(n.left) === 'winSavingRef.current' && n.right.type === 'Literal' && n.right.value === value)
@@ -14829,10 +14880,19 @@ async function main () {
     assert.ok(closeLeave && closeLeave.init && closeLeave.init.type === 'ArrowFunctionExpression',
       '必须有 closeLeaveRequest（离开拦截三选一）')
     // 三处门各在自己那条路径里：全模块凑够 3 处时，删掉某条路的门、在另一条路补两道照样绿。
-    for (const name of ['requestFilterLeave', 'onHash', 'switchTab']) {
+    // onHash 的门里要先把地址改回 #/filter 再 return（后退不得把地址留在被锁的页），其余两条是裸门；
+    // 按名字逐条钉，块门只放行那条改地址的语句（C8 r7 横扫：块门不能是「任意以 return 收尾的块」）。
+    const leaveGates = [
+      ['requestFilterLeave', bareReturn('leaveSavingRef.current')],
+      ['onHash', blockExit('leaveSavingRef.current', [
+        (stmt) => stmtLineOf(stmt) === 'if (window.location.hash !== "#/filter") window.history.replaceState(null, "", "#/filter")'
+      ])],
+      ['switchTab', bareReturn('leaveSavingRef.current')]
+    ]
+    for (const [name, gate] of leaveGates) {
       const owner = uiDecl(name)
       assert.ok(owner, `缺少 ${name}（落盘期间必须有一条路能早退）`)
-      assert.strictEqual(findAll(owner, earlyExits('leaveSavingRef.current')).length, 1,
+      assert.strictEqual(findAll(owner, gate).length, 1,
         `${name} 必须自己有一道 leaveSavingRef 早退（少一处就有一条路能在落盘中被切走）`)
     }
     const leaveSavingWrites = (value) => findAll(closeLeave, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
@@ -14916,14 +14976,21 @@ async function main () {
     const switchTabDecl = uiDecl('switchTab')
     assert.ok(switchTabDecl && findAll(switchTabDecl, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'guard && guard.dirty')).length === 1,
       '切页前必须检查过滤页脏状态（switchTab 里必须有 if (guard && guard.dirty) 门）')
-    const restoreDialog = elementsInFunction(pagesModel, 'FilterRulesPanel')
-      .find((el) => el.name === 'ConfirmDialog' && markup.attrText(el, 'title') === '确认回滚过滤规则')
+    // 按标题取，但**同标题必须恰好一个**（C8 r7 横扫）：`find` 只取第一个，再挂一个同标题的
+    // 副本（比如复制一份忘了加条件）仍会绿。
+    const restoreDialogs = elementsInFunction(pagesModel, 'FilterRulesPanel')
+      .filter((el) => el.name === 'ConfirmDialog' && markup.attrText(el, 'title') === '确认回滚过滤规则')
+    assert.strictEqual(restoreDialogs.length, 1,
+      `回滚确认弹窗必须恰好一个（实际 ${restoreDialogs.length} 个）`)
+    const restoreDialog = restoreDialogs[0]
     assert.ok(restoreDialog, '回滚会覆盖草稿时必须先确认（确认回滚弹窗）')
     assert.ok(sameShapeOf(markup.attrExpr(restoreDialog, 'confirmLabel'),
       "busy === 'restore' ? '回滚中…' : dirtyFields.length > 0 ? '放弃草稿并回滚' : '确认回滚'"),
     '回滚按钮文案必须按 busy / 脏草稿三态映射（含「放弃草稿并回滚」）')
-    const copyDialog = elementsInFunction(pagesModel, 'FilterRulesPanel')
-      .find((el) => el.name === 'ConfirmDialog' && markup.attrText(el, 'title') === '复制默认规则会覆盖草稿')
+    const copyDialogs = elementsInFunction(pagesModel, 'FilterRulesPanel')
+      .filter((el) => el.name === 'ConfirmDialog' && markup.attrText(el, 'title') === '复制默认规则会覆盖草稿')
+    assert.strictEqual(copyDialogs.length, 1, `复制默认规则确认弹窗必须恰好一个（实际 ${copyDialogs.length} 个）`)
+    const copyDialog = copyDialogs[0]
     assert.ok(copyDialog, '复制默认会覆盖草稿时必须先确认（复制默认规则弹窗）')
     assert.ok(markup.textOf(copyDialog).includes('复制代码默认会把这些修改覆盖掉'),
       '复制默认会覆盖草稿时必须在弹窗里说清楚（文案绑在弹窗内）')
@@ -15073,7 +15140,7 @@ async function main () {
     const dirtyGate = fetchTry.block.body.find((m) => m.type === 'IfStatement' && sameShapeOf(m.test, 'dirtyRef.current') &&
       m.consequent.type === 'ReturnStatement' && m.consequent.argument === null)
     assert.ok(dirtyGate, '草稿已变脏时必须裸 return（if (dirtyRef.current) return），不能带着返回值继续写')
-    assertGateBefore(fetchTry.block.body, 'dirtyRef.current', (stmt) => callSites(stmt, 'applyLoaded').length > 0,
+    assertGateBefore(fetchTry.block.body, bareReturn('dirtyRef.current'), (stmt) => callSites(stmt, 'applyLoaded').length > 0,
       '响应回来时草稿已变脏必须丢弃：if (dirtyRef.current) return 必须排在 applyLoaded 之前')
     // ⑦ 指示条要等所有 loader 落定；排队/在飞的请求不能被提前结算。
     const sysFn = markup.functionNodeOf(pagesModel, 'SysPanel')
@@ -15111,9 +15178,9 @@ async function main () {
     const refreshActiveBody = refreshActiveDecl.init.arguments[0]
     assert.ok(refreshActiveBody && refreshActiveBody.type === 'ArrowFunctionExpression' && refreshActiveBody.body.type === 'BlockStatement',
       'refreshActive 必须是 async 箭头函数（指示条要等它落定）')
-    assert.strictEqual(findAll(refreshActiveBody, (n) => earlyExits('detail.waits.length === 0', false)(n)).length, 1,
+    assert.strictEqual(findAll(refreshActiveBody, bareReturn('detail.waits.length === 0', false)).length, 1,
       '当前页没有面板接手时不得发全局请求，也不假装刷新（必须 return false）')
-    assertGateBefore(refreshActiveBody.body.body, 'detail.waits.length === 0',
+    assertGateBefore(refreshActiveBody.body.body, bareReturn('detail.waits.length === 0'),
       (stmt) => callSites(stmt, 'Promise.allSettled').length > 0,
       '无面板接手的门必须排在全局请求之前（门挪到请求后等于没守）')
     const allSettled = callSites(refreshActiveBody, 'Promise.allSettled')
@@ -15150,11 +15217,10 @@ async function main () {
     '回前台补拉必须真的挂上 visibilitychange 监听（只有回调函数不算）')
     const onVisInit = varInitOf(recoveryBody, 'onVis')
     assert.ok(onVisInit && onVisInit.type === 'ArrowFunctionExpression', 'visibilitychange 必须挂命名处理器 onVis')
-    assert.strictEqual(findAll(onVisInit, (n) => earlyExits('document.hidden')(n)).length, 1, '页面仍隐藏时不得发请求')
-    assert.strictEqual(findAll(onVisInit, (n) => earlyExits('Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS')(n) &&
-      n.consequent.type === 'ReturnStatement' && n.consequent.argument === null).length, 1,
-    '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
-    assertGateBefore(onVisInit.body.body, 'Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS',
+    assert.strictEqual(findAll(onVisInit, bareReturn('document.hidden')).length, 1, '页面仍隐藏时不得发请求')
+    assert.strictEqual(findAll(onVisInit, bareReturn('Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS')).length, 1,
+      '回前台补拉必须按距上次刷新判断，不能每次切回都发请求')
+    assertGateBefore(onVisInit.body.body, bareReturn('Date.now() - lastRefreshRef.current < VISIBLE_REFRESH_GAP_MS'),
       (stmt) => callSites(stmt, 'refreshActive').length > 0,
       '间隔门必须排在 refreshActive 之前（门挪到请求后等于每次切回都发）')
     assert.strictEqual(findAll(recoveryBody, (n) => n.type === 'CallExpression' && callLabel(n) === 'refreshActive({ respectFormPause: true })').length, 1,
@@ -15166,7 +15232,7 @@ async function main () {
       findAll(n.consequent, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'lastRefreshRef.current' &&
         callSites(m.right, 'Date.now').length === 1).length === 1).length, 1,
     '刷新成功必须推进时间戳（if (ok) lastRefreshRef.current = Date.now()）')
-    const pauseGate = findAll(refreshActiveBody, (n) => earlyExits('opts.respectFormPause && Date.now() < formPauseUntilRef.current', false)(n))
+    const pauseGate = findAll(refreshActiveBody, bareReturn('opts.respectFormPause && Date.now() < formPauseUntilRef.current', false))
     assert.strictEqual(pauseGate.length, 1, '回前台补拉必须在表单交互期间直接放弃（if (opts.respectFormPause && 未到期) return false）')
     const dispatchAt = refreshActiveBody.body.body.findIndex((stmt) => callSites(stmt, 'window.dispatchEvent').length > 0)
     assert.ok(pauseGate[0] && refreshActiveBody.body.body.indexOf(pauseGate[0]) < dispatchAt,
@@ -15246,12 +15312,12 @@ async function main () {
     const refreshNowInit = varInitOf(msgFn, 'refreshNow')
     assert.ok(refreshNowInit && refreshNowInit.type === 'ArrowFunctionExpression' && refreshNowInit.body.type === 'BlockStatement',
       '推送记录必须有 refreshNow 处理器')
-    assert.strictEqual(findAll(refreshNowInit, (n) => earlyExits('loading || busyRef.current')(n)).length, 1,
+    assert.strictEqual(findAll(refreshNowInit, bareReturn('loading || busyRef.current')).length, 1,
       '刷新必须有 in-flight 守护（覆盖自动/下拉刷新）')
-    assertGateBefore(refreshNowInit.body.body, 'loading || busyRef.current',
+    assertGateBefore(refreshNowInit.body.body, bareReturn('loading || busyRef.current'),
       (stmt) => callSites(stmt, 'load').length > 0,
       '守护之后必须真的走到 load()，不能提前 return 成空操作')
-    const gateAt = refreshNowInit.body.body.findIndex(earlyExits('loading || busyRef.current'))
+    const gateAt = refreshNowInit.body.body.findIndex(bareReturn('loading || busyRef.current'))
     const loadAt = refreshNowInit.body.body.findIndex((stmt) => callSites(stmt, 'load').length > 0)
     const between = refreshNowInit.body.body.slice(gateAt + 1, loadAt)
     assert.strictEqual(between.length, 1, '守护之后到 load 之间不得再插入别的语句（多一个 return 就把刷新变成空操作）')
@@ -15379,8 +15445,7 @@ async function main () {
     assert.ok(checkVersionDecl && checkVersionDecl.init.type === 'ArrowFunctionExpression', 'SysPanel 必须有 checkVersion')
     assert.deepStrictEqual(callSites(checkVersionDecl.init, 'apiGetSys').map((call) => argLabel(call.arguments[0])), ['{ probeVersion: true }'],
       '检查更新必须走 no-store 版本探针（apiGetSys({ probeVersion: true })）')
-    const probeGate = findAll(checkVersionDecl.init, (n) => earlyExits("verBusyRef.current || verState === 'stale'")(n) &&
-      n.consequent.type === 'ReturnStatement' && n.consequent.argument === null)
+    const probeGate = findAll(checkVersionDecl.init, bareReturn("verBusyRef.current || verState === 'stale'"))
     assert.strictEqual(probeGate.length, 1, '同一 tick 连点只能发一次探针，且已排期刷新时再点不得取消那次 reload')
     assert.strictEqual(checkVersionDecl.init.body.body.indexOf(probeGate[0]), 0,
       '同步闸必须是 checkVersion 的第一条语句（state 要等重渲染，闸晚一步就会连发）')
@@ -15419,12 +15484,11 @@ async function main () {
       n.consequent.type === 'ReturnStatement' && n.consequent.argument && n.consequent.argument.type === 'Identifier' &&
       n.consequent.argument.name === 'undefined')
     assert.strictEqual(authStop.length, 1, '凭证失效后必须停表（if (!bootVersion || authExpired) return undefined）')
-    assertGateBefore(effectFn.body.body, '!bootVersion || authExpired', (stmt) => callSites(stmt, 'setInterval').length > 0,
+    assertGateBefore(effectFn.body.body, bareReturn('!bootVersion || authExpired'), (stmt) => callSites(stmt, 'setInterval').length > 0,
       '停表门必须排在 setInterval 之前（门挪到建表后等于没停）')
     const checkDecl = findFirst(effectFn, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'check')
     assert.ok(checkDecl && checkDecl.init.type === 'ArrowFunctionExpression', '版本探针必须有命名 check 回调')
-    const hiddenGate = findAll(checkDecl.init, (n) => earlyExits("stopped || document.visibilityState === 'hidden'")(n) &&
-      n.consequent.type === 'ReturnStatement' && n.consequent.argument === null)
+    const hiddenGate = findAll(checkDecl.init, bareReturn("stopped || document.visibilityState === 'hidden'"))
     assert.strictEqual(hiddenGate.length, 1, '页面隐藏时不得持续打接口')
     assert.strictEqual(checkDecl.init.body.body.indexOf(hiddenGate[0]), 0, '隐藏门必须是 check 的第一条语句（否则隐藏期已经发了请求）')
     // 乱序守卫：`.then` 回调的第一条必须是「旧请求作废」的提前返回，且它排在回写之前——
@@ -15435,11 +15499,11 @@ async function main () {
     assert.strictEqual(probeThens.length, 1, '版本对账必须有一个 apiGetSys(…).then(…) 回调')
     const probeCb = probeThens[0].arguments[0]
     assert.ok(probeCb && probeCb.body && probeCb.body.type === 'BlockStatement', '对账回调必须是块体（判据对象）')
-    const staleGate = earlyExits('stopped || mine < done')
+    const staleGate = bareReturn('stopped || mine < done')
     assert.strictEqual(probeCb.body.body.filter(staleGate).length, 1,
       '乱序响应必须丢弃（if (stopped || mine < done) return，且 consequent 必须是 return）')
     assert.strictEqual(probeCb.body.body.findIndex(staleGate), 0, '乱序守卫必须是回调的第一条语句')
-    assertGateBefore(probeCb.body.body, 'stopped || mine < done',
+    assertGateBefore(probeCb.body.body, bareReturn('stopped || mine < done'),
       (stmt) => callSites(stmt, 'setNewVersion').length > 0 ||
         findAll(stmt, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n.left, 'done')).length > 0,
       '乱序守卫必须排在 done 记账与 setNewVersion 之前（门挪到回写之后等于没门）')
@@ -15515,7 +15579,16 @@ async function main () {
     const changeMode = changeDecl.init
     // 有快照：数据先于选中态落地（同一批渲染），首帧就是目标档。整段语句序列逐条比对——
     // 把 setData(cached) 挪到 setMode(m) 之后、或漏掉 setDataMode(key)，首帧都会画错档。
-    const cachedGate = findAll(changeMode, earlyExits('cached !== null'))
+    // 门内真的要把快照同一批换成目标档（七步）再 return：块门逐条指定，多一条也不命中（C8 r7 横扫）。
+    const cachedGate = findAll(changeMode, blockExit('cached !== null', [
+      (stmt) => stmtLineOf(stmt) === 'setPendingMode(null)',
+      (stmt) => stmtLineOf(stmt) === 'setPendingBusy(false)',
+      (stmt) => stmtLineOf(stmt) === 'setData(cached)',
+      (stmt) => stmtLineOf(stmt) === 'setDataMode(key)',
+      (stmt) => stmtLineOf(stmt) === 'setMode(m)',
+      (stmt) => stmtLineOf(stmt) === 'setPageNo(1)',
+      (stmt) => stmtLineOf(stmt) === 'quietNextRef.current = true'
+    ]))
     assert.strictEqual(cachedGate.length, 1, '有快照的分支必须是「if (cached !== null) { …; return }」')
     assert.deepStrictEqual(cachedGate[0].consequent.body.map(stmtLineOf),
       ['setPendingMode(null)', 'setPendingBusy(false)', 'setData(cached)', 'setDataMode(key)', 'setMode(m)',
@@ -15664,7 +15737,7 @@ async function main () {
       '快滚条必须用 aria-controls 指向被控日志框（读屏不能只听到一个孤立滚动条）')
     // 按下：第二根手指不得顶掉正在拖的那根；抓取偏移必须保留（按在拇指上不跳位）。
     const onRailDown = memberFn('onRailDown')
-    assert.strictEqual(findAll(onRailDown, earlyExits('dragRef.current')).length, 1,
+    assert.strictEqual(findAll(onRailDown, bareReturn('dragRef.current')).length, 1,
       '已有指针在拖时必须忽略新的 pointerdown（if (dragRef.current) return，且 consequent 必须是 return）')
     const dragAssigns = findAll(onRailDown, (n) => n.type === 'AssignmentExpression' && sameShapeOf(n.left, 'dragRef.current'))
     assert.strictEqual(dragAssigns.length, 1, '按下必须记下这次拖拽（dragRef.current = {…}，只有一处）')
@@ -15712,7 +15785,7 @@ async function main () {
       n.arguments[1].elements.map(exprLabel).join(',') === 'active,syncRail')
     assert.strictEqual(activeEffects.length, 1, '必须有 active/syncRail 的 effect（判据对象）')
     const activeBody = activeEffects[0].arguments[0].body
-    assert.ok(earlyExits('!active')(activeBody.body[0]),
+    assert.ok(bareReturn('!active')(activeBody.body[0]),
       'active 变 true 必须重量：if (!active) return 必须是 effect 的第一条（consequent 必须是 return）')
     assert.strictEqual(callSites(activeBody, 'window.requestAnimationFrame').length, 1,
       '重量必须等一帧（requestAnimationFrame），否则量到的还是隐藏时的 0 高')
@@ -16477,7 +16550,7 @@ async function main () {
     assert.ok(snapKeyDecl.start < themesDecl.start,
       '首屏快照块必须排在主题块之前（主题红线只允许服务端首帧渲染，快照先读出来才能先定主题）')
     const readSnapFn = fnNamed(uiModel, 'readSnapshot')
-    assert.strictEqual(findAll(readSnapFn, earlyExits('!v || v.v !== BOOT.version', null)).length, 1,
+    assert.strictEqual(findAll(readSnapFn, bareReturn('!v || v.v !== BOOT.version', null)).length, 1,
       '快照必须有版本守卫（旧结构不渲染：if (!v || v.v !== BOOT.version) return null）')
     const writeSnapFn = fnNamed(uiModel, 'writeSnapshot')
     const snapWrite = callSites(writeSnapFn, 'window.localStorage.setItem')
@@ -16516,11 +16589,20 @@ async function main () {
     // 弹窗就渲染在概览那一段 <section hidden> 里面。切页（含浏览器后退）时若只把 section
     // 置 display:none，dialog 仍是 open/:modal ⇒ 塌成 0×0、背景继续 inert（手机只能刷新）。
     // 所以 open 必须与「当前页」绑在同一个条件里：切页与关闭是同一次提交，不留坏帧。
-    const dialog = elementsInFunction(componentsModel, 'TriggerBar')
-      .find((el) => el.name === 'ConfirmDialog')
-    assert.ok(dialog, 'TriggerBar 必须渲染 <ConfirmDialog>（判据对象）')
-    assert.ok(sameShapeOf(markup.attrExpr(dialog, 'open'), 'pending !== null && active'),
+    // 判据面是 TriggerBar 里的**全部**元素（C8 r7）：origin/main 的 `!/open=\$\{pending !== null\}\s/`
+    // 是「任何 dialog 都不得只按 pending 渲染」的普遍否定；收窄成「取第一个 ConfirmDialog 正面比形状」
+    // 后，再挂第二个不受当前页门控的弹窗仍全绿——切页后它照样 open/:modal 留在 display:none 里。
+    const barEls = elementsInFunction(componentsModel, 'TriggerBar')
+    const dialogs = barEls.filter((el) => el.name === 'ConfirmDialog')
+    assert.strictEqual(dialogs.length, 1,
+      `TriggerBar 必须恰好渲染一个 <ConfirmDialog>（实际 ${dialogs.length} 个：多出来的那个没有当前页门控）`)
+    assert.ok(sameShapeOf(markup.attrExpr(dialogs[0], 'open'), 'pending !== null && active'),
       '确认弹窗的 open 必须同时受「有 pending」与「当前页」门控（否则后退切页会把它留在 display:none 里）')
+    // 全集否定（按元素逐个判，不是只判第一个）：TriggerBar 里任何带 open 的元素都不得只按 pending
+    // 渲染；违规的按元素名逐条点名，新增弹窗 / 改组件名都逃不掉。
+    const ungatedOpens = barEls.filter((el) => sameShapeOf(markup.attrExpr(el, 'open'), 'pending !== null'))
+    assert.deepStrictEqual(ungatedOpens.map((el) => el.name), [],
+      '不得只按 pending 渲染弹窗（切页后 dialog 仍 open/:modal，整页保持 inert）')
     // 关掉还不够：pending 必须真清掉（走 onCancel 同一条 setPending(null)），且作废在路上的 askConfirm。
     const closeEffect = findAll(barFn, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'useEffect' &&
       n.arguments[1] && n.arguments[1].type === 'ArrayExpression' &&
@@ -16684,10 +16766,15 @@ async function main () {
     assert.strictEqual(callSites(runsFn, 'doCancel').length, 1,
       '整个 RunsPanel 只能有一处调 doCancel（确认弹窗的 onConfirm）：按钮直发就是两处')
     // 确认弹窗：与 C7-001 同口径受当前页门控，且只有确认才真的发。
-    const dialog = elementsInFunction(pagesModel, 'RunsPanel').find((el) => el.name === 'ConfirmDialog')
-    assert.ok(dialog, 'RunsPanel 必须渲染 <ConfirmDialog>（判据对象）')
-    assert.ok(sameShapeOf(markup.attrExpr(dialog, 'open'), 'cancelAsk !== null && active'),
+    // 计数 + 逐个判 open（C8 r7 横扫，与 C7-001 同口径）：只取第一个 ConfirmDialog 再正面比 open 时，
+    // 再挂第二个不受当前页门控的弹窗仍全绿（切页后它在 display:none 的 section 里保持 open/:modal）。
+    const runDialogs = elementsInFunction(pagesModel, 'RunsPanel').filter((el) => el.name === 'ConfirmDialog')
+    assert.strictEqual(runDialogs.length, 1,
+      `RunsPanel 必须恰好渲染一个 <ConfirmDialog>（实际 ${runDialogs.length} 个：多出来的那个没有当前页门控）`)
+    assert.deepStrictEqual(runDialogs.map((el) => exprLabel(markup.attrExpr(el, 'open'))), ['cancelAsk !== null && active'],
       '停止确认弹窗的 open 必须同时受「有待确认」与「当前页」门控（隐藏 section 里的 dialog 会塌成 0×0）')
+    const dialog = runDialogs[0]
+    assert.ok(dialog, 'RunsPanel 必须渲染 <ConfirmDialog>（判据对象）')
     const confirmClick = markup.attrExpr(dialog, 'onConfirm')
     const confirmStmts = confirmClick.body.body
     assert.deepStrictEqual(confirmStmts.slice(0, 2).map(stmtLineOf), ['id = cancelAsk', 'setCancelAsk(null)'],
@@ -17294,9 +17381,14 @@ async function main () {
     assert.strictEqual(findAll(revokeBtn, (n) => n.type === 'CallExpression' && exprLabel(n.callee) === 'revokeDevices').length, 0,
       '按钮自身不得直接调 revokeDevices（一次误触会把所有设备踢下线）')
     // 确认弹窗：open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）。
-    const revokeDlg = twoFaEls.find((el) => el.name === 'ConfirmDialog' &&
-      sameShapeOf(markup.attrExpr(el, 'open'), 'revokeAsk && active'))
-    assert.ok(revokeDlg, '必须有确认弹窗，且 open 必须是 revokeAsk && active（受当前页门控）')
+    // 计数 + 逐个判 open（C8 r7 横扫）：`find(el => open === 期望形状)` 只证明「存在一个门控正确的」，
+    // 第二个不门控的弹窗照样全绿。
+    const twoFaDialogs = twoFaEls.filter((el) => el.name === 'ConfirmDialog')
+    assert.strictEqual(twoFaDialogs.length, 1,
+      `TwoFactorBlock 必须恰好渲染一个 <ConfirmDialog>（实际 ${twoFaDialogs.length} 个：多出来的那个没有当前页门控）`)
+    assert.deepStrictEqual(twoFaDialogs.map((el) => exprLabel(markup.attrExpr(el, 'open'))), ['revokeAsk && active'],
+      '确认弹窗的 open 必须是 revokeAsk && active（受当前页门控；每个弹窗都要判，不是找到一个就够）')
+    const revokeDlg = twoFaDialogs[0]
     const revokeConfirm = markup.attrExpr(revokeDlg, 'onConfirm')
     assert.deepStrictEqual(callSites(revokeConfirm, 'revokeDevices').map(callArgLabels), [[]],
       '确认后才调 revokeDevices()（且只能调一次）')
@@ -17338,9 +17430,13 @@ async function main () {
     assert.strictEqual(findAll(removeBtn, (n) => n.type === 'CallExpression' && exprLabel(n.callee) === 'removeWatch').length, 0,
       '× 自身不得直接调 removeWatch（误触就丢关注词）')
     // 确认弹窗：open 必须受当前页门控（隐藏 section 里的 dialog 会塌成 0×0）。
-    const removeDlg = searchEls.find((el) => el.name === 'ConfirmDialog' &&
-      sameShapeOf(markup.attrExpr(el, 'open'), 'askRemove !== null && active'))
-    assert.ok(removeDlg, '必须有确认弹窗，且 open 必须是 askRemove !== null && active（受当前页门控）')
+    // 计数 + 逐个判 open（C8 r7 横扫，与 C7-001 同口径）。
+    const searchDialogs = searchEls.filter((el) => el.name === 'ConfirmDialog')
+    assert.strictEqual(searchDialogs.length, 1,
+      `SearchPanel 必须恰好渲染一个 <ConfirmDialog>（实际 ${searchDialogs.length} 个：多出来的那个没有当前页门控）`)
+    assert.deepStrictEqual(searchDialogs.map((el) => exprLabel(markup.attrExpr(el, 'open'))), ['askRemove !== null && active'],
+      '取消关注确认弹窗的 open 必须是 askRemove !== null && active（受当前页门控；每个弹窗都要判）')
+    const removeDlg = searchDialogs[0]
     const removeConfirm = markup.attrExpr(removeDlg, 'onConfirm')
     assert.ok(removeConfirm && removeConfirm.type === 'ArrowFunctionExpression', '确认动作必须绑在 onConfirm 上')
     assert.deepStrictEqual(callSites(removeConfirm, 'removeWatch').map(callArgLabels), [['q']],
@@ -17431,8 +17527,10 @@ async function main () {
     // 骨架只能有一份实现：单飞闸 + 结算时间戳 + queue 排队都在 runAutoLoad 里。
     const helper = markup.functionNodeOf(pagesModel, 'runAutoLoad')
     assert.ok(helper, 'pages.js 必须有 runAutoLoad（懒加载/节流的唯一骨架）')
-    assert.ok(findAll(helper, earlyExits('pendingRef.current && !force', false)).length === 1,
-      '单飞闸必须在公共骨架里：if (pendingRef.current && !force) return false')
+    // 裸门（C8 r7）：单飞闸的 consequent 必须**就是** `return false`；块化
+    // （`{ pendingRef.current = false; return false }`）等于每拍自清 ⇒ 并发调用不再复用同一发。
+    assert.strictEqual(findAll(helper, bareReturn('pendingRef.current && !force', false)).length, 1,
+      '单飞闸必须在公共骨架里：if (pendingRef.current && !force) return false（块化即红）')
     assert.ok(findAll(helper, (n) => n.type === 'AssignmentExpression' &&
       memberPath(n.left) === 'loadedAtRef.current' && exprLabel(n.right) === 'Date.now()').length === 1,
     '结算时间戳必须在公共骨架里（loadedAtRef.current = Date.now()：新鲜度判断的唯一来源）')
@@ -17813,11 +17911,14 @@ async function main () {
     assert.ok(tickDecl && tickDecl.init.type === 'CallExpression' && memberPath(tickDecl.init.callee) === 'useCallback',
       'ui.js 必须有 runTick（主轮询节拍的唯一入口）')
     const tickFn = tickDecl.init.arguments[0]
-    assert.ok(findAll(tickFn, earlyExits('document.hidden')).length === 1,
-      '后台整拍跳过仍在：if (document.hidden) return（别把隐藏页改成照跑）')
+    // 裸门（C8 r7）：C7-013 原来逐字钉 `if (document.hidden) return`；换成 earlyExits 后
+    // `if (document.hidden) { refreshSplit(); return }` 也算命中 ⇒ 隐藏页每拍照跑（正是本用例名
+    // 与失败文案要防的回归）。consequent 必须**就是**那条无参 return，块化即红。
+    assert.strictEqual(findAll(tickFn, bareReturn('document.hidden')).length, 1,
+      '后台整拍跳过仍在：if (document.hidden) return（块化成 { …; return } 等于把隐藏页改成照跑）')
     // 只按时间窗关死 = 窗内到达的 SSE tick（服务端报「有新数据」）被一起吞掉，
     // 页面最多停在补拉那一刻一个轮询周期（SSE 在线时 60s）。
-    assert.ok(findAll(tickFn, earlyExits('Date.now() < resumeQuietUntilRef.current && Date.now() - lastRefreshRef.current < POLL_BUSY_MS')).length === 1,
+    assert.ok(findAll(tickFn, bareReturn('Date.now() < resumeQuietUntilRef.current && Date.now() - lastRefreshRef.current < POLL_BUSY_MS')).length === 1,
       '静默窗必须叠加「距上次成功刷新 < POLL_BUSY_MS」：否则窗内的 SSE tick 会被静默吞掉')
     // 判据的另一半：补拉成功要推进 lastRefreshRef，否则上面那道条件恒真，等于又关死。
     const activeDecl = findFirst(uiModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
