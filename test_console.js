@@ -14731,43 +14731,105 @@ async function main () {
   })
   await aok('结构红线: 过滤页有未保存修改时拦截离开（切页/后退/刷新）', () => {
     const src = readConsoleSource()
-    assert.ok(src.includes('function LeaveGuardDialog'), '必须有“取消/不保存/保存并继续”三选一弹窗')
-    assert.ok(src.includes('点「不保存并离开」会丢掉这些修改'), '弹窗必须说清楚只有丢弃按钮才会丢修改，不能把自动草稿说成必丢')
-    assert.ok(!src.includes('现在离开，这些修改会丢'), '有自动草稿时不得再写“现在离开就会丢”')
-    assert.ok(src.includes('保存并继续'), '离开拦截里的保存按钮要明确告诉用户保存后会继续')
-    assert.ok(src.includes('beginGuardSave'), '保存并继续必须等待真正保存成功后再继续原操作')
-    assert.ok(src.includes('const beginGuardSave') && src.includes('submitSave({ filter: candidate'), '保存并继续必须直接调用保存，不能再弹第二次确认')
-    assert.ok(src.includes('settleSaveResult(true)'), '只有保存成功才能放行原来的切页/后退')
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
+    // v3.508（assertshape C6 r7）：这段原来留了 8 条读源码文本的判据（`src.includes('submitSave({ filter: candidate')`
+    // 之类），生产源码纯重排（逗号/括号后加空格）就整段变红 —— probe 判 format-coupled。改成 AST：
+    // 弹窗组件的入参与文案、beginGuardSave → submitSave 的直接保存链路、res.ok 才 resolve(true)、
+    // beforeunload/popstate 的监听与取消卸载、切页前的脏状态门。
+    const dialog = markup.functionNodeOf(componentsModel, 'LeaveGuardDialog')
+    assert.ok(dialog, '必须有“取消/不保存/保存并继续”三选一弹窗')
+    const dialogParams = dialog.params.flatMap((param) => (param.type === 'ObjectPattern'
+      ? param.properties.map((prop) => prop.value && prop.value.name)
+      : [param.name]))
+    assert.deepStrictEqual(dialogParams, ['open', 'count', 'busy', 'onCancel', 'onSave', 'onDiscard'],
+      '弹窗必须同时接 busy 与取消 / 保存并继续 / 不保存并离开三个回调（缺一个就有按钮点了不响应）')
+    assert.ok(stringValuesOf(dialog).some((value) => value.includes('点「不保存并离开」会丢掉这些修改')),
+      '弹窗必须说清楚只有丢弃按钮才会丢修改，不能把自动草稿说成必丢')
+    assert.ok(!stringValuesOf(componentsModel).concat(stringValuesOf(pagesModel), stringValuesOf(uiModel))
+      .some((value) => value.includes('现在离开，这些修改会丢')),
+    '有自动草稿时不得再写“现在离开就会丢”')
+    assert.ok(stringValuesOf(dialog).some((value) => value.includes('保存并继续')), '离开拦截里的保存按钮要明确告诉用户保存后会继续')
+    const guardSaveDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'beginGuardSave')
+    assert.ok(guardSaveDecl, '保存并继续必须等待真正保存成功后再继续原操作（beginGuardSave）')
+    assert.ok(ancestorsOf(pagesModel, guardSaveDecl).some((n) => n.type === 'VariableDeclaration' && n.kind === 'const'),
+      'beginGuardSave 必须是 const（保存并继续的实现不能在运行期被换掉）')
+    const guardSaveCalls = callSites(guardSaveDecl, 'submitSave')
+    assert.strictEqual(guardSaveCalls.length, 1, '保存并继续必须直接调用 submitSave，不能再弹第二次确认')
+    const guardSaveArg = guardSaveCalls[0].arguments[0]
+    const guardFilterProp = guardSaveArg && guardSaveArg.type === 'ObjectExpression'
+      ? guardSaveArg.properties.find((prop) => prop.key && prop.key.name === 'filter')
+      : null
+    assert.strictEqual(guardFilterProp && exprLabel(guardFilterProp.value), 'candidate',
+      '保存并继续必须把当前草稿（candidate）直接交给 submitSave（重新走 beginSave 会多问一遍）')
+    const submitSaveDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'submitSave')
+    const okBranch = findFirst(submitSaveDecl, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'res.ok'))
+    assert.ok(okBranch && findAll(okBranch.consequent, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'settleSaveResult' &&
+      exprLabel(n.arguments[0]) === 'true').length === 1,
+    '只有保存成功（res.ok 分支）才能 settleSaveResult(true) 放行原来的切页/后退')
     // v3.507（assertshape C6 r6-A 横扫）：名字出现不等于守卫在——只判 src.includes('leaveSavingRef')
     // 时，删掉三处 gate 只留 useRef 声明照样绿；同理「文本里有 = true / = false」也不管复位在不在
     // finally。这里按 AST 判 .current 的门与读写点（三处早退 + finally 复位）。
-    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
-    assert.strictEqual(findAll(uiModel, earlyExits('leaveSavingRef.current')).length, 3,
-      '保存并继续落盘期间必须三处早退：拦新请求 / hash 路由 / switchTab（少一处就有一条路能在落盘中被切走）')
-    const leaveSavingWrites = (value) => findAll(uiModel, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+    // v3.508（assertshape C6 r7-A）：判据必须落在各自的函数体里。全模块数「共 3 处门 / 1 处写 true」
+    // 时，把 `leaveSavingRef.current = true` 从 closeLeaveRequest 挪到 requestFilterLeave 之后，
+    // 落盘期间旗从不置位、三处门永远开着，旧判据仍然全绿（r7 实测复现）；旧断言
+    // `leaveSave.includes('leaveSavingRef.current = true')` 守的正是「锁设在落盘块里」。
+    const uiDecl = (name) => findFirst(uiModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === name)
+    const closeLeave = uiDecl('closeLeaveRequest')
+    assert.ok(closeLeave && closeLeave.init && closeLeave.init.type === 'ArrowFunctionExpression',
+      '必须有 closeLeaveRequest（离开拦截三选一）')
+    // 三处门各在自己那条路径里：全模块凑够 3 处时，删掉某条路的门、在另一条路补两道照样绿。
+    for (const name of ['requestFilterLeave', 'onHash', 'switchTab']) {
+      const owner = uiDecl(name)
+      assert.ok(owner, `缺少 ${name}（落盘期间必须有一条路能早退）`)
+      assert.strictEqual(findAll(owner, earlyExits('leaveSavingRef.current')).length, 1,
+        `${name} 必须自己有一道 leaveSavingRef 早退（少一处就有一条路能在落盘中被切走）`)
+    }
+    const leaveSavingWrites = (value) => findAll(closeLeave, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
       exprLabel(n.left) === 'leaveSavingRef.current' && n.right.type === 'Literal' && n.right.value === value)
-    assert.strictEqual(leaveSavingWrites(true).length, 1, '落盘开始必须把 in-flight 旗写 true（只声明不置位 = 三处门永远开着）')
-    assert.strictEqual(leaveSavingWrites(false).length, 1, '落盘结束必须写 false（漏写则一次失败后永久锁死切页/后退）')
-    const leaveFinally = findFirst(uiModel, (n) => n.type === 'TryStatement' && n.finalizer &&
+    assert.strictEqual(leaveSavingWrites(true).length, 1,
+      '落盘开始必须把 in-flight 旗写 true，且必须在 closeLeaveRequest 里（写在外面 = 落盘期间三处门永远开着）')
+    assert.strictEqual(leaveSavingWrites(false).length, 1,
+      '落盘结束必须写 false，且必须在 closeLeaveRequest 里（漏写则一次失败后永久锁死切页/后退）')
+    const saveBranch = findFirst(closeLeave, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, "mode === 'save'"))
+    assert.ok(saveBranch, 'closeLeaveRequest 必须先分 save 模式')
+    assert.strictEqual(findAll(saveBranch.consequent, (n) => n.type === 'AssignmentExpression' && n.operator === '=' &&
+      exprLabel(n.left) === 'leaveSavingRef.current' && n.right.type === 'Literal' && n.right.value === true).length, 1,
+    '写 true 必须落在 save 分支的落盘块里（挪到 discard/cancel 分支 = 保存全程没有锁）')
+    const leaveSaveCall = callSites(closeLeave, 'guard.save')[0]
+    assert.ok(leaveSaveCall && leaveSavingWrites(true)[0].start < leaveSaveCall.start,
+      '写 true 必须排在 guard.save() 之前（先占位再落盘，否则落盘窗口内仍可被切走）')
+    const leaveFinally = findFirst(closeLeave, (n) => n.type === 'TryStatement' && n.finalizer &&
       findAll(n.finalizer, (m) => m.type === 'AssignmentExpression' && exprLabel(m.left) === 'leaveSavingRef.current').length === 1)
-    assert.ok(leaveFinally, '复位必须在 finally 里（guard.save() 抛错也要解锁）')
-    const leaveSave = src.slice(src.indexOf('const closeLeaveRequest = '), src.indexOf('// 「查看日志」跳转'))
-    assert.ok(/await guard\.save\(\)/.test(leaveSave), '保存按钮必须等 guard.save() 的结果')
-    assert.ok(leaveSave.includes('doSwitchTab(req.target, true)'), '保存成功后必须继续用户原来要去的页签（并替换 sentinel）')
-    assert.ok(leaveSave.indexOf('if (!saved)') >= 0 && leaveSave.indexOf('if (!saved)') < leaveSave.indexOf('doSwitchTab(req.target, true)'),
-      '保存失败/取消必须先 return，不能先跳页')
-    assert.ok(src.includes("window.addEventListener('beforeunload'"), '刷新/关页必须走 beforeunload')
-    const unload = src.slice(src.indexOf('const onBeforeUnload = '), src.indexOf("window.addEventListener('beforeunload'"))
-    assert.ok(unload.includes('e.preventDefault()') && unload.includes("e.returnValue = ''"),
-      'beforeunload 必须真的取消卸载，不能只挂监听')
-    assert.ok(src.includes("window.addEventListener('popstate'"), '手机左滑/后退必须拦 popstate')
+    assert.ok(leaveFinally, '复位必须在 finally 里（guard.save() 抛错也要解锁），且在 closeLeaveRequest 内（同模块别的 try/finally 不算）')
+    assert.ok(ancestorsOf(closeLeave, leaveSaveCall).some((n) => n.type === 'AwaitExpression'),
+      '保存按钮必须等 guard.save() 的结果（await，不是只调用不等待）')
+    assert.deepStrictEqual([...new Set(callSites(closeLeave, 'doSwitchTab').map((call) => callArgLabels(call).join(',')))], ['req.target,true'],
+      '保存成功后必须继续用户原来要去的页签（并替换 sentinel）')
+    const savedGate = findFirst(closeLeave, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, '!saved'))
+    assert.ok(savedGate && callSites(closeLeave, 'doSwitchTab')[0].start > savedGate.start,
+      '保存失败/取消必须先 return，不能先跳页（!saved 门必须排在 doSwitchTab 之前）')
+    assert.ok(savedGate.consequent.type === 'BlockStatement' &&
+      savedGate.consequent.body[savedGate.consequent.body.length - 1].type === 'ReturnStatement',
+    '保存失败/取消必须先 return（门里只提示不 return = 仍然会跳页）')
+    const unloadCall = callSites(pagesModel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"beforeunload"')
+    assert.strictEqual(unloadCall.length, 1, '刷新/关页必须走 beforeunload')
+    const onUnloadDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onBeforeUnload')
+    assert.ok(onUnloadDecl && exprLabel(unloadCall[0].arguments[1]) === 'onBeforeUnload',
+      'beforeunload 必须挂命名处理器 onBeforeUnload（便于逐条判）')
+    assert.strictEqual(callSites(onUnloadDecl, 'e.preventDefault').length, 1,
+      'beforeunload 必须真的取消卸载（e.preventDefault()）')
+    assert.strictEqual(findAll(onUnloadDecl, (n) => n.type === 'AssignmentExpression' && exprLabel(n.left) === 'e.returnValue' &&
+      n.right.type === 'Literal' && n.right.value === '').length, 1,
+    "beforeunload 必须设 e.returnValue = ''（只挂监听拦不住卸载）")
+    // popstate 的挂载与处理器由下面的 popstateCall / onPopDecl（AST，唯一一处）判。
     assert.ok(src.includes('__xbkFilterGuard'), '脏草稿必须在历史里压 sentinel，否则左滑直接退走')
     assert.ok(src.includes("source: 'tab'") && src.includes("source: 'hash'") && src.includes("source: 'history'"),
       '切页、hash 变化、浏览器后退三种来源都要能回到同一个拦截弹窗')
     // v3.507（横扫 ①）：`src.includes('onLeaveRequestRef.current')` 与 `src.includes('guardRef')`
     // 只判名字出现（后者连 `filterGuardRef` 的子串都能满足）——删掉读写点、只留声明/属性名照样绿。
     // 按 AST 判：popstate 的命名处理器必须真的从 ref 读最新回调；guardRef 必须绑同一个 filterGuardRef。
-    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
     const popstateCall = callSites(pagesModel, 'window.addEventListener').filter((call) => callArgLabels(call)[0] === '"popstate"')
     assert.strictEqual(popstateCall.length, 1, '手机左滑/后退必须挂一处 popstate')
     const onPopDecl = findFirst(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'onPop')
@@ -14781,10 +14843,12 @@ async function main () {
     assert.strictEqual(guardWired.length, 1, '必须把 guardRef 交给过滤页（唯一一处）')
     assert.strictEqual(exprLabel(markup.attrExpr(guardWired[0], 'guardRef')), 'filterGuardRef',
       'guardRef 属性必须绑 App 的 filterGuardRef（换一份 ref 就拿不到脏状态）')
-    assert.ok(findAll(uiModel, (n) => n.type === 'MemberExpression' && memberPath(n) === 'filterGuardRef.current').length >= 2,
-      'App 必须真的从 filterGuardRef.current 读脏状态（只声明 = 永远拿到 null）')
-    const app = src.slice(src.indexOf('const switchTab = '), src.indexOf('const openLog = useCallback'))
-    assert.ok(/guard && guard\.dirty/.test(app), '切页前必须检查过滤页脏状态')
+    const appFn = findFirst(uiModel, (n) => n.type === 'FunctionDeclaration' && n.id && n.id.name === 'App')
+    assert.ok(appFn && findAll(appFn, (n) => n.type === 'MemberExpression' && memberPath(n) === 'filterGuardRef.current').length >= 2,
+      'App 必须真的从 filterGuardRef.current 读脏状态（只声明 = 永远拿到 null；同模块别处读到的不算）')
+    const switchTabDecl = uiDecl('switchTab')
+    assert.ok(switchTabDecl && findAll(switchTabDecl, (n) => n.type === 'IfStatement' && sameShapeOf(n.test, 'guard && guard.dirty')).length === 1,
+      '切页前必须检查过滤页脏状态（switchTab 里必须有 if (guard && guard.dirty) 门）')
     assert.ok(src.includes('放弃草稿并回滚'), '回滚会覆盖草稿时必须把按钮文案说清楚')
     assert.ok(src.includes('复制代码默认会把这些修改覆盖掉'), '复制默认会覆盖草稿时必须先确认')
   })
