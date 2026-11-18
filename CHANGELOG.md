@@ -2477,10 +2477,20 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
 ## v3.510
 
 - **assertshape C7（只改测试面 `test_console.js`；生产逻辑一行未改）**：第 7 段（草稿自动保存 → 离开拦截 → 页面内下拉刷新 → 新版本提示）98 条「读源码文本」断言全部替换为可靠判据。
-  - **范围与账目**：`test_console.js` 源码文本断言基线 514 → 实测 386（-128 处命中，对应 spec 的 98 条；同一断言行上有多个片段，故命中数大于条目数）；`assert.*` 调用点 4416 → 4499（判据拆细、无静默删除）；`git diff --numstat -- test_console.js` = 463 / 151。
+  - **范围与账目**：`test_console.js` 源码文本断言基线 514 → 实测 386（-128 处命中，对应 spec 的 98 条；同一断言行上有多个片段，故命中数大于条目数）；`assert.*` 调用点 4416 → 4499（判据拆细、无静默删除）；`git diff --numstat -- test_console.js` = 463 / 151；白名单已写盘（见 v3.511：`total` 885 → 757、`by_file['test_console.js']` 514 → 386）。
+  - **闸门（TZ=UTC，本工作树实跑；白名单数字为 v3.511 补记）**：`node test_console.js` → `通过 376 / 失败 0`；`node scripts/check-source-text-asserts.js` → exit 0，基线 total=757 / 实测 total=757（test_console.js 514→386 已写盘）；`node check-version.js` → 版本四方一致；`npx standard test_console.js xbk_function_v3.js` → exit 0。
   - **四式分布（98 条）**：式① AST 结构 93 条、式② 解析后字段（CSS 规则声明值）4 条、式③ 行为断言 1 条（`loadErrorText` 直接执行：`Failed to fetch` → 网络请求失败、`HTTP 502` → 服务器错误）、式④ 删除 0 条。
   - **判据收紧（逐类横扫 C3–C6 判过的五类缺陷）**：① 所有 `callSites` 都钉实参（`callArgLabels` / `argLabel` / `callLabel` / `sameShapeOf`），例如每个面板的 `usePullRefresh(active, loader)` 逐参判、`apiGetSys({ probeVersion: true })` 判对象字段、`refreshSplit(force ? { force: true } : undefined)` 判整段三元；② 守卫同时判 `consequent` 是裸 `ReturnStatement`（`argument === null`），并用 `assertGateBefore` / 语句下标判「门在副作用之前」（`dirtyRef.current` 门、`detail.waits.length === 0` 门、`!bootVersion || authExpired` 停表门、`opts.respectFormPause` 门、`verBusyRef` / `visibilitychange` 隐藏门）；③ 三元一律 `sameShapeOf` 钉 test + consequent + alternate（下拉三态文案、检查更新五态按钮、`ariaBusy`、`readBoot.version`、`refreshSplit` 的 force 三元、回滚确认按钮文案）；④ 不再用 `names.includes(...)` 判表达式，改按段比 `exprLabel` / `argLabel`；⑤ 负面断言一律用 `consoleAssetStrings()` / `consoleAssetElements()`（全部前端模块）与 `cssRulesOf(app.css)`，不手写模块子集。
   - **反向验证（scratch 副本实跑，TZ=UTC）**：① `PULL_TRIGGER = 56 → 48` → `松手阈值必须固定 56px` 红（375 / 1），还原后 376 / 0；② `.ver-check { white-space: nowrap → normal }` → `按钮文案不得按字换行` 红，还原后绿；③ `refreshSplit(force ? { force: true } : undefined) → refreshSplit(force ? {} : undefined)` → `下拉必须绕过表单交互暂停…` 红，还原后绿；④ `loadErrorText` 的「网络请求失败」文案改成「网络错误」→ 行为断言红，还原后绿；⑤ 把 `if (dirtyRef.current) return` 挪到 `applyLoaded` 之后 → 新判据「门必须排在 applyLoaded 之前」红，还原后绿（旧的 `includes` 判据对这种挪位仍然全绿——这正是把它换成门位置判据的动机）。
   - **格式耦合探针**：`node scripts/probe-format-coupling.js test_console.js` → exit 1，首个红点是 `if (stopped || mine < done) return`（`specs/C8.md` 第 7 条，属下一段的既有 deferral）；75 个生产文件全量重排后：本包段 v3.330 判据 0 红，v3.332 段只有上述 C8 行变红（本包新判据全绿）。
   - **清理**：`test_console.js` 里已无后端源码文本断言，`readConsoleServerSource()` / `CONSOLE_SERVER_FILES` 随之无调用，本包删除（否则 `standard` 报 `no-unused-vars`）；后端断言全部改为 `source_model` 的 AST。
   - **版本**：3.509.0 → **3.510.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。
+
+## v3.511
+
+- **assertshape C7 收尾：白名单基线落盘（只动 `scripts/source-text-assert.allowlist.json`、CHANGELOG 与版本四方；`test_console.js` 与生产逻辑一行未改）**：v3.510 把 `test_console.js` 第 7 段 98 条「读源码文本」断言换成了 AST／解析值／行为判据，但白名单文件仍是旧值（`total=885`、`by_file['test_console.js']=514`）——「514 → 386」当时只写进了 CHANGELOG，盘上没落。
+  - **后果**：闸门自检的端到端用例红（`test_check_source_text_asserts.js` 40 通过 / 1 失败，报「基线 total=885，实测 total=757」——该用例钉的是「基线 total 必须等于 `by_file` 之和且等于实测」，`test_check_source_text_asserts.js:1468`）；并连带 `test_run_mutation_cli.js` 在沙箱里基线整体红（沙箱复制的是盘上白名单，同一处不等即整段判红）。
+  - **修法**：在本工作树跑 `node scripts/check-source-text-asserts.js --write-allowlist` 重算写盘；diff 只有两处——`total` 885 → 757、`by_file['test_console.js']` 514 → 386，其余 34 个文件逐字不变（`git diff --numstat` = 2 / 2）。
+  - **闸门（TZ=UTC，本工作树实跑）**：`node scripts/check-source-text-asserts.js` → exit 0（基线 total=757 / 实测 total=757，逐文件 386/386）；`node test_check_source_text_asserts.js` → 41 检查全绿；`node test_console.js` → `通过 376 / 失败 0`；`node check-version.js` → 版本四方一致 v3.511；`npx standard test_console.js xbk_function_v3.js` → exit 0。
+  - **根因**：闸门本体按「只减不增」口径放行下降（基线 885 > 实测 757 只打印「ℹ️ 基线下降」并 exit 0），只有端到端用例与跑在沙箱里的 `test_run_mutation_cli.js` 才比对「基线 = 实测」。所以「先改判据、后写白名单」在本地看起来全绿，一出端到端就红。后续包改完断言必须**先 `--write-allowlist` 再写 CHANGELOG 账目**，实测值不得只记在文字里。
+- **版本**：3.510.0 → **3.511.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。

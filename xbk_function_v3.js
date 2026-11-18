@@ -1,4 +1,4 @@
-//* ******* 线报酷推送脚本 v3.510 — assertshape C7：test_console.js 第 7 段 98 条「读源码文本」断言全部改为 AST 结构 / 解析后字段 / 行为断言（128 处命中清零；生产逻辑一行未改） *******
+//* ******* 线报酷推送脚本 v3.511 — assertshape C7 收尾：源码文本断言白名单按本包实测写盘（total 885 → 757、by_file['test_console.js'] 514 → 386），修掉「CHANGELOG 写了 514 → 386、盘上基线仍是旧值」造成的 test_check_source_text_asserts 端到端一红与 test_run_mutation_cli 沙箱基线整体红；只动白名单、CHANGELOG 与版本四方，测试与生产逻辑一行未改 *******
 
 /* eslint promise/param-names: off */ // new Promise(r => ...) 短参数名为项目既有风格
 
