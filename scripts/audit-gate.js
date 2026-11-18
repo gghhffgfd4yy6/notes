@@ -23,7 +23,8 @@ const fs = require('fs')
 // ⚠️ 理由里「got@11 传递依赖已停更」这个子串被 test_audit_gate.js AG-07 钉住（防静默放行），
 //    改写文案时必须保留它。
 const ALLOWED_ADVISORIES = new Map([
-  ['GHSA-CH52-4W7C-C8XP', '4.3.0 已落在受影响范围 <=4.2.0 之外（实测 npm audit 命中归零），但 GitHub 侧 first_patched_version 仍为 null、告警引用的 max-stale 表达式一字未改 ⇒ 属「范围消解 + 上游 Vary 匹配加固」而非确认修复；got@11 传递依赖已停更；项目用法为直连推送 API，cacheable-request 缓存路径不生效，实际暴露面趋近于零（PR #194 豁免，PR #203 更新理由）']
+  ['GHSA-CH52-4W7C-C8XP', '4.3.0 已落在受影响范围 <=4.2.0 之外（实测 npm audit 命中归零），但 GitHub 侧 first_patched_version 仍为 null、告警引用的 max-stale 表达式一字未改 ⇒ 属「范围消解 + 上游 Vary 匹配加固」而非确认修复；got@11 传递依赖已停更；项目用法为直连推送 API，cacheable-request 缓存路径不生效，实际暴露面趋近于零（PR #194 豁免，PR #203 更新理由）'],
+  ['GHSA-FC5Q-39XC-VJPF', 'picomatch ReDoS（affected <=4.0.7；registry 最新版即 4.0.7、first_patched_version=null ⇒ 无补丁可升）。依赖链 re2→node-gyp→tinyglobby→picomatch，只存在于构建/安装期工具链：仓库内 `git grep -E "require\\(.(tinyglobby|picomatch|fdir|node-gyp)"` 零命中，运行期不可达，且 ReDoS 需要攻击者控制 glob 模式，本仓无此入口。2026-11-18 经仓库所有者确认豁免（另一选项是改依赖链，收益不成立）。复查条件：① picomatch 发布 >4.0.7 或 advisory 给出 first_patched_version；② re2 不再经 node-gyp 构建；③ advisory 范围被修正。三者任一成立即回来删掉本条']
 ])
 
 // severity 的合法取值集合（npm audit 的 vulnerabilities[].severity 枚举）。

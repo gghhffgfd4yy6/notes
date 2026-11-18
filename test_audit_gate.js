@@ -24,6 +24,8 @@ const SCRIPT = path.resolve(__dirname, 'scripts', 'audit-gate.js')
 // 与 scripts/audit-gate.js 的 ALLOWED_ADVISORIES 同源：唯一豁免条目
 const EXEMPT_URL = 'https://github.com/advisories/GHSA-ch52-4w7c-c8xp'
 const OTHER_URL = 'https://github.com/advisories/GHSA-zzzz-zzzz-zzzz'
+// 第二个豁免条目：picomatch ReDoS（构建期工具链，无补丁可升）
+const PICOMATCH_URL = 'https://github.com/advisories/GHSA-fc5q-39xc-vjpf'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xbk-audit-gate-'))
 // 清理兜底（照 test_storage.js:19 的写法）：断言失败走 process.exit 时末尾 rmSync 会被跳过，
@@ -261,6 +263,23 @@ check('AG-13 间接链命中豁免：warning 必须带出真实理由（旧实�
   assert.match(warning, /got 被显式豁免：\S/, `理由不得为空（实际：${warning}）`)
   assert.match(warning, /got@11 传递依赖已停更/, `理由必须取自 ALLOWED_ADVISORIES 的原文（实际：${warning}）`)
   assert.doesNotMatch(r.stdout, /豁免清单未记录理由/, '理由查得到时不得落到兜底文案')
+})
+
+check('AG-14 picomatch 构建期链豁免：re2→node-gyp→tinyglobby→picomatch 放行且带理由，换成未豁免 advisory 必须拦', () => {
+  const chain = (adv) => indirect([
+    { name: 're2' },
+    { name: 'node-gyp' },
+    { name: 'tinyglobby' },
+    { name: 'picomatch', advisories: [adv] }
+  ])
+  const hit = run({ vulnerabilities: chain(PICOMATCH_URL) })
+  ok0(hit, '构建期链上的 picomatch 豁免必须放行')
+  assert.match(hit.stdout, /picomatch\(GHSA-FC5Q-39XC-VJPF\) 被显式豁免/, '注解必须指名包名与 GHSA')
+  assert.match(hit.stdout, /构建\/安装期工具链/, '注解必须带上豁免理由，供审计追溯')
+  // 对照组：同一链换成未豁免 advisory ⇒ 必须红（证明上一条不是夹具坏了就绿）
+  const blocked = run({ vulnerabilities: chain(OTHER_URL) })
+  ok1(blocked, '同一链上的未豁免 advisory 必须拦')
+  assert.match(blocked.stderr, /未豁免的高危漏洞：re2/, '必须点名链首的包')
 })
 
 fs.rmSync(tmp, { recursive: true, force: true })
