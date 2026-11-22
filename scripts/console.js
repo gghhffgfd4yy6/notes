@@ -2116,8 +2116,8 @@ function readBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
 //   · 全局闸对 POST 只认 Bearer、对「仅 Cookie」统一回 unauthorized——直接复用会让
 //     「URL 带 token」与「仅 Cookie」都落到同一条 401，无法给出规格要求的专属 code。
 // 规则正文绝不进访问日志/审计：审计只记 action/revision/changedFields 与 prevHash 链。
-// v3.394：与 xbk_filter_store 的 FILTER_RULES_MAX_BYTES 同步 64 KiB → 256 KiB（单字段上限 4000 → 16000）
-const FILTER_BODY_MAX_BYTES = 256 * 1024
+// v3.394：与 xbk_filter_store 同步 64 KiB → 256 KiB（单字段上限同步抬升）；F1 起读 FILTER_LIMITS 单一来源
+const FILTER_BODY_MAX_BYTES = FilterStore.FILTER_LIMITS.requestBodyMaxBytes
 const FILTER_AUDIT_MAX_BYTES = 4 * 1024 * 1024
 const FILTER_LOCK_STALE_MS = 10 * 1000
 const FILTER_BACKUP_KEEP = 3
@@ -2129,7 +2129,6 @@ const FILTER_AUDIT_GENESIS = '0'.repeat(64)
 // 草稿是「没点保存的整页规则」，与正式覆盖文件分开存；不参与备份/审计/锁。
 const FILTER_DRAFT_SCHEMA = 1
 const FILTER_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
-const FILTER_DRAFT_FIELD_MAX_LEN = 16000
 const FILTER_DRAFT_FIELD_SET = new Set(FilterStore.FILTER_RULE_FIELDS)
 // 控制字符：允许 \t(09) \n(0A) \r(0D)，其余 C0 与 DEL 一律拒绝。
 function hasFilterDraftControlChar (value) {
@@ -4448,8 +4447,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         errors.push({ field, code: 'not_string', message: `字段「${field}」必须是字符串（当前 ${typeof value}）` })
         continue
       }
-      if (value.length > FILTER_DRAFT_FIELD_MAX_LEN) {
-        errors.push({ field, code: 'too_long', message: `字段「${field}」长度 ${value.length} 超过上限 ${FILTER_DRAFT_FIELD_MAX_LEN}` })
+      const fieldMaxLen = FilterStore.fieldMaxLenOf(field)
+      if (value.length > fieldMaxLen) {
+        errors.push({ field, code: 'too_long', message: `字段「${field}」长度 ${value.length} 超过上限 ${fieldMaxLen}` })
         continue
       }
       if (hasFilterDraftControlChar(value)) {

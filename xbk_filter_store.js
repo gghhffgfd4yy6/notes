@@ -51,21 +51,118 @@ const FILTER_RULE_FIELDS = Object.freeze([
 ])
 
 const FILTER_RULES_SCHEMA = 1
+// ── 预算的单一来源（F1）────────────────────────────────────────────────────
+// 过去这四条上限是四份手抄副本：store 的单字段/整份上限 + console 的 body/草稿上限，改一处忘一处
+// 就会造出「能保存但读不回」。从 F1 起，数字只写在下面这一块：store 的每个闸门都经
+// FILTER_LIMITS / fieldMaxLenOf / readFieldMaxLen 取值，console 也从 FilterStore.FILTER_LIMITS
+// （requestBodyMaxBytes / fieldMaxLenOf）取，不再自带副本。
+//
+// 读硬顶（readMaxBytes）与写预算（requestBodyMaxBytes）在这一步就拆成两个独立旋钮，为 F3 的
+// 动态预算铺路；**本项两者同值**（256 KiB），故行为零变化。
+//
+// 下面这些常量是**今天的值**：既是历史源码锚点（派生别名），也是加载期 fail-closed 的兜底数值；
+// FILTER_LIMITS 由它们组装，除此之外本文件与 console.js 不许再出现这些数字。
 // 单字段正文上限：16000 个 UTF-16 码元（与文档行长闸门的 String.length 口径一致）。
 // v3.394：4000 → 16000（用户实测到 386 条 ≈1500 字符后要求放宽，按三字词算约 4000 条/字段）。
-// 覆盖文件整体上限 256 KiB：与 console 的 body 上限同源，避免「能保存但读不回」。
 const FILTER_FIELD_MAX_LEN = 16000
+// 覆盖文件整体上限 / 读硬顶：256 KiB，与 console 的 body 上限同源，避免「能保存但读不回」。
 const FILTER_RULES_MAX_BYTES = 256 * 1024
+// 保存闸门给 revision 位数增长留的余量（整份闸门按 上限-32 判，见 validateFilterRules 闸门 5）。
+const FILTER_SAVE_HEADROOM_BYTES = 32
+
+// 冻结的预算表：全仓唯一的取值入口（console 也从这里取 requestBodyMaxBytes）。
+// fieldMaxLen 是**按 11 个字段全覆盖的表**（当前同值 16000，F3 才允许分字段增长）；
+// 未知字段由 fieldMaxLenOf 返回 0，绝不回落成「无限」。
+const LIMIT_SCALAR_KEYS = Object.freeze([
+  'rulesFileMaxBytes', 'readMaxBytes', 'requestBodyMaxBytes', 'draftFieldMaxLen',
+  'saveHeadroomBytes', 'lastgoodWrapperBytes', 'appliedWrapperBytes'
+])
+// 今日常量（fail-closed 兜底）：与 FILTER_LIMITS 同值，表里任何一项被改坏时用它顶替。
+const LIMIT_FALLBACKS = Object.freeze({
+  fieldMaxLen: FILTER_FIELD_MAX_LEN,
+  rulesFileMaxBytes: FILTER_RULES_MAX_BYTES,
+  readMaxBytes: FILTER_RULES_MAX_BYTES,
+  requestBodyMaxBytes: FILTER_RULES_MAX_BYTES,
+  draftFieldMaxLen: FILTER_FIELD_MAX_LEN,
+  saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
+  lastgoodWrapperBytes: 1024,
+  appliedWrapperBytes: 1024
+})
+
+function isPositiveSafeInt (value) {
+  return Number.isSafeInteger(value) && value > 0
+}
+
+/**
+ * 加载期校验 FILTER_LIMITS：不合格的项逐项回落到今日常量并 console.warn（fail-closed）。
+ * 为什么必须有这道闸：xbk_storage.resolveMaxBytes 在 maxBytes 非正/NaN 时返回 null = **不设限整读**
+ * （xbk_storage.js:204），一次笔误就会把「有界读」变成「无界读」。所有闸门读的都是本函数产出的
+ * 冻结对象，故 NaN/0/负数永远到不了 readSafeTextResult。
+ * 字段表额外保证 11 个字段齐全：缺字段的项同样回落今日常量（fieldMaxLenOf 的 0 只留给**未知**字段）。
+ * @param {{fieldMaxLen:Object}} [limits]
+ * @returns {{fieldMaxLen:Object, [key:string]:number}}
+ */
+function normalizeFilterLimits (limits) {
+  const bad = []
+  const source = limits && typeof limits.fieldMaxLen === 'object' && limits.fieldMaxLen !== null ? limits.fieldMaxLen : {}
+  const fieldMaxLen = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    const value = source[field]
+    if (isPositiveSafeInt(value)) fieldMaxLen[field] = value
+    else {
+      bad.push(`fieldMaxLen.${field}=${String(value)}`)
+      fieldMaxLen[field] = LIMIT_FALLBACKS.fieldMaxLen
+    }
+  }
+  const normalized = { fieldMaxLen: Object.freeze(fieldMaxLen) }
+  for (const key of LIMIT_SCALAR_KEYS) {
+    const value = limits ? limits[key] : undefined
+    if (isPositiveSafeInt(value)) normalized[key] = value
+    else {
+      bad.push(`${key}=${String(value)}`)
+      normalized[key] = LIMIT_FALLBACKS[key]
+    }
+  }
+  if (bad.length) {
+    console.warn(`⚠️ FILTER_LIMITS 非法（${bad.join('、')}），已 fail-closed 回落到今日常量`)
+  }
+  return normalized
+}
+
+const FILTER_LIMITS = Object.freeze(normalizeFilterLimits({
+  fieldMaxLen: Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, FILTER_FIELD_MAX_LEN])),
+  rulesFileMaxBytes: FILTER_RULES_MAX_BYTES,
+  // 读硬顶与写预算在本项同值（行为零变化）；F3 起两者分道扬镳。
+  readMaxBytes: FILTER_RULES_MAX_BYTES,
+  requestBodyMaxBytes: FILTER_RULES_MAX_BYTES,
+  draftFieldMaxLen: FILTER_FIELD_MAX_LEN,
+  saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
+  lastgoodWrapperBytes: 1024,
+  appliedWrapperBytes: 1024
+}))
+
+// 保存路径的单字段上限：以 FILTER_LIMITS.fieldMaxLen 为准；**未知字段返回 0**（一律拒绝），
+// 绝不回落成无限——那等于给每个新增的未知字段开一条绕过长度闸门的通道。
+function fieldMaxLenOf (field) {
+  return hasOwn(FILTER_LIMITS.fieldMaxLen, field) ? FILTER_LIMITS.fieldMaxLen[field] : 0
+}
+
+// 读路径的单字段上限：max(今日单字段上限, fieldMaxLenOf(field))——读端必须能读回存量文件，
+// F3 抬上限后旧的小值字段仍然可读。本项两者相等，行为零变化。
+function readFieldMaxLen (field) {
+  return Math.max(FILTER_FIELD_MAX_LEN, fieldMaxLenOf(field))
+}
+
 // 持久 LKG 的读上限（F4-1 返工 R3）：LKG 是覆盖文件的**再包装**——`{schema,revision,hash,override}`
 // 比覆盖文件的 `{schema,revision,filter}` 多出 `"hash":"<64 位十六进制>",`（74 字节）与
 // `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。若读写共用 FILTER_RULES_MAX_BYTES，
 // 则覆盖文件落在 (MAX-76, MAX] 这段（控制台保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG
 // 必然 > MAX ⇒ readSafeTextResult 判 tooLarge ⇒ readLastGood 返回 null ⇒ 新进程降级回代码默认，
 // 而写入侧仍返回 true（「写成功但读不回」，与 C9-012 同类的阈值差几字节缺陷，只是差在包装层）。
-// 故读上限 = 覆盖文件上限 + 包装预算；写入侧（writeLastGoodFile）用同一常量预检，绝不产出读不回的文件。
+// 故读上限 = 读硬顶（FILTER_LIMITS.readMaxBytes）+ 包装预算；写入侧（writeLastGoodFile）用同一常量预检，绝不产出读不回的文件。
 // 1024 的余量足够：覆盖文件能读回就 ≤ 256 KiB，包装固定 +76，revision 最多 16 位数字也吃不满。
-const LASTGOOD_WRAPPER_BYTES = 1024
-const LASTGOOD_MAX_BYTES = FILTER_RULES_MAX_BYTES + LASTGOOD_WRAPPER_BYTES
+const LASTGOOD_WRAPPER_BYTES = FILTER_LIMITS.lastgoodWrapperBytes
+const LASTGOOD_MAX_BYTES = FILTER_LIMITS.readMaxBytes + LASTGOOD_WRAPPER_BYTES
 // 生效快照（filter-rules.applied.json）的读上限：它是覆盖文件的**超集**，不能直接复用
 // FILTER_RULES_MAX_BYTES。比覆盖文件多出：11 个白名单字段按合并结果**补齐**（覆盖文件缺的字段
 // 也要写成 ""）、`source`/`hash`/`appliedAt`/`lastGoodUsed` 四个诊断字段、以及 `keyword` 包装
@@ -75,8 +172,8 @@ const LASTGOOD_MAX_BYTES = FILTER_RULES_MAX_BYTES + LASTGOOD_WRAPPER_BYTES
 // ⇒ readAppliedSnapshot 恒 ioError ⇒「内容一致跳过写盘」永不生效、控制台永远显示「尚未生效」
 // （与 LKG 的 R3 同一类缺陷：写成功但读不回）。故读上限 = 覆盖文件上限 + 包装预算；
 // 写入侧（writeAppliedSnapshot）用同一常量预检，绝不落一个自己读不回的快照。
-const APPLIED_WRAPPER_BYTES = 1024
-const APPLIED_MAX_BYTES = FILTER_RULES_MAX_BYTES + APPLIED_WRAPPER_BYTES
+const APPLIED_WRAPPER_BYTES = FILTER_LIMITS.appliedWrapperBytes
+const APPLIED_MAX_BYTES = FILTER_LIMITS.readMaxBytes + APPLIED_WRAPPER_BYTES
 // pingbitime 天数上限：与 xbk_rules.compileRules / validateConfig 的 PINGBITIME_MAX_DAYS 同值。
 // 超上限的行会被运行期静默丢弃 ⇒ 编译对账必然失败，这里提前给出明确错误码。
 const PINGBITIME_MAX_DAYS = 3650000
@@ -279,8 +376,9 @@ function validateFilterRules (input, deps, options) {
       addError(errors, field, 'not_string', `字段「${field}」必须是字符串（当前 ${typeof value}）`)
       continue
     }
-    if (value.length > FILTER_FIELD_MAX_LEN) {
-      addError(errors, field, 'too_long', `字段「${field}」长度 ${value.length} 超过上限 ${FILTER_FIELD_MAX_LEN}`)
+    const fieldMaxLen = fieldMaxLenOf(field)
+    if (value.length > fieldMaxLen) {
+      addError(errors, field, 'too_long', `字段「${field}」长度 ${value.length} 超过上限 ${fieldMaxLen}`)
       continue
     }
     if (CONTROL_CHAR_RE.test(value)) {
@@ -449,16 +547,16 @@ function validateFilterRules (input, deps, options) {
   }
 
   // ---------- 闸门 5：整份规则文件的字节预算（C9-012）----------
-  // 读端按 FILTER_RULES_MAX_BYTES（64 KiB）硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到
-  // 上次合法规则/代码默认。而闸门 1 只限**单字段** 16000 码元：11 个字段全填满中文（UTF-8 3 字节/字）
+  // 读端按 FILTER_LIMITS.readMaxBytes（256 KiB）硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到
+  // 上次合法规则/代码默认。而闸门 1 只限**单字段**（FILTER_LIMITS.fieldMaxLen）：11 个字段全填满中文（UTF-8 3 字节/字）
   // 就能堆出 528 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
   // 不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给 revision 位数增长。
   //
   // **只对保存入参生效**（评审 C9-012）：读路径（deepValidationError）复用本函数时必须跳过此闸——
-  // 已落盘文件是经 readSafeTextResult(FILTER_RULES_MAX_BYTES) 有界读进来的，能读到就必然 ≤ 读端上限，
+  // 已落盘文件是经 readSafeTextResult(FILTER_LIMITS.readMaxBytes) 有界读进来的，能读到就必然 ≤ 读端上限，
   // 再按「落盘形状重新序列化」量一遍字节，会把 (MAX_BYTES-32, MAX_BYTES] 这段**合法且可读**的存量
-  // 覆盖文件判成 corrupt（旧版控制台 body 上限 64 KiB，落盘形状只多约 13 字节包装 ⇒ 该区间是真实存量），
-  // 于是每轮降级、规则静默不生效，也与 SYSTEM_CONTRACT「超限（>64 KiB）」口径相反。
+  // 覆盖文件判成 corrupt（落盘形状只比请求体多约 13 字节包装，手改/旧版可落到 MAX ⇒ 该区间是真实存量），
+  // 于是每轮降级、规则静默不生效，也与 SYSTEM_CONTRACT「超限（>256 KiB）」口径相反。
   if (!(options && options.fromDisk === true)) {
     let serializedBytes
     try {
@@ -466,13 +564,13 @@ function validateFilterRules (input, deps, options) {
     } catch (e) {
       return { ok: false, errors: [{ field: 'filter', code: 'serialize_failed', message: `规则无法序列化为 JSON：${safeErrorMessage(e)}` }] }
     }
-    if (serializedBytes > FILTER_RULES_MAX_BYTES - 32) {
+    if (serializedBytes > FILTER_LIMITS.rulesFileMaxBytes - FILTER_LIMITS.saveHeadroomBytes) {
       return {
         ok: false,
         errors: [{
           field: 'filter',
           code: 'too_large',
-          message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_RULES_MAX_BYTES} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
+          message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_LIMITS.readMaxBytes} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
         }]
       }
     }
@@ -499,7 +597,7 @@ function parseOverrideFields (rawFilter) {
     if (!FIELD_SET.has(field)) return { ok: false, message: `含未知字段「${field}」` }
     const value = safeGet(rawFilter, field)
     if (typeof value !== 'string') return { ok: false, message: `字段「${field}」必须是字符串` }
-    if (value.length > FILTER_FIELD_MAX_LEN) return { ok: false, message: `字段「${field}」超长` }
+    if (value.length > readFieldMaxLen(field)) return { ok: false, message: `字段「${field}」超长` }
     if (CONTROL_CHAR_RE.test(value)) return { ok: false, message: `字段「${field}」含控制字符` }
     filter[field] = value
   }
@@ -637,7 +735,7 @@ function writeLastGoodFile (filePath, filter, revision) {
 
 /**
  * 读持久 LKG。任何异常/不合格形态一律返回 null（= 没有 LKG），绝不抛错、绝不部分采用。
- * 读上限用 LASTGOOD_MAX_BYTES（覆盖文件上限 + 包装预算）：拿 FILTER_RULES_MAX_BYTES 读会把
+ * 读上限用 LASTGOOD_MAX_BYTES（FILTER_LIMITS.readMaxBytes + 包装预算）：拿读硬顶直接读会把
  * 「自身合法、只是多了包装」的 LKG 判成 tooLarge ⇒ 静默失效（F4-1 返工 R3）。
  * @returns {{filter:Object, revision:number}|null}
  */
@@ -698,7 +796,7 @@ function isTransientReadStatus (status) {
 }
 
 function readRulesFile (filePath) {
-  return storage.readSafeTextResult(filePath, FILTER_RULES_MAX_BYTES, { openNonBlocking: true })
+  return storage.readSafeTextResult(filePath, FILTER_LIMITS.readMaxBytes, { openNonBlocking: true })
 }
 
 function corruptResult (defaults, keyword, message, key, lastGoodFile) {
@@ -743,7 +841,7 @@ function corruptResult (defaults, keyword, message, key, lastGoodFile) {
 function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGood }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
-  // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（64 KiB 与 console body 上限同源）。
+  // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（FILTER_LIMITS.readMaxBytes 与 console body 上限同源）。
   // 两条「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
   // + 读后复检 inode，末级是链接直接判 unsafe），收紧走 enforceOwnerOnlyMode（O_NOFOLLOW 打开、
   // 对比 lstat 的 dev/ino、只在已校验的 fd 上 fchmod 并按同一 fd 复检）——任一处被换成链接都不会读到、
@@ -935,8 +1033,8 @@ function appliedLastGoodUsed (snapshot) {
 
 /**
  * 读回生效快照。状态机：missing / invalid / ioError / ok（不抛错）。
- * 读上限用 APPLIED_MAX_BYTES（覆盖文件上限 + 包装预算）：快照是覆盖文件的超集（11 字段补齐 +
- * source/hash/appliedAt/lastGoodUsed + keyword 包装，实测 +179 字节）。直接拿 FILTER_RULES_MAX_BYTES
+ * 读上限用 APPLIED_MAX_BYTES（FILTER_LIMITS.readMaxBytes + 包装预算）：快照是覆盖文件的超集（11 字段补齐 +
+ * source/hash/appliedAt/lastGoodUsed + keyword 包装，实测 +179 字节）。直接拿读硬顶
  * 读会把「自身合法、只是多了包装」的快照判成 tooLarge ⇒ 恒 ioError ⇒「内容一致跳过写盘」永不生效、
  * 控制台永远显示「尚未生效」（F4-1 R3 / LKG 同型缺陷）。写侧用同一常量预检。
  * @returns {{status:'ok',snapshot:Object}|{status:'missing'}|{status:'invalid',error:Object}|{status:'ioError',error:Object}}
@@ -1022,6 +1120,13 @@ function resetStoreStateForTests () {
 module.exports = {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
+  // 预算单一来源（F1）：读硬顶 / 写预算 / 各字段上限的唯一取值入口。
+  // 全字段都是正整数安全整数（加载期 normalizeFilterLimits 已 fail-closed 校验），
+  // 任何代码都不得把 NaN/0 传给 readSafeTextResult（= 无界读）。
+  FILTER_LIMITS,
+  // 保存路径的单字段上限（未知字段 0）与读路径的单字段上限（max(今日常量, 字段值)）
+  fieldMaxLenOf,
+  readFieldMaxLen,
   // LKG 包装层的读上限（仅测试用：断言「写出的 LKG 必须 ≤ 读上限」这条不变式）
   LASTGOOD_MAX_BYTES,
   // 生效快照的读上限（仅测试用：断言「写出的 applied 必须 ≤ 读上限」以及贴上限的覆盖文件仍读得回）
