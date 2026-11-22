@@ -162,9 +162,10 @@ export function buildSaveCandidate (override, dirtyFields, draft, fieldNames) {
 }
 
 // ── F4：草稿增量（只存 dirty 字段）与超大字段分页 ─────────────────────────────
-// 草稿：旧实现每 500 ms 把 11 个字段全量 JSON.stringify 进 localStorage。1 MiB 预算下
-// 两个主字段可各 160,000 码元 ⇒ 单份草稿 ≈1.0 M 码元，叠上「服务器那份草稿 + 首屏快照」
-// 就撞 5M 字符配额，写不进去时只能提示「存储已满」，等于草稿能力失效。
+// 草稿：旧实现每 500 ms 把 11 个字段全量 JSON.stringify 进 localStorage。11 个字段全按
+// perField 上限填满时正文 333,192 码元、草稿 filter JSON 333,410 码元（UTF-8 999,794 B），
+// 叠上「服务器那份草稿 + 首屏快照」三份也只有 ≈1.0 M 码元、约占 5M 码元配额的 20%——增量
+// 是为配额留余量，也省掉每 500 ms 的全量序列化（只改 pingbitime 时补丁 18 字节、整条值 81 字节）。
 // 口径：只存「与已生效值不同」的字段（keys 是白名单里的字段名，值是完整正文）；恢复时
 // 以**当前 revision 的生效值**为底合并——草稿的 baseRevision 必须等于当前 revision 才会
 // 被采用（applyLoaded 的 usable 过滤），所以合并底永远与写草稿时同源。

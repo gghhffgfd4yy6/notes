@@ -14993,7 +14993,7 @@ async function main () {
     assert.deepStrictEqual(mergeFilterDraft(base, { pingbibiaoti: 'a2' }, FIELDS),
       { pingbibiaoti: 'a2', pingbineirong: 'b', pingbitime: '5' }, '恢复时以当前生效值为底合并')
     assert.deepStrictEqual(mergeFilterDraft(base, null, FIELDS), base, '没有补丁时整份回生效值（不塞 undefined）')
-    // 1 MiB 预算下最坏情形：两主字段各 160,000 码元，全量草稿 ≈1.0 M 码元；增量只留被改的那个字段。
+    // 1 MiB 预算下最坏情形：11 个字段全按 perField 上限填满也只有 333,410 码元（三份 ≈1.0 M 码元、约占 5M 码元配额 20%）；增量只留被改的那个字段。
     const huge = { pingbibiaoti: '甲'.repeat(160000), pingbineirong: '乙'.repeat(160000), pingbitime: '5' }
     const patch = filterDraftPatch(huge, { ...huge, pingbitime: '7' }, FIELDS)
     assert.deepStrictEqual(patch, { pingbitime: '7' })

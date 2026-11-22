@@ -4273,8 +4273,9 @@ const FILTER_FIELD_LABELS = FILTER_GROUPS.reduce((acc, g) => {
 // 过滤规则草稿：改了但没保存的内容先落在浏览器本地，关标签/杀后台/浏览器退出后
 // 下次打开还能捡回来。只存规则字段，不存 token；同一浏览器只保留最近一份。
 // F4：`filter` 字段里只放**与已生效值不同**的字段（filterDraftPatch），不再整份 JSON.stringify
-// ——1 MiB 预算下两个主字段可各 160,000 码元，全量草稿 ≈1.0 M 码元，撞 5M 字符配额就写不进去
-// （只能提示「存储已满」，草稿能力等于失效）。读取侧按 baseRevision 用 mergeFilterDraft 合并回去。
+// ——11 个字段全按 perField 上限填满时草稿 filter JSON 333,410 码元（UTF-8 999,794 B），三份
+// 也只有 ≈1.0 M 码元、约占 5M 码元配额的 20%；不整份写是为配额留余量，也省掉每 500 ms 的
+// 全量序列化（只改 pingbitime 时补丁 18 字节、整条值 81 字节）。读取侧按 baseRevision 用 mergeFilterDraft 合并回去。
 const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'
 const FILTER_DRAFT_SCHEMA = 1
 const FILTER_DRAFT_SAVE_DELAY = 500
@@ -4626,7 +4627,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const saveDraftNow = useCallback(() => {
     if (!draftRef.current || !baseRef.current) return false
     const d = dataRef.current
-    // F4：只写 dirty 字段（与已生效值不同的那些）——整份写会撞 localStorage 配额。
+    // F4：只写 dirty 字段（与已生效值不同的那些）——整份写每 500 ms 全量序列化 ≈333 K 码元，增量省掉这笔并为配额留余量。
     const patch = filterDraftPatch(baseRef.current, draftRef.current, FILTER_FIELD_NAMES)
     const ok = writeFilterDraft(patch, d && Number.isSafeInteger(d.revision) ? d.revision : null)
     if (ok) {
