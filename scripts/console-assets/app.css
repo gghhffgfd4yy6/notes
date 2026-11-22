@@ -1360,7 +1360,7 @@
   }
   .fr-field-hint { margin-top: 4px; color: var(--text-dim); font-size: var(--fs-2xs); line-height: 1.55; overflow-wrap: anywhere; }
   .fr-field-err { margin-top: 4px; color: var(--bad-fg); font-size: var(--fs-xs); overflow-wrap: anywhere; }
-  /* F4：超大字段的只读分页预览（>100 KB 默认走这里，不做大 textarea）。固定高度 + 自滚，
+  /* F4：超大字段的只读分页预览（阈值 100 KiB 档 = 102,400 码元，超过默认走这里，不做大 textarea）。固定高度 + 自滚，
      2000 行不会把页面顶到几万像素高；等宽 + 保留空白与 textarea 的读写外观一致。 */
   .fr-paged { margin-top: 6px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--panel); }
   .fr-paged-head {
