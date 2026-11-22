@@ -20,10 +20,127 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
   // 用 | 连接；单行输入原样返回（不做任何改写）。
   // 只作用于简单模式：含 ### 的配置走多行规则（每行「分类###值」），分隔口径见 RULE_LINE_SPLIT_RE。
   const SIMPLE_LINE_SPLIT_RE = /\r\n|\r|\n/
+  // O2：行拆分只留一份实现——join 与「切块边界」必须逐行对齐，否则块会把一行切成两半。
+  const simpleLinesOf = (val) => {
+    const s = String(val)
+    if (!SIMPLE_LINE_SPLIT_RE.test(s)) return [s]
+    return s.split(SIMPLE_LINE_SPLIT_RE).map((line) => line.trim()).filter((line) => line !== '')
+  }
   const joinSimpleRegexLines = (val) => {
     const s = String(val)
     if (!SIMPLE_LINE_SPLIT_RE.test(s)) return s
-    return s.split(SIMPLE_LINE_SPLIT_RE).map((line) => line.trim()).filter((line) => line !== '').join('|')
+    return simpleLinesOf(s).join('|')
+  }
+
+  // v3.529（O2）：简单模式**切块**。整字段一条 `a|b|c…` 的 alternation 一旦超过约 1,300 个顶层分支，
+  // RE2 就建不出 DFA、整条回退 NFA（成本 ∝ 分支数 × 文本长度）：线上 4,073 个分支实测 1,292 µs/次，
+  // 而按 ≤600 分支切开、命中即短路只要 8~12 µs（110~160×），判定结果与整段正则**完全等价**
+  // （存在性语义：任一行命中 ⇔ 整段命中）。块边界只按行切，绝不拆单行。
+  // 取舍：RE2.Set 更快（~500×），但要显式 maxMem 且是另一个注入面，留到常驻进程能摊薄编译溢价后再评估。
+  const SIMPLE_BLOCK_MAX_BRANCHES = 600
+  const SIMPLE_BLOCK_CAP = 512
+  const SIMPLE_BLOCK_DEGRADED_BRANCHES = 1000
+
+  /** 一行的顶层分支数 = 1 + 未转义 `|` 个数（`\|` 是字面量竖线，不算分支；
+   *  `\\|` 是「转义反斜杠 + 分支」，故看前面反斜杠个数的奇偶）。 */
+  const countLineBranches = (line) => {
+    let pipes = 0
+    let backslashes = 0
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i]
+      if (ch === '\\') { backslashes++; continue }
+      if (ch === '|' && backslashes % 2 === 0) pipes++
+      backslashes = 0
+    }
+    return pipes + 1
+  }
+
+  /** 单行是否自包含：圆/方/花括号各自配平、无行尾悬挂反斜杠。
+   *  不配平（`(?:a`、`a{`、行尾 `\`）意味着该行与相邻行在整段编译时会跨行拼接
+   *  （`a{` + `b` 整段是字面量 `a{|b`，单独编译却各自成义）——此时逐块与整段不等价，不切块。
+   *  误判方向恒为「保守不切块」（只影响速度，不改判定）。 */
+  const lineSelfContained = (line) => {
+    let paren = 0
+    let bracket = 0
+    let brace = 0
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i]
+      if (ch === '\\') {
+        // 行尾悬挂反斜杠：与下一行拼接时会转义掉中间的 `|`（`a\` + `b` ⇒ `a\|b`），逐块不等价
+        if (i + 1 >= line.length) return false
+        i++
+        continue
+      }
+      if (ch === '(') {
+        paren++
+      } else if (ch === ')') {
+        if (--paren < 0) return false
+      } else if (ch === '[') {
+        bracket++
+      } else if (ch === ']') {
+        if (--bracket < 0) return false
+      } else if (ch === '{') {
+        brace++
+      } else if (ch === '}') {
+        if (--brace < 0) return false
+      }
+    }
+    return paren === 0 && bracket === 0 && brace === 0
+  }
+
+  /** 按「累计分支数 ≤ maxBranches」把行切块；单行自身 > maxBranches ⇒ 独占一块（不拆单行）。
+   *  source 是该块的行用 `|` 连接（与 joinSimpleRegexLines 同一口径），branches 是块内分支数。 */
+  const chunkLinesByBranches = (lines, maxBranches) => {
+    const blocks = []
+    let pending = []
+    let pendingBranches = 0
+    const flush = () => {
+      if (pending.length === 0) return
+      blocks.push({ source: pending.join('|'), branches: pendingBranches })
+      pending = []
+      pendingBranches = 0
+    }
+    for (const line of lines) {
+      const branches = countLineBranches(line)
+      // 巨行（单行 > 上限）独占一块：混进别的行会让整块退回 NFA（实测该块 163~196 µs vs 2.1 µs）
+      if (branches > maxBranches) { flush(); blocks.push({ source: line, branches }); continue }
+      if (pendingBranches + branches > maxBranches) flush()
+      pending.push(line)
+      pendingBranches += branches
+    }
+    flush()
+    return blocks
+  }
+
+  /** 行内**无作用域**的内联标志组 `(?i)` / `(?-i)` / `(?s)`：RE2 里它把**其后整段模式**的标志都改掉，
+   *  于是「整段」与「切块后」不等价（后续块不再继承该标志）。带这类行的一律不切块。
+   *  带冒号的作用域形式 `(?i:…)` 只作用于本组、天然自包含，不受此限（正则只认无冒号形态）。 */
+  const INLINE_FLAG_RE = /\(\?[a-zA-Z-]+\)/
+
+  /** `\Q…\E` 引用块在整段里可以跨行：`\Qabc` + `def` 的整段是字面量「abc|def」，而两块各自编译
+   *  都成功、语义却不同（块 1 命中 abc、块 2 命中 def）——这是**编译成功但不等价**的唯一形态，
+   *  括号配平查不出来，故出现 `\Q`/`\E` 的行一律不切块（保守方向：只影响速度）。 */
+  const QUOTE_ESCAPE_RE = /\\[QE]/
+
+  /** 简单模式切块：返回 [{ re, source, branches }]，或 null（= 不切块，用整段正则）。
+   *  null 的四种来源：① 某行跨行拼接（lineSelfContained 为假）；② 某行带无作用域内联标志；
+   *  ③ 某行出现 `\Q`/`\E`（跨行引用块）；④ 某块编译不出来而整段能编出来（病态规则）
+   *  ——都退回「现状的整条正则」，编译结果不变。 */
+  const buildSimpleBlocks = (lines, field) => {
+    if (!lines.every((line) => lineSelfContained(line) && !INLINE_FLAG_RE.test(line) && !QUOTE_ESCAPE_RE.test(line))) return null
+    let blocks = chunkLinesByBranches(lines, SIMPLE_BLOCK_MAX_BRANCHES)
+    if (blocks.length > SIMPLE_BLOCK_CAP) {
+      // 块太多 ⇒ 每块的固定调用开销会盖过收益，退化为大块（仍远低于 NFA 悬崖）
+      console.warn(`⚠️ 规则「${String(field)}」简单模式切块数 ${blocks.length} 超过上限 ${SIMPLE_BLOCK_CAP}，已退化为每 ${SIMPLE_BLOCK_DEGRADED_BRANCHES} 分支一块`)
+      blocks = chunkLinesByBranches(lines, SIMPLE_BLOCK_DEGRADED_BRANCHES)
+    }
+    const out = []
+    for (const block of blocks) {
+      const re = compileUserRegex(block.source, 'i')
+      if (!re) return null
+      out.push({ re, source: block.source, branches: block.branches })
+    }
+    return out.length > 0 ? out : null
   }
 
   // C9-018：pingbitime 天数上限的**唯一字面量**（3650000 天 ≈ 10000 年）。此前 compileRules 与
@@ -305,12 +422,18 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
           val = val.trim()
           if (!val) { compiled[field] = null; continue }
           // v3.390：按行写的多个值等价于 a|b（见 joinSimpleRegexLines）
+          const simpleLines = simpleLinesOf(val) // v3.529：切块边界必须先取（join 之后行边界就没了）
           val = joinSimpleRegexLines(val)
           if (!val) { compiled[field] = null; continue }
           if (this.hasNestedQuantifier(val)) { compiled[field] = null; continue } // ReDoS 防护
           const re = compileUserRegex(val, 'i')
           if (re) {
-            compiled[field] = { _type: 're', re, source: val }
+            const entry = { _type: 're', re, source: val }
+            // v3.529（O2）：re 仍是整段一条正则（诊断/断言口径不变），blocks 是逐块短路用的等价副本；
+            // 任何一块编不出来/行不自包含 ⇒ blocks 缺席，matchesCompiled 退回整条 re。
+            const blocks = buildSimpleBlocks(simpleLines, field)
+            if (blocks) entry.blocks = blocks
+            compiled[field] = entry
           } else {
             if (!isRe2Available()) {
               compiled[field] = null
@@ -512,6 +635,15 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
 
       if (compiled._type === 're') {
       // 简单正则（形状守卫与 .test 异常处理都在 _safeTestText 内：不命中即放行）
+      // v3.529（O2）：优先逐块匹配、命中即短路（各块与整段等价，见 buildSimpleBlocks）。
+      // blocks 缺失/非数组/空数组（旧编译产物、手搓 { _type:'re', re } 夹具）⇒ 退回整条 re，行为逐字不变。
+        const blocks = Array.isArray(compiled.blocks) ? compiled.blocks : null
+        if (blocks && blocks.length > 0) {
+          for (const block of blocks) {
+            if (this._safeTestText(block && block.re, text)) return true
+          }
+          return false
+        }
         return this._safeTestText(compiled.re, text)
       }
 

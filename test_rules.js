@@ -395,4 +395,138 @@ const r2Warn = (fn) => {
     ['⚠️ 配置「pingbitime」的天数值「3650001」超过上限 3650000 天，已忽略'])
 }
 
+// ===================== v3.529（O2）：简单模式切块 =====================
+// 整条 alternation 在 RE2 里约 1,300 个顶层分支就掉出 DFA 快路（改走 NFA，成本 ∝ 分支数 × 文本长度），
+// 故按行切成 ≤600 分支的小块、命中即短路；判定与整段正则完全等价（存在性语义）。
+// 下面每条都是「把切块关掉/改坏就变红」的结构断言：块数、每块上限、巨行隔离、块数上限退化、
+// 命中短路、防回退安全网、单行零改写的等价性。
+const o2Cases = []
+const o2Check = (name, fn) => {
+  try { const detail = fn(); o2Cases.push('✅ ' + name + (detail ? '：' + detail : '')) } catch (e) { o2Cases.push('❌ ' + name + '：' + e.message); process.exitCode = 1 }
+}
+const o2MakeEngine = (compileUserRegex) => createRuleEngine({
+  Utils: r2Utils,
+  FILTER_FIELDS: ['keyword'],
+  compileUserRegex,
+  isRe2Available: () => true
+})
+// 夹具里不含转义 `|`，故「source 里的 | 个数 + 1」= 该块的分支数（与实现同一公式的独立复算）
+const o2BranchesOf = (source) => source.split('|').length
+
+o2Check('O2 结构：>600 分支按行切块（700 分支 ⇒ 2 块、每块 ≤600、块内分支可复核）', () => {
+  const lines = []
+  for (let i = 0; i < 350; i++) lines.push('aa' + i + '|bb' + i) // 每行 2 分支 ⇒ 700 分支
+  const r = o2MakeEngine(r2Compile).compileRules({ keyword: lines.join('\n') })
+  assert.strictEqual(r.keyword._type, 're', '简单模式仍必须是 _type=re（blocks 不改 _type）')
+  assert.strictEqual(r.keyword.re.source, r.keyword.source, 're 必须仍是整段原文编译出的整条正则')
+  assert.strictEqual(r.keyword.blocks.length, 2, '700 分支必须切成 2 块（600 + 100），实际 ' + r.keyword.blocks.length)
+  for (const b of r.keyword.blocks) {
+    assert.ok(b.branches <= 600, '每块分支数必须 ≤600，实际 ' + b.branches)
+    assert.strictEqual(o2BranchesOf(b.source), b.branches, '块的 branches 必须与 source 里的分支数一致（' + b.source.slice(0, 20) + '…）')
+  }
+  // 块边界必须与 joinSimpleRegexLines 的 join 边界完全一致：块 source 拼回去 == 整段
+  assert.strictEqual(r.keyword.blocks.map((b) => b.source).join('|'), r.keyword.source, '块拼接必须逐字等于整段源码（不拆行、不漏行）')
+  assert.strictEqual(r.keyword.blocks[0].branches, 600, '第一块必须恰好 600 分支（累计超 600 才切）')
+  assert.ok(o2MakeEngine(r2Compile).compileStateOf(r).includes('keyword=re'), 'compileStateOf 必须仍输出 keyword=re')
+  return 'blocks=' + r.keyword.blocks.map((b) => b.branches).join('+')
+})
+
+o2Check('O2 结构：单行 >600 分支的巨行独占一块且只含这一行', () => {
+  const giant = Array.from({ length: 713 }, (_, i) => '城' + i).join('|') // 712 个 | ⇒ 713 分支
+  const r = o2MakeEngine(r2Compile).compileRules({ keyword: ['甲', '乙|丙', giant, '丁'].join('\n') })
+  assert.strictEqual(r.keyword.blocks.length, 3, '巨行必须夹在两块之间独占一块，实际块数 ' + r.keyword.blocks.length)
+  assert.strictEqual(r.keyword.blocks[1].branches, 713, '巨行块的分支数必须是 713')
+  assert.strictEqual(r.keyword.blocks[1].source, giant, '巨行块必须逐字等于那一行（不得与相邻行拼在一起）')
+  assert.strictEqual(r.keyword.blocks[0].source, '甲|乙|丙', '巨行前的行仍按 ≤600 分支成块')
+  assert.strictEqual(r.keyword.blocks[2].source, '丁', '巨行后的行单独成块')
+  const eng = o2MakeEngine(r2Compile)
+  assert.strictEqual(eng.matchesCompiled(r.keyword, '城712'), true, '巨行块必须命中其末位城市')
+  assert.strictEqual(eng.matchesCompiled(r.keyword, '丙'), true, '巨行前的块仍须命中')
+  assert.strictEqual(eng.matchesCompiled(r.keyword, '戊'), false, '未列出的词仍不命中')
+  return 'blocks=' + r.keyword.blocks.map((b) => b.branches).join('+')
+})
+
+o2Check('O2 结构：块数超 512 退化为每 1000 分支一块，且只告警一次', () => {
+  // 320,000 分支：600 档会切出 534 块（>512）⇒ 退化到 1000 档（320 块）。
+  // 编译用替身（返回假 re）——真编译 32 万分支的整条正则既慢又会被引擎规模上限拒掉，
+  // 本用例只校验结构，不校验匹配。
+  const lines = []
+  for (let i = 0; i < 160000; i++) lines.push('k' + i + '|v' + i) // 每行 2 分支
+  const eng = o2MakeEngine((src) => ({ test: () => false, source: String(src) }))
+  let r = null
+  const warns = r2Warn(() => { r = eng.compileRules({ keyword: lines.join('\n') }) })
+  assert.strictEqual(warns.length, 1, '块数上限退化必须只告警一次，实际 ' + warns.length + ' 次')
+  assert.ok(warns[0].includes('512'), '告警必须点名上限 512，实际：' + warns[0])
+  assert.ok(warns[0].includes('keyword'), '告警必须点名字段（便于定位是哪条规则），实际：' + warns[0])
+  assert.ok(r.keyword.blocks.length <= 512, '退化后块数必须 ≤512，实际 ' + r.keyword.blocks.length)
+  for (const b of r.keyword.blocks) assert.ok(b.branches <= 1000, '退化后每块必须 ≤1000 分支，实际 ' + b.branches)
+  assert.strictEqual(r.keyword.blocks.map((b) => b.source).join('|'), r.keyword.source, '退化切块后仍必须覆盖整段原文')
+  return 'blocks=' + r.keyword.blocks.length + '，maxBranches=' + Math.max(...r.keyword.blocks.map((b) => b.branches))
+})
+
+o2Check('O2 结构：命中即短路（第一块命中时后续块一次都不调用）', () => {
+  const lines = []
+  for (let i = 0; i < 350; i++) lines.push('aa' + i + '|bb' + i) // 2 块
+  const eng = o2MakeEngine(r2Compile)
+  const r = eng.compileRules({ keyword: lines.join('\n') })
+  let laterCalls = 0
+  r.keyword.blocks[1] = { re: { test: () => { laterCalls++; return false } }, source: 'stub', branches: 1 }
+  assert.strictEqual(eng.matchesCompiled(r.keyword, 'bb7'), true, '第一块命中必须判 true')
+  assert.strictEqual(laterCalls, 0, '第一块命中后不得再调用后续块（命中短路），实际调用 ' + laterCalls + ' 次')
+  assert.strictEqual(eng.matchesCompiled(r.keyword, '都没有'), false, '全块不命中必须判 false')
+  assert.strictEqual(laterCalls, 1, '不命中时必须逐块扫完（第二块被调用 1 次），实际 ' + laterCalls + ' 次')
+  return 'laterCalls(命中)=0 / (不命中)=1'
+})
+
+o2Check('O2 等价性：单行/小规则仍 1 块，且 blocks 与整条 re 判定一致', () => {
+  const eng = o2MakeEngine(r2Compile)
+  const single = eng.compileRules({ keyword: '京东|淘宝' })
+  assert.strictEqual(single.keyword.blocks.length, 1, '单行规则必须只有 1 块（不做多余改写）')
+  assert.strictEqual(single.keyword.blocks[0].source, '京东|淘宝', '单行规则的块源码必须逐字等于整段')
+  assert.strictEqual(single.keyword.blocks[0].branches, 2, '单行规则的块分支数必须是 2')
+  const multi = eng.compileRules({ keyword: '  京东  \r\n\r\n 淘宝 ' })
+  assert.strictEqual(multi.keyword.blocks.length, 1, '多行小规则（2 行 2 分支）必须是 1 块')
+  assert.strictEqual(multi.keyword.source, '京东|淘宝', '小规则仍按 joinSimpleRegexLines 归一（空白行/缩进都归一）')
+  for (const value of ['京东', '淘宝', '天猫', '京', '淘宝京东']) {
+    assert.strictEqual(eng.matchesCompiled(single.keyword, value), single.keyword.re.test(value), 'blocks 与 re 判定必须一致：' + value)
+  }
+  return 'single.blocks=1(2 分支)，判定逐条一致'
+})
+
+o2Check('O2 安全网：跨行拼接的病态规则退回整条正则（不切块、判定不变）', () => {
+  const eng = o2MakeEngine(r2Compile)
+  // ① 行尾悬挂反斜杠：整段 a\|b 是字面量「a|b」，逐块编译会失败 ⇒ 必须退回、且判定与整段一致
+  const backslash = eng.compileRules({ keyword: '京东\\\n淘宝' })
+  assert.strictEqual(backslash.keyword.blocks, undefined, '行尾悬挂反斜杠必须退回不分块')
+  assert.strictEqual(backslash.keyword.re.test('京东|淘宝'), true, '退回后仍是整段的字面量语义')
+  assert.strictEqual(eng.matchesCompiled(backslash.keyword, '京东|淘宝'), true, '退回后的判定必须与整段一致')
+  assert.strictEqual(eng.matchesCompiled(backslash.keyword, '京东'), false, '退回后不得把两行当成两个分支')
+  // ② 跨行未闭合分组：整段 (?:京东|淘宝) 合法，第一块 (?:京东 编不出来 ⇒ 退回
+  const group = eng.compileRules({ keyword: '(?:京东\n淘宝)' })
+  assert.strictEqual(group.keyword.blocks, undefined, '跨行未闭合分组必须退回不分块')
+  assert.strictEqual(eng.matchesCompiled(group.keyword, '淘宝'), true, '退回后仍按整段匹配')
+  // ③ 未闭合花括号：整段 a{|b 里的 `{` 是字面量，逐块 a{ 却会跨行断义 ⇒ 退回（保守不切）
+  const brace = eng.compileRules({ keyword: 'a{\nb' })
+  assert.strictEqual(brace.keyword.blocks, undefined, '未闭合花括号必须退回不分块（误判方向只能是「不切」）')
+  assert.strictEqual(eng.matchesCompiled(brace.keyword, 'a{|b'), brace.keyword.re.test('a{|b'), '退回后的判定必须与整段逐条一致')
+  // ④ 无作用域内联标志 (?i)：RE2 里它改的是「其后整段」的标志，切块后只影响本块 ⇒ 退回。
+  //    用替身编译（V8 不保证支持 (?i) 这类修饰符），只验「不切块 + 只编译整段一次」。
+  const flagSources = []
+  const flagEng = o2MakeEngine((src) => { flagSources.push(String(src)); return { test: () => false, source: String(src) } })
+  const flag = flagEng.compileRules({ keyword: '(?i)abc\ndef' })
+  assert.strictEqual(flag.keyword.blocks, undefined, '带 (?i) 的行必须退回不分块（标志会跨行泄漏）')
+  assert.deepStrictEqual(flagSources, ['(?i)abc|def'], '退回后只编译整段一次，不得再逐块编译')
+  // ⑤ `\Q…\E` 引用块跨行：`\Qabc` + `def` 整段是字面量「abc|def」；实测 RE2 下两块各自都能编译
+  //    （块 1 命中 abc、块 2 命中 def），语义与整段不同，且括号配平查不出来 ⇒ 带 \Q/\E 的行一律退回。
+  const quoteSources = []
+  const quoteEng = o2MakeEngine((src) => { quoteSources.push(String(src)); return { test: () => false, source: String(src) } })
+  const quote = quoteEng.compileRules({ keyword: '\\Qabc\ndef' })
+  assert.strictEqual(quote.keyword.blocks, undefined, '带 \\Q 的行必须退回不分块（引用块会跨行）')
+  assert.deepStrictEqual(quoteSources, ['\\Qabc|def'], '退回后只编译整段一次，不得逐块编译')
+  return '4 例均 blocks=undefined 且判定与整段一致（另 (?i)/(\\Q) 两例只编译整段）'
+})
+
+for (const line of o2Cases) console.log('  ' + line)
+console.log(`O2 切块结构断言 ${o2Cases.filter((l) => l.startsWith('✅')).length}/${o2Cases.length} 通过`)
+
 console.log('test_rules OK')

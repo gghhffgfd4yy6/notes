@@ -2766,6 +2766,67 @@ console.log('========================================\n');
     assertEqual(r.pingbibiaoti.re.test('京东'), true, 'r.pingbibiaoti.re.test(\'京东\') 应等于 true')
   })
 
+  // ---- v3.529（O2）简单模式切块：切块只是「同一存在性判定」的短路实现，判定必须逐条一致 ----
+  // 真实形态（多行 + 行内 | + 单行 713 分支巨行）下，把同一份规则编两遍：一份带 blocks（新路径），
+  // 一份剥掉 blocks（等价于旧实现的「整条正则」路径），对比 matchesCompiled 与 explainFilter。
+  await test('v3.529 O2: 切块与整段正则的判定逐条一致（matchesCompiled + explainFilter 0 差异）', () => {
+    const lines = []
+    for (let i = 0; i < 900; i++) lines.push('品牌' + i) // 900 行字面量
+    lines.push('甲|乙|丙') // 行内 |
+    lines.push(Array.from({ length: 713 }, (_, i) => '城' + i).join('|')) // 单行 713 分支巨行
+    const cfg = { pingbibiaoti: lines.join('\n'), pingbineirong: lines.slice(0, 400).join('\r\n') }
+    const chunked = compileRules(cfg)
+    // 非空断言：没切出多块说明这条用例退化成「整条正则 vs 整条正则」，等于什么都没验
+    assertEqual(chunked.pingbibiaoti.blocks.length > 1, true, '巨型规则必须切出多块，实际 ' + chunked.pingbibiaoti.blocks.length)
+    assertEqual(chunked.pingbibiaoti.re.source, chunked.pingbibiaoti.source, 're 必须仍是整段原文编译出的整条正则（诊断口径不变）')
+    const whole = {} // 对照组：同一份规则、只保留整条正则（blocks 缺失 ⇒ 旧路径）
+    for (const key of Object.keys(chunked)) {
+      const c = chunked[key]
+      whole[key] = c && c._type === 're' ? { _type: 're', re: c.re, source: c.source } : c
+    }
+    const values = ['品牌0', '品牌599', '品牌600', '品牌899', '甲', '乙', '丙', '城0', '城712', '城713', '不存在的词', '品牌1 好价']
+    const diffs = []
+    for (const field of ['pingbibiaoti', 'pingbineirong']) {
+      for (const value of values) {
+        const a = matchesCompiled(chunked[field], value, '')
+        const b = matchesCompiled(whole[field], value, '')
+        if (a !== b) diffs.push(field + '/' + value + '：切块=' + a + ' 整段=' + b)
+      }
+    }
+    assertEqual(diffs.join('；'), '', '切块与整段正则的 matchesCompiled 判定必须逐条一致')
+    const items = [
+      makeItem({ title: '品牌3 好价' }),
+      makeItem({ title: '完全无关的标题' }),
+      makeItem({ content: '城700' }),
+      makeItem({ content: '限时抢购，手慢无' }),
+      makeItem({ title: '品牌899', content: '城0' }),
+      makeItem({ catename: '数码' })
+    ]
+    for (const item of items) {
+      const a = explainFilter(item, chunked)
+      const b = explainFilter(item, whole)
+      const aStage = a.reason ? a.reason.stage : null
+      const bStage = b.reason ? b.reason.stage : null
+      assertEqual(a.passed, b.passed, 'explainFilter.passed 必须一致（title=' + item.title + '）')
+      assertEqual(aStage, bStage, 'explainFilter.reason.stage 必须一致（title=' + item.title + '）')
+    }
+    // 命中确实发生过（否则上面全是「都不命中」的平凡一致）
+    assertEqual(explainFilter(makeItem({ title: '品牌3 好价' }), chunked).passed, false, '命中的标题必须被拦截')
+    assertEqual(explainFilter(makeItem({ title: '完全无关的标题' }), chunked).passed, true, '不命中的标题必须放行')
+  })
+
+  await test('v3.529 O2: 有 blocks 时只用 blocks（忽略 compiled.re），空 blocks 才回落', () => {
+    const boom = { test: () => { throw new Error('有 blocks 时不得调用 compiled.re') } }
+    const withBlocks = { _type: 're', re: boom, source: '京东', blocks: [{ re: /京东/, source: '京东', branches: 1 }, { re: /淘宝/, source: '淘宝', branches: 1 }] }
+    assertEqual(matchesCompiled(withBlocks, '京东'), true, '第一块命中必须 true（不得走 compiled.re）')
+    assertEqual(matchesCompiled(withBlocks, '淘宝'), true, '后续块命中必须 true')
+    assertEqual(matchesCompiled(withBlocks, '天猫'), false, '全部块不命中必须 false')
+    // 空 blocks ⇒ 回落整条 re（旧编译产物/手搓对象的兼容契约）
+    const emptyBlocks = { _type: 're', re: /京东/, source: '京东', blocks: [] }
+    assertEqual(matchesCompiled(emptyBlocks, '京东'), true, 'blocks 为空数组时必须回落 compiled.re')
+    assertEqual(matchesCompiled(emptyBlocks, '淘宝'), false, 'blocks 为空数组时仍是整条 re 的判定')
+  })
+
   // ==================== C007 _legacyCompileKey 字符串/对象同缓存键 ====================
   console.log('\n📂 29. C007 _legacyCompileKey 字符串/对象同缓存键')
 
