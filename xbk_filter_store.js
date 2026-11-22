@@ -7,15 +7,16 @@
 // 职责边界（规格 §3 / 计划 §3.1）：
 //   · 只做「读覆盖文件 → 合并代码默认 → 生效规则」与「校验待保存规则」；
 //   · 只做「写/读生效快照」与「审计/锁/备份路径」helper；
-//   · **不**读规则于模块加载期（每轮由 App.run 调用 loadFilterRules 一次）；
-//   · **不**缓存 activeFilter——模块级状态只有 last-known-good（损坏降级用，按 cacheDir 分槽）；
+//   · **不**读规则于模块加载期；常驻侧由 App.run 每轮经 loadFilterRulesCached 探测覆盖文件签名，未命中才调 loadFilterRules；
+//   · **不**在模块级跨轮缓存 activeFilter——跨轮复用状态由调用方持有（createRulesReuseCache），
+//     模块级状态只有 last-known-good（损坏降级用，按 cacheDir 分槽）；
 //   · **不** require xbk_function_v3（会与 xbk_app → FilterStore 形成循环依赖）；
 //     RuleEngine / compileUserRegex / RE2 可用性一律由调用方经 deps 注入；
 //   · 全程同步、零新依赖；读走 xbk_storage.readSafeTextResult，写走 writeAtomic（原子 + 0600）。
 //
 // 失败语义：本模块的任何导出都**不 throw**——校验失败返回 {ok:false,errors}，
 //   读取失败走 {source:'corrupt',degraded:true} 降级并保留 last-known-good。
-//   这是硬约束：loadFilterRules 在每轮 App.run 开头执行，抛穿会杀掉整轮推送。
+//   这是硬约束：loadFilterRules 位于每轮 App.run 的准备路径上（签名命中的轮次不进入它），抛穿会杀掉整轮推送。
 //
 // 覆盖文件形状（schema:1）：
 //   { "schema": 1, "revision": <非负整数>, "filter": { <11 字段中任意子集>: "<字符串>" } }
@@ -2125,7 +2126,7 @@ module.exports = {
   mergeActiveFilter,
   loadFilterRules,
   // O1：常驻进程内的「签名不变 ⇒ 复用上一轮 active」入口与它的进程内状态工厂。
-  // 状态由调用方（App）持有：本模块不存任何跨轮状态（与「不缓存 activeFilter」的既有边界一致）。
+  // 状态由调用方（App）持有：本模块不存任何跨轮状态（模块级只有 last-known-good，与既有边界一致）。
   loadFilterRulesCached,
   createRulesReuseCache,
   // 仅供测试直调（生产代码只经 loadFilterRules / corruptResult 使用）：验证「写侧不得产出读不回的文件」
