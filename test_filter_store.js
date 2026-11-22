@@ -2335,10 +2335,13 @@ test('F2-1 LKG 内容未变不重写（两轮 mtime/inode 不动）；改一行�
   assert.match(readJson(paths.lastgood).hash, /^[0-9a-f]{64}$/, '损坏的 LKG 必须被重写成合法内容')
 
   // 权限不符：必须写（跳过写盘不得放弃「每轮修回 0600」——LKG 里有用户全部规则正文）。
-  // 宽权限同样用**位组合**表达（0600 + group/other 只读 = 0644）：不写字面量宽松权限
-  // （Sonar S2612 把 chmod 的宽松字面量判成漏洞），也不在 chmod 前再取一次 stat
-  // （那是 CodeQL js/file-system-race 的 check→use 形状）。被钉住的语义不变：非 0600 必须自愈。
-  const looseMode = 0o600 | 0o044
+  // 构造「不是 0600」的形态用只含 owner 位的字面量 0o700（属主 rwx、group/other 位全清）：
+  // 既不对 group/other 开放任何位（Sonar S2612 对 chmod 的宽松模式报漏洞），也不在 chmod 前
+  // 再取一次 stat（那是 CodeQL js/file-system-race 的 check→use 形状）。不能用「0600 + group/other
+  // 只读」的位组合代替：常量折叠后就是 0644，S2612 照样判不安全。
+  // 为什么不是 0600：isOwnerOnlyFile() 精确比较 (mode & 0o777) === 0o600，写成 0600 就进不了
+  // 「权限不符」分支，这条用例什么都没测。被钉住的语义不变：非 0600 必须自愈。
+  const looseMode = 0o700
   assert.notStrictEqual(looseMode, 0o600, '前置：构造出的模式必须真的不是 0600（否则这条用例什么都没测）')
   fs.chmodSync(paths.lastgood, looseMode)
   assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, looseMode,
