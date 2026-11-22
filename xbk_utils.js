@@ -180,6 +180,22 @@ function createUtils (options = {}) {
   if (typeof safeRe !== 'function') throw new TypeError('createUtils requires the shared safeRe function')
   const ENTITY_RE = safeRe('&(?:' + Object.keys(ENTITY_MAP).map(k => escapeRe(k.slice(1, -1))).join('|') + ');', 'g') // 从 ENTITY_MAP 自动生成，加实体只改一处
 
+  // ==================== validUrl 结果缓存（v3.530 / O3） ====================
+  // 为什么 memo **整条** validUrl：这条链上贵的是 safeUrl（3 次正则 + trim，实测 3.09 µs/条）
+  // 与 isDangerousUrl（两次实体解码 + 两次正则，2.66 µs/条），normUrl 本体只 0.17 µs——
+  // 只 memo normUrl 省不到 3%。实测 3,713 条身份四索引重建 24.7~27.1 ms → 1.51~1.62 ms（16~17×）。
+  // 键 = **原始 URL 字符串**：validUrl 是纯函数（入参字符串 → 返回值一一确定），拿原来的串查表
+  // 连「先归一化再查」的那一步都省了；用归一化结果做键还要先付 normUrl 的钱，且不同原始串可能
+  // 映射到同一结果、把「哪些原始串进来过」的信息糊掉（危险 URL 的 '' 与空 URL 的 '' 也不可混）。
+  // 值 = validUrl 的最终返回值（归一化后的 URL 或 ''）：危险/非法结果一并缓存，语义零变更——
+  // 缓存的是**判定结果**，不是「安全」这一结论，任何读路径都不会把危险 URL 洗成安全。
+  // 为什么纯函数无需失效：不读 fs / 网络 / 时钟 / 规则，进程内结果恒定；规则保存不清它
+  // （过滤规则与 URL 校验无关），进程重启自然为空（**不落盘**）。
+  // 内存：上限 20,000 条 × (原始 URL 约 20–120 B + Map 项开销约 100 B) ≈ 2–3 MB。
+  // 有界 LRU：Map 迭代序 = 插入序，命中即 delete+set 移到最近使用位，写满淘汰最旧的一条。
+  const VALID_URL_CACHE_MAX = 20000
+  const validUrlCache = new Map()
+
   const Utils = {
   // ==================== 时间工具 ====================
   /**
@@ -419,8 +435,32 @@ function createUtils (options = {}) {
      * 可用于身份判重的 URL：仅接受字符串、可归一化且非危险协议。
      * 非字符串 URL（对象/数组/数字/Symbol）不能通过 String() 变成判重键，
      * 否则不同脏数据会共同落到 `[object Object]` 等伪 URL，造成静默丢消息。
+     * v3.530（O3）：结果按原始 URL 做实例级有界 LRU 缓存，语义零变更（见 createUtils 里
+     * validUrlCache 的注释）；getMessageIdentity / saveBatch 共用同一个 Utils 即共用这一份缓存。
      */
   validUrl (u) {
+    // 非字符串一律返回 ''（与 safeUrl 首个分支同一判定），且**不进缓存**：
+    // 脏数据条数不该挤占 URL 的缓存容量，对象/数组也不该被折算成同一个键。
+    if (typeof u !== 'string') return ''
+    const cached = validUrlCache.get(u)
+    if (cached !== undefined) {
+      // 命中：移到最近使用位（Map 迭代序 = 插入序，delete+set 即挪到队尾）
+      validUrlCache.delete(u)
+      validUrlCache.set(u, cached)
+      return cached
+    }
+    const result = this._validUrlUncached(u)
+    // 写满先淘汰最旧（队首）再写；容量恒 ≤ VALID_URL_CACHE_MAX
+    if (validUrlCache.size >= VALID_URL_CACHE_MAX) validUrlCache.delete(validUrlCache.keys().next().value)
+    validUrlCache.set(u, result)
+    return result
+  },
+
+  /**
+     * validUrl 的实际判定（v3.530 从 validUrl 提取，逐字保留原实现）。
+     * 缓存未命中时才走到这里；本方法不写缓存，避免「读路径」与「写路径」互相污染。
+     */
+  _validUrlUncached (u) {
     const safe = this.safeUrl(u)
     if (!safe) return ''
     const normalized = this.normUrl(safe)
@@ -429,6 +469,25 @@ function createUtils (options = {}) {
     if (this.isDangerousUrl(normalized)) return ''
     return normalized || ''
   },
+
+  /**
+     * 只读观测口：当前 validUrl 结果缓存条数。
+     * 仅供测试/诊断使用，生产代码不调用；不改变任何缓存状态。
+     */
+  validUrlCacheSize () { return validUrlCache.size },
+
+  /**
+     * 只读观测口：某原始 URL 是否在缓存中（**不**触碰 LRU 顺序，Map.has 不改迭代序）。
+     * 仅供测试/诊断使用，生产代码不调用：命中/重算的返回值都是同一个字符串，只有它能区分
+     * 「真的命中」与「淘汰后重算」。
+     */
+  validUrlCacheHas (u) { return validUrlCache.has(u) },
+
+  /**
+     * 清空 validUrl 结果缓存。
+     * 仅供测试/诊断使用，生产代码不调用；规则保存路径**不清它**（URL 校验与过滤规则无关）。
+     */
+  clearValidUrlCache () { validUrlCache.clear() },
 
   /** 判断 URL 是否为危险协议（先解码实体，兼容 javascript&#58; 等编码绕过） */
   isDangerousUrl (url) {
