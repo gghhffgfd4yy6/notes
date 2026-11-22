@@ -2395,7 +2395,9 @@ function appendFilterAudit ({ auditPath, actor, action, revision, changedFields 
 
 // 审计失败时把覆盖文件回滚为保存前内容：原本有文件（含损坏文件）就原子写回原文，
 // 原本没有就删掉本次新建的文件——绝不留下「规则已生效但审计缺失」的状态。
-function rollbackFilterOverride (paths, previousText) {
+// createdNew 必填真值才允许删（F2-4）：previousText=null 也可能是「文件读不回来」（>body 上限、
+// 非普通文件、瞬时 IO 错），把那种情况当成「原本没有文件」删掉，就是把用户整份规则从磁盘上抹去。
+function rollbackFilterOverride (paths, previousText, createdNew = false) {
   // 有保存前原文：只尝试写回，失败就如实报 rolledBack:false，绝不删文件（删除会把
   // 「保存前规则」变成「代码默认」，是比留下旧规则更大的语义跳变）。
   if (typeof previousText === 'string') {
@@ -2404,6 +2406,7 @@ function rollbackFilterOverride (paths, previousText) {
     } catch (e) { /* 落到下面如实上报 */ }
     return { ok: false, mode: 'restore_failed' }
   }
+  if (!createdNew) return { ok: false, mode: 'read_failed' }
   // 原本没有覆盖文件（本次新建）：删掉才回到保存前状态。
   try {
     fs.unlinkSync(paths.file)
@@ -2420,6 +2423,11 @@ function rollbackFilterOverride (paths, previousText) {
 //   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
 //   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
 //   computeHash=false 给导入用：它不返回 hash，也就不必为拿摘要去懒加载规则引擎。
+//   tooLarge 早退（读不回保存前原文）**只对保存生效**：覆盖文件超过读硬顶（= body 上限 256 KiB）
+//   时 loadCurrentFilter 判 corrupt、上一代原文读不回来，保存必须中止（宁可拒写，不覆盖看不见的内容）。
+//   但 /restore（回滚备份 / 恢复默认）与 /api/backup/import 恰恰是这个状态下**唯一**的自助修复路径：
+//   把它们也 500 掉，用户只能上机器手改文件。故这三个 action 继续提交，previousText 保持 null、
+//   previousFileMissing 保持 false（rollbackFilterOverride 因此绝不 unlink），直接原子写新一代。
 function commitFilterOverride ({
   paths, deps, defaults, loaded, filterValue, action, actorToken,
   writeLabel = '过滤规则覆盖文件', computeHash = true, rollbackOnAuditFailure = true
@@ -2428,11 +2436,32 @@ function commitFilterOverride ({
   // 改文件前先备份当前这一代：合法覆盖文件既写备份（回滚用），也留原文给审计失败回滚；
   // 损坏文件不备份（不是可回滚的代），但仍留原文，审计失败时原样写回。
   let previousText = null
+  // 保存前是否**确实**没有覆盖文件（F2-4：只有这种情况回滚才允许 unlink）
+  let previousFileMissing = loaded.source === 'default'
+  // 保存前原文是否因超上限读不回（>body 上限）：备份需要原文，读不到就没法备份（也不该拿
+  // 看不见的旧内容当回滚点）。只有这一种「读不回」允许继续提交，见下面 tooLarge 分支。
+  let previousReadTooLarge = false
   if (loaded.source === 'override' || loaded.source === 'corrupt') {
     const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
     if (raw.status === 'ok') previousText = raw.text
+    else if (raw.status === 'missing') previousFileMissing = true
+    // F2-4：**保存**时读不回保存前原文就绝不写盘。旧实现把 previousText=null 一律当成「原本没有覆盖文件」，
+    // 审计失败回滚时直接 unlink，把用户整份规则文件删掉。真正会丢数据的是 tooLarge：文件比 body 上限
+    // （= 读硬顶 256 KiB）大 ⇒ 加载判 corrupt、这里读不回来，而下一行 writeAtomic 仍会把它覆盖掉。
+    // 此时**保存**中止本次提交、原文件一个字节不动（这是唯一「看不见就别写」的调用方）。
+    // 恢复 / 恢复默认 / 导入不中止：它们正是这个状态下的自助修复路径，旧代码在这三条路径上就是
+    // 200 并重写文件，中止只会把用户锁死在损坏状态里。它们继续往下走，previousText 保持 null 且
+    // previousFileMissing 保持 false ⇒ 审计失败时 rollbackFilterOverride 走 read_failed、绝不 unlink。
+    // 其余状态保持原语义：missing = 保存前没有文件（回滚 unlink 才是正确的）；unsafe（目标是目录/FIFO）
+    // 继续落到 writeAtomic 如实报 write_failed。
+    else if (raw.status === 'tooLarge') {
+      if (action === 'save') return { ok: false, status: 500, body: { error: 'rollback_read_failed', code: 'rollback_read_failed' } }
+      previousReadTooLarge = true
+    }
     // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
-    if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+    // tooLarge 例外：原文读不回来 ⇒ backupFilterFile 必然返回 false，此时报 backup_failed 是假错误码
+    // （真正的失败是读不回，而上面已按调用方分别处理）。unsafe 仍按原语义报 backup_failed。
+    if (loaded.source === 'override' && !previousReadTooLarge && !backupFilterFile(paths, curRevision, previousText)) {
       return { ok: false, status: 500, body: { error: 'backup_failed', code: 'backup_failed' } }
     }
   }
@@ -2464,7 +2493,7 @@ function commitFilterOverride ({
     if (!rollbackOnAuditFailure) {
       return { ok: false, status: 500, body: { error: audit.code, code: audit.code } }
     }
-    const rolled = rollbackFilterOverride(paths, previousText)
+    const rolled = rollbackFilterOverride(paths, previousText, previousFileMissing)
     return {
       ok: false,
       status: 500,
@@ -5066,7 +5095,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 口径对齐（I2/F4-1）：lastGoodUsed 只认运行侧本轮写进 applied.json 的记录。控制台进程读文件
       // 时自己也会刷新 LKG（那描述的是「下次降级能用什么」），拿它冒充运行侧状态会给出假绿。
       lastGoodUsed: FilterStore.appliedLastGoodUsed(applied),
-      auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt }
+      auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt },
+      // F2-5：上限与用量（前端本项只读不用，F3 才接）。字段必须先在，否则前端只能继续写死 256 KiB。
+      ...FilterStore.filterLimitsReport(stateDir, loaded.filter)
     }
     if (corrupt) {
       payload.error = {
@@ -5258,6 +5289,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           code: 'cache_unavailable',
           scanned: null,
           capped: false,
+          cappedBy: null,
+          budgetMs: FilterStore.FILTER_PREVIEW_BUDGET_MS,
           reEvalCount: null,
           atLeast: false,
           limit,
@@ -5269,41 +5302,33 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       // 扫描上限只作用于 _f 记录：capped 必须按 _f 条数判定（缓存总条数与补推估算无关）。
       const fRecords = records.filter((entry) => entry && typeof entry === 'object' && entry._f === true)
-      const capped = fRecords.length > FILTER_PREVIEW_SCAN_MAX
       // zkt_gjc 白名单与运行期同源（Config.keyword.zkt_gjc）：标题不匹配白名单的记录即使过了
       // 候选规则也不会补推，必须从估算里排除；拿不到编译能力时按「未应用」如实标注。
       const zktRegex = previewWhitelistRegex(deps, defaults.keyword)
-      const zktApplied = zktRegex !== null
-      let scanned = 0
-      let reEvalCount = 0
-      const samples = []
-      for (const entry of fRecords) {
-        if (scanned >= FILTER_PREVIEW_SCAN_MAX) break
-        scanned++
-        let verdict = null
-        try { verdict = deps.explainFilter(entry, compiled, candidate) } catch (e) { verdict = null }
-        if (!verdict || verdict.passed !== true) continue
-        if (!previewWhitelistKeeps(entry, zktRegex, deps.RuleEngine && deps.RuleEngine._normalizeReInput)) continue
-        reEvalCount++
-        if (samples.length < limit) {
-          samples.push({
-            id: entry.id === undefined ? null : entry.id,
-            title: typeof entry.title === 'string' ? entry.title : '',
-            reason: verdict.reason === undefined ? null : verdict.reason
-          })
-        }
-      }
+      // F2-2：扫描预算（200 ms / 200 条，先到者）在 store 里实现——console.js 的变异分片只剩个位数
+      // 余量，且那段是纯函数（可直接单测 capped/cappedBy/时间预算）。
+      const scan = FilterStore.scanPreviewRecords({
+        records: fRecords,
+        limit,
+        maxScan: FILTER_PREVIEW_SCAN_MAX,
+        evaluate: (entry) => {
+          try { return deps.explainFilter(entry, compiled, candidate) } catch (e) { return null }
+        },
+        whitelistKeeps: (entry) => previewWhitelistKeeps(entry, zktRegex, deps.RuleEngine && deps.RuleEngine._normalizeReInput)
+      })
       sendJson(res, 200, {
         ok: true,
         available: true,
-        scanned,
-        capped,
-        reEvalCount,
-        atLeast: capped,
+        scanned: scan.scanned,
+        capped: scan.capped,
+        cappedBy: scan.cappedBy,
+        budgetMs: scan.budgetMs,
+        reEvalCount: scan.reEvalCount,
+        atLeast: scan.capped,
         limit,
-        samples,
+        samples: scan.samples,
         cacheStatus: read.status,
-        zktApplied
+        zktApplied: zktRegex !== null
       })
     }).catch((e) => {
       logCaught('filter/preview', e)

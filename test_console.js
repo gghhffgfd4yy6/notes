@@ -2921,7 +2921,7 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则 preview: _f 补推统计（不用 readMessages）+ limit 钳制 + capped(>5000)', async () => {
+  await aok('过滤规则 preview: _f 补推统计（不用 readMessages）+ limit 钳制 + 扫描预算（200 条 / 200ms 先到者）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const pushPath = path.join(dir, 'push.json')
@@ -2954,14 +2954,24 @@ async function filterRuleApiTests () {
       assert.strictEqual(JSON.parse(wideOk.text).reEvalCount, 3)
 
       const many = []
-      for (let i = 0; i < 5001; i++) many.push({ id: String(i), title: 't', content: '', catename: '', shijianchuo: nowS, _f: true })
+      for (let i = 0; i < 5000; i++) many.push({ id: String(i), title: 't', content: '', catename: '', shijianchuo: nowS, _f: true })
       fs.writeFileSync(pushPath, JSON.stringify(many))
+      const previewStart = Date.now()
       const capped = await postFilterJson(port, '/api/config/filter/preview', { filter: {} })
+      const previewMs = Date.now() - previewStart
       assert.strictEqual(capped.status, 200)
       const cappedBody = JSON.parse(capped.text)
-      assert.strictEqual(cappedBody.capped, true, '总条数 >5000 必须 capped')
-      assert.strictEqual(cappedBody.scanned, 5000, '最多扫 5000 条 _f')
-      assert.strictEqual(cappedBody.reEvalCount, 5000)
+      assert.strictEqual(cappedBody.capped, true, '超过扫描预算必须 capped（不得继续同步扫 5000 条）')
+      assert.ok(cappedBody.scanned > 0 && cappedBody.scanned <= 200,
+        `单次 preview 最多扫 200 条（实际 ${cappedBody.scanned}）`)
+      assert.ok(['records', 'time'].indexOf(cappedBody.cappedBy) >= 0,
+        `cappedBy 只能是 records（200 条先到）或 time（200ms 先到），实际 ${String(cappedBody.cappedBy)}`)
+      assert.strictEqual(cappedBody.budgetMs, 200, '响应必须带 budgetMs（前端据此显示「已截断」）')
+      assert.strictEqual(cappedBody.atLeast, true, 'capped 时计数只是下界')
+      assert.ok(cappedBody.reEvalCount <= cappedBody.scanned, '补推数不得超过扫描数')
+      // 定向用例要求：5000 条历史实测 < 400ms（旧实现 5000 × 2.01ms ≈ 11.1s，客户端 8s 直接超时）
+      assert.ok(previewMs < 400, `5000 条历史 preview 必须 <400ms（实测 ${previewMs}ms）`)
+      console.log(`  ⏱️ 5000 条历史 preview 实测 ${previewMs}ms（scanned=${cappedBody.scanned}, cappedBy=${cappedBody.cappedBy}）`)
     } finally { server.close() }
   })
 
@@ -2985,6 +2995,150 @@ async function filterRuleApiTests () {
       server.close()
     }
   })
+  await aok('过滤规则 GET: limits/usage 随响应下发（上限与 FILTER_LIMITS 同源，用量按真实文件量）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    const FilterStore = require('./xbk_filter_store')
+    try {
+      const none = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.deepStrictEqual(Object.keys(none.limits).sort((a, b) => a.localeCompare(b)),
+        ['draftFieldMaxLen', 'fieldMaxLen', 'maxAlternationsPerField', 'maxRuleLines', 'maxRuleLinesPerField', 'readMaxBytes', 'requestBodyMaxBytes', 'rulesFileMaxBytes'],
+        'limits 必须含 spec 要求的五项（F3 起前端据此显示余量）')
+      assert.deepStrictEqual(none.limits.fieldMaxLen, { ...FilterStore.FILTER_LIMITS.fieldMaxLen }, '单字段上限必须与 store 同源（不得再抄一份）')
+      assert.strictEqual(none.limits.fieldMaxLen.pingbibiaoti, 16000)
+      assert.strictEqual(none.limits.rulesFileMaxBytes, 256 * 1024)
+      assert.strictEqual(none.limits.requestBodyMaxBytes, 256 * 1024)
+      assert.strictEqual(none.limits.readMaxBytes, 256 * 1024)
+      assert.strictEqual(none.limits.draftFieldMaxLen, 16000)
+      assert.strictEqual(none.limits.maxRuleLines, 2000)
+      assert.strictEqual(none.limits.maxAlternationsPerField, 1000)
+      assert.strictEqual(none.usage.rulesFileBytes, 0, '没有覆盖文件时按 0 字节')
+      assert.deepStrictEqual(Object.keys(none.usage.fieldChars).sort((a, b) => a.localeCompare(b)),
+        [...FilterStore.FILTER_RULE_FIELDS].sort((a, b) => a.localeCompare(b)), '11 个字段的字符数必须全在')
+
+      // 覆盖文件必须是**合法**形状（{schema, revision, filter}）：否则加载判 corrupt、filter 回默认，
+      // 字段字符数就测不到「覆盖值」这条口径。
+      const body = JSON.stringify({ schema: 1, revision: 1, filter: { pingbibiaoti: '用量词' } })
+      fs.writeFileSync(paths.file, body)
+      const over = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(over.usage.rulesFileBytes, Buffer.byteLength(body), '规则文件字节数必须是真实落盘大小')
+      assert.strictEqual(over.usage.fieldChars.pingbibiaoti, '用量词'.length, '字段字符数按生效规则原文计（覆盖值）')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 覆盖文件读不回（>body 上限）→ 500 rollback_read_failed 且原文件一个字节不动（不再 unlink）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      // 覆盖文件 300 KiB：读硬顶/body 上限都是 256 KiB ⇒ loadCurrentFilter 判 corrupt，
+      // commitFilterOverride 的「保存前原文」读回来也是 tooLarge（旧实现于是 previousText=null）。
+      const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(300 * 1024) } })
+      fs.writeFileSync(paths.file, huge)
+      const before = fs.readFileSync(paths.file)
+      const res = await postFilterJson(port, '/api/config/filter', {
+        schema: 1,
+        baseRevision: 0,
+        confirmReplaceCorrupt: true,
+        filter: { pingbibiaoti: '新规则' }
+      })
+      assert.strictEqual(res.status, 500)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.code, 'rollback_read_failed', `读不回保存前原文必须明确报 rollback_read_failed：${res.text}`)
+      assert.strictEqual(body.error, 'rollback_read_failed')
+      assert.strictEqual(fs.existsSync(paths.file), true, '读不回时绝不能 unlink 原规则文件（F2-4 数据丢失隐患）')
+      assert.deepStrictEqual(fs.readFileSync(paths.file), before, '原文件必须一个字节不动（既未覆盖也未删除）')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径同样必须释放锁')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则恢复: 覆盖文件读不回（>body 上限）时 恢复默认/回滚备份/导入 仍 200 并重写覆盖文件（只有保存中止）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    // 与上一条用例同一夹具形状：300 KiB > 读硬顶/body 上限 256 KiB ⇒ 加载判 corrupt、原文读不回。
+    const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(300 * 1024) } })
+    const hugeBytes = Buffer.byteLength(huge)
+    const lastAuditAction = () => {
+      const lines = fs.readFileSync(paths.audit, 'utf8').trim().split('\n')
+      return JSON.parse(lines[lines.length - 1]).action
+    }
+    try {
+      // 前置：这正是「保存必须中止」的状态，也正是用户唯一还能自助恢复的状态。
+      fs.writeFileSync(paths.file, huge)
+      const before = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(before.source, 'corrupt', '前置：300 KiB 覆盖文件必须判 corrupt')
+      assert.strictEqual(before.revision, 0, '前置：corrupt 时 revision 归 0（恢复请求以它作 baseRevision）')
+      assert.strictEqual(before.usage.rulesFileBytes, hugeBytes, '前置：用量必须报真实文件字节数')
+
+      // 1) 恢复默认：把覆盖文件重写成空规则，用户才能从「读不回的损坏文件」里出来。
+      const reset = await postFilterJson(port, '/api/config/filter/restore', { to: 'default', confirm: true, baseRevision: 0 })
+      assert.strictEqual(reset.status, 200, `恢复默认不得被 tooLarge 早退挡住：${reset.text}`)
+      const resetBody = JSON.parse(reset.text)
+      assert.strictEqual(resetBody.ok, true)
+      assert.strictEqual(resetBody.revision, 1, '恢复默认必须写新一代 revision')
+      assert.strictEqual(resetBody.restoredFrom, 'default')
+      // 存在性直接由读取证明（被 unlink 即抛 ENOENT），不再 existsSync 探路后 use 同一路径。
+      let afterResetText
+      try {
+        afterResetText = fs.readFileSync(paths.file, 'utf8')
+      } catch (e) {
+        assert.fail(`恢复路径不得 unlink 覆盖文件（删文件比留下旧规则更糟；读原文件失败：${e.message}）`)
+      }
+      const afterReset = JSON.parse(afterResetText)
+      assert.deepStrictEqual(afterReset.filter, {}, '恢复默认必须把覆盖文件重写成空规则')
+      assert.strictEqual(afterReset.revision, 1)
+      assert.ok(Buffer.byteLength(afterResetText) < 1024, `恢复默认后文件必须回到常规大小（实际 ${Buffer.byteLength(afterResetText)} 字节）`)
+      assert.strictEqual(lastAuditAction(), 'reset_default', '恢复默认必须留 reset_default 审计')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '恢复默认成功后必须释放锁')
+
+      // 2) 回滚到备份：备份文件本身合法（小于上限），覆盖文件仍是读不回的 300 KiB。
+      fs.writeFileSync(paths.file, huge)
+      const backupRev = 3
+      fs.writeFileSync(paths.backupFor(backupRev), JSON.stringify({ schema: 1, revision: backupRev, filter: { pingbibiaoti: '备份规则' } }))
+      const back = await postFilterJson(port, '/api/config/filter/restore', { to: backupRev, confirm: true, baseRevision: 0 })
+      assert.strictEqual(back.status, 200, `回滚到备份不得被 tooLarge 早退挡住：${back.text}`)
+      const backBody = JSON.parse(back.text)
+      assert.strictEqual(backBody.ok, true)
+      assert.strictEqual(backBody.revision, 1)
+      assert.strictEqual(backBody.restoredFrom, backupRev)
+      assert.strictEqual(typeof backBody.hash, 'string', '回滚到备份必须回吐新规则摘要')
+      const afterBackText = fs.readFileSync(paths.file, 'utf8')
+      const afterBack = JSON.parse(afterBackText)
+      assert.strictEqual(afterBack.filter.pingbibiaoti, '备份规则', '覆盖文件必须被重写为备份里的规则')
+      assert.strictEqual(afterBack.revision, 1)
+      assert.ok(Buffer.byteLength(afterBackText) < 1024, `回滚后文件必须回到常规大小（实际 ${Buffer.byteLength(afterBackText)} 字节）`)
+      assert.strictEqual(lastAuditAction(), 'restore', '回滚必须留 restore 审计')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '回滚成功后必须释放锁')
+
+      // 3) 导入：bundle 形状照抄「数据备份: 导入自动识别并恢复」用例，只带 filter 类别。
+      fs.writeFileSync(paths.file, huge)
+      const bundle = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: { filter: { text: JSON.stringify({ schema: 1, revision: 9, filter: { pingbifenlei: '导入规则' } }) } }
+      }
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, `导入不得被 tooLarge 早退挡住：${imp.text}`)
+      const impBody = JSON.parse(imp.text)
+      assert.strictEqual(impBody.ok, true)
+      assert.strictEqual(impBody.imported.filter, true, '导入必须报告 filter 已恢复')
+      assert.strictEqual(impBody.imported.filterRevision, 1)
+      const afterImportText = fs.readFileSync(paths.file, 'utf8')
+      const afterImport = JSON.parse(afterImportText)
+      assert.strictEqual(afterImport.filter.pingbifenlei, '导入规则', '覆盖文件必须被重写成导入的规则')
+      assert.strictEqual(afterImport.revision, 1)
+      assert.ok(Buffer.byteLength(afterImportText) < 1024, `导入后文件必须回到常规大小（实际 ${Buffer.byteLength(afterImportText)} 字节）`)
+      assert.strictEqual(lastAuditAction(), 'import', '导入必须留 import 审计')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '导入成功后必须释放锁')
+    } finally { server.close() }
+  })
+
   await aok('过滤规则 POST: 写盘失败（目标是目录）→ 500 write_failed 且锁释放', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
@@ -3356,6 +3510,34 @@ async function filterRuleApiTests () {
     assert.strictEqual(first.consequent.type, 'ReturnStatement', '该分支必须直接返回文案')
     assert.ok(stringValuesOf(first.consequent).includes('无法读取推送历史，本次不显示补推估算'),
       'available===false 时必须返回「无法读取推送历史」而不是格式化 0 条')
+    // ①b 补推条数口径（r3-C must_fix）：capped 只表示「还有记录没扫到」，补推下界是 reEvalCount；
+    //     scanned 是「扫了多少条」，拿它当「将重评」数量会把「扫 200 条 / 0 条命中」说成「≥200」。
+    const scannedRefs = findAll(reEval, (n) => n.type === 'MemberExpression' && memberPath(n) === 'preview.scanned')
+    assert.deepStrictEqual(scannedRefs.map((n) => n.loc.start.line), [],
+      'capped 时补推下界必须用 reEvalCount，不能用 scanned：reEvalText 内不得读取 preview.scanned（横扫断言：把已扫描条数当补推数即红）')
+    // 同一个三元表达式的两个分支都必须落回 reEvalCount（capped 只是多一个「≥」前缀表示下界）。
+    const countCond = findFirst(reEval.body, (n) => n.type === 'ConditionalExpression' &&
+      n.test.type === 'LogicalExpression' && n.test.operator === '&&' &&
+      memberPath(n.test.left) === 'preview' &&
+      n.test.right.type === 'BinaryExpression' && n.test.right.operator === '===' &&
+      memberPath(n.test.right.left) === 'preview.capped' && n.test.right.right.value === true)
+    assert.ok(countCond, 'reEvalText 必须按 preview.capped === true 分支决定是否加「≥」前缀')
+    const cappedTpl = countCond.consequent
+    assert.strictEqual(cappedTpl.type, 'TemplateLiteral', 'capped 分支必须返回带前缀的模板（「≥N」）')
+    assert.strictEqual(cappedTpl.quasis[0].value.cooked, '≥', 'capped 分支的前缀必须恰是「≥」（表示下界）')
+    assert.strictEqual(cappedTpl.expressions.length, 1, 'capped 分支的模板只允许一个插值（条数本身）')
+    const cappedNum = cappedTpl.expressions[0]
+    assert.strictEqual(cappedNum.type, 'CallExpression')
+    assert.strictEqual(memberPath(cappedNum.callee), 'fmtNum')
+    assert.strictEqual(memberPath(cappedNum.arguments[0]), 'preview.reEvalCount',
+      'capped 时补推下界必须用 reEvalCount，不能用 scanned')
+    const exactNum = countCond.alternate
+    assert.strictEqual(exactNum.type, 'CallExpression', '非 capped 分支必须直接格式化精确条数')
+    assert.strictEqual(memberPath(exactNum.callee), 'fmtNum')
+    const exactArg = exactNum.arguments[0]
+    assert.strictEqual(exactArg.type, 'ConditionalExpression', 'preview 可能为 null：必须先判 preview 再取 reEvalCount')
+    assert.strictEqual(memberPath(exactArg.consequent), 'preview.reEvalCount', '非 capped 分支必须取精确的 preview.reEvalCount')
+    assert.strictEqual(exactArg.alternate.value, null, 'preview 缺失时与旧行为一致落 null（fmtNum 负责「—」）')
     // ② 渲染面至少两处按 available===false 分支（预览面板 + 保存前提示）。
     const unavailableBranches = findAll(pages, (n) => n.type === 'ConditionalExpression' &&
       n.test.type === 'BinaryExpression' && n.test.operator === '===' &&

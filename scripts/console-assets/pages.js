@@ -4391,12 +4391,15 @@ function fieldErrorMap (errors) {
   return map
 }
 
-// 补推口径（规格 §4.4）：最多扫 5000 条 _f 记录，超过显示「≥5000」。
+// 补推口径（规格 §4.4，v3.524）：服务端单次最多扫 200 ms 或 200 条 `_f`（先到者）。capped 时
+// **reEvalCount 才是补推数的下界**（还有记录没扫到），显示「≥reEvalCount」——不得用 scanned
+// 冒充补推数：扫 200 条、0 条命中时那样会说成「≥200」，把 0 虚报成 200。也**不得再写死 5000**
+// （旧文案会谎报「≥5000」，而预算先到的是 200 条/200ms）。
 // 缓存读不到时服务端回 available:false（scanned/reEvalCount 为 null）——此时显示「未知」，
 // 不能把 null 格式化成 0 条（那等于把「读不到」说成「没有影响」）。
 function reEvalText (preview) {
   if (preview && preview.available === false) return '无法读取推送历史，本次不显示补推估算'
-  const n = preview && preview.capped === true ? '≥5000' : fmtNum(preview ? preview.reEvalCount : null)
+  const n = preview && preview.capped === true ? `≥${fmtNum(preview.reEvalCount)}` : fmtNum(preview ? preview.reEvalCount : null)
   return `将重评 ${n} 条历史被过滤记录，后续每轮最多补推 Config.push.maxPerRun（默认 100）条。`
 }
 
@@ -5203,7 +5206,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           <div class="fr-preview-main">${reEvalText(preview)}</div>
           ${preview.available === false
             ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
-            : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（超过 5000 条，实际可能更多）' : ''}</div>`}
+            : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（已达单次扫描预算，实际可能更多）' : ''}</div>`}
         </div>
         ${wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
           含 .* 全命中规则：${wide.join('、')}。保存后几乎所有记录都会被命中，因此需要二次确认（confirmWideMatch:true）。
@@ -5399,7 +5402,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         <div class="fr-preview-main">${reEvalText(preview)}</div>
         ${preview.available === false
           ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
-          : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（被过滤记录超过 5000 条，实际可能更多）' : ''}${preview.zktApplied === true ? ' · 已按 zkt_gjc 白名单排除不匹配标题' : ''} · 缓存读取 ${preview.cacheStatus || '—'}</div>`}
+          : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（已达单次扫描预算，实际可能更多）' : ''}${preview.zktApplied === true ? ' · 已按 zkt_gjc 白名单排除不匹配标题' : ''} · 缓存读取 ${preview.cacheStatus || '—'}</div>`}
         ${Array.isArray(preview.samples) && preview.samples.length > 0 && html`<ul class="fr-samples">
           ${preview.samples.map((s, i) => html`<li key=${s && s.id !== null && s.id !== undefined ? String(s.id) : `sample-${i}`}>
             <span class="fr-sample-title">${s && s.title ? s.title : '（无标题）'}</span>

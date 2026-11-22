@@ -50,6 +50,7 @@ const { FILTER_FIELDS } = require('./xbk_utils')
 const {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
+  FILTER_LIMITS,
   LASTGOOD_MAX_BYTES,
   APPLIED_MAX_BYTES,
   filterRulesPaths,
@@ -61,6 +62,9 @@ const {
   writeAppliedSnapshot,
   appliedLastGoodUsed,
   readAppliedSnapshot,
+  scanPreviewRecords,
+  countUnescapedAlternations,
+  filterLimitsReport,
   resetStoreStateForTests
 } = require('./xbk_filter_store')
 // C10-019：直调收紧入口的用例需要拿到函数本身（走 loadFilterRules 的集成路径看不到收紧分支）。
@@ -2282,6 +2286,262 @@ test('R1-4 文档同步：README 必须写持久 LKG（不得再写「进程内�
   assert.ok(applied, 'README 必须仍描述 filter-rules.applied.json 生效快照')
   assert.ok(applied.text.includes('lastGoodUsed'),
     `applied 快照的字段清单必须含 lastGoodUsed（控制台「沿用上次合法规则」唯一口径）：${applied.text.slice(0, 200)}`)
+})
+
+// ===== F2：抬上限之前的五件前置条件（本文件覆盖 store 侧的四件：LKG 跳过写盘 / preview 预算 /
+// ### 条目闸 / limits 报告；回滚路径在 test_console.js）=====
+
+// F2-1：连续两轮同一份规则，第二轮不得重写 LKG。
+// 判据用 inode + mtime（不是「文件还在」）：writeAtomic 是「临时文件 + rename」，一次真实的写盘
+// 必然换 inode 并把 mtime 推到当前时刻。为了让「没写」可判，先把 mtime 钉到 60 秒前——旧实现每轮
+// 无条件重写（81 KB × 17,280 轮/天 ≈ 1.4 GB/天），第二轮会把 mtime 推回「现在」。
+test('F2-1 LKG 内容未变不重写（两轮 mtime/inode 不动）；改一行后必写；缺失/损坏/权限不符必写', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const load = () => loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {} })
+  writeJson(paths.file, { schema: 1, revision: 3, filter: { pingbibiaoti: '牙膏', pingbineirong: 'a|b' } })
+  assert.strictEqual(load().source, 'override', '前置：覆盖文件必须正常加载')
+  const past = new Date(Date.now() - 60 * 1000)
+  fs.utimesSync(paths.lastgood, past, past)
+  const before = readTextAndStat(paths.lastgood)
+
+  assert.strictEqual(load().source, 'override', '第二轮必须是同一个合法覆盖文件')
+  const after = readTextAndStat(paths.lastgood)
+  assert.strictEqual(after.text, before.text, 'LKG 内容必须逐字不变')
+  assert.strictEqual(after.stat.ino, before.stat.ino, '内容未变不得重写 LKG（原子写会换 inode）')
+  assert.strictEqual(after.stat.mtimeMs, before.stat.mtimeMs,
+    '内容未变时第二轮 mtime 必须不动（旧实现每轮重写 ⇒ mtime 会被推到现在）')
+  assert.ok(after.stat.mtimeMs <= past.getTime() + 1000,
+    `mtime 必须仍是钉住的旧值（实测 ${after.stat.mtimeMs} vs ${past.getTime()}）`)
+
+  // 改一行规则（revision 不变、内容变了）⇒ hash 变化 ⇒ 必须重写。
+  writeJson(paths.file, { schema: 1, revision: 3, filter: { pingbibiaoti: '牙膏\n车厘子', pingbineirong: 'a|b' } })
+  assert.strictEqual(load().source, 'override')
+  const changed = readTextAndStat(paths.lastgood)
+  assert.notStrictEqual(changed.stat.ino, before.stat.ino, '规则内容变化必须重写 LKG')
+  assert.ok(changed.stat.mtimeMs > before.stat.mtimeMs,
+    `改一行后 mtime 必须前进（实测 ${changed.stat.mtimeMs} vs ${before.stat.mtimeMs}）`)
+  assert.notStrictEqual(changed.text, after.text, '重写后的 LKG 必须反映新规则')
+
+  // 文件不存在：必须写（新进程降级时唯一的兜底来源）。
+  fs.rmSync(paths.lastgood)
+  assert.strictEqual(load().source, 'override')
+  assert.strictEqual(fs.existsSync(paths.lastgood), true, 'LKG 缺失时必须重建')
+
+  // 文件损坏：必须写（自愈；不得把坏文件当成「已是最新」而跳过）。
+  writeRaw(paths.lastgood, '{ 不是合法 LKG')
+  assert.strictEqual(load().source, 'override')
+  assert.match(readJson(paths.lastgood).hash, /^[0-9a-f]{64}$/, '损坏的 LKG 必须被重写成合法内容')
+
+  // 权限不符：必须写（跳过写盘不得放弃「每轮修回 0600」——LKG 里有用户全部规则正文）。
+  // 构造「不是 0600」的形态用只含 owner 位的字面量 0o700（属主 rwx、group/other 位全清）：
+  // 既不对 group/other 开放任何位（Sonar S2612 对 chmod 的宽松模式报漏洞），也不在 chmod 前
+  // 再取一次 stat（那是 CodeQL js/file-system-race 的 check→use 形状）。不能用「0600 + group/other
+  // 只读」的位组合代替：常量折叠后就是 0644，S2612 照样判不安全。
+  // 为什么不是 0600：isOwnerOnlyFile() 精确比较 (mode & 0o777) === 0o600，写成 0600 就进不了
+  // 「权限不符」分支，这条用例什么都没测。被钉住的语义不变：非 0600 必须自愈。
+  const looseMode = 0o700
+  assert.notStrictEqual(looseMode, 0o600, '前置：构造出的模式必须真的不是 0600（否则这条用例什么都没测）')
+  fs.chmodSync(paths.lastgood, looseMode)
+  assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, looseMode,
+    `前置：权限必须已被改成 0${looseMode.toString(8)}（否则下面的「自愈」断言恒真）`)
+  assert.strictEqual(load().source, 'override')
+  assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, 0o600, 'LKG 权限不是 0600 时必须重写自愈')
+})
+
+// F2-3：### 每行编译成 2 个 RE2 对象（约 3.9 KB/个），4 MiB 全多行 ≈ 33 万对象 ≈ 1.29 GB 内存。
+// 行夹具必须短：单字段 16000 字符上限**先于**行数闸生效，故 2000 行拆两个字段（各 1000）——
+// 这同时证明「全份 2000」与「单字段 1000」两道闸各管各的。
+function multilineFixture (count, prefix) {
+  const lines = []
+  for (let i = 1; i <= count; i++) lines.push(`${prefix}###v${i}`)
+  return lines.join('\n')
+}
+
+test('F2-3 ### 行数闸：全份 2000 行通过、2001 行拒绝（文案给实际行数与上限）；单字段 1001 行拒绝', () => {
+  const twoFields = validateFilterRules({
+    filter: { pingbibiaoti: multilineFixture(1000, 'a'), pingbineirong: multilineFixture(1000, 'b') }
+  }, deps)
+  assert.strictEqual(twoFields.ok, true, `2000 行必须通过：${JSON.stringify(twoFields.errors)}`)
+
+  const over = validateFilterRules({
+    filter: {
+      pingbibiaoti: multilineFixture(1000, 'a'),
+      pingbineirong: multilineFixture(1000, 'b'),
+      pingbilouzhu: multilineFixture(1, 'c')
+    }
+  }, deps)
+  assert.strictEqual(over.ok, false, '2001 行必须拒绝')
+  const totalErr = over.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(totalErr, `必须给出 too_many_lines：${JSON.stringify(over.errors)}`)
+  assert.strictEqual(totalErr.field, 'filter', '全份超限挂在 filter 上')
+  assert.match(totalErr.message, /2001/, `文案必须给出实际行数：${totalErr.message}`)
+  assert.match(totalErr.message, /2000/, `文案必须给出上限：${totalErr.message}`)
+
+  const oneField = validateFilterRules({ filter: { pingbibiaoti: multilineFixture(1001, 'a') } }, deps)
+  assert.strictEqual(oneField.ok, false, '单字段 1001 行必须拒绝（全份只有 1001 行，撞的是单字段闸）')
+  const fieldErr = oneField.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(fieldErr, `必须给出 too_many_lines：${JSON.stringify(oneField.errors)}`)
+  assert.strictEqual(fieldErr.field, 'pingbibiaoti')
+  assert.match(fieldErr.message, /1001/)
+  assert.match(fieldErr.message, /1000/)
+})
+
+test('F2-3 行数闸只管 ###：普通字段 2001 行仍按字符上限通过', () => {
+  const plain = []
+  for (let i = 1; i <= 2001; i++) plain.push(`k${i}`)
+  const value = plain.join('\n')
+  assert.ok(value.length < FILTER_LIMITS.fieldMaxLen.pingbineirong,
+    `夹具必须在单字段字符上限内（${value.length}）`)
+  const result = validateFilterRules({ filter: { pingbineirong: value } }, deps)
+  assert.strictEqual(result.ok, true, `非 ### 字段不受行数闸影响：${JSON.stringify(result.errors)}`)
+})
+
+test('F2-3 未转义 | 闸：1000 个通过、1001 个拒绝；转义 \\| 不计入（含 \\\\| 的奇偶口径）', () => {
+  // alts(n) 生成**恰好 n 个**未转义 | （n+1 个分支）
+  const alts = (n) => Array.from({ length: n + 1 }, (_, i) => `x${i}`).join('|')
+  const ok = validateFilterRules({ filter: { pingbibiaoti: alts(1000) } }, deps)
+  assert.strictEqual(ok.ok, true, `1000 个交替必须通过：${JSON.stringify(ok.errors)}`)
+  const over = validateFilterRules({ filter: { pingbibiaoti: alts(1001) } }, deps)
+  assert.strictEqual(over.ok, false, '1001 个交替必须拒绝')
+  const err = over.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(err, `交替超限必须给 too_many_lines：${JSON.stringify(over.errors)}`)
+  assert.strictEqual(err.field, 'pingbibiaoti')
+  assert.match(err.message, /1001/)
+  assert.match(err.message, /1000/)
+  // 计数口径：`\|` 是字面竖线（0 个交替），`\\|` 是「转义反斜杠 + 交替」（1 个）。
+  // 用 String.fromCharCode(92) 拼反斜杠，避免本文件自身再被转义层数搞混。
+  const BS = String.fromCharCode(92)
+  assert.strictEqual(countUnescapedAlternations('a|b'), 1)
+  assert.strictEqual(countUnescapedAlternations(`a${BS}|b`), 0)
+  assert.strictEqual(countUnescapedAlternations(`a${BS}${BS}|b`), 1)
+  assert.strictEqual(countUnescapedAlternations(`${BS}|`.repeat(1000) + '|'), 1)
+  assert.strictEqual(countUnescapedAlternations(`${BS}|`.repeat(1000)), 0)
+})
+
+test('F2-3 pingbitime 的 `分类###天数` 只把分类段的交替数纳入闸（纯天数仍全字段豁免）', () => {
+  // `分类###天数` 的分类段会被 RuleEngine.compileRules 编译成分类正则、天数段只做 Number 解析，
+  // 所以整字段豁免会让 `1001 个 |###7` 从闸门侧面绕过（与「单字段未转义 | >1000 返回 400」相反）。
+  const altsOf = (n, prefix) => Array.from({ length: n + 1 }, (_, i) => `${prefix}${i}`).join('|')
+  const cap = FILTER_LIMITS.fieldMaxLen.pingbitime
+  const overValue = `${altsOf(1001, 'c')}###7`
+  assert.ok(overValue.length < cap, `夹具必须在单字段字符上限内（${overValue.length} < ${cap}）`)
+  const over = validateFilterRules({ filter: { pingbitime: overValue } }, deps)
+  assert.strictEqual(over.ok, false, '分类段 1001 个未转义 | 必须拒绝')
+  const err = over.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(err, `交替超限必须给 too_many_lines：${JSON.stringify(over.errors)}`)
+  assert.strictEqual(err.field, 'pingbitime')
+  assert.match(err.message, /1001/)
+  assert.match(err.message, /1000/)
+
+  const exactValue = `${altsOf(1000, 'c')}###7`
+  assert.ok(exactValue.length < cap, `夹具必须在单字段字符上限内（${exactValue.length} < ${cap}）`)
+  const exact = validateFilterRules({ filter: { pingbitime: exactValue } }, deps)
+  assert.strictEqual(exact.ok, true, `分类段恰好 1000 个交替必须通过：${JSON.stringify(exact.errors)}`)
+
+  // 纯天数（无 ###）不是正则：继续整字段豁免
+  assert.strictEqual(validateFilterRules({ filter: { pingbitime: '7' } }, deps).ok, true, '纯天数仍必须通过')
+  // 合法 `分类###天数`（分类段无交替）不受影响
+  assert.strictEqual(validateFilterRules({ filter: { pingbitime: '牙膏###7' } }, deps).ok, true, '合法分类规则仍必须通过')
+  // 分类段里的 `\|` 是字面竖线，不计入（与其它字段的转义奇偶口径同源）
+  const BS = String.fromCharCode(92)
+  const escaped = `${`${BS}|`.repeat(1001)}###7`
+  assert.ok(escaped.length < cap, `夹具必须在单字段字符上限内（${escaped.length} < ${cap}）`)
+  assert.strictEqual(validateFilterRules({ filter: { pingbitime: escaped } }, deps).ok, true,
+    '分类段 1001 个转义 \\| 是字面竖线，不得计入交替')
+
+  // 按字段累加：两行 `分类###天数` 各 600 个（单行未超限）合计 1200 → 拒绝
+  const multiValue = `${altsOf(600, 'a')}###7\n${altsOf(600, 'b')}###7`
+  assert.ok(multiValue.length < cap, `夹具必须在单字段字符上限内（${multiValue.length} < ${cap}）`)
+  const multi = validateFilterRules({ filter: { pingbitime: multiValue } }, deps)
+  assert.strictEqual(multi.ok, false, '跨行累加 1200 个交替必须拒绝')
+  const multiErr = multi.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(multiErr, `跨行累加超限必须给 too_many_lines：${JSON.stringify(multi.errors)}`)
+  assert.strictEqual(multiErr.field, 'pingbitime')
+  assert.match(multiErr.message, /1200/)
+})
+
+test('F2-2 preview 预算：条数 200 先到、小样本完整、时间预算先到者停（纯函数）', () => {
+  const records = Array.from({ length: 500 }, (_, i) => ({ id: String(i), title: `t${i}` }))
+  const pass = () => ({ passed: true, reason: 'ok' })
+  const many = scanPreviewRecords({ records, limit: 5, evaluate: pass })
+  assert.strictEqual(many.scanned, 200, '默认条数预算 200')
+  assert.strictEqual(many.capped, true)
+  assert.strictEqual(many.cappedBy, 'records')
+  assert.strictEqual(many.budgetMs, 200)
+  assert.strictEqual(many.reEvalCount, 200)
+  assert.strictEqual(many.samples.length, 5, '样例仍按 limit 截断')
+  assert.deepStrictEqual(Object.keys(many.samples[0]).sort(byCodeUnit), ['id', 'reason', 'title'])
+
+  const small = scanPreviewRecords({ records: records.slice(0, 3), limit: 5, evaluate: pass })
+  assert.deepStrictEqual([small.scanned, small.capped, small.cappedBy, small.reEvalCount], [3, false, null, 3],
+    '小样本必须完整返回（不得因为「有预算」就提前截断）')
+
+  // 时间预算：now 每次 +60ms ⇒ 第 4 次进入循环时已过 200ms，只能扫 3 条。
+  let ticks = 0
+  const now = () => { const value = ticks * 60; ticks += 1; return value }
+  const timed = scanPreviewRecords({ records, limit: 5, evaluate: pass, now })
+  assert.strictEqual(timed.capped, true)
+  assert.strictEqual(timed.cappedBy, 'time')
+  assert.strictEqual(timed.scanned, 3, `时间预算必须在 200ms 处停（实测扫了 ${timed.scanned} 条）`)
+
+  // 硬上限：预算都放宽时仍停在 maxScan——旧「最多扫 5000 条」的兜底语义一个字没丢（只多了一层更早的预算）。
+  const manyRecords = Array.from({ length: 6000 }, (_, i) => ({ id: String(i), title: `t${i}` }))
+  const hard = scanPreviewRecords({ records: manyRecords, limit: 5, evaluate: pass, maxRecords: 10000, budgetMs: Infinity, maxScan: 5000 })
+  assert.deepStrictEqual([hard.scanned, hard.cappedBy], [5000, 'max'], '旧 5000 条硬上限仍在（cappedBy=max）')
+
+  // 判定抛错按「未通过」处理、白名单拦截不计入补推数，但两者都算「扫过」。
+  let calls = 0
+  const mixed = scanPreviewRecords({
+    records: records.slice(0, 4),
+    limit: 5,
+    evaluate: (entry) => { calls += 1; if (entry.id === '1') throw new Error('boom'); return { passed: true } },
+    whitelistKeeps: (entry) => entry.id !== '2'
+  })
+  assert.strictEqual(mixed.scanned, 4)
+  assert.strictEqual(calls, 4)
+  assert.strictEqual(mixed.reEvalCount, 2, '抛错(1) 与白名单拦截(2) 不计入补推数')
+})
+
+test('F2-5 limits/usage 报告：上限与 FILTER_LIMITS 同源 + 规则文件字节数/各字段字符数', () => {
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const missing = filterLimitsReport(dir, { pingbibiaoti: 'abc' })
+  assert.strictEqual(missing.usage.rulesFileBytes, 0, '文件缺失按 0 字节')
+  assert.strictEqual(missing.usage.fieldChars.pingbibiaoti, 3)
+  assert.strictEqual(missing.usage.fieldChars.pingbineirong, 0)
+  assert.deepStrictEqual(Object.keys(missing.usage.fieldChars).sort(byCodeUnit), [...FILTER_RULE_FIELDS].sort(byCodeUnit),
+    '11 个字段必须全在（前端按字段取用量）')
+
+  const text = JSON.stringify({ schema: 1, revision: 2, filter: { pingbibiaoti: 'abc' } })
+  writeRaw(paths.file, text)
+  const report = filterLimitsReport(dir, { pingbibiaoti: 'abc', pingbitime: '5' })
+  assert.strictEqual(report.usage.rulesFileBytes, Buffer.byteLength(text))
+  assert.strictEqual(report.usage.fieldChars.pingbibiaoti, 3)
+  assert.strictEqual(report.usage.fieldChars.pingbitime, 1)
+  assert.strictEqual(report.limits.rulesFileMaxBytes, FILTER_LIMITS.rulesFileMaxBytes)
+  assert.strictEqual(report.limits.requestBodyMaxBytes, FILTER_LIMITS.requestBodyMaxBytes)
+  assert.strictEqual(report.limits.readMaxBytes, FILTER_LIMITS.readMaxBytes)
+  assert.strictEqual(report.limits.draftFieldMaxLen, FILTER_LIMITS.draftFieldMaxLen)
+  assert.strictEqual(report.limits.maxRuleLines, 2000)
+  assert.strictEqual(report.limits.maxAlternationsPerField, 1000)
+  assert.deepStrictEqual(report.limits.fieldMaxLen, { ...FILTER_LIMITS.fieldMaxLen })
+  assert.strictEqual(report.limits.fieldMaxLen.pingbibiaoti, 16000, 'F2 不得改变今日常量')
+  // 非字符串值不得被算成字符数（否则前端拿到的用量是假的）
+  assert.strictEqual(filterLimitsReport(dir, { pingbibiaoti: 42 }).usage.fieldChars.pingbibiaoti, 0)
+
+  // 末级符号链接：元数据走 storage.statSafeMeta（O_NOFOLLOW）⇒ unsafe ⇒ 如实报 null，
+  // 且**不得**泄露链接目标的大小。旧实现 fs.statSync 会跟随链接，把目标文件字节数当成
+  // 规则文件的——这条用例就是那条路径的反向验证（把实现改回 statSync 即变红）。
+  const outside = path.join(tmp, 'limits-outside.json')
+  writeRaw(outside, 'x'.repeat(4096))
+  fs.rmSync(paths.file)
+  fs.symlinkSync(outside, paths.file)
+  assert.strictEqual(fs.lstatSync(paths.file).isSymbolicLink(), true, '前置：夹具必须是符号链接')
+  assert.strictEqual(fs.statSync(paths.file).size, 4096, '前置：链接目标确实有 4096 字节（否则测不出泄露）')
+  assert.strictEqual(filterLimitsReport(dir, { pingbibiaoti: 'abc' }).usage.rulesFileBytes, null,
+    '符号链接不得被跟随取大小（unsafe ⇒ null，不得把链接目标的 4096 字节报成规则文件大小）')
 })
 
 // ===== 路径 helper =====

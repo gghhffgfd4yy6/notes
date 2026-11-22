@@ -69,13 +69,28 @@ const FILTER_FIELD_MAX_LEN = 16000
 const FILTER_RULES_MAX_BYTES = 256 * 1024
 // 保存闸门给 revision 位数增长留的余量（整份闸门按 上限-32 判，见 validateFilterRules 闸门 5）。
 const FILTER_SAVE_HEADROOM_BYTES = 32
+// ── F2-3：### 多行规则的对象爆炸闸（只约束**保存**入参）─────────────────────
+// ### 每行编译成 2 个 RE2 对象（约 3.9 KB/个）：4 MiB 全是多行规则 = 165,016 行 ≈ 33 万个对象
+// ≈ 1.29 GB 内存，单进程直接 OOM。抬上限（F3/F4）之前必须先把「条目数」钉住，否则字节上限被放松
+// 等于给 OOM 开门。读路径**不设**这道闸：已落盘的既有文件必须还能读回来（见 validateFilterRules 闸门 2b）。
+const FILTER_MAX_RULE_LINES = 2000
+// 全份预算 2000 行，单字段最多吃一半——一个字段把整份预算吃光时，其余字段的任何规则都会撞总闸。
+const FILTER_MAX_RULE_LINES_PER_FIELD = 1000
+// 单字段未转义 `|` 的个数上限：交替分支数与单条正则的编译/匹配代价线性相关，超限同样在保存时拒绝。
+const FILTER_MAX_ALTERNATIONS_PER_FIELD = 1000
+// ── F2-2：/preview 的扫描预算（默认 200 ms 或 200 条 _f 记录，先到者）──────────
+// 5000 条 × 2.01 ms ≈ 11.1 s 的同步循环会把控制台事件循环占死（客户端 8 s 就超时）；
+// 抬上限后是 52–107 s。预算只约束「扫多少」，不改变单条判定结果。
+const FILTER_PREVIEW_BUDGET_MS = 200
+const FILTER_PREVIEW_BUDGET_RECORDS = 200
 
 // 冻结的预算表：全仓唯一的取值入口（console 也从这里取 requestBodyMaxBytes）。
 // fieldMaxLen 是**按 11 个字段全覆盖的表**（当前同值 16000，F3 才允许分字段增长）；
 // 未知字段由 fieldMaxLenOf 返回 0，绝不回落成「无限」。
 const LIMIT_SCALAR_KEYS = Object.freeze([
   'rulesFileMaxBytes', 'readMaxBytes', 'requestBodyMaxBytes', 'draftFieldMaxLen',
-  'saveHeadroomBytes', 'lastgoodWrapperBytes', 'appliedWrapperBytes'
+  'saveHeadroomBytes', 'lastgoodWrapperBytes', 'appliedWrapperBytes',
+  'maxRuleLines', 'maxRuleLinesPerField', 'maxAlternationsPerField'
 ])
 // 今日常量（fail-closed 兜底）：与 FILTER_LIMITS 同值，表里任何一项被改坏时用它顶替。
 const LIMIT_FALLBACKS = Object.freeze({
@@ -86,7 +101,10 @@ const LIMIT_FALLBACKS = Object.freeze({
   draftFieldMaxLen: FILTER_FIELD_MAX_LEN,
   saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
   lastgoodWrapperBytes: 1024,
-  appliedWrapperBytes: 1024
+  appliedWrapperBytes: 1024,
+  maxRuleLines: FILTER_MAX_RULE_LINES,
+  maxRuleLinesPerField: FILTER_MAX_RULE_LINES_PER_FIELD,
+  maxAlternationsPerField: FILTER_MAX_ALTERNATIONS_PER_FIELD
 })
 
 function isPositiveSafeInt (value) {
@@ -138,7 +156,11 @@ const FILTER_LIMITS = Object.freeze(normalizeFilterLimits({
   draftFieldMaxLen: FILTER_FIELD_MAX_LEN,
   saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
   lastgoodWrapperBytes: 1024,
-  appliedWrapperBytes: 1024
+  appliedWrapperBytes: 1024,
+  // F2-3：条目数上限（与字节上限同表，console 的 GET 也下发它们）
+  maxRuleLines: FILTER_MAX_RULE_LINES,
+  maxRuleLinesPerField: FILTER_MAX_RULE_LINES_PER_FIELD,
+  maxAlternationsPerField: FILTER_MAX_ALTERNATIONS_PER_FIELD
 }))
 
 // 保存路径的单字段上限：以 FILTER_LIMITS.fieldMaxLen 为准；**未知字段返回 0**（一律拒绝），
@@ -151,6 +173,102 @@ function fieldMaxLenOf (field) {
 // F3 抬上限后旧的小值字段仍然可读。本项两者相等，行为零变化。
 function readFieldMaxLen (field) {
   return Math.max(FILTER_FIELD_MAX_LEN, fieldMaxLenOf(field))
+}
+
+/**
+ * /preview 的扫描预算（F2-2）：最多扫 budgetMs 毫秒或 maxRecords 条 _f 记录，先到者停。
+ * 为什么必须：保存前必调 preview，5000 条 × 2.01 ms ≈ 11.1 s，而客户端 FETCH_TIMEOUT_MS = 8 s
+ * ——现在就已经超时；抬上限后是 52–107 s，且这个同步循环会把控制台的事件循环占死。
+ * 语义：capped:true 只表示「还有记录没扫到」，调用方**不得**把 reEvalCount 当成完整补推数（atLeast）；
+ * 小样本（条数 ≤ 预算且未超时）照旧完整返回，逐条判定结果与无预算时逐字相同。
+ * 预算逻辑放这里（而不是 console.js）：console 的变异分片只剩个位数余量，且这段是纯函数，可直接单测。
+ * @param {{records:Array<Object>, limit:number, evaluate:Function, whitelistKeeps?:Function,
+ *          budgetMs?:number, maxRecords?:number, maxScan?:number, now?:Function}} opts
+ *   evaluate(entry) → {passed:boolean, reason?:string} | null（抛错按 null = 未通过处理）
+ *   whitelistKeeps(entry) → boolean（默认全部保留；运行期 zkt_gjc 白名单从这里接）
+ * @returns {{scanned:number, capped:boolean, cappedBy:('records'|'time'|'max'|null), budgetMs:number,
+ *            reEvalCount:number, samples:Array, elapsedMs:number}}
+ */
+function scanPreviewRecords ({
+  records, limit, evaluate, whitelistKeeps = null,
+  budgetMs = FILTER_PREVIEW_BUDGET_MS, maxRecords = FILTER_PREVIEW_BUDGET_RECORDS,
+  maxScan = Infinity, now = Date.now
+} = {}) {
+  const list = Array.isArray(records) ? records : []
+  const sampleLimit = Number.isSafeInteger(limit) && limit > 0 ? limit : 0
+  const startedAt = now()
+  let scanned = 0
+  let reEvalCount = 0
+  let cappedBy = null
+  const samples = []
+  for (const entry of list) {
+    // 三个上限的顺序：硬上限（历史 5000 条）→ 条数预算 → 时间预算。任一条触发都只停「继续扫」，
+    // 已扫到的结果照常返回。
+    if (scanned >= maxScan) { cappedBy = 'max'; break }
+    if (scanned >= maxRecords) { cappedBy = 'records'; break }
+    if (now() - startedAt >= budgetMs) { cappedBy = 'time'; break }
+    scanned++
+    let verdict = null
+    try { verdict = evaluate(entry) } catch (e) { verdict = null }
+    if (!verdict || verdict.passed !== true) continue
+    if (whitelistKeeps && whitelistKeeps(entry) !== true) continue
+    reEvalCount++
+    if (samples.length < sampleLimit) {
+      samples.push({
+        id: entry.id === undefined ? null : entry.id,
+        title: typeof entry.title === 'string' ? entry.title : '',
+        reason: verdict.reason === undefined ? null : verdict.reason
+      })
+    }
+  }
+  return {
+    scanned,
+    capped: cappedBy !== null,
+    cappedBy,
+    budgetMs,
+    reEvalCount,
+    samples,
+    elapsedMs: now() - startedAt
+  }
+}
+
+/**
+ * GET /api/config/filter 的 limits / usage 块（F2-5）。
+ * 前端要显示余量与文案，但此前的响应里没有任何上限信息，前端只能写死 256 KiB（pages.js:4846）。
+ * 这里把 FILTER_LIMITS（全仓唯一取值入口）与当前用量一起下发；前端本项**只读不用**（F3 才接）。
+ * 规则文件字节数：缺失按 0，其它读不到的情况如实报 null——不把「不知道」说成 0。
+ * 元数据走 storage.statSafeMeta（xbk_storage.js 的唯一元数据原语，O_NOFOLLOW + 普通文件断言），
+ * 不走 fs.statSync：后者会跟随末级符号链接（大小取自链接目标，等于泄露目标的信息），
+ * 对目录/FIFO 也会报出一个「字节数」。statSafeMeta 只有 status==='ok' 才有 size，
+ * unsafe（符号链接/非普通文件）/ioError 一律 null ⇒ 口径不变、语义只强不弱（不再跟随链接）。
+ * @param {string} cacheDir
+ * @param {Object} [filter] 当前生效规则（11 字段合并结果），用于各字段字符数
+ * @returns {{limits:Object, usage:{rulesFileBytes:(number|null), fieldChars:Object}}}
+ */
+function filterLimitsReport (cacheDir, filter) {
+  const paths = filterRulesPaths(cacheDir)
+  const meta = storage.statSafeMeta(paths.file)
+  const rulesFileBytes = meta.status === 'ok' ? meta.size : (meta.status === 'missing' ? 0 : null)
+  const fieldChars = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    const value = safeGet(filter, field)
+    fieldChars[field] = typeof value === 'string' ? value.length : 0
+  }
+  return {
+    limits: {
+      // 拷贝一份冻结表的浅拷贝：响应对象要被 JSON 序列化，直接下发 FILTER_LIMITS.fieldMaxLen
+      // 会让调用方拿到进程内共享的冻结表（改不动，但引用一泄漏就少一层边界）。
+      fieldMaxLen: { ...FILTER_LIMITS.fieldMaxLen },
+      rulesFileMaxBytes: FILTER_LIMITS.rulesFileMaxBytes,
+      requestBodyMaxBytes: FILTER_LIMITS.requestBodyMaxBytes,
+      draftFieldMaxLen: FILTER_LIMITS.draftFieldMaxLen,
+      readMaxBytes: FILTER_LIMITS.readMaxBytes,
+      maxRuleLines: FILTER_LIMITS.maxRuleLines,
+      maxRuleLinesPerField: FILTER_LIMITS.maxRuleLinesPerField,
+      maxAlternationsPerField: FILTER_LIMITS.maxAlternationsPerField
+    },
+    usage: { rulesFileBytes, fieldChars }
+  }
 }
 
 // 持久 LKG 的读上限（F4-1 返工 R3）：LKG 是覆盖文件的**再包装**——`{schema,revision,hash,override}`
@@ -201,6 +319,20 @@ function dedupeRuleLines (value) {
     kept.push(line) // 保留首次出现的原样文本（含用户写的空格），不擅自改写规则
   }
   return { value: kept.join('\n'), removed }
+}
+// 未转义 `|` 的个数（F2-3）：`\|` 是字面竖线，`\\|` 是「转义反斜杠 + 交替」。从每个 `|` 往回数
+// 连续反斜杠，偶数个（含 0）才算交替。逐字符线性扫描——不能用 replace 去转义序列，那会把
+// `\\|` 里的交替一起吞掉（左分支是字符类里的反斜杠，右分支才是交替）。
+function countUnescapedAlternations (value) {
+  const text = typeof value === 'string' ? value : ''
+  let count = 0
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '|') continue
+    let backslashes = 0
+    for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) backslashes++
+    if (backslashes % 2 === 0) count++
+  }
+  return count
 }
 // 全命中：trim 后等于这两个字面量即视为「放行一切」，console 需二次确认。
 const WIDE_MATCH_VALUES = new Set(['.*', '^.*$'])
@@ -405,10 +537,20 @@ function validateFilterRules (input, deps, options) {
   const ruleLines = [] // 多行规则的每一有效行：{ field, cat, val }
   const simpleRules = [] // 简单规则：{ field, val }
   const multilineCount = new Map()
+  const alternationCount = new Map()
   for (const field of FILTER_RULE_FIELDS) {
     if (!hasOwn(filter, field)) continue
     const value = filter[field]
     if (value === '') continue
+    // F2-3：交替数按**字段**统计（多行字段的每一行各是一条正则，分支数逐行累加）。
+    // pingbitime 不含 ### 时值是纯天数（运行期 Number 解析，不编译正则）→ 整字段豁免；
+    // 含 ### 时 `分类` 段**会**被 compileRules 编译成分类正则，所以分类段的交替数在下面的
+    // 行解析里逐行累加（见 `@pingbitime-cat-alts`）。整字段豁免会让 `1001 个 |###7` 这种
+    // 可编译的形状从闸门侧面溜过去（与「单字段未转义 | >1000 返回 400」的契约相反）。
+    if (field !== 'pingbitime') {
+      const alternations = countUnescapedAlternations(value)
+      if (alternations > 0) alternationCount.set(field, alternations)
+    }
     if (field === 'pingbifenlei' && value.includes('###')) {
       addError(errors, field, 'multiline_not_supported', 'pingbifenlei 不支持 ### 多行分类语法')
       continue
@@ -429,6 +571,13 @@ function validateFilterRules (input, deps, options) {
         }
         const cat = safeString(parts[0]).trim()
         const val = safeString(parts[1]).trim()
+        if (field === 'pingbitime') {
+          // @pingbitime-cat-alts：`分类###天数` 的分类段会被 compileRules 编译成正则，天数段只做
+          // Number 解析 ⇒ 只统计分类段的交替数（纯 `天数` 仍整字段豁免，见上方整字段统计处）。
+          // 按字段累加，与其它字段「整字段值」的口径一致（多行各是一条分类正则）。
+          const catAlternations = countUnescapedAlternations(cat)
+          if (catAlternations > 0) alternationCount.set(field, (alternationCount.get(field) || 0) + catAlternations)
+        }
         if (!val) {
           addError(errors, field, 'empty_value', `行「${trimmed}」的正则值为空`)
           continue
@@ -452,6 +601,27 @@ function validateFilterRules (input, deps, options) {
         continue
       }
       simpleRules.push({ field, val })
+    }
+  }
+  // ---------- 闸门 2b：条目数（### 行数 / 单字段未转义 | 数；F2-3）----------
+  // 只约束**保存**入参：读路径（fromDisk）必须能读回抬上限之前落盘的既有文件——把读端也卡住等于
+  // 让「以前存得下」的规则文件突然变 corrupt，规则被静默降级（比保存被拒严重得多）。
+  // 位置必须在闸门 4 的 compileRules 之前：33 万个 RE2 对象正是在那一步生成的，闸门放到后面就晚了。
+  if (!(options && options.fromDisk === true)) {
+    let totalLines = 0
+    for (const count of multilineCount.values()) totalLines += count
+    if (totalLines > FILTER_LIMITS.maxRuleLines) {
+      addError(errors, 'filter', 'too_many_lines', `多行规则共 ${totalLines} 行 ### 规则，超过上限 ${FILTER_LIMITS.maxRuleLines} 行（每行会编译成 2 个正则对象，超限会耗尽内存），请删减后再保存`)
+    }
+    for (const [field, count] of multilineCount) {
+      if (count > FILTER_LIMITS.maxRuleLinesPerField) {
+        addError(errors, field, 'too_many_lines', `字段「${field}」有 ${count} 行 ### 规则，超过单字段上限 ${FILTER_LIMITS.maxRuleLinesPerField} 行（全份上限 ${FILTER_LIMITS.maxRuleLines} 行），请删减后再保存`)
+      }
+    }
+    for (const [field, count] of alternationCount) {
+      if (count > FILTER_LIMITS.maxAlternationsPerField) {
+        addError(errors, field, 'too_many_lines', `字段「${field}」含 ${count} 个未转义 | 交替，超过单字段上限 ${FILTER_LIMITS.maxAlternationsPerField} 个（交替分支越多，编译与匹配代价越大），请改用更具体的规则后再保存`)
+      }
     }
   }
   if (errors.length) return { ok: false, errors }
@@ -709,12 +879,22 @@ function writeLastGoodFile (filePath, filter, revision) {
   if (typeof filePath !== 'string' || filePath === '') return false
   try {
     const override = overrideFieldsOf(filter)
+    const revisionValue = Number.isSafeInteger(revision) && revision >= 0 ? revision : 0
+    const hash = lastGoodHash(override, revisionValue)
     const payload = {
       schema: FILTER_RULES_SCHEMA,
-      revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : 0,
-      hash: lastGoodHash(override, revision),
+      revision: revisionValue,
+      hash,
       override
     }
+    // F2-1：内容没变就不写盘。旧实现每轮（约 5 s）无条件原子重写一次：81 KB × 17,280 轮/天
+    // ≈ 1.4 GB/天写放大，抬到 512 KiB 变 8.8 GB/天、1 MiB 变 18 GB/天。
+    // 判据与 applied 同源：先按**内容**比（readLastGood 已复验 hash，故 hash 相等 ⇔ 内容相等），
+    // 再确认目标仍是 0600——跳过写盘等于放弃「每轮自愈权限」，一份 0644 的 LKG（含用户全部规则
+    // 正文，目录被拷贝/解包/手工 chmod 的常见结果）会永久留着，故权限不符一律落到写盘分支。
+    // 文件不存在/损坏时 readLastGood 返回 null ⇒ 必然重写（自愈），不会把坏文件当成「已是最新」。
+    const prev = readLastGood(filePath)
+    if (prev && lastGoodHash(prev.filter, prev.revision) === hash && isOwnerOnlyFile(filePath)) return true
     const text = JSON.stringify(payload)
     // 写侧与读侧同口径（读上限 LASTGOOD_MAX_BYTES）：超出就**不写**并留痕，绝不落一个「写成功但
     // readLastGood 永远读不回」的文件。正常形状下这里恒不触发（覆盖文件能读回就 ≤ 上限，包装 +76）；
@@ -1129,6 +1309,12 @@ module.exports = {
   readFieldMaxLen,
   // LKG 包装层的读上限（仅测试用：断言「写出的 LKG 必须 ≤ 读上限」这条不变式）
   LASTGOOD_MAX_BYTES,
+  // F2-2 / F2-3：/preview 的扫描预算与条目数上限（console 的 /preview 与 GET limits 都从这里取）
+  FILTER_PREVIEW_BUDGET_MS,
+  FILTER_PREVIEW_BUDGET_RECORDS,
+  scanPreviewRecords,
+  countUnescapedAlternations,
+  filterLimitsReport,
   // 生效快照的读上限（仅测试用：断言「写出的 applied 必须 ≤ 读上限」以及贴上限的覆盖文件仍读得回）
   APPLIED_MAX_BYTES,
   filterRulesPaths,
