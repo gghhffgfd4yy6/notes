@@ -14940,13 +14940,28 @@ async function main () {
     assert.ok(fromServer, '必须能定位 filterDraftFromServer')
     assert.strictEqual(findAll(fromServer, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'mergeFilterDraft').length, 1,
       '服务器草稿恢复同样要以生效值为底合并（老服务端回整份时合并结果不变）')
-    // 前端文案不得再出现写死的旧容量（F4 的「文档/文案数字全部来自 limits」）
-    const assetsSrc = fs.readdirSync(CONSOLE_ASSET_DIR)
-      .filter((file) => file.endsWith('.js') || file.endsWith('.mjs'))
-      .map((file) => fs.readFileSync(path.join(CONSOLE_ASSET_DIR, file), 'utf8'))
-      .join('\n')
-    assert.ok(!/256 KiB|256KB|16000|16,000/.test(assetsSrc),
-      '前端资产不得写死旧的 256 KiB / 16,000（一律读 GET limits 下发的数字）')
+    // 前端文案不得再出现写死的旧容量（F4 的「文档/文案数字全部来自 limits」）。
+    // 判据落在 AST 字面量上：字符串 / 数字 / 模板静态段三类写死形状都算，注释与格式化不参与
+    // —— 旧 readFileSync + 正则的文本判据既会被注释满足，也会随格式化/插桩误红。
+    const legacyCapacity = /256 KiB|256KB|16000|16,000/
+    const offenders = []
+    for (const file of fs.readdirSync(CONSOLE_ASSET_DIR)
+      .filter((entry) => entry.endsWith('.js') || entry.endsWith('.mjs'))) {
+      const model = loadModel(path.join(CONSOLE_ASSET_DIR, file))
+      for (const node of findAll(model.ast, (n) => n.type === 'Literal' || n.type === 'TemplateElement')) {
+        const value = node.type === 'TemplateElement' ? node.value.raw : node.value
+        const legacyNumber = node.type === 'Literal' && value === 16000
+        const legacyText = typeof value === 'string' && legacyCapacity.test(value)
+        if (!legacyNumber && !legacyText) continue
+        offenders.push({
+          file,
+          kind: node.type === 'TemplateElement' ? 'template' : typeof value,
+          snippet: String(value).slice(0, 80)
+        })
+      }
+    }
+    assert.deepStrictEqual(offenders, [],
+      `前端资产不得写死旧的 256 KiB / 16,000（一律读 GET limits 下发的数字）：${offenders.map((o) => `${o.file}: ${o.snippet}`).join('；')}`)
   })
 
   // ── 数字框锁定，长按加减连续调整 ─────────────────────────────────────────────

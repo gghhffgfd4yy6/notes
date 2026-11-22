@@ -2808,7 +2808,7 @@ test('F4 GET merged 视图与保存响应的去重摘要：同一份规则只下
   assert.strictEqual(merged.view, 'merged')
   assert.strictEqual(Object.prototype.hasOwnProperty.call(merged, 'override'), false, 'merged 视图不得再下发 override 原文')
   assert.deepStrictEqual(merged.overrideFields, ['pingbibiaoti', 'pingbineirong'], 'overrideFields 按白名单顺序给出显式写过的字段')
-  assert.deepStrictEqual(Object.keys(merged.applied).sort(), ['appliedAt', 'hash', 'revision', 'source'],
+  assert.deepStrictEqual(Object.keys(merged.applied).sort((a, b) => a.localeCompare(b)), ['appliedAt', 'hash', 'revision', 'source'],
     'merged 视图的 applied 只留元信息（整份 filter/keyword 不重复下发）')
   assert.deepStrictEqual(merged.filter, filter, 'merged 视图仍必须给合并后的生效值（编辑器唯一数据源）')
   const fullBytes = Buffer.byteLength(JSON.stringify(full), 'utf8')
