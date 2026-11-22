@@ -3053,6 +3053,85 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则恢复: 覆盖文件读不回（>body 上限）时 恢复默认/回滚备份/导入 仍 200 并重写覆盖文件（只有保存中止）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    // 与上一条用例同一夹具形状：300 KiB > 读硬顶/body 上限 256 KiB ⇒ 加载判 corrupt、原文读不回。
+    const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(300 * 1024) } })
+    const hugeBytes = Buffer.byteLength(huge)
+    const lastAuditAction = () => {
+      const lines = fs.readFileSync(paths.audit, 'utf8').trim().split('\n')
+      return JSON.parse(lines[lines.length - 1]).action
+    }
+    try {
+      // 前置：这正是「保存必须中止」的状态，也正是用户唯一还能自助恢复的状态。
+      fs.writeFileSync(paths.file, huge)
+      const before = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(before.source, 'corrupt', '前置：300 KiB 覆盖文件必须判 corrupt')
+      assert.strictEqual(before.revision, 0, '前置：corrupt 时 revision 归 0（恢复请求以它作 baseRevision）')
+      assert.strictEqual(before.usage.rulesFileBytes, hugeBytes, '前置：用量必须报真实文件字节数')
+
+      // 1) 恢复默认：把覆盖文件重写成空规则，用户才能从「读不回的损坏文件」里出来。
+      const reset = await postFilterJson(port, '/api/config/filter/restore', { to: 'default', confirm: true, baseRevision: 0 })
+      assert.strictEqual(reset.status, 200, `恢复默认不得被 tooLarge 早退挡住：${reset.text}`)
+      const resetBody = JSON.parse(reset.text)
+      assert.strictEqual(resetBody.ok, true)
+      assert.strictEqual(resetBody.revision, 1, '恢复默认必须写新一代 revision')
+      assert.strictEqual(resetBody.restoredFrom, 'default')
+      assert.strictEqual(fs.existsSync(paths.file), true, '恢复路径不得 unlink 覆盖文件（删文件比留下旧规则更糟）')
+      const afterResetText = fs.readFileSync(paths.file, 'utf8')
+      const afterReset = JSON.parse(afterResetText)
+      assert.deepStrictEqual(afterReset.filter, {}, '恢复默认必须把覆盖文件重写成空规则')
+      assert.strictEqual(afterReset.revision, 1)
+      assert.ok(Buffer.byteLength(afterResetText) < 1024, `恢复默认后文件必须回到常规大小（实际 ${Buffer.byteLength(afterResetText)} 字节）`)
+      assert.strictEqual(lastAuditAction(), 'reset_default', '恢复默认必须留 reset_default 审计')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '恢复默认成功后必须释放锁')
+
+      // 2) 回滚到备份：备份文件本身合法（小于上限），覆盖文件仍是读不回的 300 KiB。
+      fs.writeFileSync(paths.file, huge)
+      const backupRev = 3
+      fs.writeFileSync(paths.backupFor(backupRev), JSON.stringify({ schema: 1, revision: backupRev, filter: { pingbibiaoti: '备份规则' } }))
+      const back = await postFilterJson(port, '/api/config/filter/restore', { to: backupRev, confirm: true, baseRevision: 0 })
+      assert.strictEqual(back.status, 200, `回滚到备份不得被 tooLarge 早退挡住：${back.text}`)
+      const backBody = JSON.parse(back.text)
+      assert.strictEqual(backBody.ok, true)
+      assert.strictEqual(backBody.revision, 1)
+      assert.strictEqual(backBody.restoredFrom, backupRev)
+      assert.strictEqual(typeof backBody.hash, 'string', '回滚到备份必须回吐新规则摘要')
+      const afterBack = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
+      assert.strictEqual(afterBack.filter.pingbibiaoti, '备份规则', '覆盖文件必须被重写为备份里的规则')
+      assert.strictEqual(afterBack.revision, 1)
+      assert.ok(fs.statSync(paths.file).size < 1024, '回滚后文件必须回到常规大小')
+      assert.strictEqual(lastAuditAction(), 'restore', '回滚必须留 restore 审计')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '回滚成功后必须释放锁')
+
+      // 3) 导入：bundle 形状照抄「数据备份: 导入自动识别并恢复」用例，只带 filter 类别。
+      fs.writeFileSync(paths.file, huge)
+      const bundle = {
+        kind: 'xbk-console-backup',
+        schema: 1,
+        data: { filter: { text: JSON.stringify({ schema: 1, revision: 9, filter: { pingbifenlei: '导入规则' } }) } }
+      }
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, `导入不得被 tooLarge 早退挡住：${imp.text}`)
+      const impBody = JSON.parse(imp.text)
+      assert.strictEqual(impBody.ok, true)
+      assert.strictEqual(impBody.imported.filter, true, '导入必须报告 filter 已恢复')
+      assert.strictEqual(impBody.imported.filterRevision, 1)
+      const afterImport = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
+      assert.strictEqual(afterImport.filter.pingbifenlei, '导入规则', '覆盖文件必须被重写成导入的规则')
+      assert.strictEqual(afterImport.revision, 1)
+      assert.ok(fs.statSync(paths.file).size < 1024, '导入后文件必须回到常规大小')
+      assert.strictEqual(lastAuditAction(), 'import', '导入必须留 import 审计')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '导入成功后必须释放锁')
+    } finally { server.close() }
+  })
+
   await aok('过滤规则 POST: 写盘失败（目标是目录）→ 500 write_failed 且锁释放', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)

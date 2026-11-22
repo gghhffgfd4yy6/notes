@@ -2423,6 +2423,11 @@ function rollbackFilterOverride (paths, previousText, createdNew = false) {
 //   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
 //   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
 //   computeHash=false 给导入用：它不返回 hash，也就不必为拿摘要去懒加载规则引擎。
+//   tooLarge 早退（读不回保存前原文）**只对保存生效**：覆盖文件超过读硬顶（= body 上限 256 KiB）
+//   时 loadCurrentFilter 判 corrupt、上一代原文读不回来，保存必须中止（宁可拒写，不覆盖看不见的内容）。
+//   但 /restore（回滚备份 / 恢复默认）与 /api/backup/import 恰恰是这个状态下**唯一**的自助修复路径：
+//   把它们也 500 掉，用户只能上机器手改文件。故这三个 action 继续提交，previousText 保持 null、
+//   previousFileMissing 保持 false（rollbackFilterOverride 因此绝不 unlink），直接原子写新一代。
 function commitFilterOverride ({
   paths, deps, defaults, loaded, filterValue, action, actorToken,
   writeLabel = '过滤规则覆盖文件', computeHash = true, rollbackOnAuditFailure = true
@@ -2433,18 +2438,30 @@ function commitFilterOverride ({
   let previousText = null
   // 保存前是否**确实**没有覆盖文件（F2-4：只有这种情况回滚才允许 unlink）
   let previousFileMissing = loaded.source === 'default'
+  // 保存前原文是否因超上限读不回（>body 上限）：备份需要原文，读不到就没法备份（也不该拿
+  // 看不见的旧内容当回滚点）。只有这一种「读不回」允许继续提交，见下面 tooLarge 分支。
+  let previousReadTooLarge = false
   if (loaded.source === 'override' || loaded.source === 'corrupt') {
     const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
     if (raw.status === 'ok') previousText = raw.text
     else if (raw.status === 'missing') previousFileMissing = true
-    // F2-4：读不回保存前原文时**绝不写盘**。旧实现把 previousText=null 一律当成「原本没有覆盖文件」，
+    // F2-4：**保存**时读不回保存前原文就绝不写盘。旧实现把 previousText=null 一律当成「原本没有覆盖文件」，
     // 审计失败回滚时直接 unlink，把用户整份规则文件删掉。真正会丢数据的是 tooLarge：文件比 body 上限
     // （= 读硬顶 256 KiB）大 ⇒ 加载判 corrupt、这里读不回来，而下一行 writeAtomic 仍会把它覆盖掉。
-    // 此时中止本次提交、原文件一个字节不动。其余状态保持原语义：missing = 保存前没有文件（回滚
-    // unlink 才是正确的）；unsafe（目标是目录/FIFO）继续落到 writeAtomic 如实报 write_failed。
-    else if (raw.status === 'tooLarge') return { ok: false, status: 500, body: { error: 'rollback_read_failed', code: 'rollback_read_failed' } }
+    // 此时**保存**中止本次提交、原文件一个字节不动（这是唯一「看不见就别写」的调用方）。
+    // 恢复 / 恢复默认 / 导入不中止：它们正是这个状态下的自助修复路径，旧代码在这三条路径上就是
+    // 200 并重写文件，中止只会把用户锁死在损坏状态里。它们继续往下走，previousText 保持 null 且
+    // previousFileMissing 保持 false ⇒ 审计失败时 rollbackFilterOverride 走 read_failed、绝不 unlink。
+    // 其余状态保持原语义：missing = 保存前没有文件（回滚 unlink 才是正确的）；unsafe（目标是目录/FIFO）
+    // 继续落到 writeAtomic 如实报 write_failed。
+    else if (raw.status === 'tooLarge') {
+      if (action === 'save') return { ok: false, status: 500, body: { error: 'rollback_read_failed', code: 'rollback_read_failed' } }
+      previousReadTooLarge = true
+    }
     // 合法 override 必须能备份：备份失败就不能替换（否则这一代永久失去回滚点）。
-    if (loaded.source === 'override' && !backupFilterFile(paths, curRevision, previousText)) {
+    // tooLarge 例外：原文读不回来 ⇒ backupFilterFile 必然返回 false，此时报 backup_failed 是假错误码
+    // （真正的失败是读不回，而上面已按调用方分别处理）。unsafe 仍按原语义报 backup_failed。
+    if (loaded.source === 'override' && !previousReadTooLarge && !backupFilterFile(paths, curRevision, previousText)) {
       return { ok: false, status: 500, body: { error: 'backup_failed', code: 'backup_failed' } }
     }
   }
