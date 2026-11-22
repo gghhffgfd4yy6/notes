@@ -1656,6 +1656,40 @@ process.stdout.write('\nPROBE_JSON:' + JSON.stringify({
   warnsAfterInvalid: warns.length
 }))
 `
+const o4CacheProbe = String.raw`
+'use strict'
+const mod = require('./xbk_function_v3')
+let re2Available = false
+try { re2Available = Boolean(require('re2')) } catch (e) { re2Available = false }
+const out = { re2: re2Available, noClearFinal: -1, evictBound: -1, clearMax: -1, identity: false, sizeAfterClear: -1 }
+if (re2Available) {
+  // 50 轮「保存」：每轮 7 个不同源码（一次性规则集 ≈ 7 个正则字段）
+  const sourcesOf = (round) => Array.from({ length: 7 }, (_, i) => 'o4src' + round + 'x' + i)
+  mod.clearUserRegexCache()
+  // 对照组（不清）：350 个不同键全留在进程里，只受 USER_RE_CACHE_MAX=256 的淘汰约束
+  for (let r = 0; r < 50; r++) for (const src of sourcesOf(r)) mod.compileUserRegex(src)
+  out.noClearFinal = mod.userRegexCacheSize()
+  for (let i = 0; i < 50; i++) mod.compileUserRegex('o4extra' + i)
+  out.evictBound = mod.userRegexCacheSize()
+  // 实验组（每轮结束清一次）：只该看到当前这一轮的 7 条
+  mod.clearUserRegexCache()
+  let max = 0
+  for (let r = 0; r < 50; r++) {
+    for (const src of sourcesOf(r)) mod.compileUserRegex(src)
+    const size = mod.userRegexCacheSize()
+    if (size > max) max = size
+    mod.clearUserRegexCache()
+  }
+  out.clearMax = max
+  // 同一份源码重复编译必须仍命中同一实例（清空只发生在 revision 变化时，不退化）
+  const a = mod.compileUserRegex('o4identical')
+  const b = mod.compileUserRegex('o4identical')
+  out.identity = a !== null && a === b
+  mod.clearUserRegexCache()
+  out.sizeAfterClear = mod.userRegexCacheSize()
+}
+process.stdout.write('\nPROBE_JSON:' + JSON.stringify(out))
+`
 const entryProbe = String.raw`
 'use strict'
 const xbk = require('./xbk_function_v3')
@@ -1748,6 +1782,23 @@ check('safeRe/compileUserRegex：未装 re2 时直接走 V8、用户正则一律
   assert.strictEqual(out.invalid, 'THREW:SyntaxError', '无效模式仍由 V8 抛出')
   assert.strictEqual(out.warnsAfterInvalid, 0, 'RE2C 为 null 时不得触发回落告警（if (RE2C) 守卫被变异即会误报）')
   assert.strictEqual(out.cuString, 'null', '未装 re2 时用户配置正则必须被跳过（不得回退 V8）')
+})
+
+// C6-009 续 v3.531（O4-5）：同一份源码重复编译仍命中同一实例；换一批规则（模拟 50 次保存）时，
+// 若不按 revision 清空，缓存只受 256 上限约束——「没有线性增长」的判据必须靠 App 侧按 revision 清。
+// 回退即红：把 clearUserRegexCache 的 _userReCache.clear() 改成空实现 ⇒ sizeAfterClear 断言红；
+// 让 compileUserRegex 每次都新建实例 ⇒ identity 断言红。
+check('用户正则缓存生命周期：50 轮 × 7 条不同源码——不清时涨到上限 256，每轮清时 ≤ 8，同源码仍复用同一实例', () => {
+  const out = cachedProbe('o4usercache', o4CacheProbe, probeBaseEnv)
+  if (!out.re2) {
+    console.log('  ⏭ SKIP：本环境 require("re2") 失败，compileUserRegex 一律返回 null（缓存长度恒 0），该项无可观测面')
+    return
+  }
+  assert.strictEqual(out.noClearFinal, 256, `不清时 350 个不同键必须涨到上限 256（实测 ${out.noClearFinal}）`)
+  assert.strictEqual(out.evictBound, 256, `再编译 50 个新键也必须仍 ≤ 256（淘汰生效，实测 ${out.evictBound}）`)
+  assert.ok(out.clearMax <= 8, `每轮清一次时缓存长度必须只反映当前这一轮（≈7 条），实测峰值 ${out.clearMax}`)
+  assert.strictEqual(out.identity, true, '同一份源码重复编译必须命中同一实例（===）')
+  assert.strictEqual(out.sizeAfterClear, 0, `clearUserRegexCache 必须真的清空（实测剩余 ${out.sizeAfterClear}）`)
 })
 
 // compileUserRegex：非字符串直接 null（typeof 守卫 + || 短路），字符串按注入的 RE2 编译且默认 flags=i

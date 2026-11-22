@@ -332,6 +332,34 @@ const { findAll, memberPath, callSites, hasCallWithIdentifier } = require('./tes
   assert.strictEqual(fs.existsSync(make('durable3.txt')), false, 'fsync 失败时目标文件不得出现（未提交）')
   assert.deepStrictEqual(fs.readdirSync(tmp).filter((f) => f.startsWith('durable3.txt')), leftover, 'fsync 失败时不得残留 .tmp')
 
+  // ===== v3.531（O4-2）：durable:false 跳过两处 fsync，其余（lstat 守卫 / 唯一 tmp / write / rename / 清理）不变 =====
+  // 回退即红：把 writeAtomic 里的 `if (durable) fs.fsyncSync(fd)` 或 `if (durable) fsyncDirBestEffort(...)`
+  // 改回无条件调用 ⇒ 下面 fsyncCount === 0 的断言变红（实测 2：文件 + 父目录各一次）。
+  const noSyncPath = make('durable-off.txt')
+  let fsyncCount = 0
+  const origFsyncOff = fs.fsyncSync
+  fs.fsyncSync = (target) => { fsyncCount += 1; return origFsyncOff.call(fs, target) }
+  let offRet
+  try { offRet = writeAtomic(noSyncPath, 'x', '不抖盘状态', { durable: false }) } finally { fs.fsyncSync = origFsyncOff }
+  assert.strictEqual(offRet, true, 'durable:false 仍应成功提交（rename 仍是唯一提交点）')
+  assert.strictEqual(fs.statSync(noSyncPath).size, 1, 'durable:false 写入内容长度必须仍是 1 字节')
+  // 内容核对走存储层自己的读取入口（readSafeTextResult），不经 fs.readFileSync 的文本比对
+  const offBack = readSafeTextResult(noSyncPath)
+  assert.strictEqual(offBack.status, 'ok', 'durable:false 写入后必须仍是可读普通文件')
+  assert.strictEqual(offBack.text, 'x', 'durable:false 不得影响写入内容')
+  assert.strictEqual(fsyncCount, 0, `durable:false 不得 fsync（文件与父目录都不），实测 ${fsyncCount} 次`)
+  assert.deepStrictEqual(fs.readdirSync(tmp).filter((f) => f.startsWith('durable-off.txt') && f.endsWith('.tmp')), [], 'durable:false 也不得残留 .tmp')
+
+  // 反向对照：缺省（不传 options）仍必须 fsync——持久性口径只是被选项收紧，没有被整体摘掉
+  let fsyncDefault = 0
+  const origFsyncDef = fs.fsyncSync
+  fs.fsyncSync = (target) => { fsyncDefault += 1; return origFsyncDef.call(fs, target) }
+  let defRet
+  try { defRet = writeAtomic(make('durable-on.txt'), 'y') } finally { fs.fsyncSync = origFsyncDef }
+  assert.strictEqual(defRet, true, '默认写仍应成功')
+  assert.ok(fsyncDefault >= 1, `默认写必须 fsync（文件或父目录至少一次），实测 ${fsyncDefault} 次`)
+  assert.strictEqual(readSafeTextResult(make('durable-on.txt')).text, 'y', '默认写内容不变')
+
   // ===== readSafeTextResult =====
   // 不存在 → missing
   const r1 = readSafeTextResult(make('missing.txt'))

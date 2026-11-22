@@ -2882,7 +2882,7 @@ checkAsync('恢复认领清零: 通道恢复成功后计数清零、lastRecovere
 
 // --- _updateChannelHealth 主流程用例（失败计数 / 告警入队 / 恢复认领 / 状态损坏防御）---
 // _sendAlert 经 makeHealthApp 无注入——检查其实现依赖 getNotify/Pusher。用 sendAlert 注入参数版本。
-function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true, enabled = true }) {
+function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, threshold = 2, intervalMs = 3600000, pusher, writeOk = true, enabled = true, writeLog = null }) {
   return createApp({
     Config: { channelHealth: { enabled, consecutiveFailures: threshold, intervalMs } },
     Utils: {
@@ -2905,7 +2905,13 @@ function makeHealthApp2 ({ fs, cacheDir = dir, alive = () => false, sendAlert, t
       return { status: 'ok', text: String(text) }
     },
     // writeOk（参照 makeLogApp 的 opts.writeOk 先例）：false 模拟 writeAtomic 失败，覆盖 _writeState 短路分支
-    writeAtomic: (p, text) => { fs.writeFileSync(p, text); return writeOk },
+    // v3.531（O4-1）：writeLog 收集每次写入的 { path, text, options }——用来证明「内容没变就不写」
+    // 与「哪些调用点带 durable:false」，不依赖内存 fs 的 mtime 精度。
+    writeAtomic: (p, text, label, options) => {
+      if (writeLog) writeLog.push({ path: p, text, label, options })
+      fs.writeFileSync(p, text)
+      return writeOk
+    },
     isRegularOrMissing: () => true,
     STATE_TEXT_MAX_BYTES: 262144,
     DEFAULT_MAX_SIZE: 1048576,
@@ -3050,6 +3056,73 @@ checkAsync('通道健康: 状态写入失败时提前返回（不入队告警、
   const app2 = makeHealthApp2({ fs: makeMemFs(), threshold: 1, pusher: { send: async (t) => { sent.push(t) } } })
   await app2._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
   assert.strictEqual(sent.length, 1, 'writeOk 正常时同配置应入队告警')
+})
+
+// --- v3.531（O4-1）：channel-health.state 写前比较 ---
+// 回退即红：把生产侧 `_writeStateIfChanged(...)` 改回无条件 `_writeState(...)`，第一条用例的
+// 「第二次写入次数为 0」立刻变红；把 previousText 判据改成「缺失也当相同」或直接 return true，
+// 第三条（文件 missing ⇒ 首次必写）变红。
+checkAsync('O4-1 健康状态写前比较：内容与磁盘逐字节相同 ⇒ 第二次不落盘、文件字节不变', async () => {
+  const mfs = makeMemFs()
+  const writes = []
+  const app = makeHealthApp2({ fs: mfs, writeLog: writes })
+  // 首轮：文件缺失 ⇒ 必须写（不得把「读不到」当「内容相同」）
+  await app._updateChannelHealth({ successfulChannels: [], failures: [] })
+  assert.strictEqual(writes.length, 1, '文件不存在时首次必须落盘（missing ⇒ 退回 _writeState）')
+  const afterFirst = mfs.readFileSync(healthPath)
+  // 第二轮：state 仍是 {}，与磁盘内容逐字节相同 ⇒ 跳过原子写
+  await app._updateChannelHealth({ successfulChannels: [], failures: [] })
+  assert.strictEqual(writes.length, 1, `内容没变时不得再落盘（实测又写了 ${writes.length - 1} 次）`)
+  assert.strictEqual(mfs.readFileSync(healthPath), afterFirst, '跳过写盘时文件字节必须不变（inode/mtime 也不变）')
+  assert.strictEqual(mfs._files.has(healthPath + '.lock'), false, '跳过路径也必须释放锁（finally 语义）')
+})
+
+checkAsync('O4-1 健康状态写前比较：计数器变化 ⇒ 必写（内容含 consecutiveFailures:1）', async () => {
+  const mfs = makeMemFs()
+  const writes = []
+  const app = makeHealthApp2({ fs: mfs, writeLog: writes })
+  await app._updateChannelHealth({ successfulChannels: [], failures: [] }) // 先落一份 {}
+  assert.strictEqual(writes.length, 1)
+  await app._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  assert.strictEqual(writes.length, 2, '计数器变化必须落盘（内容与磁盘不同）')
+  assert.ok(writes[1].text.includes('"consecutiveFailures":1'), `落盘内容必须含 consecutiveFailures:1：${writes[1].text}`)
+  const state = JSON.parse(mfs.readFileSync(healthPath))
+  assert.strictEqual(state.pushdeer.consecutiveFailures, 1, '磁盘上必须看到本次累计')
+})
+
+checkAsync('O4-1 健康状态写前比较：文件 missing ⇒ 首次必写（不得跳过）', async () => {
+  const mfs = makeMemFs()
+  const writes = []
+  const app = makeHealthApp2({ fs: mfs, writeLog: writes })
+  assert.strictEqual(mfs.existsSync(healthPath), false, '前置：状态文件不存在')
+  await app._updateChannelHealth({ successfulChannels: [], failures: [] })
+  assert.strictEqual(writes.length, 1, 'missing 时首次必须写一次')
+  assert.deepStrictEqual(Object.keys(JSON.parse(mfs.readFileSync(healthPath))), [], '空表照旧落盘为 {}')
+})
+
+// --- v3.531（O4-2）：report.state 跳过 fsync，channel-health 保持 durable ---
+// 回退即红：删掉 _persistReportState 里的 { durable: false } ⇒ 本用例第一条断言红；
+// 把 channel-health 也改成 durable:false ⇒ 第二条断言红。
+checkAsync('O4-2 report.state 去 fsync：_persistReportState 传 {durable:false}，channel-health 不带该选项', async () => {
+  const reportWrites = []
+  const { app } = makeLogApp({
+    writeAtomic: (p, t, label, options) => {
+      reportWrites.push({ path: p, text: t, label, options })
+      return true
+    }
+  })
+  assert.strictEqual(app._persistReportState('/p/report.state', { runs: 1 }), true)
+  assert.strictEqual(reportWrites.length, 1, '日报状态每轮仍写一次（保留 tmp+rename 原子提交）')
+  assert.deepStrictEqual(reportWrites[0].options, { durable: false },
+    `report.state 必须显式去掉 fsync：${JSON.stringify(reportWrites[0].options)}`)
+
+  const healthWrites = []
+  const mfs = makeMemFs()
+  const hApp = makeHealthApp2({ fs: mfs, threshold: 1, writeLog: healthWrites })
+  await hApp._updateChannelHealth({ successfulChannels: [], failures: [{ channel: 'pushdeer', message: 'boom' }] })
+  assert.strictEqual(healthWrites.length, 1, '前置：健康状态写入一次')
+  assert.ok(!healthWrites[0].options || healthWrites[0].options.durable !== false,
+    `channel-health.state 必须保持持久写（不得带 durable:false）：${JSON.stringify(healthWrites[0].options)}`)
 })
 
 // 本簇的状态文件路径全部取自**私有 mkdtemp 目录**，不写可预测的 /tmp 文件名
@@ -3388,9 +3461,11 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     summarizeError,
     PROFILE3: false,
     PROFILE3_BOOT_MARKS: [],
-    prewarmDns: () => ({ ok: true, skipped: true }),
-    prewarmTls: () => ({ ok: true, skipped: true, okCount: 0, count: 0 }),
-    getNotify: () => Promise.resolve(null),
+    // v3.531（O4-3）：预热桩可注入——用例据此记录 prewarmTls 的第 3 参（连接数）；
+    // getNotify 也可注入，以便走「已配置 WxPusher」的真实预热分支。
+    prewarmDns: over.prewarmDns || (() => ({ ok: true, skipped: true })),
+    prewarmTls: over.prewarmTls || (() => ({ ok: true, skipped: true, okCount: 0, count: 0 })),
+    getNotify: over.getNotify || (() => Promise.resolve(null)),
     PKG_VERSION: '0.0.0-test',
     trimTrailingSlashes,
     compileUserRegex
@@ -3412,6 +3487,32 @@ function buildFilterRunHarness (cacheDir, over = {}) {
     cacheMessages () { return MessageStore.readMessages(MessageStore.getFilePath(MessageStore.getFileName(Config.api.pushUrl))) }
   }
 }
+
+// v3.531（O4-3）：TLS 预热的连接数固定夹到 2（与并发窗口无关）。
+// 回退即红：把生产侧的 `Math.min(resolveParallelWindow(...), PREWARM_TLS_CONNECTIONS)` 改回
+// `resolveParallelWindow(...)`，第一条断言实测得到 10（parallelLimit=10）。
+checkAsync('O4-3 TLS 预热连接数夹到 2：parallelLimit=10 ⇒ count=2；parallelLimit=1 ⇒ 1', async () => {
+  const cacheDir = mkTmpFixture('o4-prewarm-')
+  const counts = []
+  const h = buildFilterRunHarness(cacheDir, {
+    prewarmDns: () => ({ ok: true, skipped: true }),
+    prewarmTls: (host, timeout, count) => {
+      counts.push(count)
+      return Promise.resolve({ ok: true, okCount: count, count })
+    },
+    getNotify: () => Promise.resolve({ hasWxPusherConfigured: () => true })
+  })
+  const ctxOf = (parallelLimit) => ({
+    dryRun: false,
+    checkpoint: () => {},
+    config: { push: { parallelLimit, maxPerRun: 100 } },
+    warmup: { dns: null, tls: null, dnsSettled: false, tlsSettled: false, controller: null, cancelled: false }
+  })
+  await h.App._startNotifyWarmup(ctxOf(10))
+  assert.deepStrictEqual(counts, [2], `并发窗口 10 时预热连接数必须夹到 2（实测 ${JSON.stringify(counts)}）`)
+  await h.App._startNotifyWarmup(ctxOf(1))
+  assert.deepStrictEqual(counts, [2, 1], `parallelLimit=1 时必须仍是 1（min 生效，实测 ${JSON.stringify(counts)}）`)
+})
 
 function makeRunItem (id, title) {
   return { id, title, catename: '测试分类', content: '', shijianchuo: 1760000000 }
@@ -6796,10 +6897,11 @@ checkAsync('P1-1 阶段管线成功一轮：summary 字段顺序与 run.log 摘�
     const lines = readRunLogLines(realFs, cacheDir)
     const summaryLines = lines.filter(l => RUN_SUMMARY_LINE_RE.test(l))
     assert.strictEqual(summaryLines.length, 1, `本轮必须恰好一行摘要：${JSON.stringify(lines)}`)
-    // 关键行格式：戳 + 六项计数（固定顺序）+ elapsed + 条件尾部（本场景只有 cachesaved）
+    // 关键行格式：戳 + 六项计数（固定顺序）+ elapsed + 条件尾部。v3.531（O4-4）起 elapsed 之后
+    // 必有 ` pp=<ms>`（preprocess 毫秒，真跑恒有 timings，缺 pp 即应红），其余片段顺序不变（本场景只有 cachesaved）。
     assert.match(summaryLines[0],
-      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=\d+\.\ds cachesaved=1$/,
-      `run.log 摘要行格式必须不变：${summaryLines[0]}`)
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=\d+\.\ds pp=(?:0|[1-9]\d*)(?:\.\d)? cachesaved=1$/,
+      `run.log 摘要行格式必须不变（pp= 只加在 elapsed 之后）：${summaryLines[0]}`)
     const parsed = parseRunSummaryLine(summaryLines[0])
     assert.ok(parsed, `摘要行必须能被读侧解析：${summaryLines[0]}`)
     assert.deepStrictEqual(
@@ -6929,7 +7031,7 @@ checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run
 // 桩件无法证明「真的没读文件」与「真的没重编译」，只能证明我们自己写的调用形态。
 // 这里的断言口径与 specs/O1.md 一致：规则没变 ⇒ 下一轮复用同一批对象；控制台保存（原子替换）⇒
 // 下一轮必须重读并重编译（「保存后下一轮生效」的语义一字不改）。
-function makeRulesHarness (tag, dirOverride) {
+function makeRulesHarness (tag, dirOverride, extra = {}) {
   const realFs = require('fs')
   const { createUtils, FILTER_FIELDS } = require('./xbk_utils')
   const { createRuleEngine } = require('./xbk_rules')
@@ -6999,7 +7101,9 @@ function makeRulesHarness (tag, dirOverride) {
     getNotify: () => Promise.resolve(null),
     PKG_VERSION: '0.0.0',
     trimTrailingSlashes: (s) => s,
-    compileUserRegex
+    compileUserRegex,
+    // v3.531（O4-5）：规则 revision 变化时 App 调这个清空用户正则编译缓存——用例注入 spy 计数。
+    clearUserRegexCache: extra.clearUserRegexCache || (() => {})
   })
   const ctxOf = () => ({
     dryRun: true,
@@ -7088,6 +7192,27 @@ check('O1 filter.hash：内容没变不写盘（inode 与 mtime 都不变）；�
   assert.notStrictEqual(third.mtimeMs, first.mtimeMs, '内容变了 mtime 必须变')
   peer.App._invalidateFilteredCache({ active, cacheName, filterHash: 'hash-2', dryRun: false })
   assert.strictEqual(peer.realFs.statSync(hashPath).ino, third.ino, '独立读取方确认新内容已落盘（同样跳过）')
+})
+
+// v3.531（O4-5）：_userReCache 按规则 revision 失效——首轮基线清一次（缓存本为空），同一
+// revision 的后续轮次不再清（保证「同一份规则重复编译仍命中缓存」），revision 变化必清。
+// 回退即红：删掉 _runPrepare 里的 clearUserRegexCache() 调用 ⇒ 第三轮仍是 1 次。
+checkAsync('O4-5 规则 revision 变化才清用户正则缓存：首轮 1 次、同 revision 仍 1 次、revision 2 ⇒ 2 次', async () => {
+  let clears = 0
+  const h = makeRulesHarness('o4-clear-', null, { clearUserRegexCache: () => { clears += 1 } })
+  const first = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(first.rules.active.revision, 1, '前置：首轮读到覆盖文件 revision 1')
+  assert.strictEqual(clears, 1, `首轮基线必须清一次（实测 ${clears} 次）`)
+  const second = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(second.timings.rulesReused, 1, '前置：同 revision 第二轮命中 O1 签名短路')
+  assert.strictEqual(clears, 1, `同一 revision 不得再清（否则每次都丢缓存）：实测 ${clears} 次`)
+  // 控制台保存形态：写临时文件 + rename 覆盖（ino 必变、revision 变 2）
+  const tmpFile = h.rulesFile + '.tmp'
+  h.realFs.writeFileSync(tmpFile, JSON.stringify({ schema: 1, revision: 2, filter: { ...h.filter, pingbibiaoti: '屏蔽标题丙' } }))
+  h.realFs.renameSync(tmpFile, h.rulesFile)
+  const third = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(third.rules.active.revision, 2, '第三轮必须读到 revision 2')
+  assert.strictEqual(clears, 2, `revision 变化必须清一次（实测 ${clears} 次）`)
 })
 
 // ===== 异步用例执行（必须留在文件末尾）=====
