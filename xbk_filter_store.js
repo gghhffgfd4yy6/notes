@@ -67,7 +67,11 @@ const FILTER_RULES_SCHEMA = 1
 //     diskBudget = diskAvailBytes × 0.01 / 6                              # 6 份产物：override/tmp/bak/lkg/applied/audit
 //   totalBytes  = clamp(min(resourceCeiling, softCap), 256 KiB, 8 MiB)
 //   reserve     = Σ reserveChars(field) × 3 B = 42,432 B（8 个非 plus × 1000 + 3 个 plus × 2048）
-//   mainChars   = quantize1000((totalBytes − reserve) / 主字段数 / 3)
+//   mainChars   = min(quantize1000((totalBytes − reserve) / 主字段数 / 3), FILTER_MAIN_CHARS_MAX)
+//
+// F4：默认 softCap 抬到 1 MiB ⇒ 两主字段 160,000 字符（公式本来能摊到 167,000，但主字段的对外
+// 数字钉在 FILTER_MAIN_CHARS_MAX，见该常量的注释）。1 MiB 预算下 11 个字段全填满 = 999,576 B，
+// 仍在 rulesFileMaxBytes − 32 之内。
 //
 // 落点：resolveFilterLimits() 在**模块加载**探测一次（/proc/meminfo 的 MemAvailable；自身 cgroup
 // 上溯的 memory.max/current —— `max` 必须特判：Number('max') = NaN；fs.statfsSync(cacheDir) 的
@@ -75,7 +79,7 @@ const FILTER_RULES_SCHEMA = 1
 // 与 worker 共读；两个进程必须用同一份预算，不一致时以文件为准并告警。
 //
 // 覆盖：XBK_FILTER_SOFT_CAP_BYTES（整数 → 夹 [256 KiB, 8 MiB]、向下 4096 对齐；非法值回落默认
-// 512 KiB 并 console.warn，不静默当 auto）。探测失败（meminfo 读不到／MemAvailable ≤ 0／cgroup
+// 1 MiB 并 console.warn，不静默当 auto）。探测失败（meminfo 读不到／MemAvailable ≤ 0／cgroup
 // headroom ≤ 0／statfs 抛错）→ 回落 256 KiB + 16,000 字符 + degraded:true，**绝不回落成「无限」**
 // （readSafeTextResult 的 maxBytes 非正/NaN 等于不设限整读）。
 const FILTER_BYTES_PER_CHAR = 3
@@ -83,14 +87,18 @@ const FILTER_MAIN_CHARS_QUANTUM = 1000
 const FILTER_TOTAL_QUANTUM_BYTES = 64 * 1024
 const FILTER_MIN_TOTAL_BYTES = 256 * 1024
 const FILTER_MAX_TOTAL_BYTES = 8 * 1024 * 1024
-const FILTER_DEFAULT_SOFT_CAP_BYTES = 512 * 1024
+const FILTER_DEFAULT_SOFT_CAP_BYTES = 1024 * 1024
 const FILTER_SOFT_CAP_ALIGN_BYTES = 4096
 const FILTER_SOFT_CAP_ENV = 'XBK_FILTER_SOFT_CAP_BYTES'
 const FILTER_CACHE_DIR_ENV = 'XBK_CACHE_DIR'
 // 文件名取自 scripts/filter-rules-paths.js 的 CAPACITY_FILE（与 filterRulesPaths(dir).capacity 同源，
 // 避免两处字面量漂移）；本常量继续导出，测试与日志按它构造/点名路径。
 const FILTER_CAPACITY_FILE = CAPACITY_FILE
-const FILTER_CAPACITY_SCHEMA = 1
+// 容量文件 schema。**改它就是「换一代预算」**：老文件会被 readCapacityFile 判非法 ⇒ 本进程按当前
+// 默认重算并重写（另一进程随后跟同一份）。F4 从 1 升到 2：默认 softCap 512 KiB → 1 MiB，若不换代，
+// 升级后每个进程都会「以文件为准」沿用盘上那份 512 KiB，新默认永远不生效（只有删文件或改环境变量
+// 才动），而两侧都认为自己是对的。
+const FILTER_CAPACITY_SCHEMA = 2
 const FILTER_CAPACITY_FILE_MAX_BYTES = 64 * 1024
 const FILTER_REQUEST_BODY_MARGIN_BYTES = 8192
 const FILTER_READ_MARGIN_BYTES = 1024
@@ -104,9 +112,17 @@ const FILTER_SAVE_HEADROOM_BYTES = 32
 // 非主字段的单字段档位（8 个非 plus × 1000 + 3 个 plus × 2048 = 14,144 字符 = 42,432 B）。
 const FILTER_FIELD_RESERVE_CHARS = 1000
 const FILTER_FIELD_PLUS_RESERVE_CHARS = 2048
-// 主字段：用户实际会填满的两个大字段（现网实测 屏蔽标题 15,735 / 屏蔽内容 15,636 字符），上限取
-// mainChars；其余字段按预留档位钉死（小字段 1000 / plus 2048），11 个字段全满也必须落在 totalBytes 内。
+// 主字段：用户实际会填满的两个大字段（现网实测 屏蔽标题 15,735 / 屏蔽内容 15,636 字符）…
 const FILTER_MAIN_FIELDS = Object.freeze(['pingbibiaoti', 'pingbineirong'])
+// 主字段的**硬顶**（F4 的头条数字，也是文档/前端文案唯一引用的那个数）：1 MiB softCap 按公式能
+// 摊到 167,000，但对外数字钉在 160,000——
+//   ① 它是 spec / SYSTEM_CONTRACT / README / 前端提示共用的一个数，不该随 softCap 档位漂移
+//      （否则同一台机器改个环境变量，页面文案里的「上限」和文档里的就不再是同一个）；
+//   ② 两主字段各 160,000 × 3 B = 960,000 B，加 reserve 42,432 B = 1,002,432 B，在 1 MiB 的
+//      整份预算里留 46,144 B 给 JSON 包装（`{"schema":1,"revision":N,"rules":{…}}`、字段名、转义）
+//      与将来的字段扩展——按公式顶满 167,000 只剩 4 KB，一次 revision 位数增长就贴边；
+//   ③ 资源更小时仍按公式随 totalBytes 收缩（min，不是替换），探头失败仍回落今日的 16,000。
+const FILTER_MAIN_CHARS_MAX = 160000
 // 今日常量（F1 的数字）：既是**读端下限**（存量小字段不得被判 corrupt），也是探测失败时的回落值。
 const FILTER_FIELD_MAX_LEN = 16000
 const FILTER_RULES_MAX_BYTES = 256 * 1024
@@ -172,7 +188,7 @@ function clampInt (value, min, max) {
 
 /**
  * 覆盖值 XBK_FILTER_SOFT_CAP_BYTES：只认十进制非负整数；夹 [256 KiB, 8 MiB]、向下 4096 对齐。
- * 非法值（空串以外的任何非整数形态）回落默认 512 KiB 并 console.warn——**不静默当 auto**：
+ * 非法值（空串以外的任何非整数形态）回落默认 1 MiB 并 console.warn——**不静默当 auto**：
  * 用户显式设了值却没生效，必须能在日志里看到原因。
  * @returns {{bytes:number, explicit:boolean, invalid:boolean}}
  */
@@ -201,7 +217,10 @@ function layoutFilterCapacity (totalBytes, {
 } = {}) {
   const mainChars = Math.max(
     FILTER_MAIN_CHARS_QUANTUM,
-    quantizeDown((totalBytes - FILTER_RESERVE_BYTES) / FILTER_MAIN_FIELDS.length / FILTER_BYTES_PER_CHAR, FILTER_MAIN_CHARS_QUANTUM)
+    Math.min(
+      quantizeDown((totalBytes - FILTER_RESERVE_BYTES) / FILTER_MAIN_FIELDS.length / FILTER_BYTES_PER_CHAR, FILTER_MAIN_CHARS_QUANTUM),
+      FILTER_MAIN_CHARS_MAX
+    )
   )
   const perField = {}
   for (const field of FILTER_RULE_FIELDS) {
@@ -787,6 +806,90 @@ function filterLimitsReport (cacheDir, filter) {
     },
     usage: { rulesFileBytes, fieldChars }
   }
+}
+
+// GET /api/config/filter 的响应体（F4：单一来源的读面形状）。
+// 为什么搬到 store：① 响应形状要能被纯函数直测（console.js 的变异分片没有余量，塞进去的每段
+// 逻辑都只能靠 HTTP 端到端覆盖）；② 旧形状把同一份规则正文下发**三份**（`filter` 合并结果、
+// `override` 覆盖原文、`applied.filter` 生效快照），1 MiB 预算下单次响应 ≈ 2–3 MiB，而前端
+// 轮询是每 5 s 一拍。`view==='merged'` 只下发一份：
+//   · `filter`：合并后的生效值（编辑器的唯一数据源）；
+//   · `overrideFields`：覆盖文件里**显式写了**的字段名清单（值就是上面 `filter[name]`，同一次读盘）；
+//   · `applied`：只留 revision/source/hash/appliedAt/lastGoodUsed（整份 filter/keyword 不重复下发）。
+// `view` 缺省=旧形状（外部脚本/老页面兼容），只有显式 `?view=merged` 才收窄。
+function buildFilterGetPayload (input) {
+  const opts = input && typeof input === 'object' ? input : {}
+  const loaded = opts.loaded && typeof opts.loaded === 'object' ? opts.loaded : {}
+  const appliedRead = opts.appliedRead && typeof opts.appliedRead === 'object' ? opts.appliedRead : { status: 'missing' }
+  const applied = appliedRead.status === 'ok' ? appliedRead.snapshot : null
+  const chain = opts.auditChain && typeof opts.auditChain === 'object'
+    ? opts.auditChain
+    : { ok: true, entries: 0, brokenAt: null }
+  const filter = loaded.filter && typeof loaded.filter === 'object' ? loaded.filter : {}
+  const override = loaded.override && typeof loaded.override === 'object' ? loaded.override : {}
+  const corrupt = loaded.source === 'corrupt'
+  const merged = opts.view === 'merged'
+  // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
+  const revision = corrupt ? 0 : (Number.isSafeInteger(loaded.revision) ? loaded.revision : 0)
+  const keyword = safeGet(loaded, 'keyword')
+  const payload = {
+    schema: FILTER_RULES_SCHEMA,
+    revision,
+    source: loaded.source,
+    filter,
+    // 与 filter 同源（同一次读盘给出）：不得在调用侧再读一遍文件，否则两次读之间文件被别的
+    // 进程替换/读失败时，filter 与 override 会描述两个不同快照，保存会丢字段。
+    ...(merged ? {} : { override }),
+    keyword: {
+      zkt_gjc: keyword && safeGet(keyword, 'zkt_gjc') !== undefined ? safeGet(keyword, 'zkt_gjc') : '',
+      writable: false
+    },
+    wideMatch: Array.isArray(opts.wideMatch) ? opts.wideMatch : [],
+    applied,
+    // 口径对齐（I2/F4-1）：lastGoodUsed 只认运行侧本轮写进 applied.json 的记录。
+    lastGoodUsed: appliedLastGoodUsed(applied),
+    auditChain: { ok: chain.ok !== false, entries: chain.entries, brokenAt: chain.brokenAt },
+    // F2-5：上限与用量（F3 起前端已接：字段计数器与 413 文案都读这里）。
+    ...(opts.limits && typeof opts.limits === 'object' ? opts.limits : {})
+  }
+  if (corrupt) {
+    payload.error = {
+      code: 'store_corrupt',
+      message: loaded.error && loaded.error.message ? loaded.error.message : '覆盖文件损坏'
+    }
+  }
+  if (!merged) return payload
+  // merged：override 退化成字段名清单、applied 去掉整份 filter/keyword。
+  payload.view = 'merged'
+  payload.overrideFields = FILTER_RULE_FIELDS.filter(field => typeof safeGet(override, field) === 'string')
+  payload.applied = applied && typeof applied === 'object'
+    ? {
+        revision: applied.revision,
+        source: applied.source,
+        hash: applied.hash,
+        appliedAt: applied.appliedAt
+        // 顶层 payload.lastGoodUsed 已经是同一个信息的运行侧派生值，这里不再重复（省字节也更难漂移）
+      }
+    : null
+  return payload
+}
+
+// 保存响应里「被去重的字段及其落盘正文」（F4）：旧响应回吐整份 `filter`（1 MiB 预算下等于把
+// 刚才上传的正文再传一遍），而前端只用它修正「我粘进去的重复行已被收掉」这一件事。只回去重
+// 命中的字段（没有去重就是空对象 ⇒ 响应里一个字节的规则正文都没有）。
+function dedupedFieldsOf (filter, deduped) {
+  const counts = deduped && typeof deduped === 'object' ? deduped : {}
+  const out = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    const removed = safeGet(counts, field)
+    if (!isPositiveSafeInt(removed)) continue
+    const value = safeGet(filter, field)
+    // 只回「既有去重计数、又确实有正文」的字段：两边对不上时宁可不回，也不能凭空造一个空字段
+    // 让前端拿 '' 覆盖掉编辑器里的内容。
+    if (typeof value !== 'string') continue
+    out[field] = value
+  }
+  return out
 }
 
 // 持久 LKG 的读上限（F4-1 返工 R3）：LKG 是覆盖文件的**再包装**——`{schema,revision,hash,override}`
@@ -1846,15 +1949,21 @@ module.exports = {
   computeDerivedReadLimits,
   readCapacityFile,
   FILTER_CAPACITY_FILE,
+  // 容量文件 schema（F4 起 2）：测试构造夹具必须用它，别写死 1——换代后写死的夹具会被判非法。
+  FILTER_CAPACITY_SCHEMA,
   FILTER_SOFT_CAP_ENV,
   FILTER_CACHE_DIR_ENV,
   FILTER_MAIN_FIELDS,
+  // F4：主字段硬顶（160,000）——文档/前端文案/测试都引用它，不在别处再写一遍这个数。
+  FILTER_MAIN_CHARS_MAX,
   FILTER_MIN_TOTAL_BYTES,
   // 今日常量（F1 的数字）：读端单字段下限、探测失败时的回落值。测试要按它断「回落成 16,000」。
   FILTER_FIELD_MAX_LEN,
   FILTER_MAX_TOTAL_BYTES,
   FILTER_DEFAULT_SOFT_CAP_BYTES,
   FILTER_RESERVE_BYTES,
+  // F4：公式里的「每字符 3 字节」假设（文档同步用同一常量，避免文档写 2 B 代码按 3 B 算）
+  FILTER_BYTES_PER_CHAR,
   // 保存路径的单字段上限（未知字段 0）与读路径的单字段上限（max(今日常量, 字段值)）
   fieldMaxLenOf,
   readFieldMaxLen,
@@ -1866,6 +1975,9 @@ module.exports = {
   scanPreviewRecords,
   countUnescapedAlternations,
   filterLimitsReport,
+  // F4：GET /api/config/filter 的响应体（merged 视图只下发一份规则）与保存响应的去重字段摘要。
+  buildFilterGetPayload,
+  dedupedFieldsOf,
   // 生效快照的读上限（仅测试用：断言「写出的 applied 必须 ≤ 读上限」以及贴上限的覆盖文件仍读得回）
   APPLIED_MAX_BYTES,
   filterRulesPaths,
