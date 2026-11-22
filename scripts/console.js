@@ -2116,7 +2116,7 @@ function readBody (req, maxBytes = BODY_DEFAULT_MAX_BYTES) {
 //   · 全局闸对 POST 只认 Bearer、对「仅 Cookie」统一回 unauthorized——直接复用会让
 //     「URL 带 token」与「仅 Cookie」都落到同一条 401，无法给出规格要求的专属 code。
 // 规则正文绝不进访问日志/审计：审计只记 action/revision/changedFields 与 prevHash 链。
-// v3.394：与 xbk_filter_store 同步 64 KiB → 256 KiB（单字段上限同步抬升）；F1 起读 FILTER_LIMITS 单一来源
+// v3.394：与 xbk_filter_store 同步 64 KiB → 256 KiB（单字段上限同步抬升）；F1 起读 FILTER_LIMITS 单一来源。F3：请求体 = 整份预算 + 8192（动态、启动钉住），**读**覆盖文件/备份改用 readMaxBytes（两旋钮分道）。
 const FILTER_BODY_MAX_BYTES = FilterStore.FILTER_LIMITS.requestBodyMaxBytes
 const FILTER_AUDIT_MAX_BYTES = 4 * 1024 * 1024
 const FILTER_LOCK_STALE_MS = 10 * 1000
@@ -2442,7 +2442,7 @@ function commitFilterOverride ({
   // 看不见的旧内容当回滚点）。只有这一种「读不回」允许继续提交，见下面 tooLarge 分支。
   let previousReadTooLarge = false
   if (loaded.source === 'override' || loaded.source === 'corrupt') {
-    const raw = readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
+    const raw = readSafeTextResult(paths.file, FilterStore.FILTER_LIMITS.readMaxBytes, { openNonBlocking: true })
     if (raw.status === 'ok') previousText = raw.text
     else if (raw.status === 'missing') previousFileMissing = true
     // F2-4：**保存**时读不回保存前原文就绝不写盘。旧实现把 previousText=null 一律当成「原本没有覆盖文件」，
@@ -4478,7 +4478,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       const fieldMaxLen = FilterStore.fieldMaxLenOf(field)
       if (value.length > fieldMaxLen) {
-        errors.push({ field, code: 'too_long', message: `字段「${field}」长度 ${value.length} 超过上限 ${fieldMaxLen}` })
+        errors.push({ field, code: 'too_long', limit: fieldMaxLen, actual: value.length, message: `字段「${field}」长度 ${value.length} 超过上限 ${fieldMaxLen}（本机上限 ${fieldMaxLen}、当前 ${value.length}）` })
         continue
       }
       if (hasFilterDraftControlChar(value)) {
@@ -4677,7 +4677,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       }
       if (selected.includes('filter')) {
         const paths = FilterStore.filterRulesPaths(stateDir)
-        const read = readBackupFile(paths.file, FILTER_BODY_MAX_BYTES)
+        const read = readBackupFile(paths.file, FilterStore.FILTER_LIMITS.readMaxBytes)
         if (read.status === 'ok') {
           let parsed
           try { parsed = JSON.parse(read.text) } catch (e) { parsed = null }
@@ -5096,7 +5096,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 时自己也会刷新 LKG（那描述的是「下次降级能用什么」），拿它冒充运行侧状态会给出假绿。
       lastGoodUsed: FilterStore.appliedLastGoodUsed(applied),
       auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt },
-      // F2-5：上限与用量（前端本项只读不用，F3 才接）。字段必须先在，否则前端只能继续写死 256 KiB。
+      // F2-5：上限与用量（F3 起前端已接：字段计数器与 413 文案都读这里）。字段必须先在，否则前端只能继续写死 256 KiB。
       ...FilterStore.filterLimitsReport(stateDir, loaded.filter)
     }
     if (corrupt) {
@@ -5364,7 +5364,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       const paths = FilterStore.filterRulesPaths(stateDir)
       let restoredFilter = null
       if (!toDefault) {
-        const read = readSafeTextResult(paths.backupFor(to), FILTER_BODY_MAX_BYTES, { openNonBlocking: true })
+        const read = readSafeTextResult(paths.backupFor(to), FilterStore.FILTER_LIMITS.readMaxBytes, { openNonBlocking: true })
         if (read.status === 'missing') {
           sendJson(res, 404, { error: 'backup_not_found', code: 'backup_not_found' })
           return
