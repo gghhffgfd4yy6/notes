@@ -191,6 +191,189 @@ check('validUrl: 非字符串无效', () => {
   assert.strictEqual(Utils.validUrl(123), '')
 })
 
+// ===== validUrl 进程内命中缓存（v3.530 / O3） =====
+// 50 条构造样本：危险协议（大小写/实体编码/内部空白/NUL/协议相对）、带凭证、超长、非 http(s)、
+// 空串/空白/控制字符、历史伪值。等价性口径 = 缓存前后逐条相同；危险样本必须恒为 ''。
+function v530DangerousUrls () {
+  return [
+    'javascript:alert(1)',
+    'JavaScript:alert(1)',
+    ' javascript:alert(1) ',
+    'javascript&colon;alert(1)',
+    '&#106;avascript:alert(1)',
+    'jav&#x61;script:alert(1)',
+    'java\tscript:alert(1)',
+    'java\nscript:alert(1)',
+    'javascript&NewLine;:alert(1)',
+    'vbscript:msgbox(1)',
+    'VBScript:msgbox(1)',
+    'data:text/html,<script>alert(1)</script>',
+    'DATA:text/html;base64,PHNjcmlwdD4=',
+    '//javascript:alert(1)',
+    '//data:text/html,abc'
+  ]
+}
+function v530Samples () {
+  return v530DangerousUrls().concat([
+    '',
+    '   ',
+    '\t\n\r',
+    '\u0000https://example.com',
+    'https://example.com/\u0007path',
+    'https://user:pass@example.com/path',
+    'http://user:pass@EXample.COM/a/?utm_source=x&b=2',
+    'ftp://example.com/file',
+    'mailto:a@b.com',
+    'file:///etc/passwd',
+    'tel:+8613800000000',
+    'weixin://dl/business/?t=1',
+    'android-app://com.example/x',
+    'intent://scan/#Intent;scheme=zxing;end',
+    'example.com/path',
+    'HTTPS://EXAMPLE.COM/Path/',
+    'https://example.com/path/?utm_source=a&utm_medium=b&id=3#frag',
+    'https://example.com/path#frag',
+    'https://example.com/?fbclid=abc',
+    'https://example.com/?gclid=1&keep=2',
+    '[object Object]',
+    'undefined',
+    'null',
+    'true',
+    'https://例え.jp/パス',
+    'https://example.com/a b',
+    'https://example.com/a%20b',
+    'https://example.com:8080/p',
+    'http://[::1]:8080/p',
+    'https://example.com/p?q=中文',
+    'https://example.com/p?q=%E4%B8%AD%E6%96%87',
+    'https://example.com/p#',
+    'https://example.com/' + 'a'.repeat(4096),
+    'https://example.com/' + 'a'.repeat(20000),
+    'https://example.com/' + '超'.repeat(2000)
+  ])
+}
+
+check('v3.530 validUrl 缓存：50 条危险/畸形样本 冷(新实例)/热(命中) 逐条相同', () => {
+  const urls = v530Samples()
+  assert.strictEqual(urls.length, 50, '样本必须正好 50 条')
+  const cold = createUtils({ safeRe })
+  const warm = createUtils({ safeRe })
+  for (const u of urls) {
+    const first = warm.validUrl(u)
+    assert.strictEqual(first, cold.validUrl(u), `首次（未命中）必须与冷实例相同：${JSON.stringify(u.slice(0, 40))}`)
+    const second = warm.validUrl(u)
+    assert.strictEqual(second, first, `第二次（命中）必须与首次相同：${JSON.stringify(u.slice(0, 40))}`)
+    assert.strictEqual(warm.validUrlCacheHas(u), true, '字符串入参必须进缓存（含返回空串的非法/危险串）')
+  }
+  assert.ok(warm.validUrlCacheSize() <= 50, '样本集不得撑破缓存上限')
+  // 危险 URL 的 '' 也是缓存值：命中后仍是 ''，绝不能因为「命中缓存」而被当成安全 URL 返回原串
+  for (const u of v530DangerousUrls()) {
+    assert.strictEqual(warm.validUrl(u), '', `危险 URL 命中缓存后仍必须是 '': ${JSON.stringify(u)}`)
+    assert.strictEqual(warm.validUrlCacheHas(u), true, '危险结果必须缓存（值为空串），不是不缓存')
+    assert.strictEqual(warm.validUrl(u), '', '重复命中仍必须是空串')
+  }
+})
+
+check('v3.530 validUrl 缓存：同 URL 连续两次 → 值相同且 size 不增（真命中）', () => {
+  const u = createUtils({ safeRe })
+  assert.strictEqual(u.validUrlCacheSize(), 0, '新实例缓存必须为空（不跨实例/不落盘）')
+  const sample = 'https://Example.com/Path/?utm_source=x&id=9'
+  const first = u.validUrl(sample)
+  assert.strictEqual(first, 'https://example.com/Path?id=9')
+  assert.strictEqual(u.validUrlCacheSize(), 1)
+  assert.strictEqual(u.validUrl(sample), first, '命中必须返回同一结果')
+  assert.strictEqual(u.validUrlCacheSize(), 1, '命中不得新增条目（size 不增即证明走的是缓存）')
+  u.clearValidUrlCache()
+  assert.strictEqual(u.validUrlCacheSize(), 0, 'clearValidUrlCache 后必须为空')
+  assert.strictEqual(u.validUrlCacheHas(sample), false)
+  assert.strictEqual(u.validUrl(sample), first, '清空后重算结果必须与原结果逐字相同')
+  assert.strictEqual(u.validUrlCacheSize(), 1)
+  // 真命中的硬判据：命中时不得再走 safeUrl 校验链。「值相同 + size 不增」不足以区分
+  // 「命中」与「重算后写回同一个键」（后者 size 同样不增），必须数 safeUrl 的调用次数。
+  const spy = createUtils({ safeRe })
+  let safeCalls = 0
+  const origSafeUrl = spy.safeUrl
+  spy.safeUrl = function (v) { safeCalls++; return origSafeUrl.call(this, v) }
+  assert.strictEqual(spy.validUrl(sample), first)
+  assert.strictEqual(safeCalls, 1, '首次未命中必须走 safeUrl')
+  assert.strictEqual(spy.validUrl(sample), first)
+  assert.strictEqual(safeCalls, 1, '第二次必须命中缓存：不得再走 safeUrl（关掉缓存读时此断言必红）')
+  assert.strictEqual(spy.validUrlCacheSize(), 1)
+})
+
+check('v3.530 validUrl 缓存：写 20,001 条后 size === 20,000、首条被淘汰但重算正确、末条仍在', () => {
+  const u = createUtils({ safeRe })
+  const url = (i) => 'https://example.com/o3/' + i
+  const firstUrl = url(0)
+  const firstValue = u.validUrl(firstUrl)
+  assert.strictEqual(firstValue, 'https://example.com/o3/0')
+  for (let i = 1; i < 20000; i++) u.validUrl(url(i))
+  assert.strictEqual(u.validUrlCacheSize(), 20000, '写满 20,000 条不同 URL')
+  u.validUrl(url(20000)) // 第 20,001 个不同 URL ⇒ 必须淘汰最旧的一条
+  assert.strictEqual(u.validUrlCacheSize(), 20000, '容量上限 20,000，不得涨到 20,001')
+  assert.strictEqual(u.validUrlCacheHas(firstUrl), false, '第 1 个 URL 必须已被淘汰')
+  assert.strictEqual(u.validUrlCacheHas(url(20000)), true, '最近写入的必须仍在缓存')
+  assert.strictEqual(u.validUrl(firstUrl), firstValue, '被淘汰的首条重算结果必须与原结果相同')
+  assert.strictEqual(u.validUrlCacheSize(), 20000, '重算插入后仍保持上限（淘汰 url(1) 而不是越界）')
+  for (let i = 0; i < 5; i++) u.validUrl('https://example.com/o3/extra/' + i)
+  assert.strictEqual(u.validUrlCacheSize(), 20000, '继续插入后 size 仍 ≤ 上限')
+})
+
+check('v3.530 validUrl 缓存：命中把键移到最近使用位（LRU，不是 FIFO）', () => {
+  const u = createUtils({ safeRe })
+  let safeCalls = 0
+  const origSafeUrl = u.safeUrl
+  u.safeUrl = function (v) { safeCalls++; return origSafeUrl.call(this, v) }
+  const url = (i) => 'https://example.com/lru/' + i
+  for (let i = 0; i < 20000; i++) u.validUrl(url(i))
+  assert.strictEqual(u.validUrlCacheSize(), 20000)
+  const callsFull = safeCalls
+  // 触碰最旧的一条：必须命中（不再走 safeUrl），并把它挪到队尾
+  assert.strictEqual(u.validUrl(url(0)), 'https://example.com/lru/0')
+  assert.strictEqual(safeCalls, callsFull, '触碰最旧项必须命中缓存（关掉缓存读时此断言必红）')
+  assert.strictEqual(u.validUrlCacheSize(), 20000, '命中不新增条目')
+  u.validUrl('https://example.com/lru/fresh')
+  assert.strictEqual(safeCalls, callsFull + 1, '新 URL 必须走一次 safeUrl')
+  assert.strictEqual(u.validUrlCacheSize(), 20000)
+  assert.strictEqual(u.validUrlCacheHas(url(0)), true, '刚命中过的 url(0) 不能被淘汰（FIFO 会淘汰它）')
+  assert.strictEqual(u.validUrlCacheHas(url(1)), false, '被淘汰的应是最旧的未命中项 url(1)')
+})
+
+check('v3.530 validUrl 缓存：非字符串一律空串且不进缓存（不挤占容量）', () => {
+  const u = createUtils({ safeRe })
+  // Object('…') 是装箱的 String 对象（typeof 'object'），与 new String 同形；用 Object() 避开 standard 的
+  // no-new-wrappers，同时锁住「装箱字符串也按非字符串处理」这条既有语义。
+  const boxed = Object('https://example.com')
+  const samples = [123, 0, Number.NaN, true, null, undefined, {}, [], ['https://example.com'], boxed, Symbol('url')]
+  for (const v of samples) {
+    assert.strictEqual(u.validUrl(v), '', `非字符串必须返回空串：${String(typeof v)}`)
+  }
+  assert.strictEqual(u.validUrlCacheSize(), 0, '非字符串不得进缓存')
+  assert.strictEqual(u.validUrl('https://example.com'), 'https://example.com')
+  assert.strictEqual(u.validUrlCacheSize(), 1, '字符串入参才进缓存')
+})
+
+check('v3.530 validUrl 缓存：归一化样本缓存前后逐字相同（跟踪参数/主机大小写/尾斜杠/query）', () => {
+  const cases = [
+    ['https://Example.COM/Path/?utm_source=x&utm_medium=y&id=7#frag', 'https://example.com/Path?id=7'],
+    ['https://example.com/path/', 'https://example.com/path'],
+    ['https://example.com/path?fbclid=abc', 'https://example.com/path'],
+    ['https://example.com/a///', 'https://example.com/a'],
+    ['HTTPS://EXAMPLE.COM/Path/', 'https://example.com/Path'],
+    ['https://User:Pass@EXAMPLE.com/P?gclid=1&keep=2', 'https://User:Pass@example.com/P?keep=2'],
+    ['https://example.com/?utm_source=a', 'https://example.com'],
+    [' https://example.com/x ', 'https://example.com/x'],
+    ['https://example.com/p?q=%E4%B8%AD&utm_campaign=z', 'https://example.com/p?q=%E4%B8%AD']
+  ]
+  const cold = createUtils({ safeRe })
+  const warm = createUtils({ safeRe })
+  for (const [input, want] of cases) {
+    assert.strictEqual(warm.validUrl(input), want, `首次（未命中）${input}`)
+    assert.strictEqual(warm.validUrl(input), want, `二次（命中）${input}`)
+    assert.strictEqual(cold.validUrl(input), want, `冷实例 ${input}`)
+  }
+})
+
 // ===== normUrl：URL 归一化 =====
 check('normUrl: https URL 归一化', () => {
   const r = Utils.normUrl('https://Example.com/path/')
