@@ -811,6 +811,20 @@ function pushBodyOf (body) {
 // 统一走它（O_NOFOLLOW + fstat 复检 + 读后复检），规避 CodeQL js/file-system-race 对
 // 「写路径 → 按路径 open」的 check-then-use 判红。
 const { readSafeTextResult } = require('./xbk_storage')
+// 读文本 + 取 stat 必须走同一个 fd：先 `existsSync`/`statSync(path)` 再 `readFileSync(path)`
+// 是 check-then-use（CodeQL js/file-system-race），两次按路径取值还可能落到两个 inode 上。
+// open → read → fstat 全程钉在同一份 inode，mode/ino 与内容出自同一次快照；
+// 路径不存在时 open 直接抛 ENOENT——存在性由读取本身证明，不再先探路。
+function readTextAndStat (file) {
+  const fd = fs.openSync(file, 'r')
+  try {
+    const text = fs.readFileSync(fd, 'utf8')
+    const stat = fs.fstatSync(fd)
+    return { text, stat }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
 
 // 变异 dry-run 取证（仅变异子进程 + 仅 CI 生效）：tap 档失败时只回传 `test_console.js # exit code 1`，
 // stryker.log 不含测试 stdout；把 stdout/stderr 与未捕获异常落盘，mutation.yml 的
@@ -2303,8 +2317,9 @@ async function filterRuleApiTests () {
         schema: 99, baseRevision: 0, filter: { pingbibiaoti: 'x' }
       })
       assert.strictEqual(badSchema.status, 400, '不支持的草稿 schema 必须拒绝')
-      assert.strictEqual(fs.statSync(paths.draft).mode & 0o777, 0o600, '草稿文件必须 0600')
-      const disk = JSON.parse(readSafeTextResult(paths.draft, 64 * 1024).text)
+      const draftSnap = readTextAndStat(paths.draft)
+      assert.strictEqual(draftSnap.stat.mode & 0o777, 0o600, '草稿文件必须 0600')
+      const disk = JSON.parse(draftSnap.text)
       assert.strictEqual(disk.baseRevision, 0)
       assert.strictEqual(disk.filter.pingbibiaoti, '半成品(', '草稿允许存未编译的半个正则')
 
@@ -2315,13 +2330,13 @@ async function filterRuleApiTests () {
 
       const saved = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '正式' } })
       assert.strictEqual(saved.status, 200)
-      assert.strictEqual(fs.existsSync(paths.draft), false, '正式保存成功必须删服务器草稿')
+      assert.throws(() => fs.readFileSync(paths.draft, 'utf8'), err => err.code === 'ENOENT', '正式保存成功必须删服务器草稿')
       assert.strictEqual(JSON.parse((await request(port, 'GET', '/api/config/filter/draft', { token: TOKEN })).text).draft, null)
 
       const stale = await postFilterJson(port, '/api/config/filter/draft', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '旧' } })
       assert.strictEqual(stale.status, 409)
       assert.strictEqual(JSON.parse(stale.text).code, 'revision_mismatch')
-      assert.strictEqual(fs.existsSync(paths.draft), false, '过期草稿不得落盘')
+      assert.throws(() => fs.readFileSync(paths.draft, 'utf8'), err => err.code === 'ENOENT', '过期草稿不得落盘')
 
       const anonPost = await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: {} }, { token: null })
       assert.strictEqual(anonPost.status, 401)
@@ -2334,14 +2349,14 @@ async function filterRuleApiTests () {
       assert.strictEqual((await request(port, 'DELETE', '/api/config/filter/draft')).status, 401, '删草稿也只认 Bearer')
 
       assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: '草稿' } })).status, 200)
-      assert.strictEqual(fs.existsSync(paths.draft), true)
+      assert.ok(readTextAndStat(paths.draft).text.length > 0, '草稿写成功必须落盘（存在性由读取证明）')
       const del = await request(port, 'DELETE', '/api/config/filter/draft', { token: TOKEN })
       assert.strictEqual(del.status, 200)
-      assert.strictEqual(fs.existsSync(paths.draft), false)
+      assert.throws(() => fs.readFileSync(paths.draft, 'utf8'), err => err.code === 'ENOENT', '删除草稿后文件必须消失')
 
       assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { nope: 'x' } })).status, 400)
       assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: 1 } })).status, 400)
-      assert.strictEqual(fs.existsSync(paths.draft), false, '非法草稿不得落盘')
+      assert.throws(() => fs.readFileSync(paths.draft, 'utf8'), err => err.code === 'ENOENT', '非法草稿不得落盘')
       // F3：草稿闸按 perField[field].chars 判（旧实现写死 16000，抬上限后就与保存闸分叉）：
       // 等于上限必须 200、+1 必须 400 too_long，且错误体带 limit/actual 供前端显示。
       const draftLimit = FilterStore.FILTER_LIMITS.perField.pingbifenlei.chars
@@ -2357,7 +2372,7 @@ async function filterRuleApiTests () {
       assert.strictEqual(draftErr.limit, draftLimit, '错误体必须带 limit（前端据此显示已用/上限）')
       assert.strictEqual(draftErr.actual, draftLimit + 1)
       // 被拒的写入不得覆盖已存在的合法草稿（上一条 200 已经落盘），更不得把草稿删掉
-      const keptDraft = JSON.parse(fs.readFileSync(paths.draft, 'utf8'))
+      const keptDraft = JSON.parse(readTextAndStat(paths.draft).text)
       assert.strictEqual(keptDraft.filter.pingbifenlei.length, draftLimit, '超长草稿不得覆盖上一份合法草稿')
     } finally { server.close() }
   })

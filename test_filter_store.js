@@ -2936,8 +2936,9 @@ test('F3 容量文件：0600、含 totalBytes/perField/source/degraded/at；跨�
     first = resolveFilterLimits({ cacheDir: dir, env: {}, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 1700000000000 })
   } finally { console.warn = origWarn }
   assert.strictEqual(first.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES)
-  assert.strictEqual(fs.statSync(capacityPath).mode & 0o777, 0o600, '容量文件必须是 0600（writeAtomic）')
-  const text = fs.readFileSync(capacityPath, 'utf8')
+  const firstSnap = readTextAndStat(capacityPath)
+  assert.strictEqual(firstSnap.stat.mode & 0o777, 0o600, '容量文件必须是 0600（writeAtomic）')
+  const text = firstSnap.text
   const payload = JSON.parse(text)
   for (const key of ['totalBytes', 'perField', 'source', 'degraded', 'at']) {
     assert.ok(Object.prototype.hasOwnProperty.call(payload, key), `容量文件必须含 ${key}：${text}`)
@@ -2951,17 +2952,17 @@ test('F3 容量文件：0600、含 totalBytes/perField/source/degraded/at；跨�
   assert.deepStrictEqual(onDisk.perField, first.perField, '文件里的 perField 必须与本进程钉住的一致')
 
   // ① 预算没变 ⇒ 不重写（保留原 at / inode）：worker 每 5 秒 spawn 一次，不能每轮都写盘
-  const before = fs.statSync(capacityPath)
+  const before = readTextAndStat(capacityPath)
   const second = resolveFilterLimits({ cacheDir: dir, env: {}, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 1800000000000 })
-  const after = fs.statSync(capacityPath)
+  const after = readTextAndStat(capacityPath)
   assert.strictEqual(second.totalBytes, first.totalBytes)
-  assert.strictEqual(after.ino, before.ino, '预算没变不得重写容量文件')
-  assert.strictEqual(JSON.parse(fs.readFileSync(capacityPath, 'utf8')).at, 1700000000000, '预算没变必须保留原 at（启动钉住的时间点）')
+  assert.strictEqual(after.stat.ino, before.stat.ino, '预算没变不得重写容量文件')
+  assert.strictEqual(JSON.parse(after.text).at, 1700000000000, '预算没变必须保留原 at（启动钉住的时间点）')
 
   // ② 另一个进程算出不同预算（探测差异）⇒ 以**文件**为准并告警（console 与 worker 必须同一份）
   const otherDir = makeDir()
   const otherPath = path.join(otherDir, FILTER_CAPACITY_FILE)
-  const sharedPayload = JSON.parse(fs.readFileSync(capacityPath, 'utf8'))
+  const sharedPayload = JSON.parse(readTextAndStat(capacityPath).text)
   sharedPayload.totalBytes = FILTER_MIN_TOTAL_BYTES
   sharedPayload.perField = Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, { chars: 20000 }]))
   sharedPayload.mainChars = 20000
@@ -2998,7 +2999,8 @@ test('F3 容量文件：0600、含 totalBytes/perField/source/degraded/at；跨�
     console.warn = () => {}
     resolveFilterLimits({ env: { [FILTER_CACHE_DIR_ENV]: envDir }, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 2100000000000 })
   } finally { console.warn = savedWarn }
-  assert.strictEqual(fs.existsSync(path.join(envDir, FILTER_CAPACITY_FILE)), true,
+  const envCap = readTextAndStat(path.join(envDir, FILTER_CAPACITY_FILE))
+  assert.ok(envCap.stat.isFile() && envCap.text.length > 0,
     'XBK_CACHE_DIR 必须决定容量文件位置（否则两边各写一份、预算悄悄分叉）')
 })
 
