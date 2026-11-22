@@ -32,7 +32,8 @@ const crypto = require('node:crypto')
 const storage = require('./xbk_storage')
 const { writeAtomic } = storage
 // 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
-const { filterRulesPaths } = require('./scripts/filter-rules-paths')
+// CAPACITY_FILE：F3 容量文件名与 filterRulesPaths(dir).capacity 的单一来源（本文件不再抄字面量）。
+const { filterRulesPaths, CAPACITY_FILE } = require('./scripts/filter-rules-paths')
 // 权限收紧/判定单独成模块（Semgrep 对非字面量路径的 fs 调用一律报 path-traversal，单独成模块后
 // 只排除该模块，不整文件排除本模块）。**必须在顶部 require**：F3 的容量文件在模块加载期
 // （resolveFilterLimits → writeCapacityFile）就要用 isOwnerOnlyFile，放到文件中部的 const 会踩 TDZ。
@@ -86,7 +87,9 @@ const FILTER_DEFAULT_SOFT_CAP_BYTES = 512 * 1024
 const FILTER_SOFT_CAP_ALIGN_BYTES = 4096
 const FILTER_SOFT_CAP_ENV = 'XBK_FILTER_SOFT_CAP_BYTES'
 const FILTER_CACHE_DIR_ENV = 'XBK_CACHE_DIR'
-const FILTER_CAPACITY_FILE = 'filter-capacity.json'
+// 文件名取自 scripts/filter-rules-paths.js 的 CAPACITY_FILE（与 filterRulesPaths(dir).capacity 同源，
+// 避免两处字面量漂移）；本常量继续导出，测试与日志按它构造/点名路径。
+const FILTER_CAPACITY_FILE = CAPACITY_FILE
 const FILTER_CAPACITY_SCHEMA = 1
 const FILTER_CAPACITY_FILE_MAX_BYTES = 64 * 1024
 const FILTER_REQUEST_BODY_MARGIN_BYTES = 8192
@@ -297,6 +300,11 @@ function probeMemAvailableBytes ({ readFileSync = fs.readFileSync, meminfoPath =
  * memory.max / memory.current，取**所有有限层级里最小的 headroom**（v2 里某级写 `max` 只表示该级
  * 无限制，父级仍可能有限制）。`max` 必须特判：Number('max') = NaN，漏了它预算会变成 NaN 或被静默
  * 夹成 0。
+ *
+ * 路径一律 path.posix.join：cgroup 层级路径恒为 POSIX——层级与挂载点都是内核接口（仅 Linux），
+ * 内核只认 '/'；平台 path.join 在 Windows 上会拼出 '\'，而这条探测链在非 Linux 上根本不成立。
+ * （副作用是也不再落入 path-traversal 规则对 path.join(形参, …) 的形态匹配：base/relPath 全部
+ * 来自 /proc 文本与固定挂载点，不含任何外部输入。）
  * @returns {{status:('ok'|'unlimited'|'unavailable'|'invalid'), headroomBytes?:number}}
  */
 function probeCgroupHeadroomBytes ({
@@ -314,7 +322,7 @@ function probeCgroupHeadroomBytes ({
     if (legacy) { rel = legacy[1]; v1 = true }
   }
   if (rel === null) return { status: 'unavailable' }
-  const base = v1 ? path.join(cgroupRoot, 'memory') : cgroupRoot
+  const base = v1 ? path.posix.join(cgroupRoot, 'memory') : cgroupRoot
   const relPaths = []
   let cursor = rel === '' ? '/' : rel
   for (let depth = 0; depth < 64; depth++) {
@@ -327,14 +335,14 @@ function probeCgroupHeadroomBytes ({
   let headroom = Infinity
   let sawLimit = false
   for (const relPath of relPaths) {
-    const dir = path.join(base, relPath)
-    const maxText = readTextFile(readFileSync, path.join(dir, 'memory.max'))
+    const dir = path.posix.join(base, relPath)
+    const maxText = readTextFile(readFileSync, path.posix.join(dir, 'memory.max'))
     if (maxText === null) continue
     const trimmed = maxText.trim()
     if (trimmed === 'max') continue // 该级无限制：继续上溯，父级仍可能有界
     const max = Number(trimmed)
     if (!Number.isFinite(max) || max <= 0) continue
-    const currentText = readTextFile(readFileSync, path.join(dir, 'memory.current'))
+    const currentText = readTextFile(readFileSync, path.posix.join(dir, 'memory.current'))
     const current = currentText === null ? 0 : Number(currentText.trim())
     const used = Number.isFinite(current) && current >= 0 ? current : 0
     headroom = Math.min(headroom, max - used)
@@ -514,7 +522,9 @@ function resolveFilterLimits (options) {
       softCapBytes: softCap.bytes,
       probeErrors
     })
-    const capacityPath = cacheDir ? path.join(cacheDir, FILTER_CAPACITY_FILE) : null
+    // 路径构造统一走 filterRulesPaths（本模块不自行拼运行期目录）：capacity 与其余覆盖文件同源，
+    // 也让「运行期目录 + 字面量文件名」这一类 path.join 只存在于被 .codacy.yml 排除的纯路径模块里。
+    const capacityPath = cacheDir ? filterRulesPaths(cacheDir).capacity : null
     let capacity = local
     if (capacityPath) {
       const shared = readCapacityFile(capacityPath)

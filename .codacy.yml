@@ -393,7 +393,8 @@ exclude_paths:
   # ---- v3.310 过滤规则覆盖文件：静态路径构造的误报登记 ----
   # scripts/filter-rules-paths.js 只做 path.join(运行期目录, 本文件常量名)：
   # 目录来自调用方（控制台 stateDir / XBK_CACHE_DIR 解析结果 / 测试临时目录），
-  # 不来自请求体或 URL；4 个文件名是字面量常量，备份名里的 rev 先经
+  # 不来自请求体或 URL；7 个文件名（含 F3 的 filter-capacity.json）都是字面量常量，
+  # 备份名里的 rev 先经
   # Number.isSafeInteger + >=0 归一（非法一律归 0），无路径穿越片段。
   # 把纯路径构造单独成模块正是不想整文件排除 xbk_filter_store.js——校验、
   # 合并、降级、审计等真实逻辑的告警必须继续生效。
