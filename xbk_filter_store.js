@@ -137,8 +137,15 @@ const FILTER_MAX_LIMIT_VALUE = FILTER_MAX_TOTAL_BYTES + FILTER_REQUEST_BODY_MARG
 const FILTER_MAX_RULE_LINES = 2000
 // 全份预算 2000 行，单字段最多吃一半——一个字段把整份预算吃光时，其余字段的任何规则都会撞总闸。
 const FILTER_MAX_RULE_LINES_PER_FIELD = 1000
-// 单字段未转义 `|` 的个数上限：交替分支数与单条正则的编译/匹配代价线性相关，超限同样在保存时拒绝。
+// 单字段未转义 `|` 的个数上限（按字段大小分档）：
+// - 主字段（160,000 字符）5,000：简单模式下整字段合成**一条**正则，分支数 = 行数 + | 数（线上 3,010 行
+//   + 银行城市规则单行 713 个 | ⇒ 字段合计 1,057 个 |）。1,000 的闸把一份**已经在跑**的合法配置锁在保存
+//   之外——控制台任何一次保存都被 400 too_many_lines 拒回。实测分支成本 3k ≈ 1.8 ms/条、10k ≈ 4.6 ms/条，
+//   5,000 在每轮 20 条下约 60 ms，仍远低于 5 秒轮询。
+// - 其余字段 1,000：这些字段本身 ≤2,048 字符，1,000 个分支已接近其能表达的极限，维持原档。
+// 真正防 OOM 的是上面的 ### 行数闸（每行 2 个 RE2 对象），与 | 个数无关，故不随本条一起放宽。
 const FILTER_MAX_ALTERNATIONS_PER_FIELD = 1000
+const FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD = 5000
 // ── F2-2：/preview 的扫描预算（默认 200 ms 或 200 条 _f 记录，先到者）──────────
 // 5000 条 × 2.01 ms ≈ 11.1 s 的同步循环会把控制台事件循环占死（客户端 8 s 就超时）；
 // 抬上限后是 52–107 s。预算只约束「扫多少」，不改变单条判定结果。
@@ -154,6 +161,12 @@ const FILTER_MAIN_FIELD_SET = new Set(FILTER_MAIN_FIELDS)
 // ≤ totalBytes − 32（贴边），reserve 仍按 spec 的 42,432 B（pingbitime 的预留只算 1000，差额由
 // reserve 的 4,680 B 余量吸收，方向保守：reserve 偏大 ⇒ mainChars 偏小）。
 const FILTER_PLUS_LIMIT_FIELD_SET = new Set([...FILTER_PLUS_FIELD_SET, 'pingbitime'])
+
+// 交替闸的每字段上限：主字段 5,000（字段本身 160,000 字符），其余 1,000（≤2,048 字符，1,000 个分支
+// 已接近其表达极限，pingbitime 的 `分类###天数` 也靠这一档让闸门可达）。取值理由见常量处注释。
+function maxAlternationsOfField (field) {
+  return FILTER_MAIN_FIELD_SET.has(field) ? FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD : FILTER_MAX_ALTERNATIONS_PER_FIELD
+}
 
 function isPositiveSafeInt (value) {
   return Number.isSafeInteger(value) && value > 0
@@ -1250,8 +1263,9 @@ function validateFilterRules (input, deps, options) {
       }
     }
     for (const [field, count] of alternationCount) {
-      if (count > FILTER_LIMITS.maxAlternationsPerField) {
-        addError(errors, field, 'too_many_lines', `字段「${field}」含 ${count} 个未转义 | 交替，超过单字段上限 ${FILTER_LIMITS.maxAlternationsPerField} 个（交替分支越多，编译与匹配代价越大），请改用更具体的规则后再保存`)
+      const cap = maxAlternationsOfField(field)
+      if (count > cap) {
+        addError(errors, field, 'too_many_lines', `字段「${field}」含 ${count} 个未转义 | 交替，超过单字段上限 ${cap} 个（交替分支越多，编译与匹配代价越大），请改用更具体的规则后再保存`)
       }
     }
   }
@@ -1972,6 +1986,10 @@ module.exports = {
   // F2-2 / F2-3：/preview 的扫描预算与条目数上限（console 的 /preview 与 GET limits 都从这里取）
   FILTER_PREVIEW_BUDGET_MS,
   FILTER_PREVIEW_BUDGET_RECORDS,
+  // 交替闸的两档上限：主字段 5,000 / 其余 1,000（测试按常量断言，不在断言里写死数字）
+  FILTER_MAX_ALTERNATIONS_PER_FIELD,
+  FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD,
+  maxAlternationsOfField,
   scanPreviewRecords,
   countUnescapedAlternations,
   filterLimitsReport,
