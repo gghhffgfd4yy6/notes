@@ -17,7 +17,7 @@
 - **缓存**：统一 `writeAtomic`（唯一临时文件 + `wx` 独占 + 0600 + rename，失败清理临时文件并回滚内存）；**写成功后才更新内存快照**；规则变更使过滤标记（`_f`）失效并重评，`filter.hash` 读失败或清理失败不得推进；被裁剪的身份在磁盘写成功后落墓碑；目录缺失可递归重建，初始化必须独占创建，不得以空数组覆盖并发写入。墓碑淘汰必须保证推进：无法通过淘汰达到字节上限时返回空、放弃本次持久化并告警，不得原地死循环。
 - **状态写 / 预热 / 日志字段 / 正则缓存（v3.531）**：
   - (a) `run.log` 摘要行：六项计数与 `elapsed` 之后可有 ` pp=<ms>`（本轮 preprocess 毫秒、保留 1 位小数，仅在 `ctx.timings.preprocessMs` 为有限非负数时写）。它固定排在所有既有尾部片段之前，读侧（`parseRunSummaryLine` / `parseRunSummaryExtras`）**不解析**它，旧行与旧解析器照常工作——不得把它挪到行尾（会挤压末 64 字符窗口、丢 `cachesaved`/`similar*` 系列）。
-  - (b) `channel-health.state`：内容与磁盘逐字节一致时**跳过原子写**（inode/mtime 可能连续多轮不变）。「按 mtime 判活」**不是**契约，判活看 run 级单飞锁与进程存活；文件 missing 或读失败时仍必写（不得把「读不到」当「内容相同」）。
+  - (b) `channel-health.state`：内容与磁盘逐字节一致时**跳过原子写**（inode/mtime 可能连续多轮不变）。「按 mtime 判活」**不是**契约，判活看 run 级单飞锁与进程存活；文件 missing 时仍必写（不得把「读不到」当「内容相同」）；其它读失败（`ioError`/`unsafe`/`tooLarge`/`replaced`）跳过本轮健康更新、原文件逐字节保留（fail-closed），不得以空状态覆盖。
   - (c) `report.state`：每轮仍走 tmp+rename 原子提交，但跳过 fsync（`writeAtomic(..., { durable: false })`）——进程崩溃不丢、整机掉电可能丢当天最后一次累计。`durable:false` 只允许用于这类可丢累计状态；缓存、规则文件与 `channel-health.state` 必须保持默认持久写。
   - (d) TLS 预热固定 **2 条**连接（`PREWARM_TLS_CONNECTIONS`，与并发窗口无关，仍受 `parallelLimit` 下限约束）；首次真推送最多多 1 个握手 RTT，96.6% 的空转轮不再预建 10 条（120 → 24 条/分钟）。
   - (e) 用户正则编译缓存按规则 **revision** 失效：同一 revision 内复用（同一源码返回同一实例、不退化），revision / degraded / source 变化时整表清空、只留当前约 7 条；不得改成每轮清（等于关掉缓存），也不得持久化到磁盘。

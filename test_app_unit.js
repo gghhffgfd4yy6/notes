@@ -6898,9 +6898,9 @@ checkAsync('P1-1 阶段管线成功一轮：summary 字段顺序与 run.log 摘�
     const summaryLines = lines.filter(l => RUN_SUMMARY_LINE_RE.test(l))
     assert.strictEqual(summaryLines.length, 1, `本轮必须恰好一行摘要：${JSON.stringify(lines)}`)
     // 关键行格式：戳 + 六项计数（固定顺序）+ elapsed + 条件尾部。v3.531（O4-4）起 elapsed 之后
-    // 可有 ` pp=<ms>`（preprocess 毫秒，真跑恒有 timings），其余片段顺序不变（本场景只有 cachesaved）。
+    // 必有 ` pp=<ms>`（preprocess 毫秒，真跑恒有 timings，缺 pp 即应红），其余片段顺序不变（本场景只有 cachesaved）。
     assert.match(summaryLines[0],
-      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=\d+\.\ds(?: pp=(?:0|[1-9]\d*)(?:\.\d)?)? cachesaved=1$/,
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} total=2 dedup=0 filtered=0 truncated=0 pushed=2 failed=0 elapsed=\d+\.\ds pp=(?:0|[1-9]\d*)(?:\.\d)? cachesaved=1$/,
       `run.log 摘要行格式必须不变（pp= 只加在 elapsed 之后）：${summaryLines[0]}`)
     const parsed = parseRunSummaryLine(summaryLines[0])
     assert.ok(parsed, `摘要行必须能被读侧解析：${summaryLines[0]}`)

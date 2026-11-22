@@ -963,8 +963,10 @@ function createApp ({
 
     // v3.531（O4-1）：内容没变就不落盘——channel-health.state 每轮无条件原子写 104 B（含两次
     // fsync），而 93% 的轮次内容与磁盘上那份逐字节相同（没有失败/恢复/告警时间变化）。
-    // previousText 不是字符串（文件 missing / 读失败 / 超限）时退回 _writeState：不拿「读不到」
-    // 当「内容相同」，否则读失败会静默跳过本该写的更新。
+    // previousText 不是字符串（文件 missing，或调用方未给文本）时退回无条件 _writeState：不拿
+    // 「读不到」当「内容相同」。生产调用点 _updateChannelHealth 只放行 missing，其它读失败
+    // （ioError/unsafe/tooLarge/replaced）已在读入口就地跳过本轮（fail-closed，原文件逐字节保留），
+    // 到不了这里。
     // 语义：内容没变 ⇒ inode/mtime 都不变（**不得**据此判活，见 SYSTEM_CONTRACT）；内容变
     // （计数器 +1、告警时间、恢复认领）⇒ 必写。alerts 非空必然伴随 lastAlertAt/lastRecoveredAt
     // 变化，故不存在「有告警却跳过写」的路径。
