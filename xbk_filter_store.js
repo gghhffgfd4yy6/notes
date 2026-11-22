@@ -543,7 +543,10 @@ function validateFilterRules (input, deps, options) {
     const value = filter[field]
     if (value === '') continue
     // F2-3：交替数按**字段**统计（多行字段的每一行各是一条正则，分支数逐行累加）。
-    // pingbitime 的值是天数，不参与正则统计。
+    // pingbitime 不含 ### 时值是纯天数（运行期 Number 解析，不编译正则）→ 整字段豁免；
+    // 含 ### 时 `分类` 段**会**被 compileRules 编译成分类正则，所以分类段的交替数在下面的
+    // 行解析里逐行累加（见 `@pingbitime-cat-alts`）。整字段豁免会让 `1001 个 |###7` 这种
+    // 可编译的形状从闸门侧面溜过去（与「单字段未转义 | >1000 返回 400」的契约相反）。
     if (field !== 'pingbitime') {
       const alternations = countUnescapedAlternations(value)
       if (alternations > 0) alternationCount.set(field, alternations)
@@ -568,6 +571,13 @@ function validateFilterRules (input, deps, options) {
         }
         const cat = safeString(parts[0]).trim()
         const val = safeString(parts[1]).trim()
+        if (field === 'pingbitime') {
+          // @pingbitime-cat-alts：`分类###天数` 的分类段会被 compileRules 编译成正则，天数段只做
+          // Number 解析 ⇒ 只统计分类段的交替数（纯 `天数` 仍整字段豁免，见上方整字段统计处）。
+          // 按字段累加，与其它字段「整字段值」的口径一致（多行各是一条分类正则）。
+          const catAlternations = countUnescapedAlternations(cat)
+          if (catAlternations > 0) alternationCount.set(field, (alternationCount.get(field) || 0) + catAlternations)
+        }
         if (!val) {
           addError(errors, field, 'empty_value', `行「${trimmed}」的正则值为空`)
           continue

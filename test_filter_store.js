@@ -2420,6 +2420,48 @@ test('F2-3 未转义 | 闸：1000 个通过、1001 个拒绝；转义 \\| 不计
   assert.strictEqual(countUnescapedAlternations(`${BS}|`.repeat(1000)), 0)
 })
 
+test('F2-3 pingbitime 的 `分类###天数` 只把分类段的交替数纳入闸（纯天数仍全字段豁免）', () => {
+  // `分类###天数` 的分类段会被 RuleEngine.compileRules 编译成分类正则、天数段只做 Number 解析，
+  // 所以整字段豁免会让 `1001 个 |###7` 从闸门侧面绕过（与「单字段未转义 | >1000 返回 400」相反）。
+  const altsOf = (n, prefix) => Array.from({ length: n + 1 }, (_, i) => `${prefix}${i}`).join('|')
+  const cap = FILTER_LIMITS.fieldMaxLen.pingbitime
+  const overValue = `${altsOf(1001, 'c')}###7`
+  assert.ok(overValue.length < cap, `夹具必须在单字段字符上限内（${overValue.length} < ${cap}）`)
+  const over = validateFilterRules({ filter: { pingbitime: overValue } }, deps)
+  assert.strictEqual(over.ok, false, '分类段 1001 个未转义 | 必须拒绝')
+  const err = over.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(err, `交替超限必须给 too_many_lines：${JSON.stringify(over.errors)}`)
+  assert.strictEqual(err.field, 'pingbitime')
+  assert.match(err.message, /1001/)
+  assert.match(err.message, /1000/)
+
+  const exactValue = `${altsOf(1000, 'c')}###7`
+  assert.ok(exactValue.length < cap, `夹具必须在单字段字符上限内（${exactValue.length} < ${cap}）`)
+  const exact = validateFilterRules({ filter: { pingbitime: exactValue } }, deps)
+  assert.strictEqual(exact.ok, true, `分类段恰好 1000 个交替必须通过：${JSON.stringify(exact.errors)}`)
+
+  // 纯天数（无 ###）不是正则：继续整字段豁免
+  assert.strictEqual(validateFilterRules({ filter: { pingbitime: '7' } }, deps).ok, true, '纯天数仍必须通过')
+  // 合法 `分类###天数`（分类段无交替）不受影响
+  assert.strictEqual(validateFilterRules({ filter: { pingbitime: '牙膏###7' } }, deps).ok, true, '合法分类规则仍必须通过')
+  // 分类段里的 `\|` 是字面竖线，不计入（与其它字段的转义奇偶口径同源）
+  const BS = String.fromCharCode(92)
+  const escaped = `${`${BS}|`.repeat(1001)}###7`
+  assert.ok(escaped.length < cap, `夹具必须在单字段字符上限内（${escaped.length} < ${cap}）`)
+  assert.strictEqual(validateFilterRules({ filter: { pingbitime: escaped } }, deps).ok, true,
+    '分类段 1001 个转义 \\| 是字面竖线，不得计入交替')
+
+  // 按字段累加：两行 `分类###天数` 各 600 个（单行未超限）合计 1200 → 拒绝
+  const multiValue = `${altsOf(600, 'a')}###7\n${altsOf(600, 'b')}###7`
+  assert.ok(multiValue.length < cap, `夹具必须在单字段字符上限内（${multiValue.length} < ${cap}）`)
+  const multi = validateFilterRules({ filter: { pingbitime: multiValue } }, deps)
+  assert.strictEqual(multi.ok, false, '跨行累加 1200 个交替必须拒绝')
+  const multiErr = multi.errors.find((item) => item.code === 'too_many_lines')
+  assert.ok(multiErr, `跨行累加超限必须给 too_many_lines：${JSON.stringify(multi.errors)}`)
+  assert.strictEqual(multiErr.field, 'pingbitime')
+  assert.match(multiErr.message, /1200/)
+})
+
 test('F2-2 preview 预算：条数 200 先到、小样本完整、时间预算先到者停（纯函数）', () => {
   const records = Array.from({ length: 500 }, (_, i) => ({ id: String(i), title: `t${i}` }))
   const pass = () => ({ passed: true, reason: 'ok' })
