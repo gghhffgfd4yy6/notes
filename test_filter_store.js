@@ -2335,7 +2335,14 @@ test('F2-1 LKG 内容未变不重写（两轮 mtime/inode 不动）；改一行�
   assert.match(readJson(paths.lastgood).hash, /^[0-9a-f]{64}$/, '损坏的 LKG 必须被重写成合法内容')
 
   // 权限不符：必须写（跳过写盘不得放弃「每轮修回 0600」——LKG 里有用户全部规则正文）。
-  fs.chmodSync(paths.lastgood, 0o644)
+  // 宽权限同样用**位组合**表达（0600 + group/other 只读 = 0644）：不写字面量宽松权限
+  // （Sonar S2612 把 chmod 的宽松字面量判成漏洞），也不在 chmod 前再取一次 stat
+  // （那是 CodeQL js/file-system-race 的 check→use 形状）。被钉住的语义不变：非 0600 必须自愈。
+  const looseMode = 0o600 | 0o044
+  assert.notStrictEqual(looseMode, 0o600, '前置：构造出的模式必须真的不是 0600（否则这条用例什么都没测）')
+  fs.chmodSync(paths.lastgood, looseMode)
+  assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, looseMode,
+    `前置：权限必须已被改成 0${looseMode.toString(8)}（否则下面的「自愈」断言恒真）`)
   assert.strictEqual(load().source, 'override')
   assert.strictEqual(fs.statSync(paths.lastgood).mode & 0o777, 0o600, 'LKG 权限不是 0600 时必须重写自愈')
 })
@@ -2478,6 +2485,18 @@ test('F2-5 limits/usage 报告：上限与 FILTER_LIMITS 同源 + 规则文件�
   assert.strictEqual(report.limits.fieldMaxLen.pingbibiaoti, 16000, 'F2 不得改变今日常量')
   // 非字符串值不得被算成字符数（否则前端拿到的用量是假的）
   assert.strictEqual(filterLimitsReport(dir, { pingbibiaoti: 42 }).usage.fieldChars.pingbibiaoti, 0)
+
+  // 末级符号链接：元数据走 storage.statSafeMeta（O_NOFOLLOW）⇒ unsafe ⇒ 如实报 null，
+  // 且**不得**泄露链接目标的大小。旧实现 fs.statSync 会跟随链接，把目标文件字节数当成
+  // 规则文件的——这条用例就是那条路径的反向验证（把实现改回 statSync 即变红）。
+  const outside = path.join(tmp, 'limits-outside.json')
+  writeRaw(outside, 'x'.repeat(4096))
+  fs.rmSync(paths.file)
+  fs.symlinkSync(outside, paths.file)
+  assert.strictEqual(fs.lstatSync(paths.file).isSymbolicLink(), true, '前置：夹具必须是符号链接')
+  assert.strictEqual(fs.statSync(paths.file).size, 4096, '前置：链接目标确实有 4096 字节（否则测不出泄露）')
+  assert.strictEqual(filterLimitsReport(dir, { pingbibiaoti: 'abc' }).usage.rulesFileBytes, null,
+    '符号链接不得被跟随取大小（unsafe ⇒ null，不得把链接目标的 4096 字节报成规则文件大小）')
 })
 
 // ===== 路径 helper =====

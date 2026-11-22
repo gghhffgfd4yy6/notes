@@ -237,18 +237,18 @@ function scanPreviewRecords ({
  * 前端要显示余量与文案，但此前的响应里没有任何上限信息，前端只能写死 256 KiB（pages.js:4846）。
  * 这里把 FILTER_LIMITS（全仓唯一取值入口）与当前用量一起下发；前端本项**只读不用**（F3 才接）。
  * 规则文件字节数：缺失按 0，其它读不到的情况如实报 null——不把「不知道」说成 0。
+ * 元数据走 storage.statSafeMeta（xbk_storage.js 的唯一元数据原语，O_NOFOLLOW + 普通文件断言），
+ * 不走 fs.statSync：后者会跟随末级符号链接（大小取自链接目标，等于泄露目标的信息），
+ * 对目录/FIFO 也会报出一个「字节数」。statSafeMeta 只有 status==='ok' 才有 size，
+ * unsafe（符号链接/非普通文件）/ioError 一律 null ⇒ 口径不变、语义只强不弱（不再跟随链接）。
  * @param {string} cacheDir
  * @param {Object} [filter] 当前生效规则（11 字段合并结果），用于各字段字符数
  * @returns {{limits:Object, usage:{rulesFileBytes:(number|null), fieldChars:Object}}}
  */
 function filterLimitsReport (cacheDir, filter) {
   const paths = filterRulesPaths(cacheDir)
-  let rulesFileBytes = null
-  try {
-    rulesFileBytes = fs.statSync(paths.file).size
-  } catch (e) {
-    rulesFileBytes = e && e.code === 'ENOENT' ? 0 : null
-  }
+  const meta = storage.statSafeMeta(paths.file)
+  const rulesFileBytes = meta.status === 'ok' ? meta.size : (meta.status === 'missing' ? 0 : null)
   const fieldChars = {}
   for (const field of FILTER_RULE_FIELDS) {
     const value = safeGet(filter, field)
