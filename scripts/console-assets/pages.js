@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetLogFiles, apiGetLogPage, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, AUTH_HEADER, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, fieldPageOf, filterCorruptNotice, filterDraftPatch, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, mergeFilterDraft, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
+import { FILTER_FIELD_PAGE_LINES, backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, fieldPageOf, filterCorruptNotice, filterDraftPatch, filterLogLines, filterOverrideFrom, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, mergeFilterDraft, searchBodyView, searchRefreshError, shouldPageField, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -4363,21 +4363,9 @@ function filterDraftFrom (data) {
   return out
 }
 
-// GET 返回的 override：覆盖文件里实际存在的字段（服务端已按白名单裁剪）。
-// 保存是整份替换 ⇒ 本次没改但已落盘的字段必须原样带回，否则会被静默删掉退回代码默认。
-// F4：`?view=merged` 只下发 `overrideFields`（字段名清单，值就是同一响应里的 filter[name]，
-// 同一次读盘、同源），这里两种形态都认；都没有就是空对象（覆盖文件不存在 / 一个字段都没写）。
-function filterOverrideFrom (data) {
-  const direct = filterOverrideFields(data && data.override, FILTER_FIELD_NAMES)
-  if (Object.keys(direct).length > 0) return direct
-  const names = data && Array.isArray(data.overrideFields) ? data.overrideFields : []
-  const src = data && data.filter && typeof data.filter === 'object' ? data.filter : {}
-  const out = {}
-  for (const name of names) {
-    if (FILTER_FIELD_NAMES.includes(name) && typeof src[name] === 'string') out[name] = src[name]
-  }
-  return out
-}
+// GET 的覆盖字段（override）由 pure.mjs 的 filterOverrideFrom(payload, FIELD_NAMES) 复原：
+// 旧视图读 `payload.override`，F4 的 `?view=merged` 读 `overrideFields` + 同源 `filter`。
+// 两种形态都在那个纯函数里，页面只负责把**整份载荷**交进去（传子对象会丢字段，见该函数注释）。
 
 // 服务器草稿响应 → 与本地草稿同形；坏的/缺字段的响应当没有，不能让他覆盖页面。
 // F4：草稿只存 dirty 字段（filterDraftPatch），所以恢复时要以**当前生效值**（base）为底合并；
@@ -4452,9 +4440,8 @@ function filterFieldLimitOf (data, name) {
 // 行），不再把整段塞进 textarea——1 MiB 预算下主字段可到 160,000 字符，一次性 layout 一个
 // 160k 的 textarea 在 4× CPU 节流下要几百毫秒（实测见 PR）。要点「编辑全部」显式按钮才换成
 // 可写的 textarea（用户明确要求时才付这份代价），旁边留一个「收起为分页预览」回去。
-// 阈值按**码元**（String.length）判，与 limits.perField[].chars 同口径（服务端上限就是这个单位）。
-const FILTER_FIELD_PAGED_CHARS = 100 * 1024
-const FILTER_FIELD_PAGE_LINES = 2000
+// 阈值与判据（码元口径，与 limits.perField[].chars 同单位）都在 pure.mjs 的 shouldPageField 里，
+// 这里只接线——放在组件里就只能靠 AST 存在性断言，关掉分页也不会变红（实测过）。
 function FilterField ({ def, value, saved, error, onChange, maxLen }) {
   const id = `filter-rule-${def.name}`
   const hintId = `${id}-hint`
@@ -4467,7 +4454,7 @@ function FilterField ({ def, value, saved, error, onChange, maxLen }) {
   // 分页态：超大字段默认走只读预览；编辑全部 = 用户显式接管（大 textarea 的代价由他确认）。
   const [editAll, setEditAll] = useState(false)
   const [page, setPage] = useState(0)
-  const big = shown.length > FILTER_FIELD_PAGED_CHARS
+  const big = shouldPageField(shown)
   const paged = big && !editAll
   const pageView = useMemo(() => (paged ? fieldPageOf(shown, page, FILTER_FIELD_PAGE_LINES) : null), [paged, shown, page])
   // 两个分支都显式渲染 textarea：天数字段用单行外观（rows=2 + fr-input-days），其余规则字段可能
@@ -4613,7 +4600,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     setData(d)
     setDraft(restored || next)
     setBase(next)
-    setOverride(filterOverrideFrom(d && d.override))
+    // GET 载荷整份交进去：merged 视图没有 override 键，靠 overrideFields + filter 复原；
+    // 只传 d.override 会让 override 恒 {}（保存时把已落盘字段静默删掉）。
+    setOverride(filterOverrideFrom(d, FILTER_FIELD_NAMES))
     setPreview(null)
     setFieldErrors({})
     if (restoreNotice) setNotice(restoreNotice)
@@ -4879,7 +4868,7 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     setBase(next)
     // 覆盖文件现在就是这份 filter（整份替换）：同步 override，否则下一次保存会把
     // 这次刚写进去的字段当成「没改过」再删一遍。
-    setOverride(filterOverrideFrom(filter))
+    setOverride(filterOverrideFrom({ override: filter }, FILTER_FIELD_NAMES))
     setFieldErrors({})
     setPreview(null)
     setDialog(null)

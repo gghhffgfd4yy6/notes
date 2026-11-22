@@ -132,6 +132,25 @@ export function filterOverrideFields (override, fieldNames) {
   return out
 }
 
+// GET 载荷 → 「覆盖文件里已落盘的字段」映射（保存候选的 override 入参）。
+// 两种响应形态都认：① 旧视图/直传形态 `{ override: {字段: 正文} }`；② F4 的 `?view=merged`
+// 形态——没有 `override` 键，只有 `overrideFields`（字段名清单）与 `filter`（合并后的生效值，
+// 同一次读盘同源），值就取 `filter[name]`。两种都取不到才是 `{}`（覆盖文件不存在 / 一个字段
+// 都没写）。入参必须是**整份载荷**：传 `data.override` 子对象或裸 map 会恒得 `{}`，保存时
+// 覆盖文件里其它已落盘字段就被静默删掉（v3.359 的那类数据丢失）。
+export function filterOverrideFrom (data, fieldNames) {
+  const names = Array.isArray(fieldNames) ? fieldNames : []
+  const direct = filterOverrideFields(data && data.override, names)
+  if (Object.keys(direct).length > 0) return direct
+  const declared = data && Array.isArray(data.overrideFields) ? data.overrideFields : []
+  const src = data && data.filter && typeof data.filter === 'object' && !Array.isArray(data.filter) ? data.filter : {}
+  const out = {}
+  for (const name of declared) {
+    if (names.includes(name) && typeof src[name] === 'string') out[name] = src[name]
+  }
+  return out
+}
+
 export function buildSaveCandidate (override, dirtyFields, draft, fieldNames) {
   const candidate = filterOverrideFields(override, fieldNames)
   const src = draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}
@@ -173,6 +192,18 @@ export function mergeFilterDraft (base, patch, fieldNames) {
     else out[name] = prev[name] === undefined || prev[name] === null ? '' : String(prev[name])
   }
   return out
+}
+
+// ── F4：超大字段分页的阈值 ────────────────────────────────────────────────────
+// 「该不该分页」必须是可直测的纯函数：阈值与判据留在组件里只能靠 AST 存在性断言，
+// 把 `paged = false` 或阈值抬到 100 MiB 都照样全绿（实测过）。口径按**码元**（String.length），
+// 与 `limits.perField[].chars` 同单位：等于阈值不分页，多一个码元就分页。
+export const FILTER_FIELD_PAGED_CHARS = 100 * 1024
+export const FILTER_FIELD_PAGE_LINES = 2000
+export function shouldPageField (value, chars = FILTER_FIELD_PAGED_CHARS) {
+  const text = value === undefined || value === null ? '' : String(value)
+  const limit = Number.isSafeInteger(chars) && chars >= 0 ? chars : FILTER_FIELD_PAGED_CHARS
+  return text.length > limit
 }
 
 // 超大字段的只读分页：一页 linesPerPage 行，页码越界夹回有效区间（不抛错——页面永远画得出来）。

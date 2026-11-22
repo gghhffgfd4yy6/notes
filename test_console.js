@@ -2734,7 +2734,7 @@ async function filterRuleApiTests () {
   })
 
   await aok('过滤规则保存: 保存候选行为（pure.mjs）——覆盖项保留、改动项优先、未涉及的字段不提交', async () => {
-    const { buildSaveCandidate, filterOverrideFields } = await import('./scripts/console-assets/pure.mjs')
+    const { buildSaveCandidate, filterOverrideFields, filterOverrideFrom } = await import('./scripts/console-assets/pure.mjs')
     const FIELDS = ['pingbilouzhu', 'zhanxianlouzhu', 'pingbitime']
     assert.deepStrictEqual(
       buildSaveCandidate({ pingbilouzhu: 'A' }, ['pingbitime'], { pingbilouzhu: 'A', zhanxianlouzhu: '默认', pingbitime: 'B' }, FIELDS),
@@ -2760,6 +2760,47 @@ async function filterRuleApiTests () {
     assert.deepStrictEqual(filterOverrideFields({ pingbilouzhu: '', pingbitime: 2 }, FIELDS), { pingbilouzhu: '' },
       '空串也算「文件里已存在」，非字符串不算')
     assert.deepStrictEqual(buildSaveCandidate(null, null, null, FIELDS), {}, '坏输入不得抛错，退化为空候选')
+
+    // ── override 从 GET 载荷复原（filterOverrideFrom）──────────────────────────────
+    // 前端固定请求 GET /api/config/filter?view=merged：响应里**没有** override 键，只有
+    // overrideFields（字段名清单）与同源 filter。它是 buildSaveCandidate 的第一个实参——恢复
+    // 不出来就只剩 dirtyFields，而服务端保存是整份替换 ⇒ 覆盖文件里其它字段被静默删掉。
+    const goodFilterMap = { pingbilouzhu: '楼主规则', zhanxianlouzhu: '闲置楼主规则', pingbitime: '8' }
+    const mergedPayload = { view: 'merged', revision: 4, filter: goodFilterMap, overrideFields: ['pingbilouzhu', 'zhanxianlouzhu'] }
+    assert.strictEqual(Object.hasOwn(mergedPayload, 'override'), false, '夹具必须是 merged 形状（没有 override 键）')
+    assert.deepStrictEqual(filterOverrideFrom(mergedPayload, FIELDS),
+      { pingbilouzhu: '楼主规则', zhanxianlouzhu: '闲置楼主规则' },
+      'merged 载荷（无 override 键）必须按 overrideFields 从同源 filter 复原出全部已落盘字段')
+    // 旧视图（override 整份 map）与非 merged 服务端必须得到同一份结果。
+    assert.deepStrictEqual(filterOverrideFrom({ revision: 4, source: 'override', filter: goodFilterMap, override: { pingbilouzhu: '楼主规则', zhanxianlouzhu: '闲置楼主规则' } }, FIELDS),
+      { pingbilouzhu: '楼主规则', zhanxianlouzhu: '闲置楼主规则' },
+      '旧视图（override 整份 map）必须与 merged 视图复原出同一份 override')
+    // 保存成功后的形态：覆盖文件就是这份 filter，全部字段都属显式覆盖。
+    const savedFilter = { pingbilouzhu: '楼主规则', pingbitime: '9' }
+    assert.deepStrictEqual(filterOverrideFrom({ override: savedFilter }, FIELDS), savedFilter,
+      'applySaved 形态（{ override: filter }）必须把这份 filter 的全部字段认成显式覆盖')
+    // 端到端：merged 载荷 → override → 保存候选，必须含 overrideFields 全部字段 + 被改字段。
+    assert.deepStrictEqual(
+      buildSaveCandidate(filterOverrideFrom(mergedPayload, FIELDS), ['pingbitime'], { ...goodFilterMap, pingbitime: '9' }, FIELDS),
+      { pingbilouzhu: '楼主规则', zhanxianlouzhu: '闲置楼主规则', pingbitime: '9' },
+      'merged 载荷必须足以构造整份替换的候选：overrideFields 的字段 + 被改字段（只剩 dirty = 保存时静默删字段）')
+    // 反证：把「子对象 / 裸 map」交给它 —— 正是 v3.526 接线错的那两种形状，必须恒为空，
+    // 空 override 再进 buildSaveCandidate 就只剩 dirty 字段。
+    assert.deepStrictEqual(filterOverrideFrom(mergedPayload.override, FIELDS), {},
+      '传 payload.override（merged 视图下是 undefined）必须得空——传子对象就是这个 bug 的形状')
+    assert.deepStrictEqual(filterOverrideFrom(goodFilterMap, FIELDS), {},
+      '传裸 filter map 必须得空（override 与生效值不是一回事：全员 override 会把代码默认钉死）')
+    assert.deepStrictEqual(
+      buildSaveCandidate(filterOverrideFrom(goodFilterMap, FIELDS), ['pingbitime'], { ...goodFilterMap, pingbitime: '9' }, FIELDS),
+      { pingbitime: '9' },
+      '接线接错时后果必须是「候选只剩 dirty」——这条钉住数据丢失的形状本身')
+    // overrideFields 里的白名单外字段与「filter 里同名字段不是字符串」都必须丢弃。
+    assert.deepStrictEqual(
+      filterOverrideFrom({ filter: { pingbilouzhu: 'x', pingbitime: 5 }, overrideFields: ['pingbilouzhu', 'pingbitime', '未知字段'] }, FIELDS),
+      { pingbilouzhu: 'x' },
+      'overrideFields 只认白名单内的字段名，值必须是字符串（同 filter 的口径）')
+    assert.deepStrictEqual(filterOverrideFrom(null, FIELDS), {}, '坏输入（null）不得抛错，退化为空 override')
+    assert.deepStrictEqual(filterOverrideFrom({}, FIELDS), {}, '既无 override 也无 overrideFields ⇒ 空 override（覆盖文件不存在）')
   })
 
   await aok('过滤规则页: 两处保存入口都走 pure.mjs 的候选构造，没有第二条提交路径', () => {
@@ -2790,13 +2831,26 @@ async function filterRuleApiTests () {
     const saveCalls = callSites(pages, 'apiPostFilterSave')
     assert.strictEqual(saveCalls.length, 2,
       'apiPostFilterSave 只允许 submitSave 与首启复制默认两处调用（多一处就可能绕过候选构造）')
-    // applySaved 必须同步 override（否则保存成功后页面仍显示旧值）。
-    const syncOverride = callSites(pages, 'setOverride').filter((call) => {
-      const arg = call.arguments[0]
-      return !!arg && arg.type === 'CallExpression' && memberPath(arg.callee) === 'filterOverrideFrom' &&
-        arg.arguments.length === 1 && memberPath(arg.arguments[0]) === 'filter'
-    })
-    assert.strictEqual(syncOverride.length, 1, 'applySaved 必须 setOverride(filterOverrideFrom(filter)) 同步 override')
+    // override 接线（F4 契约）：filterOverrideFrom 吃**整份 GET 载荷**，不吃子对象。
+    // ① load/applyLoaded —— 前端固定请求 ?view=merged，响应没有 override 键，必须把 d 整份交进去；
+    // ② applySaved —— 保存后覆盖文件就是这份 filter，按 { override: filter } 交给同一函数。
+    const setOverrideLabels = callSites(pages, 'setOverride').map((call) => callLabel(call.arguments[0]))
+    assert.deepStrictEqual(setOverrideLabels,
+      ['filterOverrideFrom(d, FILTER_FIELD_NAMES)', 'filterOverrideFrom({ override: filter }, FILTER_FIELD_NAMES)'],
+      '两处 setOverride 都必须把整份载荷交给 pure.mjs 的 filterOverrideFrom（传 d.override / 裸 map 会恒得 {}，保存时静默删字段）')
+    // 实现只能有一份：页面不得再留本地实现（两处入参形态会分叉，正是这次漏改的根因）。
+    assert.strictEqual(importBindings(pages, './pure.mjs').get('filterOverrideFrom'), 'filterOverrideFrom',
+      'filterOverrideFrom 必须从 pure.mjs 引入（Node 侧直测同一份实现）')
+    const localOverrideImpl = findAll(pages, (n) =>
+      (n.type === 'FunctionDeclaration' && n.id && n.id.name === 'filterOverrideFrom') ||
+      (n.type === 'VariableDeclarator' && n.id && n.id.type === 'Identifier' && n.id.name === 'filterOverrideFrom'))
+    assert.strictEqual(localOverrideImpl.length, 0, 'pages.js 不得再留一份本地 filterOverrideFrom（两处入参形态会分叉）')
+    // 反向判据：任何把 GET 载荷的子对象（d.override / data.override / payload.override）喂进去的接线
+    // 都必须为零——这正是 v3.526 漏改的形状（merged 视图没有 override 键 ⇒ 恒 {}）。
+    const staleOverrideWires = callSites(pages, 'filterOverrideFrom')
+      .filter((call) => /(^|\.)override$/.test(memberPath(call.arguments[0]) || ''))
+    assert.deepStrictEqual(staleOverrideWires.map((call) => callLabel(call)), [],
+      'loader 不得再传 d.override（merged 视图没有该键）⇒ 这类接线必须为零；列出的每一条都会让 override 恒 {}')
     // 首启复制默认：{ schema: 1, baseRevision: 0, filter: { ...base } } —— 逐字段断言（键序无关）。
     const firstBoot = saveCalls.filter((call) => (objectKeyNames(call.arguments[0]) || []).join(',') === 'schema,baseRevision,filter')
     assert.strictEqual(firstBoot.length, 1, '首启复制默认必须显式给出 schema / baseRevision / filter 三个键')
@@ -14887,7 +14941,7 @@ async function main () {
   })
 
   await aok('F4 大字段分页与草稿增量（pure.mjs 纯函数 + pages.js 接线）', async () => {
-    const { fieldPageOf, filterDraftPatch, mergeFilterDraft } = await import('./scripts/console-assets/pure.mjs')
+    const { FILTER_FIELD_PAGE_LINES, FILTER_FIELD_PAGED_CHARS, fieldPageOf, filterDraftPatch, mergeFilterDraft, shouldPageField } = await import('./scripts/console-assets/pure.mjs')
     const FIELDS = ['pingbibiaoti', 'pingbineirong', 'pingbitime']
     // ── 分页 ──
     const text = Array.from({ length: 4500 }, (_, i) => `规则${i}`).join('\n')
@@ -14906,6 +14960,31 @@ async function main () {
       '\\r\\n / \\r 都要归一（服务端存的正文两种行尾都可能出现）')
     const empty = fieldPageOf('', 0, 2000)
     assert.deepStrictEqual([empty.total, empty.pages, empty.lines], [1, 1, ['']], '空字段 = 1 行 1 页')
+    // ── 该不该分页：阈值与判据（spec「>100 KB 默认只读预览」的唯一守门）──
+    // 组件里只留接线（big = shouldPageField(shown)、paged = big && !editAll），阈值与边界在这里直测：
+    // 把它们留在 FilterField 里就只能做 AST 存在性断言——改成 `paged = false`、阈值抬到 100 MiB
+    // 都照样全绿（实测 381/381）。
+    assert.strictEqual(FILTER_FIELD_PAGED_CHARS, 1024 * 100, '分页阈值必须是 100 KB（spec 口径），不是 100 MiB')
+    assert.strictEqual(FILTER_FIELD_PAGE_LINES, 2000, '每页必须是 2000 行（分页文案与 fieldPageOf 同源）')
+    assert.strictEqual(shouldPageField('a'.repeat(FILTER_FIELD_PAGED_CHARS)), false,
+      '恰好 102,400 码元不分页（判据是「大于」而不是「大于等于」）')
+    assert.strictEqual(shouldPageField('a'.repeat(FILTER_FIELD_PAGED_CHARS + 1)), true,
+      '102,401 码元必须分页（多一个码元就越线）')
+    assert.strictEqual(shouldPageField('a'.repeat(102400)), false, '默认阈值下 102400 不分页')
+    assert.strictEqual(shouldPageField('a'.repeat(102401)), true, '默认阈值下 102401 分页')
+    assert.strictEqual(shouldPageField('abcde', 5), false, '显式阈值：等于阈值不分页（边界口径与默认阈值一致）')
+    assert.strictEqual(shouldPageField('abcdef', 5), true, '显式阈值：越线即分页')
+    assert.strictEqual(shouldPageField(''), false, '空字段不分页')
+    assert.strictEqual(shouldPageField(undefined), false, '未定义按空串处理（不抛错）')
+    assert.strictEqual(shouldPageField(null), false, 'null 按空串处理（不抛错）')
+    // 1 MiB 档下主字段 = 160,000 码元 ⇒ 必须走分页（否则一次性 layout 一个大 textarea）。
+    assert.strictEqual(shouldPageField('甲'.repeat(160000)), true, '160,000 码元的主字段必须分页')
+    // 带 \\r\\n 的大文本同样按码元判分页（预览侧会把两种行尾归一，但阈值看的是原始长度）。
+    const crlfHuge = '规则行\r\n'.repeat(25000)
+    assert.ok(crlfHuge.length > FILTER_FIELD_PAGED_CHARS, `夹具必须越线（${crlfHuge.length} 码元）`)
+    assert.strictEqual(shouldPageField(crlfHuge), true, '含 \\r\\n 的大文本仍必须判分页')
+    assert.strictEqual(shouldPageField(crlfHuge.slice(0, FILTER_FIELD_PAGED_CHARS)), false,
+      '同一份 \\r\\n 文本截到阈值内就不分页（判据只看码元数）')
     // ── 草稿增量：只存与已生效值不同的字段 ──
     const base = { pingbibiaoti: 'a', pingbineirong: 'b', pingbitime: '5' }
     assert.deepStrictEqual(filterDraftPatch(base, { ...base, pingbibiaoti: 'a2' }, FIELDS),
@@ -14931,6 +15010,38 @@ async function main () {
       '分页预览必须只渲染当前页的行（pageView.lines），不得回退成整段正文')
     assert.ok(elementsInFunction(pagesModel, 'FilterField').some((el) => el.name === 'pre' && markup.hasClass(el, 'fr-paged-lines')),
       '只读预览必须是 <pre class="fr-paged-lines">（等宽、可滚动、与 textarea 外观一致）')
+    // 「该不该分页」的接线：阈值来自 pure.mjs，paged 初值必须是 big && !editAll。
+    // 只断言 fieldPageOf/pre 存在是不够的——`paged = false` 时那些节点照旧在源码里，断言恒真
+    // （实测把 pages.js:4471 改成 `const paged = false` 仍 381/381）。
+    const bigDecl = findFirst(field, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'big')
+    assert.ok(bigDecl, 'FilterField 必须有 big = 该不该分页的判定')
+    assert.strictEqual(callLabel(bigDecl.init), 'shouldPageField(shown)',
+      'big 必须由 pure.mjs 的 shouldPageField(shown) 判（阈值/边界在那里直测，组件里手写比较会把阈值重新藏回来）')
+    const pagedDecl = findFirst(field, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'paged')
+    assert.ok(pagedDecl, 'FilterField 必须有 paged 状态')
+    assert.strictEqual(exprLabel(pagedDecl.init), 'big && !editAll',
+      'paged 初值必须是 big && !editAll（改成 false 等于整条 spec 必做项消失，且「编辑全部」按钮一起没了）')
+    // paged 分支必须带「编辑全部」显式按钮（用户明确要求才载入整段到 textarea）。
+    const fieldEls = elementsInFunction(pagesModel, 'FilterField')
+    const editAllButtons = fieldEls.filter((el) => el.name === 'Button' && markup.textOf(el) === '编辑全部')
+    assert.strictEqual(editAllButtons.length, 1, '分页预览必须恰好一个「编辑全部」按钮（没有它大字段永远只能看）')
+    assert.strictEqual(markup.attrText(editAllButtons[0], 'variant'), 'primary',
+      '「编辑全部」必须是主按钮（分页态的主动作，不能被降级成次要按钮）')
+    // textarea 只在 !paged 时渲染：`${!paged && control}`，不能无条件挂出。
+    const controlGate = findAll(field, (n) => n.type === 'LogicalExpression' && n.operator === '&&' &&
+      exprLabel(n.left) === '!paged' && memberPath(n.right) === 'control')
+    assert.strictEqual(controlGate.length, 1, '字段控件必须由 `!paged && control` 决定（paged 时不得渲染 textarea）')
+    assert.strictEqual(elementsInFunction(pagesModel, 'FilterField').filter((el) => el.name === 'textarea').length, 2,
+      'textarea 只应存在于 control 的两个分支（days / 多行）里，分页分支不得再挂一个')
+    // 常量与判据只能有一份：从 pure.mjs 引入，pages.js 不得再声明本地副本。
+    const pureBinds = importBindings(pagesModel, './pure.mjs')
+    for (const name of ['FILTER_FIELD_PAGE_LINES', 'shouldPageField']) {
+      assert.strictEqual(pureBinds.get(name), name, `pages.js 必须从 pure.mjs 引入 ${name}`)
+    }
+    const localPageConsts = findAll(pagesModel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+      (n.id.name === 'FILTER_FIELD_PAGED_CHARS' || n.id.name === 'FILTER_FIELD_PAGE_LINES' || n.id.name === 'shouldPageField'))
+    assert.deepStrictEqual(localPageConsts.map((n) => n.id.name), [],
+      '分页阈值/判据不得在 pages.js 里再声明一份（两份阈值 = 改一处不改另一处，页面与实际行为分叉）')
     const panel = markup.functionNodeOf(pagesModel, 'FilterRulesPanel')
     assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'filterDraftPatch').length, 3,
       '三处写草稿都必须走 filterDraftPatch（本机保存 / 服务器 PUT / 服务器草稿回写本机）')
