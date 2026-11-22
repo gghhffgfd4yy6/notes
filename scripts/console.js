@@ -5096,7 +5096,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
       // 时自己也会刷新 LKG（那描述的是「下次降级能用什么」），拿它冒充运行侧状态会给出假绿。
       lastGoodUsed: FilterStore.appliedLastGoodUsed(applied),
       auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt },
-      // F2-5：上限与用量（前端本项只读不用，F3 才接）。字段必须先在，否则前端只能继续写死 256 KiB。
+      // F2-5：上限与用量（F3 起前端已接：字段计数器与 413 文案都读这里）。字段必须先在，否则前端只能继续写死 256 KiB。
       ...FilterStore.filterLimitsReport(stateDir, loaded.filter)
     }
     if (corrupt) {

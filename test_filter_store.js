@@ -2841,6 +2841,110 @@ test('F3 读硬顶边界：恰好 readMaxBytes 可读、+1 判 corrupt；写入�
   assert.match(over.error.message, /tooLarge/)
 })
 
+// ===== F3 readMaxBytes 的「≥ 当前覆盖文件字节数」分支（数据丢失防线）=====
+// 为什么必须开子进程：FILTER_LIMITS 在 require 时按当时的 cacheDir／环境钉住，进程内注入不进去；
+// 子进程用 XBK_CACHE_DIR 指到临时目录、XBK_FILTER_SOFT_CAP_BYTES 钉 512 KiB，才能复现「软上限
+// 512 KiB，但盘上已有一份更大的合法覆盖文件」这个真实场景（softCap 调低／手改大文件／跨版本降级）。
+// 夹具必须 > totalBytes + 1024（= 525,312 字节），否则「只用 totalBytes」算出的读硬顶也够读，
+// 对 Math.max 分支没有鉴别力——回退后必须见到这条用例红。
+const CAPACITY_READ_PROBE = `
+const Store = require('./xbk_filter_store')
+const dir = process.env.XBK_CAPACITY_PROBE_DIR
+const loaded = Store.loadFilterRules({ cacheDir: dir, defaults: {}, keyword: {}, persistLastGood: false })
+process.stdout.write(JSON.stringify({
+  totalBytes: Store.FILTER_LIMITS.totalBytes,
+  readMaxBytes: Store.FILTER_LIMITS.readMaxBytes,
+  source: loaded.source,
+  revision: loaded.revision,
+  error: loaded.error ? loaded.error.message : null
+}))
+`
+
+// 合法覆盖文件：2 个主字段各填满（80,000 字符 × 3 B ≈ 480 KB），再补两个小字段各 16,000 字符
+// （读上限 16,000，不得超）⇒ 整份 ≈ 576 KB，稳稳越过 512 KiB + 1024。字段都是合法规则正文
+// （无控制字符、无 ###），读路径只做结构校验，不编译正则。
+function bigLegitOverrideFilter () {
+  return {
+    pingbibiaoti: '线'.repeat(readCharsOf('pingbibiaoti')),
+    pingbineirong: '线'.repeat(readCharsOf('pingbineirong')),
+    pingbifenlei: '线'.repeat(FILTER_FIELD_MAX_LEN),
+    pingbibiaotiplus: '线'.repeat(FILTER_FIELD_MAX_LEN)
+  }
+}
+
+test('F3 readMaxBytes 必须 ≥ 当前覆盖文件字节数：软上限之下已有大文件仍能读回（子进程实跑，区分 Math.max 分支）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const paths = filterRulesPaths(dir)
+  const text = JSON.stringify({ schema: 1, revision: 12, filter: bigLegitOverrideFilter() })
+  const fileBytes = Buffer.byteLength(text, 'utf8')
+  assert.ok(fileBytes > FILTER_DEFAULT_SOFT_CAP_BYTES + 1024,
+    `前置：夹具必须 > totalBytes + 1024（${FILTER_DEFAULT_SOFT_CAP_BYTES + 1024}），否则测不出 Math.max 分支：实得 ${fileBytes}`)
+  writeRaw(paths.file, text)
+  const probe = spawnSync(process.execPath, ['-e', CAPACITY_READ_PROBE], {
+    encoding: 'utf8',
+    cwd: __dirname,
+    maxBuffer: 4 * 1024 * 1024,
+    env: {
+      ...process.env,
+      // 生产口径：容量文件与覆盖文件在同一个缓存目录（systemd/控制台就是这么注入的）。
+      XBK_CACHE_DIR: dir,
+      XBK_FILTER_SOFT_CAP_BYTES: String(FILTER_DEFAULT_SOFT_CAP_BYTES),
+      XBK_CAPACITY_PROBE_DIR: dir
+    }
+  })
+  const out = `${probe.stdout || ''}${probe.stderr || ''}`
+  assert.strictEqual(probe.status, 0, `预算探针必须正常结束：${out.slice(-600)}`)
+  const result = JSON.parse(String(probe.stdout).trim().split('\n').pop())
+  // 不钉死 totalBytes=524288：探测在极端资源下会回落 256 KiB（仍被 env 夹在 512 KiB 之内），
+  // 而夹具 > 525,312 ⇒ 无论 totalBytes 是 512 KiB 还是回落的 256 KiB，Math.max 分支都必须生效。
+  assert.ok(result.totalBytes <= FILTER_DEFAULT_SOFT_CAP_BYTES,
+    `前置：XBK_FILTER_SOFT_CAP_BYTES 必须把整份预算夹在 512 KiB 内（实得 ${result.totalBytes}）`)
+  assert.ok(fileBytes > result.totalBytes + 1024,
+    `前置：夹具必须越过「只用 totalBytes」的读硬顶（${fileBytes} vs ${result.totalBytes + 1024}）`)
+  assert.strictEqual(result.readMaxBytes, fileBytes + 1024,
+    `readMaxBytes 必须按当前文件字节数抬高（= ${fileBytes} + 1024）；只按 totalBytes 算得 ${result.totalBytes + 1024}，文件下一轮就被整份判 corrupt（实得 ${result.readMaxBytes}）`)
+  assert.strictEqual(result.source, 'override',
+    `大文件必须仍被读回、规则不得静默失效（source=${result.source}${result.error ? '：' + result.error : ''}）`)
+  assert.strictEqual(result.revision, 12)
+
+  // 同形状的第二处接线：容量文件（另一进程钉住的更小预算）胜出时，adoptSharedCapacity 也必须把
+  // 「当前文件字节数」重新喂给 layoutFilterCapacity。删掉那个 fileBytes 传参同样会退化成 256 KiB + 1024，
+  // 盘上的大文件下一轮整份判 corrupt——故这里用同一份夹具直测以文件为准的分支。
+  const adoptDir = makeDir()
+  writeRaw(filterRulesPaths(adoptDir).file, text)
+  const shared = {
+    schema: 1,
+    totalBytes: FILTER_MIN_TOTAL_BYTES,
+    perField: Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, { chars: FILTER_FIELD_MAX_LEN }])),
+    mainChars: FILTER_FIELD_MAX_LEN,
+    source: 'fallback',
+    degraded: true,
+    softCapBytes: FILTER_DEFAULT_SOFT_CAP_BYTES,
+    at: 1700000000000
+  }
+  fs.writeFileSync(path.join(adoptDir, FILTER_CAPACITY_FILE), JSON.stringify(shared))
+  const origWarn = console.warn
+  let adopted
+  try {
+    console.warn = () => {}
+    adopted = resolveFilterLimits({
+      cacheDir: adoptDir,
+      env: {},
+      readFileSync: (filePath) => {
+        const p = String(filePath)
+        if (p === '/proc/meminfo') return 'MemAvailable: 460800 kB\n'
+        throw new Error('ENOENT ' + p)
+      },
+      statfsSync: () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 }),
+      now: () => 1800000000000
+    })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(adopted.totalBytes, FILTER_MIN_TOTAL_BYTES, '前置：容量文件胜出（以文件为准）')
+  assert.strictEqual(adopted.readMaxBytes, fileBytes + 1024,
+    `容量文件胜出时 readMaxBytes 仍必须按当前文件字节数抬高（实得 ${adopted.readMaxBytes}，期望 ${fileBytes + 1024}）`)
+})
+
 test('F3 normalizeFilterLimits fail-closed：0/负数/NaN/缺字段/缺 totalBytes 逐项回落，读硬顶不得小于接受阈值', () => {
   const good = computeFilterCapacity(capacityInput())
   const clone = () => JSON.parse(JSON.stringify({ ...good, perField: good.perField }))

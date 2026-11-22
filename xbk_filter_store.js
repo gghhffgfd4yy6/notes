@@ -746,7 +746,8 @@ function scanPreviewRecords ({
 /**
  * GET /api/config/filter 的 limits / usage 块（F2-5）。
  * 前端要显示余量与文案，但此前的响应里没有任何上限信息，前端只能写死 256 KiB（pages.js:4846）。
- * 这里把 FILTER_LIMITS（全仓唯一取值入口）与当前用量一起下发；前端本项**只读不用**（F3 才接）。
+ * 这里把 FILTER_LIMITS（全仓唯一取值入口）与当前用量一起下发；F3 起前端已接：字段计数器显示
+ * 「已用 / 上限」（取 perField[name].chars），413 文案用 limits.requestBodyMaxBytes。
  * 规则文件字节数：缺失按 0，其它读不到的情况如实报 null——不把「不知道」说成 0。
  * 元数据走 storage.statSafeMeta（xbk_storage.js 的唯一元数据原语，O_NOFOLLOW + 普通文件断言），
  * 不走 fs.statSync：后者会跟随末级符号链接（大小取自链接目标，等于泄露目标的信息），
