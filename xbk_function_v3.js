@@ -359,7 +359,7 @@ const Pusher = createPusher({ Utils, getNotify })
 // ============================================================
 // 🗂️ FilterStore — 过滤规则覆盖文件存储层
 // ============================================================
-// 只读存储层（不反向 require 本文件，避免循环依赖）；App.run 每轮调用一次 loadFilterRules。
+// 只读存储层（不反向 require 本文件，避免循环依赖）；App.run 每轮走 loadFilterRulesCached：签名不变即复用，不读盘。
 const FilterStore = profile3Require('xbk_filter_store', () => require('./xbk_filter_store'))
 
 // ============================================================
@@ -499,8 +499,9 @@ async function runNotifyTest (args = process.argv.slice(2)) {
 //   · MessageStore 的告警去重标记（warnedEnvDir/warnedEnvOverride/_journalWarned/_residualTombstoneWarned）。
 // **有意不复位**：MessageStore._memoryCache（常驻方案要复用的热数据，另有磁盘签名新鲜度校验）、
 //   _verified/_readFailed（读写闸门，提前复位会放大误写风险）、xbk_agents 的 DNS 在飞计数
-//   （+1/-1 必须在真实回调里结算，清零会把计数减成负数）。规则本身每轮由 run() 重新
-//   loadFilterRules + compileRules，不依赖任何跨轮缓存。
+//   （+1/-1 必须在真实回调里结算，清零会把计数减成负数）。规则由 createApp 闭包 rulesReuse
+//   跨轮复用（签名命中即连 active/compiled/hash/warnings 一起复用，每 60 轮按内容复核，
+//   只认本进程、不落盘），故不在 worker 轮间复位。
 // 返回值 { steps } 是**逐项**复位摘要：每一项只由它自己那条复位语句生成（「复位调用」与「该项
 // 摘要」写在同一语句内），所以单独删掉 5 条语句中的任意一条，摘要必缺该项、被复位状态也不会被
 // 清空——test_worker_protocol.js 的逐项用例因此能逐条咬住每个调用点。

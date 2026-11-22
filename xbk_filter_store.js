@@ -978,7 +978,7 @@ const FIELD_SET = new Set(FILTER_RULE_FIELDS)
 // 用单个槽位会让「A 目录的合法规则」在「B 目录损坏」时代入，把 B 的过滤面悄悄改成 A 的（A2）。
 // 键取 path.dirname(filterRulesPaths(cacheDir).file)，而不是给 filterRulesPaths 增加 dir 字段——
 // 后者被 console/qinglong 共用，为一行取值扩大公共契约不划算。
-// 不是 activeFilter 缓存——每轮 loadFilterRules 仍重新读盘、重新合并、返回新对象。
+// 不是 active 复用缓存——签名命中的轮次不进入 loadFilterRules；本 Map 只存 last-known-good，与复用无关。
 const lastGoodByDir = new Map()
 
 function cacheDirKey (cacheDir) {
