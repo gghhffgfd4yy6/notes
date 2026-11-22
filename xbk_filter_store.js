@@ -1021,7 +1021,7 @@ function normalizeKeyword (keyword, { forSnapshot = false } = {}) {
 
 /**
  * 合并生效规则：覆盖文件逐字段覆盖代码默认，缺字段回默认（规格 §4.1 / 计划 §2）。
- * 返回值每轮新建；字符串不可变，故不存在跨轮共享可变引用。
+ * 每次调用新建对象；但 loadFilterRulesCached 命中时跨轮复用同一个 active（filter/keyword 等嵌套对象一并共享），调用方必须只读。
  */
 function mergeActiveFilter ({ defaults, keyword, override } = {}) {
   const base = defaults && typeof defaults === 'object' ? defaults : {}
@@ -1613,7 +1613,7 @@ function removeLastGood (filePath) {
 const TRANSIENT_READ_RETRY_MS = 50
 
 function sleepMs (ms) {
-  // 本模块读路径全同步（loadFilterRules 在 App.run 开头同步调用），不能 await；Atomics.wait 是
+  // 本模块读路径全同步（App.run 每轮同步调用 loadFilterRulesCached，签名命中轮不进入 loadFilterRules），不能 await；Atomics.wait 是
   // Node 主线程可用的同步睡眠，不占 CPU（忙等会让 50ms 退避变成一次 CPU 尖峰）。
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
@@ -1736,7 +1736,7 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGo
 }
 
 /**
- * 读取覆盖文件并返回本轮的生效规则（每轮 App.run 开头调用一次）。
+ * 读取覆盖文件并返回一份生效规则；常驻运行侧经 loadFilterRulesCached 每轮调用，只有签名未命中（含降级轮不建基线）/每 60 轮内容复核不一致/调用方未给进程内缓存时才真正进入本函数，控制台读面等一次性调用方直接调用。
  * 任何异常都不得抛穿；文件不存在 → source:'default'、revision:0、filter 为代码默认深拷贝。
  * @param {{cacheDir:string, defaults:Object, keyword:Object, persistLastGood?:boolean,
  *   deps?:{RuleEngine:Object, compileUserRegex:Function, re2Available?:boolean, isRe2Available?:Function}}} options

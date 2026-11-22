@@ -2576,7 +2576,7 @@ function createApp ({
         safeConfigText: (value) => {
           try { return String(value) } catch (e) { return '<不可转换值>' }
         },
-        // 生效过滤规则：active 每轮新建、只读一次；compiled/hash 是同一份 active 的编译产物
+        // 生效过滤规则：每轮只绑定一次、调用方必须只读不得原地修改（O1 命中时 active/compiled/hash 都是上一轮同一个对象，跨轮共享）
         rules: { active: null, compiled: null, hash: '' },
         // 计时（抓取/预处理/落盘三段，统计行与 profile 行共用）
         timings: { fetchMs: null, preprocessMs: null, cacheMs: null },
