@@ -2921,7 +2921,7 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则 preview: _f 补推统计（不用 readMessages）+ limit 钳制 + capped(>5000)', async () => {
+  await aok('过滤规则 preview: _f 补推统计（不用 readMessages）+ limit 钳制 + 扫描预算（200 条 / 200ms 先到者）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const pushPath = path.join(dir, 'push.json')
@@ -2954,14 +2954,24 @@ async function filterRuleApiTests () {
       assert.strictEqual(JSON.parse(wideOk.text).reEvalCount, 3)
 
       const many = []
-      for (let i = 0; i < 5001; i++) many.push({ id: String(i), title: 't', content: '', catename: '', shijianchuo: nowS, _f: true })
+      for (let i = 0; i < 5000; i++) many.push({ id: String(i), title: 't', content: '', catename: '', shijianchuo: nowS, _f: true })
       fs.writeFileSync(pushPath, JSON.stringify(many))
+      const previewStart = Date.now()
       const capped = await postFilterJson(port, '/api/config/filter/preview', { filter: {} })
+      const previewMs = Date.now() - previewStart
       assert.strictEqual(capped.status, 200)
       const cappedBody = JSON.parse(capped.text)
-      assert.strictEqual(cappedBody.capped, true, '总条数 >5000 必须 capped')
-      assert.strictEqual(cappedBody.scanned, 5000, '最多扫 5000 条 _f')
-      assert.strictEqual(cappedBody.reEvalCount, 5000)
+      assert.strictEqual(cappedBody.capped, true, '超过扫描预算必须 capped（不得继续同步扫 5000 条）')
+      assert.ok(cappedBody.scanned > 0 && cappedBody.scanned <= 200,
+        `单次 preview 最多扫 200 条（实际 ${cappedBody.scanned}）`)
+      assert.ok(['records', 'time'].indexOf(cappedBody.cappedBy) >= 0,
+        `cappedBy 只能是 records（200 条先到）或 time（200ms 先到），实际 ${String(cappedBody.cappedBy)}`)
+      assert.strictEqual(cappedBody.budgetMs, 200, '响应必须带 budgetMs（前端据此显示「已截断」）')
+      assert.strictEqual(cappedBody.atLeast, true, 'capped 时计数只是下界')
+      assert.ok(cappedBody.reEvalCount <= cappedBody.scanned, '补推数不得超过扫描数')
+      // 定向用例要求：5000 条历史实测 < 400ms（旧实现 5000 × 2.01ms ≈ 11.1s，客户端 8s 直接超时）
+      assert.ok(previewMs < 400, `5000 条历史 preview 必须 <400ms（实测 ${previewMs}ms）`)
+      console.log(`  ⏱️ 5000 条历史 preview 实测 ${previewMs}ms（scanned=${cappedBody.scanned}, cappedBy=${cappedBody.cappedBy}）`)
     } finally { server.close() }
   })
 
@@ -2985,6 +2995,64 @@ async function filterRuleApiTests () {
       server.close()
     }
   })
+  await aok('过滤规则 GET: limits/usage 随响应下发（上限与 FILTER_LIMITS 同源，用量按真实文件量）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    const FilterStore = require('./xbk_filter_store')
+    try {
+      const none = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.deepStrictEqual(Object.keys(none.limits).sort((a, b) => a.localeCompare(b)),
+        ['draftFieldMaxLen', 'fieldMaxLen', 'maxAlternationsPerField', 'maxRuleLines', 'maxRuleLinesPerField', 'readMaxBytes', 'requestBodyMaxBytes', 'rulesFileMaxBytes'],
+        'limits 必须含 spec 要求的五项（F3 起前端据此显示余量）')
+      assert.deepStrictEqual(none.limits.fieldMaxLen, { ...FilterStore.FILTER_LIMITS.fieldMaxLen }, '单字段上限必须与 store 同源（不得再抄一份）')
+      assert.strictEqual(none.limits.fieldMaxLen.pingbibiaoti, 16000)
+      assert.strictEqual(none.limits.rulesFileMaxBytes, 256 * 1024)
+      assert.strictEqual(none.limits.requestBodyMaxBytes, 256 * 1024)
+      assert.strictEqual(none.limits.readMaxBytes, 256 * 1024)
+      assert.strictEqual(none.limits.draftFieldMaxLen, 16000)
+      assert.strictEqual(none.limits.maxRuleLines, 2000)
+      assert.strictEqual(none.limits.maxAlternationsPerField, 1000)
+      assert.strictEqual(none.usage.rulesFileBytes, 0, '没有覆盖文件时按 0 字节')
+      assert.deepStrictEqual(Object.keys(none.usage.fieldChars).sort((a, b) => a.localeCompare(b)),
+        [...FilterStore.FILTER_RULE_FIELDS].sort((a, b) => a.localeCompare(b)), '11 个字段的字符数必须全在')
+
+      // 覆盖文件必须是**合法**形状（{schema, revision, filter}）：否则加载判 corrupt、filter 回默认，
+      // 字段字符数就测不到「覆盖值」这条口径。
+      const body = JSON.stringify({ schema: 1, revision: 1, filter: { pingbibiaoti: '用量词' } })
+      fs.writeFileSync(paths.file, body)
+      const over = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      assert.strictEqual(over.usage.rulesFileBytes, Buffer.byteLength(body), '规则文件字节数必须是真实落盘大小')
+      assert.strictEqual(over.usage.fieldChars.pingbibiaoti, '用量词'.length, '字段字符数按生效规则原文计（覆盖值）')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则保存: 覆盖文件读不回（>body 上限）→ 500 rollback_read_failed 且原文件一个字节不动（不再 unlink）', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
+    try {
+      // 覆盖文件 300 KiB：读硬顶/body 上限都是 256 KiB ⇒ loadCurrentFilter 判 corrupt，
+      // commitFilterOverride 的「保存前原文」读回来也是 tooLarge（旧实现于是 previousText=null）。
+      const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(300 * 1024) } })
+      fs.writeFileSync(paths.file, huge)
+      const before = fs.readFileSync(paths.file)
+      const res = await postFilterJson(port, '/api/config/filter', {
+        schema: 1,
+        baseRevision: 0,
+        confirmReplaceCorrupt: true,
+        filter: { pingbibiaoti: '新规则' }
+      })
+      assert.strictEqual(res.status, 500)
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.code, 'rollback_read_failed', `读不回保存前原文必须明确报 rollback_read_failed：${res.text}`)
+      assert.strictEqual(body.error, 'rollback_read_failed')
+      assert.strictEqual(fs.existsSync(paths.file), true, '读不回时绝不能 unlink 原规则文件（F2-4 数据丢失隐患）')
+      assert.deepStrictEqual(fs.readFileSync(paths.file), before, '原文件必须一个字节不动（既未覆盖也未删除）')
+      assert.strictEqual(fs.existsSync(paths.lock), false, '失败路径同样必须释放锁')
+    } finally { server.close() }
+  })
+
   await aok('过滤规则 POST: 写盘失败（目标是目录）→ 500 write_failed 且锁释放', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
