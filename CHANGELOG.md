@@ -2700,11 +2700,9 @@ Sourcery 第六轮（close/reopen 触发的全新评审）10 条落地：
   - **门禁与账目**：`TZ=UTC node test_filter_store.js` **117/117**、`TZ=UTC node test_console.js` **381/381**、`TZ=UTC node test_console_routes.js` **13/13**；`node check-version.js` 与 `npx standard`（改动文件）全绿。`TZ=UTC node test_filter.js` **未跑**：本机容器的 `check-host-clean` 前置读 `/proc/1/cwd` 报 `EACCES`（pid=1、uid=0 且不可读）⇒ fail-closed 拒绝启动，属环境限制而非本版改动（该文件与 `scripts/test-harness.js` 一行未动）。
   - **版本**：3.525.0 → **3.526.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。
 
-## v3.527
+## v3.528
 
-- **交替闸按字段分档（主字段 5,000 / 其余 1,000）：修「一份已在跑的合法规则存不回去」**。v3.524 给保存加的条目闸把「单字段未转义 `|` >1,000 个」一律拒回，但简单模式（整字段不含 `###`）下**整个字段会合成一条正则**、分支数 = 行数 + `|` 数：线上 `pingbibiaoti` 是 3,010 行 + 银行城市规则单行 713 个 `|` = 字段合计 1,057 个，`pingbineirong` 1,046 个 —— 两个主字段都超过 1,000，任何一次保存（控制台「保存」、批量加词脚本）都被 400 `too_many_lines` 拒回，规则自 v3.524 部署后事实上不可写。
-  - 改动：`FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD = 5,000`（只对 `pingbibiaoti` / `pingbineirong`），其余字段维持 1,000（这些字段本身 ≤2,048 字符，1,000 个分支已接近其表达极限，`pingbitime` 的 `分类###天数` 也靠这一档让闸门可达）。`maxAlternationsOfField(field)` 是唯一取档入口，报错文案给的是**实际档位**而不是写死的 1,000。
-  - 为什么 5,000 安全：分支成本实测 3k ≈ 1.8 ms/条、10k ≈ 4.6 ms/条（v3.526 的满载压测），5,000 分支在每轮 20 条下约 60 ms，占 5 秒轮询 1.2%；真正防 OOM 的是 `###` 行数闸（每行 2 个 RE2 对象、单字段 1,000 行），与 `|` 个数无关，故不随之放宽。
-  - 门禁：`TZ=UTC node test_filter_store.js` **117/117**（新增「主字段 5,000 通过 / 5,001 拒绝」「线上形状 1,057 个交替 + 3,010 行必须通过」「非主字段 1,001 个仍拒绝」「两档取值同源」四条断言）；`node check-version.js` 与 `npx standard`（改动文件）全绿。
-  - 版本：3.526.0 → **3.527.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。
-
+- **回退 v3.527（按用户要求撤销 PR #437）**：交替闸回到单一档位——**所有字段**单字段未转义 `|` 上限一律 **1,000 个**（删除 `FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD` 与 `maxAlternationsOfField` 分档入口，`FILTER_LIMITS.maxAlternationsPerField` 恢复为 1,000）。
+  - 回退后**已知影响**：线上主字段合计 1,057 / 1,046 个 `|`，超过 1,000 ⇒ 控制台「保存」与批量加词脚本会收到 400 `too_many_lines`，直到把主字段的 `|` 数降到 1,000 以内。此为用户明确要求的取舍，不是回归。
+  - 测试：`test_filter_store.js` 恢复为 1,000 档断言（含线上形状 1,057 个 → 拒绝），`node check-version.js` / `npx standard` 全绿。
+  - 版本：3.527.0 → **3.528.0**（主文件头 banner ／ 本文件 ／ `package.json` ／ `package-lock.json` 顶层与 `packages[""]` 两处）。

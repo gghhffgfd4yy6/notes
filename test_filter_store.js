@@ -72,9 +72,6 @@ const {
   readAppliedSnapshot,
   scanPreviewRecords,
   countUnescapedAlternations,
-  FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD,
-  FILTER_MAX_ALTERNATIONS_PER_FIELD,
-  maxAlternationsOfField,
   filterLimitsReport,
   // F4：GET 读面的响应体组装（lastGoodUsed 口径 / merged 视图 / 保存响应的去重字段摘要）
   buildFilterGetPayload,
@@ -2533,30 +2530,18 @@ test('F2-3 行数闸只管 ###：普通字段 2001 行仍按字符上限通过',
   assert.strictEqual(result.ok, true, `非 ### 字段不受行数闸影响：${JSON.stringify(result.errors)}`)
 })
 
-test('F2-3 未转义 | 闸：主字段 5000 个通过、5001 个拒绝；非主字段仍 1000 档；转义 \\| 不计入（含 \\\\| 的奇偶口径）', () => {
+test('F2-3 未转义 | 闸：1000 个通过、1001 个拒绝；转义 \\| 不计入（含 \\\\| 的奇偶口径）', () => {
   // alts(n) 生成**恰好 n 个**未转义 | （n+1 个分支）
   const alts = (n) => Array.from({ length: n + 1 }, (_, i) => `x${i}`).join('|')
-  const CAP = FILTER_MAX_ALTERNATIONS_PER_MAIN_FIELD
-  assert.strictEqual(CAP, 5000, '主字段交替闸上限是 5,000（线上银行城市规则用掉 1,057 个）')
-  assert.strictEqual(maxAlternationsOfField('pingbineirong'), CAP, '两个主字段同档')
-  assert.strictEqual(maxAlternationsOfField('pingbitime'), FILTER_MAX_ALTERNATIONS_PER_FIELD, '非主字段维持 1,000 档')
-  const ok = validateFilterRules({ filter: { pingbibiaoti: alts(CAP) } }, deps)
-  assert.strictEqual(ok.ok, true, `${CAP} 个交替必须通过：${JSON.stringify(ok.errors)}`)
-  const over = validateFilterRules({ filter: { pingbibiaoti: alts(CAP + 1) } }, deps)
-  assert.strictEqual(over.ok, false, `${CAP + 1} 个交替必须拒绝`)
+  const ok = validateFilterRules({ filter: { pingbibiaoti: alts(1000) } }, deps)
+  assert.strictEqual(ok.ok, true, `1000 个交替必须通过：${JSON.stringify(ok.errors)}`)
+  const over = validateFilterRules({ filter: { pingbibiaoti: alts(1001) } }, deps)
+  assert.strictEqual(over.ok, false, '1001 个交替必须拒绝')
   const err = over.errors.find((item) => item.code === 'too_many_lines')
   assert.ok(err, `交替超限必须给 too_many_lines：${JSON.stringify(over.errors)}`)
   assert.strictEqual(err.field, 'pingbibiaoti')
-  assert.match(err.message, new RegExp(String(CAP + 1)))
-  assert.match(err.message, new RegExp(String(CAP)))
-  // 线上真实形状：3,010 行 + 银行城市规则那行的 713 个 |（字段合计 1,057 个）必须存得进去。
-  // 这是 1,000 档锁死控制台保存的回归用例——分母是「字段合计」，不是「单行」。
-  const liveShape = `${alts(1057)}\n${Array.from({ length: 3009 }, (_, i) => `w${i}`).join('\n')}`
-  const live = validateFilterRules({ filter: { pingbibiaoti: liveShape } }, deps)
-  assert.strictEqual(live.ok, true, `线上形状（1,057 个交替 + 3,010 行）必须通过：${JSON.stringify(live.errors)}`)
-  // 非主字段仍走 1,000 档（pingbitime 的单字段限额 2,048 字符，1,001 个 | 至少 2,005 字符，闸门可达）
-  const smallField = validateFilterRules({ filter: { pingbitime: `${Array.from({ length: 1002 }, () => '7').join('|')}###7` } }, deps)
-  assert.strictEqual(smallField.ok, false, '非主字段 1,001 个交替必须仍被拒绝')
+  assert.match(err.message, /1001/)
+  assert.match(err.message, /1000/)
   // 计数口径：`\|` 是字面竖线（0 个交替），`\\|` 是「转义反斜杠 + 交替」（1 个）。
   // 用 String.fromCharCode(92) 拼反斜杠，避免本文件自身再被转义层数搞混。
   const BS = String.fromCharCode(92)
