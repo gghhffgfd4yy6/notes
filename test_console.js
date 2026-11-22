@@ -3079,8 +3079,13 @@ async function filterRuleApiTests () {
       assert.strictEqual(resetBody.ok, true)
       assert.strictEqual(resetBody.revision, 1, '恢复默认必须写新一代 revision')
       assert.strictEqual(resetBody.restoredFrom, 'default')
-      assert.strictEqual(fs.existsSync(paths.file), true, '恢复路径不得 unlink 覆盖文件（删文件比留下旧规则更糟）')
-      const afterResetText = fs.readFileSync(paths.file, 'utf8')
+      // 存在性直接由读取证明（被 unlink 即抛 ENOENT），不再 existsSync 探路后 use 同一路径。
+      let afterResetText
+      try {
+        afterResetText = fs.readFileSync(paths.file, 'utf8')
+      } catch (e) {
+        assert.fail(`恢复路径不得 unlink 覆盖文件（删文件比留下旧规则更糟；读原文件失败：${e.message}）`)
+      }
       const afterReset = JSON.parse(afterResetText)
       assert.deepStrictEqual(afterReset.filter, {}, '恢复默认必须把覆盖文件重写成空规则')
       assert.strictEqual(afterReset.revision, 1)
@@ -3099,10 +3104,11 @@ async function filterRuleApiTests () {
       assert.strictEqual(backBody.revision, 1)
       assert.strictEqual(backBody.restoredFrom, backupRev)
       assert.strictEqual(typeof backBody.hash, 'string', '回滚到备份必须回吐新规则摘要')
-      const afterBack = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
+      const afterBackText = fs.readFileSync(paths.file, 'utf8')
+      const afterBack = JSON.parse(afterBackText)
       assert.strictEqual(afterBack.filter.pingbibiaoti, '备份规则', '覆盖文件必须被重写为备份里的规则')
       assert.strictEqual(afterBack.revision, 1)
-      assert.ok(fs.statSync(paths.file).size < 1024, '回滚后文件必须回到常规大小')
+      assert.ok(Buffer.byteLength(afterBackText) < 1024, `回滚后文件必须回到常规大小（实际 ${Buffer.byteLength(afterBackText)} 字节）`)
       assert.strictEqual(lastAuditAction(), 'restore', '回滚必须留 restore 审计')
       assert.strictEqual(fs.existsSync(paths.lock), false, '回滚成功后必须释放锁')
 
@@ -3123,10 +3129,11 @@ async function filterRuleApiTests () {
       assert.strictEqual(impBody.ok, true)
       assert.strictEqual(impBody.imported.filter, true, '导入必须报告 filter 已恢复')
       assert.strictEqual(impBody.imported.filterRevision, 1)
-      const afterImport = JSON.parse(fs.readFileSync(paths.file, 'utf8'))
+      const afterImportText = fs.readFileSync(paths.file, 'utf8')
+      const afterImport = JSON.parse(afterImportText)
       assert.strictEqual(afterImport.filter.pingbifenlei, '导入规则', '覆盖文件必须被重写成导入的规则')
       assert.strictEqual(afterImport.revision, 1)
-      assert.ok(fs.statSync(paths.file).size < 1024, '导入后文件必须回到常规大小')
+      assert.ok(Buffer.byteLength(afterImportText) < 1024, `导入后文件必须回到常规大小（实际 ${Buffer.byteLength(afterImportText)} 字节）`)
       assert.strictEqual(lastAuditAction(), 'import', '导入必须留 import 审计')
       assert.strictEqual(fs.existsSync(paths.lock), false, '导入成功后必须释放锁')
     } finally { server.close() }
