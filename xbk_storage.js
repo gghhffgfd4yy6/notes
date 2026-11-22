@@ -65,7 +65,7 @@ function fsyncDirBestEffort (filePath) {
   }
 }
 
-function writeAtomic (filePath, text, label = '缓存文件') {
+function writeAtomic (filePath, text, label = '缓存文件', options = {}) {
   // 已知取舍（审查 2026-08-15，记录不修）：isRegularOrMissing 检查与 renameSync 之间、以及
   // cacheDir 的 realpath 校验与每次写入之间均存在 TOCTOU 窗口（校验时是普通文件/目录，窗口内被替换
   // 为符号链接时，rename 会替换链接本身不跟随，但中间目录若为链接可指向根外）。本模块自身只提供
@@ -77,6 +77,14 @@ function writeAtomic (filePath, text, label = '缓存文件') {
   // 使「原子写」在掉电场景也成立（此前只对进程崩溃成立）。fsync 失败不再静默：文件 fsync 失败
   // 走 catch → 删除 tmp 并返回 false（fail-closed，避免假装持久），目录 fsync 失败只告警。
   // 攻击者需先具备对项目根/缓存目录的写权限，风险等级低，接受现状（单实例 cron 信任本地文件系统）。
+  //
+  // v3.531（O4-2）：`options.durable === false` 时跳过两处 fsync，其余步骤（lstat 守卫、唯一 tmp、
+  // write、close、rename、失败清理）逐字不变。只给「可丢的累计状态」用（当前唯一调用点是
+  // App._persistReportState 的 report.state）：rename 已提交 ⇒ 进程崩溃仍安全，只有整机掉电
+  // （或内核崩溃）可能丢本次提交——代价是当天日报累计的最后一两次 +1 需要重放，收益是每轮
+  // 省掉两次 syscall（本机实测 104 B 原子写 4.71~9.45 → 0.155~0.190 ms，见 CHANGELOG v3.531）。缺省 durable=true，其它调用点
+  // （过滤器 applied、filter.hash、channel-health.state 等）持久性口径不变。
+  const durable = !(options && options.durable === false)
   if (!isRegularOrMissing(filePath)) {
     console.error(`拒绝写入非普通文件 ${label} ${filePath}`)
     return false
@@ -90,12 +98,12 @@ function writeAtomic (filePath, text, label = '缓存文件') {
     tmpFile = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`
     fd = fs.openSync(tmpFile, 'wx', 0o600) // nosemgrep（tmpFile 由 filePath + pid + 时间 + crypto 随机构成）
     fs.writeFileSync(fd, text, { encoding: 'utf8' }) // nosemgrep（首参是 fd 不是路径）
-    fs.fsyncSync(fd) // 内容先落盘，再 rename 提交
+    if (durable) fs.fsyncSync(fd) // 内容先落盘，再 rename 提交（durable:false 时跳过，见上方注释）
     fs.closeSync(fd)
     fd = -1
     fs.renameSync(tmpFile, filePath)
     tmpFile = ''
-    fsyncDirBestEffort(filePath)
+    if (durable) fsyncDirBestEffort(filePath)
     return true
   } catch (e) {
     if (fd >= 0) { try { fs.closeSync(fd) } catch (e2) { /* 忽略 */ } }

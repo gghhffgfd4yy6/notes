@@ -225,11 +225,15 @@ function parseRunSummaryLine (line) {
 // 拼可选片段。stamp 由调用方传入（_localStamp() 是 Asia/Shanghai 的进程时钟，不进纯模块）；
 // elapsed 传**原样 token**（生产侧传 `${elapsed}s`，含单位）。
 // 可选片段顺序与条件逐条照抄生产：
+//   ⓪ v3.531：`pp=<ms>`（preprocess 毫秒，仅 extras.preprocessMs 是有限的非负数时写，保留 1 位小数）
+//     **必须排在最前**（elapsed 之后、其余片段之前）：parseRunSummaryExtras 只看行尾 64 字符窗口，
+//     插在最前不会把既有尾部字段挤出窗口；解析器**不读** pp（只加不改）。
 //   ① dry-run 且未推送 > 0 才写 dry-run未推送；② noidentity/bad/similar/similarlogged/similardrop
 //   只在 > 0 时写；③ cachesaved 仅在非 dry-run 时写，取 truthy→1/else→0。
 function formatRunSummaryLine ({ stamp = '', counters = {}, elapsed = '', extras = {} } = {}) {
   const dryRun = extras.dryRun === true
   const tail = [
+    extras.preprocessMs != null && Number.isFinite(Number(extras.preprocessMs)) && Number(extras.preprocessMs) >= 0 ? ' pp=' + (Math.round(Number(extras.preprocessMs) * 10) / 10) : '',
     dryRun && extras.dryRunUnpushed > 0 ? ` dry-run未推送=${extras.dryRunUnpushed}` : '',
     extras.noidentity > 0 ? ` noidentity=${extras.noidentity}` : '',
     extras.bad > 0 ? ` bad=${extras.bad}` : '',

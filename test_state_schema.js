@@ -23,8 +23,8 @@ let skipped = 0
 const failures = []
 const skips = []
 // 声明用例数：新增/删除用例时必须同步（结算数不符 ⇒ 直接红，避免「不执行的用例被记成通过」）。
-// 42 条原有用例 + 2 条自检（恒 SKIP 探针 + 跳过记账自检，见文件末尾）。
-const DECLARED_CASES = 44
+// 45 条原有用例（含 v3.531 新增 3 条 pp= 用例）+ 2 条自检（恒 SKIP 探针 + 跳过记账自检，见文件末尾）。
+const DECLARED_CASES = 47
 
 function check (name, fn) {
   try {
@@ -388,6 +388,57 @@ check('format → parse 回环：写入格式与解析正则对得上（加字�
     assert.strictEqual(parsed.elapsed, c.elapsed, 'elapsed 原样回环')
     assert.strictEqual(parsed.day, '2026-11-14')
   }
+})
+
+// ===== v3.531（O4-4）：摘要行 pp=（preprocess 毫秒，只加不改）=====
+// 回退即红：去掉 tail 数组第 0 项（pp 片段）⇒ 下面第一条的 ` pp=0.9` 断言立刻红。
+check('O4-4 formatRunSummaryLine pp=：0.94 ⇒ pp=0.9（保留 1 位），既有字段与读侧解析不受影响', () => {
+  const withPp = S.formatRunSummaryLine({
+    stamp: STAMP,
+    counters: COUNTERS,
+    elapsed: '12.3s',
+    extras: { dryRun: false, cachesaved: 1, preprocessMs: 0.94 }
+  })
+  assert.strictEqual(withPp,
+    '2026-11-14 09:25:53 total=12 dedup=3 filtered=4 truncated=1 pushed=5 failed=2 elapsed=12.3s pp=0.9 cachesaved=1',
+    'pp 必须紧跟 elapsed、在其余尾部字段之前')
+  // 不传 preprocessMs ⇒ 与旧模板逐字相同（既有用例同样锁这一形状，这里做就地对照）
+  const withoutPp = S.formatRunSummaryLine({
+    stamp: STAMP, counters: COUNTERS, elapsed: '12.3s', extras: { dryRun: false, cachesaved: 1 }
+  })
+  assert.strictEqual(withoutPp,
+    '2026-11-14 09:25:53 total=12 dedup=3 filtered=4 truncated=1 pushed=5 failed=2 elapsed=12.3s cachesaved=1')
+  // 读侧只加不改：解析出的计数/elapsed/extras 与无 pp 时逐字段相同
+  const parsedWith = S.parseRunSummaryLine(withPp)
+  const parsedWithout = S.parseRunSummaryLine(withoutPp)
+  assert.ok(parsedWith, `带 pp 的行必须仍被解析：${withPp}`)
+  assert.deepStrictEqual(parsedWith.counters, parsedWithout.counters, 'pp 不得影响计数解析')
+  assert.deepStrictEqual(parsedWith.extras, parsedWithout.extras, 'pp 不得影响既有的 extras 解析（解析器不读 pp）')
+  assert.strictEqual(parsedWith.elapsed, '12.3s', 'elapsed 原样回环（pp 在它之后，不侵占 elapsed token）')
+})
+
+check('O4-4 formatRunSummaryLine pp=：null/undefined/NaN/负数/非数字串一律不写（不得写 pp=undefined）', () => {
+  const base = { stamp: STAMP, counters: COUNTERS, elapsed: '1s', extras: { dryRun: false, cachesaved: 1 } }
+  const legacy = '2026-11-14 09:25:53 total=12 dedup=3 filtered=4 truncated=1 pushed=5 failed=2 elapsed=1s cachesaved=1'
+  for (const v of [null, undefined, NaN, -1, 'abc', Infinity]) {
+    const got = S.formatRunSummaryLine({ ...base, extras: { ...base.extras, preprocessMs: v } })
+    assert.strictEqual(got.includes('pp='), false, `preprocessMs=${String(v)} 不得写 pp=：${got}`)
+    assert.strictEqual(got, legacy, `preprocessMs=${String(v)} 时必须与旧模板逐字相同`)
+  }
+})
+
+check('O4-4 formatRunSummaryLine pp= 不挤掉尾部字段：带 similar 系列的长行仍能解析出 cachesaved/similarlogged', () => {
+  const extras = { dryRun: false, noidentity: 2, bad: 1, cachesaved: 1, similar: 5, similarlogged: 2, similardrop: 1, preprocessMs: 42.37 }
+  const line = S.formatRunSummaryLine({ stamp: STAMP, counters: COUNTERS, elapsed: '9.9s', extras })
+  assert.ok(line.includes(' pp=42.4 '), `pp 必须保留 1 位小数：${line}`)
+  const parsed = S.parseRunSummaryLine(line)
+  assert.ok(parsed, '带 pp 与全部尾部字段的行必须仍被解析')
+  // pp 插在 tail 最前 ⇒ 既有尾部字段到行尾的距离不变，仍落在 parseRunSummaryExtras 的末 64 字符窗口内
+  assert.strictEqual(parsed.extras.cachesaved, 1, `cachesaved 必须仍在窗口内：${line}`)
+  assert.strictEqual(parsed.extras.similarlogged, 2, `similarlogged 必须仍在窗口内：${line}`)
+  assert.strictEqual(parsed.extras.similardrop, 1, `similardrop 必须仍在窗口内：${line}`)
+  assert.strictEqual(parsed.extras.bad, 1, `bad 必须仍在窗口内：${line}`)
+  assert.deepStrictEqual(parsed.counters, COUNTERS, '计数解析不受 pp 影响')
 })
 
 // ===== deriveRunStats：今日/近 7 天边界、未来日期、lastFailure、truncated =====

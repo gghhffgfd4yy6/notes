@@ -88,13 +88,18 @@ function createApp ({
   fs, path, crypto, readSafeTextResult, writeAtomic, isRegularOrMissing,
   STATE_TEXT_MAX_BYTES, DEFAULT_MAX_SIZE, RE2C, RE2_WARN_STATE_FILE, RE2_MISSING_WARNING,
   summarizeError, PROFILE3, PROFILE3_BOOT_MARKS, prewarmDns, prewarmTls,
-  getNotify, PKG_VERSION, trimTrailingSlashes, compileUserRegex
+  getNotify, PKG_VERSION, trimTrailingSlashes, compileUserRegex, clearUserRegexCache = () => {}
 }) {
   // C1-026：parallelLimit 的**唯一**夹取口径。此前三处各自夹取（预热窗口按 10、并行 worker 按 50、
   // 0/负数按 items.length），于是「预热连接数与并发窗口对齐」的注释不成立：窗口 >10 时预热恒定只开
   // 10 条连接。规则收敛为：正数向下取整；0/负数/非法回退「按消息总数」（调用方拿不到条目数时传
   // 单轮上限，语义仍是同一上限）；统一受 MAX_PARALLEL_WORKERS 约束，空批次兜底 1。
   const MAX_PARALLEL_WORKERS = 50
+  // v3.531（O4-3）：TLS 预热的连接数上限。预热发生在拿到数据之前，旧实现按并发窗口预建
+  // （默认 10 条）⇒ 每 5 s 一轮即 120 条/分钟，而 96.6% 的轮次没有任何推送（空转也照开）。
+  // 固定 2 条：首轮真推送最多多 1 个握手 RTT（~100 ms 量级，未在本机对 wxpusher 实测），
+  // 稳态连接数降到 24 条/分钟；实际值仍受 resolveParallelWindow 约束（parallelLimit=1 ⇒ 1 条）。
+  const PREWARM_TLS_CONNECTIONS = 2
   const resolveParallelWindow = (configured, totalItems) => {
     const pl = Utils.num(configured, 0)
     const items = Number.isFinite(totalItems) && totalItems > 0 ? Math.floor(totalItems) : 0
@@ -109,7 +114,11 @@ function createApp ({
     cache: FilterStore && typeof FilterStore.createRulesReuseCache === 'function' ? FilterStore.createRulesReuseCache() : null,
     compiled: null, // 上一轮 compileRules 的产物（与 cache.active 同一份规则的编译结果）
     hash: '', // 上一轮 Utils.filterHash 的结果
-    warnings: null // 上一轮 validateConfig 的告警数组（同一份规则 + 同一份 Config ⇒ 逐字相同）
+    warnings: null, // 上一轮 validateConfig 的告警数组（同一份规则 + 同一份 Config ⇒ 逐字相同）
+    // v3.531（O4-5）：上一轮生效规则的 revision 键。变了就整表清空用户正则编译缓存
+    // （clearUserRegexCache）——旧实现按源码键只增不减，规则保存后的旧条目永久留在进程里
+    // （每次保存约 +0.93~1.95 MB，140 次保存 RSS 68 → 198.6 MB）。
+    revisionKey: null
   }
   // C1-013：O_EXCL 文件锁的**唯一**实现与唯一常数来源。run.log / RE2 标记 / 通道健康此前各写
   // 一遍「独占创建 + pid:start 令牌 + mtime 超龄 + 持有进程存活复核 + 抢占重开」，常数也各写一份
@@ -740,13 +749,15 @@ function createApp ({
       return readSafeTextResult(filePath, STATE_TEXT_MAX_BYTES, { openNonBlocking: true })
     },
 
-    _writeTextAtomic (filePath, text) {
+    _writeTextAtomic (filePath, text, options) {
     // v3.245 P1：writeAtomic 内部有 try/catch（失败会 console.error 后返回 false），正常不抛；
     // 这一层只兜「String 化异常」等意外，任何异常都不向调用链冒泡。
     // C1-016：旧实现 `catch (e) { return false }` 把原因整条丢掉——调用方与运维只看到 false，
     // 分不清「磁盘/权限失败」与「text 无法字符串化」。不冒泡的契约不变，原因必须留痕。
+    // v3.531（O4-2）：options 原样作为第 4 参透传给 writeAtomic（当前只有 { durable: false } 一
+    // 种用法，来自 _persistReportState）；不传即 undefined ⇒ 存储层按 durable=true 处理。
       try {
-        return writeAtomic(filePath, text, '缓存文件')
+        return writeAtomic(filePath, text, '缓存文件', options)
       } catch (e) {
       // 原因自己安全字符串化（不依赖 Utils：本方法的既有单测用最小 Utils 替身，且这里正好是
       // 「text 不可字符串化」的兜底路径，取原因本身也不能再抛一次）。
@@ -927,20 +938,41 @@ function createApp ({
     },
 
     // 状态文件统一原子写入（tmp + rename）：避免进程中断留下半写 JSON，导致告警限频/日报累计状态损坏。
-    _writeState (filePath, state) {
+    // v3.531（O4-1）：序列化前的类型守卫 + JSON.stringify 抽成 _serializeState，供「写前比较」
+    // （_writeStateIfChanged）复用同一份守卫与文案——两处各写一份必然漂移。
+    _serializeState (filePath, state) {
     // v3.179：类型守卫——state 为 undefined/null/非对象时 JSON.stringify 会静默产出
     // "null"/undefined 文本或抛错，明确告警并拒绝写入，避免状态文件被污染
     // v3.246：数组 typeof 'object' 同样穿透守卫被序列化写入（产出 '[]'），一并拒绝
       if (state === undefined || state === null || typeof state !== 'object' || Array.isArray(state)) {
         const kind = Array.isArray(state) ? 'array' : (state === null ? 'null' : typeof state)
         console.warn(`_writeState: state 必须是非空对象, 实际为 ${kind}, 拒绝写入 ${filePath}`)
-        return false
+        return null
       }
-      let text
-      try { text = JSON.stringify(state) } catch (e) {
+      try { return JSON.stringify(state) } catch (e) {
         console.error(`状态序列化失败 ${filePath}:`, e.message)
-        return false
+        return null
       }
+    },
+
+    _writeState (filePath, state, options) {
+      const text = this._serializeState(filePath, state)
+      if (text === null) return false
+      return this._writeTextAtomic(filePath, text, options)
+    },
+
+    // v3.531（O4-1）：内容没变就不落盘——channel-health.state 每轮无条件原子写 104 B（含两次
+    // fsync），而 93% 的轮次内容与磁盘上那份逐字节相同（没有失败/恢复/告警时间变化）。
+    // previousText 不是字符串（文件 missing / 读失败 / 超限）时退回 _writeState：不拿「读不到」
+    // 当「内容相同」，否则读失败会静默跳过本该写的更新。
+    // 语义：内容没变 ⇒ inode/mtime 都不变（**不得**据此判活，见 SYSTEM_CONTRACT）；内容变
+    // （计数器 +1、告警时间、恢复认领）⇒ 必写。alerts 非空必然伴随 lastAlertAt/lastRecoveredAt
+    // 变化，故不存在「有告警却跳过写」的路径。
+    _writeStateIfChanged (filePath, state, previousText) {
+      if (typeof previousText !== 'string') return this._writeState(filePath, state)
+      const text = this._serializeState(filePath, state)
+      if (text === null) return false
+      if (text === previousText) return true
       return this._writeTextAtomic(filePath, text)
     },
 
@@ -1733,7 +1765,12 @@ function createApp ({
 
     _persistReportState (statePath, state) {
       const normalized = this._normalizeReportState(state)
-      const ok = this._writeState(statePath, normalized)
+      // v3.531（O4-2）：report.state 每轮只为把计数器 +1 而整份原子写（含两次 fsync，本机实测
+      // 4.6~9.3 ms/轮）。
+      // 保留 tmp+rename 的原子提交（进程崩溃不丢），但跳过 fsync：这份状态是「可丢的当天累计」，
+      // 整机掉电最多丢最后一次 +1，重启后从最后一次落盘值继续。不要改成 60 秒去抖——那需要跨轮
+      // 内存态，而常驻 worker 每轮 _resetRunState 会清 _reportMemoryStateByPath，窗口内会丢计数。
+      const ok = this._writeState(statePath, normalized, { durable: false })
       // 状态写失败时保留进程内已知状态；重启后仍会重试并发出低磁盘告警。
       this._reportMemoryStateByPath.set(statePath, { state: normalized, persisted: ok })
       if (!ok) {
@@ -2068,7 +2105,7 @@ function createApp ({
             state[channel] = { consecutiveFailures: 0, lastFailureAt: 0, lastAlertAt: 0, lastRecoveredAt: now }
           }
         }
-        if (!this._writeState(statePath, state)) return
+        if (!this._writeStateIfChanged(statePath, state, stateResult.status === 'ok' ? stateResult.text : null)) return
         for (const alert of alerts) pendingAlerts.push(alert)
       } catch (e) {
       // APP2-06：「仅作观测」不等于隐身——整体异常留一行 WARN，避免通道健康状态永久不更新却一切「正常」。
@@ -2649,9 +2686,11 @@ function createApp ({
         const prewarmCount = (() => {
           // C1-026：预热发生在拿到数据之前，条目数未知——把单轮上限 maxPerRun 作为「消息总数」输入，
           // 走与并行 worker 同一个 resolveParallelWindow（不再单独夹到 10，连接数才真的与并发窗口一致）。
+          // v3.531（O4-3）：再夹一道 PREWARM_TLS_CONNECTIONS=2——96.6% 的轮次没有任何推送，按并发
+          // 窗口预建连接纯属空转（实测 120 条/分钟）；有推送时最多多 1 个握手 RTT。
           const maxPerRun = Utils.num(ctx.config.push.maxPerRun, 100)
           const batch = Number.isInteger(maxPerRun) && maxPerRun > 0 ? maxPerRun : 100
-          return resolveParallelWindow(ctx.config.push.parallelLimit, batch)
+          return Math.min(resolveParallelWindow(ctx.config.push.parallelLimit, batch), PREWARM_TLS_CONNECTIONS)
         })()
         // HEAD 预取：连接数与并发窗口对齐；signal 允许主流程结束/失败时取消未完成请求。
         const tlsWarmupPromise = Promise.resolve(prewarmTls('wxpusher.zjiecode.com', 5000, prewarmCount, signal))
@@ -2807,6 +2846,19 @@ function createApp ({
       // 只有连持久 LKG 也不可用时才回代码默认。degraded 轮不建复用基线（每轮都会重试）。
       const prepared = this._loadActiveRules(config)
       const active = prepared.active
+      // v3.531（O4-5）：规则 revision 变化 ⇒ 整表清空用户正则编译缓存（每条编译产物在 1 MB 量级，
+      // 旧条目按源码键永不归还）。同一 revision 内**不清**——保证「同一份规则重复编译仍命中缓存」
+      // 的既有语义（O1 短路下每轮只编译一次，缓存命中率不受影响）；首轮基线也清一次（缓存本为空）。
+      // degraded/source 一起进键：降级轮会换用 LKG 或代码默认，规则内容变了但 revision 可能不变。
+      const ruleRevisionKey = [
+        active.revision == null ? '' : active.revision,
+        active.degraded === true ? 'degraded' : 'ok',
+        typeof active.source === 'string' ? active.source : ''
+      ].join('|')
+      if (rulesReuse.revisionKey !== ruleRevisionKey) {
+        clearUserRegexCache()
+        rulesReuse.revisionKey = ruleRevisionKey
+      }
       ctx.rules.active = active
       // O1 可观测：reused / reloaded / forcedRecheck 是本进程累计计数（run.log 字段只加不改，这里只进
       // ctx.timings 与 profile detail 行，不改摘要行）。
@@ -3637,6 +3689,9 @@ function createApp ({
         },
         elapsed: `${elapsed}s`,
         extras: {
+          // v3.531（O4-4）：preprocess 毫秒写进摘要行（`pp=`）——elapsed 分辨率 0.1 s，O1/O2/O3 的
+          // 收益在里面看不见。只加不改：无 timings / 非数字时不写该字段。
+          preprocessMs: ctx.timings && ctx.timings.preprocessMs,
           dryRun: ctx.dryRun,
           dryRunUnpushed: items.length - push.success,
           noidentity: counters.noIdentity,
