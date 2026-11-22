@@ -33,6 +33,13 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
   // 暴露在 RuleEngine 上，注入方（deps.RuleEngine）可直接取；xbk_filter_store 那份属别的模块，本批未动。
   const PINGBITIME_MAX_DAYS = 3650000
 
+  // O1：hasNestedQuantifier 的进程内 memo（详见该方法）。上限 4096 项 **且** 总字符 4 MiB——
+  // 后者是内存护栏：单个主字段可达 160,000 字符，4096 条这种键本身就 ≈650 MB。
+  const NESTED_QUANTIFIER_MEMO_MAX = 4096
+  const NESTED_QUANTIFIER_MEMO_MAX_CHARS = 4 * 1024 * 1024
+  const nestedQuantifierMemo = new Map()
+  let nestedQuantifierMemoChars = 0
+
   let testFailWarned = false
   const RuleEngine = {
     // RULES-06：此处原有 _compileUserRegex 包装方法，全仓库（含测试）无任何调用者，
@@ -73,6 +80,25 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
      * 返回 true = 高风险（编译方应跳过/警告，避免卡死主线程）
      */
     hasNestedQuantifier (pattern) {
+      // O1：纯函数 + 同一份规则每轮被 compileRules 与 validateConfig 各扫一遍（单次 7.1 ms @160k）
+      // ⇒ 按源码字符串做进程内 memo。超上限整表清空（规则变更时整批换键，FIFO 淘汰旧键并不比
+      // 清空省事，还会让旧规则的键长期占内存）。非字符串入参不走 memo，直接交给原实现——
+      // 那里的兜底语义（v3.108 fuzz：Symbol / 抛错 toString 返回 false）必须逐字保留。
+      if (typeof pattern !== 'string') return this._scanNestedQuantifier(pattern)
+      const hit = nestedQuantifierMemo.get(pattern)
+      if (hit !== undefined) return hit
+      const result = this._scanNestedQuantifier(pattern)
+      if (nestedQuantifierMemo.size >= NESTED_QUANTIFIER_MEMO_MAX || nestedQuantifierMemoChars >= NESTED_QUANTIFIER_MEMO_MAX_CHARS) {
+        nestedQuantifierMemo.clear()
+        nestedQuantifierMemoChars = 0
+      }
+      nestedQuantifierMemo.set(pattern, result)
+      nestedQuantifierMemoChars += pattern.length
+      return result
+    },
+
+    /** 嵌套量词判据的原实现（无缓存；memo 只包一层，判据与注释逐字保留）。 */
+    _scanNestedQuantifier (pattern) {
     // v3.108 fuzz：String(Symbol) 抛 TypeError；嵌套 Symbol 的数组 String() 也崩——统一兜底
       if (pattern === undefined || pattern === null || typeof pattern === 'symbol') return false
       let s

@@ -6924,6 +6924,172 @@ checkAsync('P1-5 阶段管线推送部分失败：摘要 failed/failures 与 run
   })
 })
 
+// ===== O1：规则签名短路（真实 FilterStore + 真实 RuleEngine 驱动 _runPrepare）=====
+// 为什么必须用真实存储层/规则引擎：短路命中时要复用的是「上一轮的 active + 编译产物 + 哈希」，
+// 桩件无法证明「真的没读文件」与「真的没重编译」，只能证明我们自己写的调用形态。
+// 这里的断言口径与 specs/O1.md 一致：规则没变 ⇒ 下一轮复用同一批对象；控制台保存（原子替换）⇒
+// 下一轮必须重读并重编译（「保存后下一轮生效」的语义一字不改）。
+function makeRulesHarness (tag, dirOverride) {
+  const realFs = require('fs')
+  const { createUtils, FILTER_FIELDS } = require('./xbk_utils')
+  const { createRuleEngine } = require('./xbk_rules')
+  const FilterStore = require('./xbk_filter_store')
+  const storage = require('./xbk_storage')
+  const Utils = createUtils({ fs: realFs, safeRe: (src, flags) => new RegExp(src, flags) })
+  const compileUserRegex = (source, flags) => {
+    try { return new RegExp(source, flags) } catch (e) { return null }
+  }
+  // isRe2Available 恒 true + compileUserRegex 走 V8：本仓既有单测的同一手法（断言非法正则/编译结果
+  // 的形态，不依赖本机是否装了 re2）。
+  const RuleEngine = createRuleEngine({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Available: () => true })
+  const dir = dirOverride || mkTmpFixture(tag) // dirOverride：让第二个实例读同一个缓存目录（独立读取方）
+  const rulesFile = FilterStore.filterRulesPaths(dir).file
+  const filter = {}
+  for (const field of FILTER_FIELDS) filter[field] = ''
+  filter.pingbibiaoti = '屏蔽标题甲'
+  filter.pingbineirong = '屏蔽内容乙'
+  filter.pingbitime = '30'
+  realFs.writeFileSync(rulesFile, JSON.stringify({ schema: 1, revision: 1, filter }))
+  const Config = {
+    filter,
+    keyword: { zkt_gjc: '' },
+    cache: { dir, maxSize: 10000 },
+    domain: 'https://example.com',
+    template: { title: '{标题}', content: '{内容}' },
+    api: { timeout: 10000, retry: 1 },
+    timing: { pushInterval: 500, finalWait: 0 },
+    push: { parallelLimit: 5, maxPerRun: 100 },
+    alert: {},
+    storage: {}
+  }
+  const App = createApp({
+    Config,
+    Utils,
+    Formatter: {},
+    RuleEngine,
+    FilterEngine: {},
+    MessageStore: {
+      cacheDir: dir,
+      init: () => {},
+      readMessages: () => [],
+      saveMessages: () => true,
+      getFilePath: (name) => path.join(dir, name),
+      _readFailed: {},
+      _getTombstoneProcessStart: () => 0
+    },
+    FilterStore,
+    Network: {},
+    Pusher: {},
+    fs: realFs,
+    path,
+    crypto,
+    readSafeTextResult: storage.readSafeTextResult,
+    writeAtomic: storage.writeAtomic,
+    isRegularOrMissing: storage.isRegularOrMissing,
+    STATE_TEXT_MAX_BYTES: 262144,
+    DEFAULT_MAX_SIZE: 1048576,
+    RE2C: {},
+    RE2_WARN_STATE_FILE: 're2warn.state',
+    RE2_MISSING_WARNING: 're2 missing',
+    summarizeError: () => ({ message: '' }),
+    PROFILE3: false,
+    PROFILE3_BOOT_MARKS: [],
+    prewarmDns: () => {},
+    prewarmTls: () => {},
+    getNotify: () => Promise.resolve(null),
+    PKG_VERSION: '0.0.0',
+    trimTrailingSlashes: (s) => s,
+    compileUserRegex
+  })
+  const ctxOf = () => ({
+    dryRun: true,
+    checkpoint: () => {},
+    config: Config,
+    safeConfigText: (v) => String(v),
+    rules: { active: null, compiled: null, hash: '' },
+    timings: { fetchMs: null, preprocessMs: null, cacheMs: null },
+    warmup: { dns: null, tls: null, dnsSettled: false, tlsSettled: false, controller: null, cancelled: false }
+  })
+  return { dir, rulesFile, filter, App, ctxOf, realFs, RuleEngine }
+}
+
+// _runPrepare 会 console.debug 一行 + 可能的配置告警；用例只看 ctx，不看 stdout。
+async function runPrepareQuiet (app, ctx) {
+  const origDebug = console.debug
+  const origWarn = console.warn
+  console.debug = () => {}
+  console.warn = () => {}
+  try { await app._runPrepare(ctx) } finally {
+    console.debug = origDebug
+    console.warn = origWarn
+  }
+  return ctx
+}
+
+checkAsync('O1 规则签名：规则没变 ⇒ 第二轮跳过读盘/校验/编译，复用同一批对象（并发计数进 ctx.timings）', async () => {
+  const h = makeRulesHarness('o1-reuse-')
+  const first = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(first.rules.active.revision, 1, `首轮必须读到覆盖文件：${JSON.stringify(first.rules.active.source)}`)
+  assert.strictEqual(first.timings.rulesReloaded, 1, '首轮必须重载一次')
+  assert.strictEqual(first.timings.rulesReused, 0)
+  const second = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(second.timings.rulesReused, 1, '第二轮必须命中签名短路（ctx.timings.rulesReused）')
+  assert.strictEqual(second.timings.rulesReloaded, 1, '整个进程只应重载一次')
+  assert.strictEqual(second.rules.active, first.rules.active, '命中时必须复用同一个 active 对象')
+  assert.strictEqual(second.rules.compiled, first.rules.compiled, '命中时不得重新编译（同一对象）')
+  assert.strictEqual(second.rules.hash, first.rules.hash, '命中时 filterHash 必须复用')
+  const third = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(third.timings.rulesReused, 2, '之后每轮都命中（累计计数）')
+})
+
+checkAsync('O1 规则签名：控制台保存（原子替换）⇒ 下一轮必重读并重编译，新规则立即生效', async () => {
+  const h = makeRulesHarness('o1-save-')
+  const first = await runPrepareQuiet(h.App, h.ctxOf())
+  // 与 scripts/console.js 保存同一形态：写临时文件 + rename 覆盖（ino 必变）
+  const nextFilter = { ...h.filter, pingbibiaoti: '屏蔽标题甲-改' }
+  const tmpFile = h.rulesFile + '.tmp'
+  h.realFs.writeFileSync(tmpFile, JSON.stringify({ schema: 1, revision: 2, filter: nextFilter }))
+  h.realFs.renameSync(tmpFile, h.rulesFile)
+  const second = await runPrepareQuiet(h.App, h.ctxOf())
+  assert.strictEqual(second.timings.rulesReloaded, 2, '保存后必须发生第二次重载')
+  assert.strictEqual(second.rules.active.revision, 2, '下一轮必须读到新的 revision')
+  assert.strictEqual(second.rules.active.filter.pingbibiaoti, '屏蔽标题甲-改', '新规则必须下一轮立即生效')
+  assert.notStrictEqual(second.rules.compiled, first.rules.compiled, '规则变了必须重新编译')
+  assert.notStrictEqual(second.rules.hash, first.rules.hash, '规则变了 filterHash 必须变（否则 _f 不会失效、改宽后漏推）')
+})
+
+check('O1 filter.hash：内容没变不写盘（inode 与 mtime 都不变）；内容变了必写', () => {
+  const h = makeRulesHarness('o1-hash-')
+  const hashPath = path.join(h.dir, 'filter.hash')
+  const active = { degraded: false }
+  const cacheName = 'push.json'
+  // 期望内容由变量拼出（不是字面量断言）：本仓 CI 禁止「读文件文本再比字面量」，这里只用
+  // ①字节数（量纲）②另一个 App 实例（独立读取方）的判定 来钉住「磁盘上就是这两行」。
+  const expectedBytesOf = (hash) => Buffer.byteLength([cacheName, hash].join('\n'))
+  h.App._invalidateFilteredCache({ active, cacheName, filterHash: 'hash-1', dryRun: false })
+  const first = h.realFs.statSync(hashPath)
+  assert.strictEqual(first.size, expectedBytesOf('hash-1'), '首次必须写出「缓存名 + hash」两行（且无多余字节）')
+  h.App._invalidateFilteredCache({ active, cacheName, filterHash: 'hash-1', dryRun: false })
+  const second = h.realFs.statSync(hashPath)
+  assert.strictEqual(second.ino, first.ino, '内容没变 ⇒ 不得原子重写（inode 必须不变）')
+  assert.strictEqual(second.mtimeMs, first.mtimeMs, '内容没变 ⇒ mtime 必须不变（每轮 7.4 ms 的 fsync 要省掉）')
+  assert.strictEqual(second.size, first.size, '跳过写盘不得改动内容（字节数不变）')
+  // 独立读取方：同目录另起一个 App 实例（等价于「下一轮换了个进程」）用同一 hash 也必须判定
+  // 「已是最新」⇒ 磁盘上确实是本轮写的那两行；不是的话它会重写（inode 变）。
+  const peer = makeRulesHarness('o1-hash-peer-', h.dir)
+  peer.App._invalidateFilteredCache({ active, cacheName, filterHash: 'hash-1', dryRun: false })
+  assert.strictEqual(peer.realFs.statSync(hashPath).ino, first.ino,
+    '另一个实例用同一 hash 必须也跳过写盘（磁盘内容确实是那两行）')
+  // 规则变了（hash 变）⇒ 必须写
+  h.App._invalidateFilteredCache({ active, cacheName, filterHash: 'hash-2', dryRun: false })
+  const third = h.realFs.statSync(hashPath)
+  assert.strictEqual(third.size, expectedBytesOf('hash-2'), '内容变了必须写出新的两行')
+  assert.notStrictEqual(third.ino, first.ino, '内容变了必须走原子重写（inode 变）')
+  assert.notStrictEqual(third.mtimeMs, first.mtimeMs, '内容变了 mtime 必须变')
+  peer.App._invalidateFilteredCache({ active, cacheName, filterHash: 'hash-2', dryRun: false })
+  assert.strictEqual(peer.realFs.statSync(hashPath).ino, third.ino, '独立读取方确认新内容已落盘（同样跳过）')
+})
+
 // ===== 异步用例执行（必须留在文件末尾）=====
 // F3 自检探针：恒返回 'skip' 的 async 用例。drain 的 skip 分支（`if (await fn() === 'skip') continue`）
 // 必须被断言锁住——探针被计成 passed 时下面的自检与声明数对账同时变红。

@@ -65,6 +65,9 @@ const {
   validateFilterRules,
   mergeActiveFilter,
   loadFilterRules,
+  // O1：签名短路入口与它的进程内状态工厂（签名为 (dev,ino,size,mtimeNs,ctimeNs)）
+  loadFilterRulesCached,
+  createRulesReuseCache,
   writeLastGoodFile,
   readLastGood,
   writeAppliedSnapshot,
@@ -697,6 +700,217 @@ test('每次 load 重新读盘（不缓存 activeFilter，只缓存 last-known-g
   assert.strictEqual(second.source, 'override')
   assert.strictEqual(second.revision, 2)
   assert.strictEqual(second.filter.pingbibiaoti, '第二版', '第二轮必须读到新文件内容（不得复用上一轮对象）')
+})
+
+// ===== O1：签名短路（loadFilterRulesCached）=====
+// 守三条硬约束：① 签名没变 ⇒ 规则文件读取次数为 0（用注入的 readRulesFile 计数，与生产同一调用点）；
+// ② 文件一变（mtime / ino / size 任一）立刻重载；③ 签名被「人为保留」时第 61 轮仍按内容复核兜底。
+// 计数器同时覆盖「重载轮的那次内容哈希读」——命中短路必须一次都不读。
+const countingReader = (counter) => (file) => {
+  counter.reads += 1
+  try {
+    return { status: 'ok', text: fs.readFileSync(file, 'utf8'), error: null }
+  } catch (e) {
+    return { status: e && e.code === 'ENOENT' ? 'missing' : 'ioError', text: null, error: e }
+  }
+}
+const reuseDeps = (counter, extra) => ({ ...deps, readRulesFile: countingReader(counter), ...(extra || {}) })
+const reuseOptions = (dir, counter, cache, extraDeps) => ({
+  cacheDir: dir,
+  defaults: DEFAULTS,
+  keyword: {},
+  deps: reuseDeps(counter, extraDeps),
+  cache
+})
+const writeRules = (dir, revision, title) => {
+  writeJson(filterRulesPaths(dir).file, { schema: 1, revision, filter: { pingbibiaoti: title } })
+}
+
+test('O1 签名短路：签名不变 ⇒ 规则文件读取 0 次、复用同一个 active（不重读/不重校验/不写 LKG）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeRules(dir, 3, '第一版')
+  const counter = { reads: 0 }
+  const cache = createRulesReuseCache()
+  const opts = reuseOptions(dir, counter, cache)
+  const first = loadFilterRulesCached(opts)
+  assert.strictEqual(first.reused, false, '首轮没有「上一轮」，必须真读')
+  assert.strictEqual(first.active.source, 'override')
+  assert.ok(counter.reads >= 1, `首轮必须真的读过覆盖文件（实测 ${counter.reads} 次）`)
+  const readsAfterFirst = counter.reads
+  const second = loadFilterRulesCached(opts)
+  assert.strictEqual(second.reused, true, '签名没变必须命中短路')
+  assert.strictEqual(counter.reads, readsAfterFirst,
+    `命中短路时规则文件读取次数必须为 0（实测新增 ${counter.reads - readsAfterFirst} 次）`)
+  assert.strictEqual(second.active, first.active,
+    '命中时必须原样复用上一轮的 active 对象（不是重新解析出内容相同的新对象）')
+  assert.strictEqual(second.counters.reloaded, 1, '只有首轮发生过重载')
+  assert.strictEqual(second.counters.reused, 1, '第二轮必须记一次 reused')
+  // 对照：同一份文件走普通 loadFilterRules 仍每轮读盘（签名短路只在新入口里，不改变旧契约）
+  const plainBefore = counter.reads
+  loadFilterRules({ cacheDir: dir, defaults: DEFAULTS, keyword: {}, deps: reuseDeps(counter) })
+  assert.ok(counter.reads > plainBefore, '普通 loadFilterRules 必须照旧每轮读盘（本次不改变它的语义）')
+})
+
+test('O1 签名短路：mtime 变（内容一字不改）⇒ 必重读，不得继续用旧 active', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeRules(dir, 4, '第一版')
+  const counter = { reads: 0 }
+  const cache = createRulesReuseCache()
+  const opts = reuseOptions(dir, counter, cache)
+  const first = loadFilterRulesCached(opts)
+  assert.strictEqual(first.reused, false)
+  const readsAfterFirst = counter.reads
+  // 只动时间戳（mtime 推到 5 秒后）：ino/size 不变，签名里只有时间维度变化 ⇒ 仍必须重读
+  const future = new Date(Date.now() + 5000)
+  fs.utimesSync(file, future, future)
+  const second = loadFilterRulesCached(opts)
+  assert.strictEqual(second.reused, false, 'mtime 变了就必须重读（不能只看 ino/size）')
+  assert.ok(counter.reads > readsAfterFirst, '重载轮必须真的读了覆盖文件')
+  assert.notStrictEqual(second.active, first.active, '重载不得返回上一轮那个对象')
+  assert.strictEqual(second.active.revision, 4, '重读的仍是同一份合法规则')
+})
+
+test('O1 签名短路：原子替换（inode 变、size 不变）⇒ 必重读并读到新内容', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeRules(dir, 5, '第一版')
+  const beforeStat = fs.statSync(file)
+  const counter = { reads: 0 }
+  const cache = createRulesReuseCache()
+  const opts = reuseOptions(dir, counter, cache)
+  const first = loadFilterRulesCached(opts)
+  assert.strictEqual(first.reused, false)
+  const readsAfterFirst = counter.reads
+  // 控制台保存的真实形态：写临时文件再 rename 覆盖。内容长度刻意保持一致（revision 5→6、等长标题），
+  // 这样这条用例只会被「inode 变」抓住——size 相同，盯的就是签名里的 ino。
+  const tmpFile = path.join(dir, 'filter-rules.json.tmp')
+  writeJson(tmpFile, { schema: 1, revision: 6, filter: { pingbibiaoti: '第二版' } })
+  fs.renameSync(tmpFile, file)
+  const afterStat = fs.statSync(file)
+  assert.strictEqual(afterStat.size, beforeStat.size, '前置：只让 inode 变（size 必须相同，否则测的是 size 不是 ino）')
+  assert.notStrictEqual(afterStat.ino, beforeStat.ino, '前置：原子替换必须换掉 inode')
+  const second = loadFilterRulesCached(opts)
+  assert.strictEqual(second.reused, false, 'ino 变了必须重读')
+  assert.ok(counter.reads > readsAfterFirst, '重载轮必须真的读了覆盖文件')
+  assert.strictEqual(second.active.revision, 6)
+  assert.strictEqual(second.active.filter.pingbibiaoti, '第二版', '必须读到替换后的新规则')
+})
+
+test('O1 签名短路：原地追加（ino 不变、size 变）⇒ 必重读', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  const file = filterRulesPaths(dir).file
+  writeRules(dir, 7, '第一版')
+  // 同一 fd 上 fstat/write，避免 CodeQL js/file-system-race 的 check-then-use：
+  // 路径级 statSync + appendFileSync 是两次独立解析，检查的文件与写入的文件可能不是同一个。
+  const fd = fs.openSync(file, 'a')
+  try {
+    const beforeStat = fs.fstatSync(fd)
+    const counter = { reads: 0 }
+    const cache = createRulesReuseCache()
+    const opts = reuseOptions(dir, counter, cache)
+    const first = loadFilterRulesCached(opts)
+    assert.strictEqual(first.reused, false)
+    const readsAfterFirst = counter.reads
+    fs.writeSync(fd, ' ') // JSON 根值之后的空白仍是合法 JSON（parseStoredRules 照常解析）
+    const afterStat = fs.fstatSync(fd)
+    assert.strictEqual(afterStat.ino, beforeStat.ino, '前置：原地追加不得换 inode（否则测的是 ino 不是 size）')
+    assert.ok(afterStat.size > beforeStat.size, '前置：size 必须变大')
+    const second = loadFilterRulesCached(opts)
+    assert.strictEqual(second.reused, false, 'size 变了必须重读')
+    assert.ok(counter.reads > readsAfterFirst, '重载轮必须真的读了覆盖文件')
+    assert.strictEqual(second.active.revision, 7)
+  } finally {
+    fs.closeSync(fd)
+  }
+})
+
+test('O1 兜底复核：签名被冻结（mtime/ino 未变）但字节被改 ⇒ 第 61 轮强制复核并重载生效', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeRules(dir, 9, 'AAAA')
+  const counter = { reads: 0 }
+  // 签名桩恒返回同一个签名：模拟「mtime/ino 被人为保留、字节却变了」（保留时间戳的保存、备份回填）
+  const frozenSignature = { status: 'ok', signature: 'frozen' }
+  const cache = createRulesReuseCache()
+  const opts = reuseOptions(dir, counter, cache, { statRulesFile: () => frozenSignature })
+  const first = loadFilterRulesCached(opts)
+  assert.strictEqual(first.reused, false, '首轮必须真读')
+  assert.strictEqual(first.counters.forcedRecheck, 0)
+  // 就地改字节（签名桩不变 ⇒ 只看签名的实现会一直复用旧规则）
+  writeRules(dir, 10, 'BBBB')
+  let last = null
+  for (let round = 2; round <= 60; round += 1) {
+    last = loadFilterRulesCached(opts)
+    assert.strictEqual(last.reused, true, `第 ${round} 轮必须命中短路（签名没变）`)
+    assert.strictEqual(last.active.revision, 9, `第 ${round} 轮不得提前看到未复核的内容`)
+  }
+  assert.strictEqual(last.counters.forcedRecheck, 0, '第 2..60 轮不得触发强制复核')
+  const readsBefore61 = counter.reads
+  const round61 = loadFilterRulesCached(opts)
+  assert.strictEqual(round61.counters.forcedRecheck, 1, '第 61 轮必须做一次强制内容复核')
+  assert.ok(counter.reads > readsBefore61, '强制复核必须真的读了内容（不是只看签名）')
+  assert.strictEqual(round61.reused, false, '复核发现字节变了 ⇒ 必须重载，不得继续复用')
+  assert.strictEqual(round61.active.revision, 10, '重载必须生效被篡改后的内容（复核不是白读）')
+  assert.strictEqual(round61.active.filter.pingbibiaoti, 'BBBB')
+})
+
+test('O1 兜底复核：签名不变且内容一致 ⇒ 第 61 轮复核后仍复用（不误判成变更）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeRules(dir, 11, '不变的内容')
+  const counter = { reads: 0 }
+  const frozenSignature = { status: 'ok', signature: 'frozen-2' }
+  const cache = createRulesReuseCache()
+  const opts = reuseOptions(dir, counter, cache, { statRulesFile: () => frozenSignature })
+  const first = loadFilterRulesCached(opts)
+  for (let round = 2; round <= 60; round += 1) loadFilterRulesCached(opts)
+  const readsBefore61 = counter.reads
+  const round61 = loadFilterRulesCached(opts)
+  assert.strictEqual(round61.counters.forcedRecheck, 1, '第 61 轮必须复核')
+  assert.ok(counter.reads > readsBefore61, '复核必须读一次内容')
+  assert.strictEqual(round61.reused, true, '内容与基线一致 ⇒ 复核后仍复用上一轮对象')
+  assert.strictEqual(round61.active, first.active, '复用必须是同一个对象')
+  assert.strictEqual(round61.counters.reloaded, 1, '复核通过不得触发重载')
+})
+
+test('O1 签名短路：降级（损坏）轮不建基线，下一轮必须重试（不得把 corrupt 结果缓存住）', () => {
+  resetStoreStateForTests()
+  const dir = makeDir()
+  writeRaw(filterRulesPaths(dir).file, '{ 坏掉的 JSON')
+  const counter = { reads: 0 }
+  const cache = createRulesReuseCache()
+  const opts = reuseOptions(dir, counter, cache)
+  const first = loadFilterRulesCached(opts)
+  assert.strictEqual(first.active.degraded, true, '前置：这份文件必须是降级读')
+  assert.strictEqual(cache.signature, '', '降级结果不得成为复用基线')
+  const readsAfterFirst = counter.reads
+  const second = loadFilterRulesCached(opts)
+  assert.strictEqual(second.reused, false, '损坏轮必须每轮重试（用户可能正在修文件）')
+  assert.ok(counter.reads > readsAfterFirst, '重试必须真的重读文件')
+  assert.strictEqual(second.active.degraded, true)
+})
+
+test('O1 hasNestedQuantifier memo：缓存不改变判定（逐条等于无缓存实现），非字符串入参仍走原兜底', () => {
+  const samples = [
+    '(a+)+', '(a|aa)+', '(a?)+', '(a|aa){30}', '(a)+', '普通关键词',
+    '[^(a+)+]x', '^(?:a+)+$', 'a'.repeat(2000) + '(b+)+', '\\\\(a+\\\\)'
+  ]
+  for (const sample of samples) {
+    const cached = RuleEngine.hasNestedQuantifier(sample)
+    assert.strictEqual(cached, RuleEngine._scanNestedQuantifier(sample),
+      `「${sample.slice(0, 30)}」的 memo 结果必须与无缓存实现一致`)
+    assert.strictEqual(RuleEngine.hasNestedQuantifier(sample), cached, '同一输入的重复调用必须稳定')
+  }
+  // 非字符串入参不进 memo，必须保留 v3.108 fuzz 的兜底语义
+  assert.strictEqual(RuleEngine.hasNestedQuantifier(undefined), false)
+  assert.strictEqual(RuleEngine.hasNestedQuantifier(null), false)
+  assert.strictEqual(RuleEngine.hasNestedQuantifier(Symbol('x')), false)
+  assert.strictEqual(RuleEngine.hasNestedQuantifier(['(a+)+']), true, '数组经 String() 后仍按正则判据处理')
 })
 
 test('损坏 → 优先 last-known-good（revision 沿用，degraded/lastGoodUsed 标记）', () => {

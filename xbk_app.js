@@ -102,6 +102,15 @@ function createApp ({
     return Math.max(1, Math.min(base, MAX_PARALLEL_WORKERS))
   }
   const lockWaiter = new Int32Array(new SharedArrayBuffer(4))
+  // O1：规则签名短路的进程内状态——**只有**本 App 实例的「上一轮」。
+  // 常驻 worker 同一进程多轮共用（命中时连编译产物/告警一起复用）；控制台每轮 spawn 的新进程
+  // 天然没有上一轮（首轮 miss 是预期形态）。禁止持久化到磁盘：跨进程的「上一轮」不存在。
+  const rulesReuse = {
+    cache: FilterStore && typeof FilterStore.createRulesReuseCache === 'function' ? FilterStore.createRulesReuseCache() : null,
+    compiled: null, // 上一轮 compileRules 的产物（与 cache.active 同一份规则的编译结果）
+    hash: '', // 上一轮 Utils.filterHash 的结果
+    warnings: null // 上一轮 validateConfig 的告警数组（同一份规则 + 同一份 Config ⇒ 逐字相同）
+  }
   // C1-013：O_EXCL 文件锁的**唯一**实现与唯一常数来源。run.log / RE2 标记 / 通道健康此前各写
   // 一遍「独占创建 + pid:start 令牌 + mtime 超龄 + 持有进程存活复核 + 抢占重开」，常数也各写一份
   // （通道健康把 10000 写死成字面量，run.log 与 RE2 各有一份 LOCK_STALE_MS，deadline/退避也是
@@ -2151,7 +2160,16 @@ function createApp ({
       // C1-016：写入结果此前被丢弃——hash 没落盘就等于本轮没记录「已生效规则」，下一轮会
       // 重新走规则变更检测（清 _f 后重复推送的风险方向是「多推」，不是漏推），但运维看不到
       // 「规则改了却没生效记录」。这里接住失败并留痕，语义不变（不会因失败改判本轮推送）。
-        if (!this._writeTextAtomic(hashPath, `${cacheName}\n${filterHash}`)) {
+      // O1：内容没变就不写盘——这 31 B 的原子重写要建临时文件 + 写 + fsync(fd) + rename + 目录
+      // fsync（实测 7.39 ms/轮），而内容在两次规则变更之间恒定（线上 inode 每 5.3 s 变一次）。
+      // 判据是「磁盘现有内容读起来就是本轮要写的那两行」：逐字比较，只额外容忍末尾恰好多一个换行
+      // （读侧是 trim().split('\n')，对它和少一个换行等价，为它重写一次没有意义）；其余任何差异
+      // （多一行、多空格、别的 hash）都照旧写。读不到旧内容（missing/ioError/unsafe/tooLarge）时
+      // 一律照旧写，绝不因为「比不出来」而跳过。
+        const nextHashText = `${cacheName}\n${filterHash}`
+        const currentHashText = hashResult.status === 'ok' && typeof hashResult.text === 'string' ? hashResult.text : null
+        const hashAlreadyCurrent = currentHashText === nextHashText || currentHashText === nextHashText + '\n'
+        if (!hashAlreadyCurrent && !this._writeTextAtomic(hashPath, nextHashText)) {
           console.warn(`⚠️ 过滤规则 hash 写入失败（${hashPath}），本轮不记录已生效规则；下次运行会重新检测规则变更并重试`)
           this._writeRunLog(`${this._localStamp()} WARN 过滤规则 hash 写入失败：${hashPath}（下次运行重新检测并重试）\n`)
         }
@@ -2558,7 +2576,7 @@ function createApp ({
         safeConfigText: (value) => {
           try { return String(value) } catch (e) { return '<不可转换值>' }
         },
-        // 生效过滤规则：active 每轮新建、只读一次；compiled/hash 是同一份 active 的编译产物
+        // 生效过滤规则：每轮只绑定一次、调用方必须只读不得原地修改（O1 命中时 active/compiled/hash 都是上一轮同一个对象，跨轮共享）
         rules: { active: null, compiled: null, hash: '' },
         // 计时（抓取/预处理/落盘三段，统计行与 profile 行共用）
         timings: { fetchMs: null, preprocessMs: null, cacheMs: null },
@@ -2736,6 +2754,27 @@ function createApp ({
       }
     },
 
+    /** O1：读本轮生效规则——覆盖文件签名没变就复用上一轮的 active（不读文件、不深校验、不写 LKG）。
+     *  返回 `{ active, reused, forcedRecheck, counters }`；counters 是**本进程累计**的
+     *  reused/reloaded/forcedRecheck（并入 ctx.timings，供常驻形态观测命中率）。
+     *  FilterStore 没有签名入口时（单测桩只实现 loadFilterRules）退回每轮完整加载，语义不变。 */
+    _loadActiveRules (config) {
+      const options = {
+        cacheDir: this._cacheDir(),
+        defaults: config.filter,
+        keyword: config.keyword,
+        // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
+        // 会被当成 last-known-good，而运行期 compileRules 跳过坏规则后本方法仍推进 filter.hash
+        // 并清 _f ⇒ 被过滤记录补推且无损坏告警。缺 RE2 时 FilterStore 自行跳过深度校验
+        // （读路径仍能读合法文件），故这里传 re2Available 而不是让存储层猜。
+        deps: { RuleEngine, compileUserRegex, re2Available: Boolean(RE2C) }
+      }
+      if (rulesReuse.cache && typeof FilterStore.loadFilterRulesCached === 'function') {
+        return FilterStore.loadFilterRulesCached({ ...options, cache: rulesReuse.cache })
+      }
+      return { active: FilterStore.loadFilterRules(options), reused: false, forcedRecheck: false, counters: null }
+    },
+
     // ① 准备：缓存目录/磁盘自检、读本轮生效的过滤规则、校验配置、编译规则、写生效快照。
     // 同时启动通知通道后台预热（旧实现在业务体之前就发起，这里顺序不变）。
     async _runPrepare (ctx) {
@@ -2755,24 +2794,27 @@ function createApp ({
       this._warnLowDisk()
       checkpoint('disk-check')
 
-      // ①′ 每轮读取过滤规则覆盖文件（<cacheDir>/filter-rules.json）——「保存后下一轮生效」的唯一入口。
-      // 必须放在本轮开头且只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则；
-      // active 每轮新建，禁止提升到模块级（否则常驻进程会跨轮陈旧，控制台的修改永不生效）。
+      // ①′ 读取过滤规则覆盖文件（<cacheDir>/filter-rules.json）——「保存后下一轮生效」的唯一入口。
+      // 每轮只读一次：正在跑的一轮始终使用同一个局部 active，不在中途换规则。
+      // O1：常驻进程内按覆盖文件签名短路——签名（dev/ino/size/mtimeNs/ctimeNs）与上一轮相同就
+      // 直接复用上一轮的 active（不读 82 KB、不深校验、不写 LKG），每 60 轮另按内容 sha256 强制
+      // 复核一次。状态挂在 createApp 闭包里（进程内「上一轮」），绝不跨进程持久化：控制台每 5 秒
+      // spawn 的新进程没有上一轮，首轮 miss 是预期形态。控制台保存走原子 rename ⇒ ino 必变 ⇒
+      // 下一轮必然重载，这条语义由 loadFilterRulesCached 与用例同时守住。
       // FilterStore.loadFilterRules 契约不抛错：覆盖文件损坏时返回 source:'corrupt' + degraded:true，
       // 降级顺序是「进程内缓存 → 持久 LKG <缓存目录>/filter-rules.lastgood.json → 代码默认」：
       // 新进程（控制台 auto-run 每 5 秒 spawn 一轮）没有进程内缓存，仍会先读持久 LKG，
-      // 只有连持久 LKG 也不可用时才回代码默认。
-      const active = FilterStore.loadFilterRules({
-        cacheDir: this._cacheDir(),
-        defaults: config.filter,
-        keyword: config.keyword,
-        // Sourcery #256 A1：读路径也做深度校验（非法正则/嵌套量词）。只过结构校验的手工编辑文件
-        // 会被当成 last-known-good，而运行期 compileRules 跳过坏规则后本方法仍推进 filter.hash
-        // 并清 _f ⇒ 被过滤记录补推且无损坏告警。缺 RE2 时 FilterStore 自行跳过深度校验
-        // （读路径仍能读合法文件），故这里传 re2Available 而不是让存储层猜。
-        deps: { RuleEngine, compileUserRegex, re2Available: Boolean(RE2C) }
-      })
+      // 只有连持久 LKG 也不可用时才回代码默认。degraded 轮不建复用基线（每轮都会重试）。
+      const prepared = this._loadActiveRules(config)
+      const active = prepared.active
       ctx.rules.active = active
+      // O1 可观测：reused / reloaded / forcedRecheck 是本进程累计计数（run.log 字段只加不改，这里只进
+      // ctx.timings 与 profile detail 行，不改摘要行）。
+      if (prepared.counters) {
+        ctx.timings.rulesReused = prepared.counters.reused
+        ctx.timings.rulesReloaded = prepared.counters.reloaded
+        ctx.timings.rulesForcedRecheck = prepared.counters.forcedRecheck
+      }
       if (active.degraded) {
         // 三处告警之一（console.warn / run.log WARN / 控制台红条由 console 侧读 GET source 呈现）。
         // 降级不放宽规则、不把规则置空，也不进入下方的 filter.hash 比对/_f 清理（见 ③b 的 !active.degraded 闸）。
@@ -2783,10 +2825,17 @@ function createApp ({
       }
 
       // ① 校验配置
-      const warnings = RuleEngine.validateConfig({ ...active.filter, zkt_gjc: active.keyword.zkt_gjc })
+      // O1：命中签名短路时复用上一轮的告警数组——同一份规则字节 + 同一份 Config ⇒ validateConfig
+      // 的产物逐字相同；未命中才真跑一遍。两种情况都按同一顺序打印，线上告警文案与频率不变
+      // （zkt_gjc 仍从本轮生效的 keyword 传入，口径不变）。
+      const reuseWarnings = prepared.reused === true && Array.isArray(rulesReuse.warnings)
+      const warnings = reuseWarnings
+        ? rulesReuse.warnings
+        : RuleEngine.validateConfig({ ...active.filter, zkt_gjc: active.keyword.zkt_gjc })
       // CodeRabbit：zkt_gjc 在 keyword 下（validateConfig 只收 filter 配置时该字段恒为 undefined，
       // 首尾空白/非法正则告警在正常执行时永不触发）——显式传入本轮生效的 keyword 使告警生效
       for (const w of warnings) console.warn(w)
+      if (!reuseWarnings) rulesReuse.warnings = warnings
 
       // 校验缓存 maxSize（#7）：函数层已回退默认，配置层补提示（validateConfig 只接收 filter，此处兜底完整 Config）
       // v3.175：字符串 maxSize（'10000' 环境变量）曾误报——用 Utils.num 口径
@@ -2825,13 +2874,26 @@ function createApp ({
       checkpoint('config-validated')
 
       // ② 预编译规则（只执行一次）
-      const compiledRules = RuleEngine.compileRules(active.filter)
-      ctx.rules.compiled = compiledRules
+      // O1：命中签名短路时复用上一轮的编译产物与哈希——同一份 active（对象都还是同一个）必然编译出
+      // 同一份结果，filterHash 也只由它派生。未命中才真编译一次。
+      if (prepared.reused && rulesReuse.compiled) {
+        ctx.rules.compiled = rulesReuse.compiled
+      } else {
+        const compiledRules = RuleEngine.compileRules(active.filter)
+        ctx.rules.compiled = compiledRules
+        rulesReuse.compiled = compiledRules
+      }
       checkpoint('rules-compiled')
 
       // 生效哈希只算一次：既用于写 applied 快照，也用于 ③b 的 filter.hash 比对（原 1125 处复用本值）。
-      const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(compiledRules))
-      ctx.rules.hash = filterHash
+      // O1：命中短路时连哈希一起复用（它只由 active.filter / zkt_gjc / 编译状态派生，三者都没变）。
+      if (prepared.reused && rulesReuse.hash) {
+        ctx.rules.hash = rulesReuse.hash
+      } else {
+        const filterHash = Utils.filterHash(active.filter, active.keyword.zkt_gjc, RuleEngine.compileStateOf(ctx.rules.compiled))
+        ctx.rules.hash = filterHash
+        rulesReuse.hash = filterHash
+      }
       // 生效快照：证明「本轮实际用的是哪一版规则」，供控制台显示「已生效 rN」。写失败只告警，绝不抛穿本轮推送。
       if (!FilterStore.writeAppliedSnapshot({
         cacheDir: this._cacheDir(),
@@ -2839,7 +2901,7 @@ function createApp ({
         keyword: active.keyword,
         revision: active.revision,
         source: active.source,
-        hash: filterHash,
+        hash: ctx.rules.hash,
         // F4-1：把「本轮是否沿用了持久 LKG」一起写进快照——控制台 GET 只认这个运行侧事实，
         // 不得用控制台进程自己的 lastGood 冒充。
         lastGoodUsed: active.lastGoodUsed
@@ -3526,7 +3588,11 @@ function createApp ({
           const warmupElapsed = (w) => Number.isFinite(w && w.elapsedMs) ? `${(w.elapsedMs / 1000).toFixed(3)}s` : 'n/a'
           const warmupText = dnsWarmup ? `${dnsWarmup.skipped ? '跳过' : (dnsWarmup.ok ? '成功' : '失败')} ${warmupElapsed(dnsWarmup)}${dnsWarmup.family ? ` IPv${dnsWarmup.family}` : ''}` : 'n/a'
           const tlsText = tlsWarmup ? `${tlsWarmup.skipped ? '跳过' : `${tlsWarmup.okCount}/${tlsWarmup.count} 成功`} ${warmupElapsed(tlsWarmup)}` : 'n/a'
-          console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, ctx.timings.preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(ctx.timings.cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(config.timing.finalWait, 0) / 1000).toFixed(3)}s`)
+          // O1：规则签名短路的进程内累计命中率（只加字段，既有字段一字不改）。
+          const rulesReuseText = Number.isFinite(ctx.timings.rulesReused)
+            ? ` | 规则复用: reuse=${ctx.timings.rulesReused} reload=${ctx.timings.rulesReloaded} recheck=${ctx.timings.rulesForcedRecheck}`
+            : ''
+          console.log(`  [profile detail] DNS预热: ${warmupText} | TLS预取: ${tlsText} | 预处理: ${(Math.max(0, ctx.timings.preprocessMs || 0) / 1000).toFixed(3)}s | 缓存写入: ${(ctx.timings.cacheMs || 0) / 1000}s | 收尾等待: ${(Utils.num(config.timing.finalWait, 0) / 1000).toFixed(3)}s${rulesReuseText}`)
         }
       }
       ctx.dumpCheckpoints()
