@@ -805,21 +805,28 @@ test('O1 签名短路：原地追加（ino 不变、size 变）⇒ 必重读', (
   const dir = makeDir()
   const file = filterRulesPaths(dir).file
   writeRules(dir, 7, '第一版')
-  const beforeStat = fs.statSync(file)
-  const counter = { reads: 0 }
-  const cache = createRulesReuseCache()
-  const opts = reuseOptions(dir, counter, cache)
-  const first = loadFilterRulesCached(opts)
-  assert.strictEqual(first.reused, false)
-  const readsAfterFirst = counter.reads
-  fs.appendFileSync(file, ' ') // JSON 根值之后的空白仍是合法 JSON（parseStoredRules 照常解析）
-  const afterStat = fs.statSync(file)
-  assert.strictEqual(afterStat.ino, beforeStat.ino, '前置：原地追加不得换 inode（否则测的是 ino 不是 size）')
-  assert.ok(afterStat.size > beforeStat.size, '前置：size 必须变大')
-  const second = loadFilterRulesCached(opts)
-  assert.strictEqual(second.reused, false, 'size 变了必须重读')
-  assert.ok(counter.reads > readsAfterFirst, '重载轮必须真的读了覆盖文件')
-  assert.strictEqual(second.active.revision, 7)
+  // 同一 fd 上 fstat/write，避免 CodeQL js/file-system-race 的 check-then-use：
+  // 路径级 statSync + appendFileSync 是两次独立解析，检查的文件与写入的文件可能不是同一个。
+  const fd = fs.openSync(file, 'a')
+  try {
+    const beforeStat = fs.fstatSync(fd)
+    const counter = { reads: 0 }
+    const cache = createRulesReuseCache()
+    const opts = reuseOptions(dir, counter, cache)
+    const first = loadFilterRulesCached(opts)
+    assert.strictEqual(first.reused, false)
+    const readsAfterFirst = counter.reads
+    fs.writeSync(fd, ' ') // JSON 根值之后的空白仍是合法 JSON（parseStoredRules 照常解析）
+    const afterStat = fs.fstatSync(fd)
+    assert.strictEqual(afterStat.ino, beforeStat.ino, '前置：原地追加不得换 inode（否则测的是 ino 不是 size）')
+    assert.ok(afterStat.size > beforeStat.size, '前置：size 必须变大')
+    const second = loadFilterRulesCached(opts)
+    assert.strictEqual(second.reused, false, 'size 变了必须重读')
+    assert.ok(counter.reads > readsAfterFirst, '重载轮必须真的读了覆盖文件')
+    assert.strictEqual(second.active.revision, 7)
+  } finally {
+    fs.closeSync(fd)
+  }
 })
 
 test('O1 兜底复核：签名被冻结（mtime/ino 未变）但字节被改 ⇒ 第 61 轮强制复核并重载生效', () => {
