@@ -4391,13 +4391,15 @@ function fieldErrorMap (errors) {
   return map
 }
 
-// 补推口径（规格 §4.4，v3.524）：服务端单次最多扫 200 ms 或 200 条 `_f`（先到者），capped 时
-// 显示「≥已扫条数」——**不得再写死 5000**（旧文案会谎报「≥5000」，而预算先到的是 200 条/200ms）。
+// 补推口径（规格 §4.4，v3.524）：服务端单次最多扫 200 ms 或 200 条 `_f`（先到者）。capped 时
+// **reEvalCount 才是补推数的下界**（还有记录没扫到），显示「≥reEvalCount」——不得用 scanned
+// 冒充补推数：扫 200 条、0 条命中时那样会说成「≥200」，把 0 虚报成 200。也**不得再写死 5000**
+// （旧文案会谎报「≥5000」，而预算先到的是 200 条/200ms）。
 // 缓存读不到时服务端回 available:false（scanned/reEvalCount 为 null）——此时显示「未知」，
 // 不能把 null 格式化成 0 条（那等于把「读不到」说成「没有影响」）。
 function reEvalText (preview) {
   if (preview && preview.available === false) return '无法读取推送历史，本次不显示补推估算'
-  const n = preview && preview.capped === true ? `≥${fmtNum(preview.scanned)}` : fmtNum(preview ? preview.reEvalCount : null)
+  const n = preview && preview.capped === true ? `≥${fmtNum(preview.reEvalCount)}` : fmtNum(preview ? preview.reEvalCount : null)
   return `将重评 ${n} 条历史被过滤记录，后续每轮最多补推 Config.push.maxPerRun（默认 100）条。`
 }
 

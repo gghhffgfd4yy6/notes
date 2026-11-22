@@ -3424,6 +3424,34 @@ async function filterRuleApiTests () {
     assert.strictEqual(first.consequent.type, 'ReturnStatement', '该分支必须直接返回文案')
     assert.ok(stringValuesOf(first.consequent).includes('无法读取推送历史，本次不显示补推估算'),
       'available===false 时必须返回「无法读取推送历史」而不是格式化 0 条')
+    // ①b 补推条数口径（r3-C must_fix）：capped 只表示「还有记录没扫到」，补推下界是 reEvalCount；
+    //     scanned 是「扫了多少条」，拿它当「将重评」数量会把「扫 200 条 / 0 条命中」说成「≥200」。
+    const scannedRefs = findAll(reEval, (n) => n.type === 'MemberExpression' && memberPath(n) === 'preview.scanned')
+    assert.deepStrictEqual(scannedRefs.map((n) => n.loc.start.line), [],
+      'capped 时补推下界必须用 reEvalCount，不能用 scanned：reEvalText 内不得读取 preview.scanned（横扫断言：把已扫描条数当补推数即红）')
+    // 同一个三元表达式的两个分支都必须落回 reEvalCount（capped 只是多一个「≥」前缀表示下界）。
+    const countCond = findFirst(reEval.body, (n) => n.type === 'ConditionalExpression' &&
+      n.test.type === 'LogicalExpression' && n.test.operator === '&&' &&
+      memberPath(n.test.left) === 'preview' &&
+      n.test.right.type === 'BinaryExpression' && n.test.right.operator === '===' &&
+      memberPath(n.test.right.left) === 'preview.capped' && n.test.right.right.value === true)
+    assert.ok(countCond, 'reEvalText 必须按 preview.capped === true 分支决定是否加「≥」前缀')
+    const cappedTpl = countCond.consequent
+    assert.strictEqual(cappedTpl.type, 'TemplateLiteral', 'capped 分支必须返回带前缀的模板（「≥N」）')
+    assert.strictEqual(cappedTpl.quasis[0].value.cooked, '≥', 'capped 分支的前缀必须恰是「≥」（表示下界）')
+    assert.strictEqual(cappedTpl.expressions.length, 1, 'capped 分支的模板只允许一个插值（条数本身）')
+    const cappedNum = cappedTpl.expressions[0]
+    assert.strictEqual(cappedNum.type, 'CallExpression')
+    assert.strictEqual(memberPath(cappedNum.callee), 'fmtNum')
+    assert.strictEqual(memberPath(cappedNum.arguments[0]), 'preview.reEvalCount',
+      'capped 时补推下界必须用 reEvalCount，不能用 scanned')
+    const exactNum = countCond.alternate
+    assert.strictEqual(exactNum.type, 'CallExpression', '非 capped 分支必须直接格式化精确条数')
+    assert.strictEqual(memberPath(exactNum.callee), 'fmtNum')
+    const exactArg = exactNum.arguments[0]
+    assert.strictEqual(exactArg.type, 'ConditionalExpression', 'preview 可能为 null：必须先判 preview 再取 reEvalCount')
+    assert.strictEqual(memberPath(exactArg.consequent), 'preview.reEvalCount', '非 capped 分支必须取精确的 preview.reEvalCount')
+    assert.strictEqual(exactArg.alternate.value, null, 'preview 缺失时与旧行为一致落 null（fmtNum 负责「—」）')
     // ② 渲染面至少两处按 available===false 分支（预览面板 + 保存前提示）。
     const unavailableBranches = findAll(pages, (n) => n.type === 'ConditionalExpression' &&
       n.test.type === 'BinaryExpression' && n.test.operator === '===' &&
