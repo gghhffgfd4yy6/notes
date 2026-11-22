@@ -481,9 +481,18 @@ function filterWriteHeaders () {
 
 function apiGetFilter () {
   // 配置页和过滤规则页启动预加载时都会要同一份过滤规则快照，共享在飞 Promise。
-  return once('filter', () => consumeJson(fetch('/api/config/filter', timedRequest({
-    headers: { Accept: 'application/json', ...AUTH_HEADER }
-  }))))
+  // F4：`?view=merged` —— 只回一份规则（override 退化成 overrideFields 字段名清单、applied 不含
+  // 整份 filter），1 MiB 预算下响应从 ≈2–3 MiB 降到 ≈1 MiB。条件请求同理：规则不变时每 5 s 的
+  // 轮询命中 304（服务端 sendJsonConditional），连那 1 MiB 也不用重传。
+  const attempt = (conditional) => {
+    const merged = timedRequest({
+      headers: { Accept: 'application/json', ...AUTH_HEADER }
+    })
+    // 条件头必须在 fetch 之前注入（fetch 调用时就快照 headers）。
+    const sentTag = conditional ? addConditional(merged, 'filter') : null
+    return { p: fetch('/api/config/filter?view=merged', merged), sentTag }
+  }
+  return once('filter', () => consumeConditional('filter', attempt))
 }
 
 // 服务器草稿：读面沿用 Cookie/Bearer 均可的全局鉴权；写/删只认 Bearer。

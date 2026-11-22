@@ -3,7 +3,10 @@
 // F3：过滤预算在**模块加载**时探测一次并钉住。测试钉 softCap，保证 CI 与本机同预算；没有它，
 // 共享 runner 的 MemAvailable/磁盘余量差异会让「整份字节预算」类断言随机器漂移。
 // 必须在 require xbk_filter_store 之前设置（加载期读 process.env）。
-process.env.XBK_FILTER_SOFT_CAP_BYTES = '524288'
+// F4：生产默认已抬到 1 MiB，这里仍钉 512 KiB——它是「覆盖档」的代表值，且一大批 F3 夹具的字节数
+// 是按 512 KiB 造的；1 MiB 默认档由下面的 F4 用例显式断言。
+const TEST_SOFT_CAP_BYTES = 524288
+process.env.XBK_FILTER_SOFT_CAP_BYTES = String(TEST_SOFT_CAP_BYTES)
 
 // xbk_filter_store.js 单元测试（S1-store）
 // 覆盖：字段白名单/schema/revision/长度/控制字符、### 行语法、嵌套量词、RE2 不可用、
@@ -70,6 +73,9 @@ const {
   scanPreviewRecords,
   countUnescapedAlternations,
   filterLimitsReport,
+  // F4：GET 读面的响应体组装（lastGoodUsed 口径 / merged 视图 / 保存响应的去重字段摘要）
+  buildFilterGetPayload,
+  dedupedFieldsOf,
   resetStoreStateForTests,
   // F3：预算纯函数 / 加载期解析 / fail-closed 校验 / 派生读上限（都要直测，不靠「读代码」当门禁）
   computeFilterCapacity,
@@ -80,6 +86,7 @@ const {
   readFieldMaxLen,
   fieldMaxLenOf,
   FILTER_CAPACITY_FILE,
+  FILTER_CAPACITY_SCHEMA,
   FILTER_SOFT_CAP_ENV,
   FILTER_CACHE_DIR_ENV,
   FILTER_MAIN_FIELDS,
@@ -87,7 +94,10 @@ const {
   FILTER_FIELD_MAX_LEN,
   FILTER_MAX_TOTAL_BYTES,
   FILTER_DEFAULT_SOFT_CAP_BYTES,
-  FILTER_RESERVE_BYTES
+  FILTER_RESERVE_BYTES,
+  // F4：主字段硬顶 + 每字符字节数（1 MiB 默认档的公式断言要用）
+  FILTER_MAIN_CHARS_MAX,
+  FILTER_BYTES_PER_CHAR
 } = require('./xbk_filter_store')
 // C10-019：直调收紧入口的用例需要拿到函数本身（走 loadFilterRules 的集成路径看不到收紧分支）。
 const { enforceOwnerOnlyMode, isOwnerOnlyFile } = require('./scripts/owner-only-mode')
@@ -1540,25 +1550,58 @@ test('appliedLastGoodUsed 口径：只有 source=corrupt 且 lastGoodUsed=true �
 })
 
 test('控制台口径：GET /api/config/filter 的 lastGoodUsed 取自 applied，不用控制台进程自己的 LKG', () => {
-  if (skipIfInstrumented('控制台 lastGoodUsed 接线（源码结构断言）')) return
-  // 本 item 只允许跑 test_filter_store/test_filter 两个定向套件（console 套件不在其中），
-  // 故这处接线用**结构**锁定：console.js 里 `lastGoodUsed:` 这个对象字段的值必须是
-  // FilterStore.appliedLastGoodUsed(applied)——回退成 loaded.lastGoodUsed 即变红。
-  const model = loadModel('scripts/console.js')
-  const fields = []
+  // F4：响应体组装从 console.js 搬进 store（buildFilterGetPayload），契约随之落在这里：
+  // ① 结构：`lastGoodUsed:` 的值必须是 appliedLastGoodUsed(applied)（不是 loaded.lastGoodUsed，
+  //    也不是常量），且 console.js 里**不再**出现该字段（单一来源，改回旧写法即红）；
+  // ② 行为：loaded 上带一个诱饵 lastGoodUsed，载荷必须仍用 applied 快照的——这才是「运行侧口径」。
+  const model = loadModel('xbk_filter_store.js')
+  // 只扫 buildFilterGetPayload 的函数体：store 里其他 `lastGoodUsed:`（写 applied 快照、写 LKG）
+  // 是**生产方**，不是 GET 读面的推导，不该被这条口径约束。
+  let builder = null
   walkAst(model.ast, (node) => {
+    if (node.type === 'FunctionDeclaration' && node.id && node.id.name === 'buildFilterGetPayload') builder = node
+  })
+  assert.ok(builder, 'GET 读面必须由 buildFilterGetPayload 组装（F4：响应形状单一来源）')
+  const fields = []
+  walkAst(builder, (node) => {
     if (node.type === 'Property' && !node.computed && keyName(node.key) === 'lastGoodUsed') fields.push(node.value)
   })
   assert.ok(fields.length > 0,
     'GET /api/config/filter 的 payload 必须带 lastGoodUsed 字段（控制台要能展示运行侧降级状态）')
   const derived = fields.filter((value) => value.type === 'CallExpression' &&
-    memberPathOf(value.callee) === 'FilterStore.appliedLastGoodUsed' &&
+    memberPathOf(value.callee) === 'appliedLastGoodUsed' &&
     value.arguments.length === 1 && value.arguments[0].type === 'Identifier' &&
     value.arguments[0].name === 'applied')
   assert.strictEqual(derived.length, fields.length,
     `lastGoodUsed 必须由 applied 快照推导（运行侧口径）：实得 ${fields.map((v) => memberPathOf(v.callee) || v.type).join(', ')}`)
   const usesLocalLkg = fields.some((value) => memberPathOf(value) === 'loaded.lastGoodUsed')
   assert.ok(!usesLocalLkg, '不得用控制台进程自己读文件的 lastGoodUsed 冒充运行侧')
+  const consoleModel = loadModel('scripts/console.js')
+  let consoleOwns = 0
+  walkAst(consoleModel.ast, (node) => {
+    if (node.type === 'Property' && !node.computed && keyName(node.key) === 'lastGoodUsed') consoleOwns += 1
+  })
+  assert.strictEqual(consoleOwns, 0,
+    'F4：lastGoodUsed 只能在 buildFilterGetPayload 里组装（console.js 里再写一份 = 两处口径）')
+  // 行为：诱饵 loaded.lastGoodUsed 不得顶替 applied 快照里的运行侧记录
+  const payload = buildFilterGetPayload({
+    loaded: { source: 'override', revision: 7, filter: { pingbibiaoti: 'a' }, override: {}, keyword: {}, lastGoodUsed: true },
+    appliedRead: { status: 'ok', snapshot: { revision: 7, source: 'corrupt', hash: 'h', appliedAt: 1700000000000, lastGoodUsed: true } },
+    wideMatch: [],
+    limits: {}
+  })
+  assert.strictEqual(payload.lastGoodUsed, true, 'applied 快照记录了运行时降级 ⇒ payload.lastGoodUsed 必须是 true')
+  // 同一份诱饵、但 applied 是正常快照 ⇒ 必须 false（跑的是 applied，不是 loaded）
+  const healthy = buildFilterGetPayload({
+    loaded: { source: 'override', revision: 7, filter: {}, override: {}, lastGoodUsed: true },
+    appliedRead: { status: 'ok', snapshot: { revision: 7, source: 'override', hash: 'h', appliedAt: 1700000000000 } },
+    wideMatch: [],
+    limits: {}
+  })
+  assert.strictEqual(healthy.lastGoodUsed, false,
+    'applied 正常时 lastGoodUsed 必须 false——拿 loaded.lastGoodUsed 会给出假绿')
+  const noApplied = buildFilterGetPayload({ loaded: { source: 'override', revision: 7, filter: {}, override: {} }, appliedRead: { status: 'missing' }, wideMatch: [], limits: {} })
+  assert.strictEqual(noApplied.lastGoodUsed, false, '没有 applied 快照时 lastGoodUsed 必须是 false（不是 undefined/true）')
 })
 
 // ===== F4-3：瞬时读失败（replaced/ioError）重读一次，不折叠成永久降级 =====
@@ -2652,16 +2695,16 @@ const capacityInput = () => ({
   cgroupHeadroomBytes: Infinity,
   diskAvailBytes: 20 * 1024 * 1024 * 1024,
   fileBytes: 81435,
-  softCapBytes: FILTER_DEFAULT_SOFT_CAP_BYTES
+  softCapBytes: TEST_SOFT_CAP_BYTES
 })
 
-test('F3 computeFilterCapacity：纯函数（同入参两次 JSON 逐字节相等）+ 预算公式', () => {
+test('F3 computeFilterCapacity：纯函数（同入参两次 JSON 逐字节相等）+ 预算公式（512 KiB 覆盖档）', () => {
   const first = computeFilterCapacity(capacityInput())
   const second = computeFilterCapacity(capacityInput())
   assert.strictEqual(JSON.stringify(first), JSON.stringify(second),
     '同一入参连调两次必须逐字节相等（容量文件跨进程共读的前提：不得含时钟/随机）')
   assert.strictEqual(Object.isFrozen(first.perField), true, 'perField 必须冻结（闸门读的就是它）')
-  // 默认 softCap 512 KiB ⇒ totalBytes 512 KiB、两主字段 80,000、reserve 42,432（= spec 的 8×1000 + 3×2048）
+  // 512 KiB 覆盖档 ⇒ totalBytes 512 KiB、两主字段 80,000、reserve 42,432（= 8×1000 + 3×2048 字符）
   assert.strictEqual(first.totalBytes, 512 * 1024)
   assert.strictEqual(first.reserveBytes, FILTER_RESERVE_BYTES, 'reserve 必须是 42,432 B（8×1000 + 3×2048 字符 × 3）')
   assert.strictEqual(first.reserveBytes, 42432, 'spec 钉死的 reserve 数值（改公式必须同步文档）')
@@ -2697,13 +2740,110 @@ test('F3 computeFilterCapacity：纯函数（同入参两次 JSON 逐字节相�
   assert.strictEqual(computeFilterCapacity({ ...capacityInput(), softCapBytes: 512 * 1024 }).totalBytes, 512 * 1024)
 })
 
+// F4：默认预算抬到 1 MiB / 主字段 160,000。这条是「文档 / 前端文案 / GET limits / 容量文件」共同的
+// 数字来源，任何一处漂移都要在这里红。
+test('F4 默认 1 MiB：主字段 160,000（硬顶不随 softCap 上浮）、11 字段全填满仍落在整份预算内', () => {
+  assert.strictEqual(FILTER_DEFAULT_SOFT_CAP_BYTES, 1024 * 1024,
+    'XBK_FILTER_SOFT_CAP_BYTES 的默认值必须是 1 MiB（F4 的目标档）')
+  assert.strictEqual(FILTER_MAIN_CHARS_MAX, 160000,
+    '主字段硬顶必须是 160,000（spec / SYSTEM_CONTRACT / README / 前端提示共用的那个数）')
+  const big = computeFilterCapacity({ ...capacityInput(), softCapBytes: FILTER_DEFAULT_SOFT_CAP_BYTES })
+  assert.strictEqual(big.totalBytes, 1024 * 1024, '默认档整份预算 = 1 MiB')
+  assert.strictEqual(big.mainChars, 160000)
+  for (const field of FILTER_MAIN_FIELDS) {
+    assert.strictEqual(big.perField[field].chars, FILTER_MAIN_CHARS_MAX, `主字段 ${field} 必须拿到 160,000`)
+  }
+  // 小字段/plus 档位不随预算漂移（它们本来就小于「按比例摊」的结果）
+  assert.strictEqual(big.perField.pingbifenlei.chars, 1000)
+  for (const field of ['pingbibiaotiplus', 'pingbineirongplus', 'pingbilouzhuplus', 'pingbitime']) {
+    assert.strictEqual(big.perField[field].chars, 2048, `${field} 必须留在 plus 档 2048`)
+  }
+  // 11 个字段全按上限填满：2×160,000 + 5×1,000 + 4×2,048 = 333,192 字符 ⇒ 999,576 B
+  const fullFill = FILTER_RULE_FIELDS.reduce((n, field) => n + big.perField[field].chars * FILTER_BYTES_PER_CHAR, 0)
+  assert.strictEqual(fullFill, 999576, '全填满字节数必须按 perField 算得 999,576 B')
+  assert.ok(fullFill <= big.rulesFileMaxBytes - big.saveHeadroomBytes,
+    `全填满必须落在整份预算 − 保存余量之内（${fullFill} vs ${big.rulesFileMaxBytes - big.saveHeadroomBytes}）`)
+  // 抬到 8 MiB：整份预算涨，但主字段停在硬顶（对外数字只有一个）
+  const huge = computeFilterCapacity({ ...capacityInput(), softCapBytes: FILTER_MAX_TOTAL_BYTES })
+  assert.strictEqual(huge.totalBytes, FILTER_MAX_TOTAL_BYTES)
+  assert.strictEqual(huge.mainChars, FILTER_MAIN_CHARS_MAX, '超过硬顶时 mainChars 必须停在 160,000（不得摊到 167,000）')
+  // 资源不足时仍按公式收缩（硬顶只封顶、不垫底）
+  const tiny = computeFilterCapacity({ ...capacityInput(), memAvailableBytes: 12 * 1024 * 1024 })
+  assert.ok(tiny.mainChars < 80000 && tiny.mainChars > 0, `小资源必须收缩到 80,000 以下：${tiny.mainChars}`)
+  // 三个读写旋钮跟着整份预算走：请求体 = 整份 + 8192、整份文件 = totalBytes、读硬顶 = totalBytes + 1024
+  assert.strictEqual(big.rulesFileMaxBytes, 1024 * 1024)
+  assert.strictEqual(big.requestBodyMaxBytes, 1024 * 1024 + 8192)
+  assert.strictEqual(big.readMaxBytes, Math.max(big.totalBytes, 81435) + 1024)
+  // 派生读上限（LKG / applied 的包装）也必须容得下「读硬顶 + 76 字节包装」
+  const derived = computeDerivedReadLimits({ readMaxBytes: big.readMaxBytes, lastgoodWrapperBytes: 1024, appliedWrapperBytes: 1024 })
+  assert.strictEqual(derived.fallback, false)
+  assert.strictEqual(derived.lastgoodMaxBytes, big.readMaxBytes + 1024)
+  assert.strictEqual(derived.appliedMaxBytes, big.readMaxBytes + 1024)
+  // 本进程钉的是 512 KiB（TEST_SOFT_CAP_BYTES）：FILTER_LIMITS 必须与覆盖值一致——两个进程读不同的
+  // 数字就会「控制台允许 160,000、worker 按 80,000 拒绝」。
+  assert.strictEqual(FILTER_LIMITS.totalBytes, TEST_SOFT_CAP_BYTES)
+  assert.strictEqual(FILTER_LIMITS.perField.pingbibiaoti.chars, 80000)
+})
+
+test('F4 GET merged 视图与保存响应的去重摘要：同一份规则只下发一次、没去重就不回正文', () => {
+  const bigText = '线'.repeat(4000)
+  const filter = { pingbifenlei: 'x', pingbibiaoti: bigText, pingbineirong: bigText }
+  const override = { pingbibiaoti: bigText, pingbineirong: bigText }
+  const snapshot = { revision: 3, source: 'override', hash: 'h', appliedAt: 1700000000000, filter: { ...filter }, keyword: { zkt_gjc: 'kw' } }
+  const input = {
+    loaded: { source: 'override', revision: 3, filter, override, keyword: { zkt_gjc: 'kw' } },
+    appliedRead: { status: 'ok', snapshot },
+    wideMatch: ['pingbibiaoti'],
+    limits: { limits: { totalBytes: 1048576 }, usage: { rulesFileBytes: 24000, fieldChars: { pingbibiaoti: 4000 } } }
+  }
+  // 缺省（老形状）：override 原文 + applied 整份快照都要在（外部脚本/老页面兼容）
+  const full = buildFilterGetPayload({ ...input })
+  assert.deepStrictEqual(full.override, override)
+  assert.deepStrictEqual(full.applied.filter, filter, '缺省视图必须原样带 applied 快照的 filter')
+  assert.strictEqual(full.view, undefined)
+  assert.strictEqual(full.limits.totalBytes, 1048576, 'limits 必须原样展开（前端计数器读它）')
+  assert.strictEqual(full.usage.rulesFileBytes, 24000)
+  // merged：只留一份正文，override 退化成字段名清单，applied 只留元信息
+  const merged = buildFilterGetPayload({ ...input, view: 'merged' })
+  assert.strictEqual(merged.view, 'merged')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(merged, 'override'), false, 'merged 视图不得再下发 override 原文')
+  assert.deepStrictEqual(merged.overrideFields, ['pingbibiaoti', 'pingbineirong'], 'overrideFields 按白名单顺序给出显式写过的字段')
+  assert.deepStrictEqual(Object.keys(merged.applied).sort(), ['appliedAt', 'hash', 'revision', 'source'],
+    'merged 视图的 applied 只留元信息（整份 filter/keyword 不重复下发）')
+  assert.deepStrictEqual(merged.filter, filter, 'merged 视图仍必须给合并后的生效值（编辑器唯一数据源）')
+  const fullBytes = Buffer.byteLength(JSON.stringify(full), 'utf8')
+  const mergedBytes = Buffer.byteLength(JSON.stringify(merged), 'utf8')
+  assert.ok(mergedBytes < fullBytes * 0.6,
+    `merged 视图必须显著更小（${mergedBytes} vs ${fullBytes} B）：规则正文只出现一次`)
+  // 损坏的覆盖文件：revision 强制 0 + error，读面不得把内部栈/路径漏给前端
+  const corrupt = buildFilterGetPayload({
+    loaded: { source: 'corrupt', revision: 9, filter: {}, override: {}, error: { message: '覆盖文件损坏' } },
+    appliedRead: { status: 'missing' },
+    wideMatch: [],
+    limits: {}
+  })
+  assert.strictEqual(corrupt.revision, 0)
+  assert.strictEqual(corrupt.error.code, 'store_corrupt')
+  assert.strictEqual(corrupt.error.message, '覆盖文件损坏')
+  assert.strictEqual(corrupt.applied, null)
+  // 保存响应的去重摘要：只回去重命中的字段，没去重时一个字节的规则正文都不回
+  assert.deepStrictEqual(dedupedFieldsOf({ pingbibiaoti: 'a', pingbineirong: 'b' }, {}), {},
+    '没有去重必须回空对象（响应里不得出现整份正文）')
+  assert.deepStrictEqual(dedupedFieldsOf({ pingbibiaoti: 'a', pingbineirong: 'b' }, null), {})
+  assert.deepStrictEqual(dedupedFieldsOf({ pingbibiaoti: 'a', pingbineirong: 'b' }, { pingbibiaoti: 2 }),
+    { pingbibiaoti: 'a' }, '只回去重命中的字段')
+  assert.deepStrictEqual(dedupedFieldsOf({ pingbibiaoti: 'a' }, { pingbibiaoti: 0 }), {}, '0 条不算去重')
+  assert.deepStrictEqual(dedupedFieldsOf({ pingbibiaoti: 'a' }, { zhanxianbiaoti: 5 }), {},
+    '去重表里有、但正文里没有的字段不得凭空出现')
+})
+
 test('F3 softCap 覆盖：夹 [256 KiB, 8 MiB]、向下 4096 对齐、非法值回落默认（不静默当 auto）', () => {
   const at = (softCapBytes) => computeFilterCapacity({ ...capacityInput(), softCapBytes }).totalBytes
   assert.strictEqual(at(400000), 397312, '400,000 必须向下对齐到 397,312（4096 × 97）')
   assert.strictEqual(at(FILTER_MIN_TOTAL_BYTES - 1), FILTER_MIN_TOTAL_BYTES, '低于下界必须夹到 256 KiB')
   assert.strictEqual(at(FILTER_MAX_TOTAL_BYTES + 4096), FILTER_MAX_TOTAL_BYTES, '高于上界必须夹到 8 MiB')
-  assert.strictEqual(at(undefined), FILTER_DEFAULT_SOFT_CAP_BYTES, '不设覆盖时用默认 512 KiB')
-  assert.strictEqual(at(Number.NaN), FILTER_DEFAULT_SOFT_CAP_BYTES, '非数字覆盖回落默认')
+  assert.strictEqual(at(undefined), FILTER_DEFAULT_SOFT_CAP_BYTES, '不设覆盖时用默认 1 MiB（F4）')
+  assert.strictEqual(at(Number.NaN), FILTER_DEFAULT_SOFT_CAP_BYTES, '非数字覆盖回落默认 1 MiB')
   // 加载期：非法覆盖（'abc'）必须回落默认并 console.warn（不静默当 auto）
   const dir = makeDir()
   const warned = []
@@ -2722,7 +2862,7 @@ test('F3 softCap 覆盖：夹 [256 KiB, 8 MiB]、向下 4096 对齐、非法值�
       now: () => 1700000000000
     })
   } finally { console.warn = origWarn }
-  assert.strictEqual(resolved.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES, '非法覆盖必须回落默认 512 KiB')
+  assert.strictEqual(resolved.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES, '非法覆盖必须回落默认 1 MiB（不静默当 auto）')
   assert.ok(warned.some(line => line.includes(FILTER_SOFT_CAP_ENV) && line.includes('abc')),
     `非法覆盖必须留一条点名环境变量与实际值的告警：${JSON.stringify(warned)}`)
 })
@@ -2878,8 +3018,8 @@ test('F3 readMaxBytes 必须 ≥ 当前覆盖文件字节数：软上限之下�
   const paths = filterRulesPaths(dir)
   const text = JSON.stringify({ schema: 1, revision: 12, filter: bigLegitOverrideFilter() })
   const fileBytes = Buffer.byteLength(text, 'utf8')
-  assert.ok(fileBytes > FILTER_DEFAULT_SOFT_CAP_BYTES + 1024,
-    `前置：夹具必须 > totalBytes + 1024（${FILTER_DEFAULT_SOFT_CAP_BYTES + 1024}），否则测不出 Math.max 分支：实得 ${fileBytes}`)
+  assert.ok(fileBytes > TEST_SOFT_CAP_BYTES + 1024,
+    `前置：夹具必须 > totalBytes + 1024（${TEST_SOFT_CAP_BYTES + 1024}），否则测不出 Math.max 分支：实得 ${fileBytes}`)
   writeRaw(paths.file, text)
   const probe = spawnSync(process.execPath, ['-e', CAPACITY_READ_PROBE], {
     encoding: 'utf8',
@@ -2889,7 +3029,7 @@ test('F3 readMaxBytes 必须 ≥ 当前覆盖文件字节数：软上限之下�
       ...process.env,
       // 生产口径：容量文件与覆盖文件在同一个缓存目录（systemd/控制台就是这么注入的）。
       XBK_CACHE_DIR: dir,
-      XBK_FILTER_SOFT_CAP_BYTES: String(FILTER_DEFAULT_SOFT_CAP_BYTES),
+      XBK_FILTER_SOFT_CAP_BYTES: String(TEST_SOFT_CAP_BYTES),
       XBK_CAPACITY_PROBE_DIR: dir
     }
   })
@@ -2898,7 +3038,7 @@ test('F3 readMaxBytes 必须 ≥ 当前覆盖文件字节数：软上限之下�
   const result = JSON.parse(String(probe.stdout).trim().split('\n').pop())
   // 不钉死 totalBytes=524288：探测在极端资源下会回落 256 KiB（仍被 env 夹在 512 KiB 之内），
   // 而夹具 > 525,312 ⇒ 无论 totalBytes 是 512 KiB 还是回落的 256 KiB，Math.max 分支都必须生效。
-  assert.ok(result.totalBytes <= FILTER_DEFAULT_SOFT_CAP_BYTES,
+  assert.ok(result.totalBytes <= TEST_SOFT_CAP_BYTES,
     `前置：XBK_FILTER_SOFT_CAP_BYTES 必须把整份预算夹在 512 KiB 内（实得 ${result.totalBytes}）`)
   assert.ok(fileBytes > result.totalBytes + 1024,
     `前置：夹具必须越过「只用 totalBytes」的读硬顶（${fileBytes} vs ${result.totalBytes + 1024}）`)
@@ -2914,13 +3054,13 @@ test('F3 readMaxBytes 必须 ≥ 当前覆盖文件字节数：软上限之下�
   const adoptDir = makeDir()
   writeRaw(filterRulesPaths(adoptDir).file, text)
   const shared = {
-    schema: 1,
+    schema: FILTER_CAPACITY_SCHEMA,
     totalBytes: FILTER_MIN_TOTAL_BYTES,
     perField: Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, { chars: FILTER_FIELD_MAX_LEN }])),
     mainChars: FILTER_FIELD_MAX_LEN,
     source: 'fallback',
     degraded: true,
-    softCapBytes: FILTER_DEFAULT_SOFT_CAP_BYTES,
+    softCapBytes: TEST_SOFT_CAP_BYTES,
     at: 1700000000000
   }
   fs.writeFileSync(path.join(adoptDir, FILTER_CAPACITY_FILE), JSON.stringify(shared))
@@ -3106,6 +3246,57 @@ test('F3 容量文件：0600、含 totalBytes/perField/source/degraded/at；跨�
   const envCap = readTextAndStat(path.join(envDir, FILTER_CAPACITY_FILE))
   assert.ok(envCap.stat.isFile() && envCap.text.length > 0,
     'XBK_CACHE_DIR 必须决定容量文件位置（否则两边各写一份、预算悄悄分叉）')
+})
+
+test('F4 容量文件换代：F3 的 schema 1 文件必须判非法并重写成当前默认（否则升级后仍钉着 512 KiB）', () => {
+  const dir = makeDir()
+  const capacityPath = path.join(dir, FILTER_CAPACITY_FILE)
+  // F3 形态：schema 1 + 512 KiB + softCapBytes 524288（升级前本机盘上就是这一份）
+  const legacy = {
+    schema: 1,
+    totalBytes: TEST_SOFT_CAP_BYTES,
+    perField: Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, { chars: 80000 }])),
+    mainChars: 80000,
+    source: 'probe',
+    degraded: false,
+    softCapBytes: TEST_SOFT_CAP_BYTES,
+    at: 1700000000000
+  }
+  fs.writeFileSync(capacityPath, JSON.stringify(legacy), { mode: 0o600 })
+  assert.strictEqual(readCapacityFile(capacityPath), null, '旧 schema 必须不再被接受（换代标记）')
+  const fakeProc = (filePath) => {
+    const target = String(filePath)
+    if (target === '/proc/meminfo') return 'MemAvailable: 460800 kB\n'
+    throw new Error('ENOENT ' + target)
+  }
+  const origWarn = console.warn
+  let resolved
+  try {
+    console.warn = () => {}
+    resolved = resolveFilterLimits({
+      cacheDir: dir, env: {}, readFileSync: fakeProc, statfsSync: () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 }), now: () => 1950000000000
+    })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(resolved.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES,
+    '旧文件必须被忽略、按新默认（1 MiB）重算 —— 沿用 512 KiB 等于 F4 在这台机器上没生效')
+  assert.strictEqual(resolved.perField.pingbibiaoti.chars, FILTER_MAIN_CHARS_MAX)
+  const rewritten = JSON.parse(fs.readFileSync(capacityPath, 'utf8'))
+  assert.strictEqual(rewritten.schema, FILTER_CAPACITY_SCHEMA, '必须重写成当前 schema')
+  assert.strictEqual(rewritten.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES)
+  assert.strictEqual(rewritten.at, 1950000000000, '重写后 at 前进到本次钉住的时间点')
+  assert.strictEqual(readCapacityFile(capacityPath).totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES)
+  // 显式覆盖仍然优先：旧 schema + XBK_FILTER_SOFT_CAP_BYTES=524288 时用户的选择不被 F4 抬走
+  const pinnedDir = makeDir()
+  fs.writeFileSync(path.join(pinnedDir, FILTER_CAPACITY_FILE), JSON.stringify(legacy), { mode: 0o600 })
+  const pinned = resolveFilterLimits({
+    cacheDir: pinnedDir,
+    env: { [FILTER_SOFT_CAP_ENV]: String(TEST_SOFT_CAP_BYTES) },
+    readFileSync: fakeProc,
+    statfsSync: () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 }),
+    now: () => 1960000000000
+  })
+  assert.strictEqual(pinned.totalBytes, TEST_SOFT_CAP_BYTES, '显式覆盖的机器仍停在 512 KiB（默认值不等于强制）')
+  assert.strictEqual(pinned.perField.pingbibiaoti.chars, 80000)
 })
 
 test('F3 加载期产出的 FILTER_LIMITS 自洽：两主字段、全字段写满 ≤ totalBytes−32、读写两旋钮分道', () => {

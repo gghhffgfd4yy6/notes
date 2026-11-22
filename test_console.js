@@ -2412,14 +2412,20 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
-  await aok('过滤规则 POST: 去重与变更摘要（deduped / diff 只报新增与删除）', async () => {
+  await aok('过滤规则 POST: 去重与变更摘要（deduped / diff 只报新增与删除；响应不回吐整份规则）', async () => {
     const dir = mkTmp('xbk-console-filter-diff-')
     const { server, port } = await filterServer(dir)
+    const paths = filterPaths(dir)
     try {
       const first = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 0, filter: { pingbibiaoti: '甲\n乙\n甲' } })
       assert.strictEqual(first.status, 200)
       const firstBody = JSON.parse(first.text)
-      assert.strictEqual(firstBody.filter.pingbibiaoti, '甲\n乙', '落盘正文必须是去重后的')
+      // F4：保存响应不再回吐整份 filter（1 MiB 预算下等于把刚上传的正文再传一遍），只回去重命中
+      // 的字段；落盘内容另外直接从文件断言，强度不靠响应本身。
+      assert.strictEqual(firstBody.filter, undefined, '保存响应不得回吐整份规则正文（F4）')
+      assert.strictEqual(firstBody.dedupedFilter.pingbibiaoti, '甲\n乙', '回去重字段必须与落盘正文一致')
+      assert.strictEqual(JSON.parse(fs.readFileSync(paths.file, 'utf8')).filter.pingbibiaoti, '甲\n乙',
+        '落盘正文必须是去重后的')
       assert.deepStrictEqual(firstBody.deduped, { pingbibiaoti: 1 })
       assert.deepStrictEqual(firstBody.diff, { pingbibiaoti: { added: ['甲', '乙'], removed: [] } }, '首存全部算新增')
 
@@ -2430,6 +2436,11 @@ async function filterRuleApiTests () {
       const same = await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 2, filter: { pingbibiaoti: '丙\n乙' } })
       assert.strictEqual(same.status, 200)
       assert.deepStrictEqual(JSON.parse(same.text).diff, {}, '只换顺序不算变化（按行集合比对）')
+      // 没有去重 ⇒ 响应里一个字节的规则正文都没有（1 MiB 预算下的往返成本 = 0）
+      const noDedupe = JSON.parse((await postFilterJson(port, '/api/config/filter', { schema: 1, baseRevision: 3, filter: { pingbibiaoti: '丙\n乙\n丁' } })).text)
+      assert.deepStrictEqual(noDedupe.deduped, {}, '无重复行 ⇒ deduped 为空')
+      assert.deepStrictEqual(noDedupe.dedupedFilter, {}, '无重复行 ⇒ dedupedFilter 一个字段都不回')
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(noDedupe, 'filter'), false)
     } finally { server.close() }
   })
 
@@ -2911,6 +2922,57 @@ async function filterRuleApiTests () {
       const bad = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
       assert.strictEqual(bad.source, 'corrupt')
       assert.deepStrictEqual(bad.override, {}, '损坏时 override 必须是 {}')
+    } finally { server.close() }
+  })
+
+  await aok('过滤规则 GET ?view=merged: 只下发一份规则 + ETag 304（1 MiB 预算下轮询不再搬整份正文）', async () => {
+    const dir = mkTmp('xbk-console-filter-merged-')
+    const { server, port } = await filterServer(dir)
+    try {
+      const big = '线'.repeat(3000)
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+        schema: 1, baseRevision: 0, filter: { pingbibiaoti: big, pingbilouzhu: '楼主' }
+      })).status, 200)
+      const full = await request(port, 'GET', '/api/config/filter', { token: TOKEN })
+      const merged = await request(port, 'GET', '/api/config/filter?view=merged', { token: TOKEN })
+      assert.strictEqual(merged.status, 200)
+      const fullBody = JSON.parse(full.text)
+      const body = JSON.parse(merged.text)
+      assert.strictEqual(body.view, 'merged', '显式 ?view=merged 必须回 view=merged')
+      assert.strictEqual(body.override, undefined, 'merged 视图不得再下发 override 原文')
+      assert.deepStrictEqual(body.overrideFields, ['pingbibiaoti', 'pingbilouzhu'],
+        'overrideFields 必须是覆盖文件里显式写过的字段（按白名单顺序）')
+      assert.deepStrictEqual(body.filter, fullBody.filter, 'merged 的 filter 必须与默认视图逐字段相等')
+      // applied 快照是否存在取决于本进程有没有跑过运行侧；存在时只允许留元信息。
+      if (body.applied) {
+        assert.strictEqual(body.applied.filter, undefined, 'applied 不得重复下发整份 filter')
+        assert.strictEqual(body.applied.revision, 1, 'applied 元信息仍要在（前端读 revision/appliedAt）')
+      } else {
+        assert.strictEqual(body.applied, null, '没有 applied 快照时必须 null（不是空对象，前端据此判「未知」）')
+      }
+      assert.strictEqual(body.limits.totalBytes, FilterStore.FILTER_LIMITS.totalBytes, 'limits 仍必须带（计数器/413 文案读它）')
+      assert.ok(Buffer.byteLength(merged.text) < Buffer.byteLength(full.text) * 0.75,
+        `merged 必须显著更小：${Buffer.byteLength(merged.text)} vs ${Buffer.byteLength(full.text)} B`)
+      // 前端保存候选用的 override 对象仍能从 merged 视图复原（overrideFields + 同源 filter）
+      const { buildSaveCandidate } = await import('./scripts/console-assets/pure.mjs')
+      const overrideObj = Object.fromEntries((body.overrideFields || []).map((name) => [name, body.filter[name]]))
+      const candidate = buildSaveCandidate(overrideObj, ['pingbitime'], { ...body.filter, pingbitime: '9' }, ['pingbibiaoti', 'pingbilouzhu', 'pingbitime'])
+      assert.deepStrictEqual(candidate, { pingbibiaoti: big, pingbilouzhu: '楼主', pingbitime: '9' },
+        'merged 视图必须足以构造整份替换的保存候选（否则保存会静默删字段）')
+      // 条件请求：规则没变 ⇒ 304 且不重传正文
+      const tag = merged.headers.etag
+      assert.ok(tag, 'GET /api/config/filter 必须带 ETag（条件请求的前提）')
+      const again = await request(port, 'GET', '/api/config/filter?view=merged', { token: TOKEN, headers: { 'if-none-match': tag } })
+      assert.strictEqual(again.status, 304, '规则未变 ⇒ 条件请求必须 304（每 5 s 的轮询不再搬正文）')
+      assert.strictEqual(again.text, '', '304 不得带正文')
+      // 规则变了 ⇒ ETag 必须变（否则前端会一直拿 304 停在旧值）
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter', {
+        schema: 1, baseRevision: 1, filter: { pingbibiaoti: big, pingbilouzhu: '楼主2' }
+      })).status, 200)
+      const changed = await request(port, 'GET', '/api/config/filter?view=merged', { token: TOKEN, headers: { 'if-none-match': tag } })
+      assert.strictEqual(changed.status, 200, '规则变了必须 200 重发')
+      assert.notStrictEqual(changed.headers.etag, tag, '内容变了 ETag 必须变')
+      assert.strictEqual(JSON.parse(changed.text).filter.pingbilouzhu, '楼主2')
     } finally { server.close() }
   })
 
@@ -6090,7 +6152,8 @@ async function main () {
       }
       const pFiles = mod.apiGetFiles()
       const pFilter = mod.apiGetFilter()
-      assert.deepStrictEqual(calls, ['/api/files', '/api/config/filter'],
+      // F4：过滤规则读面固定走 ?view=merged（只下发一份规则）；URL 是契约的一部分，改回去即红。
+      assert.deepStrictEqual(calls, ['/api/files', '/api/config/filter?view=merged'],
         '不同 key 必须各自发请求（不能互相顶掉）')
       releaseFiles()
       assert.strictEqual((await pFilter).marker, 'filter')
@@ -14823,6 +14886,69 @@ async function main () {
     'pingbitime 必须仍有字段定义（改名会让规则永远填不进去）')
   })
 
+  await aok('F4 大字段分页与草稿增量（pure.mjs 纯函数 + pages.js 接线）', async () => {
+    const { fieldPageOf, filterDraftPatch, mergeFilterDraft } = await import('./scripts/console-assets/pure.mjs')
+    const FIELDS = ['pingbibiaoti', 'pingbineirong', 'pingbitime']
+    // ── 分页 ──
+    const text = Array.from({ length: 4500 }, (_, i) => `规则${i}`).join('\n')
+    const p0 = fieldPageOf(text, 0, 2000)
+    assert.deepStrictEqual([p0.total, p0.pages, p0.page, p0.start, p0.end], [4500, 3, 0, 1, 2000],
+      '第 1 页：共 4500 行 / 3 页 / 行号 1–2000（行号是 1 基，直接印给用户）')
+    assert.strictEqual(p0.lines.length, 2000)
+    assert.strictEqual(p0.lines[0], '规则0')
+    assert.strictEqual(p0.lines[1999], '规则1999')
+    const p2 = fieldPageOf(text, 2, 2000)
+    assert.deepStrictEqual([p2.page, p2.start, p2.end, p2.lines.length], [2, 4001, 4500, 500],
+      '末页必须只切到尾（不补空行、不越界）')
+    assert.strictEqual(fieldPageOf(text, 99, 2000).page, 2, '页码越界必须夹回末页（页面永远画得出来，不抛错）')
+    assert.strictEqual(fieldPageOf(text, -1, 2000).page, 0)
+    assert.deepStrictEqual(fieldPageOf('a\r\nb\rc\nd', 0, 2000).lines, ['a', 'b', 'c', 'd'],
+      '\\r\\n / \\r 都要归一（服务端存的正文两种行尾都可能出现）')
+    const empty = fieldPageOf('', 0, 2000)
+    assert.deepStrictEqual([empty.total, empty.pages, empty.lines], [1, 1, ['']], '空字段 = 1 行 1 页')
+    // ── 草稿增量：只存与已生效值不同的字段 ──
+    const base = { pingbibiaoti: 'a', pingbineirong: 'b', pingbitime: '5' }
+    assert.deepStrictEqual(filterDraftPatch(base, { ...base, pingbibiaoti: 'a2' }, FIELDS),
+      { pingbibiaoti: 'a2' }, '只存改过的字段（没改的字段不进 localStorage）')
+    assert.deepStrictEqual(filterDraftPatch(base, base, FIELDS), {}, '一个字段都没改 ⇒ 空补丁')
+    assert.deepStrictEqual(mergeFilterDraft(base, { pingbibiaoti: 'a2' }, FIELDS),
+      { pingbibiaoti: 'a2', pingbineirong: 'b', pingbitime: '5' }, '恢复时以当前生效值为底合并')
+    assert.deepStrictEqual(mergeFilterDraft(base, null, FIELDS), base, '没有补丁时整份回生效值（不塞 undefined）')
+    // 1 MiB 预算下最坏情形：两主字段各 160,000 码元，全量草稿 ≈1.0 M 码元；增量只留被改的那个字段。
+    const huge = { pingbibiaoti: '甲'.repeat(160000), pingbineirong: '乙'.repeat(160000), pingbitime: '5' }
+    const patch = filterDraftPatch(huge, { ...huge, pingbitime: '7' }, FIELDS)
+    assert.deepStrictEqual(patch, { pingbitime: '7' })
+    const fullBytes = JSON.stringify({ ...huge, pingbitime: '7' }).length
+    assert.ok(JSON.stringify(patch).length < 100,
+      `增量草稿必须只与被改字段成正比（${JSON.stringify(patch).length} vs 全量 ${fullBytes} 码元）`)
+    // ── pages.js 接线（结构）：分页只渲染当前页、草稿只写补丁 ──
+    const pagesModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'pages.js'))
+    const field = markup.functionNodeOf(pagesModel, 'FilterField')
+    assert.ok(field, '必须能定位 FilterField')
+    assert.strictEqual(findAll(field, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'fieldPageOf').length, 1,
+      'FilterField 必须用 fieldPageOf 分页（组件里手写 slice 会与 pure.mjs 的边界口径分叉）')
+    assert.ok(findAll(field, (n) => n.type === 'MemberExpression' && memberPath(n) === 'pageView.lines').length >= 1,
+      '分页预览必须只渲染当前页的行（pageView.lines），不得回退成整段正文')
+    assert.ok(elementsInFunction(pagesModel, 'FilterField').some((el) => el.name === 'pre' && markup.hasClass(el, 'fr-paged-lines')),
+      '只读预览必须是 <pre class="fr-paged-lines">（等宽、可滚动、与 textarea 外观一致）')
+    const panel = markup.functionNodeOf(pagesModel, 'FilterRulesPanel')
+    assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'filterDraftPatch').length, 3,
+      '三处写草稿都必须走 filterDraftPatch（本机保存 / 服务器 PUT / 服务器草稿回写本机）')
+    assert.strictEqual(findAll(panel, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'mergeFilterDraft').length, 1,
+      '本机草稿恢复必须以生效值为底合并（草稿只存差量）')
+    const fromServer = markup.functionNodeOf(pagesModel, 'filterDraftFromServer')
+    assert.ok(fromServer, '必须能定位 filterDraftFromServer')
+    assert.strictEqual(findAll(fromServer, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'mergeFilterDraft').length, 1,
+      '服务器草稿恢复同样要以生效值为底合并（老服务端回整份时合并结果不变）')
+    // 前端文案不得再出现写死的旧容量（F4 的「文档/文案数字全部来自 limits」）
+    const assetsSrc = fs.readdirSync(CONSOLE_ASSET_DIR)
+      .filter((file) => file.endsWith('.js') || file.endsWith('.mjs'))
+      .map((file) => fs.readFileSync(path.join(CONSOLE_ASSET_DIR, file), 'utf8'))
+      .join('\n')
+    assert.ok(!/256 KiB|256KB|16000|16,000/.test(assetsSrc),
+      '前端资产不得写死旧的 256 KiB / 16,000（一律读 GET limits 下发的数字）')
+  })
+
   // ── 数字框锁定，长按加减连续调整 ─────────────────────────────────────────────
   await aok('结构红线: 数字框锁定，长按加减连续调整', () => {
     const componentsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'components.js'))
@@ -15043,8 +15169,8 @@ async function main () {
     const loadDecl = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'load')
     assert.ok(loadDecl && callSites(loadDecl, 'apiGetFilterDraft').length === 1, '打开过滤页必须同时读服务器草稿')
     const applyLoaded = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'applyLoaded')
-    assert.ok(applyLoaded && callSites(applyLoaded, 'filterDraftFromServer').map((call) => callArgLabels(call).join(',')).includes('serverDraft'),
-      '服务器草稿响应必须校验后再恢复（filterDraftFromServer）')
+    assert.ok(applyLoaded && callSites(applyLoaded, 'filterDraftFromServer').map((call) => callArgLabels(call).join(',')).includes('serverDraft,next'),
+      '服务器草稿响应必须校验后再恢复（filterDraftFromServer(serverDraft, next)：F4 起草稿只存 dirty 字段，恢复时以当前生效值为底合并）')
     // 本机草稿要同步到服务器（串行 PUT），清草稿要等链落地再 DELETE。
     const pushDecl = findFirst(panel, (n) => n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.id.name === 'pushDraftNow')
     assert.ok(pushDecl && callSites(pushDecl, 'apiPostFilterDraft').length === 1, '本机草稿要同步到服务器')

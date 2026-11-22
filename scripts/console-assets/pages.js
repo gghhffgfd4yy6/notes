@@ -6,7 +6,7 @@ import { BACKUP_FILE_MAX_BYTES, NOTIFY_WINDOW_MAX_S, NOTIFY_WINDOW_MIN_S, OBJECT
 import { BOOT, DAY_KEY_RE, apiCancelRun, apiDeleteFilterDraft, apiGetAccessLog, apiGetCacheHealth, apiGetConfig, apiGetConsoleSettings, apiGetFiles, apiGetFilter, apiGetFilterDraft, apiGetLineWatch, apiGetLogs, apiGetLogFiles, apiGetLogPage, apiGetMessages, apiGetRunDetail, apiGetRunHistory, apiGetSys, apiGetTrends, apiGetTwoFactorStatus, apiPostBackupExport, apiPostBackupImport, apiPostConsoleSettings, apiPostDevicesRevoke, apiPostFilterDraft, apiPostFilterPreview, apiPostFilterRestore, apiPostFilterSave, apiPostFilterValidate, apiPostLineWatch, apiPostTwoFactorDisable, apiPostTwoFactorEnable, apiPostTwoFactorSetup, apiSearchLines, AUTH_HEADER, timedRequest } from './api.js'
 import { Badge, Button, ConfirmDialog, DateRange, Drawer, EMPTY_RANGE, Hint, LoadError, MiniSelect, PanelHead, PanelSkeleton, RUN_LOG_WAIT_MS, Reveal, channelLabel, inDayRange, placeAt, scrollIntoBox, stickyPad, useHoldRepeat } from './components.js'
 import { MOTION, flash, useFlipList, useRevealWhen } from './motion.js'
-import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, filterCorruptNotice, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
+import { backupImportProblem, backupPasswordProblem, buildSaveCandidate as buildSaveCandidateOf, cacheWriteInfo, decryptBackup, effectiveFilterRows, encryptBackup, fieldPageOf, filterCorruptNotice, filterDraftPatch, filterLogLines, filterOverrideFields, filterRunItems, filterSourceNote, fmtAge, isEncryptedBackup, isNewerThan, isTimeoutError, logLineCounts, logLineTone, mergeFilterDraft, searchBodyView, searchRefreshError, splitHits } from './pure.mjs'
 import { fmtBytes, fmtIsoStamp, fmtLocalTime, fmtNum, fmtTime } from './format.js'
 // 定位引擎（同 MiniSelect）：分类弹层的翻上/夹取/压高都交给中间件，不再自己量 below/above。
 import { computePosition, flip, offset, shift, size } from './floating-ui.module.js'
@@ -4272,6 +4272,9 @@ const FILTER_FIELD_LABELS = FILTER_GROUPS.reduce((acc, g) => {
 
 // 过滤规则草稿：改了但没保存的内容先落在浏览器本地，关标签/杀后台/浏览器退出后
 // 下次打开还能捡回来。只存规则字段，不存 token；同一浏览器只保留最近一份。
+// F4：`filter` 字段里只放**与已生效值不同**的字段（filterDraftPatch），不再整份 JSON.stringify
+// ——1 MiB 预算下两个主字段可各 160,000 码元，全量草稿 ≈1.0 M 码元，撞 5M 字符配额就写不进去
+// （只能提示「存储已满」，草稿能力等于失效）。读取侧按 baseRevision 用 mergeFilterDraft 合并回去。
 const FILTER_DRAFT_KEY = 'xbk_filter_draft_v1'
 const FILTER_DRAFT_SCHEMA = 1
 const FILTER_DRAFT_SAVE_DELAY = 500
@@ -4297,11 +4300,11 @@ function readFilterDraft () {
   }
 }
 
-function writeFilterDraft (filter, baseRevision, savedAt) {
+function writeFilterDraft (filterPatch, baseRevision, savedAt) {
   try {
     window.localStorage.setItem(FILTER_DRAFT_KEY, JSON.stringify({
       schema: FILTER_DRAFT_SCHEMA,
-      filter,
+      filter: filterPatch,
       baseRevision: Number.isSafeInteger(baseRevision) ? baseRevision : null,
       savedAt: Number.isFinite(savedAt) && savedAt > 0 ? savedAt : Date.now()
     }))
@@ -4362,17 +4365,29 @@ function filterDraftFrom (data) {
 
 // GET 返回的 override：覆盖文件里实际存在的字段（服务端已按白名单裁剪）。
 // 保存是整份替换 ⇒ 本次没改但已落盘的字段必须原样带回，否则会被静默删掉退回代码默认。
+// F4：`?view=merged` 只下发 `overrideFields`（字段名清单，值就是同一响应里的 filter[name]，
+// 同一次读盘、同源），这里两种形态都认；都没有就是空对象（覆盖文件不存在 / 一个字段都没写）。
 function filterOverrideFrom (data) {
-  return filterOverrideFields(data, FILTER_FIELD_NAMES)
+  const direct = filterOverrideFields(data && data.override, FILTER_FIELD_NAMES)
+  if (Object.keys(direct).length > 0) return direct
+  const names = data && Array.isArray(data.overrideFields) ? data.overrideFields : []
+  const src = data && data.filter && typeof data.filter === 'object' ? data.filter : {}
+  const out = {}
+  for (const name of names) {
+    if (FILTER_FIELD_NAMES.includes(name) && typeof src[name] === 'string') out[name] = src[name]
+  }
+  return out
 }
 
 // 服务器草稿响应 → 与本地草稿同形；坏的/缺字段的响应当没有，不能让他覆盖页面。
-function filterDraftFromServer (data) {
+// F4：草稿只存 dirty 字段（filterDraftPatch），所以恢复时要以**当前生效值**（base）为底合并；
+// 没给 base 就退回全空（老服务端存的是整份，缺字段本来就该是空串）。
+function filterDraftFromServer (data, base) {
   if (!data || data.ok !== true || !data.draft || typeof data.draft !== 'object') return null
   const savedAt = Number(data.draft.savedAt)
   if (!Number.isFinite(savedAt) || savedAt <= 0) return null
   return {
-    filter: filterDraftFrom({ filter: data.draft.filter }),
+    filter: mergeFilterDraft(base, data.draft.filter, FILTER_FIELD_NAMES),
     baseRevision: Number.isSafeInteger(data.draft.baseRevision) ? data.draft.baseRevision : null,
     savedAt,
     source: 'server'
@@ -4433,6 +4448,13 @@ function filterFieldLimitOf (data, name) {
 }
 
 // 单个规则字段：label/for 绑定、当前值、脏标记、逐字段错误、已用/上限计数。
+// F4：单字段超过 FILTER_FIELD_PAGED_CHARS 时默认**只读预览 + 分页**（每页 FILTER_FIELD_PAGE_LINES
+// 行），不再把整段塞进 textarea——1 MiB 预算下主字段可到 160,000 字符，一次性 layout 一个
+// 160k 的 textarea 在 4× CPU 节流下要几百毫秒（实测见 PR）。要点「编辑全部」显式按钮才换成
+// 可写的 textarea（用户明确要求时才付这份代价），旁边留一个「收起为分页预览」回去。
+// 阈值按**码元**（String.length）判，与 limits.perField[].chars 同口径（服务端上限就是这个单位）。
+const FILTER_FIELD_PAGED_CHARS = 100 * 1024
+const FILTER_FIELD_PAGE_LINES = 2000
 function FilterField ({ def, value, saved, error, onChange, maxLen }) {
   const id = `filter-rule-${def.name}`
   const hintId = `${id}-hint`
@@ -4442,6 +4464,21 @@ function FilterField ({ def, value, saved, error, onChange, maxLen }) {
   const dirty = shown !== prev
   const limit = Number.isSafeInteger(maxLen) && maxLen > 0 ? maxLen : null
   const describedBy = error ? `${hintId} ${errId}` : hintId
+  // 分页态：超大字段默认走只读预览；编辑全部 = 用户显式接管（大 textarea 的代价由他确认）。
+  const [editAll, setEditAll] = useState(false)
+  const [page, setPage] = useState(0)
+  const big = shown.length > FILTER_FIELD_PAGED_CHARS
+  const paged = big && !editAll
+  const pageView = useMemo(() => (paged ? fieldPageOf(shown, page, FILTER_FIELD_PAGE_LINES) : null), [paged, shown, page])
+  // 两个分支都显式渲染 textarea：天数字段用单行外观（rows=2 + fr-input-days），其余规则字段可能
+  // 上千行，仍是多行框。结构断言钉住「days 分支带 fr-input-days 且两者都是 textarea」。
+  const control = def.kind === 'days'
+    ? html`<textarea id=${id} class="fr-input fr-textarea fr-input-days" rows="2" spellcheck="false"
+        value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
+        onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`
+    : html`<textarea id=${id} class="fr-input fr-textarea" rows="2" spellcheck="false"
+        value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
+        onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`
   return html`<div class=${'fr-field' + (def.protect ? ' fr-field-protect' : '')}>
     <div class="fr-field-head">
       <label class="fr-label" for=${id}>${def.label}</label>
@@ -4450,13 +4487,22 @@ function FilterField ({ def, value, saved, error, onChange, maxLen }) {
       ${limit !== null && html`<span class=${'fr-count' + (shown.length > limit ? ' fr-count-over' : '')}>已用 ${fmtNum(shown.length)} / 上限 ${fmtNum(limit)}</span>`}
       <code class="fr-key">${def.name}</code>
     </div>
-    ${def.kind === 'days'
-      ? html`<textarea id=${id} class="fr-input fr-textarea fr-input-days" rows="2" spellcheck="false"
-          value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
-          onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`
-      : html`<textarea id=${id} class="fr-input fr-textarea" rows="2" spellcheck="false"
-          value=${shown} aria-describedby=${describedBy} aria-invalid=${error ? 'true' : 'false'}
-          onInput=${(e) => onChange(def.name, e.target.value)}></textarea>`}
+    ${paged && html`<div class="fr-paged">
+      <div class="fr-paged-head">
+        <span class="fr-paged-meta">字段较大（${fmtNum(shown.length)} 字符）：默认只读预览，每页 ${fmtNum(FILTER_FIELD_PAGE_LINES)} 行 · 第 ${fmtNum(pageView.start)}–${fmtNum(pageView.end)} 行 / 共 ${fmtNum(pageView.total)} 行（${pageView.page + 1}/${pageView.pages} 页）</span>
+        <span class="fr-paged-actions">
+          <${Button} variant="secondary" disabled=${pageView.page <= 0} onClick=${() => setPage(pageView.page - 1)}>上一页<//>
+          <${Button} variant="secondary" disabled=${pageView.page >= pageView.pages - 1} onClick=${() => setPage(pageView.page + 1)}>下一页<//>
+          <${Button} variant="primary" onClick=${() => setEditAll(true)}>编辑全部<//>
+        </span>
+      </div>
+      <pre id=${id} class="fr-paged-lines" aria-describedby=${describedBy} aria-label=${`${def.label}只读预览（第 ${pageView.page + 1} 页）`}>${pageView.lines.join('\n')}</pre>
+      <div class="fr-field-hint">只读预览不参与输入：要点「编辑全部」才会载入整段到编辑框（大字段在手机上会更吃力）。</div>
+    </div>`}
+    ${!paged && control}
+    ${!paged && big && html`<div class="fr-paged-foot">
+      <${Button} variant="secondary" onClick=${() => { setEditAll(false); setPage(0) }}>收起为分页预览<//>
+    </div>`}
     <div class="fr-field-hint" id=${hintId}>${def.hint}</div>
     ${error && html`<div class="fr-field-err" id=${errId} role="alert">${error}</div>`}
   </div>`
@@ -4516,13 +4562,15 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     const localSaved = readFilterDraft()
     const local = localSaved
       ? {
-          filter: filterDraftFrom({ filter: localSaved.filter }),
+          // F4：草稿只存 dirty 字段 ⇒ 以**当前生效值**（next）为底合并回整份；缺的字段就是没改过。
+          // 合并底必须与写草稿时同源：baseRevision 不等于当前 revision 的草稿在下面就被丢弃了。
+          filter: mergeFilterDraft(next, localSaved.filter, FILTER_FIELD_NAMES),
           baseRevision: Number.isSafeInteger(localSaved.baseRevision) ? localSaved.baseRevision : null,
           savedAt: localSaved.savedAt,
           source: 'local'
         }
       : null
-    const remote = filterDraftFromServer(serverDraft)
+    const remote = filterDraftFromServer(serverDraft, next)
     // 同一份草稿可能本机和服务器都有：先排除基于旧 revision 的草稿，再按时间取新。
     // 否则「本机旧草稿但时间更新」会挡住「服务器上基于当前 revision 的可用草稿」。
     const candidates = [local, remote].filter(Boolean)
@@ -4549,7 +4597,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         setDraftSavedAt(saved.savedAt)
         setDraftSyncedAt(saved.source === 'server' ? saved.savedAt : 0)
         // 服务器草稿也要在本机留一份：断网/服务挂掉时还能从 localStorage 捡回来。
-        if (saved.source === 'server') writeFilterDraft(savedDraft, baseRev, saved.savedAt)
+        // F4：留的是**差量**（只存 dirty 字段），与 saveDraftNow 写本机草稿的口径一致。
+        if (saved.source === 'server') writeFilterDraft(filterDraftPatch(next, savedDraft, FILTER_FIELD_NAMES), baseRev, saved.savedAt)
       } else {
         clearFilterDraft()
         setDraftSavedAt(0)
@@ -4588,7 +4637,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
   const saveDraftNow = useCallback(() => {
     if (!draftRef.current || !baseRef.current) return false
     const d = dataRef.current
-    const ok = writeFilterDraft(draftRef.current, d && Number.isSafeInteger(d.revision) ? d.revision : null)
+    // F4：只写 dirty 字段（与已生效值不同的那些）——整份写会撞 localStorage 配额。
+    const patch = filterDraftPatch(baseRef.current, draftRef.current, FILTER_FIELD_NAMES)
+    const ok = writeFilterDraft(patch, d && Number.isSafeInteger(d.revision) ? d.revision : null)
     if (ok) {
       setDraftSavedAt(Date.now())
     } else {
@@ -4598,8 +4649,12 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     return ok
   }, [])
   const pushDraftNow = useCallback(({ keepalive = false } = {}) => {
-    if (!draftRef.current || !baseRef.current) return Promise.resolve(false)
-    const filter = draftRef.current
+    // 快照：判「这次响应还能不能改状态」用（发出去之后用户又改了/已经放弃 ⇒ 不能回写「已同步」）。
+    const snapshot = draftRef.current
+    if (!snapshot || !baseRef.current) return Promise.resolve(false)
+    // F4：服务器草稿同样只存 dirty 字段（服务端 normalizeFilterDraft 本来就按字段可选校验）。
+    // 1 MiB 预算下整份 PUT 每 1.5 s 一次 ≈ 660 KB/s 的写盘 + 上行，且 GET 回读要再搬一遍。
+    const patch = filterDraftPatch(baseRef.current, snapshot, FILTER_FIELD_NAMES)
     const d = dataRef.current
     const baseRevision = d && Number.isSafeInteger(d.revision) ? d.revision : 0
     const epoch = draftEpochRef.current
@@ -4608,10 +4663,10 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
       .catch(() => false)
       .then(() => {
         if (epoch !== draftEpochRef.current) return false
-        return apiPostFilterDraft(filter, baseRevision, { keepalive })
+        return apiPostFilterDraft(patch, baseRevision, { keepalive })
           .then((res) => {
             // 发出去以后又改了/已经放弃：这次响应不能把状态改回「已同步」。
-            if (epoch !== draftEpochRef.current || draftRef.current !== filter) return false
+            if (epoch !== draftEpochRef.current || draftRef.current !== snapshot) return false
             if (res && res.ok) {
               setDraftSyncedAt(Date.now())
               return true
@@ -4979,10 +5034,11 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         const payload = res.data && typeof res.data === 'object' ? res.data : {}
         // v3.391：服务端保存时自动去重，落盘的是去重后的正文。把这份正文接回编辑器，
         // 否则用户看到的还是自己粘进去的那一坨重复行，以为没生效。
+        // F4：响应不再回吐整份 filter（1 MiB 正文再传一遍 = 往返翻倍），只回去重命中的字段。
         const dedupedCounts = payload.deduped && typeof payload.deduped === 'object' ? payload.deduped : {}
         const dedupedTotal = Object.keys(dedupedCounts).reduce((n, k) => n + (Number(dedupedCounts[k]) || 0), 0)
-        const savedFilter = dedupedTotal > 0 && payload.filter && typeof payload.filter === 'object'
-          ? { ...filter, ...payload.filter }
+        const savedFilter = dedupedTotal > 0 && payload.dedupedFilter && typeof payload.dedupedFilter === 'object'
+          ? { ...filter, ...payload.dedupedFilter }
           : filter
         applySaved(savedFilter, payload.revision, copy === true)
         // v3.392：把服务端算好的增/删摘要显示出来（没有变化就清空，别留上一版）。

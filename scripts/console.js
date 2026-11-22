@@ -2423,7 +2423,7 @@ function rollbackFilterOverride (paths, previousText, createdNew = false) {
 //   rollbackOnAuditFailure=false 给导入用：它有自己的多文件回滚（restoreImportBackup 会把
 //   过滤规则文件一起还原），这里再回滚一次会让「rolledBack」分裂成两层语义。
 //   computeHash=false 给导入用：它不返回 hash，也就不必为拿摘要去懒加载规则引擎。
-//   tooLarge 早退（读不回保存前原文）**只对保存生效**：覆盖文件超过读硬顶（= body 上限 256 KiB）
+//   tooLarge 早退（读不回保存前原文）**只对保存生效**：覆盖文件超过读硬顶（= 当前动态预算的 readMaxBytes）
 //   时 loadCurrentFilter 判 corrupt、上一代原文读不回来，保存必须中止（宁可拒写，不覆盖看不见的内容）。
 //   但 /restore（回滚备份 / 恢复默认）与 /api/backup/import 恰恰是这个状态下**唯一**的自助修复路径：
 //   把它们也 500 掉，用户只能上机器手改文件。故这三个 action 继续提交，previousText 保持 null、
@@ -2446,8 +2446,9 @@ function commitFilterOverride ({
     if (raw.status === 'ok') previousText = raw.text
     else if (raw.status === 'missing') previousFileMissing = true
     // F2-4：**保存**时读不回保存前原文就绝不写盘。旧实现把 previousText=null 一律当成「原本没有覆盖文件」，
-    // 审计失败回滚时直接 unlink，把用户整份规则文件删掉。真正会丢数据的是 tooLarge：文件比 body 上限
-    // （= 读硬顶 256 KiB）大 ⇒ 加载判 corrupt、这里读不回来，而下一行 writeAtomic 仍会把它覆盖掉。
+    // 审计失败回滚时直接 unlink，把用户整份规则文件删掉。真正会丢数据的是 tooLarge：文件比读硬顶
+    // （= 当前动态预算的 readMaxBytes，F4 默认 1 MiB + 1024）大 ⇒ 加载判 corrupt、这里读不回来，
+    // 而下一行 writeAtomic 仍会把它覆盖掉。
     // 此时**保存**中止本次提交、原文件一个字节不动（这是唯一「看不见就别写」的调用方）。
     // 恢复 / 恢复默认 / 导入不中止：它们正是这个状态下的自助修复路径，旧代码在这三条路径上就是
     // 200 并重写文件，中止只会把用户锁死在损坏状态里。它们继续往下走，previousText 保持 null 且
@@ -5069,43 +5070,20 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   }
 
   // GET /api/config/filter：读面，沿用全局鉴权（Cookie / Bearer 均可；查询串 token 已不接受）。
-  // 损坏时 revision 强制 0（即便进程内有 last-known-good，那是运行侧降级，不是覆盖文件版本）。
-  const handleFilterGet = (req, res) => {
+  // F4：响应形状搬进 FilterStore.buildFilterGetPayload（纯函数、可直测）：`?view=merged` 只下发
+  // 一份规则（override 退化成字段名清单、applied 不含整份 filter），缺省仍是旧形状（兼容外部脚本）。
+  // 并对整份响应发 ETag（sendJsonConditional）：规则不变时 5 s 轮询命中 304，不再每拍搬 1 MiB。
+  const handleFilterGet = (req, res, url) => {
     const loaded = loadCurrentFilter()
-    const corrupt = loaded.source === 'corrupt'
-    const appliedRead = FilterStore.readAppliedSnapshot(stateDir)
-    // 原样返回生效快照（readAppliedSnapshot 的 snapshot），UI 读 revision/appliedAt/hash；
-    // 不在这里二次裁剪，避免与运行侧写入形状漂移。
-    const applied = appliedRead.status === 'ok' ? appliedRead.snapshot : null
-    const chain = readFilterAuditChain(FilterStore.filterRulesPaths(stateDir).audit)
-    const payload = {
-      schema: FilterStore.FILTER_RULES_SCHEMA,
-      revision: corrupt ? 0 : loaded.revision,
-      source: loaded.source,
-      filter: loaded.filter,
-      // 与 filter 同源（FilterStore 同一次读盘给出）：不得在这里再读一遍文件，否则两次读之间
-      // 文件被别的进程替换/读失败时，filter 与 override 会描述两个不同快照，保存会丢字段。
-      override: loaded.override || {},
-      keyword: {
-        zkt_gjc: loaded.keyword && loaded.keyword.zkt_gjc !== undefined ? loaded.keyword.zkt_gjc : '',
-        writable: false
-      },
+    const payload = FilterStore.buildFilterGetPayload({
+      loaded,
+      appliedRead: FilterStore.readAppliedSnapshot(stateDir),
+      auditChain: readFilterAuditChain(FilterStore.filterRulesPaths(stateDir).audit),
+      limits: FilterStore.filterLimitsReport(stateDir, loaded.filter),
       wideMatch: wideMatchFields(loaded.filter),
-      applied,
-      // 口径对齐（I2/F4-1）：lastGoodUsed 只认运行侧本轮写进 applied.json 的记录。控制台进程读文件
-      // 时自己也会刷新 LKG（那描述的是「下次降级能用什么」），拿它冒充运行侧状态会给出假绿。
-      lastGoodUsed: FilterStore.appliedLastGoodUsed(applied),
-      auditChain: { ok: chain.ok, entries: chain.entries, brokenAt: chain.brokenAt },
-      // F2-5：上限与用量（F3 起前端已接：字段计数器与 413 文案都读这里）。字段必须先在，否则前端只能继续写死 256 KiB。
-      ...FilterStore.filterLimitsReport(stateDir, loaded.filter)
-    }
-    if (corrupt) {
-      payload.error = {
-        code: 'store_corrupt',
-        message: loaded.error && loaded.error.message ? loaded.error.message : '覆盖文件损坏'
-      }
-    }
-    sendJson(res, 200, payload)
+      view: url && typeof url.searchParams.get === 'function' ? url.searchParams.get('view') : ''
+    })
+    sendJsonConditional(req, res, payload)
   }
 
   // v3.392：保存时回吐「这次到底改了什么」——按字段比对新旧规则行（口径同去重：trim + 小写），
@@ -5209,9 +5187,9 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           revision: committed.revision,
           changedFields: committed.changedFields,
           hash: committed.hash,
-          // v3.391：回吐「实际落盘」的规则正文与去重条数——前端据此把重复行从编辑框里收掉，
-          // 不必等下次读取才发现「少了几行」。
-          filter: result.value,
+          // F4：不再回吐整份 filter（1 MiB 预算下等于把刚上传的正文再传一遍；前端只用它修正
+          // 「重复行已被收掉」这一件事）——只回去重命中的字段，没去重就一个字节正文都不回。
+          dedupedFilter: FilterStore.dedupedFieldsOf(result.value, result.deduped),
           deduped: result.deduped || {},
           diff,
           appliedHint: '下一轮生效'

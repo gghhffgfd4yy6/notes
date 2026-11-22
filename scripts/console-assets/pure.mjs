@@ -142,6 +142,55 @@ export function buildSaveCandidate (override, dirtyFields, draft, fieldNames) {
   return candidate
 }
 
+// ── F4：草稿增量（只存 dirty 字段）与超大字段分页 ─────────────────────────────
+// 草稿：旧实现每 500 ms 把 11 个字段全量 JSON.stringify 进 localStorage。1 MiB 预算下
+// 两个主字段可各 160,000 码元 ⇒ 单份草稿 ≈1.0 M 码元，叠上「服务器那份草稿 + 首屏快照」
+// 就撞 5M 字符配额，写不进去时只能提示「存储已满」，等于草稿能力失效。
+// 口径：只存「与已生效值不同」的字段（keys 是白名单里的字段名，值是完整正文）；恢复时
+// 以**当前 revision 的生效值**为底合并——草稿的 baseRevision 必须等于当前 revision 才会
+// 被采用（applyLoaded 的 usable 过滤），所以合并底永远与写草稿时同源。
+export function filterDraftPatch (base, draft, fieldNames) {
+  const names = Array.isArray(fieldNames) ? fieldNames : []
+  const src = draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}
+  const prev = base && typeof base === 'object' && !Array.isArray(base) ? base : {}
+  const patch = {}
+  for (const name of names) {
+    if (typeof src[name] !== 'string') continue
+    const before = prev[name] === undefined || prev[name] === null ? '' : String(prev[name])
+    if (src[name] !== before) patch[name] = src[name]
+  }
+  return patch
+}
+
+// 合并（补丁优先）：缺的字段回**底**里的值，再缺按空串——绝不把 undefined 塞进 textarea。
+export function mergeFilterDraft (base, patch, fieldNames) {
+  const names = Array.isArray(fieldNames) ? fieldNames : []
+  const prev = base && typeof base === 'object' && !Array.isArray(base) ? base : {}
+  const add = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {}
+  const out = {}
+  for (const name of names) {
+    if (typeof add[name] === 'string') out[name] = add[name]
+    else out[name] = prev[name] === undefined || prev[name] === null ? '' : String(prev[name])
+  }
+  return out
+}
+
+// 超大字段的只读分页：一页 linesPerPage 行，页码越界夹回有效区间（不抛错——页面永远画得出来）。
+// 只切不改：页内每行原样返回（调用方按 '\n' 拼成只读预览），切分同时吃掉 \r\n / \r —— 服务端
+// 存下来的多行规则两种行尾都可能出现，不归一会在预览里留下看不见的 \r。
+// 空文本按 1 行 1 页处理，start/end 是给「第 a–b 行 / 共 n 行」用的 1 基行号。
+export function fieldPageOf (text, page, linesPerPage) {
+  const size = Number.isSafeInteger(linesPerPage) && linesPerPage > 0 ? linesPerPage : 2000
+  const all = String(text === undefined || text === null ? '' : text).split(/\r\n|\r|\n/)
+  const total = all.length
+  const pages = Math.max(1, Math.ceil(total / size))
+  const want = Number.isSafeInteger(page) && page > 0 ? page : 0
+  const current = Math.min(want, pages - 1)
+  const from = current * size
+  const to = Math.min(total, from + size)
+  return { lines: all.slice(from, to), total, pages, page: current, start: from + 1, end: to }
+}
+
 export function effectiveFilterRows (configFilter, activeFilter) {
   const isPlain = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
   const base = isPlain(configFilter) ? configFilter : {}

@@ -36,8 +36,9 @@ function createConfigHandlers (ctx) {
       sendJsonConditional(req, res, view)
     },
     // GET /api/config/filter：过滤规则读面（全局鉴权已通过，Cookie/Bearer 均可）。
+    // F4：`?view=merged` 由 handleFilterGet 解析（只下发一份规则），所以 url 必须透传。
     getFilter (req, res, url) {
-      handleFilterGet(req, res)
+      handleFilterGet(req, res, url)
     },
     getFilterDraft (req, res, url) {
       handleFilterDraftGet(req, res)
