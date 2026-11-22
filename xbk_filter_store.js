@@ -33,6 +33,10 @@ const storage = require('./xbk_storage')
 const { writeAtomic } = storage
 // 路径构造单独成模块（纯 path.join + 本文件常量名），见该文件顶部说明。
 const { filterRulesPaths } = require('./scripts/filter-rules-paths')
+// 权限收紧/判定单独成模块（Semgrep 对非字面量路径的 fs 调用一律报 path-traversal，单独成模块后
+// 只排除该模块，不整文件排除本模块）。**必须在顶部 require**：F3 的容量文件在模块加载期
+// （resolveFilterLimits → writeCapacityFile）就要用 isOwnerOnlyFile，放到文件中部的 const 会踩 TDZ。
+const { enforceOwnerOnlyMode, isOwnerOnlyFile } = require('./scripts/owner-only-mode.js')
 
 // 字段顺序沿用 xbk_utils.FILTER_FIELDS 的历史顺序（末尾追加 pingbitime），
 // 必须与 Config.filter 的键集合完全一致（测试逐元素断言）。
@@ -51,24 +55,62 @@ const FILTER_RULE_FIELDS = Object.freeze([
 ])
 
 const FILTER_RULES_SCHEMA = 1
-// ── 预算的单一来源（F1）────────────────────────────────────────────────────
-// 过去这四条上限是四份手抄副本：store 的单字段/整份上限 + console 的 body/草稿上限，改一处忘一处
-// 就会造出「能保存但读不回」。从 F1 起，数字只写在下面这一块：store 的每个闸门都经
-// FILTER_LIMITS / fieldMaxLenOf / readFieldMaxLen 取值，console 也从 FilterStore.FILTER_LIMITS
-// （requestBodyMaxBytes / fieldMaxLenOf）取，不再自带副本。
+// ── 预算的单一来源（F1 收口 · F3 动态化）──────────────────────────────────
+// 历史：单字段／整份文件／请求体／草稿四条上限曾是四份手抄副本，改一处忘一处就会造出「能保存但
+// 读不回」。F1 把它们收成这块单一来源；F3 再把「常数」换成**启动时算一次并钉住**的动态预算——
+// 保存时绝不重算：实测 MemAvailable 4 分钟内摆动 18%，每轮重算会得出 7 个不同上限。
 //
-// 读硬顶（readMaxBytes）与写预算（requestBodyMaxBytes）在这一步就拆成两个独立旋钮，为 F3 的
-// 动态预算铺路；**本项两者同值**（256 KiB），故行为零变化。
+// 公式（computeFilterCapacity，纯函数：无 IO／无时钟／无随机）：
+//   resourceCeiling = quantize64k(min(memBudget, diskBudget))
+//     memBudget  = 0.25 × min(MemAvailable, cgroup memory headroom) / 8   # 8 = 解析/请求/副本放大
+//     diskBudget = diskAvailBytes × 0.01 / 6                              # 6 份产物：override/tmp/bak/lkg/applied/audit
+//   totalBytes  = clamp(min(resourceCeiling, softCap), 256 KiB, 8 MiB)
+//   reserve     = Σ reserveChars(field) × 3 B = 42,432 B（8 个非 plus × 1000 + 3 个 plus × 2048）
+//   mainChars   = quantize1000((totalBytes − reserve) / 主字段数 / 3)
 //
-// 下面这些常量是**今天的值**：既是历史源码锚点（派生别名），也是加载期 fail-closed 的兜底数值；
-// FILTER_LIMITS 由它们组装，除此之外本文件与 console.js 不许再出现这些数字。
-// 单字段正文上限：16000 个 UTF-16 码元（与文档行长闸门的 String.length 口径一致）。
-// v3.394：4000 → 16000（用户实测到 386 条 ≈1500 字符后要求放宽，按三字词算约 4000 条/字段）。
-const FILTER_FIELD_MAX_LEN = 16000
-// 覆盖文件整体上限 / 读硬顶：256 KiB，与 console 的 body 上限同源，避免「能保存但读不回」。
-const FILTER_RULES_MAX_BYTES = 256 * 1024
+// 落点：resolveFilterLimits() 在**模块加载**探测一次（/proc/meminfo 的 MemAvailable；自身 cgroup
+// 上溯的 memory.max/current —— `max` 必须特判：Number('max') = NaN；fs.statfsSync(cacheDir) 的
+// bavail × bsize），结果钉进 FILTER_LIMITS，并写 <缓存目录>/filter-capacity.json（0600）供 console
+// 与 worker 共读；两个进程必须用同一份预算，不一致时以文件为准并告警。
+//
+// 覆盖：XBK_FILTER_SOFT_CAP_BYTES（整数 → 夹 [256 KiB, 8 MiB]、向下 4096 对齐；非法值回落默认
+// 512 KiB 并 console.warn，不静默当 auto）。探测失败（meminfo 读不到／MemAvailable ≤ 0／cgroup
+// headroom ≤ 0／statfs 抛错）→ 回落 256 KiB + 16,000 字符 + degraded:true，**绝不回落成「无限」**
+// （readSafeTextResult 的 maxBytes 非正/NaN 等于不设限整读）。
+const FILTER_BYTES_PER_CHAR = 3
+const FILTER_MAIN_CHARS_QUANTUM = 1000
+const FILTER_TOTAL_QUANTUM_BYTES = 64 * 1024
+const FILTER_MIN_TOTAL_BYTES = 256 * 1024
+const FILTER_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+const FILTER_DEFAULT_SOFT_CAP_BYTES = 512 * 1024
+const FILTER_SOFT_CAP_ALIGN_BYTES = 4096
+const FILTER_SOFT_CAP_ENV = 'XBK_FILTER_SOFT_CAP_BYTES'
+const FILTER_CACHE_DIR_ENV = 'XBK_CACHE_DIR'
+const FILTER_CAPACITY_FILE = 'filter-capacity.json'
+const FILTER_CAPACITY_SCHEMA = 1
+const FILTER_CAPACITY_FILE_MAX_BYTES = 64 * 1024
+const FILTER_REQUEST_BODY_MARGIN_BYTES = 8192
+const FILTER_READ_MARGIN_BYTES = 1024
+const FILTER_MEM_BUDGET_RATIO = 0.25
+const FILTER_MEM_AMPLIFICATION = 8
+const FILTER_DISK_BUDGET_RATIO = 0.01
+const FILTER_DISK_COPIES = 6
 // 保存闸门给 revision 位数增长留的余量（整份闸门按 上限-32 判，见 validateFilterRules 闸门 5）。
 const FILTER_SAVE_HEADROOM_BYTES = 32
+// 单字段的**预留**字符数：plus（强化屏蔽）2048、其余 1000。它同时是 reserve 的唯一来源与
+// 非主字段的单字段档位（8 个非 plus × 1000 + 3 个 plus × 2048 = 14,144 字符 = 42,432 B）。
+const FILTER_FIELD_RESERVE_CHARS = 1000
+const FILTER_FIELD_PLUS_RESERVE_CHARS = 2048
+// 主字段：用户实际会填满的两个大字段（现网实测 屏蔽标题 15,735 / 屏蔽内容 15,636 字符），上限取
+// mainChars；其余字段按预留档位钉死（小字段 1000 / plus 2048），11 个字段全满也必须落在 totalBytes 内。
+const FILTER_MAIN_FIELDS = Object.freeze(['pingbibiaoti', 'pingbineirong'])
+// 今日常量（F1 的数字）：既是**读端下限**（存量小字段不得被判 corrupt），也是探测失败时的回落值。
+const FILTER_FIELD_MAX_LEN = 16000
+const FILTER_RULES_MAX_BYTES = 256 * 1024
+// LKG / applied 快照相对覆盖文件的包装预算（F4-1 R3 / P2 返工）：1024 只写这一处。
+const FILTER_WRAPPER_BYTES = 1024
+// 预算表里任何标量项的合法上界：整份/读硬顶 ≤ 8 MiB，请求体再多 8 KiB 的余量。
+const FILTER_MAX_LIMIT_VALUE = FILTER_MAX_TOTAL_BYTES + FILTER_REQUEST_BODY_MARGIN_BYTES
 // ── F2-3：### 多行规则的对象爆炸闸（只约束**保存**入参）─────────────────────
 // ### 每行编译成 2 个 RE2 对象（约 3.9 KB/个）：4 MiB 全是多行规则 = 165,016 行 ≈ 33 万个对象
 // ≈ 1.29 GB 内存，单进程直接 OOM。抬上限（F3/F4）之前必须先把「条目数」钉住，否则字节上限被放松
@@ -84,62 +126,500 @@ const FILTER_MAX_ALTERNATIONS_PER_FIELD = 1000
 const FILTER_PREVIEW_BUDGET_MS = 200
 const FILTER_PREVIEW_BUDGET_RECORDS = 200
 
-// 冻结的预算表：全仓唯一的取值入口（console 也从这里取 requestBodyMaxBytes）。
-// fieldMaxLen 是**按 11 个字段全覆盖的表**（当前同值 16000，F3 才允许分字段增长）；
-// 未知字段由 fieldMaxLenOf 返回 0，绝不回落成「无限」。
-const LIMIT_SCALAR_KEYS = Object.freeze([
-  'rulesFileMaxBytes', 'readMaxBytes', 'requestBodyMaxBytes', 'draftFieldMaxLen',
-  'saveHeadroomBytes', 'lastgoodWrapperBytes', 'appliedWrapperBytes',
-  'maxRuleLines', 'maxRuleLinesPerField', 'maxAlternationsPerField'
-])
-// 今日常量（fail-closed 兜底）：与 FILTER_LIMITS 同值，表里任何一项被改坏时用它顶替。
-const LIMIT_FALLBACKS = Object.freeze({
-  fieldMaxLen: FILTER_FIELD_MAX_LEN,
-  rulesFileMaxBytes: FILTER_RULES_MAX_BYTES,
-  readMaxBytes: FILTER_RULES_MAX_BYTES,
-  requestBodyMaxBytes: FILTER_RULES_MAX_BYTES,
-  draftFieldMaxLen: FILTER_FIELD_MAX_LEN,
-  saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
-  lastgoodWrapperBytes: 1024,
-  appliedWrapperBytes: 1024,
-  maxRuleLines: FILTER_MAX_RULE_LINES,
-  maxRuleLinesPerField: FILTER_MAX_RULE_LINES_PER_FIELD,
-  maxAlternationsPerField: FILTER_MAX_ALTERNATIONS_PER_FIELD
-})
+const FILTER_PLUS_FIELD_SET = new Set(FILTER_RULE_FIELDS.filter(field => field.endsWith('plus')))
+const FILTER_MAIN_FIELD_SET = new Set(FILTER_MAIN_FIELDS)
+// 限额档位 plus 2048 的字段：3 个 plus + pingbitime。pingbitime 单独说明——它的 `分类###天数`
+// 多行规则是**正则**（分类段编译成分类正则），F2-3 的交替闸要在长度闸之前可达：分类段 1001 个
+// 未转义 `|` 至少 2,005 字符（'7|7|…###7'），1000 档会让交替闸在 pingbitime 上变成不可达的死闸，
+// 也会拒掉既有的多行天数配置。2048 = 9 个非主字段里最大的档位，全字段按限额填满仍是 519,576 B
+// ≤ totalBytes − 32（贴边），reserve 仍按 spec 的 42,432 B（pingbitime 的预留只算 1000，差额由
+// reserve 的 4,680 B 余量吸收，方向保守：reserve 偏大 ⇒ mainChars 偏小）。
+const FILTER_PLUS_LIMIT_FIELD_SET = new Set([...FILTER_PLUS_FIELD_SET, 'pingbitime'])
 
 function isPositiveSafeInt (value) {
   return Number.isSafeInteger(value) && value > 0
 }
 
+function isPositiveFinite (value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+// 单字段的预留档位（plus 2048、其余 1000）。pingbitime 也在 1000 档：纯天数字段实测只有个位数，
+// 但 `分类###天数` 多行规则要放得下（16 字符会拒掉既有配置）。
+function reserveCharsOf (field) {
+  return FILTER_PLUS_FIELD_SET.has(field) ? FILTER_FIELD_PLUS_RESERVE_CHARS : FILTER_FIELD_RESERVE_CHARS
+}
+
+// 单字段的**限额**档位：主字段取 mainChars，plus 档（含 pingbitime）2048，其余 1000。
+function limitCharsOf (field, mainChars) {
+  if (FILTER_MAIN_FIELD_SET.has(field)) return mainChars
+  return FILTER_PLUS_LIMIT_FIELD_SET.has(field) ? FILTER_FIELD_PLUS_RESERVE_CHARS : FILTER_FIELD_RESERVE_CHARS
+}
+
+// reserve = 11 个字段的预留字符数 × 3 B（= spec 的 (8 小字段 × 1000 + 3 plus × 2048) × 3 = 42,432）。
+const FILTER_RESERVE_BYTES = FILTER_RULE_FIELDS.reduce((sum, field) => sum + reserveCharsOf(field), 0) * FILTER_BYTES_PER_CHAR
+
+function quantizeDown (value, quantum) {
+  return Math.floor(value / quantum) * quantum
+}
+
+function clampInt (value, min, max) {
+  return Math.min(Math.max(value, min), max)
+}
+
 /**
- * 加载期校验 FILTER_LIMITS：不合格的项逐项回落到今日常量并 console.warn（fail-closed）。
+ * 覆盖值 XBK_FILTER_SOFT_CAP_BYTES：只认十进制非负整数；夹 [256 KiB, 8 MiB]、向下 4096 对齐。
+ * 非法值（空串以外的任何非整数形态）回落默认 512 KiB 并 console.warn——**不静默当 auto**：
+ * 用户显式设了值却没生效，必须能在日志里看到原因。
+ * @returns {{bytes:number, explicit:boolean, invalid:boolean}}
+ */
+function parseSoftCapBytes (raw) {
+  const text = raw === undefined || raw === null ? '' : String(raw).trim()
+  if (text === '') return { bytes: FILTER_DEFAULT_SOFT_CAP_BYTES, explicit: false, invalid: false }
+  if (!/^\d+$/.test(text)) return { bytes: FILTER_DEFAULT_SOFT_CAP_BYTES, explicit: true, invalid: true }
+  const value = Number(text)
+  if (!Number.isSafeInteger(value)) return { bytes: FILTER_DEFAULT_SOFT_CAP_BYTES, explicit: true, invalid: true }
+  return {
+    bytes: clampInt(quantizeDown(value, FILTER_SOFT_CAP_ALIGN_BYTES), FILTER_MIN_TOTAL_BYTES, FILTER_MAX_TOTAL_BYTES),
+    explicit: true,
+    invalid: false
+  }
+}
+
+/**
+ * 把 totalBytes 摊成完整预算表：computeFilterCapacity 与「以容量文件为准」共用同一套派生，
+ * 保证两个进程对同一个 totalBytes 得到逐字段相同的 perField 与读/写旋钮。
+ * readMaxBytes 只在 max(totalBytes, 当前文件字节数) 之上再加 1024——「当前文件字节数」进公式是为了
+ * 杜绝「保存成功但下一轮读端判 tooLarge」。
+ */
+function layoutFilterCapacity (totalBytes, {
+  fileBytes = 0, source = 'probe', degraded = false, degradedReasons = [],
+  softCapBytes = FILTER_DEFAULT_SOFT_CAP_BYTES
+} = {}) {
+  const mainChars = Math.max(
+    FILTER_MAIN_CHARS_QUANTUM,
+    quantizeDown((totalBytes - FILTER_RESERVE_BYTES) / FILTER_MAIN_FIELDS.length / FILTER_BYTES_PER_CHAR, FILTER_MAIN_CHARS_QUANTUM)
+  )
+  const perField = {}
+  for (const field of FILTER_RULE_FIELDS) {
+    perField[field] = Object.freeze({ chars: limitCharsOf(field, mainChars) })
+  }
+  const currentFileBytes = isPositiveSafeInt(fileBytes) ? fileBytes : 0
+  return {
+    totalBytes,
+    perField: Object.freeze(perField),
+    mainChars,
+    reserveBytes: FILTER_RESERVE_BYTES,
+    rulesFileMaxBytes: totalBytes,
+    readMaxBytes: Math.min(Math.max(totalBytes, currentFileBytes) + FILTER_READ_MARGIN_BYTES, FILTER_MAX_TOTAL_BYTES),
+    requestBodyMaxBytes: totalBytes + FILTER_REQUEST_BODY_MARGIN_BYTES,
+    saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
+    // 与预算无关、但同表下发的旋钮：包装预算与条目闸（console 的 GET limits 也从这里取）。
+    lastgoodWrapperBytes: FILTER_WRAPPER_BYTES,
+    appliedWrapperBytes: FILTER_WRAPPER_BYTES,
+    maxRuleLines: FILTER_MAX_RULE_LINES,
+    maxRuleLinesPerField: FILTER_MAX_RULE_LINES_PER_FIELD,
+    maxAlternationsPerField: FILTER_MAX_ALTERNATIONS_PER_FIELD,
+    softCapBytes,
+    source,
+    degraded,
+    degradedReasons: Object.freeze(degradedReasons.slice())
+  }
+}
+
+/**
+ * 纯函数：把本机资源探测结果换算成过滤规则预算（无 IO／无时钟／无随机 ⇒ 同一入参连调两次的
+ * JSON 逐字节相等，这是容量文件跨进程共读的前提）。
+ * @param {{memAvailableBytes?:number|null, cgroupHeadroomBytes?:number|null, diskAvailBytes?:number|null,
+ *          fileBytes?:number, softCapBytes?:number, probeErrors?:string[]}} [input]
+ *   null／非正／非有限 = 该项探测失败。四类失败（meminfo 读不到／MemAvailable ≤ 0／cgroup
+ *   headroom ≤ 0／statfs 抛错）一律整体回落 256 KiB + 16,000 字符 + degraded:true。
+ *   cgroupHeadroomBytes 传 Infinity = cgroup 无上限（只剩 MemAvailable 一个约束），不算失败。
+ * @returns {{totalBytes:number, perField:Object, mainChars:number, reserveBytes:number,
+ *            readMaxBytes:number, requestBodyMaxBytes:number, rulesFileMaxBytes:number,
+ *            saveHeadroomBytes:number, softCapBytes:number, source:string, degraded:boolean,
+ *            degradedReasons:string[]}}
+ */
+function computeFilterCapacity (input) {
+  const opts = input && typeof input === 'object' ? input : {}
+  const softCapBytes = isPositiveSafeInt(opts.softCapBytes)
+    ? clampInt(quantizeDown(opts.softCapBytes, FILTER_SOFT_CAP_ALIGN_BYTES), FILTER_MIN_TOTAL_BYTES, FILTER_MAX_TOTAL_BYTES)
+    : FILTER_DEFAULT_SOFT_CAP_BYTES
+  const reasons = Array.isArray(opts.probeErrors) ? opts.probeErrors.filter(reason => typeof reason === 'string' && reason) : []
+  const memAvailableBytes = isPositiveFinite(opts.memAvailableBytes) ? opts.memAvailableBytes : null
+  if (memAvailableBytes === null) reasons.push('meminfo 的 MemAvailable 不可用')
+  const cgroupHeadroomBytes = opts.cgroupHeadroomBytes === Infinity
+    ? Infinity
+    : (isPositiveFinite(opts.cgroupHeadroomBytes) ? opts.cgroupHeadroomBytes : null)
+  if (cgroupHeadroomBytes === null) reasons.push('cgroup memory headroom 不可用或 ≤ 0')
+  const diskAvailBytes = isPositiveFinite(opts.diskAvailBytes) ? opts.diskAvailBytes : null
+  if (diskAvailBytes === null) reasons.push('statfs 可用空间不可用')
+  if (reasons.length > 0) {
+    // fail-closed：回落今日常量（256 KiB / 16,000）。方向永远是「更严」，绝不回落成无限。
+    const base = layoutFilterCapacity(FILTER_RULES_MAX_BYTES, {
+      fileBytes: opts.fileBytes, source: 'fallback', degraded: true, degradedReasons: reasons, softCapBytes
+    })
+    const perField = {}
+    for (const field of FILTER_RULE_FIELDS) perField[field] = Object.freeze({ chars: FILTER_FIELD_MAX_LEN })
+    return { ...base, perField: Object.freeze(perField), mainChars: FILTER_FIELD_MAX_LEN }
+  }
+  const memLimitBytes = cgroupHeadroomBytes === Infinity ? memAvailableBytes : Math.min(memAvailableBytes, cgroupHeadroomBytes)
+  const memBudget = (FILTER_MEM_BUDGET_RATIO * memLimitBytes) / FILTER_MEM_AMPLIFICATION
+  const diskBudget = (diskAvailBytes * FILTER_DISK_BUDGET_RATIO) / FILTER_DISK_COPIES
+  const resourceCeiling = quantizeDown(Math.min(memBudget, diskBudget), FILTER_TOTAL_QUANTUM_BYTES)
+  const totalBytes = clampInt(Math.min(resourceCeiling, softCapBytes), FILTER_MIN_TOTAL_BYTES, FILTER_MAX_TOTAL_BYTES)
+  return layoutFilterCapacity(totalBytes, { fileBytes: opts.fileBytes, softCapBytes })
+}
+
+function readTextFile (readFileSync, filePath) {
+  try {
+    const text = readFileSync(filePath, 'utf8')
+    return typeof text === 'string' ? text : String(text)
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * /proc/meminfo 的 MemAvailable（字节）。读不到／格式不符返回 null（⇒ 预算整体回落 degraded）。
+ */
+function probeMemAvailableBytes ({ readFileSync = fs.readFileSync, meminfoPath = '/proc/meminfo' } = {}) {
+  const text = readTextFile(readFileSync, meminfoPath)
+  if (text === null) return null
+  const match = /^MemAvailable:\s*(\d+)\s*kB/m.exec(text)
+  if (!match) return null
+  const kb = Number(match[1])
+  return isPositiveSafeInt(kb) ? kb * 1024 : null
+}
+
+/**
+ * 自身 cgroup 的 memory headroom（字节）。从 /proc/self/cgroup 找 memory 层级路径，逐级上溯读
+ * memory.max / memory.current，取**所有有限层级里最小的 headroom**（v2 里某级写 `max` 只表示该级
+ * 无限制，父级仍可能有限制）。`max` 必须特判：Number('max') = NaN，漏了它预算会变成 NaN 或被静默
+ * 夹成 0。
+ * @returns {{status:('ok'|'unlimited'|'unavailable'|'invalid'), headroomBytes?:number}}
+ */
+function probeCgroupHeadroomBytes ({
+  readFileSync = fs.readFileSync, procCgroupPath = '/proc/self/cgroup', cgroupRoot = '/sys/fs/cgroup'
+} = {}) {
+  const text = readTextFile(readFileSync, procCgroupPath)
+  if (text === null) return { status: 'unavailable' }
+  let rel = null
+  let v1 = false
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    const v2 = /^\d+::(.*)$/.exec(trimmed)
+    if (v2) { rel = v2[1]; v1 = false; break }
+    const legacy = /^\d+:memory:(.*)$/.exec(trimmed)
+    if (legacy) { rel = legacy[1]; v1 = true }
+  }
+  if (rel === null) return { status: 'unavailable' }
+  const base = v1 ? path.join(cgroupRoot, 'memory') : cgroupRoot
+  const relPaths = []
+  let cursor = rel === '' ? '/' : rel
+  for (let depth = 0; depth < 64; depth++) {
+    relPaths.push(cursor)
+    if (cursor === '/' || cursor === '.') break
+    const parent = path.posix.dirname(cursor)
+    if (parent === cursor) break
+    cursor = parent
+  }
+  let headroom = Infinity
+  let sawLimit = false
+  for (const relPath of relPaths) {
+    const dir = path.join(base, relPath)
+    const maxText = readTextFile(readFileSync, path.join(dir, 'memory.max'))
+    if (maxText === null) continue
+    const trimmed = maxText.trim()
+    if (trimmed === 'max') continue // 该级无限制：继续上溯，父级仍可能有界
+    const max = Number(trimmed)
+    if (!Number.isFinite(max) || max <= 0) continue
+    const currentText = readTextFile(readFileSync, path.join(dir, 'memory.current'))
+    const current = currentText === null ? 0 : Number(currentText.trim())
+    const used = Number.isFinite(current) && current >= 0 ? current : 0
+    headroom = Math.min(headroom, max - used)
+    sawLimit = true
+  }
+  if (!sawLimit) return { status: 'unlimited' }
+  return headroom > 0 ? { status: 'ok', headroomBytes: headroom } : { status: 'invalid' }
+}
+
+/**
+ * fs.statfsSync(dir) 的可用字节（bavail × bsize）。抛错／非正返回 null（⇒ 预算整体回落 degraded）。
+ */
+function probeDiskAvailBytes ({ statfsSync = fs.statfsSync, dir = process.cwd() } = {}) {
+  try {
+    const stats = statfsSync(String(dir))
+    const avail = Number(stats.bavail) * Number(stats.bsize)
+    return Number.isFinite(avail) && avail > 0 ? Math.floor(avail) : null
+  } catch (e) {
+    return null
+  }
+}
+
+// 当前覆盖文件字节数（readMaxBytes 的输入之一）：读不到按 0——只影响读硬顶的下界，不影响预算。
+function statRulesFileBytes (filePath) {
+  if (typeof filePath !== 'string' || filePath === '') return 0
+  try {
+    const meta = storage.statSafeMeta(filePath)
+    return meta.status === 'ok' && isPositiveSafeInt(meta.size) ? meta.size : 0
+  } catch (e) {
+    return 0
+  }
+}
+
+// 容量目录：只认绝对路径（与 XBK_CACHE_DIR 的既有规则一致：相对路径忽略，见 SYSTEM_CONTRACT 缓存目录条）。
+function resolveCapacityDir (explicit, env) {
+  for (const candidate of [explicit, safeGet(env, FILTER_CACHE_DIR_ENV)]) {
+    const text = typeof candidate === 'string' ? candidate.trim() : ''
+    if (text !== '' && path.isAbsolute(text)) return text
+  }
+  return null
+}
+
+/**
+ * 读共读的容量文件（<缓存目录>/filter-capacity.json）。任何不合规形态返回 null（= 没有文件），绝不
+ * 部分采用：这份文件决定 console 与 worker 的预算，读到半份就等于两边各用一套。
+ * @returns {{totalBytes:number, perField:Object, mainChars:number, source:string,
+ *            degraded:boolean, at:number, softCapBytes:(number|null)}|null}
+ */
+function readCapacityFile (filePath) {
+  if (typeof filePath !== 'string' || filePath === '') return null
+  try {
+    const read = storage.readSafeTextResult(filePath, FILTER_CAPACITY_FILE_MAX_BYTES, { openNonBlocking: true })
+    if (!read || read.status !== 'ok' || typeof read.text !== 'string') return null
+    let data
+    try { data = JSON.parse(read.text) } catch (e) { return null }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+    if (data.schema !== FILTER_CAPACITY_SCHEMA) return null
+    if (!isPositiveSafeInt(data.totalBytes) || data.totalBytes < FILTER_MIN_TOTAL_BYTES || data.totalBytes > FILTER_MAX_TOTAL_BYTES) return null
+    if (typeof data.source !== 'string' || data.source === '') return null
+    if (typeof data.degraded !== 'boolean') return null
+    if (typeof data.at !== 'number' || !Number.isFinite(data.at)) return null
+    if (!data.perField || typeof data.perField !== 'object' || Array.isArray(data.perField)) return null
+    const perField = {}
+    for (const field of FILTER_RULE_FIELDS) {
+      const entry = safeGet(data.perField, field)
+      const chars = entry && typeof entry === 'object' ? safeGet(entry, 'chars') : undefined
+      if (!isPositiveSafeInt(chars)) return null
+      perField[field] = Object.freeze({ chars })
+    }
+    const mainCharEntry = safeGet(perField, FILTER_MAIN_FIELDS[0])
+    return {
+      totalBytes: data.totalBytes,
+      perField: Object.freeze(perField),
+      mainChars: mainCharEntry.chars,
+      source: data.source,
+      degraded: data.degraded,
+      at: data.at,
+      softCapBytes: isPositiveSafeInt(data.softCapBytes) ? data.softCapBytes : null
+    }
+  } catch (e) {
+    return null
+  }
+}
+
+function sameFieldChars (a, b) {
+  for (const field of FILTER_RULE_FIELDS) {
+    const left = a && typeof a === 'object' ? safeGet(a, field) : undefined
+    const right = b && typeof b === 'object' ? safeGet(b, field) : undefined
+    if (!left || !right || left.chars !== right.chars) return false
+  }
+  return true
+}
+
+/**
+ * 写容量文件（0600，writeAtomic 原子提交）。预算没变时**不重写**并保留原 `at`——worker 每 5 秒
+ * spawn 一次单轮进程，每轮重写等于把「启动钉住」换成新的写放大；`at` 只在预算真的变化时前进。
+ * @returns {boolean} 是否落盘成功（失败只告警，绝不阻断模块加载）
+ */
+function writeCapacityFile (filePath, capacity, nowMs) {
+  if (typeof filePath !== 'string' || filePath === '') return false
+  try {
+    const prev = readCapacityFile(filePath)
+    if (prev && prev.totalBytes === capacity.totalBytes && prev.source === capacity.source &&
+        prev.degraded === capacity.degraded && prev.softCapBytes === capacity.softCapBytes &&
+        prev.mainChars === capacity.mainChars && sameFieldChars(prev.perField, capacity.perField) &&
+        isOwnerOnlyFile(filePath)) {
+      return true
+    }
+    const payload = {
+      schema: FILTER_CAPACITY_SCHEMA,
+      totalBytes: capacity.totalBytes,
+      perField: capacity.perField,
+      mainChars: capacity.mainChars,
+      source: capacity.source,
+      degraded: capacity.degraded,
+      softCapBytes: capacity.softCapBytes,
+      at: Math.floor(Number.isFinite(nowMs) ? nowMs : Date.now())
+    }
+    const ok = writeAtomic(filePath, JSON.stringify(payload), '过滤规则容量')
+    if (!ok) {
+      console.warn(`⚠️ 过滤规则容量文件写入失败（本进程仍用已钉住的预算，但 console/worker 可能各算一份）：${filePath}`)
+    }
+    return ok
+  } catch (e) {
+    console.warn(`⚠️ 过滤规则容量文件写入异常（本进程仍用已钉住的预算）：${filePath}：${safeErrorMessage(e)}`)
+    return false
+  }
+}
+
+// 以容量文件为准时的派生：totalBytes/perField/mainChars 用文件的，readMaxBytes 按**当前**文件字节数
+// 重算（只会更大，方向安全——读端不得比写端更严）。
+function adoptSharedCapacity (shared, { fileBytes, softCapBytes }) {
+  const base = layoutFilterCapacity(shared.totalBytes, {
+    fileBytes,
+    source: shared.source,
+    degraded: shared.degraded,
+    degradedReasons: ['沿用容量文件（以文件为准）'],
+    softCapBytes: softCapBytes === null ? FILTER_DEFAULT_SOFT_CAP_BYTES : softCapBytes
+  })
+  return { ...base, perField: shared.perField, mainChars: shared.mainChars }
+}
+
+/**
+ * 解析本进程的过滤规则预算：探测一次 → 与容量文件对齐（跨进程共读）→（必要时）写回容量文件。
+ * **只在模块加载调用一次**；保存路径绝不重算。注入点只给测试用（生产走 /proc、/sys、fs 与 process.env）。
+ * 优先级：显式 XBK_FILTER_SOFT_CAP_BYTES（用户显式覆盖，且会重写容量文件）＞ 容量文件（启动钉住，
+ * 两进程同预算）＞ 本进程探测。
+ * @returns {Object} computeFilterCapacity 形状的冻结对象
+ */
+function resolveFilterLimits (options) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const env = opts.env && typeof opts.env === 'object' ? opts.env : process.env
+  const readFileSync = typeof opts.readFileSync === 'function' ? opts.readFileSync : fs.readFileSync
+  const statfsSync = typeof opts.statfsSync === 'function' ? opts.statfsSync : fs.statfsSync
+  const now = typeof opts.now === 'function' ? opts.now : Date.now
+  const rawSoftCap = safeGet(env, FILTER_SOFT_CAP_ENV)
+  const softCap = parseSoftCapBytes(rawSoftCap)
+  if (softCap.invalid) {
+    console.warn(`⚠️ ${FILTER_SOFT_CAP_ENV}=${String(rawSoftCap)} 不是十进制整数，已回落默认 ${FILTER_DEFAULT_SOFT_CAP_BYTES} 字节（要自动探测就不要设置它）`)
+  }
+  try {
+    const cacheDir = resolveCapacityDir(opts.cacheDir, env)
+    const probeErrors = []
+    const memAvailableBytes = probeMemAvailableBytes({ readFileSync })
+    const cgroup = probeCgroupHeadroomBytes({ readFileSync })
+    // 'unavailable'（无 /proc/self/cgroup 或没有 memory 层级）与 'unlimited'（所有层级都写 max）都是
+    // **没有 cgroup 上限**，不是探测失败：此时只剩 MemAvailable 一个约束（否则裸机会被误判成 degraded）。
+    // 只有 'invalid'（max ≤ current，进程已贴着上限）算失败——那时 memBudget 会算出 0 或负数。
+    if (cgroup.status === 'invalid') probeErrors.push('cgroup memory headroom ≤ 0（max ≤ current）')
+    const diskAvailBytes = probeDiskAvailBytes({ statfsSync, dir: cacheDir || process.cwd() })
+    const fileBytes = statRulesFileBytes(cacheDir ? filterRulesPaths(cacheDir).file : null)
+    const local = computeFilterCapacity({
+      memAvailableBytes,
+      cgroupHeadroomBytes: cgroup.status === 'ok' ? cgroup.headroomBytes : Infinity,
+      diskAvailBytes,
+      fileBytes,
+      softCapBytes: softCap.bytes,
+      probeErrors
+    })
+    const capacityPath = cacheDir ? path.join(cacheDir, FILTER_CAPACITY_FILE) : null
+    let capacity = local
+    if (capacityPath) {
+      const shared = readCapacityFile(capacityPath)
+      if (shared) {
+        if (softCap.explicit) {
+          // 显式覆盖优先：否则「可覆盖」在第二个进程上就失效（文件是上一次的钉住值）。
+          if (shared.totalBytes !== local.totalBytes) {
+            console.warn(`⚠️ 容量文件（${capacityPath}）记录 totalBytes=${shared.totalBytes}，与本次 ${FILTER_SOFT_CAP_ENV}=${softCap.bytes} 算出的 ${local.totalBytes} 不一致：以显式覆盖为准并重写容量文件`)
+          }
+        } else if (shared.totalBytes !== local.totalBytes || shared.source !== local.source) {
+          console.warn(`⚠️ 本进程探测到 totalBytes=${local.totalBytes}（${local.source}），与容量文件（${capacityPath}）的 ${shared.totalBytes}（${shared.source}）不一致：以文件为准（启动钉住，console 与 worker 必须用同一份预算）`)
+          capacity = adoptSharedCapacity(shared, { fileBytes, softCapBytes: shared.softCapBytes })
+        }
+      }
+      writeCapacityFile(capacityPath, capacity, now())
+    }
+    return Object.freeze(capacity)
+  } catch (e) {
+    // 模块加载期绝不抛穿：任何意外都回落今日常量（degraded），否则整轮推送起不来。
+    console.warn(`⚠️ 过滤规则预算解析异常，已回落 ${FILTER_RULES_MAX_BYTES} 字节 / ${FILTER_FIELD_MAX_LEN} 字符：${safeErrorMessage(e)}`)
+    return Object.freeze(computeFilterCapacity({ probeErrors: ['预算解析异常'] }))
+  }
+}
+
+const LIMIT_SCALAR_KEYS = Object.freeze([
+  'rulesFileMaxBytes', 'readMaxBytes', 'requestBodyMaxBytes', 'saveHeadroomBytes',
+  'lastgoodWrapperBytes', 'appliedWrapperBytes',
+  'maxRuleLines', 'maxRuleLinesPerField', 'maxAlternationsPerField'
+])
+// 今日常量（fail-closed 兜底）：探测失败与「表里某项被改坏」都回落这一组，数值与 F1 逐字相同
+// ——与 FILTER_LIMITS 的构造共用上面那几个常量，同一批数字不再写两遍。
+const LIMIT_FALLBACKS = Object.freeze({
+  totalBytes: FILTER_RULES_MAX_BYTES,
+  perField: Object.freeze(Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, Object.freeze({ chars: FILTER_FIELD_MAX_LEN })]))),
+  rulesFileMaxBytes: FILTER_RULES_MAX_BYTES,
+  readMaxBytes: FILTER_RULES_MAX_BYTES,
+  requestBodyMaxBytes: FILTER_RULES_MAX_BYTES,
+  saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
+  lastgoodWrapperBytes: FILTER_WRAPPER_BYTES,
+  appliedWrapperBytes: FILTER_WRAPPER_BYTES,
+  maxRuleLines: FILTER_MAX_RULE_LINES,
+  maxRuleLinesPerField: FILTER_MAX_RULE_LINES_PER_FIELD,
+  maxAlternationsPerField: FILTER_MAX_ALTERNATIONS_PER_FIELD
+})
+
+/**
+ * 加载期校验预算表：不合格的项逐项回落 LIMIT_FALLBACKS 并 console.warn（fail-closed）。
  * 为什么必须有这道闸：xbk_storage.resolveMaxBytes 在 maxBytes 非正/NaN 时返回 null = **不设限整读**
  * （xbk_storage.js:204），一次笔误就会把「有界读」变成「无界读」。所有闸门读的都是本函数产出的
  * 冻结对象，故 NaN/0/负数永远到不了 readSafeTextResult。
- * 字段表额外保证 11 个字段齐全：缺字段的项同样回落今日常量（fieldMaxLenOf 的 0 只留给**未知**字段）。
- * @param {{fieldMaxLen:Object}} [limits]
- * @returns {{fieldMaxLen:Object, [key:string]:number}}
+ * 两条结构不变式在这里兜住：① 11 个字段的 perField 必须齐全（fieldMaxLenOf 的 0 只留给**未知**字段）；
+ * ② 写入接受阈值（rulesFileMaxBytes − saveHeadroomBytes）必须 ≤ 读硬顶 readMaxBytes——否则就是
+ * 「保存成功但下一轮读端判超限 → 整份降级」。
+ * @param {{totalBytes?:number, perField?:Object, [key:string]:number}} [limits]
+ * @returns {{totalBytes:number, perField:Object, fieldMaxLen:Object, [key:string]:number}}
  */
 function normalizeFilterLimits (limits) {
   const bad = []
-  const source = limits && typeof limits.fieldMaxLen === 'object' && limits.fieldMaxLen !== null ? limits.fieldMaxLen : {}
+  const source = limits && typeof limits.perField === 'object' && limits.perField !== null ? limits.perField : {}
+  const perField = {}
   const fieldMaxLen = {}
   for (const field of FILTER_RULE_FIELDS) {
-    const value = source[field]
-    if (isPositiveSafeInt(value)) fieldMaxLen[field] = value
-    else {
-      bad.push(`fieldMaxLen.${field}=${String(value)}`)
-      fieldMaxLen[field] = LIMIT_FALLBACKS.fieldMaxLen
+    const entry = safeGet(source, field)
+    const value = entry && typeof entry === 'object' ? safeGet(entry, 'chars') : undefined
+    const fallbackChars = LIMIT_FALLBACKS.perField[field].chars
+    if (isPositiveSafeInt(value)) {
+      perField[field] = Object.freeze({ chars: value })
+      fieldMaxLen[field] = value
+    } else {
+      bad.push(`perField.${field}.chars=${String(value)}`)
+      perField[field] = Object.freeze({ chars: fallbackChars })
+      fieldMaxLen[field] = fallbackChars
     }
   }
-  const normalized = { fieldMaxLen: Object.freeze(fieldMaxLen) }
+  const normalized = { perField: Object.freeze(perField), fieldMaxLen: Object.freeze(fieldMaxLen) }
+  const totalBytes = limits ? limits.totalBytes : undefined
+  if (isPositiveSafeInt(totalBytes) && totalBytes >= FILTER_MIN_TOTAL_BYTES && totalBytes <= FILTER_MAX_TOTAL_BYTES) {
+    normalized.totalBytes = totalBytes
+  } else {
+    bad.push(`totalBytes=${String(totalBytes)}`)
+    normalized.totalBytes = LIMIT_FALLBACKS.totalBytes
+  }
   for (const key of LIMIT_SCALAR_KEYS) {
     const value = limits ? limits[key] : undefined
-    if (isPositiveSafeInt(value)) normalized[key] = value
+    if (isPositiveSafeInt(value) && value <= FILTER_MAX_LIMIT_VALUE) normalized[key] = value
     else {
       bad.push(`${key}=${String(value)}`)
       normalized[key] = LIMIT_FALLBACKS[key]
     }
+  }
+  // ③ 整份预算不得大于 totalBytes（spec：整份 ≤ totalBytes − 32；反向不设下限，方向只会更严）。
+  if (normalized.rulesFileMaxBytes > normalized.totalBytes) {
+    bad.push(`rulesFileMaxBytes=${normalized.rulesFileMaxBytes} 大于 totalBytes=${normalized.totalBytes}`)
+    normalized.rulesFileMaxBytes = normalized.totalBytes
+  }
+  // ④ 请求体预算必须容得下整份预算——否则「预算填满」的文件按请求体就被 413，等于白抬上限。
+  const minRequestBodyMaxBytes = Math.min(normalized.totalBytes + FILTER_REQUEST_BODY_MARGIN_BYTES, FILTER_MAX_LIMIT_VALUE)
+  if (normalized.requestBodyMaxBytes < minRequestBodyMaxBytes) {
+    bad.push(`requestBodyMaxBytes=${normalized.requestBodyMaxBytes} 小于 totalBytes+${FILTER_REQUEST_BODY_MARGIN_BYTES}=${minRequestBodyMaxBytes}`)
+    normalized.requestBodyMaxBytes = minRequestBodyMaxBytes
+  }
+  const acceptMaxBytes = normalized.rulesFileMaxBytes - normalized.saveHeadroomBytes
+  if (acceptMaxBytes > normalized.readMaxBytes) {
+    bad.push(`readMaxBytes=${normalized.readMaxBytes} 小于写入接受阈值 ${acceptMaxBytes}`)
+    normalized.readMaxBytes = Math.min(normalized.rulesFileMaxBytes, FILTER_MAX_TOTAL_BYTES)
   }
   if (bad.length) {
     console.warn(`⚠️ FILTER_LIMITS 非法（${bad.join('、')}），已 fail-closed 回落到今日常量`)
@@ -147,21 +627,17 @@ function normalizeFilterLimits (limits) {
   return normalized
 }
 
-const FILTER_LIMITS = Object.freeze(normalizeFilterLimits({
-  fieldMaxLen: Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, FILTER_FIELD_MAX_LEN])),
-  rulesFileMaxBytes: FILTER_RULES_MAX_BYTES,
-  // 读硬顶与写预算在本项同值（行为零变化）；F3 起两者分道扬镳。
-  readMaxBytes: FILTER_RULES_MAX_BYTES,
-  requestBodyMaxBytes: FILTER_RULES_MAX_BYTES,
-  draftFieldMaxLen: FILTER_FIELD_MAX_LEN,
-  saveHeadroomBytes: FILTER_SAVE_HEADROOM_BYTES,
-  lastgoodWrapperBytes: 1024,
-  appliedWrapperBytes: 1024,
-  // F2-3：条目数上限（与字节上限同表，console 的 GET 也下发它们）
-  maxRuleLines: FILTER_MAX_RULE_LINES,
-  maxRuleLinesPerField: FILTER_MAX_RULE_LINES_PER_FIELD,
-  maxAlternationsPerField: FILTER_MAX_ALTERNATIONS_PER_FIELD
-}))
+// 模块加载时探测一次并钉住（console 与 worker 通过 <缓存目录>/filter-capacity.json 共读同一份）。
+const RESOLVED_CAPACITY = resolveFilterLimits()
+
+// 冻结的预算表：全仓唯一的取值入口（console 也从这里取 readMaxBytes / requestBodyMaxBytes）。
+// perField[field].chars 是**按 11 个字段全覆盖的表**（主字段 mainChars、plus 2048、小字段 1000）；
+// fieldMaxLen 是同一份数据的扁平视图（兼容既有调用方）。未知字段由 fieldMaxLenOf 返回 0，绝不回落成「无限」。
+const FILTER_LIMITS = Object.freeze({
+  ...normalizeFilterLimits(RESOLVED_CAPACITY),
+  source: RESOLVED_CAPACITY.source,
+  degraded: RESOLVED_CAPACITY.degraded
+})
 
 // 保存路径的单字段上限：以 FILTER_LIMITS.fieldMaxLen 为准；**未知字段返回 0**（一律拒绝），
 // 绝不回落成无限——那等于给每个新增的未知字段开一条绕过长度闸门的通道。
@@ -169,10 +645,35 @@ function fieldMaxLenOf (field) {
   return hasOwn(FILTER_LIMITS.fieldMaxLen, field) ? FILTER_LIMITS.fieldMaxLen[field] : 0
 }
 
-// 读路径的单字段上限：max(今日单字段上限, fieldMaxLenOf(field))——读端必须能读回存量文件，
-// F3 抬上限后旧的小值字段仍然可读。本项两者相等，行为零变化。
+// 读路径的单字段上限：max(今日单字段上限, fieldMaxLenOf(field))——读端必须能读回存量文件：
+// F3 把非主字段的写预算收到 1000/2048，但存量里可能有 16,000 字符的老字段，判 corrupt 等于让规则
+// 静默失效（比保存被拒严重得多）。故读端永远不严于今日的 16,000。
 function readFieldMaxLen (field) {
   return Math.max(FILTER_FIELD_MAX_LEN, fieldMaxLenOf(field))
+}
+
+/**
+ * LKG / 生效快照的读上限 = 读硬顶 + 包装预算，并在加载期做**形态与上界**校验：预算可被外部覆盖，
+ * 派生值不得变成 NaN 或被静默溢出（NaN 传给 readSafeTextResult = 无界读；比上限还大则等于放开读端）。
+ * @param {{readMaxBytes?:number, lastgoodWrapperBytes?:number, appliedWrapperBytes?:number}} [input]
+ * @returns {{lastgoodMaxBytes:number, appliedMaxBytes:number, fallback:boolean}}
+ */
+function computeDerivedReadLimits (input) {
+  const opts = input && typeof input === 'object' ? input : {}
+  const hardCap = FILTER_MAX_TOTAL_BYTES + FILTER_WRAPPER_BYTES
+  let fallback = false
+  const sumOf = (base, wrapper, label) => {
+    const total = isPositiveSafeInt(base) && isPositiveSafeInt(wrapper) ? base + wrapper : NaN
+    if (isPositiveSafeInt(total) && total <= hardCap) return total
+    fallback = true
+    console.warn(`⚠️ 派生读上限 ${label} 非法（readMaxBytes=${String(base)} + 包装 ${String(wrapper)}），已 fail-closed 回落到 ${hardCap} 字节`)
+    return hardCap
+  }
+  return {
+    lastgoodMaxBytes: sumOf(opts.readMaxBytes, opts.lastgoodWrapperBytes, 'LASTGOOD_MAX_BYTES'),
+    appliedMaxBytes: sumOf(opts.readMaxBytes, opts.appliedWrapperBytes, 'APPLIED_MAX_BYTES'),
+    fallback
+  }
 }
 
 /**
@@ -256,16 +757,22 @@ function filterLimitsReport (cacheDir, filter) {
   }
   return {
     limits: {
-      // 拷贝一份冻结表的浅拷贝：响应对象要被 JSON 序列化，直接下发 FILTER_LIMITS.fieldMaxLen
-      // 会让调用方拿到进程内共享的冻结表（改不动，但引用一泄漏就少一层边界）。
+      // totalBytes：本机钉住的整份预算（perField 与两个旋钮都由它派生）。
+      totalBytes: FILTER_LIMITS.totalBytes,
+      // perField[field].chars 是 spec 口径（单字段码元上限）；fieldMaxLen 是同一份数据的扁平视图。
+      // 两者都是**拷贝**：响应对象要被 JSON 序列化，直接下发进程内的冻结表会让引用泄漏（少一层边界）。
+      perField: Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, { chars: FILTER_LIMITS.perField[field].chars }])),
       fieldMaxLen: { ...FILTER_LIMITS.fieldMaxLen },
       rulesFileMaxBytes: FILTER_LIMITS.rulesFileMaxBytes,
       requestBodyMaxBytes: FILTER_LIMITS.requestBodyMaxBytes,
-      draftFieldMaxLen: FILTER_LIMITS.draftFieldMaxLen,
       readMaxBytes: FILTER_LIMITS.readMaxBytes,
+      saveHeadroomBytes: FILTER_LIMITS.saveHeadroomBytes,
       maxRuleLines: FILTER_LIMITS.maxRuleLines,
       maxRuleLinesPerField: FILTER_LIMITS.maxRuleLinesPerField,
-      maxAlternationsPerField: FILTER_LIMITS.maxAlternationsPerField
+      maxAlternationsPerField: FILTER_LIMITS.maxAlternationsPerField,
+      // 预算从哪来（probe／fallback）与是否降级：控制台据此显示「本机上限」的口径。
+      source: FILTER_LIMITS.source,
+      degraded: FILTER_LIMITS.degraded
     },
     usage: { rulesFileBytes, fieldChars }
   }
@@ -277,10 +784,11 @@ function filterLimitsReport (cacheDir, filter) {
 // 则覆盖文件落在 (MAX-76, MAX] 这段（控制台保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG
 // 必然 > MAX ⇒ readSafeTextResult 判 tooLarge ⇒ readLastGood 返回 null ⇒ 新进程降级回代码默认，
 // 而写入侧仍返回 true（「写成功但读不回」，与 C9-012 同类的阈值差几字节缺陷，只是差在包装层）。
-// 故读上限 = 读硬顶（FILTER_LIMITS.readMaxBytes）+ 包装预算；写入侧（writeLastGoodFile）用同一常量预检，绝不产出读不回的文件。
-// 1024 的余量足够：覆盖文件能读回就 ≤ 256 KiB，包装固定 +76，revision 最多 16 位数字也吃不满。
-const LASTGOOD_WRAPPER_BYTES = FILTER_LIMITS.lastgoodWrapperBytes
-const LASTGOOD_MAX_BYTES = FILTER_LIMITS.readMaxBytes + LASTGOOD_WRAPPER_BYTES
+// 读上限 = 读硬顶（FILTER_LIMITS.readMaxBytes）+ 包装预算；写入侧（writeLastGoodFile）用同一常量预检，
+// 绝不产出读不回的文件。派生值的形态/上界校验由 computeDerivedReadLimits 兜住（预算可被外部覆盖，
+// NaN 传给 readSafeTextResult 等于无界读）。
+const DERIVED_READ_LIMITS = computeDerivedReadLimits(FILTER_LIMITS)
+const LASTGOOD_MAX_BYTES = DERIVED_READ_LIMITS.lastgoodMaxBytes
 // 生效快照（filter-rules.applied.json）的读上限：它是覆盖文件的**超集**，不能直接复用
 // FILTER_RULES_MAX_BYTES。比覆盖文件多出：11 个白名单字段按合并结果**补齐**（覆盖文件缺的字段
 // 也要写成 ""）、`source`/`hash`/`appliedAt`/`lastGoodUsed` 四个诊断字段、以及 `keyword` 包装
@@ -290,8 +798,7 @@ const LASTGOOD_MAX_BYTES = FILTER_LIMITS.readMaxBytes + LASTGOOD_WRAPPER_BYTES
 // ⇒ readAppliedSnapshot 恒 ioError ⇒「内容一致跳过写盘」永不生效、控制台永远显示「尚未生效」
 // （与 LKG 的 R3 同一类缺陷：写成功但读不回）。故读上限 = 覆盖文件上限 + 包装预算；
 // 写入侧（writeAppliedSnapshot）用同一常量预检，绝不落一个自己读不回的快照。
-const APPLIED_WRAPPER_BYTES = FILTER_LIMITS.appliedWrapperBytes
-const APPLIED_MAX_BYTES = FILTER_LIMITS.readMaxBytes + APPLIED_WRAPPER_BYTES
+const APPLIED_MAX_BYTES = DERIVED_READ_LIMITS.appliedMaxBytes
 // pingbitime 天数上限：与 xbk_rules.compileRules / validateConfig 的 PINGBITIME_MAX_DAYS 同值。
 // 超上限的行会被运行期静默丢弃 ⇒ 编译对账必然失败，这里提前给出明确错误码。
 const PINGBITIME_MAX_DAYS = 3650000
@@ -419,8 +926,15 @@ function overrideFieldsOf (override) {
   return out
 }
 
-function addError (errors, field, code, message) {
-  errors.push({ field, code, message })
+// 逐字段错误：{field, code, message} +（长度/字节这类闸门）{limit, actual}——前端要显示
+// 「已用／上限」与「本机上限 N、当前 M」，只给一句话文案就得再解析字符串。
+function addError (errors, field, code, message, extra) {
+  const item = { field, code, message }
+  if (extra && typeof extra === 'object') {
+    if (Number.isSafeInteger(extra.limit)) item.limit = extra.limit
+    if (Number.isSafeInteger(extra.actual)) item.actual = extra.actual
+  }
+  errors.push(item)
 }
 
 function isValidDays (value) {
@@ -508,9 +1022,12 @@ function validateFilterRules (input, deps, options) {
       addError(errors, field, 'not_string', `字段「${field}」必须是字符串（当前 ${typeof value}）`)
       continue
     }
-    const fieldMaxLen = fieldMaxLenOf(field)
+    // 单字段闸门：保存路径按**写预算**（perField[field].chars），读路径（fromDisk，deepValidationError
+    // 复用）按**读预算** readFieldMaxLen（不低于今日常量的 16,000）——读端不得比写端更严，否则存量里
+    // 合法的大字段会被判 too_long → 整份降级（「能保存但读不回」的镜像）。
+    const fieldMaxLen = options && options.fromDisk === true ? readFieldMaxLen(field) : fieldMaxLenOf(field)
     if (value.length > fieldMaxLen) {
-      addError(errors, field, 'too_long', `字段「${field}」长度 ${value.length} 超过上限 ${fieldMaxLen}`)
+      addError(errors, field, 'too_long', `字段「${field}」长度 ${value.length} 超过上限 ${fieldMaxLen}`, { limit: fieldMaxLen, actual: value.length })
       continue
     }
     if (CONTROL_CHAR_RE.test(value)) {
@@ -717,16 +1234,17 @@ function validateFilterRules (input, deps, options) {
   }
 
   // ---------- 闸门 5：整份规则文件的字节预算（C9-012）----------
-  // 读端按 FILTER_LIMITS.readMaxBytes（256 KiB）硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到
-  // 上次合法规则/代码默认。而闸门 1 只限**单字段**（FILTER_LIMITS.fieldMaxLen）：11 个字段全填满中文（UTF-8 3 字节/字）
-  // 就能堆出 528 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到「保存成功但规则
-  // 不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给 revision 位数增长。
+  // 读端按 FILTER_LIMITS.readMaxBytes 硬上限读覆盖文件，超限即 tooLarge ⇒ 视为损坏，降级到上次合法
+  // 规则/代码默认。而闸门 1 只限**单字段**（FILTER_LIMITS.perField[field].chars）：11 个字段全填满中文
+  // （UTF-8 3 字节/字）就能堆出 516 KB 以上——保存返回 200，规则却在下一轮整份被判超限丢弃（用户看到
+  // 「保存成功但规则不生效」）。这里按**实际落盘形状** {schema, revision, filter} 量字节，留 32 字节给
+  // revision 位数增长。
   //
   // **只对保存入参生效**（评审 C9-012）：读路径（deepValidationError）复用本函数时必须跳过此闸——
   // 已落盘文件是经 readSafeTextResult(FILTER_LIMITS.readMaxBytes) 有界读进来的，能读到就必然 ≤ 读端上限，
-  // 再按「落盘形状重新序列化」量一遍字节，会把 (MAX_BYTES-32, MAX_BYTES] 这段**合法且可读**的存量
-  // 覆盖文件判成 corrupt（落盘形状只比请求体多约 13 字节包装，手改/旧版可落到 MAX ⇒ 该区间是真实存量），
-  // 于是每轮降级、规则静默不生效，也与 SYSTEM_CONTRACT「超限（>256 KiB）」口径相反。
+  // 再按「落盘形状重新序列化」量一遍字节，会把 (接受阈值, readMaxBytes] 这段**合法且可读**的存量
+  // 覆盖文件判成 corrupt（落盘形状只比请求体多约 13 字节包装，手改/旧版可落到 readMaxBytes ⇒ 该区间是
+  // 真实存量），于是每轮降级、规则静默不生效，也与 SYSTEM_CONTRACT「超限（> readMaxBytes）」口径相反。
   if (!(options && options.fromDisk === true)) {
     let serializedBytes
     try {
@@ -734,13 +1252,18 @@ function validateFilterRules (input, deps, options) {
     } catch (e) {
       return { ok: false, errors: [{ field: 'filter', code: 'serialize_failed', message: `规则无法序列化为 JSON：${safeErrorMessage(e)}` }] }
     }
-    if (serializedBytes > FILTER_LIMITS.rulesFileMaxBytes - FILTER_LIMITS.saveHeadroomBytes) {
+    // 判定阈值与文案必须是**同一个数**：acceptMaxBytes = 整份预算 − revision 余量。文案里再给整份
+    // 预算与读硬顶，用户按提示删到阈值以下就一定能保存（旧文案引用读硬顶，F3 两旋钮分道后会指错）。
+    const acceptMaxBytes = FILTER_LIMITS.rulesFileMaxBytes - FILTER_LIMITS.saveHeadroomBytes
+    if (serializedBytes > acceptMaxBytes) {
       return {
         ok: false,
         errors: [{
           field: 'filter',
           code: 'too_large',
-          message: `规则文件共 ${serializedBytes} 字节，超过读端上限 ${FILTER_LIMITS.readMaxBytes} 字节（保存后整份规则会在下一轮被判超限丢弃），请删减规则后再保存`
+          limit: acceptMaxBytes,
+          actual: serializedBytes,
+          message: `规则文件共 ${serializedBytes} 字节，超过本机保存预算 ${acceptMaxBytes} 字节（整份上限 ${FILTER_LIMITS.rulesFileMaxBytes} − revision 余量 ${FILTER_LIMITS.saveHeadroomBytes}；读硬顶 ${FILTER_LIMITS.readMaxBytes}），请删减规则后再保存`
         }]
       }
     }
@@ -802,8 +1325,8 @@ function parseStoredRules (text) {
  * 有宽位就先收紧到 0600；收紧失败按损坏处理（不改用一份权限不可控的规则）。
  * 实现放在 scripts/owner-only-mode.js：Semgrep 对非字面量路径的 fs 调用一律报
  * path-traversal，单独成模块后可只排除该模块（不整文件排除本模块）。
+ * 两个函数的 require 在**文件顶部**（加载期容量文件要用 isOwnerOnlyFile，见那里的注释）。
  */
-const { enforceOwnerOnlyMode, isOwnerOnlyFile } = require('./scripts/owner-only-mode.js')
 
 /**
  * 读路径是否具备「深度校验」条件：需要注入完整 deps 且引擎可用。
@@ -1300,10 +1823,27 @@ function resetStoreStateForTests () {
 module.exports = {
   FILTER_RULE_FIELDS,
   FILTER_RULES_SCHEMA,
-  // 预算单一来源（F1）：读硬顶 / 写预算 / 各字段上限的唯一取值入口。
+  // 预算单一来源（F1 收口 / F3 动态化）：读硬顶 / 写预算 / 各字段上限的唯一取值入口。
   // 全字段都是正整数安全整数（加载期 normalizeFilterLimits 已 fail-closed 校验），
   // 任何代码都不得把 NaN/0 传给 readSafeTextResult（= 无界读）。
   FILTER_LIMITS,
+  // F3：预算的纯函数与加载期解析（探测一次 → 与容量文件对齐 → 写回），以及加载期 fail-closed 校验。
+  // computeFilterCapacity 无 IO/时钟/随机，导出是为了让测试直接注入「资源探测结果」而不依赖本机。
+  computeFilterCapacity,
+  resolveFilterLimits,
+  normalizeFilterLimits,
+  computeDerivedReadLimits,
+  readCapacityFile,
+  FILTER_CAPACITY_FILE,
+  FILTER_SOFT_CAP_ENV,
+  FILTER_CACHE_DIR_ENV,
+  FILTER_MAIN_FIELDS,
+  FILTER_MIN_TOTAL_BYTES,
+  // 今日常量（F1 的数字）：读端单字段下限、探测失败时的回落值。测试要按它断「回落成 16,000」。
+  FILTER_FIELD_MAX_LEN,
+  FILTER_MAX_TOTAL_BYTES,
+  FILTER_DEFAULT_SOFT_CAP_BYTES,
+  FILTER_RESERVE_BYTES,
   // 保存路径的单字段上限（未知字段 0）与读路径的单字段上限（max(今日常量, 字段值)）
   fieldMaxLenOf,
   readFieldMaxLen,

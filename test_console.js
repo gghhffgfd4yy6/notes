@@ -1,5 +1,9 @@
 'use strict'
 
+// F3：过滤预算在**模块加载**时探测一次并钉住。测试钉 softCap，保证 CI 与本机同预算；
+// 必须在 require ./xbk_filter_store（含 console.js 的间接 require）之前设置。
+process.env.XBK_FILTER_SOFT_CAP_BYTES = '524288'
+
 // scripts/console.js 测试：token 校验 / 锁语义 / 动作解析 / HTML 转义 / HTTP 端到端（鉴权、
 // 看板渲染、触发 202/409、JSON API、SIGTERM 优雅关闭）。触发用例真实 spawn 子进程——
 // 动作默认指向 --check（环境检查，秒级、不写缓存不发通知），不存在注入式 fake child。
@@ -2195,6 +2199,9 @@ const TOKEN = 'x'.repeat(32)
 // ── 过滤规则控制面（scripts/console.js，含服务器草稿）──────────────────────
 // 全部用 mkdtemp 隔离缓存目录；写端点只认 Authorization 头，读面沿用全局鉴权。
 function filterPaths (dir) { return require('./xbk_filter_store').filterRulesPaths(dir) }
+// F3：多个用例要按**派生预算**构造夹具（readMaxBytes / requestBodyMaxBytes），统一从这里取，
+// 不在用例里写死 256 KiB / 16000。
+const FilterStore = require('./xbk_filter_store')
 function postFilterJson (port, urlPath, obj, { token = TOKEN, headers = {}, raw } = {}) {
   return request(port, 'POST', urlPath, {
     token,
@@ -2335,10 +2342,27 @@ async function filterRuleApiTests () {
       assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { nope: 'x' } })).status, 400)
       assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft', { baseRevision: 1, filter: { pingbibiaoti: 1 } })).status, 400)
       assert.strictEqual(fs.existsSync(paths.draft), false, '非法草稿不得落盘')
+      // F3：草稿闸按 perField[field].chars 判（旧实现写死 16000，抬上限后就与保存闸分叉）：
+      // 等于上限必须 200、+1 必须 400 too_long，且错误体带 limit/actual 供前端显示。
+      const draftLimit = FilterStore.FILTER_LIMITS.perField.pingbifenlei.chars
+      assert.strictEqual((await postFilterJson(port, '/api/config/filter/draft',
+        { baseRevision: 1, filter: { pingbifenlei: 'a'.repeat(draftLimit) } })).status, 200,
+      `草稿恰好等于单字段上限 ${draftLimit} 必须通过`)
+      const draftOver = await postFilterJson(port, '/api/config/filter/draft',
+        { baseRevision: 1, filter: { pingbifenlei: 'a'.repeat(draftLimit + 1) } })
+      assert.strictEqual(draftOver.status, 400, '草稿超过单字段上限必须 400')
+      const draftErr = JSON.parse(draftOver.text).errors.find(e => e.code === 'too_long')
+      assert.ok(draftErr, `草稿超长必须给 too_long：${draftOver.text.slice(0, 200)}`)
+      assert.strictEqual(draftErr.field, 'pingbifenlei')
+      assert.strictEqual(draftErr.limit, draftLimit, '错误体必须带 limit（前端据此显示已用/上限）')
+      assert.strictEqual(draftErr.actual, draftLimit + 1)
+      // 被拒的写入不得覆盖已存在的合法草稿（上一条 200 已经落盘），更不得把草稿删掉
+      const keptDraft = JSON.parse(fs.readFileSync(paths.draft, 'utf8'))
+      assert.strictEqual(keptDraft.filter.pingbifenlei.length, draftLimit, '超长草稿不得覆盖上一份合法草稿')
     } finally { server.close() }
   })
 
-  await aok('过滤规则写端点: 415（text/plain、Content-Encoding:gzip）与 413（>256KiB）', async () => {
+  await aok('过滤规则写端点: 415（text/plain、Content-Encoding:gzip）与 413（> 请求体预算）', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     try {
@@ -2357,10 +2381,18 @@ async function filterRuleApiTests () {
       })
       assert.strictEqual(gz.status, 415, '压缩体不解析')
 
-      const big = JSON.stringify({ schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'a'.repeat(300 * 1024) } })
+      // 夹具按**派生值**构造：请求体预算 = totalBytes + 8192（F3 起动态），比它多 1 字节即 413。
+      // 用精确填充而不是「300 KiB」：预算抬到 512 KiB 后 300 KiB 已经合法，写死数字的用例会变成假绿。
+      const bodyPad = FilterStore.FILTER_LIMITS.requestBodyMaxBytes + 1
+      const big = JSON.stringify({ schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'a'.repeat(bodyPad) } })
       const tooBig = await postFilterJson(port, '/api/config/filter', null, { raw: big })
       assert.strictEqual(tooBig.status, 413)
       assert.strictEqual(JSON.parse(tooBig.text).code, 'body_too_large')
+      // 预算边界：恰好 = 请求体预算的请求必须进到业务校验（201 之外还得有具体错误码，不再是 413），
+      // 否则「+1 就 413」可能只是因为更小的隐藏上限。
+      const atBudget = JSON.stringify({ schema: 1, baseRevision: 0, filter: { pingbibiaoti: 'a'.repeat(FilterStore.FILTER_LIMITS.requestBodyMaxBytes - 64) } })
+      const atBudgetRes = await postFilterJson(port, '/api/config/filter', null, { raw: atBudget })
+      assert.notStrictEqual(atBudgetRes.status, 413, `恰好落在请求体预算内的请求不得被判 413：${atBudgetRes.text.slice(0, 200)}`)
       assert.strictEqual(fs.existsSync(filterPaths(dir).file), false)
     } finally { server.close() }
   })
@@ -3002,17 +3034,28 @@ async function filterRuleApiTests () {
     const FilterStore = require('./xbk_filter_store')
     try {
       const none = JSON.parse((await request(port, 'GET', '/api/config/filter', { token: TOKEN })).text)
+      // F3：limits 是**动态预算**（启动钉住），故这里只断「与 store 同源 + 形状齐全」，绝不写死数值。
       assert.deepStrictEqual(Object.keys(none.limits).sort((a, b) => a.localeCompare(b)),
-        ['draftFieldMaxLen', 'fieldMaxLen', 'maxAlternationsPerField', 'maxRuleLines', 'maxRuleLinesPerField', 'readMaxBytes', 'requestBodyMaxBytes', 'rulesFileMaxBytes'],
-        'limits 必须含 spec 要求的五项（F3 起前端据此显示余量）')
+        ['degraded', 'fieldMaxLen', 'maxAlternationsPerField', 'maxRuleLines', 'maxRuleLinesPerField',
+          'perField', 'readMaxBytes', 'requestBodyMaxBytes', 'rulesFileMaxBytes', 'saveHeadroomBytes',
+          'source', 'totalBytes'],
+        'limits 必须含 F3 下发的全部旋钮（前端据此显示已用/上限与 413 文案）')
       assert.deepStrictEqual(none.limits.fieldMaxLen, { ...FilterStore.FILTER_LIMITS.fieldMaxLen }, '单字段上限必须与 store 同源（不得再抄一份）')
-      assert.strictEqual(none.limits.fieldMaxLen.pingbibiaoti, 16000)
-      assert.strictEqual(none.limits.rulesFileMaxBytes, 256 * 1024)
-      assert.strictEqual(none.limits.requestBodyMaxBytes, 256 * 1024)
-      assert.strictEqual(none.limits.readMaxBytes, 256 * 1024)
-      assert.strictEqual(none.limits.draftFieldMaxLen, 16000)
-      assert.strictEqual(none.limits.maxRuleLines, 2000)
-      assert.strictEqual(none.limits.maxAlternationsPerField, 1000)
+      assert.strictEqual(none.limits.fieldMaxLen.pingbibiaoti, FilterStore.FILTER_LIMITS.perField.pingbibiaoti.chars,
+        'fieldMaxLen 是 perField 的扁平视图（同一份数据）')
+      assert.strictEqual(none.limits.totalBytes, FilterStore.FILTER_LIMITS.totalBytes)
+      assert.deepStrictEqual(none.limits.perField, Object.fromEntries(
+        FilterStore.FILTER_RULE_FIELDS.map(f => [f, { chars: FilterStore.FILTER_LIMITS.perField[f].chars }])),
+      'perField 必须逐字段下发（前端计数器按它显示上限）')
+      assert.strictEqual(none.limits.rulesFileMaxBytes, FilterStore.FILTER_LIMITS.rulesFileMaxBytes)
+      assert.strictEqual(none.limits.requestBodyMaxBytes, FilterStore.FILTER_LIMITS.requestBodyMaxBytes)
+      assert.strictEqual(none.limits.readMaxBytes, FilterStore.FILTER_LIMITS.readMaxBytes)
+      assert.strictEqual(none.limits.saveHeadroomBytes, FilterStore.FILTER_LIMITS.saveHeadroomBytes)
+      assert.strictEqual(none.limits.source, FilterStore.FILTER_LIMITS.source, '预算来源必须下发（probe/fallback）')
+      assert.strictEqual(none.limits.degraded, FilterStore.FILTER_LIMITS.degraded)
+      assert.strictEqual(typeof none.limits.draftFieldMaxLen, 'undefined', 'draftFieldMaxLen 是死旋钮，已从表里删除')
+      assert.strictEqual(none.limits.maxRuleLines, FilterStore.FILTER_LIMITS.maxRuleLines)
+      assert.strictEqual(none.limits.maxAlternationsPerField, FilterStore.FILTER_LIMITS.maxAlternationsPerField)
       assert.strictEqual(none.usage.rulesFileBytes, 0, '没有覆盖文件时按 0 字节')
       assert.deepStrictEqual(Object.keys(none.usage.fieldChars).sort((a, b) => a.localeCompare(b)),
         [...FilterStore.FILTER_RULE_FIELDS].sort((a, b) => a.localeCompare(b)), '11 个字段的字符数必须全在')
@@ -3032,9 +3075,10 @@ async function filterRuleApiTests () {
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
     try {
-      // 覆盖文件 300 KiB：读硬顶/body 上限都是 256 KiB ⇒ loadCurrentFilter 判 corrupt，
-      // commitFilterOverride 的「保存前原文」读回来也是 tooLarge（旧实现于是 previousText=null）。
-      const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(300 * 1024) } })
+      // 覆盖文件 > 读硬顶 readMaxBytes ⇒ loadCurrentFilter 判 corrupt，commitFilterOverride 的
+      // 「保存前原文」读回来也是 tooLarge（旧实现于是 previousText=null）。夹具按**派生值**构造：
+      // 单字段塞满到 readMaxBytes 个字符，落盘 JSON 必然 > readMaxBytes（F3 前这里是 300 KiB / 256 KiB）。
+      const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(FilterStore.FILTER_LIMITS.readMaxBytes) } })
       fs.writeFileSync(paths.file, huge)
       const before = fs.readFileSync(paths.file)
       const res = await postFilterJson(port, '/api/config/filter', {
@@ -3057,8 +3101,8 @@ async function filterRuleApiTests () {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)
     const paths = filterPaths(dir)
-    // 与上一条用例同一夹具形状：300 KiB > 读硬顶/body 上限 256 KiB ⇒ 加载判 corrupt、原文读不回。
-    const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(300 * 1024) } })
+    // 与上一条用例同一夹具形状：落盘字节数 > 读硬顶 readMaxBytes ⇒ 加载判 corrupt、原文读不回。
+    const huge = JSON.stringify({ schema: 1, revision: 6, filter: { pingbibiaoti: 'x'.repeat(FilterStore.FILTER_LIMITS.readMaxBytes) } })
     const hugeBytes = Buffer.byteLength(huge)
     const lastAuditAction = () => {
       const lines = fs.readFileSync(paths.audit, 'utf8').trim().split('\n')

@@ -1,5 +1,10 @@
 'use strict'
 
+// F3：过滤预算在**模块加载**时探测一次并钉住。测试钉 softCap，保证 CI 与本机同预算；没有它，
+// 共享 runner 的 MemAvailable/磁盘余量差异会让「整份字节预算」类断言随机器漂移。
+// 必须在 require xbk_filter_store 之前设置（加载期读 process.env）。
+process.env.XBK_FILTER_SOFT_CAP_BYTES = '524288'
+
 // xbk_filter_store.js 单元测试（S1-store）
 // 覆盖：字段白名单/schema/revision/长度/控制字符、### 行语法、嵌套量词、RE2 不可用、
 //       编译结果对账、合并优先级、覆盖文件缺失/损坏/last-known-good、生效快照往返、
@@ -65,7 +70,24 @@ const {
   scanPreviewRecords,
   countUnescapedAlternations,
   filterLimitsReport,
-  resetStoreStateForTests
+  resetStoreStateForTests,
+  // F3：预算纯函数 / 加载期解析 / fail-closed 校验 / 派生读上限（都要直测，不靠「读代码」当门禁）
+  computeFilterCapacity,
+  resolveFilterLimits,
+  normalizeFilterLimits,
+  computeDerivedReadLimits,
+  readCapacityFile,
+  readFieldMaxLen,
+  fieldMaxLenOf,
+  FILTER_CAPACITY_FILE,
+  FILTER_SOFT_CAP_ENV,
+  FILTER_CACHE_DIR_ENV,
+  FILTER_MAIN_FIELDS,
+  FILTER_MIN_TOTAL_BYTES,
+  FILTER_FIELD_MAX_LEN,
+  FILTER_MAX_TOTAL_BYTES,
+  FILTER_DEFAULT_SOFT_CAP_BYTES,
+  FILTER_RESERVE_BYTES
 } = require('./xbk_filter_store')
 // C10-019：直调收紧入口的用例需要拿到函数本身（走 loadFilterRules 的集成路径看不到收紧分支）。
 const { enforceOwnerOnlyMode, isOwnerOnlyFile } = require('./scripts/owner-only-mode')
@@ -97,10 +119,15 @@ const deps = { RuleEngine, compileUserRegex, re2Available: true }
 // 其实从来没被走到：任何 compileOk 都成功，C9-010 那类「唯一可用规则被误拒」的缺陷在测试里不可见。
 const noRe2Deps = { ...deps, re2Available: false, compileUserRegex: () => null }
 
-// 覆盖文件读端上限：与 xbk_filter_store.FILTER_RULES_MAX_BYTES 同值（未导出）。
-// LKG（F4-1 R3）与生效快照（P2 返工）两组用例都要拿它当「包装前的基线」——包装后的文件若仍按
-// 这个上限读就会静默判 tooLarge，故常量提到前面，避免用例受声明顺序影响（TDZ）。
-const RULES_READ_MAX_BYTES = 256 * 1024
+// 覆盖文件**读端**上限（F3：动态预算的 readMaxBytes，启动钉住）。LKG（F4-1 R3）与生效快照
+// （P2 返工）两组用例都要拿它当「包装前的基线」——包装后的文件若仍按这个上限读就会静默判 tooLarge，
+// 故常量提到前面，避免用例受声明顺序影响（TDZ）。夹具按派生值构造，不再写死 256 KiB。
+const RULES_READ_MAX_BYTES = FILTER_LIMITS.readMaxBytes
+// 保存闸门 5 的**接受阈值**（整份预算 − revision 余量）：写侧比读侧更严，两者不得混用。
+const SAVE_ACCEPT_MAX_BYTES = FILTER_LIMITS.rulesFileMaxBytes - FILTER_LIMITS.saveHeadroomBytes
+// 每字段的写预算（perField[field].chars）与读上限（readFieldMaxLen，≥ 今日的 16,000）。
+const writeCharsOf = (field) => FILTER_LIMITS.perField[field].chars
+const readCharsOf = (field) => readFieldMaxLen(field)
 
 // 代码默认层夹具：含非字符串值（pingbilouzhu: 123）与额外非白名单键，用于验证「只取 11 字段 + String 安全化」。
 const DEFAULTS = {
@@ -266,19 +293,40 @@ test('合法规则通过校验并原样返回已提交字段（不做 trim 改�
   }, '校验不得就地改写入参')
 })
 
-test('C9-012 整份规则文件超过读端 256 KiB 上限必须拒绝（单字段 16000 上限挡不住多字段累积）', () => {
-  // 11 个字段各 16000 个中文字（UTF-8 3 字节/字）⇒ 约 528 KB，远超读端 FILTER_RULES_MAX_BYTES。
-  // 旧实现只限单字段：保存返回 200，下一轮读盘整份判 tooLarge 被丢弃（用户看到「保存成功但不生效」）。
-  const filter = {}
+test('C9-012 整份规则文件的字节预算：全字段按写预算填满必须通过、超预算拒绝（错误体带 limit/actual）', () => {
+  // 写预算的形状由 reserve 公式保证：11 个字段按 perField 填满（UTF-8 3 字节/字）必须落在
+  // 「整份预算 − revision 余量」之内。这是「单字段闸门挡不住多字段累积」的另一半——单字段闸门
+  // 放行的组合也不得把文件写到读端读不回的大小。
+  const full = {}
   for (const field of FILTER_RULE_FIELDS) {
-    if (field === 'pingbitime') continue
-    filter[field] = '中'.repeat(16000)
+    // pingbitime 是数字型字段：'0' × n 的 Number 是 0（合法天数）。它比中文少 2 B/字符，
+    // 全份字节数因此少算约 4 KB —— 贴边断言的 16 KiB 容差已覆盖。
+    full[field] = field === 'pingbitime' ? '0'.repeat(writeCharsOf(field)) : '中'.repeat(writeCharsOf(field))
+  }
+  const fullBytes = Buffer.byteLength(JSON.stringify({ schema: 1, revision: 0, filter: full }), 'utf8')
+  const okFull = validateFilterRules({ schema: 1, revision: 0, filter: full }, deps)
+  assert.strictEqual(okFull.ok, true, `全字段写满必须仍能保存：${JSON.stringify(okFull.errors)}`)
+  assert.ok(fullBytes <= SAVE_ACCEPT_MAX_BYTES,
+    `全字段写满（${fullBytes} 字节）必须落在写入接受阈值 ${SAVE_ACCEPT_MAX_BYTES} 之内`)
+  assert.ok(fullBytes >= SAVE_ACCEPT_MAX_BYTES - 16 * 1024,
+    `贴边：全字段写满必须落在预算近端（${fullBytes} vs ${SAVE_ACCEPT_MAX_BYTES}，差 >16 KiB 说明 reserve 公式已失效）`)
+  // 闸门 5 守的是**字符口径之外**的真实膨胀：孤立代理项会被 JSON.stringify 写成 \udXXX（6 字节/码元），
+  // 两个主字段各 80,000 码元就是 ≈ 937 KB > 写入接受阈值 ⇒ 必须 400——否则保存 200、下一轮读端判
+  // tooLarge、整份规则被静默丢弃（用户看到「保存成功但不生效」）。
+  const filter = {
+    pingbibiaoti: '\ud800'.repeat(writeCharsOf('pingbibiaoti')),
+    pingbineirong: '\ud800'.repeat(writeCharsOf('pingbineirong'))
   }
   const result = validateFilterRules({ schema: 1, revision: 0, filter }, deps)
-  assert.strictEqual(result.ok, false, '整份超过 256 KiB 必须拒绝保存')
+  assert.strictEqual(result.ok, false, '整份超过写入接受阈值必须拒绝保存')
   const err = result.errors.find(e => e.code === 'too_large')
-  assert.ok(err, `应给出 too_large 错误码：${JSON.stringify(result.errors)}`)
+  assert.ok(err, `应给出 too_large 错误码：${JSON.stringify(result.errors).slice(0, 400)}`)
   assert.strictEqual(err.field, 'filter', '字段归属必须是 filter（整份而非某一字段超限）')
+  assert.strictEqual(err.limit, SAVE_ACCEPT_MAX_BYTES,
+    '错误体必须给出真正的判定阈值（整份预算 − revision 余量），不是读硬顶 readMaxBytes')
+  const actualBytes = Buffer.byteLength(JSON.stringify({ schema: 1, revision: 0, filter }), 'utf8')
+  assert.strictEqual(err.actual, actualBytes, '错误体必须给出实际字节数')
+  assert.ok(err.actual > err.limit, 'actual 必须真的超过 limit（否则这条用例什么都没测）')
   // 文案形态「<数字> 字节」用逐字符扫描判定：Sonar javascript:S8786 把 `\d+ 字节` 判成可回溯
   // （量词 + 字面量），而这条判据需要的只是「' 字节' 前面紧邻一位数字」；扫描与 /\d+ 字节/ 等价
   // （多个 ' 字节' 出现处逐个看），无回溯面，代价 O(文案长度)。
@@ -292,8 +340,11 @@ test('C9-012 整份规则文件超过读端 256 KiB 上限必须拒绝（单字�
     }
     return false
   }
-  assert.ok(hasByteCount(err.message) && err.message.includes(String(256 * 1024)),
-    `错误文案必须给出实际字节数与上限：${err.message}`)
+  assert.ok(hasByteCount(err.message) && err.message.includes(String(SAVE_ACCEPT_MAX_BYTES)),
+    `错误文案必须给出实际字节数与真正的判定阈值：${err.message}`)
+  // 文案不得再把读硬顶当成拒绝阈值（F3 两旋钮已分道：accept = 整份预算 − 32 ≤ readMaxBytes）。
+  assert.ok(!err.message.includes('超过读端上限'),
+    `文案不得再引用读硬顶当判定阈值（用户按它删到提示值仍可能保存失败）：${err.message}`)
   // 与 /\d+ 字节/ 的对拍：两条正向（含 offset 0 的边界）+ 一条反向控制，逐面与正则对齐。
   // ① offset 0：旧实现 `at > 0` 把 0 当「没找到」退出，' 字节 70000 字节' 被判 false。
   assert.strictEqual(hasByteCount(' 字节 70000 字节'), true,
@@ -302,37 +353,42 @@ test('C9-012 整份规则文件超过读端 256 KiB 上限必须拒绝（单字�
     '普通文案（数字紧邻「 字节」）必须命中')
   assert.strictEqual(hasByteCount('没有数字的 字节 文案'), false,
     '「 字节」前面没有数字时不得误判（防「一律 true」让上面两条失去鉴别力）')
-  // 对照：把字段砍到总量在预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
-  const small = { pingbibiaoti: '中'.repeat(16000), pingbineirong: '中'.repeat(16000) }
+  // 对照：把规则砍到预算内就必须通过（防「一律拒绝」让上面失去鉴别力）
+  const small = { pingbibiaoti: '中'.repeat(writeCharsOf('pingbibiaoti')) }
   const okSmall = validateFilterRules({ schema: 1, revision: 0, filter: small }, deps)
   assert.strictEqual(okSmall.ok, true, JSON.stringify(okSmall.errors))
 })
 
-test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 判 corrupt（(256 KiB-32, 256 KiB] 区间）', () => {
-  // 旧版控制台 body 上限 256 KiB、落盘形状只多约 13 字节包装 ⇒ 该区间的覆盖文件是真实存量。
-  // 闸门 5 落在 validateFilterRules 里，读路径的 deepValidationError 复用同一函数后：
-  // 65505..65535 这些「readSafeTextResult 读得到、结构也合法」的文件被重新序列化量字节 ⇒ too_large
-  // ⇒ corrupt，生产每轮降级、规则静默不生效。这里按落盘字节数逐个断言 source 必须为 override。
+test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 判 corrupt（(接受阈值, readMaxBytes] 区间）', () => {
+  // 落盘形状只比请求体多约 13 字节包装 ⇒ (写入接受阈值, readMaxBytes] 这段覆盖文件是真实存量
+  // （手改、旧版本写出、或另一个进程用更大的预算写的）。读路径必须照常加载；保存路径仍按自己的
+  // 阈值拒绝。闸门 5 落在 validateFilterRules 里，读路径的 deepValidationError 复用同一函数，
+  // 若忘了 fromDisk 跳过，这些「读得到、结构也合法」的文件会被重新序列化量字节 ⇒ too_large ⇒ corrupt，
+  // 生产每轮降级、规则静默不生效。
   resetStoreStateForTests()
   const buildAtBytes = (target) => {
     const filter = {}
-    const fields = FILTER_RULE_FIELDS.filter(f => f !== 'pingbitime')
-    for (const f of fields) filter[f] = ''
+    const fields = FILTER_RULE_FIELDS.filter(field => field !== 'pingbitime')
+    for (const field of FILTER_RULE_FIELDS) filter[field] = ''
+    filter.pingbitime = '5'
     const size = () => Buffer.byteLength(JSON.stringify({ schema: 1, revision: 0, filter }), 'utf8')
     let remaining = target - size()
-    for (const f of fields) {
-      const cn = Math.min(16000, Math.floor(remaining / 3))
-      filter[f] = '线'.repeat(cn)
+    for (const field of fields) {
+      // 逐字段不得超过**读**上限（parseOverrideFields 会按 readFieldMaxLen 判超长）。
+      const maxChars = readCharsOf(field)
+      const cn = Math.max(0, Math.min(maxChars, Math.floor(remaining / 3)))
+      filter[field] = '线'.repeat(cn)
       remaining -= cn * 3
-      const ascii = Math.min(16000 - cn, remaining)
-      filter[f] += 'a'.repeat(ascii)
+      const ascii = Math.max(0, Math.min(maxChars - cn, remaining))
+      filter[field] += 'a'.repeat(ascii)
       remaining -= ascii
-      if (remaining === 0) break
+      if (remaining <= 0) break
     }
     assert.strictEqual(size(), target, `夹具必须恰为 ${target} 字节`)
     return filter
   }
-  for (const target of [262113, 262130, 262144]) {
+  // 三个点：写入接受阈值 +1（保存必拒、读取必须照常）、整份预算、读硬顶（读端上限本身）。
+  for (const target of [SAVE_ACCEPT_MAX_BYTES + 1, FILTER_LIMITS.rulesFileMaxBytes, RULES_READ_MAX_BYTES]) {
     const dir = makeDir()
     const file = filterRulesPaths(dir).file
     const filter = buildAtBytes(target)
@@ -344,15 +400,17 @@ test('C9-012 读路径不得把「已可读」的合法覆盖文件按闸门 5 �
     assert.strictEqual(loaded.degraded, false)
     assert.strictEqual(loaded.revision, 3)
   }
-  // 对照 1：同一份内容走**保存**路径仍必须被闸门 5 拒绝（不得借读路径放行「保存后下轮必被丢弃」的内容）
-  const tooBig = validateFilterRules({ schema: 1, revision: 3, filter: buildAtBytes(262130) }, deps)
-  assert.strictEqual(tooBig.ok, false)
-  assert.ok(tooBig.errors.some(e => e.code === 'too_large'), `保存路径必须仍拒绝：${JSON.stringify(tooBig.errors)}`)
-  // 对照 2：真正超过读端 256 KiB 的覆盖文件仍按 tooLarge 判 corrupt（读路径不放松读端上限）
+  // 对照 1：同一份内容走**保存**路径仍必须被拒绝（不得借读路径放行「保存后下轮必被丢弃」的内容）。
+  // 它同时会撞单字段闸（小字段 16,000 > 写预算 1,000）——这正说明该体积只能手改产生；整份字节闸
+  // 本身另由上面 C9-012 的孤立代理项用例钉住（那条是**只**撞字节闸的形状）。
+  const tooBig = validateFilterRules({ schema: 1, revision: 3, filter: buildAtBytes(SAVE_ACCEPT_MAX_BYTES + 1) }, deps)
+  assert.strictEqual(tooBig.ok, false, '超过写入接受阈值的内容不得借读路径放行')
+  assert.ok(tooBig.errors.length > 0, '保存路径必须给出拒绝原因')
+  // 对照 2：真正超过读硬顶的覆盖文件仍按 tooLarge 判 corrupt（读路径不放松读端上限）
   const overDir = makeDir()
-  writeRaw(filterRulesPaths(overDir).file, JSON.stringify({ schema: 1, revision: 4, filter: buildAtBytes(262145) }))
+  writeRaw(filterRulesPaths(overDir).file, JSON.stringify({ schema: 1, revision: 4, filter: buildAtBytes(RULES_READ_MAX_BYTES + 1) }))
   const over = loadFilterRules({ cacheDir: overDir, defaults: DEFAULTS, keyword: {}, deps })
-  assert.strictEqual(over.source, 'corrupt', '超过 256 KiB 的覆盖文件必须仍判损坏（读端上限不变）')
+  assert.strictEqual(over.source, 'corrupt', '超过读硬顶的覆盖文件必须仍判损坏（读端上限不变）')
   assert.match(over.error.message, /不可读（tooLarge）/)
 })
 
@@ -371,10 +429,30 @@ test('非字符串值被拒绝', () => {
   }
 })
 
-test('超长字段被拒绝（16000 边界通过 / 16001 拒绝）', () => {
-  const okBoundary = validateFilterRules({ revision: 0, filter: { pingbibiaoti: 'a'.repeat(16000) } }, deps)
-  assert.strictEqual(okBoundary.ok, true, JSON.stringify(okBoundary.errors))
-  expectError(validateFilterRules({ revision: 0, filter: { pingbibiaoti: 'a'.repeat(16001) } }, deps), 'pingbibiaoti', 'too_long', '超长')
+test('超长字段被拒绝（逐字段等于写上限通过 / +1 拒绝；错误体带 limit/actual）', () => {
+  for (const field of FILTER_RULE_FIELDS) {
+    const limit = writeCharsOf(field)
+    // pingbitime 是数字型字段：'0' × n 的 Number 是 0（合法天数）；其余字段用 'a'。
+    const unit = field === 'pingbitime' ? '0' : 'a'
+    const okBoundary = validateFilterRules({ revision: 0, filter: { [field]: unit.repeat(limit) } }, deps)
+    assert.strictEqual(okBoundary.ok, true,
+      `${field} 恰好等于写上限 ${limit} 必须通过：${JSON.stringify(okBoundary.errors)}`)
+    const over = validateFilterRules({ revision: 0, filter: { [field]: unit.repeat(limit + 1) } }, deps)
+    const err = over.errors.find(item => item.code === 'too_long' && item.field === field)
+    assert.ok(err, `${field} 超过上限 ${limit} 必须给 too_long：${JSON.stringify(over.errors).slice(0, 300)}`)
+    assert.strictEqual(err.limit, limit, `${field} 的 too_long 必须带 limit=${limit}`)
+    assert.strictEqual(err.actual, limit + 1, `${field} 的 too_long 必须带 actual=${limit + 1}`)
+    assert.ok(err.message.includes(String(limit)), `${field} 文案必须给出上限：${err.message}`)
+  }
+  // 未知字段：写侧返回 0（一律拒绝），读侧回落到今日常量 16,000——两边都不许是「无限」。
+  assert.strictEqual(fieldMaxLenOf('evil'), 0, '未知字段的写上限必须是 0（一律拒绝），不得回落成无限')
+  assert.strictEqual(readFieldMaxLen('evil'), 16000, '未知字段的读上限回落到今日常量，不是无限')
+  // 读路径（fromDisk）按读上限判：存量 16,000 字符的小字段不得被判 too_long（写上限只有 1000）。
+  const legacy = { pingbifenlei: 'a'.repeat(16000) }
+  const written = validateFilterRules({ schema: 1, revision: 0, filter: legacy }, deps)
+  assert.ok(written.errors.some(item => item.code === 'too_long'), '写路径必须按 1000 拒绝 16,000 字符的小字段')
+  const fromDisk = validateFilterRules({ schema: 1, revision: 0, filter: legacy }, deps, { fromDisk: true })
+  assert.strictEqual(fromDisk.ok, true, `读路径必须仍能读回存量 16,000 字符的小字段：${JSON.stringify(fromDisk.errors)}`)
 })
 
 test('控制字符被拒绝，\\n \\r \\t 允许', () => {
@@ -1201,7 +1279,7 @@ test('P2 must_fix 1 isOwnerOnlyFile：只有 0600 普通文件才允许跳过；
 
 // ===== P2 返工 must_fix 2：applied 是覆盖文件的超集，读上限必须加包装预算 =====
 // 构造「覆盖文件贴 256 KiB 上限」的合并结果：11 个字段里前几个填满，末个按字节回削，使 applied
-// 序列化后落在 (覆盖文件上限, applied 读上限]。旧实现拿 FILTER_RULES_MAX_BYTES 读 ⇒ 恒 ioError。
+// 序列化后落在 (覆盖文件上限, applied 读上限]。旧实现拿 FILTER_MIN_TOTAL_BYTES 读 ⇒ 恒 ioError。
 function nearLimitAppliedFilter (targetAppliedBytes) {
   const filter = {}
   for (const field of FILTER_RULE_FIELDS) filter[field] = ''
@@ -1217,7 +1295,8 @@ function nearLimitAppliedFilter (targetAppliedBytes) {
   }), 'utf8')
   for (const field of FILTER_RULE_FIELDS) {
     if (field === 'pingbitime') continue
-    filter[field] = '中'.repeat(16000)
+    // 按**读**上限填（快照只走读路径；写侧预算更小，这里不必可保存）。
+    filter[field] = '中'.repeat(readCharsOf(field))
     if (probe() >= targetAppliedBytes) {
       // 回削这个字段，让整份快照落在目标附近（中文 3 字节/字）
       let chars = filter[field].length
@@ -1266,7 +1345,7 @@ test('P2 must_fix 2 写侧同口径：序列化后超过 applied 读上限 ⇒ �
   const dir = makeDir()
   const paths = filterRulesPaths(dir)
   const huge = {}
-  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(readCharsOf(field))
   // 先落一份合法快照：预检拒绝不得破坏已有快照（写侧「不落盘」不等于「清空」）
   const base = { cacheDir: dir, filter: { pingbibiaoti: 'x' }, keyword: {}, revision: 1, source: 'override', hash: 'h' }
   assert.strictEqual(writeAppliedSnapshot(base), true)
@@ -1590,6 +1669,9 @@ process.stdout.write(JSON.stringify({
 function runLkgProbe (dir) {
   const probe = spawnSync(process.execPath, ['-e', LKG_PROBE], {
     encoding: 'utf8',
+    // 夹具可到 readMaxBytes（512 KiB 预算 + 余量 ≈ 525 KB），而探针把 filter 回传两次（加载结果 +
+    // 生效快照）≈ 1.1 MB：默认 1 MB 的 maxBuffer 会 ENOBUFS，status=null 被误报成「探针崩溃」。
+    maxBuffer: 16 * 1024 * 1024,
     cwd: __dirname,
     env: { ...process.env, XBK_LKG_DIR: dir, XBK_LKG_DEFAULTS: JSON.stringify(DEFAULTS) }
   })
@@ -1745,10 +1827,11 @@ test('F4-1 resetStoreStateForTests 同步清掉持久 LKG（测试隔离前提�
 // `"override"`/`"filter"` 的键名差（+2），实测 +76 字节。旧实现读写共用 256 KiB ⇒ 覆盖文件落在
 // (256 KiB-76, 256 KiB] 这段（保存闸门允许 ≤ MAX-32，手改可到 MAX）时，写出的 LKG 必然 > 读上限，
 // readLastGood 判 tooLarge 返回 null，新进程照样回代码默认，而 writeLastGoodFile 还返回 true。
-// 把 11 个字段堆到接近上限（单字段上限 16000 码元，中文 3 字节/字；pingbitime 是数字型字段）
+// 把 11 个字段堆到接近上限（每字段按**读**上限填：主字段 mainChars、其余 max(16,000, 写预算)，
+// 中文 3 字节/字；pingbitime 是数字型字段）。这些体积只能手改产生——写侧单字段预算更小。
 function nearLimitFilter (targetBytes) {
   const filter = {}
-  for (const field of FILTER_RULE_FIELDS) filter[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  for (const field of FILTER_RULE_FIELDS) filter[field] = field === 'pingbitime' ? '7' : '中'.repeat(readCharsOf(field))
   const sizeOf = () => Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 1, filter }), 'utf8')
   let size = sizeOf()
   for (let i = FILTER_RULE_FIELDS.length - 2; i >= 0 && size > targetBytes; i--) {
@@ -1768,11 +1851,10 @@ test('F4-1 R3 覆盖文件贴读上限时持久 LKG 仍必须被**新进程**读
     const { filter, size } = nearLimitFilter(target)
     assert.ok(size > RULES_READ_MAX_BYTES - 76 && size <= RULES_READ_MAX_BYTES,
       `夹具必须落在缺陷窗口 (${RULES_READ_MAX_BYTES - 76}, ${RULES_READ_MAX_BYTES}]：实得 ${size}`)
-    if (size <= RULES_READ_MAX_BYTES - 32) {
-      const gate = validateFilterRules({ schema: FILTER_RULES_SCHEMA, revision: 1, filter }, deps)
-      assert.strictEqual(gate.ok, true,
-        `前置：${size} 字节的覆盖文件必须能过保存闸门（否则只是「本来就存不进去」）：${JSON.stringify(gate.errors)}`)
-    }
+    // 该体积只能手改/旧版本产生：写侧单字段预算更小（小字段 1000 / plus 2048，主字段 mainChars），
+    // 故这里**不**断言「能过保存闸门」；保存侧贴边形状由上面 C9-012 的「全字段按写预算写满」用例钉住。
+    assert.ok(size > SAVE_ACCEPT_MAX_BYTES,
+      `夹具必须落在写入接受阈值之上（只能手改产生）：${size} vs ${SAVE_ACCEPT_MAX_BYTES}`)
     const dir = makeDir()
     const paths = filterRulesPaths(dir)
     writeJson(paths.file, { schema: 1, revision: 1, filter })
@@ -1799,7 +1881,7 @@ test('F4-1 R3 写侧同口径：序列化后超过 LKG 读上限 ⇒ 不落盘 +
   const dir = makeDir()
   const paths = filterRulesPaths(dir)
   const huge = {}
-  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  for (const field of FILTER_RULE_FIELDS) huge[field] = field === 'pingbitime' ? '7' : '中'.repeat(readCharsOf(field))
   const bytes = Buffer.byteLength(JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 0, filter: huge }), 'utf8')
   assert.ok(bytes > LASTGOOD_MAX_BYTES, `前置：夹具必须超过 LKG 读上限（${bytes} vs ${LASTGOOD_MAX_BYTES}）`)
   const warned = []
@@ -1821,7 +1903,7 @@ test('F4-1 R3 读侧仍是有界读：LKG 超过 LASTGOOD_MAX_BYTES ⇒ 当「�
   const paths = filterRulesPaths(dir)
   // 合法 JSON、形状也合法，只是体积超过 LKG 读上限（模拟包装膨胀或被外部塞了大文件）
   const override = {}
-  for (const field of FILTER_RULE_FIELDS) override[field] = field === 'pingbitime' ? '7' : '中'.repeat(16000)
+  for (const field of FILTER_RULE_FIELDS) override[field] = field === 'pingbitime' ? '7' : '中'.repeat(readCharsOf(field))
   writeRaw(paths.lastgood, JSON.stringify({ schema: FILTER_RULES_SCHEMA, revision: 1, hash: 'x', override }))
   assert.ok(fs.statSync(paths.lastgood).size > LASTGOOD_MAX_BYTES)
   assert.strictEqual(readLastGood(paths.lastgood), null, '超过上限的 LKG 必须当没有（有界读，不得无界整读）')
@@ -2102,18 +2184,24 @@ server.listen(0, '127.0.0.1', async () => {
 
 test('R1-3 静态接线：备份当前一代的读必须显式 openNonBlocking（回退成裸读即红）', () => {
   if (skipIfInstrumented('R1-3 备份当前一代 openNonBlocking（源码结构断言）')) return
-  // 结构断言：定位「读当前覆盖文件原文」的那次调用（readSafeTextResult(paths.file, FILTER_BODY_MAX_BYTES, …)），
+  // 结构断言：定位「读当前覆盖文件原文」的那次调用（readSafeTextResult(paths.file, FilterStore.FILTER_LIMITS.readMaxBytes, …)），
   // 再断言它的第三实参里 openNonBlocking === true——比在源码行上正则更准（换行/缩进/其它 readSafeTextResult 都不影响）。
+  // F3：读面必须用**读硬顶** readMaxBytes，不得再用请求体预算 FILTER_BODY_MAX_BYTES（两旋钮分道后
+  // 那会让控制台读得到的文件、运行侧读不回）。
   const model = loadModel('scripts/console.js')
   const reads = []
+  const readCaps = []
   walkAst(model.ast, (node) => {
     if (node.type !== 'CallExpression' || node.arguments.length < 3) return
     if (memberPathOf(node.callee) !== 'readSafeTextResult') return
     if (memberPathOf(node.arguments[0]) !== 'paths.file') return
-    if (memberPathOf(node.arguments[1]) !== 'FILTER_BODY_MAX_BYTES') return
+    readCaps.push(memberPathOf(node.arguments[1]))
+    if (memberPathOf(node.arguments[1]) !== 'FilterStore.FILTER_LIMITS.readMaxBytes') return
     reads.push(node)
   })
-  assert.ok(reads.length > 0, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）')
+  assert.ok(reads.length > 0, 'console.js 必须仍有一处读取当前覆盖文件原文（审计失败回滚用）且按 readMaxBytes 读')
+  assert.ok(readCaps.every(cap => cap !== 'FILTER_BODY_MAX_BYTES'),
+    `控制台读覆盖文件不得再用请求体预算（F3 两旋钮分道）：${JSON.stringify(readCaps)}`)
   for (const read of reads) {
     const options = read.arguments[2]
     const flag = options && options.type === 'ObjectExpression'
@@ -2351,7 +2439,8 @@ test('F2-1 LKG 内容未变不重写（两轮 mtime/inode 不动）；改一行�
 })
 
 // F2-3：### 每行编译成 2 个 RE2 对象（约 3.9 KB/个），4 MiB 全多行 ≈ 33 万对象 ≈ 1.29 GB 内存。
-// 行夹具必须短：单字段 16000 字符上限**先于**行数闸生效，故 2000 行拆两个字段（各 1000）——
+// 行夹具必须短：单字段字符上限**先于**行数闸生效，故 2000 行拆两个字段（各 1000，两个主字段的
+// 写预算是 80,000 字符，放得下）——
 // 这同时证明「全份 2000」与「单字段 1000」两道闸各管各的。
 function multilineFixture (count, prefix) {
   const lines = []
@@ -2423,9 +2512,11 @@ test('F2-3 未转义 | 闸：1000 个通过、1001 个拒绝；转义 \\| 不计
 test('F2-3 pingbitime 的 `分类###天数` 只把分类段的交替数纳入闸（纯天数仍全字段豁免）', () => {
   // `分类###天数` 的分类段会被 RuleEngine.compileRules 编译成分类正则、天数段只做 Number 解析，
   // 所以整字段豁免会让 `1001 个 |###7` 从闸门侧面绕过（与「单字段未转义 | >1000 返回 400」相反）。
-  const altsOf = (n, prefix) => Array.from({ length: n + 1 }, (_, i) => `${prefix}${i}`).join('|')
-  const cap = FILTER_LIMITS.fieldMaxLen.pingbitime
-  const overValue = `${altsOf(1001, 'c')}###7`
+  // 标签必须短：pingbitime 的单字段限额只有 2,048 字符，1001 个交替至少 2,005 字符（'7|7|…'）
+  // ——`c0|c1|…` 这种多字符标签会让夹具先撞长度闸，交替闸永远测不到。
+  const altsOf = (n, label = '7') => Array.from({ length: n + 1 }, () => label).join('|')
+  const cap = writeCharsOf('pingbitime')
+  const overValue = `${altsOf(1001)}###7`
   assert.ok(overValue.length < cap, `夹具必须在单字段字符上限内（${overValue.length} < ${cap}）`)
   const over = validateFilterRules({ filter: { pingbitime: overValue } }, deps)
   assert.strictEqual(over.ok, false, '分类段 1001 个未转义 | 必须拒绝')
@@ -2435,7 +2526,7 @@ test('F2-3 pingbitime 的 `分类###天数` 只把分类段的交替数纳入闸
   assert.match(err.message, /1001/)
   assert.match(err.message, /1000/)
 
-  const exactValue = `${altsOf(1000, 'c')}###7`
+  const exactValue = `${altsOf(1000)}###7`
   assert.ok(exactValue.length < cap, `夹具必须在单字段字符上限内（${exactValue.length} < ${cap}）`)
   const exact = validateFilterRules({ filter: { pingbitime: exactValue } }, deps)
   assert.strictEqual(exact.ok, true, `分类段恰好 1000 个交替必须通过：${JSON.stringify(exact.errors)}`)
@@ -2451,15 +2542,15 @@ test('F2-3 pingbitime 的 `分类###天数` 只把分类段的交替数纳入闸
   assert.strictEqual(validateFilterRules({ filter: { pingbitime: escaped } }, deps).ok, true,
     '分类段 1001 个转义 \\| 是字面竖线，不得计入交替')
 
-  // 按字段累加：两行 `分类###天数` 各 600 个（单行未超限）合计 1200 → 拒绝
-  const multiValue = `${altsOf(600, 'a')}###7\n${altsOf(600, 'b')}###7`
+  // 按字段累加：两行 `分类###天数` 各 501 个（单行未超限）合计 1002 → 拒绝
+  const multiValue = `${altsOf(501, '7')}###7\n${altsOf(501, '8')}###7`
   assert.ok(multiValue.length < cap, `夹具必须在单字段字符上限内（${multiValue.length} < ${cap}）`)
   const multi = validateFilterRules({ filter: { pingbitime: multiValue } }, deps)
-  assert.strictEqual(multi.ok, false, '跨行累加 1200 个交替必须拒绝')
+  assert.strictEqual(multi.ok, false, '跨行累加 1002 个交替必须拒绝')
   const multiErr = multi.errors.find((item) => item.code === 'too_many_lines')
   assert.ok(multiErr, `跨行累加超限必须给 too_many_lines：${JSON.stringify(multi.errors)}`)
   assert.strictEqual(multiErr.field, 'pingbitime')
-  assert.match(multiErr.message, /1200/)
+  assert.match(multiErr.message, /1002/)
 })
 
 test('F2-2 preview 预算：条数 200 先到、小样本完整、时间预算先到者停（纯函数）', () => {
@@ -2523,11 +2614,19 @@ test('F2-5 limits/usage 报告：上限与 FILTER_LIMITS 同源 + 规则文件�
   assert.strictEqual(report.limits.rulesFileMaxBytes, FILTER_LIMITS.rulesFileMaxBytes)
   assert.strictEqual(report.limits.requestBodyMaxBytes, FILTER_LIMITS.requestBodyMaxBytes)
   assert.strictEqual(report.limits.readMaxBytes, FILTER_LIMITS.readMaxBytes)
-  assert.strictEqual(report.limits.draftFieldMaxLen, FILTER_LIMITS.draftFieldMaxLen)
-  assert.strictEqual(report.limits.maxRuleLines, 2000)
-  assert.strictEqual(report.limits.maxAlternationsPerField, 1000)
+  assert.strictEqual(report.limits.totalBytes, FILTER_LIMITS.totalBytes, 'F3：整份预算随 limits 下发')
+  assert.strictEqual(report.limits.saveHeadroomBytes, FILTER_LIMITS.saveHeadroomBytes)
+  assert.strictEqual(report.limits.source, FILTER_LIMITS.source, '预算来源（probe/fallback）必须如实下发')
+  assert.strictEqual(report.limits.degraded, FILTER_LIMITS.degraded)
+  assert.deepStrictEqual(report.limits.perField.pingbibiaoti, { chars: FILTER_LIMITS.perField.pingbibiaoti.chars },
+    'perField 是 spec 口径：{chars}，不得直接下发进程内的冻结引用')
+  assert.strictEqual(report.limits.maxRuleLines, FILTER_LIMITS.maxRuleLines)
+  assert.strictEqual(report.limits.maxAlternationsPerField, FILTER_LIMITS.maxAlternationsPerField)
   assert.deepStrictEqual(report.limits.fieldMaxLen, { ...FILTER_LIMITS.fieldMaxLen })
-  assert.strictEqual(report.limits.fieldMaxLen.pingbibiaoti, 16000, 'F2 不得改变今日常量')
+  assert.strictEqual(report.limits.fieldMaxLen.pingbibiaoti, FILTER_LIMITS.perField.pingbibiaoti.chars,
+    'fieldMaxLen 是 perField 的扁平视图（同一份数据，不是第二个旋钮）')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(report.limits, 'draftFieldMaxLen'), false,
+    'draftFieldMaxLen 是死旋钮（草稿闸读 fieldMaxLenOf），F3 已从表里删除')
   // 非字符串值不得被算成字符数（否则前端拿到的用量是假的）
   assert.strictEqual(filterLimitsReport(dir, { pingbibiaoti: 42 }).usage.fieldChars.pingbibiaoti, 0)
 
@@ -2542,6 +2641,387 @@ test('F2-5 limits/usage 报告：上限与 FILTER_LIMITS 同源 + 规则文件�
   assert.strictEqual(fs.statSync(paths.file).size, 4096, '前置：链接目标确实有 4096 字节（否则测不出泄露）')
   assert.strictEqual(filterLimitsReport(dir, { pingbibiaoti: 'abc' }).usage.rulesFileBytes, null,
     '符号链接不得被跟随取大小（unsafe ⇒ null，不得把链接目标的 4096 字节报成规则文件大小）')
+})
+
+// ===== F3：动态预算（纯函数 / 探测回落 / 覆盖夹取 / 容量文件跨进程共读 / fail-closed）=====
+// 目标不是「读代码」：computeFilterCapacity 是纯函数，全部用注入的资源值直测；加载期探测的四类失败
+// 与容量文件的「以文件为准」也用注入的 readFileSync/statfsSync 直测，不依赖本机真实资源。
+
+const capacityInput = () => ({
+  memAvailableBytes: 450 * 1024 * 1024,
+  cgroupHeadroomBytes: Infinity,
+  diskAvailBytes: 20 * 1024 * 1024 * 1024,
+  fileBytes: 81435,
+  softCapBytes: FILTER_DEFAULT_SOFT_CAP_BYTES
+})
+
+test('F3 computeFilterCapacity：纯函数（同入参两次 JSON 逐字节相等）+ 预算公式', () => {
+  const first = computeFilterCapacity(capacityInput())
+  const second = computeFilterCapacity(capacityInput())
+  assert.strictEqual(JSON.stringify(first), JSON.stringify(second),
+    '同一入参连调两次必须逐字节相等（容量文件跨进程共读的前提：不得含时钟/随机）')
+  assert.strictEqual(Object.isFrozen(first.perField), true, 'perField 必须冻结（闸门读的就是它）')
+  // 默认 softCap 512 KiB ⇒ totalBytes 512 KiB、两主字段 80,000、reserve 42,432（= spec 的 8×1000 + 3×2048）
+  assert.strictEqual(first.totalBytes, 512 * 1024)
+  assert.strictEqual(first.reserveBytes, FILTER_RESERVE_BYTES, 'reserve 必须是 42,432 B（8×1000 + 3×2048 字符 × 3）')
+  assert.strictEqual(first.reserveBytes, 42432, 'spec 钉死的 reserve 数值（改公式必须同步文档）')
+  assert.strictEqual(first.mainChars, 80000)
+  assert.strictEqual(first.source, 'probe')
+  assert.strictEqual(first.degraded, false)
+  assert.strictEqual(FILTER_MAIN_FIELDS.length, 2, '主字段必须恰好两个（mainChars 公式按 2 摊）')
+  for (const field of FILTER_MAIN_FIELDS) {
+    assert.strictEqual(first.perField[field].chars, 80000, `主字段 ${field} 必须拿到 mainChars`)
+  }
+  assert.strictEqual(first.perField.pingbibiaotiplus.chars, 2048, 'plus 字段档位 2048')
+  assert.strictEqual(first.perField.pingbineirongplus.chars, 2048)
+  assert.strictEqual(first.perField.pingbilouzhuplus.chars, 2048)
+  assert.strictEqual(first.perField.pingbifenlei.chars, 1000, '小字段档位 1000')
+  assert.strictEqual(first.perField.pingbitime.chars, 2048,
+    'pingbitime 取 plus 档 2048：交替闸要在长度闸之前可达（分类段 1001 个 | 至少 2,005 字符）')
+  // 读写两旋钮：请求体 = 整份 + 8192；读硬顶 = max(整份, 当前文件字节数) + 1024
+  assert.strictEqual(first.rulesFileMaxBytes, first.totalBytes)
+  assert.strictEqual(first.requestBodyMaxBytes, first.totalBytes + 8192)
+  assert.strictEqual(first.readMaxBytes, Math.max(first.totalBytes, 81435) + 1024)
+  assert.strictEqual(first.saveHeadroomBytes, 32)
+  // 资源不足时**真的**按资源收紧（不是永远返回 softCap）：12 MiB 可用内存 ⇒ memBudget 384 KiB
+  const tiny = computeFilterCapacity({ ...capacityInput(), memAvailableBytes: 12 * 1024 * 1024 })
+  assert.strictEqual(tiny.totalBytes, 384 * 1024, 'memBudget = 0.25 × 12 MiB / 8 = 384 KiB（64 KiB 对齐）')
+  assert.ok(tiny.mainChars < 80000 && tiny.mainChars > 0, `主字段预算必须随 totalBytes 收缩：${tiny.mainChars}`)
+  // 磁盘预算同样生效：64 MiB 可用 × 0.01 / 6 ≈ 106 KiB < 256 KiB ⇒ 被下界夹到 256 KiB
+  const tinyDisk = computeFilterCapacity({ ...capacityInput(), diskAvailBytes: 64 * 1024 * 1024 })
+  assert.strictEqual(tinyDisk.totalBytes, FILTER_MIN_TOTAL_BYTES)
+  // cgroup 有界时取 min(MemAvailable, headroom)：headroom 12 MiB 优先
+  const cgroupBound = computeFilterCapacity({ ...capacityInput(), cgroupHeadroomBytes: 12 * 1024 * 1024 })
+  assert.strictEqual(cgroupBound.totalBytes, 384 * 1024, 'cgroup headroom 更小时必须取它（进程会被 OOM 杀死）')
+  // 恰好等于 softCap 的输入不得被 4096 对齐改小（512 KiB 本身已对齐）
+  assert.strictEqual(computeFilterCapacity({ ...capacityInput(), softCapBytes: 512 * 1024 }).totalBytes, 512 * 1024)
+})
+
+test('F3 softCap 覆盖：夹 [256 KiB, 8 MiB]、向下 4096 对齐、非法值回落默认（不静默当 auto）', () => {
+  const at = (softCapBytes) => computeFilterCapacity({ ...capacityInput(), softCapBytes }).totalBytes
+  assert.strictEqual(at(400000), 397312, '400,000 必须向下对齐到 397,312（4096 × 97）')
+  assert.strictEqual(at(FILTER_MIN_TOTAL_BYTES - 1), FILTER_MIN_TOTAL_BYTES, '低于下界必须夹到 256 KiB')
+  assert.strictEqual(at(FILTER_MAX_TOTAL_BYTES + 4096), FILTER_MAX_TOTAL_BYTES, '高于上界必须夹到 8 MiB')
+  assert.strictEqual(at(undefined), FILTER_DEFAULT_SOFT_CAP_BYTES, '不设覆盖时用默认 512 KiB')
+  assert.strictEqual(at(Number.NaN), FILTER_DEFAULT_SOFT_CAP_BYTES, '非数字覆盖回落默认')
+  // 加载期：非法覆盖（'abc'）必须回落默认并 console.warn（不静默当 auto）
+  const dir = makeDir()
+  const warned = []
+  const origWarn = console.warn
+  let resolved
+  try {
+    console.warn = (...parts) => { warned.push(parts.join(' ')) }
+    resolved = resolveFilterLimits({
+      cacheDir: dir,
+      env: { [FILTER_SOFT_CAP_ENV]: 'abc' },
+      readFileSync: (filePath) => {
+        if (String(filePath) === '/proc/meminfo') return 'MemTotal: 1 kB\nMemAvailable: 460800 kB\n'
+        throw new Error('ENOENT ' + String(filePath))
+      },
+      statfsSync: () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 }),
+      now: () => 1700000000000
+    })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(resolved.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES, '非法覆盖必须回落默认 512 KiB')
+  assert.ok(warned.some(line => line.includes(FILTER_SOFT_CAP_ENV) && line.includes('abc')),
+    `非法覆盖必须留一条点名环境变量与实际值的告警：${JSON.stringify(warned)}`)
+})
+
+test('F3 探测失败四类一律回落 256 KiB / 16,000 + degraded（绝不回落成「无限」）', () => {
+  const base = capacityInput()
+  const cases = [
+    ['meminfo 读不到', { memAvailableBytes: null }],
+    ['MemAvailable ≤ 0', { memAvailableBytes: 0 }],
+    ['cgroup headroom ≤ 0', { cgroupHeadroomBytes: 0 }],
+    ['statfs 抛错', { diskAvailBytes: null }]
+  ]
+  for (const [label, patch] of cases) {
+    const capacity = computeFilterCapacity({ ...base, ...patch })
+    assert.strictEqual(capacity.totalBytes, FILTER_MIN_TOTAL_BYTES, `${label} ⇒ 整份预算回落 256 KiB`)
+    assert.strictEqual(capacity.source, 'fallback')
+    assert.strictEqual(capacity.degraded, true, `${label} ⇒ degraded:true`)
+    assert.ok(capacity.degradedReasons.length >= 1, `${label} ⇒ 必须给出回落原因`)
+    assert.strictEqual(capacity.mainChars, FILTER_FIELD_MAX_LEN, `${label} ⇒ 主字段回落 16,000`)
+    for (const field of FILTER_RULE_FIELDS) {
+      assert.strictEqual(capacity.perField[field].chars, FILTER_FIELD_MAX_LEN, `${label} ⇒ ${field} 回落 16,000`)
+    }
+    assert.ok(Number.isSafeInteger(capacity.readMaxBytes) && capacity.readMaxBytes > 0,
+      `${label} ⇒ readMaxBytes 必须仍是正安全整数（NaN/0 = 无界读）`)
+    assert.ok(Number.isSafeInteger(capacity.requestBodyMaxBytes) && capacity.requestBodyMaxBytes > 0)
+  }
+  // 真实探测链：readFileSync 全抛错 ⇒ 四类里至少 meminfo/statfs 两条同时命中，仍必须是 256 KiB（不是 Infinity）
+  const warned = []
+  const origWarn = console.warn
+  let resolved
+  try {
+    console.warn = (...parts) => { warned.push(parts.join(' ')) }
+    resolved = resolveFilterLimits({
+      cacheDir: makeDir(),
+      env: {},
+      readFileSync: () => { throw new Error('EACCES') },
+      statfsSync: () => { throw new Error('EPERM') },
+      now: () => 1700000000000
+    })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(resolved.totalBytes, FILTER_MIN_TOTAL_BYTES)
+  assert.strictEqual(resolved.degraded, true)
+  assert.ok(Number.isFinite(resolved.readMaxBytes) && resolved.readMaxBytes > 0)
+  // cgroup 'max' 必须特判：Number('max') = NaN，漏了它预算是 NaN 或被夹成 0
+  const unlimitedCgroup = resolveFilterLimits({
+    cacheDir: makeDir(),
+    env: {},
+    readFileSync: (filePath) => {
+      const p = String(filePath)
+      if (p === '/proc/meminfo') return 'MemAvailable: 460800 kB\n'
+      if (p === '/proc/self/cgroup') return '0::/\n'
+      if (p.endsWith('/memory.max')) return 'max\n'
+      if (p.endsWith('/memory.current')) return '12345\n'
+      throw new Error('ENOENT ' + p)
+    },
+    statfsSync: () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 }),
+    now: () => 1700000000000
+  })
+  assert.strictEqual(unlimitedCgroup.degraded, false, "cgroup 'max' = 无上限，不是探测失败")
+  assert.strictEqual(unlimitedCgroup.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES)
+  // headroom ≤ 0（max ≤ current）必须算失败：进程已经贴着 cgroup 上限，不能再按「有 12 MiB」用
+  const zeroHeadroom = resolveFilterLimits({
+    cacheDir: makeDir(),
+    env: {},
+    readFileSync: (filePath) => {
+      const p = String(filePath)
+      if (p === '/proc/meminfo') return 'MemAvailable: 460800 kB\n'
+      if (p === '/proc/self/cgroup') return '0::/\n'
+      if (p.endsWith('/memory.max')) return '1024\n'
+      if (p.endsWith('/memory.current')) return '1024\n'
+      throw new Error('ENOENT ' + p)
+    },
+    statfsSync: () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 }),
+    now: () => 1700000000000
+  })
+  assert.strictEqual(zeroHeadroom.totalBytes, FILTER_MIN_TOTAL_BYTES, 'headroom = 0 ⇒ 回落 256 KiB')
+  assert.strictEqual(zeroHeadroom.degraded, true)
+})
+
+test('F3 读硬顶边界：恰好 readMaxBytes 可读、+1 判 corrupt；写入接受阈值 ≤ readMaxBytes', () => {
+  // 不变式（加载期）：保存接受阈值不得大于读硬顶——否则「保存成功但下一轮读端判超限」。
+  assert.ok(SAVE_ACCEPT_MAX_BYTES <= FILTER_LIMITS.readMaxBytes,
+    `写入接受阈值 ${SAVE_ACCEPT_MAX_BYTES} 必须 ≤ 读硬顶 ${FILTER_LIMITS.readMaxBytes}`)
+  assert.ok(FILTER_LIMITS.readMaxBytes >= FILTER_LIMITS.rulesFileMaxBytes,
+    '读硬顶必须 ≥ 整份预算（否则保存到预算上限的文件自己读不回）')
+  resetStoreStateForTests()
+  const buildAt = (target) => {
+    const filter = {}
+    for (const field of FILTER_RULE_FIELDS) filter[field] = ''
+    filter.pingbitime = '5'
+    const fields = FILTER_RULE_FIELDS.filter(field => field !== 'pingbitime')
+    const size = () => Buffer.byteLength(JSON.stringify({ schema: 1, revision: 0, filter }), 'utf8')
+    let remaining = target - size()
+    for (const field of fields) {
+      const maxChars = readCharsOf(field)
+      const cn = Math.max(0, Math.min(maxChars, Math.floor(remaining / 3)))
+      filter[field] = '线'.repeat(cn)
+      remaining -= cn * 3
+      const ascii = Math.max(0, Math.min(maxChars - cn, remaining))
+      filter[field] += 'a'.repeat(ascii)
+      remaining -= ascii
+      if (remaining <= 0) break
+    }
+    assert.strictEqual(size(), target)
+    return filter
+  }
+  const exactDir = makeDir()
+  writeJson(filterRulesPaths(exactDir).file, { schema: 1, revision: 9, filter: buildAt(FILTER_LIMITS.readMaxBytes) })
+  const exact = loadFilterRules({ cacheDir: exactDir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(exact.source, 'override', `恰好 readMaxBytes 的文件必须能读回：${JSON.stringify(exact.error || {})}`)
+  assert.strictEqual(exact.revision, 9)
+  const overDir = makeDir()
+  writeJson(filterRulesPaths(overDir).file, { schema: 1, revision: 9, filter: buildAt(FILTER_LIMITS.readMaxBytes + 1) })
+  const over = loadFilterRules({ cacheDir: overDir, defaults: DEFAULTS, keyword: {}, deps })
+  assert.strictEqual(over.source, 'corrupt', 'readMaxBytes + 1 必须判 corrupt（读硬顶不得放松）')
+  assert.match(over.error.message, /tooLarge/)
+})
+
+test('F3 normalizeFilterLimits fail-closed：0/负数/NaN/缺字段/缺 totalBytes 逐项回落，读硬顶不得小于接受阈值', () => {
+  const good = computeFilterCapacity(capacityInput())
+  const clone = () => JSON.parse(JSON.stringify({ ...good, perField: good.perField }))
+  const warned = []
+  const origWarn = console.warn
+  const normalizeQuiet = (limits) => {
+    warned.length = 0
+    console.warn = (...parts) => { warned.push(parts.join(' ')) }
+    try { return normalizeFilterLimits(limits) } finally { console.warn = origWarn }
+  }
+  const bad = clone()
+  bad.perField.pingbibiaoti = { chars: 0 }
+  bad.perField.pingbineirong = { chars: -1 }
+  bad.perField.pingbifenlei = { chars: Number.NaN }
+  delete bad.perField.pingbitime
+  bad.readMaxBytes = 0
+  bad.requestBodyMaxBytes = -5
+  bad.maxRuleLines = '2000'
+  const normalized = normalizeQuiet(bad)
+  assert.strictEqual(normalized.perField.pingbibiaoti.chars, FILTER_FIELD_MAX_LEN, 'chars=0 必须回落 16,000')
+  assert.strictEqual(normalized.perField.pingbineirong.chars, FILTER_FIELD_MAX_LEN, 'chars=-1 必须回落 16,000')
+  assert.strictEqual(normalized.perField.pingbifenlei.chars, FILTER_FIELD_MAX_LEN, 'chars=NaN 必须回落 16,000')
+  assert.strictEqual(normalized.perField.pingbitime.chars, FILTER_FIELD_MAX_LEN, '缺字段必须补齐（fieldMaxLenOf 的 0 只留给未知字段）')
+  // readMaxBytes=0 / requestBody=-5 先回落今日常量，再被结构不变式抬到自洽值（0 传给
+  // readSafeTextResult 就是无界读，这是本表存在的唯一理由）。
+  assert.ok(normalized.readMaxBytes >= SAVE_ACCEPT_MAX_BYTES,
+    `readMaxBytes=0 必须被抬到 ≥ 写入接受阈值 ${SAVE_ACCEPT_MAX_BYTES}（实得 ${normalized.readMaxBytes}）`)
+  assert.ok(normalized.requestBodyMaxBytes >= normalized.totalBytes + 8192,
+    `requestBodyMaxBytes=-5 必须被抬到 ≥ totalBytes+8192（实得 ${normalized.requestBodyMaxBytes}）`)
+  assert.ok(warned[0].includes('readMaxBytes=0'), '告警必须点名原始非法值')
+  assert.strictEqual(normalized.maxRuleLines, FILTER_LIMITS.maxRuleLines, '数字字符串不算合格值（必须回落）')
+  assert.ok(warned.length === 1, `一次加载只打一条汇总告警：${JSON.stringify(warned)}`)
+  assert.match(warned[0], /fail-closed/, warned[0])
+  // 全部字段都在告警里点名（可定位）
+  for (const token of ['perField.pingbibiaoti.chars=0', 'perField.pingbineirong.chars=-1', 'readMaxBytes=0']) {
+    assert.ok(warned[0].includes(token), `告警必须点名 ${token}：${warned[0]}`)
+  }
+  // totalBytes 缺失/越界 ⇒ 回落 256 KiB
+  const noTotal = normalizeQuiet({ ...clone(), totalBytes: 8 * 1024 * 1024 + 1 })
+  assert.strictEqual(noTotal.totalBytes, FILTER_MIN_TOTAL_BYTES)
+  // 不变式：readMaxBytes 小于写入接受阈值时加载期必须把它抬到整份预算（否则就是「保存成功但读不回」）
+  const broken = normalizeQuiet({ ...clone(), readMaxBytes: 1024 })
+  const accept = broken.rulesFileMaxBytes - broken.saveHeadroomBytes
+  assert.ok(broken.readMaxBytes >= accept,
+    `readMaxBytes 必须被抬到 ≥ 写入接受阈值 ${accept}（实得 ${broken.readMaxBytes}）`)
+  // 合格表不得产生任何告警
+  const clean = normalizeQuiet(clone())
+  assert.strictEqual(warned.length, 0, '合格表不得告警')
+  assert.deepStrictEqual(clean.fieldMaxLen, { ...good.perField && Object.fromEntries(FILTER_RULE_FIELDS.map(f => [f, good.perField[f].chars])) })
+})
+
+test('F3 派生读上限（LKG / applied）：非法组合不得变 NaN，且封顶在 8 MiB + 包装', () => {
+  const ok = computeDerivedReadLimits({ readMaxBytes: 525312, lastgoodWrapperBytes: 1024, appliedWrapperBytes: 1024 })
+  assert.strictEqual(ok.lastgoodMaxBytes, 526336)
+  assert.strictEqual(ok.appliedMaxBytes, 526336)
+  assert.strictEqual(ok.fallback, false)
+  const hardCap = FILTER_MAX_TOTAL_BYTES + 1024
+  for (const bad of [Number.NaN, 0, -1, '1024', Infinity, undefined, 8 * 1024 * 1024 * 4]) {
+    const warned = []
+    const origWarn = console.warn
+    let derived
+    try {
+      console.warn = (...parts) => { warned.push(parts.join(' ')) }
+      derived = computeDerivedReadLimits({ readMaxBytes: bad, lastgoodWrapperBytes: 1024, appliedWrapperBytes: 1024 })
+    } finally { console.warn = origWarn }
+    assert.strictEqual(derived.lastgoodMaxBytes, hardCap, `readMaxBytes=${String(bad)} ⇒ 回落硬顶 ${hardCap}`)
+    assert.strictEqual(derived.appliedMaxBytes, hardCap)
+    assert.strictEqual(derived.fallback, true)
+    assert.ok(warned.length === 2, `两项派生各留一条告警：${JSON.stringify(warned)}`)
+  }
+  // 真实导出的派生值必须是正安全整数（NaN 传给 readSafeTextResult = 无界读）
+  for (const value of [LASTGOOD_MAX_BYTES, APPLIED_MAX_BYTES]) {
+    assert.ok(Number.isSafeInteger(value) && value > 0, `派生读上限必须是正安全整数：${value}`)
+  }
+  assert.ok(LASTGOOD_MAX_BYTES >= FILTER_LIMITS.readMaxBytes + 76,
+    'LKG 读上限必须容得下「读硬顶的覆盖文件 + 76 字节包装」')
+})
+
+test('F3 容量文件：0600、含 totalBytes/perField/source/degraded/at；跨进程以文件为准；显式覆盖优先并重写', () => {
+  const dir = makeDir()
+  const capacityPath = path.join(dir, FILTER_CAPACITY_FILE)
+  const fakeProc = (filePath) => {
+    const target = String(filePath)
+    if (target === '/proc/meminfo') return 'MemAvailable: 460800 kB\n'
+    throw new Error('ENOENT ' + target)
+  }
+  const fakeStatfs = () => ({ bavail: 4 * 1024 * 1024, bsize: 4096 })
+  const warned = []
+  const origWarn = console.warn
+  let first
+  try {
+    console.warn = (...parts) => { warned.push(parts.join(' ')) }
+    first = resolveFilterLimits({ cacheDir: dir, env: {}, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 1700000000000 })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(first.totalBytes, FILTER_DEFAULT_SOFT_CAP_BYTES)
+  assert.strictEqual(fs.statSync(capacityPath).mode & 0o777, 0o600, '容量文件必须是 0600（writeAtomic）')
+  const text = fs.readFileSync(capacityPath, 'utf8')
+  const payload = JSON.parse(text)
+  for (const key of ['totalBytes', 'perField', 'source', 'degraded', 'at']) {
+    assert.ok(Object.prototype.hasOwnProperty.call(payload, key), `容量文件必须含 ${key}：${text}`)
+  }
+  assert.strictEqual(payload.at, 1700000000000, 'at 取注入的时钟（写文件时才取，纯函数内不带时钟）')
+  assert.strictEqual(payload.totalBytes, first.totalBytes)
+  assert.deepStrictEqual(Object.keys(payload.perField).sort(byCodeUnit), [...FILTER_RULE_FIELDS].sort(byCodeUnit),
+    '11 个字段必须全在（半份文件等于两边各用一套预算）')
+  const onDisk = readCapacityFile(capacityPath)
+  assert.ok(onDisk, '写出的容量文件必须能被 readCapacityFile 读回')
+  assert.deepStrictEqual(onDisk.perField, first.perField, '文件里的 perField 必须与本进程钉住的一致')
+
+  // ① 预算没变 ⇒ 不重写（保留原 at / inode）：worker 每 5 秒 spawn 一次，不能每轮都写盘
+  const before = fs.statSync(capacityPath)
+  const second = resolveFilterLimits({ cacheDir: dir, env: {}, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 1800000000000 })
+  const after = fs.statSync(capacityPath)
+  assert.strictEqual(second.totalBytes, first.totalBytes)
+  assert.strictEqual(after.ino, before.ino, '预算没变不得重写容量文件')
+  assert.strictEqual(JSON.parse(fs.readFileSync(capacityPath, 'utf8')).at, 1700000000000, '预算没变必须保留原 at（启动钉住的时间点）')
+
+  // ② 另一个进程算出不同预算（探测差异）⇒ 以**文件**为准并告警（console 与 worker 必须同一份）
+  const otherDir = makeDir()
+  const otherPath = path.join(otherDir, FILTER_CAPACITY_FILE)
+  const sharedPayload = JSON.parse(fs.readFileSync(capacityPath, 'utf8'))
+  sharedPayload.totalBytes = FILTER_MIN_TOTAL_BYTES
+  sharedPayload.perField = Object.fromEntries(FILTER_RULE_FIELDS.map(field => [field, { chars: 20000 }]))
+  sharedPayload.mainChars = 20000
+  fs.writeFileSync(otherPath, JSON.stringify(sharedPayload))
+  const adoptWarned = []
+  let adopted
+  try {
+    console.warn = (...parts) => { adoptWarned.push(parts.join(' ')) }
+    adopted = resolveFilterLimits({ cacheDir: otherDir, env: {}, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 1900000000000 })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(adopted.totalBytes, FILTER_MIN_TOTAL_BYTES, '不一致时必须以容量文件为准（启动钉住）')
+  assert.strictEqual(adopted.perField.pingbibiaoti.chars, 20000, 'perField 也以文件为准（否则两进程闸门不同）')
+  assert.strictEqual(adopted.requestBodyMaxBytes, FILTER_MIN_TOTAL_BYTES + 8192, '派生旋钮按文件的 totalBytes 重算')
+  assert.ok(adoptWarned.some(line => line.includes('以文件为准')), `必须留一条「以文件为准」的告警：${JSON.stringify(adoptWarned)}`)
+
+  // ③ 显式 XBK_FILTER_SOFT_CAP_BYTES 优先（否则「可覆盖」在第二个进程上失效），并重写容量文件
+  const overrideWarned = []
+  let overridden
+  try {
+    console.warn = (...parts) => { overrideWarned.push(parts.join(' ')) }
+    overridden = resolveFilterLimits({
+      cacheDir: otherDir, env: { [FILTER_SOFT_CAP_ENV]: '1048576' }, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 2000000000000
+    })
+  } finally { console.warn = origWarn }
+  assert.strictEqual(overridden.totalBytes, 1048576, '显式覆盖必须压过容量文件里钉住的值')
+  assert.strictEqual(JSON.parse(fs.readFileSync(otherPath, 'utf8')).totalBytes, 1048576, '覆盖后必须重写容量文件（下一个进程跟着改）')
+  assert.ok(overrideWarned.some(line => line.includes('以显式覆盖为准')), `必须说明为何忽略文件里的值：${JSON.stringify(overrideWarned)}`)
+
+  // ④ 缓存目录也可以只从环境变量来（生产走的就是这条：systemd 注入 XBK_CACHE_DIR）——
+  // 容量文件必须落在同一个目录，console 与 worker 才可能读到同一份。
+  const envDir = makeDir()
+  const savedWarn = console.warn
+  try {
+    console.warn = () => {}
+    resolveFilterLimits({ env: { [FILTER_CACHE_DIR_ENV]: envDir }, readFileSync: fakeProc, statfsSync: fakeStatfs, now: () => 2100000000000 })
+  } finally { console.warn = savedWarn }
+  assert.strictEqual(fs.existsSync(path.join(envDir, FILTER_CAPACITY_FILE)), true,
+    'XBK_CACHE_DIR 必须决定容量文件位置（否则两边各写一份、预算悄悄分叉）')
+})
+
+test('F3 加载期产出的 FILTER_LIMITS 自洽：两主字段、全字段写满 ≤ totalBytes−32、读写两旋钮分道', () => {
+  const writeTotal = FILTER_RULE_FIELDS.reduce((sum, field) => sum + FILTER_LIMITS.perField[field].chars, 0)
+  assert.ok(writeTotal > 0)
+  // 主字段必须是两个、且严格大于其它字段（不是「所有字段同值 16000」的旧形状）
+  for (const field of FILTER_MAIN_FIELDS) {
+    assert.ok(FILTER_LIMITS.perField[field].chars > FILTER_LIMITS.perField.pingbifenlei.chars,
+      `主字段 ${field} 的写预算必须大于小字段`)
+  }
+  // 读端下限：存量小字段（16,000）不得被判 corrupt
+  for (const field of FILTER_RULE_FIELDS) {
+    assert.ok(readFieldMaxLen(field) >= FILTER_FIELD_MAX_LEN, `${field} 的读上限不得低于今日常量`)
+    assert.ok(readFieldMaxLen(field) >= FILTER_LIMITS.perField[field].chars, `${field} 的读上限不得低于写预算`)
+  }
+  assert.strictEqual(FILTER_LIMITS.requestBodyMaxBytes, FILTER_LIMITS.totalBytes + 8192, '请求体 = 整份 + 8192')
+  assert.ok(FILTER_LIMITS.source === 'probe' || FILTER_LIMITS.source === 'fallback', `source 只能是 probe/fallback：${FILTER_LIMITS.source}`)
+  assert.strictEqual(typeof FILTER_LIMITS.degraded, 'boolean')
+  // FILTER_LIMITS 是冻结的：任何闸门若就地改表都会在这里炸
+  assert.strictEqual(Object.isFrozen(FILTER_LIMITS), true)
+  assert.strictEqual(Object.isFrozen(FILTER_LIMITS.perField), true)
+  assert.strictEqual(Object.isFrozen(FILTER_LIMITS.fieldMaxLen), true)
 })
 
 // ===== 路径 helper =====

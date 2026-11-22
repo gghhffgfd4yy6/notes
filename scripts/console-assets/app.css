@@ -1334,6 +1334,9 @@
   .fr-field-head { display: flex; align-items: baseline; gap: var(--sp-2); flex-wrap: wrap; }
   .fr-label { font-size: var(--fs-sm); font-weight: 500; }
   .fr-key { color: var(--text-dim); font-family: var(--mono); font-size: var(--fs-2xs); }
+  /* F3：字段计数器「已用 / 上限」——上限由服务端 limits 下发（动态预算），超限转红。 */
+  .fr-count { margin-left: auto; color: var(--text-dim); font-family: var(--mono); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+  .fr-count-over { color: var(--bad-fg); }
   .fr-protect {
     padding: 0 8px; border-radius: var(--r-pill); font-size: var(--fs-2xs);
     color: var(--ok-fg); background: var(--ok-soft); border: 1px solid var(--ok-line);

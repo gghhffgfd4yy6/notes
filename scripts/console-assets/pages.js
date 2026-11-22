@@ -4421,20 +4421,33 @@ function backupRevisionsOf (files, revision) {
     .slice(0, 3)
 }
 
-// 单个规则字段：label/for 绑定、当前值、脏标记、逐字段错误。
-function FilterField ({ def, value, saved, error, onChange }) {
+// 单字段上限：只认服务端下发的 limits（perField[name].chars，老版本退回 fieldMaxLen[name]）。
+// 拿不到就返回 null ⇒ 不显示计数器——**绝不写死数字**（上限是动态的：启动钉住 + 可覆盖）。
+function filterFieldLimitOf (data, name) {
+  const limits = data && data.limits && typeof data.limits === 'object' ? data.limits : null
+  if (!limits) return null
+  const perField = limits.perField && typeof limits.perField === 'object' ? limits.perField : null
+  const entry = perField && typeof perField[name] === 'object' ? perField[name] : null
+  const chars = entry ? entry.chars : (limits.fieldMaxLen ? limits.fieldMaxLen[name] : null)
+  return Number.isSafeInteger(chars) && chars > 0 ? chars : null
+}
+
+// 单个规则字段：label/for 绑定、当前值、脏标记、逐字段错误、已用/上限计数。
+function FilterField ({ def, value, saved, error, onChange, maxLen }) {
   const id = `filter-rule-${def.name}`
   const hintId = `${id}-hint`
   const errId = `${id}-err`
   const shown = value === undefined || value === null ? '' : String(value)
   const prev = saved === undefined || saved === null ? '' : String(saved)
   const dirty = shown !== prev
+  const limit = Number.isSafeInteger(maxLen) && maxLen > 0 ? maxLen : null
   const describedBy = error ? `${hintId} ${errId}` : hintId
   return html`<div class=${'fr-field' + (def.protect ? ' fr-field-protect' : '')}>
     <div class="fr-field-head">
       <label class="fr-label" for=${id}>${def.label}</label>
       ${def.protect && html`<span class="fr-protect">保护（命中即保留，优先于屏蔽）</span>`}
       ${dirty && html`<span class="fr-dirty">未保存</span>`}
+      ${limit !== null && html`<span class=${'fr-count' + (shown.length > limit ? ' fr-count-over' : '')}>已用 ${fmtNum(shown.length)} / 上限 ${fmtNum(limit)}</span>`}
       <code class="fr-key">${def.name}</code>
     </div>
     ${def.kind === 'days'
@@ -4846,7 +4859,12 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
     }
     if (res.status === 401) { fail('凭证已失效（401），写操作被拒绝；请用带 token 的完整链接重新打开控制台。'); return 'unauthorized' }
     if (code === 'engine_unavailable' || res.status === 503) { fail('安全正则引擎（re2）暂不可用，本次不落盘；请检查部署后重试。'); return 'engine_unavailable' }
-    if (code === 'body_too_large' || res.status === 413) { fail('规则内容超过 256 KiB 上限，请精简后再保存。'); return 'body_too_large' }
+    if (code === 'body_too_large' || res.status === 413) {
+      // 上限来自服务端 GET limits（动态预算，启动钉住）：拿不到时只给口径、不写死数字。
+      const cap = Number.isSafeInteger(data && data.limits && data.limits.requestBodyMaxBytes) ? data.limits.requestBodyMaxBytes : null
+      fail(cap === null ? '规则内容超过请求体上限，请精简后再保存。' : `规则内容超过 ${fmtBytes(cap)} 请求体上限，请精简后再保存。`)
+      return 'body_too_large'
+    }
     if (code === 'unsupported_media_type' || res.status === 415) { fail('请求格式不被接受（写端点要求 application/json）。'); return 'unsupported_media_type' }
     if (code === 'write_busy') { fail(`另一个写入正在进行，请 1 秒后重试（Retry-After: ${res.retryAfter || '1'}）。`); return 'write_busy' }
     if (code === 'store_corrupt') { fail('覆盖文件已损坏：保存需要确认覆盖（确认后损坏内容不可回滚）。'); return 'store_corrupt' }
@@ -5384,7 +5402,8 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           <div class="fr-group-note">${g.note}</div>
           ${g.fields.map((f) => html`<${FilterField} key=${f.name} def=${f}
             value=${draft ? draft[f.name] : ''} saved=${base ? base[f.name] : ''}
-            error=${fieldErrors[f.name] || ''} onChange=${setFieldValue} />`)}
+            error=${fieldErrors[f.name] || ''} onChange=${setFieldValue}
+            maxLen=${filterFieldLimitOf(data, f.name)} />`)}
         </fieldset>`)}
       </div>
 
