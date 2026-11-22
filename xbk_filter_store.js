@@ -1669,9 +1669,12 @@ function corruptResult (defaults, keyword, message, key, lastGoodFile) {
   }
 }
 
-function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGood }) {
+function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGood, readFile }) {
   const paths = filterRulesPaths(cacheDir)
   const key = path.dirname(paths.file)
+  // O1：覆盖文件的读取入口可注入（默认模块级 readRulesFile）。唯一用途是让「签名不变 ⇒ 0 次读」
+  // 这条契约能被用例按**调用计数**验证，而不是靠「读代码」；生产路径恒不传。
+  const readRules = typeof readFile === 'function' ? readFile : readRulesFile
   // 明确上限：覆盖文件是外部可编辑的输入，禁止无界整读（FILTER_LIMITS.readMaxBytes 与 console body 上限同源）。
   // 两条「不跟随符号链接」的闸门一前一后（C10-019）：读走 readSafeTextResult（O_NOFOLLOW + fstat
   // + 读后复检 inode，末级是链接直接判 unsafe），收紧走 enforceOwnerOnlyMode（O_NOFOLLOW 打开、
@@ -1680,12 +1683,12 @@ function loadFilterRulesImpl ({ cacheDir, defaults, keyword, deps, persistLastGo
   // F4-2：openNonBlocking —— 裸 O_RDONLY 打开无写者的 FIFO 会同步阻塞（无日志、无退出码），
   // 控制台每 5 秒 spawn 的单轮进程会永久挂死；O_NONBLOCK 下 open FIFO 立刻 ENXIO ⇒ unsafe，
   // 随后的 fstat 普通文件校验同样拒绝一切非普通文件。下同（applied / LKG 读取）。
-  let read = readRulesFile(paths.file)
+  let read = readRules(paths.file)
   if (isTransientReadStatus(read.status)) {
     // F4-3：replaced / ioError 是瞬时并发事实（另一进程原子 rename 覆盖文件的那一瞬），
     // 退避 50ms 重读一次再判降级——否则会白丢一轮合法规则并误报损坏。
     sleepMs(TRANSIENT_READ_RETRY_MS)
-    read = readRulesFile(paths.file)
+    read = readRules(paths.file)
   }
   if (read.status === 'missing') {
     // 文件被删除 = 用户恢复代码默认：本目录的 last-known-good 随之作废（进程内缓存 + 持久 LKG 一起清）。
@@ -1755,7 +1758,8 @@ function loadFilterRules (options) {
       defaults: opts.defaults,
       keyword: opts.keyword,
       deps: opts.deps,
-      persistLastGood: opts.persistLastGood
+      persistLastGood: opts.persistLastGood,
+      readFile: opts.deps && typeof opts.deps.readRulesFile === 'function' ? opts.deps.readRulesFile : null
     })
   } catch (e) {
     // 兜底：读盘/解析/合并的任何未预期异常都收敛成降级结果（绝不杀整轮 run）。
@@ -1763,6 +1767,124 @@ function loadFilterRules (options) {
     try { lkgFile = filterRulesPaths(opts.cacheDir).lastgood } catch (e2) { lkgFile = '' }
     return corruptResult(opts.defaults, opts.keyword, `覆盖文件读取异常：${safeErrorMessage(e)}`, key, lkgFile)
   }
+}
+
+// ============================================================
+// O1：规则签名短路（常驻进程内「上一轮」）
+//
+// 现状（实测见 ledgers/perf-20261122/loop.md）：覆盖文件一天只改约 2 次，而常驻 worker 每 5.3 s
+// 一轮，每轮都要重读 82 KB + 深校验（3.6 ms）+ 两次编译（2.3 ms）+ 读 LKG/applied（2.1 ms）——
+// 99.99% 的轮次读到的都是同一份字节。本段是「文件签名没变就复用上一轮 active」的唯一实现。
+//
+// 三条硬约束（缺一条就会变成「控制台保存后永不生效」或「静默吃旧规则」）：
+//   ① 只认**本进程内**的「上一轮」：状态由调用方（App 的 createApp 闭包）持有并每轮传回来，
+//      禁止持久化到磁盘——新进程（控制台 spawn 形态）没有上一轮，首轮 miss 是预期行为；
+//   ② 只有上一轮**健康**加载（degraded === true 的一律不建基线）才允许短路：损坏/降级轮必须
+//      每轮重试（用户正在修文件、瞬时读失败都是逐轮自愈的场景）；
+//   ③ 兜底复核：签名不变也每 60 轮按**内容 sha256** 复核一次，兜住「mtime/ino 被人为保留但字节
+//      变了」的边角（保留时间戳的编辑器保存、备份工具回填）；复核发现变化立刻走完整重载。
+//
+// 与 loadFilterRules 的关系：命中短路时**根本不进入** loadFilterRules（不读文件、不深校验、
+// 不写 LKG）；未命中时原样调用它，语义与既有契约逐条一致。
+// ============================================================
+const RULES_REUSE_FORCED_RECHECK_ROUNDS = 60
+
+/** 进程内「上一轮」状态。每个常驻运行实例一份（App 持有），不得跨进程共享/落盘。 */
+function createRulesReuseCache () {
+  return {
+    cacheDir: '',
+    inputs: null, // { defaults, keyword } 的对象身份：同一进程换了配置对象时不得复用
+    signature: '', // 上一轮健康加载后覆盖文件的 (dev,ino,size,mtimeNs,ctimeNs)
+    contentHash: '', // 上一轮健康加载后覆盖文件内容的 sha256（兜底复核基线）
+    active: null, // 上一轮的 loadFilterRules 结果（命中时原样返回**同一个对象**）
+    rounds: 0, // 本进程本状态已调用轮数（决定何时强制复核）
+    counters: { reused: 0, reloaded: 0, forcedRecheck: 0 }
+  }
+}
+
+function rulesContentHash (text) {
+  return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex')
+}
+
+// 元数据探测与读取都可注入（默认走 xbk_storage.statFileSignature / 本模块 readRulesFile）：
+// 用例据此既能注入「签名冻结」的桩来驱动第 61 轮复核，也能按调用次数证明「签名不变 ⇒ 0 次读」。
+function statRulesSignature (filePath, deps) {
+  const fn = deps && typeof deps.statRulesFile === 'function' ? deps.statRulesFile : storage.statFileSignature
+  try {
+    const got = fn(filePath)
+    return got && typeof got === 'object' ? got : { status: 'ioError', signature: null }
+  } catch (e) {
+    return { status: 'ioError', signature: null }
+  }
+}
+
+function readRulesForHash (filePath, deps) {
+  const fn = deps && typeof deps.readRulesFile === 'function' ? deps.readRulesFile : readRulesFile
+  try { return fn(filePath) } catch (e) { return { status: 'ioError', text: null, error: e } }
+}
+
+/**
+ * 带「签名短路」的 loadFilterRules（常驻运行侧每轮调用一次）。
+ * @param {Object} options 与 loadFilterRules 同参，另加 cache = createRulesReuseCache() 的进程内状态。
+ *   cache 缺省时退化成 loadFilterRules（无「上一轮」可言，多一次 stat 也不算收益）。
+ * @returns {{active:Object, reused:boolean, forcedRecheck:boolean, counters:Object|null}}
+ *   reused=true ⇒ active 就是上一轮那个对象，调用方应连同编译产物/哈希/告警一起复用。
+ *   counters 是**进程内累计**计数（reused/reloaded/forcedRecheck），未提供 cache 时为 null。
+ */
+function loadFilterRulesCached (options) {
+  const opts = options && typeof options === 'object' ? options : {}
+  const cache = opts.cache && typeof opts.cache === 'object' ? opts.cache : null
+  if (!cache) return { active: loadFilterRules(opts), reused: false, forcedRecheck: false, counters: null }
+  cache.rounds += 1
+  let filePath = ''
+  try { filePath = filterRulesPaths(opts.cacheDir).file } catch (e) { filePath = '' }
+  const dirKey = cacheDirKey(opts.cacheDir)
+  const sameInputs = Boolean(cache.inputs) && cache.inputs.defaults === opts.defaults && cache.inputs.keyword === opts.keyword
+  const usable = cache.cacheDir === dirKey && sameInputs && typeof cache.signature === 'string' && cache.signature !== '' &&
+    cache.active !== null && cache.active !== undefined && cache.active.degraded !== true
+  if (usable) {
+    const stat = statRulesSignature(filePath, opts.deps)
+    if (stat.status === 'ok' && stat.signature === cache.signature) {
+      // 第 1 轮建立基线；之后第 61 / 121 / … 轮强制按内容复核（每 60 轮一次，约 5 分钟）
+      const forced = (cache.rounds - 1) % RULES_REUSE_FORCED_RECHECK_ROUNDS === 0
+      if (!forced) {
+        cache.counters.reused += 1
+        return { active: cache.active, reused: true, forcedRecheck: false, counters: cache.counters }
+      }
+      cache.counters.forcedRecheck += 1
+      const read = readRulesForHash(filePath, opts.deps)
+      if (read.status === 'ok' && cache.contentHash !== '' && rulesContentHash(read.text) === cache.contentHash) {
+        cache.counters.reused += 1
+        return { active: cache.active, reused: true, forcedRecheck: true, counters: cache.counters }
+      }
+      // 内容与基线不一致（或复核读失败/无基线）：不信任缓存，落到下面的完整重载。
+    }
+  }
+  const before = statRulesSignature(filePath, opts.deps)
+  const active = loadFilterRules(opts)
+  const after = statRulesSignature(filePath, opts.deps)
+  cache.counters.reloaded += 1
+  // 只有「健康加载 + 读前读后**内容签名**一致」才建立可复用基线；否则清空基线，下一轮必然重载——
+  // 宁可多读一次，也不在文件被并发替换时把旧 active 当成新规则。
+  // 判据用 contentSignature（dev:ino:size:mtimeNs，不含 ctime）：读路径的 enforceOwnerOnlyMode
+  // 会把外部工具留下的 0644 收紧成 0600，那只会改 ctime——这种「只改了权限」的读窗口必须能建立
+  // 基线，否则首次加载后又要多空转一轮（线上规则文件本来就是 0600，不受影响，但外部编辑过的会）。
+  const contentStable = before.status === 'ok' && after.status === 'ok' && before.contentSignature === after.contentSignature
+  if (!active || active.degraded === true || !contentStable) {
+    cache.cacheDir = dirKey
+    cache.inputs = { defaults: opts.defaults, keyword: opts.keyword }
+    cache.signature = ''
+    cache.contentHash = ''
+    cache.active = null
+    return { active, reused: false, forcedRecheck: false, counters: cache.counters }
+  }
+  const read = readRulesForHash(filePath, opts.deps)
+  cache.cacheDir = dirKey
+  cache.inputs = { defaults: opts.defaults, keyword: opts.keyword }
+  cache.signature = after.signature
+  cache.contentHash = read.status === 'ok' ? rulesContentHash(read.text) : ''
+  cache.active = active
+  return { active, reused: false, forcedRecheck: false, counters: cache.counters }
 }
 
 /**
@@ -2002,6 +2124,10 @@ module.exports = {
   validateFilterRules,
   mergeActiveFilter,
   loadFilterRules,
+  // O1：常驻进程内的「签名不变 ⇒ 复用上一轮 active」入口与它的进程内状态工厂。
+  // 状态由调用方（App）持有：本模块不存任何跨轮状态（与「不缓存 activeFilter」的既有边界一致）。
+  loadFilterRulesCached,
+  createRulesReuseCache,
   // 仅供测试直调（生产代码只经 loadFilterRules / corruptResult 使用）：验证「写侧不得产出读不回的文件」
   writeLastGoodFile,
   readLastGood,

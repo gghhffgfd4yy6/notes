@@ -249,6 +249,34 @@ function statSafeMeta (filePath) {
   }
 }
 
+// 变更签名（O1）：与 statSafeMeta 同一 opener / 同一普通文件语义（O_NOFOLLOW + O_NONBLOCK + isFile），
+// 但返回值只有「签名串」——它唯一的用途是让常驻运行侧判断「这份文件自上一轮以来有没有变」，
+// 没变就跳过重读/重校验/重编译（见 xbk_filter_store.loadFilterRulesCached）。
+// 为什么另起一个函数而不扩 statSafeMeta：后者的返回形状被 test_console / test_storage 逐字
+// deepStrictEqual（unsafe 三态必须恰好四个键），加字段就是改契约。
+// 为什么取纳秒：就地改写（编辑器保存）可能保持 dev/ino/size，只有时间戳会动；毫秒级取整会让
+// 「同一毫秒内改两次」静默漏掉，ns 是内核给的原值。缺 mtimeNs/ctimeNs 的平台（fstat bigint 不提供）
+// 一律报 unsupported ⇒ 调用方退回「每轮完整加载」，绝不退化成只比 ino/size 的弱签名。
+// contentSignature 去掉 ctime：chmod（本仓读路径的 enforceOwnerOnlyMode 收紧 0600）只改 ctime、
+// 不动内容，调用方据此区分「读窗口内只是被收紧了权限」与「读窗口内内容被换掉」。
+function statFileSignature (filePath) {
+  let fd
+  try {
+    fd = openSafeReadFd(filePath, { nonBlock: true })
+    const st = fs.fstatSync(fd, { bigint: true })
+    if (!st.isFile()) return { status: 'unsafe', signature: null, contentSignature: null }
+    if (st.mtimeNs === undefined || st.ctimeNs === undefined) return { status: 'unsupported', signature: null, contentSignature: null }
+    const contentSignature = `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`
+    return { status: 'ok', signature: `${contentSignature}:${st.ctimeNs}`, contentSignature }
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { status: 'missing', signature: null, contentSignature: null }
+    if (e && e.code === 'ELOOP') return { status: 'unsafe', signature: null, contentSignature: null }
+    return { status: 'ioError', signature: null, contentSignature: null }
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd) } catch (e) { /* 忽略 */ } }
+  }
+}
+
 // 路径包含校验（S1 统一原语）：target 解析后必须**严格**位于 root 之下。
 // 这段判据原先内联在 xbk_message_store.resolveCacheDirInRoot 的 realInsideRoot 里，是唯一实现；
 // 搬到这里供多处复用，语义逐条不变：
@@ -392,5 +420,7 @@ module.exports = {
   readSafeTextResult,
   // S1：只读打开 / 元数据探测 / 普通文件判定 / 路径包含校验的唯一实现（调用方只 require 这里）
   statSafeMeta,
+  // O1：覆盖文件「变更签名」原语（ino/size/mtime/ctime，纳秒精度），与 statSafeMeta 同一 opener
+  statFileSignature,
   isRealPathInside
 }
