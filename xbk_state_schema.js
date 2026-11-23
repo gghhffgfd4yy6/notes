@@ -246,6 +246,23 @@ function formatRunSummaryLine ({ stamp = '', counters = {}, elapsed = '', extras
     `truncated=${counters.truncated} pushed=${counters.pushed} failed=${counters.failed} elapsed=${elapsed}${tail}`
 }
 
+// 逐行批量解析（v3.533）：run.log 的解析结果要按文件签名记忆化（scripts/status.js 的
+// readRunLog），所以「切行 → 逐行摘要解析」必须能只做一次、之后按这份结果派生统计 / 趋势 /
+// 运行历史。返回 [{ i, at19, parsed }]：i = 0-based 行号，at19 = 行首 19 字符（lastFailure 的
+// 展示口径，与 deriveRunStats 旧实现逐字一致），parsed = parseRunSummaryLine 的结果（必非 null）。
+// 解析器仍只此一份——调用方不得自己 exec RUN_SUMMARY_LINE_RE。
+function parseRunSummaryLines (lines) {
+  const out = []
+  if (!Array.isArray(lines)) return out
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const parsed = parseRunSummaryLine(line)
+    if (!parsed) continue
+    out.push({ i, at19: typeof line === 'string' ? line.slice(0, 19).trim() : '', parsed })
+  }
+  return out
+}
+
 // 首屏「今日 / 近 7 天」聚合（原 scripts/status.js.parseRunStats，同源同口径）：
 //   - 与趋势同源（摘要行 + Asia/Shanghai 日历日，run.log 的戳由生产侧固定按上海写）；
 //   - today/week 的 successRate = pushed/(pushed+failed)，无尝试时 null（前端显示「—」）；
@@ -253,15 +270,17 @@ function formatRunSummaryLine ({ stamp = '', counters = {}, elapsed = '', extras
 //   - 未来日期（时钟回拨/手写 fixture/坏摘要）一律排除，否则周汇总与 lastFailure 会被推高；
 //   - truncated 由调用方按日志读取窗口传入（尾部 1 MiB 窗口外可能还有本日/本周摘要，此时前端
 //     必须标注「仅统计日志尾部」，不得把少算的总数当完整数据展示）。
-function deriveRunStats (lines, now = Date.now(), { truncated = false } = {}) {
+// v3.533 拆成「解析一次（parseRunSummaryLines）+ 按已解析条目聚合（deriveRunStatsFromParsed）」：
+// 聚合逻辑仍只此一份，`deriveRunStats(lines, …)` 保持旧签名，内部就是这两步串起来。
+function deriveRunStatsFromParsed (entries, now = Date.now(), { truncated = false } = {}) {
   const todayKey = shanghaiDayKey(now)
   const weekStartKey = shanghaiDayKey(now - 6 * 86400000)
   const blank = (date) => ({ date, rounds: 0, total: 0, pushed: 0, failed: 0 })
   const today = blank(todayKey)
   const week = { from: weekStartKey, to: todayKey, rounds: 0, total: 0, pushed: 0, failed: 0 }
   let lastFailure = null
-  for (const line of lines) {
-    const parsed = parseRunSummaryLine(line)
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const parsed = entry && entry.parsed
     if (!parsed) continue
     const day = parsed.day
     if (!day || day < weekStartKey || day > todayKey) continue
@@ -278,7 +297,7 @@ function deriveRunStats (lines, now = Date.now(), { truncated = false } = {}) {
     }
     if (counters.failed > 0) {
       // at 取行首 19 字符（与旧实现逐字一致）：无时间戳的行得到空串，前端按「未知」展示。
-      lastFailure = { at: line.slice(0, 19).trim(), date: day, failed: counters.failed }
+      lastFailure = { at: entry.at19 || '', date: day, failed: counters.failed }
     }
   }
   const rate = (pushed, failed) => (pushed + failed > 0 ? pushed / (pushed + failed) : null)
@@ -288,6 +307,10 @@ function deriveRunStats (lines, now = Date.now(), { truncated = false } = {}) {
     lastFailure,
     truncated: truncated === true
   }
+}
+
+function deriveRunStats (lines, now = Date.now(), options) {
+  return deriveRunStatsFromParsed(parseRunSummaryLines(lines), now, options)
 }
 
 module.exports = {
@@ -305,6 +328,8 @@ module.exports = {
   RUN_SUMMARY_LINE_RE,
   parseRunSummaryExtras,
   parseRunSummaryLine,
+  parseRunSummaryLines,
   formatRunSummaryLine,
-  deriveRunStats
+  deriveRunStats,
+  deriveRunStatsFromParsed
 }

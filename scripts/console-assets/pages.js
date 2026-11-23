@@ -3019,6 +3019,22 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     stickRef.current = true
     load(true).catch(() => {})
   }
+  // v3.533：「跳到最新」——从周档/翻页回到**实时尾部窗口**（服务端默认只回尾部 ≤2000 行 /
+  // ≤256 KiB）。更早的行没丢，翻页仍走 ?file=&page=&size=；这一下只是把视图切回尾页、贴底，
+  // 并补一发（尾部可能已经旧了）。清空 arch 后 rawText 回落到 data.text（默认窗口），
+  // 页码行也随之隐藏——与「切回当周（实时尾部）」下拉选空是同一个状态。
+  const jumpToLatest = useCallback(() => {
+    setJumpText('')
+    navSeqRef.current++
+    pageCacheRef.current.clear()
+    inflightRef.current.clear()
+    setArch((prev) => ({ files: (prev && prev.files) || [], file: '', page: 1, pages: 1, total: 0, text: null }))
+    stickRef.current = true
+    const el = preRef.current
+    if (el) el.scrollTop = el.scrollHeight
+    syncRail()
+    load(true).catch(() => {})
+  }, [load, syncRail])
   const pickMode = (next) => {
     stickRef.current = true
     if (next !== mode) setFocusDismissed(true)
@@ -3032,7 +3048,7 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
       ? `在「${modeLabel}」筛选下 · 显示 ${ranged.length} / ${lines.length} 行`
       : ((kw !== '' || logRangeActive)
           ? `显示 ${ranged.length} / ${lines.length} 行`
-          : ((arch && arch.file) ? `本页 ${lines.length} 行` : `共 ${lines.length} 行`)),
+          : ((arch && arch.file) ? `本页 ${lines.length} 行` : `窗口 ${lines.length} 行（更早的行仍在磁盘上：按页码或周档翻看）`)),
     (mode === 'issue' || mode === 'error') ? '已排除控制台停止记录' : '',
     heavy ? `行数过多（>${LOG_HIGHLIGHT_MAX}），已关闭高亮` : '',
     logRangeActive ? `日期 ${logRange.from} ~ ${logRange.to}` : '',
@@ -3085,9 +3101,13 @@ function LogsPanel ({ pollMs, initialQuery = '', initialMode = 'all', initialDat
     const fmt = (x) => x.slice(4, 6) + '.' + x.slice(6, 8)
     return kind + ' ' + fmt(k.slice(0, 8)) + '–' + fmt(k.slice(9))
   }
+  // v3.533：窗口上限一律用服务端下发的元数据（maxLines / truncated），前端不写死尺寸。
+  const tailLabel = (data && data.maxLines)
+    ? `run.log 尾部窗口（最新 ${data.maxLines} 行${data.truncated ? '，已截断' : ''}）`
+    : 'run.log 尾部窗口'
   return html`<div class="panel">
-    <${PanelHead} title="运行日志" level=${1} sub=${'run.log 尾部 1 MiB' + (pollMs ? ' · 任务运行中，实时跟随' : '')}
-      right=${html`<${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
+    <${PanelHead} title="运行日志" level=${1} sub=${tailLabel + (pollMs ? ' · 任务运行中，实时跟随' : '')}
+      right=${html`<${Button} variant="ghost" onClick=${jumpToLatest}>跳到最新<//><${Button} variant="ghost" onClick=${refreshNow}>刷新<//>`} />
     ${err && html`<${Hint} tone="error">${err}<//>`}
     ${active && html`<div class="log-tools log-arch">
       <${MiniSelect} value=${arch && arch.file ? arch.file : ''} ariaLabel="选择日志文件"
@@ -4029,7 +4049,7 @@ function SysPanel ({ onReady, active = true, onSettingsSaved, pollTick = 0, onFr
           ${logTail.map((it, i) => html`<tr key=${`${i}|${it.at}|${it.method}|${it.path}|${it.status}|${it.ms}`}><td>${it.at}</td><td>${it.method} ${it.path} → ${it.status} · ${it.ms}ms</td></tr>`)}
         </tbody></table>`}
     </details>
-    <${Hint} style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志取尾部 1 MiB。<//>
+    <${Hint} style="margin-top:12px">数据说明：推送记录来自判重缓存 push.json（服务端已裁剪正文 HTML）；趋势解析 run.log 摘要行；日志默认取尾部窗口（带 ETag，日志没变时 304 空体），更早的行按页码或周档翻看。<//>
   </div>`
 }
 

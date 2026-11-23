@@ -18809,6 +18809,234 @@ async function main () {
     assert.deepStrictEqual(await quietFor(async () => { throw new Error('boom') }), ['回前台补拉失败'],
       '请求抛错必须在顶栏留一条可见痕迹')
   })
+
+  // ── v3.533 W2：/api/logs 默认尾部窗口 + ETag/304；两个 SSE 端点不压缩；自动刷新两级闸 ──
+  await aok('HTTP: v3.533 /api/logs 默认只回尾部窗口（≤2000 行 / ≤256 KiB）+ ETag/304 + 翻页仍可达', async () => {
+    const summary = (n) => `2026-10-15 14:0${n}:00 total=${n} dedup=0 filtered=0 truncated=0 pushed=${n} failed=0 elapsed=1.0s cachesaved=1`
+    // 甲夹具：行少但很长（≈530 KB）⇒ 必须由「字节上限」截，且截断点必须落在整行边界。
+    const longLines = []
+    for (let i = 0; i < 2500; i++) longLines.push(`2026-10-15 13:${String(i % 60).padStart(2, '0')}:00 中文行-${i} ` + '文'.repeat(80))
+    longLines.push(summary(7))
+    const longText = longLines.join('\n') + '\n'
+    assert.ok(Buffer.byteLength(longText, 'utf8') > 400 * 1024, `甲夹具必须远大于窗口（实际 ${Buffer.byteLength(longText)} B）`)
+    const dirA = tmpDir()
+    fs.writeFileSync(path.join(dirA, 'run.log'), longText)
+    const a = createConsole({ token: TOKEN, stateDir: dirA, runHistoryDir: dirA })
+    const portA = await listen(a.server)
+    const first = await requestBuffer(portA, 'GET', '/api/logs', { token: TOKEN })
+    assert.strictEqual(first.status, 200)
+    assert.ok(Buffer.byteLength(first.body) <= 256 * 1024,
+      `默认响应整体必须 ≤256 KiB（实际 ${first.body.length} B；旧口径整段尾部 1 MiB）`)
+    const body = JSON.parse(first.body.toString('utf8'))
+    assert.strictEqual(body.status, 'ok', '默认分支仍是 status=ok（向后兼容）')
+    assert.strictEqual(body.paged, false, '默认分支不是翻页模式')
+    assert.strictEqual(body.tail, true, '默认分支是尾部窗口')
+    assert.ok(body.lines <= 2000, `行数必须 ≤2000（实际 ${body.lines}）`)
+    // 独立复算：正文自身（UTF-8 字节）也不得超限——只判 body.length 会被「多塞元数据」放行。
+    assert.ok(Buffer.byteLength(body.text, 'utf8') <= 256 * 1024, '正文自身必须 ≤256 KiB')
+    // 字节上限必须先于行上限生效（甲夹具 2000 行远大于 256 KiB）：证明真的按字节截了。
+    assert.ok(body.lines < 2000, `甲夹具必须由字节上限截断（实际仍给了 ${body.lines} 行 ⇒ 字节门没生效）`)
+    // UTF-8 完整性：按字节切会把中文切成 U+FFFD。
+    assert.strictEqual(body.text.includes('\uFFFD'), false, '不得把 UTF-8 多字节字符切开（出现 U+FFFD）')
+    const winLines = body.text.split('\n')
+    assert.strictEqual(winLines.length, body.lines, 'lines 元数据必须等于正文实际行数')
+    assert.strictEqual(winLines[0], longLines[longLines.length - body.lines], '窗口必须是连续的尾部行（首行 = 倒数第 lines 行）')
+    assert.strictEqual(winLines[winLines.length - 1], summary(7), '窗口末行必须是文件最后一行（最新摘要）')
+    assert.strictEqual(body.truncated, true, '更早的行被窗口切掉时必须如实上报 truncated')
+    // ② ETag/304：内容哈希命中必须 304 且 0 字节正文。
+    const tag = first.headers.etag
+    assert.ok(typeof tag === 'string' && tag.length >= 2, '默认窗口必须下发 ETag')
+    assert.strictEqual(first.headers['cache-control'], 'no-store', '日志带鉴权语义：不得让浏览器缓存存储')
+    const hit = await requestBuffer(portA, 'GET', '/api/logs', { token: TOKEN, headers: { 'if-none-match': tag } })
+    assert.strictEqual(hit.status, 304, 'If-None-Match 命中必须 304')
+    assert.strictEqual(hit.body.length, 0, `304 必须 0 字节正文（实际 ${hit.body.length} B）`)
+    const miss = await requestBuffer(portA, 'GET', '/api/logs', { token: TOKEN, headers: { 'if-none-match': '"other"' } })
+    assert.strictEqual(miss.status, 200, 'ETag 不匹配照常 200')
+    // 内容一变（追加一行）⇒ ETag 必须变、不得再吃 304（否则日志永远停在旧窗口）。
+    fs.appendFileSync(path.join(dirA, 'run.log'), summary(9) + '\n')
+    const changed = await requestBuffer(portA, 'GET', '/api/logs', { token: TOKEN, headers: { 'if-none-match': tag } })
+    assert.strictEqual(changed.status, 200, '内容变了必须忽略旧 If-None-Match')
+    assert.notStrictEqual(changed.headers.etag, tag, '内容变化必须换 ETag')
+    assert.ok(JSON.parse(changed.body.toString('utf8')).text.endsWith(summary(9)), '变化后 200 必须带新内容')
+    await new Promise((resolve) => a.server.close(resolve))
+    // 乙夹具：行多但很短（5000 × 5 B ≈ 25 KB）⇒ 必须由「行数上限」截，且恰好 2000 行。
+    // 每行带自增编号（同一份内容会掩盖「page=1 与 page=2 是不是真的不同」）。
+    const dirB = tmpDir()
+    const shortLines = Array.from({ length: 5000 }, (_, i) => String(i % 10000).padStart(4, '0'))
+    fs.writeFileSync(path.join(dirB, 'run.log'), shortLines.join('\n') + '\n')
+    const b = createConsole({ token: TOKEN, stateDir: dirB, runHistoryDir: dirB })
+    const portB = await listen(b.server)
+    const tiny = JSON.parse((await request(portB, 'GET', '/api/logs', { token: TOKEN })).text)
+    assert.strictEqual(tiny.lines, 2000, `短行夹具必须恰好卡在 2000 行（实际 ${tiny.lines}）`)
+    // 独立复算：2000 行 × 4 B + 1999 个换行 = 9999 B；首行必须是第 3000 行（尾部 2000 行）。
+    assert.strictEqual(Buffer.byteLength(tiny.text, 'utf8'), 2000 * 4 + 1999, '2000 行 4 B 行 = 9999 B')
+    assert.strictEqual(tiny.text.split('\n')[0], '3000', '尾部窗口首行必须是第 5000-2000 = 3000 行')
+    assert.strictEqual(tiny.truncated, true, '5000 行进 2000 行窗口 ⇒ truncated')
+    // ③ 既有翻页行为不变：更早的行仍能按页读到（服务端没丢内容）。
+    const p1 = JSON.parse((await request(portB, 'GET', '/api/logs?file=run.log&page=1&size=200', { token: TOKEN })).text)
+    const p2 = JSON.parse((await request(portB, 'GET', '/api/logs?file=run.log&page=2&size=200', { token: TOKEN })).text)
+    assert.strictEqual([p1.status, p2.status].join(','), 'ok,ok', '翻页分支仍可用')
+    assert.strictEqual([p1.page, p1.pages, p1.total].join(','), '1,25,5000', '翻页元数据不变（5000 行 / 200 一行 = 25 页）')
+    assert.strictEqual(p2.page, 2)
+    assert.notStrictEqual(p2.lines.join('\n'), p1.lines.join('\n'), 'page=2 必须是不同内容')
+    assert.notStrictEqual(p2.lines.join('\n'), tiny.text, 'page=2 也不得等于默认尾部窗口')
+    await new Promise((resolve) => b.server.close(resolve))
+  })
+
+  await aok('结构红线: v3.533 两个 SSE 端点都不得被压缩（Accept-Encoding 三选一也必须是 identity）', async () => {
+    const dir = tmpDir()
+    fs.writeFileSync(path.join(dir, 'run.log'), '2026-10-15 14:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=1.0s\n')
+    const { server, runs } = createConsole({ token: TOKEN, stateDir: dir, runHistoryDir: dir })
+    const port = await listen(server)
+    runs.set('1750000000000.9', makeStreamRecord('1750000000000.9'))
+    const headerOf = (urlPath) => new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port,
+        path: urlPath,
+        // 浏览器真实会发的三选一：中间件若按 Accept-Encoding 协商压缩，这里立刻能看出来。
+        headers: { authorization: 'Bearer ' + TOKEN, 'accept-encoding': 'gzip, deflate, br' }
+      }, (res) => {
+        const snapshot = { status: res.statusCode, headers: { ...res.headers } }
+        res.destroy() // 长连接：只取响应头，由服务端 teardown 收尾
+        resolve(snapshot)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    for (const [name, urlPath] of [['/api/stream', '/api/stream'], ['/api/runs/stream', '/api/runs/stream?id=1750000000000.9&since=0']]) {
+      const res = await headerOf(urlPath)
+      assert.strictEqual(res.status, 200, `${name} 必须 200 建流`)
+      assert.match(String(res.headers['content-type'] || ''), /text\/event-stream/, `${name} Content-Type 不变`)
+      const enc = res.headers['content-encoding']
+      assert.ok(enc === undefined || enc === 'identity',
+        `${name} 不得被压缩（Content-Encoding=${enc}）：事件流逐帧 flush，压缩会把 tick 憋在块里`)
+      assert.strictEqual(res.headers.vary, undefined, `${name} 不压 ⇒ 不得新增 Vary`)
+    }
+  })
+
+  await aok('结构红线: v3.533 自动刷新两级闸（1 s 合并窗 + 15 s 下限 ⇒ 稳态 240 次/h）', async () => {
+    const { TICK_MERGE_MS, AUTO_REFRESH_MIN_MS, createAutoTickGate } = await import('./scripts/console-assets/pure.mjs')
+    assert.strictEqual(TICK_MERGE_MS, 1000, '合并窗必须是 1 s（spec）')
+    assert.strictEqual(AUTO_REFRESH_MIN_MS, 15000, '自动刷新下限必须是 15 s（spec）')
+    // 算术：3600 s / 15 s = 240 次/h（spec 上限）；旧实现实测 720 次/h。
+    assert.strictEqual(3600 * 1000 / AUTO_REFRESH_MIN_MS, 240, '15 s 下限 ⇒ 每小时 240 次')
+    // ① 合并窗**独立**可测：把 15 s 下限关掉（minMs: 0），只剩 1 s 合并窗——否则「1 s 内只放行
+    // 一次」会被下限顺手满足，合并窗删掉也照样绿（反向验证 3 实测过：mergeMs=0 曾全绿）。
+    let t = 1_000_000
+    const mergeOnly = createAutoTickGate({ now: () => t, minMs: 0 })
+    assert.strictEqual(mergeOnly.accept(), true, '第一拍必须放行')
+    t += 200
+    assert.strictEqual(mergeOnly.accept(), false, '同 1 s 内第二拍必须被合并（minMs=0 ⇒ 只有合并窗能挡住）')
+    t += 300
+    assert.strictEqual(mergeOnly.accept(), false, '同 1 s 内第三拍必须被合并')
+    t += 600 // 距第一拍 1.1 s
+    assert.strictEqual(mergeOnly.accept(), true, '1 s 合并窗过后必须放行（合并窗是 1000 ms 而不是「永不」）')
+    t += 100 // 距上一拍 0.1 s
+    assert.strictEqual(mergeOnly.accept(), false, '放行后重新计时：紧接着的一拍仍要合并')
+    // ② 下限**独立**可测：把合并窗关掉（mergeMs: 0）⇒ 15 s 内仍只放行一次。
+    let u = 2_000_000
+    const gapOnly = createAutoTickGate({ now: () => u, mergeMs: 0 })
+    assert.strictEqual(gapOnly.accept(), true, '下限闸的第一拍必须放行')
+    u += 500
+    assert.strictEqual(gapOnly.accept(), false, '15 s 内第二拍必须被下限挡住（mergeMs=0 ⇒ 只有下限能挡住）')
+    u += 600
+    assert.strictEqual(gapOnly.accept(), false, '过了 1 s 仍被 15 s 下限挡住')
+    u = 2_000_000 + 15_000
+    assert.strictEqual(gapOnly.accept(), true, '距上次放行满 15 s 必须放行')
+    // ③ 默认参数 = 两道闸同时生效。
+    let v = 3_000_000
+    const bothGates = createAutoTickGate({ now: () => v })
+    assert.strictEqual(bothGates.accept(), true)
+    v += 1100
+    assert.strictEqual(bothGates.accept(), false, '默认参数下 1.1 s 那一拍仍被 15 s 下限挡住')
+    v = 3_000_000 + 15_000
+    assert.strictEqual(bothGates.accept(), true, '默认参数下满 15 s 放行')
+    // ④ 稳态：SSE 每 500 ms 来一拍、连续 1 小时，放行次数必须恰好 240（不是 720）。
+    let clock = 5_000_000
+    let fired = 0
+    const hourly = createAutoTickGate({ now: () => clock })
+    for (let i = 0; i < 7200; i++) { if (hourly.accept()) fired += 1; clock += 500 }
+    assert.strictEqual(fired, 240, `常驻标签每小时放行次数必须 = 240（实际 ${fired}）`)
+    // ④ 接线：accept 只能在 runTick 里出现一次（手动刷新不得被闸住），且必须排在 refreshSplit 之前。
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const acceptSites = findAll(uiModel.ast, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'tickGateRef.current.accept')
+    assert.strictEqual(acceptSites.length, 1, '闸只允许有一处调用（自动入口唯一）')
+    const runTickDecl = findAll(uiModel.ast, (n) => n.type === 'VariableDeclarator' && exprLabel(n.id) === 'runTick')
+      .map((n) => n.init && n.init.arguments && n.init.arguments[0])
+    assert.strictEqual(runTickDecl.length, 1, 'ui.js 里必须只有一个 runTick 声明')
+    const runTickNode = runTickDecl[0]
+    assert.ok(runTickNode && runTickNode.type === 'ArrowFunctionExpression', 'runTick 必须是 useCallback(箭头函数)')
+    assert.strictEqual(findAll(runTickNode, (n) => n === acceptSites[0]).length, 1,
+      'accept 必须真的在 runTick 里（放到别处就不是「自动入口统一闸」了）')
+    // 门在 refreshSplit 之前：把 accept 挪到 refreshSplit 之后等于没闸。
+    const gateStmt = runTickNode.body.body.findIndex((stmt) => findAll(stmt, (n) => n === acceptSites[0]).length > 0)
+    const refreshStmt = runTickNode.body.body.findIndex((stmt) => callSites(stmt, 'refreshSplit').length > 0)
+    assert.ok(gateStmt > -1 && refreshStmt > -1 && gateStmt < refreshStmt,
+      `闸必须排在 refreshSplit 之前（闸在第 ${gateStmt} 条、refreshSplit 在第 ${refreshStmt} 条）`)
+    // 手动刷新（refreshActive / 下拉）不得经过 runTick：它们直接调 refreshSplit。
+    const manualRefresh = findAll(uiModel.ast, (n) => n.type === 'VariableDeclarator' && exprLabel(n.id) === 'refreshActive')
+    assert.strictEqual(manualRefresh.length, 1, '必须只有一处 refreshActive 定义')
+    assert.ok(callSites(manualRefresh[0], 'refreshSplit').length >= 1,
+      '手动刷新必须直接调 refreshSplit（不经过合并窗/下限）')
+  })
+
+  await aok('结构红线: v3.533 轮询 effect 不再因 locking 翻转重建定时器/补发（ref 持有 + 节奏未变不重建）', async () => {
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    // 主定时器只有一处：第二实参识别符 `interval`（别的 setInterval 各有自己的节奏值）。
+    const timers = callSites(uiModel.ast, 'setInterval').filter((call) => exprLabel(call.arguments[1]) === 'interval')
+    assert.strictEqual(timers.length, 1, `主定时器只允许一处（实际 ${timers.length} 处按 interval 建）`)
+    const timerNode = timers[0]
+    // 它必须被 `armedIntervalRef.current !== interval` 这道门包住：节奏没变就不重建。
+    const ifs = ancestorsOf(uiModel.ast, timerNode).filter((n) => n.type === 'IfStatement')
+    assert.strictEqual(ifs.length, 1, '定时器必须恰好被一道 if 包住（节奏门）')
+    assert.strictEqual(exprLabel(ifs[0].test), 'armedIntervalRef.current !== interval',
+      '定时器重建必须由「已武装的节奏 ≠ 当前节奏」守卫（否则 locking 翻转就拆装一次）')
+    // 补发（刷新首屏那一发）必须由 scheduleChanged 守：locking 翻转不再白打一对请求。
+    const effectOfTimer = ancestorsOf(uiModel.ast, timerNode).filter((n) => n.type === 'CallExpression' &&
+      memberPath(n.callee) === 'useEffect')
+    assert.strictEqual(effectOfTimer.length, 1, '定时器必须在轮询 useEffect 内')
+    const pollEffect = effectOfTimer[0]
+    const bootIfs = findAll(pollEffect, (n) => n.type === 'IfStatement' &&
+      findAll(n.test, (x) => x.type === 'Identifier' && x.name === 'scheduleChanged').length === 1)
+    assert.strictEqual(bootIfs.length, 1, '补发必须由 scheduleChanged 单一守卫')
+    assert.strictEqual(callSites(bootIfs[0], 'refreshSplit').length, 1, '补发那一发必须在 scheduleChanged 门内')
+    assert.strictEqual(callSites(pollEffect, 'refreshSplit').length, 1,
+      'effect 内只允许一处 refreshSplit（门的条件式补发）；多出来的一处就是 locking 翻转时的白打')
+    // 定时器不能被「每次 effect 重跑」的 cleanup 清掉：重建被 armedIntervalRef 守卫着，两边一起
+    // 做就会出现「清掉却没人重装」⇒ 只剩 SSE tick、断线后彻底不轮询（本版实现中曾真踩到）。
+    const pollBody = pollEffect.arguments[0].body.body
+    const returns = pollBody.filter((stmt) => stmt.type === 'ReturnStatement')
+    assert.strictEqual(returns.length, 1, '轮询 effect 必须只 return 一个 cleanup')
+    const cleanupFn = returns[0].argument
+    assert.ok(cleanupFn && cleanupFn.type === 'ArrowFunctionExpression', 'cleanup 必须是箭头函数')
+    assert.strictEqual(callSites(cleanupFn, 'clearInterval').length, 0,
+      'cleanup 不得 clearInterval（会与守卫冲突，定时器永久丢失）；摘监听器即可')
+    // 所以必须另有一个「空依赖、卸载时清定时器」的 effect 兜底，否则真泄漏一个 interval。
+    // cleanup 允许两种写法：`() => { … }`（显式 return）与 `() => () => { … }`（隐式返回）。
+    const cleanupFnsOf = (call) => {
+      const fn = call.arguments[0]
+      if (!fn || fn.type !== 'ArrowFunctionExpression' || !fn.body) return []
+      if (fn.body.type === 'ArrowFunctionExpression') return [fn.body]
+      if (fn.body.type !== 'BlockStatement') return []
+      return fn.body.body
+        .filter((stmt) => stmt.type === 'ReturnStatement' && stmt.argument && stmt.argument.type === 'ArrowFunctionExpression')
+        .map((stmt) => stmt.argument)
+    }
+    const unmountCleanups = callSites(uiModel.ast, 'useEffect').filter((call) => {
+      const deps = call.arguments[1]
+      if (!deps || deps.type !== 'ArrayExpression' || deps.elements.length !== 0) return false
+      return cleanupFnsOf(call).some((fn) => callSites(fn, 'clearInterval').length > 0)
+    })
+    assert.strictEqual(unmountCleanups.length, 1, '必须恰好一个空依赖 effect 在卸载时清定时器（否则泄漏）')
+    // /api/auto 独立轮询：节奏值必须走常量 AUTO_POLL_MS（不再是裸 2000）。
+    const autoTimers = callSites(uiModel.ast, 'setInterval').filter((call) => exprLabel(call.arguments[1]) === 'AUTO_POLL_MS')
+    assert.strictEqual(autoTimers.length, 1, '/api/auto 轮询必须用 AUTO_POLL_MS（写死 2000 会被这里判红）')
+    const constsModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'constants.js'))
+    const autoPoll = findAll(constsModel.ast, (n) => n.type === 'VariableDeclarator' && exprLabel(n.id) === 'AUTO_POLL_MS')
+      .map((n) => Number(n.init && n.init.value))
+    assert.deepStrictEqual(autoPoll, [5000], `AUTO_POLL_MS 必须是 5000 ms（2 s → 5 s，实际 ${JSON.stringify(autoPoll)}）`)
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──

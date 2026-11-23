@@ -375,10 +375,10 @@ function apiGetConfig () {
 }
 
 function apiGetLogs () {
-  const merged = timedRequest({
-    headers: { Accept: 'application/json', ...AUTH_HEADER }
-  })
-  return consumeJson(fetch('/api/logs', merged))
+  // 条件请求（v3.533）：服务端默认窗口（尾部 ≤2000 行 / ≤256 KiB）带内容哈希 ETag；日志没变时
+  // 304 空体，运行期每拍的轮询不再搬 ~220 KB identity 正文（旧口径 675 KB / 次）。
+  // 304 且本地无副本时 consumeJson 会自动去掉条件头重取一次（不会把 304 当错误）。
+  return conditionalRequest('logs', (merged) => fetch('/api/logs', merged))
 }
 
 // v3.403：周档列表 + 按页读取（只解目标页所在的那个 1MiB gzip 成员）。
