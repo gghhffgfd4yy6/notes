@@ -5550,12 +5550,15 @@ async function main () {
     acorn.parse(body, { ecmaVersion: 'latest', sourceType: 'module' })
     // ② 源码里的**整行**注释文本一条都不许出现在响应体里。只取「独占一行」的 Line 注释
     // 且长度 ≥ 8：太短的 `// x` 可能恰好是某个字符串字面量的一部分，断言会假红。
+    // 「独占一行」由解析器元数据判定：同一行上没有任何 token 在注释起点之前结束 ⇒ 行首无代码
+    // （行内尾注释、缩进后的 `// x` 之后的注释都按 token 位置区分，不看字符切片）。
     const comments = []
-    acorn.parse(disk, { ecmaVersion: 'latest', sourceType: 'module', onComment: comments })
+    const tokens = []
+    acorn.parse(disk, { ecmaVersion: 'latest', sourceType: 'module', locations: true, onComment: comments, onToken: tokens })
     const fullLine = comments.filter((c) => {
       if (c.type !== 'Line') return false
-      const lineStart = disk.lastIndexOf('\n', c.start - 1) + 1
-      return disk.slice(lineStart, c.start).trim() === '' && String(c.value).trim().length >= 8
+      const codeOnLine = tokens.some((t) => t.loc.end.line === c.loc.start.line && t.end <= c.start)
+      return !codeOnLine && String(c.value).trim().length >= 8
     })
     assert.ok(fullLine.length >= 100, `pages.js 必须有足够多的整行注释供断言（实际 ${fullLine.length}）`)
     const leaked = fullLine.filter((c) => body.includes(String(c.value).trim()))
