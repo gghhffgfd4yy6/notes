@@ -122,12 +122,20 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
    *  括号配平查不出来，故出现 `\Q`/`\E` 的行一律不切块（保守方向：只影响速度）。 */
   const QUOTE_ESCAPE_RE = /\\[QE]/
 
+  /** 命名捕获组 `(?P<x>…)` / `(?<x>…)`：RE2 把「整段里重名」判成非法，而**逐块各自编译却都能成功**
+   *  ——实测 `new RE2('(?P<x>a)|(?P<x>b)','i')` 抛 `duplicate capture group name`，
+   *  `new RE2('(?P<x>a)','i')` 正常编译。切块会把「整段编译失败 ⇒ 该规则被跳过、判定面窄」变成
+   *  「逐块成功 ⇒ 规则生效、判定面变宽」，方向正是本项目最忌的少推。
+   *  故带命名组的行一律不切块：走整段编译一次，成功/失败与 W4 之前逐字一致。 */
+  const NAMED_GROUP_RE = /\(\?P<|\(\?</
+
   /** 简单模式切块：返回 [{ re, source, branches }]，或 null（= 不切块，用整段正则）。
-   *  null 的四种来源：① 某行跨行拼接（lineSelfContained 为假）；② 某行带无作用域内联标志；
-   *  ③ 某行出现 `\Q`/`\E`（跨行引用块）；④ 某块编译不出来而整段能编出来（病态规则）
+   *  null 的五种来源：① 某行跨行拼接（lineSelfContained 为假）；② 某行带无作用域内联标志；
+   *  ③ 某行出现 `\Q`/`\E`（跨行引用块）；④ 某行含命名捕获组（RE2 遇跨块重名会判整段非法，
+   *  逐块却能编，见 NAMED_GROUP_RE）；⑤ 某块编译不出来而整段能编出来（病态规则）
    *  ——都退回「现状的整条正则」，编译结果不变。 */
   const buildSimpleBlocks = (lines, field) => {
-    if (!lines.every((line) => lineSelfContained(line) && !INLINE_FLAG_RE.test(line) && !QUOTE_ESCAPE_RE.test(line))) return null
+    if (!lines.every((line) => lineSelfContained(line) && !INLINE_FLAG_RE.test(line) && !QUOTE_ESCAPE_RE.test(line) && !NAMED_GROUP_RE.test(line))) return null
     let blocks = chunkLinesByBranches(lines, SIMPLE_BLOCK_MAX_BRANCHES)
     if (blocks.length > SIMPLE_BLOCK_CAP) {
       // 块太多 ⇒ 每块的固定调用开销会盖过收益，退化为大块（仍远低于 NFA 悬崖）
@@ -426,23 +434,37 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
           val = joinSimpleRegexLines(val)
           if (!val) { compiled[field] = null; continue }
           if (this.hasNestedQuantifier(val)) { compiled[field] = null; continue } // ReDoS 防护
-          const re = compileUserRegex(val, 'i')
-          if (re) {
-            const entry = { _type: 're', re, source: val }
-            // v3.529（O2）：re 仍是整段一条正则（诊断/断言口径不变），blocks 是逐块短路用的等价副本；
-            // 任何一块编不出来/行不自包含 ⇒ blocks 缺席，matchesCompiled 退回整条 re。
-            const blocks = buildSimpleBlocks(simpleLines, field)
-            if (blocks) entry.blocks = blocks
-            compiled[field] = entry
+          const blocks = buildSimpleBlocks(simpleLines, field)
+          // v3.535（W4）：切成多块时**不再构造整段 RE2**——matchesCompiled 只要 blocks 非空就只走块
+          // （整条正则在热路径 0 调用），编出来只白占 RE2 原生内存（线上两条 4k 分支主字段 ≈2.6 MiB）与启动时间。
+          // `re: null` 是编译产物的**契约**（不是「缺失/编译失败」）：判定（matchesCompiled）、诊断
+          // （explainFilter 经 matchesCompiled 走块，不懒编译）、载荷守卫（xbk_filter._passIfMissing 接受
+          // 「re 非 null **或** blocks 非空」）都必须按此处理。`source` 逐字保留整段原文（filter.hash /
+          // 诊断 ruleHash / ### 分支都依赖它）；`_type` 仍是 're'（compileStateOf 输出不变）。
+          // 只切成 1 块时照旧编译整段并保留 re：块源码 === 整段源码（compileUserRegex 按源码缓存命中同一实例），
+          // 砍它零收益零风险，留着让单块形态下任何读 re 的旧路径逐字不变。
+          if (blocks && blocks.length > 1) {
+            compiled[field] = { _type: 're', re: null, source: val, blocks }
           } else {
-            if (!isRe2Available()) {
-              compiled[field] = null
-              continue
+            // 单块：块源码逐字等于整段源码（chunkLinesByBranches 只按行 join），直接复用块实例
+            // ——不依赖 compileUserRegex 的按源码缓存，`entry.re === blocks[0].re` 恒成立。
+            const re = blocks && blocks.length === 1 ? blocks[0].re : compileUserRegex(val, 'i')
+            if (re) {
+              const entry = { _type: 're', re, source: val }
+              // v3.529（O2）：blocks 是逐块短路用的等价副本；单块时 blocks[0].re === re（同一缓存实例）。
+              // 任何一块编不出来/行不自包含/含命名组 ⇒ blocks 缺席，matchesCompiled 退回整条 re。
+              if (blocks) entry.blocks = blocks
+              compiled[field] = entry
+            } else {
+              if (!isRe2Available()) {
+                compiled[field] = null
+                continue
+              }
+              // 本分支只可能是「正则非法」：re2 不可用时上面 :240-243 已提前 return，走不到这里。
+              // 旧文案说「无法使用安全正则引擎」，把原因指向引擎缺失，与事实相反（引擎可用，是正则编译失败）。
+              console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${val}」，已跳过（RE2 可用但编译失败；validateConfig 已告警）`)
+              compiled[field] = null // 非法正则置 null 跳过（validateConfig 已警告）
             }
-            // 本分支只可能是「正则非法」：re2 不可用时上面 :240-243 已提前 return，走不到这里。
-            // 旧文案说「无法使用安全正则引擎」，把原因指向引擎缺失，与事实相反（引擎可用，是正则编译失败）。
-            console.warn(`⚠️ 规则「${String(field)}」包含非法正则「${val}」，已跳过（RE2 可用但编译失败；validateConfig 已告警）`)
-            compiled[field] = null // 非法正则置 null 跳过（validateConfig 已警告）
           }
         }
       }
@@ -636,7 +658,8 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       if (compiled._type === 're') {
       // 简单正则（形状守卫与 .test 异常处理都在 _safeTestText 内：不命中即放行）
       // v3.529（O2）：优先逐块匹配、命中即短路（各块与整段等价，见 buildSimpleBlocks）。
-      // blocks 缺失/非数组/空数组（旧编译产物、手搓 { _type:'re', re } 夹具）⇒ 退回整条 re，行为逐字不变。
+      // v3.535（W4）：多块编译产物的 re 恒为 null（不再编整段），**块非空即唯一判据**；blocks 缺失/非数组/
+      // 空数组（单块形态、旧编译产物、手搓 { _type:'re', re } 夹具）⇒ 退回整条 re，行为逐字不变。
         const blocks = Array.isArray(compiled.blocks) ? compiled.blocks : null
         if (blocks && blocks.length > 0) {
           for (const block of blocks) {
@@ -675,6 +698,26 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
       }
 
       return false
+    },
+
+    /** 简单模式源码「能否编译生效」的唯一判定（v3.535 / W4；校验路径专用）
+     *  与 compileRules 同一口径：先按行归一（v3.390 换行=或），能切成多块 ⇒ 视同「整段有效」
+     *  （运行期本来就只走块，见 buildSimpleBlocks / matchesCompiled）；否则退回整段编译。
+     *  **校验路径不得直接 compileUserRegex(整段)**：线上 4k 分支主字段的整条 RE2 编出来会按源码
+     *  常驻 `_userReCache`（256 条缓存），把 W4「有分块就不编整段」的收益从 worker 与 console 两侧
+     *  抵消掉。ReDoS（hasNestedQuantifier）仍由调用方各自把关，本方法只回答「能不能编」。
+     *  @param {*} source 原始配置值（含换行；**不要**传已 join 的整段，否则行边界丢失、退回整段编译）
+     *  @param {string} [fieldLabel] 仅用于退化告警里点名是哪个字段
+     */
+    simpleSourceCompiles (source, fieldLabel) {
+      let text = ''
+      try { text = String(source).trim() } catch (e) { return false } // 脏配置（抛错 toString）视为不可编译
+      if (!text) return true // 空模式：compileRules 会置 null（无规则），不属于「非法」
+      const lines = simpleLinesOf(text)
+      const blocks = buildSimpleBlocks(lines, fieldLabel)
+      if (blocks && blocks.length > 1) return true
+      // 单块/不切块：与运行期同一条整段源码（单块时 blocks[0].source === 整段，缓存命中同一实例）
+      return Boolean(compileUserRegex(joinSimpleRegexLines(text), 'i'))
     },
 
     /** 验证配置合法性（与 compileRules 共享解析逻辑） */
@@ -754,13 +797,16 @@ function createRuleEngine ({ Utils, FILTER_FIELDS, compileUserRegex, isRe2Availa
             warnings.push(`⚠️ 配置「${field}」为空白字符，将被忽略`)
             continue
           }
-          const trimmedVal = joinSimpleRegexLines(val.trim()) // C048：简单模式与 compileRules 一致，用 trim 后值校验；v3.390 换行=或
+          // C048：简单模式与 compileRules 一致，用 trim 后值校验；v3.390 换行=或（此处只用于告警文案）
+          const trimmedVal = joinSimpleRegexLines(val.trim())
           if (this.hasNestedQuantifier(trimmedVal)) {
             warnings.push(`⚠️ 配置「${field}」的正则含灾难性回溯结构（嵌套量词，或组内交替/无限量词 + 组后重复，如 (a+)+、(a|aa)+），该规则将被忽略：「${trimmedVal}」`)
             continue
           }
           // 与 compileRules 的 'i' 保持一致
-          if (isRe2Available() && !compileUserRegex(trimmedVal, 'i')) {
+          // v3.535（W4）：走 simpleSourceCompiles 且传**原始值**（保留行边界）——有分块形态时它只编块、
+          // 不编整段，否则校验路径会把 4k 分支的整条 RE2 编出来常驻 _userReCache，抵消 W4 收益。
+          if (isRe2Available() && !this.simpleSourceCompiles(val.trim(), field)) {
             warnings.push(`⚠️ 配置「${field}」包含无效或当前环境不支持的正则表达式：「${trimmedVal}」`)
           }
         }

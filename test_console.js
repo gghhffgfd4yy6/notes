@@ -2302,6 +2302,26 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  // W4 注入面回归：console 的 RuleEngine 桩必须带 simpleSourceCompiles。缺了它（旧桩只有
+  // hasNestedQuantifier/compileRules）xbk_filter_store 闸门 3 的 typeof 检查落空 ⇒ 回落 compileOk，
+  // 校验期把 4k 分支的**整条** RE2 编出来并常驻 _userReCache，W4「有分块就不编整段」的收益在
+  // 控制台进程里归零（实测生产规则 r367 在旧桩下编 7 条、其中 2 条 >5,000 字符 15,905/15,806）。
+  // 断言语义：>600 分支只编 2 块 ⇒ 缓存新增 2 条；回落 compileOk 只编 1 条整段源码（新增 1 条）。
+  await aok('过滤规则 deps: 注入的 RuleEngine 带 simpleSourceCompiles（>600 分支只编 2 块、不编整段）', async () => {
+    const deps = runtimeFilterDeps()
+    assert.strictEqual(typeof deps.RuleEngine.simpleSourceCompiles, 'function',
+      'runtimeFilterDeps 必须注入 simpleSourceCompiles（缺则 FilterStore 闸门 3 回落 compileOk，校验期编整段）')
+    const lines = []
+    for (let i = 0; i < 420; i++) lines.push('aaaa' + i + '|bbbb' + i) // 每行 2 分支 ⇒ 840 分支
+    const src = lines.join('\n')
+    assert.ok(src.length > 5000, '夹具必须 >5,000 字符（线上 4k 分支整段的量级），实际 ' + src.length)
+    deps.v3.clearUserRegexCache()
+    const before = deps.v3.userRegexCacheSize()
+    assert.strictEqual(deps.RuleEngine.simpleSourceCompiles(src, 'pingbibiaoti'), true, '840 分支可切块 ⇒ 视同整段有效')
+    const after = deps.v3.userRegexCacheSize()
+    assert.strictEqual(after - before, 2, '>600 分支应切成 2 块、只编块；旧桩回落 compileOk 会编 1 条整段源码')
+  })
+
   await aok('过滤规则草稿: 服务器读/写/删 + 0600 + 正式保存清草稿 + revision 冲突', async () => {
     const dir = mkTmp('xbk-console-filter-')
     const { server, port } = await filterServer(dir)

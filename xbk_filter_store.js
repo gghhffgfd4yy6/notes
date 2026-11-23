@@ -1107,6 +1107,19 @@ function compileOk (deps, source) {
   try { return Boolean(deps.compileUserRegex(source, 'i')) } catch (e) { return false }
 }
 
+/** 简单模式字段「能否编译生效」（闸门 3 专用）。
+ *  W4：优先用 `RuleEngine.simpleSourceCompiles`——有分块形态（多块）时它只编块、**不编整段**。否则校验
+ *  路径会把线上 4k 分支字段的整条 RE2 编出来并常驻 `_userReCache`（按源码缓存 256 条），把运行期
+ *  「有分块就不编整段」的收益原样抵消掉（worker 的 loadFilterRules 深校验与 console 保存都走这里）。
+ *  注入方没有该方法（旧替身 / 别的模块）时回落 compileOk；错误码与文案一律不变。 */
+function simpleRuleCompiles (deps, field, source) {
+  const engine = deps && deps.RuleEngine
+  if (engine && typeof engine.simpleSourceCompiles === 'function') {
+    try { return engine.simpleSourceCompiles(source, field) === true } catch (e) { return false }
+  }
+  return compileOk(deps, source)
+}
+
 /**
  * 校验待保存/待预检的过滤规则（五道闸：schema/字段白名单/长度 → 行语法 → RE2 与嵌套量词 →
  * 编译对账 → 整份字节预算；最后一道只约束保存入参，读路径以 options.fromDisk 跳过。规格 §3 / 计划 §3.3）。
@@ -1330,7 +1343,7 @@ function validateFilterRules (input, deps, options) {
     // 否则缺 re2 的环境（compileUserRegex 恒 null）会把用户唯一还能用的时间规则判成
     // invalid_value_regex 直接拒掉。
     if (rule.field === 'pingbitime') continue
-    if (!compileOk(deps, rule.val)) {
+    if (!simpleRuleCompiles(deps, rule.field, rule.val)) {
       addError(errors, rule.field, 'invalid_value_regex', `正则无法编译：「${rule.val}」`)
     }
   }

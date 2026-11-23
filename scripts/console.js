@@ -2275,7 +2275,9 @@ function runtimeFilterDeps () {
         hasNestedQuantifier: v3.hasNestedQuantifier,
         compileRules: v3.compileRules,
         // 预览白名单与运行期同口径：先剥零宽字符再 test（缺导出时退化为原串）。
-        _normalizeReInput: typeof v3._normalizeReInput === 'function' ? v3._normalizeReInput : undefined
+        _normalizeReInput: typeof v3._normalizeReInput === 'function' ? v3._normalizeReInput : undefined,
+        // W4：校验路径同口径的「有分块不编整段」（缺导出时 undefined ⇒ FilterStore 回落 compileOk）。
+        simpleSourceCompiles: typeof v3.simpleSourceCompiles === 'function' ? v3.simpleSourceCompiles : undefined
       }
     : null
   filterDepsCache = {

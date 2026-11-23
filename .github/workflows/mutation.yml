@@ -264,7 +264,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-822"
+            mutate: "xbk_function_v3.js:1-825"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -353,9 +353,13 @@ jobs:
             src: "xbk_state_schema.js"
             mutate: "xbk_state_schema.js"
             config: "stryker.tap.config.js"
-          # console.js 6773 行（v3.532 W1：资产去注释（acorn onComment 收集注释区间 + CSS 字符串/
+          # console.js 6775 行（v3.535 W4：runtimeFilterDeps 的 RuleEngine 桩补 simpleSourceCompiles——校验期
+          # 只编块、不编整段，+2 行 ⇒ 尾部 part13 由 6253-6773 扩到 6253-6775；13 段划分沿用 v3.532 W1 的
+          # **等宽重拆**（521 行/段、段名不变，最大段 523 行 ≤700），part1..12 行段数字不变。
+          # 此前 6773 行（v3.532 W1：资产去注释（acorn onComment 收集注释区间 + CSS 字符串/
           # 转义感知的 /* */ 剥离）+ Node 侧 br(q11)/gzip(9) 预压 + 按 Accept-Encoding 三路协商，
-          # 净 +93 行 ⇒ 按 6773 行**等宽重拆 13 段**（521 行/段，段名不变）。为什么不沿用旧边界：
+          # 净 +93 行 ⇒ 按当时的 6773 行**等宽重拆 13 段**（521 行/段，段名不变；v3.535 W4 的 +2 行只把
+          # 尾部 part13 顺延到 6775，不重拆）。为什么不沿用旧边界：
           # +88 行全落在 part2 区间内，直接把 part2 撑到 772 行，超出「单段 ≤700 行」的既定上限
           # （700 行 ≈174min，再涨就有撞 step 330min 的风险）；等宽后最大段 521 行 ≈130min。
           # 此前 6680 行（v3.526 F4：GET 响应形状搬进 FilterStore.buildFilterGetPayload（merged
@@ -453,7 +457,7 @@ jobs:
             timeout_ms: 60000
           - name: console-part13
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6253-6773"
+            mutate: "scripts/console.js:6253-6775"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:

@@ -10,7 +10,7 @@ if (hostClean.shouldAbortForDirtyHost(process.env)) process.exit(1)
 // 直接测试 xbk_function_v3.js 里的 listfilter
 // ============================================================
 
-const { listfilter, explainFilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, compileUserRegex, _normalizeReInput, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num } = require('./xbk_function_v3.js')
+const { listfilter, explainFilter, filterByKeyword, validateConfig, tuisong_replace, htmlToMarkdown, looksLikeHtmlLinear, isMessageInFile, appendMessageToFile, getFileName, whitelistFilter, compileRules, matchesCompiled, checkTimeCompiled, saveBatch, init, decodeHtmlEntities, Config, daysComputed, checkRegisterTime, checkCategory, checkFields, _splitLines, getFilePath, _ensureFileExists, readMessages, saveMessages, anonKey, hasValidId, normUrl, safeUrl, validUrl, safeText, safeErrorText, sanitizeDecodedHtml, runSingleEntry, hasNestedQuantifier, compileUserRegex, _normalizeReInput, truncateUtf16, filterHash, MessageStore, getMessageIdentity, num, compileStateOf } = require('./xbk_function_v3.js')
 const { createUtils } = require('./xbk_utils.js')
 const assert = require('assert')
 const slim = require('./xbk_sendNotify_slim.js')
@@ -2768,7 +2768,9 @@ console.log('========================================\n');
 
   // ---- v3.529（O2）简单模式切块：切块只是「同一存在性判定」的短路实现，判定必须逐条一致 ----
   // 真实形态（多行 + 行内 | + 单行 713 分支巨行）下，把同一份规则编两遍：一份带 blocks（新路径），
-  // 一份剥掉 blocks（等价于旧实现的「整条正则」路径），对比 matchesCompiled 与 explainFilter。
+  // 一份**独立整段编译**（compileUserRegex(source) —— 等价于旧实现的「整条正则」路径），对比
+  // matchesCompiled 与 explainFilter。v3.535（W4）起切块字段的 compiled.re 恒为 null，故对照组
+  // **不能**再读 c.re，必须自己编一条整段正则。
   await test('v3.529 O2: 切块与整段正则的判定逐条一致（matchesCompiled + explainFilter 0 差异）', () => {
     const lines = []
     for (let i = 0; i < 900; i++) lines.push('品牌' + i) // 900 行字面量
@@ -2778,11 +2780,11 @@ console.log('========================================\n');
     const chunked = compileRules(cfg)
     // 非空断言：没切出多块说明这条用例退化成「整条正则 vs 整条正则」，等于什么都没验
     assertEqual(chunked.pingbibiaoti.blocks.length > 1, true, '巨型规则必须切出多块，实际 ' + chunked.pingbibiaoti.blocks.length)
-    assertEqual(chunked.pingbibiaoti.re.source, chunked.pingbibiaoti.source, 're 必须仍是整段原文编译出的整条正则（诊断口径不变）')
-    const whole = {} // 对照组：同一份规则、只保留整条正则（blocks 缺失 ⇒ 旧路径）
+    // `re === null` 这条契约断言放到判定对比之后（见本用例末）：先证判定等价，再证真的没编整段
+    const whole = {} // 对照组：同一份规则、只保留**独立编译**的整条正则（blocks 缺失 ⇒ 旧路径）
     for (const key of Object.keys(chunked)) {
       const c = chunked[key]
-      whole[key] = c && c._type === 're' ? { _type: 're', re: c.re, source: c.source } : c
+      whole[key] = c && c._type === 're' ? { _type: 're', re: compileUserRegex(c.source, 'i'), source: c.source } : c
     }
     const values = ['品牌0', '品牌599', '品牌600', '品牌899', '甲', '乙', '丙', '城0', '城712', '城713', '不存在的词', '品牌1 好价']
     const diffs = []
@@ -2813,6 +2815,8 @@ console.log('========================================\n');
     // 命中确实发生过（否则上面全是「都不命中」的平凡一致）
     assertEqual(explainFilter(makeItem({ title: '品牌3 好价' }), chunked).passed, false, '命中的标题必须被拦截')
     assertEqual(explainFilter(makeItem({ title: '完全无关的标题' }), chunked).passed, true, '不命中的标题必须放行')
+    // 契约断言（放最后）：多块字段真的没有整段 RE2
+    assertEqual(chunked.pingbibiaoti.re, null, '多块字段不得再编整段（re 必须是 null）')
   })
 
   await test('v3.529 O2: 有 blocks 时只用 blocks（忽略 compiled.re），空 blocks 才回落', () => {
@@ -2825,6 +2829,168 @@ console.log('========================================\n');
     const emptyBlocks = { _type: 're', re: /京东/, source: '京东', blocks: [] }
     assertEqual(matchesCompiled(emptyBlocks, '京东'), true, 'blocks 为空数组时必须回落 compiled.re')
     assertEqual(matchesCompiled(emptyBlocks, '淘宝'), false, 'blocks 为空数组时仍是整条 re 的判定')
+  })
+
+  // ---- v3.535（W4）有分块就不编整段：判定/诊断/载荷守卫全链路 ----
+  // 300 条真实帖子夹具（test/fixtures/filter-posts-300.json，只读自生产 push.json 副本）：
+  // 新路径（compileRules 产出 re:null + blocks）与**独立整段编译**（compileUserRegex(source)，
+  // 等价于 W4 之前的旧路径）逐条对比 matchesCompiled 与 explainFilter(passed + reason.stage) 必须 0 差异；
+  // 同时钉住「category / title / content 三个阶段都真的命中过」——否则「0 差异」可能只是全都不命中的平凡一致。
+  const W4_POSTS = require('./test/fixtures/filter-posts-300.json')
+  const w4Field = (pairs, total, prefix) => {
+    const lines = pairs.slice()
+    for (let i = 0; i < total - pairs.length; i++) lines.push(prefix + i + '|' + prefix + 'v' + i)
+    return lines.join('\n')
+  }
+  // 2100 行 × 2 分支 = 4200 分支 ⇒ 7 块/字段（与线上 4,088/4,073 分支的真实形态同档）
+  const W4_TITLE_RULES = w4Field(['京东|支付', '福临门|汽车', '工行|联通', '武夫人|甘源', '正大招|楼上', '按需|原文'], 2100, 'kwT')
+  const W4_CONTENT_RULES = w4Field(['自营|淘宝', '小红薯|小金库', '现在去|有没', '京东支付|京东省'], 2100, 'kwC')
+  const W4_CFG = {
+    pingbifenlei: '酷安', // 分类屏蔽
+    pingbibiaoti: W4_TITLE_RULES, // >600 分支简单字段（7 块）
+    zhanxianbiaoti: '甘源|福临门', // 强制展现
+    pingbibiaotiplus: '甘源', // 强化屏蔽（抵消同字段强制展现）
+    pingbineirong: W4_CONTENT_RULES, // >600 分支简单字段（7 块）
+    zhanxianneirong: '',
+    pingbineirongplus: '',
+    pingbilouzhu: '好单线报###小明\n赚客吧###小红', // ### 多分类
+    zhanxianlouzhu: '',
+    pingbilouzhuplus: '',
+    pingbitime: '好单线报###3' // 天数（多分类形态）
+  }
+  const w4DaysAgo = (n) => {
+    const d = new Date(Date.now() - n * 86400000)
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+  }
+
+  await test('v3.535 W4: 300 条真实帖子 × 7 块规则，切块与独立整段编译 0 差异（含 category/title/content 阶段分布）', () => {
+    assertEqual(W4_POSTS.posts.length, 300, '夹具必须恰好 300 条真实帖子')
+    assertEqual(W4_POSTS.posts.every((p) => typeof p.title === 'string' && typeof p.content === 'string' && typeof p.catename === 'string'), true, '夹具只含 catename/title/content 三个字符串字段')
+    const chunked = compileRules(W4_CFG)
+    // 对照组：同一份规则，只保留**独立整段编译**的整条正则（blocks 缺失 ⇒ W4 之前的旧路径）
+    const whole = {}
+    for (const key of Object.keys(chunked)) {
+      const c = chunked[key]
+      whole[key] = c && c._type === 're' ? { _type: 're', re: compileUserRegex(c.source, 'i'), source: c.source } : c
+    }
+    whole.__compiled = true
+    const diffs = []
+    const dist = new Map()
+    const oldDist = new Map()
+    let protections = 0
+    let skipped = 0
+    let plusBlocked = 0
+    W4_POSTS.posts.forEach((p, i) => {
+      const item = {
+        catename: p.catename,
+        louzhu: i % 3 === 0 ? '小明' : (i % 3 === 1 ? '小红' : '路人'),
+        title: p.title,
+        content: p.content,
+        // 前 8 条「好单线报」保持「新号」⇒ pingbitime（3 天）命中；其余 30 天前 ⇒ 不命中
+        louzhuregtime: (i < 8 && p.catename.startsWith('好单线报')) ? w4DaysAgo(1) : w4DaysAgo(30),
+        url: '/p/' + i
+      }
+      for (const [field, value] of [['pingbifenlei', p.catename], ['pingbibiaoti', p.title], ['pingbineirong', p.content], ['pingbilouzhu', item.louzhu]]) {
+        if (matchesCompiled(chunked[field], value, p.catename) !== matchesCompiled(whole[field], value, p.catename)) {
+          diffs.push('matchesCompiled/' + field + '：' + String(value).slice(0, 20))
+        }
+      }
+      const a = explainFilter(item, chunked)
+      const b = explainFilter(item, whole)
+      const sa = a.reason ? a.reason.stage : 'pass'
+      const sb = b.reason ? b.reason.stage : 'pass'
+      if (a.passed !== b.passed || sa !== sb) diffs.push('explainFilter：' + item.title.slice(0, 20) + ' 切块=' + sa + ' 整段=' + sb)
+      dist.set(sa, (dist.get(sa) || 0) + 1)
+      oldDist.set(sb, (oldDist.get(sb) || 0) + 1)
+      if (a.protections.length > 0) protections++
+      if (a.skipped.length > 0) skipped++
+      if (a.reason && a.reason.configKey === 'pingbibiaotiplus') plusBlocked++
+    })
+    assertEqual(diffs.slice(0, 5).join('；'), '', '切块与独立整段编译必须 0 差异（前 5 条）')
+    // 结构断言放在判定对比**之后**：这样若有人回退「多块不再编整段」，判定对比仍然证明「0 差异」，
+    // 红的是这条契约断言（而不是靠判定不等价来报警）——两者各自守一件事：语义不漂移 / 真的没编整段。
+    for (const field of ['pingbibiaoti', 'pingbineirong']) {
+      assertEqual(chunked[field].re, null, field + ' 切成多块后必须 re=null（不再编整段）')
+      assertEqual(chunked[field].blocks.length, 7, field + ' 必须切成 7 块（4200 分支 / 600），实际 ' + chunked[field].blocks.length)
+      const maxBranches = Math.max(...chunked[field].blocks.map((b) => b.branches))
+      assertEqual(maxBranches <= 600, true, field + ' 每块必须 ≤600 分支，实际最大 ' + maxBranches)
+      assertEqual(chunked[field].blocks.map((b) => b.source).join('|'), chunked[field].source, field + ' 块拼接必须逐字等于 source')
+    }
+    // 阶段分布：三个阶段都必须真的命中过（防「全都不命中」的平凡一致），且与旧路径逐项相等
+    for (const stage of ['category', 'title', 'content']) {
+      assertEqual((dist.get(stage) || 0) > 0, true, '阶段 ' + stage + ' 必须至少命中 1 条（否则该阶段的等价性是空的），实际 ' + (dist.get(stage) || 0))
+    }
+    const sorted = (m) => [...m.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1))
+    assertEqual(JSON.stringify(sorted(dist)), JSON.stringify(sorted(oldDist)), '阶段分布必须与旧路径逐项相等')
+    // 展现/强化屏蔽也真的参与过（否则「强制展现+plus」两条规则等于没配）
+    assertEqual(protections > 0, true, '必须有记录命中强制展现（protections），实际 ' + protections)
+    assertEqual(skipped > 0, true, '必须有记录因更高优先级保护而跳过屏蔽（skipped），实际 ' + skipped)
+    assertEqual(plusBlocked > 0, true, '必须有记录被强化屏蔽（pingbibiaotiplus）拦下，实际 ' + plusBlocked)
+  })
+
+  await test('v3.535 W4: filter.hash 与改动前逐字相同（固定配置 + 固定 compileState 冻结期望值）', () => {
+    // 期望值由 **bd2a9ec（改动前）** 的 xbk_utils.filterHash 实算得出，另用改动后的代码复算一致：
+    //   base state: re2=1,pingbifenlei=re,pingbibiaoti=re,...,pingbilouzhu=multi:1,pingbitime=time
+    //   base hash : 4047111832-3592920623
+    // 冻结的意义：compileRules 现在把切块字段的 re 置 null，但 filter.hash 只由「原始配置 + compileStateOf
+    // （只看 _type）+ zkt_gjc（+ 时间过滤启用时的 UTC 日期）」组成 ⇒ 编译产物形状变化不得改哈希，
+    // 否则部署瞬间 _f 缓存整份失效（全量重评/重推）。pingbitime 固定 '0'（未启用时间过滤）以免日期折入。
+    const hashLines = []
+    for (let i = 0; i < 350; i++) hashLines.push('城市' + i + '|品牌' + i) // 与冻结值同一份夹具：700 分支 ⇒ 2 块
+    const cfg = {
+      pingbifenlei: '酷安',
+      pingbibiaoti: hashLines.join('\n'),
+      zhanxianbiaoti: '甘源|福临门',
+      pingbibiaotiplus: '甘源',
+      pingbineirong: '自营|淘宝',
+      zhanxianneirong: '',
+      pingbineirongplus: '',
+      pingbilouzhu: '好单线报###小明',
+      zhanxianlouzhu: '',
+      pingbilouzhuplus: '',
+      pingbitime: '0'
+    }
+    const compiled = compileRules(cfg)
+    assertEqual(compiled.pingbibiaoti.blocks.length, 2, '该夹具必须切 2 块（700 分支），实际 ' + compiled.pingbibiaoti.blocks.length)
+    const state = compileStateOf(compiled)
+    assertEqual(filterHash(cfg, '京东', state), '4047111832-3592920623', 'filter.hash 切块前后必须逐字相等')
+    // 反向对照：换了 compileState（规则实际生效面变化）哈希必须变——证明这维度仍在起作用、冻结值不是常量
+    assertEqual(filterHash(cfg, '京东', state + ',x=re') !== '4047111832-3592920623', true, 'compileState 变化必须改变哈希')
+    // 形状契约（放最后，避免哈希用例被「re 不是 null」这类与哈希无关的原因带红）
+    assertEqual(compiled.pingbibiaoti.re, null, '该夹具的 pingbibiaoti 必须真的切成多块（re=null）')
+  })
+
+  await test('v3.535 W4: checkCategory/checkFields 对切块字段（re=null）仍能拦截且无形状告警', () => {
+    const catLines = []
+    for (let i = 0; i < 350; i++) catLines.push('城市' + i + '|品牌' + i) // 700 分支 ⇒ 2 块
+    const compiled = compileRules({ pingbifenlei: catLines.join('\n'), pingbibiaoti: '屏蔽词' })
+    assertEqual(compiled.pingbifenlei.re, null, '分类字段切成多块后 re 必须是 null')
+    assertEqual(compiled.pingbifenlei.blocks.length, 2, '分类字段必须切 2 块')
+    const originalWarn = console.warn
+    const warnings = []
+    let blockedCat = null
+    let passedCat = null
+    let blockedFields = null
+    let nullRePass = null
+    let barePass = null
+    try {
+      console.warn = (...args) => warnings.push(args.join(' '))
+      blockedCat = checkCategory({ catename: '城市7' }, compiled.pingbifenlei)
+      passedCat = checkCategory({ catename: '不相干分类' }, compiled.pingbifenlei)
+      blockedFields = checkFields({ catename: '品牌9', title: 'x', content: 'y' }, compiled)
+      // 无 blocks 的 re:null 仍是「缺载荷」：告警 + 保守放行（旧契约不变）
+      nullRePass = checkCategory({ catename: '城市7' }, { _type: 're', re: null })
+      barePass = checkCategory({ catename: '城市7' }, { _type: 're' })
+    } finally {
+      console.warn = originalWarn
+    }
+    assertEqual(blockedCat, false, 'checkCategory 对切块字段命中的分类必须拦截（返回 false）')
+    assertEqual(passedCat, true, 'checkCategory 未命中必须放行（返回 true）')
+    assertEqual(blockedFields, false, 'checkFields 对切块分类字段命中的帖子必须拦截（返回 false）')
+    assertEqual(nullRePass, true, '{_type:re, re:null} 无 blocks 必须保守放行')
+    assertEqual(barePass, true, '{_type:re} 必须保守放行')
+    const shapeWarns = warnings.filter((w) => w.includes('不匹配或缺载荷'))
+    assertEqual(shapeWarns.length, 2, '只有两条缺载荷载荷（re:null / 裸 _type:re）应告警，切块字段不得告警；实际 ' + shapeWarns.length + ' 条：' + warnings.join(' | '))
   })
 
   // ==================== C007 _legacyCompileKey 字符串/对象同缓存键 ====================
@@ -6840,6 +7006,24 @@ console.log('========================================\n');
     // 非法正则被编译守卫丢弃 ⇒ 编译生效面变了，指纹必须跟着变（否则改宽后静默漏推）
     const dropped = v3.compileStateOf(v3.compileRules({ pingbibiaoti: '(' }))
     assertEqual(dropped !== compiled, true, '编译结果变化必须改变指纹（否则 filter.hash 不变、_f 永不失效）')
+  })
+
+  // W4：simpleSourceCompiles 是校验路径（validateConfig 简单模式 / FilterStore 闸门 3）的唯一判定口。
+  // console 的 runtimeFilterDeps() 与 qinglong --check 都按名把它注入 RuleEngine 桩——导出一旦漏掉，
+  // 闸门的 typeof 检查落空、回落 compileOk，校验期又把 4k 分支的整条 RE2 编出来常驻 _userReCache。
+  // 这里钉住导出语义与「只编块」：>600 分支只新增 2 条缓存，整段源码一次都没被编译。
+  await test('W4: simpleSourceCompiles 导出（校验路径判定口）——合法单块 true / 非法 false / 多块只编块', () => {
+    const v3 = require('./xbk_function_v3.js')
+    assertEqual(typeof v3.simpleSourceCompiles, 'function', '必须导出 simpleSourceCompiles（注入桩缺它即回落 compileOk）')
+    assertEqual(v3.simpleSourceCompiles('苏州|杭州', 'pingbibiaoti'), true, '合法单块模式必须判可编译')
+    assertEqual(v3.simpleSourceCompiles('(', 'pingbibiaoti'), false, '非法正则必须判不可编译（退回整段编译后仍失败）')
+    const lines = []
+    for (let i = 0; i < 350; i++) lines.push('w4sb' + i + '|w4sc' + i) // 每行 2 分支 ⇒ 700 分支 ⇒ 2 块
+    v3.clearUserRegexCache()
+    const before = v3.userRegexCacheSize()
+    assertEqual(v3.simpleSourceCompiles(lines.join('\n'), 'pingbibiaoti'), true, '可切块的多行规则必须判可编译')
+    const delta = v3.userRegexCacheSize() - before
+    assertEqual(delta, 2, `>600 分支必须只编 2 块（整段 0 次），实际新增缓存 ${delta} 条`)
   })
 
   // ==================== 94. 死代码检测(可达性) ====================
