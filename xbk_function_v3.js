@@ -755,6 +755,8 @@ if (typeof module !== 'undefined' && module.exports) {
     // 补充导出（供更全面的测试）
     whitelistFilter: FilterEngine.whitelistFilter.bind(FilterEngine),
     compileRules: RuleEngine.compileRules.bind(RuleEngine),
+    // 校验路径专用（validateConfig / FilterStore 闸门 3）：有分块形态时只编块、不编整段。
+    simpleSourceCompiles: RuleEngine.simpleSourceCompiles.bind(RuleEngine),
     // FILTER-01：规则「实际编译生效」指纹。App.run 把它折进 filter.hash；控制台保存规则后
     // 要用**同一口径**算摘要，否则两边 hash 永远不相等（控制台的那份成了无意义的纯配置摘要）。
     compileStateOf: RuleEngine.compileStateOf.bind(RuleEngine),

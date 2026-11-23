@@ -674,6 +674,28 @@ o2Check('W4 simpleSourceCompiles：多块只编块、非法/重名返回 false�
   return '真实切块 + 4 类边界'
 })
 
+// W4 校验路径的**唯一**回归靶：validateConfig 简单模式必须走 simpleSourceCompiles（只编块），
+// 不能直接 compileUserRegex(整段)——后者会把线上 4k 分支的整条 RE2 编出来并按源码常驻 _userReCache
+// （256 条缓存），把 W4「有分块就不编整段」的收益在 worker / console 的保存校验路径上原样抵消。
+// 计数型 compileUserRegex：断言「编译记录恰好 2 条块源码、整段一次都没编」，回退整段编译立即红。
+o2Check('W4 validateConfig：简单模式 >5,000 字符可切块时只编块、整段一次都不编', () => {
+  const lines = []
+  for (let i = 0; i < 420; i++) lines.push('aaaa' + i + '|bbbb' + i) // 每行 2 分支 ⇒ 840 分支 ⇒ 2 块
+  const src = lines.join('\n')
+  const whole = lines.join('|') // simpleSourceCompiles 之外的旧实现会编译的整段源码
+  assert.ok(whole.length > 5000, '夹具整段必须 >5,000 字符，实际 ' + whole.length)
+  const seen = []
+  const eng = o2MakeEngine((s) => { seen.push(String(s)); return { test: () => false, source: String(s) } })
+  const warnings = eng.validateConfig({ keyword: src })
+  assert.strictEqual(warnings.some((w) => w.includes('包含无效或当前环境不支持的正则表达式')), false,
+    '可切块 ⇒ 不得出现「无效正则」告警，实际：' + warnings.join(' / '))
+  assert.deepStrictEqual(warnings, [], '可切块的合法配置必须零告警，实际：' + warnings.join(' / '))
+  assert.strictEqual(seen.length, 2, '校验期只编 2 块，实际编了 ' + seen.length + ' 条（长度 ' + seen.map((s) => s.length).join(',') + '）')
+  assert.ok(seen.every((s) => s.length < 5000), '编译记录必须都是块源码（<5,000 字符），实际 ' + seen.map((s) => s.length).join(','))
+  assert.ok(!seen.includes(whole), '整段源码（' + whole.length + ' 字符）不得出现在编译记录里')
+  return '编译记录 2 条块源码 + 0 条整段，零告警'
+})
+
 for (const line of o2Cases) console.log('  ' + line)
 console.log(`O2 切块结构断言 ${o2Cases.filter((l) => l.startsWith('✅')).length}/${o2Cases.length} 通过`)
 

@@ -7008,6 +7008,24 @@ console.log('========================================\n');
     assertEqual(dropped !== compiled, true, '编译结果变化必须改变指纹（否则 filter.hash 不变、_f 永不失效）')
   })
 
+  // W4：simpleSourceCompiles 是校验路径（validateConfig 简单模式 / FilterStore 闸门 3）的唯一判定口。
+  // console 的 runtimeFilterDeps() 与 qinglong --check 都按名把它注入 RuleEngine 桩——导出一旦漏掉，
+  // 闸门的 typeof 检查落空、回落 compileOk，校验期又把 4k 分支的整条 RE2 编出来常驻 _userReCache。
+  // 这里钉住导出语义与「只编块」：>600 分支只新增 2 条缓存，整段源码一次都没被编译。
+  await test('W4: simpleSourceCompiles 导出（校验路径判定口）——合法单块 true / 非法 false / 多块只编块', () => {
+    const v3 = require('./xbk_function_v3.js')
+    assertEqual(typeof v3.simpleSourceCompiles, 'function', '必须导出 simpleSourceCompiles（注入桩缺它即回落 compileOk）')
+    assertEqual(v3.simpleSourceCompiles('苏州|杭州', 'pingbibiaoti'), true, '合法单块模式必须判可编译')
+    assertEqual(v3.simpleSourceCompiles('(', 'pingbibiaoti'), false, '非法正则必须判不可编译（退回整段编译后仍失败）')
+    const lines = []
+    for (let i = 0; i < 350; i++) lines.push('w4sb' + i + '|w4sc' + i) // 每行 2 分支 ⇒ 700 分支 ⇒ 2 块
+    v3.clearUserRegexCache()
+    const before = v3.userRegexCacheSize()
+    assertEqual(v3.simpleSourceCompiles(lines.join('\n'), 'pingbibiaoti'), true, '可切块的多行规则必须判可编译')
+    const delta = v3.userRegexCacheSize() - before
+    assertEqual(delta, 2, `>600 分支必须只编 2 块（整段 0 次），实际新增缓存 ${delta} 条`)
+  })
+
   // ==================== 94. 死代码检测(可达性) ====================
   console.log('\n📂 94. 死代码检测')
 

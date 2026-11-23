@@ -97,8 +97,13 @@ function runCheck (app) {
         const FilterStore = require('../xbk_filter_store')
         // 与 App.run 同口径传 deps：--check 也要能发现「规则编译不了」的覆盖文件，
         // 否则控制台红条/启动校验都报合法、真正跑起来却降级。
+        // W4：校验路径同口径的「有分块不编整段」（缺导出时 undefined ⇒ FilterStore 回落 compileOk）。
         const ruleEngine = typeof app.compileRules === 'function' && typeof app.hasNestedQuantifier === 'function'
-          ? { hasNestedQuantifier: app.hasNestedQuantifier, compileRules: app.compileRules }
+          ? {
+              hasNestedQuantifier: app.hasNestedQuantifier,
+              compileRules: app.compileRules,
+              simpleSourceCompiles: typeof app.simpleSourceCompiles === 'function' ? app.simpleSourceCompiles : undefined
+            }
           : null
         let re2Ready = false
         try { re2Ready = Boolean(require('re2')) } catch (e) { re2Ready = false }
