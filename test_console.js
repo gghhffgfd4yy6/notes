@@ -5390,19 +5390,25 @@ async function main () {
     const crypto = require('node:crypto')
     // v3.364：不再硬编码文件名清单——直接按 STATIC_ASSETS 的插入顺序取（服务端算版本号
     // 用的是同一个对象），新增分片时这条断言自动跟随，不会出现「清单漏一个、版本号对不上」。
-    // v3.532：版本哈希按**去注释后**的字节算。这里直接问生产入口要那份快照（buildAssetStore
-    // 返回的 raw 就是剥离后的字节），不再自己读原始磁盘文件——原始字节算出的哈希必然不同，
-    // 下一条断言把「去注释必须换 URL」单独钉住（否则浏览器会拿旧 immutable 缓存配新字节）。
+    // v3.532：版本哈希按**去注释后**的字节算。这里独立复算：不碰服务端算好的 version 字段，
+    // 按 STATIC_ASSETS 顺序把 16 份资产以 identity 正文从 HTTP 取回来（下发的就是去注释后的
+    // 字节），逐份 sha256 前 16 位、再按同规则拼接取前 16 位——把 version 写成常量这条必红。
     const { STATIC_ASSETS } = require('./scripts/console.js')
-    const assetStore = consoleAssetStore()
-    assert.strictEqual(verMatch[1], assetStore.version,
-      '版本号必须等于去注释后资产内容的哈希（不能是常量/陈旧值，也不得按原始字节算）')
+    const httpHashes = []
+    for (const route of Object.keys(STATIC_ASSETS)) {
+      const res = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+      assert.strictEqual(res.status, 200, `${route} 必须可取（复算版本号用）`)
+      httpHashes.push(crypto.createHash('sha256').update(res.body).digest('hex').slice(0, 16))
+    }
+    const httpVersion = crypto.createHash('sha256').update(httpHashes.join('|')).digest('hex').slice(0, 16)
+    assert.strictEqual(verMatch[1], httpVersion,
+      '版本号必须由 HTTP 下发的 16 份去注释资产内容独立复算（常量/陈旧/按原始字节算都过不了）')
     const rawDiskHashes = Object.values(STATIC_ASSETS).map((spec) => {
       const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', spec.file))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
     const rawDiskVersion = crypto.createHash('sha256').update(rawDiskHashes.join('|')).digest('hex').slice(0, 16)
-    assert.notStrictEqual(assetStore.version, rawDiskVersion,
+    assert.notStrictEqual(verMatch[1], rawDiskVersion,
       '去注释必须换 URL：按原始磁盘字节算出的版本号不得等于实际下发的版本号')
     const immutable = await requestBuffer(port, 'GET', `/assets/app.css?v=${verMatch[1]}`, { token: TOKEN })
     const cc = String(immutable.headers['cache-control'] || '')
