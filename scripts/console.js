@@ -984,7 +984,72 @@ const STATIC_ASSETS = Object.freeze({
   '/assets/virtual-core.module.js': { file: 'virtual-core.module.js', type: 'text/javascript; charset=utf-8' }
 })
 
-// 资产存储（v3.302）：启动时一次性读盘成快照（raw/gzip/ETag 常驻内存，各文件 < 100KB）。
+// ── 资产去注释（v3.532）────────────────────────────────────────────────────
+// 前端源码里注释占 30–48%（pages.js 尤甚），而 br 对中文注释只有 2–2.5:1：注释既占压缩前
+// 字节、又几乎压不动，先抹成空白再压缩，16 份资产的 br 总量少 41.9%（见 CHANGELOG v3.532）。
+// **等长空白而不是删除**：注释区间逐字符替换成空格，换行（\n / \r）原样保留 ⇒ 行号与列号
+// 完全不变，堆栈里的行号仍对得上源码，也不改变 ASI 语义（换行一个都没少）。
+const acorn = require('acorn')
+
+function blankOut (chars, start, end) {
+  for (let i = start; i < end; i++) {
+    const ch = chars[i]
+    if (ch !== '\n' && ch !== '\r') chars[i] = ' '
+  }
+}
+
+// JS/MJS：用 acorn 的 onComment 拿**语法树认定的**注释区间——正则字面量里的 `/*`、字符串里的
+// `//` 都不会被误判（手写扫描器在这两处必然出错）。解析失败一律抛错（fail-closed）：资产语法
+// 错误说明发布内容本身是坏的，宁可让启动/部署当场红，也不能「跳过这份、继续伺服」。
+function stripJsComments (src, label = 'JS 资产') {
+  const comments = []
+  try {
+    acorn.parse(src, { ecmaVersion: 'latest', sourceType: 'module', onComment: comments })
+  } catch (e) {
+    throw new Error(`${label} 解析失败，拒绝在语法树不完整时去注释：${e.message}`)
+  }
+  const chars = src.split('')
+  for (const comment of comments) blankOut(chars, comment.start, comment.end)
+  return chars.join('')
+}
+
+// CSS：剥 /* … */。必须跳过字符串字面量（`content: "/*"` 里的不是注释）并尊重 `\` 转义
+// （`"a\"/*b"` 的引号不算结束）；未闭合注释抛错（fail-closed，与 JS 侧同口径）。
+function stripCssComments (src, label = 'CSS 资产') {
+  const chars = src.split('')
+  let i = 0
+  while (i < chars.length) {
+    const ch = chars[i]
+    if (ch === '"' || ch === "'") {
+      i++
+      while (i < chars.length) {
+        if (chars[i] === '\\') { i += 2; continue }
+        if (chars[i] === ch) { i++; break }
+        i++
+      }
+      continue
+    }
+    if (ch === '/' && chars[i + 1] === '*') {
+      const close = src.indexOf('*/', i + 2)
+      if (close < 0) throw new Error(`${label} 有未闭合的 /* 注释，拒绝猜测它的边界`)
+      blankOut(chars, i, close + 2)
+      i = close + 2
+      continue
+    }
+    i++
+  }
+  return chars.join('')
+}
+
+// 按白名单登记的扩展名选剥离器：只有 .js/.mjs/.css 是文本源码；其它（将来若有图片/字体）
+// 原样保留——二进制按 UTF-8 拆字符会损坏字节。
+function stripAssetComments (spec, raw) {
+  if (/\.m?js$/.test(spec.file)) return Buffer.from(stripJsComments(raw.toString('utf8'), spec.file), 'utf8')
+  if (/\.css$/.test(spec.file)) return Buffer.from(stripCssComments(raw.toString('utf8'), spec.file), 'utf8')
+  return raw
+}
+
+// 资产存储（v3.302）：启动时一次性读盘成快照（raw/br/gzip/ETag 常驻内存，各文件 < 100KB）。
 // 版本号 = 各文件内容哈希拼接后的 sha16，renderPage 以 ?v=<sha16> 引用；带当前版本的 URL 可长缓存
 // （public + immutable），裸 URL 仍 no-cache（测试与旧页面兼容）。部署 = systemd restart。
 // 注：app.js 内部 `import './pure.mjs'` 不带版本号，走裸 URL 的 no-cache + ETag 协商（内容哈希仍参与
@@ -1007,14 +1072,20 @@ function buildAssetStore () {
   const table = new Map()
   const hashes = []
   for (const [route, spec] of Object.entries(STATIC_ASSETS)) {
-    const raw = fs.readFileSync(path.join(ASSETS_DIR, spec.file))
+    // v3.532：raw 是**去注释后**的字节——版本哈希、br/gzip 预压、响应体全部以它为准。
+    // 所以注释一改版本号就变，旧页面的长缓存 URL 不会被新字节污染。
+    const raw = stripAssetComments(spec, fs.readFileSync(path.join(ASSETS_DIR, spec.file)))
     const hash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     table.set(route, {
       spec,
       raw,
+      // v3.532：Node 侧预压两个表示（br q11 / gzip 9），按 Accept-Encoding 协商直发；
+      // 边缘反代不再需要「解压再重压」（opt-web 取证：每请求 encode ≈19 ms，identity 7 ms；本机未复测）。
+      br: zlib.brotliCompressSync(raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 } }),
       gzip: zlib.gzipSync(raw, { level: 9 }),
       etag: `"${hash}"`,
-      gzipEtag: `"${hash}-gz"`
+      gzipEtag: `"${hash}-gz"`,
+      brEtag: `"${hash}-br"`
     })
     hashes.push(hash)
   }
@@ -1051,8 +1122,8 @@ function assetBase () {
 }
 
 // Accept-Encoding 里某个 token 的 q 值：显式项优先，缺失时才落 `*` 通配；两者都没有返回 null。
-// 非法 q 值按 0（拒绝）——与 RFC 9110「不可解析即不可接受」同向。三个协商入口
-// （acceptsGzip）与静态资产的 gzip 变体共用这一份解析，避免多处同构循环各自漂移。
+// 非法 q 值按 0（拒绝）——与 RFC 9110「不可解析即不可接受」同向。两个协商入口
+// （acceptsGzip 与静态资产的编码选择）共用这一份解析，避免多处同构循环各自漂移。
 function acceptQuality (header, token) {
   let explicit = null
   let wildcard = null
@@ -1070,6 +1141,17 @@ function acceptQuality (header, token) {
     else wildcard = q
   }
   return explicit !== null ? explicit : wildcard
+}
+
+// 静态资产编码协商（v3.532）：br 优先，gzip 次之，identity 兜底。
+// 判据与 acceptsGzip 同一份 acceptQuality（不另写一套循环）：br 显式 q>0 且不低于 gzip 的 q
+// 时选 br（同 q 选压缩率更高的那个）；否则 gzip q>0 选 gzip；都不接受就发原文。
+function pickAssetEncoding (header) {
+  const brQ = acceptQuality(header, 'br')
+  const gzipQ = acceptQuality(header, 'gzip')
+  if (brQ !== null && brQ > 0 && (gzipQ === null || brQ >= gzipQ)) return 'br'
+  if (gzipQ !== null && gzipQ > 0) return 'gzip'
+  return 'identity'
 }
 
 // Accept-Encoding：按 RFC 9110 只认「显式接受且 q>0」的 gzip（含 * 通配）。
@@ -1116,8 +1198,11 @@ function serveStatic (req, res, route, spec, assetVersion = null) {
     return
   }
   const entry = store.table.get(route)
-  const useGzip = acceptsGzip(req.headers['accept-encoding'])
-  const assetEtag = useGzip ? entry.gzipEtag : entry.etag
+  // v3.532：一个 URL 三个表示（br / gzip / identity），ETag 按编码分后缀、Vary 已声明，
+  // 缓存与 304 都按**实际发送的那个表示**对账——否则 br 体的 304 会让缓存拿 gzip 体。
+  const encoding = pickAssetEncoding(req.headers['accept-encoding'])
+  const assetEtag = encoding === 'br' ? entry.brEtag : encoding === 'gzip' ? entry.gzipEtag : entry.etag
+  const variant = encoding === 'br' ? entry.br : encoding === 'gzip' ? entry.gzip : entry.raw
   // 内容寻址有两种写法：旧页面的 ?v=<version>，和新页面把版本写进路径（/assets/<version>/file）。
   // 路径写法只在**版本等于当前资产哈希**时发 immutable；部署前打开的旧页面仍能取到文件
   // （宁可给它当前字节，也不要 404 白屏），但只能 no-store——否则会把新字节写进旧版本的
@@ -1149,9 +1234,12 @@ function serveStatic (req, res, route, spec, assetVersion = null) {
     res.end()
     return
   }
-  if (useGzip) headers['Content-Encoding'] = 'gzip'
+  // Content-Length 显式写：writeHead 之后 Node 不再补，缺它就只能走 chunked。它与
+  // Content-Encoding 必须是**同一个表示**的（br 体的长度不能报成 gzip 的）。
+  if (encoding !== 'identity') headers['Content-Encoding'] = encoding
+  headers['Content-Length'] = String(variant.length)
   res.writeHead(200, headers)
-  res.end(useGzip ? entry.gzip : entry.raw)
+  res.end(variant)
 }
 
 // ── HTML 看板 ──────────────────────────────────────────────────────────────
@@ -6508,6 +6596,11 @@ module.exports = {
   // M1：控制台读的判重缓存文件名（pushUrl → 文件名，与运行侧 getFileName 同一实现）——对拍测试入口
   messagesCacheName,
   STATIC_ASSETS,
+  // v3.532 资产去注释：剥离函数与构建入口都导出，单测直接对拍「原始字节 vs 剥离后字节」
+  // （版本号按剥离后内容算，这条只能由测试来钉）。
+  buildAssetStore,
+  stripJsComments,
+  stripCssComments,
   finishRun,
   // R1 返工 #2：自动运行收尾判定（ok/failed/busy）——纯函数，供单测直接喂 record
   autoRunOutcome,
