@@ -19251,6 +19251,62 @@ async function main () {
     assert.strictEqual(oldCalls, 0, `定时器不得再跑「建表那次渲染」的旧 runTick 闭包（实际 ${oldCalls} 次 ⇒ 切页后非概览页不刷新）`)
     assert.strictEqual(newCalls, 1, `定时器必须调用最新的 runTick（实际 ${newCalls} 次）`)
   })
+
+  // v3.533 复查（W2 must_fix）：暂停分支（`if (!autoRefresh) { clearInterval…; timerRef.current = null;
+  // armedIntervalRef.current = 0 }`）是暂停时**唯一**的停表点，可上面两条重放只跑「正常 / authExpired」。
+  // 把整个暂停块删掉，全量仍 391 通过 / 0 失败——而真实源码重放是「暂停后 timers=1、armed=15000」⇒
+  // 用户点了暂停，主定时器仍每 15 s（busy 2 s）空打一对 /api/status + /api/runs。这里补第三条：
+  // 正常建表 → 暂停必须停表且残留回调一次都不许 runTick → 恢复必须恰好重建 1 个主定时器（防「armed
+  // 置 0 的守卫被改坏 ⇒ 暂停一次就永久停表」）。
+  await aok('行为: v3.533 暂停自动刷新时轮询 effect 必须停表，恢复时恰好重建 1 个主定时器', () => {
+    const h = pollEffectReplayOf(loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js')))
+    let runTicks = 0
+    const runTick = () => { runTicks += 1 }
+    const state = {
+      authExpired: false,
+      autoRefresh: true,
+      tab: 'overview',
+      interval: 15000,
+      scheduleRef: { current: null },
+      bootFetchedRef: { current: true },
+      refreshSplit: () => {},
+      intervalRef: { current: 15000 },
+      timerRef: { current: null },
+      setNextAt: () => {},
+      markRef: { current: null },
+      armedIntervalRef: { current: 0 },
+      runTickRef: { current: runTick },
+      resumeQuietUntilRef: { current: 0 },
+      runTick
+    }
+    const cleanup = h.run(state)
+    assert.strictEqual(h.timers.size, 1, `正常渲染必须恰好建 1 个主定时器（实际 ${h.timers.size}）`)
+    assert.strictEqual(state.armedIntervalRef.current, 15000, '正常渲染后 armedIntervalRef 必须记着已武装周期 15000')
+    const creationsBeforePause = h.intervalCreations()
+    // React 语义：点暂停 ⇒ autoRefresh=false 让本 effect 重跑（先跑上一次 cleanup，再跑这一次）。
+    cleanup()
+    const pausedCleanup = h.run({ ...state, autoRefresh: false })
+    assert.strictEqual(h.timers.size, 0,
+      `暂停后不得留下主定时器（实际 ${h.timers.size} 个仍在跑 ⇒ 点了暂停仍每 15 s 空打一对 /api/status + /api/runs）`)
+    assert.strictEqual(state.armedIntervalRef.current, 0,
+      '暂停后必须把 armedIntervalRef.current 置 0（否则恢复时守卫会跳过重建 ⇒ 暂停一次就永久停表）')
+    assert.strictEqual(state.timerRef.current, null, '暂停后 timerRef.current 必须归还为 null（不留悬空句柄）')
+    assert.strictEqual(h.intervalCreations(), creationsBeforePause, '暂停分支不得再新建定时器')
+    for (const fn of h.timers.values()) fn()
+    assert.strictEqual(runTicks, 0, `暂停后残留定时器不得再 runTick（实际 ${runTicks} 次 ⇒ 暂停后仍每 15 s 空打一对接口）`)
+    // 恢复：先跑暂停分支注册的 cleanup，再按 autoRefresh=true 重跑 effect ⇒ 必须恰好重建 1 个。
+    assert.strictEqual(typeof pausedCleanup, 'function', '暂停分支必须注册 cleanup（clearInterval(timerRef.current)）')
+    pausedCleanup()
+    const resumedCleanup = h.run({ ...state, autoRefresh: true })
+    assert.strictEqual(h.timers.size, 1,
+      `恢复自动刷新必须恰好重建 1 个主定时器（实际 ${h.timers.size} 个 ⇒ 把 armedIntervalRef 置 0 的守卫改坏就永久停表）`)
+    assert.strictEqual(state.armedIntervalRef.current, 15000, '恢复后 armedIntervalRef 必须重新记成 15000')
+    assert.strictEqual(typeof resumedCleanup, 'function', '恢复后必须注册 cleanup（摘 visibilitychange 监听）')
+    const resumed = [...h.timers.values()]
+    assert.strictEqual(resumed.length, 1)
+    resumed[0]()
+    assert.strictEqual(runTicks, 1, `恢复后的定时器必须恢复 runTick（实际 ${runTicks} 次）`)
+  })
 }
 
 // ── C5-030：收尾（分项汇总 + 泄漏闸 + 强退闸）两条路径共用 ──
