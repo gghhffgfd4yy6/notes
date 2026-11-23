@@ -4685,8 +4685,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 备份里所有「大小」判断都必须按 UTF-8 字节：String.length 会把一个中文/emoji 当 1，
   // 与 readSafeTextResult / writeAtomic 的真实字节上限不一致。
   const backupBytes = (text) => Buffer.byteLength(String(text), 'utf8')
-  const validBackupMessage = (m) => m && typeof m === 'object' && !Array.isArray(m) &&
-    (typeof m.title === 'string' || typeof m.content === 'string')
+  // `_f` 条目写盘已删正文（toDiskEntry）：只要 id（非空字符串/有限数字）+ url（非空字符串）身份齐全就算合法备份条目，否则整类 messages 被跳过/拒收
+  const validBackupMessage = (m) => m && typeof m === 'object' && !Array.isArray(m) && (typeof m.title === 'string' || typeof m.content === 'string' || (m._f === true && ((typeof m.id === 'string' && m.id !== '') || (typeof m.id === 'number' && Number.isFinite(m.id))) && typeof m.url === 'string' && m.url !== ''))
   const countBackupMessages = (items) => items.reduce((n, m) => n + (validBackupMessage(m) && m._f !== true ? 1 : 0), 0)
   const importKeyOf = (req) => {
     const raw = req && req.headers ? req.headers['idempotency-key'] : ''
@@ -5310,8 +5310,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
     })
   }
 
-  // POST /api/config/filter/preview：候选规则对 push.json 中 _f===true 记录试算补推数。
-  // 直接 readSafeTextResult + JSON.parse（**不能**用 status.readMessages：它会丢弃 _f）。
+  // POST /api/config/filter/preview：候选规则对 push.json 中 _f===true 记录试算补推数；直接 readSafeTextResult + JSON.parse（**不能**用 status.readMessages：它会丢弃 _f）。
   const handleFilterPreview = (req, res) => {
     readFilterJson(req).then((parsed) => {
       if (parsed.error) { sendJson(res, parsed.error.status, parsed.error.body); return }
@@ -5346,26 +5345,25 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         : FILTER_PREVIEW_SAMPLE_DEFAULT
       const read = readMergedRawMessages(stateDir, { filename: messagesFile, maxBytes: FILTER_PREVIEW_MAX_BYTES })
       const records = read.status === 'ok' ? read.items : null
-      // 读不到缓存（缺失/超限/坏 JSON/非数组）不能显示成「0 条影响」——那是把未知说成确定。
-      // 200 + available:false，计数一律 null，前端显示「无法读取推送历史，本次不显示补推估算」。
-      if (records === null) {
-        sendJson(res, 200, {
-          ok: true,
-          available: false,
-          code: 'cache_unavailable',
-          scanned: null,
-          capped: false,
-          cappedBy: null,
-          budgetMs: FilterStore.FILTER_PREVIEW_BUDGET_MS,
-          reEvalCount: null,
-          atLeast: false,
-          limit,
-          samples: [],
-          cacheStatus: read.status,
-          zktApplied: false
-        })
-        return
-      }
+      // 读不到缓存（缺失/超限/坏 JSON/非数组）/ 记录已瘦身无正文，都不能显示成「0 条影响」——那是把未知说成
+      // 确定：200 + available:false、计数一律 null，前端按 code 选文案。
+      const unavailablePreview = (code, extra) => sendJson(res, 200, {
+        ok: true,
+        available: false,
+        code,
+        scanned: null,
+        capped: false,
+        cappedBy: null,
+        budgetMs: FilterStore.FILTER_PREVIEW_BUDGET_MS,
+        reEvalCount: null,
+        atLeast: false,
+        limit,
+        samples: [],
+        cacheStatus: read.status,
+        zktApplied: false,
+        ...extra
+      })
+      if (records === null) { unavailablePreview('cache_unavailable'); return }
       // 扫描上限只作用于 _f 记录：capped 必须按 _f 条数判定（缓存总条数与补推估算无关）。
       const fRecords = records.filter((entry) => entry && typeof entry === 'object' && entry._f === true)
       // zkt_gjc 白名单与运行期同源（Config.keyword.zkt_gjc）：标题不匹配白名单的记录即使过了
@@ -5382,6 +5380,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
         },
         whitelistKeeps: (entry) => previewWhitelistKeeps(entry, zktRegex, deps.RuleEngine && deps.RuleEngine._normalizeReInput)
       })
+      // 无正文的 `_f`（写盘已瘦身，见 SYSTEM_CONTRACT）：正文类规则必然不命中 ⇒ 不给确定性数字。
+      if (scan.noBody > 0) { unavailablePreview('bodies_unavailable', { noBody: scan.noBody, zktApplied: zktRegex !== null }); return }
       sendJson(res, 200, {
         ok: true,
         available: true,

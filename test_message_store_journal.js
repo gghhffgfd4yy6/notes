@@ -428,12 +428,13 @@ check('J2-03 墓碑 + 崩溃回放：已落墓碑的裁剪条目不得靠 journa
   }
 })
 
-check('J2-04 同批「先插入后更新同一身份」：重启后 readMessages 必须与重启前逐条深比较一致（顺序+内容，无 _f 与含 _f 两式）', () => {
+check('J2-04 同批「先插入后更新同一身份」：重启后 readMessages 必须与重启前逐条深比较一致（顺序+内容，无 _f 与含 _f 两式；含 _f 一式按 v3.534「_f 优先淘汰」口径）', () => {
   // 审查 B 的 orderFlip 复现：写入顺序 ≠ 内存数组顺序。maxSize=5、journal 不合并 ⇒ 重启只能靠日志
   // 重建数组；回放对未命中项只能 push 到尾部，若 put 按写入顺序记（r 在前、p' 在后），重启后数组
   // 变成 [q,r,p']（修前实测），与内存的 [q,p',r] 不同 ⇒ 后续条数裁剪先裁谁也随之改变。
-  // 含 _f 一式再叠一层「先插入 f、再插入 x、最后更新 f」，并且第三批触发条数裁剪（a 被裁）——
-  // 被裁的身份必须进日志 drop，否则回放会把它放回数组。
+  // 含 _f 一式再叠一层「先插入 f、再插入 x、最后更新 f」，并且第三批触发条数裁剪——v3.534 起
+  // 条数淘汰 `_f` 优先 ⇒ 被裁的是 f（旧口径裁最旧的 a）。被裁身份必须进日志 drop，
+  // 否则回放会把它放回数组尾部、又去挤掉活条目。
   const clock = virtualClock()
   const NAME = 'push.json'
   const constants = { JOURNAL_DIRECT_MAX_BYTES: 0, JOURNAL_MAX_BYTES: 1 << 30 } // 不合并：顺序全靠日志自己承载
@@ -454,10 +455,14 @@ check('J2-04 同批「先插入后更新同一身份」：重启后 readMessages
       batches: [
         [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }, { id: 'c', title: 'C' }],
         [{ id: 'f', title: 'F', _f: true }, { id: 'x', title: 'X' }, { id: 'f', title: 'F2', _f: true }],
-        [{ id: 'y', title: 'Y' }] // 6 条 > 上限 5：最旧的 a 被裁（f 是 _f，不落墓碑，只能靠日志 drop）
+        // 6 条 > 上限 5。v3.534 口径：先淘汰 `_f`（f 从未推送、不落墓碑，规则变更后由上游整批重评），
+        // 已推送的 a/b/c/x 因此保命——旧口径「数组最旧优先」会在这里先裁掉 a，等于用 `_f` 洪峰
+        // 把已推送记录的判重记忆挤出上限（上游重放即重复推送）。被淘汰的 f 仍必须进日志 drop，
+        // 否则回放会把它放回尾部、又去挤活条目。
+        [{ id: 'y', title: 'Y' }]
       ],
-      expectIds: ['b', 'c', 'f', 'x', 'y'],
-      expectDropL3: ['a']
+      expectIds: ['a', 'b', 'c', 'x', 'y'],
+      expectDropL3: ['f']
     }
   ]
   try {
@@ -486,7 +491,10 @@ check('J2-04 同批「先插入后更新同一身份」：重启后 readMessages
         assert.strictEqual(reopened.has({ id: m.id, title: m.title }, NAME), true, `${c.tag}: 活条目 ${m.id} 的判重记忆不得丢失`)
       }
       // 被裁条目仍由墓碑拦下（_f 从不落墓碑：它只是「没被推送过」，回到上游应能重新评估）
-      if (c.tag === 'filtered') assert.strictEqual(reopened.has({ id: 'a' }, NAME), true, '已推送过的被裁条目仍须判重命中')
+      if (c.tag === 'filtered') {
+        assert.strictEqual(reopened.has({ id: 'a' }, NAME), true, '已推送过的 a 在 _f 优先口径下保命 ⇒ 判重必须命中（旧口径它会先被裁掉）')
+        assert.strictEqual(reopened.has({ id: 'f' }, NAME), false, '被淘汰的 _f（f）不得留下判重记忆：它从未推送，回到上游要能重新评估')
+      }
     }
   } finally {
     clock.restore()
@@ -988,6 +996,153 @@ check('J8-03 外部删除 .seen.json 后同进程不再用旧墓碑；外部新�
   assert.strictEqual(store._tombstoneSig[fp], store._tombstoneFileSig(fp),
     '本进程写墓碑后记录的签名必须与磁盘一致')
   assert.strictEqual(store._tombstoneHasIdentity(fp, { id: 'drop-1' }), true, '本进程刚写的墓碑必须命中')
+})
+
+// ============================================================
+section('9. v3.534：`_f` 写盘瘦身（journal 行同口径）')
+// ============================================================
+
+check('J9-01 journal 行的 _f put 已瘦身：日志不带 content/content_html，普通条目正文完整，重启后身份仍命中', () => {
+  const NAME = 'push.json'
+  const dir = tmpDir('slim-f-journal')
+  // 强制纯日志模式（小块直写会把整份快照写进 push.json、日志里什么都没有，等于没测到 journal 行）
+  const constants = { JOURNAL_DIRECT_MAX_BYTES: 0 }
+  const store = makeStore({ dir, maxSize: 100, constants })
+  const fp = store.getFilePath(NAME)
+  const jp = journalPathFor(fp)
+  const fBody = '过滤未推正文-'.repeat(40)
+  const fHtml = '<p>' + '过滤未推正文-'.repeat(40) + '</p>'
+  assert.strictEqual(store.saveBatch([
+    { id: 'f1', url: 'https://u.example/f1', title: 'F1', content: fBody, content_html: fHtml, _f: true },
+    { id: 'n1', url: 'https://u.example/n1', title: 'N1', content: '正常正文', content_html: '<p>正常正文</p>' }
+  ], NAME), true)
+  const put = journalPuts(readJournalRecords(jp)).filter((m) => m && m.id)
+  const f = put.find((m) => m.id === 'f1')
+  const n = put.find((m) => m.id === 'n1')
+  assert.ok(f && n, `journal 的 put 必须同时含 f1 与 n1（实际：${JSON.stringify(put.map((m) => m.id))}）`)
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(f, 'content'), false, 'journal 行里的 _f（id+url 齐全）不得带 content（否则新日志行把快照刚瘦掉的字节原样带回来）')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(f, 'content_html'), false, 'journal 行里的 _f 不得带 content_html')
+  assert.strictEqual(f.url, 'https://u.example/f1', '身份字段 url 必须原样保留')
+  assert.strictEqual(f._f, true, '_f 标记必须保留（规则变更时靠它整批重评）')
+  assert.strictEqual(n.content, '正常正文', '普通条目的 content 必须逐字完整')
+  assert.strictEqual(n.content_html, '<p>正常正文</p>', '普通条目的 content_html 必须逐字完整')
+  // 最后一条兜底：journal 文件**整体**不得残留 _f 正文。判据落在解析后的结构上，而不是文件文本片段——
+  // ① 逐行 JSON.parse（非空行必须全部可解析 ⇒ 同时证明文件里没有非 JSON 垃圾行）；
+  // ② 递归收集每条记录里的全部字符串值（含嵌套对象/数组，覆盖 content/content_html 与任何新字段），
+  //    断言没有任何一个字符串包含正文标记（不是只查两个已知键，新加的正文类字段同样会被兜住）；
+  // ③ 字节量级：无正文时整份 journal 几百字节，f1 的 content+content_html（各 ~840 B）一旦残留会让
+  //    体积翻数倍，故用体积上限兜住「解析看不到但字节还在」的形态（量纲比较不计入源码文本断言）。
+  const F_BODY_MARK = '过滤未推正文'
+  const journalLines = fs.readFileSync(jp, 'utf8').split('\n').filter((line) => line.trim().length > 0)
+  assert.ok(journalLines.length >= 1, `journal 必须至少有一行非空记录（实际 ${journalLines.length}）`)
+  const journalLinesParsed = journalLines.map((line, index) => {
+    try {
+      return JSON.parse(line)
+    } catch (e) {
+      return assert.fail(`journal 第 ${index + 1} 个非空行不是合法 JSON（journal 里不得有非 JSON 垃圾行）：${e.message}`)
+    }
+  })
+  const allStrings = (value, out = []) => {
+    if (typeof value === 'string') out.push(value)
+    else if (Array.isArray(value)) value.forEach((item) => allStrings(item, out))
+    else if (value && typeof value === 'object') Object.keys(value).forEach((key) => allStrings(value[key], out))
+    return out
+  }
+  const journalStrings = allStrings(journalLinesParsed)
+  // 正控：递归遍历必须真的走到正文位置（否则下面的「没有残留」是空断言，遍历写错也能全绿）
+  assert.ok(journalStrings.some((s) => s === '正常正文'),
+    `递归收集必须覆盖到普通条目的正文（实收 ${journalStrings.length} 个字符串）；否则「无残留」是空断言`)
+  const leaked = journalStrings.filter((s) => s.indexOf(F_BODY_MARK) !== -1)
+  assert.deepStrictEqual(leaked.map((s) => s.slice(0, 40)), [],
+    'journal 记录里不得有任何字符串携带 _f 正文（含嵌套字段）')
+  const journalBytes = fs.statSync(jp).size
+  assert.ok(journalBytes < 1024,
+    `journal 字节必须在无正文上限内（实测 ${journalBytes} B；f1 的 content+content_html 残留约 +1.5 KB）`)
+  for (const rec of journalPuts(journalLinesParsed).filter((m) => m && m._f === true)) {
+    const recBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8')
+    assert.ok(recBytes < 400, `_f 条目的 journal 记录不得携带正文（实测 ${recBytes} B，无正文时约 100 B）`)
+  }
+  // 重启（新进程语义，只能靠 journal 回放重建）：瘦身不碰 id/url ⇒ 身份必须仍命中
+  const reopened = makeStore({ dir, maxSize: 100, constants })
+  assert.strictEqual(reopened.has({ id: 'f1', url: 'https://u.example/f1' }, NAME), true, '重启后 _f 身份必须仍可判重命中')
+  assert.strictEqual(reopened.has({ id: 'n1' }, NAME), true, '重启后普通条目身份必须仍可判重命中')
+  const after = reopened.readMessages(fp)
+  assert.deepStrictEqual(after.map((m) => m.id), ['f1', 'n1'], '回放后的顺序与条目集合不得变化')
+  assert.strictEqual(after.find((m) => m.id === 'n1').content, '正常正文', '回放后普通条目正文仍完整')
+  // 合并写快照（_compact）也必须走同一份投影：磁盘上不能出现「日志瘦、快照胖」。
+  // 这里喂的必须是**内存里带正文的 `_f`**（`_memoSet` 里存的就是原对象）：上面的 `after` 来自
+  // journal 回放、本来就没有 content/content_html，拿它喂 `_compact` 是自证断言——`_compact`
+  // 就算完全不投影，落盘快照照样无正文，这只用例照样全绿（B 路复查指出的缺陷）。
+  const inMemory = [
+    { id: 'f1', url: 'https://u.example/f1', _f: true, content: fBody, content_html: fHtml },
+    { id: 'n1', content: '正常正文', content_html: '<p>正常正文</p>' }
+  ]
+  assert.strictEqual(reopened._compact(fp, inMemory), true, '合并必须成功')
+  const snap = JSON.parse(fs.readFileSync(fp, 'utf8'))
+  assert.strictEqual(snap.length, 2, '合并后的快照必须含两条')
+  const snapF = snap.find((m) => m.id === 'f1')
+  assert.ok(snapF, `合并后的快照必须含 f1（实际：${JSON.stringify(snap.map((m) => m.id))}）`)
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(snapF, 'content'), false, '合并写快照时 _f 同样不得带 content（喂的是内存里带正文的原对象）')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(snapF, 'content_html'), false, '合并写快照时 _f 同样不得带 content_html')
+  assert.strictEqual(snapF.url, 'https://u.example/f1', '合并写快照后 _f 的身份字段 url 必须原样保留')
+  assert.strictEqual(snapF._f, true, '合并写快照后 _f 标记必须保留')
+  // 与 journal 侧同一口径：递归收集快照里的全部字符串值（含嵌套字段），不得有任何一处携带 _f 正文
+  const snapStrings = allStrings(snap)
+  assert.ok(snapStrings.some((s) => s === '正常正文'),
+    `递归收集必须覆盖到普通条目的正文（实收 ${snapStrings.length} 个字符串）；否则下面的「无残留」是空断言`)
+  assert.deepStrictEqual(snapStrings.filter((s) => s.indexOf(F_BODY_MARK) !== -1).map((s) => s.slice(0, 40)), [],
+    '合并后的快照里不得有任何字符串携带 _f 正文（含嵌套字段）')
+  assert.strictEqual(snap.find((m) => m.id === 'n1').content, '正常正文', '快照里普通条目正文必须完整')
+  assert.strictEqual(snap.find((m) => m.id === 'n1').content_html, '<p>正常正文</p>', '快照里普通条目 content_html 必须完整')
+  // 回放（新实例，只能读磁盘快照）：顺序、正文、判重身份都不得因合并而变
+  const reread = makeStore({ dir, maxSize: 100, constants })
+  const replayed = reread.readMessages(fp)
+  assert.deepStrictEqual(replayed.map((m) => m.id), ['f1', 'n1'], '合并写快照后回放的顺序与条目集合不得变化')
+  assert.strictEqual(replayed.find((m) => m.id === 'n1').content, '正常正文', '合并后普通条目正文回放仍完整')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(replayed.find((m) => m.id === 'f1'), 'content'), false, '合并后的磁盘快照回放时 _f 仍无正文')
+  assert.strictEqual(reread.has({ id: 'f1', url: 'https://u.example/f1' }, NAME), true, '合并后 _f 身份仍可判重命中')
+  assert.strictEqual(reread.has({ id: 'n1' }, NAME), true, '合并后普通条目身份仍可判重命中')
+})
+
+check('J9-02 读端兜底裁剪（maxSize 下调 + journal 回放）必须与写路径同口径：_f 先出局、已推送条目不被挤掉', () => {
+  const NAME = 'push.json'
+  // 直接写快照 + 手写 journal 行（不经 store），避免写路径自己先裁一遍把现场做平。
+  const setup = (tag) => {
+    const dir = tmpDir('trim-f-' + tag)
+    const fp = path.join(dir, NAME)
+    fs.writeFileSync(fp, JSON.stringify([
+      { id: 'a', title: 'A' },
+      { id: 'b', title: 'B' },
+      { id: 'f', url: 'https://u.example/f', title: 'F', _f: true }
+    ]))
+    fs.writeFileSync(journalPathFor(fp), JSON.stringify({ v: 2, at: 100, put: [{ id: 'c', title: 'C' }] }) + '\n')
+    return { dir, fp }
+  }
+  // 场景 1：上限 3、回放后 4 条 ⇒ 只超 1 条，必须淘汰 `_f`（f），不能动数组最旧的活条目 a。
+  // 修前实测：返回 ['b','f','c']（a 被误删并落墓碑）——等于让 `_f` 挤掉已推送记录的判重记忆。
+  {
+    const { dir, fp } = setup('keep')
+    const beforeBytes = fs.readFileSync(fp)
+    const store = makeStore({ dir, maxSize: 3 })
+    const got = store.readMessages(fp)
+    assert.deepStrictEqual(got.map((m) => m.id), ['a', 'b', 'c'],
+      '上限 3 + 回放 1 条：必须先淘汰 _f，已推送的 a/b 保命')
+    assert.strictEqual(store.has({ id: 'a' }, NAME), true, '活条目 a 的判重记忆不得丢失')
+    assert.strictEqual(store.has({ id: 'b' }, NAME), true, '活条目 b 的判重记忆不得丢失')
+    assert.strictEqual(store.has({ id: 'f' }, NAME), false, '被淘汰的 _f 不落墓碑：回到上游要能重新评估')
+    assert.deepStrictEqual(fs.readFileSync(fp), beforeBytes, '读路径不得写盘（push.json 字节不变）')
+  }
+  // 场景 2：上限 2、回放后 4 条 ⇒ 两个名额：`_f` 先出局，不足再按数组序取最旧的 a（必须落墓碑）。
+  {
+    const { dir, fp } = setup('drop')
+    const beforeBytes = fs.readFileSync(fp)
+    const store = makeStore({ dir, maxSize: 2 })
+    const got = store.readMessages(fp)
+    assert.deepStrictEqual(got.map((m) => m.id), ['b', 'c'], '上限 2：_f 先出局，再从最旧的活条目收敛到上限')
+    assert.strictEqual(store.has({ id: 'a' }, NAME), true, '被读端裁掉的活条目 a 必须由墓碑拦下（fail-closed）')
+    assert.strictEqual(store.has({ id: 'f' }, NAME), false, '被淘汰的 _f 不落墓碑')
+    assert.deepStrictEqual(fs.readFileSync(fp), beforeBytes, '读路径不得写盘（push.json 字节不变）')
+  }
 })
 
 // ============================================================

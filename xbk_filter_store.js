@@ -731,7 +731,7 @@ function computeDerivedReadLimits (input) {
  *   evaluate(entry) → {passed:boolean, reason?:string} | null（抛错按 null = 未通过处理）
  *   whitelistKeeps(entry) → boolean（默认全部保留；运行期 zkt_gjc 白名单从这里接）
  * @returns {{scanned:number, capped:boolean, cappedBy:('records'|'time'|'max'|null), budgetMs:number,
- *            reEvalCount:number, samples:Array, elapsedMs:number}}
+ *            reEvalCount:number, noBody:number, samples:Array, elapsedMs:number}}
  */
 function scanPreviewRecords ({
   records, limit, evaluate, whitelistKeeps = null,
@@ -743,6 +743,7 @@ function scanPreviewRecords ({
   const startedAt = now()
   let scanned = 0
   let reEvalCount = 0
+  let noBody = 0
   let cappedBy = null
   const samples = []
   for (const entry of list) {
@@ -752,6 +753,10 @@ function scanPreviewRecords ({
     if (scanned >= maxRecords) { cappedBy = 'records'; break }
     if (now() - startedAt >= budgetMs) { cappedBy = 'time'; break }
     scanned++
+    // 无正文的条目单独计数（诊断用）：预览靠 explainFilter 逐条重判，正文类规则（线上
+    // pingbineirong / zhanxianneirong 非空）缺 content / content_html 时必然不命中 ⇒ 任何数字
+    // 都是系统性偏高。这个计数只用于让调用方如实回「不可用」，不参与判定。
+    if (!hasRecordBody(entry)) noBody++
     let verdict = null
     try { verdict = evaluate(entry) } catch (e) { verdict = null }
     if (!verdict || verdict.passed !== true) continue
@@ -771,9 +776,24 @@ function scanPreviewRecords ({
     cappedBy,
     budgetMs,
     reEvalCount,
+    noBody,
     samples,
     elapsedMs: now() - startedAt
   }
+}
+
+/**
+ * 记录是否带正文。`_f` 条目的写盘投影（xbk_message_store.toDiskEntry）会删掉 `content` /
+ * `content_html` 两个键——此时 explainFilter 的正文类规则永远不命中，补推估算没有意义。
+ * 口径钉死为「缺键才算无正文」：`content: ''` 是**有正文**（空正文照样是一条可判定的记录），
+ * 显式 null/undefined 也按无正文处理（旧投影外的脏数据不该被算成有正文）。
+ * @param {any} entry
+ * @returns {boolean}
+ */
+function hasRecordBody (entry) {
+  if (!entry || typeof entry !== 'object') return false
+  return ['content', 'content_html'].some((key) =>
+    Object.prototype.hasOwnProperty.call(entry, key) && entry[key] !== undefined && entry[key] !== null)
 }
 
 /**

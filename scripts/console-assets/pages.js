@@ -4420,9 +4420,12 @@ function fieldErrorMap (errors) {
 // 冒充补推数：扫 200 条、0 条命中时那样会说成「≥200」，把 0 虚报成 200。也**不得再写死 5000**
 // （旧文案会谎报「≥5000」，而预算先到的是 200 条/200ms）。
 // 缓存读不到时服务端回 available:false（scanned/reEvalCount 为 null）——此时显示「未知」，
-// 不能把 null 格式化成 0 条（那等于把「读不到」说成「没有影响」）。
+// 不能把 null 格式化成 0 条（那等于把「读不到」说成「没有影响」）。两种降级文案分开：
+// code==='bodies_unavailable' 是「记录已瘦身、缺正文」（可用计数为 0 但正文类规则判不了），
+// 其余（cache_unavailable 等）是「推送历史读不到」。两者都不得显示条数。
+// 两句都必须是**这个分支直接 return 的返回值**（结构红线按 AST 检查，不得外提到辅助函数）。
 function reEvalText (preview) {
-  if (preview && preview.available === false) return '无法读取推送历史，本次不显示补推估算'
+  if (preview && preview.available === false) return preview.code === 'bodies_unavailable' ? '旧记录已瘦身（无正文），无法估算本次补推数量' : '无法读取推送历史，本次不显示补推估算'
   const n = preview && preview.capped === true ? `≥${fmtNum(preview.reEvalCount)}` : fmtNum(preview ? preview.reEvalCount : null)
   return `将重评 ${n} 条历史被过滤记录，后续每轮最多补推 Config.push.maxPerRun（默认 100）条。`
 }
@@ -5289,7 +5292,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
           <div class="fr-preview-head">补推影响</div>
           <div class="fr-preview-main">${reEvalText(preview)}</div>
           ${preview.available === false
-            ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
+            ? html`<div class="fr-preview-meta">${preview.code === 'bodies_unavailable'
+              ? `已瘦身 ${fmtNum(preview.noBody)} 条历史记录无正文（写盘时省略 content/content_html）· 缓存读取 ${preview.cacheStatus || '—'}`
+              : `缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）`}</div>`
             : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（已达单次扫描预算，实际可能更多）' : ''}</div>`}
         </div>
         ${wide.length > 0 && html`<div class="fr-wide-warn" role="alert">
@@ -5486,7 +5491,9 @@ function FilterRulesPanel ({ onSync, active = true, pollTick = 0, guardRef, onLe
         <div class="fr-preview-head">补推影响预览</div>
         <div class="fr-preview-main">${reEvalText(preview)}</div>
         ${preview.available === false
-          ? html`<div class="fr-preview-meta">缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）</div>`
+          ? html`<div class="fr-preview-meta">${preview.code === 'bodies_unavailable'
+            ? `已瘦身 ${fmtNum(preview.noBody)} 条历史记录无正文（写盘时省略 content/content_html）· 缓存读取 ${preview.cacheStatus || '—'}`
+            : `缓存读取 ${preview.cacheStatus || '—'}（${preview.code || 'cache_unavailable'}）`}</div>`
           : html`<div class="fr-preview-meta">已扫描 ${fmtNum(preview.scanned)} 条历史被过滤记录${preview.capped ? '（已达单次扫描预算，实际可能更多）' : ''}${preview.zktApplied === true ? ' · 已按 zkt_gjc 白名单排除不匹配标题' : ''} · 缓存读取 ${preview.cacheStatus || '—'}</div>`}
         ${Array.isArray(preview.samples) && preview.samples.length > 0 && html`<ul class="fr-samples">
           ${preview.samples.map((s, i) => html`<li key=${s && s.id !== null && s.id !== undefined ? String(s.id) : `sample-${i}`}>

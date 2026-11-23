@@ -3671,6 +3671,46 @@ async function filterRuleApiTests () {
     } finally { server.close() }
   })
 
+  await aok('过滤规则 preview: _f 记录缺正文（写盘已瘦身）→ available:false / bodies_unavailable，计数全 null', async () => {
+    const dir = mkTmp('xbk-console-filter-')
+    const { server, port } = await filterServer(dir)
+    const pushPath = path.join(dir, 'push.json')
+    const nowS = Math.floor(Date.now() / 1000)
+    try {
+      // ① 有正文（含 content:''）⇒ 正常估算。这条是对照面：去掉 noBody 判定后它仍必须绿，
+      //    说明新分支只对「真的没有正文」的记录生效。
+      fs.writeFileSync(pushPath, JSON.stringify([
+        { id: '1', title: '有正文', content: '正文字样', catename: '', shijianchuo: nowS, _f: true },
+        { id: '2', title: '空正文', content: '', catename: '', shijianchuo: nowS, _f: true }
+      ]))
+      const okBody = JSON.parse((await postFilterJson(port, '/api/config/filter/preview', { filter: {}, limit: 10 })).text)
+      assert.strictEqual(okBody.available, true, "content:'' 算有正文 ⇒ 仍按正常估算返回")
+      assert.strictEqual(typeof okBody.reEvalCount, 'number')
+      assert.strictEqual(okBody.scanned, 2, '两条都算扫过（空串正文照样可判定）')
+
+      // ② 写盘投影后的 _f（只剩身份，无 content / content_html）⇒ 不得给确定性数字。
+      fs.writeFileSync(pushPath, JSON.stringify([
+        { id: '1', title: '甲', url: 'https://e/1', catename: '', shijianchuo: nowS, _f: true },
+        { id: '2', title: '乙', url: 'https://e/2', catename: '', shijianchuo: nowS, _f: true },
+        { id: '3', title: '丙', content: '', catename: '', shijianchuo: nowS, _f: true }
+      ]))
+      const res = await postFilterJson(port, '/api/config/filter/preview', { filter: {}, limit: 10 })
+      assert.strictEqual(res.status, 200, '无正文是可预期降级，不是请求错误')
+      const body = JSON.parse(res.text)
+      assert.strictEqual(body.available, false)
+      assert.strictEqual(body.code, 'bodies_unavailable')
+      assert.strictEqual(body.scanned, null, '扫过但判不了正文：不得把扫描条数当成确定值下发')
+      assert.strictEqual(body.reEvalCount, null, 'reEvalCount 必须是 null（正文类规则必然不命中，数字只会偏低）')
+      assert.strictEqual(body.atLeast, false)
+      assert.deepStrictEqual(body.samples, [])
+      assert.strictEqual(body.capped, false, '不可用路径 capped/cappedBy 归零')
+      assert.strictEqual(body.cappedBy, null)
+      assert.strictEqual(body.noBody, 2, "同时缺 content 与 content_html 的 2 条必须被数出来（第 3 条 content:'' 不算）")
+      assert.strictEqual(body.cacheStatus, 'ok', '缓存本身读到了：降级原因必须与「读不到历史」区分')
+      assert.strictEqual(typeof body.budgetMs, 'number', '预算仍如实下发（诊断用）')
+    } finally { server.close() }
+  })
+
   // 前端对接的结构红线（HTTP 用例测不到 app.js 的渲染分支，只能断言渲染结构与调用形状）。
   // 全部改成 AST/标记断言：文案必须是**那个分支的返回值**、对象必须带那个键、模板必须绑那个
   // 表达式——注释里写同一句不再算数（旧的 `js.includes(...)` 会被注释满足）。
@@ -3721,12 +3761,34 @@ async function filterRuleApiTests () {
     assert.strictEqual(exactArg.type, 'ConditionalExpression', 'preview 可能为 null：必须先判 preview 再取 reEvalCount')
     assert.strictEqual(memberPath(exactArg.consequent), 'preview.reEvalCount', '非 capped 分支必须取精确的 preview.reEvalCount')
     assert.strictEqual(exactArg.alternate.value, null, 'preview 缺失时与旧行为一致落 null（fmtNum 负责「—」）')
+    // ①a 两种降级必须分开说（v3.534 复查 must_fix）：`bodies_unavailable` 是「记录已瘦身、缺正文」，
+    //    与 cache_unavailable（推送历史读不到）不是一回事；把新文案改回旧文案、或去掉 code 分支，这条即红。
+    const bodyCond = findFirst(first.consequent, (n) => n.type === 'ConditionalExpression' &&
+      n.test.type === 'BinaryExpression' && n.test.operator === '===' &&
+      memberPath(n.test.left) === 'preview.code' && n.test.right.value === 'bodies_unavailable')
+    assert.ok(bodyCond, "reEvalText 的不可用分支必须按 preview.code === 'bodies_unavailable' 分文案")
+    assert.ok(stringValuesOf(bodyCond.consequent).some((text) => text.includes('已瘦身') && text.includes('无法估算')),
+      'bodies_unavailable 必须说明「旧记录已瘦身…无法估算本次补推数量」，不得复用「读不到历史」的说法')
+    assert.ok(stringValuesOf(bodyCond.alternate).includes('无法读取推送历史，本次不显示补推估算'),
+      '其余不可用（cache_unavailable 等）必须仍用「无法读取推送历史」原文案')
     // ② 渲染面至少两处按 available===false 分支（预览面板 + 保存前提示）。
     const unavailableBranches = findAll(pages, (n) => n.type === 'ConditionalExpression' &&
       n.test.type === 'BinaryExpression' && n.test.operator === '===' &&
       memberPath(n.test.left) === 'preview.available' && n.test.right.type === 'Literal' && n.test.right.value === false)
     assert.ok(unavailableBranches.length >= 2,
       `预览面板与保存前提示都必须先判 preview.available === false（实际 ${unavailableBranches.length} 处）`)
+    // ②b meta 行必须把 bodies_unavailable 说人话（条数 + 「已瘦身/无正文」），不能只丢一个机器码。
+    for (const branch of unavailableBranches) {
+      const metaCond = findFirst(branch.consequent, (n) => n.type === 'ConditionalExpression' &&
+        n.test.type === 'BinaryExpression' && n.test.operator === '===' &&
+        memberPath(n.test.left) === 'preview.code' && n.test.right.value === 'bodies_unavailable')
+      assert.ok(metaCond, '两处预览 meta 行都必须按 code 区分 bodies_unavailable')
+      const metaTexts = stringValuesOf(metaCond.consequent)
+      assert.ok(metaTexts.some((text) => text.includes('已瘦身')) && metaTexts.some((text) => text.includes('无正文')),
+        'meta 行必须写明「已瘦身 / 无正文」（改回旧文案只剩 code 即红）')
+      assert.ok(findAll(metaCond.consequent, (n) => memberPath(n) === 'preview.noBody').length >= 1,
+        'meta 行必须显示 noBody 条数（诊断：有多少条被瘦身）')
+    }
     // ③ 回滚请求必须把页面加载时的 baseRevision 与 confirm 一起提交（漏了就会在陈旧页面上覆盖别人）。
     const restoreCalls = callSites(pages, 'apiPostFilterRestore')
     assert.strictEqual(restoreCalls.length, 1, '回滚只能有一个提交点（apiPostFilterRestore）')
@@ -3925,6 +3987,50 @@ async function backupApiTests () {
       assert.strictEqual(failed.status, 500, failed.text)
       assert.strictEqual(JSON.parse(failed.text).rolledBack, true, '回滚必须成功')
       assert.strictEqual(fs.readFileSync(pushPath, 'utf8'), JSON.stringify([{ id: 1, title: 'old' }]), '失败导入不得留下半套数据')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: _f 瘦身条目（无正文、身份齐全）不得让整类 messages 被跳过 / 拒收', async () => {
+    const dir = mkTmp('xbk-console-backup-')
+    const pushPath = path.join(dir, 'push.json')
+    // 模拟 v3.534 写盘投影后的真实磁盘形态：`_f` 条目的 content/content_html 已被 toDiskEntry 删掉，
+    // 上游「(无标题线报)」这类条目连 title 都没有 ⇒ 只剩 id/url 身份。它仍是合法备份条目。
+    const slim = [
+      { id: 'f-1', url: 'https://u.example/f-1', _f: true },
+      { id: 'n1', url: 'https://u.example/n1', title: 'n1', content: '正常正文' }
+    ]
+    fs.writeFileSync(pushPath, JSON.stringify(slim))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const exp = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(exp.status, 200, exp.text)
+      const bundle = JSON.parse(exp.text)
+      assert.ok(bundle.data.messages,
+        `瘦身后的 _f 条目不得让整类 messages 被跳过（实际 skipped：${JSON.stringify(bundle.skipped)}）`)
+      assert.deepStrictEqual(bundle.skipped.filter((s) => s.key === 'messages'), [], '导出不得报告 messages 被跳过')
+      assert.strictEqual(exp.headers['x-backup-skipped'] || '', '', 'X-Backup-Skipped 不得含 messages')
+      assert.strictEqual(bundle.data.messages.count, 1, '统计仍只计已推送条目（_f 不计入 count）')
+      const backedUp = JSON.parse(bundle.data.messages.text)
+      assert.deepStrictEqual(backedUp.map((m) => m.id), ['f-1', 'n1'],
+        '备份必须带上 _f 身份（缺了它，换机恢复后上游重放会重复推送）')
+      // 同一份备份必须能导回：判据与导出同源，否则用户看到「导出成功、恢复 400」。
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, imp.text)
+      assert.strictEqual(JSON.parse(imp.text).imported.messages, 1, '导入计数与导出 count 同口径')
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(pushPath, 'utf8')).map((m) => m.id), ['f-1', 'n1'],
+        '导入后 push.json 必须仍含两个 id（身份齐全的 _f 条目不得被拒收）')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
