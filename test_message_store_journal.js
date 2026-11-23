@@ -1026,7 +1026,42 @@ check('J9-01 journal 行的 _f put 已瘦身：日志不带 content/content_html
   assert.strictEqual(f._f, true, '_f 标记必须保留（规则变更时靠它整批重评）')
   assert.strictEqual(n.content, '正常正文', '普通条目的 content 必须逐字完整')
   assert.strictEqual(n.content_html, '<p>正常正文</p>', '普通条目的 content_html 必须逐字完整')
-  assert.ok(!fs.readFileSync(jp, 'utf8').includes('过滤未推正文'), 'journal 文件整体不得残留 _f 正文（整行级兜底）')
+  // 最后一条兜底：journal 文件**整体**不得残留 _f 正文。判据落在解析后的结构上，而不是文件文本片段——
+  // ① 逐行 JSON.parse（非空行必须全部可解析 ⇒ 同时证明文件里没有非 JSON 垃圾行）；
+  // ② 递归收集每条记录里的全部字符串值（含嵌套对象/数组，覆盖 content/content_html 与任何新字段），
+  //    断言没有任何一个字符串包含正文标记（不是只查两个已知键，新加的正文类字段同样会被兜住）；
+  // ③ 字节量级：无正文时整份 journal 几百字节，f1 的 content+content_html（各 ~840 B）一旦残留会让
+  //    体积翻数倍，故用体积上限兜住「解析看不到但字节还在」的形态（量纲比较不计入源码文本断言）。
+  const F_BODY_MARK = '过滤未推正文'
+  const journalLines = fs.readFileSync(jp, 'utf8').split('\n').filter((line) => line.trim().length > 0)
+  assert.ok(journalLines.length >= 1, `journal 必须至少有一行非空记录（实际 ${journalLines.length}）`)
+  const journalLinesParsed = journalLines.map((line, index) => {
+    try {
+      return JSON.parse(line)
+    } catch (e) {
+      return assert.fail(`journal 第 ${index + 1} 个非空行不是合法 JSON（journal 里不得有非 JSON 垃圾行）：${e.message}`)
+    }
+  })
+  const allStrings = (value, out = []) => {
+    if (typeof value === 'string') out.push(value)
+    else if (Array.isArray(value)) value.forEach((item) => allStrings(item, out))
+    else if (value && typeof value === 'object') Object.keys(value).forEach((key) => allStrings(value[key], out))
+    return out
+  }
+  const journalStrings = allStrings(journalLinesParsed)
+  // 正控：递归遍历必须真的走到正文位置（否则下面的「没有残留」是空断言，遍历写错也能全绿）
+  assert.ok(journalStrings.some((s) => s === '正常正文'),
+    `递归收集必须覆盖到普通条目的正文（实收 ${journalStrings.length} 个字符串）；否则「无残留」是空断言`)
+  const leaked = journalStrings.filter((s) => s.indexOf(F_BODY_MARK) !== -1)
+  assert.deepStrictEqual(leaked.map((s) => s.slice(0, 40)), [],
+    'journal 记录里不得有任何字符串携带 _f 正文（含嵌套字段）')
+  const journalBytes = fs.statSync(jp).size
+  assert.ok(journalBytes < 1024,
+    `journal 字节必须在无正文上限内（实测 ${journalBytes} B；f1 的 content+content_html 残留约 +1.5 KB）`)
+  for (const rec of journalPuts(journalLinesParsed).filter((m) => m && m._f === true)) {
+    const recBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8')
+    assert.ok(recBytes < 400, `_f 条目的 journal 记录不得携带正文（实测 ${recBytes} B，无正文时约 100 B）`)
+  }
   // 重启（新进程语义，只能靠 journal 回放重建）：瘦身不碰 id/url ⇒ 身份必须仍命中
   const reopened = makeStore({ dir, maxSize: 100, constants })
   assert.strictEqual(reopened.has({ id: 'f1', url: 'https://u.example/f1' }, NAME), true, '重启后 _f 身份必须仍可判重命中')
