@@ -2867,6 +2867,49 @@ test('F2-2 preview 预算：条数 200 先到、小样本完整、时间预算�
   assert.strictEqual(mixed.reEvalCount, 2, '抛错(1) 与白名单拦截(2) 不计入补推数')
 })
 
+test('F2-2b scanPreviewRecords 无正文计数：缺 content/content_html 逐条累计，content:"" 算有正文', () => {
+  const pass = () => ({ passed: true, reason: 'ok' })
+  const withBody = scanPreviewRecords({
+    records: [
+      { id: '1', title: 'a', content: '' },
+      { id: '2', title: 'b', content_html: '<p>x</p>' },
+      { id: '3', title: 'c', content: '正文' }
+    ],
+    limit: 5,
+    evaluate: pass
+  })
+  assert.strictEqual(withBody.noBody, 0,
+    'content:"" 算有正文：既有夹具都是空串正文，把他们算成瘦身会让预览无条件变成不可用')
+  assert.strictEqual(withBody.scanned, 3)
+
+  // 写盘投影后的 `_f`：只剩身份（无 content / content_html），逐条计入 noBody。
+  const projected = scanPreviewRecords({
+    records: [
+      { id: '1', title: 'a', url: 'https://e/1', _f: true },
+      { id: '2', title: 'b', url: 'https://e/2', _f: true, content_html: '' },
+      { id: '3', title: 'c', url: 'https://e/3', _f: true }
+    ],
+    limit: 5,
+    evaluate: pass
+  })
+  assert.strictEqual(projected.noBody, 2, '缺两键的逐条累计；带 content_html 键（哪怕是空串）的算有正文')
+  assert.strictEqual(projected.scanned, 3, 'noBody 不影响「扫过」的计数')
+
+  // 扫描窗口：预算先到时只统计窗口内的条目（窗口外的条目不计入 noBody）。
+  const many = Array.from({ length: 10 }, (_, i) => ({ id: String(i), title: `t${i}` }))
+  const capped = scanPreviewRecords({ records: many, limit: 5, evaluate: pass, maxRecords: 4 })
+  assert.deepStrictEqual([capped.scanned, capped.noBody, capped.cappedBy], [4, 4, 'records'],
+    'noBody 只统计扫描窗口内实际扫到的条目')
+
+  // 显式 null/undefined 的正文值按无正文（脏数据不得冒充「有正文」）。
+  const nullish = scanPreviewRecords({ records: [{ id: '1', title: 'a', content: null }], limit: 5, evaluate: pass })
+  assert.strictEqual(nullish.noBody, 1, 'content:null 没有可判定的正文')
+
+  // 有正文时 noBody 恒为 0（既有预算用例的语义不受影响）。
+  const empty = scanPreviewRecords({ records: [], limit: 5, evaluate: pass })
+  assert.deepStrictEqual([empty.scanned, empty.noBody], [0, 0])
+})
+
 test('F2-5 limits/usage 报告：上限与 FILTER_LIMITS 同源 + 规则文件字节数/各字段字符数', () => {
   const dir = makeDir()
   const paths = filterRulesPaths(dir)
