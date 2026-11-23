@@ -19089,6 +19089,9 @@ async function main () {
     const src = uiModel.code.slice(pollEffect.arguments[0].start, pollEffect.arguments[0].end)
     const timers = new Map()
     let seq = 0
+    // setInterval 的创建次数：只比 Map.size 抓不到「清旧 + 建新」（重建后 size 仍是 1），
+    // 所以重建型回归要同时看句柄身份与这个计数。
+    let intervalCreations = 0
     const doc = {
       hidden: false,
       visibilityState: 'visible',
@@ -19105,6 +19108,7 @@ async function main () {
     }
     const setIntervalImpl = (fn, ms) => {
       const handle = { id: ++seq, ms }
+      intervalCreations += 1
       timers.set(handle, fn)
       return handle
     }
@@ -19116,6 +19120,7 @@ async function main () {
     return {
       timers,
       doc,
+      intervalCreations: () => intervalCreations,
       run (state) {
         return factory(
           state.authExpired === true, state.autoRefresh !== false, state.tab,
@@ -19126,6 +19131,37 @@ async function main () {
         )()
       }
     }
+  }
+
+  // v3.533 复查（W2 must_fix）：上面两条重放用例原先用手改 `runTickRef.current = () => …` 假装
+  // 「App 的 ref 同步 effect 已经跑过」，可全仓没有用例驱动那条真实接线——把 ui.js 的
+  // `useEffect(() => { runTickRef.current = runTick }, [runTick])` 整条删掉，用例照样全绿，
+  // 而线上定时器会永远跑首渲染的旧 runTick（切页后非概览页静默不刷新，正是本轮修的 bug）。
+  // 这里把它同时做成结构红线与真实源码重放：AST 上必须**恰好一处**「回调体里把
+  // runTickRef.current 赋成 runTick、依赖数组恰好 [runTick]」的 useEffect，并把该回调的源码
+  // 切片经 runInSandbox 执行——删掉或改坏它（含把依赖改成 []、把右侧改成别的函数）必红。
+  const runTickRefSyncEffectOf = (uiModel) => {
+    const { runInSandbox } = require('./test/_vm-sandbox')
+    const app = markup.functionNodeOf(uiModel, 'App')
+    assert.ok(app, 'ui.js 必须有 App')
+    const isRefAssignment = (node) => node.type === 'AssignmentExpression' &&
+      node.operator === '=' &&
+      memberPath(node.left) === 'runTickRef.current' &&
+      exprLabel(node.right) === 'runTick'
+    const hits = callSites(app, 'useEffect').filter((call) => {
+      const cb = call.arguments[0]
+      const deps = call.arguments[1]
+      if (!cb || !deps || deps.type !== 'ArrayExpression') return false
+      if (deps.elements.length !== 1 || exprLabel(deps.elements[0]) !== 'runTick') return false
+      return findAll(cb, isRefAssignment).length === 1
+    })
+    assert.strictEqual(hits.length, 1,
+      'App 必须恰好一处 `useEffect(() => { runTickRef.current = runTick }, [runTick])`（结构与依赖数组都要对；' +
+      `少了它定时器永远跑首渲染的旧 runTick，切页后非概览页不刷新）。实际命中 ${hits.length} 处`)
+    const src = uiModel.code.slice(hits[0].arguments[0].start, hits[0].arguments[0].end)
+    const factory = runInSandbox(`(function (runTickRef, runTick) { 'use strict'; return (${src}) })`, {})
+    // runner：按 React 语义「依赖变了 ⇒ 重跑 effect」，执行的是 ui.js 自己的回调源码。
+    return (runTickRef, runTick) => factory(runTickRef, runTick)()
   }
 
   await aok('行为: v3.533 凭证失效时轮询 effect 必须自己归还主定时器（authExpired 早退不靠通用 cleanup）', () => {
@@ -19166,7 +19202,10 @@ async function main () {
   })
 
   await aok('行为: v3.533 轮询定时器回调必须经 runTickRef 读最新 runTick（切页后不得跑旧闭包）', () => {
-    const h = pollEffectReplayOf(loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js')))
+    const uiModel = loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js'))
+    const h = pollEffectReplayOf(uiModel)
+    // App 真实的 `useEffect(() => { runTickRef.current = runTick }, [runTick])`：结构红线 + 源码重放。
+    const syncRunTickRef = runTickRefSyncEffectOf(uiModel)
     let oldCalls = 0
     let newCalls = 0
     // 建表那次渲染的 runTick 捕获的是 tab='overview'；切页后它换身份（useCallback deps 含 tab）。
@@ -19190,12 +19229,22 @@ async function main () {
     }
     const cleanup = h.run(state)
     assert.strictEqual(h.timers.size, 1, `首次渲染必须建 1 个主定时器（实际 ${h.timers.size}）`)
-    // 新一次渲染：App 的 `useEffect(() => { runTickRef.current = runTick }, [runTick])` 把 ref 换成新函数。
-    runTickRef.current = () => { newCalls += 1 }
+    const firstHandle = [...h.timers.keys()][0]
+    // 新一次渲染：执行 ui.js 里那条 ref 同步 effect 的**真实源码**（不是测试手改 ref）——它把
+    // runTickRef.current 换成新 runTick；删掉那条 effect 时上面的结构红线已经先红。
+    const nextRunTick = () => { newCalls += 1 }
+    syncRunTickRef(runTickRef, nextRunTick)
+    assert.strictEqual(runTickRef.current, nextRunTick, 'App 的 ref 同步 effect 必须把 runTickRef.current 赋成新 runTick')
     cleanup()
     // 切页但节奏值不变（SSE 降级后的 15 s）：守卫必须跳过重建，定时器沿用上一次的句柄。
     h.run({ ...state, tab: 'messages', runTickRef })
     assert.strictEqual(h.timers.size, 1, '节奏值没变 ⇒ 不得重建定时器（重装会丢拍，也与守卫语义矛盾）')
+    // 重建（clearInterval + setInterval）后 Map.size 仍是 1，size 断言检测不到——所以钉句柄
+    // 同一性与 setInterval 创建次数：重建时旧句柄被删、新句柄 id 递增，这两条必红。
+    assert.strictEqual([...h.timers.keys()][0], firstHandle,
+      '节奏值没变 ⇒ 必须沿用同一个定时器句柄（清旧+建新会丢拍，Map.size 仍是 1 抓不到）')
+    assert.strictEqual(h.intervalCreations(), 1,
+      `节奏值没变 ⇒ setInterval 只许创建 1 次（实际 ${h.intervalCreations()} 次 ⇒ 守卫被去掉）`)
     const fired = [...h.timers.values()]
     assert.strictEqual(fired.length, 1)
     fired[0]()
