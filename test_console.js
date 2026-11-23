@@ -73,6 +73,14 @@ const markup = require('./test_support/markup')
 
 const CONSOLE_ASSET_DIR = path.join(__dirname, 'scripts', 'console-assets')
 
+// v3.532：资产快照（去注释 + br/gzip 预压）每次构建约 1.3–1.5 s（br q11 占大头），
+// 一个进程里只建一次就够——三条断言（版本号、协商、304）共用这一份，别各自再压一遍。
+let consoleAssetStoreCache = null
+function consoleAssetStore () {
+  if (consoleAssetStoreCache === null) consoleAssetStoreCache = require('./scripts/console.js').buildAssetStore()
+  return consoleAssetStoreCache
+}
+
 // 7 个前端模块**各自**建模：它们都 import 同名符号（FETCH_TIMEOUT_MS 等），拼成一份再按
 // module 解析会因重复声明直接失败的——旧 readConsoleSource() 的文本拼接不能喂给 AST。
 // loadModel 自带进程内缓存，重复取不会重复解析。
@@ -5382,13 +5390,26 @@ async function main () {
     const crypto = require('node:crypto')
     // v3.364：不再硬编码文件名清单——直接按 STATIC_ASSETS 的插入顺序取（服务端算版本号
     // 用的是同一个对象），新增分片时这条断言自动跟随，不会出现「清单漏一个、版本号对不上」。
+    // v3.532：版本哈希按**去注释后**的字节算。这里独立复算：不碰服务端算好的 version 字段，
+    // 按 STATIC_ASSETS 顺序把 16 份资产以 identity 正文从 HTTP 取回来（下发的就是去注释后的
+    // 字节），逐份 sha256 前 16 位、再按同规则拼接取前 16 位——把 version 写成常量这条必红。
     const { STATIC_ASSETS } = require('./scripts/console.js')
-    const hashes = Object.values(STATIC_ASSETS).map((spec) => {
+    const httpHashes = []
+    for (const route of Object.keys(STATIC_ASSETS)) {
+      const res = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+      assert.strictEqual(res.status, 200, `${route} 必须可取（复算版本号用）`)
+      httpHashes.push(crypto.createHash('sha256').update(res.body).digest('hex').slice(0, 16))
+    }
+    const httpVersion = crypto.createHash('sha256').update(httpHashes.join('|')).digest('hex').slice(0, 16)
+    assert.strictEqual(verMatch[1], httpVersion,
+      '版本号必须由 HTTP 下发的 16 份去注释资产内容独立复算（常量/陈旧/按原始字节算都过不了）')
+    const rawDiskHashes = Object.values(STATIC_ASSETS).map((spec) => {
       const raw = fs.readFileSync(path.join(__dirname, 'scripts', 'console-assets', spec.file))
       return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)
     })
-    const expectVer = crypto.createHash('sha256').update(hashes.join('|')).digest('hex').slice(0, 16)
-    assert.strictEqual(verMatch[1], expectVer, '版本号必须等于资产内容的哈希（不能是常量/陈旧值）')
+    const rawDiskVersion = crypto.createHash('sha256').update(rawDiskHashes.join('|')).digest('hex').slice(0, 16)
+    assert.notStrictEqual(verMatch[1], rawDiskVersion,
+      '去注释必须换 URL：按原始磁盘字节算出的版本号不得等于实际下发的版本号')
     const immutable = await requestBuffer(port, 'GET', `/assets/app.css?v=${verMatch[1]}`, { token: TOKEN })
     const cc = String(immutable.headers['cache-control'] || '')
     // 内容寻址（?v= 为内容哈希）⇒ 命中即同一份字节：public + immutable 一年，浏览器/CDN
@@ -5519,6 +5540,135 @@ async function main () {
     assert.strictEqual(nope.status, 404, '白名单外 404')
     const traversal = await request(port, 'GET', '/assets/..%2F..%2Fconsole.js', { token: TOKEN })
     assert.strictEqual(traversal.status, 404, '路径穿越形态 404（白名单精确匹配，不解码拼接）')
+  })
+  // ── v3.532：资产去注释 + Node 侧 br(q11)/gzip(9) 预压 ─────────────────────
+  // 这一组用例守三件事：① 注释真的被抹掉且没弄坏语法/行号；② 三种表示（br/gzip/identity）
+  // 各自对齐 Content-Encoding / Content-Length / ETag / 304；③ CSS 剥离不误删字符串里的 `/*`。
+  await aok('资产: JS 按语法树去注释（响应体不含整行注释、acorn 可解析、行号与长度不变）', async () => {
+    const { stripJsComments } = require('./scripts/console.js')
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const disk = fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'pages.js')).toString('utf8')
+    const res = await requestBuffer(port, 'GET', '/assets/pages.js', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+    assert.strictEqual(res.status, 200)
+    const body = res.body.toString('utf8')
+    // ① 抹注释没把语法弄坏：空白替换不动 token 边界，ESM 仍应完整可解析。
+    acorn.parse(body, { ecmaVersion: 'latest', sourceType: 'module' })
+    // ② 源码里的**整行**注释文本一条都不许出现在响应体里。只取「独占一行」的 Line 注释
+    // 且长度 ≥ 8：太短的 `// x` 可能恰好是某个字符串字面量的一部分，断言会假红。
+    // 「独占一行」由解析器元数据判定：同一行上没有任何 token 在注释起点之前结束 ⇒ 行首无代码
+    // （行内尾注释、缩进后的 `// x` 之后的注释都按 token 位置区分，不看字符切片）。
+    const comments = []
+    const tokens = []
+    acorn.parse(disk, { ecmaVersion: 'latest', sourceType: 'module', locations: true, onComment: comments, onToken: tokens })
+    const fullLine = comments.filter((c) => {
+      if (c.type !== 'Line') return false
+      const codeOnLine = tokens.some((t) => t.loc.end.line === c.loc.start.line && t.end <= c.start)
+      return !codeOnLine && String(c.value).trim().length >= 8
+    })
+    assert.ok(fullLine.length >= 100, `pages.js 必须有足够多的整行注释供断言（实际 ${fullLine.length}）`)
+    const leaked = fullLine.filter((c) => body.includes(String(c.value).trim()))
+    assert.deepStrictEqual(leaked.slice(0, 3).map((c) => String(c.value).trim().slice(0, 40)), [],
+      `响应体不得含源码整行注释文本（${leaked.length}/${fullLine.length} 条泄漏）`)
+    // ③ 等长空白 + 换行一个不删 ⇒ 行号/列号与源码完全一致（堆栈才对得上）。
+    assert.strictEqual(body.split('\n').length, disk.split('\n').length, '抹注释不得改变行数')
+    assert.strictEqual(body.length, disk.length, '抹注释必须等长（否则偏移与列号全漂）')
+    assert.strictEqual(body, stripJsComments(disk), '响应体必须逐字等于剥离函数的输出')
+  })
+  await aok('资产: br/gzip/identity 三路协商（Content-Encoding / Content-Length / ETag 对齐）', async () => {
+    const { STATIC_ASSETS } = require('./scripts/console.js')
+    const store = consoleAssetStore()
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const route = '/assets/pages.js'
+    const stripped = store.table.get(route).raw
+    const plain = await requestBuffer(port, 'GET', route, { token: TOKEN })
+    assert.strictEqual(plain.status, 200)
+    // 不带 Accept-Encoding ⇒ identity：无 Content-Encoding，且逐字等于**剥离后**的字节。
+    assert.strictEqual(plain.headers['content-encoding'], undefined, '不声明编码时不得压缩')
+    assert.deepStrictEqual(plain.body, stripped, 'identity 体必须等于剥离后的资产字节（不是原始磁盘文件）')
+    assert.strictEqual(Number(plain.headers['content-length']), plain.body.length, 'Content-Length 必须等于 identity 体长度')
+    assert.strictEqual(plain.headers.etag, store.table.get(route).etag, 'identity 的 ETag 无后缀')
+    // 只接受 gzip ⇒ gzip：解压后与 identity 逐字一致，长度/ETag 都是 gzip 表示的。
+    const gz = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'gzip' } })
+    assert.strictEqual(gz.headers['content-encoding'], 'gzip', '只带 gzip 时必须发 gzip')
+    assert.deepStrictEqual(zlib.gunzipSync(gz.body), plain.body, 'gzip 解压后必须与 identity 逐字一致')
+    assert.strictEqual(Number(gz.headers['content-length']), gz.body.length, 'Content-Length 必须等于 gzip 体长度')
+    assert.match(String(gz.headers.etag), /-gz"$/, 'gzip 表示的 ETag 必须带 -gz 后缀')
+    assert.deepStrictEqual(gz.body, store.table.get(route).gzip, 'gzip 体必须是预压产物本身（不是现压的）')
+    // 接受 br ⇒ br：不是 gzip 魔数/明文，能解回 identity，ETag 带 -br。
+    const br = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'br' } })
+    assert.strictEqual(br.headers['content-encoding'], 'br', '只带 br 时必须发 br')
+    assert.ok(!(br.body[0] === 0x1f && br.body[1] === 0x8b), 'br 体不得以 gzip 魔数 1f 8b 开头')
+    assert.deepStrictEqual(zlib.brotliDecompressSync(br.body), plain.body, 'br 解压后必须与 identity 逐字一致')
+    assert.strictEqual(Number(br.headers['content-length']), br.body.length, 'Content-Length 必须等于 br 体长度')
+    assert.match(String(br.headers.etag), /-br"$/, 'br 表示的 ETag 必须带 -br 后缀')
+    assert.ok(br.body.length < gz.body.length, `br 必须小于 gzip（实测 ${br.body.length} vs ${gz.body.length}）`)
+    assert.match(String(br.headers.vary || ''), /Accept-Encoding/, '必须 Vary: Accept-Encoding')
+    // q 值协商：同 q 选 br；gzip 更高时退回 gzip；br;q=0 时不许发 br。
+    const both = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'gzip, br' } })
+    assert.strictEqual(both.headers['content-encoding'], 'br', 'br 与 gzip 同 q 时必须选 br')
+    const gzWins = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'br;q=0.5, gzip;q=1' } })
+    assert.strictEqual(gzWins.headers['content-encoding'], 'gzip', 'gzip 的 q 更高时必须发 gzip')
+    const brOff = await requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': 'br;q=0' } })
+    assert.strictEqual(brOff.headers['content-encoding'], undefined, 'br;q=0 时必须回 identity')
+    // 资产清单里每个文件都得有三份表示，且 gzip/br 都是预压产物。
+    for (const [r, spec] of Object.entries(STATIC_ASSETS)) {
+      const entry = store.table.get(r)
+      assert.ok(entry, `${r} 必须在资产表里`)
+      assert.deepStrictEqual(zlib.brotliDecompressSync(entry.br), entry.raw, `${spec.file} 的 br 必须能解回剥离后字节`)
+      assert.deepStrictEqual(zlib.gunzipSync(entry.gzip), entry.raw, `${spec.file} 的 gzip 必须能解回剥离后字节`)
+      assert.strictEqual(entry.brEtag, entry.etag.replace(/"$/, '-br"'), `${spec.file} 的 br ETag 口径`)
+      assert.strictEqual(entry.gzipEtag, entry.etag.replace(/"$/, '-gz"'), `${spec.file} 的 gzip ETag 口径`)
+    }
+  })
+  await aok('资产: 三种表示各有自己的 ETag，If-None-Match 各命中 304（br 不得与 gzip/identity 同 tag）', async () => {
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const route = '/assets/app.js'
+    const get = (ae, extra) => requestBuffer(port, 'GET', route, { token: TOKEN, headers: { 'accept-encoding': ae, ...(extra || {}) } })
+    const plain = await get('identity')
+    const gz = await get('gzip')
+    const br = await get('br')
+    const tags = [plain.headers.etag, gz.headers.etag, br.headers.etag]
+    assert.strictEqual(new Set(tags).size, 3, `br/gzip/identity 的 ETag 必须互不相同：${tags.join(' / ')}`)
+    for (const [ae, tag, label] of [['identity', plain.headers.etag, 'identity'], ['gzip', gz.headers.etag, 'gzip'], ['br', br.headers.etag, 'br']]) {
+      const r304 = await get(ae, { 'if-none-match': tag })
+      assert.strictEqual(r304.status, 304, `${label} 的 ETag 命中必须 304`)
+      assert.strictEqual(r304.body.length, 0, `${label} 的 304 不得带正文`)
+    }
+    // 用 br 的 ETag 配 gzip 的 Accept-Encoding 不得命中（表示不同 ⇒ 字节不同）。
+    const cross = await get('gzip', { 'if-none-match': br.headers.etag })
+    assert.strictEqual(cross.status, 200, 'br 的 ETag 不得命中 gzip 表示（否则缓存会拿到错字节）')
+    assert.strictEqual(cross.headers['content-encoding'], 'gzip')
+  })
+  await aok('资产: CSS 剥 /* */ 不误删字符串（含转义与未闭合 fail-closed）', async () => {
+    const { stripCssComments } = require('./scripts/console.js')
+    // ① 普通注释：抹成等长空白，声明本身不动。
+    assert.strictEqual(stripCssComments('a{/* x */color:red}'), 'a{       color:red}')
+    // ② 字符串里的 `/*` 不是注释：整份样本必须逐字不变（误删即红）。
+    const inString = '.a{content:"/* 不是注释 */";color:red}'
+    assert.strictEqual(stripCssComments(inString), inString, '字符串里的 /* 不得被当成注释')
+    // ③ `\` 转义：`\"` 不是字符串结束，其后仍在字符串里 ⇒ 里面的 `/*` 同样不能删。
+    const escaped = '.a{content:"\\"/*x*/"}'
+    assert.strictEqual(stripCssComments(escaped), escaped, '转义引号后的 /* 仍在字符串里，不得删')
+    // ④ 跨行块注释：换行保留 ⇒ 行数不变。
+    const multiline = 'a{}\n/* 第一行\n第二行 */\nb{color:red}'
+    const strippedMulti = stripCssComments(multiline)
+    assert.strictEqual(strippedMulti.split('\n').length, multiline.split('\n').length, 'CSS 去注释必须保留换行')
+    assert.strictEqual(strippedMulti.length, multiline.length, 'CSS 去注释必须等长')
+    assert.ok(strippedMulti.endsWith('\nb{color:red}'), '注释后的规则必须原样保留')
+    // ⑤ 未闭合必须抛错（fail-closed，不许静默截断）。
+    assert.throws(() => stripCssComments('a{/* 没闭合'), /未闭合/, '未闭合注释必须抛错')
+    // ⑥ 线上 app.css：响应体逐字等于剥离结果，且注释文本不再出现。
+    const cssDisk = fs.readFileSync(path.join(CONSOLE_ASSET_DIR, 'app.css')).toString('utf8')
+    const { server } = createConsole({ token: TOKEN, stateDir: tmpDir() })
+    const port = await listen(server)
+    const css = await requestBuffer(port, 'GET', '/assets/app.css', { token: TOKEN, headers: { 'accept-encoding': 'identity' } })
+    const cssBody = css.body.toString('utf8')
+    assert.strictEqual(cssBody, stripCssComments(cssDisk), 'app.css 响应体必须逐字等于剥离函数的输出')
+    assert.ok(!cssBody.includes('—— 控制台样式'), 'app.css 里的注释文本必须已被抹掉（连标记一起抹）')
+    assert.strictEqual(cssBody.split('\n').length, cssDisk.split('\n').length, 'app.css 去注释必须保留行数')
   })
   await aok('资产: 每个模块 import 的文件都在白名单里（漏登记 = 整页白屏且测试全绿）', () => {
     const acorn = require('acorn')

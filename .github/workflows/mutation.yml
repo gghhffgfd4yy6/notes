@@ -264,7 +264,7 @@ jobs:
           # V3 入口及拆分模块
           - name: v3-entry
             src: "xbk_function_v3.js"
-            mutate: "xbk_function_v3.js:1-820"
+            mutate: "xbk_function_v3.js:1-821"
             config: "stryker.config.js"
           - name: app
             src: "xbk_app.js"
@@ -353,7 +353,12 @@ jobs:
             src: "xbk_state_schema.js"
             mutate: "xbk_state_schema.js"
             config: "stryker.tap.config.js"
-          # console.js 6680 行（v3.526 F4：GET 响应形状搬进 FilterStore.buildFilterGetPayload（merged
+          # console.js 6773 行（v3.532 W1：资产去注释（acorn onComment 收集注释区间 + CSS 字符串/
+          # 转义感知的 /* */ 剥离）+ Node 侧 br(q11)/gzip(9) 预压 + 按 Accept-Encoding 三路协商，
+          # 净 +93 行 ⇒ 按 6773 行**等宽重拆 13 段**（521 行/段，段名不变）。为什么不沿用旧边界：
+          # +88 行全落在 part2 区间内，直接把 part2 撑到 772 行，超出「单段 ≤700 行」的既定上限
+          # （700 行 ≈174min，再涨就有撞 step 330min 的风险）；等宽后最大段 521 行 ≈130min。
+          # 此前 6680 行（v3.526 F4：GET 响应形状搬进 FilterStore.buildFilterGetPayload（merged
           # 视图只下发一份规则）+ 保存响应不再回吐整份 filter，净 -22 行 ⇒ 尾部 part13 收敛到 6680；
           # part1..12 行段数字不变。
           # 此前 6685 行（v3.524 F2：LKG 内容 hash 未变跳过写盘 / preview 的时间+条数预算搬进 store /
@@ -381,69 +386,74 @@ jobs:
           #   60s 的依据：test_console.js 全量 ≈21s ⇒ 上限 ≈1.5×21+60 = 91s（原 ≈331s），而 313 个 Timeout
           #   累计 235min 正是「挂死等满 300s 偏移」造成的。它只经 CLI `--timeoutMS` 生效（见「变异测试」
           #   step 的注释：不进缓存身份、不改判据），其余段不设此字段 ⇒ 表达式回落 300000。
+          #   ⚠️ v3.532 实测：本机 test_console.js 全量 39.3 → 49.8 s（资产去注释 + br(q11) 预压让每个
+          #   console 进程冷启动 +≈1.5 s，其中 4 处用例会 spawn `scripts/console.js` 子进程）。60s 的余量
+          #   因此变薄（同一公式下 ≈1.5×40+60 = 120s），但**本版不改这个数值**：它由 test_ci_skip_suites.js
+          #   的锁定断言（恰 console 段 60000、裸整数）守着，上调必须连同那条断言与评估依据一起改，
+          #   属独立决策；此处只留实测证据，供合并后按 CI 的 Timeout 计数复核。
           - name: console-part1
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1-650"
+            mutate: "scripts/console.js:1-521"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part2
             src: "scripts/console.js"
-            mutate: "scripts/console.js:651-1334"
+            mutate: "scripts/console.js:522-1042"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part3
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1335-1984"
+            mutate: "scripts/console.js:1043-1563"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part4
             src: "scripts/console.js"
-            mutate: "scripts/console.js:1985-2634"
+            mutate: "scripts/console.js:1564-2084"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part5
             src: "scripts/console.js"
-            mutate: "scripts/console.js:2635-3284"
+            mutate: "scripts/console.js:2085-2605"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part6
             src: "scripts/console.js"
-            mutate: "scripts/console.js:3285-3709"
+            mutate: "scripts/console.js:2606-3126"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part7
             src: "scripts/console.js"
-            mutate: "scripts/console.js:3710-4404"
+            mutate: "scripts/console.js:3127-3647"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part8
             src: "scripts/console.js"
-            mutate: "scripts/console.js:4405-4834"
+            mutate: "scripts/console.js:3648-4168"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part9
             src: "scripts/console.js"
-            mutate: "scripts/console.js:4835-5234"
+            mutate: "scripts/console.js:4169-4689"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part10
             src: "scripts/console.js"
-            mutate: "scripts/console.js:5235-5834"
+            mutate: "scripts/console.js:4690-5210"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part11
             src: "scripts/console.js"
-            mutate: "scripts/console.js:5835-6110"
+            mutate: "scripts/console.js:5211-5731"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part12
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6111-6390"
+            mutate: "scripts/console.js:5732-6252"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
           - name: console-part13
             src: "scripts/console.js"
-            mutate: "scripts/console.js:6391-6680"
+            mutate: "scripts/console.js:6253-6773"
             config: "stryker.tap.config.js"
             timeout_ms: 60000
     steps:
