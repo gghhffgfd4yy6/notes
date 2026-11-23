@@ -268,8 +268,11 @@ function orderJournalPutsInMemoryOrder (messages, puts) {
 }
 
 // ===== v3.534：`_f`（过滤未推）条目的写盘投影 + 条数淘汰口径 =====
-// 为什么：`_f` 条目永不推送（过滤命中），生产快照实测占 47%，其中 content + content_html
-// 2,752,658 B 永远不会被读；判重身份只需要 id/url。故**写盘时**只留身份与展示字段——内存快照
+// 为什么：`_f` 条目永不推送（过滤命中），判重身份只需要 id/url。证据夹具 push.copy.json（13:28 快照、
+// **不是现网实时缓存**）实测 5,685 条里 2,274 条 `_f`（40.0%），这些记录**整块** JSON 字节（逐条
+// `JSON.stringify` 求和）2,752,658 B = 整份 6,013,344 B 的 45.8%——它不是两个正文字段的值字节；
+// 删掉 content / content_html 两键的边际差是整份 6,013,344 → 4,029,040 B（−33.0%，差 1,984,304 B）。
+// 故**写盘时**只留身份与展示字段——内存快照
 // 仍保存原对象（控制台消息列表/统计、过滤判定读的都是内存，一字不改）；但**补推预览读的是磁盘
 // 投影**（`FilterStore.scanPreviewRecords` 统计 noBody），记录无正文时必须回 available:false /
 // code:'bodies_unavailable'，不得给确定性补推数（见 SYSTEM_CONTRACT「补推提示」）。
@@ -280,8 +283,9 @@ function orderJournalPutsInMemoryOrder (messages, puts) {
 /** 写盘投影：条目是对象、`_f === true`、且身份完整（id = 非空字符串或有限数字，url = 非空字符串）
  *  时返回**浅拷贝**并删掉 content / content_html 两个键；否则原样返回**同一对象**。
  *  缺 id/url 的 `_f` 保留正文兜底——它们的身份只能靠正文重算/展示，瘦身会把这类条目变成哑记录。
- *  只用于「写盘序列化」：内存快照、判重索引、控制台一律仍看原对象（补推预览看的是落盘投影，
- *  由 scanPreviewRecords 统计无正文后如实降级）。 */
+ *  只用于「写盘序列化」：内存快照（`_memoSet`）、判重索引、控制台消息列表/统计仍看原对象；
+ *  补推预览读落盘投影，由 scanPreviewRecords 统计 noBody 后如实降级（available:false /
+ *  code:'bodies_unavailable'）——补推预览同样是控制台功能，但它走的是磁盘，不在「仍看原对象」之列。 */
 function toDiskEntry (m) {
   if (!m || typeof m !== 'object' || Array.isArray(m) || m._f !== true) return m
   const id = m.id

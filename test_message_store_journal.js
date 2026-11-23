@@ -1069,14 +1069,39 @@ check('J9-01 journal 行的 _f put 已瘦身：日志不带 content/content_html
   const after = reopened.readMessages(fp)
   assert.deepStrictEqual(after.map((m) => m.id), ['f1', 'n1'], '回放后的顺序与条目集合不得变化')
   assert.strictEqual(after.find((m) => m.id === 'n1').content, '正常正文', '回放后普通条目正文仍完整')
-  // 合并写快照（_compact）也必须走同一份投影：磁盘上不能出现「日志瘦、快照胖」
-  assert.strictEqual(reopened._compact(fp, after), true, '合并必须成功')
+  // 合并写快照（_compact）也必须走同一份投影：磁盘上不能出现「日志瘦、快照胖」。
+  // 这里喂的必须是**内存里带正文的 `_f`**（`_memoSet` 里存的就是原对象）：上面的 `after` 来自
+  // journal 回放、本来就没有 content/content_html，拿它喂 `_compact` 是自证断言——`_compact`
+  // 就算完全不投影，落盘快照照样无正文，这只用例照样全绿（B 路复查指出的缺陷）。
+  const inMemory = [
+    { id: 'f1', url: 'https://u.example/f1', _f: true, content: fBody, content_html: fHtml },
+    { id: 'n1', content: '正常正文', content_html: '<p>正常正文</p>' }
+  ]
+  assert.strictEqual(reopened._compact(fp, inMemory), true, '合并必须成功')
   const snap = JSON.parse(fs.readFileSync(fp, 'utf8'))
   assert.strictEqual(snap.length, 2, '合并后的快照必须含两条')
   const snapF = snap.find((m) => m.id === 'f1')
-  assert.strictEqual(Object.prototype.hasOwnProperty.call(snapF, 'content'), false, '合并写快照时 _f 同样不得带 content')
+  assert.ok(snapF, `合并后的快照必须含 f1（实际：${JSON.stringify(snap.map((m) => m.id))}）`)
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(snapF, 'content'), false, '合并写快照时 _f 同样不得带 content（喂的是内存里带正文的原对象）')
   assert.strictEqual(Object.prototype.hasOwnProperty.call(snapF, 'content_html'), false, '合并写快照时 _f 同样不得带 content_html')
+  assert.strictEqual(snapF.url, 'https://u.example/f1', '合并写快照后 _f 的身份字段 url 必须原样保留')
+  assert.strictEqual(snapF._f, true, '合并写快照后 _f 标记必须保留')
+  // 与 journal 侧同一口径：递归收集快照里的全部字符串值（含嵌套字段），不得有任何一处携带 _f 正文
+  const snapStrings = allStrings(snap)
+  assert.ok(snapStrings.some((s) => s === '正常正文'),
+    `递归收集必须覆盖到普通条目的正文（实收 ${snapStrings.length} 个字符串）；否则下面的「无残留」是空断言`)
+  assert.deepStrictEqual(snapStrings.filter((s) => s.indexOf(F_BODY_MARK) !== -1).map((s) => s.slice(0, 40)), [],
+    '合并后的快照里不得有任何字符串携带 _f 正文（含嵌套字段）')
   assert.strictEqual(snap.find((m) => m.id === 'n1').content, '正常正文', '快照里普通条目正文必须完整')
+  assert.strictEqual(snap.find((m) => m.id === 'n1').content_html, '<p>正常正文</p>', '快照里普通条目 content_html 必须完整')
+  // 回放（新实例，只能读磁盘快照）：顺序、正文、判重身份都不得因合并而变
+  const reread = makeStore({ dir, maxSize: 100, constants })
+  const replayed = reread.readMessages(fp)
+  assert.deepStrictEqual(replayed.map((m) => m.id), ['f1', 'n1'], '合并写快照后回放的顺序与条目集合不得变化')
+  assert.strictEqual(replayed.find((m) => m.id === 'n1').content, '正常正文', '合并后普通条目正文回放仍完整')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(replayed.find((m) => m.id === 'f1'), 'content'), false, '合并后的磁盘快照回放时 _f 仍无正文')
+  assert.strictEqual(reread.has({ id: 'f1', url: 'https://u.example/f1' }, NAME), true, '合并后 _f 身份仍可判重命中')
+  assert.strictEqual(reread.has({ id: 'n1' }, NAME), true, '合并后普通条目身份仍可判重命中')
 })
 
 // ============================================================
