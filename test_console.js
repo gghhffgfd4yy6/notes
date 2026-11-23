@@ -8671,9 +8671,14 @@ async function main () {
       n.body.type === 'CallExpression' && memberPath(n.body.callee) === 'channel.dispose')
     assert.strictEqual(cleanup.length, 1, 'effect 清理必须 channel.dispose()（摘监听 + close，切页/暂停/卸载都不漏）')
     // 全页只有一个定时器，且它复用同一拍；轮询 effect 内不得再建第二条流。
+    // v3.533 复查：回调必须经 runTickRef 解引用——直接 `runTick()` 会捕获「建表那次渲染」的闭包，
+    // 切页后仍按旧 tab 判定（非概览页静默不刷新），所以这里判的是 runTickRef.current()。
     const runTickIntervals = findAll(ui, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setInterval' &&
-      findAll(n.arguments[0], (inner) => inner.type === 'CallExpression' && memberPath(inner.callee) === 'runTick').length === 1)
-    assert.strictEqual(runTickIntervals.length, 1, '全页只能有一个按 runTick 走的定时器')
+      findAll(n.arguments[0], (inner) => inner.type === 'CallExpression' && memberPath(inner.callee) === 'runTickRef.current').length === 1)
+    assert.strictEqual(runTickIntervals.length, 1, '全页只能有一个按 runTickRef.current() 走的定时器')
+    assert.strictEqual(findAll(ui, (n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setInterval' &&
+      findAll(n.arguments[0], (inner) => inner.type === 'CallExpression' && memberPath(inner.callee) === 'runTick').length > 0).length, 0,
+    '定时器回调不得直接调 runTick（会捕获建表那次渲染的旧闭包 ⇒ 切页后不刷新）')
     assert.strictEqual(memberPath(runTickIntervals[0].arguments[1]), 'interval', '定时器间隔必须用唯一那次 pollIntervalFor 的结果')
     const timerAssign = findAll(ui, (n) => n.type === 'AssignmentExpression' && memberPath(n.left) === 'timerRef.current' &&
       n.right.type === 'CallExpression' && memberPath(n.right.callee) === 'setInterval')
@@ -11121,10 +11126,14 @@ async function main () {
     assert.strictEqual(findAll(runTick.init, (n) => n.type === 'IfStatement' && exprLabel(n.test) === 'document.hidden').length, 1,
       '概览主轮询在后台必须跳过（tick 整拍不发）')
     // 全页只此一个定时器：SSE tick 复用 runTick，不得另建 interval。
+    // v3.533 复查：定时器回调必须经 runTickRef 解引用（直接调 runTick 会捕获建表那次的闭包）。
     const intervals = callSites(app, 'setInterval')
     const pollTimer = intervals.filter((call) => call.arguments[0] &&
-      callSites(call.arguments[0], 'runTick').length === 1)
-    assert.strictEqual(pollTimer.length, 1, '全页只此一个定时器：定时器里的唯一动作必须是 runTick()')
+      callSites(call.arguments[0], 'runTickRef.current').length === 1)
+    assert.strictEqual(pollTimer.length, 1, '全页只此一个定时器：定时器里的唯一动作必须是 runTickRef.current()（读最新闭包）')
+    assert.strictEqual(intervals.filter((call) => call.arguments[0] &&
+      callSites(call.arguments[0], 'runTick').length > 0).length, 0,
+    '定时器回调不得直接调 runTick（旧闭包按建表那次渲染的 tab 判定 ⇒ 切页后不刷新）')
     assert.strictEqual(exprLabel(pollTimer[0].arguments[1]), 'interval', '定时器间隔必须来自 pollIntervalFor 的 interval')
     const sseTicks = findAll(app, (n) => n.type === 'LogicalExpression' || n.type === 'CallExpression')
       .filter((n) => n.type === 'CallExpression' && memberPath(n.callee) === 'setPollTick')
@@ -19007,11 +19016,36 @@ async function main () {
     // 做就会出现「清掉却没人重装」⇒ 只剩 SSE tick、断线后彻底不轮询（本版实现中曾真踩到）。
     const pollBody = pollEffect.arguments[0].body.body
     const returns = pollBody.filter((stmt) => stmt.type === 'ReturnStatement')
-    assert.strictEqual(returns.length, 1, '轮询 effect 必须只 return 一个 cleanup')
-    const cleanupFn = returns[0].argument
+    // v3.533 复查：authExpired 早退分支也会 return（`return undefined`，它要自己归还定时器）；
+    // 因此这里只数「返回箭头函数」的那一条——cleanup 仍然必须恰好一个，既有的「cleanup 不得
+    // clearInterval」判据原样保留在下面。
+    const cleanupReturns = returns.filter((stmt) => stmt.argument && stmt.argument.type === 'ArrowFunctionExpression')
+    assert.strictEqual(cleanupReturns.length, 1,
+      `轮询 effect 必须只 return 一个 cleanup（箭头函数；实际 ${cleanupReturns.length} 条，总 return ${returns.length} 条）`)
+    const cleanupFn = cleanupReturns[0].argument
     assert.ok(cleanupFn && cleanupFn.type === 'ArrowFunctionExpression', 'cleanup 必须是箭头函数')
     assert.strictEqual(callSites(cleanupFn, 'clearInterval').length, 0,
       'cleanup 不得 clearInterval（会与守卫冲突，定时器永久丢失）；摘监听器即可')
+    // 凭证失效的早退分支必须自己归还定时器（通用 cleanup 有意不清）：否则 401 后定时器继续
+    // runTick ⇒ 每 15 s（busy 2 s）空打一对 401，与「401 ⇒ 停轮询」和横幅「已停止自动刷新」矛盾。
+    const authEarly = pollBody.filter((stmt) => stmt.type === 'IfStatement' && exprLabel(stmt.test) === 'authExpired')
+    assert.strictEqual(authEarly.length, 1, '轮询 effect 必须以 authExpired 早退分支归还主定时器')
+    assert.strictEqual(authEarly[0].consequent.type, 'BlockStatement', 'authExpired 早退必须是块（归还定时器要写三条）')
+    const authReturns = authEarly[0].consequent.body.filter((stmt) => stmt.type === 'ReturnStatement')
+    assert.strictEqual(authReturns.length, 1, 'authExpired 早退分支必须 return undefined（不得继续注册监听器/建表）')
+    assert.ok(authReturns[0].argument === null || exprLabel(authReturns[0].argument) === 'undefined',
+      'authExpired 早退分支必须 return undefined（与 React effect 的「无 cleanup」语义一致）')
+    assert.ok(callSites(authEarly[0], 'clearInterval').length >= 1,
+      'authExpired 早退分支必须 clearInterval(timerRef.current)（否则 401 后空打）')
+    const authAssigns = findAll(authEarly[0], (n) => n.type === 'AssignmentExpression')
+    const authTargets = authAssigns.map((n) => memberPath(n.left))
+    assert.ok(authTargets.includes('timerRef.current'), 'authExpired 早退分支必须把 timerRef.current 置空')
+    assert.ok(authTargets.includes('armedIntervalRef.current'),
+      'authExpired 早退分支必须把 armedIntervalRef.current 置 0（否则下次恢复时不重建定时器）')
+    assert.strictEqual(exprLabel(authAssigns.find((n) => memberPath(n.left) === 'armedIntervalRef.current').right), '0',
+      'armedIntervalRef.current 必须置 0')
+    assert.strictEqual(exprLabel(authAssigns.find((n) => memberPath(n.left) === 'timerRef.current').right), 'null',
+      'timerRef.current 必须置 null')
     // 所以必须另有一个「空依赖、卸载时清定时器」的 effect 兜底，否则真泄漏一个 interval。
     // cleanup 允许两种写法：`() => { … }`（显式 return）与 `() => () => { … }`（隐式返回）。
     const cleanupFnsOf = (call) => {
@@ -19036,6 +19070,137 @@ async function main () {
     const autoPoll = findAll(constsModel.ast, (n) => n.type === 'VariableDeclarator' && exprLabel(n.id) === 'AUTO_POLL_MS')
       .map((n) => Number(n.init && n.init.value))
     assert.deepStrictEqual(autoPoll, [5000], `AUTO_POLL_MS 必须是 5000 ms（2 s → 5 s，实际 ${JSON.stringify(autoPoll)}）`)
+  })
+
+  // v3.533 复查：轮询 effect 的行为级重放（不并真 React/DOM）。用 acorn 的 node.start/end 取
+  // 箭头函数源码切片，注入假 refs / 假定时器 / 假 document，按 React 语义「先跑上一次 cleanup，
+  // 再跑这一次 effect」重放——只钉 AST 形状抓不到「定时器没归还」「回调捕获旧闭包」这两类真 bug
+  // （评审 A/C 双路已实测复现）。动态执行按仓库约定收口在 test/_vm-sandbox.js（S1523），
+  // 被执行的是 ui.js 自己的源码切片。
+  const pollEffectReplayOf = (uiModel) => {
+    const { runInSandbox } = require('./test/_vm-sandbox')
+    const app = markup.functionNodeOf(uiModel, 'App')
+    assert.ok(app, 'ui.js 必须有 App')
+    const pollEffect = callSites(app, 'useEffect').find((call) => call.arguments[1] &&
+      call.arguments[1].type === 'ArrayExpression' &&
+      call.arguments[1].elements.some((el) => exprLabel(el) === 'runTick') &&
+      call.arguments[1].elements.some((el) => exprLabel(el) === 'tab'))
+    assert.ok(pollEffect, '找不到轮询 useEffect（依赖里必须同时含 runTick 与 tab）')
+    const src = uiModel.code.slice(pollEffect.arguments[0].start, pollEffect.arguments[0].end)
+    const timers = new Map()
+    let seq = 0
+    const doc = {
+      hidden: false,
+      visibilityState: 'visible',
+      listeners: new Map(),
+      addEventListener (type, fn) {
+        const set = this.listeners.get(type) || new Set()
+        set.add(fn)
+        this.listeners.set(type, set)
+      },
+      removeEventListener (type, fn) {
+        const set = this.listeners.get(type)
+        if (set) set.delete(fn)
+      }
+    }
+    const setIntervalImpl = (fn, ms) => {
+      const handle = { id: ++seq, ms }
+      timers.set(handle, fn)
+      return handle
+    }
+    const clearIntervalImpl = (handle) => { if (handle) timers.delete(handle) }
+    const params = 'authExpired, autoRefresh, tab, scheduleRef, bootFetchedRef, refreshSplit, intervalRef, ' +
+      'timerRef, setNextAt, markRef, armedIntervalRef, interval, setInterval, clearInterval, runTickRef, ' +
+      'document, resumeQuietUntilRef, runTick'
+    const factory = runInSandbox(`(function (${params}) { 'use strict'; return (${src}) })`, {})
+    return {
+      timers,
+      doc,
+      run (state) {
+        return factory(
+          state.authExpired === true, state.autoRefresh !== false, state.tab,
+          state.scheduleRef, state.bootFetchedRef, state.refreshSplit, state.intervalRef,
+          state.timerRef, state.setNextAt, state.markRef, state.armedIntervalRef, state.interval,
+          setIntervalImpl, clearIntervalImpl, state.runTickRef, doc,
+          state.resumeQuietUntilRef, state.runTick
+        )()
+      }
+    }
+  }
+
+  await aok('行为: v3.533 凭证失效时轮询 effect 必须自己归还主定时器（authExpired 早退不靠通用 cleanup）', () => {
+    const h = pollEffectReplayOf(loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js')))
+    let runTicks = 0
+    const runTick = () => { runTicks += 1 }
+    const state = {
+      authExpired: false,
+      autoRefresh: true,
+      tab: 'overview',
+      interval: 15000,
+      scheduleRef: { current: null },
+      bootFetchedRef: { current: true },
+      refreshSplit: () => {},
+      intervalRef: { current: 15000 },
+      timerRef: { current: null },
+      setNextAt: () => {},
+      markRef: { current: null },
+      armedIntervalRef: { current: 0 },
+      runTickRef: { current: runTick },
+      resumeQuietUntilRef: { current: 0 },
+      runTick
+    }
+    const cleanup = h.run(state)
+    assert.strictEqual(typeof cleanup, 'function', '正常渲染必须注册 cleanup（摘 visibilitychange 监听）')
+    assert.strictEqual(h.timers.size, 1, `正常渲染必须恰好建 1 个主定时器（实际 ${h.timers.size}）`)
+    // React 语义：凭证失效让本 effect 重跑 ⇒ 先跑上一次的 cleanup，再跑这一次。
+    cleanup()
+    const stopped = h.run({ ...state, authExpired: true })
+    assert.strictEqual(h.timers.size, 0,
+      `凭证失效后不得留下主定时器（实际 ${h.timers.size} 个仍在跑 ⇒ 每 15 s 空打一对 401）`)
+    assert.strictEqual(state.armedIntervalRef.current, 0,
+      'authExpired 早退必须把 armedIntervalRef.current 置 0（否则凭证恢复/暂停取消时守卫会跳过重建）')
+    assert.strictEqual(stopped, undefined, 'authExpired 早退分支不注册 cleanup（定时器已自己归还）')
+    // 反向验证（把早退分支的归还删掉）时这里才有残留定时器：它一次都不许再 runTick。
+    for (const fn of h.timers.values()) fn()
+    assert.strictEqual(runTicks, 0, `凭证失效后残留定时器不得再 runTick（实际 ${runTicks} 次）`)
+  })
+
+  await aok('行为: v3.533 轮询定时器回调必须经 runTickRef 读最新 runTick（切页后不得跑旧闭包）', () => {
+    const h = pollEffectReplayOf(loadModel(path.join(CONSOLE_ASSET_DIR, 'ui.js')))
+    let oldCalls = 0
+    let newCalls = 0
+    // 建表那次渲染的 runTick 捕获的是 tab='overview'；切页后它换身份（useCallback deps 含 tab）。
+    const runTickRef = { current: () => { oldCalls += 1 } }
+    const state = {
+      authExpired: false,
+      autoRefresh: true,
+      tab: 'overview',
+      interval: 15000,
+      scheduleRef: { current: null },
+      bootFetchedRef: { current: true },
+      refreshSplit: () => {},
+      intervalRef: { current: 15000 },
+      timerRef: { current: null },
+      setNextAt: () => {},
+      markRef: { current: null },
+      armedIntervalRef: { current: 0 },
+      runTickRef,
+      resumeQuietUntilRef: { current: 0 },
+      runTick: runTickRef.current
+    }
+    const cleanup = h.run(state)
+    assert.strictEqual(h.timers.size, 1, `首次渲染必须建 1 个主定时器（实际 ${h.timers.size}）`)
+    // 新一次渲染：App 的 `useEffect(() => { runTickRef.current = runTick }, [runTick])` 把 ref 换成新函数。
+    runTickRef.current = () => { newCalls += 1 }
+    cleanup()
+    // 切页但节奏值不变（SSE 降级后的 15 s）：守卫必须跳过重建，定时器沿用上一次的句柄。
+    h.run({ ...state, tab: 'messages', runTickRef })
+    assert.strictEqual(h.timers.size, 1, '节奏值没变 ⇒ 不得重建定时器（重装会丢拍，也与守卫语义矛盾）')
+    const fired = [...h.timers.values()]
+    assert.strictEqual(fired.length, 1)
+    fired[0]()
+    assert.strictEqual(oldCalls, 0, `定时器不得再跑「建表那次渲染」的旧 runTick 闭包（实际 ${oldCalls} 次 ⇒ 切页后非概览页不刷新）`)
+    assert.strictEqual(newCalls, 1, `定时器必须调用最新的 runTick（实际 ${newCalls} 次）`)
   })
 }
 

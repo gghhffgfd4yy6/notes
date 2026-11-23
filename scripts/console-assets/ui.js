@@ -804,7 +804,15 @@ function App () {
   }, [])
 
   useEffect(() => {
-    if (authExpired) return undefined
+    if (authExpired) {
+      // v3.533 复查：这条早退不走下面的通用 cleanup（那里有意不清定时器，见 return 处注释），
+      // 所以必须自己归还主定时器——否则凭证失效后它仍按旧节奏 runTick ⇒ 每 15 s（busy 2 s）
+      // 空打一对 401，与「401 ⇒ 停轮询」和横幅「已停止自动刷新」直接矛盾。
+      clearInterval(timerRef.current)
+      timerRef.current = null
+      armedIntervalRef.current = 0
+      return undefined
+    }
     // 只有「首屏」与「真的在自动刷新」才补这一发：暂停时切页签 / locking 翻转同样会让本
     // effect 重跑，无条件 refreshSplit() 等于按了暂停还在打接口（C7-040）。首屏例外——
     // 否则暂停着重开页面就是一片空白。
@@ -837,7 +845,9 @@ function App () {
     markRef.current = mark
     if (armedIntervalRef.current !== interval) {
       clearInterval(timerRef.current)
-      timerRef.current = setInterval(() => { runTick() }, interval)
+      // v3.533 复查：回调必须经 runTickRef 解引用。直接调 runTick 会捕获「建表那次渲染」的闭包，
+      // 而按 tab 判定的 runTick 在切页后换身份、节拍守卫又不重建定时器 ⇒ 非概览页的自动刷新静默失效。
+      timerRef.current = setInterval(() => { runTickRef.current() }, interval)
       armedIntervalRef.current = interval
       mark()
     }
