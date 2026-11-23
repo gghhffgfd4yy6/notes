@@ -50,15 +50,22 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
     // CodeRabbit PR #147：只判 `typeof _type === 'string'` 太宽——把 time/timeMulti 形状误传给分类检查
     // （或反之）时下游返回 false、本函数取反成 true，会**静默全放行且无告警**；故按调用方给的
     // allowedTypes 校验判别式，并要求对应载荷字段存在（re→re / time→value / multi|timeMulti→rules）。
+    // v3.535（W4）切块契约：`_type:'re'` 的简单模式字段切成多块后 **`re` 恒为 null**（不再编整段），
+    // 判定由 `blocks` 逐块短路完成（RuleEngine.matchesCompiled）。故 `re` 的载荷条件放宽为
+    // 「re 非 null **或** blocks 是非空数组」；两者都缺（`{_type:'re'}` / `{_type:'re', re:null}` 且无块，
+    // 例如手搓夹具或编译失败残留）仍按原样告警并保守放行。其它判别式的载荷条件逐字不变。
     let ruleShape = false
     try {
       // 注意：本函数开头已有 `if (!compiled || !group) return true`，故此处 compiled 必为真值，
       // 不需要也不能再写 `compiled !== null`（恒真——CodeQL 会报 "Comparison between inconvertible types"）。
       const type = typeof compiled === 'object' ? compiled._type : null
       const payloadKey = type === 're' ? 're' : type === 'time' ? 'value' : (type === 'multi' || type === 'timeMulti') ? 'rules' : null
+      const payload = payloadKey === null ? undefined : compiled[payloadKey]
+      const payloadOk = payload !== undefined && payload !== null
+      const blocksOk = payloadKey === 're' && Array.isArray(compiled.blocks) && compiled.blocks.length > 0
       ruleShape = typeof type === 'string' && payloadKey !== null &&
         (allowedTypes === undefined || allowedTypes.includes(type)) &&
-        compiled[payloadKey] !== undefined && compiled[payloadKey] !== null
+        (payloadOk || blocksOk)
     } catch (e) { ruleShape = false }
     if (!ruleShape) {
       console.warn('⚠️ 过滤检查收到与本调用方不匹配或缺载荷的规则对象（应为 compileRules 产物），已保守放行')
@@ -167,6 +174,9 @@ function createFilterEngine ({ Utils, RuleEngine, FILTER_FIELDS, compileUserRege
      *  （空串即使规则是 .* 也不命中）。 */
     const matchOnce = (compiled, value, catename) => {
       if (!compiled || value === undefined || value === null || value === '') return { hit: false, rule: null }
+      // v3.535（W4）：简单模式（_type 're'）直接交给 matchesCompiled —— 它 blocks 优先、命中即短路，
+      // 所以诊断**不需要**单条整段正则，也**不做懒编译**（切块产物的 compiled.re 恒为 null；为诊断再
+      // new 一条 4k 分支的整段 RE2 只会白占原生内存，且 explainFilter 是每轮热路径）。
       if (compiled._type !== 'multi') return { hit: RuleEngine.matchesCompiled(compiled, value, catename), rule: null }
       // C9-007：正文整次扫描只归一化一次——逐条谓词里再归一化等于「规则数 × 文本长度」的白扫
       // （归一化是纯函数，同一输入结果恒定）；分类名的归一化由 _firstMatchingRule 做一次。

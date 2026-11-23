@@ -574,6 +574,55 @@ test('非法正则被拒绝', () => {
   expectError(validateFilterRules({ revision: 0, filter: { pingbibiaoti: '(' } }, deps), 'pingbibiaoti', 'invalid_value_regex', '非法值')
 })
 
+test('W4：>600 分支简单字段保存校验通过，且校验/编译全程不编整段（只编块）', () => {
+  // 计数型 compileUserRegex 替身：记录每一次编译的源码，并真正编译（闸门 3/4 都要能过）
+  const seen = []
+  const countingCompile = (source, flags) => {
+    seen.push(String(source))
+    try { return new RegExp(source, flags) } catch (e) { return null }
+  }
+  const countedEngine = createRuleEngine({
+    Utils: {
+      safeGet: (obj, key) => (obj === null || obj === undefined ? undefined : obj[key]),
+      safeErrorText: (error, fallback = '') => (error && error.message ? String(error.message) : fallback),
+      parseTime: () => null,
+      daysFrom: () => 0
+    },
+    FILTER_FIELDS: FILTER_RULE_FIELDS,
+    compileUserRegex: countingCompile,
+    isRe2Available: () => true
+  })
+  const countedDeps = { RuleEngine: countedEngine, compileUserRegex: countingCompile, re2Available: true }
+  const lines = []
+  for (let i = 0; i < 350; i++) lines.push('城市' + i + '|品牌' + i) // 700 分支 ⇒ 2 块
+  const bigSource = lines.join('|') // 整段源码（只按行 join，不含换行）
+  // 先取一次 compileRules 产物（同时拿到块源码集合），再单独量**校验路径**的编译记录
+  const compiled = countedEngine.compileRules({ pingbibiaoti: lines.join('\n') })
+  assert.strictEqual(compiled.pingbibiaoti._type, 're', '简单字段编译产物 _type 必须是 re（compileStateOf 口径不变）')
+  assert.strictEqual(compiled.pingbibiaoti.re, null, '切成多块后 re 必须是 null')
+  assert.strictEqual(compiled.pingbibiaoti.blocks.length, 2, '700 分支必须切 2 块，实际 ' + compiled.pingbibiaoti.blocks.length)
+  const blockSources = new Set(compiled.pingbibiaoti.blocks.map((b) => b.source))
+  const maxBlockLen = Math.max(...[...blockSources].map((s) => s.length))
+  seen.length = 0
+  const result = validateFilterRules({ revision: 0, filter: { pingbibiaoti: lines.join('\n') } }, countedDeps)
+  assert.strictEqual(result.ok, true, `>600 分支简单字段必须通过校验：${JSON.stringify(result.errors)}`)
+  assert.ok(seen.length > 0, '校验路径必须真的编译（计数替身没被调用说明这条用例没验到东西）')
+  assert.strictEqual(seen.includes(bigSource), false, '校验路径不得编译整段源码（否则整条 RE2 会常驻 _userReCache，抵消 W4 收益）')
+  assert.strictEqual(seen.some((s) => s.length > maxBlockLen), false, '校验路径不得编译比块更长的源码（整段/带换行原文都算整段）')
+  // 只允许编译块源码：每一条被编译的源码都必须与某个块源码逐字相等（不是整段、也不是带换行的原值）
+  for (const src of seen) {
+    assert.ok(blockSources.has(src), '被编译的源码必须恰好是某个块源码（不是整段）：len=' + src.length + ' head=' + src.slice(0, 30))
+  }
+  // 非法简单正则仍报 invalid_value_regex（错误码不变），且走的是整段编译（替身记录里能看到它）
+  seen.length = 0
+  expectError(validateFilterRules({ revision: 0, filter: { pingbibiaoti: '(' } }, countedDeps), 'pingbibiaoti', 'invalid_value_regex', '非法值仍拒绝')
+  // 注入方没有 simpleSourceCompiles（旧替身/别的模块）时回落 compileOk：行为与旧版一致
+  const legacyEngine = Object.assign({}, countedEngine)
+  delete legacyEngine.simpleSourceCompiles
+  const legacyDeps = { RuleEngine: legacyEngine, compileUserRegex: countingCompile, re2Available: true }
+  assert.strictEqual(validateFilterRules({ revision: 0, filter: { pingbibiaoti: '苏州|杭州' } }, legacyDeps).ok, true, '缺 simpleSourceCompiles 时必须回落 compileOk 且照常通过')
+})
+
 // ===== 闸门 4：编译结果对账 =====
 test('简单字段编译结果必须是 re（对账失败即拒绝）', () => {
   const fakeEngine = {
