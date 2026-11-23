@@ -4685,8 +4685,8 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
   // 备份里所有「大小」判断都必须按 UTF-8 字节：String.length 会把一个中文/emoji 当 1，
   // 与 readSafeTextResult / writeAtomic 的真实字节上限不一致。
   const backupBytes = (text) => Buffer.byteLength(String(text), 'utf8')
-  const validBackupMessage = (m) => m && typeof m === 'object' && !Array.isArray(m) &&
-    (typeof m.title === 'string' || typeof m.content === 'string')
+  // `_f` 条目写盘已删正文（toDiskEntry）：只要 id（非空字符串/有限数字）+ url（非空字符串）身份齐全就算合法备份条目，否则整类 messages 被跳过/拒收
+  const validBackupMessage = (m) => m && typeof m === 'object' && !Array.isArray(m) && (typeof m.title === 'string' || typeof m.content === 'string' || (m._f === true && ((typeof m.id === 'string' && m.id !== '') || (typeof m.id === 'number' && Number.isFinite(m.id))) && typeof m.url === 'string' && m.url !== ''))
   const countBackupMessages = (items) => items.reduce((n, m) => n + (validBackupMessage(m) && m._f !== true ? 1 : 0), 0)
   const importKeyOf = (req) => {
     const raw = req && req.headers ? req.headers['idempotency-key'] : ''

@@ -1104,6 +1104,47 @@ check('J9-01 journal 行的 _f put 已瘦身：日志不带 content/content_html
   assert.strictEqual(reread.has({ id: 'n1' }, NAME), true, '合并后普通条目身份仍可判重命中')
 })
 
+check('J9-02 读端兜底裁剪（maxSize 下调 + journal 回放）必须与写路径同口径：_f 先出局、已推送条目不被挤掉', () => {
+  const NAME = 'push.json'
+  // 直接写快照 + 手写 journal 行（不经 store），避免写路径自己先裁一遍把现场做平。
+  const setup = (tag) => {
+    const dir = tmpDir('trim-f-' + tag)
+    const fp = path.join(dir, NAME)
+    fs.writeFileSync(fp, JSON.stringify([
+      { id: 'a', title: 'A' },
+      { id: 'b', title: 'B' },
+      { id: 'f', url: 'https://u.example/f', title: 'F', _f: true }
+    ]))
+    fs.writeFileSync(journalPathFor(fp), JSON.stringify({ v: 2, at: 100, put: [{ id: 'c', title: 'C' }] }) + '\n')
+    return { dir, fp }
+  }
+  // 场景 1：上限 3、回放后 4 条 ⇒ 只超 1 条，必须淘汰 `_f`（f），不能动数组最旧的活条目 a。
+  // 修前实测：返回 ['b','f','c']（a 被误删并落墓碑）——等于让 `_f` 挤掉已推送记录的判重记忆。
+  {
+    const { dir, fp } = setup('keep')
+    const beforeBytes = fs.readFileSync(fp)
+    const store = makeStore({ dir, maxSize: 3 })
+    const got = store.readMessages(fp)
+    assert.deepStrictEqual(got.map((m) => m.id), ['a', 'b', 'c'],
+      '上限 3 + 回放 1 条：必须先淘汰 _f，已推送的 a/b 保命')
+    assert.strictEqual(store.has({ id: 'a' }, NAME), true, '活条目 a 的判重记忆不得丢失')
+    assert.strictEqual(store.has({ id: 'b' }, NAME), true, '活条目 b 的判重记忆不得丢失')
+    assert.strictEqual(store.has({ id: 'f' }, NAME), false, '被淘汰的 _f 不落墓碑：回到上游要能重新评估')
+    assert.deepStrictEqual(fs.readFileSync(fp), beforeBytes, '读路径不得写盘（push.json 字节不变）')
+  }
+  // 场景 2：上限 2、回放后 4 条 ⇒ 两个名额：`_f` 先出局，不足再按数组序取最旧的 a（必须落墓碑）。
+  {
+    const { dir, fp } = setup('drop')
+    const beforeBytes = fs.readFileSync(fp)
+    const store = makeStore({ dir, maxSize: 2 })
+    const got = store.readMessages(fp)
+    assert.deepStrictEqual(got.map((m) => m.id), ['b', 'c'], '上限 2：_f 先出局，再从最旧的活条目收敛到上限')
+    assert.strictEqual(store.has({ id: 'a' }, NAME), true, '被读端裁掉的活条目 a 必须由墓碑拦下（fail-closed）')
+    assert.strictEqual(store.has({ id: 'f' }, NAME), false, '被淘汰的 _f 不落墓碑')
+    assert.deepStrictEqual(fs.readFileSync(fp), beforeBytes, '读路径不得写盘（push.json 字节不变）')
+  }
+})
+
 // ============================================================
 console.log(`\n判重日志套件：通过 ${pass} / 失败 ${fail}`)
 cleanup()

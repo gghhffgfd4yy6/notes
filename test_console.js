@@ -3993,6 +3993,50 @@ async function backupApiTests () {
     }
   })
 
+  await aok('数据备份: _f 瘦身条目（无正文、身份齐全）不得让整类 messages 被跳过 / 拒收', async () => {
+    const dir = mkTmp('xbk-console-backup-')
+    const pushPath = path.join(dir, 'push.json')
+    // 模拟 v3.534 写盘投影后的真实磁盘形态：`_f` 条目的 content/content_html 已被 toDiskEntry 删掉，
+    // 上游「(无标题线报)」这类条目连 title 都没有 ⇒ 只剩 id/url 身份。它仍是合法备份条目。
+    const slim = [
+      { id: 'f-1', url: 'https://u.example/f-1', _f: true },
+      { id: 'n1', url: 'https://u.example/n1', title: 'n1', content: '正常正文' }
+    ]
+    fs.writeFileSync(pushPath, JSON.stringify(slim))
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      const exp = await request(port, 'POST', '/api/backup/export', {
+        token: TOKEN,
+        body: JSON.stringify({ categories: ['messages'] }),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(exp.status, 200, exp.text)
+      const bundle = JSON.parse(exp.text)
+      assert.ok(bundle.data.messages,
+        `瘦身后的 _f 条目不得让整类 messages 被跳过（实际 skipped：${JSON.stringify(bundle.skipped)}）`)
+      assert.deepStrictEqual(bundle.skipped.filter((s) => s.key === 'messages'), [], '导出不得报告 messages 被跳过')
+      assert.strictEqual(exp.headers['x-backup-skipped'] || '', '', 'X-Backup-Skipped 不得含 messages')
+      assert.strictEqual(bundle.data.messages.count, 1, '统计仍只计已推送条目（_f 不计入 count）')
+      const backedUp = JSON.parse(bundle.data.messages.text)
+      assert.deepStrictEqual(backedUp.map((m) => m.id), ['f-1', 'n1'],
+        '备份必须带上 _f 身份（缺了它，换机恢复后上游重放会重复推送）')
+      // 同一份备份必须能导回：判据与导出同源，否则用户看到「导出成功、恢复 400」。
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, imp.text)
+      assert.strictEqual(JSON.parse(imp.text).imported.messages, 1, '导入计数与导出 count 同口径')
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(pushPath, 'utf8')).map((m) => m.id), ['f-1', 'n1'],
+        '导入后 push.json 必须仍含两个 id（身份齐全的 _f 条目不得被拒收）')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   await aok('数据备份: 判重历史随消息恢复，重复导入按幂等键返回原结果', async () => {
     const dir = mkTmp('xbk-console-backup-')
     const pushPath = path.join(dir, 'push.json')
