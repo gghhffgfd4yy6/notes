@@ -1,8 +1,8 @@
 'use strict'
 
 const path = require('node:path')
-const fs = require('node:fs')
-const { readSafeTextResult } = require('../xbk_storage')
+const { readSafeTextResult, statFileSignature } = require('../xbk_storage')
+const { countArchives } = require('./log-archive')
 const { defaultMessageSignature } = require('./message-signature')
 // 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧固定按 Asia/Shanghai 写，趋势窗口/输出键
 // 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
@@ -205,14 +205,15 @@ function classifyRoundFailures (lines, summaryAt) {
 // 22.9% / grab 15% / tsMs 13% / slice 9% —— 同一份 run.log（672 KB / 6,260 行）被 readStatus、
 // readTrends、readRunHistory 各自重读 + split + 逐行正则一遍。
 // 这里把「读 → 切行 → 逐行摘要解析 → 轮界归属 → 按日聚合 → 尾窗指纹」收进唯一入口
-// readRunLog()，以 (dir, maxBytes/tail, dev, ino, size, mtimeMs) 为键缓存最近 1 份。
+// readRunLog()，以 (dir, maxBytes/tail, signature) 为键缓存最近 1 份。
 // 纪律：
 //   · 解析逻辑仍只有一份（xbk_state_schema.parseRunSummaryLines / parseRunSummaryLine），本文件
 //     只负责「缓存 + 复用」，不得内联第二套正则或计数校验；
 //   · report.state / channel-health.state 不走这里，仍是每次整读（既有新鲜度语义不变）；
-//   · 同 size 同 mtime 的原地改写会命中旧值——这与 SSE 指纹（console.js 采样 run.log 的
-//     size+mtimeMs）是同一个假设，口径一致；run.log 只追加（size 必变）、截尾走 tmp+rename
-//     （dev/ino 必变），故实际触发面只剩「同毫秒同长度改写」，ctimeMs 一并进键再收窄一层；
+//   · signature 来自 xbk_storage.statFileSignature（O_NOFOLLOW 打开 + fstat bigint，
+//     dev:ino:size:mtimeNs:ctimeNs）——run.log 只追加（size/mtime 必变）、截尾走 tmp+rename
+//     （dev/ino 必变），纳秒时间戳让「同一毫秒内同长度改写」也不再命中旧值；取不到签名
+//     （missing/unsafe/ioError/unsupported）就不缓存、每次照读（判不出新鲜度，宁可多解析一遍）；
 //   · 读取仍走 readText（= readSafeTextResult：O_NONBLOCK + 普通文件校验的唯一入口），缓存只做
 //     「同一份字节别解析第二遍」，不绕过任何防御；读窗口内文件被追加/替换（前后 stat 不一致）
 //     时照样返回本次内容，但不缓存。
@@ -234,20 +235,23 @@ function resetRunLogParseStats () {
 }
 
 function statRunLog (dir) {
+  // 审计原语（O_NOFOLLOW 打开 + fstat bigint）：返回 { status, signature, contentSignature }。
+  // 只有 ok 且签名非空才可用于记忆化；missing / unsafe / ioError / unsupported 一律按 null 处理
+  // ⇒ 不缓存、每次照读（与既有「stat 失败就不缓存」语义一致：判不出新鲜度就不拿它当缓存键）。
   try {
-    const st = fs.statSync(path.join(dir, FILES.run))
-    return st.isFile() ? st : null
+    const st = statFileSignature(path.join(dir, FILES.run))
+    return st.status === 'ok' && st.signature ? st : null
   } catch (e) { return null }
 }
 
 function runLogKeyOf (dir, maxBytes, tail, st) {
-  return [dir, maxBytes, tail ? 1 : 0, st.dev, st.ino, st.size, st.mtimeMs, st.ctimeMs].join('\u0000')
+  return [dir, maxBytes, tail ? 1 : 0, st.signature].join('\u0000')
 }
 
 // 一次解析的全部中间结果（同一份文件版本内只算一次）：
 //   lines / summaries（逐行摘要解析结果）/ summaryAt / classification（轮界归属）/
 //   byDay（按上海日历日聚合的趋势中间量）/ windowKey（尾窗指纹）/ lastCancelIdx / firstAnchored。
-function buildRunLogEntry (read, size, maxBytes) {
+function buildRunLogEntry (read) {
   const text = read.value
   const lines = text.split('\n')
   const summaries = parseRunSummaryLines(lines)
@@ -294,7 +298,7 @@ function buildRunLogEntry (read, size, maxBytes) {
     // value/text 都是原文（parseLastRun 的既有调用方与测试按 read.value 取文本）。
     value: text,
     text,
-    truncated: read.truncated === true || (typeof size === 'number' && size > maxBytes),
+    truncated: read.truncated === true,
     lines,
     summaries,
     summaryAt,
@@ -327,10 +331,9 @@ function readRunLog (dir, { maxBytes = LOG_MAX_BYTES, tail = true } = {}) {
     return { status: read.status }
   }
   runLogParses += 1
-  const entry = buildRunLogEntry(read, before === null ? null : before.size, maxBytes)
+  const entry = buildRunLogEntry(read)
   const after = statRunLog(dir)
-  const stable = before !== null && after !== null && after.dev === before.dev &&
-    after.ino === before.ino && after.size === before.size && after.mtimeMs === before.mtimeMs
+  const stable = before !== null && after !== null && after.signature === before.signature
   if (stable) {
     runLogCache.clear()
     runLogCache.set(runLogKeyOf(dir, maxBytes, tail, after), entry)
@@ -539,8 +542,8 @@ function clampTrendDays (v) {
 }
 
 function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = {}) {
-  // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读不报截断，缓存条目在
-  // readRunLog 里以「文件实际大于读取上限」判定（见 buildRunLogEntry 的 truncated）。
+  // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读在「起点 >0」（文件大于读取
+  // 上限）时置 truncated:true，缓存条目原样透传（见 buildRunLogEntry 的 truncated）。
   // 窗口内的更早摘要若被截掉，趋势只反映尾部日志——前端副标题会注明。
   const runLog = readRunLog(dir)
   if (runLog.status !== 'ok') return { status: runLog.status }
@@ -583,10 +586,8 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   }
   // 周档轮转后，run.log 只剩本周：更早的日子不是「真的 0」，而是收进了 logs/ 周档。
   // 如实置 truncated（前端会提示「更早轮次已丢失/见周档」），并给出周档数量。
-  let archivedWeeks = 0
-  try {
-    archivedWeeks = fs.readdirSync(path.join(dir, 'logs')).filter((n) => /^run-\d{8}-\d{8}\.log\.gz$/.test(n)).length
-  } catch (e) {}
+  // 计数走 log-archive.countArchives（白名单与 listArchives 同源，口径 = 只数文件名）。
+  const archivedWeeks = countArchives(dir, FILES.run)
   return result('ok', { days: spanDays, from: rangeMode ? startKey : '', to: rangeMode ? endKey : '', byDay: out, truncated: truncated || archivedWeeks > 0, archivedWeeks, today: todayKey })
 }
 
@@ -785,10 +786,7 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
     key: roundKey.get(r.i)
   }))
   // 同 readTrends：run.log 被周档切走后，更早的轮次不是不存在，而是进了 logs/。
-  let archivedWeeks = 0
-  try {
-    archivedWeeks = require('node:fs').readdirSync(path.join(dir, 'logs')).filter((n) => /^run-\d{8}-\d{8}\.log\.gz$/.test(n)).length
-  } catch (e) {}
+  const archivedWeeks = countArchives(dir, FILES.run)
   return { status: 'ok', items, hasMore: pool.length > items.length, truncated: truncated || archivedWeeks > 0, archivedWeeks, windowKey: key }
 }
 

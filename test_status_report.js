@@ -13,7 +13,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { readStatus, formatStatus, readRunHistory } = require('./scripts/status')
+const { readStatus, formatStatus, readTrends, readRunHistory } = require('./scripts/status')
 
 let failed = 0
 function test (name, fn) {
@@ -668,6 +668,27 @@ try {
     const gone = readStatus(b, { now: NOW })
     assert.strictEqual(gone.run.status, 'missing', 'run.log 已删必须 missing（不得命中旧缓存）')
     assert.strictEqual(runLogParseStats().cached, 0, '不可读时必须顺手丢掉缓存条目')
+  })
+
+  // 周档计数（archivedWeeks）：白名单 = run-<8位>-<8位>.log.gz，非法名不计，且**不要求**
+  // .idx.json（status 的口径历来是「只数文件名」，与 log-archive.listArchives 的「gz+idx 都在」
+  // 是两件事）。archivedWeeks > 0 ⇒ truncated 必须为 true（更早轮次已不在 run.log 里）。
+  test('S31 趋势周档计数：logs/ 下只数合法周键（非法名不计、无 idx 也计）→ archivedWeeks=2 且 truncated', () => {
+    const dir = scratch('s31')
+    put(dir, 'run.log', RUN_OK)
+    fs.mkdirSync(path.join(dir, 'logs'), { recursive: true })
+    // 内容不被读取（只数文件名），故占位字节足够。
+    put(dir, 'logs/run-20261101-20261107.log.gz', 'stub')
+    put(dir, 'logs/run-20261108-20261114.log.gz', 'stub')
+    put(dir, 'logs/run-bad.log.gz', 'stub') // 非法周键：不匹配 /^\d{8}-\d{8}$/ ⇒ 不计
+    const trends = readTrends(dir, { now: NOW })
+    assert.strictEqual(trends.status, 'ok')
+    assert.strictEqual(trends.value.archivedWeeks, 2, '只数合法周键（非法名 run-bad.log.gz 不得计入）')
+    assert.strictEqual(trends.value.truncated, true, '有周档 ⇒ 更早轮次已轮转，truncated 必须为 true')
+    // 运行历史同一口径（两处都走 log-archive.countArchives）。
+    const hist = readRunHistory(dir, { limit: 5 })
+    assert.strictEqual(hist.archivedWeeks, 2, 'readRunHistory 的 archivedWeeks 必须与 readTrends 同口径')
+    assert.strictEqual(hist.truncated, true)
   })
 
   console.log(`test_status_report OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)
