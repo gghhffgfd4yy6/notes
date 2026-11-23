@@ -1080,7 +1080,8 @@ function buildAssetStore () {
       spec,
       raw,
       // v3.532：Node 侧预压两个表示（br q11 / gzip 9），按 Accept-Encoding 协商直发；
-      // 边缘反代不再需要「解压再重压」（opt-web 取证：每请求 encode ≈19 ms，identity 7 ms；本机未复测）。
+      // 现网该路由的 header_up -Accept-Encoding 只摘客户端头、Caddy 的 Go transport 会补回 gzip，线上实为
+      // gzip → 边缘解压 → br6 重压；去掉该头才省掉这步（opt-web 取证：每请求 encode ≈19 ms，identity 7 ms；本机未复测）。
       br: zlib.brotliCompressSync(raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 } }),
       gzip: zlib.gzipSync(raw, { level: 9 }),
       etag: `"${hash}"`,
@@ -2052,8 +2053,7 @@ function logCaught (label, e) {
 
 function sendJson (res, code, obj) {
   // 压缩统一在边缘（Caddy 的 encode 片段）完成：本进程只发 identity，不再自带协商/压缩。
-  // 反代已经把 Accept-Encoding 摘掉（header_up -Accept-Encoding），Node 侧压缩在现网
-  // 永远不会触发；两套并存只会让后来人以为线上跑的是 Node 压缩。
+  // 反代虽会向上游补回 gzip（header_up -Accept-Encoding 只摘客户端头），但本端点不发压缩表示：JSON 仍 identity 交边缘压缩，别误以为线上跑的是 Node 压缩。
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(obj))
 }
