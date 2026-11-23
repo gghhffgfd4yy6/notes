@@ -356,7 +356,7 @@ function App () {
   // 已按哪个节奏值建过定时器：节奏没变就不重建（SSE 在线时 interval 恒为 60 s，locking 翻转
   // 不再把定时器拆了重装）。0 = 还没有定时器。
   const armedIntervalRef = useRef(0)
-  // 上一次补发首屏的那组「调度开关」（页签 / 暂停 / 凭证）：只有它变了才补一发，
+  // 上一次补发首屏的那组「调度开关」（页签 / 暂停）：只有它变了才补一发（凭证失效另有早退停表），
   // 节奏值或 locking 翻转只改定时器，不再白打一对 /api/status + /api/runs。
   const scheduleRef = useRef('')
 
@@ -816,10 +816,11 @@ function App () {
     // 只有「首屏」与「真的在自动刷新」才补这一发：暂停时切页签 / locking 翻转同样会让本
     // effect 重跑，无条件 refreshSplit() 等于按了暂停还在打接口（C7-040）。首屏例外——
     // 否则暂停着重开页面就是一片空白。
-    // v3.533：补发再收紧到「调度开关真的变了」（页签 / 暂停 / 凭证）。旧实现的依赖里含 locking
+    // v3.533：补发再收紧到「调度开关真的变了」（页签 / 暂停）。旧实现的依赖里含 locking
     // （本机每 5 s 一轮运行 ⇒ 翻转频繁），每翻一次就白打一对 /api/status + /api/runs；而节奏值
-    // 变化（interval）本来只需重装定时器，不需要额外来一发。
-    const scheduleKey = `${tab}|${autoRefresh ? 1 : 0}|${authExpired ? 1 : 0}`
+    // 变化（interval）本来只需重装定时器，不需要额外来一发。凭证不进键：失效已被上面的早退
+    // 分支拦下（停表），这里再放一个恒为 0 的分量只会是死代码（CodeQL js/trivial-conditional）。
+    const scheduleKey = `${tab}|${autoRefresh ? 1 : 0}`
     const scheduleChanged = scheduleRef.current !== scheduleKey
     scheduleRef.current = scheduleKey
     if (scheduleChanged && (autoRefresh || !bootFetchedRef.current)) {
