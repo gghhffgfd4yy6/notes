@@ -88,7 +88,7 @@
     "re2@1.27.0": true
   },
   "optionalDependencies": {
-    "re2": "^1.27.0"
+    "re2": "^1.27.2"
   },
   "standard": {
     "ignore": [
