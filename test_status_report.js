@@ -13,7 +13,7 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { readStatus, formatStatus, readRunHistory } = require('./scripts/status')
+const { readStatus, formatStatus, readTrends, readRunHistory } = require('./scripts/status')
 
 let failed = 0
 function test (name, fn) {
@@ -605,6 +605,90 @@ try {
     const tail = readStatus(big, { now: NOW }).stats
     assert.strictEqual(tail.status, 'ok')
     assert.strictEqual(tail.value.truncated, true, '尾部截断必须显式上报')
+  })
+
+  // ===== v3.533 run.log 读取+解析记忆化 =====
+  // 判据只用「真解析了几次」这一个可观测计数（runLogParseStats，仅测试用内省接口），
+  // 不比两次返回相同——那是自证（缓存坏了但两份都错也会绿）。
+  test('S29 run.log 记忆化：文件未变零重解析、追加一行恰好重解析一次、三处读取共用一份', () => {
+    const { runLogParseStats, resetRunLogParseStats, readTrends } = require('./scripts/status')
+    const dir = scratch('s29')
+    put(dir, 'run.log', [
+      '2026-09-08 10:00:00 total=5 dedup=1 filtered=2 truncated=0 pushed=2 failed=0 elapsed=0.5s',
+      '2026-09-08 11:00:00 total=6 dedup=0 filtered=1 truncated=0 pushed=6 failed=0 elapsed=0.4s'
+    ].join('\n') + '\n')
+    resetRunLogParseStats()
+    const first = readStatus(dir, { now: NOW })
+    const s1 = runLogParseStats()
+    assert.deepStrictEqual([s1.parses, s1.hits, s1.cached], [1, 0, 1], '冷读：解析 1 次、命中 0、缓存留 1 份')
+    assert.strictEqual(first.run.value.total, 6)
+    // ① 文件完全没变：第二次不得再解析（parses 增量 0），只记一次命中。
+    const second = readStatus(dir, { now: NOW })
+    const s2 = runLogParseStats()
+    assert.strictEqual(s2.parses - s1.parses, 0, '文件未变，第二次 readStatus 不得再解析 run.log')
+    assert.strictEqual(s2.hits - s1.hits, 1, '文件未变，第二次必须命中缓存（hits +1）')
+    assert.deepStrictEqual(second.run, first.run, '命中与冷读的运行卡必须一致（同一份解析结果）')
+    assert.deepStrictEqual(second.stats, first.stats, '命中与冷读的聚合必须一致')
+    // ② 追加一行：size/mtime 变 ⇒ 必须重解析，且只解析一次。
+    fs.appendFileSync(path.join(dir, 'run.log'), '2026-09-08 12:00:00 total=9 dedup=0 filtered=0 truncated=0 pushed=9 failed=0 elapsed=0.3s\n')
+    const third = readStatus(dir, { now: NOW })
+    const s3 = runLogParseStats()
+    assert.strictEqual(s3.parses - s2.parses, 1, '追加一行后必须恰好重解析一次')
+    assert.strictEqual(third.run.value.total, 9, '追加后的新摘要必须被读到（缓存不得返回旧值）')
+    // ③ readTrends / readRunHistory 复用同一份：同一拍里三个端点不再各解析一遍。
+    const before = runLogParseStats()
+    readTrends(dir, { now: NOW })
+    readRunHistory(dir, { limit: 5 })
+    const after = runLogParseStats()
+    assert.strictEqual(after.parses - before.parses, 0, 'readTrends / readRunHistory 不得重复解析同一份 run.log')
+    assert.strictEqual(after.hits - before.hits, 2, '两处读取都必须命中同一缓存条目')
+  })
+
+  // 缓存只留 1 份（内存上界）+ 缺失不缓存（否则删了日志还拿旧值）。
+  test('S30 run.log 记忆化：只留最近 1 份（换目录必重解析）、文件消失后不得命中', () => {
+    const { runLogParseStats, resetRunLogParseStats } = require('./scripts/status')
+    const a = scratch('s30a')
+    const b = scratch('s30b')
+    const line = '2026-09-08 10:00:00 total=1 dedup=0 filtered=0 truncated=0 pushed=1 failed=0 elapsed=0.1s\n'
+    put(a, 'run.log', line)
+    put(b, 'run.log', line)
+    resetRunLogParseStats()
+    readStatus(a, { now: NOW })
+    const s1 = runLogParseStats()
+    assert.strictEqual(s1.parses, 1)
+    readStatus(b, { now: NOW })
+    const s2 = runLogParseStats()
+    assert.strictEqual(s2.parses - s1.parses, 1, '换目录必须重解析（缓存键含 dir，不是全局一份）')
+    assert.strictEqual(s2.cached, 1, '缓存只保留最近 1 份（不随目录数增长）')
+    readStatus(a, { now: NOW })
+    const s3 = runLogParseStats()
+    assert.strictEqual(s3.parses - s2.parses, 1, 'A 已被淘汰：再读 A 必须重解析（证明只留 1 份）')
+    // 文件被删除/截走：不得继续命中旧值。
+    fs.unlinkSync(path.join(b, 'run.log'))
+    const gone = readStatus(b, { now: NOW })
+    assert.strictEqual(gone.run.status, 'missing', 'run.log 已删必须 missing（不得命中旧缓存）')
+    assert.strictEqual(runLogParseStats().cached, 0, '不可读时必须顺手丢掉缓存条目')
+  })
+
+  // 周档计数（archivedWeeks）：白名单 = run-<8位>-<8位>.log.gz，非法名不计，且**不要求**
+  // .idx.json（status 的口径历来是「只数文件名」，与 log-archive.listArchives 的「gz+idx 都在」
+  // 是两件事）。archivedWeeks > 0 ⇒ truncated 必须为 true（更早轮次已不在 run.log 里）。
+  test('S31 趋势周档计数：logs/ 下只数合法周键（非法名不计、无 idx 也计）→ archivedWeeks=2 且 truncated', () => {
+    const dir = scratch('s31')
+    put(dir, 'run.log', RUN_OK)
+    fs.mkdirSync(path.join(dir, 'logs'), { recursive: true })
+    // 内容不被读取（只数文件名），故占位字节足够。
+    put(dir, 'logs/run-20261101-20261107.log.gz', 'stub')
+    put(dir, 'logs/run-20261108-20261114.log.gz', 'stub')
+    put(dir, 'logs/run-bad.log.gz', 'stub') // 非法周键：不匹配 /^\d{8}-\d{8}$/ ⇒ 不计
+    const trends = readTrends(dir, { now: NOW })
+    assert.strictEqual(trends.status, 'ok')
+    assert.strictEqual(trends.value.archivedWeeks, 2, '只数合法周键（非法名 run-bad.log.gz 不得计入）')
+    assert.strictEqual(trends.value.truncated, true, '有周档 ⇒ 更早轮次已轮转，truncated 必须为 true')
+    // 运行历史同一口径（两处都走 log-archive.countArchives）。
+    const hist = readRunHistory(dir, { limit: 5 })
+    assert.strictEqual(hist.archivedWeeks, 2, 'readRunHistory 的 archivedWeeks 必须与 readTrends 同口径')
+    assert.strictEqual(hist.truncated, true)
   })
 
   console.log(`test_status_report OK (${failed === 0 ? '全部通过' : failed + ' 项失败'})`)

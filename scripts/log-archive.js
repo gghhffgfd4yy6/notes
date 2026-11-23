@@ -933,6 +933,25 @@ function listArchives (cacheDir, fileName) {
   return out
 }
 
+// 只数归档周档的数量（控制台「更早轮次已进 logs/ 周档」提示用，status.js 的 archivedWeeks）。
+// 白名单与 listArchives **完全一致**（同一个 archiveDir + baseOf + 周键正则），但有意不读
+// `.idx.json`、不做 stat：listArchives 认的是「gz + idx 都在」的**可读成品**（崩在发布中途的
+// 半成品不算一档，否则读档会拿到不全的内容）；本函数只是「轮转出去了几周」的计数，沿用
+// status.js 既有口径——只数文件名（半成品也意味着这段日志已不在 run.log 里了）。
+function countArchives (cacheDir, fileName) {
+  const dir = archiveDir(cacheDir)
+  const base = baseOf(fileName)
+  let names = []
+  try { names = fs.readdirSync(dir) } catch (e) { return 0 } // nosemgrep（固定子目录）
+  let count = 0
+  for (const n of names) {
+    if (!n.startsWith(base + '-') || !n.endsWith('.log.gz')) continue
+    if (!/^\d{8}-\d{8}$/.test(n.slice(base.length + 1, -'.log.gz'.length))) continue
+    count += 1
+  }
+  return count
+}
+
 // 一年保留：删掉最老的归档（gz + idx）。
 function pruneArchives (cacheDir, fileName, keep = KEEP_WEEKS) {
   const list = listArchives(cacheDir, fileName)
@@ -952,6 +971,7 @@ module.exports = {
   readGzPage,
   loadPlainIndex,
   listArchives,
+  countArchives,
   pruneArchives,
   weekMarkerPath,
   readMarker,

@@ -1,7 +1,8 @@
 'use strict'
 
 const path = require('node:path')
-const { readSafeTextResult } = require('../xbk_storage')
+const { readSafeTextResult, statFileSignature } = require('../xbk_storage')
+const { countArchives } = require('./log-archive')
 const { defaultMessageSignature } = require('./message-signature')
 // 上海日历日（YYYY-MM-DD）：run.log 的时间戳由生产侧固定按 Asia/Shanghai 写，趋势窗口/输出键
 // 必须用同一日历日，否则宿主为 UTC 时每天 00:00–08:00 的轮次会被算进前一天/后一天
@@ -19,8 +20,8 @@ const {
   isValidChannelHealthEntry,
   validateChannelHealth,
   RUN_SUMMARY_LINE_RE,
-  parseRunSummaryLine,
-  deriveRunStats
+  parseRunSummaryLines,
+  deriveRunStatsFromParsed
 } = require('../xbk_state_schema')
 // P1：判重缓存的增量日志（journal）口径与回放实现只此一份——运行侧 MessageStore 与这里共用
 // 同一组纯函数，禁止控制台各写一套（两套身份语义一旦分叉，控制台就会把更新显示成重复条目）。
@@ -149,17 +150,11 @@ function tsMs (line) {
   return Number.isFinite(v) ? v : null
 }
 
-// 摘要行索引表：0-based 行号 → 摘要时间戳(ms) / null（无时间戳）。
+// 摘要行索引表（0-based 行号 → 摘要时间戳(ms)/null）现在由 readRunLog 的缓存条目一次建好
+// （见下方 buildRunLogEntry），parseLastRun / readRunHistory 共用同一份——同一份日志不再各自
+// 扫一遍正则。
 // 计数器非法/缺失的摘要行不参与归属（否则失败轮会凭空消失）——parseRunSummaryLine 已含
 // 「行首锚定 + 六项计数必须是非负安全整数」两道判据（与写入侧同源），故只看它返回 null 与否。
-function summaryIndexOf (lines) {
-  const summaryAt = new Map()
-  for (let i = 0; i < lines.length; i++) {
-    if (!parseRunSummaryLine(lines[i])) continue
-    summaryAt.set(i, tsMs(lines[i]))
-  }
-  return summaryAt
-}
 
 // 失败行 → 所属摘要行（interruptedIdx）或无主崩溃行（crashIdx）。
 function classifyRoundFailures (lines, summaryAt) {
@@ -205,22 +200,160 @@ function classifyRoundFailures (lines, summaryAt) {
   return { interruptedIdx, crashIdx }
 }
 
-function parseLastRun (read) {
-  if (read.status !== 'ok') return { status: read.status }
-  const lines = read.value.trim().split('\n').filter(Boolean)
+// ── run.log 读取 + 解析记忆化（v3.533）──────────────────────────────────────
+// 取证（perf-20261122/opt-api ④）：/api/status 每拍 52.5 ms CPU，profile 里 parseRunSummaryLine
+// 22.9% / grab 15% / tsMs 13% / slice 9% —— 同一份 run.log（672 KB / 6,260 行）被 readStatus、
+// readTrends、readRunHistory 各自重读 + split + 逐行正则一遍。
+// 这里把「读 → 切行 → 逐行摘要解析 → 轮界归属 → 按日聚合 → 尾窗指纹」收进唯一入口
+// readRunLog()，以 (dir, maxBytes/tail, signature) 为键缓存最近 1 份。
+// 纪律：
+//   · 解析逻辑仍只有一份（xbk_state_schema.parseRunSummaryLines / parseRunSummaryLine），本文件
+//     只负责「缓存 + 复用」，不得内联第二套正则或计数校验；
+//   · report.state / channel-health.state 不走这里，仍是每次整读（既有新鲜度语义不变）；
+//   · signature 来自 xbk_storage.statFileSignature（O_NOFOLLOW 打开 + fstat bigint，
+//     dev:ino:size:mtimeNs:ctimeNs）——run.log 只追加（size/mtime 必变）、截尾走 tmp+rename
+//     （dev/ino 必变），纳秒时间戳让「同一毫秒内同长度改写」也不再命中旧值；取不到签名
+//     （missing/unsafe/ioError/unsupported）就不缓存、每次照读（判不出新鲜度，宁可多解析一遍）；
+//   · 读取仍走 readText（= readSafeTextResult：O_NONBLOCK + 普通文件校验的唯一入口），缓存只做
+//     「同一份字节别解析第二遍」，不绕过任何防御；读窗口内文件被追加/替换（前后 stat 不一致）
+//     时照样返回本次内容，但不缓存。
+const RUN_LOG_CACHE_MAX = 1
+const runLogCache = new Map() // key → entry；只留最近 1 份（RUN_LOG_CACHE_MAX）
+let runLogParses = 0
+let runLogHits = 0
+
+// 内省接口（**只给测试用**）：parses = 真正做了解析的次数，hits = 命中缓存的次数，
+// cached = 当前缓存条目数（0/1）。不进任何 HTTP 响应、不进 --status 输出——它只回答
+// 「这一拍到底有没有重新解析」。reset 同时清空缓存，便于用例从零开始计数。
+function runLogParseStats () {
+  return { parses: runLogParses, hits: runLogHits, cached: runLogCache.size }
+}
+function resetRunLogParseStats () {
+  runLogParses = 0
+  runLogHits = 0
+  runLogCache.clear()
+}
+
+function statRunLog (dir) {
+  // 审计原语（O_NOFOLLOW 打开 + fstat bigint）：返回 { status, signature, contentSignature }。
+  // 只有 ok 且签名非空才可用于记忆化；missing / unsafe / ioError / unsupported 一律按 null 处理
+  // ⇒ 不缓存、每次照读（与既有「stat 失败就不缓存」语义一致：判不出新鲜度就不拿它当缓存键）。
+  try {
+    const st = statFileSignature(path.join(dir, FILES.run))
+    return st.status === 'ok' && st.signature ? st : null
+  } catch (e) { return null }
+}
+
+function runLogKeyOf (dir, maxBytes, tail, st) {
+  return [dir, maxBytes, tail ? 1 : 0, st.signature].join('\u0000')
+}
+
+// 一次解析的全部中间结果（同一份文件版本内只算一次）：
+//   lines / summaries（逐行摘要解析结果）/ summaryAt / classification（轮界归属）/
+//   byDay（按上海日历日聚合的趋势中间量）/ windowKey（尾窗指纹）/ lastCancelIdx / firstAnchored。
+function buildRunLogEntry (read) {
+  const text = read.value
+  const lines = text.split('\n')
+  const summaries = parseRunSummaryLines(lines)
+  const summaryAt = new Map()
+  const byDay = new Map()
+  for (const item of summaries) {
+    summaryAt.set(item.i, tsMs(lines[item.i]))
+    const day = item.parsed.day
+    if (!day) continue
+    const counters = item.parsed.counters
+    const agg = byDay.get(day) || { date: day, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 }
+    agg.rounds += 1
+    agg.total += counters.total
+    agg.dedup += counters.dedup
+    agg.filtered += counters.filtered
+    agg.truncated += counters.truncated
+    agg.pushed += counters.pushed
+    agg.failed += counters.failed
+    byDay.set(day, agg)
+  }
+  // 取消留痕的全部行号（升序）：parseLastRun 只要最后一条，readRunHistory 要全部——同一份扫描
+  // 结果两处共用（v3.533：8,888 行 × 每请求一次全表扫 + 逐条 isCancelTrace 是 readRunHistory
+  // 单次 15 ms 里的一块；缓存条目内只算一次）。
+  const cancelIdx = []
+  for (let i = 0; i < lines.length; i++) if (isCancelTrace(lines[i])) cancelIdx.push(i)
+  const lastCancelIdx = cancelIdx.length > 0 ? cancelIdx[cancelIdx.length - 1] : -1
+  // 行 → 游标 key 的记忆表（entryKeyOf 是逐字符 FNV，一次翻页要算上千条；同一文件版本内每条
+  // 只算一次，随条目一起失效）。readRunHistory 的 occurrence 去重仍按「本轮参与的条目集合」编号，
+  // 那部分是集合语义，不在这里缓存。
+  const lineKeys = new Map()
+  const lineKeyOf = (i) => {
+    const hit = lineKeys.get(i)
+    if (hit !== undefined) return hit
+    const k = entryKeyOf(lines[i])
+    lineKeys.set(i, k)
+    return k
+  }
+  // 首行是否「时间戳锚定」：尾读/截尾后首行可能切在行中，readRunHistory 据此判轮转（[5]）。
+  const first = lines[0] || ''
+  const firstAnchored = first.trim() === '' || RUN_SUMMARY_LINE_RE.test(first) ||
+    /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(first)
+  return {
+    status: 'ok',
+    // value/text 都是原文（parseLastRun 的既有调用方与测试按 read.value 取文本）。
+    value: text,
+    text,
+    truncated: read.truncated === true,
+    lines,
+    summaries,
+    summaryAt,
+    classification: classifyRoundFailures(lines, summaryAt),
+    byDay,
+    lastCancelIdx,
+    cancelIdx,
+    lineKeyOf,
+    firstAnchored,
+    windowKey: windowKeyOf(lines)
+  }
+}
+
+// run.log 的唯一读取/解析入口：readStatus / readTrends / readRunHistory 共用。
+// 返回缓存条目（status 'ok'）或 { status }（missing / unsafe / tooLarge / ioError / replaced）。
+function readRunLog (dir, { maxBytes = LOG_MAX_BYTES, tail = true } = {}) {
+  const before = statRunLog(dir)
+  const key = before === null ? '' : runLogKeyOf(dir, maxBytes, tail, before)
+  if (key !== '') {
+    const hit = runLogCache.get(key)
+    if (hit !== undefined) {
+      runLogHits += 1
+      return hit
+    }
+  }
+  const read = readText(dir, FILES.run, maxBytes, { tail })
+  if (read.status !== 'ok') {
+    // 不可读/缺失不缓存（下一次读要重新判状态），顺手丢掉上一份，不给旧条目留内存。
+    runLogCache.clear()
+    return { status: read.status }
+  }
+  runLogParses += 1
+  const entry = buildRunLogEntry(read)
+  const after = statRunLog(dir)
+  const stable = before !== null && after !== null && after.signature === before.signature
+  if (stable) {
+    runLogCache.clear()
+    runLogCache.set(runLogKeyOf(dir, maxBytes, tail, after), entry)
+    while (runLogCache.size > RUN_LOG_CACHE_MAX) runLogCache.delete(runLogCache.keys().next().value)
+  }
+  return entry
+}
+
+function parseLastRun (runLog) {
+  if (runLog.status !== 'ok') return { status: runLog.status }
+  // 行数组来自 readRunLog（原始 split('\n')）：旧实现先 trim + filter(Boolean)，但空行既不可能
+  // 是摘要行也不可能带 CANCEL 留痕，两者对结果的贡献恒为空，故不再各复制一份数组。
+  const { lines, summaries, classification, lastCancelIdx } = runLog
+  const lastSummary = summaries.length > 0 ? summaries[summaries.length - 1].i : -1
   // 取消留痕也可能就是「最近一轮」：它没有 counters，旧实现跳过它继续找上一条摘要，
   // 于是刚被停止的任务在状态卡里显示成上一轮「正常」。只取比最后一条摘要更晚的 CANCEL；
   // 取消后若已有新摘要，仍以新摘要为准。
-  const summaryAt = summaryIndexOf(lines)
-  let lastSummary = -1
-  for (const idx of summaryAt.keys()) lastSummary = Math.max(lastSummary, idx)
-  let lastCancel = -1
-  for (let i = 0; i < lines.length; i++) {
-    if (isCancelTrace(lines[i])) lastCancel = i
-  }
-  if (lastCancel > lastSummary) {
+  if (lastCancelIdx > lastSummary) {
     return result('ok', {
-      at: tsOf(lines[lastCancel]),
+      at: tsOf(lines[lastCancelIdx]),
       total: null,
       dedup: null,
       filtered: null,
@@ -236,25 +369,18 @@ function parseLastRun (read) {
       orphanFailureAt: ''
     })
   }
-  for (let i = lines.length - 1; i >= 0; i--) {
-    // 行首锚定：摘要行只可能是「时间戳（本地 YYYY-MM-DD HH:MM:SS 或历史 ISO）+ total=」或裸 total=，
-    // 避免 ERROR/ALERT 行文本里恰好含 total=… 子串时被误取；六项计数必须是非负安全整数
-    // （超长数字经 Number 得 Infinity/超界，整行跳过）。这两道判据与写入侧同源
-    // （xbk_state_schema.parseRunSummaryLine），不再在此内联正则与计数校验。
-    // 审查 SS-01：时间戳由非捕获组改为捕获组（旧实现只用来锚定，结果里没有任何时间字段，
-    // 输出无法判断这一轮是何时跑的、也看不出日志已经很久没更新）。
-    const parsed = parseRunSummaryLine(lines[i])
-    if (!parsed) continue
+  // summaries 按行号升序（parseRunSummaryLines 的产出序），最后一条即「最近一条合格摘要」。
+  if (summaries.length > 0) {
+    const item = summaries[summaries.length - 1]
+    const i = item.i
+    const parsed = item.parsed
     const counters = parsed.counters
-    // 找到最近一条完整摘要就返回，循环不会进入第二次——归属表可以在这里一次性构建
-    // （CodeQL: 旧写法的 !summaryAt 条件恒真，属死分支）。
-    const summaryAt = summaryIndexOf(lines)
-    const classified = classifyRoundFailures(lines, summaryAt)
-    // 与 readRunHistory 同一归属口径：只标「本条摘要自己的轮」是否中断；其后的无主失败行
-    // 单独计数上报（旧实现把尾部任意 ERROR 回填给本条摘要 ⇒ 与运行历史结论相反）。
+    // 与 readRunHistory 同一归属口径（同一份 classification）：只标「本条摘要自己的轮」是否
+    // 中断；其后的无主失败行单独计数上报（旧实现把尾部任意 ERROR 回填给本条摘要 ⇒ 与运行
+    // 历史结论相反）。
     let orphanFailures = 0
     let orphanFailureAt = ''
-    for (const j of classified.crashIdx) {
+    for (const j of classification.crashIdx) {
       if (j <= i) continue
       orphanFailures += 1
       const at = tsOf(lines[j])
@@ -270,7 +396,7 @@ function parseLastRun (read) {
       failed: counters.failed,
       elapsed: parsed.elapsed,
       dryRun: parsed.extras.dryRun,
-      interrupted: classified.interruptedIdx.has(i),
+      interrupted: classification.interruptedIdx.has(i),
       orphanFailures,
       orphanFailureAt
     })
@@ -281,11 +407,13 @@ function parseLastRun (read) {
 // 首屏「今日 / 近 7 天」聚合（v3.307）：与趋势同源同口径（run.log 摘要行 + Asia/Shanghai
 // 日历日），只下发计数，不在前端重算。today/week 的 successRate = pushed/(pushed+failed)，
 // 无尝试时 null（前端显示「—」而不是编一个 100%）。
-// S2：聚合实现收进 xbk_state_schema.deriveRunStats（与摘要行解析同一份实现）；本函数只负责
-// 「读结果三态 → 返回形状」的适配，truncated 如实透传日志读取窗口的截断标记。
-function parseRunStats (read, now = Date.now()) {
-  if (read.status !== 'ok') return { status: read.status }
-  return result('ok', deriveRunStats(read.value.split('\n'), now, { truncated: read.truncated === true }))
+// S2：聚合实现收进 xbk_state_schema.deriveRunStatsFromParsed（与摘要行解析同一份实现）；本函数
+// 只负责「读结果三态 → 返回形状」的适配，truncated 如实透传日志读取窗口的截断标记。
+// v3.533：入参从 readText 的结果换成 readRunLog 的缓存条目——逐行解析已经做过一次，这里只按
+// 已解析条目聚合，不再重新 split + exec 正则。
+function parseRunStats (runLog, now = Date.now()) {
+  if (runLog.status !== 'ok') return { status: runLog.status }
+  return result('ok', deriveRunStatsFromParsed(runLog.summaries, now, { truncated: runLog.truncated === true }))
 }
 
 function parseDiagnostics (read) {
@@ -309,10 +437,12 @@ function readStatus (dir, { now = Date.now() } = {}) {
   // report.state / channel-health 是「整份 JSON」，必须整读：超限仍判 tooLarge（读尾部只会得到
   // 半个 JSON，假装可读更危险）。run.log / filter-diagnostics 是追加式日志，取尾部 1 MiB
   // （审查 SS-03）：超限时旧行为让这两个部件整体不可见，而解析本来就是「从最后一行往前找」。
-  const runRead = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
-  const run = parseLastRun(runRead)
+  // run.log 走 readRunLog（v3.533 记忆化）：run 与 stats 共用同一份「切行 + 逐行摘要解析」结果，
+  // 不再各解析一遍；report/channels 仍是每次整读（新鲜度语义不变）。
+  const runLog = readRunLog(dir)
+  const run = parseLastRun(runLog)
   const diagnostics = parseDiagnostics(readText(dir, FILES.diagnostics, LOG_MAX_BYTES, LOG_READ_OPTIONS))
-  return { generatedAt: now, report, channels, run, diagnostics, stats: parseRunStats(runRead, now) }
+  return { generatedAt: now, report, channels, run, diagnostics, stats: parseRunStats(runLog, now) }
 }
 
 // 判重缓存条数（v3.298 附加部件，与 readStatus 同目录同防御）：控制台缓存健康面板的
@@ -412,15 +542,12 @@ function clampTrendDays (v) {
 }
 
 function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = {}) {
-  // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读不报截断，这里以「文件实际大于
-  // 读取上限」判定。窗口内的更早摘要若被截掉，趋势只反映尾部日志——前端副标题会注明。
-  let truncated = false
-  try {
-    const st = require('node:fs').statSync(path.join(dir, FILES.run))
-    if (st.isFile() && st.size > LOG_MAX_BYTES) truncated = true
-  } catch (e) { /* stat 失败按未截断处理：readText 随后会给出真实状态 */ }
-  const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
-  if (read.status !== 'ok') return { status: read.status }
+  // [7] 日志超限读尾部时如实标注：readSafeTextResult 对 tail 读在「起点 >0」（文件大于读取
+  // 上限）时置 truncated:true，缓存条目原样透传（见 buildRunLogEntry 的 truncated）。
+  // 窗口内的更早摘要若被截掉，趋势只反映尾部日志——前端副标题会注明。
+  const runLog = readRunLog(dir)
+  if (runLog.status !== 'ok') return { status: runLog.status }
+  const truncated = runLog.truncated === true
   const todayKey = shanghaiDayKey(now)
   const rangeMode = isRealDayKey(from) && isRealDayKey(to) && from <= to
   // 区间模式：to 超过今天按今天截；跨度上限 92 天（超出时保留靠近 to 的一端）。
@@ -440,28 +567,13 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   const startMs = Date.parse(rawStart + 'T00:00:00Z')
   const spanDays = Math.min(92, Math.max(1, Math.round((endMs - startMs) / 86400000) + 1))
   const startKey = new Date(endMs - (spanDays - 1) * 86400000).toISOString().slice(0, 10)
+  // 按日聚合是缓存条目的中间结果（readRunLog 建条目时算过一遍，与 parseLastRun / readHist 同一
+  // 份逐行解析）：这里只做「窗口过滤 + 拷一份」，绝不改写缓存里的对象（同一份 entry 会被后续
+  // 请求复用）。窗口口径不变：只聚合 [startKey, endKey]，旧日志行不进窗口。
   const byDay = new Map()
-  const lines = read.value.split('\n')
-  for (const line of lines) {
-    // 与 readRunHistory / parseLastRun 同一解析器（xbk_state_schema.parseRunSummaryLine）：
-    // 行首锚定 + 六项计数必须是非负安全整数，日历日取时间戳前 10 位。
-    const parsed = parseRunSummaryLine(line)
-    if (!parsed) continue
-    // 无时间戳的历史行（极旧格式）没有日期键，归不进任何一天——跳过（诚实于「不知道」）。
-    const day = parsed.day
-    if (!day) continue
-    // 只聚合窗口内：旧日志行不进窗口（避免「总计」被陈旧数据污染）。
+  for (const [day, agg] of runLog.byDay) {
     if (day < startKey || day > endKey) continue
-    const counters = parsed.counters
-    const agg = byDay.get(day) || { date: day, rounds: 0, total: 0, dedup: 0, filtered: 0, truncated: 0, pushed: 0, failed: 0 }
-    agg.rounds += 1
-    agg.total += counters.total
-    agg.dedup += counters.dedup
-    agg.filtered += counters.filtered
-    agg.truncated += counters.truncated
-    agg.pushed += counters.pushed
-    agg.failed += counters.failed
-    byDay.set(day, agg)
+    byDay.set(day, { ...agg })
   }
   // 输出按日期升序补零：没有记录的日期也给全 0 行，前端画图不用补洞。
   const out = []
@@ -474,10 +586,8 @@ function readTrends (dir, { now = Date.now(), days = 14, from = '', to = '' } = 
   }
   // 周档轮转后，run.log 只剩本周：更早的日子不是「真的 0」，而是收进了 logs/ 周档。
   // 如实置 truncated（前端会提示「更早轮次已丢失/见周档」），并给出周档数量。
-  let archivedWeeks = 0
-  try {
-    archivedWeeks = require('node:fs').readdirSync(path.join(dir, 'logs')).filter((n) => /^run-\d{8}-\d{8}\.log\.gz$/.test(n)).length
-  } catch (e) {}
+  // 计数走 log-archive.countArchives（白名单与 listArchives 同源，口径 = 只数文件名）。
+  const archivedWeeks = countArchives(dir, FILES.run)
   return result('ok', { days: spanDays, from: rangeMode ? startKey : '', to: rangeMode ? endKey : '', byDay: out, truncated: truncated || archivedWeeks > 0, archivedWeeks, today: todayKey })
 }
 
@@ -545,16 +655,13 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
   // （首行可能是半行）；另有写入侧历史上发生过截尾的情形——文件已 ≤1MiB，stat 大小判不出，
   // 但窗口首行不是「时间戳锚定」形态（首行切在行中，退位算法总保完整字符、半行保不住锚），
   // 同样判轮转。两者合并报 truncated，前端如实提示「更早轮次已丢失」。
-  const read = readText(dir, FILES.run, LOG_MAX_BYTES, LOG_READ_OPTIONS)
-  if (read.status !== 'ok') return { status: read.status, items: [], hasMore: false, truncated: false }
-  let truncated = read.truncated === true
-  const lines = read.value.split('\n')
-  const first = lines[0] || ''
-  if (!truncated && first.trim() !== '' && !RUN_SUMMARY_LINE_RE.test(first) &&
-      !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(first)) {
-    truncated = true
-  }
-  const key = windowKeyOf(lines)
+  // v3.533：两个判据都在 readRunLog 的缓存条目里（truncated / firstAnchored），这里不再重读文件。
+  const runLog = readRunLog(dir)
+  if (runLog.status !== 'ok') return { status: runLog.status, items: [], hasMore: false, truncated: false }
+  let truncated = runLog.truncated === true
+  const lines = runLog.lines
+  if (!truncated && !runLog.firstAnchored) truncated = true
+  const key = runLog.windowKey
   // 行号游标必须配窗口指纹（窗口平移后同一行号指向别的轮次）；key 游标自带身份，不需要。
   if (beforeKey === '' && typeof windowKey === 'string' && windowKey !== '' && windowKey !== key) {
     return { status: 'stale', items: [], hasMore: false, truncated, windowKey: key }
@@ -563,22 +670,22 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
   // 轮界模型（审查 #241 M2 / #242 M3+S2 / #243 / D2-N5，按生产写序 xbk_app.js :1684→:1688）：
   // 一轮的摘要行在**轮末**写出，失败行写在其所属摘要行**之前**。归属判据与 parseLastRun
   // 共用 classifyRoundFailures（近距 ≤2 行且 ≤2s / 轮内远距 ≤10min / 其余为崩溃占位），
-  // 同一文件在「上一轮 / 运行历史」两处必须给出同一结论。
-  const summaryAt = summaryIndexOf(lines)
-  const { interruptedIdx, crashIdx } = classifyRoundFailures(lines, summaryAt)
+  // 同一文件在「上一轮 / 运行历史」两处必须给出同一结论。v3.533：summaryAt 与归属表都是缓存
+  // 条目里的同一份（与 parseLastRun 共用），这里只按行号取条目。
+  const summaryAt = runLog.summaryAt
+  const { interruptedIdx, crashIdx } = runLog.classification
 
   const roundKey = new Map() // 0-based 行号 → 条目稳定 key（重复内容追加 -N 序号）
   const rounds = []
-  for (const i of summaryAt.keys()) {
-    const line = lines[i]
-    // summaryAt 只收 parseRunSummaryLine 非 null 的行 ⇒ 这里必非 null（同一解析器，不再二次 exec）。
-    const parsed = parseRunSummaryLine(line)
+  for (const item of runLog.summaries) {
+    const i = item.i
+    const parsed = item.parsed
     const counters = parsed.counters
     rounds.push({
       i,
       // 运行历史沿用「行首 19 字符」口径（无时间戳 → ''）：与 parseLastRun 的 at（保留历史 ISO
-      // 的分段后缀）不同，这是既有输出形状，不改。
-      at: parsed.at ? line.slice(0, 19).trim() : '',
+      // 的分段后缀）不同，这是既有输出形状，不改。at19 在建条目时已切好（deriveRunStats 同口径）。
+      at: parsed.at ? item.at19 : '',
       total: counters.total,
       dedup: counters.dedup,
       filtered: counters.filtered,
@@ -616,8 +723,8 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
   // 文件序倒置即时间倒序（摘要行在其失败行之后写出；占位行号取失败行自身）。
   // 取消留痕单独成条（cancelled=true），既不标相邻轮中断、也不让这轮消失。
   // 同秒多条停止留痕保持独立：每条的 task/action 都可能是不同请求，不能按时间合并。
-  for (let i = 0; i < lines.length; i++) {
-    if (summaryAt.has(i) || crashIdx.has(i) || !isCancelTrace(lines[i])) continue
+  for (const i of runLog.cancelIdx) {
+    if (summaryAt.has(i) || crashIdx.has(i)) continue
     rounds.push({
       i,
       at: tsOf(lines[i]),
@@ -642,7 +749,7 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
   // 首次出现保留裸 8 位 key，旧游标/旧书签仍可定位到第一条。
   const occurrence = new Map()
   for (const r of [...rounds].sort((a, b) => a.i - b.i)) {
-    const h = entryKeyOf(lines[r.i])
+    const h = runLog.lineKeyOf(r.i)
     const n = (occurrence.get(h) || 0) + 1
     occurrence.set(h, n)
     roundKey.set(r.i, n === 1 ? h : `${h}-${n}`)
@@ -679,10 +786,7 @@ function readRunHistory (dir, { limit = 50, before = 0, windowKey = '', excludeC
     key: roundKey.get(r.i)
   }))
   // 同 readTrends：run.log 被周档切走后，更早的轮次不是不存在，而是进了 logs/。
-  let archivedWeeks = 0
-  try {
-    archivedWeeks = require('node:fs').readdirSync(path.join(dir, 'logs')).filter((n) => /^run-\d{8}-\d{8}\.log\.gz$/.test(n)).length
-  } catch (e) {}
+  const archivedWeeks = countArchives(dir, FILES.run)
   return { status: 'ok', items, hasMore: pool.length > items.length, truncated: truncated || archivedWeeks > 0, archivedWeeks, windowKey: key }
 }
 
@@ -826,4 +930,6 @@ function readMessages (dir, { maxBytes = 32 * 1024 * 1024, filename = FILES.mess
   return value
 }
 
-module.exports = { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey, messagesFileName }
+// runLogParseStats / resetRunLogParseStats：run.log 解析记忆化的**内省接口，只给测试用**
+// （parses/hits 计数 + 清缓存），不进任何 HTTP 响应、不进 --status 输出。
+module.exports = { readStatus, formatStatus, readTrends, readMessages, readMergedRawMessages, readMessageCount, readRunHistory, RUN_SUMMARY_LINE_RE, isRealDayKey, messagesFileName, runLogParseStats, resetRunLogParseStats }

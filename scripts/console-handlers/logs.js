@@ -4,13 +4,52 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
+// v3.533：`/api/logs` 默认窗口（尾部 ≤2000 行且 ≤256 KiB）。perf 取证（opt-api ③）：
+// 旧口径整段尾部 1 MiB —— 实测单次 675,579 B / 6,260 行；日志页运行期 2 s 一轮 ≈ 1.17 GB/h
+// identity，是全站最大的单项流量；identity 客户端（SSH 隧道/直连）在 <700 kbps 链路上每轮都
+// 撞 8 s 超时，于是每 2 s 重传 675 KB、永远成功不了。
+// 2000 行够看清最近几十轮 + 报错上下文；256 KiB 让「过 Caddy br6」的首屏稳定在几十 KB 内。
+// 读盘量也随之从 1 MiB 降到 256 KiB + 一行余量（约 4× 更少的字节）。
+const LOG_TAIL_MAX_LINES = 2000
+// 256 KiB 是**响应整体**（identity JSON）的预算，不是正文的上界：JSON 里每个换行要转义成 `\n`
+// 两个字节（2000 行 ⇒ 至多 +2000 B），加上 lines/bytes/paged/tail/truncated/maxLines/maxBytes
+// 等元数据约 200 B。留 4 KiB 余量（比最坏开销大一倍）给正文，实测长行夹具 263,104 → 259,xxx B。
+const LOG_TAIL_MAX_BYTES = 256 * 1024
+const LOG_TAIL_TEXT_BYTES = LOG_TAIL_MAX_BYTES - 4096
+// 多读一行余量：尾读从任意字节切起，首行是半行必须丢掉，否则窗口会白少一行。
+const LOG_TAIL_READ_BYTES = LOG_TAIL_TEXT_BYTES + 8192
+
+// 从尾部按「整行」累加，凑到 ≤maxLines 且 ≤maxBytes 的窗口（v3.533）。
+// **不得按字节切**：UTF-8 多字节字符被切开会变成 U+FFFD；这里先按 '\n' 切（JS 字符串层，永不落
+// 在字符中间），再从末尾往前收整行，累计字节超限就停。tailCut = 尾读窗口本身切掉了更早的行
+// （readSafeTextResult 的 truncated）——首行一律丢弃，它既不是完整行，也可能是半个多字节字符。
+function logTailWindow (text, tailCut, maxLines = LOG_TAIL_MAX_LINES, maxBytes = LOG_TAIL_TEXT_BYTES) {
+  const lines = String(text === undefined || text === null ? '' : text).split('\n')
+  if (tailCut && lines.length > 0) lines.shift()
+  // 文件以换行结尾时 split 会多出一个空串：它不是一行内容，丢掉（否则行数恒多 1）。
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  const kept = []
+  let bytes = 0
+  let cut = false
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    // 行间换行也算进窗口字节（join('\n') 的真实大小）。
+    const size = Buffer.byteLength(line, 'utf8') + (kept.length > 0 ? 1 : 0)
+    if (kept.length >= maxLines || bytes + size > maxBytes) { cut = true; break }
+    kept.push(line)
+    bytes += size
+  }
+  kept.reverse()
+  return { text: kept.join('\n'), lines: kept.length, bytes, truncated: cut || tailCut === true }
+}
+
 function createLogsHandlers (ctx) {
   const { sendJson, sendJsonConditional } = ctx.http
   const { stateDir, historyDir } = ctx.paths
   const { readTrends, readRunHistory, parseDayKey } = ctx.data
   const { handleBackupExport, handleBackupImport } = ctx.actions
   const {
-    TREND_DAYS_ALLOWED, TREND_DAYS_DEFAULT, RUN_HISTORY_LIMIT_DEFAULT, RUN_HISTORY_LIMIT_MAX, LOG_VIEW_MAX_BYTES
+    TREND_DAYS_ALLOWED, TREND_DAYS_DEFAULT, RUN_HISTORY_LIMIT_DEFAULT, RUN_HISTORY_LIMIT_MAX
   } = ctx.consts
   return {
     getLogs (req, res, url) {
@@ -62,8 +101,14 @@ function createLogsHandlers (ctx) {
         sendJson(res, 200, { status: 'ok', file, page: out.page, pages: out.pages, total: out.total, size, lines: out.lines })
         return
       }
+      // v3.533：默认分支（无 list/file/page 参数）只回「尾部 ≤2000 行且 ≤256 KiB」的窗口，
+      // 并走 sendJsonConditional（内容哈希 ETag + 304 空体）：日志没变时 2 s 一拍也只剩响应头。
+      // 字段向后兼容：status / text 原样保留（老前端与既有测试按 text 取正文），新增
+      // lines / bytes / paged / tail / truncated / maxLines / maxBytes 元数据。
+      // 更早的行不丢在磁盘上：翻页仍走上面的 ?file=&page=&size=（周档/当周按页读，行为不变），
+      // 「跳到最新」由前端回到本分支（尾部窗口）。
       const { readSafeTextResult } = require('../../xbk_storage')
-      const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_VIEW_MAX_BYTES, { tail: true, openNonBlocking: true })
+      const safe = readSafeTextResult(path.join(historyDir(), 'run.log'), LOG_TAIL_READ_BYTES, { tail: true, openNonBlocking: true })
       if (safe.status === 'missing') {
         sendJson(res, 200, { status: 'missing', text: '' })
         return
@@ -72,7 +117,18 @@ function createLogsHandlers (ctx) {
         sendJson(res, 200, { status: safe.status, text: '' })
         return
       }
-      sendJson(res, 200, { status: 'ok', text: safe.text })
+      const window = logTailWindow(safe.text, safe.truncated === true)
+      sendJsonConditional(req, res, {
+        status: 'ok',
+        text: window.text,
+        lines: window.lines,
+        bytes: window.bytes,
+        paged: false,
+        tail: true,
+        truncated: window.truncated,
+        maxLines: LOG_TAIL_MAX_LINES,
+        maxBytes: LOG_TAIL_MAX_BYTES
+      })
     },
     getTrends (req, res, url) {
       // 近 N 日运行趋势：run.log 摘要行按日聚合（scripts/status.js readTrends，与 parseLastRun

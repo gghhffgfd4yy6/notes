@@ -3,9 +3,9 @@
 // 入口 app.js 只 import App。依赖方向单向，无循环引用。
 import { AUTO_DEFAULT_S, AlertBanner, AutoRefreshText, Badge, Button, LeaveGuardDialog, StatusCards, TapTip, TriggerBar, clampAutoSeconds, fmtWeekday, stickyPad } from './components.js'
 import { BOOT, apiGetAuto, apiGetConsoleSettings, apiGetLogs, apiGetRuns, apiGetStatus, apiGetSys, apiSetAuto } from './api.js'
-import { BUSY_FALLBACK_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
+import { BUSY_FALLBACK_MS, AUTO_POLL_MS, POLL_BUSY_MS, POLL_MS, SSE_HEARTBEAT_MS, TZ_LABEL, VERSION_CHECK_MS } from './constants.js'
 import { MOTION, enter, motionOK } from './motion.js'
-import { backToTopBehavior, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, snapshotOk, TAB_KEYS, tabFromHash } from './pure.mjs'
+import { backToTopBehavior, createAutoTickGate, createLiveChannel, partBroken, pollIntervalFor, runViewTransition, snapshotOk, TAB_KEYS, tabFromHash } from './pure.mjs'
 import { fmtLocalTime } from './format.js'
 import { Component, html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from './htm-preact.module.js'
 // 页面面板（pages.js）
@@ -350,6 +350,15 @@ function App () {
   // 首屏那一发不受暂停开关影响（暂停也要先把页面填上）；之后暂停期间的 effect 重跑
   // （切页签 / locking 翻转）不再补发请求（C7-040）。
   const bootFetchedRef = useRef(false)
+  // v3.533：自动刷新的两级闸（1 s 合并窗 + 15 s 下限，见 pure.mjs createAutoTickGate）。
+  // 只作用于自动入口（SSE tick / 定时器）；手动刷新直接调 refreshSplit，不经这里。
+  const tickGateRef = useRef(createAutoTickGate())
+  // 已按哪个节奏值建过定时器：节奏没变就不重建（SSE 在线时 interval 恒为 60 s，locking 翻转
+  // 不再把定时器拆了重装）。0 = 还没有定时器。
+  const armedIntervalRef = useRef(0)
+  // 上一次补发首屏的那组「调度开关」（页签 / 暂停）：只有它变了才补一发（凭证失效另有早退停表），
+  // 节奏值或 locking 翻转只改定时器，不再白打一对 /api/status + /api/runs。
+  const scheduleRef = useRef('')
 
   // 每个页签记住自己的「数据截至」：切回已来过的页签时先显示上次时间，
   // 不再先闪一下「手动刷新」再跳成时间。第一次进入才显示占位符。
@@ -715,6 +724,12 @@ function App () {
     // 补拉失败时 lastRefreshRef 不前进（见 refreshActive），窗内仍会立刻重试。
     if (Date.now() < resumeQuietUntilRef.current && Date.now() - lastRefreshRef.current < POLL_BUSY_MS) return
     if (Date.now() < formPauseUntilRef.current) return
+    // v3.533：自动刷新的两级闸。SSE tick 与定时器都汇到这一拍，闸放在这里就是「统一入口」——
+    // 在 SSE 回调与定时器回调各写一遍会漂移（一处改了另一处忘改）。手动刷新（下拉/刷新按钮）
+    // 走 refreshActive → refreshSplit，不经过本函数，因此不受任何闸限制。
+    //   ① 1 s 合并窗：窗内连发只算一拍（挡住 tick 与定时器在同一瞬间叠出来的重复请求）；
+    //   ② 15 s 下限：稳态 3600 / 15 = 240 次/h（旧实现实测 720 次/h）。
+    if (!tickGateRef.current.accept()) return
     refreshSplit()
     if (tab !== 'overview' && tab !== 'logs') setPollTick((t) => t + 1)
     if (markRef.current) markRef.current()
@@ -751,6 +766,11 @@ function App () {
   // 同一个表达式写两遍就会漂移——改了一处忘了另一处，就是「倒计时说 4 秒、定时器按 60 秒走」。
   // 判定在 pure.mjs 里（pollIntervalFor），Node 侧可直接断言。
   const interval = pollIntervalFor({ sseUp, busy: locking, pollMs: POLL_MS, busyMs: POLL_BUSY_MS, safetyMs: SSE_HEARTBEAT_MS })
+  // v3.533：节奏值同时放进 ref。定时器回调一旦建好就捕获了旧闭包，而 runTick / 倒计时 mark /
+  // 回前台静默窗都该按「当前节奏」算——ref 让这三处始终读到最新值，effect 也就不必为了换节奏
+  // 把定时器拆了重装（只有周期值本身变了才重建，见轮询 effect）。
+  const intervalRef = useRef(interval)
+  intervalRef.current = interval
 
   useEffect(() => {
     const onAuth = () => setAuthExpired(true)
@@ -784,41 +804,78 @@ function App () {
   }, [])
 
   useEffect(() => {
-    if (authExpired) return undefined
+    if (authExpired) {
+      // v3.533 复查：这条早退不走下面的通用 cleanup（那里有意不清定时器，见 return 处注释），
+      // 所以必须自己归还主定时器——否则凭证失效后它仍按旧节奏 runTick ⇒ 每 15 s（busy 2 s）
+      // 空打一对 401，与「401 ⇒ 停轮询」和横幅「已停止自动刷新」直接矛盾。
+      clearInterval(timerRef.current)
+      timerRef.current = null
+      armedIntervalRef.current = 0
+      return undefined
+    }
     // 只有「首屏」与「真的在自动刷新」才补这一发：暂停时切页签 / locking 翻转同样会让本
     // effect 重跑，无条件 refreshSplit() 等于按了暂停还在打接口（C7-040）。首屏例外——
     // 否则暂停着重开页面就是一片空白。
-    if (autoRefresh || !bootFetchedRef.current) {
+    // v3.533：补发再收紧到「调度开关真的变了」（页签 / 暂停）。旧实现的依赖里含 locking
+    // （本机每 5 s 一轮运行 ⇒ 翻转频繁），每翻一次就白打一对 /api/status + /api/runs；而节奏值
+    // 变化（interval）本来只需重装定时器，不需要额外来一发。凭证不进键：失效已被上面的早退
+    // 分支拦下（停表），这里再放一个恒为 0 的分量只会是死代码（CodeQL js/trivial-conditional）。
+    const scheduleKey = `${tab}|${autoRefresh ? 1 : 0}`
+    const scheduleChanged = scheduleRef.current !== scheduleKey
+    scheduleRef.current = scheduleKey
+    if (scheduleChanged && (autoRefresh || !bootFetchedRef.current)) {
       bootFetchedRef.current = true
       refreshSplit()
     }
-    clearInterval(timerRef.current)
     // v3.348：所有页都轮询（用户要求：推送记录/配置/过滤规则/系统 的「自动刷新」必须真的在跑）。
     // 概览/日志拉状态与历史；其余页由统一 tick 让当前面板重拉自己的数据。
     // 页面在后台时不轮询（切回前台立即补一次）：控制台标签页常驻也不该整夜打接口。
     // 暂停（autoRefresh=false）同样不建定时器；恢复时本 effect 重跑并立即补一次。
-    if (!autoRefresh) return () => clearInterval(timerRef.current)
+    if (!autoRefresh) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+      armedIntervalRef.current = 0
+      return () => clearInterval(timerRef.current)
+    }
     // v3.374：SSE 在线 → 60s 安全轮询（tick 才是主通道）；断线自动回到 15s；任务在跑仍按
     // POLL_BUSY_MS 快轮询。间隔取上面唯一那次 pollIntervalFor 的结果（见「轮询节奏」块）。
-    const mark = () => setNextAt(Date.now() + interval)
+    const mark = () => setNextAt(Date.now() + intervalRef.current)
     // 只在这一个地方持定时器：SSE tick 不另建 interval，它复用 runTick（顺带复位倒计时）。
+    // v3.533：节奏值没变就不重建（SSE 在线时 interval 恒为 60 s ⇒ locking 翻转不再拆装定时器）；
+    // 15 s ↔ 2 s 是真实的节奏变化，setInterval 的周期无法在运行中改，只能重建一次。
     markRef.current = mark
-    timerRef.current = setInterval(() => { runTick() }, interval)
-    mark()
+    if (armedIntervalRef.current !== interval) {
+      clearInterval(timerRef.current)
+      // v3.533 复查：回调必须经 runTickRef 解引用。直接调 runTick 会捕获「建表那次渲染」的闭包，
+      // 而按 tab 判定的 runTick 在切页后换身份、节拍守卫又不重建定时器 ⇒ 非概览页的自动刷新静默失效。
+      timerRef.current = setInterval(() => { runTickRef.current() }, interval)
+      armedIntervalRef.current = interval
+      mark()
+    }
     // 回前台只重排下一拍（别刚回来就补一发，补拉由下面的「回到前台」effect 统一发：
     // 那里还会通知当前面板一起刷新，重复请求会翻倍）。
     const onVis = () => {
       if (document.hidden) return
-      resumeQuietUntilRef.current = Date.now() + interval
+      resumeQuietUntilRef.current = Date.now() + intervalRef.current
       mark()
     }
     document.addEventListener('visibilitychange', onVis)
     return () => {
-      clearInterval(timerRef.current)
+      // v3.533：这里**只**摘监听器，不再 clearInterval——本 effect 会因 locking 翻转重跑，而定时器
+      // 的重建被 armedIntervalRef 守卫着（节奏没变就不重建），两边一起做就会出现「定时器被清掉、
+      // 却没人重装」⇒ 页面只剩 SSE tick、断线后彻底不轮询。定时器由下面两个地方收：暂停时（上面的
+      // !autoRefresh 分支）与组件卸载时（紧随其后的空依赖 effect）。
       markRef.current = null
       document.removeEventListener('visibilitychange', onVis)
     }
   }, [refreshSplit, locking, tab, autoRefresh, authExpired, sseUp, runTick])
+
+  // 定时器的唯一「归还」点（v3.533）：卸载时清掉，避免调度 effect 反复重跑把定时器丢掉。
+  useEffect(() => () => {
+    clearInterval(timerRef.current)
+    timerRef.current = null
+    armedIntervalRef.current = 0
+  }, [])
 
   // hash 路由（v3.307）：首次进入补 #/overview；前进/后退跟着切页。
   useEffect(() => {
@@ -994,11 +1051,13 @@ function App () {
   useEffect(() => {
     if (tab !== 'overview') return undefined
     let alive = true
-    // 后台标签页同样不轮询：这条 2s 轮询不在主轮询 effect 里，此前一直照跑，
+    // 后台标签页同样不轮询：这条独立轮询不在主轮询 effect 里，此前一直照跑，
     // 是「隐藏 15s 仍有请求」的主因。切回前台由「回到前台」effect 统一补拉（连带 refreshAuto）。
+    // v3.533：2 s → 5 s（AUTO_POLL_MS，理由见 constants.js）：自动运行状态的字段极少、变化只来自
+    // 用户改设置与调度器起跑，倒计时本来就是前端每秒本地算的。1,800 → 720 次/h。
     const load = () => { if (alive && !document.hidden) refreshAuto() }
     load()
-    const t = setInterval(load, 2000)
+    const t = setInterval(load, AUTO_POLL_MS)
     return () => { alive = false; clearInterval(t) }
   }, [tab, refreshAuto])
 

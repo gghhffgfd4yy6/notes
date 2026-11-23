@@ -815,6 +815,40 @@ export function pollIntervalFor ({ sseUp, busy, pollMs, busyMs, safetyMs }) {
   return sseUp ? safetyMs : pollMs
 }
 
+// ── 自动刷新两级闸（v3.533）───────────────────────────────────────────────────
+// 取证（perf-20261122/opt-api ②）：服务端 SSE_TICK_MS=500 采样指纹，run.log 一变就推 tick，
+// 前端 runTick 每拍都 refreshSplit（/api/status + /api/runs）——实测常驻标签 **720 次/h**
+// （设计意图 60 次/h），运行期 0.5–1 s 一次，单标签约 10% 单核。
+// 两级闸，各自独立记账：
+//   ① 合并窗 TICK_MERGE_MS = 1000：1 s 内的连发只算一次——挡「SSE tick 与定时器/回前台」在同一
+//      瞬间叠出来的重复请求（runTick 内的语义，单测直接驱动它）；
+//   ② 自动刷新下限 AUTO_REFRESH_MIN_MS = 15000：常驻标签稳态 3600 / 15 = **240 次/h**（spec 上限）。
+//      只约束自动入口（SSE onTick 与定时器回调都汇入 runTick）；手动刷新（下拉/刷新按钮）直接
+//      走 refreshSplit，不经这道闸。
+// 为什么是 15 s 而不是继续 2 s：常驻标签的数据新鲜度需求本来就由 15 s 轮询（POLL_MS）定义，SSE
+// 只是「有变化早点知道」；把自动刷新钉在 15 s 后，稳态请求量与「断线退回 15 s」完全一致，两条
+// 通道的负载不再相差 12 倍。
+export const TICK_MERGE_MS = 1000
+export const AUTO_REFRESH_MIN_MS = 15000
+export function createAutoTickGate ({ now = () => Date.now(), mergeMs = TICK_MERGE_MS, minMs = AUTO_REFRESH_MIN_MS } = {}) {
+  let lastMerged = null
+  let lastFired = null
+  return {
+    // 这一拍该不该刷：true = 放行（同时记一次账），false = 被合并窗或下限挡住（不记账）。
+    accept () {
+      const t = now()
+      if (lastMerged !== null && t - lastMerged < mergeMs) return false
+      lastMerged = t
+      // 下限只在上一次真的发过请求之后才生效：第一拍永远放行（首屏/重连后立刻要一次数据）。
+      if (lastFired !== null && t - lastFired < minMs) return false
+      lastFired = t
+      return true
+    },
+    // 内省：上一次放行的时刻（没有则 null）。
+    lastFiredAt: () => lastFired
+  }
+}
+
 // 通知流的状态机：连流 / 收 tick / 断线降级 / 隐藏断开 / 可见重连。DOM 与构造器全部注入，
 // 所以本模块仍然是「无 DOM、无 fetch」——Node 测试塞假 EventSource + 假 document 就能
 // 跑真实行为断言（不必 eval 源码，S1523）。

@@ -48,6 +48,11 @@ function createRunsHandlers (ctx) {
       if (streamClients.size >= SSE_STREAM_MAX_CONNECTIONS) { sendJson(res, 503, { error: 'SSE 连接数已达上限' }); return }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
+        // 绝不能被压缩（v3.533 契约）：SSE 是逐帧 flush 的长连接，压缩会按块攒字节 ⇒ tick 被
+        // 憋在压缩窗口里、代理也会重压；Node 侧本就不压（无中间件），这里显式不设
+        // Content-Encoding 并由 test_console.js 用例钉住「响应无 Content-Encoding」。
+        // 反向代理侧仍需排除：Caddy 的 00-compress.caddy 目前只排除了 /api/stream，
+        // /api/runs/stream 的排除是运维项（RUNBOOK 第 5 项），不在本仓代码里改。
         // no-store 而不是 no-cache：这条流带鉴权语义，浏览器不得把任何一帧存下来复用。
         'Cache-Control': 'no-store',
         'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理按块缓冲（否则 tick 要等代理攒满）
@@ -98,6 +103,9 @@ function createRunsHandlers (ctx) {
       }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
+        // 不压缩（v3.533 契约）：逐帧 flush 的长连接一压缩就被块缓冲憋住；Node 侧无压缩中间件，
+        // 由 test_console.js 钉住「无 Content-Encoding」。代理侧 /api/runs/stream 的排除是
+        // 运维项（Caddy 00-compress.caddy 现只排除 /api/stream）。
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no', // 禁 nginx 类反向代理缓冲（蓝图口径）
         Connection: 'keep-alive'
