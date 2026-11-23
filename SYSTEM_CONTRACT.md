@@ -15,6 +15,7 @@
   - **近似去重拦截明细（v3.410）**：每次拦截追加一行到缓存目录的 `similar-blocked.ndjson`，字段 `{at,title,matched,price,mprice}`——`at` 与 `run.log` 同格式；`title` 是被拦下的原标题、`matched` 是撞上的那条窗口标题（窗口只存归一化标题），各截 160 字；`price`/`mprice` 是两侧价格签名，没写价格为 `null`；**不记**正文/HTML/URL。每轮最多 200 条（超出只计数不落盘）；文件 ≥2 MiB 时先 `rename` 为 `similar-blocked.ndjson.1`（覆盖旧 `.1`）再新建，磁盘上恒为 2 份；写失败只 `console.warn`，不改变推送结果与退出码；实际写入条数在摘要行末尾追加 `similarlogged=N`（0 时不追加，旧格式兼容）。
 
 - **缓存**：统一 `writeAtomic`（唯一临时文件 + `wx` 独占 + 0600 + rename，失败清理临时文件并回滚内存）；**写成功后才更新内存快照**；规则变更使过滤标记（`_f`）失效并重评，`filter.hash` 读失败或清理失败不得推进；被裁剪的身份在磁盘写成功后落墓碑；目录缺失可递归重建，初始化必须独占创建，不得以空数组覆盖并发写入。墓碑淘汰必须保证推进：无法通过淘汰达到字节上限时返回空、放弃本次持久化并告警，不得原地死循环。
+  - **`_f` 写盘投影与淘汰（v3.534）**：`push.json` 与 journal 行在**写盘时**对 `_f === true` 且 id（非空字符串或有限数字）+ url（非空字符串）齐全的条目只保留身份与展示字段，不写 `content` / `content_html`（内存快照、判重索引、控制台与统计仍读原对象；判重身份、过滤判定、统计口径不变）；缺 id 或 url 的 `_f` 保留正文兜底；带正文的旧文件照常读入，下一次保存自然瘦身。超出 `maxSize` 时**先淘汰 `_f`**（同类内数组序最旧优先）、不足再淘汰其余最旧条目；墓碑口径不变（`_tombstoneDropped` 仍跳过 `_f`，被淘汰的 `_f` 不进 `.seen.json`）。
 - **状态写 / 预热 / 日志字段 / 正则缓存（v3.531）**：
   - (a) `run.log` 摘要行：六项计数与 `elapsed` 之后可有 ` pp=<ms>`（本轮 preprocess 毫秒、保留 1 位小数，仅在 `ctx.timings.preprocessMs` 为有限非负数时写）。它固定排在所有既有尾部片段之前，读侧（`parseRunSummaryLine` / `parseRunSummaryExtras`）**不解析**它，旧行与旧解析器照常工作——不得把它挪到行尾（会挤压末 64 字符窗口、丢 `cachesaved`/`similar*` 系列）。
   - (b) `channel-health.state`：内容与磁盘逐字节一致时**跳过原子写**（inode/mtime 可能连续多轮不变）。「按 mtime 判活」**不是**契约，判活看 run 级单飞锁与进程存活；文件 missing 时仍必写（不得把「读不到」当「内容相同」）；其它读失败（`ioError`/`unsafe`/`tooLarge`/`replaced`）跳过本轮健康更新、原文件逐字节保留（fail-closed），不得以空状态覆盖。

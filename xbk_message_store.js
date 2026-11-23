@@ -46,6 +46,9 @@ const PUSH_SOURCES_MAX_URL_LEN = 2048
 //     与数组顺序不同，回放对未命中项只能追加到尾部，顺序错位会改变后续条数裁剪裁掉谁；
 //   · 每行还要记本批被**裁剪**的身份（drop）：裁剪只发生在本批写入之后，且 `_f`（过滤未推）条目
 //     按设计不落墓碑，不记 drop 就会在回放时复活并排到尾部，把快照里的活条目挤出上限；
+//   · v3.534 起写盘（快照与 journal 行）一律经 `toDiskEntry` 投影：`_f === true` 且 id+url 齐全的
+//     条目只留身份，不写 content/content_html（内存快照仍保存原对象；缺失 id/url 的 `_f` 保留正文兜底）。
+//     旧文件里带正文的 `_f` 照常读入，下一次保存自然瘦身；条数淘汰改为 `_f` 优先（见 trimMessagesToMaxSize）；
 //   · 合并成功写快照后先追加一行 ckpt 再 truncate：ckpt 之前的行已全部进快照，读端只回放最后一个
 //     ckpt 之后的行。truncate 失败（或进程死在两者之间）时，旧行不会被重复回放；
 //   · journal 读失败（ioError/unsafe/tooLarge/半读）= fail-closed：置 _readFailed、返回空集，
@@ -262,6 +265,61 @@ function orderJournalPutsInMemoryOrder (messages, puts) {
     picked.set(m, i)
   }
   return [...picked.entries()].sort((a, b) => a[1] - b[1]).map((e) => e[0])
+}
+
+// ===== v3.534：`_f`（过滤未推）条目的写盘投影 + 条数淘汰口径 =====
+// 为什么：`_f` 条目永不推送（过滤命中），生产快照实测占 47%，其中 content + content_html
+// 2,752,658 B 永远不会被读；判重身份只需要 id/url。故**写盘时**只留身份与展示字段——内存快照
+// 仍保存原对象（控制台/过滤/统计读的都是内存，语义一字不改）；旧文件里带正文的 `_f` 照常读入，
+// 下一次保存自然瘦身。
+// 为什么淘汰要 `_f` 优先：`_f` 从未推送、按设计不落墓碑（规则变更后由上游整批重新拉取重评），
+// 先挤掉它们不丢任何判重记忆；反过来（旧口径「数组最旧优先」）会让 `_f` 洪峰先把**已推送**记录
+// 的判重记忆挤出上限 ⇒ 上游重放即重复推送。墓碑口径本身不变（_tombstoneDropped 仍跳过 `_f`）。
+/** 写盘投影：条目是对象、`_f === true`、且身份完整（id = 非空字符串或有限数字，url = 非空字符串）
+ *  时返回**浅拷贝**并删掉 content / content_html 两个键；否则原样返回**同一对象**。
+ *  缺 id/url 的 `_f` 保留正文兜底——它们的身份只能靠正文重算/展示，瘦身会把这类条目变成哑记录。
+ *  只用于「写盘序列化」：内存快照、判重索引、控制台一律仍看原对象。 */
+function toDiskEntry (m) {
+  if (!m || typeof m !== 'object' || Array.isArray(m) || m._f !== true) return m
+  const id = m.id
+  const idOk = (typeof id === 'string' && id !== '') || (typeof id === 'number' && Number.isFinite(id))
+  if (!idOk) return m
+  if (typeof m.url !== 'string' || m.url === '') return m
+  const out = Object.assign({}, m)
+  delete out.content
+  delete out.content_html
+  return out
+}
+
+/** 恒等投影（不写盘瘦身时的默认口径）：`_trimCacheByBytes` 的可选参数默认值。 */
+function identityDiskEntry (m) { return m }
+
+/** 条数淘汰（**原地**改 messages）：超出 maxSize 时先淘汰 `_f === true` 的条目（同类内数组序最旧
+ *  优先），不足再淘汰其余最旧的条目；幸存者保持原顺序。返回被移除的条目数组（按数组序）。
+ *  唯一的实现：saveMessages / _persistChanges / _compact / _recoverOverlargeCache 四处共用同一口径
+ *  （否则内存快照、磁盘快照、journal 的 drop 与墓碑会各按一套规则取舍）。 */
+function trimMessagesToMaxSize (messages, maxSize) {
+  if (!Array.isArray(messages)) return []
+  const limit = Number.isFinite(maxSize) ? Math.floor(maxSize) : messages.length
+  const total = messages.length
+  const excess = total - limit
+  if (!(excess > 0)) return []
+  const doomed = new Set()
+  for (let i = 0; i < total && doomed.size < excess; i++) {
+    const m = messages[i]
+    if (m && typeof m === 'object' && m._f === true) doomed.add(i)
+  }
+  for (let i = 0; i < total && doomed.size < excess; i++) {
+    if (!doomed.has(i)) doomed.add(i)
+  }
+  const removed = []
+  let w = 0
+  for (let i = 0; i < total; i++) {
+    if (doomed.has(i)) removed.push(messages[i])
+    else messages[w++] = messages[i]
+  }
+  messages.length = w
+  return removed
 }
 
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
@@ -1420,16 +1478,19 @@ function createMessageStore ({
         return null
       }
       // 重建集必须同时满足「条数上限」与「字节上限」——两条都是 saveMessages 的既有口径，
-      // 超出的最旧元素走 _tombstoneDropped（它们已推送过，防上游重放重复推送）。
+      // 超出者走 _tombstoneDropped（已推送过，防上游重放重复推送）。v3.534 起条数裁剪先淘汰
+      // `_f`（见 trimMessagesToMaxSize），`_f` 按设计不入墓碑。
       const maxSize = this._resolveMaxSize()
       const dropped = []
-      if (elements.length > maxSize) {
-        console.warn(`缓存尾部恢复：完整元素 ${elements.length} 条超过条数上限(${maxSize})，裁剪掉最早 ${elements.length - maxSize} 条`)
-        dropped.push(...elements.splice(0, elements.length - maxSize))
+      const totalBefore = elements.length
+      const droppedByCount = trimMessagesToMaxSize(elements, maxSize)
+      if (droppedByCount.length > 0) {
+        console.warn(`缓存尾部恢复：完整元素 ${totalBefore} 条超过条数上限(${maxSize})，裁剪掉 ${droppedByCount.length} 条（过滤未推 _f 优先，其余最旧优先）`)
+        dropped.push(...droppedByCount)
       }
       let text
       try {
-        text = this._trimCacheByBytes(JSON.stringify(elements), elements, filePath, MESSAGE_CACHE_MAX_BYTES, dropped)
+        text = this._trimCacheByBytes(JSON.stringify(elements.map(toDiskEntry)), elements, filePath, MESSAGE_CACHE_MAX_BYTES, dropped, toDiskEntry)
       } catch (e) {
         console.error(`缓存尾部恢复裁剪异常，无法自动恢复（保持写闸门）${filePath}:`, e && e.message)
         return null
@@ -1531,17 +1592,17 @@ function createMessageStore ({
       // P4（CodeAnt Round2）：被裁剪记录先收集、缓存原子写盘成功后才统一落墓碑——
       // 写盘失败（序列化/单条超限/rename 失败）时记录并未真正从磁盘缓存移除，
       // 提前落墓碑会把仍在缓存中的身份误判为已判重（消息被永久跳过）。
-      const droppedAll = []
-      if (toSave.length > maxSize) {
-        console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${toSave.length - maxSize} 条`)
-        const dropped = toSave.splice(0, toSave.length - maxSize)
-        droppedAll.push(...dropped)
+      const droppedAll = trimMessagesToMaxSize(toSave, maxSize)
+      if (droppedAll.length > 0) {
+        console.warn(`缓存超出上限(${maxSize})，裁剪掉 ${droppedAll.length} 条（过滤未推 _f 优先，其余最旧优先）`)
       }
       let text
       // 序列化防御：循环引用等无法 JSON.stringify 时容错（内存缓存保留，不落盘不崩溃）
       try {
       // P3（审查 2026-08-15）：紧凑输出替代美化缩进——缓存文件体积 -30~50%，万条级序列化内存峰值更低
-        text = JSON.stringify(toSave)
+      // v3.534：写盘投影——`_f`（过滤未推）且 id+url 齐全的条目只留身份，不写 content/content_html
+      // （内存快照 / 判重索引 / 控制台仍看原对象；缺失 id/url 的 `_f` 保留正文兜底）。
+        text = JSON.stringify(toSave.map(toDiskEntry))
       } catch (e) {
         console.error(`缓存序列化失败 ${filePath}（可能含循环引用）:`, e.message)
         text = null
@@ -1564,7 +1625,7 @@ function createMessageStore ({
       try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
       try {
         if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
-        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll)
+        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll, toDiskEntry)
       } catch (e) {
       // 评审 qodo（v3.267）：裁剪阶段意外异常（如极端不可序列化元素）也不崩溃进程，与序列化失败同口径 fail-open
         console.error(`缓存裁剪失败 ${filePath}:`, e.message)
@@ -1831,10 +1892,9 @@ function createMessageStore ({
       const restoreMemo = this._memoGuard(filePath)
       const maxSize = this._resolveMaxSize()
       // 条数裁剪在这里做（与 saveMessages 同口径），保证内存快照与旧实现逐条一致
-      const droppedAll = []
-      if (messages.length > maxSize) {
-        console.warn(`缓存超出上限(${maxSize})，裁剪掉最早 ${messages.length - maxSize} 条`)
-        droppedAll.push(...messages.splice(0, messages.length - maxSize))
+      const droppedAll = trimMessagesToMaxSize(messages, maxSize)
+      if (droppedAll.length > 0) {
+        console.warn(`缓存超出上限(${maxSize})，裁剪掉 ${droppedAll.length} 条（过滤未推 _f 优先，其余最旧优先）`)
       }
       const jPath = journalPathFor(filePath)
       const jStat = this._journalStat(jPath)
@@ -1862,9 +1922,12 @@ function createMessageStore ({
       let line = ''
       if (put.length > 0 || drop.length > 0) {
         try {
+          // v3.534：journal 与快照同一份写盘投影——`_f`（id+url 齐全）的 put/drop 都不写正文，
+          // 否则日志行会把快照里刚瘦掉的那几 KB 原样带回来（新行同步变小）。
+          const putLine = put.length > 0 ? put.map(toDiskEntry) : put
           line = JSON.stringify(drop.length > 0
-            ? { v: JOURNAL_VERSION, at: Date.now(), put, drop }
-            : { v: JOURNAL_VERSION, at: Date.now(), put }) + '\n'
+            ? { v: JOURNAL_VERSION, at: Date.now(), put: putLine, drop: drop.map(toDiskEntry) }
+            : { v: JOURNAL_VERSION, at: Date.now(), put: putLine }) + '\n'
         } catch (e) {
           console.error(`判重日志序列化失败 ${jPath}（可能含循环引用）:`, e && e.message)
           restoreMemo()
@@ -1927,11 +1990,10 @@ function createMessageStore ({
     _compact (filePath, messages) {
       const maxSize = this._resolveMaxSize()
       const toSave = [...messages]
-      const dropped = []
-      if (toSave.length > maxSize) dropped.push(...toSave.splice(0, toSave.length - maxSize))
+      const dropped = trimMessagesToMaxSize(toSave, maxSize)
       let text
       try {
-        text = JSON.stringify(toSave)
+        text = JSON.stringify(toSave.map(toDiskEntry))
       } catch (e) {
         console.error(`判重缓存合并序列化失败 ${filePath}（可能含循环引用）:`, e && e.message)
         return false
@@ -1940,7 +2002,7 @@ function createMessageStore ({
         let textBytes = null
         try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
         if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
-        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, dropped)
+        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, dropped, toDiskEntry)
       } catch (e) {
         console.error(`判重缓存合并裁剪失败 ${filePath}:`, e && e.message)
         return false
@@ -1963,9 +2025,11 @@ function createMessageStore ({
     /** 写端字节上限裁剪：二分查找「最新 k 条序列化后不超读端上限」的最大 k（O(log n) 次序列化），
    *  至少保留最新 1 条；不超限原样返回；连最新单条都超限时返回 null（调用方跳过落盘）。
    *  maxBytes 仅供测试缩限（生产恒为 MESSAGE_CACHE_MAX_BYTES）。
+   *  project（v3.534）是**写盘投影**（默认恒等）：逐条 sizes 与最终 JSON.stringify 必须用同一条投影，
+   *  否则按「未瘦身字节」裁剪会在 `_f` 占多数时多裁掉本可保留的活条目（磁盘上实际写得更小）。
    *  本方法不写墓碑：被裁剪记录追加到 droppedOut（与条数裁剪统一），
    *  由 saveMessages 在缓存原子写盘成功后一并落墓碑（CodeAnt Round2 时序修复）。 */
-    _trimCacheByBytes (text, toSave, filePath, maxBytes = MESSAGE_CACHE_MAX_BYTES, droppedOut = null) {
+    _trimCacheByBytes (text, toSave, filePath, maxBytes = MESSAGE_CACHE_MAX_BYTES, droppedOut = null, project = identityDiskEntry) {
       // text === null 表示「调用方已确认超限并主动丢弃了首份序列化」（C3-009）：跳过快路径，直接裁剪后重新序列化。
       if (text !== null && Buffer.byteLength(text, 'utf8') <= maxBytes) return text
       if (toSave.length <= 1) {
@@ -1976,7 +2040,7 @@ function createMessageStore ({
       // 数组序列化口径：不可序列化元素（undefined/函数/Symbol/toJSON→undefined）在整体 JSON.stringify 时写为 null，
       // 单条 stringify 返回 undefined 会令 Buffer.byteLength 抛 TypeError——统一按 'null' 计字节（评审 qodo/coderabbit）
       const sizes = toSave.map((m) => {
-        const s = JSON.stringify(m)
+        const s = JSON.stringify(project(m))
         return Buffer.byteLength(s === undefined ? 'null' : s, 'utf8')
       })
       // v3.267（评审建议）：后缀和数组——sizeOfLast(count) 从 O(count) 线性求和降为 O(1)，大数组二分不再重复累加
@@ -2000,7 +2064,7 @@ function createMessageStore ({
       // 与单条超限路径同口径跳过落盘（防读端 tooLarge 自锁），且不产生任何丢弃。
       let out = null
       while (lo >= 1) {
-        out = JSON.stringify(toSave.slice(-lo))
+        out = JSON.stringify(toSave.slice(-lo).map(project))
         if (Buffer.byteLength(out, 'utf8') <= maxBytes) break
         out = null
         lo--
@@ -2952,5 +3016,8 @@ module.exports = {
   parseJournalText,
   applyJournalPuts,
   applyJournalRecords,
-  orderJournalPutsInMemoryOrder
+  orderJournalPutsInMemoryOrder,
+  // v3.534：`_f` 写盘投影与条数淘汰（唯一实现，四处写盘共用；导出供测试直接钉口径）
+  toDiskEntry,
+  trimMessagesToMaxSize
 }

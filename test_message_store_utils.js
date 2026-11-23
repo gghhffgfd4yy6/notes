@@ -2126,13 +2126,117 @@ check('saveBatch: 超出 maxSize 必须裁剪最早条目并把被裁剪身份�
   })
   const saved = JSON.parse(cacheWrites(writes)[0].text)
   assert.deepStrictEqual(saved.map(m => m.id), ['b', 'c'], '必须只保留最新 maxSize 条')
-  assert.strictEqual(warns.filter(w => w.includes('裁剪掉最早 1 条')).length, 1, `裁剪必须告警一次并含被裁剪条数：${JSON.stringify(warns)}`)
+  assert.strictEqual(warns.filter(w => w.includes('裁剪掉 1 条（过滤未推 _f 优先，其余最旧优先）')).length, 1, `裁剪必须告警一次并含被裁剪条数：${JSON.stringify(warns)}`)
   assert.ok(!warns.some(w => w.includes('墓碑写入未获锁')), '单实例内存 fs 下墓碑锁必须拿到')
   const tomb = writes.filter(w => w.label === '墓碑')
   assert.strictEqual(tomb.length, 1, '裁剪后必须落一次墓碑')
   assert.strictEqual(tomb[0].p, filePath + '.seen.json', '墓碑路径必须是 <缓存文件>.seen.json')
   const tombData = JSON.parse(tomb[0].text)
   assert.deepStrictEqual(tombData.id, ['a'], '被裁剪身份必须进墓碑（防重放重复推送）')
+})
+
+// ===== v3.534：`_f` 写盘瘦身 + `_f` 优先淘汰 =====
+check('v3.534 写盘投影：_f 且 id+url 齐全的条目落盘不带 content/content_html（缺 url 的 _f 保留正文兜底、普通条目正文逐字不变）', () => {
+  const name = 'v3534_slim.json'
+  const { store: s, writes, filePath } = makeBatchStore({ name })
+  const normal = { id: 'n1', url: 'https://u.example/n1', title: '正常线报', content: '正文一字不少 <b>&amp;</b>', content_html: '<p>正文一字不少 <b>&amp;</b></p>' }
+  const f1 = { id: 'f1', url: 'https://u.example/f1', title: '过滤1', content: 'C1', content_html: '<p>C1</p>', _f: true }
+  const f2 = { id: 'f2', url: 'https://u.example/f2', title: '过滤2', content: 'C2', content_html: '<p>C2</p>', _f: true }
+  // 缺 url 的 _f：身份只剩 id、正文是它唯一可展示/可重算的部分 ⇒ 必须保留正文兜底
+  const fNoUrl = { id: 'f3', title: '过滤3', content: 'C3', content_html: '<p>C3</p>', _f: true }
+  assert.strictEqual(s.saveBatch([normal, f1, f2, fNoUrl], name), true)
+  const saved = JSON.parse(cacheWrites(writes).pop().text)
+  const byId = new Map(saved.map(m => [m.id, m]))
+  for (const id of ['f1', 'f2']) {
+    const got = byId.get(id)
+    assert.ok(got, `${id}: 瘦身只丢正文，条目本身必须仍在落盘文件里（身份还在判重窗口内）`)
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(got, 'content'), false, `${id}: _f 且 id+url 齐全时写盘不得带 content`)
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(got, 'content_html'), false, `${id}: _f 且 id+url 齐全时写盘不得带 content_html`)
+    assert.strictEqual(got.url, `https://u.example/${id}`, `${id}: 身份字段 url 必须原样保留`)
+    assert.strictEqual(got._f, true, `${id}: _f 标记必须保留（规则变更时靠它整批重评）`)
+    assert.strictEqual(got.title, `过滤${id.slice(1)}`, `${id}: 展示字段必须保留`)
+  }
+  assert.strictEqual(byId.get('f3').content, 'C3', '缺 url 的 _f 必须保留正文兜底（无条件瘦身会把这条变成哑记录）')
+  assert.strictEqual(byId.get('f3').content_html, '<p>C3</p>', '缺 url 的 _f 连 content_html 也必须保留')
+  assert.strictEqual(byId.get('n1').content, normal.content, '普通条目 content 必须逐字不变（不得被顺手裁掉）')
+  assert.strictEqual(byId.get('n1').content_html, normal.content_html, '普通条目 content_html 必须逐字不变')
+  // 内存快照仍保存原对象：控制台/过滤/统计读的是内存，瘦身只发生在写盘序列化那一步
+  const memo = s._memoryCache[filePath]
+  assert.strictEqual(memo.find(m => m.id === 'f1').content, 'C1', '内存快照必须保留原对象正文（写盘投影不得改变运行时行为）')
+  assert.strictEqual(s.has({ id: 'f1', url: 'https://u.example/f1' }, name), true, '瘦身后的 _f 身份必须仍可判重命中')
+})
+
+check('v3.534 超限淘汰：_f 先出局、已推送记录保命并进墓碑（_f 不在数组头也先出局）', () => {
+  // 判别性布置：_f 的 f 夹在 a、b 中间。超上限 1 条时——
+  //   新口径（_f 优先）⇒ 淘汰 f，幸存 [a, b, c]；旧口径（数组最旧优先）⇒ 淘汰 a，幸存 [b, f, c]。
+  // 所以「f 不在幸存集、a 在」这一对断言正是「_f 优先」唯一能解释的结果（去掉优先级必红）。
+  const name = 'v3534_trim_f.json'
+  const cache0 = [
+    { id: 'a', url: 'https://u.example/a', title: 'A' },
+    { id: 'f', url: 'https://u.example/f', title: '过滤未推', _f: true },
+    { id: 'b', url: 'https://u.example/b', title: 'B' }
+  ]
+  const { store: s, writes, filePath } = makeBatchStore({ name, maxSize: 3, files: { [cachePath(name)]: JSON.stringify(cache0) } })
+  assert.deepStrictEqual(s.readMessages(filePath).map(m => m.id), ['a', 'f', 'b'], '前置：缓存里已有 _f 与两条已推送记录（_f 在中间）')
+  const warns = captureConsole('warn', () => {
+    assert.strictEqual(s.saveBatch([{ id: 'c', url: 'https://u.example/c', title: 'C' }], name), true)
+  })
+  const saved = JSON.parse(cacheWrites(writes).pop().text)
+  assert.deepStrictEqual(saved.map(m => m.id), ['a', 'b', 'c'],
+    '4 条超上限 3：必须淘汰 _f 的 f（旧口径「数组最旧优先」会淘汰最旧的已推送 a）')
+  assert.ok(!saved.some(m => m.id === 'f'), '被淘汰的 _f 不得留在落盘文件里')
+  assert.strictEqual(warns.filter(w => w.includes('裁剪掉 1 条（过滤未推 _f 优先，其余最旧优先）')).length, 1, `裁剪必须告警一次并含条数：${JSON.stringify(warns)}`)
+  const tomb = writes.filter(w => w.label === '墓碑')
+  assert.strictEqual(tomb.length, 0, '_f 不进墓碑，因此这一轮不应有墓碑写入')
+  assert.strictEqual(s.has({ id: 'a', url: 'https://u.example/a' }, name), true, '已推送的 a 保命 ⇒ 判重必须命中')
+  assert.strictEqual(s.has({ id: 'f', url: 'https://u.example/f' }, name), false, '_f 被裁后不得留下判重记忆（规则变更后要能重新评估）')
+  assert.strictEqual(s.has({ id: 'b', url: 'https://u.example/b' }, name), true, '幸存条目必须仍在判重集合')
+})
+
+check('v3.534 超限淘汰：_f 与已推送记录同时出局时，只有已推送的进墓碑', () => {
+  // spec 的取舍例子：maxSize=2、缓存 [_f f, a, b] 再存 c ⇒ 4 条超 2 条，f 与最旧的 a 都出局，
+  // 但墓碑只收 a（_f 从未推送、不承载判重记忆）。
+  const name = 'v3534_trim_f2.json'
+  const cache0 = [
+    { id: 'f', url: 'https://u.example/f', title: '过滤未推', _f: true },
+    { id: 'a', url: 'https://u.example/a', title: 'A' },
+    { id: 'b', url: 'https://u.example/b', title: 'B' }
+  ]
+  const { store: s, writes, filePath } = makeBatchStore({ name, maxSize: 2, files: { [cachePath(name)]: JSON.stringify(cache0) } })
+  assert.deepStrictEqual(s.readMessages(filePath).map(m => m.id), ['f', 'a', 'b'])
+  assert.strictEqual(s.saveBatch([{ id: 'c', url: 'https://u.example/c', title: 'C' }], name), true)
+  const saved = JSON.parse(cacheWrites(writes).pop().text)
+  assert.deepStrictEqual(saved.map(m => m.id), ['b', 'c'], '先淘汰 _f 的 f，不足再淘汰最旧的已推送 a')
+  const tomb = writes.filter(w => w.label === '墓碑')
+  assert.strictEqual(tomb.length, 1, '只有已推送身份出局时才落墓碑')
+  assert.deepStrictEqual(JSON.parse(tomb[0].text).id, ['a'], '只有已推送的 a 进墓碑（_f 按设计不入墓碑）')
+  assert.strictEqual(s.has({ id: 'a', url: 'https://u.example/a' }, name), true, '被裁的已推送记录仍须判重命中（墓碑兜底）')
+  assert.strictEqual(s.has({ id: 'f', url: 'https://u.example/f' }, name), false, '_f 被裁后不得留下判重记忆')
+})
+
+check('v3.534 读旧格式兼容：带正文的 _f 能正常读入，随后一次 save 自动瘦身（落盘无正文）', () => {
+  const name = 'v3534_legacy.json'
+  const legacyOld = { id: 'old', url: 'https://u.example/old', title: '旧格式 _f', content: '旧正文'.repeat(60), content_html: '<p>' + '旧正文'.repeat(60) + '</p>', _f: true }
+  const legacyKeep = { id: 'keep', url: 'https://u.example/keep', title: '普通', content: '普通正文', content_html: '<p>普通正文</p>' }
+  const { store: s, fs: fsMock, writes, filePath } = makeBatchStore({ name, files: { [cachePath(name)]: JSON.stringify([legacyOld, legacyKeep]) } })
+  const loaded = s.readMessages(filePath)
+  assert.strictEqual(loaded.length, 2, '旧格式（_f 带正文）必须照常读入：不报错、不丢条目')
+  assert.strictEqual(loaded.find(m => m.id === 'old').content, legacyOld.content, '读路径不做投影：读入时正文原样')
+  assert.strictEqual(s.has({ id: 'old', url: 'https://u.example/old' }, name), true, '旧格式 _f 的身份必须仍可判重命中')
+  assert.strictEqual(s.saveBatch([{ id: 'new', url: 'https://u.example/new', title: '新增' }], name), true)
+  const saved = JSON.parse(cacheWrites(writes).pop().text)
+  const oldAfter = saved.find(m => m.id === 'old')
+  assert.ok(oldAfter, '瘦身不得删除条目')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(oldAfter, 'content'), false, '下一次保存必须自然瘦身：落盘不再有 content')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(oldAfter, 'content_html'), false, '下一次保存必须自然瘦身：落盘不再有 content_html')
+  assert.strictEqual(saved.find(m => m.id === 'keep').content, '普通正文', '普通条目正文必须原样保留')
+  // 再起一个进程读同一份文件（同一内存 fs）：瘦身后形态仍能读入、身份仍命中
+  const reopened = makeBatchStore({ name, fsMock }).store
+  const again = reopened.readMessages(filePath)
+  assert.deepStrictEqual(again.map(m => m.id), ['old', 'keep', 'new'], '瘦身后文件必须仍可完整读入')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(again.find(m => m.id === 'old'), 'content'), false, '瘦身后的 _f 读回来就是没有正文的形态')
+  assert.strictEqual(reopened.has({ id: 'old', url: 'https://u.example/old' }, name), true, '瘦身后重启的判重结论不得改变')
+  assert.strictEqual(fsMock.files.get(filePath).includes('旧正文'), false, '落盘文件里不得残留 _f 正文')
 })
 
 check('saveBatch: 未超上限时不得裁剪、不得落墓碑、不得触碰墓碑锁文件', () => {
