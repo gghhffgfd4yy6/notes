@@ -562,33 +562,85 @@ o2Check('W4 契约：单块字段 re 存在且 blocks[0].re 与它是同一实�
   return 'single/multi-line 单块均 re===blocks[0].re'
 })
 
-o2Check('W4 命名组安全网：跨块重名不切块（整段编译失败 ⇒ 规则仍被跳过，判定面不得变宽）', () => {
+o2Check('W4 命名组安全网：跨块重名一律不切块，整段编得出来与否都与独立整段编译一致（判定面不得变宽）', () => {
   // 与生产 compileUserRegex 同口径的替身：编译失败返回 null（r2Compile 直接抛，不能用来测「非法」）
   const safeCompile = (src, flags) => { try { return new NativeRegExp(String(src), flags) } catch (e) { return null } }
   const eng = o2MakeEngine(safeCompile)
-  // ① 两行重名（`(?<x>…)` 形态，V8 与 RE2 都判整段非法——RE2 实测文案 `duplicate capture group name`）：
-  //    必须仍被判非法并跳过（编译产物 null + 告警），与 W4 之前一致。
+  // ① **与引擎版本无关**的非法样本：同一 alternative 内重名，且是单行（归一后仍逐字是 `(?<x>a)(?<x>b)`）。
+  //    ES2025（V8 13 / Node 24）只放宽「不同 alternative 允许同名组」，同一 alternative 内重名仍非法；
+  //    V8 22 与 RE2 同样非法（本机实证 `node -e "new RegExp('(?<x>a)(?<x>b)','i')"` ⇒ ERR）。
+  //    用它锁「非法 ⇒ 编译产物 null + 告警」，判定不随引擎版本漂移。
   let dup = null
-  const warns = r2Warn(() => { dup = eng.compileRules({ keyword: '(?<x>a)\n(?<x>b)' }) })
-  assert.strictEqual(dup.keyword, null, '重复命名组必须仍被判非法并跳过（编译产物为 null），实际 ' + JSON.stringify(dup.keyword && Object.keys(dup.keyword)))
-  assert.strictEqual(warns.some((w) => w.includes('非法正则') && w.includes('keyword')), true, '必须产生「非法正则」告警，实际：' + warns.join(' / '))
-  // ② **真正的回归场景**：两条重名行落在不同块里时，逐块各自都能编、整段编不出来——
-  //    没有守卫就会产出 `{re:null, blocks:[2]}`（规则从「被跳过」变成「生效」= 判定面变宽）。
+  const warns = r2Warn(() => { dup = eng.compileRules({ keyword: '(?<x>a)(?<x>b)' }) })
+  assert.strictEqual(dup.keyword, null, '同一 alternative 内重复命名组必须仍被判非法并跳过（编译产物为 null），实际 ' + JSON.stringify(dup.keyword && Object.keys(dup.keyword)))
+  assert.strictEqual(warns.some((w) => w.includes('非法正则') && w.includes('keyword')), true, '必须产生含「非法正则」与字段名的告警，实际：' + warns.join(' / '))
+  // ② **真正的回归场景**：两条重名行落在不同块里，逐块各自都能编——没有守卫就会产出
+  //    `{re:null, blocks:[2]}`（规则从「被跳过」变成「生效」= 判定面变宽）。
+  //    但「整段编不编得出来」本身随引擎漂移：RE2 与 V8 ≤22 判整段非法，V8 13 起（ES2025）放宽到
+  //    「不同 alternative 允许同名」⇒ 整段合法。故本用例**不假设整段必失败**，只锁三件引擎无关的事：
+  //    不切块（blocks 恒缺席）、只编整段一次、判定与「独立整段编译」逐条一致（成功/失败两条分支都要成立）。
   //    构造 700 分支、两块（599 + 101），重名分别在首行与末行。
   const lines = ['(?<x>a)']
   for (let i = 0; i < 299; i++) lines.push('kwA' + i + '|kwB' + i)
   for (let i = 0; i < 50; i++) lines.push('kwC' + i + '|kwD' + i)
   lines.push('(?<x>b)')
-  const seen = []
-  const recEng = o2MakeEngine((src) => { seen.push(String(src)); return safeCompile(src, 'i') })
-  let cross = null
-  const warns2 = r2Warn(() => { cross = recEng.compileRules({ keyword: lines.join('\n') }) })
-  assert.strictEqual(cross.keyword, null, '跨块重名的规则必须仍被跳过（否则它会带着 blocks 变活）')
-  assert.strictEqual(warns2.some((w) => w.includes('非法正则')), true, '跨块重名同样必须告警')
-  assert.deepStrictEqual(seen, [lines.join('|')], '守卫必须让编译只发生在整段一次，不得逐块编译')
+  const whole = lines.join('|') // 守卫命中时 compileRules 实际编译的整段源码（joinSimpleRegexLines 的归一结果）
+  // 探针：命中（'a'/'b'/任意 kw 分支；'ab' 含 a 子串）与不命中（'c'、空串）两侧都有
+  const probes = ['a', 'b', 'ab', 'c', '', 'kwA0', 'kwB7', 'kwC3', 'kwD49', 'zzz']
+  // 整段判非法时编译产物是 null，取 blocks 前必须先过 null（否则 TypeError 会盖住真正的断言）
+  const blocksOf = (entry) => (entry ? entry.blocks : undefined)
+
+  // 跨块重名的共同断言（引擎无关）：整段非法 ⇒ 跳过 + 告警；整段可编 ⇒ 生效且判定与独立整段编译逐条一致。
+  // 走哪条分支由 indep（独立整段编译）的实际结果决定，不预设 —— 同一条代码路径在 V8 22 走前者、
+  // 在 CI 的 V8 13 走后者，断言都必须成立。
+  const checkCross = (label, compile) => {
+    const seen = []
+    const recEng = o2MakeEngine((src) => { seen.push(String(src)); return compile(src, 'i') })
+    let cross = null
+    const crossWarns = r2Warn(() => { cross = recEng.compileRules({ keyword: lines.join('\n') }) })
+    const observed = blocksOf(cross.keyword)
+    // 用 assert.ok（而非 strictEqual）只为让失败信息紧凑：blocks 里含整块源码，strictEqual 会把几 KB 的 actual 全打印出来
+    assert.ok(observed === undefined, label + '：跨块重名必须不切块（blocks 必须缺席），实际 ' + (observed ? observed.length + ' 块 [' + observed.map((b) => b.branches).join('+') + ']' : String(observed)))
+    assert.deepStrictEqual(seen, [whole], label + '：守卫必须让编译只发生在整段一次，不得逐块编译')
+    const indep = compile(whole, 'i')
+    if (indep === null) {
+      assert.strictEqual(cross.keyword, null, label + '：整段编不出来 ⇒ 规则必须仍被跳过（不得带 blocks 变活）')
+      assert.strictEqual(crossWarns.some((w) => w.includes('非法正则') && w.includes('keyword')), true, label + '：整段非法必须产生含字段名的「非法正则」告警')
+      assert.strictEqual(recEng.matchesCompiled(cross.keyword, 'a'), false, label + '：规则被跳过 ⇒ 任何输入都不得拦截')
+      return '整段非法 ⇒ 跳过'
+    }
+    assert.ok(cross.keyword, label + '：整段可编 ⇒ 规则必须生效（编译产物不得为 null）')
+    assert.ok(blocksOf(cross.keyword) === undefined, label + '：整段可编也不得切块（blocks 必须缺席）')
+    assert.strictEqual(cross.keyword.source, whole, label + '：source 必须仍是整段原文')
+    for (const v of probes) {
+      assert.strictEqual(recEng.matchesCompiled(cross.keyword, v), indep.test(v),
+        label + '：判定必须与独立整段编译逐条一致：' + JSON.stringify(v))
+    }
+    return '整段可编 ⇒ 生效 + 判定一致'
+  }
+  checkCross('原生 safeCompile', safeCompile)
+
+  // V8 13（ES2025）允许**不同 alternative** 内同名捕获组，本机 Node 22（V8 12）不允许。为让「整段可编」
+  // 那条分支在本机也**真实跑到**，用注入替身模拟 V8 13：先把第 2 个及以后的同名组在源码文本里改成唯一名，
+  // 再交给原生 RegExp——只改源码拼写、不改语言（各分支仍是原来的并集），探针也不读捕获，
+  // 故可安全用作「独立整段编译」的对照面（下游只用 .test 判 true/false）。
+  const renameDupGroups = (src) => {
+    const used = new Set()
+    return String(src).replace(/\(\?<([A-Za-z_$][\w$]*)>/g, (m, name) => {
+      if (!used.has(name)) { used.add(name); return m }
+      let n = 1
+      while (used.has(name + '__' + n)) n++
+      used.add(name + '__' + n)
+      return '(?<' + name + '__' + n + '>'
+    })
+  }
+  const safeCompileCi = (src, flags) => { try { return new NativeRegExp(renameDupGroups(src), flags) } catch (e) { return null } }
+  const viaCi = checkCross('safeCompileCi（模拟 V8 13 跨 alternative 重名）', safeCompileCi)
+  assert.strictEqual(viaCi, '整段可编 ⇒ 生效 + 判定一致', 'safeCompileCi 必须构造出「整段可编」的对照面，否则该分支在本机没被测到，实际 ' + viaCi)
   // ③ `(?P<x>…)`（Python 风格，V8 不支持、RE2 支持）：同一守卫按源码文本生效 ⇒ 不切块
   const pEng = o2MakeEngine((src) => ({ test: () => true, source: String(src) }))
   const py = pEng.compileRules({ keyword: '(?P<x>a)\n(?P<y>b)' })
+  assert.ok(py.keyword, '`(?P<>` 整段编译成功（替身恒成功）⇒ 规则必须生效，不得为 null')
   assert.strictEqual(py.keyword.blocks, undefined, '`(?P<>` 行同样不切块（守卫是行级、不分语法）')
   // ④ 不同名、无跨块冲突：整段本来就能编，规则照旧生效（守卫是行级的，故同样不切块——保守方向只影响速度）
   const ok = eng.compileRules({ keyword: '(?<x>a)\n(?<y>b)' })
@@ -597,9 +649,9 @@ o2Check('W4 命名组安全网：跨块重名不切块（整段编译失败 ⇒ 
   assert.strictEqual(eng.matchesCompiled(ok.keyword, 'a'), true, '命名组规则仍须命中 a')
   assert.strictEqual(eng.matchesCompiled(ok.keyword, 'b'), true, '命名组规则仍须命中 b')
   // 判定与「独立整段编译」逐条一致（对照面独立构造，不读 compiled.re 之外的任何字段）
-  const indep = safeCompile(ok.keyword.source, 'i')
-  for (const v of ['a', 'b', 'ab', 'c', '']) assert.strictEqual(eng.matchesCompiled(ok.keyword, v), v !== '' && indep.test(v), '命名组判定必须与独立整段编译一致：' + v)
-  return '两行重名/跨块重名 ⇒ 跳过 + 告警（只编整段一次）；不同名 ⇒ 不切块但判定一致'
+  const indepOk = safeCompile(ok.keyword.source, 'i')
+  for (const v of ['a', 'b', 'ab', 'c', '']) assert.strictEqual(eng.matchesCompiled(ok.keyword, v), indepOk.test(v), '命名组判定必须与独立整段编译一致：' + v)
+  return '同一 alternative 重名 ⇒ 跳过 + 告警；跨块重名两条分支均只编整段一次且判定与独立整段编译一致；不同名 ⇒ 不切块但判定一致'
 })
 
 o2Check('W4 simpleSourceCompiles：多块只编块、非法/重名返回 false、单块编整段', () => {
