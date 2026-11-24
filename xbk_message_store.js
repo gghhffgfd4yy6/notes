@@ -8,7 +8,7 @@
 // `--status` 静默报「缺失」。抽成无副作用函数后两侧口径恒等；fs/path 由调用方注入，本模块只 require
 // 零外部依赖的 xbk_utils（纯常量+纯函数）与 xbk_storage（只 require fs/path/node:crypto），
 // `--status` 复用它**不需要**加载 got/re2，原设计（缺依赖也能诊断）不受影响。
-const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS } = require('./xbk_utils')
+const { timingSafeEqualStr, TOMBSTONE_MAX_KEYS, createUtils } = require('./xbk_utils')
 // S1：根内路径校验（逐级回溯 + lstat 目录 + realpath 仍在根内）的唯一实现在 xbk_storage。
 // 该模块只 require fs/path/node:crypto（零外部依赖），故上面「--status 复用它不需要加载
 // got/re2」的设计不受影响；也不能反过来让 xbk_storage require 本模块（循环依赖）。
@@ -48,7 +48,11 @@ const PUSH_SOURCES_MAX_URL_LEN = 2048
 //     按设计不落墓碑，不记 drop 就会在回放时复活并排到尾部，把快照里的活条目挤出上限；
 //   · v3.534 起写盘（快照与 journal 行）一律经 `toDiskEntry` 投影：`_f === true` 且 id+url 齐全的
 //     条目只留身份，不写 content/content_html（内存快照仍保存原对象；缺失 id/url 的 `_f` 保留正文兜底）。
-//     旧文件里带正文的 `_f` 照常读入，下一次保存自然瘦身；条数淘汰改为 `_f` 优先（见 trimMessagesToMaxSize）；
+//     W5 收紧：投影还要求「去掉正文后 getMessageIdentity 的 kind+key 不变」（canDropBody）——legacy
+//     匿名 id / 空白 id 的 `_f` 不再被投影（否则身份翻转、重启后判重丢失）；
+//     journal 的 `drop` 行另按同一判据只留 id/url/timestamp，不能脱离正文的身份原样保留（回放靠身份匹配）。
+//     旧文件里带正文的 `_f` 照常读入，下一次保存自然瘦身；条数/字节两条上限都改为 `_f` 优先（见
+//     selectEvictionIndices / trimMessagesToMaxSize / _trimCacheByBytes）；
 //   · 合并成功写快照后先追加一行 ckpt 再 truncate：ckpt 之前的行已全部进快照，读端只回放最后一个
 //     ckpt 之后的行。truncate 失败（或进程死在两者之间）时，旧行不会被重复回放；
 //   · journal 读失败（ioError/unsafe/tooLarge/半读）= fail-closed：置 _readFailed、返回空集，
@@ -280,18 +284,63 @@ function orderJournalPutsInMemoryOrder (messages, puts) {
 // 为什么淘汰要 `_f` 优先：`_f` 从未推送、按设计不落墓碑（规则变更后由上游整批重新拉取重评），
 // 先挤掉它们不丢任何判重记忆；反过来（旧口径「数组最旧优先」）会让 `_f` 洪峰先把**已推送**记录
 // 的判重记忆挤出上限 ⇒ 上游重放即重复推送。墓碑口径本身不变（_tombstoneDropped 仍跳过 `_f`）。
-/** 写盘投影：条目是对象、`_f === true`、且身份完整（id = 非空字符串或有限数字，url = 非空字符串）
- *  时返回**浅拷贝**并删掉 content / content_html 两个键；否则原样返回**同一对象**。
+// W5 收口三处（原判据只在「典型 `_f`」上成立，w3b 5.1/5.2/5.5 实测到的空洞）：
+//   ① 投影判据改为与 getMessageIdentity 同源（canDropBody：去掉正文后身份 kind+key 必须不变），
+//      `_f` 投影 = 原 id+url 齐全口径 ∩ 身份等价（见 toDiskEntry）；
+//   ② 64 MiB 字节上限淘汰与条数上限共用 selectEvictionIndices（`_f` 优先，不足再最旧），此前按
+//      数组序从头部 splice，字节到顶时会把最旧的已推送条目挤掉、留下最新的 `_f`；
+//   ③ journal 的 `drop` 行只留身份字段（journalDropEntry），被淘汰的已推送条目不再把全文写进日志。
+/** 「去掉正文后身份是否等价」——**唯一**的「能否安全丢正文」判据（W5）：
+ *  对同一对象分别算 `getMessageIdentity(原对象)` 与 `getMessageIdentity(删掉 content/content_html
+ *  的浅拷贝)`，两者都有效且 kind + key 相同才允许丢正文。与 getMessageIdentity **同源**，不复制
+ *  身份规则（w3b 5.1 的反例就是这么漏的：`toDiskEntry` 自己判「id 与 url 都存在」，而身份判据会降级）。
+ *  为什么 id/url 齐全还不够：legacy「匿名 id + 非法 url」的条目（id 形如 `anon:<hex>`、url 不可用）
+ *  在 getMessageIdentity 里降级成**内容 anon 身份**，删掉正文后翻转成 `id:anon:…` ⇒ 重启后 has()
+ *  变 false、saveBatch 重复收录、journal 的 drop 回放按身份匹配失配（removed:0）。
+ *  空白 id（trim 后为空）同理：删正文后从内容 anon 变成 id 身份。
+ *  兼容子句：现有测试锁定「`_f` 且 url 缺失/为空时保留正文」（w3b ①② 的 f3），故 `_f` 投影仍
+ *  要求 id+url 齐全（见 diskIdentityComplete）——新判据是原口径的**收紧**，不是放宽。
+ *  异常 getter 等算不出身份的情况一律按「不能丢正文」处理（fail-safe）。 */
+function canDropBody (m, Utils) {
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return false
+  if (!Utils || typeof Utils.getMessageIdentity !== 'function') return false
+  try {
+    const before = Utils.getMessageIdentity(m)
+    if (!before || before.valid !== true) return false
+    const copy = Object.assign({}, m)
+    delete copy.content
+    delete copy.content_html
+    const after = Utils.getMessageIdentity(copy)
+    return !!after && after.valid === true && after.kind === before.kind && after.key === before.key
+  } catch (e) {
+    return false
+  }
+}
+
+/** 既有 `_f` 投影的身份完整性判据（id = 非空字符串或有限数字 + url = 非空字符串）：字符串 id 用
+ *  trim() 判空——`'   '` 在 getMessageIdentity 里不是 id，原实现却把它当 id 投影了（身份会翻转）。 */
+function diskIdentityComplete (m) {
+  try {
+    const id = m.id
+    const idOk = (typeof id === 'string' && id.trim() !== '') || (typeof id === 'number' && Number.isFinite(id))
+    if (!idOk) return false
+    return typeof m.url === 'string' && m.url !== ''
+  } catch (e) {
+    return false
+  }
+}
+
+/** 写盘投影：条目是对象、`_f === true`、id+url 齐全（diskIdentityComplete）且身份不依赖正文
+ *  （canDropBody）时返回**浅拷贝**并删掉 content / content_html；否则原样返回**同一对象**。
  *  缺 id/url 的 `_f` 保留正文兜底——它们的身份只能靠正文重算/展示，瘦身会把这类条目变成哑记录。
+ *  Utils 必须由调用方注入（身份判据的来源）；拿不到 Utils 时一律不投影（宁可不瘦身，也不翻转身份）。
  *  只用于「写盘序列化」：内存快照（`_memoSet`）、判重索引、控制台消息列表/统计仍看原对象；
  *  补推预览读落盘投影，由 scanPreviewRecords 统计 noBody 后如实降级（available:false /
  *  code:'bodies_unavailable'）——补推预览同样是控制台功能，但它走的是磁盘，不在「仍看原对象」之列。 */
-function toDiskEntry (m) {
+function toDiskEntry (m, Utils) {
   if (!m || typeof m !== 'object' || Array.isArray(m) || m._f !== true) return m
-  const id = m.id
-  const idOk = (typeof id === 'string' && id !== '') || (typeof id === 'number' && Number.isFinite(id))
-  if (!idOk) return m
-  if (typeof m.url !== 'string' || m.url === '') return m
+  if (!diskIdentityComplete(m)) return m
+  if (!canDropBody(m, Utils)) return m
   const out = Object.assign({}, m)
   delete out.content
   delete out.content_html
@@ -301,8 +350,51 @@ function toDiskEntry (m) {
 /** 恒等投影（不写盘瘦身时的默认口径）：`_trimCacheByBytes` 的可选参数默认值。 */
 function identityDiskEntry (m) { return m }
 
-/** 条数淘汰（**原地**改 messages）：超出 maxSize 时先淘汰 `_f === true` 的条目（同类内数组序最旧
- *  优先），不足再淘汰其余最旧的条目；幸存者保持原顺序。返回被移除的条目数组（按数组序）。
+/** journal `drop` 行只带身份字段（回放只按身份匹配）。判据必须与写盘投影同源（canDropBody），
+ *  不得另写一套；`_f` / id+url 齐全不是这里的条件——被淘汰的**已推送**条目同样只留身份
+ *  （w3b 5.5 实测：一次降 maxSize 的单行 drop 里 939 条非 `_f` 条目带了 523.7 KB 正文）。
+ *  不能脱离正文的身份（anon 内容哈希 / legacy 匿名 id）必须原样保留正文，否则回放按身份匹配失配
+ *  （w3b 5.1 实测 removed:0）。极小对象仍须算出同一身份（兜底，例如身份来自 title 的匿名条目）。 */
+const DROP_IDENTITY_FIELDS = Object.freeze(['id', 'url', 'timestamp'])
+function journalDropEntry (m, Utils) {
+  if (!canDropBody(m, Utils)) return m
+  const out = {}
+  for (const key of DROP_IDENTITY_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(m, key)) out[key] = m[key]
+  }
+  try {
+    const a = Utils.getMessageIdentity(m)
+    const b = Utils.getMessageIdentity(out)
+    if (a && b && a.valid === true && b.valid === true && a.kind === b.kind && a.key === b.key) return out
+  } catch (e) { /* 身份算不出来 ⇒ 保留原文（fail-safe） */ }
+  return m
+}
+
+/** **唯一**的淘汰顺序选择（条数上限与字节上限共用，禁止两处各写一份）：
+ *  先按数组序取 `_f === true`（从未推送、按设计不落墓碑 ⇒ 丢掉不损失任何判重记忆），不足再取其余
+ *  最旧的条目。返回**淘汰顺序**的索引数组（前 `excess` 个即本次要淘汰的集合）。 */
+function selectEvictionIndices (messages, excess) {
+  const total = Array.isArray(messages) ? messages.length : 0
+  const need = Number.isFinite(excess) ? Math.floor(excess) : 0
+  const out = []
+  if (!(need > 0) || total === 0) return out
+  for (let i = 0; i < total && out.length < need; i++) {
+    const m = messages[i]
+    if (m && typeof m === 'object' && !Array.isArray(m) && m._f === true) out.push(i)
+  }
+  if (out.length < need) {
+    const chosen = new Set(out)
+    for (let i = 0; i < total && out.length < need; i++) {
+      if (chosen.has(i)) continue
+      chosen.add(i)
+      out.push(i)
+    }
+  }
+  return out
+}
+
+/** 条数淘汰（**原地**改 messages）：超出 maxSize 时按 selectEvictionIndices 的顺序淘汰（`_f` 优先，
+ *  同类内数组序最旧优先；不足再淘汰其余最旧的条目）；幸存者保持原顺序。返回被移除的条目数组（按数组序）。
  *  唯一的实现：saveMessages / _persistChanges / _compact / _recoverOverlargeCache 四处共用同一口径
  *  （否则内存快照、磁盘快照、journal 的 drop 与墓碑会各按一套规则取舍）。 */
 function trimMessagesToMaxSize (messages, maxSize) {
@@ -311,14 +403,7 @@ function trimMessagesToMaxSize (messages, maxSize) {
   const total = messages.length
   const excess = total - limit
   if (!(excess > 0)) return []
-  const doomed = new Set()
-  for (let i = 0; i < total && doomed.size < excess; i++) {
-    const m = messages[i]
-    if (m && typeof m === 'object' && m._f === true) doomed.add(i)
-  }
-  for (let i = 0; i < total && doomed.size < excess; i++) {
-    if (!doomed.has(i)) doomed.add(i)
-  }
+  const doomed = new Set(selectEvictionIndices(messages, excess))
   const removed = []
   let w = 0
   for (let i = 0; i < total; i++) {
@@ -327,6 +412,35 @@ function trimMessagesToMaxSize (messages, maxSize) {
   }
   messages.length = w
   return removed
+}
+
+/** 模块级默认 Utils：只有「没有 store 实例」的写盘入口（控制台恢复备份）需要它。身份只依赖
+ *  xbk_utils 的纯函数；本文件用到的 safeRe 模式（`%` / `\` / `|`）在 re2 与 V8 下等价，且控制台
+ *  进程本来就用 V8 版 statusUtils，不会出现两套身份口径。 */
+let fallbackIdentityUtils = null
+function defaultIdentityUtils () {
+  if (fallbackIdentityUtils === null) {
+    fallbackIdentityUtils = createUtils({ safeRe: (src, flags) => new RegExp(src, flags) })
+  }
+  return fallbackIdentityUtils
+}
+
+/** 控制台恢复用的写盘投影（W5）：把备份里的旧格式快照文本按 saveMessages 的落盘口径重写
+ *  （紧凑 JSON 数组 + 逐条 toDiskEntry，与 `JSON.stringify(toSave.map(toDiskEntry))` 逐字节同类）。
+ *  解析失败 / 不是数组时返回 null ⇒ 调用方按「写失败」处理（绝不写裸文本，更不写空文件）。
+ *  为什么放在这里：恢复是第五条写路径，直接写裸 JSON 会把刚瘦掉的快照重新吹大，且要等到下一次
+ *  compact 才收敛（w3b 5.3 实测 11,071,546 B 恢复后原样，直到合并才变 5,144,707 B）。 */
+function projectMessagesText (text, Utils) {
+  if (typeof text !== 'string' || text === '') return null
+  let parsed = null
+  try { parsed = JSON.parse(text) } catch (e) { return null }
+  if (!Array.isArray(parsed)) return null
+  const u = Utils && typeof Utils.getMessageIdentity === 'function' ? Utils : defaultIdentityUtils()
+  try {
+    return JSON.stringify(parsed.map((m) => toDiskEntry(m, u)))
+  } catch (e) {
+    return null
+  }
 }
 
 // 墓碑每类键数的**生效上限**——唯一口径（C6-006 / 评审 CR-01·CR-02）：
@@ -536,6 +650,11 @@ function createMessageStore ({
   // 读路径是否回放 journal（见 JOURNAL_READ_ENABLED 注释）：只有显式注入 false 才关闭，
   // 生产缺省恒为 true——不能让一个「读不到的配置」把回放静默关掉。
   const journalReadEnabled = constants.JOURNAL_READ_ENABLED !== false
+
+  // W5：写盘投影的唯一入口。身份判据（canDropBody）需要 Utils，而 toDiskEntry 是模块级纯函数
+  // （控制台恢复用 projectMessagesText 的默认 Utils）；本闭包内一律经这个绑定调用，禁止再写
+  // toDiskEntry(m) —— 少传 Utils 会让投影静默退化成「恒等」（保留正文，不会翻转身份）。
+  const toDisk = (m) => toDiskEntry(m, Utils)
 
   // XBK_CACHE_DIR 取值规则（审查 #241 M1）：与青龙 `--status`（statusCacheDir）同一套——
   // 只采纳绝对路径；相对路径告警一次并忽略。绝对路径原样采纳（含项目根外路径），因为
@@ -1497,7 +1616,7 @@ function createMessageStore ({
       }
       let text
       try {
-        text = this._trimCacheByBytes(JSON.stringify(elements.map(toDiskEntry)), elements, filePath, MESSAGE_CACHE_MAX_BYTES, dropped, toDiskEntry)
+        text = this._trimCacheByBytes(JSON.stringify(elements.map(toDisk)), elements, filePath, MESSAGE_CACHE_MAX_BYTES, dropped, toDisk)
       } catch (e) {
         console.error(`缓存尾部恢复裁剪异常，无法自动恢复（保持写闸门）${filePath}:`, e && e.message)
         return null
@@ -1609,7 +1728,7 @@ function createMessageStore ({
       // P3（审查 2026-08-15）：紧凑输出替代美化缩进——缓存文件体积 -30~50%，万条级序列化内存峰值更低
       // v3.534：写盘投影——`_f`（过滤未推）且 id+url 齐全的条目只留身份，不写 content/content_html
       // （内存快照 / 判重索引 / 控制台仍看原对象；缺失 id/url 的 `_f` 保留正文兜底）。
-        text = JSON.stringify(toSave.map(toDiskEntry))
+        text = JSON.stringify(toSave.map(toDisk))
       } catch (e) {
         console.error(`缓存序列化失败 ${filePath}（可能含循环引用）:`, e.message)
         text = null
@@ -1632,7 +1751,7 @@ function createMessageStore ({
       try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
       try {
         if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
-        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll, toDiskEntry)
+        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, droppedAll, toDisk)
       } catch (e) {
       // 评审 qodo（v3.267）：裁剪阶段意外异常（如极端不可序列化元素）也不崩溃进程，与序列化失败同口径 fail-open
         console.error(`缓存裁剪失败 ${filePath}:`, e.message)
@@ -1949,9 +2068,12 @@ function createMessageStore ({
         try {
           // v3.534：journal 与快照同一份写盘投影——`_f`（id+url 齐全）的 put/drop 都不写正文，
           // 否则日志行会把快照里刚瘦掉的那几 KB 原样带回来（新行同步变小）。
-          const putLine = put.length > 0 ? put.map(toDiskEntry) : put
+          // W5：drop 行只带身份字段（journalDropEntry，判据与写盘投影同源）：被淘汰的**已推送**条目
+          // 此前把全文写进 drop（w3b 5.5 实测单行 939 条 drop 带 523.7 KB）；不能脱离正文的身份
+          // （anon 内容哈希 / legacy 匿名 id）仍原样保留，否则回放按身份匹配失配（removed:0）。
+          const putLine = put.length > 0 ? put.map(toDisk) : put
           line = JSON.stringify(drop.length > 0
-            ? { v: JOURNAL_VERSION, at: Date.now(), put: putLine, drop: drop.map(toDiskEntry) }
+            ? { v: JOURNAL_VERSION, at: Date.now(), put: putLine, drop: drop.map((m) => journalDropEntry(m, Utils)) }
             : { v: JOURNAL_VERSION, at: Date.now(), put: putLine }) + '\n'
         } catch (e) {
           console.error(`判重日志序列化失败 ${jPath}（可能含循环引用）:`, e && e.message)
@@ -2018,7 +2140,7 @@ function createMessageStore ({
       const dropped = trimMessagesToMaxSize(toSave, maxSize)
       let text
       try {
-        text = JSON.stringify(toSave.map(toDiskEntry))
+        text = JSON.stringify(toSave.map(toDisk))
       } catch (e) {
         console.error(`判重缓存合并序列化失败 ${filePath}（可能含循环引用）:`, e && e.message)
         return false
@@ -2027,7 +2149,7 @@ function createMessageStore ({
         let textBytes = null
         try { textBytes = Buffer.byteLength(text, 'utf8') } catch (e) { textBytes = null }
         if (textBytes !== null && textBytes > MESSAGE_CACHE_MAX_BYTES) text = null
-        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, dropped, toDiskEntry)
+        text = this._trimCacheByBytes(text, toSave, filePath, MESSAGE_CACHE_MAX_BYTES, dropped, toDisk)
       } catch (e) {
         console.error(`判重缓存合并裁剪失败 ${filePath}:`, e && e.message)
         return false
@@ -2047,13 +2169,16 @@ function createMessageStore ({
       return true
     },
 
-    /** 写端字节上限裁剪：二分查找「最新 k 条序列化后不超读端上限」的最大 k（O(log n) 次序列化），
-   *  至少保留最新 1 条；不超限原样返回；连最新单条都超限时返回 null（调用方跳过落盘）。
-   *  maxBytes 仅供测试缩限（生产恒为 MESSAGE_CACHE_MAX_BYTES）。
-   *  project（v3.534）是**写盘投影**（默认恒等）：逐条 sizes 与最终 JSON.stringify 必须用同一条投影，
-   *  否则按「未瘦身字节」裁剪会在 `_f` 占多数时多裁掉本可保留的活条目（磁盘上实际写得更小）。
-   *  本方法不写墓碑：被裁剪记录追加到 droppedOut（与条数裁剪统一），
-   *  由 saveMessages 在缓存原子写盘成功后一并落墓碑（CodeAnt Round2 时序修复）。 */
+    /** 写端字节上限裁剪：按**与条数上限共用的淘汰顺序**（selectEvictionIndices：先 `_f`，不足再最旧）
+     *  逐步淘汰到序列化后不超读端上限，至少保留 1 条；不超限原样返回；连最新单条都超限时返回 null
+     *  （调用方跳过落盘）。
+     *  maxBytes 仅供测试缩限（生产恒为 MESSAGE_CACHE_MAX_BYTES）。
+     *  project（v3.534）是**写盘投影**（默认恒等）：逐条 sizes 与最终 JSON.stringify 必须用同一条投影，
+     *  否则按「未瘦身字节」裁剪会在 `_f` 占多数时多裁掉本可保留的活条目（磁盘上实际写得更小）。
+     *  W5：淘汰顺序不再是「数组序从头部 splice」——字节到顶时那样会把最旧的**已推送**条目挤掉、
+     *  留下最新的 `_f`（w3b 5.2 实测），与条数上限的 `_f` 优先口径相反。
+     *  本方法不写墓碑：被裁剪记录追加到 droppedOut（与条数裁剪统一），
+     *  由 saveMessages 在缓存原子写盘成功后一并落墓碑（CodeAnt Round2 时序修复）。 */
     _trimCacheByBytes (text, toSave, filePath, maxBytes = MESSAGE_CACHE_MAX_BYTES, droppedOut = null, project = identityDiskEntry) {
       // text === null 表示「调用方已确认超限并主动丢弃了首份序列化」（C3-009）：跳过快路径，直接裁剪后重新序列化。
       if (text !== null && Buffer.byteLength(text, 'utf8') <= maxBytes) return text
@@ -2068,41 +2193,61 @@ function createMessageStore ({
         const s = JSON.stringify(project(m))
         return Buffer.byteLength(s === undefined ? 'null' : s, 'utf8')
       })
-      // v3.267（评审建议）：后缀和数组——sizeOfLast(count) 从 O(count) 线性求和降为 O(1)，大数组二分不再重复累加
-      const suffix = new Array(toSave.length + 1).fill(0)
-      for (let i = toSave.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + sizes[i]
-      const sizeOfLast = (count) => { // 最后 count 条的数组序列化字节 = [] 开销 2 + (count-1) 个逗号 + 后缀和
-        return 2 + (count > 1 ? count - 1 : 0) + suffix[toSave.length - count]
+      // 淘汰顺序（唯一来源）：前 k 个下标即「淘汰 k 条」时要丢的条目；kept = len - k 条。
+      // 最多淘汰 len-1 条（至少留 1 条做真实口径校验），与旧实现的「单条超限返回 null」同边界。
+      const order = selectEvictionIndices(toSave, toSave.length - 1)
+      const evictedBytes = new Array(order.length + 1).fill(0)
+      for (let i = 0; i < order.length; i++) evictedBytes[i + 1] = evictedBytes[i] + sizes[order[i]]
+      let totalBytes = 0
+      for (const n of sizes) totalBytes += n
+      const bytesAfterEvicting = (k) => { // 淘汰 k 条后的数组序列化字节 = [] 开销 2 + (kept-1) 个逗号 + 幸存者字节和
+        const kept = toSave.length - k
+        return 2 + (kept > 1 ? kept - 1 : 0) + (totalBytes - evictedBytes[k])
       }
-      let lo = 1
-      let hi = toSave.length
+      // 估计值随淘汰条数 k 单调下降 ⇒ 二分找「第一个估计不超限」的 k（k 越大幸存者越少）
+      let lo = 0
+      let hi = order.length
       while (lo < hi) {
-        const mid = (lo + hi + 1) >> 1
-        if (sizeOfLast(mid) <= maxBytes) lo = mid
-        else hi = mid - 1
+        const mid = (lo + hi) >> 1
+        if (bytesAfterEvicting(mid) <= maxBytes) hi = mid
+        else lo = mid + 1
       }
       // 评审 coderabbit（v3.267）：key-sensitive toJSON 时根级估算可能低估数组内真实字节
       // （根级 key='' vs 数组内 key=索引，toJSON 可返回不同长度，实测可低估 10 倍）——
-      // 收敛后做一次真实数组口径校验，超限则线性回退（极罕见场景，正常路径零额外开销），防写盘超限触发读端 tooLarge 自锁
-      // C3-009：真实数组口径校验与「产出终稿」合并成一次循环——旧实现校验时 stringify 一次、
-      // 产出终稿再 stringify 一次，超限场景每次多背一份全量字符串。收敛到 lo < 1 即「连最新单条都超限」，
-      // 与单条超限路径同口径跳过落盘（防读端 tooLarge 自锁），且不产生任何丢弃。
+      // 收敛后做一次真实数组口径校验，超限则按同一淘汰顺序线性多淘汰一条（极罕见场景，正常路径只跑一次），
+      // 防写盘超限触发读端 tooLarge 自锁。淘汰到空集仍超限 ⇒ 与「单条超限」同口径返回 null 且不产生任何丢弃。
       let out = null
-      while (lo >= 1) {
-        out = JSON.stringify(toSave.slice(-lo).map(project))
-        if (Buffer.byteLength(out, 'utf8') <= maxBytes) break
-        out = null
-        lo--
+      let evicted = 0
+      for (let k = lo; k <= order.length; k++) {
+        const dead = new Set(order.slice(0, k))
+        const kept = []
+        for (let i = 0; i < toSave.length; i++) if (!dead.has(i)) kept.push(toSave[i])
+        if (kept.length === 0) break
+        const candidate = JSON.stringify(kept.map(project))
+        if (Buffer.byteLength(candidate, 'utf8') <= maxBytes) {
+          out = candidate
+          evicted = k
+          break
+        }
       }
       if (out === null) {
         console.warn(`缓存单条消息即超过读端上限(${maxBytes} 字节)，无法裁剪：${filePath}`)
         return null
       }
-      const dropped = toSave.length - lo
-      if (dropped > 0) console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${dropped} 条（防读端 tooLarge 自锁）`)
-      if (dropped > 0) {
-        const droppedMsgs = toSave.splice(0, dropped)
+      if (evicted > 0) console.warn(`缓存字节超上限(${maxBytes} 字节)，裁剪掉最早 ${evicted} 条（淘汰顺序：过滤未推 _f 优先，其余最旧优先，防读端 tooLarge 自锁）`)
+      if (evicted > 0) {
+        // 被淘汰集合可能不是数组头部一段（`_f` 优先 ⇒ 中段出局）：按数组序收集 droppedOut，
+        // 再把幸存者原地写回 toSave（调用方随后用它做内存快照/墓碑），保持原数组顺序。
+        const dead = new Set(order.slice(0, evicted))
+        const droppedMsgs = []
+        const kept = []
+        for (let i = 0; i < toSave.length; i++) {
+          if (dead.has(i)) droppedMsgs.push(toSave[i])
+          else kept.push(toSave[i])
+        }
         if (droppedOut) droppedOut.push(...droppedMsgs)
+        toSave.length = 0
+        for (const m of kept) toSave.push(m)
       }
       return out
     },
@@ -3043,6 +3188,11 @@ module.exports = {
   applyJournalRecords,
   orderJournalPutsInMemoryOrder,
   // v3.534：`_f` 写盘投影与条数淘汰（唯一实现，四处写盘共用；导出供测试直接钉口径）
+  // W5：新增「能否安全丢正文」的唯一判据（canDropBody，与 getMessageIdentity 同源）、条数/字节
+  // 两条上限共用的淘汰顺序（selectEvictionIndices）与控制台恢复的写盘投影（projectMessagesText）。
   toDiskEntry,
-  trimMessagesToMaxSize
+  canDropBody,
+  selectEvictionIndices,
+  trimMessagesToMaxSize,
+  projectMessagesText
 }

@@ -70,6 +70,8 @@ const CONSOLE_MODULE_FILES = [
 const { loadModel } = require('./test_support/source_model')
 const { parseText, findFirst, findAll, callSites, memberPath, objectKeyNames, importBindings, declaresVariable } = require('./test_support/ast_query')
 const markup = require('./test_support/markup')
+// W5：控制台恢复走 store 的写盘投影——测试直接拿同一函数算期望值（禁止在测试里重写一份投影规则）
+const { projectMessagesText } = require('./xbk_message_store')
 
 const CONSOLE_ASSET_DIR = path.join(__dirname, 'scripts', 'console-assets')
 
@@ -4165,6 +4167,70 @@ async function backupApiTests () {
         headers: { 'content-type': 'application/json' }
       })
       assert.strictEqual(bad.status, 400)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await aok('数据备份: 恢复旧格式快照当场投影（不等到 compact），_f 正文 0 残留、普通条目逐字不变', async () => {
+    const dir = mkTmp('xbk-console-backup-')
+    const pushPath = path.join(dir, 'push.json')
+    const journalPath = path.join(dir, 'push.json.journal.ndjson')
+    fs.writeFileSync(pushPath, JSON.stringify([{ id: 1, title: 'old' }]))
+    fs.writeFileSync(journalPath, JSON.stringify({ v: 2, at: 1, put: [{ id: 'stale', title: 'stale' }] }) + '\n')
+    const { server } = createConsole({ token: TOKEN, stateDir: dir })
+    const port = await listen(server)
+    try {
+      // 同构的小号「11 MB 旧格式备份」：`_f` 条目 id+url 齐全但正文还在（W3 之前的磁盘形态），
+      // 普通条目必须逐字保真。旧实现在这里把备份文本原样写进 push.json，于是 11 MB 恢复后仍是
+      // 11 MB、要等下一次 compact（最长 6 h/8 MiB）才收敛（w3b 5.3 实测）。
+      const body = '推送正文'.repeat(400)
+      const html = '<p>' + body + '</p>'
+      const items = []
+      for (let i = 0; i < 240; i++) items.push({ id: 'f' + i, url: 'https://u.example/f' + i, title: 'F' + i, content: body, content_html: html, _f: true })
+      for (let i = 0; i < 5; i++) items.push({ id: 'n' + i, url: 'https://u.example/n' + i, title: 'N' + i, content: '普通正文-' + i, content_html: '<p>N' + i + '</p>' })
+      const legacyText = JSON.stringify(items)
+      const bundle = { kind: 'xbk-console-backup', schema: 1, data: { messages: { count: 5, text: legacyText } } }
+      const imp = await request(port, 'POST', '/api/backup/import', {
+        token: TOKEN,
+        body: JSON.stringify(bundle),
+        headers: { 'content-type': 'application/json' }
+      })
+      assert.strictEqual(imp.status, 200, imp.text)
+      assert.strictEqual(JSON.parse(imp.text).imported.messages, 5, '导入计数口径不变（只计已推送条目）')
+      const expected = projectMessagesText(legacyText)
+      assert.ok(expected, '前置：投影函数必须能处理这份旧格式快照')
+      const legacyBytes = Buffer.byteLength(legacyText, 'utf8')
+      const expectedBytes = Buffer.byteLength(expected, 'utf8')
+      // 正控：这份夹具必须真的「投影了就变小」，否则下面的断言区分不出「投影了」与「没投影」。
+      assert.ok(expectedBytes < legacyBytes / 2, `正控：投影后必须显著变小（旧格式 ${legacyBytes} B → 投影 ${expectedBytes} B）`)
+      const written = fs.readFileSync(pushPath, 'utf8')
+      // 断言落在「结构 + 字节长度」上，不做源码/文本字面量比对（源码文本断言闸门禁止新增那类判据）。
+      assert.strictEqual(Buffer.byteLength(written, 'utf8'), expectedBytes, '恢复必须当场写投影后的文本（与 saveMessages 同格式），不得原样写裸 JSON')
+      assert.deepStrictEqual(JSON.parse(written), JSON.parse(expected), '恢复落盘的条目必须与投影函数逐条一致（同一口径）')
+      // 不等到 compact：恢复完成后文件**立刻** ≤ 投影后大小
+      assert.ok(Buffer.byteLength(written, 'utf8') <= expectedBytes, '恢复后文件必须立刻 ≤ 投影后大小（不等到 compact）')
+      assert.ok(Buffer.byteLength(written, 'utf8') < legacyBytes / 2, `恢复后文件不得仍是旧格式的体量（实测 ${Buffer.byteLength(written, 'utf8')} B / 旧 ${legacyBytes} B）`)
+      const saved = JSON.parse(written)
+      assert.deepStrictEqual(saved.map((m) => m.id), items.map((m) => m.id), '恢复后的条目集合与顺序不得变化')
+      for (const f of saved.filter((m) => m._f === true)) {
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(f, 'content'), false, '恢复后 _f 条目不得带 content')
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(f, 'content_html'), false, '恢复后 _f 条目不得带 content_html')
+        assert.strictEqual(typeof f.url, 'string', '恢复后 _f 的身份字段 url 必须保留')
+        assert.strictEqual(f._f, true, '_f 标记必须保留（规则变更时靠它整批重评）')
+      }
+      assert.deepStrictEqual(saved.filter((m) => m._f !== true), items.filter((m) => m._f !== true), '普通条目正文 0 差异')
+      // 残留正文扫描落在「解析后的值」上（逐字符串判定），不对文件文本做字面量比对。
+      const leaked = []
+      const walk = (v) => {
+        if (typeof v === 'string') leaked.push(v)
+        else if (v && typeof v === 'object') for (const k of Object.keys(v)) walk(v[k])
+      }
+      walk(saved)
+      assert.strictEqual(leaked.some((s) => s.includes('推送正文')), false, '落盘文件不得残留 _f 正文（含 content_html）')
+      // 快照换新后旧 journal 必须清空（既有语义）：否则旧 put 回放会把导入前的条目掺回来
+      assert.strictEqual(fs.statSync(journalPath).size, 0, '恢复后必须清空旧 journal')
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })

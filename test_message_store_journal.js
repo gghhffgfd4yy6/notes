@@ -28,6 +28,12 @@ const {
   createMessageStore,
   journalPathFor,
   parseJournalText,
+  applyJournalRecords,
+  toDiskEntry,
+  canDropBody,
+  selectEvictionIndices,
+  trimMessagesToMaxSize,
+  projectMessagesText,
   JOURNAL_SUFFIX,
   JOURNAL_VERSION,
   JOURNAL_MAX_BYTES,
@@ -1143,6 +1149,221 @@ check('J9-02 读端兜底裁剪（maxSize 下调 + journal 回放）必须与写
     assert.strictEqual(store.has({ id: 'f' }, NAME), false, '被淘汰的 _f 不落墓碑')
     assert.deepStrictEqual(fs.readFileSync(fp), beforeBytes, '读路径不得写盘（push.json 字节不变）')
   }
+})
+
+// ============================================================
+section('10. W5：投影判据与 getMessageIdentity 同源 / 字节上限 `_f` 优先 / drop 行只留身份')
+// ============================================================
+
+check('J10-01 legacy「anon:<hex> id + 非法 url」的 _f：投影必须保留正文（身份不得翻转），save→read 后 has() 仍命中、saveBatch 不重复收录', () => {
+  const NAME = 'push.json'
+  const dir = tmpDir('w5-legacy-anon-id')
+  const constants = { JOURNAL_DIRECT_MAX_BYTES: 0 }
+  const store = makeStore({ dir, maxSize: 100, constants })
+  const fp = store.getFilePath(NAME)
+  const jp = journalPathFor(fp)
+  // 构造「历史匿名合成键」：id 就是这条消息自身内容的 anonKey（getMessageIdentity 会对
+  // 「anon:<hex> id + 不可用 url」降级成内容 anon 身份），url='#' 在 validUrl 下不可用。
+  const seed = { title: 'W5 匿名标题', content: 'W5匿名正文-'.repeat(20) }
+  const anonKey = Utils.getMessageIdentity(seed).key
+  assert.match(anonKey, /^anon:[0-9a-f]+$/, '前置：无 id/url 的消息应得内容匿名身份')
+  const legacy = { id: anonKey, url: '#', title: seed.title, content: seed.content, _f: true }
+  assert.strictEqual(Utils.getMessageIdentity(legacy).kind, 'anon', '前置：该条目的身份必须已降级成 anon（否则本用例没有判别力）')
+  // 判据：删掉正文后身份会从 anon 翻转成 id:anon:… ⇒ 不允许投影
+  assert.strictEqual(canDropBody(legacy, Utils), false, '身份依赖正文时必须判「不能丢正文」')
+  assert.strictEqual(toDiskEntry(legacy, Utils), legacy, '不能安全丢正文时必须原样返回同一对象（保留正文）')
+  // 快照路径：save → 磁盘上正文仍在 → 新进程 read 后 has() 仍命中
+  assert.strictEqual(store.saveMessages(fp, [legacy]), true, '保存必须成功')
+  const onDisk = JSON.parse(fs.readFileSync(fp, 'utf8'))
+  assert.strictEqual(onDisk.length, 1)
+  assert.strictEqual(onDisk[0].content, legacy.content, '身份依赖正文的 _f 不得被投影掉 content（否则身份翻转）')
+  const reopened = makeStore({ dir, maxSize: 100, constants })
+  assert.strictEqual(reopened.has(legacy, NAME), true, '重启后（读到落盘快照）原身份必须仍判重命中')
+  // journal 路径同一判据：新批次写入的 put 行同样不得删正文
+  assert.strictEqual(reopened.saveBatch([{ id: 'n1', title: 'N1', content: '正常正文' }], NAME), true)
+  const putRows = journalPuts(readJournalRecords(jp))
+  const legacyRow = putRows.concat(JSON.parse(fs.readFileSync(fp, 'utf8')).filter((m) => m._f === true))
+    .find((m) => m && m.id === anonKey)
+  assert.ok(legacyRow, '前置：journal 或快照里必须能找到这条 legacy 条目')
+  // 同一身份再喂一次：不得重复收录（修前实测 1→2）
+  assert.strictEqual(reopened.saveBatch([legacy], NAME), true)
+  const after = reopened.readMessages(fp)
+  assert.strictEqual(after.length, 2, `同一身份重放不得重复收录（实际 ${after.length} 条：${JSON.stringify(after.map((m) => m.id))}）`)
+  assert.strictEqual(after.filter((m) => m.id === anonKey).length, 1, 'legacy anon 身份必须仍只有 1 条')
+})
+
+check('J10-02 空白 id（trim 后为空）的 _f 同样保留正文；id+url 齐全的普通 _f 仍瘦身；url 为空的 _f 行为不变（收紧而非放宽）', () => {
+  const blank = { id: '   ', url: 'javascript:void(0)', title: '空白 id', content: 'C'.repeat(200), _f: true }
+  assert.strictEqual(Utils.getMessageIdentity(blank).kind, 'anon', '前置：空白 id + 不可用 url 应降级成内容 anon 身份')
+  assert.strictEqual(canDropBody(blank, Utils), false, '空白 id 的身份依赖正文 ⇒ 不能投影')
+  assert.strictEqual(toDiskEntry(blank, Utils), blank, '空白 id 的 _f 必须保留正文（原实现按 id !== "" 误判为可投影）')
+  const slim = { id: 'ok-1', url: 'https://u.example/ok-1', title: 'T', content: 'C'.repeat(200), content_html: '<p>C</p>', _f: true }
+  assert.strictEqual(canDropBody(slim, Utils), true, 'id+url 齐全且身份只认 id ⇒ 可投影')
+  const proj = toDiskEntry(slim, Utils)
+  assert.notStrictEqual(proj, slim, '可投影时必须返回浅拷贝（内存对象不动）')
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(proj, 'content'), false)
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(proj, 'content_html'), false)
+  assert.strictEqual(slim.content, 'C'.repeat(200), '投影不得改动内存里的原对象')
+  // 既有行为锁定（w3b ①② 的 f3）：url 缺失/为空的 _f 保留正文——W5 只收紧，不得放宽
+  const f3 = { id: 'f3', url: '', title: 'F3', content: 'x'.repeat(50), _f: true }
+  assert.strictEqual(toDiskEntry(f3, Utils), f3, 'url 为空的 _f 必须保留正文（既有测试锁定的行为）')
+  assert.strictEqual(toDiskEntry({ id: 'f4', title: 'F4', content: 'y'.repeat(50), _f: true }, Utils).content, 'y'.repeat(50), '缺 url 的 _f 必须保留正文')
+  // 非 _f 条目永不投影（写盘瘦身只针对过滤未推条目）
+  const pushed = { id: 'p1', url: 'https://u.example/p1', content: 'z'.repeat(50) }
+  assert.strictEqual(toDiskEntry(pushed, Utils), pushed, '已推送条目必须原样写盘')
+})
+
+check('J10-03 超字节上限淘汰与条数上限共用 selectEvictionIndices：先淘汰 `_f`（哪怕它最新），已推送条目仍在', () => {
+  // 「超 64 MiB 且含 _f」的同一段代码路径：用注入的小上限代替 64 MiB（真 64 MiB 夹具会把套件变成内存大户，
+  // maxBytes 只是 _trimCacheByBytes 的参数，生产恒为 MESSAGE_CACHE_MAX_BYTES）
+  const dir = tmpDir('w5-bytes-f-first')
+  const NAME = 'push.json'
+  const p1 = { id: 'p1', title: 'P1', content: 'a'.repeat(120) }
+  const p2 = { id: 'p2', title: 'P2', content: 'b'.repeat(120) }
+  const fNew = { id: 'f-new', url: 'https://u.example/f-new', title: 'F', content: 'c'.repeat(400), _f: true }
+  const all = [p1, p2, fNew]
+  const project = (m) => toDiskEntry(m, Utils)
+  const keepBoth = Buffer.byteLength(JSON.stringify([p1, p2].map(project)), 'utf8')
+  const maxBytes = keepBoth + 8 // 放得下两条已推送，放不下再加最新那条 _f
+  assert.ok(Buffer.byteLength(JSON.stringify(all.map(project)), 'utf8') > maxBytes, '前置：三整份必须超限（否则不会走裁剪）')
+  const store = makeStore({ dir, maxSize: 100, constants: { MESSAGE_CACHE_MAX_BYTES: maxBytes } })
+  const fp = path.join(dir, NAME)
+  const toSave = [...all]
+  const dropped = []
+  const text = store._trimCacheByBytes(JSON.stringify(all.map(project)), toSave, fp, maxBytes, dropped, project)
+  assert.strictEqual(typeof text, 'string', '超限必须裁剪出可读文本')
+  assert.ok(Buffer.byteLength(text, 'utf8') <= maxBytes, '产出必须 ≤ maxBytes（防读端 tooLarge 自锁）')
+  assert.deepStrictEqual(JSON.parse(text).map((m) => m.id), ['p1', 'p2'], '字节上限必须淘汰最新的 _f，而不是最旧的已推送条目（w3b 5.2 修前实测丢掉 pushed1）')
+  assert.deepStrictEqual(toSave.map((m) => m.id), ['p1', 'p2'], '幸存者必须按原数组顺序写回入参（内存快照/tombstone 依赖它）')
+  assert.deepStrictEqual(dropped.map((m) => m.id), ['f-new'], '被淘汰条目必须上报 droppedOut（journal drop 与墓碑语义不变）')
+  // 与条数上限同一淘汰函数：同一集合、同样超 1 条 ⇒ 丢同一条
+  const byCount = [...all]
+  assert.deepStrictEqual(trimMessagesToMaxSize(byCount, 2).map((m) => m.id), ['f-new'], '条数上限必须与字节上限同口径')
+  assert.deepStrictEqual(byCount.map((m) => m.id), ['p1', 'p2'], '条数上限的幸存者顺序同样不变')
+  assert.deepStrictEqual(selectEvictionIndices(all, 1), [2], '淘汰顺序的唯一来源：唯一一条 _f（下标 2）先出局')
+  assert.deepStrictEqual(selectEvictionIndices([p1, { id: 'f1', _f: true }, p2, { id: 'f2', _f: true }, { id: 'p3' }], 3), [1, 3, 0],
+    '两条 _f 按数组序先出局，不足才轮到最旧的已推送条目')
+  // `_f` 用尽后继续按「最旧优先」淘汰已推送条目
+  const tight = Buffer.byteLength(JSON.stringify([p2].map(project)), 'utf8')
+  const toSave2 = [...all]
+  const dropped2 = []
+  const text2 = store._trimCacheByBytes(JSON.stringify(all.map(project)), toSave2, fp, tight + 8, dropped2, project)
+  assert.deepStrictEqual(JSON.parse(text2).map((m) => m.id), ['p2'], '_f 先出局，再淘汰最旧的已推送条目')
+  assert.deepStrictEqual(dropped2.map((m) => m.id), ['p1', 'f-new'], 'droppedOut 按数组序收集被淘汰条目')
+})
+
+check('J10-04 字节上限单条即超限：仍返回 null、保留原告警文案、不记任何丢弃', () => {
+  const dir = tmpDir('w5-bytes-single')
+  const store = makeStore({ dir, maxSize: 100, constants: { MESSAGE_CACHE_MAX_BYTES: 64 } })
+  const big = { id: 'f-big', url: 'https://u.example/big', content: 'x'.repeat(400), _f: true }
+  const toSave = [big, { id: 'f-big2', url: 'https://u.example/big2', content: 'y'.repeat(400), _f: true }]
+  const dropped = []
+  const warns = captureWarn(() => {
+    assert.strictEqual(store._trimCacheByBytes(JSON.stringify(toSave), toSave, path.join(dir, 'push.json'), 64, dropped), null,
+      '连单条都放不下时必须返回 null（调用方跳过落盘）')
+  })
+  assert.ok(warns.some((w) => w.includes('缓存单条消息即超过读端上限')), `必须保留原告警文案：${JSON.stringify(warns)}`)
+  assert.strictEqual(dropped.length, 0, 'null 路径不得记为丢弃（没有实际裁掉任何记录）')
+  assert.strictEqual(toSave.length, 2, 'null 路径不得改动入参数组的成员')
+})
+
+check('J10-05 journal 的 drop 行只留身份：不带 content/content_html，回放仍按 id/url 命中；anon 身份原样保留正文', () => {
+  const NAME = 'push.json'
+  const constants = { JOURNAL_DIRECT_MAX_BYTES: 0 }
+  {
+    const dir = tmpDir('w5-drop-slim')
+    const store = makeStore({ dir, maxSize: 2, constants })
+    const fp = store.getFilePath(NAME)
+    const jp = journalPathFor(fp)
+    const bodyA = 'A正文-'.repeat(60)
+    const a = { id: 'drop-a', url: 'https://u.example/a', title: 'A', content: bodyA, content_html: '<p>' + bodyA + '</p>', timestamp: 111 }
+    const b = { id: 'drop-b', url: 'https://u.example/b', title: 'B', content: 'B正文-'.repeat(60) }
+    const c = { id: 'drop-c', url: 'https://u.example/c', title: 'C', content: 'C正文-'.repeat(60) }
+    assert.strictEqual(store.saveBatch([a, b], NAME), true)
+    // 推入第 3 条 ⇒ 条数上限 2，最旧的 a（已推送、非 _f）被淘汰
+    assert.strictEqual(store.saveBatch([c], NAME), true)
+    const rec = readJournalRecords(jp).find((r) => Array.isArray(r.drop) && r.drop.length > 0)
+    assert.ok(rec, '前置：journal 必须记下本批被裁的条目（drop 行）')
+    const d = rec.drop[0]
+    assert.deepStrictEqual(Object.keys(d).sort(), ['id', 'timestamp', 'url'],
+      `drop 行只保留身份与必要字段（实际：${JSON.stringify(d).slice(0, 200)}）`)
+    assert.strictEqual(d.id, 'drop-a', '身份字段 id 必须原样保留')
+    assert.strictEqual(d.url, 'https://u.example/a', '身份字段 url 必须原样保留（回放的 idWithUrl fallback 依赖它）')
+    assert.strictEqual(typeof d.timestamp, 'string', '必要展示字段 timestamp 必须保留')
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(d, 'content'), false, 'drop 行不得带 content')
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(d, 'content_html'), false, 'drop 行不得带 content_html')
+    const allStrings = (value, out = []) => {
+      if (typeof value === 'string') out.push(value)
+      else if (Array.isArray(value)) value.forEach((item) => allStrings(item, out))
+      else if (value && typeof value === 'object') Object.keys(value).forEach((key) => allStrings(value[key], out))
+      return out
+    }
+    assert.ok(allStrings(rec).some((s) => s === 'drop-b') || allStrings(rec).some((s) => s === 'drop-c'),
+      '正控：递归遍历必须覆盖到同行的 put（否则「无残留」是空断言）')
+    assert.deepStrictEqual(allStrings(rec).filter((s) => s.includes('A正文')).map((s) => s.slice(0, 20)), [],
+      'drop 行里不得残留被淘汰条目的正文（含嵌套字段）')
+    // 回放：去掉正文的 drop 行必须仍按 id/url 命中（修前若投影 anon 身份会 removed:0）
+    const replay = [{ ...a }, { ...b }, { ...c }]
+    const r = applyJournalRecords(replay, [{ put: [], drop: rec.drop }], Utils)
+    assert.strictEqual(r.removed, 1, 'drop 行必须仍能按身份命中（removed 不得为 0）')
+    assert.deepStrictEqual(replay.map((m) => m.id), ['drop-b', 'drop-c'], '回放后只删掉被淘汰的那条')
+    // 墓碑口径不变：被淘汰的已推送条目仍按 id 与 url 判重命中
+    assert.strictEqual(store.has({ id: 'drop-a', url: 'https://u.example/a' }, NAME), true, '墓碑必须仍按 id+url 命中')
+    assert.strictEqual(store.has({ url: 'https://u.example/a' }, NAME), true, '墓碑必须仍按 url 单独命中（idWithUrl fallback）')
+  }
+  {
+    // anon 身份（无 id/url）被淘汰：身份只能靠正文重算 ⇒ drop 行必须原样保留正文，否则回放失配
+    const dir = tmpDir('w5-drop-anon')
+    const store = makeStore({ dir, maxSize: 2, constants })
+    const jp = journalPathFor(store.getFilePath(NAME))
+    const a1 = { title: 'anon-1', content: 'anon1正文-'.repeat(40) }
+    const a2 = { title: 'anon-2', content: 'anon2正文-'.repeat(40) }
+    const a3 = { title: 'anon-3', content: 'anon3正文-'.repeat(40) }
+    assert.strictEqual(store.saveBatch([a1, a2], NAME), true)
+    assert.strictEqual(store.saveBatch([a3], NAME), true)
+    const rec = readJournalRecords(jp).find((r) => Array.isArray(r.drop) && r.drop.length > 0)
+    assert.ok(rec, '前置：anon 条目被淘汰时同样要有 drop 行')
+    assert.strictEqual(rec.drop[0].content, a1.content, 'anon 身份不能脱离正文 ⇒ drop 行必须保留 content（否则回放 removed:0）')
+    const replay = [{ ...a1 }, { ...a2 }, { ...a3 }]
+    assert.strictEqual(applyJournalRecords(replay, [{ put: [], drop: rec.drop }], Utils).removed, 1,
+      'anon 的 drop 回放必须命中（w3b 5.1 修前实测 removed:0）')
+    assert.deepStrictEqual(replay.map((m) => m.title), ['anon-2', 'anon-3'])
+  }
+})
+
+check('J10-06 旧格式快照加载/保存兼容：正文都在、身份不变；saveMessages 与 projectMessagesText 落盘逐字节一致', () => {
+  const NAME = 'push.json'
+  const dir = tmpDir('w5-legacy-file')
+  const fp = path.join(dir, NAME)
+  const seed = { title: 'legacy 匿名', content: 'legacy匿名正文-'.repeat(10) }
+  const anonKey = Utils.getMessageIdentity(seed).key
+  // W3 之前的磁盘形态：`_f` 全带正文，其中一条是 legacy 匿名 id
+  const legacyItems = [
+    { id: 'lf-1', url: 'https://u.example/lf-1', title: 'LF1', content: '瘦身正文-'.repeat(80), content_html: '<p>x</p>', _f: true },
+    { id: anonKey, url: '#', title: seed.title, content: seed.content, _f: true },
+    { id: 'ln-1', url: 'https://u.example/ln-1', title: 'LN1', content: '普通正文-'.repeat(20), content_html: '<p>n</p>' }
+  ]
+  const legacyText = JSON.stringify(legacyItems)
+  fs.writeFileSync(fp, legacyText)
+  const store = makeStore({ dir, maxSize: 100 })
+  const loaded = store.readMessages(fp)
+  assert.strictEqual(loaded.length, 3, '旧格式必须照常读入')
+  assert.strictEqual(loaded[0].content, legacyItems[0].content, '旧格式的 _f 正文必须原样进内存（下一次保存才瘦身）')
+  assert.strictEqual(store.has(legacyItems[1], NAME), true, 'legacy anon 身份读入后必须判重命中')
+  assert.strictEqual(store.saveMessages(fp, loaded), true)
+  const written = fs.readFileSync(fp, 'utf8')
+  const projected = projectMessagesText(legacyText, Utils)
+  assert.ok(projected, '前置：投影函数必须能处理旧格式文本')
+  assert.ok(projected.length < legacyText.length, '正控：这份旧格式快照的投影必须真的变小')
+  assert.strictEqual(Buffer.byteLength(written, 'utf8'), Buffer.byteLength(projected, 'utf8'), 'saveMessages 的落盘文本长度必须与 projectMessagesText 一致（控制台恢复同一口径）')
+  assert.deepStrictEqual(JSON.parse(written), JSON.parse(projected), 'saveMessages 的落盘条目必须与 projectMessagesText 逐条一致')
+  const saved = JSON.parse(written)
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(saved[0], 'content'), false, '普通 `_f`（id+url 齐全）必须瘦身')
+  assert.strictEqual(saved[1].content, seed.content, 'legacy 匿名 id 的 `_f` 必须保留正文')
+  assert.deepStrictEqual(saved[2], legacyItems[2], '普通条目必须逐字不变')
+  const reread = makeStore({ dir, maxSize: 100 })
+  assert.strictEqual(reread.has(legacyItems[1], NAME), true, '瘦身写盘后 legacy 身份必须仍命中')
+  assert.strictEqual(reread.has(legacyItems[2], NAME), true, '普通条目身份必须仍命中')
 })
 
 // ============================================================
