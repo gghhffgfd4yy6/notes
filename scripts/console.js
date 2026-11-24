@@ -35,7 +35,7 @@ const { journalPathFor, JOURNAL_SUFFIX } = require('../xbk_message_store')
 // 墓碑计数走 readSafeTextResult 本尊（status.js 已有同款顶层依赖，无新增副作用面）。
 const { MESSAGE_CACHE_MAX_BYTES, DEFAULT_MAX_SIZE, TOMBSTONE_MAX_BYTES, timingSafeEqualStr: sharedTimingSafeEqualStr, shanghaiStamp, isRunBusyLine } = require('../xbk_utils')
 const { readSafeTextResult, writeAtomic, statSafeMeta } = require('../xbk_storage')
-const { removeStaleTombstoneFile, tombstoneKeyCap } = require('../xbk_message_store') // C3-013：清残留墓碑 / CR-01：墓碑上限同一规则
+const { removeStaleTombstoneFile, tombstoneKeyCap, projectMessagesText } = require('../xbk_message_store') // C3-013：清残留墓碑 / CR-01：墓碑上限同一规则 / W5：恢复走写盘投影
 // 过滤规则覆盖文件存储层（纯同步、零新依赖、不 require xbk_function_v3）：
 // 路径/合并/校验/生效快照复用 store 的单一实现，控制台只做 HTTP 装配与写流程。
 const FilterStore = require('../xbk_filter_store')
@@ -5054,7 +5054,7 @@ function createConsole ({ token, stateDir, port = 0, host = '127.0.0.1', log = c
           sendJson(res, status, { ...body, field, rolledBack })
         }
         if (plans.messages) {
-          if (!writeAtomic(path.join(stateDir, messagesFile), plans.messages.text, '推送记录恢复')) {
+          if (!writeAtomic(path.join(stateDir, messagesFile), projectMessagesText(plans.messages.text), '推送记录恢复')) { // W5：经 store 写盘投影（旧格式 _f 正文就地瘦掉），解析失败即返回 null 走下面的写失败回滚
             abortImport('messages', 500, { error: 'write_failed', code: 'write_failed' })
             return
           }
