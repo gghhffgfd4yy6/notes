@@ -1285,7 +1285,7 @@ check('J10-05 journal 的 drop 行只留身份：不带 content/content_html，�
     const rec = readJournalRecords(jp).find((r) => Array.isArray(r.drop) && r.drop.length > 0)
     assert.ok(rec, '前置：journal 必须记下本批被裁的条目（drop 行）')
     const d = rec.drop[0]
-    assert.deepStrictEqual(Object.keys(d).sort(), ['id', 'timestamp', 'url'],
+    assert.deepStrictEqual(Object.keys(d).sort((x, y) => x.localeCompare(y)), ['id', 'timestamp', 'url'],
       `drop 行只保留身份与必要字段（实际：${JSON.stringify(d).slice(0, 200)}）`)
     assert.strictEqual(d.id, 'drop-a', '身份字段 id 必须原样保留')
     assert.strictEqual(d.url, 'https://u.example/a', '身份字段 url 必须原样保留（回放的 idWithUrl fallback 依赖它）')
